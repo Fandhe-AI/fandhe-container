@@ -20,8 +20,9 @@
 //! - 常に付ける: `nosuid`・`nodev`（型が常に真を返し、外した値を表現できない。REPAIR-2）。伝播は常に private
 //!   （適用側は private で付ける契約）。`noexec` は指定時のみ
 //! - 再帰: 既定は非再帰。`rbind` 指定時のみ再帰（属性を再帰で付けるのは適用側）
-//! - マウント元: 字句検証（絶対・`..`/`.`/空要素/NUL/`\` なし・`/` 不可）。rootfs・bundle・状態ルートの
-//!   同一・祖先は [`BindMountSet::check_against_host_paths`]
+//! - マウント元: 字句検証（絶対・`..`/`.`/空要素/NUL/`\` なし・`/` 不可）。rootfs・bundle の同一・祖先は
+//!   [`BindMountSet::check_against_host_paths`]（子孫は受ける）、状態ルートの同一・祖先・子孫は
+//!   [`BindMountSet::check_against_protected_trees`]
 //! - マウント先: `/proc`・`/sys`・`/dev` とその配下を拒否。先行 bind との同一・入れ子を拒否。tmpfs・注入・
 //!   保護パスとの重なりは各 `check_against_*`
 //!
@@ -42,12 +43,22 @@
 //! | 宛先 `/proc`・`/sys`・`/dev` 配下 | 制限なし | 拒否 |
 //! | bind 同士の入れ子 | Linux は列挙順に適用 | 拒否 |
 //!
-//! # 暫定の判断（#1910 の決定外。オーナー確認待ち）
+//! # 決定（#2063・2026-10-16 のオーナー決定。SEC-1・OCI-4）
 //!
-//! `bind` と `rbind` の併記は拒否、マウント元の `.` 要素と `\` は拒否、bind 同士の入れ子は拒否（子の宛先が
-//! ホストのディレクトリになり、無いディレクトリの作成がホストへ書き込む経路になるため）、
-//! `check_against_host_paths` は子孫（bundle 配下など）を拒否しない。いずれも fail-closed 側または仕様どおりで、
-//! 決定が出たらここを更新する。
+//! #1910 の決定外だった 4 点は #2063 で確定した。各点は単体・結合試験で具体値により固定する（REPAIR-3・REPAIR-12）。
+//!
+//! | 点 | 決定 | 判定を担う箇所 |
+//! | -- | -- | -- |
+//! | (a) | `bind` と `rbind` の併記は拒否 | `parse_options` の `ConflictingBindKind` |
+//! | (b) | マウント元の `.` 要素と `\` は両方拒否（PR #2044 の本文の「`/`」は誤記で、対象は `.` 要素と `\`） | `validate_source` の `InvalidSource` |
+//! | (c) | bind 同士の入れ子（宛先が同一・親子）は拒否。子の宛先がホストのディレクトリになり、無いディレクトリの作成がホストへ書き込む経路になるため | `from_mounts` の `DuplicateDestination` / `NestedDestination` |
+//! | (d) | 状態ルートは同一・祖先・子孫を拒否する。rootfs・bundle は同一・祖先だけを拒否し、子孫は受ける | 下記 |
+//!
+//! (d) のうち状態ルート側は [`BindMountSet::check_against_protected_trees`]・
+//! [`BindMountSet::check_resolved_sources_against_protected_trees`]（`canonicalize` 後の照合）・`start` の mountinfo と inode の鎖による
+//! 実体照合・適用の段の `ProtectedFsRoot::new` が担う。rootfs・bundle 側は
+//! [`BindMountSet::check_against_host_paths`]・`start` の `source_contains`・適用の段の `ProtectedFsRoot::contained`
+//! が担う。暫定の「子孫はすべて受ける」から、状態ルートの子孫だけが拒否に変わった。
 //!
 //! # Landlock との解釈の共有
 //!
@@ -58,7 +69,7 @@
 //! # スコープ外（REPAIR-3）
 //!
 //! 本型は字句検証のみで、検証から適用までの TOCTOU を防がない。symlink を含む実体の照合・fd 起点 `O_NOFOLLOW` の
-//! 走査・種別と存在の確認・宛先ディレクトリの作成・利用者権限での到達性・rootfs 自身とその祖先の実体照合（`dev`/`ino`）は、
+//! 走査・種別と存在の確認・宛先ディレクトリの作成・利用者権限での到達性・rootfs 自身とその祖先の実体照合（`dev`/`ino`）・疑似 FS 上の元の拒否（`f_type`。#2098）は、
 //! 適用の段 `crate::exec::mount_binds`（#1913。実装済み。Linux 限定のため intra-doc リンクは張らない）が担う。
 //! bundle は適用の段の rootfs の鎖（inode）と mountinfo（`ProtectedFsRoot::contained`）で、状態ルートは start が固定した inode の鎖（`with_inode_chain`。#2066）と mountinfo で照合する。残余（REPAIR-3）は、状態ルートを別の親ディレクトリへ付け替えた場合の祖先判定、overlayfs・FUSE 系の別 superblock 経由の同一データ、start 後に改名された子マウントの mountinfo 照合で、詳細は `crate::exec::mount_binds` のモジュール doc。`run_pre_pivot` への組み込みは済み（#1914）、`start` と本番 launcher への結線は済み（#1915。検証は `start`、tmpfs との重なりは launcher、
 //! 監査は `ProcessLauncher::rejection_audit_sink` 経由）。`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917
@@ -543,7 +554,9 @@ impl BindMountSet {
     /// マウント元が `forbidden`（rootfs・bundle・状態ルートのホスト絶対パス。呼び出し側が渡す）と
     /// 同一または祖先なら拒否する。
     ///
-    /// 字句比較のみ。rootfs 自身とその祖先の実体照合は適用の段（#1913）が `dev`/`ino` で行う。bundle・状態ルートの実体照合は未対応。子孫は拒否しない（暫定）。
+    /// 字句比較のみ。子孫は受ける（#2063 の決定 (d)。rootfs・bundle の配下は公開してよい）。状態ルートはこの関数に
+    /// 渡さず [`Self::check_against_protected_trees`] で検査する。実体照合（rootfs・bundle の祖先を別名経由で
+    /// 公開させない）は `start` と適用の段（#1913）が担う（詳細は module doc）。
     pub fn check_against_host_paths(&self, forbidden: &[&str]) -> Result<(), BindMountError> {
         for b in &self.mounts {
             if forbidden
@@ -562,7 +575,7 @@ impl BindMountSet {
     /// 元が `protected` のいずれかと同一・祖先・子孫のとき `ForbiddenSource` で拒否する（状態ルート用）。
     ///
     /// [`Self::check_against_host_paths`] は子孫を許すが、状態ルートの配下を書込み可能で公開すると
-    /// `state.json` 等を改変できるため、両方向で拒否する（SEC-1・OCI-4・#1915）。字句比較のみ。
+    /// `state.json` 等を改変できるため、両方向で拒否する（SEC-1・OCI-4・#1915。#2063 の決定 (d)）。字句比較のみ。
     pub fn check_against_protected_trees(&self, protected: &[&str]) -> Result<(), BindMountError> {
         for b in &self.mounts {
             if protected.iter().any(|f| overlaps(f, &b.source)) {
@@ -893,14 +906,14 @@ mod tests {
         }
     }
 
-    /// CORE-2: bind と rbind の併記は拒否する（暫定）。
+    /// CORE-2: bind と rbind の併記は拒否する（#2063 の決定 (a)。SEC-1・OCI-4）。
     #[test]
     fn core2_bind_rejects_bind_and_rbind() {
         let (k, i, _) = kind_of(json!([bind(&["bind", "rbind"])]));
         assert_eq!((k, i), (BindMountErrorKind::ConflictingBindKind, Some(0)));
     }
 
-    /// CORE-2: マウント元の字句規則。
+    /// CORE-2: マウント元の字句規則（#2063 の決定 (b)。`.` 要素と `\` は拒否）。
     #[test]
     fn core2_bind_source_lexical() {
         for ok in ["/data", "/a/b"] {
@@ -910,7 +923,7 @@ mod tests {
             );
         }
         for bad in [
-            "data", "./a", "/", "//", "/a//b", "/a/", "/a/./b", "/a/../b", "/a\\b",
+            "data", "./a", "/", "/.", "/a/.", "//", "/a//b", "/a/", "/a/./b", "/a/../b", "/a\\b",
         ] {
             let (k, i, _) = kind_of(json!([one(Some("bind"), "/x", Some(bad), &[])]));
             assert_eq!(
@@ -956,7 +969,7 @@ mod tests {
         }
     }
 
-    /// CORE-2: 同一宛先・入れ子は拒否し、相手の位置を返す。
+    /// CORE-2: 同一宛先・入れ子は拒否し、相手の位置を返す（#2063 の決定 (c)）。
     #[test]
     fn core2_bind_rejects_duplicate_and_nested() {
         let m = |d: &str| one(Some("bind"), d, Some("/data"), &[]);
@@ -1084,6 +1097,36 @@ mod tests {
         }
         let ok = set(json!([one(Some("bind"), "/d", Some("/var/lib/y"), &[])])).expect("set");
         assert!(ok.check_against_host_paths(&host).is_ok());
+    }
+
+    /// SEC-1・OCI-4: #2063 の決定 (d)。rootfs・bundle の子孫は受け、同一・祖先は拒否する。状態ルートは子孫も拒否する。
+    #[test]
+    fn sec1_oci4_host_paths_decision_d() {
+        let src = |p: &str| set(json!([one(Some("bind"), "/d", Some(p), &[])])).expect("set");
+        let host = ["/var/lib/x/rootfs", "/var/lib/x"];
+        for ok in ["/var/lib/x/rootfs/sub", "/var/lib/x/data"] {
+            assert!(src(ok).check_against_host_paths(&host).is_ok(), "{ok}");
+        }
+        for bad in ["/var/lib/x", "/var/lib"] {
+            let e = src(bad).check_against_host_paths(&host).expect_err(bad);
+            assert_eq!(
+                (e.kind().clone(), e.index()),
+                (BindMountErrorKind::ForbiddenSource, Some(0)),
+                "{bad}"
+            );
+        }
+        let state = ["/var/lib/fandhe"];
+        for bad in ["/var/lib/fandhe/ctr-1", "/var/lib/fandhe", "/var/lib"] {
+            let e = src(bad)
+                .check_against_protected_trees(&state)
+                .expect_err(bad);
+            assert_eq!(*e.kind(), BindMountErrorKind::ForbiddenSource, "{bad}");
+        }
+        assert!(
+            src("/var/lib/fandhe-other")
+                .check_against_protected_trees(&state)
+                .is_ok()
+        );
     }
 
     /// SEC-4: 監査はコンテナ内の宛先のみを載せ、マウント元を載せない。

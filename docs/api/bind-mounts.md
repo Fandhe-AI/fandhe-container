@@ -35,16 +35,21 @@ Linux の fandhe-container は、OCI `config.json` の `mounts[]` に書いた b
 | `bind` と `rbind` の併記 | 意味が曖昧なため |
 | 相対パス・`..`・`.`・空要素・`\`・NUL を含む `source`、`source: "/"` | 絶対パスの正規形のみ受ける |
 | bundle の rootfs・bundle ディレクトリと同一、またはその祖先の `source` | コンテナが自身の rootfs を書き換える経路を作らない |
+| 状態ルート（状態の保存先）と同一・祖先・子孫の `source` | `state.json` 等の改変を防ぐ。rootfs・bundle の配下の `source` は受ける（#2063・SEC-1・OCI-4） |
+| procfs・sysfs・cgroup などの疑似 FS 上の `source`（`rbind` の配下に疑似 FS のマウントがある場合を含む） | ホストのプロセス・カーネルの情報の露出と、`linux.maskedPaths` / `readonlyPaths` の迂回を防ぐ。適用の段が固定した元の `fstatfs` の `f_type` と、付け替えた木の mountinfo の fstype で判定する（SEC-1・#2098・#2065） |
 | `/proc`・`/sys`・`/dev` とその配下の `destination` | 暗黙のマウントと固定の保護パスがあるため |
 | bind 同士で同一・入れ子の `destination` | 子の宛先がホストのディレクトリになるのを防ぐ |
 | `linux.readonlyPaths` / `maskedPaths` と重なる `destination` | 保護パスを覆えないようにする |
 | bind 以外の種類（`proc`・`tmpfs` など） | 未対応（`UNIMPLEMENTED`） |
+
+拒否する疑似 FS（mountinfo の fstype 名）は、`proc`・`sysfs`・`debugfs`・`tracefs`・`securityfs`・`cgroup`（v1）・`cgroup2`・`bpf`・`configfs`・`pstore`・`efivarfs`・`selinuxfs`・`smackfs`・`binfmt_misc`・`fusectl`・`resctrl`・`xenfs`・`nsfs`・`mqueue`・`devpts`・`binder` の 21 種である。根拠と magic 値は `crates/core/src/exec/bind_mounts.rs` の `PSEUDO_FS_DENYLIST`。ext4・xfs・btrfs・tmpfs・overlayfs・NFS などデータを持つ通常の FS は受ける。
 
 ## Docker / runc と異なる既定
 
 - `nosuid` と `nodev` を常に付ける。外せない
 - 伝播は常に private
 - `source` は絶対パスのみ（bundle 相対は不可）
+- 疑似 FS（procfs・sysfs・cgroup など）上の `source` は拒否する（runc は受ける）
 - `source` に symlink が含まれるときは拒否する（辿らない）。存在しない `source` は作らずに拒否する
 - `destination` の経路に symlink があるときは拒否する。`destination` のディレクトリは rootfs の中に作る
 - rootless（user namespace を使う）の起動経路だけが対象。rootful では受けない
@@ -54,6 +59,7 @@ Linux の fandhe-container は、OCI `config.json` の `mounts[]` に書いた b
 - `ro` の bind は、root が書き込み可能な構成では Landlock が書き込み制限を保証できないため、起動前に拒否される。解消は #1917
 - bind 以外の `mounts[]` の種類は未対応
 - 状態ルート（`StateStore::host_state_root`）と同一・祖先・子孫の `source` は start が拒否する（字句比較と `canonicalize` した実体の比較。SEC-1）。状態ルートを示せないストアでは bind つきの start を拒否する。適用の段も、固定した元に対して状態ルートとの重なりを毎回再検証する（元の属するマウントは fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントも照合する。保護対象と同じファイルシステム上でリンク数 2 以上の通常ファイルは状態ファイルへのハードリンクかもしれないため拒否する。start は状態ルート配下の通常ファイルのリンク数を上限つきで走査し、リンク数 2 以上のものがある〔または走査できない〕場合は、同じファイルシステム上のディレクトリ元も適用の段で拒否する）。元のマウント ID は `O_PATH` で固定した fd から取り、FIFO への差し替えでもブロックしない（REPAIR-5）。mountinfo は読み取りバイト数と行数に上限を設け、超過は構造化エラーで拒否する
+- 疑似 FS の拒否は拒否リストの方式のため、リストにない未知の疑似 FS は受ける。devtmpfs（ホストの `/dev`）は `f_type` が tmpfs と同じで区別できず、デバイスノードは `source` の種別の制限（ディレクトリと通常ファイルだけ）と常に付ける `nodev` で無効になることに頼る。FUSE（lxcfs など）・overlayfs の下層の中身は見ない。実機での確認は #1916
 - restart でも、起動時と同じ bind の集合を適用する
 
 ## 拒否の記録

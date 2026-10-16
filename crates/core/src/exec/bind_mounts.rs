@@ -46,6 +46,10 @@
 //! 1. **元の固定**: 新しい mount namespace の中で `/` から全要素を `O_NOFOLLOW` で辿って fd に固定する。symlink は
 //!    `bind_source_symlink`、種別がディレクトリ・通常ファイル以外は `bind_source_unsupported_type`、存在しなければ
 //!    `NOT_FOUND`（違反ではない。何も作らない）。固定した fd から複製し、パス文字列で再解決しない
+//!    **元の FS の種類**: 固定した fd に `fstatfs(2)` を掛け、`f_type` が `PSEUDO_FS_DENYLIST` にあれば `bind_source_pseudo_fs`
+//!    で拒否する（#2098・#2065 案 B。SEC-1。字句の段では判定しない。`fstatfs` の失敗は fail-closed、対応外アーキテクチャは
+//!    `UNIMPLEMENTED`）。ホストの `/proc` を bind すると、コンテナ自身の `/proc` に掛ける `maskedPaths`・`readonlyPaths` が
+//!    効かない別の宛先からホストのプロセス情報が見えるため。拒否リストの根拠は `PSEUDO_FS_DENYLIST` の doc を参照
 //! 2. **rootfs との同一性**: rootfs の `(st_dev, st_ino)` とその祖先（`..` を `O_NOFOLLOW` で辿る。4096 段が上限）に元が
 //!    含まれれば `bind_source_contains_rootfs` で拒否する。rootfs の祖先には bundle が入るため、bundle の bind 別名（同じ inode）も
 //!    ここで拒否する。bundle・rootfs の配下は受ける（#2063 案 B）。あわせて状態ルートの inode の鎖
@@ -64,7 +68,10 @@
 //! 8. **付け替え**: `move_mount(2)` の空パス + fd 指定。直後に自分のマウントの fd を保持する
 //! 9. **事後検証**: マウント前と別のマウントであること・自分のマウントの ID であること・`mount_flags` が要求どおりであること・
 //!    元と同じ `(st_dev, st_ino)` であること・mountinfo で自分のマウント（`rbind` は配下全体）に `shared:`・`master:` が無く
-//!    per-mount options が要求を満たすこと。満たさなければ fail-closed で失敗にする
+//!    per-mount options が要求を満たすこと。満たさなければ fail-closed で失敗にする。続けて同じ mountinfo で、自分のマウント
+//!    （`rbind` は配下全体）の fstype を拒否リストの名前と照合し、疑似 FS が 1 つでもあれば `bind_source_pseudo_fs` で拒否する
+//!    （配下だけ除いて載せることはしない。付け替えた木そのものを見るため、検査から複製までの間に元の下へマウントが足される
+//!    TOCTOU が無い。拒否は付け替えの後だが `pivot_root`・exec の前で、後始末が自分のマウントを外す）
 //!
 //! **伝播**: 明示の private 化はしない。`MountIsolation::establish` が `/` を `MS_REC|MS_PRIVATE` にしており、この
 //! namespace のマウントは shared でも slave でもない。shared でも slave でもないマウントの複製はやはりそうなる。付け替え先は
@@ -101,7 +108,7 @@
 //!
 //! # エラーと監査
 //!
-//! 失敗は段 `MountBinds` の [`ExecError`]。分離違反（symlink・配下でない・種別違い・移動・読めない元・shared）は
+//! 失敗は段 `MountBinds` の [`ExecError`]。分離違反（symlink・配下でない・種別違い・移動・読めない元・shared・疑似 FS）は
 //! [`ViolationReason`] を持ち、[`audit_mount_violation`](super::audit_mount_violation) で `Mount` 監査レコードにできる。違反記録の対象と
 //! message のパスは**コンテナ内の宛先**で、ホスト側のマウント元・rootfs の実パスは載せない。宛先は [`display_destination`]
 //! のエスケープと切り詰めを通す。新マウント API の無いカーネルでは `mount(2)` へ縮退せず `UNIMPLEMENTED` で拒否する。
@@ -126,7 +133,10 @@
 //!   照合（start 時点の FS 内パス）だけで見ており、start の後の改名には追随しない。別の superblock を通して同じデータを見せるもの
 //!   （overlayfs の lowerdir・FUSE 系）はどちらの層でも検出しない。bundle の実体は rootfs の鎖と mountinfo の `contained` で照合済み
 //!   （ホスト側の bind による別名を含む）。実機での別名の確認は #1916
-//! - procfs・sysfs など特殊な FS を元にすることは方針（#1910）上拒否していない
+//! - 疑似 FS の元は `f_type`（と配下の mountinfo の fstype）の**拒否リスト**で拒否する（#2098・#2065 案 B）。リストにない未知の
+//!   疑似 FS は受ける。devtmpfs（ホストの `/dev`）は `f_type` が tmpfs と同じで区別できず、デバイスノードは元の種別の制限
+//!   （ディレクトリと通常ファイルだけ）と常に付ける `nodev` で無効になることに頼る。FUSE（lxcfs のように `/proc` に似た内容を作るもの）・
+//!   overlayfs の下層の中身は検出しない。実機（user namespace と実際のマウント）での確認は #1916
 //!
 //! # 単体テストの安全策
 //!
@@ -271,6 +281,7 @@ fn mount_binds_checked(
         source_path: &pinned_source_path,
         source_mnt_id: &pinned_source_mnt_id,
         umount: &umount_fd,
+        source_fs_type: &|src| sys::fs_type(src.as_fd()),
         before_attach,
     };
     mount_binds_at(prepared.new_root(), set, &deps)
@@ -300,8 +311,132 @@ struct BindDeps<'a> {
     source_mnt_id: &'a dyn Fn(&VerifiedBindSourceFd) -> Result<u64, ExecError>,
     /// 自分のマウントを fd 指定で外す（`MNT_DETACH`）。
     umount: &'a dyn Fn(BorrowedFd<'_>) -> Result<(), SysError>,
+    /// 固定した元の `statfs.f_type`（疑似 FS の拒否用。#2098）。
+    source_fs_type: &'a dyn Fn(&VerifiedBindSourceFd) -> Result<i64, SysError>,
     /// 移動検査の後・付け替えの直前に呼ぶ（本番は空。結合試験専用の入口だけが差し込む）。
     before_attach: &'a dyn Fn(),
+}
+
+/// 拒否リストの 1 行（疑似 FS の `statfs.f_type` と、mountinfo の fstype 欄の名前）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PseudoFs {
+    /// `statfs.f_type`（include/uapi/linux/magic.h、非 uapi の 3 つはカーネルのソース。値は `sys` の定数）。
+    magic: i64,
+    /// mountinfo の fstype 欄（各 FS の `struct file_system_type` の `.name`）。
+    name: &'static str,
+}
+
+/// bind mount の元として拒否する疑似 FS の**拒否リスト**（#2098・#2065 案 B。SEC-1。SSOT。適用の段だけが使う）。
+///
+/// 一次情報は Linux の `include/uapi/linux/magic.h` と、uapi に無い 3 つ（configfs・mqueue・fusectl）のソース
+/// （`fs/configfs/mount.c`・`ipc/mqueue.c`・`fs/fuse/control.c`）。ホストのプロセス・カーネル・LSM・cgroup 階層・BPF・
+/// 名前空間などの情報や制御口を見せる FS を並べる。`proc` は `linux.maskedPaths`・`readonlyPaths` が効かない別の宛先から
+/// 見えること、`nsfs` は `ip netns` などが通常ファイルへ bind した名前空間の固定（`/run/netns/*`）を辿れてしまうこと、
+/// `mqueue` はホストの IPC namespace の分離を越えること、`devpts`・`binder` は `nodev` で開けないが安全側に倒すこと、
+/// `cgroup`（v1）は CORE-4 で非対応でも元としてはホストの階層を見せるため v2 と同じく拒否すること、が理由。
+/// 通常のデータを持つ FS（ext4・xfs・btrfs・tmpfs・overlayfs・NFS・FUSE など）は拒否しない。
+const PSEUDO_FS_DENYLIST: [PseudoFs; 21] = [
+    PseudoFs {
+        magic: sys::PROC_MAGIC,
+        name: "proc",
+    },
+    PseudoFs {
+        magic: sys::SYSFS_MAGIC,
+        name: "sysfs",
+    },
+    PseudoFs {
+        magic: sys::DEBUGFS_MAGIC,
+        name: "debugfs",
+    },
+    PseudoFs {
+        magic: sys::TRACEFS_MAGIC,
+        name: "tracefs",
+    },
+    PseudoFs {
+        magic: sys::SECURITYFS_MAGIC,
+        name: "securityfs",
+    },
+    PseudoFs {
+        magic: sys::CGROUP_SUPER_MAGIC,
+        name: "cgroup",
+    },
+    PseudoFs {
+        magic: sys::CGROUP2_MAGIC,
+        name: "cgroup2",
+    },
+    PseudoFs {
+        magic: sys::BPF_FS_MAGIC,
+        name: "bpf",
+    },
+    PseudoFs {
+        magic: sys::CONFIGFS_MAGIC,
+        name: "configfs",
+    },
+    PseudoFs {
+        magic: sys::PSTOREFS_MAGIC,
+        name: "pstore",
+    },
+    PseudoFs {
+        magic: sys::EFIVARFS_MAGIC,
+        name: "efivarfs",
+    },
+    PseudoFs {
+        magic: sys::SELINUX_MAGIC,
+        name: "selinuxfs",
+    },
+    PseudoFs {
+        magic: sys::SMACK_MAGIC,
+        name: "smackfs",
+    },
+    PseudoFs {
+        magic: sys::BINFMTFS_MAGIC,
+        name: "binfmt_misc",
+    },
+    PseudoFs {
+        magic: sys::FUSE_CTL_SUPER_MAGIC,
+        name: "fusectl",
+    },
+    PseudoFs {
+        magic: sys::RDTGROUP_SUPER_MAGIC,
+        name: "resctrl",
+    },
+    PseudoFs {
+        magic: sys::XENFS_SUPER_MAGIC,
+        name: "xenfs",
+    },
+    PseudoFs {
+        magic: sys::NSFS_MAGIC,
+        name: "nsfs",
+    },
+    PseudoFs {
+        magic: sys::MQUEUE_MAGIC,
+        name: "mqueue",
+    },
+    PseudoFs {
+        magic: sys::DEVPTS_MAGIC,
+        name: "devpts",
+    },
+    PseudoFs {
+        magic: sys::BINDERFS_SUPER_MAGIC,
+        name: "binder",
+    },
+];
+
+/// 固定した fd の `statfs.f_type` を拒否リストと照合する純関数。
+fn pseudo_fs_by_magic(f_type: i64) -> Option<&'static PseudoFs> {
+    PSEUDO_FS_DENYLIST.iter().find(|p| p.magic == f_type)
+}
+
+/// mountinfo の fstype 欄を拒否リストの名前と**完全一致**で照合する純関数（`fuse.lxcfs` などの派生名は一致しない）。
+fn pseudo_fs_by_name(fstype: &str) -> Option<&'static PseudoFs> {
+    PSEUDO_FS_DENYLIST.iter().find(|p| p.name == fstype)
+}
+
+/// 疑似 FS の拒否を作る。message の末尾には拒否リストの静的な FS 名だけを足す（ホスト側のパスは載せない。SEC-4）。
+fn pseudo_fs_violation(spec: &BindMountSpec, fs: &PseudoFs) -> ExecError {
+    let mut err = violation(spec, ViolationReason::BindSourcePseudoFs);
+    err.message.push_str(&format!(" ({})", fs.name));
+    err
 }
 
 /// 付け替え前後の観測値（[`check_new_bind`] の入力）。
@@ -446,6 +581,12 @@ fn apply_one(
 ) -> Result<BindSourceKind, ExecError> {
     let deps = ctx.deps;
     let PinnedSource { fd: src, dir_ids } = pin_source(spec)?;
+    // 固定した fd の FS の種類を見る（パスで再解決しない）。procfs・sysfs などの疑似 FS は、宛先に何も作る前に拒否する（#2098・SEC-1）。
+    let f_type = (deps.source_fs_type)(&src)
+        .map_err(|e| mount_api_error(spec, e, "fstatfs(bind mount source)"))?;
+    if let Some(fs) = pseudo_fs_by_magic(f_type) {
+        return Err(pseudo_fs_violation(spec, fs));
+    }
     // rootfs（と bundle・その祖先）・状態ルートとの重なりを (st_dev, st_ino) で照合する。mountinfo の照合とは独立の層。
     if let Some(reason) =
         judge_source_inodes(src.dev_ino(), &dir_ids, &ctx.rootfs_ids, &ctx.state_chains)
@@ -504,6 +645,12 @@ fn apply_one(
     let info = (deps.mountinfo)()?;
     check_bind_subtree(&info, observed.own_mnt_id, expected, spec.recursive())
         .map_err(|why| failed(spec, &why))?;
+    // 付け替えた木そのものの fstype を照合する（`rbind` の配下の疑似 FS を含む。検査から複製までの TOCTOU が無い）。
+    match find_pseudo_fs_in_subtree(&info, observed.own_mnt_id, spec.recursive()) {
+        Ok(None) => {}
+        Ok(Some(fs)) => return Err(pseudo_fs_violation(spec, fs)),
+        Err(why) => return Err(failed(spec, &why)),
+    }
     Ok(kind)
 }
 
@@ -1007,6 +1154,8 @@ struct MountInfoEntry<'a> {
     parent: u64,
     options: &'a str,
     optional: Vec<&'a str>,
+    /// 区切り `-` の次の fstype 欄（疑似 FS の照合に使う。出力へは写さない）。
+    fstype: &'a str,
 }
 
 /// mountinfo の 1 行に必須の固定フィールド数（`id parent major:minor root mount_point options`）。
@@ -1029,7 +1178,64 @@ fn parse_mountinfo_line(line: &str) -> Option<MountInfoEntry<'_>> {
         parent: fields.get(1)?.parse().ok()?,
         options: fields.get(5)?,
         optional: fields.get(MOUNTINFO_FIXED_FIELDS..sep)?.to_vec(),
+        fstype: fields.get(sep + 1)?,
     })
+}
+
+/// 自分のマウント（`recursive` なら親子関係で集めた配下全体）を返す。最初の要素が mount top。件数は行数が上限。
+/// 書式の崩れ・該当なし・重複は fail-closed の `Err`。
+fn subtree_members<'a, 'b>(
+    entries: &'b [MountInfoEntry<'a>],
+    own_id: u64,
+    recursive: bool,
+) -> Result<Vec<&'b MountInfoEntry<'a>>, String> {
+    let mut own = entries.iter().filter(|e| e.id == own_id);
+    let Some(top) = own.next() else {
+        return Err("no mount entry found for the bind mount".to_owned());
+    };
+    if own.next().is_some() {
+        return Err("duplicate mount ID in /proc/thread-self/mountinfo".to_owned());
+    }
+    let mut members: Vec<&MountInfoEntry<'_>> = vec![top];
+    if recursive {
+        // 親子関係で配下を集める（件数は行数が上限）。
+        let mut ids = vec![top.id];
+        loop {
+            let before = ids.len();
+            for e in entries {
+                if !ids.contains(&e.id) && ids.contains(&e.parent) {
+                    ids.push(e.id);
+                    members.push(e);
+                }
+            }
+            if ids.len() == before {
+                break;
+            }
+        }
+    }
+    Ok(members)
+}
+
+/// 付け替えた自分のマウント（`recursive` なら配下全体）に拒否リストの疑似 FS があるか、fstype 欄の完全一致で探す純関数
+/// （#2098）。書式に反する行・該当なし・重複は fail-closed の `Err`。
+fn find_pseudo_fs_in_subtree(
+    info: &str,
+    own_id: u64,
+    recursive: bool,
+) -> Result<Option<&'static PseudoFs>, String> {
+    let entries = parse_all_mountinfo(info)?;
+    Ok(subtree_members(&entries, own_id, recursive)?
+        .iter()
+        .find_map(|e| pseudo_fs_by_name(e.fstype)))
+}
+
+fn parse_all_mountinfo(info: &str) -> Result<Vec<MountInfoEntry<'_>>, String> {
+    info.lines()
+        .map(|l| {
+            parse_mountinfo_line(l)
+                .ok_or_else(|| "malformed line in /proc/thread-self/mountinfo".to_owned())
+        })
+        .collect()
 }
 
 /// 自分のマウント（`recursive` なら配下全体）の mountinfo を判定する（純関数）。
@@ -1044,36 +1250,12 @@ fn check_bind_subtree(
     expected: Expected,
     recursive: bool,
 ) -> Result<(), String> {
-    let malformed = || "malformed line in /proc/thread-self/mountinfo".to_owned();
-    let entries: Vec<MountInfoEntry<'_>> = info
-        .lines()
-        .map(|l| parse_mountinfo_line(l).ok_or_else(malformed))
-        .collect::<Result<_, _>>()?;
-    let mut own = entries.iter().filter(|e| e.id == own_id);
-    let Some(top) = own.next() else {
+    let entries = parse_all_mountinfo(info)?;
+    let members = subtree_members(&entries, own_id, recursive)?;
+    let Some(top) = members.first() else {
         return Err("no mount entry found for the bind mount".to_owned());
     };
-    if own.next().is_some() {
-        return Err("duplicate mount ID in /proc/thread-self/mountinfo".to_owned());
-    }
     let has = |e: &MountInfoEntry<'_>, opt: &str| e.options.split(',').any(|o| o == opt);
-    let mut members: Vec<&MountInfoEntry<'_>> = vec![top];
-    if recursive {
-        // 親子関係で配下を集める（件数は行数が上限）。
-        let mut ids = vec![top.id];
-        loop {
-            let before = ids.len();
-            for e in &entries {
-                if !ids.contains(&e.id) && ids.contains(&e.parent) {
-                    ids.push(e.id);
-                    members.push(e);
-                }
-            }
-            if ids.len() == before {
-                break;
-            }
-        }
-    }
     for e in &members {
         if e.optional.iter().any(|f| {
             f.starts_with("shared:") || f.starts_with("master:") || f.starts_with("propagate_from:")
@@ -1703,6 +1885,8 @@ mod tests {
         observe_mod: Option<fn(BindObservation) -> BindObservation>,
         mountinfo: Option<String>,
         umount_fail: bool,
+        /// 固定した元の `f_type` を差し替える（`None` は本番と同じ `sys::fs_type`）。
+        source_fs_type: Option<Result<i64, SysError>>,
     }
 
     fn bits(read_only: bool, noexec: bool) -> i64 {
@@ -1805,6 +1989,10 @@ mod tests {
                 } else {
                     Ok(())
                 }
+            },
+            source_fs_type: &|src| {
+                k.source_fs_type
+                    .unwrap_or_else(|| sys::fs_type(src.as_fd()))
             },
             before_attach: &|| push("before_attach".into()),
         };
@@ -1909,7 +2097,7 @@ mod tests {
     }
 
     /// SEC-1・SEC-4（#2066）: 実ファイルで、状態ルートの同一・祖先・配下（ディレクトリ・通常ファイル）を inode の層が拒否する。
-    /// 保護対象の FS 内パス・dev は無関係な値にして、mountinfo の層では拒否されない条件にする。兄弟は受ける。
+    /// 保護対象の FS 内パス・dev は無関係な値にして、mountinfo の層では拒否されない条件にする。兄弟は受ける。（#2063 の決定 (d)。OCI-4）
     #[test]
     fn sec1_state_root_identity_rejects_same_ancestor_and_descendant_at_apply() {
         let fx = fx();
@@ -1998,7 +2186,7 @@ mod tests {
     }
 
     /// SEC-1（#1915）: rootfs・bundle の実体（`ProtectedFsRoot::contained`）は、元がそれと同一・祖先のときだけ拒否する。
-    /// 保護対象の配下の別の実体を元にすること、同じ FS 上のリンク数 2 以上の通常ファイルは拒否しない。
+    /// 保護対象の配下の別の実体を元にすること、同じ FS 上のリンク数 2 以上の通常ファイルは拒否しない。（#2063 の決定 (d)。OCI-4）
     #[test]
     fn sec1_contained_root_rejects_only_same_or_ancestor_sources() {
         let fx = fx();
@@ -2969,6 +3157,234 @@ mod tests {
         }
     }
 
+    /// SEC-1・SEC-4（#2098）: 拒否リストの表の件数・各行の (magic, name) の具体値・重複なし。
+    #[test]
+    fn sec1_2098_denylist_table_is_exact() {
+        let expected: [(i64, &str); 21] = [
+            (0x9fa0, "proc"),
+            (0x6265_6572, "sysfs"),
+            (0x6462_6720, "debugfs"),
+            (0x7472_6163, "tracefs"),
+            (0x7363_6673, "securityfs"),
+            (0x0027_e0eb, "cgroup"),
+            (0x6367_7270, "cgroup2"),
+            (0xcafe_4a11, "bpf"),
+            (0x6265_6570, "configfs"),
+            (0x6165_676c, "pstore"),
+            (0xde5e_81e4, "efivarfs"),
+            (0xf97c_ff8c, "selinuxfs"),
+            (0x4341_5d53, "smackfs"),
+            (0x4249_4e4d, "binfmt_misc"),
+            (0x6573_5543, "fusectl"),
+            (0x0765_5821, "resctrl"),
+            (0xabba_1974, "xenfs"),
+            (0x6e73_6673, "nsfs"),
+            (0x1980_0202, "mqueue"),
+            (0x1cd1, "devpts"),
+            (0x6c6f_6f70, "binder"),
+        ];
+        let actual: Vec<(i64, &str)> = PSEUDO_FS_DENYLIST
+            .iter()
+            .map(|p| (p.magic, p.name))
+            .collect();
+        assert_eq!(actual, expected);
+        for (i, a) in PSEUDO_FS_DENYLIST.iter().enumerate() {
+            for b in &PSEUDO_FS_DENYLIST[i + 1..] {
+                assert_ne!(a.magic, b.magic);
+                assert_ne!(a.name, b.name);
+            }
+        }
+    }
+
+    /// SEC-1（#2098）: 拒否リストの各値は拒否され、通常の FS は受ける（f_type・fstype 名の両方）。
+    #[test]
+    fn sec1_2098_pseudo_fs_by_magic_and_name() {
+        for p in &PSEUDO_FS_DENYLIST {
+            assert_eq!(pseudo_fs_by_magic(p.magic).map(|x| x.name), Some(p.name));
+            assert_eq!(pseudo_fs_by_name(p.name).map(|x| x.magic), Some(p.magic));
+        }
+        for regular in [
+            0xef53,      // ext4
+            0x5846_5342, // xfs
+            0x9123_683e, // btrfs
+            0x0102_1994, // tmpfs（devtmpfs も同じ値で区別できない）
+            0x794c_7630, // overlayfs
+            0x6573_5546, // FUSE
+            0x6969,      // NFS
+            0x8584_58f6, // ramfs
+            0,
+            -1,
+        ] {
+            assert_eq!(pseudo_fs_by_magic(regular), None, "{regular:#x}");
+        }
+        for name in ["ext4", "tmpfs", "fuse.lxcfs", "overlay", "", "Proc"] {
+            assert_eq!(pseudo_fs_by_name(name), None, "{name}");
+        }
+    }
+
+    /// SEC-1・SEC-4（#2098）: 拒否リストの各 f_type は、宛先に何も作る前に `bind_source_pseudo_fs` で拒否され、
+    /// message はコンテナ内の宛先と FS 名だけを含みホスト側の元のパスを含まない（ディレクトリ・通常ファイルの元）。
+    #[test]
+    fn sec1_2098_pseudo_fs_source_is_rejected_before_any_mount() {
+        let fx = fx();
+        for source in [fx.src("dir"), fx.src("file")] {
+            for p in &PSEUDO_FS_DENYLIST {
+                let set = one("/mnt/x", &source, &[]);
+                let knobs = Knobs {
+                    source_fs_type: Some(Ok(p.magic)),
+                    ..Knobs::default()
+                };
+                let (r, log) = run(&fx, &set, &knobs);
+                let err = r.expect_err("must be rejected");
+                assert_eq!(log, Vec::<String>::new(), "{}", p.name);
+                assert!(!fx.rootfs.join("mnt").exists(), "{}", p.name);
+                assert_eq!(reason_of(&err), Some(ViolationReason::BindSourcePseudoFs));
+                assert_eq!(
+                    (err.code, err.stage),
+                    (ErrorCode::InvalidArgument, IsolationStage::MountBinds)
+                );
+                assert!(
+                    err.message.starts_with("mounts[0] (/mnt/x): "),
+                    "{}",
+                    err.message
+                );
+                assert!(
+                    err.message.ends_with(&format!(" ({})", p.name)),
+                    "{}",
+                    err.message
+                );
+                assert!(!err.message.contains(&source), "{}", err.message);
+            }
+        }
+    }
+
+    /// SEC-1（#2098）: 通常の FS の値なら従来どおり最後まで適用される。
+    #[test]
+    fn sec1_2098_regular_fs_source_is_accepted() {
+        let fx = fx();
+        let set = one("/mnt/x", &fx.src("dir"), &[]);
+        let knobs = Knobs {
+            source_fs_type: Some(Ok(0xef53)),
+            ..Knobs::default()
+        };
+        let (r, log) = run(&fx, &set, &knobs);
+        r.unwrap_or_else(|e| panic!("unexpected error: {e}; log: {log:?}"));
+        assert!(log.iter().any(|l| l.starts_with("move_mount(")), "{log:?}");
+    }
+
+    /// SEC-1・REPAIR-4（#2098）: `fstatfs` の失敗は fail-closed（何も作らない）。対応外は `UNIMPLEMENTED`。
+    #[test]
+    fn sec1_2098_source_fs_type_errors_fail_closed() {
+        let fx = fx();
+        for (e, code) in [
+            (SysError::Unsupported, ErrorCode::Unimplemented),
+            (
+                SysError::Os(sys::EBADF),
+                ExecError::from_sys(SysError::Os(sys::EBADF), STAGE, "x").code,
+            ),
+        ] {
+            let set = one("/mnt/x", &fx.src("dir"), &[]);
+            let knobs = Knobs {
+                source_fs_type: Some(Err(e)),
+                ..Knobs::default()
+            };
+            let (r, log) = run(&fx, &set, &knobs);
+            let err = r.expect_err("must fail");
+            assert_eq!(err.code, code, "{e:?}");
+            assert_eq!(reason_of(&err), None);
+            assert_eq!(log, Vec::<String>::new());
+            assert!(!fx.rootfs.join("mnt").exists());
+        }
+    }
+
+    /// SEC-1（#2098）: 本番の `sys::fs_type` で、実際の procfs（`/proc/sys`。symlink でないディレクトリ）の元が拒否される。
+    #[test]
+    fn sec1_2098_real_procfs_source_is_rejected() {
+        let fx = fx();
+        if !Path::new("/proc/sys").is_dir() {
+            return;
+        }
+        let set = one("/mnt/x", "/proc/sys", &[]);
+        let (r, log) = run(&fx, &set, &Knobs::default());
+        let err = r.expect_err("must be rejected");
+        assert_eq!(reason_of(&err), Some(ViolationReason::BindSourcePseudoFs));
+        assert!(err.message.ends_with(" (proc)"), "{}", err.message);
+        assert_eq!(log, Vec::<String>::new());
+    }
+
+    fn pseudo_mountinfo(child_fstype: &str) -> String {
+        format!(
+            "200 1 0:1 / /x rw,nosuid,nodev - tmpfs none rw\n\
+             201 200 0:2 / /x/c rw,nosuid,nodev - {child_fstype} none rw\n"
+        )
+    }
+
+    /// SEC-1（#2098）: `rbind` の配下に疑似 FS があれば拒否して自分のマウントを外す。非 `rbind` は配下を公開しないため受ける。
+    #[test]
+    fn sec1_2098_rbind_child_pseudo_fs_is_rejected_and_rolled_back() {
+        let fx = fx();
+        let knobs = Knobs {
+            mountinfo: Some(pseudo_mountinfo("proc")),
+            ..Knobs::default()
+        };
+        let set = one("/mnt/x", &fx.src("dir"), &["rbind"]);
+        let (r, log) = run(&fx, &set, &knobs);
+        let err = r.expect_err("must be rejected");
+        assert_eq!(reason_of(&err), Some(ViolationReason::BindSourcePseudoFs));
+        assert!(err.message.ends_with(" (proc)"), "{}", err.message);
+        assert!(log.iter().any(|l| l.starts_with("umount(")), "{log:?}");
+        assert!(!fx.rootfs.join("mnt").exists());
+
+        let set = one("/mnt/x", &fx.src("dir"), &[]);
+        let (r, log) = run(&fx, &set, &knobs);
+        r.unwrap_or_else(|e| panic!("non-recursive must be accepted: {e}; log: {log:?}"));
+    }
+
+    /// SEC-1（#2098）: 配下の照合は孫も見つけ、親が別の行は無視し、書式の崩れは `Err`。
+    #[test]
+    fn sec1_2098_find_pseudo_fs_in_subtree_is_exact() {
+        let tree = "200 1 0:1 / /x rw - tmpfs none rw\n\
+                    201 200 0:2 / /x/c rw - ext4 none rw\n\
+                    202 201 0:3 / /x/c/g rw - cgroup2 none rw\n\
+                    300 1 0:4 / /other rw - proc none rw\n";
+        assert_eq!(
+            find_pseudo_fs_in_subtree(tree, 200, true).map(|o| o.map(|p| p.name)),
+            Ok(Some("cgroup2"))
+        );
+        assert_eq!(find_pseudo_fs_in_subtree(tree, 200, false), Ok(None));
+        assert_eq!(find_pseudo_fs_in_subtree(tree, 201, false), Ok(None));
+        assert_eq!(
+            find_pseudo_fs_in_subtree(tree, 300, false).map(|o| o.map(|p| p.name)),
+            Ok(Some("proc"))
+        );
+        assert!(find_pseudo_fs_in_subtree("garbage\n", 200, true).is_err());
+        assert!(find_pseudo_fs_in_subtree(tree, 999, true).is_err());
+    }
+
+    /// SEC-4（#2098）: 疑似 FS の拒否は `Mount` 監査レコード（理由 `bind_source_pseudo_fs`・コンテナ内の宛先）になる。
+    #[test]
+    fn sec4_2098_pseudo_fs_rejection_becomes_mount_audit_record() {
+        let fx = fx();
+        let set = one("/mnt/x", &fx.src("dir"), &[]);
+        let knobs = Knobs {
+            source_fs_type: Some(Ok(sys::SYSFS_MAGIC)),
+            ..Knobs::default()
+        };
+        let (r, _) = run(&fx, &set, &knobs);
+        let err = r.expect_err("rejected");
+        let sink = VecSink::new(false);
+        let out = audit_mount_violation(err, None, &sink);
+        assert_eq!(out.delivery, AuditDelivery::Recorded);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), AuditLayer::Mount);
+        assert_eq!(
+            recs[0].reason().map(crate::audit_log::AuditReason::as_str),
+            Some("bind_source_pseudo_fs")
+        );
+        assert_eq!(recs[0].path(), Some(Path::new("/mnt/x")));
+    }
+
     /// 新しい 5 理由の具体値（種別・ビヘイビア ID・`ErrorCode`・トークン）。
     #[test]
     fn violation_reasons_have_exact_attributes() {
@@ -2996,6 +3412,11 @@ mod tests {
             (
                 ViolationReason::BindTargetKindMismatch,
                 "bind_target_kind_mismatch",
+                ErrorCode::InvalidArgument,
+            ),
+            (
+                ViolationReason::BindSourcePseudoFs,
+                "bind_source_pseudo_fs",
                 ErrorCode::InvalidArgument,
             ),
         ];
@@ -3148,6 +3569,7 @@ mod tests {
             source_path: &|_| Ok(String::new()),
             source_mnt_id: &|_| Ok(0),
             umount: &|_| Ok(()),
+            source_fs_type: &|_| Ok(0),
             before_attach: &|| {},
         };
         let ctx = Ctx {
@@ -3185,6 +3607,7 @@ mod tests {
             source_path: &|_| Ok(String::new()),
             source_mnt_id: &|_| Ok(0),
             umount: &|_| Ok(()),
+            source_fs_type: &|_| Ok(0),
             before_attach: &|| {},
         };
         let ctx = Ctx {

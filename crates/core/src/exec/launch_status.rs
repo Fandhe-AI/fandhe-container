@@ -20,7 +20,9 @@
 //! 運ぶのは段の名前・`ErrorCode`・任意の違反理由コードだけで、英語メッセージ・パス・errno 文字列は運ばない。
 //! 復号は厳格（単一スペース区切り・フィールド数固定・全トークンが許可リスト内・末尾に余分なバイト無し）で、
 //! 親は固定語彙の許可リストで引き直した静的トークンだけを監査レコードに入れる。`CODE` と `reason` の整合
-//! （`reason.error_code()` との一致）は検査しない: `CODE` は情報用で、記録の有無は `reason` だけで決まるため。
+//! （`reason.error_code()` との一致）は検査しない: `CODE` は情報用で、記録の有無は `reason` だけで決まるため
+//! （段 `mount_binds` と組で受ける user namespace 由来の 2 理由〔#2072〕も同じ規則）。段と理由の整合は
+//! 段つきの許可リスト（[`launch_violation`]）で検査する。
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::AsFd as _;
@@ -55,8 +57,9 @@ pub(super) enum PrePivotStep {
     MountTmpfs,
     /// ファイルの注入。
     InjectFiles,
-    /// 検証済み bind mount の適用（指定時のみ。#1914）。違反理由のうち user namespace 由来の拒否は
-    /// PlanRejected 種別のため許可リストに入らず、理由なしで親へ届く（失敗として報告される点は同じ）。
+    /// 検証済み bind mount の適用（指定時のみ。#1914）。user namespace 由来の 2 理由（SEC-5。
+    /// `ViolationReason::MOUNT_BINDS_USER_NAMESPACE_REASONS`）は、この段に限って許可リストに入り、
+    /// 親へ届いて層 `mount` に記録される（#2072）。他の段では `Malformed`。
     MountBinds,
     /// 読み取り専用にするパスの固定集合の適用（`setup` の有無によらず常に走る。#1850）。
     ReadonlyPaths,
@@ -130,6 +133,22 @@ pub(super) const ALL_ERROR_CODES: [ErrorCode; 9] = [
     ErrorCode::Unavailable,
 ];
 
+/// 段つきの許可リスト照合（子の符号化と親の復号で共有する唯一の規則。#2072）。
+///
+/// `ViolationReason::from_launch_token` が通す理由に加え、段 `MountBinds` に限って user namespace 由来の 2 理由
+/// （SEC-5）を `Some` にする。子は untrusted なので、文字列は固定語彙の走査で静的な値へ引き直す。
+fn launch_violation(step: PrePivotStep, token: &str) -> Option<ViolationReason> {
+    if let Some(r) = ViolationReason::from_launch_token(token) {
+        return Some(r);
+    }
+    if step != PrePivotStep::MountBinds {
+        return None;
+    }
+    ViolationReason::MOUNT_BINDS_USER_NAMESPACE_REASONS
+        .into_iter()
+        .find(|r| r.as_str() == token)
+}
+
 /// 子が報告する pivot 前段の失敗。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PrePivotFailure {
@@ -145,7 +164,7 @@ impl PrePivotFailure {
         let violation = error
             .violation
             .as_ref()
-            .and_then(|v| ViolationReason::from_launch_token(v.reason.as_str()));
+            .and_then(|v| launch_violation(step, v.reason.as_str()));
         Self {
             step,
             code: error.code,
@@ -238,10 +257,7 @@ impl PrePivotStatus {
                 let violation = if *reason == "-" {
                     None
                 } else {
-                    Some(
-                        ViolationReason::from_launch_token(reason)
-                            .ok_or(PrePivotStatusError::Malformed)?,
-                    )
+                    Some(launch_violation(step, reason).ok_or(PrePivotStatusError::Malformed)?)
                 };
                 Ok(Self::Failed(PrePivotFailure {
                     step,
@@ -381,6 +397,35 @@ pub(super) fn read_line_bounded<const N: usize>(
             Err(_) => return Err(PrePivotStatusError::Io),
         }
     }
+}
+
+/// 結合試験専用: 段 `mount_binds` の違反 `reason` を、子の符号化・状態 pipe・親の復号と記録まで本番と同じ関数で
+/// 往復させる（SEC-4・SEC-5・REPAIR-10・#2072）。通常の利用者は呼ばない。
+///
+/// 子の失敗（`ExecError::from_violation_at(reason, None, MountBinds)`）を `report_failure` で pipe へ書き、
+/// `read_pre_pivot_status` で読んで `resolve_pre_pivot_status` に渡す。許可リスト外の理由は子で落ちて理由なしで届く。
+#[doc(hidden)]
+#[cfg(feature = "exec-test-support")]
+pub fn relay_mount_binds_failure_for_test(
+    reason: ViolationReason,
+    sink: &dyn AuditSink,
+    container: Option<&ContainerId>,
+) -> Result<(), Box<AuditedRejection<ExecError>>> {
+    let (r, w) = std::io::pipe().map_err(|e| {
+        Box::new(AuditedRejection::not_applicable(ExecError::from_io(
+            &e,
+            IsolationStage::Spawn,
+            "create the test pipe",
+        )))
+    })?;
+    let w = std::fs::File::from(std::os::fd::OwnedFd::from(w));
+    let r = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+    let error = ExecError::from_violation_at(reason, None, IsolationStage::MountBinds);
+    let failure = PrePivotFailure::from_exec_error(PrePivotStep::MountBinds, &error);
+    report_failure(&w, &failure).map_err(|e| Box::new(AuditedRejection::not_applicable(e)))?;
+    drop(w);
+    let status = read_pre_pivot_status(&r, Duration::from_secs(5));
+    resolve_pre_pivot_status(status, LaunchAudit { sink, container })
 }
 
 /// 起動時の監査の渡し先（借用。`LaunchSpec` に載せない理由: `Debug + Clone + PartialEq + Eq` の値型に
@@ -558,7 +603,7 @@ mod tests {
                 reasons.extend(
                     ViolationReason::ALL
                         .into_iter()
-                        .filter(|r| ViolationReason::from_launch_token(r.as_str()) == Some(*r))
+                        .filter(|r| launch_violation(step, r.as_str()) == Some(*r))
                         .map(Some),
                 );
                 for v in reasons {
@@ -575,7 +620,7 @@ mod tests {
     /// 厳格な復号: 許可リスト外・形式違反は `Malformed`（SEC-4）。
     #[test]
     fn sec4_1815_decode_rejects_malformed_lines() {
-        let cases: [&[u8]; 14] = [
+        let cases: [&[u8]; 18] = [
             b"",
             b"P",
             b"P\n\n",
@@ -590,6 +635,11 @@ mod tests {
             b"F establish INTERNAL exec_target_cgroup_mismatch\n",
             b"F establish INTERNAL plan_rejected\n",
             b"F establish INTERNAL no_namespaces\n",
+            // #2072: user namespace 由来の 2 理由は段 mount_binds と組のときだけ受ける。
+            b"F establish INTERNAL user_namespace_required\n",
+            b"F prepare_rootfs FAILED_PRECONDITION host_root_identity_mapping\n",
+            b"F mount_binds INVALID_ARGUMENT no_namespaces\n",
+            b"F mount_binds INVALID_ARGUMENT user_namespace_required \n",
         ];
         for c in cases {
             assert_eq!(
@@ -704,6 +754,71 @@ mod tests {
         let e = ExecError::from_violation(ViolationReason::PathMissing, None);
         let f = PrePivotFailure::from_exec_error(PrePivotStep::PrepareRootfs, &e);
         assert_eq!(f.violation, Some(ViolationReason::PathMissing));
+    }
+
+    /// #2072: 段 mount_binds の user namespace 由来の 2 理由は子で残り、符号化・復号で往復する。
+    /// 他の段・他の PlanRejected 理由は子で落ちる。
+    #[test]
+    fn sec4_2072_mount_binds_user_namespace_reasons_roundtrip() {
+        for (reason, code, line) in [
+            (
+                ViolationReason::UserNamespaceRequired,
+                ErrorCode::InvalidArgument,
+                &b"F mount_binds INVALID_ARGUMENT user_namespace_required\n"[..],
+            ),
+            (
+                ViolationReason::HostRootIdentityMapping,
+                ErrorCode::FailedPrecondition,
+                &b"F mount_binds FAILED_PRECONDITION host_root_identity_mapping\n"[..],
+            ),
+        ] {
+            let e = ExecError::from_violation_at(reason, None, IsolationStage::MountBinds);
+            let f = PrePivotFailure::from_exec_error(PrePivotStep::MountBinds, &e);
+            assert_eq!(f.code, code);
+            assert_eq!(f.violation, Some(reason));
+            assert_eq!(PrePivotStatus::Failed(f).encode().as_bytes(), line);
+            assert_eq!(PrePivotStatus::decode(line), Ok(PrePivotStatus::Failed(f)));
+            let other = PrePivotFailure::from_exec_error(PrePivotStep::PrepareRootfs, &e);
+            assert_eq!(other.violation, None);
+        }
+        let e = ExecError::from_violation_at(
+            ViolationReason::NoNamespaces,
+            None,
+            IsolationStage::MountBinds,
+        );
+        let f = PrePivotFailure::from_exec_error(PrePivotStep::MountBinds, &e);
+        assert_eq!(f.violation, None);
+    }
+
+    /// #2072: 親は 2 理由を層 mount のパスなし・理由コードつきで 1 件記録する。
+    #[test]
+    fn sec4_2072_resolve_records_mount_binds_user_namespace_reasons() {
+        for (reason, token) in [
+            (
+                ViolationReason::UserNamespaceRequired,
+                "user_namespace_required",
+            ),
+            (
+                ViolationReason::HostRootIdentityMapping,
+                "host_root_identity_mapping",
+            ),
+        ] {
+            let sink = VecSink::new(false);
+            let status = fail(PrePivotStep::MountBinds, reason.error_code(), Some(reason));
+            let r = resolve_pre_pivot_status(Ok(status), audit(&sink, None)).unwrap_err();
+            assert_eq!(r.delivery, AuditDelivery::Recorded);
+            assert_eq!(r.error.stage, IsolationStage::MountBinds);
+            assert_eq!(r.error.code, reason.error_code());
+            assert_eq!(
+                r.error.violation.as_ref().map(|v| v.reason.as_str()),
+                Some(token)
+            );
+            let recs = sink.snapshot();
+            assert_eq!(recs.len(), 1);
+            assert_eq!(recs[0].layer(), AuditLayer::Mount);
+            assert_eq!(recs[0].path(), None);
+            assert!(format!("{:?}", recs[0]).contains(token), "{token}");
+        }
     }
 
     fn audit<'a>(sink: &'a VecSink, id: Option<&'a ContainerId>) -> LaunchAudit<'a> {

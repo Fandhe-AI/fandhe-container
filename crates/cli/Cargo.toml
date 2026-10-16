@@ -34,14 +34,28 @@ fandhe-container-supervisor = { path = "../supervisor" }
 # 含めない。リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。依存は増えない。
 [features]
 signal-test-support = []
+# start-test-support: start が systemd-run を解決する入口に、環境変数 `FANDHE_CONTAINER_TEST_SYSTEMD_RUN`（絶対パス）による
+# 差し替えを足す（偽の systemd-run で既定集合の結合試験を動かすため。#2081・CORE-3）。既定のビルドには含めず、
+# リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。依存は増えない。
+start-test-support = []
 
 # 自己参照の dev-dependency（supervisor・core と同じ仕組み。外部クレートの追加ではない）: cli 自身のテストでは
-# `signal-test-support` を常に有効にし、試験専用の入口を使う結合試験（signal_forward）が `cargo test --workspace`
+# `signal-test-support`・`start-test-support` を常に有効にし、試験専用の入口を使う結合試験（signal_forward）が `cargo test --workspace`
 # の既定のテスト集合から外れないようにする。通常のビルド（`cargo build`・リリース成果物）は dev-dependency を
 # 解決しないため、feature は無効のまま。
 [dev-dependencies]
-fandhe-container-cli = { path = ".", features = ["signal-test-support"] }
+fandhe-container-cli = { path = ".", features = ["signal-test-support", "start-test-support"] }
 
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true
+
+# 実機前提の結合試験（#2081）。`harness = false` の単一 main で、`-- --ignored` のときだけ実機シナリオを動かす。
+[[test]]
+name = "start_scope_real"
+harness = false
+
+# 実機前提の結合試験（#2061）。`harness = false` の単一 main で、`-- --ignored` のときだけ実機シナリオを動かす。
+[[test]]
+name = "delete_cgroup_real"
+harness = false

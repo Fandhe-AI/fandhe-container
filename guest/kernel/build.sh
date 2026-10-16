@@ -52,6 +52,12 @@ USAGE
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$script_dir/../.." && pwd)"
+# lib.sh は source 時に cwd をリポジトリルートへ移す（make 経由と同じ意味にするため）。本スクリプトは
+# 利用者の相対パスを呼び出し元の cwd 基準で解釈するので、source 後に元の cwd へ戻す。
+caller_pwd="$PWD"
+# shellcheck source=../../scripts/lib.sh
+source "$root/scripts/lib.sh"
+cd -- "$caller_pwd" || { err bad-environment "cannot return to the working directory"; exit 2; }
 
 output_dir="${GUEST_KERNEL_OUTPUT_DIR:-}"
 tarball_arg="${GUEST_KERNEL_TARBALL:-}"
@@ -251,23 +257,15 @@ if [ -z "$jobs" ]; then
     [ "$jobs" -ge 1 ] || jobs=1
 fi
 
-# --- 一時領域と期限つき実行（scripts/generate-third-party-licenses.sh と同じ見張り役方式） ---
+# --- 一時領域と期限つき実行（scripts/lib.sh の run_limited） ---
 work_dir=""
-child_pid=""
-wd_pid=""
 out_created=0
 lock_dir=""
 publishing=0
 published=""
 cleanup() {
     local rc=$?
-    if [ -n "$child_pid" ]; then
-        kill -TERM -- "-$child_pid" 2>/dev/null || true
-        kill -KILL -- "-$child_pid" 2>/dev/null || true
-    fi
-    if [ -n "$wd_pid" ]; then
-        kill "$wd_pid" 2>/dev/null || true
-    fi
+    run_limited_abort
     [ -z "$work_dir" ] || rm -rf "$work_dir"
     # 出力先の排他ロックを持つ間に始めた公開だけを回収する（ロックを持たない側は触らない）。
     if [ "$rc" -ne 0 ] && [ "$publishing" -eq 1 ]; then
@@ -284,6 +282,7 @@ trap cleanup EXIT
 trap 'exit 143' INT TERM
 
 work_dir="$(mktemp -d)" || { work_dir=""; err bad-environment "cannot create a temporary directory"; exit 2; }
+RUN_LIMITED_DIR="$work_dir"
 
 # 出力先の排他ロック（mkdir は不可分）。同じ出力先への同時実行は後発を拒否し、
 # 「既存の出力を上書きしない」契約を守る。ロック確保後に空であることを再検査する。
@@ -309,52 +308,6 @@ if [ -d "$output_dir" ]; then
         exit 2
     fi
 fi
-
-# 子プロセスを上限秒で打ち切る。子は job control（set -m）で独立したプロセスグループにし、
-# 超過時はグループ全体へ TERM → 猶予後 KILL を送って消滅を確認する。超過時は 124 を返す。
-run_limited() {
-    local limit="$1"
-    shift
-    local marker="$work_dir/timeout-marker"
-    rm -f "$marker"
-    set -m
-    "$@" &
-    local pid=$!
-    set +m
-    child_pid="$pid"
-    (
-        i=0
-        while [ "$i" -lt "$limit" ]; do
-            sleep 1
-            kill -0 "$pid" 2>/dev/null || exit 0
-            i=$((i + 1))
-        done
-        : >"$marker"
-        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-        sleep 2
-        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-    ) &
-    wd_pid=$!
-    local rc=0
-    wait "$pid" || rc=$?
-    if [ -e "$marker" ]; then
-        wait "$wd_pid" 2>/dev/null || true
-        local n=0
-        while kill -0 -- "-$pid" 2>/dev/null && [ "$n" -lt 5 ]; do
-            sleep 1
-            n=$((n + 1))
-        done
-        wd_pid=""
-        child_pid=""
-        rm -f "$marker"
-        return 124
-    fi
-    kill "$wd_pid" 2>/dev/null || true
-    wait "$wd_pid" 2>/dev/null || true
-    wd_pid=""
-    child_pid=""
-    return "$rc"
-}
 
 # --- 取得 ---
 tarball="$tarball_arg"

@@ -1,11 +1,13 @@
 //! `mount(2)` の薄いラッパー（`unsafe` はこのモジュールに閉じる。#1823 の事前承認の範囲・MAC-1）。
 //!
-//! ゲスト init が `/proc`・`/sys`・`/dev` と virtiofs の mount に使う。安全な関数だけを公開し、
-//! `unsafe fn` は外へ出さない。`extern "C"` 宣言は自前（外部クレートを使わない）。#1318 の `libc` との
+//! ゲスト init が `/proc`・`/sys`・`/dev` と virtiofs の mount に使う。公開するのは用途別の安全な関数
+//! （virtiofs・proc・sysfs・devtmpfs）だけで、任意の flags / data は型の上で渡せない（`MS_BIND`・
+//! `MS_MOVE`・`MS_REMOUNT` を呼び出し側が組めない。REPAIR-2）。`unsafe fn` は外へ出さない。`extern "C"` 宣言は自前（外部クレートを使わない）。#1318 の `libc` との
 //! 機械照合はこの crate には未導入で、フラグ定数は固定値テストで照合する。
 //!
 //! 定数は x86_64 / aarch64 の Linux で同値だが、他アーキテクチャへ流用しない（`SUPPORTED` が偽なら
-//! `ENOSYS` を返して何も呼ばない）。
+//! `ENOSYS` を返して何も呼ばない）。`c_ulong` が u64 になる LP64 だけを対象にし、x32・ILP32 は `ENOSYS`
+//! とする。
 
 use std::ffi::CString;
 use std::io;
@@ -13,16 +15,20 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 /// 対応アーキテクチャ（定数を検証済みのもの）。
-const SUPPORTED: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
+/// `c_ulong` が u64 になる LP64 に限る（x32・ILP32 は除外）。
+const SUPPORTED: bool = cfg!(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    target_pointer_width = "64"
+));
 
 /// 読み取り専用。
-pub const MS_RDONLY: u64 = 1;
+const MS_RDONLY: u64 = 1;
 /// setuid / setgid を無効にする。
-pub const MS_NOSUID: u64 = 2;
+const MS_NOSUID: u64 = 2;
 /// デバイスファイルを無効にする。
-pub const MS_NODEV: u64 = 4;
+const MS_NODEV: u64 = 4;
 /// 実行を禁止する。
-pub const MS_NOEXEC: u64 = 8;
+const MS_NOEXEC: u64 = 8;
 /// `open(2)` で制御端末にしない。
 pub const O_NOCTTY: i32 = 0o400;
 
@@ -47,8 +53,20 @@ fn cstring(bytes: &[u8]) -> io::Result<CString> {
     CString::new(bytes).map_err(|_| io::Error::from_raw_os_error(22))
 }
 
-/// `mount(source, target, fstype, flags, data)` を呼ぶ。失敗は直後の errno を `io::Error` で返す。
-pub fn mount_fs(
+/// virtiofs の mount flags（nosuid・nodev は fail-closed の既定。`ro` は必ず `MS_RDONLY`）。
+fn virtiofs_flags(read_only: bool) -> u64 {
+    let flags = MS_NOSUID | MS_NODEV;
+    if read_only { flags | MS_RDONLY } else { flags }
+}
+
+/// proc・sysfs の flags（nosuid・nodev・noexec）。
+const PSEUDO_STRICT: u64 = MS_NOSUID | MS_NODEV | MS_NOEXEC;
+/// devtmpfs の flags（デバイスノードを置くため nodev は付けない）。
+const DEVTMPFS_FLAGS: u64 = MS_NOSUID | MS_NOEXEC;
+
+/// `mount(source, target, fstype, flags, data)` を呼ぶ。本モジュール内の用途別関数だけが呼ぶ。
+/// 失敗は直後の errno を `io::Error` で返す。
+fn mount_raw(
     source: &str,
     target: &Path,
     fstype: &str,
@@ -66,8 +84,9 @@ pub fn mount_fs(
         d.as_ptr().cast::<core::ffi::c_void>()
     });
     // SAFETY: `source`・`target`・`fstype` は NUL 終端の `CString` で、この呼び出しが戻るまで生存する。
-    // `data` は null か、同様に生存する NUL 終端文字列（virtiofs では使わず、devtmpfs の `mode=0755` のみ）。
-    // `flags` は `c_ulong`（u64）と同幅。mount(2) はポインタ先を読むだけで保持しない。
+    // `data` は null か、同様に生存する NUL 終端文字列（呼び出し元は本モジュールの用途別関数だけで、
+    // devtmpfs の `mode=0755` 固定か null）。`flags` は `c_ulong`（u64、LP64 のみ `SUPPORTED`）と同幅。
+    // mount(2) はポインタ先を読むだけで保持しない。errno は直後に取る。
     let rc = unsafe {
         mount(
             source.as_ptr(),
@@ -85,6 +104,32 @@ pub fn mount_fs(
     }
 }
 
+/// virtiofs（`tag`）を `target` へ mount する。`init` の `GuestOps::mount_virtiofs` から呼ばれる（MAC-1）。
+pub fn mount_virtiofs(tag: &str, target: &Path, read_only: bool) -> io::Result<()> {
+    mount_raw(tag, target, "virtiofs", virtiofs_flags(read_only), None)
+}
+
+/// proc を `target` へ mount する（nosuid・nodev・noexec）。
+pub fn mount_proc(target: &Path) -> io::Result<()> {
+    mount_raw("proc", target, "proc", PSEUDO_STRICT, None)
+}
+
+/// sysfs を `target` へ mount する（nosuid・nodev・noexec）。
+pub fn mount_sysfs(target: &Path) -> io::Result<()> {
+    mount_raw("sysfs", target, "sysfs", PSEUDO_STRICT, None)
+}
+
+/// devtmpfs を `target` へ mount する（nosuid・noexec、`mode=0755` 固定）。
+pub fn mount_devtmpfs(target: &Path) -> io::Result<()> {
+    mount_raw(
+        "devtmpfs",
+        target,
+        "devtmpfs",
+        DEVTMPFS_FLAGS,
+        Some("mode=0755"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,15 +144,36 @@ mod tests {
     }
 
     #[test]
+    fn mac1_virtiofs_flags_compose() {
+        assert_eq!(virtiofs_flags(true), 7);
+        assert_eq!(virtiofs_flags(false), 6);
+    }
+
+    #[test]
+    fn mac1_pseudo_flags_compose() {
+        assert_eq!(PSEUDO_STRICT, 14);
+        assert_eq!(DEVTMPFS_FLAGS, 10);
+    }
+
+    #[test]
+    #[cfg(all(
+        any(target_arch = "x86_64", target_arch = "aarch64"),
+        target_pointer_width = "64"
+    ))]
+    fn mac1_supported_on_lp64_targets() {
+        const { assert!(SUPPORTED) };
+    }
+
+    #[test]
     fn mac1_mount_rejects_nul_with_einval() {
-        let e = mount_fs("a\0b", Path::new("/nonexistent"), "virtiofs", 0, None).unwrap_err();
+        let e = mount_virtiofs("a\0b", Path::new("/nonexistent"), false).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(22));
     }
 
     #[test]
     fn mac1_mount_of_unknown_fs_fails_without_effect() {
         // 存在しない fstype・target への mount は権限の有無に関わらず失敗し、何も mount されない。
-        let e = mount_fs(
+        let e = mount_raw(
             "x",
             Path::new("/nonexistent-fandhe-guest-init"),
             "nosuchfs",
@@ -115,6 +181,12 @@ mod tests {
             None,
         )
         .unwrap_err();
+        assert!(e.raw_os_error().is_some_and(|n| n > 0));
+    }
+
+    #[test]
+    fn mac1_mount_proc_to_missing_target_fails() {
+        let e = mount_proc(Path::new("/nonexistent-fandhe-guest-init")).unwrap_err();
         assert!(e.raw_os_error().is_some_and(|n| n > 0));
     }
 }

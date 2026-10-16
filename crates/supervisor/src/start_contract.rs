@@ -14,7 +14,12 @@
 //! - 契約の fd は 0〜2 のみ。supervisor は入口（`start_entry`）で fd [`FIRST_INHERITED_FD`] 以降を閉じる
 //!   （特権ランチャーと同じ処理。#2070・SEC-1）。呼び出し側が追加の fd を渡しても使われない。exec から入口までの
 //!   短い窓は残る（CLI は CLOEXEC の無い fd を自分では閉じない）。
-//! - 環境変数は契約に含めない（supervisor は契約の値を環境から読まない）。
+//! - 環境変数は契約に含めない（supervisor は契約の値を環境から読まない）。CLI が渡す環境は `PATH`（固定値）と
+//!   `XDG_RUNTIME_DIR`（systemd-run が user マネージャへ接続するため。supervisor は読まない）だけである。
+//! - 委譲スコープ（#2081・CORE-3・CORE-4）: `DelegatedCgroup::prepare` は親 cgroup に自分以外のプロセスがいると拒否するため、
+//!   CLI は supervisor を [`USER_SCOPE_WRAPPER_ARGS`] で包んで起動する（`systemd-run <引数> <supervisor の絶対パス> start ...`）。
+//!   systemd-run は scope の登録後に同じプロセスでコマンドを exec する（`man systemd-run` の scope の説明と systemd の
+//!   `src/run/run.c` の `start_transient_scope`）ため、spawn した pid・プロセスグループ・stdio はそのまま supervisor のものになる。
 //! - stdin は `/dev/null`、**stdout は結果を通知する pipe の書き込み端**（supervisor は報告を 1 行書いたら以後 stdout に
 //!   何も書かない）、stderr は呼び出し側が選ぶ。supervisor の構造化ログは supervisor 自身が
 //!   `<root>/@supervisor-logs/` へ保存する（[`crate::supervisor_log`]。#2067）ので、呼び出し側の stderr へ行くのは fd 2 へ
@@ -56,6 +61,12 @@ use crate::restart::RestartPolicy;
 
 /// supervisor の入口とランチャーが閉じ始める fd 番号（0〜2 は契約の stdin / stdout / stderr。SEC-1・#2070）。
 pub const FIRST_INHERITED_FD: u32 = 3;
+/// supervisor を委譲された新しい cgroup scope で起動するための `systemd-run` の引数（#2081・CORE-3・CORE-4）。
+///
+/// CLI の `start` と実機試験（`supervisor_bin_real`）の唯一の出所。後ろに supervisor の絶対パスと契約の argv が続く。
+/// `--unit` は付けない（名前を決め打ちすると残った scope と衝突して start が落ちうるため）。
+pub const USER_SCOPE_WRAPPER_ARGS: [&str; 6] =
+    ["--user", "--scope", "--quiet", "-p", "Delegate=yes", "--"];
 /// 報告の先頭トークン（契約の版。互換性のない変更では数字を上げる）。
 pub const REPORT_MAGIC: &str = "FCSUP1";
 /// 報告 1 行（終端の `\n` を含む）の最大バイト数。
@@ -343,6 +354,15 @@ pub fn cli_receive_deadline(timeouts: &StartTimeouts) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    /// CORE-3・SUP-1: 委譲 scope の包み込みの引数は固定（CLI と実機試験が同じ値を使う。#2081）。
+    #[test]
+    fn sup1_core3_user_scope_wrapper_args_are_fixed() {
+        assert_eq!(
+            super::USER_SCOPE_WRAPPER_ARGS,
+            ["--user", "--scope", "--quiet", "-p", "Delegate=yes", "--"]
+        );
+    }
+
     use super::*;
 
     /// 絶対パスの fixture（Windows の `Path::is_absolute` はドライブ接頭辞を要する。CLI-1）。

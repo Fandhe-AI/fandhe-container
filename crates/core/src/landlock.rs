@@ -28,12 +28,18 @@ use std::fmt;
 use std::num::NonZeroU32;
 
 mod apply;
+mod mounted;
 mod rules;
 pub use apply::{
     LandlockApplyError, LandlockApplyErrorKind, LandlockApplyReport,
     LandlockEnforcementObservation, observe_landlock_enforcement,
 };
-pub(crate) use apply::{apply_landlock_ruleset, apply_landlock_ruleset_with};
+pub(crate) use apply::{
+    apply_landlock_ruleset, apply_landlock_ruleset_with, observe_mount_beneath,
+};
+#[cfg(test)]
+pub(crate) use mounted::MountIdentity;
+pub(crate) use mounted::{MountCheck, MountedBy, MountedTarget, MountedTargets};
 pub(crate) use rules::handled_for_abi;
 pub use rules::{
     AccessFs, LandlockRuleError, LandlockRuleErrorKind, LandlockRuleset, MAX_LANDLOCK_RULES,

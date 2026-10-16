@@ -11,7 +11,7 @@
 | 項目 | 内容 |
 | ---- | ---- |
 | restart の再 launch（#491） | supervisor の再 launch は本番 launcher の単一スレッド要求で拒否される（#2043）。#2043 が入るまで `make restart-latency` は再起動未観測（終了コード 1）になり数値は出ない。`make supervisor-independence` の `--check-restart` も同じ |
-| 計測の権限（#485・#219） | supervisor は入口で `PR_SET_DUMPABLE=0` にする（SUP-14）。同じ利用者の非 root からも `/proc/<pid>/exe`・`smaps_rollup` を読めない。一方 supervisor は rootful 起動を拒否する（SEC-5）。#485 は「root が計測し、supervisor は非 root で起動する」2 つのシェルで行う。#219 の own は 1 つのスクリプトが起動と PSS の読み取りを行うため両立せず、非 root では `unreadable-memory-value` で fail-closed になり、root では起動前に終了コード 3 になる。特権の橋渡しは未実装で、別途判断が要る（SUP-14 に関わる） |
+| 計測の権限（#485・#219） | supervisor は入口で `PR_SET_DUMPABLE=0` にする（SUP-14）。同じ利用者の非 root からも `/proc/<pid>/exe`・`smaps_rollup` を読めない。一方 supervisor は rootful 起動を拒否する（SEC-5）。#485 は「root が計測し、supervisor は非 root で起動する」2 つのシェルで行う。#219 の own は 1 つのスクリプトが起動と PSS の読み取りを行うため両立せず、非 root では `unreadable-memory-value` で fail-closed になり、root では起動前に終了コード 3 になる。特権の橋渡しは #2090 で案 A（計測だけ root、起動は対象の利用者へ降格）に決定済み。実装は #2099（未実装） |
 | supervisor の停止 | SIGTERM のハンドラは無くコンテナを止めない。CLI の `stop` は未実装（#1544）。スクリプトは記録した pid・起動時刻の同一性を照合して子孫へ SIGKILL を送り、状態ルートごと削除する。CLI の `delete` は呼ばない |
 | バックオフ（#491） | supervisor の bin にバックオフを指定する引数は無く、既定 100ms 固定（`crates/supervisor/src/restart.rs` の `DEFAULT_BACKOFF`）。計測値はバックオフを含むため、スクリプトは差し引いた値も出す |
 

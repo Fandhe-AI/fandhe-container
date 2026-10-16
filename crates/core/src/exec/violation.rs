@@ -173,8 +173,17 @@ pub enum ViolationReason {
     BindSourceContainsRootfs,
     /// bind mount の元（または配下のマウント）が状態ストアのルートに到達する。適用の段が固定した元に対して判定する（#1915。SEC-1）。
     BindSourceReachesStateRoot,
+    /// bind mount の元（または `rbind` で公開される配下のマウント）が procfs・sysfs などの疑似 FS 上にある。
+    /// 適用の段が固定した fd の `fstatfs` の `f_type` と、付け替えた木の mountinfo の fstype で判定する（#2098・#2065 案 B。SEC-1）。
+    BindSourcePseudoFs,
     /// bind mount 先の既存の種別が元と合わない（ディレクトリと通常ファイルの取り違え等。#1913。SEC-1）。
     BindTargetKindMismatch,
+    /// Landlock の適用時に、Mount 由来のルールの対象のマウント ID（`mnt_id`）が、pivot 前段が載せた直後に記録した
+    /// ものと違う（記録後にマウントが差し替えられた。CORE-5・SEC-1・SEC-4・#2071）。
+    LandlockMountIdentityMismatch,
+    /// Landlock の適用時に、Mount 由来のルールの対象がマウントのルートでない（マウントの内側のディレクトリを
+    /// 指している。CORE-5・SEC-1・SEC-4・#2071）。
+    LandlockMountNotRoot,
     /// rootless の基本デバイスノードの bind 元（ホストの `/dev/<名前>`）が、期待する文字デバイスではない
     /// （symlink・通常ファイル・ディレクトリ、または `rdev` が固定表と違う）。bind せずに拒否する
     /// （TASK-29 追補・#1660。CORE-6・SEC-5）。
@@ -381,7 +390,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 58] = [
+    pub(super) const ALL: [ViolationReason; 61] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -415,7 +424,10 @@ impl ViolationReason {
         Self::BindSourceNotAccessible,
         Self::BindSourceContainsRootfs,
         Self::BindSourceReachesStateRoot,
+        Self::BindSourcePseudoFs,
         Self::BindTargetKindMismatch,
+        Self::LandlockMountIdentityMismatch,
+        Self::LandlockMountNotRoot,
         Self::HostDeviceNodeUnexpected,
         Self::RootfsIsHostRoot,
         Self::RootfsOnSharedMount,
@@ -466,9 +478,28 @@ impl ViolationReason {
     ///
     /// 対象は `MountTarget`・`SharedPropagation`・`RootfsPivot`（[`IsolationViolation::mount_audit_event`] と同じ範囲）。
     /// 子から無制限長のパスを運ばないため、パスは載せない。
+    ///
+    /// 加えて、bind mount の段（`MountBinds`）が user namespace 由来で拒否した 2 理由
+    /// （[`Self::MOUNT_BINDS_USER_NAMESPACE_REASONS`]。SEC-5・#2072）も同じ形で写す。共有の写像
+    /// （`mount_layer_audit_event`）は広げないため、`plan()` 時点の拒否や worker の経路の記録は変わらない。
     pub(super) fn launch_mount_audit_event(self) -> Option<AuditEvent> {
-        self.mount_layer_audit_event(None)
+        if let Some(event) = self.mount_layer_audit_event(None) {
+            return Some(event);
+        }
+        if Self::MOUNT_BINDS_USER_NAMESPACE_REASONS.contains(&self) {
+            return Some(AuditEvent::Mount {
+                path: None,
+                reason: Some(AuditReason::new(self.as_str())),
+            });
+        }
+        None
     }
+
+    /// bind mount の段（`PrePivotStep::MountBinds`）が user namespace の状態で拒否する理由（SEC-5・SEC-4・#2072）。
+    /// 種別は `PlanRejected` のため [`Self::from_launch_token`] は通さず、`launch_status` が段 `mount_binds` と
+    /// 組のときだけ追加で受ける。理由の集合の唯一の定義。
+    pub(super) const MOUNT_BINDS_USER_NAMESPACE_REASONS: [Self; 2] =
+        [Self::UserNamespaceRequired, Self::HostRootIdentityMapping];
 
     /// マウント層（`MountTarget`・`SharedPropagation`・`RootfsPivot`）の理由なら、理由コードつきの
     /// `Mount` 監査イベントを返す。それ以外の種別は `None`（#1701）。
@@ -488,6 +519,22 @@ impl ViolationReason {
             | ViolationKind::EvidenceMismatch
             | ViolationKind::Entrypoint
             | ViolationKind::ExecTarget => None,
+        }
+    }
+
+    /// Landlock 適用の失敗の種別から、対応する違反理由を引く（Mount 由来のルールの識別子の照合の違反だけ。
+    /// 他は分離違反の試行ではないため `None`。CORE-5・SEC-4・#2071）。
+    ///
+    /// launch 経路（`MountCheck::Recorded`）でのみ生じる。exec の再適用（worker の経路）は `NotRecorded` で
+    /// 照合しないため、これらは `EXEC_WORKER_REASONS` に含めない。
+    pub(super) fn from_landlock_apply_kind(
+        kind: &crate::landlock::LandlockApplyErrorKind,
+    ) -> Option<Self> {
+        use crate::landlock::LandlockApplyErrorKind as K;
+        match kind {
+            K::MountIdentityMismatch { .. } => Some(Self::LandlockMountIdentityMismatch),
+            K::MountNotRoot { .. } => Some(Self::LandlockMountNotRoot),
+            _ => None,
         }
     }
 
@@ -527,7 +574,10 @@ impl ViolationReason {
             Self::BindSourceNotAccessible => "bind_source_not_accessible",
             Self::BindSourceContainsRootfs => "bind_source_contains_rootfs",
             Self::BindSourceReachesStateRoot => "bind_source_reaches_state_root",
+            Self::BindSourcePseudoFs => "bind_source_pseudo_fs",
             Self::BindTargetKindMismatch => "bind_target_kind_mismatch",
+            Self::LandlockMountIdentityMismatch => "landlock_mount_identity_mismatch",
+            Self::LandlockMountNotRoot => "landlock_mount_not_root",
             Self::HostDeviceNodeUnexpected => "host_device_node_unexpected",
             Self::RootfsIsHostRoot => "rootfs_is_host_root",
             Self::RootfsOnSharedMount => "rootfs_on_shared_mount",
@@ -592,7 +642,10 @@ impl ViolationReason {
             | Self::BindSourceNotAccessible
             | Self::BindSourceContainsRootfs
             | Self::BindSourceReachesStateRoot
+            | Self::BindSourcePseudoFs
             | Self::BindTargetKindMismatch
+            | Self::LandlockMountIdentityMismatch
+            | Self::LandlockMountNotRoot
             | Self::HostDeviceNodeUnexpected => ViolationKind::MountTarget,
             Self::TargetOnSharedMount | Self::RootfsOnSharedMount => {
                 ViolationKind::SharedPropagation
@@ -646,7 +699,9 @@ impl ViolationReason {
             | Self::BindSourceNotAccessible
             | Self::BindSourceContainsRootfs
             | Self::BindSourceReachesStateRoot
+            | Self::BindSourcePseudoFs
             | Self::BindTargetKindMismatch => "SEC-1",
+            Self::LandlockMountIdentityMismatch | Self::LandlockMountNotRoot => "CORE-5",
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
@@ -678,6 +733,7 @@ impl ViolationReason {
             | Self::BindSourceUnsupportedType
             | Self::BindSourceContainsRootfs
             | Self::BindSourceReachesStateRoot
+            | Self::BindSourcePseudoFs
             | Self::BindTargetKindMismatch
             | Self::RootfsIsHostRoot => ErrorCode::InvalidArgument,
             Self::BindSourceNotAccessible => ErrorCode::PermissionDenied,
@@ -696,6 +752,8 @@ impl ViolationReason {
             | Self::TargetOnSharedMount
             | Self::TargetMoved
             | Self::HostDeviceNodeUnexpected
+            | Self::LandlockMountIdentityMismatch
+            | Self::LandlockMountNotRoot
             | Self::RootfsOnSharedMount
             | Self::RootfsMoved
             | Self::RootfsHasSubmounts
@@ -811,9 +869,16 @@ impl ViolationReason {
             Self::BindSourceReachesStateRoot => {
                 "bind mount source must not expose the container state store"
             }
+            Self::BindSourcePseudoFs => {
+                "bind mount source must not be on a pseudo filesystem such as procfs or sysfs"
+            }
             Self::BindTargetKindMismatch => {
                 "bind mount target kind does not match the source (directory vs regular file)"
             }
+            Self::LandlockMountIdentityMismatch => {
+                "the mount identity of a landlock rule target differs from the one recorded after mounting"
+            }
+            Self::LandlockMountNotRoot => "the landlock rule target is not the root of its mount",
             Self::HostDeviceNodeUnexpected => {
                 "host device node is not the expected character device; refusing to bind it"
             }
@@ -999,6 +1064,16 @@ impl IsolationViolation {
     }
 }
 
+/// [`ViolationReason::from_landlock_apply_kind`] の自由関数版（`exec/landlock.rs` が呼ぶ入口）。
+///
+/// worker の経路のソース走査（`violation_scan`）は `ViolationReason::<名前>` の字面を数えるため、launch 経路でだけ
+/// 生じる本理由の引き直しは自由関数を経由する（exec の再適用は `NotRecorded` でこの違反を作らない。#2071）。
+pub(super) fn landlock_apply_violation(
+    kind: &crate::landlock::LandlockApplyErrorKind,
+) -> Option<ViolationReason> {
+    ViolationReason::from_landlock_apply_kind(kind)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1045,6 +1120,27 @@ mod tests {
         );
         assert_eq!(ViolationReason::from_launch_token("plan_rejected"), None);
         assert_eq!(ViolationReason::from_launch_token(""), None);
+    }
+
+    /// bind mount の段の user namespace 由来 2 理由が `Mount` 監査イベントに写り、パスは載らない（SEC-4・#2072）。
+    #[test]
+    fn sec4_2072_launch_mount_audit_event_maps_user_namespace_reasons() {
+        for r in ViolationReason::MOUNT_BINDS_USER_NAMESPACE_REASONS {
+            assert_eq!(ViolationReason::from_launch_token(r.as_str()), None);
+            assert_eq!(
+                r.launch_mount_audit_event(),
+                Some(AuditEvent::Mount {
+                    path: None,
+                    reason: Some(AuditReason::new(r.as_str())),
+                })
+            );
+            // 共有の写像は広げていない（plan() 時点の拒否の記録は変わらない）。
+            assert_eq!(r.mount_layer_audit_event(None), None);
+        }
+        assert_eq!(
+            ViolationReason::NoNamespaces.launch_mount_audit_event(),
+            None
+        );
     }
 
     /// 監査イベントはマウント層の 3 種別だけに写り、パスは載らない（SEC-4・#1815）。

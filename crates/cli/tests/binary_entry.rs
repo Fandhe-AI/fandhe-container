@@ -322,7 +322,13 @@ fn prepare_c1(tmp: &TmpDir, cli: &std::path::Path) -> (std::path::PathBuf, Strin
 /// テストのプロセスが書き込み用の fd を持たないようにする（ETXTBSY の回避）。
 #[cfg(target_os = "linux")]
 fn install_fake_supervisor(dir: &std::path::Path, body: &str) {
-    let path = dir.join("fandhe-container-supervisor");
+    install_fake_exe(dir, "fandhe-container-supervisor", body);
+}
+
+/// 固定名 `name` のフェイクの実行ファイル（シェルスクリプト）を `dir` に置く。
+#[cfg(target_os = "linux")]
+fn install_fake_exe(dir: &std::path::Path, name: &str, body: &str) {
+    let path = dir.join(name);
     let status = Command::new("/bin/sh")
         .arg("-c")
         .arg("cat > \"$1\" && chmod 755 \"$1\"")
@@ -362,6 +368,59 @@ fn install_fake_supervisor(dir: &std::path::Path, body: &str) {
         .expect("install fake supervisor")
         .expect("install fake supervisor timed out (REPAIR-5)");
     assert!(status.success());
+}
+
+/// 偽の systemd-run の本体。先頭 6 引数が `USER_SCOPE_WRAPPER_ARGS` と一致しなければ ERR を報告し、一致すれば
+/// argv と環境を記録して、本物と同じく残りのコマンドを同じプロセスで exec する（#2081）。
+#[cfg(target_os = "linux")]
+const FAKE_SYSTEMD_RUN_BODY: &str = r#"d=$(dirname "$0")
+[ "$1 $2 $3 $4 $5 $6" = "--user --scope --quiet -p Delegate=yes --" ] || { printf 'FCSUP1 ERR INTERNAL 1 badwrapper\n'; exit 0; }
+printf '%s\n' "$@" > "$d/wrapper.argv"
+env > "$d/wrapper.env"
+shift 6
+exec "$@""#;
+
+/// 偽の systemd-run と偽の user マネージャのソケット（`<xdg>/systemd/private`）。GitHub ホステッド runner や
+/// `make docker-ci` には user マネージャが無いため、既定集合の start の結合試験はこれで包み込みを通す（#2081）。
+#[cfg(target_os = "linux")]
+struct FakeScope {
+    systemd_run: std::path::PathBuf,
+    xdg: std::path::PathBuf,
+    _listener: std::os::unix::net::UnixListener,
+}
+
+#[cfg(target_os = "linux")]
+impl FakeScope {
+    fn new(dir: &std::path::Path, tmp: &TmpDir) -> Self {
+        install_fake_exe(dir, "fake-systemd-run", FAKE_SYSTEMD_RUN_BODY);
+        let xdg = tmp.0.join("xdg");
+        std::fs::create_dir_all(xdg.join("systemd")).expect("mkdir xdg");
+        let listener = std::os::unix::net::UnixListener::bind(xdg.join("systemd").join("private"))
+            .expect("bind fake user manager socket");
+        Self {
+            systemd_run: dir.join("fake-systemd-run"),
+            xdg,
+            _listener: listener,
+        }
+    }
+
+    /// 差し替え口と `XDG_RUNTIME_DIR` を渡して CLI を起動する。
+    fn run(
+        &self,
+        exe: &std::path::Path,
+        args: &[&str],
+        extra: &[(&str, &std::ffi::OsStr)],
+    ) -> Output {
+        let mut envs: Vec<(&str, &std::ffi::OsStr)> = vec![
+            (
+                "FANDHE_CONTAINER_TEST_SYSTEMD_RUN",
+                self.systemd_run.as_os_str(),
+            ),
+            ("XDG_RUNTIME_DIR", self.xdg.as_os_str()),
+        ];
+        envs.extend_from_slice(extra);
+        run_exe_env(exe, args, &envs)
+    }
 }
 
 /// CLI-1・OCI-4・ERR-2: Linux で create → 状態ファイル作成（0）、重複は 4、未作成 start は 3。
@@ -417,9 +476,10 @@ fn sup1_start_delegates_to_sibling_supervisor_on_linux() {
     let dir = isolated_cli_dir("sup");
     let cli = dir.join("fandhe-container");
     let (_root, root_s) = prepare_c1(&tmp, &cli);
+    let scope = FakeScope::new(&dir, &tmp);
 
     install_fake_supervisor(&dir, "printf 'FCSUP1 OK 4242\\n'; exec sleep 1");
-    let out = run_isolated(&cli, &["--root", &root_s, "start", "c1"]);
+    let out = scope.run(&cli, &["--root", &root_s, "start", "c1"], &[]);
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stdout.is_empty());
     assert!(
@@ -432,7 +492,7 @@ fn sup1_start_delegates_to_sibling_supervisor_on_linux() {
         &dir,
         "printf 'FCSUP1 ERR UNIMPLEMENTED 8 production process launcher is not available yet\\n'",
     );
-    let out = run_isolated(&cli, &["--root", &root_s, "start", "c1"]);
+    let out = scope.run(&cli, &["--root", &root_s, "start", "c1"], &[]);
     assert_eq!(out.status.code(), Some(8));
     assert_eq!(op_and_code(&out), ("start".into(), "UNIMPLEMENTED".into()));
     assert!(out.stdout.is_empty());
@@ -466,6 +526,7 @@ fn sup14_start_via_path_symlink_uses_supervisor_beside_real_exe() {
     let cli = dir.join("fandhe-container");
     let (_root, root_s) = prepare_c1(&tmp, &cli);
     install_fake_supervisor(&dir, "printf 'FCSUP1 OK 4242\\n'; exec sleep 1");
+    let scope = FakeScope::new(&dir, &tmp);
 
     let bin = tmp.0.join("bin");
     std::fs::create_dir_all(&bin).expect("mkdir bin");
@@ -476,7 +537,7 @@ fn sup14_start_via_path_symlink_uses_supervisor_beside_real_exe() {
     );
 
     // (a) symlink の絶対パスで起動する。
-    let out = run_exe_env(&link, &["--root", &root_s, "start", "c1"], &[]);
+    let out = scope.run(&link, &["--root", &root_s, "start", "c1"], &[]);
     assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
     assert!(out.stdout.is_empty());
     assert!(
@@ -486,7 +547,7 @@ fn sup14_start_via_path_symlink_uses_supervisor_beside_real_exe() {
     );
 
     // (b) `PATH` を symlink のディレクトリだけにして、名前 `fandhe-container` で起動する。
-    let out = run_exe_env(
+    let out = scope.run(
         std::path::Path::new("fandhe-container"),
         &["--root", &root_s, "start", "c1"],
         &[("PATH", bin.as_os_str())],
@@ -1017,4 +1078,121 @@ fn cli2_setup_on_non_linux_lists_steps_and_fails() {
         String::from_utf8(out.stderr).expect("utf8"),
         "{\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"
     );
+}
+
+/// CORE-3・CLI-1・SUP-1（#2081）: start は supervisor を `systemd-run --user --scope --quiet -p Delegate=yes --` で包んで
+/// 起動する。包み込みの argv（supervisor の絶対パスと契約の argv が続く）と、systemd-run が受けた環境
+/// （許可リストの `PATH` と `XDG_RUNTIME_DIR` だけ。`DBUS_SESSION_BUS_ADDRESS` 等は持ち込まない）を具体値で照合する。
+#[cfg(target_os = "linux")]
+#[test]
+fn core3_cli1_start_wraps_supervisor_in_delegated_user_scope() {
+    let tmp = TmpDir::new("wrap");
+    let dir = isolated_cli_dir("wrap");
+    let cli = dir.join("fandhe-container");
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+    install_fake_supervisor(&dir, "printf 'FCSUP1 OK 4242\\n'; exec sleep 1");
+    let scope = FakeScope::new(&dir, &tmp);
+
+    let out = scope.run(
+        &cli,
+        &["--root", &root_s, "start", "c1"],
+        &[(
+            "DBUS_SESSION_BUS_ADDRESS",
+            std::ffi::OsStr::new("unix:path=/nonexistent"),
+        )],
+    );
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+
+    let argv = std::fs::read_to_string(dir.join("wrapper.argv")).expect("argv record");
+    let supervisor = dir.join("fandhe-container-supervisor");
+    let expected = format!(
+        "--user\n--scope\n--quiet\n-p\nDelegate=yes\n--\n{}\nstart\n--root\n{root_s}\nc1\n",
+        std::fs::canonicalize(&supervisor).expect("canon").display()
+    );
+    assert_eq!(argv, expected);
+
+    let env = std::fs::read_to_string(dir.join("wrapper.env")).expect("env record");
+    let mut kept: Vec<&str> = env
+        .lines()
+        .filter(|l| {
+            l.starts_with("PATH=") || l.starts_with("XDG_RUNTIME_DIR=") || l.starts_with("DBUS_")
+        })
+        .collect();
+    kept.sort_unstable();
+    let xdg_line = format!("XDG_RUNTIME_DIR={}", tmp.0.join("xdg").display());
+    assert_eq!(
+        kept,
+        ["PATH=/usr/sbin:/usr/bin:/sbin:/bin", xdg_line.as_str()]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// CLI-1・ERR-2・SEC-5（#2081）: user マネージャに届かない環境（`XDG_RUNTIME_DIR` 無し・ソケット無し）では、
+/// spawn の前に FAILED_PRECONDITION（5）で止まり（案 B へは落とさない）、状態は Created のまま。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_start_fails_closed_without_user_manager() {
+    let tmp = TmpDir::new("noxdg");
+    let dir = isolated_cli_dir("noxdg");
+    let cli = dir.join("fandhe-container");
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+    install_fake_supervisor(&dir, "printf 'FCSUP1 OK 4242\\n'; exec sleep 1");
+    let scope = FakeScope::new(&dir, &tmp);
+
+    // (a) XDG_RUNTIME_DIR を外す。
+    let out = Command::new(&cli)
+        .args(["--root", &root_s, "start", "c1"])
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("FANDHE_CONTAINER_PLUGIN_PATH_SEARCH")
+        .env("FANDHE_CONTAINER_TEST_SYSTEMD_RUN", &scope.systemd_run)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run cli");
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(
+        op_and_code(&out),
+        ("start".into(), "FAILED_PRECONDITION".into())
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("XDG_RUNTIME_DIR is not set to an absolute path"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // (b) ソケットの無い XDG_RUNTIME_DIR。
+    let empty = tmp.0.join("empty-xdg");
+    std::fs::create_dir_all(&empty).expect("mkdir");
+    let out = run_exe_env(
+        &cli,
+        &["--root", &root_s, "start", "c1"],
+        &[
+            (
+                "FANDHE_CONTAINER_TEST_SYSTEMD_RUN",
+                scope.systemd_run.as_os_str(),
+            ),
+            ("XDG_RUNTIME_DIR", empty.as_os_str()),
+        ],
+    );
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(
+        op_and_code(&out),
+        ("start".into(), "FAILED_PRECONDITION".into())
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("systemd user manager is not reachable"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        !dir.join("wrapper.argv").exists(),
+        "must fail before spawning"
+    );
+    let out = run_isolated(&cli, &["--root", &root_s, "list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ID\tSTATUS\tPID\nc1\tcreated\t-\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }

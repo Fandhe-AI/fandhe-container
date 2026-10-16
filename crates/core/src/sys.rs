@@ -339,6 +339,42 @@ mod consts {
     pub const ENOTEMPTY: i32 = 39;
     // include/uapi/linux/magic.h の `CGROUP2_SUPER_MAGIC`（"cgrp"）。
     pub const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+    // include/uapi/linux/magic.h の `SYSFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SYSFS_MAGIC: i64 = 0x6265_6572;
+    // include/uapi/linux/magic.h の `DEBUGFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const DEBUGFS_MAGIC: i64 = 0x6462_6720;
+    // include/uapi/linux/magic.h の `TRACEFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const TRACEFS_MAGIC: i64 = 0x7472_6163;
+    // include/uapi/linux/magic.h の `SECURITYFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SECURITYFS_MAGIC: i64 = 0x7363_6673;
+    // include/uapi/linux/magic.h の `CGROUP_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const CGROUP_SUPER_MAGIC: i64 = 0x0027_e0eb;
+    // include/uapi/linux/magic.h の `BPF_FS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
+    // fs/configfs/mount.c の `CONFIGFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const CONFIGFS_MAGIC: i64 = 0x6265_6570;
+    // include/uapi/linux/magic.h の `PSTOREFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const PSTOREFS_MAGIC: i64 = 0x6165_676c;
+    // include/uapi/linux/magic.h の `EFIVARFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const EFIVARFS_MAGIC: i64 = 0xde5e_81e4;
+    // include/uapi/linux/magic.h の `SELINUX_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SELINUX_MAGIC: i64 = 0xf97c_ff8c;
+    // include/uapi/linux/magic.h の `SMACK_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SMACK_MAGIC: i64 = 0x4341_5d53;
+    // include/uapi/linux/magic.h の `BINFMTFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const BINFMTFS_MAGIC: i64 = 0x4249_4e4d;
+    // fs/fuse/control.c の `FUSE_CTL_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const FUSE_CTL_SUPER_MAGIC: i64 = 0x6573_5543;
+    // include/uapi/linux/magic.h の `RDTGROUP_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const RDTGROUP_SUPER_MAGIC: i64 = 0x0765_5821;
+    // include/uapi/linux/magic.h の `XENFS_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const XENFS_SUPER_MAGIC: i64 = 0xabba_1974;
+    // include/uapi/linux/magic.h の `NSFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const NSFS_MAGIC: i64 = 0x6e73_6673;
+    // ipc/mqueue.c の `MQUEUE_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const MQUEUE_MAGIC: i64 = 0x1980_0202;
+    // include/uapi/linux/magic.h の `BINDERFS_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const BINDERFS_SUPER_MAGIC: i64 = 0x6c6f_6f70;
     // include/linux/statfs.h の `ST_NOEXEC`・`ST_VALID`（`statfs.f_flags`。全アーキテクチャ共通）。
     pub const ST_NOEXEC: i64 = 0x0008;
     // include/linux/statfs.h の `ST_NODEV`（#1676・rootfs の nodev の事後検証）。
@@ -640,6 +676,42 @@ mod consts {
     pub const ENOTEMPTY: i32 = 39;
     // include/uapi/linux/magic.h の `CGROUP2_SUPER_MAGIC`（"cgrp"）。
     pub const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+    // include/uapi/linux/magic.h の `SYSFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SYSFS_MAGIC: i64 = 0x6265_6572;
+    // include/uapi/linux/magic.h の `DEBUGFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const DEBUGFS_MAGIC: i64 = 0x6462_6720;
+    // include/uapi/linux/magic.h の `TRACEFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const TRACEFS_MAGIC: i64 = 0x7472_6163;
+    // include/uapi/linux/magic.h の `SECURITYFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SECURITYFS_MAGIC: i64 = 0x7363_6673;
+    // include/uapi/linux/magic.h の `CGROUP_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const CGROUP_SUPER_MAGIC: i64 = 0x0027_e0eb;
+    // include/uapi/linux/magic.h の `BPF_FS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
+    // fs/configfs/mount.c の `CONFIGFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const CONFIGFS_MAGIC: i64 = 0x6265_6570;
+    // include/uapi/linux/magic.h の `PSTOREFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const PSTOREFS_MAGIC: i64 = 0x6165_676c;
+    // include/uapi/linux/magic.h の `EFIVARFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const EFIVARFS_MAGIC: i64 = 0xde5e_81e4;
+    // include/uapi/linux/magic.h の `SELINUX_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SELINUX_MAGIC: i64 = 0xf97c_ff8c;
+    // include/uapi/linux/magic.h の `SMACK_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const SMACK_MAGIC: i64 = 0x4341_5d53;
+    // include/uapi/linux/magic.h の `BINFMTFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const BINFMTFS_MAGIC: i64 = 0x4249_4e4d;
+    // fs/fuse/control.c の `FUSE_CTL_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const FUSE_CTL_SUPER_MAGIC: i64 = 0x6573_5543;
+    // include/uapi/linux/magic.h の `RDTGROUP_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const RDTGROUP_SUPER_MAGIC: i64 = 0x0765_5821;
+    // include/uapi/linux/magic.h の `XENFS_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const XENFS_SUPER_MAGIC: i64 = 0xabba_1974;
+    // include/uapi/linux/magic.h の `NSFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const NSFS_MAGIC: i64 = 0x6e73_6673;
+    // ipc/mqueue.c の `MQUEUE_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const MQUEUE_MAGIC: i64 = 0x1980_0202;
+    // include/uapi/linux/magic.h の `BINDERFS_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    pub const BINDERFS_SUPER_MAGIC: i64 = 0x6c6f_6f70;
     // include/linux/statfs.h の `ST_NOEXEC`・`ST_VALID`（`statfs.f_flags`。全アーキテクチャ共通）。
     pub const ST_NOEXEC: i64 = 0x0008;
     // include/linux/statfs.h の `ST_NODEV`（#1676・rootfs の nodev の事後検証）。
@@ -912,6 +984,24 @@ mod consts {
     pub const EBUSY: i32 = -16;
     pub const ENOTEMPTY: i32 = -17;
     pub const CGROUP2_SUPER_MAGIC: i64 = 0;
+    pub const SYSFS_MAGIC: i64 = 0;
+    pub const DEBUGFS_MAGIC: i64 = 0;
+    pub const TRACEFS_MAGIC: i64 = 0;
+    pub const SECURITYFS_MAGIC: i64 = 0;
+    pub const CGROUP_SUPER_MAGIC: i64 = 0;
+    pub const BPF_FS_MAGIC: i64 = 0;
+    pub const CONFIGFS_MAGIC: i64 = 0;
+    pub const PSTOREFS_MAGIC: i64 = 0;
+    pub const EFIVARFS_MAGIC: i64 = 0;
+    pub const SELINUX_MAGIC: i64 = 0;
+    pub const SMACK_MAGIC: i64 = 0;
+    pub const BINFMTFS_MAGIC: i64 = 0;
+    pub const FUSE_CTL_SUPER_MAGIC: i64 = 0;
+    pub const RDTGROUP_SUPER_MAGIC: i64 = 0;
+    pub const XENFS_SUPER_MAGIC: i64 = 0;
+    pub const NSFS_MAGIC: i64 = 0;
+    pub const MQUEUE_MAGIC: i64 = 0;
+    pub const BINDERFS_SUPER_MAGIC: i64 = 0;
     pub const ST_NOEXEC: i64 = 0;
     pub const ST_NODEV: i64 = 0;
     pub const ST_RDONLY: i64 = 0;
@@ -2256,6 +2346,13 @@ const fn open_tree_bind_flags(scope: MountTreeScope) -> u32 {
 /// ロックされたマウントを持つ場合、カーネルは `EINVAL` を返す（`__do_loopback` の `has_locked_children`。
 /// 黙って再帰へ切り替えず、呼び出し側が構造化エラーにする）。
 ///
+/// 伝播の前提（SEC-1・#2079）: 複製は複製元のマウントの伝播（`mnt_group_id`・`mnt_master`）を引き継ぐ。複製元が
+/// shared なら複製は同じ peer group に入り、その後の接続・解除が peer（ホスト側）へ伝播しうる。本関数も
+/// `bind_mount_attr`（`propagation` = 0）も伝播を変えない。安全は、`MountIsolation::establish`（`crate::exec`）が
+/// `unshare(CLONE_NEWNS)` の直後に `mount_root_private_recursive`（`/` を `MS_REC|MS_PRIVATE`）を呼ぶことに
+/// 依存する（通常の経路と rootless の経路の両方）。これを外す・順序を入れ替える改修は前提を壊す。呼び出し側
+/// （#1913 の適用段）は、付け替え先が shared でないことと付け替え後の mountinfo を照合して確かめている。
+///
 /// 想定する呼び出し順（#1913）: `verify_bind_source_fd` → 本関数 → [`set_bind_mount_attrs`]（切り離した状態で属性を設定し、
 /// 属性なしでコンテナから見える瞬間を作らない）→ [`move_mount_empty_path`]（rootfs 側の固定済みマウント先へ）。
 ///
@@ -3428,15 +3525,30 @@ pub(crate) fn remove_dir_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), S
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `unlinkat(2)`・`renameat2(2)` に渡す名前が dirfd 直下の 1 要素であることを確かめる（空・`/` を含む・`.`・`..`
+/// は `EINVAL`）。これらの syscall は中間要素の symlink を辿るため、複数要素の名前を許すと dirfd（rootfs・隔離
+/// ディレクトリ）の外の実体を消す・動かす経路になる。呼び出し側の検証に頼らず `sys` の境界で塞ぐ
+/// （SEC-1・#2079。`remove_file_at`・`rename_noreplace_at` から呼ぶ）。`.hidden`・`..a` のような名前は通す。
+fn ensure_single_component(name: &CStr) -> Result<(), SysError> {
+    let b = name.to_bytes();
+    if b.is_empty() || b.contains(&b'/') || b == b"." || b == b".." {
+        return Err(SysError::Os(EINVAL));
+    }
+    Ok(())
+}
+
 /// `parent` 配下の `name` を `unlinkat(2)`（`flags` = 0）で削除する（ディレクトリは `EISDIR`/`EPERM` で拒否され、
 /// 最終要素の symlink は辿らずリンク自体を消す）。bind mount の適用段（`crate::exec::mount_binds`）が、失敗時の後始末で
-/// 自分が作った空の通常ファイル（マウント先の置き場）だけを消すために使う（#1913・SEC-1）。`name` は呼び出し側が
-/// 1 要素に検証済みの前提。
+/// 自分が作った空の通常ファイル（マウント先の置き場）だけを消すために使う（#1913・SEC-1）。`name` が 1 要素
+/// （空・`/` を含む・`.`・`..` のいずれでもない）であることは本関数が検証し、違反は syscall を発行せず `EINVAL`
+/// （#2079）。
 pub(crate) fn remove_file_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    // SAFETY: `name` は NUL 終端の借用で呼び出しの間生存する。`parent` は生存中の `BorrowedFd`。`flags` が 0 のため
+    ensure_single_component(name)?;
+    // SAFETY: `name` は NUL 終端の借用で呼び出しの間生存し、上で 1 要素と検証済み（dirfd 直下の 1 エントリだけが
+    // 対象になり、中間要素の symlink は辿られない）。`parent` は生存中の `BorrowedFd`。`flags` が 0 のため
     // `unlinkat` は `AT_REMOVEDIR` を伴わず、ディレクトリは削除されない。副作用は `parent` 配下の非ディレクトリ
     // 1 件の削除のみで、ポインタは保持されない。
     let rc = unsafe { unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
@@ -3447,7 +3559,22 @@ pub(crate) fn remove_file_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), 
 /// symlink は辿らない。改名先が既にあれば置き換えず `EEXIST`）。bind mount の適用段（`crate::exec::mount_binds`）が、
 /// 失敗時の後始末で「消す対象を自分専用の隔離ディレクトリへ移してから実体を照合して消す」ことと、「照合に通らなかった
 /// 実体を元の名前へ戻すとき、新しく作られた同名の実体を上書きしない」ことに使う（#1913・SEC-1）。
-/// `old`・`new` は呼び出し側が 1 要素に検証済みの前提。
+///
+/// `old`・`new` は本関数が 1 要素（空・`/` を含む・`.`・`..` のいずれでもない）であることを検証し、違反は
+/// syscall を発行せず `EINVAL`（#2079）。
+///
+/// # エラー
+///
+/// `EINVAL` は 2 つの原因で返る。(a) 名前が 1 要素でない（上記。syscall 前に拒否）、(b) 改名先の FS が
+/// `RENAME_NOREPLACE` を持たない（カーネルの返り値）。(b) でも `rename(2)` の上書き改名へは縮退しない
+/// （fail-closed）。呼び出し側では、`remove_verified` は `rename` の失敗を報告して要素を残し、`create_dir_proven` は
+/// ステージングを片付けたうえで `rename` の失敗を報告する。`renameat2` を持たないカーネル（3.15 未満）の
+/// `ENOSYS` は `SysError::Os(ENOSYS)` のまま返る。
+///
+/// # リンクの前提
+///
+/// `renameat2` は glibc 2.28 以降のシンボルで、それより古い glibc ではリンク時にシンボル未解決エラーになる
+/// （実行時の未定義動作ではない）。`extern` 宣言の `// SAFETY` コメントと同じ前提。
 pub(crate) fn rename_noreplace_at(
     old_dir: BorrowedFd<'_>,
     old: &CStr,
@@ -3457,9 +3584,12 @@ pub(crate) fn rename_noreplace_at(
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
+    ensure_single_component(old)?;
+    ensure_single_component(new)?;
     // include/uapi/linux/fs.h の `RENAME_NOREPLACE`（全アーキテクチャ共通）。
     const RENAME_NOREPLACE: u32 = 1;
-    // SAFETY: `old`・`new` は NUL 終端の借用で呼び出しの間生存する。`old_dir`・`new_dir` は生存中の
+    // SAFETY: `old`・`new` は NUL 終端の借用で呼び出しの間生存し、上で 1 要素と検証済み（各 dirfd 直下の 1 エントリ
+    // だけが対象になり、中間要素の symlink は辿られない）。`old_dir`・`new_dir` は生存中の
     // `BorrowedFd`。flags は `RENAME_NOREPLACE` のみで、改名先を置き換えない。副作用は 1 要素の改名のみで、
     // ポインタは保持されない。
     let rc = unsafe {
@@ -3758,6 +3888,27 @@ fn statfs_of(fd: BorrowedFd<'_>) -> Result<StatFs, SysError> {
 
 /// CORE-3: cgroup2 の `statfs.f_type` 定数（`CGROUP2_SUPER_MAGIC`）。
 pub(crate) const CGROUP2_MAGIC: i64 = consts::CGROUP2_SUPER_MAGIC;
+
+/// #2098: bind mount の元として拒否する疑似 FS の `statfs.f_type`（`exec::bind_mounts` の拒否リストが使う）。
+/// 対応外アーキテクチャでは 0 になるが、`fs_type` が先に `Unsupported` を返すため照合には使われない。
+pub(crate) const SYSFS_MAGIC: i64 = consts::SYSFS_MAGIC;
+pub(crate) const DEBUGFS_MAGIC: i64 = consts::DEBUGFS_MAGIC;
+pub(crate) const TRACEFS_MAGIC: i64 = consts::TRACEFS_MAGIC;
+pub(crate) const SECURITYFS_MAGIC: i64 = consts::SECURITYFS_MAGIC;
+pub(crate) const CGROUP_SUPER_MAGIC: i64 = consts::CGROUP_SUPER_MAGIC;
+pub(crate) const BPF_FS_MAGIC: i64 = consts::BPF_FS_MAGIC;
+pub(crate) const CONFIGFS_MAGIC: i64 = consts::CONFIGFS_MAGIC;
+pub(crate) const PSTOREFS_MAGIC: i64 = consts::PSTOREFS_MAGIC;
+pub(crate) const EFIVARFS_MAGIC: i64 = consts::EFIVARFS_MAGIC;
+pub(crate) const SELINUX_MAGIC: i64 = consts::SELINUX_MAGIC;
+pub(crate) const SMACK_MAGIC: i64 = consts::SMACK_MAGIC;
+pub(crate) const BINFMTFS_MAGIC: i64 = consts::BINFMTFS_MAGIC;
+pub(crate) const FUSE_CTL_SUPER_MAGIC: i64 = consts::FUSE_CTL_SUPER_MAGIC;
+pub(crate) const RDTGROUP_SUPER_MAGIC: i64 = consts::RDTGROUP_SUPER_MAGIC;
+pub(crate) const XENFS_SUPER_MAGIC: i64 = consts::XENFS_SUPER_MAGIC;
+pub(crate) const NSFS_MAGIC: i64 = consts::NSFS_MAGIC;
+pub(crate) const MQUEUE_MAGIC: i64 = consts::MQUEUE_MAGIC;
+pub(crate) const BINDERFS_SUPER_MAGIC: i64 = consts::BINDERFS_SUPER_MAGIC;
 
 /// glibc の `gnu_dev_makedev` と同じビット配置で `dev_t` を作る純関数（`unsafe` なし）。
 pub(crate) const fn makedev(major: u32, minor: u32) -> u64 {
@@ -5124,6 +5275,31 @@ mod tests {
         assert_eq!(std::mem::size_of::<PollFd>(), 8);
     }
 
+    /// #2098: 疑似 FS の magic 定数の具体値（include/uapi/linux/magic.h と、非 uapi の 3 つはカーネルのソース）。
+    /// 0xcafe4a11 などは `i32::MAX` を超えるため、符号拡張されない正の `i64` のリテラルで固定する。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sec1_2098_pseudo_fs_magics_are_exact() {
+        assert_eq!(SYSFS_MAGIC, 0x6265_6572);
+        assert_eq!(DEBUGFS_MAGIC, 0x6462_6720);
+        assert_eq!(TRACEFS_MAGIC, 0x7472_6163);
+        assert_eq!(SECURITYFS_MAGIC, 0x7363_6673);
+        assert_eq!(CGROUP_SUPER_MAGIC, 0x0027_e0eb);
+        assert_eq!(BPF_FS_MAGIC, 0xcafe_4a11);
+        assert_eq!(CONFIGFS_MAGIC, 0x6265_6570);
+        assert_eq!(PSTOREFS_MAGIC, 0x6165_676c);
+        assert_eq!(EFIVARFS_MAGIC, 0xde5e_81e4);
+        assert_eq!(SELINUX_MAGIC, 0xf97c_ff8c);
+        assert_eq!(SMACK_MAGIC, 0x4341_5d53);
+        assert_eq!(BINFMTFS_MAGIC, 0x4249_4e4d);
+        assert_eq!(FUSE_CTL_SUPER_MAGIC, 0x6573_5543);
+        assert_eq!(RDTGROUP_SUPER_MAGIC, 0x0765_5821);
+        assert_eq!(XENFS_SUPER_MAGIC, 0xabba_1974);
+        assert_eq!(NSFS_MAGIC, 0x6e73_6673);
+        assert_eq!(MQUEUE_MAGIC, 0x1980_0202);
+        assert_eq!(BINDERFS_SUPER_MAGIC, 0x6c6f_6f70);
+    }
+
     /// CORE-3・TASK-32.1: cgroup 操作用の定数・`statfs` バッファの具体値。
     #[cfg(all(
         target_pointer_width = "64",
@@ -6022,6 +6198,75 @@ mod tests {
             assert!(MountFlags::from_bits(0x20 | 0x3).is_nosuid());
             assert!(!MountFlags::from_bits(0).is_read_only());
         }
+    }
+
+    /// SEC-1（#2079）: 1 要素検証は空・`/` を含む・`.`・`..` を `EINVAL` で拒否し、ドット始まりの通常名は通す。
+    #[test]
+    fn sec1_2079_single_component_check_rejects_multi_and_dot_names() {
+        let name = |n: &str| CString::new(n).expect("name");
+        for bad in ["", "a/b", "/a", "a/", ".", ".."] {
+            assert_eq!(
+                ensure_single_component(&name(bad)),
+                Err(SysError::Os(EINVAL)),
+                "{bad:?}"
+            );
+        }
+        for ok in [
+            "a",
+            ".hidden",
+            "..a",
+            "a.b",
+            ".fandhe-rollback-1-0-00000000",
+        ] {
+            assert_eq!(ensure_single_component(&name(ok)), Ok(()), "{ok:?}");
+        }
+    }
+
+    /// SEC-1（#2079）: 複数要素・`..`・空の名前は syscall を発行せず `EINVAL`（実体が残る）。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec1_2079_file_ops_reject_multi_component_names_without_syscall() {
+        let guard = crate::test_support::TestTempDir::new("sys-2079").expect("temp dir");
+        let base = guard.path().to_path_buf();
+        let dir = std::fs::File::open(&base).expect("open dir");
+        std::fs::create_dir(base.join("sub")).expect("mkdir");
+        std::fs::write(base.join("sub/f"), b"x").expect("write");
+        std::fs::write(base.join("ok"), b"y").expect("write");
+        let name = |n: &str| CString::new(n).expect("name");
+        let einval = Err(SysError::Os(EINVAL));
+        for bad in ["sub/f", "..", ""] {
+            assert_eq!(remove_file_at(dir.as_fd(), &name(bad)), einval, "{bad:?}");
+        }
+        assert!(base.join("sub/f").exists());
+        // old が不正
+        for bad in ["sub/f", ".."] {
+            assert_eq!(
+                rename_noreplace_at(dir.as_fd(), &name(bad), dir.as_fd(), &name("moved")),
+                einval,
+                "{bad:?}"
+            );
+        }
+        // new が不正
+        for bad in ["sub/g", ".."] {
+            assert_eq!(
+                rename_noreplace_at(dir.as_fd(), &name("ok"), dir.as_fd(), &name(bad)),
+                einval,
+                "{bad:?}"
+            );
+        }
+        assert!(base.join("sub/f").exists());
+        assert!(base.join("ok").exists());
+        assert!(!base.join("moved").exists());
+        assert!(!base.join("sub/g").exists());
+        // 回帰: 正しい名前どうしは従来どおり成功する
+        assert_eq!(
+            rename_noreplace_at(dir.as_fd(), &name("ok"), dir.as_fd(), &name("moved")),
+            Ok(())
+        );
+        assert!(base.join("moved").exists() && !base.join("ok").exists());
     }
 
     /// SEC-1（#1913）: `remove_file_at` は通常ファイルと symlink（リンク自体）を消し、ディレクトリは消さず、

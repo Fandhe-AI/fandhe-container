@@ -1,7 +1,8 @@
 //! 起動レイテンシの計測本体（Linux・x86_64 / aarch64 限定。TASK-190・REPAIR-8・REPAIR-5・CORE-10）。
 //!
-//! 1 試行は「core の `oci_runtime::create` → `systemd-run --user --scope` で supervisor の bin を起動 → 結果チャネルの
-//! `FCSUP1 OK` を読み終える」までで、CLI は経由しない。supervisor は本番 launcher（#1819）まで到達するため、分離
+//! 1 試行は「core の `oci_runtime::create` → 本番の `start` と同じ包み込み（`USER_SCOPE_WRAPPER_ARGS`・`scope_wrap`）の
+//! `systemd-run` で supervisor の bin を起動 → 結果チャネルの `FCSUP1 OK` を読み終える」までで、CLI は経由しない。
+//! scope 取得（D-Bus の往復）は本番が起動ごとに払う費用のため区間に含める（#2081・#2122・#2089）。supervisor は本番 launcher（#1819）まで到達するため、分離
 //! （user namespace・cgroup・Landlock）込みの起動を測る。分離を弱める経路は持たず、失敗は失敗として数える（REPAIR-3）。
 //!
 //! # 後始末（core の `delete` を使わない理由）
@@ -17,6 +18,7 @@ use super::bundle::build_bundle;
 use super::output::{Failures, Params, RunResult, Sample, render_json};
 use super::probe_env::effective_uid;
 use super::report::{ReportOutcome, classify, spawn_report_reader};
+use super::scope_wrap::{scoped_command, user_manager_env};
 use crate::sys;
 use fandhe_container_core::cgroups::CgroupName;
 use fandhe_container_core::observability::OpRecorder;
@@ -29,7 +31,7 @@ use fandhe_container_supervisor::state::open_default_store;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -367,6 +369,8 @@ trait Host {
 /// 実機の `Host`。
 struct RealHost {
     euid: u32,
+    /// 検証済みの `XDG_RUNTIME_DIR`（user マネージャへ直結するため子へ渡す。本番の `start` と同じ）。
+    xdg_runtime_dir: std::ffi::OsString,
 }
 
 struct RealHandle {
@@ -447,18 +451,20 @@ impl Host for RealHost {
 
     fn spawn(&self, ctx: &Ctx<'_>, created: &Created<RealHandle>) -> Result<Launched, SpawnFailed> {
         let unit = scope_unit(&created.id_str);
-        let mut cmd = Command::new(&ctx.plan.systemd_run);
+        // 本番の `start` と同じ包み込み（argv・環境・cwd）。scope 取得の費用も本番と同じ経路で区間に入る（#2089）。
+        let Some(mut cmd) = scoped_command(
+            &ctx.plan.systemd_run,
+            &unit,
+            &ctx.plan.supervisor_bin,
+            &created.root,
+            &created.id_str,
+            &self.xdg_runtime_dir,
+        ) else {
+            return Err(SpawnFailed { clean: true });
+        };
         // 親がブロックした中断シグナルを子（systemd-run・supervisor・コンテナ init）へ継承させない。
         sys::unblock_termination_signals_in_child(&mut cmd);
         let mut child = cmd
-            .args(["--user", "--scope", "--quiet", "-p", "Delegate=yes"])
-            .arg(format!("--unit={unit}"))
-            .arg("--")
-            .arg(&ctx.plan.supervisor_bin)
-            .arg("start")
-            .arg("--root")
-            .arg(&created.root)
-            .arg(&created.id_str)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -765,6 +771,11 @@ pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
         },
         euid,
     )?;
+
+    // user マネージャへ直結できるか（本番の `start` と同じ判定）。作業ディレクトリを作る前に fail-closed で止める。
+    // work-dir の拒否が user マネージャの有無に依存しないよう、work-dir の検証より後ろに置く。
+    let xdg_runtime_dir = user_manager_env(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), euid)?;
+
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -790,7 +801,13 @@ pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
             report_timeout: cli_receive_deadline(&StartTimeouts::default()),
             keep_work: &keep_work,
         };
-        run_trials(&RealHost { euid }, &ctx)
+        run_trials(
+            &RealHost {
+                euid,
+                xdg_runtime_dir,
+            },
+            &ctx,
+        )
     });
     let keep = keep_work.get() || matches!(&result, Ok(r) if !r.leftover_ids.is_empty());
     if keep {
@@ -1132,6 +1149,7 @@ mod tests {
 #[cfg(test)]
 mod real_process_tests {
     use super::*;
+    use std::process::Command;
 
     struct Tmp(PathBuf);
 

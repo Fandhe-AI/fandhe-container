@@ -5,6 +5,11 @@
 //! `.claude/rules/coding-rust.md`）。`unsafe` は外へ公開せず、安全な関数だけを公開する。
 //! シグナルハンドラは登録しない（ブロックして `sigpending` で見るだけ）。
 //!
+//! # エラーの返し方（REPAIR-4）
+//! 関数ごとに失敗の伝わり方が違う。`pthread_sigmask` は errno を設定せず、エラー番号を戻り値で返す（POSIX）ため
+//! `io::Error::last_os_error()` を使わず戻り値から作る（`sigmask_result`）。`sigpending`・`raise` は失敗時に
+//! 非 0（-1）を返し errno を設定する型で、本モジュールは errno を読まず成否だけを扱う。
+//!
 //! # 呼び出しの契約
 //! - ブロックは呼び出したスレッドだけに効く（以後にそのスレッドが作るスレッドへは継承される）。他のスレッドを作る前に
 //!   `block_termination_signals` を呼ぶこと。先に作られたスレッドはブロックしておらず、シグナルをそのスレッドが受けて
@@ -57,14 +62,32 @@ impl SigSet {
 }
 
 unsafe extern "C" {
+    /// 成功で 0、失敗でエラー番号（正の値）を戻り値で返す。errno は設定しない（POSIX）。
     fn pthread_sigmask(how: c_int, set: *const SigSet, old: *mut SigSet) -> c_int;
+    /// 成功で 0、失敗で -1 を返し errno を設定する。
     fn sigpending(set: *mut SigSet) -> c_int;
+    /// 成功で 0、失敗で非 0 を返す（試験専用）。
     #[cfg(test)]
     fn raise(sig: c_int) -> c_int;
 }
 
+/// `pthread_sigmask` の戻り値を `io::Result` にする（REPAIR-4）。
+/// `pthread_sigmask` は errno を設定せず、成功で 0、失敗でエラー番号を戻り値で返す（POSIX）ため、
+/// `io::Error::last_os_error()` ではなく戻り値から作る。`from_raw_os_error` はアロケーション・ロックを伴わず、
+/// `pre_exec`（fork 後・exec 前）のクロージャからも呼べる。
+fn sigmask_result(rc: c_int) -> std::io::Result<()> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(rc))
+    }
+}
+
 /// 呼び出しスレッド（と以後に作るスレッド）で SIGINT・SIGTERM・SIGHUP をブロックする。成功なら `true`。
 /// 計測の開始前（スレッドを作る前）に 1 回呼ぶ。
+///
+/// エラー: `pthread_sigmask` は errno を設定せず戻り値でエラー番号を返す。本関数は成否だけを `bool` で返し、
+/// 呼び出し側は固定の文言で `unsupported-environment` にする。
 pub fn block_termination_signals() -> bool {
     let mut set = SigSet::empty();
     for s in TERMINATION {
@@ -72,10 +95,13 @@ pub fn block_termination_signals() -> bool {
     }
     // SAFETY: `set` は有効な `sigset_t` 相当（1024 ビット）の領域を指す読み取り専用の引数で、`old` は
     // 使わないため null を渡す（pthread_sigmask は null を許す）。呼び出し中、`set` は生存し続ける。
-    unsafe { pthread_sigmask(SIG_BLOCK, &raw const set, std::ptr::null_mut()) == 0 }
+    let rc = unsafe { pthread_sigmask(SIG_BLOCK, &raw const set, std::ptr::null_mut()) };
+    sigmask_result(rc).is_ok()
 }
 
 /// ブロック中の中断シグナルが保留されているか。確認できない場合は `true`（fail-closed。後始末へ進める）。
+///
+/// エラー: `sigpending` は失敗時に -1 を返し errno を設定する（POSIX）。本関数は errno を読まず、失敗を `true` にする。
 pub fn termination_pending() -> bool {
     let mut set = SigSet::empty();
     // SAFETY: `set` は書き込み可能な 1024 ビットの領域で、`sigpending` はそこへ保留集合を書くだけ。
@@ -87,6 +113,9 @@ pub fn termination_pending() -> bool {
 /// 子の起動前（`pre_exec`）に、中断シグナルのブロックを解除する（親のマスクの継承を打ち消す）。
 /// `cmd` で起こす子は、親が `block_termination_signals` 済みでも SIGINT・SIGTERM・SIGHUP を通常どおり受ける。
 /// `pre_exec` を使うため `posix_spawn` の経路は使われず、fork+exec になる。
+///
+/// エラー: `pthread_sigmask` は errno を設定せず戻り値でエラー番号を返すため、そのエラー番号から `io::Error` を作って
+/// 返す（`sigmask_result`）。`spawn` が `Err` になり子は exec しない。
 pub fn unblock_termination_signals_in_child(cmd: &mut std::process::Command) {
     use std::os::unix::process::CommandExt as _;
     let mut set = SigSet::empty();
@@ -95,15 +124,16 @@ pub fn unblock_termination_signals_in_child(cmd: &mut std::process::Command) {
     }
     // SAFETY: `pre_exec` のクロージャは fork 後・exec 前の子で、非同期シグナル安全な呼び出しだけを行う必要がある。
     // ここでは `pthread_sigmask`（async-signal-safe。POSIX）を、あらかじめスタック上に作った `set`（クロージャへ
-    // Copy で移動済み）に対して呼ぶだけで、アロケーション・ロック・panic を伴う処理をしない。失敗は errno を
-    // `io::Error` で返し、`spawn` が `Err` になる（子は exec しない）。
+    // Copy で移動済み）に対して呼ぶだけで、アロケーション・ロック・panic を伴う処理をしない。失敗時は戻り値の
+    // エラー番号（`pthread_sigmask` は errno を設定しない）を `from_raw_os_error` で `io::Error` にして返す
+    // （同関数もアロケーション・ロックを伴わない）。`spawn` が `Err` になり子は exec しない。
     unsafe {
         cmd.pre_exec(move || {
-            if pthread_sigmask(SIG_UNBLOCK, &raw const set, std::ptr::null_mut()) == 0 {
-                Ok(())
-            } else {
-                Err(std::io::Error::last_os_error())
-            }
+            sigmask_result(pthread_sigmask(
+                SIG_UNBLOCK,
+                &raw const set,
+                std::ptr::null_mut(),
+            ))
         });
     }
 }
@@ -161,6 +191,17 @@ mod tests {
         })
         .join()
         .expect("thread");
+    }
+
+    /// REPAIR-4: 戻り値 0 は `Ok`、非 0 はそのエラー番号を保持する `io::Error`（22 = EINVAL は x86_64 / aarch64 共通）。
+    #[test]
+    fn sigmask_result_maps_return_code_to_io_error_repair_4() {
+        assert!(sigmask_result(0).is_ok());
+        let einval = sigmask_result(22).expect_err("EINVAL");
+        assert_eq!(einval.raw_os_error(), Some(22));
+        assert_eq!(einval.kind(), std::io::ErrorKind::InvalidInput);
+        let eperm = sigmask_result(1).expect_err("EPERM");
+        assert_eq!(eperm.raw_os_error(), Some(1));
     }
 
     #[test]

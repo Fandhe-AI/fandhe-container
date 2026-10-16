@@ -447,7 +447,10 @@ impl Host for RealHost {
 
     fn spawn(&self, ctx: &Ctx<'_>, created: &Created<RealHandle>) -> Result<Launched, SpawnFailed> {
         let unit = scope_unit(&created.id_str);
-        let mut child = Command::new(&ctx.plan.systemd_run)
+        let mut cmd = Command::new(&ctx.plan.systemd_run);
+        // 親がブロックした中断シグナルを子（systemd-run・supervisor・コンテナ init）へ継承させない。
+        sys::unblock_termination_signals_in_child(&mut cmd);
+        let mut child = cmd
             .args(["--user", "--scope", "--quiet", "-p", "Delegate=yes"])
             .arg(format!("--unit={unit}"))
             .arg("--")

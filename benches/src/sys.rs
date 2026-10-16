@@ -3,9 +3,16 @@
 //!
 //! 本 crate で `unsafe` を置く唯一のモジュール（各 crate の `sys` モジュールに限る事前承認の範囲。
 //! `.claude/rules/coding-rust.md`）。`unsafe` は外へ公開せず、安全な関数だけを公開する。
-//! シグナルハンドラは登録しない（ブロックして `sigpending` で見るだけ）。ブロックはスレッド単位で、
-//! 以後に作るスレッドへ継承される。`std::process::Command` は子の起動時にマスクを空へ戻すため、
-//! 子（`systemd-run` と supervisor）へはブロックが継承されない。
+//! シグナルハンドラは登録しない（ブロックして `sigpending` で見るだけ）。
+//!
+//! # 呼び出しの契約
+//! - ブロックは呼び出したスレッドだけに効く（以後にそのスレッドが作るスレッドへは継承される）。他のスレッドを作る前に
+//!   `block_termination_signals` を呼ぶこと。先に作られたスレッドはブロックしておらず、シグナルをそのスレッドが受けて
+//!   既定動作（プロセス終了）になり得る。
+//! - `std::process::Command` は子へ親のシグナルマスクを継承する（fork+exec・`posix_spawn` のどちらも戻さない）。
+//!   ブロックしたまま子（`systemd-run`・supervisor・コンテナ init）を起こすと、子で SIGTERM 等がブロックされ、
+//!   graceful stop が効かない。子を起こす `Command` には必ず `unblock_termination_signals_in_child` を適用すること。
+//!   `pre_exec` を使うため、その `Command` は `posix_spawn` の経路を外れ、fork+exec で起動される。
 //!
 //! 対象は Linux の 64 ビット（x86_64 / aarch64）。この 2 つは `SIG_BLOCK`・シグナル番号・`sigset_t`
 //! （1024 ビット = `u64` 16 個。第 n 番のシグナルは語 `(n-1)/64` のビット `(n-1)%64`）が同じ。
@@ -15,6 +22,7 @@
 use std::ffi::c_int;
 
 const SIG_BLOCK: c_int = 0;
+const SIG_UNBLOCK: c_int = 1;
 const SIGHUP: c_int = 1;
 const SIGINT: c_int = 2;
 const SIGTERM: c_int = 15;
@@ -76,6 +84,30 @@ pub fn termination_pending() -> bool {
     rc != 0 || TERMINATION.iter().any(|s| set.contains(*s))
 }
 
+/// 子の起動前（`pre_exec`）に、中断シグナルのブロックを解除する（親のマスクの継承を打ち消す）。
+/// `cmd` で起こす子は、親が `block_termination_signals` 済みでも SIGINT・SIGTERM・SIGHUP を通常どおり受ける。
+/// `pre_exec` を使うため `posix_spawn` の経路は使われず、fork+exec になる。
+pub fn unblock_termination_signals_in_child(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    let mut set = SigSet::empty();
+    for s in TERMINATION {
+        set.add(s);
+    }
+    // SAFETY: `pre_exec` のクロージャは fork 後・exec 前の子で、非同期シグナル安全な呼び出しだけを行う必要がある。
+    // ここでは `pthread_sigmask`（async-signal-safe。POSIX）を、あらかじめスタック上に作った `set`（クロージャへ
+    // Copy で移動済み）に対して呼ぶだけで、アロケーション・ロック・panic を伴う処理をしない。失敗は errno を
+    // `io::Error` で返し、`spawn` が `Err` になる（子は exec しない）。
+    unsafe {
+        cmd.pre_exec(move || {
+            if pthread_sigmask(SIG_UNBLOCK, &raw const set, std::ptr::null_mut()) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
 /// 試験用: 呼び出しスレッドへ SIGTERM を送る（`raise` はスレッド宛て。ブロック済みなら保留になる）。
 #[cfg(test)]
 pub fn raise_sigterm() -> bool {
@@ -94,6 +126,41 @@ mod tests {
         assert_eq!((SIG_BLOCK, SIGHUP, SIGINT, SIGTERM), (0, 1, 2, 15));
         assert_eq!(size_of::<SigSet>(), 128);
         assert_eq!(align_of::<SigSet>(), 8);
+    }
+
+    /// 子の `SigBlk`（`/proc/<pid>/status`）を読む。
+    fn child_sigblk(cmd: &mut std::process::Command) -> u64 {
+        let mut child = cmd
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let status = std::fs::read_to_string(format!("/proc/{}/status", child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
+        let status = status.expect("read status");
+        let hex = status
+            .lines()
+            .find_map(|l| l.strip_prefix("SigBlk:"))
+            .expect("SigBlk line")
+            .trim();
+        u64::from_str_radix(hex, 16).expect("hex")
+    }
+
+    /// 親がブロック済みでも、適用した子の SigBlk は 0（対照: 適用しない子は継承して非 0）。
+    #[test]
+    fn child_does_not_inherit_the_blocked_termination_signals() {
+        std::thread::spawn(|| {
+            assert!(block_termination_signals());
+            let inherited = child_sigblk(&mut std::process::Command::new("sleep"));
+            // SIGHUP(1)・SIGINT(2)・SIGTERM(15) のビット。
+            assert_eq!(inherited & 0x4003, 0x4003);
+            let mut cmd = std::process::Command::new("sleep");
+            unblock_termination_signals_in_child(&mut cmd);
+            assert_eq!(child_sigblk(&mut cmd), 0);
+        })
+        .join()
+        .expect("thread");
     }
 
     #[test]

@@ -67,7 +67,7 @@ core の `delete` は使わない。ベンチのプロセスは試行ごとの s
 - 外部コマンドは argv 配列で渡し、シェルを使わない。`--supervisor-bin`・`--systemd-run` は絶対パスに限り、`PATH` から探さない
 - 起動前に、通常ファイル（symlink 不可）・実行ビットあり・group / other 書き込み不可・所有者が実効 UID か root・全祖先ディレクトリ（字面上と symlink 解決後の両方）が実効 UID か root 所有で other 書き込み不可・group 書き込み不可（自分の group でも拒否する。同 group の別 UID による差し替えを防ぐため。umask 002 で 0775 になる `target/` 配下は `chmod g-w` してから使う。sticky 付きは可）であることを検証する。検証から exec までの自分自身（同一 UID）による差し替えの TOCTOU は残る（開発者のローカル target 配下のバイナリを対象とする計測道具のため許容）。別 UID・別 group による差し替えは上の検証で拒否する
 - 作業ディレクトリ・状態ルートは 0700 で排他作成する。rootful（euid 0）は拒否する（SEC-5）
-- 出力に絶対パス・ホスト名・ユーザー名・OS のエラー文字列を載せない。新規の外部依存は無い。`unsafe` は `benches/src/sys.rs` の中断シグナル用 FFI ラッパー（`pthread_sigmask`・`sigpending`、試験のみ `raise`）だけで、`sys` の外へ公開しない（各ブロックに `// SAFETY:` を付け、Linux の x86_64 / aarch64 に限る。ハンドラは登録せず、ブロックして保留を確かめるだけ）
+- 出力に絶対パス・ホスト名・ユーザー名・OS のエラー文字列を載せない。新規の外部依存は無い。`unsafe` は `benches/src/sys.rs` の中断シグナル用 FFI ラッパー（`pthread_sigmask`・`sigpending`・子の `pre_exec` でのブロック解除、試験のみ `raise`）だけで、`sys` の外へ公開しない（各ブロックに `// SAFETY:` を付け、Linux の x86_64 / aarch64 に限る。ハンドラは登録せず、ブロックして保留を確かめるだけ）
 
 ## 残余・フォローアップ
 

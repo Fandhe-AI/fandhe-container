@@ -42,7 +42,8 @@
 //!   実行ファイルの所有者・権限の fd 経由の検証は特権経路のランチャー（#1719）の責務とする。
 //! - rootful の特権起動でランチャー（`fandhe-container-launcher`）を選ぶ規則は未実装（#1719・#1722）。
 //! - supervisor の stderr（構造化ログ）の保存先は未整備。
-//! - 親から継承した CLOEXEC の無い fd は、直接起動では閉じられない（ランチャー経由の起動は fd 3 以降を閉じる）。
+//! - 親から継承した CLOEXEC の無い fd は CLI では閉じない。supervisor の bin の入口が fd 3 以降を閉じる
+//!   （ランチャー経由と同じ処理。#2070・SEC-1）。exec から入口までの短い窓は残る。
 //! - core の本番 launcher（#1715 の Phase B）が入るまで、supervisor は `UNIMPLEMENTED` を報告する。
 
 use std::io::Read;

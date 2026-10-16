@@ -207,6 +207,12 @@ impl ControlAuditRelay {
         })
     }
 
+    /// helper の PID。呼び出し元（supervisor）が cgroup の退避で自プロセスと一緒に移す対象として宣言する
+    /// （`DelegatedCgroup::with_companions`。helper が委譲 cgroup に残ると退避が拒否される。CORE-3・SUP-1）。
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
     /// helper を SIGKILL する（pidfd 優先。無ければ未回収を確かめてから pid へ送る）。
     fn kill_helper(&self) {
         match &self.pidfd {

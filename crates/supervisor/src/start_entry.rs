@@ -1665,6 +1665,8 @@ mod linux {
         privilege: Result<IsolationPrivilege, TraitError>,
         cgroup: Option<HeldCgroup>,
         audit: Option<Arc<dyn AuditSink>>,
+        /// 退避で一緒に移す同伴プロセスの PID（監査 helper。`DelegatedCgroup::with_companions`）。
+        companions: Vec<u32>,
     }
 
     /// 手順 5 で作った cgroup（`release_cgroup` と launcher の参加フックの源で共有する）。
@@ -1719,7 +1721,15 @@ mod linux {
                 privilege,
                 cgroup: None,
                 audit: None,
+                companions: Vec::new(),
             }
+        }
+
+        /// cgroup の退避で自プロセスと一緒に移す同伴プロセス（入口が fork した監査 helper）の PID を宣言する。
+        #[must_use]
+        pub fn with_companions(mut self, pids: Vec<u32>) -> Self {
+            self.companions = pids;
+            self
         }
     }
 
@@ -1746,7 +1756,9 @@ mod linux {
             let to_trait = |e: fandhe_container_core::cgroups::CgroupError| {
                 TraitError::new(e.code, "failed to prepare the container cgroup")
             };
-            let delegated = DelegatedCgroup::detect().map_err(to_trait)?;
+            let delegated = DelegatedCgroup::detect()
+                .map_err(to_trait)?
+                .with_companions(&self.companions);
             let plan = CgroupLimitPlan::for_privilege(privilege);
             let recorder = OpRecorder::new();
             let prepared = delegated
@@ -1978,7 +1990,6 @@ mod linux {
             Err(e) => return fail(&mut out, op_err(e)),
         };
         let req = StartRequest::new(args.id.clone());
-        let deps = Box::new(ProductionStartDeps::new(args.root.clone()));
         // 制御チャネルの認証境界の拒否の記録先（SEC-4）。制御チャネルのサーバスレッドは監視スレッドと並行して動くため、
         // 複数スレッドでは `FileAuditSink` の隔離（fork）が使えない。そこで監査専用の helper プロセスを fork し、以後の
         // 記録はそこへ渡して期限付きで永続化する（`ControlAuditRelay`）。`spawn` は単一スレッドのときだけ成功するので、
@@ -1987,6 +1998,11 @@ mod linux {
         let audit = crate::exec::default_audit_sink(Some(args.root.clone()))
             .and_then(fandhe_container_core::audit_log::ControlAuditRelay::spawn)
             .map_err(|e| e.code());
+        // helper は fork 時点で委譲 cgroup に属するため、cgroup の準備（自プロセスの退避）へ同伴プロセスとして宣言し、
+        // 一緒に退避リーフへ移す（宣言しないと「他のプロセスがいる」として起動が拒否される。CORE-3・SUP-1）。
+        let companions: Vec<u32> = audit.as_ref().map(|r| vec![r.pid()]).unwrap_or_default();
+        let deps =
+            Box::new(ProductionStartDeps::new(args.root.clone()).with_companions(companions));
         // 回復・回収と報告の書き込みで同じ期限を共有し、報告を内部上限内に収める（REPAIR-5）。
         let deadline =
             Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
@@ -2052,6 +2068,15 @@ mod linux {
                 .map(|p| p + entry)
                 .expect("run_start_until call in the entry");
             assert!(spawn < run, "relay must be spawned before run_start_until");
+            // CORE-3・SUP-1: helper は委譲 cgroup に属するため、deps へ同伴プロセスとして宣言してから起動する。
+            let deps = src[entry..]
+                .find(".with_companions(companions)")
+                .map(|p| p + entry)
+                .expect("companions declared to the start deps");
+            assert!(
+                spawn < deps && deps < run,
+                "helper must be declared as a cgroup companion before run_start_until"
+            );
         }
 
         /// 資格情報だけを変えた `/proc/self/status` の fixture（必須項目は縮退後の非特権プロセス相当）。

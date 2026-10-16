@@ -794,6 +794,9 @@ pub struct DelegatedCgroup {
     path: CgroupPath,
     fd: OwnedFd,
     controllers: ControllerSet,
+    /// 自プロセスと一緒に退避リーフへ移す同伴プロセスの PID（自プロセスが fork した補助 helper。
+    /// 空なら従来どおり自プロセス以外がいる親を拒否する）。
+    companions: Vec<u32>,
 }
 
 /// コンテナ用子 cgroup。O_PATH ディレクトリ fd を保持し、fork 後の子が fd 経由で `cgroup.procs` へ
@@ -930,6 +933,8 @@ struct Rollback {
     /// 新規作成した退避リーフの fd（`leaf_created` のときのみ）。削除時の同一性確認に使う。
     /// 作成後に開けなかった場合は `None` のままで、名前指定の削除に落ちる（結果に未検証と記す）。
     leaf_fd: Option<OwnedFd>,
+    /// 退避リーフへ移した同伴プロセスの PID（巻き戻しで親へ戻す）。
+    moved_companions: Vec<u32>,
 }
 
 /// `parent` 配下の `name` を名前指定で削除する（保持 fd が無い巻き戻し経路専用）。
@@ -982,7 +987,18 @@ impl DelegatedCgroup {
             path,
             fd,
             controllers,
+            companions: Vec::new(),
         })
+    }
+
+    /// `prepare` が自プロセスと一緒に退避リーフへ移す同伴プロセスを宣言する。
+    ///
+    /// 呼び出し元は、自プロセスが fork した監査 helper の PID を渡す（supervisor の制御チャネル。SUP-1・SEC-4・#2058）。
+    /// 宣言した PID 以外の他者は従来どおり動かさず拒否する（他者の PID を移さない）。
+    #[must_use]
+    pub fn with_companions(mut self, pids: &[u32]) -> Self {
+        self.companions = pids.to_vec();
+        self
     }
 
     /// 親 cgroup で利用可能な controller（`cgroup.controllers`）。
@@ -1038,7 +1054,10 @@ impl DelegatedCgroup {
                 "current process is not in the detected delegated cgroup; refusing to evacuate",
             ));
         }
-        if parent_procs.iter().any(|p| *p != me) {
+        if parent_procs
+            .iter()
+            .any(|p| *p != me && !self.companions.contains(p))
+        {
             return Err(CgroupError::precondition(
                 CgroupStep::Evacuate,
                 "delegated cgroup contains other processes; refusing to move them",
@@ -1059,7 +1078,12 @@ impl DelegatedCgroup {
             };
 
         let mut rollback = Rollback::default();
-        match self.evacuate_and_verify(child_fd.as_fd(), &mut rollback) {
+        let companions: Vec<u32> = parent_procs
+            .iter()
+            .copied()
+            .filter(|p| *p != me && self.companions.contains(p))
+            .collect();
+        match self.evacuate_and_verify(child_fd.as_fd(), &companions, &mut rollback) {
             Ok(parent_id) => Ok((
                 ContainerCgroup {
                     name: name.clone(),
@@ -1080,6 +1104,10 @@ impl DelegatedCgroup {
                         "; restoring process membership failed ({})",
                         e.message
                     ));
+                }
+                // 同伴プロセスも best-effort で親へ戻す（既に終了していれば失敗しても構わない）。
+                for pid in &rollback.moved_companions {
+                    let _ = self.write_pid_to(self.fd.as_fd(), *pid, CgroupStep::Cleanup);
                 }
                 if rollback.leaf_created {
                     match &rollback.leaf_fd {
@@ -1135,11 +1163,27 @@ impl DelegatedCgroup {
         Ok(())
     }
 
+    /// `dir` の `cgroup.procs` へ `pid` を 1 件書く（書き込みは 1 回に 1 PID。毎回開き直す）。
+    fn write_pid_to(
+        &self,
+        dir: BorrowedFd<'_>,
+        pid: u32,
+        step: CgroupStep,
+    ) -> Result<(), CgroupError> {
+        let procs = cstring(step, "cgroup.procs")?;
+        let wfd = sys::open_write_at(dir, &procs)
+            .map_err(|e| sys_error(step, "open cgroup.procs for a companion", e))?;
+        File::from(wfd)
+            .write_all(pid.to_string().as_bytes())
+            .map_err(|e| io_error(step, "write cgroup.procs for a companion", &e))
+    }
+
     /// 自プロセスを退避リーフへ移し、退避を検証する。成功時は親 cgroup の (dev, ino) を返す。
     /// `child` は `prepare` が作成直後に固定したコンテナ用子 cgroup の fd。
     fn evacuate_and_verify(
         &self,
         child: BorrowedFd<'_>,
+        companions: &[u32],
         rollback: &mut Rollback,
     ) -> Result<(u64, u64), CgroupError> {
         // 退避リーフ。既存なら再利用（cgroup2 であることは open_cgroup_dir が確認する）。
@@ -1168,6 +1212,12 @@ impl DelegatedCgroup {
         File::from(wfd)
             .write_all(std::process::id().to_string().as_bytes())
             .map_err(|e| io_error(CgroupStep::Evacuate, "write leaf cgroup.procs", &e))?;
+        // 宣言された同伴プロセス（監査 helper）も同じリーフへ移す。親に残ると検証 1 とコンテナの
+        // 起動前提（親が空）を満たさない。
+        for pid in companions {
+            rollback.moved_companions.push(*pid);
+            self.write_pid_to(leaf_fd.as_fd(), *pid, CgroupStep::Evacuate)?;
+        }
 
         let verify = CgroupStep::VerifyEvacuation;
         // 検証 1: 親に誰も残っていない。

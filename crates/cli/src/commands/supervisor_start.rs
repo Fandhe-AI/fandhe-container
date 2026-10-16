@@ -9,11 +9,33 @@
 //! 残す経路は無い（#1541）。報告の復号は契約の型（`StartReport::decode`）に任せ、ここで書式を組まない・割らない（REPAIR-2）。
 //!
 //! # 契約の要点（呼び出し側の責務。詳細は `start_contract` の module doc）
-//! - argv: `start --root <状態ルートの絶対パス> <id>`（`--restart` は渡さず既定の `no`）。環境変数は契約に含まれないため、
-//!   `env_clear` の後に固定の `PATH` だけを渡す（ランチャー経由の起動と同じ環境）。cwd は `/`。
+//! - argv: `start --root <状態ルートの絶対パス> <id>`（`--restart` は渡さず既定の `no`）。`env_clear` の後に渡す環境は
+//!   許可リストの 2 つだけ: 固定の `PATH` と、`XDG_RUNTIME_DIR`（systemd-run が user マネージャへ接続するため。絶対パスを検証する）。
+//!   `DBUS_SESSION_BUS_ADDRESS` は渡さない（sd-bus のアドレスは `unixexec:` 等で任意プログラムの起動や接続先の付け替えができ、
+//!   user マネージャの直結ソケット `$XDG_RUNTIME_DIR/systemd/private` だけで足りる。`man sd_bus_default` と systemd の
+//!   `src/shared/bus-util.c` の `bus_connect_user_systemd`）。supervisor は契約の値を環境から読まず、状態ルートは常に
+//!   `--root` で受けるため、契約に反しない。cwd は `/`。
 //! - stdin は null、stdout は結果の pipe、stderr は null。supervisor の構造化ログは stderr へ出るが、CLI の stderr は
 //!   「失敗時に 1 行の JSON」という契約のため混ぜず、受け手を置かない（保存先は未整備。下記）。
 //! - `process_group(0)` で別のプロセスグループにし、端末の SIGINT / SIGHUP が supervisor に届かないようにする。
+//!
+//! # 委譲スコープでの起動（#2081・CORE-3・CORE-4・SEC-5）
+//! supervisor 側の `DelegatedCgroup::prepare` は、委譲された親 cgroup に自分以外のプロセスがいると拒否する。CLI と同じ
+//! cgroup（端末のシェルと同居）で起動するとほぼ必ず拒否されるため、`systemd-run --user --scope --quiet -p Delegate=yes --`
+//! （`start_contract::USER_SCOPE_WRAPPER_ARGS`）で包み、supervisor を新しい scope で一人で動かす。
+//! systemd-run は scope の登録後に同じプロセスで `execvpe` する（`man systemd-run` の「scope として実行するコマンドは
+//! systemd-run 自身が親プロセスとして実行し〜同期的」の段落と systemd の `src/run/run.c` の `start_transient_scope`）。
+//! したがって spawn した `Child` の pid・`process_group(0)`・stdio・渡した環境はそのまま supervisor のものになり、
+//! CLI は scope に居残らない。scope の取得時間も受信期限（36 秒）に含まれる。
+//! fail-closed（案 B の「CLI の cgroup の下に子 cgroup を作る」へは落とさない）の判定はすべて spawn の前に行う。
+//! - rootful（`/proc/self/status` の uid のどれかが 0）: `UNIMPLEMENTED`（supervisor の判定と同じ文）。
+//! - `systemd-run` が固定候補（`/usr/sbin`・`/usr/bin`・`/sbin`・`/bin`。`PATH` 探索はしない。PLUG-11）に無い、または
+//!   実体が root 所有の通常ファイルで group / other 書き込み不可（祖先ディレクトリも同様）でない: `FAILED_PRECONDITION`。
+//!   検証から exec までの TOCTOU は、root 所有で非 root が書けない場所に限ることで抑える（CLI と supervisor は同じ uid で
+//!   権限の境界が無いため、fd 経由の検証は特権ランチャー〔#1719〕の責務とする）。
+//! - `XDG_RUNTIME_DIR` が絶対パスでない、または `systemd/private` が euid 所有のソケットでない（symlink は辿らない）:
+//!   `FAILED_PRECONDITION`（user マネージャに届かない）。
+//! - 委譲が効いていない場合の判定は supervisor の `detect` / `prepare` が行い、その報告を `map_received` が写す。
 //!
 //! # 期限と子の扱い（REPAIR-5）
 //! - 受信期限は `cli_receive_deadline`（既定 36 秒）。期限内に 1 行が来なければ `TIMEOUT`（結果不明）、1 行も無いまま EOF なら
@@ -47,9 +69,17 @@
 //! - 親から継承した CLOEXEC の無い fd は CLI では閉じない。supervisor の bin の入口が fd 3 以降を閉じる
 //!   （ランチャー経由と同じ処理。#2070・SEC-1）。exec から入口までの短い窓は残る。
 //! - core の本番 launcher（#1715 の Phase B）が入るまで、supervisor は `UNIMPLEMENTED` を報告する。
+//! - 1 行も無いまま EOF のとき、supervisor の異常終了と systemd-run の失敗（D-Bus 接続の失敗等）を区別できない
+//!   （stderr を pipe にすると supervisor の構造化ログが混ざり、CLI の終了後に EPIPE になるため採らない。制御チャネル #2058 の後の課題）。
+//! - 固定候補の外にある `systemd-run`（NixOS 等）には未対応。
+//! - 試験専用 feature `start-test-support` のときだけ、環境変数 `FANDHE_CONTAINER_TEST_SYSTEMD_RUN`（絶対パス）で
+//!   systemd-run の解決を差し替えられる（所有者の検証だけを飛ばす。他の検査は飛ばさない）。本番のビルドにはこの環境変数を
+//!   読むコードが存在せず、最適化ビルドで feature を有効にするとコンパイルが止まる（`lib.rs`）。
 
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::num::NonZeroU32;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -59,8 +89,9 @@ use std::time::Duration;
 use fandhe_container_core::oci_runtime::{LifecycleOp, OciRuntimeError, StartTimeouts};
 use fandhe_container_core::traits::{ContainerId, ErrorCode};
 use fandhe_container_supervisor::launcher::SUPERVISOR_FILE_NAME;
+use fandhe_container_supervisor::privilege::parse_proc_status;
 use fandhe_container_supervisor::start_contract::{
-    MAX_REPORT_LEN, StartReport, cli_receive_deadline,
+    MAX_REPORT_LEN, StartReport, USER_SCOPE_WRAPPER_ARGS, cli_receive_deadline,
 };
 
 /// supervisor へ渡す `PATH` の値（固定）。ランチャーの `FIXED_PATH_ENV` と同値で、呼び出し元の `PATH` は渡さない。
@@ -138,6 +169,9 @@ fn receive_report(out: impl Read + Send + 'static, within: Duration) -> Received
     }
 }
 
+/// 1 行も無いまま EOF のときの message（supervisor の異常終了と systemd-run の失敗を区別できない。REPAIR-3）。
+const EOF_MESSAGE: &str = "supervisor exited without reporting a start result (systemd-run may have failed to create the user scope)";
+
 /// 受信結果を `start` の結果へ写す（ERR-1・ERR-2）。報告は untrusted として復号で検証済みの値だけを使い、
 /// 壊れた報告は `INTERNAL` で fail-closed にする（利用者の引数の誤りではないため `INVALID_ARGUMENT` には写さない）。
 fn map_received(received: Received) -> Result<NonZeroU32, OciRuntimeError> {
@@ -150,10 +184,7 @@ fn map_received(received: Received) -> Result<NonZeroU32, OciRuntimeError> {
             }
             Ok(_) | Err(_) => Err(start_error(ErrorCode::Internal, MALFORMED)),
         },
-        Received::Eof => Err(start_error(
-            ErrorCode::Internal,
-            "supervisor exited without reporting a start result",
-        )),
+        Received::Eof => Err(start_error(ErrorCode::Internal, EOF_MESSAGE)),
         Received::ReadError => Err(start_error(
             ErrorCode::Internal,
             "failed to read the supervisor start result",
@@ -206,7 +237,7 @@ fn launch_and_receive(
             let err = if e.kind() == std::io::ErrorKind::NotFound {
                 start_error(
                     ErrorCode::FailedPrecondition,
-                    "supervisor executable is not installed",
+                    "systemd-run is not installed; starting a container requires a systemd user manager",
                 )
             } else {
                 start_error(
@@ -238,9 +269,166 @@ fn production_deadline() -> Duration {
     cli_receive_deadline(&StartTimeouts::default())
 }
 
-/// 本番入口: supervisor を起動して pid か構造化エラーを期限付きで受け取る。
+/// systemd-run の固定の探索先（`SUPERVISOR_PATH_ENV` と同じ順序。`PATH` 探索はしない。PLUG-11）。
+const SYSTEMD_RUN_DIRS: [&str; 4] = ["/usr/sbin", "/usr/bin", "/sbin", "/bin"];
+
+/// 固定候補に置く systemd-run の実行ファイル名。
+const SYSTEMD_RUN_NAME: &str = "systemd-run";
+
+/// 試験専用: systemd-run の解決を差し替える環境変数（feature `start-test-support` のときだけ読む）。
+#[cfg(feature = "start-test-support")]
+const TEST_SYSTEMD_RUN_ENV: &str = "FANDHE_CONTAINER_TEST_SYSTEMD_RUN";
+
+/// `/proc/self/status` の読み取り上限（`privilege::MAX_STATUS_BYTES` と同じ）。
+const MAX_STATUS_READ: u64 = fandhe_container_supervisor::privilege::MAX_STATUS_BYTES as u64;
+
+/// rootful 判定と euid の取得（純関数。SEC-5）。real / effective / saved / fs の uid のどれかが 0 なら
+/// supervisor の `privilege_for_status` と同じ文で `UNIMPLEMENTED`、読めない・壊れた入力は `FAILED_PRECONDITION`。
+fn privilege_gate(status_text: &str) -> Result<u32, OciRuntimeError> {
+    let snapshot = parse_proc_status(status_text).map_err(|_| {
+        start_error(
+            ErrorCode::FailedPrecondition,
+            "process status is unreadable",
+        )
+    })?;
+    let uid = snapshot.uid;
+    if [uid.real, uid.effective, uid.saved, uid.fs].contains(&0) {
+        return Err(start_error(
+            ErrorCode::Unimplemented,
+            "rootful start is not supported by the production launcher",
+        ));
+    }
+    Ok(uid.effective)
+}
+
+/// `/proc/self/status` を上限つきで読む。
+fn read_self_status() -> Result<String, OciRuntimeError> {
+    let unreadable = || {
+        start_error(
+            ErrorCode::FailedPrecondition,
+            "process status is unreadable",
+        )
+    };
+    let file = std::fs::File::open("/proc/self/status").map_err(|_| unreadable())?;
+    let mut text = String::new();
+    file.take(MAX_STATUS_READ + 1)
+        .read_to_string(&mut text)
+        .map_err(|_| unreadable())?;
+    Ok(text)
+}
+
+/// group / other に書き込み権が無く、所有者が `owner` であること。
+fn is_owned_and_closed(meta: &std::fs::Metadata, owner: u32) -> bool {
+    meta.uid() == owner && meta.mode() & 0o022 == 0
+}
+
+/// 固定候補から systemd-run の実体を決める（PLUG-11 の方針に揃え `PATH` 探索をしない）。
+///
+/// 最初に存在した候補を `canonicalize`（usrmerge の `/bin -> usr/bin` を解く）し、実体が実行ビットのある通常ファイルで
+/// `required_owner` 所有・group / other 書き込み不可、かつ `ancestor_floor` 以下の祖先ディレクトリがすべて同じ条件であることを
+/// 確かめる。本番は `required_owner = 0`・`ancestor_floor = "/"`。試験は一時ディレクトリを floor にして成功経路を確かめる。
+fn resolve_systemd_run(
+    candidates: &[&Path],
+    required_owner: u32,
+    ancestor_floor: &Path,
+) -> Result<PathBuf, OciRuntimeError> {
+    let Some(real) = candidates
+        .iter()
+        .find_map(|c| std::fs::canonicalize(c).ok())
+    else {
+        return Err(start_error(
+            ErrorCode::FailedPrecondition,
+            "systemd-run is not installed; starting a container requires a systemd user manager",
+        ));
+    };
+    let untrusted = || {
+        start_error(
+            ErrorCode::FailedPrecondition,
+            "systemd-run is not a trusted executable (must be a root-owned regular file not writable by group or others)",
+        )
+    };
+    let meta = std::fs::metadata(&real).map_err(|_| untrusted())?;
+    if !meta.is_file() || meta.mode() & 0o111 == 0 || !is_owned_and_closed(&meta, required_owner) {
+        return Err(untrusted());
+    }
+    for dir in real.ancestors().skip(1) {
+        if !dir.starts_with(ancestor_floor) {
+            break;
+        }
+        let m = std::fs::metadata(dir).map_err(|_| untrusted())?;
+        if !m.is_dir() || !is_owned_and_closed(&m, required_owner) {
+            return Err(untrusted());
+        }
+    }
+    Ok(real)
+}
+
+/// 本番の systemd-run の解決（試験専用 feature のときだけ環境変数で差し替えられる）。
+fn locate_systemd_run() -> Result<PathBuf, OciRuntimeError> {
+    #[cfg(feature = "start-test-support")]
+    if let Some(p) = std::env::var_os(TEST_SYSTEMD_RUN_ENV) {
+        let p = PathBuf::from(p);
+        if p.is_absolute() {
+            return Ok(p);
+        }
+    }
+    let candidates: Vec<PathBuf> = SYSTEMD_RUN_DIRS
+        .iter()
+        .map(|d| Path::new(d).join(SYSTEMD_RUN_NAME))
+        .collect();
+    let refs: Vec<&Path> = candidates.iter().map(PathBuf::as_path).collect();
+    resolve_systemd_run(&refs, 0, Path::new("/"))
+}
+
+/// systemd の user マネージャに届くかを検査し、環境へ渡す `XDG_RUNTIME_DIR` の値を返す（純関数に近い検査）。
+///
+/// 値は絶対パスであること、`<値>/systemd/private` が symlink でなく euid 所有のソケットであること（直結ソケット。
+/// systemd-run `--user` の接続先）を確かめる。値そのものはエラー文に載せない。
+fn user_manager_env(xdg: Option<&OsStr>, euid: u32) -> Result<OsString, OciRuntimeError> {
+    let unset = || {
+        start_error(
+            ErrorCode::FailedPrecondition,
+            "XDG_RUNTIME_DIR is not set to an absolute path; the systemd user manager is not reachable",
+        )
+    };
+    let xdg = xdg.filter(|v| !v.is_empty()).ok_or_else(unset)?;
+    let dir = Path::new(xdg);
+    if !dir.is_absolute() {
+        return Err(unset());
+    }
+    let sock = dir.join("systemd").join("private");
+    let unreachable = || {
+        start_error(
+            ErrorCode::FailedPrecondition,
+            "systemd user manager is not reachable (no private socket under XDG_RUNTIME_DIR)",
+        )
+    };
+    let meta = std::fs::symlink_metadata(&sock).map_err(|_| unreachable())?;
+    if !meta.file_type().is_socket() || meta.uid() != euid {
+        return Err(unreachable());
+    }
+    Ok(xdg.to_os_string())
+}
+
+/// systemd-run で包んだ起動コマンドを組む（シェルも文字列連結も使わない）。内側の設定は [`configure`]。
+fn scoped_command(
+    systemd_run: &Path,
+    supervisor: &Path,
+    root: &Path,
+    id: &ContainerId,
+    xdg: &OsStr,
+) -> Command {
+    let mut cmd = Command::new(systemd_run);
+    cmd.args(USER_SCOPE_WRAPPER_ARGS).arg(supervisor);
+    configure(&mut cmd, root, id);
+    cmd.env("XDG_RUNTIME_DIR", xdg);
+    cmd
+}
+
+/// 本番入口: supervisor を委譲 scope で起動して pid か構造化エラーを期限付きで受け取る。
 ///
 /// `root` は `StateRoot::resolve` で解決した絶対パス。`id` は `ContainerId::new` で検証済みの値。
+/// 事前検査（supervisor の実在・rootful・systemd-run・user マネージャ）はすべて spawn の前に行い、失敗は案 B へ落とさず返す。
 pub(super) fn start_via_supervisor(
     root: &Path,
     id: &ContainerId,
@@ -252,8 +440,16 @@ pub(super) fn start_via_supervisor(
         )
     })?;
     let program = supervisor_path_beside(&cli_exe)?;
-    let mut cmd = Command::new(program);
-    configure(&mut cmd, root, id);
+    if !std::fs::metadata(&program).is_ok_and(|m| m.is_file()) {
+        return Err(start_error(
+            ErrorCode::FailedPrecondition,
+            "supervisor executable is not installed",
+        ));
+    }
+    let euid = privilege_gate(&read_self_status()?)?;
+    let systemd_run = locate_systemd_run()?;
+    let xdg = user_manager_env(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), euid)?;
+    let cmd = scoped_command(&systemd_run, &program, root, id, &xdg);
     let (result, child) = launch_and_receive(cmd, production_deadline());
     // supervisor は CLI より長く生きる。wait も kill もせずに手放す。
     drop(child);
@@ -429,10 +625,7 @@ mod tests {
         reap(child);
         let e = result.expect_err("eof");
         assert_eq!(e.code(), ErrorCode::Internal);
-        assert_eq!(
-            e.message(),
-            "supervisor exited without reporting a start result"
-        );
+        assert_eq!(e.message(), EOF_MESSAGE);
         fx.assert_state_untouched();
     }
 
@@ -479,7 +672,10 @@ mod tests {
         let e = result.expect_err("not installed");
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
         assert_eq!(e.exit_code().get(), 5);
-        assert_eq!(e.message(), "supervisor executable is not installed");
+        assert_eq!(
+            e.message(),
+            "systemd-run is not installed; starting a container requires a systemd user manager"
+        );
         fx.assert_state_untouched();
     }
 
@@ -528,5 +724,195 @@ mod tests {
             [("PATH".to_string(), Some(SUPERVISOR_PATH_ENV.to_string()))]
         );
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
+    }
+
+    /// 擬似の `/proc/self/status`（uid の 4 つ組だけ可変）。
+    fn status_with_uid(uid: &str) -> String {
+        format!(
+            "Name:\tx\nUid:\t{uid}\nGid:\t1000\t1000\t1000\t1000\nGroups:\t\nNoNewPrivs:\t0\nCapInh:\t0000000000000000\nCapPrm:\t0000000000000000\nCapEff:\t0000000000000000\nCapBnd:\t000001ffffffffff\nCapAmb:\t0000000000000000\n"
+        )
+    }
+
+    /// SEC-5・CLI-1: rootful（どの位置の uid が 0 でも）は UNIMPLEMENTED で拒否し、壊れた入力は FAILED_PRECONDITION。
+    #[test]
+    fn sec5_cli_rootful_is_unimplemented() {
+        assert_eq!(
+            privilege_gate(&status_with_uid("1000\t1000\t1000\t1000")).expect("rootless"),
+            1000
+        );
+        for uid in [
+            "0\t1000\t1000\t1000",
+            "1000\t0\t1000\t1000",
+            "1000\t1000\t0\t1000",
+            "1000\t1000\t1000\t0",
+        ] {
+            let e = privilege_gate(&status_with_uid(uid)).expect_err(uid);
+            assert_eq!(e.code(), ErrorCode::Unimplemented, "{uid}");
+            assert_eq!(e.exit_code().get(), 8, "{uid}");
+            assert_eq!(
+                e.message(),
+                "rootful start is not supported by the production launcher"
+            );
+        }
+        for bad in ["", "garbage"] {
+            let e = privilege_gate(bad).expect_err(bad);
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), "process status is unreadable");
+        }
+    }
+
+    /// CORE-3・SUP-1: systemd-run で包んだ argv・環境・cwd は固定（環境は PATH と XDG_RUNTIME_DIR だけ）。
+    #[test]
+    fn core3_sup1_scoped_command_argv_env_cwd() {
+        let id = ContainerId::new("c1").expect("id");
+        let cmd = scoped_command(
+            Path::new("/usr/bin/systemd-run"),
+            Path::new("/opt/x/fandhe-container-supervisor"),
+            Path::new("/r"),
+            &id,
+            OsStr::new("/run/user/1000"),
+        );
+        assert_eq!(cmd.get_program(), "/usr/bin/systemd-run");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "-p",
+                "Delegate=yes",
+                "--",
+                "/opt/x/fandhe-container-supervisor",
+                "start",
+                "--root",
+                "/r",
+                "c1"
+            ]
+        );
+        let mut envs: Vec<_> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        envs.sort();
+        assert_eq!(
+            envs,
+            [
+                ("PATH".to_string(), Some(SUPERVISOR_PATH_ENV.to_string())),
+                (
+                    "XDG_RUNTIME_DIR".to_string(),
+                    Some("/run/user/1000".to_string())
+                )
+            ]
+        );
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    fn self_uid() -> u32 {
+        std::fs::metadata("/proc/self").expect("meta").uid()
+    }
+
+    /// CLI-1・PLUG-11: systemd-run の解決。候補が無い・所有者違い・書き込み可・非通常ファイル・実行ビット無しは拒否し、
+    /// 条件を満たす実体（symlink 経由なら解決後のパス）だけを返す。
+    #[test]
+    fn cli1_systemd_run_resolution() {
+        const NOT_INSTALLED: &str =
+            "systemd-run is not installed; starting a container requires a systemd user manager";
+        const UNTRUSTED: &str = "systemd-run is not a trusted executable (must be a root-owned regular file not writable by group or others)";
+        let tmp = TmpDir::new("sdrun");
+        let me = self_uid();
+        let floor = std::fs::canonicalize(&tmp.0).expect("canon");
+        let bin = floor.join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        set_mode(&bin, 0o755);
+        let exe = bin.join("systemd-run");
+
+        let missing = bin.join("nope");
+        let e = resolve_systemd_run(&[missing.as_path()], me, &floor).expect_err("missing");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), NOT_INSTALLED);
+
+        std::fs::write(&exe, b"#!/bin/sh\n").expect("write");
+        for (mode, why) in [(0o775, "group-w"), (0o757, "other-w"), (0o644, "no-exec")] {
+            set_mode(&exe, mode);
+            let e = resolve_systemd_run(&[exe.as_path()], me, &floor).expect_err(why);
+            assert_eq!(e.message(), UNTRUSTED, "{why}");
+        }
+        set_mode(&exe, 0o755);
+        let e =
+            resolve_systemd_run(&[exe.as_path()], me.wrapping_add(1), &floor).expect_err("owner");
+        assert_eq!(e.message(), UNTRUSTED);
+        let e = resolve_systemd_run(&[bin.as_path()], me, &floor).expect_err("dir");
+        assert_eq!(e.message(), UNTRUSTED);
+
+        assert_eq!(
+            resolve_systemd_run(&[missing.as_path(), exe.as_path()], me, &floor).expect("ok"),
+            exe
+        );
+        // 祖先ディレクトリが group / other 書き込み可なら拒否する。
+        set_mode(&bin, 0o775);
+        let e = resolve_systemd_run(&[exe.as_path()], me, &floor).expect_err("ancestor");
+        assert_eq!(e.message(), UNTRUSTED);
+        set_mode(&bin, 0o755);
+        // symlink 経由の候補は実体のパスを返す。
+        let link_dir = floor.join("link");
+        std::os::unix::fs::symlink(&bin, &link_dir).expect("symlink");
+        let via = link_dir.join("systemd-run");
+        assert_eq!(
+            resolve_systemd_run(&[via.as_path()], me, &floor).expect("via link"),
+            exe
+        );
+    }
+
+    /// CLI-1: user マネージャの到達性。未設定・空・相対パス・ソケット無し・通常ファイル・symlink は拒否し、
+    /// euid 所有のソケットなら値を返す。
+    #[test]
+    fn cli1_user_manager_env() {
+        const UNSET: &str = "XDG_RUNTIME_DIR is not set to an absolute path; the systemd user manager is not reachable";
+        const UNREACHABLE: &str =
+            "systemd user manager is not reachable (no private socket under XDG_RUNTIME_DIR)";
+        let me = self_uid();
+        for bad in [None, Some(OsStr::new("")), Some(OsStr::new("rel/dir"))] {
+            let e = user_manager_env(bad, me).expect_err("unset");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), UNSET);
+        }
+        let tmp = TmpDir::new("xdg");
+        let xdg = tmp.0.join("xdg");
+        std::fs::create_dir_all(xdg.join("systemd")).expect("mkdir");
+        let e = user_manager_env(Some(xdg.as_os_str()), me).expect_err("no socket");
+        assert_eq!(e.message(), UNREACHABLE);
+        let sock = xdg.join("systemd").join("private");
+        std::fs::write(&sock, b"").expect("file");
+        let e = user_manager_env(Some(xdg.as_os_str()), me).expect_err("regular file");
+        assert_eq!(e.message(), UNREACHABLE);
+        std::fs::remove_file(&sock).expect("rm");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+        assert_eq!(
+            user_manager_env(Some(xdg.as_os_str()), me).expect("socket"),
+            xdg.as_os_str()
+        );
+        let e = user_manager_env(Some(xdg.as_os_str()), me.wrapping_add(1)).expect_err("owner");
+        assert_eq!(e.message(), UNREACHABLE);
+        // symlink は辿らない（ソケットへの symlink でも拒否）。
+        let xdg2 = tmp.0.join("xdg2");
+        std::fs::create_dir_all(xdg2.join("systemd")).expect("mkdir");
+        std::os::unix::fs::symlink(&sock, xdg2.join("systemd").join("private")).expect("symlink");
+        let e = user_manager_env(Some(xdg2.as_os_str()), me).expect_err("symlink");
+        assert_eq!(e.message(), UNREACHABLE);
+        drop(listener);
     }
 }

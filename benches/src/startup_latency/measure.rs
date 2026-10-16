@@ -763,9 +763,6 @@ pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
     plan.supervisor_bin = verify_executable(&plan.supervisor_bin, euid)?;
     plan.systemd_run = verify_executable(&plan.systemd_run, euid)?;
 
-    // user マネージャへ直結できるか（本番の `start` と同じ判定）。作業ディレクトリを作る前に fail-closed で止める。
-    let xdg_runtime_dir = user_manager_env(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), euid)?;
-
     // 作業ディレクトリの親は全祖先の所有者・書き込み権限を検証し、実体パスだけを使う。
     let base: PathBuf = verify_work_base(
         &match &plan.work_dir {
@@ -774,6 +771,11 @@ pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
         },
         euid,
     )?;
+
+    // user マネージャへ直結できるか（本番の `start` と同じ判定）。作業ディレクトリを作る前に fail-closed で止める。
+    // work-dir の拒否が user マネージャの有無に依存しないよう、work-dir の検証より後ろに置く。
+    let xdg_runtime_dir = user_manager_env(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), euid)?;
+
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())

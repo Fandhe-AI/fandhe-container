@@ -1,7 +1,7 @@
 //! 起動する外部実行ファイル（supervisor の bin・`systemd-run`）の事前検証（TASK-190・OWASP 不安全な設計）。
 //!
 //! ベンチは `--supervisor-bin` / `--systemd-run` で受けた絶対パスを起動する。他ユーザーが差し替えられる実行ファイルを
-//! 起動しないよう、起動前に所有者・書き込み権限・symlink・親ディレクトリを検証する。検証から exec までの TOCTOU は
+//! 起動しないよう、起動前に所有者・書き込み権限・symlink・全祖先ディレクトリを検証する。検証から exec までの TOCTOU は
 //! 残る（開発者のローカル target ディレクトリを対象とする計測道具のため許容し、doc に記す）。
 //! `std::os::unix::fs::MetadataExt` だけで行い、`unsafe` は使わない。
 
@@ -14,7 +14,7 @@ fn untrusted(message: &str) -> StartupLatencyError {
 }
 
 /// 実行ファイルを検証する。絶対パス・symlink でない通常ファイル・実行ビットあり・group/other 書き込み不可・
-/// 所有者が `euid` か root・親ディレクトリが other 書き込み不可、をすべて満たさなければ拒否する。
+/// 所有者が `euid` か root・全祖先ディレクトリ（字面上と実体の両方）が実効 UID か root 所有で group / other 書き込み不可（sticky 付きは可）、をすべて満たさなければ拒否する。
 pub fn verify_executable(path: &Path, euid: u32) -> Result<(), StartupLatencyError> {
     if !path.is_absolute() {
         return Err(StartupLatencyError::new(
@@ -39,13 +39,36 @@ pub fn verify_executable(path: &Path, euid: u32) -> Result<(), StartupLatencyErr
     if meta.uid() != euid && meta.uid() != 0 {
         return Err(untrusted("executable owner is neither the caller nor root"));
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| untrusted("executable has no parent directory"))?;
-    let parent_meta =
-        std::fs::metadata(parent).map_err(|_| untrusted("parent directory is not accessible"))?;
-    if parent_meta.mode() & 0o002 != 0 {
-        return Err(untrusted("parent directory is writable by others"));
+    // 字面上の祖先と、symlink を解決した実体の祖先の両方を検証する。symlink の差し替えにはそれを置く
+    // ディレクトリの書き込み権が要るため、字面上の祖先の検証がそれも覆う。
+    let real =
+        std::fs::canonicalize(path).map_err(|_| untrusted("executable is not accessible"))?;
+    for chain in [path, real.as_path()] {
+        for dir in chain.ancestors().skip(1) {
+            verify_ancestor(dir, euid)?;
+        }
+    }
+    Ok(())
+}
+
+/// 祖先ディレクトリ 1 つを検証する。ディレクトリで、所有者が `euid` か root で、group / other 書き込み不可
+/// （sticky ビット付きは `/tmp` のように他者が差し替えられないため許容）であること。
+fn verify_ancestor(dir: &Path, euid: u32) -> Result<(), StartupLatencyError> {
+    let meta =
+        std::fs::metadata(dir).map_err(|_| untrusted("ancestor directory is not accessible"))?;
+    if !meta.is_dir() {
+        return Err(untrusted("ancestor is not a directory"));
+    }
+    if meta.uid() != euid && meta.uid() != 0 {
+        return Err(untrusted(
+            "ancestor directory owner is neither the caller nor root",
+        ));
+    }
+    let mode = meta.mode();
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(untrusted(
+            "ancestor directory is writable by group or others",
+        ));
     }
     Ok(())
 }
@@ -114,6 +137,58 @@ mod tests {
         let d = Dir::new("w");
         assert_eq!(
             verify_executable(&d.file("bin", 0o777), euid())
+                .expect_err("reject")
+                .code,
+            "untrusted-binary"
+        );
+    }
+
+    /// 祖先が group 書き込み可なら、実行ファイル自体が 0755 でも拒否する。
+    #[test]
+    fn group_writable_ancestor_is_rejected() {
+        let d = Dir::new("gw");
+        let sub = d.0.join("sub");
+        std::fs::create_dir(&sub).expect("mkdir");
+        let f = sub.join("bin");
+        std::fs::write(&f, b"x").expect("write");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // 直近の親ではなく祖先（d.0）を group 書き込み可にする。
+        std::fs::set_permissions(&d.0, std::fs::Permissions::from_mode(0o770)).expect("chmod");
+        assert_eq!(
+            verify_executable(&f, euid()).expect_err("reject").code,
+            "untrusted-binary"
+        );
+    }
+
+    /// 祖先の所有者が自分でも root でもなければ拒否する（euid を偽って照合する）。
+    #[test]
+    fn foreign_owned_ancestor_is_rejected() {
+        let d = Dir::new("fa");
+        let dir_owner = std::fs::metadata(&d.0).expect("meta").uid();
+        if dir_owner != 0 {
+            assert_eq!(
+                verify_ancestor(&d.0, dir_owner.wrapping_add(1))
+                    .expect_err("reject")
+                    .code,
+                "untrusted-binary"
+            );
+        }
+    }
+
+    /// symlink 経由で group 書き込み可の実体ディレクトリへ出る配置も拒否する。
+    #[test]
+    fn symlinked_ancestor_into_writable_dir_is_rejected() {
+        let d = Dir::new("sl");
+        let real = d.0.join("real");
+        std::fs::create_dir(&real).expect("mkdir");
+        let f = real.join("bin");
+        std::fs::write(&f, b"x").expect("write");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o775)).expect("chmod");
+        let link = d.0.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        assert_eq!(
+            verify_executable(&link.join("bin"), euid())
                 .expect_err("reject")
                 .code,
             "untrusted-binary"

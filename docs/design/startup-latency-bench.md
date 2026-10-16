@@ -36,12 +36,12 @@
 | ---- | ---- |
 | `--trials` | 既定 30・範囲 20〜200（20 未満だと p95 が最大値と同じ順位になる） |
 | `--warmup` | 既定 3・範囲 0〜20（標本に入れない。失敗は数える） |
-| `--timeout-secs` | 全体の期限。既定 1800・範囲 60〜7200。各試行の前に照合し、超えたら `deadline-exceeded` で打ち切る |
+| `--timeout-secs` | 全体の期限。既定 1800・範囲 60〜7200。各試行の前と、各試行の後始末を終えた直後（結果の公開前）に照合し、超えたら成功結果・metric を出さず `deadline-exceeded` で失敗する |
 | p95 | nearest-rank 法。昇順に並べ、順位 `ceil(95·n/100)` の要素。p50・max は診断用 |
 
 ## 失敗の扱い（REPAIR-3・fail-closed）
 
-- 失敗は種別ごとに数える: `create` / `spawn` / `report_err`（`CODE` 別の内訳つき）/ `report_timeout` / `report_eof` / `report_invalid` / `supervisor_exit` / `cleanup`
+- 失敗は種別ごとに数える: `create` / `spawn` / `report_err`（`CODE` 別の内訳つき）/ `report_timeout` / `report_eof` / `report_invalid` / `supervisor_exit`（supervisor の終了コード不一致・ワークロードの終了コードが 0 でない場合を含む）/ `cleanup`
 - 1 件でも失敗または後始末の残りがあれば、`metrics` を空 `{}` にして `failures` を載せた JSON を出し、終了コード 1 で終わる。部分的な標本の p95 をゲートへ流さない
 - 分離を弱める経路（Landlock なし・フェイクの launcher・supervisor の迂回）は実装しない。launcher が拒否したら `report_err` として数える
 
@@ -64,7 +64,7 @@ core の `delete` は使わない。ベンチのプロセスは試行ごとの s
 ## セキュリティ上の扱い
 
 - 外部コマンドは argv 配列で渡し、シェルを使わない。`--supervisor-bin`・`--systemd-run` は絶対パスに限り、`PATH` から探さない
-- 起動前に、通常ファイル（symlink 不可）・実行ビットあり・group / other 書き込み不可・所有者が実効 UID か root・親ディレクトリが other 書き込み不可を検証する。検証から exec までの TOCTOU は残る（開発者のローカル target 配下のバイナリを対象とする計測道具のため許容）
+- 起動前に、通常ファイル（symlink 不可）・実行ビットあり・group / other 書き込み不可・所有者が実効 UID か root・全祖先ディレクトリ（字面上と symlink 解決後の両方）が実効 UID か root 所有で group / other 書き込み不可（sticky 付きは可）であることを検証する。検証から exec までの TOCTOU は残る（開発者のローカル target 配下のバイナリを対象とする計測道具のため許容）
 - 作業ディレクトリ・状態ルートは 0700 で排他作成する。rootful（euid 0）は拒否する（SEC-5）
 - 出力に絶対パス・ホスト名・ユーザー名・OS のエラー文字列を載せない。新規の外部依存・`unsafe` は無い
 

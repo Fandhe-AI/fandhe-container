@@ -174,13 +174,17 @@ group_is_private() { # 自分の primary group が自分専用なら 0
     if [ -z "$private_group_cache" ]; then
         private_group_cache=no
         if command -v getent >/dev/null 2>&1; then
-            local gid user members others
+            local gid user grp_line members pw_out others
             gid="$(id -g)"
             user="$(id -un)"
-            members="$(getent group "$gid" 2>/dev/null | awk -F: '{print $4}')"
-            others="$(getent passwd 2>/dev/null | awk -F: -v g="$gid" -v u="$user" '$4==g && $1!=u {n++} END {print n+0}')"
-            if [ "$others" = "0" ] && { [ -z "$members" ] || [ "$members" = "$user" ]; }; then
-                private_group_cache=yes
+            # getent の失敗・空の出力は「自分しかいない」と区別できないため共有扱い（fail-closed）。
+            if grp_line="$(getent group "$gid" 2>/dev/null)" && [ -n "$grp_line" ] &&
+                pw_out="$(getent passwd 2>/dev/null)" && [ -n "$pw_out" ]; then
+                members="$(printf '%s\n' "$grp_line" | awk -F: '{print $4}')"
+                others="$(printf '%s\n' "$pw_out" | awk -F: -v g="$gid" -v u="$user" '$4==g && $1!=u {n++} END {print n+0}')"
+                if [ "$others" = "0" ] && { [ -z "$members" ] || [ "$members" = "$user" ]; }; then
+                    private_group_cache=yes
+                fi
             fi
         fi
     fi
@@ -218,6 +222,11 @@ check_output_safe() {
     }
     # 物理パスで確定する（以後の操作はこのパスだけを使う）。
     if [ "$d" = "/" ]; then output_dir="$rest"; else output_dir="$d$rest"; fi
+    # 解決後が空（"/"・"/."・"/tmp/.." 等のルート）だと not-empty 検査と mkdir が空パスで崩れる。
+    if [ -z "$output_dir" ] || [ "$output_dir" = "/" ]; then
+        err bad-output "output directory must not be the filesystem root or empty"
+        exit 2
+    fi
     while :; do
         reason="$(dir_unsafe_reason "$d" "$kind")"
         if [ -n "$reason" ]; then

@@ -207,6 +207,34 @@ chmod 770 "$out"
 run env GUEST_INITRD_PRIVATE_GROUP=no "$target" --init "$good" --output-dir "$out"
 check "3b group-writable shared group error code" unsafe-output "$(errcode)"
 chmod 700 "$out"
+# getent の失敗・空の出力は fail-closed（共有 group 扱い）。スタブの getent を PATH の先頭へ置く。
+for mode in fail empty; do
+    mkdir -p "$sb/getent-$mode"
+    if [ "$mode" = fail ]; then
+        printf '#!/bin/sh\nexit 2\n' >"$sb/getent-$mode/getent"
+    else
+        printf '#!/bin/sh\nexit 0\n' >"$sb/getent-$mode/getent"
+    fi
+    chmod 755 "$sb/getent-$mode/getent"
+    newout
+    mkdir "$out"
+    chmod 770 "$out"
+    run env PATH="$sb/getent-$mode:$PATH" "$target" --init "$good" --output-dir "$out"
+    check "3b getent $mode exit code" 2 "$rc"
+    check "3b getent $mode error code" unsafe-output "$(errcode)"
+    check "3b getent $mode left empty" "" "$(ls -A "$out")"
+    chmod 700 "$out"
+done
+# ルート・空に解決される出力先は拒否し、カレントディレクトリへ何も作らない。
+for p in / /. /tmp/..; do
+    newout
+    mkdir "$sb/cwd-$n"
+    rc=0
+    (cd "$sb/cwd-$n" && env GUEST_INITRD_TEST_SANDBOX="$sb" "$target" --init "$good" --output-dir "$p" >"$sb/o.out" 2>"$sb/o.err") || rc=$?
+    check "3b root output '$p' exit code" 2 "$rc"
+    check "3b root output '$p' error code" bad-output "$(errcode)"
+    check "3b root output '$p' cwd untouched" "" "$(ls -A "$sb/cwd-$n")"
+done
 # 自分専用 group（umask 002 の 0775 ツリー）の group 書き込みは許す（PR #2086 の指摘）。
 newout
 mkdir "$out"

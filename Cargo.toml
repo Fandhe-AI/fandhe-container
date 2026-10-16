@@ -12,6 +12,7 @@ members = [
     "crates/io",
     "crates/core",
     "crates/supervisor",
+    "crates/guest-init", # macOS ゲスト用 PID 1（#1823 のオーナー判断 2026-10-12・#1875。crate-naming.md の表 #20）
     "crates/oci",
     "crates/cri",
     "crates/platform-macos",

@@ -127,7 +127,7 @@ use super::launch::{
     BundleLock, LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, StartTimeouts,
 };
 use super::mountinfo_identity::{
-    MountinfoReadError, fs_identity, mounts_under, parse_mountinfo, path_mount_id,
+    FsIdentity, MountinfoReadError, fs_identity, mounts_under, parse_mountinfo, path_mount_id,
     read_mountinfo_bounded, source_reaches,
 };
 use crate::observability::{OpName, OpRecorder};
@@ -821,6 +821,9 @@ fn validate_bind_mounts(
             "the state store root is not found in mountinfo",
         ));
     };
+    // 状態ルート配下の子マウント（別名の bind mount を含む）も保護対象に加える（SEC-1・#1915）。
+    let children = mounts_under(&mounts, &state_real);
+    let roots = build_protected_roots(&state_id, &state_real, &children);
     set.check_sources_with(|spec| {
         let Some(real) = std::fs::canonicalize(spec.source())
             .ok()
@@ -833,25 +836,70 @@ fn validate_bind_mounts(
         let Some(mnt) = path_mount_id(&real) else {
             return false;
         };
+        // 状態ルート自身と配下の子マウントのいずれかに到達する元は拒否する（適用の段と同じ照合を fork 前に行う）。
         // 元のマウントを特定できないときは fail-closed（到達するものとして拒否）。
-        source_reaches(&mounts, mnt, &real, spec.recursive(), &state_id).unwrap_or(true)
+        source_reaches_protected(&mounts, mnt, &real, spec.recursive(), &state_id, &children)
     })
     .map_err(reject)?;
     // 検査済みの実体を集合に持たせる。適用の段（restart を含む毎回）が、固定した元に対して再照合する。
-    // 状態ルート配下の状態ファイルが別名（ハードリンク）を持つか。持つなら適用の段が同じ FS 上のディレクトリ元を拒否する。
-    // 走査できない・大きすぎる場合も「持つ」とみなす（fail-closed。同じ FS 上のディレクトリ元だけが拒否される）。
-    let mut roots = vec![
-        ProtectedFsRoot::new(state_id.dev, state_id.path, true).with_scan_root(state_real.clone()),
-    ];
-    for child in mounts_under(&mounts, &state_real) {
-        roots.push(
-            ProtectedFsRoot::new(child.dev, child.path, true).with_scan_root(state_real.clone()),
-        );
-    }
     let set = set.with_protected_roots(roots);
     set.check_against_protected_paths(config.readonly_paths(), config.masked_paths())
         .map_err(reject)?;
     Ok(set)
+}
+
+/// 元が状態ルートまたは配下の子マウントのいずれかに到達するか。位置を特定できない場合は到達とみなす（fail-closed）。
+fn source_reaches_protected(
+    mounts: &[super::mountinfo_identity::MountRow],
+    src_mnt_id: u64,
+    src_real: &str,
+    recursive: bool,
+    state_id: &FsIdentity,
+    children: &[(FsIdentity, String)],
+) -> bool {
+    std::iter::once(state_id)
+        .chain(children.iter().map(|(id, _)| id))
+        .any(|protected| {
+            source_reaches(mounts, src_mnt_id, src_real, recursive, protected).unwrap_or(true)
+        })
+}
+
+/// 保護対象（状態ルートと配下の子マウント）ごとの `ProtectedFsRoot` を作る（SEC-1・#1915）。
+///
+/// 状態ファイルのハードリンクは、適用の段が毎回走査し直す。走査は保護対象ごとに自分のマウントの木に限り、別の FS の
+/// マウントポイントへは降りない（他の FS 上のリンクのせいで無関係な FS 上のディレクトリ元を誤って拒否しない）。
+/// 子マウントは自分のマウントポイントを走査根にする。同じマウントポイントに複数のマウントが重なるなど、走査で
+/// 実体を確定できないものは「リンクあり」に固定する（fail-closed）。
+fn build_protected_roots(
+    state_id: &FsIdentity,
+    state_real: &str,
+    children: &[(FsIdentity, String)],
+) -> Vec<ProtectedFsRoot> {
+    let prune_for = |dev: &str, scan_root: &str| -> Vec<String> {
+        children
+            .iter()
+            .filter(|(id, point)| {
+                id.dev != dev
+                    && point != scan_root
+                    && Path::new(point).starts_with(Path::new(scan_root))
+            })
+            .map(|(_, point)| point.clone())
+            .collect()
+    };
+    let mut roots = vec![
+        ProtectedFsRoot::new(state_id.dev.clone(), state_id.path.clone(), true)
+            .with_scan_root(state_real.to_owned(), prune_for(&state_id.dev, state_real)),
+    ];
+    for (id, point) in children {
+        let shared = children.iter().filter(|(_, p)| p == point).count() > 1;
+        let root = ProtectedFsRoot::new(id.dev.clone(), id.path.clone(), true);
+        roots.push(if shared {
+            root
+        } else {
+            root.with_scan_root(point.clone(), prune_for(&id.dev, point))
+        });
+    }
+    roots
 }
 
 /// 絶対パスを `Component::Normal` だけの `/a/b` 形式へ字句正規化する（`.` は落とす）。
@@ -2572,5 +2620,116 @@ mod tests {
         assert_eq!(err.op(), LifecycleOp::Start);
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(err.exit_code().get(), 5);
+    }
+
+    /// SEC-1（#1915）: 他の FS 上のハードリンクは、無関係な FS の保護対象のリンク判定に混ぜない。
+    /// 状態ルート直下の別 FS のマウントポイント配下にだけリンクがあるとき、状態ルート側は「なし」、子マウント側は「あり」。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_hard_link_scan_is_confined_to_each_protected_filesystem() {
+        let base = std::env::temp_dir().join(format!("fandhe-oci-hl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let state = base.join("state");
+        let sub = state.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        std::fs::write(state.join("plain"), b"x").expect("write");
+        std::fs::write(sub.join("f"), b"x").expect("write");
+        std::fs::hard_link(sub.join("f"), sub.join("g")).expect("link");
+        let state_s = state.to_str().expect("utf8").to_owned();
+        let sub_s = sub.to_str().expect("utf8").to_owned();
+        let state_id = FsIdentity {
+            dev: "8:1".to_owned(),
+            path: "/srv/state".to_owned(),
+        };
+        let children = vec![(
+            FsIdentity {
+                dev: "8:2".to_owned(),
+                path: "/c1".to_owned(),
+            },
+            sub_s.clone(),
+        )];
+        let roots = build_protected_roots(&state_id, &state_s, &children);
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].dev(), "8:1");
+        assert!(
+            !roots[0].has_hard_linked_files(),
+            "other FS link must not count"
+        );
+        assert_eq!(roots[1].dev(), "8:2");
+        assert!(roots[1].has_hard_linked_files());
+        // 同じ FS（同じ dev）の子マウントは枝刈りしない（リンクは状態ルート側でも見つかる）。
+        let same = vec![(
+            FsIdentity {
+                dev: "8:1".to_owned(),
+                path: "/srv/state/sub".to_owned(),
+            },
+            sub_s,
+        )];
+        let roots = build_protected_roots(&state_id, &state_s, &same);
+        assert!(roots[0].has_hard_linked_files());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// SEC-1（#1915）: 同じマウントポイントに複数のマウントが重なる子は走査で確定できないため「リンクあり」に固定する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_shared_mount_point_child_is_fixed_to_linked() {
+        let base = std::env::temp_dir().join(format!("fandhe-oci-hl2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).expect("mkdir");
+        let state_s = base.to_str().expect("utf8").to_owned();
+        let sub_s = sub.to_str().expect("utf8").to_owned();
+        let state_id = FsIdentity {
+            dev: "8:1".to_owned(),
+            path: "/s".to_owned(),
+        };
+        let child = |dev: &str| {
+            (
+                FsIdentity {
+                    dev: dev.to_owned(),
+                    path: "/".to_owned(),
+                },
+                sub_s.clone(),
+            )
+        };
+        let roots = build_protected_roots(&state_id, &state_s, &[child("8:2"), child("8:3")]);
+        assert!(roots[1].has_hard_linked_files());
+        assert!(roots[2].has_hard_linked_files());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// SEC-1（#1915）: 状態ルート配下の子マウントの別名を元にした bind は、start の検査（fork 前）で拒否される。
+    #[test]
+    fn sec1_start_check_rejects_alias_of_nested_state_mount() {
+        use super::super::mountinfo_identity::parse_mountinfo;
+        let info = "10 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                    20 10 8:1 /srv/state /state rw - ext4 /dev/sda1 rw\n\
+                    30 20 8:2 /c1 /state/c1 rw - ext4 /dev/sda2 rw\n\
+                    40 10 8:2 /c1 /alias rw - ext4 /dev/sda2 rw\n\
+                    50 10 8:3 / /other rw - ext4 /dev/sda3 rw\n";
+        let mounts = parse_mountinfo(info).expect("parse");
+        let state_id = fs_identity(&mounts, 20, "/state").expect("state");
+        let children = mounts_under(&mounts, "/state");
+        assert_eq!(children.len(), 1);
+        assert!(source_reaches_protected(
+            &mounts, 40, "/alias", true, &state_id, &children
+        ));
+        assert!(!source_reaches_protected(
+            &mounts, 50, "/other", true, &state_id, &children
+        ));
+        // 子マウントを考慮しない（状態ルートだけの）照合では見逃していた。
+        assert!(!source_reaches_protected(
+            &mounts,
+            40,
+            "/alias",
+            true,
+            &state_id,
+            &[]
+        ));
+        // 位置を特定できない元は fail-closed。
+        assert!(source_reaches_protected(
+            &mounts, 99, "/x", true, &state_id, &children
+        ));
     }
 }

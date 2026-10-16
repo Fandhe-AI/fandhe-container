@@ -281,6 +281,9 @@ pub(crate) struct ProtectedFsRoot {
     /// 設定されていれば、適用の段が毎回この状態ルート（ホストの正規化済みパス）配下を走査し直して
     /// `has_hard_linked_files` を更新する（start 後に追加されたハードリンクを restart でも検出する。SEC-1・#1915）。
     scan_root: Option<String>,
+    /// 走査で降りないホストのパス（別のファイルシステムのマウントポイント）。そのマウントは別の `ProtectedFsRoot` が
+    /// 自分のマウントポイントを `scan_root` にして走査する。これにより、他の FS 上のリンクでこの FS を拒否しない（SEC-1・#1915）。
+    scan_prune: Vec<String>,
 }
 
 impl ProtectedFsRoot {
@@ -290,12 +293,15 @@ impl ProtectedFsRoot {
             path,
             has_hard_linked_files,
             scan_root: None,
+            scan_prune: Vec::new(),
         }
     }
 
     /// 適用のたびに `root` 配下のハードリンクを走査し直すようにする（`new` の固定値より優先）。
-    pub(crate) fn with_scan_root(mut self, root: String) -> Self {
+    /// `prune` のパス（走査根の配下の他 FS のマウントポイント）へは降りない。
+    pub(crate) fn with_scan_root(mut self, root: String, prune: Vec<String>) -> Self {
         self.scan_root = Some(root);
+        self.scan_prune = prune;
         self
     }
 
@@ -305,7 +311,8 @@ impl ProtectedFsRoot {
     /// `scan_root` があれば呼び出しのたびに走査し直す。走査できない・項目数が多すぎる場合は「持つ」とみなす（fail-closed）。
     pub(crate) fn has_hard_linked_files(&self) -> bool {
         match &self.scan_root {
-            Some(root) => state_tree_has_hard_links(std::path::Path::new(root)).unwrap_or(true),
+            Some(root) => state_tree_has_hard_links(std::path::Path::new(root), &self.scan_prune)
+                .unwrap_or(true),
             None => self.has_hard_linked_files,
         }
     }
@@ -331,7 +338,8 @@ const STATE_SCAN_MAX_ENTRIES: usize = 100_000;
 /// symlink は辿らない。読めない・項目数が `STATE_SCAN_MAX_ENTRIES` を超える場合は `None`（呼び出し側が「持つ」とみなす）。
 /// 走査から attach までの間に追加されるハードリンクは検出できない（残る競合。状態ルートへの書き込み権限が前提）。
 #[cfg(target_os = "linux")]
-fn state_tree_has_hard_links(root: &std::path::Path) -> Option<bool> {
+/// `prune` に一致するパスのディレクトリには降りない（別 FS のマウントを、この FS の判定に混ぜない）。
+fn state_tree_has_hard_links(root: &std::path::Path, prune: &[String]) -> Option<bool> {
     use std::os::unix::fs::MetadataExt as _;
     let mut stack = vec![root.to_path_buf()];
     let mut seen = 0usize;
@@ -344,7 +352,11 @@ fn state_tree_has_hard_links(root: &std::path::Path) -> Option<bool> {
             }
             let meta = std::fs::symlink_metadata(entry.path()).ok()?;
             if meta.is_dir() {
-                stack.push(entry.path());
+                let path = entry.path();
+                if prune.iter().any(|p| path == std::path::Path::new(p)) {
+                    continue;
+                }
+                stack.push(path);
             } else if meta.is_file() && meta.nlink() > 1 {
                 return Some(true);
             }

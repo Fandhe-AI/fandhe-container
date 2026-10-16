@@ -268,14 +268,19 @@ pub(crate) fn exposed_devs(
 
 /// `state_root`（正規化済みの絶対パス）の配下に載るマウントの実体（状態ルート自身のマウントは含まない）。
 /// 状態ルート配下の子 bind mount 経由でも状態ファイルを公開させないため、保護対象に加える（SEC-1・#1915）。
-/// 覆い隠されたマウントも保守的に含める。
-pub(crate) fn mounts_under(mounts: &[MountRow], state_root: &str) -> Vec<FsIdentity> {
+/// 覆い隠されたマウントも保守的に含める。各要素は FS 内の実体と、ホスト側のマウントポイント（走査・枝刈りに使う）。
+pub(crate) fn mounts_under(mounts: &[MountRow], state_root: &str) -> Vec<(FsIdentity, String)> {
     mounts
         .iter()
         .filter(|m| m.point != state_root && under(state_root, &m.point).is_some())
-        .map(|m| FsIdentity {
-            dev: m.dev.clone(),
-            path: m.root.clone(),
+        .map(|m| {
+            (
+                FsIdentity {
+                    dev: m.dev.clone(),
+                    path: m.root.clone(),
+                },
+                m.point.clone(),
+            )
         })
         .collect()
 }
@@ -449,8 +454,9 @@ mod tests {
         let mounts = parse_mountinfo(info).expect("parse");
         let v = mounts_under(&mounts, "/state");
         assert_eq!(v.len(), 1);
-        assert_eq!(v[0].dev, "8:2");
-        assert_eq!(v[0].path, "/container-state");
+        assert_eq!(v[0].0.dev, "8:2");
+        assert_eq!(v[0].0.path, "/container-state");
+        assert_eq!(v[0].1, "/state/c1");
     }
 
     #[cfg(target_os = "linux")]

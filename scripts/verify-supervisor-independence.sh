@@ -398,7 +398,7 @@ track_descendants() {
       # 既に消滅した supervisor で、子孫を 1 つも観測できていない。ERR を出して終了したのなら
       # （sup_report が NOCHILD を記録して起動失敗で終了する）追跡不能とは扱わない。
       sup_report "$i" || true
-      untracked=1
+      [ -n "${NOCHILD[$i]:-}" ] || untracked=1
     fi
     for d in ${DESC[$i]:-}; do
       c="${d%%:*}"
@@ -541,17 +541,20 @@ sup_spawn() { # <i>
   exec {fd}<>"$fifo"
   FDS[$i]="$fd"
   (
-    FANDHE_BENCH_OWNER="$owner_tok" exec "$systemd_run" --user --scope --quiet -p Delegate=yes -- "$sup_bin" start --root "$state_root" "${id_prefix}-${i}" </dev/null >"$fifo" 2>"${logdir}/l${i}.err"
+    FANDHE_BENCH_OWNER="$owner_tok" exec "$systemd_run" --user --scope --quiet -p Delegate=yes -- "$sup_bin" start --root "$state_root" ${restart_args[@]+"${restart_args[@]}"} "${id_prefix}-${i}" </dev/null >"$fifo" 2>"${logdir}/l${i}.err"
   ) &
   pids[i]=$!
   pstart[i]=""
   if read_starttime "${pids[$i]}"; then pstart[i]="$ST"; fi
 }
 
-# 報告の 1 行を読み、FCSUP1 OK <pid> なら REP_PID へ記録して 0。ERR・書式不正は起動失敗として即終了。未到着は 1。
+# 報告の 1 行を読み、FCSUP1 OK <pid> なら REP_PID へ記録して 0。ERR・書式不正は起動失敗として REP_FAIL・NOCHILD を記録して 2
+# （exit しない。EXIT trap 内の cleanup_procs からも呼ばれるため、後始末を中断させない。終了コードの決定は呼び出し側が
+# 後始末の前に行う）。未到着は 1。
 sup_report() { # <i>
   local i="$1" line=""
   [ -z "${REP_PID[$i]:-}" ] || return 0
+  [ -z "${NOCHILD[$i]:-}" ] || return 2
   IFS= read -r -n 640 -t 0.05 -u "${FDS[$i]}" line || true
   [ -n "$line" ] || return 1
   if [[ "$line" =~ ^FCSUP1\ OK\ ([1-9][0-9]{0,9})$ ]]; then
@@ -565,8 +568,8 @@ sup_report() { # <i>
   fi
   # 起動失敗した supervisor はコンテナ側プロセスを持たないため、子孫を観測できなかったことを追跡不能にしない。
   NOCHILD[$i]=1
-  final_rc=1
-  exit 1
+  REP_FAIL=1
+  return 2
 }
 
 # 全 supervisor が生存し、FCSUP1 OK を返し、報告 pid がその supervisor の子孫であること（直前の scan の結果で判定）。
@@ -574,6 +577,8 @@ all_ready() {
   local i
   # 全員の報告を先に読む（ERR を出した supervisor は、他の報告待ちに関係なく起動失敗として検出する）。
   for i in $(seq 1 "$count"); do sup_report "$i" || true; done
+  # 起動失敗の報告があれば待機を打ち切る（呼び出し側が REP_FAIL を見て終了する）。
+  [ "$REP_FAIL" -eq 0 ] || return 0
   for i in $(seq 1 "$count"); do
     # 報告を先に読む（ERR を出して終了した supervisor も、ここで起動失敗として検出する）。
     sup_report "$i" || return 1
@@ -585,6 +590,10 @@ all_ready() {
 
 timed_out() { err "timeout" "$1"; final_rc=1; exit 1; }
 
+# --check-restart のときだけ再起動ポリシーを渡す（bin の既定は RestartPolicy::No で、渡さないと再起動を観測できない。SUP-3）。
+restart_args=()
+if [ "$check_restart" -eq 1 ]; then restart_args=(--restart always); fi
+REP_FAIL=0
 spawned=1
 for i in $(seq 1 "$count"); do make_bundle_copy "$i"; done
 for i in $(seq 1 "$count"); do sup_create "$i"; done
@@ -593,6 +602,7 @@ for i in $(seq 1 "$count"); do
   [ -n "${pstart[$i]:-}" ] || { err "launch-failed" "cannot record the start time of a launcher"; final_rc=1; exit 1; }
 done
 wait_tracked "$timeout_s" all_ready || timed_out "not all ${count} supervisors reported FCSUP1 OK within ${timeout_s}s"
+if [ "$REP_FAIL" -eq 1 ]; then final_rc=1; exit 1; fi
 
 # --- kill 前スナップショット: 全 launcher の生存・木の大きさ・子孫（コンテナ側プロセス）を記録 ---
 settle_tracked

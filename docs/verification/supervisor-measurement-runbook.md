@@ -63,17 +63,64 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
 
    ```bash
    root=$(mktemp -d)
+   declare -A FD
    for i in $(seq 1 50); do
      cp -al <テンプレート> "$root/b$i"
      "$BIN_DIR/fandhe-container" --root "$root/state" create --bundle "$root/b$i" "sup-$i"
      mkfifo "$root/f$i"
-     exec {fd}<>"$root/f$i"
+     exec {FD[$i]}<>"$root/f$i"   # コンテナごとの fd を保存する（報告の読み取りと後始末で使う）
      systemd-run --user --scope --quiet -p Delegate=yes -- \
        "$BIN_DIR/fandhe-container-supervisor" start --root "$root/state" "sup-$i" >"$root/f$i" &
+     echo $! >"$root/sup$i.pid"
    done
    ```
 
-   `FCSUP1 OK <pid>` が全員分出たら起動完了。後始末は起動したシェルで supervisor の pid を終了させ、`$root` を削除する
+   起動報告を期限付きで読み、全員の `FCSUP1 OK <pid>` を確認する（60 秒で打ち切る）。
+
+   ```bash
+   ok=0
+   for i in $(seq 1 50); do
+     line=""
+     IFS= read -r -t 60 -u "${FD[$i]}" line || true
+     case "$line" in
+       "FCSUP1 OK "*) ok=$((ok + 1)); echo "${line#FCSUP1 OK }" >"$root/ctr$i.pid" ;;
+       *) echo "sup-$i: not ready: ${line:-<no report within 60s>}" >&2 ;;   # ERR 行や無報告はここに出る
+     esac
+   done
+   echo "ready: $ok/50"
+   ```
+
+   `ready: 50/50` で起動完了。ERR や無報告があれば計測せず、下の後始末をして原因を調べる。報告の pid はコンテナ側プロセス（supervisor の子孫）で、`ctr<i>.pid` に保存する。
+
+   後始末は、supervisor の SIGTERM ではコンテナを停止しない（コンテナ側プロセスが孤児として残る）ため、次の順で行う。
+
+   ```bash
+   # 1. コンテナ側プロセスの pid と起動時刻を、supervisor を止める前に保存する（pid 再利用の取り違え防止）
+   : >"$root/tracked"
+   for i in $(seq 1 50); do
+     cp=$(cat "$root/ctr$i.pid" 2>/dev/null) || continue
+     for c in $cp $(pgrep -P "$cp" 2>/dev/null); do
+       echo "$c $(awk '{print $22}' "/proc/$c/stat" 2>/dev/null)" >>"$root/tracked"
+     done
+   done
+   # 2. supervisor を終了させ、保存した pid が同じ起動時刻のまま生きていれば SIGKILL
+   kill $(cat "$root"/sup*.pid) 2>/dev/null; sleep 1
+   while read -r c st; do
+     [ "$(awk '{print $22}' "/proc/$c/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$c"
+   done <"$root/tracked"
+   sleep 1
+   # 3. 残存確認（1 つでも残っていれば削除せず手で回収する）
+   left=0
+   while read -r c st; do
+     [ "$(awk '{print $22}' "/proc/$c/stat" 2>/dev/null)" = "$st" ] && { echo "still alive: $c" >&2; left=1; }
+   done <"$root/tracked"
+   # 4. 残存が無いときだけ fd を閉じて状態を削除する
+   if [ "$left" -eq 0 ]; then
+     for i in $(seq 1 50); do eval "exec ${FD[$i]}>&-"; done
+     rm -rf "$root"
+   fi
+   ```
+
 2. root のシェル（権限付きシェル）で計測する
 
    ```bash

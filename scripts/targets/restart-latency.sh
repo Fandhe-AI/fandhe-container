@@ -45,6 +45,7 @@ if [ "${t}" -lt "${budget}" ]; then
 fi
 if [ -n "${OUTPUT:-}" ]; then args+=(--output "${OUTPUT}"); fi
 if [ -n "${SYSTEMD_RUN:-}" ]; then args+=(--systemd-run "${SYSTEMD_RUN}"); fi
+if [ -n "${STATE_ROOT:-}" ]; then args+=(--state-root "${STATE_ROOT}"); fi
 rc=0
 timeout --preserve-status --kill-after=60 "${t}" bash "${script}" --bin-dir "${BIN_DIR}" --bundle "${BUNDLE}" ${args[@]+"${args[@]}"} || rc=$?
 case "${rc}" in

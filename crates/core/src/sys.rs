@@ -2263,8 +2263,9 @@ const fn open_tree_bind_flags(scope: MountTreeScope) -> u32 {
 /// 前提は [`open_tree_clone`] と同じで、`unshare(CLONE_NEWNS)` の後・`pivot_root` の前に、同じ mount namespace の中で
 /// 開いた fd を渡す（`check_mnt` を満たさないと `EINVAL`）。seccomp フィルタの適用前に呼ぶ
 /// （既定の拒否集合は `DeniedSyscall::OpenTree`・`MoveMount`・`MountSetattr` を含む）。
-/// 一次情報（man page・fs/namespace.c）との本 issue での再照合は未実施（未確認）で、上記は #1659 で確認した
-/// v5.2・v6.12 の `__do_loopback` の知見に基づく。
+/// 非再帰の `EINVAL` は Linux v5.12・v6.12・v7.0 の `__do_loopback`（`has_locked_children`。v7.0 は
+/// `__has_locked_children`）と `mount(2)` の ERRORS で確認済み（#2064）。`EINVAL` は他に unbindable な元と `check_mnt`
+/// 不成立でも返るが、前者は呼び出し側の `MS_REC|MS_PRIVATE`、後者は同一 namespace の fd で起きない。v5.2 は #1659 の知見。
 pub(crate) fn open_tree_clone_bind(
     src: &VerifiedBindSourceFd,
     scope: MountTreeScope,
@@ -2312,9 +2313,10 @@ const fn read_only_mount_attr() -> MountAttr {
 
 /// 利用者指定の bind mount に足す属性（#1912）。`nosuid`・`nodev` は常に足し、`BindMountAttrs` の指定で `rdonly`・`noexec` を足す。
 /// `attr_clr` = 0 のため、元のマウントでロックされた属性は外さない（`rw` 指定も ro を外さない）。
-/// `propagation` は 0（変更しない）。切り離した（`OPEN_TREE_CLONE` の匿名 namespace の）マウントに対する propagation 変更が
-/// 許されるかは一次情報で未確認のため、同じ呼び出しには含めない。private であることは明示設定せず、呼び出し側（#1913）が
-/// 付け替え先の非 shared の確認と、付け替え後の mountinfo の照合で確かめる。
+/// `propagation` は 0（変更しない）。切り離した（`OPEN_TREE_CLONE` の匿名 namespace の）マウントに対する propagation 変更は
+/// Linux v5.12・v6.12・v7.0 の `mount_setattr` 系（`mount_setattr_prepare`／`do_mount_setattr`）で許されると確認済み（#2064）だが、
+/// 複製は元の伝播を引き継ぐため使わない。private であることは `MountIsolation::establish` の `MS_REC|MS_PRIVATE` に依存し、
+/// 明示設定はせず、呼び出し側（#1913）が付け替え先の非 shared の確認と、付け替え後の mountinfo の照合で確かめる。
 const fn bind_mount_attr(attrs: BindMountAttrs) -> MountAttr {
     MountAttr {
         attr_set: attrs.attr_bits() as u64,

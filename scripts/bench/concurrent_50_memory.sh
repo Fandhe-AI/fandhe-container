@@ -81,8 +81,8 @@
 #     コンテナごとの FIFO へ流し、本スクリプトの直接の子である収集プロセスが先頭 LOG_MAX_KIB KiB だけを
 #     ログファイルへ書き、それ以降は読み捨てる（launcher は書き込みを拒否されず、SIGPIPE・SIGXFSZ も
 #     受けない）。試行ごとのログは次の試行の前に削除するので、ディスク消費は試行回数によらず
-#     「起動数 × LOG_MAX_KIB KiB」を超えない（REPAIR-5）。READY 行は先頭
-#     LOG_MAX_KIB KiB 以内に出すこと（それより後の READY は記録されず、起動未完了として失敗になる）。
+#     「起動数 × LOG_MAX_KIB KiB」を超えない（REPAIR-5）。`FCSUP1 OK` 行は先頭
+#     LOG_MAX_KIB KiB 以内に出すこと（それより後の `FCSUP1 OK` は記録されず、起動未完了として失敗になる）。
 #     収集プロセスは launcher の子孫ではないので PSS・RSS の集計には入らない（参考値の
 #     mem_available_delta_kb には、コンテナごとに 2 プロセス程度の分が含まれる）。
 #   - 停止: 直接の子へ SIGTERM、期限内に終了しなければ SIGKILL。supervisor に SIGTERM のハンドラは無くコンテナを
@@ -102,13 +102,13 @@
 #     観測した子孫の「pid:起動時刻」を記録し（record_tree）、その同一性で集計の対象と後始末の回収を決める。記録できない
 #     プロセスが木にあれば untracked-process で失敗にする（fail-closed）。トークンは補助の追跡として残す。
 #   - 現状（REPAIR-3）: 製品バイナリ（CLI・supervisor の bin）は提供済みだが、own の実測値は未取得（#219）。
-#     未解決の前提: supervisor は起動時に dumpable=0 にするため、同じ利用者の非 root からは supervisor の smaps_rollup
+#     未解決の前提（特権の橋渡しは #2090 で案 A に決定、実装は #2099）: supervisor は起動時に dumpable=0 にするため、同じ利用者の非 root からは supervisor の smaps_rollup
 #     （PSS）を読めず、own を非 root で実行すると unreadable-memory-value で fail-closed になる。一方 supervisor は
 #     rootful 起動を拒否する（SEC-5）ため、root では起動前に終了コード 3 で止める。両立には「root が計測し、起動だけ
 #     非 root へ降格する」か、製品側で dumpable=0 を特権経路に限る判断（SUP-14）が要る。本スクリプトは特権の橋渡しを
 #     実装していない（別 issue で扱う）。受け入れは自己テスト（スタブ・疑似 /proc）で照合している。
 #
-# 計測手順（1 試行）: N 個を同時起動 → 起動完了待ち（期限 --timeout。launcher が生存し、READY 行を
+# 計測手順（1 試行）: N 個を同時起動 → 起動完了待ち（期限 --timeout。launcher が生存し、`FCSUP1 OK` 行を
 #   出力済みで、ツリーのプロセス数が --min-procs 以上）→ --settle 秒待機して再確認 → 全ツリーの Pss（smaps_rollup）・
 #   VmRSS（status）を合算 → 全コンテナの起動条件を再確認（集計中に終了したコンテナがあれば失敗）→
 #   全 launcher を停止・回収。--trials 回繰り返し、試行ごとの集約 PSS の
@@ -153,7 +153,7 @@
 #   - --output の親ディレクトリは実行ユーザー所有・group/other 書き込み不可で、祖先を含む全パス要素が非 symlink（".." 不可）に限る。
 #     / までの祖先ディレクトリは、所有者が実行ユーザーか root で、group/other 書き込み不可か sticky 付きに限る
 #     （startup_latency.sh・idle_memory_supervised.sh と同じ規則）。
-#   - 集計後の再確認は「launcher の生存・READY・プロセス数」を見る。集計中に子孫が入れ替わっても
+#   - 集計後の再確認は「launcher の生存・`FCSUP1 OK`・プロセス数」を見る。集計中に子孫が入れ替わっても
 #     プロセス数が --min-procs 以上なら検出しない。
 #   - 起動時刻の照合からシグナル送信までの間に pid が再利用される可能性は残る（bash からは pidfd を
 #     使えない）。照合の直後に送ることで窓を最小にしている。
@@ -646,7 +646,7 @@ kill_child_with_kids() { # <pid> <起動時刻>
 # 読み捨てる（読み手を残すことで launcher の書き込みを止めず、SIGPIPE も起こさない）。dd は bs=1 で
 # 1 バイトずつ読んでその都度書く。FIFO からの read は書き込み単位ごとの部分読みになり、dd は部分読みも
 # 1 レコードと数えるため、bs を大きくすると短い行を count 回読んだ時点で（上限バイト数より前に）打ち切って
-# READY を取りこぼす。bs=1 なら count がそのままバイト数になり、READY 行も出力された時点でログに現れる
+# `FCSUP1 OK` を取りこぼす。bs=1 なら count がそのままバイト数になり、`FCSUP1 OK` 行も出力された時点でログに現れる
 # （head -c は標準出力がファイルのとき stdio でバッファするため使わない）。launcher の起動を遅らせないよう、全コンテナ
 # 分を launcher より先に起動しておく（FIFO の open は launcher 側の open と揃うまで待つ）。
 # 本スクリプトの直接の子で、環境変数トークンを持たず launcher のツリーにも入らない。TERM / HUP / INT は
@@ -1193,7 +1193,7 @@ report_unstarted() { # <trial>
     id="${id_prefix}-$1-$((i + 1))"
     err "unstarted" "id=${id}"
     if [ -r "$tmpdir/$id.log" ]; then
-      # ログが上限に達していれば、それ以降の出力（READY を含む）は記録されていないことを示す。
+      # ログが上限に達していれば、それ以降の出力（`FCSUP1 OK` を含む）は記録されていないことを示す。
       sz="$(wc -c <"$tmpdir/$id.log" 2>/dev/null || true)"
       sz="${sz//[[:space:]]/}"
       if [[ "$sz" =~ $num_re ]] && [ "$sz" -ge "$((LOG_MAX_KIB * 1024))" ]; then
@@ -1337,7 +1337,7 @@ run_report() {
 # --- docker モード（TASK-50.2）。docker CLI・Docker のプロセス構成との接点は dk_* 関数群に隔離する ---
 #
 # 呼び出し元は計測本体の dk_trials（--mode docker）と、EXIT trap の on_exit（dk_stop）。own モードの
-# ln_* 群（launcher の直接の子・FIFO ログの READY 行・環境変数トークンに依存する）は、Docker のプロセスが
+# ln_* 群（launcher の直接の子・FIFO ログの `FCSUP1 OK` 行・環境変数トークンに依存する）は、Docker のプロセスが
 # それらを継承しないため再利用できない。共通で使うのは read_kb・ln_collect_pids（任意 pid を根とする
 # 子孫の幅優先列挙）・median・出力部だけで、起動・起動完了の判定・集計対象・後始末を dk_* で独立させる。
 # 所有の証明は cidfile の 64 桁 16 進 ID（本スクリプトが起動した docker run が書く）だけで、破壊的操作
@@ -1929,7 +1929,7 @@ trial_json=()
 n_started_min="$count"
 
 # docker モードは dk_trials が全試行を実行する。以降の own の試行ループは own モードのときだけ回す
-# （docker では 0 回。ループ本体は own 専用で、launcher・READY 行・環境変数トークンに依存する）。
+# （docker では 0 回。ループ本体は own 専用で、launcher・`FCSUP1 OK` 行・環境変数トークンに依存する）。
 own_trials="$trials"
 if [ "$mode" != "own" ]; then own_trials=0; fi
 if [ "$mode" = "docker" ]; then dk_trials; fi
@@ -2036,7 +2036,7 @@ while [ "$t" -le "$own_trials" ]; do
     exit 1
   fi
   # 集計は 1 コンテナずつ順に行うため、先に集計したコンテナが後続の集計中に終了し得る。全コンテナの
-  # 集計後に起動条件（launcher の生存・READY・プロセス数 >= --min-procs）を全件で再確認し、1 つでも
+  # 集計後に起動条件（launcher の生存・`FCSUP1 OK`・プロセス数 >= --min-procs）を全件で再確認し、1 つでも
   # 欠けていれば「N 個同時稼働時の集約値」ではないので失敗にする（CORE-9。過少計上を公開しない）。
   n_started=0
   for i in "${!pids[@]}"; do

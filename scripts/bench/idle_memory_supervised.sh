@@ -49,8 +49,17 @@
 # 前提・現状の制約:
 #   - Linux 限定。スクリプト内で sudo は呼ばない（実計測は操作者が権限付きシェルで明示実行する。
 #     非 root では idle_memory.sh が pid 1 の exe を読めず終了コード 3 になる）。
-#   - 製品の実行ファイル（supervisor の入口・本番 ProcessLauncher・CLI バイナリ〔TASK-79〕）は未提供の
-#     ため、実 driver は現時点で存在しない（実装済みを装わない。REPAIR-3）。CI で動くのは
+#   - 製品の実行ファイル（supervisor の bin〔#1717・#1819〕・本番 ProcessLauncher〔#1715〕・CLI の
+#     create / start〔#1718・#2122〕）は提供済みで、driver の up は runbook
+#     （docs/verification/supervisor-measurement-runbook.md）の手順で書ける（create → systemd-run --user
+#     --scope --quiet -p Delegate=yes -- fandhe-container-supervisor start --root <R> <id> →
+#     `FCSUP1 OK <pid>` を期限付きで受け、supervisor と init の pid・起動時刻を記録して復帰）。down は
+#     CLI の stop が未結線（#2059）のため、記録した pid と起動時刻の一致を確かめてから SIGKILL を送り
+#     状態ルートを削除する形になる。init を記録できず回収を証明できなければ非ゼロで返す（SUP-5）。
+#   - ただし本スクリプトは root で動かす必要があり（pid 1 の exe を読むため。supervisor は dumpable=0）、
+#     一方 supervisor は rootful 起動を拒否する（SEC-5）。両立には driver 内で対象の利用者へ降格して
+#     起動する特権の橋渡しが要る。方式は #2090 で案 A に決定済みだが実装（#2099）は未了のため、実機で
+#     使える driver はリポジトリに無い（実装済みを装わない。REPAIR-3）。CI で動くのは
 #     idle_memory_supervised_selftest.sh（スタブ）だけで、実機での確定値取得・Docker 比較は #215
 #     （TASK-47.h1）の担当。実機では `--expected-dir` に配置ディレクトリを必ず渡す。
 #   - 「寿命後に supervisor 役プロセスが残らない」ことの Rust 側の保証は

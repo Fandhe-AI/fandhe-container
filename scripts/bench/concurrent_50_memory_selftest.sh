@@ -159,6 +159,12 @@ record_child() { # この selftest が起動した sleep の pid と起動時刻
 if [ "$mode" = "dieafter" ]; then sleep 300 & record_child $!; sleep 1; exit 0; fi
 if [ "$mode" = "diefast" ]; then sleep 300 & record_child $!; exit 0; fi
 # diefast_notoken: 実 supervisor と同じく、コンテナ側プロセスが FANDHE_BENCH_OWNER を継承せず、親（本スタブ）も即死する。
+# diefast_mixed: 1 番目のコンテナはトークン非継承の子を残して即死し、それ以外はトークンを継承する子を残して即死する
+# （別コンテナのトークン検出で、1 番目の追跡不能が解除されないことの照合用）。
+if [ "$mode" = "diefast_mixed" ]; then
+  if [ "$idx" = "1" ]; then env -u FANDHE_BENCH_OWNER sleep 300 & record_child $!; else sleep 300 & record_child $!; fi
+  exit 0
+fi
 if [ "$mode" = "diefast_notoken" ]; then env -u FANDHE_BENCH_OWNER sleep 300 & record_child $!; exit 0; fi
 if [ "$mode" != "nochild" ] && [ "$mode" != "hang" ]; then
   sleep 300 &
@@ -460,6 +466,29 @@ expect_has "untracked-notoken-stderr" "$errf" "cleanup-failed: a launcher exited
 kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
 if [ -n "$kept" ] && [ -d "$kept" ]; then pass "untracked-notoken-state-kept"; rm -rf -- "$kept"; else fail "untracked-notoken-state-kept"; fi
 # 未回収の sleep（記録した pid・起動時刻が一致するものだけ）を片付ける。
+while read -r p st; do
+  [ -n "$p" ] && [ "$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$p" 2>/dev/null
+done <"$STUB_PIDFILE" || true
+
+# --- 12d3. 別コンテナのトークン検出で追跡不能が解除されない（コンテナごとの照合）→ exit 4・状態保持 ---
+: >"$STUB_PIDFILE"
+STUB_MODE=diefast_mixed run_target --count 2 --trials 1 --settle 1 --timeout 5
+expect_eq "untracked-mixed-exit4" 4 "$rc"
+expect_has "untracked-mixed-stderr" "$errf" "cleanup-failed: a launcher exited before any descendant was recorded"
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "untracked-mixed-state-kept"; rm -rf -- "$kept"; else fail "untracked-mixed-state-kept"; fi
+while read -r p st; do
+  [ -n "$p" ] && [ "$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$p" 2>/dev/null
+done <"$STUB_PIDFILE" || true
+
+# --- 12d4. 残存があっても追跡不能を確定し、状態（tmpdir）を残す ---
+: >"$STUB_PIDFILE"
+STUB_MODE=diefast_mixed FANDHE_CONCURRENT_MEMORY_SELFTEST=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_NOKILL=1 run_target --count 2 --trials 1 --settle 1 --timeout 5
+expect_eq "untracked-residual-exit4" 4 "$rc"
+expect_has "untracked-residual-stderr" "$errf" "processes still running"
+expect_has "untracked-residual-kept-msg" "$errf" "a launcher exited before any descendant was recorded (state kept at"
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\)).*/\1/p' "$errf" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "untracked-residual-state-kept"; rm -rf -- "$kept"; else fail "untracked-residual-state-kept"; fi
 while read -r p st; do
   [ -n "$p" ] && [ "$(awk '{print $22}' "/proc/$p/stat" 2>/dev/null)" = "$st" ] && kill -KILL "$p" 2>/dev/null
 done <"$STUB_PIDFILE" || true

@@ -296,6 +296,7 @@ reported="null"
 reported_err=0
 collect_log=0
 snap_seen=0
+keep_state=0
 last_snap_cs=0
 # 本計測への帰属を証明済みのプロセスの「pid → 起動時刻」（試行で kill 対象にしたコンテナ側プロセスと、launcher の
 # 生存中に採取した子孫のスナップショット）。後始末で全件を同一性照合のうえ回収する。
@@ -620,7 +621,7 @@ tracked_alive() {
 # 回収。戻り値 0 = 回収確認済み / 非 0 = 残存または帰属不明（呼び出し側が終了コード 4 にする）。
 # 所要時間の上限は約 20 秒（launcher の停止待ち 5 + 2 秒、回収の再試行 5 秒、/proc 走査）。--print-budget は 60 秒を見込む。
 do_cleanup() {
-  local i d p rc=0
+  local i d p rc=0 untracked=0 evidence=0
   [ "$cleaned" -eq 0 ] || return 0
   cleaned=1
   trap '' INT TERM HUP
@@ -628,7 +629,10 @@ do_cleanup() {
   if launcher_ok; then
     snapshot_descendants || true
   elif [ -n "$launcher_pid" ] && [ "$snap_seen" -eq 0 ]; then
-    printf 'note: the launcher exited before its process tree could be recorded; leftovers that neither inherit the owner token nor appear in state.json cannot be detected\n' >&2 || true
+    # FCSUP1 ERR の報告や早期終了は子の不在証明にならない（製品の start_contract.rs は ERR を後始末より先に報告し、
+    # start_entry.rs には未回収ハンドルを伴う失敗経路もある）。子孫を 1 つも記録できず、後段でトークン・state.json の
+    # いずれでも帰属を証明できなければ、追跡不能として終了コード 4 にし、手動回収のため状態を残す（SUP-5）。
+    untracked=1
   fi
   # 2. launcher を止める（同一性を確認できる間だけ送る。先に終了して PID が再利用されていれば送らない）。
   if launcher_ok; then
@@ -651,6 +655,7 @@ do_cleanup() {
   # 5. トークン一致の所有プロセスと追跡済みプロセスを回収する。消えるまで最大 5 秒再試行する。
   for ((i = 0; i < 25; i++)); do
     owned_scan
+    if [ "${#OWNED[@]}" -gt 0 ]; then evidence=1; fi
     if [ "${#OWNED[@]}" -eq 0 ] && ! tracked_alive; then break; fi
     for d in ${OWNED[@]+"${OWNED[@]}"}; do
       p="${d%%:*}"
@@ -663,6 +668,11 @@ do_cleanup() {
   # 6. 最終確認。再試行の後に現れたものを含め、所有・追跡済みプロセスが 1 つでも生存していれば残存。
   owned_scan
   if [ "${#OWNED[@]}" -gt 0 ] || tracked_alive; then rc=4; fi
+  if [ "$untracked" -eq 1 ] && [ "$evidence" -eq 0 ] && [ "${#tracked[@]}" -eq 0 ]; then
+    printf 'warning: the launcher exited before any descendant was recorded; container-side processes cannot be tracked (state kept at %s)\n' "${workdir:-<none>}" >&2 || true
+    rc=4
+    keep_state=1
+  fi
   if [ -n "$launcher_pid" ]; then
     if launcher_ok; then
       rc=4
@@ -672,7 +682,7 @@ do_cleanup() {
       wait "$launcher_pid" 2>/dev/null || true
     fi
   fi
-  [ -z "$workdir" ] || rm -rf -- "$workdir" 2>/dev/null || true
+  if [ -n "$workdir" ] && [ "${keep_state:-0}" -eq 0 ]; then rm -rf -- "$workdir" 2>/dev/null || true; fi
   if [ -n "$state_root" ] && [ -n "$container_id" ] && [ "$rc" -eq 0 ]; then
     # --state-root は操作者の領域。<id>/ は削除しない（残置を通知する）。
     printf 'note: left state entry for id %s under --state-root (operator-owned)\n' "$container_id" >&2 || true

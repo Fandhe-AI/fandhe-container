@@ -587,7 +587,12 @@ run_case count_jump 1 count_jump "" --trials 1 --warmup 0 --timeout 2 || true
 run_case dead_new 1 dead_new "" --trials 1 --warmup 0 --timeout 3 || true
 run_case error_line 1 error_line "101000 101000" --trials 1 --warmup 0 --timeout 2 || true
 # FCSUP1 ERR・書式不正の報告・バックオフ未満の計測値（差し引けない）は計測失敗（SUP-3・REPAIR-12）
-run_case err_report 1 err_report "" --trials 1 --warmup 0 --timeout 3 || true
+# ERR は子の不在証明にならない。子孫を 1 つも記録できないまま supervisor が消えたら、追跡不能として終了コード 4・状態保持（SUP-5）
+run_case err_report 4 err_report "" --trials 1 --warmup 0 --timeout 3 || true
+if grep -q 'cannot be tracked' "${root}/err_report.err"; then pass "err_report: untracked warning"; else fail "err_report: untracked warning missing"; fi
+if grep -q 'cleanup-failed' "${root}/err_report.err"; then pass "err_report: cleanup-failed reported"; else fail "err_report: cleanup-failed missing"; fi
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\))*$/\1/p' "${root}/err_report.err" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "err_report: state kept"; rm -rf -- "$kept"; else fail "err_report: state not kept"; fi
 run_case bad_report 1 bad_report "" --trials 1 --warmup 0 --timeout 3 || true
 run_case no_backoff 1 no_backoff "" --trials 1 --warmup 0 --timeout 3 || true
 run_case reported_below 1 normal "1000 2000" --trials 2 --warmup 0 --timeout 5 || true

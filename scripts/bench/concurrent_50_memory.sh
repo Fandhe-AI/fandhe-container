@@ -490,8 +490,8 @@ known=()
 # 子孫を 1 つも記録できないまま launcher が消滅した場合に 1 にする（追跡不能。後始末の成功とは判定せず、
 # 一時ディレクトリも削除しない）。
 untracked=0
-untracked_cand=0 # untracked の候補（ln_stop の中で、所有トークンによる追跡が無かったときだけ untracked へ確定する）
-owned_seen=0
+untracked_cand=" " # untracked の候補のスロット番号（空白区切り。ln_stop の中で、そのスロットの所有トークンによる追跡が無かったときだけ untracked へ確定する）
+owned_seen=" "     # 所有トークンを観測できたスロット番号（空白区切り。別スロットのトークンは不在証明に使わない）
 # 起動した子プロセス（収集プロセス・launcher）を配列へ登録し終えるまでの間は 1。この間に受けた
 # TERM / INT / HUP は pending_sig へ記録するだけにして、登録後に処理する（on_signal・spawn_section_end）。
 in_spawn=0
@@ -688,7 +688,7 @@ ln_prepare() { # <id>
 # （supervisor は標準出力が FIFO であることを要求する）。
 ln_spawn() { # <id> <logfile>
   (
-    FANDHE_BENCH_OWNER="$owner_tok" exec "$systemd_run" --user --scope --quiet -p Delegate=yes -- "$sup_bin" start --root "$tmpdir/state" "$1" </dev/null >"$2.fifo" 2>&1
+    FANDHE_BENCH_OWNER="${owner_tok}.s${#pids[@]}" exec "$systemd_run" --user --scope --quiet -p Delegate=yes -- "$sup_bin" start --root "$tmpdir/state" "$1" </dev/null >"$2.fifo" 2>&1
   ) &
   LAST_PID=$!
   # FANDHE_CONCURRENT_MEMORY_SELFTEST_SIGNAL_IN_SPAWN は selftest が「launcher を起動した直後、pid を
@@ -820,21 +820,26 @@ tracked_pid() { # <i> <pid>
 # 「pid:起動時刻」で OWNED へ入れる。トークンは実行ごとの乱数。列挙からシグナル送信までの間の pid
 # 再利用に備え、送信時は起動時刻とトークンを再照合する（owned_kill）。
 owned_scan() {
-  local f p
+  local f p slot tok_re="${owner_tok//./\\.}"
   OWNED=()
   [ -n "$owner_tok" ] || return 0
   while IFS= read -r f; do
     p="${f#"$proc"/}"
     p="${p%%/*}"
     [[ "$p" =~ $num_re ]] || continue
-    if read_starttime "$p" && proc_alive "$p"; then OWNED+=("${p}:${ST}"); owned_seen=1; fi
-  done < <(grep -lzxF -- "FANDHE_BENCH_OWNER=${owner_tok}" "$proc"/[0-9]*/environ 2>/dev/null || true)
+    if read_starttime "$p" && proc_alive "$p"; then
+      OWNED+=("${p}:${ST}")
+      slot="$(tr '\0' '\n' <"$proc/$p/environ" 2>/dev/null | sed -n "s/^FANDHE_BENCH_OWNER=${tok_re}\\.s\([0-9][0-9]*\)\$/\1/p" | head -n 1)" || slot=""
+      case "$owned_seen" in *" ${slot:-x} "*) ;; *) [ -z "$slot" ] || owned_seen="${owned_seen}${slot} " ;; esac
+    fi
+  done < <(grep -lzE -- "^FANDHE_BENCH_OWNER=${tok_re}\.s[0-9]+\$" "$proc"/[0-9]*/environ 2>/dev/null || true)
 }
 
 # pid の environ が実行ごとのトークンを継承しているか（読めない・無ければ失敗）。
 owned_by_token() { # <pid>
   [ -n "$owner_tok" ] || return 1
-  [ -r "$proc/$1/environ" ] && grep -qzxF -- "FANDHE_BENCH_OWNER=${owner_tok}" "$proc/$1/environ" 2>/dev/null
+  local tok_re="${owner_tok//./\\.}"
+  [ -r "$proc/$1/environ" ] && grep -qzE -- "^FANDHE_BENCH_OWNER=${tok_re}\.s[0-9]+\$" "$proc/$1/environ" 2>/dev/null
 }
 
 # OWNED の各プロセスへ、トークンと起動時刻を再照合してから SIGKILL を送る。
@@ -878,7 +883,7 @@ ln_stop() {
     # FANDHE_BENCH_OWNER を継承しないため、トークン走査でも見つからず、生存していても追跡できない。
     # 子プロセス不在の証明にならないので、追跡不能として扱う（SUP-5。独立性検証スクリプトと同じ）。
     # 所有トークンで 1 件でも見つかれば（スタブ等、環境変数を継承する場合）追跡できているので、回収後に判定する。
-    if ! ln_alive "$i" && [ -z "${known[i]:-}" ]; then untracked_cand=1; fi
+    if ! ln_alive "$i" && [ -z "${known[i]:-}" ]; then untracked_cand="${untracked_cand}${i} "; fi
   done
   for i in "${!pids[@]}"; do
     sig_same_proc TERM "${pids[i]}" "${pstart[i]:-}" "$$"
@@ -946,18 +951,28 @@ ln_stop() {
       *) residual+=("pid=${pid}") ;;
     esac
   done
+  # 追跡不能の確定は残存の有無に関わらず先に行う（残存で戻っても状態を残して手動回収へ進めるため）。
+  # 所有トークンの観測はスロット単位で照合し、別のコンテナのトークンを不在証明に使わない。
+  for i in "${!pids[@]}"; do
+    case "$untracked_cand" in
+      *" ${i} "*) case "$owned_seen" in *" ${i} "*) ;; *) untracked=1 ;; esac ;;
+    esac
+  done
+  untracked_cand=" "
+  owned_seen=" "
   pids=()
   pstart=()
   snaps=()
   known=()
   need_sweep=0
   if [ "${#residual[@]}" -gt 0 ]; then
-    err "cleanup-failed" "processes still running: ${residual[*]}"
+    if [ "$untracked" -eq 1 ]; then
+      err "cleanup-failed" "processes still running: ${residual[*]}; a launcher exited before any descendant was recorded (state kept at ${tmpdir:-<none>})"
+    else
+      err "cleanup-failed" "processes still running: ${residual[*]}"
+    fi
     return 4
   fi
-  if [ "$untracked_cand" -eq 1 ] && [ "$owned_seen" -eq 0 ]; then untracked=1; fi
-  untracked_cand=0
-  owned_seen=0
   if [ "$untracked" -eq 1 ]; then
     err "cleanup-failed" "a launcher exited before any descendant was recorded; container-side processes cannot be tracked (state kept at ${tmpdir:-<none>})"
     return 4

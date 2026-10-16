@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# scripts/lib.sh の workspace 判定（has_cargo・has_members・skip_unless_workspace）の回帰テスト。
+# scripts/lib.sh の workspace 判定（has_cargo・has_members・skip_unless_workspace）と run_limited の回帰テスト。
 #
 # 一時ディレクトリに scripts/lib.sh・scripts/versions.sh を複製した疑似リポジトリを作り、Cargo.toml・
 # crates/*/Cargo.toml の有無の組み合わせごとに判定結果と skip の出力を具体値で照合する。
 # 実行する bash は PATH 上の bash に加え、/bin/bash があればそれでも回す（macOS 標準の bash 3.2 で
 # glob 不一致時の判定が崩れないことを確かめる。PR #1756 の指摘）。リポジトリ内のファイルは変更しない。
+# run_limited は終了コード・経過秒・子孫の回収を具体値で照合する（TASK-64 追補・#2092・REPAIR-1・REPAIR-5）。
 # 呼び出し元: Makefile の `lib-selftest`（CI の platform-ci ジョブ。PR は ubuntu・main は 3 OS）。
 # 終了コード: 0 = 全件一致、1 = 不一致あり。
 set -euo pipefail
@@ -76,6 +77,84 @@ check cargo-empty-crates 1 empty "cargo=1 members=0|${skip_line}"
 check cargo-dir-without-manifest 1 dironly "cargo=1 members=0|${skip_line}"
 check member-without-root-cargo 0 member "cargo=0 members=1|${skip_line}"
 check cargo-and-member 1 member "cargo=1 members=1|ran"
+
+# --- run_limited（REPAIR-5）: 終了コードと経過秒を具体値で照合する ---
+# probe は lib.sh を source し、RUN_LIMITED_DIR に private な一時ディレクトリを設定して 1 ケースを実行し、
+# `rc=<終了コード> secs=<経過秒> extra=<補足> left=<印ファイルの残り>` の 1 行を出す。
+make_rl_probe() {
+  local dir="$1"
+  mkdir -p "${dir}/scripts"
+  cp "${src_dir}/lib.sh" "${src_dir}/versions.sh" "${dir}/scripts/"
+  cat >"${dir}/gc.sh" <<'GC'
+#!/bin/sh
+# TERM を無視する孫を作る（期限切れで KILL まで届くことの確認用）
+sh -c 'trap "" TERM; echo $$ >"$1"; exec sleep 30' _ "$RL_DIR/gc.pid" &
+wait
+GC
+  chmod +x "${dir}/gc.sh"
+  cat >"${dir}/scripts/rl-probe.sh" <<'PROBE'
+#!/usr/bin/env bash
+set -euo pipefail
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+RL_DIR="$2"
+export RL_DIR
+mkdir -p "${RL_DIR}/work"
+RUN_LIMITED_DIR="${RL_DIR}/work"
+trap run_limited_abort EXIT
+f5() { return 5; }
+SECONDS=0
+rc=0
+extra=""
+case "$1" in
+  exit7) run_limited 10 sh -c 'exit 7' || rc=$? ;;
+  true) run_limited 10 true || rc=$? ;;
+  func) run_limited 10 f5 || rc=$? ;;
+  timeout) run_limited 1 sleep 30 || rc=$? ;;
+  grandchild)
+    run_limited 1 "${RL_DIR}/gc.sh" || rc=$?
+    if kill -0 "$(cat "${RL_DIR}/gc.pid")" 2>/dev/null; then extra=alive; else extra=gone; fi
+    ;;
+  badlimit0) run_limited 0 touch "${RL_DIR}/ran" || rc=$? ;;
+  badlimitabc) run_limited abc touch "${RL_DIR}/ran" || rc=$? ;;
+  nodir) unset RUN_LIMITED_DIR; run_limited 5 touch "${RL_DIR}/ran" || rc=$? ;;
+esac
+if [ -e "${RL_DIR}/ran" ]; then extra="${extra}ran"; fi
+left="$(ls -A "${RL_DIR}/work" | tr '\n' ',')"
+echo "rc=${rc} secs=${SECONDS} extra=${extra} left=${left}"
+PROBE
+}
+
+# check_rl <ケース> <期待 rc> <最小秒> <最大秒> <期待 extra>
+check_rl() {
+  local name="$1" want_rc="$2" min="$3" max="$4" want_extra="$5" sh dir got rc rc_got secs extra left
+  for sh in "${shells[@]}"; do
+    dir="${root}/rl-${name}-$(basename "$(dirname "${sh}")")-$$-${RANDOM}"
+    make_rl_probe "${dir}"
+    rc=0
+    got="$(cd / && "${sh}" "${dir}/scripts/rl-probe.sh" "${name}" "${dir}" 2>&1)" || rc=$?
+    # 失敗しても孫を残さない
+    if [ -f "${dir}/gc.pid" ]; then kill -KILL "$(cat "${dir}/gc.pid")" 2>/dev/null || true; fi
+    rc_got="$(printf '%s' "${got}" | sed -n 's/.*rc=\([0-9]*\) secs=.*/\1/p' | tail -n 1)"
+    secs="$(printf '%s' "${got}" | sed -n 's/.* secs=\([0-9]*\) extra=.*/\1/p' | tail -n 1)"
+    extra="$(printf '%s' "${got}" | sed -n 's/.* extra=\([a-z]*\) left=.*/\1/p' | tail -n 1)"
+    left="$(printf '%s' "${got}" | sed -n 's/.* left=\(.*\)$/\1/p' | tail -n 1)"
+    if [ "${rc}" -eq 0 ] && [ "${rc_got}" = "${want_rc}" ] && [ "${extra}" = "${want_extra}" ] &&
+      [ -n "${secs}" ] && [ "${secs}" -ge "${min}" ] && [ "${secs}" -le "${max}" ] && [ -z "${left}" ]; then
+      pass "run_limited ${name} (${sh}): rc=${rc_got} secs=${secs}"
+    else
+      fail "run_limited ${name} (${sh}): exit=${rc} got='${got}' want rc=${want_rc} secs=${min}..${max} extra='${want_extra}' left=''"
+    fi
+  done
+}
+
+check_rl exit7 7 0 2 ""
+check_rl true 0 0 2 ""
+check_rl func 5 0 2 ""
+check_rl timeout 124 1 8 ""
+check_rl grandchild 124 1 10 "gone"
+check_rl badlimit0 125 0 2 ""
+check_rl badlimitabc 125 0 2 ""
+check_rl nodir 125 0 2 ""
 
 for sh in "${shells[@]}"; do
   # shellcheck disable=SC2016 # BASH_VERSION は子の bash 側で展開させる

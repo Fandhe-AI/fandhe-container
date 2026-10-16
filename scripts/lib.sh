@@ -188,3 +188,86 @@ bench_args_for() {
     *) ;;
   esac
 }
+
+# run_limited <上限秒> <コマンド> [引数...]: 子プロセスを上限秒で打ち切って実行する（REPAIR-5）。
+# macOS 標準に timeout が無いため見張り役方式で、guest/kernel/build.sh・scripts/build-guest-initrd.sh・
+# scripts/generate-third-party-licenses.sh が共有する（以前は 3 本に重複していた。REPAIR-1）。回帰テストは
+# scripts/lib-selftest.sh。シェル関数も子として渡せる。
+#   前提: 呼び出し元が mktemp -d で作った private なディレクトリを RUN_LIMITED_DIR に設定する
+#         （期限切れの印ファイルの置き場。共有の固定パスを使わない）。呼び出し元の EXIT trap で
+#         run_limited_abort を呼ぶこと（異常終了時に実行中の子孫を回収する）。
+#   戻り値: 子の終了コードをそのまま返す（0 を含む）。期限切れは 124。
+#           上限秒が 1〜999999 の整数でない・RUN_LIMITED_DIR がディレクトリでない場合は実行せず 125。
+#   期限切れ時: 子のプロセスグループ全体へ TERM → 2 秒後に KILL を送り、最大 5 秒グループの消滅を確認する。
+_run_limited_child_pid=""
+_run_limited_wd_pid=""
+run_limited() {
+  local limit="$1"
+  shift
+  case "${limit}" in '' | *[!0-9]* | ???????*) limit=invalid ;; esac
+  if [ "${limit}" = invalid ] || [ "${limit}" -eq 0 ]; then
+    echo "error: run-limited: limit must be an integer from 1 to 999999 (seconds)" >&2
+    return 125
+  fi
+  if [ -z "${RUN_LIMITED_DIR:-}" ] || [ ! -d "${RUN_LIMITED_DIR}" ]; then
+    echo "error: run-limited: RUN_LIMITED_DIR must be a directory" >&2
+    return 125
+  fi
+  local marker="${RUN_LIMITED_DIR}/timeout-marker"
+  rm -f "${marker}"
+  # 子は job control で独立したプロセスグループにする（グループ宛ての kill で子孫ごと止める）。
+  set -m
+  "$@" &
+  local pid=$!
+  set +m
+  _run_limited_child_pid="${pid}"
+  (
+    # 親の EXIT / TERM trap（呼び出し元の cleanup）を引き継がない
+    trap - EXIT INT TERM
+    i=0
+    while [ "${i}" -lt "${limit}" ]; do
+      sleep 1
+      kill -0 "${pid}" 2>/dev/null || exit 0
+      i=$((i + 1))
+    done
+    : >"${marker}"
+    kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+    sleep 2
+    kill -KILL -- "-${pid}" 2>/dev/null || kill -KILL "${pid}" 2>/dev/null || true
+  ) &
+  _run_limited_wd_pid=$!
+  local rc=0
+  wait "${pid}" || rc=$?
+  if [ -e "${marker}" ]; then
+    # 見張り役が KILL まで送り終えるのを待ち、グループの消滅を確認する。
+    wait "${_run_limited_wd_pid}" 2>/dev/null || true
+    local n=0
+    while kill -0 -- "-${pid}" 2>/dev/null && [ "${n}" -lt 5 ]; do
+      sleep 1
+      n=$((n + 1))
+    done
+    _run_limited_wd_pid=""
+    _run_limited_child_pid=""
+    rm -f "${marker}"
+    return 124
+  fi
+  kill -KILL "${_run_limited_wd_pid}" 2>/dev/null || true
+  wait "${_run_limited_wd_pid}" 2>/dev/null || true
+  _run_limited_wd_pid=""
+  _run_limited_child_pid=""
+  return "${rc}"
+}
+
+# run_limited_abort: 実行中の run_limited の子（プロセスグループ）と見張り役を止める。冪等。
+# 呼び出し元の EXIT trap（cleanup）から呼ぶ。送る相手は run_limited 自身が起動したものだけ。
+run_limited_abort() {
+  if [ -n "${_run_limited_child_pid}" ]; then
+    kill -TERM -- "-${_run_limited_child_pid}" 2>/dev/null || true
+    kill -KILL -- "-${_run_limited_child_pid}" 2>/dev/null || true
+  fi
+  if [ -n "${_run_limited_wd_pid}" ]; then
+    kill -KILL "${_run_limited_wd_pid}" 2>/dev/null || true
+  fi
+  _run_limited_child_pid=""
+  _run_limited_wd_pid=""
+}

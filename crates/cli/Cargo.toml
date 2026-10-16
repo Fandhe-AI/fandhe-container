@@ -54,3 +54,8 @@ workspace = true
 [[test]]
 name = "start_scope_real"
 harness = false
+
+# 実機前提の結合試験（#2061）。`harness = false` の単一 main で、`-- --ignored` のときだけ実機シナリオを動かす。
+[[test]]
+name = "delete_cgroup_real"
+harness = false

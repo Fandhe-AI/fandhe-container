@@ -13,7 +13,7 @@ crate の短縮名は [crate-naming.md](../../docs/design/crate-naming.md)（TAS
 | `crates/io/`（I/O 共有層・バッチ write-back・フラッシュバリア・FS 正規化） | io-builder | sonnet |
 | `crates/core/`・`crates/supervisor/`（namespace・cgroups v2・seccomp/Landlock・rootless・監査ログ・監視プロセス） | runtime-builder | sonnet |
 | `crates/oci/`・`crates/cri/`・`fandhe-container-plugin-cri`（イメージ・ライフサイクル・CRI） | oci-cri-builder | sonnet |
-| `crates/platform-macos/`・`crates/platform-windows/`・`crates/microvm/`・`fandhe-container-plugin-macos` / `-windows` / `-microvm` | platform-builder | sonnet |
+| `crates/platform-macos/`・`crates/guest-init/`・`crates/platform-windows/`・`crates/microvm/`・`fandhe-container-plugin-macos` / `-windows` / `-microvm` | platform-builder | sonnet |
 | `crates/gpu/`（CDI・`/dev/dxg`・Venus） | gpu-builder | sonnet |
 | `crates/net/`（netlink・nftables・bridge/veth/netns・DNS） | net-builder | sonnet |
 | `crates/plugin/`・`fandhe-container-plugin-mcp`（plugin 境界機構・MCP サーバー） | plugin-builder | sonnet |

@@ -7,7 +7,7 @@
 //! ESC-05（`/proc/sys`・`/proc/sysrq-trigger`）が前提にする「書き込めない」状態を作る。
 //!
 //! ```text
-//! prepare_rootfs -> (create_default_devices -> mount_tmpfs -> inject_files) -> apply_readonly_paths -> pivot_root
+//! prepare_rootfs -> (create_default_devices -> mount_tmpfs -> inject_files -> mount_binds) -> apply_readonly_paths -> pivot_root
 //! ```
 //!
 //! **`setup` の有無によらず常に走る**（`inject_files` までは `setup` 指定時のみ）。外す入口は作らない

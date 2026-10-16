@@ -57,10 +57,12 @@
 //!
 //! # スコープ外（REPAIR-3）
 //!
-//! 字句検証のみ。symlink を含む実体の照合（dev/ino）・fd 起点 `O_NOFOLLOW` の走査・種別と存在の確認・
-//! 宛先ディレクトリの作成・利用者権限での到達性は適用側 #1913 の担当で、本型は検証から適用までの TOCTOU を
-//! 防がない。`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917、`start` の結線は #1915。
-//! 監査 sink の本番配線も #1915 で未実装。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
+//! 本型は字句検証のみで、検証から適用までの TOCTOU を防がない。symlink を含む実体の照合・fd 起点 `O_NOFOLLOW` の
+//! 走査・種別と存在の確認・宛先ディレクトリの作成・利用者権限での到達性・rootfs 自身とその祖先の実体照合（`dev`/`ino`）は、
+//! 適用の段 `crate::exec::mount_binds`（#1913。実装済み。Linux 限定のため intra-doc リンクは張らない）が担う。
+//! 実体照合の残余（REPAIR-3）は bundle・状態ルートと、ホスト側の別の bind mount による別名で、字句検証（`check_against_host_paths`）
+//! だけが効く。`run_pre_pivot` への組み込みは済み（#1914）、`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917、
+//! `start` の結線は #1915。監査 sink の本番配線も #1915 で未実装。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
 
 use std::fmt;
 use std::path::Path;
@@ -394,7 +396,7 @@ impl BindMountSet {
     /// マウント元が `forbidden`（rootfs・bundle・状態ルートのホスト絶対パス。呼び出し側が渡す）と
     /// 同一または祖先なら拒否する。
     ///
-    /// 字句比較のみ。symlink を含む実体の照合は適用側 #1913 の dev/ino 照合へ委ねる。子孫は拒否しない（暫定）。
+    /// 字句比較のみ。rootfs 自身とその祖先の実体照合は適用の段（#1913）が `dev`/`ino` で行う。bundle・状態ルートの実体照合は未対応。子孫は拒否しない（暫定）。
     pub fn check_against_host_paths(&self, forbidden: &[&str]) -> Result<(), BindMountError> {
         for b in &self.mounts {
             if forbidden

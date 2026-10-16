@@ -280,6 +280,7 @@ dependencies = [
 name = "fandhe-container-benches"
 version = "0.0.0"
 dependencies = [
+ "fandhe-container-io",
  "fandhe-container-plugin",
 ]
 
@@ -291,6 +292,7 @@ dependencies = [
  "fandhe-container-core",
  "fandhe-container-net",
  "fandhe-container-plugin",
+ "fandhe-container-supervisor",
 ]
 
 [[package]]
@@ -328,6 +330,13 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde-saphyr",
+]
+
+[[package]]
+name = "fandhe-container-guest-init"
+version = "0.0.0"
+dependencies = [
+ "fandhe-container-platform-macos",
 ]
 
 [[package]]

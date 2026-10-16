@@ -1,0 +1,120 @@
+//! `mount(2)` の薄いラッパー（`unsafe` はこのモジュールに閉じる。#1823 の事前承認の範囲・MAC-1）。
+//!
+//! ゲスト init が `/proc`・`/sys`・`/dev` と virtiofs の mount に使う。安全な関数だけを公開し、
+//! `unsafe fn` は外へ出さない。`extern "C"` 宣言は自前（外部クレートを使わない）。#1318 の `libc` との
+//! 機械照合はこの crate には未導入で、フラグ定数は固定値テストで照合する。
+//!
+//! 定数は x86_64 / aarch64 の Linux で同値だが、他アーキテクチャへ流用しない（`SUPPORTED` が偽なら
+//! `ENOSYS` を返して何も呼ばない）。
+
+use std::ffi::CString;
+use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
+
+/// 対応アーキテクチャ（定数を検証済みのもの）。
+const SUPPORTED: bool = cfg!(any(target_arch = "x86_64", target_arch = "aarch64"));
+
+/// 読み取り専用。
+pub const MS_RDONLY: u64 = 1;
+/// setuid / setgid を無効にする。
+pub const MS_NOSUID: u64 = 2;
+/// デバイスファイルを無効にする。
+pub const MS_NODEV: u64 = 4;
+/// 実行を禁止する。
+pub const MS_NOEXEC: u64 = 8;
+/// `open(2)` で制御端末にしない。
+pub const O_NOCTTY: i32 = 0o400;
+
+/// `ENOSYS`（Linux 共通）。
+const ENOSYS: i32 = 38;
+
+unsafe extern "C" {
+    // SAFETY（宣言そのものの妥当性）: `int mount(const char *source, const char *target,
+    // const char *fstype, unsigned long flags, const void *data)`。`c_ulong` は LP64（x86_64・aarch64 の
+    // Linux。glibc / musl）で u64。
+    fn mount(
+        source: *const core::ffi::c_char,
+        target: *const core::ffi::c_char,
+        fstype: *const core::ffi::c_char,
+        flags: u64,
+        data: *const core::ffi::c_void,
+    ) -> i32;
+}
+
+fn cstring(bytes: &[u8]) -> io::Result<CString> {
+    // NUL を含む入力は EINVAL にする（カーネルへ切り詰めた文字列を渡さない）。
+    CString::new(bytes).map_err(|_| io::Error::from_raw_os_error(22))
+}
+
+/// `mount(source, target, fstype, flags, data)` を呼ぶ。失敗は直後の errno を `io::Error` で返す。
+pub fn mount_fs(
+    source: &str,
+    target: &Path,
+    fstype: &str,
+    flags: u64,
+    data: Option<&str>,
+) -> io::Result<()> {
+    if !SUPPORTED {
+        return Err(io::Error::from_raw_os_error(ENOSYS));
+    }
+    let source = cstring(source.as_bytes())?;
+    let target = cstring(target.as_os_str().as_bytes())?;
+    let fstype = cstring(fstype.as_bytes())?;
+    let data = data.map(|d| cstring(d.as_bytes())).transpose()?;
+    let data_ptr = data.as_ref().map_or(core::ptr::null(), |d| {
+        d.as_ptr().cast::<core::ffi::c_void>()
+    });
+    // SAFETY: `source`・`target`・`fstype` は NUL 終端の `CString` で、この呼び出しが戻るまで生存する。
+    // `data` は null か、同様に生存する NUL 終端文字列（virtiofs では使わず、devtmpfs の `mode=0755` のみ）。
+    // `flags` は `c_ulong`（u64）と同幅。mount(2) はポインタ先を読むだけで保持しない。
+    let rc = unsafe {
+        mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            flags,
+            data_ptr,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        // 直後に errno を取る（間に libc 呼び出しを挟まない）。
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mac1_flag_constants_match_linux_abi() {
+        assert_eq!(MS_RDONLY, 1);
+        assert_eq!(MS_NOSUID, 2);
+        assert_eq!(MS_NODEV, 4);
+        assert_eq!(MS_NOEXEC, 8);
+        assert_eq!(O_NOCTTY, 0o400);
+    }
+
+    #[test]
+    fn mac1_mount_rejects_nul_with_einval() {
+        let e = mount_fs("a\0b", Path::new("/nonexistent"), "virtiofs", 0, None).unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(22));
+    }
+
+    #[test]
+    fn mac1_mount_of_unknown_fs_fails_without_effect() {
+        // 存在しない fstype・target への mount は権限の有無に関わらず失敗し、何も mount されない。
+        let e = mount_fs(
+            "x",
+            Path::new("/nonexistent-fandhe-guest-init"),
+            "nosuchfs",
+            0,
+            None,
+        )
+        .unwrap_err();
+        assert!(e.raw_os_error().is_some_and(|n| n > 0));
+    }
+}

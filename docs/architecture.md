@@ -22,6 +22,8 @@ workspace は次の層に分けられる。
 6. **plugin 境界の外側（バックエンド実装ライブラリ）**: `cri`・`platform-macos`・`platform-windows`・`microvm`。PLUG-1 上は「core」ではなく、対応する plugin バイナリから呼ばれる実装本体
 7. **plugin バイナリ（別プロセス）**: `plugin-cri`・`plugin-macos`・`plugin-windows`・`plugin-microvm`・`plugin-mcp`。UDS 境界（PLUG-2）を越えて 6. の実装ライブラリを動かす
 
+`guest-init`（`fandhe-container-guest-init`）は macOS ゲスト VM の initrd に入れる PID 1 で、ホスト側の層には属さない「ゲスト資産」である（crate-naming.md の表 #20。#1823・#1875）。通常の依存を持たず（std のみ）、`platform-macos` への依存は契約の照合試験（`tests/contract.rs`）のための `[dev-dependencies]` のみ。
+
 `benches`（`fandhe-container-benches`）は上記いずれの層にも属さない、crate をまたぐベンチ回帰専用の `publish = false` workspace メンバーである（crate-naming.md 決定 7）。
 
 ### crate 一覧の要約表
@@ -38,6 +40,7 @@ workspace は次の層に分けられる。
 | 独立ツール | compose-convert |
 | plugin 境界の外側（バックエンド実装） | cri・platform-macos・platform-windows・microvm |
 | plugin バイナリ | plugin-cri・plugin-macos・plugin-windows・plugin-microvm・plugin-mcp |
+| ゲスト資産（ホスト側の層の外） | guest-init |
 | ベンチ専用 | benches |
 
 ### crate 境界図
@@ -148,6 +151,7 @@ flowchart LR
     cli -.->|想定| oci
     cli -.->|想定| stack
     cli -->|確定| net
+    cli -->|確定| supervisor
     cli -->|確定| plugin
     platform_macos -->|確定| io
     plugin_star["plugin-*（バイナリ群）"] -.->|想定| core
@@ -159,6 +163,7 @@ flowchart LR
 | 依存元 → 依存先 | 根拠 | 状態 |
 | ---------------- | ---- | ---- |
 | `compose-convert` → `stack` | crate-naming.md 決定 5（TOML の型は `stack` のものを使う） | 確定 |
+| `guest-init` →(dev) `platform-macos` | ゲスト init と `guest_mount` の契約の機械照合（`tests/contract.rs`。MAC-1・#1875。dev-dependencies のみで、通常の依存には入れない。外部クレートの追加ではない） | 確定 |
 | `supervisor` → `core` | crate-naming.md 決定 6（`StateStore` 既定実装を core に一本化。supervisor は 2 つ目の実装を持たない） | 確定 |
 | `plugin-cri` → `cri` | crate-naming.md 表 #15（`cri` の実装を別プロセス化。TASK-114） | 確定 |
 | `cri` → `oci` | `PullImage` が oci の pull 経路（認証・manifest・blob 取得・digest 検証）を呼ぶ（CRI-4・OCI-1・TASK-61.3・#446。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド実装ライブラリ → core 側で、規則 2 の逆向き（core 側が `cri` に依存しない）のため抵触しない | 確定 |
@@ -169,6 +174,7 @@ flowchart LR
 | `plugin`（境界基盤） | crate-naming.md 表 #10（core 側・plugin 側双方が依存する境界基盤） | 確定（依存の向きは双方向的な基盤利用であり、上記フローチャートでは個別の辺として描かない） |
 | `core` → `io` | `VolumeProvider`（core 実装）がデータパスで I/O 共有層を使う想定（D-14。G2/G3 で確定） | 想定 |
 | `cli` → `core` | 統一 CLI が実行層を呼ぶ。Linux は core を直接、macOS / Windows は core の plugin 発見・登録機構（PLUG-4）経由で、platform-* / microvm 系へは直接依存しない（`make check-cli-backend-deps` で normal / build / dev 辺・全ターゲットを機械判定。TASK-79.2〜79.4） | 確定 |
+| `cli` → `supervisor` | `start` が supervisor の bin を起動し、結果の 1 行を契約の型（`start_contract::StartReport`）で復号する。実行ファイルの固定名（`launcher::SUPERVISOR_FILE_NAME`）もここから得る（TASK-79 追補・#1718・REPAIR-2。workspace 内 path 依存で実装済み。外部クレートの追加ではない。supervisor は core にのみ依存し循環しない） | 確定 |
 | `cli` → `oci` | 統一 CLI がイメージ管理を呼ぶ想定（G6・TASK-79） | 想定 |
 | `platform-macos` → `io` | virtiofs 共有の I/O 共有プロトコルクライアント（`PipelineClient`）を使う（MAC-1・TASK-65.2。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド → core 側で、規則 2 の逆向きのため抵触しない | 確定 |
 | `cli` → `net` | `doctor` が br_netfilter・ホストの `ip filter FORWARD` policy の判定材料を net の読み取り照会（GETCHAIN）で取得する（NET-10・TASK-148.1。workspace 内 path 依存で実装済み。組み合わせ判定・警告・DOCKER-USER 案内・終了コードの評価層は TASK-148.2 で実装済み。CLI 配線は TASK-79） | 確定 |

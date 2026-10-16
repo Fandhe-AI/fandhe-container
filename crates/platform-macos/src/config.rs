@@ -37,6 +37,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use crate::guest_mount::GuestTestMode;
 use crate::virtiofs::VirtiofsSharesSpec;
 
 /// カーネルコマンドラインの最大バイト数（Linux の `COMMAND_LINE_SIZE` 相当。無制限確保の防止）。
@@ -204,6 +205,9 @@ pub enum ConfigError {
     GuestMountRequiresConsoleArg,
     /// ユーザー指定のコマンドラインに予約キー（`fandhe.` 始まり）のトークンがある（`index` はバイト位置）。
     CommandLineReservedKey { index: usize },
+    /// ゲスト試験モード（virtiofs-io）が指定されたが、プローブ用の共有（tag `fandhe-io`・RW・
+    /// ゲスト mount `/mnt/fandhe/io`）が無い（fail-closed。#1876）。
+    GuestTestRequiresProbeShare,
     /// virtiofs 共有数が上限を超えた。
     TooManyVirtiofsShares { count: usize, max: usize },
     /// 共有ディレクトリがディレクトリでない。
@@ -314,6 +318,7 @@ impl ConfigError {
             ConfigError::GuestMountRequiresConsole => "config.guest_mount_requires_console",
             ConfigError::GuestMountRequiresConsoleArg => "config.guest_mount_requires_console_arg",
             ConfigError::CommandLineReservedKey { .. } => "config.command_line_reserved_key",
+            ConfigError::GuestTestRequiresProbeShare => "config.guest_test_requires_probe_share",
             ConfigError::TooManyVirtiofsShares { .. } => "config.too_many_virtiofs_shares",
             ConfigError::SharedDirNotDirectory { .. } => "config.shared_dir_not_directory",
             ConfigError::SharedDirSymlink { .. } => "config.shared_dir_symlink",
@@ -504,6 +509,10 @@ impl ConfigError {
             }
             ConfigError::CommandLineReservedKey { index } => {
                 format!("kernel command line has a reserved 'fandhe.' key at byte {index}")
+            }
+            ConfigError::GuestTestRequiresProbeShare => {
+                "guest test mode requires a read-write 'fandhe-io' share mounted at /mnt/fandhe/io"
+                    .to_string()
             }
             ConfigError::DuplicateVirtiofsTag { tag } => {
                 format!("virtiofs tag is used more than once: {tag}")
@@ -1651,6 +1660,8 @@ pub struct VmConfigSpec {
     pub devices: DeviceConfigSpec,
     /// virtiofs 共有（TASK-65.1。既定は共有なし）。
     pub shares: VirtiofsSharesSpec,
+    /// ゲスト試験モード（#1876。既定は `None`）。試験専用で、本番の生成経路は設定しない。
+    pub guest_test: Option<GuestTestMode>,
 }
 
 impl VmConfigSpec {
@@ -1668,7 +1679,18 @@ impl VmConfigSpec {
             memory: MemorySize::default(),
             devices: DeviceConfigSpec::default(),
             shares: VirtiofsSharesSpec::default(),
+            guest_test: None,
         })
+    }
+
+    /// ゲスト試験モードを有効にする（試験専用。MAC-1・IO-5・#1876）。
+    ///
+    /// 実効コマンドラインに予約キー `fandhe.guest-test=<mode>` が加わる。利用者指定のコマンドラインからは
+    /// 予約キーとして拒否されるため、このメソッド経由でしか有効にならない。プローブ用の共有が無い構成は
+    /// [`Self::effective_cmdline`] が拒否する。
+    pub fn with_guest_test(mut self, mode: GuestTestMode) -> Self {
+        self.guest_test = Some(mode);
+        self
     }
 
     /// 生成時に検証したホストのパス（kernel・initrd・共有元）を、同じ検証でもう一度確かめる
@@ -1819,14 +1841,32 @@ impl VmConfigSpec {
     /// 再度通して長さ上限を実効値に対して適用する。mount 指定が無ければユーザー指定と同一。
     pub fn effective_cmdline(&self) -> Result<KernelCommandLine, ConfigError> {
         crate::guest_mount::reject_reserved_keys(self.cmdline.as_str())?;
-        let directives = crate::guest_mount::encode_directives(&self.shares);
-        if directives.is_empty() {
+        let mut tokens = crate::guest_mount::encode_directives(&self.shares);
+        if let Some(mode) = self.guest_test {
+            // 試験モードはプローブ用の共有が実在するときだけ許す（ゲストも mount 成功を AND 条件にする）。
+            let has_probe_share = self.shares.shares().iter().any(|s| {
+                s.tag.as_str() == crate::guest_probe::SHARE_TAG
+                    && !s.access.is_read_only()
+                    && s.guest_mount
+                        .as_ref()
+                        .is_some_and(|m| m.as_str() == crate::guest_probe::GUEST_MOUNT)
+            });
+            if !has_probe_share {
+                return Err(ConfigError::GuestTestRequiresProbeShare);
+            }
+            if !tokens.is_empty() {
+                tokens.push(' ');
+            }
+            tokens.push_str(crate::guest_mount::GUEST_TEST_KEY);
+            tokens.push_str(mode.token());
+        }
+        if tokens.is_empty() {
             return Ok(self.cmdline.clone());
         }
         let joined = if self.cmdline.as_str().is_empty() {
-            directives
+            tokens
         } else {
-            format!("{} {directives}", self.cmdline.as_str())
+            format!("{} {tokens}", self.cmdline.as_str())
         };
         KernelCommandLine::try_new(&joined)
     }
@@ -3942,6 +3982,63 @@ broken line
             spec.effective_cmdline().unwrap_err().code(),
             "config.command_line_too_long"
         );
+    }
+
+    /// MAC-1・IO-5・#1876: 試験モードは既定で無効で、有効にするとプローブ用の実効コマンドラインになる。
+    #[test]
+    fn guest_test_cmdline_is_off_by_default_and_exact_when_on() {
+        use crate::guest_mount::GuestTestMode;
+        use crate::virtiofs::ShareAccess::ReadWrite;
+        let t = TempDir::new("guest-test-cmdline");
+        let k = t.file("vmlinux");
+        let plain = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_shared_directories(mount_shares(
+                &t.0,
+                &[("fandhe-io", "/mnt/fandhe/io", ReadWrite)],
+            ));
+        assert_eq!(plain.guest_test, None);
+        assert_eq!(
+            plain.effective_cmdline().unwrap().as_str(),
+            "console=hvc0 fandhe.virtiofs=fandhe-io:/mnt/fandhe/io:rw"
+        );
+        let on = plain.with_guest_test(GuestTestMode::VirtiofsIo);
+        // virtiofs_io.rs（macOS 専用）の期待値と同一の文字列。打ち間違いを Linux CI で検出する。
+        assert_eq!(
+            on.effective_cmdline().unwrap().as_str(),
+            "console=hvc0 fandhe.virtiofs=fandhe-io:/mnt/fandhe/io:rw fandhe.guest-test=virtiofs-io"
+        );
+    }
+
+    /// MAC-1・IO-5・#1876: プローブ用の共有が無い・RO・別 mount point・別 tag の構成は fail-closed で拒否する。
+    #[test]
+    fn guest_test_requires_probe_share() {
+        use crate::guest_mount::GuestTestMode;
+        use crate::virtiofs::ShareAccess::{ReadOnly, ReadWrite};
+        let t = TempDir::new("guest-test-reject");
+        let k = t.file("vmlinux");
+        let base = VmConfigSpec::from_parts(&k, None, "console=hvc0")
+            .unwrap()
+            .with_guest_test(GuestTestMode::VirtiofsIo);
+        assert_eq!(
+            base.effective_cmdline().unwrap_err().code(),
+            "config.guest_test_requires_probe_share"
+        );
+        for shares in [
+            &[("fandhe-io", "/mnt/fandhe/io", ReadOnly)][..],
+            &[("fandhe-io", "/mnt/fandhe/other", ReadWrite)][..],
+            &[("other", "/mnt/fandhe/io", ReadWrite)][..],
+        ] {
+            let spec = base
+                .clone()
+                .with_shared_directories(mount_shares(&t.0, shares));
+            let err = spec.effective_cmdline().unwrap_err();
+            assert_eq!(err.code(), "config.guest_test_requires_probe_share");
+            assert_eq!(
+                err.message(),
+                "guest test mode requires a read-write 'fandhe-io' share mounted at /mnt/fandhe/io"
+            );
+        }
     }
 
     /// MAC-1・TASK-65.3: mount 指定があるのにコンソールが無い構成は fail-closed で拒否する。

@@ -89,16 +89,69 @@ ensure_cargo_deny() {
 }
 
 # 登録済みベンチ名（bench-check / bench-baseline が実行する。旧 Makefile の BENCH_NAMES）。
-# 実ベンチを追加するときに足す場所（plugin 境界ベンチ〔TASK-113〕は登録済み。files/s・起動 p95 のベンチは
-# 担当タスク未定で、docs/design/bench-calibration.md「既知の欠落」）。
-# plugin 境界ベンチ（TASK-113.1〜113.3）は metric を benches/metrics.json に登録済みのため、ここにも同時に載せる
+# 実ベンチを追加するときに足す場所（plugin 境界ベンチ〔TASK-113〕・small_files〔files/s・TASK-189 追補・#1899〕は
+# 登録済み。起動 p95 のベンチは #1900・#1901 の担当で、docs/design/bench-calibration.md「既知の欠落」）。
+# 各ベンチの metric は benches/metrics.json に登録済みのため、ここにも同時に載せる
 # （generate_baseline.sh は metrics.json と results の metric 集合が完全一致しないと exit 2）。
-# Windows（OS=Windows_NT）は Unix ドメインソケット前提の plugin 境界ベンチを実行できないため regression_placeholder のみ。
-BENCH_NAMES="regression_placeholder plugin_boundary plugin_boundary_list_images"
+BENCH_NAMES="regression_placeholder plugin_boundary plugin_boundary_list_images small_files"
+
+# 段階登録ベンチ名: metrics.json には登録済みだが baseline.json へ実測基準値が入るまでは比較しないベンチ
+# （実測基準値の確定は TASK-88.h1〔#230〕・TASK-113.h1）。scripts/bench/assemble_results.sh が、これらの結果から
+# baseline 登録済みの metric だけを比較対象に残す。新しい段階登録ベンチ（起動 p95 等）は BENCH_NAMES と
+# ここへ 1 語足すだけでよい。
+# shellcheck disable=SC2034 # scripts/targets/bench-check.sh が source 後に参照する
+BENCH_STAGED_NAMES="plugin_boundary plugin_boundary_list_images small_files"
+
+# Unix 限定ベンチ名: Windows（OS=Windows_NT）では実行せず、baseline・metrics からも除く。
+# plugin 境界ベンチは Unix ドメインソケット前提（PLUG-5）。small_files は基準値（#230）が ubuntu の CI 環境の値で、
+# Windows の永続化は file 単位の同期（SupportedFileSync）と Linux の syncfs で計測方式が異なり、登録後に
+# Windows で比べると偽の回帰が出るため除く。metric 名は「<ベンチ名>_」で始まる命名規約に従う
+# （bench_metric_prefixes_jq が一覧から jq 用の接頭辞配列を作る）。
+BENCH_UNIX_ONLY_NAMES="plugin_boundary plugin_boundary_list_images small_files"
+
 bench_names_for_os() {
   if [ "${OS:-}" = "Windows_NT" ]; then
-    echo "regression_placeholder"
+    local n out=""
+    for n in ${BENCH_NAMES}; do
+      case " ${BENCH_UNIX_ONLY_NAMES} " in
+        *" ${n} "*) ;;
+        *) out="${out:+${out} }${n}" ;;
+      esac
+    done
+    echo "${out}"
   else
     echo "${BENCH_NAMES}"
   fi
+}
+
+# bench_metric_prefixes_jq: Unix 限定ベンチの metric 名接頭辞（"<名>_"）を JSON 配列で返す
+# （Windows で baseline・metrics から除く jq の入力。接頭辞をスクリプトへ直書きしない）。
+bench_metric_prefixes_jq() {
+  local n out=""
+  for n in ${BENCH_UNIX_ONLY_NAMES}; do
+    out="${out:+${out},}\"${n}_\""
+  done
+  echo "[${out}]"
+}
+
+# bench_args_for <ベンチ名> <作業用ルート>: make bench-check / bench-baseline が各ベンチへ渡す引数を 1 行ずつ出す
+# （両ターゲットの値の乖離を防ぐため 1 か所で決める）。
+# small_files（IO-6・TASK-189 追補・#1899）は計測負荷を決める引数をすべて明示し、将来の既定値変更で
+# ゲートの負荷が黙って変わらないようにする。
+#   --count 2000          ハーネス CLI の下限（MIN_COUNT。IO-6 の 2,000 件）。CI の所要時間を小さく保つ
+#   --batch-size 1        1 ファイルごとに永続化（IO-2 の保証内。flush-every-k は保証外かつ Linux 限定のため使わない）
+#   --file-size 2         既定値を明示
+#   --layout tree         3〜5 万件の実測（#107）で auto が選ぶ配置形にそろえ、平置きのディレクトリ走査が区間を支配しない
+#   --config bind         ラベルのみ（挙動は変えない）
+#   --trials 3            中央値が 1 回の外れ値に耐える最小数
+#   --trial-timeout-secs 120 / --timeout-secs 300  ジョブ上限（15 分）より十分短く切る（REPAIR-5）
+# 3〜5 万件の実測は人間がハーネスを直接実行する（#107）。他のベンチは引数なし。
+bench_args_for() {
+  case "$1" in
+    small_files)
+      printf '%s\n' --count 2000 --batch-size 1 --file-size 2 --layout tree --config bind \
+        --trials 3 --trial-timeout-secs 120 --timeout-secs 300 --root "$2"
+      ;;
+    *) ;;
+  esac
 }

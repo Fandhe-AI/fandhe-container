@@ -55,6 +55,9 @@ pub(super) enum PrePivotStep {
     MountTmpfs,
     /// ファイルの注入。
     InjectFiles,
+    /// 検証済み bind mount の適用（指定時のみ。#1914）。違反理由のうち user namespace 由来の拒否は
+    /// PlanRejected 種別のため許可リストに入らず、理由なしで親へ届く（失敗として報告される点は同じ）。
+    MountBinds,
     /// 読み取り専用にするパスの固定集合の適用（`setup` の有無によらず常に走る。#1850）。
     ReadonlyPaths,
     /// 覆うパスの固定集合の適用（`setup` 指定時のみ。検証済みの `/dev/null` が要るため。#1851）。
@@ -64,13 +67,14 @@ pub(super) enum PrePivotStep {
 }
 
 impl PrePivotStep {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Establish,
         Self::PrepareRootfs,
         Self::VerifyPinned,
         Self::CreateDefaultDevices,
         Self::MountTmpfs,
         Self::InjectFiles,
+        Self::MountBinds,
         Self::ReadonlyPaths,
         Self::MaskedPaths,
         Self::PivotRoot,
@@ -85,6 +89,7 @@ impl PrePivotStep {
             Self::CreateDefaultDevices => "create_default_devices",
             Self::MountTmpfs => "mount_tmpfs",
             Self::InjectFiles => "inject_files",
+            Self::MountBinds => "mount_binds",
             Self::ReadonlyPaths => "readonly_paths",
             Self::MaskedPaths => "masked_paths",
             Self::PivotRoot => "pivot_root",
@@ -103,6 +108,7 @@ impl PrePivotStep {
             Self::CreateDefaultDevices => IsolationStage::CreateDevices,
             Self::MountTmpfs => IsolationStage::MountTmpfs,
             Self::InjectFiles => IsolationStage::InjectFiles,
+            Self::MountBinds => IsolationStage::MountBinds,
             Self::ReadonlyPaths => IsolationStage::MountReadonlyPaths,
             Self::MaskedPaths => IsolationStage::MountMaskedPaths,
             Self::PivotRoot => IsolationStage::PivotRoot,
@@ -444,9 +450,10 @@ fn step_ordinal(step: PrePivotStep) -> usize {
         PrePivotStep::CreateDefaultDevices => 3,
         PrePivotStep::MountTmpfs => 4,
         PrePivotStep::InjectFiles => 5,
-        PrePivotStep::ReadonlyPaths => 6,
-        PrePivotStep::MaskedPaths => 7,
-        PrePivotStep::PivotRoot => 8,
+        PrePivotStep::MountBinds => 6,
+        PrePivotStep::ReadonlyPaths => 7,
+        PrePivotStep::MaskedPaths => 8,
+        PrePivotStep::PivotRoot => 9,
     }
 }
 
@@ -512,7 +519,7 @@ mod tests {
         for (i, s) in PrePivotStep::ALL.into_iter().enumerate() {
             assert_eq!(step_ordinal(s), i);
         }
-        assert_eq!(PrePivotStep::ALL.len(), 9);
+        assert_eq!(PrePivotStep::ALL.len(), 10);
     }
 
     /// 具体値の符号化（ワイヤー形式の固定。SEC-4・REPAIR-2）。
@@ -530,6 +537,15 @@ mod tests {
         );
         let s = fail(PrePivotStep::PivotRoot, ErrorCode::Internal, None);
         assert_eq!(s.encode().as_bytes(), b"F pivot_root INTERNAL -\n");
+        let s = fail(
+            PrePivotStep::MountBinds,
+            ErrorCode::PermissionDenied,
+            Some(ViolationReason::BindSourceNotAccessible),
+        );
+        assert_eq!(
+            s.encode().as_bytes(),
+            b"F mount_binds PERMISSION_DENIED bind_source_not_accessible\n"
+        );
     }
 
     /// 全段 x 全 ErrorCode x 全許可理由の往復と、最長の行が上限に収まること。

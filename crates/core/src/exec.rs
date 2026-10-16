@@ -27,6 +27,9 @@
 //!    その直後に、覆うパスの固定集合（`/proc` 配下の 10 件。SEC-2・#1851）を `masked_paths` 段が適用する
 //!    （ファイルは検証済みの `/dev/null`、ディレクトリは読み取り専用の空 tmpfs を載せる。適用は `exec::masked_paths`。
 //!    **実装済み**だが、検証済みの `/dev/null` が要るため `setup` 指定時のみ。`setup` なしの最小構成は適用しない）
+//!    検証済みの bind mount（`config.json` の `mounts[]` の bind。CORE-1・SEC-1）は [`mount_binds`]（`exec/bind_mounts.rs`。
+//!    TASK-29 追補・#1913。**段の実装は済み**。`run_pre_pivot` へ組み込み済みで、`inject_files` の後・`readonly_paths` の前に固定した〔#1914〕。
+//!    `start` への結線は #1915）が、マウント元の固定・属性・付け替え・事後検証を fd 起点で行う
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
 //!    → Landlock → seccomp（#136・#832・#833。**枠・`NO_NEW_PRIVS`・capability 削減・seccomp は実装済み**: [`StagePipeline`] が
 //!    [`StageKind::ORDER`] の固定順でフックを呼び、`NO_NEW_PRIVS` は差し替え不可の組み込み段として
@@ -106,6 +109,7 @@ use crate::rootless::{
 use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
 
+mod bind_mounts;
 mod capabilities;
 mod cgroup_join;
 mod container_env;
@@ -136,6 +140,12 @@ mod violation;
 #[cfg(test)]
 mod violation_scan;
 
+/// 結合試験専用の再公開（TASK-29 追補・#1913・#1916。通常の利用者は呼ばない。詳細は定義側）。
+/// `exec-test-support` feature を付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use bind_mounts::mount_binds_with_attach_hook;
+pub use bind_mounts::{BindMountOutcome, BindMountReport, BindSourceType, mount_binds};
 pub use capabilities::{CapabilityReport, SupplementaryGroups};
 /// 結合試験 `tests/exec_child_setup.rs`・supervisor の `tests/exec_setns_join.rs` 専用の再公開
 /// （SUP-6・TASK-163 追補・#1457。通常の利用者は呼ばない。詳細は定義側）。
@@ -728,6 +738,8 @@ pub enum IsolationStage {
     MountReadonlyPaths,
     /// 覆うパスの固定集合の適用（`/proc` 配下の 10 件。SEC-2・TASK-29 追補・#1851）。
     MountMaskedPaths,
+    /// 検証済みの bind mount（`mounts[]` の bind。fd 起点で rootfs へ適用する段。CORE-1・SEC-1・TASK-29 追補・#1913）。
+    MountBinds,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。
@@ -949,6 +961,11 @@ pub struct MountIsolation {
 /// `PID_NS_INIT_INO`）。初期 namespace の inode は uapi で予約された固定値で、アーキテクチャに
 /// 依存しない。
 const PID_NS_INIT_INO: u64 = 0xEFFF_FFFC;
+
+/// 初期 user namespace の inode 番号（同じ `enum init_ns_ino` の `USER_NS_INIT_INO`。[`PID_NS_INIT_INO`] の
+/// 1 つ上）。bind mount の適用段が、user namespace の外（init）で呼ばれていないことの確認に使う
+/// （`exec/bind_mounts.rs`・#1913・SEC-5）。
+const USER_NS_INIT_INO: u64 = 0xEFFF_FFFD;
 
 /// `/proc/thread-self/ns/pid` のリンク先（`pid:[inode]`）の inode 番号。書式に反すれば `None`。
 fn parse_pid_ns_inode(link: &str) -> Option<u64> {
@@ -2471,6 +2488,13 @@ mod tests {
             "mount_proc must be called by PID 1 of the isolated PID namespace"
         );
         assert_eq!(take_dry_run_mounts(), Vec::<String>::new());
+    }
+
+    /// 初期 user namespace の inode の具体値（`include/uapi/linux/nsfs.h`。#1913・SEC-5）。
+    #[test]
+    fn user_ns_init_ino_is_reserved_value() {
+        assert_eq!(USER_NS_INIT_INO, 4_026_531_837);
+        assert_eq!(USER_NS_INIT_INO, PID_NS_INIT_INO + 1);
     }
 
     /// `ns/pid` の inode の解析と、初期 PID namespace の inode の具体値。

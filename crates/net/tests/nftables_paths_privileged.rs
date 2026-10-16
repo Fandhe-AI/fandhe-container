@@ -47,6 +47,13 @@
 //! ため、本テストは公開の `NetlinkRouteSocket::request` と `NlMsgBuilder` で `RTM_SETLINK` を組んで送る。
 //! 接続は `RTM_GETLINK` 応答の `IFLA_MASTER` が bridge の ifindex と一致することで具体値照合する。
 //!
+//! # router の lo
+//!
+//! router は自分の netns の `lo` を up にする。(c) のルール投入前に、ホスト自身が外側アドレス宛てに
+//! 送る UDP を自分の待受が受ける場面は、ローカル宛て配送が loopback デバイスを通るため（新規 netns の
+//! `lo` は down で、そのままだと送信は成功扱いのまま破棄される。#1927）。子は自己宛て配送が無いため
+//! `lo` を触らない。`lo` の up も隔離 netns の中に閉じ host は変えない。
+//!
 //! ip_forward・nft ルール・bridge・veth はすべて隔離 netns の中に閉じ、host の設定は変えない。待ちは
 //! すべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・
 //! `unshare`・カーネルモジュール）を満たさない場合は skip せず失敗する。
@@ -84,9 +91,9 @@ mod linux {
     use fandhe_container_net::error::{NetError, NetErrorCode};
     use fandhe_container_net::netlink::AttrIter;
     use fandhe_container_net::netlink_route::{
-        AddrScope, AddressSpec, IFINFOMSG_LEN, IFLA_IFNAME, IfIndex, IfName, IpPrefix, LinkCreate,
-        LinkRef, LinkSet, NetlinkRouteSocket, NetnsPid, NetnsTarget, NlMsgBuilder, RTM_GETLINK,
-        RTM_NEWLINK, RTM_SETLINK, RouteNextHop, RouteSpec,
+        AddrScope, AddressSpec, IFF_UP, IFINFOMSG_LEN, IFLA_IFNAME, IfIndex, IfName, IpPrefix,
+        LinkCreate, LinkRef, LinkSet, NetlinkRouteSocket, NetnsPid, NetnsTarget, NlMsgBuilder,
+        RTM_GETLINK, RTM_NEWLINK, RTM_SETLINK, RouteNextHop, RouteSpec,
     };
     use fandhe_container_net::nftables_batch::{
         BaseChain, ChainCreate, ChainType, NF_IP_PRI_NAT_DST, NF_IP_PRI_NAT_SRC,
@@ -115,6 +122,8 @@ mod linux {
     const HOST_OUTER: Ipv4Addr = Ipv4Addr::new(10, 212, 2, 1);
     const EXTERNAL_ADDR: Ipv4Addr = Ipv4Addr::new(10, 212, 2, 2);
     const BRIDGE: &str = "fbr0";
+    /// router の netns のループバック。ホスト自身宛ての配送が通る（#1927）。
+    const LO: &str = "lo";
     const PC1: &str = "fpc1";
     const CC1: &str = "fcc1";
     const PC2: &str = "fpc2";
@@ -289,6 +298,25 @@ mod linux {
             b.put_attr(IFLA_MASTER, &master.get().to_ne_bytes())
         })?;
         Ok(())
+    }
+
+    /// `RTM_GETLINK` 応答の `ifi_flags` を返す。
+    fn get_link_flags(sock: &NetlinkRouteSocket, name: &str) -> Result<u32, NetError> {
+        let payload = get_link_payload(sock, name)?;
+        let raw = payload
+            .get(8..12)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .ok_or_else(|| NetError::new(NetErrorCode::Internal, "short ifinfomsg in reply"))?;
+        Ok(u32::from_ne_bytes(raw))
+    }
+
+    /// router の `lo` が up であることを具体値（`IFF_UP`）で照合する。
+    fn assert_lo_up(sock: &NetlinkRouteSocket, why: &str) {
+        let flags = get_link_flags(sock, LO).expect("lo flags");
+        assert!(
+            flags & IFF_UP != 0,
+            "router lo must be up ({why}); flags={flags:#x}"
+        );
     }
 
     /// `RTM_GETLINK` 応答の `IFLA_MASTER`（接続先 bridge の ifindex）を返す。未接続なら `None`。
@@ -738,6 +766,10 @@ mod linux {
         external.expect_prefix("ready");
 
         let sock = NetlinkRouteSocket::open().expect("open netlink route socket");
+        // 新規 netns の lo は down。down のままだと自己宛て（HOST_OUTER 宛て）の送信は noop qdisc で
+        // 黙って破棄され、(c) 投入前の照合が受信期限切れになる（#1927）。
+        configure_router_side(&sock, LO, None);
+        assert_lo_up(&sock, "after link up");
         sock.create_link(&LinkCreate::bridge(ifname(BRIDGE)), timeout())
             .expect("create bridge");
         for (host_side, child_side) in [(PC1, CC1), (PC2, CC2), (PE, EX)] {
@@ -815,6 +847,7 @@ mod linux {
             "path (b) before rules"
         );
         // (c) 投入前: 外側アドレス宛ては DNAT されずホスト自身に届く。
+        assert_lo_up(&sock, "local delivery to HOST_OUTER goes through lo");
         let pc0 = host_sends(&mut host_held, HOST_OUTER, (HOST_OUTER, HOST_PORT));
         track(pc0, &mut host_ports);
         let c_before = router_receives(&host_sock);

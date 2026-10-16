@@ -343,6 +343,9 @@ mod consts {
     pub const ST_NOEXEC: i64 = 0x0008;
     // include/linux/statfs.h の `ST_NODEV`（#1676・rootfs の nodev の事後検証）。
     pub const ST_NODEV: i64 = 0x0004;
+    // include/linux/statfs.h の `ST_RDONLY`・`ST_NOSUID`（bind mount の属性の事後検証。#1913）。
+    pub const ST_RDONLY: i64 = 0x0001;
+    pub const ST_NOSUID: i64 = 0x0002;
     pub const ST_VALID: i64 = 0x0020;
     // arch/x86/entry/syscalls/syscall_64.tbl の `execveat`。
     pub const SYS_EXECVEAT: ArchSysNo = ArchSysNo::new(322);
@@ -641,6 +644,9 @@ mod consts {
     pub const ST_NOEXEC: i64 = 0x0008;
     // include/linux/statfs.h の `ST_NODEV`（#1676・rootfs の nodev の事後検証）。
     pub const ST_NODEV: i64 = 0x0004;
+    // include/linux/statfs.h の `ST_RDONLY`・`ST_NOSUID`（bind mount の属性の事後検証。#1913）。
+    pub const ST_RDONLY: i64 = 0x0001;
+    pub const ST_NOSUID: i64 = 0x0002;
     pub const ST_VALID: i64 = 0x0020;
     // include/uapi/asm-generic/unistd.h の `__NR_execveat`（arm64 は asm-generic の表。
     // x86_64 の 322 を流用しない）。
@@ -908,6 +914,8 @@ mod consts {
     pub const CGROUP2_SUPER_MAGIC: i64 = 0;
     pub const ST_NOEXEC: i64 = 0;
     pub const ST_NODEV: i64 = 0;
+    pub const ST_RDONLY: i64 = 0;
+    pub const ST_NOSUID: i64 = 0;
     pub const ST_VALID: i64 = 0;
     pub const SYS_EXECVEAT: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const AT_EMPTY_PATH: i64 = 0;
@@ -1147,6 +1155,15 @@ unsafe extern "C" {
     fn mkdirat(dirfd: i32, path: *const core::ffi::c_char, mode: u32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int unlinkat(int dirfd, const char *path, int flags)`。
     fn unlinkat(dirfd: i32, path: *const core::ffi::c_char, flags: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int renameat2(int olddirfd, const char *oldpath, int newdirfd,
+    // const char *newpath, unsigned int flags)`（glibc 2.28 以降・musl）。
+    fn renameat2(
+        olddirfd: i32,
+        oldpath: *const core::ffi::c_char,
+        newdirfd: i32,
+        newpath: *const core::ffi::c_char,
+        flags: u32,
+    ) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int fstatfs(int fd, struct statfs *buf)`。構造体は下の
     // [`StatFs`]（arch 別に個別定義）で、カーネルが書く 120 バイトを確保する。
     fn fstatfs(fd: i32, buf: *mut StatFs) -> i32;
@@ -2123,7 +2140,6 @@ fn open_tree_raw(node: RawFd, flags: u32) -> Result<OwnedFd, SysError> {
 /// `Recursive` は利用者が `rbind` を指定したときだけ選ぶ（#1910 の決定。呼び出し側 #1913 が
 /// `BindMountSpec::recursive()` から写す）。`MountOnly` は mount top 1 枚だけで、配下のマウントを持ち込まない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "#1913 で適用の段に結線するまで呼び出し元なし")]
 pub(crate) enum MountTreeScope {
     /// mount top 1 枚だけ（`bind`）。
     MountOnly,
@@ -2133,7 +2149,6 @@ pub(crate) enum MountTreeScope {
 
 /// bind mount 元として受け付ける種別（[`verify_bind_source_fd`] が `fstat` で確かめた値）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "#1913 で適用の段に結線するまで呼び出し元なし")]
 pub(crate) enum BindSourceKind {
     /// ディレクトリ。
     Directory,
@@ -2143,7 +2158,6 @@ pub(crate) enum BindSourceKind {
 
 /// [`verify_bind_source_fd`] の拒否理由。照合した実値を持ち、呼び出し側（#1913）が構造化エラーへ写す。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "#1913 で適用の段に結線するまで呼び出し元なし")]
 pub(crate) enum BindSourceError {
     /// ディレクトリでも通常ファイルでもない（symlink・デバイス・FIFO・ソケット等）。`mode` は `st_mode` の実値。
     NotDirOrRegular { mode: u32 },
@@ -2157,7 +2171,6 @@ pub(crate) enum BindSourceError {
 /// [`verify_bind_source_fd`] だけが作る（フィールドは `sys` の外から触れない）。検証に使った fd そのものを保持し、
 /// 検証後にパスを開き直さないため、検証と複製の対象は同じ inode になる（TOCTOU なし）。
 #[derive(Debug)]
-#[allow(dead_code, reason = "#1913 で適用の段に結線するまで呼び出し元なし")]
 pub(crate) struct VerifiedBindSourceFd {
     fd: OwnedFd,
     kind: BindSourceKind,
@@ -2165,7 +2178,6 @@ pub(crate) struct VerifiedBindSourceFd {
     ino: u64,
 }
 
-#[allow(dead_code, reason = "#1913 で適用の段に結線するまで呼び出し元なし")]
 impl VerifiedBindSourceFd {
     /// 検証で確かめた種別。
     pub(crate) fn kind(&self) -> BindSourceKind {
@@ -2190,7 +2202,6 @@ impl std::os::fd::AsFd for VerifiedBindSourceFd {
 ///
 /// パスの `stat` ではなく fd の `fstat`（std の `File::metadata`。fd は複製して見るだけで、元の fd を保持する）で
 /// 見るため、検証後の差し替えは効かない（新規 `unsafe` なし。[`verify_device_node_fd`] と同形）。
-#[allow(dead_code, reason = "#1913 で適用の段に結線するまで呼び出し元なし")]
 pub(crate) fn verify_bind_source_fd(fd: OwnedFd) -> Result<VerifiedBindSourceFd, BindSourceError> {
     use std::os::unix::fs::MetadataExt as _;
     if !consts::SUPPORTED {
@@ -2247,7 +2258,6 @@ const fn open_tree_bind_flags(scope: MountTreeScope) -> u32 {
 /// （既定の拒否集合は `DeniedSyscall::OpenTree`・`MoveMount`・`MountSetattr` を含む）。
 /// 一次情報（man page・fs/namespace.c）との本 issue での再照合は未実施（未確認）で、上記は #1659 で確認した
 /// v5.2・v6.12 の `__do_loopback` の知見に基づく。
-#[allow(dead_code, reason = "#1913 で適用の段に結線するまで呼び出し元なし")]
 pub(crate) fn open_tree_clone_bind(
     src: &VerifiedBindSourceFd,
     scope: MountTreeScope,
@@ -2296,8 +2306,8 @@ const fn read_only_mount_attr() -> MountAttr {
 /// 利用者指定の bind mount に足す属性（#1912）。`nosuid`・`nodev` は常に足し、`BindMountAttrs` の指定で `rdonly`・`noexec` を足す。
 /// `attr_clr` = 0 のため、元のマウントでロックされた属性は外さない（`rw` 指定も ro を外さない）。
 /// `propagation` は 0（変更しない）。切り離した（`OPEN_TREE_CLONE` の匿名 namespace の）マウントに対する propagation 変更が
-/// 許されるかは一次情報で未確認のため、同じ呼び出しには含めない。private 化は呼び出し側（#1913）が別途行う。
-#[allow(dead_code, reason = "#1913 で適用の段に結線するまで呼び出し元なし")]
+/// 許されるかは一次情報で未確認のため、同じ呼び出しには含めない。private であることは明示設定せず、呼び出し側（#1913）が
+/// 付け替え先の非 shared の確認と、付け替え後の mountinfo の照合で確かめる。
 const fn bind_mount_attr(attrs: BindMountAttrs) -> MountAttr {
     MountAttr {
         attr_set: attrs.attr_bits() as u64,
@@ -2310,7 +2320,6 @@ const fn bind_mount_attr(attrs: BindMountAttrs) -> MountAttr {
 /// bind mount に立てる属性の指定。`nosuid`・`nodev` は常に付与され、外す値は表現できない
 /// （#1911 の「nosuid・nodev は常に付与」と一致。SEC-1・REPAIR-2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code, reason = "#1913 で適用の段に結線するまで呼び出し元なし")]
 pub(crate) struct BindMountAttrs {
     /// `MOUNT_ATTR_RDONLY` を足す。`false` は「足さない」だけで、ロックされた ro は外さない。
     pub(crate) read_only: bool,
@@ -2320,7 +2329,6 @@ pub(crate) struct BindMountAttrs {
 
 impl BindMountAttrs {
     /// `attr_set` のビット（`MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV` は常に含む）。
-    #[allow(dead_code, reason = "#1913 で適用の段に結線するまで呼び出し元なし")]
     const fn attr_bits(self) -> u32 {
         let mut bits = consts::MOUNT_ATTR_NOSUID | consts::MOUNT_ATTR_NODEV;
         if self.read_only {
@@ -2408,7 +2416,6 @@ pub(crate) fn bind_mount_call_params(
 /// seccomp フィルタの適用前に呼ぶ（既定の拒否集合は `DeniedSyscall::MountSetattr` を含む）。呼び出し順は
 /// [`open_tree_clone_bind`] の doc を参照。再帰時に途中で失敗した場合の巻き戻しは未確認のため、呼び出し側は
 /// 失敗時に fd を drop して複製ごと破棄すること。
-#[allow(dead_code, reason = "#1913 で適用の段に結線するまで呼び出し元なし")]
 pub(crate) fn set_bind_mount_attrs(
     mount: BorrowedFd<'_>,
     attrs: BindMountAttrs,
@@ -2418,7 +2425,6 @@ pub(crate) fn set_bind_mount_attrs(
 }
 
 /// [`set_bind_mount_attrs`] の本体。無効 fd の拒否を単体テストで確かめるために `RawFd` を受ける。
-#[allow(dead_code, reason = "#1913 で適用の段に結線するまで呼び出し元なし")]
 fn set_bind_mount_attrs_raw(
     fd: RawFd,
     attrs: BindMountAttrs,
@@ -3413,6 +3419,52 @@ pub(crate) fn remove_dir_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), S
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `parent` 配下の `name` を `unlinkat(2)`（`flags` = 0）で削除する（ディレクトリは `EISDIR`/`EPERM` で拒否され、
+/// 最終要素の symlink は辿らずリンク自体を消す）。bind mount の適用段（`crate::exec::mount_binds`）が、失敗時の後始末で
+/// 自分が作った空の通常ファイル（マウント先の置き場）だけを消すために使う（#1913・SEC-1）。`name` は呼び出し側が
+/// 1 要素に検証済みの前提。
+pub(crate) fn remove_file_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `name` は NUL 終端の借用で呼び出しの間生存する。`parent` は生存中の `BorrowedFd`。`flags` が 0 のため
+    // `unlinkat` は `AT_REMOVEDIR` を伴わず、ディレクトリは削除されない。副作用は `parent` 配下の非ディレクトリ
+    // 1 件の削除のみで、ポインタは保持されない。
+    let rc = unsafe { unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `old_dir` 配下の `old` を `new_dir` 配下の `new` へ `renameat2(2)` の `RENAME_NOREPLACE` で改名する（最終要素の
+/// symlink は辿らない。改名先が既にあれば置き換えず `EEXIST`）。bind mount の適用段（`crate::exec::mount_binds`）が、
+/// 失敗時の後始末で「消す対象を自分専用の隔離ディレクトリへ移してから実体を照合して消す」ことと、「照合に通らなかった
+/// 実体を元の名前へ戻すとき、新しく作られた同名の実体を上書きしない」ことに使う（#1913・SEC-1）。
+/// `old`・`new` は呼び出し側が 1 要素に検証済みの前提。
+pub(crate) fn rename_noreplace_at(
+    old_dir: BorrowedFd<'_>,
+    old: &CStr,
+    new_dir: BorrowedFd<'_>,
+    new: &CStr,
+) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // include/uapi/linux/fs.h の `RENAME_NOREPLACE`（全アーキテクチャ共通）。
+    const RENAME_NOREPLACE: u32 = 1;
+    // SAFETY: `old`・`new` は NUL 終端の借用で呼び出しの間生存する。`old_dir`・`new_dir` は生存中の
+    // `BorrowedFd`。flags は `RENAME_NOREPLACE` のみで、改名先を置き換えない。副作用は 1 要素の改名のみで、
+    // ポインタは保持されない。
+    let rc = unsafe {
+        renameat2(
+            old_dir.as_raw_fd(),
+            old.as_ptr(),
+            new_dir.as_raw_fd(),
+            new.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// [`open_read_at`] / [`open_write_at`] 共通の `openat(2)` 呼び出し。`O_NOFOLLOW|O_CLOEXEC` を常に付け、
 /// `O_CREAT` を含まない（既存ファイルだけを開く。cgroup のインターフェースファイルは作らせない）。
 fn open_file_at(parent: BorrowedFd<'_>, name: &CStr, access: i32) -> Result<OwnedFd, SysError> {
@@ -3642,6 +3694,18 @@ impl MountFlags {
     /// マウントが `noexec`（`ST_NOEXEC`。`MNT_NOEXEC` 由来）か。
     pub(crate) fn is_noexec(self) -> bool {
         has_flag(self.0, consts::ST_NOEXEC)
+    }
+
+    /// マウントまたはその superblock が読み取り専用（`ST_RDONLY`）か。`f_flags` は vfsmount の `MNT_READONLY` と
+    /// superblock の `SB_RDONLY` の両方を反映するため、読み取り専用の FS を rw で bind した場合も真になる
+    /// （bind mount の属性の事後検証。#1913・SEC-1）。
+    pub(crate) fn is_read_only(self) -> bool {
+        has_flag(self.0, consts::ST_RDONLY)
+    }
+
+    /// マウントが `nosuid`（`ST_NOSUID`。`MNT_NOSUID` 由来）か（bind mount の属性の事後検証。#1913・SEC-1）。
+    pub(crate) fn is_nosuid(self) -> bool {
+        has_flag(self.0, consts::ST_NOSUID)
     }
 }
 
@@ -5928,6 +5992,59 @@ mod tests {
             assert!(MountFlags::from_bits(0x20 | 0x4).is_nodev());
             assert!(!MountFlags::from_bits(0).is_nodev());
         }
+    }
+
+    /// SEC-1（#1913）: `is_read_only`・`is_nosuid` は `ST_RDONLY`（0x1）・`ST_NOSUID`（0x2）だけを見る。
+    #[test]
+    fn sec1_1913_mount_flags_read_only_and_nosuid_boundaries() {
+        #[cfg(all(
+            target_pointer_width = "64",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            assert_eq!((consts::ST_RDONLY, consts::ST_NOSUID), (0x1, 0x2));
+            assert!(MountFlags::from_bits(0x1).is_read_only());
+            assert!(!MountFlags::from_bits(0x1).is_nosuid());
+            assert!(MountFlags::from_bits(0x2).is_nosuid());
+            assert!(!MountFlags::from_bits(0x2).is_read_only());
+            assert!(!MountFlags::from_bits(0x20 | 0x4 | 0x8).is_read_only());
+            assert!(!MountFlags::from_bits(0x20 | 0x4 | 0x8).is_nosuid());
+            assert!(MountFlags::from_bits(0x20 | 0x3).is_read_only());
+            assert!(MountFlags::from_bits(0x20 | 0x3).is_nosuid());
+            assert!(!MountFlags::from_bits(0).is_read_only());
+        }
+    }
+
+    /// SEC-1（#1913）: `remove_file_at` は通常ファイルと symlink（リンク自体）を消し、ディレクトリは消さず、
+    /// 不在は `ENOENT`。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec1_1913_remove_file_at_removes_files_and_links_not_directories() {
+        let guard = crate::test_support::TestTempDir::new("sys-rm-file").expect("temp dir");
+        let base = guard.path().to_path_buf();
+        let dir = std::fs::File::open(&base).expect("open dir");
+        std::fs::write(base.join("f"), b"x").expect("write");
+        std::fs::create_dir(base.join("d")).expect("mkdir");
+        std::fs::write(base.join("target"), b"keep").expect("write");
+        std::os::unix::fs::symlink(base.join("target"), base.join("l")).expect("symlink");
+        let name = |n: &str| CString::new(n).expect("name");
+        assert_eq!(remove_file_at(dir.as_fd(), &name("f")), Ok(()));
+        assert!(!base.join("f").exists());
+        assert_eq!(
+            remove_file_at(dir.as_fd(), &name("f")),
+            Err(SysError::Os(ENOENT))
+        );
+        assert_eq!(remove_file_at(dir.as_fd(), &name("l")), Ok(()));
+        assert!(std::fs::symlink_metadata(base.join("l")).is_err());
+        assert_eq!(std::fs::read(base.join("target")).expect("target"), b"keep");
+        match remove_file_at(dir.as_fd(), &name("d")) {
+            Err(SysError::Os(e)) => assert!(e == 21 || e == EPERM, "errno {e}"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(base.join("d").is_dir());
     }
 
     /// SEC-1（#1676）: 無効 fd は失敗する。特権の有無でカーネルの検査順が変わるため、非特権では `may_mount` の

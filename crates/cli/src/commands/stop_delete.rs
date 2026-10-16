@@ -33,7 +33,7 @@
 //!   `plugin_backend` を呼び、現状は必ず fail-closed で失敗する（起動と RPC は TASK-114・TASK-125）。
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
@@ -267,21 +267,101 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
     }
 }
 
-/// core の `delete` が成功した後に、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）を best effort で消す
-/// （#2067・REPAIR-4）。
+/// ログ削除を待つ上限。ローカル FS の小さなファイル数個（世代数 × 3 MiB 以下）の unlink には十分長く、
+/// I/O 停止（NFS ハング等）でも CLI が秒単位で戻れる値にする（REPAIR-5）。
+const SUPERVISOR_LOG_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// ログ削除を期限つきで試した結果（REPAIR-5）。
+#[derive(Debug, PartialEq, Eq)]
+enum LogRemoval {
+    /// 期限内に終わった（削除自体の成否は問わない。best effort）。
+    Finished,
+    /// 期限内に終わらなかった。作業スレッドは I/O で止まったまま残る。
+    TimedOut,
+}
+
+/// `job` を作業スレッドで実行し、`timeout` までだけ待つ。呼び出し元スレッドは削除 I/O で止まらない。
 ///
-/// 失敗しても delete の結果は変えず、何も出力しない（成功時の stderr は空。ERR-2）。supervisor が生存中でロックを
-/// 取れない等で消せなかった分は、1 ID あたり世代数 × 上限（3 MiB）に収まり、同じ ID の次の start で世代として回される。
+/// 期限切れのとき作業スレッドは join せず残す（CLI は直後にプロセスごと終了する。止まった I/O を中断する
+/// 手段は無く、待てば CLI が無期限に戻らなくなるため。`main.rs` の `report_deferred` と同じ流儀）。
+/// スレッドを起動できなかった場合は削除を諦めて `Finished` 扱いにする（同期実行へ退避しない。ブロックし得るため）。
+fn run_log_removal_bounded(job: impl FnOnce() + Send + 'static, timeout: Duration) -> LogRemoval {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("supervisor-log-remove".to_string())
+        .spawn(move || {
+            job();
+            let _ = tx.send(());
+        });
+    if spawned.is_err() {
+        return LogRemoval::Finished;
+    }
+    match rx.recv_timeout(timeout) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => LogRemoval::TimedOut,
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => LogRemoval::Finished,
+    }
+}
+
+/// 期限切れの警告（stderr に 1 行の JSON。`code` / `message` は ERR-1 の形）。
+fn log_removal_timeout_warning() -> &'static str {
+    "{\"level\":\"warn\",\"code\":\"TIMEOUT\",\"message\":\"supervisor log removal did not finish within the deadline; leftover logs may remain\"}"
+}
+
+/// core の `delete` が成功した後に、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）を best effort で消す
+/// （#2067・REPAIR-4）。削除は作業スレッドで [`SUPERVISOR_LOG_REMOVE_TIMEOUT`] まで待つ（REPAIR-5）。
+///
+/// 失敗しても delete の結果は変えず、成功時の stderr は空（ERR-2）。期限切れのときも delete は成功のまま
+/// （状態の削除は完了済みで、ログは残っても次の start で世代として回るため）、警告を 1 行だけ stderr に出す。
+/// supervisor が生存中でロックを取れない等で消せなかった分は、1 ID あたり世代数 × 上限（3 MiB）に収まる。
 /// core の delete より前には消さない（delete が失敗したとき稼働中のログを消さないため）。
 fn remove_supervisor_log(store: &dyn StateStore, req: &DeleteRequest) {
-    if let Some(root) = store.host_state_root() {
-        let _ = fandhe_container_supervisor::supervisor_log::remove(root, req.id());
+    let Some(root) = store.host_state_root() else {
+        return;
+    };
+    let root = root.to_path_buf();
+    let id = req.id().clone();
+    let outcome = run_log_removal_bounded(
+        move || {
+            let _ = fandhe_container_supervisor::supervisor_log::remove(&root, &id);
+        },
+        SUPERVISOR_LOG_REMOVE_TIMEOUT,
+    );
+    if outcome == LogRemoval::TimedOut {
+        eprintln!("{}", log_removal_timeout_warning());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REPAIR-5・REPAIR-4: ログ削除が止まっても期限で戻り、`TimedOut` になる。期限内に終われば `Finished`。
+    #[test]
+    fn repair5_log_removal_is_bounded_by_deadline() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let started = Instant::now();
+        let out = run_log_removal_bounded(
+            move || {
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            },
+            Duration::from_millis(100),
+        );
+        assert_eq!(out, LogRemoval::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(release_tx);
+
+        let out = run_log_removal_bounded(|| {}, Duration::from_secs(10));
+        assert_eq!(out, LogRemoval::Finished);
+    }
+
+    /// ERR-1: 期限切れの警告は `code` / `message` を持つ 1 行の JSON。
+    #[test]
+    fn err1_log_removal_timeout_warning_is_single_line_json() {
+        let w = log_removal_timeout_warning();
+        assert!(!w.contains('\n'));
+        assert!(w.contains("\"code\":\"TIMEOUT\""));
+        assert!(w.contains("\"message\":\"supervisor log removal did not finish"));
+    }
 
     fn stop_args(id: &str) -> StopArgs {
         StopArgs { id: id.into() }

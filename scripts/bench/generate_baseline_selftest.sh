@@ -169,6 +169,8 @@ run_case "host-kind-only" 2 --metrics "${fx}/metrics.json" --host-kind vm "${fx}
 run_case "host-arch-uppercase" 2 --metrics "${fx}/metrics.json" --arch X86 --host-kind vm "${fx}/results-all.json"
 run_case "host-kind-empty" 2 --metrics "${fx}/metrics.json" --arch x86_64 --host-kind "" "${fx}/results-all.json"
 run_case "host-kind-33-chars" 2 --metrics "${fx}/metrics.json" --arch x86_64 --host-kind "$(printf 'a%.0s' $(seq 1 33))" "${fx}/results-all.json"
+run_case "host-arch-embedded-newline" 2 --metrics "${fx}/metrics.json" --arch $'x86_64\nINVALID' --host-kind vm "${fx}/results-all.json"
+run_case "host-kind-embedded-newline" 2 --metrics "${fx}/metrics.json" --arch x86_64 --host-kind $'vm\nINVALID' "${fx}/results-all.json"
 
 if [ "$failures" -gt 0 ]; then
   echo "${failures} case(s) failed" >&2

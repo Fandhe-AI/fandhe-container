@@ -116,7 +116,8 @@ if [ "$have_arch" -ne "$have_kind" ]; then
 fi
 if [ "$have_arch" -eq 1 ]; then
   for v in "$host_arch" "$host_kind"; do
-    if ! printf '%s' "$v" | grep -Eq '^[a-z0-9_-]{1,32}$'; then
+    # grep は行単位のため改行入りの値を通してしまう。文字列全体を [[ =~ ]] で照合する
+    if ! [[ "$v" =~ ^[a-z0-9_-]{1,32}$ ]]; then
       err "invalid-input" "--arch / --host-kind must match ^[a-z0-9_-]{1,32}$"
       exit 2
     fi

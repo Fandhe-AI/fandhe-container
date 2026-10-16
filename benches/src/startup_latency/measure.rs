@@ -85,6 +85,8 @@ struct Ctx<'a> {
     deadline: Instant,
     /// 結果 1 行を待つ上限（実機では `cli_receive_deadline`。試験では短くする）。
     report_timeout: Duration,
+    /// 中断時に残存リソースがあるとき `run_trials` が立てる（`run` が作業ディレクトリを残す判断に使う）。
+    keep_work: &'a std::cell::Cell<bool>,
 }
 
 impl Ctx<'_> {
@@ -611,6 +613,12 @@ fn run_trial<H: Host>(
     let scope_clean = waiter.stop_scope();
     let mut settled_ok = false;
     if reaped && scope_clean {
+        // 中断で kill した試行は状態が Stopped にならないため、期待を緩めて残存だけを確かめる。
+        let expect_state = if interrupted() {
+            Expect::Any
+        } else {
+            expect_state
+        };
         let settled = host.settle(ctx, &created, expect_state);
         settled_ok = settled.ok;
         // 起動報告のあとに exec や動的ローダが失敗した標本を有効にしない（終了コード 0 を要求。計測の終点は変えない）。
@@ -677,6 +685,7 @@ fn run_trials<H: Host>(host: &H, ctx: &Ctx<'_>) -> Result<RunResult, StartupLate
         // 中断を受けた試行も後始末（kill・スコープ回収・settle）まで終えてから、非ゼロで終了する。
         if interrupted() {
             if trial.leftover {
+                ctx.keep_work.set(true);
                 eprintln!("startup_latency: interrupted; leftover resource {id}");
             }
             return Err(interrupted_error());
@@ -767,6 +776,7 @@ pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
         .map_err(|e| io_err("create work dir", &e))?;
 
     let nonce = format!("{pid:x}{nanos:x}");
+    let keep_work = std::cell::Cell::new(false);
     let result = build_bundle(&work, &nonce).and_then(|bundle| {
         let ctx = Ctx {
             plan: &plan,
@@ -775,10 +785,11 @@ pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
             nonce: &nonce,
             deadline: Instant::now() + Duration::from_secs(plan.timeout_secs),
             report_timeout: cli_receive_deadline(&StartTimeouts::default()),
+            keep_work: &keep_work,
         };
         run_trials(&RealHost { euid }, &ctx)
     });
-    let keep = matches!(&result, Ok(r) if !r.leftover_ids.is_empty());
+    let keep = keep_work.get() || matches!(&result, Ok(r) if !r.leftover_ids.is_empty());
     if keep {
         // 調査用に残す。相対名だけを出す（絶対パスを出さない）。
         eprintln!("startup_latency: leftover resources; work dir kept as {dir_name}");
@@ -954,8 +965,19 @@ mod tests {
         warmup: u32,
         deadline: Duration,
     ) -> (FakeHost, Result<RunResult, StartupLatencyError>) {
+        let (h, r, _) = run_with_keep(scripts, trials, warmup, deadline);
+        (h, r)
+    }
+
+    fn run_with_keep(
+        scripts: Vec<Script>,
+        trials: u32,
+        warmup: u32,
+        deadline: Duration,
+    ) -> (FakeHost, Result<RunResult, StartupLatencyError>, bool) {
         let host = FakeHost::new(scripts);
         let p = plan(trials, warmup);
+        let keep_work = std::cell::Cell::new(false);
         let ctx = Ctx {
             plan: &p,
             work: Path::new("/nonexistent"),
@@ -963,9 +985,11 @@ mod tests {
             nonce: "n",
             deadline: Instant::now() + deadline,
             report_timeout: Duration::from_millis(50),
+            keep_work: &keep_work,
         };
         let r = run_trials(&host, &ctx);
-        (host, r)
+        let keep = keep_work.get();
+        (host, r, keep)
     }
 
     /// 正常終了: 標本は計測回数ぶん・失敗 0・metric が出る（REPAIR-12・CORE-10）。
@@ -1073,6 +1097,19 @@ mod tests {
         assert_eq!(*host.created.lock().expect("lock"), vec![0]);
         assert_eq!(host.scope_stopped.load(Ordering::SeqCst), 1);
         assert_eq!(*host.settled.lock().expect("lock"), vec![Expect::Any]);
+    }
+
+    /// 中断時に回収を確認できなかった（スコープに残存）なら、作業ディレクトリを残す印を立てる（REPAIR-5）。
+    #[test]
+    fn interrupt_with_leftover_keeps_the_work_dir() {
+        assert!(sys::block_termination_signals());
+        let mut stuck = Script::ok();
+        stuck.report = None;
+        stuck.interrupt = true;
+        stuck.stop_ok = false;
+        let (_, r, keep) = run_with_keep(vec![stuck], 1, 0, Duration::from_secs(30));
+        assert_eq!(r.expect_err("must fail").code, "interrupted");
+        assert!(keep);
     }
 
     /// 全体期限: 最終試行が期限を超えて終わったら成功結果を返さない（REPAIR-5）。

@@ -422,6 +422,11 @@ fn parse_options(index: usize, m: &OciMount) -> Result<ParsedOptions, BindMountE
     let err = |kind| BindMountError::at(index, kind);
     let (mut has_bind, mut has_rbind) = (false, false);
     let (mut read_only, mut noexec) = (false, false);
+    // 種類判定を先に行う（処理順は種類 → オプション）。bind 以外は他オプションの内容に依らず NotBind。
+    let opts_have = |name: &str| m.options().iter().any(|o| o.as_str() == name);
+    if !(m.fs_type() == Some("bind") || opts_have("bind") || opts_have("rbind")) {
+        return Err(err(BindMountErrorKind::NotBind));
+    }
     for opt in m.options() {
         match opt.as_str() {
             "bind" => has_bind = true,
@@ -438,9 +443,6 @@ fn parse_options(index: usize, m: &OciMount) -> Result<ParsedOptions, BindMountE
             }
             _ => return Err(err(BindMountErrorKind::UnsupportedOption)),
         }
-    }
-    if !(m.fs_type() == Some("bind") || has_bind || has_rbind) {
-        return Err(err(BindMountErrorKind::NotBind));
     }
     if has_bind && has_rbind {
         return Err(err(BindMountErrorKind::ConflictingBindKind));
@@ -622,6 +624,23 @@ mod tests {
             (k, c),
             (BindMountErrorKind::NotBind, ErrorCode::Unimplemented)
         );
+        // 許可集合外のオプションがあっても種類判定が先（UNIMPLEMENTED）。
+        for opts in [
+            &["size=64m"][..],
+            &["mode=755", "strictatime"],
+            &["newinstance"],
+        ] {
+            let (k, i, c) = kind_of(json!([one(Some("tmpfs"), "/x", Some("/data/x"), opts)]));
+            assert_eq!(
+                (k, i, c),
+                (
+                    BindMountErrorKind::NotBind,
+                    Some(0),
+                    ErrorCode::Unimplemented
+                ),
+                "opts={opts:?}"
+            );
+        }
     }
 
     /// SEC-1: 制限を外すオプションは拒否する。

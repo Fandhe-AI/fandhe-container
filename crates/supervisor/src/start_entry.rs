@@ -75,7 +75,7 @@ use fandhe_container_core::traits::{
     StateRecord, StateRevision, StateStore, SupervisionState, TraitError, UpdateStateRequest,
 };
 
-use crate::deadline_store::DeadlineStore;
+use crate::deadline_store::{DeadlineStore, LateWrites};
 use crate::log_pipeline::CaptureHub;
 use crate::logs::LogSink;
 use crate::restart::{
@@ -494,7 +494,9 @@ fn launch_after_prepare(
                 ErrorCode::Internal,
                 "the start worker terminated abnormally",
             )),
-            cleanup: Cleanup::ReleaseCgroup,
+            // 予約を持つ claim を落とすと pid なしの Running が残り、cgroup だけ消えて回復が cgroup を失う。
+            // 報告の後に予約を戻してから cgroup を消す（戻せなければ cgroup を残す。CORE-2）。
+            cleanup: discard_prepared(prepared),
         };
     }
     if !has_launch_budget(deadline, timeouts) {
@@ -654,7 +656,14 @@ enum Cleanup {
     ReleaseCgroup,
     /// `start` が失敗（Timeout を含む。予約が残れば Created へ戻し、予約の解放と core のワーカー完了を確かめ、
     /// 未回収のハンドルを terminate してから cgroup を消す）。
-    AfterFailure(Arc<dyn ProcessLauncher>, Vec<Box<dyn LaunchedProcess>>),
+    ///
+    /// 第 3 要素は期限で打ち切った状態 I/O の完了待ちと、遅れて成功した記録の受け渡し口。遅れた Running・pid ありの
+    /// 記録は、子の回収を確かめてから照合して Created へ戻す（CORE-2・REPAIR-5）。
+    AfterFailure(
+        Arc<dyn ProcessLauncher>,
+        Vec<Box<dyn LaunchedProcess>>,
+        Arc<LateWrites>,
+    ),
     /// launch しなかった準備済みの起動権の予約を、報告の後に Created へ戻す（`StateStore` の更新は報告を
     /// 止め得るため報告の前に行わない。REPAIR-5）。戻せたら cgroup を消し、戻せなければ消さない。
     DiscardClaim(Box<ClaimedStart>),
@@ -901,8 +910,8 @@ fn cleanup_after_report(
                 return false;
             }
         },
-        Cleanup::AfterFailure(launcher, pending) => {
-            settle_failed_start(store, &launcher, id, timeouts, pending)
+        Cleanup::AfterFailure(launcher, pending, late) => {
+            settle_after_late_writes(store, &launcher, id, timeouts, pending, &late)
         }
     };
     if confirmed {
@@ -1038,8 +1047,16 @@ fn launch_prepared(
     } = prepared;
     // launch の後の状態 I/O（Running の記録・失敗時の予約の解放）は期限（報告の書き込み分を除く）で打ち切る。
     // 打ち切られて残る予約は報告の後の後始末が回復する（REPAIR-5・CORE-2）。
-    let until = deadline.map(|d| d.checked_sub(REPORT_RESERVE).unwrap_or(d));
+    // 保存が期限で打ち切られると core は子の terminate を始める。その待ち（terminate と応答猶予）も報告の前に
+    // 収まるよう、保存の期限をその分だけ前倒しする（REPAIR-5）。
+    let terminate_reserve = timeouts.terminate().saturating_add(LAUNCHER_REPLY_GRACE);
+    let until = deadline.map(|d| {
+        d.checked_sub(REPORT_RESERVE)
+            .and_then(|t| t.checked_sub(terminate_reserve))
+            .unwrap_or(d)
+    });
     let bounded = DeadlineStore::new(Arc::clone(store_arc), until);
+    let late = bounded.late_writes();
     // 8（予約は作業スレッドで済ませてある。ここは launcher の呼び出しと Running の記録だけ）
     match launch_claimed(&bounded, recorder, &launcher, *claimed, timeouts) {
         Ok(started) => {
@@ -1069,7 +1086,7 @@ fn launch_prepared(
         // 報告の後に状態と core の予約の解放を確かめてから cgroup を消す（CORE-1・CORE-2・CORE-3）。
         Err(e) => Attempt::Failed {
             error: e,
-            cleanup: Cleanup::AfterFailure(launcher, take_unreaped_processes()),
+            cleanup: Cleanup::AfterFailure(launcher, take_unreaped_processes(), late),
         },
     }
 }
@@ -1111,6 +1128,75 @@ fn recover_after_timeout(
         }
     }
     recovered && all_reaped
+}
+
+/// 打ち切った状態 I/O の完了を待ち、遅れて成功した Running・pid ありの記録を修復してから
+/// [`settle_failed_start`] で確かめる（CORE-2・REPAIR-5）。確かめられたら `true`。
+///
+/// 遅れた `update` が後から成功すると、core の予約の解放（revision 不一致）が外れ、回収済みの pid が Running のまま
+/// 残る（`recover_interrupted_start` は pid ありを回復しない）。そこで完了を待ち、子の回収と不在確認を済ませてから、
+/// 記録が遅れた書き込みのままのときだけ Created へ戻す。待ちが上限を超えたら、後から書かれ得るため確かめられない
+/// 扱いにする（cgroup を消さない）。
+fn settle_after_late_writes(
+    store: &dyn StateStore,
+    launcher: &Arc<dyn ProcessLauncher>,
+    id: &ContainerId,
+    timeouts: &StartTimeouts,
+    pending: Vec<Box<dyn LaunchedProcess>>,
+    late: &LateWrites,
+) -> bool {
+    let settled = late.wait_settled(timeouts.terminate().saturating_add(LAUNCHER_REPLY_GRACE));
+    if !settled {
+        log_event("late_store_write_unsettled", Some(ErrorCode::Timeout));
+    }
+    let commits = late.take_commits();
+    if commits.is_empty() {
+        return settle_failed_start(store, launcher, id, timeouts, pending) && settled;
+    }
+    // 遅れた記録がある。先に子を回収し、不在を確かめてから記録を戻す。
+    let mut reaped = true;
+    for p in pending.into_iter().chain(take_unreaped_processes()) {
+        if terminate_retrying(p, timeouts.terminate()).is_none() {
+            reaped = false;
+        }
+    }
+    let mut repaired = reaped && launcher.confirm_no_process(id, timeouts.confirm()).is_ok();
+    if repaired {
+        for commit in &commits {
+            if let Err(code) = revert_late_running(store, id, commit) {
+                log_event("late_running_revert_failed", Some(code));
+                repaired = false;
+            }
+        }
+    }
+    settle_failed_start(store, launcher, id, timeouts, Vec::new()) && settled && repaired
+}
+
+/// 遅れて成功した Running の記録が（revision・pid とも）そのまま残っていれば Created へ戻す。
+/// 別の更新や再作成で変わっていれば書かない（別インスタンスを上書きしない。SEC-1）。
+fn revert_late_running(
+    store: &dyn StateStore,
+    id: &ContainerId,
+    commit: &StateRecord,
+) -> Result<(), ErrorCode> {
+    let record = store
+        .get(&GetStateRequest::new(id.clone()))
+        .map_err(|e| e.code())?;
+    let status = record.status();
+    let same = record.revision() == commit.revision()
+        && status.state() == ContainerState::Running
+        && status.pid().is_some()
+        && status.pid() == commit.status().pid();
+    if !same {
+        return Ok(());
+    }
+    store
+        .update(&UpdateStateRequest::new(
+            ContainerStatus::created(id.clone(), None),
+            record.revision(),
+        ))
+        .map(drop)
+        .map_err(|e| e.code())
 }
 
 /// 記録の失敗など Timeout 以外で `start` が失敗した後に、cgroup を消してよいかを確かめる。確かめられたら `true`。

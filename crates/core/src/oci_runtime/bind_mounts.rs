@@ -69,7 +69,7 @@
 //! # スコープ外（REPAIR-3）
 //!
 //! 本型は字句検証のみで、検証から適用までの TOCTOU を防がない。symlink を含む実体の照合・fd 起点 `O_NOFOLLOW` の
-//! 走査・種別と存在の確認・宛先ディレクトリの作成・利用者権限での到達性・rootfs 自身とその祖先の実体照合（`dev`/`ino`）は、
+//! 走査・種別と存在の確認・宛先ディレクトリの作成・利用者権限での到達性・rootfs 自身とその祖先の実体照合（`dev`/`ino`）・疑似 FS 上の元の拒否（`f_type`。#2098）は、
 //! 適用の段 `crate::exec::mount_binds`（#1913。実装済み。Linux 限定のため intra-doc リンクは張らない）が担う。
 //! bundle は適用の段の rootfs の鎖（inode）と mountinfo（`ProtectedFsRoot::contained`）で、状態ルートは start が固定した inode の鎖（`with_inode_chain`。#2066）と mountinfo で照合する。残余（REPAIR-3）は、状態ルートを別の親ディレクトリへ付け替えた場合の祖先判定、overlayfs・FUSE 系の別 superblock 経由の同一データ、start 後に改名された子マウントの mountinfo 照合で、詳細は `crate::exec::mount_binds` のモジュール doc。`run_pre_pivot` への組み込みは済み（#1914）、`start` と本番 launcher への結線は済み（#1915。検証は `start`、tmpfs との重なりは launcher、
 //! 監査は `ProcessLauncher::rejection_audit_sink` 経由）。`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917

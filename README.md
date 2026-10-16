@@ -46,7 +46,7 @@ cargo build --workspace  # ビルド
 make test                # テスト（lint・deny まで含めた一括検証は make ci）
 ```
 
-ビルド後は `target/debug/` に CLI と supervisor が並びます（`start` は CLI の隣の supervisor を探すため、同じディレクトリから実行してください）。`--root` は状態ルート、`<bundle>` は `config.json` と `rootfs/` を持つ OCI bundle の絶対パスです。
+ビルド後は `target/debug/` に CLI と supervisor が並びます（`start` は CLI の隣の supervisor を探すため、同じディレクトリから実行してください）。インストール後も CLI は launcher・supervisor と同じディレクトリに置きます（`PATH` 上の symlink 経由でも実体のディレクトリを見ます。rootful と rootless の配置手順は [docs/setup/linux.md](docs/setup/linux.md)）。`--root` は状態ルート、`<bundle>` は `config.json` と `rootfs/` を持つ OCI bundle の絶対パスです。
 
 ```bash
 target/debug/fandhe-container --root /tmp/fc-state create --bundle <bundle> c1   # 状態を Created で記録

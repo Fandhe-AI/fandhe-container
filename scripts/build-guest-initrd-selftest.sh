@@ -135,7 +135,7 @@ esac
 newout
 run env GUEST_INITRD_CARGO="$sb/cargo-ok" "$target" --compress none --output-dir "$out"
 check "1 exit code" 0 "$rc"
-check "1 stdout is the initrd path" "$out/initrd.cpio" "$(cat "$sb/o.out")"
+check "1 stdout is the initrd path" "$(cd -P "$sb" && pwd -P)/${out##*/}/initrd.cpio" "$(cat "$sb/o.out")"
 entries="$(list_newc "$out/initrd.cpio" | grep -v '^ok' || true)"
 check "1 entries are exactly init and TRAILER" "init 000081ed 00000000 00000000 $good_size
 TRAILER!!! 00000000 00000000 00000000 0" "$entries"
@@ -162,7 +162,7 @@ cpio_ref="$out/initrd.cpio"
 newout
 run "$target" --init "$good" --output-dir "$out"
 check "2 exit code" 0 "$rc"
-check "2 stdout is the gz path" "$out/initrd.cpio.gz" "$(cat "$sb/o.out")"
+check "2 stdout is the gz path" "$(cd -P "$sb" && pwd -P)/${out##*/}/initrd.cpio.gz" "$(cat "$sb/o.out")"
 if gzip -dc "$out/initrd.cpio.gz" | cmp -s - "$cpio_ref"; then ok "2 gunzip equals the plain archive"; else ng "2 gunzip differs"; fi
 if grep -qx "init_sha256=$good_sha" "$out/build-info.txt"; then ok "2 build-info has the init sha256"; else ng "2 build-info sha256 missing"; fi
 if grep -qx 'compress=gzip' "$out/build-info.txt"; then ok "2 build-info has compress=gzip"; else ng "2 build-info compress missing"; fi

@@ -291,10 +291,10 @@ idle-memory: ## アイドル時常駐メモリ（プロセス数・PSS・RSS）�
 idle-memory-supervised: ## 監視プロセス込みのアイドル常駐メモリ回帰テスト（DRIVER=<絶対パス> [EXPECTED_DIR=] [OUTPUT=]。CORE-7・Linux・実機前提）
 	@scripts/targets/idle-memory-supervised.sh
 
-supervisor-pss: ## 監視プロセスの PSS を計測（PID="<pid>..." または COUNT=<N>。[SAMPLES= INTERVAL= EXE_NAME= EXPECTED_DIR= OUTPUT=]。SUP-2・Linux・実機前提）
+supervisor-pss: ## 監視プロセスの PSS を計測（root で実行。PID="<pid>..." または COUNT=<N> と RUN_AS=<起動した利用者> 必須。[SAMPLES= INTERVAL= EXE_NAME= EXPECTED_DIR= OUTPUT=]。SUP-2・Linux・実機前提）
 	@scripts/targets/supervisor-pss.sh
 
-concurrent-memory: ## 50 コンテナ同時起動時の集約 PSS を計測する（実機前提・timeout 付き。BIN_DIR=<絶対パス> BUNDLE=<dir> TARGET=<名前> 必須）
+concurrent-memory: ## 50 コンテナ同時起動時の集約 PSS を計測する（root で実行し起動は降格。実機前提・timeout 付き。BIN_DIR=<絶対パス> BUNDLE=<dir> TARGET=<名前> RUN_AS=<利用者> 必須）
 	@scripts/targets/concurrent-memory.sh
 
 concurrent-memory-docker: ## Docker 側の 50 コンテナ同時起動時の集約 PSS を計測する（実機前提・timeout 付き。DOCKER=<docker の絶対パス> 必須。TASK-50.2）

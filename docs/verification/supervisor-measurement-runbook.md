@@ -11,16 +11,17 @@
 | 項目 | 内容 |
 | ---- | ---- |
 | restart の再 launch（#491） | supervisor の再 launch は本番 launcher の単一スレッド要求で拒否される（#2043）。#2043 が入るまで `make restart-latency` は再起動未観測（終了コード 1）になり数値は出ない。`make supervisor-independence` の `--check-restart` も同じ |
-| 計測の権限（#485・#219） | supervisor は入口で `PR_SET_DUMPABLE=0` にする（SUP-14）。同じ利用者の非 root からも `/proc/<pid>/exe`・`smaps_rollup` を読めない。一方 supervisor は rootful 起動を拒否する（SEC-5）。#485 は「root が計測し、supervisor は非 root で起動する」2 つのシェルで行う。#219 の own は 1 つのスクリプトが起動と PSS の読み取りを行うため両立せず、非 root では `unreadable-memory-value` で fail-closed になり、root では起動前に終了コード 3 になる。特権の橋渡しは #2090 で案 A（計測だけ root、起動は対象の利用者へ降格）に決定済み。実装は #2099（未実装） |
+| 計測の権限（#485・#219） | supervisor は入口で `PR_SET_DUMPABLE=0` にする（SUP-14）。同じ利用者の非 root からも `/proc/<pid>/exe`・`smaps_rollup` を読めない。一方 supervisor は rootful 起動を拒否する（SEC-5）。両立のため #2090 のオーナー決定（案 A）に従い、**計測（`/proc` の読み取りとシグナル送信）だけを root で行い、create・`systemd-run`・supervisor の起動は対象の利用者（`RUN_AS`）へ降格する**。#485 は「root が計測し、supervisor は対象の利用者が起動する」2 つのシェルで行う（これが案 A そのもの）。#219 の own は 1 つのスクリプトが root で動き、起動だけを `setpriv` で降格する（実装は #2099。自己テストはスタブのみで、**実機〔root〕での実行・検証は #485・#219 の人間担当が行う。結果は未取得**）。製品の `dumpable=0`・rootful 拒否は変えない |
 | supervisor の停止 | SIGTERM のハンドラは無くコンテナを止めない。CLI の `stop` は未実装（#1544）。スクリプトは記録した pid・起動時刻の同一性を照合して子孫へ SIGKILL を送り、状態ルートごと削除する。CLI の `delete` は呼ばない |
 | バックオフ（#491） | supervisor の bin にバックオフを指定する引数は無く、既定 100ms 固定（`crates/supervisor/src/restart.rs` の `DEFAULT_BACKOFF`）。計測値はバックオフを含むため、スクリプトは差し引いた値も出す |
 
 ## 共通の必要環境
 
 - Linux 6.12 以上（Landlock ABI 6 以上）。bash 5・`jq`・`timeout`・`mkfifo`・`cp`・`setsid`・`systemd-run`
-- 非 root の利用者で実行する（#485 の PSS 読み取りだけ root）
+- #499・#491 は非 root の利用者で実行する。#485 の PSS 読み取りと #219 は root で実行する（#219 は起動を `RUN_AS` の利用者へ降格する。root で動くのは計測だけ）
+- #485・#219 の対象の利用者（`RUN_AS`）は非 root（uid 0 は終了コード 2）で、その user マネージャが動いていること（`/run/user/<uid>/bus` がある。ログアウト後も使うなら `loginctl enable-linger <利用者>`）。#219 では `setpriv`（util-linux。既定 `/usr/bin/setpriv`。違う場合は `SETPRIV=<絶対パス>`）が必要。`systemctl --user` の確認は root のシェルではなく対象の利用者のシェルで行う
 - 非特権 user namespace を許可する（例: `kernel.apparmor_restrict_unprivileged_userns=0`）
-- `systemd-run --user` が使える（利用者の systemd と DBus セッション）。supervisor は親 cgroup に自分だけがいることを要求するため、スクリプトは supervisor ごとに `systemd-run --user --scope --quiet -p Delegate=yes --` で新しいスコープへ入れる
+- `systemd-run --user` が使える（利用者の systemd と DBus セッション）。supervisor は親 cgroup に自分だけがいることを要求するため、スクリプトは supervisor ごとに `systemd-run --user --scope --quiet --collect --unit=fc-bench-... -p Delegate=yes --` で新しいスコープへ入れる（#219 は対象の利用者へ降格した側がこれを呼ぶ）
 - cgroup v2 の委譲がある
 - 参考: `crates/supervisor/tests/supervisor_bin_real.rs` の module doc に同じ前提がある
 
@@ -166,14 +167,18 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
 
    追跡不能・残存で状態を保持したときは、`ps -ef --forest` で `fandhe-container` 系の孤児プロセスを探し、起動時刻が本計測の開始以降のものだけを手で止めてから `$root` を削除する。
 
-2. root のシェル（権限付きシェル）で計測する
+2. root のシェル（権限付きシェル）で計測する。`RUN_AS` は 1. のシェルの利用者（案 A: 起動は対象の利用者、計測だけ root）
 
    ```bash
-   make supervisor-pss COUNT=50 EXPECTED_DIR="$BIN_DIR" SAMPLES=5 OUTPUT=<新規ファイル>
+   sudo make supervisor-pss COUNT=50 RUN_AS=<1. のシェルの利用者> EXPECTED_DIR="$BIN_DIR" SAMPLES=5 OUTPUT=<root 所有のディレクトリ配下の新規ファイル>
    ```
+
+   - スクリプトは起動しない。測定対象の各 pid が `RUN_AS` の利用者で動き（`/proc/<pid>/status` の Uid 4 値）、`user@<uid>.service` 配下の `.scope` に入っていること（`systemd-run --user --scope` の委譲スコープ）を確かめ、違えば終了コード 3 になる（root のまま起動した supervisor は SEC-5 で拒否されるため通常は起きない）
+   - 非 root で実行すると終了コード 2、`RUN_AS` が uid 0 でも 2
 
 - 出力の読み方: `apportioned_pss_kb_median`（N 按分後の主指標）と `per_process_pss_kb_median`（単体の参考）。目標 2048KB は `target_pss_kb` に参考値として載るだけで、スクリプトは合否を出さない
 - 読めないときは終了コード 3 で、メッセージに dumpable の旨が出る。root のシェルから実行する
+- 結果欄は空のまま。実測値は人間が #485 に記録する（この手順書・スクリプトは実測値を持たない）
 
 ## #491 restart レイテンシ（SUP-3・TASK-160）
 
@@ -194,15 +199,18 @@ make restart-latency BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> TRIALS=20 WA
 ## #219 50 コンテナ同時起動の集約メモリ（CORE-9・SUP-1・TASK-50）
 
 ```bash
-make concurrent-memory BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> TARGET=own COUNT=50 TRIALS=3 OUTPUT=<新規ファイル>
+sudo make concurrent-memory BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> TARGET=own RUN_AS=<対象の利用者> COUNT=50 TRIALS=3 OUTPUT=<root 所有のディレクトリ配下の新規ファイル>
 make concurrent-memory-docker DOCKER=<docker の絶対パス> ...   # Docker 側の同一手法計測（#218）
 make concurrent-memory-report OWN_RESULT=<own の出力> DOCKER_RESULT=<docker の出力>
 ```
 
-- **未解決の前提**（上の表）: own は supervisor の PSS を読めないため、非 root の単独実行では成立しない。解決方針の選択肢は (A) スクリプトが root で動き起動行だけ非 root へ降格する、(B) 製品側で dumpable=0 を特権経路に限る（SUP-14 の判断が要る）。実測の前に判断を得る
+- **権限（案 A。#2090 で決定・#2099 で実装）**: スクリプトは root で動く。root で行うのは計測だけで、bundle の複製・create・`systemd-run --user --scope`・supervisor の起動と、対象の利用者の領域（状態ルート・bundle の複製）への書き込み・削除は、`RUN_AS` の利用者へ降格して実行する（`setpriv --reuid --regid --init-groups`。環境変数は `HOME`・`USER`・`LOGNAME`・`PATH`・`XDG_RUNTIME_DIR`・`DBUS_SESSION_BUS_ADDRESS` の許可リストだけ。fd 3 以上は閉じる）。起動前に降格した `id` を確かめ、起動後は各 supervisor の Uid・Gid・補助グループと、cgroup が `user@<uid>.service` 配下の本スクリプトのスコープであることを確かめる（不一致は終了コード 1〔`demotion-mismatch` / `scope-mismatch`〕。結果は公開しない）
+- 前提: `RUN_AS` の利用者が `BUNDLE` のテンプレートを読めること。`OUTPUT` は root 所有のディレクトリ配下の新規ファイル（祖先を含む所有者・書き込み権を検査する）。バイナリ（`BIN_DIR`）は symlink でない通常ファイルで、`RUN_AS` の利用者が実行できること（root は直接実行しない）。`--no-new-privs` は付けない（rootless の user namespace の設定が setuid の `newuidmap` / `newgidmap` を使うため）
+- 後始末: 中断（HUP / INT / TERM）・失敗でも、supervisor・スコープ・状態ルート・利用者所有の一時ディレクトリを回収する。利用者の領域に root 所有のファイルがあれば削除せず、スコープや一時ディレクトリが残れば識別子（スコープ名・パス）つきで報告して終了コード 4
+- 実機（root）での実行と検証は未実施。自己テスト（スタブの `setpriv`・疑似 `/proc`）は root 不要で、実機の結果はこの手順書に書かない
 - 集計の対象は supervisor を根とする子孫全体（コンテナ側プロセスを含む）。コンテナ側プロセスは環境変数を継承しないため、所有の証明は生存中に記録した pid・起動時刻の同一性で行う
 - 出力の読み方・SUP-1（Docker の 80% 以下）の判定は #219 の担当。スクリプトは合否を出さない
-- 終了コード: 0 = 全試行 N/N 起動、1 = 計測失敗、2 = 引数エラー（bundle の複製失敗を含む）、3 = 前提欠如（root 実行を含む）、4 = 後始末失敗
+- 終了コード: 0 = 全試行 N/N 起動、1 = 計測失敗、2 = 引数エラー（bundle の複製失敗を含む）、3 = 前提欠如（非 root 実行・降格の不一致〔`demotion-mismatch`〕・対象の利用者の user マネージャの bus が無い）、4 = 後始末失敗（残存プロセス・スコープ・利用者の一時ディレクトリ、利用者の領域の root 所有ファイル）
 
 ## 実行後の確認
 

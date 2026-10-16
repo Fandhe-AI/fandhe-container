@@ -305,7 +305,7 @@ fn expect_error(msg: ControlMessage<Vec<String>>, want_id: u64) -> (PluginErrorC
 fn task115_3_plug1_adapter_rejects_invalid_create_with_fixed_messages() {
     let mut h = Harness::start();
     let r = expect_error(
-        h.call(1, &["create", "a", "/nonexistent/SECRET", "", ""]),
+        h.call(1, &["create", "a", "/nonexistent/SECRET", "", "", ""]),
         1,
     );
     assert_eq!(
@@ -315,7 +315,7 @@ fn task115_3_plug1_adapter_rejects_invalid_create_with_fixed_messages() {
             "config.path_not_found: VM configuration was rejected".to_string()
         )
     );
-    let r = expect_error(h.call(2, &["create", "..", "/k", "", ""]), 2);
+    let r = expect_error(h.call(2, &["create", "..", "/k", "", "", ""]), 2);
     assert_eq!(
         r,
         (
@@ -341,7 +341,7 @@ fn task115_3_mac1_start_returns_error_frame_and_keeps_connection() {
     let kernel = h.dir.join("kernel");
     std::fs::write(&kernel, b"k").expect("write kernel");
     let k = kernel.to_str().expect("utf8").to_string();
-    match h.call(1, &["create", "a", &k, "", ""]) {
+    match h.call(1, &["create", "a", &k, "", "", ""]) {
         ControlMessage::Response { id, body } => {
             assert_eq!(id.get(), 1);
             assert_eq!(body, vec!["created".to_string()]);

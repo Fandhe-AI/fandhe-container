@@ -14,7 +14,7 @@
 //!   必要環境と実行コマンドは `AGENTS.md`「実機前提テスト」節。
 //!
 //! 待ちはすべて期限つきで、裸の `join()` は使わない（REPAIR-5）。暫定ワイヤー契約（型つき本体は TASK-114 待ち）:
-//! create `["create", id, kernel, initrd|"", cmdline, (tag, host_dir, "ro"|"rw")*]` → `["created"]`、
+//! create `["create", id, kernel, initrd|"", cmdline, console_log|"", (tag, host_dir, "ro"|"rw", guest_mount|"")*]` → `["created"]`、
 //! start → `["running"]`、stop → `["stopped"]`、ping → `["pong"]`。
 #![cfg(unix)]
 
@@ -269,7 +269,7 @@ fn task115_6_plug1_mac1_create_start_stop_roundtrip_over_uds() {
     let mut h = E2e::start();
     let k = h.kernel();
     assert_eq!(
-        expect_ok(h.call(1, &["create", "c1", &k, "", "console=hvc0"]), 1),
+        expect_ok(h.call(1, &["create", "c1", &k, "", "console=hvc0", ""]), 1),
         one("created")
     );
     assert_eq!(expect_ok(h.call(2, &["start", "c1"]), 2), one("running"));
@@ -304,7 +304,7 @@ fn task115_6_plug1_mac1_create_start_stop_roundtrip_over_uds() {
 fn task115_6_mac1_disconnect_with_running_vm_is_stopped_by_stop_all() {
     let mut h = E2e::start();
     let k = h.kernel();
-    expect_ok(h.call(1, &["create", "c1", &k, "", ""]), 1);
+    expect_ok(h.call(1, &["create", "c1", &k, "", "", ""]), 1);
     expect_ok(h.call(2, &["start", "c1"]), 2);
     let (o, rec) = h.disconnect();
     assert!(matches!(o.exit, Ok(LoopExit::PeerClosed)), "{:?}", o.exit);
@@ -323,7 +323,7 @@ fn task115_6_mac1_disconnect_with_running_vm_is_stopped_by_stop_all() {
 fn task115_6_mac1_shutdown_flag_stops_running_vm() {
     let mut h = E2e::start();
     let k = h.kernel();
-    expect_ok(h.call(1, &["create", "c1", &k, "", ""]), 1);
+    expect_ok(h.call(1, &["create", "c1", &k, "", "", ""]), 1);
     expect_ok(h.call(2, &["start", "c1"]), 2);
     h.stop_flag.store(true, Ordering::SeqCst);
     // 接続は開いたまま（`IDLE_POLL` 1 秒＋余裕の期限内に抜けることを `wait_outcome` が検証する）。
@@ -354,7 +354,10 @@ fn task115_6_mac1_virtiofs_share_reaches_backend() {
         .expect("mkdir share");
     let share = h.dir.join_str("share");
     expect_ok(
-        h.call(1, &["create", "c1", &k, "", "", "share0", &share, "ro"]),
+        h.call(
+            1,
+            &["create", "c1", &k, "", "", "", "share0", &share, "ro", ""],
+        ),
         1,
     );
     expect_ok(h.call(2, &["start", "c1"]), 2);
@@ -374,6 +377,139 @@ fn task115_6_mac1_virtiofs_share_reaches_backend() {
     assert!(shares[0].access.is_read_only());
 }
 
+/// MAC-1・REPAIR-12（#2075）: 非空の console_log とゲスト内マウント先が UDS 越しにバックエンドへ届き、
+/// 実効 cmdline にゲスト init への指示が付く。
+#[test]
+fn task2075_mac1_guest_mount_and_console_log_reach_backend_over_uds() {
+    let mut h = E2e::start();
+    let k = h.kernel();
+    for name in ["s1", "s2"] {
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(h.dir.path().join(name))
+            .expect("mkdir share");
+    }
+    let (d1, d2) = (h.dir.join_str("s1"), h.dir.join_str("s2"));
+    let log = h.dir.join_str("console.log");
+    expect_ok(
+        h.call(
+            1,
+            &[
+                "create",
+                "c1",
+                &k,
+                "",
+                "console=hvc0",
+                &log,
+                "data",
+                &d1,
+                "rw",
+                "/mnt/fandhe/data",
+                "ro",
+                &d2,
+                "ro",
+                "/mnt/fandhe/ro",
+            ],
+        ),
+        1,
+    );
+    assert_eq!(expect_ok(h.call(2, &["start", "c1"]), 2), one("running"));
+    let (_o, rec) = h.disconnect();
+    let rec = rec.lock().expect("lock");
+    assert_eq!(rec.launched.len(), 1);
+    let spec = &rec.launched[0];
+    let mounts: Vec<Option<String>> = spec
+        .shares
+        .shares()
+        .iter()
+        .map(|s| s.guest_mount.as_ref().map(|m| m.as_str().to_string()))
+        .collect();
+    assert_eq!(
+        mounts,
+        vec![
+            Some("/mnt/fandhe/data".to_string()),
+            Some("/mnt/fandhe/ro".to_string())
+        ]
+    );
+    assert_eq!(
+        spec.effective_cmdline().expect("cmdline").as_str(),
+        "console=hvc0 fandhe.virtiofs=data:/mnt/fandhe/data:rw fandhe.virtiofs=ro:/mnt/fandhe/ro:ro"
+    );
+}
+
+/// MAC-1・SEC-4・REPAIR-12（#2075）: 不正なマウント先と、console_log なしのマウント先は Error フレームで拒否され、
+/// 固定文言のまま入力値を反射せず、接続は維持され、バックエンドへは届かない。
+#[test]
+fn task2075_mac1_sec4_invalid_guest_mount_is_rejected_over_uds() {
+    let mut h = E2e::start();
+    let k = h.kernel();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(h.dir.path().join("s1"))
+        .expect("mkdir share");
+    let d1 = h.dir.join_str("s1");
+    let log = h.dir.join_str("console.log");
+    let rejected = "VM configuration was rejected";
+    let (code, msg) = expect_err(
+        h.call(
+            1,
+            &[
+                "create",
+                "c1",
+                &k,
+                "",
+                "console=hvc0",
+                &log,
+                "data",
+                &d1,
+                "rw",
+                "/etc/SECRET",
+            ],
+        ),
+        1,
+    );
+    assert_eq!(
+        (code, msg.as_str()),
+        (
+            PluginErrorCode::InvalidArgument,
+            format!("config.guest_mount_point_not_under_base: {rejected}").as_str()
+        )
+    );
+    assert!(!msg.contains("SECRET"), "{msg}");
+    let (code, msg) = expect_err(
+        h.call(
+            2,
+            &[
+                "create",
+                "c1",
+                &k,
+                "",
+                "console=hvc0",
+                &log,
+                "data",
+                &d1,
+                "rw",
+                "/mnt/fandhe/../SECRET",
+            ],
+        ),
+        2,
+    );
+    assert_eq!(
+        (code, msg.as_str()),
+        (
+            PluginErrorCode::InvalidArgument,
+            format!("config.guest_mount_point_invalid: {rejected}").as_str()
+        )
+    );
+    assert!(!msg.contains("SECRET"), "{msg}");
+    // 接続は維持され、拒否された create は登録されていない（start は NOT_FOUND）。
+    let (code, _) = expect_err(h.call(3, &["start", "c1"]), 3);
+    assert_eq!(code, PluginErrorCode::NotFound);
+    assert_eq!(expect_ok(h.call(4, &["ping"]), 4), one("pong"));
+    let (_o, rec) = h.disconnect();
+    assert!(rec.lock().expect("lock").launched.is_empty());
+}
+
 /// PLUG-1: 状態違反はエラーフレームになるが接続は維持され、固定文言に入力値（id・パス）を反射しない。
 #[test]
 fn task115_6_plug1_error_frames_keep_connection() {
@@ -390,8 +526,8 @@ fn task115_6_plug1_error_frames_keep_connection() {
         (code, msg.as_str()),
         (PluginErrorCode::NotFound, "container not found")
     );
-    expect_ok(h.call(3, &["create", secret_id, &k, "", ""]), 3);
-    let (code, msg) = expect_err(h.call(4, &["create", secret_id, &k, "", ""]), 4);
+    expect_ok(h.call(3, &["create", secret_id, &k, "", "", ""]), 3);
+    let (code, msg) = expect_err(h.call(4, &["create", secret_id, &k, "", "", ""]), 4);
     assert_eq!(
         (code, msg.as_str()),
         (PluginErrorCode::AlreadyExists, "container already exists")
@@ -424,7 +560,7 @@ fn task115_6_mac1_launch_failure_is_reported_and_counted_remaining() {
     let mut h = E2e::start();
     let k = h.kernel();
     h.record.lock().expect("lock").fail_launch = true;
-    expect_ok(h.call(1, &["create", "c1", &k, "", ""]), 1);
+    expect_ok(h.call(1, &["create", "c1", &k, "", "", ""]), 1);
     let (code, msg) = expect_err(h.call(2, &["start", "c1"]), 2);
     assert_eq!(
         (code, msg.as_str()),
@@ -485,7 +621,7 @@ mod real_vm {
     /// PLUG-1・MAC-1: 実バイナリを spawn し、plugin 経由で実 VM を起動・停止して終了コード 0 で終わる。
     ///
     /// 実機前提のため `#[ignore]` で既定集合から分離している（CI 通過のための弱体化ではない）。
-    /// 共有（virtiofs）は渡さない（ゲスト init 未実装では `guest_mount.timeout` になるため）。
+    /// 共有（virtiofs）とマウント先は渡さない（ゲスト init の initrd 梱包は #1878、実機確認は #1628）。
     /// 署名対象は plugin バイナリ。手順は `AGENTS.md`「実機前提テスト」節。
     #[test]
     #[ignore = "requires real macOS 13+ with Virtualization.framework, the plugin binary codesigned with com.apple.security.virtualization, and guest assets; MAC-1 PLUG-1; see AGENTS.md"]
@@ -518,7 +654,7 @@ mod real_vm {
         let mut stream = listener.accept(ACCEPT_WAIT, &mut obs).expect("accept");
 
         assert_eq!(expect_ok(call(&mut stream, 1, &["ping"]), 1), one("pong"));
-        let body = ["create", "real1", &kernel, &initrd, &cmdline];
+        let body = ["create", "real1", &kernel, &initrd, &cmdline, ""];
         assert_eq!(expect_ok(call(&mut stream, 2, &body), 2), one("created"));
         // 起動期限は adapter 固定の 7 秒。失敗時はまず start の Error フレームのコード（TIMEOUT か）を確認する。
         assert_eq!(

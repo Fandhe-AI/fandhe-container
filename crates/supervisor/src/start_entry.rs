@@ -23,6 +23,9 @@
 //! プロセスが単一スレッドであることを確かめる（満たさなければ副作用なしで `FailedPrecondition`）。そのため手順 3〜7
 //! だけを作業スレッドで行い、作業スレッドを `join` で終了させてから、入口スレッドが手順 8 を直接呼ぶ
 //! （`join` が返った直後は `/proc/self/task` にまだ残り得るため、`SelfBounded` の launcher の前に短く待つ）。
+//! 状態の読み取り・bundle の検証・所有ロック・起動権の予約（`claim_start`。`StateStore` と bundle のファイル I/O）は
+//! 作業スレッドの末尾で行うため、入口は期限で待ち切れる（FUSE 上の bundle が止まっても報告できる。REPAIR-5）。入口
+//! スレッドが行うのは launcher の呼び出しと Running の記録（`launch_claimed`）だけである。
 //! 手順 8 の上限は launcher 自身が守る。入口は launch の前に [`crate::start_contract::launch_step_budget`] が期限内に
 //! 残っているかを確かめ、足りなければ launch しない。手順 8 より前に常駐スレッドを作らないよう、成功経路の
 //! 手順 3〜7 では `log_event`（`stderr_sink` の常駐スレッドを作る）を呼ばない。
@@ -62,9 +65,9 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{
-    LAUNCHER_REPLY_GRACE, LaunchMode, LaunchSpec, LaunchedProcess, LifecycleOp, OciRuntimeError,
-    ProcessLauncher, StartTimeouts, exit_code_for, recover_interrupted_start, start,
-    take_unreaped_processes,
+    ClaimedStart, LAUNCHER_REPLY_GRACE, LaunchMode, LaunchSpec, LaunchedProcess, LifecycleOp,
+    OciRuntimeError, ProcessLauncher, StartTimeouts, claim_start, exit_code_for, launch_claimed,
+    recover_interrupted_start, take_unreaped_processes,
 };
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
@@ -454,15 +457,18 @@ pub fn run_start_until(
 
 /// 手順 8 の前に、期限内に手順 8 の見込み（[`launch_step_budget`]）が残っているか。
 ///
-/// 残り時間は `deadline − REPORT_RESERVE`（報告の書き込みに残す幅）まで。期限が無ければ（加算があふれる巨大な
+/// 残り時間は `deadline − REPORT_RESERVE`（報告の書き込みに残す幅）まで。見込みは手順 8 の予算に、launch の前の
+/// 作業スレッド消滅の待ち（[`START_WORKER_EXIT_WAIT`]）を加えたもの。期限が無ければ（加算があふれる巨大な
 /// 上限）常に残っているとみなす。
 fn has_launch_budget(deadline: Option<Instant>, timeouts: &StartTimeouts) -> bool {
     let Some(deadline) = deadline else {
         return true;
     };
     let limit = deadline.checked_sub(REPORT_RESERVE).unwrap_or(deadline);
+    // launch の前に作業スレッドの消滅を最大 START_WORKER_EXIT_WAIT まで待つため、その分も見込みに含める。
     Instant::now()
         .checked_add(launch_step_budget(timeouts))
+        .and_then(|t| t.checked_add(START_WORKER_EXIT_WAIT))
         .is_some_and(|end| end <= limit)
 }
 
@@ -472,7 +478,6 @@ fn launch_after_prepare(
     (worker_exited, worker_tid): (bool, Option<NonZeroU32>),
     store: &Arc<dyn StateStore>,
     recorder: &OpRecorder,
-    req: &StartRequest,
     timeouts: &StartTimeouts,
     deadline: Option<Instant>,
 ) -> Attempt {
@@ -493,19 +498,20 @@ fn launch_after_prepare(
     if !has_launch_budget(deadline, timeouts) {
         // 期限内に終わらない launch を始めない（子を作ってから期限を超えない。REPAIR-5）。
         log_event("start_launch_skipped", Some(ErrorCode::Timeout));
+        let cleanup = discard_prepared(prepared, store.as_ref());
         return Attempt::Failed {
             error: OciRuntimeError::new(
                 LifecycleOp::Start,
                 ErrorCode::Internal,
                 DEADLINE_EXCEEDED_MESSAGE,
             ),
-            cleanup: Cleanup::ReleaseCgroup,
+            cleanup,
         };
     }
     if prepared.launcher.launch_mode() == LaunchMode::SelfBounded {
         wait_task_gone(worker_tid, START_WORKER_EXIT_WAIT);
     }
-    launch_prepared(prepared, store, recorder, req, timeouts)
+    launch_prepared(prepared, store, recorder, timeouts)
 }
 
 /// 起動の計測を [`START_OP`] に記録する（準備の開始から手順 8 の終わりまで）。
@@ -544,15 +550,8 @@ fn start_reporting(
     if let Some((deps, outcome)) = worker.wait_until(wait_until) {
         // 作業スレッドは結果を渡した直後に終わる。launch の前に終了を確かめる（単一スレッドの要求。CORE-1）。
         let worker_exited = worker.join();
-        let attempt = launch_after_prepare(
-            outcome,
-            worker_exited,
-            store,
-            recorder,
-            req,
-            timeouts,
-            deadline,
-        );
+        let attempt =
+            launch_after_prepare(outcome, worker_exited, store, recorder, timeouts, deadline);
         record_start(recorder, started, matches!(attempt, Attempt::Started(_)));
         return match attempt {
             Attempt::Started(running) => {
@@ -666,6 +665,8 @@ struct Prepared {
     launcher: Arc<dyn ProcessLauncher>,
     /// コンテナ出力の捕捉ハブ。
     logs: Option<Arc<CaptureHub>>,
+    /// 起動権の予約済みの状態（bundle の検証・所有ロック・予約の更新は作業スレッドで済ませてある。#1819）。
+    claimed: Box<ClaimedStart>,
 }
 
 /// 作業スレッドで行った準備（手順 3〜7）の結果。
@@ -852,6 +853,18 @@ fn wait_task_gone(tid: Option<NonZeroU32>, limit: Duration) {
     }
 }
 
+/// launch しない準備済みの結果を捨てる。予約を Created へ戻せたら cgroup を消す後始末を、戻せなければ cgroup を
+/// 消さない（予約が Running・pid なしで残るため `recover_interrupted_start` での回復を待つ。CORE-2）。
+fn discard_prepared(prepared: Prepared, store: &dyn StateStore) -> Cleanup {
+    match prepared.claimed.release(store) {
+        Ok(()) => Cleanup::ReleaseCgroup,
+        Err(_) => {
+            log_event("start_claim_release_failed", Some(ErrorCode::Internal));
+            Cleanup::Nothing
+        }
+    }
+}
+
 /// 入口が待つのをやめた後に作業スレッドが戻ったとき（または期限超過の報告の後に結果が出たとき）の後始末。
 ///
 /// launch はしない。準備が済んだ結果（`Ready`）は作った cgroup を消し、失敗の結果はその後始末を行う
@@ -864,7 +877,7 @@ fn abandoned_cleanup(
     outcome: PrepareOutcome,
 ) {
     let cleanup = match outcome {
-        PrepareOutcome::Ready(_) => Cleanup::ReleaseCgroup,
+        PrepareOutcome::Ready(prepared) => discard_prepared(prepared, store),
         PrepareOutcome::Failed { cleanup, .. } => cleanup,
     };
     let _ = cleanup_after_report(deps, store, id, timeouts, cleanup);
@@ -962,20 +975,32 @@ fn prepare_start(
     });
     let capturing = Arc::new(SpecCapturingLauncher::new(checked));
     let launcher: Arc<dyn ProcessLauncher> = capturing.clone();
+    // 起動権の予約（状態の読み取り・bundle の検証・所有ロック・予約の更新）。ファイル I/O を含むため、入口が期限で
+    // 待ち切れる作業スレッドで行う。ここまでで launcher は呼ばない（REPAIR-5・CORE-2）。
+    let claimed = match claim_start(store, req) {
+        Ok(c) => Box::new(c),
+        // 予約は取れていない（状態は Created のまま）。作った cgroup だけを消す。
+        Err(e) => {
+            return PrepareOutcome::Failed {
+                error: e,
+                cleanup: Cleanup::ReleaseCgroup,
+            };
+        }
+    };
     PrepareOutcome::Ready(Prepared {
         inner,
         capturing,
         launcher,
         logs,
+        claimed,
     })
 }
 
-/// 手順 8（入口スレッドで実行）。`oci_runtime::start` を呼び、成功なら監視に要るものを、失敗なら後始末の種類を返す。
+/// 手順 8（入口スレッドで実行）。`oci_runtime::launch_claimed` を呼び、成功なら監視に要るものを、失敗なら後始末の種類を返す。
 fn launch_prepared(
     prepared: Prepared,
     store_arc: &Arc<dyn StateStore>,
     recorder: &OpRecorder,
-    req: &StartRequest,
     timeouts: &StartTimeouts,
 ) -> Attempt {
     let Prepared {
@@ -983,10 +1008,11 @@ fn launch_prepared(
         capturing,
         launcher,
         logs,
+        claimed,
     } = prepared;
     let store: &dyn StateStore = store_arc.as_ref();
-    // 8
-    match start(store, recorder, &launcher, req, timeouts) {
+    // 8（予約は作業スレッドで済ませてある。ここは launcher の呼び出しと Running の記録だけ）
+    match launch_claimed(store, recorder, &launcher, *claimed, timeouts) {
         Ok(started) => {
             let (record, process) = started.into_parts();
             let instance = record.cgroup().map(|c| c.instance());

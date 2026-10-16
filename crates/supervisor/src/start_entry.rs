@@ -9,8 +9,8 @@
 //! 0. 結果チャネルの検証（stdout が FIFO か。`run_main`）／1. argv の解析（[`crate::start_contract::StartArgs`]）／
 //! 2. スレッド数が 1 か（`oci_runtime::start` の前提。以後のスレッドは手順 3〜7 の作業スレッド〔入口は待つだけ〕と
 //!    手順 10 以降のログ捕捉・restart のワーカーに限る）／
-//!    2b. supervisor の構造化ログの保存先を開き、`stderr_sink` の書き先を差し替える（レコードがあるときだけ。スレッドを
-//!    作らない。失敗は fail-closed。保存先と上限は [`crate::supervisor_log`]。#2067・REPAIR-4）／
+//!    2b. supervisor の構造化ログの保存先を開き、`stderr_sink` の書き先を差し替える（レコードがあるときだけ。期限つきの
+//!    作業スレッドで行い終了を確認してから進む。失敗は fail-closed。保存先と上限は [`crate::supervisor_log`]。#2067・REPAIR-4）／
 //! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし）／4. [`StartDeps::check_launcher_available`]
 //!    （副作用なし。権限モデルと Landlock ABI を確かめ、満たさなければここで止まる）／5. cgroup の連鎖
 //!    （[`StartDeps::prepare_cgroup`]）／6. 監査 sink（[`StartDeps::build_audit_sink`]。fork の前）・ログ sink／
@@ -1650,6 +1650,8 @@ mod linux {
     const REPORT_WRITE_DEADLINE: Duration = Duration::from_secs(5);
     /// stderr への報告 1 行（結果チャネルが使えないとき）と、終了前のログの書き出しを待つ期限（REPAIR-5）。
     const STDERR_DEADLINE: Duration = Duration::from_secs(1);
+    /// supervisor ログの準備（手順 2b）を待つ上限（全体期限から報告の予約分を引いた残りでさらに絞る）。
+    const LOG_PREPARE_DEADLINE: Duration = Duration::from_secs(5);
 
     /// 本番の [`StartDeps`]。core の本番 `ProcessLauncher`（`oci_runtime::ProductionLauncher`）へ結線する
     /// （#1819・SUP-1・CORE-1・CORE-2・CORE-3・CORE-5・SEC-1・SEC-4・SEC-5）。
@@ -1906,8 +1908,48 @@ mod linux {
     ///
     /// レコードが無い・読めない場合は何もせず先へ進む（詳細なエラーは手順 3 が報告する。打ち間違えた ID のために
     /// `delete` で消せないログを作らない）。開くのに失敗したら呼び出し側が fail-closed で報告する（ログ喪失を黙って
-    /// 許さない。同じ ID の supervisor が生存中なら `FailedPrecondition`）。スレッドは作らない。
+    /// 許さない。同じ ID の supervisor が生存中なら `FailedPrecondition`）。
+    ///
+    /// 状態ストアの取得とログのディレクトリ走査・ローテーション・`sync_dir` は保存先の I/O が止まりうるため、
+    /// 作業スレッドで行い `until` まで待つ（REPAIR-5）。成功時は作業スレッドを `join` で終了させてから返すため、
+    /// 後続の `oci_runtime::start` の単一スレッド要求を満たす。期限超過時は `Timeout` を返す（作業スレッドは
+    /// 残るが、呼び出し側は launch せず失敗を報告して終わる）。
     fn prepare_supervisor_log(
+        store: &Arc<dyn StateStore>,
+        root: &std::path::Path,
+        id: &ContainerId,
+        until: Option<Instant>,
+    ) -> Result<(), TraitError> {
+        let (store, root, id) = (Arc::clone(store), root.to_path_buf(), id.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("fandhe-suplog".into())
+            .spawn(move || {
+                let _ = tx.send(open_supervisor_log(&store, &root, &id));
+            })
+            .map_err(|_| {
+                TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to spawn the log prepare worker",
+                )
+            })?;
+        let until = until.map(|d| d.checked_sub(REPORT_RESERVE).unwrap_or(d));
+        let limit = write_limit(LOG_PREPARE_DEADLINE, until, Instant::now());
+        match rx.recv_timeout(limit) {
+            Ok(result) => {
+                // 送信は作業スレッドの最後の処理。join で OS スレッドの終了まで確認する（単一スレッドの回復）。
+                let _ = handle.join();
+                result
+            }
+            Err(_) => Err(TraitError::new(
+                ErrorCode::Timeout,
+                "supervisor log preparation timed out",
+            )),
+        }
+    }
+
+    /// [`prepare_supervisor_log`] の本体（作業スレッドで実行する）。
+    fn open_supervisor_log(
         store: &Arc<dyn StateStore>,
         root: &std::path::Path,
         id: &ContainerId,
@@ -1996,8 +2038,8 @@ mod linux {
             Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
         out.limit_until(deadline);
         // 2b: supervisor の構造化ログの保存先を開き、stderr の出口の書き先を差し替える（#2067・REPAIR-4）。
-        // スレッドは作らない。開けなければ fail-closed で、手順 3 より前に止まる（何も動かさない）。
-        if let Err(e) = prepare_supervisor_log(&store, &args.root, &args.id) {
+        // 期限つきの作業スレッドで行い、終了を確認してから先へ進む。開けなければ fail-closed で、手順 3 より前に止まる。
+        if let Err(e) = prepare_supervisor_log(&store, &args.root, &args.id, deadline) {
             return fail(&mut out, op_err(e));
         }
         let deps = Box::new(ProductionStartDeps::new(args.root));

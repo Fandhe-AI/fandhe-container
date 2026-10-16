@@ -428,15 +428,16 @@ root_exe_is_safe() { # <絶対パス>
         ;;
     esac
     if [ "$cur" = "/" ]; then next="/${comp}"; else next="${cur}/${comp}"; fi
-    info="$(stat -c '%u %a %F' -- "$next" 2>/dev/null)" || return 1
+    # 種別は翻訳されない生のモード（%f。16 進）から判定する（%F は英語以外のロケールで翻訳され、/ まで拒否してしまう）。
+    info="$(stat -c '%u %f' -- "$next" 2>/dev/null)" || return 1
     uid="${info%% *}"
-    rest="${info#* }"
-    mode="${rest%% *}"
-    kind="${rest#* }"
-    [[ "$uid" =~ ^[0-9]+$ ]] && [[ "$mode" =~ ^[0-7]+$ ]] || return 1
+    mode="${info#* }"
+    [[ "$uid" =~ ^[0-9]+$ ]] && [[ "$mode" =~ ^[0-9a-fA-F]{1,8}$ ]] || return 1
     [ "$uid" = "$owner" ] || return 1
+    kind=$((16#$mode & 16#F000))
+    mode=$((16#$mode))
     case "$kind" in
-      'symbolic link')
+      $((16#A000)))
         # symlink は root 所有のものだけ解決する（上で所有者を確認済み）。循環・過剰な連鎖は拒否する。
         n_links=$((n_links + 1))
         [ "$n_links" -le 40 ] || return 1
@@ -452,12 +453,12 @@ root_exe_is_safe() { # <絶対パス>
         esac
         comps=("${tcomps[@]}" "${comps[@]}")
         ;;
-      directory)
-        [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+      $((16#4000)))
+        [ $((mode & 8#022)) -eq 0 ] || return 1
         cur="$next"
         ;;
-      'regular file' | 'regular empty file')
-        [ $((8#$mode & 8#022)) -eq 0 ] || return 1
+      $((16#8000)))
+        [ $((mode & 8#022)) -eq 0 ] || return 1
         # 最終要素でなければ（残りが '.' / 空だけでなければ）拒否する。
         for rest in "${comps[@]}"; do
           case "$rest" in '' | .) ;; *) return 1 ;; esac
@@ -474,14 +475,13 @@ root_exe_is_safe() { # <絶対パス>
 
 # ディレクトリ 1 つが所有者 uid で group / other 書き込み不可であること（root_exe_is_safe の起点用）。
 root_dir_ok() { # <dir> <uid>
-  local info uid rest mode kind
-  info="$(stat -c '%u %a %F' -- "$1" 2>/dev/null)" || return 1
+  local info uid mode
+  info="$(stat -c '%u %f' -- "$1" 2>/dev/null)" || return 1
   uid="${info%% *}"
-  rest="${info#* }"
-  mode="${rest%% *}"
-  kind="${rest#* }"
-  [[ "$uid" =~ ^[0-9]+$ ]] && [[ "$mode" =~ ^[0-7]+$ ]] || return 1
-  [ "$kind" = directory ] && [ "$uid" = "$2" ] && [ $((8#$mode & 8#022)) -eq 0 ]
+  mode="${info#* }"
+  [[ "$uid" =~ ^[0-9]+$ ]] && [[ "$mode" =~ ^[0-9a-fA-F]{1,8}$ ]] || return 1
+  mode=$((16#$mode))
+  [ $((mode & 16#F000)) -eq $((16#4000)) ] && [ "$uid" = "$2" ] && [ $((mode & 8#022)) -eq 0 ]
 }
 
 if [ "$mode" = "own" ]; then

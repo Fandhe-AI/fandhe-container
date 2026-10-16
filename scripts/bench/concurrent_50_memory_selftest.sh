@@ -981,6 +981,40 @@ walk_check "exe-walk-missing-rejected" 1 "$walk/ok/bin/nothing"
 walk_check "exe-walk-dotdot-escape-rejected" 1 "$walk/../walk/ok/bin/tool"
 walk_check "exe-walk-wrong-owner-rejected" 1 "$walk/ok/bin/tool" "$(($(id -u) + 1))"
 # 実行全体: 祖先が group 書き込み可の setpriv は起動前に exit 2 で拒否し、降格コマンドも supervisor も起動しない。
+# 英語以外のロケールでも / と安全な経路が拒否されない（種別を翻訳される %F でなく生のモードで判定する。#2127 の指摘）。
+# ja ロケールの stat を模すスタブを PATH の先頭に置く（種別名を日本語に翻訳して返す。%F を使う実装だと全要素が拒否される）。
+mkdir -p "$work/jastat"
+{
+  printf '#!%s\n' "$bash_bin"
+  cat <<'STUB'
+out="$(/usr/bin/stat "$@")" || exit $?
+printf '%s\n' "$out" | sed 's/regular empty file/通常の空ファイル/; s/regular file/通常ファイル/; s/symbolic link/シンボリックリンク/; s/directory/ディレクトリ/'
+STUB
+} >"$work/jastat/stat"
+chmod +x "$work/jastat/stat"
+walk_check_ja() { # <名前> <期待 rc> <パス>
+  local name="$1" want="$2" path="$3" r=0
+  (
+    eval "$walk_defs"
+    PATH="$work/jastat:$PATH" FANDHE_CONCURRENT_MEMORY_SELFTEST=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_WALK=1 \
+      FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_OWNER_UID="$(id -u)" FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_WALK_BASE="$walk" \
+      root_exe_is_safe "$path"
+  ) || r=$?
+  [ "$r" = 0 ] || r=1
+  expect_eq "$name" "$want" "$r"
+}
+walk_check_ja "exe-walk-ja-locale-safe-chain-accepted" 0 "$walk/ok/bin/tool"
+walk_check_ja "exe-walk-ja-locale-symlink-accepted" 0 "$walk/lk/dirlink/tool"
+walk_check_ja "exe-walk-ja-locale-group-writable-ancestor-rejected" 1 "$walk/gw/bin/tool"
+# 本物の / も英語以外のロケールで受理される（root 所有の環境のときだけ。root_dir_ok は起点の / を検査する）。
+if [ "$(stat -c %u /)" = 0 ] && [ -n "$(find / -maxdepth 0 ! -perm /022 -print 2>/dev/null)" ]; then
+  r=0
+  (
+    eval "$walk_defs"
+    PATH="$work/jastat:$PATH" root_dir_ok / 0
+  ) || r=$?
+  expect_eq "exe-walk-ja-locale-real-root-accepted" 0 "$r"
+fi
 cp -- "$work/setpriv" "$walk/gw/bin/setpriv"; chmod 755 "$walk/gw/bin/setpriv"
 : >"$STUB_PIDFILE"
 FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_WALK=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_OWNER_UID="$(id -u)" \

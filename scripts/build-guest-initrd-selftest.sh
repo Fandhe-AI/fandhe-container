@@ -175,6 +175,20 @@ check "3 exit code" 2 "$rc"
 check "3 error code" output-exists "$(errcode)"
 check "3 existing content kept" KEEP-ME "$(cat "$out/initrd.cpio.gz")"
 
+# 3b: 確定先がディレクトリ・ディレクトリへの symlink でも拒否し、出力先の外へ書かない
+newout
+mkdir "$out" "$out/initrd.cpio.gz"
+run "$target" --init "$good" --output-dir "$out"
+check "3b dir exit code" 2 "$rc"
+check "3b dir entries inside" 0 "$(find "$out/initrd.cpio.gz" -mindepth 1 | wc -l | tr -d ' ')"
+newout
+mkdir "$out" "$sb/outside"
+ln -s "$sb/outside" "$out/initrd.cpio.gz"
+run "$target" --init "$good" --output-dir "$out"
+check "3b dir-symlink exit code" 2 "$rc"
+check "3b dir-symlink wrote nothing outside" 0 "$(find "$sb/outside" -mindepth 1 | wc -l | tr -d ' ')"
+rm -rf "$sb/outside"
+
 # --- 4: 他者のロック ---
 newout
 mkdir "$out.lock"

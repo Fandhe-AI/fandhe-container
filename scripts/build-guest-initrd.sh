@@ -500,8 +500,31 @@ fi
 for pair in "build-info.txt:$tmp_info" "$final_name:$tmp_initrd"; do
     dest="${pair%%:*}"
     tmp="${pair#*:}"
-    if ! ln -- "$tmp" "$output_dir/$dest" 2>/dev/null; then
+    # 確定先がディレクトリ・ディレクトリへの symlink・ダングリング symlink なら ln はその配下に
+    # リンクを作って成功しうるため、事前に -e / -L で拒否し、GNU ln の -T（確定先をディレクトリ
+    # として解釈しない）が使えれば付ける。BSD / macOS には -T が無いため、リンク後に確定先が
+    # 一時ファイルと同一 inode の通常ファイルであることを検証し、違えば配下に出来た名前を消して失敗にする。
+    if [ -e "$output_dir/$dest" ] || [ -L "$output_dir/$dest" ]; then
+        err output-exists "cannot publish $dest: it already exists; refusing to overwrite"
+        exit 2
+    fi
+    if ln -T -- "$tmp" "$tmp.probe" 2>/dev/null; then
+        rm -f -- "$tmp.probe"
+        ln_notarget="-T"
+    else
+        ln_notarget=""
+    fi
+    # shellcheck disable=SC2086
+    if ! ln $ln_notarget -- "$tmp" "$output_dir/$dest" 2>/dev/null; then
         err output-exists "cannot publish $dest: it already exists or the link failed; refusing to overwrite"
+        exit 2
+    fi
+    if [ -L "$output_dir/$dest" ] || [ ! -f "$output_dir/$dest" ] || [ ! "$output_dir/$dest" -ef "$tmp" ]; then
+        # 競合でディレクトリ等が確定先に現れた。配下に出来た名前だけを除いて失敗にする。
+        if [ -d "$output_dir/$dest" ]; then
+            rm -f -- "$output_dir/$dest/${tmp##*/}" 2>/dev/null || true
+        fi
+        err output-exists "cannot publish $dest: the destination is not a regular file; refusing"
         exit 2
     fi
     published="$published $dest"

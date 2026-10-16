@@ -953,6 +953,31 @@ jobs:
           echo "inject_files: content, read-only and rollback verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::inject_files verified"
 
+      # lo_self_delivery（`crates/net/tests/lo_self_delivery.rs`。NET-2・NET-11・TASK-140 追補・#2077）:
+      # 非特権の user + network namespace（`unshare -rn`）で、`lo` が down のときの自己宛て UDP の受信期限切れ
+      # （#1927 の場面）と up 後の配送を照合する実機前提テスト（harness = false）。上で緩和した sysctl を使い回し、
+      # 新しい check-run・sudo・permissions は追加しない（rootless 経路のみ。rootful 経路は未検証で #319 が担う）。
+      # `--ignored` が届かなくても exit 0 になるため成功行を行単位で完全一致 grep する。
+      - name: lo_self_delivery のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-net --test lo_self_delivery --no-run
+
+      - name: lo_self_delivery の実行（実機前提テスト・--ignored。NET-2・NET-11・#2077）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/lo_self_delivery.log"
+          cargo test -p fandhe-container-net --test lo_self_delivery -- --ignored 2>&1 | tee "${log}"
+          line='lo_self_delivery: lo down timed out and lo up delivered (root=false)'
+          if ! grep -Fxq "${line}" "${log}"; then
+            echo "::error::lo_self_delivery did not report verification (possibly not executed)" >&2
+            exit 1
+          fi
+          echo "${line}" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::lo_self_delivery verified"
+
   # --------------------------------------------------
   # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）
   # --------------------------------------------------

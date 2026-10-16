@@ -80,6 +80,21 @@ if ! jq -e --argjson m "${manual_json}" \
   exit 2
 fi
 
+# 各 metric の値と単位の検査（基準値の有無に関わらず行う）: value は有限の正の数（文字列・0・負数・欠落は不可）、
+# unit は metrics.json に登録された単位（ms）と一致すること。metric 名だけの検査では {} も通ってしまうため。
+if ! jq -e --slurpfile reg "${BENCH_METRICS}" \
+  '(.metrics | to_entries | length > 0)
+   and (.metrics | to_entries | all(
+     (.value | type) == "object"
+     and ((.value.value | type) == "number")
+     and (.value.value > 0 and .value.value < 1.7976931348623157e308)
+     and ((.value.unit | type) == "string")
+     and (.value.unit == ($reg[0].metrics[.key].unit // null))
+   ))' "${BENCH_RESULTS}" >/dev/null 2>&1; then
+  err "every metric in results must have a finite positive numeric value and a unit equal to the registered one in ${BENCH_METRICS}"
+  exit 2
+fi
+
 if [ ! -e "${BENCH_MANUAL_BASELINE}" ] && [ ! -L "${BENCH_MANUAL_BASELINE}" ]; then
   echo "skip: bench-check-manual: ${BENCH_MANUAL_BASELINE} is not registered yet (TASK-88.h1 #230); results validated but not compared"
   exit 0

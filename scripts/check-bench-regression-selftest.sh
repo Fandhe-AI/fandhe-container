@@ -306,6 +306,14 @@ run_manual_case "manual-no-baseline-leftover" "${mk_dir}/leftover.json" "${mk_di
 printf '{"schema_version": 1, "metrics": {%s: {"value": 100, "unit": "ms"}, %s: {"value": 1, "unit": "ops/s"}}}\n' "${sl}" "${ph}" >"${mk_dir}/mixed.json"
 run_manual_case "manual-result-with-ci-metric" "${mk_dir}/mixed.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2
 
+# metric の値・単位の不正は基準値の有無に関わらず 2（既定経路で exit 0 にしない）
+for bad in '{}' '{"value": "100", "unit": "ms"}' '{"value": 0, "unit": "ms"}' '{"value": -5, "unit": "ms"}' \
+  '{"unit": "ms"}' '{"value": 100}' '{"value": 100, "unit": "s"}' 'null'; do
+  printf '{"schema_version": 1, "metrics": {%s: %s}}\n' "${sl}" "${bad}" >"${mk_dir}/bad.json"
+  run_manual_case "manual-no-baseline-invalid-metric ${bad}" "${mk_dir}/bad.json" "${mk_dir}/none.json" "${mk_dir}/metrics.json" 2
+  run_manual_case "manual-with-baseline-invalid-metric ${bad}" "${mk_dir}/bad.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2
+done
+
 write_manual_results "${mk_dir}/r115.json" 115
 run_manual_case "manual-exactly-15-percent-worse" "${mk_dir}/r115.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 0
 write_manual_results "${mk_dir}/r116.json" 116

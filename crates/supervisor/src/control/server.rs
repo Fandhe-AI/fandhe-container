@@ -12,6 +12,8 @@
 //! - 読み取りは絶対期限（[`ServeConfig::read_deadline`]）、返信待ちは送信期限 + 猶予、書き込みは
 //!   [`ServeConfig::write_timeout`] で打ち切る（REPAIR-5）。
 //! - 拒否は固定語彙の構造化ログ（理由名のみ。入力値・uid・パス・errno は出さない）。応答は理由コードだけ。
+//!   認証境界の拒否（別 uid・資格情報の取得失敗）は [`ControlObserver`] 経由で SEC-4 の `AuditSink` にも記録する。
+//! - 各要求の成功・失敗とレイテンシは [`ControlObserver`] が集計して構造化ログに出す（REPAIR-4）。
 //!
 //! サーバスレッドは停止可能（`accept` の non-blocking ポーリング）。restart の再 launch の再構成（#2043）で
 //! スレッドを止める必要が出たときの口である。
@@ -25,7 +27,10 @@ use std::sync::mpsc::{RecvTimeoutError, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use fandhe_container_core::audit_log::ControlPeerRejection;
+
 use super::log_control_event;
+use super::observe::ControlObserver;
 use super::protocol::{
     ControlReason, FrameHeader, HEADER_LEN, ResponseFrame, SIGNAL_REQUEST_PAYLOAD_LEN,
     SignalRequestFrame, encode_hello,
@@ -101,45 +106,58 @@ pub(super) fn read_exact_until(
     Ok(())
 }
 
-fn respond(stream: &mut UnixStream, reason: ControlReason) {
+fn respond(stream: &mut UnixStream, reason: ControlReason) -> ControlReason {
     if reason != ControlReason::Ok {
         log_control_event("control_request_rejected", Some(reason.name()));
     }
     // 書き込めなくても（相手が閉じた・期限）処理は止めない。
     let _ = stream.write_all(&ResponseFrame { reason }.encode());
+    reason
 }
 
 /// 1 接続を処理する（1 要求 1 応答で閉じる）。
 ///
 /// 接続元の検証（`peer`）は呼び出し元（accept ループ）が `SO_PEERCRED` から作った値を渡す。別 uid 相当を
-/// 試験から注入できるよう、資格情報は引数で受ける。
+/// 試験から注入できるよう、資格情報は引数で受ける。別 uid は何も書かずに切断し、`observer` 経由で監査へ記録する。
+/// 検証を通した接続は、結果とレイテンシを `observer` に集計する。
 pub fn serve_connection(
-    mut stream: UnixStream,
+    stream: UnixStream,
     peer: PeerCred,
     expected_uid: u32,
     slot: &SignalSlot,
     config: &ServeConfig,
+    observer: &ControlObserver,
 ) {
     if !peer_allowed(peer.uid, expected_uid) {
-        // 何も書かずに切断する（uid の値はログにも出さない）。
-        log_control_event("control_peer_rejected", None);
+        // 何も書かずに切断する（uid の値はログにも監査にも出さない）。
+        observer.record_peer_rejection(ControlPeerRejection::PeerUidMismatch);
         return;
     }
+    let started = Instant::now();
+    let reason = handle_request(stream, slot, config);
+    observer.record_request(reason == ControlReason::Ok, started.elapsed());
+}
+
+/// 検証済みの接続の 1 要求を処理し、最終的な理由を返す（`Ok` が成功。応答を書けなかった場合も処理結果を返す）。
+fn handle_request(
+    mut stream: UnixStream,
+    slot: &SignalSlot,
+    config: &ServeConfig,
+) -> ControlReason {
     if stream
         .set_write_timeout(Some(config.write_timeout))
         .is_err()
     {
-        return;
+        return ControlReason::Internal;
     }
     if stream.write_all(&encode_hello()).is_err() {
-        return;
+        return ControlReason::Internal;
     }
     let read_deadline = Instant::now() + config.read_deadline;
 
     let mut header = [0u8; HEADER_LEN];
-    match read_exact_until(&mut stream, &mut header, read_deadline) {
-        Ok(()) => {}
-        Err(_) => return respond(&mut stream, ControlReason::Malformed),
+    if read_exact_until(&mut stream, &mut header, read_deadline).is_err() {
+        return respond(&mut stream, ControlReason::Malformed);
     }
     let parsed = FrameHeader::decode(&header).and_then(|h| h.expect_signal_request().map(|()| h));
     if let Err(reason) = parsed {
@@ -155,7 +173,9 @@ pub fn serve_connection(
     };
 
     // 送信期限はクライアントが載せた絶対期限（CLOCK_MONOTONIC）。受信までの遅れの分だけ残りが縮むので、
-    // サーバ側の遅延でクライアントの期限より後ろへずれない（REPAIR-5）。
+    // サーバ側の遅延でクライアントの期限より後ろへずれない（REPAIR-5）。`Instant` を先に取ってから単調時計を
+    // 読む順序にして、2 回の読み取りの間にスレッドが止まっても期限が延びず早まる側にずれるようにする。
+    let base = Instant::now();
     let Ok(now_ns) = crate::sys::monotonic_now_ns() else {
         return respond(&mut stream, ControlReason::Internal);
     };
@@ -163,12 +183,12 @@ pub fn serve_connection(
         Ok(r) => r,
         Err(reason) => return respond(&mut stream, reason),
     };
-    let deadline = Instant::now() + remaining;
+    let deadline = base + remaining;
     let reason = match slot.submit(request.pid, request.signal, deadline) {
         Ok(rx) => wait_reply(&rx, deadline, config.reply_grace),
         Err(reason) => reason,
     };
-    respond(&mut stream, reason);
+    respond(&mut stream, reason)
 }
 
 /// accept ループのスレッドとその停止の口。`Drop` で停止を要求して期限つきで join する。
@@ -188,6 +208,7 @@ impl ControlServer {
         slot: SignalSlot,
         expected_uid: u32,
         config: ServeConfig,
+        observer: Arc<ControlObserver>,
     ) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -196,7 +217,14 @@ impl ControlServer {
         let handle = std::thread::Builder::new()
             .name("control-channel".to_owned())
             .spawn(move || {
-                accept_loop(&listener, &slot, expected_uid, &config, &thread_stop);
+                accept_loop(
+                    &listener,
+                    &slot,
+                    expected_uid,
+                    &config,
+                    &thread_stop,
+                    &observer,
+                );
                 let _ = done_tx.send(());
             })?;
         Ok(Self {
@@ -237,6 +265,7 @@ fn accept_loop(
     expected_uid: u32,
     config: &ServeConfig,
     stop: &AtomicBool,
+    observer: &ControlObserver,
 ) {
     while !stop.load(Ordering::SeqCst) {
         match listener.accept() {
@@ -246,7 +275,8 @@ fn accept_loop(
                 }
                 let Ok(cred) = crate::sys::peer_credentials(stream.as_fd()) else {
                     // 資格情報を確かめられない接続は受け付けない。
-                    log_control_event("control_peer_rejected", None);
+                    observer
+                        .record_peer_rejection(ControlPeerRejection::PeerCredentialsUnavailable);
                     continue;
                 };
                 let peer = PeerCred {
@@ -254,7 +284,7 @@ fn accept_loop(
                     uid: cred.uid,
                     gid: cred.gid,
                 };
-                serve_connection(stream, peer, expected_uid, slot, config);
+                serve_connection(stream, peer, expected_uid, slot, config, observer);
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 std::thread::sleep(config.poll_interval);

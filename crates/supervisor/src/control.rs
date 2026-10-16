@@ -33,7 +33,8 @@
 //!   （停止の口は `ControlServer::shutdown` に用意済み）
 //! - 異常終了で残った `supervisor.sock` のために、core の `delete` が `<id>/` を残す件（core 側で掃除対象に加えるかは
 //!   別 issue で判断する）
-//! - 別 uid からの接続の拒否を SEC-4 の監査の記録先へ記録すること（今は構造化ログだけ）
+//! - `start` の OK 報告は制御チャネルの作成より前に送信済みのため、作成に失敗した場合は報告を取り消せない。
+//!   停止を要求し、supervisor の終了コードを非 0 にして `Stopped` を記録する（報告の順序の再構成は別 issue）
 
 pub mod client;
 pub mod protocol;
@@ -41,6 +42,8 @@ pub mod target;
 
 #[cfg(target_os = "linux")]
 pub mod listener;
+#[cfg(target_os = "linux")]
+pub mod observe;
 #[cfg(target_os = "linux")]
 pub mod server;
 
@@ -65,10 +68,12 @@ mod install {
     use std::path::Path;
     use std::sync::Arc;
 
-    use fandhe_container_core::traits::ContainerId;
+    use fandhe_container_core::audit_log::AuditSink;
+    use fandhe_container_core::oci_runtime::exit_code_for;
+    use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
     use super::listener::{ControlListener, effective_uid};
-    use super::log_control_event;
+    use super::observe::ControlObserver;
     use super::server::{ControlServer, ServeConfig};
     use super::target::{ControlledProcess, ControlledRelauncher, SignalSlot};
     use crate::run::StopToken;
@@ -77,38 +82,68 @@ mod install {
     /// 制御チャネルの後始末（`Drop` でサーバスレッドを止め、その後にソケットを消す）。
     ///
     /// フィールドの宣言順がそのまま drop 順で、サーバを先に止めてから listener の `Drop` が最終名を消す。
+    /// 作成に失敗していたら [`Self::failure`] が構造化エラーを返す。
     #[must_use = "dropping the handle stops the control channel"]
     pub struct ControlHandle {
         _server: Option<ControlServer>,
         _listener: Option<ControlListener>,
+        failure: Option<TraitError>,
+    }
+
+    impl ControlHandle {
+        /// 作成の失敗（機械可読な code と message。入力値を含まない）。成功なら `None`。
+        pub fn failure(&self) -> Option<&TraitError> {
+            self.failure.as_ref()
+        }
+
+        /// `run_supervised` の終了コードへ作成の失敗を反映する（失敗していて `code` が 0 なら非 0 にする）。
+        ///
+        /// 失敗時は停止を要求済みで、回収に成功すると `run_supervised` は 0 を返す。それを正常終了として
+        /// 報告しない（SUP-1・REPAIR-4）。
+        pub fn exit_code(&self, code: u8) -> u8 {
+            match (&self.failure, code) {
+                (Some(e), 0) => exit_code_for(e.code()).get(),
+                _ => code,
+            }
+        }
+    }
+
+    fn failed_handle(error: TraitError) -> ControlHandle {
+        // 機械可読な固定語彙の 1 行（code は列挙名。message は固定文言）。
+        let line = format!(
+            "{{\"component\":\"supervisor\",\"event\":\"control_channel_failed\",\"code\":\"{:?}\",\"message\":\"{}\"}}\n",
+            error.code(),
+            error.message()
+        );
+        let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
+        ControlHandle {
+            _server: None,
+            _listener: None,
+            failure: Some(error),
+        }
     }
 
     /// `running` の起動ハンドルと relauncher を制御チャネルに結線し、サーバを起動する。
     ///
-    /// bind・サーバスレッドの生成に失敗したら、構造化ログ（`control_channel_failed`）を出して `stop` に停止を
-    /// 要求する（停止できないコンテナを残さない。fail-closed）。呼び出し元は `run_supervised` の前に呼び、
-    /// 返った [`ControlHandle`] を `run_supervised` が返るまで保持する。
+    /// bind・サーバスレッドの生成に失敗したら、構造化エラーを [`ControlHandle::failure`] に載せ、`stop` に
+    /// 停止を要求する（停止できないコンテナを残さない。fail-closed）。呼び出し元は `run_supervised` の前に呼び、
+    /// 返った [`ControlHandle`] を `run_supervised` が返るまで保持し、終了コードを [`ControlHandle::exit_code`]
+    /// に通す。`audit` は認証境界の拒否（別 uid 等）の記録先（SEC-4）。
     pub fn install(
         state_root: &Path,
         id: &ContainerId,
         running: Running,
         stop: &StopToken,
+        audit: Option<Arc<dyn AuditSink>>,
     ) -> (Running, ControlHandle) {
-        let fail = |stop: &StopToken| {
-            log_control_event("control_channel_failed", None);
-            stop.request_stop();
-        };
         let bound = effective_uid()
             .and_then(|uid| ControlListener::bind_as(state_root, id, uid).map(|l| (uid, l)));
-        let Ok((uid, listener)) = bound else {
-            fail(stop);
-            return (
-                running,
-                ControlHandle {
-                    _server: None,
-                    _listener: None,
-                },
-            );
+        let (uid, listener) = match bound {
+            Ok(v) => v,
+            Err(e) => {
+                stop.request_stop();
+                return (running, failed_handle(e));
+            }
         };
         let slot = SignalSlot::new();
         let Running {
@@ -123,22 +158,28 @@ mod install {
             instance,
             logs,
         };
+        let observer = Arc::new(ControlObserver::new(audit, Some(id.clone())));
         let server = listener
             .try_clone_listener()
-            .and_then(|l| ControlServer::spawn(l, slot, uid, ServeConfig::default()));
-        let server = match server {
-            Ok(s) => Some(s),
+            .and_then(|l| ControlServer::spawn(l, slot, uid, ServeConfig::default(), observer));
+        match server {
+            Ok(s) => (
+                running,
+                ControlHandle {
+                    _server: Some(s),
+                    _listener: Some(listener),
+                    failure: None,
+                },
+            ),
             Err(_) => {
-                fail(stop);
-                None
+                stop.request_stop();
+                let mut handle = failed_handle(TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to start the control channel server",
+                ));
+                handle._listener = Some(listener);
+                (running, handle)
             }
-        };
-        (
-            running,
-            ControlHandle {
-                _server: server,
-                _listener: Some(listener),
-            },
-        )
+        }
     }
 }

@@ -6,6 +6,8 @@
 
 #![cfg(target_os = "linux")]
 
+use fandhe_container_core::audit_log::{AuditLayer, AuditRecord, AuditSink};
+use fandhe_container_core::observability::OpName;
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
 use std::os::unix::fs::PermissionsExt as _;
@@ -20,6 +22,7 @@ use fandhe_container_core::traits::{ContainerId, ErrorCode, Signal, TraitError};
 use fandhe_container_supervisor::control::listener::{
     CONTROL_SOCKET_NAME, ControlListener, effective_uid,
 };
+use fandhe_container_supervisor::control::observe::ControlObserver;
 use fandhe_container_supervisor::control::protocol::{
     ControlReason, HEADER_LEN, RESPONSE_LEN, ResponseFrame,
 };
@@ -143,6 +146,7 @@ impl Rig {
             slot.clone(),
             effective_uid().unwrap(),
             config,
+            Arc::new(ControlObserver::new(None, None)),
         )
         .unwrap();
         Self {
@@ -259,7 +263,14 @@ fn sec1_peer_with_other_uid_is_disconnected_without_a_byte() {
             uid: euid.wrapping_add(1),
             gid: 0,
         };
-        serve_connection(server_side, peer, euid, &slot, &ServeConfig::default());
+        serve_connection(
+            server_side,
+            peer,
+            euid,
+            &slot,
+            &ServeConfig::default(),
+            &ControlObserver::new(None, None),
+        );
     });
     client
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -267,6 +278,72 @@ fn sec1_peer_with_other_uid_is_disconnected_without_a_byte() {
     let mut buf = [0u8; 16];
     assert_eq!(client.read(&mut buf).unwrap(), 0, "expected EOF");
     handle.join().unwrap();
+}
+
+/// 受け取ったレコードを溜める監査 sink（試験用）。
+struct CollectSink(Mutex<Vec<AuditRecord>>);
+
+impl AuditSink for CollectSink {
+    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+        self.0.lock().unwrap().push(record.clone());
+        Ok(())
+    }
+}
+
+/// SEC-4・SEC-1: 別 uid の接続拒否は監査の記録先に 1 件記録される（layer = control_channel・理由トークンのみ）。
+#[test]
+fn sec4_peer_uid_mismatch_is_recorded_to_the_audit_sink() {
+    let euid = effective_uid().unwrap();
+    let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+    let observer = ControlObserver::new(
+        Some(Arc::clone(&sink) as Arc<dyn AuditSink>),
+        Some(ContainerId::new("audited").unwrap()),
+    );
+    let (_client, server_side) = UnixStream::pair().unwrap();
+    serve_connection(
+        server_side,
+        PeerCred {
+            pid: 1,
+            uid: euid.wrapping_add(1),
+            gid: 0,
+        },
+        euid,
+        &SignalSlot::new(),
+        &ServeConfig::default(),
+        &observer,
+    );
+    let recs = sink.0.lock().unwrap();
+    assert_eq!(recs.len(), 1);
+    let rec = recs.first().unwrap();
+    assert_eq!(rec.layer(), AuditLayer::ControlChannel);
+    assert_eq!(rec.reason().unwrap().as_str(), "control_peer_uid_mismatch");
+    assert_eq!(rec.container_id().unwrap().as_str(), "audited");
+}
+
+/// REPAIR-4: 要求の成功・失敗件数とレイテンシが `OpRecorder` に集計される。
+#[test]
+fn repair4_requests_are_counted_with_latency() {
+    let euid = effective_uid().unwrap();
+    let observer = ControlObserver::new(None, None);
+    // 不正な要求（EOF）は失敗として数える。
+    let (client, server_side) = UnixStream::pair().unwrap();
+    drop(client);
+    serve_connection(
+        server_side,
+        PeerCred {
+            pid: 1,
+            uid: euid,
+            gid: 0,
+        },
+        euid,
+        &SignalSlot::new(),
+        &ServeConfig::default(),
+        &observer,
+    );
+    let name = OpName::new("control_signal").unwrap();
+    let stats = observer.recorder().snapshot_op(&name).expect("recorded");
+    assert_eq!((stats.success(), stats.failure()), (0, 1));
+    assert!(stats.latency().is_some());
 }
 
 /// REPAIR-2・SEC-1: 長すぎる要求（payload_len = 4096）は payload を読まずに TooLarge で拒否する。
@@ -374,7 +451,7 @@ fn sup1_sec1_install_wires_process_and_cleans_up() {
         exited: Arc::new(AtomicBool::new(false)),
     };
     let stop = StopToken::new();
-    let (running, handle) = install(&root.0, &id, running_with(fake), &stop);
+    let (running, handle) = install(&root.0, &id, running_with(fake), &stop, None);
     assert!(!stop.is_stop_requested());
     let process = running.process;
     let done = Arc::new(AtomicBool::new(false));
@@ -414,8 +491,13 @@ fn sec1_install_failure_requests_stop_fail_closed() {
         exited: Arc::new(AtomicBool::new(false)),
     };
     let stop = StopToken::new();
-    let (_running, _handle) = install(&root.0, &id, running_with(fake), &stop);
+    let (_running, handle) = install(&root.0, &id, running_with(fake), &stop, None);
     assert!(stop.is_stop_requested());
+    // SUP-1・REPAIR-4: 失敗は構造化エラーで返り、回収後の終了コード 0 を非 0 へ上書きする。
+    let failure = handle.failure().expect("install must report the failure");
+    assert_eq!(failure.code(), ErrorCode::FailedPrecondition);
+    assert_ne!(handle.exit_code(0), 0);
+    assert_eq!(handle.exit_code(7), 7);
     assert!(std::fs::symlink_metadata(dir.join(CONTROL_SOCKET_NAME)).is_err());
 }
 

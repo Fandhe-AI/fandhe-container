@@ -357,6 +357,8 @@ pub enum AuditLayer {
     ExecTarget,
     /// エントリポイント検証の拒否（launch と exec の子で共有。SEC-4・SUP-6・TASK-163 追補・#1595）。
     Entrypoint,
+    /// supervisor の制御チャネルの接続元の拒否（別 uid・資格情報を確かめられない接続。SEC-4・SEC-1・SUP-1・#2058）。
+    ControlChannel,
 }
 
 impl AuditLayer {
@@ -369,6 +371,7 @@ impl AuditLayer {
             AuditLayer::PluginTrust => "plugin_trust",
             AuditLayer::ExecTarget => "exec_target",
             AuditLayer::Entrypoint => "entrypoint",
+            AuditLayer::ControlChannel => "control_channel",
         }
     }
 }
@@ -439,6 +442,41 @@ pub enum AuditEvent {
         /// 拒否理由トークン（`entrypoint_*` 等の静的トークン。[`AuditReason`] 参照）。
         reason: AuditReason,
     },
+    /// supervisor の制御チャネルが接続元を拒否した記録（SEC-4・SEC-1・SUP-1・#2058）。
+    ///
+    /// 理由トークンだけを持ち、パス・接続元の uid・pid は持たない（型で保証する。REPAIR-2）。
+    /// 構築は [`ControlPeerRejection::audit_event`] で行う。
+    ControlPeer {
+        /// 拒否理由トークン（[`ControlPeerRejection::as_str`]）。
+        reason: AuditReason,
+    },
+}
+
+/// 制御チャネルが接続元を拒否した理由（SEC-4・SEC-1・SUP-1・#2058）。固定語彙で、入力値を載せない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ControlPeerRejection {
+    /// 接続元の uid が supervisor の実効 uid と違う。
+    PeerUidMismatch,
+    /// `SO_PEERCRED` で接続元の資格情報を取れなかった。
+    PeerCredentialsUnavailable,
+}
+
+impl ControlPeerRejection {
+    /// 監査レコードに入る静的トークン。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerUidMismatch => "control_peer_uid_mismatch",
+            Self::PeerCredentialsUnavailable => "control_peer_credentials_unavailable",
+        }
+    }
+
+    /// 対応する監査イベントを返す。
+    pub fn audit_event(self) -> AuditEvent {
+        AuditEvent::ControlPeer {
+            reason: AuditReason::new(self.as_str()),
+        }
+    }
 }
 
 impl AuditEvent {
@@ -451,6 +489,7 @@ impl AuditEvent {
             AuditEvent::PluginTrust { .. } => AuditLayer::PluginTrust,
             AuditEvent::ExecTarget { .. } => AuditLayer::ExecTarget,
             AuditEvent::Entrypoint { .. } => AuditLayer::Entrypoint,
+            AuditEvent::ControlPeer { .. } => AuditLayer::ControlChannel,
         }
     }
 }
@@ -539,7 +578,8 @@ impl AuditRecord {
             AuditEvent::Mount { .. }
             | AuditEvent::PluginTrust { .. }
             | AuditEvent::ExecTarget { .. }
-            | AuditEvent::Entrypoint { .. } => None,
+            | AuditEvent::Entrypoint { .. }
+            | AuditEvent::ControlPeer { .. } => None,
         }
     }
 
@@ -556,7 +596,8 @@ impl AuditRecord {
         match &self.event {
             AuditEvent::Seccomp { .. }
             | AuditEvent::ExecTarget { .. }
-            | AuditEvent::Entrypoint { .. } => None,
+            | AuditEvent::Entrypoint { .. }
+            | AuditEvent::ControlPeer { .. } => None,
             AuditEvent::Landlock { path, .. } => Some(path.as_path()),
             AuditEvent::Mount { path, .. } => path.as_ref().map(AuditPath::as_path),
             AuditEvent::PluginTrust { path, .. } => Some(path.as_path()),
@@ -570,7 +611,8 @@ impl AuditRecord {
             AuditEvent::Mount { reason, .. } => *reason,
             AuditEvent::PluginTrust { reason, .. }
             | AuditEvent::ExecTarget { reason }
-            | AuditEvent::Entrypoint { reason } => Some(*reason),
+            | AuditEvent::Entrypoint { reason }
+            | AuditEvent::ControlPeer { reason } => Some(*reason),
             _ => None,
         }
     }
@@ -697,6 +739,17 @@ mod tests {
         assert_eq!(AuditLayer::Mount.as_str(), "mount");
         assert_eq!(AuditLayer::ExecTarget.as_str(), "exec_target");
         assert_eq!(AuditLayer::Entrypoint.as_str(), "entrypoint");
+        assert_eq!(AuditLayer::ControlChannel.as_str(), "control_channel");
+        assert_eq!(
+            ControlPeerRejection::PeerUidMismatch.as_str(),
+            "control_peer_uid_mismatch"
+        );
+        assert_eq!(
+            ControlPeerRejection::PeerCredentialsUnavailable
+                .audit_event()
+                .layer(),
+            AuditLayer::ControlChannel
+        );
     }
 
     /// SEC-4・SUP-6・TASK-163 追補・#1595: entrypoint レコードは理由だけを持ち、パス・syscall は持たない。

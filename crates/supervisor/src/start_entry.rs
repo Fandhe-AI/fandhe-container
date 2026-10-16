@@ -2002,8 +2002,16 @@ mod linux {
         // 報告の後に作るのでスレッドの制約に触れない。作成に失敗したら install が停止を要求し、既存の停止経路が
         // コンテナを終了させて Stopped を記録する（停止できないコンテナを残さない）。
         let stop = StopToken::new();
-        let (running, control) = crate::control::install(&args.root, &args.id, running, &stop);
+        // 認証境界の拒否の記録先（SEC-4）。開けなければ構造化ログのみになる（fail-closed の判定は変えない）。
+        let audit: Option<Arc<dyn fandhe_container_core::audit_log::AuditSink>> =
+            crate::exec::default_audit_sink(Some(args.root.clone()))
+                .ok()
+                .map(|s| Arc::new(s) as _);
+        let (running, control) =
+            crate::control::install(&args.root, &args.id, running, &stop, audit);
         let code = run_supervised(store, args.id, running, args.restart, &timeouts, &stop);
+        // 制御チャネルの作成に失敗していたら、回収に成功しても非 0 で終える（SUP-1）。
+        let code = control.exit_code(code);
         // サーバスレッドを止めてからソケットを消す（RAII）。
         drop(control);
         ExitCode::from(code)

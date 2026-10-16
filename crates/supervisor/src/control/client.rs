@@ -206,6 +206,9 @@ mod linux {
             .map_err(|r| r.to_error().unwrap_or_else(unavailable))?;
 
         // 余裕を引いた絶対期限（CLOCK_MONOTONIC）をサーバへ渡す。サーバの受信が遅れても期限は延びない。
+        // 単調時計を `Instant` より先に読む。2 回の読み取りの間にスレッドが止まっても、載せる絶対期限は
+        // 早まる側にずれ、クライアントが Timeout を返した後に送信されうる期限にならない（REPAIR-5）。
+        let now_ns = crate::sys::monotonic_now_ns().map_err(|_| unavailable())?;
         let send_budget = deadline
             .saturating_duration_since(Instant::now())
             .saturating_sub(DEADLINE_MARGIN)
@@ -213,7 +216,6 @@ mod linux {
         if send_budget.is_zero() {
             return Err(timeout());
         }
-        let now_ns = crate::sys::monotonic_now_ns().map_err(|_| unavailable())?;
         let abs_ns = u64::try_from(send_budget.as_nanos())
             .ok()
             .and_then(|n| now_ns.checked_add(n))

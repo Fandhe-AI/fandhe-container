@@ -241,7 +241,8 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
     let path = match record.event() {
         AuditEvent::Seccomp { .. }
         | AuditEvent::ExecTarget { .. }
-        | AuditEvent::Entrypoint { .. } => None,
+        | AuditEvent::Entrypoint { .. }
+        | AuditEvent::ControlPeer { .. } => None,
         AuditEvent::Landlock { path, .. } => Some(path),
         AuditEvent::Mount { path, .. } => path.as_ref(),
         AuditEvent::PluginTrust { path, .. } => Some(path),

@@ -9,11 +9,17 @@ use fandhe_container_guest_init::directive::{
     MAX_GUEST_MOUNT_ELEMENT_BYTES, MAX_GUEST_MOUNT_POINT_BYTES, MAX_VIRTIOFS_SHARES,
     MAX_VIRTIOFS_TAG_BYTES, Tag, decode_all,
 };
+use fandhe_container_guest_init::probe::{
+    GUEST_MOUNT, ProbePlan, SHARE_TAG, TEST_KEY, TOKEN_VIRTIOFS_IO, TestMode, WRITE_LINE,
+    WRITE_LINES, decode_test_mode, run_virtiofs_io,
+};
 use fandhe_container_guest_init::report::{
-    Errno, InitStage, MAX_REPORT_LINE_BYTES, REPORT_PREFIX, ReportLine,
+    Errno, InitStage, MAX_PROBE_LINE_BYTES, MAX_REPORT_LINE_BYTES, PROBE_NAMESPACE, PROBE_PREFIX,
+    ProbeEntries, ProbeOp, ProbeValue, REPORT_PREFIX, ReportLine,
 };
 use fandhe_container_platform_macos::guest_mount as host;
 use fandhe_container_platform_macos::guest_mount::{GuestMountOutcome, parse_report_line};
+use fandhe_container_platform_macos::guest_probe as host_probe;
 use fandhe_container_platform_macos::virtiofs as host_virtiofs;
 
 #[test]
@@ -174,4 +180,198 @@ fn mac1_marker_and_diagnostics_are_not_reports_for_host() {
     let diag = ReportLine::init_error(InitStage::Cmdline, Errno::E2BIG);
     assert!(parse_report_line(diag.as_str().as_bytes()).is_none());
     assert!(parse_report_line(ReportLine::ready().as_str().as_bytes()).is_none());
+}
+
+// ---- virtiofs_io のプローブ契約（MAC-1・IO-5・#1876）----
+
+#[test]
+fn mac1_io5_probe_constants_match_host() {
+    assert_eq!(TEST_KEY, host::GUEST_TEST_KEY);
+    assert_eq!(TOKEN_VIRTIOFS_IO, host::GuestTestMode::VirtiofsIo.token());
+    assert_eq!(PROBE_NAMESPACE, host_probe::PROBE_NAMESPACE);
+    assert_eq!(PROBE_PREFIX, host_probe::PROBE_PREFIX);
+    assert_eq!(MAX_PROBE_LINE_BYTES, host_probe::MAX_PROBE_LINE_BYTES);
+    assert_eq!(SHARE_TAG, host_probe::SHARE_TAG);
+    assert_eq!(GUEST_MOUNT, host_probe::GUEST_MOUNT);
+    assert_eq!(WRITE_LINE, host_probe::WRITE_LINE);
+    assert_eq!(WRITE_LINES, host_probe::WRITE_LINES);
+    // ready マーカーと mount 報告は、プローブの名前空間に属さない。
+    assert!(!READY_MARKER.starts_with(host_probe::PROBE_NAMESPACE));
+}
+
+#[test]
+fn mac1_io5_every_probe_line_round_trips_through_host_parser() {
+    use host_probe::{ProbeItem, ProbeLine, parse_probe_line};
+    let p = |l: &ReportLine| parse_probe_line(l.as_str().as_bytes());
+    let v = ProbeValue::try_new("fandhe-read-abc").unwrap();
+    assert_eq!(
+        p(&ReportLine::probe_read(&v)),
+        ProbeLine::Item(ProbeItem::Read("fandhe-read-abc".into()))
+    );
+    let names = vec!["a-1".to_string(), "b-1".to_string()];
+    assert_eq!(
+        p(&ReportLine::probe_readdir(
+            &ProbeEntries::try_new(&names).unwrap()
+        )),
+        ProbeLine::Item(ProbeItem::Readdir("a-1,b-1".into()))
+    );
+    assert_eq!(
+        p(&ReportLine::probe_write_done()),
+        ProbeLine::Item(ProbeItem::Write)
+    );
+    for (op, name) in [
+        (ProbeOp::Read, "read"),
+        (ProbeOp::Readdir, "readdir"),
+        (ProbeOp::Write, "write"),
+    ] {
+        assert_eq!(
+            p(&ReportLine::probe_error(op)),
+            ProbeLine::Item(ProbeItem::OpError(name.into()))
+        );
+    }
+    assert_eq!(
+        p(&ReportLine::probe_done()),
+        ProbeLine::Item(ProbeItem::Done)
+    );
+    // 行全体がちょうど 256 バイトの値もホストが受理する（257 バイトはゲストが作れない）。
+    let head = PROBE_PREFIX.len() + "op=read value=".len();
+    let fit = "a".repeat(MAX_PROBE_LINE_BYTES - head);
+    let line = ReportLine::probe_read(&ProbeValue::try_new(&fit).unwrap());
+    assert_eq!(line.as_str().len(), 256);
+    assert_eq!(p(&line), ProbeLine::Item(ProbeItem::Read(fit)));
+    // プローブ行は mount 報告の走査に誤認されない。
+    assert!(parse_report_line(ReportLine::probe_done().as_str().as_bytes()).is_none());
+}
+
+struct Tmp(std::path::PathBuf);
+impl Tmp {
+    fn new(tag: &str) -> Self {
+        let p = std::env::temp_dir().join(format!(
+            "fandhe-guest-contract-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        Self(p)
+    }
+}
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// ゲストが出す順序（mount 報告 → ready → プローブ行）のログ全体を組み立てる。
+fn guest_log(plan: ProbePlan, root: &std::path::Path) -> String {
+    let tag = Tag::try_new(SHARE_TAG).unwrap();
+    let mut log = String::new();
+    for l in [ReportLine::ok(&tag), ReportLine::ready()] {
+        log.push_str(l.as_str());
+        log.push('\n');
+    }
+    run_virtiofs_io(plan, root, &mut |l| {
+        log.push_str(l.as_str());
+        log.push('\n');
+    });
+    log
+}
+
+#[test]
+fn mac1_io5_real_probe_output_is_accepted_by_host_log_parser() {
+    let t = Tmp::new("ok");
+    let root = &t.0;
+    std::fs::create_dir_all(root.join("in/dir")).unwrap();
+    std::fs::create_dir_all(root.join("out")).unwrap();
+    std::fs::write(root.join("in/read.txt"), "fandhe-read-1f\n").unwrap();
+    let expected: std::collections::BTreeSet<String> = ["a-1f", "b-1f", "c-1f"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for n in &expected {
+        std::fs::write(root.join("in/dir").join(n), "x").unwrap();
+    }
+    let log = guest_log(ProbePlan::Run, root);
+    let parsed = host_probe::parse_probe_log(&log);
+    assert_eq!(parsed.read.as_deref(), Some("fandhe-read-1f"));
+    assert!(parsed.write_done && parsed.done && !parsed.invalid);
+    assert!(parsed.errors.is_empty());
+    let reported = parsed.readdir.as_deref().unwrap();
+    assert_eq!(host_probe::compare_entries(&expected, reported), Ok(()));
+    // mount 報告は従来どおりホストの走査で読め、ready とプローブ行は報告として読まれない。
+    let reports: Vec<_> = log
+        .lines()
+        .filter_map(|l| parse_report_line(l.as_bytes()))
+        .collect();
+    assert_eq!(reports.len(), 1);
+    let report = reports[0].as_ref().unwrap();
+    assert_eq!(report.tag.as_str(), SHARE_TAG);
+    assert_eq!(report.outcome, GuestMountOutcome::Mounted);
+    // 書いた内容は、ホストが検証する期待内容と一致する。
+    let written = std::fs::read(root.join("out/write.txt")).unwrap();
+    assert_eq!(
+        written,
+        format!("{}\n", host_probe::WRITE_LINE)
+            .repeat(host_probe::WRITE_LINES)
+            .into_bytes()
+    );
+}
+
+#[test]
+fn mac1_io5_error_probe_output_is_accepted_by_host_log_parser() {
+    // 入力が何も無い共有（read / readdir が error）と、mount 不成立（全 op が error）。
+    let t = Tmp::new("err");
+    std::fs::create_dir_all(t.0.join("out")).unwrap();
+    let parsed = host_probe::parse_probe_log(guest_log(ProbePlan::Run, &t.0));
+    assert!(parsed.has_error("read") && parsed.has_error("readdir"));
+    assert!(parsed.write_done && parsed.done && !parsed.invalid);
+    let t = Tmp::new("missing");
+    std::fs::create_dir_all(t.0.join("out")).unwrap();
+    let parsed = host_probe::parse_probe_log(guest_log(ProbePlan::MountMissing, &t.0));
+    assert!(parsed.has_error("read") && parsed.has_error("readdir") && parsed.has_error("write"));
+    assert!(parsed.done && !parsed.invalid);
+    assert!(!t.0.join("out/write.txt").exists());
+}
+
+#[test]
+fn mac1_io5_host_effective_cmdline_enables_probe_only_when_requested() {
+    use fandhe_container_platform_macos::config::VmConfigSpec;
+    use fandhe_container_platform_macos::guest_mount::{GuestMountPoint, GuestTestMode};
+    use fandhe_container_platform_macos::virtiofs::{
+        ShareAccess, SharedDirectoryPath, VirtiofsShareSpec, VirtiofsSharesSpec, VirtiofsTag,
+    };
+    let t = Tmp::new("cmdline");
+    let kernel = t.0.join("vmlinux");
+    std::fs::write(&kernel, b"k").unwrap();
+    let share_dir = t.0.join("share");
+    std::fs::create_dir_all(&share_dir).unwrap();
+    let shares = VirtiofsSharesSpec::try_new(vec![
+        VirtiofsShareSpec::new(
+            VirtiofsTag::try_new(SHARE_TAG).unwrap(),
+            SharedDirectoryPath::try_new(&share_dir).unwrap(),
+            ShareAccess::ReadWrite,
+        )
+        .with_guest_mount(GuestMountPoint::try_new(GUEST_MOUNT).unwrap()),
+    ])
+    .unwrap();
+    let off = VmConfigSpec::from_parts(&kernel, None, "console=hvc0")
+        .unwrap()
+        .with_shared_directories(shares);
+    let off_cmdline = off.effective_cmdline().unwrap();
+    assert_eq!(decode_test_mode(off_cmdline.as_str()), TestMode::Absent);
+    let on_cmdline = off
+        .with_guest_test(GuestTestMode::VirtiofsIo)
+        .effective_cmdline()
+        .unwrap();
+    assert_eq!(decode_test_mode(on_cmdline.as_str()), TestMode::VirtiofsIo);
+    // 指示は従来どおり復号でき、試験キーの追加で件数や内容は変わらない。
+    let d = decode_all(on_cmdline.as_str()).unwrap();
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0].tag.as_str(), SHARE_TAG);
+    assert_eq!(d[0].mount_point.as_str(), GUEST_MOUNT);
+    assert_eq!(d[0].access, Access::ReadWrite);
+    // ホストは自分の復号でも同じ指示を得る（試験キーは指示として数えない）。
+    assert_eq!(
+        host::parse_directives(on_cmdline.as_str()).unwrap().len(),
+        1
+    );
 }

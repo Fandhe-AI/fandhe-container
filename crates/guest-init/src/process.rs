@@ -23,6 +23,8 @@ pub trait GuestOps {
 pub struct ProcessOutcome {
     /// mount に成功した共有の数。
     pub mounted: usize,
+    /// mount に成功した指示（試験用プローブの起動条件の判定に使う。#1876）。
+    pub mounted_directives: Vec<Directive>,
     /// mount に失敗した共有の数（復号成功後の失敗）。
     pub failed: usize,
     /// 復号に失敗した場合のエラー（この場合 mount は 0 件）。
@@ -35,6 +37,7 @@ pub struct ProcessOutcome {
 pub fn process_directives<O: GuestOps>(cmdline: &str, ops: &mut O) -> ProcessOutcome {
     let mut outcome = ProcessOutcome {
         mounted: 0,
+        mounted_directives: Vec::new(),
         failed: 0,
         rejected: None,
         rejected_reports: 0,
@@ -48,6 +51,7 @@ pub fn process_directives<O: GuestOps>(cmdline: &str, ops: &mut O) -> ProcessOut
                 match result {
                     Ok(()) => {
                         outcome.mounted += 1;
+                        outcome.mounted_directives.push(d.clone());
                         ops.write_line(&ReportLine::ok(&d.tag));
                     }
                     Err(errno) => {
@@ -120,6 +124,15 @@ mod tests {
             &mut f,
         );
         assert_eq!(out.mounted, 2);
+        let mounted: Vec<(&str, Access)> = out
+            .mounted_directives
+            .iter()
+            .map(|d| (d.tag.as_str(), d.access))
+            .collect();
+        assert_eq!(
+            mounted,
+            vec![("a", Access::ReadOnly), ("b", Access::ReadWrite)]
+        );
         assert_eq!(
             f.events,
             vec![
@@ -151,6 +164,7 @@ mod tests {
         };
         let out = process_directives("fandhe.virtiofs=a:/mnt/fandhe/a:ro", &mut f);
         assert_eq!((out.mounted, out.failed), (0, 1));
+        assert!(out.mounted_directives.is_empty());
         assert_eq!(
             f.lines,
             vec!["fandhe-guest: virtiofs-mount v1 tag=a result=error errno=2"]

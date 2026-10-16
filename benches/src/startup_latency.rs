@@ -44,6 +44,12 @@ mod bundle;
 mod measure;
 #[cfg(target_os = "linux")]
 mod probe_env;
+#[cfg(all(
+    target_os = "linux",
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod scope_wrap;
 
 use args::Command;
 use std::path::PathBuf;

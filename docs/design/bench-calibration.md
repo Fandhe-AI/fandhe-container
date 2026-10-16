@@ -81,9 +81,9 @@ files/s ベンチは TASK-189（#1898）で実装し、#1899 で `metrics.json`�
 
 ## 実機前提ベンチの比較と基準値の作り方（#1901）
 
-- 比較: 実機で `cargo bench -p fandhe-container-benches --bench startup_latency -- <引数> --output <絶対パス>` を実行し、`make bench-check-manual BENCH_RESULTS=<その絶対パス>` で `benches/baseline-manual.json` と比べる。基準値が無い間は `skip:` を出して 0 で終わる（結果の検査は行う。失敗した実行・後始末の残りがある結果は 2）。`skip:` は合格の根拠にしない
-- 基準値の作り方（実測の後。#230）: `jq '.metrics |= {startup_create_to_supervisor_ok_p95_ms}' benches/metrics.json` を一時ファイルへ書き、`bash scripts/bench/generate_baseline.sh --metrics <その一時ファイル> --output benches/baseline-manual.json --environment "<一般化した環境>" <実測の結果>` を実行する。同じ手順が通ることは `make bench-check-selftest` が合成 fixture で確かめる。生成用ターゲットは未作成
-- 基準値と結果の `arch`・ホストの種類が違う比較には意味が無い。照合は機械化していないため、`environment` を見て人が判断する
+- 比較: 実機で `cargo bench -p fandhe-container-benches --bench startup_latency -- <引数> --output <絶対パス>` を実行し、`make bench-check-manual BENCH_RESULTS=<その絶対パス> BENCH_HOST_KIND=<bare-metal|vm|wsl2>` で `benches/baseline-manual.json` と比べる。基準値が無い間は `skip:` を出して 0 で終わる（結果の検査は行う。失敗した実行・後始末の残りがある結果、`arch` が語彙外の結果は 2）。`skip:` は合格の根拠にしない
+- 基準値の作り方（実測の後。#230）: `make bench-baseline-manual BENCH_RESULTS=<実測の結果の絶対パス> BENCH_HOST_KIND=<bare-metal|vm|wsl2> [BENCH_ENVIRONMENT="<一般化した環境>"]` を実行する（#2095・REPAIR-8）。既定の出力先は `target/bench-baseline-manual/baseline-manual.json` で、共有の `benches/baseline-manual.json` へは `BENCH_BASELINE_OUT` で明示したときだけ書く。失敗した実行の結果からは作らず 2 で終わる。内部では実機前提 metric に絞った metrics で `scripts/bench/generate_baseline.sh` を呼ぶ。同じ手順は `make bench-check-selftest` が合成 fixture で確かめる。実測値と基準値の確定は人間担当の #230 で、本リポには置かない
+- 環境の機械照合（#2095）: 基準値は `host: {arch, kind}` を持つ。`arch` は結果 JSON の `.arch`（`x86_64` / `aarch64`）から取り、ホストの種類（`bare-metal` / `vm` / `wsl2`）は結果に載らないため操作者が `BENCH_HOST_KIND` で指定する（自動判定はしない）。`bench-check-manual` は、基準値があるとき `BENCH_HOST_KIND` を必須とし、結果の `arch` と基準値の `host.arch`、または `BENCH_HOST_KIND` と `host.kind` が食い違う、あるいは基準値に `host` が無い場合は、比較せず入力エラー（2）で終わる。自由記述の `environment` は人向けの説明で、照合には使わない
 - Linux 以外: `startup_latency` は `bench_names_for_os` がどの OS でも返さず、`bench-baseline` の metrics からも全 OS で除く。ベンチ自体は Linux 以外で何も書かずに終わるため、比較できる結果は Linux の実測だけ
 
 ## 関連

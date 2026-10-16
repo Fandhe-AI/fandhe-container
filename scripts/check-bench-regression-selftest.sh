@@ -274,11 +274,18 @@ mkdir "${mk_dir}"
 write_metrics "${ph}: {\"unit\": \"ops/s\", \"direction\": \"higher_is_better\"}, ${sl}: {\"unit\": \"ms\", \"direction\": \"lower_is_better\"}" "${mk_dir}/metrics.json"
 # 結果 JSON: <ファイル> <値> [追加の JSON オブジェクト断片（failures 等）]
 write_manual_results() {
-  printf '{"schema_version": 1, "metrics": {%s: {"value": %s, "unit": "ms"}}%s}\n' "${sl}" "$2" "${3:+, $3}" >"$1"
+  printf '{"schema_version": 1, "arch": "%s", "metrics": {%s: {"value": %s, "unit": "ms"}}%s}\n' "${MANUAL_ARCH:-x86_64}" "${sl}" "$2" "${3:+, $3}" >"$1"
 }
+# 基準値: <ファイル> <arch> <kind> <値>。host を持つ実機前提の基準値（#2095）。
+write_manual_baseline() {
+  write_baseline "$1" "${sl}" "$4" ms lower_is_better
+  jq --arg a "$2" --arg k "$3" '. + {host: {arch: $a, kind: $k}}' "$1" >"$1.tmp" && mv "$1.tmp" "$1"
+}
+# run_manual_case <名> <結果> <基準値> <metrics> <期待終了コード> [BENCH_HOST_KIND（既定 bare-metal。"-" で未指定）]
 run_manual_case() {
-  local name="$1" res="$2" bl="$3" mt="$4" expected="$5" actual=0
-  BENCH_RESULTS="${res}" BENCH_MANUAL_BASELINE="${bl}" BENCH_METRICS="${mt}" \
+  local name="$1" res="$2" bl="$3" mt="$4" expected="$5" kind="${6-bare-metal}" actual=0
+  [ "${kind}" = "-" ] && kind=""
+  BENCH_RESULTS="${res}" BENCH_MANUAL_BASELINE="${bl}" BENCH_METRICS="${mt}" BENCH_HOST_KIND="${kind}" \
     bash "${manual_script}" >"${mk_dir}/out.txt" 2>&1 || actual=$?
   if [ "${actual}" -eq "${expected}" ]; then
     echo "PASS: ${name} (exit=${actual})"
@@ -287,7 +294,7 @@ run_manual_case() {
     failures=$((failures + 1))
   fi
 }
-write_baseline "${mk_dir}/baseline.json" "${sl}" 100 ms lower_is_better
+write_manual_baseline "${mk_dir}/baseline.json" x86_64 bare-metal 100
 
 write_manual_results "${mk_dir}/ok.json" 100
 run_manual_case "manual-no-baseline-skips" "${mk_dir}/ok.json" "${mk_dir}/none.json" "${mk_dir}/metrics.json" 0
@@ -323,6 +330,8 @@ run_manual_case "manual-improvement" "${mk_dir}/r80.json" "${mk_dir}/baseline.js
 write_metrics "${ph}: {\"unit\": \"ops/s\", \"direction\": \"higher_is_better\"}" "${mk_dir}/metrics-removed.json"
 run_manual_case "manual-registered-metric-removed" "${mk_dir}/ok.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics-removed.json" 2
 write_baseline "${mk_dir}/baseline-ci.json" "${sl}" 100 ms lower_is_better "${ph}" 1000 ops/s higher_is_better
+jq '. + {host: {arch: "x86_64", kind: "bare-metal"}}' "${mk_dir}/baseline-ci.json" >"${mk_dir}/baseline-ci2.json"
+mv "${mk_dir}/baseline-ci2.json" "${mk_dir}/baseline-ci.json"
 run_manual_case "manual-baseline-with-ci-metric" "${mk_dir}/ok.json" "${mk_dir}/baseline-ci.json" "${mk_dir}/metrics.json" 2
 
 # 入力検証: 未指定・相対パス・存在しない・symlink
@@ -332,17 +341,134 @@ run_manual_case "manual-results-missing" "${mk_dir}/missing.json" "${mk_dir}/bas
 ln -s "${mk_dir}/ok.json" "${mk_dir}/link.json"
 run_manual_case "manual-results-symlink" "${mk_dir}/link.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2
 
-# 基準値の生成手順（bench-calibration.md）の疎通: 実機前提 metric に絞った metrics で generate_baseline.sh が生成でき、
-# その生成物を基準値にした比較が通る。
-jq '.metrics |= {startup_create_to_supervisor_ok_p95_ms}' "${repo_root}/benches/metrics.json" >"${mk_dir}/metrics-manual-only.json"
-if bash "${script_dir}/bench/generate_baseline.sh" --metrics "${mk_dir}/metrics-manual-only.json" \
-  --output "${mk_dir}/generated.json" --environment "selftest" "${mk_dir}/ok.json" >/dev/null 2>&1; then
-  echo "PASS: manual-baseline-generation (exit=0)"
+# 環境の機械照合（#2095・REPAIR-8）: arch・ホストの種類の食い違いは比較せず 2（回帰の 1 でも合格の 0 でもない）。
+MANUAL_ARCH=aarch64 write_manual_results "${mk_dir}/arm-ok.json" 100
+MANUAL_ARCH=aarch64 write_manual_results "${mk_dir}/arm-r200.json" 200
+run_manual_case "manual-arch-mismatch" "${mk_dir}/arm-ok.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2
+run_manual_case "manual-arch-mismatch-with-regression" "${mk_dir}/arm-r200.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2
+write_manual_results "${mk_dir}/r200.json" 200
+run_manual_case "manual-same-env-regression" "${mk_dir}/r200.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 1
+run_manual_case "manual-host-kind-mismatch" "${mk_dir}/ok.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2 vm
+run_manual_case "manual-host-kind-mismatch-with-regression" "${mk_dir}/r200.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2 vm
+run_manual_case "manual-host-kind-unset-with-baseline" "${mk_dir}/ok.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2 -
+for bad_kind in cloud VM 'bare-metal;x'; do
+  run_manual_case "manual-host-kind-invalid ${bad_kind} (baseline)" "${mk_dir}/ok.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2 "${bad_kind}"
+  run_manual_case "manual-host-kind-invalid ${bad_kind} (no baseline)" "${mk_dir}/ok.json" "${mk_dir}/none.json" "${mk_dir}/metrics.json" 2 "${bad_kind}"
+done
+run_manual_case "manual-host-kind-unset-no-baseline" "${mk_dir}/ok.json" "${mk_dir}/none.json" "${mk_dir}/metrics.json" 0 -
+if grep -q '^skip: ' "${mk_dir}/out.txt"; then
+  echo "PASS: manual-host-kind-unset-no-baseline-prints-skip"
 else
-  echo "FAIL: manual-baseline-generation" >&2
+  echo "FAIL: manual-host-kind-unset-no-baseline-prints-skip" >&2
   failures=$((failures + 1))
 fi
-run_manual_case "manual-generated-baseline-compares" "${mk_dir}/ok.json" "${mk_dir}/generated.json" "${repo_root}/benches/metrics.json" 0
+printf '{"schema_version": 1, "metrics": {%s: {"value": 100, "unit": "ms"}}}\n' "${sl}" >"${mk_dir}/no-arch.json"
+run_manual_case "manual-results-missing-arch (baseline)" "${mk_dir}/no-arch.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2
+run_manual_case "manual-results-missing-arch (no baseline)" "${mk_dir}/no-arch.json" "${mk_dir}/none.json" "${mk_dir}/metrics.json" 2
+MANUAL_ARCH=sparc write_manual_results "${mk_dir}/sparc.json" 100
+run_manual_case "manual-results-invalid-arch" "${mk_dir}/sparc.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2
+write_baseline "${mk_dir}/baseline-nohost.json" "${sl}" 100 ms lower_is_better
+run_manual_case "manual-baseline-missing-host" "${mk_dir}/ok.json" "${mk_dir}/baseline-nohost.json" "${mk_dir}/metrics.json" 2
+write_manual_baseline "${mk_dir}/baseline-badhost.json" x86_64 cloud 100
+run_manual_case "manual-baseline-invalid-host-kind" "${mk_dir}/ok.json" "${mk_dir}/baseline-badhost.json" "${mk_dir}/metrics.json" 2
+write_manual_baseline "${mk_dir}/baseline-badarch.json" sparc bare-metal 100
+run_manual_case "manual-baseline-invalid-host-arch" "${mk_dir}/ok.json" "${mk_dir}/baseline-badarch.json" "${mk_dir}/metrics.json" 2
+write_manual_baseline "${mk_dir}/baseline-arm.json" aarch64 vm 100
+run_manual_case "manual-aarch64-vm-match" "${mk_dir}/arm-ok.json" "${mk_dir}/baseline-arm.json" "${mk_dir}/metrics.json" 0 vm
+
+# 基準値の生成ターゲット（bench-baseline-manual）: 結果から host つきの基準値を作り、比較ターゲットがそれを使える。
+gen_script="${script_dir}/targets/bench-baseline-manual.sh"
+gen_out="${mk_dir}/gen-out.json"
+# run_gen_case <名> <期待終了コード> <BENCH_RESULTS> <BENCH_HOST_KIND> [出力先（既定 gen_out）]: 出力先は事前に sentinel を置く。
+run_gen_case() {
+  local name="$1" expected="$2" res="$3" kind="$4" out="${5:-${gen_out}}" actual=0
+  printf '%s' '{"sentinel":true}' >"${out}"
+  BENCH_RESULTS="${res}" BENCH_HOST_KIND="${kind}" BENCH_BASELINE_OUT="${out}" BENCH_ENVIRONMENT="selftest" \
+    BENCH_METRICS="${repo_root}/benches/metrics.json" bash "${gen_script}" >"${mk_dir}/gen.txt" 2>&1 || actual=$?
+  if [ "${actual}" -eq "${expected}" ]; then
+    echo "PASS: ${name} (exit=${actual})"
+  else
+    echo "FAIL: ${name} (expected exit=${expected}, actual exit=${actual})" >&2
+    failures=$((failures + 1))
+  fi
+}
+gen_untouched() {
+  expect_eq "$1 (output untouched)" "$(cat "${gen_out}")" '{"sentinel":true}'
+}
+run_gen_case "manual-baseline-generate" 0 "${mk_dir}/ok.json" bare-metal
+expect_eq "manual-baseline-generate-host" "$(jq -c '.host' "${gen_out}")" '{"arch":"x86_64","kind":"bare-metal"}'
+expect_eq "manual-baseline-generate-metrics" "$(jq -c '.metrics' "${gen_out}")" "{${sl}:{\"value\":100,\"unit\":\"ms\",\"direction\":\"lower_is_better\"}}"
+expect_eq "manual-baseline-generate-environment" "$(jq -r '.environment' "${gen_out}")" "selftest"
+run_manual_case "manual-generated-baseline-compares" "${mk_dir}/ok.json" "${gen_out}" "${repo_root}/benches/metrics.json" 0
+run_manual_case "manual-generated-baseline-host-kind-mismatch" "${mk_dir}/ok.json" "${gen_out}" "${repo_root}/benches/metrics.json" 2 vm
+run_manual_case "manual-generated-baseline-arch-mismatch" "${mk_dir}/arm-ok.json" "${gen_out}" "${repo_root}/benches/metrics.json" 2
+run_gen_case "manual-baseline-generate-aarch64" 0 "${mk_dir}/arm-ok.json" wsl2
+expect_eq "manual-baseline-generate-aarch64-host" "$(jq -c '.host' "${gen_out}")" '{"arch":"aarch64","kind":"wsl2"}'
+run_gen_case "manual-baseline-results-unset" 2 "" bare-metal
+gen_untouched "manual-baseline-results-unset"
+run_gen_case "manual-baseline-results-relative" 2 "ok.json" bare-metal
+gen_untouched "manual-baseline-results-relative"
+run_gen_case "manual-baseline-results-symlink" 2 "${mk_dir}/link.json" bare-metal
+gen_untouched "manual-baseline-results-symlink"
+run_gen_case "manual-baseline-failed-run" 2 "${mk_dir}/failed.json" bare-metal
+gen_untouched "manual-baseline-failed-run"
+run_gen_case "manual-baseline-failures-total" 2 "${mk_dir}/failures.json" bare-metal
+gen_untouched "manual-baseline-failures-total"
+run_gen_case "manual-baseline-leftover" 2 "${mk_dir}/leftover.json" bare-metal
+gen_untouched "manual-baseline-leftover"
+run_gen_case "manual-baseline-host-kind-unset" 2 "${mk_dir}/ok.json" ""
+gen_untouched "manual-baseline-host-kind-unset"
+run_gen_case "manual-baseline-host-kind-invalid" 2 "${mk_dir}/ok.json" cloud
+gen_untouched "manual-baseline-host-kind-invalid"
+run_gen_case "manual-baseline-results-missing-arch" 2 "${mk_dir}/no-arch.json" bare-metal
+gen_untouched "manual-baseline-results-missing-arch"
+run_gen_case "manual-baseline-results-invalid-arch" 2 "${mk_dir}/sparc.json" bare-metal
+gen_untouched "manual-baseline-results-invalid-arch"
+ln -s "${mk_dir}/target-of-link.json" "${mk_dir}/out-link.json"
+actual=0
+BENCH_RESULTS="${mk_dir}/ok.json" BENCH_HOST_KIND=bare-metal BENCH_BASELINE_OUT="${mk_dir}/out-link.json" \
+  BENCH_METRICS="${repo_root}/benches/metrics.json" bash "${gen_script}" >/dev/null 2>&1 || actual=$?
+expect_eq "manual-baseline-output-symlink-exit" "${actual}" "2"
+expect_eq "manual-baseline-output-symlink-target-not-created" "$([ -e "${mk_dir}/target-of-link.json" ] && echo yes || echo no)" "no"
+
+# 出力先が BENCH_METRICS・BENCH_RESULTS と同一ファイル（直接指定・symlink 経由）なら 2 で拒否し、元ファイルを書き換えない。
+cp "${repo_root}/benches/metrics.json" "${mk_dir}/metrics-copy.json"
+cp "${mk_dir}/metrics-copy.json" "${mk_dir}/metrics-copy.orig"
+ln -s "${mk_dir}/metrics-copy.json" "${mk_dir}/metrics-alias.json"
+for alias_out in "${mk_dir}/metrics-copy.json" "${mk_dir}/metrics-alias.json"; do
+  actual=0
+  BENCH_RESULTS="${mk_dir}/ok.json" BENCH_HOST_KIND=bare-metal BENCH_BASELINE_OUT="${alias_out}" \
+    BENCH_METRICS="${mk_dir}/metrics-copy.json" bash "${gen_script}" >/dev/null 2>&1 || actual=$?
+  expect_eq "manual-baseline-output-is-metrics-exit ($(basename "${alias_out}"))" "${actual}" "2"
+  expect_eq "manual-baseline-output-is-metrics-untouched ($(basename "${alias_out}"))" \
+    "$(cmp -s "${mk_dir}/metrics-copy.json" "${mk_dir}/metrics-copy.orig" && echo same || echo changed)" "same"
+done
+cp "${mk_dir}/ok.json" "${mk_dir}/ok-copy.json"
+actual=0
+BENCH_RESULTS="${mk_dir}/ok-copy.json" BENCH_HOST_KIND=bare-metal BENCH_BASELINE_OUT="${mk_dir}/ok-copy.json" \
+  BENCH_METRICS="${repo_root}/benches/metrics.json" bash "${gen_script}" >/dev/null 2>&1 || actual=$?
+expect_eq "manual-baseline-output-is-results-exit" "${actual}" "2"
+expect_eq "manual-baseline-output-is-results-untouched" \
+  "$(cmp -s "${mk_dir}/ok.json" "${mk_dir}/ok-copy.json" && echo same || echo changed)" "same"
+
+# 既定の出力先は共有の基準値（benches/baseline-manual.json）と一致せず target/ 配下（既定で上書きしない）。
+default_out="$(bash -c 'source "$1"; echo "${BENCH_MANUAL_BASELINE_OUT_DEFAULT}"' _ "${lib_sh}")"
+case "${default_out}" in
+  target/*) echo "PASS: manual-baseline-default-out-in-target (${default_out})" ;;
+  *)
+    echo "FAIL: manual-baseline-default-out-in-target (${default_out})" >&2
+    failures=$((failures + 1))
+    ;;
+esac
+if [ "${default_out}" != "benches/baseline-manual.json" ]; then
+  echo "PASS: manual-baseline-default-out-not-shared-baseline"
+else
+  echo "FAIL: manual-baseline-default-out-not-shared-baseline" >&2
+  failures=$((failures + 1))
+fi
+# lib の語彙は、ハーネスの対象 arch（Linux の x86_64 / aarch64）と一致する。
+expect_eq "manual-arches-vocab" "$(bash -c 'source "$1"; echo "${BENCH_MANUAL_ARCHES}"' _ "${lib_sh}")" "x86_64 aarch64"
+
 
 if [ "$failures" -gt 0 ]; then
   echo "self-test failed: ${failures} case(s) did not match the expected exit code" >&2

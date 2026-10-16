@@ -24,6 +24,9 @@
 //! 拒否を `Mount` 監査レコードにする [`MountDestination::resolve_in_audited`]・[`audit_mount_config_error`]
 //! を持つ。ファイル永続化（TASK-41.5.1・#839）は実装済みで、本番経路への sink の配線は未実装。
 //!
+//! bind mount の宛先は `BindMountSet::from_mounts`（`bind_mounts`。#1911）を経て検証する。bind の適用で
+//! [`MountDestination::resolve_in`] の文字列結合を直接 `mount(2)` に渡してはならない。
+//!
 //! # スコープ外（REPAIR-3）
 //!
 //! 字句的な正規化のみで、rootfs 内の symlink は解決しない。[`MountDestination::resolve_in`] の返り値は

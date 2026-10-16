@@ -20,11 +20,14 @@
 //! 出せる（TASK-96.2・TASK-96.3）。実 stderr への書き出しとプロセス終了は CLI 側（TASK-79・TASK-95）の
 //! 責務で未結線である（REPAIR-3）。
 //! launcher が fork 前に cgroup 要件を検査する関数 `require_cgroup_join`（#1814・CORE-3）も置く。
+//! `mounts[]` の bind mount の指定を検証済みの型へ変換する `bind_mounts`（#1911）は型と検証のみで、適用・`start` への
+//! 結線は #1912〜#1915 で未実装である（REPAIR-3）。
 //! 例外は start の rootfs 固定（`RootfsDir::pin`。`exec::open_dir_beneath` を使う。検証後の差し替えの違反は
 //! `RootfsPinError` で運び、exec の経路が監査ログの層 `mount` へ記録する。start の経路は記録しない〔#1314〕。#1702）と
 //! `ContainerChildProcess` で、`launch.rs` 内に `cfg(target_os = "linux")` で局所化している。Linux 以外の
 //! start は rootfs を固定できないため、起動前に `Unimplemented` で拒否する（fail-closed）。
 
+mod bind_mounts;
 mod cgroup_requirement;
 mod config;
 mod create;
@@ -36,6 +39,9 @@ mod launcher;
 mod mount_destination;
 mod start;
 
+pub use bind_mounts::{
+    BindMountError, BindMountErrorKind, BindMountSet, BindMountSpec, audit_bind_mount_error,
+};
 pub use cgroup_requirement::{
     CgroupJoinMeans, CgroupRequirement, launch_after_cgroup_check, require_cgroup_join,
 };

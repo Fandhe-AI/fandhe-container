@@ -1011,10 +1011,27 @@ fn remove_verified(
     let victim =
         CString::new(QUARANTINED).map_err(|_| ("rename", "invalid quarantine name".to_owned()))?;
     sys::mkdir_at(parent, &qname, QUARANTINE_MODE).map_err(|e| ("mkdir", errno(e)))?;
-    let qdir = sys::open_dir_path_nofollow(Some(parent), &qname).map_err(|e| ("open", errno(e)))?;
-    let qst = fstat_fd(qdir.as_fd()).map_err(|e| ("verify", errno(e)))?;
+    // 作った隔離ディレクトリは、以降の早期エラーでも（空のときだけ）消す。差し替えられていても空ディレクトリしか消えない。
+    let cleanup_qdir = || {
+        let _ = sys::remove_dir_at(parent, &qname);
+    };
+    let qdir = match sys::open_dir_path_nofollow(Some(parent), &qname) {
+        Ok(fd) => fd,
+        Err(e) => {
+            cleanup_qdir();
+            return Err(("open", errno(e)));
+        }
+    };
+    let qst = match fstat_fd(qdir.as_fd()) {
+        Ok(st) => st,
+        Err(e) => {
+            cleanup_qdir();
+            return Err(("verify", errno(e)));
+        }
+    };
     if !qst.is_dir || qst.uid != sys::effective_uid() || qst.mode & 0o777 != QUARANTINE_MODE {
         // 作った直後に他者が差し替えた。中へ移すと他者から触れるため何もしない。
+        cleanup_qdir();
         return Err((
             "verify",
             "the quarantine directory is not private to this process; left in place".to_owned(),

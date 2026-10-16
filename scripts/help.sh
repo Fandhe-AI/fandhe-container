@@ -130,7 +130,9 @@ cat <<'EOF'
   bench-check                         scripts/targets/bench-check.sh
                                         ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
   bench-check-manual                  scripts/targets/bench-check-manual.sh
-                                        実機前提ベンチ（起動 p95）の結果を基準値と比較する（REPAIR-8・#1901。CI では実行しない。BENCH_RESULTS=<絶対パス> 必須）
+                                        実機前提ベンチ（起動 p95）の結果を基準値と比較する（REPAIR-8・#1901。CI では実行しない。BENCH_RESULTS=<絶対パス> 必須・基準値があれば BENCH_HOST_KIND 必須で環境が違えば 2）
+  bench-baseline-manual               scripts/with-tools.sh jq scripts/targets/bench-baseline-manual.sh
+                                        実機前提ベンチ（起動 p95）の結果から基準値を生成する（REPAIR-8・#2095。BENCH_RESULTS・BENCH_HOST_KIND 必須。既定の出力先は target/ 配下）
   bench-plugin-boundary               scripts/targets/bench-plugin-boundary.sh
                                         plugin 境界ベンチを実行し Δp50 と CORE-10 比をログ出力する（TASK-113.3・PLUG-5。基準値比較なし）
   bench-macos-cold-start              scripts/with-workspace.sh bench-macos-cold-start cargo bench -p fandhe-container-benches --bench plugin_boundary_macos_cold_start

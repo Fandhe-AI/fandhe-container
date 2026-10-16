@@ -7,7 +7,7 @@ TASK-189・IO-6・IO-7・REPAIR-8（関連: IO-1・IO-2・REPAIR-3・REPAIR-5）
 ## 位置づけ
 
 - IO-6（3〜5 万件の実機実測。#107）・IO-7（bind / named volume の比。#110）・REPAIR-8（主要ベンチ）が使う計測手段
-- 回帰ゲート（`benches/metrics.json`・`scripts/lib.sh` の `BENCH_NAMES`・`baseline.json`・`make bench-check`）への登録は #1899。本ハーネスはゲート未接続
+- 回帰ゲート（`benches/metrics.json`・`scripts/lib.sh` の `BENCH_NAMES`・`baseline.json`・`make bench-check`）への登録は #1899 で `metrics.json`・`BENCH_NAMES`（段階登録）まで済み。baseline は未登録で、実測基準値の確定は #230（TASK-88.h1）。`make bench-check` / `make bench-baseline` は `scripts/lib.sh` の `bench_args_for` が決める固定引数（`--count 2000 --batch-size 1 --file-size 2 --layout tree --config bind --trials 3 --trial-timeout-secs 120 --timeout-secs 300`）で実行し、Windows では実行しない
 - 実測値はこの文書に書かない（実機実測は人間担当の #107・#230）
 
 ## 承認された計測定義（#1897）

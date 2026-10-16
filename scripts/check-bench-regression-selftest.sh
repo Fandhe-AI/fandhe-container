@@ -88,6 +88,141 @@ else
   rm -f "$unreadable"
 fi
 
+# TASK-189 追補・#1899・REPAIR-8: scripts/bench/assemble_results.sh（段階登録ベンチの絞り込み・照合）と
+# 比較スクリプトをつないだ判定。fixture は一時ディレクトリへ生成する（cargo 不要）。
+assemble_script="${script_dir}/bench/assemble_results.sh"
+gate_tmp="$(mktemp -d)"
+trap 'rm -rf "${gate_tmp}"' EXIT
+
+sf='"small_files_files_per_sec"'
+pb1='"plugin_boundary_op_a_inproc_p50"'
+pb2='"plugin_boundary_op_a_framed_p50"'
+ph='"placeholder_throughput"'
+
+# 結果 JSON を書く: <ファイル> <metric 名> <値> <単位>...（3 つ組の繰り返し）
+write_results() {
+  local out="$1"
+  shift
+  local body=""
+  while [ "$#" -ge 3 ]; do
+    body="${body:+${body}, }$1: {\"value\": $2, \"unit\": \"$3\"}"
+    shift 3
+  done
+  printf '{"schema_version": 1, "metrics": {%s}}\n' "${body}" >"${out}"
+}
+# baseline JSON を書く: <ファイル> と 4 つ組（metric 名・値・単位・direction）の繰り返し
+write_baseline() {
+  local out="$1"
+  shift
+  local body=""
+  while [ "$#" -ge 4 ]; do
+    body="${body:+${body}, }$1: {\"value\": $2, \"unit\": \"$3\", \"direction\": \"$4\"}"
+    shift 4
+  done
+  printf '{"schema_version": 1, "metrics": {%s}}\n' "${body}" >"${out}"
+}
+write_metrics() {
+  printf '{"schema_version": 1, "metrics": {%s}}\n' "$1" >"$2"
+}
+all_metrics='"placeholder_throughput": {"unit": "ops/s", "direction": "higher_is_better"}, "plugin_boundary_op_a_inproc_p50": {"unit": "ns", "direction": "lower_is_better"}, "plugin_boundary_op_a_framed_p50": {"unit": "ns", "direction": "lower_is_better"}, "small_files_files_per_sec": {"unit": "files/s", "direction": "higher_is_better"}'
+write_metrics "${all_metrics}" "${gate_tmp}/metrics.json"
+mkdir "${gate_tmp}/in"
+write_results "${gate_tmp}/in/placeholder.json" "${ph}" 1000 ops/s
+cp "${gate_tmp}/in/placeholder.json" "${gate_tmp}/in/regression_placeholder.json"
+rm "${gate_tmp}/in/placeholder.json"
+write_results "${gate_tmp}/in/small_files.json" "${sf}" 2000 files/s
+write_results "${gate_tmp}/in/plugin_boundary.json" "${pb1}" 100 ns "${pb2}" 200 ns
+staged="plugin_boundary small_files"
+
+# 段階登録の 1 ケース: <名> <baseline> <metrics> <staged> <assemble の期待終了コード> <比較の期待終了コード（assemble 成功時）>
+# assemble の期待が 2 のときは比較を実行しない。results は ${gate_tmp}/in/*.json を使う。
+run_gate_case() {
+  local name="$1" bl="$2" mt="$3" st="$4" exp_asm="$5" exp_cmp="${6:-}"
+  local act_asm=0 act_cmp=0
+  rm -f "${gate_tmp}/out.json"
+  bash "${assemble_script}" --baseline "${bl}" --metrics "${mt}" --staged "${st}" \
+    --output "${gate_tmp}/out.json" "${gate_tmp}"/in/*.json >/dev/null 2>&1 || act_asm=$?
+  if [ "${act_asm}" -ne "${exp_asm}" ]; then
+    echo "FAIL: ${name} (assemble expected exit=${exp_asm}, actual exit=${act_asm})" >&2
+    failures=$((failures + 1))
+    return
+  fi
+  if [ "${exp_asm}" -eq 0 ]; then
+    bash "$check_script" "${bl}" "${gate_tmp}/out.json" >/dev/null 2>&1 || act_cmp=$?
+    if [ "${act_cmp}" -ne "${exp_cmp}" ]; then
+      echo "FAIL: ${name} (compare expected exit=${exp_cmp}, actual exit=${act_cmp})" >&2
+      failures=$((failures + 1))
+      return
+    fi
+  fi
+  echo "PASS: ${name} (assemble exit=${act_asm}, compare exit=${act_cmp})"
+}
+
+write_baseline "${gate_tmp}/b-unreg.json" "${ph}" 1000 ops/s higher_is_better
+# 未登録の段階登録ベンチは比較しない: assemble 0・比較 0・出力に small_files と plugin の metric が無い
+run_gate_case "gate-unregistered-not-compared" "${gate_tmp}/b-unreg.json" "${gate_tmp}/metrics.json" "${staged}" 0 0
+if [ "$(jq -c '.metrics | keys' "${gate_tmp}/out.json")" = '["placeholder_throughput"]' ]; then
+  echo "PASS: gate-unregistered-output-keys"
+else
+  echo "FAIL: gate-unregistered-output-keys (got $(jq -c '.metrics | keys' "${gate_tmp}/out.json"))" >&2
+  failures=$((failures + 1))
+fi
+
+# 登録済み: ちょうど 15% 悪化（higher_is_better 2000 → 1700）は合格、16% 悪化（1680）は回帰
+write_baseline "${gate_tmp}/b-reg.json" "${ph}" 1000 ops/s higher_is_better "${sf}" 2000 files/s higher_is_better
+write_results "${gate_tmp}/in/small_files.json" "${sf}" 1700 files/s
+run_gate_case "gate-registered-boundary-15" "${gate_tmp}/b-reg.json" "${gate_tmp}/metrics.json" "${staged}" 0 0
+write_results "${gate_tmp}/in/small_files.json" "${sf}" 1680 files/s
+run_gate_case "gate-registered-regress-16" "${gate_tmp}/b-reg.json" "${gate_tmp}/metrics.json" "${staged}" 0 1
+write_results "${gate_tmp}/in/small_files.json" "${sf}" 2000 files/s
+
+# 登録済み metric が metrics.json から消えた → 入力エラー
+write_metrics "${all_metrics%, \"small_files_files_per_sec\"*}" "${gate_tmp}/metrics-removed.json"
+run_gate_case "gate-registered-metric-removed" "${gate_tmp}/b-reg.json" "${gate_tmp}/metrics-removed.json" "${staged}" 2
+
+# 段階登録ベンチの部分登録（2 metric のうち 1 つだけ baseline に登録）→ 入力エラー
+write_baseline "${gate_tmp}/b-partial.json" "${ph}" 1000 ops/s higher_is_better "${pb1}" 100 ns lower_is_better
+run_gate_case "gate-staged-partial-registration" "${gate_tmp}/b-partial.json" "${gate_tmp}/metrics.json" "${staged}" 2
+
+# 段階登録でないベンチの未登録 metric は絞り込まず、比較スクリプトが入力エラー（登録漏れの検出）
+run_gate_case "gate-non-staged-unregistered" "${gate_tmp}/b-unreg.json" "${gate_tmp}/metrics.json" "plugin_boundary" 0 2
+
+# 複数の段階登録ベンチの独立性: plugin_boundary は登録済み（比較対象）、small_files は未登録（除外）
+write_baseline "${gate_tmp}/b-plugin.json" "${ph}" 1000 ops/s higher_is_better "${pb1}" 100 ns lower_is_better "${pb2}" 200 ns lower_is_better
+run_gate_case "gate-staged-independent" "${gate_tmp}/b-plugin.json" "${gate_tmp}/metrics.json" "${staged}" 0 0
+if [ "$(jq -c '.metrics | keys' "${gate_tmp}/out.json")" = '["placeholder_throughput","plugin_boundary_op_a_framed_p50","plugin_boundary_op_a_inproc_p50"]' ]; then
+  echo "PASS: gate-staged-independent-output-keys"
+else
+  echo "FAIL: gate-staged-independent-output-keys (got $(jq -c '.metrics | keys' "${gate_tmp}/out.json"))" >&2
+  failures=$((failures + 1))
+fi
+
+# 入力検証: 不正な段階登録名・symlink の結果ファイル → 入力エラー
+run_gate_case "gate-invalid-staged-name" "${gate_tmp}/b-unreg.json" "${gate_tmp}/metrics.json" 'bad;name' 2
+ln -s "${gate_tmp}/in/small_files.json" "${gate_tmp}/in/link.json"
+run_gate_case "gate-symlink-result" "${gate_tmp}/b-unreg.json" "${gate_tmp}/metrics.json" "${staged}" 2
+rm -f "${gate_tmp}/in/link.json"
+
+# lib.sh と metrics.json の整合: 段階登録・Unix 限定の各名が BENCH_NAMES に含まれ、small_files の metric が
+# ハーネスの定数（METRIC_NAME・METRIC_UNIT）と metrics.json で一致する。
+repo_root="$(cd "${script_dir}/.." && pwd)"
+lib_check="$(bash -c 'source "$1/scripts/lib.sh"; for n in ${BENCH_STAGED_NAMES} ${BENCH_UNIX_ONLY_NAMES}; do case " ${BENCH_NAMES} " in *" ${n} "*) ;; *) echo "missing:${n}" ;; esac; done' _ "${repo_root}")"
+if [ -z "${lib_check}" ]; then
+  echo "PASS: lib-bench-names-consistent"
+else
+  echo "FAIL: lib-bench-names-consistent (${lib_check})" >&2
+  failures=$((failures + 1))
+fi
+harness_name="$(sed -n 's/^pub const METRIC_NAME: &str = "\(.*\)";$/\1/p' "${repo_root}/benches/src/small_files.rs")"
+harness_unit="$(sed -n 's/^pub const METRIC_UNIT: &str = "\(.*\)";$/\1/p' "${repo_root}/benches/src/small_files.rs")"
+if jq -e --arg n "${harness_name}" --arg u "${harness_unit}" \
+  '.metrics[$n] | .unit == $u and .direction == "higher_is_better"' "${repo_root}/benches/metrics.json" >/dev/null; then
+  echo "PASS: small-files-metric-registered (${harness_name} ${harness_unit})"
+else
+  echo "FAIL: small-files-metric-registered (${harness_name} ${harness_unit})" >&2
+  failures=$((failures + 1))
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo "self-test failed: ${failures} case(s) did not match the expected exit code" >&2
   exit 1

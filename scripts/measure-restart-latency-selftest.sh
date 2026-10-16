@@ -266,7 +266,6 @@ while :; do
   [ "$STUB_MODE" != deep ] || shown="$grand"
   [ "$STUB_MODE" != foreign_new ] || shown="$(<"${STUB_FOREIGN}")"
   [ "$STUB_MODE" != same_pid ] || shown="$(sed -n 's/.*"pid":\([0-9]*\).*/\1/p' "${sd}/state.json")"
-  write_state "$shown"
   e="${elapsed[$idx]:-101000}"
   idx=$((idx + 1))
   line="{\"component\":\"supervisor.monitor\",\"operation\":\"restart\",\"result\":\"ok\",\"elapsed_us\":${e}}"
@@ -278,6 +277,9 @@ while :; do
     error_line) logline "{\"component\":\"supervisor.monitor\",\"operation\":\"restart\",\"result\":\"error\",\"code\":\"x\",\"elapsed_us\":${e}}" ;;
     *) logline "$line" ;;
   esac
+  # ログ行を state.json の更新より先に残す。計測側は state.json を見て launcher を止めるため、順序が逆だと
+  # 停止の TERM が書き込みの前に届いて最終 trial の行が欠け、supervisor_reported が null になる（競合の除去）。
+  write_state "$shown"
 done
 STUB
 chmod 700 "${root}/bin/fandhe-container" "${root}/bin/fandhe-container-supervisor" "${root}/systemd-run" "$root"

@@ -35,7 +35,7 @@ crate の scope は短縮名（`crates/<短縮名>`）に合わせる。短縮�
 | supervisor | `crates/supervisor`（コンテナごとの監視プロセス） |
 | oci | `crates/oci` |
 | cri | `crates/cri`・`fandhe-container-plugin-cri` |
-| platform | `crates/platform-*`・`fandhe-container-plugin-macos` / `-windows`（複数 crate をまとめる scope） |
+| platform | `crates/platform-*`・`crates/guest-init`・`fandhe-container-plugin-macos` / `-windows`（複数 crate をまとめる scope） |
 | microvm | `crates/microvm`・`fandhe-container-plugin-microvm` |
 | gpu | `crates/gpu` |
 | net | `crates/net` |

@@ -14,6 +14,10 @@ Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実
 
 開発進行中で、実装済みの範囲は crate ごとに異なります。進捗は GitHub の Issue で管理します。タスク定義は spec リポの [`05-tasks.md`](https://github.com/Fandhe-AI/fandhe-container-spec/blob/main/05-tasks.md)、マイルストーンは [`06-roadmap.md`](https://github.com/Fandhe-AI/fandhe-container-spec/blob/main/06-roadmap.md)（MS-1〜14）を参照してください。
 
+## macOS ゲスト用 init
+
+macOS VM の initrd に入れる Rust 製 init は `crates/guest-init`（静的リンクの `aarch64-unknown-linux-musl` を想定。busybox 等の GPL ユーザーランドは入れない）。virtiofs の mount と報告を行い、起動完了後に `fandhe-guest: init ready v1` を 1 行出す。initrd への梱包と実機での起動確認は未実施（MAC-1・TASK-64 追補・#1875）。
+
 ## 実装方針（要点）
 
 - **フルスクラッチ**: youki / Cloud Hypervisor / Firecracker / rust-vmm は設計の参考にとどめ、コードの採用や低レベル基盤クレートとしての利用は行いません

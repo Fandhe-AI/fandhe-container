@@ -26,7 +26,7 @@ spec で確定済みの前提と、本ドキュメントで確定した内容を
 
 ## crate 一覧（確定）
 
-spec の仮称（`05-tasks.md` 冒頭）は core 系 8 個（`io`・`core`・`oci`・`cri`・`platform-macos`・`platform-windows`・`microvm`・`cli`）・plugin 系 5 個（`plugin-cri`・`plugin-macos`・`plugin-windows`・`plugin-microvm`・`plugin-mcp`）である。本決定はこれに `supervisor`・`gpu`・`net`・`plugin`（旧称 `plugin-api`）・`stack`・`compose-convert` の 6 crate を加え、core 系 13・独立ツール 1（`compose-convert`）・plugin 系 5 の 19 crate を確定一覧とした（決定 1・決定 4・決定 5）。加えて、crate をまたぐベンチ（TASK-113）・基準値（TASK-88）を置く root の `benches/` を、19 crate とは別枠で `publish = false` の workspace メンバー crate（`fandhe-container-benches`）とする（決定 7）。
+spec の仮称（`05-tasks.md` 冒頭）は core 系 8 個（`io`・`core`・`oci`・`cri`・`platform-macos`・`platform-windows`・`microvm`・`cli`）・plugin 系 5 個（`plugin-cri`・`plugin-macos`・`plugin-windows`・`plugin-microvm`・`plugin-mcp`）である。本決定はこれに `supervisor`・`gpu`・`net`・`plugin`（旧称 `plugin-api`）・`stack`・`compose-convert` の 6 crate を加え、core 系 13・独立ツール 1（`compose-convert`）・plugin 系 5 の 19 crate を確定一覧とした（決定 1・決定 4・決定 5）。追補として、macOS ゲスト用の `guest-init` を #20 に加えた（TASK-64 追補・#1875。#1823 のオーナー判断 2026-10-12）。加えて、crate をまたぐベンチ（TASK-113）・基準値（TASK-88）を置く root の `benches/` を、19 crate とは別枠で `publish = false` の workspace メンバー crate（`fandhe-container-benches`）とする（決定 7）。
 
 なお「core 系 13・独立ツール 1・plugin 系 5」は本ドキュメントが workspace 上の配置区分として便宜的に付けた分類であり、PLUG-1 の「core／plugin」区分（下表「PLUG-1 区分」列）とは別軸である。`cri`・`platform-macos`・`platform-windows`・`microvm` の 4 crate は、PLUG-1 上は「plugin 境界の外側」（plugin バイナリから呼ばれるバックエンド実装ライブラリ）であり、PLUG-1 上の「core」には区分されない。`compose-convert` は plugin ではない独立ツールであり、PLUG-1 区分の対象外である（決定 5）。
 
@@ -51,6 +51,7 @@ spec の仮称（`05-tasks.md` 冒頭）は core 系 8 個（`io`・`core`・`oc
 | 17 | plugin-windows | plugin-windows | Windows バックエンド plugin バイナリ（`platform-windows` の実装を別プロセス化） | G8（TASK-116） | plugin |
 | 18 | plugin-microvm | plugin-microvm | microVM 制御 plugin バイナリ（`microvm` の実装を別プロセス化） | G8（TASK-117） | plugin |
 | 19 | plugin-mcp | plugin-mcp | MCP サーバー plugin バイナリ（参照実装） | G8（TASK-118、PoC-13） | plugin |
+| 20 | guest-init | guest-init | macOS ゲスト VM の initrd に入れる Rust 製 PID 1（virtiofs の mount と報告・起動完了マーカー。TASK-64 追補・#1875。#1823 のオーナー判断 2026-10-12 で配置を確定。ターゲットは静的リンクの `aarch64-unknown-linux-musl`） | G5（TASK-64 追補） | 該当外（ゲスト資産。ホスト側の PLUG-1 境界の外） |
 
 〔注 1〕`gpu` 行の PLUG-1 区分の内訳: `plugin-system.md` の境界表で core と明記されているのは GPU-1〜4（CDI 適用・OCI hook 実行）のみ（2026-10-15 に「推奨」から確定。#4 のコメント）。GPU-5・GPU-7・GPU-8（Landlock/seccomp・cgroup device・読み取り専用 rootfs との両立）は境界表での明示判定がなく、`gpu` crate に実装される付随機能として扱っている。GPU-9 は `api-gpu.md` でステータス「検討中」のため確定扱いしない。
 

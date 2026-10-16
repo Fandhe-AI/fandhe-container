@@ -1125,7 +1125,16 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-          targets: aarch64-unknown-linux-gnu,aarch64-apple-darwin,x86_64-pc-windows-msvc
+          targets: aarch64-unknown-linux-gnu,aarch64-apple-darwin,x86_64-pc-windows-msvc,aarch64-unknown-linux-musl
+      # macOS ゲスト用 init（crates/guest-init。#1823・#1875・MAC-1）の配布ターゲット。型検査のみで、
+      # 静的リンクの実ビルドとサイズ確認は initrd への梱包（#1878）で行う。dev-dependency の platform-macos・io も
+      # 型検査の対象になる。
+      - name: guest-init の cargo check（aarch64-unknown-linux-musl・MAC-1）
+        run: cargo check -p fandhe-container-guest-init --all-targets --target aarch64-unknown-linux-musl
+      - name: guest-init の cargo clippy（aarch64-unknown-linux-musl・MAC-1）
+        run: >-
+          cargo clippy -p fandhe-container-guest-init --all-targets
+          --target aarch64-unknown-linux-musl -- -D warnings
       - name: cargo check（aarch64-unknown-linux-gnu・クロス型検査）
         run: cargo check --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu
       - name: cargo clippy（aarch64-unknown-linux-gnu）

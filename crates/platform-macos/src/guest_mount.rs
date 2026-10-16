@@ -32,7 +32,8 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! 指示を読んで `mount(2)` を実行し報告を出すゲスト init（TASK-64 の Rust 製 init）は本リポに未存在。
+//! 指示を読んで `mount(2)` を実行し報告を出すゲスト init は `crates/guest-init`（#1875）。initrd への梱包は #1878、
+//! 実機での確認は #1628（人間担当）で、いずれも未実施。
 //! 実機の end-to-end 検証は `tests/virtiofs_io.rs` の `#[ignore]` テスト（TASK-65.4・実機前提）。mount 後の再接続・エラー処理は TASK-65.5。
 
 use std::sync::Arc;
@@ -62,6 +63,34 @@ pub const DIRECTIVE_KEY: &str = "fandhe.virtiofs=";
 
 /// 予約キーの接頭辞（ユーザー cmdline では使えない）。
 pub const RESERVED_KEY_PREFIX: &str = "fandhe.";
+
+/// ゲスト試験モードの指示トークンのキー（`=` まで。MAC-1・IO-5・TASK-65.4 追補・#1876）。
+///
+/// `RESERVED_KEY_PREFIX`（`fandhe.`）で始まるため、利用者指定のコマンドラインからは
+/// [`reject_reserved_keys`] により注入できない。有効にできるのはホストのコードが
+/// `VmConfigSpec::with_guest_test` を呼んだときだけで、本番経路（plugin-macos の `build_spec`）は呼ばない。
+pub const GUEST_TEST_KEY: &str = "fandhe.guest-test=";
+
+/// ゲスト init が走らせる試験用プローブの種別（試験専用。本番の起動では指定されない）。
+///
+/// ゲストは `GUEST_TEST_KEY` のトークンがちょうど 1 個で値が既知のときだけプローブを走らせる
+/// （未知の値・重複は fail-closed で何もしない）。#1877（symlink・ハードリンクの観測）は variant を
+/// 足すだけで済み、起動条件の仕組みには手を入れない（REPAIR-3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GuestTestMode {
+    /// 共有 `fandhe-io` の read / write / readdir のプローブ（`guest_probe` の契約。IO-5）。
+    VirtiofsIo,
+}
+
+impl GuestTestMode {
+    /// コマンドラインに載せる値（`GUEST_TEST_KEY` の右辺）。
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::VirtiofsIo => "virtiofs-io",
+        }
+    }
+}
 
 /// 報告行の接頭辞（行頭固定）。
 pub const REPORT_PREFIX: &str = "fandhe-guest: virtiofs-mount";
@@ -757,6 +786,18 @@ mod tests {
             Err(ConfigError::CommandLineReservedKey { index: 0 })
         );
         assert_eq!(reject_reserved_keys("xfandhe.x=1 fandhe=1"), Ok(()));
+    }
+
+    /// MAC-1・IO-5・#1876: 試験モードのキーは予約キーに含まれ、利用者指定では注入できない。
+    #[test]
+    fn guest_test_key_is_reserved_and_token_is_fixed() {
+        assert!(GUEST_TEST_KEY.starts_with(RESERVED_KEY_PREFIX));
+        assert_eq!(GUEST_TEST_KEY, "fandhe.guest-test=");
+        assert_eq!(GuestTestMode::VirtiofsIo.token(), "virtiofs-io");
+        assert_eq!(
+            reject_reserved_keys("console=hvc0 fandhe.guest-test=virtiofs-io"),
+            Err(ConfigError::CommandLineReservedKey { index: 13 })
+        );
     }
 
     /// MAC-1・TASK-65.3: 報告行の受理と、境界・不正行の個別確認。

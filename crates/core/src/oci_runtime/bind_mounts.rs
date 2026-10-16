@@ -60,7 +60,7 @@
 //! 本型は字句検証のみで、検証から適用までの TOCTOU を防がない。symlink を含む実体の照合・fd 起点 `O_NOFOLLOW` の
 //! 走査・種別と存在の確認・宛先ディレクトリの作成・利用者権限での到達性・rootfs 自身とその祖先の実体照合（`dev`/`ino`）は、
 //! 適用の段 `crate::exec::mount_binds`（#1913。実装済み。Linux 限定のため intra-doc リンクは張らない）が担う。
-//! 実体照合の残余（REPAIR-3）は bundle の実体で、字句検証（`check_against_host_paths`）だけが効く。`run_pre_pivot` への組み込みは済み（#1914）、`start` と本番 launcher への結線は済み（#1915。検証は `start`、tmpfs との重なりは launcher、
+//! bundle は適用の段の rootfs の鎖（inode）と mountinfo（`ProtectedFsRoot::contained`）で、状態ルートは start が固定した inode の鎖（`with_inode_chain`。#2066）と mountinfo で照合する。残余（REPAIR-3）は、状態ルートを別の親ディレクトリへ付け替えた場合の祖先判定、overlayfs・FUSE 系の別 superblock 経由の同一データ、start 後に改名された子マウントの mountinfo 照合で、詳細は `crate::exec::mount_binds` のモジュール doc。`run_pre_pivot` への組み込みは済み（#1914）、`start` と本番 launcher への結線は済み（#1915。検証は `start`、tmpfs との重なりは launcher、
 //! 監査は `ProcessLauncher::rejection_audit_sink` 経由）。`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917
 //! （それまで `ro` の bind は fork 前に拒否される）。状態ルートとの重なりは `start` が字句比較・`canonicalize` 比較・
 //! mountinfo によるファイルシステム内の実体照合（別の bind mount による別名）で検査する。適用の段も固定した元に対して状態ルートとの重なりを毎回再検証する（`ProtectedFsRoot`。元のマウントは fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントを照合する。保護対象と同じ FS 上のリンク数 2 以上の通常ファイルは拒否する。状態ルート配下にリンク数 2 以上の通常ファイルがあれば、同じ FS 上のディレクトリ元も拒否する）。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
@@ -287,6 +287,9 @@ pub(crate) struct ProtectedFsRoot {
     /// 真なら状態ルートではなく rootfs・bundle の実体。ハードリンクの検査は行わず、元（と rbind で公開される子孫マウント）が
     /// この実体と同一・祖先のときだけ拒否する（配下の別の実体を元にすることは許す。SEC-1）。
     containment_only: bool,
+    /// 状態ルート自身を先頭に `/` を末尾にした `(st_dev, st_ino)` の鎖（start の段が fd で固定した実体。SEC-1・#2066）。
+    /// 空なら固定していない。適用の段が元との同一・祖先・子孫を、mountinfo の文字列に依らず inode で照合する。
+    inode_chain: Vec<(u64, u64)>,
 }
 
 impl ProtectedFsRoot {
@@ -298,7 +301,20 @@ impl ProtectedFsRoot {
             scan_root: None,
             scan_prune: Vec::new(),
             containment_only: false,
+            inode_chain: Vec::new(),
         }
+    }
+
+    /// start の段が固定した状態ルートの inode の鎖（先頭が自身、末尾が `/`）を持たせる（SEC-1・#2066）。
+    pub(crate) fn with_inode_chain(mut self, chain: Vec<(u64, u64)>) -> Self {
+        self.inode_chain = chain;
+        self
+    }
+
+    /// 適用の段（Linux 限定の `exec::mount_binds`）だけが読む。空なら固定されていない。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn inode_chain(&self) -> &[(u64, u64)] {
+        &self.inode_chain
     }
 
     /// rootfs・bundle の実体を保護対象にする（同一・祖先の元だけを拒否する）。

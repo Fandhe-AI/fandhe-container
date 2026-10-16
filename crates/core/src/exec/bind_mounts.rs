@@ -518,18 +518,26 @@ fn pin_target(
     let fd = match sys::open_path_nofollow(parent, &c_leaf) {
         Ok(fd) => fd,
         Err(SysError::Os(sys::ENOENT)) => {
-            let created = create_target(spec, kind, parent, &c_leaf, last_index(state), state);
-            created?;
-            let fd = reopen_created(spec, kind, parent, &c_leaf, state)?;
-            if state.created_dirs.contains(&last_index(state)) {
-                // 開き直して固定した fd の実体を記録する（名前を辿り直さない）。
-                let st = fstat_fd(fd.as_fd())
-                    .map_err(|e| mount_api_error(spec, e, "fstat(bind mount target)"))?;
-                state
-                    .created_dir_ids
-                    .push((last_index(state), (st.dev, st.ino)));
+            if kind == BindSourceKind::Directory {
+                // 自分が作った実体であることを証明してから配置する（作成と開き直しの間の差し替えを許さない）。
+                match create_dir_proven(parent, &c_leaf) {
+                    Ok(Some((fd, id))) => {
+                        state.created_dirs.push(last_index(state));
+                        state.created_dir_ids.push((last_index(state), id));
+                        fd
+                    }
+                    Ok(None) => reopen_created(spec, kind, parent, &c_leaf, state)?,
+                    Err((what, detail)) => {
+                        return Err(failed(
+                            spec,
+                            &format!("mkdirat(bind mount target) {what}: {detail}"),
+                        ));
+                    }
+                }
+            } else {
+                create_target(spec, kind, parent, &c_leaf, state)?;
+                reopen_created(spec, kind, parent, &c_leaf, state)?
             }
-            fd
         }
         Err(e) => return Err(mount_api_error(spec, e, "openat(bind mount target)")),
     };
@@ -556,24 +564,26 @@ fn open_parents_recording(
         let next = match sys::open_dir_path_nofollow(Some(dir), &c) {
             Ok(fd) => fd,
             Err(SysError::Os(sys::ENOENT)) => {
-                match sys::mkdir_at(dir, &c, DIR_MODE) {
-                    Ok(()) => state.created_dirs.push(index),
-                    Err(SysError::Os(sys::EEXIST)) => {}
-                    Err(e) => return Err(mount_api_error(spec, e, "mkdirat(bind mount target)")),
+                // 自分が作った実体であることを証明してから配置する（作成と開き直しの間の差し替えを許さない）。
+                match create_dir_proven(dir, &c) {
+                    Ok(Some((fd, id))) => {
+                        state.created_dirs.push(index);
+                        state.created_dir_ids.push((index, id));
+                        fd
+                    }
+                    Ok(None) => sys::open_dir_path_nofollow(Some(dir), &c).map_err(|e| {
+                        annotate(
+                            spec,
+                            super::open_error(e, true, Path::new("/"), parents).at_stage(STAGE),
+                        )
+                    })?,
+                    Err((what, detail)) => {
+                        return Err(failed(
+                            spec,
+                            &format!("mkdirat(bind mount target) {what}: {detail}"),
+                        ));
+                    }
                 }
-                let fd = sys::open_dir_path_nofollow(Some(dir), &c).map_err(|e| {
-                    annotate(
-                        spec,
-                        super::open_error(e, true, Path::new("/"), parents).at_stage(STAGE),
-                    )
-                })?;
-                if state.created_dirs.contains(&index) {
-                    let st = fstat_fd(fd.as_fd()).map_err(|e| {
-                        mount_api_error(spec, e, "fstat(created bind mount parent)")
-                    })?;
-                    state.created_dir_ids.push((index, (st.dev, st.ino)));
-                }
-                fd
             }
             Err(e) => {
                 return Err(annotate(
@@ -587,21 +597,22 @@ fn open_parents_recording(
     cur.ok_or_else(|| failed(spec, "bind mount destination is empty"))
 }
 
-/// 無いマウント先の末尾を作る（ディレクトリは 0755、通常ファイルは空の 0644）。競合で先に作られた場合は何もしない。
+/// 無いマウント先の末尾の通常ファイルを空の 0644 で作る（ディレクトリは `create_dir_proven`）。競合で先に作られた場合は何もしない。
 fn create_target(
     spec: &BindMountSpec,
     kind: BindSourceKind,
     parent: BorrowedFd<'_>,
     c_leaf: &CString,
-    index: usize,
     state: &mut Applied<'_>,
 ) -> Result<(), ExecError> {
     match kind {
-        BindSourceKind::Directory => match sys::mkdir_at(parent, c_leaf, DIR_MODE) {
-            Ok(()) => state.created_dirs.push(index),
-            Err(SysError::Os(sys::EEXIST)) => {}
-            Err(e) => return Err(mount_api_error(spec, e, "mkdirat(bind mount target)")),
-        },
+        // ディレクトリは `create_dir_proven` が作る（作成と所有証明の間に差し替えを許さないため）。
+        BindSourceKind::Directory => {
+            return Err(failed(
+                spec,
+                "directory targets are created by create_dir_proven",
+            ));
+        }
         BindSourceKind::RegularFile => match sys::create_file_excl_at(parent, c_leaf, FILE_MODE) {
             Ok(created) => {
                 let st = fstat_fd(created.as_fd())
@@ -1011,50 +1022,47 @@ fn remove_verified(
     let victim =
         CString::new(QUARANTINED).map_err(|_| ("rename", "invalid quarantine name".to_owned()))?;
     sys::mkdir_at(parent, &qname, QUARANTINE_MODE).map_err(|e| ("mkdir", errno(e)))?;
-    // 作った隔離ディレクトリは、以降の早期エラーでも（空のときだけ）消す。差し替えられていても空ディレクトリしか消えない。
-    let cleanup_qdir = || {
-        let _ = sys::remove_dir_at(parent, &qname);
+    // 隔離ディレクトリを（空のときだけ）消す。差し替えられていても空ディレクトリしか消えない。失敗は文字列で返す。
+    let drop_qdir = || -> Option<String> {
+        sys::remove_dir_at(parent, &qname).err().map(|e| {
+            format!(
+                "removing the quarantine directory failed: {}; it was left in place",
+                errno(e)
+            )
+        })
     };
     let qdir = match sys::open_dir_path_nofollow(Some(parent), &qname) {
         Ok(fd) => fd,
-        Err(e) => {
-            cleanup_qdir();
-            return Err(("open", errno(e)));
-        }
+        Err(e) => return Err(("open", join_detail(errno(e), drop_qdir()))),
     };
     let qst = match fstat_fd(qdir.as_fd()) {
         Ok(st) => st,
-        Err(e) => {
-            cleanup_qdir();
-            return Err(("verify", errno(e)));
-        }
+        Err(e) => return Err(("verify", join_detail(errno(e), drop_qdir()))),
     };
     if !qst.is_dir || qst.uid != sys::effective_uid() || qst.mode & 0o777 != QUARANTINE_MODE {
         // 作った直後に他者が差し替えた。中へ移すと他者から触れるため何もしない。
-        cleanup_qdir();
         return Err((
             "verify",
-            "the quarantine directory is not private to this process; left in place".to_owned(),
+            join_detail(
+                "the quarantine directory is not private to this process; left in place".to_owned(),
+                drop_qdir(),
+            ),
         ));
     }
     match sys::rename_noreplace_at(parent, name, qdir.as_fd(), &victim) {
         Ok(()) => {}
         // 既に無い（自分の作った実体が消えている）なら後始末は済んでいる。
         Err(SysError::Os(sys::ENOENT)) => {
-            let _ = sys::remove_dir_at(parent, &qname);
-            return Ok(());
+            return match drop_qdir() {
+                None => Ok(()),
+                Some(x) => Err(("rmdir", x)),
+            };
         }
-        Err(e) => {
-            let _ = sys::remove_dir_at(parent, &qname);
-            return Err(("rename", errno(e)));
-        }
+        Err(e) => return Err(("rename", join_detail(errno(e), drop_qdir()))),
     }
     let put_back = |what: &'static str, detail: String| {
         let detail = match sys::rename_noreplace_at(qdir.as_fd(), &victim, parent, name) {
-            Ok(()) => {
-                let _ = sys::remove_dir_at(parent, &qname);
-                detail
-            }
+            Ok(()) => join_detail(detail, drop_qdir()),
             Err(SysError::Os(sys::EEXIST)) => format!(
                 "{detail}; the original name was re-created by another process, so the element was left in the quarantine directory"
             ),
@@ -1084,12 +1092,113 @@ fn remove_verified(
         sys::remove_file_at(qdir.as_fd(), &victim)
     };
     match removed {
-        Ok(()) => {
-            // 空になった自分専用ディレクトリを消す（差し替えられていても空ディレクトリしか消えない）。
-            let _ = sys::remove_dir_at(parent, &qname);
-            Ok(())
-        }
+        Ok(()) => match drop_qdir() {
+            None => Ok(()),
+            Some(x) => Err(("rmdir", x)),
+        },
         Err(e) => put_back(if is_dir { "rmdir" } else { "unlink" }, errno(e)),
+    }
+}
+
+/// 元のエラー文に、後始末の失敗（あれば）を併記する。
+fn join_detail(detail: String, extra: Option<String>) -> String {
+    match extra {
+        Some(x) => format!("{detail}; {x}"),
+        None => detail,
+    }
+}
+
+/// `create_dir_proven` の結果（作った fd と `(dev, ino)`、既存なら `None`、失敗は段名と詳細）。
+type CreateProven = Result<Option<(OwnedFd, (u64, u64))>, (&'static str, String)>;
+
+/// `parent` 配下に新しいディレクトリ `name` を作り、自分が作った実体であることを証明した fd と `(dev, ino)` を返す。
+/// 既に `name` がある（競合を含む）ときは `Ok(None)`（何も作らない）。
+///
+/// `mkdirat` してから名前で開き直すと、その間に別プロセスが改名して別の同名ディレクトリを置ける。そこで
+/// (1) `parent` の中に自分専用（0700・実効 uid 所有）のステージングディレクトリを作って fd で固定し、
+/// (2) その中（他者は入れない）に `mkdirat` して fd を開き直し `(dev, ino)` を取り、
+/// (3) `RENAME_NOREPLACE` の `renameat2` で `name` へ原子的に移す（inode は変わらない）。
+/// 記録する実体は常に自分が作ったものになる。ステージングディレクトリは成否に関わらず空にして消し、
+/// 削除の失敗はエラーに併記する（SEC-1・REPAIR-4）。
+fn create_dir_proven(parent: BorrowedFd<'_>, name: &CString) -> CreateProven {
+    let errno = |e: SysError| super::describe(e);
+    let seq = QUARANTINE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let stage = CString::new(format!(
+        ".fandhe-stage-{}-{seq}-{nanos:08x}",
+        std::process::id()
+    ))
+    .map_err(|_| ("mkdir", "invalid staging name".to_owned()))?;
+    let inner = CString::new("new").map_err(|_| ("mkdir", "invalid staging name".to_owned()))?;
+    sys::mkdir_at(parent, &stage, QUARANTINE_MODE).map_err(|e| ("mkdir", errno(e)))?;
+    let drop_stage = || -> Option<String> {
+        sys::remove_dir_at(parent, &stage).err().map(|e| {
+            format!(
+                "removing the staging directory failed: {}; it was left in place",
+                errno(e)
+            )
+        })
+    };
+    let sdir = match sys::open_dir_path_nofollow(Some(parent), &stage) {
+        Ok(fd) => fd,
+        Err(e) => return Err(("open", join_detail(errno(e), drop_stage()))),
+    };
+    match fstat_fd(sdir.as_fd()) {
+        Ok(st)
+            if st.is_dir
+                && st.uid == sys::effective_uid()
+                && st.mode & 0o777 == QUARANTINE_MODE => {}
+        Ok(_) => {
+            return Err((
+                "verify",
+                join_detail(
+                    "the staging directory is not private to this process; left in place"
+                        .to_owned(),
+                    drop_stage(),
+                ),
+            ));
+        }
+        Err(e) => return Err(("verify", join_detail(errno(e), drop_stage()))),
+    }
+    // ステージング内の `new`（作っていれば）とステージング自体を消し、失敗を元のエラーへ併記する。
+    let unstage = |made: bool| -> Option<String> {
+        let first = if made {
+            sys::remove_dir_at(sdir.as_fd(), &inner)
+                .err()
+                .map(|e| format!("removing the staged directory failed: {}", errno(e)))
+        } else {
+            None
+        };
+        match (first, drop_stage()) {
+            (None, None) => None,
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        }
+    };
+    if let Err(e) = sys::mkdir_at(sdir.as_fd(), &inner, DIR_MODE) {
+        return Err(("mkdir", join_detail(errno(e), unstage(false))));
+    }
+    let fd = match sys::open_dir_path_nofollow(Some(sdir.as_fd()), &inner) {
+        Ok(fd) => fd,
+        Err(e) => return Err(("open", join_detail(errno(e), unstage(true)))),
+    };
+    let id = match fstat_fd(fd.as_fd()) {
+        Ok(st) => (st.dev, st.ino),
+        Err(e) => return Err(("verify", join_detail(errno(e), unstage(true)))),
+    };
+    match sys::rename_noreplace_at(sdir.as_fd(), &inner, parent, name) {
+        Ok(()) => match drop_stage() {
+            None => Ok(Some((fd, id))),
+            Some(x) => Err(("rmdir", x)),
+        },
+        // 既に同名がある。作った分は捨てて、既存を使わせる。
+        Err(SysError::Os(sys::EEXIST)) => match unstage(true) {
+            None => Ok(None),
+            Some(x) => Err(("rmdir", x)),
+        },
+        Err(e) => Err(("rename", join_detail(errno(e), unstage(true)))),
     }
 }
 
@@ -2252,6 +2361,34 @@ mod tests {
         let fd = sys::open_dir_path_nofollow(None, &c).expect("open dir");
         let meta = std::fs::metadata(dir).expect("metadata");
         (fd, (meta.dev(), meta.ino()))
+    }
+
+    /// SEC-1・REPAIR-4: ステージング経由で作ったディレクトリの `(dev, ino)` は配置後の実体と一致し、ステージングは残らない。
+    /// 既存の名前は作らず `None`（上書きしない）。
+    #[test]
+    fn sec1_create_dir_proven_returns_the_placed_inode_and_leaves_no_staging() {
+        use std::os::unix::fs::MetadataExt as _;
+        let fx = fx();
+        let (parent, _) = dir_fd_and_id(&fx.rootfs);
+        let name = CString::new("d").expect("cstring");
+        let (fd, id) = create_dir_proven(parent.as_fd(), &name)
+            .expect("created")
+            .expect("some");
+        let meta = std::fs::metadata(fx.rootfs.join("d")).expect("meta");
+        assert_eq!(id, (meta.dev(), meta.ino()));
+        let st = fstat_fd(fd.as_fd()).expect("fstat");
+        assert_eq!((st.dev, st.ino), id);
+        let names: Vec<_> = std::fs::read_dir(&fx.rootfs)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name())
+            .filter(|n| n.to_string_lossy().starts_with(".fandhe-"))
+            .collect();
+        assert!(names.is_empty(), "leftover: {names:?}");
+        assert!(
+            create_dir_proven(parent.as_fd(), &name)
+                .expect("exists")
+                .is_none()
+        );
     }
 
     /// SEC-1・REPAIR-4: 照合と削除の間に同名の別実体へ差し替えられたら消さず、元の名前へ戻して失敗を返す。

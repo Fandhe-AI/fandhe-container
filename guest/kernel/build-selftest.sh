@@ -59,6 +59,7 @@ make_src() { # 展開元ディレクトリ（$1）へスタブの Makefile を�
 # スタブ: allnoconfig は KCONFIG_ALLCONFIG の =y 行を .config へ写す（DROP_OPTION の記号は落とす）。
 allnoconfig:
 TAB>grep '^CONFIG_.*=y$$' "$(KCONFIG_ALLCONFIG)" | grep -v "^CONFIG_$$DROP_OPTION=y$$" > .config || true
+TAB>printf 'CONFIG_ARM_GIC=y\nCONFIG_ARM_GIC_V3=y\n' | grep -v "^CONFIG_$$DROP_OPTION=y$$" >> .config || true
 TAB>echo called >> "$(CALL_MARK)"
 olddefconfig:
 TAB>@:
@@ -287,6 +288,30 @@ expect_err "config option missing" 1 config-option-missing
 if grep -q "CONFIG_VIRTIO_FS" "$sandbox/out.stderr"; then ok; else ng "config option missing: symbol not named"; fi
 [ ! -e "$out9/Image" ] && ok || ng "config option missing: Image was output"
 
+# 9b. GIC は select で有効になる記号。落ちたら 1・config-option-missing
+out9b="$sandbox/out9b"
+run_build "${std_env[@]}" "CALL_MARK=$sandbox/calls" "DROP_OPTION=ARM_GIC_V3" -- \
+    --output-dir "$out9b" --cross-compile "$cc" --tarball "$good_tar"
+expect_err "gic missing" 1 config-option-missing
+if grep -q "CONFIG_ARM_GIC_V3" "$sandbox/out.stderr"; then ok; else ng "gic missing: symbol not named"; fi
+
+# 9c. 出力先の末尾スラッシュ: ロックは出力先の外 (<出力先>.lock) に作り、成功する
+out9c="$sandbox/out9c"
+run_build "${std_env[@]}" "CALL_MARK=$sandbox/calls" -- --output-dir "$out9c/" --cross-compile "$cc" --tarball "$good_tar"
+expect_eq "trailing slash: exit code" "0" "$(rc_of)"
+expect_eq "trailing slash: stdout" "$out9c/Image" "$(cat "$sandbox/out.stdout")"
+[ ! -e "$out9c.lock" ] && ok || ng "trailing slash: lock left behind"
+# 空の既存ディレクトリ + 末尾スラッシュも成功する
+out9d="$sandbox/out9d"
+mkdir -p "$out9d"
+run_build "${std_env[@]}" "CALL_MARK=$sandbox/calls" -- --output-dir "$out9d//" --cross-compile "$cc" --tarball "$good_tar"
+expect_eq "trailing slash on empty dir: exit code" "0" "$(rc_of)"
+# 外のロックが残っていれば末尾スラッシュでも output-busy
+mkdir -p "$sandbox/out9e.lock"
+run_build "${std_env[@]}" -- --output-dir "$sandbox/out9e/" --cross-compile "$cc" --tarball "$good_tar"
+expect_err "trailing slash busy" 2 output-busy
+rmdir "$sandbox/out9e.lock"
+
 # 10. 差し替え口はサンドボックスの外では拒否する
 rc=0
 GUEST_KERNEL_UNAME_S=Linux GUEST_KERNEL_TEST_SANDBOX="" bash "$build" --output-dir "$sandbox/outs" >/dev/null 2>"$sandbox/seam.err" </dev/null || rc=$?
@@ -303,7 +328,7 @@ expect_err "windows host" 2 unsupported-os
 # 12. 実リポのフラグメントとロックファイルの静的検査（ネットワーク不要）
 frag="$here/arm64-guest.config"
 lock="$here/source.lock"
-for sym in VIRTIO_FS VIRTIO_VSOCKETS DRM_VIRTIO_GPU VIRTIO_CONSOLE VIRTIO_BLK BLK_DEV_INITRD DEVTMPFS; do
+for sym in ARCH_VIRT VIRTIO_FS VIRTIO_VSOCKETS DRM_VIRTIO_GPU VIRTIO_CONSOLE VIRTIO_BLK BLK_DEV_INITRD DEVTMPFS; do
     grep -qx "CONFIG_$sym=y" "$frag" && ok || ng "fragment: CONFIG_$sym=y missing"
 done
 grep -qx '# CONFIG_MODULES is not set' "$frag" && ok || ng "fragment: CONFIG_MODULES is not disabled"

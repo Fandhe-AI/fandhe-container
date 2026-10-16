@@ -200,6 +200,10 @@ fi
 
 # --- 出力先（空または未存在のみ。上書きしない） ---
 [ -n "$output_dir" ] || output_dir="$root/target/guest-kernel/$lock_ver/arm64"
+# 末尾スラッシュを除く（ロック名 <出力先>.lock が出力先の内側にならないように。"/" だけは残す）。
+while [ "${#output_dir}" -gt 1 ] && [ "${output_dir%/}" != "$output_dir" ]; do
+    output_dir="${output_dir%/}"
+done
 if [ -L "$output_dir" ]; then
     err bad-output "output directory must not be a symlink"
     exit 2
@@ -436,6 +440,13 @@ while IFS= read -r line; do
             ;;
     esac
 done <"$fragment"
+# 割り込みコントローラ（GIC）は選択（select）で有効になる記号のため、フラグメントに書かなくても
+# 必須として照合する。無いと arm64 ゲストが起動できない（MAC-1）。
+for sym in CONFIG_ARM_GIC CONFIG_ARM_GIC_V3; do
+    if ! grep -qx -- "$sym=y" "$src/.config" 2>/dev/null; then
+        missing="$missing $sym"
+    fi
+done
 if [ -n "$missing" ]; then
     err config-option-missing "options requested as =y are absent from the generated .config:$missing"
     exit 1
@@ -453,7 +464,8 @@ if [ ! -d "$output_dir" ]; then
     out_created=1
 fi
 tc_cmd=(gcc)
-if [ -n "$cross_compile" ]; then tc_cmd=("${cross_compile}gcc"); elif [ "$use_llvm" -eq 1 ]; then tc_cmd=(clang); fi
+# --llvm を優先する（CROSS_COMPILE が環境に残っていても clang の版を記録する）。
+if [ "$use_llvm" -eq 1 ]; then tc_cmd=(clang); elif [ -n "$cross_compile" ]; then tc_cmd=("${cross_compile}gcc"); fi
 tc_line=""
 if run_limited 30 "${tc_cmd[0]}" --version >"$work_dir/tc-version" 2>/dev/null; then
     tc_line="$(head -n 1 "$work_dir/tc-version" 2>/dev/null || true)"

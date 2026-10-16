@@ -24,9 +24,25 @@
 //! - どの枝でも子を `wait` しない。supervisor は CLI より長く生きる前提で、期限切れでも kill しない
 //!   （kill すると起動権の予約や子プロセスを宙に浮かせる。後始末は supervisor の責務。利用者は `state` で確かめる）。
 //!
+//! # 待機中のシグナル（#2069・CLI-1・ERR-2・REPAIR-5・PLUG-7）
+//! 結果待ちの間に SIGINT・SIGTERM・SIGHUP を受けたときの扱いは、現状の挙動を契約とする（Linux のみ。
+//! `tests/start_signal_interrupt.rs` が具体値で固定する）。
+//! - CLI: `signals` の固定ハンドラが plugin へ転送してから同じシグナルを自分へ再送し、シグナル終了する
+//!   （`ExitStatus::signal()` が 2 / 15 / 1、`code()` は `None`。シェル上は 128+N）。`main` へ戻らないため stderr に
+//!   構造化エラーの JSON は出ず、stdout も空で、この起動の op ログの行も書かれない（REPAIR-4 の観測の穴）。
+//! - supervisor: plugin の登録表に載らず転送されない。`process_group(0)` で別グループのため、端末から前面グループへ
+//!   配送される SIGINT・SIGHUP も届かない。start を続け、結果の 1 行を書くときは読み手が居らず EPIPE になる
+//!   （std は SIGPIPE を無視する）が、報告の失敗を構造化ログへ出して監視・後始末を続ける。
+//! - 状態: CLI は `start` で状態を書かない（#1541）。supervisor が成功すれば Running を記録し、失敗すれば自分の
+//!   後始末の規則で Created へ戻す。利用者は `state`・`list` で確かめる（期限切れの `TIMEOUT` と同じ案内）。
+//! - 起動時に `SIG_IGN` を継承したシグナルはハンドラが入らず無視され、待機は期限まで続く。
+//! - 待機の取り消しを supervisor へ伝える経路は無い。#2058 の制御チャネルが入った後の将来課題とする。
+//!
 //! # 未実装・簡易実装（REPAIR-3）
 //! - 実行ファイルは CLI 自身の実体パスと同じディレクトリの固定名 `fandhe-container-supervisor` から解決する
-//!   （`PATH` 探索・環境変数・引数による上書きは作らない）。同一ユーザーで起動するため CLI と supervisor の間に権限の境界は無く、
+//!   （`PATH` 探索・環境変数・引数による上書きは作らない）。`PATH` 上の symlink から起動されても、Linux の `current_exe()` は
+//!   `/proc/self/exe` の解決結果（実体のパス）を返すため、argv[0] や symlink の置き場所ではなく実体のディレクトリを見る
+//!   （配布手順は CLI を launcher・supervisor と同じディレクトリに置く。#2068・SUP-14）。同一ユーザーで起動するため CLI と supervisor の間に権限の境界は無く、
 //!   実行ファイルの所有者・権限の fd 経由の検証は特権経路のランチャー（#1719）の責務とする。
 //! - rootful の特権起動でランチャー（`fandhe-container-launcher`）を選ぶ規則は未実装（#1719・#1722）。
 //! - supervisor の fd 2 へ直接書かれるもの（core の診断・panic のメッセージ等）は保存されない（stderr が null のため捨てられる。

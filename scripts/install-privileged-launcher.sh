@@ -1,25 +1,28 @@
 #!/usr/bin/env bash
-# 特権ランチャー（fandhe-container-launcher）と supervisor を固定の配置先へ置き、ランチャーにだけ file capability
-# を付与するインストールスクリプト（TASK-171 追補・#1721・MS-9・SUP-14・SEC-1・PLUG-11・CORE-6）。
+# 特権ランチャー（fandhe-container-launcher）・supervisor・CLI（fandhe-container）を固定の配置先へ同じディレクトリに
+# 置き、ランチャーにだけ file capability を付与するインストールスクリプト
+# （TASK-171 追補・#1721・#2068・MS-9・SUP-14・SEC-1・PLUG-11・CORE-6）。
 #
 # 役割: #1454 の決定（2026-10-10）に従い、権限の付与は CLI ではなくこのスクリプト（またはパッケージの postinst）が
 #   root で行う。CLI は特権を持たず、`setup` は本スクリプトの手順を表示するだけ（#1722）。ランチャー側の実行時検証
 #   （crates/supervisor/src/launcher.rs の verify_install_chain 等）が前提とする「root 所有・g/o 書き込み不可の
-#   配置先」を、ここで作って検証する。
+#   配置先」を、ここで作って検証する。CLI を同じ配置先へ置くのは、CLI の `start` が自分の実体（`current_exe()`）と同じ
+#   ディレクトリの supervisor を起動する（#1718）ため、かつ CLI と supervisor の起動契約（FCSUP1）の版を一組で更新して
+#   ずらさないため（#2068）。CLI には capability も setuid も付けない（supervisor と同じく読み戻しで空と 755 を確かめる）。
 # 呼び出し元: 人間が root で直接 / パッケージの postinst（`--dest-dir` で配置先を渡す） / `make install-launcher-selftest`
 #   （スタブのみの自己テスト。root 不要）。root での実機実行と検証は人間担当（#538・#539）。本スクリプトの中で sudo は呼ばない。
-# 使い方: install-privileged-launcher.sh --launcher <file> --supervisor <file> [--dest-dir <絶対パス>]
+# 使い方: install-privileged-launcher.sh --launcher <file> --supervisor <file> --cli <file> [--dest-dir <絶対パス>]
 #   既定の配置先は /usr/local/libexec/fandhe-container。入力元は必須（root が作業ツリーの暗黙の既定パスを拾わないため）。
 # 終了コード: 0 成功 / 1 インストール操作の失敗（期限超過を含む） / 2 引数エラー / 3 前提不成立（root でない・Linux でない・
 #   配置先が信頼条件を満たさない・入力元が不正・同じ配置先へ別のインストールが進行中） / 129・130・143 HUP・INT・TERM による中断。
 # 出力: 成功は stdout に 1 行 `installed: method=file-capability|setuid dest-dir=<path>`。失敗は stderr の 1 行目に原因
 #   `error: <code>: <message>`（英語）。更新の途中で止まったときと後始末が残ったときだけ、結果を示す行が続く
 #   （どれも `error|warning: <code>: <message>` の 1 行）:
-#     warning: rolled-back        旧 supervisor へ戻した（新規インストールなら新 supervisor を消した。最終名が旧 supervisor の
+#     warning: rolled-back        旧 supervisor・旧 CLI へ戻した（新規なら新しいファイルを消した。最終名が旧ファイルの
 #                                 ままと確かめられたら何もしない）。置換済みのファイルは無い
-#     error: restore-failed       旧 supervisor へ戻せなかった。退避ファイルを残し、場所と復元コマンドを示す
+#     error: restore-failed       旧 supervisor または旧 CLI へ戻せなかった。退避ファイルを残し、場所と復元コマンドを示す
 #     error: state-indeterminate  launcher の置換が起きたか確かめられなかった。退避ファイルを残し、確かめ方を示す
-#     warning: replaced-unverified 2 つとも置換済みだが最後の読み戻しを終えていない（再実行で検証できる）
+#     warning: replaced-unverified 3 つとも置換済みだが最後の読み戻しを終えていない（再実行で検証できる）
 #     warning: cleanup-incomplete 一時ファイル・退避ファイルを消せなかった（置換の成否には影響しない。成功時は終了コード 0 のまま）
 #   setuid へ切り替えたときは成功でも `warning: setuid-fallback` が出る。
 # 付与する capability: crates/supervisor/src/privilege.rs の RUNTIME_REQUIRED_CAPABILITIES（7 件）に、`elevate` の契約
@@ -35,8 +38,10 @@
 #   配置先は祖先を含む全要素が root 所有・g/o 書き込み不可でなければ、補修も上書きもせず止まる。置換は同一ディレクトリの
 #   一時ファイルで検証を済ませてから rename する。入力元は 1 回だけ開いた fd を検査して同じ fd から複製し、以降は複製に対して操作する。
 # 排他: 配置先ごとのロックファイル `<dest-dir>/.install.lock`（root 所有・0600。消さずに残す）に flock(1) を取り、既存
-#   ファイルの確認から置換・復元・最後の読み戻しまでを 1 つのインストールだけが行う（2 つの置換は一組。並行する実行が
-#   launcher と supervisor を別々の版にしたり、他方の更新を旧版へ戻したりしない）。ロックは待たずに取り（flock -n）、取れなければ
+#   ファイルの確認から置換・復元・最後の読み戻しまでを 1 つのインストールだけが行う（3 つの置換は一組。並行する実行が
+#   CLI・launcher・supervisor を別々の版にしたり、他方の更新を旧版へ戻したりしない）。置換の順序は CLI → supervisor →
+#   launcher。launcher には退避が無く（最後に置換するので、失敗したらそれより前を戻せば済む）、CLI と supervisor は
+#   ハードリンクの退避から戻す。ロックは待たずに取り（flock -n）、取れなければ
 #   `error: install-locked`（終了コード 3）で何も変えずに止まる。ロックはプロセスの終了で必ず解放される（残骸で次回が
 #   止まらない）。0600 にするのは、読めるだけの利用者でも flock を取れてしまい、インストールを止められるため。
 # 期限（REPAIR-5）: 配置先・入力元に触る外部コマンド（stat・mkdir・flock・mktemp・dd・chown・chmod・setcap・getcap・ln・mv・rm）は
@@ -47,7 +52,7 @@
 #   `error: operation-timeout` で終了コード 1。超過した操作は「実行されたか不明」
 #   として扱い、置換の成否は inode の読み戻しで確かめてから復元する（確かめられなければ state-indeterminate）。
 #   後始末と復元の間は INT・HUP・TERM を無視して完遂を優先する（各操作に期限があるので有限時間で終わる。子は TERM を無視した
-#   まま起動されるので、後始末中の期限超過は KILL までの猶予を含めて最大 35 秒）。期限超過 1 回のあとの後始末は最大 5 操作。
+#   まま起動されるので、後始末中の期限超過は KILL までの猶予を含めて最大 35 秒）。期限超過 1 回のあとの後始末は最大 7 操作。
 # 既知の未実装（実装済みを装わない）: 入力元のハッシュ・署名の照合は行わない（PLUG-11 との整合は設計書 12 章の未確認事項）。
 #   nosuid マウント上の配置先では file capability / setuid が効かない（ランチャーが実行時に fail-closed で拒否する）。
 #   SIGKILL でも終わらない子（割り込めない I/O 待ち）は timeout(1) が回収を待ち続けるため、期限では打ち切れない。
@@ -60,6 +65,8 @@ set -euo pipefail
 DEFAULT_DEST_DIR="/usr/local/libexec/fandhe-container"
 LAUNCHER_NAME="fandhe-container-launcher"
 SUPERVISOR_NAME="fandhe-container-supervisor"
+# CLI の配置名は crates/cli/Cargo.toml の [[bin]] 名と一致させる。
+CLI_NAME="fandhe-container"
 LAUNCHER_CAPS="cap_sys_admin,cap_mknod,cap_setpcap,cap_net_admin,cap_audit_write,cap_dac_override,cap_kill,cap_setgid+ep"
 
 # 子プロセス 1 つあたりの期限（秒）と、期限超過後に KILL するまでの猶予（秒）。
@@ -69,20 +76,26 @@ KILL_GRACE=5
 DEST_DIR=""
 LAUNCHER_DST=""
 SUPERVISOR_DST=""
+CLI_DST=""
 TMP_LAUNCHER=""
 TMP_SUPERVISOR=""
+TMP_CLI=""
 BAK_SUPERVISOR=""
+BAK_CLI=""
 # 置換前に読んだ一時ファイルの inode（dev:inode）。期限超過・中断のあと、最終名が新しい実体かどうかの判定に使う。
 NEW_LAUNCHER_ID=""
 NEW_SUPERVISOR_ID=""
+NEW_CLI_ID=""
 # 退避を取った時点の旧 supervisor の inode（退避ファイルと同じ実体）。最終名が旧 supervisor のままかどうかの判定に使う。
 OLD_SUPERVISOR_ID=""
+OLD_CLI_ID=""
 # 進行段階。rename の前に「置換中」へ進めておき、rename が起きたか不明な間は起きた可能性があるものとして後始末する。
-#   precheck → staged（一時ファイル作成以降。置換済みのファイルは無い） → supervisor-replacing → mid-update（supervisor
-#   だけ置換済み） → launcher-replacing → committed（2 つとも置換済み）
+#   precheck → staged（一時ファイル作成以降。置換済みのファイルは無い） → cli-replacing → cli-replaced（CLI だけ置換済み）
+#   → supervisor-replacing → mid-update（CLI と supervisor が置換済み） → launcher-replacing → committed（3 つとも置換済み）
 PHASE="precheck"
-# 1 のとき退避ファイル（旧 supervisor）を消さずに残す（復元に失敗した・状態を確かめられなかった）。
-KEEP_BACKUP=0
+# 1 のとき該当の退避ファイル（旧 supervisor / 旧 CLI）を消さずに残す（復元に失敗した・状態を確かめられなかった）。
+KEEP_BAK_SUPERVISOR=0
+KEEP_BAK_CLI=0
 
 # 構造化エラーを 1 行出して終了する。
 die() { # <exit-code> <code> <message>
@@ -94,7 +107,7 @@ warn() { # <code> <message>
 }
 
 usage() {
-  echo "usage: $0 --launcher <file> --supervisor <file> [--dest-dir <absolute-dir>]" >&2
+  echo "usage: $0 --launcher <file> --supervisor <file> --cli <file> [--dest-dir <absolute-dir>]" >&2
   exit 2
 }
 
@@ -130,7 +143,7 @@ timed_out() {
 state_hint() {
   case "${PHASE}" in
     precheck | staged) printf 'no installed file was replaced' ;;
-    committed) printf 'both files are already replaced' ;;
+    committed) printf 'all files are already replaced' ;;
     *) printf 'the update was in progress and its outcome is reported below' ;;
   esac
 }
@@ -207,76 +220,152 @@ replaced_state() { # <最終名> <新しい実体の dev:inode>
   fi
 }
 
-# 退避ファイルを消す。消せなくても置換の成否は変わらないので、場所を示して続ける（再試行しない）。
+# 退避ファイル（旧 supervisor・旧 CLI）を消す。消せなくても置換の成否は変わらないので、場所を示して続ける（再試行しない）。
+# 復元に失敗した・状態を確かめられなかったファイルの退避は KEEP_BAK_* で残す。
 remove_backup() {
-  [ -n "${BAK_SUPERVISOR}" ] || return 0
-  bounded rm -f -- "${BAK_SUPERVISOR}" ||
-    warn cleanup-incomplete "could not remove the backup of the previous supervisor at ${BAK_SUPERVISOR} (exit code ${BOUNDED_RC}); it does not affect the installed files, remove it manually"
-  BAK_SUPERVISOR=""
+  if [ -n "${BAK_SUPERVISOR}" ] && [ "${KEEP_BAK_SUPERVISOR}" -ne 1 ]; then
+    bounded rm -f -- "${BAK_SUPERVISOR}" ||
+      warn cleanup-incomplete "could not remove the backup of the previous supervisor at ${BAK_SUPERVISOR} (exit code ${BOUNDED_RC}); it does not affect the installed files, remove it manually"
+    BAK_SUPERVISOR=""
+  fi
+  if [ -n "${BAK_CLI}" ] && [ "${KEEP_BAK_CLI}" -ne 1 ]; then
+    bounded rm -f -- "${BAK_CLI}" ||
+      warn cleanup-incomplete "could not remove the backup of the previous CLI at ${BAK_CLI} (exit code ${BOUNDED_RC}); it does not affect the installed files, remove it manually"
+    BAK_CLI=""
+  fi
 }
 
-# 置換の途中（supervisor-replacing・mid-update・launcher-replacing）で止まったときに、旧 launcher と新 supervisor の
+# 1 ファイル（supervisor または CLI）の置換を確定する。「最終名が旧ファイルの実体（退避ファイルと同じ inode）である」と
+# 確かめられたときだけ戻さずに退避ファイルを残して後始末に任せる。それ以外（新しい実体・無い・別の実体・確かめられない）は
+# すべて退避ファイルから戻す（退避ファイルが旧ファイルの唯一の写しになっている可能性があるため、確かめずに消さない）。
+# 退避が無い（新規）ときは、最終名が新しい実体でないと確かめられたら触らず、そうでなければ消す。
+# 結果は SETTLE_STATE: untouched（旧のまま）・restored（退避から戻した。退避は消費済み）・fresh-untouched・fresh-removed・
+# failed（戻せなかった。場所と復元コマンドの行は出力済み）。
+SETTLE_STATE=""
+settle_file() { # <表示名> <最終名> <退避ファイル> <旧 inode> <新 inode>
+  local label="$1" dst="$2" bak="$3" old_id="$4" new_id="$5" is="may be"
+  SETTLE_STATE=""
+  replaced_state "${dst}" "${new_id}"
+  if [ "${REPLACED}" = "yes" ]; then
+    is="is"
+  fi
+  if [ -n "${bak}" ]; then
+    if [ "${REPLACED}" = "no" ] && [ -n "${old_id}" ] && [ "${P_ID}" = "${old_id}" ]; then
+      SETTLE_STATE="untouched"
+    elif bounded mv -f -T -- "${bak}" "${dst}"; then
+      SETTLE_STATE="restored"
+    else
+      # 復元に失敗したら状態を消さない。退避ファイル（旧ファイル）は削除せず、場所と復元コマンドを示す。
+      SETTLE_STATE="failed"
+      printf 'error: restore-failed: could not restore the previous %s (exit code %s); it is kept at %s and %s %s the new one; restore with: mv -f -T -- %s %s\n' \
+        "${label}" "${BOUNDED_RC}" "${bak}" "${dst}" "${is}" "${bak}" "${dst}" >&2
+    fi
+    return 0
+  fi
+  if [ "${REPLACED}" = "no" ]; then
+    SETTLE_STATE="fresh-untouched"
+  elif bounded rm -f -- "${dst}"; then
+    SETTLE_STATE="fresh-removed"
+  else
+    SETTLE_STATE="failed"
+    printf 'error: restore-failed: could not remove the new %s at %s (exit code %s); there was no previous one, remove it manually\n' \
+      "${label}" "${dst}" "${BOUNDED_RC}" >&2
+  fi
+}
+
+# settle_file の結果を、rolled-back の 1 行へ載せる断片（SETTLE_FRAGS）と集計（SETTLE_FAILED・SETTLE_HAD_PREVIOUS）へ足す。
+SETTLE_FRAGS=""
+SETTLE_FAILED=0
+SETTLE_HAD_PREVIOUS=0
+settle_note() { # <表示名> <最終名>
+  local frag=""
+  case "${SETTLE_STATE}" in
+    untouched)
+      frag="the previous $1 is still in place at $2"
+      SETTLE_HAD_PREVIOUS=1
+      ;;
+    restored)
+      frag="previous $1 restored at $2"
+      SETTLE_HAD_PREVIOUS=1
+      ;;
+    fresh-untouched) frag="the new $1 had not been installed yet" ;;
+    fresh-removed) frag="new $1 removed from $2" ;;
+    failed) SETTLE_FAILED=1 ;;
+  esac
+  if [ -n "${frag}" ]; then
+    SETTLE_FRAGS="${SETTLE_FRAGS}${SETTLE_FRAGS:+, }${frag}"
+  fi
+}
+
+# 置換の途中（cli-replacing 以降 launcher-replacing まで）で止まったときに、旧 launcher と新しい supervisor・CLI の
 # 組み合わせを残さないよう状態を確定する。EXIT trap から呼ばれる。rename が起きたか不明な段階では inode を読み戻して
-# 判定し、launcher の置換を判定できないときは何も動かさず退避ファイルを残して確かめ方を示す。
-# supervisor は「最終名が旧 supervisor の実体（退避ファイルと同じ inode）である」ことを確かめられたときだけ戻さずに
-# 退避ファイルを消す。それ以外（新しい実体・無い・別の実体・確かめられない）はすべて退避ファイルから戻す（退避ファイルが
-# 旧 supervisor の唯一の写しになっている可能性があるため、確かめずに消さない）。
+# 判定し、launcher の置換を判定できないときは何も動かさず退避ファイルを残して確かめ方を示す。復元は置換と逆の順
+# （supervisor → CLI）。
 settle_update() {
-  local sup_is="may be"
+  local clause cmds baks="" sep=" && "
   if [ "${PHASE}" = "launcher-replacing" ]; then
     replaced_state "${LAUNCHER_DST}" "${NEW_LAUNCHER_ID}"
     case "${REPLACED}" in
       yes)
-        # launcher の rename は完了していた。2 つとも新しい実体で揃っているので戻さない。
+        # launcher の rename は完了していた。3 つとも新しい実体で揃っているので戻さない。
         PHASE="committed"
         return 0
         ;;
       unknown)
-        KEEP_BACKUP=1
+        KEEP_BAK_SUPERVISOR=1
+        KEEP_BAK_CLI=1
         if [ -n "${BAK_SUPERVISOR}" ]; then
-          printf 'error: state-indeterminate: could not confirm whether %s was replaced; %s is the new supervisor and the previous one is kept at %s; if the launcher is still the previous one, restore with: mv -f -T -- %s %s; otherwise remove %s; or rerun the installer\n' \
-            "${LAUNCHER_DST}" "${SUPERVISOR_DST}" "${BAK_SUPERVISOR}" "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" "${BAK_SUPERVISOR}" >&2
+          clause="the previous supervisor is kept at ${BAK_SUPERVISOR}"
+          cmds="mv -f -T -- ${BAK_SUPERVISOR} ${SUPERVISOR_DST}"
+          baks="${BAK_SUPERVISOR}"
         else
-          printf 'error: state-indeterminate: could not confirm whether %s was installed; %s is the new supervisor and there was no previous one; if the launcher is missing, remove %s; or rerun the installer\n' \
-            "${LAUNCHER_DST}" "${SUPERVISOR_DST}" "${SUPERVISOR_DST}" >&2
+          clause="there was no previous supervisor"
+          cmds="rm -f -- ${SUPERVISOR_DST}"
         fi
+        if [ -n "${BAK_CLI}" ]; then
+          clause="${clause}; the previous CLI is kept at ${BAK_CLI}"
+          cmds="${cmds}${sep}mv -f -T -- ${BAK_CLI} ${CLI_DST}"
+          baks="${baks}${baks:+ }${BAK_CLI}"
+        else
+          clause="${clause}; there was no previous CLI"
+          cmds="${cmds}${sep}rm -f -- ${CLI_DST}"
+        fi
+        printf 'error: state-indeterminate: could not confirm whether %s was replaced; %s and %s are the new files; %s; if the launcher was not replaced, restore with: %s;%s or rerun the installer\n' \
+          "${LAUNCHER_DST}" "${SUPERVISOR_DST}" "${CLI_DST}" "${clause}" "${cmds}" "${baks:+ otherwise remove ${baks};}" >&2
         return 0
         ;;
     esac
   fi
-  replaced_state "${SUPERVISOR_DST}" "${NEW_SUPERVISOR_ID}"
-  if [ "${REPLACED}" = "yes" ]; then
-    sup_is="is"
+  SETTLE_FRAGS=""
+  SETTLE_FAILED=0
+  SETTLE_HAD_PREVIOUS=0
+  case "${PHASE}" in
+    supervisor-replacing | mid-update | launcher-replacing)
+      settle_file supervisor "${SUPERVISOR_DST}" "${BAK_SUPERVISOR}" "${OLD_SUPERVISOR_ID}" "${NEW_SUPERVISOR_ID}"
+      settle_note supervisor "${SUPERVISOR_DST}"
+      case "${SETTLE_STATE}" in
+        restored) BAK_SUPERVISOR="" ;;
+        failed) [ -z "${BAK_SUPERVISOR}" ] || KEEP_BAK_SUPERVISOR=1 ;;
+      esac
+      ;;
+  esac
+  settle_file CLI "${CLI_DST}" "${BAK_CLI}" "${OLD_CLI_ID}" "${NEW_CLI_ID}"
+  settle_note CLI "${CLI_DST}"
+  case "${SETTLE_STATE}" in
+    restored) BAK_CLI="" ;;
+    failed) [ -z "${BAK_CLI}" ] || KEEP_BAK_CLI=1 ;;
+  esac
+  if [ "${SETTLE_FAILED}" -eq 0 ]; then
+    PHASE="staged"
   fi
-  if [ -n "${BAK_SUPERVISOR}" ]; then
-    if [ "${REPLACED}" = "no" ] && [ -n "${OLD_SUPERVISOR_ID}" ] && [ "${P_ID}" = "${OLD_SUPERVISOR_ID}" ]; then
-      # 最終名は旧 supervisor のまま（rename は起きていない）。退避ファイルは余分なリンクなので後始末で消してよい。
-      PHASE="staged"
-      warn rolled-back "the previous supervisor is still in place at ${SUPERVISOR_DST}; no installed file is replaced"
-      return 0
-    fi
-    if bounded mv -f -T -- "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}"; then
-      BAK_SUPERVISOR=""
-      PHASE="staged"
-      warn rolled-back "previous supervisor restored at ${SUPERVISOR_DST}; no installed file is replaced"
+  if [ -n "${SETTLE_FRAGS}" ]; then
+    if [ "${SETTLE_FAILED}" -eq 1 ]; then
+      warn rolled-back "${SETTLE_FRAGS}; see the restore-failed error above for the file that could not be restored"
+    elif [ "${SETTLE_HAD_PREVIOUS}" -eq 1 ]; then
+      warn rolled-back "${SETTLE_FRAGS}; no installed file is replaced"
     else
-      # 復元に失敗したら状態を消さない。退避ファイル（旧 supervisor）は削除せず、場所と復元コマンドを示す。
-      KEEP_BACKUP=1
-      printf 'error: restore-failed: could not restore the previous supervisor (exit code %s); it is kept at %s and %s %s the new one; restore with: mv -f -T -- %s %s\n' \
-        "${BOUNDED_RC}" "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" "${sup_is}" "${BAK_SUPERVISOR}" "${SUPERVISOR_DST}" >&2
+      warn rolled-back "${SETTLE_FRAGS}; nothing is installed"
     fi
-    return 0
-  fi
-  # 旧 supervisor が無かった（新規）。最終名が新しい実体でないと確かめられたら触らない（自分が置いたものではない）。
-  if [ "${REPLACED}" = "no" ]; then
-    PHASE="staged"
-    warn rolled-back "the new supervisor had not been installed yet; nothing is installed"
-  elif bounded rm -f -- "${SUPERVISOR_DST}"; then
-    PHASE="staged"
-    warn rolled-back "new supervisor removed from ${SUPERVISOR_DST}; nothing is installed"
-  else
-    printf 'error: restore-failed: could not remove the new supervisor at %s (exit code %s); there was no previous one, remove it manually\n' \
-      "${SUPERVISOR_DST}" "${BOUNDED_RC}" >&2
   fi
 }
 
@@ -288,16 +377,16 @@ cleanup() {
   # 個々の失敗は下で明示的に扱う。想定外の失敗（メッセージの出力失敗など）で後始末を打ち切らない。
   set +e
   case "${PHASE}" in
-    supervisor-replacing | mid-update | launcher-replacing) settle_update ;;
+    cli-replacing | cli-replaced | supervisor-replacing | mid-update | launcher-replacing) settle_update ;;
   esac
-  for f in "${TMP_LAUNCHER}" "${TMP_SUPERVISOR}"; do
+  for f in "${TMP_LAUNCHER}" "${TMP_SUPERVISOR}" "${TMP_CLI}"; do
     [ -n "${f}" ] || continue
     bounded rm -f -- "${f}" ||
       warn cleanup-incomplete "could not remove the temporary file ${f} (exit code ${BOUNDED_RC}); remove it manually"
   done
-  [ "${KEEP_BACKUP}" -eq 1 ] || remove_backup
+  remove_backup
   if [ "${rc}" -ne 0 ] && [ "${PHASE}" = "committed" ]; then
-    warn replaced-unverified "both files were replaced but the final verification did not finish; rerun the installer to verify"
+    warn replaced-unverified "all files were replaced but the final verification did not finish; rerun the installer to verify"
   fi
   exit "${rc}"
 }
@@ -309,16 +398,18 @@ trap 'exit 143' TERM
 
 LAUNCHER_SRC=""
 SUPERVISOR_SRC=""
+CLI_SRC=""
 DEST_DIR="${DEFAULT_DEST_DIR}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --launcher) [ $# -ge 2 ] || usage; LAUNCHER_SRC="$2"; shift 2 ;;
     --supervisor) [ $# -ge 2 ] || usage; SUPERVISOR_SRC="$2"; shift 2 ;;
+    --cli) [ $# -ge 2 ] || usage; CLI_SRC="$2"; shift 2 ;;
     --dest-dir) [ $# -ge 2 ] || usage; DEST_DIR="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
-[ -n "${LAUNCHER_SRC}" ] && [ -n "${SUPERVISOR_SRC}" ] || usage
+[ -n "${LAUNCHER_SRC}" ] && [ -n "${SUPERVISOR_SRC}" ] && [ -n "${CLI_SRC}" ] || usage
 
 # --dest-dir は許可リスト方式で検証する（空白・改行・glob・.. を拒否）。単一の末尾スラッシュは検査より先に除去する
 # （除去後に残る `//` は空要素として拒否する）。
@@ -379,6 +470,7 @@ command -v flock >/dev/null 2>&1 || die 3 flock-unavailable "flock(1) is require
 # パスが symlink でないこと（lstat）と、fd の指す実体（fstat）が通常ファイルで lstat と同一 inode であることを確かめる。
 SRC_FD_LAUNCHER=""
 SRC_FD_SUPERVISOR=""
+SRC_FD_CLI=""
 # 親シェル自身が行う open（入力元・ロックファイル）の期限。期限つきの子へ移せない（fd を親が持つ必要がある）ため、
 # 期限を過ぎたら構造化エラーを出して本体を KILL する watchdog を open の間だけ動かす。呼び出すのは一時ファイルも置換も
 # 無い段階に限る（KILL では EXIT trap が走らない）。待ちには外部コマンド（sleep）を使わず read の期限を使う: watchdog を
@@ -416,6 +508,7 @@ open_source() { # <path> <fd 番号を入れる変数名>
 }
 open_source "${LAUNCHER_SRC}" SRC_FD_LAUNCHER
 open_source "${SUPERVISOR_SRC}" SRC_FD_SUPERVISOR
+open_source "${CLI_SRC}" SRC_FD_CLI
 
 # 配置先の 1 要素が信頼条件（ディレクトリ・非 symlink・信頼する所有者・g/o 書き込み不可）を満たすか確かめる。
 # 種別・所有者・権限は 1 回の lstat で読む（symlink は種別が `symbolic link` になるので通らない）。
@@ -492,14 +585,17 @@ take_install_lock
 
 LAUNCHER_DST="${DEST_DIR}/${LAUNCHER_NAME}"
 SUPERVISOR_DST="${DEST_DIR}/${SUPERVISOR_NAME}"
-# 最終名にあるものが「無い」か「symlink でない通常ファイル」であることを確かめ、旧 supervisor の有無を SUPERVISOR_EXISTS へ
-# 入れる。一時ファイルを作る前（早く止まるため）と、退避を取る直前（その間に現れた・変わったものを見落とさないため）の
+CLI_DST="${DEST_DIR}/${CLI_NAME}"
+# 最終名にあるものが「無い」か「symlink でない通常ファイル」であることを確かめ、旧 supervisor・旧 CLI の有無を
+# SUPERVISOR_EXISTS・CLI_EXISTS へ入れる。一時ファイルを作る前（早く止まるため）と、退避を取る直前（その間に現れた・変わったものを見落とさないため）の
 # 2 回呼ぶ。ロックを持っているので、その間に変えうるのはこのスクリプト以外の root の操作だけ。
 SUPERVISOR_EXISTS=0
+CLI_EXISTS=0
 check_destinations() {
   local dst
   SUPERVISOR_EXISTS=0
-  for dst in "${LAUNCHER_DST}" "${SUPERVISOR_DST}"; do
+  CLI_EXISTS=0
+  for dst in "${LAUNCHER_DST}" "${SUPERVISOR_DST}" "${CLI_DST}"; do
     probe_path "${dst}" || fail_bounded 3 untrusted-dest-dir "stat of ${dst}"
     if [ "${P_KIND}" = "missing" ]; then
       continue
@@ -507,6 +603,8 @@ check_destinations() {
     is_regular || die 3 untrusted-dest-dir "existing destination is not a regular file: ${dst}"
     if [ "${dst}" = "${SUPERVISOR_DST}" ]; then
       SUPERVISOR_EXISTS=1
+    elif [ "${dst}" = "${CLI_DST}" ]; then
+      CLI_EXISTS=1
     fi
   done
 }
@@ -599,13 +697,17 @@ make_temp() { # <接頭辞> <名前を入れる変数名>
 PHASE="staged"
 make_temp ".launcher" TMP_LAUNCHER
 make_temp ".supervisor" TMP_SUPERVISOR
+make_temp ".cli" TMP_CLI
 run_child all dd bs=65536 of="${TMP_LAUNCHER}" <&"${SRC_FD_LAUNCHER}" || fail_bounded 1 install-failed "copy of the launcher"
 run_child all dd bs=65536 of="${TMP_SUPERVISOR}" <&"${SRC_FD_SUPERVISOR}" || fail_bounded 1 install-failed "copy of the supervisor"
-exec {SRC_FD_LAUNCHER}<&- {SRC_FD_SUPERVISOR}<&-
+run_child all dd bs=65536 of="${TMP_CLI}" <&"${SRC_FD_CLI}" || fail_bounded 1 install-failed "copy of the CLI"
+exec {SRC_FD_LAUNCHER}<&- {SRC_FD_SUPERVISOR}<&- {SRC_FD_CLI}<&-
 step "chown" chown root:root "${TMP_LAUNCHER}"
 step "chmod" chmod 0755 "${TMP_LAUNCHER}"
 step "chown" chown root:root "${TMP_SUPERVISOR}"
 step "chmod" chmod 0755 "${TMP_SUPERVISOR}"
+step "chown" chown root:root "${TMP_CLI}"
+step "chmod" chmod 0755 "${TMP_CLI}"
 
 METHOD="file-capability"
 LAUNCHER_MODE=755
@@ -630,12 +732,23 @@ NEW_LAUNCHER_ID="${P_ID}"
 expect_no_caps "${TMP_SUPERVISOR}"
 expect_stat "${TMP_SUPERVISOR}" 755
 NEW_SUPERVISOR_ID="${P_ID}"
+expect_no_caps "${TMP_CLI}"
+expect_stat "${TMP_CLI}" 755
+NEW_CLI_ID="${P_ID}"
 
-# 失敗しうる処理がすべて成功してから最終名へ置換する（rename は xattr を保つ）。2 つの置換は一組として扱い、
-# 途中で止まったら旧ファイル（ハードリンクで保持した退避。xattr も保つ）へ戻す（旧 launcher と新 supervisor の不整合を残さない）。
+# 失敗しうる処理がすべて成功してから最終名へ置換する（rename は xattr を保つ）。3 つの置換は一組として扱い、
+# 途中で止まったら旧ファイル（ハードリンクで保持した退避。xattr も保つ）へ戻す（旧 launcher と新 supervisor・新 CLI の
+# 不整合を残さない）。launcher は最後に置換するので退避を取らない。
 # 退避の名前は mktemp で一意に取り、その名前をハードリンクで置き換える（以前の実行が残した退避ファイルと衝突しない）。
 # 退避を取る直前に最終名を確かめ直し、取った退避が通常ファイルであることと inode を読み戻す。
 check_destinations
+if [ "${CLI_EXISTS}" -eq 1 ]; then
+  make_temp ".cli.bak" BAK_CLI
+  bounded ln -f -- "${CLI_DST}" "${BAK_CLI}" || fail_bounded 1 install-failed "backup of the previous CLI"
+  probe_path "${BAK_CLI}" || fail_bounded 1 install-failed "stat of ${BAK_CLI}"
+  is_regular || die 1 install-failed "backup of the previous CLI is not a regular file: ${BAK_CLI}"
+  OLD_CLI_ID="${P_ID}"
+fi
 if [ "${SUPERVISOR_EXISTS}" -eq 1 ]; then
   make_temp ".supervisor.bak" BAK_SUPERVISOR
   bounded ln -f -- "${SUPERVISOR_DST}" "${BAK_SUPERVISOR}" || fail_bounded 1 install-failed "backup of the previous supervisor"
@@ -647,12 +760,19 @@ fi
 # その中へ移動せずに失敗する。
 # rename の前に段階を進める。rename の完了と段階の更新の間で中断・期限超過が起きても、EXIT trap が inode を読み戻して
 # 置換の有無を確かめるので、信号を無視する区間は要らない（期限つきの子を信号無視のまま待たない）。
+PHASE="cli-replacing"
+bounded mv -f -T -- "${TMP_CLI}" "${CLI_DST}" || fail_bounded 1 install-failed "rename of the CLI"
+TMP_CLI=""
+PHASE="cli-replaced"
+# 置換後の CLI を読み戻して検証する間に中断・失敗しても、EXIT trap が旧 CLI へ戻す。
+expect_no_caps "${CLI_DST}"
+expect_stat "${CLI_DST}" 755
 PHASE="supervisor-replacing"
 bounded mv -f -T -- "${TMP_SUPERVISOR}" "${SUPERVISOR_DST}" || fail_bounded 1 install-failed "rename of the supervisor"
 TMP_SUPERVISOR=""
 PHASE="mid-update"
 # ここから launcher の rename 完了までが更新途中。置換後の supervisor を読み戻して検証する間に中断・失敗しても、
-# EXIT trap が旧 supervisor へ戻す。
+# EXIT trap が旧 supervisor・旧 CLI へ戻す。
 expect_no_caps "${SUPERVISOR_DST}"
 expect_stat "${SUPERVISOR_DST}" 755
 PHASE="launcher-replacing"
@@ -661,6 +781,8 @@ TMP_LAUNCHER=""
 PHASE="committed"
 remove_backup
 
+expect_no_caps "${CLI_DST}"
+expect_stat "${CLI_DST}" 755
 expect_no_caps "${SUPERVISOR_DST}"
 expect_stat "${SUPERVISOR_DST}" 755
 expect_stat "${LAUNCHER_DST}" "${LAUNCHER_MODE}"

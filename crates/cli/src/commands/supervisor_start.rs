@@ -338,7 +338,14 @@ mod tests {
     fn reap(child: Option<Child>) {
         if let Some(mut c) = child {
             let _ = c.kill();
-            let _ = c.wait();
+            // REPAIR-5: 回収も有限の猶予（5 秒）で打ち切る（超過時は回収を諦める）。
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                match c.try_wait() {
+                    Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                    _ => break,
+                }
+            }
         }
     }
 

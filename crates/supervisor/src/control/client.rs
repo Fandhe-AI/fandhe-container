@@ -9,14 +9,16 @@
 //!
 //! 1. `<state_root>/<id>/` を symlink を辿らずに開き、所有者（実効 uid）・権限（0700 相当）を検証する
 //!    （listen 側と同じ検証。`control::listener`）。
-//! 2. 検証した fd 経由で `supervisor.sock` へ接続する。start の報告と bind の間の短い空白と、前回の異常終了で残った
+//! 2. 検証した fd 経由で `supervisor.sock` へ non-blocking で接続する。start の報告と bind の間の短い空白と、前回の異常終了で残った
 //!    ソケットのため、`ENOENT`・`ECONNREFUSED` は 20ms 間隔で最大 500ms（または期限）まで再試行し、超えたら
 //!    `Unavailable`（固定文言）を返す。
 //! 3. 接続したソケットの `SO_PEERCRED`（listen 側の資格情報）が自分の実効 uid と一致することを確かめる。
-//! 4. Hello を受けてから、残り時間から余裕（20ms）を引いた値を budget として要求を送り、応答を受ける。
+//! 4. Hello を受けてから、期限から余裕（20ms）を引いた絶対期限を載せて要求を送り、応答を受ける。
 //!
-//! やり取り全体は作業スレッドで行い、`recv_timeout` で期限に打ち切る（`UnixStream::connect` にタイムアウトが
-//! 無いため）。期限の残りが余裕以下なら接続せずに `Timeout` を返す（送らない）。
+//! 接続は non-blocking の試行（listen backlog 満杯は `EAGAIN`）を絶対期限まで繰り返し、読み書きは残り時間を
+//! タイムアウトにして呼び出しスレッドの上で行う（作業スレッドを切り離さない。REPAIR-5）。要求には余裕を引いた
+//! 絶対期限（`CLOCK_MONOTONIC`）を載せ、サーバの受信が遅れても送信期限が延びないようにする。期限の残りが余裕
+//! 以下なら接続せずに `Timeout` を返す（送らない）。
 //!
 //! 非 Linux では同名の型が `Unimplemented` を返す（CLI に `cfg` を持ち込まないため）。
 
@@ -77,7 +79,6 @@ mod linux {
     use std::os::fd::AsFd as _;
     use std::os::unix::net::UnixStream;
     use std::path::Path;
-    use std::sync::mpsc::{RecvTimeoutError, sync_channel};
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::traits::{ContainerId, ErrorCode, Signal, TraitError};
@@ -87,13 +88,15 @@ mod linux {
     };
     use crate::control::protocol::{
         ControlReason, FrameHeader, HEADER_LEN, MAX_SIGNAL_BUDGET, RESPONSE_PAYLOAD_LEN,
-        ResponseFrame, SignalBudget, SignalRequestFrame,
+        ResponseFrame, SignalDeadline, SignalRequestFrame,
     };
     use crate::control::server::{peer_allowed, read_exact_until};
 
-    /// connect の再試行の間隔と窓。
+    /// connect の再試行の間隔と、`ENOENT`・`ECONNREFUSED` を再試行する窓。
     const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(20);
     const CONNECT_RETRY_WINDOW: Duration = Duration::from_millis(500);
+    /// backlog 満杯（`EAGAIN`）の再試行の間隔（期限までは待つ）。
+    const CONNECT_BACKLOG_INTERVAL: Duration = Duration::from_millis(5);
     /// 期限からサーバの処理・応答の往復のために引いておく余裕。
     const DEADLINE_MARGIN: Duration = Duration::from_millis(20);
 
@@ -110,7 +113,11 @@ mod linux {
             .unwrap_or_else(unavailable)
     }
 
-    /// 期限つきの呼び出し本体（作業スレッドを起こして打ち切る）。
+    /// 期限つきの呼び出し本体。
+    ///
+    /// 作業スレッドは使わない。接続は non-blocking の試行を絶対期限まで繰り返し、読み書きは残り時間を
+    /// タイムアウトに設定し直すので、すべて呼び出しスレッドの上で期限に終わる（切り離されたスレッドも
+    /// 残った fd も無い。REPAIR-5）。
     pub(super) fn signal(
         state_root: &Path,
         id: &ContainerId,
@@ -123,25 +130,13 @@ mod linux {
             // 期限が迫っているときは接続せず、送らない（期限後にシグナルが届かない。REPAIR-5）。
             return Err(timeout());
         }
-        let (tx, rx) = sync_channel(1);
-        let root = state_root.to_path_buf();
-        let id = id.clone();
-        std::thread::Builder::new()
-            .name("control-client".to_owned())
-            .spawn(move || {
-                let _ = tx.send(exchange(&root, &id, pid, signal, deadline));
-            })
-            .map_err(|_| unavailable())?;
-        match rx.recv_timeout(usable) {
-            Ok(result) => result,
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => Err(timeout()),
-        }
+        exchange(state_root, id, pid, signal, deadline)
     }
 
-    fn connect_with_retry(path: &Path, deadline: Instant) -> Result<UnixStream, TraitError> {
+    fn connect_until(path: &Path, deadline: Instant) -> Result<UnixStream, TraitError> {
         let retry_until = deadline.min(Instant::now() + CONNECT_RETRY_WINDOW);
         loop {
-            match UnixStream::connect(path) {
+            let interval = match crate::sys::connect_unix_nonblocking(path) {
                 Ok(s) => return Ok(s),
                 Err(e)
                     if matches!(
@@ -149,10 +144,22 @@ mod linux {
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                     ) && Instant::now() < retry_until =>
                 {
-                    std::thread::sleep(CONNECT_RETRY_INTERVAL);
+                    CONNECT_RETRY_INTERVAL
+                }
+                // 相手の listen backlog が満杯。期限まで待つ。
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(timeout());
+                    }
+                    CONNECT_BACKLOG_INTERVAL
                 }
                 Err(_) => return Err(unavailable()),
+            };
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(timeout());
             }
+            std::thread::sleep(interval.min(remaining));
         }
     }
 
@@ -174,7 +181,7 @@ mod linux {
         let euid = effective_uid()?;
         let dir = open_state_dir(state_root, id, euid)?;
         let path = path_via_fd(&dir, CONTROL_SOCKET_NAME);
-        let mut stream = connect_with_retry(&path, deadline)?;
+        let mut stream = connect_until(&path, deadline)?;
 
         // listen 側の資格情報を確かめる（別 uid が同名のソケットを置いていても送らない）。
         let cred = crate::sys::peer_credentials(stream.as_fd()).map_err(|_| unavailable())?;
@@ -198,17 +205,24 @@ mod linux {
             .and_then(FrameHeader::expect_hello)
             .map_err(|r| r.to_error().unwrap_or_else(unavailable))?;
 
-        let budget = deadline
+        // 余裕を引いた絶対期限（CLOCK_MONOTONIC）をサーバへ渡す。サーバの受信が遅れても期限は延びない。
+        let send_budget = deadline
             .saturating_duration_since(Instant::now())
             .saturating_sub(DEADLINE_MARGIN)
             .min(MAX_SIGNAL_BUDGET);
-        let Ok(budget) = SignalBudget::new(budget) else {
+        if send_budget.is_zero() {
             return Err(timeout());
-        };
+        }
+        let now_ns = crate::sys::monotonic_now_ns().map_err(|_| unavailable())?;
+        let abs_ns = u64::try_from(send_budget.as_nanos())
+            .ok()
+            .and_then(|n| now_ns.checked_add(n))
+            .ok_or_else(unavailable)?;
+        let deadline_frame = SignalDeadline::from_nanos(abs_ns).map_err(|_| unavailable())?;
         let frame = SignalRequestFrame {
             pid,
             signal,
-            budget,
+            deadline: deadline_frame,
         };
         stream
             .write_all(&frame.encode())

@@ -154,8 +154,16 @@ pub fn serve_connection(
         Err(reason) => return respond(&mut stream, reason),
     };
 
-    // 送信期限は受信時刻 + budget（Hello を挟むので、クライアントの期限より後ろへずれない）。
-    let deadline = Instant::now() + request.budget.as_duration();
+    // 送信期限はクライアントが載せた絶対期限（CLOCK_MONOTONIC）。受信までの遅れの分だけ残りが縮むので、
+    // サーバ側の遅延でクライアントの期限より後ろへずれない（REPAIR-5）。
+    let Ok(now_ns) = crate::sys::monotonic_now_ns() else {
+        return respond(&mut stream, ControlReason::Internal);
+    };
+    let remaining = match request.deadline.remaining_from(now_ns) {
+        Ok(r) => r,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    let deadline = Instant::now() + remaining;
     let reason = match slot.submit(request.pid, request.signal, deadline) {
         Ok(rx) => wait_reply(&rx, deadline, config.reply_grace),
         Err(reason) => reason,

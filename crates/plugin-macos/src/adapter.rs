@@ -11,7 +11,7 @@
 //!
 //! | 操作 | 要求本体 | 成功応答本体 |
 //! | ---- | -------- | ------------ |
-//! | create | `["create", id, kernel, initrd または "", cmdline, (tag, host_dir, "ro" / "rw")*]` | `["created"]` |
+//! | create | `["create", id, kernel, initrd または "", cmdline, console_log または "", (tag, host_dir, "ro" / "rw", guest_mount または "")*]` | `["created"]` |
 //! | start | `["start", id]` | `["running"]` |
 //! | stop | `["stop", id]` | `["stopped"]` |
 //! | ping | `["ping"]`（要素 1 つ） | `["pong"]` |
@@ -77,6 +77,20 @@
 //! - 残余: 再検証の直後から Virtualization.framework がパスを開くまでの差し替えは検出できない（VZ は fd では
 //!   なくパスを受け取る。残余リスクとして受け入れる）。
 //!
+//! # ゲスト内 virtiofs のマウント先とコンソールログ（MAC-1・SEC-4・TASK-64 追補・#2075）
+//!
+//! 共有の 4 番目 `guest_mount` が空でなければ `GuestMountPoint::try_new` に要求の値をそのまま渡す（基底
+//! `/mnt/fandhe` 配下・文字種・深さ・長さ・重なりの検証は platform-macos に一本化し、ここでは正規化しない。
+//! ゲスト init 側の同じ規則との一致は `crates/guest-init/tests/contract.rs` が照合する）。空は「デバイス構成のみ」。
+//! ゲスト init の報告（hvc0）を受ける経路がコンソールログのため、マウント先を指定する要求は 6 番目の
+//! `console_log`（絶対パス。`ConsoleLogPath::try_new` が symlink・所有者・親ディレクトリを検証し、
+//! kernel / initrd・RW 共有との衝突は `VmConfigSpec` が拒否する）と cmdline の `console=hvc0` も要する。
+//! 欠けた構成は create で `config.guest_mount_requires_console*`（`INVALID_ARGUMENT`）にする。
+//! エラーの message は固定文言で、マウント先・ログのパスは含めない（SEC-4）。作られたログは診断のため削除しない。
+//! 報告待ちは start の中で [`LAUNCH_GUEST_MOUNT_TIMEOUT`]（3 秒）に限り、超過は `TIMEOUT`
+//! （`guest_mount.timeout`）、失敗報告は `INTERNAL`（`guest_mount.failed`）。マウント先つきの start は共有走査 1 秒 +
+//! 開始 3 秒 + 報告 3 秒 = 最大 [`LAUNCH_TOTAL_TIMEOUT`]（7 秒）で、10 秒の RPC 期限に収まる。
+//!
 //! # 取り消せない OS 呼び出しの隔離（REPAIR-5）
 //!
 //! 要求由来のパスに触れる処理（create の kernel・initrd・共有元の検証と共有走査、start の `Vm::launch`）は
@@ -105,8 +119,9 @@
 //!
 //! # 未実装範囲（実装済みを装わない。REPAIR-3）
 //! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（TASK-114 待ち）。
-//! - virtiofs 共有は「デバイス構成のみ」。ゲスト内 mount 先の指定は受け付けない（ゲスト init 未実装のため
-//!   `guest_mount.timeout` になる。MAC-1）。rootfs ブロックデバイス・コンソールログ・CPU / メモリ指定も含まない。
+//! - virtiofs 共有は、マウント先とコンソールログを指定すればゲスト init の報告を待つ（上の節）。initrd への
+//!   ゲスト init の梱包（#1878）と、3 秒の報告待ちで足りるかを含む実機確認（#1628）は未実施。
+//!   rootfs ブロックデバイス・CPU / メモリ指定は含まない。
 //! - VM が作られ得た起動失敗（`VmError::StartFailed`・`GuestMount` 等）の後の `start` 再試行は拒否する
 //!   （VM 生成前に確定した失敗〔`UnsupportedHost`・構成エラー〕は `Created` のまま再試行・`stop` を許す。
 //!   失敗した VM の停止は非同期で完了を確認できず、VM が重複し得るため。
@@ -122,8 +137,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use fandhe_container_platform_macos::config::{ConfigError, VmConfigSpec};
+use fandhe_container_platform_macos::config::{
+    ConfigError, ConsoleLogPath, DeviceConfigSpec, SerialConsoleSink, VmConfigSpec,
+};
 use fandhe_container_platform_macos::error::{GuestMountError, PlatformError, VmError};
+use fandhe_container_platform_macos::guest_mount::GuestMountPoint;
 use fandhe_container_platform_macos::virtiofs::{
     MAX_VIRTIOFS_SHARES, ShareAccess, SharedDirectoryPath, VirtiofsIoError, VirtiofsShareSpec,
     VirtiofsSharesSpec, VirtiofsTag,
@@ -132,6 +150,16 @@ use fandhe_container_plugin::{PluginError, PluginErrorCode};
 
 use crate::frame_loop::RequestHandler;
 use crate::isolate::{self, IsolateError, Workers};
+
+/// create 要求本体の固定項目数（`create`・id・kernel・initrd・cmdline・console_log）。
+const CREATE_FIXED_ITEMS: usize = 6;
+/// 共有 1 件あたりの項目数（tag・host_dir・access・guest_mount）。
+const SHARE_ITEMS: usize = 4;
+// 共有の上限まで並べても、フレームループの要求本体の項目数上限に収まる。
+const _: () = assert!(
+    CREATE_FIXED_ITEMS + SHARE_ITEMS * MAX_VIRTIOFS_SHARES
+        <= crate::frame_loop::REQUEST_BODY_MAX_ITEMS
+);
 
 /// 登録できるコンテナ数の上限（無制限確保の防止）。
 pub const MAX_CONTAINERS: usize = 64;
@@ -512,12 +540,14 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
     }
 
     fn create(&mut self, body: &[String]) -> Result<Vec<String>, PluginError> {
-        let (id, kernel, initrd, cmdline, rest) = match body {
-            [_, id, kernel, initrd, cmdline, rest @ ..] => (id, kernel, initrd, cmdline, rest),
+        let (id, kernel, initrd, cmdline, console_log, rest) = match body {
+            [_, id, kernel, initrd, cmdline, console_log, rest @ ..] => {
+                (id, kernel, initrd, cmdline, console_log, rest)
+            }
             _ => return Err(invalid(MSG_MALFORMED)),
         };
         validate_id(id)?;
-        if rest.len() % 3 != 0 {
+        if rest.len() % SHARE_ITEMS != 0 {
             return Err(invalid(MSG_MALFORMED));
         }
         if self.entries.contains_key(id.as_str()) {
@@ -528,7 +558,7 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         }
         // 件数だけで決まる上限は、ホストのファイルシステムに触れる検証（各共有元の検証・別名の確認）より
         // 先に確かめる（platform-macos の `VirtiofsSharesSpec::try_new` と同じ上限・同じエラー）。
-        let share_count = rest.len() / 3;
+        let share_count = rest.len() / SHARE_ITEMS;
         if share_count > MAX_VIRTIOFS_SHARES {
             return Err(config_to_plugin(ConfigError::TooManyVirtiofsShares {
                 count: share_count,
@@ -544,6 +574,7 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
         // 以降はホストのファイルシステムに触れる。取り消せない呼び出しで要求処理を止めないよう作業スレッドへ
         // 隔離し、期限を過ぎたら結果を待たない（残った検証は副作用を持たず、結果は捨てられる。REPAIR-5）。
         let (kernel, initrd, cmdline) = (kernel.clone(), initrd.clone(), cmdline.clone());
+        let console_log = console_log.clone();
         let (rest, scan) = (rest.to_vec(), self.share_scan_timeout);
         #[cfg(test)]
         let gate = self.validation_gate.take();
@@ -552,7 +583,7 @@ impl<B: MacosBackend> MacosRuntimeAdapter<B> {
             if let Some(gate) = gate {
                 let _ = gate.recv();
             }
-            build_spec(&kernel, &initrd, &cmdline, &rest, scan)
+            build_spec(&kernel, &initrd, &cmdline, &console_log, &rest, scan)
         })
         .map_err(|e| match e {
             IsolateError::Timeout { .. } => {
@@ -703,11 +734,14 @@ fn single_id(body: &[String]) -> Result<&str, PluginError> {
 /// create の要求本体から検証済みの VM 設定を組み立てる（ホストのファイルシステムに触れる唯一の create 処理）。
 ///
 /// `MacosRuntimeAdapter::create` が [`crate::isolate::run`] の作業スレッドで呼ぶ。`shares` は
-/// `(tag, host_dir, "ro" / "rw")` の並び（長さが 3 の倍数であることは呼び出し側が検査済み）。副作用は無い。
+/// `(tag, host_dir, "ro" / "rw", guest_mount または "")` の並び（長さが 4 の倍数であることは呼び出し側が
+/// 検査済み）。`console_log` が空でなければシリアルコンソールのログ先にする（ゲスト init の報告の受け口。MAC-1）。
+/// 構成の組み立てと検証のみで、ログファイルは作らない。
 fn build_spec(
     kernel: &str,
     initrd: &str,
     cmdline: &str,
+    console_log: &str,
     shares: &[String],
     share_scan_timeout: Duration,
 ) -> Result<VmConfigSpec, PluginError> {
@@ -718,27 +752,42 @@ fn build_spec(
     };
     let mut specs = Vec::new();
     // 端数は呼び出し側で検査済みのため捨てる剰余は空。
-    let (triples, _) = shares.as_chunks::<3>();
-    for [tag, dir, access] in triples {
+    let (quads, _) = shares.as_chunks::<SHARE_ITEMS>();
+    for [tag, dir, access, mount] in quads {
         let access = match access.as_str() {
             "ro" => ShareAccess::ReadOnly,
             "rw" => ShareAccess::ReadWrite,
             _ => return Err(invalid(MSG_MALFORMED)),
         };
-        specs.push(VirtiofsShareSpec::new(
+        let mut share = VirtiofsShareSpec::new(
             VirtiofsTag::try_new(tag).map_err(config_to_plugin)?,
             // 要求の値を解決せずに検証する（既知の別名だけ実体へ置換。モジュール doc 参照）。
             SharedDirectoryPath::try_new(&rewrite_known_alias(dir, KNOWN_ROOT_ALIASES))
                 .map_err(config_to_plugin)?,
             access,
-        ));
+        );
+        if !mount.is_empty() {
+            share =
+                share.with_guest_mount(GuestMountPoint::try_new(mount).map_err(config_to_plugin)?);
+        }
+        specs.push(share);
     }
-    let spec = VmConfigSpec::from_parts(Path::new(kernel), initrd, cmdline)
+    let mut spec = VmConfigSpec::from_parts(Path::new(kernel), initrd, cmdline)
         .map_err(config_to_plugin)?
         .with_shared_directories(VirtiofsSharesSpec::try_new(specs).map_err(config_to_plugin)?);
+    if !console_log.is_empty() {
+        let log = ConsoleLogPath::try_new(console_log).map_err(config_to_plugin)?;
+        let devices = DeviceConfigSpec::try_new(Vec::new(), Some(SerialConsoleSink::LogFile(log)))
+            .map_err(config_to_plugin)?;
+        spec = spec.with_devices(devices).map_err(config_to_plugin)?;
+    }
     // 走査は期限内に打ち切る（巨大な共有元で処理を占有しない。REPAIR-5）。
     spec.check_share_conflicts_within(share_scan_timeout)
         .map_err(config_to_plugin)?;
+    // マウント先つきなのにコンソール / `console=hvc0` が無い構成や、予約キー・長さ超過の cmdline は
+    // start まで持ち越さず create で拒否する（ファイルシステムに触れない純粋な検査）。
+    spec.guest_mount_plan().map_err(config_to_plugin)?;
+    spec.effective_cmdline().map_err(config_to_plugin)?;
     Ok(spec)
 }
 
@@ -933,6 +982,12 @@ mod tests {
     #[derive(Default)]
     struct Calls {
         launched: Vec<(PathBuf, Vec<(String, bool)>)>,
+        /// launch に渡された共有ごとのゲスト内マウント先（MAC-1）。
+        launched_mounts: Vec<Vec<Option<String>>>,
+        /// launch に渡された構成の実効 cmdline（ゲスト init への指示を含む）。
+        launched_cmdline: Vec<String>,
+        /// 設定されていれば launch がこの失敗を返す（`PlatformError` を要求どおりに写すかの照合用）。
+        launch_error: Option<PlatformError>,
         stopped: Vec<u32>,
         fail_launch: bool,
         /// VM 生成前に確定する失敗（非 macOS 相当）を返す。
@@ -963,6 +1018,22 @@ mod tests {
                     },
                 )));
             }
+            if let Some(e) = c.launch_error.take() {
+                return Err(BackendError::Platform(e));
+            }
+            let mounts = spec
+                .shares
+                .shares()
+                .iter()
+                .map(|s| s.guest_mount.as_ref().map(|m| m.as_str().to_string()))
+                .collect();
+            c.launched_mounts.push(mounts);
+            c.launched_cmdline.push(
+                spec.effective_cmdline()
+                    .expect("cmdline")
+                    .as_str()
+                    .to_string(),
+            );
             let shares = spec
                 .shares
                 .shares()
@@ -1025,7 +1096,7 @@ mod tests {
     }
 
     fn create_ok(a: &mut MacosRuntimeAdapter<Fake>, id: &str, k: &str) {
-        let r = a.handle(&s(&["create", id, k, "", "console=hvc0"]));
+        let r = a.handle(&s(&["create", id, k, "", "console=hvc0", ""]));
         assert_eq!(r.expect("create"), s(&["created"]));
     }
 
@@ -1048,9 +1119,11 @@ mod tests {
             &k,
             "",
             "console=hvc0",
+            "",
             "data",
             share.to_str().expect("utf8"),
             "rw",
+            "",
         ]));
         assert_eq!(r.expect("create"), s(&["created"]));
         assert!(f.0.borrow().launched.is_empty());
@@ -1085,7 +1158,8 @@ mod tests {
             &k,
             "",
             "console=hvc0",
-            &s(&["fandhe-io", share.to_str().expect("utf8"), "rw"]),
+            "",
+            &s(&["fandhe-io", share.to_str().expect("utf8"), "rw", ""]),
             Duration::from_secs(5),
         )
         .expect("spec");
@@ -1106,7 +1180,7 @@ mod tests {
         let k = kernel(&dir);
         let (mut a, _f) = adapter();
         create_ok(&mut a, "a", &k);
-        let dup = a.handle(&s(&["create", "a", &k, "", ""]));
+        let dup = a.handle(&s(&["create", "a", &k, "", "", ""]));
         assert_eq!(err_of(dup).0, PluginErrorCode::AlreadyExists);
         assert_eq!(
             err_of(a.handle(&s(&["stop", "zz"]))).0,
@@ -1119,7 +1193,7 @@ mod tests {
         for i in 1..MAX_CONTAINERS {
             create_ok(&mut a, &format!("n{i}"), &k);
         }
-        let over = a.handle(&s(&["create", "over", &k, "", ""]));
+        let over = a.handle(&s(&["create", "over", &k, "", "", ""]));
         assert_eq!(
             err_of(over),
             (
@@ -1135,10 +1209,21 @@ mod tests {
         let (mut a, _f) = adapter();
         let cases: Vec<Vec<String>> = vec![
             s(&["create", "a", "/k", ""]),
-            s(&["create", "a", "/k", "", "c", "tag"]),
-            s(&["create", "a", "/k", "", "c", "tag", "/d", "SECRETMODE"]),
-            s(&["create", "..", "/k", "", "c"]),
-            s(&["create", "a/b", "/k", "", "c"]),
+            s(&["create", "a", "/k", "", "c", "", "tag"]),
+            s(&[
+                "create",
+                "a",
+                "/k",
+                "",
+                "c",
+                "",
+                "tag",
+                "/d",
+                "SECRETMODE",
+                "",
+            ]),
+            s(&["create", "..", "/k", "", "c", ""]),
+            s(&["create", "a/b", "/k", "", "c", ""]),
             s(&["start"]),
             s(&["start", "a", "extra"]),
             s(&["stop", ""]),
@@ -1222,7 +1307,7 @@ mod tests {
         let (c, m) = err_of(a.handle(&s(&["stop", "a"])));
         assert_eq!(c, PluginErrorCode::FailedPrecondition);
         assert_eq!(m, "previous launch failed and VM shutdown is unconfirmed");
-        let (c, _) = err_of(a.handle(&s(&["create", "a", &k, "", ""])));
+        let (c, _) = err_of(a.handle(&s(&["create", "a", &k, "", "", ""])));
         assert_eq!(c, PluginErrorCode::AlreadyExists);
         assert!(f.0.borrow().stopped.is_empty());
     }
@@ -1427,7 +1512,9 @@ mod tests {
         k: &str,
         host_dir: &str,
     ) -> Result<Vec<String>, PluginError> {
-        a.handle(&s(&["create", id, k, "", "", "data", host_dir, "ro"]))
+        a.handle(&s(&[
+            "create", id, k, "", "", "", "data", host_dir, "ro", "",
+        ]))
     }
 
     /// TASK-115.3・MAC-1・SEC-4: 共有元は要求の値のまま検証し、symlink 経由（最終要素・祖先）・相対パス・
@@ -1619,7 +1706,7 @@ mod tests {
             releases.push(release);
             a.validation_gate = Some(gate);
             assert_eq!(
-                err_of(a.handle(&s(&["create", "a", &k, "", ""]))),
+                err_of(a.handle(&s(&["create", "a", &k, "", "", ""]))),
                 (
                     PluginErrorCode::Timeout,
                     "request validation did not finish in time".to_string()
@@ -1628,7 +1715,7 @@ mod tests {
         }
         assert_eq!(a.workers.live(), isolate::MAX_WORKERS);
         assert_eq!(
-            err_of(a.handle(&s(&["create", "a", &k, "", ""]))),
+            err_of(a.handle(&s(&["create", "a", &k, "", "", ""]))),
             (
                 PluginErrorCode::Unavailable,
                 "too many operations are blocked on the host file system".to_string()
@@ -1687,9 +1774,9 @@ mod tests {
         let missing = dir.join("missing");
         let missing = missing.to_str().expect("utf8");
         let request = |n: usize| {
-            let mut body = s(&["create", "c1", &k, "", ""]);
+            let mut body = s(&["create", "c1", &k, "", "", ""]);
             for i in 0..n {
-                body.extend(s(&[&format!("t{i}"), missing, "ro"]));
+                body.extend(s(&[&format!("t{i}"), missing, "ro", ""]));
             }
             body
         };
@@ -1769,7 +1856,7 @@ mod tests {
         // OS 非依存の絶対パス（Windows では Unix 形式パスが相対扱いになるため temp_dir 基準にする）。
         let missing = std::env::temp_dir().join("fc-adapter-SECRETPATH-missing");
         let missing = missing.to_str().expect("utf8");
-        let (c, m) = err_of(a.handle(&s(&["create", "a", missing, "", ""])));
+        let (c, m) = err_of(a.handle(&s(&["create", "a", missing, "", "", ""])));
         assert_eq!(c, PluginErrorCode::InvalidArgument);
         assert_eq!(m, "config.path_not_found: VM configuration was rejected");
         assert!(!m.contains("SECRETPATH"));
@@ -2143,7 +2230,8 @@ mod tests {
         let k = kernel(&dir);
         let mut a = MacosRuntimeAdapter::new(PlatformBackend::default());
         assert_eq!(
-            a.handle(&s(&["create", "a", &k, "", ""])).expect("create"),
+            a.handle(&s(&["create", "a", &k, "", "", ""]))
+                .expect("create"),
             s(&["created"])
         );
         assert_eq!(
@@ -2153,5 +2241,339 @@ mod tests {
                 MSG_UNSUPPORTED_HOST.to_string()
             )
         );
+    }
+
+    // ---- MAC-1・TASK-64 追補（#2075）: ゲスト内 virtiofs のマウント先とコンソールログ ----
+
+    /// `(tag, host_dir, access, guest_mount)`。
+    type GmShare<'a> = (&'a str, &'a str, &'a str, &'a str);
+
+    const GM_REJECTED: &str = "VM configuration was rejected";
+
+    /// マウント先つきの create 本体を組む（`shares` は `(tag, host_dir, access, guest_mount)`）。
+    fn gm_body(
+        id: &str,
+        k: &str,
+        cmdline: &str,
+        console_log: &str,
+        shares: &[(&str, &str, &str, &str)],
+    ) -> Vec<String> {
+        let mut b = s(&["create", id, k, "", cmdline, console_log]);
+        for (tag, dir, access, mount) in shares {
+            b.extend(s(&[tag, dir, access, mount]));
+        }
+        b
+    }
+
+    fn gm_share_dir(dir: &Path, name: &str) -> String {
+        let d = dir.join(name);
+        std::fs::create_dir_all(&d).expect("mkdir");
+        d.to_str().expect("utf8").to_string()
+    }
+
+    /// MAC-1: マウント先とコンソールログを受け、検証済みの値が backend の構成へ届き、cmdline に指示が付く。
+    #[cfg(unix)]
+    #[test]
+    fn mac1_guest_mount_point_accepted_and_reaches_backend() {
+        let dir = tmp_dir("gm-ok");
+        let k = kernel(&dir);
+        let (d1, d2) = (gm_share_dir(&dir, "s1"), gm_share_dir(&dir, "s2"));
+        let log = dir.join("console.log");
+        let (mut a, f) = adapter();
+        let body = gm_body(
+            "c1",
+            &k,
+            "console=hvc0",
+            log.to_str().expect("utf8"),
+            &[
+                ("data", &d1, "rw", "/mnt/fandhe/data"),
+                ("ro", &d2, "ro", "/mnt/fandhe/ro"),
+            ],
+        );
+        assert_eq!(a.handle(&body).expect("create"), s(&["created"]));
+        assert_eq!(
+            a.handle(&s(&["start", "c1"])).expect("start"),
+            s(&["running"])
+        );
+        let c = f.0.borrow();
+        assert_eq!(
+            c.launched_mounts,
+            vec![vec![
+                Some("/mnt/fandhe/data".to_string()),
+                Some("/mnt/fandhe/ro".to_string())
+            ]]
+        );
+        assert_eq!(
+            c.launched_cmdline,
+            vec![
+                "console=hvc0 fandhe.virtiofs=data:/mnt/fandhe/data:rw fandhe.virtiofs=ro:/mnt/fandhe/ro:ro"
+                    .to_string()
+            ]
+        );
+    }
+
+    /// MAC-1: マウント先が空ならデバイス構成のみ（指示なし）。コンソールログだけの指定も受ける。
+    #[cfg(unix)]
+    #[test]
+    fn mac1_empty_guest_mount_keeps_device_only() {
+        let dir = tmp_dir("gm-empty");
+        let k = kernel(&dir);
+        let d1 = gm_share_dir(&dir, "s1");
+        let log = dir.join("console.log");
+        let (mut a, f) = adapter();
+        let body = gm_body(
+            "c1",
+            &k,
+            "console=hvc0",
+            log.to_str().expect("utf8"),
+            &[("data", &d1, "ro", "")],
+        );
+        a.handle(&body).expect("create");
+        a.handle(&s(&["start", "c1"])).expect("start");
+        let c = f.0.borrow();
+        assert_eq!(c.launched_mounts, vec![vec![None]]);
+        assert_eq!(c.launched_cmdline, vec!["console=hvc0".to_string()]);
+    }
+
+    /// MAC-1・SEC-4: 不正なマウント先は固定文言で拒否し、値を message へ反射せず、launch に至らない。
+    #[cfg(unix)]
+    #[test]
+    fn mac1_sec4_guest_mount_point_rejected_without_reflection() {
+        let dir = tmp_dir("gm-bad");
+        let k = kernel(&dir);
+        let (d1, d2) = (gm_share_dir(&dir, "s1"), gm_share_dir(&dir, "s2"));
+        let log = dir.join("console.log");
+        let log = log.to_str().expect("utf8");
+        let long = format!("/mnt/fandhe/{}SECRET", "a".repeat(64));
+        let cases: Vec<(String, &str)> = vec![
+            ("/etc".into(), "config.guest_mount_point_not_under_base"),
+            (
+                "/mnt/fandhe".into(),
+                "config.guest_mount_point_not_under_base",
+            ),
+            (
+                "relative/SECRET".into(),
+                "config.guest_mount_point_not_under_base",
+            ),
+            (
+                "/mnt/fandhe/../SECRET".into(),
+                "config.guest_mount_point_invalid",
+            ),
+            (
+                "/mnt/fandhe/a//b".into(),
+                "config.guest_mount_point_invalid",
+            ),
+            (
+                "/mnt/fandhe/a/b/c/d/e".into(),
+                "config.guest_mount_point_invalid",
+            ),
+            (
+                "/mnt/fandhe/SE CRET".into(),
+                "config.guest_mount_point_invalid",
+            ),
+            (long, "config.guest_mount_point_too_long"),
+        ];
+        for (mount, code) in cases {
+            let (mut a, f) = adapter();
+            let body = gm_body(
+                "c1",
+                &k,
+                "console=hvc0",
+                log,
+                &[("data", &d1, "rw", &mount)],
+            );
+            let (c, m) = err_of(a.handle(&body));
+            assert_eq!(
+                (c, m.clone()),
+                (
+                    PluginErrorCode::InvalidArgument,
+                    format!("{code}: {GM_REJECTED}")
+                ),
+                "mount={mount}"
+            );
+            assert!(!m.contains("SECRET"));
+            assert!(f.0.borrow().launched.is_empty());
+        }
+        // 同一・入れ子（大文字小文字非区別）のマウント先は重複として拒否する。
+        let (mut a, _f) = adapter();
+        let body = gm_body(
+            "c1",
+            &k,
+            "console=hvc0",
+            log,
+            &[
+                ("one", &d1, "ro", "/mnt/fandhe/a"),
+                ("two", &d2, "ro", "/mnt/fandhe/A/b"),
+            ],
+        );
+        assert_eq!(
+            err_of(a.handle(&body)),
+            (
+                PluginErrorCode::InvalidArgument,
+                format!("config.duplicate_guest_mount_point: {GM_REJECTED}")
+            )
+        );
+    }
+
+    /// MAC-1: マウント先があるのにコンソールログ / `console=hvc0` が無い要求は create で拒否し、登録しない。
+    #[cfg(unix)]
+    #[test]
+    fn mac1_guest_mount_requires_console_at_create() {
+        let dir = tmp_dir("gm-console");
+        let k = kernel(&dir);
+        let d1 = gm_share_dir(&dir, "s1");
+        let log = dir.join("console.log");
+        let log = log.to_str().expect("utf8");
+        let (mut a, _f) = adapter();
+        let shares = [("data", d1.as_str(), "ro", "/mnt/fandhe/data")];
+        for (cmdline, console, code) in [
+            ("console=hvc0", "", "config.guest_mount_requires_console"),
+            ("quiet", log, "config.guest_mount_requires_console_arg"),
+        ] {
+            let body = gm_body("c1", &k, cmdline, console, &shares);
+            assert_eq!(
+                err_of(a.handle(&body)),
+                (
+                    PluginErrorCode::InvalidArgument,
+                    format!("{code}: {GM_REJECTED}")
+                )
+            );
+        }
+        // 拒否した create は登録されず、同じ id で作り直せる。
+        create_ok(&mut a, "c1", &k);
+    }
+
+    /// MAC-1・SEC-4: 不正なコンソールログの指定は固定文言で拒否し、パスを反射しない。
+    #[cfg(unix)]
+    #[test]
+    fn mac1_sec4_console_log_path_rejected_without_reflection() {
+        let dir = tmp_dir("gm-log-bad");
+        let k = kernel(&dir);
+        let rw = gm_share_dir(&dir, "rw");
+        let real = dir.join("real.log");
+        std::fs::write(&real, b"").expect("write");
+        let link = dir.join("SECRETlink.log");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let (mut a, f) = adapter();
+        let rw_log = format!("{rw}/SECRET.log");
+        let rw_share = [("w", rw.as_str(), "rw", "")];
+        let cases: Vec<(String, &[GmShare])> = vec![
+            ("SECRET/relative.log".to_string(), &[]),
+            (link.to_str().expect("utf8").to_string(), &[]),
+            (rw_log, &rw_share),
+            (k.clone(), &[]),
+        ];
+        for (log, shares) in cases {
+            let body = gm_body("c1", &k, "console=hvc0", &log, shares);
+            let (code, msg) = err_of(a.handle(&body));
+            assert!(
+                matches!(
+                    code,
+                    PluginErrorCode::InvalidArgument | PluginErrorCode::PermissionDenied
+                ),
+                "log={log} code={code:?}"
+            );
+            assert!(msg.ends_with(GM_REJECTED), "msg={msg}");
+            assert!(!msg.contains("SECRET") && !msg.contains(&*dir.to_string_lossy()));
+        }
+        assert!(f.0.borrow().launched.is_empty());
+    }
+
+    /// マウント先つきで create し、backend の launch が `err` を返すようにして start の結果を返す。
+    #[cfg(unix)]
+    fn gm_started(err: PlatformError) -> (MacosRuntimeAdapter<Fake>, (PluginErrorCode, String)) {
+        let dir = tmp_dir("gm-launch");
+        let k = kernel(&dir);
+        let d1 = gm_share_dir(&dir, "s1");
+        let log = dir.join("console.log");
+        let (mut a, f) = adapter();
+        let body = gm_body(
+            "c1",
+            &k,
+            "console=hvc0",
+            log.to_str().expect("utf8"),
+            &[("data", &d1, "ro", "/mnt/fandhe/data")],
+        );
+        a.handle(&body).expect("create");
+        f.0.borrow_mut().launch_error = Some(err);
+        let e = err_of(a.handle(&s(&["start", "c1"])));
+        (a, e)
+    }
+
+    /// MAC-1・REPAIR-5: 期限内に報告が来ない start は `TIMEOUT` で、停止未確認（`LaunchFailed`）として扱う。
+    #[cfg(unix)]
+    #[test]
+    fn mac1_guest_mount_report_timeout_maps_to_timeout() {
+        let (mut a, e) = gm_started(PlatformError::GuestMount(GuestMountError::Timeout {
+            after: LAUNCH_GUEST_MOUNT_TIMEOUT,
+            pending: vec!["SECRETTAG".into()],
+        }));
+        assert_eq!(
+            e,
+            (
+                PluginErrorCode::Timeout,
+                "guest_mount.timeout: guest did not report mount results in time".to_string()
+            )
+        );
+        assert_eq!(
+            err_of(a.handle(&s(&["start", "c1"]))),
+            (
+                PluginErrorCode::FailedPrecondition,
+                "container is not in the created state".to_string()
+            )
+        );
+        assert_eq!(a.stop_all().remaining, 1);
+    }
+
+    /// MAC-1・SEC-4: ゲストの失敗報告は `INTERNAL` で、共有タグを message に含めない。
+    #[cfg(unix)]
+    #[test]
+    fn mac1_guest_mount_failure_report_maps_to_internal() {
+        let (_a, e) = gm_started(PlatformError::GuestMount(GuestMountError::Failed {
+            tag: "SECRETTAG".into(),
+            errno: 5,
+        }));
+        assert_eq!(
+            e,
+            (
+                PluginErrorCode::Internal,
+                "guest_mount.failed: guest failed to mount a virtiofs share".to_string()
+            )
+        );
+    }
+
+    /// MAC-1: 共有の上限まで並べた create 本体は、フレームの項目数上限に収まる。旧形式（3 つ組）は拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn mac1_create_body_items_fit_frame_limit() {
+        let dir = tmp_dir("gm-items");
+        let k = kernel(&dir);
+        let d1 = gm_share_dir(&dir, "s1");
+        let shares: Vec<(String, &str)> = (0..=MAX_VIRTIOFS_SHARES)
+            .map(|i| (format!("t{i}"), d1.as_str()))
+            .collect();
+        let full: Vec<(&str, &str, &str, &str)> = shares[..MAX_VIRTIOFS_SHARES]
+            .iter()
+            .map(|(t, d)| (t.as_str(), *d, "ro", ""))
+            .collect();
+        let body = gm_body("c1", &k, "", "", &full);
+        assert_eq!(body.len(), 38);
+        assert!(body.len() <= crate::frame_loop::REQUEST_BODY_MAX_ITEMS);
+        let (mut a, _f) = adapter();
+        let over: Vec<(&str, &str, &str, &str)> = shares
+            .iter()
+            .map(|(t, d)| (t.as_str(), *d, "ro", ""))
+            .collect();
+        let (c, m) = err_of(a.handle(&gm_body("c1", &k, "", "", &over)));
+        assert_eq!(
+            (c, m.as_str()),
+            (
+                PluginErrorCode::InvalidArgument,
+                "config.too_many_virtiofs_shares: VM configuration was rejected"
+            )
+        );
+        // 旧形式（コンソール項目なし・3 つ組）は項目数が合わず malformed になる。
+        let old = s(&["create", "c1", &k, "", "c", "data", &d1, "rw"]);
+        assert_eq!(err_of(a.handle(&old)).0, PluginErrorCode::InvalidArgument);
     }
 }

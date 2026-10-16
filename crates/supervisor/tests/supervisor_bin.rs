@@ -1,9 +1,13 @@
-//! supervisor の bin（`fandhe-container-supervisor`）の外形の結合試験（TASK-157 追補・#1717・SUP-1・REPAIR-2・REPAIR-3・CLI-1）。
+//! supervisor の bin（`fandhe-container-supervisor`）の外形の結合試験（TASK-157 追補・#1717・#1819・SUP-1・REPAIR-2・
+//! REPAIR-3・CLI-1）。
 //!
 //! 実バイナリを CLI と同じ契約（argv・stdout の pipe の結果チャネル）で起動し、報告 1 行・終了コード・状態を具体値で
-//! 照合する。root 不要で既定のテスト集合で動く。core の本番 `ProcessLauncher`（#1715 の Phase B）が無い間、
-//! 起動は `UNIMPLEMENTED` で止まる。この挙動を固定するのが `repair3_bin_fails_closed_until_core_launcher_exists` で、
-//! Phase B の PR で Running を照合する試験に置き換える。`FileStateStore` は Linux 限定のため全体を Linux に限る。
+//! 照合する。root 不要で既定のテスト集合で動く。起動は core の本番 launcher（`ProductionLauncher`）まで結線済みで、
+//! 到達する分岐は実行環境（実効 uid・Landlock ABI・cgroup の委譲・user namespace）で変わる。そのため
+//! `sup1_bin_reaches_production_launcher_and_fails_closed` は、環境から試験側で決められる分岐（rootful・Landlock ABI 6
+//! 未満）は報告のコードと文言まで完全一致で照合し、それ以外の分岐は fail-closed の不変条件（報告が 1 行・終了コードが
+//! 報告と整合・子と pid つきの Running を残さない）を照合する。実プロセスでの起動と `monitor` の通しは実機前提の
+//! `supervisor_bin_real`（`--ignored`・人間担当）が照合する。`FileStateStore` は Linux 限定のため全体を Linux に限る。
 
 #![cfg(target_os = "linux")]
 
@@ -134,33 +138,77 @@ fn args(root: &Path, id: &str) -> Vec<String> {
     ]
 }
 
-/// REPAIR-3・SUP-1: core の本番 launcher が無い間、bin は副作用の前に UNIMPLEMENTED で止まり、状態は Created のまま。
+/// 手順 4（副作用なしの事前確認）で止まるはずの環境なら、その報告のコードと固定文言。試験側で環境から決められる分岐
+/// だけを返す（rootful は実効 uid、Landlock は `detect_landlock_abi`）。判定の順は bin と同じ（権限モデル → Landlock）。
+fn expected_check_failure() -> Option<(ErrorCode, &'static str)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let euid_is_root = std::fs::metadata("/proc/self").is_ok_and(|m| m.uid() == 0);
+    if euid_is_root {
+        return Some((
+            ErrorCode::Unimplemented,
+            "rootful start is not supported by the production launcher",
+        ));
+    }
+    fandhe_container_core::landlock::detect_landlock_abi()
+        .err()
+        .map(|e| {
+            (
+                e.code,
+                "Landlock ABI 6 or newer is required to start a container",
+            )
+        })
+}
+
+/// SUP-1・CORE-1・CORE-2・CORE-5・SEC-5・REPAIR-3・#1819: bin は本番 launcher まで到達し、旧「未提供」の報告で止まらない。
+/// 環境から決められる事前確認の失敗は固定のコードと文言で照合し（副作用なし: 状態は Created・revision 不変・cgroup なし）、
+/// それ以外は fail-closed の不変条件を照合する（報告 1 行・終了コードの整合・pid つきの Running を残さない）。
 #[test]
-fn repair3_bin_fails_closed_until_core_launcher_exists() {
-    let env = Env::new("failclosed");
+fn sup1_bin_reaches_production_launcher_and_fails_closed() {
+    let env = Env::new("production");
     env.create("c1");
     let id = ContainerId::new("c1").unwrap();
     let before = env.store().get(&GetStateRequest::new(id.clone())).unwrap();
     let (code, stdout, _stderr) = run_with_pipe(bin().args(args(&env.root, "c1")));
-    let n = exit_code_for(ErrorCode::Unimplemented);
-    assert_eq!(code, Some(i32::from(n.get())));
-    assert_eq!(
-        String::from_utf8(stdout.clone()).unwrap(),
-        format!("FCSUP1 ERR UNIMPLEMENTED {n} production process launcher is not available yet\n")
-    );
-    assert!(matches!(
-        StartReport::decode(&stdout).unwrap(),
-        StartReport::Failed {
-            code: ErrorCode::Unimplemented,
-            ..
-        }
-    ));
+    // 報告は改行で終わる 1 行だけ。
+    assert_eq!(stdout.iter().filter(|&&b| b == b'\n').count(), 1);
+    let report = StartReport::decode(&stdout).unwrap();
     let after = env.store().get(&GetStateRequest::new(id)).unwrap();
-    assert_eq!(after.status().state(), ContainerState::Created);
-    assert_eq!(after.revision(), before.revision());
-    assert!(after.cgroup().is_none());
+    match report {
+        StartReport::Failed {
+            code: c,
+            exit_code,
+            message,
+        } => {
+            // 旧「本番 launcher は未提供」の報告ではない。
+            assert_ne!(
+                message.as_str(),
+                "production process launcher is not available yet"
+            );
+            // 終了コードは報告のコード、または後始末を確かめられなかった INTERNAL。
+            let internal = exit_code_for(ErrorCode::Internal);
+            assert!(
+                code == Some(i32::from(exit_code.get())) || code == Some(i32::from(internal.get())),
+                "exit code {code:?} for report {c:?}"
+            );
+            if let Some((expected_code, expected_message)) = expected_check_failure() {
+                assert_eq!(c, expected_code);
+                assert_eq!(message.as_str(), expected_message);
+                assert_eq!(code, Some(i32::from(exit_code_for(expected_code).get())));
+                assert_eq!(after.status().state(), ContainerState::Created);
+                assert_eq!(after.revision(), before.revision());
+                assert!(after.cgroup().is_none());
+            }
+            // pid つきの Running を残さない（子を残さない。予約だけが残る場合の pid は無い）。
+            assert!(after.status().pid().is_none());
+        }
+        StartReport::Started { pid } => {
+            // 全前提が揃った環境で起動できた場合: bin の終了後は Stopped で、子は残っていない。
+            assert_eq!(after.status().state(), ContainerState::Stopped);
+            assert!(!Path::new(&format!("/proc/{pid}")).exists());
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
 }
-
 /// SUP-1: 引数の誤りは INVALID_ARGUMENT を報告し、状態に触れない。
 #[test]
 fn sup1_bin_reports_invalid_arguments() {

@@ -430,6 +430,95 @@ fn start_inner(
     req: &StartRequest,
     timeouts: &StartTimeouts,
 ) -> Result<StartedContainer, TraitError> {
+    let claimed = claim_inner(store, launcher.as_ref(), req)?;
+    launch_inner(store, launcher, claimed, timeouts)
+}
+
+/// 起動権を予約済みで、launch だけが残った状態（[`claim_start`] の結果。CORE-2・REPAIR-5・#1819）。
+///
+/// 状態の読み取り・bundle の検証・所有ロックの取得・予約の更新（`StateStore` と bundle のファイル I/O）を
+/// 済ませたもの。呼び出し元（supervisor）はこの段階までを別スレッドで期限つきに実行し、`SelfBounded` の
+/// launcher を呼ぶ [`launch_claimed`] だけを単一スレッドの入口スレッドで行える。launch を行わずに捨てる場合は
+/// [`ClaimedStart::release`] で予約を Created へ戻す（戻さずに落とすと Running・pid なしの予約が残り、
+/// [`recover_interrupted_start`] での回復が要る）。
+#[must_use = "a claimed start must be launched or released"]
+pub struct ClaimedStart {
+    reservation: Arc<StartReservation>,
+    id: ContainerId,
+    claimed: StateRecord,
+    spec: LaunchSpec,
+}
+
+impl ClaimedStart {
+    /// launch せずに予約を Created へ戻す。戻せなければ `Internal`（予約は残り、回復が要る）。
+    pub fn release(self, store: &dyn StateStore) -> Result<(), OciRuntimeError> {
+        let Self {
+            reservation,
+            id,
+            claimed,
+            spec,
+        } = self;
+        let result = store.update(&UpdateStateRequest::new(
+            ContainerStatus::created(id.clone(), None),
+            claimed.revision(),
+        ));
+        // 予約（プロセス内・所有ロック）は状態を戻した後に手放す。
+        drop(spec);
+        drop(reservation);
+        result.map(|_| ()).map_err(|_| {
+            OciRuntimeError::new(
+                LifecycleOp::Start,
+                ErrorCode::Internal,
+                "the start reservation could not be released",
+            )
+        })
+    }
+}
+
+impl std::fmt::Debug for ClaimedStart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimedStart")
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+/// [`start`] の前半（launch の前まで）。状態を検証し、起動権を予約して [`ClaimedStart`] を返す。
+///
+/// launcher の launch は呼ばない（bind mount の検証の拒否を `launcher` の監査 sink へ記録するために受け取る）。`StateStore` と bundle のファイル I/O を含むため、呼び出し元が期限を課したい場合は
+/// 別スレッドで呼ぶ（REPAIR-5）。失敗時は予約を取っておらず、状態は変わらない（拒否の条件は [`start`] と同じ）。
+pub fn claim_start(
+    store: &dyn StateStore,
+    launcher: &dyn ProcessLauncher,
+    req: &StartRequest,
+) -> Result<ClaimedStart, OciRuntimeError> {
+    claim_inner(store, launcher, req)
+        .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Start, e))
+}
+
+/// [`start`] の後半。`SelfBounded` の launcher は呼び出しスレッドで直接呼ぶ（単一スレッドの要求）。
+///
+/// 成功・失敗の件数と所要時間は `recorder` へ操作名 `start` で記録する（launch から状態記録まで）。失敗時の
+/// 予約の扱いは [`start`] と同じ。
+pub fn launch_claimed(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    launcher: &Arc<dyn ProcessLauncher>,
+    claimed: ClaimedStart,
+    timeouts: &StartTimeouts,
+) -> Result<StartedContainer, OciRuntimeError> {
+    let to_err = |e: TraitError| OciRuntimeError::from_trait_error(LifecycleOp::Start, e);
+    let name = OpName::new(START_OP_NAME).map_err(to_err)?;
+    recorder.record_op(&name, || {
+        launch_inner(store, launcher, claimed, timeouts).map_err(to_err)
+    })
+}
+
+fn claim_inner(
+    store: &dyn StateStore,
+    launcher: &dyn ProcessLauncher,
+    req: &StartRequest,
+) -> Result<ClaimedStart, TraitError> {
     let reservation = Arc::new(StartReservation::acquire(req.id())?);
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     if record.status().state() != ContainerState::Created {
@@ -447,12 +536,7 @@ fn start_inner(
         ));
     }
 
-    let spec = build_spec(
-        record.bundle(),
-        req.id(),
-        launcher.as_ref(),
-        store.host_state_root(),
-    )?;
+    let spec = build_spec(record.bundle(), req.id(), launcher, store.host_state_root())?;
 
     // 起動権の所有ロック（プロセス間の排他）を予約の前に取り、launch が終わるまで保持する。所有ロックを
     // 持つプロセスが終了すればカーネルが解放するため、回復はその終了を条件にできる（CORE-2）。
@@ -463,6 +547,26 @@ fn start_inner(
         ContainerStatus::running(req.id().clone(), None),
         record.revision(),
     ))?;
+    Ok(ClaimedStart {
+        reservation,
+        id: req.id().clone(),
+        claimed,
+        spec,
+    })
+}
+
+fn launch_inner(
+    store: &dyn StateStore,
+    launcher: &Arc<dyn ProcessLauncher>,
+    prepared: ClaimedStart,
+    timeouts: &StartTimeouts,
+) -> Result<StartedContainer, TraitError> {
+    let ClaimedStart {
+        reservation,
+        id,
+        claimed,
+        spec,
+    } = prepared;
 
     let launch_timeout = timeouts.launch();
     let terminate_timeout = timeouts.terminate();
@@ -495,11 +599,11 @@ fn start_inner(
                 ),
             ));
         }
-        Ok(Err(err)) => return Err(release_claim(store, req.id(), &claimed, err)),
+        Ok(Err(err)) => return Err(release_claim(store, &id, &claimed, err)),
         // launch は呼ばれていないため予約を戻してよい。
         Err(Unbounded::SpawnFailed) => {
             let err = TraitError::new(ErrorCode::Internal, "failed to run the process launcher");
-            return Err(release_claim(store, req.id(), &claimed, err));
+            return Err(release_claim(store, &id, &claimed, err));
         }
         // launch がまだ進行中でプロセスが後から現れ得るため、予約は Created へ戻さない（CORE-2）。
         Err(Unbounded::TimedOut) => {
@@ -511,7 +615,7 @@ fn start_inner(
         }
     };
 
-    let running = ContainerStatus::running(req.id().clone(), Some(process.pid()));
+    let running = ContainerStatus::running(id.clone(), Some(process.pid()));
     match store.update(&UpdateStateRequest::new(running, claimed.revision())) {
         // ハンドルは呼び出し元（監視・回収の所有者）へ引き渡す（捨てると回収できない。CORE-1）。
         Ok(record) => Ok(StartedContainer { record, process }),
@@ -520,7 +624,7 @@ fn start_inner(
             // 未記録プロセスが残り得ることを呼び出し元へ伝える（元のエラーで隠さない。予約は残す）。
             // 回収を確認できなかったハンドルは未回収レジストリに残り、監視側が引き取って再試行する。
             if terminate_bounded(process, terminate_timeout) {
-                Err(release_claim(store, req.id(), &claimed, err))
+                Err(release_claim(store, &id, &claimed, err))
             } else {
                 Err(TraitError::new(
                     ErrorCode::Internal,
@@ -1613,6 +1717,46 @@ mod tests {
         let err = run(&store, &launcher, "twice").expect_err("second");
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(launcher.calls(), 1);
+    }
+
+    /// CORE-2・REPAIR-5（#1819）: claim_start は launcher を呼ばずに予約し、release で Created へ戻る。
+    /// 予約中は同じ ID の start が拒否される。launch_claimed は予約済みから launch して Running へ進む。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_claim_release_and_launch_claimed_split_start() {
+        let (_b, store) = created("split");
+        let launcher = RecordingLauncher::new(false);
+        let claimed = claim_start(&store, launcher.as_ref(), &sid("split")).expect("claim");
+        assert_eq!(launcher.calls(), 0);
+        let rec = store
+            .get(&GetStateRequest::new(
+                ContainerId::new("split").expect("id"),
+            ))
+            .expect("get");
+        assert_eq!(rec.status().state(), ContainerState::Running);
+        assert!(rec.status().pid().is_none());
+        let err = run(&store, &launcher, "split").expect_err("claimed");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        claimed.release(&store).expect("release");
+        let rec = store
+            .get(&GetStateRequest::new(
+                ContainerId::new("split").expect("id"),
+            ))
+            .expect("get");
+        assert_eq!(rec.status().state(), ContainerState::Created);
+
+        let claimed = claim_start(&store, launcher.as_ref(), &sid("split")).expect("claim again");
+        let started = launch_claimed(
+            &store,
+            &OpRecorder::new(),
+            &dynl(&launcher),
+            claimed,
+            &StartTimeouts::default(),
+        )
+        .expect("launch");
+        assert_eq!(launcher.calls(), 1);
+        assert_eq!(started.record().status().state(), ContainerState::Running);
+        assert!(started.record().status().pid().is_some());
     }
 
     /// SEC-1: create 後に壊れた JSON へ書き換えられた config は start で拒否される（TOCTOU）。

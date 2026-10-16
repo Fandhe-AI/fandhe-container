@@ -12,8 +12,12 @@
 //! 1 進む（再 launch 失敗・記録失敗は数えない）。
 //!
 //! # 未実装の将来仕様（REPAIR-3）
-//! - 本番の再 launch は [`LauncherRelauncher`]（start で使った launcher と `LaunchSpec` をそのまま使うアダプタ。#1717）で
-//!   足りるが、core の本番 `ProcessLauncher` が未提供のため実機では成り立たない（SUP-3。bin 入口は [`crate::start_entry`]）。実機でのレイテンシ実測・合否判定は #490・#491（TASK-160）の担当。
+//! - 本番の再 launch は [`LauncherRelauncher`]（start で使った launcher と `LaunchSpec` をそのまま使うアダプタ。#1717）で、
+//!   bin 入口（[`crate::start_entry`]）は core の本番 `ProcessLauncher` を結線済み（#1819）。ただし再 launch は
+//!   `relaunch_bounded` の `fandhe-relaunch` スレッドや `stderr_sink` の常駐スレッドが存在する状態で呼ばれ、本番 launcher の
+//!   単一スレッドの要求を満たせないため、`FailedPrecondition` で拒否されて [`SuperviseOutcome::RelaunchFailed`] になる
+//!   （fail-closed。新しい子は作られない）。実機で成立させる再構成は #2043（SUP-3・CORE-1）で、レイテンシ実測・合否判定
+//!   （#490・#491。TASK-160）はその後になる。
 //! - 明示的な stop の検知は SUP-9 の担当で、本モジュールは [`StopToken`] を [`StopIntent`] へ写すだけ。
 //!   再 launch 時の `unless-stopped` と `always` の差（stop 済みを復帰させるか）も未実装（SUP-3・SUP-9）。
 //! - [`crate::run::MonitorOutcome::ExitedUnrecorded`]（終了は回収済みだが記録失敗）の回復は未実装で、
@@ -257,7 +261,7 @@ const BACKOFF_SLICE: Duration = Duration::from_millis(10);
 /// 同じコンテナのプロセスを再 launch する拡張点（SUP-3・TASK-159.3）。
 ///
 /// [`supervise_with_restart`] へ呼び出し側から注入する。本番のアダプタは [`LauncherRelauncher`]（#1717）で、
-/// 中身の core の本番 `ProcessLauncher` は未提供（REPAIR-3）。
+/// 中身の core の本番 `ProcessLauncher` は結線済み（#1819）だが、再 launch は単一スレッドの要求を満たせず拒否される（#2043。REPAIR-3）。
 ///
 /// 期限は実装への依頼だけに頼らず、[`supervise_with_restart`] が別スレッド上の呼び出し境界で強制する
 /// （上限＋[`RELAUNCH_REPLY_GRACE`] で待ちをやめる。REPAIR-5）。そのため `Send + Sync` を要求する。

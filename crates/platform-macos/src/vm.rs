@@ -28,8 +28,9 @@
 //! `VmError::Timeout` を返すことを Linux 上のテストで検証する。
 //!
 //! ゲスト内 virtiofs mount の待機（TASK-65.3）: `Vm::launch` は `start` 成功後、mount 指定つき共有の報告を
-//! `guest_mount` モジュールの契約で `OpTimeouts::guest_mount`（既定 60 秒）を上限に待つ。ゲスト init が未実装の
-//! 間（REPAIR-3）は、mount 指定つきの `launch` は報告が届かず `guest_mount.timeout` になる。
+//! `guest_mount` モジュールの契約で `OpTimeouts::guest_mount`（既定 60 秒）を上限に待つ。ゲスト init は
+//! `crates/guest-init`（#1875）で実装済みだが、initrd への梱包（#1878）と実機確認（#1628）までは、
+//! mount 指定つきの `launch` は報告が届かず `guest_mount.timeout` になりうる（REPAIR-3）。
 //!
 //! 起動失敗時のクリーンアップ（TASK-64.5）: 失敗した完了通知の直後に `Core::complete_and_settle` が
 //! VZ の実状態へ追従し、状態機械が `Error` のまま残らない。`Vm::launch`（macOS）は設定の構築・VM 生成・

@@ -80,6 +80,6 @@ pub use launch::{
 pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
 pub use mount_destination::{MountDestination, audit_mount_config_error};
 pub use start::{
-    LAUNCHER_REPLY_GRACE, StartedContainer, recover_interrupted_start, start,
-    take_unreaped_processes,
+    ClaimedStart, LAUNCHER_REPLY_GRACE, StartedContainer, claim_start, launch_claimed,
+    recover_interrupted_start, start, take_unreaped_processes,
 };

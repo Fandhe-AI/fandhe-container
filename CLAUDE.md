@@ -39,6 +39,7 @@ fandhe-container/
 │   ├── io/                        #   I/O 共有層（バッチ write-back・フラッシュバリア・FS 正規化）
 │   ├── core/                      #   実行層（namespace・cgroups v2・seccomp/Landlock・rootless）
 │   ├── supervisor/                #   コンテナごとの軽量監視プロセス（bin: fandhe-container-supervisor・特権ランチャー fandhe-container-launcher〔TASK-171 追補・#1719〕）
+│   ├── guest-init/                #   macOS ゲスト VM の initrd に入れる Rust 製 PID 1（bin: fandhe-container-guest-init。静的リンクの aarch64-unknown-linux-musl。TASK-64 追補・#1875・MAC-1）
 │   ├── oci/ / cri/                #   OCI イメージ・ライフサイクル / CRI
 │   │   └── cri/proto/             #     cri-api の .proto（kubernetes/cri-api v0.37.1 無改変）と出典 README（TASK-56.2・CRI-3）
 │   ├── platform-macos/ / platform-windows/ / microvm/  # プラットフォーム層
@@ -104,7 +105,7 @@ main セッションはオーケストレーションに徹し、調査・実装
 | `crates/io/` | explorer | io-builder |
 | `crates/core/`・`crates/supervisor/` | explorer | runtime-builder |
 | `crates/oci/`・`crates/cri/`・`plugin-cri` | explorer | oci-cri-builder |
-| `crates/platform-*/`・`crates/microvm/`・`plugin-macos` / `-windows` / `-microvm` | explorer | platform-builder |
+| `crates/platform-*/`・`crates/guest-init/`・`crates/microvm/`・`plugin-macos` / `-windows` / `-microvm` | explorer | platform-builder |
 | `crates/gpu/` | explorer | gpu-builder |
 | `crates/net/` | explorer | net-builder |
 | `crates/plugin/`・`plugin-mcp` | explorer | plugin-builder |

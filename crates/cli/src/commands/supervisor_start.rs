@@ -16,7 +16,7 @@
 //! - `process_group(0)` で別のプロセスグループにし、端末の SIGINT / SIGHUP が supervisor に届かないようにする。
 //!
 //! # 期限と子の扱い（REPAIR-5）
-//! - 受信期限は `cli_receive_deadline`（既定 35 秒）。期限内に 1 行が来なければ `TIMEOUT`（結果不明）、1 行も無いまま EOF なら
+//! - 受信期限は `cli_receive_deadline`（既定 36 秒）。期限内に 1 行が来なければ `TIMEOUT`（結果不明）、1 行も無いまま EOF なら
 //!   `INTERNAL`。読み込みは `MAX_REPORT_LEN` バイトで頭打ちにし、改行の無い出力で無制限に確保しない。
 //! - supervisor は報告の後も生き続け stdout を閉じないため、EOF を待たず 1 行の受信で完了とみなす。
 //! - どの枝でも子を `wait` しない。supervisor は CLI より長く生きる前提で、期限切れでも kill しない
@@ -216,7 +216,7 @@ fn launch_and_receive(
     (map_received(received), Some(child))
 }
 
-/// CLI の受信期限（既定 35 秒。supervisor の内部上限 33 秒 + 受信の猶予 2 秒。REPAIR-5）。
+/// CLI の受信期限（既定 36 秒。supervisor の内部上限 34 秒（手順 8 の見込み 28 秒 + cgroup 準備 6 秒。`result_deadline` 参照） + 受信の猶予 2 秒。REPAIR-5）。
 fn production_deadline() -> Duration {
     cli_receive_deadline(&StartTimeouts::default())
 }
@@ -480,10 +480,10 @@ mod tests {
         }
     }
 
-    /// REPAIR-5: 本番の受信期限は 35 秒。
+    /// REPAIR-5: 本番の受信期限は 36 秒。
     #[test]
-    fn repair5_production_deadline_is_35s() {
-        assert_eq!(production_deadline(), Duration::from_secs(35));
+    fn repair5_production_deadline_is_36s() {
+        assert_eq!(production_deadline(), Duration::from_secs(36));
     }
 
     /// 契約: stdout 以外は null、環境は PATH だけ、cwd は `/`、argv は契約の順。

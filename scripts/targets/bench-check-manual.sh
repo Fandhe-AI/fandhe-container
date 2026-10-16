@@ -13,23 +13,26 @@
 #   BENCH_RESULTS          必須。結果ファイルの絶対パス（通常ファイル・symlink 不可・1 MiB 以下）
 #   BENCH_MANUAL_BASELINE  任意。基準値（既定 benches/baseline-manual.json。実測の確定は TASK-88.h1・#230）
 #   BENCH_METRICS          任意。metrics の SSOT（既定 benches/metrics.json）
+#   BENCH_HOST_KIND        基準値があるとき必須。実測したホストの種類（bare-metal / vm / wsl2。lib.sh の語彙）。
+#                          結果の .arch と基準値の host.arch、または host.kind が食い違うと比較せず 2（#2095）
 #
 # 終了コード: 0 合格（基準値が無い間は skip: を出して 0。結果の検査は行う）/ 1 回帰を検出 / 2 入力エラー。
 # 失敗した実行（metrics が空・failures.total > 0・leftover_ids 有り）は基準値の有無に関わらず 2（fail-closed）。
+# 結果の arch が語彙外でも 2。基準値は make bench-baseline-manual で作る（host を持たない基準値は 2）。
 set -euo pipefail
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=../lib.sh
 source "${DIR}/../lib.sh"
 
-readonly MAX_FILE_BYTES=1048576
 err() { echo "error: invalid-input: $1" >&2; }
 
 BENCH_RESULTS="${BENCH_RESULTS:-}"
 BENCH_MANUAL_BASELINE="${BENCH_MANUAL_BASELINE:-benches/baseline-manual.json}"
 BENCH_METRICS="${BENCH_METRICS:-benches/metrics.json}"
+BENCH_HOST_KIND="${BENCH_HOST_KIND:-}"
 
 if [ -z "${BENCH_RESULTS}" ]; then
-  echo "usage: make bench-check-manual BENCH_RESULTS=<absolute path of the startup_latency results json>" >&2
+  echo "usage: make bench-check-manual BENCH_RESULTS=<absolute path of the startup_latency results json> BENCH_HOST_KIND=<bare-metal|vm|wsl2>" >&2
   exit 2
 fi
 case "${BENCH_RESULTS}" in
@@ -44,54 +47,21 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 2
 fi
 
-# 入力ファイルの検査（assemble_results.sh と同じ規則: symlink 拒否・通常ファイル・1 MiB 上限）。
-check_input_file() {
-  local path="$1" size
-  if [ -L "${path}" ]; then
-    err "${path} is a symlink, refusing to read"
-    exit 2
-  fi
-  if [ ! -f "${path}" ]; then
-    err "${path} is not an existing regular file"
-    exit 2
-  fi
-  if ! size=$(wc -c <"${path}" 2>/dev/null | tr -d ' '); then
-    err "${path} could not be read"
-    exit 2
-  fi
-  if [ "${size}" -gt "${MAX_FILE_BYTES}" ]; then
-    err "${path} exceeds ${MAX_FILE_BYTES} bytes"
-    exit 2
-  fi
-}
-
-check_input_file "${BENCH_RESULTS}"
-check_input_file "${BENCH_METRICS}"
+bench_manual_check_input_file "${BENCH_RESULTS}"
+bench_manual_check_input_file "${BENCH_METRICS}"
 manual_json="$(bench_manual_metrics_jq)"
 
-# 結果そのものの検査（基準値の有無に関わらず行う）: 実機前提 metric だけを持ち、失敗・後始末の残りが無いこと。
-if ! jq -e --argjson m "${manual_json}" \
-  '.schema_version == 1
-   and ((.metrics | type) == "object")
-   and ((.metrics | keys | sort) == ($m | sort))
-   and (((.failures.total // 0) | . == 0))
-   and (((.leftover_ids // []) | length) == 0)' "${BENCH_RESULTS}" >/dev/null 2>&1; then
-  err "results must have schema_version 1, exactly the manual-bench metrics ${manual_json}, no failures and no leftover ids (a failed run emits empty metrics)"
+# 結果そのものの検査（基準値の有無に関わらず行う。bench-baseline-manual と共通の規則）。
+bench_manual_validate_results "${BENCH_RESULTS}" "${BENCH_METRICS}"
+
+# 環境の語彙検査（基準値の有無に関わらず行う）: 操作者指定のホストの種類と、結果の arch。
+if [ -n "${BENCH_HOST_KIND}" ] && ! bench_manual_in_vocab "${BENCH_HOST_KIND}" "${BENCH_MANUAL_HOST_KINDS}"; then
+  err "BENCH_HOST_KIND must be one of: ${BENCH_MANUAL_HOST_KINDS}"
   exit 2
 fi
-
-# 各 metric の値と単位の検査（基準値の有無に関わらず行う）: value は有限の正の数（文字列・0・負数・欠落は不可）、
-# unit は metrics.json に登録された単位（ms）と一致すること。metric 名だけの検査では {} も通ってしまうため。
-if ! jq -e --slurpfile reg "${BENCH_METRICS}" \
-  '(.metrics | to_entries | length > 0)
-   and (.metrics | to_entries | all(
-     (.value | type) == "object"
-     and ((.value.value | type) == "number")
-     and (.value.value > 0 and .value.value < 1.7976931348623157e308)
-     and ((.value.unit | type) == "string")
-     and (.value.unit == ($reg[0].metrics[.key].unit // null))
-   ))' "${BENCH_RESULTS}" >/dev/null 2>&1; then
-  err "every metric in results must have a finite positive numeric value and a unit equal to the registered one in ${BENCH_METRICS}"
+results_arch="$(jq -r '.arch // "" | if type == "string" then . else "" end' "${BENCH_RESULTS}")"
+if ! bench_manual_in_vocab "${results_arch}" "${BENCH_MANUAL_ARCHES}"; then
+  err "results must have a top-level arch that is one of: ${BENCH_MANUAL_ARCHES}"
   exit 2
 fi
 
@@ -99,13 +69,34 @@ if [ ! -e "${BENCH_MANUAL_BASELINE}" ] && [ ! -L "${BENCH_MANUAL_BASELINE}" ]; t
   echo "skip: bench-check-manual: ${BENCH_MANUAL_BASELINE} is not registered yet (TASK-88.h1 #230); results validated but not compared"
   exit 0
 fi
-check_input_file "${BENCH_MANUAL_BASELINE}"
+bench_manual_check_input_file "${BENCH_MANUAL_BASELINE}"
 
 # 基準値は実機前提 metric だけを持つこと（CI 向け metric の混入は共有 baseline.json との取り違え）。
 if ! jq -e --argjson m "${manual_json}" \
   '((.metrics | type) == "object") and ((.metrics | keys) - $m | length == 0)' \
   "${BENCH_MANUAL_BASELINE}" >/dev/null 2>&1; then
   err "${BENCH_MANUAL_BASELINE} must contain only the manual-bench metrics ${manual_json}"
+  exit 2
+fi
+
+# 環境の機械照合（fail-closed）: 基準値の host（arch・kind）と結果の環境が食い違う比較は行わない。
+# 食い違いを偽の合格・偽の回帰にしないため、比較スクリプトを呼ぶ前に 2 で終える（#2095・REPAIR-8）。
+base_arch="$(jq -r '.host.arch // "" | if type == "string" then . else "" end' "${BENCH_MANUAL_BASELINE}" 2>/dev/null || true)"
+base_kind="$(jq -r '.host.kind // "" | if type == "string" then . else "" end' "${BENCH_MANUAL_BASELINE}" 2>/dev/null || true)"
+if ! bench_manual_in_vocab "${base_arch}" "${BENCH_MANUAL_ARCHES}" || ! bench_manual_in_vocab "${base_kind}" "${BENCH_MANUAL_HOST_KINDS}"; then
+  err "${BENCH_MANUAL_BASELINE} must have host.arch (${BENCH_MANUAL_ARCHES}) and host.kind (${BENCH_MANUAL_HOST_KINDS}); regenerate it with make bench-baseline-manual"
+  exit 2
+fi
+if [ -z "${BENCH_HOST_KIND}" ]; then
+  err "BENCH_HOST_KIND is required when a baseline exists (one of: ${BENCH_MANUAL_HOST_KINDS})"
+  exit 2
+fi
+if [ "${results_arch}" != "${base_arch}" ]; then
+  err "environment mismatch: results arch ${results_arch} != baseline host.arch ${base_arch}"
+  exit 2
+fi
+if [ "${BENCH_HOST_KIND}" != "${base_kind}" ]; then
+  err "environment mismatch: BENCH_HOST_KIND ${BENCH_HOST_KIND} != baseline host.kind ${base_kind}"
   exit 2
 fi
 

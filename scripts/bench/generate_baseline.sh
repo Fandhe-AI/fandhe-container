@@ -9,7 +9,12 @@
 #
 # 使い方:
 #   generate_baseline.sh --metrics <metrics.json> --output <baseline.json> \
-#     [--environment <text>] <results.json>...
+#     [--environment <text>] [--arch <arch> --host-kind <kind>] <results.json>...
+#
+# --arch / --host-kind は同時にだけ指定でき、指定時だけ基準値に host: {arch, kind} を出力する
+# （実機前提ベンチの環境照合用。#2095・REPAIR-8）。書式は ^[a-z0-9_-]{1,32}$ で検査し、語彙の妥当性は
+# 呼び出し側（scripts/lib.sh の BENCH_MANUAL_ARCHES / BENCH_MANUAL_HOST_KINDS）が判定する。
+# 指定しなければ出力は従来と完全に同じ。
 #
 # 終了コード:
 #   0: 生成成功（往復検証に合格）
@@ -39,11 +44,15 @@ metrics_file=""
 output_file=""
 environment=""
 have_env=0
+host_arch=""
+host_kind=""
+have_arch=0
+have_kind=0
 results_files=()
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --metrics | --output | --environment)
+    --metrics | --output | --environment | --arch | --host-kind)
       if [ "$#" -lt 2 ]; then
         err "arg-count" "$1 requires a value"
         exit 2
@@ -54,6 +63,14 @@ while [ "$#" -gt 0 ]; do
         --environment)
           environment="$2"
           have_env=1
+          ;;
+        --arch)
+          host_arch="$2"
+          have_arch=1
+          ;;
+        --host-kind)
+          host_kind="$2"
+          have_kind=1
           ;;
       esac
       shift 2
@@ -91,6 +108,27 @@ fi
 if [ "${#environment}" -gt "$MAX_ENV_CHARS" ]; then
   err "invalid-input" "--environment exceeds ${MAX_ENV_CHARS} characters"
   exit 2
+fi
+
+if [ "$have_arch" -ne "$have_kind" ]; then
+  err "arg-count" "--arch and --host-kind must be given together"
+  exit 2
+fi
+if [ "$have_arch" -eq 1 ]; then
+  for v in "$host_arch" "$host_kind"; do
+    # bash 3.2（macOS）の [[ =~ ]] は区間指定 {1,32} の扱いが不定のため使わない。
+    # 文字種は case（改行入りも [!...] に合致して弾ける）、長さは ${#v} で検査する
+    case "$v" in
+      "" | *[!abcdefghijklmnopqrstuvwxyz0123456789_-]*)
+        err "invalid-input" "--arch / --host-kind must match ^[a-z0-9_-]{1,32}$"
+        exit 2
+        ;;
+    esac
+    if [ "${#v}" -gt 32 ]; then
+      err "invalid-input" "--arch / --host-kind must match ^[a-z0-9_-]{1,32}$"
+      exit 2
+    fi
+  done
 fi
 
 if ! command -v jq >/dev/null 2>&1; then
@@ -232,6 +270,7 @@ def is_finite_positive_number:
       + (if ($d.note | type) == "string" then {note: $d.note} else {} end)
       + { generated_at: ((if $epoch == "" then now else ($epoch | tonumber) end) | todate) }
       + (if $have_env == 1 then {environment: $env} else {} end)
+      + (if $have_host == 1 then {host: {arch: $host_arch, kind: $host_kind}} else {} end)
       + { metrics: ($def_keys | map({key: ., value: {
             value: $merged[.].value,
             unit: $d.metrics[.].unit,
@@ -258,6 +297,9 @@ if ! merged=$(jq -n \
   --arg epoch "$epoch" \
   --argjson have_env "$have_env" \
   --arg env "$environment" \
+  --argjson have_host "$have_arch" \
+  --arg host_arch "$host_arch" \
+  --arg host_kind "$host_kind" \
   --slurpfile defs "$metrics_file" \
   "$jq_program" "${results_files[@]}" 2>&1); then
   err "invalid-input" "$merged"

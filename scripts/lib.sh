@@ -120,6 +120,78 @@ BENCH_MANUAL_NAMES="startup_latency"
 # 実機前提ベンチの metric 名（完全一致で扱う。名前が "<ベンチ名>_" で始まる規約に従わないため接頭辞は使わない）。
 BENCH_MANUAL_METRICS="startup_create_to_supervisor_ok_p95_ms"
 
+# 実機前提ベンチの基準値・結果の環境を機械照合するための閉じた語彙（#2095・TASK-190 追補・REPAIR-8）。
+# arch は結果 JSON の .arch（ハーネスの std::env::consts::ARCH。計測は Linux の x86_64 / aarch64 のみ）から取る。
+# ホストの種類は結果に載らないため、操作者が BENCH_HOST_KIND で語彙から指定する（自動判定は行わない）。
+# shellcheck disable=SC2034 # bench-check-manual / bench-baseline-manual とテストが参照する
+BENCH_MANUAL_ARCHES="x86_64 aarch64"
+# shellcheck disable=SC2034
+BENCH_MANUAL_HOST_KINDS="bare-metal vm wsl2"
+# bench-baseline-manual の既定の出力先。共有の benches/baseline-manual.json を誤って上書きしないよう target/ 配下にする。
+# shellcheck disable=SC2034
+BENCH_MANUAL_BASELINE_OUT_DEFAULT="target/bench-baseline-manual/baseline-manual.json"
+
+# bench_manual_in_vocab <語> <語彙（空白区切り）>: 語が語彙に完全一致すれば 0。空・部分一致・空白入りは不一致。
+bench_manual_in_vocab() {
+  local w="$1" v
+  [ -n "${w}" ] || return 1
+  for v in $2; do
+    [ "${w}" = "${v}" ] && return 0
+  done
+  return 1
+}
+
+# bench_manual_check_input_file <パス>: 入力ファイルの検査（symlink 拒否・通常ファイル・1 MiB 以下）。
+# 不正なら error: invalid-input を stderr に出して exit 2（呼び出し元スクリプトを終了させる）。
+# bench-check-manual / bench-baseline-manual の両方が使い、結果の検査規則を一箇所に保つ。
+bench_manual_check_input_file() {
+  local path="$1" size
+  if [ -L "${path}" ]; then
+    echo "error: invalid-input: ${path} is a symlink, refusing to read" >&2
+    exit 2
+  fi
+  if [ ! -f "${path}" ]; then
+    echo "error: invalid-input: ${path} is not an existing regular file" >&2
+    exit 2
+  fi
+  if ! size=$(wc -c <"${path}" 2>/dev/null | tr -d ' '); then
+    echo "error: invalid-input: ${path} could not be read" >&2
+    exit 2
+  fi
+  if [ "${size}" -gt 1048576 ]; then
+    echo "error: invalid-input: ${path} exceeds 1048576 bytes" >&2
+    exit 2
+  fi
+}
+
+# bench_manual_validate_results <結果> <metrics.json>: 実機前提ベンチの結果の検査。実機前提 metric だけを持ち、
+# 失敗・後始末の残りが無く、値は有限の正の数、単位は metrics.json の登録値と一致すること。不正なら exit 2。
+bench_manual_validate_results() {
+  local results="$1" metrics="$2" manual_json
+  manual_json="$(bench_manual_metrics_jq)"
+  if ! jq -e --argjson m "${manual_json}" \
+    '.schema_version == 1
+     and ((.metrics | type) == "object")
+     and ((.metrics | keys | sort) == ($m | sort))
+     and (((.failures.total // 0) | . == 0))
+     and (((.leftover_ids // []) | length) == 0)' "${results}" >/dev/null 2>&1; then
+    echo "error: invalid-input: results must have schema_version 1, exactly the manual-bench metrics ${manual_json}, no failures and no leftover ids (a failed run emits empty metrics)" >&2
+    exit 2
+  fi
+  if ! jq -e --slurpfile reg "${metrics}" \
+    '(.metrics | to_entries | length > 0)
+     and (.metrics | to_entries | all(
+       (.value | type) == "object"
+       and ((.value.value | type) == "number")
+       and (.value.value > 0 and .value.value < 1.7976931348623157e308)
+       and ((.value.unit | type) == "string")
+       and (.value.unit == ($reg[0].metrics[.key].unit // null))
+     ))' "${results}" >/dev/null 2>&1; then
+    echo "error: invalid-input: every metric in results must have a finite positive numeric value and a unit equal to the registered one in ${metrics}" >&2
+    exit 2
+  fi
+}
+
 bench_names_for_os() {
   if [ "${OS:-}" = "Windows_NT" ]; then
     local n out=""

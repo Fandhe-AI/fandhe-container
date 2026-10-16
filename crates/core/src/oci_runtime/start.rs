@@ -127,8 +127,8 @@ use super::launch::{
     BundleLock, LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, StartTimeouts,
 };
 use super::mountinfo_identity::{
-    FsIdentity, MountinfoReadError, fs_identity, mounts_under, parse_mountinfo, path_mount_id,
-    read_mountinfo_bounded, source_contains, source_reaches,
+    FsIdentity, MountinfoReadError, dir_identity_chain, fs_identity, mounts_under, parse_mountinfo,
+    path_mount_id, read_mountinfo_bounded, source_contains, source_reaches,
 };
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
@@ -928,6 +928,17 @@ fn validate_bind_mounts(
     // 状態ルート配下の子マウント（別名の bind mount を含む）も保護対象に加える（SEC-1・#1915）。
     let children = mounts_under(&mounts, &state_real);
     let mut roots = build_protected_roots(&state_id, &state_real, &children);
+    // 状態ルートの実体（dev, ino）の鎖を fd で固定する。適用の段（restart を含む毎回）が、mountinfo の文字列に依らず
+    // 元との同一・祖先・子孫を inode で照合する（SEC-1・SEC-4・#2066）。固定できなければ fail-closed（パスは載せない）。
+    let Some(chain) = dir_identity_chain(&state_real) else {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "the state store root cannot be pinned, so bind mounts cannot be checked",
+        ));
+    };
+    if let Some(first) = roots.first_mut() {
+        *first = first.clone().with_inode_chain(chain);
+    }
     // rootfs・bundle の実体も保護する。rbind が公開する子マウントが別名で rootfs・bundle を含む場合を拒否する（SEC-1）。
     let mut contained = Vec::with_capacity(2);
     for dir in [rootfs, bundle] {
@@ -2037,6 +2048,39 @@ mod tests {
             .map(|m| m.mount_destination().as_str().to_owned())
             .collect();
         assert_eq!(config_dests, ["/data", "/cache"]);
+    }
+
+    /// SEC-1（#2066）: start の段が状態ルートの inode の鎖（先頭が状態ルート自身）を固定して launcher へ渡す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_start_pins_state_root_inode_chain() {
+        use std::os::unix::fs::MetadataExt as _;
+        let name = "bind-pin";
+        let b = Bundle::new(name);
+        b.write_config(&with_mounts(json!([bind_json(
+            "/data",
+            "/srv/data",
+            &["bind", "rw"]
+        )])));
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        let store = MemStateStore::new(None);
+        create(&store, &OpRecorder::new(), &b.create_req(name)).expect("create");
+        let launcher = RecordingLauncher::new(false);
+        run(&store, &launcher, name).expect("start");
+        let specs = launcher.specs.lock().expect("lock");
+        let spec = specs.first().expect("spec");
+        let meta = std::fs::metadata(std::env::temp_dir()).expect("state root");
+        let first_state = spec
+            .bind_mounts()
+            .protected_roots()
+            .iter()
+            .find(|r| !r.is_containment_only())
+            .expect("state root");
+        assert_eq!(
+            first_state.inode_chain().first(),
+            Some(&(meta.dev(), meta.ino()))
+        );
+        assert!(first_state.inode_chain().len() >= 2);
     }
 
     /// SEC-4（#1915）: 設定の検証での拒否は launcher の sink へ宛先のみで 1 件記録される。sink が無くても

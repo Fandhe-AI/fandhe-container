@@ -17,6 +17,7 @@ use super::bundle::build_bundle;
 use super::output::{Failures, Params, RunResult, Sample, render_json};
 use super::probe_env::effective_uid;
 use super::report::{ReportOutcome, classify, spawn_report_reader};
+use crate::sys;
 use fandhe_container_core::cgroups::CgroupName;
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{StartTimeouts, create};
@@ -30,7 +31,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 /// supervisor の終了を待つ上限（成功時はコンテナの終了を待って 0 で終わる）。
@@ -104,6 +105,40 @@ enum ExitWait {
     TimedOut { reaped: bool },
 }
 
+/// 中断シグナル（SIGINT・SIGTERM・SIGHUP。`run` がブロック済み）が保留されているか。
+fn interrupted() -> bool {
+    sys::termination_pending()
+}
+
+fn interrupted_error() -> StartupLatencyError {
+    StartupLatencyError::new("interrupted", "interrupted by a termination signal")
+}
+
+/// 結果 1 行を期限つきで待つ。中断シグナルを受けたら待ちを打ち切る（`.1` が true）。
+fn recv_report(
+    rx: &Receiver<(Vec<u8>, Instant)>,
+    total: Duration,
+) -> (Result<(Vec<u8>, Instant), RecvTimeoutError>, bool) {
+    let until = Instant::now() + total;
+    loop {
+        let slice = until.saturating_duration_since(Instant::now()).min(POLL);
+        match rx.recv_timeout(slice) {
+            Ok(v) => return (Ok(v), false),
+            Err(RecvTimeoutError::Disconnected) => {
+                return (Err(RecvTimeoutError::Disconnected), false);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if interrupted() {
+                    return (Err(RecvTimeoutError::Timeout), true);
+                }
+                if Instant::now() >= until {
+                    return (Err(RecvTimeoutError::Timeout), false);
+                }
+            }
+        }
+    }
+}
+
 /// 子の終了を期限つきで待つ。超過したら kill して回収を `REAP_TIMEOUT` まで待つ（REPAIR-5）。
 fn wait_for_exit(child: &mut Child, timeout: Duration) -> ExitWait {
     let until = Instant::now() + timeout;
@@ -113,7 +148,8 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> ExitWait {
             Ok(None) => {}
             Err(_) => return ExitWait::TimedOut { reaped: false },
         }
-        if Instant::now() >= until {
+        // 中断シグナルを受けたら期限を待たずに kill へ進む（呼び出し側が回収と後始末を続ける）。
+        if Instant::now() >= until || interrupted() {
             break;
         }
         std::thread::sleep(POLL);
@@ -377,7 +413,8 @@ impl Host for RealHost {
         ctx: &Ctx<'_>,
         n: u32,
     ) -> Result<CreateOutcome<RealHandle>, StartupLatencyError> {
-        let id_str = format!("fcsl{}t{n}", std::process::id());
+        // 実行ごとの nonce を含め、PID 再利用で過去の残存スコープ・cgroup と衝突させない。
+        let id_str = format!("fcsl{}t{n}", ctx.nonce);
         let root = ctx.work.join(format!("state-{n}"));
         std::fs::DirBuilder::new()
             .mode(0o700)
@@ -527,7 +564,8 @@ fn run_trial<H: Host>(
             ));
         }
     };
-    let outcome = classify(rx.recv_timeout(ctx.cap(ctx.report_timeout)));
+    let (received, _) = recv_report(&rx, ctx.cap(ctx.report_timeout));
+    let outcome = classify(received);
 
     let mut sample = None;
     let (expect_exit, expect_state) = match outcome {
@@ -629,10 +667,20 @@ fn run_trials<H: Host>(host: &H, ctx: &Ctx<'_>) -> Result<RunResult, StartupLate
     let mut leftover_ids = Vec::new();
     let total = ctx.plan.warmup.saturating_add(ctx.plan.trials);
     for n in 0..total {
+        if interrupted() {
+            return Err(interrupted_error());
+        }
         if Instant::now() >= ctx.deadline {
             return Err(deadline_exceeded());
         }
         let (trial, id) = run_trial(host, ctx, n)?;
+        // 中断を受けた試行も後始末（kill・スコープ回収・settle）まで終えてから、非ゼロで終了する。
+        if interrupted() {
+            if trial.leftover {
+                eprintln!("startup_latency: interrupted; leftover resource {id}");
+            }
+            return Err(interrupted_error());
+        }
         tally(&mut failures, &trial.fails, trial.leftover);
         if n >= ctx.plan.warmup
             && let Some(s) = trial.sample
@@ -678,6 +726,14 @@ pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
         return Err(StartupLatencyError::new(
             "unsupported-environment",
             "must run as a non-root user",
+        ));
+    }
+    // 中断シグナルをブロックし、計測ループの各待ち点で保留を確かめて後始末の経路へ進める（REPAIR-5）。
+    // スレッド（読み取りスレッド等）を作る前に呼び、以後のスレッドへブロックを継承させる。
+    if !sys::block_termination_signals() {
+        return Err(StartupLatencyError::new(
+            "unsupported-environment",
+            "cannot block termination signals",
         ));
     }
     // 出力先は計測の開始前に検証する（FIFO・symlink・既存ファイルを後から開かない）。
@@ -742,6 +798,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc;
 
     /// 1 試行ぶんの筋書き（実機依存部分の応答）。
@@ -755,6 +812,8 @@ mod tests {
         workload_exit: Option<i32>,
         /// 後始末で待つ時間（期限超過の再現用）。
         settle_delay: Duration,
+        /// spawn の直後に自スレッドへ SIGTERM を送る（中断の試験。事前に `sys::block_termination_signals`）。
+        interrupt: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -772,11 +831,13 @@ mod tests {
                 settle_ok: true,
                 workload_exit: Some(0),
                 settle_delay: Duration::ZERO,
+                interrupt: false,
             }
         }
     }
 
     struct FakeWaiter {
+        stopped: Arc<AtomicUsize>,
         script: Script,
         _keep: Option<mpsc::Sender<(Vec<u8>, Instant)>>,
     }
@@ -790,6 +851,7 @@ mod tests {
         }
 
         fn stop_scope(&mut self) -> bool {
+            self.stopped.fetch_add(1, Ordering::SeqCst);
             self.script.stop_ok
         }
     }
@@ -798,6 +860,7 @@ mod tests {
         scripts: Vec<Script>,
         created: Mutex<Vec<u32>>,
         settled: Mutex<Vec<Expect>>,
+        scope_stopped: Arc<AtomicUsize>,
     }
 
     impl FakeHost {
@@ -806,6 +869,7 @@ mod tests {
                 scripts,
                 created: Mutex::new(Vec::new()),
                 settled: Mutex::new(Vec::new()),
+                scope_stopped: Arc::new(AtomicUsize::new(0)),
             }
         }
 
@@ -848,9 +912,13 @@ mod tests {
                     (rx, Some(tx))
                 }
             };
+            if script.interrupt {
+                assert!(sys::raise_sigterm());
+            }
             Ok(Launched {
                 rx,
                 waiter: Box::new(FakeWaiter {
+                    stopped: Arc::clone(&self.scope_stopped),
                     script,
                     _keep: keep,
                 }),
@@ -986,6 +1054,25 @@ mod tests {
         assert_eq!(*host.created.lock().expect("lock"), vec![0]);
         assert!(host.settled.lock().expect("lock").is_empty());
         assert!(r.samples.is_empty());
+    }
+
+    /// 中断（SIGTERM）: 待ちを打ち切り、スコープ回収と settle（Any）まで終えてから `interrupted` で失敗し、
+    /// 以後の試行を始めない（REPAIR-5）。
+    #[test]
+    fn sigterm_during_a_trial_reclaims_then_stops_with_interrupted() {
+        // ブロックはスレッド単位。試験スレッド自身でブロックし、保留はスレッド終了で捨てられる。
+        assert!(sys::block_termination_signals());
+        let mut hang = Script::ok();
+        hang.report = None;
+        hang.exit = ExitScript::TimedOut;
+        hang.interrupt = true;
+        let started = Instant::now();
+        let (host, r) = run_with(vec![hang, Script::ok()], 2, 0, Duration::from_secs(30));
+        assert_eq!(r.expect_err("must fail").code, "interrupted");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(*host.created.lock().expect("lock"), vec![0]);
+        assert_eq!(host.scope_stopped.load(Ordering::SeqCst), 1);
+        assert_eq!(*host.settled.lock().expect("lock"), vec![Expect::Any]);
     }
 
     /// 全体期限: 最終試行が期限を超えて終わったら成功結果を返さない（REPAIR-5）。

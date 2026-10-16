@@ -22,3 +22,9 @@ pub mod plugin_boundary;
 pub mod plugin_boundary_list_images;
 pub mod small_files;
 pub mod startup_latency;
+#[cfg(all(
+    target_os = "linux",
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod sys;

@@ -85,7 +85,7 @@ cat <<'EOF'
                                         macOS ゲスト init の静的リンクビルドと /init だけの initrd（newc・gzip）の作成（TASK-64 追補・#1878・MAC-1。ローカルの実ビルド。make ci には含めない）
   guest-initrd-build-selftest         scripts/build-guest-initrd-selftest.sh
                                         ゲスト initrd 梱包スクリプトの自己テスト（#1878・MAC-1・REPAIR-12。スタブ・fixture のみ）
-  third-party-licenses-selftest      scripts/generate-third-party-licenses-selftest.sh
+  third-party-licenses-selftest       scripts/generate-third-party-licenses-selftest.sh
                                         ライセンス表記生成スクリプトの自己テスト（スタブ cargo のみ。TASK-103.1）
   deny-license-fail-closed-selftest   scripts/targets/deny-license-fail-closed-selftest.sh
                                         deny.toml のライセンス fail-closed 自己テスト（TASK-90.2・OSS-4・OSS-5）

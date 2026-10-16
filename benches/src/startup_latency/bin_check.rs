@@ -14,7 +14,7 @@ fn untrusted(message: &str) -> StartupLatencyError {
 }
 
 /// 実行ファイルを検証する。絶対パス・symlink でない通常ファイル・実行ビットあり・group/other 書き込み不可・
-/// 所有者が `euid` か root・全祖先ディレクトリ（字面上と実体の両方）が実効 UID か root 所有で other 書き込み不可・group 書き込み不可（自分の実効 GID の group は可。sticky 付きは可）、をすべて満たさなければ拒否する。
+/// 所有者が `euid` か root・全祖先ディレクトリ（字面上と実体の両方）が実効 UID か root 所有で other 書き込み不可・group 書き込み不可（sticky 付きは可）、をすべて満たさなければ拒否する。
 pub fn verify_executable(path: &Path, euid: u32) -> Result<(), StartupLatencyError> {
     if !path.is_absolute() {
         return Err(StartupLatencyError::new(
@@ -43,21 +43,19 @@ pub fn verify_executable(path: &Path, euid: u32) -> Result<(), StartupLatencyErr
     // ディレクトリの書き込み権が要るため、字面上の祖先の検証がそれも覆う。
     let real =
         std::fs::canonicalize(path).map_err(|_| untrusted("executable is not accessible"))?;
-    let egid = super::probe_env::effective_gid()
-        .ok_or_else(|| untrusted("effective gid is not readable"))?;
     for chain in [path, real.as_path()] {
         for dir in chain.ancestors().skip(1) {
-            verify_ancestor(dir, euid, egid)?;
+            verify_ancestor(dir, euid)?;
         }
     }
     Ok(())
 }
 
-/// 祖先ディレクトリ 1 つを検証する。ディレクトリで、所有者が `euid` か root で、other 書き込み不可であること。
-/// group 書き込み可は、ディレクトリの group が実行ユーザー自身の実効 GID（umask 002 の下で cargo が `target/` を
-/// 0775・ユーザー専用 group で作る既定環境）のときだけ許容する。他 group の書き込み可は拒否する。
-/// sticky ビット付きは `/tmp` のように他者が差し替えられないため許容する。
-fn verify_ancestor(dir: &Path, euid: u32, egid: u32) -> Result<(), StartupLatencyError> {
+/// 祖先ディレクトリ 1 つを検証する。ディレクトリで、所有者が `euid` か root で、group / other 書き込み不可であること。
+/// 実効 GID はユーザー専用 group とは限らず、同じ group の別 UID が検証後に実行ファイルを差し替えられるため、
+/// group 書き込み可は（自分の group でも）拒否する。umask 002 で `target/` が 0775 になる環境では
+/// `chmod g-w` した場所へバイナリを置く。sticky ビット付きは `/tmp` のように他者が差し替えられないため許容する。
+fn verify_ancestor(dir: &Path, euid: u32) -> Result<(), StartupLatencyError> {
     let meta =
         std::fs::metadata(dir).map_err(|_| untrusted("ancestor directory is not accessible"))?;
     if !meta.is_dir() {
@@ -73,10 +71,8 @@ fn verify_ancestor(dir: &Path, euid: u32, egid: u32) -> Result<(), StartupLatenc
         if mode & 0o002 != 0 {
             return Err(untrusted("ancestor directory is writable by others"));
         }
-        if mode & 0o020 != 0 && meta.gid() != egid {
-            return Err(untrusted(
-                "ancestor directory is writable by a foreign group",
-            ));
+        if mode & 0o020 != 0 {
+            return Err(untrusted("ancestor directory is writable by a group"));
         }
     }
     Ok(())
@@ -152,32 +148,29 @@ mod tests {
         );
     }
 
-    /// cargo が umask 002 で作る `target/`（0775・自分の group）配下の実行ファイルは受け入れる。
+    /// 自分の group でも group 書き込み可の祖先は拒否する（同 group の別 UID による差し替えを防ぐ）。
     #[test]
-    fn own_group_writable_ancestor_is_accepted() {
+    fn group_writable_ancestor_is_rejected_even_for_own_group() {
         let d = Dir::new("og");
         let sub = d.0.join("target");
         std::fs::create_dir(&sub).expect("mkdir");
-        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o775)).expect("chmod");
         let f = sub.join("bin");
         std::fs::write(&f, b"x").expect("write");
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        std::fs::set_permissions(&d.0, std::fs::Permissions::from_mode(0o775)).expect("chmod");
-        assert_eq!(verify_executable(&f, euid()), Ok(()));
-    }
-
-    /// 他 group の書き込み可祖先は拒否する（実効 GID を偽って照合する）。
-    #[test]
-    fn foreign_group_writable_ancestor_is_rejected() {
-        let d = Dir::new("fg");
         std::fs::set_permissions(&d.0, std::fs::Permissions::from_mode(0o770)).expect("chmod");
-        let gid = std::fs::metadata(&d.0).expect("meta").gid();
         assert_eq!(
-            verify_ancestor(&d.0, euid(), gid.wrapping_add(1))
-                .expect_err("reject")
-                .code,
+            verify_executable(&f, euid()).expect_err("reject").code,
             "untrusted-binary"
         );
+    }
+
+    /// group 書き込み不可（0755）の祖先配下は受け入れる。
+    #[test]
+    fn non_group_writable_ancestor_is_accepted() {
+        let d = Dir::new("ng");
+        let f = d.file("bin", 0o755);
+        std::fs::set_permissions(&d.0, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(verify_executable(&f, euid()), Ok(()));
     }
 
     /// 祖先が other 書き込み可（sticky なし）なら、実行ファイル自体が 0755 でも拒否する。
@@ -204,7 +197,7 @@ mod tests {
         let dir_owner = std::fs::metadata(&d.0).expect("meta").uid();
         if dir_owner != 0 {
             assert_eq!(
-                verify_ancestor(&d.0, dir_owner.wrapping_add(1), 0)
+                verify_ancestor(&d.0, dir_owner.wrapping_add(1))
                     .expect_err("reject")
                     .code,
                 "untrusted-binary"

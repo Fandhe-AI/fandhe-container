@@ -984,3 +984,131 @@ mod tests {
         assert_eq!(*host.settled.lock().expect("lock"), vec![Expect::Stopped]);
     }
 }
+/// 実際の子プロセスとファイルシステムに対する期限・回収・後始末判定の試験（REPAIR-5・REPAIR-12・CORE-10）。
+/// `Host` のスタブ越しではなく、`wait_for_exit`・`probe_count`・`read_populated`・`kill_and_drain` を直接呼ぶ。
+/// root・実 cgroup・systemd は使わず、スタブの子プロセス（`sh`）と一時ディレクトリの擬似 `cgroup.events` で照合する。
+/// 実 cgroup を要する通し確認は実機前提（AGENTS.md の `startup_latency` 節。CI では走らない）。
+#[cfg(test)]
+mod real_process_tests {
+    use super::*;
+
+    struct Tmp(PathBuf);
+
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let p =
+                std::env::temp_dir().join(format!("fc-sl-{tag}-{}-{nanos}", std::process::id()));
+            std::fs::create_dir(&p).expect("mkdir");
+            Self(p)
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sh(script: &str, extra: &[&str]) -> Child {
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .args(extra)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh")
+    }
+
+    #[test]
+    fn child_exit_code_is_reported_before_the_deadline() {
+        let mut child = sh("exit 3", &[]);
+        match wait_for_exit(&mut child, Duration::from_secs(10)) {
+            ExitWait::Exited(code) => assert_eq!(code, Some(3)),
+            ExitWait::TimedOut { .. } => panic!("must not time out"),
+        }
+    }
+
+    #[test]
+    fn overdue_child_is_killed_and_reaped() {
+        let mut child = sh("sleep 30", &[]);
+        let started = Instant::now();
+        match wait_for_exit(&mut child, Duration::from_millis(150)) {
+            ExitWait::TimedOut { reaped } => assert!(reaped, "killed child must be reaped"),
+            ExitWait::Exited(_) => panic!("must time out"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // 回収済みなら再度 try_wait しても終了状態が返る。
+        assert!(matches!(child.try_wait(), Ok(Some(_))));
+    }
+
+    #[test]
+    fn probe_count_sees_a_live_probe_and_not_a_reaped_one() {
+        let nonce = format!(
+            "fc-sl-nonce-{}-{}",
+            std::process::id(),
+            Tmp::new("n").0.display()
+        );
+        let mut child = sh("sleep 30", &[&nonce]);
+        assert!(wait_until(Duration::from_secs(5), || probe_count(&nonce) == Some(1)));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(probe_count(&nonce), Some(0));
+    }
+
+    #[test]
+    fn populated_flag_is_read_from_cgroup_events() {
+        let t = Tmp::new("pop");
+        std::fs::write(t.0.join("cgroup.events"), "populated 1\nfrozen 0\n").expect("write");
+        assert_eq!(read_populated(&t.0), Some(true));
+        std::fs::write(t.0.join("cgroup.events"), "populated 0\nfrozen 0\n").expect("write");
+        assert_eq!(read_populated(&t.0), Some(false));
+        std::fs::write(t.0.join("cgroup.events"), "garbage\n").expect("write");
+        assert_eq!(read_populated(&t.0), None);
+    }
+
+    /// 読めない（ファイルが無いがディレクトリは在る）状態は空と扱わず、後始末失敗になる。
+    #[test]
+    fn unreadable_cgroup_is_a_cleanup_failure_not_empty() {
+        let t = Tmp::new("unr");
+        assert_eq!(read_populated(&t.0), None);
+        assert!(!kill_and_drain(&t.0));
+    }
+
+    #[test]
+    fn already_empty_cgroup_drains_without_kill_and_vanished_one_is_gone() {
+        let t = Tmp::new("emp");
+        std::fs::write(t.0.join("cgroup.events"), "populated 0\n").expect("write");
+        assert!(kill_and_drain(&t.0));
+        // 空なら cgroup.kill は書かれない。
+        assert!(!t.0.join("cgroup.kill").exists());
+        let gone = t.0.join("absent");
+        assert_eq!(read_populated(&gone), Some(false));
+        assert!(path_gone(&gone));
+        assert!(remove_container_cgroup(&gone));
+        assert_eq!(find_dir(&t.0, "absent", 2).expect("find"), None);
+    }
+
+    /// 在籍ありなら `cgroup.kill` へ "1" を書き、空になったら成功する。
+    #[test]
+    fn populated_cgroup_gets_a_kill_request_then_drains() {
+        let t = Tmp::new("kill");
+        std::fs::write(t.0.join("cgroup.events"), "populated 1\n").expect("write");
+        let dir = t.0.clone();
+        let h = std::thread::spawn(move || {
+            wait_until(Duration::from_secs(5), || dir.join("cgroup.kill").exists());
+            std::fs::write(dir.join("cgroup.events"), "populated 0\n").expect("write");
+        });
+        assert!(kill_and_drain(&t.0));
+        h.join().expect("join");
+        assert_eq!(
+            std::fs::read_to_string(t.0.join("cgroup.kill")).expect("read"),
+            "1"
+        );
+    }
+}

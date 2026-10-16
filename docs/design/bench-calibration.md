@@ -12,7 +12,7 @@
 | metric | 向き | 単位 | 状態 |
 | ---- | ---- | ---- | ---- |
 | 小ファイル多数ワークロードの files/s | `higher_is_better` | 未確定（実測で確定。TASK-88.h1） | ハーネス実装済み（TASK-189・#1898。metric は `small_files_files_per_sec`）。`metrics.json`・`BENCH_NAMES` へ登録済み（#1899）。baseline 未登録のため `bench-check` の比較対象外 |
-| コンテナ起動レイテンシ p95 | `lower_is_better` | 未確定（同上） | 対応するベンチが未実装。計測には TASK-29（create/start）の完了も必要 |
+| コンテナ起動レイテンシ p95 | `lower_is_better` | 未確定（同上） | ベンチ実装済み（TASK-190・#1900。metric は `startup_create_to_supervisor_ok_p95_ms`。`startup-latency-bench.md`）。実機前提で CI では実行しない。`metrics.json`・`BENCH_NAMES`・baseline へ未登録（登録は #1901。オーナー判断待ち） |
 | plugin 境界 代表操作 A の inproc / framed / Δp50（`plugin_boundary_op_a_{inproc,framed,delta}_p50`） | `lower_is_better`（ns） | 未確定（実測は未実施） | TASK-113.1・113.3 で実装済み。metrics.json・`BENCH_NAMES` に登録済み。baseline 未登録 |
 | plugin 境界 代表操作 B の inproc / framed / Δp50（`plugin_boundary_list_images_{inproc,framed,delta}_p50`） | `lower_is_better`（ns） | 未確定（実測は未実施） | TASK-113.2・113.3 で実装済み。登録状況は上と同じ |
 
@@ -26,8 +26,8 @@
 
 ## 実測の前提条件
 
-1. files/s ベンチ（充足。#1898・#1899）と起動 p95 ベンチ（未充足）が `benches/benches/` に実装され、`scripts/lib.sh` の `BENCH_NAMES` と `benches/metrics.json` に登録されている
-2. 起動 p95 は TASK-29（コンテナ create/start）が完了している
+1. files/s ベンチ（充足。#1898・#1899）と起動 p95 ベンチ（実装は充足〔#1900〕・登録は未充足〔#1901〕）が `benches/benches/` に実装され、`scripts/lib.sh` の `BENCH_NAMES` と `benches/metrics.json` に登録されている
+2. 起動 p95 は TASK-29（コンテナ create/start）と supervisor の本番 launcher 結線（#1819）が完了している（充足）
 3. 計測環境の扱いが TASK-88.h1 で決まっている（下記）
 
 現状は `BENCH_NAMES := regression_placeholder plugin_boundary plugin_boundary_list_images`・metric は placeholder 2 件と plugin 境界 6 件（TASK-113.3 で登録）。`make bench-check` の対象は placeholder のみで、baseline 再生成時は `bench-check` の対象ベンチも同じ集合に揃えること（baseline と results の集合不一致は比較スクリプトが exit 2 にする）。metric だけを先に追加すると `generate_baseline.sh` は `results are missing metrics` で exit 2 になる（fail-closed。設計どおり）。
@@ -52,9 +52,31 @@ placeholder ベンチの結果を `benches/baseline.json` へ書き出さない�
 - 起動 p95 の計測権限: namespace 操作に root / rootless のどちらを使うか。実機前提テストとして分離するか（`.claude/rules/ci.md`）
 - 15% 閾値と、placeholder 段階をいつ終了するか
 
+## CI の扱いの決定（TASK-190）
+
+TASK-190 は「CI で分離込みの起動を測れるか」を実装の前に確かめて決めることを求める。
+
+| 観点 | 確かめた方法 | 結果 |
+| ---- | ---- | ---- |
+| カーネル版・Landlock ABI | `actions/runner-images` の Ubuntu2404-Readme.md（Image Version 20261012.334.1） | Kernel 6.17.0-1022-azure。ABI 6 に要る 6.12 以上を満たす。LSM に landlock が有効かは未確認 |
+| 非特権 user namespace | `.github/workflows/ci.yml` の platform-ci「AppArmor の非特権 user namespace 制限を緩和」ステップ | 既定は `kernel.apparmor_restrict_unprivileged_userns=1`。緩めるのは platform-ci だけで、`bench-regression` は緩めていない |
+| 委譲 cgroup | `DelegatedCgroup` の契約（非 root ではルート cgroup を拒否・親に自分以外のプロセスがいれば拒否）と #2049 の観察 | supervisor ごとに `systemd-run --user --scope -p Delegate=yes` が要る。hosted runner に user manager（`/run/user/<uid>/bus`）があるかは未確認。用意には `loginctl enable-linger` などの sudo が要り、ci.md の方針（sudo の用途を増やさない）に反する |
+| root | — | runner は非 root。supervisor は rootful を拒否する（SEC-5） |
+| 揺らぎ | — | 共有 VM で p95 に 15% の閾値をかけると誤検知の恐れがある（未実測） |
+| runner 上のプローブ | スモーク（引数なし）が 1 行出す（`apparmor_restrict_unprivileged_userns`・`max_user_namespaces`・landlock・user bus・`DelegatedCgroup::detect`・euid） | 未取得（PR の CI 実行後に `platform-ci` の `cargo test` のログから転記する。取得できなければ未取得のまま） |
+
+**暫定の決定（オーナー確認待ち）: (b) ベンチ全体を実機前提として分離し、CI の回帰比較に入れない**（ci.md「実機前提テスト」）。
+
+- (a)（区間を分ける）は採らない。特権なしで通る区間は `create` 単体だけで、それを「起動レイテンシ」と呼ぶと REPAIR-3 に反する
+- CI で走るのは、引数なしのスモーク（何も起動しない）と単体テストだけ
+- **REPAIR-8 の「CI で 15% 超の悪化を fail にする」は本 issue の時点では満たされない**。「REPAIR-8 を満たした」とは書かない。#1901 は、次の選択肢のオーナー判断（上の「起動 p95 の計測権限」）待ちでブロックされる
+  - (c) hosted runner に sudo を追加して user manager を用意し、揺らぎを許容する
+  - (d) self-hosted runner で比較する
+  - (e) 実機の定期実測で基準値を管理する
+
 ## 既知の欠落（要ユーザー確認）
 
-files/s ベンチは TASK-189（#1898）で実装し、#1899 で `metrics.json`・`BENCH_NAMES` へ登録した（`small-files-bench.md`）。起動 p95 ベンチを実装するタスクは見当たらない。TASK-88.1（#228）は実ベンチの実装を TASK-113 へ送ったが、TASK-113（#269）は plugin 制御面往復レイテンシのベンチで、2 metric を扱わない。spec 側のタスク定義の補完が必要な可能性がある（spec は本リポから編集しない）。
+files/s ベンチは TASK-189（#1898）で実装し、#1899 で `metrics.json`・`BENCH_NAMES` へ登録した（`small-files-bench.md`）。起動 p95 ベンチは TASK-190（#1900）で実装した（`startup-latency-bench.md`）。実機前提のため CI では測れず、回帰ゲートへの登録（#1901）はオーナー判断待ちである（下記「CI の扱いの決定（TASK-190）」）。
 
 ## 関連
 

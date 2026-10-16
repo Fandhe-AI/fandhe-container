@@ -29,7 +29,8 @@
 //!
 //! - 協調停止: `reboot(2)` 等は呼ばない。VM の停止はホストの VZ の強制停止に任せる（TASK-115）。
 //! - 子プロセスの回収（`waitpid`）: 現状は子を作らない。ゲスト内でコンテナを実行する際に実装する。
-//! - 静的リンクの実ビルド・initrd への梱包は #1878、symlink・ハードリンクの観測モードは #1877、実機起動は #1628。
+//! - 静的リンクのビルドと initrd への梱包は `scripts/build-guest-initrd.sh`（`make guest-initrd-build`。#1878）
+//!   で行う（梱包までの確認のみ。実機の VM での起動は未確認で #1628）。symlink・ハードリンクの観測モードは #1877。
 
 pub mod cmdline;
 pub mod directive;

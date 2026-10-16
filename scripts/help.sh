@@ -81,6 +81,10 @@ cat <<'EOF'
                                         macOS ゲストカーネル（arm64）の取得・sha256 照合・ビルド（TASK-64 追補・#1874・MAC-1。ネットワークと実ビルド。make ci には含めない）
   guest-kernel-build-selftest         guest/kernel/build-selftest.sh
                                         ゲストカーネルのビルドスクリプトの自己テスト（#1874・MAC-1・REPAIR-12。スタブのみ）
+  guest-initrd-build                  scripts/build-guest-initrd.sh
+                                        macOS ゲスト init の静的リンクビルドと /init だけの initrd（newc・gzip）の作成（TASK-64 追補・#1878・MAC-1。ローカルの実ビルド。make ci には含めない）
+  guest-initrd-build-selftest         scripts/build-guest-initrd-selftest.sh
+                                        ゲスト initrd 梱包スクリプトの自己テスト（#1878・MAC-1・REPAIR-12。スタブ・fixture のみ）
   third-party-licenses-selftest       scripts/generate-third-party-licenses-selftest.sh
                                         ライセンス表記生成スクリプトの自己テスト（スタブ cargo のみ。TASK-103.1）
   deny-license-fail-closed-selftest   scripts/targets/deny-license-fail-closed-selftest.sh

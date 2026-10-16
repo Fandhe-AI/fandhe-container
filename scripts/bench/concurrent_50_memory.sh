@@ -1474,9 +1474,25 @@ if [ "$mode" = "own" ]; then
     err "invalid-input" "cannot create the user work directory"
     exit 2
   fi
-  if ! [[ "$user_tmp" =~ ^/tmp/fandhe-concurrent-user\.[A-Za-z0-9]{6}$ ]] ||
-    [ -z "$(find -P "$user_tmp" -maxdepth 0 -type d -user "$ra_uid" -print 2>/dev/null)" ]; then
-    err "invalid-input" "the user work directory is not owned by --run-as user"
+  # 検証に失敗しても、mktemp が作ったディレクトリを黙って残さない。形式が合わないパスは何を指すか信用できないため削除はせず
+  # （降格した rm でも対象を取り違えうる）、表示できる文字だけならパスを報告する。形式は合うが所有者が違う場合は、
+  # 利用者のものでないので削除せず、パスを報告する。どちらも手動で確認・回収する。
+  if ! [[ "$user_tmp" =~ ^/tmp/fandhe-concurrent-user\.[A-Za-z0-9]{6}$ ]]; then
+    if [[ "$user_tmp" =~ ^/[A-Za-z0-9._/-]{1,200}$ ]]; then
+      err "invalid-input" "the user work directory has an unexpected path format; it was left in place and not removed (path: ${user_tmp})"
+    else
+      err "invalid-input" "the user work directory has an unexpected path format (unprintable); it was left in place and not removed"
+    fi
+    user_tmp=""
+    exit 2
+  fi
+  # 自己テストだけ、所有者の検査対象 uid を差し替えられる（他人所有のディレクトリを自己テストでは作れないため）。
+  chk_uid="$ra_uid"
+  if [ "${FANDHE_CONCURRENT_MEMORY_SELFTEST:-}" = "1" ] && [ -n "${FANDHE_CONCURRENT_MEMORY_SELFTEST_USER_TMP_OWNER_UID:-}" ]; then
+    chk_uid="$FANDHE_CONCURRENT_MEMORY_SELFTEST_USER_TMP_OWNER_UID"
+  fi
+  if [ -z "$(find -P "$user_tmp" -maxdepth 0 -type d -user "$chk_uid" -print 2>/dev/null)" ]; then
+    err "invalid-input" "the user work directory is not owned by --run-as user; it was left in place and not removed (path: ${user_tmp})"
     user_tmp=""
     exit 2
   fi

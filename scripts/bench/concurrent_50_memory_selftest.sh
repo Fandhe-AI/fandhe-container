@@ -173,6 +173,7 @@ if [ -n "${STUB_FD_LOG:-}" ]; then
 fi
 shift 6
 if [ -n "${STUB_FAKE_ID:-}" ] && [ "${*: -2:1}" = id ]; then echo 99999; exit 0; fi
+if [ -n "${STUB_MKTEMP_PRINT:-}" ] && [ "${*: -3:1}" = mktemp ]; then mkdir -p -- "$STUB_MKTEMP_PRINT" && echo "$STUB_MKTEMP_PRINT"; exit 0; fi
 exec "$@"
 STUB
 } >"$work/setpriv"
@@ -980,7 +981,6 @@ walk_check "exe-walk-directory-final-rejected" 1 "$walk/ok/bin"
 walk_check "exe-walk-missing-rejected" 1 "$walk/ok/bin/nothing"
 walk_check "exe-walk-dotdot-escape-rejected" 1 "$walk/../walk/ok/bin/tool"
 walk_check "exe-walk-wrong-owner-rejected" 1 "$walk/ok/bin/tool" "$(($(id -u) + 1))"
-# 実行全体: 祖先が group 書き込み可の setpriv は起動前に exit 2 で拒否し、降格コマンドも supervisor も起動しない。
 # 英語以外のロケールでも / と安全な経路が拒否されない（種別を翻訳される %F でなく生のモードで判定する。#2127 の指摘）。
 # ja ロケールの stat を模すスタブを PATH の先頭に置く（種別名を日本語に翻訳して返す。%F を使う実装だと全要素が拒否される）。
 mkdir -p "$work/jastat"
@@ -1015,6 +1015,7 @@ if [ "$(stat -c %u /)" = 0 ] && [ -n "$(find / -maxdepth 0 ! -perm /022 -print 2
   ) || r=$?
   expect_eq "exe-walk-ja-locale-real-root-accepted" 0 "$r"
 fi
+# 実行全体: 祖先が group 書き込み可の setpriv は起動前に exit 2 で拒否し、降格コマンドも supervisor も起動しない。
 cp -- "$work/setpriv" "$walk/gw/bin/setpriv"; chmod 755 "$walk/gw/bin/setpriv"
 : >"$STUB_PIDFILE"
 FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_WALK=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_EXE_OWNER_UID="$(id -u)" \
@@ -1023,6 +1024,29 @@ expect_eq "exe-walk-setpriv-unsafe-ancestor-exit2" 2 "$rc"
 expect_has "exe-walk-setpriv-unsafe-ancestor-stderr" "$errf" "--setpriv must be a regular root-owned executable"
 expect_eq "exe-walk-setpriv-unsafe-ancestor-no-residual" 0 "$(alive_stub_count)"
 rm -rf -- "$walk"
+
+# --- 12zd. 作業ディレクトリの検証に失敗しても、作ったディレクトリを黙って残さず場所を報告する（SUP-2・CORE-9。#2127 の指摘） ---
+# 形式が合わない場合: 何を指すか信用できないので削除せず、表示できるパスを報告する（exit 2）。
+rm -rf -- "$work/oddtmp"
+STUB_MKTEMP_PRINT="$work/oddtmp" run_target --count 2 --trials 1
+expect_eq "user-tmp-bad-format-exit2" 2 "$rc"
+expect_has "user-tmp-bad-format-stderr" "$errf" "the user work directory has an unexpected path format; it was left in place and not removed (path: $work/oddtmp)"
+if [ -d "$work/oddtmp" ]; then pass "user-tmp-bad-format-left-in-place"; else fail "user-tmp-bad-format-left-in-place"; fi
+expect_eq "user-tmp-bad-format-no-residual" 0 "$(alive_stub_count)"
+rm -rf -- "$work/oddtmp"
+# 表示できない文字を含むパスは、パスを出さずに「表示不能」とだけ報告する。
+STUB_MKTEMP_PRINT="$work/odd tmp" run_target --count 2 --trials 1
+expect_eq "user-tmp-unprintable-exit2" 2 "$rc"
+expect_has "user-tmp-unprintable-stderr" "$errf" "unexpected path format (unprintable); it was left in place and not removed"
+rm -rf -- "$work/odd tmp"
+# 形式は合うが所有者が違う場合: 形式不一致とは別のメッセージで、パスを報告して削除しない（exit 2）。
+owner_dir="/tmp/fandhe-concurrent-user.Zz9Zz9"
+rm -rf -- "$owner_dir"
+STUB_MKTEMP_PRINT="$owner_dir" FANDHE_CONCURRENT_MEMORY_SELFTEST_USER_TMP_OWNER_UID="$(($(id -u) + 1))" run_target --count 2 --trials 1
+expect_eq "user-tmp-wrong-owner-exit2" 2 "$rc"
+expect_has "user-tmp-wrong-owner-stderr" "$errf" "the user work directory is not owned by --run-as user; it was left in place and not removed (path: $owner_dir)"
+if [ -d "$owner_dir" ]; then pass "user-tmp-wrong-owner-left-in-place"; else fail "user-tmp-wrong-owner-left-in-place"; fi
+rm -rf -- "$owner_dir"
 
 # --- 13. 引数エラーは exit 2 ---
 expect_rc2() { # <名前> <引数...>

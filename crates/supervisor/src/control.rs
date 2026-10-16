@@ -111,8 +111,8 @@ mod install {
     fn failed_handle(error: TraitError) -> ControlHandle {
         // 機械可読な固定語彙の 1 行（code は列挙名。message は固定文言）。
         let line = format!(
-            "{{\"component\":\"supervisor\",\"event\":\"control_channel_failed\",\"code\":\"{:?}\",\"message\":\"{}\"}}\n",
-            error.code(),
+            "{{\"component\":\"supervisor\",\"event\":\"control_channel_failed\",\"code\":\"{}\",\"message\":\"{}\"}}\n",
+            error.code().as_str(),
             error.message()
         );
         let _ = crate::stderr_sink::stderr().emit(line.into_bytes());

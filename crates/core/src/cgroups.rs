@@ -1106,9 +1106,7 @@ impl DelegatedCgroup {
                     ));
                 }
                 // 同伴プロセスも best-effort で親へ戻す（既に終了していれば失敗しても構わない）。
-                for pid in &rollback.moved_companions {
-                    let _ = self.write_pid_to(self.fd.as_fd(), *pid, CgroupStep::Cleanup);
-                }
+                self.restore_companions(&rollback.moved_companions);
                 if rollback.leaf_created {
                     match &rollback.leaf_fd {
                         Some(leaf_fd) => {
@@ -1161,6 +1159,13 @@ impl DelegatedCgroup {
             ));
         }
         Ok(())
+    }
+
+    /// 退避リーフへ移した同伴プロセスを親へ戻す（巻き戻し用。既に終了していれば失敗しても構わない）。
+    fn restore_companions(&self, pids: &[u32]) {
+        for pid in pids {
+            let _ = self.write_pid_to(self.fd.as_fd(), *pid, CgroupStep::Cleanup);
+        }
     }
 
     /// `dir` の `cgroup.procs` へ `pid` を 1 件書く（書き込みは 1 回に 1 PID。毎回開き直す）。
@@ -2668,5 +2673,46 @@ mod tests {
                 .map(|s| s.len()),
             Some(4096)
         );
+    }
+
+    /// SUP-1・CORE-3: 退避リーフへ移した同伴プロセスが、巻き戻しで親 cgroup の `cgroup.procs` へ戻る
+    /// （具体 PID の所属を読み戻す）。`prepare` 途中の失敗そのものは再現が不安定なため、巻き戻しの実体を
+    /// 実 cgroup で直接検証する。
+    ///
+    /// 実機前提（委譲 cgroup v2）のため `#[ignore]`。委譲スコープの中でテストバイナリを直接実行する:
+    /// `systemd-run --user --scope -p Delegate=yes <target/debug/deps/fandhe_container_core-XXXX> --ignored sup1_core3`
+    #[test]
+    #[ignore = "requires a delegated cgroup v2 subtree (systemd-run --user --scope -p Delegate=yes)"]
+    fn sup1_core3_restore_companions_moves_helper_back_to_parent() {
+        let delegated = DelegatedCgroup::detect().expect("detect");
+        let parent = std::path::PathBuf::from("/sys/fs/cgroup")
+            .join(delegated.path().trim_start_matches('/'));
+        let leaf = parent.join(format!("fc-restore-test-{}", std::process::id()));
+        std::fs::create_dir(&leaf).expect("mkdir leaf");
+        let mut helper = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = helper.id();
+        std::fs::write(leaf.join("cgroup.procs"), pid.to_string()).expect("move helper to leaf");
+        let in_leaf = std::fs::read_to_string(leaf.join("cgroup.procs")).unwrap();
+        assert_eq!(in_leaf.trim(), pid.to_string());
+
+        delegated.restore_companions(&[pid]);
+
+        let in_parent = std::fs::read_to_string(parent.join("cgroup.procs")).unwrap();
+        assert!(
+            in_parent.lines().any(|l| l.trim() == pid.to_string()),
+            "{in_parent}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(leaf.join("cgroup.procs"))
+                .unwrap()
+                .trim(),
+            ""
+        );
+        let _ = helper.kill();
+        let _ = helper.wait();
+        std::fs::remove_dir(&leaf).expect("rmdir leaf");
     }
 }

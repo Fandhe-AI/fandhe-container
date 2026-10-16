@@ -920,6 +920,27 @@ expect_has "root-owned-leftover-stderr" "$errf" "cleanup-failed: root-owned file
 kept_user="$(sed -n 's/.*user state kept at \(\/tmp\/fandhe-concurrent-user\.[A-Za-z0-9]*\).*/\1/p' "$errf" | head -n 1)"
 if [ -n "$kept_user" ] && [ -d "$kept_user" ]; then pass "root-owned-leftover-kept"; rm -rf -- "$kept_user"; else fail "root-owned-leftover-kept"; fi
 
+# --- 12zb. 利用者の作業ディレクトリを回収できなければ、成功形式の結果を公開せず exit 4（SUP-2・CORE-9。#2127 の指摘） ---
+# JSON を --output へ出す経路と、標準出力へ出す経路の両方で、公開が起きていないことを具体値で確かめる。
+rm -f -- "$work/published.json"
+NO_RM_USER_KEPT=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_ROOT_UID="$(id -u)" run_target --count 2 --trials 1 --format json --output "$work/published.json"
+expect_eq "no-publish-on-cleanup-failure-exit4" 4 "$rc"
+if [ -e "$work/published.json" ]; then fail "no-publish-on-cleanup-failure-output-absent"; else pass "no-publish-on-cleanup-failure-output-absent"; fi
+expect_has "no-publish-on-cleanup-failure-stderr" "$errf" "cleanup-failed: root-owned files remain under the user work directory"
+kept_user="$(sed -n 's/.*user state kept at \(\/tmp\/fandhe-concurrent-user\.[A-Za-z0-9]*\).*/\1/p' "$errf" | head -n 1)"
+[ -z "$kept_user" ] || rm -rf -- "$kept_user"
+NO_RM_USER_KEPT=1 FANDHE_CONCURRENT_MEMORY_SELFTEST_ROOT_UID="$(id -u)" run_target --count 2 --trials 1 --format json
+expect_eq "no-publish-on-cleanup-failure-stdout-exit4" 4 "$rc"
+expect_eq "no-publish-on-cleanup-failure-stdout-bytes" 0 "$(wc -c <"$out" | tr -d ' ')"
+kept_user="$(sed -n 's/.*user state kept at \(\/tmp\/fandhe-concurrent-user\.[A-Za-z0-9]*\).*/\1/p' "$errf" | head -n 1)"
+[ -z "$kept_user" ] || rm -rf -- "$kept_user"
+# 回収できた場合は従来どおり公開される（exit 0・JSON が具体値で出る）。
+rm -f -- "$work/published.json"
+run_target --count 2 --trials 1 --format json --output "$work/published.json"
+expect_eq "publish-after-cleanup-exit0" 0 "$rc"
+expect_eq "publish-after-cleanup-benchmark" '"concurrent_memory"' "$(jq -c '.benchmark' "$work/published.json" 2>/dev/null)"
+rm -f -- "$work/published.json"
+
 # --- 13. 引数エラーは exit 2 ---
 expect_rc2() { # <名前> <引数...>
   local name="$1"; shift

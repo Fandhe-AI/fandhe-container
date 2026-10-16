@@ -1,6 +1,7 @@
 # コンテナごとの軽量監視プロセス（restart・healthcheck・exec・logs・stats。crate-naming.md の表 #3）。
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G12（TASK-157〜171）で実装する。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
+# #2070 で bin の入口の継承 fd の整理を追加した（依存は不変）。
 # TASK-163 追補（#1594）で exec の本番用 AuditSink の構築入口 default_audit_sink を追加した（依存は不変）。
 # TASK-163 追補（#1698）で exec の entrypoint_mode のログを core の待たない出力経路へ載せ替えた（依存は不変）。
 # TASK-164 追補（#1469）でロックファイルの掃除経路（remove_all・open 失敗時の削除）を追加した（依存は不変）。
@@ -154,6 +155,13 @@ harness = false
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true
+
+# bin の入口（start_entry::run_main）が継承 fd（fd 3 以降）を閉じること（SEC-1・SUP-14・CORE-1・#2070）。単一スレッドの
+# main で入口の手順 2 を通し、CLOEXEC の無い fd を sh の exec で仕込む自己再実行のため独自 main（harness = false）で動かす。
+[[test]]
+name = "inherited_fds"
+path = "tests/inherited_fds.rs"
+harness = false
 
 # supervisor の bin から core の本番 launcher を経て monitor まで通す実機シナリオ（起動 → 報告 → 監視 → Stopped の記録、
 # 起動失敗で何も残らないこと、restart の fail-closed。SUP-1・SUP-3・CORE-1・CORE-2・TASK-157 追補・#1819）。同じ実行ファイルが

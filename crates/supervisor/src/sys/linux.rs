@@ -19,6 +19,10 @@
 
 use std::ffi::CString;
 use std::io;
+use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::net::UnixStream;
+use std::path::Path;
 
 /// `capget(2)` / `capset(2)` の syscall 番号（`syscall(2)` 経由。glibc にラッパーが無い）。
 /// 出典: x86_64 は arch/x86/entry/syscalls/syscall_64.tbl、aarch64 は include/uapi/asm-generic/unistd.h。
@@ -29,6 +33,13 @@ mod arch {
     pub(super) const SYS_CAPGET: Option<i64> = Some(125);
     pub(super) const SYS_CAPSET: Option<i64> = Some(126);
     pub(super) const SYS_EXECVEAT: Option<i64> = Some(322);
+    // 制御チャネル（#2058）。open(2) の O_DIRECTORY / O_NOFOLLOW は arch ごとに値が違う
+    // （arch/x86/include/uapi/asm/fcntl.h は asm-generic の既定値のまま: 0o200000 / 0o400000）。
+    pub(super) const O_DIRECTORY: Option<i32> = Some(0o200000);
+    pub(super) const O_NOFOLLOW: Option<i32> = Some(0o400000);
+    // asm-generic/socket.h の値（x86_64・aarch64 で共通）。
+    pub(super) const SOL_SOCKET: Option<i32> = Some(1);
+    pub(super) const SO_PEERCRED: Option<i32> = Some(17);
 }
 #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
 mod arch {
@@ -36,6 +47,13 @@ mod arch {
     pub(super) const SYS_CAPGET: Option<i64> = Some(90);
     pub(super) const SYS_CAPSET: Option<i64> = Some(91);
     pub(super) const SYS_EXECVEAT: Option<i64> = Some(281);
+    // 制御チャネル（#2058）。aarch64 の O_DIRECTORY / O_NOFOLLOW は
+    // arch/arm64/include/uapi/asm/fcntl.h の値（0o40000 / 0o100000）。
+    pub(super) const O_DIRECTORY: Option<i32> = Some(0o40000);
+    pub(super) const O_NOFOLLOW: Option<i32> = Some(0o100000);
+    // asm-generic/socket.h の値（x86_64・aarch64 で共通）。
+    pub(super) const SOL_SOCKET: Option<i32> = Some(1);
+    pub(super) const SO_PEERCRED: Option<i32> = Some(17);
 }
 #[cfg(not(any(
     all(target_arch = "x86_64", target_pointer_width = "64"),
@@ -46,6 +64,10 @@ mod arch {
     pub(super) const SYS_CAPGET: Option<i64> = None;
     pub(super) const SYS_CAPSET: Option<i64> = None;
     pub(super) const SYS_EXECVEAT: Option<i64> = None;
+    pub(super) const O_DIRECTORY: Option<i32> = None;
+    pub(super) const O_NOFOLLOW: Option<i32> = None;
+    pub(super) const SOL_SOCKET: Option<i32> = None;
+    pub(super) const SO_PEERCRED: Option<i32> = None;
 }
 
 /// include/uapi/linux/prctl.h の値。
@@ -86,6 +108,66 @@ unsafe extern "C" {
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int close(int fd)`。
     fn close(fd: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int getsockopt(int sockfd, int level, int optname, void *optval,
+    // socklen_t *optlen)`（`socklen_t` は Linux で u32）。制御チャネルの `SO_PEERCRED` 取得だけに使う（#2058）。
+    fn getsockopt(
+        fd: i32,
+        level: i32,
+        optname: i32,
+        optval: *mut std::ffi::c_void,
+        optlen: *mut u32,
+    ) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int socket(int domain, int type, int protocol)`。制御チャネルの
+    // non-blocking connect だけに使う（#2058・REPAIR-5）。
+    fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen)`
+    // （`socklen_t` は Linux で u32）。
+    fn connect(fd: i32, addr: *const std::ffi::c_void, addrlen: u32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int clock_gettime(clockid_t clk_id, struct timespec *tp)`
+    // （`clockid_t` は i32）。LP64 の `struct timespec` は `time_t`・`long` がともに 8 バイト。
+    fn clock_gettime(clock_id: i32, tp: *mut Timespec) -> i32;
+}
+
+/// `struct timespec`（LP64 の Linux。`time_t` と `long` はともに i64）。
+/// `libc` との機械照合は未導入（上の `Ucred` と同じ理由）。大きさは単体テストが固定する。
+#[repr(C)]
+struct Timespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+/// `struct sockaddr_un`（`sa_family_t` は u16、`sun_path` は 108 バイト。大きさ 110）。
+#[repr(C)]
+struct SockaddrUn {
+    sun_family: u16,
+    sun_path: [u8; 108],
+}
+
+const AF_UNIX: i32 = 1;
+const SOCK_STREAM: i32 = 1;
+/// asm-generic の値（x86_64・aarch64 で共通）: `O_NONBLOCK`（0o4000）と `O_CLOEXEC`（0o2000000）。
+const SOCK_NONBLOCK: i32 = 0o4000;
+const SOCK_CLOEXEC: i32 = 0o2_000_000;
+/// `CLOCK_MONOTONIC`（include/uapi/linux/time.h）。`std::time::Instant` と同じ時計で、同一ホストの
+/// プロセス間で比較できる。
+const CLOCK_MONOTONIC: i32 = 1;
+
+/// `struct ucred`（`SO_PEERCRED` の結果。include/uapi/asm-generic/socket.h・`<sys/socket.h>`）。
+/// `libc` との機械照合はこの crate では未導入（dev-dependencies に `libc` が無い。coding-rust.md「照合が未導入の
+/// crate」）。レイアウトは pid_t(i32)・uid_t(u32)・gid_t(u32) の 12 バイトで、単体テストが大きさを固定する。
+#[repr(C)]
+struct Ucred {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+/// 接続相手の資格情報（`SO_PEERCRED`。接続時点の相手プロセスの値）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeerCredentials {
+    pub(crate) pid: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
 }
 
 /// `capget(2)` / `capset(2)` のヘッダ（`struct __user_cap_header_struct`）。
@@ -342,6 +424,114 @@ pub(crate) fn fd_is_open(fd: i32) -> bool {
     unsafe { fcntl(fd, F_GETFD) != -1 }
 }
 
+/// ディレクトリを symlink を辿らずに開くための `open(2)` フラグ（`O_DIRECTORY | O_NOFOLLOW`）。
+/// 対応外の arch では `Unsupported`（別 arch の値を流用しない。fail-closed）。
+pub(crate) fn open_dir_nofollow_flags() -> io::Result<i32> {
+    match (arch::O_DIRECTORY, arch::O_NOFOLLOW) {
+        (Some(d), Some(n)) => Ok(d | n),
+        _ => Err(unsupported()),
+    }
+}
+
+/// 接続済みの UNIX ドメインソケットの相手の資格情報を取る（`getsockopt(SOL_SOCKET, SO_PEERCRED)`）。
+///
+/// 制御チャネルの accept 直後（サーバ）と connect 直後（クライアント）に、相手の uid を照合するために呼ぶ
+/// （SEC-1・PLUG-12 と同じ考え方）。結果の大きさが `struct ucred` と一致しなければ `EINVAL`。
+pub(crate) fn peer_credentials(fd: BorrowedFd<'_>) -> io::Result<PeerCredentials> {
+    let (Some(level), Some(optname)) = (arch::SOL_SOCKET, arch::SO_PEERCRED) else {
+        return Err(unsupported());
+    };
+    let mut cred = Ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let expected = u32::try_from(std::mem::size_of::<Ucred>())
+        .map_err(|_| io::Error::from_raw_os_error(22))?;
+    let mut len = expected;
+    // SAFETY: `fd` は借用で呼び出しの間開いている。`cred` は `#[repr(C)]` の 12 バイトで `optval` に渡すポインタは
+    // その先頭を指し、`len` は書き込み可能な大きさ（12）を表す `optlen`。カーネルは最大 `len` バイトを `cred` に書き、
+    // `len` を実際の大きさへ更新する。いずれもこの関数のスタック上の値で呼び出しの間有効かつ排他的。
+    let rc = unsafe {
+        getsockopt(
+            fd.as_raw_fd(),
+            level,
+            optname,
+            (&raw mut cred).cast(),
+            &raw mut len,
+        )
+    };
+    check(i64::from(rc))?;
+    if len != expected {
+        return Err(io::Error::from_raw_os_error(22)); // EINVAL
+    }
+    Ok(PeerCredentials {
+        pid: u32::try_from(cred.pid).unwrap_or(0),
+        uid: cred.uid,
+        gid: cred.gid,
+    })
+}
+
+/// UNIX ドメインソケットへ non-blocking で 1 回だけ接続を試みる（制御チャネルのクライアント。#2058・REPAIR-5）。
+///
+/// `UnixStream::connect` は相手の listen backlog が満杯だと無期限にブロックし、期限で打ち切れない。ここでは
+/// `SOCK_NONBLOCK` のソケットで `connect(2)` を 1 回呼び、backlog 満杯は `WouldBlock`（`EAGAIN`）で即座に返す。
+/// 呼び出し元が絶対期限まで間隔を置いて再試行し、期限で自分の fd を閉じる（作業スレッドも fd も残らない）。
+/// 成功時は blocking に戻した `UnixStream` を返す。`NotFound`（`ENOENT`）・`ConnectionRefused` はそのまま返す。
+/// パスが `sun_path`（108 バイト、終端 NUL を含む）に収まらない・NUL を含む場合は `InvalidInput`。
+pub(crate) fn connect_unix_nonblocking(path: &Path) -> io::Result<UnixStream> {
+    let bytes = path.as_os_str().as_bytes();
+    let mut addr = SockaddrUn {
+        sun_family: 0,
+        sun_path: [0u8; 108],
+    };
+    // 終端 NUL のために 1 バイト残す。
+    if bytes.len() >= addr.sun_path.len() || bytes.contains(&0) {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    addr.sun_family = u16::try_from(AF_UNIX).map_err(|_| io::Error::from_raw_os_error(22))?;
+    for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = *src;
+    }
+    // SAFETY: 引数は整数のみ。成功時の戻り値は新規に作られた所有権のある fd。
+    let fd = unsafe { socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0) };
+    check(i64::from(fd))?;
+    // SAFETY: `fd` は直前の `socket(2)` が返した有効な fd で、他に所有者がいない。`OwnedFd` が drop で閉じる。
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let len = u32::try_from(std::mem::size_of::<SockaddrUn>())
+        .map_err(|_| io::Error::from_raw_os_error(22))?;
+    loop {
+        // SAFETY: `owned` は開いている fd。`addr` は `#[repr(C)]` の `sockaddr_un` で、`len` はその大きさ。
+        // いずれもこの関数のスタック上の値で呼び出しの間有効。カーネルは `addr` を読むだけ。
+        let rc = unsafe { connect(owned.as_raw_fd(), (&raw const addr).cast(), len) };
+        match check(i64::from(rc)) {
+            Ok(_) => break,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let stream = UnixStream::from(owned);
+    stream.set_nonblocking(false)?;
+    Ok(stream)
+}
+
+/// `CLOCK_MONOTONIC` の現在値（ナノ秒）。制御チャネルの絶対期限の基準（同一ホストの別プロセスと比較できる。
+/// #2058・REPAIR-5）。負の値・桁あふれは `EINVAL`。
+pub(crate) fn monotonic_now_ns() -> io::Result<u64> {
+    let mut ts = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` は `#[repr(C)]` の 16 バイトで、呼び出しの間有効かつ排他的。カーネルは `ts` に書くだけ。
+    let rc = unsafe { clock_gettime(CLOCK_MONOTONIC, &raw mut ts) };
+    check(i64::from(rc))?;
+    let secs = u64::try_from(ts.tv_sec).map_err(|_| io::Error::from_raw_os_error(22))?;
+    let nanos = u64::try_from(ts.tv_nsec).map_err(|_| io::Error::from_raw_os_error(22))?;
+    secs.checked_mul(1_000_000_000)
+        .and_then(|v| v.checked_add(nanos))
+        .ok_or_else(|| io::Error::from_raw_os_error(22))
+}
+
 /// `PR_SET_DUMPABLE` を設定する。0 にすると ptrace attach・core dump・`/proc/<pid>/mem` 等の読み取りを
 /// 同一 uid の別プロセスから受けない（昇格中の窓の防御）。
 pub(crate) fn set_dumpable(on: bool) -> io::Result<()> {
@@ -364,6 +554,69 @@ mod tests {
         assert_eq!(PR_CAP_AMBIENT_RAISE, 2);
         assert_eq!(PR_CAP_AMBIENT_CLEAR_ALL, 4);
         assert_eq!(LINUX_CAPABILITY_VERSION_3, 0x2008_0522);
+    }
+
+    /// REPAIR-5・SUP-1: 制御チャネル用 FFI 構造体の大きさと時計の単調性を固定する。
+    #[test]
+    fn repair5_sup1_control_ffi_layout_and_clock() {
+        assert_eq!(std::mem::size_of::<Timespec>(), 16);
+        assert_eq!(std::mem::size_of::<SockaddrUn>(), 110);
+        let a = monotonic_now_ns().unwrap();
+        let b = monotonic_now_ns().unwrap();
+        assert!(b >= a && a > 0);
+    }
+
+    /// REPAIR-5: 長すぎる・NUL を含むパスは接続を試みず `InvalidInput`、存在しないパスは `NotFound`。
+    #[test]
+    fn repair5_connect_unix_nonblocking_rejects_bad_paths() {
+        let long = std::path::PathBuf::from("/".repeat(120));
+        assert_eq!(
+            connect_unix_nonblocking(&long).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let nul = std::path::PathBuf::from("/tmp/a\0b");
+        assert_eq!(
+            connect_unix_nonblocking(&nul).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let missing = std::path::PathBuf::from("/nonexistent-fandhe-dir/sock");
+        assert_eq!(
+            connect_unix_nonblocking(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    /// REPAIR-5: listen backlog が満杯の相手へは、ブロックせず `WouldBlock` で即座に戻る。
+    #[test]
+    fn repair5_connect_unix_nonblocking_returns_wouldblock_when_backlog_is_full() {
+        let dir = std::env::temp_dir().join(format!("fc-bl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // 既に listen 中のソケットへ `listen(2)` を再度呼ぶと backlog だけが更新される。0 にして早く満杯にする。
+        unsafe extern "C" {
+            // SAFETY（宣言そのものの妥当性）: `int listen(int sockfd, int backlog)`。
+            fn listen(fd: i32, backlog: i32) -> i32;
+        }
+        // SAFETY: `_listener` は開いている listen 中のソケットの fd。整数引数のみ。
+        let rc = unsafe { listen(std::os::fd::AsRawFd::as_raw_fd(&_listener), 0) };
+        assert_eq!(rc, 0);
+        let mut held = Vec::new();
+        let started = std::time::Instant::now();
+        let mut saw = None;
+        for _ in 0..600 {
+            match connect_unix_nonblocking(&path) {
+                Ok(s) => held.push(s),
+                Err(e) => {
+                    saw = Some(e.kind());
+                    break;
+                }
+            }
+        }
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(saw, Some(io::ErrorKind::WouldBlock));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
@@ -437,6 +690,44 @@ mod tests {
     #[test]
     fn sup14_task1719_execveat_number_aarch64() {
         assert_eq!(arch::SYS_EXECVEAT, Some(281));
+    }
+
+    /// SEC-1・SUP-1・#2058: `struct ucred` の大きさと制御チャネル用の ABI 定数を固定する。
+    #[test]
+    fn sup1_sec1_task2058_ucred_layout_and_constants() {
+        assert_eq!(std::mem::size_of::<Ucred>(), 12);
+        assert_eq!(std::mem::align_of::<Ucred>(), 4);
+        assert_eq!(arch::SOL_SOCKET, Some(1));
+        assert_eq!(arch::SO_PEERCRED, Some(17));
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+    #[test]
+    fn sup1_sec1_task2058_open_flags_x86_64() {
+        assert_eq!(open_dir_nofollow_flags().unwrap(), 0o200000 | 0o400000);
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+    #[test]
+    fn sup1_sec1_task2058_open_flags_aarch64() {
+        assert_eq!(open_dir_nofollow_flags().unwrap(), 0o40000 | 0o100000);
+    }
+
+    /// socketpair 相手（自プロセス）の pid・uid が `/proc/self/status` と一致する。
+    #[test]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    fn sup1_sec1_task2058_peer_credentials_match_self() {
+        use std::os::fd::AsFd as _;
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let cred = peer_credentials(a.as_fd()).unwrap();
+        assert_eq!(cred.pid, std::process::id());
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let uid_line = status.lines().find(|l| l.starts_with("Uid:")).unwrap();
+        let euid: u32 = uid_line.split_whitespace().nth(2).unwrap().parse().unwrap();
+        assert_eq!(cred.uid, euid);
     }
 
     /// 存在しない fd への execveat は exec せず EBADF で戻る。

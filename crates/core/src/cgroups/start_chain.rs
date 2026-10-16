@@ -320,6 +320,7 @@ mod tests {
             },
             fd,
             controllers: ControllerSet::of(&[]),
+            companions: Vec::new(),
         }
     }
 

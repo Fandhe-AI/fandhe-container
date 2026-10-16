@@ -9,7 +9,7 @@
 //! 0a. 継承 fd（fd 3 以降）を閉じる（ランチャーと同じ処理。結果チャネルの複製より前。#2070）／
 //! 0. 結果チャネルの検証（stdout が FIFO か。`run_main`）／1. argv の解析（[`crate::start_contract::StartArgs`]）／
 //! 2. スレッド数が 1 か（`oci_runtime::start` の前提。以後のスレッドは手順 3〜7 の作業スレッド〔入口は待つだけ〕と
-//!    手順 10 以降のログ捕捉・restart のワーカーに限る）／
+//!    手順 10 以降のログ捕捉・restart のワーカーと、制御チャネルの accept スレッド〔`control`。#2058〕に限る）／
 //! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし）／4. [`StartDeps::check_launcher_available`]
 //!    （副作用なし。権限モデルと Landlock ABI を確かめ、満たさなければここで止まる）／5. cgroup の連鎖
 //!    （[`StartDeps::prepare_cgroup`]）／6. 監査 sink（[`StartDeps::build_audit_sink`]。fork の前）・ログ sink／
@@ -54,6 +54,9 @@
 //!   再 launch は `fandhe-relaunch` スレッドや `stderr_sink` の常駐スレッドが存在する状態で呼ばれるため、本番 launcher が
 //!   `FailedPrecondition` で拒否し、`RelaunchFailed` で終わる（fail-closed。子は作られない）。単一スレッドの呼び出し
 //!   スレッドで再 launch する再構成は #2043（SUP-3・CORE-1）で行う。
+//!   制御チャネルの accept スレッドも #2043 で止める対象に 1 本増える（停止の口は `control::server::ControlServer::shutdown`）。
+//! - CLI の `stop`・`kill` からのシグナル送信は `control`（制御チャネル。#2058）が受けるが、CLI への結線（#1544 の段 C）と
+//!   明示的な stop の意図の伝達（SUP-9）は未実装。
 //! - 権限モデルは `RootlessSingleId` のみ（実効 uid が 0 の rootful 起動は手順 4 で拒否する。SEC-5）。
 //!
 //! フェイクの [`StartDeps`] を使う試験（`tests/start_entry.rs`）が処理順・報告・後始末・relaunch のアダプタを照合し、
@@ -1662,6 +1665,8 @@ mod linux {
         privilege: Result<IsolationPrivilege, TraitError>,
         cgroup: Option<HeldCgroup>,
         audit: Option<Arc<dyn AuditSink>>,
+        /// 退避で一緒に移す同伴プロセスの PID（監査 helper。`DelegatedCgroup::with_companions`）。
+        companions: Vec<u32>,
     }
 
     /// 手順 5 で作った cgroup（`release_cgroup` と launcher の参加フックの源で共有する）。
@@ -1716,7 +1721,15 @@ mod linux {
                 privilege,
                 cgroup: None,
                 audit: None,
+                companions: Vec::new(),
             }
+        }
+
+        /// cgroup の退避で自プロセスと一緒に移す同伴プロセス（入口が fork した監査 helper）の PID を宣言する。
+        #[must_use]
+        pub fn with_companions(mut self, pids: Vec<u32>) -> Self {
+            self.companions = pids;
+            self
         }
     }
 
@@ -1743,7 +1756,9 @@ mod linux {
             let to_trait = |e: fandhe_container_core::cgroups::CgroupError| {
                 TraitError::new(e.code, "failed to prepare the container cgroup")
             };
-            let delegated = DelegatedCgroup::detect().map_err(to_trait)?;
+            let delegated = DelegatedCgroup::detect()
+                .map_err(to_trait)?
+                .with_companions(&self.companions);
             let plan = CgroupLimitPlan::for_privilege(privilege);
             let recorder = OpRecorder::new();
             let prepared = delegated
@@ -1975,7 +1990,19 @@ mod linux {
             Err(e) => return fail(&mut out, op_err(e)),
         };
         let req = StartRequest::new(args.id.clone());
-        let deps = Box::new(ProductionStartDeps::new(args.root));
+        // 制御チャネルの認証境界の拒否の記録先（SEC-4）。制御チャネルのサーバスレッドは監視スレッドと並行して動くため、
+        // 複数スレッドでは `FileAuditSink` の隔離（fork）が使えない。そこで監査専用の helper プロセスを fork し、以後の
+        // 記録はそこへ渡して期限付きで永続化する（`ControlAuditRelay`）。`spawn` は単一スレッドのときだけ成功するので、
+        // `run_start_until` が `stderr_sink` の常駐スレッドを作る前のここで作る（launch の単一スレッド要求にも触れない。
+        // helper は fork 子で親にスレッドを増やさない）。失敗の記録は常駐スレッドを作れる launch の後まで保留する。
+        let audit = crate::exec::default_audit_sink(Some(args.root.clone()))
+            .and_then(fandhe_container_core::audit_log::ControlAuditRelay::spawn)
+            .map_err(|e| e.code());
+        // helper は fork 時点で委譲 cgroup に属するため、cgroup の準備（自プロセスの退避）へ同伴プロセスとして宣言し、
+        // 一緒に退避リーフへ移す（宣言しないと「他のプロセスがいる」として起動が拒否される。CORE-3・SUP-1）。
+        let companions: Vec<u32> = audit.as_ref().map(|r| vec![r.pid()]).unwrap_or_default();
+        let deps =
+            Box::new(ProductionStartDeps::new(args.root.clone()).with_companions(companions));
         // 回復・回収と報告の書き込みで同じ期限を共有し、報告を内部上限内に収める（REPAIR-5）。
         let deadline =
             Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
@@ -1995,20 +2022,62 @@ mod linux {
         // 報告は 1 行だけ書く契約。複製は閉じるが、fd 1 自体は std の stdout が持つため pipe は開いたまま
         // （CLI は EOF ではなく 1 行の受信で完了とみなす。fd を閉じるには unsafe が要るため行わない）。
         drop(out);
-        let code = run_supervised(
-            store,
-            args.id,
-            running,
-            args.restart,
-            &timeouts,
-            &StopToken::new(),
-        );
+        // 制御チャネル（CLI からのシグナル送信を受ける UDS。SUP-1・SEC-1・#2058）。launch（手順 8。単一スレッド要求）と
+        // 報告の後に作るのでスレッドの制約に触れない。作成に失敗したら install が停止を要求し、既存の停止経路が
+        // コンテナを終了させて Stopped を記録する（停止できないコンテナを残さない）。
+        let stop = StopToken::new();
+        // 失敗は握りつぶさず、構造化ログに固定語彙で残す（拒否の判定自体は fail-closed のまま。SEC-4）。
+        let audit = match audit {
+            Ok(relay) => {
+                Some(Arc::new(relay) as Arc<dyn fandhe_container_core::audit_log::AuditSink>)
+            }
+            Err(code) => {
+                log_event("control_audit_relay_unavailable", Some(code));
+                None
+            }
+        };
+        let (running, control) =
+            crate::control::install(&args.root, &args.id, running, &stop, audit);
+        let code = run_supervised(store, args.id, running, args.restart, &timeouts, &stop);
+        // 制御チャネルの作成に失敗していたら、回収に成功しても非 0 で終える（SUP-1）。
+        let code = control.exit_code(code);
+        // サーバスレッドを止めてからソケットを消す（RAII）。
+        drop(control);
         ExitCode::from(code)
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// SEC-4・SUP-1・#2058: 監査中継は単一スレッドでしか作れないため、`run_start_until`（`stderr_sink` の常駐スレッドを
+        /// 作る）より前に生成する。実プロセスの単一スレッド条件はテストハーネス（複数スレッド）では再現できないので、
+        /// 入口の呼び出し順をソースで固定し、前後が入れ替わる退行（接続拒否が監査へ届かなくなる）を検出する。
+        #[test]
+        fn sec4_audit_relay_is_spawned_before_the_first_logging_thread() {
+            let src = include_str!("start_entry.rs");
+            let entry = src
+                .find("let audit = crate::exec::default_audit_sink(")
+                .expect("relay construction in the entry");
+            let spawn = src[entry..]
+                .find("ControlAuditRelay::spawn")
+                .map(|p| p + entry)
+                .expect("relay spawn in the entry");
+            let run = src[entry..]
+                .find("run_start_until(\n")
+                .map(|p| p + entry)
+                .expect("run_start_until call in the entry");
+            assert!(spawn < run, "relay must be spawned before run_start_until");
+            // CORE-3・SUP-1: helper は委譲 cgroup に属するため、deps へ同伴プロセスとして宣言してから起動する。
+            let deps = src[entry..]
+                .find(".with_companions(companions)")
+                .map(|p| p + entry)
+                .expect("companions declared to the start deps");
+            assert!(
+                spawn < deps && deps < run,
+                "helper must be declared as a cgroup companion before run_start_until"
+            );
+        }
 
         /// 資格情報だけを変えた `/proc/self/status` の fixture（必須項目は縮退後の非特権プロセス相当）。
         fn status(uid: &str, gid: &str) -> String {

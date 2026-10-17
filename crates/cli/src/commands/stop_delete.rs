@@ -7,9 +7,11 @@
 //!
 //! 設計判断（fail-closed）:
 //! - `stop` は core の `kill` に `SIGTERM` で写像する。core に stop（猶予 → SIGKILL）は無い。
-//! - 本番の [`ProcessSignaler`] はリポジトリ内に無い（supervisor が提供。TASK-157）ため、
-//!   [`UnavailableSignaler`] が常に `Unimplemented` で失敗する。`state.json` の pid へ生の `kill(2)` は
-//!   送らない（PID 再利用で無関係なプロセスを止めない。SEC-1・CORE-1）。
+//! - 本番の [`ProcessSignaler`] は [`production_signaler`] が返す supervisor の `ControlSignaler`
+//!   （`<state_root>/<id>/supervisor.sock` の制御チャネル。#2059）で、supervisor が保持する起動ハンドルへ
+//!   シグナルを渡す。supervisor に届かない・期限切れ・接続元の検証で拒否・pid 不一致のときは ERR-2 の構造化エラー
+//!   （UNAVAILABLE・TIMEOUT・PERMISSION_DENIED・FAILED_PRECONDITION）で失敗する。`state.json` の pid へ生の
+//!   `kill(2)` は送らない（PID 再利用で無関係なプロセスを止めない。縮退しない。SEC-1・CORE-1）。
 //! - `delete` の cgroup 削除は Linux では `DetectedCgroupRemover`（`cgroups::DelegatedCgroup` の遅延検出。
 //!   #1314 の 3-ii）が担う。cgroup 配置が記録されたレコードに出会った場合だけ検出し、検出の失敗・削除の失敗は
 //!   cgroup も状態記録も残したまま構造化エラーで失敗する（fail-closed。OCI-6・CORE-3・SEC-1）。検出したスコープと
@@ -27,9 +29,9 @@
 //! 未実装・簡易実装（REPAIR-3）:
 //! - stop の失敗 JSON の `op` は `kill` になる（core に `LifecycleOp::Stop` が無いため。core 到達前の失敗も
 //!   `kill` に揃える）。猶予待ち → SIGKILL・Stopped への遷移確認は TASK-157 の範囲。
-//! - 本番 signaler は未結線（#1544 の残り）。CLI と supervisor の間に制御チャネル（UDS。supervisor が保持する
-//!   起動ハンドルへシグナルを渡す受け口）がまだ無いため、その追加（TASK-157 追補）の後にクライアントとして
-//!   結線する。それまで `stop` は `Unimplemented` で失敗する。
+//! - stop の猶予後の SIGKILL と Stopped への遷移確認（#1545）、stop の意図の supervisor への伝達（SUP-9。
+//!   SIGTERM による終了は今も restart ポリシーの評価に入る）、`kill` コマンド（#1902。同じ
+//!   [`production_signaler`] を使う）は未実装。
 //! - `delete` が最初に照合する委譲スコープは CLI 自身の cgroup から検出したもの。start 時に supervisor が記録した
 //!   スコープと一致すれば従来の経路、食い違えば記録のスコープを直接開く経路（#2096）で消す。検出自体の失敗は
 //!   記録の経路へ回さず失敗させる（壊れた環境で使わない安全側の判断。再検討は別 issue）。
@@ -48,15 +50,31 @@ use fandhe_container_core::traits::{
     CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, DeleteRequest, DeleteResponse,
     ErrorCode, KillRequest, Signal, StateRevision, StateStore, TraitError,
 };
+use fandhe_container_supervisor::control::ControlSignaler;
 
 use super::CliExit;
 use super::args::{DeleteArgs, GlobalArgs, StopArgs};
 use super::create_start::{OP_LOG_ENV, export_ops, production_runtime};
 
-/// 本番の signaler。送信手段の本番実装がまだ無いため、常に `Unimplemented` で失敗する（REPAIR-3）。
+/// 状態ルートを公開しないストア用の fail-closed の signaler。常に `Unimplemented` で失敗する（REPAIR-3）。
 ///
-/// 将来仕様: supervisor が保持する起動ハンドルへ委ねる実装（TASK-157・CORE-1）に置き換える。
+/// [`production_signaler`] が `host_state_root()` の無いストアに対してだけ返す。送らないことで
+/// `state.json` の pid への縮退を防ぐ（SEC-1・CORE-1）。
 struct UnavailableSignaler;
+
+/// 本番の signaler（stop・kill 共通の注入点。#2059・#1902。CLI-1・SEC-1・CORE-1）。
+///
+/// `run_stop`（将来は #1902 の kill）から呼ばれる。`<host_state_root>/<id>/supervisor.sock` の supervisor へ
+/// 依頼する `ControlSignaler` を返し、到達できなければ構造化エラーで失敗する。`state.json` の pid へ
+/// `kill(2)` する縮退は持たない。ルートに `host_state_root()` を使うのは、supervisor のログルートや
+/// `remove_supervisor_log` と揃い、cfg を CLI に持ち込まないため。supervisor の bind 側（`args.root`）との違いは
+/// 親の symlink の解決だけで、`<root>/<id>` は同じディレクトリを指す。
+pub(super) fn production_signaler(store: &dyn StateStore) -> Arc<dyn ProcessSignaler> {
+    match store.host_state_root() {
+        Some(root) => Arc::new(ControlSignaler::new(root.to_path_buf())),
+        None => Arc::new(UnavailableSignaler),
+    }
+}
 
 impl ProcessSignaler for UnavailableSignaler {
     fn signal(
@@ -253,7 +271,7 @@ pub(super) fn run_stop(global: &GlobalArgs, args: &StopArgs) -> CliExit {
         Ok(v) => v,
         Err(e) => return CliExit::Runtime(e),
     };
-    let signaler: Arc<dyn ProcessSignaler> = Arc::new(UnavailableSignaler);
+    let signaler = production_signaler(rt.store.as_ref());
     let result = stop_container(
         rt.store.as_ref(),
         &rt.recorder,
@@ -472,7 +490,7 @@ mod tests {
         }
     }
 
-    /// REPAIR-3: 本番の signaler は fail-closed の Unimplemented（非 Linux は cgroup remover も）。
+    /// REPAIR-3: 状態ルート無しのストア用 signaler は fail-closed の Unimplemented（非 Linux は cgroup remover も）。
     #[test]
     fn repair3_unavailable_signaler_and_remover_fail_closed() {
         let id = ContainerId::new("c1").expect("id");
@@ -483,6 +501,10 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         #[cfg(not(target_os = "linux"))]
         {
+            let e = ControlSignaler::new(std::path::PathBuf::from("root"))
+                .signal(&id, pid, Signal::SIGTERM, Instant::now())
+                .expect_err("control signal");
+            assert_eq!(e.code(), ErrorCode::Unimplemented);
             let e = UnavailableCgroupRemover.scope().expect_err("scope");
             assert_eq!(e.code(), ErrorCode::Unimplemented);
             let e = UnavailableCgroupRemover
@@ -997,24 +1019,128 @@ mod tests {
             );
         }
 
-        /// REPAIR-3: 本番 signaler では stop が UNIMPLEMENTED（8・op=kill）で、状態は Running のまま。
+        /// SEC-1・ERR-2: 本番 signaler は supervisor のソケットが無ければ UNAVAILABLE（9・op=kill）で失敗し、
+        /// pid へ縮退せず状態は Running のまま。
         #[test]
-        fn repair3_stop_with_unavailable_signaler_is_unimplemented() {
+        fn sec1_stop_with_production_signaler_without_supervisor_is_unavailable() {
             let base = TmpDir::new("stop-unavail");
             let st = store(&base);
             let rec = OpRecorder::new();
             do_create(&base, &st, &rec, "sd-stop-unavail");
             let _handle = do_start(&st, &rec, "sd-stop-unavail");
-            let e = stop_with(&st, &rec, Arc::new(UnavailableSignaler), "sd-stop-unavail")
-                .expect_err("unimpl");
-            assert_eq!(e.code(), ErrorCode::Unimplemented);
-            assert_eq!(e.exit_code().get(), 8);
+            let e = stop_with(&st, &rec, production_signaler(&st), "sd-stop-unavail")
+                .expect_err("unavailable");
+            assert_eq!(e.code(), ErrorCode::Unavailable);
+            assert_eq!(e.exit_code().get(), 9);
             assert_eq!(e.op(), LifecycleOp::Kill);
             let got = st
                 .get(&GetStateRequest::new(id("sd-stop-unavail")))
                 .expect("get");
             assert_eq!(got.status().state(), ContainerState::Running);
             assert_eq!(got.status().pid(), std::num::NonZeroU32::new(4242));
+        }
+
+        /// REPAIR-3: 状態ルートを公開しないストアでは UNIMPLEMENTED（8）で fail-closed。
+        #[test]
+        fn repair3_production_signaler_without_host_root_is_unimplemented() {
+            struct NoRoot(FileStateStore);
+            impl StateStore for NoRoot {
+                fn create(
+                    &self,
+                    r: &fandhe_container_core::traits::CreateStateRequest,
+                ) -> Result<fandhe_container_core::traits::StateRecord, TraitError>
+                {
+                    self.0.create(r)
+                }
+                fn update(
+                    &self,
+                    r: &fandhe_container_core::traits::UpdateStateRequest,
+                ) -> Result<fandhe_container_core::traits::StateRecord, TraitError>
+                {
+                    self.0.update(r)
+                }
+                fn get(
+                    &self,
+                    r: &GetStateRequest,
+                ) -> Result<fandhe_container_core::traits::StateRecord, TraitError>
+                {
+                    self.0.get(r)
+                }
+                fn list(
+                    &self,
+                    r: &fandhe_container_core::traits::ListStateRequest,
+                ) -> Result<fandhe_container_core::traits::StateList, TraitError> {
+                    self.0.list(r)
+                }
+                fn delete(
+                    &self,
+                    r: &fandhe_container_core::traits::DeleteStateRequest,
+                ) -> Result<fandhe_container_core::traits::DeleteStateResponse, TraitError>
+                {
+                    self.0.delete(r)
+                }
+            }
+            let base = TmpDir::new("stop-noroot");
+            let st = NoRoot(store(&base));
+            let e = production_signaler(&st)
+                .signal(
+                    &id("c1"),
+                    std::num::NonZeroU32::new(4242).expect("pid"),
+                    Signal::SIGTERM,
+                    Instant::now(),
+                )
+                .expect_err("unimpl");
+            assert_eq!(e.code(), ErrorCode::Unimplemented);
+        }
+
+        /// ERR-2・REPAIR-5: 応答しない相手には期限で TIMEOUT（7・op=kill）になる。
+        #[test]
+        fn err2_stop_with_silent_supervisor_times_out() {
+            let base = TmpDir::new("stop-timeout");
+            let st = store(&base);
+            let rec = OpRecorder::new();
+            do_create(&base, &st, &rec, "sd-stop-timeout");
+            let _handle = do_start(&st, &rec, "sd-stop-timeout");
+            let sock = state_root(&base)
+                .join("sd-stop-timeout")
+                .join("supervisor.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+            // 接続が来なくても有限時間で終わるよう、non-blocking の accept を絶対期限まで再試行する
+            // （REPAIR-5。worker が接続前に Timeout になっても join が戻らなくならない）。
+            listener.set_nonblocking(true).expect("nonblocking");
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let t = std::thread::spawn(move || {
+                let accept_deadline = Instant::now() + Duration::from_secs(5);
+                let mut conn = None;
+                while Instant::now() < accept_deadline {
+                    match listener.accept() {
+                        Ok(c) => {
+                            conn = Some(c);
+                            break;
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+                // 呼び出し側の検証が終わるまで無応答のまま接続を保持する（有限の上限つき）。
+                let _ = done_rx.recv_timeout(Duration::from_secs(5));
+                drop(conn);
+            });
+            let req = build_stop_request(&stop_args("sd-stop-timeout")).expect("req");
+            let t0 = Instant::now();
+            let e = stop_container(
+                &st,
+                &rec,
+                &production_signaler(&st),
+                &req,
+                &KillTimeout::new(Duration::from_millis(300)).expect("timeout"),
+            )
+            .expect_err("timeout");
+            assert_eq!(e.code(), ErrorCode::Timeout);
+            assert_eq!(e.exit_code().get(), 7);
+            assert_eq!(e.op(), LifecycleOp::Kill);
+            assert!(t0.elapsed() < Duration::from_secs(2));
+            let _ = done_tx.send(());
+            t.join().expect("join");
         }
 
         /// CLI-1・OCI-6: Created の delete は core を呼んで状態記録を消す。

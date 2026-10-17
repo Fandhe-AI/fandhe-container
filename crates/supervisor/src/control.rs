@@ -26,7 +26,7 @@
 //!
 //! # 未実装・残余（REPAIR-3）
 //!
-//! - CLI の `stop`・`kill` への結線（`UnavailableSignaler` から `ControlSignaler` への差し替え。#1544 の段 C・#1902）
+//! - CLI の `kill` への結線（`stop` は `stop_delete::production_signaler` で結線済み。#2059。`kill` は #1902 が同じ注入点を使う）
 //! - 明示的な stop の意図の伝達（SUP-9・#1545）: CLI の stop による SIGTERM の終了は、今は通常の終了として
 //!   restart ポリシーの評価に入る。protocol の kind を拡張して `StopToken` を立てる op を足すのは別 issue
 //! - restart の再 launch を単一スレッドで行う再構成（#2043）では、制御チャネルのスレッドも止める対象になる

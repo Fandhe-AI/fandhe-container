@@ -1,8 +1,8 @@
 //! 制御チャネルのクライアント入口（SUP-1・SEC-1・REPAIR-5・#2058）。
 //!
 //! CLI の `stop`（と `kill`）が、起動ハンドルを持つ supervisor へシグナル送信を依頼するための公開 API。core の
-//! `ProcessSignaler`（`oci_runtime::kill` の送信境界）を実装するので、CLI は `UnavailableSignaler` をこの
-//! `ControlSignaler` に差し替えるだけで済む（結線は別 issue。#1544 の段 C。REPAIR-3）。
+//! `ProcessSignaler`（`oci_runtime::kill` の送信境界）を実装する。CLI の `stop_delete::production_signaler` が
+//! これを使う（`stop` は結線済み。#2059。`kill` は #1902 が同じ注入点を使う。#1544 の段 C）。
 //! `state.json` の pid へ生の `kill(2)` は送らない（pid 再利用で無関係なプロセスを止めない。SEC-1・CORE-1）。
 //!
 //! # 手順（Linux）

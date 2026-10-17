@@ -71,7 +71,7 @@
 //! 本型は字句検証のみで、検証から適用までの TOCTOU を防がない。symlink を含む実体の照合・fd 起点 `O_NOFOLLOW` の
 //! 走査・種別と存在の確認・宛先ディレクトリの作成・利用者権限での到達性・rootfs 自身とその祖先の実体照合（`dev`/`ino`）・疑似 FS 上の元の拒否（`f_type`。#2098）は、
 //! 適用の段 `crate::exec::mount_binds`（#1913。実装済み。Linux 限定のため intra-doc リンクは張らない）が担う。
-//! bundle は適用の段の rootfs の鎖（inode）と mountinfo（`ProtectedFsRoot::contained`）で、状態ルートは start が固定した inode の鎖（`with_inode_chain`。#2066）と mountinfo で照合する。残余（REPAIR-3）は、状態ルートを別の親ディレクトリへ付け替えた場合の祖先判定、overlayfs・FUSE 系の別 superblock 経由の同一データ、start 後に改名された子マウントの mountinfo 照合で、詳細は `crate::exec::mount_binds` のモジュール doc。`run_pre_pivot` への組み込みは済み（#1914）、`start` と本番 launcher への結線は済み（#1915。検証は `start`、tmpfs との重なりは launcher、
+//! bundle は適用の段の rootfs の鎖（inode）と mountinfo（`ProtectedFsRoot::contained`）で、状態ルートは start が固定した inode の鎖（`with_inode_chain`。#2066）と mountinfo で照合する。start の後に状態ルートが移動・改名された場合は、適用の段が固定したパスを辿り直して一致しなければ `FAILED_PRECONDITION` で拒否する（#2129）。残余（REPAIR-3）は、祖先の bind mount を別の経路から改名してパスが同じ inode に解決したまま FS 内パスだけが変わる場合、overlayfs・FUSE 系の別 superblock 経由の同一データ、start 後に改名された子マウントの mountinfo 照合で、詳細は `crate::exec::mount_binds` のモジュール doc。`run_pre_pivot` への組み込みは済み（#1914）、`start` と本番 launcher への結線は済み（#1915。検証は `start`、tmpfs との重なりは launcher、
 //! 監査は `ProcessLauncher::rejection_audit_sink` 経由）。`ro` と Landlock の `WriteRestrictionShadowed` の衝突解消は #1917
 //! （それまで `ro` の bind は fork 前に拒否される）。状態ルートとの重なりは `start` が字句比較・`canonicalize` 比較・
 //! mountinfo によるファイルシステム内の実体照合（別の bind mount による別名）で検査する。適用の段も固定した元に対して状態ルートとの重なりを毎回再検証する（`ProtectedFsRoot`。元のマウントは fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントを照合する。保護対象と同じ FS 上のリンク数 2 以上の通常ファイルは拒否する。状態ルート配下にリンク数 2 以上の通常ファイルがあれば、同じ FS 上のディレクトリ元も拒否する）。`MountDestination::resolve_in` の文字列結合で直接 mount してはならない。
@@ -301,6 +301,9 @@ pub(crate) struct ProtectedFsRoot {
     /// 状態ルート自身を先頭に `/` を末尾にした `(st_dev, st_ino)` の鎖（start の段が fd で固定した実体。SEC-1・#2066）。
     /// 空なら固定していない。適用の段が元との同一・祖先・子孫を、mountinfo の文字列に依らず inode で照合する。
     inode_chain: Vec<(u64, u64)>,
+    /// `inode_chain` を固定したときのホスト側パス（正規化済み）。適用の段が毎回これを `/` から辿り直し、固定した実体と
+    /// 一致するかを確かめる。start の後に状態ルートが移動・改名されたら一致せず fail-closed になる（SEC-1・#2129）。
+    chain_path: Option<String>,
 }
 
 impl ProtectedFsRoot {
@@ -313,13 +316,22 @@ impl ProtectedFsRoot {
             scan_prune: Vec::new(),
             containment_only: false,
             inode_chain: Vec::new(),
+            chain_path: None,
         }
     }
 
     /// start の段が固定した状態ルートの inode の鎖（先頭が自身、末尾が `/`）を持たせる（SEC-1・#2066）。
-    pub(crate) fn with_inode_chain(mut self, chain: Vec<(u64, u64)>) -> Self {
+    /// `host_path` は鎖を固定したホスト側のパスで、適用の段の辿り直し（#2129）に使う。
+    pub(crate) fn with_inode_chain(mut self, host_path: String, chain: Vec<(u64, u64)>) -> Self {
+        self.chain_path = Some(host_path);
         self.inode_chain = chain;
         self
+    }
+
+    /// 鎖を固定したホスト側のパス（適用の段が辿り直す。Linux 限定の `exec::mount_binds` だけが読む）。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn chain_path(&self) -> Option<&str> {
+        self.chain_path.as_deref()
     }
 
     /// 適用の段（Linux 限定の `exec::mount_binds`）だけが読む。空なら固定されていない。

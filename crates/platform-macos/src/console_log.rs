@@ -327,6 +327,31 @@ fn len_u64(b: &[u8]) -> u64 {
     u64::try_from(b.len()).unwrap_or(u64::MAX)
 }
 
+/// 排他 lock の取得を試みる。`WouldBlock` なら短い猶予の中で数回やり直し、それでも取れなければ `WouldBlock` を返す。
+///
+/// 猶予の理由（MAC-1・REPAIR-4・#2138）: lock は open file description 単位（unix は `flock(2)`）で、fd を
+/// `close` しても、他スレッドの `fork` / `posix_spawn` が複製した fd が `exec` で閉じられるまで description が
+/// 生き続け、lock が一瞬残る。同一プロセスで子プロセスを起動する処理と並行すると、直前に自分が解放した lock
+/// が「使用中」に見える（macOS の CI で観測）。実際に使用中の相手は猶予を超えて保持し続けるため、
+/// 使用中なら何も動かさず拒否する fail-closed の挙動は変わらない（拒否が最大 `LOCK_GRACE` 遅れるだけ）。
+pub(crate) fn try_lock_with_grace(file: &File) -> Result<(), std::fs::TryLockError> {
+    let deadline = std::time::Instant::now() + LOCK_GRACE;
+    loop {
+        match file.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(LOCK_RETRY_INTERVAL);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// [`try_lock_with_grace`] が `WouldBlock` を再試行する合計時間（fork と exec の間の窓を覆う長さ）。
+const LOCK_GRACE: Duration = Duration::from_millis(250);
+
+/// [`try_lock_with_grace`] の再試行間隔。
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
 /// 上限つきで書き出されるコンソールログの入口（pipe の書き込み端と書き出しスレッドの結果）。
 ///
 /// 生のログファイルは保持せず公開もしないため、上限を迂回して追記する経路はない。
@@ -365,7 +390,7 @@ impl ConsoleLogSink {
         cap: u64,
         reports: Option<ReportSender>,
     ) -> Result<ConsoleLogSink, SpawnError> {
-        match file.try_lock() {
+        match try_lock_with_grace(&file) {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => return Err(SpawnError::InUse),
             Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
@@ -848,6 +873,42 @@ mod tests {
         let second = ConsoleLogSink::spawn(t.append_handle(), 1000, None).unwrap();
         second.finish(WAIT).expect("writer thread finished");
         assert_eq!(std::fs::read(&t.0).unwrap(), b"one\n");
+    }
+
+    /// MAC-1・REPAIR-4・REPAIR-12・#2138: 別の open file description が持つ lock が猶予内に解放されれば
+    /// `try_lock_with_grace` は成功する（fork 直後の fd 複製などによる一時的な競合の再現）。
+    #[test]
+    fn try_lock_with_grace_succeeds_when_released_within_grace() {
+        let t = TempFile::new("grace-ok", b"");
+        let holder = t.append_handle();
+        holder.try_lock().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(holder);
+        });
+        let waiter = t.append_handle();
+        assert!(matches!(try_lock_with_grace(&waiter), Ok(())));
+        releaser.join().unwrap();
+    }
+
+    /// MAC-1・REPAIR-4・REPAIR-5・REPAIR-12・#2138: 保持され続ける lock は猶予ぶん待ってから `WouldBlock`
+    /// を返す。下限（猶予を待ったこと）と上限（有限時間で返ること）の両方を確かめる。
+    #[test]
+    fn try_lock_with_grace_would_block_after_bounded_wait() {
+        let t = TempFile::new("grace-held", b"");
+        let holder = t.append_handle();
+        holder.try_lock().unwrap();
+        let waiter = t.append_handle();
+        let started = std::time::Instant::now();
+        let result = try_lock_with_grace(&waiter);
+        let elapsed = started.elapsed();
+        assert!(matches!(result, Err(std::fs::TryLockError::WouldBlock)));
+        assert!(elapsed >= LOCK_GRACE, "returned too early: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must stay bounded: {elapsed:?}"
+        );
+        drop(holder);
     }
 
     /// MAC-1・TASK-64.3: 既に上限に達したファイルへは追記しない（再起動の繰り返しでも総量が増えない）。

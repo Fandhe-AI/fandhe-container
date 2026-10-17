@@ -31,8 +31,9 @@
 //!   restart ポリシーの評価に入る。protocol の kind を拡張して `StopToken` を立てる op を足すのは別 issue
 //! - restart の再 launch を単一スレッドで行う再構成（#2043）では、制御チャネルのスレッドも止める対象になる
 //!   （停止の口は `ControlServer::shutdown` に用意済み）
-//! - 異常終了で残った `supervisor.sock` のために、core の `delete` が `<id>/` を残す件（core 側で掃除対象に加えるかは
-//!   別 issue で判断する）
+//! - 異常終了で残った `supervisor.sock` は、core の `StateStore::delete`（`FileStateStore`）が `<id>/` を開いた fd を
+//!   起点に種別（ソケット）と所有者（実効 UID）を検証してから消す（#2174・OCI-6・SUP-1）。ソケット以外・他 UID 所有の
+//!   同名は消さず `<id>/` を残す。`purge_corrupted` は触れない
 //! - `start` の OK 報告は制御チャネルの作成より前に送信済みのため、作成に失敗した場合は報告を取り消せない。
 //!   停止を要求し、supervisor の終了コードを非 0 にして `Stopped` を記録する（報告の順序の再構成は別 issue）
 

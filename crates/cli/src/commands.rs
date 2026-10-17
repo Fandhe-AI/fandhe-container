@@ -6,8 +6,8 @@
 //! （#1718・`supervisor_start` module）。supervisor は core の本番 launcher（#1715 の Phase B）が入るまで `UNIMPLEMENTED` を
 //! 報告し、同じディレクトリに supervisor が無ければ `FAILED_PRECONDITION`（5）で失敗する（REPAIR-3）。
 //! `stop` / `delete` は core の `oci_runtime::kill`（SIGTERM）/ `delete` を直接呼ぶ（TASK-79.2.2・#867。`stop_delete` module）。
-//! 本番の `ProcessSignaler`・cgroup remover が未提供のため、pid ありの対象への `stop` や cgroup 配置つきの `delete` は
-//! `UNIMPLEMENTED`（8）で失敗する（REPAIR-3）。
+//! `stop` の本番 `ProcessSignaler` は supervisor の制御チャネル経由（`stop_delete::production_signaler`。#2059・SEC-1）で、
+//! supervisor に届かなければ構造化エラー（UNAVAILABLE 等）で失敗する。非 Linux は `UNIMPLEMENTED`（8）で fail-closed（REPAIR-3）。
 //! `list` は core の状態ストアを読んで stdout へタブ区切りで一覧を出し、`logs` は引数・ID・存在確認までを行う
 //! （TASK-79.3・#640。`list_logs` module）。ログ内容の読み出しは未実装で、対象が存在しても `UNIMPLEMENTED`（8）で
 //! 失敗する（REPAIR-3）。
@@ -22,7 +22,7 @@
 //!
 //! 将来仕様（本実装の範囲外）:
 //! - start の実プロセス起動: core の本番 launcher（#1715 の Phase B）。ランチャー経由の特権起動の選択（#1719・#1722）。
-//! - stop の猶予 → SIGKILL・本番 signaler / cgroup remover の結線: supervisor 経由（TASK-157）。
+//! - stop の猶予 → SIGKILL（#1545）・stop の意図の伝達（SUP-9）・`kill` コマンド（#1902。`production_signaler` を共用）。
 //! - logs の内容読み出し・list の JSON 出力: ログ契約と crate 境界の決定後（`list_logs` module の doc 参照。TASK-95・TASK-98）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・#641・PLUG-4。`plugin_backend` module）。発見 → 登録 → 信頼性検証までを
 //!   配線済みで、platform-* へは直接依存しない（`make check-cli-backend-deps`）。非 Linux の信頼性検証（PLUG-11）・plugin の
@@ -563,8 +563,8 @@ mod tests {
     /// Linux 経路の `run_to` 境界の単体テスト（TASK-79.5・#642・CLI-1）。
     ///
     /// 本番入口（引数解析 → 状態ストア open → core 呼び出し → `CliExit` への写像 → `write_stderr`）を
-    /// 6 コマンドそれぞれ直接呼んで検証する。本番 launcher / signaler は fail-closed のため
-    /// プロセス起動・シグナル送信は発生しない。全呼び出しは `invoke` が `--root <TmpDir>` を強制し、
+    /// 6 コマンドそれぞれ直接呼んで検証する。本番 launcher は fail-closed のため
+    /// プロセス起動は発生せず、signaler は supervisor 不在で UNAVAILABLE になりシグナル送信は発生しない。全呼び出しは `invoke` が `--root <TmpDir>` を強制し、
     /// 利用者の実状態ルートへ触れない。環境変数は変更しない（並列テストとの競合回避）。
     #[cfg(target_os = "linux")]
     mod linux {

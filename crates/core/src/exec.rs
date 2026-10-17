@@ -1507,7 +1507,7 @@ fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
 /// 呼び出し元が `CLONE_NEWUSER` → mapper へ go → mapper が親 pid の `uid_map` / `gid_map` を書く
 /// （`newuidmap` / `newgidmap` 経由は setuid ヘルパーで root 権限を代替）→ 応答（固定 3 バイト）を
 /// 上限付き・タイムアウト付きで受領 → 自プロセスの写像を読み戻して計画と照合 → user namespace 内で
-/// uid / gid が 0 であることを確認 → 残りの namespace を分離（[`isolate`] と同じ `MS_PRIVATE`・hostname）。
+/// uid / gid が 0 であることを確認 → 残りの namespace を分離（[`isolate`] と同じく `Mount` を含むときだけ `/` を再帰 private 化・hostname）。
 ///
 /// 契約:
 /// - シングルスレッドから呼ぶこと（mapper の fork と `CLONE_NEWUSER` の制約。マルチスレッドは

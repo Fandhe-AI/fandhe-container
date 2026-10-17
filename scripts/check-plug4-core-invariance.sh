@@ -6,7 +6,9 @@
 #         core 側のソースやテストを書き換えない」に合わせ、成果物に入らない tests/ も対象に含める。
 #   (2) `cargo tree -p fandhe-container-core --locked -e normal` の依存木
 #   (3) `cargo build -p fandhe-container-core --locked` の成果物（rlib）の sha256
-#       ※ core は lib のみで bin が無いため rlib を代理にする。CLI bin（TASK-79）導入後に実行ファイルへ切り替える（REPAIR-3）。
+#       ※ core は lib のみの crate で bin を持たない（CORE-1・D-19）。cli・supervisor の実行ファイルは core 以外の crate
+#         もリンクし、plugin を足す PR の正当な cli・plugin 変更で誤って NG になるため、rlib を比べる（#2136 の判断。
+#         理由は crate-naming.md 決定 3 の補足）。
 # 手順: 「追加前」の tree を一時ディレクトリへ展開 → 追加前の指紋 → 「追加後」の tree（PR head の作業ツリー）へ
 # 入れ替えて probe plugin crate を追加（root Cargo.toml / Cargo.lock は決定 3 により比較対象外）→ target を作り直して
 # 追加後の指紋 → 比較。同一パス・同一 rustc で 2 回ビルドするため、パス埋め込み差で偽陽性にならない。

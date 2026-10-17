@@ -15,7 +15,7 @@ paths:
 - 複数行・`if`/`for`・`curl`・ツール導入・timeout や終了コードの変換などの処理は `scripts/` 配下の bash に書く。Makefile にチェック内容を二重定義しない
 - 構成:
   - `scripts/targets/<target>.sh`: ターゲットの実体（入力は make 変数＝環境変数。必須変数と既定値は各スクリプト冒頭のコメントに書く）
-  - `scripts/lib.sh`: 共通ヘルパー（`skip_unless_workspace`・`validate_timeout`・`require_cmd` 等）。source するとリポジトリルートへ移動する
+  - `scripts/lib.sh`: 共通ヘルパー（`skip_unless_workspace`・`validate_timeout`・`require_cmd`・期限つき実行の `run_limited` と `run_limited_abort` 等）。source するとリポジトリルートへ移動する（利用者の相対パスを cwd 基準で扱うスクリプトは source 前に `$PWD` を保存して戻す）
   - `scripts/versions.sh`: 固定バージョン（lint ツール・cargo-deny・cargo-about・lefthook）の単一の定義元。`Dockerfile`・`ci.yml` の値と同期する
   - `scripts/with-tools.sh`（必須コマンド確認）・`scripts/with-workspace.sh`（workspace 未整備なら skip）・`scripts/run-parallel.sh`（CI 用の並列実行）・`scripts/help.sh`（Make 非依存の一覧）
   - それ以外の `scripts/*.sh`（`scripts/bench/` を含む）は既存の判定・計測スクリプトと自己テスト。Makefile から直接呼ぶ
@@ -40,7 +40,7 @@ paths:
 ## 新規スクリプトの規約
 
 - 先頭は `#!/usr/bin/env bash` と役割コメント（日本語。呼び出し元・入力・終了コードの契約を書く）。`set -euo pipefail` を付け、`scripts/lib.sh` を source する（`# shellcheck source=` ディレクティブ付き）
-- `scripts/lib.sh` の判定（`has_cargo`・`has_members`・`skip_unless_workspace`）を変えたら `make lib-selftest`（`scripts/lib-selftest.sh`。PATH の bash と `/bin/bash` の両方で照合する）を通し、ケースを追加する
+- `scripts/lib.sh` の判定（`has_cargo`・`has_members`・`skip_unless_workspace`・`run_limited`）を変えたら `make lib-selftest`（`scripts/lib-selftest.sh`。PATH の bash と `/bin/bash` の両方で照合する）を通し、ケースを追加する
 - 実行権限を付ける（`chmod +x`。git の mode 100755）。Makefile は `@scripts/...` で直接実行するため、権限が無いと失敗する
 - shellcheck をエラー・警告なしで通す。macOS 標準の bash 3.2 でも動く書き方にする（`local -n`・連想配列・`wait -n`・`${var,,}` を使わない。空配列の展開は `${arr[@]+"${arr[@]}"}`）。例外は CI 専用の `scripts/run-parallel.sh`（bash 4.3 以上）
 - プログラムの出力文字列（エラーメッセージ・ログ）は英語、コメントは日本語（[japanese-style](japanese-style.md)）
@@ -54,8 +54,9 @@ paths:
 | 読み取り専用の検査 | `lint-*`・`fmt-check`・`lint`・`doc`・`test`・`check-*`・`deny`・`*-selftest` | ソースを変更しない。失敗は非 0 で返す。`*-selftest` は一時ディレクトリ・スタブ・fixture だけを使い、実機・root・ネットワークに依存しない |
 | 整形 | `fmt` | `cargo fmt --all` でソースを書き換える唯一のターゲット。検査用は `fmt-check` |
 | 環境構築 | `setup`・`hooks`・`install-cargo-about` | 再実行しても安全（冪等）。`rustup` は確認のみで自動導入しない（`curl \| sh` を作らない。[security](security.md)） |
-| 生成 | `third-party-licenses`・`bench-baseline` | 出力先は `target/` 配下か `OUTPUT` / `BENCH_BASELINE_OUT` で指定した 1 ファイルのみ |
-| 実機前提 | `cli-parity`・`fio-bench`・`startup-latency*`・`net-setup-timing`・`dns-helper-measure`・`idle-memory*`・`supervisor-*`・`concurrent-memory*`・`restart-latency` | `make ci` に含めない。必須変数が無ければ usage を出して終了コード 2。sudo をスクリプト内で呼ばない（root 実行は操作者の明示操作）。timeout で包み、終了コードは契約の値へ変換する |
+| 取得と実ビルド | `guest-kernel-build`・`guest-initrd-build` | `guest-kernel-build` はネットワーク取得と実ビルド（#1874）、`guest-initrd-build` はネットワーク取得なしのローカルの実ビルド（ゲスト init の静的リンクと initrd の梱包。#1878）を行う人間用のターゲット。`make ci` と CI には含めない。成果物は `target/` 配下へ出し、既存の出力は上書きしない |
+| 生成 | `third-party-licenses`・`bench-baseline`・`bench-baseline-manual` | 出力先は `target/` 配下か `OUTPUT` / `BENCH_BASELINE_OUT` で指定した 1 ファイルのみ |
+| 実機前提 | `bench-check-manual`・`cli-parity`・`fio-bench`・`startup-latency*`・`net-setup-timing`・`dns-helper-measure`・`idle-memory*`・`supervisor-*`・`concurrent-memory*`・`restart-latency` | `make ci` に含めない。必須変数が無ければ usage を出して終了コード 2。sudo をスクリプト内で呼ばない（root 実行は操作者の明示操作）。timeout で包み、終了コードは契約の値へ変換する |
 | 集約 | `ci` | ワークスペース全体の任意の一括確認（CI の失敗の再現・リリース前。ローカル必須ではない。[ci](ci.md)「ローカルゲート」）。CI 全体とは同一ではない |
 
 - `clean` ターゲットは無い。追加する場合は `target/` など自分が作った生成物だけを消し、共有ディレクトリ（`$HOME`・リポジトリ外・`docs/spec` submodule）を消さない

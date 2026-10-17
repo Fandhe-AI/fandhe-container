@@ -350,7 +350,9 @@ mod tests {
                     if linux { 0 } else { 5 },
                     "",
                 ),
-                Command::Start => (vec!["start", "c1"], if linux { 8 } else { 5 }, ""),
+                // Linux の start は supervisor の bin を CLI の隣から探す。テスト実行ファイルの隣には無いため FAILED_PRECONDITION（5）
+                // （非 Linux は plugin 解決の失敗の 5。いずれも OS 固有設定を要求しない。#1718）。
+                Command::Start => (vec!["start", "c1"], 5, ""),
                 Command::Stop => (vec!["stop", "c1"], 5, ""),
                 Command::Delete => (vec!["delete", "d1"], if linux { 0 } else { 5 }, ""),
                 Command::List => (
@@ -363,7 +365,7 @@ mod tests {
                     },
                 ),
                 Command::Logs => (vec!["logs", "c1"], if linux { 8 } else { 5 }, ""),
-                Command::Setup => continue,
+                Command::Setup | Command::Doctor => continue,
             };
             let (code, out, err) = invoke(&root, &argv);
             assert_eq!(out, stdout, "{}", command.as_str());

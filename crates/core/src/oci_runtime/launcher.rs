@@ -18,7 +18,9 @@
 //! 4. Landlock の ruleset(**必須**。ABI 6 未満は `FailedPrecondition` で起動を拒否し、縮退しない。CORE-5・#1314)
 //! 5. ステージ列(`with_landlock` は型上 `Option` を取らず、Landlock 無しの列を作れない。参加の源があれば
 //!    起動のたびに `CgroupJoin` を作って登録する)
-//! 6. 分離計画・状態 pipe・中間プロセスの起動(`exec` 側)
+//! 6. 既定 tmpfs(`/dev/shm`)の構築と、bind mount の宛先との重なりの検査(`InvalidArgument`。拒否は
+//!    監査 sink へ記録する。SEC-4・#1915)
+//! 7. 分離計画・状態 pipe・中間プロセスの起動(`exec` 側)
 //!
 //! exec は `StagePipeline::run_then` が作る `LaunchReady`(制限適用の証跡。Landlock を含む)が無ければ通らない。
 //! この型は証跡を作る手段を増やさず、既存の `run_child` の `require_restriction_evidence` に任せる(SEC-1・CORE-5)。
@@ -35,8 +37,8 @@
 //! launch の失敗は、起動した全プロセス(中間プロセス I と PID 1)の消滅を確かめられたかを、コンテナ ID ごとの
 //! 台帳(上限 `LEDGER_MAX_ENTRIES` 件)に残す。`Clean` は消滅を確かめ済み、`Pending` は回収できなかった子の
 //! ハンドルと、報告前の PID 1 の再探索が要る起動識別子を保持する状態、`Handed` は launch 成功でハンドルの所有者が
-//! 呼び出し側に移った状態である。`confirm_no_process` は `Clean` のときだけ `Ok` を返し、`Pending` は期限内に
-//! 再回収(I → PID 1 の順。PID 1 は I の回収後でないと C の子にならない)と再探索を試みる。台帳に無い ID・`Handed`・
+//! 呼び出し側に移った状態である(そのハンドルの `terminate` が成功すると、同じ launch の項目だけが `Clean` に進む)。`confirm_no_process` は `Clean` のときだけ `Ok` を返し、`Pending` は期限内に
+//! 再回収(I → PID 1 の順。PID 1 は I の回収後でないと C の子にならない)と再探索を試みる。台帳に無い ID・回収前の `Handed`・
 //! 確かめられない `Pending` は `Ok` にしない。`Pending` の ID への再 launch は(再回収を試みても確かめられなければ)
 //! fork 前に拒否する。再回収の待ちの間は `Pending` を台帳から取り出し(記録は `Settling`)、台帳の Mutex を解放する
 //! ため、他コンテナの launch は待たされない(REPAIR-5・CORE-1)。同じ ID への並行な確認・launch は拒否する。期限内に確かめられなかった事実は、launch の `TraitError` の固定の接尾辞
@@ -52,9 +54,14 @@
 //!   `FailedPrecondition` で返す(fail-closed)。cgroup の `cgroup.procs` が空であることの確認は別 issue の範囲
 //!   (StateStore の cgroup 記録との結線が要る)
 //! - 起動台帳はプロセス内のメモリのみ(再起動をまたがない。別プロセスの残存の確認は上記のとおり未対応)
-//! - **supervisor の結線**: `launch` は呼び出しスレッドで直接呼ぶ必要があり、supervisor の `run_start`
-//!   手順 8 と restart の再 launch は別スレッドで呼んでいる。再構成は #1819 の範囲
-//! - mounts・bind mount・`/dev` 以外の tmpfs の注入は `start` が拒否済みで、ここでは載せない
+//! - **supervisor の結線**: `launch` は単一スレッドの呼び出しスレッドで直接呼ぶ必要がある。supervisor の
+//!   `run_start` 手順 8 は、準備の作業スレッドを `join` してから入口スレッドが直接呼ぶ形に再構成済み(#1819)。
+//!   restart の再 launch は `fandhe-relaunch` スレッド等が存在する状態で呼ばれ、この launcher が拒否する
+//!   (`RelaunchFailed`・fail-closed)。呼び出しスレッドで直接行う再構成は #2043
+//! - bind mount（`LaunchSpec::bind_mounts`。#1915）は載せる。fork 前に既定 tmpfs との重なりを検査して
+//!   `PrePivotSetup.binds` へ渡し、restart の再 launch でも同じ集合を使う。`ro` の bind は Landlock の
+//!   `WriteRestrictionShadowed` で fork 前に拒否される（#1917 で解消するまでの想定挙動）
+//! - bind 以外の `mounts[]` の種類と `/dev` 以外の tmpfs の注入は `start` が拒否済みで、ここでは載せない
 
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,12 +72,15 @@ use std::time::Duration;
 use std::time::Instant;
 
 #[cfg(target_os = "linux")]
+use super::bind_mounts::{BindMountSet, audit_bind_mount_error};
+#[cfg(target_os = "linux")]
 use super::cgroup_requirement::{CgroupJoinMeans, launch_after_cgroup_check};
 #[cfg(target_os = "linux")]
 use super::config::NamespaceKind;
 use super::launch::{LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher};
+use crate::audit_log::AuditSink;
 #[cfg(target_os = "linux")]
-use crate::audit_log::{AuditSink, AuditedRejection};
+use crate::audit_log::AuditedRejection;
 #[cfg(target_os = "linux")]
 use crate::cgroups::{CgroupError, CgroupJoin};
 #[cfg(target_os = "linux")]
@@ -233,6 +243,18 @@ impl ProcessLauncher for ProductionLauncher {
         LaunchMode::SelfBounded
     }
 
+    /// start が設定の検証で拒否したときの記録先として、この launcher の監査 sink を貸す(SEC-4・#1915)。
+    fn rejection_audit_sink(&self) -> Option<&dyn AuditSink> {
+        #[cfg(target_os = "linux")]
+        {
+            Some(self.inner.audit_sink.as_ref())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self.never {}
+        }
+    }
+
     /// 直近の `launch` の失敗で、回収できなかった子が残っている可能性があるか(CORE-2)。
     fn last_launch_may_have_left_process(&self) -> bool {
         #[cfg(target_os = "linux")]
@@ -303,6 +325,10 @@ struct SpawnInput<'a> {
     stages: StagePipeline,
     audit: LaunchAudit<'a>,
     timeout: Duration,
+    /// 暗黙の既定 tmpfs(`/dev/shm`)。launcher が fork 前に構築し、bind との重なりも検査済み。
+    tmpfs: &'a TmpfsMountSet,
+    /// 適用する bind mount の集合(空なら `None`。#1915)。
+    binds: Option<&'a BindMountSet>,
 }
 
 /// 起動した PID 1 と、stdout / stderr の読み取り側。
@@ -325,7 +351,9 @@ enum LaunchRecord {
     /// 結果は呼び出し元が書き戻す。確かめ済みとは扱わず、捨てない。
     Settling,
     /// launch 成功。ハンドルの所有者は呼び出し側(start / supervisor)で、launcher は確証できない。
-    Handed,
+    /// 値は launch ごとの世代。そのハンドルの `terminate` が成功したら、同じ世代の項目だけを `Clean` へ進める
+    /// (回収の証跡を台帳へ引き継ぐ。再 launch 後の古いハンドルが新しい項目を書き換えない。CORE-2)。
+    Handed(u64),
 }
 
 /// 消滅を確かめられていない起動の残り(握りつぶさない。CORE-2)。
@@ -422,7 +450,10 @@ struct Inner {
     privilege: IsolationPrivilege,
     audit_sink: Arc<dyn AuditSink>,
     cgroup_join_source: Option<JoinSource>,
-    ledger: Mutex<Ledger>,
+    /// ハンドルの回収通知（`ContainerChildProcess::with_reap_notice`）と共有するため `Arc`。
+    ledger: Arc<Mutex<Ledger>>,
+    /// `Handed` の世代の採番。
+    next_generation: std::sync::atomic::AtomicU64,
     /// 直近の `launch` が失敗し、子が残っている可能性があるか(回収に失敗した子がある、または報告前の PID 1 の
     /// 探索ができなかった。CORE-2)。`launch` の入口で偽に戻す。
     left_process: AtomicBool,
@@ -441,7 +472,8 @@ impl Inner {
             privilege,
             audit_sink,
             cgroup_join_source,
-            ledger: Mutex::new(Ledger::default()),
+            ledger: Arc::new(Mutex::new(Ledger::default())),
+            next_generation: std::sync::atomic::AtomicU64::new(0),
             left_process: AtomicBool::new(false),
         }
     }
@@ -516,6 +548,25 @@ impl Inner {
         }
         let entry = entrypoint_of(spec)?;
         let isolation = isolation_config_of(spec)?;
+        // 暗黙の `/dev/shm` を fork 前に構築し、bind の宛先との重なりをここで検査する(両方の集合が揃う場所。
+        // 子の `run_pre_pivot` の検査は多重防御として残す。CORE-5・#1654・#1915)。
+        let mut default_tmpfs = TmpfsMountSet::new();
+        default_tmpfs.ensure_default_dev_shm().map_err(|e| {
+            TraitError::new(e.code(), "failed to prepare the default /dev/shm mount")
+        })?;
+        let binds = (!spec.bind_mounts().is_empty()).then(|| spec.bind_mounts());
+        if let Some(binds) = binds
+            && let Err(err) = binds.check_against_tmpfs(&default_tmpfs)
+        {
+            let (code, message) = (err.code(), err.message());
+            let _ = audit_bind_mount_error(
+                err,
+                spec.config().mounts(),
+                Some(id),
+                self.audit_sink.as_ref(),
+            );
+            return Err(TraitError::new(code, message));
+        }
         let audit = LaunchAudit {
             sink: self.audit_sink.as_ref(),
             container: Some(id),
@@ -529,6 +580,8 @@ impl Inner {
                 stages,
                 audit,
                 timeout,
+                tmpfs: &default_tmpfs,
+                binds,
             })
             .map_err(|failure| self.absorb_failure(id, *failure))?;
         let Spawned {
@@ -548,8 +601,28 @@ impl Inner {
         if child.pidfd().is_none() {
             return Err(self.reject_unusable_child(id, child));
         }
-        let process = super::launch::ContainerChildProcess::new(child)?.with_output(stdout, stderr);
-        self.ledger().set(id, LaunchRecord::Handed);
+        let generation = self.next_generation.fetch_add(1, Ordering::SeqCst);
+        // ハンドルの terminate が成功した（PID 1 の消滅を回収で確かめた）ら、同じ世代の Handed を Clean へ進める。
+        // 遅れて成功した状態更新の後始末が confirm_no_process で回収済みを確かめられるようにする（CORE-2）。
+        let ledger = Arc::downgrade(&self.ledger);
+        let owner = id.clone();
+        let process = super::launch::ContainerChildProcess::new(child)?
+            .with_output(stdout, stderr)
+            .with_reap_notice(Box::new(move || {
+                let Some(ledger) = ledger.upgrade() else {
+                    return;
+                };
+                let mut ledger = ledger.lock().unwrap_or_else(PoisonError::into_inner);
+                let slot = ledger
+                    .position(&owner)
+                    .and_then(|i| ledger.entries.get_mut(i));
+                if let Some((_, record)) = slot
+                    && matches!(record, LaunchRecord::Handed(g) if *g == generation)
+                {
+                    *record = LaunchRecord::Clean;
+                }
+            }));
+        self.ledger().set(id, LaunchRecord::Handed(generation));
         Ok(Box::new(process))
     }
 
@@ -726,7 +799,7 @@ impl Inner {
                     ));
                 }
                 Some((_, LaunchRecord::Pending(_))) => {}
-                Some((_, LaunchRecord::Handed)) | None => {
+                Some((_, LaunchRecord::Handed(_))) | None => {
                     return Err(TraitError::new(
                         ErrorCode::FailedPrecondition,
                         "the launched process is owned by its handle holder; cannot confirm",
@@ -867,20 +940,11 @@ impl LaunchOps for RealOps {
                 ))
             })?;
         let (stdio, stdout, stderr) = ChildStdio::pipes().map_err(not_started)?;
-        // Landlock の ruleset は暗黙の `/dev/shm` を許可対象に含める(`landlock_implicit_mount_missing` で拒否
-        // されないよう、既定の `/dev/shm`〔64 MiB〕を `/dev` の後に載せる。CORE-5・#1654)。
-        let mut default_tmpfs = TmpfsMountSet::new();
-        default_tmpfs.ensure_default_dev_shm().map_err(|e| {
-            not_started(ExecError::new(
-                e.code(),
-                IsolationStage::Validate,
-                "failed to prepare the default /dev/shm mount",
-            ))
-        })?;
         let setup = PrePivotSetup {
             devices: crate::exec::DevptsGidSource::Rootless(&gid_map),
-            tmpfs: Some(&default_tmpfs),
+            tmpfs: Some(input.tmpfs),
             inject: None,
+            binds: input.binds,
             pinned_rootfs: Some(input.spec.rootfs_dir().as_fd()),
             config_paths: ConfigPaths {
                 readonly: input.spec.config().readonly_paths(),
@@ -962,6 +1026,9 @@ mod tests {
         ContainerChild::from_pid_for_test(pid)
     }
 
+    /// spawn に渡った (bind の宛先列, 既定 tmpfs の宛先列)。
+    type SeenSpawn = (Option<Vec<String>>, Vec<String>);
+
     /// 呼び出しの記録と注入ができる偽の実体。
     struct FakeOps {
         events: Arc<Mutex<Vec<String>>>,
@@ -978,6 +1045,8 @@ mod tests {
         rescan_results: Mutex<VecDeque<Rescan>>,
         /// ステージ列を偽のカーネル上で実行して証跡を記録するか(cgroup 参加の段を含む列は実行しない)。
         run_stages: bool,
+        /// spawn に渡った bind mount の宛先列と既定 tmpfs の宛先列の記録(spawn ごとに 1 件。bind 無しは `None`)。
+        seen: Arc<Mutex<Vec<SeenSpawn>>>,
     }
 
     impl FakeOps {
@@ -992,6 +1061,7 @@ mod tests {
                 last_pid: Arc::new(AtomicU32::new(0)),
                 rescan_results: Mutex::new(VecDeque::new()),
                 run_stages: true,
+                seen: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -1017,6 +1087,20 @@ mod tests {
 
         fn spawn(&self, input: SpawnInput<'_>) -> Result<Spawned, Box<PreparedLaunchFailure>> {
             self.spawn_calls.fetch_add(1, Ordering::SeqCst);
+            self.seen.lock().unwrap().push((
+                input.binds.map(|b| {
+                    b.mounts()
+                        .iter()
+                        .map(|m| m.destination().as_str().to_owned())
+                        .collect()
+                }),
+                input
+                    .tmpfs
+                    .mounts()
+                    .iter()
+                    .map(|m| m.destination.as_str().to_owned())
+                    .collect(),
+            ));
             push(&self.events, format!("spawn {:?}", input.stages));
             // 偽のカーネル上でステージ列を実行し、制限適用の証跡(`LaunchReady`)がそろうかを記録する。
             if self.run_stages {
@@ -1084,6 +1168,15 @@ mod tests {
     /// bundle ディレクトリを作って `LaunchSpec` を直接組み立てる(`start` は cgroup 要件ありの config を
     /// 先に拒否するため、要件の有無を試験で選べるよう `LaunchSpec::new` を使う)。
     fn spec_for(name: &str, linux_extra: serde_json::Value) -> LaunchSpec {
+        spec_with_mounts(name, linux_extra, serde_json::json!([]))
+    }
+
+    /// `spec_for` に `mounts[]` を足したもの。bind の集合は `start` と同じく `config.mounts()` から作る。
+    fn spec_with_mounts(
+        name: &str,
+        linux_extra: serde_json::Value,
+        mounts: serde_json::Value,
+    ) -> LaunchSpec {
         use super::super::cgroup_requirement::CgroupRequirement;
         use super::super::launch::RootfsDir;
         use crate::traits::ContainerId;
@@ -1105,12 +1198,15 @@ mod tests {
             "hostname": "box",
             "process": {"user": {"uid": 0, "gid": 0}, "args": ["/bin/echo", "hi"],
                         "env": ["PATH=/bin"], "cwd": "/"},
+            "mounts": mounts,
             "linux": linux
         });
         let config = parse_config_bytes(&serde_json::to_vec(&cfg).unwrap()).unwrap();
         let rootfs = dir.join("rootfs");
         let rootfs_dir = RootfsDir::pin(&dir, &rootfs).expect("pin");
         let namespaces = config.namespaces().iter().map(|n| n.kind()).collect();
+        let binds = super::super::bind_mounts::BindMountSet::from_mounts(config.mounts())
+            .expect("valid binds");
         let spec = LaunchSpec::new(
             rootfs,
             rootfs_dir,
@@ -1121,6 +1217,7 @@ mod tests {
             CgroupRequirement::of_config(&config),
             Arc::new(config),
             ContainerId::new(name).unwrap(),
+            binds,
         );
         let _ = std::fs::remove_dir_all(&dir);
         spec
@@ -1466,6 +1563,32 @@ mod tests {
         p.terminate(Duration::from_secs(5)).expect("terminate");
     }
 
+    /// CORE-2・#1819: ハンドルの `terminate` が成功すると回収の証跡が台帳へ引き継がれ、`confirm_no_process` が
+    /// `Ok` になる。再 launch 後の古いハンドルの terminate は新しい項目を `Clean` にしない(世代照合)。
+    #[test]
+    fn core2_terminate_of_handed_process_makes_confirm_ok() {
+        let spec = spec_for("handed-reaped", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let first = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        assert!(
+            l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+                .is_err()
+        );
+        // 同じ ID を再 launch すると世代が進む。古いハンドルの回収は新しい項目に影響しない。
+        let second = l.launch(&spec, Duration::from_secs(1)).expect("relaunch");
+        first.terminate(Duration::from_secs(5)).expect("terminate");
+        assert_eq!(
+            l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+                .expect_err("stale handle must not confirm")
+                .code(),
+            ErrorCode::FailedPrecondition
+        );
+        second.terminate(Duration::from_secs(5)).expect("terminate");
+        l.confirm_no_process(spec.container_id(), Duration::from_secs(1))
+            .expect("confirm after reap");
+    }
+
     /// CORE-2: 確かめられていない起動が残る ID への再 launch は、spawn を呼ばずに拒否する(二重起動の防止)。
     /// 子を回収できるようになれば(`Live`)再回収して通る。
     #[test]
@@ -1572,6 +1695,60 @@ mod tests {
             .build()
             .expect_err("missing");
         assert_eq!(e.message(), "the launcher requires an audit sink");
+    }
+
+    fn bind_mounts_json() -> serde_json::Value {
+        serde_json::json!([
+            {"destination": "/data", "type": "bind", "source": "/srv/data", "options": ["rbind", "noexec"]},
+            {"destination": "/cache", "type": "bind", "source": "/srv/cache", "options": ["bind", "rw"]}
+        ])
+    }
+
+    /// OCI-4・SEC-1(#1915): bind 付きの spec は、launcher が spawn へ同じ宛先列を渡す(空なら `None`)。
+    /// 既定 tmpfs は `/dev/shm` を含む。restart 相当の 2 回目の launch でも同じ集合が渡る。
+    #[test]
+    fn oci4_launch_passes_bind_mounts_to_spawn_on_every_launch() {
+        let spec = spec_with_mounts("binds", serde_json::json!({}), bind_mounts_json());
+        let ev = events();
+        let ops = FakeOps::new(&ev);
+        let seen = Arc::clone(&ops.seen);
+        let l = launcher(ops, rootless(), None);
+        for _ in 0..2 {
+            let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        for (binds, tmpfs) in &seen {
+            assert_eq!(
+                binds.as_deref(),
+                Some(["/data".to_owned(), "/cache".to_owned()].as_slice())
+            );
+            assert_eq!(tmpfs, &["/dev/shm".to_owned()]);
+        }
+    }
+
+    /// OCI-4(#1915): bind が無い spec では `binds` は `None`。
+    #[test]
+    fn oci4_launch_passes_no_binds_when_mounts_are_empty() {
+        let spec = spec_for("nobinds", serde_json::json!({}));
+        let ev = events();
+        let ops = FakeOps::new(&ev);
+        let seen = Arc::clone(&ops.seen);
+        let l = launcher(ops, rootless(), None);
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![(None, vec!["/dev/shm".to_owned()])]
+        );
+    }
+
+    /// SEC-4(#1915): `rejection_audit_sink` は構築時の sink を返す。
+    #[test]
+    fn sec4_rejection_audit_sink_is_the_launcher_sink() {
+        let l = launcher(FakeOps::new(&events()), rootless(), None);
+        assert!(l.rejection_audit_sink().is_some());
     }
 
     /// 全 OS 共通の型: `parse_config_bytes` を使う他の試験と同様に config が `LaunchSpec` まで載ること。

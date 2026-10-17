@@ -15,6 +15,7 @@
 //! ├── @lock               ストア全体の排他用ロックファイル
 //! ├── @revision           次に払い出す revision（10 進 ASCII）
 //! ├── @audit.log          監査ログ（`FileAuditSink` が追記。TASK-163 追補・#1594。open 後にのみ作られる）
+//! ├── @supervisor-logs/   supervisor の構造化ログ（supervisor が書く。ストアは触れない。#2067・REPAIR-4）
 //! └── <id>/state.json     ContainerId をそのままパス要素に使う
 //! ```
 //!
@@ -478,7 +479,15 @@ impl FileStateStore {
     ///   分からない）、中身のあるディレクトリの `state.json`。手動の管理操作に委ねる
     ///
     /// いずれも 0700・所有者検査済みの状態ルート配下のエントリに限り、再帰削除はしない。
-    fn remove_record(&self, id: &ContainerId) -> Result<(), TraitError> {
+    ///
+    /// `sweep_control_socket` が真（`StateStore::delete` からのみ）のとき、`<id>/` に残った固定名
+    /// `supervisor.sock` を検証してから消す（`sweep_stale_control_socket`。#2174・OCI-6・SUP-1）。
+    /// `purge_corrupted` は生存確認の無い回復操作のため偽で、ソケットには触れない。
+    fn remove_record(
+        &self,
+        id: &ContainerId,
+        sweep_control_socket: bool,
+    ) -> Result<(), TraitError> {
         let dir = self.record_dir(id);
         let dir_meta = fs::symlink_metadata(&dir)
             .map_err(|_| internal("failed to inspect the state directory"))?;
@@ -513,6 +522,9 @@ impl FileStateStore {
         // 強制終了で残った state.json の一時ファイルがあると <id>/ を消せないため先に掃除する
         // （`@lock` 保持下で呼ばれる）。
         sweep_temp_residue(&dir, STATE_FILE_NAME)?;
+        if sweep_control_socket {
+            sweep_stale_control_socket(&dir);
+        }
         // 削除（unlink）の永続化のため <id>/ を fsync する。ディレクトリ自体を消した場合は
         // その dirent の消失を永続化するため状態ルートも fsync する。
         sync_dir(&dir)?;
@@ -578,7 +590,7 @@ impl FileStateStore {
             }
             RecordHealth::Corrupted(_) => {}
         }
-        self.remove_record(id)?;
+        self.remove_record(id, false)?;
         Ok(DeleteStateResponse::new())
     }
 
@@ -704,6 +716,10 @@ impl FileStateStore {
 }
 
 impl StateStore for FileStateStore {
+    fn host_state_root(&self) -> Option<&Path> {
+        Some(&self.root)
+    }
+
     fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
         check_bundle(req.bundle())?;
         let mut guard = self.lock()?;
@@ -889,7 +905,8 @@ impl StateStore for FileStateStore {
                 "state revision does not match",
             ));
         }
-        self.remove_record(req.id())?;
+        // delete は停止済み（Stopped か pid なしの Created）だけが到達する契約（oci_runtime の check_deletable）。
+        self.remove_record(req.id(), true)?;
         Ok(DeleteStateResponse::new())
     }
 }
@@ -1233,6 +1250,70 @@ fn sweep_temp_residue(dir: &Path, name: &str) -> Result<(), TraitError> {
     }
     Ok(())
 }
+
+/// supervisor の制御チャネルの固定名（`crates/supervisor` の `CONTROL_SOCKET_NAME` と同じ。core は supervisor に
+/// 依存できないため値を重ねて持つ）。
+#[cfg(target_os = "linux")]
+const CONTROL_SOCKET_NAME: &std::ffi::CStr = c"supervisor.sock";
+
+/// 残った制御ソケットを消してよいかを判定する（純関数。#2174・PLUG-12）。
+///
+/// 種別がソケット（symlink・通常ファイル・ディレクトリは対象外）で、所有者が実効 UID のときだけ真。
+#[cfg(target_os = "linux")]
+fn is_sweepable_control_socket(is_socket: bool, uid: u32, euid: u32) -> bool {
+    is_socket && uid == euid
+}
+
+/// supervisor の異常終了で `<id>/` に残った `supervisor.sock` を、検証してから消す（#2174・OCI-6・SUP-1・
+/// PLUG-12・SEC-1）。`remove_record` が `StateStore::delete` のときだけ呼ぶ。
+///
+/// 停止済みのコンテナだけが `delete` に到達する契約なので、残ったソケットは死んだ listener のもの。ただし
+/// 他の部品が置いた同名のものを巻き込まないよう、`<id>/` を `O_NOFOLLOW` で開いた fd を起点に名前を
+/// `O_PATH|O_NOFOLLOW` で開き（symlink ならリンク自体の fd）、その fd の `fstat`（std の `metadata()`）で
+/// 種別（ソケット）と所有者（実効 UID）を確かめ、一致したときだけ `unlinkat`（フラグ 0。ディレクトリは
+/// 消えない）する。固定名 1 つだけが対象。
+///
+/// 一致しない（通常ファイル・symlink・ディレクトリ・他 UID 所有）・不在・検査や削除の失敗は、何も消さず
+/// 静かに戻る（以後の `remove_dir` が `DirectoryNotEmpty` で `<id>/` を残す、従来どおりの挙動。fail-closed）。
+/// 前提と影響範囲: `StateStore::delete` 自体は状態が停止済みかを検査せず、`oci_runtime::delete` の
+/// `check_deletable`（停止済みのみ到達）の契約に依存する。supervisor が `Stopped` を書いた後、後始末で
+/// 少しだけ生きている区間にソケットを消しても、失うのは制御チャネルだけで、コンテナは停止済みのため
+/// 影響は可用性に限られ、権限上の問題は無い。
+///
+/// 検査と削除の間の差し替えは再照合しない: `<id>/` は 0700・所有者検査済みで同一 UID 以外が書けず、
+/// `unlinkat` はディレクトリを消さず symlink を辿らないため、被害は同一 UID が置いた名前 1 件の削除に限られる。
+#[cfg(target_os = "linux")]
+fn sweep_stale_control_socket(dir: &Path) {
+    use std::os::fd::AsFd as _;
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let Ok(d) = open_nowait(dir, OpenOptions::new().read(true)) else {
+        return;
+    };
+    if !d.metadata().is_ok_and(|m| m.is_dir()) {
+        return;
+    }
+    let Ok(fd) = crate::sys::open_path_nofollow_at(d.as_fd(), CONTROL_SOCKET_NAME) else {
+        return;
+    };
+    let Ok(meta) = File::from(fd).metadata() else {
+        return;
+    };
+    if !is_sweepable_control_socket(
+        meta.file_type().is_socket(),
+        meta.uid(),
+        crate::sys::effective_uid(),
+    ) {
+        return;
+    }
+    if crate::sys::remove_file_at(d.as_fd(), CONTROL_SOCKET_NAME).is_ok() {
+        // 失敗しても `remove_dir` が `<id>/` を残すだけなので、永続化の失敗は無視する。
+        let _ = sync_dir(dir);
+    }
+}
+
+/// Linux 以外ではファイル状態ストア自体が使えない（`ensure_supported_platform`）ため何もしない。
+#[cfg(not(target_os = "linux"))]
+fn sweep_stale_control_socket(_dir: &Path) {}
 
 /// ディレクトリを fsync して dirent の変更（作成・rename・unlink）を永続化する。
 /// open は `open_nowait` で待たず、開いた実体がディレクトリでなければ拒否する。
@@ -2938,6 +3019,114 @@ mod tests {
         assert_eq!(fs::read(&outside).unwrap(), b"keep");
         assert_eq!(tmp_entries(&dir), vec!["state.json.tmp-2-0".to_owned()]);
         assert!(dir.join("state.json.tmp-2-0").is_dir());
+    }
+
+    /// 実ソケット（bind 後に listener を閉じても名前は残る）を `path` に作る。
+    fn leave_socket(path: &Path) {
+        drop(std::os::unix::net::UnixListener::bind(path).unwrap());
+        assert!(
+            fs::symlink_metadata(path)
+                .unwrap()
+                .file_type()
+                .is_socket_like()
+        );
+    }
+
+    trait SocketLike {
+        fn is_socket_like(&self) -> bool;
+    }
+    impl SocketLike for fs::FileType {
+        fn is_socket_like(&self) -> bool {
+            use std::os::unix::fs::FileTypeExt;
+            self.is_socket()
+        }
+    }
+
+    /// OCI-6・SUP-1・PLUG-12（#2174）: 異常終了で残った自 UID 所有の `supervisor.sock` があっても delete が
+    /// 成功し、`<id>/` ごと消える。
+    #[test]
+    fn oci6_delete_removes_stale_supervisor_socket_and_dir() {
+        let t = TmpDir::new("stalesock");
+        let store = t.open();
+        let a = create(&store, "a");
+        let dir = t.path().join("a");
+        leave_socket(&dir.join("supervisor.sock"));
+        store
+            .delete(&DeleteStateRequest::new(cid("a"), a.revision()))
+            .unwrap();
+        assert!(!dir.exists());
+    }
+
+    /// OCI-6・PLUG-12（#2174）: 同名でもソケット以外（通常ファイル・symlink・ディレクトリ）は消さず、
+    /// `<id>/` を残す（従来どおり。symlink の先も無傷）。
+    #[test]
+    fn oci6_delete_keeps_non_socket_supervisor_sock() {
+        let t = TmpDir::new("nonsock");
+        let store = t.open();
+        let outside = t.path().join("outside");
+        fs::write(&outside, b"keep").unwrap();
+        for (id, kind) in [("f", 0), ("l", 1), ("d", 2)] {
+            let rec = create(&store, id);
+            let dir = t.path().join(id);
+            let sock = dir.join("supervisor.sock");
+            match kind {
+                0 => fs::write(&sock, b"x").unwrap(),
+                1 => std::os::unix::fs::symlink(&outside, &sock).unwrap(),
+                _ => fs::create_dir(&sock).unwrap(),
+            }
+            store
+                .delete(&DeleteStateRequest::new(cid(id), rec.revision()))
+                .unwrap();
+            assert!(dir.exists(), "{id}: dir must remain");
+            assert!(
+                fs::symlink_metadata(&sock).is_ok(),
+                "{id}: entry must remain"
+            );
+            assert!(!dir.join("state.json").exists());
+        }
+        assert_eq!(fs::read(&outside).unwrap(), b"keep");
+    }
+
+    /// OCI-6・PLUG-12（#2174）: `supervisor.sock` が FIFO でも消さず、O_PATH で開くため読み手不在でもブロックしない。
+    #[test]
+    fn oci6_delete_keeps_fifo_supervisor_sock_without_blocking() {
+        let t = TmpDir::new("fifosock");
+        let store = t.open();
+        let rec = create(&store, "a");
+        let dir = t.path().join("a");
+        let fifo = dir.join("supervisor.sock");
+        // std に mkfifo は無く、sys にも FIFO を作る手段が無いため、テストに限り外部コマンドで作る。
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        store
+            .delete(&DeleteStateRequest::new(cid("a"), rec.revision()))
+            .unwrap();
+        assert!(dir.exists());
+        assert!(fs::symlink_metadata(&fifo).is_ok());
+    }
+
+    /// OCI-6・SEC-1（#2174）: `purge_corrupted`（生存確認の無い回復操作）は `supervisor.sock` に触れない。
+    #[test]
+    fn oci6_purge_corrupted_does_not_touch_supervisor_socket() {
+        let t = TmpDir::new("purgesock");
+        let store = t.open();
+        create(&store, "a");
+        let dir = t.path().join("a");
+        fs::write(dir.join("state.json"), b"{broken").unwrap();
+        leave_socket(&dir.join("supervisor.sock"));
+        store.purge_corrupted(&cid("a")).unwrap();
+        assert!(dir.join("supervisor.sock").exists());
+    }
+
+    /// PLUG-12・SEC-1（#2174）: 消してよいのはソケットかつ実効 UID 所有のものだけ（他 UID 所有は偽）。
+    #[test]
+    fn plug12_sweepable_control_socket_requires_socket_and_own_uid() {
+        assert!(is_sweepable_control_socket(true, 1000, 1000));
+        assert!(!is_sweepable_control_socket(true, 0, 1000));
+        assert!(!is_sweepable_control_socket(false, 1000, 1000));
     }
 
     /// OCI-5・TASK-31.2: 成功した書き込みは一時ファイルを残さない。

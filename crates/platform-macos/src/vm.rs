@@ -28,14 +28,16 @@
 //! `VmError::Timeout` を返すことを Linux 上のテストで検証する。
 //!
 //! ゲスト内 virtiofs mount の待機（TASK-65.3）: `Vm::launch` は `start` 成功後、mount 指定つき共有の報告を
-//! `guest_mount` モジュールの契約で `OpTimeouts::guest_mount`（既定 60 秒）を上限に待つ。ゲスト init が未実装の
-//! 間（REPAIR-3）は、mount 指定つきの `launch` は報告が届かず `guest_mount.timeout` になる。
+//! `guest_mount` モジュールの契約で `OpTimeouts::guest_mount`（既定 60 秒）を上限に待つ。ゲスト init は
+//! `crates/guest-init`（#1875）で実装済みだが、initrd への梱包（#1878）と実機確認（#1628）までは、
+//! mount 指定つきの `launch` は報告が届かず `guest_mount.timeout` になりうる（REPAIR-3）。
 //!
 //! 起動失敗時のクリーンアップ（TASK-64.5）: 失敗した完了通知の直後に `Core::complete_and_settle` が
 //! VZ の実状態へ追従し、状態機械が `Error` のまま残らない。`Vm::launch`（macOS）は設定の構築・VM 生成・
 //! 起動のどこで失敗しても、所有する設定と VM を Rust の drop 順（VM → 設定）で解放する。解放後は VM の
 //! `Drop` が停止を要求し（起動途中なら完了後に再要求）、コンソールログの排他 lock も書き出しスレッドの
-//! 終了とともに解放される。本 crate は一時ファイルを作らず、コンソールログも診断材料として削除しない。
+//! 終了とともに解放される。本 crate は一時ファイルを作らず、コンソールログも stop・drop・起動失敗では診断材料として残す
+//! （上限は回転が保つ。コンテナの delete では `VmConfigSpec::remove_console_logs` が消す。#2138・MAC-1・REPAIR-4）。
 //!
 //! エラー型は `crate::error` に移動し、本モジュールから `VmError`・`VmOp` を再エクスポートする（ERR-1）。
 //!
@@ -861,8 +863,9 @@ mod mac {
         /// `OpTimeouts::guest_mount` を上限に待ち、失敗・期限切れ・VM 停止は `PlatformError::GuestMount`
         /// （`guest_mount.*`）で返す。`Vm::create` を直接使う呼び出し元は mount の結果を検証されない。
         ///
-        /// コンソールログは失敗の診断材料として削除しない。本 crate は一時ファイルを作らず（kernel・initrd・
-        /// ディスクイメージは呼び出し側の所有物）、追記先として検証したパスを削除対象にする経路も作らない。
+        /// コンソールログは失敗の診断材料として削除しない（起動のたびに世代へ回転し、上限を保つ。#2138）。
+        /// 本 crate は一時ファイルを作らず（kernel・initrd・ディスクイメージは呼び出し側の所有物）、`launch` が
+        /// 削除するのは回転で押し出された最古の世代だけである。
         pub fn launch(spec: &VmConfigSpec, timeouts: OpTimeouts) -> Result<Vm, PlatformError> {
             Vm::launch_cancellable(spec, timeouts, &AtomicBool::new(false))
         }

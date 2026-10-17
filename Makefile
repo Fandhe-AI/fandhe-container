@@ -29,12 +29,12 @@ SHELL := /bin/bash
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \
 	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest crash-summary-check \
 	crash-summary-check-selftest lib-selftest \
-	vz-virtio-gpu-guest-check-selftest third-party-licenses-selftest deny-license-fail-closed-selftest \
+	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest guest-initrd-build guest-initrd-build-selftest third-party-licenses-selftest deny-license-fail-closed-selftest \
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
 	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest deny deny-poc-venus-jig \
-	third-party-licenses install-cargo-about ci bench-check bench-plugin-boundary \
+	third-party-licenses install-cargo-about ci bench-check bench-check-manual bench-baseline-manual bench-plugin-boundary \
 	bench-macos-cold-start bench-baseline cli-parity fio-bench fio-baseline-ratio startup-latency \
 	startup-latency-docker startup-latency-report net-setup-timing dns-helper-measure idle-memory \
 	idle-memory-supervised supervisor-pss concurrent-memory concurrent-memory-docker \
@@ -138,7 +138,7 @@ cli-parity-native-reclaim-check: ## capture のタイムアウトでネイティ
 cli-parity-native-reclaim-selftest: ## 回収確認スクリプトの全体期限の自己テスト（#1688・REPAIR-5・REPAIR-12）
 	@scripts/cli-parity-native-reclaim-check-selftest.sh
 
-lib-selftest: ## scripts/lib.sh の workspace 判定の回帰テスト（bash 3.2 を含む。一時ディレクトリのみ）
+lib-selftest: ## scripts/lib.sh の workspace 判定と run_limited の回帰テスト（bash 3.2 を含む。一時ディレクトリのみ）
 	@scripts/lib-selftest.sh
 
 commit-msg-line-length-selftest: ## commit-msg 行長検査スクリプトの自己テスト（Issue #1295・REPAIR-12）
@@ -152,6 +152,18 @@ crash-summary-check-selftest: ## crash-summary-check スクリプトの自己テ
 
 vz-virtio-gpu-guest-check-selftest: ## virtio-gpu ゲスト側確認スクリプトの自己テスト（TASK-172.6・GPU-6・REPAIR-12。fixture のみ）
 	@poc/vz-custom-virtio-gpu/guest/check-virtio-gpu-selftest.sh
+
+guest-kernel-build: ## macOS ゲストカーネル（arm64）を取得・sha256 照合・ビルドする（TASK-64 追補・#1874・MAC-1。ネットワークと実ビルド。make ci には含めない）
+	@guest/kernel/build.sh
+
+guest-kernel-build-selftest: ## ゲストカーネルのビルドスクリプトの自己テスト（#1874・MAC-1・REPAIR-12。スタブのみ）
+	@guest/kernel/build-selftest.sh
+
+guest-initrd-build: ## macOS ゲスト init を静的リンクでビルドし /init だけの initrd（newc・gzip）を作る（TASK-64 追補・#1878・MAC-1。ローカルの実ビルド。make ci には含めない）
+	@scripts/build-guest-initrd.sh
+
+guest-initrd-build-selftest: ## ゲスト initrd 梱包スクリプトの自己テスト（#1878・MAC-1・REPAIR-12。スタブ・fixture のみ）
+	@scripts/build-guest-initrd-selftest.sh
 
 third-party-licenses-selftest: ## ライセンス表記生成スクリプトの自己テスト（スタブ cargo のみ。TASK-103.1）
 	@scripts/generate-third-party-licenses-selftest.sh
@@ -189,13 +201,13 @@ idle-memory-supervised-selftest: ## 監視プロセス込みアイドル常駐�
 supervisor-pss-selftest: ## 監視プロセス常駐メモリ計測スクリプトの自己テスト（TASK-158・SUP-2・REPAIR-12）
 	@scripts/bench/supervisor_pss_selftest.sh
 
-concurrent-memory-selftest: ## 50 コンテナ同時起動メモリ計測スクリプトの自己テスト（CORE-9・REPAIR-12。スタブ launcher・疑似 /proc）
+concurrent-memory-selftest: ## 50 コンテナ同時起動メモリ計測スクリプトの自己テスト（CORE-9・REPAIR-12。スタブ・疑似 /proc）
 	@scripts/bench/concurrent_50_memory_selftest.sh
 
-supervisor-independence-selftest: ## 監視プロセス独立性実証スクリプトの自己テスト（SUP-5・REPAIR-12。スタブ launcher のみ）
+supervisor-independence-selftest: ## 監視プロセス独立性実証スクリプトの自己テスト（SUP-5・REPAIR-12。スタブのみ）
 	@scripts/verify-supervisor-independence-selftest.sh
 
-restart-latency-selftest: ## restart レイテンシ計測スクリプトの自己テスト（SUP-3・REPAIR-12。スタブ launcher のみ）
+restart-latency-selftest: ## restart レイテンシ計測スクリプトの自己テスト（SUP-3・REPAIR-12。スタブのみ）
 	@scripts/measure-restart-latency-selftest.sh
 
 install-launcher-selftest: ## 特権ランチャーのインストールスクリプトの自己テスト（SUP-14・SEC-1・REPAIR-12。スタブのみ・root 不要）
@@ -229,6 +241,12 @@ ci: lint-docs check-workspace-manifest fmt-check lint test doc deny ## ローカ
 
 bench-check: ## ベンチ回帰チェック（REPAIR-7 第 4 段階・REPAIR-8。現状はプレースホルダベンチ）
 	@scripts/targets/bench-check.sh
+
+bench-check-manual: ## 実機前提ベンチ（起動 p95）の結果を基準値と比較する（REPAIR-8・#1901。CI では実行しない。BENCH_RESULTS=<絶対パス> 必須・基準値があれば結果の host_kind か BENCH_HOST_KIND が必須で環境が違えば 2）
+	@scripts/with-tools.sh jq scripts/targets/bench-check-manual.sh
+
+bench-baseline-manual: ## 実機前提ベンチ（起動 p95）の結果から基準値を生成する（REPAIR-8・#2095。BENCH_RESULTS 必須・結果の host_kind が unknown か無ければ BENCH_HOST_KIND も必須。既定の出力先は target/ 配下）
+	@scripts/with-tools.sh jq scripts/targets/bench-baseline-manual.sh
 
 bench-plugin-boundary: ## plugin 境界ベンチを実行し Δp50 と CORE-10 比をログ出力する（TASK-113.3・PLUG-5。基準値比較なし）
 	@scripts/targets/bench-plugin-boundary.sh
@@ -273,10 +291,10 @@ idle-memory: ## アイドル時常駐メモリ（プロセス数・PSS・RSS）�
 idle-memory-supervised: ## 監視プロセス込みのアイドル常駐メモリ回帰テスト（DRIVER=<絶対パス> [EXPECTED_DIR=] [OUTPUT=]。CORE-7・Linux・実機前提）
 	@scripts/targets/idle-memory-supervised.sh
 
-supervisor-pss: ## 監視プロセスの PSS を計測（PID="<pid>..." または COUNT=<N>。[SAMPLES= INTERVAL= EXE_NAME= EXPECTED_DIR= OUTPUT=]。SUP-2・Linux・実機前提）
+supervisor-pss: ## 監視プロセスの PSS を計測（root で実行。PID="<pid>..." または COUNT=<N> と RUN_AS=<起動した利用者> 必須。[SAMPLES= INTERVAL= EXE_NAME= EXPECTED_DIR= OUTPUT=]。SUP-2・Linux・実機前提）
 	@scripts/targets/supervisor-pss.sh
 
-concurrent-memory: ## 50 コンテナ同時起動時の集約 PSS を計測する（実機前提・timeout 付き。LAUNCHER=<絶対パス> BUNDLE=<dir> TARGET=<名前> 必須）
+concurrent-memory: ## 50 コンテナ同時起動時の集約 PSS を計測する（root で実行し起動は降格。実機前提・timeout 付き。BIN_DIR=<絶対パス> BUNDLE=<dir> TARGET=<名前> RUN_AS=<利用者> 必須）
 	@scripts/targets/concurrent-memory.sh
 
 concurrent-memory-docker: ## Docker 側の 50 コンテナ同時起動時の集約 PSS を計測する（実機前提・timeout 付き。DOCKER=<docker の絶対パス> 必須。TASK-50.2）
@@ -285,10 +303,10 @@ concurrent-memory-docker: ## Docker 側の 50 コンテナ同時起動時の集�
 concurrent-memory-report: ## own と Docker の 50 コンテナ集約メモリの結果を 1 つのレポートに統合する（OWN_RESULT=<file> DOCKER_RESULT=<file> 必須。TASK-50.2）
 	@scripts/targets/concurrent-memory-report.sh
 
-supervisor-independence: ## 監視プロセス 1 個を kill して他の継続と孤児の稼働継続を確認する（実機前提・timeout 付き。LAUNCHER=<絶対パス> BUNDLE=<dir> 必須。SUP-5）
+supervisor-independence: ## 監視プロセス 1 個を kill して他の継続と孤児の稼働継続を確認する（実機前提・timeout 付き。BIN_DIR=<絶対パス> BUNDLE=<dir> 必須。SUP-5）
 	@scripts/targets/supervisor-independence.sh
 
-restart-latency: ## バックオフ 0 の restart レイテンシを計測する（実機前提・timeout 付き。LAUNCHER=<絶対パス> BUNDLE=<dir> 必須。[TRIALS= WARMUP= OUTPUT= RESTART_LATENCY_WAIT_TIMEOUT=]。SUP-3）
+restart-latency: ## restart レイテンシを計測する（既定バックオフ 100ms 差し引き値も出す）（実機前提・timeout 付き。BIN_DIR=<絶対パス> BUNDLE=<dir> 必須。[TRIALS= WARMUP= OUTPUT= RESTART_LATENCY_WAIT_TIMEOUT=]。SUP-3）
 	@scripts/targets/restart-latency.sh
 
 # --------------------------------------------------

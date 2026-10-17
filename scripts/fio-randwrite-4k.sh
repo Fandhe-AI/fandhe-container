@@ -905,19 +905,24 @@ snapshot_json_input() {
     exit 2
   fi
   (
+    # 親の EXIT trap（cleanup = 一時ディレクトリの削除）を引き継がない
+    trap - EXIT
     exec 3<"$src" || exit 10
     # /dev/fd/3 の stat は開いた fd 自体を指す（Linux・macOS 共通）
     [ -f /dev/fd/3 ] || exit 11
     exec head -c "$((MAX_FROM_JSON_BYTES + 1))" <&3 >"$dst"
   ) 2>/dev/null &
   reader_pid=$!
-  ( sleep "$INPUT_READ_TIMEOUT_SECS" && kill -KILL "$reader_pid" ) >/dev/null 2>&1 &
+  ( trap - EXIT; sleep "$INPUT_READ_TIMEOUT_SECS" && kill -KILL "$reader_pid" ) >/dev/null 2>&1 &
   watchdog_pid=$!
   wait "$reader_pid" || rc=$?
   # 見張りの終了コードは判定に使わない（読み取りが先に終われば kill で止めるだけ）。
   # ここでの `|| true` は、既に終了した見張りへの kill・wait の失敗で set -e が
   # スクリプトを止めないためのもの。
-  kill "$watchdog_pid" >/dev/null 2>&1 || true
+  # SIGKILL を使う理由: EXIT trap があると bash は終了系シグナルにハンドラを入れる。
+  # 見張りの fork 直後（trap のリセット前）に SIGTERM が届くと、子が親の cleanup を
+  # 実行して一時ディレクトリ（スナップショット）を消す競合になるため。
+  kill -KILL "$watchdog_pid" >/dev/null 2>&1 || true
   wait "$watchdog_pid" >/dev/null 2>&1 || true
   case "$rc" in
     0) ;;

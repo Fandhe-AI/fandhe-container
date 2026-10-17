@@ -26,7 +26,7 @@ spec で確定済みの前提と、本ドキュメントで確定した内容を
 
 ## crate 一覧（確定）
 
-spec の仮称（`05-tasks.md` 冒頭）は core 系 8 個（`io`・`core`・`oci`・`cri`・`platform-macos`・`platform-windows`・`microvm`・`cli`）・plugin 系 5 個（`plugin-cri`・`plugin-macos`・`plugin-windows`・`plugin-microvm`・`plugin-mcp`）である。本決定はこれに `supervisor`・`gpu`・`net`・`plugin`（旧称 `plugin-api`）・`stack`・`compose-convert` の 6 crate を加え、core 系 13・独立ツール 1（`compose-convert`）・plugin 系 5 の 19 crate を確定一覧とした（決定 1・決定 4・決定 5）。加えて、crate をまたぐベンチ（TASK-113）・基準値（TASK-88）を置く root の `benches/` を、19 crate とは別枠で `publish = false` の workspace メンバー crate（`fandhe-container-benches`）とする（決定 7）。
+spec の仮称（`05-tasks.md` 冒頭）は core 系 8 個（`io`・`core`・`oci`・`cri`・`platform-macos`・`platform-windows`・`microvm`・`cli`）・plugin 系 5 個（`plugin-cri`・`plugin-macos`・`plugin-windows`・`plugin-microvm`・`plugin-mcp`）である。本決定はこれに `supervisor`・`gpu`・`net`・`plugin`（旧称 `plugin-api`）・`stack`・`compose-convert` の 6 crate を加え、core 系 13・独立ツール 1（`compose-convert`）・plugin 系 5 の 19 crate を確定一覧とした（決定 1・決定 4・決定 5）。追補として、macOS ゲスト用の `guest-init` を #20 に加えた（TASK-64 追補・#1875。#1823 のオーナー判断 2026-10-12）。加えて、crate をまたぐベンチ（TASK-113）・基準値（TASK-88）を置く root の `benches/` を、19 crate とは別枠で `publish = false` の workspace メンバー crate（`fandhe-container-benches`）とする（決定 7）。
 
 なお「core 系 13・独立ツール 1・plugin 系 5」は本ドキュメントが workspace 上の配置区分として便宜的に付けた分類であり、PLUG-1 の「core／plugin」区分（下表「PLUG-1 区分」列）とは別軸である。`cri`・`platform-macos`・`platform-windows`・`microvm` の 4 crate は、PLUG-1 上は「plugin 境界の外側」（plugin バイナリから呼ばれるバックエンド実装ライブラリ）であり、PLUG-1 上の「core」には区分されない。`compose-convert` は plugin ではない独立ツールであり、PLUG-1 区分の対象外である（決定 5）。
 
@@ -42,8 +42,8 @@ spec の仮称（`05-tasks.md` 冒頭）は core 系 8 個（`io`・`core`・`oc
 | 8 | microvm | microvm | KVM 直接制御・最小 virtio デバイスモデル（Linux オプション） | G5（TASK-74〜78） | plugin 境界の外側（`microvm` はバックエンド実装ライブラリ。実行時は `plugin-microvm` バイナリが別プロセスとして動かす。TASK-117） |
 | 9 | cli | cli | 統一 CLI・基本コマンド（create/start/stop/delete/list/logs/ps）、観測性 | G6（TASK-79〜98 の一部。crate の中核成果物は TASK-79〔基本コマンド〕・TASK-95〔エラー形式〕。REPAIR・ERR 系タスクを含む） | core |
 | 10 | plugin | plugin（旧称 `plugin-api`） | plugin 境界機構（UDS・長さ接頭辞フレーム・gRPC・常駐/都度起動・信頼性検証） | G8（TASK-107 が crate 本体〔`crates/plugin/` に改名〕、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124。plugin 発見・登録〔TASK-109〕の成果物は `crates/core/src/plugin_discovery.rs` であり `plugin` ではない） | core・plugin 双方が依存する境界基盤ライブラリ |
-| 11 | gpu | gpu | GPU CDI spec 解析・edits 適用・Landlock/seccomp・cgroup device・読み取り専用 rootfs | G9（TASK-126〜135） | core（推奨）〔注 1〕。macOS Venus〔GPU-6〕は対象・実装機構が異なる別枠で、成果物は `plugin-macos` 側に置かれる |
-| 12 | net | net | netlink・nftables・bridge/veth/netns・DNS ヘルパー・host/none モード・ポート公開 | G10（TASK-136〜148・TASK-185〜186） | core 側のライブラリ（supervisor と `NetworkPlugin` の実装の両方がリンクする。ネットワーク設定操作は制御面として PLUG-1 で `NetworkPlugin` が plugin 側に区分され、その実装は plugin 側のまま。NET-5 の DNS ヘルパーの起動・停止は `NetworkPlugin` の実装〔plugin 側〕、NET-9 の pasta の起動・監視・回収は supervisor〔core 側〕が行う。いずれも D-14 の例外として認められている。PLUG-4 が数える「core」〔`crates/core`〕には入らない。2026-10-12 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)。rootful のネットワーク設定の配置は未解決疑問点 11 の残りで未決、`plugin-system.md`） |
+| 11 | gpu | gpu | GPU CDI spec 解析・edits 適用・Landlock/seccomp・cgroup device・読み取り専用 rootfs | G9（TASK-126〜135） | core（2026-10-15 確定）〔注 1〕。macOS Venus〔GPU-6〕は対象・実装機構が異なる別枠で、成果物は `plugin-macos` 側に置かれる |
+| 12 | net | net | netlink・nftables・bridge/veth/netns・DNS ヘルパー・host/none モード・ポート公開 | G10（TASK-136〜148・TASK-185〜186） | core 側のライブラリ（supervisor と `NetworkPlugin` の実装の両方がリンクする。ネットワーク設定操作は制御面として PLUG-1 で `NetworkPlugin` が plugin 側に区分され、その実装は plugin 側のまま。NET-5 の DNS ヘルパーの起動・停止は `NetworkPlugin` の実装〔plugin 側〕、NET-9 の pasta の起動・監視・回収は supervisor〔core 側〕が行う。いずれも D-14 の例外として認められている。PLUG-4 が数える「core」〔`crates/core`〕には入らない。2026-10-12 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)。rootful のネットワーク設定〔veth・bridge・nftables〕は `NetworkPlugin` の実装が `crates/net` を使って行い、core は network namespace を渡すだけにする。2026-10-15 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6200154873)、`plugin-system.md`） |
 | 13 | stack | stack | TOML スキーマ・`depends_on` 起動順・`profiles` 絞り込み | G11（TASK-149・150・187〜188。TASK-149 が crate 雛形） | core（CLI＋ライブラリ API） |
 | 14 | compose-convert | compose-convert | `compose.yaml` → TOML の片方向変換ツール（変換レポート・キー分類・`--downgrade` 格下げ・GPU 予約変換・`build:` エラー処理・往復検証テスト〔TASK-152〕） | G11（TASK-151 が crate 雛形・変換器本体、TASK-152・153・154・156・182） | 該当外（plugin ではない独立ツール。決定 5） |
 | 15 | plugin-cri | plugin-cri | CRI サーバー plugin バイナリ（`cri` の実装を別プロセス化） | G8（TASK-114） | plugin |
@@ -51,8 +51,9 @@ spec の仮称（`05-tasks.md` 冒頭）は core 系 8 個（`io`・`core`・`oc
 | 17 | plugin-windows | plugin-windows | Windows バックエンド plugin バイナリ（`platform-windows` の実装を別プロセス化） | G8（TASK-116） | plugin |
 | 18 | plugin-microvm | plugin-microvm | microVM 制御 plugin バイナリ（`microvm` の実装を別プロセス化） | G8（TASK-117） | plugin |
 | 19 | plugin-mcp | plugin-mcp | MCP サーバー plugin バイナリ（参照実装） | G8（TASK-118、PoC-13） | plugin |
+| 20 | guest-init | guest-init | macOS ゲスト VM の initrd に入れる Rust 製 PID 1（virtiofs の mount と報告・起動完了マーカー。TASK-64 追補・#1875。#1823 のオーナー判断 2026-10-12 で配置を確定。ターゲットは静的リンクの `aarch64-unknown-linux-musl`） | G5（TASK-64 追補） | 該当外（ゲスト資産。ホスト側の PLUG-1 境界の外） |
 
-〔注 1〕`gpu` 行の PLUG-1 区分の内訳: `plugin-system.md` の境界表で「core（推奨）」と明記されているのは GPU-1〜4（CDI 適用・OCI hook 実行）のみ。GPU-5・GPU-7・GPU-8（Landlock/seccomp・cgroup device・読み取り専用 rootfs との両立）は境界表での明示判定がなく、`gpu` crate に実装される付随機能として扱っている。GPU-9 は `api-gpu.md` でステータス「検討中」のため確定扱いしない。
+〔注 1〕`gpu` 行の PLUG-1 区分の内訳: `plugin-system.md` の境界表で core と明記されているのは GPU-1〜4（CDI 適用・OCI hook 実行）のみ（2026-10-15 に「推奨」から確定。#4 のコメント）。GPU-5・GPU-7・GPU-8（Landlock/seccomp・cgroup device・読み取り専用 rootfs との両立）は境界表での明示判定がなく、`gpu` crate に実装される付随機能として扱っている。GPU-9 は `api-gpu.md` でステータス「検討中」のため確定扱いしない。
 
 ## plugin crate の配置（決定）
 
@@ -91,6 +92,17 @@ PoC-13（plugin-boundary-mechanism）は、MCP 参照 plugin（Python 製、`fan
 3. `cargo build -p <core のバイナリ> --locked` で作った core バイナリの sha256
 
 判定対象を `-p <core>` で選んだ core 自身の依存木・core バイナリに絞っているため、plugin を足して root の `Cargo.lock` が変化しても、core に解決される依存だけを見比べられる。加えて、依存は `[workspace.dependencies]` で `=x.y.z` に完全固定しているため、plugin 側で feature を足しても core の依存の版は動かない。この 2 点により、案 A（workspace 内配置）を採用しても root `Cargo.toml`/`Cargo.lock` の変化を判定対象から外すことで PLUG-4 の趣旨を満たせる。
+
+### 決定 3 の補足: (3) の成果物は core の rlib（#2136）
+
+(3) の「core バイナリ」は、`cargo build -p fandhe-container-core --locked` が作る core の成果物（rlib）の sha256 と読む。CLI（`fandhe-container`）・supervisor の実行ファイルへは切り替えない（PLUG-4・TASK-109.4・PLUG-3）。
+
+- 実行ファイルは core 以外の crate（net・plugin・supervisor・cli 自身のソース等）をリンクする。plugin を足す PR が `crates/plugin` や `crates/cli` を一緒に変えるのは正当だが、実行ファイルの sha256 は変わり、core が同一でも NG になる。ソース一覧 (1) と差分検査は `crates/core` だけを見るため、範囲もそろわない
+- core は lib のみの crate で `[[bin]]` を持たない（CORE-1・D-19）。core だけを表す成果物は rlib である
+- rlib には依存 crate のハッシュと feature の解決結果が入るため、core の依存の版・feature の変化には rlib も反応する。版は (2) の依存木と `=x.y.z` の完全固定でも押さえている
+- 切り替えると、bin を持つ fixture の追加、Windows の `.exe` 対応、`bench-regression` での CLI 全体の 2 回リンクが要る
+
+spec の PLUG-4・TASK-109 の「core バイナリ」は PoC-13 の `core-harness` bin を前提にした言い方で、この読み替えは 2026-10-17 のオーナー決定で spec 側にも注記した（PLUG-4・TASK-109・MS-3・REPAIR-1）。PLUG-3 のサイズ記録の対象は別判断で、本補足の範囲外。
 
 ### 決定 4: `fandhe-container-plugin-api` の改名
 

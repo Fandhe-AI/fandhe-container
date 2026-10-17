@@ -24,12 +24,15 @@
 //! 拒否を `Mount` 監査レコードにする [`MountDestination::resolve_in_audited`]・[`audit_mount_config_error`]
 //! を持つ。ファイル永続化（TASK-41.5.1・#839）は実装済みで、本番経路への sink の配線は未実装。
 //!
+//! bind mount の宛先は `BindMountSet::from_mounts`（`bind_mounts`。#1911）を経て検証する。bind の適用で
+//! [`MountDestination::resolve_in`] の文字列結合を直接 `mount(2)` に渡してはならない。
+//!
 //! # スコープ外（REPAIR-3）
 //!
 //! 字句的な正規化のみで、rootfs 内の symlink は解決しない。[`MountDestination::resolve_in`] の返り値は
 //! 「字句上 rootfs 配下」の保証であり、symlink 経由の脱出や検証からマウントまでの TOCTOU は防げない。
 //! 実マウントは rootfs の fd を起点に `O_NOFOLLOW` で 1 要素ずつ辿る方式（`exec` の `open_dir_beneath` と同じ）で
-//! 行う必要があり、TASK-29.2・TASK-127 の担当とする。文字列パスで直接 `mount(2)` してはならない。
+//! 行う必要がある。bind の宛先は適用の段（`exec::mount_binds`。#1913・#1915 で結線済み）がその方式で適用する。bind 以外の種類は TASK-29.2・TASK-127 の担当とする。文字列パスで直接 `mount(2)` してはならない。
 
 use std::path::{Component, Path, PathBuf};
 

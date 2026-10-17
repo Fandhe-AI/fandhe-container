@@ -14,6 +14,10 @@ Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実
 
 開発進行中で、実装済みの範囲は crate ごとに異なります。進捗は GitHub の Issue で管理します。タスク定義は spec リポの [`05-tasks.md`](https://github.com/Fandhe-AI/fandhe-container-spec/blob/main/05-tasks.md)、マイルストーンは [`06-roadmap.md`](https://github.com/Fandhe-AI/fandhe-container-spec/blob/main/06-roadmap.md)（MS-1〜14）を参照してください。
 
+## macOS ゲスト用 init
+
+macOS VM の initrd に入れる Rust 製 init は `crates/guest-init`（静的リンクの `aarch64-unknown-linux-musl` を想定。busybox 等の GPL ユーザーランドは入れない）。virtiofs の mount と報告を行い、起動完了後に `fandhe-guest: init ready v1` を 1 行出す。initrd への梱包と実機での起動確認は未実施（MAC-1・TASK-64 追補・#1875）。
+
 ## 実装方針（要点）
 
 - **フルスクラッチ**: youki / Cloud Hypervisor / Firecracker / rust-vmm は設計の参考にとどめ、コードの採用や低レベル基盤クレートとしての利用は行いません
@@ -30,7 +34,7 @@ Rust でフルスクラッチ開発する軽量なコンテナ実行基盤の実
 
 ## クイックスタート
 
-現時点では利用者向けの統一 CLI（TASK-79・`CLI-1`）が未提供のため、ここではソースからのビルドとテストの手順を示します。利用者向けの手順は CLI の実装後に追記します。
+統一 CLI（`fandhe-container`。TASK-79・`CLI-1`）は Linux で `create` / `start` / `stop` / `delete` / `list` / `logs` の入口を提供済みです。`start` は CLI と同じディレクトリの `fandhe-container-supervisor` を user スコープ（`systemd-run --user --scope -p Delegate=yes`）で起動し、supervisor が core の本番 launcher でコンテナのプロセスを起動して Running を記録します（#1718・#1819）。対応は rootless のみで、前提（非 root・`systemd-run` と user マネージャ・委譲 cgroup・Landlock ABI 6 以上）を満たさないと `FAILED_PRECONDITION`（5）等で止まります。実機での通し確認は未実施です（#2062。前提の詳細は [docs/setup/linux.md](docs/setup/linux.md)）。rootful の特権起動はランチャー（#1719。`scripts/install-privileged-launcher.sh` のインストールに root が必要）が前提で、CLI からの選択は未対応です。macOS / Windows は plugin 経由で未提供です。ここではソースからのビルドとテスト、現状の CLI の動作確認の手順を示します。
 
 前提: `git`・`make`・`rustup`（toolchain は `rust-toolchain.toml` で固定）。`make setup` は最後に git hooks を導入するため、`lefthook`・`brew`・`npx` のいずれかも必要です（いずれも無いと `make hooks` が終了コード 1 で停止します。ビルドとテストだけなら `make setup` を使わず、`git submodule update --init`〔任意〕の後に下記の `cargo build` / `make test` を実行できます）。
 
@@ -41,6 +45,16 @@ make setup               # submodule → rustup 確認 → git hooks 導入
 cargo build --workspace  # ビルド
 make test                # テスト（lint・deny まで含めた一括検証は make ci）
 ```
+
+ビルド後は `target/debug/` に CLI と supervisor が並びます（`start` は CLI の隣の supervisor を探すため、同じディレクトリから実行してください）。インストール後も CLI は launcher・supervisor と同じディレクトリに置きます（`PATH` 上の symlink 経由でも実体のディレクトリを見ます。rootful と rootless の配置手順は [docs/setup/linux.md](docs/setup/linux.md)）。`--root` は状態ルート、`<bundle>` は `config.json` と `rootfs/` を持つ OCI bundle の絶対パスです。
+
+```bash
+target/debug/fandhe-container --root /tmp/fc-state create --bundle <bundle> c1   # 状態を Created で記録
+target/debug/fandhe-container --root /tmp/fc-state start c1                      # rootless で前提を満たせば 0（出力なし）。満たさなければ構造化エラー
+target/debug/fandhe-container --root /tmp/fc-state list                          # 実際の状態はここで確かめる
+```
+
+`start` の終了結果だけでコンテナの状態は決まりません。成功しても、すぐ終わるプロセスなら次の `list` では既に stopped になっていることがあります。CLI が supervisor の報告を待ち切れずにタイムアウトで失敗した場合も、supervisor は止めないので、コンテナが running になっていることがあります。状態は `list` で確かめてください。
 
 `make help` でターゲット一覧を表示します（Makefile は薄い入口で、実体は `scripts/` 配下のスクリプトです。Make を使わない場合は `scripts/help.sh` を参照。編集規約は [.claude/rules/makefile.md](./.claude/rules/makefile.md)）。コントリビュートの流れは [CONTRIBUTING.md](./CONTRIBUTING.md)、crate 境界は [docs/architecture.md](./docs/architecture.md)、ビルド・回帰確認コマンドは [AGENTS.md](./AGENTS.md) を参照してください。
 

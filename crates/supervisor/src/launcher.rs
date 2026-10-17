@@ -21,7 +21,7 @@
 //!   与えるパスも受け付けない（[`supervisor_path_beside`]）
 //! - 実体: パスの全要素を辿って root 所有・他者書き込み不可を確かめ（[`verify_install_chain`]）、`open` した fd に
 //!   `fstat` をかけて同じ条件を確かめ、検証した同じ fd を `execveat(AT_EMPTY_PATH)` で exec する（TOCTOU 回避）
-//! - 継承 fd・cwd・ダンプ: fd 0〜2 が開いていることを確認し、fd 3 以降を閉じ、cwd を `/` にし、
+//! - 継承 fd・cwd・ダンプ: fd 0〜2 が開いていることを確認し、fd 3 以降を閉じ（supervisor の入口でも同じ処理を行う。#2070）、cwd を `/` にし、
 //!   `PR_SET_DUMPABLE=0` を `elevate` の前に設定する（設計書 7 章の「実装時に決める」項目をここで確定した）
 //!
 //! # 失敗時の契約（fail-closed）
@@ -552,7 +552,8 @@ mod linux {
         vars: Vec<(OsString, OsString)>,
     ) -> Result<std::convert::Infallible, LauncherError> {
         // 継承 fd・cwd の整理。
-        crate::sys::close_fds_from(3).map_err(|e| setup_failed("closing inherited fds", &e))?;
+        crate::sys::close_fds_from(crate::start_contract::FIRST_INHERITED_FD)
+            .map_err(|e| setup_failed("closing inherited fds", &e))?;
         std::env::set_current_dir("/").map_err(|e| setup_failed("chdir to /", &e))?;
         // 引数: supervisor と同じ契約で検証し、通った列をそのまま転送する。
         StartArgs::parse(args.iter().cloned())?;

@@ -1,65 +1,41 @@
 //! `create` / `start` コマンド本体（Linux は plugin を介さず core を直接呼ぶ。TASK-79.2.1・CLI-1・MS-6）。
 //!
-//! `commands::run` が argv を解析した後に [`run_create`] / [`run_start`] を呼ぶ。実処理は core の
-//! `oci_runtime::create` / `oci_runtime::start`（OCI-4・OCI-5・TASK-29）へ委ね、入力の意味検証
-//! （ID の文字種・bundle の絶対パス・rootfs の symlink 検査）も core の型と関数を唯一の判定とする。
+//! `commands::run` が argv を解析した後に [`run_create`] / [`run_start`] を呼ぶ。`create` の実処理は core の
+//! `oci_runtime::create`（OCI-4・TASK-29）へ委ね、入力の意味検証（ID の文字種・bundle の絶対パス）も
+//! core の型と関数を唯一の判定とする。`start` は core を呼ばず、supervisor の bin を起動して結果の 1 行を
+//! 期限付きで受け取る（`supervisor_start` module。#1718・#1314 の配置 1-A）。CLI は `start` で状態を書かない。
 //! `--bundle` 自体やその祖先が symlink でも create は受理し、渡されたパスのまま状態へ保存する
-//! （canonicalize しない）。bundle までの経路の symlink は start が起動前に検査して拒否する（SEC-1）。
-//! 依存（状態ストア・launcher・計測器）は [`Runtime`] で注入できるようにし、単体テストではフェイクを差せる。
+//! （canonicalize しない）。bundle までの経路の symlink は supervisor 側の start が起動前に検査して拒否する（SEC-1）。
+//! 依存（状態ストア・計測器）は [`Runtime`] で注入できるようにし、単体テストではフェイクを差せる。
 //!
 //! 未実装・簡易実装（REPAIR-3）:
-//! - 本番の [`ProcessLauncher`] はリポジトリ内に存在しない。そのため本番入口の `start` は
-//!   [`UnavailableLauncher`] により fail-closed で `UNIMPLEMENTED` を返す。将来は supervisor 経由の
-//!   起動（TASK-157・TASK-37〜39・CORE-1）に差し替え、起動済みプロセスの監視・回収を supervisor へ引き渡す。
-//!   失敗する `start` でも core は起動権の予約（Created → Running）と取り消し（Running → Created）を
-//!   状態ストアへ書くため、状態は Created のままでも `state.json` の revision は進む（ファイルは不変ではない）。
+//! - 本番入口の `start` は、状態ストアで ID の存在を確かめた後、CLI の実体と同じディレクトリの
+//!   `fandhe-container-supervisor` を起動して結果を受け取る（`supervisor_start` module の doc に契約・期限・
+//!   未実装範囲を書く）。supervisor が core の本番 launcher（#1715・#1819）で起動し、Running の記録は supervisor が行う
+//!   （rootless のみ。実機での通し確認は未実施で #2062）。CLI は状態を書かないので、失敗しても `state.json` は変わらない
+//!   （プロセスのいない Running を CLI は残さない。#1541）。ランチャー経由の特権起動の選択は未対応（#1719・#1722）。
 //! - 計測（REPAIR-4）のファイル出力は core の `open_flags` が対応するアーキテクチャの Linux のみ（`op_log_file`。対応外は出力しない）。本バイナリを
 //!   setuid / setgid・file capability つきで導入しない前提で、権限分離（TASK-171・SUP-14）で見直す。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4。`plugin_backend` module）。非 Linux では
 //!   `production_runtime` が状態ストアの代わりに plugin の発見・信頼性検証を試み、現状は必ず fail-closed で
 //!   失敗する（起動と RPC は TASK-114・TASK-125）。
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
-use fandhe_container_core::oci_runtime::{
-    LaunchSpec, LaunchedProcess, LifecycleOp, OciRuntimeError, ProcessLauncher, StartTimeouts,
-    StartedContainer, create, start,
-};
+use fandhe_container_core::oci_runtime::{LifecycleOp, OciRuntimeError, create};
 use fandhe_container_core::state_store::FileStateStore;
 use fandhe_container_core::traits::{
-    ContainerId, CreateRequest, ErrorCode, StartRequest, StateRecord, StateStore, TraitError,
+    ContainerId, CreateRequest, StartRequest, StateRecord, StateStore, TraitError,
 };
 
 use super::CliExit;
 use super::args::{CreateArgs, GlobalArgs, StartArgs};
 
-/// core の操作へ注入する依存の束。
+/// core の操作へ注入する依存の束（`start` は core を呼ばないため、状態ストアの存在確認と計測にだけ使う）。
 pub(super) struct Runtime {
     pub(super) store: Box<dyn StateStore>,
-    pub(super) launcher: Arc<dyn ProcessLauncher>,
     pub(super) recorder: OpRecorder,
-    pub(super) timeouts: StartTimeouts,
-}
-
-/// 本番の launcher。プロセス起動の本番実装がまだ無いため、常に `Unimplemented` で失敗する（REPAIR-3）。
-///
-/// core の `start` は launch 失敗時に予約を Created へ戻すため、状態は壊れない。将来仕様: supervisor 経由で
-/// コンテナプロセスを起動する実装（TASK-157・TASK-37〜39・CORE-1）に置き換える。
-struct UnavailableLauncher;
-
-impl ProcessLauncher for UnavailableLauncher {
-    fn launch(
-        &self,
-        _spec: &LaunchSpec,
-        _timeout: Duration,
-    ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
-        Err(TraitError::new(
-            ErrorCode::Unimplemented,
-            "process launcher is not available yet",
-        ))
-    }
 }
 
 /// 構築済みの要求で core の `create` を呼ぶ。
@@ -68,21 +44,6 @@ pub(super) fn create_container(
     req: &CreateRequest,
 ) -> Result<StateRecord, OciRuntimeError> {
     create(rt.store.as_ref(), &rt.recorder, req)
-}
-
-/// 構築済みの要求で core の `start` を呼ぶ。起動済みプロセスのハンドルは呼び出し元へ返す
-/// （監視・回収は呼び出し元の責務。CORE-1）。
-pub(super) fn start_container(
-    rt: &Runtime,
-    req: &StartRequest,
-) -> Result<StartedContainer, OciRuntimeError> {
-    start(
-        rt.store.as_ref(),
-        &rt.recorder,
-        &rt.launcher,
-        req,
-        &rt.timeouts,
-    )
 }
 
 /// ID の文字種と bundle の絶対パスを core の型で検証する（相対パスの解決・canonicalize はしない。SEC-1）。
@@ -97,7 +58,7 @@ fn build_start_request(args: &StartArgs) -> Result<StartRequest, TraitError> {
 
 /// 要求を構築し、状態ルートを解決して本番の依存を組む。要求構築が先なので、不正な入力では状態ルートを作らない。
 /// いずれかの失敗は core に到達していないため、ここで `op_name` の失敗として記録する（REPAIR-4）。
-/// stop / delete（`stop_delete` module）からも呼ばれる。その場合 `launcher`・`timeouts` は使われない。
+/// stop / delete（`stop_delete` module）からも呼ばれる。
 pub(super) fn production_runtime<R>(
     global: &GlobalArgs,
     recorder: OpRecorder,
@@ -110,9 +71,7 @@ pub(super) fn production_runtime<R>(
         Ok((req, store)) => Ok((
             Runtime {
                 store: Box::new(store),
-                launcher: Arc::new(UnavailableLauncher),
                 recorder,
-                timeouts: StartTimeouts::default(),
             },
             req,
         )),
@@ -556,7 +515,12 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     }
 }
 
-/// 本番入口の `start`。
+/// 本番入口の `start`。成功時は何も出さない（OCI の start 互換）。
+///
+/// 要求を構築して状態ストアで ID の存在を確かめ（不在は `NOT_FOUND`。spawn しない）、ストアを閉じてから
+/// supervisor を起動する（`supervisor_start::start_via_supervisor`）。状態の正否の判定（Created か等）は
+/// supervisor の手順に任せ、CLI は二重に持たない。core の `start` はこのプロセスで呼ばれなくなったため、
+/// 計測（REPAIR-4）は CLI が操作名 `start` の成功・失敗と経過時間を 1 回記録する。
 pub(super) fn run_start(global: &GlobalArgs, args: &StartArgs) -> CliExit {
     let started = Instant::now();
     let recorder = OpRecorder::new();
@@ -568,32 +532,64 @@ pub(super) fn run_start(global: &GlobalArgs, args: &StartArgs) -> CliExit {
         Ok(v) => v,
         Err(e) => return CliExit::Runtime(e),
     };
-    let result = start_container(&rt, &req);
-    export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+    let Runtime { store, recorder } = rt;
+    let result = ensure_exists(store, &req).and_then(|()| launch_supervisor(global, &req));
+    record_start_outcome(&recorder, started, result.is_ok());
+    export_ops(&recorder, std::env::var_os(OP_LOG_ENV).as_deref());
     match result {
-        // 本番 launcher（UnavailableLauncher）では到達しない。将来 launcher が差し替わっても、
-        // 監視者へ引き渡せないまま CLI が終了して孤児プロセスを残さないよう、止めてから失敗を返す
-        // （fail-closed）。supervisor への引き渡しは TASK-157。
-        // 注意: この枝はプロセスを止めるだけで、core が Running（pid あり）へ進めた状態は戻さない。
-        // TASK-157 で launcher を差し替えるときは、supervisor への引き渡しか、状態のロールバック
-        // （停止の記録）のどちらかをここへ必ず入れること（入れないと、プロセスのいない Running が残る）。
-        Ok(started) => {
-            let (_record, process) = started.into_parts();
-            let _ = process.terminate(rt.timeouts.terminate());
-            CliExit::Runtime(OciRuntimeError::new(
-                LifecycleOp::Start,
-                ErrorCode::Internal,
-                "no supervisor is available to take over the started process",
-            ))
-        }
+        Ok(()) => CliExit::Success,
         Err(e) => CliExit::Runtime(e),
+    }
+}
+
+/// 対象の状態レコードが存在することを読み取りだけで確かめる。`store` はここで閉じ、spawn の前に手放す。
+fn ensure_exists(store: Box<dyn StateStore>, req: &StartRequest) -> Result<(), OciRuntimeError> {
+    use fandhe_container_core::traits::GetStateRequest;
+    store
+        .get(&GetStateRequest::new(req.id().clone()))
+        .map(|_| ())
+        .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Start, e))
+}
+
+/// 状態ルートの絶対パスを解決し、supervisor を起動して結果を受け取る。
+#[cfg(target_os = "linux")]
+fn launch_supervisor(global: &GlobalArgs, req: &StartRequest) -> Result<(), OciRuntimeError> {
+    use fandhe_container_core::state_store::StateRoot;
+    let root = StateRoot::resolve(global.root.clone())
+        .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Start, e))?;
+    super::supervisor_start::start_via_supervisor(root.path(), req.id()).map(|_pid| ())
+}
+
+/// 非 Linux は `production_runtime` が状態ストアを開く段階（plugin 解決）で必ず失敗するため到達しない。
+#[cfg(not(target_os = "linux"))]
+fn launch_supervisor(_global: &GlobalArgs, _req: &StartRequest) -> Result<(), OciRuntimeError> {
+    Err(OciRuntimeError::new(
+        LifecycleOp::Start,
+        fandhe_container_core::traits::ErrorCode::Unimplemented,
+        "start is not implemented on this platform",
+    ))
+}
+
+/// 操作名 `start` の成功・失敗と経過時間を記録する（REPAIR-4）。
+fn record_start_outcome(recorder: &OpRecorder, started: Instant, ok: bool) {
+    if let Ok(name) = OpName::new("start") {
+        let outcome = if ok {
+            OpOutcome::Success
+        } else {
+            OpOutcome::Failure
+        };
+        let _ = recorder.record(&name, outcome, started.elapsed());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_core::traits::ErrorCode;
     use std::path::PathBuf;
+    #[cfg(target_os = "linux")]
+    use std::sync::Arc;
+    use std::time::Duration;
 
     fn create_args(bundle: &str, id: &str) -> CreateArgs {
         CreateArgs {
@@ -1227,7 +1223,6 @@ mod tests {
     mod linux {
         use super::*;
         use fandhe_container_core::traits::ContainerState;
-        use std::num::NonZeroU32;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// テスト用の一意な一時ディレクトリ（Drop で削除）。
@@ -1268,46 +1263,13 @@ mod tests {
             b
         }
 
-        fn runtime(base: &TmpDir, launcher: Arc<dyn ProcessLauncher>) -> Runtime {
+        fn runtime(base: &TmpDir) -> Runtime {
             let root =
                 fandhe_container_core::state_store::StateRoot::from_override(base.0.join("state"))
                     .expect("root");
             Runtime {
                 store: Box::new(FileStateStore::open(root).expect("open")),
-                launcher,
                 recorder: OpRecorder::new(),
-                timeouts: StartTimeouts::default(),
-            }
-        }
-
-        struct FakeProcess;
-
-        impl LaunchedProcess for FakeProcess {
-            fn pid(&self) -> NonZeroU32 {
-                NonZeroU32::new(4242).expect("nonzero")
-            }
-            fn wait(
-                &self,
-                _timeout: Duration,
-            ) -> Result<Option<fandhe_container_core::oci_runtime::ProcessExit>, TraitError>
-            {
-                Ok(None)
-            }
-            fn terminate(&self, _timeout: Duration) -> Result<(), TraitError> {
-                Ok(())
-            }
-        }
-
-        struct FakeLauncher(AtomicUsize);
-
-        impl ProcessLauncher for FakeLauncher {
-            fn launch(
-                &self,
-                _spec: &LaunchSpec,
-                _timeout: Duration,
-            ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(Box::new(FakeProcess))
             }
         }
 
@@ -1316,7 +1278,7 @@ mod tests {
         fn cli1_create_calls_core_and_rejects_duplicate() {
             let base = TmpDir::new("create");
             let bundle = make_bundle(&base);
-            let rt = runtime(&base, Arc::new(UnavailableLauncher));
+            let rt = runtime(&base);
             let args = CreateArgs {
                 bundle: bundle.clone(),
                 id: "c1".into(),
@@ -1332,83 +1294,61 @@ mod tests {
             assert_eq!(e.op(), LifecycleOp::Create);
         }
 
-        /// ERR-2: 未 create の ID の start は NOT_FOUND（3）で launcher を呼ばない。
+        /// ERR-2: 未 create の ID の start は NOT_FOUND（3）で、supervisor を起動する前に返る。
         #[test]
         fn err2_start_unknown_id_is_not_found() {
             let base = TmpDir::new("notfound");
-            let launcher = Arc::new(FakeLauncher(AtomicUsize::new(0)));
-            let rt = runtime(&base, launcher.clone());
-            let e = start_container(
-                &rt,
+            let rt = runtime(&base);
+            let e = ensure_exists(
+                rt.store,
                 &build_start_request(&StartArgs { id: "nope".into() }).expect("req"),
             )
             .expect_err("nf");
             assert_eq!(e.code(), ErrorCode::NotFound);
             assert_eq!(e.exit_code().get(), 3);
-            assert_eq!(launcher.0.load(Ordering::SeqCst), 0);
+            assert_eq!(e.op(), LifecycleOp::Start);
         }
 
-        /// CLI-1・CORE-1: create → start で Running・launcher の返した pid が記録され、ハンドルが呼び出し元へ渡る。
+        /// ERR-2: 作成済みの ID は存在確認を通り、状態は書き換わらない。
         #[test]
-        fn cli1_start_calls_core_and_hands_over_process() {
-            let base = TmpDir::new("start");
+        fn cli1_start_existing_id_passes_existence_check() {
+            let base = TmpDir::new("exists");
             let bundle = make_bundle(&base);
-            let launcher = Arc::new(FakeLauncher(AtomicUsize::new(0)));
-            let rt = runtime(&base, launcher.clone());
-            create_container(
+            let rt = runtime(&base);
+            let rec = create_container(
                 &rt,
                 &build_create_request(&CreateArgs {
                     bundle,
-                    id: "start-ok".into(),
+                    id: "c1".into(),
                 })
                 .expect("req"),
             )
             .expect("create");
-            let started = start_container(
-                &rt,
-                &build_start_request(&StartArgs {
-                    id: "start-ok".into(),
-                })
-                .expect("req"),
-            )
-            .expect("start");
-            assert_eq!(started.record().status().state(), ContainerState::Running);
-            assert_eq!(started.record().status().pid(), NonZeroU32::new(4242));
-            assert_eq!(started.process().pid().get(), 4242);
-            assert_eq!(launcher.0.load(Ordering::SeqCst), 1);
-        }
-
-        /// REPAIR-3: 本番 launcher では start が UNIMPLEMENTED（8）で、状態は Created に戻る。
-        #[test]
-        fn repair3_unavailable_launcher_keeps_created() {
-            let base = TmpDir::new("unavail");
-            let bundle = make_bundle(&base);
-            let rt = runtime(&base, Arc::new(UnavailableLauncher));
-            create_container(
-                &rt,
-                &build_create_request(&CreateArgs {
-                    bundle,
-                    id: "unavail".into(),
-                })
-                .expect("req"),
-            )
-            .expect("create");
-            let e = start_container(
-                &rt,
-                &build_start_request(&StartArgs {
-                    id: "unavail".into(),
-                })
-                .expect("req"),
-            )
-            .expect_err("unimpl");
-            assert_eq!(e.code(), ErrorCode::Unimplemented);
-            assert_eq!(e.exit_code().get(), 8);
-            let id = ContainerId::new("unavail").expect("id");
-            let got = rt
-                .store
-                .get(&fandhe_container_core::traits::GetStateRequest::new(id))
+            let req = build_start_request(&StartArgs { id: "c1".into() }).expect("req");
+            ensure_exists(rt.store, &req).expect("exists");
+            let root =
+                fandhe_container_core::state_store::StateRoot::from_override(base.0.join("state"))
+                    .expect("root");
+            let store = FileStateStore::open(root).expect("open");
+            let got = store
+                .get(&fandhe_container_core::traits::GetStateRequest::new(
+                    req.id().clone(),
+                ))
                 .expect("get");
             assert_eq!(got.status().state(), ContainerState::Created);
+            assert_eq!(got.revision(), rec.revision());
+        }
+
+        /// REPAIR-4: start の成功・失敗は操作名 `start` で 1 件ずつ計測される。
+        #[test]
+        fn repair4_start_outcome_is_recorded() {
+            let rec = OpRecorder::new();
+            record_start_outcome(&rec, Instant::now(), false);
+            record_start_outcome(&rec, Instant::now(), true);
+            let snap = rec
+                .snapshot_op(&OpName::new("start").expect("name"))
+                .expect("snap");
+            assert_eq!((snap.success(), snap.failure()), (1, 1));
         }
     }
 }

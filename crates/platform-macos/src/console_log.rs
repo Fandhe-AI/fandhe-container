@@ -27,7 +27,15 @@
 //! - モード: 新規作成は 0600。既存ファイルは group / other が読み書きできるモードなら `config` の open が
 //!   拒否する（出力の漏えいと、他者の追記・切り詰めで上限を維持できないことを防ぐ）。
 //!
-//! 上限値 [`MAX_CONSOLE_LOG_BYTES`] は spec に規定がなく暫定値である（下記 doc 参照）。
+//! ## 回転と削除の方針（MAC-1・REPAIR-4・#2138）
+//!
+//! - 上限: 1 ファイル・1 回の起動あたり [`MAX_CONSOLE_LOG_BYTES`]（1 MiB）、世代は [`CONSOLE_LOG_GENERATIONS`]（3）。
+//!   supervisor のログ（#2067）と同じ値・同じ番号規則。起動中は回転せず上限で切る。
+//! - 回転: `open_serial_console` が書き出しの直前に、使用中 lock を先に取ってから世代を 1 つずつ送る。
+//!   現在のログが無い・空なら世代を消費しない。世代ファイルや保護入力に異常があれば何も動かさず拒否する。
+//! - 削除: VM の stop・`Vm` の drop・起動失敗では残す（診断材料）。コンテナの delete では
+//!   `VmConfigSpec::remove_console_logs` が現在のログと全世代を消す。delete からの呼び出しの配線は
+//!   plugin-macos の delete 実装（TASK-114）待ちで、本 crate では部品の提供までである。
 
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
@@ -36,17 +44,30 @@ use std::time::Duration;
 
 use crate::guest_mount::{ReportScanner, ReportSender};
 
-/// コンソールログのゲスト出力の上限（バイト。ファイル長で数える）。
+/// コンソールログ 1 ファイル・1 回の起動あたりのゲスト出力の上限（バイト。ファイル長で数える）。
 ///
 /// ファイル長がこの値に達するまでゲスト出力をそのまま書き、超える出力が来たら区切り文を 1 回だけ足して
-/// 以降を捨てる。上限内に収まる出力は 1 バイトも失わない。ファイル長は
-/// `max(open 時の長さ, MAX_CONSOLE_LOG_BYTES + TRUNCATION_MARKER.len())` を超えない（open 時に既に上限以上なら
-/// 何も書かず区切り文も重ねないため、再起動を繰り返しても増えない）。総量上限のため、起動ごとに新しい出力を
-/// 残したい呼び出し側はログのローテーション・削除を自分で行う。
+/// 以降を捨てる（起動中は回転しない。診断にいちばん効くブートログの先頭を失わないため。supervisor の
+/// sink が起動中も回転する点と異なる）。上限内に収まる出力は 1 バイトも失わない。
 ///
-/// 暫定値: spec にコンソールログの上限の規定はない。コンテナログの保持量として計画されている
-/// 1 MiB × 3 世代（SUP-7・TASK-164）の合計に揃えた。ゲストのブートログ（数十〜数百 KiB）を十分に収める。
-pub const MAX_CONSOLE_LOG_BYTES: u64 = 3 * 1024 * 1024;
+/// 起動をまたぐ総量は回転が保つ（#2138・MAC-1・REPAIR-4）。`VmConfigSpec::open_serial_console` は書き出しの
+/// 直前に既存の現在のログを `<name>.1`・`<name>.2` へ送り（[`CONSOLE_LOG_GENERATIONS`] 世代まで）、新しい
+/// 起動は常に空の現在のログから始まる。パス 1 つあたりの総量は
+/// `CONSOLE_LOG_GENERATIONS * (MAX_CONSOLE_LOG_BYTES + TRUNCATION_MARKER.len())` で有界。
+/// 世代ファイルの長さは検査しない（旧版の 3 MiB 総量方式で書かれた大きいログも、世代が進むと古い順に消える。
+/// 上限を守るのは本 crate が書くファイルだけ）。
+///
+/// 値は supervisor のログ（`SUPERVISOR_LOG_FILE_BYTES` = 1 MiB・`SUPERVISOR_LOG_GENERATIONS` = 3。#2067・SUP-7）に
+/// 揃えた暫定値で、spec に規定はない。1 MiB を超える冗長なカーネル出力では ready マーカーより前で切られ得るが、
+/// ゲストのブートログ（数十〜数百 KiB）は十分に収まる。
+pub const MAX_CONSOLE_LOG_BYTES: u64 = 1024 * 1024;
+
+/// 保持するコンソールログの世代数（現在のログを含む。`<name>`・`<name>.1`・`<name>.2`）。
+///
+/// supervisor の `SUPERVISOR_LOG_GENERATIONS`（`crates/supervisor`）と同じ値と意味（新しいほど番号が小さい）。
+/// コードは共有しない（platform-macos は supervisor へ依存しないため。共通化は crate 境界の変更として別途）。
+/// 回転・削除は `config::VmConfigSpec` の `open_serial_console`（回転）と `remove_console_logs`（削除）が行う。
+pub const CONSOLE_LOG_GENERATIONS: u32 = 3;
 
 /// 上限を超えたときにログへ 1 回だけ書く区切り文（プログラム出力のため英語）。
 pub const TRUNCATION_MARKER: &[u8] =
@@ -112,6 +133,53 @@ pub(crate) fn event_log_line(event: ConsoleLogEvent) -> String {
 /// 出来事を stderr へ 1 行で出す。stderr への書き込み失敗（EPIPE 等）では panic しない（`eprintln!` を使わない）。
 fn report_to_stderr(event: ConsoleLogEvent) {
     let _ = writeln!(std::io::stderr().lock(), "{}", event_log_line(event));
+}
+
+/// コンソールログの世代管理の操作種別（[`lifecycle_log_line`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifecycleOp {
+    /// 起動直前の回転（現在のログを世代へ送る）。
+    Rotate,
+    /// コンテナ delete 用の全世代削除。
+    Remove,
+}
+
+/// 世代管理の結果を 1 行の JSON にする（MAC-1・REPAIR-4・#2138）。
+///
+/// `result` は成功なら処理したファイル数（回転は改名した数、削除は消した数）、失敗なら `ConfigError::code()`
+/// の固定文字列。要求由来のパス・ファイル名は含めない（SEC-4）。`elapsed_ms` は排他の取得から終了までの
+/// 所要時間。書き出し中の出来事の [`event_log_line`] と同じ component で、`operation` が違う。
+pub(crate) fn lifecycle_log_line(
+    op: LifecycleOp,
+    result: Result<usize, &'static str>,
+    elapsed: Duration,
+) -> String {
+    let operation = match op {
+        LifecycleOp::Rotate => "rotate",
+        LifecycleOp::Remove => "remove",
+    };
+    let ms = elapsed.as_millis();
+    match result {
+        Ok(files) => format!(
+            "{{\"component\":\"platform-macos.console_log\",\"operation\":\"{operation}\",\"result\":\"ok\",\"files\":{files},\"elapsed_ms\":{ms}}}"
+        ),
+        Err(code) => format!(
+            "{{\"component\":\"platform-macos.console_log\",\"operation\":\"{operation}\",\"result\":\"error\",\"code\":\"{code}\",\"elapsed_ms\":{ms}}}"
+        ),
+    }
+}
+
+/// 世代管理の結果を stderr へ 1 行で出す。書き込み失敗では panic しない。
+pub(crate) fn report_lifecycle(
+    op: LifecycleOp,
+    result: Result<usize, &'static str>,
+    elapsed: Duration,
+) {
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "{}",
+        lifecycle_log_line(op, result, elapsed)
+    );
 }
 
 /// open 時のファイル長から決める書き出し計画。
@@ -259,6 +327,31 @@ fn len_u64(b: &[u8]) -> u64 {
     u64::try_from(b.len()).unwrap_or(u64::MAX)
 }
 
+/// 排他 lock の取得を試みる。`WouldBlock` なら短い猶予の中で数回やり直し、それでも取れなければ `WouldBlock` を返す。
+///
+/// 猶予の理由（MAC-1・REPAIR-4・#2138）: lock は open file description 単位（unix は `flock(2)`）で、fd を
+/// `close` しても、他スレッドの `fork` / `posix_spawn` が複製した fd が `exec` で閉じられるまで description が
+/// 生き続け、lock が一瞬残る。同一プロセスで子プロセスを起動する処理と並行すると、直前に自分が解放した lock
+/// が「使用中」に見える（macOS の CI で観測）。実際に使用中の相手は猶予を超えて保持し続けるため、
+/// 使用中なら何も動かさず拒否する fail-closed の挙動は変わらない（拒否が最大 `LOCK_GRACE` 遅れるだけ）。
+pub(crate) fn try_lock_with_grace(file: &File) -> Result<(), std::fs::TryLockError> {
+    let deadline = std::time::Instant::now() + LOCK_GRACE;
+    loop {
+        match file.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(LOCK_RETRY_INTERVAL);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// [`try_lock_with_grace`] が `WouldBlock` を再試行する合計時間（fork と exec の間の窓を覆う長さ）。
+const LOCK_GRACE: Duration = Duration::from_millis(250);
+
+/// [`try_lock_with_grace`] の再試行間隔。
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
 /// 上限つきで書き出されるコンソールログの入口（pipe の書き込み端と書き出しスレッドの結果）。
 ///
 /// 生のログファイルは保持せず公開もしないため、上限を迂回して追記する経路はない。
@@ -297,7 +390,7 @@ impl ConsoleLogSink {
         cap: u64,
         reports: Option<ReportSender>,
     ) -> Result<ConsoleLogSink, SpawnError> {
-        match file.try_lock() {
+        match try_lock_with_grace(&file) {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => return Err(SpawnError::InUse),
             Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
@@ -364,6 +457,23 @@ mod tests {
     use super::*;
 
     const MARKER_LEN: u64 = TRUNCATION_MARKER.len() as u64;
+
+    /// MAC-1・REPAIR-4・#2138: 世代管理の構造化ログは固定の形で、パスを含まない。
+    #[test]
+    fn lifecycle_log_line_is_stable() {
+        assert_eq!(
+            lifecycle_log_line(LifecycleOp::Rotate, Ok(2), Duration::from_millis(7)),
+            "{\"component\":\"platform-macos.console_log\",\"operation\":\"rotate\",\"result\":\"ok\",\"files\":2,\"elapsed_ms\":7}"
+        );
+        assert_eq!(
+            lifecycle_log_line(
+                LifecycleOp::Remove,
+                Err("config.console_log_in_use"),
+                Duration::from_millis(0)
+            ),
+            "{\"component\":\"platform-macos.console_log\",\"operation\":\"remove\",\"result\":\"error\",\"code\":\"config.console_log_in_use\",\"elapsed_ms\":0}"
+        );
+    }
 
     /// テスト用: 出来事を集める。
     fn copy_collect<R: Read, W: Write>(
@@ -669,7 +779,7 @@ mod tests {
     fn event_log_lines_are_stable() {
         assert_eq!(
             event_log_line(ConsoleLogEvent::LimitReached { written_bytes: 42 }),
-            "{\"component\":\"platform-macos.console_log\",\"operation\":\"write\",\"result\":\"truncated\",\"code\":\"console_log.limit_reached\",\"limit_bytes\":3145728,\"written_bytes\":42}"
+            "{\"component\":\"platform-macos.console_log\",\"operation\":\"write\",\"result\":\"truncated\",\"code\":\"console_log.limit_reached\",\"limit_bytes\":1048576,\"written_bytes\":42}"
         );
         assert_eq!(
             event_log_line(ConsoleLogEvent::WriteFailed {
@@ -763,6 +873,42 @@ mod tests {
         let second = ConsoleLogSink::spawn(t.append_handle(), 1000, None).unwrap();
         second.finish(WAIT).expect("writer thread finished");
         assert_eq!(std::fs::read(&t.0).unwrap(), b"one\n");
+    }
+
+    /// MAC-1・REPAIR-4・REPAIR-12・#2138: 別の open file description が持つ lock が猶予内に解放されれば
+    /// `try_lock_with_grace` は成功する（fork 直後の fd 複製などによる一時的な競合の再現）。
+    #[test]
+    fn try_lock_with_grace_succeeds_when_released_within_grace() {
+        let t = TempFile::new("grace-ok", b"");
+        let holder = t.append_handle();
+        holder.try_lock().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(holder);
+        });
+        let waiter = t.append_handle();
+        assert!(matches!(try_lock_with_grace(&waiter), Ok(())));
+        releaser.join().unwrap();
+    }
+
+    /// MAC-1・REPAIR-4・REPAIR-5・REPAIR-12・#2138: 保持され続ける lock は猶予ぶん待ってから `WouldBlock`
+    /// を返す。下限（猶予を待ったこと）と上限（有限時間で返ること）の両方を確かめる。
+    #[test]
+    fn try_lock_with_grace_would_block_after_bounded_wait() {
+        let t = TempFile::new("grace-held", b"");
+        let holder = t.append_handle();
+        holder.try_lock().unwrap();
+        let waiter = t.append_handle();
+        let started = std::time::Instant::now();
+        let result = try_lock_with_grace(&waiter);
+        let elapsed = started.elapsed();
+        assert!(matches!(result, Err(std::fs::TryLockError::WouldBlock)));
+        assert!(elapsed >= LOCK_GRACE, "returned too early: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must stay bounded: {elapsed:?}"
+        );
+        drop(holder);
     }
 
     /// MAC-1・TASK-64.3: 既に上限に達したファイルへは追記しない（再起動の繰り返しでも総量が増えない）。

@@ -240,6 +240,30 @@ else
   echo "PASS: from-json-at-limit-input-not-rejected-by-size"
 fi
 
+# 見張り（watchdog）の SIGTERM 停止で EXIT trap が走り一時ディレクトリが消える競合の回帰
+# （snapshot_json_input の watchdog を fork 直後に停止していた。CI で ~4% の頻度で
+# "could not determine the size" になった）。--from-json を繰り返し、1 回も失敗しない。
+race_runs=300
+race_failed=0
+race_first_err=""
+race_i=0
+while [ "$race_i" -lt "$race_runs" ]; do
+  race_i=$((race_i + 1))
+  race_rc=0
+  race_out=$("$bash_bin" "$target_script" --from-json "${fixtures_dir}/fio-3-ok.json" --label x 2>&1 >/dev/null) || race_rc=$?
+  if [ "$race_rc" -ne 0 ]; then
+    race_failed=$((race_failed + 1))
+    [ -n "$race_first_err" ] || race_first_err="run ${race_i}: exit=${race_rc}: ${race_out}"
+  fi
+done
+if [ "$race_failed" -eq 0 ]; then
+  echo "PASS: from-json-snapshot-watchdog-race (${race_runs} runs, 0 failures)"
+else
+  echo "FAIL: from-json-snapshot-watchdog-race (${race_failed}/${race_runs} runs failed)" >&2
+  print_indented "$race_first_err"
+  failures=$((failures + 1))
+fi
+
 # --------------------------------------------------
 # 値の照合（from-json-ok が exit 0 で返す JSON の各値が期待どおりか。
 # 真偽値のみの assert に頼らず具体値で照合する。coding-rust.md）
@@ -291,7 +315,12 @@ check_value "params-end-fsync" ".params.end_fsync" '1'
 # --------------------------------------------------
 results_json="${tmp_root}/results.json"
 # 準備段階の失敗でも set -e で打ち切らず、下の round-trip 判定の FAIL として数える
-"$bash_bin" "$target_script" --from-json "${fixtures_dir}/fio-3-ok.json" --label docker_bind_mount >"$results_json" 2>/dev/null || true
+results_err="${tmp_root}/results.err"
+if ! "$bash_bin" "$target_script" --from-json "${fixtures_dir}/fio-3-ok.json" --label docker_bind_mount >"$results_json" 2>"$results_err"; then
+  # 再発時に CI のログから原因を追えるよう stderr を捨てずに出す。判定は下の round-trip で行う
+  echo "note: results.json preparation failed (see below)" >&2
+  print_indented "$(cat "$results_err")"
+fi
 
 baseline_json="${tmp_root}/baseline.json"
 jq '{

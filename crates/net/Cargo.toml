@@ -124,6 +124,15 @@ name = "static_dns_privileged"
 path = "tests/static_dns_privileged.rs"
 harness = false
 
+# 非特権の user + network namespace（`unshare -rn`）で、`lo` が down のときの自己宛て UDP の受信期限切れと、
+# up 後の配送を照合する実機前提テスト（NET-2・NET-11・TASK-140 追補・#2077）。root は不要で、非特権 user namespace が要る。
+# 子の再入（--child）のため harness = false。`-- --ignored` 指定時のみ実行する。CI では platform-ci（ubuntu）が
+# AppArmor 緩和ステップの後に実行し、成功行を照合する（AGENTS.md）。
+[[test]]
+name = "lo_self_delivery"
+path = "tests/lo_self_delivery.rs"
+harness = false
+
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true

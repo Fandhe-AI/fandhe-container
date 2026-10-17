@@ -2,7 +2,7 @@
 
 - 対応: TASK-190（MS-2。前提の TASK-29・TASK-157 と後続の TASK-88 が MS-2 にあるため割り当て）・ビヘイビア CORE-10・REPAIR-8
 - 対象: `benches/benches/startup_latency.rs`（薄い入口）と `benches/src/startup_latency/`（計測ロジック）。Issue #1900
-- ステータス: **ベンチ実装済み・実測は未実施（人間担当）・CI の回帰ゲートには未接続**。`metrics.json` へは実機前提として登録済み（#1901）。`BENCH_NAMES`・共有 `baseline.json` には入れておらず、基準値 `benches/baseline-manual.json` は未作成（実測は #230）。基準値は `make bench-baseline-manual`（#2095）で作り、比較は人が実機で `make bench-check-manual`（`BENCH_HOST_KIND` で arch・ホストの種類を照合）。CI では回帰を検出できない（実装済みを装わない。REPAIR-3）
+- ステータス: **ベンチ実装済み・実測は未実施（人間担当）・CI の回帰ゲートには未接続**。`metrics.json` へは実機前提として登録済み（#1901）。`BENCH_NAMES`・共有 `baseline.json` には入れておらず、基準値 `benches/baseline-manual.json` は未作成（実測は #230）。基準値は `make bench-baseline-manual`（#2095）で作り、比較は人が実機で `make bench-check-manual`（結果の `arch`・`host_kind` と基準値の `host` を照合。`host_kind` が `unknown` か無い結果は `BENCH_HOST_KIND` で指定）。CI では回帰を検出できない（実装済みを装わない。REPAIR-3）
 - CI での扱い（実機前提として分離・REPAIR-8 の「CI で 15% 超の悪化を fail」は未充足）は [bench-calibration.md](bench-calibration.md)「CI の扱いの決定（TASK-190）」
 
 ## 計測区間
@@ -30,7 +30,7 @@
 ### CORE-10 の「プロセス実行開始」との差
 
 - OK が出るのは、launcher が `K <pid>` を受領し、開始ゲートを許可し、pre-pivot 段の状態を読み、Running を記録した後である。ワークロードの `execve` が OK の前に終わる保証はない（launch 経路は exec の成功を通知する pipe を持たない）。本区間は「PID 1 の生成・分離設定・Running の記録まで」を測り、CORE-10 の定義との差は Running の記録の書き込みと、exec が OK の後にずれ込みうる部分である
-- `systemd-run` のスコープ取得は rootless で委譲 cgroup を得るための費用として区間に含める（`method` にも明示）。#2081 で本番の start が起動のたびに scope を取得すると決まったため、含めるのが本番と一致する。子 cgroup へ直接置く方式（`pre_exec`〔unsafe〕・core の API 追加）は本番の経路から離れるため採らない（#2089）。scope 取得の費用は systemd・D-Bus の状態で揺れ、製品側の回帰と区別しにくい点は残る
+- `systemd-run` のスコープ取得は rootless で委譲 cgroup を得るための費用として区間に含める（`method` にも明示）。#2081 で本番の start が起動のたびに scope を取得すると決まったため、含めるのが本番と一致する。子 cgroup へ直接置く方式（`pre_exec`〔unsafe〕・core の API 追加）は本番の経路から離れるため採らない（#2089）。scope 取得の費用は systemd・D-Bus の状態で揺れ、製品側の回帰と区別しにくい。切り分けには診断モード `--scope-only` を使う（下記）
 
 ### `scripts/bench/startup_latency.sh`（TASK-46.1）との差
 
@@ -82,9 +82,20 @@ core の `delete` は使わない。ベンチのプロセスは試行ごとの s
 - 作業ディレクトリ・状態ルートは 0700 で排他作成する。rootful（euid 0）は拒否する（SEC-5）
 - 出力に絶対パス・ホスト名・ユーザー名・OS のエラー文字列を載せない。新規の外部依存は無い。`unsafe` は `benches/src/sys.rs` の中断シグナル用 FFI ラッパー（`pthread_sigmask`・`sigpending`・子の `pre_exec` でのブロック解除、試験のみ `raise`）だけで、`sys` の外へ公開しない（各ブロックに `// SAFETY:` を付け、Linux の x86_64 / aarch64 に限る。ハンドラは登録せず、ブロックして保留を確かめるだけ）
 
+## 診断モード `--scope-only`（CORE-10・REPAIR-8）
+
+scope 取得だけを測る。本計測と同じ包み込み（`scope_wrap::scoped_noop_command`）で、自分自身の `--startup-latency-noop`（すぐ終了コード 0 で終わる）を起動し、`systemd-run` の起動から終了を回収するまでを試行ごとに測る。create・supervisor・ランチャー・Landlock は含まない。
+
+- 実行: `cargo bench -p fandhe-container-benches --bench startup_latency -- --scope-only [--trials N] [--warmup N] [--timeout-secs S] [--systemd-run <絶対パス>] [--output <絶対パス>]`。`--supervisor-bin`・`--work-dir` は受け付けない。実機前提（Linux・非 root・`systemd-run --user`）で CI では実行しない
+- 出力: `kind: "diagnostic"`・`metrics` は常に空（`bench-check-manual`・`bench-baseline-manual` の入力にならず、渡しても metric の集合が合わず 2 で拒否される）。統計は `summary`（p50・p95・max）に入る。失敗・scope の残りがあれば終了コード 1
+- 読み方: 本計測の p95 と診断の p95 を同じホストで並べる。両方悪化していれば systemd・D-Bus の揺れ、本計測だけ悪化していれば製品側の回帰
+
+## ホストの種類（`host_kind`）
+
+結果 JSON の `host_kind` は `/proc/sys/kernel/osrelease`・`/sys/hypervisor/type`・DMI（`/sys/class/dmi/id`）・`/proc/cpuinfo` の `hypervisor` フラグから判定する（プロセスは起動しない）。値は `bare-metal` / `vm` / `wsl2`、根拠が足りなければ `unknown`（`bare-metal` を既定値にしない）。DMI の文字列は結果に出さない。語彙の見直しと実測は #230 の担当。
+
 ## 残余・フォローアップ
 
-- scope 取得だけを測る診断（自明なコマンドを同じ包み込みで起動して切り分ける）
 - `user_manager_env` の判定の CLI との共通化（`start_contract` 等）
 - 記録済みスコープを外から開いて `delete` できる core の API（#1314 の決定の変更を伴う）
 - restart の再 launch（#2043）は対象外

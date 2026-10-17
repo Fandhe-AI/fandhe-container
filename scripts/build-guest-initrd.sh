@@ -42,12 +42,6 @@
 # エラーは stderr に `error: code=<code> message=<英語>` の 1 行で出す。
 set -euo pipefail
 
-err() {
-    printf 'error: code=%s message=%s\n' "$1" "$2" >&2
-}
-info() {
-    printf 'info: %s\n' "$1" >&2
-}
 usage() {
     cat >&2 <<'USAGE'
 usage: build-guest-initrd.sh [--output-dir <dir>] [--init <path>] [--compress gzip|none] [--linker <cmd>]
@@ -62,7 +56,7 @@ root="$(cd "$script_dir/.." && pwd)"
 caller_pwd="$PWD"
 # shellcheck source=lib.sh
 source "$root/scripts/lib.sh"
-cd -- "$caller_pwd" || { err bad-environment "cannot return to the working directory"; exit 2; }
+cd -- "$caller_pwd" || { err_code bad-environment "cannot return to the working directory"; exit 2; }
 
 output_dir="${GUEST_INITRD_OUTPUT_DIR:-}"
 init_arg="${GUEST_INITRD_INIT:-}"
@@ -74,14 +68,14 @@ max_init_bytes=67108864
 
 check_int() {
     if ! int_in_range "$2" "$3" "$4"; then
-        err bad-argument "$1 must be an integer between $3 and $4"
+        err_code bad-argument "$1 must be an integer between $3 and $4"
         usage
         exit 2
     fi
 }
 
 need_value() {
-    [ "$1" -ge 2 ] || { err bad-argument "$2 requires a value"; usage; exit 2; }
+    [ "$1" -ge 2 ] || { err_code bad-argument "$2 requires a value"; usage; exit 2; }
 }
 
 while [ $# -gt 0 ]; do
@@ -92,20 +86,20 @@ while [ $# -gt 0 ]; do
         --linker) need_value $# "$1"; linker="$2"; shift 2 ;;
         --build-timeout) need_value $# "$1"; check_int "$1" "$2" 1 7200; build_timeout="$2"; shift 2 ;;
         --pack-timeout) need_value $# "$1"; check_int "$1" "$2" 1 600; pack_timeout="$2"; shift 2 ;;
-        *) err bad-argument "unknown argument: $1"; usage; exit 2 ;;
+        *) err_code bad-argument "unknown argument: $1"; usage; exit 2 ;;
     esac
 done
 
 case "$compress" in
     gzip | none) ;;
-    *) err bad-argument "--compress must be gzip or none"; usage; exit 2 ;;
+    *) err_code bad-argument "--compress must be gzip or none"; usage; exit 2 ;;
 esac
 if ! [[ "$linker" =~ ^[A-Za-z0-9._/+-]+$ ]]; then
-    err bad-argument "--linker contains characters outside [A-Za-z0-9._/+-]"
+    err_code bad-argument "--linker contains characters outside [A-Za-z0-9._/+-]"
     exit 2
 fi
 case "$output_dir$init_arg" in
-    *[[:cntrl:]]*) err bad-argument "paths must not contain control characters"; exit 2 ;;
+    *[[:cntrl:]]*) err_code bad-argument "paths must not contain control characters"; exit 2 ;;
 esac
 
 # --- テスト用の差し替え口（自己テスト専用。サンドボックスの外では拒否する） ---
@@ -120,22 +114,22 @@ for v in GUEST_INITRD_CARGO GUEST_INITRD_UNAME_S GUEST_INITRD_EXPECT_UID GUEST_I
 done
 if [ "$seam_requested" -eq 1 ]; then
     if [ -z "$sandbox" ] || [ ! -d "$sandbox" ] || [ ! -f "$sandbox/.guest-initrd-selftest" ]; then
-        err test-seam-refused "test seams are only allowed inside the selftest sandbox"
+        err_code test-seam-refused "test seams are only allowed inside the selftest sandbox"
         exit 2
     fi
     case "${GUEST_INITRD_CARGO:-}" in
         "" | "$sandbox"/*) ;;
-        *) err test-seam-refused "GUEST_INITRD_CARGO must be inside the selftest sandbox"; exit 2 ;;
+        *) err_code test-seam-refused "GUEST_INITRD_CARGO must be inside the selftest sandbox"; exit 2 ;;
     esac
     [ -z "${GUEST_INITRD_CARGO:-}" ] || cargo_cmd="$GUEST_INITRD_CARGO"
     host_os="${GUEST_INITRD_UNAME_S:-}"
     expect_uid="${GUEST_INITRD_EXPECT_UID:-}"
     case "${GUEST_INITRD_PRIVATE_GROUP:-}" in
         "" | yes | no) private_group_seam="${GUEST_INITRD_PRIVATE_GROUP:-}" ;;
-        *) err test-seam-refused "GUEST_INITRD_PRIVATE_GROUP must be yes or no"; exit 2 ;;
+        *) err_code test-seam-refused "GUEST_INITRD_PRIVATE_GROUP must be yes or no"; exit 2 ;;
     esac
     if [ -n "$expect_uid" ] && ! [[ "$expect_uid" =~ ^[0-9]{1,10}$ ]]; then
-        err test-seam-refused "GUEST_INITRD_EXPECT_UID must be numeric"
+        err_code test-seam-refused "GUEST_INITRD_EXPECT_UID must be numeric"
         exit 2
     fi
 fi
@@ -144,12 +138,12 @@ fi
 
 case "$host_os" in
     MINGW* | MSYS* | CYGWIN*)
-        err unsupported-os "Windows hosts are not supported for building the guest initrd"
+        err_code unsupported-os "Windows hosts are not supported for building the guest initrd"
         exit 2
         ;;
 esac
 if [ "$host_os" = "Darwin" ]; then
-    info "warning: linking on macOS is unverified (see AGENTS.md)"
+    info_msg "warning: linking on macOS is unverified (see AGENTS.md)"
 fi
 
 # --- 出力先（空または未存在のみ。上書きしない） ---
@@ -220,23 +214,23 @@ check_output_safe() {
         kind="ancestor"
     done
     case "$rest" in
-        */./* | */../* | */. | */..) err bad-output "output path must not contain . or .. components"; exit 2 ;;
+        */./* | */../* | */. | */..) err_code bad-output "output path must not contain . or .. components"; exit 2 ;;
     esac
     d="$(cd -P "$d" 2>/dev/null && pwd -P)" || {
-        err bad-output "cannot resolve the output directory path"
+        err_code bad-output "cannot resolve the output directory path"
         exit 2
     }
     # 物理パスで確定する（以後の操作はこのパスだけを使う）。
     if [ "$d" = "/" ]; then output_dir="$rest"; else output_dir="$d$rest"; fi
     # 解決後が空（"/"・"/."・"/.." 等のルート）だと not-empty 検査と mkdir が空パスで崩れる。
     if [ -z "$output_dir" ] || [ "$output_dir" = "/" ]; then
-        err bad-output "output directory must not be the filesystem root or empty"
+        err_code bad-output "output directory must not be the filesystem root or empty"
         exit 2
     fi
     while :; do
         reason="$(dir_unsafe_reason "$d" "$kind")"
         if [ -n "$reason" ]; then
-            err unsafe-output "directory $d $reason; refusing to write there"
+            err_code unsafe-output "directory $d $reason; refusing to write there"
             exit 2
         fi
         [ "$d" != "/" ] || break
@@ -248,22 +242,22 @@ check_output_safe() {
 # 空ディレクトリであることの検査（一覧取得の失敗は空と誤認しない。fail-closed）。
 check_output_free() {
     if [ -L "$output_dir" ]; then
-        err bad-output "output directory must not be a symlink"
+        err_code bad-output "output directory must not be a symlink"
         exit 2
     fi
     check_output_safe
     if [ -e "$output_dir" ] && [ ! -d "$output_dir" ]; then
-        err output-exists "output path exists and is not a directory"
+        err_code output-exists "output path exists and is not a directory"
         exit 2
     fi
     if [ -d "$output_dir" ]; then
         local listing
         listing="$(ls -A "$output_dir" 2>/dev/null)" || {
-            err bad-output "cannot list the output directory; refusing to continue"
+            err_code bad-output "cannot list the output directory; refusing to continue"
             exit 2
         }
         if [ -n "$listing" ]; then
-            err output-exists "output directory is not empty; refusing to overwrite"
+            err_code output-exists "output directory is not empty; refusing to overwrite"
             exit 2
         fi
     fi
@@ -277,22 +271,21 @@ if command -v sha256sum >/dev/null 2>&1; then
 elif command -v shasum >/dev/null 2>&1; then
     sha_cmd="shasum -a 256"
 else
-    err tool-missing "sha256sum or shasum is required"
+    err_code tool-missing "sha256sum or shasum is required"
     exit 2
 fi
-command -v od >/dev/null 2>&1 || { err tool-missing "od is required"; exit 2; }
-command -v find >/dev/null 2>&1 || { err tool-missing "find is required"; exit 2; }
+command -v od >/dev/null 2>&1 || { err_code tool-missing "od is required"; exit 2; }
+command -v find >/dev/null 2>&1 || { err_code tool-missing "find is required"; exit 2; }
 if [ "$compress" = "gzip" ]; then
-    command -v gzip >/dev/null 2>&1 || { err tool-missing "gzip is required"; exit 2; }
+    command -v gzip >/dev/null 2>&1 || { err_code tool-missing "gzip is required"; exit 2; }
 fi
 if [ -z "$init_arg" ]; then
-    command -v "$cargo_cmd" >/dev/null 2>&1 || { err tool-missing "cargo is required"; exit 2; }
+    command -v "$cargo_cmd" >/dev/null 2>&1 || { err_code tool-missing "cargo is required"; exit 2; }
 fi
 
 # --- 一時領域と期限つき実行（scripts/lib.sh の run_limited） ---
 work_dir=""
 out_created=0
-lock_dir=""
 publishing=0
 published=""
 tmp_info=""
@@ -313,29 +306,23 @@ cleanup() {
             rmdir "$output_dir" 2>/dev/null || true
         fi
     fi
-    [ -z "$lock_dir" ] || rmdir "$lock_dir" 2>/dev/null || true
+    release_output_lock
 }
 trap cleanup EXIT
 trap 'exit 143' INT TERM
 
-work_dir="$(mktemp -d)" || { work_dir=""; err bad-environment "cannot create a temporary directory"; exit 2; }
+work_dir="$(mktemp -d)" || { work_dir=""; err_code bad-environment "cannot create a temporary directory"; exit 2; }
 RUN_LIMITED_DIR="$work_dir"
 
 # 出力先の排他ロック（mkdir は不可分）。取得後に空であることを再検査する。
 # 異常終了（KILL 等）で残ったロックは手で削除する。
-mkdir -p "$(dirname "$output_dir")" 2>/dev/null || { err bad-output "cannot create the parent of the output directory"; exit 2; }
-if mkdir "$output_dir.lock" 2>/dev/null; then
-    lock_dir="$output_dir.lock"
-else
-    err output-busy "another run holds $output_dir.lock (remove it if no run is active)"
-    exit 2
-fi
+acquire_output_lock "$output_dir"
 check_output_free
 
 # 出力先は cargo build より前に 0700 で作り、所有者・モード・symlink でないことを確認する
 # （ビルド中に他者が同じパスへ置いた物を、後続の mktemp・cp が使わないようにする。PR #2086 の指摘）。
 if [ ! -d "$output_dir" ]; then
-    mkdir -m 0700 "$output_dir" 2>/dev/null || { err bad-output "cannot create the output directory"; exit 2; }
+    mkdir -m 0700 "$output_dir" 2>/dev/null || { err_code bad-output "cannot create the output directory"; exit 2; }
     out_created=1
 fi
 output_dir_identity=""
@@ -347,21 +334,21 @@ dir_identity() { # $1=ディレクトリ
 recheck_output_dir() {
     local ident
     if [ -L "$output_dir" ] || [ ! -d "$output_dir" ]; then
-        err unsafe-output "output directory changed during the build; refusing to publish"
+        err_code unsafe-output "output directory changed during the build; refusing to publish"
         exit 2
     fi
     if [ -n "$(dir_unsafe_reason "$output_dir" self)" ]; then
-        err unsafe-output "output directory ownership or mode changed during the build; refusing to publish"
+        err_code unsafe-output "output directory ownership or mode changed during the build; refusing to publish"
         exit 2
     fi
     ident="$(dir_identity "$output_dir")" || ident=""
     if [ -z "$ident" ] || [ "$ident" != "$output_dir_identity" ]; then
-        err unsafe-output "output directory was replaced during the build; refusing to publish"
+        err_code unsafe-output "output directory was replaced during the build; refusing to publish"
         exit 2
     fi
 }
 output_dir_identity="$(dir_identity "$output_dir")" || output_dir_identity=""
-[ -n "$output_dir_identity" ] || { err bad-environment "cannot stat the output directory"; exit 2; }
+[ -n "$output_dir_identity" ] || { err_code bad-environment "cannot stat the output directory"; exit 2; }
 recheck_output_dir
 
 # cargo build を umask 077 と専用 target ディレクトリで走らせる（背景の子の中だけで umask を変える）。
@@ -375,14 +362,14 @@ cargo_build() {
 
 # --- 入力の取得 ---
 if [ -z "$init_arg" ]; then
-    info "building fandhe-container-guest-init (aarch64-unknown-linux-musl)"
+    info_msg "building fandhe-container-guest-init (aarch64-unknown-linux-musl)"
     rc=0
     run_limited "$build_timeout" cargo_build || rc=$?
     if [ "$rc" -eq 124 ]; then
-        err build-timeout "cargo build exceeded ${build_timeout}s"
+        err_code build-timeout "cargo build exceeded ${build_timeout}s"
         exit 3
     elif [ "$rc" -ne 0 ]; then
-        err build-failed "cargo build failed with exit code $rc (is the aarch64-unknown-linux-musl target installed and the linker available?)"
+        err_code build-failed "cargo build failed with exit code $rc (is the aarch64-unknown-linux-musl target installed and the linker available?)"
         exit 1
     fi
     init_src="$work_dir/target/aarch64-unknown-linux-musl/release/fandhe-container-guest-init"
@@ -401,11 +388,11 @@ fi
 # 防げないため、--init には自分の管理下のパスを渡すこと。
 input_timeout=30
 if [ -L "$init_src" ]; then
-    err bad-input "init must not be a symlink"
+    err_code bad-input "init must not be a symlink"
     exit 2
 fi
 if [ ! -f "$init_src" ]; then
-    err bad-input "init is not a regular file"
+    err_code bad-input "init is not a regular file"
     exit 2
 fi
 init_copy="$work_dir/init"
@@ -413,58 +400,58 @@ init_copy="$work_dir/init"
 copy_input() {
     umask 077
     if ! exec 9<"$init_src"; then
-        err bad-input "cannot open init"
+        err_code bad-input "cannot open init"
         exit 2
     fi
     local fd_path="/dev/fd/9"
     if [ -z "$(find -L "$fd_path" -prune -type f -print 2>/dev/null)" ]; then
-        err bad-input "init is not a regular file"
+        err_code bad-input "init is not a regular file"
         exit 2
     fi
     if [ -z "$(find -L "$fd_path" -prune \( -user "$expect_uid" -o -user 0 \) -print 2>/dev/null)" ]; then
-        err bad-input "init must be owned by the current user or root"
+        err_code bad-input "init must be owned by the current user or root"
         exit 2
     fi
     if [ -n "$(find -L "$fd_path" -prune \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
-        err bad-input "init must not be group or other writable"
+        err_code bad-input "init must not be group or other writable"
         exit 2
     fi
     # macOS の /dev/fd/N（fdesc）では上の fd 経由の権限検査が効かないことがあるため、パス側でも同じ検査を
     # 重ねる（早期拒否。パスの検査は安全性の根拠にしない。fd 検査は Linux で有効）。
     if [ -n "$(find "$init_src" -prune \( -perm -0020 -o -perm -0002 \) -print 2>/dev/null)" ]; then
-        err bad-input "init must not be group or other writable"
+        err_code bad-input "init must not be group or other writable"
         exit 2
     fi
     if [ -z "$(find "$init_src" -prune -type f \( -user "$expect_uid" -o -user 0 \) -print 2>/dev/null)" ]; then
-        err bad-input "init must be a regular file owned by the current user or root"
+        err_code bad-input "init must be a regular file owned by the current user or root"
         exit 2
     fi
     if ! head -c $((max_init_bytes + 1)) <&9 >"$init_copy" 2>/dev/null; then
-        err bad-input "cannot read init"
+        err_code bad-input "cannot read init"
         exit 2
     fi
 }
 rc=0
 run_limited "$input_timeout" copy_input || rc=$?
 if [ "$rc" -eq 124 ]; then
-    err input-timeout "reading init exceeded ${input_timeout}s (is it a FIFO or a stalled file?)"
+    err_code input-timeout "reading init exceeded ${input_timeout}s (is it a FIFO or a stalled file?)"
     exit 3
 elif [ "$rc" -ne 0 ]; then
     exit "$rc"
 fi
 init_size="$(wc -c <"$init_copy" | tr -d ' ')"
 if ! [[ "$init_size" =~ ^[0-9]+$ ]] || [ "$init_size" -eq 0 ]; then
-    err bad-input "init is empty or unreadable"
+    err_code bad-input "init is empty or unreadable"
     exit 2
 fi
 if [ "$init_size" -gt "$max_init_bytes" ]; then
-    err bad-input "init is larger than $max_init_bytes bytes"
+    err_code bad-input "init is larger than $max_init_bytes bytes"
     exit 2
 fi
 chmod 0700 "$init_copy"
 copy_size="$(wc -c <"$init_copy" | tr -d ' ')"
 if [ "$copy_size" != "$init_size" ]; then
-    err bad-input "init changed while being copied"
+    err_code bad-input "init changed while being copied"
     exit 2
 fi
 
@@ -484,7 +471,7 @@ rd_le() {
     printf '%s\n' "$v"
 }
 elf_fail() {
-    err "$1" "$2"
+    err_code "$1" "$2"
     exit 2
 }
 magic="$(od -An -tx1 -v -N 4 "$init_copy" | tr -d ' \n')"
@@ -543,10 +530,10 @@ if [ "$compress" = "gzip" ]; then
     rc=0
     run_limited "$pack_timeout" gzip -n -9 -c "$cpio_file" >"$work_dir/initrd.cpio.gz" || rc=$?
     if [ "$rc" -eq 124 ]; then
-        err pack-timeout "gzip exceeded ${pack_timeout}s"
+        err_code pack-timeout "gzip exceeded ${pack_timeout}s"
         exit 3
     elif [ "$rc" -ne 0 ]; then
-        err pack-failed "gzip failed with exit code $rc"
+        err_code pack-failed "gzip failed with exit code $rc"
         exit 1
     fi
     final_file="$work_dir/initrd.cpio.gz"
@@ -581,7 +568,7 @@ tmp_initrd="$(mktemp "$output_dir/.initrd.XXXXXX" 2>/dev/null)" || tmp_initrd=""
 if [ -z "$tmp_info" ] || [ -z "$tmp_initrd" ] \
     || ! write_info >"$tmp_info" 2>/dev/null \
     || ! cp "$final_file" "$tmp_initrd" 2>/dev/null; then
-    err output-failed "cannot write the build outputs (disk full or permission?)"
+    err_code output-failed "cannot write the build outputs (disk full or permission?)"
     exit 2
 fi
 for pair in "build-info.txt:$tmp_info" "$final_name:$tmp_initrd"; do
@@ -592,7 +579,7 @@ for pair in "build-info.txt:$tmp_info" "$final_name:$tmp_initrd"; do
     # として解釈しない）が使えれば付ける。BSD / macOS には -T が無いため、リンク後に確定先が
     # 一時ファイルと同一 inode の通常ファイルであることを検証し、違えば配下に出来た名前を消して失敗にする。
     if [ -e "$output_dir/$dest" ] || [ -L "$output_dir/$dest" ]; then
-        err output-exists "cannot publish $dest: it already exists; refusing to overwrite"
+        err_code output-exists "cannot publish $dest: it already exists; refusing to overwrite"
         exit 2
     fi
     if ln -T -- "$tmp" "$tmp.probe" 2>/dev/null; then
@@ -603,7 +590,7 @@ for pair in "build-info.txt:$tmp_info" "$final_name:$tmp_initrd"; do
     fi
     # shellcheck disable=SC2086
     if ! ln $ln_notarget -- "$tmp" "$output_dir/$dest" 2>/dev/null; then
-        err output-exists "cannot publish $dest: it already exists or the link failed; refusing to overwrite"
+        err_code output-exists "cannot publish $dest: it already exists or the link failed; refusing to overwrite"
         exit 2
     fi
     if [ -L "$output_dir/$dest" ] || [ ! -f "$output_dir/$dest" ] || [ ! "$output_dir/$dest" -ef "$tmp" ]; then
@@ -611,7 +598,7 @@ for pair in "build-info.txt:$tmp_info" "$final_name:$tmp_initrd"; do
         if [ -d "$output_dir/$dest" ]; then
             rm -f -- "$output_dir/$dest/${tmp##*/}" 2>/dev/null || true
         fi
-        err output-exists "cannot publish $dest: the destination is not a regular file; refusing"
+        err_code output-exists "cannot publish $dest: the destination is not a regular file; refusing"
         exit 2
     fi
     published="$published $dest"
@@ -619,6 +606,6 @@ for pair in "build-info.txt:$tmp_info" "$final_name:$tmp_initrd"; do
 done
 publishing=0
 out_created=0
-info "init sha256=$init_sha bytes=$copy_size"
-info "initrd sha256=$initrd_sha"
+info_msg "init sha256=$init_sha bytes=$copy_size"
+info_msg "initrd sha256=$initrd_sha"
 printf '%s\n' "$output_dir/$final_name"

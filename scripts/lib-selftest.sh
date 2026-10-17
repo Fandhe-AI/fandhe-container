@@ -161,6 +161,7 @@ check_range() {
   local name="$1" want="$2" value="$3" min="$4" max="$5" sh rc
   for sh in "${shells[@]}"; do
     rc=0
+    # shellcheck disable=SC2016 # 引数は子の bash 側で展開させる
     "${sh}" -c 'source "$1"; int_in_range "$2" "$3" "$4"' _ "${src_dir}/lib.sh" "${value}" "${min}" "${max}" >/dev/null 2>&1 || rc=$?
     if [ "${rc}" = "${want}" ]; then
       pass "int_in_range ${name} (${sh})"

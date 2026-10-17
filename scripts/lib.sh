@@ -72,6 +72,36 @@ int_in_range() {
   [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
 }
 
+# err_code <code> <message> / info_msg <message>: `error: code=<code> message=<英語>` と `info: <英語>` を stderr に出す。
+# guest/kernel/build.sh・scripts/build-guest-initrd.sh・scripts/generate-third-party-licenses.sh が共有する（以前は各本に
+# 重複。REPAIR-1・REPAIR-4）。`err` という名前は足さない（scripts/targets/*.sh が別書式の `err()` を source 後に自前で定義するため）。
+err_code() {
+  printf 'error: code=%s message=%s\n' "$1" "$2" >&2
+}
+info_msg() {
+  printf 'info: %s\n' "$1" >&2
+}
+
+# acquire_output_lock <出力先>: 出力先の排他ロック（<出力先>.lock ディレクトリ。mkdir は不可分）を取る。
+# 親ディレクトリを作れなければ bad-output、既にロックがあれば output-busy で exit 2。成功したら OUTPUT_LOCK_DIR に入れる。
+# 異常終了（KILL 等）で残ったロックは手で削除する。呼び出し元の EXIT trap で release_output_lock を呼ぶこと。
+OUTPUT_LOCK_DIR=""
+acquire_output_lock() {
+  mkdir -p "$(dirname "$1")" 2>/dev/null || { err_code bad-output "cannot create the parent of the output directory"; exit 2; }
+  if mkdir "$1.lock" 2>/dev/null; then
+    OUTPUT_LOCK_DIR="$1.lock"
+  else
+    err_code output-busy "another run holds $1.lock (remove it if no run is active)"
+    exit 2
+  fi
+}
+
+# release_output_lock: 自分が取った出力先のロックを外す。冪等。
+release_output_lock() {
+  [ -z "${OUTPUT_LOCK_DIR}" ] || rmdir "${OUTPUT_LOCK_DIR}" 2>/dev/null || true
+  OUTPUT_LOCK_DIR=""
+}
+
 # validate_timeout <NAME> <value>: 1〜999999 の整数でなければ exit 2 する（0 は `timeout` を無効にするため拒否）。
 validate_timeout() {
   local name="$1" t="$2"

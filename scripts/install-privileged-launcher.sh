@@ -11,10 +11,13 @@
 #   ずらさないため（#2068）。CLI には capability も setuid も付けない（supervisor と同じく読み戻しで空と 755 を確かめる）。
 # 呼び出し元: 人間が root で直接 / パッケージの postinst（`--dest-dir` で配置先を渡す） / `make install-launcher-selftest`
 #   （スタブのみの自己テスト。root 不要）。root での実機実行と検証は人間担当（#538・#539）。本スクリプトの中で sudo は呼ばない。
-# 使い方: install-privileged-launcher.sh --launcher <file> --supervisor <file> --cli <file> [--dest-dir <絶対パス>]
-#   既定の配置先は /usr/local/libexec/fandhe-container。入力元は必須（root が作業ツリーの暗黙の既定パスを拾わないため）。
+# 使い方: install-privileged-launcher.sh --launcher <file> --launcher-sha256 <hex> --supervisor <file>
+#   --supervisor-sha256 <hex> --cli <file> --cli-sha256 <hex> [--dest-dir <絶対パス>]
+#   既定の配置先は /usr/local/libexec/fandhe-container。入力元と許可済み sha256（64 桁の 16 進）は 6 つとも必須
+#   （root が作業ツリーの暗黙の既定パスを拾わないため。ハッシュを省く既定も無い。#2137・PLUG-11 の方式に倣う）。
 # 終了コード: 0 成功 / 1 インストール操作の失敗（期限超過を含む） / 2 引数エラー / 3 前提不成立（root でない・Linux でない・
-#   配置先が信頼条件を満たさない・入力元が不正・同じ配置先へ別のインストールが進行中） / 129・130・143 HUP・INT・TERM による中断。
+#   配置先が信頼条件を満たさない・入力元が不正・入力元の sha256 が許可済みの値と一致しない
+#   〔`source-hash-mismatch`〕・sha256sum が無い・同じ配置先へ別のインストールが進行中） / 129・130・143 HUP・INT・TERM による中断。
 # 出力: 成功は stdout に 1 行 `installed: method=file-capability|setuid dest-dir=<path>`。失敗は stderr の 1 行目に原因
 #   `error: <code>: <message>`（英語）。更新の途中で止まったときと後始末が残ったときだけ、結果を示す行が続く
 #   （どれも `error|warning: <code>: <message>` の 1 行）:
@@ -44,7 +47,7 @@
 #   ハードリンクの退避から戻す。ロックは待たずに取り（flock -n）、取れなければ
 #   `error: install-locked`（終了コード 3）で何も変えずに止まる。ロックはプロセスの終了で必ず解放される（残骸で次回が
 #   止まらない）。0600 にするのは、読めるだけの利用者でも flock を取れてしまい、インストールを止められるため。
-# 期限（REPAIR-5）: 配置先・入力元に触る外部コマンド（stat・mkdir・flock・mktemp・dd・chown・chmod・setcap・getcap・ln・mv・rm）は
+# 期限（REPAIR-5）: 配置先・入力元に触る外部コマンド（stat・mkdir・flock・mktemp・dd・sha256sum・chown・chmod・setcap・getcap・ln・mv・rm）は
 #   例外なく run_child（timeout(1)。期限 30 秒・超過後 5 秒で KILL）を通す。timeout が無ければ実行前に拒否する。親シェルは
 #   ファイル検査（[ -e ] 等）も配置先へのリダイレクトも行わない（NFS / FUSE の停止で無期限に待つため）。例外は入力元と
 #   ロックファイルの open の 2 か所で、watchdog が同じ期限で打ち切る（`error: source-open-timeout` / `lock-open-timeout` を
@@ -53,7 +56,13 @@
 #   として扱い、置換の成否は inode の読み戻しで確かめてから復元する（確かめられなければ state-indeterminate）。
 #   後始末と復元の間は INT・HUP・TERM を無視して完遂を優先する（各操作に期限があるので有限時間で終わる。子は TERM を無視した
 #   まま起動されるので、後始末中の期限超過は KILL までの猶予を含めて最大 35 秒）。期限超過 1 回のあとの後始末は最大 7 操作。
-# 既知の未実装（実装済みを装わない）: 入力元のハッシュ・署名の照合は行わない（PLUG-11 との整合は設計書 12 章の未確認事項）。
+# 入力元の照合（#2137・SUP-14。方式は PLUG-11 の「許可済み sha256 一覧が既定」に倣う）: 複製した一時ファイル（root 所有の
+#   配置先の中。root 以外は変えられない）を sha256sum で計算し、引数の許可済みの値と照合してから属性を変える。入力元のパスは
+#   読み直さない（開いた後の差し替えを検出でき、rename は inode を保つので照合した中身がそのまま最終名になる）。不一致は
+#   `source-hash-mismatch`（終了コード 3）で、属性の変更も置換もしない。期待値は入力元とは別の経路（リリースの SHA256SUMS・
+#   信頼できるビルドホストで取った値）から得ること。入力元と同じ時点で計算し直した値では保護にならない。
+# 既知の未実装（実装済みを装わない）: 署名の検証は行わない（PLUG-11 の opt-in の将来拡張。差し込む位置は設計書 10 章）。
+#   ランチャーが実行時に supervisor を照合するか（#1719）も未確認（設計書 12 章）。
 #   nosuid マウント上の配置先では file capability / setuid が効かない（ランチャーが実行時に fail-closed で拒否する）。
 #   SIGKILL でも終わらない子（割り込めない I/O 待ち）は timeout(1) が回収を待ち続けるため、期限では打ち切れない。
 # 注意: scripts/lib.sh は source しない（cwd がリポジトリルートへ移り、postinst からの相対パス解釈が変わるため）。
@@ -107,7 +116,7 @@ warn() { # <code> <message>
 }
 
 usage() {
-  echo "usage: $0 --launcher <file> --supervisor <file> --cli <file> [--dest-dir <absolute-dir>]" >&2
+  echo "usage: $0 --launcher <file> --launcher-sha256 <hex> --supervisor <file> --supervisor-sha256 <hex> --cli <file> --cli-sha256 <hex> [--dest-dir <absolute-dir>]" >&2
   exit 2
 }
 
@@ -399,17 +408,43 @@ trap 'exit 143' TERM
 LAUNCHER_SRC=""
 SUPERVISOR_SRC=""
 CLI_SRC=""
+LAUNCHER_SHA256=""
+SUPERVISOR_SHA256=""
+CLI_SHA256=""
 DEST_DIR="${DEFAULT_DEST_DIR}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --launcher) [ $# -ge 2 ] || usage; LAUNCHER_SRC="$2"; shift 2 ;;
     --supervisor) [ $# -ge 2 ] || usage; SUPERVISOR_SRC="$2"; shift 2 ;;
     --cli) [ $# -ge 2 ] || usage; CLI_SRC="$2"; shift 2 ;;
+    --launcher-sha256) [ $# -ge 2 ] || usage; LAUNCHER_SHA256="$2"; shift 2 ;;
+    --supervisor-sha256) [ $# -ge 2 ] || usage; SUPERVISOR_SHA256="$2"; shift 2 ;;
+    --cli-sha256) [ $# -ge 2 ] || usage; CLI_SHA256="$2"; shift 2 ;;
     --dest-dir) [ $# -ge 2 ] || usage; DEST_DIR="$2"; shift 2 ;;
     *) usage ;;
   esac
 done
 [ -n "${LAUNCHER_SRC}" ] && [ -n "${SUPERVISOR_SRC}" ] && [ -n "${CLI_SRC}" ] || usage
+[ -n "${LAUNCHER_SHA256}" ] && [ -n "${SUPERVISOR_SHA256}" ] && [ -n "${CLI_SHA256}" ] || usage
+
+# 許可済み sha256 は 64 桁の 16 進だけを許可リスト方式で受け、小文字へ正規化する（照合と出力で表記を揃える）。
+for hash_opt in launcher supervisor cli; do
+  case "${hash_opt}" in
+    launcher) hash_val="${LAUNCHER_SHA256}" ;;
+    supervisor) hash_val="${SUPERVISOR_SHA256}" ;;
+    *) hash_val="${CLI_SHA256}" ;;
+  esac
+  if ! [[ "${hash_val}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    echo "error: invalid-argument: --${hash_opt}-sha256 must be 64 hexadecimal digits" >&2
+    exit 2
+  fi
+  hash_val="${hash_val,,}"
+  case "${hash_opt}" in
+    launcher) LAUNCHER_SHA256="${hash_val}" ;;
+    supervisor) SUPERVISOR_SHA256="${hash_val}" ;;
+    *) CLI_SHA256="${hash_val}" ;;
+  esac
+done
 
 # --dest-dir は許可リスト方式で検証する（空白・改行・glob・.. を拒否）。単一の末尾スラッシュは検査より先に除去する
 # （除去後に残る `//` は空要素として拒否する）。
@@ -465,6 +500,8 @@ export LC_ALL=C
 command -v timeout >/dev/null 2>&1 || die 3 timeout-unavailable "timeout(1) is required to bound child processes"
 # 同じ配置先への並行インストールを排他できない環境でも実行前に拒否する。
 command -v flock >/dev/null 2>&1 || die 3 flock-unavailable "flock(1) is required to serialize installations"
+# 入力元の照合に使う。見つからないときに別のツールへ替えない（経路を広げない）。
+command -v sha256sum >/dev/null 2>&1 || die 3 sha256sum-unavailable "sha256sum(1) is required to verify the sources"
 
 # 入力元は 1 回だけ開き、開いた fd 自体を検査して同じ fd から複製する（検査後の再オープンによる TOCTOU を作らない）。
 # パスが symlink でないこと（lstat）と、fd の指す実体（fstat）が通常ファイルで lstat と同一 inode であることを確かめる。
@@ -702,6 +739,22 @@ run_child all dd bs=65536 of="${TMP_LAUNCHER}" <&"${SRC_FD_LAUNCHER}" || fail_bo
 run_child all dd bs=65536 of="${TMP_SUPERVISOR}" <&"${SRC_FD_SUPERVISOR}" || fail_bounded 1 install-failed "copy of the supervisor"
 run_child all dd bs=65536 of="${TMP_CLI}" <&"${SRC_FD_CLI}" || fail_bounded 1 install-failed "copy of the CLI"
 exec {SRC_FD_LAUNCHER}<&- {SRC_FD_SUPERVISOR}<&- {SRC_FD_CLI}<&-
+# 複製した一時ファイルを許可済みの sha256 と照合する。属性を変える前に済ませ、不一致なら何も変えずに止まる（fail-closed）。
+verify_staged_sha256() { # <表示名> <一時ファイル> <期待値（小文字）>
+  local actual
+  bounded sha256sum -- "$2" || fail_bounded 1 install-failed "sha256 of the $1"
+  # 出力は `<64 桁の小文字 16 進>  <一時ファイル>` の 1 行だけを受け付ける。
+  if ! [[ "${BOUNDED_OUT}" =~ ^([0-9a-f]{64})\ \ (.+)$ ]] || [ "${BASH_REMATCH[2]}" != "$2" ]; then
+    die 1 install-failed "sha256sum printed unexpected output for $2"
+  fi
+  actual="${BASH_REMATCH[1]}"
+  if [ "${actual}" != "$3" ]; then
+    die 3 source-hash-mismatch "sha256 of the $1 does not match (expected $3, got ${actual})"
+  fi
+}
+verify_staged_sha256 "launcher" "${TMP_LAUNCHER}" "${LAUNCHER_SHA256}"
+verify_staged_sha256 "supervisor" "${TMP_SUPERVISOR}" "${SUPERVISOR_SHA256}"
+verify_staged_sha256 "CLI" "${TMP_CLI}" "${CLI_SHA256}"
 step "chown" chown root:root "${TMP_LAUNCHER}"
 step "chmod" chmod 0755 "${TMP_LAUNCHER}"
 step "chown" chown root:root "${TMP_SUPERVISOR}"

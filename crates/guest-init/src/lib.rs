@@ -25,6 +25,18 @@
 //! 指示に 1 件でも不正があれば 1 件も mount しない。致命的な初期化失敗では [`READY_MARKER`] を出さない。
 //! PID 1 が終了するとカーネルが panic するため、どの経路でも終了せず待機する。
 //!
+//! - `/dev` の devtmpfs の mount が `EBUSY`（既に mount 済み）のときは成功扱いにせず、`/proc` の mount 後に
+//!   `/proc/self/mountinfo` を上限つきで読み、`devtmpfs` かつ `nosuid`・`noexec` でなければ
+//!   `stage=dev errno=16` を出して停止する（[`mountinfo`]。#2139）。EBUSY は同じ superblock が同じ
+//!   mount point に既にある場合に返るため fstype はほぼ devtmpfs で、問題になるのはオプションである
+//!   （カーネルの自動 mount は `nosuid`・`noexec` を付けない）。検査に通らなくても console は検査前の `/dev` から
+//!   開くため診断の出力は best-effort で、[`READY_MARKER`] が出ないことで fail-closed になる。
+//! - panic hook が `stage=panic errno=5` の固定の 1 行を出して待機する（payload・位置は出さない。REPAIR-2）。
+//!   hook は unwind でも `panic = "abort"` でも abort より前に呼ばれ戻らないため、将来 profile に
+//!   `panic = "abort"` を入れても PID 1 は終了しない。残る経路（hook 内の二重 panic・OOM の
+//!   `handle_alloc_error` による abort）ではカーネルが panic し、ホストは [`READY_MARKER`] のタイムアウトで
+//!   fail-closed になるが原因は見えない。
+//!
 //! # unsafe の閉じ込め（REPAIR-9）
 //!
 //! lib のルートで `unsafe_code` を deny にし、`sys` だけを allow にする。`sys` の外に `unsafe` が入ると
@@ -37,6 +49,8 @@
 //!   動かした時点で崩れるため、その変更の前に fd 起点の mount（要素ごとの `openat`＋`O_NOFOLLOW` から
 //!   `/proc/self/fd/<n>` へ mount、または `open_tree`／`move_mount`）へ移すことを前提条件とする
 //!   （#2080・#1905）。`/proc`・`/sys`・`/dev` は他のプロセスが生まれる前に固定パスへ mount する。
+//! - EBUSY の分岐（実カーネルでの devtmpfs の二重 mount）と panic hook が PID 1 で待機へ落ちる挙動は CI では
+//!   動かせない。単体テストは解析・分類・診断行だけを覆い、実機の VM での確認は #1628 に委ねる（#2139）。
 //! - 協調停止: `reboot(2)` 等は呼ばない。VM の停止はホストの VZ の強制停止に任せる（TASK-115）。
 //! - 子プロセスの回収（`waitpid`）: 現状は子を作らない。ゲスト内でコンテナを実行する際に実装する。
 //! - 静的リンクのビルドと initrd への梱包は `scripts/build-guest-initrd.sh`（`make guest-initrd-build`。#1878）
@@ -46,6 +60,7 @@
 
 pub mod cmdline;
 pub mod directive;
+pub mod mountinfo;
 pub mod probe;
 pub mod process;
 pub mod report;

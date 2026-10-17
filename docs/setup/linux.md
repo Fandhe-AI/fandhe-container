@@ -21,14 +21,17 @@ fandhe-container の実行ファイル（CLI・supervisor・特権ランチャ�
 
 ## rootful（インストールスクリプト）
 
-root で次を実行する（スクリプト内で sudo は呼ばない）。入力元は 3 つとも必須で、symlink は不可。
+root で次を実行する（スクリプト内で sudo は呼ばない）。入力元と許可済みの sha256 は 3 つとも必須で、入力元の symlink は不可。
 
 ```bash
 scripts/install-privileged-launcher.sh \
-  --launcher target/release/fandhe-container-launcher \
-  --supervisor target/release/fandhe-container-supervisor \
-  --cli target/release/fandhe-container
+  --launcher target/release/fandhe-container-launcher --launcher-sha256 <launcher の sha256> \
+  --supervisor target/release/fandhe-container-supervisor --supervisor-sha256 <supervisor の sha256> \
+  --cli target/release/fandhe-container --cli-sha256 <CLI の sha256>
 ```
+
+- sha256 は 64 桁の 16 進で、配置するファイルの期待値を入力元とは別の経路で得る。リリース物ならば別の経路で配られた `SHA256SUMS`、手元でビルドしたならばビルド直後の信頼できる状態で `sha256sum target/release/...` を取って控えた値を使う。インストールの直前に入力元から計算し直した値では、差し替えを防げない
+- 照合は配置先に複製した一時ファイルに対して行い、不一致なら `error: source-hash-mismatch`（終了コード 3）を出して何も置換しない。署名の検証は未実装
 
 - 配置先は既定 `/usr/local/libexec/fandhe-container`。`--dest-dir <絶対パス>` で変えられる
 - 配置先は根から全要素が root 所有・g/o 書き込み不可の通常ディレクトリでなければならない。満たさないときは補修せず終了コード 3 で止まる

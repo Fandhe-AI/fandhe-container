@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# scripts/install-privileged-launcher.sh の自己テスト（TASK-171 追補・#1721・#2068・MS-9・SUP-14・SEC-1・REPAIR-5・REPAIR-12）。
+# scripts/install-privileged-launcher.sh の自己テスト（TASK-171 追補・#1721・#2068・#2137・MS-9・SUP-14・SEC-1・PLUG-11・REPAIR-5・REPAIR-12）。
 #
-# 役割: 実行のたびに mktemp -d 配下へスタブ（stat / mkdir / flock / mktemp / dd / chown / chmod / setcap / getcap / ln / mv / rm / id）と
+# 役割: 実行のたびに mktemp -d 配下へスタブ（stat / mkdir / flock / mktemp / dd / sha256sum / chown / chmod / setcap / getcap / ln / mv / rm / id）と
 #   入力元・配置先を作り、終了コード・stdout / stderr・スタブ呼び出し記録・最終ファイルの中身とモードを具体値で照合する。
 #   root もホスト設定の変更も使わない（実機の root 実行と検証は人間担当: #538・#539）。インストーラ本体はテスト入口
 #   FANDHE_INSTALL_TEST_SANDBOX 経由で本番と同じ検査コードを通る。
@@ -45,6 +45,8 @@ trap 'chmod -R u+rwx "${root_tmp}" 2>/dev/null || true; rm -rf "${root_tmp}"' EX
 CAPS="cap_sys_admin,cap_mknod,cap_setpcap,cap_net_admin,cap_audit_write,cap_dac_override,cap_kill,cap_setgid+ep"
 # 配置先・属性を変えるスタブ呼び出し（「何も変更していない」の照合に使う）。
 MUTATING='^(chown|chmod|setcap|mkdir|mktemp|dd|ln|mv|rm) '
+# 属性の変更と置換だけ（sha256sum の照合で止まる場合に何も起きていないことの照合に使う）。
+ATTR_AND_REPLACE='^(chown|chmod|setcap|ln|mv) '
 # インストーラ 1 回を包む外側の期限（秒）。ハングの注入が期限で止まらなかったときに自己テスト自体を止めないため。
 OUTER_TIMEOUT=60
 # 期限の照合で使うインストーラ側の期限（秒）。
@@ -61,6 +63,11 @@ new_sandbox() {
   printf 'NEW-LAUNCHER\n' >"${SB}/src/launcher"
   printf 'NEW-SUPERVISOR\n' >"${SB}/src/supervisor"
   printf 'NEW-CLI\n' >"${SB}/src/cli"
+  # 許可済みの sha256（入力元の中身の実際の値）。HASH_ARGV は引数列として、SHA_* は個別に使う。
+  SHA_L="$(sha256sum "${SB}/src/launcher" | cut -d' ' -f1)"
+  SHA_S="$(sha256sum "${SB}/src/supervisor" | cut -d' ' -f1)"
+  SHA_C="$(sha256sum "${SB}/src/cli" | cut -d' ' -f1)"
+  HASH_ARGV=(--launcher-sha256 "${SHA_L}" --supervisor-sha256 "${SHA_S}" --cli-sha256 "${SHA_C}")
   # 全スタブ共通の前処理: 呼び出し記録・期限つき実行の確認・n 回目の呼び出しへのハング / 失敗の注入。
   #   STUB_HANG / STUB_FAIL / STUB_HANG_AFTER は `<command>:<n>` の空白区切り（そのコマンドの n 回目の呼び出し）。
   #   STUB_HANG_AFTER は本来の処理を済ませてからハングする（「操作は効いたが応答が返らない」の再現）。
@@ -79,7 +86,7 @@ read -r parent <"/proc/${PPID}/comm" || true
 # 配置先・属性を変えるコマンドは、配置先のロック（<dest-dir>/.install.lock）をインストーラが持ったまま呼ばれる。
 # ロックファイルが無い・別の記述子から取れてしまう（＝誰も持っていない）なら、排他の外での変更として記録する。
 case "${name}" in
-  mktemp | dd | chown | chmod | setcap | ln | mv | rm)
+  mktemp | dd | sha256sum | chown | chmod | setcap | ln | mv | rm)
     lock="$(find "${sb}" -name .install.lock | head -n1)"
     if [ -z "${lock}" ] || "${real_flock}" -n "${lock}" true; then echo "${name} $*" >>"${sb}/unlocked.log"; fi
     ;;
@@ -136,6 +143,21 @@ EOS
 finish "${real}" "\$@"
 EOS
   done
+  # sha256sum は STUB_SHA256_MODE で出力を壊す（既定は実コマンド）。
+  cat >"${SB}/stubs/sha256sum" <<'EOS'
+#!/bin/bash
+. "${FANDHE_INSTALL_TEST_SANDBOX}/stub-common.sh"
+file="${!#}"
+case "${STUB_SHA256_MODE:-real}" in
+  garbage) echo "not-a-hash  ${file}"; exit 0 ;;
+  two-lines)
+    out="$(/usr/bin/sha256sum -- "${file}")"
+    printf '%s\n%s\n' "${out}" "${out}"
+    exit 0 ;;
+  fail) exit 1 ;;
+esac
+finish /usr/bin/sha256sum "$@"
+EOS
   # chown は非 root では root:root にできないため、記録だけして成功を返す。
   cat >"${SB}/stubs/chown" <<'EOS'
 #!/bin/bash
@@ -213,7 +235,7 @@ run_install() { # <env 代入>... -- <引数>...
   timeout "${OUTER_TIMEOUT}" bash -c 'echo "$$" >"$0"; exec "$@"' "${SB}/installer.pid" \
     env FANDHE_INSTALL_TEST_SANDBOX="${SB}" ${envs[@]+"${envs[@]}"} "${target}" "$@" >"${SB}/out" 2>"${SB}/err" || rc=$?
 }
-std_args() { echo "--launcher ${SB}/src/launcher --supervisor ${SB}/src/supervisor --cli ${SB}/src/cli --dest-dir ${SB}/dest"; }
+std_args() { echo "--launcher ${SB}/src/launcher --launcher-sha256 ${SHA_L} --supervisor ${SB}/src/supervisor --supervisor-sha256 ${SHA_S} --cli ${SB}/src/cli --cli-sha256 ${SHA_C} --dest-dir ${SB}/dest"; }
 norm_log() {
   sed -E -e "s#${SB}#SB#g" -e 's#\.(launcher|supervisor|cli)\.[A-Za-z0-9]{6}#.\1.TMP#g' "${SB}/calls.log"
 }
@@ -255,7 +277,7 @@ eq "not-root: dest untouched" 0 "$(dest_count)"
 eq "not-root: no lock file" none "$(lock_state)"
 rc=0
 env -u FANDHE_INSTALL_TEST_SANDBOX "${target}" --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" \
-  --cli "${SB}/src/cli" --dest-dir "${SB}/dest" >"${SB}/out" 2>"${SB}/err" || rc=$?
+  --cli "${SB}/src/cli" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest" >"${SB}/out" 2>"${SB}/err" || rc=$?
 eq "not-root (real EUID): exit code" 3 "${rc}"
 eq "not-root (real EUID): stderr code" "error: not-root:" "$(stderr_head)"
 
@@ -289,7 +311,7 @@ mkdir "${SB}/parent"
 mkdir "${SB}/parent/dest"
 chmod 755 "${SB}/parent/dest"
 chmod 775 "${SB}/parent"
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/parent/dest"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" "${HASH_ARGV[@]}" --dest-dir "${SB}/parent/dest"
 eq "parent group-writable: exit code" 3 "${rc}"
 eq "parent group-writable: stderr code" "error: untrusted-dest-dir:" "$(stderr_head)"
 eq "parent group-writable: no mutating calls" 0 "$(count_log "${MUTATING}")"
@@ -371,7 +393,7 @@ new_sandbox
 rmdir "${SB}/dest"
 rc=0
 (umask 077 && run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" \
-  --cli "${SB}/src/cli" --dest-dir "${SB}/dest/a/b" && exit "${rc}") || rc=$?
+  --cli "${SB}/src/cli" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest/a/b" && exit "${rc}") || rc=$?
 eq "dest created: exit code" 0 "${rc}"
 eq "dest created: mkdir calls" "mkdir -m 0755 -- SB/dest|mkdir -m 0755 -- SB/dest/a|mkdir -m 0755 -- SB/dest/a/b" \
   "$(norm_log | grep '^mkdir' | paste -sd'|' -)"
@@ -589,16 +611,16 @@ eq "supervisor vanishes during the update: files" "OLD-LAUNCHER OLD-SUPERVISOR O
 eq "supervisor vanishes during the update: file count" 3 "$(dest_count)"
 
 new_sandbox
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest/"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest/"
 eq "dest-dir trailing slash: exit code" 0 "${rc}"
 eq "dest-dir trailing slash: stdout" "installed: method=file-capability dest-dir=${SB}/dest" "$(cat "${SB}/out")"
 new_sandbox
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest//"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest//"
 eq "dest-dir double trailing slash: exit code" 2 "${rc}"
 
 new_sandbox
 mkfifo "${SB}/src/fifo"
-run_install -- --launcher "${SB}/src/fifo" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest"
+run_install -- --launcher "${SB}/src/fifo" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest"
 eq "fifo source: exit code" 3 "${rc}"
 eq "fifo source: stderr code" "error: invalid-source:" "$(stderr_head)"
 # 検査（stat）の直後に入力元が書き手のいない FIFO へ差し替えられると、親シェルの open が止まる。watchdog が期限で
@@ -621,32 +643,32 @@ run_install --
 eq "no args: exit code" 2 "${rc}"
 run_install -- --bogus
 eq "unknown option: exit code" 2 "${rc}"
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir relative/dir
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" "${HASH_ARGV[@]}" --dest-dir relative/dir
 eq "relative dest-dir: exit code" 2 "${rc}"
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest/../dest"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest/../dest"
 eq "dest-dir with '..': exit code" 2 "${rc}"
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/de st"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" "${HASH_ARGV[@]}" --dest-dir "${SB}/de st"
 eq "dest-dir with space: exit code" 2 "${rc}"
-run_install -- --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest"
+run_install -- --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest"
 eq "missing --launcher: exit code" 2 "${rc}"
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --dest-dir "${SB}/dest"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest"
 eq "missing --cli: exit code" 2 "${rc}"
 ln -s "${SB}/src/launcher" "${SB}/src/launcher-link"
-run_install -- --launcher "${SB}/src/launcher-link" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest"
+run_install -- --launcher "${SB}/src/launcher-link" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest"
 eq "symlink source: exit code" 3 "${rc}"
 eq "symlink source: stderr code" "error: invalid-source:" "$(stderr_head)"
 ln -s "${SB}/src/cli" "${SB}/src/cli-link"
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli-link" --dest-dir "${SB}/dest"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli-link" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest"
 eq "symlink cli source: exit code" 3 "${rc}"
 eq "symlink cli source: stderr code" "error: invalid-source:" "$(stderr_head)"
 mkfifo "${SB}/src/cli-fifo"
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli-fifo" --dest-dir "${SB}/dest"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli-fifo" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest"
 eq "fifo cli source: exit code" 3 "${rc}"
 eq "fifo cli source: stderr code" "error: invalid-source:" "$(stderr_head)"
-run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/none" --dest-dir "${SB}/dest"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/none" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest"
 eq "missing cli source: exit code" 3 "${rc}"
 eq "missing cli source: stderr code" "error: invalid-source:" "$(stderr_head)"
-run_install -- --launcher "${SB}/src/none" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest"
+run_install -- --launcher "${SB}/src/none" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest"
 eq "missing source: exit code" 3 "${rc}"
 eq "missing source: stderr code" "error: invalid-source:" "$(stderr_head)"
 eq "invalid source: no mutating calls" 0 "$(count_log "${MUTATING}")"
@@ -661,9 +683,98 @@ done
 eq "timeout override refused: no mutating calls" 0 "$(count_log "${MUTATING}")"
 rc=0
 env -u FANDHE_INSTALL_TEST_SANDBOX FANDHE_INSTALL_TEST_TIMEOUT_SECS=1 "${target}" --launcher "${SB}/src/launcher" \
-  --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" --dest-dir "${SB}/dest" >"${SB}/out" 2>"${SB}/err" || rc=$?
+  --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" "${HASH_ARGV[@]}" --dest-dir "${SB}/dest" >"${SB}/out" 2>"${SB}/err" || rc=$?
 eq "timeout override outside the sandbox: exit code" 3 "${rc}"
 eq "timeout override outside the sandbox: stderr code" "error: test-seam-refused:" "$(stderr_head)"
+
+# --- 6b. 入力元の sha256 照合（#2137・SUP-14・PLUG-11） ---
+# 不一致は属性の変更も置換もせず、終了コード 3 の source-hash-mismatch で止まる。照合は複製した一時ファイルに対して行う。
+bad_hash="$(printf '0%.0s' $(seq 1 64))"
+hash_mismatch_case() { # <name> <launcher|supervisor|cli> <old|fresh>
+  new_sandbox
+  if [ "$3" = old ]; then put_old_files; fi
+  local args
+  case "$2" in
+    launcher) args=(--launcher-sha256 "${bad_hash}" --supervisor-sha256 "${SHA_S}" --cli-sha256 "${SHA_C}") ;;
+    supervisor) args=(--launcher-sha256 "${SHA_L}" --supervisor-sha256 "${bad_hash}" --cli-sha256 "${SHA_C}") ;;
+    *) args=(--launcher-sha256 "${SHA_L}" --supervisor-sha256 "${SHA_S}" --cli-sha256 "${bad_hash}") ;;
+  esac
+  run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" \
+    "${args[@]}" --dest-dir "${SB}/dest"
+  eq "hash mismatch $2 ($3): exit code" 3 "${rc}"
+  eq "hash mismatch $2 ($3): stderr code" "error: source-hash-mismatch:" "$(stderr_head)"
+  eq "hash mismatch $2 ($3): stderr is one line" 1 "$(wc -l <"${SB}/err" | tr -d ' ')"
+  eq "hash mismatch $2 ($3): stdout empty" "" "$(cat "${SB}/out")"
+  eq "hash mismatch $2 ($3): message has both values" 1 "$(count_err "expected ${bad_hash}, got [0-9a-f]{64}\)\$|expected [0-9a-f]{64}, got ${bad_hash}\)\$")"
+  eq "hash mismatch $2 ($3): no attribute change or replacement" 0 "$(count_log "${ATTR_AND_REPLACE}")"
+  eq "hash mismatch $2 ($3): no leftover temp files" "$([ "$3" = old ] && echo 3 || echo 0)" "$(dest_count)"
+  eq "hash mismatch $2 ($3): every change ran under the lock" "" "$(cat "${SB}/unlocked.log" 2>/dev/null || true)"
+  if [ "$3" = old ]; then
+    eq "hash mismatch $2 (old): files unchanged" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+  fi
+}
+for which in launcher supervisor cli; do
+  hash_mismatch_case "${which}" "${which}" old
+  hash_mismatch_case "${which}" "${which}" fresh
+done
+# 16 進の大文字は受け付ける（正規化して照合する）。
+new_sandbox
+upper_l="$(printf '%s' "${SHA_L}" | tr 'a-f' 'A-F')"
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" \
+  --launcher-sha256 "${upper_l}" --supervisor-sha256 "${SHA_S}" --cli-sha256 "${SHA_C}" --dest-dir "${SB}/dest"
+eq "uppercase hex hash: exit code" 0 "${rc}"
+eq "uppercase hex hash: files" "NEW-LAUNCHER NEW-SUPERVISOR NEW-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+# 形式の誤り（63 桁・65 桁・16 進以外・空）は終了コード 2 で、何も変えない。
+for bad in "${SHA_L:0:63}" "${SHA_L}0" "${SHA_L:0:63}g" "" "sha256:${SHA_L}"; do
+  run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" \
+    --launcher-sha256 "${bad}" --supervisor-sha256 "${SHA_S}" --cli-sha256 "${SHA_C}" --dest-dir "${SB}/dest"
+  eq "malformed hash '${bad}': exit code" 2 "${rc}"
+  if [ -n "${bad}" ]; then
+    eq "malformed hash '${bad}': stderr code" "error: invalid-argument:" "$(stderr_head)"
+  fi
+done
+new_sandbox
+run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" \
+  --launcher-sha256 "${SHA_L:0:63}" --supervisor-sha256 "${SHA_S}" --cli-sha256 "${SHA_C}" --dest-dir "${SB}/dest"
+eq "malformed hash: no mutating calls" 0 "$(count_log "${MUTATING}")"
+eq "malformed hash: no lock file" none "$(lock_state)"
+# どの --*-sha256 が欠けても使い方のエラー（ハッシュを省く既定は無い）。
+for drop in launcher supervisor cli; do
+  new_sandbox
+  case "${drop}" in
+    launcher) args=(--supervisor-sha256 "${SHA_S}" --cli-sha256 "${SHA_C}") ;;
+    supervisor) args=(--launcher-sha256 "${SHA_L}" --cli-sha256 "${SHA_C}") ;;
+    *) args=(--launcher-sha256 "${SHA_L}" --supervisor-sha256 "${SHA_S}") ;;
+  esac
+  run_install -- --launcher "${SB}/src/launcher" --supervisor "${SB}/src/supervisor" --cli "${SB}/src/cli" \
+    "${args[@]}" --dest-dir "${SB}/dest"
+  eq "missing --${drop}-sha256: exit code" 2 "${rc}"
+  eq "missing --${drop}-sha256: no mutating calls" 0 "$(count_log "${MUTATING}")"
+done
+# 入力元を開いた後（複製の最中）に中身が書き換えられても、複製した一時ファイルを照合するので検出して旧版のまま止まる。
+new_sandbox
+put_old_files
+# shellcheck disable=SC2016 # hook.sh の中で展開する
+write_hook 'printf "EVIL\n" >"${FANDHE_INSTALL_TEST_SANDBOX}/src/launcher"'
+# shellcheck disable=SC2046
+run_install STUB_HOOK_AT=dd:1 -- $(std_args)
+eq "source rewritten before the copy: exit code" 3 "${rc}"
+eq "source rewritten before the copy: stderr code" "error: source-hash-mismatch:" "$(stderr_head)"
+eq "source rewritten before the copy: no attribute change or replacement" 0 "$(count_log "${ATTR_AND_REPLACE}")"
+eq "source rewritten before the copy: files" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+eq "source rewritten before the copy: no leftover temp files" 3 "$(dest_count)"
+# sha256sum の異常（想定外の出力・失敗）は終了コード 1 の install-failed で、何も置換しない。
+for mode in garbage two-lines fail; do
+  new_sandbox
+  put_old_files
+  # shellcheck disable=SC2046
+  run_install STUB_SHA256_MODE="${mode}" -- $(std_args)
+  eq "sha256sum ${mode}: exit code" 1 "${rc}"
+  eq "sha256sum ${mode}: stderr code" "error: install-failed:" "$(stderr_head)"
+  eq "sha256sum ${mode}: no attribute change or replacement" 0 "$(count_log "${ATTR_AND_REPLACE}")"
+  eq "sha256sum ${mode}: files" "OLD-LAUNCHER OLD-SUPERVISOR OLD-CLI" "$(launcher_content) $(supervisor_content) $(cli_content)"
+  eq "sha256sum ${mode}: no leftover temp files" 3 "$(dest_count)"
+done
 
 # --- 7. privilege.rs の集合とのドリフト防止 ---
 rust_caps="$(sed -n '/RUNTIME_REQUIRED_CAPABILITIES: \[Capability; [0-9]*\] = \[/,/^\];/p' \
@@ -719,7 +830,7 @@ eq "reference upgrade: remove count" 2 "$(grep -c '^rm ' "${ref_log}")"
 eq "reference upgrade: temporary name count" 5 "$(grep -c '^mktemp ' "${ref_log}")"
 eq "reference upgrade: setcap count (launcher only)" 1 "$(grep -c '^setcap ' "${ref_log}")"
 eq "reference upgrade: every change ran under the lock" "" "$(cat "${SB}/unlocked.log" 2>/dev/null || true)"
-eq "reference upgrade: stubbed commands seen" "chmod chown dd flock getcap ln mktemp mv rm setcap stat" \
+eq "reference upgrade: stubbed commands seen" "chmod chown dd flock getcap ln mktemp mv rm setcap sha256sum stat" \
   "$(cut -d' ' -f1 "${ref_log}" | sort -u | paste -sd' ' -)"
 ref_specs=()
 while IFS= read -r spec; do ref_specs+=("${spec}"); done < <(awk '{c[$1]++; print $1 ":" c[$1]}' "${ref_log}")
@@ -966,7 +1077,7 @@ eq "no change ran outside the lock in any case" 0 "$(find "${root_tmp}" -name un
 code="$(grep -v '^[[:space:]]*#' "${target}" | sed -E 's/[[:space:]]+#[[:space:]].*$//')"
 # 配置先・入力元に触る外部コマンドがコマンド位置（行頭・`;` `&` `|` `(` `{` `!` の直後・then / do / else・command / exec /
 # env / eval / xargs の後）に現れないこと。期限つきの経路（run_child・bounded・step）の引数としてだけ現れる。
-fs_cmds='(stat|mkdir|flock|mktemp|dd|cp|cat|tee|install|chown|chmod|setcap|getcap|ln|mv|rm|rmdir|touch|readlink|realpath|ls|find|test)'
+fs_cmds='(stat|mkdir|flock|mktemp|dd|sha256sum|shasum|b2sum|md5sum|cp|cat|tee|install|chown|chmod|setcap|getcap|ln|mv|rm|rmdir|touch|readlink|realpath|ls|find|test)'
 eq "static: no file command outside the bounded runner" "" \
   "$(printf '%s\n' "${code}" | grep -n -E "(^|[;&|({!]|then|do|else|command|exec|env|eval|xargs)[[:space:]]*${fs_cmds}([[:space:]]|\$)" || true)"
 # timeout(1) の呼び出しは run_child の 2 行だけ（期限と猶予を必ず渡している）。

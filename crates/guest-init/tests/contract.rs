@@ -179,6 +179,11 @@ fn mac1_marker_and_diagnostics_are_not_reports_for_host() {
     assert!(parse_report_line(READY_MARKER.as_bytes()).is_none());
     let diag = ReportLine::init_error(InitStage::Cmdline, Errno::E2BIG);
     assert!(parse_report_line(diag.as_str().as_bytes()).is_none());
+    // #2139: panic hook と devtmpfs の検査失敗の診断行も報告行として解釈されない。
+    let panic = ReportLine::init_error(InitStage::Panic, Errno::EIO);
+    assert!(parse_report_line(panic.as_str().as_bytes()).is_none());
+    let busy = ReportLine::init_error(InitStage::Dev, Errno::EBUSY);
+    assert!(parse_report_line(busy.as_str().as_bytes()).is_none());
     assert!(parse_report_line(ReportLine::ready().as_str().as_bytes()).is_none());
 }
 

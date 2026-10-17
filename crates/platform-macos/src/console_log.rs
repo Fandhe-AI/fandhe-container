@@ -135,6 +135,53 @@ fn report_to_stderr(event: ConsoleLogEvent) {
     let _ = writeln!(std::io::stderr().lock(), "{}", event_log_line(event));
 }
 
+/// コンソールログの世代管理の操作種別（[`lifecycle_log_line`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LifecycleOp {
+    /// 起動直前の回転（現在のログを世代へ送る）。
+    Rotate,
+    /// コンテナ delete 用の全世代削除。
+    Remove,
+}
+
+/// 世代管理の結果を 1 行の JSON にする（MAC-1・REPAIR-4・#2138）。
+///
+/// `result` は成功なら処理したファイル数（回転は改名した数、削除は消した数）、失敗なら `ConfigError::code()`
+/// の固定文字列。要求由来のパス・ファイル名は含めない（SEC-4）。`elapsed_ms` は排他の取得から終了までの
+/// 所要時間。書き出し中の出来事の [`event_log_line`] と同じ component で、`operation` が違う。
+pub(crate) fn lifecycle_log_line(
+    op: LifecycleOp,
+    result: Result<usize, &'static str>,
+    elapsed: Duration,
+) -> String {
+    let operation = match op {
+        LifecycleOp::Rotate => "rotate",
+        LifecycleOp::Remove => "remove",
+    };
+    let ms = elapsed.as_millis();
+    match result {
+        Ok(files) => format!(
+            "{{\"component\":\"platform-macos.console_log\",\"operation\":\"{operation}\",\"result\":\"ok\",\"files\":{files},\"elapsed_ms\":{ms}}}"
+        ),
+        Err(code) => format!(
+            "{{\"component\":\"platform-macos.console_log\",\"operation\":\"{operation}\",\"result\":\"error\",\"code\":\"{code}\",\"elapsed_ms\":{ms}}}"
+        ),
+    }
+}
+
+/// 世代管理の結果を stderr へ 1 行で出す。書き込み失敗では panic しない。
+pub(crate) fn report_lifecycle(
+    op: LifecycleOp,
+    result: Result<usize, &'static str>,
+    elapsed: Duration,
+) {
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "{}",
+        lifecycle_log_line(op, result, elapsed)
+    );
+}
+
 /// open 時のファイル長から決める書き出し計画。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CapPlan {
@@ -385,6 +432,23 @@ mod tests {
     use super::*;
 
     const MARKER_LEN: u64 = TRUNCATION_MARKER.len() as u64;
+
+    /// MAC-1・REPAIR-4・#2138: 世代管理の構造化ログは固定の形で、パスを含まない。
+    #[test]
+    fn lifecycle_log_line_is_stable() {
+        assert_eq!(
+            lifecycle_log_line(LifecycleOp::Rotate, Ok(2), Duration::from_millis(7)),
+            "{\"component\":\"platform-macos.console_log\",\"operation\":\"rotate\",\"result\":\"ok\",\"files\":2,\"elapsed_ms\":7}"
+        );
+        assert_eq!(
+            lifecycle_log_line(
+                LifecycleOp::Remove,
+                Err("config.console_log_in_use"),
+                Duration::from_millis(0)
+            ),
+            "{\"component\":\"platform-macos.console_log\",\"operation\":\"remove\",\"result\":\"error\",\"code\":\"config.console_log_in_use\",\"elapsed_ms\":0}"
+        );
+    }
 
     /// テスト用: 出来事を集める。
     fn copy_collect<R: Read, W: Write>(

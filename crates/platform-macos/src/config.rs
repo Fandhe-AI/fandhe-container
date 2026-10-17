@@ -1024,7 +1024,7 @@ impl ConsoleLogPath {
     /// 検査から rename までの間に他者が世代の名前を差し替える TOCTOU は残る（親ディレクトリが自分だけが
     /// 書ける前提。`check_console_log_parent`）。
     #[cfg(unix)]
-    fn rotate_excluding(&self, protected: &[ProtectedInput<'_>]) -> Result<(), ConfigError> {
+    fn rotate_inner(&self, protected: &[ProtectedInput<'_>]) -> Result<usize, ConfigError> {
         use std::os::unix::fs::MetadataExt;
 
         let path = self.as_path();
@@ -1042,9 +1042,9 @@ impl ConsoleLogPath {
                     path: path.to_path_buf(),
                 });
             }
-            Ok(m) if m.len() == 0 => return Ok(()),
+            Ok(m) if m.len() == 0 => return Ok(0),
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
             Err(e) => {
                 return Err(ConfigError::PathIo {
                     field: ConfigField::ConsoleLog,
@@ -1064,7 +1064,7 @@ impl ConsoleLogPath {
         }
         let meta = current.metadata().map_err(rotation_err)?;
         if meta.len() == 0 {
-            return Ok(());
+            return Ok(0);
         }
         // 世代も開いて try_lock し、改名が終わるまで保持する（別 VM が使用中の世代を .2 へ送って次の回転で
         // 上書きし、書き出しスレッドが改名・削除済み inode へ書き続けるのを防ぐ）。
@@ -1080,6 +1080,7 @@ impl ConsoleLogPath {
                 kind: std::io::ErrorKind::Other,
             });
         }
+        let mut moved = 0;
         for n in (1..crate::console_log::CONSOLE_LOG_GENERATIONS).rev() {
             let src = if n == 1 {
                 path.to_path_buf()
@@ -1087,12 +1088,112 @@ impl ConsoleLogPath {
                 self.generation_path(n - 1)
             };
             match std::fs::rename(&src, self.generation_path(n)) {
-                Ok(()) => {}
+                Ok(()) => moved += 1,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(rotation_err(e)),
             }
         }
-        Ok(())
+        Ok(moved)
+    }
+
+    /// 回転・新規ファイルの open・書き出しの引き渡しを通して持つ排他用ファイルのパス（`<name>.0`）。
+    ///
+    /// 世代は 1 以上なので `.0` は世代と衝突しない。接尾辞の長さは世代と同じで、`check_generation_name_len`
+    /// の上限がそのまま成り立つ。現在のログは回転で inode が入れ替わるため、現在のログ自身への lock では
+    /// 回転から書き出しの lock 取得までの間を守れない。この名前は回転で変わらない（MAC-1・REPAIR-4・#2138）。
+    pub fn lock_path(&self) -> PathBuf {
+        self.generation_path(0)
+    }
+
+    /// 排他用ファイル（`lock_path`）を開いて `try_lock` し、fd を返す。呼び出し側は回転・open・書き出しの
+    /// 引き渡し（または削除）が終わるまで保持する（MAC-1・REPAIR-4・#2138）。
+    ///
+    /// fail-closed: 親ディレクトリ・既存エントリを世代と同じ規則で検査し（symlink・非通常ファイル・リンク数・
+    /// 所有者・モード・保護入力との同一性）、`O_NOFOLLOW` で開き、fd と lstat の `(dev, ino)` を照合する。
+    /// 使用中（別の起動・削除が保持中）なら `ConsoleLogInUse`。lock 取得後にもう一度 lstat と照合し、
+    /// 削除と競合して孤児になった inode の lock を掴んだ場合は拒否する（二重保持を作らない）。
+    #[cfg(unix)]
+    fn acquire_lifecycle_lock(
+        &self,
+        protected: &[ProtectedInput<'_>],
+    ) -> Result<std::fs::File, ConfigError> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let path = self.lock_path();
+        let open_err = |kind: std::io::ErrorKind| ConfigError::ConsoleLogOpen { kind };
+        check_console_log_parent(self.as_path())?;
+        check_generation_entry(&path, protected)?;
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.file_type().is_symlink() => {
+                    ConfigError::ConsoleLogIsSymlink { path: path.clone() }
+                }
+                _ => open_err(e.kind()),
+            })?;
+        let same_as_path = |file: &std::fs::File| -> Result<(), ConfigError> {
+            let fd_meta = file.metadata().map_err(|e| open_err(e.kind()))?;
+            let post = std::fs::symlink_metadata(&path).map_err(|e| open_err(e.kind()))?;
+            if post.file_type().is_symlink()
+                || !fd_meta.is_file()
+                || (fd_meta.dev(), fd_meta.ino()) != (post.dev(), post.ino())
+            {
+                return Err(open_err(std::io::ErrorKind::Other));
+            }
+            Ok(())
+        };
+        same_as_path(&file)?;
+        let fd_meta = file.metadata().map_err(|e| open_err(e.kind()))?;
+        let fd_id = (fd_meta.dev(), fd_meta.ino());
+        for input in protected {
+            if file_identity(input.field, input.path)? == fd_id {
+                return Err(conflict_error(input.field, &path));
+            }
+        }
+        check_log_ownership(
+            &path,
+            LogFileAttrs {
+                nlink: fd_meta.nlink(),
+                uid: fd_meta.uid(),
+                mode: fd_meta.mode(),
+            },
+            crate::sys::effective_uid(),
+        )?;
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(ConfigError::ConsoleLogInUse {
+                    path: self.as_path().to_path_buf(),
+                });
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(open_err(e.kind())),
+        }
+        same_as_path(&file)?;
+        Ok(file)
+    }
+
+    /// 排他 lock を取って回転する。lock の fd を返し、呼び出し側が書き出しの引き渡しまで保持する。
+    /// 結果・件数・所要時間を構造化ログに残す（要求由来のパスは含めない。REPAIR-4）。
+    #[cfg(unix)]
+    fn rotate_excluding(
+        &self,
+        protected: &[ProtectedInput<'_>],
+    ) -> Result<std::fs::File, ConfigError> {
+        let started = std::time::Instant::now();
+        let result = self.acquire_lifecycle_lock(protected).and_then(|lock| {
+            let moved = self.rotate_inner(protected)?;
+            Ok((lock, moved))
+        });
+        crate::console_log::report_lifecycle(
+            crate::console_log::LifecycleOp::Rotate,
+            result.as_ref().map(|(_, n)| *n).map_err(|e| e.code()),
+            started.elapsed(),
+        );
+        result.map(|(lock, _)| lock)
     }
 
     /// 現在のログと全世代を削除する（コンテナの delete 用の部品。MAC-1・REPAIR-4・#2138）。
@@ -1105,6 +1206,23 @@ impl ConsoleLogPath {
         &self,
         protected: &[ProtectedInput<'_>],
     ) -> Result<RemovedConsoleLogs, ConfigError> {
+        let started = std::time::Instant::now();
+        let result = self.remove_locked(protected);
+        crate::console_log::report_lifecycle(
+            crate::console_log::LifecycleOp::Remove,
+            result.as_ref().map(|r| r.removed).map_err(|e| e.code()),
+            started.elapsed(),
+        );
+        result
+    }
+
+    /// `remove_all_excluding` の本体。排他用ファイルの lock を取り、最後に排他用ファイルも消す。
+    #[cfg(unix)]
+    fn remove_locked(
+        &self,
+        protected: &[ProtectedInput<'_>],
+    ) -> Result<RemovedConsoleLogs, ConfigError> {
+        let _lifecycle_lock = self.acquire_lifecycle_lock(protected)?;
         let path = self.as_path();
         let remove_err = |e: std::io::Error| ConfigError::ConsoleLogRemove { kind: e.kind() };
         check_console_log_parent(path)?;
@@ -1150,6 +1268,12 @@ impl ConsoleLogPath {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(remove_err(e)),
             }
+        }
+        // 排他用ファイルは lock を持ったまま最後に消す（件数には数えない）。
+        match std::fs::remove_file(self.lock_path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(remove_err(e)),
         }
         Ok(RemovedConsoleLogs { removed })
     }
@@ -2221,7 +2345,9 @@ impl VmConfigSpec {
             return Ok(None);
         };
         let log_path = log.as_path();
-        log.rotate_excluding(&self.protected_inputs())?;
+        // 回転・新規ファイルの open・書き出しの lock 取得（spawn）が済むまで排他を持つ。以後は書き出しが
+        // 新しい現在のログの lock を持つため、別の起動・削除は使用中として拒否される（MAC-1・#2138）。
+        let _lifecycle_lock = log.rotate_excluding(&self.protected_inputs())?;
         let Some(file) = self.open_serial_console_log()? else {
             return Ok(None);
         };
@@ -4512,7 +4638,7 @@ broken line
         ConsoleLogPath::try_new(path).unwrap().generation_path(n)
     }
 
-    /// 定数の値の固定（supervisor の 1 MiB × 3 世代に揃える）。
+    /// MAC-1・REPAIR-4・#2138: 定数の値の固定（supervisor の 1 MiB × 3 世代に揃える）。
     #[cfg(unix)]
     #[test]
     fn console_log_limits_match_supervisor() {
@@ -4520,7 +4646,7 @@ broken line
         assert_eq!(crate::console_log::CONSOLE_LOG_GENERATIONS, 3);
     }
 
-    /// 起動のたびに現在のログが `.1` → `.2` へ送られ、3 世代より古い内容は消える。
+    /// MAC-1・REPAIR-4・#2138: 起動のたびに現在のログが `.1` → `.2` へ送られ、3 世代より古い内容は消える。
     #[cfg(unix)]
     #[test]
     fn rotation_keeps_three_generations() {
@@ -4544,7 +4670,7 @@ broken line
         );
     }
 
-    /// 現在のログが空なら世代を消費しない。
+    /// MAC-1・REPAIR-4・#2138: 現在のログが空なら世代を消費しない。
     #[cfg(unix)]
     #[test]
     fn rotation_skips_empty_log() {
@@ -4556,7 +4682,7 @@ broken line
         assert_eq!(std::fs::read(&path).unwrap(), b"boot\n");
     }
 
-    /// 使用中（1 本目の書き出しが生存中）の 2 回目の open は、何も動かさずに拒否する。
+    /// MAC-1・REPAIR-4・#2138: 使用中（1 本目の書き出しが生存中）の 2 回目の open は、何も動かさずに拒否する。
     #[cfg(unix)]
     #[test]
     fn rotation_does_not_move_log_in_use() {
@@ -4583,7 +4709,7 @@ broken line
             .expect("writer thread finished");
     }
 
-    /// 世代の名前が不正（symlink・リンク数 2・0644・kernel と同一ファイル）なら、何も動かさず既存のコードで拒否する。
+    /// MAC-1・REPAIR-4・#2138: 世代の名前が不正（symlink・リンク数 2・0644・kernel と同一ファイル）なら、何も動かさず既存のコードで拒否する。
     #[cfg(unix)]
     #[test]
     fn rotation_rejects_bad_generation_entries() {
@@ -4640,7 +4766,7 @@ broken line
         assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
     }
 
-    /// 構成エラー（kernel の消失）では世代を消費しない。
+    /// MAC-1・REPAIR-4・#2138: 構成エラー（kernel の消失）では世代を消費しない。
     #[cfg(unix)]
     #[test]
     fn rotation_not_consumed_on_config_error() {
@@ -4653,7 +4779,7 @@ broken line
         assert!(!gen_path(&path, 1).exists());
     }
 
-    /// 世代の接尾辞でファイル名が NAME_MAX を超えるパスは create 時点で拒否する。
+    /// MAC-1・REPAIR-4・#2138: 世代の接尾辞でファイル名が NAME_MAX を超えるパスは create 時点で拒否する。
     #[cfg(unix)]
     #[test]
     fn console_log_name_too_long_is_rejected() {
@@ -4668,7 +4794,7 @@ broken line
         );
     }
 
-    /// `remove_console_logs`: 現在と 2 世代を消して 3 を返す。無ければ 0。
+    /// MAC-1・REPAIR-4・#2138 `remove_console_logs`: 現在と 2 世代を消して 3 を返す。無ければ 0。
     #[cfg(unix)]
     #[test]
     fn remove_console_logs_removes_all_generations() {
@@ -4685,7 +4811,7 @@ broken line
         assert!(t.0.exists());
     }
 
-    /// 別 VM が使用中（lock 保持中）の世代ファイルは、回転でも削除でも動かさず `ConsoleLogInUse` で拒否する。
+    /// MAC-1・REPAIR-4・#2138: 別 VM が使用中（lock 保持中）の世代ファイルは、回転でも削除でも動かさず `ConsoleLogInUse` で拒否する。
     #[cfg(unix)]
     #[test]
     fn rotation_and_removal_refuse_locked_generation() {
@@ -4713,7 +4839,7 @@ broken line
         assert_eq!(spec.remove_console_logs().unwrap().removed, 2);
     }
 
-    /// `remove_console_logs`: 使用中なら何も消さず、不正なエントリがあっても何も消さない。
+    /// MAC-1・REPAIR-4・#2138 `remove_console_logs`: 使用中なら何も消さず、不正なエントリがあっても何も消さない。
     #[cfg(unix)]
     #[test]
     fn remove_console_logs_refuses_in_use_and_bad_entries() {
@@ -4743,7 +4869,54 @@ broken line
         assert_eq!(std::fs::read(&target).unwrap(), b"dummy");
     }
 
-    /// 追加した variant の code と固定文言（パスを反射しない）。
+    /// MAC-1・REPAIR-4・#2138: 回転から書き出し開始まで持つ排他用ファイル（`<name>.0`）が使用中なら、
+    /// 起動も削除も何も動かさず `ConsoleLogInUse` で拒否する。解放後は進められ、削除は排他用ファイルも消す。
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_lock_excludes_open_and_remove() {
+        let t = TempDir::new("rot-lifelock");
+        let (spec, path, _k, _i) = rotation_spec(&t);
+        put(&path, b"cur\n");
+        let lock_path = ConsoleLogPath::try_new(&path).unwrap().lock_path();
+        assert_eq!(lock_path, t.0.join("console.log.0"));
+        let held = ConsoleLogPath::try_new(&path)
+            .unwrap()
+            .acquire_lifecycle_lock(&[])
+            .unwrap();
+        assert_eq!(
+            spec.open_serial_console().unwrap_err().code(),
+            "config.console_log_in_use"
+        );
+        assert_eq!(
+            spec.remove_console_logs().unwrap_err().code(),
+            "config.console_log_in_use"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"cur\n");
+        assert!(!gen_path(&path, 1).exists());
+        drop(held);
+        boot_once(&spec, b"next\n");
+        assert_eq!(std::fs::read(gen_path(&path, 1)).unwrap(), b"cur\n");
+        assert_eq!(spec.remove_console_logs().unwrap().removed, 2);
+        assert!(!lock_path.exists());
+    }
+
+    /// MAC-1・REPAIR-4・#2138: 排他用ファイルの名前が symlink なら辿らず拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_lock_rejects_symlink() {
+        let t = TempDir::new("rot-lifelock-sym");
+        let (spec, path, _k, _i) = rotation_spec(&t);
+        let target = t.file("victim");
+        std::os::unix::fs::symlink(&target, t.0.join("console.log.0")).unwrap();
+        assert_eq!(
+            spec.open_serial_console().unwrap_err().code(),
+            "config.console_log_is_symlink"
+        );
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"dummy");
+    }
+
+    /// MAC-1・REPAIR-4・#2138: 追加した variant の code と固定文言（パスを反射しない）。
     #[test]
     fn rotation_error_codes_are_stable() {
         let e = ConfigError::ConsoleLogRotation {

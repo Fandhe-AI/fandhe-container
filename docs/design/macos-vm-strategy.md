@@ -55,7 +55,7 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 
 ### コンソールログの保持（回転・削除。#2138・MAC-1・REPAIR-4）
 
-- 上限: 1 ファイル・1 回の起動あたり 1 MiB（`MAX_CONSOLE_LOG_BYTES`）、世代は現在を含め 3（`CONSOLE_LOG_GENERATIONS`。`<name>`・`<name>.1`・`<name>.2`）。supervisor のログ（#2067・SUP-7）と同じ値と番号規則（新しいほど小さい）で、パス 1 つあたりの総量は約 3 MiB。起動中は回転せず上限で切る（ブートログの先頭を残すため）。
+- 上限: 1 ファイル・1 回の起動あたり 1 MiB（`MAX_CONSOLE_LOG_BYTES`）、世代は現在を含め 3（`CONSOLE_LOG_GENERATIONS`。`<name>`・`<name>.1`・`<name>.2`）。supervisor のログ（#2067・SUP-7）と同じ値と番号規則（新しいほど小さい）で、パス 1 つあたりの総量は約 3 MiB。起動中は回転せず上限で切る（ブートログの先頭を残すため）。 回転・新規ファイルの open・書き出しへの引き渡し、および全世代の削除は、排他用ファイル `<name>.0`（世代と衝突しない番号。回転で変わらない）の lock を通して持ち、同じログパスの二重書き出しと使用中の削除を拒否する。回転と削除の結果・件数・所要時間は stderr の構造化ログ（`operation` が `rotate` / `remove`。パスは含めない）に残す（MAC-1・REPAIR-4）。
 - 回転の時機: `VmConfigSpec::open_serial_console`（`Vm::launch` が呼ぶ）が書き出しの直前に行う。現在のログが無い・空なら世代を消費しない。使用中 lock を先に取り、世代ファイルに異常（symlink・他者所有・リンク数・モード・kernel / initrd / ディスクイメージとの同一性）があれば何も動かさず拒否する。
 - 削除の時機: VM の stop・`Vm` の drop・起動失敗では残す（診断材料）。コンテナの delete で `VmConfigSpec::remove_console_logs` が現在のログと全世代を消す。この呼び出しの配線は plugin-macos の delete 実装（TASK-114）待ちで、現状は部品の提供までである。
 - supervisor との違い: コードは共有しない（platform-macos は supervisor へ依存しない）。起動中の回転もしない。

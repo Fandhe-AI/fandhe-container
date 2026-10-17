@@ -24,6 +24,12 @@
 //! - シナリオ F（Landlock の Mount 識別子照合。#2071・CORE-5・SEC-1）: `linux.readonlyPaths` に `/dev` を足し、
 //!   記録（`RealPrePivotOps`）より後に `/dev` へ別のマウントが重なる起動が、Landlock 適用時の照合で拒否されて
 //!   失敗し、状態が Created のまま子が残らないことを照合する。記録と一致する側はシナリオ A・D の成功が担う
+//! - シナリオ G（devtmpfs の bind 拒否。#2129・SEC-1）: ホストの `/dev`（fstype `devtmpfs`。`f_type` は tmpfs と同じで見分けられない）を
+//!   `bind` / `rbind` で元にした start が、付け替えた自分のマウントの mountinfo の fstype 名で拒否される。起動は失敗し、
+//!   状態が Created のまま子が残らず、後始末で bind 先（rootfs 内の `/data`）が残らないことを照合する
+//! - シナリオ H（start 後の状態ルート移動。#2129・SEC-1）: start が状態ルートを固定した後、launcher が子を作る前に
+//!   状態ルートを別名へ改名して同じパスに別の inode の複製を置くと、適用の段が記録パスを辿り直して食い違いを検出し fail-closed で拒否する。
+//!   状態ルートが動かない場合に受理される側はシナリオ D が担う。状態が Created のまま子が残らず、bind 先も残らないことを照合する
 //! - root で実行された場合: 主経路は非 root（SEC-5）。launch が拒否され、状態が Created に戻り、子が残らないことだけを
 //!   照合する（コンテナ内 root をホスト root へ写す起動は試さない）
 //!
@@ -118,6 +124,11 @@ mod linux {
         StateStore, TraitError,
     };
     use serde_json::json;
+
+    /// launcher が子を作る直前（`cgroup_join_source` の呼び出し時。start の検証より後）に 1 回だけ実行する処理
+    /// （シナリオ H が状態ルートを改名する。#2129）。
+    type PreSpawnHook = Box<dyn FnOnce() + Send>;
+    static PRE_SPAWN_HOOK: std::sync::Mutex<Option<PreSpawnHook>> = std::sync::Mutex::new(None);
 
     /// コンテナ内の hostname（config と照合する固有値）。
     const HOSTNAME: &str = "fandhe-prod-launcher";
@@ -603,7 +614,16 @@ mod linux {
         let launcher = ProductionLauncher::builder()
             .privilege(IsolationPrivilege::RootlessSingleId)
             .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
-            .cgroup_join_source(move || join_container.join_hook())
+            .cgroup_join_source(move || {
+                let hook = PRE_SPAWN_HOOK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(hook) = hook {
+                    hook();
+                }
+                join_container.join_hook()
+            })
             .build()
             .expect("build production launcher");
         let launcher: Arc<dyn ProcessLauncher> = Arc::new(launcher);
@@ -624,6 +644,8 @@ mod linux {
         scenario_d_bind_mount(&env, tag);
         scenario_e_state_root_bind_refused(&env, tag);
         scenario_f_landlock_mount_identity_swapped(&env, tag);
+        scenario_g_devtmpfs_bind_refused(&env, tag);
+        scenario_h_state_root_moved_after_start(&env, tag);
     }
 
     /// シナリオ A: 正常起動。
@@ -988,6 +1010,168 @@ mod linux {
         );
         println!(
             "production_launcher: scenario=landlock-mount-swapped code={:?} state=created children=0",
+            err.code()
+        );
+    }
+
+    /// シナリオ G: ホストの `/dev`（devtmpfs）を `bind` / `rbind` の元にした start は、付け替えた自分のマウントの
+    /// fstype 名（`devtmpfs`）で拒否され、後始末で bind 先が残らない（SEC-1・#2129）。`f_type` は tmpfs と同じ値の
+    /// ため `fstatfs` の判定では通り、mountinfo の照合だけが拒否する。拒否理由そのものは `exec::bind_mounts` の
+    /// 単体試験が照合する（launch 中の拒否は pivot 後の子で起き、状態 pipe では親へ届かない。シナリオ F と同じ）。
+    fn scenario_g_devtmpfs_bind_refused(env: &Env, tag: u32) {
+        // 前提: ホストの `/dev` が devtmpfs であること（そうでない環境では本シナリオは意味を持たないため失敗させる）。
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        assert!(
+            mountinfo.lines().any(|l| {
+                let (pre, post) = l.split_once(" - ").unwrap_or((l, ""));
+                pre.split(' ').nth(4) == Some("/dev") && post.starts_with("devtmpfs ")
+            }),
+            "host /dev must be a devtmpfs mount for scenario G"
+        );
+        for label in ["bind", "rbind"] {
+            let bundle = Bundle::new("g");
+            let ld = make_rootfs(&bundle.rootfs(), true);
+            let mounts = json!([{
+                "destination": BIND_DEST,
+                "type": "bind",
+                "source": "/dev",
+                "options": [label, "rw"]
+            }]);
+            write_config(&bundle, &ld, &["--with-bind"], mounts);
+            let id = ContainerId::new(format!("plg{label}{tag}")).expect("id");
+            do_create(env, &bundle, &id);
+
+            wait_single_thread();
+            let err = match start(
+                &env.store,
+                &env.recorder,
+                &env.launcher,
+                &StartRequest::new(id.clone()),
+                &timeouts(),
+            ) {
+                Ok(_) => panic!("start must refuse a devtmpfs bind source ({label})"),
+                Err(e) => e,
+            };
+            assert_ne!(err.code(), ErrorCode::Timeout, "{}", err.message());
+            assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+            assert!(!env.launcher.last_launch_may_have_left_process());
+            assert!(
+                eventually(|| children_of_self().is_empty()),
+                "no process may remain after a refused launch ({label}): {:?}",
+                children_of_self()
+            );
+            // 後始末: 適用の段が rootfs 内に作った bind 先は取り除かれている。
+            assert!(
+                !bundle
+                    .rootfs()
+                    .join(BIND_DEST.trim_start_matches('/'))
+                    .exists(),
+                "the bind destination must be rolled back ({label})"
+            );
+            println!(
+                "production_launcher: scenario=devtmpfs-bind-refused kind={label} code={:?} state=created children=0 dest-removed",
+                err.code()
+            );
+        }
+    }
+
+    /// ディレクトリ木を別の場所へ複製する（通常ファイルとディレクトリのみ。権限を引き継ぐ）。
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir(to).expect("create copy dir");
+        let mode = std::fs::metadata(from)
+            .expect("stat source dir")
+            .permissions();
+        std::fs::set_permissions(to, mode).expect("chmod copy dir");
+        for entry in std::fs::read_dir(from).expect("read source dir") {
+            let entry = entry.expect("dir entry");
+            let target = to.join(entry.file_name());
+            let kind = entry.file_type().expect("file type");
+            if kind.is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else if kind.is_file() {
+                std::fs::copy(entry.path(), &target).expect("copy file");
+            } else {
+                panic!("unexpected entry kind in state root: {:?}", entry.path());
+            }
+        }
+    }
+
+    /// シナリオ H: start が状態ルートを固定した後（launcher が子を作る直前）に状態ルートが改名されると、適用の段が
+    /// 記録したパスを辿り直して食い違いを検出し、bind mount を行わず拒否する（SEC-1・#2129）。元は状態ルートと
+    /// 無関係なディレクトリで、改名が無ければ受理される（シナリオ D と同じ構成）。子を作る前に 1 回だけ、状態ルートを
+    /// 別名へ改名し、同じパスへ内容を複製した別の inode のディレクトリを置く（start の後始末が同じパスの状態ストアを
+    /// 使い続けられるようにするため。固定した実体は改名先に残る）。
+    fn scenario_h_state_root_moved_after_start(env: &Env, tag: u32) {
+        let src = Bundle::new("h-src");
+        let bundle = Bundle::new("h");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        let mounts = json!([{
+            "destination": BIND_DEST,
+            "type": "bind",
+            "source": src.dir.to_str().expect("utf8 source path"),
+            "options": ["bind", "rw"]
+        }]);
+        write_config(&bundle, &ld, &["--with-bind"], mounts);
+        let id = ContainerId::new(format!("plh{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        let state_root = env._root.dir.join("state");
+        let moved = env._root.dir.join("state-moved");
+        {
+            let (from, to) = (state_root.clone(), moved.clone());
+            *PRE_SPAWN_HOOK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(move || {
+                std::fs::rename(&from, &to).expect("rename state root after start");
+                copy_tree(&to, &from);
+            }));
+        }
+        wait_single_thread();
+        let result = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        );
+        // 固定した実体（改名先）は不要になる。同じパスの複製が以降の状態ルートになる。
+        let renamed = moved.exists();
+        if renamed {
+            std::fs::remove_dir_all(&moved).expect("remove the renamed original state root");
+        }
+        assert!(
+            renamed,
+            "the pre-spawn hook must have renamed the state root"
+        );
+        let err = match result {
+            Ok(_) => panic!("start must refuse when the state root moved after start"),
+            Err(e) => e,
+        };
+        assert_ne!(err.code(), ErrorCode::InvalidArgument, "{}", err.message());
+        assert_ne!(err.code(), ErrorCode::Timeout, "{}", err.message());
+        assert!(!env.launcher.last_launch_may_have_left_process());
+        assert!(
+            eventually(|| children_of_self().is_empty()),
+            "no process may remain after a refused launch: {:?}",
+            children_of_self()
+        );
+        assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+        assert!(
+            std::fs::read_dir(&src.dir)
+                .expect("read bind source")
+                .next()
+                .is_none(),
+            "nothing may be written to the bind source"
+        );
+        assert!(
+            !bundle
+                .rootfs()
+                .join(BIND_DEST.trim_start_matches('/'))
+                .exists(),
+            "no bind destination may remain"
+        );
+        println!(
+            "production_launcher: scenario=state-root-moved-after-start code={:?} state=created children=0",
             err.code()
         );
     }

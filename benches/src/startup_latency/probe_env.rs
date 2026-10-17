@@ -85,10 +85,16 @@ pub fn classify_host_kind(sig: &HostSignals, arch: &str) -> &'static str {
         return "wsl2";
     }
     let dmi_text = [lower(&sig.sys_vendor), lower(&sig.product_name)];
-    let dmi_vm = dmi_text
-        .iter()
-        .flatten()
-        .any(|t| VM_DMI_MARKERS.iter().any(|m| t.contains(m)));
+    // EC2 のベアメタル（`*.metal`）は sys_vendor が Amazon EC2 でも仮想化ではない。
+    // その場合は Amazon の印を無視し、hypervisor フラグ等の他の根拠で決める（REPAIR-8）。
+    let ec2_metal = lower(&sig.sys_vendor).is_some_and(|v| v.contains("amazon ec2"))
+        && lower(&sig.product_name).is_some_and(|p| p.contains(".metal"));
+    let dmi_vm = dmi_text.iter().flatten().any(|t| {
+        VM_DMI_MARKERS
+            .iter()
+            .filter(|m| !(ec2_metal && **m == "amazon ec2"))
+            .any(|m| t.contains(m))
+    });
     let hv_type = sig
         .hypervisor_type
         .as_deref()
@@ -166,6 +172,23 @@ mod tests {
             cpuinfo_hypervisor_flag: Some(true),
             ..HostSignals::default()
         };
+        assert_eq!(classify_host_kind(&sig, "x86_64"), "vm");
+    }
+
+    /// REPAIR-8: EC2 のベアメタル（.metal）は vm と判定しない。フラグ無しなら bare-metal、フラグ不明なら unknown。
+    #[test]
+    fn ec2_metal_is_not_vm() {
+        let mut sig = HostSignals {
+            sys_vendor: s("Amazon EC2"),
+            product_name: s("m5.metal"),
+            cpuinfo_hypervisor_flag: Some(false),
+            ..HostSignals::default()
+        };
+        assert_eq!(classify_host_kind(&sig, "x86_64"), "bare-metal");
+        sig.cpuinfo_hypervisor_flag = None;
+        assert_eq!(classify_host_kind(&sig, "x86_64"), "unknown");
+        sig.product_name = s("m5.large");
+        sig.cpuinfo_hypervisor_flag = Some(false);
         assert_eq!(classify_host_kind(&sig, "x86_64"), "vm");
     }
 

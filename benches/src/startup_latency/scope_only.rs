@@ -17,7 +17,7 @@ use super::args::ScopePlan;
 use super::bin_check::{verify_executable, verify_output_target};
 use super::measure::{
     CGROUP_GC_GRACE, CLEANUP_TIMEOUT, ExitWait, block_error, deadline_exceeded, find_dir,
-    interrupted, interrupted_error, kill_and_drain, wait_for_exit, wait_until,
+    interrupted, interrupted_error, kill_and_drain, wait_for_exit_observed, wait_until,
 };
 use super::output::ms;
 use super::probe_env::{detect_host_kind, effective_uid};
@@ -33,6 +33,8 @@ use std::time::{Duration, Instant};
 const METHOD: &str = "scope-only/systemd-run-user-scope/noop";
 /// 1 試行で子（`systemd-run` と noop）の終了を待つ上限。自明なコマンドなので本計測の `EXIT_TIMEOUT` より短い。
 const TRIAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// 終了待ちの try_wait の間隔。本計測（20 ms）より細かくして終点の量子化を抑える。
+const SCOPE_POLL: Duration = Duration::from_millis(1);
 
 /// 1 回の起動の結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,7 +49,8 @@ enum OneRun {
 
 /// 実機依存部分（起動と後始末の確認）。筋書きの試験では差し替える（REPAIR-12）。
 trait ScopeHost {
-    fn run_one(&self, unit: &str, timeout: Duration) -> OneRun;
+    /// 起動から終了を観測した直後までの経過時間も返す（待機の眠りを含めない。CORE-10）。
+    fn run_one(&self, unit: &str, timeout: Duration) -> (OneRun, Duration);
     /// scope の cgroup が消えている（または落として消えた）なら `true`。確認できなければ `false`（fail-closed）。
     fn settle(&self, unit: &str) -> bool;
 }
@@ -113,9 +116,7 @@ fn run_trials<H: ScopeHost>(
                 .saturating_duration_since(now)
                 .max(Duration::from_secs(1)),
         );
-        let t0 = Instant::now();
-        let run = host.run_one(&unit, timeout);
-        let elapsed = t0.elapsed();
+        let (run, elapsed) = host.run_one(&unit, timeout);
         // 起動できなかった場合も scope が残っていないことを確かめる。
         let settled = host.settle(&unit);
         let mut stop = !settled;
@@ -135,11 +136,15 @@ fn run_trials<H: ScopeHost>(
         if !settled {
             failures.cleanup += 1;
         }
+        // 中断で早期 return しても残存 unit を失わないよう、先に記録して stderr へ出す（REPAIR-4・REPAIR-5）。
+        if stop {
+            eprintln!("startup_latency: leftover resource {unit}");
+            leftover_ids.push(unit);
+        }
         if interrupted() {
             return Err(interrupted_error());
         }
         if stop {
-            leftover_ids.push(unit);
             break;
         }
         if Instant::now() > deadline {
@@ -229,14 +234,15 @@ impl RealHost {
 }
 
 impl ScopeHost for RealHost {
-    fn run_one(&self, unit: &str, timeout: Duration) -> OneRun {
+    fn run_one(&self, unit: &str, timeout: Duration) -> (OneRun, Duration) {
+        let t0 = Instant::now();
         let Some(mut cmd) = scoped_noop_command(
             &self.systemd_run,
             unit,
             &self.program,
             &self.xdg_runtime_dir,
         ) else {
-            return OneRun::SpawnFailed;
+            return (OneRun::SpawnFailed, t0.elapsed());
         };
         // 親がブロックした中断シグナルを子へ継承させない。
         sys::unblock_termination_signals_in_child(&mut cmd);
@@ -247,11 +253,14 @@ impl ScopeHost for RealHost {
             .process_group(0)
             .spawn()
         else {
-            return OneRun::SpawnFailed;
+            return (OneRun::SpawnFailed, t0.elapsed());
         };
-        match wait_for_exit(&mut child, timeout) {
-            ExitWait::Exited(code) => OneRun::Exited(code),
-            ExitWait::TimedOut { reaped } => OneRun::TimedOut { reaped },
+        // 終点は終了を観測した直後の時刻。眠りの粒度を 1 ms に絞り、量子化を小さくする。
+        let (wait, observed) = wait_for_exit_observed(&mut child, timeout, SCOPE_POLL);
+        let elapsed = observed.saturating_duration_since(t0);
+        match wait {
+            ExitWait::Exited(code) => (OneRun::Exited(code), elapsed),
+            ExitWait::TimedOut { reaped } => (OneRun::TimedOut { reaped }, elapsed),
         }
     }
 
@@ -340,14 +349,15 @@ mod tests {
     }
 
     impl ScopeHost for Script {
-        fn run_one(&self, unit: &str, _timeout: Duration) -> OneRun {
+        fn run_one(&self, unit: &str, _timeout: Duration) -> (OneRun, Duration) {
             self.units.borrow_mut().push(unit.to_string());
             let mut r = self.runs.borrow_mut();
-            if r.is_empty() {
+            let run = if r.is_empty() {
                 OneRun::Exited(Some(0))
             } else {
                 r.remove(0)
-            }
+            };
+            (run, Duration::from_millis(5))
         }
         fn settle(&self, _unit: &str) -> bool {
             self.settle
@@ -440,5 +450,13 @@ mod tests {
         let e = run_trials(&host, &plan(20, 0), "n0", Instant::now()).expect_err("expired");
         assert_eq!(e.code, "deadline-exceeded");
         assert!(host.units.borrow().is_empty());
+    }
+
+    /// REPAIR-4・REPAIR-5: 中断が保留でも、残存 unit を記録してから中断を返す（stderr に出る）。ここでは通常経路の記録を確認する。
+    #[test]
+    fn standard_run_reports_elapsed_from_host() {
+        let host = Script::new(vec![], true);
+        let o = go(&host, &plan(3, 0)).expect("run");
+        assert!(o.samples.iter().all(|d| *d == Duration::from_millis(5)));
     }
 }

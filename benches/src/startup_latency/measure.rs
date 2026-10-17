@@ -160,28 +160,39 @@ fn recv_report(
 
 /// 子の終了を期限つきで待つ。超過したら kill して回収を `REAP_TIMEOUT` まで待つ（REPAIR-5）。
 pub(super) fn wait_for_exit(child: &mut Child, timeout: Duration) -> ExitWait {
+    wait_for_exit_observed(child, timeout, POLL).0
+}
+
+/// `wait_for_exit` と同じ待ちで、終了を観測した直後の時刻も返す（`poll` は try_wait の間隔）。
+/// 診断（scope-only。CORE-10・REPAIR-8）が、待機の眠りを含めずに終点を標本へ使うために使う。
+/// 期限切れ・待ちの失敗では時刻は意味を持たない（呼び出し側は標本にしない）。
+pub(super) fn wait_for_exit_observed(
+    child: &mut Child,
+    timeout: Duration,
+    poll: Duration,
+) -> (ExitWait, Instant) {
     let until = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return ExitWait::Exited(status.code()),
+            Ok(Some(status)) => return (ExitWait::Exited(status.code()), Instant::now()),
             Ok(None) => {}
-            Err(_) => return ExitWait::TimedOut { reaped: false },
+            Err(_) => return (ExitWait::TimedOut { reaped: false }, Instant::now()),
         }
         // 中断シグナルを受けたら期限を待たずに kill へ進む（呼び出し側が回収と後始末を続ける）。
         if Instant::now() >= until || interrupted() {
             break;
         }
-        std::thread::sleep(POLL);
+        std::thread::sleep(poll);
     }
     let _ = child.kill();
     let reap_until = Instant::now() + REAP_TIMEOUT;
     while Instant::now() < reap_until {
         if matches!(child.try_wait(), Ok(Some(_))) {
-            return ExitWait::TimedOut { reaped: true };
+            return (ExitWait::TimedOut { reaped: true }, Instant::now());
         }
-        std::thread::sleep(POLL);
+        std::thread::sleep(poll);
     }
-    ExitWait::TimedOut { reaped: false }
+    (ExitWait::TimedOut { reaped: false }, Instant::now())
 }
 
 /// `ErrorKind::NotFound` か、走査中にプロセスが消えたことを示す `ESRCH`（raw os error 3）か。

@@ -58,3 +58,24 @@ ln -sf ~/.local/libexec/fandhe-container/fandhe-container ~/.local/bin/fandhe-co
 - `~/.local/bin` が `PATH` に入っていなければ追加する
 - 置き場所とその祖先は、他の利用者が書き込めないようにする（g/o 書き込み不可）。CLI と supervisor の間に権限の境界は無いが、他人が書ける場所に置くとファイルを差し替えられる
 - 更新するときは CLI と supervisor を同じ版で置き直す
+
+## 起動の前提（systemd の user マネージャ）
+
+rootless の `start` は supervisor を `systemd-run --user --scope` で包んで起動する（CORE-3・CORE-4）。次を満たす環境が前提になる。
+
+- `systemd-run` が固定の場所（`/usr/sbin`・`/usr/bin`・`/sbin`・`/bin`・NixOS の `/run/current-system/sw/bin`）にある。`PATH` は探さない。実体が root か実行ユーザー所有の通常ファイルで、group / other から書き込めず、祖先ディレクトリも同じ条件であること（plugin の信頼の基準 PLUG-11 と同じ。sticky bit は例外にしない）。マルチユーザー構成の Nix の `/nix/store`（group 書き込み可・sticky）は祖先として拒否される可能性があり、実機では確かめていない
+- `XDG_RUNTIME_DIR` が絶対パスで、`$XDG_RUNTIME_DIR/systemd/private` に自分のソケットがある（systemd のログインセッションまたは `loginctl enable-linger` で user マネージャが動いている）
+
+満たしているかは読み取り専用の診断で確かめられる。
+
+```bash
+fandhe-container doctor
+```
+
+診断は stdout に JSON Lines で出る（`code` と対処 `remediation` つき）。終了コードは、前提が満たされない警告があれば 3、判定できなければ 4、問題がなければ 0 である。root で実行すると検査を省く。
+
+`delete` は cgroup の配置を記録したコンテナを消すとき、実行中の cgroup が委譲されている必要がある。通常のログインセッション（SSH・TTY ログイン）の cgroup は委譲されていないため、そのまま実行すると失敗する。委譲されたスコープの中で実行する。
+
+```bash
+systemd-run --user --scope -p Delegate=yes -- fandhe-container delete <id>
+```

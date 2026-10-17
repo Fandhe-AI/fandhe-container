@@ -266,8 +266,8 @@ pub(super) fn decide_entrypoint_mode(
     EntrypointExecMode::PinnedInode { reason }
 }
 
-/// securityfs の `statfs.f_type`（include/uapi/linux/magic.h の `SECURITYFS_MAGIC`。アーキテクチャ非依存）。
-const SECURITYFS_MAGIC: i64 = 0x7363_6673;
+// securityfs の `statfs.f_type` は `sys::SECURITYFS_MAGIC`（#2129 でローカルの二重定義を廃止）。対応外アーキテクチャでは
+// 値が 0 になり、`read_capped_on` が `InvalidData` を返して LSM 一覧を読めない扱い（現行方式）に倒れる（fail-closed）。
 
 /// `path` を開き、開いた fd のファイルシステムが `magic`（`sys::fs_type`）であることを確かめてから `cap` バイトまで
 /// 読む（#1579 の独立監査 P3-2。`/sys/kernel/security` に別の FS が載った環境で、固定の内容を読んで判定を誤らない。
@@ -304,7 +304,7 @@ impl SealPolicy {
     pub(super) fn probe() -> Self {
         let lsm = assess_lsm_environment(read_capped_on(
             "/sys/kernel/security/lsm",
-            SECURITYFS_MAGIC,
+            sys::SECURITYFS_MAGIC,
             4096,
         ));
         Self {
@@ -755,14 +755,18 @@ mod tests {
     /// `/proc/self/status` は procfs の magic なら読め、securityfs の magic を期待すると `InvalidData` で拒否される。
     #[test]
     fn sec1_read_capped_on_checks_the_filesystem() {
-        assert_eq!(SECURITYFS_MAGIC, 0x7363_6673);
+        assert_eq!(sys::SECURITYFS_MAGIC, 0x7363_6673);
         let text = read_capped_on("/proc/self/status", sys::PROC_MAGIC, 64 * 1024).expect("procfs");
         assert!(text.starts_with("Name:"), "{text}");
-        let err = read_capped_on("/proc/self/status", SECURITYFS_MAGIC, 64 * 1024)
+        let err = read_capped_on("/proc/self/status", sys::SECURITYFS_MAGIC, 64 * 1024)
             .expect_err("not securityfs");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(
-            assess_lsm_environment(read_capped_on("/proc/self/status", SECURITYFS_MAGIC, 4096)),
+            assess_lsm_environment(read_capped_on(
+                "/proc/self/status",
+                sys::SECURITYFS_MAGIC,
+                4096
+            )),
             LsmEnvironment::Refuse(SealedCopyUnavailable::LsmListUnreadable)
         );
     }

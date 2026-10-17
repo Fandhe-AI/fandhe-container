@@ -937,7 +937,7 @@ fn validate_bind_mounts(
         ));
     };
     if let Some(first) = roots.first_mut() {
-        *first = first.clone().with_inode_chain(chain);
+        *first = first.clone().with_inode_chain(state_real.to_owned(), chain);
     }
     // rootfs・bundle の実体も保護する。rbind が公開する子マウントが別名で rootfs・bundle を含む場合を拒否する（SEC-1）。
     let mut contained = Vec::with_capacity(2);
@@ -2142,6 +2142,9 @@ mod tests {
             Some(&(meta.dev(), meta.ino()))
         );
         assert!(first_state.inode_chain().len() >= 2);
+        // 適用の段が辿り直すホスト側パス（#2129）。
+        let real = std::fs::canonicalize(std::env::temp_dir()).expect("canonical");
+        assert_eq!(first_state.chain_path(), real.to_str());
     }
 
     /// SEC-4（#1915）: 設定の検証での拒否は launcher の sink へ宛先のみで 1 件記録される。sink が無くても

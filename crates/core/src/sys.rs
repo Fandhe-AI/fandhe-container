@@ -351,7 +351,7 @@ mod consts {
     pub const CGROUP_SUPER_MAGIC: i64 = 0x0027_e0eb;
     // include/uapi/linux/magic.h の `BPF_FS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
-    // fs/configfs/mount.c の `CONFIGFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    // fs/configfs/mount.c:23（Linux v7.0 で確認。#2129）の `CONFIGFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const CONFIGFS_MAGIC: i64 = 0x6265_6570;
     // include/uapi/linux/magic.h の `PSTOREFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const PSTOREFS_MAGIC: i64 = 0x6165_676c;
@@ -363,7 +363,7 @@ mod consts {
     pub const SMACK_MAGIC: i64 = 0x4341_5d53;
     // include/uapi/linux/magic.h の `BINFMTFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const BINFMTFS_MAGIC: i64 = 0x4249_4e4d;
-    // fs/fuse/control.c の `FUSE_CTL_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    // fs/fuse/control.c:16（Linux v7.0 で確認。#2129）の `FUSE_CTL_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const FUSE_CTL_SUPER_MAGIC: i64 = 0x6573_5543;
     // include/uapi/linux/magic.h の `RDTGROUP_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const RDTGROUP_SUPER_MAGIC: i64 = 0x0765_5821;
@@ -371,7 +371,7 @@ mod consts {
     pub const XENFS_SUPER_MAGIC: i64 = 0xabba_1974;
     // include/uapi/linux/magic.h の `NSFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const NSFS_MAGIC: i64 = 0x6e73_6673;
-    // ipc/mqueue.c の `MQUEUE_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    // ipc/mqueue.c:50（Linux v7.0 で確認。#2129）の `MQUEUE_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const MQUEUE_MAGIC: i64 = 0x1980_0202;
     // include/uapi/linux/magic.h の `BINDERFS_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const BINDERFS_SUPER_MAGIC: i64 = 0x6c6f_6f70;
@@ -688,7 +688,7 @@ mod consts {
     pub const CGROUP_SUPER_MAGIC: i64 = 0x0027_e0eb;
     // include/uapi/linux/magic.h の `BPF_FS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const BPF_FS_MAGIC: i64 = 0xcafe_4a11;
-    // fs/configfs/mount.c の `CONFIGFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    // fs/configfs/mount.c:23（Linux v7.0 で確認。#2129）の `CONFIGFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const CONFIGFS_MAGIC: i64 = 0x6265_6570;
     // include/uapi/linux/magic.h の `PSTOREFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const PSTOREFS_MAGIC: i64 = 0x6165_676c;
@@ -700,7 +700,7 @@ mod consts {
     pub const SMACK_MAGIC: i64 = 0x4341_5d53;
     // include/uapi/linux/magic.h の `BINFMTFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const BINFMTFS_MAGIC: i64 = 0x4249_4e4d;
-    // fs/fuse/control.c の `FUSE_CTL_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    // fs/fuse/control.c:16（Linux v7.0 で確認。#2129）の `FUSE_CTL_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const FUSE_CTL_SUPER_MAGIC: i64 = 0x6573_5543;
     // include/uapi/linux/magic.h の `RDTGROUP_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const RDTGROUP_SUPER_MAGIC: i64 = 0x0765_5821;
@@ -708,7 +708,7 @@ mod consts {
     pub const XENFS_SUPER_MAGIC: i64 = 0xabba_1974;
     // include/uapi/linux/magic.h の `NSFS_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const NSFS_MAGIC: i64 = 0x6e73_6673;
-    // ipc/mqueue.c の `MQUEUE_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
+    // ipc/mqueue.c:50（Linux v7.0 で確認。#2129）の `MQUEUE_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const MQUEUE_MAGIC: i64 = 0x1980_0202;
     // include/uapi/linux/magic.h の `BINDERFS_SUPER_MAGIC`（疑似 FS の `statfs.f_type`。bind mount の元の拒否に使う。#2098）。
     pub const BINDERFS_SUPER_MAGIC: i64 = 0x6c6f_6f70;

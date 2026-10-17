@@ -47,6 +47,36 @@
 //! ため、本テストは公開の `NetlinkRouteSocket::request` と `NlMsgBuilder` で `RTM_SETLINK` を組んで送る。
 //! 接続は `RTM_GETLINK` 応答の `IFLA_MASTER` が bridge の ifindex と一致することで具体値照合する。
 //!
+//! # router の lo
+//!
+//! router は自分の netns の `lo` を up にする。(c) のルール投入前に、ホスト自身が外側アドレス
+//! （`HOST_OUTER`）宛てに送る UDP を自分の待受が受ける場面があるため（#1927・#2078）。
+//!
+//! 仕組みは Linux v7.0（タグの commit `028ef9c96e96197026887c0f092424679298aae8`）のソースで確かめた。
+//! 行番号は版で動くためファイル名と関数名だけを挙げる。
+//!
+//! - 経路の解決: 付けたアドレスの /32 の `RTN_LOCAL` 経路は、デバイスが down でも `fib_add_ifaddr`
+//!   （`net/ipv4/fib_frontend.c`）が local 表へ入れる。`ip_route_output_key_hash_rcu`
+//!   （`net/ipv4/route.c`）は `RTN_LOCAL` の分岐で出口を `net->loopback_dev` にする。アドレスが
+//!   `lo` 以外（本試験では `fpe0`）に付いていても、自己宛ての送信は `lo` を経由する。出口を明示した
+//!   場合（`SO_BINDTODEVICE` 等）だけ `IFF_UP` を見て `-ENETUNREACH` を返す分岐があるが、本試験は
+//!   出口を指定しないので通らない。
+//! - 破棄の場所: `lo` は `IFF_NO_QUEUE`（`drivers/net/loopback.c` の `loopback_setup`）。一度も up に
+//!   していない新規 netns の `lo` は、`dev_activate`（`net/sched/sch_generic.c`）が未実行で
+//!   qdisc が `noop_qdisc` のまま。`__dev_queue_xmit` / `__dev_xmit_skb`（`net/core/dev.c`）はそれの
+//!   `noop_enqueue` を呼び、`noop_enqueue` は `tx_dropped` を数えて skb を捨て `NET_XMIT_CN` を返す。
+//!   `dev_queue_xmit` の `IFF_UP` 検査は、noqueue の直接送信の経路にあり、down のときは到達しない。
+//! - 送信側から見える結果: `net_xmit_errno(NET_XMIT_CN)` は 0 のため `sendto` は成功を返す（仮に
+//!   `-ENOBUFS` を返す分岐を通っても、`udp_send_skb` は `IP_RECVERR` が無ければ 0 にする）。
+//!   受信側には届かず、`set_read_timeout` の受信は期限切れになる。
+//! - 関係しないもの: 捨てられるのは送信側の qdisc で、受信の入力経路の解決
+//!   （`ip_rcv_finish_core`。`fib_validate_source` つまり `rp_filter` はここ）より前である。経路表も
+//!   上のとおり正しく解決される。どちらも原因ではない。
+//!
+//! 子は自己宛て配送が無いため `lo` を触らない。`lo` の up も隔離 netns の中に閉じ host は変えない。
+//! 製品コードは `network.rs` の `configure_in_netns`（`AttachStep::ConfigureLoopback`）で `lo` を up に
+//! するため、試験側の up で足りる。
+//!
 //! ip_forward・nft ルール・bridge・veth はすべて隔離 netns の中に閉じ、host の設定は変えない。待ちは
 //! すべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・
 //! `unshare`・カーネルモジュール）を満たさない場合は skip せず失敗する。
@@ -84,9 +114,9 @@ mod linux {
     use fandhe_container_net::error::{NetError, NetErrorCode};
     use fandhe_container_net::netlink::AttrIter;
     use fandhe_container_net::netlink_route::{
-        AddrScope, AddressSpec, IFINFOMSG_LEN, IFLA_IFNAME, IfIndex, IfName, IpPrefix, LinkCreate,
-        LinkRef, LinkSet, NetlinkRouteSocket, NetnsPid, NetnsTarget, NlMsgBuilder, RTM_GETLINK,
-        RTM_NEWLINK, RTM_SETLINK, RouteNextHop, RouteSpec,
+        AddrScope, AddressSpec, IFF_UP, IFINFOMSG_LEN, IFLA_IFNAME, IfIndex, IfName, IpPrefix,
+        LinkCreate, LinkRef, LinkSet, NetlinkRouteSocket, NetnsPid, NetnsTarget, NlMsgBuilder,
+        RTM_GETLINK, RTM_NEWLINK, RTM_SETLINK, RouteNextHop, RouteSpec,
     };
     use fandhe_container_net::nftables_batch::{
         BaseChain, ChainCreate, ChainType, NF_IP_PRI_NAT_DST, NF_IP_PRI_NAT_SRC,
@@ -115,6 +145,8 @@ mod linux {
     const HOST_OUTER: Ipv4Addr = Ipv4Addr::new(10, 212, 2, 1);
     const EXTERNAL_ADDR: Ipv4Addr = Ipv4Addr::new(10, 212, 2, 2);
     const BRIDGE: &str = "fbr0";
+    /// router の netns のループバック。自己宛て配送の出口になる（`//!` の「router の lo」、#1927・#2078）。
+    const LO: &str = "lo";
     const PC1: &str = "fpc1";
     const CC1: &str = "fcc1";
     const PC2: &str = "fpc2";
@@ -289,6 +321,25 @@ mod linux {
             b.put_attr(IFLA_MASTER, &master.get().to_ne_bytes())
         })?;
         Ok(())
+    }
+
+    /// `RTM_GETLINK` 応答の `ifi_flags` を返す。
+    fn get_link_flags(sock: &NetlinkRouteSocket, name: &str) -> Result<u32, NetError> {
+        let payload = get_link_payload(sock, name)?;
+        let raw = payload
+            .get(8..12)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+            .ok_or_else(|| NetError::new(NetErrorCode::Internal, "short ifinfomsg in reply"))?;
+        Ok(u32::from_ne_bytes(raw))
+    }
+
+    /// router の `lo` が up であることを具体値（`IFF_UP`）で照合する。
+    fn assert_lo_up(sock: &NetlinkRouteSocket, why: &str) {
+        let flags = get_link_flags(sock, LO).expect("lo flags");
+        assert!(
+            flags & IFF_UP != 0,
+            "router lo must be up ({why}); flags={flags:#x}"
+        );
     }
 
     /// `RTM_GETLINK` 応答の `IFLA_MASTER`（接続先 bridge の ifindex）を返す。未接続なら `None`。
@@ -738,6 +789,11 @@ mod linux {
         external.expect_prefix("ready");
 
         let sock = NetlinkRouteSocket::open().expect("open netlink route socket");
+        // 新規 netns の lo は down。自己宛て（HOST_OUTER 宛て）は RTN_LOCAL で lo が出口になり、down の
+        // lo の noop qdisc（noop_enqueue）が黙って捨てる。sendto は成功し受信は期限切れになる。
+        // 根拠は `//!` の「router の lo」（Linux v7.0 で確認。#1927・#2078）。
+        configure_router_side(&sock, LO, None);
+        assert_lo_up(&sock, "after link up");
         sock.create_link(&LinkCreate::bridge(ifname(BRIDGE)), timeout())
             .expect("create bridge");
         for (host_side, child_side) in [(PC1, CC1), (PC2, CC2), (PE, EX)] {
@@ -815,6 +871,7 @@ mod linux {
             "path (b) before rules"
         );
         // (c) 投入前: 外側アドレス宛ては DNAT されずホスト自身に届く。
+        assert_lo_up(&sock, "local delivery to HOST_OUTER goes through lo");
         let pc0 = host_sends(&mut host_held, HOST_OUTER, (HOST_OUTER, HOST_PORT));
         track(pc0, &mut host_ports);
         let c_before = router_receives(&host_sock);

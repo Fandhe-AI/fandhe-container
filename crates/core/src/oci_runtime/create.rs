@@ -26,7 +26,7 @@
 //!
 //! # スコープ外
 //!
-//! - プロセス起動（TASK-29.3 start）・namespace 分離・mount 適用
+//! - プロセス起動（TASK-29.3 start）・namespace 分離・mount 適用（bind は start と本番 launcher が適用する〔#1915〕。bind 以外の種類は未対応）
 //! - mounts の rootfs 内 symlink 解決（mount を適用する側の担当）
 //! - OCI-7 の参照テーブル登録（TASK-183 が TASK-29 完了後に組み込む）
 //! - ファイルベースの状態保存（TASK-31・OCI-5）

@@ -13,7 +13,7 @@
 //!
 //! - core の `OpRecorder` との接続アダプタ（`fandhe-container-plugin-cri` の担当。TASK-108）。それまでは
 //!   既定の [`NoopCriOpRecorder`] が使われ、記録先を注入しない限り何も出力されない
-//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`ListImages`・`ImageStatus`・`PullImage` 以外の RPC の種別は、RPC の実装（TASK-58.2 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
+//! - `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`・`ListContainers`・`ContainerStatus`・`ListImages`・`ImageStatus`・`PullImage` 以外の RPC の種別は、RPC の実装（TASK-58.4 以降・TASK-61.3 以降）と一緒に [`CriOpKind`] へ追加する
 //!
 //! # 機微情報
 //!
@@ -46,6 +46,14 @@ pub enum CriOpKind {
     CreateContainer,
     /// `RuntimeService.StartContainer` 1 回（created から running への遷移。CRI-1・TASK-58.1）。
     StartContainer,
+    /// `RuntimeService.StopContainer` 1 回（running から exited への遷移。CRI-1・TASK-58.2）。
+    StopContainer,
+    /// `RuntimeService.RemoveContainer` 1 回（記録の除去と枠の解放。CRI-1・TASK-58.2）。
+    RemoveContainer,
+    /// `RuntimeService.ListContainers` 1 回（読み取り専用の一覧。CRI-1・TASK-58.3）。
+    ListContainers,
+    /// `RuntimeService.ContainerStatus` 1 回（読み取り専用の状態照会。CRI-1・TASK-58.3）。
+    ContainerStatus,
     /// `ImageService.ListImages` 1 回（ローカルキャッシュの絞り込み一覧。CRI-4・TASK-61.1）。
     ListImages,
     /// `ImageService.ImageStatus` 1 回（ローカルキャッシュの単一参照解決。CRI-4・TASK-61.2）。
@@ -65,6 +73,10 @@ impl CriOpKind {
             CriOpKind::ListPodSandbox => "cri.list_pod_sandbox",
             CriOpKind::CreateContainer => "cri.create_container",
             CriOpKind::StartContainer => "cri.start_container",
+            CriOpKind::StopContainer => "cri.stop_container",
+            CriOpKind::RemoveContainer => "cri.remove_container",
+            CriOpKind::ListContainers => "cri.list_containers",
+            CriOpKind::ContainerStatus => "cri.container_status",
             CriOpKind::ListImages => "cri.list_images",
             CriOpKind::ImageStatus => "cri.image_status",
             CriOpKind::PullImage => "cri.pull_image",
@@ -272,7 +284,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    const ALL_KINDS: [CriOpKind; 10] = [
+    const ALL_KINDS: [CriOpKind; 14] = [
         CriOpKind::RunPodSandbox,
         CriOpKind::StopPodSandbox,
         CriOpKind::RemovePodSandbox,
@@ -280,6 +292,10 @@ mod tests {
         CriOpKind::ListPodSandbox,
         CriOpKind::CreateContainer,
         CriOpKind::StartContainer,
+        CriOpKind::StopContainer,
+        CriOpKind::RemoveContainer,
+        CriOpKind::ListContainers,
+        CriOpKind::ContainerStatus,
         CriOpKind::ListImages,
         CriOpKind::ImageStatus,
         CriOpKind::PullImage,
@@ -301,6 +317,10 @@ mod tests {
         assert_eq!(CriOpKind::ListPodSandbox.as_str(), "cri.list_pod_sandbox");
         assert_eq!(CriOpKind::CreateContainer.as_str(), "cri.create_container");
         assert_eq!(CriOpKind::StartContainer.as_str(), "cri.start_container");
+        assert_eq!(CriOpKind::StopContainer.as_str(), "cri.stop_container");
+        assert_eq!(CriOpKind::RemoveContainer.as_str(), "cri.remove_container");
+        assert_eq!(CriOpKind::ListContainers.as_str(), "cri.list_containers");
+        assert_eq!(CriOpKind::ContainerStatus.as_str(), "cri.container_status");
         assert_eq!(CriOpKind::ListImages.as_str(), "cri.list_images");
         assert_eq!(CriOpKind::ImageStatus.as_str(), "cri.image_status");
         assert_eq!(CriOpKind::PullImage.as_str(), "cri.pull_image");

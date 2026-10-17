@@ -22,7 +22,8 @@
 
 ## 想定済みの土台（導入時にバージョンをユーザー承認）
 
-- `libc` / `nix`（syscall・ioctl。MVM-4 が許容する permissive 依存）
+- `libc`（=0.2.189。用途は自前の FFI 宣言の機械照合に限り、dev-dependencies のみ。製品コードの syscall・ioctl は各 crate の `sys` の自前宣言で行う。#1318・2026-10-12 のオーナー判断）
+- `nix` は土台に含めない（どの crate も使っていない。2026-10-15 のオーナー判断で不採用。必要になったら改めて承認を得る。[from-scratch-policy](../../docs/design/from-scratch-policy.md)「不採用の記録」）
 - `objc2-virtualization`（macOS Virtualization.framework の橋渡し層の土台。MAC 系）
 - `windows-sys`（Windows API）
 

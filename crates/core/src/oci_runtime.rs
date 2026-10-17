@@ -20,11 +20,15 @@
 //! 出せる（TASK-96.2・TASK-96.3）。実 stderr への書き出しとプロセス終了は CLI 側（TASK-79・TASK-95）の
 //! 責務で未結線である（REPAIR-3）。
 //! launcher が fork 前に cgroup 要件を検査する関数 `require_cgroup_join`（#1814・CORE-3）も置く。
+//! `mounts[]` の bind mount の指定を検証済みの型へ変換する `bind_mounts`（#1911）は型と検証で、適用の段は `exec` に実装済み
+//! （#1912〜#1914）、`start` と本番 launcher へも結線済み（#1915。検証済みの集合は `LaunchSpec::bind_mounts` で渡る）。
+//! bind 以外の種類の `mounts[]` は未対応で `start` が拒否する（REPAIR-3）。
 //! 例外は start の rootfs 固定（`RootfsDir::pin`。`exec::open_dir_beneath` を使う。検証後の差し替えの違反は
 //! `RootfsPinError` で運び、exec の経路が監査ログの層 `mount` へ記録する。start の経路は記録しない〔#1314〕。#1702）と
 //! `ContainerChildProcess` で、`launch.rs` 内に `cfg(target_os = "linux")` で局所化している。Linux 以外の
 //! start は rootfs を固定できないため、起動前に `Unimplemented` で拒否する（fail-closed）。
 
+mod bind_mounts;
 mod cgroup_requirement;
 mod config;
 mod create;
@@ -34,8 +38,14 @@ mod kill;
 mod launch;
 mod launcher;
 mod mount_destination;
+pub(crate) mod mountinfo_identity;
 mod start;
 
+#[cfg(target_os = "linux")]
+pub(crate) use bind_mounts::ProtectedFsRoot;
+pub use bind_mounts::{
+    BindMountError, BindMountErrorKind, BindMountSet, BindMountSpec, audit_bind_mount_error,
+};
 pub use cgroup_requirement::{
     CgroupJoinMeans, CgroupRequirement, launch_after_cgroup_check, require_cgroup_join,
 };
@@ -70,6 +80,6 @@ pub use launch::{
 pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
 pub use mount_destination::{MountDestination, audit_mount_config_error};
 pub use start::{
-    LAUNCHER_REPLY_GRACE, StartedContainer, recover_interrupted_start, start,
-    take_unreaped_processes,
+    ClaimedStart, LAUNCHER_REPLY_GRACE, StartedContainer, claim_start, launch_claimed,
+    recover_interrupted_start, start, take_unreaped_processes,
 };

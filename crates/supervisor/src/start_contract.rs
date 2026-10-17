@@ -11,9 +11,19 @@
 //! - argv: `fandhe-container-supervisor start --root <状態ルートの絶対パス> [--restart <policy>] <container-id>`。
 //!   `--root` は必須（CLI が `StateRoot::resolve` で解決した値を渡す。supervisor は状態ルートを環境変数から決めない）。
 //!   `--restart` は任意で既定は `no`。各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
-//! - 環境変数は契約に含めない（supervisor は契約の値を環境から読まない）。
+//! - 契約の fd は 0〜2 のみ。supervisor は入口（`start_entry`）で fd [`FIRST_INHERITED_FD`] 以降を閉じる
+//!   （特権ランチャーと同じ処理。#2070・SEC-1）。呼び出し側が追加の fd を渡しても使われない。exec から入口までの
+//!   短い窓は残る（CLI は CLOEXEC の無い fd を自分では閉じない）。
+//! - 環境変数は契約に含めない（supervisor は契約の値を環境から読まない）。CLI が渡す環境は `PATH`（固定値）と
+//!   `XDG_RUNTIME_DIR`（systemd-run が user マネージャへ接続するため。supervisor は読まない）だけである。
+//! - 委譲スコープ（#2081・CORE-3・CORE-4）: `DelegatedCgroup::prepare` は親 cgroup に自分以外のプロセスがいると拒否するため、
+//!   CLI は supervisor を [`USER_SCOPE_WRAPPER_ARGS`] で包んで起動する（`systemd-run <引数> <supervisor の絶対パス> start ...`）。
+//!   systemd-run は scope の登録後に同じプロセスでコマンドを exec する（`man systemd-run` の scope の説明と systemd の
+//!   `src/run/run.c` の `start_transient_scope`）ため、spawn した pid・プロセスグループ・stdio はそのまま supervisor のものになる。
 //! - stdin は `/dev/null`、**stdout は結果を通知する pipe の書き込み端**（supervisor は報告を 1 行書いたら以後 stdout に
-//!   何も書かない）、stderr は呼び出し側が選ぶ（supervisor の構造化ログの出力先）。
+//!   何も書かない）、stderr は呼び出し側が選ぶ。supervisor の構造化ログは supervisor 自身が
+//!   `<root>/@supervisor-logs/` へ保存する（[`crate::supervisor_log`]。#2067）ので、呼び出し側の stderr へ行くのは fd 2 へ
+//!   直接書かれるもの（core の診断・panic 等。同モジュールの「未実装・残余」）だけで、null でもログは失われない。
 //! - supervisor は CLI より長く生きる（CORE-1・D-19）。端末の SIGINT / SIGHUP を受けないよう、CLI は
 //!   `CommandExt::process_group(0)` で別のプロセスグループにして spawn する。
 //!
@@ -30,8 +40,9 @@
 //!
 //! # 報告の後の後始末
 //! supervisor は報告を期限内に 1 回書いてから、失敗の後始末（予約を Created へ戻す・cgroup の削除・terminate・
-//! `Stopped` の記録）を行う。起動処理が期限に間に合わなかったときは `INTERNAL`（期限超過の message）を報告し、
-//! 起動処理が後から成功していれば起動したプロセスを terminate して `Stopped` を記録する。
+//! `Stopped` の記録）を行う。起動の準備（手順 3〜7）が期限に間に合わなかったときは `INTERNAL`（期限超過の
+//! message）を報告し、準備が後から終わっても launch せず作った cgroup を消す（launch は準備の完了後に入口スレッドが
+//! 行うため、期限超過の後に新しいプロセスは作られない。#1819）。
 //! **ERR（`INTERNAL` を含む）の報告の後、後始末が終わるまで同じ ID は予約中**で、その間の同じ ID の start は
 //! 記録済みの cgroup スコープ・起動権の予約（revision 照合）・bundle の所有ロックの照合で `FAILED_PRECONDITION`
 //! として拒否される。後始末を確かめられなければ supervisor は `INTERNAL` の終了コードで終わる。
@@ -48,6 +59,14 @@ use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
 use crate::restart::RestartPolicy;
 
+/// supervisor の入口とランチャーが閉じ始める fd 番号（0〜2 は契約の stdin / stdout / stderr。SEC-1・#2070）。
+pub const FIRST_INHERITED_FD: u32 = 3;
+/// supervisor を委譲された新しい cgroup scope で起動するための `systemd-run` の引数（#2081・CORE-3・CORE-4）。
+///
+/// CLI の `start` と実機試験（`supervisor_bin_real`）の唯一の出所。後ろに supervisor の絶対パスと契約の argv が続く。
+/// `--unit` は付けない（名前を決め打ちすると残った scope と衝突して start が落ちうるため）。
+pub const USER_SCOPE_WRAPPER_ARGS: [&str; 6] =
+    ["--user", "--scope", "--quiet", "-p", "Delegate=yes", "--"];
 /// 報告の先頭トークン（契約の版。互換性のない変更では数字を上げる）。
 pub const REPORT_MAGIC: &str = "FCSUP1";
 /// 報告 1 行（終端の `\n` を含む）の最大バイト数。
@@ -59,7 +78,7 @@ pub const MAX_ARGS: usize = 8;
 /// argv の 1 要素の最大バイト数。
 pub const MAX_ARG_LEN: usize = 4096;
 /// cgroup の準備（mkdir・退避・制限の設定）に見込む時間。
-pub const CGROUP_PREPARE_ALLOWANCE: Duration = Duration::from_secs(5);
+pub const CGROUP_PREPARE_ALLOWANCE: Duration = Duration::from_secs(6);
 /// CLI が [`result_deadline`] に足す受信の猶予。
 pub const CLI_RECEIVE_GRACE: Duration = Duration::from_secs(2);
 
@@ -300,19 +319,32 @@ impl StartArgs {
     }
 }
 
-/// supervisor が結果を書くまでの内部上限: `launch + terminate + confirm + 3 × LAUNCHER_REPLY_GRACE + 5s`
-/// （既定値で 33s。あふれたら `Duration::MAX` に張り付く）。
+/// 起動手順 8（`oci_runtime::start`。launch・失敗時の terminate・確認）に見込む時間:
+/// `launch + terminate + confirm + 3 × LAUNCHER_REPLY_GRACE`（あふれたら `Duration::MAX` に張り付く）。
 ///
-/// supervisor（`start_entry::run_start`）は起動処理を作業スレッドで行い、開始時刻にこの値を足した期限から報告の
-/// 書き込み分（`start_entry::REPORT_RESERVE`）を引いた時点まで結果を待つ。間に合わなければ `INTERNAL`
-/// （期限超過）を報告するため、報告はこの上限内に届く。失敗後の後始末は報告の後に行う（REPAIR-5）。
-pub fn result_deadline(timeouts: &StartTimeouts) -> Duration {
+/// 手順 8 は入口スレッドが直接行う（本番 launcher は単一スレッドの呼び出しを要求するため。#1819・CORE-1）。
+/// launcher 自身が上限を守る（`SelfBounded`）ので、入口は launch の前にこの時間が期限内に残っているかを確かめ、
+/// 足りなければ launch せず `INTERNAL`（期限超過）を報告する（期限内に終わらない launch を始めない。REPAIR-5）。
+/// 既定値で 28s。
+pub fn launch_step_budget(timeouts: &StartTimeouts) -> Duration {
     timeouts
         .launch()
         .saturating_add(timeouts.terminate())
         .saturating_add(timeouts.confirm())
         .saturating_add(LAUNCHER_REPLY_GRACE.saturating_mul(3))
-        .saturating_add(CGROUP_PREPARE_ALLOWANCE)
+}
+
+/// supervisor が結果を書くまでの内部上限: [`launch_step_budget`] + [`CGROUP_PREPARE_ALLOWANCE`]
+/// （既定値で 34s。あふれたら `Duration::MAX` に張り付く）。
+///
+/// supervisor（`start_entry::run_start`）は手順 3〜7（状態の確認・cgroup の連鎖・監査 sink・launcher の構築）を
+/// 作業スレッドで行い、開始時刻にこの値を足した期限から報告の書き込み分（`start_entry::REPORT_RESERVE`）を引いた
+/// 時点まで結果を待つ。作業スレッドが終わったら入口スレッドが手順 8 を直接行う（上の [`launch_step_budget`]）。
+/// 準備に使える実質の時間は [`CGROUP_PREPARE_ALLOWANCE`] から報告の書き込み分（1s）と launch 前の作業スレッド消滅の待ち（最大 1s）を引いた 4s で、
+/// 手順 3〜7 が長引いて手順 8 の見込みが残らなければ launch せず `INTERNAL`（期限超過）を報告するため、報告は
+/// この上限内に届く。失敗後の後始末は報告の後に行う（REPAIR-5）。
+pub fn result_deadline(timeouts: &StartTimeouts) -> Duration {
+    launch_step_budget(timeouts).saturating_add(CGROUP_PREPARE_ALLOWANCE)
 }
 
 /// CLI の受信期限: [`result_deadline`] + [`CLI_RECEIVE_GRACE`]。
@@ -322,6 +354,15 @@ pub fn cli_receive_deadline(timeouts: &StartTimeouts) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    /// CORE-3・SUP-1: 委譲 scope の包み込みの引数は固定（CLI と実機試験が同じ値を使う。#2081）。
+    #[test]
+    fn sup1_core3_user_scope_wrapper_args_are_fixed() {
+        assert_eq!(
+            super::USER_SCOPE_WRAPPER_ARGS,
+            ["--user", "--scope", "--quiet", "-p", "Delegate=yes", "--"]
+        );
+    }
+
     use super::*;
 
     /// 絶対パスの fixture（Windows の `Path::is_absolute` はドライブ接頭辞を要する。CLI-1）。
@@ -518,12 +559,23 @@ mod tests {
         }
     }
 
-    /// REPAIR-5: 既定の内部上限は 33s で、CLI の受信期限はそれより厳密に長い。
+    /// REPAIR-5・#1819: 手順 8 の見込みは既定で 28s で、内部上限はそれに cgroup の準備の見込み（6s）を足した値。
     #[test]
-    fn repair5_result_deadline_default_is_33s() {
+    fn repair5_launch_step_budget_default_is_28s() {
         let t = StartTimeouts::default();
-        assert_eq!(result_deadline(&t), Duration::from_secs(33));
-        assert_eq!(cli_receive_deadline(&t), Duration::from_secs(35));
+        assert_eq!(launch_step_budget(&t), Duration::from_secs(28));
+        assert_eq!(
+            result_deadline(&t),
+            launch_step_budget(&t) + CGROUP_PREPARE_ALLOWANCE
+        );
+    }
+
+    /// REPAIR-5: 既定の内部上限は 34s で、CLI の受信期限はそれより厳密に長い。
+    #[test]
+    fn repair5_result_deadline_default_is_34s() {
+        let t = StartTimeouts::default();
+        assert_eq!(result_deadline(&t), Duration::from_secs(34));
+        assert_eq!(cli_receive_deadline(&t), Duration::from_secs(36));
         assert!(cli_receive_deadline(&t) > result_deadline(&t));
     }
 }

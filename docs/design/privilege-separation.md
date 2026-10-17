@@ -2,12 +2,12 @@
 
 sudo＋pty に頼らない権限昇格方式（setuid バイナリ・capability ベース）の選択肢と、本リポが rootful で必要とする最小権限を整理する（SUP-14）。
 
-> **位置づけ**: 方式は承認済み（オーナー判断 2026-10-10・[#1454](https://github.com/Fandhe-AI/fandhe-container/issues/1454)）。(c) 特権ランチャー＋ ambient capability を既定とし、xattr 非対応の環境に限り (a) setuid root を代わりに認める。どちらも失敗したら fail-closed にし、sudo へは戻らない。`unsafe` の syscall ラッパーは `crates/supervisor/src/sys`（Linux 版）に置く（事前承認の範囲）。ランチャーは `crates/supervisor` の bin（`fandhe-container-launcher`）とし、実装は #1719 で行う。9 章を採用方式として更新した。縮退の適用と読み戻し検証は TASK-171.1.3（#1475）で `privilege::elevate` として実装済みで、境界は 10 章末尾の補足を参照。
+> **位置づけ**: 方式は承認済み（オーナー判断 2026-10-10・[#1454](https://github.com/Fandhe-AI/fandhe-container/issues/1454)）。(c) 特権ランチャー＋ ambient capability を既定とし、xattr 非対応の環境に限り (a) setuid root を代わりに認める。どちらも失敗したら fail-closed にし、sudo へは戻らない。`unsafe` の syscall ラッパーは `crates/supervisor/src/sys`（Linux 版）に置く（事前承認の範囲）。ランチャーは `crates/supervisor` の bin（`fandhe-container-launcher`）とし、実装は #1719 で行う。9 章を採用方式として更新した。7 章に supervisor の入口の dumpable=0 を追記した（SUP-14 の 2026-10-16 明記・#2102）。縮退の適用と読み戻し検証は TASK-171.1.3（#1475）で `privilege::elevate` として実装済みで、境界は 10 章末尾の補足を参照。
 
 - 対象ビヘイビア: SUP-14（Must・確定。関連: SUP-1・CORE-1・CORE-5・CORE-6・SEC-1・SEC-5・PLUG-11・ERR-1・REPAIR-5・D-19）
 - タスク: TASK-171（MS-9・G12・担当: 共同）。本書は TASK-171.1.1（#857。親 #536・#535）
 - 後続: #858（TASK-171.1.2。成果物 `crates/supervisor/src/privilege.rs`〔仮称〕）・#537（TASK-171.2 pty 非経由の起動経路）・#538（TASK-171.3 SIGKILL 継続テスト）・#539（TASK-171.h1。実装後のセキュリティレビュー・実機検証。人間担当）
-- 出典: `docs/spec/04-behavior/api-supervisor.md` の `SUP-14`、`03-poc/supervisor-model/README.md` の発見事項 1（PoC-17）、`05-tasks.md` の TASK-171、`api-runtime-core.md` の `CORE-6`、`security-isolation.md` の `SEC-1`・`SEC-5`（submodule リビジョン `984f8a2`）。外部事実の出典は 3 章末尾に URL と確認日（2026-10-06）を付す
+- 出典: `docs/spec/04-behavior/api-supervisor.md` の `SUP-14`、`03-poc/supervisor-model/README.md` の発見事項 1（PoC-17）、`05-tasks.md` の TASK-171、`api-runtime-core.md` の `CORE-6`、`security-isolation.md` の `SEC-1`・`SEC-5`（submodule リビジョン `984f8a2`。7 章の supervisor の dumpable=0 は SUP-14 の 2026-10-16 明記〔spec#23・リビジョン `6a3e546`〕による）。外部事実の出典は 3 章末尾に URL と確認日（2026-10-06）を付す
 
 ## 1. 問題の整理
 
@@ -105,7 +105,10 @@ rootful 時に、本リポのコードが行う特権操作と、それに要す
 - ランチャーは exec の直前に supervisor の実体を検証する。パスを `open` して得た fd に対し `fstat` で所有者・パーミッション（グループ・他者の書き込みビットが無いこと）・通常ファイルであることを確認し、`/proc/self/fd` 経由や `execveat`（fd 指定）で検証した同一の実体を exec する。検証と exec の間の差し替え（TOCTOU）を避けるため、パス文字列で検証して別途パスで exec する方式にしない。許可済みハッシュ・署名との照合の要否は PLUG-11 に合わせて実装時に決める（未確認）。検証に失敗した場合は 6 章に従い fail-closed とする
 - supervisor のパスは固定の絶対パスまたは同一インストール先からの相対解決に限り、`PATH` 探索や呼び出し元が与える任意パスを受け付けない（既定）
 - core dump・ptrace の可否: `PR_SET_DUMPABLE=0` を `elevate` の前に設定する（#1719 で確定。昇格中の窓で同一 uid の別プロセスから ptrace・`/proc/<pid>/mem`・core dump を受けない）
+- supervisor の入口でも `PR_SET_DUMPABLE=0` を設定する（SUP-14。2026-10-16 に spec へ明記、spec#23、本リポへの取り込みは #2101・#2102）。`execve` は dumpable を 1 に戻し、ランチャー経由の昇格は ambient capability の受け渡しで AT_SECURE・資格情報の変化を伴わないため、ランチャー側の設定だけでは足りない。入口で改めて 0 にしないと、同じ UID の親や他プロセスから ptrace・`/proc/<pid>/`（`mem`・`smaps_rollup`・`exe` 等）の読み取り・core dump を受け、昇格した capability を奪われうる。位置は継承 fd を閉じ、結果チャネルを開いた直後で、引数の検証や起動処理より前。直接起動（ランチャー非経由）でも無条件に設定し、特権経路に限らない。設定に失敗したら結果チャネルへ構造化エラー（`code` は `INTERNAL`、メッセージは `PR_SET_DUMPABLE failed: <kind>`。ERR-1）を書いて非ゼロで終了し、起動しない（fail-closed。6 章）。`execve` での dumpable の扱いなどカーネル挙動の原文照合は 12 章の `prctl(2)`・`execve(2)` の未確認の行に含まれる
+  - 計測のために dumpable=0 を外さない。特権経路に限ることもしない（SUP-14）。supervisor の PSS の計測は読み取りだけを root で行う（TASK-158 追補。方式は #2090 で決定、実装は #2099 で未完了）。手順は `docs/verification/supervisor-measurement-runbook.md` の「計測の権限」、`scripts/bench/supervisor_pss.sh` を参照
 - 実装の対応（#1719。`crates/supervisor/src/launcher.rs`・`src/bin/fandhe-container-launcher.rs`）: 環境は `execveat` に渡す `envp` を許可リスト方式で新規に組む（固定の `PATH` のみ。`LD_*` を渡さない）。引数は supervisor と同じ `StartArgs::parse` で検証して転送する。supervisor のパスはランチャー自身の実体（`/proc/self/exe`）の親ディレクトリ + 固定名。パスは根から全要素を辿り、ディレクトリは root 所有・group / other 書き込み不可（sticky でも免除しない）、symlink は root 所有のみ許可して自前で解決する。最終ファイルは `open` した fd の `fstat` で通常ファイル・setuid / setgid 無し・group / other 書き込み不可・root 所有を確かめ（この順に最初の失敗を報告）、同じ fd を `execveat(AT_EMPTY_PATH)` で exec する。fd 0〜2 が閉じていれば結果チャネルを乗っ取られないため拒否し、fd 3 以降は閉じ、cwd は `/`。許可済みハッシュ・署名との照合は行わない（PLUG-11 との整合は 12 章に未確認として残す）
+- 実装の対応（supervisor 側の dumpable。#2102）: `crates/supervisor/src/start_entry.rs` の `run_main_inner`（結果チャネルを開いた直後の手順）が `crate::sys::set_dumpable(false)` を呼ぶ。ラッパーは `crates/supervisor/src/sys/linux.rs` の `set_dumpable` で、設定のみを行い読み戻しはしない。dumpable=0 では `/proc/self` 配下の所有者が変わるため、`ProductionStartDeps::new` は権限モデルを `/proc/self/status` の所有者ではなく内容から決める
 
 ## 8. 配置の論点（本書では決めない）
 
@@ -157,16 +160,17 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 
 ### インストールスクリプト（#1721・TASK-171 追補）
 
-`scripts/install-privileged-launcher.sh --launcher <file> --supervisor <file> [--dest-dir <絶対パス>]` を root で実行する（パッケージの postinst からも `--dest-dir` を渡して呼べる）。スクリプト内で sudo は呼ばない。自己テストは `make install-launcher-selftest`（スタブのみ・root 不要）。root での実機実行と検証は人間担当（#538・#539）。
+`scripts/install-privileged-launcher.sh --launcher <file> --launcher-sha256 <hex> --supervisor <file> --supervisor-sha256 <hex> --cli <file> --cli-sha256 <hex> [--dest-dir <絶対パス>]` を root で実行する（パッケージの postinst からも `--dest-dir` を渡して呼べる）。スクリプト内で sudo は呼ばない。自己テストは `make install-launcher-selftest`（スタブのみ・root 不要）。root での実機実行と検証は人間担当（#538・#539）。
 
-- 配置先は既定 `/usr/local/libexec/fandhe-container`。根から配置先までの全要素が root 所有・g/o 書き込み不可の通常ディレクトリ（symlink 不可）でなければ、補修も上書きもせず終了コード 3 で止まる（7 章）。supervisor もランチャーと同じ条件で置く。
+- 配置先は既定 `/usr/local/libexec/fandhe-container`。根から配置先までの全要素が root 所有・g/o 書き込み不可の通常ディレクトリ（symlink 不可）でなければ、補修も上書きもせず終了コード 3 で止まる（7 章）。supervisor と CLI（`fandhe-container`）もランチャーと同じ条件で、同じディレクトリに置く（#2068）。CLI の `start` は自分の実体と同じディレクトリの supervisor を起動する（#1718）ため、CLI を別の場所に置くと見つけられない。CLI と supervisor は起動契約（`FCSUP1`）の版が揃っている必要があり、`--cli` は必須にして 3 つを一組で更新する。CLI には capability も setuid も付けず、supervisor と同じく付いていないことと `755` を読み戻す。`PATH` 上の symlink（例: `/usr/local/bin/fandhe-container` から配置先の CLI）はスクリプトでは作らず、root の手作業とする（手順は [docs/setup/linux.md](../setup/linux.md)）。symlink から起動しても、`current_exe()` は実体のパスを返すので実体のディレクトリの supervisor が使われる（CLI の結合試験で照合）。symlink はインストーラの信頼チェーンの外にあるが、CLI と supervisor の間に権限の境界は無く（同一ユーザーで起動する）、特権経路はランチャーが自分の実体の隣の supervisor を自前で検証する（#1719）ため、昇格の経路にはならない。rootless 向けの置き場所も同じ文書に書く。
+- 入力元の照合（#2137。SUP-14、方式は PLUG-11 の「許可済み sha256 ハッシュ一覧が既定・署名は opt-in の将来拡張」に倣う）: 3 つの入力元それぞれの許可済み sha256（64 桁の 16 進。大文字は小文字へ正規化）を `--launcher-sha256`・`--supervisor-sha256`・`--cli-sha256` で渡す。3 つとも必須で、省く既定は無い（欠落は終了コード 2）。照合するのは入力元のパスではなく、fd から複製した配置先の一時ファイルである。入力元は開いた後にパスの先を差し替えられうるが、一時ファイルは root 所有の配置先の中にあり root しか変えられず、rename は inode を保つので、照合した中身がそのまま最終名になる（rename 後の再ハッシュはしない）。照合は属性の変更（chown・chmod・setcap）より前に行い、不一致は `error: source-hash-mismatch`（終了コード 3。期待値と実際の値を示す）で属性の変更も置換もせずに止まる。`sha256sum` が無ければ `error: sha256sum-unavailable`（終了コード 3）で、別のツールへは替えない。`sha256sum` の想定外の出力は終了コード 1 の `install-failed`、期限超過は `operation-timeout`。防ぐのはビルドとインストールの間の差し替え・破損・取り違えで、期待値は入力元とは別の経路（リリースの SHA256SUMS、または信頼できるビルドホストで取った値）から得ることが前提になる（入力元と同じ時点で計算し直した値では保護にならない）。期待値をマニフェストファイルで渡す方式は採らない（親シェルが開くファイルが増え、ファイル自体の信頼性検証が要るため）。署名の検証は未実装で、PLUG-11 の opt-in の将来拡張とする。差し込む位置は「一時ファイルへの複製の後、属性の変更の前」で、ハッシュ照合と置き換えるか併用するかは決めていない（形式・鍵の管理も未定）。
 - ランチャーにだけ `RUNTIME_REQUIRED_CAPABILITIES`（7 件）に `cap_setgid` を足した 8 件を `+ep` で付け、`getcap` で読み戻して照合する。`cap_setgid` は `elevate` の契約（方式 (c) は補助グループを持つ利用者向けに effective で要る）による。縮退後の保持集合は最小の 7 件に戻る。supervisor には付けず、付いていないことも読み戻す。
 - setuid root（`root:root`・`4755`）へ切り替えるのは、`setcap` が非 0 で終わり stderr に `not supported`（ENOTSUP / EOPNOTSUPP。xattr 非対応）を含むときだけ。EPERM・EINVAL・`setcap` 未導入・読み戻し不一致では切り替えず、`error: <code>: <message>` の 1 行を出して終了コード 1 で止まる（fail-closed）。
 - `getcap` は読めなかったときも終了コード 0 のまま stderr に診断を出すことがあるため、終了コードだけで成否を決めない。出力が空なら capability なし、`<file> <caps>` の 1 行なら付与あり、それ以外は失敗として止まる。例外は setuid へ切り替えた後だけで、診断が `not supported` を含むとき（2021-09 より前の libcap は xattr 非対応の FS で ENOTSUP を stderr へ出す）に限り capability なしとして扱う。setuid への切り替え条件（`setcap` の結果）は広げない。
-- 一時ファイルで検証を済ませてから rename で置換するため、途中失敗で半端な属性を残さない。supervisor・launcher の順に置換し、途中で止まったら旧 supervisor（ハードリンクの退避）へ戻す。
-- 同じ配置先への並行インストールは、配置先ごとのロックファイル `<dest-dir>/.install.lock`（root 所有・0600。消さずに残す）への `flock(1)` で排他する。既存ファイルの確認から置換・復元・最後の読み戻しまでを 1 つのインストールだけが行い、並行する実行が launcher と supervisor を別々の版にしたり、他方の更新を旧版へ戻したりしない。ロックは待たずに取り、取れなければ `error: install-locked`（終了コード 3）で何も変えずに止まる。ロックはプロセスの終了で解放される。0600 にするのは、読めるだけの利用者でも `flock` を取れてインストールを止められるため（他の利用者から読めるロックファイルは信頼できない配置先として拒否する）。
-- 配置先・入力元に触る外部コマンド（`stat`・`mkdir`・`flock`・`mktemp`・`dd`・`chown`・`chmod`・`setcap`・`getcap`・`ln`・`mv`・`rm`）はすべて `timeout(1)` の期限つき（30 秒・超過後 5 秒で KILL）で実行し、親シェルはファイル検査も配置先へのリダイレクトも行わない（REPAIR-5。NFS / FUSE の停止で無期限に待たない。親シェルが開くのは入力元とロックファイルだけで、どちらも watchdog が同じ期限で打ち切る）。期限超過は `error: operation-timeout`（終了コード 1）。期限を超えた操作は実行されたか不明として扱い、置換の有無を inode の読み戻しで確かめてから戻す。結果は stderr の 2 行目以降に `warning: rolled-back`（戻した・置換済みのファイルは無い）・`error: restore-failed`（戻せなかった。退避ファイルを残し復元コマンドを示す）・`error: state-indeterminate`（launcher の置換を確かめられなかった。退避ファイルを残す）・`warning: replaced-unverified`（2 つとも置換済みで最後の読み戻しが未完）・`warning: cleanup-incomplete`（一時ファイル・退避ファイルを消せなかっただけ。置換の成否には影響せず、成功時は終了コード 0 のまま）で示す。SIGKILL でも終わらない子（割り込めない I/O 待ち）は `timeout(1)` が回収を待つため、期限では打ち切れない。
-- 既知の範囲外: 入力元のハッシュ・署名の照合は未実装（12 章）。nosuid マウント上の配置先では file capability / setuid が効かず、ランチャーが実行時に fail-closed で拒否する。
+- 一時ファイルで検証を済ませてから rename で置換するため、途中失敗で半端な属性を残さない。CLI・supervisor・launcher の順に置換し、途中で止まったら supervisor、CLI の順に旧ファイル（ハードリンクの退避）へ戻す。launcher は最後に置換するので退避を取らない。
+- 同じ配置先への並行インストールは、配置先ごとのロックファイル `<dest-dir>/.install.lock`（root 所有・0600。消さずに残す）への `flock(1)` で排他する。既存ファイルの確認から置換・復元・最後の読み戻しまでを 1 つのインストールだけが行い、並行する実行が CLI・launcher・supervisor を別々の版にしたり、他方の更新を旧版へ戻したりしない。ロックは待たずに取り、取れなければ `error: install-locked`（終了コード 3）で何も変えずに止まる。ロックはプロセスの終了で解放される。0600 にするのは、読めるだけの利用者でも `flock` を取れてインストールを止められるため（他の利用者から読めるロックファイルは信頼できない配置先として拒否する）。
+- 配置先・入力元に触る外部コマンド（`stat`・`mkdir`・`flock`・`mktemp`・`dd`・`sha256sum`・`chown`・`chmod`・`setcap`・`getcap`・`ln`・`mv`・`rm`）はすべて `timeout(1)` の期限つき（30 秒・超過後 5 秒で KILL）で実行し、親シェルはファイル検査も配置先へのリダイレクトも行わない（REPAIR-5。NFS / FUSE の停止で無期限に待たない。親シェルが開くのは入力元とロックファイルだけで、どちらも watchdog が同じ期限で打ち切る）。期限超過は `error: operation-timeout`（終了コード 1）。期限を超えた操作は実行されたか不明として扱い、置換の有無を inode の読み戻しで確かめてから戻す。結果は stderr の 2 行目以降に `warning: rolled-back`（旧 supervisor・旧 CLI へ戻した・置換済みのファイルは無い）・`error: restore-failed`（戻せなかった。退避ファイルを残し復元コマンドを示す）・`error: state-indeterminate`（launcher の置換を確かめられなかった。2 つの退避ファイルを残す）・`warning: replaced-unverified`（3 つとも置換済みで最後の読み戻しが未完）・`warning: cleanup-incomplete`（一時ファイル・退避ファイルを消せなかっただけ。置換の成否には影響せず、成功時は終了コード 0 のまま）で示す。SIGKILL でも終わらない子（割り込めない I/O 待ち）は `timeout(1)` が回収を待つため、期限では打ち切れない。
+- 既知の範囲外: 入力元の署名の検証は未実装（ハッシュの照合は上記のとおり実装済み。12 章）。nosuid マウント上の配置先では file capability / setuid が効かず、ランチャーが実行時に fail-closed で拒否する。
 
 ## 11. 参照
 
@@ -182,5 +186,7 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 | file capabilities 付きバイナリの AppArmor 等の LSM 下の挙動 | 未確認 |
 | macOS・Windows（VM 内）で本方式が不要であること | 要確認（MAC・WIN 系ビヘイビア） |
 | rootless（CORE-6）経路との関係 | PoC 未検証 |
-| supervisor の hash / 署名照合の要否（PLUG-11 との整合） | 未確認（#1719 は所有権と書き込み権限のみで信頼を判断） |
+| ランチャーの実行時の supervisor の hash / 署名照合の要否（PLUG-11 との整合） | 未確認（#1719 は所有権と書き込み権限のみで信頼を判断） |
+| インストール時の入力元のハッシュ照合 | 決定・実装済み（#2137。許可済み sha256 を引数で渡し、複製した一時ファイルを照合する。10 章） |
+| インストール時の署名検証 | 未採用（PLUG-11 の opt-in の将来拡張。差し込む位置は 10 章） |
 | 再検証条件 | 実機（root 権限・対象カーネル）で #538・#539 を実施するとき |

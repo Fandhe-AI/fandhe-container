@@ -1,6 +1,7 @@
 # コンテナごとの軽量監視プロセス（restart・healthcheck・exec・logs・stats。crate-naming.md の表 #3）。
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G12（TASK-157〜171）で実装する。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
+# #2070 で bin の入口の継承 fd の整理を追加した（依存は不変）。
 # TASK-163 追補（#1594）で exec の本番用 AuditSink の構築入口 default_audit_sink を追加した（依存は不変）。
 # TASK-163 追補（#1698）で exec の entrypoint_mode のログを core の待たない出力経路へ載せ替えた（依存は不変）。
 # TASK-164 追補（#1469）でロックファイルの掃除経路（remove_all・open 失敗時の削除）を追加した（依存は不変）。
@@ -26,8 +27,11 @@
 # TASK-163.4（#503）で exec にコマンド実行（run_command）と実コンテナへの通し結合試験 tests/exec.rs を追加した（依存は不変）。
 # TASK-163 追補（#1465）で exec::run_command に監査の記録先を必須の引数として追加した（依存は不変）。
 # TASK-164 追補（#1470）で Windows の世代 rename 再試行・ロックファイル ID 照合（src/sys.rs。自前 FFI 宣言）を追加した（依存は不変）。
+# TASK-157 追補（#1819）で ProductionStartDeps を core の本番 launcher へ結線した（依存は不変）。
 # TASK-157 追補（#1717）で bin の入口（src/main.rs）と起動の契約（start_contract・start_entry）を追加した（依存は不変）。
 # TASK-171 追補（#1719）で特権ランチャーの bin（src/launcher.rs・src/bin/）を追加した（依存は不変）。
+# TASK-157 追補（#2058）で CLI からのシグナル送信を受ける制御チャネル（src/control）を追加した（依存は不変）。
+# #2140 で制御チャネルの sys ラッパーを LP64 に限定し、別 uid の拒否の監査配送の結合試験 control_audit_delivery を追加した（依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -153,3 +157,28 @@ harness = false
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true
+
+# bin の入口（start_entry::run_main）が継承 fd（fd 3 以降）を閉じること（SEC-1・SUP-14・CORE-1・#2070）。単一スレッドの
+# main で入口の手順 2 を通し、CLOEXEC の無い fd を sh の exec で仕込む自己再実行のため独自 main（harness = false）で動かす。
+[[test]]
+name = "inherited_fds"
+path = "tests/inherited_fds.rs"
+harness = false
+
+# supervisor の bin から core の本番 launcher を経て monitor まで通す実機シナリオ（起動 → 報告 → 監視 → Stopped の記録、
+# 起動失敗で何も残らないこと、restart の fail-closed。SUP-1・SUP-3・CORE-1・CORE-2・TASK-157 追補・#1819）。同じ実行ファイルが
+# コンテナ内のプローブも兼ねるため独自 main（harness = false）で動かす。非特権ユーザー・Linux 6.12 以上・委譲された
+# cgroup v2（systemd-run --user）を要する実機前提テストで、`-- --ignored` 指定時のみ実行する（AGENTS.md）。実行は人間担当。
+[[test]]
+name = "supervisor_bin_real"
+path = "tests/supervisor_bin_real.rs"
+harness = false
+
+# 制御チャネルの別 uid の拒否が監査の記録先（@audit.log）へ届くことの結合試験（SEC-4・SEC-1・SUP-1・PLUG-12・#2140）。
+# 監査 helper の fork は単一スレッドの呼び出し元を要求するため、単一スレッドの独自 main（harness = false）で動かす。
+# 既定のシナリオは root 不要で既定のテスト集合で実行し、本物の別 uid（65534）での実機シナリオは `-- --ignored` 指定時のみ
+# 実行する（root 必須。AGENTS.md「実機前提テスト」。依存は不変）。
+[[test]]
+name = "control_audit_delivery"
+path = "tests/control_audit_delivery.rs"
+harness = false

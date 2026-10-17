@@ -156,6 +156,22 @@ else
   fail "cdpath-relative-output (exit=${actual})"
 fi
 
+# --arch / --host-kind（#2095・REPAIR-8）: 同時指定で host を出力し、片方のみ・書式違反は入力エラー。
+actual=0
+bash "$gen" --metrics "${fx}/metrics.json" --output "${work}/host.json" --arch x86_64 --host-kind bare-metal "${fx}/results-all.json" >/dev/null 2>&1 || actual=$?
+if [ "$actual" -eq 0 ] && [ "$(jq -c '.host' "${work}/host.json")" = '{"arch":"x86_64","kind":"bare-metal"}' ]; then
+  pass "host-flags-emit-host (exit=0)"
+else
+  fail "host-flags-emit-host (exit=${actual})"
+fi
+run_case "host-arch-only" 2 --metrics "${fx}/metrics.json" --arch x86_64 "${fx}/results-all.json"
+run_case "host-kind-only" 2 --metrics "${fx}/metrics.json" --host-kind vm "${fx}/results-all.json"
+run_case "host-arch-uppercase" 2 --metrics "${fx}/metrics.json" --arch X86 --host-kind vm "${fx}/results-all.json"
+run_case "host-kind-empty" 2 --metrics "${fx}/metrics.json" --arch x86_64 --host-kind "" "${fx}/results-all.json"
+run_case "host-kind-33-chars" 2 --metrics "${fx}/metrics.json" --arch x86_64 --host-kind "$(printf 'a%.0s' $(seq 1 33))" "${fx}/results-all.json"
+run_case "host-arch-embedded-newline" 2 --metrics "${fx}/metrics.json" --arch $'x86_64\nINVALID' --host-kind vm "${fx}/results-all.json"
+run_case "host-kind-embedded-newline" 2 --metrics "${fx}/metrics.json" --arch x86_64 --host-kind $'vm\nINVALID' "${fx}/results-all.json"
+
 if [ "$failures" -gt 0 ]; then
   echo "${failures} case(s) failed" >&2
   exit 1

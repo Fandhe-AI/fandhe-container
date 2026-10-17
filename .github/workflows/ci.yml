@@ -758,6 +758,24 @@ jobs:
         timeout-minutes: 5
         run: make vz-virtio-gpu-guest-check-selftest
 
+      # macOS ゲストカーネルのビルドスクリプト（guest/kernel/build.sh）の自己テスト（#1874・MAC-1・REPAIR-12）。
+      # スタブの tar.xz・コンパイラ・curl だけを使い、ネットワーク・実ビルド・secrets は使わない。
+      # 開発者の macOS（BSD tar / shasum）・Windows（Git Bash では unsupported-os の拒否）でも回すため
+      # 3 OS で実行する。新ジョブは check-run 名が増えるため既存ジョブのステップとする（件数は不変）
+      - name: ゲストカーネルのビルドスクリプトの自己テスト（#1874・MAC-1。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make guest-kernel-build-selftest
+
+      # macOS ゲスト initrd の梱包スクリプト（scripts/build-guest-initrd.sh）の自己テスト（#1878・MAC-1・REPAIR-12）。
+      # 疑似 ELF の fixture とスタブ cargo だけを使い、ネットワーク・実ビルド・secrets は使わない。
+      # 開発者の macOS（BSD od / find / shasum）・Windows（Git Bash では unsupported-os の拒否）でも回すため
+      # 3 OS で実行する。新ジョブは check-run 名が増えるため既存ジョブのステップとする（件数は不変）
+      - name: ゲスト initrd 梱包スクリプトの自己テスト（#1878・MAC-1。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make guest-initrd-build-selftest
+
       # commit-msg フックの本文行長検査（scripts/check-commit-msg-line-length.sh）の自己テスト
       # （Issue #1295・REPAIR-12）。一時ファイルと一時 git リポジトリだけを使い、ネットワーク・secrets・
       # `${{ }}` の埋め込みは使わない。フックは開発者の macOS（BSD tr / awk）・Windows（Git Bash）でも
@@ -934,6 +952,31 @@ jobs:
           fi
           echo "inject_files: content, read-only and rollback verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::inject_files verified"
+
+      # lo_self_delivery（`crates/net/tests/lo_self_delivery.rs`。NET-2・NET-11・TASK-140 追補・#2077）:
+      # 非特権の user + network namespace（`unshare -rn`）で、`lo` が down のときの自己宛て UDP の受信期限切れ
+      # （#1927 の場面）と up 後の配送を照合する実機前提テスト（harness = false）。上で緩和した sysctl を使い回し、
+      # 新しい check-run・sudo・permissions は追加しない（rootless 経路のみ。rootful 経路は未検証で #319 が担う）。
+      # `--ignored` が届かなくても exit 0 になるため成功行を行単位で完全一致 grep する。
+      - name: lo_self_delivery のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-net --test lo_self_delivery --no-run
+
+      - name: lo_self_delivery の実行（実機前提テスト・--ignored。NET-2・NET-11・#2077）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/lo_self_delivery.log"
+          cargo test -p fandhe-container-net --test lo_self_delivery -- --ignored 2>&1 | tee "${log}"
+          line='lo_self_delivery: lo down timed out and lo up delivered (root=false)'
+          if ! grep -Fxq "${line}" "${log}"; then
+            echo "::error::lo_self_delivery did not report verification (possibly not executed)" >&2
+            exit 1
+          fi
+          echo "${line}" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::lo_self_delivery verified"
 
   # --------------------------------------------------
   # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）
@@ -1116,7 +1159,16 @@ jobs:
         with:
           toolchain: stable
           components: clippy
-          targets: aarch64-unknown-linux-gnu,aarch64-apple-darwin,x86_64-pc-windows-msvc
+          targets: aarch64-unknown-linux-gnu,aarch64-apple-darwin,x86_64-pc-windows-msvc,aarch64-unknown-linux-musl
+      # macOS ゲスト用 init（crates/guest-init。#1823・#1875・MAC-1）の配布ターゲット。型検査のみで、
+      # 静的リンクの実ビルドとサイズ確認は initrd への梱包（#1878）で行う。dev-dependency の platform-macos・io も
+      # 型検査の対象になる。
+      - name: guest-init の cargo check（aarch64-unknown-linux-musl・MAC-1）
+        run: cargo check -p fandhe-container-guest-init --all-targets --target aarch64-unknown-linux-musl
+      - name: guest-init の cargo clippy（aarch64-unknown-linux-musl・MAC-1）
+        run: >-
+          cargo clippy -p fandhe-container-guest-init --all-targets
+          --target aarch64-unknown-linux-musl -- -D warnings
       - name: cargo check（aarch64-unknown-linux-gnu・クロス型検査）
         run: cargo check --workspace --all-targets --all-features --target aarch64-unknown-linux-gnu
       - name: cargo clippy（aarch64-unknown-linux-gnu）

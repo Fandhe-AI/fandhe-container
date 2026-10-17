@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use super::bind_mounts::BindMountSet;
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
 use crate::traits::{ContainerId, ErrorCode, Signal, TraitError};
@@ -444,6 +445,8 @@ pub struct LaunchSpec {
     config: std::sync::Arc<OciConfig>,
     /// 起動対象のコンテナ ID（監査記録の `container` に使う。SEC-4）。
     container_id: ContainerId,
+    /// `config` と同じ `mounts[]` から `start` が検証した bind mount の集合（#1915）。
+    bind_mounts: BindMountSet,
 }
 
 impl LaunchSpec {
@@ -460,6 +463,7 @@ impl LaunchSpec {
         cgroup: CgroupRequirement,
         config: std::sync::Arc<OciConfig>,
         container_id: ContainerId,
+        bind_mounts: BindMountSet,
     ) -> Self {
         Self {
             rootfs,
@@ -471,7 +475,17 @@ impl LaunchSpec {
             cgroup,
             config,
             container_id,
+            bind_mounts,
         }
+    }
+
+    /// `start` が検証した bind mount の集合（`mounts[]` の指定順。TASK-29 追補・#1915・OCI-4・SEC-1）。
+    ///
+    /// `config` と同じ `Arc<OciConfig>` の `mounts()` から作るため、Landlock の ruleset
+    /// （`build_path_rules`）と入力が同一で、適用する bind と許可ルールが食い違わない。restart でも
+    /// 捕捉した spec を clone して再 launch するため、同じ集合が再適用される。空なら bind は無い。
+    pub fn bind_mounts(&self) -> &BindMountSet {
+        &self.bind_mounts
     }
 
     /// 起動対象のコンテナ ID（launcher が pivot 前段の違反を監査記録する際の `container`。SEC-4）。
@@ -651,6 +665,24 @@ pub struct ContainerChildProcess {
     /// `take_output` で 1 回だけ取り出す stdout / stderr の読み取り側（無ければ `None`）。`take_output` が
     /// `&self` のため `Mutex` で保持する。
     output: std::sync::Mutex<Option<ContainerOutput>>,
+    /// `terminate` が成功（回収を確かめられた）したときに 1 回呼ぶ通知。本番 launcher が起動台帳へ回収の
+    /// 証跡を引き継ぐために付ける（CORE-2）。
+    reap_notice: Option<ReapNotice>,
+}
+
+/// [`ContainerChildProcess::with_reap_notice`] の通知。
+#[cfg(target_os = "linux")]
+type ReapNoticeFn = Box<dyn Fn() + Send + Sync>;
+
+/// 回収通知の入れ物（`Debug` を手で実装する。クロージャは `Debug` を持たないため）。
+#[cfg(target_os = "linux")]
+struct ReapNotice(ReapNoticeFn);
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for ReapNotice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReapNotice")
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -667,7 +699,15 @@ impl ContainerChildProcess {
             child,
             pid,
             output: std::sync::Mutex::new(None),
+            reap_notice: None,
         })
+    }
+
+    /// `terminate` が成功したときに呼ぶ通知を持たせる（起動台帳への回収の証跡の引き継ぎ。CORE-2）。
+    #[must_use]
+    pub(crate) fn with_reap_notice(mut self, notice: ReapNoticeFn) -> Self {
+        self.reap_notice = Some(ReapNotice(notice));
+        self
     }
 
     /// 子の stdout / stderr の読み取り側を持たせる（`exec::ChildStdio::pipes` が返したもの。#1471）。
@@ -724,8 +764,11 @@ impl LaunchedProcess for ContainerChildProcess {
     fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {
         self.child
             .kill_and_reap(timeout)
-            .map(|_| ())
-            .map_err(|e| TraitError::new(e.code, "failed to terminate the container process"))
+            .map_err(|e| TraitError::new(e.code, "failed to terminate the container process"))?;
+        if let Some(notice) = &self.reap_notice {
+            (notice.0)();
+        }
+        Ok(())
     }
 
     /// `ContainerChild::send_signal_until`（回収状態のロック下で送信）へ委ねる。回収済み・既に消えていた
@@ -783,6 +826,14 @@ pub trait ProcessLauncher: Send + Sync {
     /// 本番 launcher が複数スレッドの呼び出しとして拒否される）。
     fn launch_mode(&self) -> LaunchMode {
         LaunchMode::CallerBounded
+    }
+
+    /// `start` が設定の検証（bind mount 等）で拒否したとき、その違反を記録する launch 経路の監査 sink（SEC-4・#1915）。
+    ///
+    /// `start` は sink を持たないため、launcher が持つ sink を借りて拒否を記録する。既定は `None`
+    /// （記録先なし）。ラッパー実装は必ず内側へ転送すること（転送しないと本番で監査が黙って落ちる）。
+    fn rejection_audit_sink(&self) -> Option<&dyn crate::audit_log::AuditSink> {
+        None
     }
 
     /// プロセスを起動し、ハンドルを返す。`timeout` は起動確認（子からの通知待ち等）の上限。

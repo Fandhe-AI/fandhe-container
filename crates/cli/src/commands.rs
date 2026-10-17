@@ -2,10 +2,12 @@
 //!
 //! `main.rs`（bin `fandhe-container`）から [`run`] が呼ばれ、argv の先頭（グローバル `--root` の後）をコマンド名として判定する。
 //! `create` / `start` は core の `oci_runtime::create` / `start` を直接呼ぶ（TASK-79.2.1・#866。`create_start` module）。
-//! ただし本番の `ProcessLauncher` が未提供のため、`start` は `UNIMPLEMENTED`（終了コード 8）で失敗する（REPAIR-3）。
+//! ただし `start` は core を呼ばず、CLI と同じディレクトリの supervisor の bin を起動して結果の 1 行を期限付きで受け取る
+//! （#1718・`supervisor_start` module）。supervisor は core の本番 launcher（#1715・#1819）でコンテナのプロセスを起動する（rootless のみ。
+//! rootful は `UNIMPLEMENTED`（8）。実機での通し確認は #2062）。同じディレクトリに supervisor が無ければ `FAILED_PRECONDITION`（5）で失敗する（REPAIR-3）。
 //! `stop` / `delete` は core の `oci_runtime::kill`（SIGTERM）/ `delete` を直接呼ぶ（TASK-79.2.2・#867。`stop_delete` module）。
-//! 本番の `ProcessSignaler`・cgroup remover が未提供のため、pid ありの対象への `stop` や cgroup 配置つきの `delete` は
-//! `UNIMPLEMENTED`（8）で失敗する（REPAIR-3）。
+//! `stop` の本番 `ProcessSignaler` は supervisor の制御チャネル経由（`stop_delete::production_signaler`。#2059・SEC-1）で、
+//! supervisor に届かなければ構造化エラー（UNAVAILABLE 等）で失敗する。非 Linux は `UNIMPLEMENTED`（8）で fail-closed（REPAIR-3）。
 //! `list` は core の状態ストアを読んで stdout へタブ区切りで一覧を出し、`logs` は引数・ID・存在確認までを行う
 //! （TASK-79.3・#640。`list_logs` module）。ログ内容の読み出しは未実装で、対象が存在しても `UNIMPLEMENTED`（8）で
 //! 失敗する（REPAIR-3）。
@@ -19,8 +21,8 @@
 //! - 分離の単体テストは `setup::tests::cli2_daily_commands_do_not_request_os_setup`（TASK-80.3）。
 //!
 //! 将来仕様（本実装の範囲外）:
-//! - start の実プロセス起動: supervisor 経由の launcher（TASK-157・TASK-37〜39）。
-//! - stop の猶予 → SIGKILL・本番 signaler / cgroup remover の結線: supervisor 経由（TASK-157）。
+//! - start: ランチャー経由の特権起動の選択（#1719・#1722）。
+//! - stop の猶予 → SIGKILL（#1545）・stop の意図の伝達（SUP-9）・`kill` コマンド（#1902。`production_signaler` を共用）。
 //! - logs の内容読み出し・list の JSON 出力: ログ契約と crate 境界の決定後（`list_logs` module の doc 参照。TASK-95・TASK-98）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・#641・PLUG-4。`plugin_backend` module）。発見 → 登録 → 信頼性検証までを
 //!   配線済みで、platform-* へは直接依存しない（`make check-cli-backend-deps`）。非 Linux の信頼性検証（PLUG-11）・plugin の
@@ -39,6 +41,7 @@ use fandhe_container_core::oci_runtime::{
 };
 use fandhe_container_core::traits::ErrorCode;
 
+use crate::doctor::DoctorExitStatus;
 use crate::error::CliError;
 
 mod args;
@@ -48,10 +51,13 @@ mod list_logs;
 #[cfg(any(not(target_os = "linux"), test))]
 mod plugin_backend;
 mod stop_delete;
+// start の実処理（supervisor の起動と結果の受信）。unix 固有の std API を使うため Linux の本番ビルドだけに含める。
+#[cfg(target_os = "linux")]
+mod supervisor_start;
 
 use args::{
-    parse_create, parse_delete, parse_global, parse_list, parse_logs, parse_setup, parse_start,
-    parse_stop,
+    parse_create, parse_delete, parse_doctor, parse_global, parse_list, parse_logs, parse_setup,
+    parse_start, parse_stop,
 };
 
 /// コマンドの区分（CLI-2・TASK-80.2）。日常操作は OS 固有設定を持たず、OS 固有設定は `setup` にのみ置く。
@@ -61,6 +67,8 @@ pub enum CommandKind {
     Daily,
     /// OS 固有設定のセットアップ（`setup`）。
     Setup,
+    /// 読み取り専用の診断（`doctor`。#2133・NET-10・CORE-3）。日常操作でも OS 設定でもなく、`crate::setup` を参照しない。
+    Diagnostic,
 }
 
 /// 基本コマンド（CLI-1）と setup（CLI-2）。日常操作か否かの区分は [`Command::kind`] で判定する。
@@ -74,11 +82,13 @@ pub enum Command {
     Logs,
     /// OS 固有設定のセットアップ（TASK-80.1・CLI-2。日常操作ではない）。
     Setup,
+    /// 読み取り専用の診断（NET-10・CORE-3。#2133。状態ルートを開かず plugin も解決しない）。
+    Doctor,
 }
 
 impl Command {
     /// 全コマンド（コマンド名の列挙順の SSOT）。
-    pub const ALL: [Command; 7] = [
+    pub const ALL: [Command; 8] = [
         Command::Create,
         Command::Start,
         Command::Stop,
@@ -86,9 +96,10 @@ impl Command {
         Command::List,
         Command::Logs,
         Command::Setup,
+        Command::Doctor,
     ];
 
-    /// 日常操作コマンドのみ（`ALL` から `Setup` を除いたもの。分離の照合の列挙元。TASK-80.2・TASK-80.3）。
+    /// 日常操作コマンドのみ（`ALL` から `Setup` と `Doctor` を除いたもの。分離の照合の列挙元。TASK-80.2・TASK-80.3）。
     pub const DAILY: [Command; 6] = [
         Command::Create,
         Command::Start,
@@ -108,6 +119,7 @@ impl Command {
             | Command::List
             | Command::Logs => CommandKind::Daily,
             Command::Setup => CommandKind::Setup,
+            Command::Doctor => CommandKind::Diagnostic,
         }
     }
 
@@ -121,6 +133,7 @@ impl Command {
             Command::List => "list",
             Command::Logs => "logs",
             Command::Setup => "setup",
+            Command::Doctor => "doctor",
         }
     }
 
@@ -151,6 +164,9 @@ pub enum CliExit {
     Runtime(OciRuntimeError),
     /// それ以外の全失敗（使い方エラー・未実装・状態ストア操作・setup。ERR-1。`op` を持たない）。
     Error(CliError),
+    /// `doctor` の診断が済んだ（#2133）。診断は stdout へ JSON Lines で書き済みで、終了コードは
+    /// [`DoctorExitStatus::code`](crate::doctor::DoctorExitStatus::code)（0 / 3 / 4、書き込み失敗は 1）。stderr には何も書かない。
+    Diagnosed(DoctorExitStatus),
 }
 
 impl CliExit {
@@ -203,6 +219,7 @@ impl CliExit {
             CliExit::Success => 0,
             CliExit::Runtime(e) => e.exit_code().get(),
             CliExit::Error(e) => e.exit_code().get(),
+            CliExit::Diagnosed(s) => s.code(),
         }
     }
 
@@ -212,6 +229,7 @@ impl CliExit {
             CliExit::Success => None,
             CliExit::Runtime(e) => Some(e.code().as_str()),
             CliExit::Error(e) => Some(e.code_str()),
+            CliExit::Diagnosed(_) => None,
         }
     }
 
@@ -223,14 +241,15 @@ impl CliExit {
     /// `O_APPEND` の共有ログへの 1 回の write〔`create_start::write_ops_once`〕とは別。ERR-1）。
     pub fn write_stderr(&self, out: &mut dyn Write) -> std::io::Result<()> {
         match self {
-            CliExit::Success => Ok(()),
+            CliExit::Success | CliExit::Diagnosed(_) => Ok(()),
             CliExit::Runtime(e) => e.write_json_line(out),
             CliExit::Error(e) => e.write_stderr(out),
         }
     }
 }
 
-const USAGE_MESSAGE: &str = "usage: fandhe-container <create|start|stop|delete|list|logs|setup>";
+const USAGE_MESSAGE: &str =
+    "usage: fandhe-container <create|start|stop|delete|list|logs|setup|doctor>";
 const STATE_ROOT_PARENT_NOT_FOUND_MESSAGE: &str = "parent of the state root not found";
 /// 回復手段（core の `purge_corrupted`）を管理操作名で示す。通常ファイルの entry や中身のある state.json ディレクトリは core が FailedPrecondition で拒否するため、拒否時は管理者による確認・手動回復を促す（core の削除防御は維持）。CLI に purge サブコマンドは無い（実在しない名を案内しない）。
 const STATE_STORE_CORRUPTED_MESSAGE: &str = "state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually";
@@ -303,6 +322,7 @@ pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write)
             Err(_) => usage(),
         },
         Command::Setup => run_setup(tail, stdout),
+        Command::Doctor => run_doctor(tail, stdout),
     }
 }
 
@@ -312,6 +332,15 @@ pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write)
 fn run_setup(tail: Vec<OsString>, stdout: &mut dyn Write) -> CliExit {
     match parse_setup(tail) {
         Ok(_) => crate::setup::run(stdout),
+        Err(_) => usage(),
+    }
+}
+
+/// `doctor` の実行（#2133・NET-10・CORE-3）。状態ルートも plugin も使わないため `GlobalArgs` を受け取らない
+/// （グローバルオプションは受理して無視する。`setup` と同じ）。診断は `stdout` へ書き、stderr は使わない。
+fn run_doctor(tail: Vec<OsString>, stdout: &mut dyn Write) -> CliExit {
+    match parse_doctor(tail) {
+        Ok(_) => CliExit::Diagnosed(crate::doctor::run(stdout)),
         Err(_) => usage(),
     }
 }
@@ -340,9 +369,10 @@ mod tests {
         assert_eq!(Command::parse("list"), Some(Command::List));
         assert_eq!(Command::parse("logs"), Some(Command::Logs));
         assert_eq!(Command::parse("setup"), Some(Command::Setup));
+        assert_eq!(Command::parse("doctor"), Some(Command::Doctor));
     }
 
-    /// CLI-2: `setup` だけが `Setup` 区分で、他 6 件は日常操作。
+    /// CLI-2: `setup` だけが `Setup` 区分、`doctor` だけが `Diagnostic` 区分で、他 6 件は日常操作。
     #[test]
     fn cli2_command_kind_classification() {
         let daily: Vec<&str> = Command::ALL
@@ -352,16 +382,17 @@ mod tests {
             .collect();
         assert_eq!(daily, ["create", "start", "stop", "delete", "list", "logs"]);
         assert_eq!(Command::Setup.kind(), CommandKind::Setup);
+        assert_eq!(Command::Doctor.kind(), CommandKind::Diagnostic);
     }
 
-    /// CLI-2: `DAILY` は `ALL` から `Setup` を除いたものと一致する。
+    /// CLI-2: `DAILY` は `ALL` から `Setup` と `Doctor` を除いたものと一致する。
     #[test]
     fn cli2_daily_is_all_minus_setup() {
         let names: Vec<&str> = Command::DAILY.iter().map(|c| c.as_str()).collect();
         assert_eq!(names, ["create", "start", "stop", "delete", "list", "logs"]);
         let rest: Vec<Command> = Command::ALL
             .into_iter()
-            .filter(|c| *c != Command::Setup)
+            .filter(|c| !matches!(c.kind(), CommandKind::Setup | CommandKind::Diagnostic))
             .collect();
         assert_eq!(rest, Command::DAILY.to_vec());
     }
@@ -372,7 +403,9 @@ mod tests {
         let names: Vec<&str> = Command::ALL.iter().map(|c| c.as_str()).collect();
         assert_eq!(
             names,
-            ["create", "start", "stop", "delete", "list", "logs", "setup"]
+            [
+                "create", "start", "stop", "delete", "list", "logs", "setup", "doctor"
+            ]
         );
     }
 
@@ -405,6 +438,8 @@ mod tests {
             args(&["list", "--all"]),
             args(&["setup", "x"]),
             args(&["setup", "--x"]),
+            args(&["doctor", "x"]),
+            args(&["doctor", "--x"]),
         ] {
             let r = run(a);
             assert_eq!(r.exit_code(), 2);
@@ -431,7 +466,7 @@ mod tests {
     /// ワイルドカード無しの match で、コマンド追加時に argv の割り当て漏れをコンパイルエラーにする。
     #[test]
     fn err1_all_commands_error_exit_is_structured_and_nonzero() {
-        let usage_line = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup>\"}\n";
+        let usage_line = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup|doctor>\"}\n";
         let mut covered = Vec::new();
         for command in Command::ALL {
             // 状態ストアを開く前（引数解析）で失敗する argv。OS に依存しない。
@@ -443,6 +478,7 @@ mod tests {
                 Command::List => vec!["list", "x"],
                 Command::Logs => vec!["logs"],
                 Command::Setup => vec!["setup", "x"],
+                Command::Doctor => vec!["doctor", "x"],
             };
             assert_eq!(argv[0], command.as_str());
             let exit = run(args(&argv));
@@ -452,7 +488,9 @@ mod tests {
         }
         assert_eq!(
             covered,
-            ["create", "start", "stop", "delete", "list", "logs", "setup"]
+            [
+                "create", "start", "stop", "delete", "list", "logs", "setup", "doctor"
+            ]
         );
     }
 
@@ -508,7 +546,7 @@ mod tests {
         for (exit, line) in [
             (
                 CliExit::usage(),
-                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup>\"}\n",
+                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup|doctor>\"}\n",
             ),
             (
                 CliExit::unimplemented(),
@@ -558,8 +596,8 @@ mod tests {
     /// Linux 経路の `run_to` 境界の単体テスト（TASK-79.5・#642・CLI-1）。
     ///
     /// 本番入口（引数解析 → 状態ストア open → core 呼び出し → `CliExit` への写像 → `write_stderr`）を
-    /// 6 コマンドそれぞれ直接呼んで検証する。本番 launcher / signaler は fail-closed のため
-    /// プロセス起動・シグナル送信は発生しない。全呼び出しは `invoke` が `--root <TmpDir>` を強制し、
+    /// 6 コマンドそれぞれ直接呼んで検証する。本番 launcher は fail-closed のため
+    /// プロセス起動は発生せず、signaler は supervisor 不在で UNAVAILABLE になりシグナル送信は発生しない。全呼び出しは `invoke` が `--root <TmpDir>` を強制し、
     /// 利用者の実状態ルートへ触れない。環境変数は変更しない（並列テストとの競合回避）。
     #[cfg(target_os = "linux")]
     mod linux {
@@ -683,8 +721,8 @@ mod tests {
             assert_eq!((o.exit, o.code), (2, Some("INVALID_ARGUMENT")));
         }
 
-        /// CLI-1・ERR-2・REPAIR-3: start は未作成で NOT_FOUND（3）、作成済みでも launcher 未提供のため UNIMPLEMENTED（8）で
-        /// 状態は Created のまま。
+        /// CLI-1・ERR-2・REPAIR-3: start は未作成で NOT_FOUND（3）。作成済みでも、テスト実行ファイルの隣に
+        /// 固定名の supervisor が無いため FAILED_PRECONDITION（5）で、状態は Created・pid なしのまま（Running を残さない。#1541）。
         #[test]
         fn cli1_run_start_on_linux() {
             let base = TmpDir::new("start");
@@ -696,8 +734,15 @@ mod tests {
 
             create_ok(&base, "c1");
             let o = invoke(&root, &["start", "c1"]);
-            assert_eq!(o.exit, 8);
-            assert_eq!(op_and_code(&o.stderr), failure("start", "UNIMPLEMENTED"));
+            assert_eq!(o.exit, 5);
+            assert_eq!(
+                op_and_code(&o.stderr),
+                failure("start", "FAILED_PRECONDITION")
+            );
+            assert_eq!(
+                (o.stdout.as_str(), o.code),
+                ("", Some("FAILED_PRECONDITION"))
+            );
 
             let o = invoke(&root, &["list"]);
             assert_eq!(o.stdout, "ID\tSTATUS\tPID\nc1\tcreated\t-\n");
@@ -997,6 +1042,15 @@ mod tests {
                     Command::List => (vec!["list"], 0, None, "ID\tSTATUS\tPID\nm1\tcreated\t-\n"),
                     Command::Logs => (vec!["logs", "none"], 3, Some("NOT_FOUND"), ""),
                     Command::Setup => (vec!["setup"], 0, None, ""),
+                    // doctor の終了コードと出力は実行環境に依る（0 / 3 / 4）。具体値は doctor 側の単体テストと
+                    // 結合試験で固定し、ここでは診断の終了であること・stderr が空であることだけを照合する。
+                    Command::Doctor => {
+                        let o = invoke(&root, &["doctor"]);
+                        assert!([0, 3, 4].contains(&o.exit), "doctor exit {}", o.exit);
+                        assert_eq!(o.code, None);
+                        covered.push(command.as_str());
+                        continue;
+                    }
                 };
                 assert_eq!(argv[0], command.as_str());
                 let o = invoke(&root, &argv);
@@ -1007,7 +1061,9 @@ mod tests {
             }
             assert_eq!(
                 covered,
-                ["create", "start", "stop", "delete", "list", "logs", "setup"]
+                [
+                    "create", "start", "stop", "delete", "list", "logs", "setup", "doctor"
+                ]
             );
         }
     }

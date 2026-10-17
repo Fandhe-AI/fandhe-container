@@ -38,12 +38,15 @@
 # エラーは stderr に `error: code=<code> message=<英語>` の 1 行で出す。
 set -euo pipefail
 
-err() {
-    printf 'error: code=%s message=%s\n' "$1" "$2" >&2
-}
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$script_dir/.." && pwd)"
+# lib.sh は source 時に cwd をリポジトリルートへ移す（make 経由と同じ意味にするため）。本スクリプトは
+# 利用者の相対パスを呼び出し元の cwd 基準で解釈するので、source 後に元の cwd へ戻す。
+caller_pwd="$PWD"
+# shellcheck source=lib.sh
+source "$root/scripts/lib.sh"
+cd -- "$caller_pwd" || { err_code bad-environment "cannot return to the working directory"; exit 2; }
 cargo="${CARGO:-cargo}"
 output=""
 timeout_s=600
@@ -51,103 +54,48 @@ timeout_s=600
 while [ $# -gt 0 ]; do
     case "$1" in
         --output)
-            [ $# -ge 2 ] || { err bad-argument "--output requires a value"; exit 2; }
+            [ $# -ge 2 ] || { err_code bad-argument "--output requires a value"; exit 2; }
             # 改行等の制御文字は祖先 symlink 検査（read による分割）を迂回し得るため拒否する。
             case "$2" in
-                *[[:cntrl:]]*) err bad-output "output path must not contain control characters"; exit 2 ;;
+                *[[:cntrl:]]*) err_code bad-output "output path must not contain control characters"; exit 2 ;;
             esac
             output="$2"
             shift 2
             ;;
         --timeout)
-            [ $# -ge 2 ] || { err bad-argument "--timeout requires a value"; exit 2; }
+            [ $# -ge 2 ] || { err_code bad-argument "--timeout requires a value"; exit 2; }
             timeout_s="$2"
             shift 2
             ;;
         *)
-            err bad-argument "unknown argument: $1"
+            err_code bad-argument "unknown argument: $1"
             exit 2
             ;;
     esac
 done
 
-if ! [[ "$timeout_s" =~ ^[0-9]{1,4}$ ]] || [ "$timeout_s" -lt 1 ] || [ "$timeout_s" -gt 3600 ]; then
-    err bad-argument "--timeout must be an integer between 1 and 3600"
+if ! int_in_range "$timeout_s" 1 3600; then
+    err_code bad-argument "--timeout must be an integer between 1 and 3600"
     exit 2
 fi
 
 for f in Cargo.toml about.toml about.hbs; do
-    [ -f "$root/$f" ] || { err bad-environment "missing $f in repository root"; exit 2; }
+    [ -f "$root/$f" ] || { err_code bad-environment "missing $f in repository root"; exit 2; }
 done
 
 # 一時領域（タイムアウト印の置き場）。後始末は cleanup が行う。
 work_dir=""
 tmp=""
-child_pid=""
-wd_pid=""
 cleanup() {
-    if [ -n "$child_pid" ]; then
-        kill -TERM -- "-$child_pid" 2>/dev/null || true
-        kill -KILL -- "-$child_pid" 2>/dev/null || true
-    fi
-    if [ -n "$wd_pid" ]; then
-        kill "$wd_pid" 2>/dev/null || true
-    fi
+    run_limited_abort
     [ -z "$tmp" ] || rm -f "$tmp"
     [ -z "$work_dir" ] || rm -rf "$work_dir"
 }
 trap cleanup EXIT
 trap 'exit 143' INT TERM
 
-work_dir="$(mktemp -d)" || { work_dir=""; err bad-environment "cannot create a temporary directory"; exit 2; }
-
-# 子プロセスを上限秒で打ち切る（macOS に timeout が無いため見張り役方式）。
-# 子は job control（set -m）で独立したプロセスグループにし、超過時はグループ全体へ
-# TERM → 猶予後 KILL を送って終了を確認する。超過時は 124 を返す。
-run_limited() {
-    local limit="$1"
-    shift
-    local marker="$work_dir/timeout-marker"
-    rm -f "$marker"
-    set -m
-    "$@" &
-    local pid=$!
-    set +m
-    child_pid="$pid"
-    (
-        i=0
-        while [ "$i" -lt "$limit" ]; do
-            sleep 1
-            kill -0 "$pid" 2>/dev/null || exit 0
-            i=$((i + 1))
-        done
-        : >"$marker"
-        kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-        sleep 2
-        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-    ) &
-    wd_pid=$!
-    local rc=0
-    wait "$pid" || rc=$?
-    if [ -e "$marker" ]; then
-        # 見張り役が KILL まで送り終えるのを待ち、グループの消滅を確認する。
-        wait "$wd_pid" 2>/dev/null || true
-        local n=0
-        while kill -0 -- "-$pid" 2>/dev/null && [ "$n" -lt 5 ]; do
-            sleep 1
-            n=$((n + 1))
-        done
-        wd_pid=""
-        child_pid=""
-        rm -f "$marker"
-        return 124
-    fi
-    kill "$wd_pid" 2>/dev/null || true
-    wait "$wd_pid" 2>/dev/null || true
-    wd_pid=""
-    child_pid=""
-    return "$rc"
-}
+work_dir="$(mktemp -d)" || { work_dir=""; err_code bad-environment "cannot create a temporary directory"; exit 2; }
+RUN_LIMITED_DIR="$work_dir"
 
 # パス要素のいずれかが symlink なら 1（symlink なし・未存在なら 0）を返す（存在する要素のみ検査し、無い要素で打ち切る）。
 # 非 root 実行時は root 所有の symlink（システム設定）を許容する。".." は字句的に畳む
@@ -179,7 +127,7 @@ path_is_symlink_free() {
 
 # ツール確認は入力検証より先に行い、未導入を別の失敗と誤分類しない。
 if ! run_limited 30 "$cargo" about --version >/dev/null 2>&1; then
-    err tool-missing "cargo-about is not installed (run: make install-cargo-about)"
+    err_code tool-missing "cargo-about is not installed (run: make install-cargo-about)"
     exit 2
 fi
 
@@ -188,41 +136,41 @@ if [ -z "$output" ]; then
     output="$default_dir/THIRD-PARTY-LICENSES.md"
     # mkdir より前に祖先（target 等）の symlink を検査する。
     if ! path_is_symlink_free "$default_dir"; then
-        err bad-output "output directory path must not contain a symlink"
+        err_code bad-output "output directory path must not contain a symlink"
         exit 2
     fi
-    mkdir -p "$default_dir" 2>/dev/null || { err bad-output "cannot create the default output directory"; exit 2; }
+    mkdir -p "$default_dir" 2>/dev/null || { err_code bad-output "cannot create the default output directory"; exit 2; }
 fi
 out_dir="$(dirname "$output")"
 if ! path_is_symlink_free "$out_dir"; then
-    err bad-output "output directory path must not contain a symlink"
+    err_code bad-output "output directory path must not contain a symlink"
     exit 2
 fi
 if [ ! -d "$out_dir" ]; then
-    err bad-output "output directory does not exist"
+    err_code bad-output "output directory does not exist"
     exit 2
 fi
-out_dir="$(cd "$out_dir" && pwd)" || { err bad-output "cannot enter the output directory"; exit 2; }
+out_dir="$(cd "$out_dir" && pwd)" || { err_code bad-output "cannot enter the output directory"; exit 2; }
 output="$out_dir/$(basename "$output")"
 if [ -L "$output" ]; then
-    err bad-output "output path must not be a symlink"
+    err_code bad-output "output path must not be a symlink"
     exit 2
 fi
 if [ -e "$output" ] && [ ! -f "$output" ]; then
-    err bad-output "output path exists and is not a regular file"
+    err_code bad-output "output path exists and is not a regular file"
     exit 2
 fi
 
 tmp="$(mktemp "$out_dir/.third-party-licenses.XXXXXX" 2>/dev/null)" \
-    || { tmp=""; err bad-output "cannot create a temporary file in the output directory"; exit 2; }
+    || { tmp=""; err_code bad-output "cannot create a temporary file in the output directory"; exit 2; }
 
 rc=0
 run_limited "$timeout_s" "$cargo" fetch --locked --manifest-path "$root/Cargo.toml" >&2 || rc=$?
 if [ "$rc" -eq 124 ]; then
-    err timeout "cargo fetch exceeded ${timeout_s}s"
+    err_code timeout "cargo fetch exceeded ${timeout_s}s"
     exit 3
 elif [ "$rc" -ne 0 ]; then
-    err fetch-failed "cargo fetch failed"
+    err_code fetch-failed "cargo fetch failed"
     exit 1
 fi
 
@@ -232,18 +180,18 @@ rc=0
 run_limited "$timeout_s" "$cargo" about generate --frozen --workspace --all-features --fail \
     -m "$root/Cargo.toml" -c "$root/about.toml" -o "$tmp" "$root/about.hbs" >&2 || rc=$?
 if [ "$rc" -eq 124 ]; then
-    err timeout "cargo about generate exceeded ${timeout_s}s"
+    err_code timeout "cargo about generate exceeded ${timeout_s}s"
     exit 3
 elif [ "$rc" -ne 0 ]; then
-    err generate-failed "cargo about generate failed"
+    err_code generate-failed "cargo about generate failed"
     exit 1
 fi
 
 if [ ! -s "$tmp" ]; then
-    err generate-failed "cargo about generate produced an empty output"
+    err_code generate-failed "cargo about generate produced an empty output"
     exit 1
 fi
 
-mv -f "$tmp" "$output" 2>/dev/null || { err bad-output "cannot move the generated file to the output path"; exit 2; }
+mv -f "$tmp" "$output" 2>/dev/null || { err_code bad-output "cannot move the generated file to the output path"; exit 2; }
 tmp=""
 printf '%s\n' "$output"

@@ -51,7 +51,7 @@
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
 //! - `oci_runtime`: OCI Runtime のライフサイクル。`config.json` の型・パーサ
 //!   （TASK-29.1.1）と create（プロセス未起動の状態初期化。TASK-29.2）は実装済み・OS 非依存。
-//!   start（TASK-29.3）の起動は `ProcessLauncher` の依存注入で、本番 launcher（`ProductionLauncher`・Linux。#1816）は実装済み。supervisor の呼び出しスレッドの再構成（#1819）は未実装。
+//!   start（TASK-29.3）の起動は `ProcessLauncher` の依存注入で、本番 launcher（`ProductionLauncher`・Linux。#1816）は実装済み。supervisor の start 経路は呼び出しスレッドでの直接 launch へ再構成済み（#1819）。restart の再 launch は未対応（#2043）。
 //!   kill（TASK-30.1）も実装済みで、送信は `ProcessSignaler` の依存注入（本番実装は supervisor 待ち）。delete（TASK-30.2・TASK-30.3）は cgroup（`ContainerCgroupRemover` の依存注入）と `StateStore` のレコードの削除を実装済みで、OCI-7 の参照解除は TASK-183 で未実装。
 //!   失敗のエラー型 `OciRuntimeError`（ERR-2・TASK-96.1）は定義済みで、4 操作（create / start / kill / delete）は結線済み・`write_json_line` で stderr 向け 1 行を出せる（TASK-96.2・TASK-96.3）。実 stderr 出力・終了は CLI 側で未実装
 //! - `tmpfs`: tmpfs マウントの検証済み仕様型（`--shm-size` / `--tmpfs`。SUP-12・TASK-169.2）。OS 非依存で、

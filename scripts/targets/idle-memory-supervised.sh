@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 監視プロセス込みのアイドル常駐メモリ回帰テスト（make idle-memory-supervised。TASK-47・CORE-7・Linux・実機前提）。
 #
-# 実機前提（root 権限の操作者が driver を渡して明示実行する。実 driver は製品バイナリ未提供のため現状なし。make ci には
+# 実機前提（root 権限の操作者が driver を渡して明示実行する。製品バイナリは提供済みだが、実機で使える driver は特権の橋渡し〔#2099〕が入るまで無い。make ci には
 # 含めない。ci.md「実機前提テスト」）。全体に timeout を掛け（REPAIR-5）、終了コードの変換規則は idle-memory と同じ。
 # 入力は環境変数: DRIVER（必須。絶対パス）、EXPECTED_DIR・OUTPUT（任意）、IDLE_MEMORY_SUPERVISED_TIMEOUT（全体の秒数。
 # 1〜999999・既定 900）、IDLE_MEMORY_SUPERVISED_CALL_TIMEOUT（driver・各計測 1 回あたりの秒数。未指定ならスクリプト既定）。

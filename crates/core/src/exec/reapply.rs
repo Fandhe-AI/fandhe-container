@@ -166,6 +166,12 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
+//! - Mount 由来のルールの対象がマウントのルートであることのマウント ID での照合（#2071）。launch は
+//!   `MountCheck::Recorded` で行うが、再適用は `MountCheck::NotRecorded`（暗黙のマウントの fs 種別・独立性の確認だけ）。
+//!   `LaunchIsolationRecord` がマウントの識別子を持たず、本番 launcher が記録を `state.json` へ書く結線も無く、マウント ID は
+//!   restart で変わるため。必要なもの: 記録へ識別子を足す（トレイト契約 12 の拡張）・子が pivot 前段の識別子を状態 pipe で
+//!   親へ返す・親が記録し restart で更新する・`TargetBinding.proc_dir` から `fdinfo/N` を読む（`setns` の後は
+//!   `/proc/thread-self` が使えないため）
 //! - `process.user` が root 以外の場合のユーザー切り替え（launch・exec とも未実装。exec は別の user namespace へ
 //!   参加するとき、launch と同じく root 以外を `Unimplemented` で拒否する）
 //! - ルールパスの解決の起点とプロセスの `/` が食い違う状況での照合専用の試験（上記 4）

@@ -1,6 +1,9 @@
 # ツールチェーン単一真実源（fandhe-db・rust-ai-library と同一方針）。
 # rustup show が本ファイルを検出して未導入なら自動インストールする。
 # channel は stable 追従とし、rustfmt / clippy を必須 component として列挙する。
+# targets は macOS ゲスト用 init（crates/guest-init）の配布ターゲット（#1823 のオーナー判断・#1875・MAC-1）。
+# 影響: 各開発者と各 CI ジョブで、rustup がこのターゲットの std を自動で取得する（ホストのビルドは変わらない）。
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
+targets = ["aarch64-unknown-linux-musl"]

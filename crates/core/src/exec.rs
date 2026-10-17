@@ -27,6 +27,9 @@
 //!    その直後に、覆うパスの固定集合（`/proc` 配下の 10 件。SEC-2・#1851）を `masked_paths` 段が適用する
 //!    （ファイルは検証済みの `/dev/null`、ディレクトリは読み取り専用の空 tmpfs を載せる。適用は `exec::masked_paths`。
 //!    **実装済み**だが、検証済みの `/dev/null` が要るため `setup` 指定時のみ。`setup` なしの最小構成は適用しない）
+//!    検証済みの bind mount（`config.json` の `mounts[]` の bind。CORE-1・SEC-1）は [`mount_binds`]（`exec/bind_mounts.rs`。
+//!    TASK-29 追補・#1913。**段の実装は済み**。`run_pre_pivot` へ組み込み済みで、`inject_files` の後・`readonly_paths` の前に固定した〔#1914〕。
+//!    `start` と本番 launcher への結線は #1915 で済み）が、マウント元の固定・属性・付け替え・事後検証を fd 起点で行う
 //! 4. 順序固定のステージ列: cgroup 参加 → capability 削減 → `PR_SET_NO_NEW_PRIVS`
 //!    → Landlock → seccomp（#136・#832・#833。**枠・`NO_NEW_PRIVS`・capability 削減・seccomp は実装済み**: [`StagePipeline`] が
 //!    [`StageKind::ORDER`] の固定順でフックを呼び、`NO_NEW_PRIVS` は差し替え不可の組み込み段として
@@ -106,6 +109,7 @@ use crate::rootless::{
 use crate::sys::{self, NsFlag, SysError};
 use crate::traits::types::ErrorCode;
 
+mod bind_mounts;
 mod capabilities;
 mod cgroup_join;
 mod container_env;
@@ -136,6 +140,12 @@ mod violation;
 #[cfg(test)]
 mod violation_scan;
 
+/// 結合試験専用の再公開（TASK-29 追補・#1913・#1916。通常の利用者は呼ばない。詳細は定義側）。
+/// `exec-test-support` feature を付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use bind_mounts::mount_binds_with_attach_hook;
+pub use bind_mounts::{BindMountOutcome, BindMountReport, BindSourceType, mount_binds};
 pub use capabilities::{CapabilityReport, SupplementaryGroups};
 /// 結合試験 `tests/exec_child_setup.rs`・supervisor の `tests/exec_setns_join.rs` 専用の再公開
 /// （SUP-6・TASK-163 追補・#1457。通常の利用者は呼ばない。詳細は定義側）。
@@ -183,6 +193,10 @@ pub(crate) use launch_intermediate::{
     IntermediateSpec, LaunchTag, Rescan, rescan_unreported_init, spawn_container_via_intermediate,
 };
 pub(crate) use launch_status::LaunchAudit;
+/// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・SEC-5・REPAIR-10・#2072。通常の利用者は呼ばない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use launch_status::relay_mount_binds_failure_for_test;
 /// supervisor の `SETUP_VIOLATIONS` との突き合わせ試験専用の再公開（SEC-4・SUP-6・#1579。通常の利用者は呼ばない）。
 #[doc(hidden)]
 pub use process::exec_child_violation_reasons;
@@ -415,8 +429,9 @@ pub fn record_exec_worker_rejection<E>(
 ///
 /// 呼び出し元は、子が状態 pipe で運んだ失敗を復号した親プロセス（`launch_status` の判定。将来は本番 launcher）。
 /// `reason` は `ViolationReason::from_launch_token` で引き直した値を渡す。種別 `mount_target`・
-/// `shared_propagation`・`rootfs_pivot` だけが層 `mount` のパスなし・理由コードつきのレコードになり
-/// （[`audit_mount_violation`] と同じ写像）、`establish_precondition`・`evidence_mismatch` は記録せず
+/// `shared_propagation`・`rootfs_pivot` と、bind mount の段の user namespace 由来の 2 理由
+/// （`user_namespace_required`・`host_root_identity_mapping`。SEC-5・#2072）だけが、層 `mount` の
+/// パスなし・理由コードつきのレコードになり（[`audit_mount_violation`] と同じ写像）、`establish_precondition`・`evidence_mismatch` は記録せず
 /// `NotApplicable`。時刻と PID は記録を行った親プロセスのもの（違反した子ではない）。パスは載らない。
 /// 記録の成否で `error` は変わらない（fail-closed）。
 pub fn record_launch_mount_rejection<E>(
@@ -728,6 +743,8 @@ pub enum IsolationStage {
     MountReadonlyPaths,
     /// 覆うパスの固定集合の適用（`/proc` 配下の 10 件。SEC-2・TASK-29 追補・#1851）。
     MountMaskedPaths,
+    /// 検証済みの bind mount（`mounts[]` の bind。fd 起点で rootfs へ適用する段。CORE-1・SEC-1・TASK-29 追補・#1913）。
+    MountBinds,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。
@@ -949,6 +966,11 @@ pub struct MountIsolation {
 /// `PID_NS_INIT_INO`）。初期 namespace の inode は uapi で予約された固定値で、アーキテクチャに
 /// 依存しない。
 const PID_NS_INIT_INO: u64 = 0xEFFF_FFFC;
+
+/// 初期 user namespace の inode 番号（同じ `enum init_ns_ino` の `USER_NS_INIT_INO`。[`PID_NS_INIT_INO`] の
+/// 1 つ上）。bind mount の適用段が、user namespace の外（init）で呼ばれていないことの確認に使う
+/// （`exec/bind_mounts.rs`・#1913・SEC-5）。
+const USER_NS_INIT_INO: u64 = 0xEFFF_FFFD;
 
 /// `/proc/thread-self/ns/pid` のリンク先（`pid:[inode]`）の inode 番号。書式に反すれば `None`。
 fn parse_pid_ns_inode(link: &str) -> Option<u64> {
@@ -1485,7 +1507,7 @@ fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
 /// 呼び出し元が `CLONE_NEWUSER` → mapper へ go → mapper が親 pid の `uid_map` / `gid_map` を書く
 /// （`newuidmap` / `newgidmap` 経由は setuid ヘルパーで root 権限を代替）→ 応答（固定 3 バイト）を
 /// 上限付き・タイムアウト付きで受領 → 自プロセスの写像を読み戻して計画と照合 → user namespace 内で
-/// uid / gid が 0 であることを確認 → 残りの namespace を分離（[`isolate`] と同じ `MS_PRIVATE`・hostname）。
+/// uid / gid が 0 であることを確認 → 残りの namespace を分離（[`isolate`] と同じく `Mount` を含むときだけ `/` を再帰 private 化・hostname）。
 ///
 /// 契約:
 /// - シングルスレッドから呼ぶこと（mapper の fork と `CLONE_NEWUSER` の制約。マルチスレッドは
@@ -1889,7 +1911,7 @@ fn fd_still_at(dir: &OwnedFd, expected: &Path) -> bool {
 }
 
 /// `/proc/thread-self/fdinfo/<fd>` の `mnt_id:` 行（fd が属するマウントの ID）を取り出す。
-fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
+pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
     fdinfo
         .lines()
         .find_map(|l| l.strip_prefix("mnt_id:"))
@@ -1927,9 +1949,18 @@ fn fd_mount_id(dir: &OwnedFd, stage: IsolationStage) -> Result<u64, ExecError> {
 /// 呼び出しスレッドの mount namespace の mountinfo（`/proc/self/mountinfo` はスレッドグループの
 /// 代表の namespace を映すため使わない）。
 fn read_thread_mountinfo(stage: IsolationStage) -> Result<String, ExecError> {
-    std::fs::read_to_string("/proc/thread-self/mountinfo").map_err(|_| {
-        mountinfo_error("cannot read /proc/thread-self/mountinfo to verify mount propagation")
-            .at_stage(stage)
+    use crate::oci_runtime::mountinfo_identity::{MountinfoReadError, read_mountinfo_bounded};
+    // 上限つきで読む（巨大な mountinfo による無制限確保を避ける。超過は fail-closed）。
+    read_mountinfo_bounded("/proc/thread-self/mountinfo").map_err(|e| {
+        let msg = match e {
+            MountinfoReadError::TooLarge => {
+                "/proc/thread-self/mountinfo exceeds the size limit; cannot verify mount propagation"
+            }
+            MountinfoReadError::Unreadable => {
+                "cannot read /proc/thread-self/mountinfo to verify mount propagation"
+            }
+        };
+        mountinfo_error(msg).at_stage(stage)
     })
 }
 
@@ -2471,6 +2502,13 @@ mod tests {
             "mount_proc must be called by PID 1 of the isolated PID namespace"
         );
         assert_eq!(take_dry_run_mounts(), Vec::<String>::new());
+    }
+
+    /// 初期 user namespace の inode の具体値（`include/uapi/linux/nsfs.h`。#1913・SEC-5）。
+    #[test]
+    fn user_ns_init_ino_is_reserved_value() {
+        assert_eq!(USER_NS_INIT_INO, 4_026_531_837);
+        assert_eq!(USER_NS_INIT_INO, PID_NS_INIT_INO + 1);
     }
 
     /// `ns/pid` の inode の解析と、初期 PID namespace の inode の具体値。

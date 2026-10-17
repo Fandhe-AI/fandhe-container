@@ -26,6 +26,9 @@ protox.workspace = true
 # オーナー判断 2026-10-10 の cri / plugin の gRPC 面。features は rt のみ。workspace 既存の =1.53.2 で新規パッケージなし）。
 [dependencies]
 fandhe-container-oci = { path = "../oci" }
+# ContainerRuntime トレイト境界の呼び出しアダプタ（TASK-59.1・#437・CRI-2・CRI-7）。workspace 内 path 依存で外部クレートの追加ではない。
+# 参照は core の traits のみ。plugin feature は引き込まない（default-features = false）。
+fandhe-container-core = { path = "../core", default-features = false }
 tokio = { workspace = true, features = ["rt"] }
 tonic.workspace = true
 tonic-prost.workspace = true

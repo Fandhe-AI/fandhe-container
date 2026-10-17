@@ -353,7 +353,9 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         AuditEvent::Landlock { path, syscall, .. } => (syscall.map(|s| s.get()), Some(path)),
         AuditEvent::Mount { path, .. } => (None, path.as_ref()),
         AuditEvent::PluginTrust { path, .. } => (None, Some(path)),
-        AuditEvent::ExecTarget { .. } | AuditEvent::Entrypoint { .. } => (None, None),
+        AuditEvent::ExecTarget { .. }
+        | AuditEvent::Entrypoint { .. }
+        | AuditEvent::ControlPeer { .. } => (None, None),
     };
     let ts = record.timestamp().as_unix_duration();
     let dto = AuditLineDto {

@@ -58,9 +58,10 @@
 //! - `logs` コマンドからの読み出し経路: TASK-164 以降 / CLI 側（ログ名の列挙は [`log_file_paths`] が実装済みで、ロックファイルを含めない。内容の読み出し・CLI 配線は未実装。TASK-164 追補・#1469）。
 //! - コンテナ削除経路からの [`RotatingFileSink::remove_all`]（ログ・ロックファイルの一括削除）の呼び出し配線: SUP-7・TASK-164 追補（#1469）。
 //! - 本番 launcher からの呼び出し配線: 子の stdout / stderr をパイプへ接続する機構（core の `exec::ChildStdio`）と、
-//!   読み取り側を受け取って起動・再起動をまたいで捕捉する配線（[`crate::log_pipeline::CaptureHub`]）は実装済みだが
-//!   （TASK-164 追補・#1471）、core の本番 `ProcessLauncher`（TASK-29 追補の Phase B）が `ChildStdio` を使って
-//!   `LaunchedProcess::take_output` を返す部分は未実装。入力は注入式のままである。
+//!   読み取り側を受け取って起動・再起動をまたいで捕捉する配線（[`crate::log_pipeline::CaptureHub`]）は実装済みで
+//!   （TASK-164 追補・#1471）、core の本番 `ProcessLauncher` が `LaunchedProcess::take_output` で返す読み取り側を、
+//!   supervisor の bin の入口（`start_entry::run_supervised`）が捕捉ハブへ渡す（#1819）。実プロセスでの確認は
+//!   実機前提の `tests/supervisor_bin_real.rs`。再起動をまたぐ捕捉は、再 launch の実機での成立（#2043）を待つ。
 //!
 //! 既定の [`MemoryLogSink`] はメモリ保持のみ（上限付き）で、supervisor 終了時に失われる。永続化には [`rotating::RotatingFileSink`] を注入する。
 
@@ -224,7 +225,7 @@ impl StreamKind {
     }
 }
 
-/// 注入される出力ストリーム（実パイプは core が未提供のため呼び出し側が渡す）。
+/// 注入される出力ストリーム（実パイプは core の本番 launcher が作り、`LaunchedProcess::take_output` で渡される）。
 ///
 /// 生存リーダー数の予算（[`ReaderBudget`]）と必ず組で作る。予算なしで作る経路（`Default` 等）は意図的に提供しない
 /// （既定の予算を暗黙に作ると、捕捉を繰り返すたびに上限が振り出しに戻るため。REPAIR-5）。

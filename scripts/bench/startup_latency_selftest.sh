@@ -4,7 +4,7 @@
 # 役割: 実ランタイム・root を使わず、bash のスタブランタイム（create / start / delete /
 # kill を模し、固定 sleep と呼び出しログを持つ）で、終了コード・出力 JSON の値・呼び出し
 # 順序・タイムアウト・後始末を具体値で機械照合する。own 実装の実測そのものは行わない
-# （CLI 提供後に人間が #213 で実施する。startup_latency.sh 冒頭の「現状の制約」参照）。
+# （own の実測は #1890 の後に人間が #213 で実施する。startup_latency.sh 冒頭の「現状の制約」参照）。
 # 呼び出し元は Makefile の `startup-latency-selftest` ターゲットと
 # `.github/workflows/ci.yml` の `bench-regression` ジョブ。
 #

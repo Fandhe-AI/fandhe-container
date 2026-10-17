@@ -22,6 +22,8 @@ workspace は次の層に分けられる。
 6. **plugin 境界の外側（バックエンド実装ライブラリ）**: `cri`・`platform-macos`・`platform-windows`・`microvm`。PLUG-1 上は「core」ではなく、対応する plugin バイナリから呼ばれる実装本体
 7. **plugin バイナリ（別プロセス）**: `plugin-cri`・`plugin-macos`・`plugin-windows`・`plugin-microvm`・`plugin-mcp`。UDS 境界（PLUG-2）を越えて 6. の実装ライブラリを動かす
 
+`guest-init`（`fandhe-container-guest-init`）は macOS ゲスト VM の initrd に入れる PID 1 で、ホスト側の層には属さない「ゲスト資産」である（crate-naming.md の表 #20。#1823・#1875）。通常の依存を持たず（std のみ）、`platform-macos` への依存は契約の照合試験（`tests/contract.rs`）のための `[dev-dependencies]` のみ。
+
 `benches`（`fandhe-container-benches`）は上記いずれの層にも属さない、crate をまたぐベンチ回帰専用の `publish = false` workspace メンバーである（crate-naming.md 決定 7）。
 
 ### crate 一覧の要約表
@@ -38,6 +40,7 @@ workspace は次の層に分けられる。
 | 独立ツール | compose-convert |
 | plugin 境界の外側（バックエンド実装） | cri・platform-macos・platform-windows・microvm |
 | plugin バイナリ | plugin-cri・plugin-macos・plugin-windows・plugin-microvm・plugin-mcp |
+| ゲスト資産（ホスト側の層の外） | guest-init |
 | ベンチ専用 | benches |
 
 ### crate 境界図
@@ -148,6 +151,7 @@ flowchart LR
     cli -.->|想定| oci
     cli -.->|想定| stack
     cli -->|確定| net
+    cli -->|確定| supervisor
     cli -->|確定| plugin
     platform_macos -->|確定| io
     plugin_star["plugin-*（バイナリ群）"] -.->|想定| core
@@ -159,15 +163,18 @@ flowchart LR
 | 依存元 → 依存先 | 根拠 | 状態 |
 | ---------------- | ---- | ---- |
 | `compose-convert` → `stack` | crate-naming.md 決定 5（TOML の型は `stack` のものを使う） | 確定 |
+| `guest-init` →(dev) `platform-macos` | ゲスト init と `guest_mount` の契約の機械照合（`tests/contract.rs`。MAC-1・#1875。dev-dependencies のみで、通常の依存には入れない。外部クレートの追加ではない） | 確定 |
 | `supervisor` → `core` | crate-naming.md 決定 6（`StateStore` 既定実装を core に一本化。supervisor は 2 つ目の実装を持たない） | 確定 |
 | `plugin-cri` → `cri` | crate-naming.md 表 #15（`cri` の実装を別プロセス化。TASK-114） | 確定 |
 | `cri` → `oci` | `PullImage` が oci の pull 経路（認証・manifest・blob 取得・digest 検証）を呼ぶ（CRI-4・OCI-1・TASK-61.3・#446。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド実装ライブラリ → core 側で、規則 2 の逆向き（core 側が `cri` に依存しない）のため抵触しない | 確定 |
+| `cri` → `core` | `RuntimeAdapter` が `ContainerRuntime` トレイト（`traits` のみ。具象の実行層は参照しない）を呼ぶ（CRI-2・CRI-7・TASK-59.1・#437。workspace 内 path 依存・`default-features = false` で外部クレートの追加なし）。向きはバックエンド実装ライブラリ → core 側で、規則 2 の逆向き（core 側が `cri` に依存しない）のため抵触しない | 確定 |
 | `plugin-macos` → `platform-macos` | crate-naming.md 表 #16（TASK-115） | 確定 |
 | `plugin-windows` → `platform-windows` | crate-naming.md 表 #17（TASK-116） | 確定 |
 | `plugin-microvm` → `microvm` | crate-naming.md 表 #18（TASK-117） | 確定 |
 | `plugin`（境界基盤） | crate-naming.md 表 #10（core 側・plugin 側双方が依存する境界基盤） | 確定（依存の向きは双方向的な基盤利用であり、上記フローチャートでは個別の辺として描かない） |
 | `core` → `io` | `VolumeProvider`（core 実装）がデータパスで I/O 共有層を使う想定（D-14。G2/G3 で確定） | 想定 |
 | `cli` → `core` | 統一 CLI が実行層を呼ぶ。Linux は core を直接、macOS / Windows は core の plugin 発見・登録機構（PLUG-4）経由で、platform-* / microvm 系へは直接依存しない（`make check-cli-backend-deps` で normal / build / dev 辺・全ターゲットを機械判定。TASK-79.2〜79.4） | 確定 |
+| `cli` → `supervisor` | `start` が supervisor の bin を起動し、結果の 1 行を契約の型（`start_contract::StartReport`）で復号する。実行ファイルの固定名（`launcher::SUPERVISOR_FILE_NAME`）もここから得る（TASK-79 追補・#1718・REPAIR-2。workspace 内 path 依存で実装済み。外部クレートの追加ではない。supervisor は core にのみ依存し循環しない） | 確定 |
 | `cli` → `oci` | 統一 CLI がイメージ管理を呼ぶ想定（G6・TASK-79） | 想定 |
 | `platform-macos` → `io` | virtiofs 共有の I/O 共有プロトコルクライアント（`PipelineClient`）を使う（MAC-1・TASK-65.2。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド → core 側で、規則 2 の逆向きのため抵触しない | 確定 |
 | `cli` → `net` | `doctor` が br_netfilter・ホストの `ip filter FORWARD` policy の判定材料を net の読み取り照会（GETCHAIN）で取得する（NET-10・TASK-148.1。workspace 内 path 依存で実装済み。組み合わせ判定・警告・DOCKER-USER 案内・終了コードの評価層は TASK-148.2 で実装済み。CLI 配線は TASK-79） | 確定 |
@@ -199,25 +206,25 @@ D-14（方針追記 2）に基づく core / plugin の割り付け表を以下�
 | Linux ネイティブ実行層（`api-runtime-core.md`）・I/O 共有プロトコル（`api-io-share.md`）・OCI イメージ（`api-oci-image.md`）・CLI（`screen-cli.md`） | core | D-14 の core 範囲定義そのもの |
 | `ContainerRuntime`（`api-cri.md` CRI-7） | plugin（トレイト定義は core、実装を別プロセスへ配置可能） | 制御面のみを扱い、Δp50=5.542μs（長さ接頭辞フレーム）で CORE-10/MAC-2 目標に無視できる影響（PoC-13。フレーム方式の値は bincode ペイロードでの計測値であり、serde_json 変更に伴い TASK-113 で再計測する） |
 | `StateStore`（同上） | **core**（トレイト定義・ファイルベースの既定実装とも core。別実装〔分散ストア等〕は plugin として差し替え可能） | 既定実装は core、別実装は plugin で差し替え可能。CLI・supervisor・`create`/`delete` の全経路が使う状態ファイル（OCI-5）であり、plugin 未導入の最小構成でも状態管理を完結させ、常駐デーモンを持たない CORE-1 と整合させるため（ユーザー決定 2026-09-26）。別実装を plugin に出す場合のオーバーヘッドは制御面として許容範囲（PoC-13） |
-| `NetworkPlugin`（同上） | plugin（同上） | 制御面（ネットワーク設定操作）でありデータパス（パケット転送そのもの）ではないため同様に許容範囲（PoC-13） |
+| `NetworkPlugin`（同上） | plugin（同上） | 制御面（ネットワーク設定操作）でありデータパス（パケット転送そのもの）ではないため同様に許容範囲（PoC-13）。rootful のネットワーク設定（veth・bridge・nftables）もこの実装が `crates/net` を使って行い、core は network namespace を用意してその参照を渡すだけにする（CNI と同じ形。2026-10-15 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6200154873)） |
 | `VolumeProvider`（同上） | **core**（トレイト定義・実装とも core に残す） | データパス（ファイル I/O）に接するため。gRPC 境界で PoC-2 batch 比 17.62%、フレーム境界でも 3.71% の劣化が数値で示された（PoC-13 データパス机上見積もり） |
 | macOS バックエンド（`api-platform-macos.md`） | plugin（別プロセス、常駐/都度起動いずれも可） | MAC-2 上乗せが常駐 5.032ms（core-harness 起動＋UDS 接続＋4 RPC〔代表操作 A・B〕を含む保守的な値）・都度起動 2.537ms（いずれも 2 秒目標の 0.3%未満、PoC-13） |
 | Windows バックエンド（`api-platform-windows.md`） | plugin（macOS と同型の境界を想定） | 上記と同様の制御面境界コストの見込み。実測は macOS 単独のため参考値（PoC-13、Linux/Windows での再確認は Phase 5 へ申し送り） |
 | microVM（`api-microvm.md`） | plugin（起動・停止等の制御面のみ。VM 内部の I/O パスは対象外） | 制御面操作である限り上記と同様（PoC-13） |
 | CRI サーバー（`api-cri.md`） | plugin | 制御面（`RunPodSandbox` 等）であり PoC-13 の代表操作 (A) そのもの |
 | MCP サーバー（`api-mcp.md`） | plugin（`fandhe-container-plugin-mcp` として参照実装済み） | core 無変更で追加可能なことを実証（PoC-13 成功基準 3） |
-| CDI の適用・OCI hook の実行（`api-gpu.md` GPU-1〜GPU-4） | core（推奨） | GPU の device node・mount・env 付与は汎用の mount／device 操作であり D-14 の core 範囲定義（Linux ネイティブ実行層）と整合する。hook はホスト権限でコンテナの rootfs を書き換える（ld キャッシュ更新等）ため、core 内で OCI hook（`createContainer` 相当）を実行する機能として実装する案を推奨する（D-15、gpu-passthrough-cdi〔PoC-14〕）。未解決疑問点 11 は未決であり、core 範囲の最終確定はスコープ確認（Phase 4→5）以降に持ち越す |
+| CDI の適用・OCI hook の実行（`api-gpu.md` GPU-1〜GPU-4） | core（2026-10-15 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6200154873)） | GPU の device node・mount・env 付与は汎用の mount／device 操作であり D-14 の core 範囲定義（Linux ネイティブ実行層）と整合する。hook はホスト権限でコンテナの rootfs を書き換える（ld キャッシュ更新等）ため、core 内で OCI hook（`createContainer` 相当）を実行する機能として実装する（D-15、gpu-passthrough-cdi〔PoC-14〕）。hook はコンテナ作成の途中（`/proc` のマウントの後・`pivot_root` の前）に実行する必要があり、plugin へ出すと起動の経路にプロセス間の往復が入るため core に置く。hook はホストの権限で動くため、タイムアウト（REPAIR-5）と実行ファイルのパスの検証を必須とする |
 | rootless ネットワーク転送（`api-network.md` NET-9） | 例外として認める（2026-10-12 オーナー決定、#340） | ユーザー空間転送（pasta）はデータパス上で動作するプロセスだが、転送は外部ヘルパーのプロセスが担い、core⇔plugin の IPC 往復がデータパスに入るわけではない。この整理を D-14 の原則（plugin 境界をデータパスに置かない）の例外として認める。例外は rootless の経路に限り、rootful の経路（veth・bridge・nftables）は変えない。fandhe-container 側が持つのは pasta の起動・監視（制御面）で、その起動・監視・回収は、コンテナごとの supervisor（core 側）が行う（2026-10-12 オーナー決定、#4・#1935）。pasta はコンテナごとに 1 プロセスで寿命がコンテナと同じであり、コンテナの終了・stop・delete・supervisor の異常終了で確実に回収できるのは親である supervisor のため。常駐デーモンを置かない CORE-1 の下で plugin 側に置くと、都度起動の plugin が親になり回収の仕組みを別に作ることになる。起動の経路に plugin との往復を足さない。 |
 | DNS ヘルパー（`api-network.md` NET-5） | 例外として認める（2026-10-12 オーナー決定、#4） | ネットワークごとの DNS ヘルパーはデータパス上で動作するプロセスだが、core⇔plugin の IPC 往復がデータパスに入るわけではなく、ヘルパー自体がネットワークを構成するという点で `VolumeProvider`（データパスのため core 固定）とは性質が異なる（D-18）。判断材料は性質の違いと、実測されたセットアップ時間への影響がないこと。この整理を D-14 の原則（plugin 境界をデータパスに置かない）の例外として認める。DNS ヘルパーは実装済みで、実装は変えない。`VolumeProvider` は core 固定、`NetworkPlugin` は plugin 側（制御面）のまま変えない。DNS ヘルパーの起動・停止は `NetworkPlugin` の実装（plugin 側）が行う（2026-10-12 オーナー決定、#4・#1935）。寿命がネットワーク単位で、参加者の数で起動・停止する（NET-7）ため、`NetworkPlugin` の `create_network`・`delete_network`・`attach`・`detach` を持つ側の状態になる。名前解決の問い合わせはコンテナからヘルパーへ直接届き、plugin 境界を通るのは起動・停止・名前の登録（制御面）だけなので、上の例外の理由と矛盾しない。参加者の数をプロセスをまたいで数える方法と、起動した親から切り離して動かし続ける方法は、実装側で扱う（NET-7・TASK-144）。 |
-| supervisor（コンテナごとの監視プロセス、`api-supervisor.md`、D-19） | core | コンテナのライフサイクルに従属する軽量監視プロセスであり、CORE-1 の「中央の常駐デーモンを持たない」への読み替え（D-19）の実装主体そのものである。PLUG-2 の plugin 境界を経由せず実行層コアの一部として動作する（supervisor-model、PoC-17。own n=0 で常駐プロセス 0 個を実機確認） |
+| supervisor（コンテナごとの監視プロセス、`api-supervisor.md`、D-19） | core | コンテナのライフサイクルに従属する軽量監視プロセスであり、CORE-1 の「中央の常駐デーモンを持たない」への読み替え（D-19）の実装主体そのものである。PLUG-2 の plugin 境界を経由せず実行層コアの一部として動作する（supervisor-model、PoC-17。own n=0 で常駐プロセス 0 個を実機確認）。この配置は 2026-10-15 にオーナーが追認した（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6200154873)） |
 | 複数コンテナ定義の `up`／`down` 等（`api-stack.md`） | 独立した plugin 境界を持たない | `up` は TOML（STACK-1）を解析し、`depends_on` のトポロジカルソート順に core の CLI／ライブラリ API を順に呼ぶオーケストレーションで、別プロセス plugin 境界を持たない（`api-supervisor.md` SUP-1 の監視プロセス起動 API 等。supervisor-model、PoC-17 の `supervisor up` 実装で確認） |
 
-転記元: `docs/spec/04-behavior/plugin-system.md`（submodule リビジョン `2241961`）の境界表。追加分 3（2026-09-23）の 4 行（CDI の適用・OCI hook の実行／DNS ヘルパー・rootless ネットワーク転送／supervisor／複数コンテナ定義の `up`／`down`）を含む。「DNS ヘルパー・rootless ネットワーク転送」の行は、2026-10-12 の決定（#340）で rootless ネットワーク転送と DNS ヘルパーの 2 行に分かれた（この 2 行はリビジョン `0b284cf` に合わせた。DNS ヘルパーの行は 2026-10-12 の決定〔#4〕で『例外として認める』になり、2 行とも同日の配置の決定〔#4・#1935〕が反映されている）。
+転記元: `docs/spec/04-behavior/plugin-system.md`（submodule リビジョン `2241961`）の境界表。追加分 3（2026-09-23）の 4 行（CDI の適用・OCI hook の実行／DNS ヘルパー・rootless ネットワーク転送／supervisor／複数コンテナ定義の `up`／`down`）を含む。「DNS ヘルパー・rootless ネットワーク転送」の行は、2026-10-12 の決定（#340）で rootless ネットワーク転送と DNS ヘルパーの 2 行に分かれた（この 2 行はリビジョン `0b284cf` に合わせた。DNS ヘルパーの行は 2026-10-12 の決定〔#4〕で『例外として認める』になり、2 行とも同日の配置の決定〔#4・#1935〕が反映されている）。CDI の適用・OCI hook の実行・`NetworkPlugin`・supervisor の行は、2026-10-15 の決定（#4。Fandhe-AI/fandhe-container-spec#22）に合わせた。
 
 補足:
 
-- CDI の適用・OCI hook の実行（行）は `core（推奨）` の段階であり、未解決疑問点 11 が未決のため確定扱いしない
-- rootless ネットワーク転送（NET-9）は D-14 の原則の例外として認められた（2026-10-12・#340。rootless の経路に限る）。DNS ヘルパー（NET-5）も D-14 の原則の例外として認められた（2026-10-12・#4）。2 つのプロセスの配置は 2026-10-12 に決まった（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)）。pasta は core 側（コンテナごとの supervisor が起動・監視・回収。CORE-1）、DNS ヘルパーは plugin 側（`NetworkPlugin` の実装が起動・停止。NET-7）で、プロセスの寿命を持つ側に置く。`crates/net` は core 側のライブラリで、supervisor と `NetworkPlugin` の実装の両方がリンクする（PLUG-4 が数える「core」〔`crates/core`〕には入らない）。未解決疑問点 11 のほかの論点（CDI の適用・OCI hook の実行・supervisor・rootful ネットワーク設定の配置）は未決のままである
+- 未解決疑問点 11 の残り（CDI の適用・OCI hook の実行・supervisor・rootful ネットワーク設定の配置）は 2026-10-15 に決まり、11 は解消した（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6200154873)。spec への反映は Fandhe-AI/fandhe-container-spec#22）
+- rootless ネットワーク転送（NET-9）は D-14 の原則の例外として認められた（2026-10-12・#340。rootless の経路に限る）。DNS ヘルパー（NET-5）も D-14 の原則の例外として認められた（2026-10-12・#4）。2 つのプロセスの配置は 2026-10-12 に決まった（[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)）。pasta は core 側（コンテナごとの supervisor が起動・監視・回収。CORE-1）、DNS ヘルパーは plugin 側（`NetworkPlugin` の実装が起動・停止。NET-7）で、プロセスの寿命を持つ側に置く。`crates/net` は core 側のライブラリで、supervisor と `NetworkPlugin` の実装の両方がリンクする（PLUG-4 が数える「core」〔`crates/core`〕には入らない）。未解決疑問点 11 のほかの論点も 2026-10-15 に決まった（上の項目）
 - GPU-5・7・8・9 は境界表に明示判定がない（[crate-naming.md](design/crate-naming.md) 注 1 を参照）
 
 ## Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）
@@ -241,15 +248,13 @@ MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である�
 | MVM-5 | microVM の 3 OS 展開は Linux（KVM）→ macOS（Hypervisor.framework）の順で進め、Windows（WHP）は将来オプションとする | `api-microvm.md` | 本書へ TASK-78 で追記予定 |
 | NET-9 | rootless ネットワークの外部ヘルパー: pasta を採用（同梱もリンクもせず利用者が導入したものを exec。ポート公開の bind の既定は loopback） | `api-network.md` | [rootless-network.md](design/rootless-network.md)（TASK-147・#340） |
 | NET-5 | DNS ヘルパーを D-14 の原則の例外として認める | `plugin-system.md` | [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6128207567)（2026-10-12 オーナー決定） |
-| NET-5・NET-9 の配置 | pasta は core 側（コンテナごとの supervisor が起動・監視・回収）、DNS ヘルパーは plugin 側（`NetworkPlugin` の実装が起動・停止）、`crates/net` は core 側のライブラリ（プロセスの寿命を持つ側に置く） | `plugin-system.md` | [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)（2026-10-12 オーナー決定。未解決疑問点 11 のほかの論点は未決） |
+| NET-5・NET-9 の配置 | pasta は core 側（コンテナごとの supervisor が起動・監視・回収）、DNS ヘルパーは plugin 側（`NetworkPlugin` の実装が起動・停止）、`crates/net` は core 側のライブラリ（プロセスの寿命を持つ側に置く） | `plugin-system.md` | [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)（2026-10-12 オーナー決定） |
+| 未解決疑問点 11 の残りの配置 | CDI の適用・OCI hook の実行は core（hook のタイムアウトとパスの検証を必須）、supervisor は core（追認）、rootful のネットワーク設定は plugin 側（`NetworkPlugin` の実装が `crates/net` を使う。core は network namespace を渡すだけ） | `plugin-system.md` | [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6200154873)（2026-10-15 オーナー決定） |
 | REPAIR-11 | モデル規模で自己補修の可否を一律禁止せず、ハーネス（REPAIR-7・REPAIR-12）を通過した変更のみ採用する | `ai-self-repair.md` | [small-model-repair-policy.md](design/small-model-repair-policy.md)（TASK-92。当該メモ自体は #44〔TASK-92.h1〕で再承認待ち） |
 | REPAIR-1 | 19 crate＋`benches` の workspace 構成（crate 分割の前提として本書冒頭の「crate 境界」節が参照する） | `ai-self-repair.md` | [crate-naming.md](design/crate-naming.md)（TASK-1.h1・#9） |
 | CORE-4 | MVP のリソース制限は cgroups v2 単独対応とし、cgroups v1（hybrid 含む）・systemd cgroup driver には対応しない | `api-runtime-core.md` | [cgroups.md](design/cgroups.md)（TASK-34・#166） |
-
-### 設計ドラフト（採否未決。確定扱いしない）
-
-- SEC-4 の seccomp・Landlock の拒否の配送経路: [audit-delivery.md](design/audit-delivery.md)（TASK-41 追補・#1835。方式は未決で、ユーザーの判断待ち）
+| SEC-4 | seccomp・Landlock の拒否の配送: ERRNO の 40 件は USER_NOTIF で supervisor が記録して EPERM で応答、KILL_PROCESS の 3 件はカーネル監査と終了シグナル（補助）、Landlock はカーネル監査（未対応なら縮退を明示）。確実な層は fail-closed・カーネル監査頼みは警告して続行・厳格モードは opt-in | `security-isolation.md` | [audit-delivery.md](design/audit-delivery.md)（TASK-41 追補・#1835。2026-10-15 オーナー決定・#2018。実装は #2023〜#2028・#2004） |
 
 ## 見直し
 
-REPAIR-3・PLUG-1、または [crate-naming.md](design/crate-naming.md) が更新されたら本書も追従する。`plugin-system.md` の境界表が更新されたら「core / plugin 境界（PLUG-1）」節も追従する。`api-platform-windows.md` の `WIN-6` が更新されたら「Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）」節も追従する。依存を追加した際は「依存関係グラフ」節の「現状」を更新する。`design/audit-delivery.md` の方式が決まったら「設計ドラフト」の小節を確定済み設計判断の表へ移す。
+REPAIR-3・PLUG-1、または [crate-naming.md](design/crate-naming.md) が更新されたら本書も追従する。`plugin-system.md` の境界表が更新されたら「core / plugin 境界（PLUG-1）」節も追従する。`api-platform-windows.md` の `WIN-6` が更新されたら「Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）」節も追従する。依存を追加した際は「依存関係グラフ」節の「現状」を更新する。採否未決の設計ドラフトを追加したら「設計ドラフト」の小節を設け、方式が決まったら確定済み設計判断の表へ移す。

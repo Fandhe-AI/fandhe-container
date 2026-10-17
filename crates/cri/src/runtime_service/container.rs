@@ -5,10 +5,16 @@
 //! サンドボックスの `config_limits` と同じ 3 段（符号化長・可変長要素の件数と長さ・累積の保持量）で
 //! 有限の上限を課す。`envs` に秘密値が入り得るため、エラー文言・計装へ `config` の内容を出さない。
 //!
+//! ListContainers・ContainerStatus（TASK-58.3・#435）の応答への変換（`to_summary`・`to_status`）と
+//! フィルタ検証（`ValidatedContainerFilter`）もここに置く。`exit_code`・`reason`・`image_ref` 等は空・0 のスタブ。
+//!
 //! **スタブの明示（REPAIR-3）**: 状態はプロセス内メモリにあるだけで、実行層（core）には未接続。
-//! `Running` は記録上の状態で、プロセスは起動しない。TASK-59（CRI-2）で `ContainerRuntime`
-//! 経由の namespace 分離起動と `StateStore` へ置き換える。`Exited` への遷移は TASK-58.2（#434）が追加する。
+//! `Running` は記録上の状態で、プロセスは起動しない。StopContainer / RemoveContainer（TASK-58.2・#434）も
+//! 記録上の遷移と除去だけで、プロセスの終了・猶予待ちは行わない。TASK-59（CRI-2）で `ContainerRuntime`
+//! 経由の namespace 分離起動・終了と `StateStore` へ置き換える。
 //! `command`・`mounts`・`log_path` 等のパス類は保持するだけで検証していない（ホストへ触れる TASK-59 で検証する）。
+
+use std::collections::HashMap;
 
 use prost::Message;
 use tonic::Status;
@@ -17,6 +23,7 @@ use super::config_limits::{
     MAX_CONFIG_COLLECTION_ENTRIES, MAX_CONFIG_ENCODED_BYTES, MAX_METADATA_FIELD_BYTES,
     RETAINED_BYTES_PER_ENTRY, RETAINED_BYTES_PER_RECORD,
 };
+use super::validate_label_selector;
 use crate::runtime::v1::{
     self, Capability, ContainerConfig, ContainerState as ProtoContainerState, LinuxContainerConfig,
     LinuxContainerResources, LinuxContainerSecurityContext, NamespaceOption, UserNamespace,
@@ -87,20 +94,21 @@ impl ContainerLimits {
 
 /// コンテナの内部状態（CRI の `ContainerState` に対応）。
 ///
-/// `Exited`（停止済み）は StopContainer（TASK-58.2・#434）が追加する。
+/// `Exited`（停止済み）は StopContainer（TASK-58.2・#434）で `Running` から遷移する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ContainerState {
     Created,
     Running,
+    Exited,
 }
 
 impl ContainerState {
     /// CRI の列挙値へ変換する（ContainerStatus / ListContainers〔TASK-58.3〕が応答に使う）。
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn to_proto(self) -> ProtoContainerState {
         match self {
             Self::Created => ProtoContainerState::ContainerCreated,
             Self::Running => ProtoContainerState::ContainerRunning,
+            Self::Exited => ProtoContainerState::ContainerExited,
         }
     }
 }
@@ -112,14 +120,135 @@ impl ContainerState {
 #[derive(Debug, Clone)]
 pub(super) struct ContainerRecord {
     pub(super) pod_sandbox_id: String,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) config: ContainerConfig,
     pub(super) state: ContainerState,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) created_at_nanos: i64,
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) started_at_nanos: i64,
+    /// 停止（`Exited` 遷移）の時刻。未停止は 0（TASK-58.2。ContainerStatus〔TASK-58.3〕が応答に使う）。
+    pub(super) finished_at_nanos: i64,
     pub(super) retained_bytes: usize,
+}
+
+impl ContainerRecord {
+    /// ContainerStatus 応答用の変換（CRI-1・TASK-58.3・#435）。
+    ///
+    /// labels・annotations・mounts・log_path は保持した値を無改変で返す。`envs`・`command`・`args` は
+    /// 応答項目に無く（秘密値が入り得る）、返さない。**スタブの明示（REPAIR-3）**: `exit_code`・`reason`・
+    /// `message`・`image_ref`・`image_id`・`user` は実行層未接続のため空・0 で、実値は TASK-59（CRI-2）で埋める。
+    pub(super) fn to_status(&self, id: &str) -> v1::ContainerStatus {
+        let linux = self
+            .config
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.resources.clone());
+        let windows = self
+            .config
+            .windows
+            .as_ref()
+            .and_then(|windows| windows.resources.clone());
+        let resources = if linux.is_none() && windows.is_none() {
+            None
+        } else {
+            Some(v1::ContainerResources { linux, windows })
+        };
+        v1::ContainerStatus {
+            id: id.to_owned(),
+            metadata: self.config.metadata.clone(),
+            state: self.state.to_proto() as i32,
+            created_at: self.created_at_nanos,
+            started_at: self.started_at_nanos,
+            finished_at: self.finished_at_nanos,
+            exit_code: 0,
+            image: self.config.image.clone(),
+            image_ref: String::new(),
+            reason: String::new(),
+            message: String::new(),
+            labels: self.config.labels.clone(),
+            annotations: self.config.annotations.clone(),
+            mounts: self.config.mounts.clone(),
+            log_path: self.config.log_path.clone(),
+            resources,
+            image_id: String::new(),
+            user: None,
+            stop_signal: self.config.stop_signal,
+        }
+    }
+
+    /// ListContainers 応答用の変換（Status の部分集合。`image_ref`・`image_id` は TASK-59 まで空）。
+    pub(super) fn to_summary(&self, id: &str) -> v1::Container {
+        v1::Container {
+            id: id.to_owned(),
+            pod_sandbox_id: self.pod_sandbox_id.clone(),
+            metadata: self.config.metadata.clone(),
+            image: self.config.image.clone(),
+            image_ref: String::new(),
+            state: self.state.to_proto() as i32,
+            created_at: self.created_at_nanos,
+            labels: self.config.labels.clone(),
+            annotations: self.config.annotations.clone(),
+            image_id: String::new(),
+        }
+    }
+}
+
+/// 検証済みの `ListContainers` フィルタ（全条件 AND。CRI-1・TASK-58.3）。
+///
+/// `state` が `CONTAINER_UNKNOWN` のとき、レジストリには Unknown 状態の記録が無いため `matches_none`
+/// で空の一覧にする。
+pub(super) struct ValidatedContainerFilter {
+    id: String,
+    state: Option<ContainerState>,
+    matches_none: bool,
+    pod_sandbox_id: String,
+    label_selector: HashMap<String, String>,
+}
+
+impl ValidatedContainerFilter {
+    /// 件数・文字列長・合計バイト数の上限と state 値を検証する（ERR-3: `INVALID_ARGUMENT`）。
+    pub(super) fn new(filter: Option<v1::ContainerFilter>) -> Result<Self, Status> {
+        let Some(filter) = filter else {
+            return Ok(Self {
+                id: String::new(),
+                state: None,
+                matches_none: false,
+                pod_sandbox_id: String::new(),
+                label_selector: HashMap::new(),
+            });
+        };
+        validate_label_selector(
+            &filter.label_selector,
+            filter.id.len().saturating_add(filter.pod_sandbox_id.len()),
+        )?;
+        let (state, matches_none) = match filter.state {
+            None => (None, false),
+            Some(value) => match ProtoContainerState::try_from(value.state) {
+                Ok(ProtoContainerState::ContainerCreated) => (Some(ContainerState::Created), false),
+                Ok(ProtoContainerState::ContainerRunning) => (Some(ContainerState::Running), false),
+                Ok(ProtoContainerState::ContainerExited) => (Some(ContainerState::Exited), false),
+                Ok(ProtoContainerState::ContainerUnknown) => (None, true),
+                Err(_) => return Err(Status::invalid_argument("unknown state filter")),
+            },
+        };
+        Ok(Self {
+            id: filter.id,
+            state,
+            matches_none,
+            pod_sandbox_id: filter.pod_sandbox_id,
+            label_selector: filter.label_selector,
+        })
+    }
+
+    /// 全条件を AND で判定する。
+    pub(super) fn matches(&self, id: &str, record: &ContainerRecord) -> bool {
+        !self.matches_none
+            && (self.id.is_empty() || self.id == id)
+            && (self.pod_sandbox_id.is_empty() || self.pod_sandbox_id == record.pod_sandbox_id)
+            && self.state.is_none_or(|s| s == record.state)
+            && self
+                .label_selector
+                .iter()
+                .all(|(k, v)| record.config.labels.get(k) == Some(v))
+    }
 }
 
 /// 入力検証を通過した `CreateContainer` の要求。
@@ -662,6 +791,7 @@ mod tests {
     fn task_58_1_state_proto_values() {
         assert_eq!(ContainerState::Created.to_proto() as i32, 0);
         assert_eq!(ContainerState::Running.to_proto() as i32, 1);
+        assert_eq!(ContainerState::Exited.to_proto() as i32, 2);
     }
 
     /// 作り直しは内容を変えない（labels・annotations 無改変）。

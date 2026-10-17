@@ -50,14 +50,22 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 | virtiofs 共有のデバイス構成（`VirtiofsSharesSpec`。最大 `MAX_VIRTIOFS_SHARES` = 8 件） | `crates/platform-macos/src/virtiofs.rs`（TASK-65.1） | 常駐（VM 構成の一部。構成構築時に固定） |
 | ゲスト内 mount の指示・報告契約（カーネルコマンドライン経由の指示、hvc0 経由の報告） | `crates/platform-macos/src/guest_mount.rs`（TASK-65.3） | 常駐（起動時 1 回。`Vm::launch` 内で待機） |
 | I/O 共有プロトコルクライアント（`VirtiofsIoClient`）と再接続（`ReconnectingVirtiofsIoClient`） | `crates/platform-macos/src/virtiofs/io_client.rs`・`reconnect.rs`（TASK-65.2・65.5） | 接続単位（寿命は VM に縛られない。常駐 VM への接続として使う想定。具象トランスポートは未実装） |
-| ゲスト init・ゲスト内のコンテナ実行（軽量プロセス分離の本体） | 未存在 | コンテナ単位（未実装） |
+| ゲスト init（`crates/guest-init`。#1875。virtiofs の mount と報告・起動完了マーカー） | ソース実装済み（initrd への梱包 #1878・実機確認 #1628 は未実施） | VM 単位 |
+| ゲスト内のコンテナ実行（軽量プロセス分離の本体） | 未存在 | コンテナ単位（未実装） |
+
+### コンソールログの保持（回転・削除。#2138・MAC-1・REPAIR-4）
+
+- 上限: 1 ファイル・1 回の起動あたり 1 MiB（`MAX_CONSOLE_LOG_BYTES`）、世代は現在を含め 3（`CONSOLE_LOG_GENERATIONS`。`<name>`・`<name>.1`・`<name>.2`）。supervisor のログ（#2067・SUP-7）と同じ値と番号規則（新しいほど小さい）で、パス 1 つあたりの総量は約 3 MiB。起動中は回転せず上限で切る（ブートログの先頭を残すため）。 回転・新規ファイルの open・書き出しへの引き渡し、および全世代の削除は、排他用ファイル `<name>.0`（世代と衝突しない番号。回転で変わらない）の lock を通して持ち、同じログパスの二重書き出しと使用中の削除を拒否する。回転と削除の結果・件数・所要時間は stderr の構造化ログ（`operation` が `rotate` / `remove`。パスは含めない）に残す（MAC-1・REPAIR-4）。
+- 回転の時機: `VmConfigSpec::open_serial_console`（`Vm::launch` が呼ぶ）が書き出しの直前に行う。現在のログが無い・空なら世代を消費しない。使用中 lock を先に取り、世代ファイルに異常（symlink・他者所有・リンク数・モード・kernel / initrd / ディスクイメージとの同一性）があれば何も動かさず拒否する。
+- 削除の時機: VM の stop・`Vm` の drop・起動失敗では残す（診断材料）。コンテナの delete で `VmConfigSpec::remove_console_logs` が現在のログと全世代を消す。この呼び出しの配線は plugin-macos の delete 実装（TASK-114）待ちで、現状は部品の提供までである。
+- supervisor との違い: コードは共有しない（platform-macos は supervisor へ依存しない）。起動中の回転もしない。
 
 ### 現状の事実（実装済みを装わない。REPAIR-3）
 
 - 現在の `Vm::launch` は「1 回の呼び出しで 1 VM を構成・起動する」API で、virtiofs 共有はカーネルコマンドラインの mount 指示とともに VM 構成の構築時に固定される。構造上は、既定方式よりオプション方式（1 コンテナ = 1 VM）に近い。複数コンテナで VM を使い回す仕組み（共用 VM の保持・コンテナ単位の追加 / 削除）は未実装である
 - `Vm` の `Drop` は実行中の VM に停止を要求する。「常駐」させるには `Vm` を保持し続ける主体が要る
 - 協調停止・pause / resume / save / restore は未実装である
-- ゲスト init（指示を読んで mount し報告するもの）・クライアント側の UDS `connect`・macOS ホスト側の VZ vsock トランスポートは未実装である。ゲスト init が無い間、mount 指定つきの `Vm::launch` は報告が届かずタイムアウトする
+- クライアント側の UDS `connect`・macOS ホスト側の VZ vsock トランスポートは未実装である。ゲスト init（指示を読んで mount し報告するもの）は `crates/guest-init` にソースがあるが（#1875）、initrd への梱包（#1878）と実機確認（#1628）までは、mount 指定つきの `Vm::launch` は報告が届かずタイムアウトしうる
 - plugin 境界越しの配線は TASK-115（`fandhe-container-plugin-macos`）で行う
 
 ## plugin 境界との関係
@@ -72,7 +80,7 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 
 - 共用 VM を保持する主体と寿命（plugin プロセス常駐との関係。CORE-1 との整合）
 - VM 生成後にコンテナ単位の bind mount をどう届けるか（virtiofs 共有が構成時固定である制約）。共用 VM で複数コンテナの共有ディレクトリが同一ゲストに見える点のアクセス制御も含む
-- 共用ゲスト内でコンテナを実行する機構（ゲスト init・`crates/core` のゲスト内利用）
+- 共用ゲスト内でコンテナを実行する機構（ゲスト init の拡張〔子プロセスの回収等〕・`crates/core` のゲスト内利用）
 - オプション方式の macOS 実現経路と選択 UI、MVM-3 のしきい値（検討中）
 - 関連タスク: TASK-70（MAC-2 / MAC-3 の実測・人間）、TASK-115（plugin 化）、TASK-74 / TASK-75（MVM-1 の Linux 実装）、TASK-78（MVM-5 の文書化）、TASK-49（CORE-8 の VM 経由リソース効率実測・人間）
 - 共用 VM の実装タスクは spec のタスク定義に明示なし。要確認事項として報告する

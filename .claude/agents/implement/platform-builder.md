@@ -13,7 +13,7 @@ macOS・Windows・microVM のプラットフォーム層と各バックエンド
 
 - `crates/platform-macos`・`fandhe-container-plugin-macos`（MAC 系ビヘイビア。G5）: Virtualization.framework 経由の最小 Linux VM（`objc2-virtualization` を土台に独自の橋渡し層）・virtiofs 共有
 - `crates/platform-windows`・`fandhe-container-plugin-windows`（WIN 系ビヘイビア）: WSL2 経由方式・virtiofs opt-in・NTFS セマンティクス吸収
-- `crates/microvm`・`fandhe-container-plugin-microvm`（MVM 系ビヘイビア）: KVM ioctl を `libc` / `nix` 経由で直接扱う最小デバイスモデル
+- `crates/microvm`・`fandhe-container-plugin-microvm`（MVM 系ビヘイビア）: KVM ioctl を crate の `sys` モジュールの自前の FFI 宣言で直接扱う最小デバイスモデル（`nix` は不採用・`libc` は dev-dependencies の機械照合のみ。dependency-policy）
 
 ## 固有の遵守事項
 

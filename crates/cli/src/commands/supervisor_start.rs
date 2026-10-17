@@ -51,7 +51,11 @@
 //! `tests/start_signal_interrupt.rs` が具体値で固定する）。
 //! - CLI: `signals` の固定ハンドラが plugin へ転送してから同じシグナルを自分へ再送し、シグナル終了する
 //!   （`ExitStatus::signal()` が 2 / 15 / 1、`code()` は `None`。シェル上は 128+N）。`main` へ戻らないため stderr に
-//!   構造化エラーの JSON は出ず、stdout も空で、この起動の op ログの行も書かれない（REPAIR-4 の観測の穴）。
+//!   構造化エラーの JSON は出ず、stdout も空で、この起動の op ログ（`FANDHE_CONTAINER_OP_LOG`）の行も書かれない（REPAIR-4 の観測の穴）。
+//!   残せない理由: ハンドラは async-signal-safe な操作（atomic・`kill`・`raise`）しか使えず、op ログの出力は JSON の
+//!   組み立て（割り当て）と symlink・ハードリンク・親の検証つきの open を伴うため呼べない。ハンドラは全コマンド共通で
+//!   `SA_RESETHAND` のうえ再送する契約でもある。後続の候補は、事前に開いた fd と固定バッファへハンドラから
+//!   `write(2)` だけを行う案と、結果待ちの間だけ再送を遅らせ待機側が書いてから再送する案（#2132）。
 //! - supervisor: plugin の登録表に載らず転送されない。`process_group(0)` で別グループのため、端末から前面グループへ
 //!   配送される SIGINT・SIGHUP も届かない。start を続け、結果の 1 行を書くときは読み手が居らず EPIPE になる
 //!   （std は SIGPIPE を無視する）が、報告の失敗を構造化ログへ出して監視・後始末を続ける。

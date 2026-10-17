@@ -189,6 +189,10 @@ check_range max 0 10 1 10
 check_range zero 1 0 1 10
 check_range over 1 11 1 10
 check_range leading-zero 0 08 1 10
+check_range leading-zero-09 0 09 1 10
+check_range leading-zero-007 0 007 1 10
+check_range leading-zero-all-zero 1 000 1 10
+check_range leading-zero-010 0 010 1 10
 check_range empty 1 "" 1 10
 check_range negative 1 -1 1 10
 check_range alpha 1 1a 1 10

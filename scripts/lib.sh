@@ -69,7 +69,10 @@ skip_unless_workspace() {
 # 異なるため揃えない。終了コードの整理: 引数エラーは呼び出し側が exit 2、run_limited の呼び出し誤りは 125（内部の誤用）。
 int_in_range() {
   case "$1" in '' | *[!0-9]* | ??????????*) return 1 ;; esac
-  [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
+  # 先頭ゼロは 8 進と解釈されるため、比較前に取り除いて 10 進にそろえる（08 のエラー、07 の誤受理の防止）。
+  local v="$1"
+  while [ "${#v}" -gt 1 ] && [ "${v#0}" != "${v}" ]; do v="${v#0}"; done
+  [ "${v}" -ge "$2" ] && [ "${v}" -le "$3" ]
 }
 
 # err_code <code> <message> / info_msg <message>: `error: code=<code> message=<英語>` と `info: <英語>` を stderr に出す。

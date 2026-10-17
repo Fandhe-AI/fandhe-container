@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup>\"}\n";
+const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup|doctor>\"}\n";
 #[cfg(target_os = "linux")]
 const UNIMPLEMENTED_JSON: &str =
     "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n";
@@ -1195,4 +1195,69 @@ fn cli1_start_fails_closed_without_user_manager() {
         "ID\tSTATUS\tPID\nc1\tcreated\t-\n"
     );
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// 実バイナリの `doctor` の stdout から、`code` が `code` の行（JSON Lines の 1 行）を探す。
+#[cfg(target_os = "linux")]
+fn doctor_line_with_code(stdout: &str, code: &str) -> Option<String> {
+    let needle = format!("\"code\":\"{code}\"");
+    stdout
+        .lines()
+        .find(|l| l.contains(&needle))
+        .map(str::to_owned)
+}
+
+/// CORE-3・CORE-4・CLI-1（#2133）: `XDG_RUNTIME_DIR` が空だと user マネージャ未到達の診断が出て終了コード 3、
+/// stderr は空。root の環境では検査を省いた通知が出て、その行が出ることを期待する（skip しない）。
+#[cfg(target_os = "linux")]
+#[test]
+fn doctor_reports_unset_xdg_runtime_dir() {
+    use std::os::unix::fs::MetadataExt;
+    let out = run_env(
+        &["doctor"],
+        &[("XDG_RUNTIME_DIR", std::ffi::OsStr::new(""))],
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let euid = std::fs::metadata("/proc/self").expect("meta").uid();
+    if euid == 0 {
+        let line = doctor_line_with_code(&stdout, "USER_SCOPE_CHECK_SKIPPED_AS_ROOT")
+            .expect("root skip notice");
+        assert!(line.contains("\"check\":\"privilege\",\"state\":\"rootful\""));
+        assert!([0, 3, 4].contains(&out.status.code().expect("code")));
+    } else {
+        let line = doctor_line_with_code(&stdout, "XDG_RUNTIME_DIR_UNSET").expect("unset line");
+        assert!(line.starts_with("{\"severity\":\"warning\","), "{line}");
+        assert!(line.ends_with("\"check\":\"user_manager\",\"state\":\"runtime_dir_unset\"}"));
+        assert_eq!(out.status.code(), Some(3));
+    }
+}
+
+/// CORE-4（#2133）: 絶対パスでも `systemd/private` が無ければ到達不能の診断を出す。パスは出力に載せない。
+#[cfg(target_os = "linux")]
+#[test]
+fn doctor_reports_unreachable_user_manager_without_leaking_the_path() {
+    use std::os::unix::fs::MetadataExt;
+    if std::fs::metadata("/proc/self").expect("meta").uid() == 0 {
+        return; // root では検査を省く（上のテストが通知を照合する）。
+    }
+    let marker = "/nonexistent-doctor-marker-2133";
+    let out = run_env(
+        &["doctor"],
+        &[("XDG_RUNTIME_DIR", std::ffi::OsStr::new(marker))],
+    );
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(out.stderr.is_empty());
+    assert!(doctor_line_with_code(&stdout, "USER_MANAGER_UNREACHABLE").is_some());
+    assert!(!stdout.contains("doctor-marker"), "{stdout}");
+    assert_eq!(out.status.code(), Some(3));
+}
+
+/// CLI-1（#2133）: `doctor` に余計な引数を渡すと使い方エラー（2）。stdout は空。
+#[test]
+fn doctor_rejects_extra_arguments() {
+    let out = run(&["doctor", "extra"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty());
+    assert_eq!(String::from_utf8(out.stderr).expect("utf8"), USAGE_JSON);
 }

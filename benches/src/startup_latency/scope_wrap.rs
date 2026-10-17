@@ -1,18 +1,18 @@
 //! 起動 p95 ベンチが supervisor を包む `systemd-run` のコマンドと user マネージャ検査（TASK-190 追補・#2089・CORE-10・REPAIR-8）。
 //!
-//! `measure` の `RealHost::spawn` から呼ばれる。CLI の `start`（`crates/cli` の `scoped_command` / `user_manager_env`）と
+//! `measure` の `RealHost::spawn` から呼ばれる。CLI の `start`（`crates/cli` の `scoped_command`）と
 //! 同じ包み込み（argv は `USER_SCOPE_WRAPPER_ARGS`、環境は固定 `PATH` と検証済み `XDG_RUNTIME_DIR` のみ、cwd は `/`）を
 //! 作り、scope 取得（D-Bus の往復）の費用を本番と同じ経路で測る（#2081・#2122）。ベンチだけの差異は `--unit=<名前>` で、
 //! 後始末が scope の cgroup を名前で探すために付ける（名前は実行ごとの nonce を含み、残った scope と衝突しない）。
 //!
-//! 判定は CLI の `user_manager_env` と同じ。CLI の関数は private でベンチは CLI に依存しないため再実装している
-//! （共通化の候補は `start_contract`。フォローアップ）。
+//! user マネージャの判定は supervisor の `user_scope::user_manager_env` を使う（CLI の `start`・`doctor` と共通。#2133）。
+//! ここで写すのは固定文言をベンチの不対応報告へ変えるだけで、判定そのものの検証は supervisor 側のテストにある。
 
 use super::StartupLatencyError;
 use fandhe_container_supervisor::launcher::FIXED_PATH_ENV;
 use fandhe_container_supervisor::start_contract::USER_SCOPE_WRAPPER_ARGS;
+use fandhe_container_supervisor::user_scope::user_manager_env as shared_user_manager_env;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
 use std::path::Path;
 use std::process::Command;
 
@@ -22,30 +22,10 @@ fn unsupported(message: &'static str) -> StartupLatencyError {
 
 /// systemd の user マネージャへ直結できる `XDG_RUNTIME_DIR` を検証して返す（試行の前に fail-closed で止める）。
 ///
-/// 空・未設定・相対パス、`<xdg>/systemd/private` が（symlink を辿らずに）自 euid 所有のソケットでない場合は拒否する。
+/// 判定は supervisor の共通実装（空・未設定・相対パス、`<xdg>/systemd/private` が自 euid 所有のソケットでない場合は拒否）。
 /// エラー文は固定の英語で、値（パス）を載せない。
 pub fn user_manager_env(xdg: Option<&OsStr>, euid: u32) -> Result<OsString, StartupLatencyError> {
-    let unset = || {
-        unsupported(
-            "XDG_RUNTIME_DIR is not set to an absolute path; the systemd user manager is not reachable",
-        )
-    };
-    let xdg = xdg.filter(|v| !v.is_empty()).ok_or_else(unset)?;
-    let dir = Path::new(xdg);
-    if !dir.is_absolute() {
-        return Err(unset());
-    }
-    let unreachable = || {
-        unsupported(
-            "systemd user manager is not reachable (no private socket under XDG_RUNTIME_DIR)",
-        )
-    };
-    let sock = dir.join("systemd").join("private");
-    let meta = std::fs::symlink_metadata(&sock).map_err(|_| unreachable())?;
-    if !meta.file_type().is_socket() || meta.uid() != euid {
-        return Err(unreachable());
-    }
-    Ok(xdg.to_os_string())
+    shared_user_manager_env(xdg, euid).map_err(|e| unsupported(e.message()))
 }
 
 /// 本番の `start` と同じ包み込みで、試行 1 回分の `systemd-run` コマンドを組む（シェルも文字列連結も使わない）。
@@ -99,44 +79,30 @@ mod tests {
         d
     }
 
+    /// CORE-3・CORE-4: 共通判定の結果をベンチの不対応報告（コード固定・文言は共通・パスを載せない）へ写す。
+    /// 判定の各分岐の検証は supervisor の `user_scope` のテストにある。
     #[test]
-    fn core3_core4_user_manager_env_accepts_own_socket() {
+    fn core3_core4_user_manager_env_maps_shared_errors() {
         let d = tmp("ok");
         std::fs::create_dir(d.join("systemd")).unwrap();
         let _l = UnixListener::bind(d.join("systemd/private")).unwrap();
-        let got = user_manager_env(Some(d.as_os_str()), euid()).unwrap();
-        assert_eq!(got, d.as_os_str());
-        // euid 不一致は拒否。
+        assert_eq!(
+            user_manager_env(Some(d.as_os_str()), euid()).unwrap(),
+            d.as_os_str()
+        );
         let e = user_manager_env(Some(d.as_os_str()), euid().wrapping_add(1)).unwrap_err();
         assert_eq!(e.code, "unsupported-environment");
-        assert!(!e.message.contains(d.to_str().unwrap()));
-        let _ = std::fs::remove_dir_all(&d);
-    }
-
-    #[test]
-    fn core3_core4_user_manager_env_rejects_bad_inputs() {
-        for v in [None, Some(OsStr::new("")), Some(OsStr::new("relative/dir"))] {
-            let e = user_manager_env(v, euid()).unwrap_err();
-            assert_eq!(e.code, "unsupported-environment");
-            assert_eq!(
-                e.message,
-                "XDG_RUNTIME_DIR is not set to an absolute path; the systemd user manager is not reachable"
-            );
-        }
-        // ソケットが無い・通常ファイル・実ソケットへの symlink。
-        let d = tmp("bad");
-        let e = user_manager_env(Some(d.as_os_str()), euid()).unwrap_err();
         assert_eq!(
             e.message,
             "systemd user manager is not reachable (no private socket under XDG_RUNTIME_DIR)"
         );
-        std::fs::create_dir(d.join("systemd")).unwrap();
-        std::fs::write(d.join("systemd/private"), b"x").unwrap();
-        assert!(user_manager_env(Some(d.as_os_str()), euid()).is_err());
-        std::fs::remove_file(d.join("systemd/private")).unwrap();
-        let _l = UnixListener::bind(d.join("real.sock")).unwrap();
-        std::os::unix::fs::symlink(d.join("real.sock"), d.join("systemd/private")).unwrap();
-        assert!(user_manager_env(Some(d.as_os_str()), euid()).is_err());
+        assert!(!e.message.contains(d.to_str().unwrap()));
+        let e = user_manager_env(None, euid()).unwrap_err();
+        assert_eq!(e.code, "unsupported-environment");
+        assert_eq!(
+            e.message,
+            "XDG_RUNTIME_DIR is not set to an absolute path; the systemd user manager is not reachable"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

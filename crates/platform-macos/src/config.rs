@@ -1012,7 +1012,8 @@ impl ConsoleLogPath {
     /// 書き出しの直前に、既存の現在のログを世代へ送る（MAC-1・REPAIR-4・#2138）。
     ///
     /// `VmConfigSpec::open_serial_console_with_reports` からだけ呼ばれる。手順（いずれも fail-closed）:
-    /// 1. 現在のログが無い・空なら何もしない（世代を消費しない。supervisor のログと同じ）。
+    /// 1. 現在のログが無い・空なら回転しない（世代を消費しない。supervisor のログと同じ）。ただし世代の
+    ///    検査と排他取得（3.）は先に行い、不正・使用中の世代があれば拒否する。
     /// 2. 現在のログを `open_for_append_excluding` で開き `try_lock` する。使用中なら `ConsoleLogInUse` で
     ///    何も動かさない（先に取らないと、同じパスへ書いている別の VM が改名後の inode へ書き続ける）。
     /// 3. 世代のファイルをすべて lstat で検査する（symlink・非通常ファイル・他者所有・リンク数・モード・
@@ -1030,6 +1031,9 @@ impl ConsoleLogPath {
         let path = self.as_path();
         let rotation_err = |e: std::io::Error| ConfigError::ConsoleLogRotation { kind: e.kind() };
         check_console_log_parent(path)?;
+        // 現在のログが無い・空かどうかは回転の要否だけを決める。世代の検証と排他取得は常に先に済ませる
+        // （空でも世代が不正・使用中なら fail-closed で拒否する）。
+        let mut needs_rotation = true;
         match std::fs::symlink_metadata(path) {
             Ok(m) if m.file_type().is_symlink() => {
                 return Err(ConfigError::ConsoleLogIsSymlink {
@@ -1042,15 +1046,21 @@ impl ConsoleLogPath {
                     path: path.to_path_buf(),
                 });
             }
-            Ok(m) if m.len() == 0 => return Ok(0),
+            Ok(m) if m.len() == 0 => needs_rotation = false,
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => needs_rotation = false,
             Err(e) => {
                 return Err(ConfigError::PathIo {
                     field: ConfigField::ConsoleLog,
                     kind: e.kind(),
                 });
             }
+        }
+        if !needs_rotation {
+            for n in 1..crate::console_log::CONSOLE_LOG_GENERATIONS {
+                lock_generation_entry(&self.generation_path(n), protected)?;
+            }
+            return Ok(0);
         }
         let current = self.open_for_append_excluding(protected)?;
         match current.try_lock() {
@@ -4831,6 +4841,40 @@ broken line
         assert_eq!(std::fs::read(&path).unwrap(), b"old\n");
     }
 
+    /// MAC-1・REPAIR-4・#2138: 現在のログが未作成・空でも、不正な世代があれば起動を拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn rotation_rejects_bad_generation_with_empty_or_missing_log() {
+        use std::os::unix::fs::PermissionsExt;
+        for empty in [false, true] {
+            let t = TempDir::new("rot-bad-empty");
+            let (spec, path, _k, _i) = rotation_spec(&t);
+            if empty {
+                put(&path, b"");
+            }
+            let target = t.file("victim");
+            std::os::unix::fs::symlink(&target, gen_path(&path, 1)).unwrap();
+            assert_eq!(
+                spec.open_serial_console().unwrap_err().code(),
+                "config.console_log_is_symlink"
+            );
+            assert_eq!(std::fs::read(&target).unwrap(), b"dummy");
+
+            let t = TempDir::new("rot-bad-empty-mode");
+            let (spec, path, _k, _i) = rotation_spec(&t);
+            if empty {
+                put(&path, b"");
+            }
+            put(&gen_path(&path, 2), b"older\n");
+            std::fs::set_permissions(gen_path(&path, 2), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            assert_eq!(
+                spec.open_serial_console().unwrap_err().code(),
+                "config.console_log_insecure_mode"
+            );
+        }
+    }
+
     /// MAC-1・REPAIR-4・#2138: 構成エラー（kernel の消失）では世代を消費しない。
     #[cfg(unix)]
     #[test]
@@ -4973,9 +5017,10 @@ broken line
         let t = TempDir::new("rot-fifo");
         let fifo = t.0.join("console.log.0");
         let status = std::process::Command::new("mkfifo").arg(&fifo).status();
-        if !matches!(status, Ok(s) if s.success()) {
-            return;
-        }
+        assert!(
+            matches!(status, Ok(s) if s.success()),
+            "mkfifo must succeed to verify FIFO handling: {status:?}"
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         let p = fifo.clone();
         std::thread::spawn(move || {

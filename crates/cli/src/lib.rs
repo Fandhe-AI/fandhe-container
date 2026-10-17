@@ -37,3 +37,5 @@ pub mod setup;
 pub mod signals;
 #[cfg(unix)]
 pub(crate) mod sys;
+#[cfg(target_os = "linux")]
+pub(crate) mod user_scope;

@@ -172,6 +172,50 @@ mod linux {
         let entries = std::fs::read_dir(&base).expect("read").count();
         assert_eq!(entries, 0, "nothing may be created under the rejected base");
     }
+
+    /// 診断モード（`--scope-only`。CORE-10・TASK-190・#2124）は公開入口から `Command::ScopeOnly` として
+    /// 本計測と別の経路へ届き、書き込み可能な `systemd-run` を起動前に拒否する（root は別の理由で拒否される）。
+    #[test]
+    fn scope_only_entry_rejects_writable_systemd_run_before_launch() {
+        let d = Dir::new("so-sd");
+        let sd = d.exe("sd", 0o777);
+        let cmd = parse_args(&args(&[
+            "--scope-only",
+            "--systemd-run",
+            sd.to_str().expect("utf8"),
+        ]))
+        .expect("plan");
+        assert!(matches!(cmd, Command::ScopeOnly(_)), "got {cmd:?}");
+        let e = execute(cmd).expect_err("must fail closed before launching anything");
+        let want = if is_root() {
+            "unsupported-environment"
+        } else {
+            "untrusted-binary"
+        };
+        assert_eq!(e.code, want);
+    }
+
+    /// 診断モード（CORE-10・TASK-190・#2124）: 既存の出力先は、scope を起動する前に拒否される。
+    #[test]
+    fn scope_only_entry_rejects_existing_output_before_launch() {
+        if is_root() {
+            return; // root は入口で unsupported-environment になる。
+        }
+        let d = Dir::new("so-out");
+        let sd = d.exe("sd", 0o755);
+        let existing = d.exe("r.json", 0o600);
+        let cmd = parse_args(&args(&[
+            "--scope-only",
+            "--systemd-run",
+            sd.to_str().expect("utf8"),
+            "--output",
+            existing.to_str().expect("utf8"),
+        ]))
+        .expect("plan");
+        let e = execute(cmd).expect_err("must fail closed before launching anything");
+        assert_eq!(e.code, "untrusted-output");
+        assert_eq!(e.message, "output path already exists");
+    }
 }
 
 #[cfg(not(all(
@@ -183,5 +227,19 @@ mod linux {
 #[test]
 fn measure_is_unsupported_off_linux() {
     let cmd = parse_args(&args(&["--supervisor-bin", "/x"])).expect("plan");
+    assert!(matches!(execute(cmd), Ok(Execution::Unsupported)));
+}
+
+/// 診断モード（`--scope-only`。CORE-10・TASK-190・#2124）も、非対応 OS では計測したように見せず
+/// `Execution::Unsupported` を返す。
+#[cfg(not(all(
+    target_os = "linux",
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+#[test]
+fn scope_only_is_unsupported_off_linux() {
+    let cmd = parse_args(&args(&["--scope-only"])).expect("plan");
+    assert!(matches!(cmd, Command::ScopeOnly(_)), "got {cmd:?}");
     assert!(matches!(execute(cmd), Ok(Execution::Unsupported)));
 }

@@ -5412,11 +5412,6 @@ mod tests {
         assert_ne!(fs_type(proc_dir.as_fd()), Ok(CGROUP2_MAGIC));
     }
 
-    /// CORE-3・TASK-32.1: `mkdir_at` / `remove_dir_at` / `open_*_at` の往復（一時ディレクトリ）。
-    #[cfg(all(
-        target_pointer_width = "64",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ))]
     /// SEC-1（#2131）: `mkdir_at`・`remove_dir_at` も複数要素・`.`・`..`・空の名前を syscall 前に `EINVAL` で拒否する。
     #[cfg(all(
         target_pointer_width = "64",
@@ -5451,6 +5446,11 @@ mod tests {
         }
     }
 
+    /// CORE-3・TASK-32.1: `mkdir_at` / `remove_dir_at` / `open_*_at` の往復（一時ディレクトリ）。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     #[test]
     fn core3_task32_1_mkdir_open_remove_roundtrip() {
         use std::io::Write as _;

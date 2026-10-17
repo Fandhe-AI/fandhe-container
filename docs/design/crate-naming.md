@@ -93,6 +93,17 @@ PoC-13（plugin-boundary-mechanism）は、MCP 参照 plugin（Python 製、`fan
 
 判定対象を `-p <core>` で選んだ core 自身の依存木・core バイナリに絞っているため、plugin を足して root の `Cargo.lock` が変化しても、core に解決される依存だけを見比べられる。加えて、依存は `[workspace.dependencies]` で `=x.y.z` に完全固定しているため、plugin 側で feature を足しても core の依存の版は動かない。この 2 点により、案 A（workspace 内配置）を採用しても root `Cargo.toml`/`Cargo.lock` の変化を判定対象から外すことで PLUG-4 の趣旨を満たせる。
 
+### 決定 3 の補足: (3) の成果物は core の rlib（#2136）
+
+(3) の「core バイナリ」は、`cargo build -p fandhe-container-core --locked` が作る core の成果物（rlib）の sha256 と読む。CLI（`fandhe-container`）・supervisor の実行ファイルへは切り替えない（PLUG-4・TASK-109.4・PLUG-3）。
+
+- 実行ファイルは core 以外の crate（net・plugin・supervisor・cli 自身のソース等）をリンクする。plugin を足す PR が `crates/plugin` や `crates/cli` を一緒に変えるのは正当だが、実行ファイルの sha256 は変わり、core が同一でも NG になる。ソース一覧 (1) と差分検査は `crates/core` だけを見るため、範囲もそろわない
+- core は lib のみの crate で `[[bin]]` を持たない（CORE-1・D-19）。core だけを表す成果物は rlib である
+- rlib には依存 crate のハッシュと feature の解決結果が入るため、core の依存の版・feature の変化には rlib も反応する。版は (2) の依存木と `=x.y.z` の完全固定でも押さえている
+- 切り替えると、bin を持つ fixture の追加、Windows の `.exe` 対応、`bench-regression` での CLI 全体の 2 回リンクが要る
+
+spec の PLUG-4・TASK-109 の「core バイナリ」は PoC-13 の `core-harness` bin を前提にした言い方で、この読み替えの spec 側への注記はオーナー確認待ちである（承認は未取得）。PLUG-3 のサイズ記録の対象は別判断で、本補足の範囲外。
+
 ### 決定 4: `fandhe-container-plugin-api` の改名
 
 `fandhe-container-plugin-api`（`crates/plugin-api/`）を `fandhe-container-plugin`（`crates/plugin/`）に改名する。

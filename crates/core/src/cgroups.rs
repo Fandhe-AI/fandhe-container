@@ -11,8 +11,8 @@
 //! # 呼び出し文脈・契約
 //! - 呼び出し元: start 経路の supervisor。`detect` → `record_scope`（状態記録へスコープを追記）→ `create_cgroup`
 //!   （`prepare`）→ `apply_limits` → `into_join`（[`ContainerCgroup::join_hook`]）の順序は `start_chain` の型の連鎖で
-//!   固定済み（#1716。[`CgroupScopeRecorded`] 以降）。supervisor・本番 launcher からの呼び出しの結線は
-//!   #1717・#1715（未結線。REPAIR-3）
+//!   固定済み（#1716。[`CgroupScopeRecorded`] 以降）。supervisor の `ProductionStartDeps::prepare_cgroup` から結線済み
+//!   （#1717・#1819）。参加フックは本番 launcher が起動のたびに `ContainerCgroup::join_hook` で作る
 //! - `unsafe` は持たない。syscall は `crate::sys` の薄いラッパー（`mkdirat`・`unlinkat`・`fstatfs`・
 //!   `O_NOFOLLOW` 付き `openat`）経由で、検証した実体を fd で固定する（TOCTOU・symlink 対策）
 //! - `/proc/self/cgroup`・`cgroup.procs` 等はカーネル応答（外部入力）として上限付きで読み、
@@ -91,7 +91,7 @@
 //! 有無が分かれる非対称の再発を防ぐ、(c) 事前検証を含む全終了経路を漏れなく数えられる。
 //!
 //! # 未実装（REPAIR-3）
-//! - デバイス cgroup の supervisor・launcher からの呼び出しの結線（#1717・#1715）・GPU の `deviceNodes` の追加（#562）
+//! - GPU の `deviceNodes` の追加（#562）
 //! - OCI `linux.resources` から `set_memory_limits` / `set_cpu_max` への反映、本番 launcher での
 //!   `detect` → `prepare` → `join_hook` の結線（TASK-29 / TASK-157 系）
 //! - OCI `linux.cgroupsPath` の反映・start 時の委譲スコープの追記の連鎖（`start_chain`。#1716）の supervisor

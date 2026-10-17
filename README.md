@@ -34,7 +34,7 @@ macOS VM の initrd に入れる Rust 製 init は `crates/guest-init`（静的�
 
 ## クイックスタート
 
-統一 CLI（`fandhe-container`。TASK-79・`CLI-1`）は Linux で `create` / `start` / `stop` / `delete` / `list` / `logs` の入口を提供済みですが、コンテナはまだ起動しません。`start` は CLI と同じディレクトリの `fandhe-container-supervisor` を起動して結果を受け取りますが（#1718）、core の本番 launcher（#1715 の Phase B）が入るまで supervisor は `UNIMPLEMENTED`（終了コード 8）を報告します。rootful の特権起動はランチャー（#1719。`scripts/install-privileged-launcher.sh` のインストールに root が必要）が前提で、CLI からの選択は未対応です。macOS / Windows は plugin 経由で未提供です。ここではソースからのビルドとテスト、現状の CLI の動作確認の手順を示します。
+統一 CLI（`fandhe-container`。TASK-79・`CLI-1`）は Linux で `create` / `start` / `stop` / `delete` / `list` / `logs` の入口を提供済みです。`start` は CLI と同じディレクトリの `fandhe-container-supervisor` を user スコープ（`systemd-run --user --scope -p Delegate=yes`）で起動し、supervisor が core の本番 launcher でコンテナのプロセスを起動して Running を記録します（#1718・#1819）。対応は rootless のみで、前提（非 root・`systemd-run` と user マネージャ・委譲 cgroup・Landlock ABI 6 以上）を満たさないと `FAILED_PRECONDITION`（5）等で止まります。実機での通し確認は未実施です（#2062。前提の詳細は [docs/setup/linux.md](docs/setup/linux.md)）。rootful の特権起動はランチャー（#1719。`scripts/install-privileged-launcher.sh` のインストールに root が必要）が前提で、CLI からの選択は未対応です。macOS / Windows は plugin 経由で未提供です。ここではソースからのビルドとテスト、現状の CLI の動作確認の手順を示します。
 
 前提: `git`・`make`・`rustup`（toolchain は `rust-toolchain.toml` で固定）。`make setup` は最後に git hooks を導入するため、`lefthook`・`brew`・`npx` のいずれかも必要です（いずれも無いと `make hooks` が終了コード 1 で停止します。ビルドとテストだけなら `make setup` を使わず、`git submodule update --init`〔任意〕の後に下記の `cargo build` / `make test` を実行できます）。
 
@@ -50,9 +50,11 @@ make test                # テスト（lint・deny まで含めた一括検証�
 
 ```bash
 target/debug/fandhe-container --root /tmp/fc-state create --bundle <bundle> c1   # 状態を Created で記録
-target/debug/fandhe-container --root /tmp/fc-state start c1                      # 現状は UNIMPLEMENTED（8）
-target/debug/fandhe-container --root /tmp/fc-state list                          # c1 は created のまま
+target/debug/fandhe-container --root /tmp/fc-state start c1                      # rootless で前提を満たせば 0（出力なし）。満たさなければ構造化エラー
+target/debug/fandhe-container --root /tmp/fc-state list                          # 実際の状態はここで確かめる
 ```
+
+`start` の終了結果だけでコンテナの状態は決まりません。成功しても、すぐ終わるプロセスなら次の `list` では既に stopped になっていることがあります。CLI が supervisor の報告を待ち切れずにタイムアウトで失敗した場合も、supervisor は止めないので、コンテナが running になっていることがあります。状態は `list` で確かめてください。
 
 `make help` でターゲット一覧を表示します（Makefile は薄い入口で、実体は `scripts/` 配下のスクリプトです。Make を使わない場合は `scripts/help.sh` を参照。編集規約は [.claude/rules/makefile.md](./.claude/rules/makefile.md)）。コントリビュートの流れは [CONTRIBUTING.md](./CONTRIBUTING.md)、crate 境界は [docs/architecture.md](./docs/architecture.md)、ビルド・回帰確認コマンドは [AGENTS.md](./AGENTS.md) を参照してください。
 

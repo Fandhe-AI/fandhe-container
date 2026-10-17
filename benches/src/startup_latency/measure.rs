@@ -118,6 +118,21 @@ fn interrupted_error() -> StartupLatencyError {
     StartupLatencyError::new("interrupted", "interrupted by a termination signal")
 }
 
+/// 中断シグナルのブロック失敗を構造化エラーにする（REPAIR-4）。message には OS のエラー番号（数値）だけを載せ、
+/// OS 由来の文字列は載せない（`StartupLatencyError` の message は固定文言に限る契約）。
+pub(super) fn block_error(e: &std::io::Error) -> StartupLatencyError {
+    match e.raw_os_error() {
+        Some(n) => StartupLatencyError::new(
+            "unsupported-environment",
+            format!("cannot block termination signals (os error {n})"),
+        ),
+        None => StartupLatencyError::new(
+            "unsupported-environment",
+            "cannot block termination signals",
+        ),
+    }
+}
+
 /// 結果 1 行を期限つきで待つ。中断シグナルを受けたら待ちを打ち切る（`.1` が true）。
 fn recv_report(
     rx: &Receiver<(Vec<u8>, Instant)>,
@@ -748,11 +763,8 @@ pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
     }
     // 中断シグナルをブロックし、計測ループの各待ち点で保留を確かめて後始末の経路へ進める（REPAIR-5）。
     // スレッド（読み取りスレッド等）を作る前に呼び、以後のスレッドへブロックを継承させる。
-    if !sys::block_termination_signals() {
-        return Err(StartupLatencyError::new(
-            "unsupported-environment",
-            "cannot block termination signals",
-        ));
+    if let Err(e) = sys::block_termination_signals() {
+        return Err(block_error(&e));
     }
     // 出力先は計測の開始前に検証する（FIFO・symlink・既存ファイルを後から開かない）。
     // 書き込みには検証済みの実体パスだけを使う（plan.output を置き換える）。
@@ -1100,12 +1112,22 @@ mod tests {
         assert!(r.samples.is_empty());
     }
 
+    /// REPAIR-4: ブロック失敗のメッセージはエラー番号（数値）だけを載せる。
+    #[test]
+    fn block_error_carries_only_the_os_error_number_repair_4() {
+        let e = block_error(&std::io::Error::from_raw_os_error(22));
+        assert_eq!(e.code, "unsupported-environment");
+        assert_eq!(e.message, "cannot block termination signals (os error 22)");
+        let e = block_error(&std::io::Error::other("x"));
+        assert_eq!(e.message, "cannot block termination signals");
+    }
+
     /// 中断（SIGTERM）: 待ちを打ち切り、スコープ回収と settle（Any）まで終えてから `interrupted` で失敗し、
     /// 以後の試行を始めない（REPAIR-5）。
     #[test]
     fn sigterm_during_a_trial_reclaims_then_stops_with_interrupted() {
         // ブロックはスレッド単位。試験スレッド自身でブロックし、保留はスレッド終了で捨てられる。
-        assert!(sys::block_termination_signals());
+        sys::block_termination_signals().expect("block");
         let mut hang = Script::ok();
         hang.report = None;
         hang.exit = ExitScript::TimedOut;
@@ -1122,7 +1144,7 @@ mod tests {
     /// 中断時に回収を確認できなかった（スコープに残存）なら、作業ディレクトリを残す印を立てる（REPAIR-5）。
     #[test]
     fn interrupt_with_leftover_keeps_the_work_dir() {
-        assert!(sys::block_termination_signals());
+        sys::block_termination_signals().expect("block");
         let mut stuck = Script::ok();
         stuck.report = None;
         stuck.interrupt = true;

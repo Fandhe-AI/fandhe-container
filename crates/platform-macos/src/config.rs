@@ -1063,7 +1063,7 @@ impl ConsoleLogPath {
             return Ok(0);
         }
         let current = self.open_for_append_excluding(protected)?;
-        match current.try_lock() {
+        match crate::console_log::try_lock_with_grace(&current) {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(ConfigError::ConsoleLogInUse {
@@ -1196,7 +1196,7 @@ impl ConsoleLogPath {
             },
             crate::sys::effective_uid(),
         )?;
-        match file.try_lock() {
+        match crate::console_log::try_lock_with_grace(&file) {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(ConfigError::ConsoleLogInUse {
@@ -1262,7 +1262,7 @@ impl ConsoleLogPath {
         let current = match std::fs::symlink_metadata(path) {
             Ok(_) => {
                 let file = self.open_for_append_excluding(protected)?;
-                match file.try_lock() {
+                match crate::console_log::try_lock_with_grace(&file) {
                     Ok(()) => {}
                     Err(std::fs::TryLockError::WouldBlock) => {
                         return Err(ConfigError::ConsoleLogInUse {
@@ -1422,7 +1422,7 @@ fn lock_generation_entry(
     {
         return Err(open_err(std::io::ErrorKind::Other));
     }
-    match file.try_lock() {
+    match crate::console_log::try_lock_with_grace(&file) {
         Ok(()) => Ok(Some(file)),
         Err(std::fs::TryLockError::WouldBlock) => Err(ConfigError::ConsoleLogInUse {
             path: path.to_path_buf(),

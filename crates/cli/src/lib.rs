@@ -1,6 +1,7 @@
 //! fandhe-container-cli: 統一 CLI・基本コマンド（create/start/stop/delete/list/logs/ps）、観測性。
 //!
-//! 実装済みは [`doctor`] の判定材料取得（TASK-148.1）と評価層（警告・DOCKER-USER 案内・終了コード。TASK-148.2・NET-10）のみで、
+//! [`doctor`] は判定材料取得（TASK-148.1）と評価層（警告・DOCKER-USER 案内・終了コード。TASK-148.2・NET-10）に加え、
+//! `systemd-run` と user マネージャの前提の診断（CORE-3・CORE-4）を持ち、サブコマンド `doctor` として結線済み（#2133）。
 //! バイナリ `fandhe-container` の入口と [`commands`] の骨格は TASK-79.1（#638・CLI-1・MS-6）で追加した。
 //! `create` は core を直接呼ぶ（TASK-79.2.1・#866）。`start` は supervisor の bin を起動して結果を期限付きで受け取る（#1718。core の本番 launcher が入るまで supervisor が `UNIMPLEMENTED` を報告する）。
 //! `stop` / `delete` は TASK-79.2.2、`list` は状態ストアから一覧を出し、`logs` は存在確認までで内容は `UNIMPLEMENTED`（TASK-79.3・#640。REPAIR-3）。
@@ -37,3 +38,5 @@ pub mod setup;
 pub mod signals;
 #[cfg(unix)]
 pub(crate) mod sys;
+#[cfg(target_os = "linux")]
+pub(crate) mod user_scope;

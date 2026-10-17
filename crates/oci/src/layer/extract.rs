@@ -51,8 +51,8 @@
 //!
 //! # whiteout（OCI-2・TASK-53.3）
 //!
-//! `extract_one_layer` は最終コンポーネントが `.wh.<name>` のエントリを `Extractor::remove_whiteout_target`、
-//! `.wh..wh..opq` を `Extractor::clear_opaque_dir` へ渡し、マーカー自体は rootfs へ展開しない（本体は読み捨て、
+//! `extract_one_layer` は最終コンポーネントが `.wh.<name>` のエントリを記録し、レイヤーの全エントリを作り終えた
+//! 終端で `Extractor::remove_whiteout_target`、`.wh..wh..opq` を `Extractor::clear_opaque_dir` へ渡して適用し、マーカー自体は rootfs へ展開しない（本体は読み捨て、
 //! `ExtractedLayer::bytes` に数えない）。image-spec は whiteout を下位レイヤーのリソースにのみ適用すると定めるため、
 //! 現在のレイヤーが作成・上書き・経路として通過したエントリの ID を `NameIndex` に世代として持ち、
 //! マーカーの前後どちらにあっても同一レイヤーのエントリは消さない（tar 内の並び順に結果が依存しない）。
@@ -349,14 +349,14 @@ struct NameIndex {
     /// あった symlink も含む。その symlink のパスを再び辿るエントリ（`a/lnk/x` など）は、並び順で結果が
     /// 変わるため拒否する（OCI-2）。symlink を含む木の名前そのもの（`a`）の再作成は禁止しない。
     link_tombstones: HashSet<PathBuf>,
-    /// 削除マーカーの親が非ディレクトリだったときの、マーカー本来の親パス（アーカイブ上の字句のコンポーネント列）。
-    /// 同じレイヤーが後からディレクトリへ置換する並びと結果をそろえるため、判定をレイヤーの終端まで遅らせ、
-    /// 終端で親パス全体を解決し直す（symlink の指す先・実際の親の祖先も含めて検査する。OCI-2）。
-    pending_nondir_markers: Vec<DeferredMarker>,
+    /// 現在のレイヤーの削除マーカー（マーカー本来の親パス〔アーカイブ上の字句のコンポーネント列〕を持つ）。
+    /// 親の作成・置換や hardlink 参照先の削除との並び順に結果を依存させないため、すべてレイヤーの終端まで
+    /// 遅らせ、全エントリを作り終えた最終状態で親パス全体を解決し直して適用する（OCI-2）。
+    pending_markers: Vec<DeferredMarker>,
 }
 
-/// 親が非ディレクトリだったために適用を遅らせた削除マーカー（OCI-2・TASK-53.3）。
-/// 終端で親を解決し直せたら、即時経路と同じ関数で下位由来の実体へ削除を適用する。
+/// レイヤーの終端まで適用を遅らせた削除マーカー（OCI-2・TASK-53.3）。
+/// 終端で親を解決し直し、`remove_whiteout_target` / `clear_opaque_dir` で下位由来の実体へ削除を適用する。
 enum DeferredMarker {
     /// `.wh.<target>`。`parent` はアーカイブ上の字句の親パス。
     Whiteout {
@@ -379,7 +379,7 @@ impl NameIndex {
             pruned: HashSet::new(),
             traversed_links: HashSet::new(),
             link_tombstones: HashSet::new(),
-            pending_nondir_markers: Vec::new(),
+            pending_markers: Vec::new(),
         }
     }
 
@@ -409,7 +409,7 @@ impl NameIndex {
         self.pruned.clear();
         self.traversed_links.clear();
         self.link_tombstones.clear();
-        self.pending_nondir_markers.clear();
+        self.pending_markers.clear();
     }
 
     /// whiteout で削除した `parent` 直下の `name` と、その配下の登録をすべて索引から外す（IO-5）。
@@ -1084,50 +1084,34 @@ impl Extractor<'_> {
         false
     }
 
-    /// 削除マーカーの親解決が「非ディレクトリ」で失敗したとき、判定をレイヤーの終端まで遅らせる。
-    /// 同じレイヤーが後からそのパスをディレクトリへ置換する並びと、結果が変わらないようにする（OCI-2）。
-    fn defer_nondir_marker(&mut self, marker: DeferredMarker) -> Result<(), OciError> {
+    /// 削除マーカー（whiteout・不透明）をレイヤーの終端まで遅らせるため記録する。
+    /// マーカーの適用をエントリの並び順から切り離し、親が後から symlink・ディレクトリへ置換される並びや、
+    /// hardlink の参照先が後から削除される並びと、結果をそろえる（OCI-2）。件数は `NameIndex` の上限で頭打ちにする。
+    fn defer_marker(&mut self, marker: DeferredMarker) -> Result<(), OciError> {
         let max = usize::try_from(self.names.limit).unwrap_or(usize::MAX);
-        if self.names.pending_nondir_markers.len() >= max {
+        if self.names.pending_markers.len() >= max {
             return Err(err(
                 OciErrorCode::ResourceExhausted,
                 "too many deferred whiteout markers",
             ));
         }
-        self.names.pending_nondir_markers.push(marker);
+        self.names.pending_markers.push(marker);
         Ok(())
     }
 
-    /// 遅らせた削除マーカーを、レイヤーの終端の rootfs で親を解決し直して適用する。
-    /// 親がディレクトリへ解決できれば（同じレイヤーが後から symlink やディレクトリへ置換した場合）、
-    /// 即時経路と同じ `remove_whiteout_target` / `clear_opaque_dir` で下位由来の実体だけを削除するため、
-    /// 結果はエントリの並び順に依存しない（OCI-2）。解決はルートに閉じ込められ、同一レイヤーの実体は残る。
-    /// 解決できなければ `FailedPrecondition`。消えていれば（同じレイヤーの whiteout で削除済み）何もしない。
-    fn verify_deferred_markers(&mut self) -> Result<(), OciError> {
-        let pending = std::mem::take(&mut self.names.pending_nondir_markers);
+    /// 遅らせた削除マーカーを、レイヤーの終端の rootfs（最終状態）で親を解決し直して、記録順に適用する。
+    /// すべてのエントリを作り終えた後で適用するため、`touched`（現在のレイヤーの実体）は常に出そろっており、
+    /// 結果はエントリの並び順に依存しない（OCI-2）。親が存在しなければ下位に消す実体が無いので何もせず、
+    /// 非ディレクトリなら `FailedPrecondition`。解決はルートに閉じ込められ、同一レイヤーの実体は残る。
+    fn apply_deferred_markers(&mut self) -> Result<(), OciError> {
+        let pending = std::mem::take(&mut self.names.pending_markers);
         for marker in pending {
-            let parent = match &marker {
-                DeferredMarker::Whiteout { parent, .. } | DeferredMarker::Opaque { parent } => {
-                    parent.clone()
-                }
-            };
-            match self.resolve_dir(&parent, false) {
-                Ok(_) => {}
-                Err(e) if e.code() == OciErrorCode::NotFound => continue,
-                Err(e) => return Err(e),
-            }
             match marker {
                 DeferredMarker::Whiteout { parent, target } => {
                     self.remove_whiteout_target(&parent, &target)?;
                 }
                 DeferredMarker::Opaque { parent } => self.clear_opaque_dir(&parent)?,
             }
-        }
-        if !self.names.pending_nondir_markers.is_empty() {
-            return Err(err(
-                OciErrorCode::FailedPrecondition,
-                "a parent path component is not a directory",
-            ));
         }
         Ok(())
     }
@@ -1332,12 +1316,6 @@ impl Extractor<'_> {
         let dir = match self.resolve_dir(parent, false) {
             Ok(d) => d,
             Err(e) if e.code() == OciErrorCode::NotFound => return Ok(()),
-            Err(e) if e.code() == OciErrorCode::FailedPrecondition => {
-                return self.defer_nondir_marker(DeferredMarker::Whiteout {
-                    parent: parent.to_vec(),
-                    target: target.to_os_string(),
-                });
-            }
             Err(e) => return Err(e),
         };
         let path = join_resolved(self.root, &dir.comps, &target.to_os_string());
@@ -1477,11 +1455,6 @@ impl Extractor<'_> {
         let dir = match self.resolve_dir(parent, false) {
             Ok(d) => d,
             Err(e) if e.code() == OciErrorCode::NotFound => return Ok(()),
-            Err(e) if e.code() == OciErrorCode::FailedPrecondition => {
-                return self.defer_nondir_marker(DeferredMarker::Opaque {
-                    parent: parent.to_vec(),
-                });
-            }
             Err(e) => return Err(e),
         };
         let path = dir
@@ -1668,9 +1641,12 @@ fn extract_one_layer<R: Read>(
                 };
                 match class {
                     crate::whiteout::NameClass::Whiteout { target } => {
-                        x.remove_whiteout_target(&parent, &bytes_to_os(&target)?)?;
+                        x.defer_marker(DeferredMarker::Whiteout {
+                            parent,
+                            target: bytes_to_os(&target)?,
+                        })?;
                     }
-                    _ => x.clear_opaque_dir(&parent)?,
+                    _ => x.defer_marker(DeferredMarker::Opaque { parent })?,
                 }
                 continue;
             }
@@ -1711,8 +1687,8 @@ fn extract_one_layer<R: Read>(
             }
         }
     }
-    // 親が非ディレクトリだった削除マーカーは、レイヤーの全エントリを見たあとで判定する（OCI-2）。
-    x.verify_deferred_markers()?;
+    // 削除マーカーは、レイヤーの全エントリを作り終えた最終状態に対して適用する（OCI-2）。
+    x.apply_deferred_markers()?;
     // 世代（現在のレイヤーが触ったエントリ）はレイヤーごとに閉じる。次のレイヤーの whiteout は
     // このレイヤーの実体を「下位レイヤー由来」として扱う。
     x.names.clear_touched();
@@ -4206,6 +4182,47 @@ mod tests {
                 );
                 assert_eq!(names_in(&sb.root.join("real")), expected, "{marker}");
             }
+        }
+    }
+
+    /// OCI-2: 親が下位に無く同じレイヤーが後から symlink で作る削除マーカーも、並び順に依らず終端の最終状態で
+    /// 適用される（`real/x` は両順序で消え、`real/y` は残る）。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_pipeline_marker_with_missing_parent_is_order_independent() {
+        let lower = [file("real/x", 0o644, b"x"), file("real/y", 0o644, b"y")];
+        for (marker, expected) in [
+            ("d/.wh.x", vec!["y".to_string()]),
+            ("d/.wh..wh..opq", Vec::<String>::new()),
+        ] {
+            for entries in [
+                vec![wh(marker), symlink("d", "real")],
+                vec![symlink("d", "real"), wh(marker)],
+            ] {
+                let sb = Sandbox::new();
+                let mut ex = ex_for(&sb, host_lstat);
+                lay(&mut ex, &lower);
+                lay(&mut ex, &entries);
+                assert_eq!(names_in(&sb.root.join("real")), expected, "{marker}");
+            }
+        }
+    }
+
+    /// OCI-2: hardlink の参照先（下位の `f`）を同じレイヤーが whiteout する並びも、順序に依らず同じ結果になる
+    /// （`g` は残り内容は `f` と同じ、`f` は消える）。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_pipeline_whiteout_of_hardlink_target_is_order_independent() {
+        for entries in [
+            vec![hardlink("g", "f"), wh(".wh.f")],
+            vec![wh(".wh.f"), hardlink("g", "f")],
+        ] {
+            let sb = Sandbox::new();
+            let mut ex = ex_for(&sb, host_lstat);
+            lay(&mut ex, &[file("f", 0o644, b"data")]);
+            lay(&mut ex, &entries);
+            assert_eq!(names_in(&sb.root), vec!["g".to_string()]);
+            assert_eq!(fs::read(sb.root.join("g")).unwrap(), b"data");
         }
     }
 }

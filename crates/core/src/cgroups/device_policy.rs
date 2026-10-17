@@ -9,8 +9,8 @@
 //!
 //! # 呼び出し文脈・契約
 //! - 呼び出し元: start 経路。`IsolationPrivilege` からの [`DevicePolicyMode`] の決定（`From` 実装）と
-//!   `cgroups::CgroupPrepared::apply_limits` の制限の段（#1716）は実装済みで、supervisor・launcher からの
-//!   呼び出しの結線は #1717・#1715（未結線。REPAIR-3）。GPU の `deviceNodes` を足したプログラムでの再利用（#562）は、
+//!   `cgroups::CgroupPrepared::apply_limits` の制限の段（#1716）は実装済みで、supervisor の `prepare_cgroup` が
+//!   `apply_limits` 経由で呼ぶ（#1717・#1819）。GPU の `deviceNodes` を足したプログラムでの再利用（#562）は、
 //!   内部の `apply_device_policy_at` に別の `DeviceProgram` を渡す形で行う
 //! - コンテナのプロセスが cgroup に入る（`CgroupJoin` 段）**前**に、cgroup を作った runtime 側のプロセスから
 //!   呼ぶ。コンテナ側の seccomp は `bpf` を拒否するため、子プロセスからは呼べない

@@ -16,7 +16,7 @@
 //! ```
 //!
 //! # 呼び出し文脈・契約
-//! - 呼び出し元: start 経路の supervisor（結線は #1717、本番 launcher は #1715）。fork の前に親で呼ぶ
+//! - 呼び出し元: start 経路の supervisor（`ProductionStartDeps::prepare_cgroup`。#1717・#1819）。fork の前に親で呼ぶ
 //!   （デバイス許可プログラムは cgroup にプロセスが入る前に付ける必要がある）
 //! - 既存の低レベル API（`prepare`・`join_hook`・`apply_default_device_policy`）は実機試験や exec 経路のために
 //!   `pub` のままだが、start の経路ではこの連鎖だけを使う

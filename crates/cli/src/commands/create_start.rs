@@ -11,8 +11,8 @@
 //! 未実装・簡易実装（REPAIR-3）:
 //! - 本番入口の `start` は、状態ストアで ID の存在を確かめた後、CLI の実体と同じディレクトリの
 //!   `fandhe-container-supervisor` を起動して結果を受け取る（`supervisor_start` module の doc に契約・期限・
-//!   未実装範囲を書く）。supervisor は core の本番 launcher（#1715 の Phase B）が入るまで `UNIMPLEMENTED` を報告するため、
-//!   現状は実際にはコンテナを起動しない。CLI は状態を書かないので、失敗しても `state.json` は変わらない
+//!   未実装範囲を書く）。supervisor が core の本番 launcher（#1715・#1819）で起動し、Running の記録は supervisor が行う
+//!   （rootless のみ。実機での通し確認は未実施で #2062）。CLI は状態を書かないので、失敗しても `state.json` は変わらない
 //!   （プロセスのいない Running を CLI は残さない。#1541）。ランチャー経由の特権起動の選択は未対応（#1719・#1722）。
 //! - 計測（REPAIR-4）のファイル出力は core の `open_flags` が対応するアーキテクチャの Linux のみ（`op_log_file`。対応外は出力しない）。本バイナリを
 //!   setuid / setgid・file capability つきで導入しない前提で、権限分離（TASK-171・SUP-14）で見直す。

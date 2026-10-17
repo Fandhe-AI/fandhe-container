@@ -63,7 +63,9 @@ harness = false
 
 # [[bench]] startup_latency は TASK-190（#1900・REPAIR-8・CORE-10）のコンテナ起動レイテンシ p95 ベンチ。
 # core の create から supervisor の bin（本番 launcher）の OK 報告までを測る。実機前提（Linux・非 root・
-# systemd-run --user）で CI では実行しない。metrics.json・BENCH_NAMES・baseline.json へは未登録（登録は #1901）。
+# systemd-run --user）で CI では実行しない。metrics.json へは実機前提として登録済み（#1901）。
+# BENCH_NAMES・共有 baseline.json には入れず scripts/lib.sh の BENCH_MANUAL_NAMES に置く。基準値は
+# benches/baseline-manual.json（未作成。実測は #230）、比較は人が実機で make bench-check-manual（#2095）。
 [[bench]]
 name = "startup_latency"
 harness = false

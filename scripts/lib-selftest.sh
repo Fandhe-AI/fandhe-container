@@ -171,6 +171,19 @@ check_range() {
   done
 }
 
+# acquire_output_lock / release_output_lock: 2 回目の取得は output-busy で exit 2、解放は冪等（一時ディレクトリだけを使う）。
+for sh in "${shells[@]}"; do
+  lockdir="$(mktemp -d)"
+  # shellcheck disable=SC2016 # 引数は子の bash 側で展開させる
+  got="$("${sh}" -c 'source "$1"; acquire_output_lock "$2/out"; release_output_lock; release_output_lock; acquire_output_lock "$2/out"; acquire_output_lock "$2/out"' _ "${src_dir}/lib.sh" "${lockdir}" 2>&1)" && rc=0 || rc=$?
+  if [ "${rc}" = 2 ] && [ "${got}" = "error: code=output-busy message=another run holds ${lockdir}/out.lock (remove it if no run is active)" ]; then
+    pass "output lock busy and idempotent release (${sh})"
+  else
+    fail "output lock (${sh}): rc=${rc} got=${got}"
+  fi
+  rm -rf "${lockdir}"
+done
+
 check_range one 0 1 1 10
 check_range max 0 10 1 10
 check_range zero 1 0 1 10

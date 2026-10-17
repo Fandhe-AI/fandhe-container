@@ -87,7 +87,9 @@ impl BundleProvider for FixedBundle {
     fn prepare(&self, id: &str, _: &str, _: &ContainerConfig) -> Result<PathBuf, Status> {
         Ok(PathBuf::from("/tmp/unused-bundle").join(id))
     }
-    fn release(&self, _: &str) {}
+    fn release(&self, _: &str) -> Result<(), Status> {
+        Ok(())
+    }
 }
 
 /// 起動した子を必ず kill・wait する（プロセスを残さない）。

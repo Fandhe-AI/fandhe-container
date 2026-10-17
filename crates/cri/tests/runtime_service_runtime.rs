@@ -129,6 +129,7 @@ impl ContainerRuntime for Shared {
 struct FakeBundles {
     calls: Mutex<Vec<String>>,
     fail: AtomicBool,
+    fail_release: AtomicBool,
 }
 
 fn bundle_root() -> PathBuf {
@@ -156,11 +157,15 @@ impl BundleProvider for FakeBundles {
         }
         Ok(bundle_root().join(container_id))
     }
-    fn release(&self, container_id: &str) {
+    fn release(&self, container_id: &str) -> Result<(), Status> {
         self.calls
             .lock()
             .unwrap()
             .push(format!("release {container_id}"));
+        if self.fail_release.load(Ordering::SeqCst) {
+            return Err(Status::internal("release failed"));
+        }
+        Ok(())
     }
 }
 
@@ -386,6 +391,21 @@ async fn task_59_2_start_failure_keeps_created() {
         status(&h.service, &id).await.state,
         S::ContainerRunning as i32
     );
+}
+
+/// bundle の解放に失敗したら記録と件数枠を保持する（資源の追跡を失わない。CRI-2・REPAIR-5）。
+#[tokio::test]
+async fn task_59_2_release_failure_keeps_record() {
+    let h = harness();
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
+    let sb = run_sandbox(&h.service).await;
+    h.bundles.fail_release.store(true, Ordering::SeqCst);
+    h.runtime
+        .create_returns_running
+        .store(true, Ordering::SeqCst);
+    let err = create(&h.service, &sb, "c").await.expect_err("create");
+    assert_eq!(err.code(), Code::Internal);
+    assert_eq!(list_count(&h.service).await, 1);
 }
 
 /// 実行層が created 以外を返したら INTERNAL とし、記録を巻き戻して bundle を解放する（CRI-2）。

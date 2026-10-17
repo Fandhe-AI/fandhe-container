@@ -130,7 +130,10 @@ pub trait BundleProvider: Send + Sync {
     ) -> Result<PathBuf, Status>;
 
     /// `prepare` で用意した資源を解放する（`create` 失敗時の後始末。stop・delete の接続は TASK-59.3）。
-    fn release(&self, container_id: &str);
+    ///
+    /// 削除・解除に失敗したら `Err` を返す。呼び出し側は `Err` のとき資源が残っているとみなし、
+    /// コンテナの記録と件数枠を保持して追跡を失わない（fail-closed）。不在は `Ok` としてよい。
+    fn release(&self, container_id: &str) -> Result<(), Status>;
 }
 
 /// RPC ハンドラから `ContainerRuntime` を呼ぶアダプタ（CRI-2・CRI-7）。
@@ -168,13 +171,13 @@ impl RuntimeAdapter {
     pub fn create(&self, id: &str, bundle: PathBuf) -> Result<RuntimeContainerStatus, Status> {
         let req =
             CreateRequest::new(Self::id(id)?, bundle).map_err(|e| trait_error_to_status(&e))?;
-        Self::finish(self.runtime.create(&req))
+        Self::finish(id, self.runtime.create(&req))
     }
 
     /// `created` 状態のコンテナを開始する。
     pub fn start(&self, id: &str) -> Result<RuntimeContainerStatus, Status> {
         let req = StartRequest::new(Self::id(id)?);
-        Self::finish(self.runtime.start(&req))
+        Self::finish(id, self.runtime.start(&req))
     }
 
     /// SIGTERM 後 `timeout_secs` 秒で SIGKILL へ切り替えて停止する。
@@ -183,7 +186,7 @@ impl RuntimeAdapter {
     pub fn stop(&self, id: &str, timeout_secs: i64) -> Result<RuntimeContainerStatus, Status> {
         let grace = Duration::from_secs(u64::try_from(timeout_secs).unwrap_or(0));
         let req = StopRequest::new(Self::id(id)?, grace).map_err(|e| trait_error_to_status(&e))?;
-        Self::finish(self.runtime.stop(&req))
+        Self::finish(id, self.runtime.stop(&req))
     }
 
     /// コンテナの資源を解放する（`ContainerRuntime::delete`）。`force` は実行中でも停止してから削除する。
@@ -200,19 +203,28 @@ impl RuntimeAdapter {
     pub fn kill(&self, id: &str, signal: u8) -> Result<RuntimeContainerStatus, Status> {
         let signal = Signal::new(signal).map_err(|e| trait_error_to_status(&e))?;
         let req = KillRequest::new(Self::id(id)?, signal);
-        Self::finish(self.runtime.kill(&req))
+        Self::finish(id, self.runtime.kill(&req))
     }
 
     /// コンテナの現在状態を照会する。
     pub fn state(&self, id: &str) -> Result<RuntimeContainerStatus, Status> {
         let req = StateRequest::new(Self::id(id)?);
-        Self::finish(self.runtime.state(&req))
+        Self::finish(id, self.runtime.state(&req))
     }
 
-    fn finish(r: Result<ContainerStatus, TraitError>) -> Result<RuntimeContainerStatus, Status> {
-        r.as_ref()
-            .map(RuntimeContainerStatus::from)
-            .map_err(trait_error_to_status)
+    /// 実行層の応答を CRI の語彙へ写す。応答の ID が要求の ID と異なれば plugin の不正な応答として
+    /// `INTERNAL`（結果不明）で拒否する（plugin 入力は untrusted。別コンテナの状態を受理しない）。
+    fn finish(
+        expected_id: &str,
+        r: Result<ContainerStatus, TraitError>,
+    ) -> Result<RuntimeContainerStatus, Status> {
+        let status = r.as_ref().map_err(trait_error_to_status)?;
+        if status.id().as_str() != expected_id {
+            return Err(Status::internal(
+                "runtime returned a status for a different container id",
+            ));
+        }
+        Ok(RuntimeContainerStatus::from(status))
     }
 }
 
@@ -262,6 +274,16 @@ mod tests {
             assert_eq!(got.pid, pid);
             assert_eq!(got.exit_code, code);
         }
+    }
+
+    /// CRI-2: 応答の ID が要求と異なれば拒否する。
+    #[test]
+    fn cri2_finish_rejects_mismatched_id() {
+        let ok = RuntimeAdapter::finish("a", Ok(ContainerStatus::creating(cid("a"))));
+        assert_eq!(ok.unwrap().id, "a");
+        let err = RuntimeAdapter::finish("a", Ok(ContainerStatus::created(cid("b"), None)))
+            .expect_err("mismatch");
+        assert_eq!(err.code(), Code::Internal);
     }
 
     /// CRI-2: 削除応答を CRI 側の型へ写す。

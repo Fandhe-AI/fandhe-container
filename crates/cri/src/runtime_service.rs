@@ -254,7 +254,9 @@ struct RuntimeBinding {
 }
 
 /// 実行層（bundle 供給元・`ContainerRuntime`）の応答待ちの既定の上限（REPAIR-5）。
-const DEFAULT_RUNTIME_TIMEOUT: Duration = Duration::from_secs(60);
+///
+/// AGENTS.md「推奨タイムアウト値」の新規応答待ちの既定（5〜10 秒）に合わせて 10 秒とする。
+const DEFAULT_RUNTIME_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// `reserve_container` の戻り値（登録したコンテナの識別子と、bundle 供給元へ渡す設定）。
 struct ReservedContainer {
@@ -350,11 +352,13 @@ impl Drop for InFlightGuard {
             // 件数の上限（MAX_CONTAINERS）で有界になり、枠を超えて worker や未解放資源が溜まらない
             // （REPAIR-5・リソース上限）。結果不明のときは実行層に資源が残りうるため bundle を解放しない
             // （削除完了を確認できた場合だけ `mark_definitely_failed` 経由で解放する。fail-closed）。
+            // 解放に失敗したら資源が残るため結果不明と同じ扱い（記録と件数枠を保持して追跡を残す）。
             if self.kind == InFlightKind::Create
                 && !self.outcome_unknown
                 && let Some(bundles) = &self.bundles
+                && bundles.release(&self.id).is_err()
             {
-                bundles.release(&self.id);
+                self.outcome_unknown = true;
             }
             rollback_in_flight(&self.registry, &self.id, self.kind, self.outcome_unknown);
         }

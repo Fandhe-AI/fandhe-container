@@ -1,4 +1,4 @@
-//! 複数レイヤー・whiteout 混在の公開 API 結合試験（TASK-53.3・OCI-2・#414）。
+//! 複数レイヤー・whiteout 混在の公開 API 結合試験（TASK-53.3・OCI-2・MS-4・#414）。
 //! digest 検証 → gzip 展開 → 下位から上位への重ね展開で whiteout・不透明ディレクトリを適用した最終 rootfs を具体値で確認する。
 
 use std::collections::BTreeSet;

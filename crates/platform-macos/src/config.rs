@@ -869,6 +869,7 @@ impl ConsoleLogPath {
         let path = path.as_ref();
         let field = ConfigField::ConsoleLog;
         check_absolute_utf8(field, path)?;
+        #[cfg(unix)]
         check_generation_name_len(path)?;
         check_console_log_parent(path)?;
         match std::fs::symlink_metadata(path) {
@@ -1065,8 +1066,13 @@ impl ConsoleLogPath {
         if meta.len() == 0 {
             return Ok(());
         }
+        // 世代も開いて try_lock し、改名が終わるまで保持する（別 VM が使用中の世代を .2 へ送って次の回転で
+        // 上書きし、書き出しスレッドが改名・削除済み inode へ書き続けるのを防ぐ）。
+        let mut _generation_locks = Vec::new();
         for n in 1..crate::console_log::CONSOLE_LOG_GENERATIONS {
-            check_generation_entry(&self.generation_path(n), protected)?;
+            if let Some(file) = lock_generation_entry(&self.generation_path(n), protected)? {
+                _generation_locks.push(file);
+            }
         }
         let now = std::fs::symlink_metadata(path).map_err(rotation_err)?;
         if now.file_type().is_symlink() || (now.dev(), now.ino()) != (meta.dev(), meta.ino()) {
@@ -1125,9 +1131,12 @@ impl ConsoleLogPath {
             }
         };
         let mut targets = Vec::new();
+        // 世代も try_lock して unlink が終わるまで保持する（使用中の世代を消さない）。
+        let mut _generation_locks = Vec::new();
         for n in (1..crate::console_log::CONSOLE_LOG_GENERATIONS).rev() {
             let gen_path = self.generation_path(n);
-            if check_generation_entry(&gen_path, protected)? {
+            if let Some(file) = lock_generation_entry(&gen_path, protected)? {
+                _generation_locks.push(file);
                 targets.push(gen_path);
             }
         }
@@ -1146,7 +1155,7 @@ impl ConsoleLogPath {
     }
 }
 
-/// [`VmConfigSpec::remove_console_logs`] の結果（将来の項目追加に備え `non_exhaustive`）。
+/// `VmConfigSpec::remove_console_logs`（unix 限定）の結果（将来の項目追加に備え `non_exhaustive`）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RemovedConsoleLogs {
@@ -1155,6 +1164,9 @@ pub struct RemovedConsoleLogs {
 }
 
 /// 世代の接尾辞（`.N`）を足してもファイル名が NAME_MAX（255 バイト）を超えないことを検査する（#2138）。
+///
+/// 世代の回転は unix 限定（`console_log` モジュールが unix 限定）のため、この検査も unix のみ。
+#[cfg(unix)]
 fn check_generation_name_len(path: &Path) -> Result<(), ConfigError> {
     const FILE_NAME_MAX_BYTES: usize = 255;
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -1218,6 +1230,48 @@ fn check_generation_entry(
         crate::sys::effective_uid(),
     )?;
     Ok(true)
+}
+
+/// 世代ファイルを検査し（`check_generation_entry`）、存在すれば開いて排他 `try_lock` した fd を返す（#2138）。
+///
+/// 使用中（別 VM の書き出しスレッドが lock 中）なら `ConsoleLogInUse`。呼び出し側は回転・削除が終わるまで
+/// 返した fd を保持する。open は `O_NOFOLLOW` で、開いた fd と lstat の `(dev, ino)` が食い違えば
+/// （検査後の差し替え）拒否する。
+#[cfg(unix)]
+fn lock_generation_entry(
+    path: &Path,
+    protected: &[ProtectedInput<'_>],
+) -> Result<Option<std::fs::File>, ConfigError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    if !check_generation_entry(path, protected)? {
+        return Ok(None);
+    }
+    let open_err = |kind: std::io::ErrorKind| ConfigError::ConsoleLogOpen { kind };
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(open_err(e.kind())),
+    };
+    let fd_meta = file.metadata().map_err(|e| open_err(e.kind()))?;
+    let post = std::fs::symlink_metadata(path).map_err(|e| open_err(e.kind()))?;
+    if post.file_type().is_symlink()
+        || !fd_meta.is_file()
+        || (fd_meta.dev(), fd_meta.ino()) != (post.dev(), post.ino())
+    {
+        return Err(open_err(std::io::ErrorKind::Other));
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(ConfigError::ConsoleLogInUse {
+            path: path.to_path_buf(),
+        }),
+        Err(std::fs::TryLockError::Error(e)) => Err(open_err(e.kind())),
+    }
 }
 
 /// コンソールログの追記先と同一ファイルであってはならない入力（kernel / initrd / ディスクイメージ）。
@@ -4459,6 +4513,7 @@ broken line
     }
 
     /// 定数の値の固定（supervisor の 1 MiB × 3 世代に揃える）。
+    #[cfg(unix)]
     #[test]
     fn console_log_limits_match_supervisor() {
         assert_eq!(crate::console_log::MAX_CONSOLE_LOG_BYTES, 1024 * 1024);
@@ -4599,6 +4654,7 @@ broken line
     }
 
     /// 世代の接尾辞でファイル名が NAME_MAX を超えるパスは create 時点で拒否する。
+    #[cfg(unix)]
     #[test]
     fn console_log_name_too_long_is_rejected() {
         let t = TempDir::new("rot-name");
@@ -4627,6 +4683,34 @@ broken line
         assert!(!gen_path(&path, 1).exists());
         assert!(!gen_path(&path, 2).exists());
         assert!(t.0.exists());
+    }
+
+    /// 別 VM が使用中（lock 保持中）の世代ファイルは、回転でも削除でも動かさず `ConsoleLogInUse` で拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn rotation_and_removal_refuse_locked_generation() {
+        let t = TempDir::new("rot-genlock");
+        let (spec, path, _k, _i) = rotation_spec(&t);
+        put(&path, b"cur\n");
+        let g1 = gen_path(&path, 1);
+        put(&g1, b"gen1\n");
+        let held = std::fs::File::open(&g1).unwrap();
+        held.try_lock().unwrap();
+        assert_eq!(
+            spec.open_serial_console().unwrap_err().code(),
+            "config.console_log_in_use"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"cur\n");
+        assert_eq!(std::fs::read(&g1).unwrap(), b"gen1\n");
+        assert!(!gen_path(&path, 2).exists());
+        assert_eq!(
+            spec.remove_console_logs().unwrap_err().code(),
+            "config.console_log_in_use"
+        );
+        assert!(path.exists());
+        assert!(g1.exists());
+        drop(held);
+        assert_eq!(spec.remove_console_logs().unwrap().removed, 2);
     }
 
     /// `remove_console_logs`: 使用中なら何も消さず、不正なエントリがあっても何も消さない。

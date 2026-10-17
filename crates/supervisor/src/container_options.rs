@@ -34,7 +34,7 @@
 //!
 //! # 未結線の箇所（REPAIR-3）
 //!
-//! 本番の `ProcessLauncher` が未提供のため、現時点で [`ContainerOptions`] の消費者は無い
+//! start 経路（`start_entry`・本番 launcher）からの結線が未実装のため、現時点で [`ContainerOptions`] の消費者は無い
 //! （CLI・launcher からの結線は後続作業。label を `CreateStateRequest::with_annotations` へ渡す結線も同様）。OS 非依存で、3 OS でビルド・テストする。
 //!
 //! # 外部入力の扱い

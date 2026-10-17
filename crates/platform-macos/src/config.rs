@@ -953,7 +953,7 @@ impl ConsoleLogPath {
             Err(e) => return Err(open_err(e.kind())),
         };
         let mut options = std::fs::OpenOptions::new();
-        options.append(true).custom_flags(O_NOFOLLOW);
+        options.append(true).custom_flags(O_NOFOLLOW | O_NONBLOCK);
         if pre.is_none() {
             // 新規作成は O_EXCL 付き（他者が先に作ったファイルを開かない）。
             options.create_new(true).mode(0o600);
@@ -1122,19 +1122,42 @@ impl ConsoleLogPath {
         let path = self.lock_path();
         let open_err = |kind: std::io::ErrorKind| ConfigError::ConsoleLogOpen { kind };
         check_console_log_parent(self.as_path())?;
-        check_generation_entry(&path, protected)?;
-        let file = std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .custom_flags(O_NOFOLLOW)
-            .open(&path)
-            .map_err(|e| match std::fs::symlink_metadata(&path) {
-                Ok(m) if m.file_type().is_symlink() => {
-                    ConfigError::ConsoleLogIsSymlink { path: path.clone() }
+        // 不存在なら O_EXCL で作り、存在すれば作成フラグなしで開く。検査と open の間に他者が FIFO 等を
+        // 置いても O_CREAT で開かない。O_NONBLOCK は FIFO の open が無期限に待つ DoS を塞ぐ（検査後の差し替え）。
+        // 競合（AlreadyExists / NotFound）は検査からやり直す（最大 3 回。超えたら fail-closed）。
+        let mut opened = None;
+        let mut last_kind = std::io::ErrorKind::Other;
+        for _ in 0..3 {
+            let exists = check_generation_entry(&path, protected)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.append(true).custom_flags(O_NOFOLLOW | O_NONBLOCK);
+            if !exists {
+                options.create_new(true).mode(0o600);
+            }
+            match options.open(&path) {
+                Ok(f) => {
+                    opened = Some(f);
+                    break;
                 }
-                _ => open_err(e.kind()),
-            })?;
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    last_kind = e.kind();
+                }
+                Err(e) => {
+                    return Err(match std::fs::symlink_metadata(&path) {
+                        Ok(m) if m.file_type().is_symlink() => {
+                            ConfigError::ConsoleLogIsSymlink { path: path.clone() }
+                        }
+                        _ => open_err(e.kind()),
+                    });
+                }
+            }
+        }
+        let file = opened.ok_or_else(|| open_err(last_kind))?;
         let same_as_path = |file: &std::fs::File| -> Result<(), ConfigError> {
             let fd_meta = file.metadata().map_err(|e| open_err(e.kind()))?;
             let post = std::fs::symlink_metadata(&path).map_err(|e| open_err(e.kind()))?;
@@ -1374,7 +1397,7 @@ fn lock_generation_entry(
     let open_err = |kind: std::io::ErrorKind| ConfigError::ConsoleLogOpen { kind };
     let file = match std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(O_NOFOLLOW)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(path)
     {
         Ok(f) => f,
@@ -1592,6 +1615,48 @@ const O_NOFOLLOW: i32 = 0x8000;
     ))
 ))]
 const O_NOFOLLOW: i32 = 0x2_0000;
+
+/// `open(2)` の `O_NONBLOCK`。FIFO を差し替えられても open が相手を待たず（読み出しは即成功、書き込みは
+/// ENXIO）、後段の種別検査で拒否できるようにする（#2138。DoS 対策）。値は各 OS の fcntl.h。
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    )
+))]
+const O_NONBLOCK: i32 = 0x0004;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6"
+    )
+))]
+const O_NONBLOCK: i32 = 0x80;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "sparc", target_arch = "sparc64")
+))]
+const O_NONBLOCK: i32 = 0x4000;
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    not(any(
+        target_arch = "mips",
+        target_arch = "mips32r6",
+        target_arch = "mips64",
+        target_arch = "mips64r6",
+        target_arch = "sparc",
+        target_arch = "sparc64"
+    ))
+))]
+const O_NONBLOCK: i32 = 0x800;
 
 /// シリアルコンソールの出力先。
 ///
@@ -4898,6 +4963,47 @@ broken line
         assert_eq!(std::fs::read(gen_path(&path, 1)).unwrap(), b"cur\n");
         assert_eq!(spec.remove_console_logs().unwrap().removed, 2);
         assert!(!lock_path.exists());
+    }
+
+    /// MAC-1・REPAIR-4・#2138: 検査後に FIFO を置かれても世代・排他用ファイルの open が待たない（DoS 対策）。
+    #[cfg(unix)]
+    #[test]
+    fn generation_open_does_not_block_on_fifo() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let t = TempDir::new("rot-fifo");
+        let fifo = t.0.join("console.log.0");
+        let status = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !matches!(status, Ok(s) if s.success()) {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || {
+            let w = std::fs::OpenOptions::new()
+                .append(true)
+                .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+                .open(&p)
+                .map(|_| ());
+            let r = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+                .open(&p)
+                .and_then(|f| f.metadata())
+                .map(|m| m.is_file());
+            let _ = tx.send((w.map_err(|e| e.raw_os_error()), r.ok()));
+        });
+        let (w, r) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("open on a FIFO must not block");
+        // 読み手がいない書き込み open は ENXIO、読み出し open は成功するが通常ファイルではない。
+        assert!(w.is_err());
+        assert_eq!(r, Some(false));
+        // 本体の経路でも、置かれた FIFO は通常ファイルでないとして拒否する。
+        let (spec, _path, _k, _i) = rotation_spec(&t);
+        assert_eq!(
+            spec.open_serial_console().unwrap_err().code(),
+            "config.not_a_file"
+        );
     }
 
     /// MAC-1・REPAIR-4・#2138: 排他用ファイルの名前が symlink なら辿らず拒否する。

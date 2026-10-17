@@ -39,6 +39,8 @@ struct FakeRuntime {
     hold_create: AtomicBool,
     /// true のとき start は stopped を返す（終了済みの応答の検証用）。
     start_returns_stopped: AtomicBool,
+    /// true のとき delete は成功する（実行層の削除完了の確認用。偽なら Unimplemented で失敗する）。
+    delete_ok: AtomicBool,
 }
 
 impl FakeRuntime {
@@ -96,7 +98,15 @@ impl ContainerRuntime for Shared {
     fn stop(&self, _: &StopRequest) -> Result<ContainerStatus, TraitError> {
         Err(TraitError::new(ErrorCode::Unimplemented, "not used"))
     }
-    fn delete(&self, _: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
+    fn delete(&self, r: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
+        self.0
+            .calls
+            .lock()
+            .unwrap()
+            .push(format!("delete {}", r.id().as_str()));
+        if self.0.delete_ok.load(Ordering::SeqCst) {
+            return Ok(DeleteResponse::new());
+        }
         Err(TraitError::new(ErrorCode::Unimplemented, "not used"))
     }
     fn state(&self, _: &StateRequest) -> Result<ContainerStatus, TraitError> {
@@ -307,6 +317,7 @@ async fn task_59_2_create_and_start_reach_the_runtime() {
 #[tokio::test]
 async fn task_59_2_create_failure_is_rolled_back() {
     let h = harness();
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
     let sb = run_sandbox(&h.service).await;
     for (code, expect) in [
         (ErrorCode::AlreadyExists, Code::AlreadyExists),
@@ -371,6 +382,7 @@ async fn task_59_2_start_failure_keeps_created() {
 #[tokio::test]
 async fn task_59_2_unexpected_create_state_releases_bundle() {
     let h = harness();
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
     let sb = run_sandbox(&h.service).await;
     h.runtime
         .create_returns_running
@@ -618,6 +630,7 @@ async fn task_59_2_start_timeout_is_bounded_and_worker_finalizes() {
 #[tokio::test]
 async fn task_59_2_create_timeout_defers_release_until_worker_finishes() {
     let h = harness();
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
     let service = h.service.with_runtime_timeout(Duration::from_millis(50));
     let sb = run_sandbox(&service).await;
     h.runtime.hold_create.store(true, Ordering::SeqCst);
@@ -652,4 +665,92 @@ async fn task_59_2_create_timeout_defers_release_until_worker_finishes() {
         std::thread::sleep(Duration::from_millis(10));
     }
     panic!("worker did not roll back");
+}
+
+fn release_count(h: &Harness) -> usize {
+    h.bundles
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|c| c.starts_with("release "))
+        .count()
+}
+
+/// REPAIR-5: 結果不明の create 失敗で削除完了を確認できなければ、記録（exited）と bundle を保持する。
+#[tokio::test]
+async fn task_59_2_ambiguous_create_failure_retains_record_and_bundle() {
+    for code in [
+        ErrorCode::Timeout,
+        ErrorCode::Unavailable,
+        ErrorCode::Internal,
+    ] {
+        let h = harness();
+        let sb = run_sandbox(&h.service).await;
+        *h.runtime.fail_create.lock().unwrap() = Some(code);
+        create(&h.service, &sb, "c").await.expect_err("create");
+        // 削除を確認できない（delete は Unimplemented）ため、追跡情報と bundle を失わせない。
+        assert_eq!(list_count(&h.service).await, 1);
+        assert_eq!(release_count(&h), 0);
+        assert!(h.runtime.calls().iter().any(|c| c.starts_with("delete ")));
+    }
+}
+
+/// 確定失敗（実行層が処理前に拒否）は delete を試さず全解放する。
+#[tokio::test]
+async fn task_59_2_definite_create_failure_skips_remove_and_releases() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    *h.runtime.fail_create.lock().unwrap() = Some(ErrorCode::InvalidArgument);
+    create(&h.service, &sb, "c").await.expect_err("create");
+    assert_eq!(list_count(&h.service).await, 0);
+    assert_eq!(release_count(&h), 1);
+    assert!(!h.runtime.calls().iter().any(|c| c.starts_with("delete ")));
+}
+
+/// created 以外の応答のあと delete が失敗したら、実行層に残った資源の追跡のため記録と bundle を保持する。
+#[tokio::test]
+async fn task_59_2_unexpected_create_state_with_failed_remove_retains() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    h.runtime
+        .create_returns_running
+        .store(true, Ordering::SeqCst);
+    let err = create(&h.service, &sb, "c").await.expect_err("create");
+    assert_eq!(err.code(), Code::Internal);
+    assert_eq!(list_count(&h.service).await, 1);
+    assert_eq!(release_count(&h), 0);
+}
+
+/// REPAIR-5: 実行層がハングして blocking pool が埋まっても、期限で DEADLINE_EXCEEDED を返す。
+#[test]
+fn task_59_2_timeout_does_not_depend_on_blocking_pool() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .build()
+        .expect("runtime");
+    rt.block_on(async {
+        let h = harness();
+        let service = h.service.with_runtime_timeout(Duration::from_millis(100));
+        let sb = run_sandbox(&service).await;
+        // blocking pool の唯一のスレッドを塞ぐ。
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let blocker = tokio::task::spawn_blocking(move || {
+            while !stop2.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        h.runtime.hold_create.store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        let err = create(&service, &sb, "c").await.expect_err("create");
+        assert_eq!(err.code(), Code::DeadlineExceeded);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "must return near the deadline"
+        );
+        h.runtime.hold_create.store(false, Ordering::SeqCst);
+        stop.store(true, Ordering::SeqCst);
+        blocker.await.expect("blocker");
+    });
 }

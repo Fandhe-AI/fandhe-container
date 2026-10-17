@@ -15,7 +15,8 @@
 //!
 //! **実行層への接続（CRI-2・CRI-7・TASK-59.2・#438）**: [`CriRuntimeService::with_runtime`] で
 //! [`RuntimeAdapter`] と [`BundleProvider`] を注入すると、`CreateContainer` は bundle を用意して
-//! `ContainerRuntime::create`、`StartContainer` は `ContainerRuntime::start` を `spawn_blocking` 上で呼ぶ。
+//! `ContainerRuntime::create`、`StartContainer` は `ContainerRuntime::start` を専用スレッド上で呼ぶ
+//! （tokio の blocking pool を使わず、期限の監視もプールの空きに依存させない。REPAIR-5）。
 //! 呼び出し中はレジストリのロックを持たず、記録の `in_flight` フラグで二重 Start・Remove・親サンドボックスの
 //! 除去を `FAILED_PRECONDITION` にする。実行層が失敗したら記録を巻き戻し（Create）・Created へ戻し（Start）、
 //! 「記録上だけ running」のフォールバックはしない（fail-closed）。注入しない場合は従来のスタブ動作のまま。
@@ -270,11 +271,11 @@ enum InFlightKind {
     Start,
 }
 
-/// `ContainerRuntime::start` のエラーコードのうち「起動していない」と確定できるものか（REPAIR-5）。
+/// `ContainerRuntime::create`・`start` のエラーコードのうち「何も起きていない」と確定できるものか（REPAIR-5）。
 ///
 /// 入力・状態・権限の拒否は実行層が処理前に弾いた確定失敗。`DeadlineExceeded`・`Unavailable`・
 /// `Internal` 等は応答不明で実行層が running の可能性があり、再 Start の二重起動を避けるため含めない。
-fn is_definite_start_failure(code: tonic::Code) -> bool {
+fn is_definite_failure(code: tonic::Code) -> bool {
     use tonic::Code;
     matches!(
         code,
@@ -289,7 +290,7 @@ fn is_definite_start_failure(code: tonic::Code) -> bool {
 
 /// 実行層の呼び出し中に立てた `in_flight` を、確定されないまま破棄されたら巻き戻す番人（TASK-59.2）。
 ///
-/// worker（`spawn_blocking` 上のクロージャ）が所有する。RPC の future が中断・タイムアウトしても
+/// worker（専用スレッド上のクロージャ）が所有する。RPC の future が中断・タイムアウトしても
 /// worker は最後まで走り、その終了時（失敗・panic を含む）に `Drop` で巻き戻すため、実行層が処理中の間に
 /// 記録・件数枠・bundle だけが先に解放されることはない。確定は [`InFlightGuard::commit`]。
 struct InFlightGuard {
@@ -299,8 +300,9 @@ struct InFlightGuard {
     committed: bool,
     /// Create の巻き戻しで `release` を呼ぶ bundle の供給元。
     bundles: Option<Arc<dyn BundleProvider>>,
-    /// 実行層の結果が不明（Start の呼び出し後で、定義的な失敗が確認できていない）か。
-    /// 真のまま破棄されたら、実行層では running かもしれないため created へ戻さず exited にする。
+    /// 実行層の結果が不明（呼び出し後で、確定失敗・削除完了が確認できていない）か。
+    /// 真のまま破棄されたら、Start は実行層で running かもしれないため created へ戻さず exited にし、
+    /// Create は実行層に資源が残るかもしれないため記録と bundle を保持する（exited にして追跡を残す）。
     outcome_unknown: bool,
 }
 
@@ -327,13 +329,13 @@ impl InFlightGuard {
         self.outcome_unknown = true;
     }
 
-    /// 実行層が「状態は created のまま（起動していない）」と確定できた。
+    /// 実行層が「何も起きていない」（Start は created のまま、Create は未作成または削除完了）と確定できた。
     fn mark_definitely_failed(&mut self) {
         self.outcome_unknown = false;
     }
 
     /// 実行層の成功を記録へ反映して確定する。反映に失敗したら巻き戻される。
-    fn commit(mut self) -> Result<(), Status> {
+    fn commit(&mut self) -> Result<(), Status> {
         commit_in_flight(&self.registry, &self.id, self.kind)?;
         self.committed = true;
         Ok(())
@@ -344,7 +346,10 @@ impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if !self.committed {
             rollback_in_flight(&self.registry, &self.id, self.kind, self.outcome_unknown);
+            // 実行層に資源が残っている可能性があるとき（結果不明）は bundle を解放しない。
+            // 削除完了を確認できた場合だけ `mark_definitely_failed` 経由で解放する（fail-closed）。
             if self.kind == InFlightKind::Create
+                && !self.outcome_unknown
                 && let Some(bundles) = &self.bundles
             {
                 bundles.release(&self.id);
@@ -353,30 +358,90 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// 実行層の呼び出しを worker スレッドで走らせ、結果を `timeout` まで待つ（REPAIR-5）。
+/// 実行層からコンテナの削除完了（または不在）を確認できたか。成功と `NOT_FOUND` を確認済みとする。
+///
+/// 失敗・タイムアウト・結果不明は未確認（偽）。偽のとき呼び出し側は記録と bundle を保持する。
+fn confirm_removed(adapter: &RuntimeAdapter, id: &str) -> bool {
+    match adapter.remove(id, true) {
+        Ok(_) => true,
+        Err(status) => status.code() == tonic::Code::NotFound,
+    }
+}
+
+/// `run_bounded` の完了待ちの共有状態（結果と、待っている future の waker）。
+struct WaitState<T> {
+    result: Option<Result<T, Status>>,
+    waker: Option<std::task::Waker>,
+}
+
+/// 専用の監視スレッドが結果を置くまで待つ future（tokio の `time` feature に依存しない）。
+struct BoundedWait<T>(Arc<Mutex<WaitState<T>>>);
+
+impl<T> std::future::Future for BoundedWait<T> {
+    type Output = Result<T, Status>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let Ok(mut state) = self.0.lock() else {
+            return std::task::Poll::Ready(Err(Status::internal("runtime task failed")));
+        };
+        match state.result.take() {
+            Some(result) => std::task::Poll::Ready(result),
+            None => {
+                state.waker = Some(cx.waker().clone());
+                std::task::Poll::Pending
+            }
+        }
+    }
+}
+
+/// 実行層の呼び出しを専用スレッドで走らせ、結果を `timeout` まで待つ（REPAIR-5）。
 ///
 /// 期限を過ぎたら `DEADLINE_EXCEEDED` を返すが、worker は打ち切れない。worker は自分の
 /// [`InFlightGuard`] で記録を最後まで確定・巻き戻すため、呼び出し側は結果不明として扱ってよい。
-/// tokio の `time` feature に依存しないよう、待機も `spawn_blocking` 上の `recv_timeout` で行う。
+/// worker も期限の監視も tokio の blocking pool を使わない。実行層のハングで pool が埋まっても、
+/// 期限の監視は開始され、`timeout` で応答を返す。
 async fn run_bounded<T, F>(timeout: Duration, work: F) -> Result<T, Status>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::channel();
-    // worker は切り離す（JoinHandle を待たない）。panic は guard の Drop が後始末する。
-    drop(tokio::task::spawn_blocking(move || {
-        let _ = tx.send(work());
+    let state = Arc::new(Mutex::new(WaitState {
+        result: None,
+        waker: None,
     }));
-    match tokio::task::spawn_blocking(move || rx.recv_timeout(timeout)).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(RecvTimeoutError::Timeout)) => {
-            Err(Status::deadline_exceeded("runtime operation timed out"))
-        }
-        Ok(Err(RecvTimeoutError::Disconnected)) | Err(_) => {
-            Err(Status::internal("runtime task failed"))
-        }
-    }
+    let waiter_state = Arc::clone(&state);
+    // 監視スレッドを先に起こす。起動に失敗したら worker は走らせない（クロージャの破棄で guard が巻き戻す）。
+    std::thread::Builder::new()
+        .name("cri-runtime-wait".into())
+        .spawn(move || {
+            let result = match rx.recv_timeout(timeout) {
+                Ok(value) => Ok(value),
+                Err(RecvTimeoutError::Timeout) => {
+                    Err(Status::deadline_exceeded("runtime operation timed out"))
+                }
+                // worker の panic（guard の Drop が後始末する）。
+                Err(RecvTimeoutError::Disconnected) => Err(Status::internal("runtime task failed")),
+            };
+            if let Ok(mut state) = waiter_state.lock() {
+                state.result = Some(result);
+                if let Some(waker) = state.waker.take() {
+                    waker.wake();
+                }
+            }
+        })
+        .map_err(|_| Status::unavailable("cannot start runtime wait thread"))?;
+    // worker は切り離す（join しない）。panic は guard の Drop が後始末する。
+    std::thread::Builder::new()
+        .name("cri-runtime-worker".into())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .map_err(|_| Status::unavailable("cannot start runtime worker thread"))?;
+    BoundedWait(state).await
 }
 
 /// 実行層の成功を記録へ反映する（Create は `in_flight` 解除、Start は running へ遷移）。
@@ -415,6 +480,9 @@ fn commit_in_flight(
 
 /// 実行層の呼び出しが失敗・中断したときの巻き戻し。Create は記録を除去し、Start は `in_flight` を解く。
 ///
+/// Create で `outcome_unknown` のときは、実行層に資源が残る可能性があるため記録を除去せず exited として
+/// 残す（追跡情報と件数枠を保持。回収は TASK-59.3・TASK-114）。
+///
 /// ロックの汚染時は何もできない（汚染済みのレジストリは以後の RPC が `INTERNAL` で拒否する）。
 ///
 /// Start で `outcome_unknown` のときは、実行層が running の可能性があるため created へ戻さず
@@ -426,10 +494,10 @@ fn rollback_in_flight(
     outcome_unknown: bool,
 ) {
     match kind {
-        InFlightKind::Create => {
+        InFlightKind::Create if !outcome_unknown => {
             let _ = drop_container_in(registry, id, true);
         }
-        InFlightKind::Start => {
+        InFlightKind::Create | InFlightKind::Start => {
             let finished_at_nanos = if outcome_unknown {
                 now_nanos().unwrap_or(0)
             } else {
@@ -539,7 +607,7 @@ impl CriRuntimeService {
     /// `CreateContainer`・`StartContainer` を実行層（`ContainerRuntime`）へ接続する（TASK-59.2・CRI-2）。
     ///
     /// 呼ばなければ従来のスタブ動作（プロセスを起動しない記録上の遷移）のまま。接続後は両 RPC が
-    /// `spawn_blocking` を使うため tokio ランタイム上で呼ぶこと。
+    /// 実行層の呼び出しは専用スレッドで行い、完了待ちは呼び出し元の future が担う。
     pub fn with_runtime(
         mut self,
         adapter: RuntimeAdapter,
@@ -833,7 +901,7 @@ impl CriRuntimeService {
 
     /// 実行層接続時の `CreateContainer`（TASK-59.2・CRI-2）。
     ///
-    /// 仮登録（`in_flight`）→ ロックを外して bundle 用意と `ContainerRuntime::create`（`spawn_blocking`）→
+    /// 仮登録（`in_flight`）→ ロックを外して bundle 用意と `ContainerRuntime::create`（専用スレッド）→
     /// 確定、の 2 相。どの失敗・中断でも [`InFlightGuard`] が記録を巻き戻し、上限の枠を残さない。
     async fn create_container_runtime(
         &self,
@@ -848,7 +916,7 @@ impl CriRuntimeService {
             .ok_or_else(|| Status::internal("container config is unavailable"))?;
         // bundle の用意・create・確定・巻き戻し・bundle の解放はすべて worker が所有する。RPC の future が
         // 中断・タイムアウトしても、実行層が処理中の間に記録・件数枠・bundle だけが解放されることはない。
-        let guard = InFlightGuard::new(
+        let mut guard = InFlightGuard::new(
             Arc::clone(&self.registry),
             container_id.clone(),
             InFlightKind::Create,
@@ -859,13 +927,30 @@ impl CriRuntimeService {
         let id = container_id.clone();
         run_bounded(self.runtime_timeout, move || -> Result<(), Status> {
             let bundle = bundles.prepare(&id, &sandbox_id, &config)?;
-            let status = adapter.create(&id, bundle)?;
+            // 以後は実行層に資源が残りうる。確定失敗または削除完了を確認できた場合だけ解放する（fail-closed）。
+            guard.mark_dispatched();
+            let status = match adapter.create(&id, bundle) {
+                Ok(status) => status,
+                Err(status) => {
+                    if is_definite_failure(status.code()) || confirm_removed(&adapter, &id) {
+                        guard.mark_definitely_failed();
+                    }
+                    return Err(status);
+                }
+            };
             if status.state != CriContainerState::ContainerCreated {
-                // 実行層側に残ったコンテナを best-effort で削除する（結果は無視。bundle は guard が解放する）。
-                let _ = adapter.remove(&id, true);
+                if confirm_removed(&adapter, &id) {
+                    guard.mark_definitely_failed();
+                }
                 return Err(Status::internal("runtime returned an unexpected state"));
             }
-            guard.commit()
+            if let Err(status) = guard.commit() {
+                if confirm_removed(&adapter, &id) {
+                    guard.mark_definitely_failed();
+                }
+                return Err(status);
+            }
+            Ok(())
         })
         .await??;
         Ok(v1::CreateContainerResponse { container_id })
@@ -924,7 +1009,7 @@ impl CriRuntimeService {
     /// 実行層接続時の `StartContainer`（TASK-59.2・CRI-2）。
     ///
     /// 前提検査と `in_flight` 化をロック下で行い、ロックを外して `ContainerRuntime::start`
-    /// （`spawn_blocking`）を呼ぶ。成功して running が返ったときだけ記録を running にし、失敗・中断では
+    /// （専用スレッド）を呼ぶ。成功して running が返ったときだけ記録を running にし、失敗・中断では
     /// created へ戻す（[`InFlightGuard`]）。
     async fn start_container_runtime(
         &self,
@@ -935,17 +1020,18 @@ impl CriRuntimeService {
         self.begin_start(req, true)?;
         let mut guard =
             InFlightGuard::new(Arc::clone(&self.registry), id.clone(), InFlightKind::Start);
-        guard.mark_dispatched();
         let adapter = binding.adapter.clone();
         // 結果の確定と巻き戻しは worker が所有する。期限超過・中断では結果不明のまま worker が終わるのを待ち、
         // その間 `in_flight` が残る（新たな Start・Remove は拒否される）。
         run_bounded(self.runtime_timeout, move || -> Result<(), Status> {
+            // 専用スレッドの起動に失敗した場合は未送信なので、送信の直前に結果不明へ倒す。
+            guard.mark_dispatched();
             let status = match adapter.start(&id) {
                 Ok(status) => status,
                 Err(status) => {
                     // 確定失敗のコードに限り created へ戻す。タイムアウト・Unavailable・Internal 等は
                     // 実行層が起動済みの可能性があるため、unknown のまま破棄して exited にする（fail-closed）。
-                    if is_definite_start_failure(status.code()) {
+                    if is_definite_failure(status.code()) {
                         guard.mark_definitely_failed();
                     }
                     return Err(status);

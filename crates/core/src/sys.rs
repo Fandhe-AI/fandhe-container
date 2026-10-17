@@ -3566,6 +3566,31 @@ pub(crate) fn remove_file_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), 
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `parent` 配下の `name` を `O_PATH|O_NOFOLLOW|O_CLOEXEC` で開き、fd を返す（`O_DIRECTORY` は付けない）。
+/// 最終要素が symlink ならリンク自体の fd が返るため、呼び出し側は fd の `fstat`（std の `metadata()`）で
+/// 種別・所有者を確かめて symlink を弾ける。`delete` が、異常終了で残った `supervisor.sock` を消す前の
+/// 検証に使う（#2174・OCI-6・SUP-1・PLUG-12）。`name` が 1 要素であることは本関数が検証し、違反は
+/// syscall を発行せず `EINVAL`。不在は `ENOENT`。返る fd は読み書きには使えない。
+pub(crate) fn open_path_nofollow_at(
+    parent: BorrowedFd<'_>,
+    name: &CStr,
+) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    ensure_single_component(name)?;
+    let flags = consts::O_PATH | consts::O_NOFOLLOW | consts::O_CLOEXEC;
+    // SAFETY: `name` は NUL 終端の借用で呼び出しの間生存し、上で 1 要素と検証済み。`parent` は生存中の
+    // `BorrowedFd`。flags に O_CREAT / O_TMPFILE を含まないため可変長引数（mode）は渡さず、カーネルも読まない。
+    // 成功時の戻り値は新規 fd で、直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
+    let fd = unsafe { openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// `old_dir` 配下の `old` を `new_dir` 配下の `new` へ `renameat2(2)` の `RENAME_NOREPLACE` で改名する（最終要素の
 /// symlink は辿らない。改名先が既にあれば置き換えず `EEXIST`）。bind mount の適用段（`crate::exec::mount_binds`）が、
 /// 失敗時の後始末で「消す対象を自分専用の隔離ディレクトリへ移してから実体を照合して消す」ことと、「照合に通らなかった

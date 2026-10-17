@@ -6,7 +6,7 @@
 //! シグナルハンドラは登録しない（ブロックして `sigpending` で見るだけ）。
 //!
 //! # エラーの返し方（REPAIR-4）
-//! 関数ごとに失敗の伝わり方が違う。`pthread_sigmask` は errno を設定せず、エラー番号を戻り値で返す（POSIX）ため
+//! 関数ごとに失敗の伝わり方が違う。`pthread_sigmask` は errno を設定せず、エラー番号を戻り値で返す（POSIX.1-2008 の規定）ため
 //! `io::Error::last_os_error()` を使わず戻り値から作る（`sigmask_result`）。`sigpending`・`raise` は失敗時に
 //! 非 0（-1）を返し errno を設定する型で、本モジュールは errno を読まず成否だけを扱う。
 //!
@@ -123,7 +123,9 @@ pub fn unblock_termination_signals_in_child(cmd: &mut std::process::Command) {
         set.add(s);
     }
     // SAFETY: `pre_exec` のクロージャは fork 後・exec 前の子で、非同期シグナル安全な呼び出しだけを行う必要がある。
-    // ここでは `pthread_sigmask`（async-signal-safe。POSIX）を、あらかじめスタック上に作った `set`（クロージャへ
+    // `pthread_sigmask` は POSIX.1-2008 TC1 で async-signal-safe 関数の一覧に加わった（signal-safety(7)）。glibc・musl では
+    // `rt_sigprocmask` の薄いラッパーで、ロックもアロケーションも伴わない。
+    // ここでは `pthread_sigmask` を、あらかじめスタック上に作った `set`（クロージャへ
     // Copy で移動済み）に対して呼ぶだけで、アロケーション・ロック・panic を伴う処理をしない。失敗時は戻り値の
     // エラー番号（`pthread_sigmask` は errno を設定しない）を `from_raw_os_error` で `io::Error` にして返す
     // （同関数もアロケーション・ロックを伴わない）。`spawn` が `Err` になり子は exec しない。

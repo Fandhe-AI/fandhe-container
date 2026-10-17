@@ -3,8 +3,8 @@
 //! bin の入口（`main.rs`）から [`run`] だけが呼ばれる。mount は `sys` の安全なラッパー経由で、
 //! 指示の復号・報告は OS 非依存の `directive`・`process`・`report` が、試験用プローブは `probe` が担う。
 //!
-//! どの経路でも終了しない（PID 1 が終了するとカーネルが panic する）。唯一の例外は PID 1 でないとき
-//! （ホストでの誤実行）で、何も mount せずに終了する。
+//! どの経路でも終了しない（PID 1 が終了するとカーネルが panic する）。panic も [`install_panic_hook`] の
+//! hook が待機へ落とす（#2139）。唯一の例外は PID 1 でないとき（ホストでの誤実行）で、何も mount せずに終了する。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -14,13 +14,11 @@ use std::time::Duration;
 
 use crate::cmdline::{MAX_CMDLINE_BYTES, read_bounded};
 use crate::directive::{Access, Directive, GUEST_MOUNT_BASE, MountPoint};
+use crate::mountinfo::{MAX_MOUNTINFO_BYTES, check_dev_hardened};
 use crate::probe::{GUEST_MOUNT, decode_test_mode, probe_plan, run_virtiofs_io};
 use crate::process::{GuestOps, emit_ready, process_directives};
 use crate::report::{Errno, InitStage, ReportLine};
 use crate::sys;
-
-/// `EBUSY`（既に mount 済み）。
-const EBUSY: i32 = 16;
 
 struct LinuxOps {
     console: Box<dyn Write>,
@@ -91,13 +89,47 @@ fn open_console() -> Box<dyn Write> {
     Box::new(std::io::stdout())
 }
 
-/// mount の結果を `Errno` へ写す。`tolerate_busy` なら EBUSY（既に mount 済み。`/dev` の devtmpfs）を成功とする。
-fn tolerate(r: std::io::Result<()>, tolerate_busy: bool) -> Result<(), Errno> {
+/// `/dev` への devtmpfs の mount 結果の分類。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DevMount {
+    /// 新しく mount でき、init が flags を付けた。
+    Fresh,
+    /// `EBUSY`。既存の mount があり flags は未確認（`/proc` の後に `verify_existing_dev` で確かめる）。
+    AlreadyMounted,
+}
+
+/// devtmpfs の mount 結果を分類する。EBUSY を成功扱いにはせず、検査が必要な状態として返す（#2139）。
+fn classify_dev_mount(r: std::io::Result<()>) -> Result<DevMount, Errno> {
     match r {
-        Ok(()) => Ok(()),
-        Err(e) if tolerate_busy && e.raw_os_error() == Some(EBUSY) => Ok(()),
+        Ok(()) => Ok(DevMount::Fresh),
+        Err(e) if e.raw_os_error() == Some(i32::from(Errno::EBUSY.get())) => {
+            Ok(DevMount::AlreadyMounted)
+        }
         Err(e) => Err(Errno::from_io(&e)),
     }
+}
+
+/// 既存の `/dev` が `devtmpfs`＋`nosuid`＋`noexec` であることを mountinfo で確かめる。`/proc` の mount 後に呼ぶ。
+fn verify_existing_dev() -> Result<(), Errno> {
+    let text = File::open("/proc/self/mountinfo")
+        .map_err(crate::cmdline::CmdlineError::Io)
+        .and_then(|f| read_bounded(f, MAX_MOUNTINFO_BYTES))
+        .map_err(|e| e.errno())?;
+    check_dev_hardened(&text, "/dev").map_err(|_| Errno::EBUSY)
+}
+
+/// panic を待機へ落とす hook を入れる。PID 1 の終了（カーネルの panic）を避け、固定の 1 行だけを出す。
+///
+/// payload・位置は untrusted な値を含みうるため出さない（REPAIR-2）。hook 自身は panic しない形に保つ。
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|_| {
+        let mut console = open_console();
+        write_console_line(
+            &mut console,
+            &ReportLine::init_error(InitStage::Panic, Errno::EIO),
+        );
+        idle()
+    }));
 }
 
 fn init_filesystems() -> Result<(), (InitStage, Errno)> {
@@ -120,9 +152,10 @@ pub fn run() -> ! {
         eprintln!("fandhe-container-guest-init: must run as PID 1");
         std::process::exit(2);
     }
+    install_panic_hook();
     // /dev を先に用意して console を開けるようにする（以降の診断・報告を hvc0 へ出すため）。
     let dev = init_filesystems().and_then(|()| {
-        tolerate(sys::mount_devtmpfs(Path::new("/dev")), true).map_err(|e| (InitStage::Dev, e))
+        classify_dev_mount(sys::mount_devtmpfs(Path::new("/dev"))).map_err(|e| (InitStage::Dev, e))
     });
     let mut ops = LinuxOps {
         console: open_console(),
@@ -131,14 +164,21 @@ pub fn run() -> ! {
         ops.write_line(&ReportLine::init_error(stage, errno));
         idle()
     };
-    if let Err((stage, errno)) = dev {
-        fatal(&mut ops, stage, errno);
+    let dev_mount = match dev {
+        Ok(m) => m,
+        Err((stage, errno)) => fatal(&mut ops, stage, errno),
+    };
+    if let Err(e) = sys::mount_proc(Path::new("/proc")) {
+        fatal(&mut ops, InitStage::Proc, Errno::from_io(&e));
     }
-    if let Err(e) = tolerate(sys::mount_proc(Path::new("/proc")), false) {
-        fatal(&mut ops, InitStage::Proc, e);
+    // EBUSY の /dev は init の flags を持つとは限らない。/proc が使えるようになってから確かめる。
+    if dev_mount == DevMount::AlreadyMounted
+        && let Err(e) = verify_existing_dev()
+    {
+        fatal(&mut ops, InitStage::Dev, e);
     }
-    if let Err(e) = tolerate(sys::mount_sysfs(Path::new("/sys")), false) {
-        fatal(&mut ops, InitStage::Sys, e);
+    if let Err(e) = sys::mount_sysfs(Path::new("/sys")) {
+        fatal(&mut ops, InitStage::Sys, Errno::from_io(&e));
     }
     let cmdline = match File::open("/proc/cmdline")
         .map_err(super::cmdline::CmdlineError::Io)
@@ -154,4 +194,23 @@ pub fn run() -> ! {
         run_virtiofs_io(plan, Path::new(GUEST_MOUNT), &mut |l| ops.write_line(&l));
     }
     idle()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MAC-1・#2139: EBUSY は成功ではなく検査が必要な状態に分類し、他の errno は失敗のまま。
+    #[test]
+    fn mac1_classify_dev_mount() {
+        assert_eq!(classify_dev_mount(Ok(())), Ok(DevMount::Fresh));
+        assert_eq!(
+            classify_dev_mount(Err(std::io::Error::from_raw_os_error(16))),
+            Ok(DevMount::AlreadyMounted)
+        );
+        assert_eq!(
+            classify_dev_mount(Err(std::io::Error::from_raw_os_error(1))),
+            Err(Errno::new(1))
+        );
+    }
 }

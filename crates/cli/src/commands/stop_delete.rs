@@ -1105,9 +1105,24 @@ mod tests {
                 .join("sd-stop-timeout")
                 .join("supervisor.sock");
             let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+            // 接続が来なくても有限時間で終わるよう、non-blocking の accept を絶対期限まで再試行する
+            // （REPAIR-5。worker が接続前に Timeout になっても join が戻らなくならない）。
+            listener.set_nonblocking(true).expect("nonblocking");
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
             let t = std::thread::spawn(move || {
-                let conn = listener.accept();
-                std::thread::sleep(Duration::from_secs(2));
+                let accept_deadline = Instant::now() + Duration::from_secs(5);
+                let mut conn = None;
+                while Instant::now() < accept_deadline {
+                    match listener.accept() {
+                        Ok(c) => {
+                            conn = Some(c);
+                            break;
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                    }
+                }
+                // 呼び出し側の検証が終わるまで無応答のまま接続を保持する（有限の上限つき）。
+                let _ = done_rx.recv_timeout(Duration::from_secs(5));
                 drop(conn);
             });
             let req = build_stop_request(&stop_args("sd-stop-timeout")).expect("req");
@@ -1124,6 +1139,7 @@ mod tests {
             assert_eq!(e.exit_code().get(), 7);
             assert_eq!(e.op(), LifecycleOp::Kill);
             assert!(t0.elapsed() < Duration::from_secs(2));
+            let _ = done_tx.send(());
             t.join().expect("join");
         }
 

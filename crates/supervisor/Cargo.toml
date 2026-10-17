@@ -31,6 +31,7 @@
 # TASK-157 追補（#1717）で bin の入口（src/main.rs）と起動の契約（start_contract・start_entry）を追加した（依存は不変）。
 # TASK-171 追補（#1719）で特権ランチャーの bin（src/launcher.rs・src/bin/）を追加した（依存は不変）。
 # TASK-157 追補（#2058）で CLI からのシグナル送信を受ける制御チャネル（src/control）を追加した（依存は不変）。
+# #2140 で制御チャネルの sys ラッパーを LP64 に限定し、別 uid の拒否の監査配送の結合試験 control_audit_delivery を追加した（依存は不変）。
 # 外部クレート（crates.io）の追加は =x.y.z 完全固定・ユーザー承認制（.claude/rules/dependency-policy.md）。
 
 [package]
@@ -171,4 +172,13 @@ harness = false
 [[test]]
 name = "supervisor_bin_real"
 path = "tests/supervisor_bin_real.rs"
+harness = false
+
+# 制御チャネルの別 uid の拒否が監査の記録先（@audit.log）へ届くことの結合試験（SEC-4・SEC-1・SUP-1・PLUG-12・#2140）。
+# 監査 helper の fork は単一スレッドの呼び出し元を要求するため、単一スレッドの独自 main（harness = false）で動かす。
+# 既定のシナリオは root 不要で既定のテスト集合で実行し、本物の別 uid（65534）での実機シナリオは `-- --ignored` 指定時のみ
+# 実行する（root 必須。AGENTS.md「実機前提テスト」。依存は不変）。
+[[test]]
+name = "control_audit_delivery"
+path = "tests/control_audit_delivery.rs"
 harness = false

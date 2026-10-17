@@ -41,12 +41,12 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// kill 後の回収を待つ上限。
 const REAP_TIMEOUT: Duration = Duration::from_secs(10);
 /// cgroup の消滅・プローブの消滅を待つ上限。
-const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// systemd のスコープ GC を待つ短い猶予（その後は空の cgroup を自分で消す）。
-const CGROUP_GC_GRACE: Duration = Duration::from_millis(500);
+pub(super) const CGROUP_GC_GRACE: Duration = Duration::from_millis(500);
 const POLL: Duration = Duration::from_millis(20);
 
-fn io_err(what: &'static str, e: &std::io::Error) -> StartupLatencyError {
+pub(super) fn io_err(what: &'static str, e: &std::io::Error) -> StartupLatencyError {
     StartupLatencyError::new("io-error", format!("{what} failed ({:?})", e.kind()))
 }
 
@@ -104,17 +104,17 @@ impl Ctx<'_> {
     }
 }
 
-enum ExitWait {
+pub(super) enum ExitWait {
     Exited(Option<i32>),
     TimedOut { reaped: bool },
 }
 
 /// 中断シグナル（SIGINT・SIGTERM・SIGHUP。`run` がブロック済み）が保留されているか。
-fn interrupted() -> bool {
+pub(super) fn interrupted() -> bool {
     sys::termination_pending()
 }
 
-fn interrupted_error() -> StartupLatencyError {
+pub(super) fn interrupted_error() -> StartupLatencyError {
     StartupLatencyError::new("interrupted", "interrupted by a termination signal")
 }
 
@@ -159,7 +159,7 @@ fn recv_report(
 }
 
 /// 子の終了を期限つきで待つ。超過したら kill して回収を `REAP_TIMEOUT` まで待つ（REPAIR-5）。
-fn wait_for_exit(child: &mut Child, timeout: Duration) -> ExitWait {
+pub(super) fn wait_for_exit(child: &mut Child, timeout: Duration) -> ExitWait {
     let until = Instant::now() + timeout;
     loop {
         match child.try_wait() {
@@ -222,7 +222,7 @@ fn probe_count(nonce: &str) -> Option<usize> {
     Some(count)
 }
 
-fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+pub(super) fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let until = Instant::now() + timeout;
     loop {
         if cond() {
@@ -255,7 +255,7 @@ fn read_populated(dir: &Path) -> Option<bool> {
 /// 子孫 cgroup を含めて空になるまで待つ（空でなければ `cgroup.kill` で落とす）。空になった（または元から空）なら `true`。
 /// 判定は `cgroup.events` の `populated`（子孫を含む）で行う。supervisor・コンテナは子 cgroup に移るため、
 /// 直下の `cgroup.procs` だけでは残存を見落とす。読み取り失敗は後始末失敗として `false`。
-fn kill_and_drain(dir: &Path) -> bool {
+pub(super) fn kill_and_drain(dir: &Path) -> bool {
     match read_populated(dir) {
         Some(false) => return true,
         None => return false,
@@ -279,7 +279,11 @@ fn remove_container_cgroup(dir: &Path) -> bool {
 
 /// `base` 配下（深さ `depth` まで）から名前が `name` のディレクトリを探す。
 /// `Ok(None)` は存在しないと確かめられた場合だけ。読み取り失敗（権限等）は `Err` で確認不能を表す（REPAIR-5）。
-fn find_dir(base: &Path, name: &str, depth: u32) -> Result<Option<PathBuf>, std::io::Error> {
+pub(super) fn find_dir(
+    base: &Path,
+    name: &str,
+    depth: u32,
+) -> Result<Option<PathBuf>, std::io::Error> {
     let direct = base.join(name);
     match std::fs::metadata(&direct) {
         Ok(m) if m.is_dir() => return Ok(Some(direct)),
@@ -682,7 +686,7 @@ fn tally(failures: &mut Failures, fails: &[Fail], leftover: bool) {
     }
 }
 
-fn deadline_exceeded() -> StartupLatencyError {
+pub(super) fn deadline_exceeded() -> StartupLatencyError {
     StartupLatencyError::new(
         "deadline-exceeded",
         "the overall deadline passed before all trials finished",

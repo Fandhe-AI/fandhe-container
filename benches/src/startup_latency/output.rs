@@ -88,7 +88,7 @@ impl RunResult {
     }
 }
 
-fn ms(d: Duration) -> String {
+pub(super) fn ms(d: Duration) -> String {
     format!("{:.3}", d.as_secs_f64() * 1000.0)
 }
 

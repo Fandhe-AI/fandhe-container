@@ -33,6 +33,16 @@ pub struct Plan {
     pub output: Option<PathBuf>,
 }
 
+/// scope 取得だけを測る診断の計画（`--scope-only`。supervisor・作業ディレクトリは使わない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopePlan {
+    pub trials: u32,
+    pub warmup: u32,
+    pub timeout_secs: u64,
+    pub systemd_run: PathBuf,
+    pub output: Option<PathBuf>,
+}
+
 /// 解析結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -42,6 +52,10 @@ pub enum Command {
     Probe(String),
     /// 計測。
     Measure(Plan),
+    /// scope 取得だけを測る診断（`--scope-only`。metric は出さない。CORE-10・REPAIR-8）。
+    ScopeOnly(ScopePlan),
+    /// 診断が scope の中で起動する自明なコマンド（`--startup-latency-noop`）。すぐ終了コード 0 で終わる。
+    Noop,
 }
 
 fn bad(message: impl Into<String>) -> StartupLatencyError {
@@ -84,6 +98,14 @@ pub fn parse_args(args: &[String]) -> Result<Command, StartupLatencyError> {
         }
         return Ok(Command::Probe(nonce.clone()));
     }
+    if args.first().map(String::as_str) == Some("--startup-latency-noop") {
+        // cargo bench 経由の起動では `--bench` が末尾に付くため、それだけは許す。
+        if args.iter().skip(1).any(|x| x != "--bench") {
+            return Err(bad("noop mode takes no other arguments"));
+        }
+        return Ok(Command::Noop);
+    }
+    let mut scope_only = false;
     let mut trials = None;
     let mut warmup = None;
     let mut timeout_secs = None;
@@ -105,6 +127,11 @@ pub fn parse_args(args: &[String]) -> Result<Command, StartupLatencyError> {
                 .ok_or_else(|| bad("option value is missing"))
         };
         match arg.as_str() {
+            "--scope-only" => {
+                if std::mem::replace(&mut scope_only, true) {
+                    return Err(dup());
+                }
+            }
             "--trials" => {
                 let v = number("--trials", value()?, MIN_TRIALS, MAX_TRIALS)?;
                 if trials.replace(v).is_some() {
@@ -158,6 +185,21 @@ pub fn parse_args(args: &[String]) -> Result<Command, StartupLatencyError> {
     if !any {
         return Ok(Command::Smoke);
     }
+    if scope_only {
+        // 診断は supervisor も作業ディレクトリも使わない。指定は取り違えなので拒否する。
+        if supervisor_bin.is_some() || work_dir.is_some() {
+            return Err(bad(
+                "--scope-only does not accept --supervisor-bin or --work-dir",
+            ));
+        }
+        return Ok(Command::ScopeOnly(ScopePlan {
+            trials: trials.unwrap_or(DEFAULT_TRIALS),
+            warmup: warmup.unwrap_or(DEFAULT_WARMUP),
+            timeout_secs: timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
+            systemd_run: systemd_run.unwrap_or_else(|| PathBuf::from(DEFAULT_SYSTEMD_RUN)),
+            output,
+        }));
+    }
     let supervisor_bin = supervisor_bin.ok_or_else(|| bad("--supervisor-bin is required"))?;
     Ok(Command::Measure(Plan {
         trials: trials.unwrap_or(DEFAULT_TRIALS),
@@ -196,6 +238,46 @@ mod tests {
         );
         assert_eq!(code(&["--startup-latency-probe"]), "invalid-args");
         assert_eq!(code(&["--startup-latency-probe", "a/b"]), "invalid-args");
+    }
+
+    /// CORE-10: noop は単独のときだけ受け付ける。
+    #[test]
+    fn noop_mode_takes_no_other_arguments() {
+        assert_eq!(
+            parse_args(&a(&["--startup-latency-noop"])),
+            Ok(Command::Noop)
+        );
+        assert_eq!(
+            parse_args(&a(&["--startup-latency-noop", "--bench"])),
+            Ok(Command::Noop)
+        );
+        assert_eq!(
+            code(&["--startup-latency-noop", "--trials", "20"]),
+            "invalid-args"
+        );
+    }
+
+    /// REPAIR-8: 診断は supervisor を要らず、指定されたら拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn scope_only_mode_is_parsed_and_rejects_measure_only_options() {
+        let got = parse_args(&a(&["--bench", "--scope-only", "--trials", "25"])).expect("plan");
+        assert_eq!(
+            got,
+            Command::ScopeOnly(ScopePlan {
+                trials: 25,
+                warmup: 3,
+                timeout_secs: 1800,
+                systemd_run: PathBuf::from("/usr/bin/systemd-run"),
+                output: None,
+            })
+        );
+        assert_eq!(
+            code(&["--scope-only", "--supervisor-bin", "/opt/sup"]),
+            "invalid-args"
+        );
+        assert_eq!(code(&["--scope-only", "--work-dir", "/w"]), "invalid-args");
+        assert_eq!(code(&["--scope-only", "--scope-only"]), "invalid-args");
     }
 
     #[cfg(unix)]

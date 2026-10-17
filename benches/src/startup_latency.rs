@@ -49,6 +49,12 @@ mod probe_env;
     target_pointer_width = "64",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
+mod scope_only;
+#[cfg(all(
+    target_os = "linux",
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod scope_wrap;
 
 use args::Command;
@@ -117,7 +123,12 @@ pub fn execute(command: Command) -> Result<Execution, StartupLatencyError> {
             "probe mode must be handled by the entry point",
         )),
         Command::Smoke => Ok(Execution::Smoke(smoke_line())),
+        Command::Noop => Err(StartupLatencyError::new(
+            "invalid-args",
+            "noop mode must be handled by the entry point",
+        )),
         Command::Measure(plan) => measure_on_this_os(plan),
+        Command::ScopeOnly(plan) => scope_only_on_this_os(plan),
     }
 }
 
@@ -146,5 +157,23 @@ fn measure_on_this_os(plan: args::Plan) -> Result<Execution, StartupLatencyError
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
 fn measure_on_this_os(_plan: args::Plan) -> Result<Execution, StartupLatencyError> {
+    Ok(Execution::Unsupported)
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn scope_only_on_this_os(plan: args::ScopePlan) -> Result<Execution, StartupLatencyError> {
+    scope_only::run(plan)
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    target_pointer_width = "64",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+fn scope_only_on_this_os(_plan: args::ScopePlan) -> Result<Execution, StartupLatencyError> {
     Ok(Execution::Unsupported)
 }

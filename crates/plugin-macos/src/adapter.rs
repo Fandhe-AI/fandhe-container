@@ -33,7 +33,7 @@
 //! | platform-macos | `PluginErrorCode` |
 //! | -------------- | ----------------- |
 //! | `Config`（既定） | `INVALID_ARGUMENT` |
-//! | `Config`: `PathIo`・`UrlConversion`・`DiskAttachment`・`ConsoleLogOpen`・`ConsoleLogWriter` | `INTERNAL` |
+//! | `Config`: `PathIo`・`UrlConversion`・`DiskAttachment`・`ConsoleLogOpen`・`ConsoleLogWriter`・`ConsoleLogRotation`・`ConsoleLogRemove` | `INTERNAL` |
 //! | `Config`: `ConsoleLogNotOwned`・`ConsoleLogInsecureMode`・`ConsoleLogParentWorldWritable` | `PERMISSION_DENIED` |
 //! | `Config`: `ConsoleLogInUse` | `FAILED_PRECONDITION` |
 //! | `Config`: `SharedDirScanTimeout` | `TIMEOUT` |
@@ -86,7 +86,9 @@
 //! `console_log`（絶対パス。`ConsoleLogPath::try_new` が symlink・所有者・親ディレクトリを検証し、
 //! kernel / initrd・RW 共有との衝突は `VmConfigSpec` が拒否する）と cmdline の `console=hvc0` も要する。
 //! 欠けた構成は create で `config.guest_mount_requires_console*`（`INVALID_ARGUMENT`）にする。
-//! エラーの message は固定文言で、マウント先・ログのパスは含めない（SEC-4）。作られたログは診断のため削除しない。
+//! エラーの message は固定文言で、マウント先・ログのパスは含めない（SEC-4）。作られたログは stop・起動失敗では診断のため残し、start のたびに 1 MiB × 3 世代（`<name>`・`<name>.1`・`<name>.2`。
+//! supervisor のログ〔#2067〕と同じ値）へ回転して総量を保つ（#2138・MAC-1・REPAIR-4）。ファイル名に世代の接尾辞を足すと
+//! NAME_MAX を超える `console_log` は create で `config.console_log_name_too_long`（`INVALID_ARGUMENT`）。
 //! 報告待ちは start の中で [`LAUNCH_GUEST_MOUNT_TIMEOUT`]（3 秒）に限り、超過は `TIMEOUT`
 //! （`guest_mount.timeout`）、失敗報告は `INTERNAL`（`guest_mount.failed`）。マウント先つきの start は共有走査 1 秒 +
 //! 開始 3 秒 + 報告 3 秒 = 最大 [`LAUNCH_TOTAL_TIMEOUT`]（7 秒）で、10 秒の RPC 期限に収まる。
@@ -119,6 +121,8 @@
 //!
 //! # 未実装範囲（実装済みを装わない。REPAIR-3）
 //! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（TASK-114 待ち）。
+//!   コンソールログの削除（現在のログと全世代。`VmConfigSpec::remove_console_logs`）は delete の実装時に呼ぶ予定で、
+//!   現時点では呼び出し元が無い（ログは stop 後も残る。#2138）。
 //! - virtiofs 共有は、マウント先とコンソールログを指定すればゲスト init の報告を待つ（上の節）。initrd への
 //!   ゲスト init の梱包（#1878）と、3 秒の報告待ちで足りるかを含む実機確認（#1628）は未実施。
 //!   rootfs ブロックデバイス・CPU / メモリ指定は含まない。
@@ -878,7 +882,9 @@ pub fn to_plugin_error(e: &PlatformError) -> PluginError {
                 | ConfigError::UrlConversion { .. }
                 | ConfigError::DiskAttachment { .. }
                 | ConfigError::ConsoleLogOpen { .. }
-                | ConfigError::ConsoleLogWriter { .. } => C::Internal,
+                | ConfigError::ConsoleLogWriter { .. }
+                | ConfigError::ConsoleLogRotation { .. }
+                | ConfigError::ConsoleLogRemove { .. } => C::Internal,
                 ConfigError::ConsoleLogNotOwned { .. }
                 | ConfigError::ConsoleLogInsecureMode { .. }
                 | ConfigError::ConsoleLogParentWorldWritable { .. } => C::PermissionDenied,
@@ -2047,6 +2053,26 @@ mod tests {
         assert_eq!(
             pe(cfg(ConfigError::ConsoleLogInUse { path: p() })).0,
             C::FailedPrecondition
+        );
+        let k = std::io::ErrorKind::PermissionDenied;
+        assert_eq!(
+            pe(cfg(ConfigError::ConsoleLogRotation { kind: k })),
+            (
+                C::Internal,
+                "config.console_log_rotation: VM configuration was rejected".to_string()
+            )
+        );
+        assert_eq!(
+            pe(cfg(ConfigError::ConsoleLogRemove { kind: k })).0,
+            C::Internal
+        );
+        assert_eq!(
+            pe(cfg(ConfigError::ConsoleLogNameTooLong {
+                len: 256,
+                max: 255
+            }))
+            .0,
+            C::InvalidArgument
         );
         let vm = |e| PlatformError::Vm(e);
         let d = || "dom".to_string();

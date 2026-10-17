@@ -62,11 +62,53 @@ skip_unless_workspace() {
   fi
 }
 
+# int_in_range <値> <最小> <最大>: 値が「数字だけ・符号なし・9 桁以下」の整数で、最小〜最大に収まれば 0、それ以外は 1 を返す。
+# 何も出力せず exit もしない純関数（bash 3.2 でも動く。`[[ =~ ]]` は使わない）。数値引数の構文と範囲判定の共通部で、
+# validate_timeout・run_limited と guest/kernel/build.sh・scripts/build-guest-initrd.sh・
+# scripts/generate-third-party-licenses.sh の数値オプション検査が使う（REPAIR-1・REPAIR-5）。範囲はオプションごとの意味で
+# 異なるため揃えない。終了コードの整理: 引数エラーは呼び出し側が exit 2、run_limited の呼び出し誤りは 125（内部の誤用）。
+int_in_range() {
+  case "$1" in '' | *[!0-9]* | ??????????*) return 1 ;; esac
+  # 先頭ゼロは 8 進と解釈されるため、比較前に取り除いて 10 進にそろえる（08 のエラー、07 の誤受理の防止）。
+  local v="$1"
+  while [ "${#v}" -gt 1 ] && [ "${v#0}" != "${v}" ]; do v="${v#0}"; done
+  [ "${v}" -ge "$2" ] && [ "${v}" -le "$3" ]
+}
+
+# err_code <code> <message> / info_msg <message>: `error: code=<code> message=<英語>` と `info: <英語>` を stderr に出す。
+# guest/kernel/build.sh・scripts/build-guest-initrd.sh・scripts/generate-third-party-licenses.sh が共有する（以前は各本に
+# 重複。REPAIR-1・REPAIR-4）。`err` という名前は足さない（scripts/targets/*.sh が別書式の `err()` を source 後に自前で定義するため）。
+err_code() {
+  printf 'error: code=%s message=%s\n' "$1" "$2" >&2
+}
+info_msg() {
+  printf 'info: %s\n' "$1" >&2
+}
+
+# acquire_output_lock <出力先>: 出力先の排他ロック（<出力先>.lock ディレクトリ。mkdir は不可分）を取る。
+# 親ディレクトリを作れなければ bad-output、既にロックがあれば output-busy で exit 2。成功したら OUTPUT_LOCK_DIR に入れる。
+# 異常終了（KILL 等）で残ったロックは手で削除する。呼び出し元の EXIT trap で release_output_lock を呼ぶこと。
+OUTPUT_LOCK_DIR=""
+acquire_output_lock() {
+  mkdir -p "$(dirname "$1")" 2>/dev/null || { err_code bad-output "cannot create the parent of the output directory"; exit 2; }
+  if mkdir "$1.lock" 2>/dev/null; then
+    OUTPUT_LOCK_DIR="$1.lock"
+  else
+    err_code output-busy "another run holds $1.lock (remove it if no run is active)"
+    exit 2
+  fi
+}
+
+# release_output_lock: 自分が取った出力先のロックを外す。冪等。
+release_output_lock() {
+  [ -z "${OUTPUT_LOCK_DIR}" ] || rmdir "${OUTPUT_LOCK_DIR}" 2>/dev/null || true
+  OUTPUT_LOCK_DIR=""
+}
+
 # validate_timeout <NAME> <value>: 1〜999999 の整数でなければ exit 2 する（0 は `timeout` を無効にするため拒否）。
 validate_timeout() {
   local name="$1" t="$2"
-  case "$t" in '' | *[!0-9]* | ???????*) t=invalid ;; esac
-  if [ "$t" = invalid ] || [ "$t" -eq 0 ]; then
+  if ! int_in_range "$t" 1 999999; then
     echo "error: invalid-argument: ${name} must be an integer from 1 to 999999 (seconds)" >&2
     exit 2
   fi
@@ -122,7 +164,9 @@ BENCH_MANUAL_METRICS="startup_create_to_supervisor_ok_p95_ms"
 
 # 実機前提ベンチの基準値・結果の環境を機械照合するための閉じた語彙（#2095・TASK-190 追補・REPAIR-8）。
 # arch は結果 JSON の .arch（ハーネスの std::env::consts::ARCH。計測は Linux の x86_64 / aarch64 のみ）から取る。
-# ホストの種類は結果に載らないため、操作者が BENCH_HOST_KIND で語彙から指定する（自動判定は行わない）。
+# ホストの種類は、ハーネスが結果 JSON の .host_kind に載せる（Linux の /proc・/sys から自動判定。判定できなければ
+# 語彙の外の unknown）。操作者は BENCH_HOST_KIND で語彙から指定でき、結果が unknown か無いときはこれが必須になる
+# （bench_manual_resolve_host_kind）。語彙そのものの見直しは #230（TASK-88.h1）の担当。
 # shellcheck disable=SC2034 # bench-check-manual / bench-baseline-manual とテストが参照する
 BENCH_MANUAL_ARCHES="x86_64 aarch64"
 # shellcheck disable=SC2034
@@ -139,6 +183,26 @@ bench_manual_in_vocab() {
     [ "${w}" = "${v}" ] && return 0
   done
   return 1
+}
+
+# bench_manual_resolve_host_kind <結果 JSON>: BENCH_HOST_KIND（操作者の指定。空可）と結果の .host_kind から、使うホストの
+# 種類を決めて BENCH_HOST_KIND に入れる（呼び出し元の変数を更新する。サブシェルでは呼ばない）。
+#   - 結果の host_kind が語彙の外で unknown でもない → exit 2。無い・文字列でない・unknown → 結果からは決まらない
+#   - 両方あって食い違う → exit 2（偽の合格・偽の回帰を避ける）。片方だけならそれを使う
+# 決まらなければ BENCH_HOST_KIND は空のまま（呼び出し元が必要かどうかを判断する）。jq が必要。
+bench_manual_resolve_host_kind() {
+  local rk
+  rk="$(jq -r '.host_kind // "" | if type == "string" then . else "" end' "$1")"
+  if [ -n "${rk}" ] && [ "${rk}" != unknown ] && ! bench_manual_in_vocab "${rk}" "${BENCH_MANUAL_HOST_KINDS}"; then
+    echo "error: invalid-input: results host_kind must be one of: ${BENCH_MANUAL_HOST_KINDS} unknown" >&2
+    exit 2
+  fi
+  [ "${rk}" != unknown ] || rk=""
+  if [ -n "${BENCH_HOST_KIND:-}" ] && [ -n "${rk}" ] && [ "${BENCH_HOST_KIND}" != "${rk}" ]; then
+    echo "error: invalid-input: environment mismatch: BENCH_HOST_KIND ${BENCH_HOST_KIND} != results host_kind ${rk}" >&2
+    exit 2
+  fi
+  BENCH_HOST_KIND="${BENCH_HOST_KIND:-${rk}}"
 }
 
 # bench_manual_check_input_file <パス>: 入力ファイルの検査（symlink 拒否・通常ファイル・1 MiB 以下）。
@@ -276,11 +340,13 @@ _run_limited_wd_pid=""
 run_limited() {
   local limit="$1"
   shift
-  case "${limit}" in '' | *[!0-9]* | ???????*) limit=invalid ;; esac
-  if [ "${limit}" = invalid ] || [ "${limit}" -eq 0 ]; then
+  if ! int_in_range "${limit}" 1 999999; then
     echo "error: run-limited: limit must be an integer from 1 to 999999 (seconds)" >&2
     return 125
   fi
+  # int_in_range は先頭ゼロを許すが、下の見張り役の [ -lt ] は 8 進と解釈する（08・09 は異常終了、010 は 8 秒になる）。
+  # 先頭ゼロを取り除いて 10 進にそろえる。
+  while [ "${#limit}" -gt 1 ] && [ "${limit#0}" != "${limit}" ]; do limit="${limit#0}"; done
   if [ -z "${RUN_LIMITED_DIR:-}" ] || [ ! -d "${RUN_LIMITED_DIR}" ]; then
     echo "error: run-limited: RUN_LIMITED_DIR must be a directory" >&2
     return 125

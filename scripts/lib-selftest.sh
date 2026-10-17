@@ -114,6 +114,8 @@ case "$1" in
     run_limited 1 "${RL_DIR}/gc.sh" || rc=$?
     if kill -0 "$(cat "${RL_DIR}/gc.pid")" 2>/dev/null; then extra=alive; else extra=gone; fi
     ;;
+  leadzero08) run_limited 08 sleep 30 || rc=$? ;;
+  leadzero010) run_limited 010 sleep 30 || rc=$? ;;
   badlimit0) run_limited 0 touch "${RL_DIR}/ran" || rc=$? ;;
   badlimitabc) run_limited abc touch "${RL_DIR}/ran" || rc=$? ;;
   nodir) unset RUN_LIMITED_DIR; run_limited 5 touch "${RL_DIR}/ran" || rc=$? ;;
@@ -152,9 +154,55 @@ check_rl true 0 0 2 ""
 check_rl func 5 0 2 ""
 check_rl timeout 124 1 8 ""
 check_rl grandchild 124 1 10 "gone"
+# 先頭ゼロは 10 進として扱う（08 でも期限が効き、010 は 8 秒でなく 10 秒）
+check_rl leadzero08 124 8 14 ""
+check_rl leadzero010 124 10 16 ""
 check_rl badlimit0 125 0 2 ""
 check_rl badlimitabc 125 0 2 ""
 check_rl nodir 125 0 2 ""
+
+# int_in_range <値> <最小> <最大>: 戻り値 0 / 1 を具体値で照合する（数字だけ・9 桁以下・範囲内）。
+check_range() {
+  local name="$1" want="$2" value="$3" min="$4" max="$5" sh rc
+  for sh in "${shells[@]}"; do
+    rc=0
+    # shellcheck disable=SC2016 # 引数は子の bash 側で展開させる
+    "${sh}" -c 'source "$1"; int_in_range "$2" "$3" "$4"' _ "${src_dir}/lib.sh" "${value}" "${min}" "${max}" >/dev/null 2>&1 || rc=$?
+    if [ "${rc}" = "${want}" ]; then
+      pass "int_in_range ${name} (${sh})"
+    else
+      fail "int_in_range ${name} (${sh}): want rc=${want}, got rc=${rc}"
+    fi
+  done
+}
+
+# acquire_output_lock / release_output_lock: 2 回目の取得は output-busy で exit 2、解放は冪等（一時ディレクトリだけを使う）。
+for sh in "${shells[@]}"; do
+  lockdir="$(mktemp -d)"
+  # shellcheck disable=SC2016 # 引数は子の bash 側で展開させる
+  got="$("${sh}" -c 'source "$1"; acquire_output_lock "$2/out"; release_output_lock; release_output_lock; acquire_output_lock "$2/out"; acquire_output_lock "$2/out"' _ "${src_dir}/lib.sh" "${lockdir}" 2>&1)" && rc=0 || rc=$?
+  if [ "${rc}" = 2 ] && [ "${got}" = "error: code=output-busy message=another run holds ${lockdir}/out.lock (remove it if no run is active)" ]; then
+    pass "output lock busy and idempotent release (${sh})"
+  else
+    fail "output lock (${sh}): rc=${rc} got=${got}"
+  fi
+  rm -rf "${lockdir}"
+done
+
+check_range one 0 1 1 10
+check_range max 0 10 1 10
+check_range zero 1 0 1 10
+check_range over 1 11 1 10
+check_range leading-zero 0 08 1 10
+check_range leading-zero-09 0 09 1 10
+check_range leading-zero-007 0 007 1 10
+check_range leading-zero-all-zero 1 000 1 10
+check_range leading-zero-010 0 010 1 10
+check_range empty 1 "" 1 10
+check_range negative 1 -1 1 10
+check_range alpha 1 1a 1 10
+check_range ten-digits 1 1234567890 1 99999999999
+check_range nine-digits 0 123456789 1 999999999
 
 for sh in "${shells[@]}"; do
   # shellcheck disable=SC2016 # BASH_VERSION は子の bash 側で展開させる

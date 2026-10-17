@@ -25,6 +25,10 @@ fn run() -> Result<ExitCode, StartupLatencyError> {
     if matches!(command, Command::Probe(_)) {
         run_workload();
     }
+    if matches!(command, Command::Noop) {
+        // 診断（`--scope-only`）が scope の中で起動する自明なコマンド。何もせず終了コード 0。
+        std::process::exit(0);
+    }
     match execute(command)? {
         Execution::Smoke(line) => {
             println!("{line}");

@@ -6,7 +6,7 @@
 //! シグナルハンドラは登録しない（ブロックして `sigpending` で見るだけ）。
 //!
 //! # エラーの返し方（REPAIR-4）
-//! 関数ごとに失敗の伝わり方が違う。`pthread_sigmask` は errno を設定せず、エラー番号を戻り値で返す（POSIX）ため
+//! 関数ごとに失敗の伝わり方が違う。`pthread_sigmask` は errno を設定せず、エラー番号を戻り値で返す（POSIX.1-2008 の規定）ため
 //! `io::Error::last_os_error()` を使わず戻り値から作る（`sigmask_result`）。`sigpending`・`raise` は失敗時に
 //! 非 0（-1）を返し errno を設定する型で、本モジュールは errno を読まず成否だけを扱う。
 //!
@@ -83,12 +83,12 @@ fn sigmask_result(rc: c_int) -> std::io::Result<()> {
     }
 }
 
-/// 呼び出しスレッド（と以後に作るスレッド）で SIGINT・SIGTERM・SIGHUP をブロックする。成功なら `true`。
+/// 呼び出しスレッド（と以後に作るスレッド）で SIGINT・SIGTERM・SIGHUP をブロックする。
 /// 計測の開始前（スレッドを作る前）に 1 回呼ぶ。
 ///
-/// エラー: `pthread_sigmask` は errno を設定せず戻り値でエラー番号を返す。本関数は成否だけを `bool` で返し、
-/// 呼び出し側は固定の文言で `unsupported-environment` にする。
-pub fn block_termination_signals() -> bool {
+/// エラー（REPAIR-4）: `pthread_sigmask` は errno を設定せず戻り値でエラー番号を返すため、そのエラー番号を保持する
+/// `io::Error` を返す（`sigmask_result`）。呼び出し側は番号（数値）だけをメッセージに載せて `unsupported-environment` にする。
+pub fn block_termination_signals() -> std::io::Result<()> {
     let mut set = SigSet::empty();
     for s in TERMINATION {
         set.add(s);
@@ -96,7 +96,7 @@ pub fn block_termination_signals() -> bool {
     // SAFETY: `set` は有効な `sigset_t` 相当（1024 ビット）の領域を指す読み取り専用の引数で、`old` は
     // 使わないため null を渡す（pthread_sigmask は null を許す）。呼び出し中、`set` は生存し続ける。
     let rc = unsafe { pthread_sigmask(SIG_BLOCK, &raw const set, std::ptr::null_mut()) };
-    sigmask_result(rc).is_ok()
+    sigmask_result(rc)
 }
 
 /// ブロック中の中断シグナルが保留されているか。確認できない場合は `true`（fail-closed。後始末へ進める）。
@@ -123,7 +123,9 @@ pub fn unblock_termination_signals_in_child(cmd: &mut std::process::Command) {
         set.add(s);
     }
     // SAFETY: `pre_exec` のクロージャは fork 後・exec 前の子で、非同期シグナル安全な呼び出しだけを行う必要がある。
-    // ここでは `pthread_sigmask`（async-signal-safe。POSIX）を、あらかじめスタック上に作った `set`（クロージャへ
+    // `pthread_sigmask` は POSIX.1-2008 TC1 で async-signal-safe 関数の一覧に加わった（signal-safety(7)）。glibc・musl では
+    // `rt_sigprocmask` の薄いラッパーで、ロックもアロケーションも伴わない。
+    // ここでは `pthread_sigmask` を、あらかじめスタック上に作った `set`（クロージャへ
     // Copy で移動済み）に対して呼ぶだけで、アロケーション・ロック・panic を伴う処理をしない。失敗時は戻り値の
     // エラー番号（`pthread_sigmask` は errno を設定しない）を `from_raw_os_error` で `io::Error` にして返す
     // （同関数もアロケーション・ロックを伴わない）。`spawn` が `Err` になり子は exec しない。
@@ -181,7 +183,7 @@ mod tests {
     #[test]
     fn child_does_not_inherit_the_blocked_termination_signals() {
         std::thread::spawn(|| {
-            assert!(block_termination_signals());
+            block_termination_signals().expect("block");
             let inherited = child_sigblk(&mut std::process::Command::new("sleep"));
             // SIGHUP(1)・SIGINT(2)・SIGTERM(15) のビット。
             assert_eq!(inherited & 0x4003, 0x4003);
@@ -219,7 +221,7 @@ mod tests {
     #[test]
     fn blocked_sigterm_becomes_pending_without_killing_the_process() {
         std::thread::spawn(|| {
-            assert!(block_termination_signals());
+            block_termination_signals().expect("block");
             assert!(!termination_pending());
             assert!(raise_sigterm());
             assert!(termination_pending());

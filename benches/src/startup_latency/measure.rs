@@ -16,7 +16,7 @@ use super::args::Plan;
 use super::bin_check::{verify_executable, verify_output_target, verify_work_base};
 use super::bundle::build_bundle;
 use super::output::{Failures, Params, RunResult, Sample, render_json};
-use super::probe_env::effective_uid;
+use super::probe_env::{detect_host_kind, effective_uid};
 use super::report::{ReportOutcome, classify, spawn_report_reader};
 use super::scope_wrap::{scoped_command, user_manager_env};
 use crate::sys;
@@ -41,12 +41,12 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// kill 後の回収を待つ上限。
 const REAP_TIMEOUT: Duration = Duration::from_secs(10);
 /// cgroup の消滅・プローブの消滅を待つ上限。
-const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const CLEANUP_TIMEOUT: Duration = Duration::from_secs(10);
 /// systemd のスコープ GC を待つ短い猶予（その後は空の cgroup を自分で消す）。
-const CGROUP_GC_GRACE: Duration = Duration::from_millis(500);
+pub(super) const CGROUP_GC_GRACE: Duration = Duration::from_millis(500);
 const POLL: Duration = Duration::from_millis(20);
 
-fn io_err(what: &'static str, e: &std::io::Error) -> StartupLatencyError {
+pub(super) fn io_err(what: &'static str, e: &std::io::Error) -> StartupLatencyError {
     StartupLatencyError::new("io-error", format!("{what} failed ({:?})", e.kind()))
 }
 
@@ -104,18 +104,33 @@ impl Ctx<'_> {
     }
 }
 
-enum ExitWait {
+pub(super) enum ExitWait {
     Exited(Option<i32>),
     TimedOut { reaped: bool },
 }
 
 /// 中断シグナル（SIGINT・SIGTERM・SIGHUP。`run` がブロック済み）が保留されているか。
-fn interrupted() -> bool {
+pub(super) fn interrupted() -> bool {
     sys::termination_pending()
 }
 
-fn interrupted_error() -> StartupLatencyError {
+pub(super) fn interrupted_error() -> StartupLatencyError {
     StartupLatencyError::new("interrupted", "interrupted by a termination signal")
+}
+
+/// 中断シグナルのブロック失敗を構造化エラーにする（REPAIR-4）。message には OS のエラー番号（数値）だけを載せ、
+/// OS 由来の文字列は載せない（`StartupLatencyError` の message は固定文言に限る契約）。
+pub(super) fn block_error(e: &std::io::Error) -> StartupLatencyError {
+    match e.raw_os_error() {
+        Some(n) => StartupLatencyError::new(
+            "unsupported-environment",
+            format!("cannot block termination signals (os error {n})"),
+        ),
+        None => StartupLatencyError::new(
+            "unsupported-environment",
+            "cannot block termination signals",
+        ),
+    }
 }
 
 /// 結果 1 行を期限つきで待つ。中断シグナルを受けたら待ちを打ち切る（`.1` が true）。
@@ -144,29 +159,40 @@ fn recv_report(
 }
 
 /// 子の終了を期限つきで待つ。超過したら kill して回収を `REAP_TIMEOUT` まで待つ（REPAIR-5）。
-fn wait_for_exit(child: &mut Child, timeout: Duration) -> ExitWait {
+pub(super) fn wait_for_exit(child: &mut Child, timeout: Duration) -> ExitWait {
+    wait_for_exit_observed(child, timeout, POLL).0
+}
+
+/// `wait_for_exit` と同じ待ちで、終了を観測した直後の時刻も返す（`poll` は try_wait の間隔）。
+/// 診断（scope-only。CORE-10・REPAIR-8）が、待機の眠りを含めずに終点を標本へ使うために使う。
+/// 期限切れ・待ちの失敗では時刻は意味を持たない（呼び出し側は標本にしない）。
+pub(super) fn wait_for_exit_observed(
+    child: &mut Child,
+    timeout: Duration,
+    poll: Duration,
+) -> (ExitWait, Instant) {
     let until = Instant::now() + timeout;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return ExitWait::Exited(status.code()),
+            Ok(Some(status)) => return (ExitWait::Exited(status.code()), Instant::now()),
             Ok(None) => {}
-            Err(_) => return ExitWait::TimedOut { reaped: false },
+            Err(_) => return (ExitWait::TimedOut { reaped: false }, Instant::now()),
         }
         // 中断シグナルを受けたら期限を待たずに kill へ進む（呼び出し側が回収と後始末を続ける）。
         if Instant::now() >= until || interrupted() {
             break;
         }
-        std::thread::sleep(POLL);
+        std::thread::sleep(poll);
     }
     let _ = child.kill();
     let reap_until = Instant::now() + REAP_TIMEOUT;
     while Instant::now() < reap_until {
         if matches!(child.try_wait(), Ok(Some(_))) {
-            return ExitWait::TimedOut { reaped: true };
+            return (ExitWait::TimedOut { reaped: true }, Instant::now());
         }
-        std::thread::sleep(POLL);
+        std::thread::sleep(poll);
     }
-    ExitWait::TimedOut { reaped: false }
+    (ExitWait::TimedOut { reaped: false }, Instant::now())
 }
 
 /// `ErrorKind::NotFound` か、走査中にプロセスが消えたことを示す `ESRCH`（raw os error 3）か。
@@ -207,7 +233,7 @@ fn probe_count(nonce: &str) -> Option<usize> {
     Some(count)
 }
 
-fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+pub(super) fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let until = Instant::now() + timeout;
     loop {
         if cond() {
@@ -240,7 +266,7 @@ fn read_populated(dir: &Path) -> Option<bool> {
 /// 子孫 cgroup を含めて空になるまで待つ（空でなければ `cgroup.kill` で落とす）。空になった（または元から空）なら `true`。
 /// 判定は `cgroup.events` の `populated`（子孫を含む）で行う。supervisor・コンテナは子 cgroup に移るため、
 /// 直下の `cgroup.procs` だけでは残存を見落とす。読み取り失敗は後始末失敗として `false`。
-fn kill_and_drain(dir: &Path) -> bool {
+pub(super) fn kill_and_drain(dir: &Path) -> bool {
     match read_populated(dir) {
         Some(false) => return true,
         None => return false,
@@ -264,7 +290,11 @@ fn remove_container_cgroup(dir: &Path) -> bool {
 
 /// `base` 配下（深さ `depth` まで）から名前が `name` のディレクトリを探す。
 /// `Ok(None)` は存在しないと確かめられた場合だけ。読み取り失敗（権限等）は `Err` で確認不能を表す（REPAIR-5）。
-fn find_dir(base: &Path, name: &str, depth: u32) -> Result<Option<PathBuf>, std::io::Error> {
+pub(super) fn find_dir(
+    base: &Path,
+    name: &str,
+    depth: u32,
+) -> Result<Option<PathBuf>, std::io::Error> {
     let direct = base.join(name);
     match std::fs::metadata(&direct) {
         Ok(m) if m.is_dir() => return Ok(Some(direct)),
@@ -667,7 +697,7 @@ fn tally(failures: &mut Failures, fails: &[Fail], leftover: bool) {
     }
 }
 
-fn deadline_exceeded() -> StartupLatencyError {
+pub(super) fn deadline_exceeded() -> StartupLatencyError {
     StartupLatencyError::new(
         "deadline-exceeded",
         "the overall deadline passed before all trials finished",
@@ -728,6 +758,7 @@ fn run_trials<H: Host>(host: &H, ctx: &Ctx<'_>) -> Result<RunResult, StartupLate
         failures,
         leftover_ids,
         arch: std::env::consts::ARCH,
+        host_kind: detect_host_kind(),
     })
 }
 
@@ -748,11 +779,8 @@ pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
     }
     // 中断シグナルをブロックし、計測ループの各待ち点で保留を確かめて後始末の経路へ進める（REPAIR-5）。
     // スレッド（読み取りスレッド等）を作る前に呼び、以後のスレッドへブロックを継承させる。
-    if !sys::block_termination_signals() {
-        return Err(StartupLatencyError::new(
-            "unsupported-environment",
-            "cannot block termination signals",
-        ));
+    if let Err(e) = sys::block_termination_signals() {
+        return Err(block_error(&e));
     }
     // 出力先は計測の開始前に検証する（FIFO・symlink・既存ファイルを後から開かない）。
     // 書き込みには検証済みの実体パスだけを使う（plan.output を置き換える）。
@@ -1100,12 +1128,22 @@ mod tests {
         assert!(r.samples.is_empty());
     }
 
+    /// REPAIR-4: ブロック失敗のメッセージはエラー番号（数値）だけを載せる。
+    #[test]
+    fn block_error_carries_only_the_os_error_number_repair_4() {
+        let e = block_error(&std::io::Error::from_raw_os_error(22));
+        assert_eq!(e.code, "unsupported-environment");
+        assert_eq!(e.message, "cannot block termination signals (os error 22)");
+        let e = block_error(&std::io::Error::other("x"));
+        assert_eq!(e.message, "cannot block termination signals");
+    }
+
     /// 中断（SIGTERM）: 待ちを打ち切り、スコープ回収と settle（Any）まで終えてから `interrupted` で失敗し、
     /// 以後の試行を始めない（REPAIR-5）。
     #[test]
     fn sigterm_during_a_trial_reclaims_then_stops_with_interrupted() {
         // ブロックはスレッド単位。試験スレッド自身でブロックし、保留はスレッド終了で捨てられる。
-        assert!(sys::block_termination_signals());
+        sys::block_termination_signals().expect("block");
         let mut hang = Script::ok();
         hang.report = None;
         hang.exit = ExitScript::TimedOut;
@@ -1122,7 +1160,7 @@ mod tests {
     /// 中断時に回収を確認できなかった（スコープに残存）なら、作業ディレクトリを残す印を立てる（REPAIR-5）。
     #[test]
     fn interrupt_with_leftover_keeps_the_work_dir() {
-        assert!(sys::block_termination_signals());
+        sys::block_termination_signals().expect("block");
         let mut stuck = Script::ok();
         stuck.report = None;
         stuck.interrupt = true;

@@ -37,12 +37,6 @@
 # エラーは stderr に `error: code=<code> message=<英語>` の 1 行で出す。
 set -euo pipefail
 
-err() {
-    printf 'error: code=%s message=%s\n' "$1" "$2" >&2
-}
-info() {
-    printf 'info: %s\n' "$1" >&2
-}
 usage() {
     cat >&2 <<'USAGE'
 usage: build.sh [--output-dir <dir>] [--tarball <path>] [--jobs N] [--cross-compile <prefix>] [--llvm]
@@ -57,7 +51,7 @@ root="$(cd "$script_dir/../.." && pwd)"
 caller_pwd="$PWD"
 # shellcheck source=../../scripts/lib.sh
 source "$root/scripts/lib.sh"
-cd -- "$caller_pwd" || { err bad-environment "cannot return to the working directory"; exit 2; }
+cd -- "$caller_pwd" || { err_code bad-environment "cannot return to the working directory"; exit 2; }
 
 output_dir="${GUEST_KERNEL_OUTPUT_DIR:-}"
 tarball_arg="${GUEST_KERNEL_TARBALL:-}"
@@ -71,15 +65,15 @@ build_timeout=7200
 
 # 数値引数の検証。$1=名前 $2=値 $3=最小 $4=最大
 check_int() {
-    if ! [[ "$2" =~ ^[0-9]{1,5}$ ]] || [ "$2" -lt "$3" ] || [ "$2" -gt "$4" ]; then
-        err bad-argument "$1 must be an integer between $3 and $4"
+    if ! int_in_range "$2" "$3" "$4"; then
+        err_code bad-argument "$1 must be an integer between $3 and $4"
         usage
         exit 2
     fi
 }
 
 need_value() {
-    [ "$1" -ge 2 ] || { err bad-argument "$2 requires a value"; usage; exit 2; }
+    [ "$1" -ge 2 ] || { err_code bad-argument "$2 requires a value"; usage; exit 2; }
 }
 
 while [ $# -gt 0 ]; do
@@ -92,7 +86,7 @@ while [ $# -gt 0 ]; do
         --fetch-timeout) need_value $# "$1"; check_int "$1" "$2" 1 3600; fetch_timeout="$2"; shift 2 ;;
         --extract-timeout) need_value $# "$1"; check_int "$1" "$2" 1 3600; extract_timeout="$2"; shift 2 ;;
         --build-timeout) need_value $# "$1"; check_int "$1" "$2" 1 21600; build_timeout="$2"; shift 2 ;;
-        *) err bad-argument "unknown argument: $1"; usage; exit 2 ;;
+        *) err_code bad-argument "unknown argument: $1"; usage; exit 2 ;;
     esac
 done
 
@@ -100,11 +94,11 @@ if [ -n "$jobs" ]; then
     check_int "--jobs" "$jobs" 1 256
 fi
 if [ -n "$cross_compile" ] && ! [[ "$cross_compile" =~ ^[A-Za-z0-9._/+-]+$ ]]; then
-    err bad-argument "--cross-compile contains characters outside [A-Za-z0-9._/+-]"
+    err_code bad-argument "--cross-compile contains characters outside [A-Za-z0-9._/+-]"
     exit 2
 fi
 case "$output_dir$tarball_arg" in
-    *[[:cntrl:]]*) err bad-argument "paths must not contain control characters"; exit 2 ;;
+    *[[:cntrl:]]*) err_code bad-argument "paths must not contain control characters"; exit 2 ;;
 esac
 
 # --- テスト用の差し替え口（自己テスト専用。サンドボックスの外では拒否する） ---
@@ -121,7 +115,7 @@ done
 if [ "$seam_requested" -eq 1 ]; then
     # サンドボックスの印（自己テストが作る一時ディレクトリ内のマーカー）が無ければ拒否する。
     if [ -z "$sandbox" ] || [ ! -d "$sandbox" ] || [ ! -f "$sandbox/.guest-kernel-selftest" ]; then
-        err test-seam-refused "test seams are only allowed inside the selftest sandbox"
+        err_code test-seam-refused "test seams are only allowed inside the selftest sandbox"
         exit 2
     fi
     for v in GUEST_KERNEL_CURL GUEST_KERNEL_MAKE GUEST_KERNEL_LOCK; do
@@ -129,14 +123,14 @@ if [ "$seam_requested" -eq 1 ]; then
         case "$val" in
             "") ;;
             "$sandbox"/*) ;;
-            *) err test-seam-refused "$v must be inside the selftest sandbox"; exit 2 ;;
+            *) err_code test-seam-refused "$v must be inside the selftest sandbox"; exit 2 ;;
         esac
     done
     [ -z "${GUEST_KERNEL_CURL:-}" ] || curl_cmd="$GUEST_KERNEL_CURL"
     [ -z "${GUEST_KERNEL_MAKE:-}" ] || make_cmd="$GUEST_KERNEL_MAKE"
     if [ -n "${GUEST_KERNEL_LOCK:-}" ]; then
         lock_file="$GUEST_KERNEL_LOCK"
-        info "warning: using a test lock file: $lock_file"
+        info_msg "warning: using a test lock file: $lock_file"
     fi
     host_os="${GUEST_KERNEL_UNAME_S:-}"
     host_arch="${GUEST_KERNEL_UNAME_M:-}"
@@ -146,7 +140,7 @@ fi
 
 case "$host_os" in
     MINGW* | MSYS* | CYGWIN*)
-        err unsupported-os "Windows hosts are not supported for building the guest kernel"
+        err_code unsupported-os "Windows hosts are not supported for building the guest kernel"
         exit 2
         ;;
 esac
@@ -155,39 +149,39 @@ esac
 lock_ver=""
 lock_url=""
 lock_sha=""
-[ -f "$lock_file" ] || { err bad-lock "lock file not found"; exit 2; }
+[ -f "$lock_file" ] || { err_code bad-lock "lock file not found"; exit 2; }
 while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
         KERNEL_VERSION=*)
-            [ -z "$lock_ver" ] || { err bad-lock "duplicate key KERNEL_VERSION"; exit 2; }
+            [ -z "$lock_ver" ] || { err_code bad-lock "duplicate key KERNEL_VERSION"; exit 2; }
             lock_ver="${line#KERNEL_VERSION=}"
-            [[ "$lock_ver" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { err bad-lock "invalid KERNEL_VERSION"; exit 2; }
+            [[ "$lock_ver" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { err_code bad-lock "invalid KERNEL_VERSION"; exit 2; }
             ;;
         KERNEL_URL=*)
-            [ -z "$lock_url" ] || { err bad-lock "duplicate key KERNEL_URL"; exit 2; }
+            [ -z "$lock_url" ] || { err_code bad-lock "duplicate key KERNEL_URL"; exit 2; }
             lock_url="${line#KERNEL_URL=}"
             ;;
         KERNEL_SHA256=*)
-            [ -z "$lock_sha" ] || { err bad-lock "duplicate key KERNEL_SHA256"; exit 2; }
+            [ -z "$lock_sha" ] || { err_code bad-lock "duplicate key KERNEL_SHA256"; exit 2; }
             lock_sha="${line#KERNEL_SHA256=}"
-            [[ "$lock_sha" =~ ^[0-9a-f]{64}$ ]] || { err bad-lock "invalid KERNEL_SHA256"; exit 2; }
+            [[ "$lock_sha" =~ ^[0-9a-f]{64}$ ]] || { err_code bad-lock "invalid KERNEL_SHA256"; exit 2; }
             ;;
-        *) err bad-lock "unknown or malformed line in lock file"; exit 2 ;;
+        *) err_code bad-lock "unknown or malformed line in lock file"; exit 2 ;;
     esac
 done <"$lock_file"
 if [ -z "$lock_ver" ] || [ -z "$lock_url" ] || [ -z "$lock_sha" ]; then
-    err bad-lock "lock file must define KERNEL_VERSION, KERNEL_URL and KERNEL_SHA256"
+    err_code bad-lock "lock file must define KERNEL_VERSION, KERNEL_URL and KERNEL_SHA256"
     exit 2
 fi
 if ! [[ "$lock_url" =~ ^https://cdn\.kernel\.org/pub/linux/kernel/[A-Za-z0-9._/+-]+$ ]]; then
-    err bad-lock "KERNEL_URL must be an https://cdn.kernel.org/pub/linux/kernel/ URL"
+    err_code bad-lock "KERNEL_URL must be an https://cdn.kernel.org/pub/linux/kernel/ URL"
     exit 2
 fi
 case "/$lock_url/" in
-    */../*) err bad-lock "KERNEL_URL must not contain .. segments"; exit 2 ;;
+    */../*) err_code bad-lock "KERNEL_URL must not contain .. segments"; exit 2 ;;
 esac
 if [ "${lock_url##*/}" != "linux-${lock_ver}.tar.xz" ]; then
-    err bad-lock "KERNEL_URL file name must be linux-<KERNEL_VERSION>.tar.xz"
+    err_code bad-lock "KERNEL_URL file name must be linux-<KERNEL_VERSION>.tar.xz"
     exit 2
 fi
 
@@ -197,11 +191,11 @@ case "$host_arch" in
     *) native_arm64=0 ;;
 esac
 if [ "$native_arm64" -eq 0 ] && [ -z "$cross_compile" ] && [ "$use_llvm" -eq 0 ]; then
-    err toolchain-required "non-arm64 host requires --cross-compile <prefix> or --llvm"
+    err_code toolchain-required "non-arm64 host requires --cross-compile <prefix> or --llvm"
     exit 2
 fi
 if [ "$host_os" = "Darwin" ]; then
-    info "warning: building on macOS is unverified (see guest/kernel/README.md)"
+    info_msg "warning: building on macOS is unverified (see guest/kernel/README.md)"
 fi
 
 # --- 出力先（空または未存在のみ。上書きしない） ---
@@ -211,21 +205,21 @@ while [ "${#output_dir}" -gt 1 ] && [ "${output_dir%/}" != "$output_dir" ]; do
     output_dir="${output_dir%/}"
 done
 if [ -L "$output_dir" ]; then
-    err bad-output "output directory must not be a symlink"
+    err_code bad-output "output directory must not be a symlink"
     exit 2
 fi
 if [ -e "$output_dir" ] && [ ! -d "$output_dir" ]; then
-    err output-exists "output path exists and is not a directory"
+    err_code output-exists "output path exists and is not a directory"
     exit 2
 fi
 if [ -d "$output_dir" ]; then
     # 一覧取得の失敗（読み取り不可の 0300 等）を空ディレクトリと誤認しない（fail-closed）。
     dir_listing="$(ls -A "$output_dir" 2>/dev/null)" || {
-        err bad-output "cannot list the output directory; refusing to continue"
+        err_code bad-output "cannot list the output directory; refusing to continue"
         exit 2
     }
     if [ -n "$dir_listing" ]; then
-        err output-exists "output directory is not empty; refusing to overwrite"
+        err_code output-exists "output directory is not empty; refusing to overwrite"
         exit 2
     fi
 fi
@@ -237,17 +231,17 @@ if command -v sha256sum >/dev/null 2>&1; then
 elif command -v shasum >/dev/null 2>&1; then
     sha_cmd="shasum -a 256"
 else
-    err tool-missing "sha256sum or shasum is required"
+    err_code tool-missing "sha256sum or shasum is required"
     exit 2
 fi
-command -v tar >/dev/null 2>&1 || { err tool-missing "tar is required"; exit 2; }
-command -v xz >/dev/null 2>&1 || { err tool-missing "xz is required"; exit 2; }
-command -v "$make_cmd" >/dev/null 2>&1 || { err tool-missing "make is required"; exit 2; }
+command -v tar >/dev/null 2>&1 || { err_code tool-missing "tar is required"; exit 2; }
+command -v xz >/dev/null 2>&1 || { err_code tool-missing "xz is required"; exit 2; }
+command -v "$make_cmd" >/dev/null 2>&1 || { err_code tool-missing "make is required"; exit 2; }
 if [ -z "$tarball_arg" ]; then
-    command -v "$curl_cmd" >/dev/null 2>&1 || { err tool-missing "curl is required"; exit 2; }
+    command -v "$curl_cmd" >/dev/null 2>&1 || { err_code tool-missing "curl is required"; exit 2; }
 fi
 if [ -n "$tarball_arg" ] && [ ! -f "$tarball_arg" ]; then
-    err bad-argument "--tarball file not found"
+    err_code bad-argument "--tarball file not found"
     exit 2
 fi
 if [ -z "$jobs" ]; then
@@ -260,7 +254,6 @@ fi
 # --- 一時領域と期限つき実行（scripts/lib.sh の run_limited） ---
 work_dir=""
 out_created=0
-lock_dir=""
 publishing=0
 published=""
 cleanup() {
@@ -276,35 +269,29 @@ cleanup() {
             rmdir "$output_dir" 2>/dev/null || true
         fi
     fi
-    [ -z "$lock_dir" ] || rmdir "$lock_dir" 2>/dev/null || true
+    release_output_lock
 }
 trap cleanup EXIT
 trap 'exit 143' INT TERM
 
-work_dir="$(mktemp -d)" || { work_dir=""; err bad-environment "cannot create a temporary directory"; exit 2; }
+work_dir="$(mktemp -d)" || { work_dir=""; err_code bad-environment "cannot create a temporary directory"; exit 2; }
 RUN_LIMITED_DIR="$work_dir"
 
 # 出力先の排他ロック（mkdir は不可分）。同じ出力先への同時実行は後発を拒否し、
 # 「既存の出力を上書きしない」契約を守る。ロック確保後に空であることを再検査する。
 # ロックは <出力先>.lock ディレクトリで、異常終了（KILL 等）で残ったら手で削除する。
-mkdir -p "$(dirname "$output_dir")" 2>/dev/null || { err bad-output "cannot create the parent of the output directory"; exit 2; }
-if mkdir "$output_dir.lock" 2>/dev/null; then
-    lock_dir="$output_dir.lock"
-else
-    err output-busy "another run holds $output_dir.lock (remove it if no run is active)"
-    exit 2
-fi
+acquire_output_lock "$output_dir"
 if [ -L "$output_dir" ] || { [ -e "$output_dir" ] && [ ! -d "$output_dir" ]; }; then
-    err output-exists "output directory is not empty; refusing to overwrite"
+    err_code output-exists "output directory is not empty; refusing to overwrite"
     exit 2
 fi
 if [ -d "$output_dir" ]; then
     dir_listing="$(ls -A "$output_dir" 2>/dev/null)" || {
-        err bad-output "cannot list the output directory; refusing to continue"
+        err_code bad-output "cannot list the output directory; refusing to continue"
         exit 2
     }
     if [ -n "$dir_listing" ]; then
-        err output-exists "output directory is not empty; refusing to overwrite"
+        err_code output-exists "output directory is not empty; refusing to overwrite"
         exit 2
     fi
 fi
@@ -313,15 +300,15 @@ fi
 tarball="$tarball_arg"
 if [ -z "$tarball" ]; then
     tarball="$work_dir/linux-${lock_ver}.tar.xz"
-    info "fetching $lock_url"
+    info_msg "fetching $lock_url"
     rc=0
     run_limited "$fetch_timeout" "$curl_cmd" --proto '=https' --tlsv1.2 -fsSL --max-filesize 400000000 \
         -o "$tarball" "$lock_url" || rc=$?
     if [ "$rc" -eq 124 ]; then
-        err fetch-timeout "fetching the kernel tarball exceeded ${fetch_timeout}s"
+        err_code fetch-timeout "fetching the kernel tarball exceeded ${fetch_timeout}s"
         exit 3
     elif [ "$rc" -ne 0 ]; then
-        err fetch-failed "curl failed with exit code $rc"
+        err_code fetch-failed "curl failed with exit code $rc"
         exit 2
     fi
 fi
@@ -331,7 +318,7 @@ fi
 if [ -n "$tarball_arg" ]; then
     pinned="$work_dir/pinned-linux-${lock_ver}.tar.xz"
     if ! cp -- "$tarball_arg" "$pinned" 2>/dev/null; then
-        err bad-argument "cannot read the tarball to compute its sha256"
+        err_code bad-argument "cannot read the tarball to compute its sha256"
         exit 2
     fi
     tarball="$pinned"
@@ -339,11 +326,11 @@ fi
 
 # --- 完全性の照合（不一致ならここで止まり、展開もビルドもしない） ---
 if ! actual_sha="$($sha_cmd "$tarball" 2>/dev/null | awk '{print $1}'; exit "${PIPESTATUS[0]}")"; then
-    err bad-argument "cannot read the tarball to compute its sha256"
+    err_code bad-argument "cannot read the tarball to compute its sha256"
     exit 2
 fi
 if [ "$actual_sha" != "$lock_sha" ]; then
-    err checksum-mismatch "sha256 of the tarball does not match source.lock (expected $lock_sha, got $actual_sha)"
+    err_code checksum-mismatch "sha256 of the tarball does not match source.lock (expected $lock_sha, got $actual_sha)"
     exit 4
 fi
 
@@ -353,10 +340,10 @@ list="$work_dir/members.txt"
 rc=0
 run_limited "$extract_timeout" tar -tJf "$tarball" >"$list" || rc=$?
 if [ "$rc" -eq 124 ]; then
-    err extract-timeout "listing the archive exceeded ${extract_timeout}s"
+    err_code extract-timeout "listing the archive exceeded ${extract_timeout}s"
     exit 3
 elif [ "$rc" -ne 0 ]; then
-    err bad-archive "tar could not list the archive"
+    err_code bad-archive "tar could not list the archive"
     exit 2
 fi
 while IFS= read -r member || [ -n "$member" ]; do
@@ -368,7 +355,7 @@ while IFS= read -r member || [ -n "$member" ]; do
         *) bad=1 ;;
     esac
     if [ "$bad" -eq 1 ]; then
-        err unsafe-archive-entry "archive member is outside $prefix/ or uses an absolute or .. path"
+        err_code unsafe-archive-entry "archive member is outside $prefix/ or uses an absolute or .. path"
         exit 2
     fi
 done <"$list"
@@ -376,22 +363,22 @@ done <"$list"
 # --- 展開（新しい空のディレクトリへ。所有者は再現しない） ---
 extract_dir="$work_dir/src"
 mkdir "$extract_dir"
-info "extracting"
+info_msg "extracting"
 rc=0
 run_limited "$extract_timeout" tar -xJf "$tarball" -C "$extract_dir" --no-same-owner || rc=$?
 if [ "$rc" -eq 124 ]; then
-    err extract-timeout "extracting the archive exceeded ${extract_timeout}s"
+    err_code extract-timeout "extracting the archive exceeded ${extract_timeout}s"
     exit 3
 elif [ "$rc" -ne 0 ]; then
-    err bad-archive "tar failed to extract the archive"
+    err_code bad-archive "tar failed to extract the archive"
     exit 2
 fi
 src="$extract_dir/$prefix"
-[ -d "$src" ] || { err bad-archive "expected directory $prefix not found after extraction"; exit 2; }
+[ -d "$src" ] || { err_code bad-archive "expected directory $prefix not found after extraction"; exit 2; }
 
 # --- 設定とビルド ---
 fragment="$script_dir/arm64-guest.config"
-[ -f "$fragment" ] || { err bad-environment "arm64-guest.config not found"; exit 2; }
+[ -f "$fragment" ] || { err_code bad-environment "arm64-guest.config not found"; exit 2; }
 make_args=(-C "$src" ARCH=arm64)
 [ -z "$cross_compile" ] || make_args+=("CROSS_COMPILE=$cross_compile")
 [ "$use_llvm" -eq 0 ] || make_args+=("LLVM=1")
@@ -402,15 +389,15 @@ make_step() {
     local rc=0
     run_limited "$build_timeout" "$make_cmd" "${make_args[@]}" "$@" >&2 || rc=$?
     if [ "$rc" -eq 124 ]; then
-        err build-timeout "make $what exceeded ${build_timeout}s"
+        err_code build-timeout "make $what exceeded ${build_timeout}s"
         exit 3
     elif [ "$rc" -ne 0 ]; then
-        err build-failed "make $what failed with exit code $rc"
+        err_code build-failed "make $what failed with exit code $rc"
         exit 1
     fi
 }
 
-info "configuring (allnoconfig + fragment)"
+info_msg "configuring (allnoconfig + fragment)"
 make_step allnoconfig "KCONFIG_ALLCONFIG=$fragment" allnoconfig
 make_step olddefconfig olddefconfig
 
@@ -433,19 +420,19 @@ for sym in CONFIG_ARM_GIC CONFIG_ARM_GIC_V3; do
     fi
 done
 if [ -n "$missing" ]; then
-    err config-option-missing "options requested as =y are absent from the generated .config:$missing"
+    err_code config-option-missing "options requested as =y are absent from the generated .config:$missing"
     exit 1
 fi
 
-info "building Image (jobs=$jobs)"
+info_msg "building Image (jobs=$jobs)"
 make_step Image "-j$jobs" Image
 image="$src/arch/arm64/boot/Image"
-[ -s "$image" ] || { err build-failed "Image was not produced"; exit 1; }
+[ -s "$image" ] || { err_code build-failed "Image was not produced"; exit 1; }
 
 # --- 出力（一時名へコピーしてから mv で確定する。失敗は構造化して exit 2） ---
 publishing=1
 if [ ! -d "$output_dir" ]; then
-    mkdir "$output_dir" 2>/dev/null || { err bad-output "cannot create the output directory"; exit 2; }
+    mkdir "$output_dir" 2>/dev/null || { err_code bad-output "cannot create the output directory"; exit 2; }
     out_created=1
 fi
 tc_cmd=(gcc)
@@ -455,22 +442,26 @@ tc_line=""
 if run_limited 30 "${tc_cmd[0]}" --version >"$work_dir/tc-version" 2>/dev/null; then
     tc_line="$(head -n 1 "$work_dir/tc-version" 2>/dev/null || true)"
 fi
-{
+if ! {
+    {
     printf 'kernel_version=%s\n' "$lock_ver"
     printf 'kernel_url=%s\n' "$lock_url"
     printf 'kernel_sha256=%s\n' "$lock_sha"
     printf 'toolchain=%s\n' "${tc_line:-unknown}"
     printf 'host=%s\n' "$host_os $host_arch"
-} >"$output_dir/.build-info.tmp" 2>/dev/null \
-    && cp "$image" "$output_dir/.Image.tmp" 2>/dev/null \
-    && cp "$src/.config" "$output_dir/.config.tmp" 2>/dev/null \
-    || { err output-failed "cannot write the build outputs (disk full or permission?)"; exit 2; }
+    } >"$output_dir/.build-info.tmp" 2>/dev/null \
+        && cp "$image" "$output_dir/.Image.tmp" 2>/dev/null \
+        && cp "$src/.config" "$output_dir/.config.tmp" 2>/dev/null
+}; then
+    err_code output-failed "cannot write the build outputs (disk full or permission?)"
+    exit 2
+fi
 # 確定は ln（ハードリンク）で行う。宛先が既にあれば原子的に失敗し、他者が作ったファイルを上書きしない。
 for pair in build-info.txt:.build-info.tmp config:.config.tmp Image:.Image.tmp; do
     dest="${pair%%:*}"
     tmp="${pair#*:}"
     if ! ln -- "$output_dir/$tmp" "$output_dir/$dest" 2>/dev/null; then
-        err output-exists "cannot publish $dest: it already exists or the link failed; refusing to overwrite"
+        err_code output-exists "cannot publish $dest: it already exists or the link failed; refusing to overwrite"
         exit 2
     fi
     published="$published $dest"

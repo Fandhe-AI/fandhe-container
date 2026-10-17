@@ -28,6 +28,26 @@ pub fn user_manager_env(xdg: Option<&OsStr>, euid: u32) -> Result<OsString, Star
     shared_user_manager_env(xdg, euid).map_err(|e| unsupported(e.message()))
 }
 
+/// `systemd-run` の包み込み（`USER_SCOPE_WRAPPER_ARGS` ＋ `--unit=<unit>` ＋ `--`）と環境（固定 `PATH` と
+/// `XDG_RUNTIME_DIR` のみ）・cwd（`/`）を組んだ `Command` を返す。包まれるコマンドは呼び出し側が `--` の後ろへ足す。
+/// 失敗するのは `USER_SCOPE_WRAPPER_ARGS` の末尾が `--` でなくなった（契約が変わった）場合だけ。
+fn wrapper_command(systemd_run: &Path, unit: &str, xdg: &OsStr) -> Option<Command> {
+    let (sep, head) = USER_SCOPE_WRAPPER_ARGS.split_last()?;
+    if *sep != "--" {
+        return None;
+    }
+    let path_value = FIXED_PATH_ENV.strip_prefix("PATH=")?;
+    let mut cmd = Command::new(systemd_run);
+    cmd.args(head)
+        .arg(format!("--unit={unit}"))
+        .arg(sep)
+        .env_clear()
+        .env("PATH", path_value)
+        .env("XDG_RUNTIME_DIR", xdg)
+        .current_dir("/");
+    Some(cmd)
+}
+
 /// 本番の `start` と同じ包み込みで、試行 1 回分の `systemd-run` コマンドを組む（シェルも文字列連結も使わない）。
 ///
 /// 組み立てに失敗するのは `USER_SCOPE_WRAPPER_ARGS` の末尾が `--` でなくなった（契約が変わった）場合だけで、
@@ -40,24 +60,26 @@ pub fn scoped_command(
     id: &str,
     xdg: &OsStr,
 ) -> Option<Command> {
-    let (sep, head) = USER_SCOPE_WRAPPER_ARGS.split_last()?;
-    if *sep != "--" {
-        return None;
-    }
-    let path_value = FIXED_PATH_ENV.strip_prefix("PATH=")?;
-    let mut cmd = Command::new(systemd_run);
-    cmd.args(head)
-        .arg(format!("--unit={unit}"))
-        .arg(sep)
-        .arg(supervisor)
+    let mut cmd = wrapper_command(systemd_run, unit, xdg)?;
+    cmd.arg(supervisor)
         .arg("start")
         .arg("--root")
         .arg(root)
-        .arg(id)
-        .env_clear()
-        .env("PATH", path_value)
-        .env("XDG_RUNTIME_DIR", xdg)
-        .current_dir("/");
+        .arg(id);
+    Some(cmd)
+}
+
+/// scope 取得だけを測る診断（`--scope-only`。`scope_only` モジュール）用に、`scoped_command` と同じ包み込みで
+/// 自明なコマンド（`<program> --startup-latency-noop`。すぐ終了コード 0 で終わる）を起動する `Command` を組む。
+/// supervisor・create・ランチャー・Landlock を含まないので、scope 取得（D-Bus の往復）だけの費用が残る。
+pub fn scoped_noop_command(
+    systemd_run: &Path,
+    unit: &str,
+    program: &Path,
+    xdg: &OsStr,
+) -> Option<Command> {
+    let mut cmd = wrapper_command(systemd_run, unit, xdg)?;
+    cmd.arg(program).arg("--startup-latency-noop");
     Some(cmd)
 }
 
@@ -135,6 +157,47 @@ mod tests {
                 "--root",
                 "/r",
                 "cid"
+            ]
+        );
+        let mut envs: Vec<_> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_str().unwrap(), v.unwrap().to_str().unwrap()))
+            .collect();
+        envs.sort();
+        assert_eq!(
+            envs,
+            [
+                ("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000")
+            ]
+        );
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
+    }
+
+    /// CORE-10: 診断の包み込みは本番と同じ前半（argv・環境・cwd）で、本体だけが noop になる。
+    #[test]
+    fn core10_scoped_noop_command_shares_the_production_wrapper() {
+        let cmd = scoped_noop_command(
+            Path::new("/usr/bin/systemd-run"),
+            "fcsl-scope-x",
+            Path::new("/opt/bench"),
+            OsStr::new("/run/user/1000"),
+        )
+        .unwrap();
+        assert_eq!(cmd.get_program(), "/usr/bin/systemd-run");
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "-p",
+                "Delegate=yes",
+                "--unit=fcsl-scope-x",
+                "--",
+                "/opt/bench",
+                "--startup-latency-noop"
             ]
         );
         let mut envs: Vec<_> = cmd

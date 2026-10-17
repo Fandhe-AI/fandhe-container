@@ -97,8 +97,23 @@ impl Drop for Reaper {
     fn drop(&mut self) {
         if let Ok(mut children) = self.0.children.lock() {
             for child in children.values_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
+                // kill の失敗は無視せず、終了を try_wait で有限期限まで確認する（REPAIR-5）。
+                let kill_result = child.kill();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut reaped = false;
+                while std::time::Instant::now() < deadline {
+                    match child.try_wait() {
+                        Ok(Some(_)) => {
+                            reaped = true;
+                            break;
+                        }
+                        Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+                        Err(_) => break,
+                    }
+                }
+                if !reaped && !std::thread::panicking() {
+                    panic!("child was not reaped within the deadline (kill: {kill_result:?})");
+                }
             }
         }
     }

@@ -361,11 +361,55 @@ impl Drop for InFlightGuard {
 /// 実行層からコンテナの削除完了（または不在）を確認できたか。成功と `NOT_FOUND` を確認済みとする。
 ///
 /// 失敗・タイムアウト・結果不明は未確認（偽）。偽のとき呼び出し側は記録と bundle を保持する。
-fn confirm_removed(adapter: &RuntimeAdapter, id: &str) -> bool {
-    match adapter.remove(id, true) {
+///
+/// 実行層の削除が止まっても worker が終わらなくなるのを避けるため、`timeout` で打ち切って未確認（偽）とする
+/// （REPAIR-5）。打ち切った後も削除の呼び出しは切り離したスレッドで走り続ける。
+fn confirm_removed(adapter: &RuntimeAdapter, id: &str, timeout: Duration) -> bool {
+    let adapter = adapter.clone();
+    let id = id.to_owned();
+    call_with_deadline(timeout, move || match adapter.remove(&id, true) {
         Ok(_) => true,
         Err(status) => status.code() == tonic::Code::NotFound,
+    })
+    .unwrap_or(false)
+}
+
+/// Start の失敗が「実行層は created のまま」と確定できるか（REPAIR-5）。
+///
+/// `FailedPrecondition`・`NotFound` は実行層が Created 以外（Running・Stopped）でも返しうるため、
+/// 状態照会で Created を確認できた場合だけ確定とする。照会の失敗・期限超過・Created 以外は結果不明。
+fn start_failure_is_definite(
+    adapter: &RuntimeAdapter,
+    id: &str,
+    code: tonic::Code,
+    timeout: Duration,
+) -> bool {
+    use tonic::Code;
+    match code {
+        Code::FailedPrecondition | Code::NotFound => {
+            let adapter = adapter.clone();
+            let id = id.to_owned();
+            call_with_deadline(timeout, move || adapter.state(&id))
+                .is_some_and(|r| r.is_ok_and(|s| s.state == CriContainerState::ContainerCreated))
+        }
+        other => is_definite_failure(other),
     }
+}
+
+/// 同期呼び出しを切り離したスレッドで走らせ、`timeout` までに終わらなければ `None`（REPAIR-5）。
+fn call_with_deadline<T, F>(timeout: Duration, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("cri-runtime-call".into())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .ok()?;
+    rx.recv_timeout(timeout).ok()
 }
 
 /// `run_bounded` の完了待ちの共有状態（結果と、待っている future の waker）。
@@ -510,6 +554,10 @@ fn rollback_in_flight(
                 if outcome_unknown {
                     record.state = ContainerState::Exited;
                     record.finished_at_nanos = finished_at_nanos;
+                    // Create の結果不明は実行層に資源が残りうる。削除接続（TASK-59.3）まで Remove を拒否する。
+                    if kind == InFlightKind::Create {
+                        record.runtime_leaked = true;
+                    }
                 }
             }
         }
@@ -531,6 +579,11 @@ fn drop_container_in(
     if record.in_flight && !include_in_flight {
         return Err(Status::failed_precondition(
             "container operation in progress",
+        ));
+    }
+    if record.runtime_leaked && !include_in_flight {
+        return Err(Status::failed_precondition(
+            "container resources are pending runtime cleanup",
         ));
     }
     // 先に検証してから変更し、失敗時にレジストリを変更しない。
@@ -775,6 +828,16 @@ impl CriRuntimeService {
                 "container operation in progress",
             ));
         }
+        // 実行層に資源が残りうるコンテナ（Create の結果不明）がある間は除去しない（追跡情報を失わない）。
+        if registry
+            .containers
+            .values()
+            .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && c.runtime_leaked)
+        {
+            return Err(Status::failed_precondition(
+                "container resources are pending runtime cleanup",
+            ));
+        }
         // 配下のコンテナ記録も連鎖して除去する（孤児と保持量の取りこぼしを防ぐ。TASK-58.1）。
         let mut released: usize = 0;
         for c in registry
@@ -888,6 +951,7 @@ impl CriRuntimeService {
                 finished_at_nanos: 0,
                 retained_bytes,
                 in_flight,
+                runtime_leaked: false,
             },
         );
         registry.container_keys.insert(key);
@@ -925,6 +989,7 @@ impl CriRuntimeService {
         let adapter = binding.adapter.clone();
         let bundles = Arc::clone(&binding.bundles);
         let id = container_id.clone();
+        let timeout = self.runtime_timeout;
         run_bounded(self.runtime_timeout, move || -> Result<(), Status> {
             let bundle = bundles.prepare(&id, &sandbox_id, &config)?;
             // 以後は実行層に資源が残りうる。確定失敗または削除完了を確認できた場合だけ解放する（fail-closed）。
@@ -932,20 +997,21 @@ impl CriRuntimeService {
             let status = match adapter.create(&id, bundle) {
                 Ok(status) => status,
                 Err(status) => {
-                    if is_definite_failure(status.code()) || confirm_removed(&adapter, &id) {
+                    if is_definite_failure(status.code()) || confirm_removed(&adapter, &id, timeout)
+                    {
                         guard.mark_definitely_failed();
                     }
                     return Err(status);
                 }
             };
             if status.state != CriContainerState::ContainerCreated {
-                if confirm_removed(&adapter, &id) {
+                if confirm_removed(&adapter, &id, timeout) {
                     guard.mark_definitely_failed();
                 }
                 return Err(Status::internal("runtime returned an unexpected state"));
             }
             if let Err(status) = guard.commit() {
-                if confirm_removed(&adapter, &id) {
+                if confirm_removed(&adapter, &id, timeout) {
                     guard.mark_definitely_failed();
                 }
                 return Err(status);
@@ -1021,6 +1087,7 @@ impl CriRuntimeService {
         let mut guard =
             InFlightGuard::new(Arc::clone(&self.registry), id.clone(), InFlightKind::Start);
         let adapter = binding.adapter.clone();
+        let timeout = self.runtime_timeout;
         // 結果の確定と巻き戻しは worker が所有する。期限超過・中断では結果不明のまま worker が終わるのを待ち、
         // その間 `in_flight` が残る（新たな Start・Remove は拒否される）。
         run_bounded(self.runtime_timeout, move || -> Result<(), Status> {
@@ -1031,7 +1098,7 @@ impl CriRuntimeService {
                 Err(status) => {
                     // 確定失敗のコードに限り created へ戻す。タイムアウト・Unavailable・Internal 等は
                     // 実行層が起動済みの可能性があるため、unknown のまま破棄して exited にする（fail-closed）。
-                    if is_definite_failure(status.code()) {
+                    if start_failure_is_definite(&adapter, &id, status.code(), timeout) {
                         guard.mark_definitely_failed();
                     }
                     return Err(status);

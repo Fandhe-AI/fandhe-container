@@ -133,6 +133,8 @@ pub(super) struct ContainerRecord {
     /// 拒否するためのフラグ。実行層を呼ぶ間はレジストリのロックを持たないので、このフラグで二重実行と
     /// 取りこぼし（記録だけ消えて実行層に残る）を防ぐ。
     pub(super) in_flight: bool,
+    /// Create の結果が不明のまま実行層に資源が残りうる（TASK-59.2）。真の間は Remove を拒否する。
+    pub(super) runtime_leaked: bool,
 }
 
 impl ContainerRecord {

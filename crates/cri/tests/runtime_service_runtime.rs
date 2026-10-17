@@ -41,6 +41,10 @@ struct FakeRuntime {
     start_returns_stopped: AtomicBool,
     /// true のとき delete は成功する（実行層の削除完了の確認用。偽なら Unimplemented で失敗する）。
     delete_ok: AtomicBool,
+    /// true のとき state は running を返す（FailedPrecondition が Created 以外でも返る場合の検証用）。
+    state_running: AtomicBool,
+    /// true の間、delete は保留する（後始末の期限の検証用）。
+    hold_delete: AtomicBool,
 }
 
 impl FakeRuntime {
@@ -104,13 +108,19 @@ impl ContainerRuntime for Shared {
             .lock()
             .unwrap()
             .push(format!("delete {}", r.id().as_str()));
+        while self.0.hold_delete.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         if self.0.delete_ok.load(Ordering::SeqCst) {
             return Ok(DeleteResponse::new());
         }
         Err(TraitError::new(ErrorCode::Unimplemented, "not used"))
     }
-    fn state(&self, _: &StateRequest) -> Result<ContainerStatus, TraitError> {
-        Err(TraitError::new(ErrorCode::Unimplemented, "not used"))
+    fn state(&self, r: &StateRequest) -> Result<ContainerStatus, TraitError> {
+        if self.0.state_running.load(Ordering::SeqCst) {
+            return Ok(ContainerStatus::running(r.id().clone(), None));
+        }
+        Ok(ContainerStatus::created(r.id().clone(), None))
     }
 }
 
@@ -753,4 +763,82 @@ fn task_59_2_timeout_does_not_depend_on_blocking_pool() {
         stop.store(true, Ordering::SeqCst);
         blocker.await.expect("blocker");
     });
+}
+
+/// REPAIR-5: Start の FailedPrecondition でも state が Created 以外なら結果不明として exited にする。
+#[tokio::test]
+async fn task_59_2_start_precondition_failure_with_non_created_state_marks_exited() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    *h.runtime.fail_start.lock().unwrap() = Some(ErrorCode::FailedPrecondition);
+    h.runtime.state_running.store(true, Ordering::SeqCst);
+    start(&h.service, &id).await.expect_err("start");
+    assert_eq!(
+        status(&h.service, &id).await.state,
+        S::ContainerExited as i32
+    );
+}
+
+/// 結果不明の create で資源が残りうるコンテナは、削除接続まで RemoveContainer / RemovePodSandbox を拒否する。
+#[tokio::test]
+async fn task_59_2_leaked_container_rejects_remove() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    *h.runtime.fail_create.lock().unwrap() = Some(ErrorCode::Internal);
+    create(&h.service, &sb, "c").await.expect_err("create");
+    assert_eq!(list_count(&h.service).await, 1);
+    let id = {
+        let resp = RuntimeService::list_containers(
+            &h.service,
+            Request::new(v1::ListContainersRequest::default()),
+        )
+        .await
+        .expect("list")
+        .into_inner();
+        resp.containers[0].id.clone()
+    };
+    let err = remove(&h.service, &id).await.expect_err("remove");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    let err = RuntimeService::remove_pod_sandbox(
+        &h.service,
+        Request::new(v1::RemovePodSandboxRequest {
+            pod_sandbox_id: sb.clone(),
+        }),
+    )
+    .await
+    .expect_err("remove sandbox");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(list_count(&h.service).await, 1);
+}
+
+/// REPAIR-5: 後始末の delete が止まっても、期限で打ち切って in_flight を解く。
+#[tokio::test]
+async fn task_59_2_hung_cleanup_delete_is_bounded() {
+    let h = harness();
+    let service = h.service.with_runtime_timeout(Duration::from_millis(100));
+    let sb = run_sandbox(&service).await;
+    *h.runtime.fail_create.lock().unwrap() = Some(ErrorCode::Internal);
+    h.runtime.hold_delete.store(true, Ordering::SeqCst);
+    create(&service, &sb, "c").await.expect_err("create");
+    // delete は止まったままでも、worker が期限で打ち切って記録を exited にして in_flight を解く。
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let id = loop {
+        let resp = RuntimeService::list_containers(
+            &service,
+            Request::new(v1::ListContainersRequest::default()),
+        )
+        .await
+        .expect("list")
+        .into_inner();
+        if let Some(c) = resp.containers.first()
+            && c.state == S::ContainerExited as i32
+        {
+            break c.id.clone();
+        }
+        assert!(std::time::Instant::now() < deadline, "worker must finish");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(status(&service, &id).await.state, S::ContainerExited as i32);
+    h.runtime.hold_delete.store(false, Ordering::SeqCst);
 }

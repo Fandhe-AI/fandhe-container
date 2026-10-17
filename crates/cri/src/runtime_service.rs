@@ -345,15 +345,18 @@ impl InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if !self.committed {
-            rollback_in_flight(&self.registry, &self.id, self.kind, self.outcome_unknown);
-            // 実行層に資源が残っている可能性があるとき（結果不明）は bundle を解放しない。
-            // 削除完了を確認できた場合だけ `mark_definitely_failed` 経由で解放する（fail-closed）。
+            // 確定失敗の Create は、bundle の解放を終えてから記録（件数枠・名前キー）を除去する。
+            // `release` が停止しても記録は `in_flight` のまま残り、枠は空かない。停止した worker の数は
+            // 件数の上限（MAX_CONTAINERS）で有界になり、枠を超えて worker や未解放資源が溜まらない
+            // （REPAIR-5・リソース上限）。結果不明のときは実行層に資源が残りうるため bundle を解放しない
+            // （削除完了を確認できた場合だけ `mark_definitely_failed` 経由で解放する。fail-closed）。
             if self.kind == InFlightKind::Create
                 && !self.outcome_unknown
                 && let Some(bundles) = &self.bundles
             {
                 bundles.release(&self.id);
             }
+            rollback_in_flight(&self.registry, &self.id, self.kind, self.outcome_unknown);
         }
     }
 }
@@ -515,6 +518,11 @@ fn commit_in_flight(
         .get_mut(id)
         .ok_or_else(|| Status::internal("container registry is inconsistent"))?;
     record.in_flight = false;
+    if kind == InFlightKind::Create {
+        // 実行層に資源（コンテナ・bundle）が存在する。削除の接続（TASK-59.3）まで Remove を拒否し、
+        // 追跡情報・名前キー・件数枠を保持する。
+        record.runtime_leaked = true;
+    }
     if kind == InFlightKind::Start {
         record.state = ContainerState::Running;
         record.started_at_nanos = started_at_nanos;

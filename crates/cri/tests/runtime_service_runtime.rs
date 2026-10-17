@@ -812,6 +812,29 @@ async fn task_59_2_leaked_container_rejects_remove() {
     assert_eq!(list_count(&h.service).await, 1);
 }
 
+/// 実行層に資源が残る成功後の記録（Create・Start 後）は、削除の接続（TASK-59.3）まで Remove を拒否して保持する。
+#[tokio::test]
+async fn task_59_2_connected_container_is_retained_on_remove() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    let err = remove(&h.service, &id).await.expect_err("remove created");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    start(&h.service, &id).await.expect("start");
+    let err = remove(&h.service, &id).await.expect_err("remove running");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    let err = RuntimeService::remove_pod_sandbox(
+        &h.service,
+        Request::new(v1::RemovePodSandboxRequest {
+            pod_sandbox_id: sb.clone(),
+        }),
+    )
+    .await
+    .expect_err("remove sandbox");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(list_count(&h.service).await, 1);
+}
+
 /// REPAIR-5: 後始末の delete が止まっても、期限で打ち切って in_flight を解く。
 #[tokio::test]
 async fn task_59_2_hung_cleanup_delete_is_bounded() {

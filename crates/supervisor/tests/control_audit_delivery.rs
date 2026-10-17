@@ -6,6 +6,9 @@
 //! ファイルの全経路は通っていなかった。本試験は supervisor の `start` と同じ順序（スレッドを作る前に relay を
 //! fork → listener を bind → サーバスレッド起動）で組み、本番の記録先のファイルの JSON Lines まで照合する。
 //!
+//! シナリオは排他で、`--ignored` を付けたときは実機のシナリオだけを実行する（既定のシナリオとは同一プロセスで
+//! 両立しない。上記のスレッド要件のため）。
+//!
 //! - 既定のシナリオ（`--ignored` なし。CI の既定集合。root は使わない）: サーバに「期待する uid」として自分の実効 uid
 //!   と異なる値を渡し、自プロセスからの接続を別 uid 相当として拒否させる。接続元の資格情報はカーネルの
 //!   `SO_PEERCRED` で、注入するのは期待値だけ。1 バイトも書かれずに切断されること、`@audit.log` に層
@@ -62,10 +65,13 @@ mod linux {
             child(Path::new(&path));
             return;
         }
-        default_scenario();
+        // 1 プロセスで走らせるシナリオは 1 つだけにする。既定シナリオの拒否処理が常駐の
+        // `supervisor-stderr` スレッドを作り（static に保持され終了しない）、続けて実機シナリオが
+        // `ControlAuditRelay::spawn` の単一スレッド要件に違反するため。
         if std::env::args().any(|a| a == "--ignored") {
             real_scenario();
         } else {
+            default_scenario();
             println!(
                 "control_audit_delivery: real-machine scenario skipped (run with -- --ignored as root)"
             );

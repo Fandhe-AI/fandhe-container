@@ -16,7 +16,7 @@ use super::args::Plan;
 use super::bin_check::{verify_executable, verify_output_target, verify_work_base};
 use super::bundle::build_bundle;
 use super::output::{Failures, Params, RunResult, Sample, render_json};
-use super::probe_env::effective_uid;
+use super::probe_env::{detect_host_kind, effective_uid};
 use super::report::{ReportOutcome, classify, spawn_report_reader};
 use super::scope_wrap::{scoped_command, user_manager_env};
 use crate::sys;
@@ -743,6 +743,7 @@ fn run_trials<H: Host>(host: &H, ctx: &Ctx<'_>) -> Result<RunResult, StartupLate
         failures,
         leftover_ids,
         arch: std::env::consts::ARCH,
+        host_kind: detect_host_kind(),
     })
 }
 

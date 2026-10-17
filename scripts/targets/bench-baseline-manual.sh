@@ -11,7 +11,8 @@
 #
 # 入力（環境変数）:
 #   BENCH_RESULTS       必須。結果ファイルの絶対パス（通常ファイル・symlink 不可・1 MiB 以下）
-#   BENCH_HOST_KIND     必須。実測したホストの種類（lib.sh の BENCH_MANUAL_HOST_KINDS）
+#   BENCH_HOST_KIND     実測したホストの種類（lib.sh の BENCH_MANUAL_HOST_KINDS）。結果の host_kind（ハーネスの
+#                       自動判定）が語彙内なら省略できる。結果が unknown か無いときは必須。結果の値と食い違えば 2
 #   BENCH_BASELINE_OUT  任意。出力先（既定 target/bench-baseline-manual/baseline-manual.json。
 #                       共有の benches/baseline-manual.json へは明示指定したときだけ書く）
 #   BENCH_ENVIRONMENT   任意。一般化した環境説明（256 文字以内。generate_baseline.sh の --environment）
@@ -30,8 +31,8 @@ BENCH_HOST_KIND="${BENCH_HOST_KIND:-}"
 BENCH_BASELINE_OUT="${BENCH_BASELINE_OUT:-${BENCH_MANUAL_BASELINE_OUT_DEFAULT}}"
 BENCH_METRICS="${BENCH_METRICS:-benches/metrics.json}"
 
-if [ -z "${BENCH_RESULTS}" ] || [ -z "${BENCH_HOST_KIND}" ]; then
-  echo "usage: make bench-baseline-manual BENCH_RESULTS=<absolute path of the startup_latency results json> BENCH_HOST_KIND=<bare-metal|vm|wsl2> [BENCH_BASELINE_OUT=<path>] [BENCH_ENVIRONMENT=<text>]" >&2
+if [ -z "${BENCH_RESULTS}" ]; then
+  echo "usage: make bench-baseline-manual BENCH_RESULTS=<absolute path of the startup_latency results json> [BENCH_HOST_KIND=<bare-metal|vm|wsl2>] [BENCH_BASELINE_OUT=<path>] [BENCH_ENVIRONMENT=<text>]" >&2
   exit 2
 fi
 case "${BENCH_RESULTS}" in
@@ -45,7 +46,7 @@ if ! command -v jq >/dev/null 2>&1; then
   err "jq is required"
   exit 2
 fi
-if ! bench_manual_in_vocab "${BENCH_HOST_KIND}" "${BENCH_MANUAL_HOST_KINDS}"; then
+if [ -n "${BENCH_HOST_KIND}" ] && ! bench_manual_in_vocab "${BENCH_HOST_KIND}" "${BENCH_MANUAL_HOST_KINDS}"; then
   err "BENCH_HOST_KIND must be one of: ${BENCH_MANUAL_HOST_KINDS}"
   exit 2
 fi
@@ -54,6 +55,11 @@ bench_manual_check_input_file "${BENCH_RESULTS}"
 bench_manual_check_input_file "${BENCH_METRICS}"
 bench_manual_validate_results "${BENCH_RESULTS}" "${BENCH_METRICS}"
 
+bench_manual_resolve_host_kind "${BENCH_RESULTS}"
+if [ -z "${BENCH_HOST_KIND}" ]; then
+  err "BENCH_HOST_KIND is required when the results host_kind is unknown or absent (one of: ${BENCH_MANUAL_HOST_KINDS})"
+  exit 2
+fi
 results_arch="$(jq -r '.arch // "" | if type == "string" then . else "" end' "${BENCH_RESULTS}")"
 if ! bench_manual_in_vocab "${results_arch}" "${BENCH_MANUAL_ARCHES}"; then
   err "results must have a top-level arch that is one of: ${BENCH_MANUAL_ARCHES}"

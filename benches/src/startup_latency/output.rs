@@ -76,6 +76,9 @@ pub struct RunResult {
     pub failures: Failures,
     pub leftover_ids: Vec<String>,
     pub arch: &'static str,
+    /// ホストの種類（`bare-metal` / `vm` / `wsl2` / `unknown`。`probe_env::detect_host_kind`）。固定の語彙だけを出す。
+    /// キーを足すだけの変更なので `schema_version` は 1 のまま（読み手は未知のキーを無視する）。
+    pub host_kind: &'static str,
 }
 
 impl RunResult {
@@ -191,7 +194,11 @@ pub fn render_json(result: &RunResult) -> Result<String, StartupLatencyError> {
         }
         let _ = write!(out, "\"{id}\"");
     }
-    let _ = writeln!(out, "],\"arch\":\"{}\"}}", result.arch);
+    let _ = writeln!(
+        out,
+        "],\"arch\":\"{}\",\"host_kind\":\"{}\"}}",
+        result.arch, result.host_kind
+    );
     Ok(out)
 }
 
@@ -246,6 +253,7 @@ mod tests {
             failures: Failures::default(),
             leftover_ids: Vec::new(),
             arch: "x86_64",
+            host_kind: "vm",
         }
     }
 
@@ -263,7 +271,7 @@ mod tests {
             "\"summary\":{\"samples\":2,\"p50_ms\":1.000,\"p95_ms\":2.000,\"max_ms\":2.000},",
             "\"trials\":[{\"total_ms\":1.000,\"create_ms\":0.500},{\"total_ms\":2.000,\"create_ms\":0.500}],",
             "\"failures\":{\"total\":0,\"create\":0,\"spawn\":0,\"report_err\":0,\"report_err_codes\":{},\"report_timeout\":0,\"report_eof\":0,\"report_invalid\":0,\"supervisor_exit\":0,\"cleanup\":0},",
-            "\"leftover_ids\":[],\"arch\":\"x86_64\"}\n"
+            "\"leftover_ids\":[],\"arch\":\"x86_64\",\"host_kind\":\"vm\"}\n"
         );
         assert_eq!(render_json(&r).expect("render"), expected);
     }

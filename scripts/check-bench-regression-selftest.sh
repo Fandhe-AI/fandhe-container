@@ -274,7 +274,8 @@ mkdir "${mk_dir}"
 write_metrics "${ph}: {\"unit\": \"ops/s\", \"direction\": \"higher_is_better\"}, ${sl}: {\"unit\": \"ms\", \"direction\": \"lower_is_better\"}" "${mk_dir}/metrics.json"
 # 結果 JSON: <ファイル> <値> [追加の JSON オブジェクト断片（failures 等）]
 write_manual_results() {
-  printf '{"schema_version": 1, "arch": "%s", "metrics": {%s: {"value": %s, "unit": "ms"}}%s}\n' "${MANUAL_ARCH:-x86_64}" "${sl}" "$2" "${3:+, $3}" >"$1"
+  # MANUAL_HOST_KIND を設定すると結果に host_kind（ハーネスの自動判定）を載せる。既定は載せない（古い結果の形）。
+  printf '{"schema_version": 1, "arch": "%s", "metrics": {%s: {"value": %s, "unit": "ms"}}%s%s}\n' "${MANUAL_ARCH:-x86_64}" "${sl}" "$2" "${MANUAL_HOST_KIND:+, \"host_kind\": \"${MANUAL_HOST_KIND}\"}" "${3:+, $3}" >"$1"
 }
 # 基準値: <ファイル> <arch> <kind> <値>。host を持つ実機前提の基準値（#2095）。
 write_manual_baseline() {
@@ -327,6 +328,20 @@ write_manual_results "${mk_dir}/r116.json" 116
 run_manual_case "manual-16-percent-worse" "${mk_dir}/r116.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 1
 write_manual_results "${mk_dir}/r80.json" 80
 run_manual_case "manual-improvement" "${mk_dir}/r80.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 0
+# 結果の host_kind（自動判定。REPAIR-8）: env 省略で比較できる・食い違えば 2・unknown は env が要る・語彙外は 2。
+MANUAL_HOST_KIND=bare-metal write_manual_results "${mk_dir}/hk-bm.json" 100
+run_manual_case "manual-host-kind-from-results-no-env" "${mk_dir}/hk-bm.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 0 -
+MANUAL_HOST_KIND=bare-metal write_manual_results "${mk_dir}/hk-bm200.json" 200
+run_manual_case "manual-host-kind-from-results-regression" "${mk_dir}/hk-bm200.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 1 -
+run_manual_case "manual-host-kind-env-mismatch-results" "${mk_dir}/hk-bm.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2 vm
+MANUAL_HOST_KIND=vm write_manual_results "${mk_dir}/hk-vm.json" 100
+run_manual_case "manual-host-kind-results-mismatch-baseline" "${mk_dir}/hk-vm.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2 -
+MANUAL_HOST_KIND=unknown write_manual_results "${mk_dir}/hk-unknown.json" 100
+run_manual_case "manual-host-kind-unknown-without-env" "${mk_dir}/hk-unknown.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2 -
+run_manual_case "manual-host-kind-unknown-with-env" "${mk_dir}/hk-unknown.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 0 bare-metal
+MANUAL_HOST_KIND=toaster write_manual_results "${mk_dir}/hk-bad.json" 100
+run_manual_case "manual-host-kind-out-of-vocabulary" "${mk_dir}/hk-bad.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2 bare-metal
+run_manual_case "manual-host-kind-absent-without-env" "${mk_dir}/ok.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics.json" 2 -
 write_metrics "${ph}: {\"unit\": \"ops/s\", \"direction\": \"higher_is_better\"}" "${mk_dir}/metrics-removed.json"
 run_manual_case "manual-registered-metric-removed" "${mk_dir}/ok.json" "${mk_dir}/baseline.json" "${mk_dir}/metrics-removed.json" 2
 write_baseline "${mk_dir}/baseline-ci.json" "${sl}" 100 ms lower_is_better "${ph}" 1000 ops/s higher_is_better

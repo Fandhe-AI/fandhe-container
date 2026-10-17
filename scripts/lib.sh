@@ -161,7 +161,9 @@ BENCH_MANUAL_METRICS="startup_create_to_supervisor_ok_p95_ms"
 
 # 実機前提ベンチの基準値・結果の環境を機械照合するための閉じた語彙（#2095・TASK-190 追補・REPAIR-8）。
 # arch は結果 JSON の .arch（ハーネスの std::env::consts::ARCH。計測は Linux の x86_64 / aarch64 のみ）から取る。
-# ホストの種類は結果に載らないため、操作者が BENCH_HOST_KIND で語彙から指定する（自動判定は行わない）。
+# ホストの種類は、ハーネスが結果 JSON の .host_kind に載せる（Linux の /proc・/sys から自動判定。判定できなければ
+# 語彙の外の unknown）。操作者は BENCH_HOST_KIND で語彙から指定でき、結果が unknown か無いときはこれが必須になる
+# （bench_manual_resolve_host_kind）。語彙そのものの見直しは #230（TASK-88.h1）の担当。
 # shellcheck disable=SC2034 # bench-check-manual / bench-baseline-manual とテストが参照する
 BENCH_MANUAL_ARCHES="x86_64 aarch64"
 # shellcheck disable=SC2034
@@ -178,6 +180,26 @@ bench_manual_in_vocab() {
     [ "${w}" = "${v}" ] && return 0
   done
   return 1
+}
+
+# bench_manual_resolve_host_kind <結果 JSON>: BENCH_HOST_KIND（操作者の指定。空可）と結果の .host_kind から、使うホストの
+# 種類を決めて BENCH_HOST_KIND に入れる（呼び出し元の変数を更新する。サブシェルでは呼ばない）。
+#   - 結果の host_kind が語彙の外で unknown でもない → exit 2。無い・文字列でない・unknown → 結果からは決まらない
+#   - 両方あって食い違う → exit 2（偽の合格・偽の回帰を避ける）。片方だけならそれを使う
+# 決まらなければ BENCH_HOST_KIND は空のまま（呼び出し元が必要かどうかを判断する）。jq が必要。
+bench_manual_resolve_host_kind() {
+  local rk
+  rk="$(jq -r '.host_kind // "" | if type == "string" then . else "" end' "$1")"
+  if [ -n "${rk}" ] && [ "${rk}" != unknown ] && ! bench_manual_in_vocab "${rk}" "${BENCH_MANUAL_HOST_KINDS}"; then
+    echo "error: invalid-input: results host_kind must be one of: ${BENCH_MANUAL_HOST_KINDS} unknown" >&2
+    exit 2
+  fi
+  [ "${rk}" != unknown ] || rk=""
+  if [ -n "${BENCH_HOST_KIND:-}" ] && [ -n "${rk}" ] && [ "${BENCH_HOST_KIND}" != "${rk}" ]; then
+    echo "error: invalid-input: environment mismatch: BENCH_HOST_KIND ${BENCH_HOST_KIND} != results host_kind ${rk}" >&2
+    exit 2
+  fi
+  BENCH_HOST_KIND="${BENCH_HOST_KIND:-${rk}}"
 }
 
 # bench_manual_check_input_file <パス>: 入力ファイルの検査（symlink 拒否・通常ファイル・1 MiB 以下）。

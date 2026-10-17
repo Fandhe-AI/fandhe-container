@@ -13,7 +13,8 @@
 #   BENCH_RESULTS          必須。結果ファイルの絶対パス（通常ファイル・symlink 不可・1 MiB 以下）
 #   BENCH_MANUAL_BASELINE  任意。基準値（既定 benches/baseline-manual.json。実測の確定は TASK-88.h1・#230）
 #   BENCH_METRICS          任意。metrics の SSOT（既定 benches/metrics.json）
-#   BENCH_HOST_KIND        基準値があるとき必須。実測したホストの種類（bare-metal / vm / wsl2。lib.sh の語彙）。
+#   BENCH_HOST_KIND        基準値があるとき必須。ただし結果の host_kind（ハーネスの自動判定）が語彙内なら省略できる。
+#                          実測したホストの種類（bare-metal / vm / wsl2。lib.sh の語彙）。結果の値と食い違えば 2。
 #                          結果の .arch と基準値の host.arch、または host.kind が食い違うと比較せず 2（#2095）
 #
 # 終了コード: 0 合格（基準値が無い間は skip: を出して 0。結果の検査は行う）/ 1 回帰を検出 / 2 入力エラー。
@@ -32,7 +33,7 @@ BENCH_METRICS="${BENCH_METRICS:-benches/metrics.json}"
 BENCH_HOST_KIND="${BENCH_HOST_KIND:-}"
 
 if [ -z "${BENCH_RESULTS}" ]; then
-  echo "usage: make bench-check-manual BENCH_RESULTS=<absolute path of the startup_latency results json> BENCH_HOST_KIND=<bare-metal|vm|wsl2>" >&2
+  echo "usage: make bench-check-manual BENCH_RESULTS=<absolute path of the startup_latency results json> [BENCH_HOST_KIND=<bare-metal|vm|wsl2>]" >&2
   exit 2
 fi
 case "${BENCH_RESULTS}" in
@@ -59,6 +60,7 @@ if [ -n "${BENCH_HOST_KIND}" ] && ! bench_manual_in_vocab "${BENCH_HOST_KIND}" "
   err "BENCH_HOST_KIND must be one of: ${BENCH_MANUAL_HOST_KINDS}"
   exit 2
 fi
+bench_manual_resolve_host_kind "${BENCH_RESULTS}"
 results_arch="$(jq -r '.arch // "" | if type == "string" then . else "" end' "${BENCH_RESULTS}")"
 if ! bench_manual_in_vocab "${results_arch}" "${BENCH_MANUAL_ARCHES}"; then
   err "results must have a top-level arch that is one of: ${BENCH_MANUAL_ARCHES}"
@@ -88,7 +90,7 @@ if ! bench_manual_in_vocab "${base_arch}" "${BENCH_MANUAL_ARCHES}" || ! bench_ma
   exit 2
 fi
 if [ -z "${BENCH_HOST_KIND}" ]; then
-  err "BENCH_HOST_KIND is required when a baseline exists (one of: ${BENCH_MANUAL_HOST_KINDS})"
+  err "BENCH_HOST_KIND is required when a baseline exists and the results host_kind is unknown or absent (one of: ${BENCH_MANUAL_HOST_KINDS})"
   exit 2
 fi
 if [ "${results_arch}" != "${base_arch}" ]; then

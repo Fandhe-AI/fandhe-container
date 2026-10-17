@@ -114,6 +114,8 @@ case "$1" in
     run_limited 1 "${RL_DIR}/gc.sh" || rc=$?
     if kill -0 "$(cat "${RL_DIR}/gc.pid")" 2>/dev/null; then extra=alive; else extra=gone; fi
     ;;
+  leadzero08) run_limited 08 sleep 30 || rc=$? ;;
+  leadzero010) run_limited 010 sleep 30 || rc=$? ;;
   badlimit0) run_limited 0 touch "${RL_DIR}/ran" || rc=$? ;;
   badlimitabc) run_limited abc touch "${RL_DIR}/ran" || rc=$? ;;
   nodir) unset RUN_LIMITED_DIR; run_limited 5 touch "${RL_DIR}/ran" || rc=$? ;;
@@ -152,6 +154,9 @@ check_rl true 0 0 2 ""
 check_rl func 5 0 2 ""
 check_rl timeout 124 1 8 ""
 check_rl grandchild 124 1 10 "gone"
+# 先頭ゼロは 10 進として扱う（08 でも期限が効き、010 は 8 秒でなく 10 秒）
+check_rl leadzero08 124 8 14 ""
+check_rl leadzero010 124 10 16 ""
 check_rl badlimit0 125 0 2 ""
 check_rl badlimitabc 125 0 2 ""
 check_rl nodir 125 0 2 ""

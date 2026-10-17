@@ -344,6 +344,9 @@ run_limited() {
     echo "error: run-limited: limit must be an integer from 1 to 999999 (seconds)" >&2
     return 125
   fi
+  # int_in_range は先頭ゼロを許すが、下の見張り役の [ -lt ] は 8 進と解釈する（08・09 は異常終了、010 は 8 秒になる）。
+  # 先頭ゼロを取り除いて 10 進にそろえる。
+  while [ "${#limit}" -gt 1 ] && [ "${limit#0}" != "${limit}" ]; do limit="${limit#0}"; done
   if [ -z "${RUN_LIMITED_DIR:-}" ] || [ ! -d "${RUN_LIMITED_DIR}" ]; then
     echo "error: run-limited: RUN_LIMITED_DIR must be a directory" >&2
     return 125

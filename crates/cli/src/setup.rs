@@ -365,7 +365,7 @@ mod tests {
                     },
                 ),
                 Command::Logs => (vec!["logs", "c1"], if linux { 8 } else { 5 }, ""),
-                Command::Setup => continue,
+                Command::Setup | Command::Doctor => continue,
             };
             let (code, out, err) = invoke(&root, &argv);
             assert_eq!(out, stdout, "{}", command.as_str());

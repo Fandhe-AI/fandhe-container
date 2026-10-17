@@ -6,8 +6,14 @@
 //! 転送が Docker のチェインで落とされ外部到達性が損なわれる可能性がある。本モジュールは次の 2 つの
 //! 事実を取得し（`FORWARD` policy はホストの `ip filter FORWARD` チェインの値であり、Docker が設定した
 //! 値かどうかは照会だけでは判別できない。NET-10）、[`evaluate`] が 2 条件の組み合わせ判定・警告文・
-//! `DOCKER-USER` 案内・終了コード・JSON Lines 出力（TASK-148.2）を担う。サブコマンド配線・出力先の選択・
-//! `process::exit` は TASK-79 の範囲で未実装である。
+//! `DOCKER-USER` 案内・終了コード・JSON Lines 出力（TASK-148.2）を担う。サブコマンド `doctor` は
+//! `commands::run_to` から [`run`] を呼ぶ（#2133）。診断は stdout へ JSON Lines で書き、終了コードは [`DoctorExitStatus`] の値になる。
+//!
+//! # CORE-3 の前提の診断（#2133）
+//!
+//! NET-10 の診断に続けて、`start` が必要とする `systemd-run` の有無・信頼と systemd の user マネージャへの到達を
+//! 検査する（`user_scope_check`。CORE-3・CORE-4）。終了ステータスは 2 つの結果の合成で、Warning（3）が 1 件でもあれば 3、
+//! そうでなく判定不能（4）があれば 4、それ以外は 0。
 //!
 //! # 確認方法
 //!
@@ -40,6 +46,8 @@ use fandhe_container_net::error::{NetError, NetErrorCode};
 use fandhe_container_net::nftables_batch::{ChainInfo, ChainPolicy, NfInetHook};
 
 use crate::json::json_escape;
+
+pub mod user_scope_check;
 
 /// sysctl・`/proc` の読み取り上限（バイト）。想定値は 1 文字なので小さく抑える。
 const MAX_PROC_READ: u64 = 4096;
@@ -715,10 +723,54 @@ fn forward_policy_token(s: &ForwardPolicyState) -> String {
     }
 }
 
+/// 2 つの終了ステータスを合成する（Warning が最優先、次に判定不能、それ以外は Ok。`Fatal` / `Usage` は評価からは来ない）。
+pub fn combine_exit_status(a: DoctorExitStatus, b: DoctorExitStatus) -> DoctorExitStatus {
+    use DoctorExitStatus::{Fatal, Inconclusive, Ok, Usage, Warning};
+    for s in [Fatal, Usage, Warning, Inconclusive] {
+        if a == s || b == s {
+            return s;
+        }
+    }
+    Ok
+}
+
+/// 本番入口: NET-10 の診断と CORE-3 の前提の診断を実行し、JSON Lines を `stdout` へ書いて終了ステータスを返す。
+///
+/// 読み取り専用で、設定を変更しない。出力順は NET-10 の行、CORE-3 の行の順。`stdout` への書き込みに失敗したら `Fatal`。
+/// `commands::run_to` の `doctor` から呼ばれる。
+pub fn run(mut stdout: &mut dyn std::io::Write) -> DoctorExitStatus {
+    #[cfg(target_os = "linux")]
+    let findings = collect(&BrNetfilterProbe::default(), &NftForwardPolicySource);
+    #[cfg(not(target_os = "linux"))]
+    let findings = DoctorFindings {
+        br_netfilter: BrNetfilterState::Unsupported,
+        forward_policy: ForwardPolicyState::Unsupported,
+    };
+    let net = evaluate(&findings);
+    let scope = user_scope_check::evaluate(&user_scope_check::collect());
+    if net.write_json_lines(&mut stdout).is_err() || scope.write_json_lines(&mut stdout).is_err() {
+        return DoctorExitStatus::Fatal;
+    }
+    combine_exit_status(net.exit_status(), scope.exit_status())
+}
+
 /// 評価層（`evaluate`）のテスト。実機に依存しない純粋関数のため全 OS で実行される
 /// （Linux 限定の実機プローブテストは後続の `tests` モジュール）。
 #[cfg(test)]
 mod eval_tests {
+    /// CORE-3・NET-10: 終了ステータスの合成は Warning(3) > Inconclusive(4) > Ok(0)。
+    #[test]
+    fn combine_exit_status_prefers_warning_then_inconclusive() {
+        use super::{DoctorExitStatus as S, combine_exit_status as c};
+        assert_eq!(c(S::Ok, S::Ok), S::Ok);
+        assert_eq!(c(S::Ok, S::Inconclusive), S::Inconclusive);
+        assert_eq!(c(S::Inconclusive, S::Ok), S::Inconclusive);
+        assert_eq!(c(S::Inconclusive, S::Warning), S::Warning);
+        assert_eq!(c(S::Warning, S::Inconclusive), S::Warning);
+        assert_eq!(c(S::Warning, S::Ok), S::Warning);
+        assert_eq!(c(S::Fatal, S::Warning), S::Fatal);
+    }
+
     use super::*;
 
     fn loaded() -> BrNetfilterState {

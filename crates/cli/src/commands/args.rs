@@ -55,6 +55,10 @@ pub(super) struct ListArgs;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SetupArgs;
 
+/// `doctor` の引数（オプションなし。#2133）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DoctorArgs;
+
 /// `logs` の引数。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LogsArgs {
@@ -176,6 +180,16 @@ pub(super) fn parse_setup(args: Vec<OsString>) -> Result<SetupArgs, UsageError> 
     match it.next() {
         None => Ok(SetupArgs),
         Some(a) if a == "--" && it.next().is_none() => Ok(SetupArgs),
+        Some(_) => Err(UsageError),
+    }
+}
+
+/// `doctor` を解析する（位置引数・オプションとも受け付けない。`--` 単独のみ許容）。
+pub(super) fn parse_doctor(args: Vec<OsString>) -> Result<DoctorArgs, UsageError> {
+    let mut it = args.into_iter();
+    match it.next() {
+        None => Ok(DoctorArgs),
+        Some(a) if a == "--" && it.next().is_none() => Ok(DoctorArgs),
         Some(_) => Err(UsageError),
     }
 }
@@ -399,6 +413,16 @@ mod tests {
         assert_eq!(parse_list(v(&["--"])), Ok(ListArgs));
         for a in [v(&["x"]), v(&["--all"]), v(&["--", "x"]), v(&["-a"])] {
             assert_eq!(parse_list(a), Err(UsageError));
+        }
+    }
+
+    /// CLI-1: doctor は引数なし（または `--` のみ）だけ受理する。
+    #[test]
+    fn cli1_parse_doctor() {
+        assert_eq!(parse_doctor(v(&[])), Ok(DoctorArgs));
+        assert_eq!(parse_doctor(v(&["--"])), Ok(DoctorArgs));
+        for a in [v(&["x"]), v(&["--x"]), v(&["--", "x"])] {
+            assert_eq!(parse_doctor(a), Err(UsageError));
         }
     }
 

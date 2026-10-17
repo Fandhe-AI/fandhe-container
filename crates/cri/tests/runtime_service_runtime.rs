@@ -35,6 +35,10 @@ struct FakeRuntime {
     create_returns_running: AtomicBool,
     /// true の間、start は保留する（並行 Start の検証用）。
     hold_start: AtomicBool,
+    /// true の間、create は保留する（期限超過・中断の検証用）。
+    hold_create: AtomicBool,
+    /// true のとき start は stopped を返す（終了済みの応答の検証用）。
+    start_returns_stopped: AtomicBool,
 }
 
 impl FakeRuntime {
@@ -52,6 +56,9 @@ impl ContainerRuntime for Shared {
             r.id().as_str(),
             r.bundle().display()
         ));
+        while self.0.hold_create.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         if let Some(c) = *self.0.fail_create.lock().unwrap() {
             return Err(TraitError::new(c, "create failed"));
         }
@@ -71,6 +78,9 @@ impl ContainerRuntime for Shared {
         }
         if let Some(c) = *self.0.fail_start.lock().unwrap() {
             return Err(TraitError::new(c, "start failed"));
+        }
+        if self.0.start_returns_stopped.load(Ordering::SeqCst) {
+            return Ok(ContainerStatus::stopped(r.id().clone(), Some(0)));
         }
         if self.0.start_returns_created.load(Ordering::SeqCst) {
             return Ok(ContainerStatus::created(r.id().clone(), None));
@@ -549,4 +559,97 @@ async fn task_59_2_without_runtime_keeps_stub_behavior() {
         status(&service, &id).await.state,
         S::ContainerRunning as i32
     );
+}
+
+/// 実行層が stopped を返したら created へ戻さず exited にし、再 Start を実行層へ届けない（P1 指摘）。
+#[tokio::test]
+async fn task_59_2_stopped_start_response_marks_exited() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    h.runtime
+        .start_returns_stopped
+        .store(true, Ordering::SeqCst);
+    start(&h.service, &id).await.expect_err("start");
+    assert_eq!(
+        status(&h.service, &id).await.state,
+        S::ContainerExited as i32
+    );
+    h.runtime
+        .start_returns_stopped
+        .store(false, Ordering::SeqCst);
+    let err = start(&h.service, &id).await.expect_err("restart");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    let starts = h
+        .runtime
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("start "))
+        .count();
+    assert_eq!(starts, 1);
+}
+
+/// 実行層の応答が期限を超えたら DEADLINE_EXCEEDED。worker は最後まで走って記録を確定する（REPAIR-5）。
+#[tokio::test]
+async fn task_59_2_start_timeout_is_bounded_and_worker_finalizes() {
+    let h = harness();
+    let service = h.service.with_runtime_timeout(Duration::from_millis(50));
+    let sb = run_sandbox(&service).await;
+    let id = create(&service, &sb, "c").await.expect("create");
+    h.runtime.hold_start.store(true, Ordering::SeqCst);
+    let err = start(&service, &id).await.expect_err("start");
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    // worker が終わるまでは in_flight のまま（再 Start・Remove は拒否される）。
+    assert_eq!(
+        start(&service, &id).await.expect_err("restart").code(),
+        Code::FailedPrecondition
+    );
+    h.runtime.hold_start.store(false, Ordering::SeqCst);
+    for _ in 0..500 {
+        if status(&service, &id).await.state == S::ContainerRunning as i32 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("worker did not finalize the record");
+}
+
+/// Create が期限超過しても、実行層の処理中は bundle を解放せず、worker の完了後に巻き戻す。
+#[tokio::test]
+async fn task_59_2_create_timeout_defers_release_until_worker_finishes() {
+    let h = harness();
+    let service = h.service.with_runtime_timeout(Duration::from_millis(50));
+    let sb = run_sandbox(&service).await;
+    h.runtime.hold_create.store(true, Ordering::SeqCst);
+    h.runtime
+        .fail_create
+        .lock()
+        .unwrap()
+        .replace(ErrorCode::Internal);
+    let err = create(&service, &sb, "c").await.expect_err("create");
+    assert_eq!(err.code(), Code::DeadlineExceeded);
+    assert!(
+        !h.bundles
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("release ")),
+        "release must wait for the worker"
+    );
+    h.runtime.hold_create.store(false, Ordering::SeqCst);
+    for _ in 0..500 {
+        let released = h
+            .bundles
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.starts_with("release "));
+        if released && list_count(&service).await == 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("worker did not roll back");
 }

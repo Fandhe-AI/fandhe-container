@@ -345,9 +345,15 @@ struct NameIndex {
     /// 現在のレイヤーが親パスの解決で通過した、下位由来の symlink の ID。同じレイヤーがその symlink を
     /// whiteout すると、エントリの並び順で rootfs が変わるため拒否する（OCI-2）。
     traversed_links: HashSet<u64>,
-    /// 現在のレイヤーの whiteout で消した下位由来の symlink の（親 ID, 綴り）。その名前を親として暗黙作成する
-    /// エントリは、並び順で結果が変わるため拒否する（OCI-2）。
-    link_tombstones: HashSet<(u64, OsString)>,
+    /// 現在のレイヤーの whiteout で消した下位由来の symlink の、ルートからの物理パス。削除された木の配下に
+    /// あった symlink も含む。その symlink のパスを再び辿るエントリ（`a/lnk/x` など）は、並び順で結果が
+    /// 変わるため拒否する（OCI-2）。symlink を含む木の名前そのもの（`a`）の再作成は禁止しない。
+    link_tombstones: HashSet<PathBuf>,
+    /// 直近の `resolve_dir` が「親コンポーネントが非ディレクトリ」で失敗したときの、その物理パス（ルートから）。
+    last_nondir: Option<PathBuf>,
+    /// 削除マーカーの親が非ディレクトリだったパス。同じレイヤーが後からディレクトリへ置換する並びと
+    /// 結果をそろえるため、判定をレイヤーの終端まで遅らせる（OCI-2）。
+    pending_nondir_markers: Vec<PathBuf>,
 }
 
 impl NameIndex {
@@ -362,6 +368,8 @@ impl NameIndex {
             pruned: HashSet::new(),
             traversed_links: HashSet::new(),
             link_tombstones: HashSet::new(),
+            last_nondir: None,
+            pending_nondir_markers: Vec::new(),
         }
     }
 
@@ -391,6 +399,8 @@ impl NameIndex {
         self.pruned.clear();
         self.traversed_links.clear();
         self.link_tombstones.clear();
+        self.last_nondir = None;
+        self.pending_nondir_markers.clear();
     }
 
     /// whiteout で削除した `parent` 直下の `name` と、その配下の登録をすべて索引から外す（IO-5）。
@@ -476,6 +486,16 @@ struct Extractor<'a> {
 
 pub(crate) fn err(code: OciErrorCode, msg: &'static str) -> OciError {
     OciError::new(code, msg)
+}
+
+/// `resolved` に `c` を足した、ルートからの相対パス。
+fn rel_path(resolved: &[OsString], c: &OsString) -> PathBuf {
+    let mut p = PathBuf::new();
+    for r in resolved {
+        p.push(r);
+    }
+    p.push(c);
+    p
 }
 
 fn order_dependent() -> OciError {
@@ -933,6 +953,7 @@ impl Extractor<'_> {
     /// ホストの任意パスへは出られない。`create` が真なら存在しないディレクトリを作る。
     /// 戻り値はルートからの物理コンポーネント列と、そのディレクトリの `NameIndex` の ID。
     fn resolve_dir(&mut self, rel: &[OsString], create: bool) -> Result<ResolvedDir, OciError> {
+        self.names.last_nondir = None;
         let mut resolved: Vec<OsString> = Vec::new();
         // `resolved` の各コンポーネントの ID（同じ長さを保つ）。
         let mut ids: Vec<u64> = Vec::new();
@@ -991,15 +1012,17 @@ impl Extractor<'_> {
                     }
                 }
                 Some(_) => {
+                    self.names.last_nondir = Some(rel_path(&resolved, &c));
                     return Err(err(
                         OciErrorCode::FailedPrecondition,
                         "a parent path component is not a directory",
                     ));
                 }
                 None => {
-                    // 同じレイヤーが whiteout 済みの symlink 名を親として辿る並びは、逆順と結果が
+                    // 同じレイヤーが whiteout 済みの symlink のパスを辿る並びは、逆順と結果が
                     // 変わるため、書き込み系・削除マーカー系のどちらでも拒否する（OCI-2）。
-                    if self.names.link_tombstones.contains(&(parent_id, c.clone())) {
+                    // 見るのは symlink そのもののパスだけで、それを含んでいた祖先の名前は対象にしない。
+                    if self.hits_link_tombstone(&resolved, &c, &queue) {
                         return Err(err(
                             OciErrorCode::InvalidArgument,
                             "entry path depends on the order of a symlink whiteout in the same layer",
@@ -1022,6 +1045,73 @@ impl Extractor<'_> {
             id: ids.last().copied().unwrap_or(ROOT_ID),
             comps: resolved,
         })
+    }
+
+    /// これから辿る残りのパス（`resolved` + `c` + `rest`）が、同じレイヤーで whiteout 済みの symlink のパスを
+    /// 通るなら真。`rest` に `..` があればそこから先は字句では判断できないため見ない。
+    fn hits_link_tombstone(
+        &self,
+        resolved: &[OsString],
+        c: &OsString,
+        rest: &VecDeque<OsString>,
+    ) -> bool {
+        if self.names.link_tombstones.is_empty() {
+            return false;
+        }
+        let mut p = rel_path(resolved, c);
+        if self.names.link_tombstones.contains(&p) {
+            return true;
+        }
+        for q in rest {
+            if q == ".." {
+                return false;
+            }
+            if q == "." {
+                continue;
+            }
+            p.push(q);
+            if self.names.link_tombstones.contains(&p) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 削除マーカーの親解決が「非ディレクトリ」で失敗したとき、判定をレイヤーの終端まで遅らせる。
+    /// 同じレイヤーが後からそのパスをディレクトリへ置換する並びと、結果が変わらないようにする（OCI-2）。
+    fn defer_nondir_marker(&mut self, e: OciError) -> Result<(), OciError> {
+        let Some(p) = self.names.last_nondir.take() else {
+            return Err(e);
+        };
+        let max = usize::try_from(self.names.limit).unwrap_or(usize::MAX);
+        if self.names.pending_nondir_markers.len() >= max {
+            return Err(err(
+                OciErrorCode::ResourceExhausted,
+                "too many deferred whiteout markers",
+            ));
+        }
+        self.names.pending_nondir_markers.push(p);
+        Ok(())
+    }
+
+    /// 遅らせた削除マーカーの親が、レイヤーの終端でもディレクトリでなければ `FailedPrecondition`。
+    /// 消えていれば（同じレイヤーの whiteout で削除済み）何もしない。
+    fn verify_deferred_markers(&mut self) -> Result<(), OciError> {
+        let pending = std::mem::take(&mut self.names.pending_nondir_markers);
+        for p in pending {
+            match fs::symlink_metadata(self.root.join(&p)) {
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => {
+                    return Err(err(
+                        OciErrorCode::FailedPrecondition,
+                        "a parent path component is not a directory",
+                    ));
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(map_fs_err(&e)),
+            }
+        }
+        Ok(())
     }
 
     /// 既存の非ディレクトリを除去する。ディレクトリなら `FailedPrecondition`。存在しなければ何もしない。
@@ -1224,6 +1314,9 @@ impl Extractor<'_> {
         let dir = match self.resolve_dir(parent, false) {
             Ok(d) => d,
             Err(e) if e.code() == OciErrorCode::NotFound => return Ok(()),
+            Err(e) if e.code() == OciErrorCode::FailedPrecondition => {
+                return self.defer_nondir_marker(e);
+            }
             Err(e) => return Err(e),
         };
         let path = join_resolved(self.root, &dir.comps, &target.to_os_string());
@@ -1238,55 +1331,66 @@ impl Extractor<'_> {
             }
             return Ok(());
         }
-        self.guard_untouched_removal(dir.id, target, &path, &meta, Some(id))?;
+        self.guard_untouched_removal(&path, &meta, Some(id))?;
         crate::whiteout::remove_tree_nofollow(&path)?;
         self.drop_deferred_subtree(&path);
         self.names.forget_tree(dir.id, target);
         Ok(())
     }
 
-    /// 現在のレイヤーが触っていない（下位由来の）実体 `name`（`parent_id` 直下・物理パス `path`）を木ごと
-    /// 削除する前の履歴検査と登録（OCI-2）。
+    /// 現在のレイヤーが触っていない（下位由来の）実体 `path` を木ごと削除する前の履歴検査と登録（OCI-2）。
     ///
     /// 対象が symlink、または配下に symlink を含むディレクトリのとき、(1) 現在のレイヤーが既に経路として通過した
-    /// symlink を消すなら並び順で結果が変わるため `InvalidArgument` で拒否し、(2) そうでなければ
-    /// `(parent_id, name)` を `link_tombstones` へ登録して、削除後にその名前を親として辿るエントリを拒否する。
-    /// 祖先の一括削除でも子孫の symlink の履歴を見落とさず、`a/lnk/.wh.x` と `.wh.a` の順序に依らず
-    /// 同じ結果（どちらも拒否）にそろえる。
+    /// symlink を消すなら並び順で結果が変わるため `InvalidArgument` で拒否し、(2) そうでなければ消える
+    /// symlink それぞれの物理パスを `link_tombstones` へ登録して、削除後にそのパスを辿るエントリを拒否する。
+    /// 登録するのは symlink のパスだけで、それを含んでいた祖先ディレクトリの名前は登録しない
+    /// （`.wh.a` の後の `a/new` は、逆順と同じく成功させる）。祖先の一括削除でも子孫の symlink の履歴を
+    /// 見落とさず、`a/lnk/.wh.x` と `.wh.a` の順序に依らず同じ結果（どちらも拒否）にそろえる。
     fn guard_untouched_removal(
         &mut self,
-        parent_id: u64,
-        name: &OsStr,
         path: &Path,
         meta: &fs::Metadata,
         id: Option<u64>,
     ) -> Result<(), OciError> {
-        let has_link = if meta.file_type().is_symlink() {
+        let mut links: Vec<PathBuf> = Vec::new();
+        if meta.file_type().is_symlink() {
             if id.is_some_and(|i| self.names.traversed_links.contains(&i)) {
                 return Err(order_dependent());
             }
-            true
+            links.push(path.to_path_buf());
         } else if meta.is_dir() {
-            self.scan_subtree_links(path, id, 0)?
-        } else {
-            false
-        };
-        if has_link {
-            self.names
-                .link_tombstones
-                .insert((parent_id, name.to_os_string()));
+            self.scan_subtree_links(path, id, 0, &mut links)?;
+        }
+        for l in links {
+            if u64::try_from(self.names.link_tombstones.len()).unwrap_or(u64::MAX)
+                >= self.names.limit
+            {
+                return Err(err(
+                    OciErrorCode::ResourceExhausted,
+                    "too many removed symbolic links in one layer",
+                ));
+            }
+            let rel = l.strip_prefix(self.root).map_err(|_| {
+                err(
+                    OciErrorCode::FailedPrecondition,
+                    "removed path is outside the extraction root",
+                )
+            })?;
+            self.names.link_tombstones.insert(rel.to_path_buf());
         }
         Ok(())
     }
 
-    /// `dir`（ID は分かれば `dir_id`）配下に symlink があるかを調べる読み取り専用の走査。通過履歴のある
-    /// symlink を見つけたら `InvalidArgument`。深さは `MAX_REMOVE_DEPTH`。
+    /// `dir`（ID は分かれば `dir_id`）配下の symlink の物理パスを `out` へ集める読み取り専用の走査。
+    /// 通過履歴のある symlink を見つけたら `InvalidArgument`。深さは `MAX_REMOVE_DEPTH`、件数は `NameIndex` の
+    /// 上限で頭打ちにする。
     fn scan_subtree_links(
         &self,
         dir: &Path,
         dir_id: Option<u64>,
         depth: usize,
-    ) -> Result<bool, OciError> {
+        out: &mut Vec<PathBuf>,
+    ) -> Result<(), OciError> {
         if depth >= crate::whiteout::MAX_REMOVE_DEPTH {
             return Err(err(
                 OciErrorCode::ResourceExhausted,
@@ -1295,7 +1399,6 @@ impl Extractor<'_> {
         }
         let meta = fs::symlink_metadata(dir).map_err(|e| map_fs_err(&e))?;
         crate::whiteout::make_dir_removable(dir, &meta)?;
-        let mut found = false;
         for entry in fs::read_dir(dir).map_err(|e| map_fs_err(&e))? {
             let entry = entry.map_err(|e| map_fs_err(&e))?;
             let name = entry.file_name();
@@ -1305,12 +1408,18 @@ impl Extractor<'_> {
                 if child_id.is_some_and(|i| self.names.traversed_links.contains(&i)) {
                     return Err(order_dependent());
                 }
-                found = true;
-            } else if m.is_dir() && self.scan_subtree_links(&entry.path(), child_id, depth + 1)? {
-                found = true;
+                if u64::try_from(out.len()).unwrap_or(u64::MAX) >= self.names.limit {
+                    return Err(err(
+                        OciErrorCode::ResourceExhausted,
+                        "too many removed symbolic links in one layer",
+                    ));
+                }
+                out.push(entry.path());
+            } else if m.is_dir() {
+                self.scan_subtree_links(&entry.path(), child_id, depth + 1, out)?;
             }
         }
-        Ok(found)
+        Ok(())
     }
 
     /// `path` 配下（`path` 自身を含む）の遅延ディレクトリ mode を取り除く。`BTreeMap` の範囲走査で、
@@ -1347,6 +1456,9 @@ impl Extractor<'_> {
         let dir = match self.resolve_dir(parent, false) {
             Ok(d) => d,
             Err(e) if e.code() == OciErrorCode::NotFound => return Ok(()),
+            Err(e) if e.code() == OciErrorCode::FailedPrecondition => {
+                return self.defer_nondir_marker(e);
+            }
             Err(e) => return Err(e),
         };
         let path = dir
@@ -1396,7 +1508,7 @@ impl Extractor<'_> {
                     // 下位由来の symlink は `remove_whiteout_target` と同じ履歴検査・登録を行い、
                     // opaque / 祖先 whiteout の前後で結果が変わらないようにする（OCI-2）。
                     let m = fs::symlink_metadata(&child).map_err(|e| map_fs_err(&e))?;
-                    self.guard_untouched_removal(dir_id, &name, &child, &m, found)?;
+                    self.guard_untouched_removal(&child, &m, found)?;
                     crate::whiteout::remove_tree_nofollow(&child)?;
                     self.drop_deferred_subtree(&child);
                     self.names.forget_tree(dir_id, &name);
@@ -1576,6 +1688,8 @@ fn extract_one_layer<R: Read>(
             }
         }
     }
+    // 親が非ディレクトリだった削除マーカーは、レイヤーの全エントリを見たあとで判定する（OCI-2）。
+    x.verify_deferred_markers()?;
     // 世代（現在のレイヤーが触ったエントリ）はレイヤーごとに閉じる。次のレイヤーの whiteout は
     // このレイヤーの実体を「下位レイヤー由来」として扱う。
     x.names.clear_touched();
@@ -3314,10 +3428,11 @@ mod tests {
         ex.remove_whiteout_target(&[], OsStr::new("nope")).unwrap();
         ex.remove_whiteout_target(&os(&["no", "dir"]), OsStr::new("x"))
             .unwrap();
-        let e = ex
-            .remove_whiteout_target(&os(&["f"]), OsStr::new("x"))
-            .unwrap_err();
-        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        // 親が通常ファイルのままレイヤーが終わるなら、終端で FailedPrecondition。
+        assert_eq!(
+            lay_err(&mut ex, &[wh("f/.wh.x")]),
+            OciErrorCode::FailedPrecondition
+        );
         assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"x");
     }
 
@@ -3475,8 +3590,11 @@ mod tests {
         let mut ex = ex_for(&sb, host_lstat);
         lay(&mut ex, &[file("f", 0o644, b"x")]);
         ex.clear_opaque_dir(&os(&["no", "dir"])).unwrap();
-        let e = ex.clear_opaque_dir(&os(&["f"])).unwrap_err();
-        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        // 親が通常ファイルのままレイヤーが終わるなら、終端で FailedPrecondition。
+        assert_eq!(
+            lay_err(&mut ex, &[wh("f/.wh..wh..opq")]),
+            OciErrorCode::FailedPrecondition
+        );
         assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"x");
     }
 
@@ -3941,5 +4059,56 @@ mod tests {
         lay(&mut ex, &entries);
         assert!(t.elapsed() < std::time::Duration::from_secs(20));
         assert_eq!(names_in(&sb.root.join("d")).len(), 3000);
+    }
+
+    /// OCI-2: 下位が通常ファイルの `d` を上位が `d/` で置換する並びは、削除マーカーが先でも後でも成功し、
+    /// 結果が同じ（空のディレクトリ `d`）になる。
+    #[test]
+    fn oci2_pipeline_marker_before_parent_type_change_is_order_independent() {
+        for marker in ["d/.wh.x", "d/.wh..wh..opq"] {
+            for entries in [
+                vec![wh(marker), dir("d/", 0o755)],
+                vec![dir("d/", 0o755), wh(marker)],
+            ] {
+                let sb = Sandbox::new();
+                let mut ex = ex_for(&sb, host_lstat);
+                lay(&mut ex, &[file("d", 0o644, b"f")]);
+                lay(&mut ex, &entries);
+                assert!(fs::symlink_metadata(sb.root.join("d")).unwrap().is_dir());
+                assert!(names_in(&sb.root.join("d")).is_empty(), "{marker}");
+            }
+        }
+        // 置換されないなら順序に依らず拒否する。
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(&mut ex, &[file("d", 0o644, b"f")]);
+        assert_eq!(
+            lay_err(&mut ex, &[wh("d/.wh.x")]),
+            OciErrorCode::FailedPrecondition
+        );
+    }
+
+    /// OCI-2: 配下に symlink を含む下位ディレクトリ `a` の whiteout の後でも前でも、同じレイヤーが `a/new` を
+    /// 作れる。結果は並び順に依らない。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_pipeline_recreating_ancestor_of_removed_symlink_is_order_independent() {
+        let lower = [
+            file("real/x", 0o644, b"x"),
+            dir("a", 0o755),
+            symlink("a/lnk", "../real"),
+        ];
+        for entries in [
+            vec![wh(".wh.a"), file("a/new", 0o644, b"n")],
+            vec![file("a/new", 0o644, b"n"), wh(".wh.a")],
+            vec![wh(".wh..wh..opq"), file("a/new", 0o644, b"n")],
+            vec![file("a/new", 0o644, b"n"), wh(".wh..wh..opq")],
+        ] {
+            let sb = Sandbox::new();
+            let mut ex = ex_for(&sb, host_lstat);
+            lay(&mut ex, &lower);
+            lay(&mut ex, &entries);
+            assert_eq!(names_in(&sb.root.join("a")), vec!["new".to_string()]);
+        }
     }
 }

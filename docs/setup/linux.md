@@ -6,7 +6,7 @@ fandhe-container の実行ファイル（CLI・supervisor・特権ランチャ�
 - タスク: TASK-171 追補（#1721）・#2068。`start` の解決規則は TASK-79 追補（#1718）、`setup` が表示する手順は #1722
 - 設計: [privilege-separation.md](../design/privilege-separation.md) の「インストールスクリプト」
 
-> 未検証の注記（REPAIR-3）: rootful の手順は `scripts/install-privileged-launcher.sh` の自己テスト（スタブのみ・root 不要）で確かめたもので、root での実機実行と検証は未実施である（#538・#539）。rootless の手順は CLI の結合試験（symlink 経由の `start`）に基づくが、実機での手順全体の通し確認は未実施である。core の本番 launcher（#1715 の Phase B）が入るまで、`start` は supervisor の `UNIMPLEMENTED`（終了コード 8）で終わる。
+> 未検証の注記（REPAIR-3）: rootful の手順は `scripts/install-privileged-launcher.sh` の自己テスト（スタブのみ・root 不要）で確かめたもので、root での実機実行と検証は未実施である（#538・#539）。rootless の手順は CLI の結合試験（symlink 経由の `start`）に基づくが、実機での手順全体の通し確認は未実施である。rootless の `start` は supervisor が core の本番 launcher で起動するが（#1819）、委譲 cgroup の準備を含む実機での確認は未実施である（#2062）。rootful の `start` は CLI からランチャーを選ぶ規則が未実装のため `UNIMPLEMENTED`（終了コード 8）で終わる（#1719・#1722）。
 
 ## 配置の規則
 

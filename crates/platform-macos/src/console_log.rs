@@ -875,6 +875,42 @@ mod tests {
         assert_eq!(std::fs::read(&t.0).unwrap(), b"one\n");
     }
 
+    /// MAC-1・REPAIR-4・REPAIR-12・#2138: 別の open file description が持つ lock が猶予内に解放されれば
+    /// `try_lock_with_grace` は成功する（fork 直後の fd 複製などによる一時的な競合の再現）。
+    #[test]
+    fn try_lock_with_grace_succeeds_when_released_within_grace() {
+        let t = TempFile::new("grace-ok", b"");
+        let holder = t.append_handle();
+        holder.try_lock().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(holder);
+        });
+        let waiter = t.append_handle();
+        assert!(matches!(try_lock_with_grace(&waiter), Ok(())));
+        releaser.join().unwrap();
+    }
+
+    /// MAC-1・REPAIR-4・REPAIR-5・REPAIR-12・#2138: 保持され続ける lock は猶予ぶん待ってから `WouldBlock`
+    /// を返す。下限（猶予を待ったこと）と上限（有限時間で返ること）の両方を確かめる。
+    #[test]
+    fn try_lock_with_grace_would_block_after_bounded_wait() {
+        let t = TempFile::new("grace-held", b"");
+        let holder = t.append_handle();
+        holder.try_lock().unwrap();
+        let waiter = t.append_handle();
+        let started = std::time::Instant::now();
+        let result = try_lock_with_grace(&waiter);
+        let elapsed = started.elapsed();
+        assert!(matches!(result, Err(std::fs::TryLockError::WouldBlock)));
+        assert!(elapsed >= LOCK_GRACE, "returned too early: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must stay bounded: {elapsed:?}"
+        );
+        drop(holder);
+    }
+
     /// MAC-1・TASK-64.3: 既に上限に達したファイルへは追記しない（再起動の繰り返しでも総量が増えない）。
     #[test]
     fn sink_does_not_grow_full_file() {

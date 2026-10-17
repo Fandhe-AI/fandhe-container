@@ -5009,6 +5009,54 @@ broken line
         assert!(!lock_path.exists());
     }
 
+    /// MAC-1・REPAIR-4・REPAIR-12・#2138: 排他用ファイルが猶予内に解放される一時的な競合の後でも、公開 API
+    /// の回転つき open と削除は正しく完了する。保持され続ける場合は有限時間で `ConsoleLogInUse` になる。
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_lock_transient_contention_resolves_within_grace() {
+        let release_later = |log: &ConsoleLogPath| {
+            let held = log.acquire_lifecycle_lock(&[]).unwrap();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                drop(held);
+            })
+        };
+        let t = TempDir::new("rot-transient");
+        let (spec, path, _k, _i) = rotation_spec(&t);
+        let log = ConsoleLogPath::try_new(&path).unwrap();
+        put(&path, b"cur\n");
+
+        // 回転つき open: 50ms 後に解放される lock を待って回転し、新しいログへ書ける。
+        let releaser = release_later(&log);
+        boot_once(&spec, b"next\n");
+        releaser.join().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"next\n");
+        assert_eq!(std::fs::read(gen_path(&path, 1)).unwrap(), b"cur\n");
+
+        // 削除: 同様に待ってから現在のログ・世代・排他用ファイルをすべて消す。
+        let releaser = release_later(&log);
+        assert_eq!(spec.remove_console_logs().unwrap().removed, 2);
+        releaser.join().unwrap();
+        assert!(!path.exists());
+        assert!(!gen_path(&path, 1).exists());
+        assert!(!log.lock_path().exists());
+
+        // 保持され続ける場合は、猶予を待ってから有限時間で拒否する。
+        let held = log.acquire_lifecycle_lock(&[]).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            spec.remove_console_logs().unwrap_err().code(),
+            "config.console_log_in_use"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "{elapsed:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+        drop(held);
+    }
+
     /// MAC-1・REPAIR-4・#2138: 検査後に FIFO を置かれても世代・排他用ファイルの open が待たない（DoS 対策）。
     #[cfg(unix)]
     #[test]

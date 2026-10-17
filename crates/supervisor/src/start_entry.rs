@@ -6,7 +6,8 @@
 //! （Created → Running の予約と記録）を呼ぶ層は CLI から本入口へ移った。
 //!
 //! # 処理順（[`run_start`] と [`run_supervised`]）
-//! 0a. 継承 fd（fd 3 以降）を閉じる（ランチャーと同じ処理。結果チャネルの複製より前。#2070）／
+//! 0a. 継承 fd（fd 3 以降）を閉じ、fd 0〜2 が開いていることを確かめる（ランチャーと同じ処理。結果チャネルの複製より前。
+//!    #2070・#2132。fd 0〜2 は Rust std が `main` より前に `/dev/null` で埋めるため、実 bin では確認が通る多層防御の backstop）／
 //! 0. 結果チャネルの検証（stdout が FIFO か。`run_main`）／1. argv の解析（[`crate::start_contract::StartArgs`]）／
 //! 2. スレッド数が 1 か（`oci_runtime::start` の前提。以後のスレッドは手順 3〜7 の作業スレッド〔入口は待つだけ〕と
 //!    手順 10 以降のログ捕捉・restart のワーカーと、制御チャネルの accept スレッド〔`control`。#2058〕に限る）／
@@ -1650,6 +1651,21 @@ mod linux {
     use crate::privilege::{MAX_STATUS_BYTES, parse_proc_status};
     use crate::start_contract::StartArgs;
 
+    /// fd 0〜2 がすべて開いているか（SEC-1・SUP-14・SUP-1・#2132）。
+    ///
+    /// 閉じていると後続の open が fd 0〜2 に割り当たり、結果チャネルの乗っ取りやログの状態ファイルへの混入を招く。
+    /// `is_open` は `crate::sys::fd_is_open` を渡す（試験では偽の述語）。特権ランチャーと同じ文言で拒否する。
+    fn check_stdio_open(is_open: impl Fn(i32) -> bool) -> Result<(), TraitError> {
+        if (0..3).all(is_open) {
+            Ok(())
+        } else {
+            Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "stdin, stdout and stderr must be open",
+            ))
+        }
+    }
+
     /// 結果チャネルの書き込みの期限（読み手が読まず pipe が満杯でも監視へ進むため。REPAIR-5）。
     const REPORT_WRITE_DEADLINE: Duration = Duration::from_secs(5);
     /// stderr への報告 1 行（結果チャネルが使えないとき）と、終了前のログの書き出しを待つ期限（REPAIR-5）。
@@ -2014,6 +2030,18 @@ mod linux {
         // （F_DUPFD_CLOEXEC で 3 以上の fd を作る）より前でなければ結果チャネルを壊すため、最初の文に置く。
         // 失敗しても結果チャネルは試み、開けたら INTERNAL を報告して起動へ進まない（fail-closed）。
         let close_result = crate::sys::close_fds_from(crate::start_contract::FIRST_INHERITED_FD);
+        // 0a の続き: fd 0〜2 が閉じていれば結果チャネルを信用できないため、使わず stderr（開いていれば）の JSON だけで終わる
+        // （SEC-1・SUP-14・#2132）。Rust std は Linux で `main` の前に閉じた fd 0〜2 を `/dev/null` で埋めるので、実 bin では
+        // 通常ここへ届かない（std の初期化を通らない入口からの呼び出しへの backstop）。埋められた fd 1 は
+        // `open_result_channel` の FIFO 検査が拒否する。
+        if let Err(e) = check_stdio_open(crate::sys::fd_is_open) {
+            let err = op_err(e);
+            let mut line = Vec::new();
+            if err.write_json_line(&mut line).is_ok() {
+                let _ = crate::stderr_sink::stderr().emit_and_wait(line, STDERR_DEADLINE);
+            }
+            return ExitCode::from(err.exit_code().get());
+        }
         // 0: 結果チャネル。不正なら報告できないので stderr に固定スキーマの JSON を出して終わる。
         let mut out = match open_result_channel() {
             Ok(f) => BoundedWriter::new(f, REPORT_WRITE_DEADLINE),
@@ -2138,6 +2166,17 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// SEC-1・SUP-1・#2132: fd 0〜2 のどれかが閉じていれば FAILED_PRECONDITION、すべて開いていれば通る。
+        #[test]
+        fn stdio_check_rejects_any_closed_standard_fd() {
+            assert!(check_stdio_open(|_| true).is_ok());
+            for closed in 0..3 {
+                let e = check_stdio_open(|fd| fd != closed).unwrap_err();
+                assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+                assert_eq!(e.message(), "stdin, stdout and stderr must be open");
+            }
+        }
         use fandhe_container_core::traits::{
             CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ListStateRequest,
             StateList,

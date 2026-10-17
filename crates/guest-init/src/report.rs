@@ -29,6 +29,8 @@ impl Errno {
     pub const EINVAL: Errno = Errno(22);
     /// `ENOTDIR`（mount point が実ディレクトリでない）。
     pub const ENOTDIR: Errno = Errno(20);
+    /// `EBUSY`（既に mount 済み。`/dev` の devtmpfs の検査に通らなかった場合の診断に使う）。
+    pub const EBUSY: Errno = Errno(16);
     /// `EIO`（errno を取得できない・範囲外の場合の固定値）。
     pub const EIO: Errno = Errno(5);
 
@@ -62,6 +64,8 @@ pub enum InitStage {
     Sys,
     /// `/proc/cmdline` の読み取り。
     Cmdline,
+    /// PID 1 の panic（panic hook が出す。原因は載せない）。
+    Panic,
 }
 
 impl InitStage {
@@ -71,6 +75,7 @@ impl InitStage {
             Self::Proc => "proc",
             Self::Sys => "sys",
             Self::Cmdline => "cmdline",
+            Self::Panic => "panic",
         }
     }
 }
@@ -316,5 +321,17 @@ mod tests {
         assert_eq!(diag.as_str(), "fandhe-guest: init error stage=proc errno=1");
         assert!(!diag.as_str().starts_with(REPORT_PREFIX));
         assert!(!ReportLine::ready().as_str().starts_with(REPORT_PREFIX));
+    }
+
+    /// MAC-1・#2139: panic と EBUSY の診断行は固定の語彙で、報告行の接頭辞と重ならない。
+    #[test]
+    fn mac1_panic_and_busy_diagnostics_are_exact() {
+        let p = ReportLine::init_error(InitStage::Panic, Errno::EIO);
+        assert_eq!(p.as_str(), "fandhe-guest: init error stage=panic errno=5");
+        let b = ReportLine::init_error(InitStage::Dev, Errno::EBUSY);
+        assert_eq!(b.as_str(), "fandhe-guest: init error stage=dev errno=16");
+        assert_eq!(Errno::EBUSY.get(), 16);
+        assert!(!p.as_str().starts_with(REPORT_PREFIX));
+        assert!(!b.as_str().starts_with(REPORT_PREFIX));
     }
 }

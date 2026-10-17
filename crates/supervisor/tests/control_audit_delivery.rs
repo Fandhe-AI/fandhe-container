@@ -252,9 +252,21 @@ mod linux {
             match child.try_wait().expect("try_wait") {
                 Some(s) => break s,
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("the other-uid client did not finish in time");
+                    let kill_result = child.kill();
+                    // 回収も有限期限までの try_wait で確認する（REPAIR-5）。
+                    let reap_deadline = Instant::now() + Duration::from_secs(5);
+                    let mut reaped = false;
+                    while Instant::now() < reap_deadline {
+                        if matches!(child.try_wait(), Ok(Some(_))) {
+                            reaped = true;
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    panic!(
+                        "the other-uid client did not finish in time (kill: {kill_result:?}, reaped: {reaped}; unreaped child pid {} if false)",
+                        child.id()
+                    );
                 }
                 None => std::thread::sleep(Duration::from_millis(50)),
             }

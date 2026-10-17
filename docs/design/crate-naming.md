@@ -102,7 +102,7 @@ PoC-13（plugin-boundary-mechanism）は、MCP 参照 plugin（Python 製、`fan
 - rlib には依存 crate のハッシュと feature の解決結果が入るため、core の依存の版・feature の変化には rlib も反応する。版は (2) の依存木と `=x.y.z` の完全固定でも押さえている
 - 切り替えると、bin を持つ fixture の追加、Windows の `.exe` 対応、`bench-regression` での CLI 全体の 2 回リンクが要る
 
-spec の PLUG-4・TASK-109 の「core バイナリ」は PoC-13 の `core-harness` bin を前提にした言い方で、この読み替えの spec 側への注記はオーナー確認待ちである（承認は未取得）。PLUG-3 のサイズ記録の対象は別判断で、本補足の範囲外。
+spec の PLUG-4・TASK-109 の「core バイナリ」は PoC-13 の `core-harness` bin を前提にした言い方で、この読み替えは 2026-10-17 のオーナー決定で spec 側にも注記した（PLUG-4・TASK-109・MS-3・REPAIR-1）。PLUG-3 のサイズ記録の対象は別判断で、本補足の範囲外。
 
 ### 決定 4: `fandhe-container-plugin-api` の改名
 

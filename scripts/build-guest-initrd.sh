@@ -73,7 +73,7 @@ pack_timeout=60
 max_init_bytes=67108864
 
 check_int() {
-    if ! [[ "$2" =~ ^[0-9]{1,5}$ ]] || [ "$2" -lt "$3" ] || [ "$2" -gt "$4" ]; then
+    if ! int_in_range "$2" "$3" "$4"; then
         err bad-argument "$1 must be an integer between $3 and $4"
         usage
         exit 2

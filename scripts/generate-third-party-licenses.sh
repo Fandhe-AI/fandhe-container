@@ -77,7 +77,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if ! [[ "$timeout_s" =~ ^[0-9]{1,4}$ ]] || [ "$timeout_s" -lt 1 ] || [ "$timeout_s" -gt 3600 ]; then
+if ! int_in_range "$timeout_s" 1 3600; then
     err bad-argument "--timeout must be an integer between 1 and 3600"
     exit 2
 fi

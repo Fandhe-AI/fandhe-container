@@ -156,6 +156,31 @@ check_rl badlimit0 125 0 2 ""
 check_rl badlimitabc 125 0 2 ""
 check_rl nodir 125 0 2 ""
 
+# int_in_range <値> <最小> <最大>: 戻り値 0 / 1 を具体値で照合する（数字だけ・9 桁以下・範囲内）。
+check_range() {
+  local name="$1" want="$2" value="$3" min="$4" max="$5" sh rc
+  for sh in "${shells[@]}"; do
+    rc=0
+    "${sh}" -c 'source "$1"; int_in_range "$2" "$3" "$4"' _ "${src_dir}/lib.sh" "${value}" "${min}" "${max}" >/dev/null 2>&1 || rc=$?
+    if [ "${rc}" = "${want}" ]; then
+      pass "int_in_range ${name} (${sh})"
+    else
+      fail "int_in_range ${name} (${sh}): want rc=${want}, got rc=${rc}"
+    fi
+  done
+}
+
+check_range one 0 1 1 10
+check_range max 0 10 1 10
+check_range zero 1 0 1 10
+check_range over 1 11 1 10
+check_range leading-zero 0 08 1 10
+check_range empty 1 "" 1 10
+check_range negative 1 -1 1 10
+check_range alpha 1 1a 1 10
+check_range ten-digits 1 1234567890 1 99999999999
+check_range nine-digits 0 123456789 1 999999999
+
 for sh in "${shells[@]}"; do
   # shellcheck disable=SC2016 # BASH_VERSION は子の bash 側で展開させる
   echo "shell: ${sh} ($("${sh}" -c 'echo "${BASH_VERSION}"'))"

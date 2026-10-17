@@ -62,11 +62,20 @@ skip_unless_workspace() {
   fi
 }
 
+# int_in_range <値> <最小> <最大>: 値が「数字だけ・符号なし・9 桁以下」の整数で、最小〜最大に収まれば 0、それ以外は 1 を返す。
+# 何も出力せず exit もしない純関数（bash 3.2 でも動く。`[[ =~ ]]` は使わない）。数値引数の構文と範囲判定の共通部で、
+# validate_timeout・run_limited と guest/kernel/build.sh・scripts/build-guest-initrd.sh・
+# scripts/generate-third-party-licenses.sh の数値オプション検査が使う（REPAIR-1・REPAIR-5）。範囲はオプションごとの意味で
+# 異なるため揃えない。終了コードの整理: 引数エラーは呼び出し側が exit 2、run_limited の呼び出し誤りは 125（内部の誤用）。
+int_in_range() {
+  case "$1" in '' | *[!0-9]* | ??????????*) return 1 ;; esac
+  [ "$1" -ge "$2" ] && [ "$1" -le "$3" ]
+}
+
 # validate_timeout <NAME> <value>: 1〜999999 の整数でなければ exit 2 する（0 は `timeout` を無効にするため拒否）。
 validate_timeout() {
   local name="$1" t="$2"
-  case "$t" in '' | *[!0-9]* | ???????*) t=invalid ;; esac
-  if [ "$t" = invalid ] || [ "$t" -eq 0 ]; then
+  if ! int_in_range "$t" 1 999999; then
     echo "error: invalid-argument: ${name} must be an integer from 1 to 999999 (seconds)" >&2
     exit 2
   fi
@@ -276,8 +285,7 @@ _run_limited_wd_pid=""
 run_limited() {
   local limit="$1"
   shift
-  case "${limit}" in '' | *[!0-9]* | ???????*) limit=invalid ;; esac
-  if [ "${limit}" = invalid ] || [ "${limit}" -eq 0 ]; then
+  if ! int_in_range "${limit}" 1 999999; then
     echo "error: run-limited: limit must be an integer from 1 to 999999 (seconds)" >&2
     return 125
   fi

@@ -75,7 +75,9 @@
 //!
 //! **伝播**: 明示の private 化はしない。`MountIsolation::establish` が `/` を `MS_REC|MS_PRIVATE` にしており、この
 //! namespace のマウントは shared でも slave でもない。shared でも slave でもないマウントの複製はやはりそうなる。付け替え先は
-//! 手順 4 で非 shared と確認済みで、手順 9 が `shared:`・`master:` の不在を確かめる。
+//! 手順 4 で非 shared と確認済みで、手順 9 が `shared:`・`master:` の不在を確かめる。`establish` の private 化は計画の
+//! namespace 集合に依らず無条件で、`mount_binds` は `&MountIsolation`（`establish` の証跡）を引数に取るため、型の上で
+//! `establish` の後にしか呼べない。`isolate*` 側の private 化は `Mount` を含む計画のときだけ走り、本段の前提はそれに依存しない（#2131）。
 //!
 //! 切り離したマウントへの伝播変更は、カーネルのソースで許されると確認済み（#2064・SEC-1。`mount_setattr(2)` の man page
 //! 〔man-pages 6.17〕は可否を明記せず、決め手はソース）。`mount_setattr_commit` はマウントごとに `change_mnt_propagation` を呼び、
@@ -117,6 +119,11 @@
 //! `(dev, ino)` と一致するときだけ消す（自分専用の隔離ディレクトリへ `renameat2(RENAME_NOREPLACE)` してから照合して消し、照合と削除の間の
 //! 差し替えを防ぐ）。後始末の失敗（umount・開き直し・照合不一致・削除）は元のエラーの message に `; cleanup failed: ...` として併記する
 //! （REPAIR-4）。呼び出し後もプロセスは破棄する（`pivot_root`・exec へ進まない）。
+//!
+//! 隔離ディレクトリの 0700・実効 uid 所有の照合が排除するのは別の uid のプロセスだけである。同じ実効 uid のプロセス
+//! （または `CAP_DAC_OVERRIDE` を持つプロセス）は隔離ディレクトリに入れ、差し替えもできるため、同じ uid のプロセスは隔離
+//! しない。これは残余として受け入れている（同じ uid のプロセスはランチャー自体を ptrace・kill でき、脅威モデルの外にある。
+//! SEC-1・#2131）。以降の「他者」「他者は入れない」は、別の uid のプロセスを指す。
 //!
 //! # 未対応・残余（REPAIR-3: 実装済みを装わない）
 //!
@@ -1472,7 +1479,7 @@ static QUARANTINE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 /// 隔離ディレクトリの中での、移した実体の名前。
 const QUARANTINED: &str = "victim";
 
-/// 隔離ディレクトリの権限（所有者のみ）。
+/// 隔離ディレクトリの権限（所有者のみ。排除するのは別の uid のプロセスだけで、同じ uid は隔離しない。モジュール doc 参照）。
 const QUARANTINE_MODE: u32 = 0o700;
 
 /// `parent` 配下の `name` を、記録した `(dev, ino)` と一致する実体のときだけ消す（検証対象と削除対象を一致させる）。
@@ -1480,7 +1487,7 @@ const QUARANTINE_MODE: u32 = 0o700;
 /// 名前のまま照合して `unlinkat` すると、照合と削除の間に別プロセスが同名の別実体へ差し替えられる。同じ親の中に
 /// 隔離名で改名するだけでも、その隔離名が他者から見えて書けるため差し替えられる。そこで
 /// (1) `parent` の中に自分専用（0700・実効 uid 所有）の隔離ディレクトリを作って fd で固定し、
-/// (2) `RENAME_NOREPLACE` の `renameat2` で対象をその中へ原子的に移し（他者はそこへ入れない）、
+/// (2) `RENAME_NOREPLACE` の `renameat2` で対象をその中へ原子的に移し（別の uid のプロセスはそこへ入れない。同じ uid は隔離しない。モジュール doc 参照）、
 /// (3) 移した実体を開いて `(dev, ino)` を照合し、(4) 一致したときだけ消す。不一致・削除失敗のときは元の名前へ
 /// `RENAME_NOREPLACE` で戻す。戻し先に別の実体が作られていれば上書きせず、実体を隔離ディレクトリに残して
 /// 失敗として報告する。マウントが残っている要素は改名が `EBUSY` で拒否されるため、umount に失敗した場合も消さない。
@@ -1600,7 +1607,7 @@ type CreateProven = Result<Option<(OwnedFd, (u64, u64), Option<String>)>, (&'sta
 ///
 /// `mkdirat` してから名前で開き直すと、その間に別プロセスが改名して別の同名ディレクトリを置ける。そこで
 /// (1) `parent` の中に自分専用（0700・実効 uid 所有）のステージングディレクトリを作って fd で固定し、
-/// (2) その中（他者は入れない）に `mkdirat` して fd を開き直し `(dev, ino)` を取り、
+/// (2) その中（別の uid のプロセスは入れない。同じ uid は隔離しない。モジュール doc 参照）に `mkdirat` して fd を開き直し `(dev, ino)` を取り、
 /// (3) `RENAME_NOREPLACE` の `renameat2` で `name` へ原子的に移す（inode は変わらない）。
 /// 記録する実体は常に自分が作ったものになる。ステージングディレクトリは成否に関わらず空にして消し、
 /// 削除の失敗はエラーに併記する（SEC-1・REPAIR-4）。

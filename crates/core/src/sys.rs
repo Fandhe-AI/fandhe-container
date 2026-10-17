@@ -1246,7 +1246,7 @@ unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int unlinkat(int dirfd, const char *path, int flags)`。
     fn unlinkat(dirfd: i32, path: *const core::ffi::c_char, flags: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int renameat2(int olddirfd, const char *oldpath, int newdirfd,
-    // const char *newpath, unsigned int flags)`（glibc 2.28 以降・musl）。
+    // const char *newpath, unsigned int flags)`（glibc 2.28 以降・musl 1.2.6 以降。出典: musl `WHATSNEW`）。
     fn renameat2(
         olddirfd: i32,
         oldpath: *const core::ffi::c_char,
@@ -2350,7 +2350,11 @@ const fn open_tree_bind_flags(scope: MountTreeScope) -> u32 {
 /// shared なら複製は同じ peer group に入り、その後の接続・解除が peer（ホスト側）へ伝播しうる。本関数も
 /// `bind_mount_attr`（`propagation` = 0）も伝播を変えない。安全は、`MountIsolation::establish`（`crate::exec`）が
 /// `unshare(CLONE_NEWNS)` の直後に `mount_root_private_recursive`（`/` を `MS_REC|MS_PRIVATE`）を呼ぶことに
-/// 依存する（通常の経路と rootless の経路の両方）。これを外す・順序を入れ替える改修は前提を壊す。呼び出し側
+/// 依存する。`establish` の private 化は計画の namespace 集合に依らず無条件で、`mount_binds` は
+/// `&MountIsolation`（`establish` の証跡）を引数に取るため、型の上で `establish` の後にしか呼べない。
+/// `isolate`・`isolate_rootful_host_root`・`isolate_rootless_subordinate` 側の private 化は `Mount` を含む計画の
+/// ときだけ走り、bind mount の前提はそちらに依存しない。`establish` の private 化を外す・順序を入れ替える
+/// 改修は前提を壊す。呼び出し側
 /// （#1913 の適用段）は、付け替え先が shared でないことと付け替え後の mountinfo を照合して確かめている。
 ///
 /// 想定する呼び出し順（#1913）: `verify_bind_source_fd` → 本関数 → [`set_bind_mount_attrs`]（切り離した状態で属性を設定し、
@@ -3499,36 +3503,43 @@ pub(crate) fn open_path_nofollow(parent: BorrowedFd<'_>, name: &CStr) -> Result<
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// `parent` 配下に 1 要素のディレクトリ `name` を `mkdirat(2)` で作る（cgroup v2 ではこれが子 cgroup
-/// の作成になる。`crate::cgroups`・CORE-3・TASK-32.1）。既存なら `EEXIST`、権限不足は `EACCES`/`EPERM`。
-/// `name` は呼び出し側が 1 要素（`/` を含まない）に検証済みの前提。
+/// `parent` 配下に 1 要素のディレクトリ `name` を `mkdirat(2)` で作る（cgroup v2 の子 cgroup の作成
+/// （`crate::cgroups`・CORE-3・TASK-32.1）のほか、bind mount の隔離・ステージング、tmpfs のマウント先、
+/// `/dev`・`/dev/pts` の作成に使う）。既存なら `EEXIST`、権限不足は `EACCES`/`EPERM`。`name` が 1 要素
+/// （空・`/` を含む・`.`・`..` のいずれでもない）であることは本関数が検証し、違反は syscall を発行せず
+/// `EINVAL`（SEC-1・#2131）。
 pub(crate) fn mkdir_at(parent: BorrowedFd<'_>, name: &CStr, mode: u32) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    // SAFETY: `name` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存する。`parent` は生存中の
-    // `BorrowedFd`。副作用は `parent` 配下へのディレクトリ作成のみで、ポインタは保持されない。
+    ensure_single_component(name)?;
+    // SAFETY: `name` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存し、上で 1 要素と検証済み（`parent` 直下の
+    // 1 エントリだけが対象になり、中間要素の symlink は辿られない）。`parent` は生存中の `BorrowedFd`。
+    // 副作用は `parent` 配下へのディレクトリ作成のみで、ポインタは保持されない。
     let rc = unsafe { mkdirat(parent.as_raw_fd(), name.as_ptr(), mode & 0o7777) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
 /// `parent` 配下の `name` を `unlinkat(2)` の `AT_REMOVEDIR` で削除する（空の cgroup のみ消せる。
 /// 子・プロセスが残っていれば `EBUSY`）。最終要素の symlink は辿らない（`AT_REMOVEDIR` は
-/// ディレクトリ以外を `ENOTDIR` で拒否する）。
+/// ディレクトリ以外を `ENOTDIR` で拒否する）。`name` が 1 要素（空・`/` を含む・`.`・`..` のいずれでもない）
+/// であることは本関数が検証し、違反は syscall を発行せず `EINVAL`（SEC-1・#2131）。
 pub(crate) fn remove_dir_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    // SAFETY: `name` は NUL 終端の借用で呼び出しの間生存する。`parent` は生存中の `BorrowedFd`。
+    ensure_single_component(name)?;
+    // SAFETY: `name` は NUL 終端の借用で呼び出しの間生存し、上で 1 要素と検証済み（`parent` 直下の 1 エントリだけが
+    // 対象になり、中間要素の symlink は辿られない）。`parent` は生存中の `BorrowedFd`。
     // 副作用は `parent` 配下の空ディレクトリ 1 件の削除のみ。
     let rc = unsafe { unlinkat(parent.as_raw_fd(), name.as_ptr(), consts::AT_REMOVEDIR) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
-/// `unlinkat(2)`・`renameat2(2)` に渡す名前が dirfd 直下の 1 要素であることを確かめる（空・`/` を含む・`.`・`..`
+/// `mkdirat(2)`・`unlinkat(2)`（`AT_REMOVEDIR` を含む）・`renameat2(2)` に渡す名前が dirfd 直下の 1 要素であることを確かめる（空・`/` を含む・`.`・`..`
 /// は `EINVAL`）。これらの syscall は中間要素の symlink を辿るため、複数要素の名前を許すと dirfd（rootfs・隔離
 /// ディレクトリ）の外の実体を消す・動かす経路になる。呼び出し側の検証に頼らず `sys` の境界で塞ぐ
-/// （SEC-1・#2079。`remove_file_at`・`rename_noreplace_at` から呼ぶ）。`.hidden`・`..a` のような名前は通す。
+/// （SEC-1・#2079・#2131。`mkdir_at`・`remove_dir_at`・`remove_file_at`・`rename_noreplace_at` から呼ぶ）。`.hidden`・`..a` のような名前は通す。
 fn ensure_single_component(name: &CStr) -> Result<(), SysError> {
     let b = name.to_bytes();
     if b.is_empty() || b.contains(&b'/') || b == b"." || b == b".." {
@@ -3571,10 +3582,19 @@ pub(crate) fn remove_file_at(parent: BorrowedFd<'_>, name: &CStr) -> Result<(), 
 /// ステージングを片付けたうえで `rename` の失敗を報告する。`renameat2` を持たないカーネル（3.15 未満）の
 /// `ENOSYS` は `SysError::Os(ENOSYS)` のまま返る。
 ///
+/// (a)・(b) を別のエラーに分けない理由（#2131）: (a) は呼び出し側のプログラミングの誤りで、syscall 前に拒否され
+/// 単体テストで固定される（本番の呼び出し元は生成した名前・検証済みの名前しか渡さない）。(b) は環境の要因で、
+/// 上の 2 つの呼び出し側はどちらの原因でも同じく fail-closed に倒し、`EINVAL` では分岐しない（分岐するのは
+/// `ENOENT`・`EEXIST` だけ）。原因は errno のまま報告される。`SysError` は crate 全体で網羅 `match` されており、
+/// variant の追加は影響が広い。呼び出し側が原因ごとに扱いを変える必要が出た時点で追加する。
+///
 /// # リンクの前提
 ///
-/// `renameat2` は glibc 2.28 以降のシンボルで、それより古い glibc ではリンク時にシンボル未解決エラーになる
-/// （実行時の未定義動作ではない）。`extern` 宣言の `// SAFETY` コメントと同じ前提。
+/// `renameat2` は glibc 2.28 以降・musl 1.2.6 以降のシンボルで、それより古い libc ではリンク時にシンボル未解決
+/// エラーになる（実行時の未定義動作ではない）。`extern` 宣言の `// SAFETY` コメントと同じ前提。musl の版は
+/// musl の `WHATSNEW`（1.2.6 の新機能に「renameat2 interface」）と `src/linux/renameat2.c` を追加したコミット
+/// 05ce67fea99c（2024-05-23）で確認した。現状 musl ターゲットで本 crate をリンクする crate は無く、ビルドで検査
+/// された前提ではない。
 pub(crate) fn rename_noreplace_at(
     old_dir: BorrowedFd<'_>,
     old: &CStr,
@@ -5390,6 +5410,40 @@ mod tests {
         assert_eq!(PROC_MAGIC, 0x9fa0);
         assert_eq!(fs_type(proc_dir.as_fd()), Ok(PROC_MAGIC));
         assert_ne!(fs_type(proc_dir.as_fd()), Ok(CGROUP2_MAGIC));
+    }
+
+    /// SEC-1（#2131）: `mkdir_at`・`remove_dir_at` も複数要素・`.`・`..`・空の名前を syscall 前に `EINVAL` で拒否する。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec1_2131_dir_ops_reject_multi_component_names_without_syscall() {
+        use std::ffi::CString;
+        use std::os::fd::AsFd;
+        let tmp = crate::test_support::TestTempDir::new("sec1-2131").unwrap();
+        let base = tmp.path().to_path_buf();
+        std::fs::create_dir_all(base.join("sub/inner")).unwrap();
+        let dir = std::fs::File::open(&base).unwrap();
+        let fd = dir.as_fd();
+        let einval = Err(SysError::Os(EINVAL));
+        for bad in ["sub/x", ".", "..", "", "/abs"] {
+            let c = CString::new(bad).unwrap();
+            assert_eq!(mkdir_at(fd, &c, 0o700), einval, "mkdir_at({bad:?})");
+        }
+        assert!(!base.join("sub/x").exists());
+        for bad in ["sub/inner", ".", "..", ""] {
+            let c = CString::new(bad).unwrap();
+            assert_eq!(remove_dir_at(fd, &c), einval, "remove_dir_at({bad:?})");
+        }
+        assert!(base.join("sub/inner").is_dir());
+        for ok in ["child", ".hidden"] {
+            let c = CString::new(ok).unwrap();
+            assert_eq!(mkdir_at(fd, &c, 0o700), Ok(()), "mkdir_at({ok:?})");
+            assert!(base.join(ok).is_dir());
+            assert_eq!(remove_dir_at(fd, &c), Ok(()), "remove_dir_at({ok:?})");
+            assert!(!base.join(ok).exists());
+        }
     }
 
     /// CORE-3・TASK-32.1: `mkdir_at` / `remove_dir_at` / `open_*_at` の往復（一時ディレクトリ）。

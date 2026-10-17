@@ -51,8 +51,10 @@ make test                # テスト（lint・deny まで含めた一括検証�
 ```bash
 target/debug/fandhe-container --root /tmp/fc-state create --bundle <bundle> c1   # 状態を Created で記録
 target/debug/fandhe-container --root /tmp/fc-state start c1                      # rootless で前提を満たせば 0（出力なし）。満たさなければ構造化エラー
-target/debug/fandhe-container --root /tmp/fc-state list                          # 成功なら c1 は running、失敗なら created のまま
+target/debug/fandhe-container --root /tmp/fc-state list                          # 実際の状態はここで確かめる
 ```
+
+`start` の終了結果だけでコンテナの状態は決まりません。成功しても、すぐ終わるプロセスなら次の `list` では既に stopped になっていることがあります。CLI が supervisor の報告を待ち切れずにタイムアウトで失敗した場合も、supervisor は止めないので、コンテナが running になっていることがあります。状態は `list` で確かめてください。
 
 `make help` でターゲット一覧を表示します（Makefile は薄い入口で、実体は `scripts/` 配下のスクリプトです。Make を使わない場合は `scripts/help.sh` を参照。編集規約は [.claude/rules/makefile.md](./.claude/rules/makefile.md)）。コントリビュートの流れは [CONTRIBUTING.md](./CONTRIBUTING.md)、crate 境界は [docs/architecture.md](./docs/architecture.md)、ビルド・回帰確認コマンドは [AGENTS.md](./AGENTS.md) を参照してください。
 

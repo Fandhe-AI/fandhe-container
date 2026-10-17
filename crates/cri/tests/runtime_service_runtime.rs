@@ -396,6 +396,61 @@ async fn task_59_2_unexpected_runtime_state_is_internal() {
     );
 }
 
+/// REPAIR-5・fail-closed: 応答不明の失敗（Timeout・Unavailable・Internal）は exited にし、再 Start させない。
+#[tokio::test]
+async fn task_59_2_ambiguous_start_failure_marks_exited() {
+    for code in [
+        ErrorCode::Timeout,
+        ErrorCode::Unavailable,
+        ErrorCode::Internal,
+    ] {
+        let h = harness();
+        let sb = run_sandbox(&h.service).await;
+        let id = create(&h.service, &sb, "c").await.expect("create");
+        *h.runtime.fail_start.lock().unwrap() = Some(code);
+        start(&h.service, &id).await.expect_err("start");
+        assert_eq!(
+            status(&h.service, &id).await.state,
+            S::ContainerExited as i32
+        );
+        *h.runtime.fail_start.lock().unwrap() = None;
+        let err = start(&h.service, &id).await.expect_err("restart");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        let starts = h
+            .runtime
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("start "))
+            .count();
+        assert_eq!(starts, 1);
+    }
+}
+
+/// Start の実行中に StopPodSandbox が入っても、停止済みサンドボックス配下で running を確定しない。
+#[tokio::test]
+async fn task_59_2_stop_sandbox_during_start_does_not_commit_running() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    h.runtime.hold_start.store(true, Ordering::SeqCst);
+    let (first, ()) = tokio::join!(start(&h.service, &id), async {
+        RuntimeService::stop_pod_sandbox(
+            &h.service,
+            Request::new(v1::StopPodSandboxRequest {
+                pod_sandbox_id: sb.clone(),
+            }),
+        )
+        .await
+        .expect("stop sandbox");
+        h.runtime.hold_start.store(false, Ordering::SeqCst);
+    });
+    assert_eq!(first.expect_err("start").code(), Code::FailedPrecondition);
+    assert_eq!(
+        status(&h.service, &id).await.state,
+        S::ContainerExited as i32
+    );
+}
+
 /// 並行する Start は一方だけが実行層へ到達し、他方は FAILED_PRECONDITION。実行中の Remove も拒否する。
 #[tokio::test]
 async fn task_59_2_concurrent_start_reaches_runtime_once() {
@@ -466,7 +521,7 @@ async fn task_59_2_outcomes_are_recorded() {
     *h.runtime.fail_start.lock().unwrap() = Some(ErrorCode::Timeout);
     let _ = start(&h.service, &id).await;
     *h.runtime.fail_start.lock().unwrap() = None;
-    start(&h.service, &id).await.expect("start");
+    let _ = start(&h.service, &id).await;
     let lines: Vec<_> = h
         .recorder
         .0
@@ -479,7 +534,8 @@ async fn task_59_2_outcomes_are_recorded() {
     assert_eq!(lines.len(), 3, "{lines:?}");
     assert_eq!(lines[0].1, "OK");
     assert_eq!(lines[1].1, "DEADLINE_EXCEEDED");
-    assert_eq!(lines[2].1, "OK");
+    // タイムアウトは結果不明のため exited になり、再 Start は拒否される。
+    assert_eq!(lines[2].1, "FAILED_PRECONDITION");
 }
 
 /// 未注入の `CriRuntimeService::new()` は従来どおりスタブ動作で、実行層を持たない。

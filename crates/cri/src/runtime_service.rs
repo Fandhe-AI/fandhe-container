@@ -263,6 +263,23 @@ enum InFlightKind {
     Start,
 }
 
+/// `ContainerRuntime::start` のエラーコードのうち「起動していない」と確定できるものか（REPAIR-5）。
+///
+/// 入力・状態・権限の拒否は実行層が処理前に弾いた確定失敗。`DeadlineExceeded`・`Unavailable`・
+/// `Internal` 等は応答不明で実行層が running の可能性があり、再 Start の二重起動を避けるため含めない。
+fn is_definite_start_failure(code: tonic::Code) -> bool {
+    use tonic::Code;
+    matches!(
+        code,
+        Code::InvalidArgument
+            | Code::NotFound
+            | Code::AlreadyExists
+            | Code::FailedPrecondition
+            | Code::Unimplemented
+            | Code::PermissionDenied
+    )
+}
+
 /// 実行層の呼び出し中に立てた `in_flight` を、確定されないまま破棄されたら巻き戻す番人（TASK-59.2）。
 ///
 /// 失敗（`?`）・panic・クライアント中断による future の破棄のどれでも `Drop` で巻き戻すため、
@@ -776,7 +793,11 @@ impl CriRuntimeService {
         let status = match result {
             Ok(status) => status,
             Err(status) => {
-                guard.mark_definitely_failed();
+                // 確定失敗のコードに限り created へ戻す。タイムアウト・Unavailable・Internal 等は
+                // 実行層が起動済みの可能性があるため、unknown のまま破棄して exited にする（fail-closed）。
+                if is_definite_start_failure(status.code()) {
+                    guard.mark_definitely_failed();
+                }
                 return Err(status);
             }
         };
@@ -796,6 +817,18 @@ impl CriRuntimeService {
             .registry
             .lock()
             .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+        // Start の実行中に StopPodSandbox が入った場合、親が Ready でなければ running を確定しない。
+        // Err を返すと guard の Drop が（結果不明として）exited へ倒す。
+        if kind == InFlightKind::Start {
+            let parent_ready = registry
+                .containers
+                .get(id)
+                .and_then(|c| registry.records.get(&c.pod_sandbox_id))
+                .is_some_and(|s| s.state == SandboxState::Ready);
+            if !parent_ready {
+                return Err(Status::failed_precondition("sandbox is not ready"));
+            }
+        }
         let record = registry
             .containers
             .get_mut(id)
@@ -930,6 +963,9 @@ impl CriRuntimeService {
     }
 
     /// `ContainerStatus` の本体。読み取り専用（CRI-1・ERR-3・TASK-58.3・#435）。
+    ///
+    /// Create の実行層呼び出し中（`in_flight` の仮登録）も created として見える。実行層にはまだ
+    /// 存在しない可能性があり、`ListContainers` も同様（仕様。Remove は `FAILED_PRECONDITION`）。
     ///
     /// 空 ID は `INVALID_ARGUMENT`、未知 ID（Remove 済みを含む）は `NOT_FOUND`（文言に入力 ID を含めない）。
     /// `verbose` でも `info` は空のスタブ（REPAIR-3）。`envs` 等は応答に含めない。

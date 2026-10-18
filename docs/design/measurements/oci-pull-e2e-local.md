@@ -21,9 +21,10 @@ systemd-run --user --scope -p Delegate=yes <上で得た実行ファイル> --ig
   --image alpine \
   --image debian:bookworm-slim --cmd /bin/true \
   --image nginx:alpine --cmd /usr/sbin/nginx -v \
-  --image busybox --cmd /bin/true \
-  --image redis:alpine --cmd /usr/local/bin/redis-server --version
+  --image busybox --cmd /bin/true
 ```
+
+- `redis:alpine` は手順に含めない。image config の Entrypoint が相対パスの `docker-entrypoint.sh` で、`--cmd` を指定しても Entrypoint が残り `process.args[0]` が `/` で始まらないため、sysctl を緩和しても config 段で `INVALID_ARGUMENT` になる（所見参照）
 
 - cargo 経由で実行すると cargo が同じ cgroup に入り `prepare` が失敗するため、実行ファイルを直接起動する
 - `FANDHE_CONTAINER_TEST_TIMEOUT_SECS` で待ち時間の上限を変更できる
@@ -75,14 +76,14 @@ systemd-run --user --scope -p Delegate=yes <上で得た実行ファイル> --ig
 ## 所見
 
 - 展開時のデバイス・FIFO・hardlink 制限による失敗は出なかった（ハーネスでの回避なし）。debian の `stripped_special_bits: 11` は setuid / setgid / sticky を既定で落とした数（`docs/design/oci-layer-special-bits.md`）
-- `redis:alpine` は config 段で `INVALID_ARGUMENT`。この記録では `stderr_tail` に詳細が無く、原因は未調査（`--cmd` の指定か image config の Entrypoint / Cmd の算出に起因する可能性。要調査）。pull と verify は成功しているため、受け入れ条件の 3 種以上には既定の 3 種（alpine・debian・nginx:alpine）を用いる
+- `redis:alpine` は config 段で `INVALID_ARGUMENT`。原因はハーネスの `derive_process`（`crates/oci/tests/pull_e2e.rs`）のコード上の挙動から特定した。args を Entrypoint ++ cmd で組み立てるが、`redis:alpine` の Entrypoint は相対パスの `docker-entrypoint.sh` で `args[0]` が絶対パスにならず、`--cmd` で上書きしても Entrypoint は残る（実行での再現確認は未実施）。ハーネスの既知の制約（`process.args[0]` は絶対パスが必要）であり、PATH 解決は未対応。pull と verify は成功しているため、受け入れ条件の 3 種以上には既定の 3 種（alpine・debian・nginx:alpine）を用いる
 - 既知の制約（ハーネスの `//!` と同じ）: `User`・`WorkingDir` は無視、`diff_id` は未検証、レイヤーは gzip のみ
 
 ## 引き継ぎ（人間担当）
 
-受け入れ条件の「終了コード 0 の確認」は未達。次を人間が実機で行い、結果を本書へ追記する。#1621 でも同じ sysctl の緩和が要るため、同じ作業の中で実施するとよい。
+受け入れ条件の「終了コード 0 の確認」は未達で、#421 を open のまま維持して追跡する（人間担当の引き継ぎ Issue は別途起票しない。起票は承認が要るため）。次を人間が実機で行い、結果を本書へ追記する。#1621 でも同じ sysctl の緩和が要るため、同じ作業の中で実施するとよい。
 
 1. `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
 2. 上記「実行手順」のコマンドを実行する
-3. 結果の表の run 列と exit を本書へ追記する（`redis:alpine` の config 段の原因も調べる）
+3. 結果の表の run 列と exit を本書へ追記する（`redis:alpine` は Entrypoint が相対パスのため対象外。必要なら Entrypoint を持たない別イメージに差し替える）
 4. `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1` で元に戻す

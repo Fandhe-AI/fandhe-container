@@ -810,10 +810,24 @@ impl CriRuntimeService {
             .registry
             .lock()
             .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
-        let record = registry
-            .records
-            .get_mut(&req.pod_sandbox_id)
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        if !registry.records.contains_key(&req.pod_sandbox_id) {
+            return Err(Status::not_found("sandbox not found"));
+        }
+        // 実プロセスを持ちうる実行層のコンテナ（Start 実行中、または created 以外）を含む間は停止を拒否する
+        // （TASK-59.3 で実行層の stop を接続するまで。プロセスが生きたまま停止済みと返さない fail-closed。
+        // CRI-1・REPAIR-3。Remove 系と同じ code）。created のみ（プロセス無し）は従来どおり停止できる。
+        if registry.containers.values().any(|c| {
+            c.pod_sandbox_id == req.pod_sandbox_id
+                && c.runtime_leaked
+                && (c.in_flight || c.state != ContainerState::Created)
+        }) {
+            return Err(Status::failed_precondition(
+                "container resources are pending runtime cleanup",
+            ));
+        }
+        let Some(record) = registry.records.get_mut(&req.pod_sandbox_id) else {
+            return Err(Status::not_found("sandbox not found"));
+        };
         record.state = SandboxState::NotReady;
         // 配下の running コンテナを exited にする（TASK-58.2。created・停止済みは変えない）。
         for c in registry.containers.values_mut().filter(|c| {
@@ -1179,6 +1193,14 @@ impl CriRuntimeService {
             .containers
             .get_mut(&req.container_id)
             .ok_or_else(|| Status::not_found("container not found"))?;
+        // 実行層経由で作成したコンテナは、TASK-59.3 で実行層の stop を接続するまで停止を拒否する。
+        // 記録だけ Exited にすると実プロセスが生存したまま「停止済み」と返るため（CRI-1・REPAIR-3。
+        // fail-closed。Remove 系と同じ code）。実行層未接続の経路（`runtime_leaked` なし）は従来どおり。
+        if record.runtime_leaked {
+            return Err(Status::failed_precondition(
+                "container resources are pending runtime cleanup",
+            ));
+        }
         match record.state {
             ContainerState::Running => {
                 record.state = ContainerState::Exited;

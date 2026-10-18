@@ -478,28 +478,23 @@ async fn task_59_2_ambiguous_start_failure_marks_exited() {
     }
 }
 
-/// Start の実行中に StopPodSandbox が入っても、停止済みサンドボックス配下で running を確定しない。
+/// CRI-1・REPAIR-3: Start の実行中の StopPodSandbox は TASK-59.3(停止の接続)まで拒否し、Start は running を確定する。
 #[tokio::test]
-async fn task_59_2_stop_sandbox_during_start_does_not_commit_running() {
+async fn task_59_3_stop_sandbox_during_start_is_rejected() {
     let h = harness();
     let sb = run_sandbox(&h.service).await;
     let id = create(&h.service, &sb, "c").await.expect("create");
     h.runtime.hold_start.store(true, Ordering::SeqCst);
-    let (first, ()) = tokio::join!(start(&h.service, &id), async {
-        RuntimeService::stop_pod_sandbox(
-            &h.service,
-            Request::new(v1::StopPodSandboxRequest {
-                pod_sandbox_id: sb.clone(),
-            }),
-        )
-        .await
-        .expect("stop sandbox");
+    let (first, stop) = tokio::join!(start(&h.service, &id), async {
+        let r = stop_sb(&h.service, &sb).await;
         h.runtime.hold_start.store(false, Ordering::SeqCst);
+        r
     });
-    assert_eq!(first.expect_err("start").code(), Code::FailedPrecondition);
+    first.expect("start");
+    assert_eq!(stop.expect_err("stop").code(), Code::FailedPrecondition);
     assert_eq!(
         status(&h.service, &id).await.state,
-        S::ContainerExited as i32
+        S::ContainerRunning as i32
     );
 }
 
@@ -884,4 +879,76 @@ async fn task_59_2_hung_cleanup_delete_is_bounded() {
     };
     assert_eq!(status(&service, &id).await.state, S::ContainerExited as i32);
     h.runtime.hold_delete.store(false, Ordering::SeqCst);
+}
+
+async fn stop_c(service: &CriRuntimeService, id: &str) -> Result<(), Status> {
+    RuntimeService::stop_container(
+        service,
+        Request::new(v1::StopContainerRequest {
+            container_id: id.into(),
+            timeout: 0,
+        }),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn stop_sb(service: &CriRuntimeService, id: &str) -> Result<(), Status> {
+    RuntimeService::stop_pod_sandbox(
+        service,
+        Request::new(v1::StopPodSandboxRequest {
+            pod_sandbox_id: id.into(),
+        }),
+    )
+    .await
+    .map(|_| ())
+}
+
+/// CRI-1・REPAIR-3: 実行層経由のコンテナは、TASK-59.3(停止の接続)まで StopContainer を拒否する。
+/// 記録は Running のまま、実行層の stop 相当(stop・delete)も呼ばれない。
+#[tokio::test]
+async fn task_59_3_pending_stop_container_is_rejected_with_runtime() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    start(&h.service, &id).await.expect("start");
+    let err = stop_c(&h.service, &id).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status(&h.service, &id).await.state,
+        S::ContainerRunning as i32
+    );
+    assert_eq!(h.runtime.calls().len(), 2);
+}
+
+/// CRI-1・REPAIR-3: 実行層のコンテナを含む sandbox の StopPodSandbox も TASK-59.3 まで拒否する。
+#[tokio::test]
+async fn task_59_3_pending_stop_sandbox_is_rejected_with_runtime() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    start(&h.service, &id).await.expect("start");
+    let err = stop_sb(&h.service, &sb).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status(&h.service, &id).await.state,
+        S::ContainerRunning as i32
+    );
+    assert_eq!(h.runtime.calls().len(), 2);
+    // 拒否後も sandbox は Ready のままで、新しいコンテナを作れる。
+    create(&h.service, &sb, "d")
+        .await
+        .expect("sandbox still ready");
+}
+
+/// CRI-1: 実行層未接続の経路は従来どおり記録上の停止が成功する。
+#[tokio::test]
+async fn task_59_3_without_runtime_stop_still_succeeds() {
+    let service = CriRuntimeService::new();
+    let sb = run_sandbox(&service).await;
+    let id = create(&service, &sb, "c").await.expect("create");
+    start(&service, &id).await.expect("start");
+    stop_c(&service, &id).await.expect("stop container");
+    assert_eq!(status(&service, &id).await.state, S::ContainerExited as i32);
+    stop_sb(&service, &sb).await.expect("stop sandbox");
 }

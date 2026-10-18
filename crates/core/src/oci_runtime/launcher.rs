@@ -57,9 +57,11 @@
 //! - **範囲写像の入力元**: `/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap`(`SubordinateIdSource`)
 //!   だけ。config の `linux.uidMappings` / `gidMappings` は `start` が引き続き拒否する(受理は SEC-5 に関わる
 //!   オーナー判断事項で、確認待ち)。supervisor が `RootlessSubordinateIds` を選ぶ経路は未結線(後続)
-//! - **mapper の回収**: 中間プロセス I が期限で殺された場合、その子の mapper(`LaunchTag` を持たない)は C へ
-//!   再親付けされ、`rescan` の対象外でゾンビとして残り得る(mapper 自身は read timeout と親 pid の再確認で終了する。
-//!   REPAIR-3。追跡 issue の候補)
+//! - **mapper と helper の回収**: mapper は I が fork 前に設定した `LaunchTag` を継承するため、I が期限で殺されて
+//!   C へ再親付けされても `rescan` の探索対象になる。mapper が起動する `newuidmap` / `newgidmap`(helper)は
+//!   exec で `comm` が識別子でなくなり識別子では見つからないため、`rescan` は識別子を持つプロセスを SIGSTOP で
+//!   止めてその子を列挙し、子を kill してから親を kill・回収し、再親付けされた子も回収する(CORE-2)。
+//!   列挙・停止に失敗した場合は `scan_incomplete` となり、台帳は Pending のまま残る(fail-closed)
 //! - **`confirm_no_process`**: この launcher 自身が起動した範囲だけを確証する(下の「起動台帳」)。別プロセス
 //!   (クラッシュ前の supervisor 等)で起動した残存は、launcher が ID から cgroup を引けないため確証できず
 //!   `FailedPrecondition` で返す(fail-closed)。cgroup の `cgroup.procs` が空であることの確認は別 issue の範囲

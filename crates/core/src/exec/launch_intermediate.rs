@@ -43,7 +43,7 @@
 //! # 未実装・残余(REPAIR-3)
 //!
 //! - **報告前の PID 1(CORE-2)**: I が PID 1 を作った後、`K` の報告前に停止・終了すると C は pid を知れない。
-//!   I は `isolate`(範囲写像の mapper の fork)の前に起動ごとの識別子(`LaunchTag`)を `comm` へ設定し、mapper と PID 1 はそれを継承する(期限切れで I だけが殺されても、再親付けされた mapper を同じ探索で回収する)。C は報告の
+//!   I は `isolate`(範囲写像の mapper の fork)の前に起動ごとの識別子(`LaunchTag`)を `comm` へ設定し、mapper と PID 1 はそれを継承する(期限切れで I だけが殺されても、再親付けされた mapper を同じ探索で回収する。mapper の子の helper〔`newuidmap` / `newgidmap`〕は exec で識別子を失うため、探索は識別子を持つプロセスの子を列挙して先に kill・回収する)。C は報告の
 //!   無い失敗で I を SIGKILL して回収した後(PID 1 は C へ再親付け済み)、`/proc` から「親が C で `comm` が
 //!   識別子と一致する」子を探して `kill_and_reap` する(`recover_unreported_init`)。I を回収できない場合は
 //!   再親付けが起きないため探索せず、I を `unreaped` で返し、探索できなかった識別子を `rescans` で返す(呼び出し側が
@@ -794,14 +794,84 @@ pub(crate) fn rescan_unreported_init(
         // 親が C の未回収の子(subreaper が再親付けした)なので、回収まで pid は解放されず、pidfd が開けなくても
         // `kill(2)` が別プロセスへ届くことはない。
         let child = ContainerChild::adopt_reparented(pid, subreaper);
+        // mapper は `newuidmap` / `newgidmap` を子として起動し、exec 後の helper は `comm` が識別子でなくなる
+        // ため、識別子の探索には一致しない。mapper を先に殺すと helper は mapper の死後も走り続け、ゾンビ化して
+        // 残り得る(CORE-2 の残存確認契約)。そこで mapper を SIGSTOP で止めて(以後 fork しない)子を列挙し、
+        // 子を先に kill してから mapper を kill・回収し、C へ再親付けされた子を回収する。
+        let stopped = std::num::NonZeroU8::new(SIGSTOP_NUMBER)
+            .is_some_and(|stop| child.send_signal(stop).is_ok());
+        let mut helpers = children_of(pid.get(), &mut out);
+        if !stopped {
+            // 止められなかった(=列挙の後に子が増え得る)ので、残存を疑える状態にする。
+            note_scan_failure(
+                &mut out,
+                "cannot stop a tagged process before listing its children",
+            );
+        }
+        for helper in &helpers {
+            // helper は止めた mapper の未回収の子なので、回収されるまで pid は再利用されない。
+            let _ = sys::kill_pid(helper.get(), sys::Signal::Kill);
+        }
         if let Err(e) = child.kill_and_reap(reap_timeout) {
             if out.error.is_none() {
                 out.error = Some(e);
             }
             out.unreaped.push(child);
         }
+        // mapper の死で C(subreaper)へ再親付けされた helper を回収する。
+        for helper in helpers.drain(..) {
+            let reparented = ContainerChild::adopt_reparented(helper, subreaper);
+            if let Err(e) = reparented.kill_and_reap(reap_timeout) {
+                if out.error.is_none() {
+                    out.error = Some(e);
+                }
+                out.unreaped.push(reparented);
+            }
+        }
     }
     out
+}
+
+/// `SIGSTOP` の番号(x86_64 / aarch64 共通の asm-generic。`sys::Signal::Number` と同じ前提)。
+const SIGSTOP_NUMBER: u8 = 19;
+
+/// 親が `parent` の `/proc` 上のプロセスを列挙する(CORE-2)。列挙・解析の失敗は `note_scan_failure` で残す。
+fn children_of(parent: u32, out: &mut Rescan) -> Vec<NonZeroU32> {
+    const WHAT: &str = "cannot scan /proc for the children of a tagged process";
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        note_scan_failure(out, WHAT);
+        return found;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            note_scan_failure(out, WHAT);
+            continue;
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+            .and_then(NonZeroU32::new)
+        else {
+            continue;
+        };
+        let path = Path::new("/proc").join(pid.get().to_string()).join("stat");
+        let stat = match read_proc_text(&path) {
+            Ok(Some(stat)) => stat,
+            Ok(None) => continue,
+            Err(_) => {
+                note_scan_failure(out, WHAT);
+                continue;
+            }
+        };
+        match parent_pid_of(&stat) {
+            Some(p) if p == parent => found.push(pid),
+            Some(_) => {}
+            None => note_scan_failure(out, WHAT),
+        }
+    }
+    found
 }
 
 /// `/proc` のテキストを読む。対象が消えていれば `Ok(None)`(列挙から読むまでの間に終了した)、それ以外の失敗は
@@ -1377,6 +1447,50 @@ mod tests {
         assert!(gone(pid1), "the tagged child {pid1} must be reaped");
         // 2 回目は何も見つからない(別の識別子の子や回収済みの子は対象外)。
         assert!(rescan_unreported_init(&tag, &subreaper, Duration::from_secs(1)).is_clean());
+    }
+
+    /// CORE-2(#2009): 識別子を持つ子(mapper)が exec 済みの子(`comm` が識別子でない helper)を持つとき、再探索は
+    /// 子も kill・回収し、`/proc` に残さない。
+    #[test]
+    fn core2_rescan_also_reaps_untagged_children_of_tagged_process() {
+        let subreaper = ChildSubreaper::enable().expect("subreaper");
+        let tag = LaunchTag::fresh();
+        let (mut ready_read, ready_write) = std::io::pipe().unwrap();
+        let ready_write = std::fs::File::from(std::os::fd::OwnedFd::from(ready_write));
+        let mapper = sys::fork_single_threaded_with(
+            || true,
+            || {
+                if sys::set_process_comm(tag.comm_bytes()).is_err() {
+                    return EXIT_SETUP_FAILED;
+                }
+                // 識別子を持たない子(exec 後の helper 相当)。
+                let helper = sys::fork_single_threaded_with(
+                    || true,
+                    || {
+                        std::thread::sleep(Duration::from_secs(120));
+                        0
+                    },
+                    EXIT_SETUP_FAILED,
+                );
+                let Ok(helper) = helper else {
+                    return EXIT_SETUP_FAILED;
+                };
+                let mut w = &ready_write;
+                let _ = w.write_all(&helper.to_le_bytes());
+                std::thread::sleep(Duration::from_secs(120));
+                0
+            },
+            EXIT_SETUP_FAILED,
+        )
+        .expect("fork the tagged mapper");
+        drop(ready_write);
+        let mut buf = [0u8; 4];
+        ready_read.read_exact(&mut buf).unwrap();
+        let helper = u32::from_le_bytes(buf);
+        let found = rescan_unreported_init(&tag, &subreaper, Duration::from_secs(5));
+        assert!(found.is_clean(), "{found:?}");
+        assert!(gone(mapper), "the tagged mapper {mapper} must be reaped");
+        assert!(gone(helper), "the helper {helper} must be reaped");
     }
 
     /// CORE-2・REPAIR-5(#1816): I が許可前に報告なしで終了しても、PID 1 は gate_w を継承していないため、C の

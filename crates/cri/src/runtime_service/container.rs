@@ -132,13 +132,16 @@ pub(super) struct ContainerRecord {
     /// 停止（`Exited` 遷移）の時刻。未停止は 0（TASK-58.2。ContainerStatus〔TASK-58.3〕が応答に使う）。
     pub(super) finished_at_nanos: i64,
     pub(super) retained_bytes: usize,
-    /// 実行層（`ContainerRuntime`）の create・start を呼び出し中（TASK-59.2・#438）。
+    /// 実行層（`ContainerRuntime`）の create・start・stop・delete を呼び出し中（TASK-59.2・#438、TASK-59.3・#439）。
     ///
-    /// 状態は `Created` のまま、並行する Start・Remove・親サンドボックスの除去を `FAILED_PRECONDITION` で
+    /// 状態は呼び出し前のまま、並行する Start・Stop・Remove・親サンドボックスの停止・除去を `FAILED_PRECONDITION` で
     /// 拒否するためのフラグ。実行層を呼ぶ間はレジストリのロックを持たないので、このフラグで二重実行と
     /// 取りこぼし（記録だけ消えて実行層に残る）を防ぐ。
     pub(super) in_flight: bool,
-    /// Create の結果が不明のまま実行層に資源が残りうる（TASK-59.2）。真の間は Remove を拒否する。
+    /// 実行層に資源（コンテナ・bundle）がある（Create 成功、または結果不明で残りうる。TASK-59.2）。
+    ///
+    /// 真の間、Stop・Remove は記録上の遷移ではなく実行層の stop・delete を経由する（TASK-59.3）。
+    /// 名前は変更せず（差分最小化）、意味は「実行層が所有する」。
     pub(super) runtime_leaked: bool,
 }
 

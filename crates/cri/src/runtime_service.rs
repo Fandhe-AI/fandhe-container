@@ -21,10 +21,16 @@
 //! 除去を `FAILED_PRECONDITION` にする。実行層が失敗したら記録を巻き戻し（Create）・Created へ戻し（Start）、
 //! 「記録上だけ running」のフォールバックはしない（fail-closed）。注入しない場合は従来のスタブ動作のまま。
 //! 未実装（REPAIR-3）: `RunPodSandbox` は実行層に対応操作が無く記録のみ（共有 namespace・net 連携は後続）。
-//! bundle の生成の本体（image 展開・`ContainerConfig` から `config.json`）と Stop・Remove の kill・delete
-//! 接続（TASK-59.3・#439）は未提供で、呼び出し元の中断で実行層側に残った資源の回収も
-//! 後続（TASK-59.3・TASK-114）で扱う。Start 後に中断・確定失敗した場合は、実行層が
-//! running の可能性があるため記録を exited にして再 Start を拒否する（fail-closed）。
+//! bundle の生成の本体（image 展開・`ContainerConfig` から `config.json`）は未提供で、core の本番
+//! launcher との結線は TASK-114、一連の結合試験は TASK-59.4 で扱う。Start 後に中断・確定失敗した場合は、
+//! 実行層が running の可能性があるため記録を unknown にして再 Start を拒否する（fail-closed）。
+//!
+//! **Stop・Remove の接続（CRI-2・TASK-59.3・#439）**: 実行層接続時、実行層の資源を持つコンテナ
+//! （`runtime_leaked`）への `StopContainer` は `ContainerRuntime::stop`、`RemoveContainer` は
+//! `delete(force)` と bundle の解放を経て記録を除去する。`StopPodSandbox` は配下の running・unknown を
+//! 猶予 0 で停止し、`RemovePodSandbox` は配下を 1 件ずつ回収してから sandbox を除去する。結果不明
+//! （期限超過・想定外の応答）は unknown で記録を保持し、Stop・Remove の再試行で回復できる。待ちは
+//! すべて期限つき（REPAIR-5）。
 //! コンテナの記録の型と上限は `container` サブモジュール。
 //!
 //! **Status/List の扱い（CRI-1・ERR-3・TASK-57.3）**: `PodSandboxStatus` は未知 ID を `NOT_FOUND`、空 ID を
@@ -55,7 +61,7 @@
 //! `ContainerStatus` は空 ID を `INVALID_ARGUMENT`、未知 ID（Remove 済みを含む）を `NOT_FOUND` にする。
 //! `ListContainers` は一致なし・未知 ID・`CONTAINER_UNKNOWN` を空の一覧とし、未知の state 値と過大な
 //! `label_selector` だけを `INVALID_ARGUMENT` にする。並びは `(created_at, id)` の昇順。labels・annotations は
-//! 無改変で返し、`envs` は返さない。`exit_code`・`reason`・`image_ref`・`user`・`info` は空・0 のスタブで、
+//! 無改変で返し、`envs` は返さない。`reason`・`image_ref`・`user`・`info` は空・0 のスタブ（`exit_code` は Stop 応答の値を反映）で、
 //! 実値は TASK-59（CRI-2）で埋める（REPAIR-3）。
 //!
 //! **スタブの明示（REPAIR-3）**: サンドボックスの状態はプロセス内メモリのレジストリにだけ持つ。
@@ -273,7 +279,19 @@ struct ReservedContainer {
 enum InFlightKind {
     Create,
     Start,
+    /// `ContainerRuntime::stop`（TASK-59.3）。成功で Exited、確定失敗で元の状態、結果不明で Unknown。
+    Stop,
+    /// `ContainerRuntime::delete(force)` と bundle の解放（TASK-59.3）。成功で記録を除去する。
+    Remove,
 }
+
+/// `StopContainer` の `timeout`（猶予秒数）の上限。core の `ContainerRuntime::stop` の上限（24 時間）と
+/// 同じ値で、超過は仮登録の前に `INVALID_ARGUMENT` にする（REPAIR-5）。
+const STOP_GRACE_MAX_SECS: i64 = 24 * 60 * 60;
+
+/// `StopPodSandbox` が配下のコンテナを停止するときの猶予秒数。要求に timeout が無く、残ったコンテナは
+/// 強制停止するのが CRI の意味であるため 0（即時 SIGKILL）とする（CRI-2）。
+const SANDBOX_STOP_GRACE_SECS: i64 = 0;
 
 /// `ContainerRuntime::create`・`start` のエラーコードのうち「何も起きていない」と確定できるものか（REPAIR-5）。
 ///
@@ -309,6 +327,8 @@ struct InFlightGuard {
     outcome_unknown: bool,
     /// 実行層が停止済みと報告した（Start の応答が Stopped）。破棄時に結果不明ではなく exited へ反映する。
     confirmed_exited: bool,
+    /// 実行層が停止応答で返した終了コード（Stop の commit で記録へ反映する。判明しなければ 0 のまま。CRI-2）。
+    exit_code: Option<i32>,
 }
 
 impl InFlightGuard {
@@ -321,7 +341,13 @@ impl InFlightGuard {
             bundles: None,
             outcome_unknown: false,
             confirmed_exited: false,
+            exit_code: None,
         }
+    }
+
+    /// 実行層が停止応答で報告した終了コードを、commit で記録へ反映するよう保持する（CRI-2）。
+    fn set_exit_code(&mut self, exit_code: Option<i32>) {
+        self.exit_code = exit_code;
     }
 
     /// 実行層が停止済みと報告した。破棄時に exited（終了時刻つき）へ反映する（結果不明の unknown にしない）。
@@ -351,7 +377,7 @@ impl InFlightGuard {
 
     /// 実行層の成功を記録へ反映して確定する。反映に失敗したら巻き戻される。
     fn commit(&mut self) -> Result<(), CriError> {
-        commit_in_flight(&self.registry, &self.id, self.kind)?;
+        commit_in_flight(&self.registry, &self.id, self.kind, self.exit_code)?;
         self.committed = true;
         Ok(())
     }
@@ -380,6 +406,45 @@ impl Drop for InFlightGuard {
                 self.outcome_unknown,
                 self.confirmed_exited,
             );
+        }
+    }
+}
+
+/// 仮登録（`in_flight`）済みだが、まだ実行層へ渡していないコンテナの一覧（sandbox 系 RPC 用。TASK-59.3）。
+///
+/// RPC の future が途中で中断されたら、未処理の記録の `in_flight` を解く（解かないと Start・Remove・
+/// sandbox の除去が永久に `FAILED_PRECONDITION` になる）。処理に回した 1 件は [`InFlightGuard`] が引き継ぐ。
+struct PendingMarks {
+    registry: Arc<Mutex<SandboxRegistry>>,
+    ids: std::collections::VecDeque<String>,
+}
+
+impl PendingMarks {
+    fn new(registry: Arc<Mutex<SandboxRegistry>>, ids: Vec<String>) -> Self {
+        Self {
+            registry,
+            ids: ids.into(),
+        }
+    }
+
+    /// 次の 1 件を取り出し、その `in_flight` の責務を持つ番人を返す（同期処理。await をまたがない）。
+    fn next_guard(&mut self, kind: InFlightKind) -> Option<InFlightGuard> {
+        let id = self.ids.pop_front()?;
+        Some(InFlightGuard::new(Arc::clone(&self.registry), id, kind))
+    }
+}
+
+impl Drop for PendingMarks {
+    fn drop(&mut self) {
+        if self.ids.is_empty() {
+            return;
+        }
+        if let Ok(mut registry) = self.registry.lock() {
+            for id in self.ids.drain(..) {
+                if let Some(record) = registry.containers.get_mut(&id) {
+                    record.in_flight = false;
+                }
+            }
         }
     }
 }
@@ -530,8 +595,13 @@ fn commit_in_flight(
     registry: &Mutex<SandboxRegistry>,
     id: &str,
     kind: InFlightKind,
+    exit_code: Option<i32>,
 ) -> Result<(), CriError> {
-    let started_at_nanos = now_nanos()?;
+    let at_nanos = now_nanos()?;
+    if kind == InFlightKind::Remove {
+        // 実行層の削除と bundle の解放を終えた。記録・名前キー・件数枠を解放する（ロックは中で取る）。
+        return drop_container_in(registry, id, true);
+    }
     let mut registry = registry
         .lock()
         .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
@@ -553,13 +623,20 @@ fn commit_in_flight(
         .ok_or_else(|| CriError::internal("container registry is inconsistent"))?;
     record.in_flight = false;
     if kind == InFlightKind::Create {
-        // 実行層に資源（コンテナ・bundle）が存在する。削除の接続（TASK-59.3）まで Remove を拒否し、
-        // 追跡情報・名前キー・件数枠を保持する。
+        // 実行層に資源（コンテナ・bundle）が存在する。Remove は実行層の delete 経由で解放し
+        // （TASK-59.3）、それまで追跡情報・名前キー・件数枠を保持する。
         record.runtime_leaked = true;
+    }
+    if kind == InFlightKind::Stop {
+        // 実行層が停止済みと報告した。現在時刻を終了時刻とする。
+        record.state = ContainerState::Exited;
+        record.finished_at_nanos = at_nanos;
+        // 実行層が返した終了コード（137 等）を保持する。不明（None）は 0 のまま。
+        record.exit_code = exit_code.unwrap_or(0);
     }
     if kind == InFlightKind::Start {
         record.state = ContainerState::Running;
-        record.started_at_nanos = started_at_nanos;
+        record.started_at_nanos = at_nanos;
     }
     Ok(())
 }
@@ -567,12 +644,16 @@ fn commit_in_flight(
 /// 実行層の呼び出しが失敗・中断したときの巻き戻し。Create は記録を除去し、Start は `in_flight` を解く。
 ///
 /// Create で `outcome_unknown` のときは、実行層に資源が残る可能性があるため記録を除去せず unknown として
-/// 残す（追跡情報と件数枠を保持。回収は TASK-59.3・TASK-114）。
+/// 残す（追跡情報と件数枠を保持。回収は Remove の実行層 delete〔TASK-59.3〕と TASK-114）。
 ///
 /// ロックの汚染時は何もできない（汚染済みのレジストリは以後の RPC が `INTERNAL` で拒否する）。
 ///
 /// Start で `outcome_unknown` のときは、実行層が running の可能性があるため created へ戻さず
-/// unknown（外向きは CONTAINER_UNKNOWN。終了時刻は設定しない）にする（再 Start による二重起動を防ぐ fail-closed。実状態の照合は TASK-59.3・TASK-114）。
+/// unknown（外向きは CONTAINER_UNKNOWN。終了時刻は設定しない）にする（再 Start による二重起動を防ぐ fail-closed。
+/// Stop・Remove の再試行で実状態を照合する〔TASK-59.3〕）。
+///
+/// Stop・Remove の `outcome_unknown` も unknown で保持する（記録と `runtime_leaked` を残し、再試行で回復できる）。
+/// 確定失敗は `in_flight` を解くだけで状態を変えない。
 fn rollback_in_flight(
     registry: &Mutex<SandboxRegistry>,
     id: &str,
@@ -583,6 +664,27 @@ fn rollback_in_flight(
     match kind {
         InFlightKind::Create if !outcome_unknown => {
             let _ = drop_container_in(registry, id, true);
+        }
+        InFlightKind::Stop | InFlightKind::Remove => {
+            let finished_at_nanos = if confirmed_exited {
+                now_nanos().unwrap_or(0)
+            } else {
+                0
+            };
+            if let Ok(mut registry) = registry.lock()
+                && let Some(record) = registry.containers.get_mut(id)
+            {
+                record.in_flight = false;
+                if confirmed_exited && !outcome_unknown {
+                    // 実行層の削除完了後に bundle の解放だけが失敗した（Remove）。
+                    if record.state != ContainerState::Exited {
+                        record.state = ContainerState::Exited;
+                        record.finished_at_nanos = finished_at_nanos;
+                    }
+                } else if outcome_unknown {
+                    record.state = ContainerState::Unknown;
+                }
+            }
         }
         InFlightKind::Create | InFlightKind::Start => {
             let finished_at_nanos = if confirmed_exited {
@@ -601,7 +703,7 @@ fn rollback_in_flight(
                     // 停止を確認できないため exited にせず unknown で保持する（終了時刻・終了コードは設定しない。
                     // 生存中のプロセスを終了済みと公開して重複実行を招かない。CRI-2・REPAIR-5）。
                     record.state = ContainerState::Unknown;
-                    // Create の結果不明は実行層に資源が残りうる。削除接続（TASK-59.3）まで Remove を拒否する。
+                    // Create の結果不明は実行層に資源が残りうる。Remove は実行層の delete 経由で行う（TASK-59.3）。
                     if kind == InFlightKind::Create {
                         record.runtime_leaked = true;
                     }
@@ -830,10 +932,9 @@ impl CriRuntimeService {
         if !registry.records.contains_key(&req.pod_sandbox_id) {
             return Err(CriError::not_found("sandbox not found"));
         }
-        // 実行層の資源を持つ、または作成・起動の実行中のコンテナを 1 つでも含む間は停止を拒否する
-        // （TASK-59.3 で実行層の stop を接続するまで。Created でも init が fork 済みで PID を持ちうる
-        // ことと、Create 実行中は `runtime_leaked` が未設定で停止後に create が完了する競合があるため。
-        // 生きたプロセスを停止済みと返さない fail-closed。CRI-1・REPAIR-3。Remove 系と同じ code）。
+        // 実行層の資源を持つ、または実行層を呼び出し中のコンテナを含む場合は、この経路（スタブ用）で
+        // 停止済みと返さない。実行層接続時は `stop_sandbox_runtime` が担う（TASK-59.3）ため、ここに来るのは
+        // 実行層未接続の異常系だけで、生きたプロセスを停止済みと返さない fail-closed。CRI-1・REPAIR-3。
         if registry
             .containers
             .values()
@@ -1011,6 +1112,7 @@ impl CriRuntimeService {
                 created_at_nanos,
                 started_at_nanos: 0,
                 finished_at_nanos: 0,
+                exit_code: 0,
                 retained_bytes,
                 in_flight,
                 runtime_leaked: false,
@@ -1201,6 +1303,307 @@ impl CriRuntimeService {
         Ok(v1::StartContainerResponse {})
     }
 
+    /// 実行層接続時の `StopContainer`（TASK-59.3・CRI-2）。
+    ///
+    /// 実行層の資源を持つ記録（`runtime_leaked`）だけを `ContainerRuntime::stop` へ渡す。それ以外
+    /// （スタブ経路の記録）は従来の記録上の遷移。exited は冪等に成功し実行層を呼ばず、created は
+    /// `FAILED_PRECONDITION`。running と unknown（結果不明の回復）は仮登録して実行層を呼ぶ。
+    async fn stop_container_runtime(
+        &self,
+        binding: &RuntimeBinding,
+        req: v1::StopContainerRequest,
+    ) -> Result<v1::StopContainerResponse, CriError> {
+        if req.container_id.is_empty() {
+            return Err(CriError::invalid_argument("container_id is required"));
+        }
+        if req.timeout < 0 {
+            return Err(CriError::invalid_argument("timeout must not be negative"));
+        }
+        if req.timeout > STOP_GRACE_MAX_SECS {
+            return Err(CriError::invalid_argument("timeout is too large"));
+        }
+        let guard = {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+            let record = registry
+                .containers
+                .get_mut(&req.container_id)
+                .ok_or_else(|| CriError::not_found("container not found"))?;
+            if !record.runtime_leaked {
+                drop(registry);
+                return self.stop_container_impl(req);
+            }
+            if record.in_flight {
+                return Err(CriError::failed_precondition(
+                    "container operation in progress",
+                ));
+            }
+            match record.state {
+                ContainerState::Exited => return Ok(v1::StopContainerResponse {}),
+                ContainerState::Created => {
+                    return Err(CriError::failed_precondition(
+                        "container is not in running state",
+                    ));
+                }
+                ContainerState::Running | ContainerState::Unknown => {}
+            }
+            record.in_flight = true;
+            InFlightGuard::new(
+                Arc::clone(&self.registry),
+                req.container_id.clone(),
+                InFlightKind::Stop,
+            )
+        };
+        self.runtime_stop_one(binding, guard, req.timeout).await?;
+        Ok(v1::StopContainerResponse {})
+    }
+
+    /// 仮登録済み（`in_flight`）のコンテナ 1 件を `ContainerRuntime::stop` で停止する（TASK-59.3）。
+    ///
+    /// 実行層が停止済みを報告するか、コンテナの不在（`NOT_FOUND`。プロセスは無い）を返したら exited に
+    /// 確定する。確定失敗は元の状態のまま、結果不明（期限超過・`UNAVAILABLE`・想定外の応答）は unknown で
+    /// 保持する。待ちの上限は `runtime_timeout` に SIGTERM の猶予を足した値で有界（REPAIR-5）。
+    async fn runtime_stop_one(
+        &self,
+        binding: &RuntimeBinding,
+        mut guard: InFlightGuard,
+        grace_secs: i64,
+    ) -> Result<(), CriError> {
+        let adapter = binding.adapter.clone();
+        let id = guard.id.clone();
+        let grace = Duration::from_secs(u64::try_from(grace_secs).unwrap_or(0));
+        run_bounded(
+            self.runtime_timeout.saturating_add(grace),
+            move || -> Result<(), CriError> {
+                guard.mark_dispatched();
+                match adapter.stop(&id, grace_secs) {
+                    Ok(status) if status.lifecycle == RuntimeLifecycle::Stopped => {
+                        guard.set_exit_code(status.exit_code);
+                        guard.commit()
+                    }
+                    Ok(_) => Err(CriError::internal("runtime returned an unexpected state")),
+                    Err(status) if status.code() == CriErrorCode::NotFound => guard.commit(),
+                    Err(status) => {
+                        if is_definite_failure(status.code()) {
+                            guard.mark_definitely_failed();
+                        }
+                        Err(status)
+                    }
+                }
+            },
+        )
+        .await?
+    }
+
+    /// 実行層接続時の `RemoveContainer`（TASK-59.3・CRI-2）。
+    ///
+    /// 実行層の資源を持つ記録は、状態を問わず（running は強制削除）`ContainerRuntime::delete(force)` と
+    /// bundle の解放を終えてから記録を除去する。それ以外は従来の記録上の除去。
+    async fn remove_container_runtime(
+        &self,
+        binding: &RuntimeBinding,
+        req: v1::RemoveContainerRequest,
+    ) -> Result<v1::RemoveContainerResponse, CriError> {
+        if req.container_id.is_empty() {
+            return Err(CriError::invalid_argument("container_id is required"));
+        }
+        let guard = {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+            let Some(record) = registry.containers.get_mut(&req.container_id) else {
+                return Ok(v1::RemoveContainerResponse {});
+            };
+            if !record.runtime_leaked {
+                drop(registry);
+                return self.remove_container_impl(req);
+            }
+            if record.in_flight {
+                return Err(CriError::failed_precondition(
+                    "container operation in progress",
+                ));
+            }
+            record.in_flight = true;
+            InFlightGuard::new(
+                Arc::clone(&self.registry),
+                req.container_id.clone(),
+                InFlightKind::Remove,
+            )
+        };
+        self.runtime_remove_one(binding, guard).await?;
+        Ok(v1::RemoveContainerResponse {})
+    }
+
+    /// 仮登録済み（`in_flight`）のコンテナ 1 件を `delete(force)` と bundle の解放で回収し、記録を除去する。
+    ///
+    /// 削除済み（成功または `NOT_FOUND`）を確認できたときだけ bundle を解放して記録を解放する。
+    /// 確定失敗・解放の失敗は記録を保持して再試行できるようにし（再試行では delete が `NOT_FOUND` になる）、
+    /// 結果不明は unknown で保持する（REPAIR-5）。
+    async fn runtime_remove_one(
+        &self,
+        binding: &RuntimeBinding,
+        mut guard: InFlightGuard,
+    ) -> Result<(), CriError> {
+        let adapter = binding.adapter.clone();
+        let bundles = Arc::clone(&binding.bundles);
+        let id = guard.id.clone();
+        run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
+            guard.mark_dispatched();
+            match adapter.remove(&id, true) {
+                Ok(_) => {}
+                Err(status) if status.code() == CriErrorCode::NotFound => {}
+                Err(status) => {
+                    if is_definite_failure(status.code()) {
+                        guard.mark_definitely_failed();
+                    }
+                    return Err(status);
+                }
+            }
+            // 実行層の資源は無い。bundle の解放に失敗したら記録を保持して再試行できるようにする。
+            if let Err(status) = bundles.release(&id) {
+                // 実行層の削除は完了している。状態は exited（終了時刻つき）にして記録と件数枠だけを
+                // 再試行用に保持する（実プロセスが消えたのに running と公開し続けない）。
+                guard.mark_confirmed_exited();
+                guard.mark_definitely_failed();
+                return Err(status);
+            }
+            guard.commit()
+        })
+        .await?
+    }
+
+    /// 実行層接続時の `StopPodSandbox`（TASK-59.3・CRI-2）。
+    ///
+    /// 配下に実行中の操作（`in_flight`）があれば拒否する。それ以外は sandbox を notready にし、配下の
+    /// 実行層経由の running・unknown・created コンテナ（created も init を持ちうる）を猶予 0（即時 SIGKILL）で
+    /// 停止し、確認できなければ成功を返さない。スタブ経路の running は
+    /// 記録上 exited にする。1 件でも失敗したら最初のエラーを返し、sandbox は notready のまま残る
+    /// （冪等なので再呼び出しで残りを再試行できる）。所要時間の上限は「対象数（`MAX_CONTAINERS` で有界）
+    /// × `runtime_timeout`」。
+    async fn stop_sandbox_runtime(
+        &self,
+        binding: &RuntimeBinding,
+        req: v1::StopPodSandboxRequest,
+    ) -> Result<v1::StopPodSandboxResponse, CriError> {
+        if req.pod_sandbox_id.is_empty() {
+            return Err(CriError::invalid_argument("pod_sandbox_id is required"));
+        }
+        let finished_at_nanos = now_nanos()?;
+        let mut pending = {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+            if !registry.records.contains_key(&req.pod_sandbox_id) {
+                return Err(CriError::not_found("sandbox not found"));
+            }
+            if registry
+                .containers
+                .values()
+                .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && c.in_flight)
+            {
+                return Err(CriError::failed_precondition(
+                    "container operation in progress",
+                ));
+            }
+            if let Some(record) = registry.records.get_mut(&req.pod_sandbox_id) {
+                record.state = SandboxState::NotReady;
+            }
+            let mut ids = Vec::new();
+            for (id, c) in registry
+                .containers
+                .iter_mut()
+                .filter(|(_, c)| c.pod_sandbox_id == req.pod_sandbox_id)
+            {
+                match (c.runtime_leaked, c.state) {
+                    (
+                        true,
+                        ContainerState::Running | ContainerState::Unknown | ContainerState::Created,
+                    ) => {
+                        c.in_flight = true;
+                        ids.push(id.clone());
+                    }
+                    (false, ContainerState::Running) => {
+                        c.state = ContainerState::Exited;
+                        c.finished_at_nanos = finished_at_nanos;
+                    }
+                    _ => {}
+                }
+            }
+            PendingMarks::new(Arc::clone(&self.registry), ids)
+        };
+        let mut first_error = None;
+        while let Some(guard) = pending.next_guard(InFlightKind::Stop) {
+            if let Err(status) = self
+                .runtime_stop_one(binding, guard, SANDBOX_STOP_GRACE_SECS)
+                .await
+            {
+                first_error.get_or_insert(status);
+            }
+        }
+        first_error.map_or(Ok(v1::StopPodSandboxResponse {}), Err)
+    }
+
+    /// 実行層接続時の `RemovePodSandbox`（TASK-59.3・CRI-2）。
+    ///
+    /// 配下に実行中の操作があれば拒否する。実行層の資源を持つ配下のコンテナを 1 件ずつ `delete(force)` と
+    /// bundle の解放で回収し、全件が成功したときだけ sandbox と残りの記録を除去する。1 件でも失敗したら
+    /// sandbox と未回収の記録を保持して最初のエラーを返す（成功した分は個別に解放済み）。
+    async fn remove_sandbox_runtime(
+        &self,
+        binding: &RuntimeBinding,
+        req: v1::RemovePodSandboxRequest,
+    ) -> Result<v1::RemovePodSandboxResponse, CriError> {
+        if req.pod_sandbox_id.is_empty() {
+            return Err(CriError::invalid_argument("pod_sandbox_id is required"));
+        }
+        let mut pending = {
+            let mut registry = self
+                .registry
+                .lock()
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+            if !registry.records.contains_key(&req.pod_sandbox_id) {
+                return Ok(v1::RemovePodSandboxResponse {});
+            }
+            if registry
+                .containers
+                .values()
+                .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && c.in_flight)
+            {
+                return Err(CriError::failed_precondition(
+                    "container operation in progress",
+                ));
+            }
+            // 子の削除中に並行する CreateContainer が新しい子を足さないよう、先に notready にする。
+            if let Some(record) = registry.records.get_mut(&req.pod_sandbox_id) {
+                record.state = SandboxState::NotReady;
+            }
+            let mut ids = Vec::new();
+            for (id, c) in registry
+                .containers
+                .iter_mut()
+                .filter(|(_, c)| c.pod_sandbox_id == req.pod_sandbox_id && c.runtime_leaked)
+            {
+                c.in_flight = true;
+                ids.push(id.clone());
+            }
+            PendingMarks::new(Arc::clone(&self.registry), ids)
+        };
+        let mut first_error = None;
+        while let Some(guard) = pending.next_guard(InFlightKind::Remove) {
+            if let Err(status) = self.runtime_remove_one(binding, guard).await {
+                first_error.get_or_insert(status);
+            }
+        }
+        if let Some(status) = first_error {
+            return Err(status);
+        }
+        self.remove_sandbox(req)
+    }
+
     /// `StopContainer` の本体。running を exited へ遷移させる（CRI-1・ERR-3・TASK-58.2）。
     ///
     /// 空 ID・負の `timeout` は `INVALID_ARGUMENT`、未知 ID は `NOT_FOUND`、created は
@@ -1226,9 +1629,9 @@ impl CriRuntimeService {
             .containers
             .get_mut(&req.container_id)
             .ok_or_else(|| CriError::not_found("container not found"))?;
-        // 実行層経由で作成したコンテナは、TASK-59.3 で実行層の stop を接続するまで停止を拒否する。
-        // 記録だけ Exited にすると実プロセスが生存したまま「停止済み」と返るため（CRI-1・REPAIR-3。
-        // fail-closed。Remove 系と同じ code）。実行層未接続の経路（`runtime_leaked` なし）は従来どおり。
+        // 実行層の資源を持つ記録の停止は `stop_container_runtime`（実行層の stop）が担う。この経路は
+        // 実行層未接続のスタブ用で、記録だけ Exited にすると実プロセスが生存したまま「停止済み」と返るため
+        // 念のため拒否する（CRI-1・REPAIR-3。fail-closed。Remove 系と同じ code）。
         if record.runtime_leaked {
             return Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
@@ -1594,9 +1997,12 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::StopPodSandboxRequest>,
     ) -> Result<Response<v1::StopPodSandboxResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::StopPodSandbox);
-        let result = self
-            .stop_sandbox(request.into_inner())
-            .map_err(Status::from);
+        let req = request.into_inner();
+        let result = match &self.runtime {
+            Some(binding) => self.stop_sandbox_runtime(binding, req).await,
+            None => self.stop_sandbox(req),
+        }
+        .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1607,9 +2013,12 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::RemovePodSandboxRequest>,
     ) -> Result<Response<v1::RemovePodSandboxResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::RemovePodSandbox);
-        let result = self
-            .remove_sandbox(request.into_inner())
-            .map_err(Status::from);
+        let req = request.into_inner();
+        let result = match &self.runtime {
+            Some(binding) => self.remove_sandbox_runtime(binding, req).await,
+            None => self.remove_sandbox(req),
+        }
+        .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1684,9 +2093,12 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::StopContainerRequest>,
     ) -> Result<Response<v1::StopContainerResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::StopContainer);
-        let result = self
-            .stop_container_impl(request.into_inner())
-            .map_err(Status::from);
+        let req = request.into_inner();
+        let result = match &self.runtime {
+            Some(binding) => self.stop_container_runtime(binding, req).await,
+            None => self.stop_container_impl(req),
+        }
+        .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1697,9 +2109,12 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::RemoveContainerRequest>,
     ) -> Result<Response<v1::RemoveContainerResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::RemoveContainer);
-        let result = self
-            .remove_container_impl(request.into_inner())
-            .map_err(Status::from);
+        let req = request.into_inner();
+        let result = match &self.runtime {
+            Some(binding) => self.remove_container_runtime(binding, req).await,
+            None => self.remove_container_impl(req),
+        }
+        .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -2025,7 +2440,7 @@ mod tests {
     }
 
     /// CRI-1・REPAIR-3: NotReady の sandbox 配下の Start は実行層を呼ばず FAILED_PRECONDITION
-    /// (停止は TASK-59.3 まで資源を持つ sandbox で拒否されるため、レジストリを直接操作して状態を作る)。
+    /// (実行層未接続のスタブ経路では資源を持つ記録を作れないため、レジストリを直接操作して状態を作る)。
     #[test]
     fn task_59_3_start_in_notready_sandbox_never_reaches_the_runtime() {
         let svc = CriRuntimeService::new();

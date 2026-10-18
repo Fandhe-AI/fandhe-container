@@ -568,6 +568,49 @@ mod linux {
             .state()
     }
 
+    /// `state.json` から読み戻した launch 時の分離の記録を検証する(SUP-6・CORE-5・SEC-1・#2007)。`/` の識別子は
+    /// ホスト側の rootfs ディレクトリの `(st_dev, st_ino)` と一致し(bind は inode と `st_dev` を保つ)、ルールは
+    /// 先頭が rootfs で、`bind_dest` があれば `mounts[0]` 由来の Mount ルールを含む。
+    fn assert_recorded_launch_isolation(
+        env: &Env,
+        id: &ContainerId,
+        bundle: &Bundle,
+        bind_dest: Option<&str>,
+    ) {
+        use fandhe_container_core::launch_isolation::RecordedTarget;
+        use std::os::unix::fs::MetadataExt as _;
+        let record = env
+            .store
+            .get(&GetStateRequest::new(id.clone()))
+            .expect("get state");
+        let iso = record
+            .launch_isolation()
+            .expect("launch_isolation recorded");
+        let meta = std::fs::metadata(bundle.rootfs()).expect("rootfs metadata");
+        assert_eq!(iso.root().dev(), meta.dev());
+        assert_eq!(iso.root().ino(), meta.ino());
+        let rules = iso.landlock().rules();
+        assert!(
+            matches!(
+                rules.first().map(|r| r.target()),
+                Some(RecordedTarget::Root)
+            ),
+            "first rule must be the rootfs"
+        );
+        assert_ne!(iso.landlock().handled(), 0);
+        let mounts: Vec<(String, usize)> = rules
+            .iter()
+            .filter_map(|r| match r.target() {
+                RecordedTarget::Mount { destination, index } => {
+                    Some((destination.as_str().to_owned(), *index))
+                }
+                _ => None,
+            })
+            .collect();
+        let want: Vec<(String, usize)> = bind_dest.map(|d| (d.to_owned(), 0)).into_iter().collect();
+        assert_eq!(mounts, want);
+    }
+
     fn do_create(env: &Env, bundle: &Bundle, id: &ContainerId) {
         let req = CreateRequest::new(id.clone(), bundle.dir.clone()).expect("absolute bundle");
         create(&env.store, &env.recorder, &req).expect("create");
@@ -694,6 +737,7 @@ mod linux {
             assert_eq!(started.record().status().state(), ContainerState::Running);
             assert_eq!(started.record().status().pid(), Some(pid));
             assert_eq!(state_of(&env.store, &id), ContainerState::Running);
+            assert_recorded_launch_isolation(env, &id, &bundle, None);
             // ホストから見た PID 1 の確認（NSpid の末尾が 1）。
             let nspid = status_field(&format!("/proc/{pid}/status"), "NSpid:").expect("host NSpid");
             let parts: Vec<&str> = nspid.split_whitespace().collect();
@@ -801,6 +845,14 @@ mod linux {
         };
         assert_ne!(err.code(), ErrorCode::Timeout, "{}", err.message());
         assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+        assert!(
+            env.store
+                .get(&GetStateRequest::new(id.clone()))
+                .expect("get state")
+                .launch_isolation()
+                .is_none(),
+            "a failed launch must leave no launch_isolation"
+        );
         assert!(!env.launcher.last_launch_may_have_left_process());
         env.launcher
             .confirm_no_process(&id, timeout())
@@ -891,6 +943,7 @@ mod linux {
         let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
         let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_eq!(started.record().status().state(), ContainerState::Running);
+            assert_recorded_launch_isolation(env, &id, &bundle, Some(BIND_DEST));
             let output = started.process().take_output().expect("container output");
             let stdout = output.stdout.expect("container stdout");
             reader_slot = Some(spawn_reader(stdout));

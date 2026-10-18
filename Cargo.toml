@@ -63,7 +63,8 @@ sha2 = { version = "=0.11.0", default-features = false }
 # macOS Virtualization.framework の橋渡し（MAC-1・TASK-64.1）。承認: Issue #356・TASK-64.hdep1。
 # crates/platform-macos から cfg(target_os = "macos") ターゲット限定で参照する。features はメンバー側で列挙する。
 # AppKit（objc2-app-kit）は引かない方針（VZVirtualMachineView は使わない）。
-objc2 = { version = "=0.6.4", default-features = false }
+# 0.6.5 へ更新（承認: Issue #1889・#1895）。aarch64 macOS の release ビルドの use-after-free 修正版（upstream madsmtm/objc2 #861）。
+objc2 = { version = "=0.6.5", default-features = false }
 objc2-foundation = { version = "=0.3.2", default-features = false }
 objc2-virtualization = { version = "=0.3.2", default-features = false }
 block2 = { version = "=0.6.2", default-features = false }

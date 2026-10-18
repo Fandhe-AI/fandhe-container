@@ -28,7 +28,8 @@
 //!    後始末スレッドが [`LaunchedProcess::terminate`]（上限 [`StartTimeouts::terminate`] を強制）で
 //!    kill・回収する。launch と後始末が終わるまでプロセス内の予約（`StartReservation`）も保持し、
 //!    同一プロセス内の start・回復を拒否する（進行中の launch との二重起動防止。CORE-2）
-//! 7. Running（pid 付き）へ状態更新。成功したら状態と起動済みプロセスのハンドル（[`StartedContainer`]）を
+//! 7. Running（pid 付き）へ状態更新。ハンドルが [`LaunchedProcess::launch_isolation`] を持てば、launch 時の分離の
+//!    記録も同じ 1 回の更新で `state.json` へ書く（SUP-6・#2007）。成功したら状態と起動済みプロセスのハンドル（[`StartedContainer`]）を
 //!    返し、監視・回収の責務を呼び出し元へ引き渡す（CORE-1）。更新に失敗した場合は起動済みプロセスを上限
 //!    [`StartTimeouts::terminate`] つきで終了し、予約を Created へ戻してから、元のエラーを返す。
 //!    終了にも失敗した・上限を超えた場合は、未記録プロセスが残り得ることを示す `Internal` を返し、
@@ -616,7 +617,14 @@ fn launch_inner(
     };
 
     let running = ContainerStatus::running(id.clone(), Some(process.pid()));
-    match store.update(&UpdateStateRequest::new(running, claimed.revision())) {
+    // launch が確定した分離の記録は Running の記録と同じ 1 回の update で書く(exec の根拠。SUP-6・CORE-5・#2007)。
+    // 記録を持たない launcher(偽の実装・Linux 以外)では付けず、前の値が引き継がれる(契約 12)。本番 launcher は
+    // 記録を作れなければ launch 自体が失敗するため、ここへ記録なしの Running は届かない。
+    let mut running_update = UpdateStateRequest::new(running, claimed.revision());
+    if let Some(isolation) = process.launch_isolation() {
+        running_update = running_update.with_launch_isolation(isolation.clone());
+    }
+    match store.update(&running_update) {
         // ハンドルは呼び出し元（監視・回収の所有者）へ引き渡す（捨てると回収できない。CORE-1）。
         Ok(record) => Ok(StartedContainer { record, process }),
         Err(err) => {
@@ -1200,11 +1208,15 @@ mod tests {
             if cur.revision() != req.expected_revision() {
                 return Err(TraitError::new(ErrorCode::FailedPrecondition, "stale"));
             }
-            let next = StateRecord::new(
+            let mut next = StateRecord::new(
                 req.status().clone(),
                 cur.bundle().to_path_buf(),
                 cur.revision().next()?,
             )?;
+            // 契約 12: 指定があれば置き換え、なければ既存の値を引き継ぐ。
+            if let Some(l) = req.launch_isolation().or(cur.launch_isolation()) {
+                next = next.with_launch_isolation(l.clone());
+            }
             records.insert(req.status().id().clone(), next.clone());
             Ok(next)
         }
@@ -1289,6 +1301,8 @@ mod tests {
         may_leave: AtomicBool,
         /// `rejection_audit_sink` が返す sink（未設定なら `None`。#1915）。
         audit: std::sync::OnceLock<Arc<crate::audit_log::mount::tests::VecSink>>,
+        /// launch が返すハンドルに持たせる分離の記録(未設定なら記録なし。#2007)。
+        isolation: Mutex<Option<crate::launch_isolation::LaunchIsolationRecord>>,
     }
 
     impl RecordingLauncher {
@@ -1307,7 +1321,13 @@ mod tests {
                 launch_threads: Mutex::new(Vec::new()),
                 may_leave: AtomicBool::new(false),
                 audit: std::sync::OnceLock::new(),
+                isolation: Mutex::new(None),
             })
+        }
+
+        /// 次の launch が返すハンドルに持たせる分離の記録を設定する。
+        fn set_isolation(&self, record: crate::launch_isolation::LaunchIsolationRecord) {
+            *self.isolation.lock().unwrap_or_else(|e| e.into_inner()) = Some(record);
         }
 
         #[cfg(target_os = "linux")]
@@ -1328,11 +1348,21 @@ mod tests {
     }
 
     /// 起動済みプロセスの模擬（terminate の回数を数え、`gate` が開くまで terminate が戻らない）。
-    struct FakeProcess(Arc<AtomicUsize>, bool, Arc<Gate>, NonZeroU32);
+    struct FakeProcess(
+        Arc<AtomicUsize>,
+        bool,
+        Arc<Gate>,
+        NonZeroU32,
+        Option<crate::launch_isolation::LaunchIsolationRecord>,
+    );
 
     impl LaunchedProcess for FakeProcess {
         fn pid(&self) -> NonZeroU32 {
             self.3
+        }
+
+        fn launch_isolation(&self) -> Option<&crate::launch_isolation::LaunchIsolationRecord> {
+            self.4.as_ref()
         }
 
         /// 模擬プロセスは terminate されるまで終了しない（terminate 後は SIGKILL 相当で終了済み）。
@@ -1416,6 +1446,10 @@ mod tests {
                 self.fail_terminate.load(Ordering::SeqCst),
                 self.term_gate.clone(),
                 NonZeroU32::new(self.pid.load(Ordering::SeqCst)).expect("nonzero"),
+                self.isolation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
             )))
         }
     }
@@ -2189,6 +2223,66 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::FailedPrecondition);
         assert_eq!(launcher.calls(), 1);
         assert_eq!(launcher.terminations(), 1);
+    }
+
+    /// 試験用の分離の記録(`/` が `(dev, ino)`・Landlock は rootfs のルール 1 件)。
+    fn iso_record(dev: u64, ino: u64) -> crate::launch_isolation::LaunchIsolationRecord {
+        use crate::launch_isolation::{
+            LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+        };
+        let landlock =
+            RecordedLandlock::new(0x3f, vec![RecordedRule::new(RecordedTarget::Root, 0x0f)])
+                .expect("landlock");
+        LaunchIsolationRecord::from_parts(RootIdentity::new(dev, ino), landlock)
+    }
+
+    /// SUP-6(#2007): ハンドルが持つ分離の記録は、Running の更新と同じ update で状態へ載る。
+    #[test]
+    fn sup6_running_record_carries_launch_isolation() {
+        let (_b, store) = created("iso-carry");
+        let launcher = RecordingLauncher::new(false);
+        launcher.set_isolation(iso_record(7, 11));
+        let record = run(&store, &launcher, "iso-carry").expect("start");
+        let got = record.launch_isolation().expect("recorded");
+        assert_eq!(got.root().dev(), 7);
+        assert_eq!(got.root().ino(), 11);
+        assert!(got == &iso_record(7, 11));
+        let stored = store
+            .get(&GetStateRequest::new(
+                ContainerId::new("iso-carry").expect("id"),
+            ))
+            .expect("get");
+        assert!(stored.launch_isolation() == Some(&iso_record(7, 11)));
+    }
+
+    /// SUP-6(#2007): 記録を持たないハンドルでは、従来どおり分離の記録は付かない。
+    #[test]
+    fn sup6_running_record_without_launch_isolation_is_unchanged() {
+        let (_b, store) = created("iso-none");
+        let launcher = RecordingLauncher::new(false);
+        let record = run(&store, &launcher, "iso-none").expect("start");
+        assert!(record.launch_isolation().is_none());
+    }
+
+    /// SEC-1・SUP-6(#2007): Running の更新に失敗したら Created へ戻り、分離の記録も残らない。
+    #[test]
+    fn sec1_failed_running_write_leaves_no_launch_isolation() {
+        let b = Bundle::new("iso-upd-fail");
+        b.write_config(&valid_config());
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        let store = MemStateStore::new(Some(1));
+        create(&store, &OpRecorder::new(), &b.create_req("iso-upd-fail")).expect("create");
+        let launcher = RecordingLauncher::new(false);
+        launcher.set_isolation(iso_record(7, 11));
+        let err = run(&store, &launcher, "iso-upd-fail").expect_err("fail");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(launcher.terminations(), 1);
+        let stored = store
+            .get(&GetStateRequest::new(
+                ContainerId::new("iso-upd-fail").expect("id"),
+            ))
+            .expect("get");
+        assert!(stored.launch_isolation().is_none());
     }
 
     /// SEC-5: user namespace が無い config（ホスト root での起動になる）は PermissionDenied で拒否する。

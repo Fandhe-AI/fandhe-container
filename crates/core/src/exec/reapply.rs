@@ -175,13 +175,10 @@
 //! - `process.user` が root 以外の場合のユーザー切り替え（launch・exec とも未実装。exec は別の user namespace へ
 //!   参加するとき、launch と同じく root 以外を `Unimplemented` で拒否する）
 //! - ルールパスの解決の起点とプロセスの `/` が食い違う状況での照合専用の試験（上記 4）
-//! - 本番 launcher（`oci_runtime` の `ProcessLauncher` 実装）は未結線で、launch 経路の Landlock も本番では
-//!   まだ適用されない（`exec/landlock.rs`）。launch 時の分離の記録（`launch_isolation_from_bundle` または
-//!   `LaunchIsolationRecord::new`）を `CreateStateRequest::with_launch_isolation` で書く結線も未実装で、結線までは
-//!   supervisor の `identify_pid1` が記録なしで exec を拒否する。restart の再 launch は mount namespace を作り直す
-//!   ため `UpdateStateRequest::with_launch_isolation` で記録し直す必要がある（しないと restart 後の exec は `/` の
-//!   照合で拒否される。fail-closed）。exec と launch の一致は「launch が適用した ruleset を記録し、同じ規則で辿る」
-//!   ことで担保する
+//! - launch 時の分離の記録は、本番 launcher が適用する ruleset そのものから作り、start の Running 更新と restart の
+//!   Running(新 pid) 更新で `state.json` へ書く（結線済み・#2007）。記録を持たない launcher（偽の実装）では
+//!   supervisor の `identify_pid1` が記録なしで exec を拒否する。本番 launcher による restart の再 launch は #2043 まで
+//!   拒否される。exec と launch の一致は「launch が適用した ruleset を記録し、同じ規則で辿る」ことで担保する
 //! - 拒否の違反記録（種別 `exec_target`）の監査ログへの保存のうち、本番の sink の実体の生成と CLI からの
 //!   受け渡し（SEC-4）。層 `AuditLayer::ExecTarget` と supervisor `run_command`（親プロセス側）の 1 拒否 1 件の
 //!   記録は実装済み（#1465）。この段関数単体は記録せず、`ExecError::violation` に載せて返す

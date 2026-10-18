@@ -16,6 +16,8 @@
 //! 2. cgroup 要件の検査(`launch_after_cgroup_check`。要件ありで参加の源が無ければ `FailedPrecondition`。CORE-3)
 //! 3. 呼び出しプロセスが単一スレッドであることの確認(`FailedPrecondition`。CORE-1)
 //! 4. Landlock の ruleset(**必須**。ABI 6 未満は `FailedPrecondition` で起動を拒否し、縮退しない。CORE-5・#1314)
+//!    と、launch 時の分離の記録の作成(pin 済み rootfs の fstat と同じ ruleset。作れなければ `Internal` で拒否。
+//!    成功時は `LaunchedProcess::launch_isolation` で返し、start / restart が `state.json` へ書く。SUP-6・#2007)
 //! 5. ステージ列(`with_landlock` は型上 `Option` を取らず、Landlock 無しの列を作れない。参加の源があれば
 //!    起動のたびに `CgroupJoin` を作って登録する)
 //! 6. 既定 tmpfs(`/dev/shm`)の構築と、bind mount の宛先との重なりの検査(`InvalidArgument`。拒否は
@@ -92,6 +94,8 @@ use crate::exec::{
 };
 #[cfg(target_os = "linux")]
 use crate::landlock::LandlockRuleset;
+#[cfg(target_os = "linux")]
+use crate::launch_isolation::RootIdentity;
 #[cfg(target_os = "linux")]
 use crate::tmpfs::TmpfsMountSet;
 use crate::traits::{ContainerId, ErrorCode, TraitError};
@@ -309,6 +313,9 @@ trait LaunchOps: Send + Sync {
         &self,
         config: &super::config::OciConfig,
     ) -> Result<LandlockRuleset, ExecError>;
+    /// pin 済みの rootfs の `(st_dev, st_ino)`（launch 時の分離の記録の `/`。fstat できなければ `None`。
+    /// SUP-6・#2007）。
+    fn root_identity(&self, rootfs: &super::launch::RootfsDir) -> Option<RootIdentity>;
     /// 中間プロセス経由で PID 1 を起動する。
     fn spawn(&self, input: SpawnInput<'_>) -> Result<Spawned, Box<PreparedLaunchFailure>>;
     /// 報告前に失われた PID 1 を、起動識別子で `/proc` から探して回収する(`confirm_no_process` が、中間プロセスの
@@ -532,6 +539,13 @@ impl Inner {
             .ops
             .landlock_ruleset(spec.config())
             .map_err(|e| to_trait_error(&e))?;
+        // 分離の記録は `with_landlock` へ渡す ruleset そのものと pin 済み rootfs の fstat から、fork の前に作る
+        // (入力を 1 つに保つ。作れなければ子を作らず拒否する。fail-closed。SUP-6・CORE-5・SEC-1・#2007)。
+        let isolation_record = crate::exec::launch_isolation_from_ruleset(
+            &ruleset,
+            self.ops.root_identity(spec.rootfs_dir()),
+        )
+        .map_err(|e| to_trait_error(&e))?;
         let mut stages = StagePipeline::new()
             .with_landlock(ruleset)
             .map_err(|e| to_trait_error(&e))?;
@@ -608,6 +622,7 @@ impl Inner {
         let owner = id.clone();
         let process = super::launch::ContainerChildProcess::new(child)?
             .with_output(stdout, stderr)
+            .with_launch_isolation(isolation_record)
             .with_reap_notice(Box::new(move || {
                 let Some(ledger) = ledger.upgrade() else {
                     return;
@@ -922,6 +937,10 @@ impl LaunchOps for RealOps {
         crate::exec::landlock_ruleset_from_config(config)
     }
 
+    fn root_identity(&self, rootfs: &super::launch::RootfsDir) -> Option<RootIdentity> {
+        RootIdentity::of_dir_fd(rootfs.as_fd())
+    }
+
     fn spawn(&self, input: SpawnInput<'_>) -> Result<Spawned, Box<PreparedLaunchFailure>> {
         let not_started = |e: ExecError| {
             Box::new(PreparedLaunchFailure::clean(
@@ -1047,6 +1066,8 @@ mod tests {
         run_stages: bool,
         /// spawn に渡った bind mount の宛先列と既定 tmpfs の宛先列の記録(spawn ごとに 1 件。bind 無しは `None`)。
         seen: Arc<Mutex<Vec<SeenSpawn>>>,
+        /// `root_identity` が `None`(rootfs を fstat できない)を返すか。
+        fail_root_identity: bool,
     }
 
     impl FakeOps {
@@ -1062,6 +1083,7 @@ mod tests {
                 rescan_results: Mutex::new(VecDeque::new()),
                 run_stages: true,
                 seen: Arc::new(Mutex::new(Vec::new())),
+                fail_root_identity: false,
             }
         }
     }
@@ -1083,6 +1105,14 @@ mod tests {
             push(&self.events, "landlock");
             let detected = crate::landlock::evaluate_abi(self.abi.unwrap_or(6));
             crate::exec::ruleset_from_detection(detected, config)
+        }
+
+        fn root_identity(&self, rootfs: &super::super::launch::RootfsDir) -> Option<RootIdentity> {
+            push(&self.events, "root_identity");
+            if self.fail_root_identity {
+                return None;
+            }
+            RootIdentity::of_dir_fd(rootfs.as_fd())
         }
 
         fn spawn(&self, input: SpawnInput<'_>) -> Result<Spawned, Box<PreparedLaunchFailure>> {
@@ -1243,12 +1273,12 @@ mod tests {
         assert_eq!(p.pid().get(), pid_of.load(Ordering::SeqCst));
         p.terminate(Duration::from_secs(5)).expect("terminate");
         let log = ev.lock().unwrap().clone();
-        assert_eq!(log.len(), 4, "{log:?}");
-        assert_eq!(&log[..2], ["threads", "landlock"]);
-        assert_eq!(log[3], "evidence ready");
-        assert!(log[2].starts_with("spawn StagePipeline"), "{}", log[2]);
-        assert!(log[2].contains(r#"landlock: "ruleset""#), "{}", log[2]);
-        assert!(!log[2].contains("custom_hook"), "{}", log[2]);
+        assert_eq!(log.len(), 5, "{log:?}");
+        assert_eq!(&log[..3], ["threads", "landlock", "root_identity"]);
+        assert_eq!(log[4], "evidence ready");
+        assert!(log[3].starts_with("spawn StagePipeline"), "{}", log[3]);
+        assert!(log[3].contains(r#"landlock: "ruleset""#), "{}", log[3]);
+        assert!(!log[3].contains("custom_hook"), "{}", log[3]);
     }
 
     /// SEC-1・CORE-5: Landlock を欠くステージ列では制限適用の証跡がそろわず(exec に進めない)、launcher の
@@ -1284,6 +1314,95 @@ mod tests {
             !ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")),
             "must not spawn"
         );
+    }
+
+    /// SUP-6・CORE-5(#2007): 成功した launch は、適用する ruleset と同じ内容の分離の記録を返し、記録の作成は fork より前。
+    #[test]
+    fn sup6_launch_isolation_is_recorded_from_the_same_ruleset() {
+        use crate::launch_isolation::{RecordedTarget, RootIdentity};
+        let spec = spec_for("iso-record", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let record = p.launch_isolation().expect("record").clone();
+        let want_root = RootIdentity::of_dir_fd(spec.rootfs_dir().as_fd()).expect("fstat");
+        assert_eq!(record.root(), want_root);
+        let ruleset =
+            crate::exec::ruleset_from_detection(crate::landlock::evaluate_abi(6), spec.config())
+                .expect("ruleset");
+        let expected = crate::launch_isolation::LaunchIsolationRecord::new(want_root, &ruleset)
+            .expect("expected record");
+        assert!(
+            record == expected,
+            "record must come from the applied ruleset"
+        );
+        let targets: Vec<&str> = record
+            .landlock()
+            .rules()
+            .iter()
+            .map(|r| r.target().as_str())
+            .collect();
+        assert_eq!(targets.first().copied(), Some("/"));
+        assert!(matches!(
+            record.landlock().rules().first().map(|r| r.target()),
+            Some(RecordedTarget::Root)
+        ));
+        let events = ev.lock().unwrap().clone();
+        let pos = |name: &str| events.iter().position(|e| e.starts_with(name)).expect(name);
+        assert!(pos("landlock") < pos("root_identity"));
+        assert!(pos("root_identity") < pos("spawn"));
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SUP-6・OCI-4(#2007・#1915): bind mount の分も同じ ruleset から記録に入る。
+    #[test]
+    fn oci4_sup6_launch_isolation_includes_bind_mounts() {
+        use crate::launch_isolation::RecordedTarget;
+        let spec = spec_with_mounts("iso-binds", serde_json::json!({}), bind_mounts_json());
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let record = p.launch_isolation().expect("record");
+        let mounts: Vec<(String, usize)> = record
+            .landlock()
+            .rules()
+            .iter()
+            .filter_map(|r| match r.target() {
+                RecordedTarget::Mount { destination, index } => {
+                    Some((destination.as_str().to_owned(), *index))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            mounts,
+            vec![("/data".to_owned(), 0), ("/cache".to_owned(), 1)]
+        );
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SEC-1・SUP-6(#2007): 記録を作れない(rootfs を fstat できない)なら fork せずに `Internal` で拒否する。
+    #[test]
+    fn sec1_launch_isolation_failure_refuses_before_fork() {
+        let spec = spec_for("iso-fail", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.fail_root_identity = true;
+        let l = launcher(ops, rootless(), None);
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(
+            err.message(),
+            "container launch failed in the Validate stage"
+        );
+        assert!(
+            !ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")),
+            "must not spawn"
+        );
+        assert!(!l.last_launch_may_have_left_process());
     }
 
     /// CORE-3: cgroup 要件ありで参加の源が無ければ、スレッド確認・Landlock・fork より前に拒否する。

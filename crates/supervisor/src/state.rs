@@ -24,6 +24,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use fandhe_container_core::launch_isolation::LaunchIsolationRecord;
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
 use fandhe_container_core::traits::{
     ContainerId, ContainerStatus, ErrorCode, GetStateRequest, StateRecord, StateStore,
@@ -92,14 +93,38 @@ impl SupervisedState {
         status: ContainerStatus,
         supervision: SupervisionState,
     ) -> Result<&StateRecord, TraitError> {
+        self.write_with_isolation(status, supervision, None)
+    }
+
+    /// restart の再 launch の記録用。`write` に加えて、再 launch が確定した分離の記録を渡されれば置き換える
+    /// （再 launch で mount namespace が作り直されるため。`None` は前の記録を引き継ぐ。トレイト契約 12。
+    /// SUP-6・SUP-3・#2007）。
+    pub fn write_relaunched(
+        &mut self,
+        status: ContainerStatus,
+        supervision: SupervisionState,
+        launch_isolation: Option<LaunchIsolationRecord>,
+    ) -> Result<&StateRecord, TraitError> {
+        self.write_with_isolation(status, supervision, launch_isolation)
+    }
+
+    fn write_with_isolation(
+        &mut self,
+        status: ContainerStatus,
+        supervision: SupervisionState,
+        launch_isolation: Option<LaunchIsolationRecord>,
+    ) -> Result<&StateRecord, TraitError> {
         if status.id() != &self.id {
             return Err(TraitError::new(
                 ErrorCode::InvalidArgument,
                 "status id does not match the supervised container",
             ));
         }
-        let req =
+        let mut req =
             UpdateStateRequest::new(status, self.last.revision()).with_supervision(supervision);
+        if let Some(record) = launch_isolation {
+            req = req.with_launch_isolation(record);
+        }
         self.last = self.store.update(&req)?;
         Ok(&self.last)
     }

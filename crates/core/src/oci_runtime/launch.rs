@@ -649,6 +649,17 @@ pub trait LaunchedProcess: Send {
     fn take_output(&self) -> Option<ContainerOutput> {
         None
     }
+
+    /// launch が確定した分離の記録（`/` の識別子と適用した Landlock ルール）。start が Running の更新と同じ
+    /// `update` で、restart が Running(新 pid) の更新で `state.json` へ書く（SUP-6・CORE-5・SEC-1・#2007）。
+    ///
+    /// 本番 launcher は必ず `Some` を持たせる（作れなければ launch が `Err` になる）。既定の `None` は記録を
+    /// 作らない実装（偽の launcher・Linux 以外）用で、状態の記録は前の値のまま引き継がれ、exec は記録が無ければ
+    /// 拒否する。`LaunchedProcess` を包み直す実装は内側へ転送すること（転送しないと restart の後の exec が
+    /// 拒否される。`take_output` と同じ注意）。
+    fn launch_isolation(&self) -> Option<&crate::launch_isolation::LaunchIsolationRecord> {
+        None
+    }
 }
 
 /// `exec::ContainerChild`（fork した子）を [`LaunchedProcess`] として扱うアダプタ（Linux。CORE-1・REPAIR-5）。
@@ -668,6 +679,8 @@ pub struct ContainerChildProcess {
     /// `terminate` が成功（回収を確かめられた）したときに 1 回呼ぶ通知。本番 launcher が起動台帳へ回収の
     /// 証跡を引き継ぐために付ける（CORE-2）。
     reap_notice: Option<ReapNotice>,
+    /// launch が確定した分離の記録（本番 launcher が付ける。[`LaunchedProcess::launch_isolation`]）。
+    launch_isolation: Option<crate::launch_isolation::LaunchIsolationRecord>,
 }
 
 /// [`ContainerChildProcess::with_reap_notice`] の通知。
@@ -700,7 +713,18 @@ impl ContainerChildProcess {
             pid,
             output: std::sync::Mutex::new(None),
             reap_notice: None,
+            launch_isolation: None,
         })
+    }
+
+    /// launch が確定した分離の記録を持たせる（[`LaunchedProcess::launch_isolation`] で返る。#2007）。
+    #[must_use]
+    pub(crate) fn with_launch_isolation(
+        mut self,
+        record: crate::launch_isolation::LaunchIsolationRecord,
+    ) -> Self {
+        self.launch_isolation = Some(record);
+        self
     }
 
     /// `terminate` が成功したときに呼ぶ通知を持たせる（起動台帳への回収の証跡の引き継ぎ。CORE-2）。
@@ -739,6 +763,10 @@ impl LaunchedProcess for ContainerChildProcess {
 
     fn launch_pidfd(&self) -> Option<BorrowedFd<'_>> {
         self.child.pidfd()
+    }
+
+    fn launch_isolation(&self) -> Option<&crate::launch_isolation::LaunchIsolationRecord> {
+        self.launch_isolation.as_ref()
     }
 
     fn take_output(&self) -> Option<ContainerOutput> {

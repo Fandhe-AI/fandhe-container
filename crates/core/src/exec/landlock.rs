@@ -141,21 +141,32 @@ fn ruleset_from_recorded_detection(
 /// pivot 後の `/` と一致する。overlay など rootfs を mount namespace の中で組み立てる launcher は本関数ではなく、
 /// 子の pivot 後の `/` から [`RootIdentity`] を得て `LaunchIsolationRecord::new` を使う。
 ///
-/// 将来仕様: 本番 launcher からの結線（作った記録を `CreateStateRequest::with_launch_isolation` で書く）は
-/// 後続作業（REPAIR-3）。
+/// 本番 launcher（`oci_runtime` の `ProductionLauncher`）は本関数を呼ばず、`StagePipeline::with_landlock` へ渡す
+/// ruleset そのものから `launch_isolation_from_ruleset` で記録を作る（入力を 1 つに保つ。SUP-6・SEC-1・#2007）。
+/// 本関数は試験と、独自の launcher 向けである。
 pub fn launch_isolation_from_bundle(
     config: &OciConfig,
     rootfs: &RootfsDir,
 ) -> Result<LaunchIsolationRecord, ExecError> {
     let ruleset = landlock_ruleset_from_config(config)?;
-    let root = RootIdentity::of_dir_fd(rootfs.as_fd()).ok_or_else(|| {
+    launch_isolation_from_ruleset(&ruleset, RootIdentity::of_dir_fd(rootfs.as_fd()))
+}
+
+/// launch が適用する `ruleset` と `/` の識別子から、`state.json` へ書く [`LaunchIsolationRecord`] を作る
+/// （`launch_isolation_from_bundle` と本番 launcher の共通部。`root` が `None` は rootfs の fstat 失敗。
+/// 失敗は fork 前の `Internal` として扱う。SUP-6・CORE-5・SEC-1・#2007）。
+pub(crate) fn launch_isolation_from_ruleset(
+    ruleset: &LandlockRuleset,
+    root: Option<RootIdentity>,
+) -> Result<LaunchIsolationRecord, ExecError> {
+    let root = root.ok_or_else(|| {
         ExecError::new(
             ErrorCode::Internal,
             IsolationStage::Validate,
             "failed to inspect the rootfs",
         )
     })?;
-    LaunchIsolationRecord::new(root, &ruleset)
+    LaunchIsolationRecord::new(root, ruleset)
         .map_err(|e| ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, e.message()))
 }
 
@@ -506,6 +517,19 @@ mod tests {
         assert_eq!(ok.handled_access_fs().bits(), 0x1FFF);
         assert_eq!(ok.rules().len(), 1);
         assert_eq!(ok.rules()[0].allowed.bits(), 0x5);
+    }
+
+    /// SUP-6・SEC-1(#2007): rootfs を fstat できない(`root` が `None`)と、固定文言の `Internal` で拒否する。
+    #[test]
+    fn sup6_2007_launch_isolation_from_ruleset_refuses_missing_root() {
+        let ruleset = crate::landlock::LandlockRuleset::from_recorded(
+            crate::landlock::AccessFs::from_bits(0x1FFF).expect("handled"),
+            Vec::new(),
+        );
+        let e = launch_isolation_from_ruleset(&ruleset, None).expect_err("refused");
+        assert_eq!(e.code, ErrorCode::Internal);
+        assert_eq!(e.stage, IsolationStage::Validate);
+        assert_eq!(e.message, "failed to inspect the rootfs");
     }
 
     /// OCI-4・CORE-5・SEC-1(#1915): Landlock の ruleset は、適用する bind と同じ `mounts[]` から導かれる。

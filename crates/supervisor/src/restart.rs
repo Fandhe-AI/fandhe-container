@@ -9,7 +9,9 @@
 //! [`supervise_with_restart`] は `monitor` を周回させる外側のループで、終了検知 → [`evaluate_restart`] →
 //! バックオフ → [`Relauncher::relaunch`] → `Running(新 pid)` と `restart_count + 1` の同時記録を行う。
 //! `restart_count` は「実施済み再起動の回数」で、再 launch に成功し `Running` を記録できた 1 回の書き込みでだけ
-//! 1 進む（再 launch 失敗・記録失敗は数えない）。
+//! 1 進む（再 launch 失敗・記録失敗は数えない）。この書き込みは、再 launch したハンドルの
+//! `LaunchedProcess::launch_isolation`（launch 時の分離の記録）も `state.json` へ置き換える（SUP-6・#2007）。
+//! ハンドルが記録を持たない場合（偽の launcher のみ）は前の記録を引き継ぐ（トレイト契約 12）。
 //!
 //! # 未実装の将来仕様（REPAIR-3）
 //! - 本番の再 launch は [`LauncherRelauncher`]（start で使った launcher と `LaunchSpec` をそのまま使うアダプタ。#1717）で、
@@ -983,8 +985,14 @@ pub fn supervise_with_restart(
                 state.record().health(),
                 state.record().restart_count().saturating_add(1),
             );
+            // 再 launch が確定した分離の記録も同じ書き込みで置き換える(再 launch で mount namespace が作り直されるため、
+            // 前の記録のままだと restart 後の exec が `/` の照合で拒否される。SUP-6・#2007)。
             state
-                .write(ContainerStatus::running(id, Some(new_pid)), supervision)
+                .write_relaunched(
+                    ContainerStatus::running(id, Some(new_pid)),
+                    supervision,
+                    new_process.launch_isolation().cloned(),
+                )
                 .map(drop)
         } else {
             Err(precondition(
@@ -1601,13 +1609,18 @@ mod tests {
             let mut g = self.rec.lock().unwrap();
             let mut c = self.conflicts.lock().unwrap();
             let bump = |g: &StateRecord, sup: SupervisionState, st: ContainerStatus| {
-                StateRecord::new(
+                let next = StateRecord::new(
                     st,
                     g.bundle().to_path_buf(),
                     StateRevision::from_raw(g.revision().value() + 1),
                 )
                 .unwrap()
-                .with_supervision(sup)
+                .with_supervision(sup);
+                // 契約 12: 指定があれば置き換え、なければ既存の値を引き継ぐ。
+                match req.launch_isolation().or(g.launch_isolation()) {
+                    Some(l) => next.with_launch_isolation(l.clone()),
+                    None => next,
+                }
             };
             if *c > 0 {
                 *c -= 1;
@@ -1696,6 +1709,29 @@ mod tests {
         }
     }
 
+    /// 分離の記録を持つ疑似プロセス(内側の `Fp` へ委ねる。#2007)。
+    struct IsoProc {
+        inner: Fp,
+        record: fandhe_container_core::launch_isolation::LaunchIsolationRecord,
+    }
+
+    impl LaunchedProcess for IsoProc {
+        fn pid(&self) -> NonZeroU32 {
+            self.inner.pid()
+        }
+        fn wait(&self, t: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            self.inner.wait(t)
+        }
+        fn terminate(&self, t: Duration) -> Result<(), TraitError> {
+            self.inner.terminate(t)
+        }
+        fn launch_isolation(
+            &self,
+        ) -> Option<&fandhe_container_core::launch_isolation::LaunchIsolationRecord> {
+            Some(&self.record)
+        }
+    }
+
     /// 用意した (pid, exit) を順に返し、尽きたら `Unavailable` で失敗する再 launch。
     struct Queue {
         items: Mutex<VecDeque<(u32, ProcessExit)>>,
@@ -1703,6 +1739,8 @@ mod tests {
         terminated: Arc<AtomicU32>,
         /// 再 launch の直前に store を競合させる（`Running` 記録を失敗させる）。
         sabotage: Option<Arc<Store>>,
+        /// 返す新しいハンドルに持たせる分離の記録(`None` なら記録なし)。
+        isolation: Option<fandhe_container_core::launch_isolation::LaunchIsolationRecord>,
     }
 
     impl Queue {
@@ -1712,6 +1750,7 @@ mod tests {
                 calls: AtomicU32::new(0),
                 terminated: Arc::new(AtomicU32::new(0)),
                 sabotage: None,
+                isolation: None,
             }
         }
     }
@@ -1724,11 +1763,20 @@ mod tests {
             }
             let next = self.items.lock().unwrap().pop_front();
             match next {
-                Some((pid, exit)) => Ok(Box::new(Fp {
-                    pid,
-                    exit,
-                    terminated: self.terminated.clone(),
-                })),
+                Some((pid, exit)) => {
+                    let fp = Fp {
+                        pid,
+                        exit,
+                        terminated: self.terminated.clone(),
+                    };
+                    match &self.isolation {
+                        Some(record) => Ok(Box::new(IsoProc {
+                            inner: fp,
+                            record: record.clone(),
+                        })),
+                        None => Ok(Box::new(fp)),
+                    }
+                }
                 None => Err(TraitError::new(ErrorCode::Unavailable, "no more processes")),
             }
         }
@@ -1795,6 +1843,78 @@ mod tests {
     }
 
     const FAIL: ProcessExit = ProcessExit::Exited(1);
+
+    /// 試験用の分離の記録(`/` が `(dev, ino)`・Landlock は rootfs のルール 1 件)。
+    fn iso(dev: u64, ino: u64) -> fandhe_container_core::launch_isolation::LaunchIsolationRecord {
+        use fandhe_container_core::launch_isolation::{
+            LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+        };
+        let landlock =
+            RecordedLandlock::new(0x3f, vec![RecordedRule::new(RecordedTarget::Root, 0x0f)])
+                .unwrap();
+        LaunchIsolationRecord::from_parts(RootIdentity::new(dev, ino), landlock)
+    }
+
+    /// SUP-6・SUP-3(#2007): restart の再 launch は、Running(新 pid) と restart_count + 1 の書き込みで
+    /// launch 時の分離の記録を新しい launch の値(`/` が (3, 4))へ置き換える。
+    #[test]
+    fn sup3_sup6_restart_replaces_launch_isolation_with_the_new_launch() {
+        let st = store(0, 42);
+        // 初期の記録(`/` が (1, 2))を載せる。
+        {
+            let mut g = st.rec.lock().unwrap();
+            let cur = g.clone();
+            *g = StateRecord::new(
+                cur.status().clone(),
+                cur.bundle().to_path_buf(),
+                StateRevision::from_raw(cur.revision().value()),
+            )
+            .unwrap()
+            .with_supervision(cur.supervision())
+            .with_launch_isolation(iso(1, 2));
+        }
+        let mut q = Queue::new(&[(43, ProcessExit::Exited(0))]);
+        q.isolation = Some(iso(3, 4));
+        let q = Arc::new(q);
+        let _ = run(
+            &st,
+            "always",
+            FAIL,
+            &q,
+            &StopToken::new(),
+            &Events::default(),
+        );
+        // 1 回再起動した後に再 launch が尽きても、記録は新しい launch の値のまま。
+        let g = st.rec.lock().unwrap();
+        let rec = g.launch_isolation().expect("recorded");
+        assert_eq!(rec.root().dev(), 3);
+        assert_eq!(rec.root().ino(), 4);
+        assert!(rec == &iso(3, 4));
+        assert_eq!(g.restart_count(), 1);
+    }
+
+    /// SUP-6(#2007): 記録を持たない再 launch のハンドルでは、前の記録(`/` が (1, 2))を引き継ぐ(契約 12)。
+    #[test]
+    fn sup6_restart_without_launch_isolation_keeps_the_previous_record() {
+        let st = store(0, 42);
+        {
+            let mut g = st.rec.lock().unwrap();
+            let cur = g.clone();
+            *g = cur.with_launch_isolation(iso(1, 2));
+        }
+        let q = Arc::new(Queue::new(&[(43, ProcessExit::Exited(0))]));
+        let _ = run(
+            &st,
+            "always",
+            FAIL,
+            &q,
+            &StopToken::new(),
+            &Events::default(),
+        );
+        let g = st.rec.lock().unwrap();
+        assert!(g.launch_isolation() == Some(&iso(1, 2)));
+        assert_eq!(g.restart_count(), 1);
+    }
 
     /// SUP-3・TASK-159.3: `always` は再起動ごとに restart_count が 1・2・3 と増え、
     /// 再 launch が尽きた時点（3 回再起動後）で RelaunchFailed・restart_count == 3・状態は Stopped。

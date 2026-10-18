@@ -61,12 +61,12 @@ impl<'a> StoreRefs<'a> {
 }
 
 impl ContainerImageRefs for StoreRefs<'_> {
-    fn bind(&self, id: &ContainerId) -> Result<(), TraitError> {
+    fn bind(&self, id: &ContainerId) -> Result<ImageRefGeneration, TraitError> {
         let mut g = self.generations.lock().unwrap_or_else(|e| e.into_inner());
         match g.1.get_mut(id.as_str()) {
             Some(entry) if !entry.1 => {
                 entry.1 = true;
-                Ok(())
+                Ok(ImageRefGeneration::from_raw(entry.0))
             }
             _ => Err(TraitError::new(ErrorCode::NotFound, "no unbound reference")),
         }

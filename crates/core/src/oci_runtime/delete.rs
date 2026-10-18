@@ -1309,7 +1309,7 @@ mod tests {
         ) -> Result<crate::oci_runtime::ImageRefRegistration, TraitError> {
             Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
         }
-        fn bind(&self, _id: &ContainerId) -> Result<(), TraitError> {
+        fn bind(&self, _id: &ContainerId) -> Result<ImageRefGeneration, TraitError> {
             Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
         }
         fn registration(

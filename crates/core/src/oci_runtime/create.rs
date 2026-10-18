@@ -43,8 +43,8 @@ use super::error::{LifecycleOp, OciRuntimeError};
 use super::image_refs::{ContainerImage, ImageRefRegistration};
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
-    ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, StateRecord, StateStore,
-    TraitError,
+    ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, GetStateRequest, StateRecord,
+    StateStore, TraitError,
 };
 
 /// bundle 直下の設定ファイル名（OCI Runtime Spec）。
@@ -151,8 +151,21 @@ fn create_with_image_inner(
             // create の参照を、既存の別の状態の delete が巻き込んで外す競合を防げる。失敗しても状態は
             // 作成済みなので成功を返す（参照は未結合のまま残り、delete は外さない。余分に持つだけの安全側。
             // 起動時の照合〔#854〕が回収する）。記録は `image_ref_bind`。
-            if let Ok(name) = OpName::new(IMAGE_REF_BIND_OP_NAME) {
-                let _ = recorder.record_op(&name, || image.refs().bind(req.id()));
+            if let Ok(name) = OpName::new(IMAGE_REF_BIND_OP_NAME)
+                && let Ok(generation) = recorder.record_op(&name, || image.refs().bind(req.id()))
+            {
+                // 状態作成から確定までの間に並行する delete が状態を消していると、delete は未確定の参照を
+                // 読めず外さない。確定した参照は他の create が同じ ID を登録できないので（`register` が
+                // AlreadyRegistered を返す）、確定後に状態が無ければそれは自分が作った状態が消えたことを
+                // 意味する。自分の世代だけを外す（再作成された別の参照を巻き込まない）。
+                let gone = matches!(
+                    store.get(&GetStateRequest::new(req.id().clone())),
+                    Err(ref e) if e.code() == ErrorCode::NotFound
+                );
+                if gone && let Ok(name) = OpName::new(IMAGE_REF_ROLLBACK_OP_NAME) {
+                    let _ =
+                        recorder.record_op(&name, || image.refs().release_if(req.id(), generation));
+                }
             }
             Ok(record)
         }
@@ -353,8 +366,12 @@ mod tests {
             Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
         }
 
-        fn delete(&self, _req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
-            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+            let mut records = self.records.lock().unwrap_or_else(|e| e.into_inner());
+            records
+                .remove(req.id())
+                .map(|_| DeleteStateResponse::new())
+                .ok_or_else(|| TraitError::new(ErrorCode::NotFound, "not found"))
         }
     }
 
@@ -661,6 +678,8 @@ mod tests {
         inner: MemStateStore,
         log: Log,
         create_error: Option<ErrorCode>,
+        /// 状態作成の直後に並行する delete が状態を消した状況を再現する。
+        delete_after_create: bool,
     }
 
     impl StateStore for LoggingStore {
@@ -669,7 +688,14 @@ mod tests {
             if let Some(code) = self.create_error {
                 return Err(TraitError::new(code, "injected"));
             }
-            self.inner.create(req)
+            let record = self.inner.create(req)?;
+            if self.delete_after_create {
+                self.inner.delete(&DeleteStateRequest::new(
+                    req.id().clone(),
+                    record.revision(),
+                ))?;
+            }
+            Ok(record)
         }
         fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
             self.inner.update(req)
@@ -708,9 +734,12 @@ mod tests {
             push(&self.log, "refs.release");
             Ok(ImageRefRelease::Released)
         }
-        fn bind(&self, _id: &ContainerId) -> Result<(), TraitError> {
+        fn bind(
+            &self,
+            _id: &ContainerId,
+        ) -> Result<crate::oci_runtime::ImageRefGeneration, TraitError> {
             push(&self.log, "refs.bind");
-            Ok(())
+            Ok(crate::oci_runtime::ImageRefGeneration::from_raw(1))
         }
         fn registration(
             &self,
@@ -723,6 +752,7 @@ mod tests {
             _id: &ContainerId,
             _expected: crate::oci_runtime::ImageRefGeneration,
         ) -> Result<ImageRefRelease, TraitError> {
+            push(&self.log, "refs.release_if");
             Ok(ImageRefRelease::NotRegistered)
         }
     }
@@ -737,6 +767,7 @@ mod tests {
             inner: MemStateStore::new(),
             log: Arc::clone(&log),
             create_error,
+            delete_after_create: false,
         };
         let refs = LoggingRefs {
             log: Arc::clone(&log),
@@ -842,5 +873,23 @@ mod tests {
             .snapshot_op(&OpName::new("create").expect("name"))
             .expect("recorded");
         assert_eq!(stats.failure(), 1);
+    }
+
+    /// OCI-7: 状態作成と確定の間に並行する delete が状態を消していたら、確定した自分の世代の参照を外す。
+    #[test]
+    fn oci7_create_releases_bound_ref_when_state_vanished_before_bind() {
+        let b = ready_bundle("oci7-vanish");
+        let (mut store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        store.delete_after_create = true;
+        run_with_image(&store, &refs, &OpRecorder::new(), &b).expect("create");
+        assert_eq!(
+            log_of(&log),
+            vec![
+                "refs.register",
+                "store.create",
+                "refs.bind",
+                "refs.release_if"
+            ]
+        );
     }
 }

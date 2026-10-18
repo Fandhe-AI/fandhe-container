@@ -106,7 +106,8 @@ impl ImageRefGeneration {
 /// - `bind`: `id` の現在の登録を「状態作成まで済んだ参照」として確定する（create が状態作成の成功直後に
 ///   呼ぶ）。未確定の登録だけが対象で、登録が無ければ [`ErrorCode::NotFound`]。確定は、登録しただけで
 ///   状態作成前に止まった create の参照を、並行する別の状態の delete が誤って外さないための目印である。
-///   状態の revision は使わない（start 等の更新で変わり、delete 時の照合が外れるため。#2265 の指摘）。
+///   確定した登録の世代を返す。create は確定の後に状態の存在を確かめ、確定の前に並行する delete が状態を消していたら
+///   この世代で `release_if` して参照の取り残しを防ぐ。状態の revision は使わない（start 等の更新で変わり、delete 時の照合が外れるため。#2265 の指摘）。
 ///   同じ ID の確定済みの登録は高々 1 件で（確定済みの間は `register` が `AlreadyRegistered` を返し
 ///   create が拒否される）、状態が存在する間それは現在の状態に属する
 /// - `registration`: `id` の現在の登録のうち、確定済みのものの世代。登録が無い・未確定のときは `None`
@@ -126,7 +127,7 @@ pub trait ContainerImageRefs {
     fn release(&self, id: &ContainerId) -> Result<ImageRefRelease, TraitError>;
 
     /// `id` の現在の登録を、状態作成まで済んだ参照として確定する。
-    fn bind(&self, id: &ContainerId) -> Result<(), TraitError>;
+    fn bind(&self, id: &ContainerId) -> Result<ImageRefGeneration, TraitError>;
 
     /// `id` の登録のうち確定済みのものの世代を返す。無ければ `None`。
     fn registration(&self, id: &ContainerId) -> Result<Option<ImageRefGeneration>, TraitError>;

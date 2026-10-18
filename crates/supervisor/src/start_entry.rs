@@ -242,6 +242,30 @@ fn log_event(event: &'static str, code: Option<ErrorCode>) {
     let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
 }
 
+/// `dev.tty.legacy_tiocsti` の観測値が警告対象なら、固定の 1 行を `sink` へ待たずに入れる（CORE-5・SEC-1・REPAIR-4・
+/// REPAIR-5・#2008）。対象外なら何もせず `None`。キュー満杯でも待たず、結果は起動の可否に使わない。
+fn log_legacy_tiocsti_to(
+    sink: &crate::stderr_sink::StderrSink,
+    state: fandhe_container_core::legacy_tiocsti::LegacyTiocsti,
+) -> Option<crate::stderr_sink::EmitOutcome> {
+    let line = fandhe_container_core::legacy_tiocsti::warning_line(state)?;
+    Some(sink.emit(format!("{line}\n").into_bytes()))
+}
+
+/// start の成功後に `dev.tty.legacy_tiocsti` の警告を supervisor のログ（`@supervisor-logs`）へ 1 行残す（#2008）。
+///
+/// core の出力（fd 2 が AF_UNIX の socket のときだけ届く）は CLI の `start`（stderr が null）では捨てられるため、
+/// supervisor が自分で観測して残す。`stderr_sink` の常駐スレッドを作るので、単一スレッド前提の区間が終わった後
+/// （`oci_runtime::start` の成功後）にだけ呼ぶ。fd 2 が socket の構成では core の出力と重複するが、出力先が別なので
+/// 許容する。restart の再 launch では再出力しない（host のグローバルな値で、初回に記録済みのため）。
+/// 残余: この呼び出しを消しても単体試験では検出できない（global の sink は差し替え後に初期化し直せない）。
+fn log_legacy_tiocsti() {
+    let _ = log_legacy_tiocsti_to(
+        crate::stderr_sink::stderr(),
+        fandhe_container_core::legacy_tiocsti::read_host(),
+    );
+}
+
 /// 回収を確かめられなかったハンドルの保管先（`Drop` は回収しないため、捨てずに保持する。REPAIR-5）。
 static STRANDED: Mutex<Vec<Box<dyn LaunchedProcess>>> = Mutex::new(Vec::new());
 
@@ -572,6 +596,7 @@ fn start_reporting(
                         pid: running.process.pid(),
                     },
                 );
+                log_legacy_tiocsti();
                 Ok(running)
             }
             Attempt::Failed { error, cleanup } => {
@@ -2334,6 +2359,90 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 書かれたバイト列を共有する書き手(#2008 の試験用)。
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 解放されるまで最初の書き込みで止まる書き手(#2008 の試験用)。
+    struct BlockedWriter(std::sync::mpsc::Receiver<()>);
+
+    impl Write for BlockedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const LEGACY_LINE: &str = r#"{"level":"warn","event":"legacy_tiocsti_enabled","sysctl":"dev.tty.legacy_tiocsti","value":1}"#;
+
+    /// CORE-5・SEC-1・REPAIR-4(#2008): 有効のとき固定 1 行が改行付きでログへ入る。
+    #[test]
+    fn sup_core5_2008_enabled_logs_exact_line() {
+        use crate::stderr_sink::{EmitOutcome, StderrSink};
+        use fandhe_container_core::legacy_tiocsti::LegacyTiocsti;
+        let buf = SharedBuf::default();
+        let sink = StderrSink::spawn(buf.clone(), 4);
+        assert_eq!(
+            log_legacy_tiocsti_to(&sink, LegacyTiocsti::Enabled),
+            Some(EmitOutcome::Queued)
+        );
+        assert_eq!(sink.flush(Duration::from_secs(5)), EmitOutcome::Written);
+        assert_eq!(
+            buf.0.lock().unwrap().as_slice(),
+            format!("{LEGACY_LINE}\n").as_bytes()
+        );
+    }
+
+    /// CORE-5(#2008): 対象外の状態では何も入れない。
+    #[test]
+    fn sup_core5_2008_non_applicable_logs_nothing() {
+        use crate::stderr_sink::StderrSink;
+        use fandhe_container_core::legacy_tiocsti::LegacyTiocsti;
+        for state in [
+            LegacyTiocsti::Absent,
+            LegacyTiocsti::Disabled,
+            LegacyTiocsti::Unexpected,
+            LegacyTiocsti::ReadFailed {
+                kind: std::io::ErrorKind::PermissionDenied,
+            },
+        ] {
+            let buf = SharedBuf::default();
+            let sink = StderrSink::spawn(buf.clone(), 4);
+            assert_eq!(log_legacy_tiocsti_to(&sink, state), None, "{state:?}");
+            let _ = sink.flush(Duration::from_secs(5));
+            assert!(buf.0.lock().unwrap().is_empty(), "{state:?}");
+        }
+    }
+
+    /// REPAIR-5(#2008): 書き手が止まりキューが満杯でも待たずに `QueueFull` で戻る。
+    #[test]
+    fn sup_repair5_2008_full_queue_does_not_block() {
+        use crate::stderr_sink::{EmitOutcome, StderrSink};
+        use fandhe_container_core::legacy_tiocsti::LegacyTiocsti;
+        let (release, rx) = std::sync::mpsc::channel();
+        let sink = StderrSink::spawn(BlockedWriter(rx), 1);
+        let started = Instant::now();
+        let outcomes: Vec<_> = (0..8)
+            .map(|_| log_legacy_tiocsti_to(&sink, LegacyTiocsti::Enabled))
+            .collect();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(outcomes.last(), Some(&Some(EmitOutcome::QueueFull)));
+        drop(release);
+    }
 
     /// terminate が呼び出し側の期限より遅れて成功する起動ハンドル。
     struct SlowOk(u32, Duration);

@@ -32,6 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{ImageStore, MAX_COMPOSITION_LAYERS, PullId};
 use crate::error::{OciError, OciErrorCode};
+use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 use crate::reference::Digest;
 
 /// ストア root 直下のステージング領域名。GC・`image ls` の走査対象外。
@@ -41,6 +42,9 @@ const STAGING_DIR_NAME: &str = "staging";
 const MAX_SESSION_BLOBS: usize = MAX_COMPOSITION_LAYERS + 1;
 
 static PULL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// セッション識別子の採番。トークンの発行元照合に使う（プロセス内で一意）。
+static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn err(code: OciErrorCode, msg: &str) -> OciError {
     OciError::new(code, msg)
@@ -79,6 +83,8 @@ pub enum BlobReuse {
 pub struct LeasedBlob {
     digest: Digest,
     path: PathBuf,
+    /// 発行元セッションの識別子。別セッション・別ストアのトークンによる解放を拒否するための照合用。
+    session: u64,
 }
 
 impl LeasedBlob {
@@ -98,8 +104,13 @@ impl LeasedBlob {
 pub struct PullSession<'a> {
     store: &'a ImageStore,
     id: PullId,
+    /// このセッション固有の識別子（`LeasedBlob` の発行元照合）。
+    session: u64,
     staging_dir: PathBuf,
     touched: BTreeSet<Digest>,
+    /// 現在リースを保持している digest。同一 digest の二重取得を拒否して、
+    /// 1 リース = 1 トークンを保つ（片方の解放で他方のリースが消えないようにする）。
+    leased: BTreeSet<Digest>,
 }
 
 fn hex_of(digest: &Digest) -> Result<&str, OciError> {
@@ -119,6 +130,7 @@ fn io_err(e: &std::io::Error, msg: &str) -> OciError {
 }
 
 fn make_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut b = fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -147,6 +159,20 @@ impl ImageStore {
     /// 同じ ID のディレクトリが既にあれば `AlreadyExists`（二重利用させない）。`staging` が
     /// symlink・非ディレクトリなら `FailedPrecondition`。
     pub fn begin_pull(&self, id: PullId) -> Result<PullSession<'_>, OciError> {
+        self.begin_pull_with(&NoopOciOpRecorder, id)
+    }
+
+    /// [`ImageStore::begin_pull`] の全体（重複 ID・非ディレクトリ・作成失敗を含む）を
+    /// `OciOpKind::BeginPull` として `recorder` へ記録する（REPAIR-4）。
+    pub fn begin_pull_with(
+        &self,
+        recorder: &dyn OciOpRecorder,
+        id: PullId,
+    ) -> Result<PullSession<'_>, OciError> {
+        record_oci_op(recorder, OciOpKind::BeginPull, || self.begin_pull_inner(id))
+    }
+
+    fn begin_pull_inner(&self, id: PullId) -> Result<PullSession<'_>, OciError> {
         let staging = self.root().join(STAGING_DIR_NAME);
         match fs::symlink_metadata(&staging) {
             Ok(_) => check_staging_is_dir(&staging)?,
@@ -165,14 +191,24 @@ impl ImageStore {
         Ok(PullSession {
             store: self,
             id,
+            session: SESSION_SEQ.fetch_add(1, Ordering::Relaxed),
             staging_dir: dir,
             touched: BTreeSet::new(),
+            leased: BTreeSet::new(),
         })
     }
 
     /// ID を生成して [`ImageStore::begin_pull`] する。
     pub fn begin_pull_generated(&self) -> Result<PullSession<'_>, OciError> {
         self.begin_pull(PullId::generate()?)
+    }
+
+    /// ID を生成して [`ImageStore::begin_pull_with`] する。
+    pub fn begin_pull_generated_with(
+        &self,
+        recorder: &dyn OciOpRecorder,
+    ) -> Result<PullSession<'_>, OciError> {
+        self.begin_pull_with(recorder, PullId::generate()?)
     }
 }
 
@@ -202,8 +238,16 @@ impl PullSession<'_> {
     ///
     /// 登録後にキャッシュ上の実体を調べ、通常ファイルでなければ自分のリースだけを外して
     /// [`BlobReuse::Absent`] / [`BlobReuse::NotRegularFile`] を返す。
+    ///
+    /// 同じ digest のトークンが未解放のうちに再度呼ぶと `AlreadyExists`（1 リース = 1 トークン）。
     pub fn lease_existing_blob(&mut self, digest: &Digest) -> Result<BlobReuse, OciError> {
         self.note_blob(digest)?;
+        if self.leased.contains(digest) {
+            return Err(err(
+                OciErrorCode::AlreadyExists,
+                "blob is already leased by this pull",
+            ));
+        }
         let path = self
             .store
             .root()
@@ -224,10 +268,14 @@ impl PullSession<'_> {
             }
         };
         match miss {
-            None => Ok(BlobReuse::Leased(LeasedBlob {
-                digest: digest.clone(),
-                path,
-            })),
+            None => {
+                self.leased.insert(digest.clone());
+                Ok(BlobReuse::Leased(LeasedBlob {
+                    digest: digest.clone(),
+                    path,
+                    session: self.session,
+                }))
+            }
             Some(r) => {
                 self.release_own(digest)?;
                 Ok(r)
@@ -236,8 +284,18 @@ impl PullSession<'_> {
     }
 
     /// 検証失敗などで再利用をやめるとき、トークンを消費して自分のリースだけを外す。
+    ///
+    /// 別セッション・別ストアが発行したトークンは `PermissionDenied` で拒否し、テーブルを変えない。
     pub fn release_leased(&mut self, blob: LeasedBlob) -> Result<(), OciError> {
-        self.release_own(&blob.digest)
+        if blob.session != self.session || !self.leased.contains(&blob.digest) {
+            return Err(err(
+                OciErrorCode::PermissionDenied,
+                "lease token does not belong to this pull",
+            ));
+        }
+        self.release_own(&blob.digest)?;
+        self.leased.remove(&blob.digest);
+        Ok(())
     }
 
     fn release_own(&self, digest: &Digest) -> Result<(), OciError> {
@@ -332,6 +390,82 @@ mod tests {
         assert!(store.lock().unwrap().blob_references(&d(1)).is_referenced());
     }
 
+    /// OCI-7: 同一 digest の二重取得を拒否し、最初のトークンのリースは残る。
+    #[test]
+    fn oci7_duplicate_lease_of_same_digest_is_rejected() {
+        let root = Root::new("duplease");
+        root.put(&d(1), 5);
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let BlobReuse::Leased(b) = s.lease_existing_blob(&d(1)).unwrap() else {
+            panic!("expected Leased");
+        };
+        assert_eq!(
+            s.lease_existing_blob(&d(1)).unwrap_err().code(),
+            OciErrorCode::AlreadyExists
+        );
+        assert_eq!(leases(&store, &d(1)), vec![pid("p1")]);
+        s.release_leased(b).unwrap();
+        assert_eq!(leases(&store, &d(1)), vec![]);
+        // 解放後は再取得できる。
+        assert!(matches!(
+            s.lease_existing_blob(&d(1)).unwrap(),
+            BlobReuse::Leased(_)
+        ));
+    }
+
+    /// OCI-7: 別セッション・別ストアのトークンでは解放できず、テーブルは変わらない。
+    #[test]
+    fn oci7_release_rejects_foreign_token() {
+        let root = Root::new("foreign");
+        root.put(&d(1), 5);
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s1 = store.begin_pull(pid("p1")).unwrap();
+        let mut s2 = store.begin_pull(pid("p2")).unwrap();
+        let BlobReuse::Leased(b1) = s1.lease_existing_blob(&d(1)).unwrap() else {
+            panic!("expected Leased");
+        };
+        let BlobReuse::Leased(b2) = s2.lease_existing_blob(&d(1)).unwrap() else {
+            panic!("expected Leased");
+        };
+        assert_eq!(
+            s2.release_leased(b1).unwrap_err().code(),
+            OciErrorCode::PermissionDenied
+        );
+        assert_eq!(leases(&store, &d(1)), vec![pid("p1"), pid("p2")]);
+
+        let root_b = Root::new("foreign-b");
+        root_b.put(&d(1), 5);
+        let store_b = ImageStore::open(&root_b.0).unwrap();
+        let mut sb = store_b.begin_pull(pid("p1")).unwrap();
+        assert_eq!(
+            sb.release_leased(b2).unwrap_err().code(),
+            OciErrorCode::PermissionDenied
+        );
+        assert_eq!(leases(&store, &d(1)), vec![pid("p1"), pid("p2")]);
+        assert_eq!(leases(&store_b, &d(1)), vec![]);
+    }
+
+    /// REPAIR-4: begin_pull の成否・エラー code・種別が記録される。
+    #[test]
+    fn repair4_begin_pull_is_recorded() {
+        use crate::instrument::OciOpOutcome;
+        use crate::instrument::testing::Collect;
+        let root = Root::new("record");
+        let store = ImageStore::open(&root.0).unwrap();
+        let rec = Collect::default();
+        let _s = store.begin_pull_with(&rec, pid("p1")).unwrap();
+        let e = store.begin_pull_with(&rec, pid("p1")).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::AlreadyExists);
+        let v = rec.0.lock().unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(v[0].kind(), OciOpKind::BeginPull);
+        assert_eq!(v[0].outcome(), OciOpOutcome::Success);
+        assert_eq!(v[0].error_code(), None);
+        assert_eq!(v[1].outcome(), OciOpOutcome::Failure);
+        assert_eq!(v[1].error_code(), Some(OciErrorCode::AlreadyExists));
+    }
+
     /// OCI-7: キャッシュに無い・通常ファイルでない blob はリースを残さない。
     #[test]
     fn oci7_missing_or_non_regular_cached_blob_leaves_no_lease() {
@@ -393,11 +527,11 @@ mod tests {
     fn oci7_begin_pull_rejects_duplicate_id_and_symlinked_staging() {
         let root = Root::new("dup");
         let store = ImageStore::open(&root.0).unwrap();
-        let s = store.begin_pull(pid("p1")).unwrap();
+        let _s = store.begin_pull(pid("p1")).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(s.staging_dir()).unwrap().permissions().mode();
+            let mode = fs::metadata(_s.staging_dir()).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o700);
         }
         assert_eq!(

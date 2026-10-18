@@ -42,6 +42,8 @@ pub enum OciOpKind {
     DiskUsage,
     /// イメージストアの排他区間の取得（待機・Timeout・毒化・ロックファイル異常を含む。TASK-183.2・OCI-7）。
     AcquireImageStoreLock,
+    /// pull セッションの開始とステージングディレクトリの作成（TASK-183.9・OCI-7）。
+    BeginPull,
 }
 
 impl OciOpKind {
@@ -60,6 +62,7 @@ impl OciOpKind {
             OciOpKind::ListImages => "oci.image.list",
             OciOpKind::DiskUsage => "oci.image.df",
             OciOpKind::AcquireImageStoreLock => "oci.store.lock",
+            OciOpKind::BeginPull => "oci.pull.begin",
         }
     }
 }

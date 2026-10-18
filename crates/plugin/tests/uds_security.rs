@@ -255,11 +255,33 @@ mod unix {
         for _ in 0..2 {
             let e = UdsListener::bind(&p).unwrap_err();
             assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+            // 記録の無い socket は、手で削除が要る旨の固定文言（#1859）。
+            assert_eq!(
+                e.message(),
+                "socket path has a socket without a matching lock record; confirm no listener is running and remove it manually"
+            );
             assert!(std::fs::symlink_metadata(&p).is_ok());
             assert!(std::fs::symlink_metadata(d.path().join("s.sock.lock")).is_err());
         }
         // 生存中の別 listener へ接続できる（socket が削除・置換されていない）。
         std::os::unix::net::UnixStream::connect(&p).unwrap();
+    }
+
+    /// PLUG-12・#1859: socket 以外のエントリは `NotSocket` の固定文言で拒否され、中身もロックも残らない。
+    #[test]
+    fn plug12_non_socket_entry_is_reported_as_not_socket_and_kept() {
+        let t = TempDir::new();
+        let d = RuntimeDir::ensure_under(&t.0).unwrap();
+        let p = d.path().join("s.sock");
+        std::fs::write(&p, b"keep").unwrap();
+        let e = UdsListener::bind(&p).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+        assert_eq!(
+            e.message(),
+            "socket path is occupied by an entry that is not a socket; inspect it and remove it manually"
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), b"keep");
+        assert!(std::fs::symlink_metadata(d.path().join("s.sock.lock")).is_err());
     }
 
     /// ロックファイルは listener の生存中だけ記録つきで存在し、記録が無くなれば（bind 失敗・正常終了）

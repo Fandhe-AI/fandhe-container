@@ -160,6 +160,28 @@ m_unreadable() {
 m_prod_in_test() {
   printf '\n#[cfg(test)]\nfn t() {\n    PluginLaunchTarget::from_verified_file(f);\n}\n' >>"$1/${PROD}"
 }
+# 文字列・コメントの中の試験属性は領域を開かない（後続の本番呼び出しは違反として検出する）
+m_str_inner_attr() {
+  printf 'const FIXTURE: &str = r#"\n#![cfg(test)]\n"#;\n\nfn prod() {\n    let _ = PluginLaunchTarget::from_verified_file(f);\n}\n' >"$1/${MODE}"
+}
+m_str_outer_attr() {
+  printf 'const F: &str = "\\n#[cfg(test)]";\nconst G: &str = r##"\n#[cfg(test)]\n"##;\nfn prod() {\n    let _ = PluginLaunchTarget::from_verified_file(f);\n}\n' >"$1/${MODE}"
+}
+m_block_comment_attr() {
+  printf '/*\n#![cfg(test)]\n#[cfg(test)]\n*/\nfn prod() {\n    let _ = PluginLaunchTarget::from_verified_file(f);\n}\n' >"$1/${MODE}"
+}
+m_multiline_str_attr() {
+  printf 'const F: &str = "a\n#[cfg(test)]\nb";\nfn prod() {\n    let _ = PluginLaunchTarget::from_verified_file(f);\n}\n' >"$1/${MODE}"
+}
+m_unterminated() {
+  printf 'const F: &str = "abc\n#![cfg(test)]\n' >"$1/${MODE}"
+}
+m_real_inner_attr() {
+  printf '#![cfg(test)]\nfn t() {\n    let _ = PluginLaunchTarget::from_verified_file(f);\n}\n' >"$1/${MODE}"
+}
+m_char_quote() {
+  printf '%s\n' "fn a() { let _ = '\"'; }" '#[cfg(test)]' 'fn t() {' '    let _ = PluginLaunchTarget::from_verified_file(f);' '}' >"$1/${MODE}"
+}
 m_second_def() {
   mkdir -p "$1/crates/net/src"
   echo 'pub fn from_verified_file() {}' >"$1/crates/net/src/lib.rs"
@@ -181,6 +203,13 @@ run_case comment_only 0 "OK:" m_comment_only
 run_case dir_rs 1 "not a readable regular file" m_dir_rs
 run_case no_crates 1 "crates directory not found" m_no_crates
 run_case second_def 1 "NG: " m_second_def
+run_case str_inner_attr 1 "NG: ${MODE}:6:" m_str_inner_attr
+run_case str_outer_attr 1 "NG: ${MODE}:6:" m_str_outer_attr
+run_case block_comment_attr 1 "NG: ${MODE}:6:" m_block_comment_attr
+run_case multiline_str_attr 1 "NG: ${MODE}:5:" m_multiline_str_attr
+run_case unterminated 1 "unterminated string" m_unterminated
+run_case real_inner_attr 0 "OK:" m_real_inner_attr
+run_case char_quote 0 "OK:" m_char_quote
 run_case bad_arg 2 "usage:" m_none --bogus
 
 # 読めないファイル。chmod 000 でも読めてしまう環境では実行できない。

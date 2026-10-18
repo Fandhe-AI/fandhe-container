@@ -25,7 +25,8 @@
 # 行頭が `//` の行（`///`・`//!` を含む）は除く。行末コメントや文字列内の一致は数える（誤検出は失敗側）。
 #
 # 試験領域: column 0 の `#[cfg(test)]`・`#[cfg(all(test` が付いた項目（続く column 0 の他の属性・空行・
-# コメントは飛ばす）。項目が 1 行で終わるもの（`;` 終わり・括弧が 1 行で閉じるもの）はその行だけ。
+# コメントは飛ばす）。属性は Rust の字句（文字列・raw 文字列・ブロックコメント・文字リテラル）の外にあるものだけを認める。
+# 文字列やコメントの中の属性は無視し、ファイル末で文字列・ブロックコメントが閉じない場合は判定不能として NG にする。項目が 1 行で終わるもの（`;` 終わり・括弧が 1 行で閉じるもの）はその行だけ。
 # それ以外は、次の column 0 の行のうち空行・`//`・`)`・`]` で始まらない最初の行まで。その行が `}` で始まれば
 # 含めて閉じ、別の項目なら手前で閉じる。ファイル先頭の `#![cfg(test)]`・`#![cfg(all(test` はファイル全体。
 # `cfg(any(test, ...))` は試験専用とみなさない。判定の誤りは領域を早く閉じる方向（失敗側）にしか働かない。
@@ -100,11 +101,64 @@ EOF
 # 1 ファイルを走査し「行番号 種別」を出す。種別: D=試験領域外の定義 / P=試験領域外の一致 / T=試験領域内の一致。
 # shellcheck disable=SC2016  # awk プログラムは単引用符で渡す（シェル展開しない）
 scan_awk='
+# Rust の字句（文字列・raw 文字列・ブロックコメント〔入れ子可〕・行コメント・文字リテラル）を
+# 行をまたいで追跡し、コード以外の文字を空白に置き換えた行を返す。属性・括弧・column 0 の判定は
+# この置換後の行で行い、文字列やコメントの中に書かれた属性で試験領域を開かせない（fail-closed）。
+function lex(line,    out, n, i, c, c2, j, k, m, prev) {
+  out = ""
+  n = length(line)
+  i = 1
+  while (i <= n) {
+    c = substr(line, i, 1)
+    c2 = substr(line, i, 2)
+    if (mode == 1) {
+      if (c2 == "/*") { depth++; out = out "  "; i += 2 }
+      else if (c2 == "*/") { depth--; out = out "  "; i += 2; if (depth == 0) mode = 0 }
+      else { out = out " "; i++ }
+    } else if (mode == 2) {
+      if (c == "\\") { out = out "  "; i += 2 }
+      else if (c == "\"") { out = out " "; i++; mode = 0 }
+      else { out = out " "; i++ }
+    } else if (mode == 3) {
+      if (c == "\"" && substr(line, i + 1, rawhash) == rawpat) {
+        out = out " " substr(spaces, 1, rawhash); i += 1 + rawhash; mode = 0
+      } else { out = out " "; i++ }
+    } else {
+      if (c2 == "//") { out = out substr(spaces, 1, n - i + 1); i = n + 1 }
+      else if (c2 == "/*") { mode = 1; depth = 1; out = out "  "; i += 2 }
+      else if (c == "\"") { mode = 2; out = out " "; i++ }
+      else if (c == "r" || (c == "b" && substr(line, i + 1, 1) == "r")) {
+        prev = (i > 1) ? substr(line, i - 1, 1) : ""
+        j = (c == "b") ? i + 2 : i + 1
+        k = j
+        while (substr(line, k, 1) == "#") k++
+        if (prev !~ /[A-Za-z0-9_]/ && substr(line, k, 1) == "\"") {
+          rawhash = k - j
+          rawpat = substr("################################################################", 1, rawhash)
+          mode = 3
+          out = out substr(spaces, 1, k - i + 1)
+          i = k + 1
+        } else { out = out c; i++ }
+      } else if (c == "\047") {
+        # 文字リテラル（x・改行の escape 付き）は読み飛ばし、ライフタイムはそのまま進める
+        if (substr(line, i + 1, 1) == "\\") {
+          m = index(substr(line, i + 2), "\047")
+          if (m > 0) { out = out substr(spaces, 1, m + 2); i += m + 2; continue }
+        } else if (substr(line, i + 2, 1) == "\047" && substr(line, i + 1, 1) != "\047") {
+          out = out "   "; i += 3; continue
+        }
+        out = out c; i++
+      } else { out = out c; i++ }
+    }
+  }
+  return out
+}
 function strip_cr() { sub(/\r$/, "", $0) }
-BEGIN { all_test = 0; state = 0 }
+BEGIN { all_test = 0; state = 0; mode = 0; depth = 0; rawhash = 0; rawpat = ""; spaces = sprintf("%400s", "") }
 {
   strip_cr()
-  line = $0
+  orig = $0
+  line = lex(orig)
   if (line ~ /^#!\[cfg\((test\)|all\(test[,)])/) all_test = 1
   # state: 0=通常 1=試験属性の直後（項目待ち） 2=複数行の試験項目の中
   if (state == 2) {
@@ -127,15 +181,16 @@ BEGIN { all_test = 0; state = 0 }
       else state = 2
     }
   }
-  tmp = line
+  tmp = orig
   sub(/^[ \t]+/, "", tmp)
   if (tmp ~ /^\/\//) next
-  if (line !~ /(^|[^A-Za-z0-9_])from_verified_file([^A-Za-z0-9_]|$)/) next
+  if (orig !~ /(^|[^A-Za-z0-9_])from_verified_file([^A-Za-z0-9_]|$)/) next
   region = (all_test || in_test_line)
-  if (!region && line ~ /(^|[^A-Za-z0-9_])fn[ \t]+from_verified_file([^A-Za-z0-9_]|$)/) print NR, "D"
+  if (!region && orig ~ /(^|[^A-Za-z0-9_])fn[ \t]+from_verified_file([^A-Za-z0-9_]|$)/) print NR, "D"
   else if (region) print NR, "T"
   else print NR, "P"
 }
+END { if (mode != 0) print NR, "U" }
 '
 
 scanned=0
@@ -157,6 +212,7 @@ while IFS= read -r -d '' f; do
   [ -n "${out}" ] || continue
   while read -r ln kind; do
     case "${kind}" in
+      U) ng "${rel}: unterminated string or block comment (cannot classify test regions)" ;;
       D)
         def_count=$((def_count + 1))
         if [ "${rel}" = "${DEF_FILE}" ]; then def_in_def_file=$((def_in_def_file + 1)); else ng "${rel}:${ln}: from_verified_file defined outside the allowed file"; fi

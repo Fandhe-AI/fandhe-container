@@ -210,12 +210,36 @@ impl UnavailableAuditSink {
     }
 }
 
+/// 通知の出力を待つ上限。stderr が満杯のパイプで読み手が止まっていても、拒否はこの時間内に返る（REPAIR-5）。
+const NOTICE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
+impl UnavailableAuditSink {
+    /// 通知を別スレッドで `out` へ書き、`deadline` を超えたら待たずに戻る（REPAIR-5）。
+    /// 出力が詰まったスレッドは取り残すが、CLI は拒否を返してすぐ終了する。出力失敗・スレッド生成失敗は無視する。
+    fn notify_bounded(&self, mut out: Box<dyn Write + Send>, deadline: std::time::Duration) {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let line = self.clone_for_notice();
+        let spawned = std::thread::Builder::new()
+            .name("audit-sink-notice".into())
+            .spawn(move || {
+                let _ = line.write_json_line(&mut *out);
+                let _ = out.flush();
+                let _ = tx.send(());
+            });
+        if spawned.is_ok() {
+            let _ = rx.recv_timeout(deadline);
+        }
+    }
+
+    fn clone_for_notice(&self) -> UnavailableAuditSink {
+        UnavailableAuditSink(self.0.clone())
+    }
+}
+
 impl AuditSink for UnavailableAuditSink {
     fn record(&self, _record: &AuditRecord) -> Result<(), TraitError> {
-        // 通知の出力失敗は本来の拒否を隠さないよう無視する。
-        let mut err = std::io::stderr();
-        let _ = self.write_json_line(&mut err);
-        let _ = err.flush();
+        // 通知の出力失敗・停止は本来の拒否を隠さない。待ちは上限付きの別スレッドで隔離する。
+        self.notify_bounded(Box::new(std::io::stderr()), NOTICE_DEADLINE);
         Err(self.0.clone())
     }
 }
@@ -439,6 +463,31 @@ mod tests {
         assert_eq!(
             String::from_utf8(buf).expect("utf8"),
             "{\"event\":\"audit_sink_unavailable\",\"code\":\"UNIMPLEMENTED\",\"message\":\"audit record sink could not be created\"}\n"
+        );
+    }
+
+    /// REPAIR-5・SEC-4（#2013）: 通知の出力先が永久に詰まっていても、`notify_bounded` は期限内に戻る。
+    #[test]
+    fn repair5_2013_blocked_notice_output_does_not_hang() {
+        struct Blocked;
+        impl Write for Blocked {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                loop {
+                    std::thread::park();
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = UnavailableAuditSink(TraitError::new(ErrorCode::Unimplemented, "x"));
+        let start = std::time::Instant::now();
+        sink.notify_bounded(Box::new(Blocked), std::time::Duration::from_millis(100));
+        let elapsed = start.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(100),
+            "{elapsed:?}"
         );
     }
 

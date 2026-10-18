@@ -38,22 +38,33 @@
 //! 台帳(上限 `LEDGER_MAX_ENTRIES` 件)に残す。`Clean` は消滅を確かめ済み、`Pending` は回収できなかった子の
 //! ハンドルと、報告前の PID 1 の再探索が要る起動識別子を保持する状態、`Handed` は launch 成功でハンドルの所有者が
 //! 呼び出し側に移った状態である(そのハンドルの `terminate` が成功すると、同じ launch の項目だけが `Clean` に進む)。`confirm_no_process` は `Clean` のときだけ `Ok` を返し、`Pending` は期限内に
-//! 再回収(I → PID 1 の順。PID 1 は I の回収後でないと C の子にならない)と再探索を試みる。台帳に無い ID・回収前の `Handed`・
+//! 再回収(I → PID 1 の順。PID 1 は I の回収後でないと C の子にならない)と再探索を試みる。台帳に無い ID は
+//! `confirm_no_process` では確かめられない(`FailedPrecondition`)が、記録された cgroup の配置を受け取る
+//! `confirm_no_process_recorded` が別プロセスの残存を確かめる(下の「別プロセスの残存」)。回収前の `Handed`・
 //! 確かめられない `Pending` は `Ok` にしない。`Pending` の ID への再 launch は(再回収を試みても確かめられなければ)
 //! fork 前に拒否する。再回収の待ちの間は `Pending` を台帳から取り出し(記録は `Settling`)、台帳の Mutex を解放する
 //! ため、他コンテナの launch は待たされない(REPAIR-5・CORE-1)。同じ ID への並行な確認・launch は拒否する。期限内に確かめられなかった事実は、launch の `TraitError` の固定の接尾辞
 //! (`UNCONFIRMED_SUFFIX`)と [`ProcessLauncher::last_launch_may_have_left_process`] で伝える。
+//!
+//! # 別プロセスの残存(CORE-2・SEC-1。#2011)
+//!
+//! クラッシュした supervisor が起動した残存は、このプロセスの台帳に無い。`recover_interrupted_start` が渡す
+//! 状態記録の cgroup の配置(`StateRecord::cgroup`)から、コンテナ cgroup `fc-<id>@<instance>` を
+//! `cgroups::ensure_no_process_in_recorded` で特定する(ID だけからパスを組み立てない。照合の規則は
+//! `RecordedCgroupScope::open` と同じ)。cgroup が無ければ(空でない cgroup は消えないので)居ない、空なら居ない、
+//! 居れば `cgroup.kill` で止めて期限内に `populated 0` を確かめて `Ok`。配置が無い・スコープを検証できない・
+//! 読めない・`cgroup.kill` が無い・期限切れは `Ok` にしない(fail-closed)。台帳にある ID は台帳で判定する。
 //!
 //! # 未実装・残余(REPAIR-3)
 //!
 //! - **権限モデル**: `RootlessSingleId` のみ。`RootfulHostRoot`(SEC-5・CORE-7・CORE-9。start が user namespace
 //!   を必須とするため、start を通る構成では到達しない。整合は spec 側の判断事項)と `RootlessSubordinateIds`
 //!   (CORE-6・TASK-40.2。`LaunchSpec` が uid/gid 写像を持たない)は `Unimplemented` で拒否する
-//! - **`confirm_no_process`**: この launcher 自身が起動した範囲だけを確証する(下の「起動台帳」)。別プロセス
-//!   (クラッシュ前の supervisor 等)で起動した残存は、launcher が ID から cgroup を引けないため確証できず
-//!   `FailedPrecondition` で返す(fail-closed)。cgroup の `cgroup.procs` が空であることの確認は別 issue の範囲
-//!   (StateStore の cgroup 記録との結線が要る)
-//! - 起動台帳はプロセス内のメモリのみ(再起動をまたがない。別プロセスの残存の確認は上記のとおり未対応)
+//! - **`confirm_no_process`**: ID だけでは、この launcher 自身が起動した範囲だけを確証する(上の「起動台帳」)。
+//!   別プロセスの残存は `confirm_no_process_recorded` が記録済みの cgroup で確かめる(上の「別プロセスの残存」。
+//!   #2011)。残余は、記録が無い場合(`FailedPrecondition`)と、コンテナ内のプロセスが cgroup の外へ移った場合
+//!   (検出できない。delete と同じ限界)。成功の内訳の観測記録は未実装(REPAIR-4)
+//! - 起動台帳はプロセス内のメモリのみ(再起動をまたがない。別プロセスの残存は記録済みの cgroup で確かめる)
 //! - **supervisor の結線**: `launch` は単一スレッドの呼び出しスレッドで直接呼ぶ必要がある。supervisor の
 //!   `run_start` 手順 8 は、準備の作業スレッドを `join` してから入口スレッドが直接呼ぶ形に再構成済み(#1819)。
 //!   restart の再 launch は `fandhe-relaunch` スレッド等が存在する状態で呼ばれ、この launcher が拒否する
@@ -82,7 +93,7 @@ use crate::audit_log::AuditSink;
 #[cfg(target_os = "linux")]
 use crate::audit_log::AuditedRejection;
 #[cfg(target_os = "linux")]
-use crate::cgroups::{CgroupError, CgroupJoin};
+use crate::cgroups::{CgroupError, CgroupJoin, RecordedCgroupOutcome};
 #[cfg(target_os = "linux")]
 use crate::exec::{
     ChildStdio, ChildSubreaper, ConfigPaths, ContainerChild, Entrypoint, ExecError, Hostname,
@@ -94,7 +105,7 @@ use crate::exec::{
 use crate::landlock::LandlockRuleset;
 #[cfg(target_os = "linux")]
 use crate::tmpfs::TmpfsMountSet;
-use crate::traits::{ContainerId, ErrorCode, TraitError};
+use crate::traits::{CgroupPlacement, ContainerId, ErrorCode, TraitError};
 
 /// 起動台帳の上限(異なるコンテナ ID の件数。無制限の確保を避ける。`Pending` は捨てないため、`Pending` だけで
 /// 満杯なら新しい ID の launch を拒否する)。
@@ -296,6 +307,26 @@ impl ProcessLauncher for ProductionLauncher {
             match self.never {}
         }
     }
+
+    /// 台帳に無い ID(別プロセスで起動した残存)を、状態記録の cgroup の配置から確かめる(CORE-2・SEC-1。#2011)。
+    /// 台帳にある ID は [`Self::confirm_no_process`] と同じ判定で、`recorded` は使わない。
+    fn confirm_no_process_recorded(
+        &self,
+        id: &ContainerId,
+        recorded: Option<&CgroupPlacement>,
+        timeout: Duration,
+    ) -> Result<(), TraitError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner
+                .confirm_no_process_recorded(id, recorded, timeout)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (id, recorded, timeout);
+            match self.never {}
+        }
+    }
 }
 
 /// 起動の実体(fork・Landlock の検出・スレッド数の観測)を差し替えられる継ぎ目(単体テストが順序と拒否を
@@ -314,6 +345,14 @@ trait LaunchOps: Send + Sync {
     /// 報告前に失われた PID 1 を、起動識別子で `/proc` から探して回収する(`confirm_no_process` が、中間プロセスの
     /// 回収後に呼ぶ。fork はしない。待ちは見つけた子ごとに `reap_timeout` まで)。
     fn rescan(&self, tag: &LaunchTag, reap_timeout: Duration) -> Rescan;
+    /// 記録された cgroup の配置のコンテナ cgroup に、プロセスが居ないことを確かめる(居れば止める。`deadline`
+    /// まで待つ。別プロセスの残存の確認。#2011)。本番は `cgroups::ensure_no_process_in_recorded`。失敗は code のみ。
+    fn ensure_no_process_in_recorded(
+        &self,
+        id: &ContainerId,
+        placement: &CgroupPlacement,
+        deadline: Instant,
+    ) -> Result<RecordedCgroupOutcome, ErrorCode>;
 }
 
 /// [`LaunchOps::spawn`] へ渡す、fork 前に launcher が確定した値。
@@ -778,6 +817,42 @@ impl Inner {
         })
     }
 
+    /// 台帳にある ID は台帳で判定し、台帳に無い ID だけ記録済みの cgroup で確かめる(#2011・CORE-2・SEC-1)。
+    ///
+    /// 台帳に無い ID は、このプロセスでは launch を始めていない(回復は `StartReservation` と `BundleLock` で
+    /// launch と排他される)ので、残存は別プロセス(クラッシュした supervisor)が起動したものである。`recorded` が
+    /// 無ければ従来どおり `FailedPrecondition`。cgroup の問い合わせの失敗は code だけを保った固定文言にする
+    /// (パス・errno を載せない)。待ちは `timeout`(上限つき)から作る単一の期限で打ち切る(REPAIR-5)。
+    /// 成功の内訳(`RecordedCgroupOutcome`)の観測記録は未実装(REPAIR-4 の将来課題)。
+    fn confirm_no_process_recorded(
+        &self,
+        id: &ContainerId,
+        recorded: Option<&CgroupPlacement>,
+        timeout: Duration,
+    ) -> Result<(), TraitError> {
+        let in_ledger = self.ledger().position(id).is_some();
+        let Some(placement) = recorded.filter(|_| !in_ledger) else {
+            return self.confirm_no_process(id, timeout);
+        };
+        let deadline = Instant::now() + timeout.min(CONFIRM_TIMEOUT_MAX);
+        match self
+            .ops
+            .ensure_no_process_in_recorded(id, placement, deadline)
+        {
+            Ok(RecordedCgroupOutcome::AlreadyAbsent)
+            | Ok(RecordedCgroupOutcome::WasEmpty)
+            | Ok(RecordedCgroupOutcome::Killed) => Ok(()),
+            Err(ErrorCode::Timeout) => Err(TraitError::new(
+                ErrorCode::Timeout,
+                "timed out confirming that no process remains in the recorded cgroup",
+            )),
+            Err(code) => Err(TraitError::new(
+                code,
+                "could not confirm that no process remains in the recorded cgroup",
+            )),
+        }
+    }
+
     /// `id` の起動が、この launcher が起動した範囲で生存プロセスを残していないことを確認する(CORE-2・REPAIR-5)。
     fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
         let deadline = Instant::now() + timeout.min(CONFIRM_TIMEOUT_MAX);
@@ -975,6 +1050,16 @@ impl LaunchOps for RealOps {
     fn rescan(&self, tag: &LaunchTag, reap_timeout: Duration) -> Rescan {
         rescan_unreported_init(tag, &self.subreaper, reap_timeout)
     }
+
+    fn ensure_no_process_in_recorded(
+        &self,
+        id: &ContainerId,
+        placement: &CgroupPlacement,
+        deadline: Instant,
+    ) -> Result<RecordedCgroupOutcome, ErrorCode> {
+        // 失敗は code だけを残す(メッセージ・パスは呼び出し側で固定文言に置き換えるため捨てる)。
+        crate::cgroups::ensure_no_process_in_recorded(id, placement, deadline).map_err(|e| e.code)
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1047,6 +1132,9 @@ mod tests {
         run_stages: bool,
         /// spawn に渡った bind mount の宛先列と既定 tmpfs の宛先列の記録(spawn ごとに 1 件。bind 無しは `None`)。
         seen: Arc<Mutex<Vec<SeenSpawn>>>,
+        /// `ensure_no_process_in_recorded` が順に返す結果(尽きたら `AlreadyAbsent`)と、受け取った配置の記録(#2011)。
+        recorded_script: Mutex<VecDeque<Result<RecordedCgroupOutcome, ErrorCode>>>,
+        recorded_calls: Arc<Mutex<Vec<(ContainerId, CgroupPlacement)>>>,
     }
 
     impl FakeOps {
@@ -1062,6 +1150,8 @@ mod tests {
                 rescan_results: Mutex::new(VecDeque::new()),
                 run_stages: true,
                 seen: Arc::new(Mutex::new(Vec::new())),
+                recorded_script: Mutex::new(VecDeque::new()),
+                recorded_calls: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -1143,6 +1233,24 @@ mod tests {
                 stdout,
                 stderr,
             })
+        }
+
+        fn ensure_no_process_in_recorded(
+            &self,
+            id: &ContainerId,
+            placement: &CgroupPlacement,
+            _deadline: Instant,
+        ) -> Result<RecordedCgroupOutcome, ErrorCode> {
+            push(&self.events, "ensure-recorded");
+            self.recorded_calls
+                .lock()
+                .unwrap()
+                .push((id.clone(), placement.clone()));
+            self.recorded_script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(RecordedCgroupOutcome::AlreadyAbsent))
         }
 
         fn rescan(&self, _tag: &LaunchTag, _reap_timeout: Duration) -> Rescan {
@@ -1561,6 +1669,119 @@ mod tests {
             "the launched process is owned by its handle holder; cannot confirm"
         );
         p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    fn placement() -> CgroupPlacement {
+        CgroupPlacement::new(
+            crate::traits::CgroupScope::new("/user.slice/x.scope").expect("scope"),
+            crate::traits::StateRevision::from_raw(5),
+        )
+    }
+
+    /// CORE-2(#2011): 台帳に無い ID は、記録された配置が無ければ従来どおり `FailedPrecondition` で、cgroup の
+    /// 継ぎ目を呼ばない。ID だけからパスを組み立てない。
+    #[test]
+    fn core2_issue2011_unknown_id_without_record_is_refused() {
+        let ev = events();
+        let ops = FakeOps::new(&ev);
+        let calls = Arc::clone(&ops.recorded_calls);
+        let l = launcher(ops, rootless(), None);
+        let id = ContainerId::new("nr").unwrap();
+        let err = l
+            .confirm_no_process_recorded(&id, None, Duration::from_secs(1))
+            .expect_err("no record");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// CORE-2(#2011): 台帳に無い ID は、`AlreadyAbsent`・`WasEmpty`・`Killed` のいずれでも `Ok` で、記録された配置を
+    /// そのまま継ぎ目へ渡す。
+    #[test]
+    fn core2_issue2011_unknown_id_is_confirmed_through_recorded_cgroup() {
+        for outcome in [
+            RecordedCgroupOutcome::AlreadyAbsent,
+            RecordedCgroupOutcome::WasEmpty,
+            RecordedCgroupOutcome::Killed,
+        ] {
+            let ev = events();
+            let ops = FakeOps::new(&ev);
+            ops.recorded_script.lock().unwrap().push_back(Ok(outcome));
+            let calls = Arc::clone(&ops.recorded_calls);
+            let l = launcher(ops, rootless(), None);
+            let id = ContainerId::new("ok").unwrap();
+            let p = placement();
+            l.confirm_no_process_recorded(&id, Some(&p), Duration::from_secs(1))
+                .unwrap_or_else(|e| panic!("{outcome:?}: {e:?}"));
+            assert_eq!(calls.lock().unwrap().clone(), vec![(id, p)]);
+        }
+    }
+
+    /// CORE-2・SEC-1・REPAIR-5(#2011): cgroup を検証・読み取りできない失敗は `Ok` にならず code を保つ。
+    /// 文言は固定で、期限切れは `Timeout`。
+    #[test]
+    fn core2_issue2011_cgroup_failures_are_not_confirmed() {
+        for code in [
+            ErrorCode::PermissionDenied,
+            ErrorCode::FailedPrecondition,
+            ErrorCode::Internal,
+            ErrorCode::Unimplemented,
+            ErrorCode::Timeout,
+        ] {
+            let ev = events();
+            let ops = FakeOps::new(&ev);
+            ops.recorded_script.lock().unwrap().push_back(Err(code));
+            let l = launcher(ops, rootless(), None);
+            let id = ContainerId::new("ng").unwrap();
+            let err = l
+                .confirm_no_process_recorded(&id, Some(&placement()), Duration::from_secs(1))
+                .expect_err("must not confirm");
+            assert_eq!(err.code(), code);
+            let expected = if code == ErrorCode::Timeout {
+                "timed out confirming that no process remains in the recorded cgroup"
+            } else {
+                "could not confirm that no process remains in the recorded cgroup"
+            };
+            assert_eq!(err.message(), expected);
+        }
+    }
+
+    /// CORE-2(#2011): 台帳にある ID は記録された配置があっても台帳で判定する。`Handed` は拒否のまま
+    /// (cgroup の継ぎ目を呼ばない)、`Clean` は継ぎ目を呼ばずに `Ok`。
+    #[test]
+    fn core2_issue2011_ledger_takes_precedence_over_recorded_cgroup() {
+        let spec = spec_for("ledger-first", serde_json::json!({}));
+        let ev = events();
+        let ops = FakeOps::new(&ev);
+        let calls = Arc::clone(&ops.recorded_calls);
+        let l = launcher(ops, rootless(), None);
+        let _handle = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let err = l
+            .confirm_no_process_recorded(
+                spec.container_id(),
+                Some(&placement()),
+                Duration::from_secs(1),
+            )
+            .expect_err("handed");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert!(calls.lock().unwrap().is_empty());
+
+        let spec2 = spec_for("ledger-clean", serde_json::json!({}));
+        let mut ops2 = FakeOps::new(&events());
+        ops2.fail_spawn = Some(FailSpawn {
+            code: ErrorCode::Internal,
+            unreaped: Unreaped::None,
+            rescans: 0,
+        });
+        let calls2 = Arc::clone(&ops2.recorded_calls);
+        let l2 = launcher(ops2, rootless(), None);
+        assert!(l2.launch(&spec2, Duration::from_secs(1)).is_err());
+        l2.confirm_no_process_recorded(
+            spec2.container_id(),
+            Some(&placement()),
+            Duration::from_secs(1),
+        )
+        .expect("clean");
+        assert!(calls2.lock().unwrap().is_empty());
     }
 
     /// CORE-2・#1819: ハンドルの `terminate` が成功すると回収の証跡が台帳へ引き継がれ、`confirm_no_process` が

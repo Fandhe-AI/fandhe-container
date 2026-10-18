@@ -4,7 +4,7 @@
 //!
 //! 呼び出しごとに plugin プロセスを spawn し、1 往復（要求フレーム送信 -> 応答フレーム受信）の
 //! 完了後に終了させる。呼び出し元は core 側の plugin proxy（TASK-114 ほか。依存方向は
-//! `core -> plugin` のため、本モジュールは core の登録表を参照せず検証済みの絶対パスを受け取る）。
+//! `core -> plugin` のため、本モジュールは core の登録表を参照せず、検証済みの fd を持つ起動対象 [`PluginLaunchTarget`] を受け取る。#1856）。
 //!
 //! # 契約
 //!
@@ -59,8 +59,11 @@
 //! # 未実装（REPAIR-3）
 //!
 //! - 外部管理の常駐 plugin への再接続（attach）と、観測記録を受け取る統一 API（`mode` の冒頭を参照）。
-//! - 起動対象の信頼性検証（所有者・モード・sha256 照合。TASK-122・PLUG-11）。本 API は検証を
-//!   行わず、呼び出し側が検証済みの絶対パスを渡すことを前提とする。
+//! - 起動対象の信頼性検証そのもの（所有者・モード・sha256 照合。TASK-122・PLUG-11）。本 API は検証を
+//!   行わず、呼び出し側が検証済みの fd を持つ起動対象を渡すことを前提とする（起動 API はパスだけでは
+//!   起動できない。#1856）。Linux は fd の実体を実行し、検証後のパス差し替えでは別の実行ファイルを
+//!   起動しない。macOS は実体のパスで起動し、起動直前の同一性確認は未実装（#1866）。構築口と本番配線は
+//!   #1857・#1869。
 //! - 孫プロセスの回収の残る制限（#1311・#1604）。タイムアウト・後始末の kill は子のプロセスグループ全体へ
 //!   送るため孫も止まる。plugin が自発終了した場合も、`waitid(WNOWAIT)`（`sys::probe_child_exit`）で回収せずに
 //!   終了を観測し（ゾンビのまま pgid は再利用されない）、グループへ `SIGKILL` を送ってから回収する
@@ -81,8 +84,13 @@
 //! - 要求 ID と応答 ID の対応づけ（TASK-114）。
 
 mod drop_report;
+mod launch_target;
 mod mode;
 mod resident;
+
+#[cfg(unix)]
+pub use launch_target::PluginFileIdentity;
+pub use launch_target::PluginLaunchTarget;
 
 pub use mode::{
     OneShotSummary, PluginCallOutcome, PluginCallRecord, PluginMode, PluginModeKind, PluginSession,
@@ -191,28 +199,24 @@ impl TryFrom<Duration> for OneShotTimeout {
 }
 
 /// 都度起動する plugin の起動仕様。検証済みの値のみ保持する。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct OneShotPlugin {
-    program: PathBuf,
+    target: PluginLaunchTarget,
     args: Vec<OsString>,
     socket_dir: PathBuf,
 }
 
 impl OneShotPlugin {
-    /// `program` は絶対パス必須（`PATH` 探索をしない。PLUG-11）。引数は件数・合計バイト数を検証する。
+    /// `target` は検証済みの fd を持つ起動対象（パスだけでは起動できない。`PATH` 探索もしない。
+    /// PLUG-11・#1856）。引数は件数・合計バイト数を検証する。
     /// `socket_dir` は listener を置く 0700 ディレクトリ（通常は `RuntimeDir::path()`）。
-    /// 違反は `InvalidArgument`。`program` の信頼性（ハッシュ等）は検証しない（TASK-122）。
+    /// 違反は `InvalidArgument`。`target` の信頼性は構築側（core の検証。TASK-122）の責務で、ここでは
+    /// 検証しない。
     pub fn new(
-        program: PathBuf,
+        target: PluginLaunchTarget,
         args: Vec<OsString>,
         socket_dir: PathBuf,
     ) -> Result<Self, PluginError> {
-        if !program.is_absolute() {
-            return Err(PluginError::new(
-                PluginErrorCode::InvalidArgument,
-                "plugin program path must be absolute",
-            ));
-        }
         let total: usize = args.iter().map(|a| a.len()).sum();
         if args.len() > ONE_SHOT_ARGS_MAX_COUNT || total > ONE_SHOT_ARGS_MAX_BYTES {
             return Err(PluginError::new(
@@ -221,15 +225,21 @@ impl OneShotPlugin {
             ));
         }
         Ok(Self {
-            program,
+            target,
             args,
             socket_dir,
         })
     }
 
-    /// 起動する実行ファイルの絶対パス。
+    /// 起動する実行ファイルの実体の絶対パス（表示専用。開き直し・起動には使わない。Linux は fd の
+    /// 実体を実行する）。
     pub fn program(&self) -> &Path {
-        &self.program
+        self.target.exec_path()
+    }
+
+    /// 起動対象（検証済み fd を持つ）。
+    pub fn launch_target(&self) -> &PluginLaunchTarget {
+        &self.target
     }
 }
 
@@ -1229,6 +1239,50 @@ fn bind_to_parent_lifetime(_cmd: &mut Command) -> Result<(), PluginError> {
     Ok(())
 }
 
+/// 都度起動・常駐の両モードが共用する plugin の `Command` を組み立てる（起動条件を 1 か所に置く。
+/// REPAIR-1）。子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ、stdin / stdout は null、stderr は
+/// 呼び出し側が用意した収集用の端、Linux では親死亡シグナルを設定する。
+///
+/// 実行するプログラムは起動対象から決める（#1856・PLUG-11）。Linux は保持した fd の実体を
+/// `/proc/self/fd/<N>` 経由で実行し（実行できなければ `FailedPrecondition`。パスへ縮退しない）、
+/// それ以外はパス（`exec_path`）で起動する（macOS の起動直前の同一性確認は未実装。#1866）。
+/// `argv[0]` は OS を問わず実体の正規パス。
+fn plugin_command(
+    plugin: &OneShotPlugin,
+    socket_path: &Path,
+    child_stderr: Stdio,
+) -> Result<Command, PluginError> {
+    #[cfg(target_os = "linux")]
+    let program = launch_target::linux_fd_exec_path(&plugin.target, Path::new("/proc/self/fd"))?;
+    #[cfg(not(target_os = "linux"))]
+    let program = plugin.target.exec_path().to_path_buf();
+
+    let mut cmd = Command::new(program);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.arg0(plugin.target.exec_path());
+    }
+    cmd.args(&plugin.args)
+        .env_clear()
+        .env(PLUGIN_SOCKET_ENV, socket_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(child_stderr);
+    bind_to_parent_lifetime(&mut cmd)?;
+    Ok(cmd)
+}
+
+/// spawn の失敗を起動対象の経路に合わせて写す。Linux は fd を保持しているのでファイル不在
+/// （`NotFound`）はあり得ず、確認後に `/proc` が使えなくなった等の競合として fd 経由の起動失敗にする。
+fn launch_spawn_error(e: PluginError) -> PluginError {
+    #[cfg(target_os = "linux")]
+    if e.code() == PluginErrorCode::NotFound {
+        return launch_target::fd_launch_error();
+    }
+    e
+}
+
 /// listener の bind・子の spawn・stderr の収集・往復・回収までを行う。戻り値の第 2 要素は、
 /// 成功・失敗のどちらでも子の回収後に確定した stderr の収集結果（spawn 前の失敗は空）。
 fn call_once_inner(
@@ -1274,17 +1328,11 @@ fn call_once_inner(
     };
     // `Command` は文の終わりで drop され、親側に書き込み端は残らない（終端の検出を妨げない）。
     let spawned = {
-        let mut cmd = Command::new(&plugin.program);
-        cmd.args(&plugin.args)
-            .env_clear()
-            .env(PLUGIN_SOCKET_ENV, listener.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(child_stderr);
-        if let Err(e) = bind_to_parent_lifetime(&mut cmd) {
-            return (Err(e), OneShotStderr::empty());
-        }
-        spawn_registered(&mut cmd, registry)
+        let mut cmd = match plugin_command(plugin, listener.path(), child_stderr) {
+            Ok(c) => c,
+            Err(e) => return (Err(e), OneShotStderr::empty()),
+        };
+        spawn_registered(&mut cmd, registry).map_err(launch_spawn_error)
     };
     let mut guard = match spawned {
         Ok(g) => g,
@@ -2143,9 +2191,8 @@ mod tests {
     /// REPAIR-4: 失敗経路でも観測記録が 1 件・機械可読 code 付きで渡される。
     #[test]
     fn repair4_observer_receives_failure_record() {
-        let abs = if cfg!(windows) { "C:\\p" } else { "/bin/p" };
         let dir = std::env::temp_dir().join("fcos-nonexistent-observer-dir");
-        let plugin = OneShotPlugin::new(abs.into(), vec![], dir).unwrap();
+        let plugin = OneShotPlugin::new(launch_target::current_exe_target(), vec![], dir).unwrap();
         let req = Frame::new(Vec::new()).unwrap();
         let mut records = Vec::new();
         let r = call_once_observed(
@@ -2925,23 +2972,17 @@ mod tests {
     }
 
     #[test]
-    fn plug7_plugin_rejects_relative_program() {
-        let e = OneShotPlugin::new("plugin".into(), vec![], "/tmp".into()).unwrap_err();
-        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
-        assert_eq!(e.message(), "plugin program path must be absolute");
-    }
-
-    #[test]
     fn plug7_plugin_rejects_too_many_or_too_long_args() {
-        let abs = if cfg!(windows) { "C:\\p" } else { "/bin/p" };
         let many = vec![OsString::from("a"); ONE_SHOT_ARGS_MAX_COUNT + 1];
-        let e = OneShotPlugin::new(abs.into(), many, "/tmp".into()).unwrap_err();
+        let e = OneShotPlugin::new(launch_target::current_exe_target(), many, "/tmp".into())
+            .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         let long = vec![OsString::from("a".repeat(ONE_SHOT_ARGS_MAX_BYTES + 1))];
-        let e = OneShotPlugin::new(abs.into(), long, "/tmp".into()).unwrap_err();
+        let e = OneShotPlugin::new(launch_target::current_exe_target(), long, "/tmp".into())
+            .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         let ok = vec![OsString::from("a"); ONE_SHOT_ARGS_MAX_COUNT];
-        assert!(OneShotPlugin::new(abs.into(), ok, "/tmp".into()).is_ok());
+        assert!(OneShotPlugin::new(launch_target::current_exe_target(), ok, "/tmp".into()).is_ok());
     }
 
     /// 応答者を pid で限定する: 同一 UID でも pid が異なる接続は受理しない（PLUG-7）。

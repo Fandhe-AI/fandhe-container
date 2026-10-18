@@ -43,6 +43,9 @@
 //!   `crate::signal_forward` が CLI バイナリのシグナルハンドラ上から呼ぶため async-signal-safe であること。#1513・PLUG-7）
 //! - Linux: `prctl(PR_SET_PDEATHSIG, SIGKILL)` と `getppid(2)` を `pre_exec` で呼び、親の強制終了時に plugin 本体を
 //!   止める（#1514・PLUG-7・REPAIR-5・CORE-1。x86_64 / aarch64 のみ。他アーキテクチャは設定しない）
+//! - Linux・macOS: `fcntl(F_DUPFD_CLOEXEC, 3)`（`dup_cloexec_min3`。検証済みファイルの fd を 3 以上かつ close-on-exec で複製する）。
+//!   それ以外の unix は `try_clone`。`lifecycle/launch_target.rs` の `PluginLaunchTarget::from_verified_file` から呼ばれる
+//!   （PLUG-11・#1856）
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
 //! # 限界（残存リスク。対策は未実装。PLUG-12・#1390）
@@ -57,7 +60,7 @@
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`send_signal`]・[`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・[`probe_child_exit`]・[`write_nonblocking`]・（Linux のみ）`set_parent_death_sigkill`・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・[`probe_child_exit`]・[`write_nonblocking`]・`dup_cloexec_min3`・（Linux のみ）`set_parent_death_sigkill`・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 //! - Linux の対応 arch は LP64 の x86_64・aarch64 だけ。各 `cfg` は `target_pointer_width = "64"` を併せて条件にし、
@@ -2177,6 +2180,46 @@ pub(crate) fn peer_pid(stream: &UnixStream) -> Result<u32, PluginError> {
             "failed to obtain peer credential",
         )
     })
+}
+
+// ---- fd の複製（PLUG-11。起動対象の保持 fd） ----
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod dupfd_abi {
+    /// `fcntl(2)` の `F_DUPFD_CLOEXEC`（Linux は全アーキ共通で 1030、macOS は 67）。
+    #[cfg(target_os = "linux")]
+    pub(super) const F_DUPFD_CLOEXEC: i32 = 1030;
+    #[cfg(target_os = "macos")]
+    pub(super) const F_DUPFD_CLOEXEC: i32 = 67;
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の `int fcntl(int, int, ...)` と同じ型・幅。
+        pub(super) fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+}
+
+/// `file` を番号 3 以上の fd へ close-on-exec つきで複製する（`fcntl(F_DUPFD_CLOEXEC, 3)`）。
+///
+/// `File::try_clone` は最小 fd が 0 のため、stdio が閉じていると 0〜2 に複製され得る。0〜2 は子の
+/// stdio の `dup2` で上書きされ別ファイルを実行しかねないので、下限を 3 にして避ける
+/// （`PluginLaunchTarget::from_verified_file` が呼ぶ。PLUG-11・#1856）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn dup_cloexec_min3(file: &File) -> io::Result<File> {
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: `file` は借用中で有効な fd。F_DUPFD_CLOEXEC は int 引数 1 つ（最小 fd）を取り、
+    // 成否は戻り値で確認する。
+    let fd = unsafe { dupfd_abi::fcntl(file.as_raw_fd(), dupfd_abi::F_DUPFD_CLOEXEC, 3) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` は直前の fcntl が返した、他に所有者のいない有効な fd（非負を確認済み）。
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Linux・macOS 以外の unix 向け。`File::try_clone` に縮退する（呼び出し側が 3 未満を拒否する）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn dup_cloexec_min3(file: &File) -> io::Result<File> {
+    file.try_clone()
 }
 
 // ---- 期限付き client connect（PLUG-2・REPAIR-5。TASK-107.5・#249） ----

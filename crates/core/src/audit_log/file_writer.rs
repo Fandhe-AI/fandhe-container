@@ -339,6 +339,12 @@ struct AuditLineDto<'a> {
     /// 理由を持つレイヤー（plugin 信頼検証・exec 対象・entrypoint、理由つきの mount）のみ: 拒否理由トークン（他レイヤーでは出力しない＝既存行は不変）。
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<&'static str>,
+    /// `exit_signal` 層のみ: 終了シグナル番号（他レイヤーでは出力しない＝既存行は不変。#2004）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signal: Option<u8>,
+    /// `exit_signal` 層のみ: 終了したプロセスの PID（回収した側の PID namespace の値。他レイヤーでは出力しない）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_pid: Option<u32>,
     /// 検証済みの `ContainerId`（`[A-Za-z0-9._-]`・255 バイト以下）の生の値。不明なら `null`（省略しない）。
     /// 末尾に置く（既存キーの値と順序は変えない。#1618）。
     container_id: Option<&'a str>,
@@ -355,7 +361,8 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         AuditEvent::PluginTrust { path, .. } => (None, Some(path)),
         AuditEvent::ExecTarget { .. }
         | AuditEvent::Entrypoint { .. }
-        | AuditEvent::ControlPeer { .. } => (None, None),
+        | AuditEvent::ControlPeer { .. }
+        | AuditEvent::ExitSignal { .. } => (None, None),
     };
     let ts = record.timestamp().as_unix_duration();
     let dto = AuditLineDto {
@@ -370,6 +377,8 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         path_truncated: path.map(|p| p.is_truncated()),
         path_original_len: path.map(|p| p.original_len()),
         reason: record.reason().map(|r| r.as_str()),
+        signal: record.exit_signal().map(|s| s.get()),
+        target_pid: record.target_pid().map(|p| p.get()),
         container_id: record.container_id().map(|c| c.as_str()),
     };
     let mut line =
@@ -811,6 +820,23 @@ mod tests {
         assert_eq!(
             text(&r),
             "{\"event\":\"audit\",\"layer\":\"plugin_trust\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":9,\"syscall\":null,\"arch\":null,\"path\":\"/p/plugin\",\"path_truncated\":false,\"path_original_len\":9,\"reason\":\"hash_mismatch\",\"container_id\":null}\n"
+        );
+    }
+
+    /// SEC-4・ESC-06・#2004: exit_signal レコードは signal と target_pid を持ち、syscall・arch は null。
+    #[test]
+    fn sec4_2004_encode_exit_signal_has_signal_and_target_pid_without_syscall() {
+        let r = rec(
+            9,
+            AuditEvent::ExitSignal {
+                signal: crate::audit_log::AuditSignal::new(31).unwrap(),
+                target_pid: crate::audit_log::AuditPid::new(1234).unwrap(),
+            },
+        )
+        .with_container_id(crate::traits::ContainerId::new("c1").unwrap());
+        assert_eq!(
+            text(&r),
+            "{\"event\":\"audit\",\"layer\":\"exit_signal\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":9,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"signal\":31,\"target_pid\":1234,\"container_id\":\"c1\"}\n"
         );
     }
 

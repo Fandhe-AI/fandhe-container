@@ -900,6 +900,8 @@ snapshot_json_input() {
   local watchdog_pid
   local rc=0
   local bytes
+  local wc_rc=0
+  local wc_out
   if ! dst=$(mktemp "${tmp_dir}/json-snapshot.XXXXXXXXXX" 2>/dev/null) || [ -z "$dst" ]; then
     err "invalid-input" "could not create a temporary file to copy ${what}"
     exit 2
@@ -943,8 +945,18 @@ snapshot_json_input() {
       exit 2
       ;;
   esac
-  if ! bytes=$(wc -c <"$dst" | tr -d ' ') || ! printf '%s' "$bytes" | grep -Eq '^[0-9]+$'; then
-    err "invalid-input" "could not determine the size of ${what}: ${src}"
+  # wc の終了コード・出力（リダイレクト失敗を知らせる bash のメッセージを含むよう
+  # 2>&1 を先に書く）を捨てずに取り、失敗時のメッセージへ入れる。スナップショットが
+  # 消えた（一時ディレクトリを別プロセスが削除した）等の原因を後から切り分けるため
+  # （Issue #2002・REPAIR-4・REPAIR-12）。
+  wc_out=$(wc -c 2>&1 <"$dst") || wc_rc=$?
+  bytes="${wc_out//[[:space:]]/}"
+  if [ "$wc_rc" -ne 0 ] || ! printf '%s' "$bytes" | grep -Eq '^[0-9]+$'; then
+    local wc_line="${wc_out//$'\n'/ }"
+    local snap_state="exists" dir_state="exists"
+    [ -e "$dst" ] || snap_state="is missing"
+    [ -d "$tmp_dir" ] || dir_state="is missing"
+    err "invalid-input" "could not determine the size of ${what}: ${src} (wc -c exit ${wc_rc}, output '${wc_line:0:200}', snapshot ${dst} ${snap_state}, temporary directory ${dir_state})"
     exit 2
   fi
   if [ "$bytes" -gt "$MAX_FROM_JSON_BYTES" ]; then

@@ -47,7 +47,10 @@
 //! 引数ベースのフィルタ（`clone`・`clone3` の `CLONE_NEW*`、`personality` 等）、moby 既定プロファイルの
 //! 許可リスト方式への発展（TASK-128・GPU-3）は扱わない。
 //! 監査ログ連携のうち拒否報告からレコードを作るフックは `audit_log`（TASK-41.2・SEC-4）にある。
-//! ただし `ERRNO(EPERM)` も `KILL_PROCESS` もユーザー空間へ報告しないため、配送経路は未実装。
+//! ただし `ERRNO(EPERM)` も `KILL_PROCESS` もユーザー空間へ報告しないため、ERRNO 側の配送経路は未実装。
+//! `KILL_PROCESS` 側の正の記録はカーネルの `AUDIT_SECCOMP` が出す（`actions_logged` に `kill_process` が
+//! ある限り記録され、`FILTER_FLAG_LOG` は不要。外部の読み手が要る。`docs/design/audit-delivery.md`・#2004）。
+//! fandhe は本番 launcher の回収点で、SIGSYS 終了の補助記録（層 `exit_signal`。syscall は持たない）を出す。
 //! 本一覧は拒否リストの土台である。将来 `config.json` の `linux.seccomp` を解釈する場合は
 //! 外部入力として別途検証が必要。
 
@@ -73,9 +76,10 @@ use std::fmt;
 // ソフトウェアは実質存在しない。
 //
 // 監査（SEC-4）: `KILL_PROCESS` では終了するプロセス自身は記録を書けないため、プロセス内の SIGSYS
-// ハンドラ経由の `SeccompDenialReport::from_sigsys` は使えない。配送経路（親の `waitpid` が得る
-// 終了シグナル・`USER_NOTIF`・カーネル監査サブシステム等）は別途設計する。ESC-06 の
-// `AuditExpectation::Deferred("seccomp")` はそのまま。
+// ハンドラ経由の `SeccompDenialReport::from_sigsys` は使えない。正の記録（syscall・arch・pid）は
+// カーネルの `AUDIT_SECCOMP`、補助は本番 launcher の回収点が出す `exit_signal` レコード（#2004。
+// syscall は推測しない）。ESC-06 の `AuditExpectation::Deferred("seccomp")` から `Required` への
+// 切り替えは #2028。
 //
 // 強制終了の範囲を広げる候補（既定は変えない。判断はオーナーが行う）: `kexec_file_load`
 // （`kexec_load` と同じ脅威）・`setns`（namespace 脱出。ランタイムの exec 経路は seccomp 適用前に

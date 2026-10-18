@@ -125,6 +125,16 @@ mod unix {
             "grandchild_exit_early" => spawn_grandchild_and_record_pid(&sock),
             "silent_no_connect" => std::thread::sleep(Duration::from_secs(60)),
             mode => {
+                // 同一 UID の別プロセス（decoy）に、接続して切断させてから本来の接続へ進む
+                // （受付は別 pid の接続を切断して待ち受けを続ける。#1861）。
+                if let Some(n) = mode.strip_prefix("decoys:") {
+                    // 回収の確認用に自 pid を残してから、decoy を順に起動する。
+                    let dir = sock.parent().unwrap();
+                    std::fs::write(dir.join("child.pid"), std::process::id().to_string()).unwrap();
+                    for _ in 0..n.parse::<u32>().unwrap() {
+                        spawn_decoy_and_wait(&sock);
+                    }
+                }
                 // 接続前に書く。親が stderr を読み続けていなければバッファが埋まって子はここで止まる。
                 if mode == "stderr_flood" {
                     write_stderr(&vec![b'x'; FLOOD_BYTES]);
@@ -178,6 +188,70 @@ mod unix {
                 }
             }
         }
+    }
+
+    /// 子プロセスと同じ UID の別プロセス（このテストバイナリの `decoy_entry`）を起動し、終了まで待つ。
+    fn spawn_decoy_and_wait(sock: &std::path::Path) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "unix::decoy_entry", "--test-threads=1"])
+            .env("FCOS_DECOY_SOCK", sock)
+            .env_remove(PLUGIN_SOCKET_ENV)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    /// decoy の入口。通常のテスト実行（`FCOS_DECOY_SOCK` 未設定）では何もしない。socket へ接続して
+    /// 受付に切断されるのを待ってから終了する（接続自体の成否は問わない）。
+    #[test]
+    fn decoy_entry() {
+        let Some(sock) = std::env::var_os("FCOS_DECOY_SOCK") else {
+            return;
+        };
+        let Ok(mut s) = UdsStream::connect(
+            std::path::Path::new(&sock),
+            Duration::from_secs(5),
+            &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+        ) else {
+            return;
+        };
+        // 受付が peer の pid を読み終えて切断する（EOF・エラー）まで生存し続ける。先に終了すると
+        // macOS の LOCAL_PEERPID 取得が失敗して pid 不一致として数えられない（#1861）。
+        let mut buf = [0u8; 64];
+        while matches!(std::io::Read::read(&mut s, &mut buf), Ok(n) if n > 0) {}
+    }
+
+    fn audit_fields(lines: &[String]) -> Vec<(String, String, String, String, u64)> {
+        lines
+            .iter()
+            .map(|l| {
+                let v: serde_json::Value = serde_json::from_str(l).unwrap();
+                let s = |k: &str| v[k].as_str().unwrap().to_string();
+                (
+                    s("reason"),
+                    s("code"),
+                    s("op"),
+                    s("outcome"),
+                    v["expected_uid"].as_u64().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn my_uid(dir: &TempDir) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        u64::from(std::fs::metadata(&dir.0).unwrap().uid())
+    }
+
+    fn recorded_child_pid(dir: &TempDir) -> u32 {
+        std::fs::read_to_string(dir.0.join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
     }
 
     /// 孫（`/bin/sleep 60`。plugin と同じプロセスグループ。stdout・stderr は閉じる）を起動し、pid を
@@ -452,6 +526,75 @@ mod unix {
 
     /// 孫プロセスが stderr の書き込み端を保持し続けても、収集は期限で打ち切られ、読み取りスレッドは
     /// 停止する（REPAIR-5・PLUG-7。呼び出しは孫の終了〔5 秒〕を待たずに戻る）。
+    /// 起動経路（`call_once`）の受付は、別プロセス（同一 UID・別 pid）の接続を切断して待ち受けを続け、
+    /// 正しい子へ接続できる。拒否 1 件につき監査イベント 1 件（PLUG-7・PLUG-12・SEC-4・#1861）。
+    /// 別 UID の接続は root なしに作れないため、同じ継続・合算の経路を pid 不一致で通す。UID 不一致
+    /// 固有の分岐は crate 内ユニットテスト `transport::tests::plug12_accept_peer_pid_*` が受け持つ。
+    #[test]
+    fn plug12_one_shot_continues_accepting_after_rejected_peers() {
+        let dir = TempDir::new("decoys:3");
+        let plugin = plugin_for(&dir);
+        let (res, lines) = with_watchdog("call_once", move || {
+            let req = Frame::new(b"ping".to_vec()).unwrap();
+            let mut audit = fandhe_container_plugin::JsonLinesPeerAuthObserver::new();
+            let r = call_once(
+                &plugin,
+                &req,
+                OneShotTimeout::new(Duration::from_millis(10000)).unwrap(),
+                &mut audit,
+            );
+            (r, audit.drain_lines())
+        });
+        let out = res.unwrap();
+        assert_eq!(
+            out.termination(),
+            OneShotTermination::Exited { code: Some(0) }
+        );
+        assert_process_gone(pid_of(out.response().payload()));
+        let expected = (
+            "peer_pid_mismatch".to_string(),
+            "PERMISSION_DENIED".to_string(),
+            "accept".to_string(),
+            "error".to_string(),
+            my_uid(&dir),
+        );
+        assert_eq!(audit_fields(&lines), vec![expected; 3]);
+        no_socket_left(&dir);
+    }
+
+    /// 拒否が上限（`UDS_ACCEPT_PEER_REJECTION_LIMIT`）を超えたら `PermissionDenied` を返し、子は回収される。
+    /// 監査イベントは上限 + 1 件（最後の 1 件も通知してから打ち切る。PLUG-12・REPAIR-5・#1861）。
+    #[test]
+    fn plug12_one_shot_stops_when_rejections_exceed_limit() {
+        let over = fandhe_container_plugin::transport::UDS_ACCEPT_PEER_REJECTION_LIMIT as usize + 1;
+        let dir = TempDir::new(&format!("decoys:{}", over + 3));
+        let plugin = plugin_for(&dir);
+        let (res, lines) = with_watchdog("call_once", move || {
+            let req = Frame::new(b"ping".to_vec()).unwrap();
+            let mut audit = fandhe_container_plugin::JsonLinesPeerAuthObserver::new();
+            let r = call_once(
+                &plugin,
+                &req,
+                OneShotTimeout::new(Duration::from_millis(10000)).unwrap(),
+                &mut audit,
+            );
+            (r, audit.drain_lines())
+        });
+        let err = res.unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+        assert_eq!(err.message(), "too many rejected peer connections");
+        let expected = (
+            "peer_pid_mismatch".to_string(),
+            "PERMISSION_DENIED".to_string(),
+            "accept".to_string(),
+            "error".to_string(),
+            my_uid(&dir),
+        );
+        assert_eq!(audit_fields(&lines), vec![expected; over]);
+        assert!(!crate::is_alive(recorded_child_pid(&dir)));
+        no_socket_left(&dir);
+    }
+
     #[test]
     fn repair5_one_shot_stops_stderr_reader_when_grandchild_holds_stderr() {
         let (res, elapsed, _dir) = run("stderr_held_by_grandchild", 5000);

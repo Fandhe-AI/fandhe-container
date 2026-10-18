@@ -2,7 +2,7 @@
 //!
 //! PLUG-12 は plugin との UDS を `$XDG_RUNTIME_DIR/fandhe-container/` 相当の、0700 かつ core 実行 UID
 //! 所有のディレクトリ配下にのみ作ることを求める。本モジュールはその「解決・作成・検証」を担い、
-//! 上位（TASK-109 の plugin 発見・TASK-114 の core 側 proxy）が socket の置き場所を得て
+//! 上位（TASK-109 の plugin 発見・#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 の core 側 proxy）が socket の置き場所を得て
 //! [`crate::UdsListener::bind`] へ渡す入口になる。
 //!
 //! # 契約
@@ -158,7 +158,7 @@
 //!   別プロセスへ渡しても検出できない、(c) pid 照合には PID 再利用の窓が残る。
 //! - 同一 UID の別プロセスは脅威モデル外（第 1 層は 0700 の配置ディレクトリ）。
 //! - `unsafe` を含む取得処理は `crate::sys::peer_uid`（`sys` モジュール）に閉じる。
-//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。別 UID 接続拒否の結合試験は `tests/peer_auth.rs`（TASK-124.4・#295。実機前提の 2 件は人間が実行）。accept / connect で最初の読み書きより前に検証する順序は `transport::tests::plug12_order` で機械照合する（TASK-124.6・#1389）。拒否 1 件ごとの監査イベント通知は `crate::audit`（TASK-124.5・#1388・SEC-4）。永続的な監査ログへの配線は core 側 proxy（TASK-114）で未実装（REPAIR-3）。
+//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。別 UID 接続拒否の結合試験は `tests/peer_auth.rs`（TASK-124.4・#295。実機前提の 2 件は人間が実行）。accept / connect で最初の読み書きより前に検証する順序は `transport::tests::plug12_order` で機械照合する（TASK-124.6・#1389）。拒否 1 件ごとの監査イベント通知は `crate::audit`（TASK-124.5・#1388・SEC-4）。永続的な監査ログへの配線は core 側 proxy（#1869 の設計・TASK-114）で未実装（REPAIR-3）。
 //!
 //! # Windows に固有の peer 認証を持たない理由（WIN-1・PLUG-12。TASK-124.3・#294）
 //! 「未実装の残件」ではなく、設計上この crate に Win32 向け実装を置かない判断である。
@@ -190,7 +190,7 @@ pub const ONE_SHOT_SWEEP_MAX_ENTRIES: usize = 256;
 /// 次回の初期化が続きの位置から走査する（手前のエントリは読み直さない）。
 pub const ONE_SHOT_SWEEP_MAX_SCAN: usize = 65_536;
 
-/// 都度起動の残骸の掃除結果（#1310・PLUG-7）。呼び出し側（TASK-114）が構造化ログへ出す材料。
+/// 都度起動の残骸の掃除結果（#1310・PLUG-7）。呼び出し側（#1869 の設計・TASK-114）が構造化ログへ出す材料。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct OneShotSweep {
@@ -215,7 +215,7 @@ impl OneShotSweep {
     /// 掃除が完了しなかったことを知らせる構造化ログ（JSON Lines の 1 行。改行なし。REPAIR-4）。
     ///
     /// 初期化時の掃除は best-effort で、失敗しても初期化は続ける。その失敗を無通知にしないため、
-    /// 初期化経路が stderr へ出す（成功時は出さない。件数の記録は TASK-114 の core 側 proxy が
+    /// 初期化経路が stderr へ出す（成功時は出さない。件数の記録は #1869 の設計・TASK-114 の core 側 proxy が
     /// [`RuntimeDir::sweep_one_shot_leftovers`] の結果から行う）。値は固定文字列・真偽値だけで、
     /// 外部入力（ファイル名等）を埋め込まない。`error_code` は掃除を始められなかった場合の機械可読な
     /// `code`（ERR-1）、`incomplete` は列挙が途中で失敗した場合に `true`。`error_code` は任意の文字列
@@ -260,7 +260,7 @@ impl RuntimeDir {
 
     /// 検証済み runtime directory 直下の socket パスを、bind 前に検証して返す（PLUG-12・TASK-123.3・#288）。
     ///
-    /// TASK-109（plugin 発見）・TASK-114（core 側 proxy）が [`crate::UdsListener::bind`] へ渡す前に使い、
+    /// TASK-109（plugin 発見）・#1869 の設計・TASK-114（core 側 proxy）が [`crate::UdsListener::bind`] へ渡す前に使い、
     /// 不正な名前と `sun_path` 超過を socket を作る前に検出する。`name` は単一の通常コンポーネント
     /// （空・`.`・`..`・区切り・NUL を含まない）でなければ `InvalidArgument`。結合後のパスが
     /// `sun_path` に収まらなければ `InvalidArgument`（"socket path is too long"）。
@@ -278,7 +278,7 @@ impl RuntimeDir {
 
     /// 異常終了で残った都度起動の socket とロックファイルを掃除する（#1310・PLUG-7・PLUG-12）。
     ///
-    /// 初期化時に best-effort で呼ばれるほか、TASK-114 の core 側 proxy が結果（件数）を得るために
+    /// 初期化時に best-effort で呼ばれるほか、#1869 の設計・TASK-114 の core 側 proxy が結果（件数）を得るために
     /// 呼べる。判定規則・上限・残余はモジュール doc の「都度起動の残骸の掃除」参照。ディレクトリを
     /// 開けない・検証に失敗した場合（初期化後に symlink へ差し替えられた場合を含む。`PermissionDenied`）、
     /// この runtime directory で `flock` の排他を確認できない場合（`FailedPrecondition`。何も削除しない）、

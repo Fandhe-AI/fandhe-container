@@ -22,7 +22,7 @@
 //!   ごとに警告ログ 1 行を出す（[`PathSearchWarning`]）。**`PATH` 上の名前一致のみでは登録しない**
 //!   （`PluginDirKind::Path` の候補は未検証。レジストリ〔#255〕は origin を区別せずに登録するが、優先度は
 //!   最も低い〔System < User < Path〕ため管理ディレクトリの同名を shadow しない。現状は許可済みハッシュ
-//!   一覧が空で全件拒否になる。許可一覧の読み込みを配線する際〔TASK-114・TASK-122〕は、`PATH` 由来も
+//!   一覧が空で全件拒否になる。許可一覧の読み込みを配線する際〔#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-122〕は、`PATH` 由来も
 //!   ハッシュ一致で採用され得るため、**登録前に除外するか採用するかを配線時に再評価し、明示的に決める**。設計案は
 //!   `docs/design/plugin-hash-allowlist.md` の 3.5。#1868・承認待ち）
 //! - CLI フラグ（opt-in の CLI 側入口）の配線は CLI 実装（TASK-79）で行う。未実装（REPAIR-3）。
@@ -100,7 +100,7 @@ pub enum PluginDirKind {
     /// ユーザー単位の管理ディレクトリ。
     User,
     /// `PATH` 由来（opt-in 時のみ）。未検証で、名前一致のみでは登録しない（PLUG-11・TASK-122）。
-    /// 許可一覧の配線時に採否を再評価する（モジュール doc の契約を参照。TASK-114。
+    /// 許可一覧の配線時に採否を再評価する（モジュール doc の契約を参照。#1869 の設計。
     /// 設計案は `docs/design/plugin-hash-allowlist.md` の 3.5・#1868）。
     Path,
 }

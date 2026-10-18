@@ -2,7 +2,7 @@
 //!
 //! 本 crate は lib（起動設定の解決ロジック。本ファイル）と bin（`src/main.rs`。薄い入口）で構成する。
 //! バイナリ名 `fandhe-container-plugin-windows` は発見規約の接頭辞に一致する（PLUG-4・PLUG-11）。
-//! core 側 proxy が `OneShotPlugin` / `ResidentPlugin` 経由で、検証済み fd を持つ起動対象（`PluginLaunchTarget`。#1856）から spawn する（TASK-114）。
+//! 起動経路は未確定。Windows ホストでは plugin の発見をしない（#1539）。起動対象（`PluginLaunchTarget`。#1856）の経路は windows-execution-layout.md〔#1862。承認待ち〕と #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕の 4.9 で決める。
 //! 既存契約では socket の絶対パスは `env_clear()` 後に環境変数 [`PLUGIN_SOCKET_ENV`] のみで渡る。
 //!
 //! # 未実装範囲（REPAIR-3）
@@ -11,7 +11,7 @@
 //! ゲスト内ランタイム起動・kill / delete / state・型つき本体は未実装。
 //! SIGTERM でのグレースフルシャットダウン（[`sys`]・`frame_loop::serve_until`）と `ping` 応答（[`adapter`]）は実装済み（TASK-116.5・#396）。
 //! SIGKILL・猶予超過・Windows ホスト上の終了要求ではマウント残留の余地があり、ゲスト内ランタイムの停止は未実装。実バックエンドは Windows ホスト上で `wsl.exe` を起動して WSL2 を操作する（WIN-1。[`adapter`] 参照）。
-//! plugin 境界機構の UDS は現状 unix 限定のため、Windows ホスト上の接続経路は TASK-114 で確定する。
+//! plugin 境界機構の UDS は現状 unix 限定のため、Windows ホスト上の接続経路は windows-execution-layout.md〔#1862。承認待ち〕で扱う。
 //! 非 unix ビルドでは既定パス解決が `Unimplemented`、非 Windows ビルドでは create が `Unimplemented` となり fail-closed になる。
 //!
 //! # 暫定契約（spec 未規定）

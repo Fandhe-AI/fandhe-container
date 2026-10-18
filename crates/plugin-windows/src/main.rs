@@ -1,6 +1,6 @@
 //! fandhe-container-plugin-windows バイナリの入口（薄いラッパー。ロジックは lib 側）。
 //!
-//! core 側 proxy（TASK-114）が spawn する別プロセス。argv / 環境変数を lib の `resolve_startup` へ渡し、
+//! 別プロセス（spawn する側の経路は windows-execution-layout.md〔#1862。承認待ち〕と #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕の 4.9 で決める）。argv / 環境変数を lib の `resolve_startup` へ渡し、
 //! core が bind 済みの UDS へ `UdsStream::connect`（peer credential 検証つき。PLUG-12）で接続して
 //! `frame_loop::serve` で要求を `adapter::WindowsRuntimeAdapter` へ渡して順次処理する
 //! （TASK-116.2・#393、TASK-116.3・#394）。終了時に stderr へ 1 行 JSON
@@ -27,7 +27,7 @@
 //! 接続経路は peer 認証つき `UdsStream::connect` のみ（TASK-116.4・#395・PLUG-12）。別 UID の listener は
 //! `PERMISSION_DENIED`・終了コード 3 で fail-closed し、`peer_auth_rejections` に件数のみ出す。
 //! 出力は固定文言と列挙名のみで、socket パス・引数値・環境変数値・受信データを含めない。
-//! peer 認証の拒否イベントは件数のみ出す（永続的な監査ログへの配線は TASK-114 で未実装。REPAIR-3）。
+//! peer 認証の拒否イベントは件数のみ出す（永続的な監査ログへの配線は #1869 の設計 の 4.7 で未実装。REPAIR-3）。
 
 use std::process::ExitCode;
 use std::time::Duration;

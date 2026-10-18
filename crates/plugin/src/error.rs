@@ -4,7 +4,7 @@
 //! 返すエラーをここに集約する。core 側の `fandhe_container_core::traits::types::ErrorCode`
 //! と機械可読文字列を揃えるが、依存方向は `core → plugin`（`docs/architecture.md`）で
 //! plugin は core に依存できないため、本 crate 内で独立に定義する。`TraitError` への
-//! 変換は core 側の proxy 実装（TASK-114）の責務である。
+//! 変換は core 側の proxy 実装（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）の責務である。
 //! ワイヤー上の表現（serde）は `message` モジュール（TASK-107.3・#247）が非公開 DTO 経由で扱い、
 //! 本型自体には serde を持たせない（フィールド非公開・切り詰めの不変条件を保つため）。
 
@@ -19,7 +19,7 @@ pub const PLUGIN_ERROR_MESSAGE_MAX_BYTES: usize = 4096;
 ///
 /// 文字列表現は、core の `ErrorCode::as_str` と共通する 9 コードでは同一（変換を無損失にする契約）。
 /// `DataLoss`（`DATA_LOSS`）はフレーム層固有で core 側には無く、`TraitError` への写像は
-/// core 側 proxy 実装（TASK-114）の責務とする。
+/// core 側 proxy 実装（#1869 の設計）の責務とする。
 /// `#[non_exhaustive]` のため、呼び出し側の `match` は `_` 分岐を持つこと。
 /// 資源上限系のコードは、使う sub で追加する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -46,7 +46,7 @@ pub enum PluginErrorCode {
     /// フレームのチェックサム不一致など、偶発的なデータ破損を検出した（TASK-107.2）。
     DataLoss,
     /// 資源の上限に達した（起動中 plugin の追跡表が満杯。#1513・PLUG-7・REPAIR-5）。
-    /// core 側 `ErrorCode` への写像は `DataLoss` と同じく core 側 proxy 実装（TASK-114）の責務。
+    /// core 側 `ErrorCode` への写像は `DataLoss` と同じく core 側 proxy 実装（#1869 の設計）の責務。
     ResourceExhausted,
 }
 

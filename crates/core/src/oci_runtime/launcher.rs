@@ -69,10 +69,14 @@
 //!   だけ。config の `linux.uidMappings` / `gidMappings` は `start` が引き続き拒否する(受理は SEC-5 に関わる
 //!   オーナー判断事項で、確認待ち)。supervisor が `RootlessSubordinateIds` を選ぶ経路は未結線(後続)
 //! - **mapper と helper の回収**: mapper は I が fork 前に設定した `LaunchTag` を継承するため、I が期限で殺されて
-//!   C へ再親付けされても `rescan` の探索対象になる。mapper が起動する `newuidmap` / `newgidmap`(helper)は
-//!   exec で `comm` が識別子でなくなり識別子では見つからないため、`rescan` は識別子を持つプロセスを SIGSTOP で
-//!   止めてその子を列挙し、子を kill してから親を kill・回収し、再親付けされた子も回収する(CORE-2)。
-//!   列挙・停止に失敗した場合は `scan_incomplete` となり、台帳は Pending のまま残る(fail-closed)
+//!   C へ再親付けされても `rescan` の探索対象になる。I は範囲写像の失敗時に mapper を kill せず `R` を報告し、C が
+//!   I の回収後に同じ探索で回収する。mapper が起動する `newuidmap` / `newgidmap`(helper)は exec で `comm` が
+//!   識別子でなくなるため、mapper は自分のセッションを作り、`rescan` は識別子を持つプロセスを SIGSTOP で止めて
+//!   (またはゾンビのまま回収せずに)錨とし、「親が錨」か「セッション ID が錨」の子孫を列挙して kill してから錨を
+//!   kill・回収し、再親付けされた子孫も回収する(mapper が helper を残して終了していても帰属を失わない。CORE-2)。
+//!   停止の確認・列挙に失敗した場合は錨を回収せずに `scan_incomplete` となり、台帳は Pending のまま残る
+//!   (fail-closed)。残余: 契約外の回収者(`waitpid(-1)` 等)が錨を回収した場合は帰属を失う(`ContainerChild` の
+//!   「唯一の回収者」の前提の外)
 //! - **`confirm_no_process`**: ID だけでは、この launcher 自身が起動した範囲だけを確証する(上の「起動台帳」)。
 //!   別プロセスの残存は `confirm_no_process_recorded` が記録済みの cgroup で確かめる(上の「別プロセスの残存」。
 //!   #2011)。残余は、記録が無い場合(`FailedPrecondition`)と、コンテナ内のプロセスが cgroup の外へ移った場合

@@ -290,7 +290,7 @@ mod tests {
         }
     }
 
-    /// メッセージは 4096 バイト・文字境界で切り詰める。
+    /// ERR-3 拡張区分（timeout・unavailable・resource_exhausted）のコンストラクタが対応する gRPC コードへ写ることを確認する。
     #[test]
     fn task_97_2_err3_extension_constructors() {
         let cases = [
@@ -306,6 +306,7 @@ mod tests {
         }
     }
 
+    /// メッセージは 4096 バイト・文字境界で切り詰める。
     #[test]
     fn task_97_1_message_truncation() {
         let exact = "a".repeat(4096);

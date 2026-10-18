@@ -155,7 +155,12 @@ impl ReferenceTable {
     /// `image ls` 相当。登録済みの manifest をタグごとの行で返す。排他の内側で呼ぶこと。
     ///
     /// 欠損 blob があっても失敗させず、行の `missing_blobs` に載せる。
+    /// `blobs` / `blobs/sha256` が symlink・非ディレクトリなら `system df` と同様に辿らず
+    /// `FailedPrecondition`（存在しない場合は全 blob が欠損扱い）。
     pub fn list_images(&self, root: &Path) -> Result<ImageList, OciError> {
+        if checked_dir(&root.join("blobs"))? {
+            checked_dir(&blob_dir(root))?;
+        }
         let mut cache = SizeCache::new(root);
         let mut per_manifest: BTreeMap<&Digest, (u64, Vec<Digest>)> = BTreeMap::new();
         for (digest, comp) in self.manifests() {
@@ -473,6 +478,19 @@ mod tests {
         fs::remove_dir_all(blob_dir(&root.0)).unwrap();
         std::os::unix::fs::symlink(&other, blob_dir(&root.0)).unwrap();
         let e = ReferenceTable::new().disk_usage(&root.0).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    }
+
+    /// OCI-7: `image ls` も symlink の blob ディレクトリを辿らず拒否する（`system df` と一貫）。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_ls_rejects_symlinked_blob_dir() {
+        let root = Root::new("ls-symlink-dir");
+        let other = root.0.join("other");
+        fs::create_dir_all(&other).unwrap();
+        fs::remove_dir_all(blob_dir(&root.0)).unwrap();
+        std::os::unix::fs::symlink(&other, blob_dir(&root.0)).unwrap();
+        let e = ReferenceTable::new().list_images(&root.0).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
     }
 }

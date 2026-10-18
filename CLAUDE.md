@@ -84,6 +84,7 @@ fandhe-container/
 │   │   ├── dev-default-mounts.md  # OCI 既定の /dev の残り（/dev/pts・/dev/ptmx・/dev/shm・/dev/console）と rootless の /dev 供給方式の設計ドラフト（TASK-29 追補・#1609。方式を確定し実装 issue を #54 配下に起票）
 │   │   ├── windows-execution-layout.md  # Windows の実行構成（WSL2 ゲスト内の core とホストの起動役）の設計ドラフト（#1415・#1539 の決定以外はオーナー承認待ち。TASK-116 追補・#1862・WIN-1）
 │   │   ├── audit-delivery.md      # seccomp・Landlock の拒否を監査の記録先へ届ける配送経路の設計（2026-10-15 に方式を採用・#2018。実装は #2023〜#2028・#2004。TASK-41 追補・#1835・SEC-4）
+│   │   ├── plugin-backend-wiring.md  # バックエンド plugin の検証後の起動と RPC の配線の設計案（#1869・TASK-115・TASK-79 追補・PLUG-1・PLUG-7。承認待ち）
 │   │   └── plugin-hash-allowlist.md  # plugin の許可済みハッシュ一覧の置き場所・読み込み経路・一覧ファイル自体の検証の設計案（TASK-122 追補・#1868・PLUG-11。オーナー承認待ち）
 │   ├── setup/                     # 利用者向けセットアップ手順
 │   │   ├── linux.md               # Linux の配置手順（CLI・supervisor・launcher を同じディレクトリに置く。rootful はインストールスクリプト、rootless は利用者所有のディレクトリ。`PATH` 上の symlink。#2068・SUP-14・CORE-6）

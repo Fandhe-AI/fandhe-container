@@ -62,8 +62,17 @@
 //! # 未実装（REPAIR-3: 実装済みを装わない）
 //!
 //! - `/sys` 配下の項目（`/sys/firmware` 等）。実行層が sysfs を供給する時点（TASK-127）で足す
-//! - 違反の監査（SEC-4）への記録: 失敗は `ExecError`（段 `MountMaskedPaths`）で返すだけで、専用の `ViolationReason` は
-//!   足していない
+//! - 記録に段のフィールドを足すこと: 経路検査の拒否は汎用理由で記録され、記録の理由だけでは段が分からない
+//!   （段は返る `ExecError::stage` に載る）。段のフィールドは #653（TASK-98.2）の共通ログ型の範囲
+//!
+//! # 監査（SEC-4）
+//!
+//! 対象を固定して検査を通った後の、覆いを載せる操作（`open_tree`・`move_mount`・tmpfs のマウント・開き直し・事後検証）
+//! の失敗には、違反の理由 `masked_path_apply_failed`（種別 `protected_path_apply`。`ExecError::code` は errno 由来の
+//! まま）を付ける。子は状態 pipe でこの理由を親へ返し、親が層 `mount` の記録を 1 件書く（`exec/launch_status.rs`。
+//! `container_id` つき・パスなし。#2013）。環境起因と rootfs の内容起因を親は区別できず、SEC-4 は記録漏れを許さない
+//! ため、どちらも記録する。経路検査の拒否と `check_bound_null` の `target_moved` は既存の汎用理由のまま。マウント前の
+//! システムエラーは違反なしの失敗で、記録しない。
 //!
 //! # 単体テストの安全策
 //!
@@ -221,22 +230,21 @@ fn apply_one(
     }
     let before_mnt_id = fd_mount_id(&leaf, STAGE)?;
 
-    match method {
-        MaskMethod::BindDevNull => {
-            bind_dev_null(
-                parent,
-                &c_leaf,
-                &leaf,
-                before_mnt_id,
-                path,
-                null,
-                &violation,
-            )?;
-        }
-        MaskMethod::EmptyTmpfs => {
-            mount_empty_tmpfs(parent, &c_leaf, &leaf, before_mnt_id, path)?;
-        }
-    }
+    // 対象を固定して検査を通った後の、覆いを載せる操作と事後検証。ここでの失敗は違反の理由を持たないため、
+    // 一度だけ `MaskedPathApplyFailed` を付ける（`check_bound_null` の `target_moved` 等は上書きしない。SEC-4・#2013）。
+    let applied = match method {
+        MaskMethod::BindDevNull => bind_dev_null(
+            parent,
+            &c_leaf,
+            &leaf,
+            before_mnt_id,
+            path,
+            null,
+            &violation,
+        ),
+        MaskMethod::EmptyTmpfs => mount_empty_tmpfs(parent, &c_leaf, &leaf, before_mnt_id, path),
+    };
+    applied.map_err(|e| e.or_violation(ViolationReason::MaskedPathApplyFailed, Some(&subject)))?;
     Ok(Outcome::Applied)
 }
 
@@ -752,6 +760,111 @@ mod tests {
             err.message,
             "the tmpfs at /proc/acpi does not have ro,nosuid,nodev,noexec after mount"
         );
+    }
+
+    /// 子の失敗を状態 pipe の往復で親へ運び、層 `mount` の記録 1 件（パスなし・`container_id` つき）を照合する。
+    fn relay_and_record(err: &ExecError) -> (ExecError, String) {
+        use crate::audit_log::mount::tests::VecSink;
+        use crate::audit_log::{AuditDelivery, AuditLayer};
+        use crate::exec::launch_status::{LaunchAudit, PrePivotStep, relay_failure_for_test};
+        use crate::traits::ContainerId;
+
+        let sink = VecSink::new(false);
+        let id = ContainerId::new("c1").expect("id");
+        let out = relay_failure_for_test(
+            PrePivotStep::MaskedPaths,
+            err,
+            LaunchAudit {
+                sink: &sink,
+                container: Some(&id),
+            },
+        )
+        .expect_err("rejected");
+        assert_eq!(out.delivery, AuditDelivery::Recorded);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), AuditLayer::Mount);
+        assert_eq!(recs[0].path(), None);
+        assert_eq!(recs[0].container_id().map(ContainerId::as_str), Some("c1"));
+        let reason = recs[0].reason().map(|r| r.as_str().to_string());
+        (out.error, reason.expect("reason"))
+    }
+
+    /// SEC-4・SEC-2（#2013）: ファイルの覆い（`open_tree` の失敗・`move_mount` の未対応カーネル）とディレクトリの覆い
+    /// （tmpfs の事後条件）の失敗に `masked_path_apply_failed` が付き、`code` は従来のまま。状態 pipe の往復を経て
+    /// 親で層 `mount` の記録 1 件になり、`ErrorCode` も保たれる。
+    #[test]
+    fn sec4_2013_apply_failures_carry_reason_and_reach_the_audit_record() {
+        for (case, code) in [
+            ("clone", ErrorCode::FailedPrecondition),
+            ("move", ErrorCode::Unimplemented),
+            ("tmpfs_options", ErrorCode::FailedPrecondition),
+        ] {
+            reset();
+            let _shared = override_shared(false);
+            let tmp = if case == "tmpfs_options" {
+                let tmp = Tmp::new("mask-apply-audit-dir");
+                std::fs::create_dir_all(tmp.0.join("proc/acpi")).expect("mkdir");
+                FORCE_BAD_OPTIONS.with(|f| f.set(true));
+                tmp
+            } else {
+                let tmp = full_rootfs("mask-apply-audit-file");
+                match case {
+                    "clone" => CLONE_FAIL.with(|f| f.set(Some(SysError::Os(sys::EINVAL)))),
+                    _ => MOVE_FAIL.with(|f| f.set(Some(SysError::Unsupported))),
+                }
+                tmp
+            };
+            let fd = tmp.fd();
+            let err = apply_at(fd.as_fd(), &null_source()).expect_err(case);
+            assert_eq!(err.code, code, "{case}");
+            assert_eq!(err.stage, IsolationStage::MountMaskedPaths, "{case}");
+            assert_eq!(
+                err.violation.as_ref().map(|v| v.reason),
+                Some(ViolationReason::MaskedPathApplyFailed),
+                "{case}"
+            );
+            let (restored, reason) = relay_and_record(&err);
+            assert_eq!(reason, "masked_path_apply_failed", "{case}");
+            assert_eq!(restored.code, code, "{case}");
+            assert_eq!(restored.stage, IsolationStage::MountMaskedPaths);
+            assert_eq!(restored.message, "failed to apply a masked path protection");
+        }
+    }
+
+    /// SEC-4・SEC-2（#2013）: `config.json` 由来の対象（`/data/x`）の覆いの失敗も同じ理由で記録される。
+    #[test]
+    fn sec4_2013_config_target_apply_failure_is_recorded() {
+        reset();
+        let _shared = override_shared(false);
+        let tmp = Tmp::new("mask-extra-audit");
+        std::fs::create_dir_all(tmp.0.join("data")).expect("mkdir");
+        std::fs::write(tmp.0.join("data/x"), b"").expect("file");
+        CLONE_FAIL.with(|f| f.set(Some(SysError::Os(sys::EINVAL))));
+        let extra = [ProtectedPath::parse("/data/x", 4096).expect("valid")];
+        let fd = tmp.fd();
+        let err = apply_at_with(fd.as_fd(), &null_source(), &extra).expect_err("clone");
+        assert!(
+            err.message.starts_with("open_tree(/data/x) failed"),
+            "{}",
+            err.message
+        );
+        let (_, reason) = relay_and_record(&err);
+        assert_eq!(reason, "masked_path_apply_failed");
+    }
+
+    /// SEC-4（#2013）: 経路検査の拒否（symlink）は既存の汎用理由のまま記録される。
+    #[test]
+    fn sec4_2013_path_check_rejection_keeps_generic_reason() {
+        reset();
+        let _shared = override_shared(false);
+        let tmp = full_rootfs("mask-symlink-audit");
+        std::fs::remove_dir(tmp.0.join("proc/asound")).expect("rm");
+        symlink("/etc", tmp.0.join("proc/asound")).expect("symlink");
+        let fd = tmp.fd();
+        let err = apply_at(fd.as_fd(), &null_source()).expect_err("symlink");
+        let (_, reason) = relay_and_record(&err);
+        assert_eq!(reason, "path_symlink_or_not_directory");
     }
 
     /// SEC-2（#1851）: mountinfo の per-mount options の判定（具体値）。

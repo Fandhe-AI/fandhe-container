@@ -5,14 +5,24 @@
 //! plugin 役の子プロセスはテストバイナリ自身を `--exact unix::plugin_child_entry` で再実行して
 //! 用意する（`lifecycle_resident.rs` と同方式。結合試験は別 crate のため harness を複製する）。
 
+/// 試験用: 実行中のテストバイナリ自身を起動対象にする（構築口を呼んでよいのは試験コードだけ。#1856）。
+fn exe_target() -> fandhe_container_plugin::PluginLaunchTarget {
+    let p = std::env::current_exe().unwrap();
+    fandhe_container_plugin::PluginLaunchTarget::from_verified_file(
+        std::fs::File::open(&p).unwrap(),
+        p.clone(),
+        p,
+    )
+    .unwrap()
+}
+
 #[cfg(not(unix))]
 #[test]
 fn plug7_mode_selection_requires_unix_transport() {
     use fandhe_container_plugin::{Frame, PluginModeKind};
     use fandhe_container_plugin::{OneShotPlugin, PluginErrorCode, PluginMode, PluginSession};
-    let exe = std::env::current_exe().unwrap();
     let dir = std::env::temp_dir();
-    let plugin = OneShotPlugin::new(exe, vec![], dir).unwrap();
+    let plugin = OneShotPlugin::new(exe_target(), vec![], dir).unwrap();
     let err = PluginSession::start(
         &plugin,
         PluginMode::resident(),
@@ -115,7 +125,7 @@ mod unix {
             .iter()
             .map(OsString::from)
             .collect();
-        OneShotPlugin::new(std::env::current_exe().unwrap(), args, dir.0.clone()).unwrap()
+        OneShotPlugin::new(super::exe_target(), args, dir.0.clone()).unwrap()
     }
 
     fn ping() -> Frame {
@@ -320,12 +330,29 @@ mod unix {
         });
     }
 
-    /// 存在しない絶対パスは両モードとも NotFound の構造化エラーで、socket は残らない。
+    /// 実行権の無いファイルの起動対象は両モードとも PermissionDenied の構造化エラーで、socket は残らない
+    /// （起動対象は開けるファイルからしか作れないため、旧「存在しないプログラムは NotFound」の置き換え。#1856）。
     #[test]
     fn plug7_mode_session_propagates_structured_errors() {
         let dir = TempDir::new("respond");
-        let missing = dir.0.join("no-such-plugin");
-        let plugin = OneShotPlugin::new(missing, vec![], dir.0.clone()).unwrap();
+        let program = dir.0.join("not-executable");
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&program)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, b"not a native executable\n"))
+                .unwrap();
+        }
+        let target = fandhe_container_plugin::PluginLaunchTarget::from_verified_file(
+            std::fs::File::open(&program).unwrap(),
+            program.clone(),
+            program,
+        )
+        .unwrap();
+        let plugin = OneShotPlugin::new(target, vec![], dir.0.clone()).unwrap();
 
         let e = PluginSession::start(
             &plugin,
@@ -333,7 +360,7 @@ mod unix {
             &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
         )
         .unwrap_err();
-        assert_eq!(e.code(), PluginErrorCode::NotFound);
+        assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
         no_socket_left(&dir);
 
         let mut s = PluginSession::start(
@@ -348,7 +375,7 @@ mod unix {
                 &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
             )
             .unwrap_err();
-        assert_eq!(e.code(), PluginErrorCode::NotFound);
+        assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
         no_socket_left(&dir);
     }
 }

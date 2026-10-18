@@ -3,7 +3,7 @@
 //!
 //! # 役割と呼び出し文脈
 //!
-//! launch（本番 launcher。未結線）が pivot 後の `/` の識別子と、実際に適用する Landlock ruleset を 1 つの
+//! launch（本番 launcher。結線済み・#2007）が pivot 後の `/` の識別子と、実際に適用する Landlock ruleset を 1 つの
 //! [`LaunchIsolationRecord`] にまとめ、`CreateStateRequest::with_launch_isolation` /
 //! `UpdateStateRequest::with_launch_isolation`（トレイト契約 12）で `state.json` へ残す。exec
 //! （`exec/reapply.rs`。supervisor の `identify_pid1` が記録を取り出して渡す）は、この記録だけを根拠に
@@ -23,12 +23,13 @@
 //!   「同じ対象」は、照合済みの `/` の fd を起点に記録したパスを `O_NOFOLLOW` で 1 要素ずつ辿ることと、
 //!   対象がすべてマウントポイント（`CAP_SYS_ADMIN` が無いと動かせない）であることで担保する
 //!
-//! # 未実装（REPAIR-3）
+//! # 書き込みの経路と残る範囲（REPAIR-3）
 //!
-//! - 記録を作って状態へ書く本番 launcher の結線（`exec/landlock.rs` の `launch_isolation_from_bundle` /
-//!   `LaunchIsolationRecord::new` は結線待ち。結線までは exec が記録なしで拒否する）
-//! - restart の再 launch での記録の更新（`UpdateStateRequest::with_launch_isolation`。再 launch で mount namespace が
-//!   作り直されるため、更新しないと restart 後の exec は `/` の照合で拒否される。fail-closed）
+//! - 本番 launcher は `StagePipeline::with_landlock` へ渡す ruleset そのものと、pin 済みの rootfs fd の fstat から
+//!   記録を作り、`LaunchedProcess::launch_isolation` で返す。start が Running の更新と同じ 1 回の `update` で書き、
+//!   supervisor の restart が Running(新 pid) の更新で置き換える（#2007）。作れなければ fork 前に launch が失敗する
+//! - 再 launch したハンドルが記録を持たない（偽の launcher のみ）場合は、契約 12 に従い前の記録を引き継ぐ
+//! - 本番 launcher による restart の再 launch は、単一スレッドの要求で今も拒否される（#2043）
 
 use std::fmt;
 

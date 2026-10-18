@@ -59,7 +59,7 @@ fn plugin_spec(dir: &Path) -> OneShotPlugin {
         .iter()
         .map(OsString::from)
         .collect();
-    OneShotPlugin::new(std::env::current_exe().unwrap(), args, dir.to_path_buf()).unwrap()
+    OneShotPlugin::new(crate::exe_target(), args, dir.to_path_buf()).unwrap()
 }
 
 /// plugin 役の入口。通常のテスト実行（`PLUGIN_SOCKET_ENV` 未設定）では何もしない。
@@ -204,4 +204,15 @@ fn plug7_inherited_sigchld_ignore_is_reset_and_lost_children_fail_closed() {
     assert!(status.success(), "role failed: {status:?}");
     let result = std::fs::read_to_string(dir.0.join(RESULT_FILE)).unwrap();
     assert_eq!(result, EXPECTED);
+}
+
+/// 試験用: 実行中のテストバイナリ自身を起動対象にする（構築口を呼んでよいのは試験コードだけ。#1856）。
+fn exe_target() -> fandhe_container_plugin::PluginLaunchTarget {
+    let p = std::env::current_exe().unwrap();
+    fandhe_container_plugin::PluginLaunchTarget::from_verified_file(
+        std::fs::File::open(&p).unwrap(),
+        p.clone(),
+        p,
+    )
+    .unwrap()
 }

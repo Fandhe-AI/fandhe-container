@@ -15,7 +15,7 @@
 //! 報告するサイズは digest 検証を兼ねない（内容の検証済みを装わない）。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）: 展開後サイズ、コンテナ（rootfs・bundle は core の領域）と
-//! ステージング（#474 で配置確定後）の使用容量、CLI 経路（`image ls` / `system df` のサブコマンド）。
+//! ステージング（配置は `<root>/staging/<pull-id>/` で確定済み・走査対象外。容量の集計は未実装）の使用容量、CLI 経路（`image ls` / `system df` のサブコマンド）。
 //!
 //! 計装（REPAIR-4）: `list_images_with` / `disk_usage_with` が `OciOpRecorder` へ成功・失敗と
 //! 所要時間を渡す。`list_images` / `disk_usage` は何も記録しない `NoopOciOpRecorder` 版。

@@ -18,7 +18,9 @@
 //! - ディスクへの永続化・再起動時の照合（#853・#854・#851）
 //! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force`・実削除は #481
 //! - GC 本体・`image tag`/`prune`・`rm` の CLI 配線（#479〜#481・#476）。`image ls`/`system df` の集計 API は
-//!   `usage`（#478・TASK-183.3）で実装済み（CLI 経路は未実装）、pull へのリース組み込み（#474・#475）
+//!   `usage`（#478・TASK-183.3）で実装済み（CLI 経路は未実装）
+//! - pull のリース登録とステージング書き込みは `pull`（#474・TASK-183.9）で実装済み。公開と
+//!   失敗時のロールバックは #475
 //! - テーブル全体の件数上限（永続化の読み込み側で判断する）
 //!
 //! core の `ContainerId` との対応づけ（変換の置き場所・依存の向き）は #853 で決める。oci は core に
@@ -36,6 +38,9 @@ use crate::reference::{Digest, RegistryHost, Repository, Tag};
 mod usage;
 
 pub use usage::{CacheUsage, DiskUsage, ImageEntry, ImageList, ImageUsage, MAX_CACHE_SCAN_ENTRIES};
+
+mod pull;
+pub use pull::{BlobReuse, LeasedBlob, PullSession};
 
 mod store;
 pub use store::{
@@ -109,7 +114,8 @@ impl fmt::Display for ContainerRefId {
     }
 }
 
-/// 進行中の `pull` の識別子（検証済みの不透明値）。生成方法・形式は #474・#852 が決める。
+/// 進行中の `pull` の識別子（検証済みの不透明値）。新規の生成は `PullId::generate`
+/// （`<pid>-<UNIX 時刻ナノ秒>-<連番>`。#474）。クラッシュ後の回収の判断は #852。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PullId(String);
 

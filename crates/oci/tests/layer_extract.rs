@@ -74,3 +74,87 @@ fn oci1_verify_then_extract() {
     assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
     std::fs::remove_dir_all(&base).unwrap();
 }
+
+/// SEC-5・OCI-1・#1810: 公開 API（`extract_layers_with_policy`）と実際の所有者取得を通して、
+/// 実際の所有者から組んだ写像に収まるファイルは setuid / setgid を残し、写像外は落とし、件数を具体値で照合する。
+#[cfg(target_os = "linux")]
+#[test]
+fn sec5_special_bits_via_public_api_with_real_owner() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    use fandhe_container_oci::instrument::NoopOciOpRecorder;
+    use fandhe_container_oci::layer::extract::{
+        IdRange, SpecialBitsDecision, SpecialBitsPolicy, extract_layers_with_policy,
+    };
+
+    let base = std::env::temp_dir().join(format!("fc-oci-sec5-it-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // 展開物の実際の所有者（このプロセスの euid / egid）を、root 配下に作ったプローブから得る。
+    let probe = root.join(".probe");
+    std::fs::write(&probe, b"").unwrap();
+    let md = std::fs::metadata(&probe).unwrap();
+    let (uid, gid) = (md.uid(), md.gid());
+    std::fs::remove_file(&probe).unwrap();
+
+    let mut b = tar::Builder::new(Vec::new());
+    for (name, mode, u, g) in [
+        ("mapped", 0o6755, 0, 0),
+        ("other_uid", 0o4755, 100, 0),
+        ("other_gid", 0o2755, 0, 100),
+    ] {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(mode);
+        h.set_uid(u);
+        h.set_gid(g);
+        h.set_size(1);
+        h.set_cksum();
+        b.append_data(&mut h, name, &b"x"[..]).unwrap();
+    }
+    let tar_bytes = b.into_inner().unwrap();
+
+    let r = extract_layers_with_policy(
+        &NoopOciOpRecorder,
+        [std::io::Cursor::new(tar_bytes)],
+        &root,
+        ExtractLimits::new(10, 100, 1 << 30, 1 << 20),
+        SpecialBitsPolicy::PreserveIfOwnerMapped {
+            uid: IdRange {
+                container_id: 0,
+                host_id: uid,
+                count: 1,
+            },
+            gid: IdRange {
+                container_id: 0,
+                host_id: gid,
+                count: 1,
+            },
+        },
+    )
+    .unwrap();
+    let r = &r[0];
+    assert_eq!(r.special_bits.decision, SpecialBitsDecision::Evaluated);
+    let mode = |n: &str| {
+        std::fs::metadata(root.join(n))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    if uid == 0 || gid == 0 {
+        // host root 所有の setuid / setgid は残さない（SEC-1）。
+        assert_eq!(r.special_bits.preserved_files, 0);
+        assert_eq!(r.files_with_stripped_special_bits, 3);
+        assert_eq!(mode("mapped"), 0o755);
+    } else {
+        assert_eq!(r.special_bits.preserved_files, 1);
+        assert_eq!(r.files_with_stripped_special_bits, 2);
+        assert_eq!(mode("mapped"), 0o6755);
+        assert_eq!(mode("other_uid"), 0o755);
+        assert_eq!(mode("other_gid"), 0o755);
+    }
+    std::fs::remove_dir_all(&base).unwrap();
+}

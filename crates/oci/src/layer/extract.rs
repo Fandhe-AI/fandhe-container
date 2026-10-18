@@ -1230,8 +1230,44 @@ fn special_bits_to_keep(
     keep
 }
 
-/// tar エントリの uid / gid（PAX の `uid` / `gid` を優先）。解析できない・u32 に収まらない値は `None`（非信頼入力）。
-fn tar_owner<R: Read>(entry: &mut tar::Entry<'_, R>) -> (Option<u32>, Option<u32>) {
+/// レイヤー内のグローバル PAX ヘッダ（`XGlobalHeader`）が指定した所有者。外側の `None` は「未指定」、
+/// 内側の `None` は「指定はあるが解析不能〔非信頼入力〕」を表す（SEC-5。後者は setuid / setgid を残さない）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct GlobalOwner {
+    uid: Option<Option<u32>>,
+    gid: Option<Option<u32>>,
+}
+
+/// グローバル PAX レコードの本体を読む上限（非信頼入力の無制限確保を防ぐ）。
+const MAX_GLOBAL_PAX_BYTES: u64 = 1 << 20;
+
+impl GlobalOwner {
+    /// `XGlobalHeader` エントリの本体から `uid` / `gid` を取り込む。後のヘッダが前を上書きする（PAX の規則）。
+    fn absorb<R: Read>(&mut self, entry: &mut tar::Entry<'_, R>) -> Result<(), OciError> {
+        let mut data = Vec::new();
+        entry
+            .by_ref()
+            .take(MAX_GLOBAL_PAX_BYTES)
+            .read_to_end(&mut data)
+            .map_err(map_stream_err)?;
+        for ext in tar::PaxExtensions::new(&data).flatten() {
+            let parsed = ext.value().ok().and_then(|v| v.parse::<u32>().ok());
+            match ext.key() {
+                Ok("uid") => self.uid = Some(parsed),
+                Ok("gid") => self.gid = Some(parsed),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// tar エントリの uid / gid。優先順位はエントリ固有の PAX、グローバル PAX、通常ヘッダの順。
+/// 解析できない・u32 に収まらない値は `None`（非信頼入力）。
+fn tar_owner<R: Read>(
+    entry: &mut tar::Entry<'_, R>,
+    global: &GlobalOwner,
+) -> (Option<u32>, Option<u32>) {
     let mut uid = entry
         .header()
         .uid()
@@ -1242,6 +1278,12 @@ fn tar_owner<R: Read>(entry: &mut tar::Entry<'_, R>) -> (Option<u32>, Option<u32
         .gid()
         .ok()
         .and_then(|v| u32::try_from(v).ok());
+    if let Some(g) = global.uid {
+        uid = g;
+    }
+    if let Some(g) = global.gid {
+        gid = g;
+    }
     if let Ok(Some(exts)) = entry.pax_extensions() {
         for ext in exts.flatten() {
             let parsed = ext.value().ok().and_then(|v| v.parse::<u32>().ok());
@@ -1921,10 +1963,13 @@ fn extract_one_layer<S: LayerSource>(
     };
     {
         let mut archive = Archive::new(TarGuard::new(&mut src));
+        // グローバル PAX の所有者指定はこのレイヤーの以降のエントリに効く（SEC-5）。
+        let mut global_owner = GlobalOwner::default();
         for entry in archive.entries().map_err(map_stream_err)? {
             let mut entry = entry.map_err(map_stream_err)?;
             let ty = entry.header().entry_type();
             if ty == EntryType::XGlobalHeader {
+                global_owner.absorb(&mut entry)?;
                 continue;
             }
             x.entries += 1;
@@ -1940,7 +1985,7 @@ fn extract_one_layer<S: LayerSource>(
                 Plan::Dir(comps, mode) => x.make_dir(comps, mode)?,
                 Plan::File(comps, mode) => {
                     let size = entry.size();
-                    let tar_ids = tar_owner(&mut entry);
+                    let tar_ids = tar_owner(&mut entry, &global_owner);
                     x.write_file(comps, mode, tar_ids, size, &mut entry)?;
                 }
                 Plan::Symlink(comps) => {
@@ -3497,6 +3542,49 @@ mod tests {
         assert_eq!(mode_of(&sb.root.join("sgid")), 0o755);
         assert_eq!(mode_of(&sb.root.join("both")), 0o711);
         assert_eq!(mode_of(&sb.root.join("sticky")), 0o1644);
+    }
+
+    /// SEC-5: グローバル PAX の uid / gid が写像外なら、通常ヘッダが写像内でも setuid / setgid を落とす。
+    /// エントリ固有の PAX はグローバルより優先される（写像内に戻せば残る）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec5_global_pax_owner_overrides_header_owner() {
+        let sb = Sandbox::new();
+        chmod_root(&sb, 0o700);
+        let mut body = pax_record("uid", "100");
+        body.extend(pax_record("gid", "100"));
+        let global = raw_entry(
+            b"pax_global",
+            EntryType::XGlobalHeader,
+            b"",
+            0o644,
+            body.len() as u64,
+            &body,
+        );
+        let local = pax_record("uid", "0");
+        let local_hdr = raw_entry(
+            b"pax",
+            EntryType::XHeader,
+            b"",
+            0o644,
+            local.len() as u64,
+            &local,
+        );
+        let r = run_policy(
+            &sb,
+            &[
+                global,
+                file_owned("global_out", 0o6755, 0, 0, b"a"),
+                local_hdr,
+                file_owned("local_in", 0o4755, 0, 0, b"b"),
+            ],
+            policy_1000(),
+            owner_1000,
+        );
+        assert_eq!(r.special_bits.preserved_files, 1);
+        assert_eq!(r.files_with_stripped_special_bits, 1);
+        assert_eq!(mode_of(&sb.root.join("global_out")), 0o755);
+        assert_eq!(mode_of(&sb.root.join("local_in")), 0o4755);
     }
 
     /// SEC-5: PAX の `uid` が数値でないときは tar の uid を信用せず、setuid を落とす。

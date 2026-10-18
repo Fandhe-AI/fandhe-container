@@ -14,6 +14,7 @@
 //! 変換は OCI の意味の正規化を済ませた値を受け取り、cgroup v2 の型の検証（`CpuMax`・`PidsMax`・`BlkioWeight`・
 //! `BlockDevice`・`IoMax`）だけを行う。`CgroupError` のメッセージは値を含まない固定文言に置き換える（ERR-1）。
 
+use super::io_max::IO_MAX_DEVICES_LIMIT;
 use super::{
     BlkioWeight, BlockDevice, CgroupError, CgroupStep, Controller, ControllerSet, CpuMax, CpuQuota,
     IoLimit, IoMax, MemoryLimit, MemoryLimits, PidsMax,
@@ -103,6 +104,10 @@ impl TryFrom<&LinuxResourceLimits> for ResourceLimitPlan {
             .map(BlkioWeight::new)
             .transpose()
             .map_err(|_| out_of_range("linux.resources.blockIO.weight"))?;
+        // 適用時の `io.max` 読み戻し（上限つき）に収まる件数だけ受理する（CORE-3）。
+        if limits.io_throttles().len() > IO_MAX_DEVICES_LIMIT {
+            return Err(out_of_range("linux.resources.blockIO.throttle"));
+        }
         let io_max = limits
             .io_throttles()
             .iter()
@@ -196,6 +201,27 @@ mod tests {
         assert_eq!(io.wbps(), IoLimit::Unlimited);
         assert_eq!(io.riops(), IoLimit::Unlimited);
         assert_eq!(io.wiops(), IoLimit::Value(100));
+    }
+
+    /// CORE-3: throttle のデバイス数が読み戻し上限に収まる件数（34）までは受理し、超えると適用前に拒否する。
+    #[test]
+    fn core3_plan_bounds_io_throttle_device_count() {
+        let build = |n: u32| {
+            let devs: Vec<_> = (0..n)
+                .map(|i| json!({"major": 8, "minor": i * 16, "rate": 1048576}))
+                .collect();
+            json!({"blockIO": {
+                "throttleReadBpsDevice": devs.clone(),
+                "throttleWriteBpsDevice": devs.clone(),
+                "throttleReadIOPSDevice": devs.clone(),
+                "throttleWriteIOPSDevice": devs
+            }})
+        };
+        let ok = ResourceLimitPlan::try_from(&limits(build(34))).expect("34 devices");
+        assert_eq!(ok.io_max.len(), 34);
+        let err = ResourceLimitPlan::try_from(&limits(build(35))).expect_err("35 devices");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("linux.resources.blockIO.throttle"));
     }
 
     /// CORE-3: 必要な controller の集合は指定した項目だけ。`{}` は空。

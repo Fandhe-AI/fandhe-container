@@ -5134,16 +5134,19 @@ mod tests {
                 None,
                 IsolationStage::MountBinds,
             ),
+            // 実機の適用失敗と同じ形（errno 由来の分類のまま、適用失敗の理由が付く。#2013）。
             "readonly_paths" => ExecError::new(
                 ErrorCode::FailedPrecondition,
                 IsolationStage::MountReadonlyPaths,
                 "injected failure",
-            ),
+            )
+            .or_violation(ViolationReason::ReadonlyPathApplyFailed, None),
             "masked_paths" => ExecError::new(
                 ErrorCode::FailedPrecondition,
                 IsolationStage::MountMaskedPaths,
                 "injected failure",
-            ),
+            )
+            .or_violation(ViolationReason::MaskedPathApplyFailed, None),
             _ => ExecError::new(
                 ErrorCode::InvalidArgument,
                 IsolationStage::InjectFiles,
@@ -5571,8 +5574,16 @@ mod tests {
                 ErrorCode::PermissionDenied,
                 Some("bind_source_not_accessible"),
             ),
-            ("readonly_paths", ErrorCode::FailedPrecondition, None),
-            ("masked_paths", ErrorCode::FailedPrecondition, None),
+            (
+                "readonly_paths",
+                ErrorCode::FailedPrecondition,
+                Some("readonly_path_apply_failed"),
+            ),
+            (
+                "masked_paths",
+                ErrorCode::FailedPrecondition,
+                Some("masked_path_apply_failed"),
+            ),
             (
                 "pivot_root",
                 ErrorCode::InvalidArgument,

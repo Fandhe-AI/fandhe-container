@@ -22,7 +22,9 @@
 //! 親は固定語彙の許可リストで引き直した静的トークンだけを監査レコードに入れる。`CODE` と `reason` の整合
 //! （`reason.error_code()` との一致）は検査しない: `CODE` は情報用で、記録の有無は `reason` だけで決まるため
 //! （段 `mount_binds` と組で受ける user namespace 由来の 2 理由〔#2072〕も同じ規則）。段と理由の整合は
-//! 段つきの許可リスト（[`launch_violation`]）で検査する。
+//! 段つきの許可リスト（[`launch_violation`]）で検査する。ただし保護の適用失敗の 2 理由（段 `readonly_paths` /
+//! `masked_paths` と組。SEC-4・SEC-2・#2013）に限り、親は `CODE` を復号した `ExecError::code` に使う（errno 由来の
+//! 分類を保つため。`CODE` は許可リストの `ErrorCode` 語彙に限られ、記録の有無・理由は変わらない）。
 
 use std::io::{Read as _, Write as _};
 use std::os::fd::AsFd as _;
@@ -33,7 +35,9 @@ use crate::sys::{self, SysError};
 use crate::traits::ContainerId;
 use crate::traits::types::ErrorCode;
 
-use super::{ExecError, IsolationStage, ViolationReason, record_launch_mount_rejection};
+use super::{
+    ExecError, IsolationStage, ViolationKind, ViolationReason, record_launch_mount_rejection,
+};
 
 /// 状態行の最大バイト数（LF を含む）。最長の行は約 85 バイトで、それより十分大きい固定上限。
 pub(super) const PRE_PIVOT_STATUS_MAX_BYTES: usize = 160;
@@ -141,12 +145,18 @@ fn launch_violation(step: PrePivotStep, token: &str) -> Option<ViolationReason> 
     if let Some(r) = ViolationReason::from_launch_token(token) {
         return Some(r);
     }
-    if step != PrePivotStep::MountBinds {
-        return None;
+    match step {
+        PrePivotStep::MountBinds => ViolationReason::MOUNT_BINDS_USER_NAMESPACE_REASONS
+            .into_iter()
+            .find(|r| r.as_str() == token),
+        // 保護の適用失敗は、自分の段の理由だけを通す（段と理由の食い違いは `Malformed`。#2013）。
+        PrePivotStep::ReadonlyPaths | PrePivotStep::MaskedPaths => {
+            ViolationReason::PROTECTED_PATH_APPLY_REASONS
+                .into_iter()
+                .find(|r| r.as_str() == token && r.stage() == step.stage())
+        }
+        _ => None,
     }
-    ViolationReason::MOUNT_BINDS_USER_NAMESPACE_REASONS
-        .into_iter()
-        .find(|r| r.as_str() == token)
 }
 
 /// 子が報告する pivot 前段の失敗。
@@ -428,6 +438,24 @@ pub fn relay_mount_binds_failure_for_test(
     resolve_pre_pivot_status(status, LaunchAudit { sink, container })
 }
 
+/// 単体テスト専用: 子の失敗 `error`（段 `step`）を、子の符号化・状態 pipe・親の復号と記録まで本番と同じ関数で
+/// 往復させる（SEC-4・#2013）。`path_masks` / `masked_paths` の適用失敗が、実際の `ExecError` から親の監査記録まで
+/// 届くことを具体値で照合するために使う。
+#[cfg(test)]
+pub(super) fn relay_failure_for_test(
+    step: PrePivotStep,
+    error: &ExecError,
+    audit: LaunchAudit<'_>,
+) -> Result<(), Box<AuditedRejection<ExecError>>> {
+    let (r, w) = std::io::pipe().expect("pipe");
+    let w = std::fs::File::from(std::os::fd::OwnedFd::from(w));
+    let r = std::fs::File::from(std::os::fd::OwnedFd::from(r));
+    let failure = PrePivotFailure::from_exec_error(step, error);
+    report_failure(&w, &failure).expect("report");
+    drop(w);
+    resolve_pre_pivot_status(read_pre_pivot_status(&r, Duration::from_secs(5)), audit)
+}
+
 /// 起動時の監査の渡し先（借用。`LaunchSpec` に載せない理由: `Debug + Clone + PartialEq + Eq` の値型に
 /// `&dyn AuditSink` を載せると derive が壊れるため。本番 launcher が起動ごとに作って渡す）。
 #[derive(Clone, Copy)]
@@ -450,12 +478,15 @@ pub(super) fn resolve_pre_pivot_status(
     match result {
         Ok(PrePivotStatus::Ready) => Ok(()),
         Ok(PrePivotStatus::Failed(f)) => Err(Box::new(match f.violation {
-            Some(reason) => record_launch_mount_rejection(
-                ExecError::from_violation_at(reason, None, f.step.stage()),
-                reason,
-                audit.container,
-                audit.sink,
-            ),
+            Some(reason) => {
+                let mut error = ExecError::from_violation_at(reason, None, f.step.stage());
+                // 保護の適用失敗は errno 由来の分類（古いカーネルの `Unimplemented` 等）をワイヤーの `CODE` で保つ。
+                // 他の理由の `code` は理由から決まる静的な値のまま（#2013）。
+                if reason.kind() == ViolationKind::ProtectedPathApply {
+                    error.code = f.code;
+                }
+                record_launch_mount_rejection(error, reason, audit.container, audit.sink)
+            }
             None => AuditedRejection::not_applicable(ExecError::new(
                 f.code,
                 f.step.stage(),
@@ -620,7 +651,7 @@ mod tests {
     /// 厳格な復号: 許可リスト外・形式違反は `Malformed`（SEC-4）。
     #[test]
     fn sec4_1815_decode_rejects_malformed_lines() {
-        let cases: [&[u8]; 18] = [
+        let cases: [&[u8]; 23] = [
             b"",
             b"P",
             b"P\n\n",
@@ -640,6 +671,12 @@ mod tests {
             b"F prepare_rootfs FAILED_PRECONDITION host_root_identity_mapping\n",
             b"F mount_binds INVALID_ARGUMENT no_namespaces\n",
             b"F mount_binds INVALID_ARGUMENT user_namespace_required \n",
+            // #2013: 保護の適用失敗の 2 理由は自分の段と組のときだけ受ける。
+            b"F establish INTERNAL readonly_path_apply_failed\n",
+            b"F masked_paths FAILED_PRECONDITION readonly_path_apply_failed\n",
+            b"F readonly_paths UNIMPLEMENTED masked_path_apply_failed\n",
+            b"F mount_binds INTERNAL masked_path_apply_failed\n",
+            b"F readonly_paths INTERNAL readonly_path_apply_failed \n",
         ];
         for c in cases {
             assert_eq!(
@@ -933,5 +970,74 @@ mod tests {
         assert!(matches!(r.delivery, AuditDelivery::SinkFailed(_)));
         assert_eq!(r.error.code, ErrorCode::InvalidArgument);
         assert_eq!(r.error.stage, IsolationStage::PrepareRootfs);
+    }
+
+    /// 監査（#2013）: 保護の適用失敗は、段ごとの理由で層 `mount` に 1 件記録され、`ErrorCode` はワイヤーの値のまま
+    /// （`Unimplemented` を保つ）、`stage` は段に対応し、`message` は理由の静的な英語になる。パスは載らない。
+    #[test]
+    fn sec4_2013_resolve_records_protected_path_apply_and_keeps_code() {
+        let id = ContainerId::new("c1").unwrap();
+        for (step, reason, code, token, stage, message) in [
+            (
+                PrePivotStep::ReadonlyPaths,
+                ViolationReason::ReadonlyPathApplyFailed,
+                ErrorCode::Unimplemented,
+                "readonly_path_apply_failed",
+                IsolationStage::MountReadonlyPaths,
+                "failed to apply a read-only path protection",
+            ),
+            (
+                PrePivotStep::MaskedPaths,
+                ViolationReason::MaskedPathApplyFailed,
+                ErrorCode::FailedPrecondition,
+                "masked_path_apply_failed",
+                IsolationStage::MountMaskedPaths,
+                "failed to apply a masked path protection",
+            ),
+        ] {
+            let sink = VecSink::new(false);
+            let r = resolve_pre_pivot_status(
+                Ok(fail(step, code, Some(reason))),
+                audit(&sink, Some(&id)),
+            )
+            .unwrap_err();
+            assert_eq!(r.delivery, AuditDelivery::Recorded);
+            assert_eq!(r.error.code, code);
+            assert_eq!(r.error.stage, stage);
+            assert_eq!(r.error.message, message);
+            let recs = sink.snapshot();
+            assert_eq!(recs.len(), 1);
+            assert_eq!(recs[0].layer(), AuditLayer::Mount);
+            assert_eq!(recs[0].path(), None);
+            assert_eq!(recs[0].reason().map(|x| x.as_str()), Some(token));
+            assert_eq!(recs[0].container_id().map(ContainerId::as_str), Some("c1"));
+
+            // sink が失敗しても拒否は覆らない（fail-closed）。
+            let failing = VecSink::new(true);
+            let r = resolve_pre_pivot_status(
+                Ok(fail(step, code, Some(reason))),
+                audit(&failing, Some(&id)),
+            )
+            .unwrap_err();
+            assert!(matches!(r.delivery, AuditDelivery::SinkFailed(_)));
+            assert_eq!(r.error.code, code);
+            assert_eq!(r.error.stage, stage);
+        }
+    }
+
+    /// 監査（#2013）: 他の理由の `code` は従来どおり理由から決まる静的な値のまま（ワイヤーの `CODE` で上書きしない）。
+    #[test]
+    fn sec4_2013_other_reasons_keep_static_code() {
+        let sink = VecSink::new(false);
+        let r = resolve_pre_pivot_status(
+            Ok(fail(
+                PrePivotStep::PrepareRootfs,
+                ErrorCode::Internal,
+                Some(ViolationReason::PathMissing),
+            )),
+            audit(&sink, None),
+        )
+        .unwrap_err();
+        assert_eq!(r.error.code, ErrorCode::InvalidArgument);
     }
 }

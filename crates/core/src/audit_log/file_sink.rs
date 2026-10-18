@@ -101,7 +101,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use crate::state_store::FileStateStore;
+use crate::state_store::{FileStateStore, StateRoot};
 #[cfg(target_os = "linux")]
 use crate::sys;
 use crate::traits::TraitError;
@@ -763,6 +763,19 @@ impl FileAuditSink {
             fallback: Arc::new(|| Box::new(KernelAuditFallback::new())),
             notify: isolated_notifier(Arc::new(|| Box::new(StderrLine)), NOTIFY_WAIT),
         }
+    }
+
+    /// 状態ルートを解決して状態ストアを開き、そのルート直下 `@audit.log` を主経路とする本番 sink を作る
+    /// （SEC-4・PLUG-11・#2013）。
+    ///
+    /// 呼び出し元: supervisor の `exec::default_audit_sink`（委譲）と、CLI の plugin バックエンド（plugin 信頼検証の
+    /// 拒否の記録先）。`root_override` が `None` なら [`StateRoot::resolve`] の既定規則に従う。ストアを開く順序は
+    /// [`Self::in_state_store`] の型による固定と同じ。Linux 以外では `FileStateStore::open` が `Unimplemented` を
+    /// 返す（作成の前に拒否するため副作用は無い。REPAIR-3: 非 Linux の記録先は未提供）。
+    pub fn open_in_state_root(root_override: Option<PathBuf>) -> Result<Self, TraitError> {
+        let root = StateRoot::resolve(root_override)?;
+        let store = FileStateStore::open(root)?;
+        Ok(Self::in_state_store(&store))
     }
 
     /// 結合試験専用: 主経路の 1 回分・待ち上限・代替経路・通知の出力先を差し込む。隔離は本番と同じ

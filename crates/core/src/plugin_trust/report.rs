@@ -14,11 +14,23 @@
 //! - `message` は kind ごとの静的英語で、パス等の入力値を含めない。パスは別フィールド `path` に分離する
 //! - 監査は拒否 1 回につき 1 レコード。記録の成否で拒否を覆さない（fail-closed。[`AuditedRejection`]）
 //!
+//! # 本番経路への配線（SEC-4・#2013）
+//!
+//! [`verify_candidate_audited`] は検証方式の切替点（[`PluginVerificationMethod::verify`]）を通し、CLI の plugin
+//! バックエンド（`fandhe-container-cli` の `plugin_backend`。macOS・Windows の本番経路）が本番の `AuditSink`
+//! （`FileAuditSink::open_in_state_root`）を渡して呼ぶ。記録先を作れないときは `SinkFailed` として扱い、拒否は覆らない。
+//!
 //! # 未実装（REPAIR-3）
 //!
-//! レジストリ登録経路・本番の `AuditSink`・CLI の終了コード処理への配線は後続。現時点で本番経路からは
-//! 呼ばれない。[`verify_candidate_audited`] は検証方式の切替点
-//! （[`PluginVerificationMethod::verify`]）を通す。
+//! - 非 Linux の記録先: 非 Linux では `FileStateStore::open` が `Unimplemented` を返すため記録先を作れず、検証が
+//!   常に返す `unsupported` の拒否の記録も `SinkFailed` になる（`FileStateStore` の非 Linux 実装待ち）
+//! - レジストリ登録・spawn の経路（TASK-114）への配線: 現状の呼び出し元は CLI の plugin バックエンドだけ
+//!
+//! # `container_id` を付けない理由（R4）
+//!
+//! plugin の信頼検証は `open_store` 経由で、create・start・stop・delete・list・logs のどれでも、コンテナを特定する
+//! 前にバックエンドを解決するために走る。特定のコンテナに属さず（`list` には対象のコンテナが無い）、載せる ID が
+//! 存在しないため付与しない（記録の `container_id` は null）。
 
 use std::io::Write;
 
@@ -186,7 +198,8 @@ pub fn record_plugin_trust_rejection(
         path: AuditPath::new(error.path()),
         reason: AuditReason::new(error.reason()),
     };
-    // plugin の信頼検証は特定のコンテナに属さないため container_id は載せない（#1618）。
+    // plugin の信頼検証はコンテナを特定する前に走り特定のコンテナに属さないため container_id は載せない（#1618・#2013。
+    // モジュール doc「`container_id` を付けない理由」）。
     let delivery = deliver(event, None, sink);
     AuditedRejection { error, delivery }
 }

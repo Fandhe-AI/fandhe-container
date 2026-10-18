@@ -272,7 +272,6 @@ use fandhe_container_core::oci_runtime::{
     OciConfig, RootfsDir, RootfsPinError, load_config, pin_bundle_rootfs_audited,
 };
 use fandhe_container_core::rlimits::Rlimits;
-use fandhe_container_core::state_store::{FileStateStore, StateRoot};
 use fandhe_container_core::traits::{
     CgroupPlacement, ContainerId, ContainerState, ErrorCode, StateRecord, TraitError,
 };
@@ -499,9 +498,7 @@ pub fn prepare_restrictions(
 pub fn default_audit_sink(
     root_override: Option<std::path::PathBuf>,
 ) -> Result<FileAuditSink, TraitError> {
-    let root = StateRoot::resolve(root_override)?;
-    let store = FileStateStore::open(root)?;
-    Ok(FileAuditSink::in_state_store(&store))
+    FileAuditSink::open_in_state_root(root_override)
 }
 
 /// 稼働中コンテナの中で実行するコマンドの要求（コンテナ内の絶対パス・argv・明示の環境変数。

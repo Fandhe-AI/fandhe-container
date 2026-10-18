@@ -33,6 +33,14 @@
 //! - **システムエラー**: 前提は満たしているが、カーネル・procfs の応答が得られない・解釈
 //!   できない、または syscall が失敗したもの（例: `ENOMEM`・`/proc` の読み取り失敗・
 //!   mountinfo の書式不正・`unshare` の `EPERM`）。`ExecError::violation` は `None`
+//! - **保護の適用不能**（種別 `protected_path_apply`。SEC-2・SEC-4・#2013）: `readonly_paths`・`masked_paths` の段で、
+//!   対象を固定して検査を通った後に、保護を載せる操作（bind・`mount_setattr`・`open_tree`・`move_mount`・tmpfs のマウント）
+//!   と事後検証が失敗したもの。失敗の原因が環境（古いカーネル〔`ENOSYS`〕・LSM）か rootfs の内容（イメージが置いた対象の
+//!   種別・マウント状態）かを、untrusted な子に頼る親は判別できない。SEC-4 は記録漏れを許さず、保護が載らないまま
+//!   起動を拒否した痕跡はこの記録だけになるため、違反の試行として記録する。理由トークンは対象の検査の拒否と分け
+//!   （`readonly_path_apply_failed`・`masked_path_apply_failed`）、受け手が区別できるようにする。`ExecError::code` は
+//!   errno 由来の分類を保つ。マウント前のシステムエラー（`fstat`・`dup`・mountinfo の読み取り失敗・定数定義の不正）は
+//!   従来どおり違反なしの失敗で記録しない
 //! - hostname の書式不正（`Hostname::new`）は入力値の書式エラーであり、分離違反の試行では
 //!   ないため違反記録を付けない
 //!
@@ -83,6 +91,11 @@ pub enum ViolationKind {
     /// 稼働中コンテナへの exec の対象（pid1）の検証（`setns` 参加前の対象の検証と、参加後の root の照合。
     /// SUP-6・SEC-1・TASK-163.1・TASK-163.3）。
     ExecTarget,
+    /// 読み取り専用化・覆い（`readonly_paths`・`masked_paths` の段）の適用そのものの失敗。対象の検査を通った後に
+    /// 保護を載せる操作（bind・`mount_setattr`・tmpfs のマウント等）と事後検証が失敗したもので、環境起因
+    /// （古いカーネル・LSM）と rootfs の内容起因を親が区別できないため、違反の試行として記録する
+    /// （SEC-4・SEC-2・TASK-41 追補・#2013）。
+    ProtectedPathApply,
 }
 
 impl ViolationKind {
@@ -97,6 +110,7 @@ impl ViolationKind {
             Self::RootfsPivot => "rootfs_pivot",
             Self::Entrypoint => "entrypoint",
             Self::ExecTarget => "exec_target",
+            Self::ProtectedPathApply => "protected_path_apply",
         }
     }
 }
@@ -265,9 +279,22 @@ pub enum ViolationReason {
     /// 起動時から保持する pidfd の指すプロセスが、記録した pid と一致しない（pidfd の取り違え・記録の
     /// 古さ。cgroup の所属に依らない同一性の照合。SUP-6・SEC-1・TASK-163 追補・#1461）。
     ExecTargetPidfdMismatch,
+    /// 読み取り専用にするパス（固定集合または `config.json` 由来）の保護を載せる操作・事後検証が失敗した
+    /// （SEC-2・SEC-4・TASK-41 追補・#2013）。対象の検査（symlink・shared・移動）の拒否は含まない。
+    ReadonlyPathApplyFailed,
+    /// 覆うパス（固定集合または `config.json` 由来）の保護を載せる操作・事後検証が失敗した
+    /// （SEC-2・SEC-4・TASK-41 追補・#2013）。
+    MaskedPathApplyFailed,
 }
 
 impl ViolationReason {
+    /// 種別 [`ViolationKind::ProtectedPathApply`] の理由の全一覧（読み取り専用化・覆いの適用失敗。SEC-2・SEC-4）。
+    ///
+    /// 親は段つきの許可リスト（`launch_status`）で、`readonly_paths` 段には前者だけ、`masked_paths` 段には後者だけを
+    /// 通す。理由の集合の唯一の定義。
+    pub(super) const PROTECTED_PATH_APPLY_REASONS: [Self; 2] =
+        [Self::ReadonlyPathApplyFailed, Self::MaskedPathApplyFailed];
+
     /// 種別 [`ViolationKind::ExecTarget`] の理由の全一覧（exec の対象の拒否。SUP-6・SEC-1）。
     ///
     /// supervisor の worker が返す理由コードを許可リストとして引き直すための SSOT（#1465）。
@@ -390,7 +417,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 61] = [
+    pub(super) const ALL: [ViolationReason; 63] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -452,6 +479,8 @@ impl ViolationReason {
         Self::ExecJoinedPidNamespaceMismatch,
         Self::ExecJoinedCgroupMismatch,
         Self::ExecTargetPidfdMismatch,
+        Self::ReadonlyPathApplyFailed,
+        Self::MaskedPathApplyFailed,
     ];
 
     /// pivot 前段の子が状態 pipe で運んだ理由コード `token` から理由を引き直す（許可リスト照合。SEC-4・#1815）。
@@ -476,7 +505,7 @@ impl ViolationReason {
 
     /// launch 経路で子が運んだ理由に対応する `Mount` 監査イベント（パスなし・理由コードつき。SEC-4・#1815）。
     ///
-    /// 対象は `MountTarget`・`SharedPropagation`・`RootfsPivot`（[`IsolationViolation::mount_audit_event`] と同じ範囲）。
+    /// 対象は `MountTarget`・`SharedPropagation`・`RootfsPivot`・`ProtectedPathApply`（[`IsolationViolation::mount_audit_event`] と同じ範囲）。
     /// 子から無制限長のパスを運ばないため、パスは載せない。
     ///
     /// 加えて、bind mount の段（`MountBinds`）が user namespace 由来で拒否した 2 理由
@@ -510,7 +539,8 @@ impl ViolationReason {
         match self.kind() {
             ViolationKind::MountTarget
             | ViolationKind::SharedPropagation
-            | ViolationKind::RootfsPivot => Some(AuditEvent::Mount {
+            | ViolationKind::RootfsPivot
+            | ViolationKind::ProtectedPathApply => Some(AuditEvent::Mount {
                 path,
                 reason: Some(AuditReason::new(self.as_str())),
             }),
@@ -604,6 +634,8 @@ impl ViolationReason {
             Self::ExecJoinedPidNamespaceMismatch => "exec_joined_pid_namespace_mismatch",
             Self::ExecJoinedCgroupMismatch => "exec_joined_cgroup_mismatch",
             Self::ExecTargetPidfdMismatch => "exec_target_pidfd_mismatch",
+            Self::ReadonlyPathApplyFailed => "readonly_path_apply_failed",
+            Self::MaskedPathApplyFailed => "masked_path_apply_failed",
         }
     }
 
@@ -672,6 +704,9 @@ impl ViolationReason {
             | Self::ExecJoinedPidNamespaceMismatch
             | Self::ExecJoinedCgroupMismatch
             | Self::ExecTargetPidfdMismatch => ViolationKind::ExecTarget,
+            Self::ReadonlyPathApplyFailed | Self::MaskedPathApplyFailed => {
+                ViolationKind::ProtectedPathApply
+            }
         }
     }
 
@@ -702,6 +737,7 @@ impl ViolationReason {
             | Self::BindSourcePseudoFs
             | Self::BindTargetKindMismatch => "SEC-1",
             Self::LandlockMountIdentityMismatch | Self::LandlockMountNotRoot => "CORE-5",
+            Self::ReadonlyPathApplyFailed | Self::MaskedPathApplyFailed => "SEC-2",
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
@@ -770,7 +806,9 @@ impl ViolationReason {
             | Self::ExecTargetPidfdMismatch
             | Self::ExecDevNotDirectory
             | Self::ExecProcNotProcfs
-            | Self::EntrypointCopySealUnverified => ErrorCode::FailedPrecondition,
+            | Self::EntrypointCopySealUnverified
+            | Self::ReadonlyPathApplyFailed
+            | Self::MaskedPathApplyFailed => ErrorCode::FailedPrecondition,
             Self::EntrypointIsRuntimeBinary
             | Self::StdioNullNotNullDevice
             | Self::EntrypointInterpreterIsRuntimeBinary
@@ -789,6 +827,10 @@ impl ViolationReason {
             ViolationKind::RootfsPivot => IsolationStage::PrepareRootfs,
             ViolationKind::Entrypoint => IsolationStage::Exec,
             ViolationKind::ExecTarget => IsolationStage::SetNs,
+            ViolationKind::ProtectedPathApply => match self {
+                Self::MaskedPathApplyFailed => IsolationStage::MountMaskedPaths,
+                _ => IsolationStage::MountReadonlyPaths,
+            },
             _ => IsolationStage::MountProc,
         }
     }
@@ -946,6 +988,8 @@ impl ViolationReason {
             Self::ExecTargetPidfdMismatch => {
                 "the process held by the launch pidfd is not the recorded exec target"
             }
+            Self::ReadonlyPathApplyFailed => "failed to apply a read-only path protection",
+            Self::MaskedPathApplyFailed => "failed to apply a masked path protection",
         }
     }
 }
@@ -1056,7 +1100,7 @@ impl IsolationViolation {
 
     /// マウント検証層の違反なら `Mount` 監査イベントを返す（SEC-4・TASK-41.4）。
     ///
-    /// 対象は `MountTarget`・`SharedPropagation`・`RootfsPivot`。計画・establish 前提・証跡不一致・
+    /// 対象は `MountTarget`・`SharedPropagation`・`RootfsPivot`・`ProtectedPathApply`。計画・establish 前提・証跡不一致・
     /// エントリポイントはマウント層の拒否ではないため `None`（エントリポイントは [`Self::entrypoint_audit_event`]、
     /// exec の対象の拒否は [`Self::exec_audit_event`] が記録する）。
     pub fn mount_audit_event(&self) -> Option<AuditEvent> {
@@ -1097,6 +1141,47 @@ mod tests {
         assert_eq!(names.len(), arms);
     }
 
+    /// SEC-4・SEC-2・#2013: 読み取り専用化・覆いの適用失敗の 2 理由は、トークン・種別・ビヘイビア ID・段・
+    /// `ErrorCode`・`Mount` 監査イベントが具体値で決まる。`from_launch_token` は通さない（段つきの許可リストが担う）。
+    #[test]
+    fn sec4_2013_protected_path_apply_reasons_have_fixed_values() {
+        let table = [
+            (
+                ViolationReason::ReadonlyPathApplyFailed,
+                "readonly_path_apply_failed",
+                IsolationStage::MountReadonlyPaths,
+                "failed to apply a read-only path protection",
+            ),
+            (
+                ViolationReason::MaskedPathApplyFailed,
+                "masked_path_apply_failed",
+                IsolationStage::MountMaskedPaths,
+                "failed to apply a masked path protection",
+            ),
+        ];
+        assert_eq!(ViolationReason::PROTECTED_PATH_APPLY_REASONS.len(), 2);
+        for (r, token, stage, msg) in table {
+            assert!(ViolationReason::PROTECTED_PATH_APPLY_REASONS.contains(&r));
+            assert_eq!(r.as_str(), token);
+            assert_eq!(r.kind(), ViolationKind::ProtectedPathApply);
+            assert_eq!(r.kind().as_str(), "protected_path_apply");
+            assert_eq!(r.behavior_id(), "SEC-2");
+            assert_eq!(r.error_code(), ErrorCode::FailedPrecondition);
+            assert_eq!(r.stage(), stage);
+            assert_eq!(r.message(), msg);
+            assert_eq!(ViolationReason::from_launch_token(token), None);
+            assert_eq!(
+                r.launch_mount_audit_event(),
+                Some(AuditEvent::Mount {
+                    path: None,
+                    reason: Some(AuditReason::new(token)),
+                })
+            );
+            // worker の経路には載らない（二重記録なし）。
+            assert_eq!(r.exec_worker_audit_event(), None);
+        }
+    }
+
     /// 引き直しは pivot 前段の 5 種別だけを受け付ける（SEC-4・#1815）。
     #[test]
     fn sec4_1815_launch_token_accepts_only_prepivot_kinds() {
@@ -1109,7 +1194,8 @@ mod tests {
                 | ViolationKind::EvidenceMismatch => true,
                 ViolationKind::PlanRejected
                 | ViolationKind::Entrypoint
-                | ViolationKind::ExecTarget => false,
+                | ViolationKind::ExecTarget
+                | ViolationKind::ProtectedPathApply => false,
             };
             let expected = accepted.then_some(r);
             assert_eq!(ViolationReason::from_launch_token(r.as_str()), expected);

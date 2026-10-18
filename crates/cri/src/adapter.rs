@@ -116,7 +116,7 @@ pub fn trait_error_to_status(err: &TraitError) -> Status {
 ///
 /// `CreateContainer` ハンドラが `ContainerRuntime::create` を呼ぶ直前に呼ぶ。CRI の要求は bundle の
 /// パスを持たないため、image の展開と `ContainerConfig` から `config.json` への変換は本トレイトの実装側の
-/// 責務とする。同期 API で、ハンドラは `spawn_blocking` 上から呼ぶ。
+/// 責務とする。同期 API で、ハンドラは tokio の blocking pool を使わず専用スレッド（worker）上から呼ぶ。
 ///
 /// **未実装（REPAIR-3）**: 本番の実装（image 展開・config 変換・パスの検証）は未提供で、本リポでは
 /// テスト用の実装だけがある。`config` の内容（envs 等の秘密値を含みうる）をエラー文言へ含めないこと。

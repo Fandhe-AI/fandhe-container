@@ -320,10 +320,14 @@ impl InFlightGuard {
         }
     }
 
-    /// Create の巻き戻し時に bundle を解放するよう設定する。
-    fn with_bundles(mut self, bundles: Arc<dyn BundleProvider>) -> Self {
+    /// Create の巻き戻し時に bundle を解放するよう設定する（bundle の解放責務を持たせる）。
+    ///
+    /// worker スレッドの先頭、`BundleProvider::prepare` の直前でだけ呼ぶ。worker が起動する前は呼ばない。
+    /// 起動前（スレッド生成の失敗でクロージャが RPC スレッド上で破棄される場合）の guard は解放責務を持たず、
+    /// `release`（外部処理）が RPC スレッドで走って期限を無視するのを防ぐ。起動前は `prepare` も未実行で、
+    /// 解放すべき bundle が無いためリークにならない（REPAIR-5・CRI-2）。
+    fn arm_bundles(&mut self, bundles: Arc<dyn BundleProvider>) {
         self.bundles = Some(bundles);
-        self
     }
 
     /// 実行層の呼び出しを開始した（以後、中断・commit 失敗では結果が不明になる）。
@@ -419,6 +423,24 @@ where
     rx.recv_timeout(timeout).ok()
 }
 
+/// `run_bounded` が使う名前つきスレッドの生成（テストでは生成失敗を注入できる）。
+///
+/// 失敗時はクロージャがこの関数内（呼び出し側のスレッド）で破棄される。クロージャが持つ値の `Drop` は
+/// 呼び出し側（RPC スレッド）で走るため、外部処理を伴う `Drop` を持たせてはならない（REPAIR-5）。
+fn spawn_runtime_thread<F>(name: &str, f: F) -> std::io::Result<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    #[cfg(test)]
+    if tests::take_spawn_failure() {
+        return Err(std::io::Error::other("injected spawn failure"));
+    }
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(f)
+        .map(|_| ())
+}
+
 /// `run_bounded` の完了待ちの共有状態（結果と、待っている future の waker）。
 struct WaitState<T> {
     result: Option<Result<T, Status>>,
@@ -466,32 +488,28 @@ where
     }));
     let waiter_state = Arc::clone(&state);
     // 監視スレッドを先に起こす。起動に失敗したら worker は走らせない（クロージャの破棄で guard が巻き戻す）。
-    std::thread::Builder::new()
-        .name("cri-runtime-wait".into())
-        .spawn(move || {
-            let result = match rx.recv_timeout(timeout) {
-                Ok(value) => Ok(value),
-                Err(RecvTimeoutError::Timeout) => {
-                    Err(Status::deadline_exceeded("runtime operation timed out"))
-                }
-                // worker の panic（guard の Drop が後始末する）。
-                Err(RecvTimeoutError::Disconnected) => Err(Status::internal("runtime task failed")),
-            };
-            if let Ok(mut state) = waiter_state.lock() {
-                state.result = Some(result);
-                if let Some(waker) = state.waker.take() {
-                    waker.wake();
-                }
+    spawn_runtime_thread("cri-runtime-wait", move || {
+        let result = match rx.recv_timeout(timeout) {
+            Ok(value) => Ok(value),
+            Err(RecvTimeoutError::Timeout) => {
+                Err(Status::deadline_exceeded("runtime operation timed out"))
             }
-        })
-        .map_err(|_| Status::unavailable("cannot start runtime wait thread"))?;
+            // worker の panic（guard の Drop が後始末する）。
+            Err(RecvTimeoutError::Disconnected) => Err(Status::internal("runtime task failed")),
+        };
+        if let Ok(mut state) = waiter_state.lock() {
+            state.result = Some(result);
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
+        }
+    })
+    .map_err(|_| Status::unavailable("cannot start runtime wait thread"))?;
     // worker は切り離す（join しない）。panic は guard の Drop が後始末する。
-    std::thread::Builder::new()
-        .name("cri-runtime-worker".into())
-        .spawn(move || {
-            let _ = tx.send(work());
-        })
-        .map_err(|_| Status::unavailable("cannot start runtime worker thread"))?;
+    spawn_runtime_thread("cri-runtime-worker", move || {
+        let _ = tx.send(work());
+    })
+    .map_err(|_| Status::unavailable("cannot start runtime worker thread"))?;
     BoundedWait(state).await
 }
 
@@ -682,7 +700,7 @@ impl CriRuntimeService {
         self
     }
 
-    /// 実行層の応答待ちの上限を指定する（既定 60 秒。REPAIR-5）。超過した RPC は `DEADLINE_EXCEEDED`。
+    /// 実行層の応答待ちの上限を指定する（既定 10 秒。REPAIR-5）。超過した RPC は `DEADLINE_EXCEEDED`。
     pub fn with_runtime_timeout(mut self, timeout: Duration) -> Self {
         self.runtime_timeout = timeout;
         self
@@ -996,13 +1014,14 @@ impl CriRuntimeService {
             Arc::clone(&self.registry),
             container_id.clone(),
             InFlightKind::Create,
-        )
-        .with_bundles(Arc::clone(&binding.bundles));
+        );
         let adapter = binding.adapter.clone();
         let bundles = Arc::clone(&binding.bundles);
         let id = container_id.clone();
         let timeout = self.runtime_timeout;
         run_bounded(self.runtime_timeout, move || -> Result<(), Status> {
+            // worker が実際に走り出してから bundle の解放責務を持つ（起動失敗時は RPC スレッドで release しない）。
+            guard.arm_bundles(Arc::clone(&bundles));
             let bundle = bundles.prepare(&id, &sandbox_id, &config)?;
             // 以後は実行層に資源が残りうる。確定失敗または削除完了を確認できた場合だけ解放する（fail-closed）。
             guard.mark_dispatched();
@@ -1776,6 +1795,27 @@ impl RuntimeService for CriRuntimeService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// 現スレッドの N 回目（0 起点）のスレッド生成を失敗させる（`None` で無効）。
+        static FAIL_SPAWN_AT: Cell<Option<u32>> = const { Cell::new(None) };
+    }
+
+    /// `spawn_runtime_thread` から呼ばれる。注入した回数に達したら true を返して注入を解除する。
+    pub(super) fn take_spawn_failure() -> bool {
+        FAIL_SPAWN_AT.with(|c| match c.get() {
+            Some(0) => {
+                c.set(None);
+                true
+            }
+            Some(n) => {
+                c.set(Some(n - 1));
+                false
+            }
+            None => false,
+        })
+    }
     use crate::instrument::CriOpOutcome;
     use crate::instrument::testing::Collect;
     use prost::Message;
@@ -1807,6 +1847,152 @@ mod tests {
         c.labels.insert("k".into(), "v".into());
         c.annotations.insert("a".into(), "b".into());
         c
+    }
+
+    /// 起動できない実行層（呼ばれたら失敗）。スレッド生成失敗の注入テスト用。
+    struct NeverRuntime;
+
+    impl fandhe_container_core::traits::ContainerRuntime for NeverRuntime {
+        fn create(
+            &self,
+            _: &fandhe_container_core::traits::CreateRequest,
+        ) -> Result<
+            fandhe_container_core::traits::ContainerStatus,
+            fandhe_container_core::traits::TraitError,
+        > {
+            Err(unused())
+        }
+        fn start(
+            &self,
+            _: &fandhe_container_core::traits::StartRequest,
+        ) -> Result<
+            fandhe_container_core::traits::ContainerStatus,
+            fandhe_container_core::traits::TraitError,
+        > {
+            Err(unused())
+        }
+        fn kill(
+            &self,
+            _: &fandhe_container_core::traits::KillRequest,
+        ) -> Result<
+            fandhe_container_core::traits::ContainerStatus,
+            fandhe_container_core::traits::TraitError,
+        > {
+            Err(unused())
+        }
+        fn stop(
+            &self,
+            _: &fandhe_container_core::traits::StopRequest,
+        ) -> Result<
+            fandhe_container_core::traits::ContainerStatus,
+            fandhe_container_core::traits::TraitError,
+        > {
+            Err(unused())
+        }
+        fn delete(
+            &self,
+            _: &fandhe_container_core::traits::DeleteRequest,
+        ) -> Result<
+            fandhe_container_core::traits::DeleteResponse,
+            fandhe_container_core::traits::TraitError,
+        > {
+            Err(unused())
+        }
+        fn state(
+            &self,
+            _: &fandhe_container_core::traits::StateRequest,
+        ) -> Result<
+            fandhe_container_core::traits::ContainerStatus,
+            fandhe_container_core::traits::TraitError,
+        > {
+            Err(unused())
+        }
+    }
+
+    fn unused() -> fandhe_container_core::traits::TraitError {
+        fandhe_container_core::traits::TraitError::new(
+            fandhe_container_core::traits::ErrorCode::Unimplemented,
+            "not used",
+        )
+    }
+
+    /// `release` を永久に止める bundle 供給元。`prepare` と `release` の呼び出し元スレッドを記録する。
+    #[derive(Default)]
+    struct HangingRelease {
+        prepares: std::sync::atomic::AtomicUsize,
+        releases: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BundleProvider for HangingRelease {
+        fn prepare(
+            &self,
+            _: &str,
+            _: &str,
+            _: &v1::ContainerConfig,
+        ) -> Result<std::path::PathBuf, Status> {
+            self.prepares
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(std::path::PathBuf::from("/bundles/x"))
+        }
+        fn release(&self, _: &str) -> Result<(), Status> {
+            self.releases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            loop {
+                std::thread::park();
+            }
+        }
+    }
+
+    /// REPAIR-5・CRI-2: worker / 監視スレッドの生成に失敗しても、bundle の `release`（外部処理）は
+    /// RPC スレッドで走らず、応答は期限内に `UNAVAILABLE` で返り、仮登録（件数枠）は巻き戻る。
+    /// 起動前は `prepare` も未実行なので解放すべき bundle は無く、リークしない。
+    #[test]
+    fn repair_5_cri_2_create_spawn_failure_never_releases_on_rpc_thread() {
+        for fail_at in [0u32, 1] {
+            let bundles = Arc::new(HangingRelease::default());
+            let svc = CriRuntimeService::new()
+                .with_runtime(
+                    crate::adapter::RuntimeAdapter::new(Arc::new(NeverRuntime)),
+                    bundles.clone(),
+                )
+                .with_runtime_timeout(Duration::from_millis(500));
+            let sb = run(&svc, Some(config("p")), "")
+                .unwrap()
+                .into_inner()
+                .pod_sandbox_id;
+            FAIL_SPAWN_AT.with(|c| c.set(Some(fail_at)));
+            let started = std::time::Instant::now();
+            let err = block_on(
+                svc.create_container(Request::new(v1::CreateContainerRequest {
+                    pod_sandbox_id: sb,
+                    config: Some(v1::ContainerConfig {
+                        metadata: Some(v1::ContainerMetadata {
+                            name: "c".into(),
+                            attempt: 0,
+                        }),
+                        image: Some(v1::ImageSpec {
+                            image: "busybox:1.36".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    sandbox_config: None,
+                })),
+            )
+            .unwrap_err();
+            FAIL_SPAWN_AT.with(|c| c.set(None));
+            assert_eq!(err.code(), Code::Unavailable);
+            assert!(started.elapsed() < Duration::from_millis(400));
+            assert_eq!(
+                bundles.releases.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert_eq!(
+                bundles.prepares.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            assert_eq!(svc.registry.lock().unwrap().containers.len(), 0);
+        }
     }
 
     fn run(

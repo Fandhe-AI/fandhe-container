@@ -16,8 +16,8 @@
 //! `unavailable` が `FileAuditSink::open_in_state_root`（`<状態ルート>/@audit.log`）で作る。記録先を作れない
 //! ときは、常にその `TraitError` を返す私的な sink を渡し、`AuditDelivery::SinkFailed` として扱う（黙って捨てない。
 //! 何もしない sink は作らない）。記録の成否は CLI の終了コード・構造化エラーを変えない（fail-closed）。
-//! 記録の結果（delivery）は stderr に出さない（出力の 3 OS 互換を保つ。両経路の失敗の通知は `FileAuditSink`
-//! 自身が出す）。記録に `container_id` は付けない: 検証はコンテナを特定する前にバックエンドを解決するために走り
+//! 記録の結果（delivery）自体は出力しない。失敗の通知は sink 側が出す: 書き込み失敗は `FileAuditSink`、
+//! 記録先の作成失敗は私的な sink が、どちらも固定スキーマ 1 行を stderr へ出す（REPAIR-4。パス・errno は含めない）。記録に `container_id` は付けない: 検証はコンテナを特定する前にバックエンドを解決するために走り
 //! （create・start・stop・delete・list・logs のどれでも）、特定のコンテナに属さないため。
 //!
 //! 未実装・簡易実装（REPAIR-3。実装済みを装わない）:
@@ -192,10 +192,30 @@ pub(super) fn backend_failure(
 
 /// 記録先を作れなかったときに渡す sink。`record` が常に作成時の失敗を返し、拒否の記録は `SinkFailed` になる
 /// （黙って捨てない。拒否は覆らない。#2013）。
+///
+/// `FileAuditSink` の失敗通知は記録先を作れたときの書き込み失敗にしか走らないため、作成失敗はここで同じ
+/// 経路（stderr への固定スキーマ 1 行。REPAIR-4）へ通知する。`rejection.delivery` は呼び出し側で捨てるので、
+/// 通知はこの sink が `record` の中で出す。
 struct UnavailableAuditSink(TraitError);
+
+impl UnavailableAuditSink {
+    /// 作成失敗を固定スキーマの 1 行（LF 終端）で `out` へ書く。値は固定トークンで、パス・errno・
+    /// 元のメッセージを含めない（ログ注入・情報漏えいの回避）。
+    fn write_json_line(&self, out: &mut dyn Write) -> std::io::Result<()> {
+        writeln!(
+            out,
+            "{{\"event\":\"audit_sink_unavailable\",\"code\":\"{}\",\"message\":\"audit record sink could not be created\"}}",
+            self.0.code().as_str(),
+        )
+    }
+}
 
 impl AuditSink for UnavailableAuditSink {
     fn record(&self, _record: &AuditRecord) -> Result<(), TraitError> {
+        // 通知の出力失敗は本来の拒否を隠さないよう無視する。
+        let mut err = std::io::stderr();
+        let _ = self.write_json_line(&mut err);
+        let _ = err.flush();
         Err(self.0.clone())
     }
 }
@@ -408,6 +428,18 @@ mod tests {
         let e = backend_failure(BackendPlugin::Macos, report_with(&tmp, &[]), &sink);
         assert_eq!(e.message(), MSG_NOT_INSTALLED);
         assert!(sink.records().is_empty());
+    }
+
+    /// SEC-4・REPAIR-4（#2013）: 記録先の作成失敗は、機械可読な固定スキーマ 1 行で通知される（パスを含めない）。
+    #[test]
+    fn sec4_2013_unavailable_audit_sink_notice_is_structured() {
+        let sink = UnavailableAuditSink(TraitError::new(ErrorCode::Unimplemented, "/secret/path"));
+        let mut buf = Vec::new();
+        sink.write_json_line(&mut buf).expect("write");
+        assert_eq!(
+            String::from_utf8(buf).expect("utf8"),
+            "{\"event\":\"audit_sink_unavailable\",\"code\":\"UNIMPLEMENTED\",\"message\":\"audit record sink could not be created\"}\n"
+        );
     }
 
     /// SEC-4（#2013）: 記録先を作れなかったときの sink は、`record` が保持した `TraitError` を常にそのまま返す。

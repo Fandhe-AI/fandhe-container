@@ -44,12 +44,20 @@
 //! root 所有でユーザーに写像されないため、書き込み open は読み取り専用マウントの検査より先にパーミッション検査で
 //! `EACCES` になる可能性が高い。rootless の `/proc` 配下は mountinfo の `ro` を主な保証とする。
 //!
+//! # `/proc`・`/sys` のマウントとの順序（#2005・SEC-2・ESC-04・ESC-05）
+//!
+//! - procfs は `prepare_rootfs`（`run_pre_pivot` の 2 番目の段）が pivot **前**に `rootfs/proc` へマウント済みで、本段の
+//!   再帰 bind と `MOUNT_ATTR_RDONLY` はその procfs の上に新しいマウントを作る。保護は見えている実 procfs に効く
+//! - launch 経路では pivot 後に `/proc`・`/sys` へマウントしない（後からマウントすると保護のマウントを覆い隠す）。
+//!   コンテナ内のプロセスは seccomp の mount 拒否と `CAP_SYS_ADMIN` の除去で `/proc` を載せ直せない
+//! - 将来 sysfs（TASK-127）や OCI `mounts[]` の proc / sysfs を受ける場合は、本段より前に載せなければならない
+//! - 順序は `run_pre_pivot` の 1 か所で固定し、単体テスト `core1_run_pre_pivot_order_is_fixed` と、結合試験
+//!   `readonly_paths`・`masked_paths` の最上位マウントの照合（親が見えている procfs であること）で検査する
+//!
 //! # 未実装（REPAIR-3: 実装済みを装わない）
 //!
 //! - `/sys` 配下の個別項目と sysfs の供給（TASK-127）。`/sys` は mount top だけを読み取り専用にする。将来 OCI
 //!   `mounts[]` で sysfs を `/sys` に載せる場合は、本段より前に載せること
-//! - `/proc` の供給（procfs マウント）。現状は本段より後に procfs をマウントする実装がない。将来 OCI `mounts[]`
-//!   等で procfs を `/proc` に載せる場合は、`/sys` と同様に本段より前に載せること（後から載せると読み取り専用の bind が隠れる）
 //! - 違反の監査（SEC-4）への記録: 失敗は `ExecError`（段 `MountReadonlyPaths`）で返すだけで、専用の
 //!   `ViolationReason` は足していない
 //!

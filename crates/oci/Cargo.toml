@@ -30,3 +30,16 @@ sha2.workspace = true
 flate2.workspace = true
 # 承認: Issue #408（workspace 承認済みの用途「レイヤー tar の解析」）。TASK-52.3（#409）で利用。unpack 系 API は使わない。
 tar.workspace = true
+
+# 実機前提ハーネス tests/pull_e2e.rs（TASK-55.1・#420・OCI-1）の実行段が TASK-29 の create / start と
+# ProductionLauncher を使うための workspace 内 path 依存（dev のみ。外部 crate の追加ではない。cri と同形）。
+[dev-dependencies]
+fandhe-container-core = { path = "../core", default-features = false }
+
+# pull・digest 検証・展開・rootfs 実行の自動検証ハーネス（OCI-1・TASK-55.1・#420）。実行段で fork するため
+# 単一スレッドの独自 main（harness = false）。`-- --ignored` 指定時のみ実機前提の部分（外向き HTTPS・委譲 cgroup v2・
+# 非特権 user namespace）を実行し、未指定時はオフライン自己検証だけを行う（AGENTS.md）。
+[[test]]
+name = "pull_e2e"
+path = "tests/pull_e2e.rs"
+harness = false

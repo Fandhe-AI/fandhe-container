@@ -67,7 +67,13 @@ fn main() {
     if std::env::args().any(|a| a == "--child") {
         let o = fandhe_container_core::exec::observe_default_seccomp_enforcement()
             .expect("apply default seccomp in child");
-        assert_eq!(o.kcmp_before, None, "control: kcmp before seccomp");
+        assert_eq!(
+            o.kcmp_before, None,
+            "precondition failed: kcmp(self, self, KCMP_VM) must succeed before our filter is applied \
+             (errno {:?}); the outer environment already denies kcmp (e.g. Docker's default seccomp \
+             profile in a dev container), so the control is meaningless. See AGENTS.md seccomp_enforcement",
+            o.kcmp_before
+        );
         assert!(o.instructions > 0, "filter has instructions");
         assert_eq!(o.seccomp_mode, "2", "SECCOMP_MODE_FILTER");
         assert_eq!(o.kcmp_after, Some(EPERM), "kcmp blocked");

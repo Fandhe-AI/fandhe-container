@@ -31,6 +31,9 @@
 //! tmpfs が作成時に `ro` を持つので後から掛けても失われない。`/dev` が載っている必要があるため
 //! `create_default_devices` より後である。順序は `run_pre_pivot` の 1 か所に固定し、外す入口は作らない。
 //!
+//! procfs は `prepare_rootfs` が pivot 前に `rootfs/proc` へマウント済みで、覆いはその実 procfs の上に載る（#2005・SEC-2）。
+//! pivot 後に `/proc` へマウントし直すと覆いが隠れるため行わない。sysfs（TASK-127）を供給するときも本段より前に載せる。
+//!
 //! # `setup` なしの最小構成では適用しない
 //!
 //! 検証済みの `/dev/null` は `create_default_devices` が作るため、`setup`（`PrePivotSetup`）指定時にだけ存在する。

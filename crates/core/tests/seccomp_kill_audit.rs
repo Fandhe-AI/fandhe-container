@@ -19,30 +19,6 @@
 //!   `actions_logged` の `kill_process`）を満たさなければ失敗にする（検証せず成功する分岐は持たない）。
 //!   `harness = false` の単一スレッド `main` で動かす（seccomp の適用が不可逆のため）
 
-/// `ausearch --raw` の出力から、`pid`・`sig=31`・`code=0x80000000`・`arch`・`syscall` が
-/// すべて空白区切りのフィールドとして完全一致する `type=SECCOMP` 行の件数を数える（部分一致はしない。
-/// `comm`・`exe` はコンテナが操作できるため解釈しない）。
-fn count_matching_seccomp_records(raw: &str, pid: u32, arch: &str, syscall: u32) -> usize {
-    let want = [
-        format!("pid={pid}"),
-        "sig=31".to_string(),
-        "code=0x80000000".to_string(),
-        format!("arch={arch}"),
-        format!("syscall={syscall}"),
-    ];
-    raw.lines()
-        .filter(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            fields.contains(&"type=SECCOMP") && want.iter().all(|w| fields.contains(&w.as_str()))
-        })
-        .count()
-}
-
-/// `actions_logged`（空白区切りの許可リスト）に `kill_process` があるか。
-fn actions_logged_has_kill_process(actions: &str) -> bool {
-    actions.split_whitespace().any(|a| a == "kill_process")
-}
-
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("seccomp_kill_audit: Linux only, not applicable on this OS");
@@ -66,10 +42,72 @@ fn main() {
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
+/// `msg=audit(<秒>.<ミリ秒>:<連番>)` の秒部分を取り出す。
+fn audit_epoch_secs(line: &str) -> Option<u64> {
+    let rest = line.split("msg=audit(").nth(1)?;
+    let secs = rest.split('.').next()?;
+    secs.parse().ok()
+}
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+/// `ausearch --raw` の出力から、`pid`・`sig=31`・`code=0x80000000`・`arch`・`syscall` が
+/// すべて空白区切りのフィールドとして完全一致し、かつ記録時刻が `min_epoch_secs` 以上の
+/// `type=SECCOMP` 行の件数を数える（部分一致はしない。`comm`・`exe` はコンテナが操作できるため解釈しない）。
+/// `min_epoch_secs` は子の起動前に取った時刻で、PID 再利用による過去の記録を除く（SEC-4・REPAIR-12）。
+fn count_matching_seccomp_records(
+    raw: &str,
+    pid: u32,
+    arch: &str,
+    syscall: u32,
+    min_epoch_secs: u64,
+) -> usize {
+    let want = [
+        format!("pid={pid}"),
+        "sig=31".to_string(),
+        "code=0x80000000".to_string(),
+        format!("arch={arch}"),
+        format!("syscall={syscall}"),
+    ];
+    raw.lines()
+        .filter(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            fields.contains(&"type=SECCOMP")
+                && want.iter().all(|w| fields.contains(&w.as_str()))
+                && audit_epoch_secs(line).is_some_and(|t| t >= min_epoch_secs)
+        })
+        .count()
+}
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+/// `actions_logged`（空白区切りの許可リスト）に `kill_process` があるか。
+fn actions_logged_has_kill_process(actions: &str) -> bool {
+    actions.split_whitespace().any(|a| a == "kill_process")
+}
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 fn main() {
+    use std::io::Read as _;
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use fandhe_container_core::exec::{KilledSyscall, observe_default_seccomp_kill};
 
@@ -85,6 +123,38 @@ fn main() {
     const ARCH: &str = "c00000b7";
     const AUSEARCH: &str = "/usr/sbin/ausearch";
     const ACTIONS_LOGGED: &str = "/proc/sys/kernel/seccomp/actions_logged";
+
+    /// `ausearch` を spawn し、1 回あたり 3 秒で打ち切る（期限超過は kill して wait で回収。REPAIR-5）。
+    /// stdout は別スレッドで読む。PATH 探索はせず絶対パスで実行する。
+    fn run_ausearch_bounded(pid: &str) -> String {
+        let mut child = Command::new(AUSEARCH)
+            .args(["-m", "SECCOMP", "-p", pid, "--raw"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("run ausearch (root and auditd required)");
+        let mut stdout = child.stdout.take().expect("ausearch stdout");
+        let reader = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout.read_to_end(&mut buf);
+            buf
+        });
+        let limit = Instant::now() + Duration::from_secs(3);
+        loop {
+            if child.try_wait().expect("try_wait ausearch").is_some() {
+                break;
+            }
+            if Instant::now() >= limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let buf = reader.join().unwrap_or_default();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
 
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--child-kill") {
@@ -107,11 +177,20 @@ fn main() {
          type=SECCOMP msg=audit(1.4:8): pid=4242 sig=31 arch={ARCH} syscall=101 code=0x80000000\n"
     );
     assert_eq!(
-        count_matching_seccomp_records(&fixture, 4242, ARCH, 272),
+        count_matching_seccomp_records(&fixture, 4242, ARCH, 272, 1),
         1,
         "exact field match only"
     );
-    assert_eq!(count_matching_seccomp_records(&fixture, 4242, ARCH, 999), 0);
+    assert_eq!(
+        count_matching_seccomp_records(&fixture, 4242, ARCH, 999, 1),
+        0
+    );
+    // 境界より前の記録（PID 再利用で残る過去分）は数えない。
+    assert_eq!(
+        count_matching_seccomp_records(&fixture, 4242, ARCH, 272, 2),
+        0,
+        "records before the boundary are ignored"
+    );
     assert!(actions_logged_has_kill_process(
         "kill_process kill_thread trap errno user_notif trace log"
     ));
@@ -135,6 +214,11 @@ fn main() {
         } else {
             arm_nr
         };
+        // 子の起動前に境界時刻を取る（監査の記録時刻は同じ実時間。1 秒の丸めに備え切り捨てる）。
+        let start_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
         let mut child = Command::new(&exe)
             .args(["--child-kill", name])
             .stdout(Stdio::null())
@@ -155,16 +239,8 @@ fn main() {
         // 記録の反映を最大 5 秒ポーリングする（REPAIR-5）。PATH 探索はせず絶対パスで実行する。
         let until = Instant::now() + Duration::from_secs(5);
         let count = loop {
-            let out = Command::new(AUSEARCH)
-                .args(["-m", "SECCOMP", "-p", &pid.to_string(), "--raw"])
-                .output()
-                .expect("run ausearch (root and auditd required)");
-            let n = count_matching_seccomp_records(
-                &String::from_utf8_lossy(&out.stdout),
-                pid,
-                ARCH,
-                nr,
-            );
+            let raw = run_ausearch_bounded(&pid.to_string());
+            let n = count_matching_seccomp_records(&raw, pid, ARCH, nr, start_secs);
             if n > 0 || Instant::now() >= until {
                 break n;
             }

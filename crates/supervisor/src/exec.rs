@@ -241,11 +241,10 @@
 //! - launcher による記録の書き込み（`launch_rlimits_from_self` の結果を `StagePipeline::with_rlimits` と
 //!   `CreateStateRequest::with_rlimits` の両方へ渡す結線）。本番の `start` は `process.rlimits` を `Unimplemented` で
 //!   拒否しており、現状は Running の記録に rlimit が載らないため、exec は記録を要求して拒否する（REPAIR-3）
-//! - launcher による launch 時の分離の記録の書き込み（`launch_isolation_from_bundle` または overlay 等では子の
-//!   pivot 後の `/` から作る `LaunchIsolationRecord::new` の結果を、`StagePipeline::with_landlock` へ渡す ruleset と同じ
-//!   入力から作り、`CreateStateRequest::with_launch_isolation` で書く結線）。結線までは exec が記録なしで拒否する。
-//!   restart の再 launch は mount namespace を作り直すため、`UpdateStateRequest::with_launch_isolation` で記録し直す
-//!   必要がある（しないと restart 後の exec は `/` の照合で拒否される。fail-closed）。ルールの対象ごとの
+//! - launch 時の分離の記録の書き込みは、本番 launcher が `StagePipeline::with_landlock` へ渡す ruleset そのものから作り
+//!   （`LaunchedProcess::launch_isolation`）、start の Running 更新と restart の Running(新 pid) 更新で書く結線済み
+//!   （#2007）。記録を持たない launcher（偽の実装）では exec が記録なしで拒否する。本番 launcher による restart の
+//!   再 launch は #2043 まで拒否される。overlay 等では子の pivot 後の `/` から作る必要がある。ルールの対象ごとの
 //!   `(st_dev, st_ino)` の記録と照合（launch の子から親への状態 pipe が要る）も未実装（REPAIR-3）
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（root を要し、CI ではビルドのみで実行していない）
 

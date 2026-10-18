@@ -226,6 +226,14 @@ impl LaunchedProcess for ControlledProcess {
         self.inner.pid()
     }
 
+    /// 内側の launch 時の分離の記録へ転送する(転送しないと restart の記録の置き換えが落ち、restart 後の exec が
+    /// `/` の照合で拒否される。SUP-6・#2007)。
+    fn launch_isolation(
+        &self,
+    ) -> Option<&fandhe_container_core::launch_isolation::LaunchIsolationRecord> {
+        self.inner.launch_isolation()
+    }
+
     fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
         self.drain(None);
         let result = self.inner.wait(timeout);
@@ -318,6 +326,7 @@ mod tests {
         signals: Arc<Mutex<Vec<u8>>>,
         exited: Arc<AtomicBool>,
         output_taken: Arc<AtomicBool>,
+        isolation: Option<fandhe_container_core::launch_isolation::LaunchIsolationRecord>,
     }
 
     impl Fake {
@@ -330,6 +339,7 @@ mod tests {
                     signals: Arc::clone(&signals),
                     exited: Arc::clone(&exited),
                     output_taken: Arc::new(AtomicBool::new(false)),
+                    isolation: None,
                 },
                 signals,
                 exited,
@@ -359,6 +369,11 @@ mod tests {
             self.signals.lock().unwrap().push(signal.as_u8());
             Ok(())
         }
+        fn launch_isolation(
+            &self,
+        ) -> Option<&fandhe_container_core::launch_isolation::LaunchIsolationRecord> {
+            self.isolation.as_ref()
+        }
         fn take_output(&self) -> Option<ContainerOutput> {
             self.output_taken.store(true, Ordering::SeqCst);
             Some(ContainerOutput::default())
@@ -387,6 +402,25 @@ mod tests {
         };
         let _ = process.wait(Duration::from_millis(1));
         rx.recv_timeout(Duration::from_secs(5)).unwrap()
+    }
+
+    /// SUP-6(#2007): 包み直しは内側の分離の記録をそのまま返す(記録なしの内側では `None`)。
+    #[test]
+    fn sup6_controlled_process_forwards_launch_isolation() {
+        use fandhe_container_core::launch_isolation::{
+            LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+        };
+        let landlock =
+            RecordedLandlock::new(0x3f, vec![RecordedRule::new(RecordedTarget::Root, 0x0f)])
+                .unwrap();
+        let record = LaunchIsolationRecord::from_parts(RootIdentity::new(5, 6), landlock);
+        let (mut fake, _, _) = Fake::new(100);
+        fake.isolation = Some(record.clone());
+        let cp = ControlledProcess::new(Box::new(fake), SignalSlot::new());
+        assert!(cp.launch_isolation() == Some(&record));
+        let (plain, _, _) = Fake::new(101);
+        let cp = ControlledProcess::new(Box::new(plain), SignalSlot::new());
+        assert!(cp.launch_isolation().is_none());
     }
 
     /// SUP-1・SEC-1: 一致する pid の要求だけがシグナル番号つきで内側へ届く。

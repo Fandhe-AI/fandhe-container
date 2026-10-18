@@ -130,7 +130,7 @@ fn build_default_program() -> Result<SeccompProgram, ExecError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SeccompEnforcementObservation {
-    /// 適用前の `kcmp(自 pid, 自 pid, KCMP_VM)`（対照。通常は成功し `None`）。
+    /// 適用前の `kcmp(自 pid, 自 pid, KCMP_VM)`（対照。通常は成功し `None`。外側の seccomp が `kcmp` を拒否する環境では `EPERM` になり対照として働かないため、試験は前提欠如として失敗させる。ESC-06・#2006）。
     pub kcmp_before: Option<i32>,
     /// 適用した BPF 命令数。
     pub instructions: usize,

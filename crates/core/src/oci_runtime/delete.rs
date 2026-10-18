@@ -57,6 +57,12 @@
 //! 参照なしの既存の状態を並行して delete しても、その create の参照を外さない（外すと状態作成後に
 //! 参照なしのコンテナが残り、使用中のイメージが GC の対象になる。OCI-7）。
 //!
+//! 事前に未確定（`None`）だった場合は、状態の削除後にもう一度 `registration` を読む。読んだ後に並行する
+//! create が `bind` を終え、続く状態の存在確認の後で delete が状態を消すと、create 側は消えたことを検知できず、
+//! delete 側も事前の読みが `None` で外す経路が失われるため（参照が残り、同 ID の再 create が `AlreadyExists`、
+//! イメージも使用中のまま残る）。確定済みの参照は同じ ID の他の create が登録できないので、状態が無い
+//! 状態で読めた確定済みの世代は削除したコンテナのものである。世代つきの `release_if` で外す。
+//!
 //! 登録世代の読み取りや解除の失敗は delete の結果を変えず（状態は消えており、エラーで返すと再実行が
 //! `NotFound` になるため）、操作名 `image_ref_release` で `recorder` に記録する。読み取りに失敗したときは
 //! 解除しない。残った参照はデータを余分に持つ安全側で、起動時の照合（#854）が回収する。
@@ -280,6 +286,22 @@ pub fn delete_releasing_image_ref(
         })
         .flatten();
     let response = delete(store, recorder, cgroups, req)?;
+    // 事前に未確定（None）だった場合、読んだ後に並行する create が bind を終えていると、解除する経路が
+    // 失われる。状態の削除後に登録を読み直し、確定済みで状態が無ければその世代を外す。
+    let generation = generation.or_else(|| {
+        let state_gone = matches!(
+            store.get(&GetStateRequest::new(req.id().clone())),
+            Err(ref e) if e.code() == ErrorCode::NotFound
+        );
+        if !state_gone {
+            return None;
+        }
+        let name = OpName::new(IMAGE_REF_LOOKUP_OP_NAME).ok()?;
+        recorder
+            .record_op(&name, || refs.registration(req.id()))
+            .ok()
+            .flatten()
+    });
     if let Some(generation) = generation
         && let Ok(name) = OpName::new(IMAGE_REF_RELEASE_OP_NAME)
     {
@@ -1281,6 +1303,9 @@ mod tests {
         result: Result<ImageRefRelease, TraitError>,
         /// `registration` が返す世代（既定は `Some(1)`）。
         generation: Option<ImageRefGeneration>,
+        /// 2 回目以降の `registration` が返す世代（並行する create の bind を模す）。
+        later_generation: Option<ImageRefGeneration>,
+        lookups: Mutex<u32>,
     }
 
     impl<'a> ProbeRefs<'a> {
@@ -1290,7 +1315,13 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 result,
                 generation: Some(ImageRefGeneration::from_raw(1)),
+                later_generation: None,
+                lookups: Mutex::new(0),
             }
+        }
+        fn with_later_generation(mut self, generation: ImageRefGeneration) -> Self {
+            self.later_generation = Some(generation);
+            self
         }
         fn with_generation(mut self, generation: Option<ImageRefGeneration>) -> Self {
             self.generation = generation;
@@ -1316,6 +1347,11 @@ mod tests {
             &self,
             _id: &ContainerId,
         ) -> Result<Option<ImageRefGeneration>, TraitError> {
+            let mut n = self.lookups.lock().unwrap_or_else(|e| e.into_inner());
+            *n += 1;
+            if *n > 1 && self.later_generation.is_some() {
+                return Ok(self.later_generation);
+            }
             Ok(self.generation)
         }
         fn release(&self, _id: &ContainerId) -> Result<ImageRefRelease, TraitError> {
@@ -1329,7 +1365,7 @@ mod tests {
             id: &ContainerId,
             expected: ImageRefGeneration,
         ) -> Result<ImageRefRelease, TraitError> {
-            assert_eq!(Some(expected), self.generation);
+            assert_eq!(Some(expected), self.later_generation.or(self.generation));
             let state_gone = !self.store.has(id.as_str());
             self.calls
                 .lock()
@@ -1415,6 +1451,18 @@ mod tests {
         let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
         let refs = ProbeRefs::new(&store, Ok(ImageRefRelease::Released))
             .with_generation(Some(ImageRefGeneration::from_raw(7)));
+        run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete");
+        assert_eq!(refs.calls(), vec![(cid("c1"), true)]);
+    }
+
+    /// OCI-7: 事前の読みが未確定（None）の間に並行する create が bind を終えた場合、delete は状態削除後に
+    /// 読み直した確定済みの世代を外す（解除経路が失われない）。
+    #[test]
+    fn oci7_delete_releases_ref_bound_after_pre_read() {
+        let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
+        let refs = ProbeRefs::new(&store, Ok(ImageRefRelease::Released))
+            .with_generation(None)
+            .with_later_generation(ImageRefGeneration::from_raw(5));
         run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete");
         assert_eq!(refs.calls(), vec![(cid("c1"), true)]);
     }

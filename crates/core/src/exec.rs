@@ -178,8 +178,6 @@ pub use diagnostic::{
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
 pub use exec_command::{ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker};
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
-/// 本番 launcher（`oci_runtime::ProductionLauncher`。#1816）だけが使う crate 内の再公開。
-pub(crate) use landlock::landlock_ruleset_from_config;
 pub use landlock::launch_isolation_from_bundle;
 #[cfg(test)]
 pub(crate) use landlock::ruleset_from_detection;
@@ -189,6 +187,8 @@ pub use landlock::{
     LANDLOCK_PROBE_CONTENT_MISMATCH, LandlockAccessKind, LandlockAccessObservation,
     LandlockAccessProbe, observe_landlock_path_access,
 };
+/// 本番 launcher（`oci_runtime::ProductionLauncher`。#1816）だけが使う crate 内の再公開。
+pub(crate) use landlock::{landlock_ruleset_from_config, launch_isolation_from_ruleset};
 pub(crate) use launch_intermediate::{
     IntermediateSpec, LaunchTag, Rescan, rescan_unreported_init, spawn_container_via_intermediate,
 };
@@ -308,7 +308,8 @@ pub use violation::{
 
 /// マウント層の分離違反を監査レコードとして記録する（SEC-4・CORE-1・TASK-41.4・#195）。
 ///
-/// `err.violation` が `MountTarget` / `SharedPropagation` / `RootfsPivot` のときだけ `Mount`
+/// `err.violation` が `MountTarget` / `SharedPropagation` / `RootfsPivot` / `ProtectedPathApply`
+/// （読み取り専用化・覆いの適用失敗。#2013）のときだけ `Mount`
 /// レコードを 1 件 `sink` へ渡す（時刻・PID は呼び出し時点。理由コード＝違反の `as_str()` つき。#1701）。システムエラー・それ以外の種別は
 /// 記録せず `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
 ///
@@ -431,7 +432,9 @@ pub fn record_exec_worker_rejection<E>(
 /// `reason` は `ViolationReason::from_launch_token` で引き直した値を渡す。種別 `mount_target`・
 /// `shared_propagation`・`rootfs_pivot` と、bind mount の段の user namespace 由来の 2 理由
 /// （`user_namespace_required`・`host_root_identity_mapping`。SEC-5・#2072）だけが、層 `mount` の
-/// パスなし・理由コードつきのレコードになり（[`audit_mount_violation`] と同じ写像）、`establish_precondition`・`evidence_mismatch` は記録せず
+/// パスなし・理由コードつきのレコードになり（[`audit_mount_violation`] と同じ写像）、段 `readonly_paths`・`masked_paths` の
+/// 保護の適用失敗（`readonly_path_apply_failed`・`masked_path_apply_failed`。SEC-2・SEC-4・#2013）も同じ形で記録し、
+/// `establish_precondition`・`evidence_mismatch` は記録せず
 /// `NotApplicable`。時刻と PID は記録を行った親プロセスのもの（違反した子ではない）。パスは載らない。
 /// 記録の成否で `error` は変わらない（fail-closed）。
 pub fn record_launch_mount_rejection<E>(
@@ -799,6 +802,18 @@ impl ExecError {
             stage,
             ..Self::from_violation(reason, subject)
         }
+    }
+
+    /// 違反を持たない失敗にだけ、保護の適用失敗の違反を付ける（SEC-4・SEC-2・#2013）。
+    ///
+    /// `code`・`stage`・`message` は変えない（errno 由来の分類、たとえば古いカーネルの `Unimplemented` を保つ）。
+    /// 既に対象の検査の違反（`target_moved` 等）を持つエラーは上書きしない。`readonly_paths`・`masked_paths`
+    /// の適用側（対象を固定して検査を通った後の操作）が、保護を載せる区間の失敗にだけ掛ける。
+    fn or_violation(mut self, reason: ViolationReason, subject: Option<&Path>) -> Self {
+        if self.violation.is_none() {
+            self.violation = Some(IsolationViolation::new(reason, subject));
+        }
+        self
     }
 
     /// 失敗した段だけを差し替える（共有ヘルパが返した `MountProc` 段のエラーを、呼び出した段へ

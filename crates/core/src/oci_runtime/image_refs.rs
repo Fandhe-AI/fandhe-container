@@ -71,6 +71,27 @@ pub enum ImageRefRelease {
     NotRegistered,
 }
 
+/// 参照の登録世代（不透明な識別子）。
+///
+/// 同じ ID の参照が外されて登録し直されると別の値になる（再利用しない）。delete が「自分が消した
+/// コンテナに属する参照」だけを外し、同じ ID で再作成されたコンテナの参照を巻き込まないために使う
+/// （OCI-7・TASK-183.8.1）。値の採番は [`ContainerImageRefs`] の実装の責務で、同一 ID の登録ごとに
+/// 単調に増える等、過去の値を再発行しないこと。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ImageRefGeneration(u64);
+
+impl ImageRefGeneration {
+    /// 実装側の採番値から作る。
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// 採番値。
+    pub fn as_raw(&self) -> u64 {
+        self.0
+    }
+}
+
 /// コンテナからイメージ manifest への参照の登録・解除（OCI-7・TASK-183.8.1）。
 ///
 /// 契約:
@@ -80,7 +101,11 @@ pub enum ImageRefRelease {
 /// - `register`: manifest が在庫に無ければ [`ErrorCode::NotFound`]、同じ ID が別の manifest を
 ///   指していれば [`ErrorCode::AlreadyExists`]。同じ manifest なら
 ///   [`ImageRefRegistration::AlreadyRegistered`]
-/// - `release`: 登録が無ければ [`ImageRefRelease::NotRegistered`]
+/// - `release`: 登録が無ければ [`ImageRefRelease::NotRegistered`]。ID だけで外すので、自分が直前に
+///   `register` した参照の巻き戻し（create の失敗経路）にだけ使う
+/// - `registration`: `id` の現在の登録世代。登録が無ければ `None`
+/// - `release_if`: 登録世代が `expected` のときだけ外す（比較と解除は 1 回の排他の内側）。世代が違う・
+///   登録が無ければ何もせず [`ImageRefRelease::NotRegistered`]（delete 用。同じ ID の再作成を巻き込まない）
 /// - エラーメッセージにパス・OS のエラー文字列を含めない
 pub trait ContainerImageRefs {
     /// `id` から `manifest` への参照を登録する。
@@ -92,6 +117,16 @@ pub trait ContainerImageRefs {
 
     /// `id` の参照を外す。
     fn release(&self, id: &ContainerId) -> Result<ImageRefRelease, TraitError>;
+
+    /// `id` の現在の登録世代を返す。登録が無ければ `None`。
+    fn registration(&self, id: &ContainerId) -> Result<Option<ImageRefGeneration>, TraitError>;
+
+    /// `id` の登録世代が `expected` と一致するときだけ参照を外す。
+    fn release_if(
+        &self,
+        id: &ContainerId,
+        expected: ImageRefGeneration,
+    ) -> Result<ImageRefRelease, TraitError>;
 }
 
 /// create に渡す「どのイメージを使うか」の束（`create::create_with_image` の引数）。

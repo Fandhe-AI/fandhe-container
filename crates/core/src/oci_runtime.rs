@@ -70,7 +70,8 @@ pub use error::{
     OciRuntimeError, exit_code_for,
 };
 pub use image_refs::{
-    ContainerImage, ContainerImageRefs, ImageManifestDigest, ImageRefRegistration, ImageRefRelease,
+    ContainerImage, ContainerImageRefs, ImageManifestDigest, ImageRefGeneration,
+    ImageRefRegistration, ImageRefRelease,
 };
 pub use kill::{KillTimeout, ProcessSignaler, kill};
 #[cfg(target_os = "linux")]

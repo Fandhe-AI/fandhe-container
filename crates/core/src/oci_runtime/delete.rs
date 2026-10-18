@@ -41,13 +41,19 @@
 //!
 //! # イメージ参照の解除（OCI-7・TASK-183.8.1）
 //!
-//! [`delete_releasing_image_ref`] は [`delete`] が `Ok` を返したときだけ [`ContainerImageRefs::release`] を
-//! 呼ぶ。`StateStore` の状態が残っている（または削除を確かめられない）失敗では呼ばない。状態削除の後に
-//! 同じ ID で並行して create されても、古い参照が残る間は新しい create の `register` が
-//! `AlreadyRegistered` / `AlreadyExists` で止まるため、解除が新しいコンテナの参照を消すことはない。
-//! 解除の失敗は delete の結果を変えず（状態は消えており、エラーで返すと再実行が `NotFound` になるため）、
-//! 操作名 `image_ref_release` で `recorder` に記録する。残った参照はデータを余分に持つ安全側で、
-//! 起動時の照合（#854）が回収する。`NotRegistered`（bundle を直に指定して作ったコンテナ）は成功。
+//! [`delete_releasing_image_ref`] は、状態の削除より前に [`ContainerImageRefs::registration`] で対象の参照の
+//! 登録世代を読み、[`delete`] が `Ok` を返したときだけ [`ContainerImageRefs::release_if`] でその世代の
+//! 参照を外す。`StateStore` の状態が残っている（または削除を確かめられない）失敗では呼ばない。
+//!
+//! ID だけで外す `release` を使わないのは、状態削除から解除までの間に同じ ID の `create_with_image` が
+//! 参照登録と状態作成を終えうるためである。参照なしのコンテナ（bundle 直指定）には古い参照が無く、
+//! 再登録を阻止しないので、ID での解除は新しいコンテナの参照を消し、使用中のイメージが GC の対象に
+//! なりうる（OCI-7 違反）。世代つきなら、再登録された参照は世代が違うので外れない。
+//! 事前に登録が無い（`None`）コンテナは解除を呼ばない。
+//!
+//! 登録世代の読み取りや解除の失敗は delete の結果を変えず（状態は消えており、エラーで返すと再実行が
+//! `NotFound` になるため）、操作名 `image_ref_release` で `recorder` に記録する。読み取りに失敗したときは
+//! 解除しない。残った参照はデータを余分に持つ安全側で、起動時の照合（#854）が回収する。
 //! 参照を登録しない [`delete`] でイメージつきのコンテナを消すと参照が残る（同じく安全側）。
 //!
 //! # cgroup を先に消す理由（OCI-6・CORE-3）
@@ -129,6 +135,8 @@ const DELETE_OP_NAME: &str = "delete";
 
 /// 参照解除の操作名（REPAIR-4）。
 const IMAGE_REF_RELEASE_OP_NAME: &str = "image_ref_release";
+/// 参照の登録世代の読み取りの操作名（REPAIR-4）。
+const IMAGE_REF_LOOKUP_OP_NAME: &str = "image_ref_lookup";
 
 /// [`ContainerCgroupRemover::remove`] の結果（将来の拡張に備え非網羅）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -253,9 +261,21 @@ pub fn delete_releasing_image_ref(
     refs: &dyn ContainerImageRefs,
     req: &DeleteRequest,
 ) -> Result<DeleteResponse, OciRuntimeError> {
+    // 状態を消す前に、消す対象に属する参照の世代を読む（モジュール doc「イメージ参照の解除」）。
+    // 読み取りの失敗は delete を止めず、解除しない（安全側）。
+    let generation = OpName::new(IMAGE_REF_LOOKUP_OP_NAME)
+        .ok()
+        .and_then(|name| {
+            recorder
+                .record_op(&name, || refs.registration(req.id()))
+                .ok()
+        })
+        .flatten();
     let response = delete(store, recorder, cgroups, req)?;
-    if let Ok(name) = OpName::new(IMAGE_REF_RELEASE_OP_NAME) {
-        let _ = recorder.record_op(&name, || refs.release(req.id()));
+    if let Some(generation) = generation
+        && let Ok(name) = OpName::new(IMAGE_REF_RELEASE_OP_NAME)
+    {
+        let _ = recorder.record_op(&name, || refs.release_if(req.id(), generation));
     }
     Ok(response)
 }
@@ -342,7 +362,7 @@ fn check_deletable(record: &StateRecord, force: bool) -> Result<(), TraitError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oci_runtime::ImageRefRelease;
+    use crate::oci_runtime::{ImageRefGeneration, ImageRefRelease};
     use crate::traits::{
         CgroupPlacement, ContainerId, ContainerStatus, CreateStateRequest, DeleteStateResponse,
         ListStateRequest, StateList, StateRevision, UpdateStateRequest,
@@ -1251,6 +1271,8 @@ mod tests {
         store: &'a MemStateStore,
         calls: Mutex<Vec<(ContainerId, bool)>>,
         result: Result<ImageRefRelease, TraitError>,
+        /// `registration` が返す世代（既定は `Some(1)`）。
+        generation: Option<ImageRefGeneration>,
     }
 
     impl<'a> ProbeRefs<'a> {
@@ -1259,7 +1281,12 @@ mod tests {
                 store,
                 calls: Mutex::new(Vec::new()),
                 result,
+                generation: Some(ImageRefGeneration::from_raw(1)),
             }
+        }
+        fn with_generation(mut self, generation: Option<ImageRefGeneration>) -> Self {
+            self.generation = generation;
+            self
         }
         fn calls(&self) -> Vec<(ContainerId, bool)> {
             self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -1274,7 +1301,24 @@ mod tests {
         ) -> Result<crate::oci_runtime::ImageRefRegistration, TraitError> {
             Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
         }
-        fn release(&self, id: &ContainerId) -> Result<ImageRefRelease, TraitError> {
+        fn registration(
+            &self,
+            _id: &ContainerId,
+        ) -> Result<Option<ImageRefGeneration>, TraitError> {
+            Ok(self.generation)
+        }
+        fn release(&self, _id: &ContainerId) -> Result<ImageRefRelease, TraitError> {
+            Err(TraitError::new(
+                ErrorCode::Internal,
+                "release(id) must not be used by delete",
+            ))
+        }
+        fn release_if(
+            &self,
+            id: &ContainerId,
+            expected: ImageRefGeneration,
+        ) -> Result<ImageRefRelease, TraitError> {
+            assert_eq!(Some(expected), self.generation);
             let state_gone = !self.store.has(id.as_str());
             self.calls
                 .lock()
@@ -1342,5 +1386,25 @@ mod tests {
             .snapshot_op(&OpName::new("image_ref_release").expect("name"))
             .expect("recorded");
         assert_eq!((stats.success(), stats.failure()), (0, 1));
+    }
+
+    /// OCI-7: 登録の無いコンテナ（bundle 直指定。`registration` が None）では解除を呼ばない。
+    /// 状態削除の後に同じ ID の再作成が参照を登録しても、ID での解除で巻き込まない。
+    #[test]
+    fn oci7_delete_without_registration_never_releases() {
+        let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
+        let refs = ProbeRefs::new(&store, Ok(ImageRefRelease::Released)).with_generation(None);
+        run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete");
+        assert_eq!(refs.calls(), vec![]);
+    }
+
+    /// OCI-7: 解除は delete の前に読んだ世代で行う（`release_if` の `expected` 照合は ProbeRefs が assert）。
+    #[test]
+    fn oci7_delete_releases_with_generation_read_before_delete() {
+        let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
+        let refs = ProbeRefs::new(&store, Ok(ImageRefRelease::Released))
+            .with_generation(Some(ImageRefGeneration::from_raw(7)));
+        run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete");
+        assert_eq!(refs.calls(), vec![(cid("c1"), true)]);
     }
 }

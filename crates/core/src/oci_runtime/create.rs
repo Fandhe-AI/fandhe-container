@@ -698,6 +698,19 @@ mod tests {
             push(&self.log, "refs.release");
             Ok(ImageRefRelease::Released)
         }
+        fn registration(
+            &self,
+            _id: &ContainerId,
+        ) -> Result<Option<crate::oci_runtime::ImageRefGeneration>, TraitError> {
+            Ok(None)
+        }
+        fn release_if(
+            &self,
+            _id: &ContainerId,
+            _expected: crate::oci_runtime::ImageRefGeneration,
+        ) -> Result<ImageRefRelease, TraitError> {
+            Ok(ImageRefRelease::NotRegistered)
+        }
     }
 
     fn fixture(

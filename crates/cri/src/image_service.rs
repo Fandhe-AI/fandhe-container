@@ -15,7 +15,8 @@
 //!   本 RPC は読み取りのみ
 //! - [`InMemoryImageStore`] はプロセス内メモリのスタブ。永続キャッシュと展開後サイズの算出は
 //!   TASK-183（OCI-7）で置き換える
-//! - エラーの正規化（TASK-97.2）は未適用。リスナー・メッセージ長上限・UDS の権限と peer credential
+//! - 失敗は `CriError`（ERR-3。`crate::error`）で組み立て、トレイトの境界で `Status` へ変換する（TASK-97.2・#450）
+//! - リスナー・メッセージ長上限・UDS の権限と peer credential
 //!   検証（PLUG-12）は plugin-cri（TASK-108）の責務
 //!
 //! # 機微情報
@@ -30,6 +31,7 @@ use std::sync::{Arc, Mutex};
 use tonic::codegen::tokio_stream::Empty;
 use tonic::{Request, Response, Status};
 
+use crate::error::CriError;
 use crate::image_pull::{
     ImagePuller, PullRequest, canonical_reference, credentials_from_auth_config,
 };
@@ -371,25 +373,25 @@ impl CriImageService {
     /// `PullImage` の本体（検証 → 資格情報変換 → 同時数制限 → blocking 実行 → ストア登録）。
     ///
     /// 文言にイメージ名・資格情報を含めない。`sandbox_config` は無視する。
-    async fn pull(&self, request: v1::PullImageRequest) -> Result<v1::PullImageResponse, Status> {
+    async fn pull(&self, request: v1::PullImageRequest) -> Result<v1::PullImageResponse, CriError> {
         let Some(puller) = self.puller.clone() else {
-            return Err(Status::unimplemented("pull_image"));
+            return Err(CriError::unimplemented("pull_image"));
         };
         let reference = request.image.map(|spec| spec.image).unwrap_or_default();
         if reference.is_empty() {
-            return Err(Status::invalid_argument(
+            return Err(CriError::invalid_argument(
                 "image reference must not be empty",
             ));
         }
         if reference.len() > MAX_FILTER_BYTES {
-            return Err(Status::invalid_argument("image reference is too long"));
+            return Err(CriError::invalid_argument("image reference is too long"));
         }
         let credentials = match request.auth {
-            Some(auth) => credentials_from_auth_config(&auth).map_err(Status::from)?,
+            Some(auth) => credentials_from_auth_config(&auth).map_err(CriError::from)?,
             None => None,
         };
         let slot = PullSlot::acquire(&self.pulls_in_flight, self.max_concurrent_pulls)
-            .ok_or_else(|| Status::resource_exhausted("too many concurrent image pulls"))?;
+            .ok_or_else(|| CriError::resource_exhausted("too many concurrent image pulls"))?;
         let pull_request = PullRequest {
             reference,
             credentials,
@@ -400,30 +402,30 @@ impl CriImageService {
             puller.pull(&pull_request)
         })
         .await
-        .map_err(|_| Status::internal("image pull task failed"))?
-        .map_err(Status::from)?;
-        let record = pulled.into_record().map_err(Status::from)?;
+        .map_err(|_| CriError::internal("image pull task failed"))?
+        .map_err(CriError::from)?;
+        let record = pulled.into_record().map_err(CriError::from)?;
         let image_ref = record.id().to_owned();
         self.store
             .upsert(record)
-            .map_err(|_| Status::internal("image store failure"))?;
+            .map_err(|_| CriError::internal("image store failure"))?;
         Ok(v1::PullImageResponse { image_ref })
     }
 
     /// `ImageStatus` の本体。参照検証 → ストア解決 → 未取得は `image: None` の成功応答（CRI-4。api.proto の ImageStatus は未存在で nil Image）。
     ///
     /// 文言に参照（イメージ名・タグ・digest）を含めない。`verbose` の `info` は未実装で空（REPAIR-3）。
-    fn status(&self, request: v1::ImageStatusRequest) -> Result<v1::ImageStatusResponse, Status> {
+    fn status(&self, request: v1::ImageStatusRequest) -> Result<v1::ImageStatusResponse, CriError> {
         let reference = request.image.map(|spec| spec.image).unwrap_or_default();
         if reference.is_empty() {
-            return Err(Status::invalid_argument(
+            return Err(CriError::invalid_argument(
                 "image reference must not be empty",
             ));
         }
         if reference.len() > MAX_FILTER_BYTES {
-            return Err(Status::invalid_argument("image reference is too long"));
+            return Err(CriError::invalid_argument("image reference is too long"));
         }
-        let store_err = |_| Status::internal("image store failure");
+        let store_err = |_| CriError::internal("image store failure");
         let mut record = self.store.get(&reference).map_err(store_err)?;
         if record.is_none()
             && let Some(canonical) = canonical_reference(&reference)
@@ -439,19 +441,19 @@ impl CriImageService {
     }
 
     /// `ListImages` の本体。フィルタ検証 → ストア読み取り → 絞り込み。
-    fn list(&self, request: v1::ListImagesRequest) -> Result<v1::ListImagesResponse, Status> {
+    fn list(&self, request: v1::ListImagesRequest) -> Result<v1::ListImagesResponse, CriError> {
         let wanted = request
             .filter
             .and_then(|f| f.image)
             .map(|spec| spec.image)
             .unwrap_or_default();
         if wanted.len() > MAX_FILTER_BYTES {
-            return Err(Status::invalid_argument("image filter is too long"));
+            return Err(CriError::invalid_argument("image filter is too long"));
         }
         let records = self
             .store
             .list()
-            .map_err(|_| Status::internal("image store failure"))?;
+            .map_err(|_| CriError::internal("image store failure"))?;
         let canonical = canonical_reference(&wanted);
         let images = records
             .iter()
@@ -488,7 +490,7 @@ impl ImageService for CriImageService {
         request: Request<v1::ListImagesRequest>,
     ) -> Result<Response<v1::ListImagesResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ListImages);
-        let result = self.list(request.into_inner());
+        let result = self.list(request.into_inner()).map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -497,7 +499,7 @@ impl ImageService for CriImageService {
         &self,
         _request: Request<v1::StreamImagesRequest>,
     ) -> Result<Response<Self::StreamImagesStream>, Status> {
-        Err(Status::unimplemented("stream_images"))
+        Err(CriError::unimplemented("stream_images").into())
     }
 
     /// 参照（id・タグ・digest）に一致する取得済みイメージの詳細を返す。未取得は `image: None` の成功応答（CRI-4・TASK-61.2）。
@@ -506,7 +508,7 @@ impl ImageService for CriImageService {
         request: Request<v1::ImageStatusRequest>,
     ) -> Result<Response<v1::ImageStatusResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ImageStatus);
-        let result = self.status(request.into_inner());
+        let result = self.status(request.into_inner()).map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -519,7 +521,7 @@ impl ImageService for CriImageService {
         request: Request<v1::PullImageRequest>,
     ) -> Result<Response<v1::PullImageResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::PullImage);
-        let result = self.pull(request.into_inner()).await;
+        let result = self.pull(request.into_inner()).await.map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -530,14 +532,14 @@ impl ImageService for CriImageService {
         &self,
         _request: Request<v1::RemoveImageRequest>,
     ) -> Result<Response<v1::RemoveImageResponse>, Status> {
-        Err(Status::unimplemented("remove_image"))
+        Err(CriError::unimplemented("remove_image").into())
     }
 
     async fn image_fs_info(
         &self,
         _request: Request<v1::ImageFsInfoRequest>,
     ) -> Result<Response<v1::ImageFsInfoResponse>, Status> {
-        Err(Status::unimplemented("image_fs_info"))
+        Err(CriError::unimplemented("image_fs_info").into())
     }
 }
 
@@ -649,9 +651,9 @@ mod tests {
         let err = svc
             .list(v1::ListImagesRequest::default())
             .expect_err("must fail");
-        assert_eq!(err.code(), Code::Internal);
+        assert_eq!(err.code().grpc_code(), Code::Internal);
         assert_eq!(err.message(), "image store failure");
-        let result: Result<(), Status> = Err(err);
+        let result: Result<(), Status> = Err(Status::from(err));
         CriOpTimer::start(c.as_ref(), CriOpKind::ListImages).finish_with(&result);
         assert_eq!(
             c.outcomes(),
@@ -672,7 +674,7 @@ mod tests {
             }),
         };
         let err = svc.list(req).expect_err("must fail");
-        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(err.code().grpc_code(), Code::InvalidArgument);
     }
 
     fn status_req(reference: &str) -> v1::ImageStatusRequest {
@@ -739,16 +741,22 @@ mod tests {
         let svc = CriImageService::new();
         let none = v1::ImageStatusRequest::default();
         assert_eq!(
-            svc.status(none).expect_err("e").code(),
+            svc.status(none).expect_err("e").code().grpc_code(),
             Code::InvalidArgument
         );
         assert_eq!(
-            svc.status(status_req("")).expect_err("e").code(),
+            svc.status(status_req(""))
+                .expect_err("e")
+                .code()
+                .grpc_code(),
             Code::InvalidArgument
         );
         let long = "x".repeat(MAX_FILTER_BYTES + 1);
         assert_eq!(
-            svc.status(status_req(&long)).expect_err("e").code(),
+            svc.status(status_req(&long))
+                .expect_err("e")
+                .code()
+                .grpc_code(),
             Code::InvalidArgument
         );
     }
@@ -758,7 +766,7 @@ mod tests {
     fn cri4_status_store_failure_is_internal() {
         let svc = CriImageService::with_store(Arc::new(Failing));
         let err = svc.status(status_req("a")).expect_err("must fail");
-        assert_eq!(err.code(), Code::Internal);
+        assert_eq!(err.code().grpc_code(), Code::Internal);
         assert_eq!(err.message(), "image store failure");
     }
 

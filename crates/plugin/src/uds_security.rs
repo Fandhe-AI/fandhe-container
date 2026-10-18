@@ -1827,9 +1827,10 @@ mod imp {
 
     /// `AlreadyExists` の原因の区分（#1859・PLUG-12）。利用者の次の行動（そのまま・再試行・手動削除）で分ける。
     /// 文言は固定で、パス・UID・plugin 由来の値を含めない（情報の出し過ぎを防ぐ）。呼び出し側が機械的に
-    /// 見分ける必要は今は無い（`sweep_one` はコードで判定する）ため非公開。公開型（`PluginError` の付加情報や公開 enum）にするのは、文言ではなく原因で機械的に
-    /// 分岐する呼び出し側が現れるまで見送る。判断の記録と再判断の起点は #2228。手順は
-    /// `docs/setup/plugin-socket-recovery.md`。
+    /// 見分ける必要は今は無い（`sweep_one` はコードで判定する）ため非公開。
+    /// 公開型（`PluginError` の付加情報や公開 enum）にするのは、文言ではなく原因で機械的に
+    /// 分岐する呼び出し側が現れるまで見送る。判断の記録と再判断の起点は #2228。
+    /// 手順は `docs/setup/plugin-socket-recovery.md`。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum BusyReason {
         /// ロックを他者が保持している。

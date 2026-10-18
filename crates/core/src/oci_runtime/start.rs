@@ -389,11 +389,25 @@ pub fn recover_interrupted_start(
     // 別プロセスの launch が進行中でないこと（所有プロセスの終了または launch の完了）を所有ロックで
     // 確かめてから、生存プロセスの確認へ進む（CORE-2）。
     reservation.lock_owner(record.bundle())?;
+    // 所有ロックの取得前に読んだレコードは古い可能性がある（別プロセスの start が pid を記録して
+    // ロックを手放した直後に取れた場合）。破壊的な確認（cgroup.kill 等）の前に読み直し、revision と
+    // Running・pid なしの予約が変わっていなければ進む。変わっていれば何もせず拒否する（CORE-2・SEC-1）。
+    let fresh = store.get(&GetStateRequest::new(id.clone()))?;
+    if fresh.revision() != record.revision()
+        || fresh.status().state() != ContainerState::Running
+        || fresh.status().pid().is_some()
+    {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "the start reservation changed while acquiring the owner lock",
+        ));
+    }
+    let record = fresh;
     let confirm = timeouts.confirm();
     let l = Arc::clone(launcher);
     let target = id.clone();
     // 別プロセスで起動した残存は、記録済みの cgroup 配置から確かめる（#2011）。配置は start の手順 5 で 1 回だけ
-    // 記録され上書きされないため、lock_owner の前に読んだレコードの値でよい（TOCTOU にならない）。
+    // 記録され上書きされない。所有ロック取得後に読み直したレコードの値を使う。
     let recorded = record.cgroup().cloned();
     // confirm_no_process は ID 単位で「残っていれば終了・回収」し得るため、上限超過で本関数が戻った後も
     // 確認が終わるまでプロセス内の予約を保持する（回復の再試行・新しい start が先に進み、その後に
@@ -1159,6 +1173,8 @@ mod tests {
         update_calls: AtomicUsize,
         /// `host_state_root` が返す場所（テストでは実在する一時ディレクトリ）。
         state_root: PathBuf,
+        /// 設定すると最初の `get` だけがこの（古い）レコードを返す（ロック取得前の読み取りとの競合の模擬）。
+        stale_first_get: Mutex<Option<StateRecord>>,
     }
 
     impl MemStateStore {
@@ -1168,6 +1184,7 @@ mod tests {
                 fail_update_at,
                 update_calls: AtomicUsize::new(0),
                 state_root: std::env::temp_dir(),
+                stale_first_get: Mutex::new(None),
             }
         }
     }
@@ -1214,6 +1231,14 @@ mod tests {
         }
 
         fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+            if let Some(stale) = self
+                .stale_first_get
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                return Ok(stale);
+            }
             let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
             records
                 .get(req.id())
@@ -2815,6 +2840,7 @@ mod tests {
     }
 
     /// 予約（Running・pid なし）のレコードを、cgroup の配置つき（`None` なら配置なし）で直接ストアへ置く。
+    #[cfg(target_os = "linux")]
     fn claimed_with_cgroup(
         name: &str,
         placement: Option<crate::traits::CgroupPlacement>,
@@ -2856,6 +2882,29 @@ mod tests {
             launcher.recorded.lock().unwrap().clone(),
             vec![Some(placement)]
         );
+    }
+
+    /// CORE-2・SEC-1: ロック取得前に読んだ予約が古い（別プロセスの start が間に pid を記録した）場合、
+    /// 回復は破壊的な確認へ進まず拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_recover_aborts_when_pid_recorded_between_read_and_lock() {
+        let (_b, store, id) = claimed_with_cgroup("rec-race", None);
+        let stale = store.get(&GetStateRequest::new(id.clone())).expect("get");
+        store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(id.clone(), std::num::NonZeroU32::new(4242)),
+                stale.revision(),
+            ))
+            .expect("record pid");
+        *store.stale_first_get.lock().unwrap() = Some(stale);
+        let launcher = RecordingLauncher::new(false);
+        launcher.confirms_no_process.store(true, Ordering::SeqCst);
+        let err = recover(&store, &launcher, &id).expect_err("must abort");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert!(launcher.recorded.lock().unwrap().is_empty());
+        let got = store.get(&GetStateRequest::new(id)).expect("get");
+        assert_eq!(got.status().pid(), std::num::NonZeroU32::new(4242));
     }
 
     /// CORE-2（#2011）: 配置の記録が無いレコードでは `None` を渡す（launcher が fail-closed にする）。

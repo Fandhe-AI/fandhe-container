@@ -147,13 +147,12 @@ fn create_with_image_inner(
     }
     match create_state(store, req) {
         Ok(record) => {
-            // 参照を作成した状態に結び付ける。delete は結び付いた参照だけを外すので、状態作成前に止まった
+            // 参照を状態作成まで済んだものとして確定する。delete は確定済みの参照だけを外すので、状態作成前に止まった
             // create の参照を、既存の別の状態の delete が巻き込んで外す競合を防げる。失敗しても状態は
             // 作成済みなので成功を返す（参照は未結合のまま残り、delete は外さない。余分に持つだけの安全側。
             // 起動時の照合〔#854〕が回収する）。記録は `image_ref_bind`。
             if let Ok(name) = OpName::new(IMAGE_REF_BIND_OP_NAME) {
-                let _ =
-                    recorder.record_op(&name, || image.refs().bind(req.id(), record.revision()));
+                let _ = recorder.record_op(&name, || image.refs().bind(req.id()));
             }
             Ok(record)
         }
@@ -709,14 +708,13 @@ mod tests {
             push(&self.log, "refs.release");
             Ok(ImageRefRelease::Released)
         }
-        fn bind(&self, _id: &ContainerId, _revision: StateRevision) -> Result<(), TraitError> {
+        fn bind(&self, _id: &ContainerId) -> Result<(), TraitError> {
             push(&self.log, "refs.bind");
             Ok(())
         }
         fn registration(
             &self,
             _id: &ContainerId,
-            _revision: StateRevision,
         ) -> Result<Option<crate::oci_runtime::ImageRefGeneration>, TraitError> {
             Ok(None)
         }

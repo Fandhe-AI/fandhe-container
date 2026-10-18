@@ -39,8 +39,8 @@ fn map_err(e: OciError) -> TraitError {
     TraitError::new(code, "image store error")
 }
 
-/// 登録 1 件分の試験用の記録（世代と、結び付いた状態の revision）。
-type Entry = (u64, Option<u64>);
+/// 登録 1 件分の試験用の記録（世代と、状態作成まで済んで確定したか）。
+type Entry = (u64, bool);
 
 /// core のトレイトを `ImageStore` で満たす試験用アダプタ。
 ///
@@ -61,26 +61,22 @@ impl<'a> StoreRefs<'a> {
 }
 
 impl ContainerImageRefs for StoreRefs<'_> {
-    fn bind(&self, id: &ContainerId, revision: StateRevision) -> Result<(), TraitError> {
+    fn bind(&self, id: &ContainerId) -> Result<(), TraitError> {
         let mut g = self.generations.lock().unwrap_or_else(|e| e.into_inner());
         match g.1.get_mut(id.as_str()) {
-            Some(entry) if entry.1.is_none() => {
-                entry.1 = Some(revision.value());
+            Some(entry) if !entry.1 => {
+                entry.1 = true;
                 Ok(())
             }
             _ => Err(TraitError::new(ErrorCode::NotFound, "no unbound reference")),
         }
     }
 
-    fn registration(
-        &self,
-        id: &ContainerId,
-        revision: StateRevision,
-    ) -> Result<Option<ImageRefGeneration>, TraitError> {
+    fn registration(&self, id: &ContainerId) -> Result<Option<ImageRefGeneration>, TraitError> {
         let g = self.generations.lock().unwrap_or_else(|e| e.into_inner());
         Ok(g.1
             .get(id.as_str())
-            .filter(|e| e.1 == Some(revision.value()))
+            .filter(|e| e.1)
             .map(|e| ImageRefGeneration::from_raw(e.0)))
     }
 
@@ -119,7 +115,7 @@ impl ContainerImageRefs for StoreRefs<'_> {
                     let mut g = self.generations.lock().unwrap_or_else(|e| e.into_inner());
                     g.0 += 1;
                     let n = g.0;
-                    g.1.insert(cid.as_str().to_owned(), (n, None));
+                    g.1.insert(cid.as_str().to_owned(), (n, false));
                     ImageRefRegistration::Registered
                 }
                 _ => ImageRefRegistration::AlreadyRegistered,
@@ -327,5 +323,78 @@ fn oci7_delete_keeps_reference_of_create_stalled_before_state_create() {
         containers_of(&images),
         vec![ContainerRefId::new("c1").expect("id")],
         "unbound reference must survive the delete of another state"
+    );
+}
+
+/// OCI-7: create → 状態更新（start 相当で revision が変わる）→ delete で参照が解除され、同じ ID で再 create できる
+/// （#2265 の指摘。照合に作成時の revision を使うと更新後の delete で外れず再 create が拒否される）。
+#[test]
+fn oci7_reference_released_after_state_update_and_recreate_succeeds() {
+    use fandhe_container_core::traits::{
+        ContainerStatus, GetStateRequest, StateStore, UpdateStateRequest,
+    };
+    let tmp = Tmp::new("update");
+    let bundle = tmp.sub("bundle");
+    make_bundle(&bundle);
+    let state = FileStateStore::open(
+        StateRoot::from_override(tmp.private_sub("state")).expect("state root"),
+    )
+    .expect("state store");
+    let images = ImageStore::open(&tmp.sub("images")).expect("image store");
+    images
+        .lock()
+        .expect("lock")
+        .register_manifest(
+            digest(MANIFEST),
+            ManifestComposition::new(
+                digest("sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"),
+                vec![],
+            )
+            .expect("comp"),
+        )
+        .expect("register manifest");
+    let refs = StoreRefs::new(&images);
+    let manifest = ImageManifestDigest::new(MANIFEST).expect("manifest");
+    let id = ContainerId::new("c1").expect("id");
+    let rec = OpRecorder::new();
+
+    let created = create_with_image(
+        &state,
+        &rec,
+        ContainerImage::new(&refs, &manifest),
+        &CreateRequest::new(id.clone(), bundle.clone()).expect("req"),
+    )
+    .expect("create");
+    // start 相当の更新で revision を進める（stop 後の状態へ）。
+    let updated = state
+        .update(&UpdateStateRequest::new(
+            ContainerStatus::stopped(id.clone(), Some(0)),
+            created.revision(),
+        ))
+        .expect("update");
+    assert_ne!(updated.revision(), created.revision());
+    let live = state.get(&GetStateRequest::new(id.clone())).expect("get");
+    assert_eq!(live.revision(), updated.revision());
+
+    delete_releasing_image_ref(
+        &state,
+        &rec,
+        &NoCgroup,
+        &refs,
+        &DeleteRequest::new(id.clone()),
+    )
+    .expect("delete");
+    assert_eq!(containers_of(&images), vec![]);
+
+    create_with_image(
+        &state,
+        &rec,
+        ContainerImage::new(&refs, &manifest),
+        &CreateRequest::new(id, bundle).expect("req"),
+    )
+    .expect("recreate with the same id");
+    assert_eq!(
+        containers_of(&images),
+        vec![ContainerRefId::new("c1").expect("id")]
     );
 }

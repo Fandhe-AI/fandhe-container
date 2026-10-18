@@ -25,7 +25,8 @@
 //! - 非 Linux の信頼性検証は core が常に `Unsupported` で拒否する（PLUG-11 の非 Linux 実装待ち）。この拒否も
 //!   `unsupported` として記録を試みるが、非 Linux では `FileStateStore::open` が `Unimplemented` を返し記録先が
 //!   作れないため、記録は `SinkFailed` になる（`FileStateStore` の非 Linux 実装待ち）。
-//! - 許可済みハッシュ一覧の配置・指定方法が未確定のため一覧は既定の空（全件拒否）のままで、読み込み経路は無い。
+//! - 許可済みハッシュ一覧の配置・指定方法が未確定のため一覧は既定の空（全件拒否）のままで、読み込み経路は無い
+//!   （設計案は `docs/design/plugin-hash-allowlist.md`・#1868。承認待ち）。
 //! - 検証を通過した plugin の起動と RPC は未実装。core 側の型つき `ContainerRuntime` proxy と spawn の配線は
 //!   TASK-114、CLI 経由の 3 OS 最終確認は TASK-125。RPC を配線する際は REPAIR-5 のタイムアウトを必須とする。
 //!
@@ -44,7 +45,8 @@
 //! - PATH 由来の候補の扱い（A1）: [`backend_failure`] は `PluginDirKind::Path` の候補も
 //!   `PluginRegistry::from_candidates` へ渡しており、現状は許可一覧が空で全件拒否になることに頼っている。
 //!   許可済みハッシュ一覧を配線すると PATH 由来もハッシュ一致で採用され得るため、登録前に除外するか
-//!   採用するかをその時点で明示的に決める（core の `plugin_discovery` の契約も参照）。
+//!   採用するかをその時点で明示的に決める（core の `plugin_discovery` の契約も参照。
+//!   設計案は `docs/design/plugin-hash-allowlist.md` の 3.5・#1868）。
 //! - `PluginTrustError` の写像（C2）: その `Display` と `From<PluginTrustError> for TraitError` は拒否対象の
 //!   パスを含む。出力へ流すときは `?` で `TraitError` へ変換せず、`kind()` だけを本 module の固定文言表へ
 //!   写し、パス・plugin 名を出力へ反射しないこと（配線時のレビュー観点）。
@@ -180,7 +182,8 @@ pub(super) fn backend_failure(
         return BackendFailure::NotInstalled.into_error();
     };
     // 所有者・モード・ハッシュの順の検証と、どの段の拒否の記録も 1 回の呼び出しで行う。
-    // 既定は空の許可一覧（全件拒否）。一覧の読み込み経路は仕様確定まで作らない。
+    // 既定は空の許可一覧（全件拒否）。一覧の読み込み経路は仕様確定まで作らない
+    // （設計案は docs/design/plugin-hash-allowlist.md・#1868）。
     match verify_candidate_audited(candidate, &PluginVerificationMethod::default(), sink) {
         Ok(_) => BackendFailure::NotInvokable.into_error(),
         Err(rejection) if rejection.error.kind() == PluginTrustErrorKind::Unsupported => {

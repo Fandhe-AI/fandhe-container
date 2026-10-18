@@ -29,12 +29,13 @@
 //!
 //! # 呼び出し元
 //!
-//! `exec::spawn_container_with_stages`（`spawn_container` を含む）が fork に成功した後、親の側で 1 回呼ぶ。
+//! `exec::spawn_container_with_stages`（`spawn_container` を含む従来経路）と、本番 launcher の入口
+//! `exec::spawn_container_via_intermediate`（#2008）が、fork に成功した後、親の側で 1 回呼ぶ。
 //! 出力は core の診断ログの共通経路（`exec::emit_diagnostic_line_to`。AF_UNIX の socket 以外へは書かず、満杯でも
 //! 待たない。REPAIR-5）で、`exec::report_legacy_tiocsti_to` が行い、結果を `exec::LegacyTiocstiReport` で返す。
 //! 本モジュールは OS 非依存の観測と固定 1 行の生成だけを持ち、出力はしない。
-//! 本番の launcher はまだ無く（`REPAIR-3`）、launcher の追加後も実プロセスを起動する経路から同じ
-//! [`read_host`] と [`warning_line`] を使う。`/proc/sys/dev/tty/legacy_tiocsti` はグローバルな値で、
+//! supervisor は start の成功後に同じ [`read_host`] と [`warning_line`] で自分のログ（`@supervisor-logs`）へも
+//! 1 行残す（stderr が AF_UNIX の socket でない構成では上の出力が捨てられるため。#2008）。`/proc/sys/dev/tty/legacy_tiocsti` はグローバルな値で、
 //! 親の user namespace から読んでも子と同じ値になる。非 Linux では常に `Absent` になり、呼び出し元は無い。
 
 use std::io::{self, Read};

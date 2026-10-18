@@ -19,7 +19,8 @@
 //!   だけが（消費して）受け取る。`/proc` は pivot **前**に rootfs 配下へマウントする。rootless
 //!   （非 init user namespace 所有の mount namespace）では、同じ mount namespace に完全に見える
 //!   procfs が既にあるときだけ新規 procfs のマウントが許され（カーネルの `mnt_already_visible`）、
-//!   旧 root を切り離した後には候補が無いため、pivot 後のマウントには頼れない
+//!   旧 root を切り離した後には候補が無いため、pivot 後のマウントには頼れない。後段の `readonly_paths`・`masked_paths`
+//!   （`run_pre_pivot`）は、この procfs の上に読み取り専用化と覆いを載せる前提である（#2005・SEC-2）
 //! - **`put_old` ディレクトリを作らない**: `pivot_root(".", ".")` 方式を採る。PoC-3 の固定名
 //!   `.old_root` は共有 rootfs で `pivot_root` の ENOENT 競合を起こした（TASK-27.3）
 //! - **旧 root を残さない**: 旧 root は `MNT_DETACH` で mount namespace から外し、旧 root を指す fd を

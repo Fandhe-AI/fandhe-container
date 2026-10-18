@@ -14,6 +14,11 @@
 //! TASK-157.9（#1069）: CLI 役（親）と supervisor 役（子プロセス）が同じ ID の `state.json` へ同時に
 //! 書いても破損・lost update がないこと、別プロセスが `@lock` を保持している間の書き込みが期限で
 //! `TIMEOUT` になることを照合する。
+//!
+//! #2001（OCI-5・REPAIR-5）: 子プロセスの stderr はファイルへ捕捉し、子が失敗・期限超過したときは
+//! 親の失敗メッセージへ含める（CI で子の panic 理由が読めず間欠失敗の原因が追えなかったため）。
+//! 複数プロセスが競う試験では、書き込みの間で短く譲る。ロック取得は 5ms 間隔の期限付きポーリングで
+//! 待ち順の公平性がなく、間を空けず取り直す側がいると他プロセスが `STATE_LOCK_TIMEOUT` まで飢えうる。
 
 /// OCI-5・CLI-1: Linux 以外では状態ルートを作らずに `Unimplemented` を返す。
 #[cfg(not(target_os = "linux"))]
@@ -36,7 +41,9 @@ fn oci5_open_is_unimplemented_outside_linux() {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::fs;
+    use std::io::Read;
     use std::num::NonZeroU32;
+    use std::ops::{Deref, DerefMut};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -57,7 +64,13 @@ mod linux {
     const CHILD_TEST: &str = "linux::child_worker_creates_records";
     const CHILDREN: u32 = 3;
     const PER_CHILD: u32 = 8;
+    /// 複数プロセスが競う試験で、書き込みの間に譲る時間。ロック待ちは 5ms 間隔のポーリングで公平性がなく、
+    /// 譲らないと解放直後に自分で取り直し、他プロセスが `STATE_LOCK_TIMEOUT`（5 秒）まで待たされうる（#2001）。
+    const WRITE_YIELD: Duration = Duration::from_millis(3);
     const CHILD_DEADLINE: Duration = Duration::from_secs(60);
+
+    /// 失敗メッセージへ含める子の出力の上限バイト数。
+    const CHILD_LOG_LIMIT: u64 = 64 * 1024;
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -85,6 +98,81 @@ mod linux {
     impl Drop for TmpDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// 子プロセスと、その stdout / stderr の捕捉先ファイル（drop で削除）。
+    ///
+    /// パイプだと親が `try_wait` で待つ間に子が詰まりうるため、ファイルへ逃がして終了後・kill 後に読む。
+    /// `Child` へ `Deref` するので `kill` / `wait` はそのまま呼べる。
+    struct Worker {
+        child: Child,
+        log: PathBuf,
+    }
+
+    impl Deref for Worker {
+        type Target = Child;
+        fn deref(&self) -> &Child {
+            &self.child
+        }
+    }
+
+    impl DerefMut for Worker {
+        fn deref_mut(&mut self) -> &mut Child {
+            &mut self.child
+        }
+    }
+
+    impl Worker {
+        /// `cmd` を stdout / stderr をログファイルへ向けて起動する。
+        fn start(mut cmd: Command) -> Self {
+            use std::os::unix::fs::OpenOptionsExt;
+            let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+            let log = std::env::temp_dir().join(format!(
+                "fandhe-state-it-log-{}-{n}.txt",
+                std::process::id()
+            ));
+            let _ = fs::remove_file(&log);
+            let out = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&log)
+                .unwrap();
+            let err = out.try_clone().unwrap();
+            let child = cmd
+                .stdout(Stdio::from(out))
+                .stderr(Stdio::from(err))
+                .spawn()
+                .unwrap();
+            Self { child, log }
+        }
+
+        /// 子の出力を上限つきで読む（超過分は切り捨てる）。
+        fn output(&self) -> String {
+            let Ok(f) = fs::File::open(&self.log) else {
+                return String::from("<child output unavailable>");
+            };
+            let mut buf = Vec::new();
+            let _ = f.take(CHILD_LOG_LIMIT).read_to_end(&mut buf);
+            if buf.is_empty() {
+                String::from("<child output empty>")
+            } else {
+                String::from_utf8_lossy(&buf).into_owned()
+            }
+        }
+
+        /// kill して回収し、出力を返す。
+        fn kill_and_output(&mut self) -> String {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            self.output()
+        }
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.log);
         }
     }
 
@@ -116,43 +204,60 @@ mod linux {
         };
         let prefix = std::env::var(PREFIX_ENV).unwrap();
         let store = open(Path::new(&root));
+        let started = Instant::now();
+        // 失敗した操作・件数・経過時間・エラーコードを stderr へ出して panic する（親が失敗メッセージへ含める）。
+        let fail = |op: &str, i: u32, e: fandhe_container_core::traits::TraitError| -> ! {
+            eprintln!(
+                "child {prefix}: {op} #{i} failed after {:?}: {}: {}",
+                started.elapsed(),
+                e.code().as_str(),
+                e.message()
+            );
+            panic!("child {prefix}: {op} #{i} failed");
+        };
         for i in 0..PER_CHILD {
             let id = format!("{prefix}-{i}");
-            let rec = store.create(&create_req(&id)).unwrap();
+            let rec = match store.create(&create_req(&id)) {
+                Ok(r) => r,
+                Err(e) => fail("create", i, e),
+            };
             // 状態遷移も行い、ロック下の read-modify-write を別プロセス間で競合させる。
-            store
-                .update(&UpdateStateRequest::new(
-                    ContainerStatus::creating(cid(&id)),
-                    rec.revision(),
-                ))
-                .unwrap();
+            if let Err(e) = store.update(&UpdateStateRequest::new(
+                ContainerStatus::creating(cid(&id)),
+                rec.revision(),
+            )) {
+                fail("update", i, e);
+            }
+            // 解放直後の取り直しで他プロセスを飢えさせない（親と同じ間隔。SUP-1 の試験の前例）。
+            std::thread::sleep(WRITE_YIELD);
         }
     }
 
-    fn spawn_child(root: &Path, prefix: &str) -> Child {
-        Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
+    fn spawn_child(root: &Path, prefix: &str) -> Worker {
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
             .env(ROOT_ENV, root)
-            .env(PREFIX_ENV, prefix)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap()
+            .env(PREFIX_ENV, prefix);
+        Worker::start(cmd)
     }
 
     /// 子プロセスを上限時間つきで待つ。超過したら kill して失敗させる（ハング検出。REPAIR-5）。
-    fn wait_with_deadline(mut child: Child) {
+    /// 失敗時は子の出力（panic の理由）を親の失敗メッセージへ含める（#2001）。
+    fn wait_with_deadline(mut child: Worker) {
         let deadline = Instant::now() + CHILD_DEADLINE;
         loop {
             match child.try_wait().unwrap() {
                 Some(status) => {
-                    assert!(status.success(), "child exited with {status}");
+                    assert!(
+                        status.success(),
+                        "child exited with {status}; child output:\n{}",
+                        child.output()
+                    );
                     return;
                 }
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("child did not finish within the deadline");
+                    let out = child.kill_and_output();
+                    panic!("child did not finish within the deadline; child output:\n{out}");
                 }
                 None => std::thread::sleep(Duration::from_millis(20)),
             }
@@ -166,12 +271,16 @@ mod linux {
         let t = TmpDir::new("share");
         // 親が先に open して `@revision` を初期化しておく。
         let parent = open(t.path());
-        let children: Vec<Child> = (0..CHILDREN)
+        let children: Vec<Worker> = (0..CHILDREN)
             .map(|n| spawn_child(t.path(), &format!("c{n}")))
             .collect();
         // 親も同時に書く。
         for i in 0..PER_CHILD {
             parent.create(&create_req(&format!("p-{i}"))).unwrap();
+            // 子と交互にロックを取れるよう、連続した取り直しを避ける。見積もり: ロック下の操作は
+            // 親 8 回 + 子 3 × 16 回 = 56 回。1 回 100ms の悲観値でも、譲れば 1 回の待ちは他 3 プロセスの
+            // 1 操作ずつ程度で、STATE_LOCK_TIMEOUT（5 秒）を大きく下回る。
+            std::thread::sleep(WRITE_YIELD);
         }
         for child in children {
             wait_with_deadline(child);
@@ -207,15 +316,13 @@ mod linux {
     /// `FAILED_PRECONDITION`（後着負け）での取り直し再試行の上限（REPAIR-5: 無限ループにしない）。
     const MAX_RETRIES_PER_WRITE: u32 = 1000;
 
-    fn spawn_worker(test: &str, envs: &[(&str, &Path)]) -> Child {
+    fn spawn_worker(test: &str, envs: &[(&str, &Path)]) -> Worker {
         let mut cmd = Command::new(std::env::current_exe().unwrap());
-        cmd.args(["--exact", test, "--test-threads=1", "--nocapture"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        cmd.args(["--exact", test, "--test-threads=1", "--nocapture"]);
         for (k, v) in envs {
             cmd.env(k, v);
         }
-        cmd.spawn().unwrap()
+        Worker::start(cmd)
     }
 
     /// 後着負け（`FAILED_PRECONDITION`）のときだけ `get` からやり直して 1 回書く。
@@ -292,9 +399,8 @@ mod linux {
         let deadline = Instant::now() + CHILD_DEADLINE;
         while !ready.exists() {
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("child did not become ready within the deadline");
+                let out = child.kill_and_output();
+                panic!("child did not become ready within the deadline; child output:\n{out}");
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -401,9 +507,8 @@ mod linux {
         let deadline = Instant::now() + CHILD_DEADLINE;
         while !ready.exists() {
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("child did not take the lock within the deadline");
+                let out = child.kill_and_output();
+                panic!("child did not take the lock within the deadline; child output:\n{out}");
             }
             std::thread::sleep(Duration::from_millis(20));
         }

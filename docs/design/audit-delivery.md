@@ -2,7 +2,7 @@
 
 カーネルが返す seccomp と Landlock の拒否を、`AuditSink`（`FileAuditSink` ほか）へ届ける配送経路の候補を、同じ比較軸で並べた判断資料。
 
-> **位置づけ**: **方式は採用済み・実装は未着手**。TASK-41 追補・#1835 の設計ドラフトとして作り、2026-10-15 にオーナーが 4 章の組み合わせ案と 7 章の推奨を採用した（判断の記録は #2018 のコメント。11 章の承認事項 1〜4 を含む）。実装は 9 章の issue が担い、本書は実装済みを装わない（REPAIR-3）。SEC-4 の「100% 記録」は記録経路が利用できる環境で満たすと spec に明記した（fandhe-container-spec#21。11 章）。
+> **位置づけ**: **方式は採用済み・一部実装（`KILL_PROCESS` 側の補助記録は #2004 で実装。ほかは未着手）**。TASK-41 追補・#1835 の設計ドラフトとして作り、2026-10-15 にオーナーが 4 章の組み合わせ案と 7 章の推奨を採用した（判断の記録は #2018 のコメント。11 章の承認事項 1〜4 を含む）。実装は 9 章の issue が担い、本書は実装済みを装わない（REPAIR-3）。SEC-4 の「100% 記録」は記録経路が利用できる環境で満たすと spec に明記した（fandhe-container-spec#21。11 章）。
 
 - 対象ビヘイビア: SEC-4（関連: SEC-2・CORE-1・CORE-5・SUP-2・SUP-6・REPAIR-3・REPAIR-5）
 - タスク: TASK-41 追補、MS-2、#1835（前提: #1834 の seccomp 拒否時の動作。origin/main 9a933113 で反映済み）
@@ -114,7 +114,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 | supervisor の exec（`exec_target`・`entrypoint`・`rootfs_pivot` の mount） | `AuditSink` | 配線済み（`default_audit_sink`。#1594） | - |
 | launch 経路のマウントの拒否 | mount 層 | pivot 前段の失敗の記録は #1815（closed）で対応。読み取り専用化・覆い（固定集合・config 由来）の適用失敗も、理由 `readonly_path_apply_failed`・`masked_path_apply_failed` で同じ経路に載せた（SEC-2・SEC-4。#2013）。マウント操作の失敗は環境起因（古いカーネル・LSM）と rootfs の内容起因を親が区別できず、記録漏れの方が過剰な記録より悪いため記録する（理由トークンは対象の検査の拒否と分ける）。記録に段のフィールドは無く、段は返る `ExecError.stage` に載る（フィールドの追加は #653） | - |
 | `mounts[]` の bind mount | mount 層 | 未配線（検証済みの型への変換が先） | #1911（open）ほか |
-| seccomp・Landlock | `record_seccomp_denial`・`landlock_denial_record` | 配送経路が無い（本書の対象） | #1835（本書）→ 実装は #2023〜#2028・#2004（9 章） |
+| seccomp・Landlock | `record_seccomp_denial`・`landlock_denial_record` | ERRNO 側と Landlock は配送経路が無い（本書の対象）。`KILL_PROCESS` 側は #2004 で補助の `exit_signal` レコードを本番 launcher の回収点に配線済み（正の記録はカーネルの `AUDIT_SECCOMP`） | #1835（本書）→ 実装は #2023〜#2028・#2004（9 章） |
 | plugin 信頼検証（`AuditLayer::PluginTrust`） | `verify_candidate_audited` | CLI の plugin バックエンド（macOS・Windows の本番経路）に配線済み（#2013）。記録先は `FileAuditSink::open_in_state_root`。作れないときは `SinkFailed`（黙って捨てない。拒否は覆らない）。非 Linux では `FileStateStore` が未実装で記録先を作れず `SinkFailed`。レジストリ・spawn への配線は TASK-114 | TASK-114 |
 | CLI・healthcheck | - | CLI は plugin 信頼検証の記録先を配線済み（#2013）。healthcheck は未配線 | #495（healthcheck。open） |
 | コンテナ ID の付与 | `AuditRecord::container_id` | mount・exec_target・entrypoint は付与済み。plugin_trust は付与しない（検証はコンテナを特定する前にバックエンドを解決するために走り、特定のコンテナに属さないため。#2013）。seccomp・landlock は未配線 | #1618（closed。型のみ）。seccomp は #2025 |
@@ -130,12 +130,21 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 | 1 | `DenyAction` の拡張と USER_NOTIF 用フィルタの構築（命令数の期待値の更新） | core | #2023 |
 | 2 | listener fd の取得と受け渡し（`sys` のラッパー） | core・supervisor | #2024 |
 | 3 | supervisor の listener ループ（期限・PID 変換・`record_seccomp_denial`・`EPERM` 応答） | supervisor | #2025 |
-| 4 | `KILL_PROCESS` 側の記録（親の終了シグナルとカーネル監査の突き合わせ。レコード型の拡張の要否） | core・supervisor | #2004 |
+| 4 | `KILL_PROCESS` 側の記録（親の終了シグナルとカーネル監査の突き合わせ。レコード型の拡張の要否） | core・supervisor | #2004（実装済み。判断は 9.1） |
 | 5 | Landlock のカーネル監査対応（ABI 7 のログ制御フラグ）と縮退時の状態表示 | core | #2026 |
 | 6 | 縮退時の挙動（起動拒否／警告）の実装 | core・supervisor | #2027 |
 | 7 | `escape_suite.rs` の整備 | core | #2028 |
 
 **完了の条件**に含める: ESC-01・03・06・10 の `AuditExpectation::Deferred` を `Required` へ切り替える。ESC-07・08 が試験の側で作っている記録（`record_landlock_denial`、`audit_mount_config_error` の直接呼び出し）を、本番の配送経路が出した記録に置き換える。本番 sink の出力ファイルを親が回収して照合する形を含める。
+
+### 9.1 案 4（#2004）の判断と結果
+
+- **正の記録はカーネルの `AUDIT_SECCOMP`**: 読むには `NETLINK_AUDIT` の `AUDIT_NLGRP_READLOG` の購読が要り、初期 user namespace の `CAP_AUDIT_READ` が必要。supervisor の承認済みの最小権限集合（`privilege-separation.md`）に含まれないため、プロセス内の読み手は作らず、auditd 等の外部の読み手に任せる（4 章 (c) と整合）。`CAP_AUDIT_READ` の付与は権限分離の設計変更でオーナー承認が要るため承認事項として残す
+- **`SECCOMP_FILTER_FLAG_LOG` は不要**: `seccomp(2)` の Audit logging 節のとおり、`KILL_PROCESS` は `actions_logged` に載っていれば記録される。現行の適用経路（`prctl(PR_SET_SECCOMP)`）はフラグを渡せず、フィルタは変えない。**カーネルソース（`kernel/seccomp.c` の `seccomp_log` 等）での記録が出なくなる条件・pid の名前空間・rootless での記録有無の一次資料確認は未実施**（man ページ以外は未確認。#2027 の縮退判定の前に確かめる）
+- **補助の `exit_signal` レコード**: 本番 launcher の回収点（`ContainerChildProcess` の `wait` / `terminate`）が SIGSYS の終了をちょうど 1 回、層 `exit_signal`（`AuditEvent::ExitSignal`。シグナルと回収側の PID namespace の対象 pid だけを持つ）で記録する。コンテナ内の `kill(SIGSYS)` と区別できないため seccomp 由来とは断定せず、syscall・arch は型として持たない（親の側で syscall を推測した記録は作れない）
+- **縮退**: カーネル監査を使えない環境では補助レコードだけが残る（syscall は残らない）。検出と表示は #2027 が担う
+- **制約（後続）**: supervisor は監視の時点で複数スレッドのため `FileAuditSink` の隔離（fork）が使えず、代替のカーネル監査送信（`CAP_AUDIT_WRITE` が要る）に回る。rootless では補助レコードが残らない場合がある。複数スレッドからの配送は `ControlAuditRelay` を `ExitSignal` も運べるよう広げる後続で直す。pid 1 以外の子孫と supervisor の exec コマンドの SIGSYS 終了は親から見えない
+- **実機試験**: `crates/core/tests/seccomp_kill_audit.rs`（`--ignored`。root と auditd が前提。`AGENTS.md` 参照）
 
 ## 10. セキュリティ上の論点
 

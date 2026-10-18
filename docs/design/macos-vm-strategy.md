@@ -2,12 +2,12 @@
 
 macOS バックエンドの VM 利用方式（既定とオプション）を定める（MAC-4）。
 
-> 方針自体は spec で確定済み（MAC-4 は確定）。本書はその文書化であり、「軽量プロセス分離」の解釈と TASK-64 / TASK-65 実装との対応の正確性は #370（TASK-66.h1。人間担当）で確認する。確認が済むまで、本書の実装対応の記述は確認待ちである。
+> 方針自体は spec で確定済み（MAC-4 は確定）。本書はその文書化である。「軽量プロセス分離」の解釈と TASK-64 / TASK-65 実装との対応は #370（TASK-66.h1）で 2026-10-12 に条件つきで承認され、本書は確定として扱う。その後 MAC-4 の期待が「方針の文書化」から「既定方式でコンテナを起動できること」まで広がり（2026-10-12・spec #14）、実装は TASK-191 で行う。着手前に本書の未決事項を確定する（#1905。設計の承認は #1906）。
 
 - 対象ビヘイビア: MAC-4（関連: MAC-1・MAC-2・MVM-1・MVM-5・PLUG-1・PLUG-6・CORE-1）
-- タスク: TASK-66（MS-5・G5。前提 TASK-65 は完了）
-- 関連 issue: #369（本書）・#370（内容確認。人間担当）
-- 出典: `docs/spec/04-behavior/api-platform-macos.md` の `MAC-4`、`api-microvm.md` の `MVM-1`・`MVM-5`、`05-tasks.md` の TASK-66（submodule リビジョン `984f8a2`）
+- タスク: TASK-66（MS-5・G5。前提 TASK-65 は完了）。既定方式の実装は TASK-191（前提 TASK-64・65・66・115）
+- 関連 issue: #369（本書）・#370（内容確認。2026-10-12 に確認済み）・#1836（本更新）・#1905（未決事項の確定と実装 issue の起票）・#1906（設計の承認）
+- 出典: `docs/spec/04-behavior/api-platform-macos.md` の `MAC-4`、`api-microvm.md` の `MVM-1`・`MVM-5`、`05-tasks.md` の TASK-66・TASK-191（submodule リビジョン `fe33bef`）
 
 ## 2 方式の比較
 
@@ -23,12 +23,12 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 - PoC-5: コンテナごとに新規 VM を起動する Apple `container` 方式の cold start は 0.92 秒で、常駐 VM を使い回す Docker Desktop に及ばない trade-off がある
 - PoC-11: Apple `container` 1.4.1 の cold start は 0.728 秒、Docker Desktop は 0.136 秒
 
-本実装の VM 起動時間（MAC-2）の実測は TASK-70（人間担当）で行う。
+本実装の VM 起動時間（MAC-2）の実測は TASK-70（人間担当）で行う。TASK-70・TASK-49 がどちらの方式を測るかは、TASK-191 の未決事項とともに #1905 で決める（本書では決めない）。
 
 ## 既定方式（常駐 VM 共用 + 軽量プロセス分離）
 
 - 常駐 VM: Virtualization.framework で起動した Linux ゲスト VM を、コンテナの起動・停止をまたいで保持し、複数コンテナで共用する
-- 軽量プロセス分離: 共用ゲスト内のコンテナ間分離を、ゲスト Linux の namespaces / cgroups v2 / seccomp / Landlock（`crates/core` の機構。CORE 系・SEC 系）で行う、というのが本書の解釈である。MAC-4 本文は「軽量プロセス分離」としか書いていないため、この具体化は #370 での確認対象とする
+- 軽量プロセス分離: 共用ゲスト内のコンテナ間分離を、ゲスト Linux の namespaces / cgroups v2 / seccomp / Landlock（`crates/core` の機構。CORE 系・SEC 系）で行う、という解釈は #370 で認められた（2026-10-12）。spec の MAC-4 の期待も、この分離をゲスト Linux の namespaces・cgroups v2・seccomp・Landlock で行うと明記している。ただし分離機構のゲスト内での実行は未実装である（TASK-191）
 - 分離強度の含意: コンテナ間はゲストカーネルを共有する。したがってカーネル脆弱性クラスへの耐性やマルチテナント分離が要る用途では、既定方式では足りない（次節のオプション方式を使う）。ホストとの境界は VM であり、virtiofs の共有範囲・アクセス権は Virtualization.framework のデバイス構成で強制される
 - CORE-1 との関係: 「中央の常駐デーモンを持たない」（CORE-1・D-19）と「常駐 VM」は別の概念である。VM を保持する主体は本書では確定しない（未決事項）
 
@@ -40,7 +40,7 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 
 ## TASK-64 / TASK-65 実装との対応
 
-どのコンポーネントが「常駐」側に属するかを示す。表の「既定方式での扱い」は本書の案であり、確認は #370 で行う。
+どのコンポーネントが「常駐」側に属するかを示す。表と現コードの対応は #370 で一致すると確認済み（2026-10-12）。ただし「既定方式での扱い」の「常駐」への割り当ては既定方式の実装（TASK-191）の前提であり、確定した実装ではない。
 
 | コンポーネント | 実装箇所（TASK） | 既定方式での扱い（案） |
 | -------------- | ---------------- | ---------------------- |
@@ -50,14 +50,14 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 | virtiofs 共有のデバイス構成（`VirtiofsSharesSpec`。最大 `MAX_VIRTIOFS_SHARES` = 8 件） | `crates/platform-macos/src/virtiofs.rs`（TASK-65.1） | 常駐（VM 構成の一部。構成構築時に固定） |
 | ゲスト内 mount の指示・報告契約（カーネルコマンドライン経由の指示、hvc0 経由の報告） | `crates/platform-macos/src/guest_mount.rs`（TASK-65.3） | 常駐（起動時 1 回。`Vm::launch` 内で待機） |
 | I/O 共有プロトコルクライアント（`VirtiofsIoClient`）と再接続（`ReconnectingVirtiofsIoClient`） | `crates/platform-macos/src/virtiofs/io_client.rs`・`reconnect.rs`（TASK-65.2・65.5） | 接続単位（寿命は VM に縛られない。常駐 VM への接続として使う想定。具象トランスポートは未実装） |
-| ゲスト init（`crates/guest-init`。#1875。virtiofs の mount と報告・起動完了マーカー） | ソース実装済み（initrd への梱包 #1878・実機確認 #1628 は未実施） | VM 単位 |
+| ゲスト init（`crates/guest-init`。#1875。virtiofs の mount と報告・起動完了マーカー） | ソース実装済み（#1875）。initrd の梱包スクリプトは整備済み（#1878。`scripts/build-guest-initrd.sh`・`make guest-initrd-build`。release には添付せず利用者が手元でビルドする〔#2093〕）。実機確認（#1628）は未実施 | VM 単位 |
 | ゲスト内のコンテナ実行（軽量プロセス分離の本体） | 未存在 | コンテナ単位（未実装） |
 
 ### コンソールログの保持（回転・削除。#2138・MAC-1・REPAIR-4）
 
 - 上限: 1 ファイル・1 回の起動あたり 1 MiB（`MAX_CONSOLE_LOG_BYTES`）、世代は現在を含め 3（`CONSOLE_LOG_GENERATIONS`。`<name>`・`<name>.1`・`<name>.2`）。supervisor のログ（#2067・SUP-7）と同じ値と番号規則（新しいほど小さい）で、パス 1 つあたりの総量は約 3 MiB。起動中は回転せず上限で切る（ブートログの先頭を残すため）。 回転・新規ファイルの open・書き出しへの引き渡し、および全世代の削除は、排他用ファイル `<name>.0`（世代と衝突しない番号。回転で変わらない）の lock を通して持ち、同じログパスの二重書き出しと使用中の削除を拒否する。回転と削除の結果・件数・所要時間は stderr の構造化ログ（`operation` が `rotate` / `remove`。パスは含めない）に残す（MAC-1・REPAIR-4）。
 - 回転の時機: `VmConfigSpec::open_serial_console`（`Vm::launch` が呼ぶ）が書き出しの直前に行う。現在のログが無い・空なら世代を消費しない。使用中 lock を先に取り、世代ファイルに異常（symlink・他者所有・リンク数・モード・kernel / initrd / ディスクイメージとの同一性）があれば何も動かさず拒否する。
-- 削除の時機: VM の stop・`Vm` の drop・起動失敗では残す（診断材料）。コンテナの delete で `VmConfigSpec::remove_console_logs` が現在のログと全世代を消す。この呼び出しの配線は plugin-macos の delete 実装（TASK-114）待ちで、現状は部品の提供までである。
+- 削除の時機: VM の stop・`Vm` の drop・起動失敗では残す（診断材料）。コンテナの delete で `VmConfigSpec::remove_console_logs` が現在のログと全世代を消す。この呼び出しの配線は plugin-macos の delete の実装と core 側の配線待ち（コード doc では TASK-114。core 側配線の設計は #1869）で、現状は部品の提供までである。
 - supervisor との違い: コードは共有しない（platform-macos は supervisor へ依存しない）。起動中の回転もしない。
 
 ### 現状の事実（実装済みを装わない。REPAIR-3）
@@ -65,8 +65,10 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 - 現在の `Vm::launch` は「1 回の呼び出しで 1 VM を構成・起動する」API で、virtiofs 共有はカーネルコマンドラインの mount 指示とともに VM 構成の構築時に固定される。構造上は、既定方式よりオプション方式（1 コンテナ = 1 VM）に近い。複数コンテナで VM を使い回す仕組み（共用 VM の保持・コンテナ単位の追加 / 削除）は未実装である
 - `Vm` の `Drop` は実行中の VM に停止を要求する。「常駐」させるには `Vm` を保持し続ける主体が要る
 - 協調停止・pause / resume / save / restore は未実装である
-- クライアント側の UDS `connect`・macOS ホスト側の VZ vsock トランスポートは未実装である。ゲスト init（指示を読んで mount し報告するもの）は `crates/guest-init` にソースがあるが（#1875）、initrd への梱包（#1878）と実機確認（#1628）までは、mount 指定つきの `Vm::launch` は報告が届かずタイムアウトしうる
-- plugin 境界越しの配線は TASK-115（`fandhe-container-plugin-macos`）で行う
+- I/O 共有プロトコル（IO-1）のクライアント側 UDS `connect`（`PipelineClient` の本番結合）は未実装である。plugin 境界の `UdsStream::connect`（`fandhe-container-plugin`。plugin-macos が core へ接続する経路）は実装済みで、別物である。io crate の vsock は Linux では実装済み（#1119）だが、macOS の VZ vsock（`VZVirtioSocketDevice`）は `Unimplemented` である
+- ゲスト init（指示を読んで mount し報告するもの）は `crates/guest-init` のソース（#1875）と initrd の梱包スクリプト（#1878）が済み、実機確認（#1628）が未実施である。mount 指定つきの `Vm::launch` は、実機で報告が届くかが未確認である
+- plugin 境界越しの配線（TASK-115。#384〜#390 は完了）は plugin 側で配線済みである: 起動引数と socket の解決（`startup`）・長さ接頭辞フレームの送受信ループ（`frame_loop`）・peer 認証つき `UdsStream::connect` による core への接続（socket は core が bind する。PLUG-12）・`adapter` による create / start / stop の platform-macos への委譲と `ping`・SIGTERM での `stop_all`・E2E 結合テスト
+- 未実装: kill / delete / state（`UNIMPLEMENTED` を返す）。要求本体は `Vec<String>` の暫定ワイヤー契約で、型つき本体への置き換えが要る。core 側から plugin-macos を起動して RPC する配線（発見・検証・spawn・型つきの `ContainerRuntime` proxy）は無い（コード doc は TASK-114 と書くが、配線の設計は #1869 で決める）。`VirtiofsIoClient` / `ReconnectingVirtiofsIoClient` は plugin-macos から使われていない。コンソールログの削除（`remove_console_logs`）を呼ぶ箇所が無い。状態はプロセス内のメモリだけに持つ。動作は 1 コンテナ = 1 VM である
 
 ## plugin 境界との関係
 
@@ -82,9 +84,9 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 - VM 生成後にコンテナ単位の bind mount をどう届けるか（virtiofs 共有が構成時固定である制約）。共用 VM で複数コンテナの共有ディレクトリが同一ゲストに見える点のアクセス制御も含む
 - 共用ゲスト内でコンテナを実行する機構（ゲスト init の拡張〔子プロセスの回収等〕・`crates/core` のゲスト内利用）
 - オプション方式の macOS 実現経路と選択 UI、MVM-3 のしきい値（検討中）
-- 関連タスク: TASK-70（MAC-2 / MAC-3 の実測・人間）、TASK-115（plugin 化）、TASK-74 / TASK-75（MVM-1 の Linux 実装）、TASK-78（MVM-5 の文書化）、TASK-49（CORE-8 の VM 経由リソース効率実測・人間）
-- 共用 VM の実装タスクは spec のタスク定義に明示なし。要確認事項として報告する
+- 関連タスク: TASK-70（MAC-2 / MAC-3 の実測・人間）、TASK-115（plugin 化。plugin 側は完了、#384）、TASK-74 / TASK-75（MVM-1 の Linux 実装）、TASK-78（MVM-5 の文書化）、TASK-49（CORE-8 の VM 経由リソース効率実測・人間）、TASK-191（既定方式の実装。#1905・#1906）
+- 既定方式の実装タスクは 2026-10-12 に spec へ TASK-191 として追加された（spec #14。#370 の決定「spec リポジトリ側で補う」による）。上の未決事項は TASK-191 の着手前に #1905 で確定し、#1906 で承認する
 
 ## 見直し
 
-MAC-4・MVM-1・MVM-5 の更新時、TASK-115 / TASK-78 の完了時、#370 の確認結果が出た時に本書を追従する。
+MAC-4・MVM-1・MVM-5 の更新時、TASK-191 の未決事項の確定時（#1905・#1906）、TASK-78 の完了時、core 側配線（#1869）の確定時に本書を追従する。

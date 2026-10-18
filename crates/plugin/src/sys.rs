@@ -1438,8 +1438,8 @@ impl From<io::Error> for LockError {
 /// `flock` の間に割り込んだ掃除で、保持は 1 候補の判定の間だけなので通常は 1 回目の待ちで解放される。
 /// 呼び出し側（`uds_security::acquire_bind_lock`）は、名前から外れた inode を掴むたびに作り直して
 /// 本関数を呼び直す（上限 8 回）ため、bind 1 回の待ちは最悪で 8 回 × 100 ms（約 0.8 秒）になる。
-/// 呼び出し側の期限（`call_once` の合計期限等）とは連動しない。
-const CREATED_LOCK_WAIT_ATTEMPTS: u32 = 100;
+/// 呼び出し側の期限（`call_once` の合計期限等）とは連動しない。テストは待ち回数の照合（#2003）に使う。
+pub(crate) const CREATED_LOCK_WAIT_ATTEMPTS: u32 = 100;
 const CREATED_LOCK_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// テスト専用。[`lock_file_at`] が新規作成（`O_EXCL`）してから `flock` を取るまでの間に処理を差し込み、
@@ -1455,6 +1455,32 @@ pub(crate) mod lock_test_hook {
     thread_local! {
         static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static CONTENDED_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        static WAITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static ON_WAIT: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// 待ちを 1 回数える（`lock_file_at` の sleep 直前から呼ばれる）。「待たない」ことを壁時計でなく
+    /// 回数で確かめるための観測点（REPAIR-5・#2003）。
+    pub(super) fn record_wait() {
+        WAITS.with(|w| w.set(w.get().saturating_add(1)));
+    }
+
+    /// 呼び出しスレッドの待ち回数を読み出して 0 に戻す。
+    pub(crate) fn take_waits() -> u32 {
+        WAITS.with(|w| w.replace(0))
+    }
+
+    /// 呼び出しスレッドの次の待ち 1 回の sleep 直前に `f` を実行させる。割り込み役の解放を
+    /// 「待っている最中」に固定し、スレッドと sleep による時間の競争をなくす（#2003）。
+    pub(crate) fn set_on_wait(f: impl FnOnce() + 'static) {
+        ON_WAIT.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn run_on_wait() {
+        let f = ON_WAIT.with(|h| h.borrow_mut().take());
+        if let Some(f) = f {
+            f();
+        }
     }
 
     /// 呼び出しスレッドの以降 `n` 回の「作成 → 既存を開く」の試行を、競合（作成は `EEXIST`、既存を
@@ -1629,6 +1655,11 @@ pub(crate) fn lock_file_at(
             Ok(()) => return Ok(LockHandle { file, created }),
             Err(std::fs::TryLockError::WouldBlock) if waits_left > 0 => {
                 waits_left -= 1;
+                #[cfg(test)]
+                {
+                    lock_test_hook::record_wait();
+                    lock_test_hook::run_on_wait();
+                }
                 std::thread::sleep(CREATED_LOCK_WAIT_INTERVAL);
             }
             Err(std::fs::TryLockError::WouldBlock) => return Err(LockError::Held),

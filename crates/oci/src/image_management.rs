@@ -11,10 +11,13 @@
 //! `register_manifest` で登録する在庫（manifest と blob 構成）は参照ではない。blob ごとの参照数を
 //! 数えるための構成情報であり、無参照の manifest が含むだけの blob は参照なしと判定する。
 //!
+//! ストア単位の排他（TASK-183.2・OCI-7・#473）は [`ImageStore`] が担う。テーブルはそのガード越しにだけ
+//! 変更でき、永続化前はプロセスごとのメモリ上の別物である（契約と前提は `store` モジュールの doc）。
+//!
 //! 未実装（後続 issue の担当。実装済みを装わない。REPAIR-3）:
-//! - ストア単位の排他（#473。呼び出し側がこの値をロックの内側で扱う前提で、本型は排他をかけない）
 //! - ディスクへの永続化・再起動時の照合（#853・#854・#851）
-//! - GC 本体・`image ls`/`rm`/`tag`/`prune`（#478〜#481・#476）、pull へのリース組み込み（#474・#475）
+//! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force`・実削除は #481
+//! - GC 本体・`image ls`/`tag`/`prune`・`rm` の CLI 配線（#478〜#481・#476）、pull へのリース組み込み（#474・#475）
 //! - テーブル全体の件数上限（永続化の読み込み側で判断する）
 //!
 //! core の `ContainerId` との対応づけ（変換の置き場所・依存の向き）は #853 で決める。oci は core に
@@ -23,8 +26,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+mod remove;
+pub use remove::{ImageInUse, ImageRmCandidate, ImageRmDecision, ImageRmTarget};
+
 use crate::error::{OciError, OciErrorCode};
 use crate::reference::{Digest, RegistryHost, Repository, Tag};
+
+mod store;
+pub use store::{
+    IMAGE_STORE_LOCK_FILE_NAME, IMAGE_STORE_LOCK_TIMEOUT, ImageStore, ImageStoreGuard,
+};
 
 /// `ContainerRefId` の最大バイト数（core の `ContainerId` と同じ）。
 pub const CONTAINER_REF_ID_MAX_BYTES: usize = 255;
@@ -238,7 +249,7 @@ pub struct LeaseAcquired {
     pub newly_added: bool,
 }
 
-/// 参照テーブル本体。排他は持たない（#473 がロックの内側で包む前提）。
+/// 参照テーブル本体。単体では排他を持たない。ストアとしては [`ImageStore::lock`] のガード越しに使う。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReferenceTable {
     manifests: BTreeMap<Digest, ManifestComposition>,

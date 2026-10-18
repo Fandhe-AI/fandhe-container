@@ -6,7 +6,7 @@
 //! 依存しない（CRI-7。依存の向きは cri → core の一方向で、core 側は cri に依存しない）。
 //!
 //! CRI の語彙（ID 文字列・秒・bool）を受け、`ContainerRuntime` の検証つき要求型へ変換して呼び、
-//! 結果のエラーを ERR-3 の gRPC ステータスへ写す。core の型は公開 API へ漏らさず、
+//! 結果のエラーを `CriError`（ERR-3）へ写す。core の型は公開 API へ漏らさず、
 //! [`RuntimeContainerStatus`] へ写して返す。
 //!
 //! **同期 API**: `ContainerRuntime` は同期トレイトで、plugin 越しの実装は REPAIR-5 のタイムアウトを持つ
@@ -25,16 +25,13 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::{
     ContainerId, ContainerRuntime, ContainerState, ContainerStatus, CreateRequest, DeleteRequest,
-    DeleteResponse, ErrorCode, KillRequest, Signal, StartRequest, StateRequest, StopRequest,
-    TraitError,
+    DeleteResponse, KillRequest, Signal, StartRequest, StateRequest, StopRequest, TraitError,
 };
-use tonic::{Code, Status};
+use tonic::Status;
 
+use crate::error::CriError;
 use crate::runtime::v1::ContainerConfig;
 use crate::runtime::v1::ContainerState as CriContainerState;
-
-/// エラーメッセージとして返す最大バイト数。plugin 由来の untrusted な文字列のため cri 側でも上限を掛ける。
-const STATUS_MESSAGE_MAX_BYTES: usize = 4096;
 
 /// 実行層が報告した生の状態（CRI の外向き状態へ写す前の区別。CRI-2・REPAIR-5）。
 ///
@@ -125,28 +122,10 @@ impl From<&DeleteResponse> for RuntimeDeleteResult {
 
 /// `ContainerRuntime` のエラーを ERR-3 の gRPC ステータスへ写す。
 ///
-/// 未知のコード（`#[non_exhaustive]`）は `Internal` にする。メッセージは plugin 由来のため上限を再確認して詰める。
+/// 写像は [`CriError`] の `From<&TraitError>`（`crate::error`）に一本化されており、本関数はその薄いラッパー
+/// （未知のコードは `Internal`、メッセージは 4096 バイトへ切り詰め）。
 pub fn trait_error_to_status(err: &TraitError) -> Status {
-    let code = match err.code() {
-        ErrorCode::InvalidArgument => Code::InvalidArgument,
-        ErrorCode::NotFound => Code::NotFound,
-        ErrorCode::AlreadyExists => Code::AlreadyExists,
-        ErrorCode::FailedPrecondition => Code::FailedPrecondition,
-        ErrorCode::Unimplemented => Code::Unimplemented,
-        ErrorCode::PermissionDenied => Code::PermissionDenied,
-        ErrorCode::Timeout => Code::DeadlineExceeded,
-        ErrorCode::Unavailable => Code::Unavailable,
-        _ => Code::Internal,
-    };
-    let mut msg = err.message().to_owned();
-    if msg.len() > STATUS_MESSAGE_MAX_BYTES {
-        let mut end = STATUS_MESSAGE_MAX_BYTES;
-        while !msg.is_char_boundary(end) {
-            end -= 1;
-        }
-        msg.truncate(end);
-    }
-    Status::new(code, msg)
+    Status::from(CriError::from(err))
 }
 
 /// CRI の `ContainerConfig` から OCI bundle（rootfs と `config.json`）を用意する注入点（TASK-59.2・#438・CRI-2）。
@@ -164,13 +143,13 @@ pub trait BundleProvider: Send + Sync {
         container_id: &str,
         sandbox_id: &str,
         config: &ContainerConfig,
-    ) -> Result<PathBuf, Status>;
+    ) -> Result<PathBuf, CriError>;
 
     /// `prepare` で用意した資源を解放する（`create` 失敗時の後始末。stop・delete の接続は TASK-59.3）。
     ///
     /// 削除・解除に失敗したら `Err` を返す。呼び出し側は `Err` のとき資源が残っているとみなし、
     /// コンテナの記録と件数枠を保持して追跡を失わない（fail-closed）。不在は `Ok` としてよい。
-    fn release(&self, container_id: &str) -> Result<(), Status>;
+    fn release(&self, container_id: &str) -> Result<(), CriError>;
 }
 
 /// RPC ハンドラから `ContainerRuntime` を呼ぶアダプタ（CRI-2・CRI-7）。
@@ -200,19 +179,18 @@ impl RuntimeAdapter {
     }
 
     /// CRI 由来の ID 文字列を検証して [`ContainerId`] にする（不正は `INVALID_ARGUMENT`）。
-    fn id(id: &str) -> Result<ContainerId, Status> {
-        ContainerId::new(id).map_err(|e| trait_error_to_status(&e))
+    fn id(id: &str) -> Result<ContainerId, CriError> {
+        ContainerId::new(id).map_err(|e| CriError::from(&e))
     }
 
     /// OCI bundle（絶対パス）からコンテナを作成する。
-    pub fn create(&self, id: &str, bundle: PathBuf) -> Result<RuntimeContainerStatus, Status> {
-        let req =
-            CreateRequest::new(Self::id(id)?, bundle).map_err(|e| trait_error_to_status(&e))?;
+    pub fn create(&self, id: &str, bundle: PathBuf) -> Result<RuntimeContainerStatus, CriError> {
+        let req = CreateRequest::new(Self::id(id)?, bundle).map_err(|e| CriError::from(&e))?;
         Self::finish(id, self.runtime.create(&req))
     }
 
     /// `created` 状態のコンテナを開始する。
-    pub fn start(&self, id: &str) -> Result<RuntimeContainerStatus, Status> {
+    pub fn start(&self, id: &str) -> Result<RuntimeContainerStatus, CriError> {
         let req = StartRequest::new(Self::id(id)?);
         Self::finish(id, self.runtime.start(&req))
     }
@@ -220,31 +198,31 @@ impl RuntimeAdapter {
     /// SIGTERM 後 `timeout_secs` 秒で SIGKILL へ切り替えて停止する。
     ///
     /// 負値は 0（即時 SIGKILL）に丸める。上限（24 時間。REPAIR-5）超過は `INVALID_ARGUMENT`。
-    pub fn stop(&self, id: &str, timeout_secs: i64) -> Result<RuntimeContainerStatus, Status> {
+    pub fn stop(&self, id: &str, timeout_secs: i64) -> Result<RuntimeContainerStatus, CriError> {
         let grace = Duration::from_secs(u64::try_from(timeout_secs).unwrap_or(0));
-        let req = StopRequest::new(Self::id(id)?, grace).map_err(|e| trait_error_to_status(&e))?;
+        let req = StopRequest::new(Self::id(id)?, grace).map_err(|e| CriError::from(&e))?;
         Self::finish(id, self.runtime.stop(&req))
     }
 
     /// コンテナの資源を解放する（`ContainerRuntime::delete`）。`force` は実行中でも停止してから削除する。
-    pub fn remove(&self, id: &str, force: bool) -> Result<RuntimeDeleteResult, Status> {
+    pub fn remove(&self, id: &str, force: bool) -> Result<RuntimeDeleteResult, CriError> {
         let req = DeleteRequest::new(Self::id(id)?).with_force(force);
         self.runtime
             .delete(&req)
             .as_ref()
             .map(RuntimeDeleteResult::from)
-            .map_err(trait_error_to_status)
+            .map_err(CriError::from)
     }
 
     /// シグナル番号（1..=64）を送る。範囲外は `INVALID_ARGUMENT`。
-    pub fn kill(&self, id: &str, signal: u8) -> Result<RuntimeContainerStatus, Status> {
-        let signal = Signal::new(signal).map_err(|e| trait_error_to_status(&e))?;
+    pub fn kill(&self, id: &str, signal: u8) -> Result<RuntimeContainerStatus, CriError> {
+        let signal = Signal::new(signal).map_err(|e| CriError::from(&e))?;
         let req = KillRequest::new(Self::id(id)?, signal);
         Self::finish(id, self.runtime.kill(&req))
     }
 
     /// コンテナの現在状態を照会する。
-    pub fn state(&self, id: &str) -> Result<RuntimeContainerStatus, Status> {
+    pub fn state(&self, id: &str) -> Result<RuntimeContainerStatus, CriError> {
         let req = StateRequest::new(Self::id(id)?);
         Self::finish(id, self.runtime.state(&req))
     }
@@ -254,10 +232,10 @@ impl RuntimeAdapter {
     fn finish(
         expected_id: &str,
         r: Result<ContainerStatus, TraitError>,
-    ) -> Result<RuntimeContainerStatus, Status> {
-        let status = r.as_ref().map_err(trait_error_to_status)?;
+    ) -> Result<RuntimeContainerStatus, CriError> {
+        let status = r.as_ref().map_err(CriError::from)?;
         if status.id().as_str() != expected_id {
-            return Err(Status::internal(
+            return Err(CriError::internal(
                 "runtime returned a status for a different container id",
             ));
         }
@@ -268,7 +246,10 @@ impl RuntimeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::STATUS_MESSAGE_MAX_BYTES;
+    use fandhe_container_core::traits::ErrorCode;
     use std::num::NonZeroU32;
+    use tonic::Code;
 
     fn cid(s: &str) -> ContainerId {
         ContainerId::new(s).unwrap()
@@ -327,7 +308,7 @@ mod tests {
         assert_eq!(ok.unwrap().id, "a");
         let err = RuntimeAdapter::finish("a", Ok(ContainerStatus::created(cid("b"), None)))
             .expect_err("mismatch");
-        assert_eq!(err.code(), Code::Internal);
+        assert_eq!(err.code().grpc_code(), Code::Internal);
     }
 
     /// CRI-2: 削除応答を CRI 側の型へ写す。

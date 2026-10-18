@@ -164,6 +164,7 @@ flowchart LR
 | ---------------- | ---- | ---- |
 | `compose-convert` → `stack` | crate-naming.md 決定 5（TOML の型は `stack` のものを使う） | 確定 |
 | `guest-init` →(dev) `platform-macos` | ゲスト init と `guest_mount` の契約の機械照合（`tests/contract.rs`。MAC-1・#1875。dev-dependencies のみで、通常の依存には入れない。外部クレートの追加ではない） | 確定 |
+| `oci` →(dev) `core` | 実機前提ハーネス `tests/pull_e2e.rs` の実行段が TASK-29 の `create` / `start` と `ProductionLauncher` を使う（OCI-1・TASK-55.1・#420。dev-dependencies のみで、通常の依存には入れない。外部クレートの追加ではない。将来 `core` が `oci` に通常依存すると dev 循環になるため、その時はハーネスの置き場所を見直す） | 確定 |
 | `supervisor` → `core` | crate-naming.md 決定 6（`StateStore` 既定実装を core に一本化。supervisor は 2 つ目の実装を持たない） | 確定 |
 | `plugin-cri` → `cri` | crate-naming.md 表 #15（`cri` の実装を別プロセス化。TASK-114） | 確定 |
 | `cri` → `oci` | `PullImage` が oci の pull 経路（認証・manifest・blob 取得・digest 検証）を呼ぶ（CRI-4・OCI-1・TASK-61.3・#446。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド実装ライブラリ → core 側で、規則 2 の逆向き（core 側が `cri` に依存しない）のため抵触しない | 確定 |

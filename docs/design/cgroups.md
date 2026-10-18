@@ -94,6 +94,33 @@ OCI の default devices と同じ固定表（`DeviceAllowList::oci_default()`。
 - 試験用の major に 120 を使う理由: 当初想定の 240 はカーネルの動的 major 割り当て（`find_dynamic_major()` は 254 から 234 へ向けて割り当てる）と重なり、開発ホストの `/proc/devices` にも `240 ttyDBC` が実在した。devices.txt で char 120-127 は LOCAL/EXPERIMENTAL USE で動的割り当ての範囲の外にある
 - 実機での実行は人間担当で、結果は #1621 に記録する（AGENTS.md「実機前提テスト」）
 
+## OCI `linux.resources` の写像（TASK-29 追補・#2019・CORE-3・CORE-4・SEC-1・SUP-13）
+
+`config.json` の `linux.resources` のうち、cgroup v2 で表せて setter がある項目を create / start で受理し、start の cgroup 連鎖（`record_scope` → `create_cgroup` → `apply_limits` → `into_join`）の `apply_limits` が委譲 cgroup の制限ファイルへ書く。`enable_controllers` を呼べるのは退避済みの証明を持つ `apply_limits` の中だけなので、controller の有効化と setter の呼び出しはそこに置く。controller が委譲に無ければ `FAILED_PRECONDITION` で止まり、制限なしでは起動しない。
+
+### 受理する項目
+
+| OCI のキー | 書き先 | 値の規則（逸脱は `INVALID_ARGUMENT`。メッセージはキー名だけ） |
+| --- | --- | --- |
+| `memory.limit` | `memory.max` | `-1` は `max`、`> 0` はバイト数。`0` と `< -1` は拒否 |
+| `memory.swap`（メモリ + swap の合計） | `memory.swap.max` | `-1` は `max`。`> 0` は `limit` がバイト数で `swap >= limit` のとき `swap - limit` を書く（runc の v2 変換と同じ）。それ以外は拒否。swap accounting が無いホストでは `FAILED_PRECONDITION` |
+| `cpu.quota` / `cpu.period` | `cpu.max` | quota は `-1` か `> 0`。period の範囲は `CpuMax` の検証に従う。period だけの指定は quota 無制限 |
+| `pids.limit` | `pids.max` | `-1` か `1..=PIDS_MAX_LIMIT` |
+| `blockIO.weight` | `io.bfq.weight` / `io.weight` | `10..=1000` |
+| `blockIO.throttle{Read,Write}{Bps,IOPS}Device[]` | デバイスごとに 4 項目を 1 つにまとめた `io.max` | rate の `0` と `u64::MAX` は拒否。同じリスト内の重複デバイスは拒否。1 リスト 64 件まで |
+
+cgroup v2 の範囲に収まるかは Linux では create の時点でも検査する（`cgroups::ResourceLimitPlan`）。start は手順 5 で同じ変換を行って書き、書いた値を launcher に渡す。launcher は fork の前に `config.json` の値との一致を確かめ、手順 5 と手順 8 の間に config が書き換えられた場合は `FAILED_PRECONDITION` で拒否する。
+
+### 拒否する項目
+
+setter が無い既知の項目は未適用として記録し、create / start が `UNIMPLEMENTED`（`unsupported config fields: <キー>`）で拒否する: `memory.{reservation,kernel,kernelTCP,swappiness,disableOOMKiller,useHierarchy,checkBeforeUpdate}`、`cpu.{shares,cpus,mems,realtimeRuntime,realtimePeriod,burst,idle}`、`blockIO.{leafWeight,weightDevice,leafWeightDevice}`、`hugepageLimits`、`network`、`rdma`、`unified`、`devices`。`rdma` と `network` は cgroup v2 で扱いにくいため拒否を続ける。
+
+`linux.resources` とその下の object の未知のキーは、OCI の「未知のプロパティは無視する」規則から外れて `INVALID_ARGUMENT` で拒否する。新しい版の spec にある制限を黙って落とし、指定より弱い資源制限で起動する経路を作らないため（SEC-1）。`resources: {}` は今のとおり cgroup が必要な指定として扱う（値による精緻化は #2010）。
+
+### `linux.cgroupsPath`
+
+型つき（4096 バイト以下・空と NUL は拒否）で保持するが、コンテナの cgroup は常に委譲スコープ配下の `fc-<id>@<n>` に置かれ、値を配置に使う実装は無い。指定があれば `cgroup_requirement::check_cgroups_path` が create / start で `UNIMPLEMENTED` として拒否する。受理に開くことと値の検証（スコープの外へ出る経路の拒否）は #2010 がこの関数を書き換えて行う。
+
 ## 前提環境（委譲スコープの作り手。#2081・CORE-3・CORE-4・SUP-1・CLI-1）
 
 supervisor の `DelegatedCgroup::prepare` は、委譲された親 cgroup に自分以外のプロセスが 1 つでもあると拒否する。このため CLI の `start` は、supervisor を CLI と同じ cgroup ではなく、`systemd-run --user --scope --quiet -p Delegate=yes --`（`start_contract::USER_SCOPE_WRAPPER_ARGS`）で包んで起動し、新しい scope の中で一人で動かす。

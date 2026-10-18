@@ -22,7 +22,8 @@
 //! 浮動小数は使わず Docker の `NanoCPUs` と同じ整数表現（1 CPU = 10^9 nano CPU）で扱い、
 //! `quota = nano_cpus * period / 10^9`（端数は切り捨て。要求より多い CPU 時間を与えない）とする。
 //! - `0` は `InvalidArgument`。無制限は [`CpuQuota::Unlimited`] で表し、「`--cpus 0` = 無制限」の写像は
-//!   呼び出し側（CLI / launcher。TASK-170.3・TASK-29 / TASK-157 系）の責務
+//!   呼び出し側（CLI。TASK-170.3・#534）の責務。OCI `linux.resources.cpu` の
+//!   `quota` / `period` の反映は #2019（`ResourceLimitPlan`）
 //! - 既定 period では 0.01 CPU 未満は quota が [`MIN_QUOTA_US`] 未満となり拒否される（fail-closed）
 //! - ホストの CPU 数との比較はしない（カーネルは quota > ncpu × period を受理する。上限方針は呼び出し側）
 //!

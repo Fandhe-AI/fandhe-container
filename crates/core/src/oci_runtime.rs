@@ -39,6 +39,7 @@ mod launch;
 mod launcher;
 mod mount_destination;
 pub(crate) mod mountinfo_identity;
+mod resources;
 mod start;
 
 #[cfg(target_os = "linux")]
@@ -54,11 +55,11 @@ pub use config::{
     CONFIG_MAX_HOSTNAME_BYTES, CONFIG_MAX_ID_MAPPINGS, CONFIG_MAX_MASKED_PATHS,
     CONFIG_MAX_MOUNT_OPTIONS, CONFIG_MAX_MOUNTS, CONFIG_MAX_NAMESPACES,
     CONFIG_MAX_OCI_VERSION_BYTES, CONFIG_MAX_PATH_BYTES, CONFIG_MAX_READONLY_PATHS,
-    CONFIG_MAX_STRING_BYTES, NamespaceKind, OciConfig, OciConfigError, OciConfigErrorKind,
-    OciIdMapping, OciMount, OciNamespace, OciProcess, OciRoot, OciUser, OciVersion, UnappliedField,
-    load_config, parse_config_bytes,
+    CONFIG_MAX_STRING_BYTES, CONFIG_MAX_THROTTLE_DEVICES, NamespaceKind, OciConfig, OciConfigError,
+    OciConfigErrorKind, OciIdMapping, OciMount, OciNamespace, OciProcess, OciRoot, OciUser,
+    OciVersion, UnappliedField, load_config, parse_config_bytes,
 };
-pub use create::create;
+pub use create::{create, load_resource_limits};
 pub use delete::{CgroupRemoval, ContainerCgroupRemover, delete};
 pub use error::{
     LifecycleOp, OCI_ERROR_MESSAGE_MAX_BYTES, OCI_EXIT_ALREADY_EXISTS,
@@ -81,6 +82,7 @@ pub use launch::{
 pub use launcher::SubordinateIdSource;
 pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
 pub use mount_destination::{MountDestination, audit_mount_config_error};
+pub use resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
 pub use start::{
     ClaimedStart, LAUNCHER_REPLY_GRACE, StartedContainer, claim_start, launch_claimed,
     recover_interrupted_start, start, take_unreaped_processes,

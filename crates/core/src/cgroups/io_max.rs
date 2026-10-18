@@ -9,8 +9,8 @@
 //! 別設定を書かせる経路はない。
 //!
 //! # 呼び出し文脈・契約
-//! - 呼び出し元: 起動フロー（`--device-read-bps` 等の受け付けと launcher への結線は TASK-170.3・
-//!   TASK-29 / TASK-157 系の担当）。本モジュールは単体の API で、起動フローからはまだ呼ばれない
+//! - 呼び出し元: start の cgroup 連鎖（`start_chain` の `apply_limits`。OCI `linux.resources.blockIO` の
+//!   throttle の反映。TASK-29 追補・#2019）。CLI の `--device-read-bps` 等の受け付けは TASK-170.3・#534
 //! - 前提: 親 cgroup の `cgroup.subtree_control` で `io` controller が有効化済み
 //!   （[`super::DelegatedCgroup::enable_controllers`]）。未有効なら `io.max` が存在せず `FailedPrecondition`
 //! - 書き込み先は保持している O_PATH ディレクトリ fd 起点の `openat`（`O_NOFOLLOW`）で、
@@ -30,7 +30,8 @@
 //! # 未実装（REPAIR-3）
 //! - `--blkio-weight`（比例配分の重み）は絶対値スロットルの `io.max` では表現できない。cgroup v2 での
 //!   実体は `io.weight` で、`io_weight` サブモジュールが担う（TASK-170.4）。本モジュールは `io.max` のみを扱う
-//! - OCI `linux.resources.blockIO` からの反映と launcher への結線（TASK-170.3・TASK-29 / TASK-157 系）
+//! - OCI `linux.resources.blockIO` の反映は #2019 で入った（`ResourceLimitPlan`）。`weightDevice`（デバイス別の
+//!   `io.weight`）は未対応で、パーサが未適用として拒否する
 
 use std::fs::File;
 use std::io::Write as _;

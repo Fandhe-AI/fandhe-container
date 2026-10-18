@@ -112,8 +112,9 @@ pub(crate) use consts::{
     EMFILE, ENFILE, ENOENT, ENOEXEC, ENOMEM, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EOPNOTSUPP, EPERM,
     EPROTONOSUPPORT, ESRCH,
 };
-// 診断ログの待たない送信（`send_nonblocking_unix`）の失敗分類に使う errno（`crate::exec::diagnostic`）。
+// `landlock_restrict_self` の flags（ABI 7 の新規 exec のログ有効化。`crate::exec` の Landlock 適用が渡す。SEC-4・#2026）。
 pub(crate) use consts::LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON;
+// 診断ログの待たない送信（`send_nonblocking_unix`）の失敗分類に使う errno（`crate::exec::diagnostic`）。
 pub(crate) use consts::{EAGAIN, EPIPE};
 
 // # `open(2)` フラグのアーキテクチャ差（Codex P0 指摘〔aarch64 の値が誤り〕への確認記録）

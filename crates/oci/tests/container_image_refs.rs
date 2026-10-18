@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
     CgroupRemoval, ContainerCgroupRemover, ContainerImage, ContainerImageRefs, ImageManifestDigest,
-    ImageRefRegistration, ImageRefRelease, create_with_image, delete_releasing_image_ref,
+    ImageRefGeneration, ImageRefRegistration, ImageRefRelease, create_with_image,
+    delete_releasing_image_ref,
 };
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
 use fandhe_container_core::traits::{
@@ -39,23 +40,69 @@ fn map_err(e: OciError) -> TraitError {
 }
 
 /// core のトレイトを `ImageStore` で満たす試験用アダプタ。
-struct StoreRefs<'a>(&'a ImageStore);
+///
+/// 登録世代は `ImageStore` がまだ持たないため、アダプタ側で登録ごとに採番して持つ（試験専用。
+/// 世代の比較と解除が 1 回の排他にならないので、本番のアダプタは oci 側で原子的に行う）。
+struct StoreRefs<'a> {
+    store: &'a ImageStore,
+    generations: std::sync::Mutex<(u64, std::collections::HashMap<String, u64>)>,
+}
+
+impl<'a> StoreRefs<'a> {
+    fn new(store: &'a ImageStore) -> Self {
+        Self {
+            store,
+            generations: std::sync::Mutex::new((0, std::collections::HashMap::new())),
+        }
+    }
+}
 
 impl ContainerImageRefs for StoreRefs<'_> {
+    fn registration(&self, id: &ContainerId) -> Result<Option<ImageRefGeneration>, TraitError> {
+        let g = self.generations.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(g.1
+            .get(id.as_str())
+            .copied()
+            .map(ImageRefGeneration::from_raw))
+    }
+
+    fn release_if(
+        &self,
+        id: &ContainerId,
+        expected: ImageRefGeneration,
+    ) -> Result<ImageRefRelease, TraitError> {
+        if self.registration(id)? != Some(expected) {
+            return Ok(ImageRefRelease::NotRegistered);
+        }
+        self.generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .remove(id.as_str());
+        self.release(id)
+    }
+
     fn register(
         &self,
         id: &ContainerId,
         manifest: &ImageManifestDigest,
     ) -> Result<ImageRefRegistration, TraitError> {
+        let cid = id;
         let id = ContainerRefId::new(id.as_str()).map_err(map_err)?;
         let digest = Digest::parse(manifest.as_str()).map_err(map_err)?;
         Ok(
             match self
-                .0
+                .store
                 .register_container_ref(&id, &digest)
                 .map_err(map_err)?
             {
-                ContainerRefRegistration::Registered => ImageRefRegistration::Registered,
+                ContainerRefRegistration::Registered => {
+                    let mut g = self.generations.lock().unwrap_or_else(|e| e.into_inner());
+                    g.0 += 1;
+                    let n = g.0;
+                    g.1.insert(cid.as_str().to_owned(), n);
+                    ImageRefRegistration::Registered
+                }
                 _ => ImageRefRegistration::AlreadyRegistered,
             },
         )
@@ -63,10 +110,12 @@ impl ContainerImageRefs for StoreRefs<'_> {
 
     fn release(&self, id: &ContainerId) -> Result<ImageRefRelease, TraitError> {
         let id = ContainerRefId::new(id.as_str()).map_err(map_err)?;
-        Ok(match self.0.release_container_ref(&id).map_err(map_err)? {
-            ContainerRefRelease::Released(_) => ImageRefRelease::Released,
-            _ => ImageRefRelease::NotRegistered,
-        })
+        Ok(
+            match self.store.release_container_ref(&id).map_err(map_err)? {
+                ContainerRefRelease::Released(_) => ImageRefRelease::Released,
+                _ => ImageRefRelease::NotRegistered,
+            },
+        )
     }
 }
 
@@ -161,7 +210,7 @@ fn oci7_create_then_delete_registers_and_releases_reference() {
         )
         .expect("register manifest");
 
-    let refs = StoreRefs(&images);
+    let refs = StoreRefs::new(&images);
     let manifest = ImageManifestDigest::new(MANIFEST).expect("manifest");
     let id = ContainerId::new("c1").expect("id");
     let rec = OpRecorder::new();
@@ -194,7 +243,7 @@ fn oci7_create_with_unknown_manifest_leaves_nothing() {
     )
     .expect("state store");
     let images = ImageStore::open(&tmp.sub("images")).expect("image store");
-    let refs = StoreRefs(&images);
+    let refs = StoreRefs::new(&images);
     let manifest = ImageManifestDigest::new(MANIFEST).expect("manifest");
 
     let err = create_with_image(

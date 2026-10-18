@@ -100,6 +100,10 @@ pub(super) enum ContainerState {
     Created,
     Running,
     Exited,
+    /// 実行層の結果が不明（Start・Create の応答不明で、プロセスが生存しているかもしれない）。
+    /// 外向きは `CONTAINER_UNKNOWN`。停止を確認できるまで `Exited` にしない fail-closed
+    /// （CRI-2・REPAIR-5。停止の確認と回収は TASK-59.3）。
+    Unknown,
 }
 
 impl ContainerState {
@@ -109,6 +113,7 @@ impl ContainerState {
             Self::Created => ProtoContainerState::ContainerCreated,
             Self::Running => ProtoContainerState::ContainerRunning,
             Self::Exited => ProtoContainerState::ContainerExited,
+            Self::Unknown => ProtoContainerState::ContainerUnknown,
         }
     }
 }
@@ -233,7 +238,7 @@ impl ValidatedContainerFilter {
                 Ok(ProtoContainerState::ContainerCreated) => (Some(ContainerState::Created), false),
                 Ok(ProtoContainerState::ContainerRunning) => (Some(ContainerState::Running), false),
                 Ok(ProtoContainerState::ContainerExited) => (Some(ContainerState::Exited), false),
-                Ok(ProtoContainerState::ContainerUnknown) => (None, true),
+                Ok(ProtoContainerState::ContainerUnknown) => (Some(ContainerState::Unknown), false),
                 Err(_) => return Err(Status::invalid_argument("unknown state filter")),
             },
         };

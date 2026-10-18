@@ -306,6 +306,8 @@ struct InFlightGuard {
     /// 真のまま破棄されたら、Start は実行層で running かもしれないため created へ戻さず exited にし、
     /// Create は実行層に資源が残るかもしれないため記録と bundle を保持する（exited にして追跡を残す）。
     outcome_unknown: bool,
+    /// 実行層が停止済みと報告した（Start の応答が Stopped）。破棄時に結果不明ではなく exited へ反映する。
+    confirmed_exited: bool,
 }
 
 impl InFlightGuard {
@@ -317,7 +319,13 @@ impl InFlightGuard {
             committed: false,
             bundles: None,
             outcome_unknown: false,
+            confirmed_exited: false,
         }
+    }
+
+    /// 実行層が停止済みと報告した。破棄時に exited（終了時刻つき）へ反映する（結果不明の unknown にしない）。
+    fn mark_confirmed_exited(&mut self) {
+        self.confirmed_exited = true;
     }
 
     /// Create の巻き戻し時に bundle を解放するよう設定する（bundle の解放責務を持たせる）。
@@ -364,7 +372,13 @@ impl Drop for InFlightGuard {
             {
                 self.outcome_unknown = true;
             }
-            rollback_in_flight(&self.registry, &self.id, self.kind, self.outcome_unknown);
+            rollback_in_flight(
+                &self.registry,
+                &self.id,
+                self.kind,
+                self.outcome_unknown,
+                self.confirmed_exited,
+            );
         }
     }
 }
@@ -554,25 +568,26 @@ fn commit_in_flight(
 
 /// 実行層の呼び出しが失敗・中断したときの巻き戻し。Create は記録を除去し、Start は `in_flight` を解く。
 ///
-/// Create で `outcome_unknown` のときは、実行層に資源が残る可能性があるため記録を除去せず exited として
+/// Create で `outcome_unknown` のときは、実行層に資源が残る可能性があるため記録を除去せず unknown として
 /// 残す（追跡情報と件数枠を保持。回収は TASK-59.3・TASK-114）。
 ///
 /// ロックの汚染時は何もできない（汚染済みのレジストリは以後の RPC が `INTERNAL` で拒否する）。
 ///
 /// Start で `outcome_unknown` のときは、実行層が running の可能性があるため created へ戻さず
-/// exited にする（再 Start による二重起動を防ぐ fail-closed。実状態の照合は TASK-59.3・TASK-114）。
+/// unknown（外向きは CONTAINER_UNKNOWN。終了時刻は設定しない）にする（再 Start による二重起動を防ぐ fail-closed。実状態の照合は TASK-59.3・TASK-114）。
 fn rollback_in_flight(
     registry: &Mutex<SandboxRegistry>,
     id: &str,
     kind: InFlightKind,
     outcome_unknown: bool,
+    confirmed_exited: bool,
 ) {
     match kind {
         InFlightKind::Create if !outcome_unknown => {
             let _ = drop_container_in(registry, id, true);
         }
         InFlightKind::Create | InFlightKind::Start => {
-            let finished_at_nanos = if outcome_unknown {
+            let finished_at_nanos = if confirmed_exited {
                 now_nanos().unwrap_or(0)
             } else {
                 0
@@ -581,9 +596,13 @@ fn rollback_in_flight(
                 && let Some(record) = registry.containers.get_mut(id)
             {
                 record.in_flight = false;
-                if outcome_unknown {
+                if confirmed_exited {
                     record.state = ContainerState::Exited;
                     record.finished_at_nanos = finished_at_nanos;
+                } else if outcome_unknown {
+                    // 停止を確認できないため exited にせず unknown で保持する（終了時刻・終了コードは設定しない。
+                    // 生存中のプロセスを終了済みと公開して重複実行を招かない。CRI-2・REPAIR-5）。
+                    record.state = ContainerState::Unknown;
                     // Create の結果不明は実行層に資源が残りうる。削除接続（TASK-59.3）まで Remove を拒否する。
                     if kind == InFlightKind::Create {
                         record.runtime_leaked = true;
@@ -813,14 +832,15 @@ impl CriRuntimeService {
         if !registry.records.contains_key(&req.pod_sandbox_id) {
             return Err(Status::not_found("sandbox not found"));
         }
-        // 実プロセスを持ちうる実行層のコンテナ（Start 実行中、または created 以外）を含む間は停止を拒否する
-        // （TASK-59.3 で実行層の stop を接続するまで。プロセスが生きたまま停止済みと返さない fail-closed。
-        // CRI-1・REPAIR-3。Remove 系と同じ code）。created のみ（プロセス無し）は従来どおり停止できる。
-        if registry.containers.values().any(|c| {
-            c.pod_sandbox_id == req.pod_sandbox_id
-                && c.runtime_leaked
-                && (c.in_flight || c.state != ContainerState::Created)
-        }) {
+        // 実行層の資源を持つ、または作成・起動の実行中のコンテナを 1 つでも含む間は停止を拒否する
+        // （TASK-59.3 で実行層の stop を接続するまで。Created でも init が fork 済みで PID を持ちうる
+        // ことと、Create 実行中は `runtime_leaked` が未設定で停止後に create が完了する競合があるため。
+        // 生きたプロセスを停止済みと返さない fail-closed。CRI-1・REPAIR-3。Remove 系と同じ code）。
+        if registry
+            .containers
+            .values()
+            .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && (c.in_flight || c.runtime_leaked))
+        {
             return Err(Status::failed_precondition(
                 "container resources are pending runtime cleanup",
             ));
@@ -1166,6 +1186,7 @@ impl CriRuntimeService {
                 }
                 // 終了済みは created へ戻さず、guard の破棄で exited へ反映する（再 Start を実行層へ届けない）。
                 CriContainerState::ContainerExited => {
+                    guard.mark_confirmed_exited();
                     Err(Status::failed_precondition("container has already exited"))
                 }
                 // 結果不明は exited（fail-closed）。
@@ -1218,6 +1239,10 @@ impl CriRuntimeService {
             ContainerState::Exited => Ok(v1::StopContainerResponse {}),
             ContainerState::Created => Err(Status::failed_precondition(
                 "container is not in running state",
+            )),
+            // 結果不明は停止を確認できないため拒否する（通常は runtime_leaked の拒否が先に効く）。
+            ContainerState::Unknown => Err(Status::failed_precondition(
+                "container resources are pending runtime cleanup",
             )),
         }
     }
@@ -1971,6 +1996,44 @@ mod tests {
                 std::thread::park();
             }
         }
+    }
+
+    /// CRI-1・REPAIR-3: NotReady の sandbox 配下の Start は実行層を呼ばず FAILED_PRECONDITION
+    /// (停止は TASK-59.3 まで資源を持つ sandbox で拒否されるため、レジストリを直接操作して状態を作る)。
+    #[test]
+    fn task_59_3_start_in_notready_sandbox_never_reaches_the_runtime() {
+        let svc = CriRuntimeService::new();
+        let sb = run(&svc, Some(config("p")), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        let id = block_on(
+            svc.create_container(Request::new(v1::CreateContainerRequest {
+                pod_sandbox_id: sb.clone(),
+                config: Some(container_config("c", 0)),
+                sandbox_config: None,
+            })),
+        )
+        .unwrap()
+        .into_inner()
+        .container_id;
+        let svc = svc.with_runtime(
+            crate::adapter::RuntimeAdapter::new(Arc::new(NeverRuntime)),
+            Arc::new(HangingRelease::default()),
+        );
+        svc.registry
+            .lock()
+            .unwrap()
+            .records
+            .get_mut(&sb)
+            .unwrap()
+            .state = SandboxState::NotReady;
+        let err = block_on(
+            svc.start_container(Request::new(v1::StartContainerRequest { container_id: id })),
+        )
+        .unwrap_err();
+        // NeverRuntime に届けば Unimplemented になる。届かないので FAILED_PRECONDITION。
+        assert_eq!(err.code(), Code::FailedPrecondition);
     }
 
     /// REPAIR-5・CRI-2: worker / 監視スレッドの生成に失敗しても、bundle の `release`（外部処理）は

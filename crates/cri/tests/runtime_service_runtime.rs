@@ -463,7 +463,7 @@ async fn task_59_2_unexpected_runtime_state_is_internal() {
     );
 }
 
-/// REPAIR-5・fail-closed: 応答不明の失敗（Timeout・Unavailable・Internal）は exited にし、再 Start させない。
+/// REPAIR-5・fail-closed: 応答不明の失敗（Timeout・Unavailable・Internal）は CONTAINER_UNKNOWN にし（CRI-2）、再 Start させない。
 #[tokio::test]
 async fn task_59_2_ambiguous_start_failure_marks_exited() {
     for code in [
@@ -478,7 +478,19 @@ async fn task_59_2_ambiguous_start_failure_marks_exited() {
         start(&h.service, &id).await.expect_err("start");
         assert_eq!(
             status(&h.service, &id).await.state,
-            S::ContainerExited as i32
+            S::ContainerUnknown as i32
+        );
+        // 生存中かもしれないプロセスを終了済みとして公開しない(終了時刻・終了コード未設定)。
+        let st = status(&h.service, &id).await;
+        assert_eq!((st.finished_at, st.exit_code), (0, 0));
+        // 再 Start・Stop・Remove は拒否される(停止の確認は TASK-59.3)。
+        assert_eq!(
+            stop_c(&h.service, &id).await.unwrap_err().code(),
+            Code::FailedPrecondition
+        );
+        assert_eq!(
+            remove(&h.service, &id).await.unwrap_err().code(),
+            Code::FailedPrecondition
         );
         *h.runtime.fail_start.lock().unwrap() = None;
         let err = start(&h.service, &id).await.expect_err("restart");
@@ -545,21 +557,14 @@ async fn task_59_2_concurrent_start_reaches_runtime_once() {
     );
 }
 
-/// 停止済み（notready）のサンドボックスへの Create・Start は実行層を呼ばず FAILED_PRECONDITION。
+/// 停止済み（notready）のサンドボックスへの Create は実行層を呼ばず FAILED_PRECONDITION。
+/// 実行層の資源を持つコンテナが無い sandbox だけが停止できる(TASK-59.3 まで)。Start 側は lib の
+/// `task_59_3_start_in_notready_sandbox_never_reaches_the_runtime` が検証する。
 #[tokio::test]
 async fn task_59_2_notready_sandbox_never_reaches_the_runtime() {
     let h = harness();
     let sb = run_sandbox(&h.service).await;
-    let id = create(&h.service, &sb, "c").await.expect("create");
-    RuntimeService::stop_pod_sandbox(
-        &h.service,
-        Request::new(v1::StopPodSandboxRequest {
-            pod_sandbox_id: sb.clone(),
-        }),
-    )
-    .await
-    .expect("stop sandbox");
-    let before = h.runtime.calls().len();
+    stop_sb(&h.service, &sb).await.expect("stop empty sandbox");
     assert_eq!(
         create(&h.service, &sb, "d")
             .await
@@ -567,11 +572,8 @@ async fn task_59_2_notready_sandbox_never_reaches_the_runtime() {
             .code(),
         Code::FailedPrecondition
     );
-    assert_eq!(
-        start(&h.service, &id).await.expect_err("start").code(),
-        Code::FailedPrecondition
-    );
-    assert_eq!(h.runtime.calls().len(), before);
+    assert_eq!(h.runtime.calls().len(), 0);
+    assert_eq!(h.bundles.calls.lock().unwrap().len(), 0);
 }
 
 /// REPAIR-4: 実行層経由でも全経路で 1 件ずつ記録し、コード名は期待どおり。
@@ -806,7 +808,7 @@ async fn task_59_2_start_precondition_failure_with_non_created_state_marks_exite
     start(&h.service, &id).await.expect_err("start");
     assert_eq!(
         status(&h.service, &id).await.state,
-        S::ContainerExited as i32
+        S::ContainerUnknown as i32
     );
 }
 
@@ -885,14 +887,17 @@ async fn task_59_2_hung_cleanup_delete_is_bounded() {
         .expect("list")
         .into_inner();
         if let Some(c) = resp.containers.first()
-            && c.state == S::ContainerExited as i32
+            && c.state == S::ContainerUnknown as i32
         {
             break c.id.clone();
         }
         assert!(std::time::Instant::now() < deadline, "worker must finish");
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    assert_eq!(status(&service, &id).await.state, S::ContainerExited as i32);
+    assert_eq!(
+        status(&service, &id).await.state,
+        S::ContainerUnknown as i32
+    );
     h.runtime.hold_delete.store(false, Ordering::SeqCst);
 }
 
@@ -934,6 +939,36 @@ async fn task_59_3_pending_stop_container_is_rejected_with_runtime() {
         S::ContainerRunning as i32
     );
     assert_eq!(h.runtime.calls().len(), 2);
+}
+
+/// CRI-1・REPAIR-3: Created のみ(Start 前)のコンテナでも、init が fork 済みの可能性があるため
+/// StopPodSandbox を TASK-59.3 まで拒否する。
+#[tokio::test]
+async fn task_59_3_stop_sandbox_with_created_only_container_is_rejected() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    let err = stop_sb(&h.service, &sb).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(
+        status(&h.service, &id).await.state,
+        S::ContainerCreated as i32
+    );
+}
+
+/// CRI-1・REPAIR-3: Create 実行中(in_flight)の sandbox の停止も拒否する(停止後に create が完了する競合の防止)。
+#[tokio::test]
+async fn task_59_3_stop_sandbox_during_create_is_rejected() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    h.runtime.hold_create.store(true, Ordering::SeqCst);
+    let (created, stop) = tokio::join!(create(&h.service, &sb, "c"), async {
+        let r = stop_sb(&h.service, &sb).await;
+        h.runtime.hold_create.store(false, Ordering::SeqCst);
+        r
+    });
+    created.expect("create");
+    assert_eq!(stop.unwrap_err().code(), Code::FailedPrecondition);
 }
 
 /// CRI-1・REPAIR-3: 実行層のコンテナを含む sandbox の StopPodSandbox も TASK-59.3 まで拒否する。
@@ -993,7 +1028,7 @@ async fn cri_2_repair_5_start_failure_with_creating_state_is_not_definite() {
     start(&h.service, &id).await.expect_err("start");
     assert_eq!(
         status(&h.service, &id).await.state,
-        S::ContainerExited as i32
+        S::ContainerUnknown as i32
     );
 }
 
@@ -1012,6 +1047,34 @@ async fn cri_2_repair_5_start_returning_creating_marks_exited() {
     );
     assert_eq!(
         status(&h.service, &id).await.state,
-        S::ContainerExited as i32
+        S::ContainerUnknown as i32
     );
+}
+
+/// CRI-2・REPAIR-5: Create の結果不明(Timeout)も CONTAINER_UNKNOWN で保持し、exit_code・finished_at を設定せず、
+/// Start・Stop・Remove を拒否する。
+#[tokio::test]
+async fn cri_2_repair_5_ambiguous_create_is_unknown_and_rejects_operations() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    *h.runtime.fail_create.lock().unwrap() = Some(ErrorCode::Timeout);
+    create(&h.service, &sb, "c").await.expect_err("create");
+    let resp = RuntimeService::list_containers(
+        &h.service,
+        Request::new(v1::ListContainersRequest::default()),
+    )
+    .await
+    .expect("list")
+    .into_inner();
+    let id = resp.containers[0].id.clone();
+    let st = status(&h.service, &id).await;
+    assert_eq!(st.state, S::ContainerUnknown as i32);
+    assert_eq!((st.finished_at, st.exit_code), (0, 0));
+    for r in [
+        start(&h.service, &id).await,
+        stop_c(&h.service, &id).await,
+        remove(&h.service, &id).await,
+    ] {
+        assert_eq!(r.unwrap_err().code(), Code::FailedPrecondition);
+    }
 }

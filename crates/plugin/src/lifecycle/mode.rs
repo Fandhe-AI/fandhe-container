@@ -28,7 +28,7 @@
 //!
 //! - 期限は各モード固有の型（[`OneShotTimeout`]・[`ResidentStartTimeout`]・[`RpcTimeout`]）を
 //!   [`PluginMode`] が保持する。無期限待ちや 0 / 上限超過は構築できない（REPAIR-5）。
-//! - 子プロセスの回収・socket の後始末・stderr の扱い・環境変数の遮断は各モードの契約に従う。
+//! - 子プロセスの回収・socket の後始末・stderr の扱い・環境変数の遮断は各モードの契約に従う（`OneShotPlugin::with_env` の組はどちらのモードでも渡る）。
 //!   [`PluginSession`] の破棄でも、常駐の子は [`ResidentPlugin`] の `Drop` で kill・回収される。
 //! - 非 unix では既存 API の挙動をそのまま伝播する（都度起動は `start` が成功し `call` が
 //!   `Unimplemented`、常駐は `start` が `Unimplemented`）。

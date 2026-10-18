@@ -123,7 +123,7 @@ mod linux {
     use fandhe_container_oci::registry::{RegistryClient, RegistryClientConfig, RegistryEndpoint};
     use serde_json::{Value, json};
 
-    /// 既定のイメージ（`--image` も環境変数も無いとき）。最終的な選定は #421（TASK-55.2）で行う。
+    /// 既定のイメージ（`--image` も環境変数も無いとき）。alpine・debian:bookworm-slim は単一レイヤー、nginx:alpine は複数レイヤー。選定は #421（TASK-55.2）で確定し、結果は docs/design/measurements/oci-pull-e2e-local.md に記録。
     const DEFAULT_IMAGES: &[(&str, &[&str])] = &[
         ("alpine", &[]),
         ("debian:bookworm-slim", &["/bin/true"]),

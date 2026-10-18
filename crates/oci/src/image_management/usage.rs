@@ -14,8 +14,10 @@
 //! 報告するサイズは digest 検証を兼ねない（内容の検証済みを装わない）。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）: 展開後サイズ、コンテナ（rootfs・bundle は core の領域）と
-//! ステージング（#474 で配置確定後）の使用容量、CLI 経路（`image ls` / `system df` のサブコマンド）、
-//! 計装。
+//! ステージング（#474 で配置確定後）の使用容量、CLI 経路（`image ls` / `system df` のサブコマンド）。
+//!
+//! 計装（REPAIR-4）: `list_images_with` / `disk_usage_with` が `OciOpRecorder` へ成功・失敗と
+//! 所要時間を渡す。`list_images` / `disk_usage` は何も記録しない `NoopOciOpRecorder` 版。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -24,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use super::{ReferenceTable, TagKey};
 use crate::error::{OciError, OciErrorCode};
+use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 use crate::reference::Digest;
 
 /// `blobs/sha256` 走査で数えるエントリ数の上限（無制限の走査を避ける。100 万件超は異常とみなす）。
@@ -158,9 +161,22 @@ impl ReferenceTable {
     /// `blobs` / `blobs/sha256` が symlink・非ディレクトリなら `system df` と同様に辿らず
     /// `FailedPrecondition`（存在しない場合は全 blob が欠損扱い）。
     pub fn list_images(&self, root: &Path) -> Result<ImageList, OciError> {
-        if checked_dir(&root.join("blobs"))? {
-            checked_dir(&blob_dir(root))?;
-        }
+        self.list_images_with(&NoopOciOpRecorder, root)
+    }
+
+    /// 計装つきの `list_images`（エラー終了も含め結果と所要時間を記録する。REPAIR-4）。
+    pub fn list_images_with(
+        &self,
+        recorder: &dyn OciOpRecorder,
+        root: &Path,
+    ) -> Result<ImageList, OciError> {
+        record_oci_op(recorder, OciOpKind::ListImages, || {
+            self.list_images_inner(root)
+        })
+    }
+
+    fn list_images_inner(&self, root: &Path) -> Result<ImageList, OciError> {
+        check_blob_dirs(root)?;
         let mut cache = SizeCache::new(root);
         let mut per_manifest: BTreeMap<&Digest, (u64, Vec<Digest>)> = BTreeMap::new();
         for (digest, comp) in self.manifests() {
@@ -207,6 +223,23 @@ impl ReferenceTable {
     /// `blobs` / `blobs/sha256` が symlink・非ディレクトリなら辿らず `FailedPrecondition`。
     /// 走査が `MAX_CACHE_SCAN_ENTRIES` を超えたら `ResourceExhausted`。
     pub fn disk_usage(&self, root: &Path) -> Result<DiskUsage, OciError> {
+        self.disk_usage_with(&NoopOciOpRecorder, root)
+    }
+
+    /// 計装つきの `disk_usage`（エラー終了も含め結果と所要時間を記録する。REPAIR-4）。
+    pub fn disk_usage_with(
+        &self,
+        recorder: &dyn OciOpRecorder,
+        root: &Path,
+    ) -> Result<DiskUsage, OciError> {
+        record_oci_op(recorder, OciOpKind::DiskUsage, || {
+            self.disk_usage_inner(root)
+        })
+    }
+
+    fn disk_usage_inner(&self, root: &Path) -> Result<DiskUsage, OciError> {
+        // blob を stat する前にディレクトリ構成を検証する（symlink・非ディレクトリは辿らず拒否）。
+        let dirs_exist = check_blob_dirs(root)?;
         let mut cache = SizeCache::new(root);
         let mut union: BTreeSet<&Digest> = BTreeSet::new();
         let mut count = 0usize;
@@ -218,18 +251,29 @@ impl ReferenceTable {
             count,
             ..ImageUsage::default()
         };
+        // 保護対象 blob（参照のある manifest の構成と、pull リース付き blob）を先に一度だけ集める。
+        let mut protected: BTreeSet<&Digest> = self.pull_leases.keys().collect();
+        for (digest, comp) in self.manifests() {
+            if self.manifest_references(digest).is_referenced() {
+                protected.extend(comp.blobs());
+            }
+        }
         for blob in &union {
             match cache.get(blob)? {
                 Some(n) => {
                     images.bytes = add(images.bytes, n)?;
-                    if !self.blob_references(blob).is_referenced() {
+                    if !protected.contains(blob) {
                         images.reclaimable_bytes = add(images.reclaimable_bytes, n)?;
                     }
                 }
                 None => images.missing_blobs += 1,
             }
         }
-        let cache_usage = scan_cache(root, &union)?;
+        let cache_usage = if dirs_exist {
+            scan_cache(root, &union)?
+        } else {
+            CacheUsage::default()
+        };
         Ok(DiskUsage {
             images,
             cache: cache_usage,
@@ -254,11 +298,14 @@ fn checked_dir(path: &Path) -> Result<bool, OciError> {
     }
 }
 
+/// `blobs` と `blobs/sha256` を検証する。両方が通常ディレクトリなら `Ok(true)`、
+/// どちらかが存在しなければ `Ok(false)`、symlink・非ディレクトリは `FailedPrecondition`。
+fn check_blob_dirs(root: &Path) -> Result<bool, OciError> {
+    Ok(checked_dir(&root.join("blobs"))? && checked_dir(&blob_dir(root))?)
+}
+
 fn scan_cache(root: &Path, registered: &BTreeSet<&Digest>) -> Result<CacheUsage, OciError> {
     let mut usage = CacheUsage::default();
-    if !checked_dir(&root.join("blobs"))? || !checked_dir(&blob_dir(root))? {
-        return Ok(usage);
-    }
     let rd = fs::read_dir(blob_dir(root))
         .map_err(|_| err(OciErrorCode::Internal, "failed to read blob directory"))?;
     let mut seen = 0usize;
@@ -272,12 +319,22 @@ fn scan_cache(root: &Path, registered: &BTreeSet<&Digest>) -> Result<CacheUsage,
         }
         let ent = ent.map_err(|_| err(OciErrorCode::Internal, "failed to read blob entry"))?;
         let name = ent.file_name();
-        let meta = fs::symlink_metadata(ent.path());
-        let (Some(name), Ok(meta)) = (name.to_str(), meta) else {
+        let Some(name) = name.to_str() else {
             usage.foreign_entries += 1;
             continue;
         };
-        if !is_hex64(name) || !meta.is_file() {
+        // 名前が blob でないものは stat せず foreign。計測失敗（権限・I/O）は過少計上せず失敗にする。
+        if !is_hex64(name) {
+            usage.foreign_entries += 1;
+            continue;
+        }
+        let meta = match fs::symlink_metadata(ent.path()) {
+            Ok(m) => m,
+            // 列挙後に消えた blob は存在しないものとして扱う。
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(_) => return Err(err(OciErrorCode::Internal, "failed to stat blob entry")),
+        };
+        if !meta.is_file() {
             usage.foreign_entries += 1;
             continue;
         }
@@ -479,6 +536,92 @@ mod tests {
         std::os::unix::fs::symlink(&other, blob_dir(&root.0)).unwrap();
         let e = ReferenceTable::new().disk_usage(&root.0).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    }
+
+    /// OCI-7: `blobs/sha256` が通常ファイルでも `system df` は Internal でなく FailedPrecondition。
+    #[test]
+    fn oci7_df_rejects_non_directory_blob_dir_before_stat() {
+        let root = Root::new("df-file-dir");
+        let t = fixture(&root);
+        fs::remove_dir_all(blob_dir(&root.0)).unwrap();
+        fs::write(blob_dir(&root.0), b"x").unwrap();
+        let e = t.disk_usage(&root.0).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    }
+
+    /// OCI-7: `blobs` が通常ファイルでも FailedPrecondition。
+    #[test]
+    fn oci7_df_rejects_non_directory_blobs() {
+        let root = Root::new("df-file-blobs");
+        let t = fixture(&root);
+        fs::remove_dir_all(root.0.join("blobs")).unwrap();
+        fs::write(root.0.join("blobs"), b"x").unwrap();
+        let e = t.disk_usage(&root.0).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    }
+
+    /// OCI-7: blob の stat が権限不足で失敗したら過少計上せず Internal で失敗する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_df_stat_failure_is_error_not_undercount() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new("df-noperm");
+        let t = ReferenceTable::new();
+        root.put(&d(0x99), 500);
+        let dir = blob_dir(&root.0);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o444)).unwrap();
+        let r = t.disk_usage(&root.0);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        // root 実行など権限が効かない環境では成功して正しい値になる。
+        match r {
+            Err(e) => assert_eq!(e.code(), OciErrorCode::Internal),
+            Ok(u) => assert_eq!(u.cache.bytes, 500),
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Collect(std::sync::Mutex<Vec<crate::instrument::OciOpSample>>);
+    impl OciOpRecorder for Collect {
+        fn record_oci_op(&self, s: &crate::instrument::OciOpSample) {
+            self.0.lock().unwrap().push(*s);
+        }
+    }
+
+    /// REPAIR-4: 成功と失敗の両方で種別・結果・エラー code を 1 件ずつ記録する。
+    #[test]
+    fn repair4_ls_and_df_record_success_and_failure() {
+        use crate::instrument::OciOpOutcome;
+        let root = Root::new("instr");
+        let t = fixture(&root);
+        let rec = Collect::default();
+        t.list_images_with(&rec, &root.0).unwrap();
+        t.disk_usage_with(&rec, &root.0).unwrap();
+        fs::remove_dir_all(blob_dir(&root.0)).unwrap();
+        fs::write(blob_dir(&root.0), b"x").unwrap();
+        t.list_images_with(&rec, &root.0).unwrap_err();
+        t.disk_usage_with(&rec, &root.0).unwrap_err();
+        let v = rec.0.lock().unwrap();
+        let got: Vec<_> = v
+            .iter()
+            .map(|s| (s.kind(), s.outcome(), s.error_code()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (OciOpKind::ListImages, OciOpOutcome::Success, None),
+                (OciOpKind::DiskUsage, OciOpOutcome::Success, None),
+                (
+                    OciOpKind::ListImages,
+                    OciOpOutcome::Failure,
+                    Some(OciErrorCode::FailedPrecondition)
+                ),
+                (
+                    OciOpKind::DiskUsage,
+                    OciOpOutcome::Failure,
+                    Some(OciErrorCode::FailedPrecondition)
+                ),
+            ]
+        );
     }
 
     /// OCI-7: `image ls` も symlink の blob ディレクトリを辿らず拒否する（`system df` と一貫）。

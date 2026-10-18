@@ -36,6 +36,10 @@ pub enum OciOpKind {
     DecompressLayer,
     /// レイヤー tar のルート配下への展開（TASK-52.3）。
     ExtractLayer,
+    /// `image ls` 相当の一覧集計（TASK-183.3・OCI-7）。
+    ListImages,
+    /// `system df` 相当の使用容量集計（TASK-183.3・OCI-7）。
+    DiskUsage,
 }
 
 impl OciOpKind {
@@ -51,6 +55,8 @@ impl OciOpKind {
             OciOpKind::VerifyBlobDigest => "oci.blob.verify",
             OciOpKind::DecompressLayer => "oci.layer.decompress",
             OciOpKind::ExtractLayer => "oci.layer.extract",
+            OciOpKind::ListImages => "oci.image.list",
+            OciOpKind::DiskUsage => "oci.image.df",
         }
     }
 }

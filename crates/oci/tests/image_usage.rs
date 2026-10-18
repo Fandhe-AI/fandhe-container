@@ -97,3 +97,15 @@ fn oci7_ls_returns_repository_tag_digest_size() {
     assert_eq!(e.size_bytes, 4096 + 123_457 + 10_000);
     assert!(e.missing_blobs.is_empty());
 }
+
+/// OCI-7: `blobs/sha256` が通常ファイルなら `system df` は FailedPrecondition（公開契約）。
+#[test]
+fn oci7_df_non_directory_blob_dir_is_failed_precondition() {
+    use fandhe_container_oci::error::OciErrorCode;
+    let f = fixture("df-notdir");
+    let dir = f.root.join("blobs").join("sha256");
+    fs::remove_dir_all(&dir).expect("rm");
+    fs::write(&dir, b"x").expect("file");
+    let e = f.table.disk_usage(&f.root).expect_err("must fail");
+    assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+}

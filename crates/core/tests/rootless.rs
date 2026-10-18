@@ -80,13 +80,22 @@ mod real_entry;
 
 #[cfg(target_os = "linux")]
 fn main() {
-    if std::env::args().any(|a| a == "--entry") {
+    let args: Vec<String> = std::env::args().collect();
+    if is_entry_mode(&args) {
         linux::entry_init();
     } else if std::env::args().any(|a| a == "--ignored" || a == "--scenario") {
         linux::run();
     } else {
         println!("rootless: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)");
     }
+}
+
+/// 実エントリポイントへの再入か（CORE-6・REPAIR-12）。コンテナ PID 1 の argv は `/entry --entry init` で、
+/// 第 1 引数（`args[1]`）だけを見る。中間プロセスは `--scenario container ... -- /entry --entry init` と
+/// 同じ語を後方に持つため、引数全体の探索では誤って entry 側に入る。
+#[cfg(target_os = "linux")]
+fn is_entry_mode(args: &[String]) -> bool {
+    args.get(1).is_some_and(|a| a == "--entry")
 }
 
 #[cfg(target_os = "linux")]
@@ -217,6 +226,25 @@ mod linux {
 
     pub fn run() {
         let args: Vec<String> = std::env::args().collect();
+        // 中間プロセスの argv は entry モードと判定されない（判定の回帰検出）。
+        let intermediate: Vec<String> = [
+            "x",
+            "--scenario",
+            "container",
+            "--",
+            "/entry",
+            "--entry",
+            "init",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(!super::is_entry_mode(&intermediate));
+        let pid1: Vec<String> = ["/entry", "--entry", "init"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(super::is_entry_mode(&pid1));
         match args.iter().position(|a| a == "--scenario") {
             Some(i) => {
                 let rest: Vec<&str> = args.iter().skip(i + 1).map(String::as_str).collect();

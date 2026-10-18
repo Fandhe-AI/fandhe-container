@@ -657,11 +657,22 @@ fn rollback_in_flight(
             let _ = drop_container_in(registry, id, true);
         }
         InFlightKind::Stop | InFlightKind::Remove => {
+            let finished_at_nanos = if confirmed_exited {
+                now_nanos().unwrap_or(0)
+            } else {
+                0
+            };
             if let Ok(mut registry) = registry.lock()
                 && let Some(record) = registry.containers.get_mut(id)
             {
                 record.in_flight = false;
-                if outcome_unknown {
+                if confirmed_exited && !outcome_unknown {
+                    // 実行層の削除完了後に bundle の解放だけが失敗した（Remove）。
+                    if record.state != ContainerState::Exited {
+                        record.state = ContainerState::Exited;
+                        record.finished_at_nanos = finished_at_nanos;
+                    }
+                } else if outcome_unknown {
                     record.state = ContainerState::Unknown;
                 }
             }
@@ -1434,6 +1445,9 @@ impl CriRuntimeService {
             }
             // 実行層の資源は無い。bundle の解放に失敗したら記録を保持して再試行できるようにする。
             if let Err(status) = bundles.release(&id) {
+                // 実行層の削除は完了している。状態は exited（終了時刻つき）にして記録と件数枠だけを
+                // 再試行用に保持する（実プロセスが消えたのに running と公開し続けない）。
+                guard.mark_confirmed_exited();
                 guard.mark_definitely_failed();
                 return Err(status);
             }
@@ -1445,8 +1459,8 @@ impl CriRuntimeService {
     /// 実行層接続時の `StopPodSandbox`（TASK-59.3・CRI-2）。
     ///
     /// 配下に実行中の操作（`in_flight`）があれば拒否する。それ以外は sandbox を notready にし、配下の
-    /// 実行層経由の running・unknown コンテナを猶予 0（即時 SIGKILL）で停止する。Created の実行層コンテナは
-    /// 変えず（Start は notready で拒否され、資源は Remove の delete で回収する）、スタブ経路の running は
+    /// 実行層経由の running・unknown・created コンテナ（created も init を持ちうる）を猶予 0（即時 SIGKILL）で
+    /// 停止し、確認できなければ成功を返さない。スタブ経路の running は
     /// 記録上 exited にする。1 件でも失敗したら最初のエラーを返し、sandbox は notready のまま残る
     /// （冪等なので再呼び出しで残りを再試行できる）。所要時間の上限は「対象数（`MAX_CONTAINERS` で有界）
     /// × `runtime_timeout`」。
@@ -1486,7 +1500,10 @@ impl CriRuntimeService {
                 .filter(|(_, c)| c.pod_sandbox_id == req.pod_sandbox_id)
             {
                 match (c.runtime_leaked, c.state) {
-                    (true, ContainerState::Running | ContainerState::Unknown) => {
+                    (
+                        true,
+                        ContainerState::Running | ContainerState::Unknown | ContainerState::Created,
+                    ) => {
                         c.in_flight = true;
                         ids.push(id.clone());
                     }
@@ -1540,6 +1557,10 @@ impl CriRuntimeService {
                 return Err(Status::failed_precondition(
                     "container operation in progress",
                 ));
+            }
+            // 子の削除中に並行する CreateContainer が新しい子を足さないよう、先に notready にする。
+            if let Some(record) = registry.records.get_mut(&req.pod_sandbox_id) {
+                record.state = SandboxState::NotReady;
             }
             let mut ids = Vec::new();
             for (id, c) in registry

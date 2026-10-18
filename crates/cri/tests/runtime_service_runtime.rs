@@ -1218,7 +1218,7 @@ async fn task_59_3_stop_timeout_is_bounded_and_worker_finalizes() {
     assert_eq!(state_of(&service, &id).await, S::ContainerExited as i32);
 }
 
-/// CRI-2: StopPodSandbox は配下の running を猶予 0 で停止して notready にする。created は変えず、停止後の Create は拒否する。
+/// CRI-2: StopPodSandbox は配下の running を猶予 0 で停止して notready にする。created も停止して exited にし（init を持ちうる）、停止後の Create は拒否する。
 #[tokio::test]
 async fn task_59_3_stop_sandbox_stops_runtime_containers() {
     let h = harness();
@@ -1227,14 +1227,15 @@ async fn task_59_3_stop_sandbox_stops_runtime_containers() {
     let created_id = create(&h.service, &sb, "c").await.expect("create");
     stop_sb(&h.service, &sb).await.expect("stop sandbox");
     assert!(h.runtime.calls().contains(&format!("stop {run_id} 0s")));
-    assert_eq!(count_calls(&h, "stop "), 1);
+    assert!(h.runtime.calls().contains(&format!("stop {created_id} 0s")));
+    assert_eq!(count_calls(&h, "stop "), 2);
     assert_eq!(
         state_of(&h.service, &run_id).await,
         S::ContainerExited as i32
     );
     assert_eq!(
         state_of(&h.service, &created_id).await,
-        S::ContainerCreated as i32
+        S::ContainerExited as i32
     );
     assert_eq!(
         create(&h.service, &sb, "d").await.unwrap_err().code(),
@@ -1246,7 +1247,7 @@ async fn task_59_3_stop_sandbox_stops_runtime_containers() {
     );
     // 冪等: 再呼び出しは実行層を呼ばない。
     stop_sb(&h.service, &sb).await.expect("again");
-    assert_eq!(count_calls(&h, "stop "), 1);
+    assert_eq!(count_calls(&h, "stop "), 2);
 }
 
 /// CRI-2: StopPodSandbox の一部失敗は最初のエラーを返し、再呼び出しで残りを再試行できる。

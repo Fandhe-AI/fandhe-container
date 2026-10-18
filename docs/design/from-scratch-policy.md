@@ -48,7 +48,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 | `serde_json` | =1.0.151 | JSON（ペイロード・設定。crates/oci のトークン応答パースにも使用。TASK-51.2・#401） | #138 |
 | `sha2` | =0.11.0 | SHA-256（digest 検証） | #278 |
 | `objc2-virtualization` | =0.3.2 | macOS Virtualization.framework（macOS のみ） | #356 |
-| `objc2` | =0.6.4 | Objective-C ランタイム連携（macOS のみ） | #356 |
+| `objc2` | =0.6.5 | Objective-C ランタイム連携（macOS のみ。0.6.5 は aarch64 macOS の release ビルドの use-after-free 修正版〔upstream #861〕） | #356・#1889 |
 | `objc2-foundation` | =0.3.2 | Foundation フレームワーク（macOS のみ） | #356 |
 | `block2` | =0.6.2 | Objective-C block（macOS のみ） | #356 |
 | `dispatch2` | =0.3.1 | libdispatch（macOS のみ） | #356 |

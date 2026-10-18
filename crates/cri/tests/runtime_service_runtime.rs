@@ -15,6 +15,7 @@ use fandhe_container_core::traits::{
     KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
 };
 use fandhe_container_cri::adapter::{BundleProvider, RuntimeAdapter};
+use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::instrument::{CriOpRecorder, CriOpSample, code_name};
 use fandhe_container_cri::runtime::v1::{
     self, ContainerConfig, ContainerMetadata, ContainerState as S, ImageSpec, PodSandboxConfig,
@@ -191,24 +192,24 @@ impl BundleProvider for FakeBundles {
         container_id: &str,
         sandbox_id: &str,
         config: &ContainerConfig,
-    ) -> Result<PathBuf, Status> {
+    ) -> Result<PathBuf, CriError> {
         let name = config.metadata.as_ref().map(|m| m.name.as_str());
         self.calls.lock().unwrap().push(format!(
             "prepare {container_id} {sandbox_id} {}",
             name.unwrap_or("")
         ));
         if self.fail.load(Ordering::SeqCst) {
-            return Err(Status::resource_exhausted("no space"));
+            return Err(CriError::resource_exhausted("no space"));
         }
         Ok(bundle_root().join(container_id))
     }
-    fn release(&self, container_id: &str) -> Result<(), Status> {
+    fn release(&self, container_id: &str) -> Result<(), CriError> {
         self.calls
             .lock()
             .unwrap()
             .push(format!("release {container_id}"));
         if self.fail_release.load(Ordering::SeqCst) {
-            return Err(Status::internal("release failed"));
+            return Err(CriError::internal("release failed"));
         }
         Ok(())
     }
@@ -580,8 +581,7 @@ async fn task_59_2_concurrent_start_reaches_runtime_once() {
 }
 
 /// 停止済み（notready）のサンドボックスへの Create は実行層を呼ばず FAILED_PRECONDITION。
-/// 実行層の資源を持つコンテナが無い sandbox だけが停止できる(TASK-59.3 まで)。Start 側は lib の
-/// `task_59_3_start_in_notready_sandbox_never_reaches_the_runtime` が検証する。
+/// Start 側は lib の `task_59_3_start_in_notready_sandbox_never_reaches_the_runtime` が検証する。
 #[tokio::test]
 async fn task_59_2_notready_sandbox_never_reaches_the_runtime() {
     let h = harness();

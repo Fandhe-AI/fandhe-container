@@ -2,9 +2,9 @@
 //!
 //! 各 RPC ハンドラが返す失敗を [`CriError`]（区分 [`CriErrorCode`] と英語のメッセージ）に集約し、
 //! `?` で `tonic::Status` へ変換できるようにする。区分から gRPC コードへの写像はここ 1 か所に置く。
-//! ハンドラ（`runtime_service`・`image_service`）と `adapter::trait_error_to_status`・
-//! `image_pull` の `From<PullError> for Status` をこの型へ置き換える作業は TASK-97.2（#450）で行う
-//! （本ファイル導入時点では既存の写像は残してある）。
+//! ハンドラ（`runtime_service`・`image_service`）は内部を [`CriError`] で組み立て、tonic トレイトの境界で
+//! `Status` へ変換する。`adapter::trait_error_to_status` と `image_pull` の `From<PullError> for Status` も
+//! この型へ委譲する薄いラッパーである（TASK-97.2・#450 で適用済み）。
 //!
 //! メッセージには要求の中身（config・labels・annotations）や資格情報を含めない。この型は
 //! 受け取った文字列を素通しするだけで、要求データを自分から付け足さない。
@@ -122,6 +122,21 @@ impl CriError {
     /// `UNIMPLEMENTED` のエラーを作る。
     pub fn unimplemented(message: impl Into<String>) -> Self {
         Self::new(CriErrorCode::Unimplemented, message)
+    }
+
+    /// 時間切れ（gRPC では `DEADLINE_EXCEEDED`）のエラーを作る。
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self::new(CriErrorCode::Timeout, message)
+    }
+
+    /// `UNAVAILABLE` のエラーを作る。
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(CriErrorCode::Unavailable, message)
+    }
+
+    /// `RESOURCE_EXHAUSTED` のエラーを作る（ERR-3 の表に無い拡張）。
+    pub fn resource_exhausted(message: impl Into<String>) -> Self {
+        Self::new(CriErrorCode::ResourceExhausted, message)
     }
 
     /// `INTERNAL` のエラーを作る。
@@ -272,6 +287,22 @@ mod tests {
             assert_eq!(c.grpc_code(), g);
             assert_eq!(c.as_str(), s);
             assert_eq!(code_of(CriError::new(c, "m")), g);
+        }
+    }
+
+    /// ERR-3 拡張区分（timeout・unavailable・resource_exhausted）のコンストラクタが対応する gRPC コードへ写ることを確認する。
+    #[test]
+    fn task_97_2_err3_extension_constructors() {
+        let cases = [
+            (CriError::timeout("t"), Code::DeadlineExceeded),
+            (CriError::unavailable("u"), Code::Unavailable),
+            (CriError::resource_exhausted("r"), Code::ResourceExhausted),
+        ];
+        for (e, code) in cases {
+            let msg = e.message().to_owned();
+            let st = Status::from(e);
+            assert_eq!(st.code(), code);
+            assert_eq!(st.message(), msg);
         }
     }
 

@@ -23,7 +23,7 @@
 //! `list_containers` の状態ルート解決では core が `XDG_RUNTIME_DIR` を読む。
 //!
 //! 未実装（REPAIR-3。TASK-118 の後続 sub で扱う）: `start_container` の本番起動（supervisor 起動の
-//! adapter。#1718 待ちで、現状は `UNIMPLEMENTED` を `isError` で返す）、core 側 proxy との結線・UDS 上のフレーミングの確定（TASK-114。現状は改行区切りの暫定契約）、MCP-4 のエラー応答（ERR-5。#469・#470）。
+//! adapter。#1718 待ちで、現状は `UNIMPLEMENTED` を `isError` で返す）、core 側 proxy との結線・UDS 上のフレーミングの確定（TASK-114。現状は改行区切りの暫定契約）。
 
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;

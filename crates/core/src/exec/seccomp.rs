@@ -130,7 +130,7 @@ fn build_default_program() -> Result<SeccompProgram, ExecError> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SeccompEnforcementObservation {
-    /// 適用前の `kcmp(自 pid, 自 pid, KCMP_VM)`（対照。通常は成功し `None`）。
+    /// 適用前の `kcmp(自 pid, 自 pid, KCMP_VM)`（対照。通常は成功し `None`。外側の seccomp が `kcmp` を拒否する環境では `EPERM` になり対照として働かないため、試験は前提欠如として失敗させる。ESC-06・#2006）。
     pub kcmp_before: Option<i32>,
     /// 適用した BPF 命令数。
     pub instructions: usize,
@@ -419,7 +419,8 @@ pub enum EscapeSyscallProbe {
 ///
 /// 現行フィルタは本 3 件を `SECCOMP_RET_KILL_PROCESS` で拒否するため、本関数は戻らず子が SIGSYS で
 /// 終了する（ESC-06 の期待。CORE-5・SEC-2。#1834）。戻るのはフィルタが欠落した場合だけ。
-/// 終了するプロセス自身は監査記録を書けない（SEC-4 の配送経路は別途設計）。
+/// 終了するプロセス自身は監査記録を書けない（SEC-4。正の記録はカーネルの `AUDIT_SECCOMP`、補助は
+/// 親の回収点が出す `exit_signal` レコード。#2004）。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub fn probe_escape_syscall(which: EscapeSyscallProbe) -> ProbeOutcome {

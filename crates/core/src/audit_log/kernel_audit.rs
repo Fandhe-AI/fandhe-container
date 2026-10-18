@@ -42,6 +42,8 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
+//! 本モジュールは送信専用で、カーネルの `AUDIT_SECCOMP` 記録の読み取りは持たない（読むには初期 user
+//! namespace の `CAP_AUDIT_READ` が要り、承認済みの最小権限集合に含まれないため。#2004）。
 //! 常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持、Linux 6.15+ の Landlock カーネル側監査
 //! （`AUDIT_LANDLOCK_*`）によるワークロード拒否の捕捉、supervisor の exec への配線は `FileAuditSink`〔#1594〕で実装済み、CLI への配線は後続タスク。
 
@@ -242,7 +244,8 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         AuditEvent::Seccomp { .. }
         | AuditEvent::ExecTarget { .. }
         | AuditEvent::Entrypoint { .. }
-        | AuditEvent::ControlPeer { .. } => None,
+        | AuditEvent::ControlPeer { .. }
+        | AuditEvent::ExitSignal { .. } => None,
         AuditEvent::Landlock { path, .. } => Some(path),
         AuditEvent::Mount { path, .. } => path.as_ref(),
         AuditEvent::PluginTrust { path, .. } => Some(path),
@@ -255,6 +258,14 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
     if let Some(reason) = record.reason() {
         tail.push_str(" reason=");
         tail.push_str(reason.as_str());
+    }
+    // `exit_signal` 層のみ: 終了シグナルと終了プロセスの PID（数値のみ。ログ注入の余地なし。#2004）。
+    if let AuditEvent::ExitSignal { signal, target_pid } = record.event() {
+        tail.push_str(&format!(
+            " signal={} target_pid={}",
+            signal.get(),
+            target_pid.get()
+        ));
     }
     match record.container_id() {
         Some(id) => {
@@ -625,6 +636,21 @@ mod tests {
             encode_payload(&r).unwrap(),
             "op=fandhe-audit layer=plugin_trust ts=1700000000.000000005 pid=1234 syscall=? arch=? \
              path=2F70 path_truncated=0 path_original_len=2 reason=untrusted_owner container_id=?"
+        );
+    }
+
+    /// SEC-4・ESC-06・#2004: exit_signal は syscall=? arch=? のまま signal と target_pid を末尾に持つ。
+    #[test]
+    fn sec4_2004_payload_exit_signal_has_signal_and_target_pid() {
+        let r = rec(AuditEvent::ExitSignal {
+            signal: crate::audit_log::AuditSignal::new(31).unwrap(),
+            target_pid: crate::audit_log::AuditPid::new(4321).unwrap(),
+        })
+        .with_container_id(crate::traits::ContainerId::new("c1").unwrap());
+        assert_eq!(
+            encode_payload(&r).unwrap(),
+            "op=fandhe-audit layer=exit_signal ts=1700000000.000000005 pid=1234 syscall=? arch=? \
+             path=? path_truncated=? path_original_len=? signal=31 target_pid=4321 container_id=c1"
         );
     }
 

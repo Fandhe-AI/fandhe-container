@@ -28,12 +28,13 @@ use fandhe_container_core::traits::{
     KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
 };
 use fandhe_container_cri::adapter::{BundleProvider, RuntimeAdapter};
+use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::runtime::v1::{
     self, ContainerConfig, ContainerMetadata, ImageSpec, PodSandboxConfig, PodSandboxMetadata,
     runtime_service_server::RuntimeService,
 };
 use fandhe_container_cri::runtime_service::CriRuntimeService;
-use tonic::{Request, Status};
+use tonic::Request;
 
 const NS: [&str; 5] = ["user", "mnt", "uts", "ipc", "net"];
 
@@ -137,10 +138,10 @@ impl ContainerRuntime for UnshareRuntime {
 struct FixedBundle;
 
 impl BundleProvider for FixedBundle {
-    fn prepare(&self, id: &str, _: &str, _: &ContainerConfig) -> Result<PathBuf, Status> {
+    fn prepare(&self, id: &str, _: &str, _: &ContainerConfig) -> Result<PathBuf, CriError> {
         Ok(PathBuf::from("/tmp/unused-bundle").join(id))
     }
-    fn release(&self, _: &str) -> Result<(), Status> {
+    fn release(&self, _: &str) -> Result<(), CriError> {
         Ok(())
     }
 }

@@ -43,6 +43,9 @@
 //!   `crate::signal_forward` が CLI バイナリのシグナルハンドラ上から呼ぶため async-signal-safe であること。#1513・PLUG-7）
 //! - Linux: `prctl(PR_SET_PDEATHSIG, SIGKILL)` と `getppid(2)` を `pre_exec` で呼び、親の強制終了時に plugin 本体を
 //!   止める（#1514・PLUG-7・REPAIR-5・CORE-1。x86_64 / aarch64 のみ。他アーキテクチャは設定しない）
+//! - Linux・macOS: `fcntl(F_DUPFD_CLOEXEC, 3)`（`dup_cloexec_min3`。検証済みファイルの fd を 3 以上かつ close-on-exec で複製する）。
+//!   それ以外の unix は `try_clone`。`lifecycle/launch_target.rs` の `PluginLaunchTarget::from_verified_file` から呼ばれる
+//!   （PLUG-11・#1856）
 //! - それ以外の OS・アーキテクチャ: peer credential を取得できないため `Unimplemented`（fail-closed）
 //!
 //! # 限界（残存リスク。対策は未実装。PLUG-12・#1390）
@@ -57,7 +60,7 @@
 //!
 //! # 契約
 //! - `unsafe fn` は公開しない。公開するのは安全な [`send_signal`]・[`peer_uid`]・[`effective_uid`]・[`fchmodat_nofollow`]・
-//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・[`probe_child_exit`]・[`write_nonblocking`]・（Linux のみ）`set_parent_death_sigkill`・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
+//!   [`unlinkat`]・[`mkdirat`]・[`lstat_at`]・[`open_dir_nofollow`]・[`lock_file_at`]・[`names_open_file`]・[`connect_unix`]・[`kill_process_group`]・[`probe_child_exit`]・[`write_nonblocking`]・`dup_cloexec_min3`・（Linux のみ）`set_parent_death_sigkill`・[`DirStream`]（`open_at`・`next_entry`・`position`）・（macOS のみ）`resident_size_bytes`（いずれも `pub(crate)`）のみ
 //! - fd は `&UnixStream` の借用中のみ渡す（呼び出し中にクローズされない）
 //! - SOL_SOCKET / SO_PEERCRED の定数は `cfg(target_arch)` ごとに個別定義し、流用しない
 //! - Linux の対応 arch は LP64 の x86_64・aarch64 だけ。各 `cfg` は `target_pointer_width = "64"` を併せて条件にし、

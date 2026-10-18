@@ -88,6 +88,12 @@ impl PluginLaunchTarget {
     /// 本番で呼んでよいのは core の `HashVerifiedPluginFile` からの変換 1 か所（#1857）。それ以外で
     /// 呼んでよいのは試験コードだけ。検証は本関数では行わない（呼び出し側の責務。PLUG-11）。
     ///
+    /// 渡す `file` は読み取り専用で開いた fd にすること。保持用の複製は open file description を共有するため、
+    /// 書き込み可能だと Linux の exec が `ETXTBSY` で失敗する（fail-closed）。
+    ///
+    /// 内容の同一性（hash）の確認は呼び出し側の責務。本関数の dev / ino の確認は同一 inode の
+    /// 書き換えを防がない（hash 許可リストの結線は #1857）。
+    ///
     /// 通常ファイルでないもの・`#!` スクリプトは `InvalidArgument`。fd の検査の失敗は `Internal`。
     /// 固定の英語文言で、パスや内容は含めない。
     pub fn from_verified_file(

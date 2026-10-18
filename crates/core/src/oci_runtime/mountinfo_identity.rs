@@ -88,6 +88,24 @@ const DIR_CHAIN_MAX: usize = 4096;
 /// symlink・ディレクトリでない要素・絶対パスでない・[`DIR_CHAIN_MAX`] 段超は `None`（呼び出し側が fail-closed にする）。
 #[cfg(target_os = "linux")]
 pub(crate) fn dir_identity_chain(path: &str) -> Option<Vec<(u64, u64)>> {
+    walk_dir_chain(path).map(|(chain, _leaf)| chain)
+}
+
+/// [`dir_identity_chain`] と同じ辿り方で鎖を作り、辿った末端の fd の属するマウント ID（fdinfo の `mnt_id`）も返す。
+/// overlayfs の層が別の overlay の上にあるか（入れ子。mountinfo の fstype で判定する）を適用の段が見るために使う
+/// （SEC-1・#2166）。末端の fd を固定したまま `mnt_id` を読むため、辿り直しによる差し替えの余地が無い。
+#[cfg(target_os = "linux")]
+pub(crate) fn dir_identity_chain_with_mnt_id(path: &str) -> Option<(Vec<(u64, u64)>, u64)> {
+    use std::os::fd::AsRawFd as _;
+    let (chain, leaf) = walk_dir_chain(path)?;
+    let fdinfo =
+        std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", leaf.as_raw_fd())).ok()?;
+    Some((chain, parse_fdinfo_mnt_id(&fdinfo)?))
+}
+
+/// `dir_identity_chain` の本体。鎖と末端のディレクトリの fd を返す。
+#[cfg(target_os = "linux")]
+fn walk_dir_chain(path: &str) -> Option<(Vec<(u64, u64)>, std::os::fd::OwnedFd)> {
     use std::os::fd::AsFd as _;
     use std::os::unix::fs::MetadataExt as _;
     if !path.starts_with('/') {
@@ -108,7 +126,7 @@ pub(crate) fn dir_identity_chain(path: &str) -> Option<Vec<(u64, u64)>> {
         chain.push(id(&cur)?);
     }
     chain.reverse();
-    Some(chain)
+    Some((chain, cur))
 }
 
 /// Linux 以外では `crate::sys` が無いため固定できない（bind mount は Linux 限定。呼び出し側は fail-closed にする）。
@@ -580,6 +598,23 @@ mod tests {
             None
         );
         assert_eq!(dir_identity_chain("relative/path"), None);
+    }
+
+    /// SEC-1・#2166: 鎖と末端の `mnt_id` を一度に返す。鎖は [`dir_identity_chain`] と同じで、`mnt_id` は `path_mount_id` と一致する。
+    #[test]
+    fn sec1_2166_dir_identity_chain_with_mnt_id_matches_plain_chain() {
+        let tmp = crate::test_support::TestTempDir::new("dir-chain-mnt").expect("temp dir");
+        let leaf = tmp.path().join("a");
+        std::fs::create_dir_all(&leaf).expect("a");
+        let path = leaf.to_str().expect("utf8");
+        let (chain, mnt_id) = dir_identity_chain_with_mnt_id(path).expect("chain");
+        assert_eq!(Some(chain), dir_identity_chain(path));
+        assert_eq!(Some(mnt_id), path_mount_id(path));
+        assert_eq!(dir_identity_chain_with_mnt_id("relative/path"), None);
+        assert_eq!(
+            dir_identity_chain_with_mnt_id(tmp.path().join("nope").to_str().expect("utf8")),
+            None
+        );
     }
 
     /// SEC-1（#1915）: 全体 bind（root が `/`）が状態ルートを含むときも到達と判定する（`/` を祖先として扱う）。

@@ -43,7 +43,7 @@
 //! # 未実装・残余(REPAIR-3)
 //!
 //! - **報告前の PID 1(CORE-2)**: I が PID 1 を作った後、`K` の報告前に停止・終了すると C は pid を知れない。
-//!   I は fork の直前に起動ごとの識別子(`LaunchTag`)を `comm` へ設定し、PID 1 はそれを継承する。C は報告の
+//!   I は `isolate`(範囲写像の mapper の fork)の前に起動ごとの識別子(`LaunchTag`)を `comm` へ設定し、mapper と PID 1 はそれを継承する(期限切れで I だけが殺されても、再親付けされた mapper を同じ探索で回収する)。C は報告の
 //!   無い失敗で I を SIGKILL して回収した後(PID 1 は C へ再親付け済み)、`/proc` から「親が C で `comm` が
 //!   識別子と一致する」子を探して `kill_and_reap` する(`recover_unreported_init`)。I を回収できない場合は
 //!   再親付けが起きないため探索せず、I を `unreaped` で返し、探索できなかった識別子を `rescans` で返す(呼び出し側が
@@ -409,6 +409,11 @@ struct RealIntermediateOps<'a> {
 
 impl IntermediateOps for RealIntermediateOps<'_> {
     fn isolate(&mut self) -> Result<(), ExecError> {
+        // 範囲写像では mapper を I の子として fork する。mapper も識別子を継承させ、起動の期限切れで C が I だけを
+        // 殺した場合に再親付けされた mapper を `rescan_unreported_init` が見つけて回収できるようにする(CORE-2)。
+        // 設定できなければ mapper を作らずに失敗させる(fail-closed)。
+        sys::set_process_comm(self.tag.comm_bytes())
+            .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "set the launch tag"))?;
         match self.plan {
             IntermediatePlan::SingleId(plan) => isolate(plan).map(|_| ()),
             // mapper の fork は flush しない版(I は C の stdio バッファを複製した子。#2009)。

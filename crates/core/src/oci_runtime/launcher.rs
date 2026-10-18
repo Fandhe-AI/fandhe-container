@@ -385,7 +385,7 @@ fn resolve_privilege(
             let uid_ranges =
                 load_subordinate_ids(&source.subuid, &owner_of(euid)?).map_err(|e| fail(e.code))?;
             let gid_ranges =
-                load_subordinate_ids(&source.subgid, &owner_of(egid)?).map_err(|e| fail(e.code))?;
+                load_subordinate_ids(&source.subgid, &owner_of(euid)?).map_err(|e| fail(e.code))?;
             if uid_ranges.is_empty() || gid_ranges.is_empty() {
                 return Err(TraitError::new(
                     ErrorCode::FailedPrecondition,

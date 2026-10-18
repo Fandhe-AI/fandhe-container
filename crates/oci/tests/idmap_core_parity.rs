@@ -1,0 +1,104 @@
+//! oci の `IdMap` と core の `IdMapSet`（#2009・本番 launcher の範囲写像）の検証規則が一致することの機械照合
+//! （SEC-5・OCI-1・#2225・REPAIR-12）。oci は core に依存しない（core は dev-dependency だけ）ため型を共有せず、
+//! 同じ入力の表で受理 / 拒否・拒否の code・受理した写像の結果が食い違わないことをここで確かめる。
+// core の `exec`・`rootless` は Linux 限定のため、この照合も Linux でだけ行う。
+#![cfg(target_os = "linux")]
+
+use fandhe_container_core::exec::IdMapping;
+use fandhe_container_core::rootless::IdMapSet;
+use fandhe_container_oci::layer::idmap::{IdMap, IdRange};
+
+fn r(c: u32, h: u32, n: u32) -> (u32, u32, u32) {
+    (c, h, n)
+}
+
+fn table() -> Vec<Vec<(u32, u32, u32)>> {
+    let mut t = vec![
+        vec![],
+        vec![r(0, 1000, 1)],
+        vec![r(0, 100_000, 1), r(1, 100_001, 65_535)],
+        vec![r(0, 1, 0)],
+        vec![r(0, 0, 1)],
+        vec![r(0, 100_000, 1), r(1, 0, 5)],
+        vec![r(1, 1000, 5)],
+        vec![r(0, 10, 5), r(1, 100, 1)],
+        vec![r(0, 10, 5), r(100, 12, 1)],
+        vec![r(0, 1, u32::MAX)],
+        vec![r(0, 1, u32::MAX), r(u32::MAX, 5, 2)],
+        vec![r(0, u32::MAX, 1)],
+        vec![r(0, u32::MAX, 2)],
+        vec![r(0, 5, 1), r(u32::MAX - 1, u32::MAX - 1, 2)],
+        vec![r(0, 5, 1), r(10, 20, 5), r(20, 30, 5)],
+    ];
+    // 行数の上限の前後（340 行は受理、341 行は拒否）。
+    for n in [340u32, 341] {
+        t.push((0..n).map(|i| r(i, 1000 + i, 1)).collect());
+    }
+    t
+}
+
+/// 受理 / 拒否・拒否の code・受理した写像の `map_to_host` / `host_id_of` が core と一致する。
+#[test]
+fn sec5_idmap_matches_core_idmapset() {
+    let probes = [
+        0u32,
+        1,
+        2,
+        4,
+        5,
+        33,
+        99,
+        100,
+        339,
+        340,
+        1000,
+        65_535,
+        65_536,
+        70_000,
+        u32::MAX - 1,
+        u32::MAX,
+    ];
+    let mut accepted = 0;
+    let mut rejected = 0;
+    for (i, lines) in table().into_iter().enumerate() {
+        let core = IdMapSet::new(
+            lines
+                .iter()
+                .map(|&(c, h, n)| IdMapping {
+                    container_id: c,
+                    host_id: h,
+                    count: n,
+                })
+                .collect(),
+        );
+        let oci = IdMap::new(
+            lines
+                .iter()
+                .map(|&(c, h, n)| IdRange {
+                    container_id: c,
+                    host_id: h,
+                    count: n,
+                })
+                .collect(),
+        );
+        match (core, oci) {
+            (Ok(c), Ok(o)) => {
+                accepted += 1;
+                for p in probes {
+                    assert_eq!(o.map_to_host(p), c.host_id_of(p), "case {i} probe {p}");
+                }
+            }
+            (Err(c), Err(o)) => {
+                rejected += 1;
+                assert_eq!(
+                    format!("{:?}", c.code),
+                    format!("{:?}", o.code()),
+                    "case {i} error code"
+                );
+            }
+            (c, o) => panic!("case {i}: core={c:?} oci={o:?}"),
+        }
+    }
+    // 表が片側に偏っていないこと（受理と拒否の両方を照合している）。
+    assert_eq!((accepted, rejected), (7, 10));
+}

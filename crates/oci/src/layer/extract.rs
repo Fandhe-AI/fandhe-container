@@ -77,10 +77,34 @@
 //! - 判定は FS の解決結果だけに依るため、Windows の 8.3 短縮名のような他の別名も同じ経路で拒否されるはずだが、
 //!   試験で確かめているのは大文字小文字と NFC / NFD だけである。
 //!
+//! # 所有者の適用（chown。SEC-5・OCI-1・#2225）
+//! 既定（`OwnershipPolicy::Keep`）は `chown` せず、展開物は実行ユーザー所有になる。`OwnershipPolicy::ChownMapped`
+//! （複数行の写像 `IdMap`）を `ExtractOptions` に入れた呼び出しだけが、tar の uid / gid（コンテナ内 ID）を写像で
+//! ホストの ID へ写して `chown` する。
+//!
+//! - 呼び出し側の契約: 展開するプロセスは初期 user namespace にいて `CAP_CHOWN` を持つ（典型はホスト root）。
+//!   ホストの非特権ユーザーは subuid 範囲の ID へ `chown` できず、`EPERM` は `PermissionDenied` で失敗する。
+//!   写像はコンテナを起動するときの user namespace の写像（core の `rootless_mapping`・`/etc/subuid` から作ったもの）と
+//!   同じものを渡す。非 Linux は展開の開始前に `Unimplemented` で拒否する（黙って飛ばさない）。
+//! - 検証: 写像に無い ID は `PermissionDenied`、解析できない ID は `InvalidArgument`。パス 1 で
+//!   そのレイヤーの書き込みより前に拒否する（グローバル PAX の取り込みもパス 3 と同じ規則）。
+//! - 順序: 通常ファイルは書き込み後に `fchown` し、所有者を読み戻して一致を確かめてから（不一致は
+//!   `FailedPrecondition`）`fchmod` する（Linux は `chown` で setuid / setgid を落とすため）。ディレクトリは子の作成を
+//!   妨げないよう全レイヤーの後に深い順で `lchown` し、その直後に mode を適用する。symlink は `lchown`（追従しない）。
+//!   tar に所有者が無い暗黙のディレクトリはコンテナ内 0:0 を写した ID にする。`root` 自身も最後にコンテナ内 0:0 を
+//!   写した ID へ `chown` する（mode は 0700 のまま）。
+//! - hardlink は `chown` しない。inode を共有するため、参照先の所有者と特殊ビットを書き換えないためで、所有者は
+//!   参照先のエントリのものになる。
+//! - PAX の `uname` / `gname` は使わない（読まない）。数値の uid / gid だけを正とする。名前はイメージの
+//!   `/etc/passwd` に属し、ホストの NSS で引くと別のユーザーに写りうるため。
+//! - tar の xattr（`security.capability` 等）は扱わない。
+//!
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
-//! - uid / gid の適用（`chown`・subuid の複数範囲への写像・rootful）（SEC-5）。展開物は実行ユーザー所有になる。
-//! - rootful（ホスト uid 0）で通常ファイルの setuid / setgid を残す経路。`chown` と idmap が入るまで常に落とす。
+//! - rootless で写像済みの user namespace の中から展開する経路（ns 内の ID の見え方と特殊ビットの条件の再設計が要る）。
+//!   `PreserveIfOwnerMapped`（`chown` しない 1 行の写像）は従来どおり。
+//! - 0700 の祖先ディレクトリで閉じ込めを判定する方式。`root` が 0700 のため、複数範囲の写像でもコンテナ内の
+//!   非 root ユーザーは `/` を辿れない。
 //!
 //! # 通常ファイルの setuid / setgid / sticky（SEC-5・SEC-1・#1810）
 //! 既定（`SpecialBitsPolicy::Strip`）は下位 9 ビット（`FILE_MODE_MASK`）だけを適用し、落とした件数を
@@ -94,6 +118,15 @@
 //! - setgid: 同様に gid で判定すること。
 //! - sticky: 上記のポリシー全体の条件を満たすこと。
 //! - 適用後に mode を読み戻し、ビットが残っていなければ適用したことにしない。
+//!
+//! `SpecialBitsPolicy::PreserveIfChowned`（`ChownMapped` と組み合わせたときだけ有効。`Keep` との組み合わせは開始前に
+//! `InvalidArgument`）は rootful で残す経路で、`chown` と読み戻しの後の所有者で判定する。条件は次のとおり。
+//! - ホストが Linux で、`root` が 0700（group / other に権限なし）であること。
+//! - setuid: 読み戻した所有 uid が 0 でなく、`uid.map_to_host(tar の uid)` と一致すること。setgid は gid で同様。
+//! - sticky: 上記のポリシー全体の条件を満たすこと。「`root` の所有 uid と一致」の共通条件は使わない
+//!   （`chown` 後の所有者は写像先のため）。
+//! - 根拠: `IdMap` はホスト ID 0 を含む写像を拒否するため、残る setuid / setgid はホスト上で非特権の subuid / subgid
+//!   にしか効かず、`root` が 0700 なのでほかのホストユーザーは辿れない。
 //!
 //! ディレクトリの mode（sticky・setgid を含む）はポリシーに関係なくそのまま適用する。
 //! - ディレクトリ fd 起点（`openat2` の `RESOLVE_IN_ROOT` 等）の解決。libc 系の依存承認後の後続課題。
@@ -109,6 +142,7 @@ use std::path::{Component, Path, PathBuf};
 
 use tar::{Archive, EntryType};
 
+pub use super::idmap::{IdMap, IdRange};
 use super::{
     DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, GzipLayerReader, oci_error_from_layer_io, open_gzip_layer,
 };
@@ -202,37 +236,13 @@ pub struct ExtractedLayer {
     pub files_with_stripped_special_bits: u64,
     /// 特殊ビットのポリシーの判定と、保持した件数（#1810）。
     pub special_bits: SpecialBitsOutcome,
-}
-
-/// uid / gid の 1 行の写像（コンテナ内 `container_id` から `count` 個を host の `host_id` 以降へ）。
-///
-/// core の `IdMapping`（`container_id host_id count`）と同じ意味。oci は core に依存しないため型は共有せず、
-/// 呼び出し元がコンテナの user namespace の写像から作って渡す。複数行の写像は `chown` の導入時に拡張する（SEC-5）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IdRange {
-    /// コンテナ内の開始 ID。
-    pub container_id: u32,
-    /// ホストの開始 ID。
-    pub host_id: u32,
-    /// 範囲の長さ。
-    pub count: u32,
-}
-
-impl IdRange {
-    /// コンテナ内の `id` に対応する host の ID。範囲外・オーバーフローは `None`（checked 演算）。
-    #[must_use]
-    pub fn map_to_host(&self, id: u32) -> Option<u32> {
-        let off = id.checked_sub(self.container_id)?;
-        if off >= self.count {
-            return None;
-        }
-        self.host_id.checked_add(off)
-    }
+    /// 所有者の適用（`chown`）の判定と件数（#2225・SEC-5）。
+    pub ownership: OwnershipOutcome,
 }
 
 /// 通常ファイルの setuid / setgid / sticky の扱い（SEC-5・SEC-1・#1810）。既定は `Strip`。
 ///
-/// 展開の入口 `extract_layers_with_policy` / `extract_layer_blobs_with_policy` が受け取る。呼び出し元は、
+/// 展開の入口 `extract_layers_with_policy` / `extract_layer_blobs_with_policy`（と `*_with_options` の `ExtractOptions`）が受け取る。呼び出し元は、
 /// rootfs を排他的に所有し、展開から rootfs として使い終わるまで `root` を 0700 に保つこと（権限の後からの
 /// 変更〔TOCTOU〕は防げない）。コンテナ内で setuid が効くかは `process.noNewPrivileges` に依り、本ポリシーは
 /// ビットの保持までを扱う。
@@ -244,13 +254,99 @@ pub enum SpecialBitsPolicy {
     Strip,
     /// 所有者が user namespace の写像に収まるファイルだけ、tar の値を適用する。条件はモジュール冒頭を参照。
     ///
-    /// 未実装（REPAIR-3）: rootful（ホスト uid 0）の経路は `chown` / idmap が入るまで常に落とす。
+    /// `chown` しない 1 行の写像の経路（rootless）。rootful（ホスト uid 0）は所有 uid が 0 のため常に落とす。
+    /// rootful で残す経路は `PreserveIfChowned`。
     PreserveIfOwnerMapped {
         /// uid の写像。
         uid: IdRange,
         /// gid の写像。
         gid: IdRange,
     },
+    /// rootful（`OwnershipPolicy::ChownMapped` で subuid 範囲へ `chown` する展開）で、`chown` と読み戻しの後の
+    /// 所有者が写像と一致するファイルだけ、tar の値を適用する（#2225・SEC-5・SEC-1）。
+    ///
+    /// `OwnershipPolicy::ChownMapped` と組み合わせたときだけ有効で、`Keep` との組み合わせは展開の開始前に
+    /// `InvalidArgument` で拒否する（副作用なし）。条件はモジュール冒頭「rootful で特殊ビットを残す条件」を参照。
+    PreserveIfChowned,
+}
+
+/// 展開物の所有者（uid / gid）の扱い（SEC-5・#2225）。既定は `Keep`。
+///
+/// `ChownMapped` は tar のコンテナ内 ID を写像でホストの ID へ写して `chown` する。ホストの非特権ユーザーは
+/// subuid 範囲の ID へ `chown` できない（`EPERM`）ため、呼び出し側は初期 user namespace で `CAP_CHOWN` を持つ
+/// プロセス（典型はホスト root）から使う。権限が無く範囲外の ID へ `chown` すると `PermissionDenied` で失敗する
+/// （fail-closed）。非 Linux では展開の開始前に `Unimplemented` で拒否する。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum OwnershipPolicy {
+    /// `chown` しない（展開物は実行ユーザー所有。従来の挙動）。
+    #[default]
+    Keep,
+    /// tar の uid / gid を写像でホストの ID へ写して `chown` する。写像に無い ID は `PermissionDenied`、
+    /// 解析できない ID は `InvalidArgument` で、そのレイヤーの書き込みより前に拒否する。
+    ChownMapped {
+        /// uid の写像。
+        uid: IdMap,
+        /// gid の写像。
+        gid: IdMap,
+    },
+}
+
+/// 展開の選択肢（所有者・特殊ビット）。将来の項目追加に備え `non_exhaustive`。
+///
+/// `extract_layers_with_options` / `extract_layer_blobs_with_options` が受け取る。既定は従来の挙動
+/// （`chown` しない・特殊ビットは落とす）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ExtractOptions {
+    /// 所有者の扱い。
+    pub ownership: OwnershipPolicy,
+    /// 通常ファイルの特殊ビットの扱い。
+    pub special_bits: SpecialBitsPolicy,
+}
+
+impl ExtractOptions {
+    /// 既定の選択肢（`chown` しない・特殊ビットは落とす）。
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 所有者の扱いを設定する。
+    #[must_use]
+    pub fn with_ownership(mut self, ownership: OwnershipPolicy) -> Self {
+        self.ownership = ownership;
+        self
+    }
+
+    /// 特殊ビットの扱いを設定する。
+    #[must_use]
+    pub fn with_special_bits(mut self, special_bits: SpecialBitsPolicy) -> Self {
+        self.special_bits = special_bits;
+        self
+    }
+}
+
+/// 所有者の適用の判定（REPAIR-4: 機械可読）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OwnershipDecision {
+    /// `OwnershipPolicy::Keep` のため `chown` しなかった。
+    NotRequested,
+    /// `OwnershipPolicy::ChownMapped` に従って `chown` した。
+    Applied,
+}
+
+/// 所有者の適用の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OwnershipOutcome {
+    /// ポリシー全体の判定。
+    pub decision: OwnershipDecision,
+    /// `chown` を実行したノード数（通常ファイル・symlink・ディレクトリ・暗黙のディレクトリ・`root`）。
+    /// ディレクトリと `root` は全レイヤーの展開後にまとめて適用するため、最後のレイヤーの結果に数える。
+    /// hardlink は参照先と inode を共有するため `chown` せず、数えない。
+    pub chowned_entries: u64,
 }
 
 /// ポリシー全体の判定結果（REPAIR-4: 機械可読）。
@@ -387,13 +483,34 @@ pub fn extract_layers_with_policy<R: Read + Seek>(
     limits: ExtractLimits,
     policy: SpecialBitsPolicy,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_layers_with_options(
+        recorder,
+        layers,
+        root,
+        limits,
+        &ExtractOptions::new().with_special_bits(policy),
+    )
+}
+
+/// `extract_layers_with` に所有者（`chown`）と特殊ビットの選択肢を足した版（SEC-5・OCI-1・#2225）。
+///
+/// `options` の契約はモジュール冒頭と `OwnershipPolicy` / `SpecialBitsPolicy` を参照。既定の `ExtractOptions` なら
+/// `extract_layers_with` と同じ。不正な組み合わせ（`PreserveIfChowned` を `Keep` と組む等）・非 Linux の
+/// `ChownMapped` は、`root` に触れる前に拒否する。
+pub fn extract_layers_with_options<R: Read + Seek>(
+    recorder: &dyn OciOpRecorder,
+    layers: impl IntoIterator<Item = R>,
+    root: &Path,
+    limits: ExtractLimits,
+    options: &ExtractOptions,
+) -> Result<Vec<ExtractedLayer>, OciError> {
     extract_stack(
         recorder,
         layers.into_iter().map(Rewind::new),
         root,
         limits,
         host_lstat,
-        SpecialSetup::host(policy),
+        SpecialSetup::from_options(options),
     )
 }
 
@@ -443,6 +560,27 @@ pub fn extract_layer_blobs_with_policy(
     limits: ExtractLimits,
     policy: SpecialBitsPolicy,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_layer_blobs_with_options(
+        recorder,
+        blob_paths,
+        root,
+        max_uncompressed_bytes,
+        limits,
+        &ExtractOptions::new().with_special_bits(policy),
+    )
+}
+
+/// `extract_layer_blobs_with` に所有者（`chown`）と特殊ビットの選択肢を足した版（SEC-5・OCI-1・#2225）。
+///
+/// `options` の契約は `extract_layers_with_options` と同じ。
+pub fn extract_layer_blobs_with_options(
+    recorder: &dyn OciOpRecorder,
+    blob_paths: &[&Path],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+    options: &ExtractOptions,
+) -> Result<Vec<ExtractedLayer>, OciError> {
     extract_stack(
         recorder,
         blob_paths.iter().map(|path| GzipBlob {
@@ -452,7 +590,7 @@ pub fn extract_layer_blobs_with_policy(
         root,
         limits,
         host_lstat,
-        SpecialSetup::host(policy),
+        SpecialSetup::from_options(options),
     )
 }
 
@@ -682,6 +820,9 @@ struct ResolvedDir {
     id: u64,
 }
 
+/// 遅延するディレクトリ（物理パス, mode, `chown` 先のホストの (uid, gid)）。
+type DeferredDir = (PathBuf, u32, Option<(u32, u32)>);
+
 /// 親ディレクトリの解決・種別ごとの処理を束ねる状態。
 struct Extractor<'a> {
     root: &'a Path,
@@ -696,7 +837,14 @@ struct Extractor<'a> {
     special: SpecialCtx,
     /// 所有者の rwx が欠けるディレクトリの（物理パス, mode）。子の作成を妨げないよう全レイヤーの処理後に適用する。
     /// キーは `NameIndex` の ID。ディレクトリを削除したら、索引から外した ID の項目も必ず取り除く（`drop_ids`）。
-    deferred_dirs: HashMap<u64, (PathBuf, u32)>,
+    ///
+    /// 第 3 要素は `chown` するホストの (uid, gid)（`ChownMapped` のときだけ `Some`）。ディレクトリの `chown` は
+    /// 子の作成を妨げないよう全レイヤーの後に深い順で行い、その直後に mode を適用する。
+    deferred_dirs: HashMap<u64, DeferredDir>,
+    /// `ChownMapped` のときの写像と `chown` 関数（`None` なら `chown` しない）。
+    own: Option<OwnerCtx>,
+    /// `chown` を実行したノード数。
+    chowned: u64,
     /// この展開が作った名前（IO-5）。
     names: NameIndex,
     /// 現在のレイヤーのパス 3 が作った・属性を定義した・経路として通ったノードの ID（OCI-1・OCI-2）。
@@ -1134,11 +1282,91 @@ fn host_owner(_m: &fs::Metadata) -> (u32, u32) {
     (0, 0)
 }
 
-/// 特殊ビットの扱いの入力（ポリシーと所有者の取得関数）。`extract_stack` の入口で受け取る。
+/// `chown` と所有者の読み戻しを行う関数の組（テストだけが差し替える。`OwnerOf` と同じ形の差し替え口）。
+///
+/// 本番は `std::os::unix::fs::{fchown, lchown}` と fd の metadata。ファイルは開いた fd に対する `fchown`、
+/// symlink とディレクトリは追従しない `lchown` を使い、新しいパス解決の経路は作らない（SEC-5）。
 #[derive(Clone, Copy)]
+struct ChownFns {
+    fchown: fn(&File, u32, u32) -> std::io::Result<()>,
+    lchown: fn(&Path, u32, u32) -> std::io::Result<()>,
+    readback: fn(&File) -> std::io::Result<(u32, u32)>,
+}
+
+#[cfg(unix)]
+impl ChownFns {
+    fn host() -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            fchown: |f, u, g| std::os::unix::fs::fchown(f, Some(u), Some(g)),
+            lchown: |p, u, g| std::os::unix::fs::lchown(p, Some(u), Some(g)),
+            readback: |f| f.metadata().map(|m| (m.uid(), m.gid())),
+        }
+    }
+}
+
+/// 非 unix では所有者の概念が無い。`ChownMapped` は開始前に `Unimplemented` で拒否されるため呼ばれない。
+#[cfg(not(unix))]
+impl ChownFns {
+    fn host() -> Self {
+        fn unsupported<T>() -> std::io::Result<T> {
+            Err(std::io::Error::from(ErrorKind::Unsupported))
+        }
+        Self {
+            fchown: |_, _, _| unsupported(),
+            lchown: |_, _, _| unsupported(),
+            readback: |_| unsupported(),
+        }
+    }
+}
+
+/// `chown` の失敗を構造化エラーにする。権限不足（`EPERM`）は `PermissionDenied`（fail-closed）。
+/// パスや ID の生の値はメッセージに載せない。
+fn chown_err(e: &std::io::Error) -> OciError {
+    let code = if e.kind() == ErrorKind::PermissionDenied {
+        OciErrorCode::PermissionDenied
+    } else {
+        OciErrorCode::Internal
+    };
+    err(code, "failed to change the owner of an extracted entry")
+}
+
+/// tar の（解析済みの）uid / gid を写像でホストの ID へ写す。解析できない値は `InvalidArgument`、
+/// 写像に無い値は `PermissionDenied`（SEC-5）。パス 1（書き込み前の検証）とパス 3 が同じ関数を使う。
+fn map_tar_owner(
+    ids: (Option<u32>, Option<u32>),
+    uid: &IdMap,
+    gid: &IdMap,
+) -> Result<(u32, u32), OciError> {
+    let (Some(u), Some(g)) = ids else {
+        return Err(err(
+            OciErrorCode::InvalidArgument,
+            "layer entry owner is malformed",
+        ));
+    };
+    match (uid.map_to_host(u), gid.map_to_host(g)) {
+        (Some(hu), Some(hg)) => Ok((hu, hg)),
+        _ => Err(err(
+            OciErrorCode::PermissionDenied,
+            "layer entry owner is outside the id mapping",
+        )),
+    }
+}
+
+/// `ChownMapped` の実行時の文脈（写像と `chown` 関数）。`Extractor::own` に持つ。
+struct OwnerCtx {
+    uid: IdMap,
+    gid: IdMap,
+    fns: ChownFns,
+}
+
+/// 特殊ビット・所有者の扱いの入力。`extract_stack` の入口で受け取る。
+#[derive(Clone)]
 struct SpecialSetup {
     policy: SpecialBitsPolicy,
     owner_of: OwnerOf,
+    ownership: OwnershipPolicy,
+    chown: ChownFns,
 }
 
 impl SpecialSetup {
@@ -1146,6 +1374,35 @@ impl SpecialSetup {
         Self {
             policy,
             owner_of: host_owner,
+            ownership: OwnershipPolicy::Keep,
+            chown: ChownFns::host(),
+        }
+    }
+
+    fn from_options(options: &ExtractOptions) -> Self {
+        Self {
+            ownership: options.ownership.clone(),
+            ..Self::host(options.special_bits)
+        }
+    }
+
+    /// 選択肢の組み合わせとホストを検査し、`ChownMapped` なら実行時の文脈を作る。`root` に触れる前に呼ぶ。
+    fn owner_ctx(&self) -> Result<Option<OwnerCtx>, OciError> {
+        match (&self.ownership, self.policy) {
+            (OwnershipPolicy::Keep, SpecialBitsPolicy::PreserveIfChowned) => Err(err(
+                OciErrorCode::InvalidArgument,
+                "the special bits policy requires an ownership mapping",
+            )),
+            (OwnershipPolicy::Keep, _) => Ok(None),
+            (OwnershipPolicy::ChownMapped { .. }, _) if !cfg!(target_os = "linux") => Err(err(
+                OciErrorCode::Unimplemented,
+                "applying layer ownership is only supported on linux",
+            )),
+            (OwnershipPolicy::ChownMapped { uid, gid }, _) => Ok(Some(OwnerCtx {
+                uid: uid.clone(),
+                gid: gid.clone(),
+                fns: self.chown,
+            })),
         }
     }
 }
@@ -1159,6 +1416,8 @@ struct SpecialCtx {
     /// `root` の所有 uid（`Evaluated` のときだけ意味を持つ）。
     root_uid: u32,
     owner_of: OwnerOf,
+    /// `PreserveIfChowned`（`chown` 後の所有者で判定する経路）か。
+    chowned_mode: bool,
 }
 
 impl SpecialCtx {
@@ -1168,6 +1427,7 @@ impl SpecialCtx {
             ranges: None,
             root_uid: 0,
             owner_of: host_owner,
+            chowned_mode: false,
         }
     }
 }
@@ -1176,8 +1436,10 @@ impl SpecialCtx {
 fn eval_special_ctx(setup: &SpecialSetup, root: &Path) -> Result<SpecialCtx, OciError> {
     let mut ctx = SpecialCtx::strip();
     ctx.owner_of = setup.owner_of;
-    let SpecialBitsPolicy::PreserveIfOwnerMapped { uid, gid } = setup.policy else {
-        return Ok(ctx);
+    let (mapped, chowned) = match setup.policy {
+        SpecialBitsPolicy::Strip => return Ok(ctx),
+        SpecialBitsPolicy::PreserveIfOwnerMapped { uid, gid } => (Some((uid, gid)), false),
+        SpecialBitsPolicy::PreserveIfChowned => (None, true),
     };
     ctx.decision = SpecialBitsDecision::UnsupportedHost;
     #[cfg(target_os = "linux")]
@@ -1188,13 +1450,14 @@ fn eval_special_ctx(setup: &SpecialSetup, root: &Path) -> Result<SpecialCtx, Oci
         let m = fs::symlink_metadata(root).map_err(|e| map_fs_err(&e))?;
         if m.is_dir() && m.permissions().mode() & 0o077 == 0 {
             ctx.decision = SpecialBitsDecision::Evaluated;
-            ctx.ranges = Some((uid, gid));
+            ctx.ranges = mapped;
+            ctx.chowned_mode = chowned;
             ctx.root_uid = (setup.owner_of)(&m).0;
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (uid, gid, root);
+        let _ = (mapped, chowned, root);
     }
     Ok(ctx)
 }
@@ -1224,6 +1487,37 @@ fn special_bits_to_keep(
     if requested & S_ISGID != 0
         && owner.1 != 0
         && tar_ids.1.and_then(|g| gid_map.map_to_host(g)) == Some(owner.1)
+    {
+        keep |= S_ISGID;
+    }
+    keep
+}
+
+/// `PreserveIfChowned` で残してよい特殊ビットを返す（ファイル単位の条件。副作用なし。#2225）。
+///
+/// `owner` は `chown` の後に読み戻した実際の所有者。共通条件「`root` の所有 uid と一致」は使わない
+/// （`chown` 後の所有者は写像先のため）。setuid / setgid は所有者が 0 でなく、tar の ID を写像した ID と
+/// 一致するときだけ残す。sticky はポリシー全体の条件（`Evaluated`）だけで残す。
+fn special_bits_to_keep_chowned(
+    requested: u32,
+    tar_ids: (Option<u32>, Option<u32>),
+    owner: (u32, u32),
+    maps: (&IdMap, &IdMap),
+    ctx: &SpecialCtx,
+) -> u32 {
+    if ctx.decision != SpecialBitsDecision::Evaluated || !ctx.chowned_mode {
+        return 0;
+    }
+    let mut keep = requested & S_ISVTX;
+    if requested & S_ISUID != 0
+        && owner.0 != 0
+        && tar_ids.0.and_then(|u| maps.0.map_to_host(u)) == Some(owner.0)
+    {
+        keep |= S_ISUID;
+    }
+    if requested & S_ISGID != 0
+        && owner.1 != 0
+        && tar_ids.1.and_then(|g| maps.1.map_to_host(g)) == Some(owner.1)
     {
         keep |= S_ISGID;
     }
@@ -1437,7 +1731,7 @@ impl Extractor<'_> {
                     // 下位レイヤー由来の非ディレクトリの位置に暗黙の親ディレクトリを作る（`d` の後の上位の `d/y`）。
                     // 非ディレクトリなので配下の登録は無く、ID はそのまま使う。
                     fs::remove_file(&cand).map_err(|e| map_fs_err(&e))?;
-                    self.create_implicit_dir(&cand)?;
+                    self.create_implicit_dir(&cand, id)?;
                     self.layer_nodes.insert(id);
                     resolved.push(c);
                     ids.push(id);
@@ -1453,7 +1747,7 @@ impl Extractor<'_> {
                         return Err(err(OciErrorCode::NotFound, "extraction path not found"));
                     }
                     let id = self.names.insert(parent_id, &c)?;
-                    self.create_implicit_dir(&cand)?;
+                    self.create_implicit_dir(&cand, id)?;
                     self.layer_nodes.insert(id);
                     resolved.push(c);
                     ids.push(id);
@@ -1468,9 +1762,18 @@ impl Extractor<'_> {
 
     /// 暗黙の親ディレクトリを作る。ホストの umask に依存させず既定 0755 にする。
     /// 明示的なディレクトリエントリがあれば `make_dir` がその mode で上書きする（OCI-1）。
-    fn create_implicit_dir(&self, path: &Path) -> Result<(), OciError> {
+    ///
+    /// `ChownMapped` のときは tar に所有者が無いため、コンテナ内 0:0 を写したホストの ID を全レイヤーの後に
+    /// `chown` する（イメージの慣行の root:root。写像は必ずコンテナ内 0 を含む）。`id` はこのノードの `NameIndex` の ID。
+    fn create_implicit_dir(&mut self, path: &Path, id: u64) -> Result<(), OciError> {
         fs::create_dir(path).map_err(|e| map_fs_err(&e))?;
-        apply_dir_mode(path, IMPLICIT_DIR_MODE)
+        apply_dir_mode(path, IMPLICIT_DIR_MODE)?;
+        if let Some(o) = &self.own {
+            let owner = map_tar_owner((Some(0), Some(0)), &o.uid, &o.gid)?;
+            self.deferred_dirs
+                .insert(id, (path.to_path_buf(), IMPLICIT_DIR_MODE, Some(owner)));
+        }
+        Ok(())
     }
 
     /// 非ディレクトリのエントリを置く位置の既存ノードを除去する。存在しなければ何もしない。
@@ -1499,7 +1802,13 @@ impl Extractor<'_> {
         }
     }
 
-    fn make_dir(&mut self, comps: Vec<OsString>, mode: u32) -> Result<(), OciError> {
+    /// `owner` は `ChownMapped` のときの `chown` 先（ホストの uid, gid）。`chown` は `finish_dirs` で行う。
+    fn make_dir(
+        &mut self,
+        comps: Vec<OsString>,
+        mode: u32,
+        owner: Option<(u32, u32)>,
+    ) -> Result<(), OciError> {
         let Some((parent, name)) = split_last(comps) else {
             return Ok(());
         };
@@ -1526,10 +1835,14 @@ impl Extractor<'_> {
         if needs_deferral(mode) {
             // umask 等で所有者の rwx が欠けても子を作れるよう、finish_dirs まで一時的に 0700 にする。
             apply_dir_mode(&path, 0o700)?;
-            self.deferred_dirs.insert(id, (path, mode));
+            self.deferred_dirs.insert(id, (path, mode, owner));
             Ok(())
         } else {
-            apply_dir_mode(&path, mode)
+            apply_dir_mode(&path, mode)?;
+            if owner.is_some() {
+                self.deferred_dirs.insert(id, (path, mode, owner));
+            }
+            Ok(())
         }
     }
 
@@ -1538,6 +1851,7 @@ impl Extractor<'_> {
         comps: Vec<OsString>,
         mode: u32,
         tar_ids: (Option<u32>, Option<u32>),
+        host_ids: Option<(u32, u32)>,
         size: u64,
         data: &mut R,
     ) -> Result<(), OciError> {
@@ -1587,17 +1901,50 @@ impl Extractor<'_> {
         if written != size {
             return Err(err(OciErrorCode::DataLoss, "layer tar stream is malformed"));
         }
+        // `chown` は `fchmod` より先に行う（Linux は `chown` で setuid / setgid を落とすため）。所有者は読み戻して
+        // 確かめ、成功を偽らない。特殊ビットの判定は読み戻した所有者で行う（SEC-5・#2225）。
+        let chowned_owner = match (&self.own, host_ids) {
+            (Some(o), Some(ids)) => {
+                (o.fns.fchown)(&f, ids.0, ids.1).map_err(|e| chown_err(&e))?;
+                let got = (o.fns.readback)(&f).map_err(|e| chown_err(&e))?;
+                if got != ids {
+                    return Err(err(
+                        OciErrorCode::FailedPrecondition,
+                        "the owner of an extracted file differs from the requested owner",
+                    ));
+                }
+                self.chowned = self.chowned.saturating_add(1);
+                Some(got)
+            }
+            (Some(_), None) => {
+                return Err(err(OciErrorCode::Internal, "entry owner is not resolved"));
+            }
+            (None, _) => None,
+        };
         let requested = mode & SPECIAL_BITS;
         let keep = if requested != 0 && self.special.decision == SpecialBitsDecision::Evaluated {
-            // 所有者は書いたファイル自身の metadata から得る（fsuid・親ディレクトリの setgid による gid 継承を反映）。
-            f.metadata().map_or(0, |m| {
-                special_bits_to_keep(
-                    requested,
-                    tar_ids,
-                    (self.special.owner_of)(&m),
-                    &self.special,
-                )
-            })
+            if self.special.chowned_mode {
+                match (&self.own, chowned_owner) {
+                    (Some(o), Some(owner)) => special_bits_to_keep_chowned(
+                        requested,
+                        tar_ids,
+                        owner,
+                        (&o.uid, &o.gid),
+                        &self.special,
+                    ),
+                    _ => 0,
+                }
+            } else {
+                // 所有者は書いたファイル自身の metadata から得る（fsuid・親ディレクトリの setgid による gid 継承を反映）。
+                f.metadata().map_or(0, |m| {
+                    special_bits_to_keep(
+                        requested,
+                        tar_ids,
+                        (self.special.owner_of)(&m),
+                        &self.special,
+                    )
+                })
+            }
         } else {
             0
         };
@@ -1614,7 +1961,12 @@ impl Extractor<'_> {
         Ok(())
     }
 
-    fn make_symlink(&mut self, comps: Vec<OsString>, target: &[u8]) -> Result<(), OciError> {
+    fn make_symlink(
+        &mut self,
+        comps: Vec<OsString>,
+        target: &[u8],
+        owner: Option<(u32, u32)>,
+    ) -> Result<(), OciError> {
         let Some((parent, name)) = split_last(comps) else {
             return Err(err(OciErrorCode::InvalidArgument, "entry path is empty"));
         };
@@ -1645,7 +1997,13 @@ impl Extractor<'_> {
         self.clear_for_non_dir(dir.id, &name, &path)?;
         let id = self.names.insert(dir.id, &name)?;
         self.layer_nodes.insert(id);
-        create_symlink(Path::new(&bytes_to_os(target)?), &path)
+        create_symlink(Path::new(&bytes_to_os(target)?), &path)?;
+        if let (Some(o), Some(ids)) = (&self.own, owner) {
+            // symlink 自体の所有者を変える（リンク先を追従しない）。mode は扱わない。
+            (o.fns.lchown)(&path, ids.0, ids.1).map_err(|e| chown_err(&e))?;
+            self.chowned = self.chowned.saturating_add(1);
+        }
+        Ok(())
     }
 
     fn make_hardlink(&mut self, comps: Vec<OsString>, target: &[u8]) -> Result<(), OciError> {
@@ -1757,19 +2115,26 @@ impl Extractor<'_> {
 
     /// 遅延していたディレクトリの mode を深い順に適用する（実ディレクトリであることを再確認する）。
     fn finish_dirs(&mut self) -> Result<(), OciError> {
-        let mut dirs: Vec<(PathBuf, u32)> = std::mem::take(&mut self.deferred_dirs)
+        let mut dirs: Vec<DeferredDir> = std::mem::take(&mut self.deferred_dirs)
             .into_values()
             .collect();
         // 深い順。同じ深さはパス順で決定的にする。
-        dirs.sort_by(|(a, _), (b, _)| {
+        dirs.sort_by(|(a, _, _), (b, _, _)| {
             b.components()
                 .count()
                 .cmp(&a.components().count())
                 .then_with(|| a.cmp(b))
         });
-        for (path, mode) in dirs {
+        for (path, mode, owner) in dirs {
             match fs::symlink_metadata(&path) {
-                Ok(m) if m.is_dir() => apply_dir_mode(&path, mode)?,
+                Ok(m) if m.is_dir() => {
+                    // `chown` の後に mode を適用する（ディレクトリは `chown` で setgid を落とさないが、順序を固定する）。
+                    if let (Some(o), Some(ids)) = (&self.own, owner) {
+                        (o.fns.lchown)(&path, ids.0, ids.1).map_err(|e| chown_err(&e))?;
+                        self.chowned = self.chowned.saturating_add(1);
+                    }
+                    apply_dir_mode(&path, mode)?;
+                }
                 _ => {
                     return Err(err(
                         OciErrorCode::FailedPrecondition,
@@ -1778,6 +2143,33 @@ impl Extractor<'_> {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// `ChownMapped` のとき、エントリの tar の uid / gid を写像したホストの ID を返す（それ以外は `None`）。
+    /// 解析できない値・写像に無い値はエラー（パス 1 と同じ判定。`map_tar_owner`）。
+    fn host_owner_of<R: Read>(
+        &self,
+        entry: &mut tar::Entry<'_, R>,
+        global: &GlobalOwner,
+    ) -> Result<Option<(u32, u32)>, OciError> {
+        let Some(o) = &self.own else {
+            return Ok(None);
+        };
+        map_tar_owner(tar_owner(entry, global), &o.uid, &o.gid).map(Some)
+    }
+
+    /// `ChownMapped` のとき `root` 自身をコンテナ内 0:0 を写した ID へ `chown` する（mode は 0700 のまま変えない）。
+    ///
+    /// 全レイヤーと `finish_dirs` の後に 1 回だけ呼ぶ。ホスト root 所有のままだと、コンテナ root（subuid）が
+    /// 自分の `/` を辿れないため。ほかのホストユーザーからの到達性は 0700 のままで変わらない（SEC-5）。
+    fn chown_root(&mut self) -> Result<(), OciError> {
+        let Some(o) = &self.own else {
+            return Ok(());
+        };
+        let ids = map_tar_owner((Some(0), Some(0)), &o.uid, &o.gid)?;
+        (o.fns.lchown)(self.root, ids.0, ids.1).map_err(|e| chown_err(&e))?;
+        self.chowned = self.chowned.saturating_add(1);
         Ok(())
     }
 }
@@ -1910,9 +2302,14 @@ fn collect_markers<R: Read>(
         let mut seen = x.entries;
         let mut bytes = x.bytes;
         let mut archive = Archive::new(TarGuard::new(&mut src));
+        // `ChownMapped` のときだけ、所有者を書き込み前に検証する（範囲外の ID はそのレイヤーの書き込みより前に拒否。SEC-5）。
+        let mut global_owner = GlobalOwner::default();
         for entry in archive.entries().map_err(map_stream_err)? {
-            let entry = entry.map_err(map_stream_err)?;
+            let mut entry = entry.map_err(map_stream_err)?;
             if entry.header().entry_type() == EntryType::XGlobalHeader {
+                if x.own.is_some() {
+                    global_owner.absorb(&mut entry)?;
+                }
                 continue;
             }
             seen = seen.saturating_add(1);
@@ -1922,7 +2319,13 @@ fn collect_markers<R: Read>(
                     "layer exceeds the entry count limit",
                 ));
             }
-            match plan_entry(&entry)? {
+            let plan = plan_entry(&entry)?;
+            if let Some(o) = &x.own
+                && matches!(plan, Plan::Dir(..) | Plan::File(..) | Plan::Symlink(_))
+            {
+                map_tar_owner(tar_owner(&mut entry, &global_owner), &o.uid, &o.gid)?;
+            }
+            match plan {
                 Plan::Marker(m) => markers.push(m),
                 Plan::File(..) => {
                     bytes = bytes
@@ -1957,7 +2360,7 @@ fn extract_one_layer<S: LayerSource>(
     input_budget: u64,
 ) -> Result<(ExtractedLayer, u64), OciError> {
     let (entries0, bytes0, stripped0) = (x.entries, x.bytes, x.stripped_special);
-    let preserved0 = x.preserved_special;
+    let (preserved0, chowned0) = (x.preserved_special, x.chowned);
     let max_entries = x.limits.max_entries;
     let markers = collect_markers(x, src.open()?, input_budget)?;
     x.apply_markers(&markers)?;
@@ -1989,20 +2392,25 @@ fn extract_one_layer<S: LayerSource>(
             match plan_entry(&entry)? {
                 // マーカーはパス 2 で適用済み。rootfs へは書かない（OCI-2）。
                 Plan::Marker(_) => {}
-                Plan::Dir(comps, mode) => x.make_dir(comps, mode)?,
+                Plan::Dir(comps, mode) => {
+                    let owner = x.host_owner_of(&mut entry, &global_owner)?;
+                    x.make_dir(comps, mode, owner)?;
+                }
                 Plan::File(comps, mode) => {
                     let size = entry.size();
                     let tar_ids = tar_owner(&mut entry, &global_owner);
-                    x.write_file(comps, mode, tar_ids, size, &mut entry)?;
+                    let owner = x.host_owner_of(&mut entry, &global_owner)?;
+                    x.write_file(comps, mode, tar_ids, owner, size, &mut entry)?;
                 }
                 Plan::Symlink(comps) => {
+                    let owner = x.host_owner_of(&mut entry, &global_owner)?;
                     let target = entry
                         .link_name_bytes()
                         .map(std::borrow::Cow::into_owned)
                         .ok_or_else(|| {
                             err(OciErrorCode::InvalidArgument, "symlink target is invalid")
                         })?;
-                    x.make_symlink(comps, &target)?;
+                    x.make_symlink(comps, &target, owner)?;
                 }
                 Plan::Hardlink(comps) => {
                     let target = entry
@@ -2026,6 +2434,14 @@ fn extract_one_layer<S: LayerSource>(
             special_bits: SpecialBitsOutcome {
                 decision: x.special.decision,
                 preserved_files: x.preserved_special.saturating_sub(preserved0),
+            },
+            ownership: OwnershipOutcome {
+                decision: if x.own.is_some() {
+                    OwnershipDecision::Applied
+                } else {
+                    OwnershipDecision::NotRequested
+                },
+                chowned_entries: x.chowned.saturating_sub(chowned0),
             },
         },
         src.read,
@@ -2060,6 +2476,8 @@ fn extract_stack<S: LayerSource>(
         let is_last = layers.peek().is_none();
         let res = record_oci_op(recorder, OciOpKind::ExtractLayer, || {
             if x.is_none() {
+                // 選択肢の不正な組み合わせ・非 Linux の `chown` は、`root` に触れる前に拒否する。
+                let own = setup.owner_ctx()?;
                 check_root_empty(root)?;
                 x = Some(Extractor {
                     root,
@@ -2070,6 +2488,8 @@ fn extract_stack<S: LayerSource>(
                     preserved_special: 0,
                     special: eval_special_ctx(&setup, root)?,
                     deferred_dirs: HashMap::new(),
+                    own,
+                    chowned: 0,
                     names: NameIndex::new(limits.max_tracked_paths),
                     layer_nodes: HashSet::new(),
                     lstat,
@@ -2082,8 +2502,16 @@ fn extract_stack<S: LayerSource>(
             let (layer, read) = extract_one_layer(ex, &mut item, budget)?;
             input_used = input_used.saturating_add(read);
             // 遅延ディレクトリ権限の適用は最後のレイヤーの記録に含める（失敗・所要時間を計装から漏らさない。REPAIR-4）。
+            let mut layer = layer;
             if is_last {
+                let chowned0 = ex.chowned;
                 ex.finish_dirs()?;
+                ex.chown_root()?;
+                // ディレクトリと `root` の `chown` は最後のレイヤーの結果に数える。
+                layer.ownership.chowned_entries = layer
+                    .ownership
+                    .chowned_entries
+                    .saturating_add(ex.chowned.saturating_sub(chowned0));
             }
             Ok(layer)
         })?;
@@ -3435,7 +3863,10 @@ mod tests {
                 &sb.root,
                 LIM(),
                 host_lstat,
-                SpecialSetup { policy, owner_of },
+                SpecialSetup {
+                    owner_of,
+                    ..SpecialSetup::host(policy)
+                },
             )
             .unwrap(),
         )
@@ -3752,6 +4183,7 @@ mod tests {
             ranges: Some((r, r)),
             root_uid: 1000,
             owner_of: owner_1000,
+            chowned_mode: false,
         };
         let all = S_ISUID | S_ISGID | S_ISVTX;
         let k = |req, ids, owner| special_bits_to_keep(req, ids, owner, &ctx);
@@ -4127,6 +4559,8 @@ mod tests {
             preserved_special: 0,
             special: SpecialCtx::strip(),
             deferred_dirs: HashMap::new(),
+            own: None,
+            chowned: 0,
             names: NameIndex::new(limits.max_tracked_paths),
             layer_nodes: HashSet::new(),
             lstat,
@@ -4861,5 +5295,500 @@ mod tests {
         assert!(t.elapsed() < std::time::Duration::from_secs(30));
         assert_eq!(names_in(&sb.root.join("d")).len(), n);
         assert!(names_in(&sb.root.join("o0")).is_empty());
+    }
+    // ---- 所有者の適用（chown）と PreserveIfChowned（SEC-5・OCI-1・#2225） ----
+    #[cfg(target_os = "linux")]
+    mod chown_tests {
+        use super::*;
+        use std::cell::{Cell, RefCell};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /// 記録した `chown` 呼び出し（種別 `f` は fchown、`l` は lchown）。
+        #[derive(Debug, PartialEq, Eq)]
+        struct ChownCall {
+            kind: char,
+            path: Option<PathBuf>,
+            uid: u32,
+            gid: u32,
+            /// 呼び出し時点の mode（`& 0o7777`）。
+            mode: u32,
+        }
+
+        thread_local! {
+            static CALLS: RefCell<Vec<ChownCall>> = const { RefCell::new(Vec::new()) };
+            static LAST: Cell<(u32, u32)> = const { Cell::new((0, 0)) };
+        }
+
+        fn rec_fchown(f: &File, uid: u32, gid: u32) -> std::io::Result<()> {
+            let mode = f.metadata()?.permissions().mode() & 0o7777;
+            CALLS.with_borrow_mut(|c| {
+                c.push(ChownCall {
+                    kind: 'f',
+                    path: None,
+                    uid,
+                    gid,
+                    mode,
+                });
+            });
+            LAST.set((uid, gid));
+            Ok(())
+        }
+
+        fn rec_lchown(p: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+            let mode = fs::symlink_metadata(p)?.permissions().mode() & 0o7777;
+            CALLS.with_borrow_mut(|c| {
+                c.push(ChownCall {
+                    kind: 'l',
+                    path: Some(p.to_path_buf()),
+                    uid,
+                    gid,
+                    mode,
+                });
+            });
+            Ok(())
+        }
+
+        fn rec_readback(_f: &File) -> std::io::Result<(u32, u32)> {
+            Ok(LAST.get())
+        }
+
+        fn bad_readback(_f: &File) -> std::io::Result<(u32, u32)> {
+            Ok((1, 1))
+        }
+
+        fn denied_fchown(_f: &File, _u: u32, _g: u32) -> std::io::Result<()> {
+            Err(std::io::Error::from(ErrorKind::PermissionDenied))
+        }
+
+        fn rec_fns() -> ChownFns {
+            ChownFns {
+                fchown: rec_fchown,
+                lchown: rec_lchown,
+                readback: rec_readback,
+            }
+        }
+
+        fn take_calls() -> Vec<ChownCall> {
+            CALLS.with_borrow_mut(std::mem::take)
+        }
+
+        /// subuid 風の写像（0 → 100000 × 1、1 → 100001 × 65535）。
+        fn subuid_map() -> IdMap {
+            IdMap::new(vec![
+                IdRange {
+                    container_id: 0,
+                    host_id: 100_000,
+                    count: 1,
+                },
+                IdRange {
+                    container_id: 1,
+                    host_id: 100_001,
+                    count: 65_535,
+                },
+            ])
+            .unwrap()
+        }
+
+        fn chown_setup(policy: SpecialBitsPolicy, fns: ChownFns) -> SpecialSetup {
+            SpecialSetup {
+                ownership: OwnershipPolicy::ChownMapped {
+                    uid: subuid_map(),
+                    gid: subuid_map(),
+                },
+                chown: fns,
+                ..SpecialSetup::host(policy)
+            }
+        }
+
+        fn run_setup(
+            sb: &Sandbox,
+            entries: &[Vec<u8>],
+            setup: SpecialSetup,
+        ) -> Result<ExtractedLayer, OciError> {
+            let tar = archive(entries);
+            take_calls();
+            single(extract_stack(
+                &NoopOciOpRecorder,
+                [Rewind::new(Cursor::new(tar.as_slice()))],
+                &sb.root,
+                LIM(),
+                host_lstat,
+                setup,
+            )?)
+        }
+
+        fn owned_entry(
+            name: &str,
+            ty: EntryType,
+            link: &str,
+            mode: u32,
+            uid: u64,
+            gid: u64,
+        ) -> Vec<u8> {
+            let mut h = tar::Header::new_gnu();
+            h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+            h.as_old_mut().linkname[..link.len()].copy_from_slice(link.as_bytes());
+            h.set_entry_type(ty);
+            h.set_mode(mode);
+            h.set_uid(uid);
+            h.set_gid(gid);
+            h.set_size(0);
+            h.set_cksum();
+            h.as_bytes().to_vec()
+        }
+
+        /// SEC-5: 複数行の写像で、ファイル・symlink・ディレクトリ・暗黙のディレクトリ・root へ期待どおりの ID を chown する。
+        #[test]
+        fn sec5_chown_maps_tar_owner_through_multi_line_map() {
+            let sb = Sandbox::new();
+            let entries = [
+                owned_entry("d/", EntryType::Directory, "", 0o755, 33, 34),
+                file_owned("d/f", 0o644, 1000, 1001, b"x"),
+                owned_entry("l", EntryType::Symlink, "d/f", 0o777, 5, 6),
+                file_owned("x/y", 0o644, 0, 0, b"y"),
+            ];
+            let r = run_setup(
+                &sb,
+                &entries,
+                chown_setup(SpecialBitsPolicy::Strip, rec_fns()),
+            )
+            .unwrap();
+            let calls = take_calls();
+            let summary: Vec<(char, Option<PathBuf>, u32, u32)> = calls
+                .iter()
+                .map(|c| (c.kind, c.path.clone(), c.uid, c.gid))
+                .collect();
+            assert_eq!(
+                summary,
+                vec![
+                    ('f', None, 101_000, 101_001),
+                    ('l', Some(sb.root.join("l")), 100_005, 100_006),
+                    ('f', None, 100_000, 100_000),
+                    ('l', Some(sb.root.join("d")), 100_033, 100_034),
+                    ('l', Some(sb.root.join("x")), 100_000, 100_000),
+                    ('l', Some(sb.root.clone()), 100_000, 100_000),
+                ]
+            );
+            assert_eq!(r.ownership.decision, OwnershipDecision::Applied);
+            assert_eq!(r.ownership.chowned_entries, 6);
+        }
+
+        /// SEC-5: 通常ファイルは chown が fchmod より先（呼び出し時点で setuid が付いていない）。
+        #[test]
+        fn sec5_chown_order_file_before_mode() {
+            let sb = Sandbox::new();
+            run_setup(
+                &sb,
+                &[file_owned("f", 0o4755, 0, 0, b"x")],
+                chown_setup(SpecialBitsPolicy::Strip, rec_fns()),
+            )
+            .unwrap();
+            let calls = take_calls();
+            let first = calls.first().unwrap();
+            assert_eq!(first.kind, 'f');
+            assert_eq!(first.mode & S_ISUID, 0);
+            assert_ne!(first.mode, 0o4755);
+        }
+
+        /// SEC-5: ディレクトリの chown は深い順で、mode の適用より前（遅延中の 0700 のときに呼ばれる）。
+        #[test]
+        fn sec5_chown_dirs_deepest_first_before_mode() {
+            let sb = Sandbox::new();
+            let entries = [
+                owned_entry("a/", EntryType::Directory, "", 0o555, 1, 1),
+                owned_entry("a/b/", EntryType::Directory, "", 0o755, 2, 2),
+            ];
+            run_setup(
+                &sb,
+                &entries,
+                chown_setup(SpecialBitsPolicy::Strip, rec_fns()),
+            )
+            .unwrap();
+            let calls = take_calls();
+            let paths: Vec<Option<PathBuf>> = calls.iter().map(|c| c.path.clone()).collect();
+            assert_eq!(
+                paths,
+                vec![
+                    Some(sb.root.join("a/b")),
+                    Some(sb.root.join("a")),
+                    Some(sb.root.clone())
+                ]
+            );
+            // `a` は 0555 に遅延される（呼び出し時点は 0700）。chown の後に 0555 が適用される。
+            assert_eq!(calls.get(1).map(|c| c.mode), Some(0o700));
+            assert_eq!(mode_of(&sb.root.join("a")), 0o555);
+            restore_perms(&sb.root);
+        }
+
+        /// SEC-5: hardlink は chown しない（inode を共有する参照先の所有者と特殊ビットを書き換えないため）。
+        #[test]
+        fn sec5_hardlink_is_not_chowned() {
+            let sb = Sandbox::new();
+            let r = run_setup(
+                &sb,
+                &[file_owned("a", 0o644, 1, 1, b"x"), hardlink("b", "a")],
+                chown_setup(SpecialBitsPolicy::Strip, rec_fns()),
+            )
+            .unwrap();
+            let calls = take_calls();
+            assert_eq!(calls.iter().filter(|c| c.kind == 'f').count(), 1);
+            assert_eq!(calls.len(), 2);
+            assert_eq!(r.ownership.chowned_entries, 2);
+        }
+
+        /// SEC-5: 写像に無い uid は PermissionDenied で、そのレイヤーのファイルを 1 件も書く前に拒否する。
+        #[test]
+        fn sec5_owner_outside_map_is_rejected_before_layer_writes() {
+            let sb = Sandbox::new();
+            let e = run_setup(
+                &sb,
+                &[
+                    file_owned("a", 0o644, 0, 0, b"x"),
+                    file_owned("b", 0o644, 70_000, 0, b"y"),
+                ],
+                chown_setup(SpecialBitsPolicy::Strip, rec_fns()),
+            )
+            .unwrap_err();
+            assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+            assert_eq!(e.message(), "layer entry owner is outside the id mapping");
+            assert!(!sb.root.join("a").exists());
+            assert!(take_calls().is_empty());
+        }
+
+        /// SEC-5: 解析できない PAX の uid（エントリ固有・グローバル）は InvalidArgument。
+        #[test]
+        fn sec5_malformed_pax_owner_is_rejected_when_chowning() {
+            for ty in [EntryType::XHeader, EntryType::XGlobalHeader] {
+                let sb = Sandbox::new();
+                let body = pax_record("uid", "not-a-number");
+                let px = raw_entry(b"pax", ty, b"", 0o644, body.len() as u64, &body);
+                let e = run_setup(
+                    &sb,
+                    &[px, file_owned("f", 0o644, 0, 0, b"x")],
+                    chown_setup(SpecialBitsPolicy::Strip, rec_fns()),
+                )
+                .unwrap_err();
+                assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+                assert_eq!(e.message(), "layer entry owner is malformed");
+                assert!(!sb.root.join("f").exists());
+            }
+        }
+
+        /// SEC-5: 読み戻した所有者が要求と違えば FailedPrecondition（成功を偽らない）。
+        #[test]
+        fn sec5_chown_readback_mismatch_is_failed_precondition() {
+            let sb = Sandbox::new();
+            let fns = ChownFns {
+                readback: bad_readback,
+                ..rec_fns()
+            };
+            let e = run_setup(
+                &sb,
+                &[file_owned("f", 0o644, 0, 0, b"x")],
+                chown_setup(SpecialBitsPolicy::Strip, fns),
+            )
+            .unwrap_err();
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        }
+
+        /// SEC-5: 権限不足の chown（EPERM）は PermissionDenied（fail-closed）。
+        #[test]
+        fn sec5_chown_eperm_is_permission_denied() {
+            let sb = Sandbox::new();
+            let fns = ChownFns {
+                fchown: denied_fchown,
+                ..rec_fns()
+            };
+            let e = run_setup(
+                &sb,
+                &[file_owned("f", 0o644, 0, 0, b"x")],
+                chown_setup(SpecialBitsPolicy::Strip, fns),
+            )
+            .unwrap_err();
+            assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+            assert_eq!(
+                e.message(),
+                "failed to change the owner of an extracted entry"
+            );
+        }
+
+        /// SEC-5: PreserveIfChowned を Keep と組むと開始前に InvalidArgument で拒否し、root に触れない。
+        #[test]
+        fn sec5_preserve_if_chowned_requires_chown_policy() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o700);
+            let setup = SpecialSetup {
+                chown: rec_fns(),
+                ..SpecialSetup::host(SpecialBitsPolicy::PreserveIfChowned)
+            };
+            let e = run_setup(&sb, &[file_owned("f", 0o4755, 0, 0, b"x")], setup).unwrap_err();
+            assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+            assert_eq!(fs::read_dir(&sb.root).unwrap().count(), 0);
+            assert!(take_calls().is_empty());
+        }
+
+        /// SEC-5: 既定（Keep）では chown を 1 回も呼ばない。
+        #[test]
+        fn sec5_keep_policy_does_not_chown() {
+            let sb = Sandbox::new();
+            let setup = SpecialSetup {
+                chown: rec_fns(),
+                ..SpecialSetup::host(SpecialBitsPolicy::Strip)
+            };
+            let r = run_setup(&sb, &[file_owned("f", 0o644, 0, 0, b"x")], setup).unwrap();
+            assert!(take_calls().is_empty());
+            assert_eq!(
+                r.ownership,
+                OwnershipOutcome {
+                    decision: OwnershipDecision::NotRequested,
+                    chowned_entries: 0
+                }
+            );
+        }
+
+        /// SEC-5・SEC-1: PreserveIfChowned は root が 0700 で、chown 後の所有者が写像と一致するビットを残す。
+        #[test]
+        fn sec5_preserve_if_chowned_keeps_bits_for_mapped_owner() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o700);
+            let r = run_setup(
+                &sb,
+                &[
+                    file_owned("suid", 0o4755, 0, 0, b"a"),
+                    file_owned("sticky", 0o1644, 33, 33, b"b"),
+                ],
+                chown_setup(SpecialBitsPolicy::PreserveIfChowned, rec_fns()),
+            )
+            .unwrap();
+            assert_eq!(r.special_bits.decision, SpecialBitsDecision::Evaluated);
+            assert_eq!(r.special_bits.preserved_files, 2);
+            assert_eq!(mode_of(&sb.root.join("suid")), 0o4755);
+            assert_eq!(mode_of(&sb.root.join("sticky")), 0o1644);
+            take_calls();
+        }
+
+        /// SEC-5・SEC-1: root が他者に開かれているときは PreserveIfChowned でもすべて落とす。
+        #[test]
+        fn sec5_preserve_if_chowned_strips_when_root_is_open() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o755);
+            let r = run_setup(
+                &sb,
+                &[file_owned("suid", 0o4755, 0, 0, b"a")],
+                chown_setup(SpecialBitsPolicy::PreserveIfChowned, rec_fns()),
+            )
+            .unwrap();
+            assert_eq!(
+                r.special_bits.decision,
+                SpecialBitsDecision::RootAccessibleByOthers
+            );
+            assert_eq!(r.files_with_stripped_special_bits, 1);
+            assert_eq!(mode_of(&sb.root.join("suid")), 0o755);
+        }
+
+        /// SEC-5: `special_bits_to_keep_chowned` の条件の組み合わせ。
+        #[test]
+        fn sec5_special_bits_to_keep_chowned_matrix() {
+            let m = subuid_map();
+            let ctx = SpecialCtx {
+                decision: SpecialBitsDecision::Evaluated,
+                ranges: None,
+                root_uid: 0,
+                owner_of: host_owner,
+                chowned_mode: true,
+            };
+            let all = S_ISUID | S_ISGID | S_ISVTX;
+            let k = |req, ids, owner| special_bits_to_keep_chowned(req, ids, owner, (&m, &m), &ctx);
+            assert_eq!(k(all, (Some(0), Some(0)), (100_000, 100_000)), all);
+            // 所有者が 0 なら setuid / setgid は残さない（sticky のみ）。
+            assert_eq!(k(all, (Some(0), Some(0)), (0, 0)), S_ISVTX);
+            // 写像と所有者の不一致。
+            assert_eq!(
+                k(all, (Some(5), Some(0)), (100_000, 100_000)),
+                S_ISGID | S_ISVTX
+            );
+            // tar の ID が解析不能。
+            assert_eq!(k(all, (None, None), (100_000, 100_000)), S_ISVTX);
+            // 全体の判定が Evaluated でなければ 0。
+            let strip = SpecialCtx {
+                decision: SpecialBitsDecision::RootAccessibleByOthers,
+                ..ctx
+            };
+            assert_eq!(
+                special_bits_to_keep_chowned(
+                    all,
+                    (Some(0), Some(0)),
+                    (100_000, 100_000),
+                    (&m, &m),
+                    &strip
+                ),
+                0
+            );
+        }
+    }
+
+    /// SEC-5: Linux 以外では chown を開始前に Unimplemented で拒否し、root に触れない（AC5）。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn sec5_chown_is_unimplemented_off_linux() {
+        let sb = Sandbox::new();
+        let one = || {
+            IdMap::new(vec![IdRange {
+                container_id: 0,
+                host_id: 1000,
+                count: 1,
+            }])
+            .unwrap()
+        };
+        let setup = SpecialSetup {
+            ownership: OwnershipPolicy::ChownMapped {
+                uid: one(),
+                gid: one(),
+            },
+            ..SpecialSetup::host(SpecialBitsPolicy::Strip)
+        };
+        let tar = archive(&[file("f", 0o644, b"x")]);
+        let e = extract_stack(
+            &NoopOciOpRecorder,
+            [Rewind::new(Cursor::new(tar.as_slice()))],
+            &sb.root,
+            LIM(),
+            host_lstat,
+            setup,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Unimplemented);
+        assert_eq!(fs::read_dir(&sb.root).unwrap().count(), 0);
+    }
+
+    /// SEC-5: Linux 以外では PreserveIfOwnerMapped でも特殊ビットをすべて落とす（Strip 相当。AC5）。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn sec5_non_linux_preserve_policy_strips_everything() {
+        let sb = Sandbox::new();
+        let r = IdRange {
+            container_id: 0,
+            host_id: 1000,
+            count: 1,
+        };
+        let tar = archive(&[file("suid", 0o4755, b"a")]);
+        let l = single(
+            extract_stack(
+                &NoopOciOpRecorder,
+                [Rewind::new(Cursor::new(tar.as_slice()))],
+                &sb.root,
+                LIM(),
+                host_lstat,
+                SpecialSetup::host(SpecialBitsPolicy::PreserveIfOwnerMapped { uid: r, gid: r }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            l.special_bits.decision,
+            SpecialBitsDecision::UnsupportedHost
+        );
+        assert_eq!(l.files_with_stripped_special_bits, 1);
+        assert_eq!(l.ownership.decision, OwnershipDecision::NotRequested);
     }
 }

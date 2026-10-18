@@ -39,8 +39,14 @@
 //! `whiteout`・`layer::extract`）。
 //! 通常ファイルの setuid / setgid / sticky は既定で落として件数を返し、`SpecialBitsPolicy::PreserveIfOwnerMapped` を
 //! 渡した rootless 経路だけ所有者の写像に合わせて保持する（SEC-5・#1810。`docs/design/oci-layer-special-bits.md`）。
-//! 未実装: ディレクトリ fd 起点の解決（TOCTOU 対策）、uid / gid の適用（`chown`・複数範囲の写像・rootful で特殊ビットを
-//! 残す経路。SEC-5）、綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する別表記は衝突として扱わない。IO-5）。
+//! 展開物の所有者は、既定では実行ユーザーのままで、`OwnershipPolicy::ChownMapped` と複数行の写像 `IdMap` を渡すと
+//! tar の uid / gid を写像してホストの ID へ `chown` する（Linux のみ。権限の主体と順序は `layer::extract` のモジュール
+//! doc を参照）。`SpecialBitsPolicy::PreserveIfChowned` は rootful（ホスト root）で `chown` 後の所有者が写像と一致する
+//! ファイルだけ特殊ビットを残す（SEC-5・SEC-1・#2225）。
+//! 未実装: ディレクトリ fd 起点の解決（TOCTOU 対策）、rootless で写像済みの user namespace の中から展開する経路、
+//! 0700 の祖先ディレクトリで閉じ込めを判定する方式（複数範囲の写像でコンテナ内の非 root が `/` を辿れるようにするため。
+//! 現状は `root` が 0700 で、コンテナ root だけが辿れる）、綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する
+//! 別表記は衝突として扱わない。IO-5）。
 //!
 //! 未実装（スタブではなく後続 issue の担当）: キャッシュ・`image ls`/`rm`/`tag`（TASK-52〜55・TASK-183〜184）。`RegistryClient` の通信は匿名トークン取得・
 //! manifest 取得・blob 取得のみ。

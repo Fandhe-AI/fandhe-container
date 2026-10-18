@@ -13,8 +13,10 @@
 //! RPC になり得る。async ハンドラからは `tokio::task::spawn_blocking` 上で呼ぶこと（`image_pull` の前例）。
 //!
 //! **未実装・簡易実装（REPAIR-3）**: 本モジュールは呼び出し境界だけを提供する。RPC ハンドラへの接続は
-//! TASK-59.2（#438。create・start）・TASK-59.3（#439。stop・delete）、結合試験は TASK-59.4（#440）で行い、
-//! `ContainerRuntime` の実装（plugin 側。TASK-114）と OCI bundle の生成も本モジュールの範囲外である。
+//! create・start が TASK-59.2（#438。`CriRuntimeService::with_runtime` で注入したときだけ有効）、
+//! stop・delete が TASK-59.3（#439）、結合試験は TASK-59.4（#440）で行い、
+//! `ContainerRuntime` の実装（plugin 側。TASK-114）と OCI bundle の生成の本体も本モジュールの範囲外である
+//! （bundle の供給は [`BundleProvider`] の注入点だけを定義する）。
 
 use std::fmt;
 use std::path::PathBuf;
@@ -28,10 +30,31 @@ use fandhe_container_core::traits::{
 };
 use tonic::{Code, Status};
 
+use crate::runtime::v1::ContainerConfig;
 use crate::runtime::v1::ContainerState as CriContainerState;
 
 /// エラーメッセージとして返す最大バイト数。plugin 由来の untrusted な文字列のため cri 側でも上限を掛ける。
 const STATUS_MESSAGE_MAX_BYTES: usize = 4096;
+
+/// 実行層が報告した生の状態（CRI の外向き状態へ写す前の区別。CRI-2・REPAIR-5）。
+///
+/// CRI の `ContainerCreated` は実行層の Creating と Created を区別しない。しかし作成完了の検査や
+/// 「未起動と確定できるか」の判定では、Creating（作成途中で結果が不確定）を Created と同一視してはならない。
+/// 判定は [`RuntimeContainerStatus::lifecycle`] のこの値で行う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RuntimeLifecycle {
+    /// 作成途中（完了未確定）。
+    Creating,
+    /// 作成完了・未起動。
+    Created,
+    /// 実行中。
+    Running,
+    /// 停止済み。
+    Stopped,
+    /// 未知の状態（将来追加される状態を含む）。
+    Unknown,
+}
 
 /// `ContainerRuntime` の状態照会結果を CRI 側の語彙へ写した値（CRI-2）。
 ///
@@ -44,6 +67,8 @@ pub struct RuntimeContainerStatus {
     /// CRI の状態。Creating・Created は `ContainerCreated`、Running は `ContainerRunning`、
     /// Stopped は `ContainerExited`、将来追加される未知の状態は `ContainerUnknown` に写す。
     pub state: CriContainerState,
+    /// 実行層が報告した生の状態。完了・未起動の厳密な判定はこちらで行う（`state` は Creating を Created に写す）。
+    pub lifecycle: RuntimeLifecycle,
     /// init プロセスの PID（判明していれば）。
     pub pid: Option<u32>,
     /// 終了コード（Stopped で判明していれば）。
@@ -52,17 +77,32 @@ pub struct RuntimeContainerStatus {
 
 impl From<&ContainerStatus> for RuntimeContainerStatus {
     fn from(s: &ContainerStatus) -> Self {
-        let state = match s.state() {
-            ContainerState::Creating | ContainerState::Created => {
-                CriContainerState::ContainerCreated
-            }
-            ContainerState::Running => CriContainerState::ContainerRunning,
-            ContainerState::Stopped => CriContainerState::ContainerExited,
-            _ => CriContainerState::ContainerUnknown,
+        let (state, lifecycle) = match s.state() {
+            ContainerState::Creating => (
+                CriContainerState::ContainerCreated,
+                RuntimeLifecycle::Creating,
+            ),
+            ContainerState::Created => (
+                CriContainerState::ContainerCreated,
+                RuntimeLifecycle::Created,
+            ),
+            ContainerState::Running => (
+                CriContainerState::ContainerRunning,
+                RuntimeLifecycle::Running,
+            ),
+            ContainerState::Stopped => (
+                CriContainerState::ContainerExited,
+                RuntimeLifecycle::Stopped,
+            ),
+            _ => (
+                CriContainerState::ContainerUnknown,
+                RuntimeLifecycle::Unknown,
+            ),
         };
         Self {
             id: s.id().as_str().to_owned(),
             state,
+            lifecycle,
             pid: s.pid().map(|p| p.get()),
             exit_code: s.exit_code(),
         }
@@ -109,6 +149,30 @@ pub fn trait_error_to_status(err: &TraitError) -> Status {
     Status::new(code, msg)
 }
 
+/// CRI の `ContainerConfig` から OCI bundle（rootfs と `config.json`）を用意する注入点（TASK-59.2・#438・CRI-2）。
+///
+/// `CreateContainer` ハンドラが `ContainerRuntime::create` を呼ぶ直前に呼ぶ。CRI の要求は bundle の
+/// パスを持たないため、image の展開と `ContainerConfig` から `config.json` への変換は本トレイトの実装側の
+/// 責務とする。同期 API で、ハンドラは tokio の blocking pool を使わず専用スレッド（worker）上から呼ぶ。
+///
+/// **未実装（REPAIR-3）**: 本番の実装（image 展開・config 変換・パスの検証）は未提供で、本リポでは
+/// テスト用の実装だけがある。`config` の内容（envs 等の秘密値を含みうる）をエラー文言へ含めないこと。
+pub trait BundleProvider: Send + Sync {
+    /// コンテナ用の bundle を用意し、その絶対パスを返す。失敗は ERR-3 の gRPC ステータスで返す。
+    fn prepare(
+        &self,
+        container_id: &str,
+        sandbox_id: &str,
+        config: &ContainerConfig,
+    ) -> Result<PathBuf, Status>;
+
+    /// `prepare` で用意した資源を解放する（`create` 失敗時の後始末。stop・delete の接続は TASK-59.3）。
+    ///
+    /// 削除・解除に失敗したら `Err` を返す。呼び出し側は `Err` のとき資源が残っているとみなし、
+    /// コンテナの記録と件数枠を保持して追跡を失わない（fail-closed）。不在は `Ok` としてよい。
+    fn release(&self, container_id: &str) -> Result<(), Status>;
+}
+
 /// RPC ハンドラから `ContainerRuntime` を呼ぶアダプタ（CRI-2・CRI-7）。
 ///
 /// トレイトオブジェクト（[`RuntimeAdapter::new`]）とジェネリクス（[`RuntimeAdapter::from_runtime`]）の
@@ -144,13 +208,13 @@ impl RuntimeAdapter {
     pub fn create(&self, id: &str, bundle: PathBuf) -> Result<RuntimeContainerStatus, Status> {
         let req =
             CreateRequest::new(Self::id(id)?, bundle).map_err(|e| trait_error_to_status(&e))?;
-        Self::finish(self.runtime.create(&req))
+        Self::finish(id, self.runtime.create(&req))
     }
 
     /// `created` 状態のコンテナを開始する。
     pub fn start(&self, id: &str) -> Result<RuntimeContainerStatus, Status> {
         let req = StartRequest::new(Self::id(id)?);
-        Self::finish(self.runtime.start(&req))
+        Self::finish(id, self.runtime.start(&req))
     }
 
     /// SIGTERM 後 `timeout_secs` 秒で SIGKILL へ切り替えて停止する。
@@ -159,7 +223,7 @@ impl RuntimeAdapter {
     pub fn stop(&self, id: &str, timeout_secs: i64) -> Result<RuntimeContainerStatus, Status> {
         let grace = Duration::from_secs(u64::try_from(timeout_secs).unwrap_or(0));
         let req = StopRequest::new(Self::id(id)?, grace).map_err(|e| trait_error_to_status(&e))?;
-        Self::finish(self.runtime.stop(&req))
+        Self::finish(id, self.runtime.stop(&req))
     }
 
     /// コンテナの資源を解放する（`ContainerRuntime::delete`）。`force` は実行中でも停止してから削除する。
@@ -176,19 +240,28 @@ impl RuntimeAdapter {
     pub fn kill(&self, id: &str, signal: u8) -> Result<RuntimeContainerStatus, Status> {
         let signal = Signal::new(signal).map_err(|e| trait_error_to_status(&e))?;
         let req = KillRequest::new(Self::id(id)?, signal);
-        Self::finish(self.runtime.kill(&req))
+        Self::finish(id, self.runtime.kill(&req))
     }
 
     /// コンテナの現在状態を照会する。
     pub fn state(&self, id: &str) -> Result<RuntimeContainerStatus, Status> {
         let req = StateRequest::new(Self::id(id)?);
-        Self::finish(self.runtime.state(&req))
+        Self::finish(id, self.runtime.state(&req))
     }
 
-    fn finish(r: Result<ContainerStatus, TraitError>) -> Result<RuntimeContainerStatus, Status> {
-        r.as_ref()
-            .map(RuntimeContainerStatus::from)
-            .map_err(trait_error_to_status)
+    /// 実行層の応答を CRI の語彙へ写す。応答の ID が要求の ID と異なれば plugin の不正な応答として
+    /// `INTERNAL`（結果不明）で拒否する（plugin 入力は untrusted。別コンテナの状態を受理しない）。
+    fn finish(
+        expected_id: &str,
+        r: Result<ContainerStatus, TraitError>,
+    ) -> Result<RuntimeContainerStatus, Status> {
+        let status = r.as_ref().map_err(trait_error_to_status)?;
+        if status.id().as_str() != expected_id {
+            return Err(Status::internal(
+                "runtime returned a status for a different container id",
+            ));
+        }
+        Ok(RuntimeContainerStatus::from(status))
     }
 }
 
@@ -231,13 +304,30 @@ mod tests {
                 Some(137),
             ),
         ];
-        for (src, state, pid, code) in cases {
+        let lifecycles = [
+            RuntimeLifecycle::Creating,
+            RuntimeLifecycle::Created,
+            RuntimeLifecycle::Running,
+            RuntimeLifecycle::Stopped,
+        ];
+        for ((src, state, pid, code), lifecycle) in cases.into_iter().zip(lifecycles) {
             let got = RuntimeContainerStatus::from(&src);
+            assert_eq!(got.lifecycle, lifecycle);
             assert_eq!(got.id, "a");
             assert_eq!(got.state, state);
             assert_eq!(got.pid, pid);
             assert_eq!(got.exit_code, code);
         }
+    }
+
+    /// CRI-2: 応答の ID が要求と異なれば拒否する。
+    #[test]
+    fn cri2_finish_rejects_mismatched_id() {
+        let ok = RuntimeAdapter::finish("a", Ok(ContainerStatus::creating(cid("a"))));
+        assert_eq!(ok.unwrap().id, "a");
+        let err = RuntimeAdapter::finish("a", Ok(ContainerStatus::created(cid("b"), None)))
+            .expect_err("mismatch");
+        assert_eq!(err.code(), Code::Internal);
     }
 
     /// CRI-2: 削除応答を CRI 側の型へ写す。

@@ -13,7 +13,8 @@
 //!    手順 10 以降のログ捕捉・restart のワーカーと、制御チャネルの accept スレッド〔`control`。#2058〕に限る）／
 //!    2b. supervisor の構造化ログの保存先を開き、`stderr_sink` の書き先を差し替える（レコードがあるときだけ。期限つきの
 //!    作業スレッドで行い終了を確認してから進む。失敗は fail-closed。保存先と上限は [`crate::supervisor_log`]。#2067・REPAIR-4）／
-//! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし）／4. [`StartDeps::check_launcher_available`]
+//! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし。Running・pid なしの予約が残っていれば
+//!    [`StartDeps::recover_interrupted`] で Created へ戻して `FailedPrecondition` を報告する。#2011）／4. [`StartDeps::check_launcher_available`]
 //!    （副作用なし。権限モデルと Landlock ABI を確かめ、満たさなければここで止まる）／5. cgroup の連鎖
 //!    （[`StartDeps::prepare_cgroup`]）／6. 監査 sink（[`StartDeps::build_audit_sink`]。fork の前）・ログ sink／
 //!    7. launcher の構築と [`SpecCapturingLauncher`] での包み／8. `oci_runtime::start`（**入口スレッドが直接行う**）／
@@ -51,6 +52,10 @@
 //! - 後始末を確かめられなければ終了コードは `INTERNAL`。後始末自体の失敗は元のエラーを隠さず、構造化ログ（stderr）に出す。
 //! - 失敗した start の後もスコープは記録されたまま残る（core に記録済みの配置から連鎖を再開する API が無い）。
 //!   同じコンテナの再 start は手順 3 で `FailedPrecondition` になる。
+//! - 別プロセスの supervisor が落ちて予約（Running・pid なし）だけが残った場合、次の `start` は手順 3 で
+//!   [`StartDeps::recover_interrupted`] を呼ぶ（core が記録済みの cgroup 配置から残存を確かめ、居れば止めて Created へ戻す。
+//!   CLI は状態を書かず、回復は supervisor が行う）。戻した後もその start は続けず、`FailedPrecondition`
+//!   （`delete` と再作成を促す）を報告する。回復に失敗したらそのエラーを報告し、予約は残る（再試行できる）。
 //!
 //! # 未実装・残余（REPAIR-3）
 //! - **restart の再 launch**: 本番 launcher の結線は済んでいる（start と同じ launcher と `LaunchSpec` を使う）が、
@@ -135,6 +140,25 @@ pub trait StartDeps {
 
     /// 作った cgroup を消す（`remove_child`）。mkdir 前なら何もしない。
     fn release_cgroup(&mut self) -> Result<(), TraitError>;
+
+    /// 手順 3: 前の supervisor が start の途中で落ち、起動権の予約（Running・pid なし）だけが残っているコンテナを、
+    /// Created へ戻す（別プロセスからの回復。`oci_runtime::recover_interrupted_start`。#2011・CORE-2・SEC-1）。
+    ///
+    /// 成功しても入口はその start を続けない（記録済みの配置から連鎖を再開する API が無いため。モジュール doc）。
+    /// 既定実装は回復の手段を持たないため fail-closed で `Unimplemented`（フェイクの [`StartDeps`] は上書きしなくてよい）。
+    /// cgroup の連鎖には触れない（スコープは記録済みで、`prepare_cgroup` / `release_cgroup` は呼ばれない）。
+    fn recover_interrupted(
+        &mut self,
+        store: &dyn StateStore,
+        id: &ContainerId,
+        timeouts: &StartTimeouts,
+    ) -> Result<(), TraitError> {
+        let _ = (store, id, timeouts);
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "recovering an interrupted start is not supported",
+        ))
+    }
 }
 
 /// 起動に成功したコンテナの、監視に必要なもの。
@@ -744,7 +768,7 @@ impl StartWorker {
             .spawn(move || {
                 worker_tid.store(current_tid(), Ordering::Release);
                 let mut deps = deps;
-                let outcome = prepare_start(deps.as_mut(), &store, &req);
+                let outcome = prepare_start(deps.as_mut(), &store, &req, &timeouts);
                 let (lock, cvar) = &*worker_shared;
                 let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
                 if matches!(*slot, WorkerSlot::Abandoned) {
@@ -1007,6 +1031,7 @@ fn prepare_start(
     deps: &mut dyn StartDeps,
     store_arc: &Arc<dyn StateStore>,
     req: &StartRequest,
+    timeouts: &StartTimeouts,
 ) -> PrepareOutcome {
     let fail = |e: TraitError, cleanup: Cleanup| PrepareOutcome::Failed {
         error: op_err(e),
@@ -1019,6 +1044,21 @@ fn prepare_start(
         Err(e) => return fail(e, Cleanup::Nothing),
     };
     let status = observed.status();
+    // 前の supervisor が落ちて残った起動権の予約(Running・pid なし)は、記録済みの cgroup 配置で残存を確かめて
+    // Created へ戻す(#2011)。戻した後もこの start は続けない: 配置は記録済みで連鎖を再開できないため、
+    // `delete` と再作成を促す(下の「スコープ記録済み」の拒否と同じ理由)。cgroup には触れない。
+    if status.state() == ContainerState::Running && status.pid().is_none() {
+        return match deps.recover_interrupted(store, req.id(), timeouts) {
+            Ok(()) => fail(
+                TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "an interrupted start was recovered; delete and recreate the container",
+                ),
+                Cleanup::Nothing,
+            ),
+            Err(e) => fail(e, Cleanup::Nothing),
+        };
+    }
     if status.state() != ContainerState::Created || status.pid().is_some() {
         return fail(
             TraitError::new(
@@ -1867,6 +1907,26 @@ mod linux {
                 .cgroup_join_source(move || source.join_hook())
                 .build()?;
             Ok(Arc::new(launcher))
+        }
+
+        /// 参加フックの源を持たない `ProductionLauncher` で `recover_interrupted_start` を呼ぶ(launch はしないので
+        /// 参加フックは要らず、`prepare_cgroup` も通さない。記録済みの配置で残存を確かめる)。構築は child subreaper
+        /// 化の副作用を持つが、この経路は直後に fail-closed で終わる。
+        fn recover_interrupted(
+            &mut self,
+            store: &dyn StateStore,
+            id: &ContainerId,
+            timeouts: &StartTimeouts,
+        ) -> Result<(), TraitError> {
+            let privilege = self.privilege.clone()?;
+            let audit = crate::exec::default_audit_sink(Some(self.root.clone()))?;
+            let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+                ProductionLauncher::builder()
+                    .privilege(privilege)
+                    .audit_sink(Arc::new(audit))
+                    .build()?,
+            );
+            recover_interrupted_start(store, &launcher, id, timeouts).map(drop)
         }
 
         fn release_cgroup(&mut self) -> Result<(), TraitError> {

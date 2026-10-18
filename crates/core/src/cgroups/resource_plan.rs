@@ -72,8 +72,15 @@ impl TryFrom<&LinuxResourceLimits> for ResourceLimitPlan {
                     .transpose()
                     .map_err(|_| out_of_range("linux.resources.memory.swap"))?,
             }),
-            // swap だけの指定は、パーサが拒否済み（合計表現にはメモリ上限が要る）。到達したら不整合として拒否する。
-            (None, Some(_)) => return Err(out_of_range("linux.resources.memory.swap")),
+            // `memory.limit` なしの `swap = -1`（無制限）はパーサが受理する。メモリも無制限として扱う（CORE-3）。
+            (None, Some(ByteLimit::Max)) => Some(MemoryLimits {
+                memory_max: MemoryLimit::Max,
+                swap_max: Some(MemoryLimit::Max),
+            }),
+            // 有限の swap だけの指定は、パーサが拒否済み（合計表現にはメモリ上限が要る）。到達したら不整合として拒否する。
+            (None, Some(ByteLimit::Bytes(_))) => {
+                return Err(out_of_range("linux.resources.memory.swap"));
+            }
         };
         let cpu = match (limits.cpu_quota(), limits.cpu_period()) {
             (None, None) => None,
@@ -211,6 +218,20 @@ mod tests {
         assert_eq!(
             io.required_controllers(),
             ControllerSet::of(&[Controller::Io])
+        );
+    }
+
+    /// CORE-3: `memory.limit` なしの `swap = -1` は `memory.max` も `max` にして swap も `max` にする。
+    #[test]
+    fn core3_plan_maps_swap_unlimited_without_memory_limit() {
+        let plan =
+            ResourceLimitPlan::try_from(&limits(json!({"memory": {"swap": -1}}))).expect("plan");
+        let memory = plan.memory.expect("memory");
+        assert_eq!(memory.memory_max, MemoryLimit::Max);
+        assert_eq!(memory.swap_max, Some(MemoryLimit::Max));
+        assert_eq!(
+            plan.required_controllers(),
+            ControllerSet::of(&[Controller::Memory])
         );
     }
 

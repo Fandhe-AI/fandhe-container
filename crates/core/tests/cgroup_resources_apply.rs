@@ -115,19 +115,15 @@ mod linux {
                 read("io.max"),
                 format!("{dev} rbps=1048576 wbps=max riops=max wiops=max")
             );
-            let weight_file = if dir.join("io.bfq.weight").exists() {
-                "io.bfq.weight"
+            // weight 500 の読み戻し。BFQ は数値のみ（500）か `default 500`、`io.weight` は変換後の `default 4950`。
+            let (weight_file, expected): (&str, &[&str]) = if dir.join("io.bfq.weight").exists() {
+                ("io.bfq.weight", &["500", "default 500"])
             } else {
-                "io.weight"
+                ("io.weight", &["default 4950"])
             };
             let first = read(weight_file);
-            assert!(
-                first
-                    .lines()
-                    .next()
-                    .is_some_and(|l| l.starts_with("default ")),
-                "{first}"
-            );
+            let line = first.lines().next().unwrap_or("");
+            assert!(expected.contains(&line), "{first}");
         }
 
         drop(start);

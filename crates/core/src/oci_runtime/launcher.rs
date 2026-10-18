@@ -91,7 +91,10 @@
 //! - bind mount（`LaunchSpec::bind_mounts`。#1915）は載せる。fork 前に既定 tmpfs との重なりを検査して
 //!   `PrePivotSetup.binds` へ渡し、restart の再 launch でも同じ集合を使う。`ro` の bind は Landlock の
 //!   `WriteRestrictionShadowed` で fork 前に拒否される（#1917 で解消するまでの想定挙動）
-//! - bind 以外の `mounts[]` の種類と `/dev` 以外の tmpfs の注入は `start` が拒否済みで、ここでは載せない
+//! - `/sys` の sysfs（`LaunchSpec::sysfs_mount`。#2020）は載せる。`PrePivotSetup.sysfs` へ渡し、restart の再 launch でも
+//!   同じ指定を使う。方式（新しい sysfs か、ホストの `/sys` の読み取り専用 rbind か）は pivot 前段が user namespace から
+//!   事前に決める。本番の `start` 経路は user namespace を必須とするため、実際には rbind になる
+//! - bind・`/sys` の sysfs 以外の `mounts[]` の種類と `/dev` 以外の tmpfs の注入は `start` が拒否済みで、ここでは載せない
 
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
@@ -110,6 +113,8 @@ use super::cgroup_requirement::{CgroupJoinMeans, launch_after_cgroup_check};
 #[cfg(target_os = "linux")]
 use super::config::NamespaceKind;
 use super::launch::{LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher};
+#[cfg(target_os = "linux")]
+use super::sysfs_mount::SysfsMountSpec;
 use crate::audit_log::AuditSink;
 #[cfg(target_os = "linux")]
 use crate::audit_log::AuditedRejection;
@@ -559,6 +564,8 @@ struct SpawnInput<'a> {
     tmpfs: &'a TmpfsMountSet,
     /// 適用する bind mount の集合(空なら `None`。#1915)。
     binds: Option<&'a BindMountSet>,
+    /// 供給する `/sys` の sysfs(無ければ `None`。#2020)。
+    sysfs: Option<&'a SysfsMountSpec>,
     /// 範囲写像で起動するときの解決済み写像(`None` なら単一 ID 写像。CORE-6・#2009)。
     subordinate: Option<&'a SubordinateIds>,
 }
@@ -827,6 +834,7 @@ impl Inner {
                 timeout,
                 tmpfs: &default_tmpfs,
                 binds,
+                sysfs: spec.sysfs_mount(),
                 subordinate: self.subordinate.as_ref(),
             })
             .map_err(|failure| self.absorb_failure(id, *failure))?;
@@ -1257,6 +1265,7 @@ impl LaunchOps for RealOps {
             tmpfs: Some(input.tmpfs),
             inject: None,
             binds: input.binds,
+            sysfs: input.sysfs,
             pinned_rootfs: Some(input.spec.rootfs_dir().as_fd()),
             config_paths: ConfigPaths {
                 readonly: input.spec.config().readonly_paths(),

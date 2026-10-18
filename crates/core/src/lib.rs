@@ -21,7 +21,7 @@
 //!
 //! - `traits`: 拡張点トレイト（実装済み。TASK-4 系）
 //! - `sanitize`: 表示を乱す文字（Cc・Cf・Zl・Zp）の判定と有界追記の共通実装（公開 API `sanitize_display_bounded` は cli も利用。ERR-2・SEC-4・TASK-96.1）
-//! - `exec`: 最小実行フロー（Linux 限定。稼働中コンテナへの exec〔SUP-6・TASK-163.1〜163.4。pid1 特定と `setns(2)` 参加は `exec/setns.rs`、cgroup join は `exec/cgroup_join.rs`、制限の再適用は `exec/reapply.rs`、fork・`close_range`・`execveat` は `exec/exec_command.rs`。user namespace への参加は未実装で、対象が別の user namespace にいれば拒否する。実コンテナへの通し試験は実機前提で、CI では実行していない〕も持つ。namespace 分離〔TASK-27.2〕と `pivot_root` による
+//! - `exec`: 最小実行フロー（Linux 限定。稼働中コンテナへの exec〔SUP-6・TASK-163.1〜163.4。pid1 特定と `setns(2)` 参加は `exec/setns.rs`、cgroup join は `exec/cgroup_join.rs`、制限の再適用は `exec/reapply.rs`、fork・`close_range`・`execveat` は `exec/exec_command.rs`。user namespace への参加は未実装で、対象が別の user namespace にいれば拒否する。実コンテナへの通し試験は実機前提で、CI では実行していない〕も持つ。`mounts[]` の sysfs を読み取り専用で `/sys` に供給する段〔`exec/sysfs.rs`・#2020・SEC-2〕も持つ。namespace 分離〔TASK-27.2〕と `pivot_root` による
 //!   rootfs 切替〔TASK-27.3〕、基本デバイスノード作成〔TASK-27.6。`exec/devices.rs`。
 //!   Issue 表記の `src/devices.rs` ではなく `exec` 配下に置く: 段の型 `ExecError`・`MountIsolation`
 //!   の検証が `exec` の非公開項目のため〕、fork / exec による子プロセス起動〔TASK-27.4.1。最小構成でフック無し〕、順序固定のステージ列の枠〔TASK-27.4.2。`exec/stages.rs`。`NO_NEW_PRIVS`〔TASK-27.4.3〕と capability 削減〔TASK-37.2〕のみ固定ステージとして実装済み〕が

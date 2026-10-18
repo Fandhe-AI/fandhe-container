@@ -13,7 +13,8 @@
 //!
 //! # 受け入れ規則
 //!
-//! - 種類: bind のみ（`type == "bind"`、または options に `bind` / `rbind`）。それ以外は `UNIMPLEMENTED`
+//! - 種類: bind のみ（`type == "bind"`、または options に `bind` / `rbind`）。それ以外は `UNIMPLEMENTED`。
+//!   ただし bind でない `type == "sysfs"` は読み飛ばし（位置は元のまま）、`SysfsMountSpec` が受ける（#2020）
 //! - 受けるオプション: `bind`・`rbind`・`ro`・`rw`・`nosuid`・`nodev`・`noexec`・`exec`・`private`・`rprivate`
 //! - 拒否: `suid`・`dev`（制限を外す側。SEC-1）、`shared`・`rshared`・`slave`・`rslave`・`unbindable`・
 //!   `runbindable`（伝播）、上記以外すべて（未知は fail-closed）
@@ -81,6 +82,7 @@ use std::path::Path;
 
 use super::config::{CONFIG_MAX_MOUNTS, CONFIG_MAX_PATH_BYTES, OciMount};
 use super::mount_destination::MountDestination;
+use super::sysfs_mount::OciMountKind;
 use crate::audit_log::{AuditSink, AuditedRejection, record_mount_rejection};
 use crate::injected_files::{InjectedFileSet, overlaps};
 use crate::path_masks::ProtectedPath;
@@ -450,6 +452,10 @@ impl BindMountSet {
         }
         let mut out: Vec<BindMountSpec> = Vec::with_capacity(mounts.len());
         for (index, m) in mounts.iter().enumerate() {
+            // `/sys` の sysfs は `SysfsMountSpec` が受ける（#2020）。位置（index）は元の `mounts[]` のまま保つ。
+            if OciMountKind::of(m) == OciMountKind::Sysfs {
+                continue;
+            }
             let opts = parse_options(index, m)?;
             let source = validate_source(index, m)?;
             let dest = m.mount_destination();
@@ -834,10 +840,28 @@ mod tests {
         }
     }
 
+    /// OCI-4・SEC-2（#2020）: `/sys` の sysfs は bind 側で読み飛ばされ、後続の bind の位置は元のまま残る。
+    #[test]
+    fn oci4_bind_skips_sysfs_and_keeps_indexes() {
+        let s = set(json!([
+            one(Some("sysfs"), "/sys", Some("sysfs"), &["ro", "nosuid"]),
+            one(Some("bind"), "/a", Some("/data/a"), &[]),
+            one(Some("sysfs"), "/anywhere", None, &["rw"]),
+            one(Some("bind"), "/b", Some("/data/b"), &[]),
+        ]))
+        .expect("sysfs entries are not the bind set's concern");
+        let seen: Vec<_> = s
+            .mounts()
+            .iter()
+            .map(|m| (m.index(), m.destination().as_str().to_owned()))
+            .collect();
+        assert_eq!(seen, [(1, "/a".to_owned()), (3, "/b".to_owned())]);
+    }
+
     /// OCI-4: bind 以外の種類は UNIMPLEMENTED。位置を照合する。
     #[test]
     fn oci4_bind_rejects_non_bind_types() {
-        for ty in ["proc", "tmpfs", "sysfs", "devpts", "mqueue", "cgroup"] {
+        for ty in ["proc", "tmpfs", "devpts", "mqueue", "cgroup"] {
             let (k, i, c) = kind_of(json!([
                 bind(&[]),
                 one(Some(ty), "/x", Some("/data/x"), &["nosuid"])

@@ -119,13 +119,13 @@ use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_
 use super::stages::{LaunchNotReady, LaunchReady};
 use super::{
     DeviceReport, DevptsGidSource, ExecError, IsolationStage, MountIsolation, PivotReport,
-    StagePipeline, ViolationReason, describe, fd_mount_id, inject_files, mount_tmpfs, pivot_root,
-    prepare_rootfs,
+    StagePipeline, ViolationReason, describe, fd_mount_id, inject_files, mount_sysfs, mount_tmpfs,
+    pivot_root, prepare_rootfs,
 };
 use crate::dev_mounts::ImplicitDevMount;
 use crate::injected_files::InjectedFileSet;
 use crate::landlock::{MountedBy, MountedTarget, MountedTargets};
-use crate::oci_runtime::BindMountSet;
+use crate::oci_runtime::{BindMountSet, SysfsMountSpec};
 use crate::path_masks::ProtectedPath;
 use crate::tmpfs::TmpfsMountSet;
 
@@ -1878,6 +1878,10 @@ pub(crate) struct PrePivotSetup<'a> {
     /// 本番 launcher が tmpfs を検査済み。#1915）が `check_against_*` を通した集合を渡す。[`run_pre_pivot`] は tmpfs・注入・
     /// 保護パスとの重なりを副作用の前に再検査する（多重防御）。本番の launcher は `LaunchSpec::bind_mounts` が非空のときだけ渡す。
     pub(crate) binds: Option<&'a BindMountSet>,
+    /// `verify_pinned` の直後（`create_default_devices` の前）に供給する `/sys` の sysfs（無ければ載せない。
+    /// #2020・SEC-2・OCI-4）。procfs を `prepare_rootfs` が載せるのと対の位置で、`readonly_paths` より前に
+    /// 載せて、その再帰 bind と読み取り専用化が上に載るようにする。
+    pub(crate) sysfs: Option<&'a SysfsMountSpec>,
     /// 検証済みの rootfs を固定した fd。あれば `prepare_rootfs` の後、パスから辿り直した実体が同じ
     /// `(st_dev, st_ino)` であることを確かめる（検証後の差し替え対策）。
     pub(crate) pinned_rootfs: Option<BorrowedFd<'a>>,
@@ -1922,6 +1926,13 @@ trait PrePivotOps {
         &self,
         prepared: &Self::Prepared,
         pinned: BorrowedFd<'_>,
+    ) -> Result<(), ExecError>;
+    /// `/sys` への読み取り専用の sysfs の供給（#2020）。procfs と対の位置で、`readonly_paths` より前に載せる。
+    fn mount_sysfs(
+        &self,
+        isolation: &Self::Isolation,
+        prepared: &Self::Prepared,
+        spec: &SysfsMountSpec,
     ) -> Result<(), ExecError>;
     fn create_default_devices(
         &self,
@@ -2057,6 +2068,17 @@ impl PrePivotOps for RealPrePivotOps {
             Ok((meta.dev(), meta.ino()))
         };
         check_rootfs_identity(identity(pinned)?, identity(prepared.new_root())?)
+    }
+
+    fn mount_sysfs(
+        &self,
+        isolation: &MountIsolation,
+        prepared: &PreparedRootfs,
+        spec: &SysfsMountSpec,
+    ) -> Result<(), ExecError> {
+        // `/sys` の Landlock ルールは作らない（`landlock::rules` の doc。VFS の ro と `readonly_paths` が書き込みを塞ぐ）ため、
+        // `self.record` による識別子の記録はしない。載せたマウントは `readonly_paths` が最上位を入れ替える。
+        mount_sysfs(isolation, prepared, spec).map(|_| ())
     }
 
     fn create_default_devices(
@@ -2199,7 +2221,7 @@ fn check_bind_overlaps(
 
 /// pivot までの前段を固定順で実行する（TASK-29 追補・#1715。CORE-1）。順序はここだけが決める:
 ///
-/// `establish` → `prepare_rootfs` → （固定した rootfs との照合）→ `create_default_devices` →
+/// `establish` → `prepare_rootfs` → （固定した rootfs との照合）→ `mount_sysfs`（指定時）→ `create_default_devices` →
 /// `mount_tmpfs`（指定時）→ `inject_files`（指定時）→ `mount_binds`（指定時）→ `readonly_paths`（常時）→
 /// `masked_paths`（`setup` 指定時）→ `pivot_root`。
 ///
@@ -2241,7 +2263,8 @@ fn check_bind_overlaps(
 ///
 /// `/proc`・`/sys` との順序（#2005・SEC-2）: procfs は `prepare_rootfs` が `rootfs/proc` にマウント済みで、
 /// `readonly_paths`・`masked_paths` はその上に載る。pivot 後にはマウントしない（後からのマウントは保護を覆い隠す）。
-/// sysfs（TASK-127）を供給するときは `readonly_paths` より前に載せる。順序は単体テスト
+/// `mounts[]` の sysfs（`mount_sysfs`。#2020）は `verify_pinned` の直後（`create_default_devices` の前）に載せ、
+/// `readonly_paths` の再帰 bind と読み取り専用化がその上に載るようにする。順序は単体テスト
 /// `core1_run_pre_pivot_order_is_fixed` が、積み方は結合試験 `readonly_paths`・`masked_paths` が検査する。
 fn run_pre_pivot<O: PrePivotOps>(
     ops: &O,
@@ -2259,6 +2282,10 @@ fn run_pre_pivot<O: PrePivotOps>(
         if let Some(pinned) = setup.pinned_rootfs {
             ops.verify_pinned(&prepared, pinned)
                 .map_err(StepError::at(S::VerifyPinned))?;
+        }
+        if let Some(spec) = setup.sysfs {
+            ops.mount_sysfs(&isolation, &prepared, spec)
+                .map_err(StepError::at(S::MountSysfs))?;
         }
         let created = ops
             .create_default_devices(&isolation, &prepared, setup.devices)
@@ -2531,11 +2558,64 @@ where
                 tmpfs: None,
                 inject: None,
                 binds: None,
+                sysfs: None,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths {
                     readonly: &readonly,
                     masked: &masked,
                 },
+                status: None,
+            };
+            let result = run_child_then(
+                rootfs,
+                Some(setup),
+                stages,
+                |isolation, _report, _evidence| {
+                    isolation.verify_caller(IsolationStage::Exec)?;
+                    probe();
+                    Ok(())
+                },
+            );
+            match result {
+                Ok(()) => 0,
+                Err(err) => {
+                    let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
+                    exit_code_for(&err)
+                }
+            }
+        },
+        EXIT_SETUP_FAILED,
+    )
+    .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
+    Ok(ContainerChild::new(pid))
+}
+
+/// [`spawn_container_probe_with_devices`] に `/sys` の sysfs の供給（`mount_sysfs`。#2020・SEC-2）を足した版。
+/// 子は本番と同じ順序（`verify_pinned` の直後に `mount_sysfs` → `create_default_devices` → `readonly_paths` →
+/// `masked_paths` → `pivot_root`）で適用してから、pivot 後に `probe` を実行する。結合試験 `tests/sysfs_mount.rs`
+/// 専用で、本番 launcher には依存しない。`spawn_container_probe` と同じ制限適用証跡の例外・契約・将来仕様に従う（REPAIR-3）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub fn spawn_container_probe_with_sysfs<F>(
+    rootfs: &Path,
+    stages: StagePipeline,
+    devices: DevptsGidSource<'_>,
+    sysfs: &SysfsMountSpec,
+    probe: F,
+) -> Result<ContainerChild, ExecError>
+where
+    F: FnOnce(),
+{
+    let pid = sys::fork_single_threaded(
+        move || {
+            let setup = PrePivotSetup {
+                devices,
+                tmpfs: None,
+                inject: None,
+                binds: None,
+                sysfs: Some(sysfs),
+                pinned_rootfs: None,
+                config_paths: ConfigPaths::NONE,
                 status: None,
             };
             let result = run_child_then(
@@ -2717,6 +2797,7 @@ pub fn spawn_container_with_stages_and_devices(
                 tmpfs: None,
                 inject: None,
                 binds: None,
+                sysfs: None,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
@@ -5129,6 +5210,11 @@ mod tests {
                 IsolationStage::MountTmpfs,
                 "injected failure",
             ),
+            "mount_sysfs" => ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::MountSysfs,
+                "injected failure",
+            ),
             "mount_binds" => ExecError::from_violation_at(
                 ViolationReason::BindSourceNotAccessible,
                 None,
@@ -5179,6 +5265,9 @@ mod tests {
         fn verify_pinned(&self, _: &(), _: BorrowedFd<'_>) -> Result<(), ExecError> {
             self.step("verify_pinned")
         }
+        fn mount_sysfs(&self, _: &(), _: &(), _: &SysfsMountSpec) -> Result<(), ExecError> {
+            self.step("mount_sysfs")
+        }
         fn create_default_devices(
             &self,
             _: &(),
@@ -5218,6 +5307,20 @@ mod tests {
         }
     }
 
+    /// 検証済みの sysfs の指定 1 件（実マウントはしない）。
+    fn test_sysfs() -> SysfsMountSpec {
+        use crate::oci_runtime::parse_config_bytes;
+        let v = serde_json::json!({
+            "ociVersion": "1.2.0",
+            "root": {"path": "rootfs"},
+            "mounts": [{"destination": "/sys", "type": "sysfs", "options": ["ro"]}],
+        });
+        let cfg = parse_config_bytes(v.to_string().as_bytes()).expect("valid config");
+        SysfsMountSpec::from_mounts(cfg.mounts())
+            .expect("valid sysfs")
+            .expect("present")
+    }
+
     /// 重なり検査を通る bind 1 件の集合（宛先のみ意味を持つ。実マウントはしない）。
     fn test_binds(dest: &str) -> BindMountSet {
         use crate::oci_runtime::parse_config_bytes;
@@ -5231,7 +5334,7 @@ mod tests {
     }
 
     /// CORE-1・CORE-5（TASK-29 追補・#1715）: pivot 前の段は
-    /// `establish` → `prepare_rootfs` → `verify_pinned` → `create_default_devices` → `mount_tmpfs` →
+    /// `establish` → `prepare_rootfs` → `verify_pinned` → `mount_sysfs` → `create_default_devices` → `mount_tmpfs` →
     /// `inject_files` → `mount_binds` → `readonly_paths` → `masked_paths` → `pivot_root` の固定順で呼ばれる（#1914）。
     /// procfs のマウント（`prepare_rootfs`）が保護の段より前であることの照合を兼ねる（#2005・SEC-2）。
     #[test]
@@ -5239,6 +5342,7 @@ mod tests {
         let tmpfs = TmpfsMountSet::new();
         let inject = InjectedFileSet::new();
         let binds = test_binds("/mnt/data");
+        let sysfs = test_sysfs();
         let pinned = std::fs::File::open("/").unwrap();
         let _ = take_calls();
         run_pre_pivot(
@@ -5249,6 +5353,7 @@ mod tests {
                 tmpfs: Some(&tmpfs),
                 inject: Some(&inject),
                 binds: Some(&binds),
+                sysfs: Some(&sysfs),
                 pinned_rootfs: Some(pinned.as_fd()),
                 config_paths: ConfigPaths::NONE,
                 status: None,
@@ -5261,6 +5366,7 @@ mod tests {
                 "establish",
                 "prepare_rootfs",
                 "verify_pinned",
+                "mount_sysfs",
                 "create_default_devices",
                 "mount_tmpfs",
                 "inject_files",
@@ -5284,6 +5390,7 @@ mod tests {
                 tmpfs: None,
                 inject: None,
                 binds: None,
+                sysfs: None,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
@@ -5345,6 +5452,7 @@ mod tests {
             tmpfs: None,
             inject: None,
             binds: None,
+            sysfs: None,
             pinned_rootfs: None,
             config_paths: ConfigPaths::NONE,
             status: None,
@@ -5408,6 +5516,7 @@ mod tests {
                 tmpfs: Some(&tmpfs),
                 inject: None,
                 binds: None,
+                sysfs: None,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
@@ -5438,6 +5547,7 @@ mod tests {
                 tmpfs: None,
                 inject: None,
                 binds: Some(&binds),
+                sysfs: None,
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
@@ -5510,6 +5620,7 @@ mod tests {
                     tmpfs: Some(&tmpfs),
                     inject: Some(&inject),
                     binds: Some(&binds),
+                    sysfs: None,
                     pinned_rootfs: None,
                     config_paths: ConfigPaths {
                         readonly: cfg.readonly_paths(),
@@ -5601,6 +5712,7 @@ mod tests {
                     tmpfs: Some(&tmpfs),
                     inject: Some(&inject),
                     binds: Some(&binds),
+                    sysfs: None,
                     pinned_rootfs: Some(pinned.as_fd()),
                     config_paths: ConfigPaths::NONE,
                     status: None,

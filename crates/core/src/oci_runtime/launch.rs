@@ -37,6 +37,7 @@ use std::time::Duration;
 use super::bind_mounts::BindMountSet;
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
+use super::sysfs_mount::SysfsMountSpec;
 use crate::traits::{CgroupPlacement, ContainerId, ErrorCode, Signal, TraitError};
 
 /// [`StartTimeouts`] の各上限が取れる最大値（無期限相当の値を型で拒否する。REPAIR-5）。
@@ -447,6 +448,8 @@ pub struct LaunchSpec {
     container_id: ContainerId,
     /// `config` と同じ `mounts[]` から `start` が検証した bind mount の集合（#1915）。
     bind_mounts: BindMountSet,
+    /// `config` の `mounts[]` から `start` が検証した `/sys` の sysfs（無ければ `None`。#2020）。
+    sysfs: Option<SysfsMountSpec>,
 }
 
 impl LaunchSpec {
@@ -476,7 +479,23 @@ impl LaunchSpec {
             config,
             container_id,
             bind_mounts,
+            sysfs: None,
         }
+    }
+
+    /// 検証済みの sysfs の指定を載せる（`start` だけが呼ぶ。#2020）。
+    pub(super) fn with_sysfs(mut self, sysfs: Option<SysfsMountSpec>) -> Self {
+        self.sysfs = sysfs;
+        self
+    }
+
+    /// `start` が検証した `/sys` の sysfs（TASK-29 追補・#2020・SEC-2・OCI-4）。
+    ///
+    /// 本番 launcher が pivot 前段の `mount_sysfs` へ渡す。restart でも捕捉した spec を clone して再 launch
+    /// するため同じ指定が再適用される。`None` なら `/sys` には何も供給しない（rootfs の `sys` を読み取り専用に
+    /// するだけの従来の動作）。
+    pub fn sysfs_mount(&self) -> Option<&SysfsMountSpec> {
+        self.sysfs.as_ref()
     }
 
     /// `start` が検証した bind mount の集合（`mounts[]` の指定順。TASK-29 追補・#1915・OCI-4・SEC-1）。

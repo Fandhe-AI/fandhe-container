@@ -252,6 +252,7 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
     pub const CLONE_NEWNET: i32 = 0x4000_0000;
+    pub const MS_RDONLY: u64 = 1;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
@@ -582,6 +583,7 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0x1000_0000;
     pub const CLONE_NEWPID: i32 = 0x2000_0000;
     pub const CLONE_NEWNET: i32 = 0x4000_0000;
+    pub const MS_RDONLY: u64 = 1;
     pub const MS_NOSUID: u64 = 2;
     pub const MS_NODEV: u64 = 4;
     pub const MS_NOEXEC: u64 = 8;
@@ -921,6 +923,7 @@ mod consts {
     pub const CLONE_NEWUSER: i32 = 0;
     pub const CLONE_NEWPID: i32 = 0;
     pub const CLONE_NEWNET: i32 = 0;
+    pub const MS_RDONLY: u64 = 0;
     pub const MS_NOSUID: u64 = 0;
     pub const MS_NODEV: u64 = 0;
     pub const MS_NOEXEC: u64 = 0;
@@ -1686,6 +1689,74 @@ pub(crate) fn mount_proc_at(target: &CStr) -> Result<(), SysError> {
         )
     };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// `target` に sysfs を `ro,nosuid,nodev,noexec` でマウントする（`mounts[]` の sysfs の供給。#2020・SEC-2・OCI-4）。
+///
+/// `crate::exec::mount_sysfs` が、検証済みの O_PATH fd を指す `/proc/thread-self/fd/N` を渡す（[`mount_proc_at`] と同じ。
+/// magic link は fd の実体へ解決されるため、パス文字列を再解決しない）。source・fstype は静的な `"sysfs"`、data は
+/// NULL で、利用者由来の文字列を渡す経路を持たない。新しい sysfs を載せるには、その network namespace を所有する
+/// user namespace の `CAP_SYS_ADMIN` が要る（コンテナが自前の network namespace を持たない現状では、初期 user
+/// namespace のときだけ通る。呼び出し側が事前に方式を選ぶ。縮退はしない）。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が本関数を呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn mount_sysfs_at(target: &CStr) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: `target` は `&CStr` の借用で NUL 終端かつ呼び出しの間生存する。source / fstype は静的な NUL 終端文字列、
+    // data は NULL。フラグは定数の `MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC` のみ。副作用は呼び出しスレッドの
+    // mount namespace へのマウント 1 件の追加に限る。
+    let rc = unsafe {
+        mount(
+            c"sysfs".as_ptr(),
+            target.as_ptr(),
+            c"sysfs".as_ptr(),
+            consts::MS_RDONLY | consts::MS_NOSUID | consts::MS_NODEV | consts::MS_NOEXEC,
+            core::ptr::null(),
+        )
+    };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// [`open_tree_clone_host_sysfs`] へ渡せる、ホストの `/sys`（sysfs と確かめたもの）の fd（#2020・SEC-2・REPAIR-2）。
+///
+/// [`verify_host_sysfs_fd`] だけが作る（フィールドは `sys` の外から触れない）。利用者の bind mount 用の
+/// [`VerifiedBindSourceFd`] とは別の型で、疑似 FS を拒否する bind の検証（#2098）を緩めずに、逆に sysfs であることを
+/// 必須にする。保持するのは検証に使った fd そのもので、検証後にパスを開き直さない。
+#[derive(Debug)]
+pub(crate) struct VerifiedHostSysfsFd(OwnedFd);
+
+/// ホストの `/sys` を `O_PATH|O_NOFOLLOW|O_DIRECTORY` で開き、`statfs.f_type` が sysfs であることを確かめる。
+///
+/// rootless の `/sys` の供給（ホストの sysfs を読み取り専用で再帰 bind する。#2020）の元になる。`/sys` が symlink・
+/// 非ディレクトリ、または sysfs 以外（tmpfs で覆われている等）なら、型を作らず拒否する（fail-closed）。
+/// `/sys` 自身がマウントのルートかどうかは確かめない（sysfs の一部だけが見える構成でも、読み取り専用の同じ sysfs の
+/// 内容に限られ、書き込み経路は増えないため）。呼び出しは `unshare(CLONE_NEWNS)` の後（同じ mount namespace）に限る。
+// テストビルドでは `crate::exec` の dry-run 差し込み点が呼ばないため dead_code を許可する。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn verify_host_sysfs_fd() -> Result<VerifiedHostSysfsFd, SysError> {
+    let fd = open_dir_path_nofollow(None, c"/sys")?;
+    if fs_type(std::os::fd::AsFd::as_fd(&fd))? != SYSFS_MAGIC {
+        return Err(SysError::Os(EINVAL));
+    }
+    Ok(VerifiedHostSysfsFd(fd))
+}
+
+/// `src`（ホストの sysfs と確かめた fd）を、配下のマウントを含めて切り離したマウントとして複製する
+/// （`open_tree(2)` + `OPEN_TREE_CLONE|AT_RECURSIVE`。#2020・SEC-2・CORE-1）。
+///
+/// 常に再帰で複製する。user namespace の中ではホストの `/sys` 配下の子マウント（cgroup2・securityfs 等）がロックされ、
+/// 非再帰の複製は `EINVAL` になる（[`open_tree_clone_bind`] の doc の `__do_loopback` の知見）ため。呼び出し側は
+/// [`set_bind_mount_attrs`] で再帰の `ro,noexec`（`nosuid`・`nodev` は常に付く）を切り離したまま付けてから
+/// [`move_mount_empty_path`] で載せる（属性の無い状態をコンテナから見せない）。前提・`ENOSYS` の扱いは
+/// [`open_tree_clone_bind`] と同じ。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn open_tree_clone_host_sysfs(src: &VerifiedHostSysfsFd) -> Result<OwnedFd, SysError> {
+    open_tree_raw(
+        std::os::fd::AsRawFd::as_raw_fd(&src.0),
+        open_tree_bind_flags(MountTreeScope::Recursive),
+    )
 }
 
 /// tmpfs の `statfs.f_type`（include/uapi/linux/magic.h の `TMPFS_MAGIC`。アーキテクチャ非依存）。
@@ -5319,6 +5390,39 @@ mod tests {
         assert_eq!((EAFNOSUPPORT, EPROTONOSUPPORT, ECONNREFUSED), (97, 93, 111));
         assert_eq!(std::mem::size_of::<SockaddrNl>(), 12);
         assert_eq!(std::mem::size_of::<PollFd>(), 8);
+    }
+
+    /// SEC-2・OCI-4（#2020）: sysfs の供給に使うマウントフラグの具体値（`MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC` = 0xF）。
+    /// libc との機械照合は core に libc が未導入のため、include/uapi/linux/mount.h の値で固定する。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sec2_2020_sysfs_mount_flags_are_exact() {
+        assert_eq!(consts::MS_RDONLY, 1);
+        assert_eq!(
+            consts::MS_RDONLY | consts::MS_NOSUID | consts::MS_NODEV | consts::MS_NOEXEC,
+            0xF
+        );
+    }
+
+    /// SEC-2（#2020）: ホストの `/sys` が sysfs なら検証済みの fd を作れ、複製の前提（sysfs）を満たす。
+    /// `/sys` が無い・sysfs でない環境では `Err`（型を作らない）。複製自体は特権依存のため結合試験で確かめる。
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn sec2_2020_verify_host_sysfs_fd_accepts_only_sysfs() {
+        let is_sysfs = std::fs::read_to_string("/proc/self/mountinfo")
+            .map(|t| {
+                t.lines().any(|l| {
+                    let f: Vec<&str> = l.split(' ').collect();
+                    f.get(4) == Some(&"/sys") && f.iter().skip(6).any(|x| *x == "sysfs")
+                })
+            })
+            .unwrap_or(false);
+        let result = verify_host_sysfs_fd();
+        if is_sysfs {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(result.is_err(), "{result:?}");
+        }
     }
 
     /// #2098: 疑似 FS の magic 定数の具体値（include/uapi/linux/magic.h と、非 uapi の 3 つはカーネルのソース）。

@@ -65,7 +65,7 @@
 //! - `process.cwd` が `/` 以外（exec フローが cwd 未対応）
 //! - `process.user` が uid 0・gid 0・追加 gid なし以外（ユーザー切替は未実装）
 //! - `process.terminal` が true（端末受け渡し未実装）
-//! - `mounts` のうち bind 以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
+//! - `mounts` のうち bind・`/sys` の sysfs（`SysfsMountSpec`。読み取り専用で供給する。#2020）以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
 //!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind〔#1917〕は未対応）
 //! - `linux.namespaces[].path` の指定（既存 namespace への join 未実装）
 //! - `network`・`cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）
@@ -134,6 +134,7 @@ use super::mountinfo_identity::{
     FsIdentity, MountinfoReadError, dir_identity_chain, fs_identity, mounts_under, parse_mountinfo,
     path_mount_id, read_mountinfo_bounded, source_contains, source_reaches,
 };
+use super::sysfs_mount::{SysfsMountSpec, audit_sysfs_mount_error};
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
@@ -839,6 +840,14 @@ fn build_spec(
     }
     // bind mount の検証は予約と fork の前に終える（失敗してもプロセスのいない Running を残さない。#1915）。
     let bind_mounts = validate_bind_mounts(&config, bundle, &rootfs, state_root, id, launcher)?;
+    // `/sys` の sysfs（#2020）。拒否は bind と同じく launcher の監査 sink へ記録する（記録の成否は結果を変えない）。
+    let sysfs = SysfsMountSpec::from_mounts(config.mounts()).map_err(|err| {
+        let (code, message) = (err.code(), err.message());
+        if let Some(sink) = launcher.rejection_audit_sink() {
+            let _ = audit_sysfs_mount_error(err, config.mounts(), Some(id), sink);
+        }
+        TraitError::new(code, message)
+    })?;
     // 検査済みの rootfs を、`/` から祖先を含む全要素を symlink 非追従で辿って fd で固定する（SEC-1）。
     // 以後の使用はこの fd に限るため、検査後に祖先や rootfs を差し替えても固定した実体は変わらない。
     // 違反の理由（`RootfsPinError::violation`）は start の経路では記録しない（`AuditSink` の配線が無い。#1314・#1702）。
@@ -854,7 +863,8 @@ fn build_spec(
         Arc::new(config),
         id.clone(),
         bind_mounts,
-    ))
+    )
+    .with_sysfs(sysfs))
 }
 
 /// `mounts[]` を検証済みの bind mount 集合へ変換する（TASK-29 追補・#1915・OCI-4・CORE-5・SEC-1・SEC-4）。
@@ -2126,6 +2136,60 @@ mod tests {
             err.message(),
             "the state store root is unknown, so bind mounts cannot be checked"
         );
+    }
+
+    fn sysfs_json(dest: &str, opts: &[&str]) -> Value {
+        json!({"destination": dest, "type": "sysfs", "source": "sysfs", "options": opts})
+    }
+
+    /// SEC-2・OCI-4（#2020）: 受けない sysfs の指定は ERR-2 の構造化エラーで拒否し、launcher は呼ばれない。
+    #[test]
+    fn sec2_oci4_start_rejects_invalid_sysfs() {
+        let cases: Vec<(&str, Value, &str)> = vec![
+            (
+                "dest",
+                with_mounts(json!([sysfs_json("/x", &["ro"])])),
+                "mounts[0]: sysfs mount destination must be /sys",
+            ),
+            (
+                "rw",
+                with_mounts(json!([sysfs_json("/sys", &["rw"])])),
+                "mounts[0]: sysfs mount option lifts a mandatory restriction",
+            ),
+            (
+                "unknown",
+                with_mounts(json!([sysfs_json("/sys", &["defaults"])])),
+                "mounts[0]: unsupported sysfs mount option",
+            ),
+        ];
+        for (name, cfg, message) in cases {
+            let err = start_rejected_after_rewrite(&format!("rej-sysfs-{name}"), &cfg);
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "case {name}");
+            assert_eq!(err.message(), message, "case {name}");
+        }
+    }
+
+    /// SEC-2・OCI-4（#2020）: 正しい sysfs は launcher へ `spec.sysfs_mount()` として渡り、bind は空のまま。
+    /// 成功する start は rootfs の固定（Linux 限定）を要するため Linux 限定。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec2_oci4_start_passes_sysfs_to_launcher() {
+        let name = "sysfs-ok";
+        let b = Bundle::new(name);
+        b.write_config(&with_mounts(json!([sysfs_json(
+            "/sys",
+            &["nosuid", "noexec", "nodev", "ro"]
+        )])));
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        let store = MemStateStore::new(None);
+        create(&store, &OpRecorder::new(), &b.create_req(name)).expect("create");
+        let launcher = RecordingLauncher::new(false);
+        let record = run(&store, &launcher, name).expect("start");
+        assert_eq!(record.status().state(), ContainerState::Running);
+        let specs = launcher.specs.lock().expect("lock");
+        let spec = specs.first().expect("spec");
+        assert_eq!(spec.sysfs_mount().map(|s| s.index()), Some(0));
+        assert!(spec.bind_mounts().is_empty());
     }
 
     /// OCI-4・OCI-5（#1915）: 検証を通った bind は launcher へ `spec.bind_mounts()` として渡り、

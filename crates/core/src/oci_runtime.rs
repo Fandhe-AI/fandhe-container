@@ -40,6 +40,7 @@ mod launcher;
 mod mount_destination;
 pub(crate) mod mountinfo_identity;
 mod start;
+mod sysfs_mount;
 
 #[cfg(target_os = "linux")]
 pub(crate) use bind_mounts::ProtectedFsRoot;
@@ -84,4 +85,9 @@ pub use mount_destination::{MountDestination, audit_mount_config_error};
 pub use start::{
     ClaimedStart, LAUNCHER_REPLY_GRACE, StartedContainer, claim_start, launch_claimed,
     recover_interrupted_start, start, take_unreaped_processes,
+};
+#[cfg(target_os = "linux")]
+pub(crate) use sysfs_mount::OciMountKind;
+pub use sysfs_mount::{
+    SysfsMountError, SysfsMountErrorKind, SysfsMountSpec, audit_sysfs_mount_error,
 };

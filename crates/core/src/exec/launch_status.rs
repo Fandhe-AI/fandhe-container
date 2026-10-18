@@ -55,6 +55,8 @@ pub(super) enum PrePivotStep {
     PrepareRootfs,
     /// 固定した rootfs との実体の照合。
     VerifyPinned,
+    /// `/sys` への sysfs の供給（`mounts[]` の sysfs の指定時のみ。#2020・SEC-2）。`readonly_paths` より前に載せる。
+    MountSysfs,
     /// 専用 `/dev` の作成。
     CreateDefaultDevices,
     /// tmpfs のマウント。
@@ -74,10 +76,11 @@ pub(super) enum PrePivotStep {
 }
 
 impl PrePivotStep {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Establish,
         Self::PrepareRootfs,
         Self::VerifyPinned,
+        Self::MountSysfs,
         Self::CreateDefaultDevices,
         Self::MountTmpfs,
         Self::InjectFiles,
@@ -93,6 +96,7 @@ impl PrePivotStep {
             Self::Establish => "establish",
             Self::PrepareRootfs => "prepare_rootfs",
             Self::VerifyPinned => "verify_pinned",
+            Self::MountSysfs => "mount_sysfs",
             Self::CreateDefaultDevices => "create_default_devices",
             Self::MountTmpfs => "mount_tmpfs",
             Self::InjectFiles => "inject_files",
@@ -112,6 +116,7 @@ impl PrePivotStep {
         match self {
             Self::Establish => IsolationStage::MountPrivate,
             Self::PrepareRootfs | Self::VerifyPinned => IsolationStage::PrepareRootfs,
+            Self::MountSysfs => IsolationStage::MountSysfs,
             Self::CreateDefaultDevices => IsolationStage::CreateDevices,
             Self::MountTmpfs => IsolationStage::MountTmpfs,
             Self::InjectFiles => IsolationStage::InjectFiles,
@@ -523,13 +528,14 @@ fn step_ordinal(step: PrePivotStep) -> usize {
         PrePivotStep::Establish => 0,
         PrePivotStep::PrepareRootfs => 1,
         PrePivotStep::VerifyPinned => 2,
-        PrePivotStep::CreateDefaultDevices => 3,
-        PrePivotStep::MountTmpfs => 4,
-        PrePivotStep::InjectFiles => 5,
-        PrePivotStep::MountBinds => 6,
-        PrePivotStep::ReadonlyPaths => 7,
-        PrePivotStep::MaskedPaths => 8,
-        PrePivotStep::PivotRoot => 9,
+        PrePivotStep::MountSysfs => 3,
+        PrePivotStep::CreateDefaultDevices => 4,
+        PrePivotStep::MountTmpfs => 5,
+        PrePivotStep::InjectFiles => 6,
+        PrePivotStep::MountBinds => 7,
+        PrePivotStep::ReadonlyPaths => 8,
+        PrePivotStep::MaskedPaths => 9,
+        PrePivotStep::PivotRoot => 10,
     }
 }
 
@@ -595,7 +601,7 @@ mod tests {
         for (i, s) in PrePivotStep::ALL.into_iter().enumerate() {
             assert_eq!(step_ordinal(s), i);
         }
-        assert_eq!(PrePivotStep::ALL.len(), 10);
+        assert_eq!(PrePivotStep::ALL.len(), 11);
     }
 
     /// 具体値の符号化（ワイヤー形式の固定。SEC-4・REPAIR-2）。

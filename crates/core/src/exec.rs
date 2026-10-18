@@ -749,6 +749,8 @@ pub enum IsolationStage {
     MountMaskedPaths,
     /// 検証済みの bind mount（`mounts[]` の bind。fd 起点で rootfs へ適用する段。CORE-1・SEC-1・TASK-29 追補・#1913）。
     MountBinds,
+    /// pivot 後の作業ディレクトリへの `chdir`（`process.cwd`。fd 起点で 1 要素ずつ symlink 非追従に辿る。OCI-1・TASK-29）。
+    WorkingDir,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。
@@ -1895,6 +1897,59 @@ pub(crate) fn open_dir_beneath(rootfs: &Path, names: &[&OsStr]) -> Result<OwnedF
             .map_err(|e| open_error(e, true, rootfs, names))?;
     }
     Ok(cur)
+}
+
+/// pivot_root 直後の `/` を起点に、`wd` を 1 要素ずつ symlink 非追従で辿って作業ディレクトリへ移る
+/// （`process.cwd` の適用。OCI-1・TASK-29・SEC-1）。
+///
+/// `process::run_pre_pivot` が `pivot_root` の直後・ステージ列の前に呼ぶ。手順:
+///
+/// 1. `/` を開き、マウント ID が `report.new_root_mnt_id`（pivot が作った新 root）と一致することを確かめる
+/// 2. `wd` の各要素を、直前の fd を起点に `O_PATH|O_DIRECTORY|O_NOFOLLOW` で開く（`/proc/self/fd/N` などの
+///    magic link も symlink なので拒否される。継承 fd 経由の脱出を作らない）
+/// 3. 最後の fd へ `fchdir` する
+///
+/// `Root` は何もしない（pivot_root が cwd を根にしている）。symlink を含む cwd は追従せず `InvalidArgument` で
+/// 拒否する（Docker / runc とは異なる fail-closed。REPAIR-3）。エラーの message は固定文言で、パス・errno を含めない。
+/// errno の写像: 不在 `ENOENT` → `NotFound`、非ディレクトリ・symlink（`ENOTDIR`・`ELOOP`）→ `InvalidArgument`、
+/// `EACCES`・`EPERM` → `PermissionDenied`、その他 → `Internal`。
+pub(crate) fn enter_working_dir(
+    report: &PivotReport,
+    wd: &crate::oci_runtime::ContainerWorkingDir,
+) -> Result<(), ExecError> {
+    const STAGE: IsolationStage = IsolationStage::WorkingDir;
+    if wd.is_root() {
+        return Ok(());
+    }
+    let map_err = |e: SysError, what: &'static str| {
+        let code = match e {
+            SysError::Os(sys::ENOENT) => ErrorCode::NotFound,
+            SysError::Os(sys::ENOTDIR) | SysError::Os(sys::ELOOP) => ErrorCode::InvalidArgument,
+            other => errno_to_code(other),
+        };
+        ExecError::new(code, STAGE, what)
+    };
+    let mut cur = sys::open_dir_path_nofollow(None, c"/")
+        .map_err(|e| map_err(e, "cannot open the container root"))?;
+    if fd_mount_id(&cur, STAGE)? != report.new_root_mnt_id {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            "/ is not the root prepared by pivot_root",
+        ));
+    }
+    for name in wd.components() {
+        let c = CString::new(name.as_bytes()).map_err(|_| {
+            ExecError::new(
+                ErrorCode::InvalidArgument,
+                STAGE,
+                "process.cwd contains an invalid component",
+            )
+        })?;
+        cur = sys::open_dir_path_nofollow(Some(cur.as_fd()), &c)
+            .map_err(|e| map_err(e, "process.cwd is missing, not a directory, or a symlink"))?;
+    }
+    sys::change_dir_fd(cur.as_fd()).map_err(|e| map_err(e, "cannot change to process.cwd"))
 }
 
 /// [`pin_rootfs`] の結果。

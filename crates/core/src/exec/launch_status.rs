@@ -71,10 +71,12 @@ pub(super) enum PrePivotStep {
     MaskedPaths,
     /// `pivot_root`。
     PivotRoot,
+    /// pivot 後の作業ディレクトリへの `chdir`（`process.cwd`。OCI-1・TASK-29。違反記録は運ばない）。
+    WorkingDir,
 }
 
 impl PrePivotStep {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::Establish,
         Self::PrepareRootfs,
         Self::VerifyPinned,
@@ -85,6 +87,7 @@ impl PrePivotStep {
         Self::ReadonlyPaths,
         Self::MaskedPaths,
         Self::PivotRoot,
+        Self::WorkingDir,
     ];
 
     /// 段名（ワイヤー上のトークン。単体テストの `RecordingOps` の段名と一致させる）。
@@ -100,6 +103,7 @@ impl PrePivotStep {
             Self::ReadonlyPaths => "readonly_paths",
             Self::MaskedPaths => "masked_paths",
             Self::PivotRoot => "pivot_root",
+            Self::WorkingDir => "working_dir",
         }
     }
 
@@ -119,6 +123,7 @@ impl PrePivotStep {
             Self::ReadonlyPaths => IsolationStage::MountReadonlyPaths,
             Self::MaskedPaths => IsolationStage::MountMaskedPaths,
             Self::PivotRoot => IsolationStage::PivotRoot,
+            Self::WorkingDir => IsolationStage::WorkingDir,
         }
     }
 }
@@ -530,6 +535,7 @@ fn step_ordinal(step: PrePivotStep) -> usize {
         PrePivotStep::ReadonlyPaths => 7,
         PrePivotStep::MaskedPaths => 8,
         PrePivotStep::PivotRoot => 9,
+        PrePivotStep::WorkingDir => 10,
     }
 }
 
@@ -595,7 +601,7 @@ mod tests {
         for (i, s) in PrePivotStep::ALL.into_iter().enumerate() {
             assert_eq!(step_ordinal(s), i);
         }
-        assert_eq!(PrePivotStep::ALL.len(), 10);
+        assert_eq!(PrePivotStep::ALL.len(), 11);
     }
 
     /// 具体値の符号化（ワイヤー形式の固定。SEC-4・REPAIR-2）。

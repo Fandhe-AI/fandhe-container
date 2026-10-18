@@ -40,6 +40,7 @@ mod launcher;
 mod mount_destination;
 pub(crate) mod mountinfo_identity;
 mod start;
+mod working_dir;
 
 #[cfg(target_os = "linux")]
 pub(crate) use bind_mounts::ProtectedFsRoot;
@@ -85,3 +86,4 @@ pub use start::{
     ClaimedStart, LAUNCHER_REPLY_GRACE, StartedContainer, claim_start, launch_claimed,
     recover_interrupted_start, start, take_unreaped_processes,
 };
+pub use working_dir::ContainerWorkingDir;

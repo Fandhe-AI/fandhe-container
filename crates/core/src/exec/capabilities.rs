@@ -79,9 +79,10 @@ trait CapKernel {
 /// 参加後に呼び出しスレッドを揃える uid・gid（`process.user` の値。名前空間内から見た値。SUP-6・SEC-5・
 /// TASK-163 追補・#1462）。
 ///
-/// rootless の exec（対象の user namespace へ参加した場合）だけが `Some` で渡す。launch は `None` を渡す
-/// （`uid_map` の結果として既に名前空間内の uid 0・gid 0 で、`process.user` は root だけを許すため。ユーザー
-/// 切り替え自体は launch・exec とも root 以外が未実装 = REPAIR-3）。
+/// rootless の exec（対象の user namespace へ参加した場合）が `Some` で渡す。launch は `process.user` が 0/0 なら
+/// `None`（`uid_map` の結果として既に名前空間内の uid 0・gid 0）、非 root なら `Some` で渡して同じ経路で切り替える
+/// （OCI-1・SEC-5。写像との整合は launcher が fork 前に検査する）。exec の非 root は `process_ids_from_config` が
+/// `Unimplemented` で拒否する（未対応 = REPAIR-3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcessIds {
     pub(crate) uid: u32,
@@ -265,6 +266,8 @@ pub struct CapabilityReport {
 ///   （`sys::fork_single_threaded` と同じ論拠）
 /// - 事後確認: 適用後にもう一度 `Threads: 1` を確認する。万一増えていれば（呼び出し側の
 ///   別経路の不具合等）`Ok` を返さず `Internal` で失敗し、権限が残った可能性を呼び出し側へ伝える
+// 本番の launch は ids を渡せる `apply_default_capabilities_with` を使う。本関数は ids なしの単体テストの入口。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError> {
     apply_default_capabilities_with(&mut ThreadCountSource::ProcSelf, None, None)
 }
@@ -278,7 +281,7 @@ pub(crate) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError
 /// 補助グループを消去できなかったときに user namespace の `setgroups` の設定を読むために使う（#1457）。
 ///
 /// `ids` が `Some` なら、補助グループの消去の後・bounding set の削減の前に、gid → uid の順で `process.user` の値へ
-/// 揃えて読み戻す（rootless の exec が user namespace へ参加した後。#1462）。launch は `None`。
+/// 揃えて読み戻す（rootless の exec が user namespace へ参加した後。#1462）。launch は非 root の `process.user` のときだけ `Some`（OCI-1）。
 pub(crate) fn apply_default_capabilities_with(
     threads: &mut ThreadCountSource,
     own_proc_dir: Option<BorrowedFd<'_>>,
@@ -714,9 +717,12 @@ pub(super) mod testing {
     }
 
     /// `stages.rs` の組み込み段が `cfg(test)` で呼ぶ偽物。本物の絞り込みロジックを偽カーネルで走らせる
-    /// （本物は `Threads: 1` を要求し、マルチスレッドの libtest では動かないため）。
-    pub(in crate::exec) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError> {
-        apply_with_ids(None)
+    /// （本物は `Threads: 1` を要求し、マルチスレッドの libtest では動かないため）。`ids` は launch の
+    /// `process.user`（0/0 のときは `None`。OCI-1・SEC-5）。
+    pub(in crate::exec) fn apply_default_capabilities_ids(
+        ids: Option<ProcessIds>,
+    ) -> Result<CapabilityReport, ExecError> {
+        apply_with_ids(ids)
     }
 
     fn apply_with_ids(ids: Option<ProcessIds>) -> Result<CapabilityReport, ExecError> {

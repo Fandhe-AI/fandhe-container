@@ -15,6 +15,7 @@
 //!       -> apply_readonly_paths(&isolation, &prepared, config)  // 読み取り専用パスの固定集合 + config の追加分。固定集合は常に適用（SEC-2・#1850・#1852）
 //!       -> apply_masked_paths(&isolation, &prepared, &null, config) // 覆うパスの固定集合 + config の追加分。`setup` 指定時のみ（SEC-2・#1851・#1852）
 //!       -> pivot_root(&isolation, prepared)            -> PivotReport
+//!       -> enter_working_dir(&report, &cwd)            // process.cwd が `/` 以外のときだけ（pivot 直後・ステージ列の前。OCI-1・TASK-29）
 //!       -> exec_entrypoint(&isolation, &report, &entry) // execve。成功時は戻らない
 //! 親: ContainerChild::wait_timeout(timeout)            // waitpid（期限超過で未回収に限り SIGKILL + 回収）
 //! ```
@@ -71,7 +72,7 @@
 //! - **回収済みの pid へ kill しない**: 回収と期限超過の `SIGKILL` は `ContainerChild` 内の `Mutex`
 //!   の下で回収状態を確認して行い、並行に待っても回収後（pid 再利用され得る）に `SIGKILL` を送らない。
 //!   待機が `Err` で戻ってもハンドルは残り、再試行で kill・回収できる
-//! - **exec は絶対パスのみ**: PATH 探索・cwd・OCI `process` からの組み立て・`preserve_fds`・
+//! - **exec は絶対パスのみ**: PATH 探索・（cwd は launch の `setup.working_dir` で pivot 直後に適用。OCI-1）・OCI `process` からの組み立て・`preserve_fds`・
 //!   `LISTEN_FDS` の受け渡しは TASK-29/30 の範囲
 //! - **環境変数と補助グループ**（SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）: `execveat` へは [`Entrypoint`] が持つ
 //!   env だけを envp として明示的に渡し、呼び出しプロセスの環境は引き継がない（既定値の補完もしない）。launch は
@@ -119,13 +120,13 @@ use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_
 use super::stages::{LaunchNotReady, LaunchReady};
 use super::{
     DeviceReport, DevptsGidSource, ExecError, IsolationStage, MountIsolation, PivotReport,
-    StagePipeline, ViolationReason, describe, fd_mount_id, inject_files, mount_tmpfs, pivot_root,
-    prepare_rootfs,
+    StagePipeline, ViolationReason, describe, enter_working_dir, fd_mount_id, inject_files,
+    mount_tmpfs, pivot_root, prepare_rootfs,
 };
 use crate::dev_mounts::ImplicitDevMount;
 use crate::injected_files::InjectedFileSet;
 use crate::landlock::{MountedBy, MountedTarget, MountedTargets};
-use crate::oci_runtime::BindMountSet;
+use crate::oci_runtime::{BindMountSet, ContainerWorkingDir};
 use crate::path_masks::ProtectedPath;
 use crate::tmpfs::TmpfsMountSet;
 
@@ -1885,6 +1886,9 @@ pub(crate) struct PrePivotSetup<'a> {
     /// 成功（`P`）または失敗（`F ...`）を 1 行書く。`None` なら何も返さない（従来どおり）。子はここ以外で sink に
     /// 触らない。pivot 前段が終われば `close_inherited_fds` が閉じる（workload へ渡らない）。
     pub(crate) status: Option<&'a std::fs::File>,
+    /// pivot 後に移る作業ディレクトリ（`process.cwd`。`None` または `Root` なら移らない。OCI-1・TASK-29）。
+    /// 違反は状態 pipe の段 `working_dir` で親へ返る。
+    pub(crate) working_dir: Option<&'a ContainerWorkingDir>,
 }
 
 /// config の `linux.readonlyPaths` / `maskedPaths`（検証済み）。固定集合に**追加**されるだけで、外す・緩める
@@ -1968,6 +1972,12 @@ trait PrePivotOps {
         isolation: &Self::Isolation,
         prepared: Self::Prepared,
     ) -> Result<Self::Pivoted, ExecError>;
+    /// pivot 直後に `process.cwd` へ移る（OCI-1）。
+    fn enter_working_dir(
+        &self,
+        pivoted: &Self::Pivoted,
+        working_dir: &ContainerWorkingDir,
+    ) -> Result<(), ExecError>;
 }
 
 /// `create_default_devices` の結果と、検証済みの `/dev/null`（`masked_paths` 段の複製元。SEC-2・#1851）。
@@ -2160,6 +2170,14 @@ impl PrePivotOps for RealPrePivotOps {
     ) -> Result<PivotReport, ExecError> {
         pivot_root(isolation, prepared)
     }
+
+    fn enter_working_dir(
+        &self,
+        pivoted: &PivotReport,
+        working_dir: &ContainerWorkingDir,
+    ) -> Result<(), ExecError> {
+        enter_working_dir(pivoted, working_dir)
+    }
 }
 
 /// 固定した rootfs の実体と、`prepare_rootfs` の後に得た mount top の実体が同じか（純関数。fail-closed）。
@@ -2289,6 +2307,11 @@ fn run_pre_pivot<O: PrePivotOps>(
     let pivoted = ops
         .pivot_root(&isolation, prepared)
         .map_err(StepError::at(S::PivotRoot))?;
+    // pivot 直後・ステージ列の前に作業ディレクトリへ移る（OCI-1）。根は pivot_root 済みのため省く。
+    if let Some(wd) = setup.and_then(|s| s.working_dir).filter(|w| !w.is_root()) {
+        ops.enter_working_dir(&pivoted, wd)
+            .map_err(StepError::at(S::WorkingDir))?;
+    }
     Ok((isolation, pivoted))
 }
 
@@ -2537,6 +2560,7 @@ where
                     masked: &masked,
                 },
                 status: None,
+                working_dir: None,
             };
             let result = run_child_then(
                 rootfs,
@@ -2720,6 +2744,7 @@ pub fn spawn_container_with_stages_and_devices(
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
+                working_dir: None,
             }),
             StdioNulling::ALL,
         ) {
@@ -5147,6 +5172,11 @@ mod tests {
                 "injected failure",
             )
             .or_violation(ViolationReason::MaskedPathApplyFailed, None),
+            "working_dir" => ExecError::new(
+                ErrorCode::NotFound,
+                IsolationStage::WorkingDir,
+                "injected failure",
+            ),
             _ => ExecError::new(
                 ErrorCode::InvalidArgument,
                 IsolationStage::InjectFiles,
@@ -5216,6 +5246,9 @@ mod tests {
         fn pivot_root(&self, _: &(), _: ()) -> Result<(), ExecError> {
             self.step("pivot_root")
         }
+        fn enter_working_dir(&self, _: &(), _: &ContainerWorkingDir) -> Result<(), ExecError> {
+            self.step("working_dir")
+        }
     }
 
     /// 重なり検査を通る bind 1 件の集合（宛先のみ意味を持つ。実マウントはしない）。
@@ -5252,6 +5285,7 @@ mod tests {
                 pinned_rootfs: Some(pinned.as_fd()),
                 config_paths: ConfigPaths::NONE,
                 status: None,
+                working_dir: None,
             }),
         )
         .unwrap();
@@ -5287,6 +5321,7 @@ mod tests {
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
+                working_dir: None,
             }),
         )
         .unwrap();
@@ -5311,6 +5346,59 @@ mod tests {
                 "pivot_root"
             ]
         );
+    }
+
+    /// OCI-1・TASK-29: `process.cwd` の移動は `pivot_root` の直後に 1 回だけ呼ばれ、`None` と根（`/`）では呼ばれない。
+    #[test]
+    fn oci1_run_pre_pivot_enters_working_dir_after_pivot() {
+        let setup = |wd: Option<&'static ContainerWorkingDir>| PrePivotSetup {
+            devices: DevptsGidSource::Rootful,
+            tmpfs: None,
+            inject: None,
+            binds: None,
+            pinned_rootfs: None,
+            config_paths: ConfigPaths::NONE,
+            status: None,
+            working_dir: wd,
+        };
+        let app: &'static ContainerWorkingDir = Box::leak(Box::new(
+            ContainerWorkingDir::parse(Path::new("/app")).unwrap(),
+        ));
+        let root: &'static ContainerWorkingDir = Box::leak(Box::new(
+            ContainerWorkingDir::parse(Path::new("/")).unwrap(),
+        ));
+        let _ = take_calls();
+        run_pre_pivot(
+            &RecordingOps { fail_at: None },
+            Path::new("/rootfs"),
+            Some(setup(Some(app))),
+        )
+        .unwrap();
+        let calls = take_calls();
+        assert_eq!(
+            calls.iter().rev().take(2).cloned().collect::<Vec<_>>(),
+            ["working_dir", "pivot_root"]
+        );
+        for wd in [None, Some(root)] {
+            run_pre_pivot(
+                &RecordingOps { fail_at: None },
+                Path::new("/rootfs"),
+                Some(setup(wd)),
+            )
+            .unwrap();
+            assert_eq!(take_calls().last().map(String::as_str), Some("pivot_root"));
+        }
+        let err = run_pre_pivot(
+            &RecordingOps {
+                fail_at: Some("working_dir"),
+            },
+            Path::new("/rootfs"),
+            Some(setup(Some(app))),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(err.step, PrePivotStep::WorkingDir);
+        assert_eq!(err.error.code, ErrorCode::NotFound);
     }
 
     /// SEC-2（#1850）: 読み取り専用パスの適用が失敗したら `pivot_root` へ進まない。`setup` が `None` の最小構成でも
@@ -5348,6 +5436,7 @@ mod tests {
             pinned_rootfs: None,
             config_paths: ConfigPaths::NONE,
             status: None,
+            working_dir: None,
         };
         let _ = take_calls();
         let err = run_pre_pivot(
@@ -5411,6 +5500,7 @@ mod tests {
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
+                working_dir: None,
             }),
         )
         .err()
@@ -5441,6 +5531,7 @@ mod tests {
                 pinned_rootfs: None,
                 config_paths: ConfigPaths::NONE,
                 status: None,
+                working_dir: None,
             }),
         )
         .err()
@@ -5516,6 +5607,7 @@ mod tests {
                         masked: cfg.masked_paths(),
                     },
                     status: None,
+                    working_dir: None,
                 }),
             )
             .err()
@@ -5589,7 +5681,9 @@ mod tests {
                 ErrorCode::InvalidArgument,
                 Some("rootfs_is_host_root"),
             ),
+            ("working_dir", ErrorCode::NotFound, None),
         ];
+        let wd = ContainerWorkingDir::parse(Path::new("/app")).unwrap();
         for (name, code, reason) in expected {
             let err = run_pre_pivot(
                 &RecordingOps {
@@ -5604,6 +5698,7 @@ mod tests {
                     pinned_rootfs: Some(pinned.as_fd()),
                     config_paths: ConfigPaths::NONE,
                     status: None,
+                    working_dir: Some(&wd),
                 }),
             )
             .err()

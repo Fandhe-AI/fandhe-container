@@ -211,11 +211,17 @@ mod unix {
         let Some(sock) = std::env::var_os("FCOS_DECOY_SOCK") else {
             return;
         };
-        let _ = UdsStream::connect(
+        let Ok(mut s) = UdsStream::connect(
             std::path::Path::new(&sock),
             Duration::from_secs(5),
             &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
-        );
+        ) else {
+            return;
+        };
+        // 受付が peer の pid を読み終えて切断する（EOF・エラー）まで生存し続ける。先に終了すると
+        // macOS の LOCAL_PEERPID 取得が失敗して pid 不一致として数えられない（#1861）。
+        let mut buf = [0u8; 64];
+        while matches!(std::io::Read::read(&mut s, &mut buf), Ok(n) if n > 0) {}
     }
 
     fn audit_fields(lines: &[String]) -> Vec<(String, String, String, String, u64)> {

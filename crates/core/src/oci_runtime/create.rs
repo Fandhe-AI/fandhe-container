@@ -56,6 +56,7 @@ const CREATE_OP_NAME: &str = "create";
 /// 参照登録・登録の巻き戻しの操作名（REPAIR-4）。
 const IMAGE_REF_REGISTER_OP_NAME: &str = "image_ref_register";
 const IMAGE_REF_ROLLBACK_OP_NAME: &str = "image_ref_rollback";
+const IMAGE_REF_BIND_OP_NAME: &str = "image_ref_bind";
 
 /// `config.json` を検証し、プロセス未起動の「created」状態を `store` に作る。
 ///
@@ -145,7 +146,17 @@ fn create_with_image_inner(
         return Err(e);
     }
     match create_state(store, req) {
-        Ok(record) => Ok(record),
+        Ok(record) => {
+            // 参照を作成した状態に結び付ける。delete は結び付いた参照だけを外すので、状態作成前に止まった
+            // create の参照を、既存の別の状態の delete が巻き込んで外す競合を防げる。失敗しても状態は
+            // 作成済みなので成功を返す（参照は未結合のまま残り、delete は外さない。余分に持つだけの安全側。
+            // 起動時の照合〔#854〕が回収する）。記録は `image_ref_bind`。
+            if let Ok(name) = OpName::new(IMAGE_REF_BIND_OP_NAME) {
+                let _ =
+                    recorder.record_op(&name, || image.refs().bind(req.id(), record.revision()));
+            }
+            Ok(record)
+        }
         Err(e) => {
             // 状態が書かれていないと断定できる失敗だけ参照を外す。
             if matches!(
@@ -698,9 +709,14 @@ mod tests {
             push(&self.log, "refs.release");
             Ok(ImageRefRelease::Released)
         }
+        fn bind(&self, _id: &ContainerId, _revision: StateRevision) -> Result<(), TraitError> {
+            push(&self.log, "refs.bind");
+            Ok(())
+        }
         fn registration(
             &self,
             _id: &ContainerId,
+            _revision: StateRevision,
         ) -> Result<Option<crate::oci_runtime::ImageRefGeneration>, TraitError> {
             Ok(None)
         }
@@ -755,7 +771,10 @@ mod tests {
         let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), Some(&b));
         let record = run_with_image(&store, &refs, &OpRecorder::new(), &b).expect("create");
         assert_eq!(record.status().state(), ContainerState::Created);
-        assert_eq!(log_of(&log), vec!["refs.register", "store.create"]);
+        assert_eq!(
+            log_of(&log),
+            vec!["refs.register", "store.create", "refs.bind"]
+        );
     }
 
     /// OCI-7: 登録が失敗したら状態は作らず、エラーはそのまま返る。

@@ -16,7 +16,7 @@
 //! 同じ形（`sha256:` ＋ 64 桁の小文字 hex）だけを受けるので、アダプタの変換は失敗しない。
 //! 本番のアダプタと CLI / plugin からの配線は後続の作業で、未実装である（REPAIR-3）。
 
-use crate::traits::{ContainerId, ErrorCode, TraitError};
+use crate::traits::{ContainerId, ErrorCode, StateRevision, TraitError};
 
 /// manifest digest の文字列の長さ（`sha256:` ＋ 64 桁）。
 const MANIFEST_DIGEST_LEN: usize = 7 + 64;
@@ -103,7 +103,12 @@ impl ImageRefGeneration {
 ///   [`ImageRefRegistration::AlreadyRegistered`]
 /// - `release`: 登録が無ければ [`ImageRefRelease::NotRegistered`]。ID だけで外すので、自分が直前に
 ///   `register` した参照の巻き戻し（create の失敗経路）にだけ使う
-/// - `registration`: `id` の現在の登録世代。登録が無ければ `None`
+/// - `bind`: `id` の現在の登録を、状態作成で得た `revision` の状態に結び付ける（create が状態作成の成功直後に
+///   呼ぶ）。結び付いていない登録だけが対象で、登録が無ければ [`ErrorCode::NotFound`]。結び付けは
+///   「この参照は revision の状態に属する」という事実を残すためにあり、登録しただけで状態作成前の参照を
+///   delete が誤って外さないための目印である
+/// - `registration`: `id` の現在の登録のうち、`revision` の状態に結び付いたものの世代。登録が無い・
+///   未結合・別の revision に結び付いているときは `None`（delete 用。削除対象の状態に属する参照だけを返す）
 /// - `release_if`: 登録世代が `expected` のときだけ外す（比較と解除は 1 回の排他の内側）。世代が違う・
 ///   登録が無ければ何もせず [`ImageRefRelease::NotRegistered`]（delete 用。同じ ID の再作成を巻き込まない）
 /// - エラーメッセージにパス・OS のエラー文字列を含めない
@@ -118,8 +123,15 @@ pub trait ContainerImageRefs {
     /// `id` の参照を外す。
     fn release(&self, id: &ContainerId) -> Result<ImageRefRelease, TraitError>;
 
-    /// `id` の現在の登録世代を返す。登録が無ければ `None`。
-    fn registration(&self, id: &ContainerId) -> Result<Option<ImageRefGeneration>, TraitError>;
+    /// `id` の現在の登録を、状態の `revision` に結び付ける。
+    fn bind(&self, id: &ContainerId, revision: StateRevision) -> Result<(), TraitError>;
+
+    /// `id` の登録のうち `revision` の状態に結び付いたものの世代を返す。無ければ `None`。
+    fn registration(
+        &self,
+        id: &ContainerId,
+        revision: StateRevision,
+    ) -> Result<Option<ImageRefGeneration>, TraitError>;
 
     /// `id` の登録世代が `expected` と一致するときだけ参照を外す。
     fn release_if(

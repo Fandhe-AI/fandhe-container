@@ -50,8 +50,9 @@
 //! **StopContainer/RemoveContainer の扱い（CRI-1・ERR-3・TASK-58.2・#434）**: `StopContainer` は空 ID と負の
 //! `timeout` を `INVALID_ARGUMENT`、未知 ID を `NOT_FOUND` にし、running を exited へ遷移させて
 //! `finished_at` を記録する。停止済み（exited）は冪等に成功し状態を変えない（proto コメント）。未起動
-//! （created）の Stop は前提違反として `FAILED_PRECONDITION`（ERR-3 の「`running` でないコンテナへの
-//! `StopContainer`」の読み分け。kubelet 運用で問題になれば実機確認の TASK-60 で見直す）。`timeout` は
+//! （created）の Stop も冪等に成功し、状態（created・`finished_at` 0）を変えない。実行層接続時も実行層を
+//! 呼ばない（proto コメントと containerd v2.1.4 の挙動に合わせる。kubelet の `killContainer` は NotFound
+//! 以外のエラーを失敗として扱うため。ERR-3・CRI-1・#2032）。`timeout` は
 //! 猶予秒数で、スタブはプロセスを持たず待たないため検証だけして破棄する。`RemoveContainer` は空 ID を
 //! `INVALID_ARGUMENT`、未知 ID を成功（冪等。proto コメント）とし、どの状態でも記録・重複判定キー・保持量を
 //! 解放する（running の強制削除。プロセスの強制終了と、実待機の上限・REPAIR-5 のタイムアウトは TASK-59 で
@@ -1306,8 +1307,8 @@ impl CriRuntimeService {
     /// 実行層接続時の `StopContainer`（TASK-59.3・CRI-2）。
     ///
     /// 実行層の資源を持つ記録（`runtime_leaked`）だけを `ContainerRuntime::stop` へ渡す。それ以外
-    /// （スタブ経路の記録）は従来の記録上の遷移。exited は冪等に成功し実行層を呼ばず、created は
-    /// `FAILED_PRECONDITION`。running と unknown（結果不明の回復）は仮登録して実行層を呼ぶ。
+    /// （スタブ経路の記録）は従来の記録上の遷移。exited・created は冪等に成功し実行層を呼ばない
+    /// （created の init は残り、回収は `RemoveContainer` の `delete(force)` が担う。#2032）。running と unknown（結果不明の回復）は仮登録して実行層を呼ぶ。
     async fn stop_container_runtime(
         &self,
         binding: &RuntimeBinding,
@@ -1341,11 +1342,9 @@ impl CriRuntimeService {
                 ));
             }
             match record.state {
-                ContainerState::Exited => return Ok(v1::StopContainerResponse {}),
-                ContainerState::Created => {
-                    return Err(CriError::failed_precondition(
-                        "container is not in running state",
-                    ));
+                // created は冪等に成功し、実行層を呼ばず状態も変えない（#2032）。
+                ContainerState::Exited | ContainerState::Created => {
+                    return Ok(v1::StopContainerResponse {});
                 }
                 ContainerState::Running | ContainerState::Unknown => {}
             }
@@ -1606,8 +1605,8 @@ impl CriRuntimeService {
 
     /// `StopContainer` の本体。running を exited へ遷移させる（CRI-1・ERR-3・TASK-58.2）。
     ///
-    /// 空 ID・負の `timeout` は `INVALID_ARGUMENT`、未知 ID は `NOT_FOUND`、created は
-    /// `FAILED_PRECONDITION`。exited は冪等に成功し状態を変えない。`timeout`（猶予秒数）はスタブが
+    /// 空 ID・負の `timeout` は `INVALID_ARGUMENT`、未知 ID は `NOT_FOUND`。created と
+    /// exited は冪等に成功し状態を変えない（created は #2032）。`timeout`（猶予秒数）はスタブが
     /// 待たないため検証のみで破棄する（実待機は TASK-59 で上限と REPAIR-5 のタイムアウトつきで追加）。
     /// プロセスは終了させない記録上の遷移（REPAIR-3）。件数・保持量の枠は解放しない。
     fn stop_container_impl(
@@ -1643,10 +1642,7 @@ impl CriRuntimeService {
                 record.finished_at_nanos = finished_at_nanos;
                 Ok(v1::StopContainerResponse {})
             }
-            ContainerState::Exited => Ok(v1::StopContainerResponse {}),
-            ContainerState::Created => Err(CriError::failed_precondition(
-                "container is not in running state",
-            )),
+            ContainerState::Exited | ContainerState::Created => Ok(v1::StopContainerResponse {}),
             // 結果不明は停止を確認できないため拒否する（通常は runtime_leaked の拒否が先に効く）。
             ContainerState::Unknown => Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
@@ -2086,8 +2082,8 @@ impl RuntimeService for CriRuntimeService {
         timer.finish_with(&result);
         result.map(Response::new)
     }
-    /// コンテナを exited にする（停止済みは冪等・created は `FAILED_PRECONDITION`。
-    /// CRI-1・ERR-3・TASK-58.2）。
+    /// コンテナを exited にする（停止済み・created は冪等に成功し状態不変。
+    /// CRI-1・ERR-3・TASK-58.2・#2032）。
     async fn stop_container(
         &self,
         request: Request<v1::StopContainerRequest>,
@@ -3597,16 +3593,22 @@ mod tests {
 
     /// ERR-3・TASK-58.2（受け入れ条件）: created（running でない）の Stop は FAILED_PRECONDITION で状態不変。
     #[test]
-    fn task_58_2_stop_created_is_failed_precondition() {
+    fn task_58_2_stop_created_succeeds_and_keeps_state() {
+        // ERR-3・CRI-1・#2032: created の Stop は成功で、状態も finished_at も変えない（冪等）。
         let svc = CriRuntimeService::new();
         let sb = run_id(&svc);
         let id = create(&svc, &sb, Some(container_config("c", 0))).unwrap();
-        let err = stop_c(&svc, &id, 0).unwrap_err();
-        assert_eq!(err.code(), Code::FailedPrecondition);
-        assert_eq!(err.message(), "container is not in running state");
-        let reg = svc.registry.lock().unwrap();
-        assert_eq!(reg.containers[&id].state, ContainerState::Created);
-        assert_eq!(reg.containers[&id].finished_at_nanos, 0);
+        let (count, bytes) = (svc.container_count(), svc.container_retained_bytes());
+        stop_c(&svc, &id, 0).unwrap();
+        stop_c(&svc, &id, 0).unwrap();
+        let st = status_c(&svc, &id).unwrap();
+        assert_eq!(st.state, v1::ContainerState::ContainerCreated as i32);
+        assert_eq!(st.finished_at, 0);
+        assert_eq!(svc.container_count(), count);
+        assert_eq!(svc.container_retained_bytes(), bytes);
+        start(&svc, &id).unwrap();
+        let st = status_c(&svc, &id).unwrap();
+        assert_eq!(st.state, v1::ContainerState::ContainerRunning as i32);
     }
 
     /// ERR-3・TASK-58.2: 空 ID・負の timeout は INVALID_ARGUMENT（状態不変）、未知 ID は NOT_FOUND。

@@ -1053,16 +1053,22 @@ async fn task_59_3_stop_exited_is_idempotent_without_runtime_call() {
     assert_eq!(count_calls(&h, "stop "), 1);
 }
 
-/// CRI-2・ERR-3: created の Stop は FAILED_PRECONDITION で実行層を呼ばない。24 時間超の timeout は仮登録の前に拒否する。
+/// CRI-2・ERR-3・#2032: created の Stop は成功し、実行層を呼ばず状態も変えない。
 #[tokio::test]
-async fn task_59_3_stop_created_and_oversized_timeout_are_rejected() {
+async fn task_59_3_stop_created_succeeds_without_runtime_call() {
     let h = harness();
     let sb = run_sandbox(&h.service).await;
     let id = create(&h.service, &sb, "c").await.expect("create");
-    assert_eq!(
-        stop_t(&h.service, &id, 0).await.unwrap_err().code(),
-        Code::FailedPrecondition
-    );
+    stop_t(&h.service, &id, 0).await.expect("stop created");
+    assert_eq!(count_calls(&h, "stop "), 0);
+    assert_eq!(state_of(&h.service, &id).await, S::ContainerCreated as i32);
+}
+
+/// CRI-2・ERR-3: 24 時間超の timeout は仮登録の前に拒否する。
+#[tokio::test]
+async fn task_59_3_oversized_timeout_is_rejected() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
     let rid = running_container(&h, &sb, "r").await;
     assert_eq!(
         stop_t(&h.service, &rid, 24 * 60 * 60 + 1)

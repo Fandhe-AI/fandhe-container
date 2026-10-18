@@ -493,6 +493,40 @@ async fn task_59_2_unexpected_runtime_state_is_internal() {
     );
 }
 
+/// REPAIR-5・fail-closed: 応答不明の失敗（Timeout・Unavailable・Internal）は CONTAINER_UNKNOWN にし（CRI-2）、再 Start させない。
+/// Stop・Remove 側の挙動は TASK-59.3 で接続済みのため `task_59_3_*` で検証する。
+#[tokio::test]
+async fn task_59_2_ambiguous_start_failure_marks_unknown() {
+    for code in [
+        ErrorCode::Timeout,
+        ErrorCode::Unavailable,
+        ErrorCode::Internal,
+    ] {
+        let h = harness();
+        let sb = run_sandbox(&h.service).await;
+        let id = create(&h.service, &sb, "c").await.expect("create");
+        *h.runtime.fail_start.lock().unwrap() = Some(code);
+        start(&h.service, &id).await.expect_err("start");
+        assert_eq!(
+            status(&h.service, &id).await.state,
+            S::ContainerUnknown as i32
+        );
+        // 生存中かもしれないプロセスを終了済みとして公開しない(終了時刻・終了コード未設定)。
+        let st = status(&h.service, &id).await;
+        assert_eq!((st.finished_at, st.exit_code), (0, 0));
+        *h.runtime.fail_start.lock().unwrap() = None;
+        let err = start(&h.service, &id).await.expect_err("restart");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        let starts = h
+            .runtime
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("start "))
+            .count();
+        assert_eq!(starts, 1);
+    }
+}
+
 /// CRI-1・REPAIR-3: Start の実行中の StopPodSandbox は TASK-59.3(停止の接続)まで拒否し、Start は running を確定する。
 #[tokio::test]
 async fn task_59_3_stop_sandbox_during_start_is_rejected() {

@@ -1,23 +1,19 @@
-//! OCI レイヤーの whiteout（`.wh.<name>`）の検出と、下位レイヤー実体の削除（TASK-53.1・OCI-2・MS-4・#412）。
+//! OCI レイヤーの whiteout（`.wh.<name>`）の検出と、下位レイヤー実体の削除（TASK-53.1〜53.3・OCI-2・MS-4・#412〜#414）。
 //!
 //! 上位レイヤーは下位のファイルを消すために、同じディレクトリへ `.wh.<name>` という空エントリを置く。
-//! 本モジュールは次の 2 つの部品を `layer::extract` へ提供する。
+//! 本モジュールは次の部品を `layer::extract` へ提供する。
 //!
 //! - `classify`: tar エントリの最終コンポーネントを whiteout / 不透明マーカー / 通常名へ分類する。
+//!   `extract_one_layer` のパス 1（収集・検証）とパス 3（展開。マーカーは書かずに読み飛ばす）が各エントリに対して呼ぶ。
 //! - `remove_tree_nofollow`: symlink を追従せずに実体（ファイル・symlink・ディレクトリの木）を再帰削除する。
-//!   root への閉じ込め・別表記の衝突検出（IO-5）は呼び出し側 `Extractor::remove_whiteout_target` が担う。
+//!   パス 2（whiteout の適用）と、パス 3 で下位レイヤー由来のノードを置き換えるとき（image-spec の
+//!   「Changeset over existing files」）に `Extractor` から呼ばれる。
 //! - `remove_dir_contents_nofollow`: 不透明ディレクトリ（`.wh..wh..opq`。TASK-53.2・#413）用に、ディレクトリ自体は
-//!   残して直下の全エントリを再帰削除する。`NameClass::Opaque` を受けた呼び出し側が `Extractor::clear_opaque_dir`
-//!   経由で呼ぶ（接続は #414）。
+//!   残して直下の全エントリを再帰削除する。パス 2 で `Extractor::apply_markers` から呼ばれる。
 //!
-//! # 未実装（実装済みを装わない。REPAIR-3）
-//!
-//! 本モジュールは部品のみで、展開パイプライン `extract_one_layer` からはまだ呼ばれない。
-//!
-//! - 展開パイプラインへの統合（TASK-53.3・#414）。同一レイヤー内で whiteout より先に作ったエントリを
-//!   消さない（image-spec は whiteout を下位レイヤーのリソースにのみ適用すると定める）ための世代管理も
-//!   そこで行う。ここでの削除は「呼ばれた時点の root 内の実体」を消す。
-//!   不透明ディレクトリも同様で、`remove_dir_contents_nofollow` は「呼ばれた時点の実体」を全消しする。
+//! root への閉じ込め・別表記の衝突検出（IO-5）・同一レイヤーの実体を消さないこと（パス 2 はパス 3 の前に
+//! 走るため、消すのは常に下位レイヤー由来の実体）は呼び出し側 `layer::extract` が担う。ここでの削除は
+//! 「呼ばれた時点の実体」を消す。
 
 use std::fs;
 use std::path::Path;
@@ -39,7 +35,6 @@ const MAX_REMOVE_DEPTH: usize = 300;
 /// tar エントリの最終コンポーネントの分類結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum NameClass {
     /// whiteout ではない通常の名前。
     Regular,
@@ -53,8 +48,7 @@ pub(crate) enum NameClass {
 ///
 /// 不正な whiteout（対象が空・`.`・`..`・`/` や NUL を含む・長すぎる、`.wh..wh.` の未知の予約名）は
 /// `InvalidArgument` で拒否する（`.wh...` を `..` の whiteout として解釈し親を消す事故を防ぐ）。
-/// TASK-53.3 で `extract_one_layer` から呼ぶまで未接続。
-#[cfg_attr(not(test), allow(dead_code))]
+/// `extract_one_layer` が各エントリの最終コンポーネントに対して呼ぶ（TASK-53.3）。
 pub(crate) fn classify(name: &[u8]) -> Result<NameClass, OciError> {
     if name == OPAQUE_MARKER {
         return Ok(NameClass::Opaque);
@@ -89,7 +83,6 @@ pub(crate) fn classify(name: &[u8]) -> Result<NameClass, OciError> {
 ///
 /// symlink はリンク自体だけを消し、リンク先は触らない。所有者の rwx が欠けるディレクトリ（0555・0000 等）は
 /// 先に権限を戻してから中身を消す。深さは `MAX_REMOVE_DEPTH` で打ち切る（`ResourceExhausted`）。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn remove_tree_nofollow(path: &Path) -> Result<(), OciError> {
     remove_at(path, 0)
 }
@@ -99,7 +92,6 @@ pub(crate) fn remove_tree_nofollow(path: &Path) -> Result<(), OciError> {
 /// 存在しなければ成功（冪等）。`path` が symlink・非ディレクトリなら `FailedPrecondition`（追従しない）。
 /// 所有者の rwx が欠けるディレクトリ（0555・0000）は権限を戻してから消す。mode の復元は呼び出し側の遅延 mode
 /// （`Extractor::finish_dirs`）が担う。再帰の深さは `MAX_REMOVE_DEPTH`。
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn remove_dir_contents_nofollow(path: &Path) -> Result<(), OciError> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,

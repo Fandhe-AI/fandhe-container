@@ -1201,7 +1201,7 @@ mod tests {
                     let dir = File::open(beneath).expect("open rule dir");
                     sys::landlock_add_path_beneath(ruleset.as_fd(), execute, dir.as_fd())
                         .expect("add rule");
-                    sys::landlock_restrict_self(ruleset.as_fd()).expect("restrict self");
+                    sys::landlock_restrict_self(ruleset.as_fd(), 0).expect("restrict self");
                 };
                 sys::set_no_new_privs().expect("no_new_privs");
                 // 継承した層（呼び出し側の制限に相当）: `allowed/` の配下だけ `EXECUTE` を許す。

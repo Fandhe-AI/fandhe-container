@@ -36,7 +36,9 @@
 //!   ため [`MountCheck::NotRecorded`] で、この照合は行わない（REPAIR-3。後続作業）
 //! - syscall は `crate::sys` の安全なラッパーのみを使い、`unsafe` を持たない。実カーネルは
 //!   [`LandlockKernel`] の差し込み点で隔離し、単体テストは偽カーネルで呼び出し順を照合する
-//! - 分離違反の試行の監査ログ記録（SEC-4）は TASK-41 の範囲で、本モジュールは記録しない
+//! - 分離違反の試行の監査ログ記録（SEC-4）は TASK-41 の範囲で、本モジュールは記録しない。ただし ABI 7 以上では
+//!   `landlock_restrict_self` にログ制御フラグ（`LOG_NEW_EXEC_ON`）を渡し、カーネル監査へ拒否を残す要求をする
+//!   （ABI 7 未満は flags 0 で縮退し、[`LandlockApplyReport::audit`] に出す。#2026）
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
@@ -54,6 +56,7 @@ use std::path::Path;
 
 use super::mounted::{MountCheck, MountIdentity};
 use super::rules::{AccessFs, LandlockRuleset, PathRule, RuleOrigin, RulePath};
+use super::{LandlockAuditMode, RestrictSelfFlags};
 use crate::dev_mounts::ImplicitDevMount;
 use crate::exec::ThreadCountSource;
 use crate::sys::{self, SysError};
@@ -250,6 +253,8 @@ pub struct LandlockApplyReport {
     pub implicit_mounts_verified: usize,
     /// 記録したマウントの識別子と一致を確かめた Mount 由来のルールの数（`MountCheck::Recorded` のときだけ増える。#2071）。
     pub mounts_verified: usize,
+    /// カーネル監査へ拒否を残す要求のモード（SEC-4・#2026）。縮退していれば `Unavailable`。
+    pub audit: LandlockAuditMode,
 }
 
 /// ルール対象の実体の種別。
@@ -295,7 +300,11 @@ pub(crate) trait LandlockKernel {
         allowed: u64,
         path: &Self::PathFd,
     ) -> Result<(), SysError>;
-    fn restrict_self(&self, ruleset: &Self::Ruleset) -> Result<(), SysError>;
+    fn restrict_self(
+        &self,
+        ruleset: &Self::Ruleset,
+        flags: RestrictSelfFlags,
+    ) -> Result<(), SysError>;
     /// 暗黙のマウントのルール対象（`open_rule_path` が返した fd。開き直さない）を観測する。
     fn probe_mount(&self, path: &Self::PathFd) -> Result<MountProbe, SysError>;
     /// ルール対象（`open_rule_path` が返した fd。開き直さない）のマウントの識別子を観測する（#2071）。
@@ -346,8 +355,8 @@ impl LandlockKernel for RealKernel<'_> {
         sys::landlock_add_path_beneath(ruleset.as_fd(), allowed, path.as_fd())
     }
 
-    fn restrict_self(&self, ruleset: &OwnedFd) -> Result<(), SysError> {
-        sys::landlock_restrict_self(ruleset.as_fd())
+    fn restrict_self(&self, ruleset: &OwnedFd, flags: RestrictSelfFlags) -> Result<(), SysError> {
+        sys::landlock_restrict_self(ruleset.as_fd(), flags.bits())
     }
 
     fn mount_identity(&self, path: &OwnedFd) -> Result<MountIdentity, SysError> {
@@ -598,6 +607,7 @@ fn apply_with<K: LandlockKernel>(
         skipped_empty: 0,
         implicit_mounts_verified: 0,
         mounts_verified: 0,
+        audit: ruleset.audit_mode(),
     };
     for (index, rule) in ruleset.rules().iter().enumerate() {
         let implicit = match rule.origin {
@@ -697,13 +707,18 @@ fn apply_with<K: LandlockKernel>(
         report.rules_added += 1;
     }
 
-    kernel.restrict_self(&rs).map_err(|e| {
-        LandlockApplyError::from_sys(
-            e,
-            |errno| Kind::RestrictSelfFailed { errno },
-            "landlock_restrict_self failed",
-        )
-    })?;
+    // ABI 7 以上はログ制御フラグでカーネル監査へ拒否を残す。失敗しても flags 0 でやり直さない（記録を黙って
+    // 失わない。fail-closed。SEC-4・#2026）。
+    let audit = ruleset.audit_mode();
+    kernel
+        .restrict_self(&rs, audit.restrict_self_flags())
+        .map_err(|e| {
+            LandlockApplyError::from_sys(
+                e,
+                |errno| Kind::RestrictSelfFailed { errno },
+                "landlock_restrict_self failed",
+            )
+        })?;
     if kernel.thread_count() != Some(1) {
         return Err(LandlockApplyError::new(
             ErrorCode::Internal,
@@ -915,8 +930,8 @@ mod tests {
             self.log(format!("add:{path}:{allowed:#x}"));
             self.add
         }
-        fn restrict_self(&self, _: &()) -> Result<(), SysError> {
-            self.log("restrict");
+        fn restrict_self(&self, _: &(), flags: RestrictSelfFlags) -> Result<(), SysError> {
+            self.log(format!("restrict:{}", flags.bits()));
             self.restrict
         }
         fn mount_identity(&self, path: &usize) -> Result<MountIdentity, SysError> {
@@ -1119,9 +1134,41 @@ mod tests {
                 "add:0:0xd".into(),
                 "open:/".into(),
                 "add:1:0xffff".into(),
-                "restrict".into(),
+                "restrict:0".into(),
                 "threads".into(),
             ]
+        );
+    }
+
+    /// SEC-4・#2026: ABI で `landlock_restrict_self` の flags と縮退の表示が切り替わる。
+    #[test]
+    fn sec4_restrict_self_flags_follow_abi() {
+        let rules = vec![PathRule {
+            path: RulePath::Root,
+            allowed: AccessFs::READ,
+            origin: RuleOrigin::Root,
+        }];
+        let k = Fake::ok(1);
+        let r7 = apply_with(&k, &LandlockRuleset::for_observation(7, rules.clone())).expect("abi7");
+        assert_eq!(r7.audit, LandlockAuditMode::KernelAuditRequested);
+        assert!(
+            k.calls().contains(&"restrict:2".to_string()),
+            "{:?}",
+            k.calls()
+        );
+        let k = Fake::ok(1);
+        let r6 = apply_with(&k, &LandlockRuleset::for_observation(6, rules)).expect("abi6");
+        assert_eq!(
+            r6.audit,
+            LandlockAuditMode::Unavailable {
+                detected: 6,
+                required: 7
+            }
+        );
+        assert!(
+            k.calls().contains(&"restrict:0".to_string()),
+            "{:?}",
+            k.calls()
         );
     }
 
@@ -1196,7 +1243,7 @@ mod tests {
                 "open:/dev/shm".into(),
                 "probe:3".into(),
                 "add:3:0x77bf".into(),
-                "restrict".into(),
+                "restrict:0".into(),
                 "threads".into(),
             ]
         );
@@ -1656,7 +1703,7 @@ mod tests {
         fn add_rule(&self, _: &(), _: u64, _: &OwnedFd) -> Result<(), SysError> {
             Ok(())
         }
-        fn restrict_self(&self, _: &()) -> Result<(), SysError> {
+        fn restrict_self(&self, _: &(), _: RestrictSelfFlags) -> Result<(), SysError> {
             Ok(())
         }
         fn probe_mount(&self, _: &OwnedFd) -> Result<MountProbe, SysError> {

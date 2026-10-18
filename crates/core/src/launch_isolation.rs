@@ -155,11 +155,34 @@ impl RecordedRule {
     }
 }
 
+/// カーネル監査のログ制御フラグを渡せる最小の Landlock ABI（ABI 7。OS 非依存の定義。`crate::landlock` が再利用する。SEC-4・#2026）。
+pub const MIN_LANDLOCK_AUDIT_ABI: u32 = 7;
+
+/// launch が Landlock の拒否をカーネル監査へ残す要求をしたかの記録（OS 非依存の語彙。SEC-4・#2026）。
+///
+/// `crate::landlock::LandlockAuditMode` の写し。ワークロードの拒否の記録はカーネル監査（読み手は外部）で、
+/// この値は「要求したか・縮退したか」を `state.json` に残すだけである。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecordedLandlockAudit {
+    /// ログ制御フラグで execve の後の拒否の記録を要求した（Landlock ABI 7 以上）。
+    KernelAuditRequested,
+    /// ABI がログ制御フラグに未対応のため要求できなかった（縮退）。
+    Unavailable {
+        /// launch 時に検出した ABI。
+        detected_abi: u32,
+    },
+    /// 記録が無い（このフィールドが入る前の `state.json`）。旧記録はフラグ無しで適用されているため、
+    /// 欠落を「監査あり」と解釈しない。
+    NotRecorded,
+}
+
 /// launch が適用した Landlock の handled access とルール（`LandlockRuleset` の素の型での写し）。
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecordedLandlock {
     handled: u64,
     rules: Vec<RecordedRule>,
+    audit: RecordedLandlockAudit,
 }
 
 impl RecordedLandlock {
@@ -192,7 +215,22 @@ impl RecordedLandlock {
                 return Err(err("landlock rules contain a duplicated path"));
             }
         }
-        Ok(Self { handled, rules })
+        Ok(Self {
+            handled,
+            rules,
+            audit: RecordedLandlockAudit::NotRecorded,
+        })
+    }
+
+    /// カーネル監査の要求の記録を添える（SEC-4・#2026）。
+    pub fn with_audit(mut self, audit: RecordedLandlockAudit) -> Self {
+        self.audit = audit;
+        self
+    }
+
+    /// カーネル監査の要求の記録。
+    pub fn audit(&self) -> RecordedLandlockAudit {
+        self.audit
     }
 
     /// handled access のビット値。
@@ -250,11 +288,14 @@ impl fmt::Debug for LaunchIsolationRecord {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use super::RecordedLandlockAudit;
     use super::{
         LaunchIsolationError, LaunchIsolationRecord, RecordedLandlock, RecordedRule,
         RecordedTarget, RootIdentity,
     };
-    use crate::landlock::{AccessFs, LandlockRuleset, PathRule, RuleOrigin, RulePath};
+    use crate::landlock::{
+        AccessFs, LandlockAuditMode, LandlockRuleset, PathRule, RuleOrigin, RulePath,
+    };
 
     impl LaunchIsolationRecord {
         /// launch が適用する `ruleset` と、launch 後の `/` の識別子から記録を作る。
@@ -270,12 +311,28 @@ mod linux {
                 .iter()
                 .map(recorded_rule)
                 .collect::<Result<Vec<_>, _>>()?;
-            let landlock = RecordedLandlock::new(ruleset.handled_access_fs().bits(), rules)?;
+            let audit = match ruleset.audit_mode() {
+                LandlockAuditMode::KernelAuditRequested => {
+                    RecordedLandlockAudit::KernelAuditRequested
+                }
+                LandlockAuditMode::Unavailable { detected, .. } => {
+                    RecordedLandlockAudit::Unavailable {
+                        detected_abi: detected,
+                    }
+                }
+            };
+            let landlock =
+                RecordedLandlock::new(ruleset.handled_access_fs().bits(), rules)?.with_audit(audit);
             Ok(Self::from_parts(root, landlock))
         }
 
         /// 記録から Landlock ruleset を組み直す（exec の再適用用。ABI の再検出も `config.json` の再解釈もしない）。
-        pub(crate) fn landlock_ruleset(&self) -> Result<LandlockRuleset, LaunchIsolationError> {
+        ///
+        /// カーネル監査のモードは記録ではなく、呼び出し側が今のカーネルの ABI から決めて渡す（SEC-4・#2026）。
+        pub(crate) fn landlock_ruleset(
+            &self,
+            audit: LandlockAuditMode,
+        ) -> Result<LandlockRuleset, LaunchIsolationError> {
             let bad = LaunchIsolationError("recorded landlock access is out of range");
             let handled = AccessFs::from_bits(self.landlock.handled()).ok_or(bad)?;
             let rules = self
@@ -302,7 +359,7 @@ mod linux {
                     })
                 })
                 .collect::<Result<Vec<_>, LaunchIsolationError>>()?;
-            Ok(LandlockRuleset::from_recorded(handled, rules))
+            Ok(LandlockRuleset::from_recorded(handled, rules, audit))
         }
     }
 
@@ -440,7 +497,7 @@ mod tests {
             let rec = LaunchIsolationRecord::new(RootIdentity::new(1, 2), &ruleset).expect("rec");
             assert_eq!(rec.root(), RootIdentity::new(1, 2));
             assert_eq!(rec.landlock().rules().len(), ruleset.rules().len());
-            let back = rec.landlock_ruleset().expect("ruleset");
+            let back = rec.landlock_ruleset(ruleset.audit_mode()).expect("ruleset");
             assert_eq!(back.handled_access_fs(), ruleset.handled_access_fs());
             assert_eq!(back.rules(), ruleset.rules());
         }

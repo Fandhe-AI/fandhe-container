@@ -152,8 +152,9 @@ fn sec5_special_bits_via_public_api_with_real_owner() {
     if gid != 0 {
         expected_mapped |= 0o2000;
     }
-    let mapped_kept = expected_mapped != 0o755;
-    let mapped_stripped = expected_mapped != 0o6755;
+    // preserved_files は要求した特殊ビットをすべて保持したファイルだけを数える（一部でも落ちれば除去側）。
+    let mapped_kept = expected_mapped == 0o6755;
+    let mapped_stripped = !mapped_kept;
     assert_eq!(r.special_bits.preserved_files, u64::from(mapped_kept));
     assert_eq!(
         r.files_with_stripped_special_bits,

@@ -500,6 +500,9 @@ mod linux {
     /// drop で削除する、自分専用の作業ディレクトリ。`create_dir` で排他的に作り、既存パスを再利用しない。
     struct WorkDir {
         dir: PathBuf,
+        /// true のとき drop で削除しない。プロセスの消滅を確認できない場合に、使用中のファイルと
+        /// 手動回収に要る状態記録を残すために立てる（CORE-2）。
+        keep: bool,
     }
 
     impl WorkDir {
@@ -515,12 +518,25 @@ mod linux {
                 std::process::id()
             ));
             mkdir_mode(&dir, 0o700).map_err(|_| Failure::new("setup", "INTERNAL"))?;
-            Ok(Self { dir })
+            Ok(Self { dir, keep: false })
+        }
+
+        /// 回収未確認のため削除を取りやめ、残した場所を標準エラーへ報告する。
+        fn retain(&mut self, what: &str) {
+            self.keep = true;
+            record_cleanup_failure();
+            eprintln!(
+                "pull_e2e: FAILED cleanup: process not confirmed gone; kept {what} at {}; remove it manually after reclaiming the process",
+                self.dir.display()
+            );
         }
     }
 
     impl Drop for WorkDir {
         fn drop(&mut self) {
+            if self.keep {
+                return;
+            }
             force_remove(&self.dir);
         }
     }
@@ -930,7 +946,7 @@ mod linux {
             exit_kind: "not_started",
             ..Report::default()
         };
-        let dir = match WorkDir::new(base, &format!("img{idx}")) {
+        let mut dir = match WorkDir::new(base, &format!("img{idx}")) {
             Ok(d) => d,
             Err(f) => {
                 r.failure = Some(f);
@@ -958,6 +974,9 @@ mod linux {
         r.failure = run.failure;
         r.stdout_tail = run.stdout_tail;
         r.stderr_tail = run.stderr_tail;
+        if run.abort_rest {
+            dir.retain("bundle/rootfs");
+        }
         (r, run.abort_rest)
     }
 
@@ -1024,7 +1043,7 @@ mod linux {
     }
 
     fn live_inner(args: &RunArgs, base: &Path, container: &Arc<ContainerCgroup>, tag: u32) -> i32 {
-        let state_dir = match WorkDir::new(base, "state") {
+        let mut state_dir = match WorkDir::new(base, "state") {
             Ok(d) => d,
             Err(f) => {
                 eprintln!("pull_e2e: FAILED setup: state dir ({})", f.code);
@@ -1079,6 +1098,9 @@ mod linux {
                 failed += 1;
             }
             abort = abort_rest;
+        }
+        if abort {
+            state_dir.retain("state records");
         }
         if failed == 0 {
             println!("pull_e2e: {total}/{total} images pulled, verified, extracted and exited 0");

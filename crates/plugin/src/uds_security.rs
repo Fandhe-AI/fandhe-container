@@ -344,8 +344,11 @@ pub(crate) struct PeerRejection {
 }
 
 /// 取得関数を差し替えられる検証本体（取得失敗の fail-closed をテストで再現するため。PLUG-12）。
+///
+/// `transport` の accept も、テストビルドでのみ取得関数を台本に差し替えてこの関数を使う
+/// （比較と拒否の組み立てを本物の経路で通すため。本番の取得は [`verify_peer`] と同値）。
 #[cfg(unix)]
-fn verify_peer_with(
+pub(crate) fn verify_peer_with(
     get: impl FnOnce() -> Result<u32, PluginError>,
     expected_uid: u32,
 ) -> Result<(), PeerRejection> {

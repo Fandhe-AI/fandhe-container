@@ -84,12 +84,17 @@ TASK-191 の着手前に確定が要る未決事項 4 点と計測対象を、�
 採る案は (i)。
 
 - ゲスト内の構成: PID 1 は guest-init のまま。mount・報告に加え、子の回収・協調停止・制御チャネルの受け口を持つ。コンテナの作成と実行はゲスト内の CLI → core → supervisor の Linux の経路で行い、分離は namespaces・cgroups v2・seccomp・Landlock（MAC-4 の期待どおり）。ゲストカーネルは #1874 の Kconfig で cgroup v2・user namespace・seccomp・Landlock を有効にする（足りない設定は実装 issue）
-- ホストとゲストの制御経路: vsock（`VZVirtioSocketDevice`）。ホスト側の vsock はゲストからの接続だけを受け、保持役配下の plugin-macos だけが VM のデバイスに触れる。シリアルコンソール（hvc0）は起動時の報告と ready マーカー専用で、制御には使わない
+- **ゲスト内の実行ユーザー（root で動かさない）**: 既存 CLI の `supervisor_start` の `privilege_gate` は、UID のいずれかが 0 のとき `start` を `UNIMPLEMENTED` で拒否する（rootful 非対応。CORE-3）。この拒否は解除しない。ゲスト内の CLI・core・supervisor は、guest-init が用意する非特権ユーザー（案: UID 1000。`/etc/passwd` 相当は initrd に固定で梱包）として動かす。guest-init（PID 1）だけが root で、ユーザーの降格（`setgroups`・`setgid`・`setuid`。`sys` モジュール内）の後にゲスト内 CLI を起動する。コンテナ内 root の写像は rootless の user namespace（SEC-5）と、ゲスト内の subordinate ID 範囲（launcher 経由の写像。#2209 の系統）で行う。ゲスト内の launcher を置くか、ゲスト用に subordinate ID を固定の範囲で渡すかは実装 issue で決める（承認事項）
+- **ゲスト内の cgroup 委譲と supervisor の起動（systemd を使わない）**: 既存の `supervisor_start` は `systemd-run --user --scope -p Delegate=yes` と systemd の user マネージャを必須とするが、ゲストは PID 1 を guest-init のままにするため systemd が無い。したがって既存の Linux 起動経路はそのままでは使えない。ゲスト向けには次の方式を案とする
+  - guest-init が起動時に cgroup v2 を mount し、`/sys/fs/cgroup/fandhe` を作って上記の非特権ユーザーへ所有を移し（`chown`）、必要な controller（`cpu`・`memory`・`pids`・`io`）を `subtree_control` で有効にする（委譲）。この委譲は supervisor 側の `DelegatedCgroup::prepare` の前提（委譲された親に自分以外のプロセスがいない）に合わせ、ゲスト内 CLI 自身はこの subtree の外に置く
+  - ゲスト内 CLI の起動は、systemd-run を介さず、委譲済みの cgroup 配下へ supervisor を直接 spawn する承認済みの別経路（ゲスト向けの起動モード）とする。`privilege_gate` の判定と systemd 経路は変えず、ゲスト向けモードは明示的な構成（ビルドの feature または固定の起動引数）でのみ有効にする。通常の Linux ホストで誤って有効にならないことを試験で確かめる
+  - 実装課題として、(1) guest-init の cgroup 委譲と非特権ユーザーへの降格、(2) ゲスト向け supervisor 起動モード（cli）、(3) ゲスト内の subordinate ID の供給を新規に起票する（起票は #1906 の承認後。G6・G9 の依存に加える）
+- ホストとゲストの制御経路: vsock（`VZVirtioSocketDevice`）。**接続の方向はホスト開始・ゲスト受け側に統一する**。guest-init がゲスト内の固定ポート（案: 1024。実装 issue で確定）で `listen` し、保持役配下の plugin-macos が `VZVirtioSocketDevice` の `connectToPort` で接続する（VM のデバイスに触れるのは plugin-macos だけ）。ゲストからホストへ接続する経路は作らない（ホスト側にゲスト由来の待受を持たない）。シリアルコンソール（hvc0）は起動時の報告と ready マーカー専用で、制御には使わない
 - **承認事項**: `objc2-virtualization` に vsock 関連の feature（`VZVirtioSocketDevice*` など）を足す必要がある。依存の更新にあたるため [dependency-policy](../../.claude/rules/dependency-policy.md) に従いユーザー承認を要する
-- 接続元の確認: ゲスト側の受け口は `VMADDR_CID_HOST`（2）からの接続だけを受ける。network namespace は vsock を分離しないため、コンテナから `socket(AF_VSOCK, …)` を使わせないよう seccomp で拒否し、結合試験で確かめる。ホスト側の CLI・plugin と保持役の間は UDS の peer UID 照合で守る（PLUG-12）
+- 接続元の確認: ゲスト側の受け口（G6）は accept した peer の CID が `VMADDR_CID_HOST`（2）であることを検証し、それ以外は即切断する。ホスト側の接続（G5）は固定ポートへ接続するだけで、待受（listen）を持たない。network namespace は vsock を分離しないため、コンテナから `socket(AF_VSOCK, …)` を使わせないよう seccomp で拒否し、結合試験で確かめる。ホスト側の CLI・plugin と保持役の間は UDS の peer UID 照合で守る（PLUG-12）
 - 中継の契約: Windows の起動役の中継（[windows-execution-layout.md](windows-execution-layout.md)）と同じ形にする。引数の配列・標準入出力・終了コードを中継し、シェルを経由させない。ゲスト内のバイナリは固定の絶対パスで呼び、`PATH` を探さない。フレームは長さの上限とチェックサムつき（REPAIR-2）。plugin のフレーム（PLUG-2）を再利用するかは実装 issue で決める
 - rootfs とイメージ: 推奨は、イメージとコンテナの rootfs をゲスト側の永続ディスク（virtio-blk のデータディスク）に置くこと。bundle をホストで作る経路（#1869 4.3 の (a)）では共有ルート経由でゲストへ渡す。MVP は「共有ルート経由の bundle」とし、ゲスト内の pull（VZ の NAT のネットワークと feature 追加が要る）は後続とする（判断事項）
-- 状態ファイル: ゲスト内の `/run/fandhe-container/<id>/state.json`（OCI-5 の (1)。ゲスト内は root で動かす）。ホストに置くのは項目 1 の所属記録だけ
+- 状態ファイル: ゲスト内の `/run/fandhe-container/<id>/state.json`（OCI-5 の (1)。上記の非特権ユーザーが書ける `/run` 配下の所有で用意する）。ホストに置くのは項目 1 の所属記録だけ
 - ログ: コンテナと supervisor のログはゲスト内に置く（SUP-7 の回転規則）。ホストの `logs` はゲスト内の CLI を中継して読む。hvc0 のコンソールログは guest-init の診断専用
 - ゲスト向けバイナリ: core・supervisor・CLI を `aarch64-unknown-linux-musl` の静的リンクでビルドし、`scripts/build-guest-initrd.sh` で initrd に入れる（またはデータディスクに置く。サイズで判断）。musl で型検査しているのは guest-init だけなので、`cross-target-check` に CLI・supervisor の musl 型検査を足す
 - guest-init（#1823・#1875）に足すもの: 子の `waitpid` ループと孤児の回収、協調停止（ホストの停止要求 → ゲスト内のコンテナ停止 → `sync` → `reboot(RB_POWER_OFF)`。期限を過ぎたらホストが VZ の強制停止へ切り替える）、子を動かす前の fd 起点の mount（#2080 の P2-4。`openat`＋`O_NOFOLLOW` → `/proc/self/fd`、または `open_tree` / `move_mount`）、vsock の受け口とゲスト内 CLI の起動、doc の「TASK-115 で未実装」の記述の修正。#1823 の決定（workspace のメンバー crate・musl・arm64 のみ）は変えない
@@ -142,7 +147,7 @@ PLUG-1 の境界表の macOS の行は「plugin（常駐。保持役が持つ）
 ## セキュリティ（OWASP の観点）
 
 - インジェクション: 中継は引数の配列でシェルを経由させない。ゲスト内のパスは固定。共有パスは正規化と検証をしてから使う
-- アクセス制御: UDS は 0700 と peer UID の照合。ゲストの vsock は CID 2 だけを受ける。コンテナからの AF_VSOCK は seccomp で拒否する。共有ルートの露出範囲は trade-off として明記済み
+- アクセス制御: UDS は 0700 と peer UID の照合。ゲストの vsock の受け口は CID 2 のホストからの接続だけを受ける（接続はホスト開始）。コンテナからの AF_VSOCK は seccomp で拒否する。共有ルートの露出範囲は trade-off として明記済み
 - 不安全な設計: すべての待ちに期限を付ける。件数・長さに上限を設ける。異常時は VM・plugin・mount・ゲスト内プロセスを回収する。二重起動はロックで防ぎ、取れなければ fail-closed
 - 完全性: plugin-macos は検証済みの fd で起動する（#1869 4.2）。ゲスト向けバイナリは initrd に梱包し、ゲストの `PATH` は探さない。版の不一致の照合を実装 issue にする
 - 情報漏えい: エラーは英語の固定文言だけにし、ホストのパスや plugin 由来の文字列は出さない
@@ -169,6 +174,8 @@ Apple Silicon の macOS 実機で確かめないと決まらない。すべて�
 
 - `objc2-virtualization` の vsock 関連 feature の追加（依存の更新）
 - 保持役を置く crate（推奨: supervisor）
+- ゲスト内の非特権ユーザー降格・cgroup 委譲・ゲスト向け supervisor 起動モード・subordinate ID の供給方式（`privilege_gate` は変えない）
+- vsock の方向（ホスト開始・ゲスト受け側）
 - MVP のイメージ経路（推奨: 共有ルート経由の bundle）
 - 猶予・上限・協調停止の期限の値（案: 猶予 30 秒、コンテナ上限 64、協調停止 30 秒）
 
@@ -198,8 +205,8 @@ Apple Silicon の macOS 実機で確かめないと決まらない。すべて�
 | G2 | #2269 | feat(platform): guest-init（PID 1）に子の waitpid ループと孤児の回収を足す |
 | G3 | #2270 | feat(platform): guest-init の協調停止とホスト側の期限つき強制停止への切り替え |
 | G4 | #2271 | build(platform): objc2-virtualization の vsock 関連 feature の追加（承認事項） |
-| G5 | #2272 | feat(platform): ホスト側の VZ vsock 接続（platform-macos）と io の vsock 表の更新 |
-| G6 | #2273 | feat(platform): guest-init の vsock 受け口（CID 2 のみ）とゲスト内 CLI の中継 |
+| G5 | #2272 | feat(platform): ホスト側の VZ vsock 接続（ホスト開始・`connectToPort`。platform-macos）と io の vsock 表の更新 |
+| G6 | #2273 | feat(platform): guest-init の vsock 受け口（ゲストが listen・CID 2 の peer のみ許可）とゲスト内 CLI の中継 |
 | G7 | #2274 | build: core・supervisor・cli の aarch64-unknown-linux-musl 型検査を cross-target-check に足す |
 | G8 | #2275 | build(platform): ゲスト向け cli・supervisor を initrd に梱包する |
 | G9 | #2276 | feat(platform): ゲストカーネルの Kconfig に cgroup v2・userns・seccomp・Landlock を足す |
@@ -211,4 +218,4 @@ Apple Silicon の macOS 実機で確かめないと決まらない。すべて�
 | G15 | #2282 | chore(platform): macOS 実機で共用 VM の起動・2 コンテナ・保持役の終了を確かめる（人間担当） |
 | G16 | #2283 | feat(cli): オプション方式（容量 1 VM）の選択の入口 |
 
-G1・G2 は #58 の、G3〜G16 は #1905 の sub-issue（#58 が sub-issue 上限 100 件に達したため）。G1〜G3 と G7・G9・G10 は共用 VM を待たずに進められる。既存の #1877・#1628・#1879・#1880 は新規起票せず関連として参照する。
+上記に加え、ゲスト内の非特権実行（降格・cgroup 委譲・ゲスト向け起動モード・subordinate ID）の実装 issue を #1906 の承認後に起票する（番号は未定）。G1・G2 は #58 の、G3〜G16 は #1905 の sub-issue（#58 が sub-issue 上限 100 件に達したため）。G1〜G3 と G7・G9・G10 は共用 VM を待たずに進められる。既存の #1877・#1628・#1879・#1880 は新規起票せず関連として参照する。

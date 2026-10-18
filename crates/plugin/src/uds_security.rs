@@ -2293,9 +2293,11 @@ mod imp {
         }
 
         /// PLUG-12（#1310）: bind 側がロックファイルを作成（`O_EXCL`）してから `flock` を取るまでの間に、
-        /// 別プロセスの掃除が先に `flock` を取った場合を再現する。割り込んだ側は 20 ms 後に空のロック
-        /// ファイルを unlink して解放する（掃除の `BindLock` の drop と同じ）。bind 側は待って取り直し、
-        /// 名前から外れた inode を捨てて作り直すので、`AlreadyExists` で失敗せずロックを得る。
+        /// 別プロセスの掃除が先に `flock` を取った場合を再現する。割り込んだ側は bind 側の 1 回目の待ちの
+        /// 時点で空のロックファイルを unlink して解放する（掃除の `BindLock` の drop と同じ）。時間でなく
+        /// 待ちの時点に固定するので、CI の負荷で割り込みが遅れて待ち予算が尽きることはない（#2003）。
+        /// bind 側は待って取り直し、名前から外れた inode を捨てて作り直すので、`AlreadyExists` で失敗せず
+        /// ロックを得る。
         #[test]
         fn plug12_bind_lock_waits_for_sweeper_that_won_flock_after_create() {
             use std::sync::{Arc, Mutex};
@@ -2309,15 +2311,25 @@ mod imp {
             crate::sys::lock_test_hook::set(move |_, _| {
                 let held = File::open(&path).unwrap();
                 held.try_lock().unwrap();
-                *slot.lock().unwrap() = Some(std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    std::fs::remove_file(&path).unwrap();
-                    drop(held);
-                }));
+                *slot.lock().unwrap() = Some(held);
             });
+            let (slot, path) = (Arc::clone(&intruder), lock_path.clone());
+            let released = Arc::new(Mutex::new(false));
+            let flag = Arc::clone(&released);
+            crate::sys::lock_test_hook::set_on_wait(move || {
+                std::fs::remove_file(&path).unwrap();
+                drop(
+                    slot.lock()
+                        .unwrap()
+                        .take()
+                        .expect("hook must have run once"),
+                );
+                *flag.lock().unwrap() = true;
+            });
+            let _ = crate::sys::lock_test_hook::take_waits();
             let lock = acquire_bind_lock(&dir, name, euid).unwrap();
-            let handle = intruder.lock().unwrap().take();
-            handle.expect("hook must have run once").join().unwrap();
+            assert!(*released.lock().unwrap(), "on_wait must have run");
+            assert_eq!(crate::sys::lock_test_hook::take_waits(), 1);
             // 得たロックは、いま名前が指しているファイルのもの（他者は取れない）。
             assert!(lock_path.exists());
             let other = File::open(&lock_path).unwrap();
@@ -2366,7 +2378,8 @@ mod imp {
 
         /// PLUG-12・REPAIR-5（#1310）: 作成直後に割り込んだ側がロックを解放しない場合、bind 側は取得 1 回分の
         /// 100 ms（1 ms × 100 回）だけ待って `AlreadyExists` を返す（待ち続けない）。走査位置ヒント用の
-        /// `LockOpen::Create` は待たずに `WouldBlock` を返す。
+        /// `LockOpen::Create` は待たずに `Held` を返す。待たないことは壁時計の短い上限でなく待ち回数
+        /// （`lock_test_hook::take_waits`）で確かめる。CI の負荷で遅れただけの呼び出しを誤検出しない（#2003）。
         #[test]
         fn repair5_bind_lock_wait_after_create_is_bounded() {
             use std::sync::{Arc, Mutex};
@@ -2383,21 +2396,25 @@ mod imp {
                 });
             };
             hold("oneshot-1-0.sock.lock");
+            let _ = crate::sys::lock_test_hook::take_waits();
             let started = std::time::Instant::now();
             let e = acquire_bind_lock(&dir, c"oneshot-1-0.sock", euid).unwrap_err();
             let waited = started.elapsed();
             assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+            assert_eq!(
+                crate::sys::lock_test_hook::take_waits(),
+                crate::sys::CREATED_LOCK_WAIT_ATTEMPTS
+            );
             assert!(
                 waited >= std::time::Duration::from_millis(100)
                     && waited < std::time::Duration::from_secs(10),
                 "waited={waited:?}"
             );
             hold("hint");
-            let started = std::time::Instant::now();
             let e =
                 crate::sys::lock_file_at(&dir, c"hint", crate::sys::LockOpen::Create).unwrap_err();
             assert!(matches!(e, crate::sys::LockError::Held), "{e:?}");
-            assert!(started.elapsed() < std::time::Duration::from_millis(100));
+            assert_eq!(crate::sys::lock_test_hook::take_waits(), 0);
             assert_eq!(held.lock().unwrap().len(), 2);
         }
 

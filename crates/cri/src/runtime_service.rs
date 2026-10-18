@@ -91,6 +91,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::codegen::tokio_stream::Empty;
 use tonic::{Request, Response, Status};
 
+use crate::error::{CriError, CriErrorCode};
+
 use crate::adapter::{BundleProvider, RuntimeAdapter, RuntimeLifecycle};
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpTimer, NoopCriOpRecorder};
 use crate::runtime::v1::{
@@ -277,16 +279,15 @@ enum InFlightKind {
 ///
 /// 入力・状態・権限の拒否は実行層が処理前に弾いた確定失敗。`DeadlineExceeded`・`Unavailable`・
 /// `Internal` 等は応答不明で実行層が running の可能性があり、再 Start の二重起動を避けるため含めない。
-fn is_definite_failure(code: tonic::Code) -> bool {
-    use tonic::Code;
+fn is_definite_failure(code: CriErrorCode) -> bool {
     matches!(
         code,
-        Code::InvalidArgument
-            | Code::NotFound
-            | Code::AlreadyExists
-            | Code::FailedPrecondition
-            | Code::Unimplemented
-            | Code::PermissionDenied
+        CriErrorCode::InvalidArgument
+            | CriErrorCode::NotFound
+            | CriErrorCode::AlreadyExists
+            | CriErrorCode::FailedPrecondition
+            | CriErrorCode::Unimplemented
+            | CriErrorCode::PermissionDenied
     )
 }
 
@@ -349,7 +350,7 @@ impl InFlightGuard {
     }
 
     /// 実行層の成功を記録へ反映して確定する。反映に失敗したら巻き戻される。
-    fn commit(&mut self) -> Result<(), Status> {
+    fn commit(&mut self) -> Result<(), CriError> {
         commit_in_flight(&self.registry, &self.id, self.kind)?;
         self.committed = true;
         Ok(())
@@ -394,7 +395,7 @@ fn confirm_removed(adapter: &RuntimeAdapter, id: &str, timeout: Duration) -> boo
     let id = id.to_owned();
     call_with_deadline(timeout, move || match adapter.remove(&id, true) {
         Ok(_) => true,
-        Err(status) => status.code() == tonic::Code::NotFound,
+        Err(err) => err.code() == CriErrorCode::NotFound,
     })
     .unwrap_or(false)
 }
@@ -406,12 +407,11 @@ fn confirm_removed(adapter: &RuntimeAdapter, id: &str, timeout: Duration) -> boo
 fn start_failure_is_definite(
     adapter: &RuntimeAdapter,
     id: &str,
-    code: tonic::Code,
+    code: CriErrorCode,
     timeout: Duration,
 ) -> bool {
-    use tonic::Code;
     match code {
-        Code::FailedPrecondition | Code::NotFound => {
+        CriErrorCode::FailedPrecondition | CriErrorCode::NotFound => {
             let adapter = adapter.clone();
             let id = id.to_owned();
             call_with_deadline(timeout, move || adapter.state(&id))
@@ -457,7 +457,7 @@ where
 
 /// `run_bounded` の完了待ちの共有状態（結果と、待っている future の waker）。
 struct WaitState<T> {
-    result: Option<Result<T, Status>>,
+    result: Option<Result<T, CriError>>,
     waker: Option<std::task::Waker>,
 }
 
@@ -465,14 +465,14 @@ struct WaitState<T> {
 struct BoundedWait<T>(Arc<Mutex<WaitState<T>>>);
 
 impl<T> std::future::Future for BoundedWait<T> {
-    type Output = Result<T, Status>;
+    type Output = Result<T, CriError>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let Ok(mut state) = self.0.lock() else {
-            return std::task::Poll::Ready(Err(Status::internal("runtime task failed")));
+            return std::task::Poll::Ready(Err(CriError::internal("runtime task failed")));
         };
         match state.result.take() {
             Some(result) => std::task::Poll::Ready(result),
@@ -490,7 +490,7 @@ impl<T> std::future::Future for BoundedWait<T> {
 /// [`InFlightGuard`] で記録を最後まで確定・巻き戻すため、呼び出し側は結果不明として扱ってよい。
 /// worker も期限の監視も tokio の blocking pool を使わない。実行層のハングで pool が埋まっても、
 /// 期限の監視は開始され、`timeout` で応答を返す。
-async fn run_bounded<T, F>(timeout: Duration, work: F) -> Result<T, Status>
+async fn run_bounded<T, F>(timeout: Duration, work: F) -> Result<T, CriError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -505,11 +505,9 @@ where
     spawn_runtime_thread("cri-runtime-wait", move || {
         let result = match rx.recv_timeout(timeout) {
             Ok(value) => Ok(value),
-            Err(RecvTimeoutError::Timeout) => {
-                Err(Status::deadline_exceeded("runtime operation timed out"))
-            }
+            Err(RecvTimeoutError::Timeout) => Err(CriError::timeout("runtime operation timed out")),
             // worker の panic（guard の Drop が後始末する）。
-            Err(RecvTimeoutError::Disconnected) => Err(Status::internal("runtime task failed")),
+            Err(RecvTimeoutError::Disconnected) => Err(CriError::internal("runtime task failed")),
         };
         if let Ok(mut state) = waiter_state.lock() {
             state.result = Some(result);
@@ -518,12 +516,12 @@ where
             }
         }
     })
-    .map_err(|_| Status::unavailable("cannot start runtime wait thread"))?;
+    .map_err(|_| CriError::unavailable("cannot start runtime wait thread"))?;
     // worker は切り離す（join しない）。panic は guard の Drop が後始末する。
     spawn_runtime_thread("cri-runtime-worker", move || {
         let _ = tx.send(work());
     })
-    .map_err(|_| Status::unavailable("cannot start runtime worker thread"))?;
+    .map_err(|_| CriError::unavailable("cannot start runtime worker thread"))?;
     BoundedWait(state).await
 }
 
@@ -532,11 +530,11 @@ fn commit_in_flight(
     registry: &Mutex<SandboxRegistry>,
     id: &str,
     kind: InFlightKind,
-) -> Result<(), Status> {
+) -> Result<(), CriError> {
     let started_at_nanos = now_nanos()?;
     let mut registry = registry
         .lock()
-        .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+        .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
     // Start の実行中に StopPodSandbox が入った場合、親が Ready でなければ running を確定しない。
     // Err を返すと guard の Drop が（結果不明として）exited へ倒す。
     if kind == InFlightKind::Start {
@@ -546,13 +544,13 @@ fn commit_in_flight(
             .and_then(|c| registry.records.get(&c.pod_sandbox_id))
             .is_some_and(|s| s.state == SandboxState::Ready);
         if !parent_ready {
-            return Err(Status::failed_precondition("sandbox is not ready"));
+            return Err(CriError::failed_precondition("sandbox is not ready"));
         }
     }
     let record = registry
         .containers
         .get_mut(id)
-        .ok_or_else(|| Status::internal("container registry is inconsistent"))?;
+        .ok_or_else(|| CriError::internal("container registry is inconsistent"))?;
     record.in_flight = false;
     if kind == InFlightKind::Create {
         // 実行層に資源（コンテナ・bundle）が存在する。削除の接続（TASK-59.3）まで Remove を拒否し、
@@ -618,25 +616,25 @@ fn drop_container_in(
     registry: &Mutex<SandboxRegistry>,
     container_id: &str,
     include_in_flight: bool,
-) -> Result<(), Status> {
+) -> Result<(), CriError> {
     let mut registry = registry
         .lock()
-        .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+        .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
     let Some(record) = registry.containers.get(container_id) else {
         return Ok(());
     };
     if record.in_flight && !include_in_flight {
-        return Err(Status::failed_precondition(
+        return Err(CriError::failed_precondition(
             "container operation in progress",
         ));
     }
     if record.runtime_leaked && !include_in_flight {
-        return Err(Status::failed_precondition(
+        return Err(CriError::failed_precondition(
             "container resources are pending runtime cleanup",
         ));
     }
     // 先に検証してから変更し、失敗時にレジストリを変更しない。
-    let inconsistent = || Status::internal("container registry is inconsistent");
+    let inconsistent = || CriError::internal("container registry is inconsistent");
     let metadata = record.config.metadata.as_ref().ok_or_else(inconsistent)?;
     let key = (
         record.pod_sandbox_id.clone(),
@@ -768,7 +766,7 @@ impl CriRuntimeService {
     fn reserve_sandbox(
         &self,
         req: v1::RunPodSandboxRequest,
-    ) -> Result<v1::RunPodSandboxResponse, Status> {
+    ) -> Result<v1::RunPodSandboxResponse, CriError> {
         let ValidatedRun {
             config,
             runtime_handler,
@@ -780,15 +778,15 @@ impl CriRuntimeService {
         let mut registry = self
             .registry
             .lock()
-            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
         if registry.records.len() >= self.limits.max_sandboxes {
-            return Err(Status::failed_precondition("too many sandboxes"));
+            return Err(CriError::failed_precondition("too many sandboxes"));
         }
         let total_retained_bytes = registry
             .retained_bytes
             .checked_add(retained_bytes)
             .filter(|total| *total <= self.limits.max_retained_bytes)
-            .ok_or_else(|| Status::failed_precondition("sandbox config storage is full"))?;
+            .ok_or_else(|| CriError::failed_precondition("sandbox config storage is full"))?;
         let mut pod_sandbox_id = None;
         for _ in 0..ID_RETRY_LIMIT {
             let candidate = generate_id();
@@ -798,7 +796,7 @@ impl CriRuntimeService {
             }
         }
         let pod_sandbox_id =
-            pod_sandbox_id.ok_or_else(|| Status::internal("failed to allocate sandbox id"))?;
+            pod_sandbox_id.ok_or_else(|| CriError::internal("failed to allocate sandbox id"))?;
         registry.records.insert(
             pod_sandbox_id.clone(),
             SandboxRecord {
@@ -820,17 +818,17 @@ impl CriRuntimeService {
     fn stop_sandbox(
         &self,
         req: v1::StopPodSandboxRequest,
-    ) -> Result<v1::StopPodSandboxResponse, Status> {
+    ) -> Result<v1::StopPodSandboxResponse, CriError> {
         if req.pod_sandbox_id.is_empty() {
-            return Err(Status::invalid_argument("pod_sandbox_id is required"));
+            return Err(CriError::invalid_argument("pod_sandbox_id is required"));
         }
         let finished_at_nanos = now_nanos()?;
         let mut registry = self
             .registry
             .lock()
-            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
         if !registry.records.contains_key(&req.pod_sandbox_id) {
-            return Err(Status::not_found("sandbox not found"));
+            return Err(CriError::not_found("sandbox not found"));
         }
         // 実行層の資源を持つ、または作成・起動の実行中のコンテナを 1 つでも含む間は停止を拒否する
         // （TASK-59.3 で実行層の stop を接続するまで。Created でも init が fork 済みで PID を持ちうる
@@ -841,12 +839,12 @@ impl CriRuntimeService {
             .values()
             .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && (c.in_flight || c.runtime_leaked))
         {
-            return Err(Status::failed_precondition(
+            return Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
             ));
         }
         let Some(record) = registry.records.get_mut(&req.pod_sandbox_id) else {
-            return Err(Status::not_found("sandbox not found"));
+            return Err(CriError::not_found("sandbox not found"));
         };
         record.state = SandboxState::NotReady;
         // 配下の running コンテナを exited にする（TASK-58.2。created・停止済みは変えない）。
@@ -866,14 +864,14 @@ impl CriRuntimeService {
     fn remove_sandbox(
         &self,
         req: v1::RemovePodSandboxRequest,
-    ) -> Result<v1::RemovePodSandboxResponse, Status> {
+    ) -> Result<v1::RemovePodSandboxResponse, CriError> {
         if req.pod_sandbox_id.is_empty() {
-            return Err(Status::invalid_argument("pod_sandbox_id is required"));
+            return Err(CriError::invalid_argument("pod_sandbox_id is required"));
         }
         let mut registry = self
             .registry
             .lock()
-            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
         let Some(record) = registry.records.get(&req.pod_sandbox_id) else {
             return Ok(v1::RemovePodSandboxResponse {});
         };
@@ -881,14 +879,14 @@ impl CriRuntimeService {
         let remaining = registry
             .retained_bytes
             .checked_sub(record.retained_bytes)
-            .ok_or_else(|| Status::internal("sandbox registry is inconsistent"))?;
+            .ok_or_else(|| CriError::internal("sandbox registry is inconsistent"))?;
         // 配下に実行層を呼び出し中のコンテナがあれば除去しない（実行層に資源が残るため。TASK-59.2）。
         if registry
             .containers
             .values()
             .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && c.in_flight)
         {
-            return Err(Status::failed_precondition(
+            return Err(CriError::failed_precondition(
                 "container operation in progress",
             ));
         }
@@ -898,7 +896,7 @@ impl CriRuntimeService {
             .values()
             .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && c.runtime_leaked)
         {
-            return Err(Status::failed_precondition(
+            return Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
             ));
         }
@@ -911,12 +909,12 @@ impl CriRuntimeService {
         {
             released = released
                 .checked_add(c.retained_bytes)
-                .ok_or_else(|| Status::internal("container registry is inconsistent"))?;
+                .ok_or_else(|| CriError::internal("container registry is inconsistent"))?;
         }
         let remaining_containers = registry
             .container_retained_bytes
             .checked_sub(released)
-            .ok_or_else(|| Status::internal("container registry is inconsistent"))?;
+            .ok_or_else(|| CriError::internal("container registry is inconsistent"))?;
         let pod_sandbox_id = &req.pod_sandbox_id;
         registry
             .containers
@@ -937,7 +935,7 @@ impl CriRuntimeService {
     fn create_container_impl(
         &self,
         req: v1::CreateContainerRequest,
-    ) -> Result<v1::CreateContainerResponse, Status> {
+    ) -> Result<v1::CreateContainerResponse, CriError> {
         let container_id = self.reserve_container(req, false)?.container_id;
         Ok(v1::CreateContainerResponse { container_id })
     }
@@ -950,7 +948,7 @@ impl CriRuntimeService {
         &self,
         req: v1::CreateContainerRequest,
         in_flight: bool,
-    ) -> Result<ReservedContainer, Status> {
+    ) -> Result<ReservedContainer, CriError> {
         let ValidatedCreate {
             pod_sandbox_id,
             name,
@@ -963,13 +961,13 @@ impl CriRuntimeService {
         let mut registry = self
             .registry
             .lock()
-            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
         let sandbox = registry
             .records
             .get(&pod_sandbox_id)
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            .ok_or_else(|| CriError::not_found("sandbox not found"))?;
         if sandbox.state != SandboxState::Ready {
-            return Err(Status::failed_precondition("sandbox is not ready"));
+            return Err(CriError::failed_precondition("sandbox is not ready"));
         }
         // 要求由来の String は余分な capacity を持ちうる。照合に成功した ID（最大 64 文字）と名前は、
         // 内容長ちょうどの新しい String へ複製して保持し、要求側の確保領域を削除まで残さない
@@ -981,16 +979,16 @@ impl CriRuntimeService {
         );
         drop((pod_sandbox_id, name));
         if registry.container_keys.contains(&key) {
-            return Err(Status::already_exists("container already exists"));
+            return Err(CriError::already_exists("container already exists"));
         }
         if registry.containers.len() >= self.container_limits.max_containers() {
-            return Err(Status::failed_precondition("too many containers"));
+            return Err(CriError::failed_precondition("too many containers"));
         }
         let total_retained_bytes = registry
             .container_retained_bytes
             .checked_add(retained_bytes)
             .filter(|total| *total <= self.container_limits.max_retained_bytes())
-            .ok_or_else(|| Status::failed_precondition("container config storage is full"))?;
+            .ok_or_else(|| CriError::failed_precondition("container config storage is full"))?;
         let mut container_id = None;
         for _ in 0..ID_RETRY_LIMIT {
             let candidate = generate_id();
@@ -1000,7 +998,7 @@ impl CriRuntimeService {
             }
         }
         let container_id =
-            container_id.ok_or_else(|| Status::internal("failed to allocate container id"))?;
+            container_id.ok_or_else(|| CriError::internal("failed to allocate container id"))?;
         let config = config.into_config();
         let provider_config = in_flight.then(|| config.clone());
         let sandbox_id = key.0.clone();
@@ -1035,13 +1033,13 @@ impl CriRuntimeService {
         &self,
         binding: &RuntimeBinding,
         req: v1::CreateContainerRequest,
-    ) -> Result<v1::CreateContainerResponse, Status> {
+    ) -> Result<v1::CreateContainerResponse, CriError> {
         let reserved = self.reserve_container(req, true)?;
         let container_id = reserved.container_id;
         let sandbox_id = reserved.pod_sandbox_id;
         let config = reserved
             .provider_config
-            .ok_or_else(|| Status::internal("container config is unavailable"))?;
+            .ok_or_else(|| CriError::internal("container config is unavailable"))?;
         // bundle の用意・create・確定・巻き戻し・bundle の解放はすべて worker が所有する。RPC の future が
         // 中断・タイムアウトしても、実行層が処理中の間に記録・件数枠・bundle だけが解放されることはない。
         let mut guard = InFlightGuard::new(
@@ -1053,7 +1051,7 @@ impl CriRuntimeService {
         let bundles = Arc::clone(&binding.bundles);
         let id = container_id.clone();
         let timeout = self.runtime_timeout;
-        run_bounded(self.runtime_timeout, move || -> Result<(), Status> {
+        run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
             // worker が実際に走り出してから bundle の解放責務を持つ（起動失敗時は RPC スレッドで release しない）。
             guard.arm_bundles(Arc::clone(&bundles));
             let bundle = bundles.prepare(&id, &sandbox_id, &config)?;
@@ -1075,7 +1073,7 @@ impl CriRuntimeService {
                 if confirm_removed(&adapter, &id, timeout) {
                     guard.mark_definitely_failed();
                 }
-                return Err(Status::internal("runtime returned an unexpected state"));
+                return Err(CriError::internal("runtime returned an unexpected state"));
             }
             if let Err(status) = guard.commit() {
                 if confirm_removed(&adapter, &id, timeout) {
@@ -1097,34 +1095,38 @@ impl CriRuntimeService {
     fn start_container_impl(
         &self,
         req: v1::StartContainerRequest,
-    ) -> Result<v1::StartContainerResponse, Status> {
+    ) -> Result<v1::StartContainerResponse, CriError> {
         self.begin_start(req, false)?;
         Ok(v1::StartContainerResponse {})
     }
 
     /// Start の前提検査。`via_runtime` なら `in_flight` を立てて返し、そうでなければ running へ遷移させる。
-    fn begin_start(&self, req: v1::StartContainerRequest, via_runtime: bool) -> Result<(), Status> {
+    fn begin_start(
+        &self,
+        req: v1::StartContainerRequest,
+        via_runtime: bool,
+    ) -> Result<(), CriError> {
         if req.container_id.is_empty() {
-            return Err(Status::invalid_argument("container_id is required"));
+            return Err(CriError::invalid_argument("container_id is required"));
         }
         let started_at_nanos = now_nanos()?;
         let mut registry = self
             .registry
             .lock()
-            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
         let record = registry
             .containers
             .get(&req.container_id)
-            .ok_or_else(|| Status::not_found("container not found"))?;
+            .ok_or_else(|| CriError::not_found("container not found"))?;
         let sandbox = registry
             .records
             .get(&record.pod_sandbox_id)
-            .ok_or_else(|| Status::internal("container registry is inconsistent"))?;
+            .ok_or_else(|| CriError::internal("container registry is inconsistent"))?;
         if sandbox.state != SandboxState::Ready {
-            return Err(Status::failed_precondition("sandbox is not ready"));
+            return Err(CriError::failed_precondition("sandbox is not ready"));
         }
         if record.state != ContainerState::Created || record.in_flight {
-            return Err(Status::failed_precondition(
+            return Err(CriError::failed_precondition(
                 "container is not in created state",
             ));
         }
@@ -1148,7 +1150,7 @@ impl CriRuntimeService {
         &self,
         binding: &RuntimeBinding,
         req: v1::StartContainerRequest,
-    ) -> Result<v1::StartContainerResponse, Status> {
+    ) -> Result<v1::StartContainerResponse, CriError> {
         let id = req.container_id.clone();
         self.begin_start(req, true)?;
         let mut guard =
@@ -1157,7 +1159,7 @@ impl CriRuntimeService {
         let timeout = self.runtime_timeout;
         // 結果の確定と巻き戻しは worker が所有する。期限超過・中断では結果不明のまま worker が終わるのを待ち、
         // その間 `in_flight` が残る（新たな Start・Remove は拒否される）。
-        run_bounded(self.runtime_timeout, move || -> Result<(), Status> {
+        run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
             // 専用スレッドの起動に失敗した場合は未送信なので、送信の直前に結果不明へ倒す。
             guard.mark_dispatched();
             let status = match adapter.start(&id) {
@@ -1177,20 +1179,22 @@ impl CriRuntimeService {
                 CriContainerState::ContainerCreated
                     if status.lifecycle != RuntimeLifecycle::Created =>
                 {
-                    Err(Status::internal("runtime returned an unexpected state"))
+                    Err(CriError::internal("runtime returned an unexpected state"))
                 }
                 // 実行層は created のままと報告した（起動していない）ため、created へ戻してよい。
                 CriContainerState::ContainerCreated => {
                     guard.mark_definitely_failed();
-                    Err(Status::internal("runtime returned an unexpected state"))
+                    Err(CriError::internal("runtime returned an unexpected state"))
                 }
                 // 終了済みは created へ戻さず、guard の破棄で exited へ反映する（再 Start を実行層へ届けない）。
                 CriContainerState::ContainerExited => {
                     guard.mark_confirmed_exited();
-                    Err(Status::failed_precondition("container has already exited"))
+                    Err(CriError::failed_precondition(
+                        "container has already exited",
+                    ))
                 }
                 // 結果不明は exited（fail-closed）。
-                _ => Err(Status::internal("runtime returned an unexpected state")),
+                _ => Err(CriError::internal("runtime returned an unexpected state")),
             }
         })
         .await??;
@@ -1206,27 +1210,27 @@ impl CriRuntimeService {
     fn stop_container_impl(
         &self,
         req: v1::StopContainerRequest,
-    ) -> Result<v1::StopContainerResponse, Status> {
+    ) -> Result<v1::StopContainerResponse, CriError> {
         if req.container_id.is_empty() {
-            return Err(Status::invalid_argument("container_id is required"));
+            return Err(CriError::invalid_argument("container_id is required"));
         }
         if req.timeout < 0 {
-            return Err(Status::invalid_argument("timeout must not be negative"));
+            return Err(CriError::invalid_argument("timeout must not be negative"));
         }
         let finished_at_nanos = now_nanos()?;
         let mut registry = self
             .registry
             .lock()
-            .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
         let record = registry
             .containers
             .get_mut(&req.container_id)
-            .ok_or_else(|| Status::not_found("container not found"))?;
+            .ok_or_else(|| CriError::not_found("container not found"))?;
         // 実行層経由で作成したコンテナは、TASK-59.3 で実行層の stop を接続するまで停止を拒否する。
         // 記録だけ Exited にすると実プロセスが生存したまま「停止済み」と返るため（CRI-1・REPAIR-3。
         // fail-closed。Remove 系と同じ code）。実行層未接続の経路（`runtime_leaked` なし）は従来どおり。
         if record.runtime_leaked {
-            return Err(Status::failed_precondition(
+            return Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
             ));
         }
@@ -1237,11 +1241,11 @@ impl CriRuntimeService {
                 Ok(v1::StopContainerResponse {})
             }
             ContainerState::Exited => Ok(v1::StopContainerResponse {}),
-            ContainerState::Created => Err(Status::failed_precondition(
+            ContainerState::Created => Err(CriError::failed_precondition(
                 "container is not in running state",
             )),
             // 結果不明は停止を確認できないため拒否する（通常は runtime_leaked の拒否が先に効く）。
-            ContainerState::Unknown => Err(Status::failed_precondition(
+            ContainerState::Unknown => Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
             )),
         }
@@ -1254,9 +1258,9 @@ impl CriRuntimeService {
     fn remove_container_impl(
         &self,
         req: v1::RemoveContainerRequest,
-    ) -> Result<v1::RemoveContainerResponse, Status> {
+    ) -> Result<v1::RemoveContainerResponse, CriError> {
         if req.container_id.is_empty() {
-            return Err(Status::invalid_argument("container_id is required"));
+            return Err(CriError::invalid_argument("container_id is required"));
         }
         self.drop_container(&req.container_id, false)?;
         Ok(v1::RemoveContainerResponse {})
@@ -1266,7 +1270,7 @@ impl CriRuntimeService {
     ///
     /// `include_in_flight` が偽のとき、実行層の呼び出し中（`in_flight`）の記録は `FAILED_PRECONDITION`
     /// で拒否する（Create の巻き戻しだけが真で呼ぶ）。
-    fn drop_container(&self, container_id: &str, include_in_flight: bool) -> Result<(), Status> {
+    fn drop_container(&self, container_id: &str, include_in_flight: bool) -> Result<(), CriError> {
         drop_container_in(&self.registry, container_id, include_in_flight)
     }
 
@@ -1280,19 +1284,19 @@ impl CriRuntimeService {
     fn container_status_impl(
         &self,
         req: v1::ContainerStatusRequest,
-    ) -> Result<v1::ContainerStatusResponse, Status> {
+    ) -> Result<v1::ContainerStatusResponse, CriError> {
         if req.container_id.is_empty() {
-            return Err(Status::invalid_argument("container_id is required"));
+            return Err(CriError::invalid_argument("container_id is required"));
         }
         let status = {
             let registry = self
                 .registry
                 .lock()
-                .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
             let record = registry
                 .containers
                 .get(&req.container_id)
-                .ok_or_else(|| Status::not_found("container not found"))?;
+                .ok_or_else(|| CriError::not_found("container not found"))?;
             record.to_status(&req.container_id)
         };
         Ok(v1::ContainerStatusResponse {
@@ -1308,13 +1312,13 @@ impl CriRuntimeService {
     fn list_containers_impl(
         &self,
         req: v1::ListContainersRequest,
-    ) -> Result<v1::ListContainersResponse, Status> {
+    ) -> Result<v1::ListContainersResponse, CriError> {
         let filter = ValidatedContainerFilter::new(req.filter)?;
         let mut containers = {
             let registry = self
                 .registry
                 .lock()
-                .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
             registry
                 .containers
                 .iter()
@@ -1333,19 +1337,19 @@ impl CriRuntimeService {
     fn status_sandbox(
         &self,
         req: v1::PodSandboxStatusRequest,
-    ) -> Result<v1::PodSandboxStatusResponse, Status> {
+    ) -> Result<v1::PodSandboxStatusResponse, CriError> {
         if req.pod_sandbox_id.is_empty() {
-            return Err(Status::invalid_argument("pod_sandbox_id is required"));
+            return Err(CriError::invalid_argument("pod_sandbox_id is required"));
         }
         let status = {
             let registry = self
                 .registry
                 .lock()
-                .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
             let record = registry
                 .records
                 .get(&req.pod_sandbox_id)
-                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+                .ok_or_else(|| CriError::not_found("sandbox not found"))?;
             record.to_status(&req.pod_sandbox_id)
         };
         let timestamp = now_nanos()?;
@@ -1364,13 +1368,13 @@ impl CriRuntimeService {
     fn list_sandboxes(
         &self,
         req: v1::ListPodSandboxRequest,
-    ) -> Result<v1::ListPodSandboxResponse, Status> {
+    ) -> Result<v1::ListPodSandboxResponse, CriError> {
         let filter = ValidatedFilter::new(req.filter)?;
         let mut items = {
             let registry = self
                 .registry
                 .lock()
-                .map_err(|_| Status::internal("sandbox registry is unavailable"))?;
+                .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
             registry
                 .records
                 .iter()
@@ -1384,13 +1388,13 @@ impl CriRuntimeService {
 }
 
 /// 現在時刻（UNIX epoch からの ns）。0 以下・変換不能は `INTERNAL`。
-fn now_nanos() -> Result<i64, Status> {
+fn now_nanos() -> Result<i64, CriError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|d| i64::try_from(d.as_nanos()).ok())
         .filter(|n| *n > 0)
-        .ok_or_else(|| Status::internal("system clock is invalid"))
+        .ok_or_else(|| CriError::internal("system clock is invalid"))
 }
 
 impl SandboxRecord {
@@ -1430,23 +1434,23 @@ impl SandboxRecord {
 fn validate_label_selector(
     selector: &HashMap<String, String>,
     extra_bytes: usize,
-) -> Result<(), Status> {
+) -> Result<(), CriError> {
     if selector.len() > MAX_CONFIG_COLLECTION_ENTRIES {
-        return Err(Status::invalid_argument(
+        return Err(CriError::invalid_argument(
             "label_selector has too many entries",
         ));
     }
     let mut total = extra_bytes;
     for (k, v) in selector {
         if k.len() > MAX_LABEL_SELECTOR_STRING_BYTES || v.len() > MAX_LABEL_SELECTOR_STRING_BYTES {
-            return Err(Status::invalid_argument(
+            return Err(CriError::invalid_argument(
                 "label_selector key or value is too long",
             ));
         }
         total = total.saturating_add(k.len()).saturating_add(v.len());
     }
     if total > MAX_LABEL_SELECTOR_TOTAL_BYTES {
-        return Err(Status::invalid_argument("label_selector is too large"));
+        return Err(CriError::invalid_argument("label_selector is too large"));
     }
     Ok(())
 }
@@ -1459,7 +1463,7 @@ struct ValidatedFilter {
 }
 
 impl ValidatedFilter {
-    fn new(filter: Option<v1::PodSandboxFilter>) -> Result<Self, Status> {
+    fn new(filter: Option<v1::PodSandboxFilter>) -> Result<Self, CriError> {
         let Some(filter) = filter else {
             return Ok(Self {
                 id: String::new(),
@@ -1473,7 +1477,7 @@ impl ValidatedFilter {
             Some(value) => match PodSandboxState::try_from(value.state) {
                 Ok(PodSandboxState::SandboxReady) => Some(SandboxState::Ready),
                 Ok(PodSandboxState::SandboxNotready) => Some(SandboxState::NotReady),
-                Err(_) => return Err(Status::invalid_argument("unknown state filter")),
+                Err(_) => return Err(CriError::invalid_argument("unknown state filter")),
             },
         };
         Ok(Self {
@@ -1526,24 +1530,26 @@ struct ValidatedRun {
 ///
 /// 必須フィールドとハンドラを先に確かめ、最後に `config` のサイズ・件数を検証して保持用に作り直す
 /// （`BoundedConfig::new`）。状態には触れない。
-fn validate_run_request(req: v1::RunPodSandboxRequest) -> Result<ValidatedRun, Status> {
+fn validate_run_request(req: v1::RunPodSandboxRequest) -> Result<ValidatedRun, CriError> {
     let v1::RunPodSandboxRequest {
         config,
         runtime_handler,
     } = req;
-    let config = config.ok_or_else(|| Status::invalid_argument("config is required"))?;
+    let config = config.ok_or_else(|| CriError::invalid_argument("config is required"))?;
     let metadata = config
         .metadata
         .as_ref()
-        .ok_or_else(|| Status::invalid_argument("config.metadata is required"))?;
+        .ok_or_else(|| CriError::invalid_argument("config.metadata is required"))?;
     if metadata.name.is_empty() {
-        return Err(Status::invalid_argument("config.metadata.name is required"));
+        return Err(CriError::invalid_argument(
+            "config.metadata.name is required",
+        ));
     }
     let runtime_handler = SUPPORTED_RUNTIME_HANDLERS
         .iter()
         .copied()
         .find(|supported| *supported == runtime_handler.as_str())
-        .ok_or_else(|| Status::invalid_argument("unknown runtime_handler"))?;
+        .ok_or_else(|| CriError::invalid_argument("unknown runtime_handler"))?;
     let config = BoundedConfig::new(config)?;
     Ok(ValidatedRun {
         config,
@@ -1569,7 +1575,9 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::RunPodSandboxRequest>,
     ) -> Result<Response<v1::RunPodSandboxResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::RunPodSandbox);
-        let result = self.reserve_sandbox(request.into_inner());
+        let result = self
+            .reserve_sandbox(request.into_inner())
+            .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1578,7 +1586,7 @@ impl RuntimeService for CriRuntimeService {
         &self,
         _request: Request<v1::VersionRequest>,
     ) -> Result<Response<v1::VersionResponse>, Status> {
-        Err(Status::unimplemented("version"))
+        Err(CriError::unimplemented("version").into())
     }
     /// サンドボックスを notready にする（冪等。未知 ID は `NOT_FOUND`。CRI-1・ERR-3・TASK-57.2）。
     async fn stop_pod_sandbox(
@@ -1586,7 +1594,9 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::StopPodSandboxRequest>,
     ) -> Result<Response<v1::StopPodSandboxResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::StopPodSandbox);
-        let result = self.stop_sandbox(request.into_inner());
+        let result = self
+            .stop_sandbox(request.into_inner())
+            .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1597,7 +1607,9 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::RemovePodSandboxRequest>,
     ) -> Result<Response<v1::RemovePodSandboxResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::RemovePodSandbox);
-        let result = self.remove_sandbox(request.into_inner());
+        let result = self
+            .remove_sandbox(request.into_inner())
+            .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1608,7 +1620,9 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::PodSandboxStatusRequest>,
     ) -> Result<Response<v1::PodSandboxStatusResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::PodSandboxStatus);
-        let result = self.status_sandbox(request.into_inner());
+        let result = self
+            .status_sandbox(request.into_inner())
+            .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1619,7 +1633,9 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::ListPodSandboxRequest>,
     ) -> Result<Response<v1::ListPodSandboxResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ListPodSandbox);
-        let result = self.list_sandboxes(request.into_inner());
+        let result = self
+            .list_sandboxes(request.into_inner())
+            .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1627,7 +1643,7 @@ impl RuntimeService for CriRuntimeService {
         &self,
         _request: Request<v1::StreamPodSandboxesRequest>,
     ) -> Result<Response<Self::StreamPodSandboxesStream>, Status> {
-        Err(Status::unimplemented("stream_pod_sandboxes"))
+        Err(CriError::unimplemented("stream_pod_sandboxes").into())
     }
     /// コンテナ ID を採番し、状態 created で登録する（同一 sandbox 内の `(name, attempt)` 重複は
     /// `ALREADY_EXISTS`。CRI-1・ERR-3・TASK-58.1）。
@@ -1640,7 +1656,8 @@ impl RuntimeService for CriRuntimeService {
         let result = match &self.runtime {
             Some(binding) => self.create_container_runtime(binding, req).await,
             None => self.create_container_impl(req),
-        };
+        }
+        .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1655,7 +1672,8 @@ impl RuntimeService for CriRuntimeService {
         let result = match &self.runtime {
             Some(binding) => self.start_container_runtime(binding, req).await,
             None => self.start_container_impl(req),
-        };
+        }
+        .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1666,7 +1684,9 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::StopContainerRequest>,
     ) -> Result<Response<v1::StopContainerResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::StopContainer);
-        let result = self.stop_container_impl(request.into_inner());
+        let result = self
+            .stop_container_impl(request.into_inner())
+            .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1677,7 +1697,9 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::RemoveContainerRequest>,
     ) -> Result<Response<v1::RemoveContainerResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::RemoveContainer);
-        let result = self.remove_container_impl(request.into_inner());
+        let result = self
+            .remove_container_impl(request.into_inner())
+            .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1687,7 +1709,9 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::ListContainersRequest>,
     ) -> Result<Response<v1::ListContainersResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ListContainers);
-        let result = self.list_containers_impl(request.into_inner());
+        let result = self
+            .list_containers_impl(request.into_inner())
+            .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1695,7 +1719,7 @@ impl RuntimeService for CriRuntimeService {
         &self,
         _request: Request<v1::StreamContainersRequest>,
     ) -> Result<Response<Self::StreamContainersStream>, Status> {
-        Err(Status::unimplemented("stream_containers"))
+        Err(CriError::unimplemented("stream_containers").into())
     }
     /// コンテナの状態を返す（読み取り専用。CRI-1・TASK-58.3・#435）。
     async fn container_status(
@@ -1703,7 +1727,9 @@ impl RuntimeService for CriRuntimeService {
         request: Request<v1::ContainerStatusRequest>,
     ) -> Result<Response<v1::ContainerStatusResponse>, Status> {
         let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::ContainerStatus);
-        let result = self.container_status_impl(request.into_inner());
+        let result = self
+            .container_status_impl(request.into_inner())
+            .map_err(Status::from);
         timer.finish_with(&result);
         result.map(Response::new)
     }
@@ -1711,139 +1737,139 @@ impl RuntimeService for CriRuntimeService {
         &self,
         _request: Request<v1::UpdateContainerResourcesRequest>,
     ) -> Result<Response<v1::UpdateContainerResourcesResponse>, Status> {
-        Err(Status::unimplemented("update_container_resources"))
+        Err(CriError::unimplemented("update_container_resources").into())
     }
     async fn reopen_container_log(
         &self,
         _request: Request<v1::ReopenContainerLogRequest>,
     ) -> Result<Response<v1::ReopenContainerLogResponse>, Status> {
-        Err(Status::unimplemented("reopen_container_log"))
+        Err(CriError::unimplemented("reopen_container_log").into())
     }
     async fn exec_sync(
         &self,
         _request: Request<v1::ExecSyncRequest>,
     ) -> Result<Response<v1::ExecSyncResponse>, Status> {
-        Err(Status::unimplemented("exec_sync"))
+        Err(CriError::unimplemented("exec_sync").into())
     }
     async fn exec(
         &self,
         _request: Request<v1::ExecRequest>,
     ) -> Result<Response<v1::ExecResponse>, Status> {
-        Err(Status::unimplemented("exec"))
+        Err(CriError::unimplemented("exec").into())
     }
     async fn attach(
         &self,
         _request: Request<v1::AttachRequest>,
     ) -> Result<Response<v1::AttachResponse>, Status> {
-        Err(Status::unimplemented("attach"))
+        Err(CriError::unimplemented("attach").into())
     }
     async fn port_forward(
         &self,
         _request: Request<v1::PortForwardRequest>,
     ) -> Result<Response<v1::PortForwardResponse>, Status> {
-        Err(Status::unimplemented("port_forward"))
+        Err(CriError::unimplemented("port_forward").into())
     }
     async fn container_stats(
         &self,
         _request: Request<v1::ContainerStatsRequest>,
     ) -> Result<Response<v1::ContainerStatsResponse>, Status> {
-        Err(Status::unimplemented("container_stats"))
+        Err(CriError::unimplemented("container_stats").into())
     }
     async fn list_container_stats(
         &self,
         _request: Request<v1::ListContainerStatsRequest>,
     ) -> Result<Response<v1::ListContainerStatsResponse>, Status> {
-        Err(Status::unimplemented("list_container_stats"))
+        Err(CriError::unimplemented("list_container_stats").into())
     }
     async fn stream_container_stats(
         &self,
         _request: Request<v1::StreamContainerStatsRequest>,
     ) -> Result<Response<Self::StreamContainerStatsStream>, Status> {
-        Err(Status::unimplemented("stream_container_stats"))
+        Err(CriError::unimplemented("stream_container_stats").into())
     }
     async fn pod_sandbox_stats(
         &self,
         _request: Request<v1::PodSandboxStatsRequest>,
     ) -> Result<Response<v1::PodSandboxStatsResponse>, Status> {
-        Err(Status::unimplemented("pod_sandbox_stats"))
+        Err(CriError::unimplemented("pod_sandbox_stats").into())
     }
     async fn list_pod_sandbox_stats(
         &self,
         _request: Request<v1::ListPodSandboxStatsRequest>,
     ) -> Result<Response<v1::ListPodSandboxStatsResponse>, Status> {
-        Err(Status::unimplemented("list_pod_sandbox_stats"))
+        Err(CriError::unimplemented("list_pod_sandbox_stats").into())
     }
     async fn stream_pod_sandbox_stats(
         &self,
         _request: Request<v1::StreamPodSandboxStatsRequest>,
     ) -> Result<Response<Self::StreamPodSandboxStatsStream>, Status> {
-        Err(Status::unimplemented("stream_pod_sandbox_stats"))
+        Err(CriError::unimplemented("stream_pod_sandbox_stats").into())
     }
     async fn update_runtime_config(
         &self,
         _request: Request<v1::UpdateRuntimeConfigRequest>,
     ) -> Result<Response<v1::UpdateRuntimeConfigResponse>, Status> {
-        Err(Status::unimplemented("update_runtime_config"))
+        Err(CriError::unimplemented("update_runtime_config").into())
     }
     async fn status(
         &self,
         _request: Request<v1::StatusRequest>,
     ) -> Result<Response<v1::StatusResponse>, Status> {
-        Err(Status::unimplemented("status"))
+        Err(CriError::unimplemented("status").into())
     }
     async fn checkpoint_container(
         &self,
         _request: Request<v1::CheckpointContainerRequest>,
     ) -> Result<Response<v1::CheckpointContainerResponse>, Status> {
-        Err(Status::unimplemented("checkpoint_container"))
+        Err(CriError::unimplemented("checkpoint_container").into())
     }
     async fn checkpoint_pod(
         &self,
         _request: Request<v1::CheckpointPodRequest>,
     ) -> Result<Response<v1::CheckpointPodResponse>, Status> {
-        Err(Status::unimplemented("checkpoint_pod"))
+        Err(CriError::unimplemented("checkpoint_pod").into())
     }
     async fn restore_pod(
         &self,
         _request: Request<v1::RestorePodRequest>,
     ) -> Result<Response<v1::RestorePodResponse>, Status> {
-        Err(Status::unimplemented("restore_pod"))
+        Err(CriError::unimplemented("restore_pod").into())
     }
     async fn get_container_events(
         &self,
         _request: Request<v1::GetEventsRequest>,
     ) -> Result<Response<Self::GetContainerEventsStream>, Status> {
-        Err(Status::unimplemented("get_container_events"))
+        Err(CriError::unimplemented("get_container_events").into())
     }
     async fn list_metric_descriptors(
         &self,
         _request: Request<v1::ListMetricDescriptorsRequest>,
     ) -> Result<Response<v1::ListMetricDescriptorsResponse>, Status> {
-        Err(Status::unimplemented("list_metric_descriptors"))
+        Err(CriError::unimplemented("list_metric_descriptors").into())
     }
     async fn list_pod_sandbox_metrics(
         &self,
         _request: Request<v1::ListPodSandboxMetricsRequest>,
     ) -> Result<Response<v1::ListPodSandboxMetricsResponse>, Status> {
-        Err(Status::unimplemented("list_pod_sandbox_metrics"))
+        Err(CriError::unimplemented("list_pod_sandbox_metrics").into())
     }
     async fn stream_pod_sandbox_metrics(
         &self,
         _request: Request<v1::StreamPodSandboxMetricsRequest>,
     ) -> Result<Response<Self::StreamPodSandboxMetricsStream>, Status> {
-        Err(Status::unimplemented("stream_pod_sandbox_metrics"))
+        Err(CriError::unimplemented("stream_pod_sandbox_metrics").into())
     }
     async fn runtime_config(
         &self,
         _request: Request<v1::RuntimeConfigRequest>,
     ) -> Result<Response<v1::RuntimeConfigResponse>, Status> {
-        Err(Status::unimplemented("runtime_config"))
+        Err(CriError::unimplemented("runtime_config").into())
     }
     async fn update_pod_sandbox_resources(
         &self,
         _request: Request<v1::UpdatePodSandboxResourcesRequest>,
     ) -> Result<Response<v1::UpdatePodSandboxResourcesResponse>, Status> {
-        Err(Status::unimplemented("update_pod_sandbox_resources"))
+        Err(CriError::unimplemented("update_pod_sandbox_resources").into())
     }
 }
 
@@ -1984,12 +2010,12 @@ mod tests {
             _: &str,
             _: &str,
             _: &v1::ContainerConfig,
-        ) -> Result<std::path::PathBuf, Status> {
+        ) -> Result<std::path::PathBuf, CriError> {
             self.prepares
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(std::path::PathBuf::from("/bundles/x"))
         }
-        fn release(&self, _: &str) -> Result<(), Status> {
+        fn release(&self, _: &str) -> Result<(), CriError> {
             self.releases
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             loop {

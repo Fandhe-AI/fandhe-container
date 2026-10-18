@@ -365,7 +365,8 @@ impl Drop for StartReservation {
 /// 取れないため `Unimplemented`（fail-closed）。
 ///
 /// launch 後・pid 記録前の中断では生きたプロセスが残り得るため、Created へ戻す前に
-/// [`ProcessLauncher::confirm_no_process`] で生存プロセスが無いことを確認する。確認できない場合
+/// [`ProcessLauncher::confirm_no_process_recorded`] で生存プロセスが無いことを確認する。レコードに記録された
+/// cgroup の配置を渡すため、別プロセスで起動した残存も確かめられる（#2011）。確認できない場合
 /// （既定実装を含む）はそのエラーを返して予約を残す（二重起動の防止。SEC-1・CORE-2）。
 ///
 /// 確認の待ちは `timeouts.confirm()` まで（REPAIR-5。呼び出し境界で強制する）。超過したら `Timeout` を
@@ -388,9 +389,26 @@ pub fn recover_interrupted_start(
     // 別プロセスの launch が進行中でないこと（所有プロセスの終了または launch の完了）を所有ロックで
     // 確かめてから、生存プロセスの確認へ進む（CORE-2）。
     reservation.lock_owner(record.bundle())?;
+    // 所有ロックの取得前に読んだレコードは古い可能性がある（別プロセスの start が pid を記録して
+    // ロックを手放した直後に取れた場合）。破壊的な確認（cgroup.kill 等）の前に読み直し、revision と
+    // Running・pid なしの予約が変わっていなければ進む。変わっていれば何もせず拒否する（CORE-2・SEC-1）。
+    let fresh = store.get(&GetStateRequest::new(id.clone()))?;
+    if fresh.revision() != record.revision()
+        || fresh.status().state() != ContainerState::Running
+        || fresh.status().pid().is_some()
+    {
+        return Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "the start reservation changed while acquiring the owner lock",
+        ));
+    }
+    let record = fresh;
     let confirm = timeouts.confirm();
     let l = Arc::clone(launcher);
     let target = id.clone();
+    // 別プロセスで起動した残存は、記録済みの cgroup 配置から確かめる（#2011）。配置は start の手順 5 で 1 回だけ
+    // 記録され上書きされない。所有ロック取得後に読み直したレコードの値を使う。
+    let recorded = record.cgroup().cloned();
     // confirm_no_process は ID 単位で「残っていれば終了・回収」し得るため、上限超過で本関数が戻った後も
     // 確認が終わるまでプロセス内の予約を保持する（回復の再試行・新しい start が先に進み、その後に
     // 遅れた確認が新しいプロセスを終了させることを防ぐ。CORE-2）。
@@ -398,7 +416,7 @@ pub fn recover_interrupted_start(
     match call_bounded(
         confirm,
         move || {
-            let result = l.confirm_no_process(&target, confirm);
+            let result = l.confirm_no_process_recorded(&target, recorded.as_ref(), confirm);
             drop(hold);
             result
         },
@@ -1155,6 +1173,8 @@ mod tests {
         update_calls: AtomicUsize,
         /// `host_state_root` が返す場所（テストでは実在する一時ディレクトリ）。
         state_root: PathBuf,
+        /// 設定すると最初の `get` だけがこの（古い）レコードを返す（ロック取得前の読み取りとの競合の模擬）。
+        stale_first_get: Mutex<Option<StateRecord>>,
     }
 
     impl MemStateStore {
@@ -1164,6 +1184,7 @@ mod tests {
                 fail_update_at,
                 update_calls: AtomicUsize::new(0),
                 state_root: std::env::temp_dir(),
+                stale_first_get: Mutex::new(None),
             }
         }
     }
@@ -1210,6 +1231,14 @@ mod tests {
         }
 
         fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+            if let Some(stale) = self
+                .stale_first_get
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                return Ok(stale);
+            }
             let records = self.records.lock().unwrap_or_else(|e| e.into_inner());
             records
                 .get(req.id())
@@ -1289,6 +1318,8 @@ mod tests {
         may_leave: AtomicBool,
         /// `rejection_audit_sink` が返す sink（未設定なら `None`。#1915）。
         audit: std::sync::OnceLock<Arc<crate::audit_log::mount::tests::VecSink>>,
+        /// `confirm_no_process_recorded` に渡された配置（呼び出し順。#2011）。
+        recorded: Mutex<Vec<Option<crate::traits::CgroupPlacement>>>,
     }
 
     impl RecordingLauncher {
@@ -1307,6 +1338,7 @@ mod tests {
                 launch_threads: Mutex::new(Vec::new()),
                 may_leave: AtomicBool::new(false),
                 audit: std::sync::OnceLock::new(),
+                recorded: Mutex::new(Vec::new()),
             })
         }
 
@@ -1371,6 +1403,19 @@ mod tests {
 
         fn last_launch_may_have_left_process(&self) -> bool {
             self.may_leave.load(Ordering::SeqCst)
+        }
+
+        fn confirm_no_process_recorded(
+            &self,
+            id: &ContainerId,
+            recorded: Option<&crate::traits::CgroupPlacement>,
+            timeout: Duration,
+        ) -> Result<(), TraitError> {
+            self.recorded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(recorded.cloned());
+            self.confirm_no_process(id, timeout)
         }
 
         fn confirm_no_process(
@@ -2792,6 +2837,85 @@ mod tests {
         assert!(eventually(Duration::from_secs(10), || launcher
             .terminations()
             == 1));
+    }
+
+    /// 予約（Running・pid なし）のレコードを、cgroup の配置つき（`None` なら配置なし）で直接ストアへ置く。
+    #[cfg(target_os = "linux")]
+    fn claimed_with_cgroup(
+        name: &str,
+        placement: Option<crate::traits::CgroupPlacement>,
+    ) -> (Bundle, MemStateStore, ContainerId) {
+        let (b, store) = created(name);
+        let id = ContainerId::new(name).expect("id");
+        let rec = store.get(&GetStateRequest::new(id.clone())).expect("get");
+        let mut next = StateRecord::new(
+            ContainerStatus::running(id.clone(), None),
+            rec.bundle().to_path_buf(),
+            rec.revision().next().expect("next"),
+        )
+        .expect("record");
+        if let Some(p) = placement {
+            next = next.with_cgroup(p);
+        }
+        store
+            .records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone(), next);
+        (b, store, id)
+    }
+
+    /// CORE-2・SEC-1（#2011）: 回復は、レコードに記録された cgroup の配置をそのまま launcher へ渡す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_issue2011_recover_passes_recorded_placement_to_launcher() {
+        let placement = crate::traits::CgroupPlacement::new(
+            crate::traits::CgroupScope::new("/user.slice/x.scope").expect("scope"),
+            crate::traits::StateRevision::from_raw(3),
+        );
+        let (_b, store, id) = claimed_with_cgroup("rec-placement", Some(placement.clone()));
+        let launcher = RecordingLauncher::new(false);
+        launcher.confirms_no_process.store(true, Ordering::SeqCst);
+        let got = recover(&store, &launcher, &id).expect("recover");
+        assert_eq!(got.status().state(), ContainerState::Created);
+        assert_eq!(
+            launcher.recorded.lock().unwrap().clone(),
+            vec![Some(placement)]
+        );
+    }
+
+    /// CORE-2・SEC-1: ロック取得前に読んだ予約が古い（別プロセスの start が間に pid を記録した）場合、
+    /// 回復は破壊的な確認へ進まず拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_recover_aborts_when_pid_recorded_between_read_and_lock() {
+        let (_b, store, id) = claimed_with_cgroup("rec-race", None);
+        let stale = store.get(&GetStateRequest::new(id.clone())).expect("get");
+        store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(id.clone(), std::num::NonZeroU32::new(4242)),
+                stale.revision(),
+            ))
+            .expect("record pid");
+        *store.stale_first_get.lock().unwrap() = Some(stale);
+        let launcher = RecordingLauncher::new(false);
+        launcher.confirms_no_process.store(true, Ordering::SeqCst);
+        let err = recover(&store, &launcher, &id).expect_err("must abort");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert!(launcher.recorded.lock().unwrap().is_empty());
+        let got = store.get(&GetStateRequest::new(id)).expect("get");
+        assert_eq!(got.status().pid(), std::num::NonZeroU32::new(4242));
+    }
+
+    /// CORE-2（#2011）: 配置の記録が無いレコードでは `None` を渡す（launcher が fail-closed にする）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core2_issue2011_recover_passes_none_without_recorded_placement() {
+        let (_b, store, id) = claimed_with_cgroup("rec-none", None);
+        let launcher = RecordingLauncher::new(false);
+        launcher.confirms_no_process.store(true, Ordering::SeqCst);
+        recover(&store, &launcher, &id).expect("recover");
+        assert_eq!(launcher.recorded.lock().unwrap().clone(), vec![None]);
     }
 
     /// REPAIR-5・CORE-2: 生存確認が上限内に戻らなければ回復は Timeout を返して予約を残す。確認が終わる

@@ -6,7 +6,8 @@
 //! サイズはここで blob ファイルを `symlink_metadata` で読んで求める。
 //!
 //! 呼び出し文脈: 読み取り専用で、削除も書き込みもしない。テーブルとキャッシュの整合を取るため、
-//! 呼び出し側がストア排他（#473）の内側で呼ぶ前提で、本モジュールは排他をかけない。
+//! 呼び出し側が `ImageStoreGuard`（#473）を保持したまま、ガードの `Deref` 越しに呼ぶ前提で、本モジュールは排他をかけない
+//! （`remove` と同じ契約。ガードなしでテーブルを読む経路は公開 API に無い）。
 //! 参照テーブルに未登録のもの（pull 中のステージング）は一覧に現れない（公開完了まで見えない。OCI-7）。
 //!
 //! サイズの定義: キャッシュ上の blob ファイルの見かけのサイズ（圧縮済みのバイト数）。
@@ -407,6 +408,17 @@ mod tests {
             root.put(&d(n), len);
         }
         t
+    }
+
+    /// OCI-7・#473: ストアのガード越しに ls / df を呼べる（排他の内側で集計する契約）。
+    #[test]
+    fn oci7_ls_and_df_run_under_store_guard() {
+        let root = Root::new("guard");
+        let table = fixture(&root);
+        let store = crate::image_management::ImageStore::with_table(&root.0, table).unwrap();
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.list_images(&root.0).unwrap().entries.len(), 2);
+        assert_eq!(guard.disk_usage(&root.0).unwrap().images.bytes, 3130);
     }
 
     /// OCI-7: タグごとに 1 行、digest とサイズは具体値。

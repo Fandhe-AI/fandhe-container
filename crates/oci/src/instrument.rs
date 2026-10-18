@@ -40,6 +40,8 @@ pub enum OciOpKind {
     ListImages,
     /// `system df` 相当の使用容量集計（TASK-183.3・OCI-7）。
     DiskUsage,
+    /// イメージストアの排他区間の取得（待機・Timeout・毒化・ロックファイル異常を含む。TASK-183.2・OCI-7）。
+    AcquireImageStoreLock,
 }
 
 impl OciOpKind {
@@ -57,6 +59,7 @@ impl OciOpKind {
             OciOpKind::ExtractLayer => "oci.layer.extract",
             OciOpKind::ListImages => "oci.image.list",
             OciOpKind::DiskUsage => "oci.image.df",
+            OciOpKind::AcquireImageStoreLock => "oci.store.lock",
         }
     }
 }

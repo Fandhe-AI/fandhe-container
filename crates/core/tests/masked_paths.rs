@@ -28,6 +28,14 @@
 //! - 読み取り専用化側（`proc/sys`）は引き続き `ro` のマウントポイント（順序の回帰検査）
 //! - rootless は rootful と同じ期待を要求する（弱めない）。差が出た場合は実機結果を踏まえて理由を記録する
 //!
+//! - 最上位（見えている）マウントの照合（#2005・SEC-2）: 覆いは、見えている `/proc`（fstype `proc`）の上に載っていること
+//!   （最上位のマウントの親が `/proc` の最上位のマウント）。保護の後に `/proc` へ新しい procfs が載ると覆いが隠れるため、
+//!   その積み方の食い違いを検出する。`/proc/sys` は最上位のマウントが `ro` の `proc`
+//!
+//! # 判定ロジックの自己照合（REPAIR-12）
+//! mountinfo の積み方の判定（`stacking_violations`）は特権なしの純関数で、合成 fixture による自己照合を `--ignored`
+//! 指定の有無にかかわらず毎回実行する（CI の `cargo test --workspace` で走る）。
+//!
 //! # 実機前提テストとしての分離
 //! Linux 5.12 以降（`open_tree`・`move_mount`・`mount_setattr`）で、root もしくは非特権 user namespace を許可する
 //! ホストが必要。GitHub ホステッド runner では保証できないため `-- --ignored` 指定時のみ実行する
@@ -41,6 +49,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn main() {
+    linux::self_check();
     if std::env::args().any(|a| a == "--ignored") {
         linux::run();
     } else {
@@ -142,17 +151,109 @@ mod linux {
         rootfs
     }
 
-    /// マウントポイント `target` の mountinfo 行の (per-mount options, fstype)。
-    fn mount_entry(mountinfo: &str, target: &str) -> Option<(Vec<String>, String)> {
-        mountinfo.lines().find_map(|l| {
-            let f: Vec<&str> = l.split(' ').collect();
-            if f.get(4) != Some(&target) {
-                return None;
+    /// mountinfo の 1 行（判定に使う欄のみ）。
+    struct Mnt {
+        id: u32,
+        parent: u32,
+        mountpoint: String,
+        opts: Vec<String>,
+        fstype: String,
+    }
+
+    /// mountinfo を解析する。カーネル応答（外部入力）として `get()` で扱い、壊れた行は `Err`（fail-closed）。
+    fn parse_mountinfo(text: &str) -> Result<Vec<Mnt>, String> {
+        text.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let bad = || format!("malformed mountinfo line: {l}");
+                let f: Vec<&str> = l.split(' ').collect();
+                let dash = f.iter().position(|x| *x == "-").ok_or_else(bad)?;
+                Ok(Mnt {
+                    id: f.first().and_then(|x| x.parse().ok()).ok_or_else(bad)?,
+                    parent: f.get(1).and_then(|x| x.parse().ok()).ok_or_else(bad)?,
+                    mountpoint: f.get(4).ok_or_else(bad)?.to_string(),
+                    opts: f
+                        .get(5)
+                        .ok_or_else(bad)?
+                        .split(',')
+                        .map(str::to_string)
+                        .collect(),
+                    fstype: f.get(dash + 1).ok_or_else(bad)?.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    /// `mountpoint` で見えている（最上位の）マウント。同じマウントポイントの他の行から親 ID として参照されて
+    /// いない行で、行の順序には頼らない。
+    fn top_mount<'a>(mnts: &'a [Mnt], mountpoint: &str) -> Option<&'a Mnt> {
+        mnts.iter()
+            .filter(|m| m.mountpoint == mountpoint)
+            .find(|m| {
+                !mnts
+                    .iter()
+                    .any(|o| o.mountpoint == mountpoint && o.parent == m.id)
+            })
+    }
+
+    /// 覆い・読み取り専用化の最上位のマウントが、見えている procfs の上に載っているかの違反一覧（空なら合格）。
+    /// `targets` のうちマウントを持つものだけを見る。`/proc/sys` は `ro` の `proc` も要求する。壊れた mountinfo は `Err`。
+    fn stacking_violations(mountinfo: &str, targets: &[&str]) -> Result<Vec<String>, String> {
+        let mnts = parse_mountinfo(mountinfo)?;
+        let mut v = Vec::new();
+        let proc_top = top_mount(&mnts, "/proc");
+        if proc_top.is_none_or(|p| p.fstype != "proc") {
+            v.push("the top mount of /proc is not procfs".to_string());
+        }
+        for t in targets.iter().chain(&["/proc/sys"]) {
+            let Some(m) = top_mount(&mnts, t) else {
+                continue;
+            };
+            if proc_top.map(|p| p.id) != Some(m.parent) {
+                v.push(format!("{t} is hidden or not on the top procfs"));
             }
-            let opts = f.get(5)?.split(',').map(str::to_string).collect();
-            let dash = f.iter().position(|x| *x == "-")?;
-            Some((opts, f.get(dash + 1)?.to_string()))
-        })
+        }
+        match top_mount(&mnts, "/proc/sys") {
+            Some(m) if m.fstype == "proc" && m.opts.iter().any(|o| o == "ro") => {}
+            _ => v.push("the top mount of /proc/sys is not a read-only procfs mount".to_string()),
+        }
+        Ok(v)
+    }
+
+    /// `stacking_violations` の合成 fixture による自己照合（特権不要。毎回実行する）。
+    pub fn self_check() {
+        let t = ["/proc/kcore", "/proc/acpi"];
+        let good = "10 1 0:5 / /proc rw - proc proc rw\n\
+                    11 10 0:5 /sys /proc/sys ro - proc proc rw\n\
+                    12 10 0:6 /null /proc/kcore rw,nosuid - tmpfs tmpfs rw\n\
+                    13 10 0:7 / /proc/acpi ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n";
+        assert_eq!(stacking_violations(good, &t), Ok(vec![]));
+        // 保護の後に新しい procfs が `/proc` へ載り、古い覆いが隠れた。
+        let hidden = format!("{good}14 10 0:8 / /proc rw - proc proc rw\n");
+        let v = stacking_violations(&hidden, &t).expect("parse");
+        assert_eq!(
+            v,
+            vec![
+                "/proc/kcore is hidden or not on the top procfs",
+                "/proc/acpi is hidden or not on the top procfs",
+                "/proc/sys is hidden or not on the top procfs",
+            ]
+        );
+        let rw = good.replace("11 10 0:5 /sys /proc/sys ro", "11 10 0:5 /sys /proc/sys rw");
+        let v = stacking_violations(&rw, &t).expect("parse");
+        assert_eq!(
+            v,
+            vec!["the top mount of /proc/sys is not a read-only procfs mount"]
+        );
+        assert!(stacking_violations("10 1 0:5 / /proc rw\n", &t).is_err());
+        println!("masked_paths: mountinfo stacking self-check passed");
+    }
+
+    /// マウントポイント `target` の最上位のマウントの (per-mount options, fstype)。
+    fn mount_entry(mountinfo: &str, target: &str) -> Option<(Vec<String>, String)> {
+        let mnts = parse_mountinfo(mountinfo).ok()?;
+        let m = top_mount(&mnts, target)?;
+        Some((m.opts.clone(), m.fstype.clone()))
     }
 
     /// 子（コンテナ内）の観測。結果は `writer` へ 1 行ずつ書き、最後に `ready` を書いて `gate` が閉じられる（親が
@@ -270,6 +371,13 @@ mod linux {
         assert!(
             matches!(exit, ChildExit::Exited(0)),
             "child must exit with 0, got {exit:?}"
+        );
+        let targets: Vec<&str> = MASKED_PROC_PATHS.to_vec();
+        let violations = stacking_violations(&mountinfo, &targets)
+            .unwrap_or_else(|e| panic!("mountinfo must parse: {e}"));
+        assert!(
+            violations.is_empty(),
+            "masks must sit on the visible procfs: {violations:?}\n{mountinfo}"
         );
         let (applied, absent) = verify(&text, &mountinfo);
         verify_host_untouched(&rootfs.0);

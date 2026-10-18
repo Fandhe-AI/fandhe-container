@@ -18,8 +18,8 @@
 //! **見積もりの位置づけ（REPAIR-3）**: 3 の値はヒープ使用量の保守的な見積もりで、アロケータの実測値では
 //! ない。TASK-59 で `StateStore` へ置換する際は、保存形式のサイズで数え直す。
 
+use crate::error::CriError;
 use prost::Message;
-use tonic::Status;
 
 use crate::runtime::v1::{
     DnsConfig, LinuxContainerResources, LinuxPodSandboxConfig, LinuxSandboxSecurityContext,
@@ -92,12 +92,12 @@ impl BoundedConfig {
     /// 作り直し（符号化して復号）は内容を変えない。呼び出し元が確保した余分な容量（長さ 0 で容量だけ
     /// 大きい `String`・`Vec`・`HashMap`）を捨て、保持量を見積もりの前提に揃えるために行う。
     /// 符号化先の確保量は検証済みの符号化長（[`MAX_CONFIG_ENCODED_BYTES`] 以下）に限られる。
-    pub(super) fn new(config: PodSandboxConfig) -> Result<Self, Status> {
+    pub(super) fn new(config: PodSandboxConfig) -> Result<Self, CriError> {
         let retained_bytes = retained_bytes(&config)?;
         let encoded = config.encode_to_vec();
         drop(config);
         let config = PodSandboxConfig::decode(encoded.as_slice())
-            .map_err(|_| Status::internal("failed to rebuild sandbox config"))?;
+            .map_err(|_| CriError::internal("failed to rebuild sandbox config"))?;
         Ok(Self {
             config,
             retained_bytes,
@@ -116,10 +116,10 @@ impl BoundedConfig {
 }
 
 /// `config` を検証し、保持量の見積もりを返す（アロケーションなし。演算は checked）。
-fn retained_bytes(config: &PodSandboxConfig) -> Result<usize, Status> {
+fn retained_bytes(config: &PodSandboxConfig) -> Result<usize, CriError> {
     let encoded_len = config.encoded_len();
     if encoded_len > MAX_CONFIG_ENCODED_BYTES {
-        return Err(Status::invalid_argument(format!(
+        return Err(CriError::invalid_argument(format!(
             "config is too large: {encoded_len} bytes exceeds the limit of {MAX_CONFIG_ENCODED_BYTES} bytes"
         )));
     }
@@ -129,24 +129,24 @@ fn retained_bytes(config: &PodSandboxConfig) -> Result<usize, Status> {
     let mut entries: usize = 0;
     for_each_collection(config, &mut |field, len| {
         if len > MAX_CONFIG_COLLECTION_ENTRIES {
-            return Err(Status::invalid_argument(format!(
+            return Err(CriError::invalid_argument(format!(
                 "config.{field} has too many entries: {len} exceeds the limit of {MAX_CONFIG_COLLECTION_ENTRIES}"
             )));
         }
         entries = entries
             .checked_add(len)
-            .ok_or_else(|| Status::invalid_argument("config has too many entries"))?;
+            .ok_or_else(|| CriError::invalid_argument("config has too many entries"))?;
         Ok(())
     })?;
     entries
         .checked_mul(RETAINED_BYTES_PER_ENTRY)
         .and_then(|overhead| overhead.checked_add(encoded_len))
         .and_then(|bytes| bytes.checked_add(RETAINED_BYTES_PER_RECORD))
-        .ok_or_else(|| Status::invalid_argument("config is too large"))
+        .ok_or_else(|| CriError::invalid_argument("config is too large"))
 }
 
 /// `metadata` の識別子の長さを検証する。
-fn check_metadata(metadata: &PodSandboxMetadata) -> Result<(), Status> {
+fn check_metadata(metadata: &PodSandboxMetadata) -> Result<(), CriError> {
     let PodSandboxMetadata {
         name,
         uid,
@@ -156,7 +156,7 @@ fn check_metadata(metadata: &PodSandboxMetadata) -> Result<(), Status> {
     for (field, value) in [("name", name), ("uid", uid), ("namespace", namespace)] {
         let len = value.len();
         if len > MAX_METADATA_FIELD_BYTES {
-            return Err(Status::invalid_argument(format!(
+            return Err(CriError::invalid_argument(format!(
                 "config.metadata.{field} is too long: {len} bytes exceeds the limit of {MAX_METADATA_FIELD_BYTES} bytes"
             )));
         }
@@ -173,8 +173,8 @@ fn check_metadata(metadata: &PodSandboxMetadata) -> Result<(), Status> {
 /// repeated / map を持たないことは本ファイルのユニットテストが固定する。
 fn for_each_collection(
     config: &PodSandboxConfig,
-    visit: &mut dyn FnMut(&'static str, usize) -> Result<(), Status>,
-) -> Result<(), Status> {
+    visit: &mut dyn FnMut(&'static str, usize) -> Result<(), CriError>,
+) -> Result<(), CriError> {
     let PodSandboxConfig {
         metadata: _,
         hostname: _,
@@ -237,8 +237,8 @@ fn for_each_collection(
 #[allow(deprecated)]
 fn visit_linux_security_context(
     security_context: &LinuxSandboxSecurityContext,
-    visit: &mut dyn FnMut(&'static str, usize) -> Result<(), Status>,
-) -> Result<(), Status> {
+    visit: &mut dyn FnMut(&'static str, usize) -> Result<(), CriError>,
+) -> Result<(), CriError> {
     let LinuxSandboxSecurityContext {
         namespace_options,
         selinux_options: _,
@@ -286,8 +286,8 @@ fn visit_linux_resources(
     resources: &LinuxContainerResources,
     hugepage_limits_field: &'static str,
     unified_field: &'static str,
-    visit: &mut dyn FnMut(&'static str, usize) -> Result<(), Status>,
-) -> Result<(), Status> {
+    visit: &mut dyn FnMut(&'static str, usize) -> Result<(), CriError>,
+) -> Result<(), CriError> {
     let LinuxContainerResources {
         cpu_period: _,
         cpu_quota: _,
@@ -338,7 +338,7 @@ mod tests {
 
     fn rejected(config: PodSandboxConfig) -> (Code, String) {
         let err = BoundedConfig::new(config).expect_err("must be rejected");
-        (err.code(), err.message().to_owned())
+        (err.code().grpc_code(), err.message().to_owned())
     }
 
     /// ERR-3・TASK-57.1: 符号化長は上限ちょうどまで受け付け、1 バイト超えると INVALID_ARGUMENT。

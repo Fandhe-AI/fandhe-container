@@ -199,6 +199,8 @@ fio に `--time_based` を渡さない。`--time_based` があると fio はフ�
 
 `--from-json` モードと `scripts/testdata/fio-bench/` の固定 fixture、および最小の fio スタブ（受け取ったオプションを fio と同じ形で `job options` に記録した固定 JSON を書き出す）を使い、実 fio なしで終了コード・出力値・`check-bench-regression.sh` との round-trip 互換性、実行条件の照合（負例 fixture は照合を通る `job options` を持たせたうえで 1 点だけ壊し、拒否理由をメッセージで照合する。必須 13 項目は 1 つずつ欠落させた JSON を selftest 内で生成して照合する）、総書き込み量の上限の境界、および symlink・競合に対する書き込み先の安全性（上記「書き込み先の安全性」・「`--output` の排他作成」。検証後に通常ファイル・FIFO・ディレクトリを指す symlink や実ディレクトリを置く競合をスタブで再現する）を機械照合する（REPAIR-12）。`make fio-bench-selftest` から実行し、CI の `bench-regression` ジョブにも組み込む。run モードの実 fio を使った実行確認は「実機での確認」節を参照。
 
+間欠失敗の調査（Issue #2002・IO-8・REPAIR-12）: 入力サイズ判定が `could not determine the size` で落ちた原因は、見張りの停止に送った SIGTERM を fork 直後の子が親の EXIT trap として受け、一時ディレクトリ（スナップショット）を消す競合だった。#2083 で SIGKILL に変え、回帰ケース `from-json-snapshot-watchdog-race` を置いた。サイズ判定の失敗メッセージには `wc -c` の終了コード・出力と、スナップショット・一時ディレクトリの有無を含める。自己テストの一時ディレクトリは `TMPDIR` を作業ルート内へ向けて閉じ、末尾で残りが無いことを照合する。
+
 `scripts/fio-baseline-ratio.sh`（IOPS・レイテンシの倍率算出。TASK-25.2）の自己テストは `scripts/fio-baseline-ratio-selftest.sh`・`scripts/testdata/fio-baseline/` に分離しており、`make fio-baseline-ratio-selftest` から実行する（同じく実 fio 不要。CI の `bench-regression` ジョブに組み込み済み）。
 
 ## Docker ベースラインの計測手順（TASK-25.2・IO-8・人間実施）

@@ -137,7 +137,10 @@ fn main() {
             observe_exec_restriction_reapply(&config, Path::new("/"), &probes).expect("observe");
         assert_eq!(
             o.kcmp_before, None,
-            "control: kcmp(self, self) must succeed"
+            "precondition failed: kcmp(self, self) must succeed before reapply (errno {:?}, Seccomp: {}); \
+             the outer environment already denies kcmp (e.g. Docker's default seccomp profile). \
+             See AGENTS.md exec_restrictions_reapply",
+            o.kcmp_before, o.seccomp_before
         );
 
         if let Some(e) = &o.prepare_error {
@@ -195,7 +198,11 @@ fn main() {
             incomplete.message,
             "exec restrictions are incomplete; not applied: rlimits, capability_drop"
         );
-        assert_eq!(o.seccomp_before, "0");
+        assert_eq!(
+            o.seccomp_before, "0",
+            "precondition failed: an outer seccomp filter is already present (Seccomp: {}). See AGENTS.md exec_restrictions_reapply",
+            o.seccomp_before
+        );
         assert_eq!(o.seccomp_after, "2");
         assert_eq!(o.no_new_privs_after, "1");
         assert_eq!(o.kcmp_after, Some(EPERM), "denied syscall must be EPERM");

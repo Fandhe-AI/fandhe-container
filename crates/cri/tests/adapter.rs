@@ -151,7 +151,7 @@ fn error_mapping() {
     }
     let (f, a) = fake_with(ContainerStatus::creating(cid("c")));
     *f.fail.lock().unwrap() = Some(ErrorCode::NotFound);
-    assert_eq!(a.state("c").unwrap_err().code(), Code::NotFound);
+    assert_eq!(a.state("c").unwrap_err().code().grpc_code(), Code::NotFound);
 }
 
 /// 入力不正は実行層を呼ばずに INVALID_ARGUMENT になる。
@@ -168,7 +168,7 @@ fn invalid_inputs_do_not_reach_runtime() {
         a.kill("c", 0).unwrap_err().code(),
         a.kill("c", 65).unwrap_err().code(),
     ];
-    assert!(codes.iter().all(|c| *c == Code::InvalidArgument));
+    assert!(codes.iter().all(|c| c.grpc_code() == Code::InvalidArgument));
     assert!(f.calls.lock().unwrap().is_empty());
 }
 

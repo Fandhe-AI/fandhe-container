@@ -13,7 +13,8 @@
 //!    手順 10 以降のログ捕捉・restart のワーカーと、制御チャネルの accept スレッド〔`control`。#2058〕に限る）／
 //!    2b. supervisor の構造化ログの保存先を開き、`stderr_sink` の書き先を差し替える（レコードがあるときだけ。期限つきの
 //!    作業スレッドで行い終了を確認してから進む。失敗は fail-closed。保存先と上限は [`crate::supervisor_log`]。#2067・REPAIR-4）／
-//! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし）／4. [`StartDeps::check_launcher_available`]
+//! 3. 状態の事前確認（Created・pid なし・cgroup 未記録。副作用なし。Running・pid なしの予約が残っていれば
+//!    [`StartDeps::recover_interrupted`] で Created へ戻して `FailedPrecondition` を報告する。#2011）／4. [`StartDeps::check_launcher_available`]
 //!    （副作用なし。権限モデルと Landlock ABI を確かめ、満たさなければここで止まる）／5. cgroup の連鎖
 //!    （[`StartDeps::prepare_cgroup`]）／6. 監査 sink（[`StartDeps::build_audit_sink`]。fork の前）・ログ sink／
 //!    7. launcher の構築と [`SpecCapturingLauncher`] での包み／8. `oci_runtime::start`（**入口スレッドが直接行う**）／
@@ -51,6 +52,10 @@
 //! - 後始末を確かめられなければ終了コードは `INTERNAL`。後始末自体の失敗は元のエラーを隠さず、構造化ログ（stderr）に出す。
 //! - 失敗した start の後もスコープは記録されたまま残る（core に記録済みの配置から連鎖を再開する API が無い）。
 //!   同じコンテナの再 start は手順 3 で `FailedPrecondition` になる。
+//! - 別プロセスの supervisor が落ちて予約（Running・pid なし）だけが残った場合、次の `start` は手順 3 で
+//!   [`StartDeps::recover_interrupted`] を呼ぶ（core が記録済みの cgroup 配置から残存を確かめ、居れば止めて Created へ戻す。
+//!   CLI は状態を書かず、回復は supervisor が行う）。戻した後もその start は続けず、`FailedPrecondition`
+//!   （`delete` と再作成を促す）を報告する。回復に失敗したらそのエラーを報告し、予約は残る（再試行できる）。
 //!
 //! # 未実装・残余（REPAIR-3）
 //! - **restart の再 launch**: 本番 launcher の結線は済んでいる（start と同じ launcher と `LaunchSpec` を使う）が、
@@ -135,6 +140,25 @@ pub trait StartDeps {
 
     /// 作った cgroup を消す（`remove_child`）。mkdir 前なら何もしない。
     fn release_cgroup(&mut self) -> Result<(), TraitError>;
+
+    /// 手順 3: 前の supervisor が start の途中で落ち、起動権の予約（Running・pid なし）だけが残っているコンテナを、
+    /// Created へ戻す（別プロセスからの回復。`oci_runtime::recover_interrupted_start`。#2011・CORE-2・SEC-1）。
+    ///
+    /// 成功しても入口はその start を続けない（記録済みの配置から連鎖を再開する API が無いため。モジュール doc）。
+    /// 既定実装は回復の手段を持たないため fail-closed で `Unimplemented`（フェイクの [`StartDeps`] は上書きしなくてよい）。
+    /// cgroup の連鎖には触れない（スコープは記録済みで、`prepare_cgroup` / `release_cgroup` は呼ばれない）。
+    fn recover_interrupted(
+        &mut self,
+        store: &dyn StateStore,
+        id: &ContainerId,
+        timeouts: &StartTimeouts,
+    ) -> Result<(), TraitError> {
+        let _ = (store, id, timeouts);
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "recovering an interrupted start is not supported",
+        ))
+    }
 }
 
 /// 起動に成功したコンテナの、監視に必要なもの。
@@ -240,6 +264,28 @@ fn log_event(event: &'static str, code: Option<ErrorCode>) {
         format!("{{\"component\":\"supervisor\",\"event\":\"{event}\",\"code\":\"{code}\"}}\n");
     // 満杯・書き込み失敗でも処理は止めない（ログの欠落は許す）。
     let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
+}
+
+/// `dev.tty.legacy_tiocsti` の観測値が警告対象なら、固定の 1 行を `sink` へ待たずに入れる（CORE-5・SEC-1・REPAIR-4・
+/// REPAIR-5・#2008）。対象外なら何もせず `None`。キュー満杯でも待たず、結果は起動の可否に使わない。
+fn log_legacy_tiocsti_to(
+    sink: &crate::stderr_sink::StderrSink,
+    state: fandhe_container_core::legacy_tiocsti::LegacyTiocsti,
+) -> Option<crate::stderr_sink::EmitOutcome> {
+    let line = fandhe_container_core::legacy_tiocsti::warning_line(state)?;
+    Some(sink.emit(format!("{line}\n").into_bytes()))
+}
+
+/// start の成功後に `dev.tty.legacy_tiocsti` の警告を supervisor のログ（`@supervisor-logs`）へ 1 行残す（#2008）。
+///
+/// core の出力（fd 2 が AF_UNIX の socket のときだけ届く）は CLI の `start`（stderr が null）では捨てられるため、
+/// supervisor が自分で観測して残す。`stderr_sink` の常駐スレッドを作るので、単一スレッド前提の区間が終わった後
+/// （`oci_runtime::start` の成功後）にだけ呼ぶ。fd 2 が socket の構成では core の出力と重複するが、出力先が別なので
+/// 許容する。restart の再 launch では再出力しない（host のグローバルな値で、初回に記録済みのため）。
+/// 結線の検証: `observe` で観測値を差し替えられる（`run_start_until_observing`）。結合試験
+/// `tests/start_tiocsti_wiring.rs` が別プロセスで共有 sink へ届くことを照合する（REPAIR-12）。
+fn log_legacy_tiocsti(observe: fn() -> fandhe_container_core::legacy_tiocsti::LegacyTiocsti) {
+    let _ = log_legacy_tiocsti_to(crate::stderr_sink::stderr(), observe());
 }
 
 /// 回収を確かめられなかったハンドルの保管先（`Drop` は回収しないため、捨てずに保持する。REPAIR-5）。
@@ -458,7 +504,37 @@ pub fn run_start_until(
     deadline: Option<Instant>,
     out: &mut dyn Write,
 ) -> Result<Running, NonZeroU8> {
-    let result = start_reporting(deps, store, recorder, req, timeouts, deadline, out);
+    run_start_until_observing(
+        deps,
+        store,
+        recorder,
+        req,
+        timeouts,
+        deadline,
+        out,
+        fandhe_container_core::legacy_tiocsti::read_host,
+    )
+}
+
+/// [`run_start_until`] の `dev.tty.legacy_tiocsti` の観測を差し替えられる版（試験用の継ぎ目。#2008・REPAIR-12）。
+///
+/// 本番は [`run_start_until`] 経由で `read_host` を渡す。起動成功の経路から共有の `stderr_sink` へ警告が届く
+/// 結線を、host の sysctl に依らず結合試験で確かめるために公開する。
+#[doc(hidden)]
+// 理由: `run_start_until` と同じ deps・store・recorder・req・timeouts・各 sink に read_host を足した入力で、
+// 結合試験が個別に差し替えるため束ねる型を作らず引数のまま渡す。
+#[allow(clippy::too_many_arguments)]
+pub fn run_start_until_observing(
+    deps: Box<dyn StartDeps + Send>,
+    store: &Arc<dyn StateStore>,
+    recorder: &Arc<OpRecorder>,
+    req: &StartRequest,
+    timeouts: &StartTimeouts,
+    deadline: Option<Instant>,
+    out: &mut dyn Write,
+    observe: fn() -> fandhe_container_core::legacy_tiocsti::LegacyTiocsti,
+) -> Result<Running, NonZeroU8> {
+    let result = start_reporting(deps, store, recorder, req, timeouts, deadline, out, observe);
     // 満杯・書き込み失敗でも処理は止めない（ログの欠落は許す）。手順 8 の後なので常駐スレッドを作ってよい。
     let _ = crate::stderr_sink::stderr().emit(start_metrics_line(recorder).into_bytes());
     result
@@ -538,6 +614,9 @@ fn record_start(recorder: &OpRecorder, started: Instant, success: bool) {
 }
 
 /// [`run_start_until`] の本体（計測ログの出力を除く）。
+// 理由: 入口 `run_start_until` が受けた値を分解せずそのまま渡す本体で、束ねる型を作ると
+// 呼び出し側の組み立てコードが増えるだけのため引数のまま渡す。
+#[allow(clippy::too_many_arguments)]
 fn start_reporting(
     deps: Box<dyn StartDeps + Send>,
     store: &Arc<dyn StateStore>,
@@ -546,6 +625,7 @@ fn start_reporting(
     timeouts: &StartTimeouts,
     deadline: Option<Instant>,
     out: &mut dyn Write,
+    observe: fn() -> fandhe_container_core::legacy_tiocsti::LegacyTiocsti,
 ) -> Result<Running, NonZeroU8> {
     let started = Instant::now();
     let worker = match StartWorker::spawn(deps, store, req, *timeouts) {
@@ -572,6 +652,7 @@ fn start_reporting(
                         pid: running.process.pid(),
                     },
                 );
+                log_legacy_tiocsti(observe);
                 Ok(running)
             }
             Attempt::Failed { error, cleanup } => {
@@ -744,7 +825,7 @@ impl StartWorker {
             .spawn(move || {
                 worker_tid.store(current_tid(), Ordering::Release);
                 let mut deps = deps;
-                let outcome = prepare_start(deps.as_mut(), &store, &req);
+                let outcome = prepare_start(deps.as_mut(), &store, &req, &timeouts);
                 let (lock, cvar) = &*worker_shared;
                 let mut slot = lock.lock().unwrap_or_else(PoisonError::into_inner);
                 if matches!(*slot, WorkerSlot::Abandoned) {
@@ -1007,6 +1088,7 @@ fn prepare_start(
     deps: &mut dyn StartDeps,
     store_arc: &Arc<dyn StateStore>,
     req: &StartRequest,
+    timeouts: &StartTimeouts,
 ) -> PrepareOutcome {
     let fail = |e: TraitError, cleanup: Cleanup| PrepareOutcome::Failed {
         error: op_err(e),
@@ -1019,6 +1101,21 @@ fn prepare_start(
         Err(e) => return fail(e, Cleanup::Nothing),
     };
     let status = observed.status();
+    // 前の supervisor が落ちて残った起動権の予約(Running・pid なし)は、記録済みの cgroup 配置で残存を確かめて
+    // Created へ戻す(#2011)。戻した後もこの start は続けない: 配置は記録済みで連鎖を再開できないため、
+    // `delete` と再作成を促す(下の「スコープ記録済み」の拒否と同じ理由)。cgroup には触れない。
+    if status.state() == ContainerState::Running && status.pid().is_none() {
+        return match deps.recover_interrupted(store, req.id(), timeouts) {
+            Ok(()) => fail(
+                TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "an interrupted start was recovered; delete and recreate the container",
+                ),
+                Cleanup::Nothing,
+            ),
+            Err(e) => fail(e, Cleanup::Nothing),
+        };
+    }
     if status.state() != ContainerState::Created || status.pid().is_some() {
         return fail(
             TraitError::new(
@@ -1869,6 +1966,26 @@ mod linux {
             Ok(Arc::new(launcher))
         }
 
+        /// 参加フックの源を持たない `ProductionLauncher` で `recover_interrupted_start` を呼ぶ(launch はしないので
+        /// 参加フックは要らず、`prepare_cgroup` も通さない。記録済みの配置で残存を確かめる)。構築は child subreaper
+        /// 化の副作用を持つが、この経路は直後に fail-closed で終わる。
+        fn recover_interrupted(
+            &mut self,
+            store: &dyn StateStore,
+            id: &ContainerId,
+            timeouts: &StartTimeouts,
+        ) -> Result<(), TraitError> {
+            let privilege = self.privilege.clone()?;
+            let audit = crate::exec::default_audit_sink(Some(self.root.clone()))?;
+            let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+                ProductionLauncher::builder()
+                    .privilege(privilege)
+                    .audit_sink(Arc::new(audit))
+                    .build()?,
+            );
+            recover_interrupted_start(store, &launcher, id, timeouts).map(drop)
+        }
+
         fn release_cgroup(&mut self) -> Result<(), TraitError> {
             let Some(held) = self.cgroup.as_ref() else {
                 return Ok(());
@@ -2334,6 +2451,90 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 書かれたバイト列を共有する書き手(#2008 の試験用)。
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 解放されるまで最初の書き込みで止まる書き手(#2008 の試験用)。
+    struct BlockedWriter(std::sync::mpsc::Receiver<()>);
+
+    impl Write for BlockedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const LEGACY_LINE: &str = r#"{"level":"warn","event":"legacy_tiocsti_enabled","sysctl":"dev.tty.legacy_tiocsti","value":1}"#;
+
+    /// CORE-5・SEC-1・REPAIR-4(#2008): 有効のとき固定 1 行が改行付きでログへ入る。
+    #[test]
+    fn sup_core5_2008_enabled_logs_exact_line() {
+        use crate::stderr_sink::{EmitOutcome, StderrSink};
+        use fandhe_container_core::legacy_tiocsti::LegacyTiocsti;
+        let buf = SharedBuf::default();
+        let sink = StderrSink::spawn(buf.clone(), 4);
+        assert_eq!(
+            log_legacy_tiocsti_to(&sink, LegacyTiocsti::Enabled),
+            Some(EmitOutcome::Queued)
+        );
+        assert_eq!(sink.flush(Duration::from_secs(5)), EmitOutcome::Written);
+        assert_eq!(
+            buf.0.lock().unwrap().as_slice(),
+            format!("{LEGACY_LINE}\n").as_bytes()
+        );
+    }
+
+    /// CORE-5(#2008): 対象外の状態では何も入れない。
+    #[test]
+    fn sup_core5_2008_non_applicable_logs_nothing() {
+        use crate::stderr_sink::StderrSink;
+        use fandhe_container_core::legacy_tiocsti::LegacyTiocsti;
+        for state in [
+            LegacyTiocsti::Absent,
+            LegacyTiocsti::Disabled,
+            LegacyTiocsti::Unexpected,
+            LegacyTiocsti::ReadFailed {
+                kind: std::io::ErrorKind::PermissionDenied,
+            },
+        ] {
+            let buf = SharedBuf::default();
+            let sink = StderrSink::spawn(buf.clone(), 4);
+            assert_eq!(log_legacy_tiocsti_to(&sink, state), None, "{state:?}");
+            let _ = sink.flush(Duration::from_secs(5));
+            assert!(buf.0.lock().unwrap().is_empty(), "{state:?}");
+        }
+    }
+
+    /// REPAIR-5(#2008): 書き手が止まりキューが満杯でも待たずに `QueueFull` で戻る。
+    #[test]
+    fn sup_repair5_2008_full_queue_does_not_block() {
+        use crate::stderr_sink::{EmitOutcome, StderrSink};
+        use fandhe_container_core::legacy_tiocsti::LegacyTiocsti;
+        let (release, rx) = std::sync::mpsc::channel();
+        let sink = StderrSink::spawn(BlockedWriter(rx), 1);
+        let started = Instant::now();
+        let outcomes: Vec<_> = (0..8)
+            .map(|_| log_legacy_tiocsti_to(&sink, LegacyTiocsti::Enabled))
+            .collect();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(outcomes.last(), Some(&Some(EmitOutcome::QueueFull)));
+        drop(release);
+    }
 
     /// terminate が呼び出し側の期限より遅れて成功する起動ハンドル。
     struct SlowOk(u32, Duration);

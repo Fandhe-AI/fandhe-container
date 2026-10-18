@@ -8,7 +8,9 @@
 //! `/seccomp-probe` へ書いた記録（`SeccompProbeRecord`）の具体値で照合する。`KILL_PROCESS` の
 //! `unshare`・`ptrace`・`kexec_load`（ESC-06。`DeniedSyscall::deny_action`）は戻らず記録を書けないため、
 //! 1 件ずつ別の子で発行し、親が終了シグナル SIGSYS（31）を照合する。Landlock を載せない構成では `LaunchReady` が作られず exec は拒否される（fail-closed。
-//! #1714）ため、プローブ用 API は exec の代わりに終端でプローブを実行する。
+//! #1714）ため、プローブ用 API は exec の代わりに終端でプローブを実行する。exec 後のプロセスでの拒否
+//! （`mount` の `EPERM`・許可 syscall の対照・`unshare`/`ptrace`/`kexec_load` の SIGSYS）は、`production_launcher` の
+//! シナリオ J・K が照合する（#2012）。
 //!
 //! # 識別的な検査と網羅確認
 //! - 識別的（capability 不足ではなく seccomp が拒否したことを示せる）: `kcmp(自 pid, 自 pid, KCMP_VM)`

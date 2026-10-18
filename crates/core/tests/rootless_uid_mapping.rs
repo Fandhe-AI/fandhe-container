@@ -4,24 +4,28 @@
 //! ディスパッチャが `stat` で所有者が非特権 UID / GID（写像先。≠ 0）であることを具体値で照合する。
 //!
 //! # 既存テストとの差別化
-//! - `rootless_file_owner`（TASK-40.3）: pivot 前・PID 1 ではない分離後プロセスがホスト上の作業
-//!   ディレクトリへ作成する。本テストはコンテナ PID 1・pivot 済み rootfs 内での作成を見る
-//! - `rootless`（TASK-40.4）: ファイルを作らず `uid_map` のみ照合する。本テストは所有者（ESC-09）を見る
+//! - `rootless_file_owner`（TASK-40.3）: 実エントリポイントの作成と `chown` の所有者写像を見る。本テストは
+//!   加えて PID 1・pivot 済み rootfs であることの証跡（`/` の一覧）と ESC-09 の RESULT 行を見る
+//! - `rootless`（TASK-40.4）: ファイルを作らずライフサイクルと `uid_map` を照合する。本テストは所有者（ESC-09）を見る
 //! - `pivot_root_isolation`（TASK-27.3）: 所有者を照合しない。本テストは subuid 範囲経路も含む
 //!
 //! # 受入基準の解釈（REPAIR-3）
-//! 本試験の経路は `with_landlock` を載せず `LaunchReady` が作られない（fail-closed。#1714）ため
-//! `exec_entrypoint` は exec を拒否し、実エントリポイントではなくテストバイナリ自身がコンテナ PID 1 の代役として
-//! ファイルを作る。本番 launcher 経由の確認は `production_launcher`（#1818）が担う。実エントリポイント内作成への置き換えは未着手。
+//! 起動経路は `StagePipeline::with_landlock` を載せたステージ列（`tests/support/real_entry.rs`。#2012）で、
+//! `LaunchReady` がそろうため exec まで到達する。コンテナ PID 1 は実エントリポイント（試験バイナリ自身を
+//! rootfs の `/entry` へコピーして `--entry <name>` で再入したもの）で、exec 後に pivot 済み rootfs 直下へ
+//! コンテナ内 root としてファイルを作る。実エントリポイントの標準入出力は `/dev/null` へ置換されるため、
+//! コンテナ視点の観測値は `/entry-report` へ書き、ホストが具体値で照合する。本番 launcher 経由の確認は
+//! `production_launcher`（#1818）が担う。
 //!
 //! # 流れ（3 段）
-//! 1. ディスパッチャ（分離なし）: rootfs を作り、`--scenario <name> <rootfs>` で自身を起動し、
-//!    終了コード 0 を期限付きで待った後、ホスト視点で所有者を具体値照合する（REPAIR-5）。root で
+//! 1. ディスパッチャ（分離なし）: rootfs（実エントリポイント入り）を作り、`--scenario <name> <rootfs> <LD_LIBRARY_PATH>`
+//!    で自身を起動し、終了コード 0 を期限付きで待った後、ホスト視点で所有者を具体値照合する（REPAIR-5）。
+//!    あわせて、実エントリポイントが報告した `/` 直下の一覧が、ホストから見た rootfs 直下の一覧（実エントリポイントが
+//!    作ったファイルと報告ファイルを除く）と完全一致することを照合する（`/` が rootfs であることの証跡）。root で
 //!    実行された場合は、ホスト root への写像が `host_root_identity_mapping` で拒否されること（SEC-5）だけを照合する
-//! 2. シナリオ: `plan_rootless_subordinate` → `isolate_rootless_subordinate` の後、自身を
-//!    `--container <name> <rootfs>` で起動する（新 PID namespace の PID 1 になる）
-//! 3. コンテナ PID 1: `MountIsolation::establish` → `prepare_rootfs` → `pivot_root` の後、
-//!    `/` 直下にコンテナ内 root としてファイルを作る
+//! 2. シナリオ: `plan_rootless_subordinate` → `isolate_rootless_subordinate` の後、`with_landlock` を載せたステージ列で
+//!    実エントリポイントを新 PID namespace の PID 1 として起動し、`Exited(0)` を待つ
+//! 3. 実エントリポイント（exec 後の PID 1）: `/` 直下の一覧を報告し、`/` 直下にコンテナ内 root としてファイルを作る
 //!
 //! シナリオ `direct` は `single_id_mapping(euid)`、`helper`（`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ）
 //! は `/etc/subuid`・`/etc/subgid` の範囲写像（ns 内 1 → subuid 範囲先頭も確認）。
@@ -30,7 +34,8 @@
 //! 必要環境: 非特権 user namespace を許可する Linux。AppArmor の
 //! `kernel.apparmor_restrict_unprivileged_userns=1`（Ubuntu 24.04 既定）・`user.max_user_namespaces=0`・
 //! Docker 既定 seccomp の開発コンテナ内では `PermissionDenied` 等で失敗する（緩和は root 権限が要り、
-//! 人間が TASK-8 環境で行う。実機実行・レポートは #208）。`-- --ignored` 指定時のみ実行し、未指定時は
+//! 人間が TASK-8 環境で行う。実機実行・レポートは #208）。実エントリポイントを exec まで通すため、Landlock ABI 6 以上
+//! （Linux 6.12 以上）も必要（満たさないと失敗する）。`-- --ignored` 指定時のみ実行し、未指定時は
 //! 「ignored」を出力して成功終了する。実行された場合は拒否を含むあらゆる失敗を失敗として扱い、
 //! 検証せずに成功する分岐は持たない。
 //! 実行: `cargo test -p fandhe-container-core --test rootless_uid_mapping -- --ignored`
@@ -41,8 +46,14 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/real_entry.rs"]
+mod real_entry;
+
+#[cfg(target_os = "linux")]
 fn main() {
-    if std::env::args().any(|a| a == "--ignored" || a == "--scenario" || a == "--container") {
+    if std::env::args().any(|a| a == "--entry") {
+        linux::entry();
+    } else if std::env::args().any(|a| a == "--ignored" || a == "--scenario") {
         linux::run();
     } else {
         println!(
@@ -53,16 +64,16 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::collections::BTreeSet;
     use std::io::{Read as _, Write as _};
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, ExitStatus, Stdio};
     use std::time::{Duration, Instant};
 
+    use super::real_entry;
     use fandhe_container_core::exec::{
-        Hostname, IsolationConfig, IsolationPrivilege, MountIsolation, Namespace, NamespaceSet,
-        isolate_rootless_subordinate, pivot_root, plan_rootless_subordinate, prepare_rootfs,
+        ChildExit, Hostname, IsolationConfig, IsolationPrivilege, Namespace, NamespaceSet,
+        isolate_rootless_subordinate, plan_rootless_subordinate,
     };
     use fandhe_container_core::rootless::{
         DEFAULT_HELPER_TIMEOUT, HelperPaths, IdMapSet, IdMapWriter, SubIdOwner, WriterKind,
@@ -118,14 +129,11 @@ mod linux {
 
     pub fn run() {
         let args: Vec<String> = std::env::args().collect();
-        if let Some(i) = args.iter().position(|a| a == "--container") {
-            let name = args.get(i + 1).expect("scenario name after --container");
-            let rootfs = args.get(i + 2).expect("rootfs after the scenario name");
-            container(name, Path::new(rootfs));
-        } else if let Some(i) = args.iter().position(|a| a == "--scenario") {
+        if let Some(i) = args.iter().position(|a| a == "--scenario") {
             let name = args.get(i + 1).expect("scenario name after --scenario");
             let rootfs = args.get(i + 2).expect("rootfs after the scenario name");
-            scenario(name, Path::new(rootfs));
+            let ld = args.get(i + 3).expect("LD_LIBRARY_PATH after the rootfs");
+            scenario(name, Path::new(rootfs), ld);
         } else {
             dispatcher();
         }
@@ -140,8 +148,9 @@ mod linux {
         }
     }
 
-    /// `prepare_rootfs` の契約に合わせ、`proc/` のみを持つ rootfs を排他作成（事前配置の差し替え防止）する。
-    fn make_rootfs(label: &str) -> Rootfs {
+    /// `proc/` と実エントリポイント（`/entry` とローダ・共有ライブラリ）を持つ rootfs を排他作成（事前配置の
+    /// 差し替え防止）する。戻り値は rootfs と、実エントリポイントの `LD_LIBRARY_PATH`。
+    fn make_rootfs(label: &str) -> (Rootfs, String) {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
@@ -154,10 +163,11 @@ mod linux {
             ));
         std::fs::create_dir(&base).expect("exclusively create rootfs");
         let rootfs = Rootfs(base);
+        let ld = real_entry::install_entry(&rootfs.0);
+        // rootfs の所有者（= コンテナ内 root）だけが入れればよい。他ユーザーによる差し替えを防ぐ（SEC-5）。
         std::fs::set_permissions(&rootfs.0, std::fs::Permissions::from_mode(0o700))
             .expect("chmod rootfs");
-        std::fs::create_dir(rootfs.0.join("proc")).expect("create rootfs/proc");
-        rootfs
+        (rootfs, ld)
     }
 
     /// 子を期限付きで待つ。期限超過なら kill して回収し `None`（REPAIR-5）。
@@ -187,12 +197,14 @@ mod linux {
     fn spawn_and_wait(
         args: &[&str],
         rootfs: &Path,
+        ld: &str,
         limit: Duration,
     ) -> (Option<ExitStatus>, String) {
         let exe = std::env::current_exe().expect("current_exe");
         let mut child = Command::new(exe)
             .args(args)
             .arg(rootfs)
+            .arg(ld)
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -249,9 +261,9 @@ mod linux {
             );
         }
         for name in names {
-            let rootfs = make_rootfs(name);
+            let (rootfs, ld) = make_rootfs(name);
             let (status, stderr) =
-                spawn_and_wait(&["--scenario", name], &rootfs.0, scenario_deadline());
+                spawn_and_wait(&["--scenario", name], &rootfs.0, &ld, scenario_deadline());
             let status =
                 status.unwrap_or_else(|| panic!("scenario {name} did not exit within the limit"));
             assert_eq!(
@@ -280,6 +292,44 @@ mod linux {
                     )),
                 )
             };
+            // 実エントリポイントの報告（exec 後のコンテナ視点）。
+            let report =
+                real_entry::read_report(&rootfs.0.join(real_entry::REPORT_FILE), timeout());
+            let field = |k: &str| report.get(k).map(String::as_str).unwrap_or("missing");
+            assert_eq!(
+                field("pid"),
+                "1",
+                "scenario {name}: real entrypoint is PID 1"
+            );
+            assert_eq!(field("uid"), "0", "scenario {name}: container uid");
+            assert_eq!(field("gid"), "0", "scenario {name}: container gid");
+            assert_eq!(field("nonewprivs"), "1", "scenario {name}: NoNewPrivs");
+            assert_eq!(
+                field("seccomp"),
+                "2",
+                "scenario {name}: Seccomp filter mode"
+            );
+            assert_eq!(
+                field("root_owner"),
+                "0:0",
+                "scenario {name}: container view"
+            );
+            if ns1.is_some() {
+                assert_eq!(field("ns1_owner"), "1:1", "scenario {name}: ns 1 view");
+            }
+            // `/` が rootfs であることの証跡: 実エントリポイントが見た `/` 直下 = ホストから見た rootfs 直下
+            // （実エントリポイントが後から作ったファイルと報告ファイルを除く）。
+            let mut host_entries: Vec<String> = std::fs::read_dir(&rootfs.0)
+                .expect("read rootfs")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .filter(|n| ![ROOT_FILE, NS1_FILE, real_entry::REPORT_FILE].contains(&n.as_str()))
+                .collect();
+            host_entries.sort();
+            assert_eq!(
+                field("root_entries"),
+                host_entries.join(","),
+                "scenario {name}: the entrypoint's / must be the rootfs"
+            );
             let meta = std::fs::metadata(rootfs.0.join(ROOT_FILE)).expect("stat root-created");
             assert_eq!(meta.uid(), want_uid, "scenario {name}: host uid");
             assert_eq!(meta.gid(), want_gid, "scenario {name}: host gid");
@@ -312,8 +362,9 @@ mod linux {
         }
     }
 
-    /// 分離 → 自身をコンテナ PID 1 として再起動。拒否を含むあらゆる失敗は panic（失敗）。
-    fn scenario(name: &str, rootfs: &Path) {
+    /// 分離 → `with_landlock` を載せて実エントリポイントを PID 1 として起動し、`Exited(0)` を待つ。
+    /// 拒否を含むあらゆる失敗は panic（失敗）。
+    fn scenario(name: &str, rootfs: &Path, ld: &str) {
         let (euid, egid) = own_ids();
         let (uid, gid, writer, want_kind) = match name {
             "direct" => (
@@ -353,67 +404,72 @@ mod linux {
             "scenario {name}: must be uid/gid 0 in the ns"
         );
 
-        let (status, stderr) = spawn_and_wait(&["--container", name], rootfs, scenario_deadline());
-        let status =
-            status.unwrap_or_else(|| panic!("container {name} did not exit within the limit"));
+        let entry =
+            real_entry::entrypoint_from(&real_entry::entry_args(name), &real_entry::entry_env(ld));
+        let child = real_entry::spawn_real_entry(rootfs, &entry, &gid);
+        let exit = child
+            .wait_timeout(scenario_deadline())
+            .unwrap_or_else(|e| panic!("wait: {e}"));
         assert_eq!(
-            status.code(),
-            Some(0),
-            "container {name} must exit with 0; stderr:\n{stderr}"
+            exit,
+            ChildExit::Exited(0),
+            "scenario {name}: the real entrypoint must create the files and exit 0"
         );
     }
 
-    /// コンテナ PID 1 の代役（REPAIR-3）。pivot 済み rootfs 直下へコンテナ内 root としてファイルを作る。
-    fn container(name: &str, rootfs: &Path) {
-        assert_eq!(
-            std::process::id(),
-            1,
-            "container must be PID 1 of the new PID namespace"
-        );
-        let isolation = MountIsolation::establish().expect("establish mount isolation");
-        let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
-        let report = pivot_root(&isolation, prepared).expect("pivot_root");
-        assert!(report.old_root_detached);
-        assert!(report.proc_mounted);
-
-        // コンテナ rootfs 内での作成である証跡（`/` はホストのルートではなく rootfs 由来のもののみ）。
-        let names: BTreeSet<String> = std::fs::read_dir("/")
-            .expect("read /")
-            .map(|e| {
-                e.expect("dir entry")
-                    .file_name()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        let want: BTreeSet<String> = ["proc"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(names, want, "/ must contain only the container rootfs");
-
-        assert_eq!(own_ids(), (0, 0), "container {name}: root in the ns");
-        let root_path = Path::new("/").join(ROOT_FILE);
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&root_path)
-            .expect("create root-created");
-        f.write_all(b"owner\n").expect("write root-created");
-        let m = std::fs::metadata(&root_path).expect("stat root-created");
-        assert_eq!(
-            (m.uid(), m.gid()),
-            (0, 0),
-            "container {name}: container view"
-        );
-
-        if name == "helper" {
-            let p = Path::new("/").join(NS1_FILE);
-            std::fs::OpenOptions::new()
+    /// 実エントリポイント（exec 後のコンテナ PID 1。REPAIR-3）。`/` 直下の一覧を報告し、コンテナ内 root として
+    /// `/` 直下へファイルを作る。失敗は値（`error:<kind>`）として記録し、終了コードは全操作が成功したときだけ 0 にする。
+    pub fn entry() {
+        let args: Vec<String> = std::env::args().collect();
+        let name = args
+            .iter()
+            .position(|a| a == "--entry")
+            .and_then(|i| args.get(i + 1))
+            .expect("mode after --entry")
+            .clone();
+        let mut lines = real_entry::entry_observations();
+        let mut ok = true;
+        // 作成前の `/` 直下の一覧（報告ファイル・作成物を含まない）。
+        let mut names: Vec<String> = match std::fs::read_dir("/") {
+            Ok(rd) => rd
+                .filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => {
+                ok = false;
+                Vec::new()
+            }
+        };
+        names.sort();
+        lines.push(("root_entries", names.join(",")));
+        let mut create = |file: &str, key: &'static str, chown: bool| -> (&'static str, String) {
+            let path = Path::new("/").join(file);
+            let made = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&p)
-                .expect("create ns1-owned");
-            std::os::unix::fs::chown(&p, Some(1), Some(1)).expect("chown to ns uid/gid 1");
-            let m = std::fs::metadata(&p).expect("stat ns1-owned");
-            assert_eq!((m.uid(), m.gid()), (1, 1), "container {name}: ns 1 view");
-        }
+                .open(&path)
+                .and_then(|mut f| f.write_all(b"owner\n"))
+                .and_then(|()| {
+                    if chown {
+                        std::os::unix::fs::chown(&path, Some(1), Some(1))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .and_then(|()| std::fs::metadata(&path));
+            match made {
+                Ok(m) => (key, format!("{}:{}", m.uid(), m.gid())),
+                Err(e) => {
+                    ok = false;
+                    (key, format!("error:{:?}", e.kind()))
+                }
+            }
+        };
+        let root = create(ROOT_FILE, "root_owner", false);
+        let ns1 = (name == "helper").then(|| create(NS1_FILE, "ns1_owner", true));
+        lines.push(root);
+        lines.extend(ns1);
+        real_entry::write_report(&lines);
+        std::process::exit(if ok { 0 } else { 1 });
     }
 }

@@ -21,8 +21,9 @@
 //! seccomp（#178。観測点の後に適用される）と exec の前の観測点として使う。フックは親と合図ファイルで
 //! 同期し、親は子が停止している間に `/proc/<pid>/status` を読む。TASK-39.4 で Landlock が組み込み段に
 //! なるとこの登録は `InvalidArgument` で失敗する（意図した仕掛け。そのとき観測点と `Exited(126)` の
-//! 期待値を見直す）。exec 後の capability（`retained_after_exec` の
-//! 上限挙動を含む）の実測は、exec が許可された後の課題とする。
+//! 期待値を見直す）。exec 後の capability の値（`retained_after_exec` の
+//! 上限挙動を含む）は、本番 launcher を実プロセスで通す `production_launcher` のシナリオ J が
+//! `CapInh`/`CapPrm`/`CapEff`/`CapBnd`/`CapAmb` を具体値で照合する（#2012）。本試験の観測点は exec 前の値を担う。
 //!
 //! # 実機前提テストとしての分離
 //! root もしくは非特権 user namespace を許可するホストが必要（`fork_exec_isolation` と同じ）。GitHub

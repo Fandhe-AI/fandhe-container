@@ -29,7 +29,8 @@
 //! - 各レイヤーの tar は 2 回走査する（下記「レイヤーごとの 3 パス」）。blob 版は同じ blob を 2 回開き、
 //!   ストリーム版（`extract_tar`・`extract_layers`）は入力に `Seek` を求め、各走査の前に最初の位置へ戻す。
 //!   2 回の走査で内容が変わらないことは digest 検証済みであることに依る（変わっても、パス 3 はマーカー名を
-//!   書き出さない）。
+//!   書き出さない）。展開後 tar の diff_id（sha256）はパス 1 の読み取りで計算し、`extract_image_layers` では
+//!   image config の `rootfs.diff_ids` と突合する（パス 3 では再計算しない。#2017・OCI-1）。
 //! - tar の終端後に入力を EOF まで読み捨てる（gzip トレーラの CRC32・ISIZE 検証のため）。読み捨てを含む
 //!   入力全体は `ExtractLimits::max_input_bytes` で上限を課す（超過は `ResourceExhausted`）。
 //!
@@ -109,11 +110,15 @@ use std::path::{Component, Path, PathBuf};
 
 use tar::{Archive, EntryType};
 
+use sha2::{Digest as _, Sha256};
+
 use super::{
-    DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, GzipLayerReader, oci_error_from_layer_io, open_gzip_layer,
+    DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, GzipLayerReader, LayerMediaType, PlainLayerReader,
+    oci_error_from_layer_io, open_gzip_layer, open_plain_layer,
 };
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
+use crate::reference::Digest;
 use crate::whiteout::{self, NameClass};
 
 /// エントリ数上限の参考既定値。API は上限を必須引数にしており、上限なしの経路は提供しない。
@@ -202,6 +207,9 @@ pub struct ExtractedLayer {
     pub files_with_stripped_special_bits: u64,
     /// 特殊ビットのポリシーの判定と、保持した件数（#1810）。
     pub special_bits: SpecialBitsOutcome,
+    /// 展開後 tar（圧縮を解いた全バイト。終端後の読み捨てを含む）の sha256。image config の
+    /// `rootfs.diff_ids` の要素と同じ値（#2017・OCI-1）。パス 1 の読み取りで計算する。
+    pub diff_id: Digest,
 }
 
 /// uid / gid の 1 行の写像（コンテナ内 `container_id` から `count` 個を host の `host_id` 以降へ）。
@@ -339,9 +347,11 @@ pub fn extract_layer_blob_with(
 ) -> Result<ExtractedLayer, OciError> {
     single(extract_stack(
         recorder,
-        [GzipBlob {
+        [BlobLayer {
             path: blob_path,
+            media_type: LayerMediaType::TarGzip,
             max_uncompressed_bytes,
+            expected_diff_id: None,
         }],
         root,
         limits,
@@ -445,9 +455,11 @@ pub fn extract_layer_blobs_with_policy(
 ) -> Result<Vec<ExtractedLayer>, OciError> {
     extract_stack(
         recorder,
-        blob_paths.iter().map(|path| GzipBlob {
+        blob_paths.iter().map(|path| BlobLayer {
             path,
+            media_type: LayerMediaType::TarGzip,
             max_uncompressed_bytes,
+            expected_diff_id: None,
         }),
         root,
         limits,
@@ -467,6 +479,11 @@ trait LayerSource {
 
     /// tar の先頭から読める状態の読み取り口を返す。
     fn open(&mut self) -> Result<Self::Reader<'_>, OciError>;
+
+    /// 展開後 tar の sha256 として期待する値（image config の `rootfs.diff_ids` の要素）。`None` なら突合しない。
+    fn expected_diff_id(&self) -> Option<&Digest> {
+        None
+    }
 }
 
 /// `Read + Seek` のストリームを、最初に `open` された時点の位置へ戻して読み直す `LayerSource`。
@@ -510,21 +527,196 @@ impl<R: Read + Seek> LayerSource for Rewind<R> {
     }
 }
 
-/// digest 検証済みの圧縮レイヤー blob を、走査のたびに開き直して gzip 展開する `LayerSource`。
-struct GzipBlob<'p> {
-    path: &'p Path,
-    max_uncompressed_bytes: u64,
+/// `BlobLayer` の読み取り口。`mediaType` に応じて gzip 展開か素通しかが決まる。
+enum LayerReader {
+    Gzip(Box<GzipLayerReader<File>>),
+    Plain(PlainLayerReader<File>),
 }
 
-impl LayerSource for GzipBlob<'_> {
+impl Read for LayerReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Gzip(r) => r.read(buf),
+            Self::Plain(r) => r.read(buf),
+        }
+    }
+}
+
+/// digest 検証済みのレイヤー blob を、走査のたびに開き直す `LayerSource`。
+///
+/// `media_type` が `TarGzip` なら gzip 展開、`Tar` なら素通し（どちらも `max_uncompressed_bytes` の上限つき）。
+/// `expected_diff_id` があれば、パス 1 で計算した展開後 tar の sha256 と突合する（#2017・OCI-1）。
+struct BlobLayer<'p> {
+    path: &'p Path,
+    media_type: LayerMediaType,
+    max_uncompressed_bytes: u64,
+    expected_diff_id: Option<Digest>,
+}
+
+impl LayerSource for BlobLayer<'_> {
     type Reader<'a>
-        = GzipLayerReader<File>
+        = LayerReader
     where
         Self: 'a;
 
-    fn open(&mut self) -> Result<GzipLayerReader<File>, OciError> {
-        open_gzip_layer(self.path, self.max_uncompressed_bytes)
+    fn open(&mut self) -> Result<LayerReader, OciError> {
+        match self.media_type {
+            LayerMediaType::TarGzip => open_gzip_layer(self.path, self.max_uncompressed_bytes)
+                .map(|r| LayerReader::Gzip(Box::new(r))),
+            LayerMediaType::Tar => {
+                open_plain_layer(self.path, self.max_uncompressed_bytes).map(LayerReader::Plain)
+            }
+        }
     }
+
+    fn expected_diff_id(&self) -> Option<&Digest> {
+        self.expected_diff_id.as_ref()
+    }
+}
+
+/// `extract_image_layers` に渡す 1 レイヤー分の記述（#2017・OCI-1）。
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct ImageLayer<'a> {
+    /// digest 検証済みの blob のパス。
+    pub path: &'a Path,
+    /// manifest の descriptor の `mediaType`。
+    pub media_type: &'a str,
+    /// image config の `rootfs.diff_ids` の対応する要素。
+    pub diff_id: &'a Digest,
+}
+
+impl<'a> ImageLayer<'a> {
+    /// blob のパス・`mediaType`・期待する diff_id から作る。
+    pub fn new(path: &'a Path, media_type: &'a str, diff_id: &'a Digest) -> Self {
+        Self {
+            path,
+            media_type,
+            diff_id,
+        }
+    }
+}
+
+/// 計装なしの `extract_image_layers_with`（`NoopOciOpRecorder`）。
+pub fn extract_image_layers(
+    layers: &[ImageLayer<'_>],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_image_layers_with(
+        &NoopOciOpRecorder,
+        layers,
+        root,
+        max_uncompressed_bytes,
+        limits,
+    )
+}
+
+/// `mediaType` で入口を選び、展開後 tar の sha256 を `rootfs.diff_ids` と突合しながら重ねて展開する（#2017・OCI-1）。
+///
+/// 手順は、(1) 全レイヤーの `mediaType` を I/O より前に検査する（未対応は `Unimplemented`。rootfs に触れない）、
+/// (2) 各レイヤーのパス 1 で計算した展開後 tar の sha256 を `diff_id` と突合する（不一致は `DataLoss`。そのレイヤーの
+/// 変更を始める前に止まるが、先行レイヤーの展開物は残るため、呼び出し側が `root` ごと破棄すること）。
+/// `layers` の件数と config の `diff_ids` の件数の照合は `image_layers_from` が行う
+/// （`diff_id` を 1 対 1 で渡すため、不一致は型の上で表現できない）。その他は `extract_layer_blobs_with` と同じ。
+pub fn extract_image_layers_with(
+    recorder: &dyn OciOpRecorder,
+    layers: &[ImageLayer<'_>],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_image_layers_with_policy(
+        recorder,
+        layers,
+        root,
+        max_uncompressed_bytes,
+        limits,
+        SpecialBitsPolicy::Strip,
+    )
+}
+
+/// `extract_image_layers_with` に通常ファイルの特殊ビットのポリシーを足した版（SEC-5・#1810）。
+pub fn extract_image_layers_with_policy(
+    recorder: &dyn OciOpRecorder,
+    layers: &[ImageLayer<'_>],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+    policy: SpecialBitsPolicy,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    let sources = layers
+        .iter()
+        .map(|l| {
+            Ok(BlobLayer {
+                path: l.path,
+                media_type: LayerMediaType::parse(l.media_type)?,
+                max_uncompressed_bytes,
+                expected_diff_id: Some(l.diff_id.clone()),
+            })
+        })
+        .collect::<Result<Vec<_>, OciError>>()?;
+    extract_stack(
+        recorder,
+        sources,
+        root,
+        limits,
+        host_lstat,
+        SpecialSetup::host(policy),
+    )
+}
+
+/// 件数の照合つきで `ImageLayer` の列を作る補助（#2017・OCI-1）。
+///
+/// manifest の `layers`・digest 検証済みの blob パス・config の `rootfs.diff_ids` の 3 者の件数が揃わなければ、
+/// どの I/O よりも前に `DataLoss` を返す。
+pub fn image_layers_from<'a>(
+    descriptors: &'a [crate::manifest::Descriptor],
+    blob_paths: &'a [&'a Path],
+    rootfs: &'a crate::config::ImageRootFs,
+) -> Result<Vec<ImageLayer<'a>>, OciError> {
+    let ids = rootfs.diff_ids();
+    if descriptors.len() != ids.len() || descriptors.len() != blob_paths.len() {
+        return Err(err(
+            OciErrorCode::DataLoss,
+            "layer count does not match rootfs.diff_ids",
+        ));
+    }
+    Ok(descriptors
+        .iter()
+        .zip(blob_paths)
+        .zip(ids)
+        .map(|((d, path), id)| ImageLayer::new(path, d.media_type.as_str(), id))
+        .collect())
+}
+
+/// 読んだバイトを sha256 へ通す読み取りアダプタ（パス 1 で展開後 tar の diff_id を計算する）。
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if let Some(read) = buf.get(..n) {
+            self.hasher.update(read);
+        }
+        Ok(n)
+    }
+}
+
+/// sha256 の出力を `Digest` へ変換する。
+fn digest_of(hasher: Sha256) -> Result<Digest, OciError> {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(71);
+    s.push_str("sha256:");
+    for b in hasher.finalize() {
+        // String への書き込みは失敗しない。
+        let _ = write!(s, "{b:02x}");
+    }
+    Digest::parse(&s)
 }
 
 /// 展開先 FS の名前解決（`lstat`）。既定は `fs::symlink_metadata`。
@@ -1894,14 +2086,18 @@ fn drain<R: Read>(src: &mut LimitedReader<R>) -> Result<(), OciError> {
 /// エントリ数（前のレイヤーまでの `x.entries` から数える）が `max_entries` を超えたら `ResourceExhausted`
 /// （集めるマーカーの件数もこれで頭打ちになる）。通常ファイルの宣言サイズの累積（`x.bytes` から数える）が
 /// `max_total_bytes` を超えても、本体を読み飛ばす前に `ResourceExhausted` にする。入力は `input_budget` バイト
-/// まで読む。戻り値のマーカーは並べ替え・重複除去済み。
+/// まで読む。戻り値のマーカーは並べ替え・重複除去済み。あわせて、EOF まで読んだ展開後 tar 全体の sha256
+/// （diff_id。#2017）を返す。
 fn collect_markers<R: Read>(
     x: &Extractor<'_>,
     src: R,
     input_budget: u64,
-) -> Result<Vec<Marker>, OciError> {
+) -> Result<(Vec<Marker>, Digest), OciError> {
     let mut src = LimitedReader {
-        inner: src,
+        inner: HashingReader {
+            inner: src,
+            hasher: Sha256::new(),
+        },
         read: 0,
         limit: input_budget,
     };
@@ -1942,7 +2138,7 @@ fn collect_markers<R: Read>(
     drain(&mut src)?;
     markers.sort_unstable();
     markers.dedup();
-    Ok(markers)
+    Ok((markers, digest_of(src.inner.hasher)?))
 }
 
 /// 1 レイヤー分の tar を `x` へ展開する。`input_budget` はこのレイヤーに残された入力バイト数の上限。
@@ -1959,7 +2155,16 @@ fn extract_one_layer<S: LayerSource>(
     let (entries0, bytes0, stripped0) = (x.entries, x.bytes, x.stripped_special);
     let preserved0 = x.preserved_special;
     let max_entries = x.limits.max_entries;
-    let markers = collect_markers(x, src.open()?, input_budget)?;
+    let (markers, diff_id) = collect_markers(x, src.open()?, input_budget)?;
+    // 突合はパス 2 の前に行う。不一致のレイヤーは rootfs を変更しない（#2017・OCI-1）。
+    if let Some(expected) = src.expected_diff_id()
+        && *expected != diff_id
+    {
+        return Err(err(
+            OciErrorCode::DataLoss,
+            "layer diff_id does not match the image config",
+        ));
+    }
     x.apply_markers(&markers)?;
     drop(markers);
     x.layer_nodes.clear();
@@ -2027,6 +2232,7 @@ fn extract_one_layer<S: LayerSource>(
                 decision: x.special.decision,
                 preserved_files: x.preserved_special.saturating_sub(preserved0),
             },
+            diff_id,
         },
         src.read,
     ))
@@ -2034,7 +2240,7 @@ fn extract_one_layer<S: LayerSource>(
 
 /// レイヤー列を `root` へ下位から順に重ねて展開する本体（単一レイヤー API もこれの 1 要素版）。
 ///
-/// 各要素は `LayerSource`（blob 版は gzip を開き直す `GzipBlob`、ストリーム版は位置を戻す `Rewind`）。
+/// 各要素は `LayerSource`（blob 版は gzip を開き直す `BlobLayer`、ストリーム版は位置を戻す `Rewind`）。
 /// `Extractor`（別表記の索引・遅延ディレクトリ mode・上限のカウンタ）は全レイヤーで共有し、上限は全体で
 /// 累積する。`lstat` はテストだけが差し替える（`Lstat` を参照）。
 fn extract_stack<S: LayerSource>(
@@ -3984,7 +4190,8 @@ mod tests {
 
     /// OCI-1: 同じレイヤーの中でのディレクトリ → 非ディレクトリの型の衝突は、従来どおり `FailedPrecondition`
     /// （置き換えるのは下位レイヤー由来のノードだけ）。経路として通った下位のディレクトリも同じレイヤーの
-    /// ノードとして扱い、配下に作った実体を消さない。
+    /// ノードとして扱い、配下に作った実体を消さない。image-spec は 1 つの changeset に同一パスの重複エントリを
+    /// 含めてはならないと定めるため、同一レイヤー内の型の衝突は不正な入力として拒否するのが正しい（#2017）。
     #[test]
     fn oci1_stack_same_layer_type_conflicts_are_rejected() {
         for upper in [

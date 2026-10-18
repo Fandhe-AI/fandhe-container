@@ -4,7 +4,7 @@
 //! 排他区間で行い、その間に参照テーブルを変える操作（create の参照登録・delete の参照解除・
 //! `image tag` のタグ登録・`image rm` の untag・pull のリース登録 / 公開 / 解放）を割り込ませない。
 //! 本モジュールはその区間を `ImageStore::lock` の RAII ガードとして提供する。
-//! 後続の #474・#475（pull）・#476（prune）・#479（tag）・#480 / #481（rm）・#853（create / delete）が使う。
+//! 後続の #474・#475（pull）・#476（prune）・#479（tag）・#480 / #481（rm）・#853（create / delete。入口は `register_container_ref` / `release_container_ref`）が使う。
 //!
 //! # 契約
 //!

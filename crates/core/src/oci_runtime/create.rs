@@ -28,7 +28,9 @@
 //!
 //! - プロセス起動（TASK-29.3 start）・namespace 分離・mount 適用（bind は start と本番 launcher が適用する〔#1915〕。bind 以外の種類は未対応）
 //! - mounts の rootfs 内 symlink 解決（mount を適用する側の担当）
-//! - OCI-7 の参照テーブル登録（TASK-183 が TASK-29 完了後に組み込む）
+//! - レイヤー展開（bundle は展開済みの前提。[`create_with_image`] の rootfs 検査の位置が将来の差し込み点）
+//! - OCI-7 の参照テーブル登録は [`create_with_image`] が担う（TASK-183.8.1）。bundle を直に指定する
+//!   [`create`] は参照を登録しない
 //! - ファイルベースの状態保存（TASK-31・OCI-5）
 //! - create 後に bundle の `config.json` が書き換えられる TOCTOU は、start（TASK-29.3）が
 //!   [`validate_bundle`] で再検証して対処する（ダイジェスト保持は `StateRecord` の拡張を要するため採らない）
@@ -38,6 +40,7 @@ use std::path::{Component, Path, PathBuf};
 
 use super::config::{OciConfig, OciConfigError, load_config};
 use super::error::{LifecycleOp, OciRuntimeError};
+use super::image_refs::{ContainerImage, ImageRefRegistration};
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, StateRecord, StateStore,
@@ -49,6 +52,10 @@ const CONFIG_FILE_NAME: &str = "config.json";
 
 /// [`OpRecorder`] に記録する操作名（REPAIR-4）。
 const CREATE_OP_NAME: &str = "create";
+
+/// 参照登録・登録の巻き戻しの操作名（REPAIR-4）。
+const IMAGE_REF_REGISTER_OP_NAME: &str = "image_ref_register";
+const IMAGE_REF_ROLLBACK_OP_NAME: &str = "image_ref_rollback";
 
 /// `config.json` を検証し、プロセス未起動の「created」状態を `store` に作る。
 ///
@@ -74,10 +81,89 @@ pub fn create(
 
 fn create_inner(store: &dyn StateStore, req: &CreateRequest) -> Result<StateRecord, TraitError> {
     validate_bundle(req.bundle())?;
+    create_state(store, req)
+}
 
+fn create_state(store: &dyn StateStore, req: &CreateRequest) -> Result<StateRecord, TraitError> {
     let status = ContainerStatus::created(req.id().clone(), None);
     let state_req = CreateStateRequest::new(status, req.bundle().to_path_buf())?;
     store.create(&state_req)
+}
+
+/// [`create`] に、OCI-7 のイメージ参照の登録を前置したもの（TASK-183.8.1・OCI-7）。
+///
+/// 処理順は「参照登録 → rootfs の使用（bundle の検証。将来のレイヤー展開もここ）→ `StateStore` の状態作成」。
+/// 参照を最初に登録するのは、GC（`image rm` / `image prune`）が使用中のレイヤーを消す窓を作らないため。
+/// 既存の [`create`] の挙動は変えない。
+///
+/// - `register` が [`ImageRefRegistration::AlreadyRegistered`] を返したら [`ErrorCode::AlreadyExists`] で拒否し、
+///   後始末はしない。自分が足した参照ではなく、並行する同じ ID の create の参照を外すと、そちらが
+///   参照なしで作られうるため
+/// - `register` のエラーはそのまま返し、状態は書かない（fail-closed）
+/// - bundle の検証が失敗したら参照を外す。`StateStore::create` が [`ErrorCode::AlreadyExists`] /
+///   [`ErrorCode::InvalidArgument`] で失敗したときも外す（状態が書かれていないと断定できるため）。
+///   `Internal`・`Timeout` 等の書き込みの有無が曖昧な失敗では参照を残す。残る方向はデータを余分に
+///   持つだけで安全側であり、起動時の照合（#854）が回収する
+/// - 後始末の失敗は元のエラーを優先して返し、操作名 `image_ref_rollback` で `recorder` に記録する（REPAIR-4）
+///
+/// 成功・失敗は操作名 `create` で記録する。登録は `image_ref_register` で記録する。
+pub fn create_with_image(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    image: ContainerImage<'_>,
+    req: &CreateRequest,
+) -> Result<StateRecord, OciRuntimeError> {
+    let to_err = |e: TraitError| OciRuntimeError::from_trait_error(LifecycleOp::Create, e);
+    let name = OpName::new(CREATE_OP_NAME).map_err(to_err)?;
+    recorder.record_op(&name, || {
+        create_with_image_inner(store, recorder, image, req).map_err(to_err)
+    })
+}
+
+fn create_with_image_inner(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    image: ContainerImage<'_>,
+    req: &CreateRequest,
+) -> Result<StateRecord, TraitError> {
+    let register_name = OpName::new(IMAGE_REF_REGISTER_OP_NAME)?;
+    let registration = recorder.record_op(&register_name, || {
+        image.refs().register(req.id(), image.manifest())
+    })?;
+    match registration {
+        ImageRefRegistration::Registered => {}
+        ImageRefRegistration::AlreadyRegistered => {
+            return Err(TraitError::new(
+                ErrorCode::AlreadyExists,
+                "container id already holds an image reference",
+            ));
+        }
+    }
+    // OCI-7: 参照登録の後・状態作成の前。将来のレイヤー展開（未実装）はこの検証の前後に入る。
+    if let Err(e) = validate_bundle(req.bundle()) {
+        rollback_image_ref(recorder, image, req);
+        return Err(e);
+    }
+    match create_state(store, req) {
+        Ok(record) => Ok(record),
+        Err(e) => {
+            // 状態が書かれていないと断定できる失敗だけ参照を外す。
+            if matches!(
+                e.code(),
+                ErrorCode::AlreadyExists | ErrorCode::InvalidArgument
+            ) {
+                rollback_image_ref(recorder, image, req);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// 登録した参照を外す。失敗は握りつぶさず `image_ref_rollback` として記録し、元のエラーを優先させる。
+fn rollback_image_ref(recorder: &OpRecorder, image: ContainerImage<'_>, req: &CreateRequest) {
+    if let Ok(name) = OpName::new(IMAGE_REF_ROLLBACK_OP_NAME) {
+        let _ = recorder.record_op(&name, || image.refs().release(req.id()));
+    }
 }
 
 /// bundle の `config.json` を読み込み、起動可能な設定であることを検証する。
@@ -534,6 +620,194 @@ mod tests {
         assert_eq!(err.op(), LifecycleOp::Create);
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert_eq!(err.exit_code().get(), 3);
+        let stats = rec
+            .snapshot_op(&OpName::new("create").expect("name"))
+            .expect("recorded");
+        assert_eq!(stats.failure(), 1);
+    }
+
+    // ---- OCI-7 イメージ参照の登録（TASK-183.8.1）----
+
+    use crate::oci_runtime::{
+        ContainerImageRefs, ImageManifestDigest, ImageRefRegistration, ImageRefRelease,
+    };
+    use std::sync::Arc;
+
+    const MANIFEST: &str =
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    type Log = Arc<Mutex<Vec<&'static str>>>;
+
+    fn push(log: &Log, entry: &'static str) {
+        log.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+    }
+
+    fn log_of(log: &Log) -> Vec<&'static str> {
+        log.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 呼び出し順を記録するテスト用 `StateStore`（`create` の結果を差し替えられる）。
+    struct LoggingStore {
+        inner: MemStateStore,
+        log: Log,
+        create_error: Option<ErrorCode>,
+    }
+
+    impl StateStore for LoggingStore {
+        fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+            push(&self.log, "store.create");
+            if let Some(code) = self.create_error {
+                return Err(TraitError::new(code, "injected"));
+            }
+            self.inner.create(req)
+        }
+        fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+            self.inner.update(req)
+        }
+        fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+            self.inner.get(req)
+        }
+        fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError> {
+            self.inner.list(req)
+        }
+        fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+            self.inner.delete(req)
+        }
+    }
+
+    /// 呼び出し順を記録するテスト用 `ContainerImageRefs`。`register` は bundle の rootfs を作れる。
+    struct LoggingRefs {
+        log: Log,
+        register_result: Result<ImageRefRegistration, TraitError>,
+        create_rootfs_in: Option<PathBuf>,
+    }
+
+    impl ContainerImageRefs for LoggingRefs {
+        fn register(
+            &self,
+            _id: &ContainerId,
+            _manifest: &ImageManifestDigest,
+        ) -> Result<ImageRefRegistration, TraitError> {
+            push(&self.log, "refs.register");
+            if let Some(bundle) = &self.create_rootfs_in {
+                std::fs::create_dir(bundle.join("rootfs")).expect("rootfs");
+            }
+            self.register_result.clone()
+        }
+        fn release(&self, _id: &ContainerId) -> Result<ImageRefRelease, TraitError> {
+            push(&self.log, "refs.release");
+            Ok(ImageRefRelease::Released)
+        }
+    }
+
+    fn fixture(
+        create_error: Option<ErrorCode>,
+        register_result: Result<ImageRefRegistration, TraitError>,
+        rootfs_by_register: Option<&Bundle>,
+    ) -> (LoggingStore, LoggingRefs, Log) {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let store = LoggingStore {
+            inner: MemStateStore::new(),
+            log: Arc::clone(&log),
+            create_error,
+        };
+        let refs = LoggingRefs {
+            log: Arc::clone(&log),
+            register_result,
+            create_rootfs_in: rootfs_by_register.map(|b| b.dir.clone()),
+        };
+        (store, refs, log)
+    }
+
+    fn run_with_image(
+        store: &LoggingStore,
+        refs: &LoggingRefs,
+        rec: &OpRecorder,
+        b: &Bundle,
+    ) -> Result<StateRecord, OciRuntimeError> {
+        let manifest = ImageManifestDigest::new(MANIFEST).expect("digest");
+        create_with_image(
+            store,
+            rec,
+            ContainerImage::new(refs, &manifest),
+            &b.request("c1"),
+        )
+    }
+
+    /// OCI-7: 参照登録 → rootfs の使用 → 状態作成の順。登録が rootfs を作る替え玉で、登録が先であることを観測する。
+    #[test]
+    fn oci7_create_registers_before_rootfs_use_and_state_create() {
+        let b = Bundle::new("oci7-order");
+        b.write_config(&valid_config());
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), Some(&b));
+        let record = run_with_image(&store, &refs, &OpRecorder::new(), &b).expect("create");
+        assert_eq!(record.status().state(), ContainerState::Created);
+        assert_eq!(log_of(&log), vec!["refs.register", "store.create"]);
+    }
+
+    /// OCI-7: 登録が失敗したら状態は作らず、エラーはそのまま返る。
+    #[test]
+    fn oci7_create_register_failure_writes_no_state() {
+        let b = ready_bundle("oci7-regfail");
+        let (store, refs, log) =
+            fixture(None, Err(TraitError::new(ErrorCode::Timeout, "lock")), None);
+        let err = run_with_image(&store, &refs, &OpRecorder::new(), &b).expect_err("fail");
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert_eq!(log_of(&log), vec!["refs.register"]);
+        assert_eq!(store.inner.len(), 0);
+    }
+
+    /// OCI-7: 既に登録済みの ID は AlreadyExists で拒否し、他者の参照を外さない。
+    #[test]
+    fn oci7_create_already_registered_is_rejected_without_rollback() {
+        let b = ready_bundle("oci7-already");
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::AlreadyRegistered), None);
+        let err = run_with_image(&store, &refs, &OpRecorder::new(), &b).expect_err("reject");
+        assert_eq!(err.code(), ErrorCode::AlreadyExists);
+        assert_eq!(log_of(&log), vec!["refs.register"]);
+    }
+
+    /// OCI-7: bundle の検証失敗では参照を外し、状態は作らない。
+    #[test]
+    fn oci7_create_rolls_back_on_bundle_validation_failure() {
+        let b = Bundle::new("oci7-badbundle");
+        b.write_config(&valid_config());
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        let err = run_with_image(&store, &refs, &OpRecorder::new(), &b).expect_err("no rootfs");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(log_of(&log), vec!["refs.register", "refs.release"]);
+    }
+
+    /// OCI-7: 状態作成が AlreadyExists で失敗したら参照を外す。
+    #[test]
+    fn oci7_create_rolls_back_on_state_already_exists() {
+        let b = ready_bundle("oci7-stateexists");
+        let (store, refs, log) = fixture(
+            Some(ErrorCode::AlreadyExists),
+            Ok(ImageRefRegistration::Registered),
+            None,
+        );
+        let err = run_with_image(&store, &refs, &OpRecorder::new(), &b).expect_err("exists");
+        assert_eq!(err.code(), ErrorCode::AlreadyExists);
+        assert_eq!(
+            log_of(&log),
+            vec!["refs.register", "store.create", "refs.release"]
+        );
+    }
+
+    /// OCI-7: 書き込みの有無が曖昧な状態作成の失敗（Internal）では参照を残す（安全側）。
+    #[test]
+    fn oci7_create_keeps_ref_on_ambiguous_state_error() {
+        let b = ready_bundle("oci7-ambiguous");
+        let (store, refs, log) = fixture(
+            Some(ErrorCode::Internal),
+            Ok(ImageRefRegistration::Registered),
+            None,
+        );
+        let rec = OpRecorder::new();
+        let err = run_with_image(&store, &refs, &rec, &b).expect_err("internal");
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert_eq!(log_of(&log), vec!["refs.register", "store.create"]);
         let stats = rec
             .snapshot_op(&OpName::new("create").expect("name"))
             .expect("recorded");

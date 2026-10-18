@@ -48,6 +48,13 @@
 //! 許可リスト方式への発展（TASK-128・GPU-3）は扱わない。
 //! 監査ログ連携のうち拒否報告からレコードを作るフックは `audit_log`（TASK-41.2・SEC-4）にある。
 //! ただし `ERRNO(EPERM)` も `KILL_PROCESS` もユーザー空間へ報告しないため、ERRNO 側の配送経路は未実装。
+//! ERRNO 側 40 件を `SECCOMP_RET_USER_NOTIF` で返すフィルタは [`build_deny_filter_with`] /
+//! [`build_filter_for_target_arch_with`]（[`ErrnoDelivery::UserNotif`]）で構築できる（#2023・SEC-4。
+//! 方式は `docs/design/audit-delivery.md` 4 章・#2018）。ただし本番の適用経路（`exec/seccomp.rs`）は
+//! 従来どおり ERRNO 版のままで、listener fd の取得・受け渡しは #2024、listener ループと `-EPERM` 応答は
+//! #2025 が担う。listener 無しで USER_NOTIF 版を載せると 40 件は `EPERM` ではなく `ENOSYS` になり
+//! （syscall は実行されず拒否は維持される）、ESC-03 の期待と食い違うため、配線前は本番に載せない。
+//! 応答側は `SECCOMP_USER_NOTIF_FLAG_CONTINUE` を使ってはならない（許可に化けるため。#2025 への契約）。
 //! `KILL_PROCESS` 側の正の記録はカーネルの `AUDIT_SECCOMP` が出す（`actions_logged` に `kill_process` が
 //! ある限り記録され、`FILTER_FLAG_LOG` は不要。外部の読み手が要る。`docs/design/audit-delivery.md`・#2004）。
 //! fandhe は本番 launcher の回収点で、SIGSYS 終了の補助記録（層 `exit_signal`。syscall は持たない）を出す。
@@ -96,6 +103,21 @@ pub enum DenyAction {
     Errno,
     /// `SECCOMP_RET_KILL_PROCESS`: SIGSYS でプロセスごと強制終了する（捕捉不可・戻らない）。
     KillProcess,
+    /// `SECCOMP_RET_USER_NOTIF`（Linux 5.0 以降）: 付属の listener へ転送し、listener が `-EPERM` で応答する
+    /// 前提（SEC-4。#2023・`docs/design/audit-delivery.md` 4 章）。listener が無い・fd が閉じられたときは
+    /// カーネルが `ENOSYS` を返し、syscall は実行されない。優先順位は ERRNO より低く ALLOW より高い。
+    UserNotif,
+}
+
+/// 拒否方針が `Errno` の syscall のフィルタ上の届け方（SEC-4・CORE-5。#2023）。真偽値にせず型で選ぶ。
+///
+/// `KillProcess` の 3 件と arch 不一致・x32 の `KILL_PROCESS` はどちらでも変わらない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrnoDelivery {
+    /// 従来どおり `ERRNO(EPERM)` を返す（本番の既定）。
+    Errno,
+    /// ERRNO 側を `SECCOMP_RET_USER_NOTIF` に置き換える（listener の配線は #2024・#2025）。
+    UserNotif,
 }
 
 impl DenyAction {
@@ -104,6 +126,7 @@ impl DenyAction {
         match self {
             DenyAction::Errno => SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA),
             DenyAction::KillProcess => SECCOMP_RET_KILL_PROCESS,
+            DenyAction::UserNotif => SECCOMP_RET_USER_NOTIF,
         }
     }
 }
@@ -296,6 +319,17 @@ impl DeniedSyscall {
             | DeniedSyscall::OpenByHandleAt
             | DeniedSyscall::Iopl
             | DeniedSyscall::Ioperm => DenyAction::Errno,
+        }
+    }
+
+    /// フィルタに載せる動作。方針（[`Self::deny_action`]）は変えず、`Errno` 側だけ `delivery` で写す
+    /// （SEC-4・#2023）。`KillProcess` はどちらでも `KillProcess`。
+    pub const fn filter_action(self, delivery: ErrnoDelivery) -> DenyAction {
+        match (self.deny_action(), delivery) {
+            (DenyAction::KillProcess, _) => DenyAction::KillProcess,
+            (DenyAction::Errno, ErrnoDelivery::Errno) => DenyAction::Errno,
+            (DenyAction::Errno, ErrnoDelivery::UserNotif) => DenyAction::UserNotif,
+            (DenyAction::UserNotif, _) => DenyAction::UserNotif,
         }
     }
 
@@ -492,6 +526,8 @@ const BPF_MAXINSNS: usize = 4096;
 const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
 /// `SECCOMP_RET_ERRNO`（同上）。
 const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+/// `SECCOMP_RET_USER_NOTIF`（同上。Linux 5.0 以降）。
+const SECCOMP_RET_USER_NOTIF: u32 = 0x7fc0_0000;
 /// `SECCOMP_RET_ALLOW`（同上）。
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 /// `SECCOMP_RET_DATA`（同上）。
@@ -644,6 +680,17 @@ impl std::error::Error for SeccompBuildError {}
 ///
 /// 命令数は checked 演算で事前計算し、上限検証してから確保する。
 pub fn build_deny_filter(table: &ArchSyscallTable) -> Result<SeccompProgram, SeccompBuildError> {
+    build_deny_filter_with(table, ErrnoDelivery::Errno)
+}
+
+/// [`build_deny_filter`] の本体。ERRNO 側の届け方だけ `delivery` で選ぶ（SEC-4・#2023）。
+///
+/// arch 検査・x32 拒否・`KILL_PROCESS` の 3 件・末尾の `ALLOW` と命令数は `delivery` に依らず同一で、
+/// `UserNotif` では ERRNO 側の `RET` の値だけが `SECCOMP_RET_USER_NOTIF` に変わる。
+pub fn build_deny_filter_with(
+    table: &ArchSyscallTable,
+    delivery: ErrnoDelivery,
+) -> Result<SeccompProgram, SeccompBuildError> {
     let audit_arch = table.audit_arch().get();
     let is_x86_64 = audit_arch == AUDIT_ARCH_X86_64_VALUE;
     let entries = table.entries();
@@ -698,7 +745,7 @@ pub fn build_deny_filter(table: &ArchSyscallTable) -> Result<SeccompProgram, Sec
         ));
         p.push(BpfInstruction::stmt(
             BPF_RET | BPF_K,
-            d.deny_action().ret_value(),
+            d.filter_action(delivery).ret_value(),
         ));
     }
     p.push(BpfInstruction::stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
@@ -707,7 +754,14 @@ pub fn build_deny_filter(table: &ArchSyscallTable) -> Result<SeccompProgram, Sec
 
 /// ビルド対象アーキのテーブルから BPF を構築する。対応外アーキは `Err(UnsupportedArch)`（fail-closed）。
 pub fn build_filter_for_target_arch() -> Result<SeccompProgram, SeccompBuildError> {
-    build_deny_filter(table_for_target_arch()?)
+    build_filter_for_target_arch_with(ErrnoDelivery::Errno)
+}
+
+/// [`build_filter_for_target_arch`] の届け方指定版（SEC-4・#2023）。対応外アーキは `Err(UnsupportedArch)`。
+pub fn build_filter_for_target_arch_with(
+    delivery: ErrnoDelivery,
+) -> Result<SeccompProgram, SeccompBuildError> {
+    build_deny_filter_with(table_for_target_arch()?, delivery)
 }
 
 /// x86_64 の番号（出典: `arch/x86/entry/syscalls/syscall_64.tbl`。`AUDIT_ARCH_X86_64` = EM_X86_64(62) | 64BIT | LE）。
@@ -1116,6 +1170,7 @@ mod bpf_tests {
     const KILL: u32 = 0x8000_0000;
     const ERRNO_EPERM: u32 = 0x0005_0001;
     const ALLOW: u32 = 0x7fff_0000;
+    const USER_NOTIF: u32 = 0x7fc0_0000;
 
     fn leak_table(audit: u32, nrs: &[u32]) -> &'static ArchSyscallTable {
         let entries: Vec<(DeniedSyscall, SyscallNr)> = nrs
@@ -1253,6 +1308,176 @@ mod bpf_tests {
         }
         assert_eq!(eval(&pa, 97, 0xC000_003E), KILL);
         assert_eq!(eval(&pa, 0x4000_0000 | 97, 0xC000_00B7), ALLOW);
+    }
+
+    /// SEC-4: `UserNotif` の戻り値と既存 variant の値。
+    #[test]
+    fn sec4_user_notif_ret_value() {
+        assert_eq!(DenyAction::UserNotif.ret_value(), 0x7fc0_0000);
+        assert_eq!(DenyAction::Errno.ret_value(), 0x0005_0001);
+        assert_eq!(DenyAction::KillProcess.ret_value(), 0x8000_0000);
+    }
+
+    /// SEC-4: 43 件のうち 40 件が USER_NOTIF、3 件が KILL_PROCESS。`Errno` 指定は方針と一致。
+    #[test]
+    fn sec4_filter_action_table() {
+        let un = DeniedSyscall::ALL
+            .iter()
+            .filter(|d| d.filter_action(ErrnoDelivery::UserNotif) == DenyAction::UserNotif)
+            .count();
+        assert_eq!(un, 40);
+        let kills: Vec<&str> = DeniedSyscall::ALL
+            .iter()
+            .filter(|d| d.filter_action(ErrnoDelivery::UserNotif) == DenyAction::KillProcess)
+            .map(|d| d.name())
+            .collect();
+        assert_eq!(kills, ["unshare", "ptrace", "kexec_load"]);
+        for d in [
+            DeniedSyscall::Mount,
+            DeniedSyscall::PivotRoot,
+            DeniedSyscall::Umount2,
+            DeniedSyscall::KexecFileLoad,
+        ] {
+            assert_eq!(
+                d.filter_action(ErrnoDelivery::UserNotif),
+                DenyAction::UserNotif
+            );
+        }
+        for d in DeniedSyscall::ALL {
+            assert_eq!(d.filter_action(ErrnoDelivery::Errno), d.deny_action());
+        }
+    }
+
+    /// SEC-4: x86_64 の USER_NOTIF 版の形（命令数は 93 のまま）。
+    #[test]
+    fn sec4_user_notif_x86_64_shape() {
+        let p = build_deny_filter_with(x86(), ErrnoDelivery::UserNotif).unwrap();
+        assert_eq!(p.len(), 93);
+        let i = p.instructions();
+        let t = |x: &BpfInstruction| (x.code(), x.jt(), x.jf(), x.k());
+        assert_eq!(t(&i[0]), (0x20, 0, 0, 4));
+        assert_eq!(t(&i[1]), (0x15, 1, 0, 0xC000_003E));
+        assert_eq!(t(&i[2]), (0x06, 0, 0, KILL));
+        assert_eq!(t(&i[3]), (0x20, 0, 0, 0));
+        assert_eq!(t(&i[4]), (0x45, 0, 1, 0x4000_0000));
+        assert_eq!(t(&i[5]), (0x06, 0, 0, KILL));
+        assert_eq!(t(&i[6]), (0x15, 0, 1, 272));
+        assert_eq!(t(&i[7]), (0x06, 0, 0, KILL));
+        assert_eq!(t(&i[8]), (0x15, 0, 1, 308));
+        assert_eq!(t(&i[9]), (0x06, 0, 0, USER_NOTIF));
+        assert_eq!(t(&i[92]), (0x06, 0, 0, ALLOW));
+    }
+
+    /// SEC-4: aarch64 の USER_NOTIF 版の形（命令数は 87 のまま）。
+    #[test]
+    fn sec4_user_notif_aarch64_shape() {
+        let p = build_deny_filter_with(aarch(), ErrnoDelivery::UserNotif).unwrap();
+        assert_eq!(p.len(), 87);
+        assert!(p.instructions().iter().all(|i| i.code() != 0x45));
+        let last = p.instructions().last().unwrap();
+        assert_eq!((last.code(), last.k()), (0x06, ALLOW));
+    }
+
+    /// SEC-4: Errno 版との差は ERRNO(EPERM) の RET が USER_NOTIF になる位置だけ。
+    #[test]
+    fn sec4_user_notif_differs_only_in_errno_returns() {
+        for (t, want) in [(x86(), 40usize), (aarch(), 38usize)] {
+            let e = build_deny_filter_with(t, ErrnoDelivery::Errno).unwrap();
+            let u = build_deny_filter_with(t, ErrnoDelivery::UserNotif).unwrap();
+            assert_eq!(e.len(), u.len());
+            let mut diff = 0;
+            for (a, b) in e.instructions().iter().zip(u.instructions()) {
+                if (a.code(), a.jt(), a.jf(), a.k()) == (b.code(), b.jt(), b.jf(), b.k()) {
+                    continue;
+                }
+                assert_eq!((a.code(), a.k()), (0x06, ERRNO_EPERM));
+                assert_eq!((b.code(), b.k()), (0x06, USER_NOTIF));
+                diff += 1;
+            }
+            assert_eq!(diff, want);
+            assert!(!u.instructions().iter().any(|i| i.k() == ERRNO_EPERM));
+            assert!(!e.instructions().iter().any(|i| i.k() == USER_NOTIF));
+        }
+    }
+
+    /// SEC-4・ESC-06: USER_NOTIF 版の評価結果。KILL の 3 件と arch 不一致・x32 は不変。
+    #[test]
+    fn sec4_user_notif_evaluation() {
+        let px = build_deny_filter_with(x86(), ErrnoDelivery::UserNotif).unwrap();
+        for n in X86_NRS {
+            let want = if X86_KILL_NRS.contains(&n) {
+                KILL
+            } else {
+                USER_NOTIF
+            };
+            assert_eq!(eval(&px, n, 0xC000_003E), want, "nr {n}");
+        }
+        for n in X86_RUNTIME {
+            assert_eq!(eval(&px, n, 0xC000_003E), ALLOW, "nr {n}");
+        }
+        assert_eq!(eval(&px, 272, 0xC000_00B7), KILL);
+        assert_eq!(eval(&px, 3, 0x4000_0003), KILL);
+        assert_eq!(eval(&px, 0x4000_0000 | 272, 0xC000_003E), KILL);
+        assert_eq!(eval(&px, 0x4000_0000, 0xC000_003E), KILL);
+        assert_eq!(eval(&px, 0xFFFF_FFFF, 0xC000_003E), KILL);
+
+        let pa = build_deny_filter_with(aarch(), ErrnoDelivery::UserNotif).unwrap();
+        for n in AARCH_NRS {
+            let want = if AARCH_KILL_NRS.contains(&n) {
+                KILL
+            } else {
+                USER_NOTIF
+            };
+            assert_eq!(eval(&pa, n, 0xC000_00B7), want, "nr {n}");
+        }
+        for n in AARCH_RUNTIME {
+            assert_eq!(eval(&pa, n, 0xC000_00B7), ALLOW, "nr {n}");
+        }
+        assert_eq!(eval(&pa, 97, 0xC000_003E), KILL);
+    }
+
+    /// SEC-4: USER_NOTIF 版でも KILL になる番号は 3 件のまま。
+    #[test]
+    fn sec4_user_notif_kill_numbers_unchanged() {
+        let kill_nrs = |t: &ArchSyscallTable| -> Vec<u32> {
+            let p = build_deny_filter_with(t, ErrnoDelivery::UserNotif).unwrap();
+            let mut v: Vec<u32> = t
+                .entries()
+                .iter()
+                .filter(|(_, n)| eval(&p, n.get(), t.audit_arch().get()) == KILL)
+                .map(|(_, n)| n.get())
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(kill_nrs(x86()), [101, 246, 272]);
+        assert_eq!(kill_nrs(aarch()), [97, 104, 117]);
+    }
+
+    /// SEC-4: `build_deny_filter` は `ErrnoDelivery::Errno` 版と同一（本番の挙動不変）。
+    #[test]
+    fn sec4_build_deny_filter_is_errno_delivery() {
+        for t in [x86(), aarch()] {
+            assert_eq!(
+                build_deny_filter(t).unwrap(),
+                build_deny_filter_with(t, ErrnoDelivery::Errno).unwrap()
+            );
+        }
+    }
+
+    /// SEC-4: ビルド対象アーキの USER_NOTIF 版の命令数。対応外アーキは `UnsupportedArch`。
+    #[test]
+    fn sec4_native_user_notif_len() {
+        let r = build_filter_for_target_arch_with(ErrnoDelivery::UserNotif);
+        #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+        assert_eq!(r.unwrap().len(), 93);
+        #[cfg(all(target_arch = "aarch64", target_pointer_width = "64"))]
+        assert_eq!(r.unwrap().len(), 87);
+        #[cfg(not(all(
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            target_pointer_width = "64"
+        )))]
+        assert!(r.is_err());
     }
 
     /// CORE-5・SEC-2・ESC-06・ESC-03: 拒否時の動作の表。強制終了は 3 件だけで `mount` 系は ERRNO。

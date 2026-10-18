@@ -13,8 +13,8 @@
 //!   それ以外で呼んでよいのは試験コードだけ。検証そのものは本型では行わない（呼び出し側の責務）。
 //!   依存方向（core -> plugin）を保つため、型は本 crate に置き、core 側の型は参照しない。
 //! - Linux: 保持した fd の実体を `/proc/self/fd/<N>` 経由で実行する。実行できない場合は
-//!   `FailedPrecondition` で失敗し、パスでの起動へ縮退しない（fail-closed）。fd は close-on-exec のまま
-//!   で、exec 後の plugin には残らない。plugin が見る `argv[0]` は実体の正規パス（`exec_path`）で、
+//!   `FailedPrecondition` で失敗し、パスでの起動へ縮退しない（fail-closed）。保持 fd は構築時に必ず
+//!   close-on-exec で複製し直す（呼び出し側の fd の状態に依らない）ため、exec 後の plugin には残らない。plugin が見る `argv[0]` は実体の正規パス（`exec_path`）で、
 //!   `/proc/<pid>/comm` は fd 番号になる。
 //! - Linux 以外の unix（macOS 等）: 実体の正規パス（`exec_path`）で起動する。起動直前の同一性確認
 //!   （dev / ino の比較）は未実装で（#1866・REPAIR-3）、それまでは検証から起動までに実体のパスを
@@ -134,17 +134,16 @@ impl PluginLaunchTarget {
                     "plugin launch target must be a native executable, not a script",
                 ));
             }
-            // fd 0〜2 は子の stdio の dup2 で上書きされ、別のファイルを実行しかねない。3 以上を保証する。
-            let file = if file.as_raw_fd() < 3 {
-                let dup = file.try_clone().map_err(|_| inspect_failed())?;
-                drop(file);
-                if dup.as_raw_fd() < 3 {
-                    return Err(inspect_failed());
-                }
-                dup
-            } else {
-                file
-            };
+            // 常に複製して保持する。`File::try_clone` は `fcntl(F_DUPFD_CLOEXEC, 3)` で複製するため、
+            // (1) 元 fd が close-on-exec 無しで渡されても保持 fd は必ず close-on-exec になり（exec 後の
+            // plugin に残らず、解釈系が `/proc/self/fd/N` を開き直す経路も作らない）、(2) fd 番号が 3 以上
+            // になる（0〜2 は子の stdio の dup2 で上書きされ別ファイルを実行しかねない）。元 fd は閉じる。
+            let dup = file.try_clone().map_err(|_| inspect_failed())?;
+            drop(file);
+            if dup.as_raw_fd() < 3 {
+                return Err(inspect_failed());
+            }
+            let file = dup;
             Ok(Self {
                 file: Arc::new(file),
                 display_path,
@@ -331,5 +330,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let e = r.unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::FailedPrecondition);
+    }
+
+    /// fd の flags に O_CLOEXEC が立っているか（/proc/self/fdinfo。unsafe を使わない）。
+    #[cfg(target_os = "linux")]
+    fn fd_is_cloexec(fd: i32) -> bool {
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}")).unwrap();
+        let flags = info
+            .lines()
+            .find_map(|l| l.strip_prefix("flags:"))
+            .unwrap()
+            .trim();
+        u32::from_str_radix(flags, 8).unwrap() & 0o2000000 != 0
+    }
+
+    /// PLUG-11: 保持 fd は close-on-exec（構築時に F_DUPFD_CLOEXEC で複製し直すため入力 fd の状態に依らない）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plug11_kept_fd_is_cloexec() {
+        use std::os::fd::AsRawFd;
+
+        let p = std::env::current_exe().unwrap();
+        let t =
+            PluginLaunchTarget::from_verified_file(File::open(&p).unwrap(), p.clone(), p).unwrap();
+        assert!(fd_is_cloexec(t.file().as_raw_fd()));
+    }
+
+    /// PLUG-11: exec した子に保持 fd が残らない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plug11_kept_fd_does_not_leak_into_exec_child() {
+        use std::os::fd::AsRawFd;
+
+        let t = exe_target();
+        let n = t.file().as_raw_fd();
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("test ! -e /proc/self/fd/{n}"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "kept fd {n} leaked into the exec child");
+    }
+
+    /// PLUG-11: 構築後に `#!` スクリプトへ書き換えられても、閉じた fd は解釈系から開けず実行されない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plug11_rewritten_to_script_is_not_run_via_proc_fd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("launch-target-rewrite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("plugin");
+        std::fs::copy("/bin/sh", &p).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let t =
+            PluginLaunchTarget::from_verified_file(File::open(&p).unwrap(), p.clone(), p.clone())
+                .unwrap();
+        let marker = dir.join("ran");
+        std::fs::write(&p, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        let exec = linux_fd_exec_path(&t, Path::new("/proc/self/fd")).unwrap();
+        let status = std::process::Command::new(&exec).status();
+        let ran = marker.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!ran, "rewritten script must not run through /proc/self/fd");
+        assert!(!matches!(status, Ok(s) if s.success()));
     }
 }

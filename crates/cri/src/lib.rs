@@ -2,6 +2,7 @@
 //!
 //! 雛形は TASK-1.3・REPAIR-1。現状の RPC 実装は `runtime_service` の `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・`PodSandboxStatus`・`ListPodSandbox`・`CreateContainer`・`StartContainer`・`StopContainer`・`RemoveContainer`（TASK-57.1〜57.3・58.1・58.2・CRI-1）と、`image_service` の `ListImages`・`ImageStatus`・`PullImage`（TASK-61.1・61.2・61.3・CRI-4。取り込み手順は `image_pull`）のみで、
 //! `ContainerRuntime` 呼び出しアダプタ `adapter` は TASK-59.1（CRI-2・CRI-7）で追加済み（ハンドラ接続は TASK-59.2・59.3）。
+//! 統一エラー型 `error`（ERR-3・TASK-97.1）を追加済みで、ハンドラへの適用は TASK-97.2。
 //! 他の RPC は `Unimplemented`、状態管理はメモリ上のスタブ（TASK-59 で置換。REPAIR-3）。
 //! RPC の結果と所要時間は `instrument` の記録先へ渡す（REPAIR-4。core の記録器への接続は plugin-cri。TASK-108）。
 //! 本体は G4（TASK-56〜63）で実装する。実行時は `fandhe-container-plugin-cri`（TASK-114）が
@@ -11,6 +12,7 @@
 //! 生成し、[`runtime::v1`] で取り込む（TASK-56.4・#427。型の整合は `tests/generated_build_check.rs` で照合）。RPC 本体は TASK-57 以降で順次実装する（未実装分はスタブ。REPAIR-3）。
 
 pub mod adapter;
+pub mod error;
 pub mod image_pull;
 pub mod image_service;
 pub mod instrument;

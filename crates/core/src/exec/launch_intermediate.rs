@@ -8,7 +8,7 @@
 //! 呼び出しプロセス C（`Threads: 1` の supervisor。child subreaper の証跡を持つ）は次の順で動く。
 //!
 //! ```text
-//! C --fork--> I(中間プロセス) : isolate(plan) -> fork -> PID 1(child_main) / 報告 pipe へ "K <pid>" -> _exit
+//! C --fork--> I(中間プロセス) : isolate(plan。範囲写像では mapper を fork し、応答まで待つ) -> fork -> PID 1(child_main) / 報告 pipe へ "K <pid>" -> _exit
 //! C : 報告 pipe を期限つきで読む -> adopt_reparented(pid) で PID 1 の pidfd を開く -> I を回収する
 //!   -> 状態 pipe(pivot 前段の結果)を読み、監査(C だけが sink に触る)・判定 -> 失敗なら PID 1 を kill_and_reap
 //! ```
@@ -43,11 +43,11 @@
 //! # 未実装・残余(REPAIR-3)
 //!
 //! - **報告前の PID 1(CORE-2)**: I が PID 1 を作った後、`K` の報告前に停止・終了すると C は pid を知れない。
-//!   I は fork の直前に起動ごとの識別子(`LaunchTag`)を `comm` へ設定し、PID 1 はそれを継承する。C は報告の
+//!   I は `isolate`(範囲写像の mapper の fork)の前に起動ごとの識別子(`LaunchTag`)を `comm` へ設定し、mapper と PID 1 はそれを継承する(期限切れで I だけが殺されても、再親付けされた mapper を同じ探索で回収する。mapper の子の helper〔`newuidmap` / `newgidmap`〕は exec で識別子を失うため、mapper は自分のセッションを作り、探索は識別子を持つプロセスを錨に「親が錨」か「セッション ID が錨」の子孫を列挙して先に kill・回収する。錨は子孫が居ないと確かめるまで回収しない)。C は報告の
 //!   無い失敗で I を SIGKILL して回収した後(PID 1 は C へ再親付け済み)、`/proc` から「親が C で `comm` が
 //!   識別子と一致する」子を探して `kill_and_reap` する(`recover_unreported_init`)。I を回収できない場合は
 //!   再親付けが起きないため探索せず、I を `unreaped` で返し、探索できなかった識別子を `rescans` で返す(呼び出し側が
-//!   起動予約を保持し、`confirm_no_process` が I の回収後に `rescan_unreported_init` で再探索する。#1817)。報告が `R`(失敗)の経路は PID 1 を作っていないため探索しない
+//!   起動予約を保持し、`confirm_no_process` が I の回収後に `rescan_unreported_init` で再探索する。#1817)。報告が `R`(失敗)の経路も、I が範囲写像の失敗で mapper を kill せずに残す(helper ごと C に回収させる)ため、I の回収後に同じ探索を行う(#2009)
 //! - **開始ゲート(CORE-2)**: PID 1 は C が `K` の pid を受領して pidfd を開き、1 行の許可を書くまで exec に進まない
 //!   (exec で `comm` の識別子が失われると、報告前の PID 1 を特定できなくなるため)。C が許可せず閉じる・期限
 //!   ([`START_GATE_TIMEOUT`])切れの PID 1 は exec せずに終了する
@@ -74,7 +74,10 @@ use super::process::{
     ChildStdio, ContainerChild, EXIT_SETUP_FAILED, Entrypoint, KILL_REAP_TIMEOUT, PrePivotSetup,
     PreparedLaunchFailure, child_main, exec_status_pipe, report_legacy_tiocsti_to,
 };
-use super::{ChildSubreaper, ExecError, IsolationPlan, IsolationStage, StagePipeline, isolate};
+use super::{
+    ChildSubreaper, ExecError, IsolationPlan, IsolationStage, StagePipeline,
+    SubordinateIsolationPlan, isolate, isolate_rootless_subordinate_no_flush,
+};
 
 /// 報告行の最大バイト数(LF を含む)。最長の行(`R FAILED_PRECONDITION isolate\n` 約 30 バイト)より大きい固定上限。
 pub(super) const REPORT_MAX_BYTES: usize = 48;
@@ -392,7 +395,7 @@ fn await_start_gate(gate_r: &std::fs::File, timeout: Duration) -> Result<(), Pre
 
 /// 本番の動作(既存の `isolate`・`child_main` への薄い委譲)。
 struct RealIntermediateOps<'a> {
-    plan: &'a IsolationPlan,
+    plan: IntermediatePlan<'a>,
     rootfs: &'a Path,
     entry: &'a Entrypoint,
     stages: Option<StagePipeline>,
@@ -405,7 +408,19 @@ struct RealIntermediateOps<'a> {
 
 impl IntermediateOps for RealIntermediateOps<'_> {
     fn isolate(&mut self) -> Result<(), ExecError> {
-        isolate(self.plan).map(|_| ())
+        // 範囲写像では mapper を I の子として fork する。mapper も識別子を継承させ、起動の期限切れで C が I だけを
+        // 殺した場合や、範囲写像の失敗で I が mapper を残して `R` を報告した場合に、再親付けされた mapper を
+        // `rescan_unreported_init` が見つけて helper ごと回収できるようにする(CORE-2)。設定できなければ mapper を
+        // 作らずに失敗させる(fail-closed)。
+        sys::set_process_comm(self.tag.comm_bytes())
+            .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "set the launch tag"))?;
+        match self.plan {
+            IntermediatePlan::SingleId(plan) => isolate(plan).map(|_| ()),
+            // mapper の fork は flush しない版(I は C の stdio バッファを複製した子。#2009)。
+            IntermediatePlan::Subordinate(plan) => {
+                isolate_rootless_subordinate_no_flush(plan).map(|_| ())
+            }
+        }
     }
 
     fn spawn_pid1(&mut self) -> Result<u32, ExecError> {
@@ -453,10 +468,19 @@ impl IntermediateOps for RealIntermediateOps<'_> {
     }
 }
 
+/// 中間プロセス I が `isolate` する分離計画(権限モデルごとの検証済み計画。借用)。
+#[derive(Clone, Copy)]
+pub(crate) enum IntermediatePlan<'a> {
+    /// 単一 ID 写像(`exec::plan`。`RootlessSingleId`)。
+    SingleId(&'a IsolationPlan),
+    /// subuid / subgid の範囲写像(`exec::plan_rootless_subordinate`。`RootlessSubordinateIds`。CORE-6・#2009)。
+    Subordinate(&'a SubordinateIsolationPlan),
+}
+
 /// [`spawn_container_via_intermediate`] へ渡す、fork 前に C が準備した値(借用)。
 pub(crate) struct IntermediateSpec<'a> {
-    /// 検証済みの分離計画(`exec::plan`。euid 0 の写像は計画の段階で拒否済み。SEC-5)。
-    pub(crate) plan: &'a IsolationPlan,
+    /// 検証済みの分離計画(euid 0 の写像は計画の段階で拒否済み。SEC-5)。
+    pub(crate) plan: IntermediatePlan<'a>,
     /// rootfs のパス(使用は `setup.pinned_rootfs` の固定 fd との照合を通る)。
     pub(crate) rootfs: &'a Path,
     /// exec するエントリポイント。
@@ -592,10 +616,18 @@ fn launch_via_intermediate(
         Ok(IntermediateReport::Pid1(pid)) => pid,
         Ok(IntermediateReport::Failed { code, phase }) => {
             let (stage, what) = phase.describe();
-            return Err(reap_intermediate_failure(
-                intermediate_child,
-                ExecError::new(code, stage, what),
-            ));
+            let mut failure =
+                reap_intermediate_failure(intermediate_child, ExecError::new(code, stage, what));
+            // `R` の経路でも、I が識別子を継承させた子(範囲写像の mapper とその helper)が残り得る。I は失敗時に
+            // mapper を kill しない(`isolate_rootless_subordinate_no_flush`)ため、I の回収後に C へ再親付けされた
+            // mapper を識別子で探して helper ごと回収する(CORE-2)。I を回収できていなければ再親付けが起きないので、
+            // 識別子を返して `confirm_no_process` の再探索に回す(#1817)。
+            if failure.unreaped.is_empty() {
+                recover_unreported_init(&mut failure, tag, subreaper);
+            } else {
+                failure.rescans.push(*tag);
+            }
+            return Err(failure);
         }
         Err(e) => {
             // 報告が無い中間プロセスは眠っている可能性があるため、待たずに殺して回収する。
@@ -784,15 +816,235 @@ pub(crate) fn rescan_unreported_init(
         }
         // 親が C の未回収の子(subreaper が再親付けした)なので、回収まで pid は解放されず、pidfd が開けなくても
         // `kill(2)` が別プロセスへ届くことはない。
-        let child = ContainerChild::adopt_reparented(pid, subreaper);
-        if let Err(e) = child.kill_and_reap(reap_timeout) {
+        reap_tagged(pid, subreaper, reap_timeout, me, &mut out);
+    }
+    out
+}
+
+/// 識別子を持つ C の子 `pid`(報告前の PID 1、または範囲写像の mapper)を、子孫(helper)ごと kill・回収する(CORE-2)。
+///
+/// mapper が起動する `newuidmap` / `newgidmap`(helper)は exec で `comm` が識別子でなくなるため、識別子では
+/// 見つからない。mapper は fork 直後に自分のセッション(ID = mapper の pid)を作る(`exec` の
+/// `isolate_rootless_subordinate_with`)ので、helper は「親が mapper」か「セッション ID が mapper の pid」で特定する。
+/// 後者は mapper が helper を残して終了し、helper が C へ再親付けされた後でも成り立つ。そのため mapper は、子孫が
+/// 居ないことを確かめるまで回収しない(未回収のゾンビが pid を保持し、セッション ID が別プロセスへ再利用されない。
+/// 帰属の錨)。手順は次のとおり。
+///
+/// 1. `SIGSTOP` を送り、`/proc` の state が停止(`T`)かゾンビ(`Z`)になるまで期限つきで待つ(以後 fork しない)。
+///    `SignalDelivery` を返す `send_signal` はゾンビをその場で回収してしまい錨を失うため使わない(未回収の子なので
+///    `kill(2)` が別プロセスへ届くことはない)
+/// 2. 子孫を列挙する。親が `pid` か C で、かつ(親が `pid` またはセッション ID が `pid`)のプロセスだけを対象とし、
+///    それ以外の親を持つ子孫(helper の子等。pid の安定を保証できない)が居れば列挙不完全とする
+/// 3. 停止を確かめられない・列挙不完全なら、`pid` も子孫も kill・回収せずに保持する(走査不完全。呼び出し側が
+///    識別子を `rescans` に残し、次の再探索が同じ錨から再び辿る。fail-closed)
+/// 4. 子孫を `SIGKILL` → `pid` を kill・回収 → C へ再親付けされた子孫を回収する
+fn reap_tagged(
+    pid: NonZeroU32,
+    subreaper: &ChildSubreaper,
+    reap_timeout: Duration,
+    me: u32,
+    out: &mut Rescan,
+) {
+    let halted = halt_and_confirm(pid.get(), reap_timeout);
+    // 子孫の列挙が不完全かを、この候補の分だけ判定する(他の候補で立った不完全フラグと区別する)。
+    let earlier_incomplete = std::mem::replace(&mut out.scan_incomplete, false);
+    let mut members = if halted {
+        descendants_of(pid.get(), me, out)
+    } else {
+        note_scan_failure(
+            out,
+            "cannot confirm a tagged process stopped or exited before listing its descendants",
+        );
+        Vec::new()
+    };
+    let enumeration_incomplete = out.scan_incomplete;
+    out.scan_incomplete |= earlier_incomplete;
+    if must_retain_tagged(halted, enumeration_incomplete) {
+        // 列挙を完了できていない間は kill・回収しない。殺すと未列挙の helper が C へ再親付けされ、回収すると錨の
+        // pid(セッション ID)が解放されて helper の帰属を失い、次の `confirm_no_process` が Clean に進む(CORE-2)。
+        // ハンドルは `unreaped`(後で無条件に kill・回収される通常の未回収ハンドル)へ入れない。捨てても対象は
+        // 停止中(またはゾンビ)のまま残り、`scan_incomplete` により呼び出し側が識別子を `rescans` に残すので、次の
+        // 再探索が識別子で再び見つけ、列挙を完了してから回収する。
+        if out.error.is_none() {
+            out.error = Some(ExecError::new(
+                ErrorCode::Internal,
+                IsolationStage::Wait,
+                "kept a tagged process because its descendants could not be fully listed",
+            ));
+        }
+        return;
+    }
+    for member in &members {
+        // 子孫は停止(またはゾンビ)の錨か C の未回収の子なので、回収されるまで pid は再利用されない。
+        let _ = sys::kill_pid(member.get(), sys::Signal::Kill);
+    }
+    // SIGKILL は送達と終了が同時でないため、列挙の後・終了の前に fork された子孫を取りこぼし得る。全員がゾンビに
+    // なった(以後 fork できない)ことを確かめてから列挙し直し、増えていれば保持する(上と同じ理由。fail-closed)。
+    if !settled_after_kill(pid.get(), &members, me, reap_timeout) {
+        out.scan_incomplete = true;
+        if out.error.is_none() {
+            out.error = Some(ExecError::new(
+                ErrorCode::Internal,
+                IsolationStage::Wait,
+                "kept a tagged process because its descendants did not settle after SIGKILL",
+            ));
+        }
+        return;
+    }
+    let child = ContainerChild::adopt_reparented(pid, subreaper);
+    if let Err(e) = child.kill_and_reap(reap_timeout) {
+        if out.error.is_none() {
+            out.error = Some(e);
+        }
+        out.unreaped.push(child);
+    }
+    // 錨の死(または回収)で C(subreaper)へ再親付けされた子孫を回収する。
+    for member in members.drain(..) {
+        let reparented = ContainerChild::adopt_reparented(member, subreaper);
+        if let Err(e) = reparented.kill_and_reap(reap_timeout) {
             if out.error.is_none() {
                 out.error = Some(e);
             }
-            out.unreaped.push(child);
+            out.unreaped.push(reparented);
         }
     }
-    out
+}
+
+/// `SIGKILL` を送った子孫 `members` が期限内に全員ゾンビになり、列挙し直しても子孫が増えていないか(CORE-2・REPAIR-5)。
+///
+/// `members` は錨か C の未回収の子なので、回収されるまで `/proc` から消えない(消えた・読めないは `false`)。
+fn settled_after_kill(anchor: u32, members: &[NonZeroU32], me: u32, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout.min(Duration::from_secs(2));
+    for member in members {
+        let path = Path::new("/proc")
+            .join(member.get().to_string())
+            .join("stat");
+        loop {
+            match read_proc_text(&path) {
+                Ok(Some(stat)) if proc_state_of(&stat) == Some('Z') => break,
+                Ok(Some(stat)) if proc_state_of(&stat).is_some() => {}
+                _ => return false,
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    let mut again = Rescan::default();
+    let relisted = descendants_of(anchor, me, &mut again);
+    !again.scan_incomplete && relisted.iter().all(|p| members.contains(p))
+}
+
+/// 識別子つきの子を kill・回収せず保持すべきか。停止(またはゾンビ化)を確認できない、または子孫の列挙が不完全な
+/// ときは、未列挙の helper の帰属を失わないよう保持する(CORE-2)。
+fn must_retain_tagged(halted: bool, enumeration_incomplete: bool) -> bool {
+    !halted || enumeration_incomplete
+}
+
+/// 未回収の子 `pid` へ `SIGSTOP` を送り、`/proc/<pid>/stat` の state が停止(`T` / `t`)かゾンビ(`Z`)になるまで
+/// 期限つきで待つ(REPAIR-5)。どちらかを確認できたときだけ `true`(SIGSTOP は送達が停止完了を意味しない。CORE-2)。
+///
+/// ゾンビは回収しない(呼び出し側が子孫の帰属の錨として使う)。`ESRCH`(契約外の回収者が回収済み)・読み取り失敗・
+/// 期限切れは `false`。
+fn halt_and_confirm(pid: u32, timeout: Duration) -> bool {
+    let Some(stop) = std::num::NonZeroU8::new(SIGSTOP_NUMBER) else {
+        return false;
+    };
+    // `pid` は親が C の未回収の子(呼び出し側で確認済み)なので、回収まで pid は再利用されない。ゾンビへの
+    // `kill(2)` は成功するが効かない(下の state で判定する)。
+    if sys::kill_pid(pid, sys::Signal::Number(stop)).is_err() {
+        return false;
+    }
+    let path = Path::new("/proc").join(pid.to_string()).join("stat");
+    let deadline = std::time::Instant::now() + timeout.min(Duration::from_secs(2));
+    loop {
+        match read_proc_text(&path) {
+            Ok(Some(stat)) => match proc_state_of(&stat) {
+                Some('T' | 't' | 'Z') => return true,
+                Some(_) => {}
+                None => return false,
+            },
+            _ => return false,
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// `/proc/<pid>/stat` の state 文字(`comm` の括弧の後の最初のフィールド)。
+fn proc_state_of(stat: &str) -> Option<char> {
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    rest.trim_start().chars().next()
+}
+
+/// `SIGSTOP` の番号(x86_64 / aarch64 共通の asm-generic。`sys::Signal::Number` と同じ前提)。
+const SIGSTOP_NUMBER: u8 = 19;
+
+/// `/proc/<pid>/stat` の親 pid とセッション ID(`comm` の括弧の後の state ppid pgrp session の 2 番目と 4 番目)。
+fn parent_and_session_of(stat: &str) -> Option<(u32, u32)> {
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    let parent = fields.nth(1)?.parse().ok()?;
+    let session = fields.nth(1)?.parse().ok()?;
+    Some((parent, session))
+}
+
+/// 錨 `anchor`(識別子つきの C の子)の子孫を `/proc` から列挙する(CORE-2)。
+///
+/// 対象は `anchor` 以外で「親が `anchor`」または「セッション ID が `anchor`」のプロセス。親が `anchor` でも C(`me`)
+/// でもない子孫は、pid の安定(未回収であること)を保証できず kill できないため、列挙不完全として残す。列挙・読み取り・
+/// 解析の失敗も `note_scan_failure` で残す(fail-closed)。
+fn descendants_of(anchor: u32, me: u32, out: &mut Rescan) -> Vec<NonZeroU32> {
+    const WHAT: &str = "cannot scan /proc for the descendants of a tagged process";
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        note_scan_failure(out, WHAT);
+        return found;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            note_scan_failure(out, WHAT);
+            continue;
+        };
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+            .and_then(NonZeroU32::new)
+        else {
+            continue;
+        };
+        if pid.get() == anchor {
+            continue;
+        }
+        let path = Path::new("/proc").join(pid.get().to_string()).join("stat");
+        let stat = match read_proc_text(&path) {
+            Ok(Some(stat)) => stat,
+            Ok(None) => continue,
+            Err(_) => {
+                note_scan_failure(out, WHAT);
+                continue;
+            }
+        };
+        match parent_and_session_of(&stat) {
+            Some((parent, _)) if parent == anchor => found.push(pid),
+            Some((parent, session)) if session == anchor => {
+                if parent == me {
+                    found.push(pid);
+                } else {
+                    note_scan_failure(
+                        out,
+                        "a descendant of a tagged process has an unexpected parent",
+                    );
+                }
+            }
+            Some(_) => {}
+            None => note_scan_failure(out, WHAT),
+        }
+    }
+    found
 }
 
 /// `/proc` のテキストを読む。対象が消えていれば `Ok(None)`(列挙から読むまでの間に終了した)、それ以外の失敗は
@@ -1099,6 +1351,10 @@ mod tests {
         MalformedReport,
         /// 中間プロセスが PID 1 の fork の失敗(`R <CODE> spawn`)を報告して終了する。
         SpawnFails,
+        /// 中間プロセスが識別子を継承した mapper 相当(自分のセッションを作り、識別子を持たない helper 相当を起動して
+        /// 眠る)を残したまま、isolate の失敗(`R`)を報告して終了する(範囲写像の handshake 失敗。CORE-2・#2009)。
+        /// テストへは helper と mapper の pid をこの順で渡す。
+        IsolateFailsLeavingMapper,
     }
 
     /// 代役の PID 1 を fork し、その pid をテストへ渡す(`pid_write`)。
@@ -1147,6 +1403,84 @@ mod tests {
         Result<ContainerChild, Box<PreparedLaunchFailure>>,
         VecSink,
         Option<u32>,
+    ) {
+        let (result, sink, pids) = run_with_pids(behavior, timeout, legacy, legacy_out, 1);
+        (result, sink, pids.first().copied())
+    }
+
+    /// [`run`] の、代役が渡す pid を `count` 個まで読む版(複数の代役の消滅を照合する試験用)。
+    fn run_pids(
+        behavior: Behavior,
+        timeout: Duration,
+        count: usize,
+    ) -> (
+        Result<ContainerChild, Box<PreparedLaunchFailure>>,
+        VecSink,
+        Vec<u32>,
+    ) {
+        let (out_tx, _out_rx) = UnixStream::pair().unwrap();
+        run_with_pids(
+            behavior,
+            timeout,
+            crate::legacy_tiocsti::LegacyTiocsti::Absent,
+            out_tx.as_fd(),
+            count,
+        )
+    }
+
+    /// 識別子を継承した mapper 相当を fork する。mapper 相当は自分のセッションを作り(`isolate_rootless_subordinate_with`
+    /// と同じ)、識別子を持たない helper 相当を起動して眠る。helper 相当は自分と mapper の pid を `pid_write` へ書き、
+    /// `ready_w` へ 1 バイト書いて眠る。
+    fn fork_mapper_with_helper(
+        pid_write: &std::fs::File,
+        ready_w: &std::io::PipeWriter,
+    ) -> Result<u32, sys::SysError> {
+        sys::fork_single_threaded_with(
+            || true,
+            || {
+                if sys::new_session().is_err() {
+                    return EXIT_SETUP_FAILED;
+                }
+                let helper = sys::fork_single_threaded_with(
+                    || true,
+                    || {
+                        if sys::set_process_comm(b"notatag-helper\0\0").is_err() {
+                            return EXIT_SETUP_FAILED;
+                        }
+                        let mut buf = [0u8; 8];
+                        buf[..4].copy_from_slice(&std::process::id().to_le_bytes());
+                        buf[4..]
+                            .copy_from_slice(&std::os::unix::process::parent_id().to_le_bytes());
+                        let mut w = pid_write;
+                        let _ = w.write_all(&buf);
+                        let mut r = ready_w;
+                        let _ = r.write_all(b"R");
+                        std::thread::sleep(Duration::from_secs(120));
+                        0
+                    },
+                    EXIT_SETUP_FAILED,
+                );
+                if helper.is_err() {
+                    return EXIT_SETUP_FAILED;
+                }
+                std::thread::sleep(Duration::from_secs(120));
+                0
+            },
+            EXIT_SETUP_FAILED,
+        )
+    }
+
+    /// [`run_with`] の本体。代役が `pid_write` へ書く pid を `count` 個まで読む。
+    fn run_with_pids(
+        behavior: Behavior,
+        timeout: Duration,
+        legacy: crate::legacy_tiocsti::LegacyTiocsti,
+        legacy_out: BorrowedFd<'_>,
+        count: usize,
+    ) -> (
+        Result<ContainerChild, Box<PreparedLaunchFailure>>,
+        VecSink,
+        Vec<u32>,
     ) {
         let subreaper = ChildSubreaper::enable().expect("subreaper");
         let (mut pid_read, pid_write) = std::io::pipe().unwrap();
@@ -1234,6 +1568,26 @@ mod tests {
                         );
                         return EXIT_SETUP_FAILED;
                     }
+                    Behavior::IsolateFailsLeavingMapper => {
+                        sys::set_process_comm(tag.comm_bytes()).expect("set the tag");
+                        let (mut ready_r, ready_w) = std::io::pipe().expect("ready pipe");
+                        let mapper = fork_mapper_with_helper(&pid_write, &ready_w);
+                        drop(ready_w);
+                        if mapper.is_err() {
+                            return EXIT_SETUP_FAILED;
+                        }
+                        // helper が起動してから失敗を報告する(helper が居る状態の回収を照合する)。
+                        let mut mark = [0u8; 1];
+                        let _ = ready_r.read_exact(&mut mark);
+                        send_report(
+                            report,
+                            &IntermediateReport::Failed {
+                                code: ErrorCode::PermissionDenied,
+                                phase: IntermediatePhase::Isolate,
+                            },
+                        );
+                        return EXIT_SETUP_FAILED;
+                    }
                 }
                 0
             },
@@ -1244,15 +1598,224 @@ mod tests {
             (legacy, legacy_out),
         );
         drop(pid_write);
+        let mut seen = Vec::new();
         let mut buf = [0u8; 4];
-        let seen = pid_read
-            .read_exact(&mut buf)
-            .ok()
-            .map(|()| u32::from_le_bytes(buf));
+        while seen.len() < count && pid_read.read_exact(&mut buf).is_ok() {
+            seen.push(u32::from_le_bytes(buf));
+        }
         (result, sink, seen)
     }
 
     /// 回収済みなら `/proc/<pid>` は残らない(ゾンビも残さない)。
+    /// 期限つきで `buf` を読み切る(期限なしのブロッキング読みでハングさせない。REPAIR-5)。
+    fn read_within(r: &mut std::io::PipeReader, buf: &mut [u8], timeout: Duration) {
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut got = 0;
+        while got < buf.len() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "the child was not ready in time");
+            let ms = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+            if !sys::poll_readable(r.as_fd(), ms).expect("poll") {
+                continue;
+            }
+            let n = r.read(&mut buf[got..]).expect("read");
+            assert!(n > 0, "the child closed the pipe before reporting");
+            got += n;
+        }
+    }
+
+    /// 識別子を設定し、自分のセッションを作って子孫を起動する代役(mapper 相当)を fork する。`body` は代役の中で
+    /// 子孫を作り、pid をテストへ渡す。
+    fn fork_tagged_session_leader(tag: LaunchTag, body: impl FnOnce() -> i32) -> u32 {
+        sys::fork_single_threaded_with(
+            || true,
+            || {
+                if sys::set_process_comm(tag.comm_bytes()).is_err() || sys::new_session().is_err() {
+                    return EXIT_SETUP_FAILED;
+                }
+                body()
+            },
+            EXIT_SETUP_FAILED,
+        )
+        .expect("fork the tagged process")
+    }
+
+    fn wait_state(pid: u32, state: char) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|s| proc_state_of(&s) == Some(state))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{pid} did not reach state {state}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn parent_of(pid: u32) -> Option<u32> {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| parent_pid_of(&s))
+    }
+
+    /// CORE-2(#2009・Codex P1): 識別子つきの mapper が helper を残して終了した(ゾンビ化し、helper は C へ再親付け
+    /// された)場合でも、再探索は mapper のゾンビを錨として回収せずに保ち、セッション ID で helper を特定して kill・
+    /// 回収してから mapper を回収する(識別子の消失で Clean に進まない)。
+    #[test]
+    fn core2_exited_mapper_still_anchors_its_orphaned_helper() {
+        let subreaper = ChildSubreaper::enable().expect("subreaper");
+        let tag = LaunchTag::fresh();
+        let (mut ready_read, ready_write) = std::io::pipe().unwrap();
+        let ready_write = std::fs::File::from(std::os::fd::OwnedFd::from(ready_write));
+        let mapper = fork_tagged_session_leader(tag, || {
+            let helper = sys::fork_single_threaded_with(
+                || true,
+                || {
+                    if sys::set_process_comm(b"notatag-helper\0\0").is_err() {
+                        return EXIT_SETUP_FAILED;
+                    }
+                    let mut w = &ready_write;
+                    let _ = w.write_all(&std::process::id().to_le_bytes());
+                    std::thread::sleep(Duration::from_secs(120));
+                    0
+                },
+                EXIT_SETUP_FAILED,
+            );
+            if helper.is_err() {
+                return EXIT_SETUP_FAILED;
+            }
+            // helper を残して終了する(helper は C へ再親付けされる)。
+            0
+        });
+        drop(ready_write);
+        let mut buf = [0u8; 4];
+        read_within(&mut ready_read, &mut buf, Duration::from_secs(10));
+        let helper = u32::from_le_bytes(buf);
+        wait_state(mapper, 'Z');
+        // helper は mapper の終了で C(この試験プロセス)へ再親付けされ、識別子も親子関係も持たない。
+        let me = std::process::id();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while parent_of(helper) != Some(me) {
+            assert!(
+                Instant::now() < deadline,
+                "the helper {helper} was not reparented"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let found = rescan_unreported_init(&tag, &subreaper, Duration::from_secs(5));
+        assert!(found.is_clean(), "{found:?}");
+        assert!(!found.scan_incomplete, "{found:?}");
+        assert!(gone(helper), "the orphaned helper {helper} must be reaped");
+        assert!(gone(mapper), "the exited mapper {mapper} must be reaped");
+    }
+
+    /// CORE-2(#2009): pid の安定を保証できない子孫(helper の子)が居る間は、識別子つきの子も子孫も kill・回収
+    /// せずに保持し(`unreaped` に入れない)、`scan_incomplete` と `error` で再探索を要求する。次の再探索も同じ錨を
+    /// 見つける(識別子の不在で解除されない)。
+    #[test]
+    fn core2_tagged_process_with_unlisted_descendant_is_kept_across_rescans() {
+        let subreaper = ChildSubreaper::enable().expect("subreaper");
+        let tag = LaunchTag::fresh();
+        let (mut ready_read, ready_write) = std::io::pipe().unwrap();
+        let ready_write = std::fs::File::from(std::os::fd::OwnedFd::from(ready_write));
+        let mapper = fork_tagged_session_leader(tag, || {
+            let helper = sys::fork_single_threaded_with(
+                || true,
+                || {
+                    if sys::set_process_comm(b"notatag-helper\0\0").is_err() {
+                        return EXIT_SETUP_FAILED;
+                    }
+                    let grandchild = sys::fork_single_threaded_with(
+                        || true,
+                        || {
+                            let _ = sys::set_process_comm(b"notatag-grand\0\0\0");
+                            let mut buf = [0u8; 8];
+                            buf[..4].copy_from_slice(
+                                &std::os::unix::process::parent_id().to_le_bytes(),
+                            );
+                            buf[4..].copy_from_slice(&std::process::id().to_le_bytes());
+                            let mut w = &ready_write;
+                            let _ = w.write_all(&buf);
+                            std::thread::sleep(Duration::from_secs(120));
+                            0
+                        },
+                        EXIT_SETUP_FAILED,
+                    );
+                    if grandchild.is_err() {
+                        return EXIT_SETUP_FAILED;
+                    }
+                    std::thread::sleep(Duration::from_secs(120));
+                    0
+                },
+                EXIT_SETUP_FAILED,
+            );
+            if helper.is_err() {
+                return EXIT_SETUP_FAILED;
+            }
+            std::thread::sleep(Duration::from_secs(120));
+            0
+        });
+        drop(ready_write);
+        let mut buf = [0u8; 8];
+        read_within(&mut ready_read, &mut buf, Duration::from_secs(10));
+        let helper = u32::from_le_bytes(buf[..4].try_into().unwrap());
+        let grandchild = u32::from_le_bytes(buf[4..].try_into().unwrap());
+        for _ in 0..2 {
+            let found = rescan_unreported_init(&tag, &subreaper, Duration::from_secs(1));
+            assert!(found.unreaped.is_empty(), "{found:?}");
+            assert!(found.scan_incomplete, "{found:?}");
+            assert_eq!(
+                found.error.as_ref().map(|e| e.message.as_str()),
+                Some("a descendant of a tagged process has an unexpected parent"),
+                "{found:?}"
+            );
+            assert!(!gone(mapper) && !gone(helper) && !gone(grandchild));
+        }
+        // 後始末: 孫 → helper の順に止め、mapper を回収してから再親付けされた子孫を回収する。
+        let _ = sys::kill_pid(grandchild, sys::Signal::Kill);
+        let _ = sys::kill_pid(helper, sys::Signal::Kill);
+        wait_state(helper, 'Z');
+        let anchor = ContainerChild::adopt_reparented(NonZeroU32::new(mapper).unwrap(), &subreaper);
+        anchor
+            .kill_and_reap(Duration::from_secs(5))
+            .expect("reap the mapper");
+        for pid in [helper, grandchild] {
+            let child = ContainerChild::adopt_reparented(NonZeroU32::new(pid).unwrap(), &subreaper);
+            child
+                .kill_and_reap(Duration::from_secs(5))
+                .expect("reap a descendant");
+        }
+    }
+
+    /// CORE-2: 停止(ゾンビ化)未確認・列挙不完全のどちらでも保持し、両方を満たしたときだけ回収へ進む。
+    #[test]
+    fn core2_tagged_process_is_retained_unless_halted_and_fully_listed() {
+        assert!(must_retain_tagged(false, false));
+        assert!(must_retain_tagged(true, true));
+        assert!(must_retain_tagged(false, true));
+        assert!(!must_retain_tagged(true, false));
+    }
+
+    /// CORE-2: `/proc/<pid>/stat` の親 pid とセッション ID を、`comm` に空白や `)` があっても読む。
+    #[test]
+    fn core2_parent_and_session_parse_tricky_comm() {
+        assert_eq!(
+            parent_and_session_of("12 (a) b) S 34 56 78 0 -1"),
+            Some((34, 78))
+        );
+        assert_eq!(parent_and_session_of("12 (x) S 34"), None);
+        assert_eq!(parent_and_session_of("garbage"), None);
+    }
+
+    #[test]
+    fn core2_proc_state_parses_tricky_comm() {
+        assert_eq!(proc_state_of("12 (a) b) T 1 2"), Some('T'));
+        assert_eq!(proc_state_of("garbage"), None);
+    }
+
     fn gone(pid: u32) -> bool {
         !Path::new(&format!("/proc/{pid}")).exists()
     }
@@ -1360,6 +1923,30 @@ mod tests {
         assert!(sink.0.lock().unwrap().is_empty());
     }
 
+    /// CORE-2(#2009・Codex P1): I が識別子つきの mapper(helper つき)を残したまま `R`(isolate 失敗)を報告して
+    /// 終了しても、C は I の回収後に識別子で再探索し、helper と mapper を kill・回収する。結果は残存なし(`unreaped`・
+    /// `reap_error`・`rescans` が空)で、両者とも `/proc` に残らない。
+    #[test]
+    fn core2_via_intermediate_isolate_failure_reaps_left_mapper_and_helper() {
+        let (result, sink, pids) = run_pids(
+            Behavior::IsolateFailsLeavingMapper,
+            Duration::from_secs(10),
+            2,
+        );
+        let failure = result.expect_err("launch must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::PermissionDenied);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Unshare);
+        assert!(failure.unreaped.is_empty(), "{failure:?}");
+        assert!(failure.reap_error.is_none(), "{failure:?}");
+        assert!(failure.rescans.is_empty(), "{failure:?}");
+        assert!(sink.0.lock().unwrap().is_empty());
+        let [helper, mapper] = pids[..] else {
+            panic!("the stand-ins did not report their pids: {pids:?}");
+        };
+        assert!(gone(helper), "the helper {helper} must be reaped");
+        assert!(gone(mapper), "the mapper {mapper} must be reaped");
+    }
+
     /// CORE-2・REPAIR-5(#1817): 識別子を `comm` に持つ C の子を、再探索が kill・回収する(`confirm_no_process` の
     /// 再探索の実体)。見つけた子は回収済みで `/proc` に残らず、結果は「残っていない」(`is_clean`)。
     #[test]
@@ -1384,13 +1971,61 @@ mod tests {
         .expect("fork the tagged child");
         drop(ready_write);
         let mut mark = [0u8; 1];
-        ready_read.read_exact(&mut mark).unwrap();
+        read_within(&mut ready_read, &mut mark, Duration::from_secs(10));
         let found = rescan_unreported_init(&tag, &subreaper, Duration::from_secs(5));
         assert!(found.is_clean(), "{found:?}");
         assert!(!found.scan_incomplete);
         assert!(gone(pid1), "the tagged child {pid1} must be reaped");
         // 2 回目は何も見つからない(別の識別子の子や回収済みの子は対象外)。
         assert!(rescan_unreported_init(&tag, &subreaper, Duration::from_secs(1)).is_clean());
+    }
+
+    /// CORE-2(#2009): 識別子を持つ子(mapper)が exec 済みの子(`comm` が識別子でない helper)を持つとき、再探索は
+    /// 子も kill・回収し、`/proc` に残さない。
+    #[test]
+    fn core2_rescan_also_reaps_untagged_children_of_tagged_process() {
+        let subreaper = ChildSubreaper::enable().expect("subreaper");
+        let tag = LaunchTag::fresh();
+        let (mut ready_read, ready_write) = std::io::pipe().unwrap();
+        let ready_write = std::fs::File::from(std::os::fd::OwnedFd::from(ready_write));
+        let mapper = sys::fork_single_threaded_with(
+            || true,
+            || {
+                if sys::set_process_comm(tag.comm_bytes()).is_err() {
+                    return EXIT_SETUP_FAILED;
+                }
+                // 識別子を持たない子(exec 後の helper 相当)。comm を別名にし、設定後に自分の pid を報告する
+                // (comm を継承したままでは、回収漏れがタグ探索で拾われて検出できない。REPAIR-12)。
+                let helper = sys::fork_single_threaded_with(
+                    || true,
+                    || {
+                        if sys::set_process_comm(b"notatag-helper\0\0").is_err() {
+                            return EXIT_SETUP_FAILED;
+                        }
+                        let mut w = &ready_write;
+                        let _ = w.write_all(&std::process::id().to_le_bytes());
+                        std::thread::sleep(Duration::from_secs(120));
+                        0
+                    },
+                    EXIT_SETUP_FAILED,
+                );
+                if helper.is_err() {
+                    return EXIT_SETUP_FAILED;
+                }
+                std::thread::sleep(Duration::from_secs(120));
+                0
+            },
+            EXIT_SETUP_FAILED,
+        )
+        .expect("fork the tagged mapper");
+        drop(ready_write);
+        let mut buf = [0u8; 4];
+        read_within(&mut ready_read, &mut buf, Duration::from_secs(10));
+        let helper = u32::from_le_bytes(buf);
+        let found = rescan_unreported_init(&tag, &subreaper, Duration::from_secs(5));
+        assert!(found.is_clean(), "{found:?}");
+        assert!(gone(mapper), "the tagged mapper {mapper} must be reaped");
+        assert!(gone(helper), "the helper {helper} must be reaped");
     }
 
     /// CORE-2・REPAIR-5(#1816): I が許可前に報告なしで終了しても、PID 1 は gate_w を継承していないため、C の
@@ -1439,7 +2074,7 @@ mod tests {
         assert!(result.is_err());
         drop(result);
         let mut mark = [0u8; 1];
-        mark_read.read_exact(&mut mark).unwrap();
+        read_within(&mut mark_read, &mut mark, Duration::from_secs(10));
         assert_eq!(&mark, b"E", "the init must see EOF on the start gate");
         assert!(started.elapsed() < Duration::from_secs(9));
     }

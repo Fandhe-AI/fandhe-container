@@ -30,6 +30,11 @@
 //! - シナリオ H（start 後の状態ルート移動。#2129・SEC-1）: start が状態ルートを固定した後、launcher が子を作る前に
 //!   状態ルートを別名へ改名して同じパスに別の inode の複製を置くと、適用の段が記録パスを辿り直して食い違いを検出し fail-closed で拒否する。
 //!   状態ルートが動かない場合に受理される側はシナリオ D が担う。状態が Created のまま子が残らず、bind 先も残らないことを照合する
+//! - シナリオ I（範囲写像。`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ。CORE-6・SEC-5・#2009）: `RootlessSubordinateIds` の
+//!   launcher（`SubordinateIdSource::system(USER)`）で start し、ホストから読んだ PID 1 の `uid_map` / `gid_map` が
+//!   `/etc/subuid`・`/etc/subgid` の範囲写像（コンテナ 0 → 自 ID、コンテナ 1 以上 → subuid / subgid の範囲の先頭）と
+//!   完全一致することを照合する。opt-in 時に前提（`uidmap`・自ユーザーの subuid / subgid 行・`USER`）が無ければ失敗とする。
+//!   root で実行された場合は、この launcher の構築が `PermissionDenied`（SEC-5）で拒否されることだけを照合する
 //! - シナリオ J（exec 後の capability と seccomp の実効。#2012・SEC-1・CORE-5）: コンテナ内プローブ（`--with-restrictions`）の
 //!   `/proc/self/status` が `CapInh`・`CapAmb` = 0、`CapPrm`・`CapEff`・`CapBnd` = `0x0000_0000_a804_25fb`（OCI 既定の 14 個。
 //!   公開 API の `OCI_DEFAULT_CAPABILITIES` から組んだマスクとリテラルの両方と照合）で、ホストから見た同プロセスの
@@ -58,6 +63,10 @@
 //! cargo test -p fandhe-container-core --test production_launcher --no-run
 //! systemd-run --user --scope -p Delegate=yes <target/debug/deps/production_launcher-XXXX> --ignored
 //! ```
+//!
+//! シナリオ I（範囲写像）は `uidmap` パッケージ（`/usr/bin/newuidmap`・`/usr/bin/newgidmap`）と `/etc/subuid`・
+//! `/etc/subgid` の自ユーザー行が要るため、`FANDHE_CONTAINER_TEST_ID_HELPER=1` を付けた時だけ実行する。実行時は成功行の前に
+//! `production_launcher: subordinate id mapping verified (uid extents=N, gid extents=M)` を出す。
 //!
 //! 成功時の最終行: `production_launcher: pid1, default /dev nodes, landlock evidence, cgroup join verified; failed
 //! launch left no process; bind mount visible on host; post-exec capabilities and seccomp verified (root=false)`（root 実行時は拒否のみ照合する旨の別の行）。
@@ -131,7 +140,8 @@ mod linux {
     };
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
-        ProcessExit, ProcessLauncher, ProductionLauncher, StartTimeouts, create, start,
+        ProcessExit, ProcessLauncher, ProductionLauncher, StartTimeouts, SubordinateIdSource,
+        create, start,
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
@@ -724,6 +734,9 @@ mod linux {
 
         if root {
             scenario_root_refused(&env, tag);
+            if subordinate_requested() {
+                scenario_i_root_refused();
+            }
             return;
         }
         scenario_a_normal(&env, expected_cgroup, tag);
@@ -734,6 +747,13 @@ mod linux {
         scenario_f_landlock_mount_identity_swapped(&env, tag);
         scenario_g_devtmpfs_bind_refused(&env, tag);
         scenario_h_state_root_moved_after_start(&env, tag);
+        if subordinate_requested() {
+            scenario_i_subordinate_ids(&env, tag);
+        } else {
+            println!(
+                "production_launcher: subordinate id case not requested (set FANDHE_CONTAINER_TEST_ID_HELPER=1)"
+            );
+        }
         scenario_j_exec_restrictions(&env, tag);
         scenario_k_seccomp_kill_after_exec(&env, tag);
     }
@@ -1009,6 +1029,139 @@ mod linux {
         assert!(
             children_of_self().is_empty(),
             "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ I の opt-in 環境変数(`rootless_file_owner` の helper ケースと同じ流儀)。
+    fn subordinate_requested() -> bool {
+        std::env::var("FANDHE_CONTAINER_TEST_ID_HELPER").as_deref() == Ok("1")
+    }
+
+    /// 起動ユーザーの euid / egid(`/proc/self/status` の実効 ID)。
+    fn own_ids() -> (u32, u32) {
+        let id = |key: &str| -> u32 {
+            std::fs::read_to_string("/proc/self/status")
+                .expect("read status")
+                .lines()
+                .find(|l| l.starts_with(key))
+                .and_then(|l| l.split_whitespace().nth(2))
+                .and_then(|v| v.parse().ok())
+                .expect("parse id")
+        };
+        (id("Uid:"), id("Gid:"))
+    }
+
+    /// `RootlessSubordinateIds` の launcher を作る。所有者名は試験側が `USER` から渡す(ライブラリは読まない)。
+    fn build_subordinate_launcher() -> Result<ProductionLauncher, TraitError> {
+        ProductionLauncher::builder()
+            .privilege(IsolationPrivilege::RootlessSubordinateIds)
+            .subordinate_ids(SubordinateIdSource::system(std::env::var("USER").ok())?)
+            .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+            .build()
+    }
+
+    /// シナリオ I(`FANDHE_CONTAINER_TEST_ID_HELPER=1`。CORE-6・SEC-5・#2009): `RootlessSubordinateIds` の launcher で
+    /// 起動し、ホストから見た PID 1 の `uid_map` / `gid_map` が `/etc/subuid`・`/etc/subgid` の範囲写像と完全一致する
+    /// (コンテナ 0 → 自 ID、コンテナ 1 以上 → subuid / subgid の範囲)ことを照合する。コンテナ内の
+    /// `/proc/self/uid_map` は読み手基準の表示になるため照合に使わない。前提(`uidmap`・subuid / subgid の自ユーザー行)が
+    /// 無ければ失敗とする。
+    fn scenario_i_subordinate_ids(env: &Env, tag: u32) {
+        use fandhe_container_core::rootless::{
+            IdKind, SubIdOwner, TargetPid, load_subordinate_ids, read_id_map, rootless_mapping,
+        };
+        let launcher: Arc<dyn ProcessLauncher> =
+            Arc::new(build_subordinate_launcher().expect("build subordinate launcher"));
+        let (euid, egid) = own_ids();
+        let name = std::env::var("USER").ok();
+        let uowner = SubIdOwner::new(euid, name.clone()).expect("uid owner");
+        let gowner = SubIdOwner::new(euid, name).expect("gid owner");
+        let uranges =
+            load_subordinate_ids(Path::new("/etc/subuid"), &uowner).expect("load /etc/subuid");
+        let granges =
+            load_subordinate_ids(Path::new("/etc/subgid"), &gowner).expect("load /etc/subgid");
+        assert!(
+            !uranges.is_empty() && !granges.is_empty(),
+            "scenario I requires subuid/subgid entries for the current user"
+        );
+        let want_uid = rootless_mapping(euid, &uranges).expect("uid range mapping");
+        let want_gid = rootless_mapping(egid, &granges).expect("gid range mapping");
+
+        let bundle = Bundle::new("i");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &[], json!([]));
+        let id = ContainerId::new(format!("pli{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            let target = TargetPid::new(pid.get()).expect("target pid");
+            let uid_map = read_id_map(target, IdKind::Uid).expect("read uid_map");
+            let gid_map = read_id_map(target, IdKind::Gid).expect("read gid_map");
+            assert_eq!(uid_map.as_slice(), want_uid.entries());
+            assert_eq!(gid_map.as_slice(), want_gid.entries());
+            assert!(uid_map.len() >= 2 && gid_map.len() >= 2, "{uid_map:?}");
+            let first_sub_uid = uranges.first().expect("a subuid range").start();
+            assert_eq!(
+                uid_map.get(1).map(|m| (m.container_id, m.host_id)),
+                Some((1, first_sub_uid))
+            );
+
+            let output = started.process().take_output().expect("container output");
+            let stdout = output.stdout.expect("container stdout");
+            reader_slot = Some(spawn_reader(stdout));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            assert_eq!(value_of(&lines, "PID"), "1");
+            assert_eq!(value_of(&lines, "NONEWPRIVS"), "1");
+            assert_eq!(value_of(&lines, "SECCOMP"), "2");
+            println!(
+                "production_launcher: subordinate id mapping verified (uid extents={}, gid extents={})",
+                uid_map.len(),
+                gid_map.len()
+            );
+        }));
+        let (_record, process) = started.into_parts();
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "production_launcher: terminate after failed verification also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after terminate"
+        );
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// root で実行された場合のシナリオ I: `RootlessSubordinateIds` の構築が `PermissionDenied` で拒否される
+    /// (コンテナ内 root をホスト root へ写さない。SEC-5・#2009)。
+    fn scenario_i_root_refused() {
+        let err = build_subordinate_launcher().expect_err("root must be refused");
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        println!(
+            "production_launcher: scenario=subordinate-root-refused code={:?}",
+            err.code()
         );
     }
 

@@ -190,7 +190,8 @@ pub use landlock::{
 /// 本番 launcher（`oci_runtime::ProductionLauncher`。#1816）だけが使う crate 内の再公開。
 pub(crate) use landlock::{landlock_ruleset_from_config, launch_isolation_from_ruleset};
 pub(crate) use launch_intermediate::{
-    IntermediateSpec, LaunchTag, Rescan, rescan_unreported_init, spawn_container_via_intermediate,
+    IntermediatePlan, IntermediateSpec, LaunchTag, Rescan, rescan_unreported_init,
+    spawn_container_via_intermediate,
 };
 pub(crate) use launch_status::LaunchAudit;
 /// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・SEC-5・REPAIR-10・#2072。通常の利用者は呼ばない）。
@@ -1536,6 +1537,35 @@ fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
 pub fn isolate_rootless_subordinate(
     plan: &SubordinateIsolationPlan,
 ) -> Result<RootlessIsolationReport, ExecError> {
+    isolate_rootless_subordinate_with(plan, MapperCaller::Standalone)
+}
+
+/// [`isolate_rootless_subordinate_with`] の呼び出し元の種類(mapper の fork 前の flush と、失敗時の mapper の扱い
+/// を決める。CORE-2・CORE-6・REPAIR-5・#2009)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MapperCaller {
+    /// 公開 API([`isolate_rootless_subordinate`])。fork 前に stdio を flush し、失敗時は mapper を kill・回収する。
+    Standalone,
+    /// 本番 launcher の中間プロセス I(`isolate_rootless_subordinate_no_flush`)。flush せず、失敗時も mapper を
+    /// kill・回収しない(呼び出し元の C が識別子の再探索で mapper と helper をまとめて回収する)。
+    Launcher,
+}
+
+/// [`isolate_rootless_subordinate`] の本体。`caller` で mapper の fork 前の flush と失敗時の扱いを切り替える。
+///
+/// 本番 launcher の中間プロセス I は、C の stdio バッファを flush せずに複製した子である。I が flush すると
+/// C の未出力分が二重に出て、flush が止まると期限も効かない(REPAIR-5)ため、launcher 経路は flush しない
+/// (`isolate_rootless_subordinate_no_flush`)。mapper は `_exit` で終わり stdout に書かないので、省いても二重出力は
+/// 起きない(CORE-6・#2009)。
+///
+/// mapper は fork 直後に `setsid(2)` で自分のセッション(ID = mapper の pid)を作ってから写像に進む。mapper が
+/// 起動する `newuidmap` / `newgidmap`(helper)はセッションを継承するため、mapper が helper を残して終了しても、
+/// 未回収の mapper(ゾンビ)の pid を ID に持つセッションとして helper を特定できる(C の再探索の帰属の根拠。
+/// CORE-2)。`setsid` に失敗した mapper は応答せずに終了する(helper を作らない。fail-closed)。
+fn isolate_rootless_subordinate_with(
+    plan: &SubordinateIsolationPlan,
+    caller: MapperCaller,
+) -> Result<RootlessIsolationReport, ExecError> {
     let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
     if euid != plan.euid || egid != plan.egid {
         return Err(ExecError::from_violation(
@@ -1552,22 +1582,41 @@ pub fn isolate_rootless_subordinate(
         plan.writer.clone(),
         plan.timeout,
     );
-    let mapper_pid = sys::fork_single_threaded(
-        move || rootless::run_id_map_mapper(parent_pid, mapper_sock, &uid, &gid, &writer, timeout),
-        EXIT_SETUP_FAILED,
-    )
+    let mapper_main = move || {
+        // helper の帰属を mapper の終了後も保つため、写像の前に自分のセッションを作る(上の doc。CORE-2)。
+        if sys::new_session().is_err() {
+            return EXIT_SETUP_FAILED;
+        }
+        rootless::run_id_map_mapper(parent_pid, mapper_sock, &uid, &gid, &writer, timeout)
+    };
+    let mapper_pid = match caller {
+        MapperCaller::Standalone => sys::fork_single_threaded(mapper_main, EXIT_SETUP_FAILED),
+        MapperCaller::Launcher => {
+            sys::fork_single_threaded_no_flush(mapper_main, EXIT_SETUP_FAILED)
+        }
+    }
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
     let mapper = ContainerChild::spawned(mapper_pid);
 
     let handshake = rootless_handshake(&mut parent_sock, plan);
     drop(parent_sock);
     match handshake {
+        // 応答(Ok)は mapper が helper を回収し終えた後にだけ届くため、ここで mapper を kill しても helper は残らない。
         Ok(()) => {
             mapper.wait_timeout(MAPPER_REAP_TIMEOUT)?;
         }
         Err(e) => {
-            // 失敗しても mapper を必ず回収する。回収自体の失敗は元のエラーを優先する。
-            let _ = mapper.kill_and_reap(MAPPER_REAP_TIMEOUT);
+            match caller {
+                // 公開 API: mapper を必ず回収する。回収自体の失敗は元のエラーを優先する。
+                MapperCaller::Standalone => {
+                    let _ = mapper.kill_and_reap(MAPPER_REAP_TIMEOUT);
+                }
+                // launcher の I: mapper を kill しない。helper の実行中に mapper だけを殺すと helper が C へ再親付け
+                // されて識別子(`LaunchTag`)を持たないまま残り、C の判定が Clean に進む(CORE-2)。mapper は I から
+                // 継承した識別子を持ち、I の終了で C へ再親付けされるので、`R` を受けた C が I の回収後に識別子で
+                // 再探索し、helper を先に kill してから mapper と helper を回収する(`launch_intermediate`)。
+                MapperCaller::Launcher => drop(mapper),
+            }
             return Err(e);
         }
     }
@@ -1598,6 +1647,25 @@ pub fn isolate_rootless_subordinate(
             },
         },
     })
+}
+
+/// 本番 launcher の中間プロセスが使う [`isolate_rootless_subordinate`](mapper の fork 前に stdio を flush
+/// しない。REPAIR-5・CORE-6。#2009)。
+///
+/// 公開版との違い: 失敗時に mapper を kill・回収しない。mapper(と helper)の回収は、`R` の報告を受けた C が
+/// 中間プロセスの回収後に起動識別子の再探索(`rescan_unreported_init`)で行う(CORE-2)。呼び出し元は、識別子を
+/// `comm` に設定した中間プロセスで、失敗を報告して終了すること。
+pub(crate) fn isolate_rootless_subordinate_no_flush(
+    plan: &SubordinateIsolationPlan,
+) -> Result<RootlessIsolationReport, ExecError> {
+    isolate_rootless_subordinate_with(plan, MapperCaller::Launcher)
+}
+
+impl SubordinateIsolationPlan {
+    /// 計画の gid 写像(本番 launcher が devpts の `gid=` の決定元として使う。#2009)。
+    pub(crate) fn gid_map(&self) -> &IdMapSet {
+        &self.gid
+    }
 }
 
 /// [`isolate_rootless_subordinate`] の親側（`unshare` → go → 応答 → 自己検証）。

@@ -608,6 +608,7 @@ impl Inner {
         let owner = id.clone();
         let process = super::launch::ContainerChildProcess::new(child)?
             .with_output(stdout, stderr)
+            .with_exit_audit(Arc::clone(&self.audit_sink), id.clone())
             .with_reap_notice(Box::new(move || {
                 let Some(ledger) = ledger.upgrade() else {
                     return;

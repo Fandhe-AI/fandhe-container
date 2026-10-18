@@ -131,6 +131,13 @@ name = "seccomp_enforcement"
 path = "tests/seccomp_enforcement.rs"
 harness = false
 
+# KILL_PROCESS の 3 件がカーネル監査 AUDIT_SECCOMP に残ることの結合試験（SEC-4・ESC-06・#2004）。seccomp の適用は
+# 不可逆・単一スレッド前提のため harness = false。実機部分は `-- --ignored`（root・auditd 前提）。
+[[test]]
+name = "seccomp_kill_audit"
+path = "tests/seccomp_kill_audit.rs"
+harness = false
+
 # exec プロセスへの seccomp / Landlock 再適用の結合試験（SUP-6・TASK-163.3・#502）。不可逆の制限適用と単一スレッド
 # 前提のため harness = false。`-- --ignored` で Landlock ABI 6+ を必須にする実機前提モード（AGENTS.md）。
 [[test]]

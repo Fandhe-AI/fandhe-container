@@ -419,7 +419,8 @@ pub enum EscapeSyscallProbe {
 ///
 /// 現行フィルタは本 3 件を `SECCOMP_RET_KILL_PROCESS` で拒否するため、本関数は戻らず子が SIGSYS で
 /// 終了する（ESC-06 の期待。CORE-5・SEC-2。#1834）。戻るのはフィルタが欠落した場合だけ。
-/// 終了するプロセス自身は監査記録を書けない（SEC-4 の配送経路は別途設計）。
+/// 終了するプロセス自身は監査記録を書けない（SEC-4。正の記録はカーネルの `AUDIT_SECCOMP`、補助は
+/// 親の回収点が出す `exit_signal` レコード。#2004）。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub fn probe_escape_syscall(which: EscapeSyscallProbe) -> ProbeOutcome {

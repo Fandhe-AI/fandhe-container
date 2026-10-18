@@ -124,8 +124,24 @@ fn main() {
     const AUSEARCH: &str = "/usr/sbin/ausearch";
     const ACTIONS_LOGGED: &str = "/proc/sys/kernel/seccomp/actions_logged";
 
-    /// `ausearch` を spawn し、1 回あたり 3 秒で打ち切る（期限超過は kill して wait で回収。REPAIR-5）。
-    /// stdout は別スレッドで読む。PATH 探索はせず絶対パスで実行する。
+    /// kill 後に有限の猶予（2 秒）で子を回収する。回収できなければ false（REPAIR-5）。
+    fn reap_bounded(child: &mut std::process::Child) -> bool {
+        let _ = child.kill();
+        let limit = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < limit {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => return false,
+            }
+        }
+        false
+    }
+
+    /// `ausearch` を spawn し、1 回あたり 10 秒で打ち切る（REPAIR-5）。
+    /// 期限超過は kill して有限の猶予で回収し、出力が途中で切れている可能性があるため
+    /// 全量として扱わず panic で失敗にする。stdout は別スレッドで読み、完了待ちにも期限を設ける。
+    /// PATH 探索はせず絶対パスで実行する。
     fn run_ausearch_bounded(pid: &str) -> String {
         let mut child = Command::new(AUSEARCH)
             .args(["-m", "SECCOMP", "-p", pid, "--raw"])
@@ -135,25 +151,32 @@ fn main() {
             .spawn()
             .expect("run ausearch (root and auditd required)");
         let mut stdout = child.stdout.take().expect("ausearch stdout");
-        let reader = std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = stdout.read_to_end(&mut buf);
-            buf
+            let _ = tx.send(buf);
         });
-        let limit = Instant::now() + Duration::from_secs(3);
+        let limit = Instant::now() + Duration::from_secs(10);
         loop {
-            if child.try_wait().expect("try_wait ausearch").is_some() {
-                break;
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(e) => {
+                    let reaped = reap_bounded(&mut child);
+                    panic!("try_wait ausearch failed: {e} (reaped={reaped})");
+                }
             }
             if Instant::now() >= limit {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
+                let reaped = reap_bounded(&mut child);
+                panic!("ausearch exceeded 10s; output may be truncated (reaped={reaped})");
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let buf = reader.join().unwrap_or_default();
-        String::from_utf8_lossy(&buf).into_owned()
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+            Err(_) => panic!("ausearch stdout reader did not finish within 3s"),
+        }
     }
 
     let args: Vec<String> = std::env::args().collect();
@@ -228,10 +251,18 @@ fn main() {
         let pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(30);
         let status = loop {
-            if let Some(s) = child.try_wait().expect("try_wait") {
-                break s;
+            match child.try_wait() {
+                Ok(Some(s)) => break s,
+                Ok(None) => {}
+                Err(e) => {
+                    let reaped = reap_bounded(&mut child);
+                    panic!("try_wait child {name} failed: {e} (reaped={reaped})");
+                }
             }
-            assert!(Instant::now() < deadline, "child {name} timed out");
+            if Instant::now() >= deadline {
+                let reaped = reap_bounded(&mut child);
+                panic!("child {name} timed out (reaped={reaped})");
+            }
             std::thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(status.signal(), Some(31), "{name} must die with SIGSYS");

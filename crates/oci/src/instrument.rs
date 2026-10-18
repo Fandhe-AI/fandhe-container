@@ -42,6 +42,8 @@ pub enum OciOpKind {
     DiskUsage,
     /// イメージストアの排他区間の取得（待機・Timeout・毒化・ロックファイル異常を含む。TASK-183.2・OCI-7）。
     AcquireImageStoreLock,
+    /// `image prune` の実行（無参照イメージ・レイヤーの回収。TASK-183.7・OCI-7）。
+    PruneImages,
 }
 
 impl OciOpKind {
@@ -60,6 +62,7 @@ impl OciOpKind {
             OciOpKind::ListImages => "oci.image.list",
             OciOpKind::DiskUsage => "oci.image.df",
             OciOpKind::AcquireImageStoreLock => "oci.store.lock",
+            OciOpKind::PruneImages => "oci.image.prune",
         }
     }
 }

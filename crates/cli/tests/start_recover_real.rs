@@ -81,6 +81,25 @@ mod linux {
         }
     }
 
+    /// 子を kill し、`REAP_TIMEOUT` 内に `try_wait` で回収する（無期限の `wait` を避ける。REPAIR-5）。
+    /// 期限内に回収できなければエラーを返す。
+    fn kill_and_reap(c: &mut Child) -> Result<(), String> {
+        let kill_err = c.kill().err();
+        let deadline = Instant::now() + REAP_TIMEOUT;
+        loop {
+            match c.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) if Instant::now() >= deadline => {
+                    return Err(format!(
+                        "child was not reaped within {REAP_TIMEOUT:?} (kill: {kill_err:?})"
+                    ));
+                }
+                Ok(None) => thread::sleep(POLL),
+                Err(e) => return Err(format!("reap child: {e}")),
+            }
+        }
+    }
+
     /// 後始末（孤児・cgroup・状態ルート）を Drop で保証する。
     struct Cleanup {
         sleeper: Option<Child>,
@@ -90,9 +109,10 @@ mod linux {
 
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            if let Some(mut c) = self.sleeper.take() {
-                let _ = c.kill();
-                let _ = c.wait();
+            if let Some(mut c) = self.sleeper.take()
+                && let Err(e) = kill_and_reap(&mut c)
+            {
+                eprintln!("start_recover_real: cleanup failed: {e}");
             }
             for d in self.dirs.iter().rev() {
                 let _ = fs::remove_dir(d);
@@ -286,9 +306,10 @@ mod linux {
             match child.try_wait().map_err(|e| format!("poll cli: {e}"))? {
                 Some(s) => break s,
                 None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("cli did not exit within {CHILD_TIMEOUT:?}"));
+                    return Err(match kill_and_reap(&mut child) {
+                        Ok(()) => format!("cli did not exit within {CHILD_TIMEOUT:?}"),
+                        Err(e) => format!("cli did not exit within {CHILD_TIMEOUT:?}; {e}"),
+                    });
                 }
                 None => thread::sleep(POLL),
             }

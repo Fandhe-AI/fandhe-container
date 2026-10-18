@@ -1018,24 +1018,25 @@ impl Extractor<'_> {
             let mut found = self.probe(parent_id, &c, &cand)?;
             // 下位由来の非ディレクトリ（ファイル等）の位置へ、現在のレイヤーがディレクトリを作る置換。
             // 同じレイヤーの `.wh.<名前>` を前提に、実体を退避して暗黙のディレクトリ作成へ進む（終端で照合する）。
-            if create && lexical && follows == 0 {
-                if let Some((m, id)) = &found {
-                    if !m.is_dir() && !m.file_type().is_symlink() && !self.names.is_touched(*id) {
-                        let (lp, ln) = rel.split_at(consumed.saturating_sub(1));
-                        if let Some(ln) = ln.first() {
-                            let (m, id) = (m.clone(), *id);
-                            self.displace_lower(
-                                parent_id,
-                                lp,
-                                ln,
-                                &cand,
-                                &m,
-                                id,
-                                "a parent path component is not a directory",
-                            )?;
-                            found = None;
-                        }
-                    }
+            let replaceable = create
+                && lexical
+                && follows == 0
+                && found.as_ref().is_some_and(|(m, id)| {
+                    !m.is_dir() && !m.file_type().is_symlink() && !self.names.is_touched(*id)
+                });
+            if replaceable && let Some((m, id)) = found.take() {
+                let (lp, ln) = rel.split_at(consumed.saturating_sub(1));
+                match ln.first() {
+                    Some(ln) => self.displace_lower(
+                        parent_id,
+                        lp,
+                        ln,
+                        &cand,
+                        &m,
+                        id,
+                        "a parent path component is not a directory",
+                    )?,
+                    None => found = Some((m, id)),
                 }
             }
             match found {

@@ -79,13 +79,23 @@
 //!
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
-//! - uid / gid の写像と `chown`（SEC-5）。展開物は実行ユーザー所有になる。
-//! - 通常ファイルの setuid / setgid / sticky の保持。展開物が実行ユーザー所有のまま setuid / setgid を残すと、
-//!   ホスト root がほかのユーザーも辿れるステージングへ展開したときに、レイヤー由来の実行ファイルが root 所有の
-//!   setuid になり、ホスト上の権限昇格に使える。所有者の写像（SEC-5）が入るまで、通常ファイルの mode は
-//!   下位 9 ビット（`FILE_MODE_MASK`）だけを適用し、落とした件数を
-//!   `ExtractedLayer::files_with_stripped_special_bits` に返す（黙って落とさない）。ディレクトリの mode は
-//!   sticky（`/tmp` の 1777）・setgid を含めてそのまま適用する。
+//! - uid / gid の適用（`chown`・subuid の複数範囲への写像・rootful）（SEC-5）。展開物は実行ユーザー所有になる。
+//! - rootful（ホスト uid 0）で通常ファイルの setuid / setgid を残す経路。`chown` と idmap が入るまで常に落とす。
+//!
+//! # 通常ファイルの setuid / setgid / sticky（SEC-5・SEC-1・#1810）
+//! 既定（`SpecialBitsPolicy::Strip`）は下位 9 ビット（`FILE_MODE_MASK`）だけを適用し、落とした件数を
+//! `ExtractedLayer::files_with_stripped_special_bits` に返す（黙って落とさない）。展開物は実行ユーザー所有のため、
+//! ホスト root がほかのユーザーも辿れるステージングへ展開したときに root 所有の setuid が生じるのを防ぐ。
+//!
+//! `SpecialBitsPolicy::PreserveIfOwnerMapped` を渡した呼び出しだけが、次の条件をすべて満たすビットを tar の値のまま
+//! 適用する（それ以外は落とす。fail-closed）。条件と根拠は `docs/design/oci-layer-special-bits.md`。
+//! - ホストが Linux で、`root` が実行ユーザー所有の 0700（group / other に権限なし）であること。
+//! - setuid: 書いたファイルの所有 uid が 0 でなく、tar の uid を写像（`IdRange`）した host uid と一致すること。
+//! - setgid: 同様に gid で判定すること。
+//! - sticky: 上記のポリシー全体の条件を満たすこと。
+//! - 適用後に mode を読み戻し、ビットが残っていなければ適用したことにしない。
+//!
+//! ディレクトリの mode（sticky・setgid を含む）はポリシーに関係なくそのまま適用する。
 //! - ディレクトリ fd 起点（`openat2` の `RESOLVE_IN_ROOT` 等）の解決。libc 系の依存承認後の後続課題。
 //! - 綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する別表記は衝突として扱わない。IO-5）。HFS+ のように
 //!   保存時に名前を書き換える FS は前提外。
@@ -187,9 +197,84 @@ pub struct ExtractedLayer {
     pub bytes: u64,
     /// tar の mode に setuid / setgid / sticky が付いていて、それを落として展開した通常ファイルのエントリ数。
     ///
-    /// 0 でなければ、展開結果の mode はレイヤーの記述と一致しない（所有者の写像〔SEC-5〕が入るまでの措置。
-    /// モジュール冒頭の「未実装」を参照）。
+    /// 0 でなければ、展開結果の mode はレイヤーの記述と一致しない（ポリシーの条件を満たさなかった。
+    /// モジュール冒頭の「通常ファイルの setuid / setgid / sticky」を参照）。
     pub files_with_stripped_special_bits: u64,
+    /// 特殊ビットのポリシーの判定と、保持した件数（#1810）。
+    pub special_bits: SpecialBitsOutcome,
+}
+
+/// uid / gid の 1 行の写像（コンテナ内 `container_id` から `count` 個を host の `host_id` 以降へ）。
+///
+/// core の `IdMapping`（`container_id host_id count`）と同じ意味。oci は core に依存しないため型は共有せず、
+/// 呼び出し元がコンテナの user namespace の写像から作って渡す。複数行の写像は `chown` の導入時に拡張する（SEC-5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdRange {
+    /// コンテナ内の開始 ID。
+    pub container_id: u32,
+    /// ホストの開始 ID。
+    pub host_id: u32,
+    /// 範囲の長さ。
+    pub count: u32,
+}
+
+impl IdRange {
+    /// コンテナ内の `id` に対応する host の ID。範囲外・オーバーフローは `None`（checked 演算）。
+    #[must_use]
+    pub fn map_to_host(&self, id: u32) -> Option<u32> {
+        let off = id.checked_sub(self.container_id)?;
+        if off >= self.count {
+            return None;
+        }
+        self.host_id.checked_add(off)
+    }
+}
+
+/// 通常ファイルの setuid / setgid / sticky の扱い（SEC-5・SEC-1・#1810）。既定は `Strip`。
+///
+/// 展開の入口 `extract_layers_with_policy` / `extract_layer_blobs_with_policy` が受け取る。呼び出し元は、
+/// rootfs を排他的に所有し、展開から rootfs として使い終わるまで `root` を 0700 に保つこと（権限の後からの
+/// 変更〔TOCTOU〕は防げない）。コンテナ内で setuid が効くかは `process.noNewPrivileges` に依り、本ポリシーは
+/// ビットの保持までを扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SpecialBitsPolicy {
+    /// 常に落とす（従来の挙動）。
+    #[default]
+    Strip,
+    /// 所有者が user namespace の写像に収まるファイルだけ、tar の値を適用する。条件はモジュール冒頭を参照。
+    ///
+    /// 未実装（REPAIR-3）: rootful（ホスト uid 0）の経路は `chown` / idmap が入るまで常に落とす。
+    PreserveIfOwnerMapped {
+        /// uid の写像。
+        uid: IdRange,
+        /// gid の写像。
+        gid: IdRange,
+    },
+}
+
+/// ポリシー全体の判定結果（REPAIR-4: 機械可読）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SpecialBitsDecision {
+    /// `Strip` のため、すべて落とした。
+    StripPolicy,
+    /// Linux 以外のホストのため、すべて落とした。
+    UnsupportedHost,
+    /// `root` が group / other に開かれている、または root の確認ができず、すべて落とした。
+    RootAccessibleByOthers,
+    /// ファイルごとの条件で判定した。
+    Evaluated,
+}
+
+/// 特殊ビットの扱いの結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SpecialBitsOutcome {
+    /// ポリシー全体の判定。
+    pub decision: SpecialBitsDecision,
+    /// 特殊ビットを tar の値どおりに適用した（読み戻しで確認した）通常ファイルのエントリ数。
+    pub preserved_files: u64,
 }
 
 /// 計装なしの `extract_tar_with`（`NoopOciOpRecorder`）。
@@ -219,6 +304,7 @@ pub fn extract_tar_with<R: Read + Seek>(
         root,
         limits,
         host_lstat,
+        SpecialSetup::host(SpecialBitsPolicy::Strip),
     )?)
 }
 
@@ -260,6 +346,7 @@ pub fn extract_layer_blob_with(
         root,
         limits,
         host_lstat,
+        SpecialSetup::host(SpecialBitsPolicy::Strip),
     )?)
 }
 
@@ -287,12 +374,26 @@ pub fn extract_layers_with<R: Read + Seek>(
     root: &Path,
     limits: ExtractLimits,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_layers_with_policy(recorder, layers, root, limits, SpecialBitsPolicy::Strip)
+}
+
+/// `extract_layers_with` に通常ファイルの特殊ビットのポリシーを足した版（SEC-5・#1810）。
+///
+/// `policy` の契約はモジュール冒頭と `SpecialBitsPolicy` を参照。`Strip` なら `extract_layers_with` と同じ。
+pub fn extract_layers_with_policy<R: Read + Seek>(
+    recorder: &dyn OciOpRecorder,
+    layers: impl IntoIterator<Item = R>,
+    root: &Path,
+    limits: ExtractLimits,
+    policy: SpecialBitsPolicy,
+) -> Result<Vec<ExtractedLayer>, OciError> {
     extract_stack(
         recorder,
         layers.into_iter().map(Rewind::new),
         root,
         limits,
         host_lstat,
+        SpecialSetup::host(policy),
     )
 }
 
@@ -323,6 +424,25 @@ pub fn extract_layer_blobs_with(
     max_uncompressed_bytes: u64,
     limits: ExtractLimits,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_layer_blobs_with_policy(
+        recorder,
+        blob_paths,
+        root,
+        max_uncompressed_bytes,
+        limits,
+        SpecialBitsPolicy::Strip,
+    )
+}
+
+/// `extract_layer_blobs_with` に通常ファイルの特殊ビットのポリシーを足した版（SEC-5・#1810）。
+pub fn extract_layer_blobs_with_policy(
+    recorder: &dyn OciOpRecorder,
+    blob_paths: &[&Path],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+    policy: SpecialBitsPolicy,
+) -> Result<Vec<ExtractedLayer>, OciError> {
     extract_stack(
         recorder,
         blob_paths.iter().map(|path| GzipBlob {
@@ -332,6 +452,7 @@ pub fn extract_layer_blobs_with(
         root,
         limits,
         host_lstat,
+        SpecialSetup::host(policy),
     )
 }
 
@@ -569,6 +690,10 @@ struct Extractor<'a> {
     bytes: u64,
     /// setuid / setgid / sticky を落として展開した通常ファイルのエントリ数。
     stripped_special: u64,
+    /// 特殊ビットを tar の値どおりに適用した通常ファイルのエントリ数。
+    preserved_special: u64,
+    /// 特殊ビットのポリシーの評価結果（展開の開始時に 1 回決める）。
+    special: SpecialCtx,
     /// 所有者の rwx が欠けるディレクトリの（物理パス, mode）。子の作成を妨げないよう全レイヤーの処理後に適用する。
     /// キーは `NameIndex` の ID。ディレクトリを削除したら、索引から外した ID の項目も必ず取り除く（`drop_ids`）。
     deferred_dirs: HashMap<u64, (PathBuf, u32)>,
@@ -988,6 +1113,160 @@ fn apply_dir_mode(_path: &Path, _mode: u32) -> Result<(), OciError> {
 /// （SEC-5 の所有者写像が入るまでの措置）。
 const FILE_MODE_MASK: u32 = 0o777;
 
+/// 通常ファイルの setuid / setgid / sticky を合わせたビット。
+const SPECIAL_BITS: u32 = 0o7000;
+const S_ISUID: u32 = 0o4000;
+const S_ISGID: u32 = 0o2000;
+const S_ISVTX: u32 = 0o1000;
+
+/// ファイルの所有者 `(uid, gid)` を取り出す関数（テストだけが差し替える）。
+type OwnerOf = fn(&fs::Metadata) -> (u32, u32);
+
+#[cfg(unix)]
+fn host_owner(m: &fs::Metadata) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt as _;
+    (m.uid(), m.gid())
+}
+
+/// 非 unix では所有者の概念が無く、`SpecialBitsDecision::UnsupportedHost` で呼ばれない。
+#[cfg(not(unix))]
+fn host_owner(_m: &fs::Metadata) -> (u32, u32) {
+    (0, 0)
+}
+
+/// 特殊ビットの扱いの入力（ポリシーと所有者の取得関数）。`extract_stack` の入口で受け取る。
+#[derive(Clone, Copy)]
+struct SpecialSetup {
+    policy: SpecialBitsPolicy,
+    owner_of: OwnerOf,
+}
+
+impl SpecialSetup {
+    fn host(policy: SpecialBitsPolicy) -> Self {
+        Self {
+            policy,
+            owner_of: host_owner,
+        }
+    }
+}
+
+/// 展開の開始時に評価した、特殊ビットの扱いの文脈（`Extractor::write_file` が参照する）。
+#[derive(Clone, Copy)]
+struct SpecialCtx {
+    decision: SpecialBitsDecision,
+    /// `Evaluated` のときだけ `Some`（uid の写像, gid の写像）。
+    ranges: Option<(IdRange, IdRange)>,
+    /// `root` の所有 uid（`Evaluated` のときだけ意味を持つ）。
+    root_uid: u32,
+    owner_of: OwnerOf,
+}
+
+impl SpecialCtx {
+    fn strip() -> Self {
+        Self {
+            decision: SpecialBitsDecision::StripPolicy,
+            ranges: None,
+            root_uid: 0,
+            owner_of: host_owner,
+        }
+    }
+}
+
+/// ポリシー全体の条件（ポリシー・ホスト OS・`root` の権限）を評価する。`check_root_empty` の後に 1 回だけ呼ぶ。
+fn eval_special_ctx(setup: &SpecialSetup, root: &Path) -> Result<SpecialCtx, OciError> {
+    let mut ctx = SpecialCtx::strip();
+    ctx.owner_of = setup.owner_of;
+    let SpecialBitsPolicy::PreserveIfOwnerMapped { uid, gid } = setup.policy else {
+        return Ok(ctx);
+    };
+    ctx.decision = SpecialBitsDecision::UnsupportedHost;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        // 0700 なら祖先の権限に依らず、ほかのユーザーは root より下へ入れない。
+        ctx.decision = SpecialBitsDecision::RootAccessibleByOthers;
+        let m = fs::symlink_metadata(root).map_err(|e| map_fs_err(&e))?;
+        if m.is_dir() && m.permissions().mode() & 0o077 == 0 {
+            ctx.decision = SpecialBitsDecision::Evaluated;
+            ctx.ranges = Some((uid, gid));
+            ctx.root_uid = (setup.owner_of)(&m).0;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (uid, gid, root);
+    }
+    Ok(ctx)
+}
+
+/// 残してよい特殊ビットを返す（ファイル単位の条件。モジュール冒頭を参照）。副作用なし。
+///
+/// `owner` は書いたファイルの実際の所有者。tar の id が `None`（解析不能）のとき setuid / setgid は残さない。
+fn special_bits_to_keep(
+    requested: u32,
+    tar_ids: (Option<u32>, Option<u32>),
+    owner: (u32, u32),
+    ctx: &SpecialCtx,
+) -> u32 {
+    let Some((uid_map, gid_map)) = ctx.ranges else {
+        return 0;
+    };
+    if ctx.decision != SpecialBitsDecision::Evaluated || ctx.root_uid != owner.0 {
+        return 0;
+    }
+    let mut keep = requested & S_ISVTX;
+    if requested & S_ISUID != 0
+        && owner.0 != 0
+        && tar_ids.0.and_then(|u| uid_map.map_to_host(u)) == Some(owner.0)
+    {
+        keep |= S_ISUID;
+    }
+    if requested & S_ISGID != 0
+        && owner.1 != 0
+        && tar_ids.1.and_then(|g| gid_map.map_to_host(g)) == Some(owner.1)
+    {
+        keep |= S_ISGID;
+    }
+    keep
+}
+
+/// tar エントリの uid / gid（PAX の `uid` / `gid` を優先）。解析できない・u32 に収まらない値は `None`（非信頼入力）。
+fn tar_owner<R: Read>(entry: &mut tar::Entry<'_, R>) -> (Option<u32>, Option<u32>) {
+    let mut uid = entry
+        .header()
+        .uid()
+        .ok()
+        .and_then(|v| u32::try_from(v).ok());
+    let mut gid = entry
+        .header()
+        .gid()
+        .ok()
+        .and_then(|v| u32::try_from(v).ok());
+    if let Ok(Some(exts)) = entry.pax_extensions() {
+        for ext in exts.flatten() {
+            let parsed = ext.value().ok().and_then(|v| v.parse::<u32>().ok());
+            match ext.key() {
+                Ok("uid") => uid = parsed,
+                Ok("gid") => gid = parsed,
+                _ => {}
+            }
+        }
+    }
+    (uid, gid)
+}
+
+/// 書き込み済みファイルの mode の特殊ビットを読み戻す（失敗は 0。偽って「残った」と報告しない）。
+#[cfg(unix)]
+fn special_bits_of(f: &fs::File) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    f.metadata()
+        .map_or(0, |m| m.permissions().mode() & SPECIAL_BITS)
+}
+
+#[cfg(not(unix))]
+fn special_bits_of(_f: &fs::File) -> u32 {
+    0
+}
 /// 所有者の rwx がそろわない mode か（子の作成を妨げうるため適用を遅延する）。
 fn needs_deferral(mode: u32) -> bool {
     mode & 0o700 != 0o700
@@ -1209,6 +1488,7 @@ impl Extractor<'_> {
         &mut self,
         comps: Vec<OsString>,
         mode: u32,
+        tar_ids: (Option<u32>, Option<u32>),
         size: u64,
         data: &mut R,
     ) -> Result<(), OciError> {
@@ -1258,9 +1538,28 @@ impl Extractor<'_> {
         if written != size {
             return Err(err(OciErrorCode::DataLoss, "layer tar stream is malformed"));
         }
-        apply_file_mode(&f, mode & FILE_MODE_MASK)?;
-        if mode & 0o7000 != 0 {
-            self.stripped_special = self.stripped_special.saturating_add(1);
+        let requested = mode & SPECIAL_BITS;
+        let keep = if requested != 0 && self.special.decision == SpecialBitsDecision::Evaluated {
+            // 所有者は書いたファイル自身の metadata から得る（fsuid・親ディレクトリの setgid による gid 継承を反映）。
+            f.metadata().map_or(0, |m| {
+                special_bits_to_keep(
+                    requested,
+                    tar_ids,
+                    (self.special.owner_of)(&m),
+                    &self.special,
+                )
+            })
+        } else {
+            0
+        };
+        apply_file_mode(&f, mode & (FILE_MODE_MASK | keep))?;
+        if requested != 0 {
+            // カーネルが黙って落とした場合（所属しない gid への setgid 等）は適用したことにしない。
+            if keep == requested && special_bits_of(&f) == requested {
+                self.preserved_special = self.preserved_special.saturating_add(1);
+            } else {
+                self.stripped_special = self.stripped_special.saturating_add(1);
+            }
         }
         self.bytes = next;
         Ok(())
@@ -1609,6 +1908,7 @@ fn extract_one_layer<S: LayerSource>(
     input_budget: u64,
 ) -> Result<(ExtractedLayer, u64), OciError> {
     let (entries0, bytes0, stripped0) = (x.entries, x.bytes, x.stripped_special);
+    let preserved0 = x.preserved_special;
     let max_entries = x.limits.max_entries;
     let markers = collect_markers(x, src.open()?, input_budget)?;
     x.apply_markers(&markers)?;
@@ -1640,7 +1940,8 @@ fn extract_one_layer<S: LayerSource>(
                 Plan::Dir(comps, mode) => x.make_dir(comps, mode)?,
                 Plan::File(comps, mode) => {
                     let size = entry.size();
-                    x.write_file(comps, mode, size, &mut entry)?;
+                    let tar_ids = tar_owner(&mut entry);
+                    x.write_file(comps, mode, tar_ids, size, &mut entry)?;
                 }
                 Plan::Symlink(comps) => {
                     let target = entry
@@ -1670,6 +1971,10 @@ fn extract_one_layer<S: LayerSource>(
             entries: x.entries.saturating_sub(entries0),
             bytes: x.bytes.saturating_sub(bytes0),
             files_with_stripped_special_bits: x.stripped_special.saturating_sub(stripped0),
+            special_bits: SpecialBitsOutcome {
+                decision: x.special.decision,
+                preserved_files: x.preserved_special.saturating_sub(preserved0),
+            },
         },
         src.read,
     ))
@@ -1686,6 +1991,7 @@ fn extract_stack<S: LayerSource>(
     root: &Path,
     limits: ExtractLimits,
     lstat: Lstat,
+    setup: SpecialSetup,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
     let mut x: Option<Extractor<'_>> = None;
     let mut input_used = 0u64;
@@ -1709,6 +2015,8 @@ fn extract_stack<S: LayerSource>(
                     entries: 0,
                     bytes: 0,
                     stripped_special: 0,
+                    preserved_special: 0,
+                    special: eval_special_ctx(&setup, root)?,
                     deferred_dirs: HashMap::new(),
                     names: NameIndex::new(limits.max_tracked_paths),
                     layer_nodes: HashSet::new(),
@@ -1757,6 +2065,7 @@ fn extract_with_lstat<R: Read + Seek>(
         root,
         limits,
         lstat,
+        SpecialSetup::host(SpecialBitsPolicy::Strip),
     )?)
 }
 
@@ -3019,6 +3328,327 @@ mod tests {
         );
     }
 
+    // ---- 特殊ビットのポリシー（SEC-5・SEC-1・#1810） ----
+
+    /// uid / gid を指定した通常ファイルのエントリを組み立てる。
+    #[cfg(unix)]
+    fn file_owned(name: &str, mode: u32, uid: u64, gid: u64, data: &[u8]) -> Vec<u8> {
+        let mut h = tar::Header::new_gnu();
+        h.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+        h.set_entry_type(EntryType::Regular);
+        h.set_mode(mode);
+        h.set_uid(uid);
+        h.set_gid(gid);
+        h.set_size(data.len() as u64);
+        h.set_cksum();
+        let mut out = h.as_bytes().to_vec();
+        out.extend_from_slice(data);
+        let pad = (512 - data.len() % 512) % 512;
+        out.extend(std::iter::repeat_n(0u8, pad));
+        out
+    }
+
+    fn owner_1000(_m: &fs::Metadata) -> (u32, u32) {
+        (1000, 1000)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn owner_root(_m: &fs::Metadata) -> (u32, u32) {
+        (0, 0)
+    }
+
+    /// コンテナ内 0 を host 1000 へ写す 1 行の写像（uid・gid 共通）。
+    #[cfg(unix)]
+    fn policy_1000() -> SpecialBitsPolicy {
+        let r = IdRange {
+            container_id: 0,
+            host_id: 1000,
+            count: 1,
+        };
+        SpecialBitsPolicy::PreserveIfOwnerMapped { uid: r, gid: r }
+    }
+
+    #[cfg(unix)]
+    fn run_policy(
+        sb: &Sandbox,
+        entries: &[Vec<u8>],
+        policy: SpecialBitsPolicy,
+        owner_of: OwnerOf,
+    ) -> ExtractedLayer {
+        let tar = archive(entries);
+        single(
+            extract_stack(
+                &NoopOciOpRecorder,
+                [Rewind::new(Cursor::new(tar.as_slice()))],
+                &sb.root,
+                LIM(),
+                host_lstat,
+                SpecialSetup { policy, owner_of },
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    fn chmod_root(sb: &Sandbox, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&sb.root, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn special_entries() -> Vec<Vec<u8>> {
+        vec![
+            file_owned("suid", 0o4755, 0, 0, b"a"),
+            file_owned("sgid", 0o2755, 0, 0, b"b"),
+            file_owned("both", 0o6711, 0, 0, b"c"),
+            file_owned("sticky", 0o1644, 0, 0, b"d"),
+            file_owned("plain", 0o755, 0, 0, b"e"),
+        ]
+    }
+
+    /// SEC-5: root が 0700 で所有者が写像に収まるとき、setuid / setgid / sticky を tar の値どおりに適用する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec5_special_bits_preserved_when_owner_mapped() {
+        let sb = Sandbox::new();
+        chmod_root(&sb, 0o700);
+        let r = run_policy(&sb, &special_entries(), policy_1000(), owner_1000);
+        assert_eq!(r.special_bits.decision, SpecialBitsDecision::Evaluated);
+        assert_eq!(r.special_bits.preserved_files, 4);
+        assert_eq!(r.files_with_stripped_special_bits, 0);
+        for (name, want) in [
+            ("suid", 0o4755),
+            ("sgid", 0o2755),
+            ("both", 0o6711),
+            ("sticky", 0o1644),
+            ("plain", 0o755),
+        ] {
+            assert_eq!(mode_of(&sb.root.join(name)), want, "{name}");
+        }
+    }
+
+    /// SEC-5: root が group / other に開かれている（0755）と、全ビットを落として件数を返す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec5_special_bits_stripped_when_root_is_accessible_by_others() {
+        let sb = Sandbox::new();
+        chmod_root(&sb, 0o755);
+        let r = run_policy(&sb, &special_entries(), policy_1000(), owner_1000);
+        assert_eq!(
+            r.special_bits.decision,
+            SpecialBitsDecision::RootAccessibleByOthers
+        );
+        assert_eq!(r.special_bits.preserved_files, 0);
+        assert_eq!(r.files_with_stripped_special_bits, 4);
+        for (name, want) in [
+            ("suid", 0o755),
+            ("sgid", 0o755),
+            ("both", 0o711),
+            ("sticky", 0o644),
+        ] {
+            assert_eq!(mode_of(&sb.root.join(name)), want, "{name}");
+        }
+    }
+
+    /// SEC-5: tar 上の所有者が写像外のファイルは setuid / setgid を落とし、写像内のファイルは残す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec5_special_bits_dropped_when_tar_owner_is_not_mapped() {
+        let sb = Sandbox::new();
+        chmod_root(&sb, 0o700);
+        let r = run_policy(
+            &sb,
+            &[
+                file_owned("mapped", 0o6755, 0, 0, b"a"),
+                file_owned("other_uid", 0o4755, 100, 0, b"b"),
+                file_owned("other_gid", 0o2755, 0, 100, b"c"),
+            ],
+            policy_1000(),
+            owner_1000,
+        );
+        assert_eq!(r.special_bits.preserved_files, 1);
+        assert_eq!(r.files_with_stripped_special_bits, 2);
+        assert_eq!(mode_of(&sb.root.join("mapped")), 0o6755);
+        assert_eq!(mode_of(&sb.root.join("other_uid")), 0o755);
+        assert_eq!(mode_of(&sb.root.join("other_gid")), 0o755);
+    }
+
+    /// SEC-5 / SEC-1: 書いたファイルの所有者が host root（uid / gid 0）なら setuid / setgid を残さない。
+    /// sticky だけの mode は、ポリシー全体の条件を満たすため残る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec5_special_bits_dropped_when_file_owner_is_host_root() {
+        let sb = Sandbox::new();
+        chmod_root(&sb, 0o700);
+        let root_map = IdRange {
+            container_id: 0,
+            host_id: 0,
+            count: 1,
+        };
+        let policy = SpecialBitsPolicy::PreserveIfOwnerMapped {
+            uid: root_map,
+            gid: root_map,
+        };
+        let r = run_policy(&sb, &special_entries(), policy, owner_root);
+        assert_eq!(r.special_bits.preserved_files, 1);
+        assert_eq!(r.files_with_stripped_special_bits, 3);
+        assert_eq!(mode_of(&sb.root.join("suid")), 0o755);
+        assert_eq!(mode_of(&sb.root.join("sgid")), 0o755);
+        assert_eq!(mode_of(&sb.root.join("both")), 0o711);
+        assert_eq!(mode_of(&sb.root.join("sticky")), 0o1644);
+    }
+
+    /// SEC-5: PAX の `uid` が数値でないときは tar の uid を信用せず、setuid を落とす。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec5_special_bits_dropped_when_pax_uid_is_malformed() {
+        let sb = Sandbox::new();
+        chmod_root(&sb, 0o700);
+        let body = pax_record("uid", "not-a-number");
+        let px = raw_entry(
+            b"pax",
+            EntryType::XHeader,
+            b"",
+            0o644,
+            body.len() as u64,
+            &body,
+        );
+        let r = run_policy(
+            &sb,
+            &[px, file_owned("suid", 0o4755, 0, 0, b"a")],
+            policy_1000(),
+            owner_1000,
+        );
+        assert_eq!(r.special_bits.preserved_files, 0);
+        assert_eq!(r.files_with_stripped_special_bits, 1);
+        assert_eq!(mode_of(&sb.root.join("suid")), 0o755);
+    }
+
+    /// SEC-5: ポリシーが `Strip` なら、条件が整っていても落とす。
+    #[cfg(unix)]
+    #[test]
+    fn sec5_strip_policy_ignores_owner_mapping() {
+        let sb = Sandbox::new();
+        chmod_root(&sb, 0o700);
+        let r = run_policy(
+            &sb,
+            &special_entries(),
+            SpecialBitsPolicy::Strip,
+            owner_1000,
+        );
+        assert_eq!(r.special_bits.decision, SpecialBitsDecision::StripPolicy);
+        assert_eq!(r.files_with_stripped_special_bits, 4);
+        assert_eq!(mode_of(&sb.root.join("both")), 0o711);
+    }
+
+    /// SEC-5: Linux 以外の unix では `PreserveIfOwnerMapped` でも落とす。
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn sec5_non_linux_host_always_strips() {
+        let sb = Sandbox::new();
+        chmod_root(&sb, 0o700);
+        let r = run_policy(&sb, &special_entries(), policy_1000(), owner_1000);
+        assert_eq!(
+            r.special_bits.decision,
+            SpecialBitsDecision::UnsupportedHost
+        );
+        assert_eq!(r.files_with_stripped_special_bits, 4);
+    }
+
+    /// OCI-1: ディレクトリの setgid（遅延適用の経路を含む）は、どのポリシーでも tar の値で適用する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci1_directory_setgid_is_applied() {
+        use std::os::unix::fs::MetadataExt as _;
+        for policy in [SpecialBitsPolicy::Strip, policy_1000()] {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o700);
+            run_policy(
+                &sb,
+                &[
+                    dir("shared/", 0o2775),
+                    file_owned("shared/f", 0o644, 0, 0, b"x"),
+                    dir("locked/", 0o2555),
+                    dir("tmp/", 0o1777),
+                ],
+                policy,
+                owner_1000,
+            );
+            assert_eq!(mode_of(&sb.root.join("shared")), 0o2775);
+            assert_eq!(mode_of(&sb.root.join("locked")), 0o2555);
+            assert_eq!(mode_of(&sb.root.join("tmp")), 0o1777);
+            let gid = |p: &str| fs::metadata(sb.root.join(p)).unwrap().gid();
+            assert_eq!(gid("shared/f"), gid("shared"));
+        }
+    }
+
+    /// SEC-5: `IdRange::map_to_host` の境界（範囲外・長さ 0・オーバーフローは `None`）。
+    #[test]
+    fn sec5_id_range_maps_with_checked_arithmetic() {
+        let r = IdRange {
+            container_id: 10,
+            host_id: 1000,
+            count: 3,
+        };
+        assert_eq!(r.map_to_host(9), None);
+        assert_eq!(r.map_to_host(10), Some(1000));
+        assert_eq!(r.map_to_host(12), Some(1002));
+        assert_eq!(r.map_to_host(13), None);
+        let empty = IdRange { count: 0, ..r };
+        assert_eq!(empty.map_to_host(10), None);
+        let wrap = IdRange {
+            container_id: 0,
+            host_id: u32::MAX,
+            count: 5,
+        };
+        assert_eq!(wrap.map_to_host(0), Some(u32::MAX));
+        assert_eq!(wrap.map_to_host(1), None);
+    }
+
+    /// SEC-5: `special_bits_to_keep` の条件の組み合わせを具体値で照合する。
+    #[test]
+    fn sec5_special_bits_to_keep_matrix() {
+        let r = IdRange {
+            container_id: 0,
+            host_id: 1000,
+            count: 1,
+        };
+        let ctx = SpecialCtx {
+            decision: SpecialBitsDecision::Evaluated,
+            ranges: Some((r, r)),
+            root_uid: 1000,
+            owner_of: owner_1000,
+        };
+        let all = S_ISUID | S_ISGID | S_ISVTX;
+        let k = |req, ids, owner| special_bits_to_keep(req, ids, owner, &ctx);
+        assert_eq!(k(all, (Some(0), Some(0)), (1000, 1000)), all);
+        assert_eq!(k(all, (Some(1), Some(0)), (1000, 1000)), S_ISGID | S_ISVTX);
+        assert_eq!(k(all, (Some(0), Some(1)), (1000, 1000)), S_ISUID | S_ISVTX);
+        assert_eq!(k(all, (None, None), (1000, 1000)), S_ISVTX);
+        // root の所有者とファイルの所有者が違うなら何も残さない。
+        assert_eq!(k(all, (Some(0), Some(0)), (1001, 1000)), 0);
+        // ホスト root 所有（uid / gid 0）は写像が 0 を指していても setuid / setgid を残さない。
+        let root_map = IdRange {
+            container_id: 0,
+            host_id: 0,
+            count: 1,
+        };
+        let root_ctx = SpecialCtx {
+            ranges: Some((root_map, root_map)),
+            root_uid: 0,
+            ..ctx
+        };
+        assert_eq!(
+            special_bits_to_keep(all, (Some(0), Some(0)), (0, 0), &root_ctx),
+            S_ISVTX
+        );
+        let strip = SpecialCtx::strip();
+        assert_eq!(
+            special_bits_to_keep(all, (Some(0), Some(0)), (1000, 1000), &strip),
+            0
+        );
+    }
     // ---- 複数レイヤーの重ね合わせ（TASK-52.4・OCI-1・#410） ----
 
     const LIM: fn() -> ExtractLimits = || ExtractLimits::new(1000, 1 << 20, 1 << 30, 1 << 20);
@@ -3036,6 +3666,7 @@ mod tests {
             &sb.root,
             limits,
             lstat,
+            SpecialSetup::host(SpecialBitsPolicy::Strip),
         )
     }
 
@@ -3360,6 +3991,8 @@ mod tests {
             entries: 0,
             bytes: 0,
             stripped_special: 0,
+            preserved_special: 0,
+            special: SpecialCtx::strip(),
             deferred_dirs: HashMap::new(),
             names: NameIndex::new(limits.max_tracked_paths),
             layer_nodes: HashSet::new(),

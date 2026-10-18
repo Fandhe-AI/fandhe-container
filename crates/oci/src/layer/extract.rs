@@ -3671,4 +3671,429 @@ mod tests {
         assert_eq!(e.code(), OciErrorCode::AlreadyExists);
         assert_eq!(fs::read(sb.root.join("d/f")).unwrap(), b"x");
     }
+
+    // ---- パイプラインへの統合（レイヤーごとの 3 パス。TASK-53.3・OCI-2・#414） ----
+
+    /// whiteout・不透明マーカー（中身の無い通常ファイル）。
+    fn wh(name: &str) -> Vec<u8> {
+        file(name, 0o644, b"")
+    }
+
+    fn lay_err(ex: &mut Extractor<'_>, entries: &[Vec<u8>]) -> OciErrorCode {
+        extract_one_layer(ex, &mut Rewind::new(Cursor::new(archive(entries))), 1 << 30)
+            .unwrap_err()
+            .code()
+    }
+
+    /// `root` 配下の全ノード（相対パス → 種別と内容。ディレクトリは unix では mode も）。最終 rootfs の比較用。
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<String, String> {
+        fn walk(dir: &Path, prefix: &str, out: &mut std::collections::BTreeMap<String, String>) {
+            for e in fs::read_dir(dir).unwrap() {
+                let e = e.unwrap();
+                let rel = format!("{prefix}{}", e.file_name().into_string().unwrap());
+                let p = e.path();
+                let m = fs::symlink_metadata(&p).unwrap();
+                if m.file_type().is_symlink() {
+                    let t = fs::read_link(&p).unwrap();
+                    out.insert(rel, format!("link:{}", t.display()));
+                } else if m.is_dir() {
+                    #[cfg(unix)]
+                    let kind = format!("dir:{:o}", mode_of(&p));
+                    #[cfg(not(unix))]
+                    let kind = "dir".to_string();
+                    out.insert(rel.clone(), kind);
+                    walk(&p, &format!("{rel}/"), out);
+                } else {
+                    let data = fs::read(&p).unwrap();
+                    out.insert(rel, format!("file:{}", String::from_utf8_lossy(&data)));
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(root, "", &mut out);
+        out
+    }
+
+    /// `items` の全順列。
+    fn permutations<T: Clone>(items: &[T]) -> Vec<Vec<T>> {
+        if items.len() <= 1 {
+            return vec![items.to_vec()];
+        }
+        let mut out = Vec::new();
+        for i in 0..items.len() {
+            let mut rest = items.to_vec();
+            let head = rest.remove(i);
+            for mut tail in permutations(&rest) {
+                tail.insert(0, head.clone());
+                out.push(tail);
+            }
+        }
+        out
+    }
+
+    /// OCI-2: 下位 `lower` に上位 `upper` を重ねる展開を、`upper` のエントリの全順列で行い、最終 rootfs（失敗なら
+    /// エラーコード）がすべて一致することを確かめて、その結果を返す。
+    fn all_orders(
+        lower: &[Vec<u8>],
+        upper: &[Vec<u8>],
+    ) -> Result<std::collections::BTreeMap<String, String>, OciErrorCode> {
+        let mut first: Option<Result<_, OciErrorCode>> = None;
+        for order in permutations(upper) {
+            let sb = Sandbox::new();
+            let got = run_stack(&sb, &[lower.to_vec(), order], LIM(), host_lstat)
+                .map(|_| snapshot(&sb.root))
+                .map_err(|e| e.code());
+            sb.assert_outside_untouched();
+            match &first {
+                None => first = Some(got),
+                Some(f) => assert_eq!(&got, f, "result depends on the entry order"),
+            }
+        }
+        first.unwrap()
+    }
+
+    fn snap(items: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        items
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    const D755: &str = "dir:755";
+    #[cfg(not(unix))]
+    const D755: &str = "dir";
+
+    /// OCI-2: 同一レイヤー内のマーカーと通常エントリは、どの並びでも同じ最終 rootfs になる
+    /// （`.wh.d` + ファイル `d` の再作成・不透明 + 同じレイヤーの子・`.wh.d` + `d/x`・`.wh.foo` + `foo`）。
+    #[test]
+    fn oci2_same_layer_markers_and_entries_are_order_independent() {
+        let r = all_orders(
+            &[file("d/x", 0o644, b"x"), file("keep", 0o644, b"k")],
+            &[wh(".wh.d"), file("d", 0o644, b"new")],
+        );
+        assert_eq!(r.unwrap(), snap(&[("d", "file:new"), ("keep", "file:k")]));
+
+        let r = all_orders(
+            &[
+                file("d/old", 0o644, b"o"),
+                file("d/sub/x", 0o644, b"x"),
+                file("e", 0o644, b"e"),
+            ],
+            &[
+                file("d/before", 0o644, b"b"),
+                wh("d/.wh..wh..opq"),
+                file("d/after", 0o644, b"a"),
+            ],
+        );
+        assert_eq!(
+            r.unwrap(),
+            snap(&[
+                ("d", D755),
+                ("d/after", "file:a"),
+                ("d/before", "file:b"),
+                ("e", "file:e"),
+            ])
+        );
+
+        let r = all_orders(
+            &[file("d/x", 0o644, b"old"), file("d/z", 0o644, b"z")],
+            &[wh(".wh.d"), file("d/x", 0o644, b"new")],
+        );
+        assert_eq!(r.unwrap(), snap(&[("d", D755), ("d/x", "file:new")]));
+
+        let r = all_orders(
+            &[file("d/foo", 0o644, b"old"), file("d/bar", 0o644, b"bar")],
+            &[
+                file("d/foo", 0o644, b"new"),
+                wh("d/.wh.foo"),
+                wh("d/.wh.bar"),
+            ],
+        );
+        assert_eq!(r.unwrap(), snap(&[("d", D755), ("d/foo", "file:new")]));
+    }
+
+    /// OCI-2: 指摘されたケース。下位のディレクトリ `d` に、上位が `d`（ファイル）・旧実装の退避名と同じ
+    /// `.fandhe-displaced-0`（ファイル）・`.wh.d` を置くと、並びに依らず成功し両ファイルが残る。
+    #[test]
+    fn oci2_former_displacement_name_does_not_collide() {
+        let r = all_orders(
+            &[file("d/x", 0o644, b"x")],
+            &[
+                file("d", 0o644, b"f"),
+                file(".fandhe-displaced-0", 0o644, b"g"),
+                wh(".wh.d"),
+            ],
+        );
+        assert_eq!(
+            r.unwrap(),
+            snap(&[("d", "file:f"), (".fandhe-displaced-0", "file:g")])
+        );
+    }
+
+    /// OCI-2: 祖先の `.wh.<dir>`・不透明マーカーが下位のノードを覆い、同じレイヤーがその位置へ別の型の
+    /// ノードを置くケースも、並びに依らず成功する。
+    #[test]
+    fn oci2_ancestor_whiteout_or_opaque_covers_lower_nodes() {
+        let lower = [file("a/b/x", 0o644, b"x"), file("c", 0o644, b"c")];
+        let r = all_orders(&lower, &[file("a/b", 0o644, b"f"), wh(".wh.a")]);
+        assert_eq!(
+            r.unwrap(),
+            snap(&[("a", D755), ("a/b", "file:f"), ("c", "file:c")])
+        );
+        let r = all_orders(&lower, &[file("a/b", 0o644, b"f"), wh(".wh..wh..opq")]);
+        assert_eq!(r.unwrap(), snap(&[("a", D755), ("a/b", "file:f")]));
+        let r = all_orders(&lower, &[file("a/b", 0o644, b"f"), wh("a/.wh..wh..opq")]);
+        assert_eq!(
+            r.unwrap(),
+            snap(&[("a", D755), ("a/b", "file:f"), ("c", "file:c")])
+        );
+    }
+
+    /// OCI-2: マーカーの親が下位で非ディレクトリなら何もせず、同じレイヤーがそこをディレクトリへ置き換える
+    /// 並びと結果が同じ。マーカーなしでも下位のファイルは置き換えられる（Changeset over existing files）。
+    #[test]
+    fn oci2_marker_under_lower_file_is_noop_in_all_orders() {
+        for marker in ["d/.wh.x", "d/.wh..wh..opq"] {
+            let r = all_orders(&[file("d", 0o644, b"f")], &[wh(marker), dir("d/", 0o755)]);
+            assert_eq!(r.unwrap(), snap(&[("d", D755)]), "{marker}");
+            let r = all_orders(&[file("d", 0o644, b"f")], &[wh(marker)]);
+            assert_eq!(r.unwrap(), snap(&[("d", "file:f")]), "{marker}");
+        }
+    }
+
+    /// OCI-2: symlink を経由する親のマーカーと、その symlink 自身の whiteout は、削除の前に下位ツリーで
+    /// 解決するため並びに依らない（リンク先の `real/x` も symlink `lnk` も消える）。マーカーは同じレイヤーが
+    /// 作る symlink を経由しない（下位に `d` が無いので `real` は無傷）。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_markers_resolve_against_lower_tree_in_all_orders() {
+        let lower = [
+            file("real/x", 0o644, b"x"),
+            file("real/y", 0o644, b"y"),
+            symlink("lnk", "real"),
+        ];
+        let r = all_orders(&lower, &[wh("lnk/.wh.x"), wh(".wh.lnk")]);
+        assert_eq!(r.unwrap(), snap(&[("real", D755), ("real/y", "file:y")]));
+        let r = all_orders(&lower, &[wh("lnk/.wh..wh..opq"), wh(".wh.lnk")]);
+        assert_eq!(r.unwrap(), snap(&[("real", D755)]));
+        let r = all_orders(&lower, &[file("lnk/new", 0o644, b"n"), wh(".wh.lnk")]);
+        assert_eq!(
+            r.unwrap(),
+            snap(&[
+                ("lnk", D755),
+                ("lnk/new", "file:n"),
+                ("real", D755),
+                ("real/x", "file:x"),
+                ("real/y", "file:y"),
+            ])
+        );
+        let r = all_orders(
+            &[file("real/x", 0o644, b"x")],
+            &[wh("d/.wh.x"), symlink("d", "real")],
+        );
+        assert_eq!(
+            r.unwrap(),
+            snap(&[("d", "link:real"), ("real", D755), ("real/x", "file:x")])
+        );
+    }
+
+    /// OCI-2: 同じレイヤーで whiteout した下位のファイルへの hardlink は、並びに依らず `NotFound`
+    /// （参照先はパス 2 で消えている）。不透明マーカーで消えた参照先への自己 hardlink も同じ。
+    #[test]
+    fn oci2_hardlink_to_whited_out_lower_file_is_not_found() {
+        let lower = [file("f", 0o644, b"data"), file("d/f", 0o644, b"x")];
+        for upper in [
+            vec![hardlink("g", "f"), wh(".wh.f")],
+            vec![hardlink("d/f", "d/f"), wh("d/.wh..wh..opq")],
+        ] {
+            assert_eq!(all_orders(&lower, &upper), Err(OciErrorCode::NotFound));
+        }
+    }
+
+    /// OCI-2: パス 1 で不正なエントリを見つけたら、先に並ぶマーカー・通常エントリを含め rootfs を一切変更しない。
+    #[test]
+    fn oci2_pass1_rejection_leaves_rootfs_unchanged() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(
+            &mut ex,
+            &[
+                file("d/x", 0o644, b"x"),
+                file("e", 0o644, b"e"),
+                dir("o/", 0o755),
+                file("o/y", 0o644, b"y"),
+            ],
+        );
+        let before = snapshot(&sb.root);
+        let head = || {
+            vec![
+                file("d/new", 0o644, b"n"),
+                wh("d/.wh.x"),
+                wh(".wh.e"),
+                wh("o/.wh..wh..opq"),
+            ]
+        };
+        for (bad, want) in [
+            (
+                file("../escape", 0o644, b"z"),
+                OciErrorCode::PermissionDenied,
+            ),
+            (wh("d/.wh..wh.plnk"), OciErrorCode::InvalidArgument),
+            (file(".wh.a/b", 0o644, b"z"), OciErrorCode::InvalidArgument),
+            (
+                file("d/.wh.y", 0o644, b"junk"),
+                OciErrorCode::InvalidArgument,
+            ),
+            (dir("d/.wh.y", 0o755), OciErrorCode::InvalidArgument),
+            (
+                raw_entry(b"fifo", EntryType::Fifo, b"", 0o644, 0, b""),
+                OciErrorCode::PermissionDenied,
+            ),
+        ] {
+            let mut entries = head();
+            entries.push(bad);
+            assert_eq!(lay_err(&mut ex, &entries), want);
+            assert_eq!(snapshot(&sb.root), before);
+        }
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2・IO-5: 別表記で既存の実体へ解決されるマーカーは、同じレイヤーの他のマーカーの削除より前に
+    /// `AlreadyExists` で拒否する（並びに依らず、下位の実体は残る）。
+    #[test]
+    fn io5_marker_alias_is_rejected_before_any_removal() {
+        for upper in [
+            vec![wh(".wh.g"), wh("d/.wh.F")],
+            vec![wh("d/.wh.F"), wh(".wh.g")],
+            vec![wh(".wh..wh..opq"), wh("D/.wh.x")],
+        ] {
+            let sb = Sandbox::new();
+            let mut ex = ex_for(&sb, folding_lstat);
+            lay(&mut ex, &[file("d/f", 0o644, b"x"), file("g", 0o644, b"g")]);
+            assert_eq!(lay_err(&mut ex, &upper), OciErrorCode::AlreadyExists);
+            assert_eq!(fs::read(sb.root.join("d/f")).unwrap(), b"x");
+            assert_eq!(fs::read(sb.root.join("g")).unwrap(), b"g");
+        }
+    }
+
+    /// OCI-2: マーカーは rootfs に残らず、本体は `bytes` に数えない（エントリ数には数える）。root の不透明は
+    /// root 自体を残し、対象・親の無い whiteout は何もしない。
+    #[test]
+    fn oci2_markers_are_not_extracted_and_missing_targets_are_noop() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(&mut ex, &[file("a", 0o644, b"1"), file("d/b", 0o644, b"2")]);
+        let (r, _) = extract_one_layer(
+            &mut ex,
+            &mut Rewind::new(Cursor::new(archive(&[
+                wh(".wh.nothing"),
+                wh("nodir/.wh.x"),
+            ]))),
+            1 << 30,
+        )
+        .unwrap();
+        assert_eq!((r.entries, r.bytes), (2, 0));
+        assert_eq!(names_in(&sb.root), vec!["a".to_string(), "d".to_string()]);
+        lay(&mut ex, &[wh(".wh..wh..opq"), file("n", 0o644, b"n")]);
+        assert!(sb.root.is_dir());
+        assert_eq!(names_in(&sb.root), vec!["n".to_string()]);
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2: whiteout はルート外を指す symlink の親を経由してもルート外へ出ず、symlink はリンクだけを消す。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_pipeline_whiteout_does_not_follow_symlinks() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(
+            &mut ex,
+            &[
+                file("real/keep", 0o644, b"k"),
+                symlink("lnk", "real"),
+                symlink("abs", "/"),
+            ],
+        );
+        lay(&mut ex, &[wh(".wh.lnk"), wh("abs/.wh.sentinel")]);
+        assert!(fs::symlink_metadata(sb.root.join("lnk")).is_err());
+        assert_eq!(fs::read(sb.root.join("real/keep")).unwrap(), b"k");
+        assert!(fs::symlink_metadata(sb.root.join("abs")).is_ok());
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2: 遅延 mode（0000・0555）の下位ディレクトリを whiteout・不透明にし、同じレイヤーが同名を作り直しても、
+    /// `finish_dirs` が成功して作り直した側の mode になる（並びに依らない）。
+    #[test]
+    #[cfg(unix)]
+    fn oci2_deferred_dir_modes_follow_markers_in_all_orders() {
+        let lower = [
+            dir("a", 0o000),
+            file("a/x", 0o644, b"x"),
+            dir("o", 0o555),
+            file("o/y", 0o644, b"y"),
+        ];
+        let r = all_orders(&lower, &[wh(".wh.a"), file("a/new", 0o644, b"n")]);
+        assert_eq!(
+            r.unwrap(),
+            snap(&[
+                ("a", "dir:755"),
+                ("a/new", "file:n"),
+                ("o", "dir:555"),
+                ("o/y", "file:y"),
+            ])
+        );
+        let r = all_orders(&lower, &[wh(".wh.a"), wh("o/.wh..wh..opq")]);
+        assert_eq!(r.unwrap(), snap(&[("o", "dir:555")]));
+    }
+
+    /// OCI-2: 大量の whiteout（10 万件。実在する対象・遅延 mode のディレクトリ・存在しない対象を含む）が
+    /// 線形時間で終わる（索引の削除は外す件数に比例し、全登録を走査しない）。
+    #[test]
+    fn oci2_many_whiteouts_complete_in_linear_time() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        ex.limits = ExtractLimits::new(300_000, 1 << 20, 1 << 32, 300_000);
+        let (files, dirs, total) = (5000, 2000, 100_000);
+        let mut lower: Vec<Vec<u8>> = (0..files)
+            .map(|i| file(&format!("d/f{i}"), 0o644, b""))
+            .collect();
+        lower.extend((0..dirs).map(|i| dir(&format!("d/s{i}/"), 0o555)));
+        lay(&mut ex, &lower);
+        let mut upper: Vec<Vec<u8>> = (0..files).map(|i| wh(&format!("d/.wh.f{i}"))).collect();
+        upper.extend((0..dirs).map(|i| wh(&format!("d/.wh.s{i}"))));
+        upper.extend((files + dirs..total).map(|i| wh(&format!("d/.wh.m{i}"))));
+        let t = std::time::Instant::now();
+        lay(&mut ex, &upper);
+        assert!(t.elapsed() < std::time::Duration::from_secs(30));
+        assert!(names_in(&sb.root.join("d")).is_empty());
+        assert!(ex.deferred_dirs.is_empty());
+        ex.finish_dirs().unwrap();
+    }
+
+    /// OCI-2: 不透明マーカーが大量（10 万件。同じディレクトリの重複を含む）でも、同じレイヤーの子を多数持つ
+    /// レイヤーが線形時間で終わり、同じレイヤーの子は残る。
+    #[test]
+    fn oci2_many_opaque_markers_complete_in_linear_time() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        ex.limits = ExtractLimits::new(300_000, 1 << 20, 1 << 32, 300_000);
+        let n = 3000;
+        lay(
+            &mut ex,
+            &(0..n)
+                .map(|i| file(&format!("o{i}/old"), 0o644, b""))
+                .collect::<Vec<_>>(),
+        );
+        let mut upper: Vec<Vec<u8>> = (0..n)
+            .map(|i| file(&format!("d/f{i}"), 0o644, b""))
+            .collect();
+        upper.extend((0..n).map(|i| wh(&format!("o{i}/.wh..wh..opq"))));
+        upper.extend((2 * n..100_000).map(|_| wh("d/.wh..wh..opq")));
+        let t = std::time::Instant::now();
+        lay(&mut ex, &upper);
+        assert!(t.elapsed() < std::time::Duration::from_secs(30));
+        assert_eq!(names_in(&sb.root.join("d")).len(), n);
+        assert!(names_in(&sb.root.join("o0")).is_empty());
+    }
 }

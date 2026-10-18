@@ -1361,6 +1361,7 @@ mod tests {
         }
 
         /// 次の launch が返すハンドルに持たせる分離の記録を設定する。
+        #[cfg(target_os = "linux")]
         fn set_isolation(&self, record: crate::launch_isolation::LaunchIsolationRecord) {
             *self.isolation.lock().unwrap_or_else(|e| e.into_inner()) = Some(record);
         }
@@ -2274,6 +2275,7 @@ mod tests {
     }
 
     /// 試験用の分離の記録(`/` が `(dev, ino)`・Landlock は rootfs のルール 1 件)。
+    #[cfg(target_os = "linux")]
     fn iso_record(dev: u64, ino: u64) -> crate::launch_isolation::LaunchIsolationRecord {
         use crate::launch_isolation::{
             LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
@@ -2285,6 +2287,7 @@ mod tests {
     }
 
     /// SUP-6(#2007): ハンドルが持つ分離の記録は、Running の更新と同じ update で状態へ載る。
+    #[cfg(target_os = "linux")]
     #[test]
     fn sup6_running_record_carries_launch_isolation() {
         let (_b, store) = created("iso-carry");
@@ -2304,6 +2307,7 @@ mod tests {
     }
 
     /// SUP-6(#2007): 記録を持たないハンドルでは、従来どおり分離の記録は付かない。
+    #[cfg(target_os = "linux")]
     #[test]
     fn sup6_running_record_without_launch_isolation_is_unchanged() {
         let (_b, store) = created("iso-none");
@@ -2313,6 +2317,7 @@ mod tests {
     }
 
     /// SEC-1・SUP-6(#2007): Running の更新に失敗したら Created へ戻り、分離の記録も残らない。
+    #[cfg(target_os = "linux")]
     #[test]
     fn sec1_failed_running_write_leaves_no_launch_isolation() {
         let b = Bundle::new("iso-upd-fail");

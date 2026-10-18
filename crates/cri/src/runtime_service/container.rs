@@ -16,8 +16,8 @@
 
 use std::collections::HashMap;
 
+use crate::error::CriError;
 use prost::Message;
-use tonic::Status;
 
 use super::config_limits::{
     MAX_CONFIG_COLLECTION_ENTRIES, MAX_CONFIG_ENCODED_BYTES, MAX_METADATA_FIELD_BYTES,
@@ -218,7 +218,7 @@ pub(super) struct ValidatedContainerFilter {
 
 impl ValidatedContainerFilter {
     /// 件数・文字列長・合計バイト数の上限と state 値を検証する（ERR-3: `INVALID_ARGUMENT`）。
-    pub(super) fn new(filter: Option<v1::ContainerFilter>) -> Result<Self, Status> {
+    pub(super) fn new(filter: Option<v1::ContainerFilter>) -> Result<Self, CriError> {
         let Some(filter) = filter else {
             return Ok(Self {
                 id: String::new(),
@@ -239,7 +239,7 @@ impl ValidatedContainerFilter {
                 Ok(ProtoContainerState::ContainerRunning) => (Some(ContainerState::Running), false),
                 Ok(ProtoContainerState::ContainerExited) => (Some(ContainerState::Exited), false),
                 Ok(ProtoContainerState::ContainerUnknown) => (Some(ContainerState::Unknown), false),
-                Err(_) => return Err(Status::invalid_argument("unknown state filter")),
+                Err(_) => return Err(CriError::invalid_argument("unknown state filter")),
             },
         };
         Ok(Self {
@@ -277,45 +277,47 @@ pub(super) struct ValidatedCreate {
 /// 状態には触れない。`sandbox_config` は保持せず（サンドボックス記録側が正）、符号化長の上限だけ検査する。
 pub(super) fn validate_create_request(
     req: v1::CreateContainerRequest,
-) -> Result<ValidatedCreate, Status> {
+) -> Result<ValidatedCreate, CriError> {
     let v1::CreateContainerRequest {
         pod_sandbox_id,
         config,
         sandbox_config,
     } = req;
     if pod_sandbox_id.is_empty() {
-        return Err(Status::invalid_argument("pod_sandbox_id is required"));
+        return Err(CriError::invalid_argument("pod_sandbox_id is required"));
     }
-    let config = config.ok_or_else(|| Status::invalid_argument("config is required"))?;
+    let config = config.ok_or_else(|| CriError::invalid_argument("config is required"))?;
     let metadata = config
         .metadata
         .as_ref()
-        .ok_or_else(|| Status::invalid_argument("config.metadata is required"))?;
+        .ok_or_else(|| CriError::invalid_argument("config.metadata is required"))?;
     if metadata.name.is_empty() {
-        return Err(Status::invalid_argument("config.metadata.name is required"));
+        return Err(CriError::invalid_argument(
+            "config.metadata.name is required",
+        ));
     }
     let image = config
         .image
         .as_ref()
-        .ok_or_else(|| Status::invalid_argument("config.image is required"))?;
+        .ok_or_else(|| CriError::invalid_argument("config.image is required"))?;
     if image.image.is_empty() {
-        return Err(Status::invalid_argument("config.image.image is required"));
+        return Err(CriError::invalid_argument("config.image.image is required"));
     }
     if let Some(sandbox_config) = sandbox_config.as_ref()
         && sandbox_config.encoded_len() > MAX_CONFIG_ENCODED_BYTES
     {
-        return Err(Status::invalid_argument("sandbox_config is too large"));
+        return Err(CriError::invalid_argument("sandbox_config is too large"));
     }
     // 複製の前に、参照のまま名前長と config 全体の符号化長を検証する（確保前に上限検証）。
     if metadata.name.len() > MAX_METADATA_FIELD_BYTES {
-        return Err(Status::invalid_argument(format!(
+        return Err(CriError::invalid_argument(format!(
             "config.metadata.name is too long: {} bytes exceeds the limit of {MAX_METADATA_FIELD_BYTES} bytes",
             metadata.name.len()
         )));
     }
     let encoded_len = config.encoded_len();
     if encoded_len > MAX_CONFIG_ENCODED_BYTES {
-        return Err(Status::invalid_argument(format!(
+        return Err(CriError::invalid_argument(format!(
             "config is too large: {encoded_len} bytes exceeds the limit of {MAX_CONFIG_ENCODED_BYTES} bytes"
         )));
     }
@@ -343,12 +345,12 @@ impl BoundedContainerConfig {
     /// `config` を検証し、保持用に作り直す。上限超過は `INVALID_ARGUMENT`（ERR-3）。
     ///
     /// 作り直し（符号化して復号）は内容を変えず、呼び出し元が確保した余分な容量を捨てる。
-    pub(super) fn new(config: ContainerConfig) -> Result<Self, Status> {
+    pub(super) fn new(config: ContainerConfig) -> Result<Self, CriError> {
         let retained_bytes = retained_bytes(&config)?;
         let encoded = config.encode_to_vec();
         drop(config);
         let config = ContainerConfig::decode(encoded.as_slice())
-            .map_err(|_| Status::internal("failed to rebuild container config"))?;
+            .map_err(|_| CriError::internal("failed to rebuild container config"))?;
         Ok(Self {
             config,
             retained_bytes,
@@ -367,17 +369,17 @@ impl BoundedContainerConfig {
 }
 
 /// `config` を検証し、保持量の見積もりを返す（アロケーションなし。演算は checked）。
-fn retained_bytes(config: &ContainerConfig) -> Result<usize, Status> {
+fn retained_bytes(config: &ContainerConfig) -> Result<usize, CriError> {
     let encoded_len = config.encoded_len();
     if encoded_len > MAX_CONFIG_ENCODED_BYTES {
-        return Err(Status::invalid_argument(format!(
+        return Err(CriError::invalid_argument(format!(
             "config is too large: {encoded_len} bytes exceeds the limit of {MAX_CONFIG_ENCODED_BYTES} bytes"
         )));
     }
     if let Some(metadata) = config.metadata.as_ref()
         && metadata.name.len() > MAX_METADATA_FIELD_BYTES
     {
-        return Err(Status::invalid_argument(format!(
+        return Err(CriError::invalid_argument(format!(
             "config.metadata.name is too long: {} bytes exceeds the limit of {MAX_METADATA_FIELD_BYTES} bytes",
             metadata.name.len()
         )));
@@ -385,13 +387,13 @@ fn retained_bytes(config: &ContainerConfig) -> Result<usize, Status> {
     let mut entries: usize = 0;
     for_each_collection(config, &mut |field, len| {
         if len > MAX_CONFIG_COLLECTION_ENTRIES {
-            return Err(Status::invalid_argument(format!(
+            return Err(CriError::invalid_argument(format!(
                 "config.{field} has too many entries: {len} exceeds the limit of {MAX_CONFIG_COLLECTION_ENTRIES}"
             )));
         }
         entries = entries
             .checked_add(len)
-            .ok_or_else(|| Status::invalid_argument("config has too many entries"))?;
+            .ok_or_else(|| CriError::invalid_argument("config has too many entries"))?;
         Ok(())
     })?;
     entries
@@ -399,7 +401,7 @@ fn retained_bytes(config: &ContainerConfig) -> Result<usize, Status> {
         .and_then(|overhead| overhead.checked_add(mounts_struct_bytes(config.mounts.len())?))
         .and_then(|overhead| overhead.checked_add(encoded_len))
         .and_then(|bytes| bytes.checked_add(RETAINED_BYTES_PER_RECORD))
-        .ok_or_else(|| Status::invalid_argument("config is too large"))
+        .ok_or_else(|| CriError::invalid_argument("config is too large"))
 }
 
 /// `mounts` の要素（`Mount` 本体）の保持量の上乗せ（符号化長・[`RETAINED_BYTES_PER_ENTRY`] に含まれない分）。
@@ -412,13 +414,13 @@ fn mounts_struct_bytes(count: usize) -> Option<usize> {
     count.checked_mul(std::mem::size_of::<v1::Mount>().checked_mul(2)?)
 }
 
-type Visit<'a> = &'a mut dyn FnMut(&'static str, usize) -> Result<(), Status>;
+type Visit<'a> = &'a mut dyn FnMut(&'static str, usize) -> Result<(), CriError>;
 
 /// `config` から辿れる repeated / map フィールドを、(フィールド名, 件数) で順に `visit` へ渡す。
 ///
 /// 各メッセージを `..` なしで分解し、cri-api の更新でフィールドが増えたらコンパイルエラーにして
 /// 件数検証の入れ忘れを防ぐ（REPAIR-12。`config_limits` と同じ狙い）。
-fn for_each_collection(config: &ContainerConfig, visit: Visit<'_>) -> Result<(), Status> {
+fn for_each_collection(config: &ContainerConfig, visit: Visit<'_>) -> Result<(), CriError> {
     let ContainerConfig {
         metadata: _,
         image,
@@ -519,7 +521,7 @@ fn for_each_collection(config: &ContainerConfig, visit: Visit<'_>) -> Result<(),
 fn visit_linux_resources(
     resources: &LinuxContainerResources,
     visit: Visit<'_>,
-) -> Result<(), Status> {
+) -> Result<(), CriError> {
     let LinuxContainerResources {
         cpu_period: _,
         cpu_quota: _,
@@ -542,7 +544,7 @@ fn visit_linux_resources(
 fn visit_linux_security_context(
     security_context: &LinuxContainerSecurityContext,
     visit: Visit<'_>,
-) -> Result<(), Status> {
+) -> Result<(), CriError> {
     let LinuxContainerSecurityContext {
         capabilities,
         privileged: _,
@@ -645,7 +647,7 @@ mod tests {
     fn code_of(req: v1::CreateContainerRequest) -> Code {
         validate_create_request(req)
             .err()
-            .map(|s| s.code())
+            .map(|s| s.code().grpc_code())
             .unwrap()
     }
 
@@ -691,7 +693,10 @@ mod tests {
         let mut c = base_config();
         c.command = vec![String::new(); MAX_CONFIG_COLLECTION_ENTRIES + 1];
         assert_eq!(
-            BoundedContainerConfig::new(c).unwrap_err().code(),
+            BoundedContainerConfig::new(c)
+                .unwrap_err()
+                .code()
+                .grpc_code(),
             Code::InvalidArgument
         );
         let mut c = base_config();
@@ -703,7 +708,10 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(
-            BoundedContainerConfig::new(c).unwrap_err().code(),
+            BoundedContainerConfig::new(c)
+                .unwrap_err()
+                .code()
+                .grpc_code(),
             Code::InvalidArgument
         );
         let mut c = base_config();
@@ -712,7 +720,10 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(
-            BoundedContainerConfig::new(c).unwrap_err().code(),
+            BoundedContainerConfig::new(c)
+                .unwrap_err()
+                .code()
+                .grpc_code(),
             Code::InvalidArgument
         );
     }
@@ -723,7 +734,10 @@ mod tests {
         let mut c = base_config();
         c.log_path = "x".repeat(MAX_CONFIG_ENCODED_BYTES);
         assert_eq!(
-            BoundedContainerConfig::new(c).unwrap_err().code(),
+            BoundedContainerConfig::new(c)
+                .unwrap_err()
+                .code()
+                .grpc_code(),
             Code::InvalidArgument
         );
         let mut c = base_config();
@@ -732,7 +746,10 @@ mod tests {
         let mut c = base_config();
         c.metadata.as_mut().unwrap().name = "n".repeat(MAX_METADATA_FIELD_BYTES + 1);
         assert_eq!(
-            BoundedContainerConfig::new(c).unwrap_err().code(),
+            BoundedContainerConfig::new(c)
+                .unwrap_err()
+                .code()
+                .grpc_code(),
             Code::InvalidArgument
         );
     }
@@ -758,7 +775,10 @@ mod tests {
         );
         c.mounts = vec![mount_with(MAX_CONFIG_COLLECTION_ENTRIES + 1)];
         assert_eq!(
-            BoundedContainerConfig::new(c).unwrap_err().code(),
+            BoundedContainerConfig::new(c)
+                .unwrap_err()
+                .code()
+                .grpc_code(),
             Code::InvalidArgument
         );
     }

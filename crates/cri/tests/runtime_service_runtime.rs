@@ -465,7 +465,7 @@ async fn task_59_2_unexpected_runtime_state_is_internal() {
 
 /// REPAIR-5・fail-closed: 応答不明の失敗（Timeout・Unavailable・Internal）は CONTAINER_UNKNOWN にし（CRI-2）、再 Start させない。
 #[tokio::test]
-async fn task_59_2_ambiguous_start_failure_marks_exited() {
+async fn task_59_2_ambiguous_start_failure_marks_unknown() {
     for code in [
         ErrorCode::Timeout,
         ErrorCode::Unavailable,
@@ -598,7 +598,7 @@ async fn task_59_2_outcomes_are_recorded() {
     assert_eq!(lines.len(), 3, "{lines:?}");
     assert_eq!(lines[0].1, "OK");
     assert_eq!(lines[1].1, "DEADLINE_EXCEEDED");
-    // タイムアウトは結果不明のため exited になり、再 Start は拒否される。
+    // タイムアウトは結果不明のため unknown(CONTAINER_UNKNOWN)になり、再 Start は拒否される。
     assert_eq!(lines[2].1, "FAILED_PRECONDITION");
 }
 
@@ -719,7 +719,7 @@ fn release_count(h: &Harness) -> usize {
         .count()
 }
 
-/// REPAIR-5: 結果不明の create 失敗で削除完了を確認できなければ、記録（exited）と bundle を保持する。
+/// REPAIR-5: 結果不明の create 失敗で削除完了を確認できなければ、記録（unknown）と bundle を保持する。
 #[tokio::test]
 async fn task_59_2_ambiguous_create_failure_retains_record_and_bundle() {
     for code in [
@@ -797,9 +797,9 @@ fn task_59_2_timeout_does_not_depend_on_blocking_pool() {
     });
 }
 
-/// REPAIR-5: Start の FailedPrecondition でも state が Created 以外なら結果不明として exited にする。
+/// REPAIR-5: Start の FailedPrecondition でも state が Created 以外なら結果不明として unknown にする。
 #[tokio::test]
-async fn task_59_2_start_precondition_failure_with_non_created_state_marks_exited() {
+async fn task_59_2_start_precondition_failure_with_non_created_state_marks_unknown() {
     let h = harness();
     let sb = run_sandbox(&h.service).await;
     let id = create(&h.service, &sb, "c").await.expect("create");
@@ -876,7 +876,7 @@ async fn task_59_2_hung_cleanup_delete_is_bounded() {
     *h.runtime.fail_create.lock().unwrap() = Some(ErrorCode::Internal);
     h.runtime.hold_delete.store(true, Ordering::SeqCst);
     create(&service, &sb, "c").await.expect_err("create");
-    // delete は止まったままでも、worker が期限で打ち切って記録を exited にして in_flight を解く。
+    // delete は止まったままでも、worker が期限で打ち切って記録を unknown にして in_flight を解く。
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let id = loop {
         let resp = RuntimeService::list_containers(
@@ -1017,7 +1017,7 @@ async fn cri_2_repair_5_create_returning_creating_is_not_complete() {
     assert!(h.runtime.calls().iter().all(|c| !c.starts_with("start ")));
 }
 
-/// CRI-2・REPAIR-5: start 失敗後の状態照会が creating でも「created のまま」と確定せず、exited にする。
+/// CRI-2・REPAIR-5: start 失敗後の状態照会が creating でも「created のまま」と確定せず、unknown にする。
 #[tokio::test]
 async fn cri_2_repair_5_start_failure_with_creating_state_is_not_definite() {
     let h = harness();
@@ -1032,9 +1032,9 @@ async fn cri_2_repair_5_start_failure_with_creating_state_is_not_definite() {
     );
 }
 
-/// CRI-2・REPAIR-5: start が creating を返しても created へ戻さず exited にする。
+/// CRI-2・REPAIR-5: start が creating を返しても created へ戻さず unknown にする。
 #[tokio::test]
-async fn cri_2_repair_5_start_returning_creating_marks_exited() {
+async fn cri_2_repair_5_start_returning_creating_marks_unknown() {
     let h = harness();
     let sb = run_sandbox(&h.service).await;
     let id = create(&h.service, &sb, "c").await.expect("create");

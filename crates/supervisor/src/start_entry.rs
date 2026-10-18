@@ -258,12 +258,10 @@ fn log_legacy_tiocsti_to(
 /// supervisor が自分で観測して残す。`stderr_sink` の常駐スレッドを作るので、単一スレッド前提の区間が終わった後
 /// （`oci_runtime::start` の成功後）にだけ呼ぶ。fd 2 が socket の構成では core の出力と重複するが、出力先が別なので
 /// 許容する。restart の再 launch では再出力しない（host のグローバルな値で、初回に記録済みのため）。
-/// 残余: この呼び出しを消しても単体試験では検出できない（global の sink は差し替え後に初期化し直せない）。
-fn log_legacy_tiocsti() {
-    let _ = log_legacy_tiocsti_to(
-        crate::stderr_sink::stderr(),
-        fandhe_container_core::legacy_tiocsti::read_host(),
-    );
+/// 結線の検証: `observe` で観測値を差し替えられる（`run_start_until_observing`）。結合試験
+/// `tests/start_tiocsti_wiring.rs` が別プロセスで共有 sink へ届くことを照合する（REPAIR-12）。
+fn log_legacy_tiocsti(observe: fn() -> fandhe_container_core::legacy_tiocsti::LegacyTiocsti) {
+    let _ = log_legacy_tiocsti_to(crate::stderr_sink::stderr(), observe());
 }
 
 /// 回収を確かめられなかったハンドルの保管先（`Drop` は回収しないため、捨てずに保持する。REPAIR-5）。
@@ -482,7 +480,35 @@ pub fn run_start_until(
     deadline: Option<Instant>,
     out: &mut dyn Write,
 ) -> Result<Running, NonZeroU8> {
-    let result = start_reporting(deps, store, recorder, req, timeouts, deadline, out);
+    run_start_until_observing(
+        deps,
+        store,
+        recorder,
+        req,
+        timeouts,
+        deadline,
+        out,
+        fandhe_container_core::legacy_tiocsti::read_host,
+    )
+}
+
+/// [`run_start_until`] の `dev.tty.legacy_tiocsti` の観測を差し替えられる版（試験用の継ぎ目。#2008・REPAIR-12）。
+///
+/// 本番は [`run_start_until`] 経由で `read_host` を渡す。起動成功の経路から共有の `stderr_sink` へ警告が届く
+/// 結線を、host の sysctl に依らず結合試験で確かめるために公開する。
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn run_start_until_observing(
+    deps: Box<dyn StartDeps + Send>,
+    store: &Arc<dyn StateStore>,
+    recorder: &Arc<OpRecorder>,
+    req: &StartRequest,
+    timeouts: &StartTimeouts,
+    deadline: Option<Instant>,
+    out: &mut dyn Write,
+    observe: fn() -> fandhe_container_core::legacy_tiocsti::LegacyTiocsti,
+) -> Result<Running, NonZeroU8> {
+    let result = start_reporting(deps, store, recorder, req, timeouts, deadline, out, observe);
     // 満杯・書き込み失敗でも処理は止めない（ログの欠落は許す）。手順 8 の後なので常駐スレッドを作ってよい。
     let _ = crate::stderr_sink::stderr().emit(start_metrics_line(recorder).into_bytes());
     result
@@ -562,6 +588,7 @@ fn record_start(recorder: &OpRecorder, started: Instant, success: bool) {
 }
 
 /// [`run_start_until`] の本体（計測ログの出力を除く）。
+#[allow(clippy::too_many_arguments)]
 fn start_reporting(
     deps: Box<dyn StartDeps + Send>,
     store: &Arc<dyn StateStore>,
@@ -570,6 +597,7 @@ fn start_reporting(
     timeouts: &StartTimeouts,
     deadline: Option<Instant>,
     out: &mut dyn Write,
+    observe: fn() -> fandhe_container_core::legacy_tiocsti::LegacyTiocsti,
 ) -> Result<Running, NonZeroU8> {
     let started = Instant::now();
     let worker = match StartWorker::spawn(deps, store, req, *timeouts) {
@@ -596,7 +624,7 @@ fn start_reporting(
                         pid: running.process.pid(),
                     },
                 );
-                log_legacy_tiocsti();
+                log_legacy_tiocsti(observe);
                 Ok(running)
             }
             Attempt::Failed { error, cleanup } => {

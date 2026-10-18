@@ -237,6 +237,7 @@ harness = false
 
 # rootless でコンテナ内 root が作るファイルの所有者写像（ホスト視点 stat）の結合試験（CORE-6・SEC-5・TASK-40.3）。
 # 上と同じ理由で harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+# 実エントリポイントを exec まで通すため Landlock ABI 6 以上（Linux 6.12 以上）が要る（#2012）。
 [[test]]
 name = "rootless_file_owner"
 path = "tests/rootless_file_owner.rs"
@@ -244,7 +245,7 @@ harness = false
 
 # rootless での OCI Runtime ライフサイクル（create → start → kill）の結合試験と既知課題の記録
 # （CORE-6・SEC-5・TASK-40.4）。CLONE_NEWUSER のため単一スレッドの main が要り harness = false。
-# `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+# `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。Landlock ABI 6 以上（Linux 6.12 以上）が要る（#2012）。
 [[test]]
 name = "rootless"
 path = "tests/rootless.rs"
@@ -253,7 +254,7 @@ harness = false
 # rootless でコンテナ（PID 1・pivot 済み rootfs）内 root が作るファイルのホスト側所有者を照合する
 # ESC-09 相当の結合試験（CORE-6・SEC-5・TASK-44）。libtest のマルチスレッドでは CLONE_NEWUSER が
 # 拒否されるため単一スレッド main の harness = false。`-- --ignored` 指定時のみ実行する
-# 実機前提テスト（AGENTS.md）。
+# 実機前提テスト（AGENTS.md）。Landlock ABI 6 以上（Linux 6.12 以上）が要る（#2012）。
 [[test]]
 name = "rootless_uid_mapping"
 path = "tests/rootless_uid_mapping.rs"

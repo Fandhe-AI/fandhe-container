@@ -30,6 +30,15 @@
 //! - シナリオ H（start 後の状態ルート移動。#2129・SEC-1）: start が状態ルートを固定した後、launcher が子を作る前に
 //!   状態ルートを別名へ改名して同じパスに別の inode の複製を置くと、適用の段が記録パスを辿り直して食い違いを検出し fail-closed で拒否する。
 //!   状態ルートが動かない場合に受理される側はシナリオ D が担う。状態が Created のまま子が残らず、bind 先も残らないことを照合する
+//! - シナリオ J（exec 後の capability と seccomp の実効。#2012・SEC-1・CORE-5）: コンテナ内プローブ（`--with-restrictions`）の
+//!   `/proc/self/status` が `CapInh`・`CapAmb` = 0、`CapPrm`・`CapEff`・`CapBnd` = `0x0000_0000_a804_25fb`（OCI 既定の 14 個。
+//!   公開 API の `OCI_DEFAULT_CAPABILITIES` から組んだマスクとリテラルの両方と照合）で、ホストから見た同プロセスの
+//!   `/proc/<pid>/status` も同値であることを照合する。seccomp は、`mount(2)` が `EPERM`（`escape_probe_mount`。capability 不足でも
+//!   `EPERM` になり得るため網羅確認）、許可された `openat` / `read`（`/proc/thread-self/status`）が成功する対照、
+//!   `NoNewPrivs: 1`・`Seccomp: 2` を照合する
+//! - シナリオ K（exec 後の seccomp の識別的な拒否。#2012・SEC-2・CORE-5）: コンテナ内プローブ（`--seccomp-kill <name>`）が
+//!   `unshare` / `ptrace` / `kexec_load` を 1 件ずつ別の start で発行し、`ProcessExit::Signaled(31)`（SIGSYS。
+//!   `SECCOMP_RET_KILL_PROCESS`）で終了することを照合する。フィルタが無ければ `unshare(0)` は成功して戻るため識別的になる
 //! - root で実行された場合: 主経路は非 root（SEC-5）。launch が拒否され、状態が Created に戻り、子が残らないことだけを
 //!   照合する（コンテナ内 root をホスト root へ写す起動は試さない）
 //!
@@ -51,11 +60,14 @@
 //! ```
 //!
 //! 成功時の最終行: `production_launcher: pid1, default /dev nodes, landlock evidence, cgroup join verified; failed
-//! launch left no process; bind mount visible on host (root=false)`（root 実行時は拒否のみ照合する旨の別の行）。
+//! launch left no process; bind mount visible on host; post-exec capabilities and seccomp verified (root=false)`（root 実行時は拒否のみ照合する旨の別の行）。
 //!
 //! # 既知の制約（REPAIR-3）
 //! - Landlock の適用は、コンテナ内で `NoNewPrivs`・`Seccomp` を読む間接証拠に留まる。パス単位の拒否を直接観測する
-//!   には `core` の公開 API の追加が要るため、本試験の範囲外（`landlock_implicit_dev` 等が単体で観測している）
+//!   には `core` の公開 API の追加が要るため、本試験の範囲外（`landlock_implicit_dev` 等が単体で観測している）。
+//!   capability と seccomp の実効はシナリオ J・K が exec 後のプロセスで直接照合する
+//! - seccomp の識別的な errno（`kcmp` が `EPERM` 等）を exec 後に照合するには `exec` の test 限定の入口の追加が要るため、
+//!   errno の拒否は `mount` の網羅確認に留め、識別はシナリオ K の SIGSYS が担う
 //! - bind 以外の `mounts[]` の種類、`ro` の bind（#1917）、段ごとの個別観測（#1916）、`linux.resources`、
 //!   supervisor 経由の起動（#1819）は対象外
 //! - 実機での実行結果の記録は #1621（Phase 3 の分離系結合試験の実機実行。人間担当）
@@ -112,11 +124,14 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
+    use fandhe_container_core::capabilities::OCI_DEFAULT_CAPABILITIES;
     use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup, DelegatedCgroup};
-    use fandhe_container_core::exec::IsolationPrivilege;
+    use fandhe_container_core::exec::{
+        EscapeSyscallProbe, IsolationPrivilege, escape_probe_mount, probe_escape_syscall,
+    };
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
-        ProcessLauncher, ProductionLauncher, StartTimeouts, create, start,
+        ProcessExit, ProcessLauncher, ProductionLauncher, StartTimeouts, create, start,
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
@@ -285,6 +300,36 @@ mod linux {
             "DEVZERO_READ {}",
             read.map_or_else(|e| format!("error:{:?}", e.kind()), |n| n.to_string())
         ));
+        // シナリオ K（exec 後の seccomp の識別的な拒否。#2012）: 禁止 syscall を 1 件発行する。フィルタが効いていれば
+        // SIGSYS で終了して戻らない。戻った場合（フィルタ欠落）は固定語彙の行を出して正常終了し、親が失敗にする。
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--seccomp-kill") {
+            let name = args.get(i + 1).map_or("missing", String::as_str);
+            let which = match name {
+                "unshare" => EscapeSyscallProbe::Unshare,
+                "ptrace" => EscapeSyscallProbe::Ptrace,
+                "kexec_load" => EscapeSyscallProbe::KexecLoad,
+                other => panic!("unknown seccomp-kill probe {other}"),
+            };
+            emit(format!("SECCOMP_KILL_ATTEMPT {name}"));
+            let outcome = probe_escape_syscall(which);
+            emit(format!("SECCOMP_KILL_RETURNED {outcome:?}"));
+            std::process::exit(0);
+        }
+        // シナリオ J（exec 後の capability と seccomp の実効。#2012）。
+        if args.iter().any(|a| a == "--with-restrictions") {
+            for key in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"] {
+                emit(format!("CAP {key} {}", field(&format!("{key}:"))));
+            }
+            // PID 1 かつ `Seccomp: 2` のときだけ発行される安全な入口。`mount` は seccomp が `EPERM` で拒否する。
+            emit(format!("SECCOMP_MOUNT {:?}", escape_probe_mount()));
+            // 許可された syscall（`openat`・`read`）の対照。拒否一辺倒のフィルタ（全拒否）と区別する。
+            let control = std::fs::read_to_string("/proc/thread-self/status");
+            emit(format!(
+                "SECCOMP_CONTROL {}",
+                control.map_or_else(|e| format!("error:{:?}", e.kind()), |_| "ok".to_string())
+            ));
+        }
         // シナリオ D（bind mount。#1915）: bind 先へ固定の内容を書き、mountinfo 上のマウントオプションを出す。
         if std::env::args().any(|a| a == "--with-bind") {
             let wrote = std::fs::write(format!("{BIND_DEST}/{BIND_FILE}"), BIND_CONTENT);
@@ -597,7 +642,7 @@ mod linux {
             );
         } else {
             println!(
-                "production_launcher: pid1, default /dev nodes, landlock evidence, cgroup join verified; failed launch left no process; bind mount visible on host (root=false)"
+                "production_launcher: pid1, default /dev nodes, landlock evidence, cgroup join verified; failed launch left no process; bind mount visible on host; post-exec capabilities and seccomp verified (root=false)"
             );
         }
     }
@@ -646,6 +691,8 @@ mod linux {
         scenario_f_landlock_mount_identity_swapped(&env, tag);
         scenario_g_devtmpfs_bind_refused(&env, tag);
         scenario_h_state_root_moved_after_start(&env, tag);
+        scenario_j_exec_restrictions(&env, tag);
+        scenario_k_seccomp_kill_after_exec(&env, tag);
     }
 
     /// シナリオ A: 正常起動。
@@ -1174,6 +1221,175 @@ mod linux {
             "production_launcher: scenario=state-root-moved-after-start code={:?} state=created children=0",
             err.code()
         );
+    }
+
+    /// `/proc/<x>/status` の cap 行（16 桁の 16 進）を `u64` へ直す。
+    fn cap_value(text: &str) -> u64 {
+        u64::from_str_radix(text.trim(), 16)
+            .unwrap_or_else(|e| panic!("cap field {text:?} is not hex: {e}"))
+    }
+
+    /// 起動済みの子を、成否に関わらず terminate して回収する共通後始末（panic を覆い隠さない）。
+    fn finish_started(
+        started: fandhe_container_core::oci_runtime::StartedContainer,
+        verified: std::thread::Result<()>,
+    ) {
+        let pid = started.process().pid();
+        let (_record, process) = started.into_parts();
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "production_launcher: terminate after failed verification also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after terminate"
+        );
+    }
+
+    /// シナリオ J: exec 後の capability と seccomp の実効（#2012・SEC-1・CORE-5）。
+    fn scenario_j_exec_restrictions(env: &Env, tag: u32) {
+        // 公開 API の OCI 既定集合から組んだマスクと、リテラルの両方で照合する（`tests/capabilities.rs` の `mask_of` と同じ作り方）。
+        let from_api = OCI_DEFAULT_CAPABILITIES
+            .iter()
+            .fold(0u64, |m, c| m | (1u64 << c.index()));
+        const OCI_DEFAULT_MASK: u64 = 0x0000_0000_a804_25fb;
+        assert_eq!(from_api, OCI_DEFAULT_MASK, "OCI default capability mask");
+
+        let bundle = Bundle::new("j");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--with-restrictions"], json!([]));
+        let id = ContainerId::new(format!("plj{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            let output = started.process().take_output().expect("container output");
+            let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+            reader_slot = Some((rx, reader));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+
+            // コンテナ内（exec 後の PID 1）から見た値。
+            assert_eq!(value_of(&lines, "PID"), "1");
+            for (key, want) in [
+                ("CapInh", 0),
+                ("CapAmb", 0),
+                ("CapPrm", OCI_DEFAULT_MASK),
+                ("CapEff", OCI_DEFAULT_MASK),
+                ("CapBnd", OCI_DEFAULT_MASK),
+            ] {
+                assert_eq!(
+                    cap_value(value_of(&lines, &format!("CAP {key}"))),
+                    want,
+                    "in-container {key}"
+                );
+                // ホストから見た同じプロセス（exec 後）の値。
+                let host = status_field(&format!("/proc/{pid}/status"), &format!("{key}:"))
+                    .unwrap_or_else(|| panic!("host {key} missing"));
+                assert_eq!(cap_value(&host), want, "host view of {key}");
+            }
+            assert_eq!(value_of(&lines, "NONEWPRIVS"), "1");
+            assert_eq!(value_of(&lines, "SECCOMP"), "2");
+            // 拒否される syscall と、許可される syscall の対照。
+            assert_eq!(value_of(&lines, "SECCOMP_MOUNT"), "Ok(Errno(1))");
+            assert_eq!(value_of(&lines, "SECCOMP_CONTROL"), "ok");
+            println!("production_launcher: scenario=j pid={pid} post-exec caps and seccomp ok");
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ K: exec 後の seccomp が禁止 syscall を SIGSYS で拒否する（#2012・SEC-2・CORE-5）。
+    fn scenario_k_seccomp_kill_after_exec(env: &Env, tag: u32) {
+        // SIGSYS（x86_64・aarch64 とも 31）。`SECCOMP_RET_KILL_PROCESS` は seccomp 以外では生じない。
+        const SIGSYS: i32 = 31;
+        for (n, name) in ["unshare", "ptrace", "kexec_load"].into_iter().enumerate() {
+            let bundle = Bundle::new(&format!("k{n}"));
+            let ld = make_rootfs(&bundle.rootfs(), true);
+            write_config(&bundle, &ld, &["--seccomp-kill", name], json!([]));
+            let id = ContainerId::new(format!("plk{n}{tag}")).expect("id");
+            do_create(env, &bundle, &id);
+
+            wait_single_thread();
+            let started = start(
+                &env.store,
+                &env.recorder,
+                &env.launcher,
+                &StartRequest::new(id.clone()),
+                &timeouts(),
+            )
+            .unwrap_or_else(|e| panic!("start failed ({name}): {:?} {}", e.code(), e.message()));
+            let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> =
+                None;
+            let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let output = started.process().take_output().expect("container output");
+                let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+                reader_slot = Some((rx, reader));
+                let exit = started
+                    .process()
+                    .wait(timeout())
+                    .expect("wait for the probe")
+                    .unwrap_or_else(|| panic!("{name}: the probe did not exit within the timeout"));
+                assert_eq!(
+                    exit,
+                    ProcessExit::Signaled(SIGSYS),
+                    "{name}: a forbidden syscall must kill the process with SIGSYS"
+                );
+                // 出力は EOF まで読み、発行の直前の行があり、戻りの行が無いことを照合する。
+                let rx = &reader_slot.as_ref().expect("reader slot").0;
+                let mut lines = Vec::new();
+                let deadline = Instant::now() + timeout();
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    match rx.recv_timeout(left) {
+                        Ok(line) => lines.push(line),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            panic!("{name}: the probe output did not reach EOF; got {lines:?}")
+                        }
+                    }
+                }
+                assert!(
+                    lines.contains(&format!("SECCOMP_KILL_ATTEMPT {name}")),
+                    "{name}: attempt line missing in {lines:?}"
+                );
+                assert!(
+                    !lines.iter().any(|l| l.starts_with("SECCOMP_KILL_RETURNED")),
+                    "{name}: the syscall returned instead of being killed: {lines:?}"
+                );
+                println!("production_launcher: scenario=k {name} killed with SIGSYS");
+            }));
+            finish_started(started, verified);
+            let (rx, reader) = reader_slot.take().expect("reader slot");
+            reader.join().expect("join reader");
+            drop(rx);
+            assert!(
+                children_of_self().is_empty(),
+                "no child may remain after terminate"
+            );
+        }
     }
 
     /// root 実行: launch が拒否され、状態は Created に戻り、子が残らない（SEC-5。成功起動は試さない）。

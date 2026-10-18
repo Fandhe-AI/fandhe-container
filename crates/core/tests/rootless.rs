@@ -15,16 +15,22 @@
 //!   観測記録（REPAIR-4）と、起動したプロセスのホスト視点の写像（`/proc/<pid>/uid_map`・`gid_map`・
 //!   `status`）で照合する。検証できるのは **create / start / kill と、kill 直後の delete の拒否まで**で、
 //!   Running → Stopped の遷移と停止後の delete の成功は未検証（下記「既知課題」）
-//! - 本試験の経路は `with_landlock` を載せず `LaunchReady` が作られない（#1714）ため、`exec_entrypoint` は
-//!   fail-closed で `Exited(126)` を返す。そのため長く動き続ける「実行中コンテナ」になれるのは
-//!   `isolate_rootless_subordinate` を通った中間プロセスだけで、これを init の代役として使う。中間プロセスは
-//!   `spawn_container` が exec 段まで到達して 126 で終わることを自身で確かめた後、stdin の EOF まで
-//!   生き続ける（ディスパッチャが panic しても孤児が残らない）
+//! - コンテナ PID 1 は実エントリポイント（#2012）。試験バイナリ自身を rootfs の `/entry` へコピーし、
+//!   `StagePipeline::with_landlock` を載せたステージ列（`tests/support/real_entry.rs`）で exec まで通して
+//!   `--entry init` で再入させる。ホストの `/proc/<pid>` の pid は、この exec 後の PID 1（`NSpid` の末尾が 1、
+//!   `cmdline` が `/entry --entry init`）で、`uid_map`・`gid_map`・`status` の照合もこの pid に対して行う。
+//!   実エントリポイントの標準入出力は `/dev/null` へ置換されるため、コンテナ視点の観測値（pid・uid・gid・hostname・
+//!   `NoNewPrivs`・`Seccomp`）は `/entry-report` へ書かせ、ホストが具体値で照合する
+//! - 起動ハンドルの所有者は supervisor（TASK-157）を模した中間プロセス（`isolate_rootless_subordinate` を通り、
+//!   実エントリポイントの親になる）。ホスト側のディスパッチャは PID 1 へ直接シグナルを送れない（子ではない）ため、
+//!   kill は stdin の `KILL` 行で中間プロセスへ中継し、中間プロセスが `ContainerChild` で SIGKILL・回収して
+//!   `EXIT` 行で終了状態を返す。stdin が EOF になれば（ディスパッチャが panic しても）PID 1 を kill・回収してから
+//!   終わる（孤児が残らない）
 //!
 //! # 流れ
 //! - ディスパッチャ: 一時 bundle（`config.json`・`rootfs/`）を排他的に作り、`start` へ渡す
 //!   `ProcessLauncher` の実装（`RootlessLauncher`）が自身を `--scenario container ...` で再起動して
-//!   代役 init とする。kill は保持している起動ハンドルへ送る `ProcessSignaler`（`HandleSignaler`）で行い、
+//!   中間プロセスとする。kill は保持している起動ハンドルへ送る `ProcessSignaler`（`HandleSignaler`）で行い、
 //!   状態に記録された pid へ生の kill を送らない（SEC-1）
 //! - モード `direct`: `single_id_mapping` と `IdMapWriter::Direct`。`uid_map` は `0 <euid> 1`
 //! - モード `helper`（`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ）: `/etc/subuid`・`/etc/subgid` の
@@ -32,7 +38,8 @@
 //! - root で実行された場合は、plan が `host_root_identity_mapping` で拒否されること（SEC-5）だけを照合する
 //!
 //! # 実機前提テストとしての分離
-//! 非特権 user namespace を許可するホストが必要。`-- --ignored` 指定時のみ実行し、未指定時は「ignored」を
+//! 非特権 user namespace を許可するホストと、Landlock ABI 6 以上（Linux 6.12 以上。実エントリポイントを exec まで
+//! 通すため。満たさないと失敗する）が必要。`-- --ignored` 指定時のみ実行し、未指定時は「ignored」を
 //! 出力して成功終了する（ci.md「実機前提テスト」。CI 通過のための弱体化ではない）。CI の
 //! `platform-ci` への組み込みは別 PR（ci.yml は infra-builder 担当・AppArmor 緩和の
 //! `sudo sysctl` は root 権限コマンド）。実行された場合は拒否を含むあらゆる失敗を失敗として扱い、検証せずに
@@ -51,10 +58,6 @@
 //!   マスクされた `/proc` で proc マウントも拒否されるため検証できない
 //! - rootless の cgroup v2 委譲（systemd ユーザー slice の Delegate）: rootless 経路での cgroup 参加は
 //!   未実装・未検証（TASK-32・CORE-3・CORE-4）
-//! - 実エントリポイントの exec: 本試験の経路は `LaunchReady` が作られず拒否されるため代役 init を使う
-//!   （Landlock を載せる経路は ABI 6+ = Linux 6.12+ が必要）。本番 `ProductionLauncher` の確認は
-//!   `production_launcher`（#1818）が担い、supervisor への配線は #1819。動き続ける実エントリポイントの pid を
-//!   対象にする置き換えは未着手
 //! - SIGKILL 以外のシグナル（SIGTERM 等）の配送: 本テストの起動ハンドルが std のみで作られており送れない。
 //!   本番の `ProcessSignaler` は supervisor（TASK-157）が提供する
 //! - Running → Stopped の遷移と停止後の delete の成功: Stopped への遷移は起動ハンドルの所有者である
@@ -72,8 +75,14 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/real_entry.rs"]
+mod real_entry;
+
+#[cfg(target_os = "linux")]
 fn main() {
-    if std::env::args().any(|a| a == "--ignored" || a == "--scenario") {
+    if std::env::args().any(|a| a == "--entry") {
+        linux::entry_init();
+    } else if std::env::args().any(|a| a == "--ignored" || a == "--scenario") {
         linux::run();
     } else {
         println!("rootless: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)");
@@ -86,16 +95,16 @@ mod linux {
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::num::NonZeroU32;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    use std::os::unix::process::ExitStatusExt as _;
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::process::{Child, ChildStdin, Command, Stdio};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use super::real_entry;
     use fandhe_container_core::exec::{
-        ChildExit, Entrypoint, Hostname, IsolationConfig, IsolationPrivilege, Namespace,
-        NamespaceSet, isolate_rootless_subordinate, plan_rootless_subordinate, spawn_container,
+        ChildExit, Hostname, IsolationConfig, IsolationPrivilege, Namespace, NamespaceSet,
+        isolate_rootless_subordinate, plan_rootless_subordinate,
     };
     use fandhe_container_core::observability::{OpName, OpRecorder};
     use fandhe_container_core::oci_runtime::{
@@ -114,7 +123,10 @@ mod linux {
     };
 
     const HOSTNAME: &str = "fandhe-rootless";
-    const READY_LINE: &str = "READY exec=126";
+    /// 中間プロセスが PID 1 の `/entry-report` を確認した後に出す行の接頭辞（続けて PID 1 のホスト pid）。
+    const READY_PREFIX: &str = "READY pid=";
+    /// PID 1 が起動完了時に書く報告ファイル（コンテナ内では `/entry-report`）。
+    const READY_FILE: &str = real_entry::REPORT_FILE;
     /// READY 行・stderr の読み取り上限（バイト）。無制限確保を避ける。
     const LINE_CAP: u64 = 256;
     const STDERR_CAP: u64 = 16 * 1024;
@@ -214,15 +226,40 @@ mod linux {
         }
     }
 
-    // ---- シナリオ側（分離された代役 init） ----
+    // ---- 実エントリポイント（exec 後のコンテナ PID 1） ----
 
-    /// 引数: `container <rootfs> <hostname> <dev> <ino> <direct|helper>`。失敗はすべて panic
-    /// （非 0 終了。launcher 側は READY 未着として `Err` にする）。
+    /// 実エントリポイント `--entry init`（コンテナの PID 1。exec 後）。コンテナ視点の観測値を `/entry-report` へ
+    /// 書いた後は、kill されるまで生き続ける（stdin は `/dev/null` のため EOF を待つ形にはしない）。
+    pub fn entry_init() {
+        let mut lines = real_entry::entry_observations();
+        let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").map_or_else(
+            |e| format!("error:{:?}", e.kind()),
+            |s| s.trim().to_string(),
+        );
+        lines.push(("hostname", hostname));
+        real_entry::write_report(&lines);
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
+
+    // ---- 中間プロセス側（分離され、実エントリポイントの親になる） ----
+
+    /// 引数: `container <rootfs> <hostname> <dev> <ino> <direct|helper> -- <args...> --env <env...>`。
+    /// 失敗はすべて panic（非 0 終了。launcher 側は READY 未着として `Err` にする）。
     fn container_scenario(args: &[&str]) {
-        let [name, rootfs, hostname, dev, ino, mode] = args else {
-            panic!("usage: container <rootfs> <hostname> <dev> <ino> <direct|helper>");
+        let [name, rootfs, hostname, dev, ino, mode, "--", rest @ ..] = args else {
+            panic!(
+                "usage: container <rootfs> <hostname> <dev> <ino> <direct|helper> -- <args> --env <env>"
+            );
         };
         assert_eq!(*name, "container");
+        let env_at = rest
+            .iter()
+            .position(|a| *a == "--env")
+            .expect("--env separator");
+        let entry_args: Vec<String> = rest[..env_at].iter().map(|s| s.to_string()).collect();
+        let entry_env: Vec<String> = rest[env_at + 1..].iter().map(|s| s.to_string()).collect();
         let rootfs = Path::new(rootfs);
         let want_dev: u64 = dev.parse().expect("dev");
         let want_ino: u64 = ino.parse().expect("ino");
@@ -257,63 +294,153 @@ mod linux {
         let meta = std::fs::metadata(rootfs).expect("stat rootfs");
         assert_eq!((meta.dev(), meta.ino()), (want_dev, want_ino));
 
-        let entry = Entrypoint::new("/entry", ["/entry"], [] as [&str; 0]).expect("entrypoint");
-        let child =
-            spawn_container(rootfs, &entry).unwrap_or_else(|e| panic!("spawn_container: {e}"));
-        let exit = child
-            .wait_timeout(timeout())
-            .unwrap_or_else(|e| panic!("wait: {e}"));
-        // `LaunchReady` が作られない経路のため exec だけが拒否される（126）。setup 失敗（125）ではない。
-        assert_eq!(exit, ChildExit::Exited(126));
+        // launcher が `LaunchSpec` から渡した args / env で、実エントリポイントを PID 1 として exec まで通す。
+        let entry = real_entry::entrypoint_from(&entry_args, &entry_env);
+        let child = real_entry::spawn_real_entry(rootfs, &entry, &report.id_maps.gid);
+
+        // PID 1 が `/entry-report` を書くまで待つ。早期の終了・期限切れは PID 1 を残さず失敗にする。
+        let ready_path = rootfs.join(READY_FILE);
+        let deadline = Instant::now() + timeout();
+        loop {
+            if real_entry::try_read_report(&ready_path).is_some() {
+                break;
+            }
+            if let Some(exit) = child
+                .wait_for_exit(Duration::ZERO)
+                .expect("poll the entrypoint")
+            {
+                println!("FAILED exit={exit:?}");
+                std::process::exit(1);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill_and_reap(timeout());
+                println!("FAILED ready-timeout");
+                std::process::exit(1);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
         let mut out = std::io::stdout();
-        writeln!(out, "{READY_LINE}").expect("write READY");
+        writeln!(out, "{READY_PREFIX}{}", child.pid()).expect("write READY");
         out.flush().expect("flush READY");
 
-        // 代役 init: stdin が EOF になる（launcher・ディスパッチャが消える）まで生き続ける。
-        let mut buf = [0u8; 64];
-        let mut stdin = std::io::stdin();
-        while stdin.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
+        // kill の中継: stdin の `KILL` 行で PID 1 を SIGKILL・回収して結果を返す。stdin が EOF になった
+        // （launcher・ディスパッチャが消えた）場合も PID 1 を kill・回収してから終わる（孤児を残さない）。
+        let mut line = String::new();
+        let mut stdin = std::io::BufReader::new(std::io::stdin().take(LINE_CAP));
+        let requested = stdin.read_line(&mut line).map(|n| n > 0).unwrap_or(false);
+        let exit = child
+            .kill_and_reap(timeout())
+            .unwrap_or_else(|e| panic!("kill and reap: {e}"));
+        if requested && line.trim_end() == "KILL" {
+            let text = match exit {
+                ChildExit::Exited(n) => format!("EXIT Exited {n}"),
+                ChildExit::Signaled(n) => format!("EXIT Signaled {n}"),
+                other => panic!("unexpected exit state {other:?}"),
+            };
+            writeln!(out, "{text}").expect("write EXIT");
+            out.flush().expect("flush EXIT");
+        }
     }
 
     // ---- launcher 側（ディスパッチャ内で start が呼ぶ） ----
 
-    /// 代役 init の子プロセスのハンドル。回収済みかを自前で管理する（`Child::kill` は回収済みにも `Ok`
-    /// を返すため pid 再利用対策の判定は自前で行う。SEC-1）。
-    struct StandInProcess {
+    /// PID 1 の起動ハンドル。実体は中間プロセス（`Child`）で、kill はその stdin へ中継する。回収済み（終了を記録済み）かを
+    /// 自前で管理する（pid 再利用対策の判定は自前で行う。SEC-1）。
+    struct RealInitProcess {
+        /// PID 1 のホスト pid（中間プロセスの `ContainerChild::pid`）。
         pid: NonZeroU32,
-        inner: Mutex<(Child, Option<ExitStatus>)>,
+        inner: Mutex<InitState>,
     }
 
-    fn to_exit(status: ExitStatus) -> ProcessExit {
-        match (status.code(), status.signal()) {
-            (Some(code), _) => ProcessExit::Exited(code),
-            (None, Some(sig)) => ProcessExit::Signaled(sig),
-            (None, None) => ProcessExit::Exited(-1),
+    struct InitState {
+        intermediary: Child,
+        stdin: Option<ChildStdin>,
+        lines: mpsc::Receiver<String>,
+        exit: Option<ProcessExit>,
+    }
+
+    /// `EXIT Exited <n>` / `EXIT Signaled <n>` を `ProcessExit` へ解釈する。
+    fn parse_exit(line: &str) -> Option<ProcessExit> {
+        let mut it = line.split_whitespace();
+        if it.next()? != "EXIT" {
+            return None;
+        }
+        let kind = it.next()?;
+        let n: i32 = it.next()?.parse().ok()?;
+        match kind {
+            "Exited" => Some(ProcessExit::Exited(n)),
+            "Signaled" => Some(ProcessExit::Signaled(n)),
+            _ => None,
         }
     }
 
-    impl StandInProcess {
-        fn reap_until(&self, deadline: Instant) -> Result<Option<ExitStatus>, TraitError> {
+    /// 中間プロセスの終了を期限つきで待つ。超過したら kill して回収する（PID 1 が孤児になり得る最終手段）。
+    fn reap_intermediary(child: &mut Child, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    impl RealInitProcess {
+        fn lock(&self) -> std::sync::MutexGuard<'_, InitState> {
+            self.inner.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// `KILL` を中継し、`deadline` までに返る `EXIT` 行を記録する。記録後は中間プロセスも回収する。
+        fn relay_kill(st: &mut InitState, deadline: Instant) -> Result<ProcessExit, TraitError> {
+            let internal = |msg: &'static str| TraitError::new(ErrorCode::Internal, msg);
+            let stdin = st
+                .stdin
+                .as_mut()
+                .ok_or_else(|| internal("the kill channel is closed"))?;
+            writeln!(stdin, "KILL")
+                .and_then(|()| stdin.flush())
+                .map_err(|_| internal("failed to relay the kill request"))?;
             loop {
-                {
-                    let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(st) = g.1 {
-                        return Ok(Some(st));
-                    }
-                    match g.0.try_wait() {
-                        Ok(Some(st)) => {
-                            g.1 = Some(st);
-                            return Ok(Some(st));
-                        }
-                        Ok(None) => {}
-                        Err(_) => {
-                            return Err(TraitError::new(
-                                ErrorCode::Internal,
-                                "failed to wait for the stand-in process",
-                            ));
+                let left = deadline.saturating_duration_since(Instant::now());
+                match st.lines.recv_timeout(left) {
+                    Ok(line) => {
+                        if let Some(exit) = parse_exit(line.trim_end()) {
+                            st.exit = Some(exit);
+                            st.stdin = None;
+                            reap_intermediary(&mut st.intermediary, timeout());
+                            return Ok(exit);
                         }
                     }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        return Err(TraitError::new(
+                            ErrorCode::Timeout,
+                            "the entrypoint was not reaped within the timeout",
+                        ));
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(internal("the intermediary closed without reporting EXIT"));
+                    }
+                }
+            }
+        }
+    }
+
+    impl LaunchedProcess for RealInitProcess {
+        fn pid(&self) -> NonZeroU32 {
+            self.pid
+        }
+
+        fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if let Some(exit) = self.lock().exit {
+                    return Ok(Some(exit));
                 }
                 if Instant::now() >= deadline {
                     return Ok(None);
@@ -321,86 +448,65 @@ mod linux {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-    }
-
-    impl LaunchedProcess for StandInProcess {
-        fn pid(&self) -> NonZeroU32 {
-            self.pid
-        }
-
-        fn wait(&self, timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
-            Ok(self.reap_until(Instant::now() + timeout)?.map(to_exit))
-        }
 
         fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {
-            {
-                let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if g.1.is_none() {
-                    let _ = g.0.kill();
-                }
+            let mut st = self.lock();
+            if st.exit.is_none() {
+                Self::relay_kill(&mut st, Instant::now() + timeout)?;
             }
-            match self.reap_until(Instant::now() + timeout)? {
-                Some(_) => Ok(()),
-                None => Err(TraitError::new(
-                    ErrorCode::Timeout,
-                    "the stand-in process was not reaped within the timeout",
-                )),
-            }
+            Ok(())
         }
 
         fn signal(&self, signal: Signal, deadline: Instant) -> Result<(), TraitError> {
-            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut st = self.lock();
             if Instant::now() >= deadline {
                 return Err(TraitError::new(
                     ErrorCode::Timeout,
                     "the signal deadline has passed",
                 ));
             }
-            let gone = || {
-                TraitError::new(
+            if st.exit.is_some() {
+                return Err(TraitError::new(
                     ErrorCode::FailedPrecondition,
                     "the container process has already exited",
-                )
-            };
-            if g.1.is_some() {
-                return Err(gone());
-            }
-            match g.0.try_wait() {
-                Ok(Some(st)) => {
-                    g.1 = Some(st);
-                    return Err(gone());
-                }
-                Ok(None) => {}
-                Err(_) => {
-                    return Err(TraitError::new(
-                        ErrorCode::Internal,
-                        "failed to poll the stand-in process",
-                    ));
-                }
+                ));
             }
             if signal != Signal::SIGKILL {
                 return Err(TraitError::new(
                     ErrorCode::Unimplemented,
-                    "only SIGKILL can be sent without libc",
+                    "only SIGKILL can be relayed to the entrypoint",
                 ));
             }
-            g.0.kill().map_err(|_| {
-                TraitError::new(ErrorCode::Internal, "failed to kill the stand-in process")
-            })
+            Self::relay_kill(&mut st, deadline).map(|_| ())
         }
     }
 
-    /// 自身を `--scenario container ...` で再起動し、代役 init を起動する launcher（テスト専用）。
+    impl Drop for RealInitProcess {
+        /// ディスパッチャが途中で panic しても PID 1 を残さない: stdin を閉じて中間プロセスに kill・回収させる。
+        fn drop(&mut self) {
+            let st = self.inner.get_mut().unwrap_or_else(|e| e.into_inner());
+            st.stdin = None;
+            reap_intermediary(&mut st.intermediary, timeout() * 2);
+        }
+    }
+
+    /// 自身を `--scenario container ...` で再起動し、中間プロセス経由で実エントリポイントを起動する launcher（テスト専用）。
     ///
     /// SEC-1 契約からの逸脱と理由は冒頭の「既知課題」を参照（rootfs は (dev, ino) の照合で代替）。
     struct RootlessLauncher {
         mode: &'static str,
     }
 
-    fn launch_failed(child: &mut Child, code: ErrorCode, msg: &'static str) -> TraitError {
-        // 契約: 失敗時にプロセスを残さない。
-        let _ = child.kill();
-        let _ = child.wait();
+    /// 失敗時の後始末。中間プロセスを直接 kill すると PID 1 が孤児になるため、まず stdin を閉じて中間プロセス自身に
+    /// PID 1 を kill・回収させ、終わらないときだけ kill する。
+    fn launch_failed(
+        child: &mut Child,
+        stdin: Option<ChildStdin>,
+        code: ErrorCode,
+        msg: &'static str,
+    ) -> TraitError {
+        drop(stdin);
+        reap_intermediary(child, timeout() * 2 + Duration::from_secs(5));
         TraitError::new(code, msg)
     }
 
@@ -429,6 +535,10 @@ mod linux {
                 .arg(pinned.dev().to_string())
                 .arg(pinned.ino().to_string())
                 .arg(self.mode)
+                .arg("--")
+                .args(spec.args())
+                .arg("--env")
+                .args(spec.env())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -436,17 +546,19 @@ mod linux {
                 .map_err(|_| {
                     TraitError::new(ErrorCode::Internal, "failed to spawn the scenario")
                 })?;
+            let stdin = child.stdin.take();
             let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
                 return Err(launch_failed(
                     &mut child,
+                    stdin,
                     ErrorCode::Internal,
                     "missing pipes",
                 ));
             };
             // stderr は上限まで共有バッファへ蓄積し、以降は捨てる（パイプ詰まりで子が止まらないように）。
-            // 蓄積分は READY 後に拒否理由（PERMISSION_DENIED）の照合に使う。
-            let captured = std::sync::Arc::new(Mutex::new(Vec::<u8>::new()));
-            let captured_writer = std::sync::Arc::clone(&captured);
+            // 蓄積分は起動失敗時の診断にだけ使う。
+            let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let captured_writer = Arc::clone(&captured);
             std::thread::spawn(move || {
                 let mut r = stderr;
                 let mut chunk = [0u8; 1024];
@@ -463,66 +575,60 @@ mod linux {
                     }
                 }
             });
+            // stdout は 1 行ずつ（上限つき）チャネルへ流す。READY の後の EXIT 行も同じチャネルで受ける。
             let (tx, rx) = mpsc::channel::<String>();
             std::thread::spawn(move || {
-                let mut line = String::new();
-                let mut r = std::io::BufReader::new(stdout.take(LINE_CAP));
-                let _ = r.read_line(&mut line);
-                let _ = tx.send(line);
-            });
-            match rx.recv_timeout(timeout) {
-                Ok(line) if line.trim_end() == READY_LINE => {}
-                Ok(_) => {
-                    return Err(launch_failed(
-                        &mut child,
-                        ErrorCode::Internal,
-                        "the scenario did not report readiness",
-                    ));
+                let mut reader = std::io::BufReader::new(stdout);
+                loop {
+                    let mut line = String::new();
+                    match (&mut reader).take(LINE_CAP).read_line(&mut line) {
+                        Ok(0) | Err(_) => return,
+                        Ok(_) => {
+                            if tx.send(line).is_err() {
+                                return;
+                            }
+                        }
+                    }
                 }
+            });
+            let ready = rx.recv_timeout(timeout);
+            let pid = match ready {
+                Ok(line) => line
+                    .trim_end()
+                    .strip_prefix(READY_PREFIX)
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .and_then(NonZeroU32::new),
                 Err(_) => {
+                    if let Ok(b) = captured.lock() {
+                        eprintln!("[scenario stderr] {}", String::from_utf8_lossy(&b));
+                    }
                     return Err(launch_failed(
                         &mut child,
+                        stdin,
                         ErrorCode::Timeout,
                         "the scenario did not report readiness within the timeout",
                     ));
                 }
-            }
-            // exec 拒否の理由まで照合する（SEC-1・CORE-5）。Exited(126) だけでは別の exec 失敗と区別できない。
-            // 子の stderr 書き込みは READY より前だが、蓄積スレッドの読み取りは非同期のため期限付きで待つ。
-            let deadline = Instant::now() + timeout;
-            let denied = loop {
-                let seen = captured
-                    .lock()
-                    .map(|b| String::from_utf8_lossy(&b).contains("PERMISSION_DENIED"))
-                    .unwrap_or(false);
-                if seen {
-                    break true;
-                }
-                if Instant::now() >= deadline {
-                    break false;
-                }
-                std::thread::sleep(Duration::from_millis(10));
             };
-            if !denied {
+            let Some(pid) = pid else {
                 if let Ok(b) = captured.lock() {
                     eprintln!("[scenario stderr] {}", String::from_utf8_lossy(&b));
                 }
                 return Err(launch_failed(
                     &mut child,
+                    stdin,
                     ErrorCode::Internal,
-                    "scenario stderr lacked PERMISSION_DENIED (exec stage not reached via fail-closed path)",
-                ));
-            }
-            let Some(pid) = NonZeroU32::new(child.id()) else {
-                return Err(launch_failed(
-                    &mut child,
-                    ErrorCode::Internal,
-                    "pid is zero",
+                    "the scenario did not report the entrypoint pid",
                 ));
             };
-            Ok(Box::new(StandInProcess {
+            Ok(Box::new(RealInitProcess {
                 pid,
-                inner: Mutex::new((child, None)),
+                inner: Mutex::new(InitState {
+                    intermediary: child,
+                    stdin,
+                    lines: rx,
+                    exit: None,
+                }),
             }))
         }
     }
@@ -643,10 +749,9 @@ mod linux {
         }
     }
 
-    /// `config.json` と `rootfs/`（`proc/`・実行権限付き `entry`）を排他的に作る。`RootfsDir::pin` は
-    /// symlink を含む祖先を拒否するため、temp は canonicalize する。
+    /// `config.json` と `rootfs/`（`proc/`・実エントリポイント `/entry` とローダ・共有ライブラリ）を排他的に作る。
+    /// `RootfsDir::pin` は symlink を含む祖先を拒否するため、temp は canonicalize する。
     fn make_bundle(label: &str) -> Bundle {
-        use std::os::unix::fs::OpenOptionsExt as _;
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
@@ -662,27 +767,15 @@ mod linux {
         std::fs::set_permissions(&bundle.0, std::fs::Permissions::from_mode(0o700))
             .expect("chmod bundle");
         let rootfs = bundle.0.join("rootfs");
-        std::fs::create_dir(&rootfs).expect("create rootfs");
-        std::fs::set_permissions(&rootfs, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod rootfs");
-        std::fs::create_dir(rootfs.join("proc")).expect("create rootfs/proc");
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o755)
-            .open(rootfs.join("entry"))
-            .expect("create entrypoint");
-        // exec は `LaunchReady` が作られず拒否されるため、中身は実行されない。
-        f.write_all(b"#!/bin/true\n").expect("write entrypoint");
-        drop(f);
+        let ld = real_entry::install_entry(&rootfs);
         // linux.uidMappings は書かない（start が拒否する。写像は launcher 側の責務）。
         let config = serde_json::json!({
             "ociVersion": "1.2.0",
-            "root": {"path": "rootfs"},
+            "root": {"path": "rootfs", "readonly": false},
             "process": {
                 "user": {"uid": 0, "gid": 0},
-                "args": ["/entry"],
-                "env": ["PATH=/usr/bin:/bin"],
+                "args": real_entry::entry_args("init"),
+                "env": real_entry::entry_env(&ld),
                 "cwd": "/"
             },
             "hostname": HOSTNAME,
@@ -748,6 +841,15 @@ mod linux {
             .collect();
         rows.sort_unstable();
         rows
+    }
+
+    /// `/proc/<pid>/status` の `key` 行の値（key の後ろ。前後の空白を除く）。
+    fn status_str(pid: u32, key: &str) -> String {
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .expect("read status")
+            .lines()
+            .find_map(|l| l.strip_prefix(key).map(|v| v.trim().to_string()))
+            .unwrap_or_else(|| panic!("status line {key} missing"))
     }
 
     fn expected_rows(set: &IdMapSet) -> Vec<(u32, u32, u32)> {
@@ -850,6 +952,37 @@ mod linux {
         assert_eq!(status_ids(p, "Uid:"), vec![euid; 4]);
         assert_eq!(status_ids(p, "Gid:"), vec![egid; 4]);
         assert_ne!(euid, 0);
+
+        // 実エントリポイントであることの照合（#2012）: ホストの pid は exec 後の PID 1。
+        let nspid = status_str(p, "NSpid:");
+        let levels: Vec<&str> = nspid.split_whitespace().collect();
+        assert_eq!(levels.len(), 2, "NSpid must have two levels: {nspid:?}");
+        assert_eq!(levels.first().copied(), Some(p.to_string().as_str()));
+        assert_eq!(levels.last().copied(), Some("1"));
+        assert_eq!(
+            std::fs::read(format!("/proc/{p}/cmdline")).expect("read cmdline"),
+            b"/entry\0--entry\0init\0".to_vec(),
+            "the host pid must be the exec'd real entrypoint"
+        );
+        // 実エントリポイントの親は、起動ハンドルの所有者である中間プロセス（`--scenario container`）。
+        let ppid = status_str(p, "PPid:");
+        let parent_cmdline =
+            std::fs::read(format!("/proc/{ppid}/cmdline")).expect("parent cmdline");
+        let parent_args: Vec<&[u8]> = parent_cmdline.split(|b| *b == 0).collect();
+        assert!(
+            parent_args.contains(&b"--scenario".as_slice())
+                && parent_args.contains(&b"container".as_slice()),
+            "the parent of the entrypoint must be the intermediary process"
+        );
+        // コンテナ視点の観測値（`/entry-report`）。
+        let ready = real_entry::read_report(&bundle.0.join("rootfs").join(READY_FILE), timeout());
+        let field = |k: &str| ready.get(k).map(String::as_str).unwrap_or("missing");
+        assert_eq!(field("pid"), "1");
+        assert_eq!(field("uid"), "0");
+        assert_eq!(field("gid"), "0");
+        assert_eq!(field("hostname"), HOSTNAME);
+        assert_eq!(field("nonewprivs"), "1");
+        assert_eq!(field("seccomp"), "2");
         // 別の user namespace にいることは、初期 namespace の恒等写像ではない上の uid_map の完全一致で
         // 保証される（`/proc/<pid>/ns/user` の readlink は ptrace 権限検査を伴い環境差が大きいため使わない）。
 
@@ -875,6 +1008,15 @@ mod linux {
             .wait(timeout())
             .expect("wait");
         assert_eq!(exit, Some(ProcessExit::Signaled(9)));
+        // 回収後は PID 1 のホスト側の /proc も消える。
+        let gone_deadline = Instant::now() + timeout();
+        while Path::new(&format!("/proc/{p}")).exists() {
+            assert!(
+                Instant::now() < gone_deadline,
+                "/proc/{p} must disappear after the entrypoint is reaped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         // kill 後も状態は Running のまま（Stopped への遷移は supervisor〔TASK-157〕の責務。書き換えない）。
         let after = store
@@ -913,7 +1055,7 @@ mod linux {
         assert_eq!(op_stats(&rec, "delete"), (0, 1));
 
         println!(
-            "rootless: scenario {mode} lifecycle verified (create/start/kill/delete-rejected; host uid={euid})"
+            "rootless: scenario {mode} lifecycle verified with the real entrypoint as PID 1 (create/start/kill/delete-rejected; host uid={euid})"
         );
     }
 }

@@ -1251,10 +1251,13 @@ impl GlobalOwner {
             .read_to_end(&mut data)
             .map_err(map_stream_err)?;
         for ext in tar::PaxExtensions::new(&data).flatten() {
-            let parsed = ext.value().ok().and_then(|v| v.parse::<u32>().ok());
+            // 空値は PAX の「指定の解除」。不正な数値（解析不能）とは区別する。
+            let raw = ext.value().ok();
+            let parsed = raw.and_then(|v| v.parse::<u32>().ok());
+            let unset = raw == Some("");
             match ext.key() {
-                Ok("uid") => self.uid = Some(parsed),
-                Ok("gid") => self.gid = Some(parsed),
+                Ok("uid") => self.uid = if unset { None } else { Some(parsed) },
+                Ok("gid") => self.gid = if unset { None } else { Some(parsed) },
                 _ => {}
             }
         }
@@ -1278,6 +1281,7 @@ fn tar_owner<R: Read>(
         .gid()
         .ok()
         .and_then(|v| u32::try_from(v).ok());
+    let (header_uid, header_gid) = (uid, gid);
     if let Some(g) = global.uid {
         uid = g;
     }
@@ -1286,10 +1290,13 @@ fn tar_owner<R: Read>(
     }
     if let Ok(Some(exts)) = entry.pax_extensions() {
         for ext in exts.flatten() {
-            let parsed = ext.value().ok().and_then(|v| v.parse::<u32>().ok());
+            // 空値は指定の解除（通常ヘッダの所有者へ戻す）。不正な数値は解析不能として `None`。
+            let raw = ext.value().ok();
+            let parsed = raw.and_then(|v| v.parse::<u32>().ok());
+            let unset = raw == Some("");
             match ext.key() {
-                Ok("uid") => uid = parsed,
-                Ok("gid") => gid = parsed,
+                Ok("uid") => uid = if unset { header_uid } else { parsed },
+                Ok("gid") => gid = if unset { header_gid } else { parsed },
                 _ => {}
             }
         }
@@ -3611,6 +3618,44 @@ mod tests {
         assert_eq!(r.special_bits.preserved_files, 0);
         assert_eq!(r.files_with_stripped_special_bits, 1);
         assert_eq!(mode_of(&sb.root.join("suid")), 0o755);
+    }
+
+    /// SEC-5: PAX の空値 `uid` は指定の解除で、通常ヘッダの所有者（写像内）へ戻るため setuid が残る。
+    /// グローバルの空値もエントリ固有の空値も同じ。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec5_empty_pax_uid_unsets_override() {
+        let sb = Sandbox::new();
+        chmod_root(&sb, 0o700);
+        let mk = |name: &'static [u8], ty: EntryType, body: &[u8]| {
+            raw_entry(name, ty, b"", 0o644, body.len() as u64, body)
+        };
+        let g1 = mk(
+            b"pax_global",
+            EntryType::XGlobalHeader,
+            &pax_record("uid", "100"),
+        );
+        let g2 = mk(
+            b"pax_global2",
+            EntryType::XGlobalHeader,
+            &pax_record("uid", ""),
+        );
+        let l1 = mk(b"pax", EntryType::XHeader, &pax_record("uid", ""));
+        let r = run_policy(
+            &sb,
+            &[
+                g1,
+                g2,
+                file_owned("global_unset", 0o4755, 0, 0, b"a"),
+                l1,
+                file_owned("local_unset", 0o4755, 0, 0, b"b"),
+            ],
+            policy_1000(),
+            owner_1000,
+        );
+        assert_eq!(r.special_bits.preserved_files, 2);
+        assert_eq!(mode_of(&sb.root.join("global_unset")), 0o4755);
+        assert_eq!(mode_of(&sb.root.join("local_unset")), 0o4755);
     }
 
     /// SEC-5: ポリシーが `Strip` なら、条件が整っていても落とす。

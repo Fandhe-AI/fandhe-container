@@ -28,7 +28,7 @@ fn invalid(message: &str) -> OciError {
 }
 
 /// レジストリのホスト（任意のポート付き）。userinfo・スキーム・パスを含められない。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RegistryHost {
     host: String,
     port: Option<u16>,
@@ -103,7 +103,7 @@ impl fmt::Display for RegistryHost {
 }
 
 /// repository 名（`/` 区切りの成分列）。各成分は `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*`。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Repository(String);
 
 impl Repository {
@@ -163,7 +163,7 @@ fn valid_repository_component(c: &str) -> bool {
 }
 
 /// digest（`sha256:` + 小文字 hex 64 桁のみ。他のアルゴリズムは fail-closed で拒否）。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Digest(String);
 
 impl Digest {
@@ -191,7 +191,7 @@ impl fmt::Display for Digest {
 }
 
 /// tag（`[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`）。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Tag(String);
 
 impl Tag {

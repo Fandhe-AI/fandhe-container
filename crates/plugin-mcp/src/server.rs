@@ -19,7 +19,7 @@
 //! バックエンドの業務エラーは result の `isError: true` に固定文言の `{code, message}` を載せる。
 //!
 //! 未実装・簡易実装（REPAIR-3）: エラー応答の生成は `error_outcome` / `tool_error_result` の仮実装で、
-//! ERR-5 の対応表に沿った `error.rs` への置き換えは TASK-120（#469・#470）。`start_container` の
+//! エラー型は `crate::error` に定義済み（#469）で、ここへの結線は TASK-120.2（#470）。`start_container` の
 //! 本番起動は未実装（`crate::backend` の doc を参照。#1718）。
 //! UDS 経由の疎通と peer 認証（PLUG-12）は `crate::uds`（TASK-118.4・#467）が持つ。
 
@@ -223,7 +223,7 @@ fn tool_definitions() -> Vec<Tool> {
     ]
 }
 
-/// 仮のエラー応答生成（REPAIR-3）。TASK-120（#469）で ERR-5 の対応表に沿った `error.rs` へ置き換える。
+/// 仮のエラー応答生成（REPAIR-3）。エラー型は `crate::error` に定義済み（#469）。結線は #470。
 /// `message` は固定の英文のみを渡し、入力値を反射させない。
 fn error_outcome(
     op: &'static str,
@@ -406,7 +406,7 @@ fn invalid_arguments(id: Value) -> Outcome {
 }
 
 /// バックエンドの業務エラー分類ごとの固定文言（ERR-1）。core の `TraitError::message` はパス等を含み得るため
-/// 出力へ流さない。仮実装（REPAIR-3）: ERR-5 の対応表は TASK-120（#469・#470）で `error.rs` に置き換える。
+/// 出力へ流さない。仮実装（REPAIR-3）: エラー型は `crate::error` に定義済み（#469）。結線は #470。
 fn tool_error_message(code: ErrorCode) -> &'static str {
     match code {
         ErrorCode::InvalidArgument => "Invalid argument",
@@ -421,7 +421,7 @@ fn tool_error_message(code: ErrorCode) -> &'static str {
     }
 }
 
-/// 業務エラーの `tools/call` result（`isError: true`）。仮実装（REPAIR-3。TASK-120 で置き換え）。
+/// 業務エラーの `tools/call` result（`isError: true`）。仮実装（REPAIR-3。`crate::error` への結線は #470）。
 fn tool_error_result(tool: &'static str, id: Value, err: &TraitError) -> Outcome {
     let code = err.code();
     let body = json!({"code": code.as_str(), "message": tool_error_message(code)});

@@ -144,17 +144,23 @@ fn sec5_special_bits_via_public_api_with_real_owner() {
             .mode()
             & 0o7777
     };
-    if uid == 0 || gid == 0 {
-        // host root 所有の setuid / setgid は残さない（SEC-1）。
-        assert_eq!(r.special_bits.preserved_files, 0);
-        assert_eq!(r.files_with_stripped_special_bits, 3);
-        assert_eq!(mode("mapped"), 0o755);
-    } else {
-        assert_eq!(r.special_bits.preserved_files, 1);
-        assert_eq!(r.files_with_stripped_special_bits, 2);
-        assert_eq!(mode("mapped"), 0o6755);
-        assert_eq!(mode("other_uid"), 0o755);
-        assert_eq!(mode("other_gid"), 0o755);
+    // special_bits_to_keep は setuid / setgid を独立に判定する（所有者が host root のビットだけ落ちる）。
+    let mut expected_mapped = 0o755;
+    if uid != 0 {
+        expected_mapped |= 0o4000;
     }
+    if gid != 0 {
+        expected_mapped |= 0o2000;
+    }
+    let mapped_kept = expected_mapped != 0o755;
+    let mapped_stripped = expected_mapped != 0o6755;
+    assert_eq!(r.special_bits.preserved_files, u64::from(mapped_kept));
+    assert_eq!(
+        r.files_with_stripped_special_bits,
+        2 + u64::from(mapped_stripped)
+    );
+    assert_eq!(mode("mapped"), expected_mapped);
+    assert_eq!(mode("other_uid"), 0o755);
+    assert_eq!(mode("other_gid"), 0o755);
     std::fs::remove_dir_all(&base).unwrap();
 }

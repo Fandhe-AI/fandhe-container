@@ -230,16 +230,13 @@ mod linux {
         let mut count = 0;
         for kind in ["masked", "readonly"] {
             for (target, _) in TARGETS {
-                let out = std::process::Command::new(&exe)
-                    .args(["--ignored", "--scenario", kind, target])
-                    .output()
-                    .expect("spawn the scenario process");
-                print!("{}", String::from_utf8_lossy(&out.stdout));
-                eprint!("{}", String::from_utf8_lossy(&out.stderr));
+                let out = run_bounded(&exe, kind, target);
+                print!("{}", out.stdout);
+                eprint!("{}", out.stderr);
                 assert!(
-                    out.status.success(),
-                    "scenario {kind}:{target} failed: {:?}",
-                    out.status
+                    out.success,
+                    "scenario {kind}:{target} failed: {}",
+                    out.status_desc
                 );
                 count += 1;
             }
@@ -247,6 +244,74 @@ mod linux {
         println!(
             "config_paths_implicit_dev: {count} overlaps with the implicit /dev mounts applied at the exec layer (no Landlock); start refuses them before fork (root={root})"
         );
+    }
+
+    /// シナリオ子プロセスの結果。
+    struct Bounded {
+        success: bool,
+        status_desc: String,
+        stdout: String,
+        stderr: String,
+    }
+
+    /// シナリオを spawn し、全体の期限（wall clock）内で終了を待つ（REPAIR-5）。
+    /// 期限超過時は子のプロセスグループを kill し、出力の収集も有限時間で打ち切る
+    /// （孫が pipe を保持し続けても無期限に待たない）。
+    fn run_bounded(exe: &std::path::Path, kind: &str, target: &str) -> Bounded {
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+        use std::time::Instant;
+
+        let mut child = std::process::Command::new(exe)
+            .args(["--ignored", "--scenario", kind, target])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn the scenario process");
+        let pgid = child.id();
+        let spawn_reader = |mut r: Box<dyn std::io::Read + Send>| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = r.by_ref().take(1024 * 1024).read_to_end(&mut buf);
+                let _ = tx.send(buf);
+            });
+            rx
+        };
+        let out_rx = spawn_reader(Box::new(child.stdout.take().expect("stdout pipe")));
+        let err_rx = spawn_reader(Box::new(child.stderr.take().expect("stderr pipe")));
+
+        let deadline = Instant::now() + timeout() * 4 + Duration::from_secs(30);
+        let (success, status_desc) = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break (st.success(), format!("{st:?}")),
+                Ok(None) if Instant::now() >= deadline => {
+                    // 子孫ごと終了させる（プロセスグループ宛の SIGKILL）。
+                    let _ = std::process::Command::new("kill")
+                        .args(["-KILL", "--", &format!("-{pgid}")])
+                        .status();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break (false, "killed: scenario exceeded its deadline".to_string());
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(e) => break (false, format!("try_wait failed: {e}")),
+            }
+        };
+        let grace = Duration::from_secs(5);
+        let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+            rx.recv_timeout(grace)
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
+        };
+        Bounded {
+            success,
+            status_desc,
+            stdout: collect(out_rx),
+            stderr: collect(err_rx),
+        }
     }
 
     fn lookup<'a>(text: &'a str, key: &str) -> &'a str {

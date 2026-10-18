@@ -943,7 +943,9 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/readonly_paths.log"
           cargo test -p fandhe-container-core --test readonly_paths -- --ignored 2>&1 | tee "${log}"
-          if ! grep -Fq 'readonly_paths: /proc bus,fs,irq,sys,sysrq-trigger and /sys mounted read-only, writes refused, reads allowed (root=false)' "${log}"; then
+          expected='readonly_paths: /proc bus,fs,irq,sys,sysrq-trigger and /sys mounted read-only,'
+          expected+=' writes refused, reads allowed (root=false)'
+          if ! grep -Fq "${expected}" "${log}"; then
             echo "::error::readonly_paths did not report verification (possibly not executed)" >&2
             exit 1
           fi
@@ -961,7 +963,9 @@ jobs:
           set -euo pipefail
           log="${RUNNER_TEMP}/config_paths_implicit_dev.log"
           cargo test -p fandhe-container-core --test config_paths_implicit_dev -- --ignored 2>&1 | tee "${log}"
-          if ! grep -Fq 'config_paths_implicit_dev: 6 overlaps with the implicit /dev mounts applied at the exec layer (no Landlock); start refuses them before fork (root=false)' "${log}"; then
+          expected='config_paths_implicit_dev: 6 overlaps with the implicit /dev mounts applied at the exec layer'
+          expected+=' (no Landlock); start refuses them before fork (root=false)'
+          if ! grep -Fq "${expected}" "${log}"; then
             echo "::error::config_paths_implicit_dev did not report verification (possibly not executed)" >&2
             exit 1
           fi

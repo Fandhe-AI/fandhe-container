@@ -190,7 +190,8 @@ pub use landlock::{
     LandlockAccessProbe, observe_landlock_path_access,
 };
 pub(crate) use launch_intermediate::{
-    IntermediateSpec, LaunchTag, Rescan, rescan_unreported_init, spawn_container_via_intermediate,
+    IntermediatePlan, IntermediateSpec, LaunchTag, Rescan, rescan_unreported_init,
+    spawn_container_via_intermediate,
 };
 pub(crate) use launch_status::LaunchAudit;
 /// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・SEC-5・REPAIR-10・#2072。通常の利用者は呼ばない）。
@@ -1521,6 +1522,19 @@ fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
 pub fn isolate_rootless_subordinate(
     plan: &SubordinateIsolationPlan,
 ) -> Result<RootlessIsolationReport, ExecError> {
+    isolate_rootless_subordinate_with(plan, true)
+}
+
+/// [`isolate_rootless_subordinate`] の本体。`flush_stdio` は mapper の fork 前に stdout / stderr を flush するか。
+///
+/// 本番 launcher の中間プロセス I は、C の stdio バッファを flush せずに複製した子である。I が flush すると
+/// C の未出力分が二重に出て、flush が止まると期限も効かない(REPAIR-5)ため、launcher 経路は `false` を渡す
+/// (`isolate_rootless_subordinate_no_flush`)。mapper は `_exit` で終わり stdout に書かないので、省いても二重出力は
+/// 起きない(CORE-6・#2009)。
+fn isolate_rootless_subordinate_with(
+    plan: &SubordinateIsolationPlan,
+    flush_stdio: bool,
+) -> Result<RootlessIsolationReport, ExecError> {
     let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
     if euid != plan.euid || egid != plan.egid {
         return Err(ExecError::from_violation(
@@ -1537,10 +1551,13 @@ pub fn isolate_rootless_subordinate(
         plan.writer.clone(),
         plan.timeout,
     );
-    let mapper_pid = sys::fork_single_threaded(
-        move || rootless::run_id_map_mapper(parent_pid, mapper_sock, &uid, &gid, &writer, timeout),
-        EXIT_SETUP_FAILED,
-    )
+    let mapper_main =
+        move || rootless::run_id_map_mapper(parent_pid, mapper_sock, &uid, &gid, &writer, timeout);
+    let mapper_pid = if flush_stdio {
+        sys::fork_single_threaded(mapper_main, EXIT_SETUP_FAILED)
+    } else {
+        sys::fork_single_threaded_no_flush(mapper_main, EXIT_SETUP_FAILED)
+    }
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
     let mapper = ContainerChild::spawned(mapper_pid);
 
@@ -1583,6 +1600,21 @@ pub fn isolate_rootless_subordinate(
             },
         },
     })
+}
+
+/// 本番 launcher の中間プロセスが使う [`isolate_rootless_subordinate`](mapper の fork 前に stdio を flush
+/// しない。REPAIR-5・CORE-6。#2009)。契約は公開版と同じ。
+pub(crate) fn isolate_rootless_subordinate_no_flush(
+    plan: &SubordinateIsolationPlan,
+) -> Result<RootlessIsolationReport, ExecError> {
+    isolate_rootless_subordinate_with(plan, false)
+}
+
+impl SubordinateIsolationPlan {
+    /// 計画の gid 写像(本番 launcher が devpts の `gid=` の決定元として使う。#2009)。
+    pub(crate) fn gid_map(&self) -> &IdMapSet {
+        &self.gid
+    }
 }
 
 /// [`isolate_rootless_subordinate`] の親側（`unshare` → go → 応答 → 自己検証）。

@@ -83,7 +83,10 @@
 //! （cgroup の分離・制限は TASK-32・CORE-3 の範囲。REPAIR-3: 未実装であることを明示する）。
 //! - `linux.uidMappings` / `gidMappings` が非空（config 指定の写像は subuid 範囲写像とともに
 //!   TASK-40・CORE-6 で対応する。SEC-5 の「コンテナ内 root をホストの非特権 UID へ写す」写像は
-//!   launcher の契約で、`exec::isolate` が呼び出しプロセスの euid / egid へ写す。`ProcessLauncher` 参照）
+//!   launcher の契約で、本番 launcher は権限モデルに応じて呼び出しプロセスの euid / egid へ写す単一 ID 写像
+//!   (`RootlessSingleId`)か、起動ユーザーの `/etc/subuid`・`/etc/subgid` 由来の範囲写像
+//!   (`RootlessSubordinateIds`。#2009)を使う。config 指定の写像を受理するかは SEC-5 に関わるオーナー判断で
+//!   確認待ちのため、ここでは拒否のまま。`ProcessLauncher` 参照）
 //! - `root.readonly` が true（読み取り専用 rootfs 未実装）
 //!
 //! `process.args` / `process.env` は `exec::Entrypoint::new` と同じ上限（件数 4096・1 要素 131072 バイト・

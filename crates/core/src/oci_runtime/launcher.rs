@@ -12,7 +12,8 @@
 //!
 //! # 起動の順序(固定。いずれの拒否も fork より前で、副作用は無い)
 //!
-//! 1. 権限モデルの検査(`RootlessSingleId` 以外は `Unimplemented`)
+//! 1. 権限モデルの検査(`RootfulHostRoot` は `Unimplemented`。`RootlessSubordinateIds` の写像の解決は構築時に済み、
+//!    ホスト ID 0 を含む・helper が無い構成は構築が拒否する。CORE-6・SEC-5・#2009)
 //! 2. cgroup 要件の検査(`launch_after_cgroup_check`。要件ありで参加の源が無ければ `FailedPrecondition`。CORE-3)
 //! 3. 呼び出しプロセスが単一スレッドであることの確認(`FailedPrecondition`。CORE-1)
 //! 4. Landlock の ruleset(**必須**。ABI 6 未満は `FailedPrecondition` で起動を拒否し、縮退しない。CORE-5・#1314)
@@ -31,6 +32,10 @@
 //! ため、start は別スレッドを作らずに呼び出しスレッドで直接 `launch` を呼ぶ。上限は `timeout` から導く単一の
 //! 期限(中間プロセスの報告・pivot 前段の状態)と、失敗後の後始末の固定上限で、戻りは `timeout` ＋後始末の
 //! 上限以内。複数スレッドの呼び出しは副作用なしで `FailedPrecondition` にする。
+//! `RootlessSubordinateIds` では中間プロセス I が `newuidmap` / `newgidmap` の応答を最大 `2 × helper_timeout + 1` 秒
+//! 待つため、launch の `timeout` がこれより短いと C が I を SIGKILL して起動は失敗する(fail-closed)。
+//! mapper の fork は stdio を flush しない版を使う(I は C のバッファの複製で、flush は二重出力と無期限の
+//! 待ちを招くため。REPAIR-5)。
 //!
 //! # 起動台帳と `confirm_no_process`(CORE-2・REPAIR-5。#1817)
 //!
@@ -46,9 +51,15 @@
 //!
 //! # 未実装・残余(REPAIR-3)
 //!
-//! - **権限モデル**: `RootlessSingleId` のみ。`RootfulHostRoot`(SEC-5・CORE-7・CORE-9。start が user namespace
-//!   を必須とするため、start を通る構成では到達しない。整合は spec 側の判断事項)と `RootlessSubordinateIds`
-//!   (CORE-6・TASK-40.2。`LaunchSpec` が uid/gid 写像を持たない)は `Unimplemented` で拒否する
+//! - **権限モデル**: `RootlessSingleId` と `RootlessSubordinateIds`(#2009)を扱う。`RootfulHostRoot`
+//!   (SEC-5・CORE-7・CORE-9。start が user namespace を必須とするため、start を通る構成では到達しない。整合は
+//!   spec 側の判断事項)は `Unimplemented` で拒否する
+//! - **範囲写像の入力元**: `/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap`(`SubordinateIdSource`)
+//!   だけ。config の `linux.uidMappings` / `gidMappings` は `start` が引き続き拒否する(受理は SEC-5 に関わる
+//!   オーナー判断事項で、確認待ち)。supervisor が `RootlessSubordinateIds` を選ぶ経路は未結線(後続)
+//! - **mapper の回収**: 中間プロセス I が期限で殺された場合、その子の mapper(`LaunchTag` を持たない)は C へ
+//!   再親付けされ、`rescan` の対象外でゾンビとして残り得る(mapper 自身は read timeout と親 pid の再確認で終了する。
+//!   REPAIR-3。追跡 issue の候補)
 //! - **`confirm_no_process`**: この launcher 自身が起動した範囲だけを確証する(下の「起動台帳」)。別プロセス
 //!   (クラッシュ前の supervisor 等)で起動した残存は、launcher が ID から cgroup を引けないため確証できず
 //!   `FailedPrecondition` で返す(fail-closed)。cgroup の `cgroup.procs` が空であることの確認は別 issue の範囲
@@ -63,6 +74,8 @@
 //!   `WriteRestrictionShadowed` で fork 前に拒否される（#1917 で解消するまでの想定挙動）
 //! - bind 以外の `mounts[]` の種類と `/dev` 以外の tmpfs の注入は `start` が拒否済みで、ここでは載せない
 
+#[cfg(target_os = "linux")]
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "linux")]
@@ -86,12 +99,18 @@ use crate::cgroups::{CgroupError, CgroupJoin};
 #[cfg(target_os = "linux")]
 use crate::exec::{
     ChildStdio, ChildSubreaper, ConfigPaths, ContainerChild, Entrypoint, ExecError, Hostname,
-    IntermediateSpec, IsolationConfig, IsolationPrivilege, IsolationStage, LaunchAudit, LaunchTag,
-    Namespace, NamespaceSet, PrePivotSetup, PreparedLaunchFailure, Rescan, StageKind,
-    StagePipeline, plan, rescan_unreported_init, spawn_container_via_intermediate,
+    IntermediatePlan, IntermediateSpec, IsolationConfig, IsolationPrivilege, IsolationStage,
+    LaunchAudit, LaunchTag, Namespace, NamespaceSet, PrePivotSetup, PreparedLaunchFailure, Rescan,
+    StageKind, StagePipeline, plan, plan_rootless_subordinate, rescan_unreported_init,
+    spawn_container_via_intermediate,
 };
 #[cfg(target_os = "linux")]
 use crate::landlock::LandlockRuleset;
+#[cfg(target_os = "linux")]
+use crate::rootless::{
+    DEFAULT_HELPER_TIMEOUT, HelperPaths, IdMapSet, IdMapWriter, SubIdOwner, load_subordinate_ids,
+    rootless_mapping,
+};
 #[cfg(target_os = "linux")]
 use crate::tmpfs::TmpfsMountSet;
 use crate::traits::{ContainerId, ErrorCode, TraitError};
@@ -149,6 +168,8 @@ pub struct ProductionLauncherBuilder {
     audit_sink: Option<Arc<dyn AuditSink>>,
     #[cfg(target_os = "linux")]
     cgroup_join_source: Option<JoinSource>,
+    #[cfg(target_os = "linux")]
+    subordinate_ids: Option<SubordinateIdSource>,
 }
 
 impl std::fmt::Debug for ProductionLauncherBuilder {
@@ -172,10 +193,19 @@ impl ProductionLauncher {
 
 #[cfg(target_os = "linux")]
 impl ProductionLauncherBuilder {
-    /// 分離の権限モデル。`RootlessSingleId` 以外は launch が `Unimplemented` で拒否する(モジュール doc)。
+    /// 分離の権限モデル。`RootlessSingleId` と `RootlessSubordinateIds`(要 [`Self::subordinate_ids`])を扱い、
+    /// `RootfulHostRoot` は launch が `Unimplemented` で拒否する(モジュール doc)。
     #[must_use]
     pub fn privilege(mut self, privilege: IsolationPrivilege) -> Self {
         self.privilege = Some(privilege);
+        self
+    }
+
+    /// `RootlessSubordinateIds` の写像の入力元(subuid / subgid と helper)。`RootlessSubordinateIds` では必須、
+    /// それ以外の権限モデルで渡すと `build` が拒否する(取り違えを黙って無視しない。CORE-6・SEC-5・#2009)。
+    #[must_use]
+    pub fn subordinate_ids(mut self, source: SubordinateIdSource) -> Self {
+        self.subordinate_ids = Some(source);
         self
     }
 
@@ -212,6 +242,13 @@ impl ProductionLauncherBuilder {
             let audit_sink = self
                 .audit_sink
                 .ok_or_else(|| missing("the launcher requires an audit sink"))?;
+            // 写像の解決と検証は subreaper 化(プロセス属性の変更)より前に行い、拒否で副作用を残さない。
+            let subordinate = resolve_privilege(
+                privilege,
+                self.subordinate_ids,
+                crate::sys::effective_uid(),
+                crate::sys::effective_gid(),
+            )?;
             let subreaper = ChildSubreaper::enable().map_err(|e| {
                 TraitError::new(
                     e.code,
@@ -222,6 +259,7 @@ impl ProductionLauncherBuilder {
                 inner: Inner::new(
                     Box::new(RealOps { subreaper }),
                     privilege,
+                    subordinate,
                     audit_sink,
                     self.cgroup_join_source,
                 ),
@@ -234,6 +272,146 @@ impl ProductionLauncherBuilder {
                 "production launcher requires Linux",
             ))
         }
+    }
+}
+
+/// `RootlessSubordinateIds` の写像の入力元(`/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap` のパス。
+/// CORE-6・SEC-5・#2009)。
+///
+/// 呼び出し元は supervisor(将来。現状は未結線)。パスはすべて絶対パスで、`PATH` は探索しない。所有者の名前は
+/// 呼び出し側が渡す(`rootless` のモジュール doc のとおり、ライブラリは `$USER` を読まず NSS も使わない)。一般的な
+/// `/etc/subuid` はユーザー名で書かれるため、名前を渡さないと数値の uid の行しか一致しない。
+/// 範囲の読み取りと helper の検証は [`ProductionLauncherBuilder::build`] が行う。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct SubordinateIdSource {
+    owner_name: Option<String>,
+    subuid: PathBuf,
+    subgid: PathBuf,
+    newuidmap: PathBuf,
+    newgidmap: PathBuf,
+    helper_timeout: Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl SubordinateIdSource {
+    /// 既定の位置(`/etc/subuid`・`/etc/subgid`・`/usr/bin/newuidmap`・`/usr/bin/newgidmap`・
+    /// `DEFAULT_HELPER_TIMEOUT`)を使う。`owner_name` は `/etc/subuid` の第 1 フィールドと照合する起動ユーザー名。
+    pub fn system(owner_name: Option<String>) -> Result<Self, TraitError> {
+        Self::with_paths(
+            owner_name,
+            Path::new("/etc/subuid"),
+            Path::new("/etc/subgid"),
+            Path::new("/usr/bin/newuidmap"),
+            Path::new("/usr/bin/newgidmap"),
+            DEFAULT_HELPER_TIMEOUT,
+        )
+    }
+
+    /// 明示パスで作る(試験・別配置向け)。パスは絶対パスのみ、`helper_timeout` は 1..=60 秒、名前は
+    /// `[A-Za-z0-9._-]`・32 文字以内。違反は `InvalidArgument`(副作用なし)。
+    pub fn with_paths(
+        owner_name: Option<String>,
+        subuid: &Path,
+        subgid: &Path,
+        newuidmap: &Path,
+        newgidmap: &Path,
+        helper_timeout: Duration,
+    ) -> Result<Self, TraitError> {
+        let invalid = |what: &'static str| Err(TraitError::new(ErrorCode::InvalidArgument, what));
+        if SubIdOwner::new(0, owner_name.clone()).is_err() {
+            return invalid("the subordinate id owner name is invalid");
+        }
+        if ![subuid, subgid, newuidmap, newgidmap]
+            .iter()
+            .all(|p| p.is_absolute())
+        {
+            return invalid("the subordinate id source paths must be absolute");
+        }
+        if helper_timeout < Duration::from_secs(1) || helper_timeout > Duration::from_secs(60) {
+            return invalid("the id map helper timeout must be within 1..=60 seconds");
+        }
+        Ok(Self {
+            owner_name,
+            subuid: subuid.to_path_buf(),
+            subgid: subgid.to_path_buf(),
+            newuidmap: newuidmap.to_path_buf(),
+            newgidmap: newgidmap.to_path_buf(),
+            helper_timeout,
+        })
+    }
+}
+
+/// 構築時に解決・検証済みの範囲写像(`Inner` が保持し、起動のたびに `plan_rootless_subordinate` へ渡す)。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+struct SubordinateIds {
+    uid: IdMapSet,
+    gid: IdMapSet,
+    writer: IdMapWriter,
+    timeout: Duration,
+}
+
+/// 権限モデルと写像の入力元の整合を検査し、`RootlessSubordinateIds` なら写像を解決する(副作用なし。
+/// `build` が subreaper 化の前に呼ぶ。`euid` / `egid` を引数に取りテスト可能にした純関数)。
+///
+/// 拒否: 入力元が無い・不要な権限モデルで渡された(`InvalidArgument`)、euid / egid が 0(`PermissionDenied`。
+/// SEC-5)、範囲が 0 件(`FailedPrecondition`。単一 ID へ黙って縮退しない)、ホスト ID 0 を含む範囲
+/// (`PermissionDenied`。`IdMapSet::new`)、subuid / subgid の読み取り・解析の失敗、helper の検証の失敗。
+/// 文言は固定の英語で、パス・errno・ユーザー名を含めない。
+#[cfg(target_os = "linux")]
+fn resolve_privilege(
+    privilege: IsolationPrivilege,
+    source: Option<SubordinateIdSource>,
+    euid: u32,
+    egid: u32,
+) -> Result<Option<SubordinateIds>, TraitError> {
+    let fail = |code: ErrorCode| {
+        TraitError::new(
+            code,
+            "failed to resolve the subordinate id mapping for the launcher",
+        )
+    };
+    match (privilege, source) {
+        (IsolationPrivilege::RootlessSubordinateIds, Some(source)) => {
+            if euid == 0 || egid == 0 {
+                return Err(TraitError::new(
+                    ErrorCode::PermissionDenied,
+                    "refusing to map the host root identity",
+                ));
+            }
+            let owner_of =
+                |id| SubIdOwner::new(id, source.owner_name.clone()).map_err(|e| fail(e.code));
+            let uid_ranges =
+                load_subordinate_ids(&source.subuid, &owner_of(euid)?).map_err(|e| fail(e.code))?;
+            let gid_ranges =
+                load_subordinate_ids(&source.subgid, &owner_of(egid)?).map_err(|e| fail(e.code))?;
+            if uid_ranges.is_empty() || gid_ranges.is_empty() {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "no subordinate id range is assigned to the launching user",
+                ));
+            }
+            let uid = rootless_mapping(euid, &uid_ranges).map_err(|e| fail(e.code))?;
+            let gid = rootless_mapping(egid, &gid_ranges).map_err(|e| fail(e.code))?;
+            let helper =
+                HelperPaths::new(&source.newuidmap, &source.newgidmap).map_err(|e| fail(e.code))?;
+            Ok(Some(SubordinateIds {
+                uid,
+                gid,
+                writer: IdMapWriter::Helper(helper),
+                timeout: source.helper_timeout,
+            }))
+        }
+        (IsolationPrivilege::RootlessSubordinateIds, None) => Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "the subordinate id privilege model requires a subordinate id source",
+        )),
+        (_, Some(_)) => Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a subordinate id source is only valid for the subordinate id privilege model",
+        )),
+        (_, None) => Ok(None),
     }
 }
 
@@ -329,6 +507,8 @@ struct SpawnInput<'a> {
     tmpfs: &'a TmpfsMountSet,
     /// 適用する bind mount の集合(空なら `None`。#1915)。
     binds: Option<&'a BindMountSet>,
+    /// 範囲写像で起動するときの解決済み写像(`None` なら単一 ID 写像。CORE-6・#2009)。
+    subordinate: Option<&'a SubordinateIds>,
 }
 
 /// 起動した PID 1 と、stdout / stderr の読み取り側。
@@ -448,6 +628,8 @@ impl Ledger {
 struct Inner {
     ops: Box<dyn LaunchOps>,
     privilege: IsolationPrivilege,
+    /// `RootlessSubordinateIds` のときだけ `Some`(`resolve_privilege` が保証する)。
+    subordinate: Option<SubordinateIds>,
     audit_sink: Arc<dyn AuditSink>,
     cgroup_join_source: Option<JoinSource>,
     /// ハンドルの回収通知（`ContainerChildProcess::with_reap_notice`）と共有するため `Arc`。
@@ -464,12 +646,14 @@ impl Inner {
     fn new(
         ops: Box<dyn LaunchOps>,
         privilege: IsolationPrivilege,
+        subordinate: Option<SubordinateIds>,
         audit_sink: Arc<dyn AuditSink>,
         cgroup_join_source: Option<JoinSource>,
     ) -> Self {
         Self {
             ops,
             privilege,
+            subordinate,
             audit_sink,
             cgroup_join_source,
             ledger: Arc::new(Mutex::new(Ledger::default())),
@@ -499,17 +683,19 @@ impl Inner {
         })
     }
 
-    /// 権限モデルの検査。未実装のモデルは fork より前に拒否する(権限を黙って広げない。SEC-5)。
+    /// 権限モデルの検査。未対応のモデルは fork より前に拒否する(権限を黙って広げない。SEC-5)。
     fn check_privilege(&self) -> Result<(), TraitError> {
         match self.privilege {
             IsolationPrivilege::RootlessSingleId => Ok(()),
+            // 写像は構築時に解決済み。無ければ構築の不整合として拒否する(fail-closed)。
+            IsolationPrivilege::RootlessSubordinateIds if self.subordinate.is_some() => Ok(()),
             IsolationPrivilege::RootfulHostRoot => Err(TraitError::new(
                 ErrorCode::Unimplemented,
                 "the rootful privilege model is not supported by the launcher",
             )),
             IsolationPrivilege::RootlessSubordinateIds => Err(TraitError::new(
-                ErrorCode::Unimplemented,
-                "the subordinate id privilege model is not supported by the launcher",
+                ErrorCode::InvalidArgument,
+                "the subordinate id privilege model requires a subordinate id source",
             )),
         }
     }
@@ -582,6 +768,7 @@ impl Inner {
                 timeout,
                 tmpfs: &default_tmpfs,
                 binds,
+                subordinate: self.subordinate.as_ref(),
             })
             .map_err(|failure| self.absorb_failure(id, *failure))?;
         let Spawned {
@@ -929,19 +1116,43 @@ impl LaunchOps for RealOps {
             ))
         };
         // euid 0 の写像は計画の段階で拒否される(`HostRootIdentityMapping`。SEC-5)。
-        let isolation_plan = plan(&input.isolation).map_err(not_started)?;
-        // 計画が euid / egid 0 を拒否した後に、自 egid をコンテナ内 0 へ写す単一 ID 写像を作る(devpts の gid= の決定元)。
-        let gid_map =
-            crate::rootless::single_id_mapping(crate::sys::effective_gid()).map_err(|_| {
-                not_started(ExecError::new(
-                    ErrorCode::PermissionDenied,
-                    IsolationStage::UserNamespaceMap,
-                    "refusing to map the host root identity",
-                ))
-            })?;
+        // 単一 ID は自 egid をコンテナ内 0 へ写す写像、範囲写像は解決済みの subuid / subgid 写像(CORE-6・#2009)。
+        // どちらも devpts の gid= の決定元になる gid 写像を併せて得る。
+        let single_plan;
+        let single_gid;
+        let subordinate_plan;
+        let (isolation_plan, gid_map): (IntermediatePlan<'_>, &IdMapSet) = match input.subordinate {
+            None => {
+                single_plan = plan(&input.isolation).map_err(not_started)?;
+                // 計画が euid / egid 0 を拒否した後に作る。
+                single_gid = crate::rootless::single_id_mapping(crate::sys::effective_gid())
+                    .map_err(|_| {
+                        not_started(ExecError::new(
+                            ErrorCode::PermissionDenied,
+                            IsolationStage::UserNamespaceMap,
+                            "refusing to map the host root identity",
+                        ))
+                    })?;
+                (IntermediatePlan::SingleId(&single_plan), &single_gid)
+            }
+            Some(ids) => {
+                subordinate_plan = plan_rootless_subordinate(
+                    &input.isolation,
+                    ids.uid.clone(),
+                    ids.gid.clone(),
+                    ids.writer.clone(),
+                    ids.timeout,
+                )
+                .map_err(not_started)?;
+                (
+                    IntermediatePlan::Subordinate(&subordinate_plan),
+                    subordinate_plan.gid_map(),
+                )
+            }
+        };
         let (stdio, stdout, stderr) = ChildStdio::pipes().map_err(not_started)?;
         let setup = PrePivotSetup {
-            devices: crate::exec::DevptsGidSource::Rootless(&gid_map),
+            devices: crate::exec::DevptsGidSource::Rootless(gid_map),
             tmpfs: Some(input.tmpfs),
             inject: None,
             binds: input.binds,
@@ -954,7 +1165,7 @@ impl LaunchOps for RealOps {
         };
         let child = spawn_container_via_intermediate(
             IntermediateSpec {
-                plan: &isolation_plan,
+                plan: isolation_plan,
                 rootfs: input.spec.rootfs(),
                 entry: input.entry,
                 setup,
@@ -1101,6 +1312,18 @@ mod tests {
                     .map(|m| m.destination.as_str().to_owned())
                     .collect(),
             ));
+            // 範囲写像で起動する場合だけ、渡された写像の内容を記録する(単一 ID の起動の記録は増やさない)。
+            if let Some(ids) = input.subordinate {
+                push(
+                    &self.events,
+                    format!(
+                        "ids uid=[{}] gid=[{}] timeout={}s",
+                        ids.uid.to_map_content().trim_end().replace('\n', ";"),
+                        ids.gid.to_map_content().trim_end().replace('\n', ";"),
+                        ids.timeout.as_secs()
+                    ),
+                );
+            }
             push(&self.events, format!("spawn {:?}", input.stages));
             // 偽のカーネル上でステージ列を実行し、制限適用の証跡(`LaunchReady`)がそろうかを記録する。
             if self.run_stages {
@@ -1160,8 +1383,23 @@ mod tests {
         privilege: IsolationPrivilege,
         join: Option<JoinSource>,
     ) -> ProductionLauncher {
+        launcher_with(ops, privilege, None, join)
+    }
+
+    fn launcher_with(
+        ops: FakeOps,
+        privilege: IsolationPrivilege,
+        subordinate: Option<SubordinateIds>,
+        join: Option<JoinSource>,
+    ) -> ProductionLauncher {
         ProductionLauncher {
-            inner: Inner::new(Box::new(ops), privilege, Arc::new(NullSink), join),
+            inner: Inner::new(
+                Box::new(ops),
+                privilege,
+                subordinate,
+                Arc::new(NullSink),
+                join,
+            ),
         }
     }
 
@@ -1361,30 +1599,213 @@ mod tests {
         assert_eq!(ev.lock().unwrap().as_slice(), ["threads"]);
     }
 
-    /// SEC-5: 未実装の権限モデルは `Unimplemented` で、何も呼ばずに拒否する。
+    /// SEC-5: 未実装の権限モデル(`RootfulHostRoot`)は `Unimplemented` で、何も呼ばずに拒否する。
     #[test]
     fn sec5_unimplemented_privilege_models_are_refused_before_fork() {
         let spec = spec_for("priv", serde_json::json!({}));
-        for (privilege, message) in [
-            (
-                IsolationPrivilege::RootfulHostRoot,
-                "the rootful privilege model is not supported by the launcher",
-            ),
-            (
-                IsolationPrivilege::RootlessSubordinateIds,
-                "the subordinate id privilege model is not supported by the launcher",
-            ),
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), IsolationPrivilege::RootfulHostRoot, None);
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        assert_eq!(
+            err.message(),
+            "the rootful privilege model is not supported by the launcher"
+        );
+        assert!(ev.lock().unwrap().is_empty());
+    }
+
+    /// CORE-6・SEC-5(#2009): 写像の無い `RootlessSubordinateIds` は(構築を迂回しても)何も呼ばずに拒否する。
+    #[test]
+    fn core6_subordinate_privilege_without_mapping_is_refused_before_fork() {
+        let spec = spec_for("priv-sub", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(
+            FakeOps::new(&ev),
+            IsolationPrivilege::RootlessSubordinateIds,
+            None,
+        );
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "the subordinate id privilege model requires a subordinate id source"
+        );
+        assert!(ev.lock().unwrap().is_empty());
+    }
+
+    /// 試験用の subuid / subgid と helper(root 所有の実在ファイルで代用)の入力元を作る。
+    fn source_in(name: &str, subuid: &str, subgid: &str, helper: &str) -> SubordinateIdSource {
+        let dir = std::env::temp_dir().join(format!("fandhe-subids-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("subuid"), subuid).unwrap();
+        std::fs::write(dir.join("subgid"), subgid).unwrap();
+        SubordinateIdSource::with_paths(
+            Some("tester".to_owned()),
+            &dir.join("subuid"),
+            &dir.join("subgid"),
+            Path::new(helper),
+            Path::new(helper),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+    }
+
+    /// root 所有で祖先も root のみ書き込み可の実在の通常ファイル(`HelperPaths` の検証を通す代用)。
+    /// symlink は検証が拒否するため、候補から実体のあるものを選ぶ。1 つも無ければ panic する(skip しない)。
+    fn helper_stand_in() -> &'static str {
+        use std::os::unix::fs::MetadataExt as _;
+        [
+            "/usr/bin/newuidmap",
+            "/usr/bin/gnutrue",
+            "/usr/bin/true",
+            "/usr/bin/dash",
+            "/usr/bin/bash",
+            "/usr/bin/su",
+            "/usr/bin/passwd",
+        ]
+        .into_iter()
+        .find(|p| {
+            std::fs::symlink_metadata(p)
+                .is_ok_and(|m| m.is_file() && m.uid() == 0 && m.mode() & 0o022 == 0)
+        })
+        .expect("a root-owned regular file under /usr/bin is required by this test")
+    }
+
+    /// SEC-5(#2009): ホスト ID 0 を含む範囲は、構築(副作用なし)で `PermissionDenied` になる。
+    #[test]
+    fn sec5_subordinate_ids_reject_host_root_range_before_fork() {
+        let src = source_in(
+            "hostroot",
+            "tester:0:65536\n",
+            "tester:100000:65536\n",
+            helper_stand_in(),
+        );
+        let err = resolve_privilege(
+            IsolationPrivilege::RootlessSubordinateIds,
+            Some(src),
+            1000,
+            1000,
+        )
+        .expect_err("host id 0 range is refused");
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert_eq!(
+            err.message(),
+            "failed to resolve the subordinate id mapping for the launcher"
+        );
+    }
+
+    /// CORE-6(#2009): helper が無ければ構築が拒否し、文言にパスを含めない。
+    #[test]
+    fn core6_subordinate_ids_reject_missing_helper_before_fork() {
+        let src = source_in(
+            "nohelper",
+            "tester:100000:65536\n",
+            "tester:100000:65536\n",
+            "/nonexistent-fandhe-dir/newuidmap",
+        );
+        let err = resolve_privilege(
+            IsolationPrivilege::RootlessSubordinateIds,
+            Some(src),
+            1000,
+            1000,
+        )
+        .expect_err("missing helper is refused");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(
+            err.message(),
+            "failed to resolve the subordinate id mapping for the launcher"
+        );
+        assert!(!err.message().contains("nonexistent"));
+    }
+
+    /// CORE-6・SEC-5(#2009): 範囲が 0 件・euid 0・入力元の欠落と取り違えは、単一 ID へ縮退せず拒否する。
+    #[test]
+    fn core6_subordinate_ids_reject_empty_range_root_and_mismatched_source() {
+        let sub = IsolationPrivilege::RootlessSubordinateIds;
+        let src = || {
+            source_in(
+                "misc",
+                "other:100000:65536\n",
+                "tester:100000:65536\n",
+                helper_stand_in(),
+            )
+        };
+        let e = resolve_privilege(sub, Some(src()), 1000, 1000).expect_err("empty");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        let e = resolve_privilege(sub, Some(src()), 0, 1000).expect_err("root");
+        assert_eq!(e.code(), ErrorCode::PermissionDenied);
+        assert_eq!(e.message(), "refusing to map the host root identity");
+        let e = resolve_privilege(sub, None, 1000, 1000).expect_err("missing source");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        let e = resolve_privilege(rootless(), Some(src()), 1000, 1000).expect_err("unneeded");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert!(
+            resolve_privilege(rootless(), None, 1000, 1000)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// CORE-6(#2009): 入力元の相対パス・不正な名前・範囲外の timeout は構築前に `InvalidArgument`。
+    #[test]
+    fn core6_subordinate_source_validates_inputs() {
+        let abs = Path::new("/etc/subuid");
+        let t = Duration::from_secs(5);
+        let name = Some("tester".to_owned());
+        for e in [
+            SubordinateIdSource::with_paths(name.clone(), Path::new("subuid"), abs, abs, abs, t),
+            SubordinateIdSource::with_paths(Some("a:b".to_owned()), abs, abs, abs, abs, t),
+            SubordinateIdSource::with_paths(name.clone(), abs, abs, abs, abs, Duration::ZERO),
+            SubordinateIdSource::with_paths(name, abs, abs, abs, abs, Duration::from_secs(61)),
         ] {
-            let ev = events();
-            let l = launcher(FakeOps::new(&ev), privilege, None);
-            let err = l
-                .launch(&spec, Duration::from_secs(1))
-                .err()
-                .expect("refused");
-            assert_eq!(err.code(), ErrorCode::Unimplemented);
-            assert_eq!(err.message(), message);
-            assert!(ev.lock().unwrap().is_empty());
+            assert_eq!(e.expect_err("invalid").code(), ErrorCode::InvalidArgument);
         }
+    }
+
+    /// CORE-6(#2009): 範囲写像の launch は `Unimplemented` にならず、spawn へコンテナ 0 → 自 ID・コンテナ 1 以上
+    /// → subuid の範囲の具体的な写像が渡る(順序は 単一スレッド確認 → Landlock → spawn)。
+    #[test]
+    fn core6_subordinate_ids_launch_reaches_spawn_with_ranged_maps() {
+        let src = source_in(
+            "launch",
+            "tester:100000:65536\n",
+            "tester:200000:65536\n",
+            helper_stand_in(),
+        );
+        let ids = resolve_privilege(
+            IsolationPrivilege::RootlessSubordinateIds,
+            Some(src),
+            1000,
+            1001,
+        )
+        .expect("resolved")
+        .expect("some");
+        let spec = spec_for("subordinate-launch", serde_json::json!({}));
+        let ev = events();
+        let l = launcher_with(
+            FakeOps::new(&ev),
+            IsolationPrivilege::RootlessSubordinateIds,
+            Some(ids),
+            None,
+        );
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        let log = ev.lock().unwrap().clone();
+        assert_eq!(log.len(), 5, "{log:?}");
+        assert_eq!(&log[..2], ["threads", "landlock"]);
+        assert_eq!(
+            log[2],
+            "ids uid=[0 1000 1;1 100000 65536] gid=[0 1001 1;1 200000 65536] timeout=5s"
+        );
+        assert!(log[3].starts_with("spawn StagePipeline"), "{}", log[3]);
+        assert_eq!(log[4], "evidence ready");
     }
 
     /// REPAIR-5: launcher は `SelfBounded` を宣言する。

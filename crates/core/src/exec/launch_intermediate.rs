@@ -8,7 +8,7 @@
 //! 呼び出しプロセス C（`Threads: 1` の supervisor。child subreaper の証跡を持つ）は次の順で動く。
 //!
 //! ```text
-//! C --fork--> I(中間プロセス) : isolate(plan) -> fork -> PID 1(child_main) / 報告 pipe へ "K <pid>" -> _exit
+//! C --fork--> I(中間プロセス) : isolate(plan。範囲写像では mapper を fork し、応答まで待つ) -> fork -> PID 1(child_main) / 報告 pipe へ "K <pid>" -> _exit
 //! C : 報告 pipe を期限つきで読む -> adopt_reparented(pid) で PID 1 の pidfd を開く -> I を回収する
 //!   -> 状態 pipe(pivot 前段の結果)を読み、監査(C だけが sink に触る)・判定 -> 失敗なら PID 1 を kill_and_reap
 //! ```
@@ -75,7 +75,10 @@ use super::process::{
     ChildStdio, ContainerChild, EXIT_SETUP_FAILED, Entrypoint, KILL_REAP_TIMEOUT, PrePivotSetup,
     PreparedLaunchFailure, child_main, exec_status_pipe,
 };
-use super::{ChildSubreaper, ExecError, IsolationPlan, IsolationStage, StagePipeline, isolate};
+use super::{
+    ChildSubreaper, ExecError, IsolationPlan, IsolationStage, StagePipeline,
+    SubordinateIsolationPlan, isolate, isolate_rootless_subordinate_no_flush,
+};
 
 /// 報告行の最大バイト数(LF を含む)。最長の行(`R FAILED_PRECONDITION isolate\n` 約 30 バイト)より大きい固定上限。
 pub(super) const REPORT_MAX_BYTES: usize = 48;
@@ -393,7 +396,7 @@ fn await_start_gate(gate_r: &std::fs::File, timeout: Duration) -> Result<(), Pre
 
 /// 本番の動作(既存の `isolate`・`child_main` への薄い委譲)。
 struct RealIntermediateOps<'a> {
-    plan: &'a IsolationPlan,
+    plan: IntermediatePlan<'a>,
     rootfs: &'a Path,
     entry: &'a Entrypoint,
     stages: Option<StagePipeline>,
@@ -406,7 +409,13 @@ struct RealIntermediateOps<'a> {
 
 impl IntermediateOps for RealIntermediateOps<'_> {
     fn isolate(&mut self) -> Result<(), ExecError> {
-        isolate(self.plan).map(|_| ())
+        match self.plan {
+            IntermediatePlan::SingleId(plan) => isolate(plan).map(|_| ()),
+            // mapper の fork は flush しない版(I は C の stdio バッファを複製した子。#2009)。
+            IntermediatePlan::Subordinate(plan) => {
+                isolate_rootless_subordinate_no_flush(plan).map(|_| ())
+            }
+        }
     }
 
     fn spawn_pid1(&mut self) -> Result<u32, ExecError> {
@@ -454,10 +463,19 @@ impl IntermediateOps for RealIntermediateOps<'_> {
     }
 }
 
+/// 中間プロセス I が `isolate` する分離計画(権限モデルごとの検証済み計画。借用)。
+#[derive(Clone, Copy)]
+pub(crate) enum IntermediatePlan<'a> {
+    /// 単一 ID 写像(`exec::plan`。`RootlessSingleId`)。
+    SingleId(&'a IsolationPlan),
+    /// subuid / subgid の範囲写像(`exec::plan_rootless_subordinate`。`RootlessSubordinateIds`。CORE-6・#2009)。
+    Subordinate(&'a SubordinateIsolationPlan),
+}
+
 /// [`spawn_container_via_intermediate`] へ渡す、fork 前に C が準備した値(借用)。
 pub(crate) struct IntermediateSpec<'a> {
-    /// 検証済みの分離計画(`exec::plan`。euid 0 の写像は計画の段階で拒否済み。SEC-5)。
-    pub(crate) plan: &'a IsolationPlan,
+    /// 検証済みの分離計画(euid 0 の写像は計画の段階で拒否済み。SEC-5)。
+    pub(crate) plan: IntermediatePlan<'a>,
     /// rootfs のパス(使用は `setup.pinned_rootfs` の固定 fd との照合を通る)。
     pub(crate) rootfs: &'a Path,
     /// exec するエントリポイント。

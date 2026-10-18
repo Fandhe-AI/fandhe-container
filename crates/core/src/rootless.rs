@@ -12,7 +12,9 @@
 //!
 //! # 呼び出し文脈・契約
 //!
-//! - 起動フローへの組み込みは `exec::isolate_rootless_subordinate`（TASK-40.2・#188）が担う。
+//! - 起動フローへの組み込みは `exec::isolate_rootless_subordinate`（TASK-40.2・#188）が担う。本番 launcher
+//!   （`oci_runtime::ProductionLauncher`）は `RootlessSubordinateIds` のとき、構築時に `SubordinateIdSource` から
+//!   [`load_subordinate_ids`]・[`rootless_mapping`]・[`HelperPaths`] を解決し、中間プロセスから呼ぶ（#2009）。
 //!   呼び出し元が [`unshare_user_namespace`] し、fork した mapper（`run_id_map_mapper`。外側の
 //!   user namespace に残る）が親 pid へ [`apply_id_maps`] する。応答は型付きの固定 3 バイト
 //!   （`MapperReply`）で返す。エラーは `ExecError`（段 `UserNamespaceMap`）へ写す
@@ -45,7 +47,7 @@
 //! - ユーザー名 → `/etc/subuid` 行の NSS 解決は**追加しない**（`getpwuid_r` は新規 FFI のため。
 //!   呼び出し側が [`SubIdOwner`] に数値 uid と検証済みユーザー名を渡す方式を維持する。
 //!   ライブラリコードは `$USER` を読まない）
-//! - `oci_runtime` の `linux.uidMappings` / `gidMappings` の受理（start.rs は現状拒否のまま。後続）
+//! - `oci_runtime` の `linux.uidMappings` / `gidMappings` の受理（start.rs は現状拒否のまま。SEC-5 に関わるオーナー判断の確認待ち。#2009）
 //!
 //! ファイル所有者の写像（SEC-5。ns 内 0 → ホスト非特権 UID）の照合は `tests/rootless_file_owner.rs`
 //! （TASK-40.3・#189）が担う。

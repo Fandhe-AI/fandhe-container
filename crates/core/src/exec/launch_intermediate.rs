@@ -798,18 +798,21 @@ pub(crate) fn rescan_unreported_init(
         // ため、識別子の探索には一致しない。mapper を先に殺すと helper は mapper の死後も走り続け、ゾンビ化して
         // 残り得る(CORE-2 の残存確認契約)。そこで mapper を SIGSTOP で止めて(以後 fork しない)子を列挙し、
         // 子を先に kill してから mapper を kill・回収し、C へ再親付けされた子を回収する。
-        let stopped = std::num::NonZeroU8::new(SIGSTOP_NUMBER)
-            .is_some_and(|stop| child.send_signal(stop).is_ok());
-        let mut helpers = children_of(pid.get(), &mut out);
-        if !stopped {
-            // 止められなかった(=列挙の後に子が増え得る)ので、残存を疑える状態にする。
+        // 停止が確認できたとき(送達成功かつ `/proc` の state が `T`)だけ子を列挙して kill する。送達できなかった
+        // (AlreadyExited / Gone / エラー)・期限内に止まらなかった場合は、子が増え得る・再親付け済みで識別できない
+        // ため列挙も kill もせず、走査不完全として残す(CORE-2。生 PID を kill して再利用された PID を殺さない)。
+        let stopped = stop_and_confirm(&child, pid.get(), reap_timeout);
+        let mut helpers = if stopped {
+            children_of(pid.get(), &mut out)
+        } else {
             note_scan_failure(
                 &mut out,
-                "cannot stop a tagged process before listing its children",
+                "cannot confirm a tagged process stopped before listing its children",
             );
-        }
+            Vec::new()
+        };
         for helper in &helpers {
-            // helper は止めた mapper の未回収の子なので、回収されるまで pid は再利用されない。
+            // helper は停止確認済みの mapper の未回収の子なので、回収されるまで pid は再利用されない。
             let _ = sys::kill_pid(helper.get(), sys::Signal::Kill);
         }
         if let Err(e) = child.kill_and_reap(reap_timeout) {
@@ -830,6 +833,42 @@ pub(crate) fn rescan_unreported_init(
         }
     }
     out
+}
+
+/// `child` へ SIGSTOP を送り、`/proc/<pid>/stat` の state が停止(`T` / `t`)になるまで期限つきで待つ(REPAIR-5)。
+/// 送達に成功し停止を確認できたときだけ `true`(SIGSTOP は送達が停止完了を意味しない。CORE-2)。
+fn stop_and_confirm(child: &ContainerChild, pid: u32, timeout: Duration) -> bool {
+    let Some(stop) = std::num::NonZeroU8::new(SIGSTOP_NUMBER) else {
+        return false;
+    };
+    if !matches!(
+        child.send_signal(stop),
+        Ok(crate::exec::SignalDelivery::Delivered)
+    ) {
+        return false;
+    }
+    let path = Path::new("/proc").join(pid.to_string()).join("stat");
+    let deadline = std::time::Instant::now() + timeout.min(Duration::from_secs(2));
+    loop {
+        match read_proc_text(&path) {
+            Ok(Some(stat)) => match proc_state_of(&stat) {
+                Some('T' | 't') => return true,
+                Some(_) => {}
+                None => return false,
+            },
+            _ => return false,
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// `/proc/<pid>/stat` の state 文字(`comm` の括弧の後の最初のフィールド)。
+fn proc_state_of(stat: &str) -> Option<char> {
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    rest.trim_start().chars().next()
 }
 
 /// `SIGSTOP` の番号(x86_64 / aarch64 共通の asm-generic。`sys::Signal::Number` と同じ前提)。
@@ -1309,6 +1348,31 @@ mod tests {
     }
 
     /// 回収済みなら `/proc/<pid>` は残らない(ゾンビも残さない)。
+    /// 期限つきで `buf` を読み切る(期限なしのブロッキング読みでハングさせない。REPAIR-5)。
+    fn read_within(r: &mut std::io::PipeReader, buf: &mut [u8], timeout: Duration) {
+        use std::io::Read;
+        use std::os::fd::AsFd;
+        let deadline = std::time::Instant::now() + timeout;
+        let mut got = 0;
+        while got < buf.len() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "the child was not ready in time");
+            let ms = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+            if !sys::poll_readable(r.as_fd(), ms).expect("poll") {
+                continue;
+            }
+            let n = r.read(&mut buf[got..]).expect("read");
+            assert!(n > 0, "the child closed the pipe before reporting");
+            got += n;
+        }
+    }
+
+    #[test]
+    fn core2_proc_state_parses_tricky_comm() {
+        assert_eq!(proc_state_of("12 (a) b) T 1 2"), Some('T'));
+        assert_eq!(proc_state_of("garbage"), None);
+    }
+
     fn gone(pid: u32) -> bool {
         !Path::new(&format!("/proc/{pid}")).exists()
     }
@@ -1440,7 +1504,7 @@ mod tests {
         .expect("fork the tagged child");
         drop(ready_write);
         let mut mark = [0u8; 1];
-        ready_read.read_exact(&mut mark).unwrap();
+        read_within(&mut ready_read, &mut mark, Duration::from_secs(10));
         let found = rescan_unreported_init(&tag, &subreaper, Duration::from_secs(5));
         assert!(found.is_clean(), "{found:?}");
         assert!(!found.scan_incomplete);
@@ -1463,20 +1527,24 @@ mod tests {
                 if sys::set_process_comm(tag.comm_bytes()).is_err() {
                     return EXIT_SETUP_FAILED;
                 }
-                // 識別子を持たない子(exec 後の helper 相当)。
+                // 識別子を持たない子(exec 後の helper 相当)。comm を別名にし、設定後に自分の pid を報告する
+                // (comm を継承したままでは、回収漏れがタグ探索で拾われて検出できない。REPAIR-12)。
                 let helper = sys::fork_single_threaded_with(
                     || true,
                     || {
+                        if sys::set_process_comm(b"notatag-helper\0\0").is_err() {
+                            return EXIT_SETUP_FAILED;
+                        }
+                        let mut w = &ready_write;
+                        let _ = w.write_all(&std::process::id().to_le_bytes());
                         std::thread::sleep(Duration::from_secs(120));
                         0
                     },
                     EXIT_SETUP_FAILED,
                 );
-                let Ok(helper) = helper else {
+                if helper.is_err() {
                     return EXIT_SETUP_FAILED;
-                };
-                let mut w = &ready_write;
-                let _ = w.write_all(&helper.to_le_bytes());
+                }
                 std::thread::sleep(Duration::from_secs(120));
                 0
             },
@@ -1485,7 +1553,7 @@ mod tests {
         .expect("fork the tagged mapper");
         drop(ready_write);
         let mut buf = [0u8; 4];
-        ready_read.read_exact(&mut buf).unwrap();
+        read_within(&mut ready_read, &mut buf, Duration::from_secs(10));
         let helper = u32::from_le_bytes(buf);
         let found = rescan_unreported_init(&tag, &subreaper, Duration::from_secs(5));
         assert!(found.is_clean(), "{found:?}");
@@ -1534,7 +1602,7 @@ mod tests {
         assert!(result.is_err());
         drop(result);
         let mut mark = [0u8; 1];
-        mark_read.read_exact(&mut mark).unwrap();
+        read_within(&mut mark_read, &mut mark, Duration::from_secs(10));
         assert_eq!(&mark, b"E", "the init must see EOF on the start gate");
         assert!(started.elapsed() < Duration::from_secs(9));
     }

@@ -26,7 +26,7 @@
 //! 実行層が running の可能性があるため記録を unknown にして再 Start を拒否する（fail-closed）。
 //!
 //! **Stop・Remove の接続（CRI-2・TASK-59.3・#439）**: 実行層接続時、実行層の資源を持つコンテナ
-//! （`runtime_leaked`）への `StopContainer` は `ContainerRuntime::stop`、`RemoveContainer` は
+//! （`runtime_owned`）への `StopContainer` は `ContainerRuntime::stop`、`RemoveContainer` は
 //! `delete(force)` と bundle の解放を経て記録を除去する。`StopPodSandbox` は配下の running・unknown を
 //! 猶予 0 で停止し、`RemovePodSandbox` は配下を 1 件ずつ回収してから sandbox を除去する。結果不明
 //! （期限超過・想定外の応答）は unknown で記録を保持し、Stop・Remove の再試行で回復できる。待ちは
@@ -625,7 +625,7 @@ fn commit_in_flight(
     if kind == InFlightKind::Create {
         // 実行層に資源（コンテナ・bundle）が存在する。Remove は実行層の delete 経由で解放し
         // （TASK-59.3）、それまで追跡情報・名前キー・件数枠を保持する。
-        record.runtime_leaked = true;
+        record.runtime_owned = true;
     }
     if kind == InFlightKind::Stop {
         // 実行層が停止済みと報告した。現在時刻を終了時刻とする。
@@ -652,7 +652,7 @@ fn commit_in_flight(
 /// unknown（外向きは CONTAINER_UNKNOWN。終了時刻は設定しない）にする（再 Start による二重起動を防ぐ fail-closed。
 /// Stop・Remove の再試行で実状態を照合する〔TASK-59.3〕）。
 ///
-/// Stop・Remove の `outcome_unknown` も unknown で保持する（記録と `runtime_leaked` を残し、再試行で回復できる）。
+/// Stop・Remove の `outcome_unknown` も unknown で保持する（記録と `runtime_owned` を残し、再試行で回復できる）。
 /// 確定失敗は `in_flight` を解くだけで状態を変えない。
 fn rollback_in_flight(
     registry: &Mutex<SandboxRegistry>,
@@ -705,7 +705,7 @@ fn rollback_in_flight(
                     record.state = ContainerState::Unknown;
                     // Create の結果不明は実行層に資源が残りうる。Remove は実行層の delete 経由で行う（TASK-59.3）。
                     if kind == InFlightKind::Create {
-                        record.runtime_leaked = true;
+                        record.runtime_owned = true;
                     }
                 }
             }
@@ -730,7 +730,7 @@ fn drop_container_in(
             "container operation in progress",
         ));
     }
-    if record.runtime_leaked && !include_in_flight {
+    if record.runtime_owned && !include_in_flight {
         return Err(CriError::failed_precondition(
             "container resources are pending runtime cleanup",
         ));
@@ -938,7 +938,7 @@ impl CriRuntimeService {
         if registry
             .containers
             .values()
-            .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && (c.in_flight || c.runtime_leaked))
+            .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && (c.in_flight || c.runtime_owned))
         {
             return Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
@@ -995,7 +995,7 @@ impl CriRuntimeService {
         if registry
             .containers
             .values()
-            .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && c.runtime_leaked)
+            .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && c.runtime_owned)
         {
             return Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
@@ -1115,7 +1115,7 @@ impl CriRuntimeService {
                 exit_code: 0,
                 retained_bytes,
                 in_flight,
-                runtime_leaked: false,
+                runtime_owned: false,
             },
         );
         registry.container_keys.insert(key);
@@ -1305,7 +1305,7 @@ impl CriRuntimeService {
 
     /// 実行層接続時の `StopContainer`（TASK-59.3・CRI-2）。
     ///
-    /// 実行層の資源を持つ記録（`runtime_leaked`）だけを `ContainerRuntime::stop` へ渡す。それ以外
+    /// 実行層の資源を持つ記録（`runtime_owned`）だけを `ContainerRuntime::stop` へ渡す。それ以外
     /// （スタブ経路の記録）は従来の記録上の遷移。exited は冪等に成功し実行層を呼ばず、created は
     /// `FAILED_PRECONDITION`。running と unknown（結果不明の回復）は仮登録して実行層を呼ぶ。
     async fn stop_container_runtime(
@@ -1331,7 +1331,7 @@ impl CriRuntimeService {
                 .containers
                 .get_mut(&req.container_id)
                 .ok_or_else(|| CriError::not_found("container not found"))?;
-            if !record.runtime_leaked {
+            if !record.runtime_owned {
                 drop(registry);
                 return self.stop_container_impl(req);
             }
@@ -1417,7 +1417,7 @@ impl CriRuntimeService {
             let Some(record) = registry.containers.get_mut(&req.container_id) else {
                 return Ok(v1::RemoveContainerResponse {});
             };
-            if !record.runtime_leaked {
+            if !record.runtime_owned {
                 drop(registry);
                 return self.remove_container_impl(req);
             }
@@ -1518,7 +1518,7 @@ impl CriRuntimeService {
                 .iter_mut()
                 .filter(|(_, c)| c.pod_sandbox_id == req.pod_sandbox_id)
             {
-                match (c.runtime_leaked, c.state) {
+                match (c.runtime_owned, c.state) {
                     (
                         true,
                         ContainerState::Running | ContainerState::Unknown | ContainerState::Created,
@@ -1585,7 +1585,7 @@ impl CriRuntimeService {
             for (id, c) in registry
                 .containers
                 .iter_mut()
-                .filter(|(_, c)| c.pod_sandbox_id == req.pod_sandbox_id && c.runtime_leaked)
+                .filter(|(_, c)| c.pod_sandbox_id == req.pod_sandbox_id && c.runtime_owned)
             {
                 c.in_flight = true;
                 ids.push(id.clone());
@@ -1632,7 +1632,7 @@ impl CriRuntimeService {
         // 実行層の資源を持つ記録の停止は `stop_container_runtime`（実行層の stop）が担う。この経路は
         // 実行層未接続のスタブ用で、記録だけ Exited にすると実プロセスが生存したまま「停止済み」と返るため
         // 念のため拒否する（CRI-1・REPAIR-3。fail-closed。Remove 系と同じ code）。
-        if record.runtime_leaked {
+        if record.runtime_owned {
             return Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
             ));
@@ -1647,7 +1647,7 @@ impl CriRuntimeService {
             ContainerState::Created => Err(CriError::failed_precondition(
                 "container is not in running state",
             )),
-            // 結果不明は停止を確認できないため拒否する（通常は runtime_leaked の拒否が先に効く）。
+            // 結果不明は停止を確認できないため拒否する（通常は runtime_owned の拒否が先に効く）。
             ContainerState::Unknown => Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
             )),

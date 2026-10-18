@@ -143,8 +143,8 @@ pub(super) struct ContainerRecord {
     /// 実行層に資源（コンテナ・bundle）がある（Create 成功、または結果不明で残りうる。TASK-59.2）。
     ///
     /// 真の間、Stop・Remove は記録上の遷移ではなく実行層の stop・delete を経由する（TASK-59.3）。
-    /// 名前は変更せず（差分最小化）、意味は「実行層が所有する」。
-    pub(super) runtime_leaked: bool,
+    /// 意味は「実行層が所有する」。
+    pub(super) runtime_owned: bool,
 }
 
 impl ContainerRecord {

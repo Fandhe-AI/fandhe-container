@@ -14,7 +14,8 @@
 //! 未実装（後続 issue の担当。実装済みを装わない。REPAIR-3）:
 //! - ストア単位の排他（#473。呼び出し側がこの値をロックの内側で扱う前提で、本型は排他をかけない）
 //! - ディスクへの永続化・再起動時の照合（#853・#854・#851）
-//! - GC 本体・`image ls`/`rm`/`tag`/`prune`（#478〜#481・#476）、pull へのリース組み込み（#474・#475）
+//! - GC 本体・`image rm`/`tag`/`prune`（#479〜#481・#476）。`image ls`/`system df` の集計 API は
+//!   `usage`（#478・TASK-183.3）で実装済み（CLI 経路は未実装）、pull へのリース組み込み（#474・#475）
 //! - テーブル全体の件数上限（永続化の読み込み側で判断する）
 //!
 //! core の `ContainerId` との対応づけ（変換の置き場所・依存の向き）は #853 で決める。oci は core に
@@ -25,6 +26,10 @@ use std::fmt;
 
 use crate::error::{OciError, OciErrorCode};
 use crate::reference::{Digest, RegistryHost, Repository, Tag};
+
+mod usage;
+
+pub use usage::{CacheUsage, DiskUsage, ImageEntry, ImageList, ImageUsage, MAX_CACHE_SCAN_ENTRIES};
 
 /// `ContainerRefId` の最大バイト数（core の `ContainerId` と同じ）。
 pub const CONTAINER_REF_ID_MAX_BYTES: usize = 255;
@@ -251,6 +256,16 @@ impl ReferenceTable {
     /// 空のテーブルを作る。
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 登録済み manifest と blob 構成を digest 昇順で返す（`image ls` / `system df` の読み取り口）。
+    pub fn manifests(&self) -> impl Iterator<Item = (&Digest, &ManifestComposition)> {
+        self.manifests.iter()
+    }
+
+    /// 登録済みタグと指す manifest を `TagKey` 昇順で返す（`image ls` の読み取り口）。
+    pub fn tags(&self) -> impl Iterator<Item = (&TagKey, &Digest)> {
+        self.tag_refs.iter()
     }
 
     /// manifest の在庫と blob 構成を登録する。同一構成なら冪等、異なる構成は `AlreadyExists`。

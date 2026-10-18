@@ -9,6 +9,8 @@ Windows 利用者が fandhe-container を使う前に整えておく前提条件
 
 > 未検証の注記（REPAIR-3）: 本書の手順は `crates/platform-windows` の実装（TASK-67）と整合させて書いたもので、Windows 実機では未確認である。実機での再検証は TASK-67.6（#377）・TASK-68.h1（#379）で行う。NTFS 差異の節の外部コマンドの挙動も、一次資料で確認できていない事項は「要確認」と明記している。
 
+実行構成（設計のみ・未実装）: core・CLI・supervisor は WSL2 ゲストの中で動かし、ホストには薄い起動役だけを置く（#1415）。詳細と未決事項は [windows-execution-layout.md](../design/windows-execution-layout.md)（#1862）。
+
 ## 前提環境の概要
 
 - 対象は Windows 10 / 11。主経路は WSL2 経由とする（WIN-1）。Windows ネイティブコンテナと Hyper-V 直接方式は MVP の対象外（WIN-6）
@@ -88,7 +90,7 @@ virtiofs に必要な WSL の最小バージョンは、根拠となる資料が
 
 確認方法: ディストリ内で `/proc/self/mountinfo`（または `findmnt`）を見て、共有の fstype が `virtiofs` であることを確かめる。実装もマウント後に fstype で検証している。
 
-未検証の注記（REPAIR-3）: `[wsl2]` の `virtiofs=true` というキーの配置と、drvfs のマウントが virtiofs で成立するかは Windows 実機で未検証（WIN-2 の再検証条件 1。手順は TASK-67.6〔#377〕）。なお現状、実装が `.wslconfig` を自動で書く経路は本番コードに配線されていない（plugin-windows への配線は TASK-116）ため、手作業で設定する。
+未検証の注記（REPAIR-3）: `[wsl2]` の `virtiofs=true` というキーの配置と、drvfs のマウントが virtiofs で成立するかは Windows 実機で未検証（WIN-2 の再検証条件 1。手順は TASK-67.6〔#377〕）。なお現状、実装が `.wslconfig` を自動で書く経路は本番コードに配線されていない（`.wslconfig` を確認・設定するのはホストの起動役で、まだ配線されていない。構成は [windows-execution-layout.md](../design/windows-execution-layout.md)〔設計ドラフト・承認待ち〕）ため、手作業で設定する。
 
 ## virtiofs が使えないとき（9P フォールバック）
 
@@ -184,6 +186,12 @@ Windows ホストでシンボリックリンクを作成するには、**Develop
 | per-directory フラグの設定・読み取り | fandhe-container は行わない。本書の手順で利用者が設定する |
 | Developer Mode の検査 | 行わない |
 | virtiofs 経由でのフラグの有効性 | 未確認（#379） |
+
+## ゲスト内への導入（設計のみ・未実装）
+
+- ゲスト内の `fandhe-container`・supervisor・launcher は、Linux 版と同じ配置規則で distro の中に置く。手順は [linux.md](linux.md) に従う
+- ホストの起動役は、ゲスト内の固定の絶対パスを直接呼び、ゲストの `PATH` は探さない
+- 起動役とゲスト内の版の照合は未実装。MVP では利用者が手で導入し、版を合わせる想定（推奨案・承認待ち。[windows-execution-layout.md](../design/windows-execution-layout.md) 7 節）
 
 ## GPU 付きコンテナの追加設定（WIN-5 追記候補）
 

@@ -114,7 +114,7 @@ TASK-4（CRI-7）で定義した 4 つの拡張点トレイトは、いずれも
 
 plugin 境界のワイヤー形式（別プロセス＋長さ接頭辞フレーム、ペイロード serde_json、wire 互換が要る場面のみ gRPC）は PLUG-2 として ID のみ参照する。詳細な実装は TASK-107 系（`plugin` crate 本体）で行う。
 
-plugin プロセスのライフサイクル（PLUG-7）では、親（core 側の proxy 等）が SIGKILL・abort で落ちた場合も plugin 本体が孤児で残らないよう、Linux では `PR_SET_PDEATHSIG`（SIGKILL）を spawn 時に設定する（#1514・#1403 の方式 B。REPAIR-5・CORE-1）。効くのは直接の子だけで、発火条件は子を fork したスレッドの終了のため、常駐 plugin はセッションより長く生きるスレッドから起動する契約とする。孫プロセスは PR #1397・#1513（プロセスグループ回収・シグナル転送）で扱う。macOS には同等の機構がなく残留し得る（kqueue `NOTE_EXIT` は将来課題）。Windows は対象外。
+plugin プロセスのライフサイクル（PLUG-7）では、親（core 側の proxy 等）が SIGKILL・abort で落ちた場合も plugin 本体が孤児で残らないよう、Linux では `PR_SET_PDEATHSIG`（SIGKILL）を spawn 時に設定する（#1514・#1403 の方式 B。REPAIR-5・CORE-1）。効くのは直接の子だけで、発火条件は子を fork したスレッドの終了のため、常駐 plugin はセッションより長く生きるスレッドから起動する契約とする。孫プロセスは PR #1397・#1513（プロセスグループ回収・シグナル転送）で扱う。macOS には同等の機構がなく残留し得る（kqueue `NOTE_EXIT` は将来課題）。Windows では起動役の補助は plugin ではなく、ゲスト内の core は Linux の規則に乗る（推奨案・承認待ち。[windows-execution-layout.md](design/windows-execution-layout.md)）。
 
 ## 依存関係グラフ
 
@@ -170,11 +170,11 @@ flowchart LR
 | `cri` → `oci` | `PullImage` が oci の pull 経路（認証・manifest・blob 取得・digest 検証）を呼ぶ（CRI-4・OCI-1・TASK-61.3・#446。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド実装ライブラリ → core 側で、規則 2 の逆向き（core 側が `cri` に依存しない）のため抵触しない | 確定 |
 | `cri` → `core` | `RuntimeAdapter` が `ContainerRuntime` トレイト（`traits` のみ。具象の実行層は参照しない）を呼ぶ（CRI-2・CRI-7・TASK-59.1・#437。workspace 内 path 依存・`default-features = false` で外部クレートの追加なし）。向きはバックエンド実装ライブラリ → core 側で、規則 2 の逆向き（core 側が `cri` に依存しない）のため抵触しない | 確定 |
 | `plugin-macos` → `platform-macos` | crate-naming.md 表 #16（TASK-115） | 確定 |
-| `plugin-windows` → `platform-windows` | crate-naming.md 表 #17（TASK-116） | 確定 |
+| `plugin-windows` → `platform-windows` | crate-naming.md 表 #17（TASK-116）。plugin-windows の位置づけ（起動役の補助への作り替え）は [windows-execution-layout.md](design/windows-execution-layout.md) で承認待ち | 確定（Windows 部分は設計ドラフト・承認待ち） |
 | `plugin-microvm` → `microvm` | crate-naming.md 表 #18（TASK-117） | 確定 |
 | `plugin`（境界基盤） | crate-naming.md 表 #10（core 側・plugin 側双方が依存する境界基盤） | 確定（依存の向きは双方向的な基盤利用であり、上記フローチャートでは個別の辺として描かない） |
 | `core` → `io` | `VolumeProvider`（core 実装）がデータパスで I/O 共有層を使う想定（D-14。G2/G3 で確定） | 想定 |
-| `cli` → `core` | 統一 CLI が実行層を呼ぶ。Linux は core を直接、macOS / Windows は core の plugin 発見・登録機構（PLUG-4）経由で、platform-* / microvm 系へは直接依存しない（`make check-cli-backend-deps` で normal / build / dev 辺・全ターゲットを機械判定。TASK-79.2〜79.4） | 確定 |
+| `cli` → `core` | 統一 CLI が実行層を呼ぶ。Linux は core を直接、macOS は core の plugin 発見・登録機構（PLUG-4）経由で（Windows は、ゲスト内の CLI が core を直接呼ぶ Linux の経路を使い、ホストの CLI は隣の起動役の補助を起動するだけにする案。承認待ち。[windows-execution-layout.md](design/windows-execution-layout.md)）、platform-* / microvm 系へは直接依存しない（`make check-cli-backend-deps` で normal / build / dev 辺・全ターゲットを機械判定。TASK-79.2〜79.4） | 確定（Windows 部分は設計ドラフト・承認待ち） |
 | `cli` → `supervisor` | `start` が supervisor の bin を起動し、結果の 1 行を契約の型（`start_contract::StartReport`）で復号する。実行ファイルの固定名（`launcher::SUPERVISOR_FILE_NAME`）もここから得る（TASK-79 追補・#1718・REPAIR-2。workspace 内 path 依存で実装済み。外部クレートの追加ではない。supervisor は core にのみ依存し循環しない） | 確定 |
 | `cli` → `oci` | 統一 CLI がイメージ管理を呼ぶ想定（G6・TASK-79） | 想定 |
 | `platform-macos` → `io` | virtiofs 共有の I/O 共有プロトコルクライアント（`PipelineClient`）を使う（MAC-1・TASK-65.2。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド → core 側で、規則 2 の逆向きのため抵触しない | 確定 |
@@ -255,6 +255,10 @@ MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である�
 | REPAIR-1 | 19 crate＋`benches` の workspace 構成（crate 分割の前提として本書冒頭の「crate 境界」節が参照する） | `ai-self-repair.md` | [crate-naming.md](design/crate-naming.md)（TASK-1.h1・#9） |
 | CORE-4 | MVP のリソース制限は cgroups v2 単独対応とし、cgroups v1（hybrid 含む）・systemd cgroup driver には対応しない | `api-runtime-core.md` | [cgroups.md](design/cgroups.md)（TASK-34・#166） |
 | SEC-4 | seccomp・Landlock の拒否の配送: ERRNO の 40 件は USER_NOTIF で supervisor が記録して EPERM で応答、KILL_PROCESS の 3 件はカーネル監査と終了シグナル（補助）、Landlock はカーネル監査（未対応なら縮退を明示）。確実な層は fail-closed・カーネル監査頼みは警告して続行・厳格モードは opt-in | `security-isolation.md` | [audit-delivery.md](design/audit-delivery.md)（TASK-41 追補・#1835。2026-10-15 オーナー決定・#2018。実装は #2023〜#2028・#2004） |
+
+## 設計ドラフト（採否未決）
+
+- Windows の実行構成（ゲスト内の core とホストの起動役。WIN-1・TASK-116 追補）: [windows-execution-layout.md](design/windows-execution-layout.md)（#1862。#1415・#1539 の決定部分以外はオーナー承認待ち）
 
 ## 見直し
 

@@ -978,6 +978,39 @@ jobs:
           echo "${line}" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::lo_self_delivery verified"
 
+      # runtime_service_namespaces（`crates/cri/tests/runtime_service_namespaces.rs`。CRI-2・TASK-59.2・TASK-59.3・
+      # #438・#439・#2188・#2220）: CRI ハンドラが adapter 経由で実際にプロセスを起動するところまで届くこと、
+      # `/proc/<pid>/ns/*` で分離が成り立つこと、Remove の後に namespace を参照するプロセスが残らないことを照合する
+      # 実機前提テスト。上で緩和した sysctl を使い回し、新しい check-run・sudo・permissions は追加しない。
+      # テスト側の `ContainerRuntime`（`unshare(1)` で起動）を注入しているため、core の分離実装そのものは照合しない。
+      # 他のステップと違い `harness = false` ではなく libtest で、試験が自分で出す成功行が無い。そのため libtest の
+      # 結果行（`test <名前> ... ok`）を 1 行ずつ完全一致 grep する（`--ignored` が届かなければ `ignored` となり
+      # `ok` の行が出ないので fail-closed）。`--test-threads=1` は、解放された namespace の inode 番号を並行して走る
+      # 別の試験の新しい namespace が再利用し「参照者 0 件」の判定が誤って失敗するのを避けるため（判定は緩めない）。
+      - name: runtime_service_namespaces のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-cri --test runtime_service_namespaces --no-run
+
+      - name: runtime_service_namespaces の実行（実機前提テスト・--ignored。CRI-2・TASK-59.2・TASK-59.3）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/runtime_service_namespaces.log"
+          cargo test -p fandhe-container-cri --test runtime_service_namespaces \
+            -- --ignored --test-threads=1 2>&1 | tee "${log}"
+          for line in \
+            'test task_59_2_started_process_is_namespace_isolated ... ok' \
+            'test task_59_3_remove_container_releases_namespaces ... ok'; do
+            if ! grep -Fxq "${line}" "${log}"; then
+              echo "::error::runtime_service_namespaces did not report: ${line} (possibly not executed)" >&2
+              exit 1
+            fi
+            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "::notice::runtime_service_namespaces verified"
+
   # --------------------------------------------------
   # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）
   # --------------------------------------------------

@@ -1,9 +1,6 @@
 //! 起動対象の差し替え試験の共通部品（Linux。#1856・PLUG-11）。`lifecycle_one_shot.rs` と
 //! `lifecycle_resident.rs` が `#[path]` で取り込む。構築口を呼んでよいのは試験コードだけ。
 
-// 取り込み側のテストファイルごとに使う部品が異なる。
-#![allow(dead_code)]
-
 use fandhe_container_plugin::{PluginError, PluginLaunchTarget};
 use std::fs::File;
 use std::io::Write;
@@ -40,6 +37,8 @@ impl Fixture {
         Self::with_target(dir, orig)
     }
 
+    // `lifecycle_resident.rs` は同じ inode の書き換え試験を行わないため未使用になる。
+    #[allow(dead_code)]
     /// 小さな非スクリプトファイル（モード 0700）を起動対象にする（同じ inode の書き換え試験用）。
     pub fn new_rewritable() -> Self {
         let dir = unique_dir();
@@ -83,6 +82,8 @@ impl Fixture {
         std::fs::rename(&tmp, &self.orig).unwrap();
     }
 
+    // `lifecycle_resident.rs` は同じ inode の書き換え試験を行わないため未使用になる。
+    #[allow(dead_code)]
     /// 同じ inode の中身を `#!` スクリプトへ書き換える。
     pub fn rewrite_in_place_to_script(&self) {
         let mut f = std::fs::OpenOptions::new()

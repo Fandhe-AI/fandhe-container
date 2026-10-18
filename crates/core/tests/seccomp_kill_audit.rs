@@ -6,8 +6,8 @@
 //! 強制終了したプロセスは自分では記録を書けない。正の記録（syscall・arch・pid）はカーネル自身が出す
 //! `AUDIT_SECCOMP` で、`seccomp_data` の `actions_logged` に `kill_process` がある限り記録される
 //! （`SECCOMP_FILTER_FLAG_LOG` は不要。`docs/design/audit-delivery.md`）。fandhe は読み手を持たず、
-//! 本試験は auditd の `ausearch` で記録を読んで照合する。コンテナ経由の補助レコード（層 `exit_signal`）は
-//! `production_launcher` のシナリオ I が担う。本試験の子は本番の seccomp フィルタを適用した非コンテナの
+//! 本試験は auditd の `ausearch` で記録を読んで照合する。コンテナ経由の補助レコード（層 `exit_signal`）の
+//! 実機確認は未整備（`oci_runtime::launch` の単体テストのみ）。本試験の子は本番の seccomp フィルタを適用した非コンテナの
 //! プロセスである（rootful の本番 launcher 起動が SEC-5 で拒否されるため）。
 //!
 //! # 実行モード

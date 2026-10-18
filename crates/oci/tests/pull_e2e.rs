@@ -470,13 +470,28 @@ mod linux {
         }
     }
 
+    /// 後始末（作業ディレクトリ・cgroup の削除）に失敗した件数。残置物があれば終了コードを非ゼロにする。
+    static CLEANUP_FAILURES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn record_cleanup_failure() {
+        CLEANUP_FAILURES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn cleanup_failures() -> usize {
+        CLEANUP_FAILURES.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 削除に失敗したら件数へ計上し、手動回収に必要な場所を出力する。
     fn force_remove(path: &Path) {
         make_removable(path, 0);
         if let Err(e) = std::fs::remove_dir_all(path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
+            record_cleanup_failure();
             eprintln!(
-                "pull_e2e: warning: failed to remove a work directory ({:?})",
+                "pull_e2e: FAILED cleanup: could not remove work directory {} ({:?}); remove it manually",
+                path.display(),
                 e.kind()
             );
         }
@@ -668,6 +683,11 @@ mod linux {
             Ok(s) => s,
             Err(e) => {
                 fail(&mut res, Failure::core("run", e.code()));
+                // start はプロセスを回収できないときも Err を返す（CORE-2）。残存を確認できなければ
+                // 後続の起動と bundle の削除前提の進行を止める。
+                if !eventually(|| children_of_self().is_empty()) {
+                    res.abort_rest = true;
+                }
                 return res;
             }
         };
@@ -721,10 +741,12 @@ mod linux {
         }
         // 出力パイプは PID 1 の終了（PID namespace の解体）で EOF になる。期限内に読み終えられなければ
         // スレッドが残るため、以降の起動は行わない。
+        let mut collect_failed = false;
         let mut collect = |rx: Option<mpsc::Receiver<String>>| -> String {
             match rx {
                 Some(rx) => rx.recv_timeout(timeout()).unwrap_or_else(|_| {
                     res.abort_rest = true;
+                    collect_failed = true;
                     String::new()
                 }),
                 None => String::new(),
@@ -733,6 +755,9 @@ mod linux {
         let (so, se) = (collect(out_rx), collect(err_rx));
         res.stdout_tail = so;
         res.stderr_tail = se;
+        if collect_failed && res.failure.is_none() {
+            fail(&mut res, Failure::new("run", "OUTPUT_COLLECT_FAILED"));
+        }
         if !res.abort_rest {
             for h in handles {
                 let _ = h.join();
@@ -976,12 +1001,20 @@ mod linux {
             live_inner(args, &base, &container, tag)
         }));
         if let Err(e) = delegated.remove_child(&container) {
+            record_cleanup_failure();
             eprintln!(
-                "pull_e2e: warning: failed to remove the container cgroup ({:?})",
+                "pull_e2e: FAILED cleanup: could not remove the container cgroup pe{tag} ({:?}); remove it manually",
                 e.code
             );
         }
         match result {
+            Ok(code) if code == 0 && cleanup_failures() > 0 => {
+                println!(
+                    "pull_e2e: FAILED {} cleanup step(s) left residue",
+                    cleanup_failures()
+                );
+                1
+            }
             Ok(code) => code,
             Err(_) => {
                 eprintln!("pull_e2e: FAILED harness panicked");

@@ -3591,7 +3591,7 @@ mod tests {
         assert_eq!(reg.containers[&id].finished_at_nanos, first);
     }
 
-    /// ERR-3・TASK-58.2（受け入れ条件）: created（running でない）の Stop は FAILED_PRECONDITION で状態不変。
+    /// ERR-3・TASK-58.2（受け入れ条件）: created（running でない）の Stop は成功で状態不変。
     #[test]
     fn task_58_2_stop_created_succeeds_and_keeps_state() {
         // ERR-3・CRI-1・#2032: created の Stop は成功で、状態も finished_at も変えない（冪等）。

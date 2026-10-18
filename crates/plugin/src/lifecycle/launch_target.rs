@@ -134,11 +134,11 @@ impl PluginLaunchTarget {
                     "plugin launch target must be a native executable, not a script",
                 ));
             }
-            // 常に複製して保持する。`File::try_clone` は `fcntl(F_DUPFD_CLOEXEC, 3)` で複製するため、
+            // 常に複製して保持する。`sys::dup_cloexec_min3` は `fcntl(F_DUPFD_CLOEXEC, 3)` で複製するため、
             // (1) 元 fd が close-on-exec 無しで渡されても保持 fd は必ず close-on-exec になり（exec 後の
             // plugin に残らず、解釈系が `/proc/self/fd/N` を開き直す経路も作らない）、(2) fd 番号が 3 以上
             // になる（0〜2 は子の stdio の dup2 で上書きされ別ファイルを実行しかねない）。元 fd は閉じる。
-            let dup = file.try_clone().map_err(|_| inspect_failed())?;
+            let dup = crate::sys::dup_cloexec_min3(&file).map_err(|_| inspect_failed())?;
             drop(file);
             if dup.as_raw_fd() < 3 {
                 return Err(inspect_failed());
@@ -332,6 +332,26 @@ mod tests {
         assert_eq!(e.code(), PluginErrorCode::FailedPrecondition);
     }
 
+    /// 子を起動し、期限（10 秒）までに終了しなければ kill して回収する（REPAIR-5）。
+    #[cfg(target_os = "linux")]
+    fn run_with_deadline(
+        mut cmd: std::process::Command,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        let mut child = cmd.spawn()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(st) = child.try_wait()? {
+                return Ok(st);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// fd の flags に O_CLOEXEC が立っているか（/proc/self/fdinfo。unsafe を使わない）。
     #[cfg(target_os = "linux")]
     fn fd_is_cloexec(fd: i32) -> bool {
@@ -364,11 +384,9 @@ mod tests {
 
         let t = exe_target();
         let n = t.file().as_raw_fd();
-        let status = std::process::Command::new("/bin/sh")
-            .arg("-c")
-            .arg(format!("test ! -e /proc/self/fd/{n}"))
-            .status()
-            .unwrap();
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(format!("test ! -e /proc/self/fd/{n}"));
+        let status = run_with_deadline(cmd).unwrap();
         assert!(status.success(), "kept fd {n} leaked into the exec child");
     }
 
@@ -391,7 +409,7 @@ mod tests {
         let marker = dir.join("ran");
         std::fs::write(&p, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
         let exec = linux_fd_exec_path(&t, Path::new("/proc/self/fd")).unwrap();
-        let status = std::process::Command::new(&exec).status();
+        let status = run_with_deadline(std::process::Command::new(&exec));
         let ran = marker.exists();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!ran, "rewritten script must not run through /proc/self/fd");

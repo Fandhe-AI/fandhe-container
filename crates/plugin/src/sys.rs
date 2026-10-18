@@ -2148,6 +2148,46 @@ pub(crate) fn peer_pid(stream: &UnixStream) -> Result<u32, PluginError> {
     })
 }
 
+// ---- fd の複製（PLUG-11。起動対象の保持 fd） ----
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod dupfd_abi {
+    /// `fcntl(2)` の `F_DUPFD_CLOEXEC`（Linux は全アーキ共通で 1030、macOS は 67）。
+    #[cfg(target_os = "linux")]
+    pub(super) const F_DUPFD_CLOEXEC: i32 = 1030;
+    #[cfg(target_os = "macos")]
+    pub(super) const F_DUPFD_CLOEXEC: i32 = 67;
+
+    unsafe extern "C" {
+        // SAFETY（宣言そのものの妥当性）: POSIX の `int fcntl(int, int, ...)` と同じ型・幅。
+        pub(super) fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+}
+
+/// `file` を番号 3 以上の fd へ close-on-exec つきで複製する（`fcntl(F_DUPFD_CLOEXEC, 3)`）。
+///
+/// `File::try_clone` は最小 fd が 0 のため、stdio が閉じていると 0〜2 に複製され得る。0〜2 は子の
+/// stdio の `dup2` で上書きされ別ファイルを実行しかねないので、下限を 3 にして避ける
+/// （`PluginLaunchTarget::from_verified_file` が呼ぶ。PLUG-11・#1856）。
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn dup_cloexec_min3(file: &File) -> io::Result<File> {
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: `file` は借用中で有効な fd。F_DUPFD_CLOEXEC は int 引数 1 つ（最小 fd）を取り、
+    // 成否は戻り値で確認する。
+    let fd = unsafe { dupfd_abi::fcntl(file.as_raw_fd(), dupfd_abi::F_DUPFD_CLOEXEC, 3) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` は直前の fcntl が返した、他に所有者のいない有効な fd（非負を確認済み）。
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Linux・macOS 以外の unix 向け。`File::try_clone` に縮退する（呼び出し側が 3 未満を拒否する）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn dup_cloexec_min3(file: &File) -> io::Result<File> {
+    file.try_clone()
+}
+
 // ---- 期限付き client connect（PLUG-2・REPAIR-5。TASK-107.5・#249） ----
 //
 // `UnixStream::connect` は期限を指定できず、Linux では backlog が埋まった listener への blocking

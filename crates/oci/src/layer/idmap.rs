@@ -48,6 +48,7 @@ impl IdRange {
 /// 拒否条件（core の `IdMapSet::new` と同じ）: 空・`MAX_ID_MAP_LINES` 超過・`count == 0`・u32 オーバーフロー・
 /// コンテナ側 / ホスト側の範囲重複・コンテナ内 0 が写されていない構成（いずれも `InvalidArgument`）、
 /// ホスト ID 0 を含む写像（SEC-5。`PermissionDenied`）。
+/// ホスト側の範囲が `u32::MAX` を含む写像も拒否する（chown の「変更なし」指定と衝突するため。core の `IdMapSet::new` より厳しい）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdMap {
     lines: Vec<IdRange>,
@@ -82,6 +83,13 @@ impl IdMap {
             let limit = u64::from(u32::MAX) + 1;
             if c_end > limit || h_end > limit {
                 return Err(invalid("id mapping range overflows u32"));
+            }
+            // chown の引数 u32::MAX（(uid_t)-1）は「所有者を変えない」の意味になるため、
+            // ホスト側の範囲に含めない（含めると所有者未適用のまま Applied を返してしまう）。
+            if h_end >= limit {
+                return Err(invalid(
+                    "id mapping host range must not include u32::MAX (chown no-change value)",
+                ));
             }
             if l.host_id == 0 {
                 return Err(OciError::new(
@@ -153,9 +161,11 @@ mod tests {
     /// SEC-5: u32 の上端付近でも checked 演算で溢れない。
     #[test]
     fn sec5_idmap_u32_max_edge() {
-        let m = IdMap::new(vec![r(0, 1, 1), r(u32::MAX - 1, u32::MAX - 1, 2)]).unwrap();
-        assert_eq!(m.map_to_host(u32::MAX), Some(u32::MAX));
-        assert_eq!(m.map_to_host(u32::MAX - 1), Some(u32::MAX - 1));
+        let m = IdMap::new(vec![r(0, 1, 1), r(u32::MAX - 1, u32::MAX - 2, 2)]).unwrap();
+        assert_eq!(m.map_to_host(u32::MAX), Some(u32::MAX - 1));
+        assert_eq!(m.map_to_host(u32::MAX - 1), Some(u32::MAX - 2));
+        // 末尾が u32::MAX - 1 までのホスト範囲は受理する。
+        assert!(IdMap::new(vec![r(0, u32::MAX - 1, 1)]).is_ok());
     }
 
     /// SEC-5: 拒否する各ケースの code。
@@ -166,6 +176,10 @@ mod tests {
         assert_eq!(code(vec![r(0, 1, 0)]), Inv);
         assert_eq!(code(vec![r(0, 1, u32::MAX), r(u32::MAX, 5, 2)]), Inv);
         assert_eq!(code(vec![r(0, 0, 1)]), Perm);
+        // chown の「変更なし」指定 u32::MAX をホスト範囲に含む写像は拒否する。
+        assert_eq!(code(vec![r(0, u32::MAX, 1)]), Inv);
+        assert_eq!(code(vec![r(0, u32::MAX - 1, 2)]), Inv);
+        assert_eq!(code(vec![r(0, 1, 1), r(5, u32::MAX - 1, 2)]), Inv);
         assert_eq!(code(vec![r(0, 10, 5), r(1, 100, 1)]), Inv);
         assert_eq!(code(vec![r(0, 10, 5), r(100, 12, 1)]), Inv);
         assert_eq!(code(vec![r(1, 10, 5)]), Inv);

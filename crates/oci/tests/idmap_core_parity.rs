@@ -23,11 +23,9 @@ fn table() -> Vec<Vec<(u32, u32, u32)>> {
         vec![r(1, 1000, 5)],
         vec![r(0, 10, 5), r(1, 100, 1)],
         vec![r(0, 10, 5), r(100, 12, 1)],
-        vec![r(0, 1, u32::MAX)],
         vec![r(0, 1, u32::MAX), r(u32::MAX, 5, 2)],
-        vec![r(0, u32::MAX, 1)],
         vec![r(0, u32::MAX, 2)],
-        vec![r(0, 5, 1), r(u32::MAX - 1, u32::MAX - 1, 2)],
+        vec![r(0, 5, 1), r(u32::MAX - 2, u32::MAX - 2, 2)],
         vec![r(0, 5, 1), r(10, 20, 5), r(20, 30, 5)],
     ];
     // 行数の上限の前後（340 行は受理、341 行は拒否）。
@@ -100,5 +98,42 @@ fn sec5_idmap_matches_core_idmapset() {
         }
     }
     // 表が片側に偏っていないこと（受理と拒否の両方を照合している）。
-    assert_eq!((accepted, rejected), (7, 10));
+    assert_eq!((accepted, rejected), (5, 10));
+}
+
+/// oci は chown の「変更なし」指定 u32::MAX をホスト範囲に含む写像を core より厳しく拒否する（意図した差。SEC-5・OCI-1）。
+#[test]
+fn sec5_idmap_oci_rejects_host_u32_max_unlike_core() {
+    for lines in [
+        vec![r(0, u32::MAX, 1)],
+        vec![r(0, 1, u32::MAX)],
+        vec![r(0, 5, 1), r(u32::MAX - 1, u32::MAX - 1, 2)],
+    ] {
+        let core = IdMapSet::new(
+            lines
+                .iter()
+                .map(|&(c, h, n)| IdMapping {
+                    container_id: c,
+                    host_id: h,
+                    count: n,
+                })
+                .collect(),
+        );
+        assert!(core.is_ok(), "core accepts {lines:?}");
+        let oci = IdMap::new(
+            lines
+                .iter()
+                .map(|&(c, h, n)| IdRange {
+                    container_id: c,
+                    host_id: h,
+                    count: n,
+                })
+                .collect(),
+        );
+        assert_eq!(
+            format!("{:?}", oci.unwrap_err().code()),
+            "InvalidArgument",
+            "{lines:?}"
+        );
+    }
 }

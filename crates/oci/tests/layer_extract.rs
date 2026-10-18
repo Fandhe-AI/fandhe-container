@@ -373,3 +373,28 @@ fn sec5_chown_subuid_range_as_root() {
     assert_eq!((m.uid(), m.gid()), (100_000, 100_000));
     std::fs::remove_dir_all(&base).unwrap();
 }
+
+/// SEC-5・#2225: chown の「変更なし」指定 u32::MAX をホスト範囲に含む写像は、`ChownMapped` に渡す前（展開・chown の前）に
+/// `IdMap::new` が InvalidArgument で拒否する。末尾が u32::MAX - 1 までは受理する。
+#[cfg(target_os = "linux")]
+#[test]
+fn sec5_chown_mapped_rejects_host_u32_max_before_extract() {
+    use fandhe_container_oci::layer::extract::{IdMap, IdRange};
+
+    let r = |h, n| {
+        IdMap::new(vec![IdRange {
+            container_id: 0,
+            host_id: h,
+            count: n,
+        }])
+    };
+    assert_eq!(
+        r(u32::MAX, 1).unwrap_err().code(),
+        OciErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        r(u32::MAX - 1, 2).unwrap_err().code(),
+        OciErrorCode::InvalidArgument
+    );
+    assert!(r(u32::MAX - 1, 1).is_ok());
+}

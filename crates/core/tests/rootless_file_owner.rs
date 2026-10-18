@@ -7,25 +7,34 @@
 //! `rootless` / `exec` モジュール自体がビルド対象外（OS 非該当であり skip ではない）。
 //!
 //! # 受入基準の解釈（REPAIR-3）
-//! 本試験の経路は `with_landlock` を載せず `LaunchReady` が作られない（fail-closed。#1714）ため、
-//! `exec_entrypoint` は rootless でも exec を拒否し、エントリポイントにファイルを作らせることはできない（exec 到達は
-//! `rootless_launch` が照合済み）。ファイル所有者はプロセスの user namespace 写像だけで決まるので、
-//! `isolate_rootless_subordinate` 成功後のシナリオプロセス（コンテナの user namespace 内 uid 0）が
-//! ファイルを作成し、分離されていない外側のディスパッチャ（ホスト視点）が `stat` で所有者を照合する。
-//! 本番 launcher 経由の確認は `production_launcher`（#1818）が担う。エントリポイント内での作成への移行は未着手。
+//! 起動経路は `StagePipeline::with_landlock` を載せたステージ列（`tests/support/real_entry.rs`。#2012）で、
+//! `LaunchReady` がそろうため exec まで到達する。コンテナ PID 1 として exec された実エントリポイント
+//! （試験バイナリ自身を rootfs の `/entry` へコピーして `--entry <name>` で再入したもの）がコンテナ内 uid 0 で
+//! ファイルを作り、分離されていない外側のディスパッチャ（ホスト視点）が `stat` で所有者を照合する。
+//! 実エントリポイントの標準入出力は `/dev/null` へ置換されるため、コンテナ視点の観測値は `/entry-report` へ書く。
+//! 本番 launcher 経由の確認は `production_launcher`（#1818）が担う。
+//!
+//! `rootless_uid_mapping`（ESC-09）との違い: 本試験は作成と `chown` の所有者写像を、ホスト上の bundle 配下の
+//! rootfs で照合する。`rootless_uid_mapping` は PID 1・pivot 済み rootfs であることの証跡（`/` の一覧）と RESULT 行を見る。
 //!
 //! # 流れ
-//! - ディスパッチャ: 作業ディレクトリを作り、自身を `--scenario <name> <dir>` で再起動して
-//!   タイムアウト付きで終了コード 0 を待った後、作成されたファイルの所有者をホスト視点で具体値照合する
-//!   （REPAIR-5）。root で実行された場合は、ホスト root への写像が `host_root_identity_mapping` で
-//!   拒否されること（SEC-5）だけを照合する
+//! - ディスパッチャ: 作業ディレクトリと `rootfs/`（実エントリポイント入り）を作り、自身を
+//!   `--scenario <name> <dir> <LD_LIBRARY_PATH>` で再起動してタイムアウト付きで終了コード 0 を待った後、
+//!   `/entry-report` の `pid=1`・`uid=0`・`gid=0`・コンテナ視点の所有者と、作成されたファイルの所有者を
+//!   ホスト視点で具体値照合する（REPAIR-5）。root で実行された場合は、ホスト root への写像が
+//!   `host_root_identity_mapping` で拒否されること（SEC-5）だけを照合する
+//! - シナリオプロセス: `isolate_rootless_subordinate` の後、`with_landlock` を載せて実エントリポイントを起動し、
+//!   `Exited(0)` を待つ
+//! - 実エントリポイント（`--entry <name>`）: `/root-created` を作る。helper では `/chowned` を作って `chown(1, 1)` する
+//!   （exec 後も OCI 既定の `CAP_CHOWN` が残ることの実証を兼ねる）
 //! - シナリオ `direct`: `single_id_mapping(euid)`。ns 内 uid 0 が作ったファイルはホスト側で euid・egid 所有
 //! - シナリオ `helper`（`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ）: `/etc/subuid`・`/etc/subgid` の
 //!   範囲写像。ns 内 0 → euid、ns 内 1 → subuid 範囲の先頭（いずれも ≠ 0）
 //!
 //! # 実機前提テストとしての分離
-//! 非特権 user namespace を許可するホストが必要（AppArmor の
-//! `kernel.apparmor_restrict_unprivileged_userns=1` 等では `PermissionDenied`）。`-- --ignored` 指定時のみ
+//! 非特権 user namespace を許可するホスト（AppArmor の `kernel.apparmor_restrict_unprivileged_userns=1` 等では
+//! `PermissionDenied`）と、Landlock ABI 6 以上（Linux 6.12 以上。実エントリポイントを exec まで通すため）が必要。
+//! `-- --ignored` 指定時のみ
 //! 実行し、未指定時は「ignored」を出力して成功終了する（ci.md「実機前提テスト」）。CI の
 //! `platform-ci` への組み込みは別 PR。実行された場合は拒否を含むあらゆる失敗を失敗として扱い、
 //! 検証せずに成功する分岐は持たない。helper ケースは env の opt-in 時のみ実行し、opt-in 時に前提
@@ -37,8 +46,14 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/real_entry.rs"]
+mod real_entry;
+
+#[cfg(target_os = "linux")]
 fn main() {
-    if std::env::args().any(|a| a == "--ignored" || a == "--scenario") {
+    if std::env::args().any(|a| a == "--entry") {
+        linux::entry();
+    } else if std::env::args().any(|a| a == "--ignored" || a == "--scenario") {
         linux::run();
     } else {
         println!(
@@ -55,8 +70,10 @@ mod linux {
     use std::process::{Command, ExitStatus, Stdio};
     use std::time::{Duration, Instant};
 
+    use super::real_entry;
+
     use fandhe_container_core::exec::{
-        Hostname, IsolationConfig, IsolationPrivilege, Namespace, NamespaceSet,
+        ChildExit, Hostname, IsolationConfig, IsolationPrivilege, Namespace, NamespaceSet,
         plan_rootless_subordinate,
     };
     use fandhe_container_core::rootless::{
@@ -116,7 +133,8 @@ mod linux {
             Some(i) => {
                 let name = args.get(i + 1).expect("scenario name after --scenario");
                 let dir = args.get(i + 2).expect("work dir after the scenario name");
-                scenario(name, Path::new(dir));
+                let ld = args.get(i + 3).expect("LD_LIBRARY_PATH after the work dir");
+                scenario(name, Path::new(dir), ld);
             }
             None => dispatcher(),
         }
@@ -235,9 +253,11 @@ mod linux {
         let exe = std::env::current_exe().expect("current_exe");
         for name in names {
             let dir = make_workdir(name);
+            let ld = real_entry::install_entry(&dir.0.join("rootfs"));
             let mut child = Command::new(&exe)
                 .args(["--scenario", name])
                 .arg(&dir.0)
+                .arg(&ld)
                 .stdin(Stdio::null())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -259,7 +279,29 @@ mod linux {
 
             // ホスト視点（分離されていないこのプロセス）での所有者照合（SEC-5）。
             let want = expected(name, euid, egid);
-            let meta = std::fs::metadata(dir.0.join(ROOT_FILE)).expect("stat root-created");
+            let rootfs = dir.0.join("rootfs");
+            let report = real_entry::read_report(&rootfs.join(real_entry::REPORT_FILE), timeout());
+            let field = |k: &str| report.get(k).map(String::as_str).unwrap_or("missing");
+            assert_eq!(
+                field("pid"),
+                "1",
+                "scenario {name}: real entrypoint is PID 1"
+            );
+            assert_eq!(field("uid"), "0", "scenario {name}: container uid");
+            assert_eq!(field("gid"), "0", "scenario {name}: container gid");
+            assert_eq!(
+                field("root_owner"),
+                "0:0",
+                "scenario {name}: container view of root-created"
+            );
+            if name == "helper" {
+                assert_eq!(
+                    field("chowned_owner"),
+                    "1:1",
+                    "scenario {name}: container view of chowned"
+                );
+            }
+            let meta = std::fs::metadata(rootfs.join(ROOT_FILE)).expect("stat root-created");
             assert_eq!(meta.uid(), want.root_uid, "scenario {name}: host uid");
             assert_eq!(meta.gid(), want.root_gid, "scenario {name}: host gid");
             assert_eq!(meta.uid(), euid, "scenario {name}: root maps to the user");
@@ -271,7 +313,7 @@ mod linux {
                 "scenario {name}: not group-owned by host root"
             );
             if let Some((cu, cg)) = want.chowned {
-                let m = std::fs::metadata(dir.0.join(CHOWNED_FILE)).expect("stat chowned");
+                let m = std::fs::metadata(rootfs.join(CHOWNED_FILE)).expect("stat chowned");
                 assert_eq!(m.uid(), cu, "scenario {name}: host uid of ns uid 1");
                 assert_eq!(m.gid(), cg, "scenario {name}: host gid of ns gid 1");
                 assert_ne!(m.uid(), 0);
@@ -303,9 +345,9 @@ mod linux {
         )
     }
 
-    /// 分離 → コンテナ内 root としてファイル作成。拒否を含むあらゆる失敗は panic（失敗）。
-    /// 所有者のホスト視点での照合は外側のディスパッチャが行う。
-    fn scenario(name: &str, dir: &Path) {
+    /// 分離 → `with_landlock` を載せて実エントリポイントを PID 1 として起動し、`Exited(0)` を待つ。
+    /// 拒否を含むあらゆる失敗は panic（失敗）。所有者のホスト視点での照合は外側のディスパッチャが行う。
+    fn scenario(name: &str, dir: &Path, ld: &str) {
         let (euid, egid) = own_ids();
         let (uid, gid, writer, want_kind) = match name {
             "direct" => (
@@ -347,31 +389,59 @@ mod linux {
             "scenario {name}: must be uid/gid 0 in the ns"
         );
 
-        let root_path = dir.join(ROOT_FILE);
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&root_path)
-            .expect("create root-created");
-        f.write_all(b"owner\n").expect("write root-created");
-        // コンテナ視点では ns 内 0 所有に見える。
-        let m = std::fs::metadata(&root_path).expect("stat root-created");
+        let entry =
+            real_entry::entrypoint_from(&real_entry::entry_args(name), &real_entry::entry_env(ld));
+        let child = real_entry::spawn_real_entry(&dir.join("rootfs"), &entry, &gid);
+        let exit = child
+            .wait_timeout(scenario_deadline())
+            .unwrap_or_else(|e| panic!("wait: {e}"));
         assert_eq!(
-            (m.uid(), m.gid()),
-            (0, 0),
-            "scenario {name}: container view"
+            exit,
+            ChildExit::Exited(0),
+            "scenario {name}: the real entrypoint must create the files and exit 0"
         );
+    }
 
-        if name == "helper" {
-            let p = dir.join(CHOWNED_FILE);
-            std::fs::OpenOptions::new()
+    /// 実エントリポイント（exec 後のコンテナ PID 1）。コンテナ内 root としてファイルを作り、観測値を報告する。
+    /// 失敗は値（`error:<kind>`）として記録し、終了コードは全操作が成功したときだけ 0 にする。
+    pub fn entry() {
+        let args: Vec<String> = std::env::args().collect();
+        let name = args
+            .iter()
+            .position(|a| a == "--entry")
+            .and_then(|i| args.get(i + 1))
+            .expect("mode after --entry")
+            .clone();
+        let mut lines = real_entry::entry_observations();
+        let mut ok = true;
+        let mut create = |file: &str, key: &'static str, chown: bool| -> (&'static str, String) {
+            let path = Path::new("/").join(file);
+            let made = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
-                .open(&p)
-                .expect("create chowned");
-            std::os::unix::fs::chown(&p, Some(1), Some(1)).expect("chown to ns uid/gid 1");
-            let m = std::fs::metadata(&p).expect("stat chowned");
-            assert_eq!((m.uid(), m.gid()), (1, 1), "scenario {name}: ns 1 view");
-        }
+                .open(&path)
+                .and_then(|mut f| f.write_all(b"owner\n"))
+                .and_then(|()| {
+                    if chown {
+                        std::os::unix::fs::chown(&path, Some(1), Some(1))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .and_then(|()| std::fs::metadata(&path));
+            match made {
+                Ok(m) => (key, format!("{}:{}", m.uid(), m.gid())),
+                Err(e) => {
+                    ok = false;
+                    (key, format!("error:{:?}", e.kind()))
+                }
+            }
+        };
+        let root = create(ROOT_FILE, "root_owner", false);
+        let chowned = (name == "helper").then(|| create(CHOWNED_FILE, "chowned_owner", true));
+        lines.push(root);
+        lines.extend(chowned);
+        real_entry::write_report(&lines);
+        std::process::exit(if ok { 0 } else { 1 });
     }
 }

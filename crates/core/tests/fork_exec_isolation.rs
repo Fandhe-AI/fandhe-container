@@ -21,7 +21,7 @@
 //!   本物の `ProductionLauncher` 経由の確認は `production_launcher`（#1818）が担う
 //! - シナリオ `ok`: プローブへ exec する構成だが、`with_landlock` を載せず `Exited(126)`・`PERMISSION_DENIED`
 //! - シナリオ `missing`: 不在のエントリポイントも同じ理由で `Exited(126)`・`PERMISSION_DENIED`
-//!   （不在時 127・`NOT_FOUND` を照合するシナリオは未整備）
+//!   （fail-closed が不在の判定より先に効くことの照合。不在時の 127 は下記 `landlock-missing` が照合する）
 //! - シナリオ `not-executable`: 実行権限の無いファイルで `Exited(126)`、stderr に `PERMISSION_DENIED`
 //! - シナリオ `stages-order`（#832・TASK-27.4.2、#833・TASK-27.4.3。`spawn_container_with_stages`）:
 //!   逆順に登録した 2 段（cgroup 参加・Landlock）のフックと、組み込みの capability 削減・NO_NEW_PRIVS が、子の pivot 後（`/` が
@@ -60,6 +60,9 @@
 //!   `LaunchReady` がそろった launch 経路が実際に `execveat` まで到達する。プローブの終了コード 42 を照合する（拒否なら 126）。
 //!   root は User を除く rootful 構成で `DevptsGidSource::Rootful`（root では gid 0 の `single_id_mapping` を呼ばない。SEC-5・#1926）、
 //!   非 root は `Rootless`（単一 ID 写像）で起動する
+//! - シナリオ `landlock-missing`（#2012・CORE-6・REPAIR-12。`landlock-exec` と同じ構成で不在のエントリポイントを指す）:
+//!   `LaunchReady` がそろった経路では、不在のエントリポイントが `Exited(127)`（`EXIT_EXEC_NOT_FOUND`）・stderr の
+//!   `NOT_FOUND at Exec` になる。`missing`（126）との対で、fail-closed が不在の判定より先に効くことも示す
 //!   `landlock-*` 系は実カーネルの Landlock を使うため ABI 6 以上（Linux 6.12 以上）が必要
 //!
 //! # 実機前提テストとしての分離
@@ -120,9 +123,10 @@ mod linux {
 
     use fandhe_container_core::dev_mounts::ImplicitDevMounts;
     use fandhe_container_core::exec::{
-        ChildExit, Entrypoint, ExecError, Hostname, IsolationConfig, Namespace, NamespaceSet,
-        StageKind, StagePipeline, isolate, isolate_rootful_host_root, plan, plan_rootful_host_root,
-        spawn_container, spawn_container_seccomp_probe, spawn_container_with_stages,
+        ChildExit, EXIT_EXEC_NOT_FOUND, Entrypoint, ExecError, Hostname, IsolationConfig,
+        Namespace, NamespaceSet, StageKind, StagePipeline, isolate, isolate_rootful_host_root,
+        plan, plan_rootful_host_root, spawn_container, spawn_container_seccomp_probe,
+        spawn_container_with_stages,
     };
     use fandhe_container_core::landlock::{
         LandlockRuleset, build_path_rules_with_dev, detect_landlock_abi,
@@ -136,7 +140,7 @@ mod linux {
     /// 子が pivot 後の `/` に追記するステージ実行ログ（親からは `<rootfs>/stage-log`）。
     const STAGE_LOG: &str = "stage-log";
     /// (シナリオ名, stderr に含まれるべき文字列)。
-    const SCENARIOS: [(&str, &str); 14] = [
+    const SCENARIOS: [(&str, &str); 15] = [
         ("ok", "PERMISSION_DENIED"),
         ("missing", "PERMISSION_DENIED"),
         ("not-executable", "PERMISSION_DENIED"),
@@ -149,6 +153,8 @@ mod linux {
         ("landlock-fail", "landlock_open_path_failed"),
         // 制限適用の証跡 `LaunchReady`（#1714）がそろった launch 経路の実 exec。stderr に診断は出ない。
         ("landlock-exec", ""),
+        // 同じ経路で不在のエントリポイントを指す。exec の入口で不在が 127・`NOT_FOUND` になる（#2012）。
+        ("landlock-missing", "NOT_FOUND"),
         // 標準 fd を閉じた親からの起動（#1299）。fd 2 を閉じると子の診断が届かないため、`all` の marker は空。
         ("stdio-closed-one", "PERMISSION_DENIED"),
         ("stdio-closed-many", "PERMISSION_DENIED"),
@@ -355,6 +361,13 @@ mod linux {
                 stderr.contains(marker),
                 "stderr of scenario {name} must contain {marker}; got:\n{stderr}"
             );
+            if name == "landlock-missing" {
+                // 別の段の NOT_FOUND と取り違えないよう、exec の段であることまで照合する。
+                assert!(
+                    stderr.contains("at Exec"),
+                    "the NOT_FOUND of scenario {name} must come from the Exec stage; got:\n{stderr}"
+                );
+            }
         }
         let is_root = is_root();
         println!("fork_exec_isolation: fork/exec verified (root={is_root})");
@@ -405,7 +418,7 @@ mod linux {
 
         let path = match name {
             "ok" => format!("/{PROBE}"),
-            "missing" => "/no-such-entrypoint".to_string(),
+            "missing" | "landlock-missing" => "/no-such-entrypoint".to_string(),
             "not-executable" => format!("/{NOT_EXEC}"),
             "stages-order" | "stage-fail" | "landlock-apply-ro" | "landlock-apply-rw"
             | "landlock-fail" | "landlock-exec" | "rlimits-apply" | "rlimit-fail"
@@ -517,6 +530,17 @@ mod linux {
                 want = ChildExit::Exited(PROBE_EXIT);
                 spawn_with_dev(rootfs, &entry, stages, host_egid, is_root)
             }
+            "landlock-missing" => {
+                // #2012・CORE-6: `landlock-exec` と同じ全段・同じ ruleset で、エントリポイントだけが不在。
+                // `open_entrypoint` が ENOENT を返し、`exit_code_for` が (Exec, NotFound) を 127 へ写す。
+                let ruleset = landlock_ruleset(true, "[]", ImplicitDevMounts::WithoutShm);
+                let stages = StagePipeline::new()
+                    .with_hook(StageKind::CgroupJoin, logging_hook(StageKind::CgroupJoin))
+                    .and_then(|p| p.with_landlock(ruleset))
+                    .unwrap_or_else(|e| panic!("register landlock: {e}"));
+                want = ChildExit::Exited(EXIT_EXEC_NOT_FOUND);
+                spawn_with_dev(rootfs, &entry, stages, host_egid, is_root)
+            }
             _ => spawn_container(rootfs, &entry),
         }
         .unwrap_or_else(|e| panic!("spawn: {e}"));
@@ -553,7 +577,7 @@ mod linux {
                 format!("cgroup_join root=1 nnp={inherited_nnp}\n"),
                 "no stage after the failed one may run"
             ),
-            "landlock-exec" => assert_eq!(
+            "landlock-exec" | "landlock-missing" => assert_eq!(
                 log,
                 format!("cgroup_join root=1 nnp={inherited_nnp}\n"),
                 "the pre-landlock stage must run before restriction, then the entrypoint must be exec'd"

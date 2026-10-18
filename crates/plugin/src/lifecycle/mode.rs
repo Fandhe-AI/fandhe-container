@@ -36,7 +36,7 @@
 //! # 未実装（REPAIR-3）
 //!
 //! - 起動対象の信頼性検証（TASK-122・PLUG-11）との結線。本 API は検証せず、呼び出し側が検証済みの
-//!   絶対パスを持つ [`OneShotPlugin`] を渡す前提とする。
+//!   fd を持つ起動対象（[`super::PluginLaunchTarget`]。#1856）から作った [`OneShotPlugin`] を渡す前提とする。
 //! - 外部管理の常駐 plugin への attach、[`OneShotPlugin`] の中立名への改名。
 
 use super::{
@@ -440,12 +440,29 @@ mod tests {
         }
     }
 
-    /// PLUG-7: 都度起動の start は spawn しない（存在しない実行ファイルでも成功する）。
+    /// PLUG-7: 都度起動の start は spawn しない（実行権の無いファイルの起動対象でも成功する）。
+    #[cfg(unix)]
     #[test]
     fn plug7_one_shot_session_start_does_not_spawn() {
+        use std::os::unix::fs::OpenOptionsExt;
+
         let dir = std::env::temp_dir();
-        let program = dir.join("no-such-plugin");
-        let plugin = OneShotPlugin::new(program, vec![], dir).unwrap();
+        let program = dir.join(format!("not-executable-plugin-{}", std::process::id()));
+        let _ = std::fs::remove_file(&program);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&program)
+            .unwrap();
+        drop(file);
+        let target = super::super::PluginLaunchTarget::from_verified_file(
+            std::fs::File::open(&program).unwrap(),
+            program.clone(),
+            program.clone(),
+        );
+        let _ = std::fs::remove_file(&program);
+        let plugin = OneShotPlugin::new(target.unwrap(), vec![], dir).unwrap();
         let session = PluginSession::start(
             &plugin,
             PluginMode::one_shot(),

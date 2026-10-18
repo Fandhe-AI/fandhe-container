@@ -563,7 +563,10 @@ mod tests {
         let events = ctr.join("cgroup.events");
         let flipper = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(30));
-            fs::write(events, "populated 0\n").expect("flip");
+            // 原子的に差し替える（`fs::write` の truncate 中に読まれると空になり、本番では起きない失敗を招く）。
+            let tmp = events.with_file_name("cgroup.events.tmp");
+            fs::write(&tmp, "populated 0\n").expect("flip tmp");
+            fs::rename(&tmp, &events).expect("flip rename");
         });
         let out = ensure(
             &root,

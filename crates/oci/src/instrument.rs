@@ -36,6 +36,8 @@ pub enum OciOpKind {
     DecompressLayer,
     /// レイヤー tar のルート配下への展開（TASK-52.3）。
     ExtractLayer,
+    /// イメージストアの排他区間の取得（待機・Timeout・毒化・ロックファイル異常を含む。TASK-183.2・OCI-7）。
+    AcquireImageStoreLock,
 }
 
 impl OciOpKind {
@@ -51,6 +53,7 @@ impl OciOpKind {
             OciOpKind::VerifyBlobDigest => "oci.blob.verify",
             OciOpKind::DecompressLayer => "oci.layer.decompress",
             OciOpKind::ExtractLayer => "oci.layer.extract",
+            OciOpKind::AcquireImageStoreLock => "oci.store.lock",
         }
     }
 }

@@ -293,9 +293,11 @@ impl PullSession<'_> {
                 "lease token does not belong to this pull",
             ));
         }
-        self.release_own(&blob.digest)?;
+        // トークンは値で消費済みのため、解放が一時的に失敗（ロックの Timeout 等）しても `leased` に
+        // digest を残すと再 lease も再解放もできず固着する。先に外して、テーブル側のリースが残った
+        // 場合は `lease_existing_blob` の再呼び出し（登録は冪等）で新トークンを得て解放し直せる。
         self.leased.remove(&blob.digest);
-        Ok(())
+        self.release_own(&blob.digest)
     }
 
     fn release_own(&self, digest: &Digest) -> Result<(), OciError> {
@@ -444,6 +446,32 @@ mod tests {
         );
         assert_eq!(leases(&store, &d(1)), vec![pid("p1"), pid("p2")]);
         assert_eq!(leases(&store_b, &d(1)), vec![]);
+    }
+
+    /// OCI-7: 解放がロック Timeout で失敗しても、再 lease で新トークンを得て解放し直せる。
+    #[test]
+    fn oci7_release_failure_does_not_pin_lease() {
+        let root = Root::new("release-fail");
+        root.put(&d(1), 5);
+        let store = ImageStore::open(&root.0)
+            .unwrap()
+            .with_timeout(std::time::Duration::from_millis(50));
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let BlobReuse::Leased(b) = s.lease_existing_blob(&d(1)).unwrap() else {
+            panic!("expected Leased");
+        };
+        let held = store.lock().unwrap();
+        assert_eq!(
+            s.release_leased(b).unwrap_err().code(),
+            OciErrorCode::Timeout
+        );
+        drop(held);
+        assert_eq!(leases(&store, &d(1)), vec![pid("p1")]);
+        let BlobReuse::Leased(b2) = s.lease_existing_blob(&d(1)).unwrap() else {
+            panic!("expected Leased");
+        };
+        s.release_leased(b2).unwrap();
+        assert_eq!(leases(&store, &d(1)), vec![]);
     }
 
     /// REPAIR-4: begin_pull の成否・エラー code・種別が記録される。

@@ -142,21 +142,10 @@ impl fmt::Display for PullError {
 
 impl std::error::Error for PullError {}
 
-/// oci の分類を gRPC ステータスへ写す（ERR-3）。
+/// oci の分類を gRPC ステータスへ写す（ERR-3）。写像は `CriError` の `From<PullError>` に一本化している。
 impl From<PullError> for Status {
     fn from(err: PullError) -> Self {
-        match err.code {
-            OciErrorCode::InvalidArgument => Status::invalid_argument(err.message),
-            OciErrorCode::Unimplemented => Status::unimplemented(err.message),
-            OciErrorCode::Unavailable => Status::unavailable(err.message),
-            OciErrorCode::Timeout => Status::deadline_exceeded(err.message),
-            OciErrorCode::PermissionDenied => Status::permission_denied(err.message),
-            OciErrorCode::NotFound => Status::not_found(err.message),
-            OciErrorCode::DataLoss => Status::data_loss(err.message),
-            OciErrorCode::ResourceExhausted => Status::resource_exhausted(err.message),
-            OciErrorCode::FailedPrecondition => Status::failed_precondition(err.message),
-            _ => Status::internal(err.message),
-        }
+        Status::from(crate::error::CriError::from(err))
     }
 }
 

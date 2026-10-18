@@ -21,8 +21,9 @@ use fandhe_container_core::oci_runtime::{
     exit_code_for,
 };
 use fandhe_container_core::traits::{
-    CgroupScope, ContainerId, ContainerState, CreateRequest, ErrorCode, GetStateRequest,
-    StartRequest, StateRecord, StateRevision, StateStore, TraitError, UpdateStateRequest,
+    CgroupScope, ContainerId, ContainerState, ContainerStatus, CreateRequest, ErrorCode,
+    GetStateRequest, StartRequest, StateRecord, StateRevision, StateStore, TraitError,
+    UpdateStateRequest,
 };
 use fandhe_container_supervisor::restart::RestartPolicy;
 use fandhe_container_supervisor::run::StopToken;
@@ -274,6 +275,8 @@ struct FakeDeps {
     prepare_delay: Duration,
     /// `true` なら `release_cgroup` が失敗する。
     release_fails: bool,
+    /// `recover_interrupted` が返すエラーの code（`None` なら成功。#2011）。
+    recover_fails: Option<ErrorCode>,
 }
 
 impl FakeDeps {
@@ -327,6 +330,19 @@ impl StartDeps for FakeDeps {
         Ok(self.launcher.clone())
     }
 
+    fn recover_interrupted(
+        &mut self,
+        _store: &dyn StateStore,
+        _id: &ContainerId,
+        _timeouts: &StartTimeouts,
+    ) -> Result<(), TraitError> {
+        self.step("recover")?;
+        match self.recover_fails {
+            Some(code) => Err(TraitError::new(code, "recover failed")),
+            None => Ok(()),
+        }
+    }
+
     fn release_cgroup(&mut self) -> Result<(), TraitError> {
         self.step("release")?;
         if self.release_fails {
@@ -348,6 +364,7 @@ fn deps(calls: &Calls, launcher: FakeLauncher) -> (FakeDeps, Arc<FakeLauncher>) 
             record_scope: false,
             prepare_delay: Duration::ZERO,
             release_fails: false,
+            recover_fails: None,
         },
         launcher,
     )
@@ -613,6 +630,66 @@ fn sup1_recorded_scope_rejects_restart() {
                 message.as_str(),
                 "cgroup scope is already recorded; delete and recreate the container"
             );
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+}
+
+/// 予約（Running・pid なし）だけが残るコンテナを作る。
+fn reserve(env: &Env, id: &str) {
+    env.create(id);
+    let rec = env.record(id);
+    env.store
+        .update(&UpdateStateRequest::new(
+            ContainerStatus::running(cid(id), None),
+            rec.revision(),
+        ))
+        .unwrap();
+}
+
+/// CORE-2・SEC-1（#2011）: 前の supervisor が落ちて残った予約（Running・pid なし）は、次の start が手順 3 で
+/// `recover_interrupted` を 1 回だけ呼び、成功しても launch せず cgroup にも触れず `FailedPrecondition` を報告する。
+#[test]
+fn core2_issue2011_reserved_container_is_recovered_without_launch() {
+    let env = Env::new("recover-ok");
+    reserve(&env, &env.id);
+    let calls = new_calls();
+    let (d, launcher) = deps(&calls, FakeLauncher::new(&calls));
+    let mut out = Vec::new();
+    let code = start_with(&env, d, &env.id, &short_timeouts(), &mut out)
+        .err()
+        .expect("must not start");
+    assert_eq!(calls_of(&calls), ["recover"]);
+    assert_eq!(launcher.launches(), 0);
+    assert_eq!(code, exit_code_for(ErrorCode::FailedPrecondition));
+    match report_of(&out) {
+        StartReport::Failed { code, message, .. } => {
+            assert_eq!(code, ErrorCode::FailedPrecondition);
+            assert_eq!(
+                message.as_str(),
+                "an interrupted start was recovered; delete and recreate the container"
+            );
+        }
+        other => panic!("unexpected report: {other:?}"),
+    }
+}
+
+/// CORE-2（#2011）: 回復に失敗したらそのエラーの code を報告し、launch せず cgroup に触れない。
+#[test]
+fn core2_issue2011_recovery_failure_is_reported_as_is() {
+    let env = Env::new("recover-ng");
+    reserve(&env, &env.id);
+    let calls = new_calls();
+    let (mut d, launcher) = deps(&calls, FakeLauncher::new(&calls));
+    d.recover_fails = Some(ErrorCode::Timeout);
+    let mut out = Vec::new();
+    assert!(start_with(&env, d, &env.id, &short_timeouts(), &mut out).is_err());
+    assert_eq!(calls_of(&calls), ["recover"]);
+    assert_eq!(launcher.launches(), 0);
+    match report_of(&out) {
+        StartReport::Failed { code, message, .. } => {
+            assert_eq!(code, ErrorCode::Timeout);
+            assert_eq!(message.as_str(), "recover failed");
         }
         other => panic!("unexpected report: {other:?}"),
     }

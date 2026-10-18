@@ -1696,6 +1696,10 @@ fn unshare_and_configure(
 /// "/proc")` を呼ぶことは、pivot 前に rootfs/proc をマウント済みなら可能だが、rootless では
 /// 旧 root を切り離した後の新規 procfs マウントは拒否され得る）。
 ///
+/// launch 経路の pivot 後に呼んではならない。`readonly_paths`・`masked_paths` が pivot 前に載せた読み取り専用化と
+/// 覆いを新しい procfs が覆い隠し、保護が効かなくなる（#2005・SEC-2・ESC-04）。本番経路は呼ばず、呼び出し元は
+/// 結合試験だけである。コンテナ内からは seccomp の mount 拒否と `CAP_SYS_ADMIN` の除去でマウントできない。
+///
 /// マウント前に次をすべて検証し、1 つでも満たさなければ副作用なしで拒否する（fail-closed。
 /// security.md「rootfs の外へ書き込める経路を作らない」）。
 ///

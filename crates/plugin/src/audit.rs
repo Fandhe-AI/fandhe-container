@@ -5,6 +5,11 @@
 //! [`PeerAuthObserver`] へ同期通知する。呼び出し側へ返すエラー（UID 値を含まない固定文言）は変えず、
 //! 運用者向けの詳細（拒否理由・期待 UID・観測 peer UID・socket パス）はこのイベントにのみ載せる。
 //!
+//! peer 認証による拒否かどうかは、返るエラーのコード（`PermissionDenied` / `Internal` / `Unimplemented`。
+//! 他の原因とも共有する）でなく、本イベントの [`PeerAuthRejectReason`] で判別する。起動経路（`lifecycle` の
+//! 都度起動 / 常駐の起動）の受付は UID・pid の不一致を切断して待ち受けを続けるため、1 回の呼び出しで
+//! 拒否 1 件につき 1 件、最大でも `UDS_ACCEPT_PEER_REJECTION_LIMIT` + 1 件のイベントが出る（#1861）。
+//!
 //! # 方式（`crates/io` の `ServerObserver` / `JsonLinesServerObserver` に揃える。A4）
 //! 観測フック trait・`#[non_exhaustive]` イベント・有界メモリの JSON Lines バッファ（あふれは集約）・
 //! `drain_lines` を `fandhe-container-io` と同じ語彙で再現する。io crate への依存や共有 crate は

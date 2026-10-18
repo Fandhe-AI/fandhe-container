@@ -28,8 +28,9 @@
 //! - TASK-41.2（#193。seccomp フックは `seccomp_hook` に実装済み。拒否報告 [`SeccompDenialReport`] から
 //!   レコードを 1 件組み立てて [`AuditSink`] へ渡す。ただし現行フィルタは禁止 syscall に `ERRNO(EPERM)` を返し
 //!   〔`unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS` で終了するが、終了するプロセス自身は記録を書けない〕
-//!   通知は発生しないため、本番の配送経路〔TRAP + SIGSYS ハンドラ / USER_NOTIF + supervisor listener〕は
-//!   **未実装**で、フックはまだ本番経路から呼ばれない。REPAIR-3）・41.4（#195 マウント検証/API。
+//!   通知は発生しないため、ERRNO 側の本番の配送経路〔USER_NOTIF + supervisor listener〕は
+//!   **未実装**で、フックはまだ本番経路から呼ばれない。REPAIR-3。KILL 側の正の記録はカーネルの
+//!   `AUDIT_SECCOMP`、親の回収点が出す `exit_signal` 層の補助記録は [`AuditEvent::ExitSignal`]〔#2004〕）・41.4（#195 マウント検証/API。
 //!   `exec::IsolationViolation` からの写像もここで扱う）が、違反検知時に [`AuditRecord`] を組み立てる
 //! - ローカルファイルへの JSON Lines 書き込み（主経路）は `file_writer` で実装済み（TASK-41.5.1・#839）。
 //!   型自体に `serde` の derive は付けず、非公開 DTO でワイヤースキーマへ写す（#652 で共通ログ型へ統一予定）。
@@ -99,6 +100,8 @@ pub enum AuditRecordErrorKind {
     ClockBeforeEpoch,
     /// SIGSYS の `si_code` が `SYS_SECCOMP` ではない（seccomp 由来でないシグナル）。
     NotSeccompSignal,
+    /// シグナル番号が `1..=64` の範囲外（[`AuditSignal`]）。
+    SignalOutOfRange,
 }
 
 /// 監査レコード構築エラー（ERR 系の構造化形式）。
@@ -133,6 +136,7 @@ impl AuditRecordError {
             AuditRecordErrorKind::SyscallNegative => "audit syscall number must not be negative",
             AuditRecordErrorKind::ClockBeforeEpoch => "system clock is before the UNIX epoch",
             AuditRecordErrorKind::NotSeccompSignal => "signal is not a seccomp report",
+            AuditRecordErrorKind::SignalOutOfRange => "audit signal number must be in 1..=64",
         }
     }
 }
@@ -230,6 +234,29 @@ impl AuditPid {
     /// PID を返す（常に 1 以上 `i32::MAX` 以下）。
     pub const fn get(self) -> u32 {
         self.0.get()
+    }
+}
+
+/// 終了シグナルの番号（Linux のシグナル番号の有効範囲 `1..=64`）。
+///
+/// [`AuditEvent::ExitSignal`] が持つ。親の `waitpid` が得た終了シグナルの値で、syscall の情報は一切含まない
+/// （SEC-4・ESC-06・#2004）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditSignal(u8);
+
+impl AuditSignal {
+    /// シグナル番号から構築する。`1..=64` の範囲外は `SignalOutOfRange`。
+    pub fn new(signal: i32) -> Result<Self, AuditRecordError> {
+        u8::try_from(signal)
+            .ok()
+            .filter(|s| (1..=64).contains(s))
+            .map(Self)
+            .ok_or_else(|| AuditRecordError::new(AuditRecordErrorKind::SignalOutOfRange))
+    }
+
+    /// シグナル番号を返す（常に 1 以上 64 以下）。
+    pub const fn get(self) -> u8 {
+        self.0
     }
 }
 
@@ -363,6 +390,10 @@ pub enum AuditLayer {
     Entrypoint,
     /// supervisor の制御チャネルの接続元の拒否（別 uid・資格情報を確かめられない接続。SEC-4・SEC-1・SUP-1・#2058）。
     ControlChannel,
+    /// 親（回収した側）が `waitpid` で得た終了シグナルの補助記録（SEC-4・ESC-06・#2004）。
+    ///
+    /// seccomp 由来とは断定しない（コンテナ内の `kill(SIGSYS)` と区別できない）ため、層は `Seccomp` と別にする。
+    ExitSignal,
 }
 
 impl AuditLayer {
@@ -376,6 +407,7 @@ impl AuditLayer {
             AuditLayer::ExecTarget => "exec_target",
             AuditLayer::Entrypoint => "entrypoint",
             AuditLayer::ControlChannel => "control_channel",
+            AuditLayer::ExitSignal => "exit_signal",
         }
     }
 }
@@ -454,6 +486,20 @@ pub enum AuditEvent {
         /// 拒否理由トークン（[`ControlPeerRejection::as_str`]）。
         reason: AuditReason,
     },
+    /// 親が回収したコンテナプロセスの終了シグナル（SEC-4・ESC-06・TASK-41 追補・#2004。補助の記録）。
+    ///
+    /// `SECCOMP_RET_KILL_PROCESS` で終了したプロセスは自分では記録を書けない。正の記録（syscall・arch・pid）は
+    /// カーネルの `AUDIT_SECCOMP` が担い、本種別はそれと突き合わせるための補助に限る。コンテナ内の
+    /// `kill(SIGSYS)` と区別できないため seccomp 由来とは断定せず、**syscall・arch を型として持たない**
+    /// （終了シグナルから syscall を推測した記録を作れない。REPAIR-2）。
+    ExitSignal {
+        /// 終了シグナル。
+        signal: AuditSignal,
+        /// 終了したプロセスの PID。**回収した側の PID namespace** から見た値で、`AuditPid` の doc にある
+        /// 「対象プロセス自身の名前空間」とは異なる。ホストの PID namespace の回収者なら、カーネル記録の
+        /// `pid=` と一致する。記録した側の PID は [`AuditRecord::pid`]。
+        target_pid: AuditPid,
+    },
 }
 
 /// 制御チャネルが接続元を拒否した理由（SEC-4・SEC-1・SUP-1・#2058）。固定語彙で、入力値を載せない。
@@ -494,6 +540,7 @@ impl AuditEvent {
             AuditEvent::ExecTarget { .. } => AuditLayer::ExecTarget,
             AuditEvent::Entrypoint { .. } => AuditLayer::Entrypoint,
             AuditEvent::ControlPeer { .. } => AuditLayer::ControlChannel,
+            AuditEvent::ExitSignal { .. } => AuditLayer::ExitSignal,
         }
     }
 }
@@ -583,7 +630,24 @@ impl AuditRecord {
             | AuditEvent::PluginTrust { .. }
             | AuditEvent::ExecTarget { .. }
             | AuditEvent::Entrypoint { .. }
-            | AuditEvent::ControlPeer { .. } => None,
+            | AuditEvent::ControlPeer { .. }
+            | AuditEvent::ExitSignal { .. } => None,
+        }
+    }
+
+    /// 終了シグナル（[`AuditEvent::ExitSignal`] のみ。他は `None`）。
+    pub fn exit_signal(&self) -> Option<AuditSignal> {
+        match &self.event {
+            AuditEvent::ExitSignal { signal, .. } => Some(*signal),
+            _ => None,
+        }
+    }
+
+    /// 終了したプロセスの PID（[`AuditEvent::ExitSignal`] のみ。回収した側の PID namespace の値）。
+    pub fn target_pid(&self) -> Option<AuditPid> {
+        match &self.event {
+            AuditEvent::ExitSignal { target_pid, .. } => Some(*target_pid),
+            _ => None,
         }
     }
 
@@ -601,7 +665,8 @@ impl AuditRecord {
             AuditEvent::Seccomp { .. }
             | AuditEvent::ExecTarget { .. }
             | AuditEvent::Entrypoint { .. }
-            | AuditEvent::ControlPeer { .. } => None,
+            | AuditEvent::ControlPeer { .. }
+            | AuditEvent::ExitSignal { .. } => None,
             AuditEvent::Landlock { path, .. } => Some(path.as_path()),
             AuditEvent::Mount { path, .. } => path.as_ref().map(AuditPath::as_path),
             AuditEvent::PluginTrust { path, .. } => Some(path.as_path()),
@@ -651,6 +716,37 @@ mod tests {
             },
         );
         assert_eq!(without.reason(), None);
+    }
+
+    /// SEC-4・ESC-06・#2004: `ExitSignal` は syscall・arch・パスを持たず、シグナルと対象 PID を返す。
+    /// `AuditSignal` は `1..=64` だけ受け付ける。
+    #[test]
+    fn sec4_2004_exit_signal_record_has_no_syscall() {
+        let r = AuditRecord::new(
+            ts(),
+            pid(9),
+            AuditEvent::ExitSignal {
+                signal: AuditSignal::new(31).unwrap(),
+                target_pid: pid(1234),
+            },
+        );
+        assert_eq!(r.layer(), AuditLayer::ExitSignal);
+        assert_eq!(r.layer().as_str(), "exit_signal");
+        assert_eq!(r.syscall(), None);
+        assert_eq!(r.seccomp_arch(), None);
+        assert_eq!(r.path(), None);
+        assert_eq!(r.reason(), None);
+        assert_eq!(r.exit_signal().map(AuditSignal::get), Some(31));
+        assert_eq!(r.target_pid().map(AuditPid::get), Some(1234));
+        for bad in [0, 65, -1] {
+            assert_eq!(
+                AuditSignal::new(bad).unwrap_err().kind(),
+                AuditRecordErrorKind::SignalOutOfRange
+            );
+        }
+        for ok in [1u8, 31, 64] {
+            assert_eq!(AuditSignal::new(i32::from(ok)).unwrap().get(), ok);
+        }
     }
 
     fn ts() -> AuditTimestamp {

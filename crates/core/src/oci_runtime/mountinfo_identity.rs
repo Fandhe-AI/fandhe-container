@@ -601,6 +601,7 @@ mod tests {
     }
 
     /// SEC-1・#2166: 鎖と末端の `mnt_id` を一度に返す。鎖は [`dir_identity_chain`] と同じで、`mnt_id` は `path_mount_id` と一致する。
+    #[cfg(target_os = "linux")]
     #[test]
     fn sec1_2166_dir_identity_chain_with_mnt_id_matches_plain_chain() {
         let tmp = crate::test_support::TestTempDir::new("dir-chain-mnt").expect("temp dir");

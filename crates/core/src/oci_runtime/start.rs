@@ -1958,8 +1958,9 @@ mod tests {
         let spec = build_spec_with_state_root("cwd-user", &cfg, None).expect("spec");
         assert_eq!(
             spec.working_dir(),
-            &ContainerWorkingDir::Path(vec!["work".to_owned(), "dir".to_owned()])
+            &ContainerWorkingDir::parse(Path::new("/work/dir")).expect("parse")
         );
+        assert_eq!(spec.working_dir().components(), ["work", "dir"]);
         assert_eq!(spec.user(), (1000, 1001));
 
         let mut cfg = valid_config();

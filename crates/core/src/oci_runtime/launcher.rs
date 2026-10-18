@@ -1641,7 +1641,7 @@ mod tests {
             Arc::new(config),
             ContainerId::new(name).unwrap(),
             binds,
-            super::super::working_dir::ContainerWorkingDir::Root,
+            super::super::working_dir::ContainerWorkingDir::root(),
             (0, 0),
         );
         let _ = std::fs::remove_dir_all(&dir);

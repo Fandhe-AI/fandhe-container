@@ -58,7 +58,7 @@ use std::fmt;
 use super::ThreadCountSource;
 use super::capabilities::ProcessIds;
 #[cfg(not(test))]
-use super::capabilities::apply_default_capabilities_with;
+use super::capabilities::apply_default_capabilities_for_launch;
 #[cfg(not(test))]
 use super::landlock::apply_landlock_stage;
 #[cfg(not(test))]
@@ -587,9 +587,8 @@ impl StagePipeline {
                 }
                 StageKind::CapabilityDrop => {
                     #[cfg(not(test))]
-                    let applied = apply_default_capabilities_with(
+                    let applied = apply_default_capabilities_for_launch(
                         &mut ThreadCountSource::ProcSelf,
-                        None,
                         self.process_ids,
                     );
                     #[cfg(test)]

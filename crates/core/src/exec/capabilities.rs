@@ -96,6 +96,15 @@ struct RealKernel<'a> {
     /// `setns` の後に `/proc/self` を解決できないため、`setns` の前に開いた fd を渡す。`None` なら `/proc` を
     /// procfs と確認したうえで `self` を引く（launch 経路。pivot 後の `/proc` は `prepare_rootfs` がマウント済み）。
     own_proc_dir: Option<BorrowedFd<'a>>,
+    /// 資格情報の切り替え後の後処理の種類（exec worker か launch か）。
+    rebind: CredentialRebind,
+}
+
+/// 資格情報の切り替え後の後処理の種類。exec worker は親の pidfd へ結び直し、launch は non-dumpable の再設定のみ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialRebind {
+    ExecWorker,
+    Launch,
 }
 
 /// procfs の `setgroups` の読み取り上限（本物は `allow\n` / `deny\n` の 5〜6 バイト）。
@@ -172,7 +181,14 @@ impl CapKernel for RealKernel<'_> {
         sys::set_keep_caps(keep)
     }
     fn rebind_to_parent(&mut self) -> Result<(), ExecError> {
-        super::exec_command::rebind_worker_after_credential_switch()
+        match self.rebind {
+            CredentialRebind::ExecWorker => {
+                super::exec_command::rebind_worker_after_credential_switch()
+            }
+            CredentialRebind::Launch => {
+                super::exec_command::rebind_launch_after_credential_switch()
+            }
+        }
     }
 }
 
@@ -293,6 +309,28 @@ pub(crate) fn apply_default_capabilities_with(
         &mut RealKernel {
             threads,
             own_proc_dir,
+            rebind: CredentialRebind::ExecWorker,
+        },
+    )
+}
+
+/// launch 経路（コンテナの PID 1）用の [`apply_default_capabilities_with`]（OCI-1・SEC-5・#2224）。
+///
+/// 非 root の `process.user` へ切り替えた後の後処理だけが exec worker 版と異なる。PID 1 は exec worker 専用の
+/// 親 pidfd を持たず、親（短命な intermediate）の生存に結び付けてもならない（intermediate の終了で PID 1 が
+/// 死ぬため）ので、non-dumpable の再設定と読み戻しだけを行う。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn apply_default_capabilities_for_launch(
+    threads: &mut ThreadCountSource,
+    ids: Option<ProcessIds>,
+) -> Result<CapabilityReport, ExecError> {
+    apply_capabilities_single_threaded(
+        CapabilitySet::oci_default(),
+        ids,
+        &mut RealKernel {
+            threads,
+            own_proc_dir: None,
+            rebind: CredentialRebind::Launch,
         },
     )
 }
@@ -491,6 +529,7 @@ pub(super) fn clear_supplementary_groups_before_join(
         &mut RealKernel {
             threads,
             own_proc_dir: Some(own_proc_dir),
+            rebind: CredentialRebind::ExecWorker,
         },
         defer_on_denied_allow,
     )
@@ -534,6 +573,7 @@ pub fn clear_supplementary_groups_for_test() -> Result<SupplementaryGroups, Exec
     drop_supplementary_groups(&mut RealKernel {
         threads: &mut ThreadCountSource::ProcSelf,
         own_proc_dir: None,
+        rebind: CredentialRebind::ExecWorker,
     })
 }
 
@@ -553,6 +593,7 @@ pub fn apply_join_credentials_for_test(
     let mut kernel = RealKernel {
         threads: &mut ThreadCountSource::ProcSelf,
         own_proc_dir: None,
+        rebind: CredentialRebind::ExecWorker,
     };
     let groups = drop_supplementary_groups(&mut kernel)?;
     set_process_ids(&mut kernel, ProcessIds { uid, gid })?;
@@ -1688,6 +1729,7 @@ mod tests {
                         &mut RealKernel {
                             threads: &mut threads,
                             own_proc_dir: None,
+                            rebind: CredentialRebind::ExecWorker,
                         },
                     )
                     .unwrap_err();
@@ -1718,6 +1760,7 @@ mod tests {
                     &mut RealKernel {
                         threads: &mut threads,
                         own_proc_dir: None,
+                        rebind: CredentialRebind::ExecWorker,
                     },
                 )
                 .unwrap();

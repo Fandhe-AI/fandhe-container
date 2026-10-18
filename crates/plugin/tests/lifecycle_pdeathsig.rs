@@ -101,8 +101,7 @@ fn intermediate_entry() {
         .iter()
         .map(OsString::from)
         .collect();
-    let plugin =
-        OneShotPlugin::new(std::env::current_exe().unwrap(), args, PathBuf::from(dir)).unwrap();
+    let plugin = OneShotPlugin::new(crate::exe_target(), args, PathBuf::from(dir)).unwrap();
     let mut audit = JsonLinesPeerAuthObserver::new();
     if role == "oneshot" {
         // plugin は応答しないので、外側に kill されるまでここで待つ。
@@ -195,4 +194,15 @@ fn plug7_pdeathsig_kills_oneshot_plugin_when_parent_is_sigkilled() {
 #[test]
 fn plug7_pdeathsig_kills_resident_plugin_when_parent_is_sigkilled() {
     run("resident");
+}
+
+/// 試験用: 実行中のテストバイナリ自身を起動対象にする（構築口を呼んでよいのは試験コードだけ。#1856）。
+fn exe_target() -> fandhe_container_plugin::PluginLaunchTarget {
+    let p = std::env::current_exe().unwrap();
+    fandhe_container_plugin::PluginLaunchTarget::from_verified_file(
+        std::fs::File::open(&p).unwrap(),
+        p.clone(),
+        p,
+    )
+    .unwrap()
 }

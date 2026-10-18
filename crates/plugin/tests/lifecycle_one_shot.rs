@@ -5,15 +5,29 @@
 //! 用意する。`call_once` は子の環境を `env_clear()` するため、振る舞いは socket ディレクトリ内の
 //! `behavior` ファイルで子へ伝える。
 
+#[cfg(target_os = "linux")]
+#[path = "support/swap.rs"]
+mod swap;
+
+/// 試験用: 実行中のテストバイナリ自身を起動対象にする（構築口を呼んでよいのは試験コードだけ。#1856）。
+fn exe_target() -> fandhe_container_plugin::PluginLaunchTarget {
+    let p = std::env::current_exe().unwrap();
+    fandhe_container_plugin::PluginLaunchTarget::from_verified_file(
+        std::fs::File::open(&p).unwrap(),
+        p.clone(),
+        p,
+    )
+    .unwrap()
+}
+
 #[cfg(not(unix))]
 #[test]
 fn plug7_one_shot_requires_unix_transport() {
     use fandhe_container_plugin::{
         Frame, OneShotPlugin, OneShotTimeout, PluginErrorCode, call_once,
     };
-    let exe = std::env::current_exe().unwrap();
     let dir = std::env::temp_dir();
-    let plugin = OneShotPlugin::new(exe, vec![], dir).unwrap();
+    let plugin = OneShotPlugin::new(exe_target(), vec![], dir).unwrap();
     let req = Frame::new(b"ping".to_vec()).unwrap();
     let err = call_once(
         &plugin,
@@ -167,8 +181,15 @@ mod unix {
                 if mode == "exit_after_request" {
                     return;
                 }
-                let body = format!("pid={}", std::process::id());
-                s.write_frame(&Frame::new(body.into_bytes()).unwrap(), rpc(5000))
+                let body = if mode == "argv0" {
+                    // 受け取った `argv[0]` を応答に載せる（起動対象の `exec_path` との照合用。#1856）。
+                    use std::os::unix::ffi::OsStrExt;
+                    let a0 = std::env::args_os().next().unwrap();
+                    [b"argv0=".as_slice(), a0.as_bytes()].concat()
+                } else {
+                    format!("pid={}", std::process::id()).into_bytes()
+                };
+                s.write_frame(&Frame::new(body).unwrap(), rpc(5000))
                     .unwrap();
                 if mode == "linger" {
                     std::thread::sleep(Duration::from_secs(60));
@@ -209,7 +230,7 @@ mod unix {
             .iter()
             .map(OsString::from)
             .collect();
-        OneShotPlugin::new(std::env::current_exe().unwrap(), args, dir.0.clone()).unwrap()
+        OneShotPlugin::new(super::exe_target(), args, dir.0.clone()).unwrap()
     }
 
     fn run(
@@ -501,12 +522,27 @@ mod unix {
         );
     }
 
-    /// 存在しない絶対パスは NotFound。
+    /// 実行権の無いファイルの起動対象は PermissionDenied（spawn 失敗の構造化エラー）で、socket は残らない
+    /// （ファイルを開けない＝起動対象を作れないため、旧「存在しないプログラムは NotFound」の試験の置き換え。#1856）。
     #[test]
-    fn plug7_one_shot_reports_missing_program() {
+    fn plug7_one_shot_reports_non_executable_program() {
+        use std::os::unix::fs::OpenOptionsExt;
         let dir = TempDir::new("respond");
-        let missing = dir.0.join("no-such-plugin");
-        let plugin = OneShotPlugin::new(missing, vec![], dir.0.clone()).unwrap();
+        let program = dir.0.join("not-executable");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&program)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"not a native executable\n"))
+            .unwrap();
+        let target = fandhe_container_plugin::PluginLaunchTarget::from_verified_file(
+            std::fs::File::open(&program).unwrap(),
+            program.clone(),
+            program,
+        )
+        .unwrap();
+        let plugin = OneShotPlugin::new(target, vec![], dir.0.clone()).unwrap();
         let req = Frame::new(b"ping".to_vec()).unwrap();
         let err = call_once(
             &plugin,
@@ -515,8 +551,79 @@ mod unix {
             &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
         )
         .unwrap_err();
-        assert_eq!(err.code(), PluginErrorCode::NotFound);
+        assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
+        assert_eq!(err.message(), "permission denied spawning plugin program");
         no_socket_left(&dir);
+    }
+
+    /// plugin が受け取る `argv[0]` は起動対象の `exec_path`（Linux でも `/proc/self/fd/N` ではない。#1856）。
+    #[test]
+    fn plug11_one_shot_passes_exec_path_as_argv0() {
+        let (res, _, _dir) = run("argv0", 5000);
+        let out = res.unwrap();
+        let expected = std::env::current_exe().unwrap();
+        let mut want = b"argv0=".to_vec();
+        std::os::unix::ffi::OsStrExt::as_bytes(expected.as_os_str())
+            .iter()
+            .for_each(|b| want.push(*b));
+        assert_eq!(out.response().payload(), want.as_slice());
+    }
+
+    /// 起動対象を作った後に元のパスを別の実行ファイルへ差し替えても、起動されるのは元の実体（Linux。
+    /// fd の実体を実行する。#1856・PLUG-11）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plug11_one_shot_runs_original_after_path_replaced() {
+        let dir = TempDir::new("respond");
+        let fx = crate::swap::Fixture::new();
+        let args: Vec<OsString> = ["--exact", "unix::plugin_child_entry", "--test-threads=1"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let plugin = OneShotPlugin::new(fx.target(), args, dir.0.clone()).unwrap();
+        fx.replace_with_script();
+        let req = Frame::new(b"ping".to_vec()).unwrap();
+        let out = with_watchdog("call_once", move || {
+            call_once(
+                &plugin,
+                &req,
+                OneShotTimeout::new(Duration::from_millis(5000)).unwrap(),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            out.termination(),
+            OneShotTermination::Exited { code: Some(0) }
+        );
+        let pid = pid_of(out.response().payload());
+        assert_ne!(pid, std::process::id());
+        // 対照: 差し替え後のパスから新しく起動対象を作るとスクリプトとして拒否される。
+        let err = fx.try_target_from_path().unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
+    }
+
+    /// 構築後に同じ inode の内容が `#!` スクリプトへ書き換えられた場合は、解釈系が閉じた fd を開き直せず
+    /// `Unavailable` で失敗する（doc の「ネイティブの実行ファイルに限る」の裏付け。Linux。#1856）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plug11_one_shot_fails_when_inode_rewritten_to_script() {
+        let dir = TempDir::new("respond");
+        let fx = crate::swap::Fixture::new_rewritable();
+        let plugin = OneShotPlugin::new(fx.target(), vec![], dir.0.clone()).unwrap();
+        fx.rewrite_in_place_to_script();
+        let req = Frame::new(b"ping".to_vec()).unwrap();
+        let err = with_watchdog("call_once", move || {
+            call_once(
+                &plugin,
+                &req,
+                OneShotTimeout::new(Duration::from_millis(5000)).unwrap(),
+                &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::Unavailable);
+        assert_eq!(err.message(), "plugin exited before connecting");
     }
 }
 

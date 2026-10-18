@@ -1,0 +1,335 @@
+//! plugin の起動対象 [`PluginLaunchTarget`]（PLUG-11・PLUG-7・REPAIR-1・#1856・TASK-110 追補）。
+//!
+//! 起動 API（[`super::OneShotPlugin`]・[`super::call_once`]・[`super::ResidentPlugin`]・
+//! [`super::PluginSession`]）が受け取る唯一の起動対象。パスではなく、信頼性検証（所有者・モード・
+//! sha256。TASK-122・PLUG-11）を通した**開いたファイル記述子**を持つ。これにより「検証を通したものだけが
+//! 起動される」ことを型で表し、検証から起動までのパス差し替え（TOCTOU）を Linux では防ぐ（#1320 の
+//! オーナー判断 2026-10-12）。
+//!
+//! # 契約
+//!
+//! - 構築口は [`PluginLaunchTarget::from_verified_file`] のみ。本番で呼んでよいのは core の
+//!   `HashVerifiedPluginFile` からの変換 1 か所（#1857。機械判定は #1857 で導入するまで doc の契約のみ）。
+//!   それ以外で呼んでよいのは試験コードだけ。検証そのものは本型では行わない（呼び出し側の責務）。
+//!   依存方向（core -> plugin）を保つため、型は本 crate に置き、core 側の型は参照しない。
+//! - Linux: 保持した fd の実体を `/proc/self/fd/<N>` 経由で実行する。実行できない場合は
+//!   `FailedPrecondition` で失敗し、パスでの起動へ縮退しない（fail-closed）。fd は close-on-exec のまま
+//!   で、exec 後の plugin には残らない。plugin が見る `argv[0]` は実体の正規パス（`exec_path`）で、
+//!   `/proc/<pid>/comm` は fd 番号になる。
+//! - Linux 以外の unix（macOS 等）: 実体の正規パス（`exec_path`）で起動する。起動直前の同一性確認
+//!   （dev / ino の比較）は未実装で（#1866・REPAIR-3）、それまでは検証から起動までに実体のパスを
+//!   差し替えられ得る。
+//! - 非 unix: 起動仕様は構築できるが、listener の bind が `Unimplemented` を返し子は spawn されない。
+//! - plugin はネイティブの実行ファイルに限る。`#!` で始まるスクリプトは構築時に拒否する
+//!   （解釈系が fd を開き直す経路を作らない）。構築後に同じ inode が `#!` へ書き換えられた場合、
+//!   Linux では解釈系が閉じた fd を開けず、`Unavailable`（`plugin exited before connecting`）になる。
+//!
+//! # 未実装（REPAIR-3）
+//!
+//! - core の `HashVerifiedPluginFile` からの変換と構築箇所の機械判定（#1857）。
+//! - macOS の起動直前の同一性確認（#1866）。
+//! - 検証後の起動と RPC の本番配線（#1869）。
+
+use crate::error::{PluginError, PluginErrorCode};
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// 起動対象ファイルの同一性（dev / ino）。構築時に fd を `fstat` して記録する。
+/// 起動直前の同一性確認（#1866）と試験が使う。
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PluginFileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+impl PluginFileIdentity {
+    /// ファイルシステムのデバイス番号。
+    pub fn dev(&self) -> u64 {
+        self.dev
+    }
+
+    /// inode 番号。
+    pub fn ino(&self) -> u64 {
+        self.ino
+    }
+}
+
+/// 検証済みの開いたファイル記述子を持つ plugin の起動対象。
+///
+/// `Clone` は同じ fd を共有するだけで、新たな構築ではない（常駐の再起動・セッションの再開始で
+/// 同じ起動対象を使い回すため）。値の等価比較は持たない（fd の同一性は値の等価ではない）。
+#[derive(Debug, Clone)]
+pub struct PluginLaunchTarget {
+    /// 保持する検証済み fd。実行に使うのは Linux だけ（他は実体のパスで起動するため読まない）。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    file: Arc<File>,
+    display_path: PathBuf,
+    exec_path: PathBuf,
+    #[cfg(unix)]
+    identity: PluginFileIdentity,
+}
+
+fn inspect_failed() -> PluginError {
+    PluginError::new(
+        PluginErrorCode::Internal,
+        "failed to inspect plugin launch target",
+    )
+}
+
+impl PluginLaunchTarget {
+    /// 検証済みのファイルから起動対象を作る。
+    ///
+    /// `display_path` は検証時のパス（発見時。表示用で開き直さない）、`exec_path` は実体の正規パス
+    /// （Linux 以外の unix の起動と `argv[0]` に使う）。いずれも絶対パス必須。
+    ///
+    /// 本番で呼んでよいのは core の `HashVerifiedPluginFile` からの変換 1 か所（#1857）。それ以外で
+    /// 呼んでよいのは試験コードだけ。検証は本関数では行わない（呼び出し側の責務。PLUG-11）。
+    ///
+    /// 通常ファイルでないもの・`#!` スクリプトは `InvalidArgument`。fd の検査の失敗は `Internal`。
+    /// 固定の英語文言で、パスや内容は含めない。
+    pub fn from_verified_file(
+        file: File,
+        display_path: PathBuf,
+        exec_path: PathBuf,
+    ) -> Result<Self, PluginError> {
+        if !display_path.is_absolute() || !exec_path.is_absolute() {
+            return Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                "plugin launch target path must be absolute",
+            ));
+        }
+        let meta = file.metadata().map_err(|_| inspect_failed())?;
+        if !meta.is_file() {
+            return Err(PluginError::new(
+                PluginErrorCode::InvalidArgument,
+                "plugin launch target must be a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::{FileExt, MetadataExt};
+
+            // 先頭 2 バイトだけ pread で読む（オフセットを動かさず、サイズに比例する確保もしない）。
+            let mut head = [0u8; 2];
+            let mut filled = 0;
+            while filled < head.len() {
+                let Some(buf) = head.get_mut(filled..) else {
+                    return Err(inspect_failed());
+                };
+                let off = u64::try_from(filled).map_err(|_| inspect_failed())?;
+                match file.read_at(buf, off) {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => return Err(inspect_failed()),
+                }
+            }
+            if head == *b"#!" {
+                return Err(PluginError::new(
+                    PluginErrorCode::InvalidArgument,
+                    "plugin launch target must be a native executable, not a script",
+                ));
+            }
+            // fd 0〜2 は子の stdio の dup2 で上書きされ、別のファイルを実行しかねない。3 以上を保証する。
+            let file = if file.as_raw_fd() < 3 {
+                let dup = file.try_clone().map_err(|_| inspect_failed())?;
+                drop(file);
+                if dup.as_raw_fd() < 3 {
+                    return Err(inspect_failed());
+                }
+                dup
+            } else {
+                file
+            };
+            Ok(Self {
+                file: Arc::new(file),
+                display_path,
+                exec_path,
+                identity: PluginFileIdentity {
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                },
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                file: Arc::new(file),
+                display_path,
+                exec_path,
+            })
+        }
+    }
+
+    /// 検証時のパス（表示用。起動には使わない）。
+    pub fn display_path(&self) -> &Path {
+        &self.display_path
+    }
+
+    /// 実体の正規パス（Linux 以外の unix の起動と `argv[0]` に使う）。
+    pub fn exec_path(&self) -> &Path {
+        &self.exec_path
+    }
+
+    /// 構築時に fd を `fstat` した dev / ino。
+    #[cfg(unix)]
+    pub fn identity(&self) -> PluginFileIdentity {
+        self.identity
+    }
+
+    /// 保持している fd（crate 内専用。書き込み・seek などの誤用を防ぐため公開しない）。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
+}
+
+/// Linux で fd の実体を実行するための `/proc/self/fd/<N>` 側のパスを返す。起動前に、その magic link
+/// を辿った先の dev / ino が構築時の同一性と一致することを確かめる（fail-closed。失敗・不一致は
+/// `FailedPrecondition` で、パスでの起動へ縮退しない）。`proc_fd_dir` は本番では `/proc/self/fd`
+/// （試験が別ディレクトリを渡して失敗経路を照合する）。リンク先が削除済み（`(deleted)`）でも stat は
+/// 成功するので拒否しない。
+#[cfg(target_os = "linux")]
+pub(crate) fn linux_fd_exec_path(
+    target: &PluginLaunchTarget,
+    proc_fd_dir: &Path,
+) -> Result<PathBuf, PluginError> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let path = proc_fd_dir.join(target.file().as_raw_fd().to_string());
+    match std::fs::metadata(&path) {
+        Ok(m) if m.dev() == target.identity.dev && m.ino() == target.identity.ino => Ok(path),
+        _ => Err(fd_launch_error()),
+    }
+}
+
+/// fd 経由で実行できないときの構造化エラー。
+#[cfg(target_os = "linux")]
+pub(crate) fn fd_launch_error() -> PluginError {
+    PluginError::new(
+        PluginErrorCode::FailedPrecondition,
+        "plugin launch target cannot be executed through its file descriptor",
+    )
+}
+
+/// 単体試験用: 実行中のテストバイナリ自身の起動対象（試験コードだけが構築口を呼んでよい契約）。
+#[cfg(test)]
+pub(crate) fn current_exe_target() -> PluginLaunchTarget {
+    let p = std::env::current_exe().unwrap();
+    PluginLaunchTarget::from_verified_file(File::open(&p).unwrap(), p.clone(), p).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn exe_target() -> PluginLaunchTarget {
+        current_exe_target()
+    }
+
+    #[test]
+    fn plug11_relative_paths_are_rejected() {
+        let p = std::env::current_exe().unwrap();
+        for (d, e) in [
+            (PathBuf::from("plugin"), p.clone()),
+            (p.clone(), PathBuf::from("plugin")),
+        ] {
+            let err =
+                PluginLaunchTarget::from_verified_file(File::open(&p).unwrap(), d, e).unwrap_err();
+            assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
+            assert_eq!(err.message(), "plugin launch target path must be absolute");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plug11_directory_is_rejected() {
+        let dir = std::env::temp_dir();
+        let err = PluginLaunchTarget::from_verified_file(
+            File::open(&dir).unwrap(),
+            dir.clone(),
+            dir.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(err.message(), "plugin launch target must be a regular file");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plug11_script_is_rejected() {
+        use std::io::Write;
+
+        let p = std::env::temp_dir().join(format!("launch-target-script-{}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let mut f = File::create(&p).unwrap();
+        f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        drop(f);
+        let r =
+            PluginLaunchTarget::from_verified_file(File::open(&p).unwrap(), p.clone(), p.clone());
+        let _ = std::fs::remove_file(&p);
+        let err = r.unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "plugin launch target must be a native executable, not a script"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plug11_fd_is_at_least_3_and_identity_matches_fstat() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let t = exe_target();
+        assert!(t.file().as_raw_fd() >= 3);
+        let m = std::fs::metadata(std::env::current_exe().unwrap()).unwrap();
+        assert_eq!(t.identity().dev(), m.dev());
+        assert_eq!(t.identity().ino(), m.ino());
+        assert_eq!(t.exec_path(), t.display_path());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plug11_fd_exec_path_resolves_through_proc() {
+        use std::os::fd::AsRawFd;
+
+        let t = exe_target();
+        let got = linux_fd_exec_path(&t, Path::new("/proc/self/fd")).unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from(format!("/proc/self/fd/{}", t.file().as_raw_fd()))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plug11_fd_exec_path_fails_closed_on_missing_dir_and_mismatch() {
+        use std::os::fd::AsRawFd;
+
+        let t = exe_target();
+        let e = linux_fd_exec_path(&t, Path::new("/nonexistent/proc/fd")).unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "plugin launch target cannot be executed through its file descriptor"
+        );
+
+        // 別ファイルを指すエントリを同じ fd 番号の名前で置く。
+        let dir = std::env::temp_dir().join(format!("launch-target-fd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("/", dir.join(t.file().as_raw_fd().to_string())).unwrap();
+        let r = linux_fd_exec_path(&t, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let e = r.unwrap_err();
+        assert_eq!(e.code(), PluginErrorCode::FailedPrecondition);
+    }
+}

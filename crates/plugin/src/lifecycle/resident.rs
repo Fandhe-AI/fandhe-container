@@ -2,7 +2,7 @@
 //!
 //! plugin プロセスを 1 回だけ起動し、確立した接続を保持したまま複数の要求を順次処理する。
 //! 呼び出し元は core 側の plugin proxy（TASK-114 ほか。依存方向は `core -> plugin` のため、本モジュールは
-//! core の登録表を参照せず、検証済みの絶対パスを持つ起動仕様 [`OneShotPlugin`] を受け取る。
+//! core の登録表を参照せず、検証済みの起動対象（fd）を持つ起動仕様 [`OneShotPlugin`] を受け取る。
 //! 起動仕様の型は都度起動モードと共用。モード選択 API は TASK-110.3 の `mode`。型名の中立化は未実施）。
 //!
 //! # 契約
@@ -45,20 +45,21 @@
 //! - core の別プロセス起動をまたいで外部管理の常駐 plugin へ再接続する経路（attach）。plugin 発見・
 //!   登録（TASK-109）と proxy（TASK-114）側の責務とする。PLUG-7 は「呼び出しごとに接続のみ行う」と
 //!   記すが、本実装は起動後に接続を保持する形である（spec 側の表現との差は PR で報告）。
-//! - 起動対象の信頼性検証（TASK-122・PLUG-11。検証から spawn までの
-//!   差し替え〔TOCTOU〕も本タスクでは解決しない）、要求 ID と応答 ID の対応づけ（TASK-114）。
+//! - 起動対象の信頼性検証そのもの（TASK-122・PLUG-11。core 側の責務で、本 API は検証済みの起動対象
+//!   [`super::PluginLaunchTarget`] の fd を受け取るだけ）。検証から spawn までの差し替え（TOCTOU）は、Linux は
+//!   fd の実体を実行して防ぐ。macOS は実体のパスで起動し、直前の同一性確認は未実装（#1866）。
+//!   要求 ID と応答 ID の対応づけ（TASK-114）。
 
 use super::{
     ChildGuard, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT, OneShotPlugin, OneShotStderr,
-    OneShotTermination, PLUGIN_SOCKET_ENV, Reap, StderrCapture, bind_to_parent_lifetime,
-    classify_reaped, group_kill_failed_error, rpc_timeout, spawn_registered, stderr_channel,
+    OneShotTermination, Reap, StderrCapture, classify_reaped, group_kill_failed_error,
+    launch_spawn_error, plugin_command, rpc_timeout, spawn_registered, stderr_channel,
     unreaped_error, with_group_kill_failure,
 };
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
 use crate::signal_forward::{PLUGIN_REGISTRY, Registry};
 use crate::transport::{RpcTimeout, UdsListener, UdsStream};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -340,16 +341,9 @@ impl ResidentPlugin {
         })?;
         // `Command` はこのブロックの終わりで drop され、親側に書き込み端は残らない。
         let mut guard = {
-            let mut cmd = Command::new(&plugin.program);
-            cmd.args(&plugin.args)
-                .env_clear()
-                .env(PLUGIN_SOCKET_ENV, listener.path())
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(child_stderr);
             // spawn 前の失敗なので子は存在しない。
-            bind_to_parent_lifetime(&mut cmd)?;
-            spawn_registered(&mut cmd, registry)?
+            let mut cmd = plugin_command(plugin, listener.path(), child_stderr)?;
+            spawn_registered(&mut cmd, registry).map_err(launch_spawn_error)?
         };
 
         // 接続待ちより前に読み取りを始める（子が接続前に大量に書いても詰まらせない）。
@@ -754,9 +748,13 @@ mod tests {
     /// `NotFound` ではなく bind 側のエラーになる）。
     #[test]
     fn plug7_resident_start_reports_bind_failure_without_spawn() {
-        let abs = if cfg!(windows) { "C:\\p" } else { "/bin/p" };
         let dir = std::env::temp_dir().join("fcos-nonexistent-resident-dir");
-        let plugin = OneShotPlugin::new(abs.into(), vec![], dir).unwrap();
+        let plugin = OneShotPlugin::new(
+            super::super::launch_target::current_exe_target(),
+            vec![],
+            dir,
+        )
+        .unwrap();
         let e = ResidentPlugin::start(
             &plugin,
             ResidentStartTimeout::default(),

@@ -2,7 +2,7 @@
 //!
 //! 本 crate は lib（起動設定の解決ロジック。本ファイル）と bin（`src/main.rs`。薄い入口）で構成する。
 //! バイナリ名 `fandhe-container-plugin-windows` は発見規約の接頭辞に一致する（PLUG-4・PLUG-11）。
-//! core 側 proxy が `OneShotPlugin` / `ResidentPlugin` 経由で spawn する（TASK-114）。
+//! core 側 proxy が `OneShotPlugin` / `ResidentPlugin` 経由で、検証済み fd を持つ起動対象（`PluginLaunchTarget`。#1856）から spawn する（TASK-114）。
 //! 既存契約では socket の絶対パスは `env_clear()` 後に環境変数 [`PLUGIN_SOCKET_ENV`] のみで渡る。
 //!
 //! # 未実装範囲（REPAIR-3）

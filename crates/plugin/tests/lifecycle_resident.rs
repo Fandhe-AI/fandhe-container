@@ -5,15 +5,29 @@
 //! 用意する（`lifecycle_one_shot.rs` と同方式）。子の環境は `env_clear()` されるため、振る舞いは
 //! socket ディレクトリ内の `behavior` ファイルで子へ伝える。
 
+#[cfg(target_os = "linux")]
+#[path = "support/swap.rs"]
+mod swap;
+
+/// 試験用: 実行中のテストバイナリ自身を起動対象にする（構築口を呼んでよいのは試験コードだけ。#1856）。
+fn exe_target() -> fandhe_container_plugin::PluginLaunchTarget {
+    let p = std::env::current_exe().unwrap();
+    fandhe_container_plugin::PluginLaunchTarget::from_verified_file(
+        std::fs::File::open(&p).unwrap(),
+        p.clone(),
+        p,
+    )
+    .unwrap()
+}
+
 #[cfg(not(unix))]
 #[test]
 fn plug7_resident_requires_unix_transport() {
     use fandhe_container_plugin::{
         OneShotPlugin, PluginErrorCode, ResidentPlugin, ResidentStartTimeout,
     };
-    let exe = std::env::current_exe().unwrap();
     let dir = std::env::temp_dir();
-    let plugin = OneShotPlugin::new(exe, vec![], dir).unwrap();
+    let plugin = OneShotPlugin::new(exe_target(), vec![], dir).unwrap();
     let err = ResidentPlugin::start(
         &plugin,
         ResidentStartTimeout::default(),
@@ -142,8 +156,15 @@ mod unix {
                     if mode == "exit0_on_second" && seq == 2 {
                         std::process::exit(0);
                     }
-                    let body = format!("pid={} seq={seq}", std::process::id());
-                    s.write_frame(&Frame::new(body.into_bytes()).unwrap(), rpc(5000))
+                    let body = if mode == "argv0" {
+                        // 受け取った `argv[0]` を応答に載せる（起動対象の `exec_path` との照合用。#1856）。
+                        use std::os::unix::ffi::OsStrExt;
+                        let a0 = std::env::args_os().next().unwrap();
+                        [b"argv0=".as_slice(), a0.as_bytes()].concat()
+                    } else {
+                        format!("pid={} seq={seq}", std::process::id()).into_bytes()
+                    };
+                    s.write_frame(&Frame::new(body).unwrap(), rpc(5000))
                         .unwrap();
                     if (mode == "exit_after_first" || mode == "grandchild_exit_after_first")
                         && seq == 1
@@ -201,14 +222,20 @@ mod unix {
             .iter()
             .map(OsString::from)
             .collect();
-        OneShotPlugin::new(std::env::current_exe().unwrap(), args, dir.0.clone()).unwrap()
+        OneShotPlugin::new(super::exe_target(), args, dir.0.clone()).unwrap()
     }
 
     fn start(
         dir: &TempDir,
         ms: u64,
     ) -> Result<ResidentPlugin, fandhe_container_plugin::PluginError> {
-        let plugin = plugin_for(dir);
+        start_plugin(plugin_for(dir), ms)
+    }
+
+    fn start_plugin(
+        plugin: OneShotPlugin,
+        ms: u64,
+    ) -> Result<ResidentPlugin, fandhe_container_plugin::PluginError> {
         // Linux では plugin が PR_SET_PDEATHSIG で start を呼んだスレッドに結び付く（#1514・PLUG-7）。
         // セッションを返す都合上、start は別スレッドではなくテストスレッド上で呼び、ハング検出だけを
         // 監視スレッドに任せる（監視スレッドは完了通知を待ち、期限超過ならプロセスごと中断する）。
@@ -536,20 +563,78 @@ mod unix {
         assert_eq!(records[1].error_code, Some("UNAVAILABLE"));
     }
 
-    /// 存在しない絶対パスは NotFound で、socket は残らない。
+    /// 実行権の無いファイルの起動対象は PermissionDenied で、socket は残らない（ファイルを開けない＝起動対象を
+    /// 作れないため、旧「存在しないプログラムは NotFound」の試験の置き換え。#1856）。
     #[test]
-    fn plug7_resident_reports_missing_program() {
+    fn plug7_resident_reports_non_executable_program() {
+        use std::os::unix::fs::OpenOptionsExt;
         let dir = TempDir::new("respond");
-        let missing = dir.0.join("no-such-plugin");
-        let plugin = OneShotPlugin::new(missing, vec![], dir.0.clone()).unwrap();
+        let program = dir.0.join("not-executable");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&program)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"not a native executable\n"))
+            .unwrap();
+        let target = fandhe_container_plugin::PluginLaunchTarget::from_verified_file(
+            std::fs::File::open(&program).unwrap(),
+            program.clone(),
+            program,
+        )
+        .unwrap();
+        let plugin = OneShotPlugin::new(target, vec![], dir.0.clone()).unwrap();
         let e = ResidentPlugin::start(
             &plugin,
             ResidentStartTimeout::default(),
             &mut fandhe_container_plugin::JsonLinesPeerAuthObserver::new(),
         )
         .unwrap_err();
-        assert_eq!(e.code(), PluginErrorCode::NotFound);
+        assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+        assert_eq!(e.message(), "permission denied spawning plugin program");
         no_socket_left(&dir);
+    }
+
+    /// plugin が受け取る `argv[0]` は起動対象の `exec_path`（Linux でも `/proc/self/fd/N` ではない。#1856）。
+    #[test]
+    fn plug11_resident_passes_exec_path_as_argv0() {
+        let dir = TempDir::new("argv0");
+        let mut session = start(&dir, 5000).unwrap();
+        let resp = session.call(&ping(), rpc(5000)).unwrap();
+        let expected = std::env::current_exe().unwrap();
+        let mut want = b"argv0=".to_vec();
+        want.extend_from_slice(std::os::unix::ffi::OsStrExt::as_bytes(expected.as_os_str()));
+        assert_eq!(resp.payload(), want.as_slice());
+        session.shutdown().unwrap();
+    }
+
+    /// 起動対象を作った後に元のパスを別の実行ファイルへ差し替えても、起動されるのは元の実体（Linux。
+    /// fd の実体を実行する。#1856・PLUG-11）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plug11_resident_runs_original_after_path_replaced() {
+        let dir = TempDir::new("respond");
+        let fx = crate::swap::Fixture::new();
+        let args: Vec<OsString> = ["--exact", "unix::plugin_child_entry", "--test-threads=1"]
+            .iter()
+            .map(OsString::from)
+            .collect();
+        let plugin = OneShotPlugin::new(fx.target(), args, dir.0.clone()).unwrap();
+        fx.replace_with_script();
+        let mut session = start_plugin(plugin, 5000).unwrap();
+        let child_pid = session.pid().unwrap();
+        assert_eq!(
+            parse(&session.call(&ping(), rpc(5000)).unwrap()),
+            (child_pid, 1)
+        );
+        let done = session.shutdown().unwrap();
+        assert_eq!(
+            done.termination(),
+            OneShotTermination::Exited { code: Some(0) }
+        );
+        // 対照: 差し替え後のパスから新しく起動対象を作るとスクリプトとして拒否される。
+        let err = fx.try_target_from_path().unwrap_err();
+        assert_eq!(err.code(), PluginErrorCode::InvalidArgument);
     }
 }
 

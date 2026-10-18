@@ -259,9 +259,7 @@ mod supported {
                 .iter()
                 .map(OsString::from)
                 .collect();
-                let plugin =
-                    OneShotPlugin::new(std::env::current_exe().unwrap(), args, dir.clone())
-                        .unwrap();
+                let plugin = OneShotPlugin::new(crate::exe_target(), args, dir.clone()).unwrap();
                 let mut session = ResidentPlugin::start(
                     &plugin,
                     ResidentStartTimeout::default(),
@@ -558,8 +556,7 @@ mod supported {
             .iter()
             .map(OsString::from)
             .collect();
-            let plugin =
-                OneShotPlugin::new(std::env::current_exe().unwrap(), args, dir.0.clone()).unwrap();
+            let plugin = OneShotPlugin::new(crate::exe_target(), args, dir.0.clone()).unwrap();
             let mut session = ResidentPlugin::start(
                 &plugin,
                 ResidentStartTimeout::new(OP_TIMEOUT).unwrap(),
@@ -644,4 +641,16 @@ fn plug8_rss_is_unimplemented_on_unsupported_os() {
         rss::current().unwrap_err().code(),
         PluginErrorCode::Unimplemented
     );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// 試験用: 実行中のテストバイナリ自身を起動対象にする（構築口を呼んでよいのは試験コードだけ。#1856）。
+fn exe_target() -> fandhe_container_plugin::PluginLaunchTarget {
+    let p = std::env::current_exe().unwrap();
+    fandhe_container_plugin::PluginLaunchTarget::from_verified_file(
+        std::fs::File::open(&p).unwrap(),
+        p.clone(),
+        p,
+    )
+    .unwrap()
 }

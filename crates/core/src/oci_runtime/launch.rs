@@ -37,7 +37,7 @@ use std::time::Duration;
 use super::bind_mounts::BindMountSet;
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
-use crate::traits::{ContainerId, ErrorCode, Signal, TraitError};
+use crate::traits::{CgroupPlacement, ContainerId, ErrorCode, Signal, TraitError};
 
 /// [`StartTimeouts`] の各上限が取れる最大値（無期限相当の値を型で拒否する。REPAIR-5）。
 ///
@@ -947,13 +947,35 @@ pub trait ProcessLauncher: Send + Sync {
     ///
     /// 本番の `ProductionLauncher` は、自身が起動した範囲だけを確証できる（起動台帳。#1817）。失敗した launch の
     /// 回収できなかった子と報告前の PID 1 を期限内に再回収・再探索し、消滅を確かめられたときだけ `Ok(())` を返す。
-    /// 台帳に無い ID（別プロセスで起動した残存）とハンドルを渡し済みの ID は確証できないため `FailedPrecondition`。
+    /// 台帳に無い ID（別プロセスで起動した残存）とハンドルを渡し済みの ID は、このメソッドでは確証できないため
+    /// `FailedPrecondition`。別プロセスの残存は [`Self::confirm_no_process_recorded`] が記録済みの cgroup から確かめる。
     fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
         let _ = (id, timeout);
         Err(TraitError::new(
             ErrorCode::Unimplemented,
             "the launcher cannot confirm that no process remains for this container",
         ))
+    }
+
+    /// [`Self::confirm_no_process`] に、状態記録の cgroup の配置 `recorded` を添えたもの（別プロセスで起動した
+    /// 残存の確認。#2011・CORE-2・SEC-1）。
+    ///
+    /// `recover_interrupted_start` が、照合済みのレコードの `StateRecord::cgroup` をそのまま渡す（配置は start の
+    /// 手順 5 で 1 回だけ記録され上書きされないため、読んだ時点の値でよい）。ID だけからパスを組み立てない。
+    /// 本番の `ProductionLauncher` は、台帳にある ID は従来どおり台帳で判定し、台帳に無い ID だけ、`recorded` の
+    /// コンテナ cgroup にプロセスが居ないことを確かめる（居れば止めて確かめる。記録が無い・検証できない・読めない
+    /// ときは `Ok` にしない）。既定実装は `recorded` を使わず [`Self::confirm_no_process`] へ転送する。
+    ///
+    /// ラッパー実装は必ず内側へ転送すること（転送しないと既定実装へ黙って縮退し、別プロセスの残存を確かめられず
+    /// 回復が成功しなくなる）。
+    fn confirm_no_process_recorded(
+        &self,
+        id: &ContainerId,
+        recorded: Option<&CgroupPlacement>,
+        timeout: Duration,
+    ) -> Result<(), TraitError> {
+        let _ = recorded;
+        self.confirm_no_process(id, timeout)
     }
 }
 

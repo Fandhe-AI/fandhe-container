@@ -154,7 +154,9 @@ pub(crate) use exec_kill::{
     EXEC_SWEEP_DELETE_TIMEOUT, ExecChildCgroupFds, ExecChildRemoval, ExecChildSweep, SweepMode,
     remove_exec_child_cgroup_at, sweep_exec_children_at, validate_exec_child_name,
 };
-pub use recorded_scope::RecordedCgroupScope;
+pub use recorded_scope::{
+    RecordedCgroupOutcome, RecordedCgroupScope, ensure_no_process_in_recorded,
+};
 
 /// 退避リーフ cgroup の名前。自プロセスの移動先（レイアウトは本モジュール冒頭を参照）。
 const EVACUATION_LEAF: &str = "fc-runtime";

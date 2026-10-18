@@ -59,3 +59,8 @@ harness = false
 [[test]]
 name = "delete_cgroup_real"
 harness = false
+
+# 実機前提の結合試験（#2011）。`harness = false` の単一 main で、`-- --ignored` のときだけ実機シナリオを動かす。
+[[test]]
+name = "start_recover_real"
+harness = false

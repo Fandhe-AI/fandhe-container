@@ -8,7 +8,8 @@
 //! 開いて消せるようにした。本モジュールがその実体で、`DelegatedCgroup` の
 //! `ContainerCgroupRemover::remove_recorded` が [`remove_recorded_with`] を呼ぶ（CLI の `delete` は
 //! `DetectedCgroupRemover` 経由でここへ届く）。別プロセスからコンテナ cgroup が空かを確かめる #2011 も、
-//! 検出スコープとの一致を条件にせず [`RecordedCgroupScope::open`] へ揃える方針である（問い合わせ API は #2011 で足す）。
+//! 検出スコープとの一致を条件にせず [`RecordedCgroupScope::open`] へ揃え、問い合わせ・停止の経路
+//! ([`ensure_no_process_in_recorded`]。下の「別プロセスの残存の確認」) を同じ規則で提供する。
 //!
 //! # 契約（fail-closed）
 //!
@@ -24,13 +25,35 @@
 //! - スコープ（または途中の要素）が存在しなければ `Ok(None)`（呼び出し側で `NotPresent`）。他の失敗は
 //!   すべてエラーで、何も kill・削除しない。`TraitError` の message は固定文言で、パス・errno を含めない
 //!
+//! # 別プロセスの残存の確認（#2011・CORE-2・SEC-1）
+//!
+//! `ProductionLauncher::confirm_no_process_recorded` が、台帳に無い ID（クラッシュした supervisor が起動した
+//! 残存）を記録済みの配置から確かめるために呼ぶ。`oci_runtime::start::recover_interrupted_start` が取得済みの
+//! レコードの配置を渡す。結果は [`RecordedCgroupOutcome`]:
+//!
+//! - スコープまたはコンテナ cgroup が無い → `AlreadyAbsent`。cgroup v2 ではプロセスや子 cgroup が居る
+//!   cgroup は `rmdir` できないため、無いことはプロセスが居ないことを意味する（PID 1 の死で scope が回収された
+//!   場合や、記録の後・mkdir の前に落ちた場合）。`NotFound` 以外の失敗は `Ok` にしない
+//! - `cgroup.events` の `populated 0` → `WasEmpty`
+//! - `populated 1` → `cgroup.kill` へ書いて期限内に `populated 0` を待つ → `Killed`。delete が空でなければ
+//!   拒否する（利用者の停止操作が前提）のと違い、回復は起動権の所有ロックを取れた後（起動者が居ない）にだけ
+//!   走り、pid が未記録のため stop・kill では止められない孤児を回収する。届くのは検証済みの
+//!   `fc-<id>@<instance>`（子孫を含む）だけ
+//!
+//! 残余: 記録したパスと同じ cgroup 名前空間から見ていること、コンテナ内のプロセスが cgroup の外へ移った場合は
+//! 検出できないこと（delete と同じ限界）。
+//!
 //! `unsafe` は持たず、syscall は既存の `crate::sys` のラッパー経由（新しい宣言なし）。
 
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
+use std::time::Instant;
+
+use super::exec_kill::{EVENTS_LIMIT, parse_populated, wait_unpopulated, write_kill};
 use super::{
-    CgroupError, CgroupPath, CgroupStep, MAX_PATH_DEPTH, open_cgroup_dir, open_cgroup_root,
-    removal_error, remove_container_cgroup_with, validate_component, verify_delegated_scope,
+    CgroupError, CgroupName, CgroupPath, CgroupStep, MAX_PATH_DEPTH, cstring, open_cgroup_dir,
+    open_cgroup_root, open_child_with, read_iface, removal_error, remove_container_cgroup_with,
+    sys_error, validate_component, verify_delegated_scope,
 };
 use crate::observability::OpRecorder;
 use crate::oci_runtime::CgroupRemoval;
@@ -38,6 +61,19 @@ use crate::sys;
 use crate::traits::{
     CgroupPlacement, CgroupScope, ContainerId, ErrorCode, StateRevision, TraitError,
 };
+
+/// 記録された配置のコンテナ cgroup について、プロセスが居ないことを確かめた結果（#2011・CORE-2）。
+///
+/// 真偽値にせず列挙型にして、観測（REPAIR-4）や将来の分岐に備える。いずれも「居ない状態に到達済み」を表す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordedCgroupOutcome {
+    /// スコープまたはコンテナ cgroup が無い（空でない cgroup は消えないので、プロセスも居ない）。
+    AlreadyAbsent,
+    /// コンテナ cgroup は在り、`populated 0`（子孫を含めて空）だった。何も kill していない。
+    WasEmpty,
+    /// プロセスが居たため `cgroup.kill` で止め、期限内に `populated 0` を確かめた。
+    Killed,
+}
 
 /// 子ディレクトリを開く関数（本番は [`open_cgroup_dir`]。テストだけが tmpfs 向けに差し替える）。
 type OpenDir<'a> = &'a dyn Fn(CgroupStep, BorrowedFd<'_>, &str) -> Result<OwnedFd, CgroupError>;
@@ -88,6 +124,84 @@ impl RecordedCgroupScope {
             sys::effective_uid(),
             &open_cgroup_dir,
         )
+    }
+}
+
+/// 記録された配置のコンテナ cgroup に、プロセスが居ないことを確かめる（居れば止める）。`deadline` まで待つ。
+///
+/// 本番の入口（`ensure_no_process_with` に実 `/sys/fs/cgroup` と euid を渡す）。#2011・CORE-2・SEC-1。
+pub fn ensure_no_process_in_recorded(
+    id: &ContainerId,
+    placement: &CgroupPlacement,
+    deadline: Instant,
+) -> Result<RecordedCgroupOutcome, CgroupError> {
+    ensure_no_process_with(
+        id,
+        placement,
+        deadline,
+        sys::effective_uid(),
+        &open_cgroup_root,
+        &open_cgroup_dir,
+    )
+}
+
+/// [`ensure_no_process_in_recorded`] の本体。`euid`・`open_root`・`open_dir` はテストの継ぎ目。
+///
+/// 順序: スコープを検証つきで開く（無ければ `AlreadyAbsent`）→ `fc-<id>@<instance>` を所有者検証つきで開く
+/// （無ければ `AlreadyAbsent`）→ `cgroup.events` を読む → 空なら `WasEmpty` → `cgroup.kill` に `1` を書き
+/// `deadline` まで `populated 0` を待つ。`cgroup.kill` が無い（Linux 5.14 未満）ときは `Ok` にせず
+/// `Unimplemented`。`deadline` を過ぎていれば kill の前に `Timeout`。待ちはすべて `deadline` で打ち切る（REPAIR-5）。
+pub(super) fn ensure_no_process_with(
+    id: &ContainerId,
+    placement: &CgroupPlacement,
+    deadline: Instant,
+    euid: u32,
+    open_root: &dyn Fn() -> Result<OwnedFd, CgroupError>,
+    open_dir: OpenDir<'_>,
+) -> Result<RecordedCgroupOutcome, CgroupError> {
+    let step = CgroupStep::Cleanup;
+    let Some(scope) = open_with(placement.scope().as_str(), euid, open_root, open_dir)? else {
+        return Ok(RecordedCgroupOutcome::AlreadyAbsent);
+    };
+    // 名前を作れない（長さ超過）cgroup は存在し得ない（delete と同じ扱い）。
+    let Ok(name) = CgroupName::for_instance(id, placement.instance()) else {
+        return Ok(RecordedCgroupOutcome::AlreadyAbsent);
+    };
+    let Some(child) = open_child_with(scope.fd.as_fd(), &name, euid, open_dir)? else {
+        return Ok(RecordedCgroupOutcome::AlreadyAbsent);
+    };
+    let events = match read_iface(step, child.fd.as_fd(), "cgroup.events", EVENTS_LIMIT) {
+        Ok(text) => text,
+        // 読む前にコンテナ cgroup が消えた（回収済み）。目的の状態。
+        Err(e) if e.code == ErrorCode::NotFound => return Ok(RecordedCgroupOutcome::AlreadyAbsent),
+        Err(e) => return Err(e),
+    };
+    if !parse_populated(&events)? {
+        return Ok(RecordedCgroupOutcome::WasEmpty);
+    }
+    if deadline.saturating_duration_since(Instant::now()).is_zero() {
+        return Err(CgroupError::new(
+            ErrorCode::Timeout,
+            step,
+            "deadline passed before the recorded container cgroup could be killed",
+        ));
+    }
+    let kill = cstring(step, "cgroup.kill")?;
+    let kill_w = sys::open_write_at(child.fd.as_fd(), &kill).map_err(|e| match e {
+        sys::SysError::Os(errno) if errno == sys::ENOENT => CgroupError::new(
+            ErrorCode::Unimplemented,
+            step,
+            "cgroup.kill is not available (Linux 5.14 or later is required)",
+        ),
+        other => sys_error(step, "cgroup.kill", other),
+    })?;
+    write_kill(&std::fs::File::from(kill_w))?;
+    let left = deadline.saturating_duration_since(Instant::now());
+    match wait_unpopulated(child.fd.as_fd(), left) {
+        Ok(()) => Ok(RecordedCgroupOutcome::Killed),
+        // 待つ間にコンテナ cgroup ごと回収された。
+        Err(e) if e.code == ErrorCode::NotFound => Ok(RecordedCgroupOutcome::Killed),
+        Err(e) => Err(e),
     }
 }
 
@@ -376,6 +490,146 @@ mod tests {
         assert_eq!(
             denied.message(),
             "container cgroup is not owned by the effective user"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // ---- #2011: 別プロセスの残存の確認（ensure_no_process_with） ----
+
+    fn ensure(
+        root: &Path,
+        scope: &str,
+        instance: u64,
+        euid: u32,
+        wait: std::time::Duration,
+    ) -> Result<RecordedCgroupOutcome, CgroupError> {
+        ensure_no_process_with(
+            &cid("c1"),
+            &placement(scope, instance),
+            Instant::now() + wait,
+            euid,
+            &root_of(root),
+            &open_plain,
+        )
+    }
+
+    const SHORT: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// 委譲スコープの下に `fc-c1@7` と `cgroup.events` を作る。
+    fn make_container(root: &Path, events: &str) -> PathBuf {
+        let scope = make_scope(root, "domain");
+        let ctr = scope.join("fc-c1@7");
+        fs::create_dir(&ctr).expect("mkdir ctr");
+        fs::write(ctr.join("cgroup.events"), events).expect("events");
+        ctr
+    }
+
+    /// CORE-2（#2011）: スコープが無い・コンテナ cgroup が無い・名前を作れない場合は `AlreadyAbsent`。
+    #[test]
+    fn core2_issue2011_absent_scope_or_container_is_already_absent() {
+        let root = tmp("ens-absent");
+        assert_eq!(
+            ensure(&root, SCOPE, 7, real_euid(), SHORT).expect("no scope"),
+            RecordedCgroupOutcome::AlreadyAbsent
+        );
+        make_scope(&root, "domain");
+        assert_eq!(
+            ensure(&root, SCOPE, 7, real_euid(), SHORT).expect("no container"),
+            RecordedCgroupOutcome::AlreadyAbsent
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// CORE-2（#2011）: `populated 0` は `WasEmpty` で、`cgroup.kill` には書かない。
+    #[test]
+    fn core2_issue2011_unpopulated_is_was_empty_without_kill() {
+        let root = tmp("ens-empty");
+        let ctr = make_container(&root, "populated 0\nfrozen 0\n");
+        fs::write(ctr.join("cgroup.kill"), "").expect("kill");
+        assert_eq!(
+            ensure(&root, SCOPE, 7, real_euid(), SHORT).expect("empty"),
+            RecordedCgroupOutcome::WasEmpty
+        );
+        assert_eq!(fs::read_to_string(ctr.join("cgroup.kill")).expect("r"), "");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// CORE-2・SEC-1（#2011）: `populated 1` は `cgroup.kill` へ `1` を書き、`populated 0` を確かめて `Killed`。
+    #[test]
+    fn core2_issue2011_populated_is_killed_and_confirmed() {
+        let root = tmp("ens-kill");
+        let ctr = make_container(&root, "populated 1\n");
+        fs::write(ctr.join("cgroup.kill"), "").expect("kill");
+        let events = ctr.join("cgroup.events");
+        let flipper = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            fs::write(events, "populated 0\n").expect("flip");
+        });
+        let out = ensure(
+            &root,
+            SCOPE,
+            7,
+            real_euid(),
+            std::time::Duration::from_secs(5),
+        )
+        .expect("killed");
+        flipper.join().expect("join");
+        assert_eq!(out, RecordedCgroupOutcome::Killed);
+        assert_eq!(fs::read_to_string(ctr.join("cgroup.kill")).expect("r"), "1");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// REPAIR-5・CORE-2（#2011）: kill 後も `populated 1` のままなら期限で `Timeout`（`Ok` にしない）。
+    #[test]
+    fn core2_issue2011_still_populated_after_kill_times_out() {
+        let root = tmp("ens-timeout");
+        let ctr = make_container(&root, "populated 1\n");
+        fs::write(ctr.join("cgroup.kill"), "").expect("kill");
+        let err = ensure(&root, SCOPE, 7, real_euid(), SHORT).expect_err("timeout");
+        assert_eq!(err.code, ErrorCode::Timeout);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// CORE-2（#2011）: 期限切れで `populated 1` なら kill せずに `Timeout`。
+    #[test]
+    fn core2_issue2011_expired_deadline_does_not_kill() {
+        let root = tmp("ens-expired");
+        let ctr = make_container(&root, "populated 1\n");
+        fs::write(ctr.join("cgroup.kill"), "").expect("kill");
+        let err =
+            ensure(&root, SCOPE, 7, real_euid(), std::time::Duration::ZERO).expect_err("expired");
+        assert_eq!(err.code, ErrorCode::Timeout);
+        assert_eq!(fs::read_to_string(ctr.join("cgroup.kill")).expect("r"), "");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// CORE-2（#2011）: `cgroup.kill` が無ければ `Ok` にせず `Unimplemented`。
+    #[test]
+    fn core2_issue2011_missing_cgroup_kill_is_unimplemented() {
+        let root = tmp("ens-nokill");
+        make_container(&root, "populated 1\n");
+        let err = ensure(&root, SCOPE, 7, real_euid(), SHORT).expect_err("no kill");
+        assert_eq!(err.code, ErrorCode::Unimplemented);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// SEC-1（#2011）: スコープの所有者不一致は `PermissionDenied`、`cgroup.events` の欠落・解析不能は `Ok` にしない。
+    #[test]
+    fn sec1_issue2011_unverifiable_states_are_errors() {
+        let root = tmp("ens-err");
+        let ctr = make_container(&root, "populated 1\n");
+        fs::write(ctr.join("cgroup.kill"), "").expect("kill");
+        let err = ensure(&root, SCOPE, 7, real_euid().wrapping_add(1), SHORT).expect_err("owner");
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert_eq!(fs::read_to_string(ctr.join("cgroup.kill")).expect("r"), "");
+        fs::write(ctr.join("cgroup.events"), "garbage\n").expect("events");
+        let err = ensure(&root, SCOPE, 7, real_euid(), SHORT).expect_err("garbage");
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        fs::remove_file(ctr.join("cgroup.events")).expect("rm");
+        // 読む前に回収された cgroup（`cgroup.events` が ENOENT）は居ない状態。
+        assert_eq!(
+            ensure(&root, SCOPE, 7, real_euid(), SHORT).expect("gone"),
+            RecordedCgroupOutcome::AlreadyAbsent
         );
         let _ = fs::remove_dir_all(&root);
     }

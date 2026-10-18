@@ -255,7 +255,10 @@ mod linux {
                         i += 1;
                         let mut c = Vec::new();
                         while let Some(a) = argv.get(i) {
-                            if a == "--image" || a == "--work-dir" {
+                            if matches!(
+                                a.as_str(),
+                                "--image" | "--work-dir" | "--ignored" | "--nocapture"
+                            ) {
                                 break;
                             }
                             c.push(a.clone());
@@ -1130,6 +1133,23 @@ mod linux {
             let both = parse_args(&strs(&["--image", "busybox"]), Some("alpine")).expect("both");
             assert_eq!(both.images.len(), 1);
             // 不正入力。
+            // --cmd の後ろの --ignored / --nocapture は区切りで、コンテナの引数にしない。
+            let t = parse_args(
+                &strs(&[
+                    "--image",
+                    "x",
+                    "--cmd",
+                    "/bin/true",
+                    "--ignored",
+                    "--nocapture",
+                ]),
+                None,
+            )
+            .expect("args");
+            assert_eq!(
+                t.images.first().and_then(|i| i.cmd_override.clone()),
+                Some(strs(&["/bin/true"]))
+            );
             assert!(parse_args(&strs(&["--cmd", "x"]), None).is_err());
             assert!(parse_args(&strs(&["--image", "alpine", "--cmd"]), None).is_err());
             assert!(parse_args(&strs(&["--image"]), None).is_err());

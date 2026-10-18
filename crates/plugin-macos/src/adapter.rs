@@ -25,7 +25,7 @@
 //! 対象外（PLUG-4）。
 //!
 //! `id` は core の `ContainerId` と同じ規則（空・`.`・`..` 不可、255 バイト以下、`[A-Za-z0-9._-]`）で
-//! 検証する（#1869 の設計 で core 型へ置換）。create は検証と登録のみ、start が `Vm::launch`、stop が
+//! 検証する（#1869 の設計で core 型へ置換）。create は検証と登録のみ、start が `Vm::launch`、stop が
 //! `Vm::stop` と登録解除（delete が無いため stop が資源をすべて手放す）。
 //!
 //! # エラー対応表（[`to_plugin_error`] が唯一の変換箇所）
@@ -120,7 +120,7 @@
 //!   終了）の挙動は実機未確認。
 //!
 //! # 未実装範囲（実装済みを装わない。REPAIR-3）
-//! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（#1869 の設計 待ち）。
+//! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（#1869 の設計待ち）。
 //!   コンソールログの削除（現在のログと全世代。`VmConfigSpec::remove_console_logs`）は delete の実装時に呼ぶ予定で、
 //!   現時点では呼び出し元が無い（ログは stop 後も残る。#2138）。
 //! - virtiofs 共有は、マウント先とコンソールログを指定すればゲスト init の報告を待つ（上の節）。initrd へのゲスト init の梱包
@@ -795,7 +795,7 @@ fn build_spec(
     Ok(spec)
 }
 
-/// core の `ContainerId` と同じ規則（#1869 の設計 で core 型へ置換予定）。
+/// core の `ContainerId` と同じ規則（#1869 の設計で core 型へ置換予定）。
 fn validate_id(id: &str) -> Result<(), PluginError> {
     let ok = !id.is_empty()
         && id.len() <= ID_MAX_BYTES

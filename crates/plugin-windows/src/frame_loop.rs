@@ -19,7 +19,7 @@
 //! その接続に閉じる。
 //!
 //! # 未実装範囲（REPAIR-3）
-//! 本体型 `Vec<String>`（先頭要素が操作名）は spec 未規定の暫定契約で、型つき本体への置換は #1869 の設計 で確定する。
+//! 本体型 `Vec<String>`（先頭要素が操作名）は spec 未規定の暫定契約で、型つき本体への置換は #1869 の設計で確定する。
 //! 既定ハンドラ [`UnimplementedHandler`] は全操作に `UNIMPLEMENTED` を返す（アダプタ未結線時・テスト用。
 //! 実ハンドラは `adapter::WindowsRuntimeAdapter`・#394）。ヘルスチェック（`ping`）は adapter が応答する（#396）。
 //!
@@ -60,7 +60,7 @@ const BODY_CHUNK: usize = 64 * 1024;
 /// 応答の符号化失敗時に返す固定文言（入力断片を載せない）。
 const MSG_ENCODE_FAILED: &str = "failed to encode response";
 
-/// 要求ハンドラの境界。`body` は先頭要素が操作名・以降が引数の暫定契約（#1869 の設計 で型つき本体へ置換）。
+/// 要求ハンドラの境界。`body` は先頭要素が操作名・以降が引数の暫定契約（#1869 の設計で型つき本体へ置換）。
 ///
 /// `Err` は同じ `MessageId` の `Error` 応答になる。メッセージに入力値を含めないこと（外部入力の反射防止）。
 pub trait RequestHandler {

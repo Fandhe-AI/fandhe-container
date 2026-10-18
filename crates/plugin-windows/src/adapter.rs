@@ -34,7 +34,7 @@
 //!   [`ReleaseAllReport::remaining`] で返すだけで、プロセス終了後は本 plugin から回収できない。
 //!   - 解除に使う記録（マウント ID）はゲスト内 `/run/fandhe/<nonce>` に既にあるが、マウント先のパスと
 //!     コンテナ ID を含まないため、別プロセスからは回収対象を特定できない。
-//!   - 起動時の一括解除は採らない。起動モード（都度起動・常駐。PLUG-7）は #1869 の設計 の 4.4 で
+//!   - 起動時の一括解除は採らない。起動モード（都度起動・常駐。PLUG-7）は #1869 の設計の 4.4 で
 //!     確定し、都度起動では別の plugin プロセスが使用中のマウントと残骸を区別できず、稼働中のコンテナの
 //!     マウントを外す恐れがある。
 //!   - ホスト側への保存も採らない。WSL の VM 再起動でマウントが消えた後も記録が残り、古い記録で別の
@@ -52,7 +52,7 @@
 //! マウントを行う。したがって本 plugin は Windows ホスト側プロセスとして動く前提である。非 Windows
 //! ビルド（WSL2 ゲスト内の Linux 等）では `wsl.exe` を解決できず、create は `UNIMPLEMENTED` で
 //! fail-closed になる（成功を装わない）。Windows ホスト上の UDS 接続は plugin 境界機構側が未対応で、
-//! #1869 の設計 で確定する（REPAIR-3）。
+//! #1869 の設計で確定する（REPAIR-3）。
 //!
 //! # 外部入力の扱い
 //! 受信文字列はすべて untrusted。platform-windows へは検証済み newtype（`DistroName`・`MountName`・
@@ -88,7 +88,7 @@ pub const RESPONSE_MARGIN: Duration = Duration::from_secs(2);
 /// 要求元（core 側 proxy）の plugin RPC 既定期限 `UDS_RPC_TIMEOUT_DEFAULT`（上限も同じ値）から
 /// [`RESPONSE_MARGIN`] を引いた値で、起点は要求の処理開始時。検出・マウント準備・回復・解除の各段には
 /// この期限の残り時間から配分するため、成功応答も失敗時の解除結果も RPC 期限内に要求元へ届く。
-/// 要求ごとの期限はワイヤーに載っていないため既定値を前提にする（期限の受け渡しは #1869 の設計 で確定。
+/// 要求ごとの期限はワイヤーに載っていないため既定値を前提にする（期限の受け渡しは #1869 の設計で確定。
 /// REPAIR-3）。期限切れになった `wsl.exe` を kill して回収する猶予（platform-windows 側）は含まない。
 pub const REQUEST_BUDGET: Duration = UDS_RPC_TIMEOUT_DEFAULT.saturating_sub(RESPONSE_MARGIN);
 
@@ -110,7 +110,7 @@ pub const RELEASE_ALL_BUDGET: Duration = ONE_SHOT_EXIT_TIMEOUT.saturating_sub(EX
 /// 残り期限がこの値未満のときは新たな解除を始めない（platform-windows の最小期限より十分大きく取る）。
 const MIN_STEP_BUDGET: Duration = Duration::from_millis(50);
 
-/// コンテナ ID の最大バイト数（core の `ContainerId` と同じ規則。#1869 の設計 で core 型へ置換予定）。
+/// コンテナ ID の最大バイト数（core の `ContainerId` と同じ規則。#1869 の設計で core 型へ置換予定）。
 const MAX_ID_LEN: usize = 255;
 
 const MSG_SHUTTING_DOWN: &str = "plugin is shutting down";

@@ -15,7 +15,7 @@
 //! 5 = 終了時に停止できなかった VM が残った。3・4 は plugin-windows と同じ値（core 側 proxy が同じ規則で扱えるようにする）。
 //! 出力は固定文言と列挙名のみで、socket パス・引数値・環境変数値・受信データを含めない。
 //! peer 認証の拒否イベント行は socket パスを含むため転記しない（永続的な監査ログへの配線は
-//! core 側 #1869 の設計 で未実装。REPAIR-3・SEC-4）。
+//! core 側 #1869 の設計で未実装。REPAIR-3・SEC-4）。
 //! SIGTERM（core 以外の運用者・OS 等から届く。core の終了要求は接続切断）を受けると、次の受信境界で
 //! フレームループを抜け、stderr へ固定の 1 行 JSON（`plugin.shutdown`）を出して `stop_all` で VM を停止してから
 //! 終了する（TASK-115.5・#389。検知は最大 `IDLE_POLL` 1 秒＋`SHUTDOWN_BUDGET` 4 秒）。SIGKILL・猶予超過では

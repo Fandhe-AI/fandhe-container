@@ -27,7 +27,7 @@
 //! 接続経路は peer 認証つき `UdsStream::connect` のみ（TASK-116.4・#395・PLUG-12）。別 UID の listener は
 //! `PERMISSION_DENIED`・終了コード 3 で fail-closed し、`peer_auth_rejections` に件数のみ出す。
 //! 出力は固定文言と列挙名のみで、socket パス・引数値・環境変数値・受信データを含めない。
-//! peer 認証の拒否イベントは件数のみ出す（永続的な監査ログへの配線は #1869 の設計 の 4.7 で未実装。REPAIR-3）。
+//! peer 認証の拒否イベントは件数のみ出す（永続的な監査ログへの配線は #1869 の設計の 4.7 で未実装。REPAIR-3）。
 
 use std::process::ExitCode;
 use std::time::Duration;

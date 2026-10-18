@@ -41,27 +41,26 @@
 //!
 //! # イメージ参照の解除（OCI-7・TASK-183.8.1）
 //!
-//! [`delete_releasing_image_ref`] は、状態の削除より前に
-//! [`ContainerImageRefs::registration`] で確定済みの参照の登録世代を読み、[`delete`] が `Ok` を返したときだけ [`ContainerImageRefs::release_if`] でその世代の
-//! 参照を外す。`StateStore` の状態が残っている（または削除を確かめられない）失敗では呼ばない。
+//! [`delete_releasing_image_ref`] は、[`delete`] が `Ok` を返した後にだけ、
+//! [`ContainerImageRefs::registration`] で確定済みの登録世代を読み、状態が無いことを確かめてから
+//! [`ContainerImageRefs::release_if`] でその世代の参照を外す。`StateStore` の状態が残っている
+//! （または削除を確かめられない）失敗では呼ばない。
 //!
 //! ID だけで外す `release` を使わないのは、状態削除から解除までの間に同じ ID の `create_with_image` が
-//! 参照登録と状態作成を終えうるためである。参照なしのコンテナ（bundle 直指定）には古い参照が無く、
-//! 再登録を阻止しないので、ID での解除は新しいコンテナの参照を消し、使用中のイメージが GC の対象に
-//! なりうる（OCI-7 違反）。世代つきなら、再登録された参照は世代が違うので外れない。
-//! 事前に登録が無い（`None`）コンテナは解除を呼ばない。
+//! 参照登録と状態作成を終えうるためである。世代つきなら、別の世代の参照は外れない。
+//!
+//! 削除前に世代を読んで持ち越す方式は採らない。別の delete が先にそのコンテナを消して同じ ID が再作成
+//! されると、持ち越した世代が今回削除したコンテナのものではなくなり、解除が空振りして参照が残るため
+//! （同 ID の再 create が `AlreadyExists`、イメージも使用中のまま残る）。状態の削除後に読む。
+//! 確定済みの登録は外されるまで同じ ID の他の create が登録できないので、「世代を読む → 状態が無いことを
+//! 確かめる」の順なら、読んだ世代のコンテナの状態は既に無い。読んだ後に状態があれば、並行する create が
+//! 作り直した新しいコンテナなので外さない。
 //!
 //! 参照は create が状態作成の成功直後に [`ContainerImageRefs::bind`] で確定する。照合に状態の revision は
 //! 使わない（start 等の更新で変わり、create 直後の値と一致しなくなって参照が解除されないため。#2265 の指摘）。
 //! 確定していない参照（登録後〜状態作成前に止まった create のもの）は `registration` が返さないので、
-//! 参照なしの既存の状態を並行して delete しても、その create の参照を外さない（外すと状態作成後に
-//! 参照なしのコンテナが残り、使用中のイメージが GC の対象になる。OCI-7）。
-//!
-//! 事前に未確定（`None`）だった場合は、状態の削除後にもう一度 `registration` を読む。読んだ後に並行する
-//! create が `bind` を終え、続く状態の存在確認の後で delete が状態を消すと、create 側は消えたことを検知できず、
-//! delete 側も事前の読みが `None` で外す経路が失われるため（参照が残り、同 ID の再 create が `AlreadyExists`、
-//! イメージも使用中のまま残る）。確定済みの参照は同じ ID の他の create が登録できないので、状態が無い
-//! 状態で読めた確定済みの世代は削除したコンテナのものである。世代つきの `release_if` で外す。
+//! その create の参照を外さない。状態作成後〜確定前に delete が状態を消した場合は、create が確定後に
+//! 状態の不在を検知して自分で外す。
 //!
 //! 登録世代の読み取りや解除の失敗は delete の結果を変えず（状態は消えており、エラーで返すと再実行が
 //! `NotFound` になるため）、操作名 `image_ref_release` で `recorder` に記録する。読み取りに失敗したときは
@@ -273,35 +272,23 @@ pub fn delete_releasing_image_ref(
     refs: &dyn ContainerImageRefs,
     req: &DeleteRequest,
 ) -> Result<DeleteResponse, OciRuntimeError> {
-    // 状態を消す前に、確定済みの参照の世代を読む（モジュール doc「イメージ参照の解除」）。状態が無い・
-    // 読み取りの失敗は delete を止めず、解除しない（安全側。状態の取得の失敗は delete が同じ code で返す）。
-    let generation = store
-        .get(&GetStateRequest::new(req.id().clone()))
-        .ok()
-        .and_then(|_| {
-            let name = OpName::new(IMAGE_REF_LOOKUP_OP_NAME).ok()?;
-            recorder
-                .record_op(&name, || refs.registration(req.id()))
-                .ok()
-        })
-        .flatten();
     let response = delete(store, recorder, cgroups, req)?;
-    // 事前に未確定（None）だった場合、読んだ後に並行する create が bind を終えていると、解除する経路が
-    // 失われる。状態の削除後に登録を読み直し、確定済みで状態が無ければその世代を外す。
-    let generation = generation.or_else(|| {
+    // 状態の削除後に、先に登録世代を読み、そのあとで状態が無いことを確かめる（この順序が要点）。
+    // 確定済みの登録は、外されるまで同じ ID の他の create が登録できないので、状態が無い時点で読んだ
+    // 確定済みの世代は、削除したコンテナ（または既に消えた別のコンテナ）のものである。読んだ後に状態が
+    // 存在するなら、それは並行する create が作り直した新しいコンテナで、外さない（OCI-7）。
+    let generation = (|| {
+        let name = OpName::new(IMAGE_REF_LOOKUP_OP_NAME).ok()?;
+        let generation = recorder
+            .record_op(&name, || refs.registration(req.id()))
+            .ok()
+            .flatten()?;
         let state_gone = matches!(
             store.get(&GetStateRequest::new(req.id().clone())),
             Err(ref e) if e.code() == ErrorCode::NotFound
         );
-        if !state_gone {
-            return None;
-        }
-        let name = OpName::new(IMAGE_REF_LOOKUP_OP_NAME).ok()?;
-        recorder
-            .record_op(&name, || refs.registration(req.id()))
-            .ok()
-            .flatten()
-    });
+        state_gone.then_some(generation)
+    })();
     if let Some(generation) = generation
         && let Ok(name) = OpName::new(IMAGE_REF_RELEASE_OP_NAME)
     {
@@ -1303,9 +1290,8 @@ mod tests {
         result: Result<ImageRefRelease, TraitError>,
         /// `registration` が返す世代（既定は `Some(1)`）。
         generation: Option<ImageRefGeneration>,
-        /// 2 回目以降の `registration` が返す世代（並行する create の bind を模す）。
-        later_generation: Option<ImageRefGeneration>,
-        lookups: Mutex<u32>,
+        /// true なら `registration` の中で同じ ID を作り直す（並行する create の完了を模す）。
+        recreate_on_lookup: bool,
     }
 
     impl<'a> ProbeRefs<'a> {
@@ -1315,12 +1301,11 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 result,
                 generation: Some(ImageRefGeneration::from_raw(1)),
-                later_generation: None,
-                lookups: Mutex::new(0),
+                recreate_on_lookup: false,
             }
         }
-        fn with_later_generation(mut self, generation: ImageRefGeneration) -> Self {
-            self.later_generation = Some(generation);
+        fn with_recreate_on_lookup(mut self) -> Self {
+            self.recreate_on_lookup = true;
             self
         }
         fn with_generation(mut self, generation: Option<ImageRefGeneration>) -> Self {
@@ -1347,10 +1332,16 @@ mod tests {
             &self,
             _id: &ContainerId,
         ) -> Result<Option<ImageRefGeneration>, TraitError> {
-            let mut n = self.lookups.lock().unwrap_or_else(|e| e.into_inner());
-            *n += 1;
-            if *n > 1 && self.later_generation.is_some() {
-                return Ok(self.later_generation);
+            if self.recreate_on_lookup {
+                self.store
+                    .create(
+                        &CreateStateRequest::new(
+                            ContainerStatus::stopped(cid("c1"), Some(0)),
+                            std::env::temp_dir().join("b"),
+                        )
+                        .expect("req"),
+                    )
+                    .expect("recreate");
             }
             Ok(self.generation)
         }
@@ -1365,7 +1356,7 @@ mod tests {
             id: &ContainerId,
             expected: ImageRefGeneration,
         ) -> Result<ImageRefRelease, TraitError> {
-            assert_eq!(Some(expected), self.later_generation.or(self.generation));
+            assert_eq!(Some(expected), self.generation);
             let state_gone = !self.store.has(id.as_str());
             self.calls
                 .lock()
@@ -1445,9 +1436,9 @@ mod tests {
         assert_eq!(refs.calls(), vec![]);
     }
 
-    /// OCI-7: 解除は delete の前に読んだ世代で行う（`release_if` の `expected` 照合は ProbeRefs が assert）。
+    /// OCI-7: 解除は状態削除後に読んだ世代で行う（`release_if` の `expected` 照合は ProbeRefs が assert）。
     #[test]
-    fn oci7_delete_releases_with_generation_read_before_delete() {
+    fn oci7_delete_releases_with_generation_read_after_delete() {
         let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
         let refs = ProbeRefs::new(&store, Ok(ImageRefRelease::Released))
             .with_generation(Some(ImageRefGeneration::from_raw(7)));
@@ -1455,15 +1446,13 @@ mod tests {
         assert_eq!(refs.calls(), vec![(cid("c1"), true)]);
     }
 
-    /// OCI-7: 事前の読みが未確定（None）の間に並行する create が bind を終えた場合、delete は状態削除後に
-    /// 読み直した確定済みの世代を外す（解除経路が失われない）。
+    /// OCI-7: 世代を読んだ後に状態が作り直されていれば（並行する create の完了）、新しいコンテナの参照を外さない。
     #[test]
-    fn oci7_delete_releases_ref_bound_after_pre_read() {
+    fn oci7_delete_does_not_release_when_state_recreated_after_lookup() {
         let store = MemStateStore::with(ContainerStatus::stopped(cid("c1"), Some(0)));
-        let refs = ProbeRefs::new(&store, Ok(ImageRefRelease::Released))
-            .with_generation(None)
-            .with_later_generation(ImageRefGeneration::from_raw(5));
+        let refs = ProbeRefs::new(&store, Ok(ImageRefRelease::Released)).with_recreate_on_lookup();
         run_releasing(&store, &refs, &OpRecorder::new(), "c1").expect("delete");
-        assert_eq!(refs.calls(), vec![(cid("c1"), true)]);
+        assert_eq!(refs.calls(), vec![]);
+        assert!(store.has("c1"));
     }
 }

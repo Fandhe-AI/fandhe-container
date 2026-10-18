@@ -36,6 +36,26 @@ use crate::runtime::v1::ContainerState as CriContainerState;
 /// エラーメッセージとして返す最大バイト数。plugin 由来の untrusted な文字列のため cri 側でも上限を掛ける。
 const STATUS_MESSAGE_MAX_BYTES: usize = 4096;
 
+/// 実行層が報告した生の状態（CRI の外向き状態へ写す前の区別。CRI-2・REPAIR-5）。
+///
+/// CRI の `ContainerCreated` は実行層の Creating と Created を区別しない。しかし作成完了の検査や
+/// 「未起動と確定できるか」の判定では、Creating（作成途中で結果が不確定）を Created と同一視してはならない。
+/// 判定は [`RuntimeContainerStatus::lifecycle`] のこの値で行う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RuntimeLifecycle {
+    /// 作成途中（完了未確定）。
+    Creating,
+    /// 作成完了・未起動。
+    Created,
+    /// 実行中。
+    Running,
+    /// 停止済み。
+    Stopped,
+    /// 未知の状態（将来追加される状態を含む）。
+    Unknown,
+}
+
 /// `ContainerRuntime` の状態照会結果を CRI 側の語彙へ写した値（CRI-2）。
 ///
 /// core の型を cri の公開 API へ漏らさないための型。将来の拡張に備えて `#[non_exhaustive]` とする。
@@ -47,6 +67,8 @@ pub struct RuntimeContainerStatus {
     /// CRI の状態。Creating・Created は `ContainerCreated`、Running は `ContainerRunning`、
     /// Stopped は `ContainerExited`、将来追加される未知の状態は `ContainerUnknown` に写す。
     pub state: CriContainerState,
+    /// 実行層が報告した生の状態。完了・未起動の厳密な判定はこちらで行う（`state` は Creating を Created に写す）。
+    pub lifecycle: RuntimeLifecycle,
     /// init プロセスの PID（判明していれば）。
     pub pid: Option<u32>,
     /// 終了コード（Stopped で判明していれば）。
@@ -55,17 +77,32 @@ pub struct RuntimeContainerStatus {
 
 impl From<&ContainerStatus> for RuntimeContainerStatus {
     fn from(s: &ContainerStatus) -> Self {
-        let state = match s.state() {
-            ContainerState::Creating | ContainerState::Created => {
-                CriContainerState::ContainerCreated
-            }
-            ContainerState::Running => CriContainerState::ContainerRunning,
-            ContainerState::Stopped => CriContainerState::ContainerExited,
-            _ => CriContainerState::ContainerUnknown,
+        let (state, lifecycle) = match s.state() {
+            ContainerState::Creating => (
+                CriContainerState::ContainerCreated,
+                RuntimeLifecycle::Creating,
+            ),
+            ContainerState::Created => (
+                CriContainerState::ContainerCreated,
+                RuntimeLifecycle::Created,
+            ),
+            ContainerState::Running => (
+                CriContainerState::ContainerRunning,
+                RuntimeLifecycle::Running,
+            ),
+            ContainerState::Stopped => (
+                CriContainerState::ContainerExited,
+                RuntimeLifecycle::Stopped,
+            ),
+            _ => (
+                CriContainerState::ContainerUnknown,
+                RuntimeLifecycle::Unknown,
+            ),
         };
         Self {
             id: s.id().as_str().to_owned(),
             state,
+            lifecycle,
             pid: s.pid().map(|p| p.get()),
             exit_code: s.exit_code(),
         }
@@ -267,8 +304,15 @@ mod tests {
                 Some(137),
             ),
         ];
-        for (src, state, pid, code) in cases {
+        let lifecycles = [
+            RuntimeLifecycle::Creating,
+            RuntimeLifecycle::Created,
+            RuntimeLifecycle::Running,
+            RuntimeLifecycle::Stopped,
+        ];
+        for ((src, state, pid, code), lifecycle) in cases.into_iter().zip(lifecycles) {
             let got = RuntimeContainerStatus::from(&src);
+            assert_eq!(got.lifecycle, lifecycle);
             assert_eq!(got.id, "a");
             assert_eq!(got.state, state);
             assert_eq!(got.pid, pid);

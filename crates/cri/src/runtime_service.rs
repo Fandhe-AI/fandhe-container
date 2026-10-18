@@ -91,7 +91,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::codegen::tokio_stream::Empty;
 use tonic::{Request, Response, Status};
 
-use crate::adapter::{BundleProvider, RuntimeAdapter};
+use crate::adapter::{BundleProvider, RuntimeAdapter, RuntimeLifecycle};
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpTimer, NoopCriOpRecorder};
 use crate::runtime::v1::{
     self, ContainerState as CriContainerState, PodSandboxConfig, PodSandboxState,
@@ -401,7 +401,7 @@ fn start_failure_is_definite(
             let adapter = adapter.clone();
             let id = id.to_owned();
             call_with_deadline(timeout, move || adapter.state(&id))
-                .is_some_and(|r| r.is_ok_and(|s| s.state == CriContainerState::ContainerCreated))
+                .is_some_and(|r| r.is_ok_and(|s| s.lifecycle == RuntimeLifecycle::Created))
         }
         other => is_definite_failure(other),
     }
@@ -1049,7 +1049,9 @@ impl CriRuntimeService {
                     return Err(status);
                 }
             };
-            if status.state != CriContainerState::ContainerCreated {
+            // 完了契約: 厳密に Created のときだけ成功とする（Creating は CRI 上 ContainerCreated に写るが、
+            // 作成途中で未完了のため成功にせず、削除を確認できるまで資源を保持する。REPAIR-5・CRI-2）。
+            if status.lifecycle != RuntimeLifecycle::Created {
                 if confirm_removed(&adapter, &id, timeout) {
                     guard.mark_definitely_failed();
                 }
@@ -1151,6 +1153,12 @@ impl CriRuntimeService {
             };
             match status.state {
                 CriContainerState::ContainerRunning => guard.commit(),
+                // Creating は未起動と確定できない（結果不明のまま exited へ倒す）。
+                CriContainerState::ContainerCreated
+                    if status.lifecycle != RuntimeLifecycle::Created =>
+                {
+                    Err(Status::internal("runtime returned an unexpected state"))
+                }
                 // 実行層は created のままと報告した（起動していない）ため、created へ戻してよい。
                 CriContainerState::ContainerCreated => {
                     guard.mark_definitely_failed();

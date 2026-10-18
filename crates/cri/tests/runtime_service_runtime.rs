@@ -43,6 +43,12 @@ struct FakeRuntime {
     delete_ok: AtomicBool,
     /// true のとき state は running を返す（FailedPrecondition が Created 以外でも返る場合の検証用）。
     state_running: AtomicBool,
+    /// true のとき create・start・state は creating を返す（作成途中の応答の検証用）。
+    returns_creating: AtomicBool,
+    /// true のとき start は creating を返す。
+    start_returns_creating: AtomicBool,
+    /// true のとき state は creating を返す。
+    state_creating: AtomicBool,
     /// true の間、delete は保留する（後始末の期限の検証用）。
     hold_delete: AtomicBool,
 }
@@ -68,6 +74,9 @@ impl ContainerRuntime for Shared {
         if let Some(c) = *self.0.fail_create.lock().unwrap() {
             return Err(TraitError::new(c, "create failed"));
         }
+        if self.0.returns_creating.load(Ordering::SeqCst) {
+            return Ok(ContainerStatus::creating(r.id().clone()));
+        }
         if self.0.create_returns_running.load(Ordering::SeqCst) {
             return Ok(ContainerStatus::running(r.id().clone(), None));
         }
@@ -84,6 +93,9 @@ impl ContainerRuntime for Shared {
         }
         if let Some(c) = *self.0.fail_start.lock().unwrap() {
             return Err(TraitError::new(c, "start failed"));
+        }
+        if self.0.start_returns_creating.load(Ordering::SeqCst) {
+            return Ok(ContainerStatus::creating(r.id().clone()));
         }
         if self.0.start_returns_stopped.load(Ordering::SeqCst) {
             return Ok(ContainerStatus::stopped(r.id().clone(), Some(0)));
@@ -117,6 +129,9 @@ impl ContainerRuntime for Shared {
         Err(TraitError::new(ErrorCode::Unimplemented, "not used"))
     }
     fn state(&self, r: &StateRequest) -> Result<ContainerStatus, TraitError> {
+        if self.0.state_creating.load(Ordering::SeqCst) {
+            return Ok(ContainerStatus::creating(r.id().clone()));
+        }
         if self.0.state_running.load(Ordering::SeqCst) {
             return Ok(ContainerStatus::running(r.id().clone(), None));
         }
@@ -951,4 +966,52 @@ async fn task_59_3_without_runtime_stop_still_succeeds() {
     stop_c(&service, &id).await.expect("stop container");
     assert_eq!(status(&service, &id).await.state, S::ContainerExited as i32);
     stop_sb(&service, &sb).await.expect("stop sandbox");
+}
+
+/// CRI-2・REPAIR-5: create が creating を返しても作成完了とは見なさない。CreateContainer は INTERNAL で
+/// 失敗し、Start は実行層へ届かない（資源は削除を確認して解放する）。
+#[tokio::test]
+async fn cri_2_repair_5_create_returning_creating_is_not_complete() {
+    let h = harness();
+    h.runtime.delete_ok.store(true, Ordering::SeqCst);
+    h.runtime.returns_creating.store(true, Ordering::SeqCst);
+    let sb = run_sandbox(&h.service).await;
+    let err = create(&h.service, &sb, "c").await.expect_err("create");
+    assert_eq!(err.code(), Code::Internal);
+    assert_eq!(list_count(&h.service).await, 0);
+    assert!(h.runtime.calls().iter().all(|c| !c.starts_with("start ")));
+}
+
+/// CRI-2・REPAIR-5: start 失敗後の状態照会が creating でも「created のまま」と確定せず、exited にする。
+#[tokio::test]
+async fn cri_2_repair_5_start_failure_with_creating_state_is_not_definite() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    *h.runtime.fail_start.lock().unwrap() = Some(ErrorCode::FailedPrecondition);
+    h.runtime.state_creating.store(true, Ordering::SeqCst);
+    start(&h.service, &id).await.expect_err("start");
+    assert_eq!(
+        status(&h.service, &id).await.state,
+        S::ContainerExited as i32
+    );
+}
+
+/// CRI-2・REPAIR-5: start が creating を返しても created へ戻さず exited にする。
+#[tokio::test]
+async fn cri_2_repair_5_start_returning_creating_marks_exited() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    h.runtime
+        .start_returns_creating
+        .store(true, Ordering::SeqCst);
+    assert_eq!(
+        start(&h.service, &id).await.expect_err("start").code(),
+        Code::Internal
+    );
+    assert_eq!(
+        status(&h.service, &id).await.state,
+        S::ContainerExited as i32
+    );
 }

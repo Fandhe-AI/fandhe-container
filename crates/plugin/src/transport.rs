@@ -47,7 +47,8 @@
 //! # 未実装の範囲（REPAIR-3）
 //!
 //! - 既存パスは bind 前に lstat 検証する（PLUG-12・TASK-123.2）。symlink・他 UID 所有は削除せず
-//!   `PermissionDenied`、生存中の listener や socket 以外は `AlreadyExists`、bind ロックを取得でき管理下の
+//!   `PermissionDenied`、生存中の listener や socket 以外は `AlreadyExists`（原因別の固定文言。記録の無い socket は
+//!   手で削除する。手順は `docs/setup/plugin-socket-recovery.md`。#1859）、bind ロックを取得でき管理下の
 //!   自 UID 所有 stale socket のみ削除して再 bind する（詳細は `uds_security` モジュール doc）
 //! - gRPC（TASK-108）
 //! - 要求 ID と応答 ID の対応づけ・要求→応答の 1 往復ヘルパー（core 側 proxy。TASK-114）
@@ -154,7 +155,8 @@ impl UdsListener {
     ///
     /// 既存エントリがある場合は lstat で検証する（PLUG-12・TASK-123.2）。symlink・他 UID 所有は削除せず
     /// `PermissionDenied`、生存中の listener・socket 以外は `AlreadyExists`、自 UID 所有の stale socket
-    /// （bind ロックを取得でき管理下のもの）のみ削除して再 bind する。
+    /// （bind ロックを取得でき管理下のもの）のみ削除して再 bind する。`AlreadyExists` の文言は原因別で、
+    /// 記録の無い socket は手で削除する（`docs/setup/plugin-socket-recovery.md`。#1859）。
     pub fn bind(path: &Path) -> Result<Self, PluginError> {
         // `..` は bind 時点とそれ以降で解決先が変わりうるため拒否する（`std::path::absolute` は
         // `..` を残す。PLUG-12）。
@@ -501,6 +503,8 @@ fn map_frame_io_error(kind: io::ErrorKind, op: FrameOp) -> PluginError {
 #[cfg_attr(not(unix), allow(dead_code))]
 fn map_bind_error(kind: io::ErrorKind) -> PluginError {
     let (code, message) = match kind {
+        // 実 bind の EADDRINUSE。bind 直前に別経路が同じ名前を作った競合で、`uds_security` の原因別文言
+        // （#1859）とは別の文字列にしてある。
         io::ErrorKind::AddrInUse | io::ErrorKind::AlreadyExists => (
             PluginErrorCode::AlreadyExists,
             "socket path is already in use",
@@ -725,7 +729,8 @@ mod imp {
             };
             // 管理下の証拠として socket の同一性をロックへ記録する。記録できないまま listener を返すと、
             // 異常終了時に記録の無い socket が残り、以後の bind が stale と判定できず `AlreadyExists` に
-            // なるため、記録失敗は bind 失敗として作成した socket を後始末する（TASK-123.2）。
+            // なるため、記録失敗は bind 失敗として作成した socket を後始末する（TASK-123.2）。後始末前に再び
+            // 異常終了した場合の残余は `docs/setup/plugin-socket-recovery.md` の手順で手動削除する（#1859）。
             // identity が無い場合は記録せず、直後の `configure` が拒否する。
             if let Some(ident) = inner.identity.as_ref()
                 && inner.lock.record_socket(ident).is_err()

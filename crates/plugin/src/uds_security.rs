@@ -48,7 +48,12 @@
 //!   fork した子は socket fd と一緒にロック fd も継承するため、子が持つ間は生存中として扱う
 //!   （`BindLock` の doc 参照）。
 //!   残余: bind 成功から記録書き込みまでの間に異常終了すると記録の無い socket が残り、以後は
-//!   `AlreadyExists`（手動削除が必要。fail-closed）。記録した socket が外部で削除され、別経路の socket が
+//!   `AlreadyExists`（手動削除が必要。fail-closed）。この残余は #1321 のオーナー判断（2026-10-12）で
+//!   受容済みで、自動回復（二相化・一時名で bind して rename）は採らない。再検討の条件は、常駐 plugin の
+//!   運用で頻度が問題になったとき。影響が残るのは固定名の常駐 socket だけで、都度起動の一意名
+//!   （`oneshot-<pid>-<連番>.sock`）は次の bind を止めない。`AlreadyExists` の文言は原因別の固定文言
+//!   （ロック保持中・競合・記録の無い socket・socket でないエントリの 4 区分。#1859）で、確認と削除の手順は
+//!   `docs/setup/plugin-socket-recovery.md`。記録した socket が外部で削除され、別経路の socket が
 //!   同じ inode 番号を再利用しても、記録には mtime（秒・ナノ秒）を含めるため一致しない（後から作られた
 //!   socket の mtime は記録時点より新しい）。誤認が残るのは、時計が巻き戻るかタイムスタンプ粒度の
 //!   範囲内で、同一 UID が削除と再作成を行い inode 番号まで一致した場合のみ（0700 ディレクトリ内の
@@ -120,7 +125,8 @@
 //!   `openat(dir, ".")` で開き直した fd を読む）。列挙で得た名前は候補の手掛かりにすぎず、削除の可否は
 //!   候補ごとに fd 基準で判定し直す。
 //! - 残余: bind 成功から記録書き込みまでの間に異常終了した記録なし socket は削除しない（手動削除が必要。
-//!   fail-closed）。常駐モードの `resident-*` は対象外。
+//!   fail-closed。#1321・2026-10-12 の決定で受容。手順は `docs/setup/plugin-socket-recovery.md`）。
+//!   常駐モードの `resident-*` は対象外。
 //!
 //! # `XDG_RUNTIME_DIR` 未設定時のフォールバック（TASK-123.4・#289）
 //! 未設定または空のときだけ、OS・euid ごとに単一の基底を選び、通常経路と同じ検証
@@ -1515,7 +1521,7 @@ mod imp {
     /// 取得した inode がロックファイル名から外れていた場合（保持者が解放時に unlink した）の再試行回数。
     const LOCK_ATTEMPTS: usize = 8;
 
-    /// `name` に対応するロックを取得する。他者が保持中（生存中の listener）は `AlreadyExists`、
+    /// `name` に対応するロックを取得する。他者が保持中（生存中の listener 等）・競合は文言の違う `AlreadyExists`、
     /// symlink・他 UID 所有・通常ファイル以外は `PermissionDenied`（fail-closed）。
     ///
     /// 自分が作成した直後のロックファイルを掃除が先にロックしていた場合は、期限つきで待って取り直す
@@ -1545,9 +1551,12 @@ mod imp {
         for _ in 0..LOCK_ATTEMPTS {
             let handle = match crate::sys::lock_file_at(dir, &lock_name, open) {
                 Ok(h) => h,
-                // 他者が保持中、または open の競合が上限まで続いた。どちらも使用中として扱う。
-                Err(crate::sys::LockError::Held | crate::sys::LockError::OpenContended) => {
-                    return Err(busy());
+                // 他者が保持中と open の競合は、コードは同じ `AlreadyExists` で文言だけ分ける（#1859）。
+                Err(crate::sys::LockError::Held) => {
+                    return Err(busy(BusyReason::LockHeld));
+                }
+                Err(crate::sys::LockError::OpenContended) => {
+                    return Err(busy(BusyReason::Contended));
                 }
                 Err(crate::sys::LockError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {
                     return Err(err(
@@ -1583,8 +1592,8 @@ mod imp {
             }
             return validate_lock(handle, dir, lock_name, euid);
         }
-        // 取得と解放が繰り返し競合した。使用中として扱う（待ち続けない。REPAIR-5）。
-        Err(busy())
+        // 取得と解放が繰り返し競合した。競合として扱う（待ち続けない。REPAIR-5）。
+        Err(busy(BusyReason::Contended))
     }
 
     /// 取得したロックファイルが自 UID 所有の専用ファイルかを確認し、[`BindLock`] にする。
@@ -1648,7 +1657,8 @@ mod imp {
     /// 取得後に呼ばれる。ロックを保持している＝同ロックを使う生存中の listener は存在しないため、
     /// 自 UID 所有の socket のうち「ロックに記録した同一性（dev / ino / mtime）と一致する（管理下の）」
     /// ものだけを削除する。記録が無い・不一致の socket（他実装・旧版・残存ロックだけが根拠の
-    /// もの）は生存中か判別できないため削除せず `AlreadyExists`（fail-closed）。削除は検証済み
+    /// もの）は生存中か判別できないため削除せず、手で削除が要る旨の固定文言の `AlreadyExists`
+    /// （fail-closed。手順は `docs/setup/plugin-socket-recovery.md`。#1859）。削除は検証済み
     /// `dir` fd 基準の `unlinkat` のみ。
     ///
     /// 記録した socket がパス上に無いと確認できた場合（不在・別エントリ・今回削除した）は、戻る前に
@@ -1703,7 +1713,7 @@ mod imp {
                     )),
                 );
             }
-            ExistingEntry::NotSocket => return (false, Err(busy())),
+            ExistingEntry::NotSocket => return (false, Err(busy(BusyReason::NotSocket))),
             ExistingEntry::OwnSocket(i) => i,
         };
         // 管理下の証拠は「ロックファイルの存在」ではなく、ロックに記録した socket の同一性
@@ -1712,13 +1722,13 @@ mod imp {
         // 可能性があるため削除しない（fail-closed）。
         let key = record_key(&first);
         if key.is_none() || lock.recorded() != key {
-            return (false, Err(busy()));
+            return (false, Err(busy(BusyReason::UnrecordedSocket)));
         }
         // 削除直前に同一性を再確認する。
         match lstat_opt(dir, name) {
             Ok(None) => return (false, Ok(())),
             Ok(Some(now)) if now == first => {}
-            Ok(Some(_)) => return (false, Err(busy())),
+            Ok(Some(_)) => return (false, Err(busy(BusyReason::Contended))),
             Err(e) => return (true, Err(e)),
         }
         match crate::sys::unlinkat(dir, name) {
@@ -1734,8 +1744,54 @@ mod imp {
         }
     }
 
-    fn busy() -> PluginError {
-        err(PluginErrorCode::AlreadyExists, "socket path already exists")
+    /// 生存中の listener などがロックを保持している場合の文言。消さずにそのままにする。
+    pub(crate) const BUSY_LOCK_HELD: &str =
+        "socket path is in use: its lock is held by another process";
+    /// 他プロセスの bind / 掃除と競合した場合の文言。消さずに時間をおいて再試行する。
+    pub(crate) const BUSY_CONTENDED: &str =
+        "socket path is being changed by another process; retry later";
+    /// ロックに記録の無い（または一致しない）socket が残っている場合の文言。確認のうえ手で削除する。
+    pub(crate) const BUSY_UNRECORDED_SOCKET: &str = "socket path has a socket without a matching lock record; confirm no listener is running and remove it manually";
+    /// socket 以外のエントリが占有している場合の文言。中身を確かめて手で削除する。
+    pub(crate) const BUSY_NOT_SOCKET: &str = "socket path is occupied by an entry that is not a socket; inspect it and remove it manually";
+
+    /// `AlreadyExists` の原因の区分（#1859・PLUG-12）。利用者の次の行動（そのまま・再試行・手動削除）で分ける。
+    /// 文言は固定で、パス・UID・plugin 由来の値を含めない（情報の出し過ぎを防ぐ）。呼び出し側が機械的に
+    /// 見分ける必要は今は無い（`sweep_one` はコードで判定する）ため非公開。手順は
+    /// `docs/setup/plugin-socket-recovery.md`。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BusyReason {
+        /// ロックを他者が保持している。
+        LockHeld,
+        /// open / 再確認の競合が続いた、または別エントリに変わった。
+        Contended,
+        /// 記録の無い・一致しない socket。
+        UnrecordedSocket,
+        /// socket でないエントリ。
+        NotSocket,
+    }
+
+    impl BusyReason {
+        #[cfg(test)]
+        const ALL: [Self; 4] = [
+            Self::LockHeld,
+            Self::Contended,
+            Self::UnrecordedSocket,
+            Self::NotSocket,
+        ];
+
+        fn message(self) -> &'static str {
+            match self {
+                Self::LockHeld => BUSY_LOCK_HELD,
+                Self::Contended => BUSY_CONTENDED,
+                Self::UnrecordedSocket => BUSY_UNRECORDED_SOCKET,
+                Self::NotSocket => BUSY_NOT_SOCKET,
+            }
+        }
+    }
+
+    fn busy(reason: BusyReason) -> PluginError {
+        err(PluginErrorCode::AlreadyExists, reason.message())
     }
 
     #[cfg(test)]
@@ -2159,6 +2215,78 @@ mod imp {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
+        }
+
+        /// PLUG-12・#1859: `AlreadyExists` の 4 文言は固定で互いに異なり、パス・UID を含まない。
+        #[test]
+        fn plug12_busy_messages_are_fixed_and_distinct() {
+            assert_eq!(
+                BUSY_LOCK_HELD,
+                "socket path is in use: its lock is held by another process"
+            );
+            assert_eq!(
+                BUSY_CONTENDED,
+                "socket path is being changed by another process; retry later"
+            );
+            assert_eq!(
+                BUSY_UNRECORDED_SOCKET,
+                "socket path has a socket without a matching lock record; confirm no listener is running and remove it manually"
+            );
+            assert_eq!(
+                BUSY_NOT_SOCKET,
+                "socket path is occupied by an entry that is not a socket; inspect it and remove it manually"
+            );
+            for (i, r) in BusyReason::ALL.into_iter().enumerate() {
+                let e = busy(r);
+                assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+                assert_eq!(e.message(), r.message());
+                let m = r.message();
+                assert!(m.is_ascii());
+                assert!(
+                    !m.chars()
+                        .any(|c| c == '/' || c.is_ascii_digit() || c.is_control()),
+                    "{m}"
+                );
+                assert_ne!(m, "socket path is already in use");
+                for other in &BusyReason::ALL[i + 1..] {
+                    assert_ne!(m, other.message());
+                }
+            }
+        }
+
+        /// PLUG-12・#1859: 他者が保持中のロックは `LockHeld` の文言で拒否される。
+        #[test]
+        fn plug12_held_lock_reports_lock_held_message() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = File::open(&t.0).unwrap();
+            let name = c"s.sock";
+            let _held = acquire_bind_lock(&dir, name, euid).unwrap();
+            let e = acquire_bind_lock(&dir, name, euid).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+            assert_eq!(
+                e.message(),
+                "socket path is in use: its lock is held by another process"
+            );
+        }
+
+        /// PLUG-12・#1859: socket 以外のエントリは削除せず `NotSocket` の文言で拒否される。
+        #[test]
+        fn plug12_clear_stale_socket_rejects_regular_file_as_not_socket() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = File::open(&t.0).unwrap();
+            let name = c"s.sock";
+            let file = t.0.join("s.sock");
+            std::fs::write(&file, b"keep").unwrap();
+            let lock = acquire_bind_lock(&dir, name, euid).unwrap();
+            let e = clear_stale_socket(&dir, name, euid, &lock).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+            assert_eq!(
+                e.message(),
+                "socket path is occupied by an entry that is not a socket; inspect it and remove it manually"
+            );
+            assert_eq!(std::fs::read(&file).unwrap(), b"keep");
         }
 
         /// PLUG-12（#1310）: bind 側がロックファイルを作成（`O_EXCL`）してから `flock` を取るまでの間に、

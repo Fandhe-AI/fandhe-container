@@ -10,7 +10,8 @@
 //!   `run_pre_pivot` が `readonly_paths` を常に走らせる）→ 子をタイムアウト付きで待つ（REPAIR-5）。
 //! - 子（pivot 後。新しい PID namespace の PID 1）: 観測値を pipe へ `key=value` の行で書く。
 //!   `/proc/self/mountinfo` の対象 6 件のマウントポイントの `ro`、書き込み用 `open(2)` の errno（1 バイトも書かない）、
-//!   読み取りが従来どおり成功すること。
+//!   読み取りが従来どおり成功すること。あわせて、各マウントポイントの「見えている（最上位の）マウント」が実 procfs の上に
+//!   載っていること（#2005）を構造化して判定し、違反を `stack_violations=N` で出す。
 //! - 親は、子の終了後に観測値を具体値で照合し、ホスト側 rootfs に副作用が無い（フィクスチャの内容・モード不変、
 //!   `proc` が空）ことを確かめる。
 //!
@@ -21,6 +22,18 @@
 //! - rootless の `/proc` 配下: 対象はホストの root 所有で、読み取り専用マウントの検査より先にパーミッション検査で
 //!   `EACCES`（13）になる可能性が高い。`EROFS` か `EACCES` のどちらかであることを要求し、観測値を出力する
 //!   （mountinfo の `ro` が主な保証。判定は弱めず、実機結果で期待を確定する）
+//!
+//! - `/proc` の最上位のマウントは fstype `proc`。存在する `/proc/*` の対象は、最上位のマウントが `ro` で、fstype が
+//!   `proc` で、親が `/proc` の最上位のマウントであること。保護の後に `/proc` へ新しい procfs が載ると、隠れた古い
+//!   `/proc/sys` の行は `ro` のまま残るが、親が最上位の procfs と食い違うため検出できる（#2005・SEC-2。pivot 前に
+//!   procfs をマウントし、保護をその上に載せる順序は `run_pre_pivot` で固定）
+//! - `/sys` は最上位のマウントが `ro`。sysfs の供給（TASK-127）はまだ無く、`/sys` は rootfs 上のディレクトリのため
+//!   fstype は `sysfs` ではない（観測値として出力のみ。供給後にこの期待を見直す）。この期待は `/sys` 配下に tmpfs を
+//!   載せない構成に限る
+//!
+//! # 判定ロジックの自己照合（REPAIR-12）
+//! mountinfo の積み方の判定（`stacking_violations`）は特権なしの純関数で、合成 fixture による自己照合を `--ignored`
+//! 指定の有無にかかわらず毎回実行する（CI の `cargo test --workspace` で走る）。
 //!
 //! # 実機前提テストとしての分離
 //! Linux 5.12 以降（`mount_setattr`）で、root もしくは非特権 user namespace を許可するホストが必要。GitHub ホステッド
@@ -34,6 +47,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn main() {
+    linux::self_check();
     if std::env::args().any(|a| a == "--ignored") {
         linux::run();
     } else {
@@ -113,6 +127,103 @@ mod linux {
         }
     }
 
+    /// mountinfo の 1 行（判定に使う欄のみ）。
+    struct Mnt {
+        id: u32,
+        parent: u32,
+        mountpoint: String,
+        opts: Vec<String>,
+        fstype: String,
+    }
+
+    /// mountinfo を解析する。カーネル応答（外部入力）として `get()` で扱い、壊れた行は `Err`（fail-closed）。
+    fn parse_mountinfo(text: &str) -> Result<Vec<Mnt>, String> {
+        text.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                let bad = || format!("malformed mountinfo line: {l}");
+                let f: Vec<&str> = l.split(' ').collect();
+                let dash = f.iter().position(|x| *x == "-").ok_or_else(bad)?;
+                Ok(Mnt {
+                    id: f.first().and_then(|x| x.parse().ok()).ok_or_else(bad)?,
+                    parent: f.get(1).and_then(|x| x.parse().ok()).ok_or_else(bad)?,
+                    mountpoint: f.get(4).ok_or_else(bad)?.to_string(),
+                    opts: f
+                        .get(5)
+                        .ok_or_else(bad)?
+                        .split(',')
+                        .map(str::to_string)
+                        .collect(),
+                    fstype: f.get(dash + 1).ok_or_else(bad)?.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    /// `mountpoint` で見えている（最上位の）マウント。同じマウントポイントの他の行から親 ID として参照されて
+    /// いない行で、行の順序には頼らない。
+    fn top_mount<'a>(mnts: &'a [Mnt], mountpoint: &str) -> Option<&'a Mnt> {
+        mnts.iter()
+            .filter(|m| m.mountpoint == mountpoint)
+            .find(|m| {
+                !mnts
+                    .iter()
+                    .any(|o| o.mountpoint == mountpoint && o.parent == m.id)
+            })
+    }
+
+    /// 保護（読み取り専用化）が見えている procfs の上に載っているかの違反一覧（空なら合格）。
+    /// 壊れた mountinfo は `Err`。
+    fn stacking_violations(mountinfo: &str, targets: &[&str]) -> Result<Vec<String>, String> {
+        let mnts = parse_mountinfo(mountinfo)?;
+        let mut v = Vec::new();
+        let proc_top = top_mount(&mnts, "/proc");
+        if proc_top.is_none_or(|p| p.fstype != "proc") {
+            v.push("the top mount of /proc is not procfs".to_string());
+        }
+        for t in targets {
+            let Some(m) = top_mount(&mnts, t) else {
+                if *t == READONLY_SYS_PATH {
+                    v.push(format!("{t} has no mount"));
+                }
+                continue;
+            };
+            if !m.opts.iter().any(|o| o == "ro") {
+                v.push(format!("the top mount of {t} is not read-only"));
+            }
+            if t.starts_with("/proc/") {
+                if m.fstype != "proc" {
+                    v.push(format!("the top mount of {t} is not procfs"));
+                }
+                if proc_top.map(|p| p.id) != Some(m.parent) {
+                    v.push(format!("{t} is hidden or not on the top procfs"));
+                }
+            }
+        }
+        Ok(v)
+    }
+
+    /// `stacking_violations` の合成 fixture による自己照合（特権不要。毎回実行する）。
+    pub fn self_check() {
+        let t = ["/proc/sys", "/sys"];
+        let good = "10 1 0:5 / /proc rw - proc proc rw\n\
+                    11 10 0:5 /sys /proc/sys ro,nosuid - proc proc rw\n\
+                    12 1 0:6 /sys /sys ro - ext4 /dev/x rw\n";
+        assert_eq!(stacking_violations(good, &t), Ok(vec![]));
+        // 保護の後に新しい procfs が `/proc` へ載り、古い `/proc/sys` の `ro` 行が隠れた。
+        let hidden = format!("{good}13 10 0:7 / /proc rw - proc proc rw\n");
+        let v = stacking_violations(&hidden, &t).expect("parse");
+        assert_eq!(v, vec!["/proc/sys is hidden or not on the top procfs"]);
+        let rw = good.replace("ro,nosuid", "rw,nosuid");
+        let v = stacking_violations(&rw, &t).expect("parse");
+        assert_eq!(v, vec!["the top mount of /proc/sys is not read-only"]);
+        let not_proc = good.replace("nosuid - proc proc rw\n12", "nosuid - tmpfs x rw\n12");
+        let v = stacking_violations(&not_proc, &t).expect("parse");
+        assert_eq!(v, vec!["the top mount of /proc/sys is not procfs"]);
+        assert!(stacking_violations("10 1 0:5 / /proc rw\n", &t).is_err());
+        println!("readonly_paths: mountinfo stacking self-check passed");
+    }
+
     /// 子（コンテナ内）の観測。結果は `writer` へ 1 行ずつ書く。
     fn observe(mut writer: std::io::PipeWriter) {
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
@@ -128,6 +239,19 @@ mod linux {
             writeln!(writer, "exists:{t}={exists}").expect("write");
             writeln!(writer, "mount_ro:{t}={ro:?}").expect("write");
         }
+        let violations = stacking_violations(&mountinfo, &targets)
+            .unwrap_or_else(|e| vec![format!("malformed: {e}")]);
+        writeln!(writer, "stack_violations={}", violations.len()).expect("write");
+        for (i, msg) in violations.iter().enumerate() {
+            writeln!(writer, "stack_violation:{i}={msg}").expect("write");
+        }
+        let fstype_of = |mp: &str| {
+            parse_mountinfo(&mountinfo)
+                .ok()
+                .and_then(|m| top_mount(&m, mp).map(|t| t.fstype.clone()))
+        };
+        writeln!(writer, "top_fstype:/proc={:?}", fstype_of("/proc")).expect("write");
+        writeln!(writer, "top_fstype:/sys={:?}", fstype_of("/sys")).expect("write");
         let fixture = format!("/{}", FIXTURE_REL.join("/"));
         for p in [
             "/proc/sys/kernel/core_pattern",
@@ -215,6 +339,21 @@ mod linux {
         // `/sys` と、この環境に実在する `/proc` 配下の対象の件数（最低でも `/sys` + `/proc/sys`）。
         assert!(verified >= 2, "too few read-only targets: {verified}");
         println!("readonly_paths: observed {verified} read-only mount point(s)");
+        assert_eq!(
+            lookup(text, "stack_violations"),
+            "0",
+            "protections must sit on the visible procfs:\n{text}"
+        );
+        assert_eq!(
+            lookup(text, "top_fstype:/proc"),
+            "Some(\"proc\")",
+            "the visible /proc must be procfs"
+        );
+        println!(
+            "readonly_paths: top mounts verified (/proc fstype {}, /sys fstype {})",
+            lookup(text, "top_fstype:/proc"),
+            lookup(text, "top_fstype:/sys")
+        );
 
         assert_eq!(
             lookup(text, "read_ok:/proc/sys/kernel/hostname"),

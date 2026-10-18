@@ -1166,7 +1166,7 @@ pub struct ExecReapplyObservation {
     pub seccomp_after: String,
     /// 試行後の `NoNewPrivs:` 値（適用に成功すれば `1`）。
     pub no_new_privs_after: String,
-    /// 適用前の `kcmp(自 pid, 自 pid, KCMP_VM)`（対照。通常は成功し `None`）。
+    /// 適用前の `kcmp(自 pid, 自 pid, KCMP_VM)`（対照。通常は成功し `None`。外側の seccomp が `kcmp` を拒否する環境では `EPERM` になり対照として働かないため、試験は前提欠如として失敗させる。ESC-06・#2006）。
     pub kcmp_before: Option<i32>,
     /// 適用後の `kcmp`（`ERRNO(EPERM)` の禁止 syscall のため `EPERM`）。適用に失敗した場合は `None`。
     ///

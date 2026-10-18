@@ -33,7 +33,9 @@
 //! 保存されるのは `stderr_sink` を通る構造化ログだけ。次は fd 2 へ直接書かれ、CLI 起動では null、ランチャー経由では
 //! 呼び出し元の fd 2 を継承する: core の `writeln!(stderr)`（`rootless`・`exec/process`）・監査 sink の stderr
 //! フォールバック・panic のメッセージ。core の `exec::diagnostic::emit_diagnostic_line`（`legacy_tiocsti` の警告）は
-//! fd 2 が AF_UNIX のソケットのときだけ書くため、保存先には届かない（届け方は #2008 で決める）。
+//! fd 2 が AF_UNIX のソケットのときだけ書くため、保存先には届かない。
+//! `legacy_tiocsti` の警告は #2008 の決定で、start の成功後に supervisor が自分で観測し（`start_entry`）、
+//! `stderr_sink` 経由で本ログへ 1 行残す（core の fd 2 経路は AF_UNIX の socket のときだけ届き、その構成では重複する）。
 //!
 //! 呼び出し元: `start_entry::run_main_inner`（open と差し込み）・CLI の `delete`（[`remove`]）。
 

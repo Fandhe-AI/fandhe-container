@@ -1129,6 +1129,10 @@ fn spawn_error(e: &io::Error) -> PluginError {
 /// `audit` は受付で拒否した接続（UID・pid の不一致・取得失敗）の監査イベントの受け手で、拒否 1 件に
 /// つき 1 回、同期で呼ばれる（PLUG-12・SEC-4・TASK-124.5）。必須で、既定の出力先は無い（出力・永続化は
 /// 呼び出し側の責務。`crate::audit` のモジュール doc）。
+/// 別 UID・別 pid の接続は切断して子の接続を待ち続けるが、その拒否が合算で
+/// [`crate::transport::UDS_ACCEPT_PEER_REJECTION_LIMIT`] 件を超えると `PermissionDenied` で失敗する
+/// （UID・pid の取得失敗は即エラー。#1861）。peer 認証による拒否かどうかは、返るエラーのコードでなく
+/// `audit` に渡る `PeerAuthRejectReason` で判別する。
 pub fn call_once(
     plugin: &OneShotPlugin,
     request: &Frame,

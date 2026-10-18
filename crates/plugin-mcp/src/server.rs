@@ -18,9 +18,9 @@
 //! [`crate::backend::ToolBackend`] へ委ねる。引数の不正は `-32602`（`data.code = INVALID_ARGUMENT`）、
 //! バックエンドの業務エラーは result の `isError: true` に固定文言の `{code, message}` を載せる。
 //!
-//! 未実装・簡易実装（REPAIR-3）: エラー応答の生成は `error_outcome` / `tool_error_result` の仮実装で、
-//! エラー型は `crate::error` に定義済み（#469）で、ここへの結線は TASK-120.2（#470）。`start_container` の
-//! 本番起動は未実装（`crate::backend` の doc を参照。#1718）。
+//! エラー応答は `crate::error` の `ProtocolError` / `ToolError` で組み立てる（MCP-4・ERR-5・TASK-120.2）。
+//!
+//! 未実装・簡易実装（REPAIR-3）: `start_container` の本番起動は未実装（`crate::backend` の doc を参照。#1718）。
 //! UDS 経由の疎通と peer 認証（PLUG-12）は `crate::uds`（TASK-118.4・#467）が持つ。
 
 use std::io::{self, BufRead, Write};
@@ -30,10 +30,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::backend::{CoreBackend, ToolBackend, UnavailableBackend};
-use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
+use crate::error::{ProtocolError, ToolError};
+use fandhe_container_core::traits::{ContainerId, TraitError};
 
 /// 本サーバーが応答する MCP のプロトコル版（MCP-1）。
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -54,12 +55,6 @@ pub const DIAG_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// ログ用キューの深さ。満杯なら新しい行を捨てる（要求処理を止めない）。
 const LOG_QUEUE_DEPTH: usize = 64;
-
-const PARSE_ERROR: i64 = -32700;
-const INVALID_REQUEST: i64 = -32600;
-const METHOD_NOT_FOUND: i64 = -32601;
-const INVALID_PARAMS: i64 = -32602;
-const INTERNAL_ERROR: i64 = -32603;
 
 /// [`serve_with`] の上限・期限。
 #[derive(Debug, Clone, Copy)]
@@ -150,11 +145,12 @@ impl Outcome {
         }
     }
 
-    fn err(op: &'static str, reply: Value, code: i64) -> Self {
+    /// プロトコルエラー応答。応答本文とログ用コードを同じ `ProtocolError` から導く（ERR-5）。
+    fn err(op: &'static str, id: Value, e: ProtocolError) -> Self {
         Self {
-            reply: Some(reply),
+            reply: Some(e.to_response(id)),
             op,
-            error_code: Some(code),
+            error_code: Some(e.rpc_code().code()),
             tool: None,
             tool_error: None,
         }
@@ -223,33 +219,11 @@ fn tool_definitions() -> Vec<Tool> {
     ]
 }
 
-/// 仮のエラー応答生成（REPAIR-3）。エラー型は `crate::error` に定義済み（#469）。結線は #470。
-/// `message` は固定の英文のみを渡し、入力値を反射させない。
-fn error_outcome(
-    op: &'static str,
-    id: Value,
-    code: i64,
-    message: &str,
-    data_code: Option<&str>,
-) -> Outcome {
-    let mut error = Map::new();
-    error.insert("code".into(), json!(code));
-    error.insert("message".into(), json!(message));
-    if let Some(c) = data_code {
-        error.insert("data".into(), json!({"code": c}));
-    }
-    Outcome::err(
-        op,
-        json!({"jsonrpc": "2.0", "id": id, "error": error}),
-        code,
-    )
-}
-
 /// 成功応答を組み立てる。result の変換に失敗したら内部エラー応答にする。
 fn success(op: &'static str, id: Value, result: impl Serialize) -> Outcome {
     match serde_json::to_value(result) {
         Ok(result) => Outcome::ok(op, json!({"jsonrpc": "2.0", "id": id, "result": result})),
-        Err(_) => error_outcome(op, id, INTERNAL_ERROR, "Internal error", None),
+        Err(_) => Outcome::err(op, id, ProtocolError::Internal),
     }
 }
 
@@ -292,26 +266,14 @@ pub fn handle_message(line: &[u8]) -> Outcome {
 /// [`handle_message`] のバックエンド指定版。`tools/call` の実行を `backend` へ委ねる（MCP-2）。
 pub fn handle_message_with(line: &[u8], backend: &dyn ToolBackend) -> Outcome {
     if line.len() > MAX_LINE_BYTES {
-        return error_outcome(
-            "other",
-            Value::Null,
-            INVALID_REQUEST,
-            "Invalid Request",
-            None,
-        );
+        return Outcome::err("other", Value::Null, ProtocolError::InvalidRequest);
     }
     let Ok(value) = serde_json::from_slice::<Value>(line) else {
-        return error_outcome("other", Value::Null, PARSE_ERROR, "Parse error", None);
+        return Outcome::err("other", Value::Null, ProtocolError::Parse);
     };
     // 2025-06-18 は JSON-RPC のバッチを廃止している。配列もここで拒否する。
     let Some(obj) = value.as_object() else {
-        return error_outcome(
-            "other",
-            Value::Null,
-            INVALID_REQUEST,
-            "Invalid Request",
-            None,
-        );
+        return Outcome::err("other", Value::Null, ProtocolError::InvalidRequest);
     };
 
     let op = obj
@@ -324,12 +286,10 @@ pub fn handle_message_with(line: &[u8], backend: &dyn ToolBackend) -> Outcome {
         .filter(|v| v.is_string() || v.is_i64() || v.is_u64())
         .cloned();
     let invalid = || {
-        error_outcome(
+        Outcome::err(
             op,
             valid_id.clone().unwrap_or(Value::Null),
-            INVALID_REQUEST,
-            "Invalid Request",
-            None,
+            ProtocolError::InvalidRequest,
         )
     };
 
@@ -356,13 +316,13 @@ pub fn handle_message_with(line: &[u8], backend: &dyn ToolBackend) -> Outcome {
         .get("params")
         .is_none_or(|p| p.is_object() || p.is_array());
     if !params_type_ok && matches!(method, "initialize" | "tools/list" | "tools/call" | "ping") {
-        return error_outcome(op, id, INVALID_PARAMS, "Invalid params", None);
+        return Outcome::err(op, id, ProtocolError::InvalidArguments);
     }
 
     match method {
         "initialize" => {
             if !initialize_params_valid(obj.get("params")) {
-                return error_outcome(op, id, INVALID_PARAMS, "Invalid params", None);
+                return Outcome::err(op, id, ProtocolError::InvalidArguments);
             }
             success(
                 op,
@@ -390,58 +350,33 @@ pub fn handle_message_with(line: &[u8], backend: &dyn ToolBackend) -> Outcome {
         ),
         "ping" => success(op, id, json!({})),
         "tools/call" => tools_call(id, obj.get("params"), backend),
-        _ => error_outcome(op, id, METHOD_NOT_FOUND, "Method not found", None),
+        _ => Outcome::err(op, id, ProtocolError::MethodNotFound),
     }
 }
 
-/// 引数不正（`-32602`）の応答。`message` は固定文言で、ツール名・ID を反射させない。
+/// 引数不正（`-32602`・`data.code = INVALID_ARGUMENT`）の応答。固定文言のみで、ツール名・ID を反射させない。
 fn invalid_arguments(id: Value) -> Outcome {
-    error_outcome(
-        "tools/call",
-        id,
-        INVALID_PARAMS,
-        "Invalid params",
-        Some("INVALID_ARGUMENT"),
-    )
+    Outcome::err("tools/call", id, ProtocolError::InvalidArguments)
 }
 
-/// バックエンドの業務エラー分類ごとの固定文言（ERR-1）。core の `TraitError::message` はパス等を含み得るため
-/// 出力へ流さない。仮実装（REPAIR-3）: エラー型は `crate::error` に定義済み（#469）。結線は #470。
-fn tool_error_message(code: ErrorCode) -> &'static str {
-    match code {
-        ErrorCode::InvalidArgument => "Invalid argument",
-        ErrorCode::NotFound => "Container not found",
-        ErrorCode::AlreadyExists => "Already exists",
-        ErrorCode::FailedPrecondition => "Operation not allowed in the current state",
-        ErrorCode::Unimplemented => "Not implemented",
-        ErrorCode::PermissionDenied => "Permission denied",
-        ErrorCode::Timeout => "Operation timed out",
-        ErrorCode::Unavailable => "Backend unavailable",
-        _ => "Internal error",
-    }
-}
-
-/// 業務エラーの `tools/call` result（`isError: true`）。仮実装（REPAIR-3。`crate::error` への結線は #470）。
+/// 業務エラーの `tools/call` result（`isError: true`）。`crate::error::ToolError` で組み立て（MCP-4・ERR-5）、
+/// `TraitError::message`（パス等を含み得る）は出力へ流さない。
 fn tool_error_result(tool: &'static str, id: Value, err: &TraitError) -> Outcome {
-    let code = err.code();
-    let body = json!({"code": code.as_str(), "message": tool_error_message(code)});
-    let result = json!({
-        "content": [{"type": "text", "text": body.to_string()}],
-        "isError": true,
-    });
+    let te = ToolError::from_trait_error(err);
+    let result = te.to_call_result();
     let mut out = Outcome::ok(
         "tools/call",
         json!({"jsonrpc": "2.0", "id": id, "result": result}),
     );
     out.tool = Some(tool);
-    out.tool_error = Some(code.as_str());
+    out.tool_error = Some(te.code_str());
     out
 }
 
 /// ツール成功の `tools/call` result。`structuredContent` と同内容の JSON 文字列を `content` にも載せる（2025-06-18）。
 fn tool_success_result(tool: &'static str, id: Value, structured: impl Serialize) -> Outcome {
     let Ok(structured) = serde_json::to_value(structured) else {
-        return error_outcome("tools/call", id, INTERNAL_ERROR, "Internal error", None);
+        return Outcome::err("tools/call", id, ProtocolError::Internal);
     };
     let result = json!({
         "content": [{"type": "text", "text": structured.to_string()}],
@@ -489,7 +424,7 @@ fn tools_call(id: Value, params: Option<&Value>, backend: &dyn ToolBackend) -> O
                 Err(e) => tool_error_result("start_container", id, &e),
             }
         }
-        _ => invalid_arguments(id),
+        _ => Outcome::err("tools/call", id, ProtocolError::UnknownTool),
     }
 }
 
@@ -618,12 +553,10 @@ pub(crate) fn log_transport(log: &mut dyn FnMut(&str), code: &str) {
 /// 上限超過は `-32600` にする（MCP-1。入力内容は応答へ反射させない）。
 pub(crate) fn process_line(line: Line, backend: &dyn ToolBackend) -> Option<Outcome> {
     match line {
-        Line::Overflow => Some(error_outcome(
+        Line::Overflow => Some(Outcome::err(
             "other",
             Value::Null,
-            INVALID_REQUEST,
-            "Invalid Request",
-            None,
+            ProtocolError::InvalidRequest,
         )),
         Line::Data(mut data) => {
             if data.last() == Some(&b'\r') {
@@ -842,6 +775,7 @@ where
 mod tests {
     use super::*;
     use crate::backend::{ContainerList, ContainerSummary, StartedSummary};
+    use fandhe_container_core::traits::ErrorCode;
     use std::io::Cursor;
     use std::sync::{Arc, Mutex};
 
@@ -934,7 +868,7 @@ mod tests {
             let v = call(case).unwrap();
             assert_eq!(
                 v,
-                json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid params"}}),
+                json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Invalid params","data":{"code":"INVALID_ARGUMENT"}}}),
                 "case: {case}"
             );
         }
@@ -950,7 +884,7 @@ mod tests {
                 let v = call(&line).unwrap();
                 assert_eq!(
                     v,
-                    json!({"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Invalid params"}}),
+                    json!({"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"Invalid params","data":{"code":"INVALID_ARGUMENT"}}}),
                     "case: {line}"
                 );
             }
@@ -1001,7 +935,7 @@ mod tests {
         let v = call(r#"{"jsonrpc":"2.0","id":3,"method":"foo/bar"}"#).unwrap();
         assert_eq!(
             v,
-            json!({"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found"}})
+            json!({"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found","data":{"code":"UNIMPLEMENTED"}}})
         );
     }
 
@@ -1203,12 +1137,108 @@ mod tests {
         assert_eq!(v, json!({"jsonrpc":"2.0","id":5,"result":{}}));
     }
 
+    const ERR5_INVALID_PARAMS: &str = r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32602,"message":"Invalid params","data":{"code":"INVALID_ARGUMENT"}}}"#;
+
+    /// MCP-4・ERR-5: 未定義ツール名の `tools/call` は -32602 + `data.code = INVALID_ARGUMENT`（完全一致）。
+    #[test]
+    fn mcp4_err5_tools_call_unknown_tool_returns_error_object() {
+        let o = handle_message_with(
+            tools_call_req(r#"{"name":"zzSECRETzz"}"#).as_bytes(),
+            &fake_ok(),
+        );
+        let expected: Value = serde_json::from_str(ERR5_INVALID_PARAMS).unwrap();
+        assert_eq!(o.reply.as_ref().unwrap(), &expected);
+        assert_eq!(o.error_code, Some(-32602));
+        assert_eq!(o.tool, None);
+        assert_eq!(o.tool_error, None);
+        assert!(!o.reply.unwrap().to_string().contains("zzSECRETzz"));
+    }
+
+    /// MCP-4・ERR-5: 引数不正の `tools/call` は未知ツールと同じ ERR-5 のエラーオブジェクトを返す。
+    #[test]
+    fn mcp4_err5_tools_call_invalid_arguments_return_error_object() {
+        let expected: Value = serde_json::from_str(ERR5_INVALID_PARAMS).unwrap();
+        let long_id = "a".repeat(256);
+        let cases = [
+            "[]".to_owned(),
+            "{}".to_owned(),
+            r#"{"name":1}"#.to_owned(),
+            r#"{"name":"list_containers","arguments":[]}"#.to_owned(),
+            r#"{"name":"start_container"}"#.to_owned(),
+            r#"{"name":"start_container","arguments":{}}"#.to_owned(),
+            r#"{"name":"start_container","arguments":{"container_id":1}}"#.to_owned(),
+            r#"{"name":"start_container","arguments":{"container_id":"a/b"}}"#.to_owned(),
+            format!(r#"{{"name":"start_container","arguments":{{"container_id":"{long_id}"}}}}"#),
+        ];
+        for params in cases {
+            let o = handle_message_with(tools_call_req(&params).as_bytes(), &fake_ok());
+            assert_eq!(o.reply.as_ref().unwrap(), &expected, "params: {params}");
+            assert_eq!(o.error_code, Some(-32602), "params: {params}");
+        }
+        let o = handle_message_with(
+            br#"{"jsonrpc":"2.0","id":4,"method":"tools/call"}"#,
+            &fake_ok(),
+        );
+        assert_eq!(o.reply.as_ref().unwrap(), &expected);
+    }
+
+    /// MCP-4・ERR-5: 全てのプロトコルエラーが `ProtocolError` の対応表どおりの `error` を返す。
+    #[test]
+    fn mcp4_err5_protocol_errors_carry_data_code() {
+        let big = vec![b'x'; MAX_LINE_BYTES + 1];
+        let cases: Vec<(Outcome, ProtocolError)> = vec![
+            (handle_message(&big), ProtocolError::InvalidRequest),
+            (
+                process_line(Line::Overflow, &UnavailableBackend).unwrap(),
+                ProtocolError::InvalidRequest,
+            ),
+            (handle_message(b"{not json"), ProtocolError::Parse),
+            (handle_message(b"[]"), ProtocolError::InvalidRequest),
+            (
+                handle_message(br#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#),
+                ProtocolError::InvalidRequest,
+            ),
+            (
+                handle_message(br#"{"jsonrpc":"2.0","id":1,"method":"foo"}"#),
+                ProtocolError::MethodNotFound,
+            ),
+        ];
+        for (o, e) in cases {
+            let reply = o.reply.unwrap();
+            assert_eq!(reply["error"], e.to_error_object());
+            assert_eq!(o.error_code, Some(e.rpc_code().code()));
+        }
+    }
+
+    /// MCP-4・ERR-5: 業務エラーは `ToolError` と同一の result（`isError: true`）で、error キーを持たない。
+    #[test]
+    fn mcp4_err5_business_error_matches_tool_error_result() {
+        for (code, name) in [
+            (ErrorCode::AlreadyExists, "ALREADY_EXISTS"),
+            (ErrorCode::PermissionDenied, "PERMISSION_DENIED"),
+            (ErrorCode::Unavailable, "UNAVAILABLE"),
+            (ErrorCode::Internal, "INTERNAL"),
+            (ErrorCode::InvalidArgument, "INVALID_ARGUMENT"),
+        ] {
+            let o = handle_message_with(
+                tools_call_req(r#"{"name":"list_containers"}"#).as_bytes(),
+                &fake_err(code, "/secret/path"),
+            );
+            let reply = o.reply.as_ref().unwrap();
+            let te = ToolError::from_trait_error(&TraitError::new(code, "/secret/path"));
+            assert_eq!(reply["result"], te.to_call_result());
+            assert!(reply.get("error").is_none());
+            assert_eq!(o.tool_error, Some(name));
+            assert!(!reply.to_string().contains("/secret/path"));
+        }
+    }
+
     #[test]
     fn invalid_json_returns_32700_with_null_id() {
         let v = call("{not json").unwrap();
         assert_eq!(
             v,
-            json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}})
+            json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error","data":{"code":"INVALID_ARGUMENT"}}})
         );
     }
 

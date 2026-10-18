@@ -12,8 +12,9 @@
 //!   （REPAIR-3）。現行の `seccomp::build_deny_filter` は禁止 syscall に `ERRNO(EPERM)`
 //!   （`unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS`。ESC-06）を返すため、どちらも報告が発生せず、
 //!   本フックは本番経路からまだ呼ばれない。`KILL_PROCESS` では終了するプロセス自身が記録を書けず、
-//!   プロセス内の SIGSYS ハンドラ経由の `SeccompDenialReport::from_sigsys` も使えない（親の `waitpid` が
-//!   得る終了シグナル等の別経路が要る）。配送経路と実カーネルでの end-to-end 試験は後続作業で行う
+//!   プロセス内の SIGSYS ハンドラ経由の `SeccompDenialReport::from_sigsys` も使えない。そのため KILL 側では
+//!   本フックを使わない（正の記録はカーネルの `AUDIT_SECCOMP`、補助は親の回収点が出す
+//!   `AuditEvent::ExitSignal`。#2004）。ERRNO 側の配送経路と実カーネルでの end-to-end 試験は後続作業で行う
 //! - カーネル報告値は untrusted。構築子で検証し、panic しない。syscall 番号・arch は拒否された試行を
 //!   落とさないよう値を保存する（SEC-4 の 100% 記録）
 //! - シンクの失敗は握りつぶさず `Err` で伝播する。リトライ・フォールバックは呼び出し側（`write_with_fallback`・#840 の `KernelAuditFallback`）の担当

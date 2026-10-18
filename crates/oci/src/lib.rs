@@ -37,14 +37,15 @@
 //! 下位レイヤーの実体だけを消す（レイヤーごとに収集・適用・展開の 3 パスで、tar 内の並び順に依らない。既存パスは
 //! image-spec の「Changeset over existing files」に従い置き換える。TASK-53.1〜53.3・OCI-1・OCI-2・#412〜#414。
 //! `whiteout`・`layer::extract`）。
-//! 未実装: ディレクトリ fd 起点の解決（TOCTOU 対策）、uid / gid 写像（SEC-5）、通常ファイルの
-//! setuid / setgid / sticky の保持（所有者の写像が入るまで落とし、件数を結果に返す。SEC-5）、綴りの畳み込みによる
-//! 名前衝突の検出（展開先 FS が区別する別表記は衝突として扱わない。IO-5）。
+//! 通常ファイルの setuid / setgid / sticky は既定で落として件数を返し、`SpecialBitsPolicy::PreserveIfOwnerMapped` を
+//! 渡した rootless 経路だけ所有者の写像に合わせて保持する（SEC-5・#1810。`docs/design/oci-layer-special-bits.md`）。
+//! 未実装: ディレクトリ fd 起点の解決（TOCTOU 対策）、uid / gid の適用（`chown`・複数範囲の写像・rootful で特殊ビットを
+//! 残す経路。SEC-5）、綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する別表記は衝突として扱わない。IO-5）。
 //!
 //! 未実装（スタブではなく後続 issue の担当）: キャッシュ・`image ls`/`rm`/`tag`（TASK-52〜55・TASK-183〜184）。`RegistryClient` の通信は匿名トークン取得・
 //! manifest 取得・blob 取得のみ。
 //! 実装済み: ローカルイメージ管理の参照テーブルのデータ構造と登録・解除・カウント API（TASK-183.1・OCI-7・MS-4・#472。
-//! `image_management`）。排他・永続化・GC・`image ls`/`rm`/`tag`/`prune` の CLI 経路は未実装。
+//! `image_management`）と、ストア単位の排他区間（TASK-183.2・OCI-7・#473。`image_management::ImageStore`）。永続化・GC・`image ls`/`rm`/`tag`/`prune` の CLI 経路は未実装。
 //! PLUG-1 区分は core（crate-naming.md）。
 
 pub mod auth;

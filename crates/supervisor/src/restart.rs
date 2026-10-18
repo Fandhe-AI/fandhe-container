@@ -1174,6 +1174,18 @@ impl ProcessLauncher for SpecCapturingLauncher {
     fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
         self.inner.confirm_no_process(id, timeout)
     }
+
+    /// 記録済みの cgroup の配置つきの確認も内側へ転送する(転送しないと既定実装の `confirm_no_process` へ縮退し、
+    /// 別プロセスで起動した残存を確かめられず回復が成功しない。CORE-2・#2011)。
+    fn confirm_no_process_recorded(
+        &self,
+        id: &ContainerId,
+        recorded: Option<&fandhe_container_core::traits::CgroupPlacement>,
+        timeout: Duration,
+    ) -> Result<(), TraitError> {
+        self.inner
+            .confirm_no_process_recorded(id, recorded, timeout)
+    }
 }
 
 /// start で使った launcher と [`LaunchSpec`] をそのまま使う [`Relauncher`] の本番アダプタ（SUP-3・#1717）。
@@ -1292,6 +1304,46 @@ mod tests {
         use fandhe_container_core::oci_runtime::LaunchMode;
         let wrapped = SpecCapturingLauncher::new(Arc::new(SelfBoundedFake));
         assert_eq!(wrapped.launch_mode(), LaunchMode::SelfBounded);
+    }
+
+    /// 配置を受け取ったことを覚える launcher(転送の照合用。#2011)。
+    struct RecordedProbe(Mutex<Vec<Option<fandhe_container_core::traits::CgroupPlacement>>>);
+
+    impl ProcessLauncher for RecordedProbe {
+        fn launch(
+            &self,
+            _spec: &LaunchSpec,
+            _timeout: Duration,
+        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            Err(TraitError::new(ErrorCode::Unimplemented, "unused"))
+        }
+
+        fn confirm_no_process_recorded(
+            &self,
+            _id: &ContainerId,
+            recorded: Option<&fandhe_container_core::traits::CgroupPlacement>,
+            _timeout: Duration,
+        ) -> Result<(), TraitError> {
+            self.0.lock().unwrap().push(recorded.cloned());
+            Ok(())
+        }
+    }
+
+    /// CORE-2・#2011: `SpecCapturingLauncher` は記録済みの配置つきの確認を内側へ転送する(既定実装へ縮退しない)。
+    #[test]
+    fn core2_issue2011_spec_capturing_launcher_forwards_recorded_confirmation() {
+        use fandhe_container_core::traits::{CgroupPlacement, CgroupScope, StateRevision};
+        let probe = Arc::new(RecordedProbe(Mutex::new(Vec::new())));
+        let wrapped = SpecCapturingLauncher::new(probe.clone());
+        let id = ContainerId::new("c1").expect("id");
+        let placement = CgroupPlacement::new(
+            CgroupScope::new("/user.slice/x.scope").expect("scope"),
+            StateRevision::from_raw(4),
+        );
+        wrapped
+            .confirm_no_process_recorded(&id, Some(&placement), Duration::from_secs(1))
+            .expect("forwarded");
+        assert_eq!(probe.0.lock().unwrap().clone(), vec![Some(placement)]);
     }
 
     /// SEC-4・#1915: `SpecCapturingLauncher` は内側の監査 sink を転送する(同一の sink が返る)。

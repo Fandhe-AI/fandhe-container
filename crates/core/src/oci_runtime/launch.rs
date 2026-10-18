@@ -37,7 +37,7 @@ use std::time::Duration;
 use super::bind_mounts::BindMountSet;
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
-use crate::traits::{ContainerId, ErrorCode, Signal, TraitError};
+use crate::traits::{CgroupPlacement, ContainerId, ErrorCode, Signal, TraitError};
 
 /// [`StartTimeouts`] の各上限が取れる最大値（無期限相当の値を型で拒否する。REPAIR-5）。
 ///
@@ -668,6 +668,27 @@ pub struct ContainerChildProcess {
     /// `terminate` が成功（回収を確かめられた）したときに 1 回呼ぶ通知。本番 launcher が起動台帳へ回収の
     /// 証跡を引き継ぐために付ける（CORE-2）。
     reap_notice: Option<ReapNotice>,
+    /// SIGSYS 終了の補助記録（SEC-4・ESC-06・#2004）。本番 launcher だけが付ける。
+    exit_audit: Option<ExitAudit>,
+}
+
+/// SIGSYS（x86_64・aarch64 とも asm-generic の 31）。
+#[cfg(target_os = "linux")]
+const SIGSYS: i32 = 31;
+
+/// [`ContainerChildProcess::with_exit_audit`] の記録先とコンテナ ID。`recorded` は 1 回だけ記録するための印。
+#[cfg(target_os = "linux")]
+struct ExitAudit {
+    sink: Arc<dyn crate::audit_log::AuditSink>,
+    container: ContainerId,
+    recorded: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for ExitAudit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExitAudit")
+    }
 }
 
 /// [`ContainerChildProcess::with_reap_notice`] の通知。
@@ -700,7 +721,63 @@ impl ContainerChildProcess {
             pid,
             output: std::sync::Mutex::new(None),
             reap_notice: None,
+            exit_audit: None,
         })
+    }
+
+    /// SIGSYS で終了したと回収した時に、補助の監査レコード（層 `exit_signal`）を 1 件出すよう設定する
+    /// （SEC-4・ESC-06・TASK-41 追補・#2004）。本番 launcher（`ProductionLauncher::launch`）が付ける。
+    ///
+    /// 契約:
+    /// - **補助**である。`SECCOMP_RET_KILL_PROCESS` で終了したプロセスは自分では記録を書けず、正の記録
+    ///   （syscall・arch・pid）はカーネルの `AUDIT_SECCOMP` が担う。コンテナ内の `kill(SIGSYS)` とは
+    ///   区別できないため、seccomp 由来とは断定せず、syscall も推測しない（`AuditEvent::ExitSignal` は
+    ///   型として syscall・arch を持たない）
+    /// - 記録は `wait` / `terminate` が SIGSYS の終了を初めて見たときにちょうど 1 回、回収の**後**に出す。
+    ///   sink の失敗は握りつぶし、終了状態の返却を変えない（`AuditSink` の契約）
+    /// - 記録の `target_pid` は回収した側（呼び出しプロセス）の PID namespace の値
+    /// - 制約（後続）: 複数スレッドのプロセスでは `FileAuditSink` の隔離が使えず、カーネル監査経由の代替になる
+    ///   ため、rootless では記録が残らない場合がある。pid 1 以外の子孫の SIGSYS 終了は親から見えない
+    #[must_use]
+    pub(crate) fn with_exit_audit(
+        mut self,
+        sink: Arc<dyn crate::audit_log::AuditSink>,
+        container: ContainerId,
+    ) -> Self {
+        self.exit_audit = Some(ExitAudit {
+            sink,
+            container,
+            recorded: std::sync::atomic::AtomicBool::new(false),
+        });
+        self
+    }
+
+    /// 回収した終了状態が SIGSYS なら、補助の `exit_signal` レコードを 1 回だけ出す（#2004）。
+    fn record_exit_signal_once(&self, exit: crate::exec::ChildExit) {
+        use std::sync::atomic::Ordering;
+        let crate::exec::ChildExit::Signaled(SIGSYS) = exit else {
+            return;
+        };
+        let Some(audit) = &self.exit_audit else {
+            return;
+        };
+        if audit.recorded.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let event = match (
+            crate::audit_log::AuditSignal::new(SIGSYS),
+            i32::try_from(self.pid.get())
+                .map_err(|_| ())
+                .and_then(|p| crate::audit_log::AuditPid::new(p).map_err(|_| ())),
+        ) {
+            (Ok(signal), Ok(target_pid)) => {
+                crate::audit_log::AuditEvent::ExitSignal { signal, target_pid }
+            }
+            _ => return,
+        };
+        // 配送結果は呼び出し側の終了状態に影響させない（失敗の通知は sink の責務）。
+        let _ =
+            crate::audit_log::mount::deliver(event, Some(&audit.container), audit.sink.as_ref());
     }
 
     /// `terminate` が成功したときに呼ぶ通知を持たせる（起動台帳への回収の証跡の引き継ぎ。CORE-2）。
@@ -757,14 +834,19 @@ impl LaunchedProcess for ContainerChildProcess {
         match exit {
             None => Ok(None),
             Some(ChildExit::Exited(code)) => Ok(Some(ProcessExit::Exited(code))),
-            Some(ChildExit::Signaled(sig)) => Ok(Some(ProcessExit::Signaled(sig))),
+            Some(ChildExit::Signaled(sig)) => {
+                self.record_exit_signal_once(ChildExit::Signaled(sig));
+                Ok(Some(ProcessExit::Signaled(sig)))
+            }
         }
     }
 
     fn terminate(&self, timeout: Duration) -> Result<(), TraitError> {
-        self.child
+        let exit = self
+            .child
             .kill_and_reap(timeout)
             .map_err(|e| TraitError::new(e.code, "failed to terminate the container process"))?;
+        self.record_exit_signal_once(exit);
         if let Some(notice) = &self.reap_notice {
             (notice.0)();
         }
@@ -865,13 +947,35 @@ pub trait ProcessLauncher: Send + Sync {
     ///
     /// 本番の `ProductionLauncher` は、自身が起動した範囲だけを確証できる（起動台帳。#1817）。失敗した launch の
     /// 回収できなかった子と報告前の PID 1 を期限内に再回収・再探索し、消滅を確かめられたときだけ `Ok(())` を返す。
-    /// 台帳に無い ID（別プロセスで起動した残存）とハンドルを渡し済みの ID は確証できないため `FailedPrecondition`。
+    /// 台帳に無い ID（別プロセスで起動した残存）とハンドルを渡し済みの ID は、このメソッドでは確証できないため
+    /// `FailedPrecondition`。別プロセスの残存は [`Self::confirm_no_process_recorded`] が記録済みの cgroup から確かめる。
     fn confirm_no_process(&self, id: &ContainerId, timeout: Duration) -> Result<(), TraitError> {
         let _ = (id, timeout);
         Err(TraitError::new(
             ErrorCode::Unimplemented,
             "the launcher cannot confirm that no process remains for this container",
         ))
+    }
+
+    /// [`Self::confirm_no_process`] に、状態記録の cgroup の配置 `recorded` を添えたもの（別プロセスで起動した
+    /// 残存の確認。#2011・CORE-2・SEC-1）。
+    ///
+    /// `recover_interrupted_start` が、照合済みのレコードの `StateRecord::cgroup` をそのまま渡す（配置は start の
+    /// 手順 5 で 1 回だけ記録され上書きされないため、読んだ時点の値でよい）。ID だけからパスを組み立てない。
+    /// 本番の `ProductionLauncher` は、台帳にある ID は従来どおり台帳で判定し、台帳に無い ID だけ、`recorded` の
+    /// コンテナ cgroup にプロセスが居ないことを確かめる（居れば止めて確かめる。記録が無い・検証できない・読めない
+    /// ときは `Ok` にしない）。既定実装は `recorded` を使わず [`Self::confirm_no_process`] へ転送する。
+    ///
+    /// ラッパー実装は必ず内側へ転送すること（転送しないと既定実装へ黙って縮退し、別プロセスの残存を確かめられず
+    /// 回復が成功しなくなる）。
+    fn confirm_no_process_recorded(
+        &self,
+        id: &ContainerId,
+        recorded: Option<&CgroupPlacement>,
+        timeout: Duration,
+    ) -> Result<(), TraitError> {
+        let _ = recorded;
+        self.confirm_no_process(id, timeout)
     }
 }
 
@@ -1317,6 +1421,87 @@ mod tests {
                 .wait_timeout(Duration::ZERO)
                 .expect("reaped"),
             crate::exec::ChildExit::Signaled(9)
+        );
+    }
+
+    /// SEC-4・ESC-06・#2004: テスト用の記録先。`fail` なら常に `Err`。
+    #[cfg(target_os = "linux")]
+    fn exit_audit_process(
+        script: &str,
+        fail: bool,
+    ) -> (
+        ContainerChildProcess,
+        Arc<crate::audit_log::mount::tests::VecSink>,
+        u32,
+    ) {
+        #[allow(clippy::zombie_processes)]
+        let pid = std::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn")
+            .id();
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(fail));
+        let process =
+            ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
+                .expect("wrap")
+                .with_exit_audit(sink.clone(), ContainerId::new("c1").expect("id"));
+        (process, sink, pid)
+    }
+
+    /// SEC-4・ESC-06・#2004: SIGSYS 終了を回収すると `exit_signal` が 1 件出る。seccomp を経ない
+    /// （`kill -SYS`）ので syscall・arch は持たない（終了シグナルから syscall を推測しない）。
+    /// `wait` の再呼び出しや `terminate` でも件数は 1 のまま。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2004_sigsys_exit_records_exit_signal_once_without_syscall() {
+        let (process, sink, pid) = exit_audit_process("kill -SYS $$; sleep 30", false);
+        let t = Duration::from_secs(10);
+        assert_eq!(
+            process.wait(t).expect("wait"),
+            Some(ProcessExit::Signaled(31))
+        );
+        assert_eq!(
+            process.wait(Duration::ZERO).expect("wait again"),
+            Some(ProcessExit::Signaled(31))
+        );
+        process.terminate(t).expect("terminate after reap");
+        let records = sink.snapshot();
+        assert_eq!(records.len(), 1);
+        let r = records.first().expect("record");
+        assert_eq!(r.layer().as_str(), "exit_signal");
+        assert_eq!(r.exit_signal().map(|s| s.get()), Some(31));
+        assert_eq!(r.target_pid().map(|p| p.get()), Some(pid));
+        assert_eq!(r.container_id().map(ContainerId::as_str), Some("c1"));
+        assert_eq!(r.syscall(), None);
+        assert_eq!(r.seccomp_arch(), None);
+    }
+
+    /// SEC-4・#2004: SIGSYS 以外の終了（SIGKILL・通常終了）では記録しない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2004_other_exits_record_nothing() {
+        let t = Duration::from_secs(10);
+        let (killed, sink, _) = exit_audit_process("exec sleep 30", false);
+        killed.terminate(t).expect("terminate");
+        assert_eq!(
+            killed.wait(t).expect("wait"),
+            Some(ProcessExit::Signaled(9))
+        );
+        assert!(sink.snapshot().is_empty());
+        let (exited, sink, _) = exit_audit_process("exit 0", false);
+        assert_eq!(exited.wait(t).expect("wait"), Some(ProcessExit::Exited(0)));
+        assert!(sink.snapshot().is_empty());
+    }
+
+    /// SEC-4・#2004: sink が `Err` でも終了状態は変わらない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2004_sink_failure_does_not_change_exit() {
+        let (process, _sink, _) = exit_audit_process("kill -SYS $$; sleep 30", true);
+        assert_eq!(
+            process.wait(Duration::from_secs(10)).expect("wait"),
+            Some(ProcessExit::Signaled(31))
         );
     }
 }

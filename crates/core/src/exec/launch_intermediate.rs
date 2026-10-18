@@ -54,11 +54,10 @@
 //! - **探索の fail-closed**: `/proc` の列挙・stat / comm の読み取りや解析の失敗は `reap_error` に残し、消滅を
 //!   確認できた場合(対象が `ENOENT`/`ESRCH` で消えた)と区別する
 //! - 回収できなかった子は [`PreparedLaunchFailure::unreaped`] で呼び出し側(launcher)へ返す。握りつぶさない
-//! - `dev.tty.legacy_tiocsti` の警告出力(#1739)は本入口に足していない
 
 use std::io::Write as _;
 use std::num::NonZeroU32;
-use std::os::fd::{AsRawFd as _, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -73,7 +72,7 @@ use super::launch_status::{
 };
 use super::process::{
     ChildStdio, ContainerChild, EXIT_SETUP_FAILED, Entrypoint, KILL_REAP_TIMEOUT, PrePivotSetup,
-    PreparedLaunchFailure, child_main, exec_status_pipe,
+    PreparedLaunchFailure, child_main, exec_status_pipe, report_legacy_tiocsti_to,
 };
 use super::{ChildSubreaper, ExecError, IsolationPlan, IsolationStage, StagePipeline, isolate};
 
@@ -475,6 +474,14 @@ pub(crate) struct IntermediateSpec<'a> {
 ///
 /// 前提: 呼び出しプロセスが `Threads: 1`(満たさなければ `FailedPrecondition`。副作用は pipe の作成のみ)。成功
 /// (`P`)の後の失敗(ステージ列・exec)は本入口では返らず、PID 1 の終了として観測される。
+///
+/// `dev.tty.legacy_tiocsti` の警告(CORE-5・SEC-1・REPAIR-4・REPAIR-5・#1739・#2008): 中間プロセスの fork に成功した
+/// 後、C の側で 1 回だけ、host の値が `1` のときに固定の 1 行を C の stderr へ出す(従来経路
+/// `spawn_container_with_stages` と同じ契約。観測のみで起動の可否は変えない)。fork 前の拒否(複数スレッド・pipe・
+/// fork の失敗)では出さない。出力は待たず(AF_UNIX の socket 以外へは書かない)、報告を読む期限を食わない。
+/// restart の再 launch(#2043)が本入口を通れば launch のたびに 1 行出る(host のグローバルな値の観測のため)。
+/// stderr が AF_UNIX の socket でない構成(CLI の `start` は null)では捨てられるため、supervisor が start の成功後に
+/// 同じ観測を自分のログ(`@supervisor-logs`)へも残す。
 pub(crate) fn spawn_container_via_intermediate(
     spec: IntermediateSpec<'_>,
     stages: StagePipeline,
@@ -513,6 +520,10 @@ pub(crate) fn spawn_container_via_intermediate(
         audit,
         timeout,
         &tag,
+        (
+            crate::legacy_tiocsti::read_host(),
+            std::io::stderr().as_fd(),
+        ),
     )
 }
 
@@ -528,6 +539,7 @@ fn launch_via_intermediate(
     audit: LaunchAudit<'_>,
     timeout: Duration,
     tag: &LaunchTag,
+    legacy: (crate::legacy_tiocsti::LegacyTiocsti, BorrowedFd<'_>),
 ) -> Result<ContainerChild, Box<PreparedLaunchFailure>> {
     let not_started = |e: ExecError| {
         Box::new(PreparedLaunchFailure::clean(
@@ -566,6 +578,8 @@ fn launch_via_intermediate(
         EXIT_SETUP_FAILED,
     )
     .map_err(|e| not_started(ExecError::from_sys(e, IsolationStage::Spawn, "fork")))?;
+    // fork に成功したので、`dev.tty.legacy_tiocsti` の警告を 1 回だけ出す(観測のみ。結果は起動の可否に使わない)。
+    let _ = report_legacy_tiocsti_to(legacy.0, legacy.1);
     // 親が書き込み側を持ち続けると、子が報告せずに終了しても EOF を観測できない。
     drop(status_w);
     drop(report_w);
@@ -851,6 +865,7 @@ fn kill_intermediate_failure(
 #[cfg(test)]
 mod tests {
     use std::io::Read as _;
+    use std::os::unix::net::UnixStream;
     use std::sync::Mutex;
 
     use super::*;
@@ -1112,6 +1127,27 @@ mod tests {
         VecSink,
         Option<u32>,
     ) {
+        // 警告の出力先は試験プロセスの stderr にせず(libtest の出力を汚さない)、読まれない socketpair にする。
+        let (out_tx, _out_rx) = UnixStream::pair().unwrap();
+        run_with(
+            behavior,
+            timeout,
+            crate::legacy_tiocsti::LegacyTiocsti::Absent,
+            out_tx.as_fd(),
+        )
+    }
+
+    /// [`run`] に `dev.tty.legacy_tiocsti` の観測値と警告の出力先を足した本体(#2008)。
+    fn run_with(
+        behavior: Behavior,
+        timeout: Duration,
+        legacy: crate::legacy_tiocsti::LegacyTiocsti,
+        legacy_out: BorrowedFd<'_>,
+    ) -> (
+        Result<ContainerChild, Box<PreparedLaunchFailure>>,
+        VecSink,
+        Option<u32>,
+    ) {
         let subreaper = ChildSubreaper::enable().expect("subreaper");
         let (mut pid_read, pid_write) = std::io::pipe().unwrap();
         let pid_write = std::fs::File::from(std::os::fd::OwnedFd::from(pid_write));
@@ -1205,6 +1241,7 @@ mod tests {
             audit,
             timeout,
             &tag,
+            (legacy, legacy_out),
         );
         drop(pid_write);
         let mut buf = [0u8; 4];
@@ -1369,6 +1406,7 @@ mod tests {
             container: None,
         };
         let tag = LaunchTag::fresh();
+        let (gate_out_tx, _gate_out_rx) = UnixStream::pair().unwrap();
         let started = Instant::now();
         let result = launch_via_intermediate(
             || true,
@@ -1393,6 +1431,10 @@ mod tests {
             audit,
             Duration::from_secs(5),
             &tag,
+            (
+                crate::legacy_tiocsti::LegacyTiocsti::Absent,
+                gate_out_tx.as_fd(),
+            ),
         );
         assert!(result.is_err());
         drop(result);
@@ -1479,6 +1521,141 @@ mod tests {
         );
     }
 
+    // ---- dev.tty.legacy_tiocsti の警告(CORE-5・SEC-1・REPAIR-4・REPAIR-5・#1739・#2008) ----
+
+    use crate::legacy_tiocsti::LegacyTiocsti;
+
+    const LEGACY_LINE: &str = r#"{"level":"warn","event":"legacy_tiocsti_enabled","sysctl":"dev.tty.legacy_tiocsti","value":1}"#;
+
+    fn read_available(rx: &mut UnixStream) -> Vec<u8> {
+        rx.set_nonblocking(true).expect("nonblocking");
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match rx.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+        out
+    }
+
+    /// 有効のとき、固定 1 行がちょうど 1 回、改行付きで届き、起動は成功する。
+    #[test]
+    fn core5_sec1_2008_enabled_emits_exact_line_once() {
+        assert_eq!(
+            crate::legacy_tiocsti::warning_line(LegacyTiocsti::Enabled),
+            Some(LEGACY_LINE)
+        );
+        let (tx, mut rx) = UnixStream::pair().unwrap();
+        let (result, _sink, _) = run_with(
+            Behavior::Ready,
+            Duration::from_secs(10),
+            LegacyTiocsti::Enabled,
+            tx.as_fd(),
+        );
+        let child = result.unwrap();
+        assert_eq!(
+            child.wait_timeout(Duration::from_secs(10)).unwrap(),
+            ChildExit::Exited(0)
+        );
+        assert_eq!(
+            read_available(&mut rx),
+            format!("{LEGACY_LINE}\n").into_bytes()
+        );
+        assert_eq!(read_available(&mut rx), Vec::<u8>::new());
+    }
+
+    /// 対象外の状態では何も出力されない。
+    #[test]
+    fn core5_sec1_2008_non_applicable_states_emit_nothing() {
+        for state in [
+            LegacyTiocsti::Absent,
+            LegacyTiocsti::Disabled,
+            LegacyTiocsti::Unexpected,
+            LegacyTiocsti::ReadFailed {
+                kind: std::io::ErrorKind::PermissionDenied,
+            },
+        ] {
+            let (tx, mut rx) = UnixStream::pair().unwrap();
+            let (result, _sink, _) =
+                run_with(Behavior::Ready, Duration::from_secs(10), state, tx.as_fd());
+            let child = result.unwrap();
+            assert_eq!(
+                child.wait_timeout(Duration::from_secs(10)).unwrap(),
+                ChildExit::Exited(0)
+            );
+            assert_eq!(read_available(&mut rx), Vec::<u8>::new(), "{state:?}");
+        }
+    }
+
+    /// fork の後なら、起動が失敗しても警告は 1 行出る。
+    #[test]
+    fn core5_sec1_2008_emitted_even_when_launch_fails() {
+        let (tx, mut rx) = UnixStream::pair().unwrap();
+        let (result, _sink, _) = run_with(
+            Behavior::IsolateFails,
+            Duration::from_secs(10),
+            LegacyTiocsti::Enabled,
+            tx.as_fd(),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            read_available(&mut rx),
+            format!("{LEGACY_LINE}\n").into_bytes()
+        );
+    }
+
+    /// 出力先が満杯でも起動は待たされず成功する(REPAIR-5)。
+    #[test]
+    fn repair5_2008_full_output_does_not_block_launch() {
+        let (mut tx, rx) = UnixStream::pair().unwrap();
+        tx.set_nonblocking(true).unwrap();
+        let chunk = [b'x'; 4096];
+        loop {
+            match std::io::Write::write(&mut tx, &chunk) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("fill: {e}"),
+            }
+        }
+        tx.set_nonblocking(false).unwrap();
+        let started = Instant::now();
+        let (result, _sink, _) = run_with(
+            Behavior::Ready,
+            Duration::from_secs(10),
+            LegacyTiocsti::Enabled,
+            tx.as_fd(),
+        );
+        let child = result.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            child.wait_timeout(Duration::from_secs(10)).unwrap(),
+            ChildExit::Exited(0)
+        );
+        drop(rx);
+    }
+
+    /// 読み手が閉じていても起動は失敗せず、SIGPIPE で落ちない(`MSG_NOSIGNAL`)。
+    #[test]
+    fn repair5_2008_closed_peer_does_not_fail_launch() {
+        let (tx, rx) = UnixStream::pair().unwrap();
+        drop(rx);
+        let (result, _sink, _) = run_with(
+            Behavior::Ready,
+            Duration::from_secs(10),
+            LegacyTiocsti::Enabled,
+            tx.as_fd(),
+        );
+        let child = result.unwrap();
+        assert_eq!(
+            child.wait_timeout(Duration::from_secs(10)).unwrap(),
+            ChildExit::Exited(0)
+        );
+    }
+
     /// CORE-1(#1816): 複数スレッドの呼び出しは中間プロセスを作らず `FailedPrecondition`。
     #[test]
     fn core1_via_intermediate_refuses_multithreaded_caller() {
@@ -1488,6 +1665,7 @@ mod tests {
             sink: &sink,
             container: None,
         };
+        let (out_tx, _out_rx) = UnixStream::pair().unwrap();
         let result = launch_via_intermediate(
             || false,
             |_, _, _| panic!("the intermediate must not run"),
@@ -1495,6 +1673,7 @@ mod tests {
             audit,
             Duration::from_secs(1),
             &LaunchTag::fresh(),
+            (crate::legacy_tiocsti::LegacyTiocsti::Absent, out_tx.as_fd()),
         );
         let failure = result.expect_err("must refuse");
         assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);

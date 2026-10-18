@@ -53,7 +53,7 @@ use crate::sys;
 use crate::traits::ErrorCode;
 
 /// `cgroup.events` の読み取り上限（数行の小さなファイル）。
-const EVENTS_LIMIT: u64 = 4096;
+pub(super) const EVENTS_LIMIT: u64 = 4096;
 
 /// 子 cgroup 名の最大長（`exec-<pid>-<連番>` は十分に収まる）。
 const NAME_MAX_LEN: usize = 64;
@@ -108,7 +108,7 @@ pub(crate) fn parse_populated(text: &str) -> Result<bool, CgroupError> {
 /// `dir` の `cgroup.events` が `populated 0` になるまで `timeout` を上限に待つ（REPAIR-5）。
 ///
 /// 上限を過ぎても空にならなければ `Timeout`。
-fn wait_unpopulated(
+pub(super) fn wait_unpopulated(
     dir: std::os::fd::BorrowedFd<'_>,
     timeout: Duration,
 ) -> Result<(), CgroupError> {
@@ -152,7 +152,7 @@ fn require_owned_by_euid(
 }
 
 /// `cgroup.kill` へ `1` を書く（子孫ごと SIGKILL。冪等）。
-fn write_kill(kill_w: &File) -> Result<(), CgroupError> {
+pub(super) fn write_kill(kill_w: &File) -> Result<(), CgroupError> {
     let mut w = kill_w;
     w.write_all(b"1")
         .map_err(|e| io_error(CgroupStep::Cleanup, "cgroup.kill", &e))

@@ -2238,6 +2238,11 @@ fn check_bind_overlaps(
 /// 作るため `setup` 指定時にだけ走る。本番の起動経路は常に `setup` を渡す（`IntermediateSpec.setup` は `Option` でない）ので
 /// 本番では常に適用され、`setup` なしの最小構成だけが飛ばす（ESC スイートは影響を受けない。#1853 で入口を切り替える）。
 /// 順序は「読み取り専用化 → 覆う」（読み取り専用化の再帰 bind が覆いの子マウントに `ro` を付け損ねないため）。
+///
+/// `/proc`・`/sys` との順序（#2005・SEC-2）: procfs は `prepare_rootfs` が `rootfs/proc` にマウント済みで、
+/// `readonly_paths`・`masked_paths` はその上に載る。pivot 後にはマウントしない（後からのマウントは保護を覆い隠す）。
+/// sysfs（TASK-127）を供給するときは `readonly_paths` より前に載せる。順序は単体テスト
+/// `core1_run_pre_pivot_order_is_fixed` が、積み方は結合試験 `readonly_paths`・`masked_paths` が検査する。
 fn run_pre_pivot<O: PrePivotOps>(
     ops: &O,
     rootfs: &Path,
@@ -5225,6 +5230,7 @@ mod tests {
     /// CORE-1・CORE-5（TASK-29 追補・#1715）: pivot 前の段は
     /// `establish` → `prepare_rootfs` → `verify_pinned` → `create_default_devices` → `mount_tmpfs` →
     /// `inject_files` → `mount_binds` → `readonly_paths` → `masked_paths` → `pivot_root` の固定順で呼ばれる（#1914）。
+    /// procfs のマウント（`prepare_rootfs`）が保護の段より前であることの照合を兼ねる（#2005・SEC-2）。
     #[test]
     fn core1_run_pre_pivot_order_is_fixed() {
         let tmpfs = TmpfsMountSet::new();

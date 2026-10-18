@@ -29,7 +29,10 @@
 //!   `accept` / `connect` は受け手 `PeerAuthObserver` を必須引数に取り、既定の出力先は持たない。
 //!   SEC-4・TASK-124.5・#1388）。永続的な監査ログへの配線は core 側 proxy（TASK-114）で未実装（REPAIR-3）
 //! - accept した接続の peer credential（`SO_PEERCRED` / `getpeereid`。`crate::sys`）を検証し、
-//!   自 UID 以外は切断して `PermissionDenied` を返す
+//!   自 UID 以外は切断する。公開の [`UdsListener::accept`] は `PermissionDenied` を返す。起動経路
+//!   （`accept_peer_pid`）は UID 不一致も pid 不一致と同様に切断して待ち受けを続け、合算で
+//!   [`UDS_ACCEPT_PEER_REJECTION_LIMIT`] を超えたら `PermissionDenied` で打ち切る（取得失敗は即エラー）。
+//!   peer 認証による拒否かどうかは、返るエラーのコードでなく observer に渡る `PeerAuthRejectReason` で判別する
 //! - 受け付けた接続には既定の read / write 期限を付ける（REPAIR-5）
 //! - client 接続（`UdsStream::connect`）は connect 自体に期限を付け、接続直後に server の peer
 //!   credential を自 UID と照合する（不一致は 1 バイトも送らず切断。listener 側 accept と対称。
@@ -47,7 +50,8 @@
 //! # 未実装の範囲（REPAIR-3）
 //!
 //! - 既存パスは bind 前に lstat 検証する（PLUG-12・TASK-123.2）。symlink・他 UID 所有は削除せず
-//!   `PermissionDenied`、生存中の listener や socket 以外は `AlreadyExists`、bind ロックを取得でき管理下の
+//!   `PermissionDenied`、生存中の listener や socket 以外は `AlreadyExists`（原因別の固定文言。記録の無い socket は
+//!   手で削除する。手順は `docs/setup/plugin-socket-recovery.md`。#1859）、bind ロックを取得でき管理下の
 //!   自 UID 所有 stale socket のみ削除して再 bind する（詳細は `uds_security` モジュール doc）
 //! - gRPC（TASK-108）
 //! - 要求 ID と応答 ID の対応づけ・要求→応答の 1 往復ヘルパー（core 側 proxy。TASK-114）
@@ -70,6 +74,16 @@ use crate::frame::Frame;
 /// `accept` の期限の上限。これを超える指定は `InvalidArgument`（REPAIR-5）。
 /// 接続待ち（`connect`）は [`UDS_CONNECT_TIMEOUT_MAX`]、フレーム待ちは [`RpcTimeout`] が別に持つ。
 pub const UDS_ACCEPT_TIMEOUT_MAX: Duration = Duration::from_secs(600);
+
+/// 起動経路の受付（`accept_peer_pid`）が、拒否した接続を切断して待ち受けを続ける回数の上限
+/// （PLUG-12・PLUG-7・SEC-4・REPAIR-5。#1861）。
+///
+/// 続ける拒否は peer UID 不一致と peer pid 不一致の合算で数え、取得失敗（UID・pid）は数えず即エラーにする。
+/// 拒否が本上限を超えた時点（上限 + 1 件目）で、その接続を切断して監査通知を済ませた後
+/// `PermissionDenied` で打ち切る。1 回の受付で出る監査イベントは最大でも上限 + 1 件。
+/// 値の制約: 既存試験の pid 不一致の件数より十分大きく、listen backlog（128）と監査枠
+/// （`PEER_AUTH_AUDIT_LOG_CAPACITY` の 256）を下回ること。
+pub const UDS_ACCEPT_PEER_REJECTION_LIMIT: u32 = 16;
 
 /// `UdsStream::connect` の期限の上限（600 秒）。これを超える指定は `InvalidArgument`（REPAIR-5）。
 /// 接続待ちと RPC 応答待ちは目的が違うため、[`UDS_RPC_TIMEOUT_MAX`] とは別の定数にしている。
@@ -154,7 +168,8 @@ impl UdsListener {
     ///
     /// 既存エントリがある場合は lstat で検証する（PLUG-12・TASK-123.2）。symlink・他 UID 所有は削除せず
     /// `PermissionDenied`、生存中の listener・socket 以外は `AlreadyExists`、自 UID 所有の stale socket
-    /// （bind ロックを取得でき管理下のもの）のみ削除して再 bind する。
+    /// （bind ロックを取得でき管理下のもの）のみ削除して再 bind する。`AlreadyExists` の文言は原因別で、
+    /// 記録の無い socket は手で削除する（`docs/setup/plugin-socket-recovery.md`。#1859）。
     pub fn bind(path: &Path) -> Result<Self, PluginError> {
         // `..` は bind 時点とそれ以降で解決先が変わりうるため拒否する（`std::path::absolute` は
         // `..` を残す。PLUG-12）。
@@ -179,7 +194,9 @@ impl UdsListener {
     /// `timeout` が 0 または [`UDS_ACCEPT_TIMEOUT_MAX`] 超なら `InvalidArgument`、期限切れは `Timeout`。
     /// 1 呼び出しで 1 接続まで。受付ループ・同時接続数の上限は呼び出し側（TASK-109・TASK-114）の責務。
     /// 返す接続は peer credential が自 UID であることを確認済み。不一致は接続を切断して
-    /// `PermissionDenied` を返す（呼び出し側の受付ループは継続してよい）。
+    /// `PermissionDenied` を返す（呼び出し側の受付ループは継続してよい）。本メソッドは拒否 1 件で必ず返り、
+    /// 自ら待ち受けを続けない（続けるのは起動経路の `accept_peer_pid` のみ）。peer 認証による拒否かどうかは
+    /// 返るエラーのコードでなく、observer に渡る `PeerAuthRejectReason` で判別する。
     ///
     /// peer 認証で拒否した接続 1 件につき、監査イベントを `observer` へ 1 件通知する（UID 不一致・peer UID
     /// 取得失敗。PLUG-12・SEC-4・TASK-124.5・#1388）。通知は切断後・エラー返却前に同期で行い、返すエラーは
@@ -208,8 +225,11 @@ impl UdsListener {
     /// [`Self::accept`] に「応答者を特定の子プロセスに限定する」「待機中に中断条件を確認する」を加えた版
     /// （都度起動モード専用。PLUG-7・PLUG-12・REPAIR-5。`crate::lifecycle::call_once` が使う）。
     ///
-    /// peer の pid が `expected_pid` と一致しない接続（同一 UID の別プロセス）は切断して受付を継続する
-    /// （期限内に限る。pid を取得できない環境は fail-closed でエラー）。pid 照合は数値比較のため、子の終了後に
+    /// peer の pid が `expected_pid` と一致しない接続（同一 UID の別プロセス）と、peer UID が自 UID と
+    /// 一致しない接続は、切断して受付を継続する（期限内に限る。#1861）。継続する拒否は合算で
+    /// [`UDS_ACCEPT_PEER_REJECTION_LIMIT`] 件まで、超えた接続は切断・監査通知の後 `PermissionDenied`
+    /// （固定文言）で打ち切る。UID・pid を取得できない場合は fail-closed で即エラー（継続しない）。
+    /// 継続する前に必ず `abort` を確認する。拒否した接続のフレームは読まない。pid 照合は数値比較のため、子の終了後に
     /// 同じ pid が再利用される窓が残る（pidfd 等での緩和は将来課題。`crate::sys` の「限界」・PLUG-12）。接続待ちの間は `abort` を
     /// 繰り返し呼び、`Some(err)` を返したらその `err` で受付を中断する。保留中の接続がある場合は
     /// `abort` より接続の受理を優先する（期限切れ間際に届いた接続を取りこぼさない）。
@@ -501,6 +521,8 @@ fn map_frame_io_error(kind: io::ErrorKind, op: FrameOp) -> PluginError {
 #[cfg_attr(not(unix), allow(dead_code))]
 fn map_bind_error(kind: io::ErrorKind) -> PluginError {
     let (code, message) = match kind {
+        // 実 bind の EADDRINUSE。bind 直前に別経路が同じ名前を作った競合で、`uds_security` の原因別文言
+        // （#1859）とは別の文字列にしてある。
         io::ErrorKind::AddrInUse | io::ErrorKind::AlreadyExists => (
             PluginErrorCode::AlreadyExists,
             "socket path is already in use",
@@ -548,8 +570,8 @@ fn map_connect_error(kind: io::ErrorKind) -> PluginError {
 #[cfg(unix)]
 mod imp {
     use super::{
-        FrameOp, PeerAuthObserver, RpcTimeout, TimeoutRestore, UDS_DEFAULT_IO_TIMEOUT,
-        map_bind_error, map_connect_error, map_frame_io_error,
+        FrameOp, PeerAuthObserver, RpcTimeout, TimeoutRestore, UDS_ACCEPT_PEER_REJECTION_LIMIT,
+        UDS_DEFAULT_IO_TIMEOUT, map_bind_error, map_connect_error, map_frame_io_error,
     };
     use crate::audit::{PeerAuthOp, PeerAuthRejectReason, PeerAuthRejection};
     use crate::error::{PluginError, PluginErrorCode};
@@ -579,6 +601,17 @@ mod imp {
 
     fn denied(m: &'static str) -> PluginError {
         PluginError::new(PluginErrorCode::PermissionDenied, m)
+    }
+
+    /// 切断して継続する拒否を 1 件数え、上限（`UDS_ACCEPT_PEER_REJECTION_LIMIT`）を超えたら
+    /// 固定文言の `PermissionDenied` を返す（PLUG-12・REPAIR-5。#1861）。呼び出し側は切断と監査通知を
+    /// 済ませてから呼ぶ。UID・pid の値は文言に含めない。
+    fn count_continued_rejection(continued: &mut u32) -> Result<(), PluginError> {
+        *continued = continued.saturating_add(1);
+        if *continued > UDS_ACCEPT_PEER_REJECTION_LIMIT {
+            return Err(denied("too many rejected peer connections"));
+        }
+        Ok(())
     }
 
     /// 親ディレクトリを開き、symlink でなく、自 UID 所有で、group/other の権限が一切ないことを
@@ -681,8 +714,13 @@ mod imp {
         /// テスト専用: peer 認証で拒否した接続を drop せず退避する（PLUG-12・TASK-124.6・#1389）。
         /// 拒否時に相手が先送りしたフレームが 1 バイトも読まれていないことを、退避した stream から
         /// 受信キューを読んで照合するため。リリースビルドには存在せず、拒否した接続は従来どおり drop する。
+        /// 続けて拒否した場合は最後の 1 件だけを保持する（前の接続は drop で切断される）。
         #[cfg(test)]
         rejected: std::sync::Mutex<Option<UnixStream>>,
+        /// テスト専用: 接続ごとの peer UID 取得結果の台本（先頭から消費。空なら実取得）。
+        /// 起動経路で「UID 不一致の後に正しい接続が来る」「取得失敗」を実 socket 上で再現するため。
+        #[cfg(test)]
+        peer_uid_script: std::sync::Mutex<std::collections::VecDeque<Result<u32, PluginError>>>,
     }
 
     impl ListenerInner {
@@ -722,10 +760,13 @@ mod imp {
                 euid,
                 #[cfg(test)]
                 rejected: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                peer_uid_script: std::sync::Mutex::new(std::collections::VecDeque::new()),
             };
             // 管理下の証拠として socket の同一性をロックへ記録する。記録できないまま listener を返すと、
             // 異常終了時に記録の無い socket が残り、以後の bind が stale と判定できず `AlreadyExists` に
-            // なるため、記録失敗は bind 失敗として作成した socket を後始末する（TASK-123.2）。
+            // なるため、記録失敗は bind 失敗として作成した socket を後始末する（TASK-123.2）。後始末前に再び
+            // 異常終了した場合の残余は `docs/setup/plugin-socket-recovery.md` の手順で手動削除する（#1859）。
             // identity が無い場合は記録せず、直後の `configure` が拒否する。
             if let Some(ident) = inner.identity.as_ref()
                 && inner.lock.record_socket(ident).is_err()
@@ -760,6 +801,27 @@ mod imp {
         ))]
         pub(super) fn set_expected_uid_for_test(&mut self, uid: u32) {
             self.euid = uid;
+        }
+
+        /// テスト専用: 次に accept する接続の peer UID 取得結果を台本へ積む（#1861）。
+        #[cfg(all(
+            test,
+            any(
+                target_os = "macos",
+                all(
+                    target_os = "linux",
+                    all(
+                        target_pointer_width = "64",
+                        any(target_arch = "x86_64", target_arch = "aarch64")
+                    )
+                )
+            )
+        ))]
+        pub(super) fn push_peer_uid_for_test(&self, r: Result<u32, PluginError>) {
+            self.peer_uid_script
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push_back(r);
         }
 
         /// 公開パス（検証済み配置ディレクトリの解決後パス＋socket 名。PLUG-12）。
@@ -861,6 +923,29 @@ mod imp {
                 .take()
         }
 
+        /// peer UID の検証。テストビルドでは台本があれば取得結果を差し替える（比較と拒否の組み立ては
+        /// 本物の `verify_peer_with` を通る）。本番ビルドの取得は `uds_security::verify_peer` と同値。
+        fn verify_peer_scripted(
+            &self,
+            stream: &UnixStream,
+            expected_uid: u32,
+        ) -> Result<(), crate::uds_security::PeerRejection> {
+            #[cfg(test)]
+            {
+                let scripted = self
+                    .peer_uid_script
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .pop_front();
+                crate::uds_security::verify_peer_with(
+                    || scripted.unwrap_or_else(|| sys::peer_uid(stream)),
+                    expected_uid,
+                )
+            }
+            #[cfg(not(test))]
+            crate::uds_security::verify_peer(stream, expected_uid)
+        }
+
         /// `accept` の本体。`expected_uid` は公開経路では常に `self.euid`。
         fn accept_with(
             &self,
@@ -872,6 +957,9 @@ mod imp {
         ) -> Result<StreamInner, PluginError> {
             let deadline = Instant::now() + timeout;
             let mut poll_interval = ACCEPT_POLL_INITIAL;
+            // 切断して継続した拒否（UID 不一致・pid 不一致の合算）の件数。上限は
+            // `UDS_ACCEPT_PEER_REJECTION_LIMIT`（#1861）。
+            let mut continued: u32 = 0;
             loop {
                 match self.listener.accept() {
                     Ok((stream, _)) => {
@@ -888,9 +976,11 @@ mod imp {
                         // drop で fd を閉じるため相手は切断される。
                         // accept 直後・最初の read より前に検証する（TASK-124.1・#292）。
                         // 拒否は「（テスト以外は drop で切断）→ 監査通知 → Err」の順（TASK-124.5・SEC-4）。
+                        // 起動経路（expected_pid あり）の UID 不一致のみ、上限・abort を確認して
+                        // 受付を継続する（#1861。取得失敗は即 Err）。
                         // 通知は戻り値を持たず、拒否判定には影響しない。順序は
                         // `transport::tests::plug12_order` で機械照合する（TASK-124.6・#1389）。
-                        if let Err(rej) = crate::uds_security::verify_peer(&stream, expected_uid) {
+                        if let Err(rej) = self.verify_peer_scripted(&stream, expected_uid) {
                             // テストでは拒否した接続を退避する（drop しない。`rejected` 参照）。
                             #[cfg(test)]
                             {
@@ -909,7 +999,16 @@ mod imp {
                                 peer_pid: None,
                                 socket_path: &self.path,
                             });
-                            return Err(rej.error);
+                            if expected_pid.is_none()
+                                || rej.reason != PeerAuthRejectReason::UidMismatch
+                            {
+                                return Err(rej.error);
+                            }
+                            count_continued_rejection(&mut continued)?;
+                            if let Some(e) = abort() {
+                                return Err(e);
+                            }
+                            continue;
                         }
                         // 応答者の限定指定がある場合、spawn した子以外（同一 UID の別プロセス）は
                         // 切断して受付を継続する（PLUG-7。取得不能は fail-closed でエラー）。
@@ -945,6 +1044,7 @@ mod imp {
                                     peer_pid: Some(peer_pid),
                                     socket_path: &self.path,
                                 });
+                                count_continued_rejection(&mut continued)?;
                                 if let Some(e) = abort() {
                                     return Err(e);
                                 }
@@ -2280,6 +2380,197 @@ mod tests {
                     .is_ok()
             );
             assert_eq!(rec2.0, vec![]);
+            drop(l);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// 台本つき listener（UID 不一致を `n` 件積む）に、`conns` 本を事前接続して返す。
+        fn scripted_listener(
+            tag: &str,
+            mismatches: usize,
+            conns: usize,
+        ) -> (UdsListener, std::path::PathBuf, Vec<UdsStream>) {
+            let me = crate::sys::effective_uid();
+            let (l, dir) = audit_listener(tag);
+            for _ in 0..mismatches {
+                l.inner.push_peer_uid_for_test(Ok(me.wrapping_add(1)));
+            }
+            let cs = (0..conns)
+                .map(|_| noop_connect(l.path()).unwrap())
+                .collect();
+            (l, dir, cs)
+        }
+
+        fn uid_mm_event(l: &UdsListener) -> RecordedRejection {
+            let me = crate::sys::effective_uid();
+            rejection(
+                PeerAuthOp::Accept,
+                PeerAuthRejectReason::UidMismatch,
+                me,
+                Some(me.wrapping_add(1)),
+                l.path(),
+            )
+        }
+
+        /// PLUG-12・SEC-4・PLUG-7: 起動経路は UID 不一致を切断して継続し、後続の正しい子を受理する。
+        #[test]
+        fn plug12_accept_peer_pid_continues_after_uid_mismatch_and_accepts_child() {
+            let me = std::process::id();
+            let (l, dir, _cs) = scripted_listener("uid-cont", 1, 2);
+            let mut rec = Recorder::default();
+            assert!(
+                l.accept_peer_pid(Duration::from_secs(5), me, &mut || None, &mut rec)
+                    .is_ok()
+            );
+            assert_eq!(rec.0, vec![uid_mm_event(&l)]);
+            drop(l);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// PLUG-12・REPAIR-5: 上限ちょうどまでは継続し、超えると固定文言の PermissionDenied。
+        #[test]
+        fn plug12_accept_peer_pid_uid_mismatch_limit_boundary() {
+            let me = std::process::id();
+            let limit = UDS_ACCEPT_PEER_REJECTION_LIMIT as usize;
+            // (a) 上限ちょうど: 継続して受理する。
+            let (l, dir, _cs) = scripted_listener("uid-lim-a", limit, limit + 1);
+            let mut rec = Recorder::default();
+            assert!(
+                l.accept_peer_pid(Duration::from_secs(5), me, &mut || None, &mut rec)
+                    .is_ok()
+            );
+            assert_eq!(rec.0.len(), limit);
+            drop(l);
+            let _ = std::fs::remove_dir_all(&dir);
+            // (b) 上限超過: 最後の 1 件も通知してから打ち切る。
+            let (l, dir, _cs) = scripted_listener("uid-lim-b", limit + 1, limit + 1);
+            let mut rec = Recorder::default();
+            let e = l
+                .accept_peer_pid(Duration::from_secs(5), me, &mut || None, &mut rec)
+                .unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert_eq!(e.message(), "too many rejected peer connections");
+            assert!(
+                !e.to_string()
+                    .contains(&crate::sys::effective_uid().to_string())
+            );
+            assert_eq!(rec.0.len(), limit + 1);
+            assert!(
+                rec.0
+                    .iter()
+                    .all(|ev| ev.reason == PeerAuthRejectReason::UidMismatch)
+            );
+            drop(l);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// PLUG-7・REPAIR-5: pid 不一致も同じ上限に合算される。
+        #[test]
+        fn plug12_accept_peer_pid_pid_mismatch_counts_toward_limit() {
+            let me = std::process::id();
+            let limit = UDS_ACCEPT_PEER_REJECTION_LIMIT as usize;
+            // pid 不一致のみ: limit + 1 件で打ち切り。
+            let (l, dir, _cs) = scripted_listener("pid-lim", 0, limit + 1);
+            let mut rec = Recorder::default();
+            let e = l
+                .accept_peer_pid(
+                    Duration::from_secs(5),
+                    me.wrapping_add(1),
+                    &mut || None,
+                    &mut rec,
+                )
+                .unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert_eq!(e.message(), "too many rejected peer connections");
+            assert_eq!(rec.0.len(), limit + 1);
+            assert!(
+                rec.0
+                    .iter()
+                    .all(|ev| ev.reason == PeerAuthRejectReason::PidMismatch)
+            );
+            drop(l);
+            let _ = std::fs::remove_dir_all(&dir);
+            // 混在: UID 不一致 limit 件 + pid 不一致 1 件で打ち切り。
+            let (l, dir, _cs) = scripted_listener("mix-lim", limit, limit + 1);
+            let mut rec = Recorder::default();
+            let e = l
+                .accept_peer_pid(
+                    Duration::from_secs(5),
+                    me.wrapping_add(1),
+                    &mut || None,
+                    &mut rec,
+                )
+                .unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert_eq!(rec.0.len(), limit + 1);
+            assert_eq!(rec.0[limit].reason, PeerAuthRejectReason::PidMismatch);
+            drop(l);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// PLUG-12・SEC-4: UID 取得失敗は 1 回で即エラー（継続しない）。
+        #[test]
+        fn plug12_accept_peer_pid_uid_unavailable_fails_immediately() {
+            let me = std::process::id();
+            let (l, dir, _cs) = scripted_listener("uid-unavail", 0, 2);
+            l.inner.push_peer_uid_for_test(Err(PluginError::new(
+                PluginErrorCode::Internal,
+                "peer uid lookup failed",
+            )));
+            let mut rec = Recorder::default();
+            let e = l
+                .accept_peer_pid(Duration::from_secs(5), me, &mut || None, &mut rec)
+                .unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::Internal);
+            assert_eq!(rec.0.len(), 1);
+            assert_eq!(rec.0[0].reason, PeerAuthRejectReason::PeerUidUnavailable);
+            assert_eq!(rec.0[0].peer_uid, None);
+            assert_eq!(rec.0[0].code, PluginErrorCode::Internal);
+            drop(l);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// PLUG-12: 公開 accept は拒否 1 件で返り、1 呼び出しで 1 接続しか消費しない。
+        #[test]
+        fn plug12_public_accept_uid_mismatch_returns_without_looping() {
+            let (l, dir, _cs) = scripted_listener("pub-once", 1, 2);
+            let mut rec = Recorder::default();
+            let e = l.accept(Duration::from_secs(5), &mut rec).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
+            assert_eq!(rec.0.len(), 1);
+            let mut rec2 = Recorder::default();
+            assert!(l.accept(Duration::from_secs(5), &mut rec2).is_ok());
+            assert_eq!(rec2.0, vec![]);
+            drop(l);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// PLUG-7・REPAIR-5: UID 不一致で継続する前にも abort を確認する。
+        #[test]
+        fn plug7_abort_is_checked_after_uid_mismatch() {
+            let me = std::process::id();
+            let (l, dir, _cs) = scripted_listener("uid-abort", 1, 1);
+            let mut rec = Recorder::default();
+            let mut calls = 0u32;
+            let start = std::time::Instant::now();
+            let e = l
+                .accept_peer_pid(
+                    Duration::from_secs(30),
+                    me,
+                    &mut || {
+                        calls += 1;
+                        Some(PluginError::new(
+                            PluginErrorCode::Unavailable,
+                            "child exited",
+                        ))
+                    },
+                    &mut rec,
+                )
+                .unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::Unavailable);
+            assert_eq!(calls, 1);
+            assert!(start.elapsed() < Duration::from_secs(10));
+            assert_eq!(rec.0.len(), 1);
             drop(l);
             let _ = std::fs::remove_dir_all(&dir);
         }

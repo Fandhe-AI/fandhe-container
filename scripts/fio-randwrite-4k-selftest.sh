@@ -39,6 +39,12 @@ bash_bin="$(command -v bash)"
 failures=0
 tmp_root=$(mktemp -d)
 trap 'rm -rf "$tmp_root"' EXIT
+# 各ケースのスタブは tmp_root 内に置き、PATH の前置き代入でそのケースだけに効かせる
+# （ケース間・並列の自己テスト間で共有しない。Issue #2002・REPAIR-12）。対象スクリプトの
+# 一時ディレクトリ（TMPDIR 配下）も tmp_root の中へ閉じ、後始末の漏れを末尾で照合する。
+script_tmp="${tmp_root}/script-tmp"
+mkdir -m 0700 "$script_tmp"
+export TMPDIR="$script_tmp"
 
 # 直近の run_case で対象スクリプトが出した stdout+stderr（失敗時の診断・
 # メッセージ照合用）と、そのケースが期待どおりだったか（1/0）。
@@ -739,6 +745,24 @@ printf '#!/usr/bin/env bash\ncat >/dev/null\necho "not-a-number"\n' >"${wc_bad_b
 chmod +x "${wc_bad_bin}/wc"
 PATH="${wc_bad_bin}:${PATH}" run_case_msg "from-json-size-check-non-numeric-wc" 2 "could not determine the size of --from-json input" \
   --from-json "${fixtures_dir}/fio-3-ok.json" --label x
+# 失敗メッセージに wc の出力が入る（Issue #2002。原因の切り分け用）
+PATH="${wc_bad_bin}:${PATH}" run_case_msg "from-json-size-check-non-numeric-wc-shows-output" 2 "output 'not-a-number'" \
+  --from-json "${fixtures_dir}/fio-3-ok.json" --label x
+# wc が非 0 で終了する場合は終了コードと stderr を出して拒否する
+wc_fail_bin="${tmp_root}/wc-fail-bin"
+mkdir -p "$wc_fail_bin"
+printf '#!/usr/bin/env bash\ncat >/dev/null\necho "stub-wc-failure" >&2\nexit 1\n' >"${wc_fail_bin}/wc"
+chmod +x "${wc_fail_bin}/wc"
+PATH="${wc_fail_bin}:${PATH}" run_case_msg "from-json-size-check-wc-fails" 2 "could not determine the size of --from-json input" \
+  --from-json "${fixtures_dir}/fio-3-ok.json" --label x
+PATH="${wc_fail_bin}:${PATH}" run_case_msg "from-json-size-check-wc-fails-shows-status" 2 "wc -c exit 1, output 'stub-wc-failure'" \
+  --from-json "${fixtures_dir}/fio-3-ok.json" --label x
+
+# TMPDIR 未設定（既定の /tmp）でも動く
+saved_tmpdir="$TMPDIR"
+unset TMPDIR
+run_case "from-json-default-tmpdir" 0 --from-json "${fixtures_dir}/fio-3-ok.json" --label x
+export TMPDIR="$saved_tmpdir"
 
 # `-` で始まる相対パスの --output がオプションとして解釈されない（find・mktemp への
 # 受け渡しで `./` を前置する）
@@ -1026,6 +1050,36 @@ snapshot_case "device" 2 "is not a regular file" /dev/zero
 mkfifo "${tmp_root}/snapshot-fifo"
 snapshot_case "fifo-open-blocks" 2 "could not be read within 2s" "${tmp_root}/snapshot-fifo"
 snapshot_case "missing" 2 "could not be opened" "${tmp_root}/snapshot-no-such-file"
+
+# 検証中に一時ディレクトリごとスナップショットが消えた場合、診断に wc の出力と
+# スナップショット・一時ディレクトリの有無が入る（Issue #2002。#2083 の競合の切り分け用）。
+# head のスタブが入力をコピーした直後に一時ディレクトリを消し、決定的に再現する
+vanish_bin="${tmp_root}/vanish-bin"
+mkdir -p "$vanish_bin"
+# shellcheck disable=SC2016 # スタブへ書き出す文字列であり、$SNAPSHOT_STUB_TMPDIR はスタブ側で展開させる
+printf '#!/usr/bin/env bash\ncat\nrm -rf -- "$SNAPSHOT_STUB_TMPDIR"\n' >"${vanish_bin}/head"
+chmod +x "${vanish_bin}/head"
+vanish_work="${tmp_root}/snapshot-work-vanished"
+mkdir -p "$vanish_work"
+vanish_actual=0
+vanish_out=$(PATH="${vanish_bin}:${PATH}" SNAPSHOT_STUB_TMPDIR="$vanish_work" timeout -k 5s 30s "$bash_bin" "$snapshot_harness" "${tmp_root}/snapshot-small.json" "$vanish_work" 2>&1) || vanish_actual=$?
+if [ "$vanish_actual" -eq 2 ] && [[ "$vanish_out" == *"could not determine the size of test input"* ]] \
+  && [[ "$vanish_out" == *"is missing, temporary directory is missing"* ]]; then
+  echo "PASS: snapshot-vanished (exit=${vanish_actual})"
+else
+  echo "FAIL: snapshot-vanished (expected exit=2 with missing snapshot/directory, actual exit=${vanish_actual})" >&2
+  print_indented "$vanish_out"
+  failures=$((failures + 1))
+fi
+
+# 対象スクリプトが TMPDIR（script_tmp）配下に作った一時ディレクトリを残していない
+script_tmp_leftover=$(count_entries "$script_tmp" -mindepth 1 -maxdepth 1)
+if is_count "$script_tmp_leftover" 0; then
+  echo "PASS: script-tmp-no-leftover"
+else
+  echo "FAIL: script-tmp-no-leftover (found ${script_tmp_leftover} entries in ${script_tmp})" >&2
+  failures=$((failures + 1))
+fi
 
 if [ "$failures" -gt 0 ]; then
   echo "self-test failed: ${failures} case(s) did not match the expected result" >&2

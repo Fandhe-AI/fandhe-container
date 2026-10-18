@@ -77,14 +77,17 @@ fandhe-container/
 │   │   │   └── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
 │   │   ├── macos-vm-strategy.md   # macOS の VM 利用方式（既定: 常駐 VM 共用＋軽量プロセス分離／オプション: 1 コンテナ = 1 VM。TASK-66・MAC-4）
 │   │   ├── fs-normalization.md   # FS 正規化（NFC/NFD の別表記の衝突を検出して拒否・名前は書き換えない。TASK-21・IO-5）
+│   │   ├── oci-layer-special-bits.md  # レイヤー展開の setuid / setgid / sticky を所有者の写像に合わせて保持する条件（既定は落とす。#1810・OCI-1・SEC-5）
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   │   ├── rootless-network.md    # rootless ネットワーク外部ヘルパーの判断記録（TASK-147・NET-9。pasta を採用〔#340〕。実装・実証は #341）
 │   │   ├── privilege-separation.md  # 権限分離方式の比較と必要最小権限の設計書（TASK-171.1.1・SUP-14。方式承認済み〔#1454〕）
 │   │   ├── dev-default-mounts.md  # OCI 既定の /dev の残り（/dev/pts・/dev/ptmx・/dev/shm・/dev/console）と rootless の /dev 供給方式の設計ドラフト（TASK-29 追補・#1609。方式を確定し実装 issue を #54 配下に起票）
+│   │   ├── windows-execution-layout.md  # Windows の実行構成（WSL2 ゲスト内の core とホストの起動役）の設計ドラフト（#1415・#1539 の決定以外はオーナー承認待ち。TASK-116 追補・#1862・WIN-1）
 │   │   └── audit-delivery.md      # seccomp・Landlock の拒否を監査の記録先へ届ける配送経路の設計（2026-10-15 に方式を採用・#2018。実装は #2023〜#2028・#2004。TASK-41 追補・#1835・SEC-4）
 │   ├── setup/                     # 利用者向けセットアップ手順
 │   │   ├── linux.md               # Linux の配置手順（CLI・supervisor・launcher を同じディレクトリに置く。rootful はインストールスクリプト、rootless は利用者所有のディレクトリ。`PATH` 上の symlink。#2068・SUP-14・CORE-6）
-│   │   └── windows.md             # Windows セットアップ前提条件（WSL2・Developer Mode・`.wslconfig` の virtiofs。TASK-69・WIN-5。NTFS セマンティクス差異への対応〔TASK-68・WIN-4〕を統合）
+│   │   ├── windows.md             # Windows セットアップ前提条件（WSL2・Developer Mode・`.wslconfig` の virtiofs。TASK-69・WIN-5。NTFS セマンティクス差異への対応〔TASK-68・WIN-4〕を統合）
+│   │   └── plugin-socket-recovery.md  # plugin socket の `ALREADY_EXISTS` の見分け方と記録の無い socket の手動削除の手順（#1859・PLUG-12）
 │   ├── verification/              # 実機確認の記録雛形（cli-cross-platform-parity.md: CLI 基本 6 コマンドの 3 OS 同一構文・挙動チェックリスト。TASK-125.1・CLI-1。結果記入は #661。supervisor-measurement-runbook.md: 監視プロセス系の実機計測〔#499・#485・#491・#219〕の実行手順。#1820）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external・ci（稼働）/ release（発火条件無効化中）

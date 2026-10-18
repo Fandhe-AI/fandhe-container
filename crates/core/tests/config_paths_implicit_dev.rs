@@ -382,9 +382,11 @@ mod linux {
             let _ = child.kill_and_reap(Duration::from_secs(5));
             panic!("[{label}] {why}")
         };
-        // 子の `ready` までを別スレッドで読み、期限付きで待つ（子が前段で失敗すれば EOF で戻る）。
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        // 子の `ready` までを読む。unshare(CLONE_NEWPID) 後のこのプロセスは pid namespace が
+        // 子孫用に切り替わっており、スレッド生成が EINVAL になるため別スレッドは使わない。
+        // 子が前段で失敗すれば EOF で戻る。子のハングは親の run_bounded の全体期限
+        // （プロセスグループ kill）が回収する（REPAIR-5）。
+        let text = {
             let mut text = String::new();
             let mut limited = reader.take(64 * 1024);
             let mut buf = [0u8; 4096];
@@ -399,11 +401,8 @@ mod linux {
                     }
                 }
             }
-            let _ = tx.send(text);
-        });
-        let text = rx
-            .recv_timeout(timeout())
-            .unwrap_or_else(|_| kill("the child did not report within the timeout"));
+            text
+        };
         if !text.lines().any(|l| l == "ready") {
             let exit = child.wait_timeout(timeout());
             panic!("[{label}] the child failed before ready: {exit:?}\n{text}");

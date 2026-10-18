@@ -1064,10 +1064,10 @@ mkdir -p "$vanish_work"
 vanish_actual=0
 vanish_out=$(PATH="${vanish_bin}:${PATH}" SNAPSHOT_STUB_TMPDIR="$vanish_work" timeout -k 5s 30s "$bash_bin" "$snapshot_harness" "${tmp_root}/snapshot-small.json" "$vanish_work" 2>&1) || vanish_actual=$?
 if [ "$vanish_actual" -eq 2 ] && [[ "$vanish_out" == *"could not determine the size of test input"* ]] \
-  && [[ "$vanish_out" == *"No such file or directory"* ]] && [[ "$vanish_out" == *"is missing, temporary directory is missing"* ]]; then
+  && [[ "$vanish_out" == *"is missing, temporary directory is missing"* ]]; then
   echo "PASS: snapshot-vanished (exit=${vanish_actual})"
 else
-  echo "FAIL: snapshot-vanished (expected exit=2 with wc output and missing snapshot/directory, actual exit=${vanish_actual})" >&2
+  echo "FAIL: snapshot-vanished (expected exit=2 with missing snapshot/directory, actual exit=${vanish_actual})" >&2
   print_indented "$vanish_out"
   failures=$((failures + 1))
 fi

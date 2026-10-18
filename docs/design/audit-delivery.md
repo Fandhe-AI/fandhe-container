@@ -112,12 +112,12 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 | 呼び出し元 | 記録ヘルパ | 配線 | 追う issue |
 | ---------- | ---------- | ---- | ---------- |
 | supervisor の exec（`exec_target`・`entrypoint`・`rootfs_pivot` の mount） | `AuditSink` | 配線済み（`default_audit_sink`。#1594） | - |
-| launch 経路のマウントの拒否 | mount 層 | pivot 前段の失敗の記録は #1815（closed）で対応 | - |
+| launch 経路のマウントの拒否 | mount 層 | pivot 前段の失敗の記録は #1815（closed）で対応。読み取り専用化・覆い（固定集合・config 由来）の適用失敗も、理由 `readonly_path_apply_failed`・`masked_path_apply_failed` で同じ経路に載せた（SEC-2・SEC-4。#2013）。マウント操作の失敗は環境起因（古いカーネル・LSM）と rootfs の内容起因を親が区別できず、記録漏れの方が過剰な記録より悪いため記録する（理由トークンは対象の検査の拒否と分ける）。記録に段のフィールドは無く、段は返る `ExecError.stage` に載る（フィールドの追加は #653） | - |
 | `mounts[]` の bind mount | mount 層 | 未配線（検証済みの型への変換が先） | #1911（open）ほか |
 | seccomp・Landlock | `record_seccomp_denial`・`landlock_denial_record` | 配送経路が無い（本書の対象） | #1835（本書）→ 実装は #2023〜#2028・#2004（9 章） |
-| plugin 信頼検証（`AuditLayer::PluginTrust`） | 監査つき検証ラッパー実装済み | レジストリ・本番 sink への配線は未実装 | #2013 |
-| CLI・healthcheck | - | 未配線 | #495（healthcheck。open）。CLI の本番 sink は #2013 |
-| コンテナ ID の付与 | `AuditRecord::container_id` | seccomp・landlock・plugin_trust への配線は未実装 | #1618（closed。型のみ）。plugin_trust への付与は #2013、seccomp は #2025 |
+| plugin 信頼検証（`AuditLayer::PluginTrust`） | `verify_candidate_audited` | CLI の plugin バックエンド（macOS・Windows の本番経路）に配線済み（#2013）。記録先は `FileAuditSink::open_in_state_root`。作れないときは `SinkFailed`（黙って捨てない。拒否は覆らない）。非 Linux では `FileStateStore` が未実装で記録先を作れず `SinkFailed`。レジストリ・spawn への配線は TASK-114 | TASK-114 |
+| CLI・healthcheck | - | CLI は plugin 信頼検証の記録先を配線済み（#2013）。healthcheck は未配線 | #495（healthcheck。open） |
+| コンテナ ID の付与 | `AuditRecord::container_id` | mount・exec_target・entrypoint は付与済み。plugin_trust は付与しない（検証はコンテナを特定する前にバックエンドを解決するために走り、特定のコンテナに属さないため。#2013）。seccomp・landlock は未配線 | #1618（closed。型のみ）。seccomp は #2025 |
 
 監査ログ・可観測性・エラー出力の統一は #653（TASK-98.2。open）が担う。本書は配送経路に限り、レコード形式の統一とは分ける。着手時に `git grep` と issue 検索で最新の状態を確かめる。
 

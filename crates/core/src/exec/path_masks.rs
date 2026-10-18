@@ -50,8 +50,20 @@
 //!   `mounts[]` で sysfs を `/sys` に載せる場合は、本段より前に載せること
 //! - `/proc` の供給（procfs マウント）。現状は本段より後に procfs をマウントする実装がない。将来 OCI `mounts[]`
 //!   等で procfs を `/proc` に載せる場合は、`/sys` と同様に本段より前に載せること（後から載せると読み取り専用の bind が隠れる）
-//! - 違反の監査（SEC-4）への記録: 失敗は `ExecError`（段 `MountReadonlyPaths`）で返すだけで、専用の
-//!   `ViolationReason` は足していない
+//! - 記録に段のフィールドを足すこと: 経路検査の拒否は汎用理由（`path_symlink_or_not_directory` 等）で記録され、
+//!   記録の理由だけでは段が分からない（段は返る `ExecError::stage` に載る）。段のフィールドは #653（TASK-98.2）
+//!   の共通ログ型の範囲
+//!
+//! # 監査（SEC-4）
+//!
+//! 対象を固定して検査を通った後の、保護を載せる操作（bind・開き直し・新しいマウントの確認・`mount_setattr`・
+//! `ro` の観測）の失敗には、違反の理由 `readonly_path_apply_failed`（種別 `protected_path_apply`。`ExecError::code`
+//! は errno 由来のまま）を付ける。子は状態 pipe でこの理由を親へ返し、親が層 `mount` の記録を 1 件書く
+//! （`exec/launch_status.rs`。`container_id` つき・パスなし。#2013）。環境起因（古いカーネル・LSM）と rootfs の内容
+//! 起因を親は区別できず、SEC-4 は記録漏れを許さないため、どちらも記録する（理由トークンは経路検査の拒否と分ける）。
+//! 経路検査の拒否（`path_symlink_or_not_directory`・`target_on_shared_mount`・`target_moved`）は既存の汎用理由のまま。
+//! マウント前のシステムエラー（`fstat`・`dup`・定義の不正）は違反なしの失敗で、記録しない。`ENOENT` で飛ばす
+//! 挙動は変わらない。
 //!
 //! # 単体テストの安全策
 //!
@@ -193,33 +205,40 @@ fn apply_one(
     let before_mnt_id = fd_mount_id(&leaf, STAGE)?;
 
     let target = fd_magic_path(&leaf)?;
-    bind_syscall(&target)
-        .map_err(|e| ExecError::from_sys(e, STAGE, &format!("mount(MS_BIND on {path})")))?;
 
-    // bind 前に得た fd は下層の dentry を指す。保持した親 fd から同名で開き直し、新しい mount top を得る。
-    let reopened = sys::open_path_nofollow(parent, &c_leaf)
-        .map_err(|e| ExecError::from_sys(e, STAGE, &format!("openat({path}) after bind")))?;
-    let reopened_meta = fd_metadata(&reopened, &format!("fstat({path}) after bind"))?;
-    if (leaf_meta.dev(), leaf_meta.ino()) != (reopened_meta.dev(), reopened_meta.ino()) {
-        return Err(violation(ViolationReason::TargetMoved));
-    }
-    check_new_mount(&reopened, before_mnt_id, &violation)?;
+    // 対象を固定して検査を通った後の、保護を載せる操作と事後検証。ここでの失敗は違反の理由を持たないため、
+    // 区間の末尾で一度だけ `ReadonlyPathApplyFailed` を付ける（既に `target_moved` 等を持つ失敗は上書きしない。
+    // 呼び出し点の取りこぼしを防ぐ。SEC-4・#2013）。
+    let apply = || -> Result<Outcome, ExecError> {
+        bind_syscall(&target)
+            .map_err(|e| ExecError::from_sys(e, STAGE, &format!("mount(MS_BIND on {path})")))?;
 
-    read_only_syscall(reopened.as_fd()).map_err(|e| {
-        ExecError::from_sys(
-            e,
-            STAGE,
-            &format!("mount_setattr(MOUNT_ATTR_RDONLY on {path})"),
-        )
-    })?;
-    if !observe_read_only(&reopened)? {
-        return Err(ExecError::new(
-            ErrorCode::FailedPrecondition,
-            STAGE,
-            format!("the mount at {path} is not read-only after mount_setattr"),
-        ));
-    }
-    Ok(Outcome::Applied)
+        // bind 前に得た fd は下層の dentry を指す。保持した親 fd から同名で開き直し、新しい mount top を得る。
+        let reopened = sys::open_path_nofollow(parent, &c_leaf)
+            .map_err(|e| ExecError::from_sys(e, STAGE, &format!("openat({path}) after bind")))?;
+        let reopened_meta = fd_metadata(&reopened, &format!("fstat({path}) after bind"))?;
+        if (leaf_meta.dev(), leaf_meta.ino()) != (reopened_meta.dev(), reopened_meta.ino()) {
+            return Err(violation(ViolationReason::TargetMoved));
+        }
+        check_new_mount(&reopened, before_mnt_id, &violation)?;
+
+        read_only_syscall(reopened.as_fd()).map_err(|e| {
+            ExecError::from_sys(
+                e,
+                STAGE,
+                &format!("mount_setattr(MOUNT_ATTR_RDONLY on {path})"),
+            )
+        })?;
+        if !observe_read_only(&reopened)? {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                STAGE,
+                format!("the mount at {path} is not read-only after mount_setattr"),
+            ));
+        }
+        Ok(Outcome::Applied)
+    };
+    apply().map_err(|e| e.or_violation(ViolationReason::ReadonlyPathApplyFailed, Some(&subject)))
 }
 
 /// 要素名を NUL 終端文字列にする（定義は定数のため NUL を含まないが、`unwrap` を避けて拒否する）。
@@ -575,6 +594,117 @@ mod tests {
         );
         // bind は済んでいるが、後続の対象は処理されない。
         assert_eq!(take_events(), vec![pair(&tmp, "bind", "proc/bus")]);
+    }
+
+    /// 子の失敗を状態 pipe の往復で親へ運び、層 `mount` の記録 1 件（パスなし・`container_id` つき）を照合する。
+    /// 戻り値は `(親が復元した ExecError, 記録の理由)`。
+    fn relay_and_record(err: &ExecError) -> (ExecError, Option<String>) {
+        use crate::audit_log::mount::tests::VecSink;
+        use crate::audit_log::{AuditDelivery, AuditLayer};
+        use crate::exec::launch_status::{LaunchAudit, PrePivotStep, relay_failure_for_test};
+        use crate::traits::ContainerId;
+
+        let sink = VecSink::new(false);
+        let id = ContainerId::new("c1").expect("id");
+        let out = relay_failure_for_test(
+            PrePivotStep::ReadonlyPaths,
+            err,
+            LaunchAudit {
+                sink: &sink,
+                container: Some(&id),
+            },
+        )
+        .expect_err("rejected");
+        let recs = sink.snapshot();
+        if out.delivery == AuditDelivery::NotApplicable {
+            assert_eq!(recs.len(), 0);
+            return (out.error, None);
+        }
+        assert_eq!(out.delivery, AuditDelivery::Recorded);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), AuditLayer::Mount);
+        assert_eq!(recs[0].path(), None);
+        assert_eq!(recs[0].container_id().map(ContainerId::as_str), Some("c1"));
+        let reason = recs[0].reason().map(|r| r.as_str().to_string());
+        (out.error, reason)
+    }
+
+    /// SEC-4・SEC-2（#2013）: bind の失敗・読み取り専用化の失敗（未対応カーネル）・事後条件の失敗のそれぞれに
+    /// `readonly_path_apply_failed` が付き、`code`・`stage`・`message` は従来のまま。状態 pipe の往復を経て親で
+    /// 層 `mount` の記録 1 件になり、`ErrorCode` も保たれる。
+    #[test]
+    fn sec4_2013_apply_failures_carry_reason_and_reach_the_audit_record() {
+        for (case, code) in [
+            ("bind", ErrorCode::FailedPrecondition),
+            ("ro", ErrorCode::Unimplemented),
+            ("post", ErrorCode::FailedPrecondition),
+        ] {
+            reset();
+            let _shared = override_shared(false);
+            let tmp = full_rootfs("ro-apply-audit");
+            match case {
+                "bind" => BIND_FAIL.with(|f| f.set(Some(SysError::Os(sys::EINVAL)))),
+                "ro" => RO_FAIL.with(|f| f.set(Some(SysError::Unsupported))),
+                _ => FORCE_RW.with(|f| f.set(true)),
+            }
+            let fd = tmp.fd();
+            let err = apply_at(fd.as_fd()).expect_err(case);
+            assert_eq!(err.code, code, "{case}");
+            assert_eq!(err.stage, IsolationStage::MountReadonlyPaths, "{case}");
+            assert_eq!(
+                err.violation.as_ref().map(|v| v.reason),
+                Some(ViolationReason::ReadonlyPathApplyFailed),
+                "{case}"
+            );
+            let (restored, reason) = relay_and_record(&err);
+            assert_eq!(
+                reason.as_deref(),
+                Some("readonly_path_apply_failed"),
+                "{case}"
+            );
+            assert_eq!(restored.code, code, "{case}");
+            assert_eq!(restored.stage, IsolationStage::MountReadonlyPaths);
+            assert_eq!(
+                restored.message,
+                "failed to apply a read-only path protection"
+            );
+        }
+    }
+
+    /// SEC-4・SEC-2（#2013）: `config.json` 由来の対象（固定集合が不在の rootfs に `/data/x` だけを置く）の
+    /// 適用失敗も同じ理由で記録され、メッセージに対象のパスが出る。
+    #[test]
+    fn sec4_2013_config_target_apply_failure_is_recorded() {
+        reset();
+        let _shared = override_shared(false);
+        let tmp = Tmp::new("ro-extra-audit");
+        std::fs::create_dir_all(tmp.0.join("data/x")).expect("mkdir");
+        BIND_FAIL.with(|f| f.set(Some(SysError::Os(sys::EINVAL))));
+        let extra = [ProtectedPath::parse("/data/x", 4096).expect("valid")];
+        let fd = tmp.fd();
+        let err = apply_at_with(fd.as_fd(), &extra).expect_err("bind");
+        assert!(
+            err.message.starts_with("mount(MS_BIND on /data/x) failed"),
+            "{}",
+            err.message
+        );
+        let (_, reason) = relay_and_record(&err);
+        assert_eq!(reason.as_deref(), Some("readonly_path_apply_failed"));
+    }
+
+    /// SEC-4（#2013）: 経路検査の拒否（symlink）は既存の汎用理由のまま記録され、適用失敗の理由に置き換わらない。
+    #[test]
+    fn sec4_2013_path_check_rejection_keeps_generic_reason() {
+        reset();
+        let _shared = override_shared(false);
+        let tmp = full_rootfs("ro-symlink-audit");
+        std::fs::remove_dir(tmp.0.join("proc/irq")).expect("rm");
+        symlink("/etc", tmp.0.join("proc/irq")).expect("symlink");
+        let fd = tmp.fd();
+        let err = apply_at(fd.as_fd()).expect_err("symlink");
+        let (restored, reason) = relay_and_record(&err);
+        assert_eq!(reason.as_deref(), Some("path_symlink_or_not_directory"));
+        assert_eq!(restored.stage, IsolationStage::MountReadonlyPaths);
     }
 
     /// SEC-2（#1850）: 事後条件（読み取り専用が観測できない）の失敗は `FailedPrecondition`。

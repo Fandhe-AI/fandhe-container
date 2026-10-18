@@ -36,7 +36,10 @@
 //!   主経路の失敗時のカーネル監査（NETLINK_AUDIT）フォールバックは `kernel_audit` で実装済み（TASK-41.5.2・#840）。
 //!   両者を束ねる本番 sink `FileAuditSink`（`AuditSink` 実装。#1594）も実装済みで、supervisor の exec は
 //!   `exec::default_audit_sink` で構築する。一方、常時の二重記録（tee）によるクラッシュ・改ざん時の記録保持、
-//!   CLI・healthcheck・mount・plugin 信頼検証への配線は **未実装**（REPAIR-3: 実装済みを装わない）
+//!   healthcheck・launch 経路（launcher）への配線は **未実装**（REPAIR-3: 実装済みを装わない）。plugin 信頼検証は
+//!   CLI の plugin バックエンド（`fandhe-container-cli` の `plugin_backend`。macOS・Windows の本番経路）に配線済み
+//!   （#2013）。記録先は `FileAuditSink::open_in_state_root` で作り、非 Linux では `FileStateStore` が未実装のため
+//!   記録先を作れず `SinkFailed` になる。レジストリ・spawn への配線は TASK-114
 //! - レイヤーごとのペイロードを [`AuditEvent`] の enum で持ち、「syscall の無い seccomp 違反」のような
 //!   不正な組み合わせを構築できない（REPAIR-2）。値は各 newtype の構築子が検証する
 //! - 秘密情報（資格情報・環境変数・namespace 識別子）は含めない。ホスト側の実パスを載せるかは各フックで判断する
@@ -46,7 +49,8 @@
 //! syscall 番号はアーキテクチャ相対（x86_64 / aarch64 で異なる）ため、seccomp レコードは
 //! アーキ識別子（`AUDIT_ARCH_*`。[`AuditSyscallArch`]）を併せて持つ（#193 で決定）。
 //! コンテナ ID は #1618 で [`AuditRecord::container_id`] として追加済み（検証済みの `ContainerId` のみ。
-//! mount・exec_target・entrypoint の配送ヘルパが載せる。seccomp・landlock・plugin_trust への配線は未実装）。
+//! mount・exec_target・entrypoint の配送ヘルパが載せる。seccomp・landlock への配線は未実装。plugin_trust は
+//! 検証がコンテナを特定する前に走り特定のコンテナに属さないため、載せない〔#2013〕）。
 //! pid1 の PID は未検証の候補しか得られないため載せない。フィールドは非公開かつ `#[non_exhaustive]` なので、
 //! 後から追加しても破壊的変更にならない。
 

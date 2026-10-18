@@ -304,6 +304,14 @@ name = "child_subreaper"
 path = "tests/child_subreaper.rs"
 harness = false
 
+# plugin 信頼検証の拒否が本番の記録先（FileAuditSink の @audit.log）へ届くことの結合試験（SEC-4・PLUG-11・#2013）。
+# FileAuditSink は主経路のファイル I/O を fork した子で行うため単一スレッドの独自 main（harness = false）で動かす。
+# root 不要で既定のテスト集合に含まれる。依存は不変。
+[[test]]
+name = "plugin_trust_audit_delivery"
+path = "tests/plugin_trust_audit_delivery.rs"
+harness = false
+
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]
 workspace = true

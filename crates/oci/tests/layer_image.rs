@@ -229,3 +229,29 @@ fn oci1_plain_layer_size_limit_is_enforced() {
     let e = extract_image_layers(&layers, &t.root(), 1024, limits()).unwrap_err();
     assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
 }
+
+/// OCI-1: レイヤー 0 のイメージは空の rootfs として正常に終わり、root には何も作らない。
+#[test]
+fn oci1_zero_layer_image_yields_empty_result() {
+    let t = Tmp::new("zero");
+    let r = extract_image_layers(&[], &t.root(), 1 << 20, limits()).unwrap();
+    assert_eq!(r.len(), 0);
+    assert!(root_is_empty(&t.root()));
+}
+
+/// OCI-1: レイヤー 0 でも root が空でなければ従来どおり拒否する。
+#[test]
+fn oci1_zero_layer_image_rejects_non_empty_root() {
+    let t = Tmp::new("zero-dirty");
+    std::fs::write(t.root().join("stale"), b"x").unwrap();
+    let e = extract_image_layers(&[], &t.root(), 1 << 20, limits()).unwrap_err();
+    assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+}
+
+/// OCI-1: 存在しない root はレイヤー 0 でも拒否する。
+#[test]
+fn oci1_zero_layer_image_rejects_missing_root() {
+    let t = Tmp::new("zero-missing");
+    let missing = t.root().join("nope");
+    assert!(extract_image_layers(&[], &missing, 1 << 20, limits()).is_err());
+}

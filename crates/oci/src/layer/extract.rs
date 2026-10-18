@@ -646,6 +646,12 @@ pub fn extract_image_layers_with_policy(
     limits: ExtractLimits,
     policy: SpecialBitsPolicy,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
+    // レイヤー 0 のイメージ（manifest の layers と diff_ids がともに空）は正常な入力。展開物は空の rootfs になる。
+    // `extract_stack` は空入力を拒否するため、ここで root の前提（存在・ディレクトリ・空）だけ確かめて空の結果を返す。
+    if layers.is_empty() {
+        check_root_empty(root)?;
+        return Ok(Vec::new());
+    }
     let sources = layers
         .iter()
         .map(|l| {

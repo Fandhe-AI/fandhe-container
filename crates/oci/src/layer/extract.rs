@@ -12,6 +12,8 @@
 //!   削除・権限変更・リンク作成の前に `AlreadyExists` で拒否する（IO-5。下記「別表記の衝突」）。
 //! - whiteout・不透明ディレクトリを下位レイヤーの実体へ適用し、マーカー自体は展開しない（OCI-2。下記
 //!   「レイヤーごとの 3 パス」）。
+//! - AUFS のメタデータ（`.wh..wh.` で始まり `.wh..wh..opq` 以外の名前。`.wh..wh.plnk` 等）は、深さ・種別を問わず
+//!   エントリごと読み飛ばして rootfs へ何も書かない（#2183・OCI-2。下記「AUFS メタデータの予約名」）。
 //!
 //! tar クレートは解析（エントリ列挙）だけに使い、`unpack` / `unpack_in` は使わない（#408 の承認条件）。
 //!
@@ -58,6 +60,23 @@
 //!
 //! 同じレイヤーの hardlink の参照先が同じレイヤーで whiteout されている場合、参照先はパス 2 で消えるため
 //! `NotFound` で拒否する（並び順に依らない）。
+//!
+//! # AUFS メタデータの予約名（#2183・OCI-2）
+//!
+//! image-spec v1.1.1 `layer.md` が定めるのは `.wh.<name>` と `.wh..wh..opq` だけで、`.wh..wh.` という予約接頭辞は無い。
+//! 一方 AUFS ストレージドライバ時代の Docker のイメージには `.wh..wh.plnk`・`.wh..wh.aufs`・`.wh..wh.orph` 等が残る。
+//! moby/go-archive（`UnpackLayer`。commit a9a82af9）はこれらを読み飛ばし、containerd も失敗させないため、
+//! 拒否すると古いイメージが展開できない。image-spec 上 `.wh.` で始まる名前は FS に実在できず whiteout 自体も隠す
+//! 決まりなので、読み飛ばしても仕様に反しない。よって本実装も読み飛ばす（`Plan::Skip`）。
+//!
+//! - 判定はパスを先頭から順に分類し、最初に通常でないと判定されたコンポーネントが決める。予約名が先なら
+//!   配下（中身のある通常ファイル・ディレクトリ・リンク・FIFO を含む）をエントリごと読み飛ばす。親の位置の
+//!   `.wh.<x>`・`.wh..wh..opq` が先なら従来どおり `InvalidArgument` で拒否する（fail-closed）。
+//! - 判定は `normalize_entry_path` の後なので、`..`・絶対パス・NUL・長すぎるパスは予約名の下でも拒否する。
+//! - 読み飛ばしたエントリも `max_entries` と入力上限には数え、展開バイト数には数えない。件数は
+//!   `ExtractedLayer::ignored_reserved_entries` に返す（黙って捨てない）。
+//! - moby との差: moby は `.wh..wh.plnk` 配下を指す hardlink の参照先を差し替えるが、本実装は再現しない。
+//!   参照先が展開されないため、その hardlink は `NotFound` で拒否する（fail-closed）。
 //!
 //! # 別表記の衝突（IO-5）
 //! 大文字小文字非区別の FS（Windows・macOS の既定）では `f` と `F`、正規化非区別の FS（APFS）では NFC と NFD の
@@ -200,6 +219,10 @@ pub struct ExtractedLayer {
     /// 0 でなければ、展開結果の mode はレイヤーの記述と一致しない（ポリシーの条件を満たさなかった。
     /// モジュール冒頭の「通常ファイルの setuid / setgid / sticky」を参照）。
     pub files_with_stripped_special_bits: u64,
+    /// AUFS メタデータの予約名（`.wh..wh.` で始まり `.wh..wh..opq` 以外。配下を含む）として読み飛ばしたエントリ数。
+    ///
+    /// 読み飛ばしたエントリは rootfs へ何も書かず、何も消さない（`entries` には数え、`bytes` には数えない。#2183・OCI-2）。
+    pub ignored_reserved_entries: u64,
     /// 特殊ビットのポリシーの判定と、保持した件数（#1810）。
     pub special_bits: SpecialBitsOutcome,
 }
@@ -666,6 +689,8 @@ enum Removal {
 enum Plan {
     /// whiteout・不透明マーカー（展開しない）。
     Marker(Marker),
+    /// AUFS メタデータの予約名（`.wh..wh.` で始まり `.wh..wh..opq` 以外）。何も書かず何も消さない（#2183）。
+    Skip,
     /// ディレクトリ（名前が `/` で終わる通常ファイルを含む）。
     Dir(Vec<OsString>, u32),
     /// 通常ファイル。
@@ -690,6 +715,8 @@ struct Extractor<'a> {
     bytes: u64,
     /// setuid / setgid / sticky を落として展開した通常ファイルのエントリ数。
     stripped_special: u64,
+    /// 予約名として読み飛ばしたエントリ数（`ExtractedLayer::ignored_reserved_entries` の元）。
+    ignored_reserved: u64,
     /// 特殊ビットを tar の値どおりに適用した通常ファイルのエントリ数。
     preserved_special: u64,
     /// 特殊ビットのポリシーの評価結果（展開の開始時に 1 回決める）。
@@ -1808,8 +1835,10 @@ fn check_root_empty(root: &Path) -> Result<(), OciError> {
 
 /// tar エントリ 1 件を検証し、処理内容を返す（パス 1 とパス 3 で共通。副作用なし）。
 ///
-/// パスの正規化（`normalize_entry_path`）、親コンポーネントの whiteout 名・予約名の拒否、最終コンポーネントの
-/// 分類（`whiteout::classify`）、マーカーの形（中身の無い通常ファイル）の検査、未対応の種別の拒否を行う。
+/// パスの正規化（`normalize_entry_path`）、先頭から順の各コンポーネントの分類（`whiteout::classify`）。
+/// 最初に通常でないと判定されたものが決める: 予約名（AUFS メタデータ）ならエントリ全体を `Plan::Skip`
+/// （読み飛ばし。moby / containerd と同じ。#2183・OCI-2）、親の位置の whiteout 名・不透明マーカーなら拒否。
+/// 最終コンポーネントの分類、マーカーの形（中身の無い通常ファイル）の検査、未対応の種別の拒否を行う。
 fn plan_entry<R: Read>(entry: &tar::Entry<'_, R>) -> Result<Plan, OciError> {
     let ty = entry.header().entry_type();
     let raw_path = entry.path_bytes();
@@ -1822,6 +1851,12 @@ fn plan_entry<R: Read>(entry: &tar::Entry<'_, R>) -> Result<Plan, OciError> {
     let mut class = NameClass::Regular;
     while let Some(c) = raw_comps.next() {
         let cls = whiteout::classify(c)?;
+        if cls == NameClass::Reserved {
+            // AUFS メタデータ。最初に現れた非通常コンポーネントが予約名なら、深さ・種別・サイズを問わず
+            // エントリ全体を読み飛ばす（配下の通常ファイルは中身を持つためマーカーの形は検査しない）。
+            // 正規化（`..`・絶対パス・NUL・長さ）は上で済んでおり、予約名の下でも従来どおり拒否される。
+            return Ok(Plan::Skip);
+        }
         if raw_comps.peek().is_none() {
             class = cls;
         } else if cls != NameClass::Regular {
@@ -1924,6 +1959,8 @@ fn collect_markers<R: Read>(
             }
             match plan_entry(&entry)? {
                 Plan::Marker(m) => markers.push(m),
+                // 書き出さないため展開バイト数には数えない（エントリ数は上で数え済み）。
+                Plan::Skip => {}
                 Plan::File(..) => {
                     bytes = bytes
                         .checked_add(entry.size())
@@ -1957,7 +1994,7 @@ fn extract_one_layer<S: LayerSource>(
     input_budget: u64,
 ) -> Result<(ExtractedLayer, u64), OciError> {
     let (entries0, bytes0, stripped0) = (x.entries, x.bytes, x.stripped_special);
-    let preserved0 = x.preserved_special;
+    let (preserved0, ignored0) = (x.preserved_special, x.ignored_reserved);
     let max_entries = x.limits.max_entries;
     let markers = collect_markers(x, src.open()?, input_budget)?;
     x.apply_markers(&markers)?;
@@ -1989,6 +2026,8 @@ fn extract_one_layer<S: LayerSource>(
             match plan_entry(&entry)? {
                 // マーカーはパス 2 で適用済み。rootfs へは書かない（OCI-2）。
                 Plan::Marker(_) => {}
+                // 予約名は本体を読み捨てて件数だけ数える（rootfs へ書かない。#2183）。
+                Plan::Skip => x.ignored_reserved = x.ignored_reserved.saturating_add(1),
                 Plan::Dir(comps, mode) => x.make_dir(comps, mode)?,
                 Plan::File(comps, mode) => {
                     let size = entry.size();
@@ -2023,6 +2062,7 @@ fn extract_one_layer<S: LayerSource>(
             entries: x.entries.saturating_sub(entries0),
             bytes: x.bytes.saturating_sub(bytes0),
             files_with_stripped_special_bits: x.stripped_special.saturating_sub(stripped0),
+            ignored_reserved_entries: x.ignored_reserved.saturating_sub(ignored0),
             special_bits: SpecialBitsOutcome {
                 decision: x.special.decision,
                 preserved_files: x.preserved_special.saturating_sub(preserved0),
@@ -2067,6 +2107,7 @@ fn extract_stack<S: LayerSource>(
                     entries: 0,
                     bytes: 0,
                     stripped_special: 0,
+                    ignored_reserved: 0,
                     preserved_special: 0,
                     special: eval_special_ctx(&setup, root)?,
                     deferred_dirs: HashMap::new(),
@@ -4124,6 +4165,7 @@ mod tests {
             entries: 0,
             bytes: 0,
             stripped_special: 0,
+            ignored_reserved: 0,
             preserved_special: 0,
             special: SpecialCtx::strip(),
             deferred_dirs: HashMap::new(),
@@ -4705,7 +4747,10 @@ mod tests {
                 file("../escape", 0o644, b"z"),
                 OciErrorCode::PermissionDenied,
             ),
-            (wh("d/.wh..wh.plnk"), OciErrorCode::InvalidArgument),
+            (
+                file(".wh..wh..opq/x", 0o644, b"z"),
+                OciErrorCode::InvalidArgument,
+            ),
             (file(".wh.a/b", 0o644, b"z"), OciErrorCode::InvalidArgument),
             (
                 file("d/.wh.y", 0o644, b"junk"),
@@ -4720,6 +4765,93 @@ mod tests {
             let mut entries = head();
             entries.push(bad);
             assert_eq!(lay_err(&mut ex, &entries), want);
+            assert_eq!(snapshot(&sb.root), before);
+        }
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2・#2183: AUFS メタデータの予約名（配下を含む）は rootfs に書かれず、他のエントリ（通常の whiteout を含む）
+    /// の展開に影響しない。結果は並び順に依らない。
+    #[test]
+    fn oci2_aufs_reserved_entries_are_skipped() {
+        let r = all_orders(
+            &[file("a", 0o644, b"a"), file("d/c", 0o644, b"c")],
+            &[
+                dir(".wh..wh.plnk/", 0o755),
+                file(".wh..wh.plnk/123", 0o644, b"payload"),
+                file(".wh..wh.aufs", 0o644, b"meta"),
+                wh(".wh.a"),
+                file("b", 0o644, b"b"),
+            ],
+        );
+        assert_eq!(
+            r.unwrap(),
+            snap(&[("b", "file:b"), ("d", D755), ("d/c", "file:c")])
+        );
+    }
+
+    /// OCI-2・#2183: 読み飛ばしの件数・バイト数の数え方（ネスト・単体・FIFO を含む）。
+    #[test]
+    fn oci2_aufs_reserved_skip_counts() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        let entries = [
+            file("ok", 0o644, b"ok"),
+            file("d/.wh..wh.plnk", 0o644, b"abc"),
+            file(".wh..wh.orph/x", 0o644, b"zz"),
+            wh(".wh..wh."),
+            raw_entry(b".wh..wh.orph/f", EntryType::Fifo, b"", 0o644, 0, b""),
+        ];
+        let r = extract_one_layer(
+            &mut ex,
+            &mut Rewind::new(Cursor::new(archive(&entries))),
+            1 << 30,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(r.entries, 5);
+        assert_eq!(r.ignored_reserved_entries, 4);
+        assert_eq!(r.bytes, 2);
+        assert_eq!(snapshot(&sb.root), snap(&[("ok", "file:ok")]));
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2・#2183: `.wh..wh.plnk` 配下を指す hardlink は moby の差し替えを再現せず、並びに依らず `NotFound`。
+    #[test]
+    fn oci2_hardlink_into_aufs_plnk_is_not_found() {
+        let r = all_orders(
+            &[],
+            &[
+                file(".wh..wh.plnk/123", 0o644, b"x"),
+                hardlink("g", ".wh..wh.plnk/123"),
+            ],
+        );
+        assert_eq!(r.unwrap_err(), OciErrorCode::NotFound);
+    }
+
+    /// OCI-2・#2183: 予約名の読み飛ばしでも fail-closed の拒否（`..`・親の位置の whiteout / 不透明）は残り、
+    /// 拒否したときは rootfs を変えない。
+    #[test]
+    fn oci2_reserved_skip_keeps_fail_closed_rules() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(&mut ex, &[file("keep", 0o644, b"k")]);
+        let before = snapshot(&sb.root);
+        for (bad, want) in [
+            (
+                file(".wh..wh.plnk/../x", 0o644, b"z"),
+                OciErrorCode::PermissionDenied,
+            ),
+            (
+                file(".wh.foo/.wh..wh.plnk", 0o644, b"z"),
+                OciErrorCode::InvalidArgument,
+            ),
+            (
+                file(".wh..wh..opq/child", 0o644, b"z"),
+                OciErrorCode::InvalidArgument,
+            ),
+        ] {
+            assert_eq!(lay_err(&mut ex, &[file("new", 0o644, b"n"), bad]), want);
             assert_eq!(snapshot(&sb.root), before);
         }
         sb.assert_outside_untouched();

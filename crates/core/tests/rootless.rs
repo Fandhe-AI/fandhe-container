@@ -527,6 +527,10 @@ mod linux {
 
     /// 失敗時の後始末。中間プロセスを直接 kill すると PID 1 が孤児になるため、まず stdin を閉じて中間プロセス自身に
     /// PID 1 を kill・回収させ、終わらないときだけ kill する。
+    ///
+    /// launch の timeout が PID 1 の起動中に発火しても、中間プロセスは READY を待つ自前の期限（`timeout()`）内に
+    /// READY を書くか PID 1 を kill・回収して終わり、READY の後は stdin の EOF で PID 1 を kill・回収する。
+    /// 待ち上限（`timeout() * 2 + 5 秒`）はその合計より長いため、kill に至るのは中間プロセス自体が固まった場合だけである。
     fn launch_failed(
         child: &mut Child,
         stdin: Option<ChildStdin>,

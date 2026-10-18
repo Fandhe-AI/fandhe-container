@@ -59,6 +59,8 @@ struct FakeRuntime {
     hold_stop: AtomicBool,
     /// true のとき stop は running を返す（想定外の応答の検証用）。
     stop_returns_running: AtomicBool,
+    /// stop が返す終了コード（既定 0。137 等の検証用）。
+    stop_exit_code: std::sync::atomic::AtomicI32,
 }
 
 impl FakeRuntime {
@@ -134,7 +136,10 @@ impl ContainerRuntime for Shared {
         if self.0.stop_returns_running.load(Ordering::SeqCst) {
             return Ok(ContainerStatus::running(r.id().clone(), None));
         }
-        Ok(ContainerStatus::stopped(r.id().clone(), Some(0)))
+        Ok(ContainerStatus::stopped(
+            r.id().clone(),
+            Some(self.0.stop_exit_code.load(Ordering::SeqCst)),
+        ))
     }
     fn delete(&self, r: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
         self.0.calls.lock().unwrap().push(format!(
@@ -1364,4 +1369,25 @@ async fn task_59_3_outcomes_are_recorded() {
     let names: Vec<_> = samples.iter().map(|s| code_name(s.code())).collect();
     // run, create, start, stop, remove, stop sb, remove sb: すべて OK。
     assert_eq!(names, vec!["OK"; 7]);
+}
+
+/// CRI-2・TASK-59.3: 実行層の Stop 応答の終了コード（137）が ContainerStatus.exit_code に反映される
+/// （StopContainer・StopPodSandbox の両経路）。
+#[tokio::test]
+async fn task_59_3_stop_exit_code_is_reflected_in_status() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    start(&h.service, &id).await.expect("start");
+    h.runtime.stop_exit_code.store(137, Ordering::SeqCst);
+    stop_c(&h.service, &id).await.expect("stop container");
+    let st = status(&h.service, &id).await;
+    assert_eq!((st.state, st.exit_code), (S::ContainerExited as i32, 137));
+
+    let id2 = create(&h.service, &sb, "d").await.expect("create");
+    start(&h.service, &id2).await.expect("start");
+    h.runtime.stop_exit_code.store(143, Ordering::SeqCst);
+    stop_sb(&h.service, &sb).await.expect("stop sandbox");
+    let st = status(&h.service, &id2).await;
+    assert_eq!((st.state, st.exit_code), (S::ContainerExited as i32, 143));
 }

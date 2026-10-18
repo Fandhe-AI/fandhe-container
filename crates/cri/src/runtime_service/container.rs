@@ -131,6 +131,8 @@ pub(super) struct ContainerRecord {
     pub(super) started_at_nanos: i64,
     /// 停止（`Exited` 遷移）の時刻。未停止は 0（TASK-58.2。ContainerStatus〔TASK-58.3〕が応答に使う）。
     pub(super) finished_at_nanos: i64,
+    /// 実行層が停止応答で返した終了コード。未停止・不明は 0（CRI-2。ContainerStatus.exit_code に反映する）。
+    pub(super) exit_code: i32,
     pub(super) retained_bytes: usize,
     /// 実行層（`ContainerRuntime`）の create・start・stop・delete を呼び出し中（TASK-59.2・#438、TASK-59.3・#439）。
     ///
@@ -149,7 +151,7 @@ impl ContainerRecord {
     /// ContainerStatus 応答用の変換（CRI-1・TASK-58.3・#435）。
     ///
     /// labels・annotations・mounts・log_path は保持した値を無改変で返す。`envs`・`command`・`args` は
-    /// 応答項目に無く（秘密値が入り得る）、返さない。**スタブの明示（REPAIR-3）**: `exit_code`・`reason`・
+    /// 応答項目に無く（秘密値が入り得る）、返さない。**スタブの明示（REPAIR-3）**: `reason`・
     /// `message`・`image_ref`・`image_id`・`user` は実行層未接続のため空・0 で、実値は TASK-59（CRI-2）で埋める。
     pub(super) fn to_status(&self, id: &str) -> v1::ContainerStatus {
         let linux = self
@@ -174,7 +176,7 @@ impl ContainerRecord {
             created_at: self.created_at_nanos,
             started_at: self.started_at_nanos,
             finished_at: self.finished_at_nanos,
-            exit_code: 0,
+            exit_code: self.exit_code,
             image: self.config.image.clone(),
             image_ref: String::new(),
             reason: String::new(),

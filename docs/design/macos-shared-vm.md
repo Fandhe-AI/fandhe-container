@@ -122,12 +122,20 @@ TASK-191 の着手前に確定が要る未決事項 4 点と計測対象を、�
 
 既存の定数: `RpcTimeout` は 10 秒を超えられない。一方 `DEFAULT_START_TIMEOUT` は 30 秒、`DEFAULT_GUEST_MOUNT_TIMEOUT` は 60 秒、plugin-macos の `LAUNCH_TOTAL_TIMEOUT` は 7 秒である。共用 VM の初回起動を CLI の 1 往復の RPC に収めることはできない。
 
-方式: 保持役が VM を CLI の RPC の外で起動する。CLI は「起動を要求する（即答）→ 期限つきの状態問い合わせでポーリングする（1 往復ごとに `RpcTimeout` 以内）」形で待つ。全体の上限は「VM 起動の期限＋ゲストの ready の期限＋余裕」とし、超えたら保持役が VM を止めて回収し `Timeout` を返す。`LAUNCH_TOTAL_TIMEOUT` 7 秒と VM の start 30 秒の食い違いは保持役の側で吸収する。
+方式: 保持役が VM を CLI の RPC の外で起動する。CLI は「起動を要求する（即答）→ 期限つきの状態問い合わせでポーリングする（1 往復ごとに `RpcTimeout` 以内）」形で待つ。全体の上限は「VM 起動の期限＋ゲストの ready の期限＋余裕」とし、超えたら保持役が VM を止めて回収し `Timeout` を返す。`LAUNCH_TOTAL_TIMEOUT` 7 秒と VM の start 30 秒の食い違いは、保持役の側だけでは吸収できない。plugin-macos の `PlatformBackend::launch` は 7 秒で打ち切って取り消しフラグを立て、内部の start・ゲスト mount 待ちも各 3 秒に設定しているため、保持役が待ち続けても plugin 側で失敗する。このため非同期化は保持役と plugin の間にも適用する（下記）。
+
+### 保持役と plugin 間の起動契約（plugin-macos の変更。REPAIR-5）
+
+1. 即答と状態照会: 保持役から plugin への起動要求は即答（受理）とし、起動の進行は状態照会（ポーリング。1 往復ごとに `RpcTimeout` 以内）で確認する。CLI と保持役の間と同じ形にそろえる
+2. plugin 内部の起動予算: `LAUNCH_TOTAL_TIMEOUT`（7 秒）と start・ゲスト mount 待ちの各 3 秒を、上の期限表（start 30 秒・ready 60 秒）に整合させる。共用 VM の初回起動の経路では、全体の予算を「start 30 秒＋ready 60 秒＋余裕」とし、段階ごとの期限は `OpTimeouts::start`（`DEFAULT_START_TIMEOUT`）と `DEFAULT_GUEST_MOUNT_TIMEOUT` から導く。コンテナ単位の create は VM 起動済みを前提に従来の短い期限を保つ（値は実測で見直す）
+3. 取り消しと回収: 全体の上限を超えたら plugin は取り消しフラグを立てて VM の協調停止 → 電源断 → 強制停止の順で回収し、`Timeout` を返す。保持役からの取り消し要求でも同じ回収を行い、起動途中の VM とスレッドを残さない
+4. 実装 issue: 上記は G14（#2281）の対象に含める（plugin-macos のアダプタ切り替えと同時に、起動の即答・状態照会・予算の整合・取り消しと回収を実装する）
 
 | 段階 | 期限 | 出どころ |
 | ---- | ---- | -------- |
 | 保持役のロック待ち | 10 秒 | `RESIDENT_START_TIMEOUT_DEFAULT` |
 | plugin の常駐起動 | `ResidentStartTimeout` | 既存 |
+| plugin 内部の起動予算 | 30 秒＋60 秒＋余裕（案） | `LAUNCH_TOTAL_TIMEOUT` 7 秒を共用 VM の初回起動で置き換える（承認待ち） |
 | VM の start | 30 秒 | `OpTimeouts::start`（`DEFAULT_START_TIMEOUT`） |
 | ゲストの ready | 60 秒 | `DEFAULT_GUEST_MOUNT_TIMEOUT` |
 | vsock の接続・中継の 1 往復 | 10 秒以内 | `RpcTimeout` の上限（値は案） |
@@ -217,7 +225,7 @@ Apple Silicon の macOS 実機で確かめないと決まらない。すべて�
 | G11 | #2278 | feat(supervisor): macOS の VM 保持役（ロック・peer 照合つき UDS・参照数・猶予後の終了） |
 | G12 | #2279 | feat(supervisor): 保持役の上限・所属記録の世代と VM 喪失時の応答 |
 | G13 | #2280 | feat(platform): 共有ルートの構成と bind ソースの検証 |
-| G14 | #2281 | feat(platform): plugin-macos のアダプタを保持役とゲストへの中継に切り替える |
+| G14 | #2281 | feat(platform): plugin-macos のアダプタを保持役とゲストへの中継に切り替える（起動の即答・状態照会・起動予算の整合・取り消しと回収を含む） |
 | G15 | #2282 | chore(platform): macOS 実機で共用 VM の起動・2 コンテナ・保持役の終了を確かめる（人間担当） |
 | G16 | #2283 | feat(cli): オプション方式（容量 1 VM）の選択の入口 |
 

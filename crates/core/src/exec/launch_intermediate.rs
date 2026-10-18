@@ -802,6 +802,8 @@ pub(crate) fn rescan_unreported_init(
         // (AlreadyExited / Gone / エラー)・期限内に止まらなかった場合は、子が増え得る・再親付け済みで識別できない
         // ため列挙も kill もせず、走査不完全として残す(CORE-2。生 PID を kill して再利用された PID を殺さない)。
         let stopped = stop_and_confirm(&child, pid.get(), reap_timeout);
+        // 子の列挙が不完全かを、この mapper の分だけ判定する(他の候補で立った不完全フラグと区別する)。
+        let earlier_incomplete = std::mem::replace(&mut out.scan_incomplete, false);
         let mut helpers = if stopped {
             children_of(pid.get(), &mut out)
         } else {
@@ -811,9 +813,25 @@ pub(crate) fn rescan_unreported_init(
             );
             Vec::new()
         };
+        let enumeration_incomplete = out.scan_incomplete;
+        out.scan_incomplete |= earlier_incomplete;
         for helper in &helpers {
             // helper は停止確認済みの mapper の未回収の子なので、回収されるまで pid は再利用されない。
             let _ = sys::kill_pid(helper.get(), sys::Signal::Kill);
+        }
+        if must_retain_mapper(stopped, enumeration_incomplete) {
+            // 列挙を完了できていない間は mapper を kill・回収しない。殺すと未列挙の helper が C へ再親付けされ、
+            // exec 済みで識別子(`LaunchTag`)も親子関係も失い、次の `confirm_no_process` が追跡できず Clean に
+            // 進んでしまう(CORE-2)。識別子を持つ mapper を未回収として保持し、再探索で列挙をやり直す。
+            if out.error.is_none() {
+                out.error = Some(ExecError::new(
+                    ErrorCode::Internal,
+                    IsolationStage::Wait,
+                    "kept a tagged process because its children could not be fully listed",
+                ));
+            }
+            out.unreaped.push(child);
+            continue;
         }
         if let Err(e) = child.kill_and_reap(reap_timeout) {
             if out.error.is_none() {
@@ -833,6 +851,12 @@ pub(crate) fn rescan_unreported_init(
         }
     }
     out
+}
+
+/// mapper を kill・回収せず保持すべきか。停止を確認できない、または子の列挙が不完全なときは、未列挙の helper が
+/// 識別子を失って再親付けされるのを避けるため保持する(CORE-2)。
+fn must_retain_mapper(stopped: bool, enumeration_incomplete: bool) -> bool {
+    !stopped || enumeration_incomplete
 }
 
 /// `child` へ SIGSTOP を送り、`/proc/<pid>/stat` の state が停止(`T` / `t`)になるまで期限つきで待つ(REPAIR-5)。
@@ -1365,6 +1389,15 @@ mod tests {
             assert!(n > 0, "the child closed the pipe before reporting");
             got += n;
         }
+    }
+
+    /// CORE-2: 停止未確認・列挙不完全のどちらでも mapper を保持し、完全に列挙できたときだけ回収へ進む。
+    #[test]
+    fn core2_mapper_is_retained_unless_enumeration_is_complete() {
+        assert!(must_retain_mapper(false, false));
+        assert!(must_retain_mapper(true, true));
+        assert!(must_retain_mapper(false, true));
+        assert!(!must_retain_mapper(true, false));
     }
 
     #[test]

@@ -822,7 +822,10 @@ pub(crate) fn rescan_unreported_init(
         if must_retain_mapper(stopped, enumeration_incomplete) {
             // 列挙を完了できていない間は mapper を kill・回収しない。殺すと未列挙の helper が C へ再親付けされ、
             // exec 済みで識別子(`LaunchTag`)も親子関係も失い、次の `confirm_no_process` が追跡できず Clean に
-            // 進んでしまう(CORE-2)。識別子を持つ mapper を未回収として保持し、再探索で列挙をやり直す。
+            // 進んでしまう(CORE-2)。mapper は `unreaped`(= 後で無条件に kill・回収される通常の未回収ハンドル)へ
+            // 入れない。ここでハンドルを捨てても mapper は生きたまま(停止中のまま)残り、`scan_incomplete` により
+            // 呼び出し側が識別子を `rescans` に残すので、次の `confirm_no_process` の再探索が識別子で再び見つけ、
+            // 子の列挙を完了してから回収する。
             if out.error.is_none() {
                 out.error = Some(ExecError::new(
                     ErrorCode::Internal,
@@ -830,7 +833,7 @@ pub(crate) fn rescan_unreported_init(
                     "kept a tagged process because its children could not be fully listed",
                 ));
             }
-            out.unreaped.push(child);
+            drop(child);
             continue;
         }
         if let Err(e) = child.kill_and_reap(reap_timeout) {
@@ -1389,6 +1392,41 @@ mod tests {
             assert!(n > 0, "the child closed the pipe before reporting");
             got += n;
         }
+    }
+
+    /// CORE-2(#2009): 停止を確認できず保持した識別子つきの子は、`unreaped`(後で無条件に kill される通常の未回収
+    /// ハンドル)へ入れず、`scan_incomplete` と `error` で再探索を要求する。
+    #[test]
+    fn core2_retained_tagged_process_is_not_returned_as_unreaped() {
+        let subreaper = ChildSubreaper::enable().expect("subreaper");
+        let tag = LaunchTag::fresh();
+        // 識別子を設定して即終了する子(回収しないのでゾンビになり、SIGSTOP の停止を確認できない)。
+        let pid = sys::fork_single_threaded_with(
+            || true,
+            || {
+                if sys::set_process_comm(tag.comm_bytes()).is_err() {
+                    return EXIT_SETUP_FAILED;
+                }
+                0
+            },
+            EXIT_SETUP_FAILED,
+        )
+        .expect("fork the tagged child");
+        let zombie = Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|s| s.contains(") Z "))
+        {
+            assert!(Instant::now() < zombie, "the child {pid} did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let found = rescan_unreported_init(&tag, &subreaper, Duration::from_secs(1));
+        assert!(found.unreaped.is_empty(), "{found:?}");
+        assert!(found.scan_incomplete, "{found:?}");
+        assert!(found.error.is_some(), "{found:?}");
+        // 後始末: 保持された子は次の再探索でも同じ扱い。直接回収する。
+        let nz = NonZeroU32::new(pid).expect("pid");
+        let child = ContainerChild::adopt_reparented(nz, &subreaper);
+        let _ = child.kill_and_reap(Duration::from_secs(5));
     }
 
     /// CORE-2: 停止未確認・列挙不完全のどちらでも mapper を保持し、完全に列挙できたときだけ回収へ進む。

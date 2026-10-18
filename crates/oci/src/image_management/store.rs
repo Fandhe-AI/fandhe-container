@@ -33,12 +33,13 @@
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, TryLockError as MutexTryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError as MutexTryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use super::ReferenceTable;
 use crate::error::{OciError, OciErrorCode};
+use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 
 /// ストア root 直下の排他用ロックファイル名。
 pub const IMAGE_STORE_LOCK_FILE_NAME: &str = "@lock";
@@ -57,6 +58,7 @@ pub struct ImageStore {
     root: PathBuf,
     table: Mutex<ReferenceTable>,
     timeout: Duration,
+    recorder: Arc<dyn OciOpRecorder>,
 }
 
 impl ImageStore {
@@ -67,7 +69,15 @@ impl ImageStore {
 
     /// 既存の参照テーブル（永続化からの読み込み結果。#853 等）でストアを開く。
     pub fn with_table(root: &Path, table: ReferenceTable) -> Result<Self, OciError> {
-        let meta = fs::symlink_metadata(root).map_err(|e| {
+        // 末尾の区切りがあると symlink_metadata が symlink を辿るため、components で正規化してから判定する。
+        let root: PathBuf = root.components().collect();
+        if root.as_os_str().is_empty() {
+            return Err(OciError::new(
+                OciErrorCode::InvalidArgument,
+                "image store root is empty",
+            ));
+        }
+        let meta = fs::symlink_metadata(&root).map_err(|e| {
             let code = if e.kind() == std::io::ErrorKind::NotFound {
                 OciErrorCode::NotFound
             } else {
@@ -82,9 +92,10 @@ impl ImageStore {
             ));
         }
         Ok(Self {
-            root: root.to_path_buf(),
+            root,
             table: Mutex::new(table),
             timeout: IMAGE_STORE_LOCK_TIMEOUT,
+            recorder: Arc::new(NoopOciOpRecorder),
         })
     }
 
@@ -94,14 +105,34 @@ impl ImageStore {
         self
     }
 
+    /// 取得ごとの結果・エラー code・所要時間の記録先を差し替える（REPAIR-4）。既定は記録しない。
+    pub fn with_recorder(mut self, recorder: Arc<dyn OciOpRecorder>) -> Self {
+        self.recorder = recorder;
+        self
+    }
+
     /// ストア root。
     pub fn root(&self) -> &Path {
         &self.root
     }
 
     /// 排他区間を取得する。スレッド間・プロセス間で他の保持者がいれば期限まで待ち、超過は `Timeout`。
+    ///
+    /// 取得ごとに成否・エラー code・所要時間を記録先へ渡す（REPAIR-4）。期限が `Instant` で表現できない
+    /// ほど長い場合は `InvalidArgument`。
     pub fn lock(&self) -> Result<ImageStoreGuard<'_>, OciError> {
-        let deadline = Instant::now() + self.timeout;
+        record_oci_op(&*self.recorder, OciOpKind::AcquireImageStoreLock, || {
+            self.lock_inner()
+        })
+    }
+
+    fn lock_inner(&self) -> Result<ImageStoreGuard<'_>, OciError> {
+        let deadline = Instant::now().checked_add(self.timeout).ok_or_else(|| {
+            OciError::new(
+                OciErrorCode::InvalidArgument,
+                "image store lock timeout is too large",
+            )
+        })?;
         let table = self.lock_table_until(deadline)?;
         let file = open_lock_file(&self.root)?;
         lock_file_until(&file, deadline)?;
@@ -397,6 +428,61 @@ mod tests {
             OciErrorCode::FailedPrecondition
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// OCI-7: 表現不能な巨大 timeout は panic せず InvalidArgument。
+    #[test]
+    fn oci7_huge_timeout_is_invalid_argument() {
+        let root = temp_root("huge");
+        let store = ImageStore::open(&root)
+            .expect("open")
+            .with_timeout(Duration::MAX);
+        assert_eq!(
+            store.lock().expect_err("huge").code(),
+            OciErrorCode::InvalidArgument
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// REPAIR-4: 成功・Timeout が種別 oci.store.lock として記録される。
+    #[test]
+    fn oci7_lock_outcomes_are_recorded() {
+        use crate::instrument::OciOpOutcome;
+        use crate::instrument::testing::Collect;
+        let (root, store) = seeded_store("rec", SHORT);
+        let rec = Arc::new(Collect::default());
+        let store = Arc::try_unwrap(store)
+            .expect("unique")
+            .with_recorder(rec.clone());
+        let g = store.lock().expect("first");
+        let e = store.lock().expect_err("timeout");
+        assert_eq!(e.code(), OciErrorCode::Timeout);
+        drop(g);
+        let items = rec.items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind(), OciOpKind::AcquireImageStoreLock);
+        assert_eq!(items[0].outcome(), OciOpOutcome::Success);
+        assert_eq!(items[1].outcome(), OciOpOutcome::Failure);
+        assert_eq!(items[1].error_code(), Some(OciErrorCode::Timeout));
+        assert!(items[1].latency() >= SHORT);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// OCI-7: 末尾区切り付きの symlink root も拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_open_rejects_symlink_root_with_trailing_slash() {
+        let base = temp_root("symroot");
+        let real = base.join("real");
+        fs::create_dir(&real).expect("mkdir");
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let slashed = PathBuf::from(format!("{}/", link.display()));
+        assert_eq!(
+            ImageStore::open(&slashed).expect_err("symlink").code(),
+            OciErrorCode::FailedPrecondition
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// OCI-7: `@lock` がディレクトリなら拒否する。

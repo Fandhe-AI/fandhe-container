@@ -497,6 +497,8 @@ pub fn run_start_until(
 /// 本番は [`run_start_until`] 経由で `read_host` を渡す。起動成功の経路から共有の `stderr_sink` へ警告が届く
 /// 結線を、host の sysctl に依らず結合試験で確かめるために公開する。
 #[doc(hidden)]
+// 理由: `run_start_until` と同じ deps・store・recorder・req・timeouts・各 sink に read_host を足した入力で、
+// 結合試験が個別に差し替えるため束ねる型を作らず引数のまま渡す。
 #[allow(clippy::too_many_arguments)]
 pub fn run_start_until_observing(
     deps: Box<dyn StartDeps + Send>,
@@ -588,6 +590,8 @@ fn record_start(recorder: &OpRecorder, started: Instant, success: bool) {
 }
 
 /// [`run_start_until`] の本体（計測ログの出力を除く）。
+// 理由: 入口 `run_start_until` が受けた値を分解せずそのまま渡す本体で、束ねる型を作ると
+// 呼び出し側の組み立てコードが増えるだけのため引数のまま渡す。
 #[allow(clippy::too_many_arguments)]
 fn start_reporting(
     deps: Box<dyn StartDeps + Send>,

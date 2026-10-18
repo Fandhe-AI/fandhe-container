@@ -14,7 +14,8 @@
 //! 未実装（後続 issue の担当。実装済みを装わない。REPAIR-3）:
 //! - ストア単位の排他（#473。呼び出し側がこの値をロックの内側で扱う前提で、本型は排他をかけない）
 //! - ディスクへの永続化・再起動時の照合（#853・#854・#851）
-//! - GC 本体・`image ls`/`rm`/`tag`/`prune`（#478〜#481・#476）、pull へのリース組み込み（#474・#475）
+//! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force`・実削除は #481
+//! - GC 本体・`image ls`/`tag`/`prune`・`rm` の CLI 配線（#478〜#481・#476）、pull へのリース組み込み（#474・#475）
 //! - テーブル全体の件数上限（永続化の読み込み側で判断する）
 //!
 //! core の `ContainerId` との対応づけ（変換の置き場所・依存の向き）は #853 で決める。oci は core に
@@ -22,6 +23,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+
+mod remove;
+pub use remove::{ImageInUse, ImageRmCandidate, ImageRmDecision, ImageRmTarget};
 
 use crate::error::{OciError, OciErrorCode};
 use crate::reference::{Digest, RegistryHost, Repository, Tag};

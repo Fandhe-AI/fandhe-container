@@ -244,7 +244,7 @@ MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である�
 | -- | ---- | --------- | --------------- |
 | CRI-8 | オーケストレーション本体（スケジューラ・マルチノード調整）は MVP 対象外とし、4 つの拡張点トレイトの設計のみを MVP に含める | `api-cri.md` | [orchestration-scope.md](design/orchestration-scope.md)（TASK-5・#20） |
 | WIN-6 | Windows ネイティブコンテナは MVP の射程外。Hyper-V 直接方式は将来の強分離オプションとして設計上残す | `api-platform-windows.md` | 本書「Windows ネイティブコンテナ・Hyper-V 直接方式の MVP スコープ（WIN-6）」節を参照 |
-| MAC-4 | 既定は常駐 VM＋軽量プロセス分離とし、1 コンテナ = 1 VM はオプション扱いとする | `api-platform-macos.md` | [macos-vm-strategy.md](design/macos-vm-strategy.md)（TASK-66・#369。内容の確認は #370〔TASK-66.h1〕） |
+| MAC-4 | 既定は常駐 VM＋軽量プロセス分離とし、1 コンテナ = 1 VM はオプション扱いとする | `api-platform-macos.md` | [macos-vm-strategy.md](design/macos-vm-strategy.md)（TASK-66・#369。#370〔TASK-66.h1〕で確認済み・2026-10-12。既定方式の実装は TASK-191〔#1905・#1906〕） |
 | MVM-5 | microVM の 3 OS 展開は Linux（KVM）→ macOS（Hypervisor.framework）の順で進め、Windows（WHP）は将来オプションとする | `api-microvm.md` | 本書へ TASK-78 で追記予定 |
 | NET-9 | rootless ネットワークの外部ヘルパー: pasta を採用（同梱もリンクもせず利用者が導入したものを exec。ポート公開の bind の既定は loopback） | `api-network.md` | [rootless-network.md](design/rootless-network.md)（TASK-147・#340） |
 | NET-5 | DNS ヘルパーを D-14 の原則の例外として認める | `plugin-system.md` | [#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6128207567)（2026-10-12 オーナー決定） |

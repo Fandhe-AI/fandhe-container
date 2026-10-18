@@ -74,7 +74,8 @@ fandhe-container/
 │   │   ├── startup-latency-bench.md  # 起動レイテンシ p95 ベンチの計測定義（TASK-190・REPAIR-8・CORE-10。実機前提・ゲート未登録）
 │   │   ├── bench-calibration.md   # ベンチ基準値の校正記録・試行ログ（TASK-88.2・REPAIR-8。実測は前提ベンチ未実装のため保留）
 │   │   ├── measurements/
-│   │   │   └── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
+│   │   │   ├── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
+│   │   │   └── oci-pull-e2e-local.md  # pull_e2e の公開イメージ 5 種での実行記録（TASK-55.2・OCI-1・#421。run 段の終了コード 0 は人間へ引き継ぎ）
 │   │   ├── macos-vm-strategy.md   # macOS の VM 利用方式（既定: 常駐 VM 共用＋軽量プロセス分離／オプション: 1 コンテナ = 1 VM。TASK-66・MAC-4）
 │   │   ├── fs-normalization.md   # FS 正規化（NFC/NFD の別表記の衝突を検出して拒否・名前は書き換えない。TASK-21・IO-5）
 │   │   ├── oci-layer-special-bits.md  # レイヤー展開の setuid / setgid / sticky を所有者の写像に合わせて保持する条件（既定は落とす。#1810・OCI-1・SEC-5）

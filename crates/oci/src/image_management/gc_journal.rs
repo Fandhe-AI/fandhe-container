@@ -971,9 +971,11 @@ mod tests {
     #[test]
     fn oci7_settle_keeps_deleted_blobs_when_blob_dir_fsync_fails() {
         let root = Root::new();
-        // blobs/sha256 を消して fsync を失敗させる。
-        fs::remove_dir(blob_dir(&root.0)).unwrap();
+        // blobs/sha256 の fsync を注入で失敗させる（Windows の sync_dir_os は常に成功するため、
+        // ディレクトリ削除ではなく test_hook で 3 OS 共通の障害条件にする）。
+        test_hook::fail_sync_of(&blob_dir(&root.0), 8);
         let st = settle(&root.0, &[d(0x22)], &[d(0x11)], 0, false);
+        test_hook::clear();
         assert_eq!(st, DeletionDurability::Pending);
         let j = read_journal(&root.0).unwrap().unwrap();
         assert_eq!(j.delete_blobs, vec![d(0x11), d(0x22)]);

@@ -64,7 +64,12 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/temp_rootfs.rs"]
+mod temp_rootfs;
+
+#[cfg(target_os = "linux")]
 mod linux {
+    use crate::temp_rootfs;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
@@ -121,16 +126,15 @@ mod linux {
     }
 
     fn make_rootfs() -> Rootfs {
-        let base = std::fs::canonicalize(std::env::temp_dir())
-            .expect("canonicalize temp_dir")
-            .join(format!("fandhe-tmpfs-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("proc")).expect("create rootfs/proc");
-        std::fs::create_dir_all(base.join("dev")).expect("create rootfs/dev");
+        // 共有 /tmp 上の推測可能なパスを削除・再利用すると、競合で置かれた symlink を root が辿りうる。
+        // 一意名で排他作成し、既存パスは削除も採用もせず、配下も 1 階層ずつ作る（#2324・SEC-2・CORE-5）。
+        let base = temp_rootfs::exclusive_temp_dir("fandhe-tmpfs", 0o755);
+        temp_rootfs::create_dir_chain(&base, &["proc"]);
+        temp_rootfs::create_dir_chain(&base, &["dev"]);
         // 失敗シナリオ用: rootfs 内の symlink（辿らずに拒否されること）とその先。
-        std::fs::create_dir_all(base.join("outside")).expect("create rootfs/outside");
+        temp_rootfs::create_dir_chain(&base, &["outside"]);
         // 差し替えシナリオ用: 検査後に改名される既存のマウント先。
-        std::fs::create_dir_all(base.join("swap")).expect("create rootfs/swap");
+        temp_rootfs::create_dir_chain(&base, &["swap"]);
         std::os::unix::fs::symlink("outside", base.join("link")).expect("create rootfs/link");
         Rootfs(base)
     }

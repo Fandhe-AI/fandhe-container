@@ -42,6 +42,10 @@
 //! （ci.md「実機前提テスト」）。rootful 経路（root）の実行は root 権限コマンドのため明示指示のもとで行い、結果を
 //! #1621 へ記録する。
 
+#[cfg(target_os = "linux")]
+#[path = "support/temp_rootfs.rs"]
+mod temp_rootfs;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("masked_paths: Linux only, not applicable on this OS");
@@ -61,6 +65,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use crate::temp_rootfs;
     use std::io::{Read as _, Write as _};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -138,11 +143,12 @@ mod linux {
             std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod rootfs dir");
         }
-        std::fs::create_dir_all(base.join("proc/sys")).expect("create rootfs/proc/sys");
+        temp_rootfs::create_dir_chain(&base, &["proc", "sys"]);
         for t in MASKED_PROC_PATHS {
             let host = base.join(t.trim_start_matches('/'));
             if is_dir_target(t) {
-                std::fs::create_dir_all(&host).expect("create dir target");
+                let rel: Vec<&str> = t.trim_start_matches('/').split('/').collect();
+                temp_rootfs::create_dir_chain(&base, &rel);
                 std::fs::write(host.join("inner"), SECRET).expect("create inner file");
             } else {
                 std::fs::write(&host, SECRET).expect("create file target");

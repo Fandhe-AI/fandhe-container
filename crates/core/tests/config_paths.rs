@@ -24,6 +24,10 @@
 //! Linux 5.12 以降で root もしくは非特権 user namespace を許可するホストが必要。`-- --ignored` 指定時のみ実行する
 //! （ci.md「実機前提テスト」。AGENTS.md）。rootful 経路（root）の実行は root 権限コマンドのため明示指示のもとで行う。
 
+#[cfg(target_os = "linux")]
+#[path = "support/temp_rootfs.rs"]
+mod temp_rootfs;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("config_paths: Linux only, not applicable on this OS");
@@ -42,6 +46,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use crate::temp_rootfs;
     use std::io::{Read as _, Write as _};
     use std::path::PathBuf;
     use std::time::Duration;
@@ -108,14 +113,14 @@ mod linux {
             std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod rootfs dir");
         }
-        std::fs::create_dir_all(base.join("data/dir")).expect("create data/dir");
+        temp_rootfs::create_dir_chain(&base, &["data", "dir"]);
         std::fs::write(base.join("data/secret.txt"), SECRET).expect("create secret");
         std::fs::write(base.join("data/dir/inner"), SECRET).expect("create inner");
-        std::fs::create_dir_all(base.join("rofile")).expect("create rofile");
+        temp_rootfs::create_dir_chain(&base, &["rofile"]);
         std::fs::write(base.join("rofile/file"), SECRET).expect("create rofile/file");
-        std::fs::create_dir_all(base.join("rodir")).expect("create rodir");
+        temp_rootfs::create_dir_chain(&base, &["rodir"]);
         // `prepare_rootfs` は rootfs/proc の存在を必須とし自動作成しない（open_proc_dir が拒否する）ため用意する。
-        std::fs::create_dir_all(base.join("proc")).expect("create proc");
+        temp_rootfs::create_dir_chain(&base, &["proc"]);
         rootfs
     }
 

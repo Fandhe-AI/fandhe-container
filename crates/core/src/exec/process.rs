@@ -184,6 +184,27 @@ impl std::fmt::Debug for Entrypoint {
     }
 }
 
+/// 同じ KEY の重複を後勝ちに正規化する（残すのは各 KEY の最後の要素。残った要素の相対順は保つ）。
+///
+/// runc は `os.Clearenv()` の後に `process.env` を順に `Setenv` し、その環境で exec する（同じ KEY は後勝ちで
+/// 1 件）。`PATH` の探索（`path_lookup`）が使う値と、子の `getenv` が見る値を一致させるため、envp も同じ規則で
+/// 1 件に揃える（OCI-1・#2314）。KEY は最初の `=` までのバイト列で比べる。件数は入力以下なので上限は保たれる。
+fn dedup_env_last_wins(env: Vec<CString>) -> Vec<CString> {
+    let key = |c: &CString| -> Vec<u8> {
+        let b = c.to_bytes();
+        let end = b.iter().position(|x| *x == b'=').unwrap_or(b.len());
+        b.get(..end).unwrap_or_default().to_vec()
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<CString> = env
+        .into_iter()
+        .rev()
+        .filter(|c| seen.insert(key(c)))
+        .collect();
+    out.reverse();
+    out
+}
+
 impl Entrypoint {
     /// 検証して作る。
     ///
@@ -264,7 +285,7 @@ impl Entrypoint {
         Ok(Self {
             path,
             argv,
-            env,
+            env: dedup_env_last_wins(env),
             search: None,
         })
     }
@@ -4609,6 +4630,38 @@ mod tests {
                 "argv=docker-entrypoint.sh redis-server".to_string(),
                 format!("env={path_env}"),
             ]
+        );
+    }
+
+    /// OCI-1（#2314）: 重複 KEY は後勝ちの 1 件に正規化され、探索と子へ渡す環境が同じ `PATH` を指す。
+    #[test]
+    fn oci1_duplicate_env_keys_are_last_wins() {
+        let entry = Entrypoint::new(
+            "/bin/app",
+            ["app"],
+            ["PATH=/old", "A=1", "PATH=/new", "B=2", "A=3"],
+        )
+        .unwrap();
+        let got: Vec<String> = entry
+            .env
+            .iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, vec!["PATH=/new", "B=2", "A=3"]);
+        let dir = TempDir::create("oci1-dup");
+        let old = format!("PATH={}/old", dir.0.display());
+        let new = format!("PATH={}/new", dir.0.display());
+        let entry =
+            Entrypoint::search_path("x", ["x"], [old.as_str(), "K=v", new.as_str()]).unwrap();
+        let got: Vec<String> = entry
+            .env
+            .iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, vec!["K=v".to_string(), new.clone()]);
+        assert_eq!(
+            entry.search.as_ref().unwrap()[0].to_string_lossy(),
+            format!("{}/new/x", dir.0.display())
         );
     }
 

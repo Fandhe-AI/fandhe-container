@@ -129,6 +129,28 @@ assert_has "hang: timeout status" "${LOGD}/summary.txt" "step=runp status=timeou
 assert_has "hang: failed_step" "${ERR}" "failed_step=runp"
 assert_eq "hang: no leftover process" 0 "$(pgrep -fc 'sleep 7311' || true)"
 
+# 3b. 中断シグナル（TERM）: 取得済みの sandbox ID だけを回収し、残存の可能性を明示する
+N=$((N + 1))
+LOGD="${T}/logs/case${N}"
+ERR="${T}/case${N}.err"
+STUB="${T}/case${N}.stub"
+: >"${STUB}"
+STUB_LOG="${STUB}" STUB_HANG_AT=create bash "${SMOKE}" --endpoint "${EP}" --crictl "${T}/crictl" --log-dir "${LOGD}" >"${T}/case${N}.out" 2>"${ERR}" &
+SMOKE_PID=$!
+for _ in $(seq 1 100); do
+  grep -q '^create ' "${STUB}" 2>/dev/null && break
+  sleep 0.1
+done
+kill -TERM "${SMOKE_PID}"
+RC=0
+wait "${SMOKE_PID}" || RC=$?
+assert_eq "signal: exit code" 1 "${RC}"
+assert_has "signal: failed_step" "${ERR}" "failed_step=interrupted"
+assert_has "signal: possible leftover is reported" "${ERR}" "may remain"
+assert_eq "signal: the sandbox is cleaned up" "stopp ${SID}
+rmp ${SID}" "$(tail -n 2 "${STUB}")"
+assert_eq "signal: no leftover process" 0 "$(pgrep -fc 'sleep 7311' || true)"
+
 # 4. 不正な ID
 BAD63="$(printf 'a%.0s' $(seq 1 63))"
 BADUP="$(printf 'A%.0s' $(seq 1 64))"
@@ -189,6 +211,10 @@ assert_lacks "keep: no cleanup calls" "${STUB}" "stopp "
 assert_lacks "keep: no rm call" "${STUB}" "rmp "
 bash "${SMOKE}" --print-budget >"${T}/budget.out" 2>&1
 assert_eq "print-budget default" 550 "$(cat "${T}/budget.out")"
+bash "${SMOKE}" --print-budget --step-timeout 010 >"${T}/budget.out" 2>&1
+assert_eq "print-budget: leading zero is decimal (010)" 150 "$(cat "${T}/budget.out")"
+bash "${SMOKE}" --print-budget --step-timeout 08 >"${T}/budget.out" 2>&1
+assert_eq "print-budget: leading zero is decimal (08)" 134 "$(cat "${T}/budget.out")"
 
 # 8. make の入口（scripts/targets/crictl-smoke.sh）。make 自体はレシピの失敗をすべて 2 にするため、
 # 終了コードの変換はターゲットのスクリプトを直接実行して照合し、make 経由では必須変数と Error N の出力だけを見る。

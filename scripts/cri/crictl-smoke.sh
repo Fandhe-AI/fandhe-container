@@ -71,6 +71,8 @@ while [ $# -gt 0 ]; do
 done
 
 int_in_range "${STEP_TIMEOUT}" 1 999999 || bad_arg "--step-timeout must be an integer from 1 to 999999 (seconds)"
+# 先頭ゼロ（010 が 8 進の 8 と読まれる、08・09 が算術エラーになる）を除いて 10 進にそろえ、以降の予算計算と timeout に使う。
+while [ "${#STEP_TIMEOUT}" -gt 1 ] && [ "${STEP_TIMEOUT#0}" != "${STEP_TIMEOUT}" ]; do STEP_TIMEOUT="${STEP_TIMEOUT#0}"; done
 if [ "${PRINT_BUDGET}" = 1 ]; then
   # version 1 + 本手順 3 + 後始末 4 の最悪値に余裕 30 秒（REPAIR-5。make 側の全体期限の既定）
   echo $(((1 + 3 + 4) * (STEP_TIMEOUT + 5) + 30))
@@ -131,6 +133,7 @@ now_ms() {
 }
 
 STEP_N=0
+CHILD_PID=""
 STEP_BASE=""
 STEP_RC=0
 STEP_STATUS=""
@@ -155,7 +158,11 @@ run_crictl() { # <name> <crictl subcommand and args...>
   printf '%s\n' "${argv[@]}" >"${STEP_BASE}.argv"
   local t0 t1 rc=0
   t0="$(now_ms)"
-  timeout --kill-after=5 "${STEP_TIMEOUT}" "${argv[@]}" >"${STEP_BASE}.stdout" 2>"${STEP_BASE}.stderr" </dev/null || rc=$?
+  # シグナルの trap をすぐ動かすため、前景ではなく背景で起動して wait する（前景だと子の終了まで trap が遅れる）。
+  timeout --kill-after=5 "${STEP_TIMEOUT}" "${argv[@]}" >"${STEP_BASE}.stdout" 2>"${STEP_BASE}.stderr" </dev/null &
+  CHILD_PID=$!
+  wait "${CHILD_PID}" || rc=$?
+  CHILD_PID=""
   t1="$(now_ms)"
   STEP_RC="${rc}"
   case "${rc}" in
@@ -188,6 +195,49 @@ fail_step() { # <name> <code> <message>
 
 SID=""
 CID=""
+
+# 後始末（ベストエフォート）。作れた ID に対してだけ、逆順に実行する。
+CLEAN_FAIL=0
+cleanup_step() { # <name> <crictl subcommand and args...>
+  run_crictl "$@"
+  if [ "${STEP_STATUS}" != ok ]; then
+    CLEAN_FAIL=1
+    echo "warning: ${1} failed (${STEP_STATUS}); the sandbox or container may remain, inspect it manually" >&2
+  fi
+}
+do_cleanup() {
+  [ "${KEEP}" = 0 ] || return 0
+  if [ -n "${CID}" ]; then
+    cleanup_step cleanup-stop stop "${CID}"
+    cleanup_step cleanup-rm rm "${CID}"
+  fi
+  if [ -n "${SID}" ]; then
+    cleanup_step cleanup-stopp stopp "${SID}"
+    cleanup_step cleanup-rmp rmp "${SID}"
+  fi
+}
+
+# 中断（INT・TERM・HUP。make 側の全体期限の TERM を含む）: 進行中の crictl を止め、取得済みの ID だけを有限時間で回収する。
+# 回収の各手順は 5 秒（kill-after 込みで最大 10 秒 x 4）に絞り、make 側の kill-after（60 秒）に収める。ID が未取得の
+# 手順（runp・create の実行中の中断）で作られた資源は特定できないため、残存の可能性を明示する。
+on_signal() { # <signal name>
+  trap '' INT TERM HUP
+  if [ -n "${CHILD_PID}" ]; then
+    kill "${CHILD_PID}" 2>/dev/null || true
+    wait "${CHILD_PID}" 2>/dev/null || true
+    CHILD_PID=""
+    echo "warning: interrupted by $1 while a crictl step was running; a resource created by that step has no known ID and may remain, inspect it manually" >&2
+  fi
+  STEP_TIMEOUT=5
+  do_cleanup
+  echo "result=failed failed_step=interrupted log_dir=${LOG_DIR}" | tee -a "${SUMMARY}" >&2
+  [ "${CLEAN_FAIL}" = 0 ] || echo "warning: cleanup after $1 did not finish; remaining resources may exist, check them manually" >&2
+  exit 1
+}
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap 'on_signal HUP' HUP
+
 
 # 手順 0: Version RPC での到達確認。ここで失敗するのはサーバー未応答であり runp の失敗と取り違えない。
 run_crictl version version
@@ -227,25 +277,8 @@ for s in runp create start; do
   case "${RAN}" in *" ${s} "*) ;; *) record "${s}" skipped - 0 ;; esac
 done
 
-# 後始末（ベストエフォート）。作れた ID に対してだけ、逆順に実行する。
-CLEAN_FAIL=0
-cleanup_step() { # <name> <crictl subcommand and args...>
-  run_crictl "$@"
-  if [ "${STEP_STATUS}" != ok ]; then
-    CLEAN_FAIL=1
-    echo "warning: ${1} failed (${STEP_STATUS}); the sandbox or container may remain, inspect it manually" >&2
-  fi
-}
-if [ "${KEEP}" = 0 ]; then
-  if [ -n "${CID}" ]; then
-    cleanup_step cleanup-stop stop "${CID}"
-    cleanup_step cleanup-rm rm "${CID}"
-  fi
-  if [ -n "${SID}" ]; then
-    cleanup_step cleanup-stopp stopp "${SID}"
-    cleanup_step cleanup-rmp rmp "${SID}"
-  fi
-fi
+trap '' INT TERM HUP
+do_cleanup
 
 if [ -n "${FAILED_STEP}" ]; then
   echo "result=failed failed_step=${FAILED_STEP} log_dir=${LOG_DIR}" | tee -a "${SUMMARY}" >&2

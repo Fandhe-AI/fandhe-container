@@ -40,10 +40,10 @@ if [ -n "${LOG_DIR:-}" ]; then args+=(--log-dir "${LOG_DIR}"); fi
 if [ -n "${CRICTL_TIMEOUT:-}" ]; then args+=(--crictl-timeout "${CRICTL_TIMEOUT}"); fi
 if [ "${KEEP:-}" = 1 ]; then args+=(--keep); fi
 rc=0
-timeout --preserve-status --kill-after=30 "${t}" bash "${script}" --endpoint "${CRI_ENDPOINT}" ${args[@]+"${args[@]}"} || rc=$?
+timeout --preserve-status --kill-after=60 "${t}" bash "${script}" --endpoint "${CRI_ENDPOINT}" ${args[@]+"${args[@]}"} || rc=$?
 case "${rc}" in
   0 | 1 | 2 | 3 | 4) exit "${rc}" ;;
-  129 | 130 | 143) echo "error: timeout: the smoke test was stopped by a signal (time limit ${t}s or an interrupt)" >&2; exit 1 ;;
+  129 | 130 | 143) echo "error: timeout: the smoke test was stopped by a signal (time limit ${t}s or an interrupt); the sandbox or container may remain, inspect it manually" >&2; exit 1 ;;
   137) echo "error: cleanup-failed: the smoke test was killed before cleanup finished; the sandbox or container may remain, inspect it manually" >&2; exit 4 ;;
   125 | 126 | 127) echo "error: invalid-input: cannot run the smoke test under timeout (exit ${rc})" >&2; exit 2 ;;
   *) echo "error: smoke-failed: unexpected exit status ${rc}" >&2; exit 1 ;;

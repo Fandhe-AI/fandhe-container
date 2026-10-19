@@ -184,11 +184,33 @@ impl RootGate {
     }
 }
 
-/// 状態ルート（正規パス）から共有ゲートを引く。ルートごとに 1 つ作り、プロセス終了まで保持する。
+/// 状態ルート（正規パス）から共有ゲートを引く。ルートごとに 1 つ作る。
+///
+/// 登録のたびに、利用中の参照がなく最後の解放から `LOCK_HANDOFF_GAP` が経ったエントリを回収する。
+/// 状態ルートを削除して別のルートを繰り返し開くプロセスでメモリが増え続けないようにするため。
+/// 解放直後のエントリは残すので、開き直した場合の引き渡し間隔は維持される（#2229）。
 fn root_gate(root: &Path) -> Arc<RootGate> {
     static GATES: Mutex<BTreeMap<PathBuf, Arc<RootGate>>> = Mutex::new(BTreeMap::new());
     let mut map = GATES.lock().unwrap_or_else(|e| e.into_inner());
+    prune_idle_gates(&mut map, root, Instant::now());
     Arc::clone(map.entry(root.to_path_buf()).or_default())
+}
+
+/// 参照が `map` だけで、保持中でなく、解放から `LOCK_HANDOFF_GAP` 以上経ったゲートを取り除く。
+///
+/// 複製は `map` のロック下でしか行われないため、`strong_count == 1` の間は新たな参照が増えない。
+/// `keep`（今から引くルート）は残す。
+fn prune_idle_gates(map: &mut BTreeMap<PathBuf, Arc<RootGate>>, keep: &Path, now: Instant) {
+    map.retain(|path, gate| {
+        if path.as_path() == keep || Arc::strong_count(gate) > 1 {
+            return true;
+        }
+        let st = gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.held
+            || st
+                .last_release
+                .is_some_and(|released| now.saturating_duration_since(released) < LOCK_HANDOFF_GAP)
+    });
 }
 
 /// 前回の解放から `LOCK_HANDOFF_GAP` が経つまでの残り時間を返す（結果は `deadline` までの残りで頭打ち）。
@@ -1798,6 +1820,35 @@ fn lock_file_until(file: &File, deadline: Instant) -> Result<(), TraitError> {
 #[cfg(test)]
 mod platform_tests {
     use super::*;
+
+    /// SUP-1・REPAIR-5・#2229: 参照が無く解放から間隔が経ったゲートだけを回収する。
+    #[test]
+    fn sup1_repair5_2229_prune_idle_gates_keeps_recent_and_used() {
+        let now = Instant::now();
+        let mk = |release: Option<Instant>, held: bool| {
+            let g = Arc::new(RootGate::default());
+            {
+                let mut st = g.state.lock().unwrap();
+                st.held = held;
+                st.last_release = release;
+            }
+            g
+        };
+        let mut map: BTreeMap<PathBuf, Arc<RootGate>> = BTreeMap::new();
+        map.insert("idle".into(), mk(Some(now - LOCK_HANDOFF_GAP), false));
+        map.insert("never".into(), mk(None, false));
+        map.insert("recent".into(), mk(Some(now), false));
+        map.insert("held".into(), mk(Some(now - LOCK_HANDOFF_GAP), true));
+        let used = mk(Some(now - LOCK_HANDOFF_GAP), false);
+        map.insert("used".into(), Arc::clone(&used));
+        map.insert("keep".into(), mk(Some(now - LOCK_HANDOFF_GAP), false));
+        prune_idle_gates(&mut map, Path::new("keep"), now);
+        let left: Vec<_> = map
+            .keys()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["held", "keep", "recent", "used"]);
+    }
 
     /// SUP-1・REPAIR-5・#2229: 前回解放が無い・間隔が経過済みなら待たない。
     #[test]

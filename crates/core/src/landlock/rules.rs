@@ -22,7 +22,8 @@
 //!   [`crate::dev_mounts`] の定義（実マウントの属性）から導いた権利のルールを rootfs の次に足す（#1657）。
 //!   `mounts[]` が同じマウント先を指す場合は拒否する（統合の規則は TASK-127）
 //! - `linux.readonlyPaths` / `maskedPaths` は参照しない（VFS のマウントが担うためルールは足さない。解釈は
-//!   `OciConfig::readonly_paths` / `masked_paths`、適用は `exec` の pivot 前段。#1852）
+//!   `OciConfig::readonly_paths` / `masked_paths`、適用は `exec` の pivot 前段。#1852）。暗黙の `/dev` 系と同じか
+//!   祖先を指す保護パスは、ここ（予約・fork の後）ではなく start が fork 前に `InvalidArgument` で拒否する（#2015）
 //!
 //! # 未実装範囲（REPAIR-3）
 //!

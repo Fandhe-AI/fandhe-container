@@ -927,6 +927,52 @@ jobs:
           echo "tmpfs_mount: mounts, flags and rollback verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::tmpfs_mount verified"
 
+      # readonly_paths（`crates/core/tests/readonly_paths.rs`。SEC-2・CORE-5・#1850）と
+      # config_paths_implicit_dev（`crates/core/tests/config_paths_implicit_dev.rs`。SEC-2・CORE-5・#2015）:
+      # 読み取り専用化・覆いの rootless での実機結果を CI のログに残す実機前提テスト（harness = false）。
+      # 上で緩和した sysctl を再利用し、新しい check-run・sudo・permissions は追加しない（rootless 経路のみ。
+      # rootful 経路は人間担当で #1621 に記録する）。成功行を grep で照合する。
+      - name: readonly_paths のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        run: cargo test -p fandhe-container-core --test readonly_paths --no-run
+
+      - name: readonly_paths の実行（実機前提テスト・--ignored。SEC-2・#1850）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/readonly_paths.log"
+          cargo test -p fandhe-container-core --test readonly_paths -- --ignored 2>&1 | tee "${log}"
+          expected='readonly_paths: /proc bus,fs,irq,sys,sysrq-trigger and /sys mounted read-only,'
+          expected+=' writes refused, reads allowed (root=false)'
+          if ! grep -Fq "${expected}" "${log}"; then
+            echo "::error::readonly_paths did not report verification (possibly not executed)" >&2
+            exit 1
+          fi
+          echo "readonly_paths: mounted read-only, writes refused, reads allowed (root=false)" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::readonly_paths verified"
+
+      - name: config_paths_implicit_dev のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        run: cargo test -p fandhe-container-core --test config_paths_implicit_dev --no-run
+
+      - name: config_paths_implicit_dev の実行（実機前提テスト・--ignored。SEC-2・#2015）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/config_paths_implicit_dev.log"
+          cargo test -p fandhe-container-core --test config_paths_implicit_dev -- --ignored 2>&1 | tee "${log}"
+          expected='config_paths_implicit_dev: 6 overlaps with the implicit /dev mounts applied at the exec layer'
+          expected+=' (no Landlock); start refuses them before fork (root=false)'
+          if ! grep -Fq "${expected}" "${log}"; then
+            echo "::error::config_paths_implicit_dev did not report verification (possibly not executed)" >&2
+            exit 1
+          fi
+          grep -F 'observed:' "${log}" >> "$GITHUB_STEP_SUMMARY" || true
+          echo "config_paths_implicit_dev: 6 overlaps observed (root=false)" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::config_paths_implicit_dev verified"
+
       # inject_files（`crates/core/tests/inject_files.rs`。SUP-12・TASK-169.4.2・#1473）:
       # secrets / configs の専用 tmpfs への注入・`mount_setattr(2)` による読み取り専用化
       # （`MOUNT_ATTR_RDONLY`。fsmount で得たマウントのルート fd 起点・`AT_EMPTY_PATH`。#1620）・

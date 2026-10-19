@@ -225,14 +225,33 @@ fn cli1_stop_delete_usage_errors() {
     }
 }
 
+/// `parent` 配下に一意名のディレクトリを排他的に作る（既存パスは削除も採用もしない）。
+///
+/// 共有 /tmp 上の推測可能な固定名を削除・再利用すると、競合で置かれた symlink を root が辿りうる。
+/// PID・時刻・試行番号の一意名を `create_dir` で作り、衝突時だけ名前を変える（#2324・SEC-2）。
+fn exclusive_dir(parent: &std::path::Path, prefix: &str) -> std::path::PathBuf {
+    for attempt in 0..16u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let p = parent.join(format!("{prefix}-{}-{nanos}-{attempt}", std::process::id()));
+        match std::fs::create_dir(&p) {
+            Ok(()) => return p,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => panic!("exclusively create {}: {e}", p.display()),
+        }
+    }
+    panic!("could not exclusively create a dir for {prefix}");
+}
+
 /// 一意な一時ディレクトリ（Drop で削除）。
 struct TmpDir(std::path::PathBuf);
 
 impl TmpDir {
     fn new(tag: &str) -> Self {
-        let p = std::env::temp_dir().join(format!("fc-cli-bin-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p).expect("mkdir");
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp_dir");
+        let p = exclusive_dir(&tmp, &format!("fc-cli-bin-{tag}"));
         // 状態ルートの祖先は group / other 書き込み不可でなければならない（umask に依存せず 0700 に固定）。
         #[cfg(unix)]
         {
@@ -273,10 +292,10 @@ fn op_and_code(out: &Output) -> (String, String) {
 /// 兄弟の supervisor bin があるかどうかに結果が左右されないようにする（#1718）。
 #[cfg(target_os = "linux")]
 fn isolated_cli_dir(tag: &str) -> std::path::PathBuf {
-    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("fc-cli-iso-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
+    let dir = exclusive_dir(
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+        &format!("fc-cli-iso-{tag}"),
+    );
     let dst = dir.join("fandhe-container");
     let src = env!("CARGO_BIN_EXE_fandhe-container");
     if std::fs::hard_link(src, &dst).is_err() {
@@ -295,7 +314,8 @@ fn run_isolated(exe: &std::path::Path, args: &[&str]) -> Output {
 #[cfg(target_os = "linux")]
 fn prepare_c1(tmp: &TmpDir, cli: &std::path::Path) -> (std::path::PathBuf, String) {
     let bundle = tmp.0.join("bundle");
-    std::fs::create_dir_all(bundle.join("rootfs")).expect("rootfs");
+    std::fs::create_dir(&bundle).expect("bundle");
+    std::fs::create_dir(bundle.join("rootfs")).expect("rootfs");
     std::fs::write(
         bundle.join("config.json"),
         r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
@@ -394,7 +414,8 @@ impl FakeScope {
     fn new(dir: &std::path::Path, tmp: &TmpDir) -> Self {
         install_fake_exe(dir, "fake-systemd-run", FAKE_SYSTEMD_RUN_BODY);
         let xdg = tmp.0.join("xdg");
-        std::fs::create_dir_all(xdg.join("systemd")).expect("mkdir xdg");
+        std::fs::create_dir(&xdg).expect("mkdir xdg");
+        std::fs::create_dir(xdg.join("systemd")).expect("mkdir xdg/systemd");
         let listener = std::os::unix::net::UnixListener::bind(xdg.join("systemd").join("private"))
             .expect("bind fake user manager socket");
         Self {
@@ -529,7 +550,7 @@ fn sup14_start_via_path_symlink_uses_supervisor_beside_real_exe() {
     let scope = FakeScope::new(&dir, &tmp);
 
     let bin = tmp.0.join("bin");
-    std::fs::create_dir_all(&bin).expect("mkdir bin");
+    std::fs::create_dir(&bin).expect("mkdir bin");
     let link = link_cli_into(&bin, &cli);
     install_fake_supervisor(
         &bin,
@@ -580,7 +601,7 @@ fn sup14_start_via_symlink_ignores_supervisor_beside_link() {
     let (_root, root_s) = prepare_c1(&tmp, &cli);
 
     let bin = tmp.0.join("bin");
-    std::fs::create_dir_all(&bin).expect("mkdir bin");
+    std::fs::create_dir(&bin).expect("mkdir bin");
     let link = link_cli_into(&bin, &cli);
     // 実体側には supervisor を置かない。symlink 側にだけ、使われれば成功してしまう supervisor を置く。
     install_fake_supervisor(&bin, "printf 'FCSUP1 OK 4242\\n'; exec sleep 1");
@@ -607,7 +628,8 @@ fn sup14_start_via_symlink_ignores_supervisor_beside_link() {
 fn cli1_stop_delete_flow_on_linux() {
     let tmp = TmpDir::new("stopdel");
     let bundle = tmp.0.join("bundle");
-    std::fs::create_dir_all(bundle.join("rootfs")).expect("rootfs");
+    std::fs::create_dir(&bundle).expect("bundle");
+    std::fs::create_dir(bundle.join("rootfs")).expect("rootfs");
     std::fs::write(
         bundle.join("config.json"),
         r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
@@ -662,7 +684,8 @@ fn cli1_stop_delete_flow_on_linux() {
 fn repair4_delete_removes_supervisor_log() {
     let tmp = TmpDir::new("suplog");
     let bundle = tmp.0.join("bundle");
-    std::fs::create_dir_all(bundle.join("rootfs")).expect("rootfs");
+    std::fs::create_dir(&bundle).expect("bundle");
+    std::fs::create_dir(bundle.join("rootfs")).expect("rootfs");
     std::fs::write(
         bundle.join("config.json"),
         r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
@@ -879,7 +902,8 @@ fn sec1_stop_delete_fail_closed_off_linux() {
 fn cli1_list_logs_flow_on_linux() {
     let tmp = TmpDir::new("listlogs");
     let bundle = tmp.0.join("bundle");
-    std::fs::create_dir_all(bundle.join("rootfs")).expect("rootfs");
+    std::fs::create_dir(&bundle).expect("bundle");
+    std::fs::create_dir(bundle.join("rootfs")).expect("rootfs");
     std::fs::write(
         bundle.join("config.json"),
         r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
@@ -1162,7 +1186,7 @@ fn cli1_start_fails_closed_without_user_manager() {
 
     // (b) ソケットの無い XDG_RUNTIME_DIR。
     let empty = tmp.0.join("empty-xdg");
-    std::fs::create_dir_all(&empty).expect("mkdir");
+    std::fs::create_dir(&empty).expect("mkdir");
     let out = run_exe_env(
         &cli,
         &["--root", &root_s, "start", "c1"],

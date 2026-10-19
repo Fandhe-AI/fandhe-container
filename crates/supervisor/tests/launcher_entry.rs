@@ -114,7 +114,43 @@ fn sup14_task1719_invalid_arguments_stop_before_elevation() {
     }
 }
 
+/// プロセスグループのリーダーとして起動されると、ランチャーの `setsid` が `EPERM` になり、読み戻しでも
+/// セッションのリーダーでないため、昇格にも exec にも進まず `FAILED_PRECONDITION` で止まる（SUP-14・TASK-171.2・#537）。
+/// 報告は 1 行だけで、メッセージは `session detach failed: ` で始まる。
+#[test]
+fn sup14_task171_2_process_group_leader_is_rejected() {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(LAUNCHER);
+    cmd.args(["start", "--root", "/var/lib/fandhe-container", "c1"])
+        .env_clear()
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = cmd.output().unwrap();
+    let o = Outcome {
+        stdout: out.stdout,
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        code: out.status.code().unwrap(),
+    };
+    let (code, msg) = failed(&o);
+    assert_eq!(code, ErrorCode::FailedPrecondition, "{msg}");
+    assert!(msg.starts_with("session detach failed: "), "{msg}");
+    assert_eq!(o.stdout.iter().filter(|&&b| b == b'\n').count(), 1);
+    assert_eq!(
+        o.code,
+        i32::from(exit_code_for(ErrorCode::FailedPrecondition).get())
+    );
+    assert!(
+        o.stderr.contains("\"code\":\"FAILED_PRECONDITION\""),
+        "{}",
+        o.stderr
+    );
+}
+
 /// 呼び出し元の環境に `LD_PRELOAD` があっても、検証に失敗する経路は fail-closed のままで、報告は 1 行だけ。
+/// 通常の spawn（親と同じプロセスグループ・端末なしの標準入出力）で切り離しに成功し、信頼検証または昇格の段まで
+/// 進むことの回帰ガードも兼ねる（#537）。
 /// 開発環境のビルド出力は通常 root 所有・他者書き込み不可の経路にないため `PERMISSION_DENIED` で止まる。
 /// root で実行した場合や経路が全て root 所有の場合は、検証を通って `elevate` が昇格手段が無いとして拒否する。
 #[test]

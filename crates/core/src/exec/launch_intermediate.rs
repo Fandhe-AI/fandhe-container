@@ -1839,10 +1839,14 @@ mod tests {
         assert!(sink.0.lock().unwrap().is_empty());
     }
 
-    /// CORE-1・REPAIR-5・REPAIR-12(#2249): 他スレッドが stdout / stderr のロックを握っている間に fork しても、
-    /// 入れ子の代役の fork が flush で止まらず成功する(修正前は中間プロセスが報告せず Timeout になった)。
+    /// 子プロセス側の本体(`REPAIR12_2249_CHILD` が無ければ何もしない)。別スレッドが stdout / stderr の
+    /// ロックを握っている間に fork しても、入れ子の代役の fork が flush で止まらず成功することを確かめる。
+    /// ロックは共有 libtest プロセスを巻き込まないよう、親が再 exec した専用プロセスの中でだけ握る。
     #[test]
-    fn repair12_2249_stand_in_fork_ignores_stdio_locks_held_by_other_threads() {
+    fn repair12_2249_stand_in_fork_ignores_stdio_locks_helper() {
+        if std::env::var_os("REPAIR12_2249_CHILD").is_none() {
+            return;
+        }
         use std::sync::mpsc;
         let (held_tx, held_rx) = mpsc::channel::<()>();
         let (release_tx, release_rx) = mpsc::channel::<()>();
@@ -1867,6 +1871,44 @@ mod tests {
             ChildExit::Exited(0)
         );
         assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    /// CORE-1・REPAIR-5・REPAIR-12(#2249): 他スレッドが stdout / stderr のロックを握っている間に fork しても、
+    /// 入れ子の代役の fork が flush で止まらず成功する(修正前は中間プロセスが報告せず Timeout になった)。
+    /// process-global のロックで並列テストを巻き込まないよう、`--test-threads=1` の子プロセスへ隔離して確かめる。
+    #[test]
+    fn repair12_2249_stand_in_fork_ignores_stdio_locks_held_by_other_threads() {
+        if std::env::var_os("REPAIR12_2249_CHILD").is_some() {
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "exec::launch_intermediate::tests::repair12_2249_stand_in_fork_ignores_stdio_locks_helper",
+            ])
+            .env("REPAIR12_2249_CHILD", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let status = status.expect("isolated child timed out");
+        assert!(status.success(), "isolated child failed: {status:?}");
     }
 
     /// SEC-4(#1816): pivot 前段の違反は C が 1 件記録し、起動失敗を返して PID 1 を回収する。

@@ -23,7 +23,7 @@
 //!   できたがプロセスグループを停止できなかった場合は、元のエラーの code を保ち message に
 //!   `process group could not be killed` の付記（pid なし）を加えて返し、状態は
 //!   [`ResidentState::GroupKillFailed`] になる（shutdown は未回収とは別の `Internal` を返す）。
-//! - 子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ。stdin / stdout は null、stderr は
+//! - 子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] と、既定は空で `OneShotPlugin::with_env` が明示した組のみ（`lifecycle` の契約）。stdin / stdout は null、stderr は
 //!   セッション全期間で 1 本の読み取りスレッドが上限つきで収集し、[`ResidentPlugin::shutdown`] の結果
 //!   （失敗時も [`ResidentShutdownError`] に載せる）でのみ返す（untrusted）。[`ResidentPlugin`] の破棄（panic 等を含む）でも子の kill・回収とスレッド停止を行う。
 //! - 親の強制終了時の停止（#1514・PLUG-7・REPAIR-5・CORE-1）: Linux では plugin に `PR_SET_PDEATHSIG`

@@ -1,4 +1,4 @@
-//! usr-merge 正規化の結合試験（TASK-126.3・GPU-1）。公開 API のみを使い、PoC の値はリテラルで写す。
+//! usr-merge 正規化の結合試験（TASK-126.3・GPU-1・MS-10）。公開 API のみを使い、PoC の値はリテラルで写す。
 use fandhe_container_gpu::cdi_edits::aggregate_container_edits;
 use fandhe_container_gpu::cdi_paths::{PathLayouts, UsrMergeLayout, normalize_cdi_spec_paths};
 use fandhe_container_gpu::cdi_spec::parse_cdi_spec;

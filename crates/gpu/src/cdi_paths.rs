@@ -1,4 +1,4 @@
-//! CDI spec のパスの usr-merge 正規化（TASK-126.3・GPU-1。根拠は PoC-14）。
+//! CDI spec のパスの usr-merge 正規化（TASK-126.3・GPU-1・MS-10。根拠は PoC-14）。
 //!
 //! usr-merge 環境（Ubuntu 24.04 等）では `/lib`・`/bin`・`/sbin`・`/lib64` が `usr/...` への
 //! シンボリックリンクで、`/proc/self/mountinfo` は解決後の `/usr/lib/...` を報告する。spec 側の
@@ -152,17 +152,12 @@ fn normalize_in_place(value: &mut String, layout: &UsrMergeLayout) {
 
 fn normalize_edits(edits: &mut ContainerEdits, layouts: &PathLayouts) {
     for node in &mut edits.device_nodes {
-        // hostPath 省略時は path がホスト側の参照先も兼ねる。path を書き換える前に
-        // 元の path をホスト側の参照先として明示化し、ホスト用レイアウトで独立に正規化する。
-        if node.host_path.is_none()
-            && normalize_usr_merge_path(&node.path, &layouts.container) != node.path.as_str()
-        {
-            node.host_path = Some(node.path.clone());
-        }
+        // hostPath 省略時は path がホスト側の参照先も兼ねる。path を書き換える前に元の path を
+        // 常にホスト側の参照先として明示化し（省略と明示の表現差で畳み込みが壊れないよう統一）、
+        // ホスト用レイアウトで独立に正規化する。
+        let host = node.host_path.get_or_insert_with(|| node.path.clone());
+        normalize_in_place(host, &layouts.host);
         normalize_in_place(&mut node.path, &layouts.container);
-        if let Some(host) = node.host_path.as_mut() {
-            normalize_in_place(host, &layouts.host);
-        }
     }
     for mount in &mut edits.mounts {
         normalize_in_place(&mut mount.container_path, &layouts.container);
@@ -358,7 +353,7 @@ devices:
         assert_eq!(n0.host_path.as_deref(), Some("/lib/x"));
         let n1 = &spec.devices[1].container_edits.device_nodes[0];
         assert_eq!(n1.path, "/usr/lib/x");
-        assert_eq!(n1.host_path, None);
+        assert_eq!(n1.host_path.as_deref(), Some("/usr/lib/x"));
         // 暗黙のホスト参照先が異なるノードは畳まれず拒否される。
         assert_eq!(
             aggregate_container_edits(&spec, &["0", "1"])
@@ -366,6 +361,16 @@ devices:
                 .map_err(|e| e.code()),
             Err(CdiSpecErrorCode::InvalidArgument)
         );
+    }
+
+    #[test]
+    fn gpu1_implicit_host_path_folds_with_explicit_usr_form() {
+        let mut spec = parse_cdi_spec(NODE_SPEC).unwrap();
+        let m = UsrMergeLayout::merged();
+        normalize_cdi_spec_paths(&mut spec, &PathLayouts::new(m, m));
+        let a = aggregate_container_edits(&spec, &["0", "1"]).unwrap();
+        assert_eq!(a.device_nodes().len(), 1);
+        assert_eq!(a.device_nodes()[0].path, "/usr/lib/x");
     }
 
     #[cfg(unix)]

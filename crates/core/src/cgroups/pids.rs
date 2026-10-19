@@ -6,8 +6,8 @@
 //! （検証済みの型）でしか表現できないため、範囲外の値はカーネルへ渡らない。
 //!
 //! # 呼び出し文脈・契約
-//! - 呼び出し元: 起動フロー（`--pids-limit` 相当の受け付けと launcher への結線は TASK-170.3・
-//!   TASK-29 / TASK-157 系の担当）。本モジュールは単体の API で、起動フローからはまだ呼ばれない
+//! - 呼び出し元: start の cgroup 連鎖（`start_chain` の `apply_limits`。OCI `linux.resources.pids` の反映。
+//!   TASK-29 追補・#2019）。CLI の `--pids-limit` 相当の受け付けは TASK-170.3・#534
 //! - 前提: 親 cgroup の `cgroup.subtree_control` で `pids` controller が有効化済み
 //!   （[`super::DelegatedCgroup::enable_controllers`]）。未有効なら `pids.max` が存在せず `FailedPrecondition`
 //! - 書き込み先は保持している O_PATH ディレクトリ fd 起点の `openat`（`O_NOFOLLOW`）で、
@@ -22,7 +22,7 @@
 //! （CLI / launcher）の責務で、本モジュールは曖昧な値を黙って無制限にしない。
 //!
 //! # 未実装（REPAIR-3）
-//! OCI `linux.resources.pids` からの反映と launcher への結線（TASK-170.3・TASK-29 / TASK-157 系）。
+//! なし（OCI `linux.resources.pids` の反映は #2019 で入った）。
 
 use std::fs::File;
 use std::io::Write as _;

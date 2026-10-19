@@ -2925,6 +2925,35 @@ mod tests {
         assert!(!spec.cgroup_requirement().is_required());
     }
 
+    /// #2019・CORE-3: 資源つきの config を start すると、launcher へ渡る `LaunchSpec` は cgroup 要件ありで、
+    /// config の `linux.resources` が具体値で載る。create 後に `cgroupsPath` を足されたら起動前に拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core3_start_carries_resources_and_requires_cgroup() {
+        use crate::oci_runtime::ByteLimit;
+        let b = Bundle::new("resources");
+        let mut cfg = valid_config();
+        cfg["linux"]["resources"] = json!({"memory": {"limit": 67108864}, "pids": {"limit": 64}});
+        b.write_config(&cfg);
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        let store = MemStateStore::new(None);
+        create(&store, &OpRecorder::new(), &b.create_req("resources")).expect("create");
+        let launcher = RecordingLauncher::new(false);
+        run(&store, &launcher, "resources").expect("start");
+        let specs = launcher.specs.lock().expect("lock");
+        let spec = specs.first().expect("spec");
+        assert!(spec.cgroup_requirement().is_required());
+        assert_eq!(spec.cgroup_requirement().reasons(), vec!["linux.resources"]);
+        let limits = spec.config().linux_resources().expect("resources");
+        assert_eq!(limits.memory_max(), Some(ByteLimit::Bytes(67_108_864)));
+        assert_eq!(limits.pids_limit(), Some(64));
+
+        let mut rewritten = valid_config();
+        rewritten["linux"]["cgroupsPath"] = json!("/x");
+        let err = start_rejected_after_rewrite("resources-path", &rewritten);
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
+    }
+
     /// SEC-1: bundle の祖先が symlink なら（create は受理しても）start は起動前に拒否し、予約もしない。
     /// 本番 launcher の `exec::prepare_rootfs` も `/` から symlink 非追従で辿るため、先に拒否する。
     #[cfg(target_os = "linux")]

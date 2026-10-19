@@ -7,6 +7,9 @@
 //! - コンテナ内のプローブ（`--container-probe`）: `READY` を 1 行出し、約 2 秒待って終了コード 7 で終わる。
 //!
 //! # 照合項目
+//! - シナリオ A の起動直後、PID 1 の `uid_map`・`gid_map` が選択規則（subuid / subgid の自分の行が両方あれば範囲写像、
+//!   無ければ 1 対 1。CORE-6・SEC-5・#2243）どおりであること。成功行の前に `id mapping verified (model=...)` を出す。
+//!   `FANDHE_CONTAINER_TEST_ID_HELPER=1` では範囲写像を必須にする（設定・`uidmap` が無ければ失敗）
 //! - シナリオ A（正常起動 → 監視 → 記録）: bin が `FCSUP1 OK <pid>` を報告し、状態が Running（pid 一致）で、ホストの
 //!   `/proc/<pid>/status` の `NSpid` 末尾が 1。プローブの終了を `monitor` が回収して状態が Stopped（終了コード 7）に
 //!   なり、bin が終了コード 0 で終わり、`/proc/<pid>` が消え、コンテナの出力（`READY`）がログ sink のファイルに残る
@@ -424,6 +427,93 @@ mod linux {
         );
     }
 
+    /// ホストの実効 uid・gid（`/proc/self/status`）。
+    fn host_ids() -> (u32, u32) {
+        let field = |key: &str| -> u32 {
+            status_field("/proc/self/status", key)
+                .and_then(|v| v.split_whitespace().nth(1).map(str::to_owned))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| panic!("cannot read {key} of this process"))
+        };
+        (field("Uid:"), field("Gid:"))
+    }
+
+    /// `/etc/subuid` 形式のファイルから、名前か数値 uid が一致する行の (start, count) を集める（試験側の独立実装）。
+    fn owner_ranges(path: &str, name: Option<&str>, uid: u32) -> Vec<(u64, u64)> {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        text.lines()
+            .filter_map(|l| {
+                let mut f = l.trim().split(':');
+                let who = f.next()?;
+                if Some(who) != name && who != uid.to_string() {
+                    return None;
+                }
+                Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+            })
+            .collect()
+    }
+
+    /// 起動した PID 1 の `uid_map`・`gid_map` が supervisor の選択規則どおりか照合する（CORE-6・SEC-5・#2243）。
+    /// subuid / subgid の両方に自分の行があれば「0 → 実効 ID × 1」と範囲の連結、どちらも無ければ 1 対 1 の 1 行。
+    /// `FANDHE_CONTAINER_TEST_ID_HELPER=1` のときは範囲写像を必須にする（設定や uidmap が無ければ失敗）。
+    fn verify_id_mapping(pid: u32) {
+        let (uid, gid) = host_ids();
+        let name = std::fs::read_to_string("/etc/passwd").ok().and_then(|t| {
+            t.lines().find_map(|l| {
+                let f: Vec<&str> = l.split(':').collect();
+                (f.get(2).and_then(|u| u.parse::<u32>().ok()) == Some(uid))
+                    .then(|| f.first().map(|n| (*n).to_owned()))
+                    .flatten()
+            })
+        });
+        let su = owner_ranges("/etc/subuid", name.as_deref(), uid);
+        let sg = owner_ranges("/etc/subgid", name.as_deref(), uid);
+        let subordinate = !su.is_empty() && !sg.is_empty();
+        if std::env::var("FANDHE_CONTAINER_TEST_ID_HELPER").as_deref() == Ok("1") {
+            assert!(
+                subordinate,
+                "FANDHE_CONTAINER_TEST_ID_HELPER=1 needs subuid and subgid rows for this user"
+            );
+        }
+        let read = |file: &str| -> Vec<(u64, u64, u64)> {
+            std::fs::read_to_string(format!("/proc/{pid}/{file}"))
+                .unwrap_or_else(|e| panic!("cannot read {file}: {e}"))
+                .lines()
+                .map(|l| {
+                    let n: Vec<u64> = l.split_whitespace().map(|x| x.parse().unwrap()).collect();
+                    (n[0], n[1], n[2])
+                })
+                .collect()
+        };
+        for (file, host, ranges) in [("uid_map", uid, &su), ("gid_map", gid, &sg)] {
+            let map = read(file);
+            if subordinate {
+                // 期待する全行: (0, 実効 ID, 1) の後に、設定の範囲を順に container id 1.. へ連結（rootless_mapping と同じ規則）。
+                let mut want = vec![(0u64, u64::from(host), 1u64)];
+                let mut next = 1u64;
+                for &(start, count) in ranges.iter() {
+                    want.push((next, start, count));
+                    next += count;
+                }
+                assert_eq!(map, want, "{file}: every extent (container, host, count)");
+            } else {
+                assert_eq!(
+                    map,
+                    vec![(0, u64::from(host), 1)],
+                    "{file}: single id mapping"
+                );
+            }
+        }
+        println!(
+            "supervisor_bin_real: id mapping verified (model={}, uid extents={}, gid extents={})",
+            if subordinate { "subordinate" } else { "single" },
+            read("uid_map").len(),
+            read("gid_map").len()
+        );
+    }
+
     /// シナリオ A: 起動 → 報告 → 監視 → Stopped の記録。
     fn scenario_a_start_monitor_record() {
         let env = Env::new("a", true);
@@ -443,6 +533,7 @@ mod linux {
         assert_eq!(parts.len(), 2, "NSpid must have two levels: {nspid:?}");
         assert_eq!(parts.first().copied(), Some(pid.to_string().as_str()));
         assert_eq!(parts.last().copied(), Some("1"));
+        verify_id_mapping(pid.get());
 
         assert_eq!(sup.exit_code(), 0, "monitor must finish cleanly");
         let stopped = env.record(&id);

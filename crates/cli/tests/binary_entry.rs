@@ -861,8 +861,26 @@ fn err2_create_rejects_relative_bundle() {
     );
 }
 
+/// OCI-5・SEC-4・CLI-1: Linux 以外の日常コマンドが fail-closed で終わった後の状態ルートの期待。
+/// plugin 拒否の監査記録先（`@audit.log`）を作る際に、`FileStateStore::open` が macOS では状態ルートを
+/// 0700 で作り、Windows（`Unimplemented`）では何も作らない。
+#[cfg(not(target_os = "linux"))]
+fn assert_state_root_after_fail_closed(root: &std::path::Path) {
+    if cfg!(target_os = "macos") {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(root).expect("state root must be created on macOS");
+            assert!(meta.is_dir());
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        }
+    } else {
+        assert!(!root.exists(), "state root must not be created on Windows");
+    }
+}
+
 /// SEC-1・PLUG-4: Linux 以外では plugin 発見機構経由になり、候補なし（既定探索先が空）の fail-closed で
-/// FAILED_PRECONDITION（5）。状態ルートは作らない。
+/// FAILED_PRECONDITION（5）。状態ルートは macOS では 0700 で作られ、Windows では作らない。
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn sec1_create_fails_closed_off_linux() {
@@ -883,7 +901,7 @@ fn sec1_create_fails_closed_off_linux() {
         ("create".into(), "FAILED_PRECONDITION".into())
     );
     assert!(out.stdout.is_empty());
-    assert!(!root.exists());
+    assert_state_root_after_fail_closed(&root);
     // 引数不正は plugin 解決より先に 2 で弾く（3 OS 同一）。
     let out = run(&["create", "--bundle", "relative", "c1"]);
     assert_eq!(out.status.code(), Some(2));
@@ -901,6 +919,7 @@ fn sec1_stop_delete_fail_closed_off_linux() {
         assert_eq!(op_and_code(&out), (op.into(), "FAILED_PRECONDITION".into()));
         assert!(out.stdout.is_empty());
     }
+    assert_state_root_after_fail_closed(&root);
 }
 
 /// CLI-1・ERR-2: Linux で list は stdout にタブ区切りの一覧を出し（0 件はヘッダのみ・ID 昇順）、
@@ -977,6 +996,7 @@ fn sec1_list_logs_fail_closed_off_linux() {
         );
         assert!(out.stdout.is_empty());
     }
+    assert_state_root_after_fail_closed(&root);
     let out = run(&["--root", root_s, "logs", "bad/id"]);
     assert_eq!(out.status.code(), Some(2));
 }
@@ -1292,4 +1312,98 @@ fn doctor_rejects_extra_arguments() {
     assert_eq!(out.status.code(), Some(2));
     assert!(out.stdout.is_empty());
     assert_eq!(String::from_utf8(out.stderr).expect("utf8"), USAGE_JSON);
+}
+
+/// `image` 系の stderr 1 行 JSON（op なし）を組み立てる。
+#[cfg(target_os = "linux")]
+fn image_err(code: &str, message: &str) -> String {
+    format!("{{\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
+}
+
+/// CLI-1・OCI-7（#2316）: `image tag` の実入口で、引数不足は INVALID_ARGUMENT（終了コード 2）。
+/// 引数の解析は OS 分岐より先なので 3 OS 共通。stdout は空。
+#[test]
+fn cli1_image_tag_too_few_args_is_invalid_argument() {
+    let tmp = TmpDir::new("tag-args");
+    let root = tmp.0.join("images");
+    let out = run(&[
+        "image",
+        "tag",
+        "--image-root",
+        root.to_str().expect("utf8"),
+        "busybox",
+    ]);
+    assert_failure(&out, 2, USAGE_JSON);
+}
+
+/// CLI-1・OCI-7（#2316）: Linux で空のストアに対する `image tag` は付け元が無く NOT_FOUND（終了コード 3）。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_image_tag_missing_source_is_not_found_on_linux() {
+    let tmp = TmpDir::new("tag-nf");
+    let root = tmp.0.join("images");
+    std::fs::create_dir(&root).expect("mkdir image root");
+    let out = run(&[
+        "image",
+        "tag",
+        "--image-root",
+        root.to_str().expect("utf8"),
+        "busybox:latest",
+        "busybox:v2",
+    ]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(out.stdout.is_empty(), "stdout must be empty");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        image_err("NOT_FOUND", "image not found")
+    );
+}
+
+/// CLI-1・OCI-7（#2316）: Linux で付け先が digest 指定なら INVALID_ARGUMENT（終了コード 2）。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_image_tag_digest_target_is_invalid_argument_on_linux() {
+    let tmp = TmpDir::new("tag-digest");
+    let root = tmp.0.join("images");
+    std::fs::create_dir(&root).expect("mkdir image root");
+    let target = format!("busybox@sha256:{}", "a".repeat(64));
+    let out = run(&[
+        "image",
+        "tag",
+        "--image-root",
+        root.to_str().expect("utf8"),
+        "busybox:latest",
+        &target,
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(out.stdout.is_empty(), "stdout must be empty");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        image_err("INVALID_ARGUMENT", "target must be a tag reference")
+    );
+}
+
+/// CLI-1・OCI-7・SEC-1（#2316）: Linux 以外の `image tag` は plugin 候補なしの fail-closed で
+/// FAILED_PRECONDITION（終了コード 5）。ストアのルートは作らない。
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn cli1_image_tag_fails_closed_off_linux() {
+    let tmp = TmpDir::new("tag-offlinux");
+    let root = tmp.0.join("images");
+    let out = run(&[
+        "image",
+        "tag",
+        "--image-root",
+        root.to_str().expect("utf8"),
+        "busybox:latest",
+        "busybox:v2",
+    ]);
+    assert_eq!(out.status.code(), Some(5));
+    assert!(out.stdout.is_empty(), "stdout must be empty");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).starts_with("{\"code\":\"FAILED_PRECONDITION\""),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!root.exists());
 }

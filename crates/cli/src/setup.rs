@@ -411,8 +411,22 @@ mod tests {
                 "create", "start", "stop", "delete", "list", "logs", "image", "system"
             ]
         );
-        if !linux {
-            assert!(!root.exists(), "state root must not be created off Linux");
+        // 日常操作は OS 固有設定を要求しないが、plugin 拒否の監査記録先（`<状態ルート>/@audit.log`。SEC-4）を
+        // 作る際に `FileStateStore::open` が状態ルートを 0700 で作る。macOS は FileStateStore 対応済み（OCI-5）で作り、
+        // Windows は未対応（Unimplemented。fail-closed）で何も作らない。
+        if cfg!(target_os = "macos") {
+            assert!(root.is_dir(), "state root must be created on macOS");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&root)
+                    .expect("metadata")
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o700);
+            }
+        } else if !linux {
+            assert!(!root.exists(), "state root must not be created on Windows");
         }
     }
 

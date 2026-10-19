@@ -134,6 +134,7 @@ mod rlimits;
 mod rootfs;
 mod sealed_copy;
 mod seccomp;
+mod seccomp_listener;
 mod setns;
 mod stages;
 mod subreaper;
@@ -283,6 +284,11 @@ pub use seccomp::{
 };
 #[doc(hidden)]
 pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
+/// 結合試験 `tests/seccomp.rs`・`tests/production_launcher.rs` 専用の再公開（CORE-5・ESC-06・#2234。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub use seccomp::{probe_denied_syscalls_for_test, probe_kcmp_self_for_test};
+pub use seccomp_listener::SeccompListener;
 pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 pub use subreaper::ChildSubreaper;
@@ -1250,6 +1256,9 @@ pub struct IsolationPlan {
 /// 保ったまま**分離する。コンテナ内 root はホスト root そのものであり、SEC-5（非 root 起動時に
 /// コンテナ内 root をホストの非特権 UID へ写す）の保護は受けない。
 ///
+/// 本番の launcher と supervisor はこの権限モデルを拒否する（許すかは #2241 で判断待ち。
+/// `docs/design/rootful-host-root.md`）。この経路は分離の下位 API で、結合試験の構成が使う。
+///
 /// **用途**: CORE-7・CORE-9 の rootful 分離（spec 上、dev-box02 の PoC-14・15・17 で実機実証済みの
 /// 構成）。root 起動でもコンテナ内 root を非特権 UID へ写す構成は未実装（TASK-40.2 の
 /// [`plan_rootless_subordinate`] は非 root 起動に限る）で、それまでの暫定経路ではなく明示的に選ぶ別経路として分けている。
@@ -1582,6 +1591,18 @@ fn isolate_rootless_subordinate_with(
             None,
         ));
     }
+    // 公開 API は呼び出し元が明示した non-dumpable の保護を外さない。写像の書き込みには対象が dumpable である
+    // ことが要る(下の `restore_non_dumpable` の理由)ため、non-dumpable のままなら fork の前に拒否する
+    // (fail-closed。CORE-6・SEC-5・SEC-1)。dumpable を一時的に上げてよいのは、保護を自分で作り直せる本番 launcher
+    // の中間プロセス I だけである。
+    if caller == MapperCaller::Standalone && matches!(sys::is_dumpable(), Ok(false)) {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::UserNamespaceMap,
+            "the caller is non-dumpable; newuidmap/newgidmap cannot map it (make the process dumpable \
+             before calling, or use the production launcher)",
+        ));
+    }
     let (mut parent_sock, mapper_sock) = std::os::unix::net::UnixStream::pair()
         .map_err(|e| ExecError::from_io(&e, IsolationStage::UserNamespaceMap, "socketpair"))?;
     let parent_pid = std::process::id();
@@ -1607,8 +1628,36 @@ fn isolate_rootless_subordinate_with(
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
     let mapper = ContainerChild::spawned(mapper_pid);
 
-    let handshake = rootless_handshake(&mut parent_sock, plan);
+    // 写像の対象(このプロセス)が non-dumpable だと `/proc/<pid>` が root 所有になり、`newuidmap` / `newgidmap` の
+    // 所有者検査が拒否する(supervisor は入口で non-dumpable にする。CORE-6・SEC-5・#2243)。launcher の中間プロセス
+    // I(写像の対象。supervisor 本体 C ではなく fork した子で、C は non-dumpable のまま)に限り、書き込みの間だけ
+    // dumpable にし、成否によらず握手の後に戻す。窓の間に同一 uid のホスト側プロセスが I を ptrace できる点は
+    // newuidmap / newgidmap の仕様上避けられない(I の fd は起動入口で close_range 済みで、PID 1 の fork より前に戻す)。
+    let restore_non_dumpable =
+        caller == MapperCaller::Launcher && matches!(sys::is_dumpable(), Ok(false));
+    // mapper を fork した後は、どの失敗も下の回収の分岐を通す(`?` で早期 return すると mapper がゾンビで残る。
+    // `ContainerChild` は drop で回収しない。CORE-2)。
+    let make_dumpable = if restore_non_dumpable {
+        sys::set_dumpable_user().map_err(|e| {
+            ExecError::from_sys(e, IsolationStage::UserNamespaceMap, "PR_SET_DUMPABLE")
+        })
+    } else {
+        Ok(())
+    };
+    let handshake = match make_dumpable {
+        Ok(()) => rootless_handshake(&mut parent_sock, plan),
+        Err(e) => Err(e),
+    };
     drop(parent_sock);
+    let restored = if restore_non_dumpable {
+        sys::set_non_dumpable().map_err(|e| {
+            ExecError::from_sys(e, IsolationStage::UserNamespaceMap, "PR_SET_DUMPABLE")
+        })
+    } else {
+        Ok(())
+    };
+    // 握手の失敗を優先し、握手が成功しても戻せなかったら失敗として扱う(non-dumpable のまま進めない)。
+    let handshake = handshake.and(restored);
     match handshake {
         // 応答(Ok)は mapper が helper を回収し終えた後にだけ届くため、ここで mapper を kill しても helper は残らない。
         Ok(()) => {
@@ -2203,6 +2252,65 @@ mod tests {
             namespaces,
             hostname: hostname.map(|h| Hostname::new(h).unwrap()),
         }
+    }
+
+    /// CORE-6・SEC-5・SEC-1(#2243): non-dumpable の呼び出し元に対する公開 API は、dumpable に戻さず(保護を外さず)
+    /// fork の前に `FailedPrecondition` で拒否する。`PR_SET_DUMPABLE` はプロセス単位でテストの他の試験に残るため、
+    /// 自分自身を再実行した使い捨てプロセスの中で確かめる。
+    #[test]
+    fn core6_sec5_standalone_rejects_non_dumpable_caller_without_weakening_it() {
+        const MARK: &str = "FANDHE_TEST_NON_DUMPABLE_CHILD";
+        if std::env::var_os(MARK).is_some() {
+            assert_eq!(sys::set_non_dumpable(), Ok(()));
+            let plan = plan_rootless_subordinate(
+                &cfg(NamespaceSet::empty().with(Namespace::User), None),
+                crate::rootless::single_id_mapping(sys::effective_uid()).unwrap(),
+                crate::rootless::single_id_mapping(sys::effective_gid()).unwrap(),
+                IdMapWriter::Direct,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let err = isolate_rootless_subordinate(&plan).unwrap_err();
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{err}");
+            assert!(err.to_string().contains("non-dumpable"), "{err}");
+            // 保護は外れておらず、user namespace にも入っていない(副作用なし)。
+            assert_eq!(sys::is_dumpable(), Ok(false));
+            return;
+        }
+        // 期限なしの `output()` は子が止まると試験ごと止まる(REPAIR-5)。出力は一時ファイルへ向け、期限つきで待つ。
+        let dir = std::env::temp_dir().join(format!("fandhe-nondumpable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("child.log");
+        let file = std::fs::File::create(&log).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exec::tests::core6_sec5_standalone_rejects_non_dumpable_caller_without_weakening_it",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(MARK, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break Some(st);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let output = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let status = status.unwrap_or_else(|| panic!("child timed out (killed)\n{output}"));
+        assert!(status.success(), "{output}");
     }
 
     /// CORE-1: 5 種の集合と単体の所属判定。

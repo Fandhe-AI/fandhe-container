@@ -50,6 +50,8 @@ crash_safety（IO-3）の有効 / 無効の試行数・損失件数は、「結�
 
 `platform-ci` の ubuntu は、AppArmor の `kernel.apparmor_restrict_unprivileged_userns` を緩和するステップ（sudo の用途はこれだけ）の後に、Linux 限定で `--ignored` の実機前提テスト（`harness = false` の試験と libtest の `#[ignore]` の試験。`unshare_isolation`・`exec_setns_join`・`container_options_ipc`・`tmpfs_mount`・`inject_files`・`readonly_paths`〔SEC-2・#1850〕・`config_paths_implicit_dev`〔SEC-2・#2015。暗黙の `/dev` 系と重なる保護パスの exec 層での観測〕・`lo_self_delivery`〔NET-2・NET-11・#2077。非特権 netns の `lo` の up 前後の自己宛て配送〕・`runtime_service_namespaces`〔CRI-2・#2220。libtest の `#[ignore]`〕）をビルド・実行の 2 ステップずつで実行する。`--ignored` が届かなくても exit 0 になるため、各成功行（libtest のものは `test <名前> ... ok` の行）をログから grep で照合して false-green を防ぐ（新しい check-run は増えない。詳細は `AGENTS.md`「実機前提テスト」）。
 
+`production_launcher`（CORE-6・SEC-5・#2244。シナリオ I の範囲写像を含む）は委譲 cgroup と `uidmap`・subuid の前提が未実測のため `platform-ci` に組み込んでいない。`linux-env-probe.yml` の `id-mapping-probe` ジョブで実測してから判断する（理由と組み込み時の照合は `AGENTS.md`「実機前提テスト」の `production_launcher`）。
+
 `platform-ci` ジョブは結合試験に続けて、スクリプトの自己テストを実行する（main への push と `workflow_dispatch` では 3 OS。Windows は Git Bash）: `make plug4-core-invariance-selftest`（PLUG-4 判定スクリプト。TASK-109.4）・`make cli-parity-selftest`（CLI 3 OS 比較。TASK-125.1・CLI-1）・`make vz-virtio-gpu-guest-check-selftest`（virtio-gpu ゲスト側確認スクリプト。合成 fixture のみ。TASK-172.6・GPU-6）・`make guest-kernel-build-selftest`（ゲストカーネルのビルドスクリプト。スタブのみで取得も実ビルドもしない。#1874・MAC-1。3 OS）・`make guest-initrd-build-selftest`（ゲスト initrd の梱包スクリプト。疑似 ELF とスタブ cargo のみで実ビルドしない。#1878・MAC-1。3 OS）・`make commit-msg-line-length-selftest`（commit-msg フックの本文行長検査。Issue #1295・REPAIR-12）・`make crash-summary-check-selftest`（crash_safety 件数サマリー検証。#1833・IO-3・REPAIR-12）・`make check-launch-target-selftest`（plugin 起動対象の構築箇所の判定。#1857・PLUG-11・REPAIR-12）・`make lib-selftest`（`scripts/lib.sh` の workspace 判定と `run_limited`〔期限つき実行。3 スクリプトの共通化。#2092・REPAIR-1・REPAIR-5〕の回帰テスト。PR #1756。macOS では `/bin/bash` 3.2 でも回す）。本判定 `make check-launch-target`（構築口 `PluginLaunchTarget::from_verified_file` を呼ぶのが core の変換と許可した試験コードだけか。#1857・PLUG-11）も `platform-ci` のステップとして実行する（`test-core-no-plugin` と同じ扱い）。あわせて `make cli-parity-native-reclaim-check`（タイムアウト回収のネイティブ exe 実測。#1548）と `make cli-parity-native-reclaim-selftest`（その全体期限の自己テスト。#1688・REPAIR-5・REPAIR-12）も実行する（後者の ubuntu 分は約 90 秒の待ちでクリティカルパスだったため `bench-regression` の並列グループへ移した。macOS・Windows は main の `platform-ci` で実行する）。いずれもステップごとに timeout-minutes 5 を付け、新しいジョブ・check-run 名は増やさない。
 
 `cli-parity-native-reclaim-check` はスクリプト自身が wall clock の全体期限（既定 150 秒。`CLI_PARITY_RECLAIM_DEADLINE_SECS`）を持ち、超えたら子孫を回収して `deadline_exceeded` の行つきで失敗する（Windows でステップの timeout-minutes が効かずジョブ上限まで止まらなかったため。#1688）。ハング注入は `CLI_PARITY_RECLAIM_TEST_HANG`、止まり方の実証は `workflow_dispatch` の `reclaim-hang-probe` 入力（none / step-timeout / script-deadline。PR ブランチへ `--ref` で dispatch すると 3 OS で回り、concurrency group が PR の CI と衝突しない）で行う。PR の CI は ubuntu のみのため、Windows での確認は `workflow_dispatch` で行う。
@@ -60,7 +62,7 @@ rustdoc の警告（壊れた intra-doc リンク・private 項目へのリン�
 
 macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/tests/macos_cold_start.rs` の結合試験（`cfg(target_os = "macos")`。他 OS は skip を明示）として `platform-ci` の macos（main への push と `workflow_dispatch`）で実行する。`bench-regression`（ubuntu 単独）のジョブ構成は変えず、基準値比較にも接続しない（模擬制御コアの計測で、実バックエンドは TASK-115）。
 
-`bench-regression` ジョブは次の 19 個の `make`（下記 1〜18 と `make cli-parity-native-reclaim-selftest`）を実行する（自己テストはスタブ・疑似 /proc・fixture のみで照合し、実機は使わない）。1〜14 の自己テスト（と下記の `make cli-parity-native-reclaim-selftest`）は互いに独立なため、`scripts/run-parallel.sh 3` で最大 3 並列に実行する（所要時間の短縮。経過秒を照合する自己テストがあるため同時実行数は 3 に絞る。1 つでも失敗すればジョブは失敗する）。15 以降は ci.yml の並びどおりに直列で実行する。
+`bench-regression` ジョブは次の 20 個の `make`（下記 1〜18・14a と `make cli-parity-native-reclaim-selftest`）を実行する（自己テストはスタブ・疑似 /proc・fixture のみで照合し、実機は使わない）。1〜14・14a の自己テスト（と下記の `make cli-parity-native-reclaim-selftest`）は互いに独立なため、`scripts/run-parallel.sh 3` で最大 3 並列に実行する（所要時間の短縮。経過秒を照合する自己テストがあるため同時実行数は 3 に絞る。1 つでも失敗すればジョブは失敗する）。15 以降は ci.yml の並びどおりに直列で実行する。
 
 1. `make fio-bench-selftest`（fio 4K ランダム write ベンチスクリプトの自己テスト。TASK-25.1・IO-8）
 2. `make fio-baseline-ratio-selftest`（fio ベースライン比の算出の自己テスト。TASK-25.2・IO-8）
@@ -76,6 +78,7 @@ macOS cold start 上乗せ確認（TASK-113.4・PLUG-6・MAC-2）は `benches/te
 12. `make supervisor-pss-selftest`（監視プロセス常駐メモリ計測スクリプト `scripts/bench/supervisor_pss.sh` の自己テスト。疑似 /proc のみ。TASK-158・SUP-2）
 13. `make restart-latency-selftest`（restart レイテンシ計測スクリプト `scripts/measure-restart-latency.sh` の自己テスト。スタブ（CLI・systemd-run・supervisor）のみ。TASK-160・SUP-3）
 14. `make install-launcher-selftest`（特権ランチャーのインストールスクリプト `scripts/install-privileged-launcher.sh` の自己テスト。スタブ・一時ディレクトリのみで root 不要。TASK-171 追補・#1721・SUP-14）
+14a. `make crictl-smoke-selftest`（crictl 疎通確認スクリプト `scripts/cri/crictl-smoke.sh` の自己テスト。スタブの crictl と一時ディレクトリの UNIX ソケットのみ。python3 が必要。実機は #442 で人間が行う。TASK-60・CRI-1）
 15. `make bench-check`（ベンチ実行・基準値比較。現状はプレースホルダの配線確認のみ）
 16. `make bench-plugin-boundary`（plugin 境界ベンチの計測と CORE-10 比のログ出力のみ。基準値比較なし。TASK-113.3）
 17. `make plugin-feature-size`（core の plugin feature 除外 release ビルドと rlib サイズの記録。PLUG-3・TASK-111.2。最終バイナリ未実装のため rlib 計測で、サイズ差に閾値は設けない）

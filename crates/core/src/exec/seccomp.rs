@@ -23,10 +23,12 @@
 //! 本物の syscall は [`RealKernel`]（`sys` のラッパー）だけが呼ぶ。テストは偽の `SeccompKernel` で
 //! 呼び出し順・エラー写像を再現し、実 syscall は使い捨てスレッドで確認する。
 
+use super::seccomp_listener::{ACK_TIMEOUT, ListenerSender};
 use super::{ExecError, IsolationStage, ThreadCountSource};
 use crate::seccomp::SeccompProgram;
 use crate::sys::{self, SysError};
 use crate::traits::types::ErrorCode;
+use std::os::fd::OwnedFd;
 
 /// `PR_GET_SECCOMP` が返す filter モードの値（`SECCOMP_MODE_FILTER`）。
 const MODE_FILTER: u32 = 2;
@@ -37,6 +39,8 @@ trait SeccompKernel {
     fn thread_count(&mut self) -> Option<u64>;
     fn no_new_privs_enabled(&mut self) -> Result<bool, SysError>;
     fn set_filter(&mut self, program: &SeccompProgram) -> Result<(), SysError>;
+    /// `NEW_LISTENER` 付きの適用（listener fd を得る。SEC-4・#2024）。
+    fn set_filter_listener(&mut self, program: &SeccompProgram) -> Result<OwnedFd, SysError>;
     fn mode(&mut self) -> Result<u32, SysError>;
 }
 
@@ -54,6 +58,9 @@ impl SeccompKernel for RealKernel<'_> {
     }
     fn set_filter(&mut self, program: &SeccompProgram) -> Result<(), SysError> {
         sys::seccomp_set_filter(program)
+    }
+    fn set_filter_listener(&mut self, program: &SeccompProgram) -> Result<OwnedFd, SysError> {
+        sys::seccomp_notify::seccomp_set_filter_new_listener(program)
     }
     fn mode(&mut self) -> Result<u32, SysError> {
         sys::seccomp_mode()
@@ -104,6 +111,53 @@ pub(crate) fn apply_seccomp_filter_with(
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn apply_default_seccomp() -> Result<SeccompReport, ExecError> {
     apply_seccomp_filter(&build_default_program()?)
+}
+
+/// 既定 deny フィルタを `NEW_LISTENER` 付きで適用し、得た listener fd を `sender` で C へ渡して ACK を待つ
+/// （SEC-4・TASK-41 追補・#2024。`stages.rs` の組み込み `Seccomp` 段が、送り手が付いているときに呼ぶ）。
+///
+/// 適用・事後検査が済んだ後に、送信 → 手元の listener を閉じる → ACK 待ちの順で行う。**filter は ERRNO 版のまま**
+/// （`USER_NOTIF` を返さないため通知は生じず、挙動は [`apply_default_seccomp`] と同じ。応答側は #2025）。
+/// 失敗（`EBUSY`・送信・ACK の不着）は段 `Seccomp` で、exec に進ませない。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn apply_default_seccomp_with_listener(
+    sender: ListenerSender,
+) -> Result<SeccompReport, ExecError> {
+    apply_default_seccomp_with_listener_threads(sender, &mut ThreadCountSource::ProcSelf)
+}
+
+/// [`apply_default_seccomp_with_listener`] のスレッド数取得元を差し替える版（exec の再適用用。SUP-6）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn apply_default_seccomp_with_listener_threads(
+    sender: ListenerSender,
+    threads: &mut ThreadCountSource,
+) -> Result<SeccompReport, ExecError> {
+    let program = match build_default_program() {
+        Ok(p) => p,
+        Err(e) => {
+            sender.report_failure(&e);
+            return Err(e);
+        }
+    };
+    // 送り手は受け渡しの closure が取り出す。適用が先に失敗して残っていたら、失敗を C へ知らせる(EOF 由来の
+    // `Internal` に潰さない。SEC-4・#2024)。
+    let slot = std::cell::RefCell::new(Some(sender));
+    let result =
+        apply_single_threaded_with_listener(&program, &mut RealKernel { threads }, |fd| match slot
+            .borrow_mut()
+            .take()
+        {
+            Some(sender) => sender.hand_over(fd, ACK_TIMEOUT),
+            None => Err(ExecError::new(
+                ErrorCode::Internal,
+                IsolationStage::Seccomp,
+                "the listener sender was already consumed",
+            )),
+        });
+    if let (Err(e), Some(sender)) = (&result, slot.borrow().as_ref()) {
+        sender.report_failure(e);
+    }
+    result
 }
 
 /// [`apply_default_seccomp`] のスレッド数取得元を差し替える版（SUP-6・TASK-163.3・#502）。
@@ -370,6 +424,7 @@ impl SeccompProbeRecord {
 /// # 将来仕様（記録のみ）
 ///
 /// exec が許可されたら（証跡配線後。後続作業）、エントリポイント側のプローブ実行へ置き換える（REPAIR-3）。
+/// exec 後の PID 1 からは test 限定の [`probe_denied_syscalls_for_test`] 経由で呼べる（#2234）。
 pub(crate) fn probe_denied_syscalls() -> Result<SeccompProbeRecord, ExecError> {
     let fail =
         |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Seccomp, m.to_string());
@@ -485,11 +540,79 @@ fn probe_context_is_isolated() -> bool {
         == Some(2)
 }
 
+/// seccomp 段を載せる前の対照として `kcmp(自 pid, 自 pid, KCMP_VM)` の結果を返す（CORE-5・ESC-06・SEC-1・#2234）。
+///
+/// `tests/seccomp.rs`・`tests/production_launcher.rs` の試験プロセス（組み込みフィルタを載せる前）が呼び、
+/// `kcmp` が成功することを前提として要求する。外側の seccomp・LSM・kcmp 非対応のカーネルでは `EPERM` / `ENOSYS`
+/// になり、コンテナ内の `EPERM` を組み込みフィルタの成果と見なせないため、試験側が前提欠如として失敗させる。
+/// `kcmp` は比較のみで副作用が無いため、PID・seccomp の前提検査は付けない。
+///
+/// # 将来仕様（記録のみ）
+///
+/// エントリポイント内のプローブへ置き換えて本関数を廃止する（REPAIR-3）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub fn probe_kcmp_self_for_test() -> ProbeOutcome {
+    ProbeOutcome::from_result(sys::kcmp_self_probe())
+}
+
+/// exec 後のコンテナ PID 1 から [`probe_denied_syscalls`] を呼ぶ test 限定の入口（CORE-5・ESC-06・SEC-1・#2234）。
+///
+/// `tests/production_launcher.rs` のシナリオ J のプローブ（exec 後の PID 1）が呼び、`kcmp` の `EPERM` を識別的に
+/// 照合する。`probe_denied_syscalls` は `mount`・`pivot_root`・`umount2` も発行するため、[`escape_probe_mount`]
+/// と同じ前提検査で fail-closed にする。PID 1 かつ `Seccomp: 2` でなければ syscall を発行せず
+/// `FailedPrecondition` を返す（ホストの `/` の propagation を変えない）。新規 `unsafe`・新規 `sys` 宣言は無い。
+///
+/// # 将来仕様（記録のみ）
+///
+/// エントリポイント内のプローブへ置き換えて本関数を廃止する（REPAIR-3）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub fn probe_denied_syscalls_for_test() -> Result<SeccompProbeRecord, ExecError> {
+    if std::process::id() != 1 || !probe_context_is_isolated() {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Seccomp,
+            "probe_denied_syscalls_for_test must run as PID 1 with the seccomp filter active"
+                .to_string(),
+        ));
+    }
+    probe_denied_syscalls()
+}
+
 /// 単一スレッド条件を適用の前後で検査して [`apply_filter`] を呼ぶ。事前検査は副作用の前に行う。
 fn apply_single_threaded(
     program: &SeccompProgram,
     kernel: &mut impl SeccompKernel,
 ) -> Result<SeccompReport, ExecError> {
+    apply_single_threaded_mode(program, kernel, false).map(|(report, _)| report)
+}
+
+/// [`apply_single_threaded`] の listener 版（SEC-4・#2024）。`handover` が listener を受けて C へ渡す
+/// （適用・事後検査がすべて済んだ後に呼ぶ）。渡せなければ失敗にする（listener 無しで進まない。fail-closed）。
+fn apply_single_threaded_with_listener(
+    program: &SeccompProgram,
+    kernel: &mut impl SeccompKernel,
+    handover: impl FnOnce(OwnedFd) -> Result<(), ExecError>,
+) -> Result<SeccompReport, ExecError> {
+    let (report, listener) = apply_single_threaded_mode(program, kernel, true)?;
+    let Some(listener) = listener else {
+        return Err(ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Seccomp,
+            "no seccomp listener was produced",
+        ));
+    };
+    handover(listener)?;
+    Ok(report)
+}
+
+/// 共通の本体。`want_listener` が真なら `NEW_LISTENER` 付きで適用して fd を返す（渡し方は呼び出し側）。
+fn apply_single_threaded_mode(
+    program: &SeccompProgram,
+    kernel: &mut impl SeccompKernel,
+    want_listener: bool,
+) -> Result<(SeccompReport, Option<OwnedFd>), ExecError> {
     if kernel.thread_count() != Some(1) {
         return Err(ExecError::new(
             ErrorCode::FailedPrecondition,
@@ -497,7 +620,7 @@ fn apply_single_threaded(
             "seccomp filter requires a single-threaded process (Threads: 1)",
         ));
     }
-    let report = apply_filter(program, kernel)?;
+    let (report, fd) = apply_filter_mode(program, kernel, want_listener)?;
     if kernel.thread_count() != Some(1) {
         return Err(ExecError::new(
             ErrorCode::Internal,
@@ -505,14 +628,23 @@ fn apply_single_threaded(
             "process became multi-threaded while applying seccomp filter",
         ));
     }
-    Ok(report)
+    Ok((report, fd))
 }
 
 /// `NO_NEW_PRIVS` 検証 → 適用 → モード読み戻し。スレッド数検査は呼び出し側が行う。
+#[cfg(test)]
 fn apply_filter(
     program: &SeccompProgram,
     kernel: &mut impl SeccompKernel,
 ) -> Result<SeccompReport, ExecError> {
+    apply_filter_mode(program, kernel, false).map(|(report, _)| report)
+}
+
+fn apply_filter_mode(
+    program: &SeccompProgram,
+    kernel: &mut impl SeccompKernel,
+    want_listener: bool,
+) -> Result<(SeccompReport, Option<OwnedFd>), ExecError> {
     let stage = IsolationStage::Seccomp;
     let nnp = kernel
         .no_new_privs_enabled()
@@ -524,9 +656,25 @@ fn apply_filter(
             "seccomp filter requires no_new_privs to be set beforehand",
         ));
     }
-    kernel
-        .set_filter(program)
-        .map_err(|e| ExecError::from_sys(e, stage, "PR_SET_SECCOMP"))?;
+    let listener = if want_listener {
+        match kernel.set_filter_listener(program) {
+            Ok(fd) => Some(fd),
+            // 祖先の filter が既に listener を持つ（カーネルは listener を 1 つに制限する）。
+            Err(SysError::Os(e)) if e == sys::EBUSY => {
+                return Err(ExecError::new(
+                    ErrorCode::FailedPrecondition,
+                    stage,
+                    "seccomp listener unavailable: an ancestor filter already has a listener",
+                ));
+            }
+            Err(e) => return Err(ExecError::from_sys(e, stage, "seccomp(NEW_LISTENER)")),
+        }
+    } else {
+        kernel
+            .set_filter(program)
+            .map_err(|e| ExecError::from_sys(e, stage, "PR_SET_SECCOMP"))?;
+        None
+    };
     let mode = kernel
         .mode()
         .map_err(|e| ExecError::from_sys(e, stage, "PR_GET_SECCOMP"))?;
@@ -537,9 +685,12 @@ fn apply_filter(
             "seccomp mode is not filter after prctl",
         ));
     }
-    Ok(SeccompReport {
-        instructions: program.len(),
-    })
+    Ok((
+        SeccompReport {
+            instructions: program.len(),
+        },
+        listener,
+    ))
 }
 
 #[cfg(all(
@@ -559,6 +710,7 @@ mod tests {
         threads: Vec<Option<u64>>,
         nnp: Option<Result<bool, SysError>>,
         set: Option<Result<(), SysError>>,
+        listener: Option<Result<(), SysError>>,
         mode: Option<Result<u32, SysError>>,
         calls: Vec<&'static str>,
     }
@@ -569,6 +721,7 @@ mod tests {
                 threads: vec![Some(1), Some(1)],
                 nnp: Some(Ok(true)),
                 set: Some(Ok(())),
+                listener: Some(Ok(())),
                 mode: Some(Ok(2)),
                 calls: vec![],
             }
@@ -591,6 +744,12 @@ mod tests {
         fn set_filter(&mut self, _p: &SeccompProgram) -> Result<(), SysError> {
             self.calls.push("set");
             self.set.unwrap()
+        }
+        fn set_filter_listener(&mut self, _p: &SeccompProgram) -> Result<OwnedFd, SysError> {
+            self.calls.push("set_listener");
+            self.listener.unwrap()?;
+            let (r, _w) = std::io::pipe().unwrap();
+            Ok(OwnedFd::from(r))
         }
         fn mode(&mut self) -> Result<u32, SysError> {
             self.calls.push("mode");
@@ -665,6 +824,24 @@ mod tests {
         assert_eq!(e.code, ErrorCode::Internal);
     }
 
+    /// CORE-5・#2234: 試験プロセス（PID 1 ではない）からは syscall を発行せず `FailedPrecondition`（fail-closed）。
+    #[cfg(feature = "escape-probe")]
+    #[test]
+    fn core5_probe_denied_syscalls_for_test_refuses_outside_container() {
+        let e = probe_denied_syscalls_for_test().unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+    }
+
+    /// CORE-5・#2234: 適用前の対照は `sys` のプローブ結果と一致する。
+    #[cfg(feature = "escape-probe")]
+    #[test]
+    fn core5_probe_kcmp_self_for_test_matches_sys_probe() {
+        assert_eq!(
+            probe_kcmp_self_for_test(),
+            ProbeOutcome::from_result(sys::kcmp_self_probe())
+        );
+    }
+
     /// CORE-5: スレッド数の事前・事後検査。
     #[test]
     fn core5_apply_seccomp_requires_single_thread() {
@@ -679,6 +856,80 @@ mod tests {
         k.threads = vec![Some(1), Some(2)];
         let e = apply_single_threaded(&program(), &mut k).unwrap_err();
         assert_eq!(e.code, ErrorCode::Internal);
+    }
+
+    /// SEC-4（#2024）: listener 版の呼び出し順は 適用 → 読み戻し → 事後のスレッド検査 → 受け渡し。
+    #[test]
+    fn sec4_listener_apply_hands_over_after_all_checks() {
+        let p = program();
+        let mut k = Fake::ok();
+        let mut handed = 0;
+        let r = apply_single_threaded_with_listener(&p, &mut k, |_fd| {
+            handed += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(r.instructions, p.len());
+        assert_eq!(handed, 1);
+        assert_eq!(
+            k.calls,
+            vec!["threads", "nnp", "set_listener", "mode", "threads"]
+        );
+    }
+
+    /// SEC-4: 受け渡しの失敗はそのまま失敗になる（listener 無しで進まない）。
+    #[test]
+    fn sec4_listener_handover_failure_is_propagated() {
+        let mut k = Fake::ok();
+        let e = apply_single_threaded_with_listener(&program(), &mut k, |_fd| {
+            Err(ExecError::new(
+                ErrorCode::Timeout,
+                IsolationStage::Seccomp,
+                "ack",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Timeout);
+    }
+
+    /// SEC-4: 受け渡しの前に失敗したら受け渡しを呼ばない。`EBUSY` は固定文言の `FailedPrecondition`。
+    #[test]
+    fn sec4_listener_apply_failures_never_hand_over() {
+        for (err, code) in [
+            (SysError::Os(sys::EBUSY), ErrorCode::FailedPrecondition),
+            (SysError::Os(EACCES), ErrorCode::PermissionDenied),
+            (SysError::Unsupported, ErrorCode::Unimplemented),
+        ] {
+            let mut k = Fake::ok();
+            k.listener = Some(Err(err));
+            let e = apply_single_threaded_with_listener(&program(), &mut k, |_fd| {
+                panic!("handover must not run")
+            })
+            .unwrap_err();
+            assert_eq!(e.code, code);
+            assert_eq!(e.stage, IsolationStage::Seccomp);
+            if err == SysError::Os(sys::EBUSY) {
+                assert_eq!(
+                    e.message,
+                    "seccomp listener unavailable: an ancestor filter already has a listener"
+                );
+            }
+        }
+        let mut k = Fake::ok();
+        k.mode = Some(Ok(0));
+        let e = apply_single_threaded_with_listener(&program(), &mut k, |_fd| {
+            panic!("handover must not run")
+        })
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal);
+        let mut k = Fake::ok();
+        k.nnp = Some(Ok(false));
+        assert!(
+            apply_single_threaded_with_listener(&program(), &mut k, |_fd| {
+                panic!("handover must not run")
+            })
+            .is_err()
+        );
     }
 
     fn thread_status_field(field: &str) -> String {
@@ -796,6 +1047,13 @@ pub(super) mod testing {
             Some(e) => Err(e),
             None => Ok(SeccompReport { instructions: 0 }),
         }
+    }
+
+    /// `stages.rs` の組み込み段が `cfg(test)` で、送り手つきのときに呼ぶ偽物。送り手は使わず閉じるだけ。
+    pub(in crate::exec) fn apply_default_seccomp_with_listener(
+        _sender: crate::exec::seccomp_listener::ListenerSender,
+    ) -> Result<SeccompReport, ExecError> {
+        apply_default_seccomp()
     }
 
     /// `exec/reapply.rs` が `cfg(test)` で呼ぶ偽物（取得元は読まない）。

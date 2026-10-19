@@ -2,7 +2,7 @@
 //!
 //! PLUG-12 は plugin との UDS を `$XDG_RUNTIME_DIR/fandhe-container/` 相当の、0700 かつ core 実行 UID
 //! 所有のディレクトリ配下にのみ作ることを求める。本モジュールはその「解決・作成・検証」を担い、
-//! 上位（TASK-109 の plugin 発見・TASK-114 の core 側 proxy）が socket の置き場所を得て
+//! 上位（TASK-109 の plugin 発見・#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 の core 側 proxy）が socket の置き場所を得て
 //! [`crate::UdsListener::bind`] へ渡す入口になる。
 //!
 //! # 契約
@@ -158,7 +158,7 @@
 //!   別プロセスへ渡しても検出できない、(c) pid 照合には PID 再利用の窓が残る。
 //! - 同一 UID の別プロセスは脅威モデル外（第 1 層は 0700 の配置ディレクトリ）。
 //! - `unsafe` を含む取得処理は `crate::sys::peer_uid`（`sys` モジュール）に閉じる。
-//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。別 UID 接続拒否の結合試験は `tests/peer_auth.rs`（TASK-124.4・#295。実機前提の 2 件は人間が実行）。accept / connect で最初の読み書きより前に検証する順序は `transport::tests::plug12_order` で機械照合する（TASK-124.6・#1389）。拒否 1 件ごとの監査イベント通知は `crate::audit`（TASK-124.5・#1388・SEC-4）。永続的な監査ログへの配線は core 側 proxy（TASK-114）で未実装（REPAIR-3）。
+//! - macOS は getpeereid で peer uid を取得済み（TASK-124.2・#293）。別 UID 接続拒否の結合試験は `tests/peer_auth.rs`（TASK-124.4・#295。実機前提の 2 件は人間が実行）。accept / connect で最初の読み書きより前に検証する順序は `transport::tests::plug12_order` で機械照合する（TASK-124.6・#1389）。拒否 1 件ごとの監査イベント通知は `crate::audit`（TASK-124.5・#1388・SEC-4）。永続的な監査ログへの配線は core 側 proxy（#1869 の設計・TASK-114）で未実装（REPAIR-3）。
 //!
 //! # Windows に固有の peer 認証を持たない理由（WIN-1・PLUG-12。TASK-124.3・#294）
 //! 「未実装の残件」ではなく、設計上この crate に Win32 向け実装を置かない判断である。
@@ -190,7 +190,7 @@ pub const ONE_SHOT_SWEEP_MAX_ENTRIES: usize = 256;
 /// 次回の初期化が続きの位置から走査する（手前のエントリは読み直さない）。
 pub const ONE_SHOT_SWEEP_MAX_SCAN: usize = 65_536;
 
-/// 都度起動の残骸の掃除結果（#1310・PLUG-7）。呼び出し側（TASK-114）が構造化ログへ出す材料。
+/// 都度起動の残骸の掃除結果（#1310・PLUG-7）。呼び出し側（#1869 の設計・TASK-114）が構造化ログへ出す材料。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct OneShotSweep {
@@ -215,7 +215,7 @@ impl OneShotSweep {
     /// 掃除が完了しなかったことを知らせる構造化ログ（JSON Lines の 1 行。改行なし。REPAIR-4）。
     ///
     /// 初期化時の掃除は best-effort で、失敗しても初期化は続ける。その失敗を無通知にしないため、
-    /// 初期化経路が stderr へ出す（成功時は出さない。件数の記録は TASK-114 の core 側 proxy が
+    /// 初期化経路が stderr へ出す（成功時は出さない。件数の記録は #1869 の設計・TASK-114 の core 側 proxy が
     /// [`RuntimeDir::sweep_one_shot_leftovers`] の結果から行う）。値は固定文字列・真偽値だけで、
     /// 外部入力（ファイル名等）を埋め込まない。`error_code` は掃除を始められなかった場合の機械可読な
     /// `code`（ERR-1）、`incomplete` は列挙が途中で失敗した場合に `true`。`error_code` は任意の文字列
@@ -260,7 +260,7 @@ impl RuntimeDir {
 
     /// 検証済み runtime directory 直下の socket パスを、bind 前に検証して返す（PLUG-12・TASK-123.3・#288）。
     ///
-    /// TASK-109（plugin 発見）・TASK-114（core 側 proxy）が [`crate::UdsListener::bind`] へ渡す前に使い、
+    /// TASK-109（plugin 発見）・#1869 の設計・TASK-114（core 側 proxy）が [`crate::UdsListener::bind`] へ渡す前に使い、
     /// 不正な名前と `sun_path` 超過を socket を作る前に検出する。`name` は単一の通常コンポーネント
     /// （空・`.`・`..`・区切り・NUL を含まない）でなければ `InvalidArgument`。結合後のパスが
     /// `sun_path` に収まらなければ `InvalidArgument`（"socket path is too long"）。
@@ -278,7 +278,7 @@ impl RuntimeDir {
 
     /// 異常終了で残った都度起動の socket とロックファイルを掃除する（#1310・PLUG-7・PLUG-12）。
     ///
-    /// 初期化時に best-effort で呼ばれるほか、TASK-114 の core 側 proxy が結果（件数）を得るために
+    /// 初期化時に best-effort で呼ばれるほか、#1869 の設計・TASK-114 の core 側 proxy が結果（件数）を得るために
     /// 呼べる。判定規則・上限・残余はモジュール doc の「都度起動の残骸の掃除」参照。ディレクトリを
     /// 開けない・検証に失敗した場合（初期化後に symlink へ差し替えられた場合を含む。`PermissionDenied`）、
     /// この runtime directory で `flock` の排他を確認できない場合（`FailedPrecondition`。何も削除しない）、
@@ -1521,6 +1521,69 @@ mod imp {
             && (!complete || (tokens.len() == fields && !last.is_empty()))
     }
 
+    /// bind ロックの競合経路をテストで決定的に再現する注入点（`#[cfg(test)]` のみ。製品ビルドには存在せず、
+    /// 本番の挙動・上限は変えない。PLUG-12・REPAIR-12・#2228）。
+    ///
+    /// `sys::lock_test_hook` は `lock_file_at` の内側（`OPEN_ATTEMPTS`）しか通せないため、
+    /// `acquire_lock` の外側ループ（`LOCK_ATTEMPTS` 枯渇）と `remove_recorded_socket` の
+    /// 削除直前の再確認不一致（どちらも `BusyReason::Contended`）をここから踏む。
+    /// thread-local のため他テストのスレッドには漏れない。
+    #[cfg(test)]
+    pub(super) mod bind_lock_test_hook {
+        use std::cell::{Cell, RefCell};
+        use std::ffi::CStr;
+        use std::fs::File;
+
+        type AfterFlock = Box<dyn FnMut(&File, &CStr)>;
+        type BeforeRecheck = Box<dyn FnOnce(&File, &CStr)>;
+
+        thread_local! {
+            static AFTER_FLOCK: RefCell<Option<AfterFlock>> = const { RefCell::new(None) };
+            static AFTER_FLOCK_CALLS: Cell<usize> = const { Cell::new(0) };
+            static BEFORE_RECHECK: RefCell<Option<BeforeRecheck>> = const { RefCell::new(None) };
+        }
+
+        /// flock 取得後・`names_open_file` 前に毎回呼ぶフックを設定する（ロックファイル名を渡す）。
+        pub(crate) fn set_after_flock(f: impl FnMut(&File, &CStr) + 'static) {
+            AFTER_FLOCK.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+        }
+
+        /// `set_after_flock` のフックを外す。
+        pub(crate) fn clear_after_flock() {
+            AFTER_FLOCK.with(|c| *c.borrow_mut() = None);
+        }
+
+        /// フックの実行回数を返して 0 に戻す。
+        pub(crate) fn take_after_flock_calls() -> usize {
+            AFTER_FLOCK_CALLS.with(|c| c.replace(0))
+        }
+
+        pub(super) fn run_after_flock(dir: &File, lock_name: &CStr) {
+            AFTER_FLOCK_CALLS.with(|c| c.set(c.get() + 1));
+            // 実行中に RefCell を借りたままにしない。
+            if let Some(mut f) = AFTER_FLOCK.with(|c| c.borrow_mut().take()) {
+                f(dir, lock_name);
+                AFTER_FLOCK.with(|c| {
+                    let mut slot = c.borrow_mut();
+                    if slot.is_none() {
+                        *slot = Some(f);
+                    }
+                });
+            }
+        }
+
+        /// 削除直前の再確認の前に 1 回だけ呼ぶフックを設定する（socket 名を渡す）。
+        pub(crate) fn set_before_recheck(f: impl FnOnce(&File, &CStr) + 'static) {
+            BEFORE_RECHECK.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+        }
+
+        pub(super) fn run_before_recheck(dir: &File, name: &CStr) {
+            if let Some(f) = BEFORE_RECHECK.with(|c| c.borrow_mut().take()) {
+                f(dir, name);
+            }
+        }
+    }
+
     /// 取得した inode がロックファイル名から外れていた場合（保持者が解放時に unlink した）の再試行回数。
     const LOCK_ATTEMPTS: usize = 8;
 
@@ -1580,6 +1643,8 @@ mod imp {
                     return Err(err(PluginErrorCode::Internal, "failed to lock socket path"));
                 }
             };
+            #[cfg(test)]
+            bind_lock_test_hook::run_after_flock(dir, &lock_name);
             // flock を取れても、名前が別の inode を指す（または消えた）なら、以前の保持者が解放時に
             // unlink した古い inode を掴んでいる。これを有効なロックと見なすと、同名の新しい inode を
             // ロックした別の bind と並走するため、捨てて開き直す。
@@ -1728,6 +1793,8 @@ mod imp {
             return (false, Err(busy(BusyReason::UnrecordedSocket)));
         }
         // 削除直前に同一性を再確認する。
+        #[cfg(test)]
+        bind_lock_test_hook::run_before_recheck(dir, name);
         match lstat_opt(dir, name) {
             Ok(None) => return (false, Ok(())),
             Ok(Some(now)) if now == first => {}
@@ -1760,8 +1827,10 @@ mod imp {
 
     /// `AlreadyExists` の原因の区分（#1859・PLUG-12）。利用者の次の行動（そのまま・再試行・手動削除）で分ける。
     /// 文言は固定で、パス・UID・plugin 由来の値を含めない（情報の出し過ぎを防ぐ）。呼び出し側が機械的に
-    /// 見分ける必要は今は無い（`sweep_one` はコードで判定する）ため非公開。手順は
-    /// `docs/setup/plugin-socket-recovery.md`。
+    /// 見分ける必要は今は無い（`sweep_one` はコードで判定する）ため非公開。
+    /// 公開型（`PluginError` の付加情報や公開 enum）にするのは、文言ではなく原因で機械的に
+    /// 分岐する呼び出し側が現れるまで見送る。判断の記録と再判断の起点は #2228。
+    /// 手順は `docs/setup/plugin-socket-recovery.md`。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum BusyReason {
         /// ロックを他者が保持している。
@@ -2218,6 +2287,111 @@ mod imp {
             fn drop(&mut self) {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
+        }
+
+        /// PLUG-12・REPAIR-12・#2228: 名前が別 inode を指す状態が `LOCK_ATTEMPTS` 回続くと、待たずに
+        /// `Contended` の固定文言で拒否する（外側ループの枯渇。内側の `OPEN_ATTEMPTS` は通らない）。
+        #[test]
+        fn plug12_bind_lock_attempts_exhausted_reports_contended() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = open_dir_for_test(&t.0);
+            let _ = crate::sys::lock_test_hook::take_waits();
+            let _ = bind_lock_test_hook::take_after_flock_calls();
+            bind_lock_test_hook::set_after_flock(|d, lock_name| {
+                crate::sys::unlinkat(d, lock_name).unwrap();
+            });
+            let e = acquire_bind_lock(&dir, c"s.sock", euid).unwrap_err();
+            bind_lock_test_hook::clear_after_flock();
+            assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+            assert_eq!(
+                e.message(),
+                "socket path is being changed by another process; retry later"
+            );
+            assert_eq!(LOCK_ATTEMPTS, 8);
+            assert_eq!(bind_lock_test_hook::take_after_flock_calls(), 8);
+            assert_eq!(crate::sys::lock_test_hook::take_waits(), 0);
+            assert_eq!(std::fs::read_dir(&t.0).unwrap().count(), 0);
+        }
+
+        /// PLUG-12・REPAIR-12・#2228: 不一致が `LOCK_ATTEMPTS - 1` 回で止まれば取得に成功する（上限の境界）。
+        #[test]
+        fn plug12_bind_lock_succeeds_when_mismatch_stops_before_limit() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = open_dir_for_test(&t.0);
+            let _ = bind_lock_test_hook::take_after_flock_calls();
+            let mut n = 0usize;
+            bind_lock_test_hook::set_after_flock(move |d, lock_name| {
+                n += 1;
+                if n < LOCK_ATTEMPTS {
+                    crate::sys::unlinkat(d, lock_name).unwrap();
+                }
+            });
+            let lock = acquire_bind_lock(&dir, c"s.sock", euid).unwrap();
+            bind_lock_test_hook::clear_after_flock();
+            assert_eq!(bind_lock_test_hook::take_after_flock_calls(), 8);
+            assert!(t.0.join("s.sock.lock").exists());
+            let e = acquire_bind_lock(&dir, c"s.sock", euid).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+            assert_eq!(e.message(), BUSY_LOCK_HELD);
+            drop(lock);
+        }
+
+        /// 記録済みの socket を作り、ロックを返す。
+        fn recorded_socket(
+            t: &Tmp,
+            dir: &File,
+            euid: u32,
+        ) -> (std::os::unix::net::UnixListener, BindLock) {
+            let l = std::os::unix::net::UnixListener::bind(t.0.join("s.sock")).unwrap();
+            let lock = acquire_bind_lock(dir, c"s.sock", euid).unwrap();
+            let ident = crate::sys::lstat_at(dir, c"s.sock").unwrap();
+            lock.record_socket(&ident).unwrap();
+            (l, lock)
+        }
+
+        /// PLUG-12・REPAIR-12・#2228: 記録と一致した後、削除直前の再確認で別の同一性に変わっていたら
+        /// 削除せず `Contended` の固定文言で拒否する（fail-closed）。旧 inode を残すので inode の再利用は起きない。
+        #[test]
+        fn plug12_clear_stale_socket_recheck_mismatch_reports_contended() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = open_dir_for_test(&t.0);
+            let (_old, lock) = recorded_socket(&t, &dir, euid);
+            let base = t.0.clone();
+            let new_listener = std::rc::Rc::new(std::cell::RefCell::new(None));
+            let slot = std::rc::Rc::clone(&new_listener);
+            bind_lock_test_hook::set_before_recheck(move |_, _| {
+                std::fs::rename(base.join("s.sock"), base.join("s.sock.old")).unwrap();
+                *slot.borrow_mut() =
+                    Some(std::os::unix::net::UnixListener::bind(base.join("s.sock")).unwrap());
+            });
+            let e = clear_stale_socket(&dir, c"s.sock", euid, &lock).unwrap_err();
+            assert_eq!(e.code(), PluginErrorCode::AlreadyExists);
+            assert_eq!(
+                e.message(),
+                "socket path is being changed by another process; retry later"
+            );
+            let m = std::fs::symlink_metadata(t.0.join("s.sock")).unwrap();
+            assert!(std::os::unix::fs::FileTypeExt::is_socket(&m.file_type()));
+            assert!(t.0.join("s.sock.old").exists());
+            assert!(new_listener.borrow().is_some());
+        }
+
+        /// PLUG-12・REPAIR-12・#2228: 再確認の時点で socket が消えていれば `Ok(())` で記録を消す。
+        #[test]
+        fn plug12_clear_stale_socket_recheck_absent_is_ok() {
+            let t = Tmp::new();
+            let euid = crate::sys::effective_uid();
+            let dir = open_dir_for_test(&t.0);
+            let (_l, lock) = recorded_socket(&t, &dir, euid);
+            let p = t.0.join("s.sock");
+            bind_lock_test_hook::set_before_recheck(move |_, _| {
+                std::fs::remove_file(&p).unwrap();
+            });
+            assert_eq!(clear_stale_socket(&dir, c"s.sock", euid, &lock), Ok(()));
+            assert!(lock.recorded().is_none());
         }
 
         /// PLUG-12・#1859: `AlreadyExists` の 4 文言は固定で互いに異なり、パス・UID を含まない。

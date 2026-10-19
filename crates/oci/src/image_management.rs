@@ -18,15 +18,22 @@
 //! - ディスクへの永続化・再起動時の照合（#853・#854・#851）
 //! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force` と実削除（untag・`remove_manifest`・非共有 blob の削除。TASK-183.6・#481）も
 //!   `remove` で実装済み（永続化・fsync・削除途中のクラッシュの再試行は #851、CLI 配線は未実装）
-//! - GC 本体・`image tag`/`prune`・`rm` の CLI 配線（#479〜#481・#476）。`image ls`/`system df` の集計 API は
+//! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（CLI 経路と永続化は未実装）
+//! - GC 本体・`prune`・`rm` の CLI 配線（#479〜#481・#476）。`image ls`/`system df` の集計 API は
 //!   `usage`（#478・TASK-183.3）で実装済み（CLI 経路は未実装）、pull へのリース組み込み（#474・#475）
 //! - テーブル全体の件数上限（永続化の読み込み側で判断する）
 //!
-//! core の `ContainerId` との対応づけ（変換の置き場所・依存の向き）は #853 で決める。oci は core に
-//! 依存しないため、ここでは同じ規則で検証する `ContainerRefId` を持つ。
+//! core の `ContainerId` との対応づけ（#853・TASK-183.8.1）: core は oci に依存せず、core 側の
+//! `ContainerImageRefs`（`oci_runtime`）を、oci と core の両方に依存するアダプタが
+//! [`ImageStore::register_container_ref`] / [`ImageStore::release_container_ref`] で満たす。
+//! `ContainerId` → `ContainerRefId` は同じ規則なので `ContainerRefId::new(id.as_str())` で失敗しない。
+//! 本番のアダプタと CLI / plugin の配線は未実装（REPAIR-3）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+
+mod container_ref;
+pub use container_ref::{ContainerRefRegistration, ContainerRefRelease};
 
 mod remove;
 pub use remove::{
@@ -40,6 +47,9 @@ use crate::reference::{Digest, RegistryHost, Repository, Tag};
 mod usage;
 
 pub use usage::{CacheUsage, DiskUsage, ImageEntry, ImageList, ImageUsage, MAX_CACHE_SCAN_ENTRIES};
+
+mod tag;
+pub use tag::{ImageTagChange, ImageTagOutcome, ImageTagSource};
 
 mod store;
 pub use store::{

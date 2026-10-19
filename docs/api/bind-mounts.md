@@ -61,9 +61,22 @@ Linux の fandhe-container は、OCI `config.json` の `mounts[]` に書いた b
 - bind 以外の `mounts[]` の種類は未対応
 - 状態ルート（`StateStore::host_state_root`）と同一・祖先・子孫の `source` は start が拒否する（字句比較と `canonicalize` した実体の比較。SEC-1）。状態ルートを示せないストアでは bind つきの start を拒否する。適用の段も、固定した元に対して状態ルートとの重なりを毎回再検証する（元の属するマウントは fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントも照合する。保護対象と同じファイルシステム上でリンク数 2 以上の通常ファイルは状態ファイルへのハードリンクかもしれないため拒否する。start は状態ルート配下の通常ファイルのリンク数を上限つきで走査し、リンク数 2 以上のものがある〔または走査できない〕場合は、同じファイルシステム上のディレクトリ元も適用の段で拒否する）。元のマウント ID は `O_PATH` で固定した fd から取り、FIFO への差し替えでもブロックしない（REPAIR-5）。mountinfo は読み取りバイト数と行数に上限を設け、超過は構造化エラーで拒否する
 - 疑似 FS の拒否は拒否リストの方式のため、リストにない未知の疑似 FS は受ける。許可リスト方式にすると zfs・ceph・9p・virtiofs などを壊すため採らず、リストの見直しはカーネルの版を上げるときに行う（SEC-1・#2129）。実機での確認は #1916
-- FUSE（`fuse`・`fuseblk`・`fuse.lxcfs` などの派生名）と overlayfs は、データを持つ FS として受ける。overlayfs の下層（`lowerdir`）や FUSE デーモンが見せる中身、別の superblock 経由で状態ルートなどと同じ実体を見せる別名は検出しない。FUSE の中身はデーモンの資格情報の範囲を超えず、ホストの mount namespace に overlayfs を作るには root が要るためである。今後の方向は mountinfo の `lowerdir=`・`upperdir=` の照合（SEC-1・#2129）
-- start の後に状態ルートが移動・改名・差し替えられた場合、適用の段（restart を含む）は記録したホスト側パスを辿り直し、固定した実体と一致しなければ `FAILED_PRECONDITION` で拒否する（SEC-1・#2129）。残余は、祖先の bind mount を別の経路から改名するなど、パスが同じ inode に解決したままファイルシステム内パスだけが変わる場合で、mountinfo の `(dev, path)` は適用時に作り直さない
+- FUSE（`fuse`・`fuseblk`・`fuse.lxcfs` などの派生名）はデータを持つ FS として受ける。FUSE デーモンが見せる中身は検出しない。中身はデーモンの資格情報の範囲を超えないためである
+- overlayfs 上の元は、付け替えた木の mountinfo の super_options（`lowerdir`・`lowerdir+`・`datadir+`・`upperdir`・`workdir`）の層を `/` から辿り、rootfs・状態ルートと同一・祖先・子孫でないことを inode で照合する（`rbind` では配下の overlay も対象。SEC-1・#2166）。次の場合は `FAILED_PRECONDITION` で拒否する。(1) 層を現在の mount namespace で解決できない（相対パス・消えた層・symlink・ディレクトリでない層）。たとえば Docker のコンテナ内のように `/` が overlay で下層が見えない環境では、その overlay 上の元を拒否する。(2) super_options を解析できない、または上限（層 500・1 層 4096 バイト・1 件の bind で合計 4096 層）を超える。(3) 層が別の overlay の上にある（入れ子。再帰的には照合しない）。層は inode の鎖に加え、層の属するマウントの ID から求めた mountinfo の `(dev, path)` でも保護対象・子マウントと照合する（bind mount を挟んだ祖先関係の検出）。(4) 上の照合に通っても、overlay の元は拒否する。開き直した層のパスは overlay が保持する実際の backing directory と同一とは限らず（作成後に lowerdir のパスを別の bind mount で覆う等）、同一性を保証できる識別情報が無いため fail-closed とする。違反の記録には層のパスを載せない
+- start の後に状態ルートが移動・改名・差し替えられた場合、適用の段（restart を含む）は記録したホスト側パスを辿り直し、固定した実体と一致しなければ `FAILED_PRECONDITION` で拒否する（SEC-1・#2129）。mountinfo の `(dev, path)`（状態ルートと、その配下の子マウント）も適用の時点で作り直し、start の記録と作り直した値の両方で照合する。作り直せない、または dev が記録と食い違う場合は `FAILED_PRECONDITION` で拒否する（#2166）
 - restart でも、起動時と同じ bind の集合を適用する
+
+## 疑似 FS の拒否リストの見直し（カーネルの版を上げるとき）
+
+拒否リストの SSOT は `crates/core/src/exec/bind_mounts.rs` の `PSEUDO_FS_DENYLIST` の doc で、本節は更新の手順書である（SEC-1・#2166）。カーネルの版を上げる（サポートする最低版や確認済みの版を変える）たびに次を行う。
+
+1. 新旧の版の `include/uapi/linux/magic.h` の差分から、新しい `*_MAGIC` を拾う
+2. `struct file_system_type` の `.name` を grep し、既存の 22 種の出典（ファイル:行）が動いていないか確かめる。uapi に無い `configfs`・`mqueue`・`fusectl` はソースで確かめる
+3. 新しく見つかった FS を「拒否する」「受ける」に分け、理由をつけて `PSEUDO_FS_DENYLIST` の doc に記録する。ホストのプロセス・カーネル・LSM・cgroup・名前空間などの情報や制御口を見せる FS は拒否し、データを持つ FS は受ける
+4. overlayfs の super_options の書式（`fs/overlayfs/params.c` の `ovl_show_options`、`include/linux/seq_file.h` の `seq_show_option` のエスケープ、`fs/overlayfs/params.h` の `OVL_MAX_STACK`）が変わっていないか確かめ、`crates/core/src/exec/overlay_layers.rs` の module doc の出典と上限を更新する
+5. 表の照合テスト（`sec1_2098_denylist_table_is_exact` など）と、必要なら `sys` の magic 定数を同じ変更で更新する
+
+受ける（拒否しない）と判断済みの fstype は、データを持つ通常の FS である。`ext4`・`xfs`・`btrfs`・`tmpfs`・`overlay`・NFS・`zfs`・`ceph`・`9p`・`virtiofs`・FUSE（`fuse`・`fuseblk`・`fuse.<subtype>`）。Linux v7.0 での全件の grep 結果は未作成のため、版を上げる際に手順 2 で作る。
 
 ## 拒否の記録
 

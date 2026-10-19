@@ -115,11 +115,11 @@ cgroup v2 の範囲に収まるかは Linux では create の時点でも検査�
 
 setter が無い既知の項目は未適用として記録し、create / start が `UNIMPLEMENTED`（`unsupported config fields: <キー>`）で拒否する: `memory.{reservation,kernel,kernelTCP,swappiness,disableOOMKiller,useHierarchy,checkBeforeUpdate}`、`cpu.{shares,cpus,mems,realtimeRuntime,realtimePeriod,burst,idle}`、`blockIO.{leafWeight,weightDevice,leafWeightDevice}`、`hugepageLimits`、`network`、`rdma`、`unified`、`devices`。`rdma` と `network` は cgroup v2 で扱いにくいため拒否を続ける。
 
-`linux.resources` とその下の object の未知のキーは、OCI の「未知のプロパティは無視する」規則から外れて `INVALID_ARGUMENT` で拒否する。新しい版の spec にある制限を黙って落とし、指定より弱い資源制限で起動する経路を作らないため（SEC-1）。`resources: {}` は今のとおり cgroup が必要な指定として扱う（値による精緻化は #2010）。
+`linux.resources` とその下の object の未知のキーは、OCI の「未知のプロパティは無視する」規則から外れて `INVALID_ARGUMENT` で拒否する。新しい版の spec にある制限を黙って落とし、指定より弱い資源制限で起動する経路を作らないため（SEC-1）。`resources: {}` も cgroup が必要な指定として扱い、値による「不要」判定への精緻化はしない（#2010の判断）。未対応の既知キー（`memory.reservation` 等）は制限が空の `LinuxResourceLimits` に正規化されて空に見えるため、値だけで判定すると fail-open になる。本番の start は常に supervisor の cgroup 連鎖で join の手段を渡すので、精緻化の実益も無い（SEC-1・CORE-3）。
 
 ### `linux.cgroupsPath`
 
-型つき（4096 バイト以下・空と NUL は拒否）で保持するが、コンテナの cgroup は常に委譲スコープ配下の `fc-<id>@<n>` に置かれ、値を配置に使う実装は無い。指定があれば `cgroup_requirement::check_cgroups_path` が create / start で `UNIMPLEMENTED` として拒否する。受理に開くことと値の検証（スコープの外へ出る経路の拒否）は #2010 がこの関数を書き換えて行う。
+型つき（4096 バイト以下・空と NUL は拒否）で保持するが、コンテナの cgroup は常に委譲スコープ配下の `fc-<id>@<n>` に置かれ、値を配置に使わない方針とする（#2010 の判断）。状態記録・記録済みスコープの検証つき削除（#2060）がこの配置を前提にしており、systemd cgroup driver は対象外（TASK-32）で `slice:prefix:name` 形式を解釈する必要も無いため。指定があれば値に関わらず（`..`・絶対パス・別表記を含め）`cgroup_requirement::check_cgroups_path` が create / start で fork 前に `UNIMPLEMENTED` として拒否する。受理に開く場合は、委譲スコープ配下に閉じる検証（`..`・絶対パス・symlink・別表記の拒否）と状態記録との整合を前提とし、オーナー判断を経て別 issue で扱う。
 
 ## 前提環境（委譲スコープの作り手。#2081・CORE-3・CORE-4・SUP-1・CLI-1）
 

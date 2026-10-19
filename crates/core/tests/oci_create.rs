@@ -307,22 +307,32 @@ fn core3_create_rejects_resources_outside_the_cgroup_range() {
     assert_eq!(store.len(), 0);
 }
 
-/// #2019・CORE-3: `linux.cgroupsPath` は値を配置に使う実装が無いため、指定があれば Unimplemented で拒否する
-/// （黙って無視しない。受理は #2010）。値はメッセージに載せない。
+/// #2019・CORE-3: `linux.cgroupsPath` は値を配置に使わない方針のため、値に関わらず指定があれば Unimplemented で拒否する
+/// （黙って無視しない。#2010 で方針を確定）。値はメッセージに載せない。
 #[test]
-fn core3_create_rejects_cgroups_path_until_accepted() {
+fn core3_sec1_create_rejects_cgroups_path() {
     let b = ready_bundle("cgroups-path");
-    let mut cfg = valid_config();
-    cfg["linux"] = json!({"cgroupsPath": "/machine.slice/secret-name"});
-    b.write_config(&cfg);
-    let store = MemStateStore::new();
-    let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
-    assert_eq!(err.code(), ErrorCode::Unimplemented);
-    assert_eq!(
-        err.message(),
-        "linux.cgroupsPath is not supported yet; the container cgroup is placed under the delegated scope"
-    );
-    assert_eq!(store.len(), 0);
+    for path in [
+        "/machine.slice/secret-name",
+        "../escape",
+        "a/../../b",
+        "/sys/fs/cgroup",
+        "fc/child",
+        "machine.slice:prefix:name",
+    ] {
+        let mut cfg = valid_config();
+        cfg["linux"] = json!({ "cgroupsPath": path });
+        b.write_config(&cfg);
+        let store = MemStateStore::new();
+        let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::Unimplemented, "{path}");
+        assert_eq!(
+            err.message(),
+            "linux.cgroupsPath is not supported yet; the container cgroup is placed under the delegated scope",
+            "{path}"
+        );
+        assert_eq!(store.len(), 0, "{path}");
+    }
 }
 
 /// SEC-1: `root.path` の `..` は InvalidArgument で拒否する。

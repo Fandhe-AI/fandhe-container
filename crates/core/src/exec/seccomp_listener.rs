@@ -108,7 +108,25 @@ impl SeccompListener {
         if self.1.swap(true, Ordering::AcqRel) {
             return Ok(None);
         }
-        let result = sys::seccomp_notify::notif_recv(self.0.as_fd());
+        // 排他の中で到着を確かめ直す。別の読み手が同じ通知を先に消費していれば未到着になり、RECV に進まない
+        // (古い `Readable` を根拠に RECV すると次の通知まで無期限に止まる。REPAIR-5)。
+        let result = match sys::seccomp_notify::poll_listener(self.0.as_fd(), 0) {
+            Ok(sys::seccomp_notify::ListenerPoll::Readable) => {
+                sys::seccomp_notify::notif_recv(self.0.as_fd())
+            }
+            Ok(_) => {
+                self.1.store(false, Ordering::Release);
+                return Ok(None);
+            }
+            Err(e) => {
+                self.1.store(false, Ordering::Release);
+                return Err(ExecError::from_sys(
+                    e,
+                    IsolationStage::Seccomp,
+                    "re-poll of the seccomp listener",
+                ));
+            }
+        };
         self.1.store(false, Ordering::Release);
         result
             .map(|n| {
@@ -857,6 +875,19 @@ mod tests {
         // 応答者(listener)が消えると、拒否は ENOSYS のまま保たれる(許可に倒れない)。
         drop(listener);
         assert_eq!(probe.call_kcmp(), Some(38));
+    }
+
+    /// REPAIR-5・SEC-4(#2025): 通知が消費済み(古い `Readable`)の状態で `receive` を呼んでも、RECV に進まず
+    /// すぐ `None` を返す(次の通知まで無期限に止まらない)。2 本目の読み手が排他を得た時点の状況を再現する。
+    #[test]
+    fn repair5_receive_without_pending_notification_returns_none_promptly() {
+        let mut probe = user_notif_probe_for_test().unwrap();
+        let listener = probe.take_listener().unwrap();
+        let started = Instant::now();
+        assert!(listener.receive().unwrap().is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // 排他フラグが戻っている(続けて呼べる)。
+        assert!(listener.receive().unwrap().is_none());
     }
 
     fn kcmp_nr() -> i32 {

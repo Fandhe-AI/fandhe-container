@@ -318,6 +318,7 @@ fn sec4_2025_missing_listener_disposes_the_process_and_fails() {
         launches: AtomicUsize::new(0),
         probes: Mutex::new(Vec::new()),
     });
+    let recorder = Arc::new(OpRecorder::new());
     let started = Instant::now();
     let mut out = Vec::new();
     let result = run_start(
@@ -326,11 +327,18 @@ fn sec4_2025_missing_listener_disposes_the_process_and_fails() {
             hub: Arc::clone(&hub),
         }),
         &env.store,
-        &Arc::new(OpRecorder::new()),
+        &recorder,
         &StartRequest::new(ContainerId::new(&env.id).unwrap()),
         &timeouts(),
         &mut out,
     );
+    // REPAIR-4: 引き渡しの失敗は supervisor.start の失敗 1 件として数え、成功と二重計上しない。
+    let stats = recorder
+        .snapshot_op(
+            &fandhe_container_core::observability::OpName::new("supervisor.start").unwrap(),
+        )
+        .expect("start must be recorded");
+    assert_eq!((stats.success(), stats.failure()), (0, 1));
     assert!(result.is_err(), "start must fail without a listener");
     assert_ne!(result.err().map(NonZeroU8::get), Some(0));
     assert!(!out.is_empty(), "the ERR line must be reported");

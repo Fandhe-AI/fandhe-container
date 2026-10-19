@@ -655,14 +655,24 @@ fn start_reporting(
         let worker_exited = worker.join();
         let attempt =
             launch_after_prepare(outcome, worker_exited, store, recorder, timeouts, deadline);
-        record_start(recorder, started, matches!(attempt, Attempt::Started(_)));
+        // Started 以外はここで確定する。Started はハブへの引き渡しまで含めた最終結果で記録する（二重計上しない。REPAIR-4）。
+        if !matches!(attempt, Attempt::Started(_)) {
+            record_start(recorder, started, false);
+        }
         return match attempt {
             Attempt::Started(running) => {
                 // 応答ハブの開始を成功報告の前に済ませる（報告の後に失敗すると、CLI へ成功を返したコンテナを
                 // 回収して非 0 で終えることになるため。失敗なら回収して ERR を報告する。ERR-1・ERR-2・SEC-4）。
                 #[cfg(target_os = "linux")]
                 let running =
-                    attach_seccomp_before_report(running, store, req.id(), timeouts, out)?;
+                    match attach_seccomp_before_report(running, store, req.id(), timeouts, out) {
+                        Ok(r) => r,
+                        Err(code) => {
+                            record_start(recorder, started, false);
+                            return Err(code);
+                        }
+                    };
+                record_start(recorder, started, true);
                 report(
                     out,
                     &StartReport::Started {

@@ -86,7 +86,9 @@
 //! `open_tree(OPEN_TREE_CLONE)` の fd は匿名 namespace の root なのでいずれも通る。それでも使わないのは、複製（`clone_mnt`）が元の
 //! 伝播（`mnt_group_id`・`mnt_master`）を引き継ぐためで、**複製が private であることは `establish` の `MS_REC|MS_PRIVATE`
 //! に依存する**（これを外す改修は手順 4・9 の照合で検出されるが、前提として維持すること）。`MS_PRIVATE` を同じ呼び出しで設定する
-//! 変更は別 issue で扱う（本 issue ではコード不変）。
+//! 変更は #2165 で検討し、見送った（伝播の前提は `establish` の無条件の private 化・手順 4 の shared 拒否・手順 9 の照合の 3 段で
+//! 守られ、いずれも fail-closed のため）。再検討するのは、`establish` の private 化を条件付き・順序替え・除去する改修や、
+//! 手順 4・9 が伝播の不備を検出したとき（SEC-1・OCI-4）。
 //!
 //! **属性とロックの一次情報**（#2064 で版つきに確認。Linux v5.12・v6.12・v7.0 の `fs/namespace.c`・`fs/pnode.c`、man-pages 6.17）:
 //!

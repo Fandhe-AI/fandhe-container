@@ -44,7 +44,7 @@
 //! - `rootless`: user namespace の UID/GID 写像の設定・読み戻し検証（Linux 限定。CORE-6・SEC-5・
 //!   TASK-40.1）。検証済み写像型・subuid/subgid 解析・`Direct` / `newuidmap` 経由の書き込みが実装済みで、
 //!   `exec::isolate_rootless_subordinate` による起動フローへの組み込みも実装済み（TASK-40.2）。
-//!   `linux.uidMappings` の受理は後続、ファイル所有者検証（TASK-40.3）は未実装
+//!   config 指定の `linux.uidMappings` は start が拒否（受けるかは #2240 で判断待ち。`docs/design/config-id-mappings.md`）、ファイル所有者検証（TASK-40.3）は未実装
 //! - `seccomp`: 禁止 syscall の一覧 `DeniedSyscall` と x86_64 / aarch64 別の番号テーブル（CORE-5・
 //!   TASK-38.1.1・#837。OS 非依存で syscall を持たない）。テーブルと BPF 構築
 //!   （TASK-38.1.2・#838）は実装済み。フィルタ適用（TASK-38.2）と起動フローへの組み込み（TASK-38.3）も実装済み

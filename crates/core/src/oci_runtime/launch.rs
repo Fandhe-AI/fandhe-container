@@ -960,7 +960,7 @@ impl LaunchedProcess for ContainerChildProcess {
 ///   euid・egid。0 なら拒否）へ写すこと。`exec::plan` / `exec::isolate` が既定でこの写像を行う（SEC-5）
 ///   subuid / subgid の範囲写像（コンテナ内に複数 UID を持たせる通常の rootless 構成）が要る場合は
 ///   `exec::plan_rootless_subordinate` / `exec::isolate_rootless_subordinate` を使う（TASK-40.2・CORE-6。
-///   `linux.uidMappings` を `LaunchSpec` へ載せる経路は未実装）
+///   `linux.uidMappings` を `LaunchSpec` へ載せる経路は未実装。受けるかは #2240 で判断待ち）
 /// - [`LaunchSpec::cgroup_requirement`] が必要なのに cgroup への join の手段が無ければ、fork の前に
 ///   `require_cgroup_join` で拒否する（SEC-1・CORE-3・#1814）。join の手段は `LaunchSpec` に載せず、
 ///   launcher の構築時に保持する

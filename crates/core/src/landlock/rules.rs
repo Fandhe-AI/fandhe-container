@@ -24,7 +24,8 @@
 //! - `/sys` の sysfs（`mounts[]`。#2020）はルールを作らない（実効の権利は root と同じ。書き込みの禁止は VFS の ro が担う。
 //!   理由は `build_path_rules_with_dev` の実装コメント）
 //! - `linux.readonlyPaths` / `maskedPaths` は参照しない（VFS のマウントが担うためルールは足さない。解釈は
-//!   `OciConfig::readonly_paths` / `masked_paths`、適用は `exec` の pivot 前段。#1852）
+//!   `OciConfig::readonly_paths` / `masked_paths`、適用は `exec` の pivot 前段。#1852）。暗黙の `/dev` 系と同じか
+//!   祖先を指す保護パスは、ここ（予約・fork の後）ではなく start が fork 前に `InvalidArgument` で拒否する（#2015）
 //!
 //! # 未実装範囲（REPAIR-3）
 //!

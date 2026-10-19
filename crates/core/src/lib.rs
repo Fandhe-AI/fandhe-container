@@ -65,8 +65,9 @@
 //! - `cgroups`: 委譲 cgroup v2 の検出・コンテナ用子 cgroup 作成・自プロセス退避の検証・controller
 //!   有効化・`memory.max` / `memory.swap.max` 設定・`cpu.max` 設定（Linux 限定。TASK-32.1・TASK-32.2・
 //!   TASK-32.3・CORE-3 は実装済み。TASK-32.4 は fork 後の子の `cgroup.procs` 参加フック `CgroupJoin` まで実装済みで、本番 launcher 側の受け口（`ProductionLauncher` の `cgroup_join_source`。#1816）も実装済み。start 経路の supervisor からの供給の結線は #1717。デバイス cgroup の eBPF 命令列の組み立て〔#1678〕まで実装済みで、ロード・アタッチは未実装）
-//! - `plugin`: `plugin` feature 配下の境界基盤型の再エクスポート（PLUG-3・TASK-111.1・#262）。
-//!   発見・登録は未実装
+//! - `plugin`: `plugin` feature 配下の境界基盤型の再エクスポートと、照合済み fd から起動対象を作る変換
+//!   `HashVerifiedPluginFile::into_launch_target`（PLUG-3・TASK-111.1・#262・PLUG-11・#1857）。
+//!   発見・登録・起動の本番配線は未実装
 //! - `plugin_discovery`: 管理ディレクトリ（system / user）からの plugin 候補探索（TASK-109.1・PLUG-4・PLUG-11）と `PATH` 探索の opt-in・警告ログ（TASK-109.2）、同名重複を解決する候補レジストリ（TASK-109.3。登録は未検証）は実装済み・OS 非依存。
 //!   候補は未検証。opt-in の CLI フラグ配線（TASK-79）・信頼性検証（TASK-122）は未実装
 //! - `plugin_trust`: plugin 候補の所有者・モード・symlink 実体解決・sha256 許可済みハッシュ検証・検証方式の切替点（TASK-122.1〜122.4・PLUG-11。既定はハッシュ一覧、署名検証は未実装で指定時は拒否）。fd 経由の fstat・ハッシュ計算で判定し検証済み fd を返す。非 Linux は常に拒否。拒否の構造化エラー（code / reason / message）と `PluginTrust` 監査レコード化は TASK-122.5 で実装済み。レジストリ・本番 sink（実装済み `FileAuditSink`）への配線は未実装

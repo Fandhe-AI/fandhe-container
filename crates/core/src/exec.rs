@@ -125,6 +125,7 @@ mod launch_intermediate;
 mod launch_status;
 mod masked_paths;
 mod no_new_privs;
+mod overlay_layers;
 mod path_masks;
 mod process;
 mod reapply;
@@ -241,6 +242,7 @@ pub use process::{StandardFd, close_standard_fds_for_test};
 pub use process::{
     spawn_container_probe, spawn_container_probe_with_config_paths,
     spawn_container_probe_with_devices, spawn_container_probe_with_sysfs,
+    spawn_container_probe_with_tmpfs_and_config_paths,
 };
 /// supervisor の結合試験 `tests/exec_audit.rs` 専用の再公開（SEC-4・SEC-1・#1614 の事後監査。通常の利用者は
 /// 呼ばない。詳細は定義側）。`exec-test-support` feature を付けたビルドにだけ存在する。

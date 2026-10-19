@@ -556,7 +556,7 @@ logdir="$(mktemp -d)" || { err "unsupported-os" "cannot create a temporary direc
 state_root="${logdir}/state"
 work="${logdir}/work"
 mkdir -m 0700 "$state_root" "$work" "${work}/bundles" "${work}/fifos" || { err "unsupported-os" "cannot create a work directory"; exit 3; }
-declare -A REP_PID FDS
+declare -A REP_PID FDS REP_BUF
 
 # --- 起動契約の差し替え点（契約の根拠は冒頭コメント）。起動行・報告行の解釈はこの関数群に閉じる ---
 
@@ -596,10 +596,20 @@ sup_spawn() { # <i>
 # （exit しない。EXIT trap 内の cleanup_procs からも呼ばれるため、後始末を中断させない。終了コードの決定は呼び出し側が
 # 後始末の前に行う）。未到着は 1。
 sup_report() { # <i>
-  local i="$1" line=""
+  local i="$1" chunk="" line="" rc=0
   [ -z "${REP_PID[$i]:-}" ] || return 0
   [ -z "${BADREP[$i]:-}" ] || return 2
-  IFS= read -r -n 640 -t 0.05 -u "${FDS[$i]}" line || true
+  # read -t は期限切れのとき、それまでに読めた途中の文字列を chunk へ返して消費する（終了コード 128 超）。
+  # 読み側は FIFO を 1 バイトずつ読むため、負荷で到着が 50ms を超えて分かれると途中の行を完全な行と誤認する
+  # （pid の途中切れを別 pid として受理し、追跡不能の終了コード 4 になる。#2154・SUP-5・REPAIR-5）。
+  # 改行が来るまで REP_BUF へ継ぎ足し、上限 640 バイトに達したら 1 行として照合する（measure-restart-latency.sh と同じ規則）。
+  IFS= read -r -n 640 -t 0.05 -u "${FDS[$i]}" chunk || rc=$?
+  REP_BUF[$i]="${REP_BUF[$i]:-}${chunk}"
+  if [ "$rc" -gt 128 ] && [ "${#REP_BUF[$i]}" -lt 640 ]; then
+    return 1
+  fi
+  line="${REP_BUF[$i]}"
+  REP_BUF[$i]=""
   [ -n "$line" ] || return 1
   if [[ "$line" =~ ^FCSUP1\ OK\ ([1-9][0-9]{0,9})$ ]]; then
     REP_PID[$i]="${BASH_REMATCH[1]}"

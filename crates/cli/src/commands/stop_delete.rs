@@ -79,7 +79,7 @@ struct UnavailableSignaler;
 /// `kill(2)` する縮退は持たない。ルートに `host_state_root()` を使うのは、supervisor のログルートや
 /// `remove_supervisor_log` と揃い、cfg を CLI に持ち込まないため。supervisor の bind 側（`args.root`）との違いは
 /// 親の symlink の解決だけで、`<root>/<id>` は同じディレクトリを指す。
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 pub(super) fn production_signaler(store: &dyn StateStore) -> Arc<dyn ProcessSignaler> {
     match store.host_state_root() {
         Some(root) => Arc::new(ControlSignaler::new(root.to_path_buf())),

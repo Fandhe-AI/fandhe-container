@@ -898,7 +898,9 @@ pub fn supervise_with_restart(
                 });
             }
         };
-        let intent = if stop.is_stop_requested() || stop.is_explicit_stop() {
+        let intent = if stop.is_stop_requested()
+            || stop.explicit_stop_state() == crate::run::ExplicitStopState::Requested
+        {
             StopIntent::Requested
         } else {
             StopIntent::NotRequested
@@ -2010,7 +2012,10 @@ mod tests {
         let q = Arc::new(Queue::new(&[(43, FAIL)]));
         let obs = Events::default();
         let stop = StopToken::new();
-        assert!(!stop.mark_explicit_stop());
+        assert_eq!(
+            stop.mark_explicit_stop(),
+            crate::run::ExplicitStopRecord::NewlyRecorded
+        );
         let out = run(&st, "always", ProcessExit::Signaled(15), &q, &stop, &obs);
         let SuperviseOutcome::Finished {
             reason, restarts, ..

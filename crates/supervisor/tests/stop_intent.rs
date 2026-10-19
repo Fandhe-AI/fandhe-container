@@ -27,7 +27,7 @@ use fandhe_container_core::traits::{
 };
 use fandhe_container_supervisor::control::{ControlSignaler, install};
 use fandhe_container_supervisor::restart::{Relauncher, RestartPolicy};
-use fandhe_container_supervisor::run::StopToken;
+use fandhe_container_supervisor::run::{ExplicitStopState, StopToken};
 use fandhe_container_supervisor::start_entry::{Running, run_supervised};
 use fandhe_container_supervisor::state::{SupervisedState, open_default_store};
 
@@ -252,7 +252,11 @@ fn sup9_sup3_stop_intent_prevents_restart_under_every_policy() {
         );
         assert_eq!(rig.relaunches.load(Ordering::SeqCst), 0, "{policy}");
         assert_eq!(*rig.signals.lock().unwrap(), vec![(100, 15)], "{policy}");
-        assert!(rig.stop.is_explicit_stop(), "{policy}");
+        assert_eq!(
+            rig.stop.explicit_stop_state(),
+            ExplicitStopState::Requested,
+            "{policy}"
+        );
         assert!(!rig.stop.is_stop_requested(), "{policy}");
     }
 }
@@ -264,7 +268,10 @@ fn sup9_sup3_plain_signal_restarts_but_stop_after_it_does_not() {
     let rig = start("contrast", "always");
     rig.send(&ControlSignaler::new(rig.root.clone()), 100)
         .unwrap();
-    assert!(!rig.stop.is_explicit_stop());
+    assert_eq!(
+        rig.stop.explicit_stop_state(),
+        ExplicitStopState::NotRequested
+    );
     rig.wait_record(|r| r.0 == ContainerState::Running && r.2 == 1 && r.3 == Some(301));
     assert_eq!(rig.relaunches.load(Ordering::SeqCst), 1);
 
@@ -288,7 +295,10 @@ fn sup9_sec1_pid_mismatch_stop_does_not_mark_intent() {
         e.message(),
         "the process id does not match the launched process"
     );
-    assert!(!rig.stop.is_explicit_stop());
+    assert_eq!(
+        rig.stop.explicit_stop_state(),
+        ExplicitStopState::NotRequested
+    );
     assert!(rig.signals.lock().unwrap().is_empty());
     assert_eq!(rig.record().0, ContainerState::Running);
     // 片付け: 正しい pid で止める。

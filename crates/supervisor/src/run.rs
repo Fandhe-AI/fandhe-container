@@ -155,6 +155,26 @@ impl Default for MonitorConfig {
     }
 }
 
+/// [`StopToken::mark_explicit_stop`] の記録結果（SUP-9・#2162）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExplicitStopRecord {
+    /// この呼び出しで初めて意図を立てた。
+    NewlyRecorded,
+    /// 既に別の呼び出しが意図を立てていた。
+    AlreadyRecorded,
+}
+
+/// 明示 stop の意図の状態（[`StopToken::explicit_stop_state`]。SUP-9・#2162）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExplicitStopState {
+    /// 意図は立っていない。
+    NotRequested,
+    /// 明示 stop の意図が立っている。
+    Requested,
+}
+
 /// 監視ループを有限時間で止めるための取り消しトークン（複製して共有できる）。
 ///
 /// 2 つの独立したフラグを持つ。
@@ -185,14 +205,22 @@ impl StopToken {
         self.stop.load(Ordering::SeqCst)
     }
 
-    /// 明示 stop の意図を立て、直前の値を返す。監視は止めない（[`Self::request_stop`] との違い）。
-    pub fn mark_explicit_stop(&self) -> bool {
-        self.explicit.swap(true, Ordering::SeqCst)
+    /// 明示 stop の意図を立て、直前の状態を返す。監視は止めない（[`Self::request_stop`] との違い）。
+    pub fn mark_explicit_stop(&self) -> ExplicitStopRecord {
+        if self.explicit.swap(true, Ordering::SeqCst) {
+            ExplicitStopRecord::AlreadyRecorded
+        } else {
+            ExplicitStopRecord::NewlyRecorded
+        }
     }
 
-    /// 明示 stop の意図が立っているか。
-    pub fn is_explicit_stop(&self) -> bool {
-        self.explicit.load(Ordering::SeqCst)
+    /// 明示 stop の意図の状態を返す。
+    pub fn explicit_stop_state(&self) -> ExplicitStopState {
+        if self.explicit.load(Ordering::SeqCst) {
+            ExplicitStopState::Requested
+        } else {
+            ExplicitStopState::NotRequested
+        }
     }
 
     /// 明示 stop の意図を戻す。直前が `false` だったときに立てた分を、シグナルの送信失敗で取り消すために使う
@@ -753,16 +781,16 @@ mod tests {
     fn sup9_explicit_stop_flag_is_independent_and_shared() {
         let t = StopToken::new();
         let c = t.clone();
-        assert!(!t.is_explicit_stop());
-        assert!(!c.mark_explicit_stop());
-        assert!(t.is_explicit_stop());
-        assert!(c.mark_explicit_stop());
+        assert_eq!(t.explicit_stop_state(), ExplicitStopState::NotRequested);
+        assert_eq!(c.mark_explicit_stop(), ExplicitStopRecord::NewlyRecorded);
+        assert_eq!(t.explicit_stop_state(), ExplicitStopState::Requested);
+        assert_eq!(c.mark_explicit_stop(), ExplicitStopRecord::AlreadyRecorded);
         assert!(!t.is_stop_requested());
         t.revert_explicit_stop();
-        assert!(!c.is_explicit_stop());
+        assert_eq!(c.explicit_stop_state(), ExplicitStopState::NotRequested);
         c.request_stop();
         assert!(t.is_stop_requested());
-        assert!(!t.is_explicit_stop());
+        assert_eq!(t.explicit_stop_state(), ExplicitStopState::NotRequested);
     }
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU32;

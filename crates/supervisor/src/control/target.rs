@@ -36,7 +36,7 @@ use fandhe_container_core::traits::{ErrorCode, Signal, TraitError};
 
 use super::protocol::{ControlReason, RequestKind};
 use crate::restart::{LateOrphan, Relauncher};
-use crate::run::StopToken;
+use crate::run::{ExplicitStopRecord, StopToken};
 
 /// 受け箱の容量（超えたら `Busy`。資源の使用量を固定に抑える）。
 pub const INBOX_CAPACITY: usize = 4;
@@ -166,6 +166,10 @@ impl SignalSlot {
                 if *held != pid {
                     Err(ControlReason::PidMismatch)
                 } else {
+                    // 終了済みでも Stop の意図は記録する（再 launch の判定が読む。SUP-9）。
+                    if let (RequestKind::Stop, Some(token)) = (kind, &inner.stop_intent) {
+                        token.mark_explicit_stop();
+                    }
                     Err(ControlReason::ContainerExited)
                 }
             }
@@ -222,7 +226,17 @@ impl ControlledProcess {
             match self.inbox.try_recv() {
                 Ok(req) => {
                     let reason = match fixed {
-                        Some(r) => r,
+                        Some(r) => {
+                            // 終了を観測済みでも、同時に来た Stop の意図は記録する（SUP-9。記録しないと
+                            // restart の判定が `always` / `unless-stopped` で再 launch してしまう）。
+                            if req.kind == RequestKind::Stop {
+                                let token = self.slot.lock().stop_intent.clone();
+                                if let Some(token) = token {
+                                    token.mark_explicit_stop();
+                                }
+                            }
+                            r
+                        }
                         None => self.handle(&req),
                     };
                     // 受け手（サーバ）が期限で諦めていても詰まらない（容量 1・送信は 1 回）。
@@ -246,10 +260,10 @@ impl ControlledProcess {
             let Some(token) = self.slot.lock().stop_intent.clone() else {
                 return ControlReason::StopIntentUnavailable;
             };
-            let was_set = token.mark_explicit_stop();
+            let record = token.mark_explicit_stop();
             #[cfg(target_os = "linux")]
             super::log_control_event("stop_intent_recorded", None);
-            Some((token, was_set))
+            Some((token, record))
         } else {
             None
         };
@@ -262,7 +276,7 @@ impl ControlledProcess {
             },
         };
         // 送れなかったとき、この要求で立てた意図だけ戻す。回収済みは止めたい対象が終わっているので残す。
-        if let Some((token, false)) = &intent
+        if let Some((token, ExplicitStopRecord::NewlyRecorded)) = &intent
             && !matches!(reason, ControlReason::Ok | ControlReason::ContainerExited)
         {
             token.revert_explicit_stop();
@@ -378,6 +392,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use crate::run::ExplicitStopState;
 
     /// 送られたシグナル番号を記録する模擬プロセス。
     struct Fake {
@@ -651,7 +666,7 @@ mod tests {
             self.seen
                 .lock()
                 .unwrap()
-                .push(self.token.is_explicit_stop());
+                .push(self.token.explicit_stop_state() == ExplicitStopState::Requested);
             if self.fail {
                 Err(TraitError::new(self.outcome, "x"))
             } else {
@@ -696,7 +711,7 @@ mod tests {
         let (slot, cp, token, seen) = probe_setup(false, ErrorCode::Internal);
         assert_eq!(stop_roundtrip(&slot, &cp), ControlReason::Ok);
         assert_eq!(*seen.lock().unwrap(), vec![true]);
-        assert!(token.is_explicit_stop());
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::Requested);
         assert!(!token.is_stop_requested());
     }
 
@@ -706,7 +721,7 @@ mod tests {
         let (slot, cp, token, seen) = probe_setup(false, ErrorCode::Internal);
         assert_eq!(roundtrip(&slot, &cp, 100, 15, far()), ControlReason::Ok);
         assert_eq!(*seen.lock().unwrap(), vec![false]);
-        assert!(!token.is_explicit_stop());
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
     }
 
     /// SUP-9: 書き先の無い slot の Stop は、送らずに `StopIntentUnavailable`（fail-closed）。
@@ -729,7 +744,7 @@ mod tests {
     fn sup9_failed_signal_reverts_intent() {
         let (slot, cp, token, _) = probe_setup(true, ErrorCode::Internal);
         assert_eq!(stop_roundtrip(&slot, &cp), ControlReason::SignalFailed);
-        assert!(!token.is_explicit_stop());
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
     }
 
     /// SUP-9: 先に別の stop が立てた意図は、後の stop の失敗で消さない。
@@ -738,7 +753,7 @@ mod tests {
         let (slot, cp, token, _) = probe_setup(true, ErrorCode::Timeout);
         token.mark_explicit_stop();
         assert_eq!(stop_roundtrip(&slot, &cp), ControlReason::Timeout);
-        assert!(token.is_explicit_stop());
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::Requested);
     }
 
     /// SUP-9・REPAIR-5: 期限切れの Stop は意図を立てず、送らない。
@@ -752,7 +767,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(60));
         let _ = cp.wait(Duration::from_millis(1));
         assert_eq!(rx.recv().unwrap(), ControlReason::Timeout);
-        assert!(!token.is_explicit_stop());
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -761,6 +776,38 @@ mod tests {
     fn sup9_reaped_stop_keeps_intent() {
         let (slot, cp, token, _) = probe_setup(true, ErrorCode::FailedPrecondition);
         assert_eq!(stop_roundtrip(&slot, &cp), ControlReason::ContainerExited);
-        assert!(token.is_explicit_stop());
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::Requested);
+    }
+
+    /// SUP-9: 終了を観測した `wait` の後始末で返す `ContainerExited` の Stop でも、意図を記録する。
+    #[test]
+    fn sup9_stop_answered_container_exited_in_drain_marks_intent() {
+        let (slot, cp, token, _) = probe_setup(false, ErrorCode::Internal);
+        let rx = slot
+            .submit(RequestKind::Stop, pid(100), Signal::SIGTERM, far())
+            .unwrap();
+        slot.mark_exited(cp.generation);
+        cp.drain(Some(ControlReason::ContainerExited));
+        assert_eq!(rx.recv().unwrap(), ControlReason::ContainerExited);
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::Requested);
+    }
+
+    /// SUP-9: `Exited` スロットへの Stop の submit でも、意図を記録する。Signal は記録しない。
+    #[test]
+    fn sup9_stop_submit_to_exited_slot_marks_intent() {
+        let (slot, cp, token, _) = probe_setup(false, ErrorCode::Internal);
+        slot.mark_exited(cp.generation);
+        assert_eq!(
+            slot.submit(RequestKind::Signal, pid(100), Signal::SIGTERM, far())
+                .unwrap_err(),
+            ControlReason::ContainerExited
+        );
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
+        assert_eq!(
+            slot.submit(RequestKind::Stop, pid(100), Signal::SIGTERM, far())
+                .unwrap_err(),
+            ControlReason::ContainerExited
+        );
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::Requested);
     }
 }

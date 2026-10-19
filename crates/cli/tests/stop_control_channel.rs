@@ -29,7 +29,7 @@ use fandhe_container_supervisor::control::listener::{ControlListener, effective_
 use fandhe_container_supervisor::control::observe::ControlObserver;
 use fandhe_container_supervisor::control::server::{ControlServer, ServeConfig};
 use fandhe_container_supervisor::control::target::{ControlledProcess, SignalSlot};
-use fandhe_container_supervisor::run::StopToken;
+use fandhe_container_supervisor::run::{ExplicitStopState, StopToken};
 
 /// 送られたシグナル番号を記録する模擬の起動ハンドル（supervisor が保持する側）。
 struct Fake {
@@ -262,7 +262,10 @@ fn cli1_sec1_stop_delivers_sigterm_via_supervisor() {
     assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
     assert_eq!(sup.recorded(), vec![15]);
     // SUP-9: stop は意図を記録してから送る（監視の打ち切りではない）。
-    assert!(sup.intent.is_explicit_stop());
+    assert_eq!(
+        sup.intent.explicit_stop_state(),
+        ExplicitStopState::Requested
+    );
     assert!(!sup.intent.is_stop_requested());
 }
 
@@ -282,7 +285,10 @@ fn sup9_err2_stop_without_intent_sink_fails_closed_and_sends_nothing() {
         )
     );
     assert!(sup.recorded().is_empty());
-    assert!(!sup.intent.is_explicit_stop());
+    assert_eq!(
+        sup.intent.explicit_stop_state(),
+        ExplicitStopState::NotRequested
+    );
 }
 
 /// SEC-1・ERR-2: supervisor が無ければ UNAVAILABLE（9）で失敗し、pid へ kill(2) で縮退しない。

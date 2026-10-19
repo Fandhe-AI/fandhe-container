@@ -17,6 +17,11 @@ use std::path::{Component, Path, PathBuf};
 use super::image_refs::ImageManifestDigest;
 use crate::traits::{ErrorCode, TraitError};
 
+/// 非公開の展開先の名前の接頭辞。`root.path` の要素としてこの接頭辞を持つ名前は、展開中の非公開の木を
+/// 通常の create が rootfs として採用することを防ぐため、`prepare_rootfs_target` と `check_rootfs` が拒否する
+/// （OCI-7: 使用中 rootfs の保持。展開中の木は名前を列挙でき、別 ID の create が指せてしまう）。
+pub(super) const STAGING_PREFIX: &str = ".fandhe-unpack-";
+
 /// 後始末で権限を補正しながら辿る項目数の上限（無制限の走査を避ける。展開側の既定上限と同程度）。
 #[cfg(target_os = "linux")]
 const CLEANUP_MAX_ENTRIES: usize = 1_000_000;
@@ -106,6 +111,9 @@ pub(super) fn prepare_rootfs_target(
     {
         return Err(invalid("root.path must not contain '..'"));
     }
+    if has_staging_component(root_path) {
+        return Err(invalid("root.path must not use a reserved staging name"));
+    }
     let rootfs = bundle.join(root_path);
     if !rootfs
         .components()
@@ -135,6 +143,14 @@ pub(super) fn prepare_rootfs_target(
     Ok(CreatedRootfs { path, backing })
 }
 
+/// 経路のいずれかの要素が非公開の展開先の予約名（[`STAGING_PREFIX`] 始まり）か。
+pub(super) fn has_staging_component(path: &Path) -> bool {
+    path.components().any(|c| match c {
+        Component::Normal(p) => p.to_string_lossy().starts_with(STAGING_PREFIX),
+        _ => false,
+    })
+}
+
 impl CreatedRootfs {
     /// 作った rootfs のパス（bundle 配下。Normal 要素だけの正規化済みの経路）。
     pub(super) fn path(&self) -> &Path {
@@ -153,6 +169,12 @@ impl CreatedRootfs {
     /// `AlreadyExists`（置き換えない）。Linux 以外は作成時から最終の名前にあるため何もしない。
     pub(super) fn publish(&mut self) -> Result<(), TraitError> {
         imp::publish(&mut self.backing)
+    }
+
+    /// 最終の名前への改名が済んでいるか。`publish` が Err でも true なら公開済みで、他の create が
+    /// 使いうるため後始末で消してはならない（OCI-7）。
+    pub(super) fn is_published(&self) -> bool {
+        imp::is_published(&self.backing)
     }
 
     /// `path`（bundle の検証で得た最終の rootfs の経路）を今解決した実体が、展開した実体か（dev・ino）。
@@ -235,6 +257,10 @@ mod imp {
     }
 
     /// 経路を今ここで解決した実体が、展開した実体（保持中の fd の dev・ino）か。
+    pub(super) fn is_published(b: &Backing) -> bool {
+        b.current == b.final_name
+    }
+
     pub(super) fn path_is_unpacked(path: &Path, b: &Backing) -> bool {
         std::fs::metadata(path).is_ok_and(|m| m.is_dir() && (m.dev(), m.ino()) == b.identity)
     }
@@ -319,7 +345,8 @@ mod imp {
             }
         }
         let staging = format!(
-            ".fandhe-unpack-{}-{}",
+            "{}{}-{}",
+            super::STAGING_PREFIX,
             std::process::id(),
             STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
         );
@@ -343,9 +370,9 @@ mod imp {
         });
         // mkdirat と open の間に、親へ書ける別プロセスが別の実体へ差し替えうる。採用する実体は、自分（実効 uid）
         // 所有・権限 0700・空のディレクトリに限る（既存データへ展開せず、失敗時の再帰削除が他人のデータに
-        // 及ばない）。0700 で自分の所有なら、検証後に他者は中身を足せない（root を除く）。
+        // 及ばない）。0700（setgid 親の下の 02700 も許容）で自分の所有なら、検証後に他者は中身を足せない（root を除く）。
         let owned_empty = opened.as_ref().is_some_and(|(fd, _, _, _)| {
-            fstat(fd.as_fd()).is_ok_and(|(_, _, is_dir, mode)| is_dir && mode & 0o7777 == 0o700)
+            fstat(fd.as_fd()).is_ok_and(|(_, _, is_dir, mode)| is_dir && mode & 0o777 == 0o700)
                 && fd_owner(fd.as_fd()) == Some(sys::effective_uid())
                 && dir_is_empty(fd.as_fd())
         });
@@ -462,6 +489,10 @@ mod imp {
     }
 
     /// 作成自体が拒否される（`create_dir` は Unimplemented）ため到達しない。
+    pub(super) fn is_published(_b: &Backing) -> bool {
+        true
+    }
+
     pub(super) fn path_is_unpacked(_path: &Path, _b: &Backing) -> bool {
         false
     }
@@ -487,8 +518,13 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("fandhe-image-rootfs-{name}-{}", std::process::id()));
+        // 呼び出しごとに固有（並行する試験が同じ名前を使っても相手のディレクトリを消さない。REPAIR-12）。
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-image-rootfs-{name}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         dir
@@ -631,6 +667,30 @@ mod tests {
         assert!(!b.join("rootfs").exists());
         let _ = std::fs::remove_dir_all(&b);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// OCI-7: 展開中の非公開の名前（予約名）は root.path として拒否する。
+    #[test]
+    fn oci7_prepare_rejects_reserved_staging_name() {
+        let b = tmp("reserved");
+        let e = prepare_rootfs_target(&b, Path::new(".fandhe-unpack-1-0")).expect_err("reserved");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert!(has_staging_component(Path::new("a/.fandhe-unpack-x/b")));
+        assert!(!has_staging_component(Path::new("a/rootfs")));
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7: setgid の親の下で 02700 になる展開先も採用できる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_prepare_accepts_setgid_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = tmp("setgid");
+        std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o2755)).expect("setgid");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        c.publish().expect("publish");
+        assert!(c.is_published());
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 返す経路は正規化済みで、等価な書き方の `root.path` でも同じ場所に作る。

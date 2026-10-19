@@ -270,7 +270,11 @@ fn unpack_rootfs(
         return Err(e);
     }
     if let Err(e) = created.publish() {
-        remove_created_rootfs(recorder, created);
+        // 改名前の失敗だけ非公開の木を消す。改名後の検証失敗は公開済みで、並行する create が使いうるため
+        // 残す（OCI-7 の使用中 rootfs の保持。#854 の起動時照合・手動で回収する）。
+        if !created.is_published() {
+            remove_created_rootfs(recorder, created);
+        }
         return Err(e);
     }
     // 公開後の失敗では rootfs を消さずに残す（OCI-7 の使用中 rootfs の保持）。公開済みの名前は並行する通常の
@@ -403,6 +407,10 @@ fn reject_unapplied(config: &OciConfig) -> Result<(), TraitError> {
 /// `root.path` が bundle 配下に収まり（bundle 外の絶対指定は拒否）、bundle 配下の全要素が
 /// symlink でない存在するディレクトリであることを確認する。
 pub(super) fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<PathBuf, TraitError> {
+    // 展開中の非公開の木（予約名）を通常の create が rootfs として採用しない（OCI-7）。
+    if super::image_rootfs::has_staging_component(root_path) {
+        return Err(invalid("root.path must not use a reserved staging name"));
+    }
     if root_path
         .components()
         .any(|c| matches!(c, Component::ParentDir))

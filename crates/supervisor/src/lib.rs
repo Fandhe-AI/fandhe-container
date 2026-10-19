@@ -66,7 +66,7 @@ mod deadline_store;
 pub mod exec;
 pub mod health;
 pub mod healthcheck;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(target_os = "linux", test))]
 mod id_model;
 pub mod inspect;
 pub mod launcher;

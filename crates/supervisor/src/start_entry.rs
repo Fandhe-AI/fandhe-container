@@ -1792,6 +1792,9 @@ mod linux {
         root: PathBuf,
         /// 自プロセスの資格情報と subuid / subgid の設定から決めた権限モデル。決められなければ手順 4 がそのエラーで止める。
         privilege: Result<LaunchPrivilege, TraitError>,
+        /// 資格情報の検証だけで決めた権限モデル（rootful の拒否のみ。subuid / subgid・passwd に依存しない）。
+        /// 残存確認の launcher（`recover_interrupted`）はこちらだけを使う（CORE-2・CORE-6）。
+        recovery_privilege: Result<IsolationPrivilege, TraitError>,
         cgroup: Option<HeldCgroup>,
         audit: Option<Arc<dyn AuditSink>>,
         /// 退避で一緒に移す同伴プロセスの PID（監査 helper。`DelegatedCgroup::with_companions`）。
@@ -1935,7 +1938,9 @@ mod linux {
         /// 状態ルート（`--root`）から作る。権限モデルは自プロセスの資格情報から決める（`/proc/self/status` は
         /// dumpable 0 の影響を受ける `/proc/self` の所有者ではなく、内容を読む）。
         pub fn new(root: PathBuf) -> Self {
-            let privilege = read_self_status().and_then(|text| {
+            let status = read_self_status();
+            let recovery_privilege = status.clone().and_then(|text| privilege_for_status(&text));
+            let privilege = status.and_then(|text| {
                 resolve_launch_privilege(
                     &text,
                     Path::new("/etc/passwd"),
@@ -1946,6 +1951,7 @@ mod linux {
             Self {
                 root,
                 privilege,
+                recovery_privilege,
                 cgroup: None,
                 audit: None,
                 companions: Vec::new(),
@@ -1963,17 +1969,16 @@ mod linux {
             &self,
             with_mapping: bool,
         ) -> Result<ProductionLauncherBuilder, TraitError> {
+            if !with_mapping {
+                // 資格情報の検証だけで作る。subuid / subgid・passwd の検証結果（`self.privilege`）には依存しない。
+                let privilege = self.recovery_privilege.clone()?;
+                return Ok(ProductionLauncher::builder().privilege(privilege));
+            }
             let decided = self.privilege.clone()?;
-            let mapped = with_mapping && decided.subordinate.is_some();
-            let privilege = if with_mapping || decided.subordinate.is_none() {
-                decided.privilege
-            } else {
-                IsolationPrivilege::RootlessSingleId
-            };
-            let builder = ProductionLauncher::builder().privilege(privilege);
+            let builder = ProductionLauncher::builder().privilege(decided.privilege);
             Ok(match decided.subordinate {
-                Some(source) if mapped => builder.subordinate_ids(source),
-                _ => builder,
+                Some(source) => builder.subordinate_ids(source),
+                None => builder,
             })
         }
 
@@ -2585,6 +2590,7 @@ mod linux {
                 privilege: IsolationPrivilege::RootlessSubordinateIds,
                 subordinate: Some(source),
             });
+            deps.recovery_privilege = Ok(IsolationPrivilege::RootlessSingleId);
             let sink: Arc<dyn AuditSink> = Arc::new(NullSink);
             let strict = deps
                 .launcher_builder(true)
@@ -2598,6 +2604,13 @@ mod linux {
                 .audit_sink(sink)
                 .build();
             assert!(recovery.is_ok());
+            // subuid / subgid の設定が壊れて `privilege` が Err でも、回復用の構築器は作れる（CORE-2・CORE-6）。
+            deps.privilege = Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "subordinate id configuration is unusable",
+            ));
+            assert!(deps.launcher_builder(true).is_err());
+            assert!(deps.launcher_builder(false).is_ok());
             let _ = std::fs::remove_dir_all(&dir);
         }
 

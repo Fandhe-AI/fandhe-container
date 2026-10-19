@@ -17,7 +17,8 @@
 //! 未実装（後続 issue の担当。実装済みを装わない。REPAIR-3）:
 //! - ディスクへの永続化・再起動時の照合（#853・#854・#851）
 //! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force`・実削除は #481
-//! - GC 本体・`image tag`/`prune`・`rm` の CLI 配線（#479〜#481・#476）。`image ls`/`system df` の集計 API は
+//! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（CLI 経路と永続化は未実装）
+//! - GC 本体・`prune`・`rm` の CLI 配線（#480・#481・#476）。`image ls`/`system df` の集計 API は
 //!   `usage`（#478・TASK-183.3）で実装済み（CLI 経路は未実装）、pull へのリース組み込み（#474・#475）
 //! - テーブル全体の件数上限（永続化の読み込み側で判断する）
 //!
@@ -42,6 +43,9 @@ use crate::reference::{Digest, RegistryHost, Repository, Tag};
 mod usage;
 
 pub use usage::{CacheUsage, DiskUsage, ImageEntry, ImageList, ImageUsage, MAX_CACHE_SCAN_ENTRIES};
+
+mod tag;
+pub use tag::{ImageTagChange, ImageTagOutcome, ImageTagSource};
 
 mod store;
 pub use store::{

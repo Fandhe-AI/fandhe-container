@@ -111,6 +111,11 @@ impl ImageStore {
         self
     }
 
+    /// 記録先。`tag` 等の同モジュール階層の操作入口が、ガード取得後の操作を計装するために使う。
+    pub(super) fn recorder(&self) -> &dyn OciOpRecorder {
+        &*self.recorder
+    }
+
     /// ストア root。
     pub fn root(&self) -> &Path {
         &self.root

@@ -116,8 +116,9 @@ fn ruleset_from_recorded_detection(
     record: &LaunchIsolationRecord,
 ) -> Result<LandlockRuleset, ExecError> {
     let support = detected.map_err(from_landlock_unavailable)?;
+    // カーネル監査のモードは記録ではなく今のカーネルの ABI から決める（SEC-4・#2026）。
     let ruleset = record
-        .landlock_ruleset()
+        .landlock_ruleset(support.audit_mode())
         .map_err(|e| ExecError::new(ErrorCode::Internal, IsolationStage::Landlock, e.message()))?;
     if !ruleset
         .handled_access_fs()
@@ -453,6 +454,7 @@ pub(super) mod testing {
                 skipped_empty: 0,
                 implicit_mounts_verified: 0,
                 mounts_verified: 0,
+                audit: ruleset.audit_mode(),
             }),
         }
     }
@@ -519,12 +521,41 @@ mod tests {
         assert_eq!(ok.rules()[0].allowed.bits(), 0x5);
     }
 
+    /// SEC-4・#2026: exec の再適用のモードは記録ではなく今のカーネルの ABI から決まる。
+    #[test]
+    fn sec4_reapply_uses_current_abi_for_audit() {
+        use crate::landlock::LandlockAuditMode;
+        let ruleset = crate::landlock::LandlockRuleset::from_recorded(
+            crate::landlock::AccessFs::from_bits(0x1FFF).expect("handled"),
+            vec![crate::landlock::PathRule {
+                path: crate::landlock::RulePath::Root,
+                allowed: crate::landlock::AccessFs::from_bits(0x1).expect("allowed"),
+                origin: crate::landlock::RuleOrigin::Root,
+            }],
+            crate::landlock::landlock_audit_mode_for_abi(6),
+        );
+        let record = LaunchIsolationRecord::new(RootIdentity::new(1, 2), &ruleset).expect("record");
+        let at7 = ruleset_from_recorded_detection(crate::landlock::evaluate_abi(7), &record)
+            .expect("abi7");
+        assert_eq!(at7.audit_mode(), LandlockAuditMode::KernelAuditRequested);
+        let at6 = ruleset_from_recorded_detection(crate::landlock::evaluate_abi(6), &record)
+            .expect("abi6");
+        assert_eq!(
+            at6.audit_mode(),
+            LandlockAuditMode::Unavailable {
+                detected: 6,
+                required: 7
+            }
+        );
+    }
+
     /// SUP-6・SEC-1(#2007): rootfs を fstat できない(`root` が `None`)と、固定文言の `Internal` で拒否する。
     #[test]
     fn sup6_2007_launch_isolation_from_ruleset_refuses_missing_root() {
         let ruleset = crate::landlock::LandlockRuleset::from_recorded(
             crate::landlock::AccessFs::from_bits(0x1FFF).expect("handled"),
             Vec::new(),
+            crate::landlock::landlock_audit_mode_for_abi(6),
         );
         let e = launch_isolation_from_ruleset(&ruleset, None).expect_err("refused");
         assert_eq!(e.code, ErrorCode::Internal);
@@ -578,7 +609,9 @@ mod tests {
             recorded,
             vec![(0, "/data".to_owned()), (1, "/cache".to_owned())]
         );
-        let rebuilt = record.landlock_ruleset().expect("rebuilt");
+        let rebuilt = record
+            .landlock_ruleset(ruleset.audit_mode())
+            .expect("rebuilt");
         assert_eq!(rebuilt.rules(), ruleset.rules());
     }
 

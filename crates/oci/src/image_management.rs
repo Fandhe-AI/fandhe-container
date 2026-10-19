@@ -20,7 +20,9 @@
 //!   `remove` で実装済み（永続化・fsync・削除途中のクラッシュの再試行は #851、CLI 配線は未実装）
 //! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（CLI 経路と永続化は未実装）
 //! - `image prune` 本体は `prune` モジュールで実装済み（#476）。`rm`・`prune` の CLI 配線（#476・#480・#481）。`image ls`/`system df` の集計 API は
-//!   `usage`（#478・TASK-183.3）で実装済み（CLI 経路は未実装）、pull へのリース組み込み（#474・#475）
+//!   `usage`（#478・TASK-183.3）で実装済み（CLI 経路は未実装）
+//! - pull のリース登録とステージング書き込みは `pull`（#474・TASK-183.9）で実装済み。公開と
+//!   失敗時のロールバックは #475
 //! - テーブル全体の件数上限（永続化の読み込み側で判断する）
 //!
 //! core の `ContainerId` との対応づけ（#853・TASK-183.8.1）: core は oci に依存せず、core 側の
@@ -50,6 +52,9 @@ pub use prune::{ImagePruneOutcome, ImagePrunePlan};
 mod usage;
 
 pub use usage::{CacheUsage, DiskUsage, ImageEntry, ImageList, ImageUsage, MAX_CACHE_SCAN_ENTRIES};
+
+mod pull;
+pub use pull::{BlobReuse, LeasedBlob, PullSession};
 
 mod tag;
 pub use tag::{ImageTagChange, ImageTagOutcome, ImageTagSource};
@@ -126,7 +131,8 @@ impl fmt::Display for ContainerRefId {
     }
 }
 
-/// 進行中の `pull` の識別子（検証済みの不透明値）。生成方法・形式は #474・#852 が決める。
+/// 進行中の `pull` の識別子（検証済みの不透明値）。新規の生成は `PullId::generate`
+/// （`<pid>-<UNIX 時刻ナノ秒>-<連番>`。#474）。クラッシュ後の回収の判断は #852。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PullId(String);
 

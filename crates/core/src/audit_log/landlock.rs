@@ -21,6 +21,10 @@
 //!
 //! # 将来仕様（REPAIR-3: 実装済みを装わない）
 //!
+//! ワークロードの拒否は ABI 7 以上のカーネル監査（`AUDIT_LANDLOCK_ACCESS`・`AUDIT_LANDLOCK_DOMAIN`。読み手は
+//! auditd 等の外部）で記録する。`landlock_restrict_self` へのログ制御フラグの指定と、ABI 7 未満での縮退の表示は
+//! 実装済み（`crate::landlock::LandlockAuditMode`・#2026）。本モジュールのレコードはワークロードの拒否の証拠に使わない。
+//!
 //! Landlock にはユーザー空間への違反通知経路がなく、`EACCES` は呼び出したプロセス自身にしか返らない。
 //! したがってコンテナのワークロードプロセスが受けた拒否の捕捉（Linux 6.15+ の Landlock 監査ログ・auditd 連携）は
 //! 未実装（#840 は主経路失敗時のフォールバックのみ）、エントリポイントの `execveat` が `EACCES` を返した場合の配線は後続作業で、本モジュールは未対応。

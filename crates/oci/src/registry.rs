@@ -354,6 +354,8 @@ impl RegistryClient {
     /// `Content-Length` の値でアロケーションしない。書き込みは `dest` + `.part` へ行い、サイズ一致を確認して
     /// 宛先を置き換えない方式（hard_link）で公開する（失敗時は自分が作った `.part` だけを削除し、部分ファイルを
     /// `dest` に公開しない）。`dest` が既に存在すれば（転送中に作られた場合も）`FailedPrecondition`。親ディレクトリは呼び出し側（ステージング領域）が用意する。
+    /// pull では `dest` に `PullSession::staged_blob_path`（`<root>/staging/<pull-id>/<hex>`）を渡し、
+    /// `blobs/sha256` へ直接書かない（OCI-7・#474）。
     ///
     /// CDN へのリダイレクト（301/302/303/307/308）は `max_redirects` 回まで手動で追従する。遷移先は絶対 https
     /// URL のみ許可し、`Authorization` を送らず公開 IP のみへ接続する（SSRF・資格情報漏えい対策）。Location は

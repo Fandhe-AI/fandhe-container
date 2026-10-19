@@ -112,6 +112,8 @@ pub(crate) use consts::{
     EMFILE, ENFILE, ENOENT, ENOEXEC, ENOMEM, ENOSPC, ENOSYS, ENOTDIR, ENOTEMPTY, EOPNOTSUPP, EPERM,
     EPROTONOSUPPORT, ESRCH,
 };
+// `landlock_restrict_self` の flags（ABI 7 の新規 exec のログ有効化。`crate::exec` の Landlock 適用が渡す。SEC-4・#2026）。
+pub(crate) use consts::LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON;
 // 診断ログの待たない送信（`send_nonblocking_unix`）の失敗分類に使う errno（`crate::exec::diagnostic`）。
 pub(crate) use consts::{EAGAIN, EPIPE};
 
@@ -429,6 +431,8 @@ mod consts {
     pub const SYS_LANDLOCK_RESTRICT_SELF: ArchSysNo = ArchSysNo::new(446);
     // include/uapi/linux/landlock.h の `enum landlock_rule_type` の `LANDLOCK_RULE_PATH_BENEATH`。
     pub const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+    // include/uapi/linux/landlock.h の `LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON`（`1U << 1`。ABI 7。SEC-4・#2026）。
+    pub const LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON: u32 = 2;
     // include/uapi/asm-generic/errno.h の `EOPNOTSUPP`（x86_64 は上書きしない）。
     pub const EOPNOTSUPP: i32 = 95;
     pub const ELOOP: i32 = 40;
@@ -768,6 +772,8 @@ mod consts {
     pub const SYS_LANDLOCK_RESTRICT_SELF: ArchSysNo = ArchSysNo::new(446);
     // include/uapi/linux/landlock.h の `enum landlock_rule_type` の `LANDLOCK_RULE_PATH_BENEATH`。
     pub const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+    // include/uapi/linux/landlock.h の `LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON`（`1U << 1`。ABI 7。SEC-4・#2026）。
+    pub const LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON: u32 = 2;
     // include/uapi/asm-generic/errno.h の `EOPNOTSUPP`（arm64 は上書きしない）。
     pub const EOPNOTSUPP: i32 = 95;
     pub const ELOOP: i32 = 40;
@@ -1041,6 +1047,7 @@ mod consts {
     pub const SYS_LANDLOCK_ADD_RULE: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const SYS_LANDLOCK_RESTRICT_SELF: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const LANDLOCK_RULE_PATH_BENEATH: u32 = 0;
+    pub const LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON: u32 = 0;
     pub const EOPNOTSUPP: i32 = -15;
     pub const ELOOP: i32 = -6;
     pub const ESRCH: i32 = -8;
@@ -4981,15 +4988,17 @@ pub(crate) fn landlock_add_path_beneath(
 ///
 /// 適用は不可逆で、呼び出したスレッド（と以後 fork・clone する子）にのみ効く。`NO_NEW_PRIVS` と
 /// 単一スレッドの事前確認は呼び出し側（`crate::landlock`）の契約で、本関数は検証しない。
-/// flags は 0（ABI 7 のログ系フラグは使わない）。
-pub(crate) fn landlock_restrict_self(ruleset: BorrowedFd<'_>) -> Result<(), SysError> {
+/// `flags` は ABI に応じた既知のビットだけを呼び出し側（`crate::landlock::RestrictSelfFlags`）が選ぶ契約で、
+/// 未知のビットはカーネルが `EINVAL` で拒否する（SEC-4・#2026）。
+pub(crate) fn landlock_restrict_self(ruleset: BorrowedFd<'_>, flags: u32) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
     let nr = consts::SYS_LANDLOCK_RESTRICT_SELF.get()?;
-    // SAFETY: 引数は生存中の `BorrowedFd` の fd 番号と flags 0 の整数のみでポインタを渡さない。
+    // SAFETY: 引数は生存中の `BorrowedFd` の fd 番号と flags の整数のみでポインタを渡さない。
     // メモリには触れず、影響は呼び出したスレッドの Landlock ドメインの追加（権限を減らす方向）のみ。
-    let rc = unsafe { syscall(nr, i64::from(ruleset.as_raw_fd()), 0u64) };
+    // flags はドメインの監査ログの設定だけで、許可する権利は広がらない。
+    let rc = unsafe { syscall(nr, i64::from(ruleset.as_raw_fd()), u64::from(flags)) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
@@ -5268,6 +5277,7 @@ mod tests {
             Ok(444)
         );
         assert_eq!(consts::LANDLOCK_CREATE_RULESET_VERSION, 1);
+        assert_eq!(consts::LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON, 2);
         assert_eq!(consts::EOPNOTSUPP, 95);
     }
 

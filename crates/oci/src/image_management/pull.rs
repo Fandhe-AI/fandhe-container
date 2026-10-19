@@ -42,7 +42,7 @@
 //! - `system df` でのステージング容量の集計。永続化・fsync は #853・#854・#851。
 //! - cri の `image_pull` からの配線。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -53,7 +53,7 @@ use super::usage::{blob_path, check_blob_dirs};
 use super::{ImageStore, MAX_COMPOSITION_LAYERS, ManifestComposition, PullId, TagKey};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{OciOpKind, OciOpRecorder, record_oci_op};
-use crate::layer::{VerifiedBlob, verify_blob_digest_with};
+use crate::layer::{VerifiedBlob, verify_blob_digest, verify_blob_digest_with};
 use crate::reference::Digest;
 
 /// ストア root 直下のステージング領域名。GC・`image ls` の走査対象外。
@@ -137,7 +137,8 @@ pub struct PullSession<'a> {
     leased: BTreeSet<Digest>,
     /// このセッションのステージングで digest 検証に成功した digest（[`PullSession::verify_staged_blob`]）。
     /// 公開できる新規 blob はこの集合にあるものに限る。
-    verified: BTreeSet<Digest>,
+    /// 値は検証で確定したサイズ。公開直前の再ハッシュの読み取り上限に使う。
+    verified: BTreeMap<Digest, u64>,
 }
 
 /// 公開の要求（manifest・構成・付けるタグ）。TASK-183.10・OCI-7。
@@ -295,7 +296,7 @@ impl ImageStore {
             staging_dir: dir,
             touched: BTreeSet::new(),
             leased: BTreeSet::new(),
-            verified: BTreeSet::new(),
+            verified: BTreeMap::new(),
         })
     }
 
@@ -457,8 +458,10 @@ impl PullSession<'_> {
             }
             Err(e) => return Err(io_err(&e, "failed to stat staged blob")),
         }
+        // 再検証の開始時に以前の検証結果を無効化する（失敗した再検証の前の登録を残さない）。
+        self.verified.remove(digest);
         let v = verify_blob_digest_with(self.store.recorder(), &path, digest, max_bytes)?;
-        self.verified.insert(digest.clone());
+        self.verified.insert(digest.clone(), v.size);
         Ok(v)
     }
 
@@ -542,7 +545,7 @@ impl PullSession<'_> {
         for b in req.composition.blobs() {
             if self.leased.contains(b) {
                 reused.push(b.clone());
-            } else if self.verified.contains(b) {
+            } else if self.verified.contains_key(b) {
                 to_move.push(b.clone());
             } else {
                 return Err(err(
@@ -587,6 +590,10 @@ impl PullSession<'_> {
             for b in &to_move {
                 let src = self.staging_dir.join(hex_of(b)?);
                 let dst = blob_path(&root, b)?;
+                // 検証後にステージングのファイルが差し替わっても未検証の内容を公開しないよう、
+                // 公開直前に排他区間の下で再ハッシュする（OCI-1・OCI-7）。
+                let size = self.verified.get(b).copied().unwrap_or(0);
+                verify_blob_digest(&src, b, size)?;
                 match fs::hard_link(&src, &dst) {
                     Ok(()) => {
                         created.push(dst);
@@ -594,7 +601,30 @@ impl PullSession<'_> {
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         match fs::symlink_metadata(&dst) {
-                            Ok(m) if m.is_file() => present.push(b.clone()),
+                            Ok(m) if m.is_file() => {
+                                // 既存の宛先は内容を検証してから受け入れる。壊れていれば
+                                // 検証済みのステージングで原子的に置き換えて修復する。
+                                match verify_blob_digest(&dst, b, size) {
+                                    Ok(_) => present.push(b.clone()),
+                                    Err(e)
+                                        if matches!(
+                                            e.code(),
+                                            OciErrorCode::DataLoss
+                                                | OciErrorCode::ResourceExhausted
+                                        ) =>
+                                    {
+                                        fs::rename(&src, &dst).map_err(|_| {
+                                            err(
+                                                OciErrorCode::Internal,
+                                                "failed to repair corrupt blob",
+                                            )
+                                        })?;
+                                        moved.push(b.clone());
+                                        continue;
+                                    }
+                                    Err(e) => return Err(e),
+                                }
+                            }
                             _ => {
                                 return Err(err(
                                     OciErrorCode::FailedPrecondition,
@@ -1274,6 +1304,58 @@ mod tests {
             .unwrap();
         assert_eq!(out.already_present_blobs, vec![cfg.clone()]);
         assert_eq!(out.moved_blobs, vec![]);
+        assert_eq!(fs::read(root.blob(&cfg)).unwrap(), b"config-body");
+    }
+
+    /// OCI-1・OCI-7: 検証後にステージングが差し替えられても、未検証の内容は公開されない。
+    #[test]
+    fn oci7_publish_rejects_staged_file_swapped_after_verify() {
+        let root = Root::new("pub-swap");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let cfg = stage(&mut s, b"config-body");
+        let path = s.staged_blob_path(&cfg).unwrap();
+        fs::write(&path, b"evil-body").unwrap();
+        let comp = ManifestComposition::new(cfg.clone(), vec![]).unwrap();
+        let err = s
+            .publish(PullPublishRequest::new(manifest_digest(), comp))
+            .unwrap_err();
+        assert_eq!(err.code(), OciErrorCode::DataLoss);
+        assert!(!root.blob(&cfg).exists());
+    }
+
+    /// OCI-1・OCI-7: 再検証が失敗したら以前の検証結果は残らず、公開できない。
+    #[test]
+    fn oci7_failed_reverify_clears_verified_state() {
+        let root = Root::new("pub-reverify");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let cfg = stage(&mut s, b"config-body");
+        let path = s.staged_blob_path(&cfg).unwrap();
+        fs::write(&path, b"evil-body").unwrap();
+        let e = s.verify_staged_blob(&cfg, 1 << 20).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        let comp = ManifestComposition::new(cfg, vec![]).unwrap();
+        let err = s
+            .publish(PullPublishRequest::new(manifest_digest(), comp))
+            .unwrap_err();
+        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    }
+
+    /// OCI-7: 宛先に壊れた既存 blob があれば、検証済みのステージングで置き換えて修復する。
+    #[test]
+    fn oci7_publish_repairs_corrupt_existing_blob() {
+        let root = Root::new("pub-corrupt");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let cfg = stage(&mut s, b"config-body");
+        fs::write(root.blob(&cfg), b"corrupt").unwrap();
+        let comp = ManifestComposition::new(cfg.clone(), vec![]).unwrap();
+        let out = s
+            .publish(PullPublishRequest::new(manifest_digest(), comp))
+            .unwrap();
+        assert_eq!(out.moved_blobs, vec![cfg.clone()]);
+        assert_eq!(out.already_present_blobs, vec![]);
         assert_eq!(fs::read(root.blob(&cfg)).unwrap(), b"config-body");
     }
 

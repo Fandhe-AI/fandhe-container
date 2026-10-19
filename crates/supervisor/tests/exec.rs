@@ -319,8 +319,7 @@ mod linux {
         wait_until("the host probe to finish its steps", || {
             work.join("data/unshare_ok").exists()
         });
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_and_reap(&mut child);
         assert!(
             !work.join("data/unshare_denied").exists(),
             "the host probe must see -EINVAL from setns(0, 0), not -EPERM"
@@ -432,8 +431,7 @@ mod linux {
         // 親（orchestrator）が stdin を閉じるまで待つ。
         let mut sink = Vec::new();
         let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
-        let _ = pid1.kill();
-        let _ = pid1.wait();
+        kill_and_reap(&mut pid1);
     }
 
     /// `--pid1`: launch と同じ手順で `pivot_root` まで進み、合図ファイルを置いて待機する。
@@ -485,19 +483,41 @@ mod linux {
             drop(self.stdin.take());
             if self.rootless {
                 // `--kill-child` が pid1 を道連れにする。
-                let _ = self.a.kill();
-                let _ = self.a.wait();
+                kill_and_reap(&mut self.a);
             }
             let deadline = Instant::now() + Duration::from_secs(10);
             while self.a.try_wait().ok().flatten().is_none() {
                 if Instant::now() >= deadline {
-                    let _ = self.a.kill();
-                    let _ = self.a.wait();
+                    kill_and_reap(&mut self.a);
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            remove_cgroup(&self.cgroup_dir);
+            // cgroup 作成前（起動途中の失敗）は空のまま。
+            if !self.cgroup_dir.as_os_str().is_empty() {
+                remove_cgroup(&self.cgroup_dir);
+            }
+        }
+    }
+
+    /// 子を kill し、期限つきで回収する（`Child::wait()` は期限なしのため使わない。REPAIR-5）。
+    /// 回収できなければ標準エラーに記録して戻る（drop 内からも呼ぶため panic しない）。
+    fn kill_and_reap(child: &mut Child) {
+        let _ = child.kill();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "exec: child {} was not reaped within 10s after kill",
+                    child.id()
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -536,8 +556,11 @@ mod linux {
         };
         let dir = PathBuf::from(format!("/sys/fs/cgroup{path}"));
         fs::create_dir(&dir).unwrap_or_else(|e| panic!("create the container cgroup: {e}"));
-        fs::write(dir.join("cgroup.procs"), pid.to_string())
-            .unwrap_or_else(|e| panic!("move pid1 into the container cgroup: {e}"));
+        if let Err(e) = fs::write(dir.join("cgroup.procs"), pid.to_string()) {
+            // 作った cgroup を残さない。
+            let _ = fs::remove_dir(&dir);
+            panic!("move pid1 into the container cgroup: {e}");
+        }
         (dir, path)
     }
 
@@ -627,13 +650,23 @@ mod linux {
         .stdout(Stdio::null())
         .spawn()
         .expect("spawn container process");
+        // spawn 直後から RAII ガードで保持する。以降の panic（待ち合わせ・cgroup 作成・prlimit の失敗）でも
+        // drop が期限つきで kill・回収し、作成済みの cgroup を消す（pid1 と名前空間を残さない）。
         let stdin = a.stdin.take();
+        let mut container = Container {
+            stdin,
+            rootless,
+            a,
+            pid1: 0,
+            cgroup_dir: PathBuf::new(),
+            cgroup_path: String::new(),
+        };
         let ready = bundle.rootfs().join(&ready_name);
         let pid_file = bundle.dir.join(format!("pid1-ready-{tag}"));
         let mut found = None;
         wait_until("pid1 to pivot into the rootfs", || {
             if rootless {
-                found = nested_pid1_child(a.id());
+                found = nested_pid1_child(container.a.id());
                 ready.exists() && found.is_some()
             } else {
                 ready.exists() && pid_file.exists()
@@ -648,7 +681,10 @@ mod linux {
                 .expect("pid1 pid"),
         };
         let scope = own_cgroup_path();
+        container.pid1 = pid1;
         let (cgroup_dir, cgroup_path) = create_container_cgroup(&scope, instance, pid1);
+        container.cgroup_dir = cgroup_dir;
+        container.cgroup_path = cgroup_path;
         // launch の `--ulimit` 相当: pid1 の NOFILE を既定と異なる値にし、exec プロセスが「pid1 と同じ値」を
         // 受け取ること（呼び出し元の既定値のままではないこと）を区別できるようにする。
         let prlimit = Command::new("prlimit")
@@ -678,14 +714,7 @@ mod linux {
             Some(0),
             "prlimit must raise pid1's NOFILE soft limit"
         );
-        Container {
-            stdin,
-            rootless,
-            a,
-            pid1,
-            cgroup_dir,
-            cgroup_path,
-        }
+        container
     }
 
     // ---------------------------------------------------------------- joiner（再入）
@@ -973,8 +1002,7 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                let _ = joiner.kill();
-                let _ = joiner.wait();
+                kill_and_reap(&mut joiner);
                 panic!("joiner did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1333,8 +1361,7 @@ mod linux {
         struct Guard(Child);
         impl Drop for Guard {
             fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
+                kill_and_reap(&mut self.0);
             }
         }
         let guard = Guard(unshare);

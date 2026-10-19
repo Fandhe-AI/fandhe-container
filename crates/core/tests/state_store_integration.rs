@@ -24,8 +24,26 @@
 //! 段階的な同期で必ず作る。子は途中の `SAME_ID_CHECKPOINT` 回で止まり、親が途中値を観測して
 //! resume マーカーを書いてから残りを再開する。
 
-/// OCI-5・CLI-1: Linux 以外では状態ルートを作らずに `Unimplemented` を返す。
-#[cfg(not(target_os = "linux"))]
+/// OCI-5・SEC-4・CLI-1（#2247）: macOS では `open` が通り、状態ルートが 0700 で作られる。
+#[cfg(target_os = "macos")]
+#[test]
+fn oci5_open_works_on_macos() {
+    use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("fandhe-state-it-macos-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    FileStateStore::open(StateRoot::from_override(root.clone()).unwrap()).unwrap();
+    assert_eq!(
+        std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// OCI-5・CLI-1: Linux・macOS 以外（Windows）では状態ルートを作らずに `Unimplemented` を返す。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn oci5_open_is_unimplemented_outside_linux() {
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
@@ -36,7 +54,7 @@ fn oci5_open_is_unimplemented_outside_linux() {
     assert_eq!(e.code(), ErrorCode::Unimplemented);
     assert_eq!(
         e.message(),
-        "file state store requires Linux to verify the state root"
+        "file state store requires Linux or macOS to verify the state root"
     );
     assert!(!root.exists());
 }

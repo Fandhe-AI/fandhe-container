@@ -75,8 +75,10 @@
 //!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）
 //!
-//! - `exec`・`sys` は `lib.rs` の `#[cfg(target_os = "linux")]` でビルド対象から外れ、
-//!   `sys.rs` も内側の `#![cfg]` で二重に隔離している。`traits` は OS 非依存で 3 OS に公開される
+//! - `exec`・`sys`（`sys.rs`）は `lib.rs` の `#[cfg(target_os = "linux")]` でビルド対象から外れ、
+//!   `sys.rs` も内側の `#![cfg]` で二重に隔離している。macOS には別ファイル `sys/macos.rs`
+//!   （実効 UID・`O_NOFOLLOW | O_NONBLOCK`・拡張 ACL の検出のみ。`state_store` 用。#2247・OCI-5）を
+//!   `#[cfg(target_os = "macos")]` で取り込み、Linux の宣言は macOS に漏らさない。`traits` は OS 非依存で 3 OS に公開される
 //! - `sys` の `extern "C"` 宣言と `unsafe` は glibc / musl の型幅・syscall 番号を前提とするため、
 //!   前提の成り立たない macOS / Windows でコンパイル・リンクさせない（安全上の理由での隔離）
 //! - 新しい Linux 専用コードは `exec` / `sys` 配下に置く。それ以外に置く場合は
@@ -124,6 +126,10 @@ pub mod sanitize;
 pub mod seccomp;
 pub mod state_store;
 #[cfg(target_os = "linux")]
+mod sys;
+// macOS 向けの `sys` は別ファイル（Linux の宣言を macOS へ漏らさない。#2247・OCI-5）。
+#[cfg(target_os = "macos")]
+#[path = "sys/macos.rs"]
 mod sys;
 #[cfg(test)]
 mod test_support;

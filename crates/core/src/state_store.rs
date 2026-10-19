@@ -66,15 +66,23 @@
 //!   逆転（デッドロック）は起きない
 //! - エラーメッセージは固定の英語文言のみで、パス・errno を含めない
 //!
-//! # 対応プラットフォーム（Linux 限定。fail-closed）
+//! # 対応プラットフォーム（Linux・macOS。Windows は fail-closed）
 //!
-//! [`FileStateStore::open`] は Linux 以外では何も作らずに `Unimplemented` を返す。信頼境界の検査
-//! （所有者 = 実効 UID・権限ビット）は Linux でしか完結しないため（Windows の ACL・所有者 SID の
-//! 検査と保護 DACL での作成、macOS の実効 UID の取得には `sys` の FFI が要るが、`sys` は Linux 限定）。
-//! macOS / Windows では状態ルートをゲスト VM 内の Linux パスに置く（OCI-5）ため、ホスト側で本実装を
-//! 使う経路はない。start の所有ロック（`BundleLock::acquire`）が Linux 以外で `Unimplemented` を返すのと
-//! 同じ扱いである（CLI-1）。Linux でも `open(2)` フラグの値を `sys` が持たないアーキテクチャ
-//! （x86_64・aarch64 以外）では同様に `Unimplemented`
+//! - Linux: 所有者 = 実効 UID・権限ビット（0700）・祖先の書き込み権限・symlink 拒否で信頼境界を検査する
+//! - macOS（#2247・OCI-5・SEC-4・CLI-1）: Linux と同じ検査に加え、状態ルート・`<id>/`・祖先に拡張 ACL が
+//!   付いていたら中身を解釈せずに拒否する（ACL は mode bits を迂回して他者に書き込みを許せるため。#1539 と
+//!   同じ方針）。実効 UID・`O_NOFOLLOW | O_NONBLOCK`・ACL の検出は `sys/macos.rs` の薄いラッパー。
+//!   制約: 既定で deny の ACL が付いた場所（ホームディレクトリ等）の下には状態ルートを置けない。既定の
+//!   状態ルート（[`StateRoot::resolve`]）は Linux のみで、macOS では上書き指定が必須
+//! - Windows: [`FileStateStore::open`] は何も作らずに `Unimplemented`（fail-closed）。所有者 SID の照合と
+//!   保護 DACL でのディレクトリ作成には Win32 FFI が要り、core は `windows-sys` に依存しないため
+//!   （依存の追加はユーザー承認事項。REPAIR-3）
+//! - Linux・macOS でも、`open(2)` フラグの値を `sys` が持たないアーキテクチャ（x86_64・aarch64 以外）では
+//!   同様に `Unimplemented`
+//!
+//! macOS で `open` が通っても、監査の記録先（`FileAuditSink`）は主経路の隔離（fork）・fd 相対 open・
+//! 代替経路が Linux 専用のため、記録は `SinkFailed` のままである（REPAIR-3。`crate::audit_log::FileAuditSink`
+//! の「未実装」節）。検査は `openat` 系の fd 基点ではなくパス基点で、TOCTOU の制約は Linux と同じ
 
 use std::collections::{BTreeMap, BinaryHeap};
 use std::ffi::OsString;
@@ -422,8 +430,8 @@ impl FileStateStore {
     /// ルートがなければ 0700 で作る。親ディレクトリは作らない（`/run` や
     /// `$XDG_RUNTIME_DIR` がなければ `NotFound`）。symlink・ディレクトリでないもの・
     /// 他ユーザー所有・group / other に権限ビットのある（0700 でない）ルートは `PermissionDenied`。
-    /// Linux 以外では何も作らずに `Unimplemented`（信頼境界を検査できないため。fail-closed。
-    /// モジュール doc「対応プラットフォーム」）。
+    /// Windows では何も作らずに `Unimplemented`（信頼境界を検査できないため。fail-closed。macOS は拡張 ACL
+    /// も拒否する。モジュール doc「対応プラットフォーム」）。
     pub fn open(root: StateRoot) -> Result<Self, TraitError> {
         // 副作用（ルートの作成）より前に拒否する。
         ensure_supported_platform()?;
@@ -542,7 +550,7 @@ impl FileStateStore {
     fn record_file(&self, id: &ContainerId) -> Result<RecordEntry, TraitError> {
         let dir = self.record_dir(id);
         match fs::symlink_metadata(&dir) {
-            Ok(m) if m.is_dir() => verify_record_dir(&m)?,
+            Ok(m) if m.is_dir() => verify_record_dir(&m, &dir)?,
             Ok(_) => {
                 return Ok(RecordEntry::Malformed(err(
                     ErrorCode::PermissionDenied,
@@ -867,7 +875,7 @@ impl StateStore for FileStateStore {
                 // 残骸ディレクトリの再利用。symlink などは read_record が拒否済みだが、
                 // 種別を再確認してから書く（多重防御）。
                 match fs::symlink_metadata(&dir) {
-                    Ok(m) if m.is_dir() => verify_record_dir(&m)?,
+                    Ok(m) if m.is_dir() => verify_record_dir(&m, &dir)?,
                     _ => {
                         return Err(err(
                             ErrorCode::PermissionDenied,
@@ -1039,13 +1047,13 @@ impl StateStore for FileStateStore {
     }
 }
 
-/// 本実装を使えるプラットフォームか確かめる（Linux のみ。モジュール doc「対応プラットフォーム」）。
+/// 本実装を使えるプラットフォームか確かめる（Linux・macOS。モジュール doc「対応プラットフォーム」）。
 ///
 /// `open` の先頭で呼ぶ。実行時の `?` で拒否するため、以降のコードは 3 OS でコンパイル・型検査される。
 ///
-/// Linux でも、`open_nowait` のフラグ（`O_NOFOLLOW | O_NONBLOCK`）の値を持たない対応外
+/// Linux・macOS でも、`open_nowait` のフラグ（`O_NOFOLLOW | O_NONBLOCK`）の値を持たない対応外
 /// アーキテクチャ（x86_64・aarch64 以外）では拒否する（FIFO 等で open が止まるのを防げないため）。
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_supported_platform() -> Result<(), TraitError> {
     if crate::sys::nofollow_nonblock_open_flags().is_none() {
         return Err(err(
@@ -1056,13 +1064,33 @@ fn ensure_supported_platform() -> Result<(), TraitError> {
     Ok(())
 }
 
-/// Linux 以外では状態ルートの信頼境界（所有者・ACL）を検査できないため拒否する（fail-closed）。
-#[cfg(not(target_os = "linux"))]
+/// Linux・macOS 以外（Windows）では状態ルートの信頼境界（所有者 SID・DACL）を検査できないため
+/// 拒否する（fail-closed。検査には Win32 FFI が要り、core は `windows-sys` に依存しない）。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn ensure_supported_platform() -> Result<(), TraitError> {
     Err(err(
         ErrorCode::Unimplemented,
-        "file state store requires Linux to verify the state root",
+        "file state store requires Linux or macOS to verify the state root",
     ))
+}
+
+/// macOS の拡張 ACL（mode bits を迂回して他者に書き込みを許せる）が `path` に付いていたら拒否する。
+/// 中身は解釈しない（付いているだけで拒否。#1539 と同じ方針。fail-closed）。symlink は辿らない。
+/// 制約: 既定で deny の ACL が付いた場所（ホームディレクトリ等）の下には状態ルートを置けない。
+#[cfg(target_os = "macos")]
+fn reject_extended_acl(path: &Path, message: &'static str) -> Result<(), TraitError> {
+    match crate::sys::has_extended_acl(path) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(err(ErrorCode::PermissionDenied, message)),
+        Err(_) => Err(internal("failed to inspect the ACL of a state entry")),
+    }
+}
+
+/// macOS 以外では拡張 ACL の検査は不要（Linux は mode bits と所有者で判定する）。
+#[cfg(not(target_os = "macos"))]
+fn reject_extended_acl(path: &Path, message: &'static str) -> Result<(), TraitError> {
+    let _ = (path, message);
+    Ok(())
 }
 
 /// 0700（unix）でディレクトリを作る builder。`let mut` が OS ごとに不要になる警告を避けるため
@@ -1094,8 +1122,8 @@ fn canonical_root(path: &Path) -> Result<PathBuf, TraitError> {
 /// 祖先ディレクトリが第三者にすり替えられないか検査する。
 ///
 /// 各祖先は、group / other 書き込み不可（sticky ビット付きは許可。`/tmp` 等）であり、
-/// root か現在のユーザーの所有でなければ `PermissionDenied`。Linux 以外は `open` が先に拒否する
-/// ため本検査に到達しない（`#[cfg(unix)]` の枝は macOS でも型検査のためにコンパイルされる）。
+/// root か現在のユーザーの所有でなければ（macOS は拡張 ACL があっても）`PermissionDenied`。Windows は `open` が先に
+/// 拒否するため本検査に到達しない（`#[cfg(unix)]` の枝は macOS でも型検査のためにコンパイルされる）。
 ///
 /// 制約（未実装。REPAIR-3）: 検査と使用の間の TOCTOU を閉じるには、ディレクトリ fd を基点に
 /// `openat` 系で操作する必要がある。std には無く `sys` の unsafe ラッパーが要るため、
@@ -1114,13 +1142,17 @@ fn verify_ancestors(root: &Path) -> Result<(), TraitError> {
                     "ancestor of the state root must not be writable by group or others",
                 ));
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             if meta.uid() != 0 && meta.uid() != crate::sys::effective_uid() {
                 return Err(err(
                     ErrorCode::PermissionDenied,
                     "ancestor of the state root must be owned by root or the current user",
                 ));
             }
+            reject_extended_acl(
+                ancestor,
+                "ancestor of the state root must not have an extended ACL",
+            )?;
         }
     }
     #[cfg(not(unix))]
@@ -1150,8 +1182,8 @@ fn verify_root(path: &Path) -> Result<(), TraitError> {
                 "state root must not be accessible by group or others",
             ));
         }
-        // 所有者検査は euid を取れる Linux のみ。他 OS は `open` が先に拒否する。
-        #[cfg(target_os = "linux")]
+        // 所有者検査は euid を取れる Linux・macOS のみ。他 OS は `open` が先に拒否する。
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if meta.uid() != crate::sys::effective_uid() {
             return Err(err(
                 ErrorCode::PermissionDenied,
@@ -1159,6 +1191,7 @@ fn verify_root(path: &Path) -> Result<(), TraitError> {
             ));
         }
     }
+    reject_extended_acl(path, "state root must not have an extended ACL")?;
     Ok(())
 }
 
@@ -1166,8 +1199,9 @@ fn verify_root(path: &Path) -> Result<(), TraitError> {
 ///
 /// group / other の権限ビットが 1 つでもあれば（0700 限定）、または所有者が現在のユーザーで
 /// なければ `PermissionDenied`（残存ディレクトリの再利用・読み取り前に呼ぶ。`state.json` 改変・
-/// bundle すり替えの防止。OCI-5）。Linux 以外は `open` が先に拒否するため本検査に到達しない。
-fn verify_record_dir(meta: &fs::Metadata) -> Result<(), TraitError> {
+/// bundle すり替えの防止。OCI-5）。macOS は拡張 ACL があっても拒否する。Windows は `open` が先に拒否するため
+/// 本検査に到達しない。
+fn verify_record_dir(meta: &fs::Metadata, path: &Path) -> Result<(), TraitError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1177,7 +1211,7 @@ fn verify_record_dir(meta: &fs::Metadata) -> Result<(), TraitError> {
                 "state directory must not be accessible by group or others",
             ));
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if meta.uid() != crate::sys::effective_uid() {
             return Err(err(
                 ErrorCode::PermissionDenied,
@@ -1187,6 +1221,7 @@ fn verify_record_dir(meta: &fs::Metadata) -> Result<(), TraitError> {
     }
     #[cfg(not(unix))]
     let _ = meta;
+    reject_extended_acl(path, "state directory must not have an extended ACL")?;
     Ok(())
 }
 
@@ -1439,13 +1474,13 @@ fn sweep_stale_control_socket(dir: &Path) {
     }
 }
 
-/// Linux 以外ではファイル状態ストア自体が使えない（`ensure_supported_platform`）ため何もしない。
+/// Linux 以外では何もしない（macOS には制御チャネルの掃除の経路が無く、Windows は `open` が先に拒否する）。
 #[cfg(not(target_os = "linux"))]
 fn sweep_stale_control_socket(_dir: &Path) {}
 
 /// ディレクトリを fsync して dirent の変更（作成・rename・unlink）を永続化する。
 /// open は `open_nowait` で待たず、開いた実体がディレクトリでなければ拒否する。
-/// Linux 以外は `open` が先に拒否するため、非 unix の枝は型検査のためだけに残す。
+/// Windows は `open` が先に拒否するため、非 unix の枝は型検査のためだけに残す。
 fn sync_dir(dir: &Path) -> Result<(), TraitError> {
     #[cfg(unix)]
     {
@@ -1467,7 +1502,7 @@ fn sync_dir(dir: &Path) -> Result<(), TraitError> {
 /// `metadata`（fstat）で行う。フラグの値はアーキテクチャ別（`sys`）で、対応外アーキテクチャでは
 /// 開かずに `Unsupported`（`open` が先に拒否するため通常は到達しない。fail-closed）。
 fn open_nowait(path: &Path, opts: &mut OpenOptions) -> std::io::Result<File> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         use std::os::unix::fs::OpenOptionsExt;
         let flags = crate::sys::nofollow_nonblock_open_flags()
@@ -1880,7 +1915,7 @@ fn lock_file_until(file: &File, deadline: Instant) -> Result<(), TraitError> {
     }
 }
 
-/// 3 OS 共通の試験（状態ルートの解決規則と、Linux 以外での fail-closed。OCI-5・CLI-1）。
+/// 3 OS 共通の試験（状態ルートの解決規則と、Windows での fail-closed。OCI-5・CLI-1）。
 #[cfg(test)]
 mod platform_tests {
     use super::*;
@@ -2087,9 +2122,9 @@ mod platform_tests {
         );
     }
 
-    /// OCI-5・CLI-1: Linux 以外では状態ルートを作らずに `Unimplemented` を返す（信頼境界を
-    /// 検査できないため。start の `BundleLock::acquire` と同じ扱い）。
-    #[cfg(not(target_os = "linux"))]
+    /// OCI-5・CLI-1: Linux・macOS 以外（Windows）では状態ルートを作らずに `Unimplemented` を返す
+    /// （信頼境界を検査できないため。start の `BundleLock::acquire` と同じ扱い）。
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn oci5_open_is_unimplemented_outside_linux() {
         let root =
@@ -2099,13 +2134,109 @@ mod platform_tests {
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         assert_eq!(
             e.message(),
-            "file state store requires Linux to verify the state root"
+            "file state store requires Linux or macOS to verify the state root"
         );
         assert!(!root.exists());
     }
 }
 
-/// ストアを開く試験（Linux 限定。他 OS では `open` が `Unimplemented` を返し、その挙動は
+/// macOS の信頼境界の検査の試験（OCI-5・SEC-4・CLI-1。#2247）。`temp_dir` は `/var` から `/private/var` への
+/// symlink の下にあるため、正規化してから使う。実行時の確認は main の macOS 実行が担う。
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    /// 試験ごとの専用ディレクトリ（drop で削除）。
+    struct Dir(PathBuf);
+
+    impl Dir {
+        fn new(tag: &str) -> Self {
+            let base = fs::canonicalize(std::env::temp_dir()).expect("temp dir");
+            let dir = base.join(format!("fandhe-ss-macos-{tag}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir(&dir).expect("create");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod");
+            Self(dir)
+        }
+    }
+
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn open_at(path: PathBuf) -> Result<FileStateStore, TraitError> {
+        FileStateStore::open(StateRoot::from_override(path).expect("root"))
+    }
+
+    /// 新規のルートは 0700 で作られ、開ける。
+    #[test]
+    fn oci5_macos_open_creates_private_root() {
+        let d = Dir::new("create");
+        let root = d.0.join("root");
+        open_at(root.clone()).expect("open");
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    /// 既存のルートが 0755 なら `PermissionDenied`。
+    #[test]
+    fn sec4_macos_rejects_group_readable_root() {
+        let d = Dir::new("mode");
+        let root = d.0.join("root");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let e = open_at(root).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::PermissionDenied);
+        assert_eq!(
+            e.message(),
+            "state root must not be accessible by group or others"
+        );
+    }
+
+    /// ルートが symlink なら `PermissionDenied`。
+    #[test]
+    fn sec4_macos_rejects_symlink_root() {
+        let d = Dir::new("symlink");
+        let real = d.0.join("real");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = d.0.join("link");
+        symlink(&real, &link).unwrap();
+        let e = open_at(link).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::PermissionDenied);
+        assert_eq!(
+            e.message(),
+            "state root must be a directory and not a symlink"
+        );
+    }
+
+    /// 拡張 ACL（他者への書き込み許可）が付いたルートは mode が 0700 でも `PermissionDenied`。
+    /// ACL の付与は試験に限り外部コマンド `chmod +a` を使う。
+    #[test]
+    fn sec4_macos_rejects_extended_acl_root() {
+        let d = Dir::new("acl");
+        let root = d.0.join("root");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let status = std::process::Command::new("chmod")
+            .arg("+a")
+            .arg("everyone allow write")
+            .arg(&root)
+            .status()
+            .expect("chmod +a");
+        assert!(status.success());
+        let e = open_at(root).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::PermissionDenied);
+        assert_eq!(e.message(), "state root must not have an extended ACL");
+    }
+}
+
+/// ストアを開く試験（Linux 限定。Windows では `open` が `Unimplemented` を返し、その挙動は
 /// `platform_tests` が照合する。モジュール doc「対応プラットフォーム」）。
 #[cfg(all(test, target_os = "linux"))]
 mod tests {

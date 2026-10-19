@@ -4,7 +4,7 @@
 
 - 対象ビヘイビア: OCI-1（イメージの pull・展開・実行）
 - 関連タスク: TASK-55.1（#420・PR #2190。ハーネス本体）・TASK-55.2（#421。本書）。親は TASK-55（#419）・MS-4
-- ステータス: **pull・digest 検証・展開は 4 イメージで成功（4/5）。run 段（コンテナ実行・終了コード 0 の確認）は AppArmor による非特権 user namespace の制限で 4 件とも `PERMISSION_DENIED` のため未達。`redis:alpine` は config 段で `INVALID_ARGUMENT`（所見参照）。終了コード 0 の確認は人間へ引き継ぐ（#2313 で追跡）**（成功を装わない。REPAIR-3）
+- ステータス: **pull・digest 検証・展開は 4 イメージで成功（4/5）。run 段（コンテナ実行・終了コード 0 の確認）は AppArmor による非特権 user namespace の制限で 4 件とも `PERMISSION_DENIED` のため未達。`redis:alpine` は計測時点では config 段で `INVALID_ARGUMENT`（#2314 で core とハーネスを修正済み。修正後の実測は未実施。所見参照）。終了コード 0 の確認は人間へ引き継ぐ（#2313 で追跡）**（成功を装わない。REPAIR-3）
 
 ## 必要環境・必要権限
 
@@ -24,7 +24,7 @@ systemd-run --user --scope -p Delegate=yes <上で得た実行ファイル> --ig
   --image busybox --cmd /bin/true
 ```
 
-- `redis:alpine` は手順に含めない。image config の Entrypoint が相対パスの `docker-entrypoint.sh` で、`--cmd` を指定しても Entrypoint が残り `process.args[0]` が `/` で始まらないため、sysctl を緩和しても config 段で `INVALID_ARGUMENT` になる（所見参照）
+- `redis:alpine` は計測時点では手順に含めなかった（Entrypoint が相対名の `docker-entrypoint.sh` で config 段が `INVALID_ARGUMENT` になるため）。#2314 で解消済みの見込みだが実測は未実施。`--cmd redis-server` のままだと `redis-server` が常駐して試験の期限で失敗するため、終了するコマンドで上書きして試す（例: `--image redis:alpine --cmd redis-server --version`。Entrypoint の `docker-entrypoint.sh` が引数をそのまま exec する前提も実測で確かめる）
 
 - cargo 経由で実行すると cargo が同じ cgroup に入り `prepare` が失敗するため、実行ファイルを直接起動する
 - `FANDHE_CONTAINER_TEST_TIMEOUT_SECS` で待ち時間の上限を変更できる
@@ -76,7 +76,7 @@ systemd-run --user --scope -p Delegate=yes <上で得た実行ファイル> --ig
 ## 所見
 
 - 展開時のデバイス・FIFO・hardlink 制限による失敗は出なかった（ハーネスでの回避なし）。debian の `stripped_special_bits: 11` は setuid / setgid / sticky を既定で落とした数（`docs/design/oci-layer-special-bits.md`）
-- `redis:alpine` は config 段で `INVALID_ARGUMENT`。原因はハーネスの `derive_process`（`crates/oci/tests/pull_e2e.rs`）のコード上の挙動から特定した。args を Entrypoint ++ cmd で組み立てるが、`redis:alpine` の Entrypoint は相対パスの `docker-entrypoint.sh` で `args[0]` が絶対パスにならず、`--cmd` で上書きしても Entrypoint は残る（実行での再現確認は未実施）。ハーネスの既知の制約（`process.args[0]` は絶対パスが必要）であり、PATH 解決は未対応。pull と verify は成功しているため、受け入れ条件の 3 種以上には既定の 3 種（alpine・debian・nginx:alpine）を用いる
+- `redis:alpine` は config 段で `INVALID_ARGUMENT`。原因はハーネスの `derive_process`（`crates/oci/tests/pull_e2e.rs`）のコード上の挙動から特定した。args を Entrypoint ++ cmd で組み立てるが、`redis:alpine` の Entrypoint は相対パスの `docker-entrypoint.sh` で `args[0]` が絶対パスにならず、`--cmd` で上書きしても Entrypoint は残る（実行での再現確認は未実施）。当時は core の launch が絶対パスの `args[0]` しか受けず（`start` の検査と `Entrypoint::new`）、ハーネスも同じ制約を持っていた。#2314（OCI-1）で、名前だけの `args[0]` を core が pivot 後に `process.env` の `PATH` で解決するようになり（runtime-spec・runc と同じ。`crates/core/src/exec/path_lookup.rs`）、ハーネスも受けるようにした。`redis:alpine` は config 段を通る見込みだが、実機での再実行は未実施（成功を装わない。REPAIR-3）。`/` を含む相対パスの `args[0]` は未対応のまま。pull と verify は成功しているため、受け入れ条件の 3 種以上には既定の 3 種（alpine・debian・nginx:alpine）を用いる
 - 既知の制約（ハーネスの `//!` と同じ）: `WorkingDir` を `process.cwd`、数値形式の `User` を `process.user` へ写す（名前形式は `UNIMPLEMENTED`、非 root の `User` は `FANDHE_CONTAINER_TEST_ID_HELPER=1` 無しでは `FAILED_PRECONDITION`）、`diff_id` は未検証、レイヤーは gzip のみ
 
 ## 引き継ぎ（人間担当）
@@ -85,7 +85,7 @@ systemd-run --user --scope -p Delegate=yes <上で得た実行ファイル> --ig
 
 1. `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
 2. `unshare -Ur true` が成功することを確かめ、上記「実行手順」のコマンドを実行する（非 root の `User` で `FAILED_PRECONDITION` が出たら `FANDHE_CONTAINER_TEST_ID_HELPER=1` を付けて再実行する）
-3. 結果の表の run 列と exit を本書へ追記する（`redis:alpine` は Entrypoint が相対パスのため対象外。必要なら Entrypoint を持たない別イメージに差し替える）
+3. 結果の表の run 列と exit を本書へ追記する（`redis:alpine` を加えて config 段を通ることも確かめる）
 4. `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1` で元に戻す
 5. `sysctl kernel.apparmor_restrict_unprivileged_userns` の出力を下記「run 段の実機記録」へ記入する
 

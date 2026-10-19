@@ -785,11 +785,16 @@ fn build_spec(
         )
     })?;
 
-    let first_is_absolute = process.args().first().is_some_and(|a| a.starts_with('/'));
-    if !first_is_absolute {
+    // 絶対パス、または `/` を含まない名前(pivot 後に `process.env` の `PATH` で解決する。OCI-1・#2314。
+    // `PATH` の有無は launcher の fork 前の検証で見る)。`/` を含む相対パスは未対応(REPAIR-3)。
+    let first_is_usable = process
+        .args()
+        .first()
+        .is_some_and(|a| a.starts_with('/') || (!a.is_empty() && !a.contains('/')));
+    if !first_is_usable {
         return Err(TraitError::new(
             ErrorCode::InvalidArgument,
-            "process.args[0] must be an absolute path",
+            "process.args[0] must be an absolute path or a bare command name",
         ));
     }
     validate_entrypoint_limits(process.args(), process.env())?;
@@ -1952,14 +1957,18 @@ mod tests {
         assert_eq!(launcher.calls(), 0);
     }
 
-    /// SEC-1: args[0] が相対パス（PATH 探索は未実装）なら InvalidArgument。
+    /// SEC-1・OCI-1: args[0] が `/` を含む相対パス（cwd 相対は未対応）なら InvalidArgument。
+    /// 名前だけの args[0] は PATH で解決する対象のため、ここでは拒否しない（#2314）。
     #[test]
     fn sec1_start_rejects_relative_entrypoint() {
         let mut cfg = valid_config();
-        cfg["process"]["args"] = json!(["echo", "hi"]);
+        cfg["process"]["args"] = json!(["bin/app", "hi"]);
         let err = start_rejected_after_rewrite("relarg", &cfg);
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
-        assert_eq!(err.message(), "process.args[0] must be an absolute path");
+        assert_eq!(
+            err.message(),
+            "process.args[0] must be an absolute path or a bare command name"
+        );
     }
 
     /// SEC-1・SEC-5・CORE-5: start が適用できない指定は黙って無視せず Unimplemented で拒否する。

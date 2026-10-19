@@ -12,9 +12,6 @@
 //! - [`create_dir_chain`] は `create_dir` で 1 階層ずつ作り、既存は symlink でないディレクトリに限って許容する。
 //! - 失敗はすべて panic（試験の前提崩れを握りつぶさない）。後始末は呼び出し側の `Drop` が、自分で作ったパスだけを消す。
 
-// 取り込み元によっては片方の関数しか使わないため。
-#![allow(dead_code)]
-
 use std::fs;
 use std::io::ErrorKind;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
@@ -24,6 +21,8 @@ use std::path::{Path, PathBuf};
 const MAX_ATTEMPTS: u32 = 16;
 
 /// 一時ディレクトリを排他作成して返す。作成時は 0700 で、直後に `mode` へ合わせる（従来の実効モードを保つため）。
+// 取り込み元のテストバイナリによっては使わないため（`create_dir_chain` だけを使う試験がある）。
+#[allow(dead_code)]
 pub fn exclusive_temp_dir(prefix: &str, mode: u32) -> PathBuf {
     let tmp = fs::canonicalize(std::env::temp_dir()).expect("canonicalize temp_dir");
     for attempt in 0..MAX_ATTEMPTS {
@@ -48,6 +47,8 @@ pub fn exclusive_temp_dir(prefix: &str, mode: u32) -> PathBuf {
 /// `base` 配下に `rel` の各要素を 1 階層ずつ `create_dir` で作り、末端のパスを返す。
 ///
 /// 既存要素は `symlink_metadata`（辿らない）が symlink でないディレクトリと答える場合だけ許容する。
+// 取り込み元のテストバイナリによっては使わないため（想定外の取り込み先への備え）。
+#[allow(dead_code)]
 pub fn create_dir_chain(base: &Path, rel: &[&str]) -> PathBuf {
     let mut cur = base.to_path_buf();
     for comp in rel {

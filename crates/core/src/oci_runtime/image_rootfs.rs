@@ -155,6 +155,13 @@ impl CreatedRootfs {
         imp::publish(&mut self.backing)
     }
 
+    /// `path`（bundle の検証で得た最終の rootfs の経路）を今解決した実体が、展開した実体か（dev・ino）。
+    ///
+    /// 展開中に bundle の途中の要素が別名へ移され、同じ文字列の別ディレクトリに差し替わっていないかの確認。
+    pub(super) fn is_unpacked_at(&self, path: &Path) -> bool {
+        imp::path_is_unpacked(path, &self.backing)
+    }
+
     /// rootfs を消す。
     ///
     /// 作成時に固定した親（Linux は fd）の下で、末尾が作ったときと同じディレクトリ（dev・ino）で
@@ -218,7 +225,18 @@ mod imp {
             _ => TraitError::new(ErrorCode::Internal, "failed to publish rootfs"),
         })?;
         b.current = b.final_name.clone();
-        Ok(())
+        // 改名した先を固定済みの親から開き直し、展開した実体（保持中の fd の dev・ino）と一致することを確認する。
+        // 一致しなければ公開した名前は別の実体を指しており、成功を装わず拒否する。
+        let same = open_dir(b.parent.as_fd(), &b.final_name)
+            .ok()
+            .and_then(|fd| fstat(fd.as_fd()).ok())
+            .is_some_and(|(dev, ino, is_dir, _)| is_dir && (dev, ino) == b.identity);
+        if same { Ok(()) } else { Err(refuse()) }
+    }
+
+    /// 経路を今ここで解決した実体が、展開した実体（保持中の fd の dev・ino）か。
+    pub(super) fn path_is_unpacked(path: &Path, b: &Backing) -> bool {
+        std::fs::metadata(path).is_ok_and(|m| m.is_dir() && (m.dev(), m.ino()) == b.identity)
     }
 
     fn cstr(s: &OsStr) -> Result<CString, TraitError> {
@@ -246,6 +264,18 @@ mod imp {
         let file = File::from(fd.try_clone_to_owned()?);
         let m = file.metadata()?;
         Ok((m.dev(), m.ino(), m.is_dir(), m.mode()))
+    }
+
+    /// fd の指す実体の所有者 uid。
+    fn fd_owner(fd: BorrowedFd<'_>) -> Option<u32> {
+        let file = File::from(fd.try_clone_to_owned().ok()?);
+        file.metadata().ok().map(|m| m.uid())
+    }
+
+    /// fd の指すディレクトリが空か（`/proc/self/fd/N` 経由で列挙。読めなければ空と見なさない）。
+    fn dir_is_empty(fd: BorrowedFd<'_>) -> bool {
+        std::fs::read_dir(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+            .is_ok_and(|mut it| it.next().is_none())
     }
 
     pub(super) fn create_dir(
@@ -311,10 +341,19 @@ mod imp {
                 .ok()
                 .map(|(dev, ino, is_dir, _)| (fd, dev, ino, is_dir))
         });
+        // mkdirat と open の間に、親へ書ける別プロセスが別の実体へ差し替えうる。採用する実体は、自分（実効 uid）
+        // 所有・権限 0700・空のディレクトリに限る（既存データへ展開せず、失敗時の再帰削除が他人のデータに
+        // 及ばない）。0700 で自分の所有なら、検証後に他者は中身を足せない（root を除く）。
+        let owned_empty = opened.as_ref().is_some_and(|(fd, _, _, _)| {
+            fstat(fd.as_fd()).is_ok_and(|(_, _, is_dir, mode)| is_dir && mode & 0o7777 == 0o700)
+                && fd_owner(fd.as_fd()) == Some(sys::effective_uid())
+                && dir_is_empty(fd.as_fd())
+        });
         let (dir, identity) = match opened {
-            Some((fd, dev, ino, true)) => (fd, (dev, ino)),
+            Some((fd, dev, ino, true)) if owned_empty => (fd, (dev, ino)),
             _ => {
-                // 作った直後に差し替えられた。固定済みの親の下の空ディレクトリだけを best effort で戻す。
+                // 作った直後に差し替えられた。差し替えられた実体は自分のものと確認できないため消さない
+                // （空ディレクトリでなければ `remove_dir_at` は失敗する。best effort で戻すのは空の場合だけ）。
                 let _ = sys::remove_dir_at(cur.as_fd(), &name);
                 return Err(TraitError::new(
                     ErrorCode::Internal,
@@ -422,6 +461,11 @@ mod imp {
         Ok(())
     }
 
+    /// 作成自体が拒否される（`create_dir` は Unimplemented）ため到達しない。
+    pub(super) fn path_is_unpacked(_path: &Path, _b: &Backing) -> bool {
+        false
+    }
+
     pub(super) fn create_dir(
         _bundle: &Path,
         _parents: &[&OsStr],
@@ -448,6 +492,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
         dir
+    }
+
+    /// OCI-7・SEC-1: 公開後の最終の経路が別の実体（同名の差し替え）なら展開した実体と見なさない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_is_unpacked_at_rejects_replaced_directory() {
+        let b = tmp("replaced");
+        std::fs::create_dir(b.join("p")).expect("parent");
+        let mut c = prepare_rootfs_target(&b, Path::new("p/rootfs")).expect("prepare");
+        c.publish().expect("publish");
+        assert!(c.is_unpacked_at(&b.join("p/rootfs")));
+        std::fs::rename(b.join("p"), b.join("moved")).expect("rename");
+        std::fs::create_dir_all(b.join("p/rootfs")).expect("new");
+        assert!(!c.is_unpacked_at(&b.join("p/rootfs")));
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 空の rootfs を作り、展開先の経路へ書いて公開し、remove で消せる。

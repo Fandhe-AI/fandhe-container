@@ -278,7 +278,13 @@ fn unpack_rootfs(
     // 確実に見分ける手段と、通常の create と共有する排他が無いため、「未使用の確認 → 削除」は使用中の
     // rootfs を壊しうる。残る木は #854 の起動時照合・手動で回収する（余分に持つだけの安全側。REPAIR-3）。
     match validate_bundle(req.bundle()) {
-        Ok((_, rootfs)) if same_dir_path(&rootfs, created.path()) => Ok(created),
+        // 文字列の一致に加え、解決した実体が展開した実体（保持中の fd の dev・ino）であることを確認する
+        // （展開中に bundle の途中の要素を別名へ移して新しい同名の rootfs を用意する差し替えを拒否する）。
+        Ok((_, rootfs))
+            if same_dir_path(&rootfs, created.path()) && created.is_unpacked_at(&rootfs) =>
+        {
+            Ok(created)
+        }
         Ok(_) => Err(invalid("root.path changed while unpacking")),
         Err(e) => Err(e),
     }

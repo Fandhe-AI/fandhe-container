@@ -592,12 +592,21 @@ impl FileStateStore {
         // 大文字小文字を区別しないファイルシステム（macOS の既定の APFS）では `Web` と `web` が同じ
         // ディレクトリに解決される。中身が「大文字小文字だけ違う別の ID」の健全な記録なら、破損では
         // なく ID の衝突なので `Err` で返す（`purge_corrupted` が他 ID の健全な記録を消さない。
-        // IO-5・OCI-5。fail-closed）。
+        // IO-5・OCI-5。fail-closed）。埋め込み ID を基準にレコード全体（status・ociVersion 等）の
+        // 整合性を検証し、通らないものは通常どおり破損として回復できるようにする。
         if dto.id != id.as_str() && dto.id.eq_ignore_ascii_case(id.as_str()) {
-            return Err(err(
-                ErrorCode::FailedPrecondition,
-                "state directory is shared with a container id that differs only in case",
-            ));
+            let Ok(embedded) = ContainerId::new(dto.id.clone()) else {
+                return Ok(RecordHealth::Corrupted(internal(
+                    "state file is inconsistent",
+                )));
+            };
+            return match dto.into_record(&embedded) {
+                Ok(_) => Err(err(
+                    ErrorCode::FailedPrecondition,
+                    "state directory is shared with a container id that differs only in case",
+                )),
+                Err(e) => Ok(RecordHealth::Corrupted(e)),
+            };
         }
         match dto.into_record(id) {
             Ok(record) => Ok(RecordHealth::Healthy(record)),
@@ -3810,6 +3819,23 @@ mod tests {
             "FAILED_PRECONDITION"
         );
         assert!(t.path().join("web").join("state.json").exists());
+    }
+
+    /// OCI-5・IO-5: 大文字小文字だけ違う ID でも、status が不正な記録は ID 衝突ではなく破損として
+    /// 列挙され、`purge_corrupted` で回復できる。
+    #[test]
+    fn oci5_case_differing_id_with_invalid_status_is_corrupted_and_purgeable() {
+        let t = TmpDir::new("casecorrupt");
+        let store = t.open();
+        create(&store, "web");
+        fs::write(
+            t.path().join("web").join("state.json"),
+            r#"{"ociVersion":"1.2.0","id":"Web","status":"bogus","bundle":"/b","revision":1}"#,
+        )
+        .unwrap();
+        assert_eq!(store.find_corrupted().unwrap(), vec![cid("web")]);
+        store.purge_corrupted(&cid("web")).unwrap();
+        assert!(!t.path().join("web").exists());
     }
 
     /// OCI-5: 書き込み側の上限を超える bundle を持つ state.json は破損として扱い、回復できる。

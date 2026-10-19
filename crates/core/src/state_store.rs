@@ -2303,6 +2303,90 @@ mod macos_tests {
         assert_eq!(e.code(), ErrorCode::PermissionDenied);
         assert_eq!(e.message(), "state root must not have an extended ACL");
     }
+
+    fn cid(s: &str) -> ContainerId {
+        ContainerId::new(s).expect("id")
+    }
+
+    fn create_req(id: &str) -> CreateStateRequest {
+        CreateStateRequest::new(
+            ContainerStatus::created(cid(id), None),
+            std::env::temp_dir().join("fandhe-bundle"),
+        )
+        .expect("create request")
+    }
+
+    fn code<T: std::fmt::Debug>(r: Result<T, TraitError>) -> ErrorCode {
+        r.unwrap_err().code()
+    }
+
+    /// IO-5・OCI-5・REPAIR-12: 大文字小文字を区別しない実 FS で、別表記の ID（`web`）による
+    /// create・get・purge_corrupted が `Web` の健全な記録を変更・削除しない。
+    /// 試験は既定の（大文字小文字非区別の）APFS を前提とし、区別する FS なら前提の assert で失敗する。
+    #[test]
+    fn io5_macos_case_colliding_id_leaves_healthy_record_untouched() {
+        let d = Dir::new("collide");
+        let root = d.0.join("root");
+        let store = open_at(root.clone()).expect("open");
+        let created = store.create(&create_req("Web")).expect("create Web");
+        assert!(
+            root.join("web").join("state.json").exists(),
+            "test requires a case-insensitive filesystem"
+        );
+        let before = fs::read(root.join("Web").join("state.json")).expect("read");
+
+        // create: 別 ID は既存記録を上書きせず拒否される。
+        assert_eq!(
+            code(store.create(&create_req("web"))),
+            ErrorCode::FailedPrecondition
+        );
+        // get: 別 ID の記録を返さない。
+        assert_eq!(
+            code(store.get(&GetStateRequest::new(cid("web")))),
+            ErrorCode::FailedPrecondition
+        );
+        // purge_corrupted: 健全な別 ID の記録を消さない。
+        assert_eq!(
+            code(store.purge_corrupted(&cid("web"))),
+            ErrorCode::FailedPrecondition
+        );
+
+        assert_eq!(
+            fs::read(root.join("Web").join("state.json")).expect("read"),
+            before
+        );
+        let got = store
+            .get(&GetStateRequest::new(cid("Web")))
+            .expect("get Web");
+        assert_eq!(got.revision(), created.revision());
+    }
+
+    /// IO-5・OCI-5・REPAIR-12: 別表記の空の残骸ディレクトリ（中断した create("Web") の `Web/`）を
+    /// create("web") が再利用せず拒否し、残骸の名前も書き換えない。
+    #[test]
+    fn io5_macos_create_rejects_case_variant_empty_leftover() {
+        let d = Dir::new("leftover");
+        let root = d.0.join("root");
+        let store = open_at(root.clone()).expect("open");
+        fs::create_dir(root.join("Web")).expect("leftover");
+        fs::set_permissions(root.join("Web"), fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert!(
+            root.join("web").exists(),
+            "test requires a case-insensitive filesystem"
+        );
+
+        assert_eq!(
+            code(store.create(&create_req("web"))),
+            ErrorCode::FailedPrecondition
+        );
+        let names: Vec<String> = fs::read_dir(&root)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .filter(|n| n.eq_ignore_ascii_case("web"))
+            .collect();
+        assert_eq!(names, vec!["Web".to_string()]);
+        assert!(!root.join("Web").join("state.json").exists());
+    }
 }
 
 /// ストアを開く試験（Linux 限定。Windows では `open` が `Unimplemented` を返し、その挙動は

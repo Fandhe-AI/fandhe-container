@@ -46,7 +46,7 @@
 //!   `exec::isolate_rootless_subordinate` による起動フローへの組み込みも実装済み（TASK-40.2）。
 //!   本番 launcher（`oci_runtime::ProductionLauncher`）経由の流れ（#2009）: 構築時に `SubordinateIdSource` から
 //!   subuid / subgid の範囲と `newuidmap` / `newgidmap` の絶対パスを解決・検証し（ホスト ID 0 を含む構成と
-//!   helper 欠落は fork 前に拒否）、起動ごとに中間プロセスが user namespace を unshare して mapper を fork する。
+//!   helper 欠落は fork 前に拒否）、起動ごとにまず mapper を fork し、その後に中間プロセスが user namespace を unshare する。
 //!   mapper は外側の user namespace に残り、helper で写像を書いて読み戻し、応答後に中間プロセスが PID 1 を fork する。
 //!   責務境界は、`rootless` が写像の検証・書き込み・読み戻し、`exec` が計画・unshare・mapper の fork と失敗時の回収、
 //!   launcher が権限モデルの検査と構築時の解決。supervisor が `RootlessSubordinateIds` を選ぶ経路は未結線（#2243）、

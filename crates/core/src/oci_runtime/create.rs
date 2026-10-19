@@ -221,7 +221,9 @@ fn create_with_image_inner(
             ) {
                 // 順序は「rootfs の削除 → 参照の解除」。間で止まっても残るのは未確定の参照だけで、
                 // #854 の起動時照合が回収できる（逆順だと参照の無い孤立 rootfs が次の create を塞ぐ）。
-                if let Some(created) = created_rootfs {
+                if let Some(created) = created_rootfs
+                    && !rootfs_may_be_in_use(store, req, &e)
+                {
                     remove_created_rootfs(recorder, created);
                 }
                 rollback_image_ref(recorder, image, req);
@@ -262,7 +264,7 @@ fn unpack_rootfs(
     }
     // 展開の間に config が書き換わり別の場所を指していたら、作った rootfs はどの状態からも指されない。
     match validate_bundle(req.bundle()) {
-        Ok((_, rootfs)) if rootfs == created.path() => Ok(created),
+        Ok((_, rootfs)) if same_dir_path(&rootfs, created.path()) => Ok(created),
         Ok(_) => {
             remove_created_rootfs(recorder, created);
             Err(invalid("root.path changed while unpacking"))
@@ -272,6 +274,36 @@ fn unpack_rootfs(
             Err(e)
         }
     }
+}
+
+/// 状態作成が `AlreadyExists` で失敗したとき、同じ bundle を指す別の状態が rootfs を使っていないか。
+///
+/// 展開の間に、同じ ID・同じ bundle への通常の `create`（展開器なし）が成功しうる。その状態は、こちらが
+/// 作った rootfs を（bundle の検証を通して）自分のものとして指すので、こちらの後始末で消すと使用中の
+/// rootfs を壊す。同じ bundle の状態が見えるか、読めない（曖昧）ときは消さずに残す（残る方向はデータを
+/// 余分に持つだけで安全側）。状態が無い・別の bundle の状態なら、どの状態も指さないので消してよい。
+fn rootfs_may_be_in_use(store: &dyn StateStore, req: &CreateRequest, err: &TraitError) -> bool {
+    if err.code() != ErrorCode::AlreadyExists {
+        return false;
+    }
+    match store.get(&GetStateRequest::new(req.id().clone())) {
+        Ok(record) => record.bundle() == req.bundle(),
+        Err(e) => e.code() != ErrorCode::NotFound,
+    }
+}
+
+/// 2 つの経路が同じディレクトリを指すかを、`.`・`//`・末尾の `/` を除いた要素列で比べる。
+///
+/// `check_rootfs` は `bundle.join(root.path)` をそのまま返すため、`./rootfs`・`rootfs/` のような等価な
+/// 書き方の `root.path` も `prepare_rootfs_target` の正規化済みの経路と同じものとして扱う。
+fn same_dir_path(a: &Path, b: &Path) -> bool {
+    let normal = |p: &Path| -> Vec<std::ffi::OsString> {
+        p.components()
+            .filter(|c| !matches!(c, Component::CurDir))
+            .map(|c| c.as_os_str().to_os_string())
+            .collect()
+    };
+    normal(a) == normal(b)
 }
 
 /// 作った rootfs を消す。失敗は握りつぶさず `image_rootfs_cleanup` として記録し、元のエラーを優先させる。
@@ -824,12 +856,17 @@ mod tests {
         create_error: Option<ErrorCode>,
         /// 状態作成の直後に並行する delete が状態を消した状況を再現する。
         delete_after_create: bool,
+        /// `create_error` で失敗させる前に、同じ ID・bundle の状態を先に作る（並行する通常の create の成功を再現）。
+        concurrent_create_wins: bool,
     }
 
     impl StateStore for LoggingStore {
         fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
             push(&self.log, "store.create");
             if let Some(code) = self.create_error {
+                if self.concurrent_create_wins {
+                    self.inner.create(req)?;
+                }
                 return Err(TraitError::new(code, "injected"));
             }
             let record = self.inner.create(req)?;
@@ -912,6 +949,7 @@ mod tests {
             log: Arc::clone(&log),
             create_error,
             delete_after_create: false,
+            concurrent_create_wins: false,
         };
         let refs = LoggingRefs {
             log: Arc::clone(&log),
@@ -1041,6 +1079,7 @@ mod tests {
     use crate::oci_runtime::{ImageRootfsUnpacked, ImageRootfsUnpacker};
 
     #[derive(Clone, Copy, PartialEq)]
+    #[cfg_attr(not(unix), allow(dead_code))]
     enum UnpackMode {
         Ok,
         /// 書いてから失敗する。
@@ -1056,6 +1095,7 @@ mod tests {
         mode: UnpackMode,
         /// 展開の途中で config の `root.path` を書き換える（bundle, 新しい config）。
         rewrite_config: Option<(PathBuf, Value)>,
+        #[cfg_attr(not(unix), allow(dead_code))]
         outside: Option<PathBuf>,
         observed: Mutex<Vec<String>>,
     }
@@ -1157,6 +1197,7 @@ mod tests {
         b
     }
 
+    #[cfg(unix)]
     fn count_of(rec: &OpRecorder, op: &str) -> (u64, u64) {
         rec.snapshot_op(&OpName::new(op).expect("name"))
             .map(|s| (s.success(), s.failure()))
@@ -1182,6 +1223,8 @@ mod tests {
     }
 
     /// OCI-7: 展開の途中の失敗で rootfs を消し、参照を外す。元のエラーが返る。
+    // Windows は rootfs の同一性を保証できず後始末を拒否する（image_rootfs.rs）ため Unix 限定。
+    #[cfg(unix)]
     #[test]
     fn oci7_unpack_failure_removes_rootfs_and_releases_ref() {
         let b = config_bundle("unpack-fail");
@@ -1243,6 +1286,8 @@ mod tests {
     }
 
     /// OCI-7: 展開の後に状態作成が AlreadyExists になったら rootfs を消し、参照を外す。
+    // Windows は rootfs の同一性を保証できず後始末を拒否する（image_rootfs.rs）ため Unix 限定。
+    #[cfg(unix)]
     #[test]
     fn oci7_unpack_state_already_exists_cleans_up() {
         let b = config_bundle("unpack-createexists");
@@ -1349,6 +1394,8 @@ mod tests {
     }
 
     /// OCI-7: 展開の間に `root.path` が書き換わったら拒否し、作った rootfs を消して参照を外す。
+    // Windows は rootfs の同一性を保証できず後始末を拒否する（image_rootfs.rs）ため Unix 限定。
+    #[cfg(unix)]
     #[test]
     fn oci7_unpack_rejects_root_path_changed_while_unpacking() {
         let b = config_bundle("unpack-rewrite");
@@ -1366,5 +1413,46 @@ mod tests {
             log_of(&log),
             vec!["refs.register", "unpack", "refs.release"]
         );
+    }
+
+    /// OCI-7: 展開の間に同じ ID・bundle の通常の create が成功していたら、使用中の rootfs は消さない。
+    #[test]
+    fn oci7_unpack_keeps_rootfs_used_by_concurrent_create() {
+        let b = config_bundle("unpack-concurrent");
+        let (mut store, refs, log) = fixture(
+            Some(ErrorCode::AlreadyExists),
+            Ok(ImageRefRegistration::Registered),
+            None,
+        );
+        store.concurrent_create_wins = true;
+        let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
+        let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
+        assert_eq!(err.code(), ErrorCode::AlreadyExists);
+        assert!(b.dir.join("rootfs").is_dir());
+    }
+
+    /// OCI-7: `root.path` の等価な書き方（`./rootfs`・`rootfs/`・`a//b`）でも、展開した木を消さず成功する。
+    #[test]
+    fn oci7_unpack_accepts_equivalent_root_path_spellings() {
+        for (i, spelling) in ["./rootfs", "rootfs/", "a//b", "./a/./b/"]
+            .iter()
+            .enumerate()
+        {
+            let b = Bundle::new(&format!("unpack-spelling-{i}"));
+            std::fs::create_dir_all(b.dir.join("a")).expect("a");
+            let mut cfg = valid_config();
+            cfg["root"]["path"] = json!(spelling);
+            b.write_config(&cfg);
+            let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+            let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
+            run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b)
+                .unwrap_or_else(|e| panic!("{spelling}: {e:?}"));
+            let expected = if spelling.contains('a') {
+                "a/b"
+            } else {
+                "rootfs"
+            };
+            assert!(b.dir.join(expected).is_dir(), "{spelling}");
+        }
     }
 }

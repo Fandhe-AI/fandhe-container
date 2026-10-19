@@ -240,6 +240,7 @@ mod sysno {
 use sysno::{ArchSysNo, SyscallNumber};
 
 pub(crate) mod bpf;
+pub(crate) mod seccomp_notify;
 
 /// アーキテクチャごとの clone / mount / open 定数。値が同一でも arch ごとに個別定義する。
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]

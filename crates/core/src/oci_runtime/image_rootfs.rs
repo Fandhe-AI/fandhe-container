@@ -18,10 +18,10 @@ use super::image_refs::ImageManifestDigest;
 use crate::traits::{ErrorCode, TraitError};
 
 /// 後始末で権限を補正しながら辿る項目数の上限（無制限の走査を避ける。展開側の既定上限と同程度）。
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const CLEANUP_MAX_ENTRIES: usize = 1_000_000;
 /// 後始末で辿るディレクトリの深さの上限。
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 const CLEANUP_MAX_DEPTH: usize = 256;
 
 /// [`ImageRootfsUnpacker::unpack`] の結果（将来の拡張に備え非網羅）。
@@ -36,8 +36,16 @@ pub struct ImageRootfsUnpacked {
 ///
 /// 契約:
 ///
-/// - `rootfs` は core が作った、存在する空のディレクトリ（Unix は実行ユーザー所有の 0700）。oci の
+/// - `rootfs` は core が作った、存在する空のディレクトリ（Unix は実行ユーザー所有の 0700）を指す経路。oci の
 ///   `extract_*` の「root は呼び出し側が排他的に所有する既存の空ディレクトリ」と一致する
+/// - Linux では、`rootfs` は core が保持するディレクトリ fd を指す `/proc/self/fd/N`（bundle 配下の経路ではない）で、
+///   最終要素が symlink（magic link）である。作成後に bundle 内の中間ディレクトリを symlink へ差し替えられても、
+///   展開先は固定したディレクトリのままで bundle 外へ書かない（SEC-1）。展開器は `rootfs` を開くとき
+///   最終要素の symlink を辿ること（`O_NOFOLLOW` を付けて開かない）。以降の要素は `rootfs` 配下を fd 相対・
+///   リンク非追従で扱うこと。この経路は展開の呼び出しの間だけ有効で、保持・保存してはならない
+///   （Linux 以外は bundle 配下の経路そのもの。後始末は拒否されるため展開物が残りうる）
+/// - 展開中の rootfs は、Linux では最終の `root.path` とは別の非公開の名前にあり、展開の成功後に core が
+///   最終の名前へ公開する（展開中に別の create が rootfs を使用中と見なして成功する競合を防ぐ。OCI-7）
 /// - 展開器は `rootfs` 自体を作り直したり別の場所へ移したりしない
 /// - 失敗時に部分的な展開物を残してよい。後始末は core が行う
 /// - イメージストアの排他は blob パスの解決に必要な間だけ取り、展開の全体にわたっては保持しない
@@ -56,10 +64,11 @@ pub trait ImageRootfsUnpacker {
 
 /// core が排他的に作った rootfs ディレクトリ（展開途中の後始末の対象）。
 ///
-/// Linux では作成時に検証した親ディレクトリの fd を保持し、作成と後始末を `mkdirat` / `unlinkat` 等の
-/// fd 相対・リンク非追従の操作だけで行う（作成後に親を symlink へ差し替えられても bundle 外に作用しない）。
-/// Linux 以外の Unix は経路の lstat と dev・ino の照合による best effort、Windows は同一性を保証できない
-/// ため後始末を拒否する（fail-closed。ハンドルのファイル ID 照合は未実装。REPAIR-3）。
+/// Linux では作成時に検証した親ディレクトリの fd を保持し、作成・展開先の指定・公開・後始末を `mkdirat` /
+/// `renameat2` / `unlinkat` 等の fd 相対・リンク非追従の操作だけで行う（作成後に親を symlink へ差し替えられても
+/// bundle 外に作用しない）。展開は非公開の名前で行い、成功後に [`CreatedRootfs::publish`] で最終の名前へ
+/// 改名する。Linux 以外（macOS 等の Unix・Windows）は fd 相対の操作が未実装で、経路を再解決する
+/// 後始末は差し替えで bundle 外を消しうるため、後始末を拒否する（fail-closed。展開物が残る。REPAIR-3）。
 #[derive(Debug)]
 pub(super) struct CreatedRootfs {
     path: PathBuf,
@@ -77,7 +86,7 @@ fn refuse() -> TraitError {
     )
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn remove_failed() -> TraitError {
     TraitError::new(ErrorCode::Internal, "failed to remove rootfs")
 }
@@ -132,10 +141,25 @@ impl CreatedRootfs {
         &self.path
     }
 
-    /// 展開途中の rootfs を消す。
+    /// 展開器へ渡す経路（[`ImageRootfsUnpacker::unpack`] の契約）。Linux は保持した fd を指す
+    /// `/proc/self/fd/N`、それ以外は [`Self::path`] と同じ。
+    pub(super) fn unpack_path(&self) -> PathBuf {
+        imp::unpack_path(&self.path, &self.backing)
+    }
+
+    /// 展開済みの rootfs を最終の名前（`root.path`）へ公開する。公開後は他の create が rootfs として見る。
+    ///
+    /// Linux は固定した親の下で `renameat2(RENAME_NOREPLACE)` により改名し、最終の名前が既にあれば
+    /// `AlreadyExists`（置き換えない）。Linux 以外は作成時から最終の名前にあるため何もしない。
+    pub(super) fn publish(&mut self) -> Result<(), TraitError> {
+        imp::publish(&mut self.backing)
+    }
+
+    /// rootfs を消す。
     ///
     /// 作成時に固定した親（Linux は fd）の下で、末尾が作ったときと同じディレクトリ（dev・ino）で
     /// なければ削除しない（`FailedPrecondition`。差し替えられた先 = bundle 外の実体を消さない fail-closed）。
+    /// Linux 以外は同一性を保証できないため常に `FailedPrecondition` で拒否する。
     pub(super) fn remove(self) -> Result<(), TraitError> {
         imp::remove(&self.path, self.backing)
     }
@@ -150,18 +174,51 @@ mod imp {
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{CLEANUP_MAX_DEPTH, CLEANUP_MAX_ENTRIES, invalid, refuse, remove_failed};
     use crate::sys::{self, SysError};
     use crate::traits::{ErrorCode, TraitError};
 
+    /// 非公開の展開先の名前の連番（同一プロセス内の衝突を避ける。別プロセスとは pid で分ける）。
+    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+
     /// 検証済みの親ディレクトリの fd と、その下の rootfs の名前・同一性。
+    ///
+    /// 作成直後は `current` が非公開の展開先の名前で、`publish` 後に最終の名前 `final_name` になる。
     #[derive(Debug)]
     pub(super) struct Backing {
         parent: OwnedFd,
-        name: CString,
+        final_name: CString,
+        current: CString,
+        /// 作った rootfs ディレクトリそのものの fd（展開器へ `/proc/self/fd/N` で渡す）。
+        dir: OwnedFd,
         identity: (u64, u64),
+    }
+
+    pub(super) fn unpack_path(_path: &Path, b: &Backing) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", b.dir.as_raw_fd()))
+    }
+
+    pub(super) fn publish(b: &mut Backing) -> Result<(), TraitError> {
+        if b.current == b.final_name {
+            return Ok(());
+        }
+        sys::rename_noreplace_at(
+            b.parent.as_fd(),
+            &b.current,
+            b.parent.as_fd(),
+            &b.final_name,
+        )
+        .map_err(|e| match e {
+            SysError::Os(n) if n == sys::EEXIST || n == sys::ENOTEMPTY => {
+                TraitError::new(ErrorCode::AlreadyExists, "rootfs already exists")
+            }
+            _ => TraitError::new(ErrorCode::Internal, "failed to publish rootfs"),
+        })?;
+        b.current = b.final_name.clone();
+        Ok(())
     }
 
     fn cstr(s: &OsStr) -> Result<CString, TraitError> {
@@ -213,7 +270,30 @@ mod imp {
         for part in parents {
             cur = open_dir(cur.as_fd(), &cstr(part)?)?;
         }
-        let name = cstr(last)?;
+        let final_name = cstr(last)?;
+        // 最終の名前が既にあれば展開せずに拒否する（利用者の既存データへ展開しない。公開時の
+        // `RENAME_NOREPLACE` が最終的な排他）。
+        match sys::open_path_nofollow_at(cur.as_fd(), &final_name) {
+            Ok(_) => {
+                return Err(TraitError::new(
+                    ErrorCode::AlreadyExists,
+                    "rootfs already exists",
+                ));
+            }
+            Err(SysError::Os(n)) if n == sys::ENOENT => {}
+            Err(_) => {
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to create rootfs",
+                ));
+            }
+        }
+        let staging = format!(
+            ".fandhe-unpack-{}-{}",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let name = cstr(OsStr::new(&staging))?;
         sys::mkdir_at(cur.as_fd(), &name, 0o700).map_err(|e| match e {
             SysError::Os(n) if n == sys::EEXIST => {
                 TraitError::new(ErrorCode::AlreadyExists, "rootfs already exists")
@@ -226,11 +306,13 @@ mod imp {
             }
             _ => TraitError::new(ErrorCode::Internal, "failed to create rootfs"),
         })?;
-        let identity = match open_dir(cur.as_fd(), &name)
-            .ok()
-            .and_then(|fd| fstat(fd.as_fd()).ok())
-        {
-            Some((dev, ino, true, _)) => (dev, ino),
+        let opened = open_dir(cur.as_fd(), &name).ok().and_then(|fd| {
+            fstat(fd.as_fd())
+                .ok()
+                .map(|(dev, ino, is_dir, _)| (fd, dev, ino, is_dir))
+        });
+        let (dir, identity) = match opened {
+            Some((fd, dev, ino, true)) => (fd, (dev, ino)),
             _ => {
                 // 作った直後に差し替えられた。固定済みの親の下の空ディレクトリだけを best effort で戻す。
                 let _ = sys::remove_dir_at(cur.as_fd(), &name);
@@ -242,13 +324,15 @@ mod imp {
         };
         Ok(Backing {
             parent: cur,
-            name,
+            final_name,
+            current: name,
+            dir,
             identity,
         })
     }
 
     pub(super) fn remove(_path: &Path, b: Backing) -> Result<(), TraitError> {
-        let root = match sys::open_dir_path_nofollow(Some(b.parent.as_fd()), &b.name) {
+        let root = match sys::open_dir_path_nofollow(Some(b.parent.as_fd()), &b.current) {
             Ok(fd) => fd,
             // 既に無ければ消す物が無い。
             Err(SysError::Os(n)) if n == sys::ENOENT => return Ok(()),
@@ -260,7 +344,7 @@ mod imp {
         }
         let mut seen = 0usize;
         remove_children(root.as_fd(), 0, &mut seen)?;
-        match sys::remove_dir_at(b.parent.as_fd(), &b.name) {
+        match sys::remove_dir_at(b.parent.as_fd(), &b.current) {
             Ok(()) => Ok(()),
             Err(SysError::Os(n)) if n == sys::ENOENT => Ok(()),
             Err(_) => Err(remove_failed()),
@@ -314,133 +398,11 @@ mod imp {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(not(target_os = "linux"))]
 mod imp {
-    //! Linux 以外の Unix: 経路の lstat と dev・ino の照合による best effort（fd 相対の操作は未実装）。
-
-    use std::ffi::OsStr;
-    use std::io;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    use std::path::{Path, PathBuf};
-
-    use super::{CLEANUP_MAX_DEPTH, CLEANUP_MAX_ENTRIES, invalid, refuse, remove_failed};
-    use crate::oci_runtime::create::{inspect, is_link_like};
-    use crate::traits::{ErrorCode, TraitError};
-
-    #[derive(Debug)]
-    pub(super) struct Backing {
-        bundle: PathBuf,
-        identity: (u64, u64),
-    }
-
-    pub(super) fn create_dir(
-        bundle: &Path,
-        parents: &[&OsStr],
-        last: &OsStr,
-    ) -> Result<Backing, TraitError> {
-        let mut current = bundle.to_path_buf();
-        for part in parents {
-            current.push(part);
-            let meta = inspect(&current)?;
-            if is_link_like(&meta) {
-                return Err(invalid("rootfs must not contain a symlink"));
-            }
-            if !meta.is_dir() {
-                return Err(invalid("rootfs parent is not a directory"));
-            }
-        }
-        current.push(last);
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder.create(&current).map_err(|e| match e.kind() {
-            io::ErrorKind::AlreadyExists => {
-                TraitError::new(ErrorCode::AlreadyExists, "rootfs already exists")
-            }
-            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => {
-                TraitError::new(ErrorCode::NotFound, "rootfs parent directory not found")
-            }
-            io::ErrorKind::PermissionDenied => {
-                TraitError::new(ErrorCode::PermissionDenied, "cannot create rootfs")
-            }
-            _ => TraitError::new(ErrorCode::Internal, "failed to create rootfs"),
-        })?;
-        let meta = inspect(&current)?;
-        if is_link_like(&meta) || !meta.is_dir() {
-            return Err(TraitError::new(
-                ErrorCode::Internal,
-                "created rootfs is not a directory",
-            ));
-        }
-        Ok(Backing {
-            bundle: bundle.to_path_buf(),
-            identity: (meta.dev(), meta.ino()),
-        })
-    }
-
-    pub(super) fn remove(path: &Path, b: Backing) -> Result<(), TraitError> {
-        let rel = path.strip_prefix(&b.bundle).map_err(|_| refuse())?;
-        let parts: Vec<_> = rel.components().collect();
-        let mut current = b.bundle.clone();
-        for (i, c) in parts.iter().enumerate() {
-            let std::path::Component::Normal(part) = c else {
-                return Err(refuse());
-            };
-            current.push(part);
-            let meta = match std::fs::symlink_metadata(&current) {
-                Ok(m) => m,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-                Err(_) => return Err(remove_failed()),
-            };
-            if is_link_like(&meta) || !meta.is_dir() {
-                return Err(refuse());
-            }
-            if i + 1 == parts.len() && (meta.dev(), meta.ino()) != b.identity {
-                return Err(refuse());
-            }
-        }
-        match std::fs::remove_dir_all(&current) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                restore_owner_access(&current)?;
-                std::fs::remove_dir_all(&current).map_err(|_| remove_failed())
-            }
-            Err(_) => Err(remove_failed()),
-        }
-    }
-
-    fn restore_owner_access(root: &Path) -> Result<(), TraitError> {
-        let mut stack = vec![(root.to_path_buf(), 0usize)];
-        let mut seen = 0usize;
-        while let Some((dir, depth)) = stack.pop() {
-            if depth > CLEANUP_MAX_DEPTH {
-                return Err(remove_failed());
-            }
-            let meta = std::fs::symlink_metadata(&dir).map_err(|_| remove_failed())?;
-            if !meta.file_type().is_dir() {
-                continue;
-            }
-            let mut perms = meta.permissions();
-            perms.set_mode(perms.mode() | 0o700);
-            std::fs::set_permissions(&dir, perms).map_err(|_| remove_failed())?;
-            for entry in std::fs::read_dir(&dir).map_err(|_| remove_failed())? {
-                let entry = entry.map_err(|_| remove_failed())?;
-                seen += 1;
-                if seen > CLEANUP_MAX_ENTRIES {
-                    return Err(remove_failed());
-                }
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                    stack.push((entry.path(), depth + 1));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
-#[cfg(not(unix))]
-mod imp {
-    //! Windows 等: ファイル ID とボリューム識別子をハンドルから照合する実装が無いため、後始末は拒否する
-    //! （fail-closed。REPAIR-3: 実装済みを装わない）。
+    //! Linux 以外（macOS 等の Unix・Windows）: fd 相対の作成・削除が未実装のため、経路を再解決して
+    //! 削除すると中間要素の差し替えで bundle 外を消しうる。後始末は拒否する（fail-closed。展開物が残る。
+    //! REPAIR-3: 実装済みを装わない）。展開先は最終の名前に直接作る（非公開の名前での展開・公開は Linux のみ）。
 
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -451,6 +413,14 @@ mod imp {
 
     #[derive(Debug)]
     pub(super) struct Backing;
+
+    pub(super) fn unpack_path(path: &Path, _b: &Backing) -> PathBuf {
+        path.to_path_buf()
+    }
+
+    pub(super) fn publish(_b: &mut Backing) -> Result<(), TraitError> {
+        Ok(())
+    }
 
     pub(super) fn create_dir(
         bundle: &Path,
@@ -469,20 +439,27 @@ mod imp {
             }
         }
         current.push(last);
-        std::fs::DirBuilder::new()
-            .create(&current)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::AlreadyExists => {
-                    TraitError::new(ErrorCode::AlreadyExists, "rootfs already exists")
-                }
-                std::io::ErrorKind::NotFound => {
-                    TraitError::new(ErrorCode::NotFound, "rootfs parent directory not found")
-                }
-                std::io::ErrorKind::PermissionDenied => {
-                    TraitError::new(ErrorCode::PermissionDenied, "cannot create rootfs")
-                }
-                _ => TraitError::new(ErrorCode::Internal, "failed to create rootfs"),
-            })?;
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut b = std::fs::DirBuilder::new();
+            b.mode(0o700);
+            b
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
+        builder.create(&current).map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => {
+                TraitError::new(ErrorCode::AlreadyExists, "rootfs already exists")
+            }
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                TraitError::new(ErrorCode::NotFound, "rootfs parent directory not found")
+            }
+            std::io::ErrorKind::PermissionDenied => {
+                TraitError::new(ErrorCode::PermissionDenied, "cannot create rootfs")
+            }
+            _ => TraitError::new(ErrorCode::Internal, "failed to create rootfs"),
+        })?;
         Ok(Backing)
     }
 
@@ -490,6 +467,7 @@ mod imp {
         Err(refuse())
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,15 +480,20 @@ mod tests {
         dir
     }
 
-    /// OCI-7: 空の rootfs を作り、remove で消せる。
-    #[cfg(unix)]
+    /// OCI-7: 空の rootfs を作り、展開先の経路へ書いて公開し、remove で消せる。
+    #[cfg(target_os = "linux")]
     #[test]
-    fn oci7_prepare_creates_empty_dir_and_remove_deletes_it() {
+    fn oci7_prepare_creates_empty_dir_publishes_and_remove_deletes_it() {
         let b = tmp("basic");
-        let c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         assert_eq!(c.path(), b.join("rootfs"));
-        assert_eq!(std::fs::read_dir(c.path()).expect("read").count(), 0);
-        std::fs::write(c.path().join("f"), b"x").expect("write");
+        // 公開前は最終の名前に存在しない（他の create から rootfs として見えない）。
+        assert!(!b.join("rootfs").exists());
+        let up = c.unpack_path();
+        assert_eq!(std::fs::read_dir(&up).expect("read").count(), 0);
+        std::fs::write(up.join("f"), b"x").expect("write");
+        c.publish().expect("publish");
+        assert!(b.join("rootfs").join("f").exists());
         c.remove().expect("remove");
         assert!(!b.join("rootfs").exists());
         let _ = std::fs::remove_dir_all(&b);
@@ -533,13 +516,13 @@ mod tests {
     }
 
     /// OCI-7: 読み取り専用 mode の木も権限を補正して消せる。
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_remove_restores_permissions_for_read_only_tree() {
         use std::os::unix::fs::PermissionsExt;
         let b = tmp("ro");
         let c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
-        let sub = c.path().join("sub");
+        let sub = c.unpack_path().join("sub");
         std::fs::create_dir(&sub).expect("sub");
         std::fs::write(sub.join("f"), b"x").expect("f");
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).expect("ro");
@@ -563,13 +546,14 @@ mod tests {
     }
 
     /// OCI-7: 差し替えられた rootfs（symlink）は消さない。
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_remove_refuses_replaced_rootfs() {
         let b = tmp("replaced");
         let outside = tmp("replaced-out");
         std::fs::write(outside.join("marker"), b"x").expect("marker");
-        let c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        c.publish().expect("publish");
         std::fs::remove_dir(c.path()).expect("rm");
         std::os::unix::fs::symlink(&outside, c.path()).expect("symlink");
         let e = c.remove().expect_err("refuse");
@@ -587,8 +571,9 @@ mod tests {
         let b = tmp("parentswap");
         let outside = tmp("parentswap-out");
         std::fs::create_dir(b.join("p")).expect("p");
-        let c = prepare_rootfs_target(&b, Path::new("p/rootfs")).expect("prepare");
-        std::fs::write(c.path().join("mine"), b"x").expect("mine");
+        let mut c = prepare_rootfs_target(&b, Path::new("p/rootfs")).expect("prepare");
+        std::fs::write(c.unpack_path().join("mine"), b"x").expect("mine");
+        c.publish().expect("publish");
         std::fs::create_dir(outside.join("rootfs")).expect("o rootfs");
         std::fs::write(outside.join("rootfs").join("marker"), b"x").expect("marker");
         std::fs::rename(b.join("p"), b.join("p_moved")).expect("move");
@@ -607,8 +592,9 @@ mod tests {
         let b = tmp("innerlink");
         let outside = tmp("innerlink-out");
         std::fs::write(outside.join("marker"), b"x").expect("marker");
-        let c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
-        std::os::unix::fs::symlink(&outside, c.path().join("dirlink")).expect("symlink");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        std::os::unix::fs::symlink(&outside, c.unpack_path().join("dirlink")).expect("symlink");
+        c.publish().expect("publish");
         c.remove().expect("remove");
         assert!(outside.join("marker").exists());
         assert!(!b.join("rootfs").exists());
@@ -620,14 +606,51 @@ mod tests {
     #[test]
     fn oci7_prepare_normalizes_path() {
         let b = tmp("normalize");
-        let c = prepare_rootfs_target(&b, Path::new("./rootfs/")).expect("prepare");
+        let mut c = prepare_rootfs_target(&b, Path::new("./rootfs/")).expect("prepare");
         assert_eq!(c.path(), b.join("rootfs"));
+        c.publish().expect("publish");
         assert!(b.join("rootfs").is_dir());
         let _ = std::fs::remove_dir_all(&b);
     }
 
-    /// OCI-7: Windows は同一性を保証できないため後始末を拒否し、展開物を残す。
-    #[cfg(not(unix))]
+    /// SEC-1: 展開先は固定した rootfs の fd を指し、作成後に親を symlink へ差し替えても bundle 外へ書かない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_unpack_path_survives_parent_swap() {
+        let b = tmp("unpackswap");
+        let outside = tmp("unpackswap-out");
+        std::fs::create_dir(b.join("p")).expect("p");
+        let c = prepare_rootfs_target(&b, Path::new("p/rootfs")).expect("prepare");
+        std::fs::rename(b.join("p"), b.join("p_moved")).expect("move");
+        std::os::unix::fs::symlink(&outside, b.join("p")).expect("symlink");
+        std::fs::write(c.unpack_path().join("payload"), b"x").expect("write");
+        assert_eq!(std::fs::read_dir(&outside).expect("read").count(), 0);
+        assert_eq!(
+            std::fs::read_dir(b.join("p_moved")).expect("read").count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// OCI-7: 最終の名前が公開前に作られていたら、公開は置き換えずに拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_publish_refuses_when_final_name_appeared() {
+        let b = tmp("pubrace");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        std::fs::create_dir(b.join("rootfs")).expect("mk");
+        std::fs::write(b.join("rootfs").join("keep"), b"x").expect("w");
+        let e = c.publish().expect_err("exists");
+        assert_eq!(e.code(), ErrorCode::AlreadyExists);
+        assert!(b.join("rootfs").join("keep").exists());
+        c.remove().expect("remove staging");
+        assert!(b.join("rootfs").join("keep").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7・SEC-1: Linux 以外は同一性を保証できないため後始末を拒否し、展開物を残す。
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn oci7_remove_refuses_without_identity_check() {
         let b = tmp("winrefuse");

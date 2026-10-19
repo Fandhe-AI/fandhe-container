@@ -155,11 +155,53 @@ impl RecordedRule {
     }
 }
 
+/// カーネル監査のログ制御フラグを渡せる最小の Landlock ABI（ABI 7。OS 非依存の定義。`crate::landlock` が再利用する。SEC-4・#2026）。
+pub const MIN_LANDLOCK_AUDIT_ABI: u32 = 7;
+
+/// launch が Landlock の拒否をカーネル監査へ残す要求をしたかの記録（OS 非依存の語彙。SEC-4・#2026）。
+///
+/// `crate::landlock::LandlockAuditMode` の写し。ワークロードの拒否の記録はカーネル監査（読み手は外部）で、
+/// この値は「要求したか・縮退したか」を `state.json` に残すだけである。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecordedLandlockAudit {
+    /// ログ制御フラグで execve の後の拒否の記録を要求した（Landlock ABI 7 以上）。
+    KernelAuditRequested,
+    /// ABI がログ制御フラグに未対応のため要求できなかった（縮退）。
+    Unavailable {
+        /// launch 時に検出した ABI。
+        detected_abi: u32,
+    },
+    /// 記録が無い（このフィールドが入る前の `state.json`）。旧記録はフラグ無しで適用されているため、
+    /// 欠落を「監査あり」と解釈しない。
+    NotRecorded,
+}
+
+impl RecordedLandlockAudit {
+    /// 永続化して読み戻せる値かを検証する（`state.json` の読み出し側の規則と同一。SEC-4・#2026）。
+    ///
+    /// `Unavailable` は縮退の記録なので、`detected_abi` は 1 以上かつ [`MIN_LANDLOCK_AUDIT_ABI`] 未満に限る
+    /// （0 は ABI を検出できていない値、要求 ABI 以上は縮退していない値で、どちらも矛盾する）。
+    pub fn validate(self) -> Result<Self, LaunchIsolationError> {
+        match self {
+            Self::Unavailable { detected_abi }
+                if detected_abi == 0 || detected_abi >= MIN_LANDLOCK_AUDIT_ABI =>
+            {
+                Err(LaunchIsolationError(
+                    "landlock audit degraded ABI is out of range",
+                ))
+            }
+            other => Ok(other),
+        }
+    }
+}
+
 /// launch が適用した Landlock の handled access とルール（`LandlockRuleset` の素の型での写し）。
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecordedLandlock {
     handled: u64,
     rules: Vec<RecordedRule>,
+    audit: RecordedLandlockAudit,
 }
 
 impl RecordedLandlock {
@@ -192,7 +234,30 @@ impl RecordedLandlock {
                 return Err(err("landlock rules contain a duplicated path"));
             }
         }
-        Ok(Self { handled, rules })
+        Ok(Self {
+            handled,
+            rules,
+            audit: RecordedLandlockAudit::NotRecorded,
+        })
+    }
+
+    /// カーネル監査の要求の記録を添える（SEC-4・#2026）。
+    ///
+    /// [`RecordedLandlockAudit::validate`] を通らない値（`Unavailable` の ABI が 0、または要求 ABI
+    /// [`MIN_LANDLOCK_AUDIT_ABI`] 以上）は拒否する。保存できても `state.json` から読み戻せない値を作らないため
+    /// （永続化できる値は必ず読み戻せる）。
+    pub fn with_audit(
+        mut self,
+        audit: RecordedLandlockAudit,
+    ) -> Result<Self, LaunchIsolationError> {
+        audit.validate()?;
+        self.audit = audit;
+        Ok(self)
+    }
+
+    /// カーネル監査の要求の記録。
+    pub fn audit(&self) -> RecordedLandlockAudit {
+        self.audit
     }
 
     /// handled access のビット値。
@@ -250,11 +315,14 @@ impl fmt::Debug for LaunchIsolationRecord {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use super::RecordedLandlockAudit;
     use super::{
         LaunchIsolationError, LaunchIsolationRecord, RecordedLandlock, RecordedRule,
         RecordedTarget, RootIdentity,
     };
-    use crate::landlock::{AccessFs, LandlockRuleset, PathRule, RuleOrigin, RulePath};
+    use crate::landlock::{
+        AccessFs, LandlockAuditMode, LandlockRuleset, PathRule, RuleOrigin, RulePath,
+    };
 
     impl LaunchIsolationRecord {
         /// launch が適用する `ruleset` と、launch 後の `/` の識別子から記録を作る。
@@ -270,12 +338,28 @@ mod linux {
                 .iter()
                 .map(recorded_rule)
                 .collect::<Result<Vec<_>, _>>()?;
-            let landlock = RecordedLandlock::new(ruleset.handled_access_fs().bits(), rules)?;
+            let audit = match ruleset.audit_mode() {
+                LandlockAuditMode::KernelAuditRequested => {
+                    RecordedLandlockAudit::KernelAuditRequested
+                }
+                LandlockAuditMode::Unavailable { detected, .. } => {
+                    RecordedLandlockAudit::Unavailable {
+                        detected_abi: detected,
+                    }
+                }
+            };
+            let landlock = RecordedLandlock::new(ruleset.handled_access_fs().bits(), rules)?
+                .with_audit(audit)?;
             Ok(Self::from_parts(root, landlock))
         }
 
         /// 記録から Landlock ruleset を組み直す（exec の再適用用。ABI の再検出も `config.json` の再解釈もしない）。
-        pub(crate) fn landlock_ruleset(&self) -> Result<LandlockRuleset, LaunchIsolationError> {
+        ///
+        /// カーネル監査のモードは記録ではなく、呼び出し側が今のカーネルの ABI から決めて渡す（SEC-4・#2026）。
+        pub(crate) fn landlock_ruleset(
+            &self,
+            audit: LandlockAuditMode,
+        ) -> Result<LandlockRuleset, LaunchIsolationError> {
             let bad = LaunchIsolationError("recorded landlock access is out of range");
             let handled = AccessFs::from_bits(self.landlock.handled()).ok_or(bad)?;
             let rules = self
@@ -302,7 +386,7 @@ mod linux {
                     })
                 })
                 .collect::<Result<Vec<_>, LaunchIsolationError>>()?;
-            Ok(LandlockRuleset::from_recorded(handled, rules))
+            Ok(LandlockRuleset::from_recorded(handled, rules, audit))
         }
     }
 
@@ -346,6 +430,27 @@ mod tests {
             },
             allowed,
         )
+    }
+
+    /// SEC-4・#2026: `with_audit` は永続化して読み戻せる値だけを受ける。縮退の ABI は 1〜6 のみで、0 と 7 以上は拒否する
+    /// （`LandlockAuditDto::into_record` と同じ規則。読み戻せない記録を保存させない）。
+    #[test]
+    fn sec4_2026_with_audit_rejects_unreadable_values() {
+        let base = || RecordedLandlock::new(0xFFFF, vec![root_rule(0x7)]).unwrap();
+        for ok in [
+            RecordedLandlockAudit::NotRecorded,
+            RecordedLandlockAudit::KernelAuditRequested,
+            RecordedLandlockAudit::Unavailable { detected_abi: 1 },
+            RecordedLandlockAudit::Unavailable { detected_abi: 6 },
+        ] {
+            assert_eq!(base().with_audit(ok).unwrap().audit(), ok);
+        }
+        for bad in [0, 7, 8, u32::MAX] {
+            let err = base()
+                .with_audit(RecordedLandlockAudit::Unavailable { detected_abi: bad })
+                .unwrap_err();
+            assert_eq!(err.message(), "landlock audit degraded ABI is out of range");
+        }
     }
 
     /// SUP-6・CORE-5・#1468: 件数・ビット範囲・先頭・重複の検証を具体値で照合する。
@@ -440,7 +545,7 @@ mod tests {
             let rec = LaunchIsolationRecord::new(RootIdentity::new(1, 2), &ruleset).expect("rec");
             assert_eq!(rec.root(), RootIdentity::new(1, 2));
             assert_eq!(rec.landlock().rules().len(), ruleset.rules().len());
-            let back = rec.landlock_ruleset().expect("ruleset");
+            let back = rec.landlock_ruleset(ruleset.audit_mode()).expect("ruleset");
             assert_eq!(back.handled_access_fs(), ruleset.handled_access_fs());
             assert_eq!(back.rules(), ruleset.rules());
         }

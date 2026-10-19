@@ -297,6 +297,14 @@ name = "landlock"
 path = "tests/landlock.rs"
 harness = false
 
+# exec 後の Landlock の拒否がカーネル監査へ届くことの実機前提の結合試験（SEC-4・CORE-5・#2026・#2291。実機実行は #2306）。
+# 適用は不可逆・単一スレッド前提のため harness = false。Landlock ABI 7+ と audit ログの可読を要し、
+# `-- --ignored` 指定時のみ検証する（AGENTS.md）。
+[[test]]
+name = "landlock_audit_exec"
+path = "tests/landlock_audit_exec.rs"
+harness = false
+
 # 攻撃テストハーネス基盤（SEC-2・TASK-42.1・#199。ESC-01〜10 は #200〜#203 で追加）。CLONE_NEWUSER /
 # 単一スレッド前提の fork のため harness = false。`-- --ignored` 指定時のみ実機前提部分を実行する（AGENTS.md）。
 [[test]]

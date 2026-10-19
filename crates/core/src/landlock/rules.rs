@@ -33,7 +33,7 @@
 
 use std::fmt;
 
-use super::LandlockSupport;
+use super::{LandlockAuditMode, LandlockSupport, landlock_audit_mode_for_abi};
 use crate::dev_mounts::{IMPLICIT_DEV_MOUNT_COUNT, ImplicitDevMount, ImplicitDevMounts};
 use crate::oci_runtime::{
     CONFIG_MAX_MOUNTS, CONFIG_MAX_PATH_BYTES, MountDestination, OciConfig, OciMount, OciRoot,
@@ -241,6 +241,8 @@ pub struct LandlockRuleset {
     handled_access_fs: AccessFs,
     rules: Vec<PathRule>,
     shadowed: Vec<ShadowedRestriction>,
+    /// カーネル監査へ拒否を残す要求の可否（SEC-4・#2026）。
+    audit: LandlockAuditMode,
 }
 
 impl LandlockRuleset {
@@ -251,6 +253,7 @@ impl LandlockRuleset {
             handled_access_fs: handled_for_abi(abi),
             rules,
             shadowed: Vec::new(),
+            audit: landlock_audit_mode_for_abi(abi),
         }
     }
 
@@ -258,14 +261,25 @@ impl LandlockRuleset {
     ///
     /// ABI の再検出も `config.json` の再解釈もしない。今のカーネルの ABI から handled を計算し直すと、launch の
     /// handled に無かった権利が無制限になり launch と意味が変わるため、**記録した `handled` をそのまま使う**。
-    /// `shadowed` は適用に使わない監査用の情報なので空にする。入力の検証は呼び出し側
+    /// `shadowed` は適用に使わない監査用の情報なので空にする。`audit` は記録ではなく**今のカーネルの ABI**から
+    /// 呼び出し側が決めて渡す（ログ制御フラグは今のカーネルが受けるかで決まる。SEC-4・#2026）。入力の検証は呼び出し側
     /// （`launch_isolation::RecordedLandlock::validate`）が済ませている前提。
-    pub(crate) fn from_recorded(handled: AccessFs, rules: Vec<PathRule>) -> Self {
+    pub(crate) fn from_recorded(
+        handled: AccessFs,
+        rules: Vec<PathRule>,
+        audit: LandlockAuditMode,
+    ) -> Self {
         Self {
             handled_access_fs: handled,
             rules,
             shadowed: Vec::new(),
+            audit,
         }
+    }
+
+    /// カーネル監査へ拒否を残す要求のモード（`landlock_restrict_self` の flags はこれで決まる。SEC-4・#2026）。
+    pub fn audit_mode(&self) -> LandlockAuditMode {
+        self.audit
     }
 
     /// ruleset 属性へ渡す handled access。
@@ -651,6 +665,7 @@ pub fn build_path_rules_with_dev(
         handled_access_fs: handled,
         rules,
         shadowed,
+        audit: support.audit_mode(),
     })
 }
 

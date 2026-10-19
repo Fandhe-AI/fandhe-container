@@ -90,8 +90,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::dev_mounts::ImplicitDevMount;
 use crate::launch_isolation::{
-    LaunchIsolationRecord, MAX_RECORDED_RULES, RecordedLandlock, RecordedRule, RecordedTarget,
-    RootIdentity,
+    LaunchIsolationRecord, MAX_RECORDED_RULES, RecordedLandlock, RecordedLandlockAudit,
+    RecordedRule, RecordedTarget, RootIdentity,
 };
 use crate::oci_runtime::MountDestination;
 use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
@@ -1558,6 +1558,47 @@ struct RootDto {
 struct LandlockDto {
     handled: u64,
     rules: Vec<LandlockRuleDto>,
+    /// カーネル監査の要求の記録（SEC-4・#2026）。無ければ `NotRecorded`（旧記録を「監査あり」と読まない）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audit: Option<LandlockAuditDto>,
+}
+
+/// カーネル監査の要求の記録。`mode` は `kernel_audit_requested` / `unavailable_abi_too_old`。
+#[derive(Debug, Serialize, Deserialize)]
+struct LandlockAuditDto {
+    mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detected_abi: Option<u32>,
+}
+
+impl LandlockAuditDto {
+    fn from_record(audit: RecordedLandlockAudit) -> Option<Self> {
+        match audit {
+            RecordedLandlockAudit::KernelAuditRequested => Some(Self {
+                mode: "kernel_audit_requested".to_owned(),
+                detected_abi: None,
+            }),
+            RecordedLandlockAudit::Unavailable { detected_abi } => Some(Self {
+                mode: "unavailable_abi_too_old".to_owned(),
+                detected_abi: Some(detected_abi),
+            }),
+            _ => None,
+        }
+    }
+
+    /// untrusted な入力を検証して戻す。未知の mode、`detected_abi` の欠落・0・要求 ABI 以上は破損として拒否する。
+    fn into_record(self) -> Result<RecordedLandlockAudit, ()> {
+        match (self.mode.as_str(), self.detected_abi) {
+            ("kernel_audit_requested", None) => Ok(RecordedLandlockAudit::KernelAuditRequested),
+            // 範囲の規則は書き込み側（`with_audit`）と同じ `validate` が唯一の定義。
+            ("unavailable_abi_too_old", Some(abi)) => {
+                RecordedLandlockAudit::Unavailable { detected_abi: abi }
+                    .validate()
+                    .map_err(|_| ())
+            }
+            _ => Err(()),
+        }
+    }
 }
 
 /// Landlock ルール 1 件。`origin` は `root` / `mount`（`index` 必須）/ `implicit`。
@@ -1598,6 +1639,7 @@ impl LaunchIsolationDto {
             landlock: LandlockDto {
                 handled: record.landlock().handled(),
                 rules,
+                audit: LandlockAuditDto::from_record(record.landlock().audit()),
             },
         }
     }
@@ -1613,7 +1655,14 @@ impl LaunchIsolationDto {
             .into_iter()
             .map(LandlockRuleDto::into_rule)
             .collect::<Result<Vec<_>, _>>()?;
-        let landlock = RecordedLandlock::new(self.landlock.handled, rules).map_err(|_| ())?;
+        let audit = match self.landlock.audit {
+            Some(a) => a.into_record()?,
+            None => RecordedLandlockAudit::NotRecorded,
+        };
+        let landlock = RecordedLandlock::new(self.landlock.handled, rules)
+            .map_err(|_| ())?
+            .with_audit(audit)
+            .map_err(|_| ())?;
         Ok(LaunchIsolationRecord::from_parts(
             RootIdentity::new(self.root.dev, self.root.ino),
             landlock,
@@ -2645,6 +2694,59 @@ mod tests {
             RootIdentity::new(44, ino),
             RecordedLandlock::new(0xFFFF, rules).unwrap(),
         )
+    }
+
+    fn iso_with_audit(a: RecordedLandlockAudit) -> LaunchIsolationRecord {
+        let base = iso(100);
+        LaunchIsolationRecord::from_parts(
+            base.root(),
+            RecordedLandlock::new(0xFFFF, base.landlock().rules().to_vec())
+                .unwrap()
+                .with_audit(a)
+                .unwrap(),
+        )
+    }
+
+    /// SEC-4・#2026: カーネル監査の要求・縮退の記録が JSON の具体値で往復し、無い旧記録は `NotRecorded`、
+    /// 不正な mode・ABI は破損として拒否される。
+    #[test]
+    fn sec4_state_landlock_audit_roundtrip() {
+        for (audit, want) in [
+            (
+                RecordedLandlockAudit::KernelAuditRequested,
+                serde_json::json!({"mode": "kernel_audit_requested"}),
+            ),
+            (
+                RecordedLandlockAudit::Unavailable { detected_abi: 6 },
+                serde_json::json!({"mode": "unavailable_abi_too_old", "detected_abi": 6}),
+            ),
+        ] {
+            let dto = LaunchIsolationDto::from_record(&iso_with_audit(audit));
+            let v = serde_json::to_value(&dto).unwrap();
+            assert_eq!(v["landlock"]["audit"], want);
+            let back: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+            assert_eq!(back.into_record().unwrap().landlock().audit(), audit);
+        }
+        let legacy = LaunchIsolationDto::from_record(&iso(100));
+        let v = serde_json::to_value(&legacy).unwrap();
+        assert!(v["landlock"].get("audit").is_none());
+        let back: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.into_record().unwrap().landlock().audit(),
+            RecordedLandlockAudit::NotRecorded
+        );
+        for bad in [
+            serde_json::json!({"mode": "bogus"}),
+            serde_json::json!({"mode": "unavailable_abi_too_old"}),
+            serde_json::json!({"mode": "unavailable_abi_too_old", "detected_abi": 0}),
+            serde_json::json!({"mode": "unavailable_abi_too_old", "detected_abi": 7}),
+            serde_json::json!({"mode": "kernel_audit_requested", "detected_abi": 7}),
+        ] {
+            let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+            v["landlock"]["audit"] = bad;
+            let dto: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+            assert!(dto.into_record().is_err());
+        }
     }
 
     /// SUP-6・TASK-163 追補・#1468: launch 時の分離の記録が `state.json` に書かれ（形を具体値で照合）、update で

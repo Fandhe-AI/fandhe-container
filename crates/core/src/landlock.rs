@@ -53,6 +53,95 @@ use crate::traits::ErrorCode;
 /// 必須の最小 Landlock ABI（CORE-5: Linux 6.12+・ABI 6+）。
 pub const MIN_LANDLOCK_ABI: u32 = 6;
 
+/// カーネル監査へ拒否を残すログ制御フラグを渡せる最小の Landlock ABI（ABI 7。SEC-4・#2026）。
+pub const MIN_LANDLOCK_AUDIT_ABI: u32 = crate::launch_isolation::MIN_LANDLOCK_AUDIT_ABI;
+
+/// `landlock_restrict_self` へ渡す flags。既知の組み合わせだけを表す newtype（任意の値は作れない。REPAIR-2）。
+///
+/// 渡すのは `LOG_NEW_EXEC_ON` だけで、`LOG_SAME_EXEC_OFF`・`LOG_SUBDOMAINS_OFF`（記録を抑える方向）と
+/// `TSYNC`（ABI 8）は使わない（SEC-4・#2026）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestrictSelfFlags(u32);
+
+impl RestrictSelfFlags {
+    /// flags なし（ABI 7 未満のカーネル。未知ビットは `EINVAL` になるため何も渡さない）。
+    pub const NONE: Self = Self(0);
+    /// execve の後の拒否もカーネル監査へ記録する（`LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON`）。
+    pub const LOG_NEW_EXEC_ON: Self = Self(sys::LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON);
+
+    /// syscall へ渡すビット値。
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+/// Landlock の拒否をカーネル監査（`AUDIT_LANDLOCK_ACCESS`・`AUDIT_LANDLOCK_DOMAIN`）へ残せるか（SEC-4・CORE-5・#2026）。
+///
+/// カーネル監査の読み手は外部（auditd 等）で、本ランタイムは記録を要求するだけである。ワークロードの拒否の
+/// 証拠に `audit_log::landlock` のレコード（ランタイム自身のプローブの写像）を使わない。ホスト側の audit が
+/// 無効なら実際の記録は出ないため、`KernelAuditRequested` は「要求した」ことだけを表す（その判定は #2027）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LandlockAuditMode {
+    /// ABI 7 以上。ログ制御フラグで execve の後の拒否の記録を要求した。
+    KernelAuditRequested,
+    /// ABI がログ制御フラグに未対応。execve の後の拒否はカーネル監査に残らない（縮退）。
+    Unavailable {
+        /// 検出した ABI。
+        detected: u32,
+        /// 必要な ABI（[`MIN_LANDLOCK_AUDIT_ABI`]）。
+        required: u32,
+    },
+}
+
+impl LandlockAuditMode {
+    /// このモードで `landlock_restrict_self` へ渡す flags。
+    pub fn restrict_self_flags(self) -> RestrictSelfFlags {
+        match self {
+            Self::KernelAuditRequested => RestrictSelfFlags::LOG_NEW_EXEC_ON,
+            Self::Unavailable { .. } => RestrictSelfFlags::NONE,
+        }
+    }
+
+    /// 機械可読な固定語彙。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::KernelAuditRequested => "kernel_audit_requested",
+            Self::Unavailable { .. } => "landlock_audit_abi_too_old",
+        }
+    }
+
+    /// 縮退を示す構造化ログ 1 行（固定語彙と数値のみ。`KernelAuditRequested` は `None`）。
+    pub fn log_line(self) -> Option<String> {
+        match self {
+            Self::KernelAuditRequested => None,
+            Self::Unavailable { detected, required } => Some(format!(
+                r#"{{"component":"core.landlock","operation":"landlock_audit","outcome":"degraded","reason":"{}","abi":{detected},"required":{required}}}"#,
+                self.as_str()
+            )),
+        }
+    }
+}
+
+/// ABI からカーネル監査のモードを決める（純粋関数。SEC-4・#2026）。
+pub fn landlock_audit_mode_for_abi(abi: u32) -> LandlockAuditMode {
+    if abi >= MIN_LANDLOCK_AUDIT_ABI {
+        LandlockAuditMode::KernelAuditRequested
+    } else {
+        LandlockAuditMode::Unavailable {
+            detected: abi,
+            required: MIN_LANDLOCK_AUDIT_ABI,
+        }
+    }
+}
+
+impl LandlockSupport {
+    /// この ABI でのカーネル監査のモード。
+    pub fn audit_mode(&self) -> LandlockAuditMode {
+        landlock_audit_mode_for_abi(self.abi.get())
+    }
+}
+
 /// Landlock ABI バージョン。0 を表現できない（壊れた値を作れない）newtype。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LandlockAbi(NonZeroU32);
@@ -252,6 +341,47 @@ mod tests {
     impl AbiProbe for Fake {
         fn abi_version(&mut self) -> Result<u32, SysError> {
             self.0
+        }
+    }
+
+    /// SEC-4: ABI で flags と縮退が切り替わる。
+    #[test]
+    fn sec4_landlock_audit_mode_for_abi() {
+        let m6 = landlock_audit_mode_for_abi(6);
+        assert_eq!(
+            m6,
+            LandlockAuditMode::Unavailable {
+                detected: 6,
+                required: 7
+            }
+        );
+        assert_eq!(m6.restrict_self_flags().bits(), 0);
+        for abi in [7, 8, u32::MAX] {
+            let m = landlock_audit_mode_for_abi(abi);
+            assert_eq!(m, LandlockAuditMode::KernelAuditRequested);
+            assert_eq!(m.restrict_self_flags().bits(), 2);
+        }
+    }
+
+    /// SEC-4: 縮退のログ行は固定文字列で、改行を含まない。
+    #[test]
+    fn sec4_landlock_audit_log_line() {
+        let line = landlock_audit_mode_for_abi(6).log_line().expect("line");
+        assert_eq!(
+            line,
+            r#"{"component":"core.landlock","operation":"landlock_audit","outcome":"degraded","reason":"landlock_audit_abi_too_old","abi":6,"required":7}"#
+        );
+        assert!(!line.contains('\n'));
+        assert_eq!(landlock_audit_mode_for_abi(7).log_line(), None);
+    }
+
+    /// SEC-4: 実カーネルの ABI から期待するモードと検出結果の `audit_mode` が一致する。
+    #[test]
+    fn sec4_detect_audit_mode_matches_raw_probe() {
+        if let Ok(raw) = sys::landlock_abi_version()
+            && let Ok(support) = detect_landlock_abi()
+        {
+            assert_eq!(support.audit_mode(), landlock_audit_mode_for_abi(raw));
         }
     }
 

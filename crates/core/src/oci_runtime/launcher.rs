@@ -1274,7 +1274,13 @@ impl LaunchOps for RealOps {
         &self,
         config: &super::config::OciConfig,
     ) -> Result<LandlockRuleset, ExecError> {
-        crate::exec::landlock_ruleset_from_config(config)
+        let ruleset = crate::exec::landlock_ruleset_from_config(config)?;
+        // ABI 7 未満ではカーネル監査へ拒否を残せない。縮退を構造化ログに出して続行する（SEC-4・#2026。
+        // 起動拒否や厳格モードは #2027）。送れなくても起動の可否は変えない。
+        if let Some(line) = ruleset.audit_mode().log_line() {
+            let _ = crate::exec::emit_diagnostic_line(&line);
+        }
+        Ok(ruleset)
     }
 
     fn root_identity(&self, rootfs: &super::launch::RootfsDir) -> Option<RootIdentity> {

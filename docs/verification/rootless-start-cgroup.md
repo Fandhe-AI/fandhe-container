@@ -37,7 +37,8 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
 
 [supervisor-measurement-runbook.md](supervisor-measurement-runbook.md#bundle-の用意) に従う。要点は次のとおり。
 
-- `config.json` に user namespace の UID マッピングを入れ、`process.args` は長時間動く静的リンクのプロセスにする
+- `config.json` の `linux.namespaces` に user namespace を指定する。`linux.uidMappings` / `linux.gidMappings` は省略するか空配列にする。非空にすると core の `reject_config_id_mappings` が `UNIMPLEMENTED` で拒否し、`prepare` に到達できない（config-id-mappings.md、SEC-5・CORE-6）。写像は launcher が権限モデルから導出する。runbook の「UID マッピングを入れる」は user namespace の指定の意味で読み、写像の配列は書かない
+- `process.args` は長時間動く静的リンクのプロセスにする
 - `linux.cgroupsPath` は書かない（`UNIMPLEMENTED` で拒否される。cgroups.md）
 - 資格情報を含めない
 
@@ -69,7 +70,7 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
    - supervisor の scope の `cgroup.procs` に CLI がいない。CLI は既に終了している
    - `systemctl --user list-units --type=scope` に新しい scope がある
    - `state.json` の `cgroupScope`・`cgroupInstance`
-5. 後始末: `stop` は未実装（#1544）で、supervisor の SIGTERM はコンテナを止めない。プロセスを止めるときは [runbook の後始末](supervisor-measurement-runbook.md#実行後の確認)と同じく、pid と起動時刻の一致を確かめてから送る（pid 再利用による誤 kill を避ける）。その後 `delete <id>` の終了コードを記録し、cgroup・`state.json`・scope の残骸が無いことを確かめる。`cgroup.procs` が空でない状態の `delete` が `FAILED_PRECONDITION` で拒否されるのは仕様どおり（`delete_cgroup_real` のシナリオ B）
+5. 後始末: `stop`（`run_stop`）は `ControlSignaler` と supervisor の制御チャネルで SIGTERM を送る。実装済みなのはこの SIGTERM の送達までで、猶予後の SIGKILL や停止完了の確認などは未実装（#1544）のため、停止しないときがある。止まらないプロセスを止めるときは [runbook の後始末](supervisor-measurement-runbook.md#実行後の確認)と同じく、pid と起動時刻の一致を確かめてから送る（pid 再利用による誤 kill を避ける）。その後 `delete <id>` を実行する。通常の端末（SSH・TTY の root 所有 session scope）のシェルからの `delete` は `DelegatedCgroup::detect` が失敗し、記録済み scope を使う削除へ進めず、cgroup と状態記録が残る。これは本確認の前提不備であり、`prepare` の回帰とは区別して記録する。後始末は `systemd-run --user --scope -p Delegate=yes -- "$BIN_DIR/fandhe-container" --root <root> delete <id>` で包んで実行する。その終了コードを記録し、cgroup・`state.json`・scope の残骸が無いことを確かめる。`cgroup.procs` が空でない状態の `delete` が `FAILED_PRECONDITION` で拒否されるのは仕様どおり（`delete_cgroup_real` のシナリオ B）
 6. 副次の変種（任意）: `systemd-run --user --scope -p Delegate=yes -- <シェル>` で作った scope の中のシェルから 1〜5 を行う
 
 ## シナリオ 2: 実機前提試験の実行

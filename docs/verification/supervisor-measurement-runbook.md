@@ -41,7 +41,7 @@ export BIN_DIR="$PWD/target/release"
 
 - 計測専用の使い捨てのテンプレートを作る。コンテナごとの複製は `cp -a --reflink=auto` で作る（inode を共有しない。複製に失敗すると終了コード 2）
 - `cp -al` は使わない。複製が rootfs 外にもリンクを持つ inode になり、製品の `check_no_external_hardlinks` が起動前に拒否するため。reflink 非対応の FS では複製ごとに page cache が別になり、PSS が Docker の lower 共有より大きく出うる（比較条件として結果に記す）
-- `config.json` を置く。user namespace（UID マッピング）を入れる。`process.args` は長時間動き続けるものにする（restart 計測では即時終了しないもの）。静的リンクのバイナリか、共有ライブラリを rootfs へコピーしたものにする
+- `config.json` を置く。user namespace（UID マッピング）を入れる（`linux.namespaces` に user namespace を指定する意味。`linux.uidMappings` / `linux.gidMappings` は省略か空配列にする。非空だと core が `UNIMPLEMENTED` で拒否する。写像は launcher が権限モデルから導出する）。`process.args` は長時間動き続けるものにする（restart 計測では即時終了しないもの）。静的リンクのバイナリか、共有ライブラリを rootfs へコピーしたものにする
 - 並列起動するスクリプトは、コンテナごとに bundle 全体を `cp -a --reflink=auto` で複製して使う（supervisor は start 中に bundle へ flock を取るため、同じ bundle を共有できない）
 
 ## #499 監視プロセス独立性（SUP-5・TASK-162）

@@ -90,7 +90,8 @@
 //! # 単体テストの安全策
 //!
 //! `open_tree`・`move_mount`・tmpfs のマウントと事後条件の観測は `cfg(test)` では dry-run に差し替わる。実機での挙動は
-//! 結合試験 `tests/masked_paths.rs`（`-- --ignored`）で確認する。
+//! 結合試験 `tests/masked_paths.rs`（`-- --ignored`）で確認する。tmpfs マウントの失敗は `exec::tmpfs` の dry-run の
+//! 注入口（`MOUNT_FAIL`。#2248）で作る。
 
 use std::ffi::{CString, OsStr};
 use std::io::Read as _;
@@ -598,7 +599,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::os::unix::fs::symlink;
 
-    use super::super::tmpfs::tests::{Tmp, take_calls};
+    use super::super::tmpfs::tests::{MOUNT_FAIL, Tmp, take_calls};
     use super::*;
     use crate::exec::devices::NullNodeSource;
     use crate::exec::tests::override_shared;
@@ -617,6 +618,7 @@ mod tests {
         CLONE_FAIL.with(|f| f.set(None));
         MOVE_FAIL.with(|f| f.set(None));
         FORCE_BAD_OPTIONS.with(|f| f.set(false));
+        MOUNT_FAIL.with(|f| f.set(None));
         let _ = take_calls();
     }
 
@@ -869,21 +871,21 @@ mod tests {
     }
 
     /// SEC-4・SEC-2（#2013）: ファイルの覆い（`open_tree` の失敗・`move_mount` の未対応カーネル）とディレクトリの覆い
-    /// （tmpfs の事後条件）の失敗に `masked_path_apply_failed` が付き、`code` は従来のまま。状態 pipe の往復を経て
+    /// （tmpfs のマウント失敗を `MOUNT_FAIL` で注入。#2248）の失敗に `masked_path_apply_failed` が付き、`code` は従来のまま。状態 pipe の往復を経て
     /// 親で層 `mount` の記録 1 件になり、`ErrorCode` も保たれる。
     #[test]
     fn sec4_2013_apply_failures_carry_reason_and_reach_the_audit_record() {
         for (case, code) in [
             ("clone", ErrorCode::FailedPrecondition),
             ("move", ErrorCode::Unimplemented),
-            ("tmpfs_options", ErrorCode::FailedPrecondition),
+            ("tmpfs_mount", ErrorCode::PermissionDenied),
         ] {
             reset();
             let _shared = override_shared(false);
-            let tmp = if case == "tmpfs_options" {
+            let tmp = if case == "tmpfs_mount" {
                 let tmp = Tmp::new("mask-apply-audit-dir");
                 std::fs::create_dir_all(tmp.0.join("proc/acpi")).expect("mkdir");
-                FORCE_BAD_OPTIONS.with(|f| f.set(true));
+                MOUNT_FAIL.with(|f| f.set(Some(SysError::Os(sys::EPERM))));
                 tmp
             } else {
                 let tmp = full_rootfs("mask-apply-audit-file");
@@ -897,6 +899,13 @@ mod tests {
             let err = apply_at(fd.as_fd(), &null_source()).expect_err(case);
             assert_eq!(err.code, code, "{case}");
             assert_eq!(err.stage, IsolationStage::MountMaskedPaths, "{case}");
+            if case == "tmpfs_mount" {
+                assert_eq!(
+                    err.message,
+                    "mount(tmpfs on /proc/acpi) failed: Operation not permitted (os error 1)"
+                );
+                assert!(take_calls().is_empty(), "{case}");
+            }
             assert_eq!(
                 err.violation.as_ref().map(|v| v.reason),
                 Some(ViolationReason::MaskedPathApplyFailed),

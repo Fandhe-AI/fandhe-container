@@ -14,7 +14,7 @@
 //! - **上限は確保前に検証**: 1 件のサイズ（[`INJECTED_FILE_MAX_BYTES`]）・件数（[`INJECTED_MAX_FILES`]）・
 //!   合計サイズ（[`INJECTED_MAX_TOTAL_BYTES`]）・パス長・深さ・ファイル名長を上限検証する（無制限確保の防止）
 //! - **マウント先**: [`MountDestination`]（字句正規化・`..` 拒否）で検証し、親ディレクトリが `/` になる指定
-//!   （rootfs 直下）・`/proc` 配下・`/dev` そのものは拒否する。親ディレクトリごとに専用 tmpfs を 1 つ作る
+//!   （rootfs 直下）・`/proc` 配下・`/sys` 配下・`/dev` そのものは拒否する。親ディレクトリごとに専用 tmpfs を 1 つ作る
 //!   ため、異なる注入ディレクトリが入れ子になる指定と、利用者指定の tmpfs（`/dev/shm` を含む）との重なりは
 //!   拒否する（どちらかが他方を覆い隠すため。[`InjectedFileSet::check_against_tmpfs`]）
 //! - **モード**: `0o777` 以下のみ（setuid / setgid / sticky は拒否）。既定は `0o444`
@@ -237,6 +237,12 @@ impl InjectedFileSet {
                 "injected files must not be placed on /proc or below",
             ));
         }
+        // `/sys` 配下は sysfs を覆い隠すため拒否する（tmpfs と同じ理由。SEC-2・#2233）。
+        if parent == "/sys" || parent.starts_with("/sys/") {
+            return Err(invalid(
+                "injected files must not be placed on /sys or below",
+            ));
+        }
         if parent == "/dev" {
             return Err(invalid("injected files must not be placed on /dev itself"));
         }
@@ -423,6 +429,14 @@ mod tests {
             err_of(set.push(spec("/proc/x/y", 1))),
             invalid_msg("injected files must not be placed on /proc or below")
         );
+        for p in ["/sys/x", "/sys/a/b"] {
+            assert_eq!(
+                err_of(set.push(spec(p, 1))),
+                invalid_msg("injected files must not be placed on /sys or below"),
+                "{p}"
+            );
+        }
+        set.push(spec("/sysx/f", 1)).expect("sibling sysx");
         assert_eq!(
             err_of(set.push(spec("/dev/x", 1))),
             invalid_msg("injected files must not be placed on /dev itself")
@@ -437,7 +451,7 @@ mod tests {
         }
         // 前方一致するだけの兄弟ディレクトリは入れ子ではない。
         set.push(spec("/run/secrets2/c", 1)).expect("sibling");
-        assert_eq!(set.files().len(), 3);
+        assert_eq!(set.files().len(), 4);
 
         let mut total = InjectedFileSet::new();
         for i in 0..8 {

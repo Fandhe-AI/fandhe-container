@@ -38,6 +38,9 @@
 //!
 //! 前提: 再起動時、ライフサイクル操作（create / delete）を受け付ける前に 1 回呼ぶ。
 //! 結果のログ出力も配線側の担当で、ここでは操作種別を増やさない。
+//!
+//! 外した結果は最後に 1 回まとめてディスクへ保存する（#2341。`container_ref` の永続化の節）。保存に失敗したら
+//! 全部元へ戻してエラーを返す。
 
 use super::{ContainerRefEntry, ContainerRefId, ImageStore};
 use crate::error::OciError;
@@ -126,6 +129,7 @@ impl ImageStore {
         }
 
         let mut guard = self.lock()?;
+        let before = guard.container_portion();
         for (id, entry) in candidates {
             // 世代と確定状態が複製時のままのときだけ外す（登録し直し・確定への変化は触れない）。
             let unchanged = guard.container_refs.get(&id) == Some(&entry);
@@ -137,6 +141,10 @@ impl ImageStore {
             } else {
                 result.skipped_changed.push(id);
             }
+        }
+        // 1 件でも外したら最後に 1 回保存する。失敗したら全部戻し、何も外さなかったことにする（#2341）。
+        if !result.removed.is_empty() {
+            self.persist_container_refs(&mut guard, before)?;
         }
         Ok(result)
     }

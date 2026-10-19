@@ -117,13 +117,15 @@ const fn event_name_is_valid(name: &str) -> bool {
 }
 
 impl LogEvent {
-    /// 静的な名前から作る。不正な名前は const 評価の段階で失敗する。
+    /// 静的な名前から const 文脈でも作る。不正な名前は `None`（panic しない）。
     ///
-    /// `const` 項目の初期化でだけ使い、実行時の呼び出しには使わない
-    /// （ライブラリの panic 禁止のため）。実行時の名前は [`LogEvent::new`] を使う。
-    pub const fn from_static(name: &'static str) -> Self {
-        assert!(event_name_is_valid(name), "invalid log event name");
-        Self(name)
+    /// `const` 項目では `match` で `None` を拒否すれば、不正な名前をコンパイル時に弾ける。
+    pub const fn from_static(name: &'static str) -> Option<Self> {
+        if event_name_is_valid(name) {
+            Some(Self(name))
+        } else {
+            None
+        }
     }
 
     /// 実行時に検証して作る。不正な名前は [`ErrorCode::InvalidArgument`]。
@@ -233,10 +235,44 @@ impl fmt::Display for LogLineError {
 
 impl std::error::Error for LogLineError {}
 
+/// 上限（[`MAX_LOG_LINE_BYTES`]）を超える書き込みを確保前に拒否するバッファ。
+///
+/// 巨大な本体で無制限に確保してから長さを検査する DoS を防ぐ（REPAIR-5）。
+struct LimitedBuf {
+    buf: Vec<u8>,
+    over: bool,
+}
+
+impl Write for LimitedBuf {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.buf.len().saturating_add(data.len()) > MAX_LOG_LINE_BYTES {
+            self.over = true;
+            return Err(std::io::Error::other("log line too long"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// 末尾 LF つきの 1 行分のバイト列を作る。ロックの中でバッファを書く呼び出し元向け。
 pub fn encode_json_line<F: Serialize>(line: &LogLine<'_, F>) -> Result<Vec<u8>, LogLineError> {
-    let mut buf =
-        serde_json::to_vec(line).map_err(|_| LogLineError::of(LogLineErrorKind::Encode))?;
+    let mut w = LimitedBuf {
+        buf: Vec::new(),
+        over: false,
+    };
+    if serde_json::to_writer(&mut w, line).is_err() {
+        let kind = if w.over {
+            LogLineErrorKind::TooLong
+        } else {
+            LogLineErrorKind::Encode
+        };
+        return Err(LogLineError::of(kind));
+    }
+    let mut buf = w.buf;
     if buf.first() != Some(&b'{') || buf.iter().any(|&b| b == b'\n' || b == b'\r') {
         return Err(LogLineError::of(LogLineErrorKind::Encode));
     }
@@ -472,8 +508,13 @@ mod tests {
 
     #[test]
     fn err4_event_from_static_in_const() {
-        const E: LogEvent = LogEvent::from_static("audit");
+        const E: LogEvent = match LogEvent::from_static("audit") {
+            Some(e) => e,
+            None => panic!("invalid event"),
+        };
         assert_eq!(E.as_str(), "audit");
+        assert!(LogEvent::from_static("").is_none());
+        assert!(LogEvent::from_static("Bad").is_none());
     }
 
     #[test]

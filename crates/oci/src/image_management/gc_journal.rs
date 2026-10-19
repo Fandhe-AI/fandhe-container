@@ -400,7 +400,7 @@ pub(super) fn sweep_blobs(root: &Path, blobs: &[Digest], dirs_present: bool) -> 
 
 /// unlink 後の永続化を確定させる。
 ///
-/// 1 件でも unlink したら `blobs/sha256` を fsync する。消せなかった blob があれば、その分でジャーナルを
+/// 1 件でも unlink したら（`force_blob_dir_sync` が真なら件数に関わらず）`blobs/sha256` を fsync する。消せなかった blob があれば、その分でジャーナルを
 /// 書き直して保持する。このとき fsync が失敗していたら、unlink 済みの blob（`deleted`）も書き直した
 /// ジャーナルに残す（クラッシュで unlink が巻き戻っても次の再試行で消し直せるようにする）。
 /// 書き直しに失敗したときは attempts を永続化できず上限に届かないため、ジャーナルを削除して
@@ -412,8 +412,11 @@ pub(super) fn settle(
     undeleted: &[Digest],
     deleted: &[Digest],
     prior_attempts: u32,
+    force_blob_dir_sync: bool,
 ) -> DeletionDurability {
-    let blobs_synced = deleted.is_empty() || sync_dir(&blob_dir(root)).is_ok();
+    // 復旧では今回の削除件数に依存せず fsync する（前回プロセスが unlink 後・fsync 前に落ちた場合に備える）。
+    let blobs_synced =
+        (deleted.is_empty() && !force_blob_dir_sync) || sync_dir(&blob_dir(root)).is_ok();
     if !undeleted.is_empty() {
         let attempts = prior_attempts.saturating_add(1);
         let abandon = || match remove_journal(root) {
@@ -474,6 +477,10 @@ pub struct PendingDeletionRecovery {
 impl ReferenceTable {
     /// manifest をテーブルから外した場合に消してよくなる blob（昇順）。副作用は無い。
     pub(super) fn blobs_deletable_after_removal(&self, manifest: &Digest) -> Vec<Digest> {
+        // 構成が分からないコンテナ参照が残る間は blob を 1 つも削除候補にしない（#2341・OCI-7）。
+        if self.has_unresolved_container_refs() {
+            return Vec::new();
+        }
         let Some(comp) = self.manifests.get(manifest) else {
             return Vec::new();
         };
@@ -518,25 +525,37 @@ impl ReferenceTable {
             }
         }
         // 数え直し: 構成に含む manifest かリースがある blob は残す。
+        // 構成が分からないコンテナ参照が残る間は blob を消さない（#2341・OCI-7）。
+        let unresolved = self.has_unresolved_container_refs();
         let mut to_sweep = Vec::new();
         for b in &journal.delete_blobs {
             let refs = self.blob_references(b);
-            if refs.referencing_manifests.is_empty() && refs.leases.is_empty() {
+            if !unresolved && refs.referencing_manifests.is_empty() && refs.leases.is_empty() {
                 to_sweep.push(b.clone());
             } else {
                 out.kept_blobs.push(b.clone());
             }
         }
         // ディレクトリ異常（symlink 等）なら何も消さず、全件を残してジャーナルを保持する。
+        let mut force_sync = false;
         let sweep = match check_blob_dirs(root) {
-            Ok(present) => sweep_blobs(root, &to_sweep, present),
+            Ok(present) => {
+                force_sync = present;
+                sweep_blobs(root, &to_sweep, present)
+            }
             Err(_) => Sweep {
                 undeleted: to_sweep,
                 ..Sweep::default()
             },
         };
         let deleted_digests: Vec<Digest> = sweep.deleted.iter().map(|(d, _)| d.clone()).collect();
-        out.durability = settle(root, &sweep.undeleted, &deleted_digests, journal.attempts);
+        out.durability = settle(
+            root,
+            &sweep.undeleted,
+            &deleted_digests,
+            journal.attempts,
+            force_sync,
+        );
         out.deleted_blobs = sweep.deleted.into_iter().map(|(d, _)| d).collect();
         out.absent_blobs = sweep.absent;
         out.undeleted_blobs = sweep.undeleted;
@@ -849,7 +868,7 @@ mod tests {
         let root = Root::new();
         // blobs/sha256 を消して fsync を失敗させる。
         fs::remove_dir(blob_dir(&root.0)).unwrap();
-        let st = settle(&root.0, &[d(0x22)], &[d(0x11)], 0);
+        let st = settle(&root.0, &[d(0x22)], &[d(0x11)], 0, false);
         assert_eq!(st, DeletionDurability::Pending);
         let j = read_journal(&root.0).unwrap().unwrap();
         assert_eq!(j.delete_blobs, vec![d(0x11), d(0x22)]);
@@ -865,7 +884,7 @@ mod tests {
         // root を書き込み不可にして、一時ファイルの作成（書き直し）を失敗させる。
         fs::set_permissions(&root.0, fs::Permissions::from_mode(0o500)).unwrap();
         let writable = fs::File::create(root.0.join("probe")).is_ok();
-        let st = settle(&root.0, &[d(0x22)], &[], 0);
+        let st = settle(&root.0, &[d(0x22)], &[], 0, false);
         fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
         // 特権で実行されて書き込めてしまう環境では前提が成り立たないので判定しない。
         if !writable {

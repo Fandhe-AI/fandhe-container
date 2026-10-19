@@ -452,6 +452,7 @@ impl ReferenceTable {
                     .map(|(d, _)| d.clone())
                     .collect::<Vec<_>>(),
                 0,
+                false,
             );
         }
         outcome.deleted_blobs = sweep.deleted.into_iter().map(|(d, _)| d).collect();

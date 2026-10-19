@@ -144,3 +144,99 @@ fn oci7_prune_after_restart_keeps_blobs_of_referenced_image() {
     drop(g);
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// 前回プロセスが残した削除ジャーナル（manifest A を外し blob 0x10・0x11 を消す意図）を書く。
+/// 内部型は公開されないため、永続形式（version 1 の JSON）を直接書く。
+fn write_pending_journal(root: &std::path::Path) {
+    let body = format!(
+        "{{\"version\":1,\"manifests\":[\"sha256:{a}\"],\"untag\":[],\"delete_blobs\":[\"sha256:{x}\",\"sha256:{y}\"],\"attempts\":0}}",
+        a = "a0".repeat(32),
+        x = "10".repeat(32),
+        y = "11".repeat(32),
+    );
+    let path = root.join(fandhe_container_oci::image_management::GC_JOURNAL_FILE_NAME);
+    std::fs::write(&path, body).expect("journal");
+    // ジャーナルは group / other 書き込み可だと信頼されないため 0600 にする。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+}
+
+fn put_blob(root: &std::path::Path, n: u8) {
+    let hex = format!("{n:02x}").repeat(32);
+    std::fs::write(root.join("blobs").join("sha256").join(hex), b"x").expect("blob");
+}
+
+fn blob_exists(root: &std::path::Path, n: u8) -> bool {
+    let hex = format!("{n:02x}").repeat(32);
+    root.join("blobs").join("sha256").join(hex).exists()
+}
+
+fn journal_exists(root: &std::path::Path) -> bool {
+    root.join(fandhe_container_oci::image_management::GC_JOURNAL_FILE_NAME)
+        .exists()
+}
+
+/// OCI-7・#2341: 別プロセスが永続化したコンテナ参照（構成不明）がある間、復旧は blob を 1 つも消さない。
+#[test]
+fn oci7_recovery_keeps_blobs_while_persisted_container_refs_unresolved() {
+    let root = temp_root("recover-guard");
+    run_child(&root);
+    put_blob(&root, 0x10);
+    put_blob(&root, 0x11);
+    write_pending_journal(&root);
+
+    let s = store(&root);
+    let rec = s
+        .recover_pending_deletion()
+        .expect("recover")
+        .expect("pending journal");
+    assert_eq!(rec.deleted_blobs, Vec::<Digest>::new());
+    assert_eq!(rec.kept_blobs, vec![d(0x10), d(0x11)]);
+    assert!(blob_exists(&root, 0x10));
+    assert!(blob_exists(&root, 0x11));
+    // 冪等: 2 回目は何も残っていない。
+    assert!(s.recover_pending_deletion().expect("again").is_none());
+    assert!(!journal_exists(&root));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// OCI-7: コンテナ参照が無ければ復旧は残りを消してジャーナルを片づけ、再実行は冪等（`None`）。
+#[test]
+fn oci7_recovery_retries_deletion_and_is_idempotent() {
+    let root = temp_root("recover-retry");
+    put_blob(&root, 0x10);
+    put_blob(&root, 0x11);
+    write_pending_journal(&root);
+
+    let s = store(&root);
+    let rec = s
+        .recover_pending_deletion()
+        .expect("recover")
+        .expect("pending journal");
+    assert_eq!(rec.deleted_blobs, vec![d(0x10), d(0x11)]);
+    assert!(!blob_exists(&root, 0x10));
+    assert!(!blob_exists(&root, 0x11));
+    assert!(!journal_exists(&root));
+    assert!(s.recover_pending_deletion().expect("again").is_none());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// OCI-7: 前回が全件 unlink 済み（今回の削除件数 0）でも復旧は成功し、ジャーナルを片づける。
+#[test]
+fn oci7_recovery_with_all_blobs_already_absent_clears_journal() {
+    let root = temp_root("recover-absent");
+    write_pending_journal(&root);
+
+    let s = store(&root);
+    let rec = s
+        .recover_pending_deletion()
+        .expect("recover")
+        .expect("pending journal");
+    assert_eq!(rec.deleted_blobs, Vec::<Digest>::new());
+    assert_eq!(rec.absent_blobs, vec![d(0x10), d(0x11)]);
+    assert!(!journal_exists(&root));
+    let _ = std::fs::remove_dir_all(root);
+}

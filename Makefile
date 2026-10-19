@@ -34,12 +34,12 @@ SHELL := /bin/bash
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
 	startup-latency-selftest net-setup-timing-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
-	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest deny deny-poc-venus-jig \
+	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest deny deny-poc-venus-jig \
 	third-party-licenses install-cargo-about ci bench-check bench-check-manual bench-baseline-manual bench-plugin-boundary \
 	bench-macos-cold-start bench-baseline cli-parity fio-bench fio-baseline-ratio startup-latency \
 	startup-latency-docker startup-latency-report net-setup-timing dns-helper-measure idle-memory \
 	idle-memory-supervised supervisor-pss concurrent-memory concurrent-memory-docker \
-	concurrent-memory-report supervisor-independence restart-latency docker-build docker-shell \
+	concurrent-memory-report supervisor-independence restart-latency crictl-smoke docker-build docker-shell \
 	docker-ci
 
 # --------------------------------------------------
@@ -220,6 +220,9 @@ restart-latency-selftest: ## restart レイテンシ計測スクリプトの自�
 install-launcher-selftest: ## 特権ランチャーのインストールスクリプトの自己テスト（SUP-14・SEC-1・REPAIR-12。スタブのみ・root 不要）
 	@scripts/install-privileged-launcher-selftest.sh
 
+crictl-smoke-selftest: ## crictl 疎通確認スクリプトの自己テスト（CRI-1・TASK-60・REPAIR-12。スタブの crictl のみ・python3 が必要）
+	@scripts/with-tools.sh python3 scripts/cri/crictl-smoke-selftest.sh
+
 # --------------------------------------------------
 # 依存監査・ライセンス表記
 # --------------------------------------------------
@@ -315,6 +318,9 @@ supervisor-independence: ## 監視プロセス 1 個を kill して他の継続�
 
 restart-latency: ## restart レイテンシを計測する（既定バックオフ 100ms 差し引き値も出す）（実機前提・timeout 付き。BIN_DIR=<絶対パス> BUNDLE=<dir> 必須。[TRIALS= WARMUP= OUTPUT= RESTART_LATENCY_WAIT_TIMEOUT=]。SUP-3）
 	@scripts/targets/restart-latency.sh
+
+crictl-smoke: ## crictl の runp→create→start の疎通確認（実機前提・timeout 付き。CRI_ENDPOINT=unix:///<絶対パス> 必須。[CRICTL= POD_CONFIG= CONTAINER_CONFIG= LOG_DIR= STEP_TIMEOUT= CRICTL_TIMEOUT= KEEP=1]。CRI-1・TASK-60）
+	@scripts/targets/crictl-smoke.sh
 
 # --------------------------------------------------
 # Docker（環境非依存の開発・検証。詳細は compose.yaml / Dockerfile 参照）

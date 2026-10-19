@@ -114,8 +114,10 @@ impl ReferenceTable {
             manifests,
             ..ImagePrunePlan::default()
         };
+        // 構成が分からない参照（在庫に無い manifest）がある間は、blob を 1 つも削除計画へ入れない（#2341）。
+        let unresolved = self.has_unresolved_container_refs();
         for blob in candidates {
-            if live.contains(blob) {
+            if live.contains(blob) || unresolved {
                 plan.kept_shared_blobs.push(blob.clone());
             } else if self.pull_leases.contains_key(blob) {
                 plan.kept_leased_blobs.push(blob.clone());

@@ -23,8 +23,10 @@
 //!
 //! # 未実装・前提（実装済みを装わない。REPAIR-3）
 //!
-//! - 永続化（#851）が入るまで、テーブルはプロセスごとのメモリ上の別物である。
-//!   プロセス間ロックは各プロセスの排他区間の順序を直列化するだけで、内容は同期しない。
+//! - コンテナ参照（エントリと世代カウンタ）は #2341 で root 直下の `@container-refs.json` へ永続化済み。
+//!   排他区間に入るたびにディスクから読み直し（ファイルが無ければメモリ上の内容を保つ）、読み込みに失敗
+//!   したら `lock` 自体がエラーを返す。manifest の在庫・タグ・pull リースは永続化されず（#851）、
+//!   プロセスごとのメモリ上の別物のままで、プロセス間ロックはそれらの内容を同期しない。
 //! - root の解決・作成・所有者 / 権限（0700）検査・祖先検査は永続化側の担当。`open` は存在する
 //!   ディレクトリ（symlink でない）であることしか見ない。oci には `sys` モジュールが無く
 //!   `O_NOFOLLOW` / `O_NONBLOCK` を使えないため、`@lock` の検査から open までの差し替えは
@@ -38,6 +40,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::ReferenceTable;
+use super::container_ref_persist::load_container_refs;
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 
@@ -141,6 +144,12 @@ impl ImageStore {
         let table = self.lock_table_until(deadline)?;
         let file = open_lock_file(&self.root)?;
         lock_file_until(&file, deadline)?;
+        let mut table = table;
+        // 区間に入るたびにディスクのコンテナ参照を正とする。別プロセスの登録・世代を見て、
+        // 世代の二重発行と他プロセスの参照の見落としを防ぐ（#2341）。壊れた参照表は fail-closed で拒否する。
+        if let Some(persisted) = load_container_refs(&self.root)? {
+            table.apply_persisted_container_refs(persisted);
+        }
         Ok(ImageStoreGuard { _file: file, table })
     }
 

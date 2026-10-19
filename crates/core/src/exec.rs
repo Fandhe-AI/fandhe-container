@@ -1611,18 +1611,29 @@ fn isolate_rootless_subordinate_with(
     // 所有者検査が拒否する(supervisor は入口で non-dumpable にする。CORE-6・SEC-5・#2243)。書き込みの間だけ
     // dumpable にし、元が non-dumpable だったときは、成否によらず握手の後に戻す。
     let restore_non_dumpable = matches!(sys::is_dumpable(), Ok(false));
-    if restore_non_dumpable {
+    // mapper を fork した後は、どの失敗も下の回収の分岐を通す(`?` で早期 return すると mapper がゾンビで残る。
+    // `ContainerChild` は drop で回収しない。CORE-2)。
+    let make_dumpable = if restore_non_dumpable {
         sys::set_dumpable_user().map_err(|e| {
             ExecError::from_sys(e, IsolationStage::UserNamespaceMap, "PR_SET_DUMPABLE")
-        })?;
-    }
-    let handshake = rootless_handshake(&mut parent_sock, plan);
+        })
+    } else {
+        Ok(())
+    };
+    let handshake = match make_dumpable {
+        Ok(()) => rootless_handshake(&mut parent_sock, plan),
+        Err(e) => Err(e),
+    };
     drop(parent_sock);
-    if restore_non_dumpable {
+    let restored = if restore_non_dumpable {
         sys::set_non_dumpable().map_err(|e| {
             ExecError::from_sys(e, IsolationStage::UserNamespaceMap, "PR_SET_DUMPABLE")
-        })?;
-    }
+        })
+    } else {
+        Ok(())
+    };
+    // 握手の失敗を優先し、握手が成功しても戻せなかったら失敗として扱う(non-dumpable のまま進めない)。
+    let handshake = handshake.and(restored);
     match handshake {
         // 応答(Ok)は mapper が helper を回収し終えた後にだけ届くため、ここで mapper を kill しても helper は残らない。
         Ok(()) => {

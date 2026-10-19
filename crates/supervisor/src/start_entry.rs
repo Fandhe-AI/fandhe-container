@@ -1954,12 +1954,26 @@ mod linux {
 
         /// 決めた権限モデル（範囲写像なら入力元つき）を設定した launcher 構築器（構築の箇所をここ 1 つにする。
         /// start と restart の再 launch が同じ設定を使う。SUP-3・CORE-6）。
-        fn launcher_builder(&self) -> Result<ProductionLauncherBuilder, TraitError> {
+        ///
+        /// `with_mapping` が偽のときは範囲写像の入力元（subuid / subgid・helper）を渡さず、権限モデルも
+        /// `RootlessSingleId` にする。残存確認だけの launcher（`recover_interrupted`）は namespace も写像も作らず、
+        /// helper（`newuidmap` / `newgidmap`）の検証に依存させない（前の supervisor の死後に uidmap が壊れても、
+        /// 記録済みの cgroup 経由の後始末が止まらないように。CORE-2・CORE-6）。
+        fn launcher_builder(
+            &self,
+            with_mapping: bool,
+        ) -> Result<ProductionLauncherBuilder, TraitError> {
             let decided = self.privilege.clone()?;
-            let builder = ProductionLauncher::builder().privilege(decided.privilege);
+            let mapped = with_mapping && decided.subordinate.is_some();
+            let privilege = if with_mapping || decided.subordinate.is_none() {
+                decided.privilege
+            } else {
+                IsolationPrivilege::RootlessSingleId
+            };
+            let builder = ProductionLauncher::builder().privilege(privilege);
             Ok(match decided.subordinate {
-                Some(source) => builder.subordinate_ids(source),
-                None => builder,
+                Some(source) if mapped => builder.subordinate_ids(source),
+                _ => builder,
             })
         }
 
@@ -2093,7 +2107,7 @@ mod linux {
             };
             let source = Arc::clone(&held.cgroup);
             let launcher = self
-                .launcher_builder()?
+                .launcher_builder(true)?
                 .audit_sink(Arc::clone(audit))
                 .cgroup_join_source(move || source.join_hook())
                 .applied_resource_limits(held.applied_resources.clone())
@@ -2112,7 +2126,7 @@ mod linux {
         ) -> Result<(), TraitError> {
             let audit = crate::exec::default_audit_sink(Some(self.root.clone()))?;
             let launcher: Arc<dyn ProcessLauncher> = Arc::new(
-                self.launcher_builder()?
+                self.launcher_builder(false)?
                     .audit_sink(Arc::new(audit))
                     .build()?,
             );
@@ -2539,6 +2553,52 @@ mod linux {
                 production.matches("ProductionLauncher::builder()").count(),
                 1
             );
+        }
+
+        /// CORE-2・CORE-6: 中断した start の回復用 launcher は、helper が無くても構築できる（写像の検証に依存しない）。
+        /// 新規 start 用は helper の検証で拒否される。
+        #[test]
+        fn recovery_launcher_does_not_validate_mapping_helpers() {
+            struct NullSink;
+            impl AuditSink for NullSink {
+                fn record(
+                    &self,
+                    _: &fandhe_container_core::audit_log::AuditRecord,
+                ) -> Result<(), TraitError> {
+                    Ok(())
+                }
+            }
+            let dir = std::env::temp_dir().join(format!("fc-rec-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let missing = dir.join("absent");
+            let source = SubordinateIdSource::with_paths(
+                Some("alice".to_owned()),
+                &missing,
+                &missing,
+                &missing,
+                &missing,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let mut deps = ProductionStartDeps::new(dir.clone());
+            deps.privilege = Ok(LaunchPrivilege {
+                privilege: IsolationPrivilege::RootlessSubordinateIds,
+                subordinate: Some(source),
+            });
+            let sink: Arc<dyn AuditSink> = Arc::new(NullSink);
+            let strict = deps
+                .launcher_builder(true)
+                .unwrap()
+                .audit_sink(Arc::clone(&sink))
+                .build();
+            assert!(strict.is_err());
+            let recovery = deps
+                .launcher_builder(false)
+                .unwrap()
+                .audit_sink(sink)
+                .build();
+            assert!(recovery.is_ok());
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// SEC-1・SUP-1・#2132: fd 0〜2 のどれかが閉じていれば FAILED_PRECONDITION、すべて開いていれば通る。

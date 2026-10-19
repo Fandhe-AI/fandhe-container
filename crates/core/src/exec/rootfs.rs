@@ -54,7 +54,7 @@
 //! - **失敗時はプロセスを破棄する**: bind mount・procfs マウント・pivot の途中で失敗しても
 //!   マウントを元へ戻す手段は無い（`crate::exec` のモジュール doc の契約）
 //! - **未対応**: rootfs のマウントポイント（`proc` ディレクトリ）の自動作成は行わない。無ければ
-//!   `ViolationReason::PathMissing` で拒否する（OCI mounts のうち bind は適用の段 `mount_binds` が担い〔#1915〕、bind 以外の種類は TASK-127 の範囲）。rootfs の
+//!   `ViolationReason::PathMissing` で拒否する（OCI mounts のうち bind は適用の段 `mount_binds` が担い〔#1915〕、bind 以外の種類は TASK-29 追補の #1910 の判断で拒否のまま。sysfs は #2020）。rootfs の
 //!   digest 検証は OCI イメージ系 TASK の範囲
 //!
 //! # 単体テストの安全策

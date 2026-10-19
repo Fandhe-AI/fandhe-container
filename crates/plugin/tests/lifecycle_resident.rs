@@ -766,7 +766,9 @@ mod unix {
         let sock = map.get(PLUGIN_SOCKET_ENV).unwrap();
         assert_eq!(
             std::path::Path::new(sock).parent().unwrap(),
-            dir.0.as_path()
+            // 公開パスは配置ディレクトリの canonicalize 結果のため、期待側も同じ規則で正規化する
+            // （macOS の `/var` → `/private/var`。PLUG-7・PLUG-12）。
+            std::fs::canonicalize(&dir.0).unwrap().as_path()
         );
         map
     }

@@ -40,6 +40,8 @@ pub enum OciOpKind {
     ListImages,
     /// `system df` 相当の使用容量集計（TASK-183.3・OCI-7）。
     DiskUsage,
+    /// `image rm` の実行（untag または完全削除。TASK-183.6・OCI-7）。
+    RemoveImage,
     /// イメージストアの排他区間の取得（待機・Timeout・毒化・ロックファイル異常を含む。TASK-183.2・OCI-7）。
     AcquireImageStoreLock,
     /// `image prune` の実行（無参照イメージ・レイヤーの回収。TASK-183.7・OCI-7）。
@@ -63,6 +65,7 @@ impl OciOpKind {
             OciOpKind::ExtractLayer => "oci.layer.extract",
             OciOpKind::ListImages => "oci.image.list",
             OciOpKind::DiskUsage => "oci.image.df",
+            OciOpKind::RemoveImage => "oci.image.rm",
             OciOpKind::AcquireImageStoreLock => "oci.store.lock",
             OciOpKind::PruneImages => "oci.image.prune",
             OciOpKind::TagImage => "oci.image.tag",

@@ -101,13 +101,25 @@ mod linux {
     }
 
     fn make_rootfs() -> Rootfs {
+        // 共有 /tmp 上の推測可能なパスを削除・再利用すると、競合で置かれた symlink を root が辿りうる。
+        // PID と時刻由来の名前を付けて 0700 の `create_dir` で排他的に作り、既存パスは削除も採用もしない。
+        // 配下も `create_dir`（`create_dir_all` ではない）で 1 階層ずつ作り、途中の symlink を辿らせない（SEC-2）。
+        use std::os::unix::fs::DirBuilderExt;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
         let base = std::fs::canonicalize(std::env::temp_dir())
             .expect("canonicalize temp_dir")
-            .join(format!("fandhe-sysfs-mount-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("proc")).expect("create rootfs/proc");
-        std::fs::create_dir_all(base.join("sys")).expect("create rootfs/sys");
-        Rootfs(base)
+            .join(format!("fandhe-sysfs-mount-{}-{nanos}", std::process::id()));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&base)
+            .expect("exclusively create rootfs dir");
+        let rootfs = Rootfs(base.clone());
+        std::fs::create_dir(base.join("proc")).expect("create rootfs/proc");
+        std::fs::create_dir(base.join("sys")).expect("create rootfs/sys");
+        rootfs
     }
 
     /// 書き込み用に開くだけで書かない（制限が欠けてもホストへ作用させないため）。失敗時の errno か `0`（開けた）。

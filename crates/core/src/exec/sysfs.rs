@@ -407,7 +407,8 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_nanos())
             ));
-            std::fs::create_dir_all(&dir).expect("mkdir");
+            // 一意名（PID＋ナノ秒）を `create_dir` で排他的に作り、既存パスを再利用しない（SEC-2）。
+            std::fs::create_dir(&dir).expect("mkdir");
             make_sys(&dir);
             let c = CString::new(dir.to_str().expect("utf8")).expect("cstr");
             let fd = sys::open_dir_path_nofollow(None, &c).expect("open root");

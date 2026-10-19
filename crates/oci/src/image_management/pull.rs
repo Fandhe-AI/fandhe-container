@@ -23,7 +23,9 @@
 //! 取得後に [`PullSession::verify_staged_blob`] で検証してから [`PullSession::publish`] を呼ぶ。
 //! cri の `image_pull` からの配線は後続で扱う（本モジュールは oci 内で完結する）。
 //!
-//! ロックの規律: ガードを持ったまま digest 検証・通信をしない。ガードの中で行うファイル操作は、
+//! ロックの規律: ガードを持ったまま digest 検証（再ハッシュ）・通信をしない。公開直前の完全性は、
+//! 検証時に控えたファイルの指紋（サイズ・時刻・inode 等）の照合で保つ。既存宛先の内容検証は
+//! ガードの外で行い、ガード内では指紋の照合だけをする。ガードの中で行うファイル操作は、
 //! 公開（OCI-7 (C) の「排他の下で移動」）の `hard_link` / `remove_file`（同一ファイルシステム内の
 //! メタデータ操作）に限る。リース登録は「リース登録 → 使う」の順に固定する。並行する prune は
 //! ガードの内側でリースを数え直すため、登録後に blob が消されることはない
@@ -31,8 +33,8 @@
 //!
 //! 公開の移動は `hard_link` で宛先を置き換えずに作り、成功後にステージング側の名前を消す
 //! （公開後のハードリンク数を 1 に保つ。cri の `check_blob_trust` の条件と整合）。宛先が既にある
-//! 通常ファイル（並行 pull が先に公開した同 digest）は受け入れ、内容は再検証しない
-//! （content-addressed で、利用時の検証に委ねる）。
+//! 通常ファイル（並行 pull が先に公開した同 digest）は、ガードの外で内容を検証した実体と
+//! 指紋が一致するときだけ受け入れ、それ以外は検証済みのステージングで置き換える。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）:
 //! - `PullSession` に `Drop` は実装しない（ロック待ちの Timeout・panic 中の毒化があり、ロックを取る
@@ -138,7 +140,49 @@ pub struct PullSession<'a> {
     /// このセッションのステージングで digest 検証に成功した digest（[`PullSession::verify_staged_blob`]）。
     /// 公開できる新規 blob はこの集合にあるものに限る。
     /// 値は検証で確定したサイズ。公開直前の再ハッシュの読み取り上限に使う。
-    verified: BTreeMap<Digest, u64>,
+    verified: BTreeMap<Digest, VerifiedEntry>,
+}
+
+/// 検証で確定したサイズと、検証した実体の同一性（[`FileIdent`]）。
+#[derive(Debug, Clone)]
+struct VerifiedEntry {
+    size: u64,
+    ident: FileIdent,
+}
+
+/// ファイルの同一性の指紋（サイズ・更新時刻、unix では dev / inode / ctime も）。
+///
+/// digest の再ハッシュを排他区間の外へ出す代わりに、検証した実体が公開直前まで同じであることを
+/// 安価な stat の照合で確かめるために使う（OCI-1・OCI-7）。差し替え（別 inode）・サイズ変更・
+/// 書き換え（mtime / ctime の変化）を検出する。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdent {
+    len: u64,
+    mtime: Option<SystemTime>,
+    #[cfg(unix)]
+    unix: (u64, u64, i64, i64),
+}
+
+impl FileIdent {
+    fn of(m: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let unix = {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino(), m.ctime(), m.ctime_nsec())
+        };
+        Self {
+            len: m.len(),
+            mtime: m.modified().ok(),
+            #[cfg(unix)]
+            unix,
+        }
+    }
+
+    /// symlink を辿らず、通常ファイルのときだけ指紋を返す。
+    fn of_regular(path: &Path) -> std::io::Result<Option<Self>> {
+        let m = fs::symlink_metadata(path)?;
+        Ok(m.is_file().then(|| Self::of(&m)))
+    }
 }
 
 /// 公開の要求（manifest・構成・付けるタグ）。TASK-183.10・OCI-7。
@@ -460,8 +504,31 @@ impl PullSession<'_> {
         }
         // 再検証の開始時に以前の検証結果を無効化する（失敗した再検証の前の登録を残さない）。
         self.verified.remove(digest);
+        // 検証の前後で指紋が一致することを確かめ、検証した実体を固定する（公開直前の再ハッシュの代わり）。
+        let before = FileIdent::of_regular(&path)
+            .map_err(|e| io_err(&e, "failed to stat staged blob"))?
+            .ok_or_else(|| {
+                err(
+                    OciErrorCode::FailedPrecondition,
+                    "staged blob is not a regular file",
+                )
+            })?;
         let v = verify_blob_digest_with(self.store.recorder(), &path, digest, max_bytes)?;
-        self.verified.insert(digest.clone(), v.size);
+        let after =
+            FileIdent::of_regular(&path).map_err(|e| io_err(&e, "failed to stat staged blob"))?;
+        if after.as_ref() != Some(&before) {
+            return Err(err(
+                OciErrorCode::DataLoss,
+                "staged blob changed during verification",
+            ));
+        }
+        self.verified.insert(
+            digest.clone(),
+            VerifiedEntry {
+                size: v.size,
+                ident: before,
+            },
+        );
         Ok(v)
     }
 
@@ -556,22 +623,44 @@ impl PullSession<'_> {
         }
         for b in &to_move {
             let src = self.staging_dir.join(hex_of(b)?);
-            match fs::symlink_metadata(&src) {
-                Ok(m) if m.is_file() => {}
-                Ok(_) => {
-                    return Err(err(
-                        OciErrorCode::FailedPrecondition,
-                        "staged blob is not a regular file",
-                    ));
-                }
-                Err(e) => return Err(io_err(&e, "failed to stat staged blob")),
-            }
+            self.check_staged_ident(&src, b)?;
         }
         if !to_move.is_empty() {
             self.ensure_blob_dirs()?;
         }
 
         let root = self.store.root().to_path_buf();
+        // 既存の宛先の内容検証（再ハッシュ）はガードの外で済ませ、検証した実体の指紋を控える。
+        // 排他区間の中では指紋の照合だけを行う（大容量 blob でガード保持が期限を超えないように。
+        // ロックの規律）。
+        let mut dst_checked: BTreeMap<Digest, Option<FileIdent>> = BTreeMap::new();
+        for b in &to_move {
+            let dst = blob_path(&root, b)?;
+            let size = self.verified.get(b).map_or(0, |v| v.size);
+            let ident = match FileIdent::of_regular(&dst) {
+                Ok(Some(before)) => match verify_blob_digest(&dst, b, size) {
+                    Ok(_) => {
+                        // 検証中に変わっていれば「未検証」として扱い、ガード内で置き換える。
+                        match FileIdent::of_regular(&dst) {
+                            Ok(Some(after)) if after == before => Some(after),
+                            _ => None,
+                        }
+                    }
+                    Err(e)
+                        if matches!(
+                            e.code(),
+                            OciErrorCode::DataLoss | OciErrorCode::ResourceExhausted
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(e) => return Err(e),
+                },
+                // 不在・通常ファイルでないもの。ガード内の hard_link の結果で判定する。
+                _ => None,
+            };
+            dst_checked.insert(b.clone(), ident);
+        }
         let mut guard = self.store.lock()?;
         if guard
             .manifests()
@@ -591,9 +680,8 @@ impl PullSession<'_> {
                 let src = self.staging_dir.join(hex_of(b)?);
                 let dst = blob_path(&root, b)?;
                 // 検証後にステージングのファイルが差し替わっても未検証の内容を公開しないよう、
-                // 公開直前に排他区間の下で再ハッシュする（OCI-1・OCI-7）。
-                let size = self.verified.get(b).copied().unwrap_or(0);
-                verify_blob_digest(&src, b, size)?;
+                // 排他区間の下では再ハッシュせず、検証した実体の指紋を照合する（OCI-1・OCI-7）。
+                self.check_staged_ident(&src, b)?;
                 match fs::hard_link(&src, &dst) {
                     Ok(()) => {
                         created.push(dst);
@@ -602,27 +690,21 @@ impl PullSession<'_> {
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         match fs::symlink_metadata(&dst) {
                             Ok(m) if m.is_file() => {
-                                // 既存の宛先は内容を検証してから受け入れる。壊れていれば
-                                // 検証済みのステージングで原子的に置き換えて修復する。
-                                match verify_blob_digest(&dst, b, size) {
-                                    Ok(_) => present.push(b.clone()),
-                                    Err(e)
-                                        if matches!(
-                                            e.code(),
-                                            OciErrorCode::DataLoss
-                                                | OciErrorCode::ResourceExhausted
-                                        ) =>
-                                    {
-                                        fs::rename(&src, &dst).map_err(|_| {
-                                            err(
-                                                OciErrorCode::Internal,
-                                                "failed to repair corrupt blob",
-                                            )
-                                        })?;
-                                        moved.push(b.clone());
-                                        continue;
-                                    }
-                                    Err(e) => return Err(e),
+                                // 既存の宛先は、ガードの外で検証した実体と指紋が一致するときだけ受け入れる。
+                                // 壊れている・検証後に変わった・未検証のものは、検証済みのステージングで
+                                // 原子的に置き換えて修復する。
+                                let verified_dst = dst_checked.get(b).and_then(Option::as_ref);
+                                if verified_dst.is_some()
+                                    && FileIdent::of_regular(&dst).ok().flatten().as_ref()
+                                        == verified_dst
+                                {
+                                    present.push(b.clone());
+                                } else {
+                                    fs::rename(&src, &dst).map_err(|_| {
+                                        err(OciErrorCode::Internal, "failed to repair corrupt blob")
+                                    })?;
+                                    moved.push(b.clone());
+                                    continue;
                                 }
                             }
                             _ => {
@@ -677,6 +759,30 @@ impl PullSession<'_> {
             released_leases,
             staging,
         })
+    }
+
+    /// ステージングのファイルが検証時と同じ実体（指紋が一致）であることを確かめる。再ハッシュはしない。
+    /// 通常ファイルでない・指紋が違う（差し替え・書き換え）なら `DataLoss`（通常ファイルでなければ
+    /// `FailedPrecondition`）。
+    fn check_staged_ident(&self, src: &Path, digest: &Digest) -> Result<(), OciError> {
+        let Some(entry) = self.verified.get(digest) else {
+            return Err(err(
+                OciErrorCode::FailedPrecondition,
+                "blob is neither leased nor verified by this pull",
+            ));
+        };
+        match FileIdent::of_regular(src) {
+            Ok(Some(now)) if now == entry.ident => Ok(()),
+            Ok(Some(_)) => Err(err(
+                OciErrorCode::DataLoss,
+                "staged blob changed after verification",
+            )),
+            Ok(None) => Err(err(
+                OciErrorCode::FailedPrecondition,
+                "staged blob is not a regular file",
+            )),
+            Err(e) => Err(io_err(&e, "failed to stat staged blob")),
+        }
     }
 
     /// `blobs` / `blobs/sha256` を（無ければ 0700 で）用意する。symlink・非ディレクトリは拒否。
@@ -1322,6 +1428,65 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), OciErrorCode::DataLoss);
         assert!(!root.blob(&cfg).exists());
+    }
+
+    /// OCI-1・OCI-7: 同じサイズの別ファイルへ差し替えられても（別 inode）、指紋の照合で拒否する。
+    #[test]
+    fn oci7_publish_rejects_same_size_replacement_after_verify() {
+        let root = Root::new("pub-swap-same");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let cfg = stage(&mut s, b"config-body");
+        let path = s.staged_blob_path(&cfg).unwrap();
+        let tmp = path.with_extension("evil");
+        fs::write(&tmp, b"evil--body!").unwrap();
+        fs::rename(&tmp, &path).unwrap();
+        let comp = ManifestComposition::new(cfg.clone(), vec![]).unwrap();
+        let err = s
+            .publish(PullPublishRequest::new(manifest_digest(), comp))
+            .unwrap_err();
+        assert_eq!(err.code(), OciErrorCode::DataLoss);
+        assert!(!root.blob(&cfg).exists());
+    }
+
+    /// OCI-7: 大容量 blob の公開でも、ガードの外で済ませる検証のため他操作のロック取得を妨げない。
+    /// 公開（検証済み 64 MiB）の最中に別スレッドがロックを取れる。
+    #[test]
+    fn oci7_publish_of_large_blob_does_not_hold_guard_for_hashing() {
+        let root = Root::new("pub-large");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let data = vec![7u8; 64 << 20];
+        let dg = sha_of(&data);
+        fs::write(s.staged_blob_path(&dg).unwrap(), &data).unwrap();
+        s.verify_staged_blob(&dg, 1 << 30).unwrap();
+        // 既存の宛先にも同内容を置く（ガード外で検証され、ガード内では指紋照合のみ）。
+        fs::write(root.blob(&dg), &data).unwrap();
+        let comp = ManifestComposition::new(dg.clone(), vec![]).unwrap();
+        let start = std::time::Instant::now();
+        let hold = std::thread::scope(|sc| {
+            let h = sc.spawn(|| {
+                // 公開中に何度かロックを取り直し、最長の取得待ちを測る。
+                let mut worst = std::time::Duration::ZERO;
+                for _ in 0..200 {
+                    let t = std::time::Instant::now();
+                    drop(store.lock().unwrap());
+                    worst = worst.max(t.elapsed());
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                worst
+            });
+            let out = s
+                .publish(PullPublishRequest::new(manifest_digest(), comp))
+                .unwrap();
+            assert_eq!(out.already_present_blobs, vec![dg.clone()]);
+            h.join().unwrap()
+        });
+        assert!(
+            hold < std::time::Duration::from_secs(1),
+            "{hold:?} {:?}",
+            start.elapsed()
+        );
     }
 
     /// OCI-1・OCI-7: 再検証が失敗したら以前の検証結果は残らず、公開できない。

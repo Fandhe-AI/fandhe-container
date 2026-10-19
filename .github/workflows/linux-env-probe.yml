@@ -586,3 +586,97 @@ jobs:
             done
           } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
           grep -qE '^escape_suite:' "${RUNNER_TEMP}/esc-nonroot.log" "${RUNNER_TEMP}/esc-root.log" 2>/dev/null || { echo "::error::no escape_suite output" >&2; exit 1; }
+
+  # --------------------------------------------------
+  # id-mapping-probe（ubuntu-latest で production_launcher のシナリオ I〔launcher 経由の
+  # 範囲写像〕の前提を満たせるかの計測。#2244・CORE-6・SEC-5・REPAIR-7。計測のみで
+  # 必須チェックではない。各項目の失敗ではジョブを落とさず、結果を表にして記録する）
+  # --------------------------------------------------
+  # production_launcher は A〜P を 1 つのバイナリで実行するため、シナリオ I 単独では
+  # 回せない。前提は uidmap（setuid の newuidmap / newgidmap）・自ユーザーの
+  # /etc/subuid・/etc/subgid の行・非 root の呼び出し元へ委譲された cgroup v2
+  # サブツリー。本ジョブは特に「委譲 cgroup をどの経路で得られるか」を測る。
+  # 結果は platform-ci へ組み込むかの判断材料（AGENTS.md の production_launcher の項）。
+  id-mapping-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Probe uidmap, subordinate ids and delegated cgroup
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          set +e
+          out="${RUNNER_TEMP}/idmap-probe.tsv"
+          : > "${out}"
+          record() { printf '%s\t%s\n' "$1" "$2" >> "${out}"; }
+          me="$(id -un)"
+
+          record "ImageOS / ImageVersion" "${ImageOS:-unknown} / ${ImageVersion:-unknown}"
+          record "kernel" "$(uname -r)"
+          record "user (id -un / id -u / USER set)" "${me} / $(id -u) / ${USER:+yes}"
+
+          # uidmap と subuid / subgid（導入前の状態。値は範囲の数値のみで秘密情報ではない）
+          record "uidmap package (before)" "$(dpkg-query -W -f='${Status}' uidmap 2>&1 | head -n1)"
+          record "newuidmap / newgidmap (before)" "$(stat -c '%n %A %U' /usr/bin/newuidmap /usr/bin/newgidmap 2>&1 | tr '\n' ';')"
+          record "subuid line (before)" "$(grep "^${me}:" /etc/subuid 2>&1 | head -n1)"
+          record "subgid line (before)" "$(grep "^${me}:" /etc/subgid 2>&1 | head -n1)"
+
+          if [ ! -u /usr/bin/newuidmap ] || [ ! -u /usr/bin/newgidmap ]; then
+            sudo apt-get install -y -qq --no-install-recommends uidmap > /dev/null 2>&1
+            record "apt-get install uidmap (exit)" "$?"
+          fi
+          record "newuidmap / newgidmap (after)" "$(stat -c '%n %A %U' /usr/bin/newuidmap /usr/bin/newgidmap 2>&1 | tr '\n' ';')"
+          record "getcap newuidmap / newgidmap" "$(getcap /usr/bin/newuidmap /usr/bin/newgidmap 2>&1 | tr '\n' ';')"
+
+          if ! grep -q "^${me}:" /etc/subuid 2>/dev/null; then
+            sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "${me}"
+            record "usermod add subuid/subgid (exit)" "$?"
+          fi
+          record "subuid line (after)" "$(grep "^${me}:" /etc/subuid 2>&1 | head -n1)"
+          record "subgid line (after)" "$(grep "^${me}:" /etc/subgid 2>&1 | head -n1)"
+
+          # userns の制限（newuidmap 経路にも効く）
+          if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = "1" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 > /dev/null 2>&1
+          fi
+          record "apparmor_restrict_unprivileged_userns (after)" "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
+
+          # ステップ自身の cgroup（委譲されていないと production_launcher の prepare は失敗する）
+          self_cg="$(cut -d: -f3 /proc/self/cgroup)"
+          record "own cgroup" "${self_cg}"
+          record "own cgroup owner / procs / subtree_control" "$(stat -c '%U' "/sys/fs/cgroup${self_cg}" 2>&1) / $(wc -l < "/sys/fs/cgroup${self_cg}/cgroup.procs" 2>&1) procs / $(cat "/sys/fs/cgroup${self_cg}/cgroup.subtree_control" 2>&1)"
+
+          # ユーザー systemd マネージャ（値は出さず有無だけ記録する）
+          record "XDG_RUNTIME_DIR set / DBUS_SESSION_BUS_ADDRESS set" "${XDG_RUNTIME_DIR:+yes} / ${DBUS_SESSION_BUS_ADDRESS:+yes}"
+          record "loginctl list-users" "$(loginctl list-users --no-legend 2>&1 | tr '\n' ';')"
+          sysrun="$(systemctl --user is-system-running 2>&1 | head -n1)"
+          record "systemctl --user is-system-running" "${sysrun}"
+
+          # 委譲 cgroup を得る経路を、追加の特権が少ない順に試す
+          probe_cmd='cg=$(cut -d: -f3 /proc/self/cgroup); echo "uid=$(id -u) cg=${cg} owner=$(stat -c %U /sys/fs/cgroup${cg})"'
+          r1="$(timeout 30 systemd-run --user --scope -p Delegate=yes sh -c "${probe_cmd}" 2>&1 | tr '\n' ' ')"
+          record "path1 systemd-run --user --scope (no extra privilege)" "${r1:0:300}"
+
+          sudo loginctl enable-linger "${me}" > /dev/null 2>&1
+          record "path2 enable-linger (exit)" "$?"
+          sleep 3
+          r2="$(XDG_RUNTIME_DIR="/run/user/$(id -u)" timeout 30 systemd-run --user --scope -p Delegate=yes sh -c "${probe_cmd}" 2>&1 | tr '\n' ' ')"
+          record "path2 systemd-run --user --scope after linger" "${r2:0:300}"
+
+          r3="$(sudo -n timeout 30 systemd-run --uid="$(id -u)" --gid="$(id -g)" -p Delegate=yes --wait --pipe --collect sh -c "${probe_cmd}" 2>&1 | tr '\n' ' ')"
+          record "path3 transient service with User= and Delegate=yes" "${r3:0:300}"
+
+          {
+            echo "### id-mapping-probe results (production_launcher scenario I prerequisites)"
+            echo ""
+            echo "| Item | Result |"
+            echo "| ---- | ------ |"
+            while IFS=$'\t' read -r item value; do
+              echo "| ${item} | ${value//|/\\|} |"
+            done < "${out}"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          exit 0

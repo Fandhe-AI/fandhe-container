@@ -40,7 +40,7 @@
 //!   healthcheck・launch 経路（launcher）への配線は **未実装**（REPAIR-3: 実装済みを装わない）。plugin 信頼検証は
 //!   CLI の plugin バックエンド（`fandhe-container-cli` の `plugin_backend`。macOS・Windows の本番経路）に配線済み
 //!   （#2013）。記録先は `FileAuditSink::open_in_state_root` で作り、非 Linux では `FileStateStore` が未実装のため
-//!   記録先を作れず `SinkFailed` になる。レジストリ・spawn への配線は TASK-114
+//!   記録先を作れず `SinkFailed` になる。レジストリ・spawn への配線は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕
 //! - レイヤーごとのペイロードを [`AuditEvent`] の enum で持ち、「syscall の無い seccomp 違反」のような
 //!   不正な組み合わせを構築できない（REPAIR-2）。値は各 newtype の構築子が検証する
 //! - 秘密情報（資格情報・環境変数・namespace 識別子）は含めない。ホスト側の実パスを載せるかは各フックで判断する

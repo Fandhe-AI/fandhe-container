@@ -62,6 +62,8 @@ struct FakeRuntime {
     stop_returns_running: AtomicBool,
     /// stop が返す終了コード（既定 0。137 等の検証用）。
     stop_exit_code: std::sync::atomic::AtomicI32,
+    /// start が stopped を返すときの終了コード（既定 0。CRI-2・REPAIR-3 の検証用）。
+    start_exit_code: std::sync::atomic::AtomicI32,
 }
 
 impl FakeRuntime {
@@ -109,7 +111,10 @@ impl ContainerRuntime for Shared {
             return Ok(ContainerStatus::creating(r.id().clone()));
         }
         if self.0.start_returns_stopped.load(Ordering::SeqCst) {
-            return Ok(ContainerStatus::stopped(r.id().clone(), Some(0)));
+            return Ok(ContainerStatus::stopped(
+                r.id().clone(),
+                Some(self.0.start_exit_code.load(Ordering::SeqCst)),
+            ));
         }
         if self.0.start_returns_created.load(Ordering::SeqCst) {
             return Ok(ContainerStatus::created(r.id().clone(), None));
@@ -647,9 +652,10 @@ async fn task_59_2_stopped_start_response_marks_exited() {
         .start_returns_stopped
         .store(true, Ordering::SeqCst);
     start(&h.service, &id).await.expect_err("start");
+    let st = status(&h.service, &id).await;
     assert_eq!(
-        status(&h.service, &id).await.state,
-        S::ContainerExited as i32
+        (st.state, st.exit_code, st.reason.as_str()),
+        (S::ContainerExited as i32, 0, "Completed")
     );
     h.runtime
         .start_returns_stopped
@@ -1422,12 +1428,71 @@ async fn task_59_3_stop_exit_code_is_reflected_in_status() {
     h.runtime.stop_exit_code.store(137, Ordering::SeqCst);
     stop_c(&h.service, &id).await.expect("stop container");
     let st = status(&h.service, &id).await;
-    assert_eq!((st.state, st.exit_code), (S::ContainerExited as i32, 137));
+    assert_eq!(
+        (st.state, st.exit_code, st.reason.as_str()),
+        (S::ContainerExited as i32, 137, "Error")
+    );
 
     let id2 = create(&h.service, &sb, "d").await.expect("create");
     start(&h.service, &id2).await.expect("start");
     h.runtime.stop_exit_code.store(143, Ordering::SeqCst);
     stop_sb(&h.service, &sb).await.expect("stop sandbox");
     let st = status(&h.service, &id2).await;
-    assert_eq!((st.state, st.exit_code), (S::ContainerExited as i32, 143));
+    assert_eq!(
+        (st.state, st.exit_code, st.reason.as_str()),
+        (S::ContainerExited as i32, 143, "Error")
+    );
+}
+
+/// CRI-2・REPAIR-3: 終了コード 0 の Stop は reason `Completed`。停止前の running は reason が空。
+#[tokio::test]
+async fn cri_2_repair_3_stop_exit_zero_reports_completed() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = running_container(&h, &sb, "c").await;
+    let st = status(&h.service, &id).await;
+    assert_eq!(
+        (st.state, st.exit_code, st.reason.as_str()),
+        (S::ContainerRunning as i32, 0, "")
+    );
+    stop_c(&h.service, &id).await.expect("stop");
+    let st = status(&h.service, &id).await;
+    assert_eq!(
+        (st.state, st.exit_code, st.reason.as_str()),
+        (S::ContainerExited as i32, 0, "Completed")
+    );
+    assert!(st.finished_at > 0);
+}
+
+/// CRI-2・REPAIR-3: 実行層にコンテナが無く終了コードが不明な Stop は、Completed と見せず reason を空にする。
+#[tokio::test]
+async fn cri_2_repair_3_stop_not_found_leaves_reason_empty() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = running_container(&h, &sb, "c").await;
+    *h.runtime.fail_stop.lock().unwrap() = Some(ErrorCode::NotFound);
+    stop_c(&h.service, &id).await.expect("stop");
+    let st = status(&h.service, &id).await;
+    assert_eq!(
+        (st.state, st.exit_code, st.reason.as_str()),
+        (S::ContainerExited as i32, 0, "")
+    );
+}
+
+/// CRI-2・REPAIR-3: Start の応答が stopped のとき、その終了コードが記録へ反映される。
+#[tokio::test]
+async fn cri_2_repair_3_stopped_start_response_reflects_exit_code() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    h.runtime
+        .start_returns_stopped
+        .store(true, Ordering::SeqCst);
+    h.runtime.start_exit_code.store(1, Ordering::SeqCst);
+    start(&h.service, &id).await.expect_err("start");
+    let st = status(&h.service, &id).await;
+    assert_eq!(
+        (st.state, st.exit_code, st.reason.as_str()),
+        (S::ContainerExited as i32, 1, "Error")
+    );
 }

@@ -89,6 +89,8 @@
 //!   (`RootlessSubordinateIds`。#2009)を使う。config 指定の写像を受理するかは SEC-5 に関わるオーナー判断で
 //!   確認待ちのため、ここでは拒否のまま。`ProcessLauncher` 参照）
 //! - `root.readonly` が true（読み取り専用 rootfs 未実装）
+//! - `linux.readonlyPaths` / `maskedPaths` が暗黙の `/dev`・`/dev/pts`・`/dev/shm` と同じか祖先を指す
+//!   （`InvalidArgument`。fork・予約より前。SEC-2・CORE-5・#2015。子孫は受ける）
 //!
 //! `process.args` / `process.env` は `exec::Entrypoint::new` と同じ上限（件数 4096・1 要素 131072 バイト・
 //! 合計 1 MiB。NUL 禁止・env は `KEY=VALUE`）を `LaunchSpec` 構築前に検証し、違反は `InvalidArgument`。
@@ -800,6 +802,7 @@ fn build_spec(
         return Err(unsupported("process.terminal"));
     }
     reject_unsupported_linux(&config)?;
+    reject_protected_paths_over_implicit_dev(&config)?;
     // process.user は root 必須のため、user namespace が無いとホスト root で起動してしまう（SEC-5）。
     if !config
         .namespaces()
@@ -1086,6 +1089,49 @@ fn lexical_abs(path: &Path) -> Option<String> {
         }
     }
     (absolute && !out.is_empty()).then_some(out)
+}
+
+/// 保護パス（`linux.readonlyPaths` / `maskedPaths`）が暗黙の `/dev` 系マウントと同じか祖先を指す config を、
+/// fork・予約より前に `InvalidArgument` で拒否する（SEC-2・CORE-5・OCI-4・TASK-29 追補・#2015）。
+///
+/// 同じパスか祖先を指すと、覆い・読み取り専用化で最上位のマウントが入れ替わるか覆いの下に隠れ、暗黙のマウントが
+/// 期待する fs 種別・識別子（#1609・#2071）が崩れる。本番 launcher では Landlock 段の照合（#2071）が fork 後に
+/// `FailedPrecondition` で止めるが、拒否が遅く理由が分かりにくいうえ、exec の再適用（SUP-6）は照合しない。
+/// ここで入口に前倒しして閉じる。子孫（`/dev/null` 等）は最上位のマウントを変えないため受ける。
+/// 比較は要素単位で、字面だけが似たパス（`/devices`）は祖先ではない。`mounts[]` との衝突
+/// （`ImplicitMountConflict`）と揃えて監査には記録しない（config の誤りであり実行時の脱出の試行ではない）。
+/// 暗黙マウントの集合は `ImplicitDevMount::ALL`（start は IPC namespace 必須で `/dev/shm` を常に載せる）。
+fn reject_protected_paths_over_implicit_dev(config: &OciConfig) -> Result<(), TraitError> {
+    let groups = [
+        ("linux.readonlyPaths", config.readonly_paths()),
+        ("linux.maskedPaths", config.masked_paths()),
+    ];
+    for (field, paths) in groups {
+        for (index, path) in paths.iter().enumerate() {
+            let overlaps = crate::dev_mounts::ImplicitDevMount::ALL
+                .iter()
+                .any(|m| is_same_or_ancestor(path.as_str(), m.destination()));
+            if overlaps {
+                return Err(TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "{field}[{index}] targets a mount point the runtime provides implicitly (/dev, /dev/pts or /dev/shm)"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 正規化済みの絶対パス `candidate` が `target` と同じか、その祖先かを要素単位で判定する。
+fn is_same_or_ancestor(candidate: &str, target: &str) -> bool {
+    if candidate == "/" || candidate == target {
+        return true;
+    }
+    target
+        .strip_prefix(candidate)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
@@ -2005,6 +2051,124 @@ mod tests {
             assert_eq!(err.code(), code, "case {name}");
             assert_eq!(err.message(), message, "case {name}");
         }
+    }
+
+    /// SEC-2・CORE-5・OCI-4（#2015）: 暗黙の `/dev` 系と同じか祖先を指す保護パスは start の fork 前に拒否する
+    /// （launcher 0 回・状態は Created のまま）。メッセージは静的で位置だけを含む。
+    #[test]
+    fn sec2_oci4_start_rejects_protected_paths_over_implicit_dev_mounts() {
+        let tail =
+            "targets a mount point the runtime provides implicitly (/dev, /dev/pts or /dev/shm)";
+        let mk = |ro: Value, masked: Value| {
+            let mut c = valid_config();
+            c["linux"]["readonlyPaths"] = ro;
+            c["linux"]["maskedPaths"] = masked;
+            c
+        };
+        let cases: Vec<(&str, Value, String)> = vec![
+            (
+                "ro-dev",
+                mk(json!(["/dev"]), json!([])),
+                format!("linux.readonlyPaths[0] {tail}"),
+            ),
+            (
+                "ro-pts",
+                mk(json!(["/dev/pts"]), json!([])),
+                format!("linux.readonlyPaths[0] {tail}"),
+            ),
+            (
+                "ro-shm",
+                mk(json!(["/dev/shm"]), json!([])),
+                format!("linux.readonlyPaths[0] {tail}"),
+            ),
+            (
+                "m-dev",
+                mk(json!([]), json!(["/dev"])),
+                format!("linux.maskedPaths[0] {tail}"),
+            ),
+            (
+                "m-pts",
+                mk(json!([]), json!(["/dev/pts"])),
+                format!("linux.maskedPaths[0] {tail}"),
+            ),
+            (
+                "m-shm",
+                mk(json!([]), json!(["/dev/shm"])),
+                format!("linux.maskedPaths[0] {tail}"),
+            ),
+            (
+                "norm-slash",
+                mk(json!(["/dev/"]), json!([])),
+                format!("linux.readonlyPaths[0] {tail}"),
+            ),
+            (
+                "norm-dslash",
+                mk(json!(["//dev"]), json!([])),
+                format!("linux.readonlyPaths[0] {tail}"),
+            ),
+            (
+                "norm-dot",
+                mk(json!(["/dev/./pts"]), json!([])),
+                format!("linux.readonlyPaths[0] {tail}"),
+            ),
+            (
+                "norm-shm",
+                mk(json!(["/dev//shm/"]), json!([])),
+                format!("linux.readonlyPaths[0] {tail}"),
+            ),
+            (
+                "pos",
+                mk(json!(["/data", "/dev/shm"]), json!([])),
+                format!("linux.readonlyPaths[1] {tail}"),
+            ),
+            (
+                "order",
+                mk(json!(["/dev"]), json!(["/dev/pts"])),
+                format!("linux.readonlyPaths[0] {tail}"),
+            ),
+        ];
+        for (name, cfg, message) in cases {
+            let err = start_rejected_after_rewrite(&format!("rej-devov-{name}"), &cfg);
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "case {name}");
+            assert_eq!(err.message(), message, "case {name}");
+        }
+    }
+
+    /// SEC-2（#2015）: 子孫・字面だけ似たパス・無関係なパスは拒否しない。
+    #[test]
+    fn sec2_protected_paths_under_or_beside_implicit_dev_are_accepted() {
+        for p in [
+            "/dev/null",
+            "/dev/pts/ptmx",
+            "/dev/shm/x",
+            "/devices",
+            "/dev-x",
+            "/dev/shmx",
+            "/proc/kcore",
+        ] {
+            let mut cfg = valid_config();
+            cfg["linux"]["readonlyPaths"] = json!([p]);
+            cfg["linux"]["maskedPaths"] = json!([p]);
+            let bytes = serde_json::to_vec(&cfg).expect("json");
+            let config = super::super::config::parse_config_bytes(&bytes)
+                .unwrap_or_else(|e| panic!("parse {p}: {e:?}"));
+            assert!(
+                reject_protected_paths_over_implicit_dev(&config).is_ok(),
+                "case {p}"
+            );
+        }
+    }
+
+    /// SEC-2（#2015）: 祖先判定は要素単位で、前方一致の取り違えをしない。
+    #[test]
+    fn sec2_is_same_or_ancestor_is_component_wise() {
+        assert!(is_same_or_ancestor("/dev", "/dev"));
+        assert!(is_same_or_ancestor("/dev", "/dev/pts"));
+        assert!(is_same_or_ancestor("/", "/dev"));
+        assert!(!is_same_or_ancestor("/de", "/dev"));
+        assert!(!is_same_or_ancestor("/dev/pts", "/dev"));
+        assert!(!is_same_or_ancestor("/dev/shmx", "/dev/shm"));
+        assert!(!is_same_or_ancestor("/dev/shm/x", "/dev/shm"));
     }
 
     /// OCI-4・SEC-1（#1915。#2063 の決定 (d)）: ホストパスの字句比較に入る拒否（bundle の祖先・保護パスとの重なり・状態ルート）。

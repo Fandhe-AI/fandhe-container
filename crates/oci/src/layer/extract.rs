@@ -12,6 +12,8 @@
 //!   削除・権限変更・リンク作成の前に `AlreadyExists` で拒否する（IO-5。下記「別表記の衝突」）。
 //! - whiteout・不透明ディレクトリを下位レイヤーの実体へ適用し、マーカー自体は展開しない（OCI-2。下記
 //!   「レイヤーごとの 3 パス」）。
+//! - AUFS のメタデータ（`.wh..wh.` で始まり `.wh..wh..opq` 以外の名前。`.wh..wh.plnk` 等）は、深さ・種別を問わず
+//!   エントリごと読み飛ばして rootfs へ何も書かない（#2183・OCI-2。下記「AUFS メタデータの予約名」）。
 //!
 //! tar クレートは解析（エントリ列挙）だけに使い、`unpack` / `unpack_in` は使わない（#408 の承認条件）。
 //!
@@ -29,7 +31,8 @@
 //! - 各レイヤーの tar は 2 回走査する（下記「レイヤーごとの 3 パス」）。blob 版は同じ blob を 2 回開き、
 //!   ストリーム版（`extract_tar`・`extract_layers`）は入力に `Seek` を求め、各走査の前に最初の位置へ戻す。
 //!   2 回の走査で内容が変わらないことは digest 検証済みであることに依る（変わっても、パス 3 はマーカー名を
-//!   書き出さない）。
+//!   書き出さない）。展開後 tar の diff_id（sha256）はパス 1 の読み取りで計算し、`extract_image_layers` では
+//!   image config の `rootfs.diff_ids` と突合する（パス 3 では再計算しない。#2017・OCI-1）。
 //! - tar の終端後に入力を EOF まで読み捨てる（gzip トレーラの CRC32・ISIZE 検証のため）。読み捨てを含む
 //!   入力全体は `ExtractLimits::max_input_bytes` で上限を課す（超過は `ResourceExhausted`）。
 //!
@@ -58,6 +61,23 @@
 //!
 //! 同じレイヤーの hardlink の参照先が同じレイヤーで whiteout されている場合、参照先はパス 2 で消えるため
 //! `NotFound` で拒否する（並び順に依らない）。
+//!
+//! # AUFS メタデータの予約名（#2183・OCI-2）
+//!
+//! image-spec v1.1.1 `layer.md` が定めるのは `.wh.<name>` と `.wh..wh..opq` だけで、`.wh..wh.` という予約接頭辞は無い。
+//! 一方 AUFS ストレージドライバ時代の Docker のイメージには `.wh..wh.plnk`・`.wh..wh.aufs`・`.wh..wh.orph` 等が残る。
+//! moby/go-archive（`UnpackLayer`。commit a9a82af9）はこれらを読み飛ばし、containerd も失敗させないため、
+//! 拒否すると古いイメージが展開できない。image-spec 上 `.wh.` で始まる名前は FS に実在できず whiteout 自体も隠す
+//! 決まりなので、読み飛ばしても仕様に反しない。よって本実装も読み飛ばす（`Plan::Skip`）。
+//!
+//! - 判定はパスを先頭から順に分類し、最初に通常でないと判定されたコンポーネントが決める。予約名が先なら
+//!   配下（中身のある通常ファイル・ディレクトリ・リンク・FIFO を含む）をエントリごと読み飛ばす。親の位置の
+//!   `.wh.<x>`・`.wh..wh..opq` が先なら従来どおり `InvalidArgument` で拒否する（fail-closed）。
+//! - 判定は `normalize_entry_path` の後なので、`..`・絶対パス・NUL・長すぎるパスは予約名の下でも拒否する。
+//! - 読み飛ばしたエントリも `max_entries` と入力上限には数え、展開バイト数には数えない。件数は
+//!   `ExtractedLayer::ignored_reserved_entries` に返す（黙って捨てない）。
+//! - moby との差: moby は `.wh..wh.plnk` 配下を指す hardlink の参照先を差し替えるが、本実装は再現しない。
+//!   参照先が展開されないため、その hardlink は `NotFound` で拒否する（fail-closed）。
 //!
 //! # 別表記の衝突（IO-5）
 //! 大文字小文字非区別の FS（Windows・macOS の既定）では `f` と `F`、正規化非区別の FS（APFS）では NFC と NFD の
@@ -109,11 +129,15 @@ use std::path::{Component, Path, PathBuf};
 
 use tar::{Archive, EntryType};
 
+use sha2::{Digest as _, Sha256};
+
 use super::{
-    DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, GzipLayerReader, oci_error_from_layer_io, open_gzip_layer,
+    DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, GzipLayerReader, LayerMediaType, PlainLayerReader,
+    oci_error_from_layer_io, open_gzip_layer, open_plain_layer,
 };
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
+use crate::reference::Digest;
 use crate::whiteout::{self, NameClass};
 
 /// エントリ数上限の参考既定値。API は上限を必須引数にしており、上限なしの経路は提供しない。
@@ -200,8 +224,15 @@ pub struct ExtractedLayer {
     /// 0 でなければ、展開結果の mode はレイヤーの記述と一致しない（ポリシーの条件を満たさなかった。
     /// モジュール冒頭の「通常ファイルの setuid / setgid / sticky」を参照）。
     pub files_with_stripped_special_bits: u64,
+    /// AUFS メタデータの予約名（`.wh..wh.` で始まり `.wh..wh..opq` 以外。配下を含む）として読み飛ばしたエントリ数。
+    ///
+    /// 読み飛ばしたエントリは rootfs へ何も書かず、何も消さない（`entries` には数え、`bytes` には数えない。#2183・OCI-2）。
+    pub ignored_reserved_entries: u64,
     /// 特殊ビットのポリシーの判定と、保持した件数（#1810）。
     pub special_bits: SpecialBitsOutcome,
+    /// 展開後 tar（圧縮を解いた全バイト。終端後の読み捨てを含む）の sha256。image config の
+    /// `rootfs.diff_ids` の要素と同じ値（#2017・OCI-1）。パス 1 の読み取りで計算する。
+    pub diff_id: Digest,
 }
 
 /// uid / gid の 1 行の写像（コンテナ内 `container_id` から `count` 個を host の `host_id` 以降へ）。
@@ -339,9 +370,11 @@ pub fn extract_layer_blob_with(
 ) -> Result<ExtractedLayer, OciError> {
     single(extract_stack(
         recorder,
-        [GzipBlob {
+        [BlobLayer {
             path: blob_path,
+            media_type: LayerMediaType::TarGzip,
             max_uncompressed_bytes,
+            expected_diff_id: None,
         }],
         root,
         limits,
@@ -445,9 +478,11 @@ pub fn extract_layer_blobs_with_policy(
 ) -> Result<Vec<ExtractedLayer>, OciError> {
     extract_stack(
         recorder,
-        blob_paths.iter().map(|path| GzipBlob {
+        blob_paths.iter().map(|path| BlobLayer {
             path,
+            media_type: LayerMediaType::TarGzip,
             max_uncompressed_bytes,
+            expected_diff_id: None,
         }),
         root,
         limits,
@@ -467,6 +502,11 @@ trait LayerSource {
 
     /// tar の先頭から読める状態の読み取り口を返す。
     fn open(&mut self) -> Result<Self::Reader<'_>, OciError>;
+
+    /// 展開後 tar の sha256 として期待する値（image config の `rootfs.diff_ids` の要素）。`None` なら突合しない。
+    fn expected_diff_id(&self) -> Option<&Digest> {
+        None
+    }
 }
 
 /// `Read + Seek` のストリームを、最初に `open` された時点の位置へ戻して読み直す `LayerSource`。
@@ -510,21 +550,202 @@ impl<R: Read + Seek> LayerSource for Rewind<R> {
     }
 }
 
-/// digest 検証済みの圧縮レイヤー blob を、走査のたびに開き直して gzip 展開する `LayerSource`。
-struct GzipBlob<'p> {
-    path: &'p Path,
-    max_uncompressed_bytes: u64,
+/// `BlobLayer` の読み取り口。`mediaType` に応じて gzip 展開か素通しかが決まる。
+enum LayerReader {
+    Gzip(Box<GzipLayerReader<File>>),
+    Plain(PlainLayerReader<File>),
 }
 
-impl LayerSource for GzipBlob<'_> {
+impl Read for LayerReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Gzip(r) => r.read(buf),
+            Self::Plain(r) => r.read(buf),
+        }
+    }
+}
+
+/// digest 検証済みのレイヤー blob を、走査のたびに開き直す `LayerSource`。
+///
+/// `media_type` が `TarGzip` なら gzip 展開、`Tar` なら素通し（どちらも `max_uncompressed_bytes` の上限つき）。
+/// `expected_diff_id` があれば、パス 1 で計算した展開後 tar の sha256 と突合する（#2017・OCI-1）。
+struct BlobLayer<'p> {
+    path: &'p Path,
+    media_type: LayerMediaType,
+    max_uncompressed_bytes: u64,
+    expected_diff_id: Option<Digest>,
+}
+
+impl LayerSource for BlobLayer<'_> {
     type Reader<'a>
-        = GzipLayerReader<File>
+        = LayerReader
     where
         Self: 'a;
 
-    fn open(&mut self) -> Result<GzipLayerReader<File>, OciError> {
-        open_gzip_layer(self.path, self.max_uncompressed_bytes)
+    fn open(&mut self) -> Result<LayerReader, OciError> {
+        match self.media_type {
+            LayerMediaType::TarGzip => open_gzip_layer(self.path, self.max_uncompressed_bytes)
+                .map(|r| LayerReader::Gzip(Box::new(r))),
+            LayerMediaType::Tar => {
+                open_plain_layer(self.path, self.max_uncompressed_bytes).map(LayerReader::Plain)
+            }
+        }
     }
+
+    fn expected_diff_id(&self) -> Option<&Digest> {
+        self.expected_diff_id.as_ref()
+    }
+}
+
+/// `extract_image_layers` に渡す 1 レイヤー分の記述（#2017・OCI-1）。
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct ImageLayer<'a> {
+    /// digest 検証済みの blob のパス。
+    pub path: &'a Path,
+    /// manifest の descriptor の `mediaType`。
+    pub media_type: &'a str,
+    /// image config の `rootfs.diff_ids` の対応する要素。
+    pub diff_id: &'a Digest,
+}
+
+impl<'a> ImageLayer<'a> {
+    /// blob のパス・`mediaType`・期待する diff_id から作る。
+    pub fn new(path: &'a Path, media_type: &'a str, diff_id: &'a Digest) -> Self {
+        Self {
+            path,
+            media_type,
+            diff_id,
+        }
+    }
+}
+
+/// 計装なしの `extract_image_layers_with`（`NoopOciOpRecorder`）。
+pub fn extract_image_layers(
+    layers: &[ImageLayer<'_>],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_image_layers_with(
+        &NoopOciOpRecorder,
+        layers,
+        root,
+        max_uncompressed_bytes,
+        limits,
+    )
+}
+
+/// `mediaType` で入口を選び、展開後 tar の sha256 を `rootfs.diff_ids` と突合しながら重ねて展開する（#2017・OCI-1）。
+///
+/// 手順は、(1) 全レイヤーの `mediaType` を I/O より前に検査する（未対応は `Unimplemented`。rootfs に触れない）、
+/// (2) 各レイヤーのパス 1 で計算した展開後 tar の sha256 を `diff_id` と突合する（不一致は `DataLoss`。そのレイヤーの
+/// 変更を始める前に止まるが、先行レイヤーの展開物は残るため、呼び出し側が `root` ごと破棄すること）。
+/// `layers` の件数と config の `diff_ids` の件数の照合は `image_layers_from` が行う
+/// （`diff_id` を 1 対 1 で渡すため、不一致は型の上で表現できない）。その他は `extract_layer_blobs_with` と同じ。
+pub fn extract_image_layers_with(
+    recorder: &dyn OciOpRecorder,
+    layers: &[ImageLayer<'_>],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_image_layers_with_policy(
+        recorder,
+        layers,
+        root,
+        max_uncompressed_bytes,
+        limits,
+        SpecialBitsPolicy::Strip,
+    )
+}
+
+/// `extract_image_layers_with` に通常ファイルの特殊ビットのポリシーを足した版（SEC-5・#1810）。
+pub fn extract_image_layers_with_policy(
+    recorder: &dyn OciOpRecorder,
+    layers: &[ImageLayer<'_>],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+    policy: SpecialBitsPolicy,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    // レイヤー 0 のイメージ（manifest の layers と diff_ids がともに空）は正常な入力。展開物は空の rootfs になる。
+    // `extract_stack` は空入力を拒否するため、ここで root の前提（存在・ディレクトリ・空）だけ確かめて空の結果を返す。
+    if layers.is_empty() {
+        check_root_empty(root)?;
+        return Ok(Vec::new());
+    }
+    let sources = layers
+        .iter()
+        .map(|l| {
+            Ok(BlobLayer {
+                path: l.path,
+                media_type: LayerMediaType::parse(l.media_type)?,
+                max_uncompressed_bytes,
+                expected_diff_id: Some(l.diff_id.clone()),
+            })
+        })
+        .collect::<Result<Vec<_>, OciError>>()?;
+    extract_stack(
+        recorder,
+        sources,
+        root,
+        limits,
+        host_lstat,
+        SpecialSetup::host(policy),
+    )
+}
+
+/// 件数の照合つきで `ImageLayer` の列を作る補助（#2017・OCI-1）。
+///
+/// manifest の `layers`・digest 検証済みの blob パス・config の `rootfs.diff_ids` の 3 者の件数が揃わなければ、
+/// どの I/O よりも前に `DataLoss` を返す。
+pub fn image_layers_from<'a>(
+    descriptors: &'a [crate::manifest::Descriptor],
+    blob_paths: &'a [&'a Path],
+    rootfs: &'a crate::config::ImageRootFs,
+) -> Result<Vec<ImageLayer<'a>>, OciError> {
+    let ids = rootfs.diff_ids();
+    if descriptors.len() != ids.len() || descriptors.len() != blob_paths.len() {
+        return Err(err(
+            OciErrorCode::DataLoss,
+            "layer count does not match rootfs.diff_ids",
+        ));
+    }
+    Ok(descriptors
+        .iter()
+        .zip(blob_paths)
+        .zip(ids)
+        .map(|((d, path), id)| ImageLayer::new(path, d.media_type.as_str(), id))
+        .collect())
+}
+
+/// 読んだバイトを sha256 へ通す読み取りアダプタ（パス 1 で展開後 tar の diff_id を計算する）。
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if let Some(read) = buf.get(..n) {
+            self.hasher.update(read);
+        }
+        Ok(n)
+    }
+}
+
+/// sha256 の出力を `Digest` へ変換する。
+fn digest_of(hasher: Sha256) -> Result<Digest, OciError> {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(71);
+    s.push_str("sha256:");
+    for b in hasher.finalize() {
+        // String への書き込みは失敗しない。
+        let _ = write!(s, "{b:02x}");
+    }
+    Digest::parse(&s)
 }
 
 /// 展開先 FS の名前解決（`lstat`）。既定は `fs::symlink_metadata`。
@@ -666,6 +887,8 @@ enum Removal {
 enum Plan {
     /// whiteout・不透明マーカー（展開しない）。
     Marker(Marker),
+    /// AUFS メタデータの予約名（`.wh..wh.` で始まり `.wh..wh..opq` 以外）。何も書かず何も消さない（#2183）。
+    Skip,
     /// ディレクトリ（名前が `/` で終わる通常ファイルを含む）。
     Dir(Vec<OsString>, u32),
     /// 通常ファイル。
@@ -690,6 +913,8 @@ struct Extractor<'a> {
     bytes: u64,
     /// setuid / setgid / sticky を落として展開した通常ファイルのエントリ数。
     stripped_special: u64,
+    /// 予約名として読み飛ばしたエントリ数（`ExtractedLayer::ignored_reserved_entries` の元）。
+    ignored_reserved: u64,
     /// 特殊ビットを tar の値どおりに適用した通常ファイルのエントリ数。
     preserved_special: u64,
     /// 特殊ビットのポリシーの評価結果（展開の開始時に 1 回決める）。
@@ -1808,8 +2033,10 @@ fn check_root_empty(root: &Path) -> Result<(), OciError> {
 
 /// tar エントリ 1 件を検証し、処理内容を返す（パス 1 とパス 3 で共通。副作用なし）。
 ///
-/// パスの正規化（`normalize_entry_path`）、親コンポーネントの whiteout 名・予約名の拒否、最終コンポーネントの
-/// 分類（`whiteout::classify`）、マーカーの形（中身の無い通常ファイル）の検査、未対応の種別の拒否を行う。
+/// パスの正規化（`normalize_entry_path`）、先頭から順の各コンポーネントの分類（`whiteout::classify`）。
+/// 最初に通常でないと判定されたものが決める: 予約名（AUFS メタデータ）ならエントリ全体を `Plan::Skip`
+/// （読み飛ばし。moby / containerd と同じ。#2183・OCI-2）、親の位置の whiteout 名・不透明マーカーなら拒否。
+/// 最終コンポーネントの分類、マーカーの形（中身の無い通常ファイル）の検査、未対応の種別の拒否を行う。
 fn plan_entry<R: Read>(entry: &tar::Entry<'_, R>) -> Result<Plan, OciError> {
     let ty = entry.header().entry_type();
     let raw_path = entry.path_bytes();
@@ -1822,6 +2049,12 @@ fn plan_entry<R: Read>(entry: &tar::Entry<'_, R>) -> Result<Plan, OciError> {
     let mut class = NameClass::Regular;
     while let Some(c) = raw_comps.next() {
         let cls = whiteout::classify(c)?;
+        if cls == NameClass::Reserved {
+            // AUFS メタデータ。最初に現れた非通常コンポーネントが予約名なら、深さ・種別・サイズを問わず
+            // エントリ全体を読み飛ばす（配下の通常ファイルは中身を持つためマーカーの形は検査しない）。
+            // 正規化（`..`・絶対パス・NUL・長さ）は上で済んでおり、予約名の下でも従来どおり拒否される。
+            return Ok(Plan::Skip);
+        }
         if raw_comps.peek().is_none() {
             class = cls;
         } else if cls != NameClass::Regular {
@@ -1894,14 +2127,18 @@ fn drain<R: Read>(src: &mut LimitedReader<R>) -> Result<(), OciError> {
 /// エントリ数（前のレイヤーまでの `x.entries` から数える）が `max_entries` を超えたら `ResourceExhausted`
 /// （集めるマーカーの件数もこれで頭打ちになる）。通常ファイルの宣言サイズの累積（`x.bytes` から数える）が
 /// `max_total_bytes` を超えても、本体を読み飛ばす前に `ResourceExhausted` にする。入力は `input_budget` バイト
-/// まで読む。戻り値のマーカーは並べ替え・重複除去済み。
+/// まで読む。戻り値のマーカーは並べ替え・重複除去済み。あわせて、EOF まで読んだ展開後 tar 全体の sha256
+/// （diff_id。#2017）を返す。
 fn collect_markers<R: Read>(
     x: &Extractor<'_>,
     src: R,
     input_budget: u64,
-) -> Result<Vec<Marker>, OciError> {
+) -> Result<(Vec<Marker>, Digest), OciError> {
     let mut src = LimitedReader {
-        inner: src,
+        inner: HashingReader {
+            inner: src,
+            hasher: Sha256::new(),
+        },
         read: 0,
         limit: input_budget,
     };
@@ -1924,6 +2161,8 @@ fn collect_markers<R: Read>(
             }
             match plan_entry(&entry)? {
                 Plan::Marker(m) => markers.push(m),
+                // 書き出さないため展開バイト数には数えない（エントリ数は上で数え済み）。
+                Plan::Skip => {}
                 Plan::File(..) => {
                     bytes = bytes
                         .checked_add(entry.size())
@@ -1942,7 +2181,7 @@ fn collect_markers<R: Read>(
     drain(&mut src)?;
     markers.sort_unstable();
     markers.dedup();
-    Ok(markers)
+    Ok((markers, digest_of(src.inner.hasher)?))
 }
 
 /// 1 レイヤー分の tar を `x` へ展開する。`input_budget` はこのレイヤーに残された入力バイト数の上限。
@@ -1957,9 +2196,18 @@ fn extract_one_layer<S: LayerSource>(
     input_budget: u64,
 ) -> Result<(ExtractedLayer, u64), OciError> {
     let (entries0, bytes0, stripped0) = (x.entries, x.bytes, x.stripped_special);
-    let preserved0 = x.preserved_special;
+    let (preserved0, ignored0) = (x.preserved_special, x.ignored_reserved);
     let max_entries = x.limits.max_entries;
-    let markers = collect_markers(x, src.open()?, input_budget)?;
+    let (markers, diff_id) = collect_markers(x, src.open()?, input_budget)?;
+    // 突合はパス 2 の前に行う。不一致のレイヤーは rootfs を変更しない（#2017・OCI-1）。
+    if let Some(expected) = src.expected_diff_id()
+        && *expected != diff_id
+    {
+        return Err(err(
+            OciErrorCode::DataLoss,
+            "layer diff_id does not match the image config",
+        ));
+    }
     x.apply_markers(&markers)?;
     drop(markers);
     x.layer_nodes.clear();
@@ -1989,6 +2237,8 @@ fn extract_one_layer<S: LayerSource>(
             match plan_entry(&entry)? {
                 // マーカーはパス 2 で適用済み。rootfs へは書かない（OCI-2）。
                 Plan::Marker(_) => {}
+                // 予約名は本体を読み捨てて件数だけ数える（rootfs へ書かない。#2183）。
+                Plan::Skip => x.ignored_reserved = x.ignored_reserved.saturating_add(1),
                 Plan::Dir(comps, mode) => x.make_dir(comps, mode)?,
                 Plan::File(comps, mode) => {
                     let size = entry.size();
@@ -2023,10 +2273,12 @@ fn extract_one_layer<S: LayerSource>(
             entries: x.entries.saturating_sub(entries0),
             bytes: x.bytes.saturating_sub(bytes0),
             files_with_stripped_special_bits: x.stripped_special.saturating_sub(stripped0),
+            ignored_reserved_entries: x.ignored_reserved.saturating_sub(ignored0),
             special_bits: SpecialBitsOutcome {
                 decision: x.special.decision,
                 preserved_files: x.preserved_special.saturating_sub(preserved0),
             },
+            diff_id,
         },
         src.read,
     ))
@@ -2034,7 +2286,7 @@ fn extract_one_layer<S: LayerSource>(
 
 /// レイヤー列を `root` へ下位から順に重ねて展開する本体（単一レイヤー API もこれの 1 要素版）。
 ///
-/// 各要素は `LayerSource`（blob 版は gzip を開き直す `GzipBlob`、ストリーム版は位置を戻す `Rewind`）。
+/// 各要素は `LayerSource`（blob 版は gzip を開き直す `BlobLayer`、ストリーム版は位置を戻す `Rewind`）。
 /// `Extractor`（別表記の索引・遅延ディレクトリ mode・上限のカウンタ）は全レイヤーで共有し、上限は全体で
 /// 累積する。`lstat` はテストだけが差し替える（`Lstat` を参照）。
 fn extract_stack<S: LayerSource>(
@@ -2067,6 +2319,7 @@ fn extract_stack<S: LayerSource>(
                     entries: 0,
                     bytes: 0,
                     stripped_special: 0,
+                    ignored_reserved: 0,
                     preserved_special: 0,
                     special: eval_special_ctx(&setup, root)?,
                     deferred_dirs: HashMap::new(),
@@ -3984,7 +4237,8 @@ mod tests {
 
     /// OCI-1: 同じレイヤーの中でのディレクトリ → 非ディレクトリの型の衝突は、従来どおり `FailedPrecondition`
     /// （置き換えるのは下位レイヤー由来のノードだけ）。経路として通った下位のディレクトリも同じレイヤーの
-    /// ノードとして扱い、配下に作った実体を消さない。
+    /// ノードとして扱い、配下に作った実体を消さない。image-spec は 1 つの changeset に同一パスの重複エントリを
+    /// 含めてはならないと定めるため、同一レイヤー内の型の衝突は不正な入力として拒否するのが正しい（#2017）。
     #[test]
     fn oci1_stack_same_layer_type_conflicts_are_rejected() {
         for upper in [
@@ -4124,6 +4378,7 @@ mod tests {
             entries: 0,
             bytes: 0,
             stripped_special: 0,
+            ignored_reserved: 0,
             preserved_special: 0,
             special: SpecialCtx::strip(),
             deferred_dirs: HashMap::new(),
@@ -4705,7 +4960,10 @@ mod tests {
                 file("../escape", 0o644, b"z"),
                 OciErrorCode::PermissionDenied,
             ),
-            (wh("d/.wh..wh.plnk"), OciErrorCode::InvalidArgument),
+            (
+                file(".wh..wh..opq/x", 0o644, b"z"),
+                OciErrorCode::InvalidArgument,
+            ),
             (file(".wh.a/b", 0o644, b"z"), OciErrorCode::InvalidArgument),
             (
                 file("d/.wh.y", 0o644, b"junk"),
@@ -4720,6 +4978,93 @@ mod tests {
             let mut entries = head();
             entries.push(bad);
             assert_eq!(lay_err(&mut ex, &entries), want);
+            assert_eq!(snapshot(&sb.root), before);
+        }
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2・#2183: AUFS メタデータの予約名（配下を含む）は rootfs に書かれず、他のエントリ（通常の whiteout を含む）
+    /// の展開に影響しない。結果は並び順に依らない。
+    #[test]
+    fn oci2_aufs_reserved_entries_are_skipped() {
+        let r = all_orders(
+            &[file("a", 0o644, b"a"), file("d/c", 0o644, b"c")],
+            &[
+                dir(".wh..wh.plnk/", 0o755),
+                file(".wh..wh.plnk/123", 0o644, b"payload"),
+                file(".wh..wh.aufs", 0o644, b"meta"),
+                wh(".wh.a"),
+                file("b", 0o644, b"b"),
+            ],
+        );
+        assert_eq!(
+            r.unwrap(),
+            snap(&[("b", "file:b"), ("d", D755), ("d/c", "file:c")])
+        );
+    }
+
+    /// OCI-2・#2183: 読み飛ばしの件数・バイト数の数え方（ネスト・単体・FIFO を含む）。
+    #[test]
+    fn oci2_aufs_reserved_skip_counts() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        let entries = [
+            file("ok", 0o644, b"ok"),
+            file("d/.wh..wh.plnk", 0o644, b"abc"),
+            file(".wh..wh.orph/x", 0o644, b"zz"),
+            wh(".wh..wh."),
+            raw_entry(b".wh..wh.orph/f", EntryType::Fifo, b"", 0o644, 0, b""),
+        ];
+        let r = extract_one_layer(
+            &mut ex,
+            &mut Rewind::new(Cursor::new(archive(&entries))),
+            1 << 30,
+        )
+        .unwrap()
+        .0;
+        assert_eq!(r.entries, 5);
+        assert_eq!(r.ignored_reserved_entries, 4);
+        assert_eq!(r.bytes, 2);
+        assert_eq!(snapshot(&sb.root), snap(&[("ok", "file:ok")]));
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2・#2183: `.wh..wh.plnk` 配下を指す hardlink は moby の差し替えを再現せず、並びに依らず `NotFound`。
+    #[test]
+    fn oci2_hardlink_into_aufs_plnk_is_not_found() {
+        let r = all_orders(
+            &[],
+            &[
+                file(".wh..wh.plnk/123", 0o644, b"x"),
+                hardlink("g", ".wh..wh.plnk/123"),
+            ],
+        );
+        assert_eq!(r.unwrap_err(), OciErrorCode::NotFound);
+    }
+
+    /// OCI-2・#2183: 予約名の読み飛ばしでも fail-closed の拒否（`..`・親の位置の whiteout / 不透明）は残り、
+    /// 拒否したときは rootfs を変えない。
+    #[test]
+    fn oci2_reserved_skip_keeps_fail_closed_rules() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(&mut ex, &[file("keep", 0o644, b"k")]);
+        let before = snapshot(&sb.root);
+        for (bad, want) in [
+            (
+                file(".wh..wh.plnk/../x", 0o644, b"z"),
+                OciErrorCode::PermissionDenied,
+            ),
+            (
+                file(".wh.foo/.wh..wh.plnk", 0o644, b"z"),
+                OciErrorCode::InvalidArgument,
+            ),
+            (
+                file(".wh..wh..opq/child", 0o644, b"z"),
+                OciErrorCode::InvalidArgument,
+            ),
+        ] {
+            assert_eq!(lay_err(&mut ex, &[file("new", 0o644, b"n"), bad]), want);
             assert_eq!(snapshot(&sb.root), before);
         }
         sb.assert_outside_untouched();

@@ -7,8 +7,13 @@
 //! 対応する `mediaType` は OCI image manifest / image index と Docker schema 2 の manifest / manifest list の
 //! 4 種のみ。これ以外（Docker schema 1 を含む）は `Unimplemented` で拒否する（互換範囲の最終確定は spec で検討中）。
 //!
+//! 対応するレイヤーの `mediaType` は gzip の 2 種（`application/vnd.oci.image.layer.v1.tar+gzip`・
+//! `application/vnd.docker.image.rootfs.diff.tar.gzip`）のみ。それ以外（zstd は #2029 で保留中、非圧縮 tar を含む）は
+//! blob を取得する前に `ensure_supported_layer_media_types` が `Unimplemented` で拒否する（#2037・OCI-1・ERR-1）。
+//!
 //! 本文はレジストリが返す非信頼入力として扱う。`unwrap` / `expect` / 添字アクセスを使わず、不正な JSON・
-//! 必須項目の欠落・不正な digest は `DataLoss` に分類する。message は固定文で、本文の断片は載せない。
+//! 必須項目の欠落・不正な digest は `DataLoss` に分類する。message は固定文で、本文の断片は載せない
+//! （例外: 未対応のレイヤーの `mediaType` だけは、長さを制限し文字を置き換えて載せる）。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）: digest の突合（本文のハッシュと参照 digest・`Docker-Content-Digest`。
 //! #405）。ここで返す値は未検証であり、digest で取得した場合の本文ハッシュ一致検証は呼び出し側が #405 で行う。
@@ -39,6 +44,59 @@ const SIZE_MAX: u64 = i64::MAX as u64;
 
 fn data_loss(msg: &'static str) -> OciError {
     OciError::new(OciErrorCode::DataLoss, msg)
+}
+
+/// OCI の gzip 圧縮レイヤーの `mediaType`。
+pub const MEDIA_TYPE_OCI_LAYER_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+/// Docker の gzip 圧縮レイヤーの `mediaType`。
+pub const MEDIA_TYPE_DOCKER_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
+/// 展開側（`layer`）が扱えるレイヤーの `mediaType` の一覧（現状は gzip のみ。zstd は #2029 で保留中）。
+///
+/// 展開側の対応が増えたとき（#2017）は、この一覧を揃える。
+pub const SUPPORTED_LAYER_MEDIA_TYPES: &[&str] =
+    &[MEDIA_TYPE_OCI_LAYER_GZIP, MEDIA_TYPE_DOCKER_LAYER_GZIP];
+/// エラー message に載せるレイヤー `mediaType` の最大バイト数（超過分は `...` に置き換える）。
+pub const LAYER_MEDIA_TYPE_DISPLAY_MAX_BYTES: usize = 128;
+
+/// 非信頼の `mediaType` を message 用に整える（RFC 6838 の名前の文字以外は `?`、上限で切り詰め）。
+fn display_media_type(mt: &str) -> String {
+    let mut out: String = mt
+        .chars()
+        .take(LAYER_MEDIA_TYPE_DISPLAY_MAX_BYTES + 1)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "!#$&^_.+/-".contains(c) {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    // 置換後は ASCII のみのため、バイト境界は文字境界でもある。
+    if out.len() > LAYER_MEDIA_TYPE_DISPLAY_MAX_BYTES {
+        out.truncate(LAYER_MEDIA_TYPE_DISPLAY_MAX_BYTES);
+        out.push_str("...");
+    }
+    out
+}
+
+/// レイヤーの `mediaType` が展開側の対応範囲かを、blob の取得前に確かめる（#2037・OCI-1・ERR-1）。
+///
+/// `registry` の manifest 解決（`fetch_manifest`）が image manifest を得た直後に呼ぶ。未対応（zstd・非圧縮 tar・
+/// 未知の値）の最初の 1 件を `Unimplemented` で返し、config / layer の blob 取得を始めさせない。
+/// 判定は完全一致（`SUPPORTED_LAYER_MEDIA_TYPES`）。zstd への対応は #2029 で保留中。
+pub fn ensure_supported_layer_media_types(manifest: &ImageManifest) -> Result<(), OciError> {
+    for (i, layer) in manifest.layers.iter().enumerate() {
+        if !SUPPORTED_LAYER_MEDIA_TYPES.contains(&layer.media_type.as_str()) {
+            return Err(OciError::new(
+                OciErrorCode::Unimplemented,
+                format!(
+                    "unsupported layer mediaType at layers[{i}]: {}",
+                    display_media_type(&layer.media_type)
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 対象 platform（OS・アーキテクチャ・任意の variant）。
@@ -509,5 +567,67 @@ mod tests {
         assert_eq!(code_of(b.as_bytes(), None), OciErrorCode::ResourceExhausted);
         let big = vec![b' '; MANIFEST_MAX_BYTES as usize + 1];
         assert_eq!(code_of(&big, None), OciErrorCode::ResourceExhausted);
+    }
+
+    fn layers_manifest(types: &[&str]) -> ImageManifest {
+        let layers: Vec<String> = types
+            .iter()
+            .map(|t| format!(r#"{{"mediaType":"{t}","digest":"sha256:{H2}","size":1}}"#))
+            .collect();
+        let body = format!(
+            r#"{{"schemaVersion":2,"mediaType":"{MEDIA_TYPE_OCI_MANIFEST}","config":{{"mediaType":"c","digest":"sha256:{H1}","size":1}},"layers":[{}]}}"#,
+            layers.join(",")
+        );
+        match parse_manifest(body.as_bytes(), None).expect("parse") {
+            ParsedManifest::Image(m) => m,
+            other => panic!("expected image: {other:?}"),
+        }
+    }
+
+    /// OCI-1: gzip の 2 種は受理する。
+    #[test]
+    fn layer_media_type_gzip_is_accepted() {
+        let m = layers_manifest(&[MEDIA_TYPE_OCI_LAYER_GZIP, MEDIA_TYPE_DOCKER_LAYER_GZIP]);
+        assert!(ensure_supported_layer_media_types(&m).is_ok());
+    }
+
+    /// OCI-1・ERR-1: zstd・非圧縮・未知・nondistributable / foreign は `Unimplemented` で値を示す。
+    #[test]
+    fn layer_media_type_unsupported_is_rejected() {
+        for t in [
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            "application/vnd.oci.image.layer.v1.tar",
+            "text/plain",
+            "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
+            "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip",
+        ] {
+            let e = ensure_supported_layer_media_types(&layers_manifest(&[t])).expect_err(t);
+            assert_eq!(e.code(), OciErrorCode::Unimplemented);
+            assert!(
+                e.message().contains(&format!("layers[0]: {t}")),
+                "{}",
+                e.message()
+            );
+        }
+    }
+
+    /// OCI-1・ERR-1: 最初の未対応レイヤーの位置を報告する。
+    #[test]
+    fn layer_media_type_reports_first_unsupported_index() {
+        let m = layers_manifest(&[MEDIA_TYPE_OCI_LAYER_GZIP, "x/zstd", "y/other"]);
+        let e = ensure_supported_layer_media_types(&m).expect_err("reject");
+        assert!(e.message().contains("layers[1]: x/zstd"), "{}", e.message());
+    }
+
+    /// ERR-1・ERR-2: message の値は 128 バイトで切り詰め、許可外の文字は `?` にする。
+    #[test]
+    fn layer_media_type_message_is_bounded_and_sanitized() {
+        let long = "a".repeat(10_000);
+        assert_eq!(
+            display_media_type(&long),
+            format!("{}...", "a".repeat(LAYER_MEDIA_TYPE_DISPLAY_MAX_BYTES))
+        );
+        assert_eq!(display_media_type("a\nb\u{1b}[0m"), "a?b??0m");
+        assert_eq!(display_media_type("日本"), "??");
     }
 }

@@ -17,7 +17,7 @@
 //! PLUG-12 の peer 認証（TASK-124）は Linux の SO_PEERCRED（`uds_security::verify_peer`。TASK-124.1・#292）と
 //! macOS の `getpeereid` 経路（TASK-124.2・#293）が実装・検証済みで、
 //! 別 UID 接続拒否の結合試験（TASK-124.4・#295。実機前提の 2 件は人間が実行）と peer 認証が最初の読み書きより前であることの照合テスト（TASK-124.6・#1389）も追加済みで、
-//! 拒否した接続の監査イベント通知（`audit`。TASK-124.5・#1388・SEC-4）も実装済みで、永続的な監査ログへの配線は core 側 proxy（TASK-114）で未実装（Windows は WIN-1 により固有実装を持たない旨を `uds_security` に文書化済み。TASK-124.3・#294。TASK-108 ほか。REPAIR-3）。
+//! 拒否した接続の監査イベント通知（`audit`。TASK-124.5・#1388・SEC-4）も実装済みで、永続的な監査ログへの配線は core 側 proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114）で未実装（Windows は WIN-1 により固有実装を持たない旨を `uds_security` に文書化済み。TASK-124.3・#294。TASK-108 ほか。REPAIR-3）。
 //! 本体は G8（TASK-107 が crate 本体、TASK-108 が gRPC〔tonic〕境界、TASK-110・TASK-113・TASK-122〜124）で
 //! 実装する。plugin 発見・登録（TASK-109）の成果物は `fandhe-container-core` 側に置かれ、本 crate ではない。
 //! PLUG-1 区分は core・plugin 双方が依存する境界基盤ライブラリ（crate-naming.md 決定 4）。
@@ -58,12 +58,13 @@ pub use frame::{
 pub use lifecycle::PluginFileIdentity;
 pub use lifecycle::{
     ChildCleanupFailure, DROP_REPORT_CAPACITY, ONE_SHOT_ARGS_MAX_BYTES, ONE_SHOT_ARGS_MAX_COUNT,
-    ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_REAP_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT,
-    ONE_SHOT_STDERR_MAX_BYTES, ONE_SHOT_STDERR_STOP_TIMEOUT, ONE_SHOT_TIMEOUT_DEFAULT,
-    ONE_SHOT_TIMEOUT_MAX, OneShotOutcome, OneShotPlugin, OneShotRecord, OneShotStderr,
-    OneShotSummary, OneShotTermination, OneShotTimeout, PLUGIN_SOCKET_ENV, PendingChildCleanup,
-    PluginCallOutcome, PluginCallRecord, PluginLaunchTarget, PluginMode, PluginModeKind,
-    PluginSession, PluginSessionShutdown, RESIDENT_EXIT_DETECT_TIMEOUT,
+    ONE_SHOT_ENV_MAX_BYTES, ONE_SHOT_ENV_MAX_COUNT, ONE_SHOT_ENV_NAME_MAX_BYTES,
+    ONE_SHOT_ENV_VALUE_MAX_BYTES, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_REAP_TIMEOUT,
+    ONE_SHOT_STDERR_DRAIN_TIMEOUT, ONE_SHOT_STDERR_MAX_BYTES, ONE_SHOT_STDERR_STOP_TIMEOUT,
+    ONE_SHOT_TIMEOUT_DEFAULT, ONE_SHOT_TIMEOUT_MAX, OneShotOutcome, OneShotPlugin, OneShotRecord,
+    OneShotStderr, OneShotSummary, OneShotTermination, OneShotTimeout, PLUGIN_SOCKET_ENV,
+    PendingChildCleanup, PluginCallOutcome, PluginCallRecord, PluginLaunchTarget, PluginMode,
+    PluginModeKind, PluginSession, PluginSessionShutdown, RESIDENT_EXIT_DETECT_TIMEOUT,
     RESIDENT_START_TIMEOUT_DEFAULT, RESIDENT_START_TIMEOUT_MAX, ResidentCallRecord, ResidentPlugin,
     ResidentShutdown, ResidentShutdownError, ResidentStartTimeout, ResidentState, call_once,
     call_once_observed, take_pending_child_cleanup_failures, write_stderr_nonblocking,

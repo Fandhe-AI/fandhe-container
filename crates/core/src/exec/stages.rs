@@ -55,7 +55,10 @@
 use std::fmt;
 
 #[cfg(not(test))]
-use super::capabilities::apply_default_capabilities;
+use super::ThreadCountSource;
+use super::capabilities::ProcessIds;
+#[cfg(not(test))]
+use super::capabilities::apply_default_capabilities_for_launch;
 #[cfg(not(test))]
 use super::landlock::apply_landlock_stage;
 #[cfg(not(test))]
@@ -63,7 +66,7 @@ use super::seccomp::apply_default_seccomp;
 use super::{CapabilityReport, ExecError, IsolationStage, no_new_privs, rlimits};
 // テストでは本物（`Threads: 1` を要求）の代わりに偽カーネルで走る関数へ差し替える。
 #[cfg(test)]
-use super::capabilities::testing::apply_default_capabilities;
+use super::capabilities::testing::apply_default_capabilities_ids;
 #[cfg(test)]
 use super::landlock::testing::apply_landlock_stage;
 #[cfg(test)]
@@ -340,6 +343,9 @@ pub struct StagePipeline {
     /// pivot 前段が載せたマウントの識別子の記録（Landlock の Mount 由来のルールの照合に使う。#2071）。
     /// 既定は空で、空のまま Mount 由来のルールがあれば Landlock 段は拒否する（fail-closed）。
     mounts: MountedTargets,
+    /// `process.user` の uid・gid（0/0 以外のときだけ `Some`）。組み込みの capability 削減段が、補助グループの
+    /// 消去の後・bounding set の削減の前に切り替える（#1462 の経路。OCI-1・SEC-5・TASK-29）。
+    process_ids: Option<ProcessIds>,
 }
 
 impl Default for StagePipeline {
@@ -382,7 +388,20 @@ impl StagePipeline {
             rlimits: None,
             landlock: None,
             mounts: MountedTargets::new(),
+            process_ids: None,
         }
+    }
+
+    /// `process.user` の uid・gid を capability 削減段で適用させる（launch の非 root 指定。OCI-1・SEC-5）。
+    ///
+    /// `0/0` は切り替え不要（`uid_map` の結果として既に名前空間内の root）なので `None` のままにする。
+    pub(crate) fn with_process_ids(mut self, uid: u32, gid: u32) -> Self {
+        self.process_ids = if uid == 0 && gid == 0 {
+            None
+        } else {
+            Some(ProcessIds { uid, gid })
+        };
+        self
     }
 
     /// pivot 前段が載せたマウントの識別子の記録を Landlock 段へ渡す（#2071・CORE-5・SEC-1）。
@@ -567,8 +586,14 @@ impl StagePipeline {
                     }
                 }
                 StageKind::CapabilityDrop => {
-                    let r = apply_default_capabilities()
-                        .map_err(|e| e.at_stage(kind.isolation_stage()))?;
+                    #[cfg(not(test))]
+                    let applied = apply_default_capabilities_for_launch(
+                        &mut ThreadCountSource::ProcSelf,
+                        self.process_ids,
+                    );
+                    #[cfg(test)]
+                    let applied = apply_default_capabilities_ids(self.process_ids);
+                    let r = applied.map_err(|e| e.at_stage(kind.isolation_stage()))?;
                     capability_report = Some(r);
                     capabilities_ev = Some(CapabilitiesDropped { _private: () });
                 }
@@ -936,6 +961,29 @@ mod tests {
         assert_eq!(err.code, ErrorCode::PermissionDenied);
         assert_eq!(take(), ["rlimits"]);
         take_sets();
+    }
+
+    /// OCI-1・SEC-5: `process.user` が 0/0 なら切り替えを渡さず(`None`)、それ以外は (uid, gid) をそのまま渡す。
+    /// 非 root の指定でも capability 削減段は偽カーネルで最後まで通る。
+    #[test]
+    fn oci1_with_process_ids_only_for_non_root() {
+        assert_eq!(
+            StagePipeline::new().with_process_ids(0, 0).process_ids,
+            None
+        );
+        for (uid, gid) in [(1000, 0), (0, 1000), (1000, 1001)] {
+            let p = StagePipeline::new().with_process_ids(uid, gid);
+            assert_eq!(p.process_ids, Some(ProcessIds { uid, gid }));
+        }
+        take();
+        StagePipeline::new()
+            .with_process_ids(1000, 1001)
+            .run_then(exec_ok)
+            .unwrap();
+        assert_eq!(
+            take(),
+            ["capability_drop", "no_new_privs", "seccomp", "exec"]
+        );
     }
 
     /// CORE-1・TASK-27.4.3・TASK-37.2: capability 削減が失敗したら NO_NEW_PRIVS には進まない。

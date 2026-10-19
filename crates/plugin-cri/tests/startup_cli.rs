@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_fandhe-container-plugin-cri");
 const DEADLINE: Duration = Duration::from_secs(10);
+/// kill 後の回収の猶予。
+const REAP_GRACE: Duration = Duration::from_secs(5);
 
 struct Out {
     code: Option<i32>,
@@ -29,9 +31,20 @@ fn run(args: &[&str]) -> Out {
             break;
         }
         if start.elapsed() > DEADLINE {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("plugin binary did not exit within deadline");
+            let kill_result = child.kill();
+            // 回収も有限の猶予で行う（期限なしの wait は割り込み不能な待ちで無期限に止まる。REPAIR-5）。
+            let reap_start = Instant::now();
+            let mut reaped = false;
+            while reap_start.elapsed() < REAP_GRACE {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    reaped = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!(
+                "plugin binary did not exit within deadline (kill: {kill_result:?}, reaped: {reaped})"
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     }

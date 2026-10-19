@@ -13,6 +13,10 @@
 //!   -> ... -> readonly_paths -> masked_paths -> pivot_root
 //! ```
 //!
+//! 本関数の成功の証跡（[`SysfsReport`]）は `run_pre_pivot` が保持して `masked_paths` 段へ渡す。証跡を受けた構成でだけ、
+//! `masked_paths` が `/sys/devices/virtual/powercap`・`/sys/firmware`・`/sys/devices/system/cpu/cpuN/thermal_throttle`
+//! （存在するもの）を読み取り専用の空 tmpfs で覆う（#2014）。覆いは本段の事後検証（`check_sysfs_tree`）より後に載る。
+//!
 //! # 供給方式（事前に決める。縮退しない）
 //!
 //! 呼び出しスレッドの user namespace が初期 namespace かどうか（`/proc/thread-self/ns/user` の inode が

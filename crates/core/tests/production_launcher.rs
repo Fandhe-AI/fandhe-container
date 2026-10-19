@@ -310,6 +310,18 @@ mod linux {
             "DEVZERO_READ {}",
             read.map_or_else(|e| format!("error:{:?}", e.kind()), |n| n.to_string())
         ));
+        // シナリオ L〜O・I の拡張(OCI-1・SEC-5): 作業ディレクトリと実・実効・保存・FS の uid / gid。
+        let cwd = std::fs::read_link("/proc/self/cwd").map_or_else(
+            |e| format!("error:{:?}", e.kind()),
+            |p| p.display().to_string(),
+        );
+        emit(format!("CWD {cwd}"));
+        for (name, key) in [("UIDS", "Uid:"), ("GIDS", "Gid:")] {
+            emit(format!(
+                "{name} {}",
+                field(key).split_whitespace().collect::<Vec<_>>().join(",")
+            ));
+        }
         // シナリオ K（exec 後の seccomp の識別的な拒否。#2012）: 禁止 syscall を 1 件発行する。フィルタが効いていれば
         // SIGSYS で終了して戻らない。戻った場合（フィルタ欠落）は固定語彙の行を出して正常終了し、親が失敗にする。
         let args: Vec<String> = std::env::args().collect();
@@ -513,6 +525,18 @@ mod linux {
         extra_args: &[&str],
         mounts: serde_json::Value,
     ) {
+        write_config_with(bundle, ld_library_path, extra_args, mounts, "/", (0, 0));
+    }
+
+    /// `write_config` に `process.cwd` と `process.user`(uid, gid)を指定できる版(OCI-1・SEC-5)。
+    fn write_config_with(
+        bundle: &Bundle,
+        ld_library_path: &str,
+        extra_args: &[&str],
+        mounts: serde_json::Value,
+        cwd: &str,
+        (uid, gid): (u32, u32),
+    ) {
         let mut args = vec!["/probe", "--container-probe"];
         args.extend_from_slice(extra_args);
         let config = json!({
@@ -520,14 +544,14 @@ mod linux {
             "root": {"path": "rootfs", "readonly": false},
             "hostname": HOSTNAME,
             "process": {
-                "user": {"uid": 0, "gid": 0},
+                "user": {"uid": uid, "gid": gid},
                 "args": args,
                 "env": [
                     "PATH=/",
                     "TERM=dumb",
                     format!("LD_LIBRARY_PATH={ld_library_path}"),
                 ],
-                "cwd": "/"
+                "cwd": cwd
             },
             "mounts": mounts,
             "linux": {"namespaces": [
@@ -756,6 +780,12 @@ mod linux {
         }
         scenario_j_exec_restrictions(&env, tag);
         scenario_k_seccomp_kill_after_exec(&env, tag);
+        scenario_l_working_dir(&env, tag);
+        scenario_m_n_working_dir_refused(&env, tag);
+        scenario_o_user_outside_mapping_refused(&env, tag);
+        if subordinate_requested() {
+            scenario_i_user_applied(tag);
+        }
     }
 
     /// シナリオ A: 正常起動。
@@ -1163,6 +1193,183 @@ mod linux {
             "production_launcher: scenario=subordinate-root-refused code={:?}",
             err.code()
         );
+    }
+
+    /// 指定の `cwd`・`user` で create → start し、`READY` までのプローブ出力を返して terminate・回収する
+    /// (OCI-1・SEC-5)。`prepare` は rootfs の準備(作業ディレクトリの作成など)。非 root の `user` のときは
+    /// ホストから見た uid を `HOST_UIDS` 行として足す。
+    fn run_probe_with(
+        env: &Env,
+        launcher: &Arc<dyn ProcessLauncher>,
+        name: &str,
+        cwd: &str,
+        user: (u32, u32),
+        prepare: &dyn Fn(&Path),
+        tag: u32,
+    ) -> Vec<String> {
+        let bundle = Bundle::new(name);
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        prepare(&bundle.rootfs());
+        write_config_with(&bundle, &ld, &[], json!([]), cwd, user);
+        let id = ContainerId::new(format!("pl{name}{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let mut lines = Vec::new();
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            let output = started.process().take_output().expect("container output");
+            let stdout = output.stdout.expect("container stdout");
+            reader_slot = Some(spawn_reader(stdout));
+            lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            if user != (0, 0) {
+                let host = status_field(&format!("/proc/{pid}/status"), "Uid:")
+                    .unwrap_or_else(|| "missing".to_string());
+                lines.push(format!(
+                    "HOST_UIDS {}",
+                    host.split_whitespace().collect::<Vec<_>>().join(",")
+                ));
+            }
+        }));
+        finish_started(started, verified);
+        if let Some((rx, reader)) = reader_slot.take() {
+            reader.join().expect("join reader");
+            drop(rx);
+        }
+        assert!(eventually(|| children_of_self().is_empty()));
+        lines
+    }
+
+    /// シナリオ L(OCI-1・TASK-29): `process.cwd` が rootfs 内の既存ディレクトリ(`/work/dir`)なら、
+    /// pivot 直後に fd 起点で移り、コンテナ内の `/proc/self/cwd` がそのパスを指す。`/` のときは `/` のまま。
+    fn scenario_l_working_dir(env: &Env, tag: u32) {
+        let mk = |root: &Path| mkdir(&root.join("work/dir"));
+        let lines = run_probe_with(env, &env.launcher, "l", "/work/dir", (0, 0), &mk, tag);
+        assert_eq!(value_of(&lines, "CWD"), "/work/dir");
+        assert_eq!(value_of(&lines, "UIDS"), "0,0,0,0");
+        let lines = run_probe_with(env, &env.launcher, "l0", "/", (0, 0), &mk, tag);
+        assert_eq!(value_of(&lines, "CWD"), "/");
+        println!("production_launcher: scenario=working-dir cwd=/work/dir applied, / kept");
+    }
+
+    /// シナリオ M・N(OCI-1・TASK-29・SEC-1): 存在しない `cwd` は `NotFound`、ファイルを指す・symlink を含む `cwd` は
+    /// `InvalidArgument` で start が失敗し、状態は Created のまま子が残らない。
+    fn scenario_m_n_working_dir_refused(env: &Env, tag: u32) {
+        for (name, cwd, want) in [
+            ("m", "/missing", ErrorCode::NotFound),
+            ("n", "/afile", ErrorCode::InvalidArgument),
+            ("ns", "/alink/x", ErrorCode::InvalidArgument),
+        ] {
+            let bundle = Bundle::new(name);
+            let ld = make_rootfs(&bundle.rootfs(), true);
+            std::fs::write(bundle.rootfs().join("afile"), b"x").expect("write file");
+            mkdir(&bundle.rootfs().join("real/x"));
+            std::os::unix::fs::symlink("real", bundle.rootfs().join("alink")).expect("symlink");
+            write_config_with(&bundle, &ld, &[], json!([]), cwd, (0, 0));
+            let id = ContainerId::new(format!("pl{name}{tag}")).expect("id");
+            do_create(env, &bundle, &id);
+            wait_single_thread();
+            let err = match start(
+                &env.store,
+                &env.recorder,
+                &env.launcher,
+                &StartRequest::new(id.clone()),
+                &timeouts(),
+            ) {
+                Ok(_) => panic!("start must fail for cwd {cwd}"),
+                Err(e) => e,
+            };
+            assert_eq!(err.code(), want, "{cwd}: {}", err.message());
+            assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+            assert!(!env.launcher.last_launch_may_have_left_process());
+            assert!(
+                eventually(|| children_of_self().is_empty()),
+                "no child may remain: {:?}",
+                children_of_self()
+            );
+            println!(
+                "production_launcher: scenario=working-dir-refused cwd={cwd} code={:?} state=created children=0",
+                err.code()
+            );
+        }
+    }
+
+    /// シナリオ O(OCI-1・SEC-5): 単一 ID 写像で 0/0 以外の `process.user` は、fork の前に `FailedPrecondition` で
+    /// 拒否される(状態は Created のまま、子は残らない)。
+    fn scenario_o_user_outside_mapping_refused(env: &Env, tag: u32) {
+        let bundle = Bundle::new("o");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config_with(&bundle, &ld, &[], json!([]), "/", (1000, 1000));
+        let id = ContainerId::new(format!("plo{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let err = match start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        ) {
+            Ok(_) => panic!("start must fail for an unmapped user"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.code(),
+            ErrorCode::FailedPrecondition,
+            "{}",
+            err.message()
+        );
+        assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+        assert!(children_of_self().is_empty());
+        println!(
+            "production_launcher: scenario=user-unmapped-refused code={:?} state=created children=0",
+            err.code()
+        );
+    }
+
+    /// シナリオ I の拡張(`FANDHE_CONTAINER_TEST_ID_HELPER=1`。OCI-1・SEC-5): 範囲写像で `process.user` 1000:1000 を
+    /// 指定すると、コンテナ内の実・実効・保存・FS の uid / gid が 1000 になり、ホストから見た uid は
+    /// 「subuid の先頭 + 999」になる(コンテナ 1 → subuid 先頭)。
+    fn scenario_i_user_applied(tag: u32) {
+        use fandhe_container_core::rootless::{SubIdOwner, load_subordinate_ids};
+        let state_dir = Bundle::new("istate");
+        let store = FileStateStore::open(
+            StateRoot::from_override(state_dir.dir.join("state")).expect("state root"),
+        )
+        .expect("open state store");
+        let launcher: Arc<dyn ProcessLauncher> =
+            Arc::new(build_subordinate_launcher().expect("build subordinate launcher"));
+        let env = Env {
+            store,
+            _root: state_dir,
+            launcher: Arc::clone(&launcher),
+            recorder: OpRecorder::new(),
+        };
+        let (euid, _) = own_ids();
+        let owner = SubIdOwner::new(euid, std::env::var("USER").ok()).expect("owner");
+        let uranges =
+            load_subordinate_ids(Path::new("/etc/subuid"), &owner).expect("load /etc/subuid");
+        let base = uranges.first().expect("a subuid range").start();
+        let lines = run_probe_with(&env, &launcher, "iu", "/", (1000, 1000), &|_| (), tag);
+        assert_eq!(value_of(&lines, "UIDS"), "1000,1000,1000,1000");
+        assert_eq!(value_of(&lines, "GIDS"), "1000,1000,1000,1000");
+        let host_uid = base + 999;
+        assert!(
+            value_of(&lines, "HOST_UIDS")
+                .split(',')
+                .all(|v| v == host_uid.to_string()),
+            "{lines:?}"
+        );
+        println!("production_launcher: scenario=user-applied uid=gid=1000 host_uid={host_uid}");
     }
 
     /// シナリオ E: 状態ルート自身、または状態ルートへの symlink 別名を bind mount の元にした start は、本番 launcher

@@ -51,8 +51,13 @@
 //! `RegistryClientConfig` の既定値（REPAIR-5）。
 //!
 //! # 既知の制約（REPAIR-3）
-//! - uid / gid の写像（SEC-5）と setuid ビットの保持は未実装。image config の `User` と `WorkingDir` は無視し、
-//!   コンテナ内 root・cwd `/` で実行する（start が cwd `/` 以外を拒否するため）
+//! - image config の `WorkingDir` は `process.cwd` へ、`User` は数値形式（`uid`・`uid:gid`。gid 省略は 0）だけを
+//!   `process.user` へ写す（OCI-1・SEC-5）。名前形式（`name`・`name:group`）は rootfs の `/etc/passwd` の解決が要るため
+//!   未対応で、段 `config`・code `UNIMPLEMENTED` で失敗させる（黙って root に落とさない）。非 root の `User` は
+//!   既定の単一 ID 写像の外のため `FAILED_PRECONDITION` で失敗する。範囲写像で効かせるには
+//!   `FANDHE_CONTAINER_TEST_ID_HELPER=1`（`production_launcher` のシナリオ I と同じ opt-in）を指定する
+//! - `process.user.additionalGids`・cwd の symlink の追従・setuid ビットの保持は未実装（cwd に symlink を含む image は
+//!   start が拒否する）
 //! - manifest の `diff_id` の検証は未実装（config blob と各レイヤーの digest のみ）
 //! - gzip 以外（zstd・無圧縮）のレイヤーは `UNIMPLEMENTED` として失敗にする
 //! - stdin は `/dev/null` に置き換わるため、対話シェルを Cmd にしたイメージは EOF で終了する
@@ -109,7 +114,8 @@ mod linux {
     use fandhe_container_core::exec::IsolationPrivilege;
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
-        ProcessExit, ProcessLauncher, ProductionLauncher, StartTimeouts, create, start,
+        ProcessExit, ProcessLauncher, ProductionLauncher, StartTimeouts, SubordinateIdSource,
+        create, start,
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{ContainerId, CreateRequest, StartRequest, TraitError};
@@ -320,6 +326,10 @@ mod linux {
         entrypoint: Vec<String>,
         cmd: Vec<String>,
         env: Vec<String>,
+        /// `WorkingDir`（空・未指定は `None`）。
+        working_dir: Option<String>,
+        /// `User`（空・未指定は `None`）。
+        user: Option<String>,
     }
 
     /// `config.json` に写す実行内容。
@@ -327,6 +337,10 @@ mod linux {
     struct Process {
         args: Vec<String>,
         env: Vec<String>,
+        /// `process.cwd`（`/` 始まり）。
+        cwd: String,
+        /// `process.user` の (uid, gid)。
+        user: (u32, u32),
     }
 
     fn parse_image_config(bytes: &[u8]) -> Result<ImageConfig, Failure> {
@@ -347,11 +361,42 @@ mod linux {
                 Some(_) => Err(bad()),
             }
         };
+        let text = |key: &str| -> Result<Option<String>, Failure> {
+            match cfg.and_then(|c| c.get(key)) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(s)) if s.len() > MAX_ARG_BYTES => {
+                    Err(Failure::new("config", "RESOURCE_EXHAUSTED"))
+                }
+                Some(Value::String(s)) => Ok((!s.is_empty()).then(|| s.clone())),
+                Some(_) => Err(bad()),
+            }
+        };
         Ok(ImageConfig {
             entrypoint: strings("Entrypoint")?,
             cmd: strings("Cmd")?,
             env: strings("Env")?,
+            working_dir: text("WorkingDir")?,
+            user: text("User")?,
         })
+    }
+
+    /// image config の `User` を数値の (uid, gid) にする。空は root、`uid` は gid 0、`uid:gid` はそのまま。
+    /// 名前形式は `/etc/passwd`・`/etc/group` の解決が要るため `UNIMPLEMENTED`、数値の桁あふれは `INVALID_ARGUMENT`。
+    fn parse_user(user: Option<&str>) -> Result<(u32, u32), Failure> {
+        let Some(user) = user else {
+            return Ok((0, 0));
+        };
+        let num = |s: &str| -> Result<u32, Failure> {
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(Failure::new("config", "UNIMPLEMENTED"));
+            }
+            s.parse::<u32>()
+                .map_err(|_| Failure::new("config", "INVALID_ARGUMENT"))
+        };
+        match user.split_once(':') {
+            None => Ok((num(user)?, 0)),
+            Some((u, g)) => Ok((num(u)?, num(g)?)),
+        }
     }
 
     /// Entrypoint ++ (override または Cmd)。Env に PATH が無ければ既定値を足す。
@@ -378,7 +423,18 @@ mod linux {
         if !env.iter().any(|e| e.starts_with("PATH=")) {
             env.push(DEFAULT_PATH_ENV.to_string());
         }
-        Ok(Process { args, env })
+        let cwd = match cfg.working_dir.as_deref() {
+            None => "/".to_string(),
+            Some(w) if w.starts_with('/') => w.to_string(),
+            Some(_) => return Err(Failure::new("config", "INVALID_ARGUMENT")),
+        };
+        let user = parse_user(cfg.user.as_deref())?;
+        Ok(Process {
+            args,
+            env,
+            cwd,
+            user,
+        })
     }
 
     // ----- 展開後の bundle 生成 ----------------------------------------------------------------------------
@@ -414,10 +470,10 @@ mod linux {
             "root": {"path": "rootfs", "readonly": false},
             "hostname": HOSTNAME,
             "process": {
-                "user": {"uid": 0, "gid": 0},
+                "user": {"uid": process.user.0, "gid": process.user.1},
                 "args": process.args,
                 "env": process.env,
-                "cwd": "/"
+                "cwd": process.cwd
             },
             "mounts": [],
             "linux": {"namespaces": [
@@ -1064,12 +1120,24 @@ mod linux {
             }
         };
         let join_container = Arc::clone(container);
-        let launcher = match ProductionLauncher::builder()
-            .privilege(IsolationPrivilege::RootlessSingleId)
+        let builder = ProductionLauncher::builder()
             .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
-            .cgroup_join_source(move || join_container.join_hook())
-            .build()
-        {
+            .cgroup_join_source(move || join_container.join_hook());
+        // 非 root の `User` を効かせる範囲写像は opt-in（`production_launcher` のシナリオ I と同じ環境変数）。
+        let builder = if std::env::var("FANDHE_CONTAINER_TEST_ID_HELPER").as_deref() == Ok("1") {
+            match SubordinateIdSource::system(std::env::var("USER").ok()) {
+                Ok(source) => builder
+                    .privilege(IsolationPrivilege::RootlessSubordinateIds)
+                    .subordinate_ids(source),
+                Err(e) => {
+                    eprintln!("pull_e2e: FAILED setup: subordinate ids ({:?})", e.code());
+                    return 1;
+                }
+            }
+        } else {
+            builder.privilege(IsolationPrivilege::RootlessSingleId)
+        };
+        let launcher = match builder.build() {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("pull_e2e: FAILED setup: launcher ({:?})", e.code());
@@ -1244,6 +1312,40 @@ mod linux {
                 derive_process(&cfg, None).expect("ep only").args,
                 strs(&["/app"])
             );
+            // WorkingDir と User（数値形式）を写す。gid 省略は 0、空・未指定は root・cwd `/`。
+            let wd = |json: &[u8]| derive_process(&parse_image_config(json).expect("cfg"), None);
+            let p = wd(br#"{"config":{"Cmd":["/bin/sh"],"WorkingDir":"/app","User":"1000:1001"}}"#)
+                .expect("wd+user");
+            assert_eq!((p.cwd.as_str(), p.user), ("/app", (1000, 1001)));
+            let p = wd(br#"{"config":{"Cmd":["/bin/sh"],"User":"1000"}}"#).expect("uid only");
+            assert_eq!((p.cwd.as_str(), p.user), ("/", (1000, 0)));
+            for json in [
+                &br#"{"config":{"Cmd":["/bin/sh"],"User":"","WorkingDir":""}}"#[..],
+                br#"{"config":{"Cmd":["/bin/sh"]}}"#,
+            ] {
+                let p = wd(json).expect("root default");
+                assert_eq!((p.cwd.as_str(), p.user), ("/", (0, 0)));
+            }
+            // 名前形式・混在は UNIMPLEMENTED、桁あふれは INVALID_ARGUMENT、相対の WorkingDir は INVALID_ARGUMENT。
+            for (user, code) in [
+                ("nginx", "UNIMPLEMENTED"),
+                ("nginx:nginx", "UNIMPLEMENTED"),
+                ("1000:staff", "UNIMPLEMENTED"),
+                ("1000:", "UNIMPLEMENTED"),
+                ("4294967296", "INVALID_ARGUMENT"),
+            ] {
+                let json = format!(r#"{{"config":{{"Cmd":["/bin/sh"],"User":"{user}"}}}}"#);
+                assert_eq!(
+                    wd(json.as_bytes()),
+                    Err(Failure::new("config", code)),
+                    "{user}"
+                );
+            }
+            assert_eq!(
+                wd(br#"{"config":{"Cmd":["/bin/sh"],"WorkingDir":"app"}}"#),
+                Err(Failure::new("config", "INVALID_ARGUMENT"))
+            );
+            assert!(parse_image_config(br#"{"config":{"WorkingDir":1}}"#).is_err());
             // 空・相対パス・壊れた JSON・型違い。
             let empty = parse_image_config(br#"{"config":{}}"#).expect("empty");
             assert_eq!(
@@ -1358,7 +1460,8 @@ mod linux {
             assert_eq!(err.code(), OciErrorCode::DataLoss);
 
             let cfg = parse_image_config(
-                br#"{"config":{"Entrypoint":["/bin/hello"],"Cmd":["x"],"Env":["A=b"]}}"#,
+                br#"{"config":{"Entrypoint":["/bin/hello"],"Cmd":["x"],"Env":["A=b"],
+                    "WorkingDir":"/app","User":"1000:1000"}}"#,
             )
             .expect("cfg");
             let process = derive_process(&cfg, Some(&strs(&["y"]))).expect("process");
@@ -1389,7 +1492,8 @@ mod linux {
             let at = |ptr: &str| config.pointer(ptr).cloned().expect("pointer");
             assert_eq!(at("/process/args"), json!(["/bin/hello", "y"]));
             assert_eq!(at("/process/env"), json!(["A=b", DEFAULT_PATH_ENV]));
-            assert_eq!(at("/process/cwd"), json!("/"));
+            assert_eq!(at("/process/cwd"), json!("/app"));
+            assert_eq!(at("/process/user"), json!({"uid": 1000, "gid": 1000}));
             assert_eq!(at("/root/path"), json!("rootfs"));
             assert_eq!(at("/hostname"), json!(HOSTNAME));
         }

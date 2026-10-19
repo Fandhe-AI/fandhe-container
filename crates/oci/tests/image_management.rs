@@ -105,6 +105,101 @@ fn oci7_missing_targets_report_not_found() {
     assert_eq!(e.code(), OciErrorCode::NotFound);
 }
 
+/// OCI-7・TASK-183.6: `ImageStore` のガード越しに `image rm --force` の untag 経路と完全削除を流す。
+///
+/// 受け入れ条件 1（停止中のコンテナだけが参照するイメージに force をかけても、起動に要る構成と blob が
+/// テーブルとディスクに揃っている）と 2（無参照のイメージの削除で manifest・config・非共有レイヤーが消える）を
+/// 確かめる。実際の `start` は oci から呼べない（core に依存しない）ため、実機での
+/// `create`・`stop`・`image rm --force`・`start` の確認は TASK-184 に任せる。
+#[test]
+fn oci7_image_rm_force_through_store_guard() {
+    use fandhe_container_oci::image_management::{
+        ImageRmKind, ImageRmOptions, ImageRmTarget, ImageStore, StoppedContainers,
+    };
+    use std::fs;
+
+    let root = std::env::temp_dir().join(format!("fc-oci-it-rm-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let blobs = root.join("blobs").join("sha256");
+    fs::create_dir_all(&blobs).expect("mkdir");
+    let put = |dg: &Digest| {
+        let hex = dg.as_str().trim_start_matches("sha256:");
+        fs::write(blobs.join(hex), dg.as_str()).expect("write blob");
+    };
+    let present = |dg: &Digest| {
+        let hex = dg.as_str().trim_start_matches("sha256:");
+        blobs.join(hex).exists()
+    };
+
+    let (ma, mb) = (d(0xa0), d(0xb0));
+    let store = ImageStore::open(&root).expect("open");
+    {
+        let mut t = store.lock().expect("lock");
+        t.register_manifest(
+            ma.clone(),
+            ManifestComposition::new(d(0xc1), vec![d(0x10), d(0x11)]).expect("comp"),
+        )
+        .expect("register a");
+        t.register_manifest(
+            mb.clone(),
+            ManifestComposition::new(d(0xc2), vec![d(0x10), d(0x12)]).expect("comp"),
+        )
+        .expect("register b");
+        for n in [0xc1, 0x10, 0x11, 0xc2, 0x12] {
+            put(&d(n));
+        }
+        t.register_tag(tag("a"), &ma).expect("tag a");
+        t.register_tag(tag("b"), &mb).expect("tag b");
+        let c1 = ContainerRefId::new("c1").expect("id");
+        t.register_container(c1.clone(), &ma).expect("container");
+
+        // 実行中（スナップショットに無い）なら force でも拒否する。
+        let e = t
+            .execute_image_rm(
+                store.root(),
+                &ImageRmTarget::Tag(tag("a")),
+                &ImageRmOptions::force(),
+                &StoppedContainers::new(),
+            )
+            .expect_err("running");
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+
+        // 停止中なら untag だけで、起動に要る blob が全部残る。
+        let stopped: StoppedContainers = [c1.clone()].into_iter().collect();
+        let out = t
+            .execute_image_rm(
+                store.root(),
+                &ImageRmTarget::Tag(tag("a")),
+                &ImageRmOptions::force(),
+                &stopped,
+            )
+            .expect("force untag");
+        assert_eq!(out.kind, ImageRmKind::UntagOnly);
+        assert_eq!(out.untagged, vec![tag("a")]);
+        assert_eq!(t.manifest_references(&ma).containers, vec![c1]);
+        for n in [0xc1, 0x10, 0x11] {
+            assert!(present(&d(n)), "blob {n:#x} must remain");
+        }
+
+        // 無参照の B は force なしで消え、共有でない config・レイヤーも消える。
+        let out = t
+            .execute_image_rm(
+                store.root(),
+                &ImageRmTarget::Tag(tag("b")),
+                &ImageRmOptions::default(),
+                &StoppedContainers::new(),
+            )
+            .expect("delete b");
+        assert_eq!(out.kind, ImageRmKind::Deleted);
+        assert_eq!(out.deleted_blobs, vec![d(0x12), d(0xc2)]);
+        assert_eq!(out.kept_blobs, vec![d(0x10)]);
+        assert!(t.manifests().all(|(m, _)| *m != mb));
+        assert!(!present(&d(0xc2)) && !present(&d(0x12)));
+        assert!(present(&d(0x10)));
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// OCI-7（TASK-183.4）: `ImageStore` 経由のタグ付与 → 付け替え → 未登録 digest の NotFound。
 #[test]
 fn oci7_image_store_tag_flow_through_public_api() {

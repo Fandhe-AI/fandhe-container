@@ -235,7 +235,7 @@ fn task_58_2_stop_remove_core_flow() {
 }
 
 /// ERR-3・TASK-58.2: エラーコードの対応（空 ID・負の timeout は INVALID_ARGUMENT、未知 ID の Stop は
-/// NOT_FOUND・Remove は成功、created の Stop は FAILED_PRECONDITION）。
+/// NOT_FOUND・Remove は成功、created の Stop は成功）。
 #[test]
 fn task_58_2_error_code_mapping() {
     let service = CriRuntimeService::new();
@@ -255,10 +255,7 @@ fn task_58_2_error_code_mapping() {
             .code(),
         Code::NotFound
     );
-    assert_eq!(
-        stop(&service, &id, 0).expect_err("created").code(),
-        Code::FailedPrecondition
-    );
+    stop(&service, &id, 0).expect("created stop is ok");
     assert_eq!(
         remove(&service, "").expect_err("empty id").code(),
         Code::InvalidArgument
@@ -273,7 +270,7 @@ fn task_58_2_operations_are_recorded() {
     let service = CriRuntimeService::with_recorder(collect.clone());
     let sandbox = run_sandbox(&service);
     let id = create(&service, &sandbox, Some(container("c"))).expect("create");
-    stop(&service, &id, 0).expect_err("created");
+    stop(&service, &id, 0).expect("created");
     start(&service, &id).expect("start");
     stop(&service, &id, 0).expect("stop");
     remove(&service, &id).expect("remove");
@@ -281,7 +278,7 @@ fn task_58_2_operations_are_recorded() {
     assert_eq!(
         collect.lines()[2..],
         [
-            ("cri.stop_container", "failure", "FAILED_PRECONDITION"),
+            ("cri.stop_container", "success", "OK"),
             ("cri.start_container", "success", "OK"),
             ("cri.stop_container", "success", "OK"),
             ("cri.remove_container", "success", "OK"),

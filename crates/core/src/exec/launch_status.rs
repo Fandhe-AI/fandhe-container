@@ -73,10 +73,12 @@ pub(super) enum PrePivotStep {
     MaskedPaths,
     /// `pivot_root`。
     PivotRoot,
+    /// pivot 後の作業ディレクトリへの `chdir`（`process.cwd`。OCI-1・TASK-29。違反記録は運ばない）。
+    WorkingDir,
 }
 
 impl PrePivotStep {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::Establish,
         Self::PrepareRootfs,
         Self::VerifyPinned,
@@ -88,6 +90,7 @@ impl PrePivotStep {
         Self::ReadonlyPaths,
         Self::MaskedPaths,
         Self::PivotRoot,
+        Self::WorkingDir,
     ];
 
     /// 段名（ワイヤー上のトークン。単体テストの `RecordingOps` の段名と一致させる）。
@@ -104,6 +107,7 @@ impl PrePivotStep {
             Self::ReadonlyPaths => "readonly_paths",
             Self::MaskedPaths => "masked_paths",
             Self::PivotRoot => "pivot_root",
+            Self::WorkingDir => "working_dir",
         }
     }
 
@@ -124,6 +128,7 @@ impl PrePivotStep {
             Self::ReadonlyPaths => IsolationStage::MountReadonlyPaths,
             Self::MaskedPaths => IsolationStage::MountMaskedPaths,
             Self::PivotRoot => IsolationStage::PivotRoot,
+            Self::WorkingDir => IsolationStage::WorkingDir,
         }
     }
 }
@@ -536,6 +541,7 @@ fn step_ordinal(step: PrePivotStep) -> usize {
         PrePivotStep::ReadonlyPaths => 8,
         PrePivotStep::MaskedPaths => 9,
         PrePivotStep::PivotRoot => 10,
+        PrePivotStep::WorkingDir => 11,
     }
 }
 

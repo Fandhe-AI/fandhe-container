@@ -64,6 +64,10 @@
 //!
 //! # 未実装・残余(REPAIR-3)
 //!
+//! - **`process.cwd` と `process.user`(OCI-1・TASK-29・SEC-5)**: cwd は子が pivot 直後に fd 起点・symlink 非追従で
+//!   適用する(symlink を含む cwd は追従せず拒否。Docker/runc と異なる)。uid・gid は fork の前に `check_user_mapped` で
+//!   user namespace の写像と照合し(単一 ID 写像は 0/0 のみ)、capability 削減段が既存の資格情報の切り替えで適用する。
+//!   補助グループ(`additionalGids`)・名前形式の `User` の解決・exec 経路の非 root は未対応
 //! - **権限モデル**: `RootlessSingleId` と `RootlessSubordinateIds`(#2009)を扱う。`RootfulHostRoot`
 //!   (SEC-5・CORE-7・CORE-9。start が user namespace を必須とするため、start を通る構成では到達しない。整合は
 //!   spec 側の判断事項)は `Unimplemented` で拒否する
@@ -682,6 +686,34 @@ impl Ledger {
     }
 }
 
+/// `process.user` の (uid, gid) が user namespace の写像に含まれることを fork の前に確かめる(純関数。副作用なし。
+/// OCI-1・SEC-5)。
+///
+/// 写像の外の id で `setresuid` すると子で `EINVAL` になり構造化されないため、ここで `FailedPrecondition` の
+/// 固定文言にする。`RootlessSingleId` は 0 だけが写る(0/0 以外は拒否)。`RootlessSubordinateIds` は
+/// `ranges`(uid の写像, gid の写像)が対象の id を含む場合だけ許す。`RootfulHostRoot` は launcher が別途拒否する。
+#[cfg(target_os = "linux")]
+fn check_user_mapped(
+    privilege: IsolationPrivilege,
+    ranges: Option<(&IdMapSet, &IdMapSet)>,
+    (uid, gid): (u32, u32),
+) -> Result<(), TraitError> {
+    let mapped = match (privilege, ranges) {
+        (IsolationPrivilege::RootlessSubordinateIds, Some((u, g))) => {
+            u.host_id_of(uid).is_some() && g.host_id_of(gid).is_some()
+        }
+        _ => uid == 0 && gid == 0,
+    };
+    if mapped {
+        Ok(())
+    } else {
+        Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "process.user is not mapped in the user namespace (SEC-5)",
+        ))
+    }
+}
+
 /// Linux の launcher 本体(拒否の判定・順序・写像・起動台帳)。
 #[cfg(target_os = "linux")]
 struct Inner {
@@ -732,6 +764,11 @@ impl Inner {
     ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
         self.left_process.store(false, Ordering::SeqCst);
         self.check_privilege()?;
+        check_user_mapped(
+            self.privilege,
+            self.subordinate.as_ref().map(|s| (&s.uid, &s.gid)),
+            spec.user(),
+        )?;
         let means = if self.cgroup_join_source.is_some() {
             CgroupJoinMeans::Provided
         } else {
@@ -784,7 +821,9 @@ impl Inner {
             self.ops.root_identity(spec.rootfs_dir()),
         )
         .map_err(|e| to_trait_error(&e))?;
+        let (uid, gid) = spec.user();
         let mut stages = StagePipeline::new()
+            .with_process_ids(uid, gid)
             .with_landlock(ruleset)
             .map_err(|e| to_trait_error(&e))?;
         if let Some(source) = &self.cgroup_join_source {
@@ -1272,6 +1311,7 @@ impl LaunchOps for RealOps {
                 masked: input.spec.config().masked_paths(),
             },
             status: None,
+            working_dir: Some(input.spec.working_dir()),
         };
         let child = spawn_container_via_intermediate(
             IntermediateSpec {
@@ -1610,9 +1650,52 @@ mod tests {
             Arc::new(config),
             ContainerId::new(name).unwrap(),
             binds,
+            super::super::working_dir::ContainerWorkingDir::root(),
+            (0, 0),
         );
         let _ = std::fs::remove_dir_all(&dir);
         spec
+    }
+
+    /// OCI-1・SEC-5: 単一 ID 写像は 0/0 だけを許し、範囲写像は uid・gid の両方が写像内の場合だけ許す(境界値を具体値で確認)。
+    #[test]
+    fn oci1_check_user_mapped_boundaries() {
+        use crate::exec::IdMapping;
+        use crate::rootless::IdMapSet;
+        let map = |host| {
+            IdMapSet::new(vec![
+                IdMapping {
+                    container_id: 0,
+                    host_id: 1000,
+                    count: 1,
+                },
+                IdMapping {
+                    container_id: 1,
+                    host_id: host,
+                    count: 65535,
+                },
+            ])
+            .unwrap()
+        };
+        let (uid_map, gid_map) = (map(100_000), map(200_000));
+        let single = IsolationPrivilege::RootlessSingleId;
+        let sub = IsolationPrivilege::RootlessSubordinateIds;
+        let r = Some((&uid_map, &gid_map));
+        assert!(check_user_mapped(single, None, (0, 0)).is_ok());
+        for ids in [(1000, 1000), (0, 1), (1, 0)] {
+            let e = check_user_mapped(single, None, ids).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition, "{ids:?}");
+            assert_eq!(
+                e.message(),
+                "process.user is not mapped in the user namespace (SEC-5)"
+            );
+        }
+        for ok in [(0, 0), (1, 1), (1000, 1000), (65535, 65535)] {
+            assert!(check_user_mapped(sub, r, ok).is_ok(), "{ok:?}");
+        }
+        for bad in [(65536, 1), (1, 65536), (65536, 65536), (u32::MAX, 0)] {
+            assert!(check_user_mapped(sub, r, bad).is_err(), "{bad:?}");
+        }
     }
 
     fn events() -> Arc<Mutex<Vec<String>>> {

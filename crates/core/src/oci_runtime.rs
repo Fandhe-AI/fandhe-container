@@ -44,6 +44,7 @@ mod mount_destination;
 pub(crate) mod mountinfo_identity;
 mod start;
 mod sysfs_mount;
+mod working_dir;
 
 #[cfg(target_os = "linux")]
 pub(crate) use bind_mounts::ProtectedFsRoot;
@@ -98,3 +99,4 @@ pub(crate) use sysfs_mount::OciMountKind;
 pub use sysfs_mount::{
     SysfsMountError, SysfsMountErrorKind, SysfsMountSpec, audit_sysfs_mount_error,
 };
+pub use working_dir::ContainerWorkingDir;

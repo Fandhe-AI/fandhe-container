@@ -84,7 +84,7 @@
 //!
 //! - 標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と同じく
 //!   `/dev/null` へ固定する（ホスト側の端末・ファイルをコンテナへ渡さない。fail-closed）
-//! - 作業ディレクトリ・ユーザーの指定（OCI `process` からの組み立て）。cwd は rootfs の根で固定。環境変数は
+//! - 作業ディレクトリ・ユーザーの指定（OCI `process` からの組み立て）。cwd は rootfs の根で固定（launch の `process.cwd` は pivot 直後に適用済みだが、exec 経路は未対応 = REPAIR-3）。環境変数は
 //!   コンテナ定義（`config.json` の `process.env`）と明示の上書きだけを [`ExecCommand`] の `ContainerEnv` で受け取り、
 //!   exec を起動したプロセスの環境は引き継がない（TASK-163 追補・#1457。`exec/container_env.rs`）
 //! - 子の失敗を構造のまま親へ返すこと（現状は終了コード・違反の理由コード・stderr。段とメッセージは親へ返らない）
@@ -427,6 +427,29 @@ pub(super) fn rebind_worker_after_credential_switch() -> Result<(), ExecError> {
         })
 }
 
+/// launch 経路（コンテナの PID 1）で、資格情報の切り替え後に non-dumpable を落とし直して読み戻す（OCI-1・SEC-5）。
+///
+/// exec worker と異なり親の pidfd も親死亡シグナルも使わない。PID 1 の親は短命な intermediate で、結び付けると
+/// intermediate の終了で PID 1 が死ぬため。`PARENT_PIDFD` が未設定でも失敗しない。
+pub(super) fn rebind_launch_after_credential_switch() -> Result<(), ExecError> {
+    rebind_launch_with(sys::set_non_dumpable, sys::is_dumpable)
+}
+
+/// [`rebind_launch_after_credential_switch`] の syscall を差し替えられる版（実プロセスの dumpable を変えずに試験するため）。
+fn rebind_launch_with(
+    set: impl FnOnce() -> Result<(), sys::SysError>,
+    read: impl FnOnce() -> Result<bool, sys::SysError>,
+) -> Result<(), ExecError> {
+    match set().and_then(|()| read()) {
+        Ok(false) => Ok(()),
+        _ => Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::CapabilityDrop,
+            "the container init could not become non-dumpable after the credential switch",
+        )),
+    }
+}
+
 /// worker（fork した子）を non-dumpable にし、読み戻して確認する。失敗時は stderr に英語 1 行を出し、
 /// worker の終了コード（`EXIT_SETUP_FAILED`）を返す（呼び出し側は `worker` を実行しない）。
 fn make_worker_non_dumpable() -> Result<(), i32> {
@@ -499,6 +522,24 @@ mod tests {
         pub(super) static CALLS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
         /// `require_non_dumpable` の差し込み点が返す値（既定は non-dumpable = worker の中）。
         pub(super) static DUMPABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// OCI-1・SEC-5: launch 経路の切り替え後処理は親の pidfd（`PARENT_PIDFD`）が未設定でも成功し、
+    /// non-dumpable になる。exec worker 用の処理は同じ状況で `FailedPrecondition` になる（経路が分離されている）。
+    #[test]
+    fn launch_rebind_succeeds_without_parent_pidfd() {
+        assert!(
+            PARENT_PIDFD
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none()
+        );
+        assert!(rebind_launch_with(|| Ok(()), || Ok(false)).is_ok());
+        // 読み戻しが dumpable のままなら fail-closed。
+        let e = rebind_launch_with(|| Ok(()), || Ok(true)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        let e = rebind_worker_after_credential_switch().unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
     }
 
     fn take_calls() -> Vec<&'static str> {

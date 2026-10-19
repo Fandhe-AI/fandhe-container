@@ -2,7 +2,7 @@
 //!
 //! 公開 API だけを通し、既存 blob の再利用で自分の pull ID のリースが登録されること、
 //! ステージング中の新規 blob が `image ls`・容量集計・参照テーブルに現れないことを照合する。
-//! 公開とロールバック（#475）は対象外。
+//! 公開とロールバック（#475）は `image_pull_publish.rs` で扱う。
 
 use std::fs;
 use std::path::PathBuf;

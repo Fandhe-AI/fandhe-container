@@ -50,6 +50,10 @@ pub enum OciOpKind {
     LeaseBlob,
     /// pull がリーストークンを返却して自分のリースを外す操作（他セッションのトークン拒否を含む。TASK-183.9・OCI-7）。
     ReleaseBlobLease,
+    /// pull の公開（検証・ステージングからの移動・manifest とタグの登録・リース解放の全体。失敗時のロールバックは含まず `AbortPull` で別に記録する。TASK-183.10・OCI-7）。
+    PublishPull,
+    /// pull の中断・失敗時のロールバック（自分のリース解放とステージング削除。TASK-183.10・OCI-7）。
+    AbortPull,
     /// `image prune` の実行（無参照イメージ・レイヤーの回収。TASK-183.7・OCI-7）。
     PruneImages,
     /// `image tag` のタグ登録（TASK-183.4・OCI-7）。
@@ -76,6 +80,8 @@ impl OciOpKind {
             OciOpKind::BeginPull => "oci.pull.begin",
             OciOpKind::LeaseBlob => "oci.pull.lease",
             OciOpKind::ReleaseBlobLease => "oci.pull.release",
+            OciOpKind::PublishPull => "oci.pull.publish",
+            OciOpKind::AbortPull => "oci.pull.abort",
             OciOpKind::PruneImages => "oci.image.prune",
             OciOpKind::TagImage => "oci.image.tag",
         }
@@ -253,6 +259,8 @@ mod tests {
         assert_eq!(OciOpKind::FetchManifest.as_str(), "oci.manifest.fetch");
         assert_eq!(OciOpKind::FetchBlob.as_str(), "oci.blob.fetch");
         assert_eq!(OciOpKind::TagImage.as_str(), "oci.image.tag");
+        assert_eq!(OciOpKind::PublishPull.as_str(), "oci.pull.publish");
+        assert_eq!(OciOpKind::AbortPull.as_str(), "oci.pull.abort");
     }
 
     /// REPAIR-4: panic で巻き戻されても Failure が 1 件残る。

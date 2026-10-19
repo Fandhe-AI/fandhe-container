@@ -13,16 +13,34 @@
 //! `RegistryClient::fetch_blob` の `dest` には [`PullSession::staged_blob_path`] の戻り値を渡す。
 //! cri の `image_pull` からの配線は後続で扱う（本モジュールは oci 内で完結する）。
 //!
-//! ロックの規律: ガードを持ったままファイルの検査・digest 検証・通信をしない。順序は
-//! 「リース登録 → 使う」に固定する。並行する prune はガードの内側でリースを数え直すため、
-//! 登録後に blob が消されることはない（OCI-7 の「余分に残す方向にのみ誤る」）。
+//! - (C) 公開: 取得と digest 検証が済んだら、排他区間の下で「ステージングから `blobs/sha256` への
+//!   移動」「manifest（在庫と構成）とタグの登録」「自分のリースの解放」を行う（[`PullSession::publish`]）。
+//!   公開が完了するまで当該イメージは `image ls` に現れない。失敗・中断時は自分のリースを解放し、
+//!   ステージングを削除する（[`PullSession::abort`]。publish の失敗時にも内部で同じ手順を行う）。
+//!
+//! 呼び出し文脈: pull の全体処理（レジストリ取得 → 検証 → 公開）から使う想定である。
+//! `RegistryClient::fetch_blob` の `dest` には [`PullSession::staged_blob_path`] の戻り値を渡し、
+//! 取得後に [`PullSession::verify_staged_blob`] で検証してから [`PullSession::publish`] を呼ぶ。
+//! cri の `image_pull` からの配線は後続で扱う（本モジュールは oci 内で完結する）。
+//!
+//! ロックの規律: ガードを持ったまま digest 検証・通信をしない。ガードの中で行うファイル操作は、
+//! 公開（OCI-7 (C) の「排他の下で移動」）の `hard_link` / `remove_file`（同一ファイルシステム内の
+//! メタデータ操作）に限る。リース登録は「リース登録 → 使う」の順に固定する。並行する prune は
+//! ガードの内側でリースを数え直すため、登録後に blob が消されることはない
+//! （OCI-7 の「余分に残す方向にのみ誤る」）。
+//!
+//! 公開の移動は `hard_link` で宛先を置き換えずに作り、成功後にステージング側の名前を消す
+//! （公開後のハードリンク数を 1 に保つ。cri の `check_blob_trust` の条件と整合）。宛先が既にある
+//! 通常ファイル（並行 pull が先に公開した同 digest）は受け入れ、内容は再検証しない
+//! （content-addressed で、利用時の検証に委ねる）。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）:
-//! - 公開（ステージングから `blobs/sha256` への移動・manifest とタグの登録・自分のリースの解放を
-//!   不可分に行う）と、失敗・中断時のロールバック（リース解放とステージング削除）は #475。
-//!   `PullSession` に `Drop` は実装しない。drop 後もリースとステージングは残る（余分に残す側）。
+//! - `PullSession` に `Drop` は実装しない（ロック待ちの Timeout・panic 中の毒化があり、ロックを取る
+//!   `Drop` は危険なため）。publish も abort もせずに drop すると、リースとステージングが残る
+//!   （余分に残す側）。呼び出し側は失敗経路で [`PullSession::abort`] を呼ぶ契約である。
 //! - クラッシュ後に残ったリース・ステージングの回収 GC は #852・#477。
-//! - `system df` でのステージング容量の集計。永続化は #853・#854・#851。
+//! - `system df` でのステージング容量の集計。永続化・fsync は #853・#854・#851。
+//! - cri の `image_pull` からの配線。
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -30,10 +48,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::usage::check_blob_dirs;
-use super::{ImageStore, MAX_COMPOSITION_LAYERS, PullId};
+use super::tag::ImageTagChange;
+use super::usage::{blob_path, check_blob_dirs};
+use super::{ImageStore, MAX_COMPOSITION_LAYERS, ManifestComposition, PullId, TagKey};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{OciOpKind, OciOpRecorder, record_oci_op};
+use crate::layer::{VerifiedBlob, verify_blob_digest_with};
 use crate::reference::Digest;
 
 /// ストア root 直下のステージング領域名。GC・`image ls` の走査対象外。
@@ -41,6 +61,9 @@ const STAGING_DIR_NAME: &str = "staging";
 
 /// 1 つの pull セッションが触れる blob 件数の上限（config 1 件 + layers）。
 const MAX_SESSION_BLOBS: usize = MAX_COMPOSITION_LAYERS + 1;
+
+/// 1 回の公開で付けるタグ件数の上限。
+pub const MAX_PUBLISH_TAGS: usize = 16;
 
 static PULL_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -112,6 +135,81 @@ pub struct PullSession<'a> {
     /// 現在リースを保持している digest。同一 digest の二重取得を拒否して、
     /// 1 リース = 1 トークンを保つ（片方の解放で他方のリースが消えないようにする）。
     leased: BTreeSet<Digest>,
+    /// このセッションのステージングで digest 検証に成功した digest（[`PullSession::verify_staged_blob`]）。
+    /// 公開できる新規 blob はこの集合にあるものに限る。
+    verified: BTreeSet<Digest>,
+}
+
+/// 公開の要求（manifest・構成・付けるタグ）。TASK-183.10・OCI-7。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PullPublishRequest {
+    /// 登録する manifest の digest。
+    pub manifest: Digest,
+    /// manifest の blob 構成（config と layers）。
+    pub composition: ManifestComposition,
+    /// 付けるタグ（`MAX_PUBLISH_TAGS` 件まで）。
+    pub tags: Vec<TagKey>,
+}
+
+impl PullPublishRequest {
+    /// タグ無しの要求を作る。
+    pub fn new(manifest: Digest, composition: ManifestComposition) -> Self {
+        Self {
+            manifest,
+            composition,
+            tags: Vec::new(),
+        }
+    }
+
+    /// 付けるタグを足す。
+    pub fn with_tag(mut self, tag: TagKey) -> Self {
+        self.tags.push(tag);
+        self
+    }
+}
+
+/// ステージング削除の結果。コミット後の削除失敗は公開の失敗にしない（残置は無害で #852・#477 が回収する）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StagingCleanup {
+    /// 削除済み（元から無かった場合を含む）。
+    Removed,
+    /// 削除に失敗した（残置）。
+    Failed {
+        /// 失敗の分類。
+        code: OciErrorCode,
+    },
+}
+
+/// 公開の結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PullPublishOutcome {
+    /// 登録した manifest。
+    pub manifest: Digest,
+    /// タグごとの付与の区分（要求の並び）。
+    pub tags: Vec<(TagKey, ImageTagChange)>,
+    /// この呼び出しでステージングから `blobs/sha256` へ移した blob。
+    pub moved_blobs: Vec<Digest>,
+    /// 宛先が既にあり、受け入れた blob（並行 pull が先に公開したもの）。
+    pub already_present_blobs: Vec<Digest>,
+    /// リース済みの既存 blob をそのまま再利用したもの。
+    pub reused_blobs: Vec<Digest>,
+    /// 解放した自分のリースの件数。
+    pub released_leases: usize,
+    /// ステージング削除の結果。
+    pub staging: StagingCleanup,
+}
+
+/// 中断（ロールバック）の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PullAbortOutcome {
+    /// 解放した自分のリースの件数。
+    pub released_leases: usize,
+    /// ステージング削除の結果。
+    pub staging: StagingCleanup,
 }
 
 fn hex_of(digest: &Digest) -> Result<&str, OciError> {
@@ -197,6 +295,7 @@ impl ImageStore {
             staging_dir: dir,
             touched: BTreeSet::new(),
             leased: BTreeSet::new(),
+            verified: BTreeSet::new(),
         })
     }
 
@@ -328,10 +427,249 @@ impl PullSession<'_> {
     /// 新規取得 blob の書き込み先 `<root>/staging/<pull-id>/<hex>` を返す。
     ///
     /// `RegistryClient::fetch_blob` の `dest` に渡す。参照テーブルには何も登録しない
-    /// （GC の走査にも `image ls` にも出さない）。公開は #475。
+    /// （GC の走査にも `image ls` にも出さない）。公開は [`PullSession::publish`]。
     pub fn staged_blob_path(&mut self, digest: &Digest) -> Result<PathBuf, OciError> {
         self.note_blob(digest)?;
         Ok(self.staging_dir.join(hex_of(digest)?))
+    }
+
+    /// ステージング済みの blob の sha256 を検証し、成功したらこのセッションの「公開できる」集合へ入れる。
+    ///
+    /// 検証はこのセッションのステージングのパスに結びつく（別ファイルの検証結果を流用できない）。
+    /// ガードは持たない。symlink・通常ファイルでないものは `FailedPrecondition`。
+    pub fn verify_staged_blob(
+        &mut self,
+        digest: &Digest,
+        max_bytes: u64,
+    ) -> Result<VerifiedBlob, OciError> {
+        self.note_blob(digest)?;
+        let path = self.staging_dir.join(hex_of(digest)?);
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => {
+                return Err(err(
+                    OciErrorCode::FailedPrecondition,
+                    "staged blob is not a regular file",
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(err(OciErrorCode::NotFound, "staged blob not found"));
+            }
+            Err(e) => return Err(io_err(&e, "failed to stat staged blob")),
+        }
+        let v = verify_blob_digest_with(self.store.recorder(), &path, digest, max_bytes)?;
+        self.verified.insert(digest.clone());
+        Ok(v)
+    }
+
+    /// 公開する（OCI-7 (C)）。排他区間の下で、ステージングからの移動・manifest とタグの登録・
+    /// 自分のリースの解放を不可分に行う。公開が完了するまで当該イメージは `image ls` に現れない。
+    ///
+    /// 構成の blob は「リース済み」か「このセッションで検証済み」のどちらかでなければ
+    /// `FailedPrecondition`。同じ digest で別構成の manifest が登録済みなら `AlreadyExists`。
+    /// `Err` を返すときは内部でロールバック（自分のリース解放とステージング削除。`AbortPull` として記録）
+    /// を試みてから元のエラーを返す。セッションは消費される。
+    pub fn publish(mut self, request: PullPublishRequest) -> Result<PullPublishOutcome, OciError> {
+        let store = self.store;
+        let r = record_oci_op(store.recorder(), OciOpKind::PublishPull, || {
+            self.publish_inner(&request)
+        });
+        if r.is_err() {
+            let _ = record_oci_op(store.recorder(), OciOpKind::AbortPull, || {
+                self.abort_inner()
+            });
+        }
+        r
+    }
+
+    /// 呼び出し側の明示的な中断。自分のリースを解放し、ステージングを削除する。
+    ///
+    /// ロックを取れない（Timeout・毒化）場合はリースが残り（余分に残す側。#852・#477 が回収）、
+    /// ステージングは削除したうえでそのエラーを返す。
+    pub fn abort(mut self) -> Result<PullAbortOutcome, OciError> {
+        let store = self.store;
+        record_oci_op(store.recorder(), OciOpKind::AbortPull, || {
+            self.abort_inner()
+        })
+    }
+
+    fn abort_inner(&mut self) -> Result<PullAbortOutcome, OciError> {
+        let released = self
+            .store
+            .lock()
+            .map(|mut g| g.release_all_leases(&self.id).len());
+        self.leased.clear();
+        self.verified.clear();
+        let staging = self.remove_staging();
+        released.map(|released_leases| PullAbortOutcome {
+            released_leases,
+            staging,
+        })
+    }
+
+    /// 自分のステージングディレクトリを消す。親・自分が symlink なら辿らず失敗とする。
+    fn remove_staging(&self) -> StagingCleanup {
+        let failed = |code| StagingCleanup::Failed { code };
+        let parent = self.store.root().join(STAGING_DIR_NAME);
+        match fs::symlink_metadata(&parent) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return failed(OciErrorCode::FailedPrecondition),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StagingCleanup::Removed,
+            Err(_) => return failed(OciErrorCode::Internal),
+        }
+        match fs::symlink_metadata(&self.staging_dir) {
+            Ok(m) if m.is_dir() => match fs::remove_dir_all(&self.staging_dir) {
+                Ok(()) => StagingCleanup::Removed,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => StagingCleanup::Removed,
+                Err(_) => failed(OciErrorCode::Internal),
+            },
+            Ok(_) => failed(OciErrorCode::FailedPrecondition),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => StagingCleanup::Removed,
+            Err(_) => failed(OciErrorCode::Internal),
+        }
+    }
+
+    fn publish_inner(&mut self, req: &PullPublishRequest) -> Result<PullPublishOutcome, OciError> {
+        if req.tags.len() > MAX_PUBLISH_TAGS {
+            return Err(err(
+                OciErrorCode::ResourceExhausted,
+                "too many tags in one publish",
+            ));
+        }
+        // 事前検証（ガードの外）。blob を再利用・移動に分類し、移動元と宛先ディレクトリを確かめる。
+        let mut reused = Vec::new();
+        let mut to_move = Vec::new();
+        for b in req.composition.blobs() {
+            if self.leased.contains(b) {
+                reused.push(b.clone());
+            } else if self.verified.contains(b) {
+                to_move.push(b.clone());
+            } else {
+                return Err(err(
+                    OciErrorCode::FailedPrecondition,
+                    "blob is neither leased nor verified by this pull",
+                ));
+            }
+        }
+        for b in &to_move {
+            let src = self.staging_dir.join(hex_of(b)?);
+            match fs::symlink_metadata(&src) {
+                Ok(m) if m.is_file() => {}
+                Ok(_) => {
+                    return Err(err(
+                        OciErrorCode::FailedPrecondition,
+                        "staged blob is not a regular file",
+                    ));
+                }
+                Err(e) => return Err(io_err(&e, "failed to stat staged blob")),
+            }
+        }
+        if !to_move.is_empty() {
+            self.ensure_blob_dirs()?;
+        }
+
+        let root = self.store.root().to_path_buf();
+        let mut guard = self.store.lock()?;
+        if guard
+            .manifests()
+            .any(|(d, c)| d == &req.manifest && c != &req.composition)
+        {
+            return Err(err(
+                OciErrorCode::AlreadyExists,
+                "manifest is already registered with a different composition",
+            ));
+        }
+        // 移動。この呼び出しで作った宛先だけを記録し、失敗時はそれだけを消す。
+        let mut created: Vec<PathBuf> = Vec::new();
+        let mut moved = Vec::new();
+        let mut present = Vec::new();
+        let moves = (|| -> Result<(), OciError> {
+            for b in &to_move {
+                let src = self.staging_dir.join(hex_of(b)?);
+                let dst = blob_path(&root, b)?;
+                match fs::hard_link(&src, &dst) {
+                    Ok(()) => {
+                        created.push(dst);
+                        moved.push(b.clone());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        match fs::symlink_metadata(&dst) {
+                            Ok(m) if m.is_file() => present.push(b.clone()),
+                            _ => {
+                                return Err(err(
+                                    OciErrorCode::FailedPrecondition,
+                                    "blob destination is not a regular file",
+                                ));
+                            }
+                        }
+                    }
+                    Err(_) => return Err(err(OciErrorCode::Internal, "failed to publish blob")),
+                }
+                // 公開後のハードリンク数を 1 に保つため、ステージング側の名前を消す。
+                fs::remove_file(&src)
+                    .map_err(|_| err(OciErrorCode::Internal, "failed to remove staged blob"))?;
+            }
+            Ok(())
+        })();
+        let result = moves.and_then(|()| {
+            guard.register_manifest(req.manifest.clone(), req.composition.clone())?;
+            let mut changes = Vec::with_capacity(req.tags.len());
+            for tag in &req.tags {
+                let change = match guard.register_tag(tag.clone(), &req.manifest)? {
+                    None => ImageTagChange::Added,
+                    Some(prev) if prev == req.manifest => ImageTagChange::Unchanged,
+                    Some(from) => ImageTagChange::Moved { from },
+                };
+                changes.push((tag.clone(), change));
+            }
+            Ok(changes)
+        });
+        let changes = match result {
+            Ok(c) => c,
+            Err(e) => {
+                for p in &created {
+                    let _ = fs::remove_file(p);
+                }
+                return Err(e);
+            }
+        };
+        let released_leases = guard.release_all_leases(&self.id).len();
+        drop(guard);
+        self.leased.clear();
+        self.verified.clear();
+        let staging = self.remove_staging();
+        Ok(PullPublishOutcome {
+            manifest: req.manifest.clone(),
+            tags: changes,
+            moved_blobs: moved,
+            already_present_blobs: present,
+            reused_blobs: reused,
+            released_leases,
+            staging,
+        })
+    }
+
+    /// `blobs` / `blobs/sha256` を（無ければ 0700 で）用意する。symlink・非ディレクトリは拒否。
+    fn ensure_blob_dirs(&self) -> Result<(), OciError> {
+        let root = self.store.root();
+        if check_blob_dirs(root)? {
+            return Ok(());
+        }
+        for dir in [root.join("blobs"), root.join("blobs").join("sha256")] {
+            match make_dir(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(io_err(&e, "failed to create blob directory")),
+            }
+        }
+        if check_blob_dirs(root)? {
+            Ok(())
+        } else {
+            Err(err(
+                OciErrorCode::FailedPrecondition,
+                "blob directory is unavailable",
+            ))
+        }
     }
 }
 
@@ -751,5 +1089,348 @@ mod tests {
         assert_eq!(PullId::new(a.as_str()).unwrap(), a);
         let first = a.as_str().split('-').next().unwrap();
         assert_eq!(first, std::process::id().to_string());
+    }
+
+    // ---- 公開とロールバック（OCI-7・TASK-183.10・#475） ----
+
+    use crate::instrument::OciOpOutcome;
+    use crate::instrument::testing::Collect;
+    use crate::reference::{RegistryHost, Repository, Tag};
+    use sha2::{Digest as _, Sha256};
+
+    fn sha_of(data: &[u8]) -> Digest {
+        let mut hex = String::new();
+        for b in Sha256::digest(data) {
+            hex.push_str(&format!("{b:02x}"));
+        }
+        Digest::parse(&format!("sha256:{hex}")).unwrap()
+    }
+
+    fn tag(name: &str) -> TagKey {
+        TagKey::new(
+            RegistryHost::parse("example.com").unwrap(),
+            Repository::parse("lib/app").unwrap(),
+            Tag::parse(name).unwrap(),
+        )
+    }
+
+    /// ステージングへ書いて検証まで済ませ、digest を返す。
+    fn stage(s: &mut PullSession<'_>, data: &[u8]) -> Digest {
+        let dg = sha_of(data);
+        let path = s.staged_blob_path(&dg).unwrap();
+        fs::write(&path, data).unwrap();
+        s.verify_staged_blob(&dg, 1 << 20).unwrap();
+        dg
+    }
+
+    fn manifest_digest() -> Digest {
+        sha_of(b"manifest-body")
+    }
+
+    fn all_leases(store: &ImageStore, dgs: &[&Digest]) -> Vec<Vec<PullId>> {
+        dgs.iter().map(|d| leases(store, d)).collect()
+    }
+
+    /// 受け入れ条件 1: 公開が完了するまで `image ls` に現れず、完了後に現れる。
+    #[test]
+    fn oci7_image_is_invisible_until_publish_completes() {
+        let root = Root::new("pub-ok");
+        let cached = sha_of(b"cached-layer");
+        fs::write(root.blob(&cached), b"cached-layer").unwrap();
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let BlobReuse::Leased(_tok) = s.lease_existing_blob(&cached).unwrap() else {
+            panic!("expected Leased");
+        };
+        let cfg = stage(&mut s, b"config-body");
+        let layer = stage(&mut s, b"layer-body");
+        let staged = s.staging_dir().to_path_buf();
+
+        // 公開前: ステージング済みでも一覧にもテーブルにも現れない。
+        {
+            let g = store.lock().unwrap();
+            assert_eq!(g.list_images(&root.0).unwrap().entries, vec![]);
+            assert_eq!(g.manifests().count(), 0);
+        }
+        let comp =
+            ManifestComposition::new(cfg.clone(), vec![cached.clone(), layer.clone()]).unwrap();
+        let m = manifest_digest();
+        let out = s
+            .publish(PullPublishRequest::new(m.clone(), comp).with_tag(tag("v1")))
+            .unwrap();
+        assert_eq!(out.moved_blobs.len(), 2);
+        assert_eq!(out.reused_blobs, vec![cached.clone()]);
+        assert_eq!(out.released_leases, 1);
+        assert_eq!(out.staging, StagingCleanup::Removed);
+        assert_eq!(out.tags, vec![(tag("v1"), ImageTagChange::Added)]);
+
+        let g = store.lock().unwrap();
+        let list = g.list_images(&root.0).unwrap();
+        assert_eq!(list.entries.len(), 1);
+        let e = &list.entries[0];
+        assert_eq!(e.tag, Some(tag("v1")));
+        assert_eq!(e.digest, m);
+        assert_eq!(e.size_bytes, (12 + 11 + 10) as u64);
+        assert_eq!(e.missing_blobs, vec![]);
+        assert_eq!(g.blob_references(&cached).leases, vec![]);
+        assert_eq!(g.disk_usage(&root.0).unwrap().cache.unregistered_count, 0);
+        assert!(!staged.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(fs::metadata(root.blob(&cfg)).unwrap().nlink(), 1);
+            assert_eq!(fs::read(root.blob(&layer)).unwrap(), b"layer-body");
+        }
+    }
+
+    /// 受け入れ条件 2: 公開の途中で失敗すると、自分のリースが解放されステージングが消える。
+    #[test]
+    fn oci7_publish_failure_midway_releases_own_leases_and_removes_staging() {
+        let root = Root::new("pub-fail");
+        let cached = sha_of(b"cached-layer");
+        fs::write(root.blob(&cached), b"cached-layer").unwrap();
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut other = store.begin_pull(pid("other")).unwrap();
+        let _o = other.lease_existing_blob(&cached).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let _t = s.lease_existing_blob(&cached).unwrap();
+        let a = stage(&mut s, b"blob-a");
+        let b = stage(&mut s, b"blob-b");
+        let staged = s.staging_dir().to_path_buf();
+        // digest 昇順で 2 番目の宛先をディレクトリにして、1 件目の移動後に失敗させる。
+        let (first, second) = if a < b { (&a, &b) } else { (&b, &a) };
+        fs::create_dir(root.blob(second)).unwrap();
+        let comp = ManifestComposition::new(a.clone(), vec![b.clone(), cached.clone()]).unwrap();
+        let err = s
+            .publish(PullPublishRequest::new(manifest_digest(), comp).with_tag(tag("v1")))
+            .unwrap_err();
+        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(leases(&store, &cached), vec![pid("other")]);
+        assert!(!staged.exists());
+        assert!(!root.blob(first).exists());
+        assert!(root.blob(second).is_dir());
+        let g = store.lock().unwrap();
+        assert_eq!(g.list_images(&root.0).unwrap().entries, vec![]);
+        assert_eq!(g.manifests().count(), 0);
+        assert_eq!(g.tags().count(), 0);
+    }
+
+    /// 同じ digest で別構成の manifest が登録済みなら、ファイルに触れず AlreadyExists でロールバックする。
+    #[test]
+    fn oci7_publish_manifest_conflict_rolls_back_before_file_ops() {
+        let root = Root::new("pub-conflict");
+        let store = ImageStore::open(&root.0).unwrap();
+        let m = manifest_digest();
+        let other_cfg = sha_of(b"other-config");
+        store
+            .lock()
+            .unwrap()
+            .register_manifest(
+                m.clone(),
+                ManifestComposition::new(other_cfg, vec![]).unwrap(),
+            )
+            .unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let cfg = stage(&mut s, b"config-body");
+        let staged = s.staging_dir().to_path_buf();
+        let comp = ManifestComposition::new(cfg.clone(), vec![]).unwrap();
+        let err = s.publish(PullPublishRequest::new(m, comp)).unwrap_err();
+        assert_eq!(err.code(), OciErrorCode::AlreadyExists);
+        assert!(!root.blob(&cfg).exists());
+        assert!(!staged.exists());
+        assert_eq!(all_leases(&store, &[&cfg]), vec![vec![]]);
+    }
+
+    /// 検証もリースも無い blob は公開できず、ロールバックされる。
+    #[test]
+    fn oci7_publish_rejects_unverified_or_unleased_blob() {
+        let root = Root::new("pub-unverified");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let dg = sha_of(b"never-verified");
+        let path = s.staged_blob_path(&dg).unwrap();
+        fs::write(&path, b"never-verified").unwrap();
+        let staged = s.staging_dir().to_path_buf();
+        let comp = ManifestComposition::new(dg.clone(), vec![]).unwrap();
+        let err = s
+            .publish(PullPublishRequest::new(manifest_digest(), comp))
+            .unwrap_err();
+        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+        assert!(!root.blob(&dg).exists());
+        assert!(!staged.exists());
+    }
+
+    /// OCI-7 (v): 並行 pull が先に公開した同 digest の宛先は受け入れ、既存の内容を変えない。
+    #[test]
+    fn oci7_publish_accepts_blob_already_published_by_other_pull() {
+        let root = Root::new("pub-present");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let cfg = stage(&mut s, b"config-body");
+        fs::write(root.blob(&cfg), b"config-body").unwrap();
+        let comp = ManifestComposition::new(cfg.clone(), vec![]).unwrap();
+        let out = s
+            .publish(PullPublishRequest::new(manifest_digest(), comp))
+            .unwrap();
+        assert_eq!(out.already_present_blobs, vec![cfg.clone()]);
+        assert_eq!(out.moved_blobs, vec![]);
+        assert_eq!(fs::read(root.blob(&cfg)).unwrap(), b"config-body");
+    }
+
+    /// abort は自分のリースだけを外し、ステージングを消す。blobs は変えない。
+    #[test]
+    fn oci7_abort_releases_own_leases_and_removes_staging() {
+        let root = Root::new("abort");
+        let cached = sha_of(b"cached-layer");
+        fs::write(root.blob(&cached), b"cached-layer").unwrap();
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut other = store.begin_pull(pid("other")).unwrap();
+        let _o = other.lease_existing_blob(&cached).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let _t = s.lease_existing_blob(&cached).unwrap();
+        let cfg = stage(&mut s, b"config-body");
+        let staged = s.staging_dir().to_path_buf();
+        let out = s.abort().unwrap();
+        assert_eq!(out.released_leases, 1);
+        assert_eq!(out.staging, StagingCleanup::Removed);
+        assert_eq!(leases(&store, &cached), vec![pid("other")]);
+        assert!(!staged.exists());
+        assert!(!root.blob(&cfg).exists());
+        assert_eq!(fs::read(root.blob(&cached)).unwrap(), b"cached-layer");
+    }
+
+    /// ステージング済みファイルが symlink なら検証・公開とも拒否し、リンク先を変えない。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_publish_rejects_symlinked_staged_file() {
+        let root = Root::new("pub-symlink");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let target = root.0.join("outside");
+        fs::write(&target, b"config-body").unwrap();
+        let dg = sha_of(b"config-body");
+        let path = s.staged_blob_path(&dg).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        assert_eq!(
+            s.verify_staged_blob(&dg, 1 << 20).unwrap_err().code(),
+            OciErrorCode::FailedPrecondition
+        );
+        let staged = s.staging_dir().to_path_buf();
+        let comp = ManifestComposition::new(dg.clone(), vec![]).unwrap();
+        let err = s
+            .publish(PullPublishRequest::new(manifest_digest(), comp))
+            .unwrap_err();
+        assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(fs::read(&target).unwrap(), b"config-body");
+        assert!(!staged.exists());
+    }
+
+    /// 既存タグの付け替えは Moved、同じ manifest なら Unchanged を返す。
+    #[test]
+    fn oci7_publish_retag_reports_moved() {
+        let root = Root::new("pub-retag");
+        let store = ImageStore::open(&root.0).unwrap();
+        let old = sha_of(b"old-manifest");
+        {
+            let mut g = store.lock().unwrap();
+            g.register_manifest(
+                old.clone(),
+                ManifestComposition::new(sha_of(b"old-config"), vec![]).unwrap(),
+            )
+            .unwrap();
+            g.register_tag(tag("v1"), &old).unwrap();
+        }
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let cfg = stage(&mut s, b"config-body");
+        let comp = ManifestComposition::new(cfg, vec![]).unwrap();
+        let out = s
+            .publish(PullPublishRequest::new(manifest_digest(), comp).with_tag(tag("v1")))
+            .unwrap();
+        assert_eq!(
+            out.tags,
+            vec![(tag("v1"), ImageTagChange::Moved { from: old })]
+        );
+    }
+
+    /// タグ件数が上限を超える公開は ResourceExhausted でロールバックされる。
+    #[test]
+    fn oci7_publish_caps_tag_count() {
+        let root = Root::new("pub-tagcap");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let cfg = stage(&mut s, b"config-body");
+        let mut req = PullPublishRequest::new(
+            manifest_digest(),
+            ManifestComposition::new(cfg, vec![]).unwrap(),
+        );
+        for i in 0..=MAX_PUBLISH_TAGS {
+            req = req.with_tag(tag(&format!("t{i}")));
+        }
+        assert_eq!(
+            s.publish(req).unwrap_err().code(),
+            OciErrorCode::ResourceExhausted
+        );
+        assert_eq!(store.lock().unwrap().tags().count(), 0);
+    }
+
+    /// REPAIR-4: publish・abort が成否つきで記録される（失敗時は publish の後に abort も記録）。
+    #[test]
+    fn repair4_publish_and_abort_are_recorded() {
+        let root = Root::new("pub-rec");
+        let rec = std::sync::Arc::new(Collect::default());
+        let store = ImageStore::open(&root.0)
+            .unwrap()
+            .with_recorder(rec.clone());
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let cfg = stage(&mut s, b"config-body");
+        s.publish(PullPublishRequest::new(
+            manifest_digest(),
+            ManifestComposition::new(cfg, vec![]).unwrap(),
+        ))
+        .unwrap();
+        let s2 = store.begin_pull(pid("p2")).unwrap();
+        let bad = ManifestComposition::new(sha_of(b"nope"), vec![]).unwrap();
+        s2.publish(PullPublishRequest::new(sha_of(b"m2"), bad))
+            .unwrap_err();
+        let s3 = store.begin_pull(pid("p3")).unwrap();
+        s3.abort().unwrap();
+        let got: Vec<_> = rec
+            .items()
+            .iter()
+            .filter(|i| matches!(i.kind(), OciOpKind::PublishPull | OciOpKind::AbortPull))
+            .map(|i| (i.kind(), i.outcome(), i.error_code()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (OciOpKind::PublishPull, OciOpOutcome::Success, None),
+                (
+                    OciOpKind::PublishPull,
+                    OciOpOutcome::Failure,
+                    Some(OciErrorCode::FailedPrecondition)
+                ),
+                (OciOpKind::AbortPull, OciOpOutcome::Success, None),
+                (OciOpKind::AbortPull, OciOpOutcome::Success, None),
+            ]
+        );
+    }
+
+    /// ロックを取れない abort は Timeout を返し、リースは残るがステージングは消える（余分に残す側）。
+    #[test]
+    fn oci7_abort_under_lock_timeout_keeps_lease_but_removes_staging() {
+        let root = Root::new("abort-timeout");
+        let cached = sha_of(b"cached-layer");
+        fs::write(root.blob(&cached), b"cached-layer").unwrap();
+        let store = ImageStore::open(&root.0)
+            .unwrap()
+            .with_timeout(std::time::Duration::from_millis(50));
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let _t = s.lease_existing_blob(&cached).unwrap();
+        let staged = s.staging_dir().to_path_buf();
+        let held = store.lock().unwrap();
+        assert_eq!(s.abort().unwrap_err().code(), OciErrorCode::Timeout);
+        drop(held);
+        assert_eq!(leases(&store, &cached), vec![pid("p1")]);
+        assert!(!staged.exists());
     }
 }

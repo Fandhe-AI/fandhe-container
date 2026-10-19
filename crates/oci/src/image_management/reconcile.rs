@@ -24,12 +24,22 @@
 //! `Absent` だけを外す（compare-and-remove）」の 3 段で行い、外す処理は 1 回の排他区間でまとめる。
 //! 2 回目の排他取得が失敗したら何も外さずエラーを返す。
 //!
-//! 前提: 再起動時、ライフサイクル操作（create / delete）を受け付ける前に 1 回呼ぶ。複製と取り直しの間に
-//! 同じ ID が同じ manifest で登録し直される（ABA）と比較では見分けられないが、この前提では起きない。
-//! 将来仕様（#2315）: テーブルに世代と「未確定」状態が入ったら、比較を世代の一致へ切り替え、
-//! 実行中の未確定参照の回収も #2315 が担う。結果のログ出力も配線側の担当で、ここでは操作種別を増やさない。
+//! # 確定・未確定の参照の扱い（#2315・#2345）
+//!
+//! 参照は登録世代と確定・未確定の状態を持つ（`container_ref.rs` のモジュール doc）。比較は複製時の
+//! 世代と確定状態の一致で行うため、同じ ID が同じ manifest で登録し直されても（ABA）外さない。
+//!
+//! - 確定済み参照が `Absent`: 状態の削除後に解除だけが落ちた残骸なので外す。
+//! - 未確定参照が `Absent`: 状態作成の前後で止まった create の残骸なので、`release_unbound_container_ref_if`
+//!   と同じ条件（未確定かつ世代一致）で外す。確定済みへ変わっていたら（`bind` が済んだ）外さない。
+//!   進行中の create が無いことは、本関数を「ライフサイクル操作を受け付ける前に 1 回」呼ぶ前提で保証する。
+//! - `Present` は確定・未確定とも残す（未確定のまま状態がある場合は `bind` 前のクラッシュで、
+//!   余分に残す側に誤るだけで GC は参照数に数える。確定への昇格は #2315 の配線側の担当）。
+//!
+//! 前提: 再起動時、ライフサイクル操作（create / delete）を受け付ける前に 1 回呼ぶ。
+//! 結果のログ出力も配線側の担当で、ここでは操作種別を増やさない。
 
-use super::{ContainerRefId, ImageStore};
+use super::{ContainerRefEntry, ContainerRefId, ImageStore};
 use crate::error::OciError;
 use crate::reference::Digest;
 
@@ -49,6 +59,7 @@ pub enum ContainerStatePresence {
 #[non_exhaustive]
 pub struct ContainerRefReconciliation {
     removed: Vec<(ContainerRefId, Digest)>,
+    removed_unbound: Vec<ContainerRefId>,
     kept_present: Vec<ContainerRefId>,
     kept_undetermined: Vec<ContainerRefId>,
     skipped_changed: Vec<ContainerRefId>,
@@ -58,6 +69,11 @@ impl ContainerRefReconciliation {
     /// 外した参照と、参照していた manifest。
     pub fn removed(&self) -> &[(ContainerRefId, Digest)] {
         &self.removed
+    }
+
+    /// `removed` のうち、未確定（状態作成まで済んでいない create の残骸）だった参照。
+    pub fn removed_unbound(&self) -> &[ContainerRefId] {
+        &self.removed_unbound
     }
 
     /// 状態が存在したため残した参照。
@@ -87,7 +103,7 @@ impl ImageStore {
     where
         F: FnMut(&ContainerRefId) -> ContainerStatePresence,
     {
-        let snapshot: Vec<(ContainerRefId, Digest)> = {
+        let snapshot: Vec<(ContainerRefId, ContainerRefEntry)> = {
             let guard = self.lock()?;
             guard
                 .container_refs
@@ -97,12 +113,12 @@ impl ImageStore {
         };
 
         let mut result = ContainerRefReconciliation::default();
-        let mut candidates: Vec<(ContainerRefId, Digest)> = Vec::new();
-        for (id, digest) in snapshot {
+        let mut candidates: Vec<(ContainerRefId, ContainerRefEntry)> = Vec::new();
+        for (id, entry) in snapshot {
             match probe(&id) {
                 ContainerStatePresence::Present => result.kept_present.push(id),
                 ContainerStatePresence::Undetermined => result.kept_undetermined.push(id),
-                ContainerStatePresence::Absent => candidates.push((id, digest)),
+                ContainerStatePresence::Absent => candidates.push((id, entry)),
             }
         }
         if candidates.is_empty() {
@@ -110,11 +126,14 @@ impl ImageStore {
         }
 
         let mut guard = self.lock()?;
-        for (id, digest) in candidates {
-            if guard.container_refs.get(&id) == Some(&digest)
-                && guard.unregister_container(&id).is_ok()
-            {
-                result.removed.push((id, digest));
+        for (id, entry) in candidates {
+            // 世代と確定状態が複製時のままのときだけ外す（登録し直し・確定への変化は触れない）。
+            let unchanged = guard.container_refs.get(&id) == Some(&entry);
+            if unchanged && guard.unregister_container(&id).is_ok() {
+                if !entry.bound {
+                    result.removed_unbound.push(id.clone());
+                }
+                result.removed.push((id, entry.manifest));
             } else {
                 result.skipped_changed.push(id);
             }
@@ -195,6 +214,75 @@ mod tests {
             vec![cid("c-unknown")]
         );
         drop(g);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// OCI-7・#2345: 確定・未確定の参照を別々に照合する（不在の未確定・確定は外れ、存在は両方残る）。
+    #[test]
+    fn oci7_reconcile_handles_bound_and_unbound_refs() {
+        let (s, dir) = store("bound");
+        reg(&s, "b-absent", 0xa0);
+        reg(&s, "u-absent", 0xa0);
+        reg(&s, "b-present", 0xb0);
+        reg(&s, "u-present", 0xb0);
+        reg(&s, "u-unknown", 0xb0);
+        for id in ["b-absent", "b-present"] {
+            s.bind_container_ref(&cid(id)).expect("bind");
+        }
+        let r = s
+            .reconcile_container_refs(|id| match id.as_str() {
+                "b-absent" | "u-absent" => ContainerStatePresence::Absent,
+                "u-unknown" => ContainerStatePresence::Undetermined,
+                _ => ContainerStatePresence::Present,
+            })
+            .expect("reconcile");
+        assert_eq!(
+            r.removed(),
+            &[(cid("b-absent"), d(0xa0)), (cid("u-absent"), d(0xa0))]
+        );
+        assert_eq!(r.removed_unbound(), &[cid("u-absent")]);
+        assert_eq!(r.kept_present(), &[cid("b-present"), cid("u-present")]);
+        assert_eq!(r.kept_undetermined(), &[cid("u-unknown")]);
+        assert!(r.skipped_changed().is_empty());
+        let g = s.lock().expect("lock");
+        assert_eq!(g.manifest_references(&d(0xa0)).count(), 0);
+        assert_eq!(
+            g.manifest_references(&d(0xb0)).containers,
+            vec![cid("b-present"), cid("u-present"), cid("u-unknown")]
+        );
+        drop(g);
+        // 回収した ID は同じ manifest で再作成できる。
+        reg(&s, "u-absent", 0xa0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// OCI-7・#2345: probe 中に同じ ID が同じ manifest で登録し直された（世代が変わった）参照と、
+    /// 未確定から確定へ変わった参照は外さない。
+    #[test]
+    fn oci7_reconcile_skips_regenerated_or_newly_bound_refs() {
+        let (s, dir) = store("aba");
+        reg(&s, "regen", 0xa0);
+        reg(&s, "bound-late", 0xa0);
+        let r = s
+            .reconcile_container_refs(|id| {
+                if id.as_str() == "regen" {
+                    s.release_container_ref(id).expect("release");
+                    s.register_container_ref(id, &d(0xa0)).expect("re-register");
+                } else {
+                    s.bind_container_ref(id).expect("bind");
+                }
+                ContainerStatePresence::Absent
+            })
+            .expect("reconcile");
+        assert!(r.removed().is_empty());
+        assert_eq!(r.skipped_changed(), &[cid("bound-late"), cid("regen")]);
+        assert_eq!(
+            s.lock()
+                .expect("lock")
+                .manifest_references(&d(0xa0))
+                .containers,
+            vec![cid("bound-late"), cid("regen")]
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

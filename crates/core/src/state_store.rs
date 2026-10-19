@@ -31,6 +31,8 @@
 //!   TASK-157.9・SUP-1）。排他は上記の `@lock` が担い、同じ ID への同時 `update` は直列化され、
 //!   後着は古い `expected_revision` のため `FAILED_PRECONDITION` になる（黙って上書きしない）。
 //!   後着側は `get` で最新の revision を取り直して再試行する（再試行の方針は呼び出し側の責務）。
+//!   同じプロセスが続けて取り直すときは、解放から [`LOCK_HANDOFF_GAP`] を空けて別プロセスへ譲る
+//!   （待ち順の仕組みが無く飢えるため。期限は変わらない。複数の待ち手の間の FIFO は保証しない。#2229）。
 //!   ロックはストア全体で 1 つで、保持は 1 操作の間だけ。保持プロセスが死ねば OS が解放する
 //! - 既存のエントリ（`@lock`・`@revision`・`state.json`・fsync するディレクトリ）は
 //!   `O_NOFOLLOW | O_NONBLOCK` で開き（`open_nowait`）、開いた実体の種別を fstat で確かめる。
@@ -116,7 +118,38 @@ pub const MAX_BUNDLE_PATH_BYTES: usize = 4096;
 pub const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// ロック再試行の間隔。
-const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(1);
+
+/// 同じプロセスが `@lock` を解放してから取り直すまでに空ける最小の間隔（#2229・SUP-1・REPAIR-5）。
+///
+/// `@lock` には待ち順の仕組みが無く、別プロセス（CLI と supervisor。TASK-157.9）は
+/// [`LOCK_RETRY_INTERVAL`] ごとにしか `try_lock` を打てない。連続して操作するプロセスが解放の
+/// 数十 µs 後に取り直すと、その空き時間に当たらない待ち手が飢える。解放側が再試行間隔の 2 倍だけ
+/// 譲れば、待ち手は少なくとも 1 回は `try_lock` を打てる。譲る時間は期限（`STATE_LOCK_TIMEOUT`）
+/// までの残りで頭打ちにするため、待ちが無期限になることはない。複数の待ち手の間の FIFO は保証しない。
+///
+/// 間隔を長くすると get から update までの窓が延びて revision 競合（`FAILED_PRECONDITION`）が増える
+/// （10ms では既存の同一 ID 競合試験が成立しなかった）ため、再試行間隔を 1ms に下げて間隔を 2ms に抑える。
+/// 計測は `docs/design/measurements/state-lock-contention.md`。
+const LOCK_HANDOFF_GAP: Duration = Duration::from_millis(2);
+
+/// このプロセスが `@lock` を最後に解放した時刻（状態ルートをまたいだプロセス全体で 1 つ）。
+///
+/// CLI は同じ状態ルートのストアを複数回開くことがあるため、インスタンスではなく static に持つ。
+static LAST_FILE_LOCK_RELEASE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// 前回の解放から [`LOCK_HANDOFF_GAP`] が経つまでの残り時間を返す（結果は `deadline` までの残りで頭打ち）。
+///
+/// `FileStateStore::lock` が `@lock` の最初の `try_lock` の前に眠る長さを決める純関数。
+/// 期限を過ぎていれば 0 を返し、期限切れの判定は `lock_file_until` に任せる（REPAIR-5）。
+fn handoff_wait(last_release: Option<Instant>, now: Instant, deadline: Instant) -> Duration {
+    let Some(released) = last_release else {
+        return Duration::ZERO;
+    };
+    let elapsed = now.saturating_duration_since(released);
+    let remaining_gap = LOCK_HANDOFF_GAP.saturating_sub(elapsed);
+    remaining_gap.min(deadline.saturating_duration_since(now))
+}
 
 /// `state.json` に書く OCI Runtime Spec のバージョン。
 const OCI_VERSION: &str = "1.2.0";
@@ -292,7 +325,20 @@ struct LockedState {
 /// ロックの RAII ガード。drop でファイルロックとミューテックスが解放される。
 struct StoreGuard<'a> {
     process: MutexGuard<'a, LockedState>,
-    _file: File,
+    /// drop で最初に閉じる（`@lock` の解放）。`Option` なのは `Drop` で取り出すため。
+    file: Option<File>,
+}
+
+impl Drop for StoreGuard<'_> {
+    /// 解放の順序: `@lock` を閉じる -> 解放時刻を記録する -> （フィールド drop で）プロセス内
+    /// `Mutex` を解放する。次の取得側が [`LOCK_HANDOFF_GAP`] を空けられるようにする（#2229）。
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let mut last = LAST_FILE_LOCK_RELEASE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *last = Some(Instant::now());
+    }
 }
 
 impl FileStateStore {
@@ -377,6 +423,14 @@ impl FileStateStore {
                 }
             }
         };
+        // 直前にこのプロセスが解放していれば、別プロセスが取れるよう間隔を空ける（#2229）。
+        let last_release = *LAST_FILE_LOCK_RELEASE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let wait = handoff_wait(last_release, Instant::now(), deadline);
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
         let path = self.root.join(LOCK_FILE_NAME);
         reject_symlink(&path)?;
         let mut opts = OpenOptions::new();
@@ -397,7 +451,7 @@ impl FileStateStore {
         lock_file_until(&file, deadline)?;
         Ok(StoreGuard {
             process,
-            _file: file,
+            file: Some(file),
         })
     }
 
@@ -1664,9 +1718,10 @@ impl StateDto {
 /// 期限つきでファイルの排他ロックを取る（REPAIR-5）。
 ///
 /// `FileStateStore::lock` から呼ばれ、`@lock` を別プロセス（CLI・supervisor。TASK-157.9・SUP-1）が
-/// 保持している間は 5ms 間隔で再試行し、`deadline` を過ぎたら `Timeout` で失敗する（無期限に待たない）。
+/// 保持している間は [`LOCK_RETRY_INTERVAL`]（1ms）間隔で再試行し、`deadline` を過ぎたら `Timeout` で失敗する（無期限に待たない）。
 /// std の `File::try_lock` のみを使うため追加依存なしで 3 OS で動く。ロックは `file` を閉じると解放され、
-/// 保持プロセスが死んでも OS が解放する。
+/// 保持プロセスが死んでも OS が解放する。待ち順は保証しない（公平性は解放側の
+/// [`LOCK_HANDOFF_GAP`] で補う。期限は変わらない。#2229）。
 fn lock_file_until(file: &File, deadline: Instant) -> Result<(), TraitError> {
     loop {
         match file.try_lock() {
@@ -1691,6 +1746,37 @@ fn lock_file_until(file: &File, deadline: Instant) -> Result<(), TraitError> {
 #[cfg(test)]
 mod platform_tests {
     use super::*;
+
+    /// SUP-1・REPAIR-5・#2229: 前回解放が無い・間隔が経過済みなら待たない。
+    #[test]
+    fn sup1_repair5_2229_handoff_wait_zero_when_no_gap_needed() {
+        let now = Instant::now();
+        let deadline = now + STATE_LOCK_TIMEOUT;
+        assert_eq!(handoff_wait(None, now, deadline), Duration::ZERO);
+        let old = now - LOCK_HANDOFF_GAP;
+        assert_eq!(handoff_wait(Some(old), now, deadline), Duration::ZERO);
+    }
+
+    /// SUP-1・#2229: 間隔の半分しか経っていなければ残りの半分だけ待つ。
+    #[test]
+    fn sup1_repair5_2229_handoff_wait_returns_remaining_gap() {
+        let now = Instant::now();
+        let deadline = now + STATE_LOCK_TIMEOUT;
+        let released = now - LOCK_HANDOFF_GAP / 2;
+        assert_eq!(
+            handoff_wait(Some(released), now, deadline),
+            LOCK_HANDOFF_GAP / 2
+        );
+    }
+
+    /// REPAIR-5・#2229: 待ちは期限までの残りで頭打ちになり、期限後は 0。
+    #[test]
+    fn sup1_repair5_2229_handoff_wait_is_capped_by_deadline() {
+        let now = Instant::now();
+        let near = now + Duration::from_millis(1);
+        assert_eq!(handoff_wait(Some(now), now, near), Duration::from_millis(1));
+        assert_eq!(handoff_wait(Some(now), now, now), Duration::ZERO);
+    }
 
     fn code<T: std::fmt::Debug>(r: Result<T, TraitError>) -> &'static str {
         r.unwrap_err().code().as_str()

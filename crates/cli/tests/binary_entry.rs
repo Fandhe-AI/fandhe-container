@@ -861,8 +861,26 @@ fn err2_create_rejects_relative_bundle() {
     );
 }
 
+/// OCI-5・SEC-4・CLI-1: Linux 以外の日常コマンドが fail-closed で終わった後の状態ルートの期待。
+/// plugin 拒否の監査記録先（`@audit.log`）を作る際に、`FileStateStore::open` が macOS では状態ルートを
+/// 0700 で作り、Windows（`Unimplemented`）では何も作らない。
+#[cfg(not(target_os = "linux"))]
+fn assert_state_root_after_fail_closed(root: &std::path::Path) {
+    if cfg!(target_os = "macos") {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(root).expect("state root must be created on macOS");
+            assert!(meta.is_dir());
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        }
+    } else {
+        assert!(!root.exists(), "state root must not be created on Windows");
+    }
+}
+
 /// SEC-1・PLUG-4: Linux 以外では plugin 発見機構経由になり、候補なし（既定探索先が空）の fail-closed で
-/// FAILED_PRECONDITION（5）。状態ルートは作らない。
+/// FAILED_PRECONDITION（5）。状態ルートは macOS では 0700 で作られ、Windows では作らない。
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn sec1_create_fails_closed_off_linux() {
@@ -883,7 +901,7 @@ fn sec1_create_fails_closed_off_linux() {
         ("create".into(), "FAILED_PRECONDITION".into())
     );
     assert!(out.stdout.is_empty());
-    assert!(!root.exists());
+    assert_state_root_after_fail_closed(&root);
     // 引数不正は plugin 解決より先に 2 で弾く（3 OS 同一）。
     let out = run(&["create", "--bundle", "relative", "c1"]);
     assert_eq!(out.status.code(), Some(2));
@@ -901,6 +919,7 @@ fn sec1_stop_delete_fail_closed_off_linux() {
         assert_eq!(op_and_code(&out), (op.into(), "FAILED_PRECONDITION".into()));
         assert!(out.stdout.is_empty());
     }
+    assert_state_root_after_fail_closed(&root);
 }
 
 /// CLI-1・ERR-2: Linux で list は stdout にタブ区切りの一覧を出し（0 件はヘッダのみ・ID 昇順）、
@@ -977,6 +996,7 @@ fn sec1_list_logs_fail_closed_off_linux() {
         );
         assert!(out.stdout.is_empty());
     }
+    assert_state_root_after_fail_closed(&root);
     let out = run(&["--root", root_s, "logs", "bad/id"]);
     assert_eq!(out.status.code(), Some(2));
 }

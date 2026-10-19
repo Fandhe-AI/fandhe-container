@@ -120,7 +120,7 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
 `sec5_special_bits_dropped_when_file_owner_is_host_root`・`sec5_special_bits_dropped_when_pax_uid_is_malformed`
 （満たさない経路で落ち、件数が出る）、`oci1_directory_setgid_is_applied`（ディレクトリの setgid）、
 `sec5_special_bits_to_keep_matrix`・`sec5_id_range_maps_with_checked_arithmetic`（純関数の条件の組み合わせ）、
-#2251: `sec5_setgid_dropped_when_file_owner_uid_is_host_root`・`oci2_global_pax_headers_count_toward_entry_limit`・
+Issue #2251 で追加: `sec5_setgid_dropped_when_file_owner_uid_is_host_root`・`oci2_global_pax_headers_count_toward_entry_limit`・
 `oci2_global_pax_headers_accumulate_across_layers`・`sec5_readback_setgid_only_drop_does_not_count_setuid_as_stripped`・
 `sec5_special_bit_counts_add_bits`。
 

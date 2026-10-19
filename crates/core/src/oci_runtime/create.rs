@@ -27,11 +27,31 @@
 //! 後始末は不要である。エラーメッセージは固定文言と静的なフィールドパスのみで、config の値や
 //! OS 依存の I/O エラー文字列を含めない。
 //!
+//! # イメージつき create のレイヤー展開（#2342・OCI-7）
+//!
+//! 展開器つきの [`create_with_image`] は、bundle の検証の「間」で展開する:
+//! 参照登録 → config 検証 → 既存状態の確認 → 展開先（`root.path`）の排他作成 → 展開 → bundle 検証
+//! （`check_rootfs` を含む全検証）→ 状態作成 → 確定。
+//!
+//! - 展開の前に config を検証するのは、不正な config で大きな展開をしないため。`root.path` も config から決まる
+//! - rootfs の実在・種類の検査は展開の後の実体に対して行う（start の TOCTOU 再検証と同じ規則）
+//! - 参照の登録を展開より前に置くのは OCI-7 の順序（未登録のレイヤーを使わない）。展開中、登録した参照が
+//!   GC から blob を守るので、展開器はイメージストアの排他を展開の全体で保持しなくてよい
+//!
+//! 失敗時の後始末は「rootfs の削除 → 参照の解除」の順。展開以降の失敗（展開・bundle 検証・`root.path` の
+//! 書き換わり・状態作成の `AlreadyExists` / `InvalidArgument`）では両方を行う。状態作成の書き込みの
+//! 有無が曖昧な失敗（`Internal`・`Timeout` 等）では、状態が rootfs を指す可能性があるため rootfs も参照も残す。
+//! 後始末は、経路の再検査と inode の同一性を通ったときだけ削除する（差し替えられていれば消さない）。
+//! create の途中でプロセスが落ちて残った部分的な rootfs は自動では回収せず、次の同じ bundle の create は
+//! `AlreadyExists` で止まる（fail-closed。利用者のデータを消さない）。delete は bundle と rootfs を消さない。
+//! 展開器なしの [`create_with_image`] は従来どおり、bundle の rootfs が展開済みの前提で動く。
+//!
 //! # スコープ外
 //!
 //! - プロセス起動（TASK-29.3 start）・namespace 分離・mount 適用（bind は start と本番 launcher が適用する〔#1915〕。bind 以外の種類は未対応）
 //! - mounts の rootfs 内 symlink 解決（mount を適用する側の担当）
-//! - レイヤー展開（bundle は展開済みの前提。[`create_with_image`] の rootfs 検査の位置が将来の差し込み点）
+//! - 本番のレイヤー展開器（oci の展開を呼ぶアダプタ。未実装。REPAIR-3）。[`create_with_image`] は
+//!   [`ImageRootfsUnpacker`] を受けて展開の位置・展開先の作成・後始末だけを担う（下記）
 //! - OCI-7 の参照テーブル登録は [`create_with_image`] が担う（TASK-183.8.1）。bundle を直に指定する
 //!   [`create`] は参照を登録しない
 //! - ファイルベースの状態保存（TASK-31・OCI-5）
@@ -45,6 +65,7 @@ use super::cgroup_requirement::check_cgroups_path;
 use super::config::{OciConfig, OciConfigError, load_config};
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::image_refs::{ContainerImage, ImageRefRegistration};
+use super::image_rootfs::{CreatedRootfs, ImageRootfsUnpacker, prepare_rootfs_target};
 use super::resources::LinuxResourceLimits;
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
@@ -62,6 +83,10 @@ const CREATE_OP_NAME: &str = "create";
 const IMAGE_REF_REGISTER_OP_NAME: &str = "image_ref_register";
 const IMAGE_REF_ROLLBACK_OP_NAME: &str = "image_ref_rollback";
 const IMAGE_REF_BIND_OP_NAME: &str = "image_ref_bind";
+
+/// レイヤー展開と、失敗時の展開途中 rootfs の削除の操作名（REPAIR-4・#2342）。
+const IMAGE_ROOTFS_UNPACK_OP_NAME: &str = "image_rootfs_unpack";
+const IMAGE_ROOTFS_CLEANUP_OP_NAME: &str = "image_rootfs_cleanup";
 
 /// `config.json` を検証し、プロセス未起動の「created」状態を `store` に作る。
 ///
@@ -98,7 +123,8 @@ fn create_state(store: &dyn StateStore, req: &CreateRequest) -> Result<StateReco
 
 /// [`create`] に、OCI-7 のイメージ参照の登録を前置したもの（TASK-183.8.1・OCI-7）。
 ///
-/// 処理順は「参照登録 → rootfs の使用（bundle の検証。将来のレイヤー展開もここ）→ `StateStore` の状態作成」。
+/// 処理順は「参照登録 → rootfs の使用（bundle の検証。展開器があればレイヤー展開を挟む。モジュール doc 参照）→
+/// `StateStore` の状態作成」。
 /// 参照を最初に登録するのは、GC（`image rm` / `image prune`）が使用中のレイヤーを消す窓を作らないため。
 /// 既存の [`create`] の挙動は変えない。
 ///
@@ -145,11 +171,24 @@ fn create_with_image_inner(
             ));
         }
     }
-    // OCI-7: 参照登録の後・状態作成の前。将来のレイヤー展開（未実装）はこの検証の前後に入る。
-    if let Err(e) = validate_bundle(req.bundle()) {
-        rollback_image_ref(recorder, image, req);
-        return Err(e);
-    }
+    // OCI-7: 参照登録の後・状態作成の前。展開器があれば、検証を展開の前後に分けて展開する。
+    let created_rootfs = match image.unpacker() {
+        None => {
+            if let Err(e) = validate_bundle(req.bundle()) {
+                rollback_image_ref(recorder, image, req);
+                return Err(e);
+            }
+            None
+        }
+        Some(unpacker) => match unpack_rootfs(store, recorder, image, unpacker, req) {
+            Ok(created) => Some(created),
+            Err(e) => {
+                // 展開済みの rootfs は unpack_rootfs が消した後。残るのは未確定の参照だけ。
+                rollback_image_ref(recorder, image, req);
+                return Err(e);
+            }
+        },
+    };
     match create_state(store, req) {
         Ok(record) => {
             // 参照を状態作成まで済んだものとして確定する。delete は確定済みの参照だけを外すので、状態作成前に止まった
@@ -180,10 +219,65 @@ fn create_with_image_inner(
                 e.code(),
                 ErrorCode::AlreadyExists | ErrorCode::InvalidArgument
             ) {
+                // 順序は「rootfs の削除 → 参照の解除」。間で止まっても残るのは未確定の参照だけで、
+                // #854 の起動時照合が回収できる（逆順だと参照の無い孤立 rootfs が次の create を塞ぐ）。
+                if let Some(created) = created_rootfs {
+                    remove_created_rootfs(recorder, created);
+                }
                 rollback_image_ref(recorder, image, req);
             }
             Err(e)
         }
+    }
+}
+
+/// 展開器ありの create の「config 検証 → 展開先の作成 → 展開 → bundle 検証」（#2342・OCI-7）。
+///
+/// 検証を展開の前後に分ける理由: config の検証（不正な config で展開しない・`root.path` を知る）は展開の
+/// 前に、rootfs の実在・種類の検査（`check_rootfs`）は展開の後の実体に対して行う。後者は start の TOCTOU
+/// 再検証と同じ規則を create でも成り立たせる。失敗時は作った rootfs をここで消す（参照の解除は呼び出し元）。
+fn unpack_rootfs(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    image: ContainerImage<'_>,
+    unpacker: &dyn ImageRootfsUnpacker,
+    req: &CreateRequest,
+) -> Result<CreatedRootfs, TraitError> {
+    let config = validate_config(req.bundle())?;
+    // 展開の無駄を避ける事前確認。最終判定は `StateStore::create`。
+    if store.get(&GetStateRequest::new(req.id().clone())).is_ok() {
+        return Err(TraitError::new(
+            ErrorCode::AlreadyExists,
+            "container state already exists",
+        ));
+    }
+    let created = prepare_rootfs_target(req.bundle(), config.root().path())?;
+    let unpack_name = OpName::new(IMAGE_ROOTFS_UNPACK_OP_NAME)?;
+    let unpacked = recorder.record_op(&unpack_name, || {
+        unpacker.unpack(image.manifest(), created.path())
+    });
+    if let Err(e) = unpacked {
+        remove_created_rootfs(recorder, created);
+        return Err(e);
+    }
+    // 展開の間に config が書き換わり別の場所を指していたら、作った rootfs はどの状態からも指されない。
+    match validate_bundle(req.bundle()) {
+        Ok((_, rootfs)) if rootfs == created.path() => Ok(created),
+        Ok(_) => {
+            remove_created_rootfs(recorder, created);
+            Err(invalid("root.path changed while unpacking"))
+        }
+        Err(e) => {
+            remove_created_rootfs(recorder, created);
+            Err(e)
+        }
+    }
+}
+
+/// 作った rootfs を消す。失敗は握りつぶさず `image_rootfs_cleanup` として記録し、元のエラーを優先させる。
+fn remove_created_rootfs(recorder: &OpRecorder, created: CreatedRootfs) {
+    if let Ok(name) = OpName::new(IMAGE_ROOTFS_CLEANUP_OP_NAME) {
+        let _ = recorder.record_op(&name, || created.remove());
     }
 }
 
@@ -200,6 +294,15 @@ fn rollback_image_ref(recorder: &OpRecorder, image: ContainerImage<'_>, req: &Cr
 /// 検証を共有するための入口。戻り値は検証済みの設定と、検査済みの rootfs の絶対パス。
 /// 検証内容はモジュール doc の「fail-closed の判断」を参照。
 pub(super) fn validate_bundle(bundle: &Path) -> Result<(OciConfig, PathBuf), TraitError> {
+    let config = validate_config(bundle)?;
+    let rootfs = check_rootfs(bundle, config.root().path())?;
+    Ok((config, rootfs))
+}
+
+/// `validate_bundle` のうち rootfs の実在に依らない部分（config の読み込みと各種検証）。
+///
+/// イメージつき create は、展開の前にこれだけを済ませる（不正な config で展開しない。#2342）。
+fn validate_config(bundle: &Path) -> Result<OciConfig, TraitError> {
     let config = load_config(&bundle.join(CONFIG_FILE_NAME)).map_err(config_error)?;
     reject_unapplied(&config)?;
     check_cgroups_path(&config)?;
@@ -207,8 +310,7 @@ pub(super) fn validate_bundle(bundle: &Path) -> Result<(OciConfig, PathBuf), Tra
     if config.process().is_none() {
         return Err(invalid("config.json: process is required"));
     }
-    let rootfs = check_rootfs(bundle, config.root().path())?;
-    Ok((config, rootfs))
+    Ok(config)
 }
 
 /// `linux.resources` が cgroup v2 の値として表せる範囲か確かめる（Linux のみ。範囲外は `InvalidArgument`）。
@@ -324,7 +426,7 @@ pub(super) fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<PathBuf, T
 ///
 /// junction は `FileType::is_symlink()` が false を返すため、属性の `FILE_ATTRIBUTE_REPARSE_POINT`
 /// で検出する。他 OS では symlink 判定のみ。
-fn is_link_like(meta: &std::fs::Metadata) -> bool {
+pub(super) fn is_link_like(meta: &std::fs::Metadata) -> bool {
     if meta.file_type().is_symlink() {
         return true;
     }
@@ -339,7 +441,7 @@ fn is_link_like(meta: &std::fs::Metadata) -> bool {
     false
 }
 
-fn inspect(path: &Path) -> Result<std::fs::Metadata, TraitError> {
+pub(super) fn inspect(path: &Path) -> Result<std::fs::Metadata, TraitError> {
     std::fs::symlink_metadata(path).map_err(|e| match e.kind() {
         io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => {
             TraitError::new(ErrorCode::NotFound, "rootfs directory not found")
@@ -932,6 +1034,337 @@ mod tests {
                 "refs.bind",
                 "refs.release_if"
             ]
+        );
+    }
+    // ---- OCI-7 レイヤー展開の位置と後始末（#2342）----
+
+    use crate::oci_runtime::{ImageRootfsUnpacked, ImageRootfsUnpacker};
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum UnpackMode {
+        Ok,
+        /// 書いてから失敗する。
+        FailAfterWrite,
+        /// 読み取り専用のディレクトリを作って成功する。
+        ReadOnlyDir,
+        /// rootfs を bundle 外への symlink に差し替えて失敗する。
+        SwapForSymlink,
+    }
+
+    struct LoggingUnpacker {
+        log: Log,
+        mode: UnpackMode,
+        /// 展開の途中で config の `root.path` を書き換える（bundle, 新しい config）。
+        rewrite_config: Option<(PathBuf, Value)>,
+        outside: Option<PathBuf>,
+        observed: Mutex<Vec<String>>,
+    }
+
+    impl LoggingUnpacker {
+        fn new(log: &Log, mode: UnpackMode) -> Self {
+            Self {
+                log: Arc::clone(log),
+                mode,
+                rewrite_config: None,
+                outside: None,
+                observed: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ImageRootfsUnpacker for LoggingUnpacker {
+        fn unpack(
+            &self,
+            _manifest: &ImageManifestDigest,
+            rootfs: &Path,
+        ) -> Result<ImageRootfsUnpacked, TraitError> {
+            push(&self.log, "unpack");
+            let empty = std::fs::read_dir(rootfs).expect("rootfs exists").count() == 0;
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(rootfs)
+                    .expect("meta")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            #[cfg(not(unix))]
+            let mode = 0o700;
+            self.observed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("empty={empty} mode={mode:o}"));
+            if let Some((bundle, cfg)) = &self.rewrite_config {
+                std::fs::write(
+                    bundle.join("config.json"),
+                    serde_json::to_vec(cfg).expect("ser"),
+                )
+                .expect("rewrite");
+            }
+            match self.mode {
+                UnpackMode::Ok => Ok(ImageRootfsUnpacked::default()),
+                UnpackMode::FailAfterWrite => {
+                    std::fs::write(rootfs.join("f"), b"x").expect("f");
+                    std::fs::create_dir(rootfs.join("d")).expect("d");
+                    std::fs::write(rootfs.join("d").join("g"), b"y").expect("g");
+                    Err(TraitError::new(ErrorCode::Internal, "unpack failed"))
+                }
+                UnpackMode::ReadOnlyDir => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let d = rootfs.join("ro");
+                        std::fs::create_dir(&d).expect("ro");
+                        std::fs::write(d.join("f"), b"x").expect("f");
+                        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555))
+                            .expect("chmod");
+                    }
+                    Ok(ImageRootfsUnpacked::default())
+                }
+                UnpackMode::SwapForSymlink => {
+                    #[cfg(unix)]
+                    {
+                        let outside = self.outside.clone().expect("outside");
+                        std::fs::remove_dir(rootfs).expect("rm");
+                        std::os::unix::fs::symlink(&outside, rootfs).expect("symlink");
+                    }
+                    Err(TraitError::new(ErrorCode::Internal, "unpack failed"))
+                }
+            }
+        }
+    }
+
+    fn run_unpacking(
+        store: &LoggingStore,
+        refs: &LoggingRefs,
+        unpacker: &LoggingUnpacker,
+        rec: &OpRecorder,
+        b: &Bundle,
+    ) -> Result<StateRecord, OciRuntimeError> {
+        let manifest = ImageManifestDigest::new(MANIFEST).expect("digest");
+        create_with_image(
+            store,
+            rec,
+            ContainerImage::new(refs, &manifest).with_unpacker(unpacker),
+            &b.request("c1"),
+        )
+    }
+
+    fn config_bundle(name: &str) -> Bundle {
+        let b = Bundle::new(name);
+        b.write_config(&valid_config());
+        b
+    }
+
+    fn count_of(rec: &OpRecorder, op: &str) -> (u64, u64) {
+        rec.snapshot_op(&OpName::new(op).expect("name"))
+            .map(|s| (s.success(), s.failure()))
+            .unwrap_or((0, 0))
+    }
+
+    /// OCI-7: 順序は 登録 → 展開 → 状態作成 → 確定。展開器は空の 0700 の rootfs を受け取る。
+    #[test]
+    fn oci7_unpack_runs_between_register_and_state_create() {
+        let b = config_bundle("unpack-order");
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
+        run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect("create");
+        assert_eq!(
+            log_of(&log),
+            vec!["refs.register", "unpack", "store.create", "refs.bind"]
+        );
+        assert_eq!(
+            *unpacker.observed.lock().expect("lock"),
+            vec!["empty=true mode=700".to_string()]
+        );
+        assert!(b.dir.join("rootfs").is_dir());
+    }
+
+    /// OCI-7: 展開の途中の失敗で rootfs を消し、参照を外す。元のエラーが返る。
+    #[test]
+    fn oci7_unpack_failure_removes_rootfs_and_releases_ref() {
+        let b = config_bundle("unpack-fail");
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        let unpacker = LoggingUnpacker::new(&log, UnpackMode::FailAfterWrite);
+        let rec = OpRecorder::new();
+        let err = run_unpacking(&store, &refs, &unpacker, &rec, &b).expect_err("fail");
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert!(!b.dir.join("rootfs").exists());
+        assert_eq!(
+            log_of(&log),
+            vec!["refs.register", "unpack", "refs.release"]
+        );
+        assert_eq!(store.inner.len(), 0);
+        assert_eq!(count_of(&rec, "image_rootfs_unpack"), (0, 1));
+        assert_eq!(count_of(&rec, "image_rootfs_cleanup"), (1, 0));
+    }
+
+    /// OCI-7: rootfs が既に存在する場合は展開せず AlreadyExists。既存の中身は残り、参照は外れる。
+    #[test]
+    fn oci7_unpack_refuses_existing_rootfs() {
+        let b = config_bundle("unpack-exists");
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        std::fs::write(b.dir.join("rootfs").join("keep"), b"x").expect("keep");
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
+        let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
+        assert_eq!(err.code(), ErrorCode::AlreadyExists);
+        assert!(b.dir.join("rootfs").join("keep").exists());
+        assert_eq!(log_of(&log), vec!["refs.register", "refs.release"]);
+    }
+
+    /// OCI-7: 不正な config（process なし）では展開せず rootfs も作らない。参照は外れる。
+    #[test]
+    fn oci7_unpack_skipped_for_invalid_config() {
+        let b = Bundle::new("unpack-badcfg");
+        let mut cfg = valid_config();
+        cfg.as_object_mut().expect("obj").remove("process");
+        b.write_config(&cfg);
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
+        let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert!(!b.dir.join("rootfs").exists());
+        assert_eq!(log_of(&log), vec!["refs.register", "refs.release"]);
+    }
+
+    /// OCI-7: 同じ ID の状態が既にあれば展開せず AlreadyExists。参照は外れる。
+    #[test]
+    fn oci7_unpack_skipped_when_state_exists() {
+        let b = config_bundle("unpack-stateexists");
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        create_state(&store.inner, &b.request("c1")).expect("pre-existing");
+        let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
+        let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
+        assert_eq!(err.code(), ErrorCode::AlreadyExists);
+        assert!(!b.dir.join("rootfs").exists());
+        assert_eq!(log_of(&log), vec!["refs.register", "refs.release"]);
+    }
+
+    /// OCI-7: 展開の後に状態作成が AlreadyExists になったら rootfs を消し、参照を外す。
+    #[test]
+    fn oci7_unpack_state_already_exists_cleans_up() {
+        let b = config_bundle("unpack-createexists");
+        let (store, refs, log) = fixture(
+            Some(ErrorCode::AlreadyExists),
+            Ok(ImageRefRegistration::Registered),
+            None,
+        );
+        let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
+        let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
+        assert_eq!(err.code(), ErrorCode::AlreadyExists);
+        assert!(!b.dir.join("rootfs").exists());
+        assert_eq!(
+            log_of(&log),
+            vec!["refs.register", "unpack", "store.create", "refs.release"]
+        );
+    }
+
+    /// OCI-7: 読み取り専用のディレクトリを含む展開物も、権限を補正して消せる。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_unpack_cleanup_handles_read_only_dirs() {
+        let b = config_bundle("unpack-ro");
+        let (store, refs, log) = fixture(
+            Some(ErrorCode::AlreadyExists),
+            Ok(ImageRefRegistration::Registered),
+            None,
+        );
+        let unpacker = LoggingUnpacker::new(&log, UnpackMode::ReadOnlyDir);
+        run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
+        assert!(!b.dir.join("rootfs").exists());
+    }
+
+    /// OCI-7: 曖昧な状態作成の失敗（Internal）では rootfs も参照も残す。
+    #[test]
+    fn oci7_unpack_keeps_rootfs_and_ref_on_ambiguous_state_error() {
+        let b = config_bundle("unpack-ambiguous");
+        let (store, refs, log) = fixture(
+            Some(ErrorCode::Internal),
+            Ok(ImageRefRegistration::Registered),
+            None,
+        );
+        let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
+        let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert!(b.dir.join("rootfs").is_dir());
+        assert_eq!(
+            log_of(&log),
+            vec!["refs.register", "unpack", "store.create"]
+        );
+    }
+
+    /// OCI-7: `root.path` が bundle 自身（`.`）なら展開せず拒否する。
+    #[test]
+    fn oci7_unpack_rejects_bundle_itself_as_rootfs() {
+        let b = Bundle::new("unpack-dot");
+        let mut cfg = valid_config();
+        cfg["root"]["path"] = json!(".");
+        b.write_config(&cfg);
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
+        let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(log_of(&log), vec!["refs.register", "refs.release"]);
+    }
+
+    /// SEC-1: `root.path` の中間要素が symlink なら拒否し、bundle 外に何も作らない。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_unpack_rejects_symlink_in_root_path() {
+        let b = Bundle::new("unpack-symlink");
+        let outside = Bundle::new("unpack-symlink-out");
+        std::os::unix::fs::symlink(&outside.dir, b.dir.join("link")).expect("symlink");
+        let mut cfg = valid_config();
+        cfg["root"]["path"] = json!("link/rootfs");
+        b.write_config(&cfg);
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
+        let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(std::fs::read_dir(&outside.dir).expect("read").count(), 0);
+        assert_eq!(log_of(&log), vec!["refs.register", "refs.release"]);
+    }
+
+    /// SEC-1: 展開器が rootfs を bundle 外への symlink に差し替えて失敗しても、後始末は先を消さない。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_unpack_cleanup_refuses_replaced_rootfs() {
+        let b = config_bundle("unpack-swap");
+        let outside = Bundle::new("unpack-swap-out");
+        std::fs::write(outside.dir.join("marker"), b"x").expect("marker");
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        let mut unpacker = LoggingUnpacker::new(&log, UnpackMode::SwapForSymlink);
+        unpacker.outside = Some(outside.dir.clone());
+        let rec = OpRecorder::new();
+        let err = run_unpacking(&store, &refs, &unpacker, &rec, &b).expect_err("x");
+        assert_eq!(err.code(), ErrorCode::Internal);
+        assert!(outside.dir.join("marker").exists());
+        assert_eq!(count_of(&rec, "image_rootfs_cleanup"), (0, 1));
+        assert_eq!(
+            log_of(&log),
+            vec!["refs.register", "unpack", "refs.release"]
+        );
+    }
+
+    /// OCI-7: 展開の間に `root.path` が書き換わったら拒否し、作った rootfs を消して参照を外す。
+    #[test]
+    fn oci7_unpack_rejects_root_path_changed_while_unpacking() {
+        let b = config_bundle("unpack-rewrite");
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        let mut cfg = valid_config();
+        cfg["root"]["path"] = json!("other");
+        std::fs::create_dir(b.dir.join("other")).expect("other");
+        let mut unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
+        unpacker.rewrite_config = Some((b.dir.clone(), cfg));
+        let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert!(!b.dir.join("rootfs").exists());
+        assert!(b.dir.join("other").is_dir());
+        assert_eq!(
+            log_of(&log),
+            vec!["refs.register", "unpack", "refs.release"]
         );
     }
 }

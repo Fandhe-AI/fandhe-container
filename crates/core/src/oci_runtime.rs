@@ -12,7 +12,8 @@
 //! 本番実装は `cgroups::DelegatedCgroup`）と `StateStore` のレコード（状態ファイル）を削除する。OCI-7 の
 //! 参照登録・解除は `create_with_image` / `delete_releasing_image_ref`（TASK-183.8.1。依存注入する
 //! `ContainerImageRefs` 経由）が担い、本番のアダプタと CLI / plugin からの配線は未実装である
-//! （REPAIR-3: 実装済みを装わない）。モジュールは
+//! （REPAIR-3: 実装済みを装わない）。イメージのレイヤーを rootfs へ展開する依存注入口 `ImageRootfsUnpacker`
+//! （#2342）も同様で、`create_with_image` が展開先の作成・展開・失敗時の後始末を担い、本番の展開器は未実装である。モジュールは
 //! `cfg(target_os)` を付けず 3 OS でビルドされる（CLI-1）。
 //! create / start / kill / delete は依存注入された `OpRecorder` へ固定の操作名（`create`・`start`・`kill`・
 //! `delete`）で成功 / 失敗と所要時間を記録する（REPAIR-4・TASK-84.4。delete は TASK-30.2 で同じ
@@ -37,6 +38,7 @@ mod create;
 mod delete;
 mod error;
 mod image_refs;
+mod image_rootfs;
 mod kill;
 mod launch;
 mod launcher;
@@ -76,6 +78,7 @@ pub use image_refs::{
     ContainerImage, ContainerImageRefs, ImageManifestDigest, ImageRefGeneration,
     ImageRefRegistration, ImageRefRelease,
 };
+pub use image_rootfs::{ImageRootfsUnpacked, ImageRootfsUnpacker};
 pub use kill::{KillTimeout, ProcessSignaler, kill};
 #[cfg(target_os = "linux")]
 pub use launch::ContainerChildProcess;

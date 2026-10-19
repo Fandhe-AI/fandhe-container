@@ -19,6 +19,10 @@
 //! 親の失敗メッセージへ含める（CI で子の panic 理由が読めず間欠失敗の原因が追えなかったため）。
 //! 複数プロセスが競う試験では、書き込みの間で短く譲る。ロック取得は 5ms 間隔の期限付きポーリングで
 //! 待ち順の公平性がなく、間を空けず取り直す側がいると他プロセスが `STATE_LOCK_TIMEOUT` まで飢えうる。
+//!
+//! #2214（OCI-5・SUP-1・REPAIR-5）: 同一 ID 試験の「親が子の途中値を観測する」重なりは、sleep の長さでなく
+//! 段階的な同期で必ず作る。子は途中の `SAME_ID_CHECKPOINT` 回で止まり、親が途中値を観測して
+//! resume マーカーを書いてから残りを再開する。
 
 /// OCI-5・CLI-1: Linux 以外では状態ルートを作らずに `Unimplemented` を返す。
 #[cfg(not(target_os = "linux"))]
@@ -307,12 +311,17 @@ mod linux {
     const SAMEID_READY_ENV: &str = "FANDHE_STATE_IT_SAMEID_READY";
     /// 親が開始合図を出すマーカーのパス。子はこれが現れるまで更新を始めない。
     const SAMEID_GO_ENV: &str = "FANDHE_STATE_IT_SAMEID_GO";
+    /// 親が再開合図を出すマーカーのパス。子は `SAME_ID_CHECKPOINT` 回書いた後これが現れるまで止まる（#2214）。
+    const SAMEID_RESUME_ENV: &str = "FANDHE_STATE_IT_SAMEID_RESUME";
     const SAMEID_CHILD_TEST: &str = "linux::child_supervisor_updates_same_id";
     const HOLD_ROOT_ENV: &str = "FANDHE_STATE_IT_HOLD_ROOT";
     const HOLD_READY_ENV: &str = "FANDHE_STATE_IT_HOLD_READY";
     const HOLD_CHILD_TEST: &str = "linux::child_holds_state_lock";
     /// 同一 ID への書き込み回数（親子それぞれ）。
     const SAME_ID_WRITES: u32 = 30;
+    /// 子がいったん止まる書き込み回数（#2214）。親は止まった子の途中値（この値）を必ず観測できる。
+    const SAME_ID_CHECKPOINT: u32 = SAME_ID_WRITES / 2;
+    const _: () = assert!(SAME_ID_CHECKPOINT > 0 && SAME_ID_CHECKPOINT < SAME_ID_WRITES);
     /// `FAILED_PRECONDITION`（後着負け）での取り直し再試行の上限（REPAIR-5: 無限ループにしない）。
     const MAX_RETRIES_PER_WRITE: u32 = 1000;
 
@@ -365,6 +374,7 @@ mod linux {
         fs::write(std::env::var_os(SAMEID_READY_ENV).unwrap(), b"ready").unwrap();
         let go = std::path::PathBuf::from(std::env::var_os(SAMEID_GO_ENV).unwrap());
         wait_for_marker(&go, "go marker");
+        let resume = std::path::PathBuf::from(std::env::var_os(SAMEID_RESUME_ENV).unwrap());
         for i in 1..=SAME_ID_WRITES {
             write_with_retry(&store, &id, &|cur| {
                 UpdateStateRequest::new(cur.status().clone(), cur.revision()).with_supervision(
@@ -372,12 +382,18 @@ mod linux {
                 )
             });
             // supervisor の監視ループ間隔を模して短く譲り、親の更新と時間的に重ねる。
-            std::thread::sleep(Duration::from_millis(3));
+            std::thread::sleep(WRITE_YIELD);
+            // 途中値で止まり、親が観測して再開合図を出すまで待つ。重なりを時間でなく合図で作る（#2214）。
+            if i == SAME_ID_CHECKPOINT {
+                wait_for_marker(&resume, "resume marker");
+            }
         }
     }
 
     /// SUP-1・OCI-5・TASK-157.9: CLI 役（親）と supervisor 役（子プロセス）が同じ ID へ同時に書いても、
     /// `@lock` で直列化され、部分書き込み・lost update・一時ファイルの残骸がない。
+    /// 重なりは合図で作る（#2214）: 子は `SAME_ID_CHECKPOINT` 回で止まり、親が途中値を観測して
+    /// resume を書くと再開する。
     #[test]
     fn sup1_task157_9_cli_and_supervisor_writes_to_same_id_are_serialized() {
         let t = TmpDir::new("sameid");
@@ -387,12 +403,14 @@ mod linux {
         let marker_dir = TmpDir::new("sameid-marker");
         let ready = marker_dir.path().join("ready");
         let go = marker_dir.path().join("go");
+        let resume = marker_dir.path().join("resume");
         let mut child = spawn_worker(
             SAMEID_CHILD_TEST,
             &[
                 (SAMEID_ROOT_ENV, t.path()),
                 (SAMEID_READY_ENV, &ready),
                 (SAMEID_GO_ENV, &go),
+                (SAMEID_RESUME_ENV, &resume),
             ],
         );
         // 子の準備完了を待ってから開始合図を出し、双方が同時に更新を始める。
@@ -413,6 +431,7 @@ mod linux {
         // 最低 N 回、かつ子が N 回書き終えたと観測するまで書き続ける。親が子の開始前に終わって
         // 直列実行になるのを防ぐ（子が進行中の値を親が観測できる = 同時書き込みの証拠）。
         let mut i = 0u32;
+        let mut resumed = false;
         loop {
             let creating = i.is_multiple_of(2);
             let (rev, _retries) = write_with_retry(&parent, &id, &|cur| {
@@ -429,6 +448,11 @@ mod linux {
             let seen = parent.get(&GetStateRequest::new(id.clone())).unwrap();
             assert_eq!(seen.id().as_str(), "web");
             child_progress.push(seen.restart_count());
+            // 子の途中値を観測したら再開合図を 1 回だけ出す（子は途中で止まっているので必ず観測できる）。
+            if !resumed && seen.restart_count() > 0 && seen.restart_count() < SAME_ID_WRITES {
+                fs::write(&resume, b"resume").unwrap();
+                resumed = true;
+            }
             i += 1;
             // ロック取得は期限付きのポーリングのため、親が連続して取り直すと子が割り込めない。
             // 実際の CLI 操作間隔を模して短く譲り、双方が交互にロックを取れるようにする。
@@ -436,12 +460,18 @@ mod linux {
             if i >= SAME_ID_WRITES && seen.restart_count() >= SAME_ID_WRITES {
                 break;
             }
-            assert!(
-                Instant::now() < write_deadline,
-                "child did not finish its writes in time: {child_progress:?}"
-            );
+            if Instant::now() >= write_deadline {
+                let out = child.kill_and_output();
+                panic!(
+                    "child did not finish its writes in time: {child_progress:?}; child output:\n{out}"
+                );
+            }
         }
         wait_with_deadline(child);
+        assert!(
+            resumed,
+            "parent never observed the child mid-run: {child_progress:?}"
+        );
         assert!(
             observed.windows(2).all(|w| w[0] < w[1]),
             "parent revisions must be strictly increasing: {observed:?}"

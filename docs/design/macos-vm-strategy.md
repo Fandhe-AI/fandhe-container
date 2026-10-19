@@ -23,14 +23,14 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 - PoC-5: コンテナごとに新規 VM を起動する Apple `container` 方式の cold start は 0.92 秒で、常駐 VM を使い回す Docker Desktop に及ばない trade-off がある
 - PoC-11: Apple `container` 1.4.1 の cold start は 0.728 秒、Docker Desktop は 0.136 秒
 
-本実装の VM 起動時間（MAC-2）の実測は TASK-70（人間担当）で行う。TASK-70・TASK-49 がどちらの方式を測るかは、TASK-191 の未決事項とともに #1905 で決める（本書では決めない）。
+本実装の VM 起動時間（MAC-2）の実測は TASK-70（人間担当）で行う。TASK-70・TASK-49 の計測対象の推奨は [macos-shared-vm.md](macos-shared-vm.md) の項目 5（承認待ち・#1906）に書いた。
 
 ## 既定方式（常駐 VM 共用 + 軽量プロセス分離）
 
 - 常駐 VM: Virtualization.framework で起動した Linux ゲスト VM を、コンテナの起動・停止をまたいで保持し、複数コンテナで共用する
 - 軽量プロセス分離: 共用ゲスト内のコンテナ間分離を、ゲスト Linux の namespaces / cgroups v2 / seccomp / Landlock（`crates/core` の機構。CORE 系・SEC 系）で行う、という解釈は #370 で認められた（2026-10-12）。spec の MAC-4 の期待も、この分離をゲスト Linux の namespaces・cgroups v2・seccomp・Landlock で行うと明記している。ただし分離機構のゲスト内での実行は未実装である（TASK-191）
 - 分離強度の含意: コンテナ間はゲストカーネルを共有する。したがってカーネル脆弱性クラスへの耐性やマルチテナント分離が要る用途では、既定方式では足りない（次節のオプション方式を使う）。ホストとの境界は VM であり、virtiofs の共有範囲・アクセス権は Virtualization.framework のデバイス構成で強制される
-- CORE-1 との関係: 「中央の常駐デーモンを持たない」（CORE-1・D-19）と「常駐 VM」は別の概念である。VM を保持する主体は本書では確定しない（未決事項）
+- CORE-1 との関係: 「中央の常駐デーモンを持たない」（CORE-1・D-19）と「常駐 VM」は別の概念である。VM を保持する主体の推奨（VM ごとの保持役）は [macos-shared-vm.md](macos-shared-vm.md) の項目 1（承認待ち・#1906）に書いた
 
 ## オプション方式（1 コンテナ = 1 VM）
 
@@ -78,15 +78,15 @@ macOS バックエンドの VM 利用方式（既定とオプション）を定�
 
 ## 未決事項・後続
 
-本書では解決しない。
+設計案は [macos-shared-vm.md](macos-shared-vm.md) に書いた。状態はすべて**承認待ち（#1906）**で、確定ではない。
 
-- 共用 VM を保持する主体と寿命（plugin プロセス常駐との関係。CORE-1 との整合）
-- VM 生成後にコンテナ単位の bind mount をどう届けるか（virtiofs 共有が構成時固定である制約）。共用 VM で複数コンテナの共有ディレクトリが同一ゲストに見える点のアクセス制御も含む
-- 共用ゲスト内でコンテナを実行する機構（ゲスト init の拡張〔子プロセスの回収等〕・`crates/core` のゲスト内利用）
-- オプション方式の macOS 実現経路と選択 UI、MVM-3 のしきい値（検討中）
-- 関連タスク: TASK-70（MAC-2 / MAC-3 の実測・人間）、TASK-115（plugin 化。plugin 側は完了、#384）、TASK-74 / TASK-75（MVM-1 の Linux 実装）、TASK-78（MVM-5 の文書化）、TASK-49（CORE-8 の VM 経由リソース効率実測・人間）、TASK-191（既定方式の実装。#1905・#1906）
-- 既定方式の実装タスクは 2026-10-12 に spec へ TASK-191 として追加された（spec #14。#370 の決定「spec リポジトリ側で補う」による）。上の未決事項は TASK-191 の着手前に #1905 で確定し、#1906 で承認する
+- 共用 VM を保持する主体と寿命: 推奨は VM ごとの保持役（supervisor crate に置く案）。#1869 4.4 との食い違いは判断事項
+- bind mount の届け方: 推奨は構成済みの共有ルートを virtiofs で共有し、ゲスト内でサブツリーを bind する
+- ゲスト内の実行機構: 推奨はゲスト内で core・supervisor・CLI を動かし、ホストは vsock で中継する（承認事項: objc2-virtualization の vsock feature）
+- オプション方式: 容量 1 の VM として同じ経路を使う。選択 UI は spec 側の課題。MVM-3 は検討中のまま
+- 計測対象: MAC-2 は共用 VM の初回起動、CORE-8 は 2 本の条件（判断事項）
+- 実装 issue は macos-shared-vm.md の一覧（#2268〜#2283）。関連タスク: TASK-70・TASK-49・TASK-74 / TASK-75・TASK-78・TASK-115・TASK-191（#1905・#1906）
 
 ## 見直し
 
-MAC-4・MVM-1・MVM-5 の更新時、TASK-191 の未決事項の確定時（#1905・#1906）、TASK-78 の完了時、core 側配線（#1869）の確定時に本書を追従する。
+MAC-4・MVM-1・MVM-5 の更新時、TASK-191 の未決事項の確定時（#1905・#1906）、TASK-78 の完了時、core 側配線（#1869・承認は #2232）の確定時に本書を追従する。

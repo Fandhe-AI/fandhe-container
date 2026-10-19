@@ -2418,6 +2418,7 @@ const fn read_only_mount_attr() -> MountAttr {
 /// Linux v5.12・v6.12・v7.0 の `mount_setattr` 系（`mount_setattr_prepare`／`do_mount_setattr`）で許されると確認済み（#2064）だが、
 /// 複製は元の伝播を引き継ぐため使わない。private であることは `MountIsolation::establish` の `MS_REC|MS_PRIVATE` に依存し、
 /// 明示設定はせず、呼び出し側（#1913）が付け替え先の非 shared の確認と、付け替え後の mountinfo の照合で確かめる。
+/// 明示設定を足すと構築子の `propagation` = 0 という不変条件が崩れるため、#2165 で見送った（SEC-1・OCI-4）。
 const fn bind_mount_attr(attrs: BindMountAttrs) -> MountAttr {
     MountAttr {
         attr_set: attrs.attr_bits() as u64,
@@ -3612,6 +3613,9 @@ pub(crate) fn open_path_nofollow_at(
 /// 上の 2 つの呼び出し側はどちらの原因でも同じく fail-closed に倒し、`EINVAL` では分岐しない（分岐するのは
 /// `ENOENT`・`EEXIST` だけ）。原因は errno のまま報告される。`SysError` は crate 全体で網羅 `match` されており、
 /// variant の追加は影響が広い。呼び出し側が原因ごとに扱いを変える必要が出た時点で追加する。
+/// #2165 で再確認した結果も同じで、見送った。`RENAME_NOREPLACE` は本関数内の固定値で外からフラグを渡す経路は無く、musl は
+/// リンク時の前提（下記）で、`EINVAL` の実行時の原因としては扱わない。再検討するのは、`EINVAL` で扱いを変える呼び出し側が
+/// 現れたとき、musl で本 crate をリンクする crate が加わったとき、フラグを外から渡す API を足すとき（SEC-1・OCI-4）。
 ///
 /// # リンクの前提
 ///

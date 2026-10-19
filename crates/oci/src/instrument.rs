@@ -44,6 +44,8 @@ pub enum OciOpKind {
     AcquireImageStoreLock,
     /// pull セッションの開始とステージングディレクトリの作成（TASK-183.9・OCI-7）。
     BeginPull,
+    /// `image tag` のタグ登録（TASK-183.4・OCI-7）。
+    TagImage,
 }
 
 impl OciOpKind {
@@ -63,6 +65,7 @@ impl OciOpKind {
             OciOpKind::DiskUsage => "oci.image.df",
             OciOpKind::AcquireImageStoreLock => "oci.store.lock",
             OciOpKind::BeginPull => "oci.pull.begin",
+            OciOpKind::TagImage => "oci.image.tag",
         }
     }
 }
@@ -237,6 +240,7 @@ mod tests {
         assert_eq!(items[1].kind().as_str(), "oci.auth.anonymous");
         assert_eq!(OciOpKind::FetchManifest.as_str(), "oci.manifest.fetch");
         assert_eq!(OciOpKind::FetchBlob.as_str(), "oci.blob.fetch");
+        assert_eq!(OciOpKind::TagImage.as_str(), "oci.image.tag");
     }
 
     /// REPAIR-4: panic で巻き戻されても Failure が 1 件残る。

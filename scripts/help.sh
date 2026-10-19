@@ -51,6 +51,10 @@ cat <<'EOF'
                                         venus 試験治具（poc/venus-decoder/jig）の fmt-check・clippy・test を実行する（GPU-6・TASK-172.4）
   check-cli-backend-deps              scripts/targets/check-cli-backend-deps.sh
                                         cli の依存ツリー（normal/build/dev・全ターゲット）に platform-* / plugin-macos / plugin-windows / microvm 系が含まれないことを検証する
+  check-launch-target                 scripts/targets/check-launch-target.sh
+                                        plugin 起動対象の構築口 from_verified_file を呼ぶのが core の変換と許可した試験コードだけか判定する（PLUG-11・#1857）
+  check-launch-target-selftest        scripts/check-plugin-launch-target-construction-selftest.sh
+                                        check-launch-target の自己テスト（REPAIR-12。fixture のみ）
   test-core-no-plugin                 scripts/targets/test-core-no-plugin.sh
                                         core を --no-default-features でテストし plugin 依存が入らないことを検証する
   plugin-feature-size                 scripts/targets/plugin-feature-size.sh

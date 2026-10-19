@@ -490,3 +490,99 @@ jobs:
           fi
 
           echo "All KVM checks succeeded."
+
+  # --------------------------------------------------
+  # escape-suite-probe（ubuntu-latest で ESC スイートの実機ケースを実行できるかの計測。
+  # #2022・TASK-43 追補・SEC-2。計測のみで必須チェックではない。ケースの失敗では
+  # ジョブを落とさず、結果を表にして記録する）
+  # --------------------------------------------------
+  # yamllint disable rule:line-length
+  escape-suite-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        timeout-minutes: 10
+        with:
+          toolchain: stable
+      - name: Record environment (kernel, Landlock ABI, LSM)
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          set +e
+          abi="$(python3 - <<'PY'
+          import ctypes
+          libc = ctypes.CDLL(None, use_errno=True)
+          libc.syscall.restype = ctypes.c_long
+          ret = libc.syscall(444, None, 0, 1)
+          print(f"abi_version={ret}" if ret >= 0 else f"error (errno={ctypes.get_errno()})")
+          PY
+          )"
+          {
+            echo "### escape-suite-probe environment"
+            echo "- ImageOS: ${ImageOS:-unknown}"
+            echo "- ImageVersion: ${ImageVersion:-unknown}"
+            echo "- kernel: $(uname -r)"
+            echo "- arch: $(uname -m)"
+            echo "- os: $(. /etc/os-release && echo "${PRETTY_NAME}")"
+            echo "- LSM: $(sudo cat /sys/kernel/security/lsm 2>/dev/null || echo unavailable)"
+            echo "- apparmor_restrict_unprivileged_userns(before): $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
+            echo "- max_user_namespaces: $(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo n/a)"
+            echo "- sudo: $(sudo -n true 2>/dev/null && echo ok || echo no)"
+            echo "- Landlock ABI: ${abi}"
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Relax AppArmor unprivileged userns restriction
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          key_file="/proc/sys/kernel/apparmor_restrict_unprivileged_userns"
+          if [ -e "${key_file}" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+            value="$(cat "${key_file}")"
+            [ "${value}" = "0" ] || { echo "::error::value is ${value}" >&2; exit 1; }
+            echo "apparmor_restrict_unprivileged_userns(after)=${value}" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Build escape_suite (unprivileged user)
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/esc-build.json"
+          cargo test -p fandhe-container-core --test escape_suite --no-run --message-format=json > "${out}"
+          bins="$(jq -r 'select(.profile.test == true and .target.name == "escape_suite") | .executable' "${out}" | grep -v '^null$' | sort -u)"
+          [ -n "${bins}" ] && [ "$(printf '%s\n' "${bins}" | wc -l)" = "1" ] || { echo "::error::expected exactly one escape_suite binary" >&2; exit 1; }
+          echo "ESC_BIN=${bins}" >> "$GITHUB_ENV"
+      - name: Run escape_suite --ignored (non-root)
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set +e
+          FANDHE_CONTAINER_TEST_TIMEOUT_SECS=30 "${ESC_BIN}" --ignored 2>&1 | tee "${RUNNER_TEMP}/esc-nonroot.log"
+          echo "exit=${PIPESTATUS[0]}" > "${RUNNER_TEMP}/esc-nonroot.exit"
+      - name: Run escape_suite --ignored (root via sudo)
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set +e
+          sudo -n env FANDHE_CONTAINER_TEST_TIMEOUT_SECS=30 "${ESC_BIN}" --ignored 2>&1 | tee "${RUNNER_TEMP}/esc-root.log"
+          echo "exit=${PIPESTATUS[0]}" > "${RUNNER_TEMP}/esc-root.exit"
+      - name: Summarize escape_suite verdicts
+        if: always()
+        timeout-minutes: 3
+        run: |
+          set +e
+          {
+            for mode in nonroot root; do
+              echo "### escape_suite verdicts (${mode}) $(cat "${RUNNER_TEMP}/esc-${mode}.exit" 2>/dev/null || echo exit=missing)"
+              grep -E '^escape_suite: .*(verdict=|harness verified)' "${RUNNER_TEMP}/esc-${mode}.log" 2>/dev/null | cut -c1-300
+            done
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -qE '^escape_suite:' "${RUNNER_TEMP}/esc-nonroot.log" "${RUNNER_TEMP}/esc-root.log" 2>/dev/null || { echo "::error::no escape_suite output" >&2; exit 1; }

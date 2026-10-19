@@ -657,18 +657,20 @@ jobs:
           record "systemctl --user is-system-running" "${sysrun}"
 
           # 委譲 cgroup を得る経路を、追加の特権が少ない順に試す
-          probe_cmd='cg=$(cut -d: -f3 /proc/self/cgroup); echo "uid=$(id -u) cg=${cg} owner=$(stat -c %U /sys/fs/cgroup${cg})"'
+          # 本番の DelegatedCgroup::detect / prepare が要求する条件（各インターフェースファイルの所有者・
+          # cgroup.type・所属プロセス・利用可能な controller。REPAIR-4）も合わせて記録する
+          probe_cmd='cg=$(cut -d: -f3 /proc/self/cgroup); d=/sys/fs/cgroup${cg}; echo "uid=$(id -u) cg=${cg} owner=$(stat -c %U ${d}) procs_owner=$(stat -c %U ${d}/cgroup.procs 2>&1) subtree_owner=$(stat -c %U ${d}/cgroup.subtree_control 2>&1) type=$(cat ${d}/cgroup.type 2>&1) pids=$(tr "\n" "," < ${d}/cgroup.procs 2>&1) controllers=$(cat ${d}/cgroup.controllers 2>&1)"'
           r1="$(timeout 30 systemd-run --user --scope -p Delegate=yes sh -c "${probe_cmd}" 2>&1 | tr '\n' ' ')"
-          record "path1 systemd-run --user --scope (no extra privilege)" "${r1:0:300}"
+          record "path1 systemd-run --user --scope (no extra privilege)" "${r1:0:600}"
 
           sudo loginctl enable-linger "${me}" > /dev/null 2>&1
           record "path2 enable-linger (exit)" "$?"
           sleep 3
           r2="$(XDG_RUNTIME_DIR="/run/user/$(id -u)" timeout 30 systemd-run --user --scope -p Delegate=yes sh -c "${probe_cmd}" 2>&1 | tr '\n' ' ')"
-          record "path2 systemd-run --user --scope after linger" "${r2:0:300}"
+          record "path2 systemd-run --user --scope after linger" "${r2:0:600}"
 
           r3="$(sudo -n timeout 30 systemd-run --uid="$(id -u)" --gid="$(id -g)" -p Delegate=yes --wait --pipe --collect sh -c "${probe_cmd}" 2>&1 | tr '\n' ' ')"
-          record "path3 transient service with User= and Delegate=yes" "${r3:0:300}"
+          record "path3 transient service with User= and Delegate=yes" "${r3:0:600}"
 
           {
             echo "### id-mapping-probe results (production_launcher scenario I prerequisites)"

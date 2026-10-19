@@ -251,6 +251,9 @@ mod tests {
     const AUX_MARKERS: [&str; 5] = ["wsl", "developer mode", "entitlement", "virtiofs", "setup"];
 
     /// 一時ディレクトリ（プロセス ID + 連番。unix は 0700。Drop で削除）。
+    /// 空のイメージストアに対する `system df` の出力（固定 9 行。値はすべて 0）。
+    const SYSTEM_DF_EMPTY: &str = "KEY\tVALUE\nimages.count\t0\nimages.bytes\t0\nimages.reclaimable_bytes\t0\nimages.missing_blobs\t0\ncache.blob_count\t0\ncache.bytes\t0\ncache.unregistered_count\t0\ncache.unregistered_bytes\t0\ncache.foreign_entries\t0\n";
+
     struct TmpDir(PathBuf);
 
     impl TmpDir {
@@ -333,6 +336,10 @@ mod tests {
         let root = base.0.join("state");
         let bundle = make_bundle(&base.0);
         let b = bundle.to_str().expect("utf8");
+        // image / system 用のイメージストア root（空。blobs/sha256 だけ作る）。
+        let images = base.0.join("images");
+        std::fs::create_dir_all(images.join("blobs").join("sha256")).expect("images");
+        let ir = images.to_str().expect("utf8").to_owned();
         if linux {
             let (c, _, e) = invoke(&root, &["create", "--bundle", b, "d1"]);
             assert_eq!((c, e.as_str()), (0, ""));
@@ -365,6 +372,20 @@ mod tests {
                     },
                 ),
                 Command::Logs => (vec!["logs", "c1"], if linux { 8 } else { 5 }, ""),
+                Command::Image => (
+                    vec!["image", "ls", "--image-root", &ir],
+                    if linux { 0 } else { 5 },
+                    if linux {
+                        "REPOSITORY\tTAG\tDIGEST\tSIZE\tMISSING\n"
+                    } else {
+                        ""
+                    },
+                ),
+                Command::System => (
+                    vec!["system", "df", "--image-root", &ir],
+                    if linux { 0 } else { 5 },
+                    if linux { SYSTEM_DF_EMPTY } else { "" },
+                ),
                 Command::Setup | Command::Doctor => continue,
             };
             let (code, out, err) = invoke(&root, &argv);
@@ -384,7 +405,12 @@ mod tests {
             );
             seen.push(command.as_str());
         }
-        assert_eq!(seen, ["create", "start", "stop", "delete", "list", "logs"]);
+        assert_eq!(
+            seen,
+            [
+                "create", "start", "stop", "delete", "list", "logs", "image", "system"
+            ]
+        );
         if !linux {
             assert!(!root.exists(), "state root must not be created off Linux");
         }

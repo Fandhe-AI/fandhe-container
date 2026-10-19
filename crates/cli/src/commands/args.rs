@@ -1,9 +1,10 @@
-//! `create` / `start` / `stop` / `delete` / `list` / `logs` の argv 解析（TASK-79.2.1・TASK-79.2.2・TASK-79.3・CLI-1・MS-6）。
+//! `create` / `start` / `stop` / `delete` / `list` / `logs` / `image` / `system` の argv 解析（TASK-79.2.1・TASK-79.2.2・TASK-79.3・CLI-1・MS-6）。
 //!
 //! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
 //! 構文は runc 互換: `fandhe-container [--root <dir>] create --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] <id>` / `... list` / `... logs <id>`。
+//! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
 use std::ffi::OsString;
@@ -63,6 +64,47 @@ pub(super) struct DoctorArgs;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LogsArgs {
     pub(super) id: String,
+}
+
+/// `image` サブコマンドの引数（#2221・CLI-1・OCI-7）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ImageArgs {
+    /// `image ls --image-root <dir>`。
+    Ls(ImageLsArgs),
+    /// `image rm [--force] --image-root <dir> <ref>`。
+    Rm(ImageRmArgs),
+}
+
+/// `image ls` の引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ImageLsArgs {
+    /// イメージストアの root（絶対パス）。
+    pub(super) image_root: PathBuf,
+}
+
+/// `image rm` の引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ImageRmArgs {
+    /// イメージストアの root（絶対パス）。
+    pub(super) image_root: PathBuf,
+    /// `--force`（停止中のコンテナだけが参照するイメージを untag だけで通す。OCI-7）。
+    pub(super) force: bool,
+    /// 対象のイメージ参照（未検証の文字列。意味検証は oci の `ImageReference::parse` に委ねる）。
+    pub(super) reference: String,
+}
+
+/// `system` サブコマンドの引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SystemArgs {
+    /// `system df --image-root <dir>`。
+    Df(SystemDfArgs),
+}
+
+/// `system df` の引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SystemDfArgs {
+    /// イメージストアの root（絶対パス）。
+    pub(super) image_root: PathBuf,
 }
 
 /// 解析失敗（使い方エラー）。理由は呼び出し元で固定文言に写す。
@@ -199,6 +241,83 @@ pub(super) fn parse_logs(args: Vec<OsString>) -> Result<LogsArgs, UsageError> {
     Ok(LogsArgs {
         id: single_positional(args)?,
     })
+}
+
+/// `image <ls|rm> ...` を解析する（サブコマンド無し・未知は使い方エラー）。
+pub(super) fn parse_image(args: Vec<OsString>) -> Result<ImageArgs, UsageError> {
+    let mut it = args.into_iter();
+    let sub = it.next().ok_or(UsageError)?;
+    let rest: Vec<OsString> = it.collect();
+    if sub == "ls" {
+        let (image_root, _, positional) = parse_image_options(rest, false)?;
+        if !positional.is_empty() {
+            return Err(UsageError);
+        }
+        Ok(ImageArgs::Ls(ImageLsArgs { image_root }))
+    } else if sub == "rm" {
+        let (image_root, force, positional) = parse_image_options(rest, true)?;
+        Ok(ImageArgs::Rm(ImageRmArgs {
+            image_root,
+            force,
+            reference: single_id(positional)?,
+        }))
+    } else {
+        Err(UsageError)
+    }
+}
+
+/// `system df --image-root <dir>` を解析する。
+pub(super) fn parse_system(args: Vec<OsString>) -> Result<SystemArgs, UsageError> {
+    let mut it = args.into_iter();
+    let sub = it.next().ok_or(UsageError)?;
+    if sub != "df" {
+        return Err(UsageError);
+    }
+    let (image_root, _, positional) = parse_image_options(it.collect(), false)?;
+    if !positional.is_empty() {
+        return Err(UsageError);
+    }
+    Ok(SystemArgs::Df(SystemDfArgs { image_root }))
+}
+
+/// image 系サブコマンド共通のオプション解析。`--image-root <dir>`（必須・1 回・絶対パスのみ）と、
+/// `allow_force` のときの `--force`（1 回）を読み、残りの位置引数を返す。`--` 以降は位置引数。
+/// 値の意味検証（存在・ディレクトリか）は oci の `ImageStore::open` に委ね、ここでは作らない・辿らない。
+fn parse_image_options(
+    args: Vec<OsString>,
+    allow_force: bool,
+) -> Result<(PathBuf, bool, Vec<OsString>), UsageError> {
+    let mut image_root: Option<PathBuf> = None;
+    let mut force = false;
+    let mut positional: Vec<OsString> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            positional.extend(it.by_ref());
+            break;
+        } else if a == "--image-root" {
+            let value = it.next().ok_or(UsageError)?;
+            if image_root.is_some() {
+                return Err(UsageError);
+            }
+            image_root = Some(PathBuf::from(value));
+        } else if allow_force && a == "--force" {
+            if force {
+                return Err(UsageError);
+            }
+            force = true;
+        } else if is_option_like(&a) {
+            return Err(UsageError);
+        } else {
+            positional.push(a);
+        }
+    }
+    let image_root = image_root.ok_or(UsageError)?;
+    // 相対パスは作業ディレクトリ依存で 3 OS の挙動がぶれるため、使い方エラーとして拒否する。
+    if !image_root.is_absolute() {
+        return Err(UsageError);
+    }
+    Ok((image_root, force, positional))
 }
 
 /// オプションを持たないコマンドの位置引数 1 個を取り出す（`--` 以降は位置引数、`-` 始まりは拒否）。
@@ -458,5 +577,80 @@ mod tests {
             parse_logs(vec![OsString::from_vec(vec![0x66, 0xff])]),
             Err(UsageError)
         );
+    }
+
+    /// CLI-1・OCI-7: image ls / system df の正常系と異常系。
+    #[test]
+    fn cli1_oci7_parse_image_ls_and_system_df() {
+        let root = std::env::temp_dir();
+        let r = root.to_str().expect("utf8").to_owned();
+        assert_eq!(
+            parse_image(v(&["ls", "--image-root", &r])),
+            Ok(ImageArgs::Ls(ImageLsArgs {
+                image_root: root.clone()
+            }))
+        );
+        assert_eq!(
+            parse_system(v(&["df", "--image-root", &r])),
+            Ok(SystemArgs::Df(SystemDfArgs {
+                image_root: root.clone()
+            }))
+        );
+        for bad in [
+            v(&[]),
+            v(&["bogus"]),
+            v(&["ls"]),
+            v(&["ls", "--image-root"]),
+            v(&["ls", "--image-root", "rel/dir"]),
+            v(&["ls", "--image-root", &r, "extra"]),
+            v(&["ls", "--image-root", &r, "--image-root", &r]),
+            v(&["ls", "--force", "--image-root", &r]),
+            v(&["ls", "--bogus", "--image-root", &r]),
+        ] {
+            assert_eq!(parse_image(bad.clone()), Err(UsageError), "{bad:?}");
+        }
+        for bad in [
+            v(&[]),
+            v(&["bogus"]),
+            v(&["df"]),
+            v(&["df", "--image-root", &r, "extra"]),
+        ] {
+            assert_eq!(parse_system(bad.clone()), Err(UsageError), "{bad:?}");
+        }
+    }
+
+    /// CLI-1・OCI-7: image rm の構文（--force は 1 回・順不同・`--` 以降は位置引数・参照は 1 個）。
+    #[test]
+    fn cli1_oci7_parse_image_rm() {
+        let root = std::env::temp_dir();
+        let r = root.to_str().expect("utf8").to_owned();
+        let expect = |force: bool| {
+            Ok(ImageArgs::Rm(ImageRmArgs {
+                image_root: root.clone(),
+                force,
+                reference: "busybox:latest".into(),
+            }))
+        };
+        assert_eq!(
+            parse_image(v(&["rm", "--image-root", &r, "busybox:latest"])),
+            expect(false)
+        );
+        assert_eq!(
+            parse_image(v(&["rm", "--force", "busybox:latest", "--image-root", &r])),
+            expect(true)
+        );
+        assert_eq!(
+            parse_image(v(&["rm", "--image-root", &r, "--", "busybox:latest"])),
+            expect(false)
+        );
+        for bad in [
+            v(&["rm", "--image-root", &r]),
+            v(&["rm", "--image-root", &r, "a", "b"]),
+            v(&["rm", "--force", "--force", "--image-root", &r, "x"]),
+            v(&["rm", "--bogus", "--image-root", &r, "x"]),
+            v(&["rm", "x"]),
+        ] {
+            assert_eq!(parse_image(bad.clone()), Err(UsageError), "{bad:?}");
+        }
     }
 }

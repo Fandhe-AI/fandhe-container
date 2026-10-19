@@ -400,15 +400,15 @@ mod imp {
 
 #[cfg(not(target_os = "linux"))]
 mod imp {
-    //! Linux 以外（macOS 等の Unix・Windows）: fd 相対の作成・削除が未実装のため、経路を再解決して
-    //! 削除すると中間要素の差し替えで bundle 外を消しうる。後始末は拒否する（fail-closed。展開物が残る。
-    //! REPAIR-3: 実装済みを装わない）。展開先は最終の名前に直接作る（非公開の名前での展開・公開は Linux のみ）。
+    //! Linux 以外（macOS 等の Unix・Windows）: 展開先を fd／ハンドルで固定する実装が無い。経路を再解決して
+    //! 作成・展開・削除すると、検査後や作成後に親が symlink／junction へ差し替えられて bundle 外へ
+    //! 作成・書き込み・削除しうる（SEC-1）。そのため作成の前に Unimplemented を返して展開を拒否する
+    //! （fail-closed。REPAIR-3: 実装済みを装わない。固定の実装は 3 OS 対応の課題として追跡する）。
 
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
-    use super::{invalid, refuse};
-    use crate::oci_runtime::create::{inspect, is_link_like};
+    use super::refuse;
     use crate::traits::{ErrorCode, TraitError};
 
     #[derive(Debug)]
@@ -423,44 +423,14 @@ mod imp {
     }
 
     pub(super) fn create_dir(
-        bundle: &Path,
-        parents: &[&OsStr],
-        last: &OsStr,
+        _bundle: &Path,
+        _parents: &[&OsStr],
+        _last: &OsStr,
     ) -> Result<Backing, TraitError> {
-        let mut current: PathBuf = bundle.to_path_buf();
-        for part in parents {
-            current.push(part);
-            let meta = inspect(&current)?;
-            if is_link_like(&meta) {
-                return Err(invalid("rootfs must not contain a symlink"));
-            }
-            if !meta.is_dir() {
-                return Err(invalid("rootfs parent is not a directory"));
-            }
-        }
-        current.push(last);
-        #[cfg(unix)]
-        let builder = {
-            use std::os::unix::fs::DirBuilderExt;
-            let mut b = std::fs::DirBuilder::new();
-            b.mode(0o700);
-            b
-        };
-        #[cfg(not(unix))]
-        let builder = std::fs::DirBuilder::new();
-        builder.create(&current).map_err(|e| match e.kind() {
-            std::io::ErrorKind::AlreadyExists => {
-                TraitError::new(ErrorCode::AlreadyExists, "rootfs already exists")
-            }
-            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
-                TraitError::new(ErrorCode::NotFound, "rootfs parent directory not found")
-            }
-            std::io::ErrorKind::PermissionDenied => {
-                TraitError::new(ErrorCode::PermissionDenied, "cannot create rootfs")
-            }
-            _ => TraitError::new(ErrorCode::Internal, "failed to create rootfs"),
-        })?;
-        Ok(Backing)
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "image rootfs unpacking is not supported on this OS yet",
+        ))
     }
 
     pub(super) fn remove(_path: &Path, _b: Backing) -> Result<(), TraitError> {
@@ -500,6 +470,7 @@ mod tests {
     }
 
     /// OCI-7: 既存の rootfs・bundle 自身・`..` は拒否し、既存の中身に触れない。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_prepare_rejects_existing_bundle_itself_and_parent_dir() {
         let b = tmp("reject");
@@ -532,6 +503,7 @@ mod tests {
     }
 
     /// OCI-7: 中間要素が symlink なら拒否し、bundle 外に何も作らない。
+    #[cfg(target_os = "linux")]
     #[cfg(unix)]
     #[test]
     fn oci7_prepare_rejects_symlink_parent() {
@@ -603,6 +575,7 @@ mod tests {
     }
 
     /// OCI-7: 返す経路は正規化済みで、等価な書き方の `root.path` でも同じ場所に作る。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_prepare_normalizes_path() {
         let b = tmp("normalize");
@@ -649,15 +622,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&b);
     }
 
-    /// OCI-7・SEC-1: Linux 以外は同一性を保証できないため後始末を拒否し、展開物を残す。
+    /// OCI-7・SEC-1: Linux 以外は展開先を固定できないため、作成の前に Unimplemented で拒否する。
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn oci7_remove_refuses_without_identity_check() {
+    fn sec1_prepare_refuses_without_fd_pinning() {
         let b = tmp("winrefuse");
-        let c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
-        let e = c.remove().expect_err("refuse");
-        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
-        assert!(b.join("rootfs").is_dir());
+        let e = prepare_rootfs_target(&b, Path::new("rootfs")).expect_err("refuse");
+        assert_eq!(e.code(), ErrorCode::Unimplemented);
+        assert!(!b.join("rootfs").exists());
         let _ = std::fs::remove_dir_all(&b);
     }
 }

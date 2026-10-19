@@ -75,8 +75,8 @@ use super::image_rootfs::{CreatedRootfs, ImageRootfsUnpacker, prepare_rootfs_tar
 use super::resources::LinuxResourceLimits;
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
-    ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, GetStateRequest,
-    ListStateRequest, StateRecord, StateStore, TraitError,
+    ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, GetStateRequest, StateRecord,
+    StateStore, TraitError,
 };
 
 /// bundle 直下の設定ファイル名（OCI Runtime Spec）。
@@ -178,7 +178,7 @@ fn create_with_image_inner(
         }
     }
     // OCI-7: 参照登録の後・状態作成の前。展開器があれば、検証を展開の前後に分けて展開する。
-    let created_rootfs = match image.unpacker() {
+    let _published_rootfs = match image.unpacker() {
         None => {
             if let Err(e) = validate_bundle(req.bundle()) {
                 rollback_image_ref(recorder, image, req);
@@ -227,9 +227,7 @@ fn create_with_image_inner(
             ) {
                 // 順序は「rootfs の削除 → 参照の解除」。間で止まっても残るのは未確定の参照だけで、
                 // #854 の起動時照合が回収できる（逆順だと参照の無い孤立 rootfs が次の create を塞ぐ）。
-                if let Some(created) = created_rootfs {
-                    remove_unless_in_use(store, recorder, req, created);
-                }
+                // 公開済みの rootfs は使用中かを確定できないため消さずに残す（`unpack_rootfs` の注記）。
                 rollback_image_ref(recorder, image, req);
             }
             Err(e)
@@ -275,61 +273,15 @@ fn unpack_rootfs(
         remove_created_rootfs(recorder, created);
         return Err(e);
     }
-    // 公開後の失敗では、公開から後始末までの間に並行する通常の create が同じ bundle の rootfs を自分のものとして
-    // 成功しうる。その状態が見えるとき（または読めないとき）は消さずに残す。
-    // 展開の間に config が書き換わり別の場所を指していたら、作った rootfs はどの状態からも指されない。
+    // 公開後の失敗では rootfs を消さずに残す（OCI-7 の使用中 rootfs の保持）。公開済みの名前は並行する通常の
+    // create が検証して自分のものとして成功しうるが、bundle の別表記・別 bundle からの同一 rootfs の参照を
+    // 確実に見分ける手段と、通常の create と共有する排他が無いため、「未使用の確認 → 削除」は使用中の
+    // rootfs を壊しうる。残る木は #854 の起動時照合・手動で回収する（余分に持つだけの安全側。REPAIR-3）。
     match validate_bundle(req.bundle()) {
         Ok((_, rootfs)) if same_dir_path(&rootfs, created.path()) => Ok(created),
-        Ok(_) => {
-            remove_unless_in_use(store, recorder, req, created);
-            Err(invalid("root.path changed while unpacking"))
-        }
-        Err(e) => {
-            remove_unless_in_use(store, recorder, req, created);
-            Err(e)
-        }
+        Ok(_) => Err(invalid("root.path changed while unpacking")),
+        Err(e) => Err(e),
     }
-}
-
-/// 公開済みの rootfs を、同じ bundle を指す状態が無いときだけ消す。
-///
-/// 並行する通常の `create`（展開器なし・別 ID を含む）は、公開済みの rootfs を検証して成功しうる。その状態が
-/// 指す rootfs を消すと使用中の rootfs を壊す。同じ bundle の状態が見える、または読めない（曖昧）ときは
-/// 消さずに残す（残る方向はデータを余分に持つだけで安全側）。なお確認から削除までの間の極小の窓は残る
-/// （create 間の排他は未実装。REPAIR-3）。
-fn remove_unless_in_use(
-    store: &dyn StateStore,
-    recorder: &OpRecorder,
-    req: &CreateRequest,
-    created: CreatedRootfs,
-) {
-    if !bundle_in_use(store, req.bundle()) {
-        remove_created_rootfs(recorder, created);
-    }
-}
-
-/// いずれかの状態が `bundle` を指しているか。一覧を読めない・走査が上限を超えるときは真（保守側）。
-fn bundle_in_use(store: &dyn StateStore, bundle: &Path) -> bool {
-    const MAX_PAGES: usize = 1024;
-    let Some(page_size) = std::num::NonZeroU32::new(256) else {
-        return true;
-    };
-    let Ok(mut request) = ListStateRequest::new(page_size) else {
-        return true;
-    };
-    for _ in 0..MAX_PAGES {
-        let Ok(list) = store.list(&request) else {
-            return true;
-        };
-        if list.records().iter().any(|r| r.bundle() == bundle) {
-            return true;
-        }
-        match list.next_cursor() {
-            None => return false,
-            Some(cursor) => request = request.with_cursor(cursor.clone()),
-        }
-    }
-    true
 }
 
 /// 2 つの経路が同じディレクトリを指すかを、`.`・`//`・末尾の `/` を除いた要素列で比べる。
@@ -1255,6 +1207,7 @@ mod tests {
     }
 
     /// OCI-7: 順序は 登録 → 展開 → 状態作成 → 確定。展開器は空の 0700 の rootfs を受け取る。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_unpack_runs_between_register_and_state_create() {
         let b = config_bundle("unpack-order");
@@ -1294,6 +1247,7 @@ mod tests {
     }
 
     /// OCI-7: rootfs が既に存在する場合は展開せず AlreadyExists。既存の中身は残り、参照は外れる。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_unpack_refuses_existing_rootfs() {
         let b = config_bundle("unpack-exists");
@@ -1308,6 +1262,7 @@ mod tests {
     }
 
     /// OCI-7: 不正な config（process なし）では展開せず rootfs も作らない。参照は外れる。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_unpack_skipped_for_invalid_config() {
         let b = Bundle::new("unpack-badcfg");
@@ -1323,6 +1278,7 @@ mod tests {
     }
 
     /// OCI-7: 同じ ID の状態が既にあれば展開せず AlreadyExists。参照は外れる。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_unpack_skipped_when_state_exists() {
         let b = config_bundle("unpack-stateexists");
@@ -1349,7 +1305,8 @@ mod tests {
         let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
         let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
         assert_eq!(err.code(), ErrorCode::AlreadyExists);
-        assert!(!b.dir.join("rootfs").exists());
+        // 公開済みの rootfs は使用中かを確定できないため残し、参照だけ外す。
+        assert!(b.dir.join("rootfs").is_dir());
         assert_eq!(
             log_of(&log),
             vec!["refs.register", "unpack", "store.create", "refs.release"]
@@ -1368,10 +1325,12 @@ mod tests {
         );
         let unpacker = LoggingUnpacker::new(&log, UnpackMode::ReadOnlyDir);
         run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
-        assert!(!b.dir.join("rootfs").exists());
+        // 公開後の失敗では使用中かを確定できないため残す（読み取り専用ディレクトリの削除は image_rootfs の単体試験）。
+        assert!(b.dir.join("rootfs").is_dir());
     }
 
     /// OCI-7: 曖昧な状態作成の失敗（Internal）では rootfs も参照も残す。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_unpack_keeps_rootfs_and_ref_on_ambiguous_state_error() {
         let b = config_bundle("unpack-ambiguous");
@@ -1391,6 +1350,7 @@ mod tests {
     }
 
     /// OCI-7: `root.path` が bundle 自身（`.`）なら展開せず拒否する。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_unpack_rejects_bundle_itself_as_rootfs() {
         let b = Bundle::new("unpack-dot");
@@ -1405,6 +1365,7 @@ mod tests {
     }
 
     /// SEC-1: `root.path` の中間要素が symlink なら拒否し、bundle 外に何も作らない。
+    #[cfg(target_os = "linux")]
     #[cfg(unix)]
     #[test]
     fn oci7_unpack_rejects_symlink_in_root_path() {
@@ -1452,7 +1413,20 @@ mod tests {
         assert!(b.dir.join("rootfs").join("others").exists());
     }
 
+    /// OCI-7・SEC-1: Linux 以外は展開先を固定できないため、作成も展開もせず Unimplemented で拒否する。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn sec1_unpack_is_refused_without_creating_rootfs_on_non_linux() {
+        let b = config_bundle("unpack-non-linux");
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
+        let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        assert!(!b.dir.join("rootfs").exists());
+    }
+
     /// OCI-7: 同じ bundle を指す別 ID の状態があるとき、公開後の失敗でも rootfs を消さない。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_unpack_keeps_rootfs_used_by_other_id_with_same_bundle() {
         let b = config_bundle("unpack-other-id");
@@ -1473,7 +1447,7 @@ mod tests {
         assert!(b.dir.join("rootfs").is_dir());
     }
 
-    /// OCI-7: 展開の間に `root.path` が書き換わったら拒否し、作った rootfs を消して参照を外す。
+    /// OCI-7: 展開の間に `root.path` が書き換わったら拒否し、参照を外し rootfs は残す。
     // Linux 以外は rootfs の同一性を保証できず後始末を拒否する（image_rootfs.rs）ため Linux 限定。
     #[cfg(target_os = "linux")]
     #[test]
@@ -1487,7 +1461,8 @@ mod tests {
         unpacker.rewrite_config = Some((b.dir.clone(), cfg));
         let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
-        assert!(!b.dir.join("rootfs").exists());
+        // 公開済みの rootfs は使用中かを確定できないため残す。
+        assert!(b.dir.join("rootfs").is_dir());
         assert!(b.dir.join("other").is_dir());
         assert_eq!(
             log_of(&log),
@@ -1496,6 +1471,7 @@ mod tests {
     }
 
     /// OCI-7: 展開の間に同じ ID・bundle の通常の create が成功していたら、使用中の rootfs は消さない。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_unpack_keeps_rootfs_used_by_concurrent_create() {
         let b = config_bundle("unpack-concurrent");
@@ -1512,6 +1488,7 @@ mod tests {
     }
 
     /// OCI-7: `root.path` の等価な書き方（`./rootfs`・`rootfs/`・`a//b`）でも、展開した木を消さず成功する。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_unpack_accepts_equivalent_root_path_spellings() {
         for (i, spelling) in ["./rootfs", "rootfs/", "a//b", "./a/./b/"]

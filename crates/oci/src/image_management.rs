@@ -18,12 +18,12 @@
 //! - ディスクへの永続化（#851）。再起動時の照合 API は `reconcile` で実装済み（#854）。本番 probe と起動時の配線は未実装（#2315）
 //! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force` と実削除（untag・`remove_manifest`・非共有 blob の削除。TASK-183.6・#481）も
 //!   `remove` で実装済み（永続化・fsync・削除途中のクラッシュの再試行は #851、CLI 配線は未実装）
-//! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（CLI 経路と永続化は未実装）
+//! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（永続化は未実装。CLI 配線は #2316）
 //! - `image prune` 本体は `prune` モジュールで実装済み（#476）。`rm`・`prune` の CLI 配線（#476・#480・#481）。`image ls`/`system df` の集計 API は
 //!   `usage`（#478・TASK-183.3）で実装済み（staging の容量・コンテナ容量の受け口・展開後サイズの二段階 API は #2222。CLI 経路は未実装）
 //! - pull のリース登録・ステージング書き込み（#474・TASK-183.9）と、公開・失敗時のロールバック
 //!   （#475・TASK-183.10）は `pull` で実装済み（cri からの配線は未実装）
-//! - テーブル全体の件数上限（永続化の読み込み側で判断する）
+//! - テーブル全体の件数上限: タグは `MAX_TAG_REFS` で書き込み側が検査済み（#2316）。manifest・リースは永続化と合わせて判断する
 //!
 //! core の `ContainerId` との対応づけ（#853・TASK-183.8.1）: core は oci に依存せず、core 側の
 //! `ContainerImageRefs`（`oci_runtime`）を、oci と core の両方に依存するアダプタが
@@ -66,7 +66,7 @@ pub use pull::{
 };
 
 mod tag;
-pub use tag::{ImageTagChange, ImageTagOutcome, ImageTagSource};
+pub use tag::{ImageTagChange, ImageTagOutcome, ImageTagSource, MAX_TAG_REFS};
 
 mod store;
 pub use store::{
@@ -439,12 +439,16 @@ impl ReferenceTable {
     }
 
     /// タグ → manifest を登録する（既存タグは付け替え）。直前の付け先を返す。manifest 不在は `NotFound`。
+    ///
+    /// 新規キーでタグ件数が [`MAX_TAG_REFS`] に達していれば `ResourceExhausted`（テーブルは変えない）。
+    /// 既存キーの付け替え・再付与は上限に達していても通す。
     pub fn register_tag(
         &mut self,
         key: TagKey,
         manifest: &Digest,
     ) -> Result<Option<Digest>, OciError> {
         self.require_manifest(manifest)?;
+        self.ensure_tag_capacity([&key])?;
         Ok(self.tag_refs.insert(key, manifest.clone()))
     }
 

@@ -12,14 +12,24 @@
 //! 契約: 失敗（ソース不在・在庫に無い manifest）の経路ではテーブルを変えない。ロック待ちの期限切れは
 //! `Timeout`（REPAIR-5）、毒化したストアは `Internal`（fail-closed。#473）。
 //!
+//! 件数の上限: テーブル全体のタグ件数は [`MAX_TAG_REFS`] を超えない。検査は書き込み側
+//! （`ReferenceTable::register_tag`）で行い、新規キーだけを拒否する（`ResourceExhausted`）。
+//! 既存タグの付け替えと再付与は上限に達していても通す（#2316）。
+//!
 //! 未実装（実装済みを装わない。REPAIR-3）: 永続化（#853・#854・#851）のため、タグ登録は
-//! プロセス内メモリ上だけで効く。CLI 経路（`image tag` サブコマンドの配線）も未実装。
-//! タグ件数の上限は永続化の読み込み側で判断する（本モジュールでは設けない）。
+//! プロセス内メモリ上だけで効く。CLI 配線は `fandhe-container-cli` の `image tag`（#2316）。
 
 use super::{ImageStore, ReferenceTable, TagKey};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{OciOpKind, OciOpRecorder, record_oci_op};
 use crate::reference::Digest;
+
+/// テーブル全体のタグ件数の上限（#2316・OCI-7）。
+///
+/// コンテナ参照の上限 `MAX_CONTAINER_REFS`（#2352）と同じ値に揃えた。`TagKey` 1 件は検証済みの
+/// host・repository・tag の文字列で 1 KiB 未満のため、最大でも十数 MiB に収まる。永続化（#851）の
+/// 読み込み側も同じ定数で検査する前提。
+pub const MAX_TAG_REFS: usize = 16_384;
 
 /// `image tag` のソース（検証済みの newtype だけで表す）。`ImageRmTarget` と同じ形の別の型。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,6 +69,27 @@ pub struct ImageTagOutcome {
 }
 
 impl ReferenceTable {
+    /// `keys` のうちテーブルに未登録のもの（重複は 1 件と数える）を足しても [`MAX_TAG_REFS`] を
+    /// 超えないことを確かめる。超えるなら `ResourceExhausted`（テーブルは変えない）。
+    ///
+    /// `register_tag`（1 件）と pull の公開（複数件。途中失敗で半端なタグを残さない事前検査）が共用する。
+    pub(super) fn ensure_tag_capacity<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a TagKey>,
+    ) -> Result<(), OciError> {
+        let fresh: std::collections::BTreeSet<&TagKey> = keys
+            .into_iter()
+            .filter(|k| !self.tag_refs.contains_key(*k))
+            .collect();
+        if self.tag_refs.len().saturating_add(fresh.len()) > MAX_TAG_REFS {
+            return Err(OciError::new(
+                OciErrorCode::ResourceExhausted,
+                "too many image tags",
+            ));
+        }
+        Ok(())
+    }
+
     /// ソースを解決して `target` を付ける。呼び出し側が排他区間（ガード）を保持している前提。
     ///
     /// 解決と存在確認は書き込みの前に済ませるため、エラー時にテーブルは変わない。
@@ -174,6 +205,48 @@ mod tests {
 
     fn code<T: std::fmt::Debug>(r: Result<T, OciError>) -> OciErrorCode {
         r.unwrap_err().code()
+    }
+
+    fn full_table() -> ReferenceTable {
+        let mut t = table();
+        for i in 0..MAX_TAG_REFS {
+            t.register_tag(tk(&format!("f{i}")), &d(0xa0)).unwrap();
+        }
+        t
+    }
+
+    /// OCI-7: 上限に達していると新規キーは ResourceExhausted で、テーブルは変わらない（#2316）。
+    #[test]
+    fn oci7_register_tag_at_limit_rejects_new_key_and_keeps_table() {
+        let mut t = full_table();
+        let before = t.clone();
+        let r = t.register_tag(tk("new"), &d(0xa0));
+        assert_eq!(code(r), OciErrorCode::ResourceExhausted);
+        assert_eq!(t.tags().count(), MAX_TAG_REFS);
+        assert_eq!(t, before);
+    }
+
+    /// OCI-7: 上限に達していても既存キーの付け替え・再付与は成功する（#2316）。
+    #[test]
+    fn oci7_register_tag_at_limit_allows_retag_and_same() {
+        let mut t = full_table();
+        assert_eq!(t.register_tag(tk("f0"), &d(0xb0)).unwrap(), Some(d(0xa0)));
+        assert_eq!(t.register_tag(tk("f0"), &d(0xb0)).unwrap(), Some(d(0xb0)));
+        assert_eq!(t.tags().count(), MAX_TAG_REFS);
+    }
+
+    /// OCI-7: ImageStore::tag_image 経由でも上限が効き、付け替えは通る（#2316）。
+    #[test]
+    fn oci7_tag_image_at_limit_is_resource_exhausted() {
+        let root = temp_root("limit");
+        let store = ImageStore::with_table(&root, full_table()).expect("store");
+        let r = store.tag_image(&ImageTagSource::Manifest(d(0xa0)), tk("new"));
+        assert_eq!(code(r), OciErrorCode::ResourceExhausted);
+        let o = store
+            .tag_image(&ImageTagSource::Manifest(d(0xb0)), tk("f1"))
+            .unwrap();
+        assert_eq!(o.change, ImageTagChange::Moved { from: d(0xa0) });
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// OCI-7: 在庫にある manifest へ digest で付与すると Added になる。

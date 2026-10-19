@@ -3,6 +3,8 @@
 //! # 役割と呼び出し文脈
 //!
 //! 対象の定義は [`crate::path_masks`]（`/proc` 配下の 10 件。`/proc/kcore`・`/proc/keys`・`/proc/sched_debug` 等）。
+//! `mounts[]` の sysfs を供給した構成（`exec::mount_sysfs` の成功の証跡 [`SysfsReport`] を受けたとき）だけ、`/sys` 配下の
+//! 3 種（`/sys/devices/virtual/powercap`・`/sys/firmware`・`/sys/devices/system/cpu/cpuN/thermal_throttle`。#2014）も足す。
 //! 本モジュールは適用側で、`process::run_pre_pivot` の `masked_paths` 段から呼ばれる。OCI の `linux.maskedPaths`
 //! 相当を、`config.json` に関係なく常に適用する固定集合にする（オーナー判断 2026-10-12・#1315）。
 //!
@@ -59,9 +61,20 @@
 //!
 //! 覆いは VFS のマウントで、Landlock のルールを足さない（`exec::path_masks` と同じ）。
 //!
+//! # `/sys` 配下（#2014）
+//!
+//! - **証跡で絞る**: sysfs を供給しない構成では `/sys` は image の内容を読み取り専用にしただけのディレクトリで、
+//!   そこへ覆いを足さない（image の `possible` を解釈して最大 8192 個の tmpfs を載せさせる入口にもなりうるため）
+//! - **`cpuN` の列挙**: 新しい mount top の fd から `sys/devices/system/cpu/possible` を `O_NOFOLLOW|O_NONBLOCK` で 1 要素ずつ
+//!   辿って開き、通常ファイルであることを `fstat` で確かめ、4096 バイトまでを範囲リストとして解釈する
+//!   ([`path_masks::parse_possible_cpus`]。上限 8192 件)。途中の要素や `possible` が無ければ 0 件。不正（書式違反・上限超え・
+//!   通常ファイルでない・長すぎる）なら fail-closed で `FailedPrecondition`
+//! - **存在しないものは飛ばす**: `possible` だが present でない CPU や `thermal_throttle` を持たない構成は `ENOENT` として
+//!   `skipped` に数える（moby の `os.Stat` で存在するものだけ足す挙動と同じ）
+//!
 //! # 未実装（REPAIR-3: 実装済みを装わない）
 //!
-//! - `/sys` 配下の項目（`/sys/firmware` 等）。`/sys` 配下の覆いは #2014 で扱う（sysfs の供給は #2020 で実装済み）
+//! - debugfs・tracefs・securityfs・bpf 等の擬似 FS の覆い（moby の一覧に無い。範囲はオーナー判断待ち。`path_masks` 参照）
 //! - 記録に段のフィールドを足すこと: 経路検査の拒否は汎用理由で記録され、記録の理由だけでは段が分からない
 //!   （段は返る `ExecError::stage` に載る）。段のフィールドは #653（TASK-98.2）の共通ログ型の範囲
 //!
@@ -80,6 +93,7 @@
 //! 結合試験 `tests/masked_paths.rs`（`-- --ignored`）で確認する。
 
 use std::ffi::{CString, OsStr};
+use std::io::Read as _;
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 use std::path::Path;
 
@@ -88,6 +102,7 @@ use crate::sys::{self, SysError};
 use crate::traits::types::ErrorCode;
 
 use super::devices::NullNodeSource;
+use super::sysfs::SysfsReport;
 use super::tmpfs::{MountObservation, check_new_tmpfs, root_display};
 use super::{
     ExecError, IsolationStage, MountIsolation, PreparedRootfs, ViolationReason, fd_mount_id,
@@ -134,34 +149,44 @@ enum Outcome {
 /// 固定集合を `prepared` の mount top 配下に適用する。
 ///
 /// [`MountIsolation`] の証跡が現在の状態と一致しなければ副作用なしに拒否する（fail-closed）。契約はモジュール doc。
+///
+/// `sysfs` は `mount_sysfs` が成功した証跡で、`Some` のときだけ `/sys` 配下の 3 種も覆う（#2014）。
 pub(super) fn apply_masked_paths(
     isolation: &MountIsolation,
     prepared: &PreparedRootfs,
     null: &NullNodeSource,
+    sysfs: Option<&SysfsReport>,
     extra: &[ProtectedPath],
 ) -> Result<MaskedPathsReport, ExecError> {
     isolation.verify_caller(STAGE)?;
-    apply_at_with(prepared.new_root(), null, extra)
+    apply_at_with(prepared.new_root(), null, sysfs, extra)
 }
 
 /// 固定集合だけを適用する（単体テスト用の短縮形）。
 #[cfg(test)]
 fn apply_at(root: BorrowedFd<'_>, null: &NullNodeSource) -> Result<MaskedPathsReport, ExecError> {
-    apply_at_with(root, null, &[])
+    apply_at_with(root, null, None, &[])
 }
 
 /// [`apply_masked_paths`] の証跡検証後の本体（単体テストは偽 rootfs の fd を渡す）。
 fn apply_at_with(
     root: BorrowedFd<'_>,
     null: &NullNodeSource,
+    sysfs: Option<&SysfsReport>,
     extra: &[ProtectedPath],
 ) -> Result<MaskedPathsReport, ExecError> {
     let rootfs = root_display(root);
+    // sysfs を供給したときだけ `possible` を読む（供給しない構成では image の内容を解釈しない）。
+    let sys_cpus = match sysfs {
+        Some(_) => Some(read_possible_cpus(root, &rootfs)?),
+        None => None,
+    };
     let mut report = MaskedPathsReport {
         applied: 0,
         skipped: 0,
     };
-    for path in path_masks::masked_targets(extra) {
+    for path in path_masks::masked_targets(sys_cpus.as_deref(), extra) {
+        let path = path.as_ref();
         let names = path_masks::components(path).ok_or_else(|| {
             ExecError::new(
                 ErrorCode::Internal,
@@ -175,6 +200,59 @@ fn apply_at_with(
         }
     }
     Ok(report)
+}
+
+/// 新しい mount top の `sys/devices/system/cpu/possible` を fd 起点で読み、CPU 番号の列にする（#2014）。
+///
+/// 途中の要素や `possible` が無ければ空（存在しないものは飛ばす契約）。symlink・非ディレクトリ・通常ファイルでない・
+/// 4096 バイト超・UTF-8 でない・範囲リストとして不正（上限 [`path_masks::MAX_SYSFS_CPUS`] 超えを含む）は fail-closed で拒否する。
+/// `O_NONBLOCK` で開くため、FIFO への差し替えでも止まらない（REPAIR-5）。
+fn read_possible_cpus(root: BorrowedFd<'_>, rootfs: &Path) -> Result<Vec<u32>, ExecError> {
+    const DIRS: [&str; 4] = ["sys", "devices", "system", "cpu"];
+    let rejected = |what: &str| {
+        ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            format!("/sys/devices/system/cpu/possible is not usable: {what}"),
+        )
+    };
+    let mut cur: Option<OwnedFd> = None;
+    for (i, name) in DIRS.iter().enumerate() {
+        let c = c_name(name, "/sys/devices/system/cpu/possible")?;
+        let parent = cur.as_ref().map_or(root, |f| f.as_fd());
+        match sys::open_dir_path_nofollow(Some(parent), &c) {
+            Ok(fd) => cur = Some(fd),
+            Err(SysError::Os(sys::ENOENT)) => return Ok(Vec::new()),
+            Err(e) => {
+                let names: Vec<&OsStr> = DIRS.iter().take(i + 1).map(OsStr::new).collect();
+                return Err(open_error(e, true, rootfs, &names).at_stage(STAGE));
+            }
+        }
+    }
+    let parent = cur.as_ref().map_or(root, |f| f.as_fd());
+    let c = c_name("possible", "/sys/devices/system/cpu/possible")?;
+    let fd = match sys::open_read_nonblock_at(parent, &c) {
+        Ok(fd) => fd,
+        Err(SysError::Os(sys::ENOENT)) => return Ok(Vec::new()),
+        Err(e) => return Err(ExecError::from_sys(e, STAGE, "openat(possible)")),
+    };
+    let file = std::fs::File::from(fd);
+    let meta = file
+        .metadata()
+        .map_err(|e| ExecError::from_io(&e, STAGE, "fstat(possible)"))?;
+    if !meta.file_type().is_file() {
+        return Err(rejected("not a regular file"));
+    }
+    let mut buf = Vec::new();
+    file.take(path_masks::MAX_POSSIBLE_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| ExecError::from_io(&e, STAGE, "read(possible)"))?;
+    if buf.len() > path_masks::MAX_POSSIBLE_BYTES {
+        return Err(rejected("too long"));
+    }
+    let text = std::str::from_utf8(&buf).map_err(|_| rejected("not UTF-8"))?;
+    path_masks::parse_possible_cpus(text, path_masks::MAX_SYSFS_CPUS)
+        .map_err(|_| rejected("malformed or too many CPUs"))
 }
 
 /// 対象 1 件。`names` は `path` の要素列。
@@ -843,7 +921,7 @@ mod tests {
         CLONE_FAIL.with(|f| f.set(Some(SysError::Os(sys::EINVAL))));
         let extra = [ProtectedPath::parse("/data/x", 4096).expect("valid")];
         let fd = tmp.fd();
-        let err = apply_at_with(fd.as_fd(), &null_source(), &extra).expect_err("clone");
+        let err = apply_at_with(fd.as_fd(), &null_source(), None, &extra).expect_err("clone");
         assert!(
             err.message.starts_with("open_tree(/data/x) failed"),
             "{}",
@@ -880,5 +958,136 @@ mod tests {
         assert!(mount_has_options("x y\n", 41, &req).is_err());
         let dup = format!("{info}41 29 0:36 / /x ro - tmpfs tmpfs ro\n");
         assert!(mount_has_options(&dup, 41, &req).is_err());
+    }
+
+    fn sysfs_proof() -> SysfsReport {
+        SysfsReport {
+            source: super::super::sysfs::SysfsSource::Fresh,
+        }
+    }
+
+    /// 偽 rootfs に `sys/firmware/`・`possible`・`cpu0`/`cpu2` の `thermal_throttle/` を置く。
+    fn sys_rootfs(tag: &str, possible: &str) -> Tmp {
+        let tmp = Tmp::new(tag);
+        std::fs::create_dir_all(tmp.0.join("sys/firmware")).expect("mkdir");
+        let cpu = tmp.0.join("sys/devices/system/cpu");
+        for n in [0, 2] {
+            std::fs::create_dir_all(cpu.join(format!("cpu{n}/thermal_throttle"))).expect("mkdir");
+        }
+        std::fs::write(cpu.join("possible"), possible).expect("possible");
+        tmp
+    }
+
+    /// SEC-2（#2014）: sysfs の証跡があれば firmware と存在する thermal_throttle だけを覆い、無いものは飛ばす。
+    #[test]
+    fn sec2_2014_sysfs_masks_firmware_and_existing_thermal_throttle() {
+        reset();
+        let _shared = override_shared(false);
+        let tmp = sys_rootfs("mask-sys", "0-3\n");
+        let fd = tmp.fd();
+        let proof = sysfs_proof();
+        let report = apply_at_with(fd.as_fd(), &null_source(), Some(&proof), &[]).expect("apply");
+        // /proc は全て不在（10 skipped）。/sys: firmware・cpu0・cpu2 が applied、powercap・cpu1・cpu3 が skipped。
+        assert_eq!((report.applied, report.skipped), (3, 13));
+        let calls = take_calls();
+        let got: Vec<String> = calls.iter().map(|c| c.0.clone()).collect();
+        let want: Vec<String> = [
+            "sys/firmware",
+            "sys/devices/system/cpu/cpu0/thermal_throttle",
+            "sys/devices/system/cpu/cpu2/thermal_throttle",
+        ]
+        .iter()
+        .map(|r| tmp.0.join(r).to_string_lossy().into_owned())
+        .collect();
+        assert_eq!(got, want);
+    }
+
+    /// SEC-2（#2014）: 証跡が無ければ `/sys` 配下を 1 件も試みない（`possible` も解釈しない）。
+    #[test]
+    fn sec2_2014_without_sysfs_proof_sys_is_untouched() {
+        reset();
+        let _shared = override_shared(false);
+        let tmp = sys_rootfs("mask-sys-none", "garbage");
+        let fd = tmp.fd();
+        let report = apply_at_with(fd.as_fd(), &null_source(), None, &[]).expect("apply");
+        assert_eq!((report.applied, report.skipped), (0, 10));
+        assert_eq!(take_calls().len(), 0);
+    }
+
+    /// SEC-2（#2014）: `possible` が無ければ thermal_throttle は 0 件で成功する。
+    #[test]
+    fn sec2_2014_missing_possible_yields_no_thermal_targets() {
+        reset();
+        let _shared = override_shared(false);
+        let tmp = Tmp::new("mask-sys-nopossible");
+        std::fs::create_dir_all(tmp.0.join("sys/firmware")).expect("mkdir");
+        let fd = tmp.fd();
+        let proof = sysfs_proof();
+        let report = apply_at_with(fd.as_fd(), &null_source(), Some(&proof), &[]).expect("apply");
+        assert_eq!((report.applied, report.skipped), (1, 11));
+    }
+
+    /// SEC-2（#2014）: 不正・長すぎる・通常ファイルでない `possible` は fail-closed で、何も覆わない。
+    #[test]
+    fn sec2_2014_bad_possible_is_fail_closed() {
+        let long = "0,".repeat(3000);
+        for (case, content) in [
+            ("malformed", "0-x"),
+            ("toomany", "0-8192"),
+            ("toolong", long.as_str()),
+        ] {
+            reset();
+            let _shared = override_shared(false);
+            let tmp = sys_rootfs(&format!("mask-sys-bad-{case}"), content);
+            let fd = tmp.fd();
+            let proof = sysfs_proof();
+            let err = apply_at_with(fd.as_fd(), &null_source(), Some(&proof), &[]).expect_err(case);
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{case}");
+            assert_eq!(err.stage, IsolationStage::MountMaskedPaths, "{case}");
+            assert_eq!(take_calls().len(), 0, "{case}");
+        }
+        // ディレクトリの `possible`。
+        reset();
+        let _shared = override_shared(false);
+        let tmp = Tmp::new("mask-sys-dir-possible");
+        std::fs::create_dir_all(tmp.0.join("sys/devices/system/cpu/possible")).expect("mkdir");
+        let fd = tmp.fd();
+        let proof = sysfs_proof();
+        let err = apply_at_with(fd.as_fd(), &null_source(), Some(&proof), &[]).expect_err("dir");
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(take_calls().len(), 0);
+    }
+
+    /// SEC-2（#2014）: `possible` が symlink なら辿らず拒否する。
+    #[test]
+    fn sec2_2014_possible_symlink_is_rejected() {
+        reset();
+        let _shared = override_shared(false);
+        let tmp = Tmp::new("mask-sys-possible-link");
+        let cpu = tmp.0.join("sys/devices/system/cpu");
+        std::fs::create_dir_all(&cpu).expect("mkdir");
+        symlink("/proc/cpuinfo", cpu.join("possible")).expect("symlink");
+        let fd = tmp.fd();
+        let proof = sysfs_proof();
+        let err = apply_at_with(fd.as_fd(), &null_source(), Some(&proof), &[]).expect_err("link");
+        assert_eq!(err.stage, IsolationStage::MountMaskedPaths);
+        assert_eq!(take_calls().len(), 0);
+    }
+
+    /// SEC-2（#2014）: `sys/firmware` が symlink なら既存の経路検査どおり違反つきで拒否する。
+    #[test]
+    fn sec2_2014_firmware_symlink_is_rejected() {
+        reset();
+        let _shared = override_shared(false);
+        let tmp = Tmp::new("mask-sys-fw-link");
+        std::fs::create_dir_all(tmp.0.join("sys")).expect("mkdir");
+        symlink("/etc", tmp.0.join("sys/firmware")).expect("symlink");
+        let fd = tmp.fd();
+        let proof = sysfs_proof();
+        let err = apply_at_with(fd.as_fd(), &null_source(), Some(&proof), &[]).expect_err("link");
+        assert_eq!(
+            err.violation.as_ref().map(|v| v.reason),
+            Some(ViolationReason::PathSymlinkOrNotDirectory)
+        );
     }
 }

@@ -58,8 +58,9 @@
 //!
 //! # 未実装（REPAIR-3: 実装済みを装わない）
 //!
-//! - `/sys` 配下の個別項目（`/sys/firmware` 等。#2014）。`/sys` は mount top だけを読み取り専用にする。sysfs の供給は
-//!   `exec::mount_sysfs`（#2020。`mounts[]` に sysfs がある起動のみ。本段より前に載せる）
+//! - 読み取り専用化の側の `/sys` 配下の個別項目（moby の `ReadonlyPaths` に無い）。`/sys` は mount top だけを読み取り専用にする。
+//!   sysfs の供給は `exec::mount_sysfs`（#2020。`mounts[]` に sysfs がある起動のみ。本段より前に載せる）。`/sys/firmware` 等の
+//!   覆いは後段の `masked_paths` が担う（`exec::masked_paths`。#2014）
 //! - `/proc` の供給（procfs マウント）。現状は本段より後に procfs をマウントする実装がない。将来 OCI `mounts[]`
 //!   等で procfs を `/proc` に載せる場合は、`/sys` と同様に本段より前に載せること（後から載せると読み取り専用の bind が隠れる）
 //! - 記録に段のフィールドを足すこと: 経路検査の拒否は汎用理由（`path_symlink_or_not_directory` 等）で記録され、

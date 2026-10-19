@@ -53,6 +53,7 @@ use crate::run::{
     MonitorConfig, MonitorEvent, MonitorObserver, MonitorOperation, MonitorOutcome, StopToken,
     ensure_owner, is_running_with_pid, monitor_with_observer, precondition, write_with_retry_when,
 };
+use crate::seccomp_notify::SeccompNotifyHub;
 use crate::state::SupervisedState;
 
 /// 終了の分類結果（SUP-3・TASK-159.1）。
@@ -1211,6 +1212,8 @@ pub struct LauncherRelauncher {
     launcher: Arc<dyn ProcessLauncher>,
     spec: LaunchSpec,
     capture: Option<Arc<CaptureHub>>,
+    /// seccomp の通知への応答ハブ（`with_seccomp`。再 launch のたびに listener を差し替える。SEC-4・#2025）。
+    seccomp: Option<Arc<SeccompNotifyHub>>,
     /// 捕捉開始に失敗し terminate も失敗したプロセスのハンドル（[`Relauncher::take_stranded`] が引き渡す）。
     stranded: Mutex<Vec<LateOrphan>>,
 }
@@ -1222,8 +1225,21 @@ impl LauncherRelauncher {
             launcher,
             spec,
             capture: None,
+            seccomp: None,
             stranded: Mutex::new(Vec::new()),
         }
+    }
+
+    /// 再 launch したプロセスの seccomp の listener を `hub` へ渡す（SEC-4・REPAIR-5・#2025）。
+    ///
+    /// 再 launch の直前に [`SeccompNotifyHub::quiesce`] でスレッドを 0 本にし（core の launch は `Threads: 1` を要する）、
+    /// 直後に新プロセスの listener を取り出して `attach` する。受け取れない・スレッドを作れないときは新プロセスを
+    /// terminate して `Err`（応答者のいない USER_NOTIF は拒否対象の syscall を止めるため動かさない。fail-closed）。
+    /// 注意: 本番 launcher の再 launch が成り立つかは #2043 で、差し替えは偽の launcher でだけ試している。
+    #[must_use]
+    pub fn with_seccomp(mut self, hub: Arc<SeccompNotifyHub>) -> Self {
+        self.seccomp = Some(hub);
+        self
     }
 
     /// 再 launch したプロセスの出力を `hub` へ渡す。
@@ -1240,7 +1256,32 @@ impl Relauncher for LauncherRelauncher {
             // 旧プロセスは回収済み。読み取りスレッドを残したまま fork しない（SUP-7）。
             hub.quiesce();
         }
+        if let Some(hub) = &self.seccomp {
+            hub.quiesce();
+        }
         let process = self.launcher.launch(&self.spec, timeout)?;
+        #[cfg(target_os = "linux")]
+        if let Some(hub) = &self.seccomp {
+            let attached = match process.take_seccomp_listener() {
+                Some(listener) => hub.attach(listener),
+                None => Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "the seccomp listener was not delivered",
+                )),
+            };
+            if let Err(e) = attached {
+                return match process.terminate(timeout) {
+                    Ok(()) => Err(e),
+                    Err(t) => {
+                        self.stranded
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push((process, t.clone()));
+                        Err(t)
+                    }
+                };
+            }
+        }
         // 捕捉ハブが無いときは読み取り側を取り出さない（取り出して捨てるとコンテナが SIGPIPE を受ける）。
         if let Some(hub) = &self.capture
             && let Some(output) = process.take_output()

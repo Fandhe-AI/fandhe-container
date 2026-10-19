@@ -204,6 +204,8 @@ pub struct ProductionLauncherBuilder {
     subordinate_ids: Option<SubordinateIdSource>,
     #[cfg(target_os = "linux")]
     applied_resources: Option<LinuxResourceLimits>,
+    #[cfg(target_os = "linux")]
+    seccomp_delivery: crate::seccomp::ErrnoDelivery,
 }
 
 impl std::fmt::Debug for ProductionLauncherBuilder {
@@ -261,6 +263,17 @@ impl ProductionLauncherBuilder {
         self
     }
 
+    /// ERRNO 側の拒否の届け方(SEC-4・#2025)。既定は [`crate::seccomp::ErrnoDelivery::Errno`](通知なし。listener を
+    /// 受け取っても応答者がいなくてよい)。`UserNotif` は **launch で得た listener に応答する者がいる呼び出し元だけ**が
+    /// 指定する(supervisor の start 経路が `LaunchedProcess::take_seccomp_listener` で受け取って応答する)。
+    /// 応答者がいないまま指定すると、拒否対象の syscall が listener を閉じるまで止まる(閉じれば `ENOSYS`)。
+    /// 既存の exec 経路(`exec/reapply.rs`)と送り手の無い経路は常に ERRNO のまま(SUP-6 は #2385)。
+    #[must_use]
+    pub fn seccomp_errno_delivery(mut self, delivery: crate::seccomp::ErrnoDelivery) -> Self {
+        self.seccomp_delivery = delivery;
+        self
+    }
+
     /// 起動のたびに cgroup 参加フックを作る源(`ContainerCgroup::join_hook` を呼ぶクロージャ等。CORE-3)。
     #[must_use]
     pub fn cgroup_join_source(
@@ -308,6 +321,7 @@ impl ProductionLauncherBuilder {
                 self.cgroup_join_source,
             );
             inner.applied_resources = self.applied_resources;
+            inner.seccomp_delivery = self.seccomp_delivery;
             Ok(ProductionLauncher { inner })
         }
         #[cfg(not(target_os = "linux"))]
@@ -742,6 +756,8 @@ struct Inner {
     cgroup_join_source: Option<JoinSource>,
     /// cgroup 連鎖で書いた `linux.resources`(`ProductionLauncherBuilder::applied_resource_limits`)。
     applied_resources: Option<LinuxResourceLimits>,
+    /// ERRNO 側の拒否の届け方(`ProductionLauncherBuilder::seccomp_errno_delivery`。既定 `Errno`。SEC-4・#2025)。
+    seccomp_delivery: crate::seccomp::ErrnoDelivery,
     /// ハンドルの回収通知（`ContainerChildProcess::with_reap_notice`）と共有するため `Arc`。
     ledger: Arc<Mutex<Ledger>>,
     /// `Handed` の世代の採番。
@@ -767,6 +783,7 @@ impl Inner {
             audit_sink,
             cgroup_join_source,
             applied_resources: None,
+            seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
             ledger: Arc::new(Mutex::new(Ledger::default())),
             next_generation: std::sync::atomic::AtomicU64::new(0),
             left_process: AtomicBool::new(false),
@@ -857,6 +874,7 @@ impl Inner {
         .map_err(|e| to_trait_error(&e))?;
         let (uid, gid) = spec.user();
         let mut stages = StagePipeline::new()
+            .with_seccomp_delivery(self.seccomp_delivery)
             .with_process_ids(uid, gid)
             .with_landlock(ruleset)
             .map_err(|e| to_trait_error(&e))?;

@@ -266,7 +266,7 @@ impl LaunchedProcess for ControlledProcess {
         self.inner.take_output()
     }
 
-    /// seccomp の listener を内側へ転送する(転送しないと、包み直した後は取り出せず #2025 の応答ループが
+    /// seccomp の listener を内側へ転送する(転送しないと、包み直した後は取り出せず #2025 の応答ハブが
     /// listener を得られない。`take_output` と同じ注意。SEC-4・#2024)。
     #[cfg(target_os = "linux")]
     fn take_seccomp_listener(&self) -> Option<fandhe_container_core::exec::SeccompListener> {

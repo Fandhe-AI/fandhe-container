@@ -28,8 +28,10 @@
 //! - TASK-41.2（#193。seccomp フックは `seccomp_hook` に実装済み。拒否報告 [`SeccompDenialReport`] から
 //!   レコードを 1 件組み立てて [`AuditSink`] へ渡す。ただし現行フィルタは禁止 syscall に `ERRNO(EPERM)` を返し
 //!   〔`unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS` で終了するが、終了するプロセス自身は記録を書けない〕
-//!   通知は発生しないため、ERRNO 側の本番の配送経路〔USER_NOTIF + supervisor listener〕は
-//!   **未実装**で、フックはまだ本番経路から呼ばれない。REPAIR-3。KILL 側の正の記録はカーネルの
+//!   通知は発生しない既定の launcher では、フックは呼ばれない。supervisor の start 経路は
+//!   `ProductionLauncherBuilder::seccomp_errno_delivery(UserNotif)` で ERRNO 側を USER_NOTIF にし、listener ループ
+//!   〔`fandhe-container-supervisor::seccomp_notify`。#2025〕が `record_seccomp_denial_for` で記録してから `-EPERM` で応答する。
+//!   exec 経路〔SUP-6〕の USER_NOTIF 化は #2385。KILL 側の正の記録はカーネルの
 //!   `AUDIT_SECCOMP`、親の回収点が出す `exit_signal` 層の補助記録は [`AuditEvent::ExitSignal`]〔#2004〕）・41.4（#195 マウント検証/API。
 //!   `exec::IsolationViolation` からの写像もここで扱う）が、違反検知時に [`AuditRecord`] を組み立てる
 //! - ローカルファイルへの JSON Lines 書き込み（主経路）は `file_writer` で実装済み（TASK-41.5.1・#839）。
@@ -50,7 +52,7 @@
 //! syscall 番号はアーキテクチャ相対（x86_64 / aarch64 で異なる）ため、seccomp レコードは
 //! アーキ識別子（`AUDIT_ARCH_*`。[`AuditSyscallArch`]）を併せて持つ（#193 で決定）。
 //! コンテナ ID は #1618 で [`AuditRecord::container_id`] として追加済み（検証済みの `ContainerId` のみ。
-//! mount・exec_target・entrypoint の配送ヘルパが載せる。seccomp・landlock への配線は未実装。plugin_trust は
+//! mount・exec_target・entrypoint の配送ヘルパが載せる。seccomp は supervisor の listener ループが `record_seccomp_denial_for` で載せる〔#2025〕。landlock への配線は未実装。plugin_trust は
 //! 検証がコンテナを特定する前に走り特定のコンテナに属さないため、載せない〔#2013〕）。
 //! pid1 の PID は未検証の候補しか得られないため載せない。フィールドは非公開かつ `#[non_exhaustive]` なので、
 //! 後から追加しても破壊的変更にならない。
@@ -86,7 +88,9 @@ mod seccomp_hook;
 mod sink;
 
 pub use mount::{AuditDelivery, AuditedRejection, current_pid, record_mount_rejection};
-pub use seccomp_hook::{SeccompDenialReport, SeccompReportSource, record_seccomp_denial};
+pub use seccomp_hook::{
+    SeccompDenialReport, SeccompReportSource, record_seccomp_denial, record_seccomp_denial_for,
+};
 pub use sink::AuditSink;
 
 /// [`AuditPath`] が保持するバイト長の上限（Linux の `PATH_MAX` に合わせる。超過分は切り詰める）。

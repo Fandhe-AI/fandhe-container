@@ -8,9 +8,13 @@
 //! `exec/seccomp.rs` の `apply_default_seccomp_with_listener` が [`ListenerSender::hand_over`] を呼び、
 //! `exec/launch_intermediate.rs` の launch 経路（と exec の経路）が [`receive_listener`] で受け取る。
 //! 受け取った [`SeccompListener`] は `LaunchedProcess::take_seccomp_listener` で supervisor へ渡る。
-//! 通知を読んで応答するループ（PID 変換・`record_seccomp_denial`・`EPERM` 応答）は #2025 が担い、本モジュールは
-//! 取得と受け渡しだけを担う。**本番の filter は当面 ERRNO 版のまま**（`USER_NOTIF` を返さない）なので通知は生じず、
-//! listener を保持するだけでコンテナの挙動は変わらない（`audit-delivery.md` 9 章の案 2 の段階実装）。
+//! 通知を読んで応答するループ（PID 変換・`record_seccomp_denial_for`・`EPERM` 応答）は supervisor の
+//! `seccomp_notify`（#2025）が担い、本モジュールは取得・受け渡しと、通知の読み書きの安全 API（[`SeccompListener::wait`]・
+//! `receive`・`is_pending`・`deny_eperm`）を担う。**filter の既定は ERRNO 版**（`USER_NOTIF` を返さない）で、listener を
+//! 保持するだけならコンテナの挙動は変わらない。`ProductionLauncherBuilder::seccomp_errno_delivery(UserNotif)` で opt-in した
+//! launcher（supervisor の start 経路だけ）では ERRNO 側の 40 件が通知になり、応答者がいる前提になる
+//! （`audit-delivery.md` 9 章の案 3）。通知の引数・命令ポインタは公開せず、応答は `-EPERM` の 1 種類だけ（TOCTOU の余地を
+//! 型で無くす）。
 //!
 //! # ワイヤー形式（REPAIR-2。AF_UNIX `SOCK_SEQPACKET` の socketpair。パスを持たない）
 //!
@@ -69,19 +73,156 @@ const NOTIFY_FD_KIND: &str = "anon_inode:seccomp notify";
 pub struct SeccompListener(OwnedFd);
 
 impl SeccompListener {
-    /// 通知の読み取り（#2025）に使う借用。
+    /// fd の借用(種別の確認・試験用)。通知の読み書きは下の安全 API を使う。
     pub fn as_fd(&self) -> BorrowedFd<'_> {
         self.0.as_fd()
     }
+
+    /// 通知の到着か、filter の利用者の消滅(`Closed`)を最大 `timeout` 待つ。`EINTR` は `Idle`(呼び出し側のループが
+    /// 停止フラグを見て再試行する)。supervisor の listener スレッドが呼ぶ(SEC-4・#2025)。
+    pub fn wait(&self, timeout: Duration) -> Result<ListenerReadiness, ExecError> {
+        let ms = i32::try_from(timeout.as_millis().min(i32::MAX as u128)).unwrap_or(i32::MAX);
+        sys::seccomp_notify::poll_listener(self.0.as_fd(), ms)
+            .map(|p| match p {
+                sys::seccomp_notify::ListenerPoll::Idle => ListenerReadiness::Idle,
+                sys::seccomp_notify::ListenerPoll::Readable => ListenerReadiness::Readable,
+                sys::seccomp_notify::ListenerPoll::Closed => ListenerReadiness::Closed,
+            })
+            .map_err(|e| {
+                ExecError::from_sys(e, IsolationStage::Seccomp, "poll of the seccomp listener")
+            })
+    }
+
+    /// 通知を 1 件受信する。対象が既に消えていれば `None`。[`Self::wait`] が `Readable` を返した直後に呼ぶ。
+    ///
+    /// 返す [`SeccompNotification`] は記録に要る値(通知 ID・PID・syscall 番号・arch)だけを持つ。引数と命令ポインタは
+    /// 公開しない(ポインタ先を許可の判断に使うと TOCTOU になるため。応答は常に `-EPERM` の 1 種類)。
+    pub fn receive(&self) -> Result<Option<SeccompNotification>, ExecError> {
+        sys::seccomp_notify::notif_recv(self.0.as_fd())
+            .map(|n| {
+                n.map(|n| SeccompNotification {
+                    id: NotificationId(n.id),
+                    pid_in_listener_ns: n.pid,
+                    nr: n.nr,
+                    arch: n.arch,
+                })
+            })
+            .map_err(|e| {
+                ExecError::from_sys(
+                    e,
+                    IsolationStage::Seccomp,
+                    "receive of a seccomp notification",
+                )
+            })
+    }
+
+    /// 通知 `id` がまだ応答待ちか(`ID_VALID`)。`/proc` の読み取りの後に呼び、pid の再利用や対象の終了で別プロセスの
+    /// 情報を記録しないことを確かめる cookie 検証。
+    pub fn is_pending(&self, id: NotificationId) -> Result<bool, ExecError> {
+        sys::seccomp_notify::notif_id_valid(self.0.as_fd(), id.0).map_err(|e| {
+            ExecError::from_sys(
+                e,
+                IsolationStage::Seccomp,
+                "validate of a seccomp notification id",
+            )
+        })
+    }
+
+    /// 通知 `id` へ `-EPERM` で応答する(拒否を許可に覆す応答は持たない)。対象が既に消えていれば
+    /// [`DenyOutcome::TargetGone`]。
+    pub fn deny_eperm(&self, id: NotificationId) -> Result<DenyOutcome, ExecError> {
+        sys::seccomp_notify::notif_send_eperm(self.0.as_fd(), id.0)
+            .map(|sent| {
+                if sent {
+                    DenyOutcome::Sent
+                } else {
+                    DenyOutcome::TargetGone
+                }
+            })
+            .map_err(|e| {
+                ExecError::from_sys(
+                    e,
+                    IsolationStage::Seccomp,
+                    "response to a seccomp notification",
+                )
+            })
+    }
+}
+
+/// [`SeccompListener::wait`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ListenerReadiness {
+    /// 時間切れ(通知なし)。
+    Idle,
+    /// 未処理の通知がある。
+    Readable,
+    /// filter の利用者がいなくなった(コンテナの全プロセスが終了した)。以後通知は来ない。
+    Closed,
+}
+
+/// 通知の識別子(カーネルが採番する cookie)。値を作れるのは受信だけ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotificationId(u64);
+
+/// 受信した通知のうち記録に要る値。引数・命令ポインタは持たない(TOCTOU の余地を型で無くす。SEC-4・#2025)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeccompNotification {
+    id: NotificationId,
+    pid_in_listener_ns: u32,
+    nr: i32,
+    arch: u32,
+}
+
+impl SeccompNotification {
+    /// 応答に使う識別子。
+    pub fn id(&self) -> NotificationId {
+        self.id
+    }
+    /// 対象スレッドの TID。**listener(受信側)の PID namespace** の値で、記録にはそのまま使えない
+    /// (`AuditPid` は対象自身の PID namespace の値。`/proc/<値>/status` の `NSpid` で変換する)。
+    pub fn pid_in_listener_ns(&self) -> u32 {
+        self.pid_in_listener_ns
+    }
+    /// 拒否された syscall 番号(`seccomp_data.nr`)。
+    pub fn nr(&self) -> i32 {
+        self.nr
+    }
+    /// `seccomp_data.arch`(`AUDIT_ARCH_*`)。
+    pub fn arch(&self) -> u32 {
+        self.arch
+    }
+}
+
+/// [`SeccompListener::deny_eperm`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DenyOutcome {
+    /// `-EPERM` を返した。
+    Sent,
+    /// 応答の前に対象が消えていた(`ENOENT`)。
+    TargetGone,
 }
 
 /// 子（PID 1 / worker）側の送信口。socketpair の子の端を所有する。
 #[derive(Debug)]
-pub(crate) struct ListenerSender(OwnedFd);
+pub(crate) struct ListenerSender(OwnedFd, crate::seccomp::ErrnoDelivery);
 
 impl ListenerSender {
     pub(crate) fn new(child_end: OwnedFd) -> Self {
-        Self(child_end)
+        Self(child_end, crate::seccomp::ErrnoDelivery::Errno)
+    }
+
+    /// 載せる filter の ERRNO 側の届け方を設定する(既定 `Errno`。`UserNotif` は listener に応答する者がいる
+    /// 本番 launcher の opt-in だけ。SEC-4・#2025)。
+    pub(crate) fn with_delivery(mut self, delivery: crate::seccomp::ErrnoDelivery) -> Self {
+        self.1 = delivery;
+        self
+    }
+
+    /// 設定済みの届け方。
+    pub(crate) fn delivery(&self) -> crate::seccomp::ErrnoDelivery {
+        self.1
     }
 
     /// listener を得る前の適用失敗(`EBUSY` 等)を `E` + コード 1 バイト(`F` FailedPrecondition・`P` PermissionDenied・
@@ -296,6 +437,121 @@ pub(crate) fn listener_socketpair() -> Result<(OwnedFd, OwnedFd), ExecError> {
         super::process::keep_above_stdio(parent_end)?,
         super::process::keep_above_stdio(child_end)?,
     ))
+}
+
+/// USER_NOTIF 版の filter を載せた使い捨てスレッド(試験専用。SEC-4・#2025)。
+///
+/// 本番の filter 適用は PID 1 で単一スレッドを要するため、試験では適用を **専用スレッド 1 本** に閉じ込める
+/// (filter は呼び出しスレッドだけに効く)。`NEW_LISTENER` で得た listener は [`Self::take_listener`] で取り出し、
+/// 応答者(supervisor のループ)に渡す。`kcmp`(ERRNO 側の禁止 syscall)は [`Self::call_kcmp`] でこのスレッドから呼ぶ。
+/// 呼び出し元: `fandhe-container-supervisor` の結合試験 `seccomp_notify_audit`(`exec-test-support`)と本 crate の単体試験。
+#[cfg(any(test, feature = "exec-test-support"))]
+#[doc(hidden)]
+pub struct UserNotifProbe {
+    listener: Option<SeccompListener>,
+    tid: u32,
+    commands: Option<std::sync::mpsc::Sender<std::sync::mpsc::Sender<Option<i32>>>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(any(test, feature = "exec-test-support"))]
+impl UserNotifProbe {
+    /// listener を 1 回だけ取り出す。
+    pub fn take_listener(&mut self) -> Option<SeccompListener> {
+        self.listener.take()
+    }
+
+    /// プローブスレッドの TID(自身の PID namespace での値。記録の `pid` の期待値)。
+    pub fn tid(&self) -> u32 {
+        self.tid
+    }
+
+    /// プローブスレッドで `kcmp(自 pid, 自 pid, KCMP_VM)` を呼び、成功なら `None`、失敗ならその errno を返す。
+    /// 応答が無い間は呼び出しがブロックする(試験が期限で別途見張る)。
+    pub fn call_kcmp(&self) -> Option<i32> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sent = self.commands.as_ref().is_some_and(|c| c.send(tx).is_ok());
+        if !sent {
+            return Some(-1);
+        }
+        rx.recv().unwrap_or(Some(-1))
+    }
+}
+
+#[cfg(any(test, feature = "exec-test-support"))]
+impl Drop for UserNotifProbe {
+    fn drop(&mut self) {
+        self.commands.take();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// 呼び出しスレッドで `kcmp(自 pid, 自 pid, KCMP_VM)`(ERRNO 側の禁止 syscall)を発行し、成功なら `None`、失敗ならその errno を
+/// 返す(試験専用)。`unsafe` を持たない結合試験のコンテナ内プローブが、本番の filter の拒否を観測するために使う
+/// (`supervisor_bin_real` の PID 1 のプローブ。SEC-4・#2025)。
+#[cfg(any(test, feature = "exec-test-support"))]
+#[doc(hidden)]
+pub fn kcmp_self_errno_for_test() -> Option<i32> {
+    match sys::kcmp_self_probe() {
+        Ok(()) => None,
+        Err(sys::SysError::Os(n)) => Some(n),
+        Err(_) => Some(-1),
+    }
+}
+
+/// [`UserNotifProbe`] を作る(試験専用)。`NO_NEW_PRIVS` を立て、`UserNotif` 版の filter を `NEW_LISTENER` 付きで載せる。
+/// 祖先に listener がある環境などで失敗したら理由を `Err` で返す。
+#[cfg(any(test, feature = "exec-test-support"))]
+#[doc(hidden)]
+pub fn user_notif_probe_for_test() -> Result<UserNotifProbe, String> {
+    use std::sync::mpsc;
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(OwnedFd, u32), String>>();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<mpsc::Sender<Option<i32>>>();
+    let thread = std::thread::Builder::new()
+        .name("user-notif-probe".into())
+        .spawn(move || {
+            let setup = || -> Result<(OwnedFd, u32), String> {
+                sys::set_no_new_privs().map_err(|e| format!("no_new_privs: {e:?}"))?;
+                let program = crate::seccomp::build_filter_for_target_arch_with(
+                    crate::seccomp::ErrnoDelivery::UserNotif,
+                )
+                .map_err(|e| e.to_string())?;
+                let fd = sys::seccomp_notify::seccomp_set_filter_new_listener(&program)
+                    .map_err(|e| format!("new listener: {e:?}"))?;
+                // `/proc/thread-self` は "<tgid>/task/<tid>" へのリンク(gettid の syscall 番号を増やさない)。
+                let link = std::fs::read_link("/proc/thread-self").map_err(|e| e.to_string())?;
+                let tid = link
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .ok_or("unparsable /proc/thread-self")?;
+                Ok((fd, tid))
+            };
+            let ok = setup();
+            let failed = ok.is_err();
+            let _ = ready_tx.send(ok);
+            if failed {
+                return;
+            }
+            while let Ok(reply) = cmd_rx.recv() {
+                let r = match sys::kcmp_self_probe() {
+                    Ok(()) => None,
+                    Err(sys::SysError::Os(n)) => Some(n),
+                    Err(_) => Some(-1),
+                };
+                let _ = reply.send(r);
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    let (fd, tid) = ready_rx.recv().map_err(|e| e.to_string())??;
+    Ok(UserNotifProbe {
+        listener: Some(SeccompListener(fd)),
+        tid,
+        commands: Some(cmd_tx),
+        thread: Some(thread),
+    })
 }
 
 #[cfg(test)]
@@ -537,5 +793,78 @@ mod tests {
         assert!(listing.contains("-> pipe:["), "control: {listing}");
         assert!(!listing.contains("seccomp notify"), "{listing}");
         assert!(!listing.contains(&socket_name), "{listing}");
+    }
+
+    /// SEC-4(#2025): USER_NOTIF 版の filter では ERRNO 側の syscall が通知になり、応答者が `-EPERM` を返すと
+    /// 対象は `EPERM`(1) を観測する。通知の中身(nr・arch・TID)は具体値で、引数は公開されない。
+    #[test]
+    fn sec4_2025_user_notif_is_answered_with_eperm_and_reports_values() {
+        let mut probe = user_notif_probe_for_test().unwrap();
+        let listener = probe.take_listener().unwrap();
+        let tid = probe.tid();
+        let responder = std::thread::spawn(move || {
+            assert_eq!(
+                listener.wait(Duration::from_secs(10)).unwrap(),
+                ListenerReadiness::Readable
+            );
+            let n = listener.receive().unwrap().expect("a notification");
+            assert!(listener.is_pending(n.id()).unwrap());
+            // 受信側の PID namespace と対象は同じなので TID が一致する(テストは入れ子の namespace を使わない)。
+            assert_eq!(n.pid_in_listener_ns(), tid);
+            assert_eq!((n.nr(), n.arch()), (kcmp_nr(), audit_arch()));
+            assert_eq!(listener.deny_eperm(n.id()).unwrap(), DenyOutcome::Sent);
+            // 応答済みの ID は無効になり、二重応答は対象なし扱いにならず失敗する(EINPROGRESS)か TargetGone。
+            assert!(!listener.is_pending(n.id()).unwrap());
+            listener
+        });
+        assert_eq!(probe.call_kcmp(), Some(1));
+        let listener = responder.join().unwrap();
+        assert_eq!(
+            listener.wait(Duration::from_millis(50)).unwrap(),
+            ListenerReadiness::Idle
+        );
+        // 応答者(listener)が消えると、拒否は ENOSYS のまま保たれる(許可に倒れない)。
+        drop(listener);
+        assert_eq!(probe.call_kcmp(), Some(38));
+    }
+
+    fn kcmp_nr() -> i32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            312
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            272
+        }
+    }
+
+    fn audit_arch() -> u32 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            0xC000_003E
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            0xC000_00B7
+        }
+    }
+
+    /// SEC-4(#2025): 送り手の届け方の既定は ERRNO で、`UserNotif` は明示した場合だけ(誤って応答者のいない構成にしない)。
+    #[test]
+    fn sec4_2025_sender_delivery_defaults_to_errno() {
+        let (_p, c) = listener_socketpair().unwrap();
+        let sender = ListenerSender::new(c);
+        assert_eq!(sender.delivery(), crate::seccomp::ErrnoDelivery::Errno);
+        assert_eq!(
+            sender
+                .with_delivery(crate::seccomp::ErrnoDelivery::UserNotif)
+                .delivery(),
+            crate::seccomp::ErrnoDelivery::UserNotif
+        );
+        assert_eq!(
+            crate::exec::StagePipeline::new().seccomp_delivery(),
+            crate::seccomp::ErrnoDelivery::Errno
+        );
     }
 }

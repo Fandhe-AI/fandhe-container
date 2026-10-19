@@ -20,7 +20,9 @@
 //!
 //! `SO_PEERCRED` は socketpair では作成者（呼び出し元自身）を両端で返し検証の意味が無いため使わない。
 
-use super::{ArchSysNo, EINVAL, SockFprog, SysError, consts, fcntl, last_error, syscall};
+use super::{
+    ArchSysNo, EINVAL, PollFd, SockFprog, SysError, consts, fcntl, ioctl, last_error, poll, syscall,
+};
 use crate::seccomp::SeccompProgram;
 use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
 
@@ -421,6 +423,213 @@ pub(crate) fn recv_nowait(sock: BorrowedFd<'_>, buf: &mut [u8]) -> Result<usize,
     usize::try_from(n).map_err(|_| last_error())
 }
 
+// ---- 通知の受信・応答（SEC-4・#2025）----
+//
+// 一次情報（Linux v6.12 `include/uapi/linux/seccomp.h`・`kernel/seccomp.c`。2026-10-19 に確認）:
+// - 構造体: `seccomp_data`（64 B）・`seccomp_notif`（80 B: id u64・pid u32・flags u32・data）・
+//   `seccomp_notif_resp`（24 B: id u64・val s64・error s32・flags u32）
+// - ioctl: `RECV = _IOWR('!', 0, seccomp_notif)`・`SEND = _IOWR('!', 1, seccomp_notif_resp)`・
+//   `ID_VALID = _IOW('!', 2, __u64)`（5.0〜5.6 の `_IOR` 版はカーネルが互換で受けるが、ここでは現行値だけを使う）
+// - `RECV` は `notif` が 0 初期化でないと `EINVAL`。`notif.pid` は `task_pid_vnr(task)`（RECV を呼んだ側の PID namespace の
+//   TID）。待機中の通知が無ければ、filter の利用者が 0 のときは待たずに、そうでなければ到着まで待つ。見つからなければ `ENOENT`
+// - `SEND` は `ENOENT`（対象が既に消えた）・`EINPROGRESS`（応答済み）を返す。`ID_VALID` は `RECV` 済み（SENT 状態）の
+//   通知が存在するとき 0、無ければ `ENOENT`
+// - poll: 未処理の通知があれば `EPOLLIN`、filter の利用者が 0 なら `EPOLLHUP`
+// `libc` との機械照合は core には未導入（#1837 の子の未着手）のため、本節の定数は上記 uapi 値を `tests` で照合する。
+// `SECCOMP_USER_NOTIF_FLAG_CONTINUE` は引数を許可判断に使うと TOCTOU になるため、定数も宣言しない。
+
+const SECCOMP_IOC_MAGIC: u64 = b'!' as u64;
+/// `_IOC(dir, type, nr, size)`（asm-generic/ioctl.h。x86_64・aarch64 共通: nr 8 bit・type 8 bit・size 14 bit・dir 2 bit）。
+const fn ioc(dir: u64, nr: u64, size: u64) -> u64 {
+    (dir << 30) | (size << 16) | (SECCOMP_IOC_MAGIC << 8) | nr
+}
+const IOC_WRITE: u64 = 1;
+const IOC_READ: u64 = 2;
+const SECCOMP_IOCTL_NOTIF_RECV: u64 = ioc(IOC_READ | IOC_WRITE, 0, 80);
+const SECCOMP_IOCTL_NOTIF_SEND: u64 = ioc(IOC_READ | IOC_WRITE, 1, 24);
+const SECCOMP_IOCTL_NOTIF_ID_VALID: u64 = ioc(IOC_WRITE, 2, 8);
+
+const ENOENT_ERRNO: i32 = 2;
+const EPERM_ERRNO: i32 = 1;
+const POLLERR: i16 = 0x08;
+const POLLHUP: i16 = 0x10;
+
+/// `struct seccomp_data`（64 バイト）。引数と命令ポインタは `SeccompNotification` に公開しない（TOCTOU）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SeccompData {
+    nr: i32,
+    arch: u32,
+    instruction_pointer: u64,
+    args: [u64; 6],
+}
+
+/// `struct seccomp_notif`（80 バイト）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SeccompNotif {
+    id: u64,
+    pid: u32,
+    flags: u32,
+    data: SeccompData,
+}
+
+/// `struct seccomp_notif_resp`（24 バイト）。
+#[repr(C)]
+struct SeccompNotifResp {
+    id: u64,
+    val: i64,
+    error: i32,
+    flags: u32,
+}
+
+/// 受信した通知のうち、記録に使う値だけ（引数・命令ポインタは持たない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RawNotification {
+    pub(crate) id: u64,
+    /// 受信側（listener）の PID namespace での対象 TID。
+    pub(crate) pid: u32,
+    pub(crate) nr: i32,
+    pub(crate) arch: u32,
+}
+
+/// [`poll_listener`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListenerPoll {
+    /// 時間切れ（通知なし）。
+    Idle,
+    /// 未処理の通知がある。
+    Readable,
+    /// filter の利用者がいない（`POLLHUP`）か fd の異常。通知は来ない。
+    Closed,
+}
+
+/// listener fd を最大 `timeout_ms` 待つ。`POLLIN` と `POLLHUP` / `POLLERR` を区別する（HUP を読み取り可能と取り違えない）。
+/// `EINTR` は `Idle` として返す（呼び出し側のループが停止フラグを見て再試行する）。
+pub(crate) fn poll_listener(fd: BorrowedFd<'_>, timeout_ms: i32) -> Result<ListenerPoll, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut pfd = PollFd {
+        fd: fd.as_raw_fd(),
+        events: consts::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `pfd` はスタック上の初期化済み 1 要素で、`nfds` = 1 と一致する。カーネルは呼び出しの間だけ `revents` を書く。
+    let r = unsafe { poll(&raw mut pfd, 1, timeout_ms) };
+    if r < 0 {
+        return match last_error() {
+            SysError::Os(e) if e == super::EINTR => Ok(ListenerPoll::Idle),
+            other => Err(other),
+        };
+    }
+    if r == 0 {
+        return Ok(ListenerPoll::Idle);
+    }
+    // 未処理の通知が残っていれば HUP と同時でも先に読む（取りこぼさない）。
+    if pfd.revents & consts::POLLIN != 0 {
+        Ok(ListenerPoll::Readable)
+    } else if pfd.revents & (POLLHUP | POLLERR) != 0 {
+        Ok(ListenerPoll::Closed)
+    } else {
+        Ok(ListenerPoll::Idle)
+    }
+}
+
+/// 通知を 1 件受信する。対象が既に消えていた（`ENOENT`）ときは `Ok(None)`。
+/// 呼び出し前に [`poll_listener`] で `Readable` を確認する（無ければ到着までブロックする。利用者が 0 になれば戻る）。
+pub(crate) fn notif_recv(fd: BorrowedFd<'_>) -> Result<Option<RawNotification>, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // カーネルは全体が 0 であることを要求する（0 以外は EINVAL）。
+    let mut notif = SeccompNotif {
+        id: 0,
+        pid: 0,
+        flags: 0,
+        data: SeccompData {
+            nr: 0,
+            arch: 0,
+            instruction_pointer: 0,
+            args: [0; 6],
+        },
+    };
+    // SAFETY: `notif` は 80 バイトの `#[repr(C)]` で初期化済み・書き込み可能。`RECV` の要求サイズ（80）と一致し、
+    // カーネルは呼び出しの間だけそれへ書く。`fd` は生存中の `BorrowedFd`。
+    let rc = unsafe {
+        ioctl(
+            fd.as_raw_fd(),
+            SECCOMP_IOCTL_NOTIF_RECV,
+            &raw mut notif as usize as u64,
+        )
+    };
+    if rc == -1 {
+        return match last_error() {
+            SysError::Os(e) if e == ENOENT_ERRNO => Ok(None),
+            other => Err(other),
+        };
+    }
+    Ok(Some(RawNotification {
+        id: notif.id,
+        pid: notif.pid,
+        nr: notif.data.nr,
+        arch: notif.data.arch,
+    }))
+}
+
+/// `id` の通知が受信済みで応答待ちか（`ID_VALID`）。pid の再利用・対象の終了を見分ける cookie 検証。
+pub(crate) fn notif_id_valid(fd: BorrowedFd<'_>, id: u64) -> Result<bool, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut id = id;
+    // SAFETY: `id` はスタック上の `u64` で、`ID_VALID` が読む 8 バイトと一致する。読み取りのみで状態を変えない。
+    let rc = unsafe {
+        ioctl(
+            fd.as_raw_fd(),
+            SECCOMP_IOCTL_NOTIF_ID_VALID,
+            &raw mut id as usize as u64,
+        )
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    match last_error() {
+        SysError::Os(e) if e == ENOENT_ERRNO => Ok(false),
+        other => Err(other),
+    }
+}
+
+/// `id` の通知へ `-EPERM`（`val` = 0・`flags` = 0）で応答する。応答の種類はこの 1 つだけ（許可に倒す応答は持たない）。
+/// 対象が既に消えていた（`ENOENT`）ときは `Ok(false)`、送れたら `Ok(true)`。
+pub(crate) fn notif_send_eperm(fd: BorrowedFd<'_>, id: u64) -> Result<bool, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let mut resp = SeccompNotifResp {
+        id,
+        val: 0,
+        error: -EPERM_ERRNO,
+        flags: 0,
+    };
+    // SAFETY: `resp` はスタック上の 24 バイトの `#[repr(C)]` で、`SEND` が読むサイズ（24）と一致する。
+    // カーネルは呼び出しの間だけ読み、ポインタを保持しない。
+    let rc = unsafe {
+        ioctl(
+            fd.as_raw_fd(),
+            SECCOMP_IOCTL_NOTIF_SEND,
+            &raw mut resp as usize as u64,
+        )
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    match last_error() {
+        SysError::Os(e) if e == ENOENT_ERRNO => Ok(false),
+        other => Err(other),
+    }
+}
+
 #[cfg(all(
     test,
     target_pointer_width = "64",
@@ -540,5 +749,20 @@ mod tests {
         let got = recv_fd_with_creds(b.as_fd()).unwrap();
         assert!(got.payload.is_empty());
         assert!(got.fds.is_empty());
+    }
+
+    /// SEC-4（#2025）: 通知まわりの構造体と ioctl 番号は uapi と一致する（出典: include/uapi/linux/seccomp.h v6.12）。
+    #[test]
+    fn sec4_2025_notif_layouts_and_ioctl_numbers_match_uapi() {
+        assert_eq!(core::mem::size_of::<SeccompData>(), 64);
+        assert_eq!(core::mem::size_of::<SeccompNotif>(), 80);
+        assert_eq!(core::mem::size_of::<SeccompNotifResp>(), 24);
+        assert_eq!(core::mem::offset_of!(SeccompNotif, data), 16);
+        assert_eq!(core::mem::offset_of!(SeccompData, args), 16);
+        assert_eq!(core::mem::offset_of!(SeccompNotifResp, error), 16);
+        assert_eq!(SECCOMP_IOCTL_NOTIF_RECV, 0xC050_2100);
+        assert_eq!(SECCOMP_IOCTL_NOTIF_SEND, 0xC018_2101);
+        assert_eq!(SECCOMP_IOCTL_NOTIF_ID_VALID, 0x4008_2102);
+        assert_eq!((POLLERR, POLLHUP), (0x08, 0x10));
     }
 }

@@ -75,6 +75,7 @@ pub mod logs;
 pub mod privilege;
 pub mod restart;
 pub mod run;
+pub mod seccomp_notify;
 pub mod start_contract;
 pub mod start_entry;
 pub mod state;

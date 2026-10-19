@@ -27,6 +27,10 @@
 //! `layer::GzipLayerReader`）。展開後サイズの上限を必須引数とし、超過で中断する（decompression bomb 対策）。
 //! 展開後 tar の diff_id 検証は未実装。
 //!
+//! 対応するレイヤーの mediaType は `application/vnd.oci.image.layer.v1.tar+gzip`・
+//! `application/vnd.docker.image.rootfs.diff.tar.gzip` の 2 種のみ。それ以外（zstd は #2029 で保留中）は
+//! manifest 解決の時点で blob 取得前に `Unimplemented` で拒否する（`manifest::ensure_supported_layer_media_types`。#2037）。
+//!
 //! 実装済み: レイヤー tar のルート配下への安全な展開（TASK-52.3・OCI-1・MS-4・#409。`layer::extract`）。
 //! パス検証、ルートに閉じ込めた symlink 解決、hardlink の制限、エントリ数・累積サイズの上限を持つ。
 //! 展開先 FS が別表記（大文字小文字・Unicode 正規化）を既存の実体へ解決する名前は、変更操作の前に

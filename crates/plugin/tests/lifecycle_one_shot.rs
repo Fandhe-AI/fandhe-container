@@ -739,9 +739,12 @@ mod unix {
         });
         let map = parse_env_dump(out.response().payload());
         let sock = map.get(PLUGIN_SOCKET_ENV).unwrap();
+        // 公開パスは配置ディレクトリの canonicalize 結果＋socket 名（transport.rs の契約）。
+        // macOS の `/var` → `/private/var` のように一時ディレクトリが symlink 経由でも一致させるため、
+        // 期待側も同じ規則（canonicalize）で正規化して比べる（PLUG-7・PLUG-12）。
         assert_eq!(
             std::path::Path::new(sock).parent().unwrap(),
-            dir.0.as_path(),
+            std::fs::canonicalize(&dir.0).unwrap().as_path(),
             "socket variable points into the test socket directory"
         );
         map

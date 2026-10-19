@@ -265,6 +265,13 @@ impl LaunchedProcess for ControlledProcess {
     fn take_output(&self) -> Option<ContainerOutput> {
         self.inner.take_output()
     }
+
+    /// seccomp の listener を内側へ転送する(転送しないと、包み直した後は取り出せず #2025 の応答ループが
+    /// listener を得られない。`take_output` と同じ注意。SEC-4・#2024)。
+    #[cfg(target_os = "linux")]
+    fn take_seccomp_listener(&self) -> Option<fandhe_container_core::exec::SeccompListener> {
+        self.inner.take_seccomp_listener()
+    }
 }
 
 impl Drop for ControlledProcess {
@@ -377,6 +384,11 @@ mod tests {
         fn take_output(&self) -> Option<ContainerOutput> {
             self.output_taken.store(true, Ordering::SeqCst);
             Some(ContainerOutput::default())
+        }
+        #[cfg(target_os = "linux")]
+        fn take_seccomp_listener(&self) -> Option<fandhe_container_core::exec::SeccompListener> {
+            self.output_taken.store(true, Ordering::SeqCst);
+            None
         }
     }
 
@@ -519,6 +531,21 @@ mod tests {
         assert_eq!(
             slot.submit(pid(100), Signal::SIGTERM, far()).unwrap_err(),
             ControlReason::Busy
+        );
+    }
+
+    /// SEC-4・#2024: `take_seccomp_listener` が内側へ転送される(転送を忘れると包み直した後に listener を取れない)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2024_take_seccomp_listener_is_forwarded() {
+        let slot = SignalSlot::new();
+        let (fake, _, _) = Fake::new(100);
+        let called = Arc::clone(&fake.output_taken);
+        let cp = ControlledProcess::new(Box::new(fake), slot);
+        assert!(cp.take_seccomp_listener().is_none());
+        assert!(
+            called.load(Ordering::SeqCst),
+            "the inner process was not asked"
         );
     }
 

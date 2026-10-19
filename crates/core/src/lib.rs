@@ -44,7 +44,14 @@
 //! - `rootless`: user namespace の UID/GID 写像の設定・読み戻し検証（Linux 限定。CORE-6・SEC-5・
 //!   TASK-40.1）。検証済み写像型・subuid/subgid 解析・`Direct` / `newuidmap` 経由の書き込みが実装済みで、
 //!   `exec::isolate_rootless_subordinate` による起動フローへの組み込みも実装済み（TASK-40.2）。
-//!   `linux.uidMappings` の受理は後続、ファイル所有者検証（TASK-40.3）は未実装
+//!   本番 launcher（`oci_runtime::ProductionLauncher`）経由の流れ（#2009）: 構築時に `SubordinateIdSource` から
+//!   subuid / subgid の範囲と `newuidmap` / `newgidmap` の絶対パスを解決・検証し（ホスト ID 0 を含む構成と
+//!   helper 欠落は fork 前に拒否）、起動ごとにまず mapper を fork し、その後に中間プロセスが user namespace を unshare する。
+//!   mapper は外側の user namespace に残り、helper で写像を書いて読み戻し、応答後に中間プロセスが PID 1 を fork する。
+//!   責務境界は、`rootless` が写像の検証・書き込み・読み戻し、`exec` が計画・unshare・mapper の fork と失敗時の回収、
+//!   launcher が権限モデルの検査と構築時の解決。supervisor が `RootlessSubordinateIds` を選ぶ経路は未結線（#2243）、
+//!   `RootfulHostRoot` は未実装（`Unimplemented`。#2241）。詳細は `oci_runtime` の launcher と `rootless` のモジュール doc を参照。
+//!   config 指定の `linux.uidMappings` は start が拒否（受けるかは #2240 で判断待ち。`docs/design/config-id-mappings.md`）、ファイル所有者検証（TASK-40.3）は未実装
 //! - `seccomp`: 禁止 syscall の一覧 `DeniedSyscall` と x86_64 / aarch64 別の番号テーブル（CORE-5・
 //!   TASK-38.1.1・#837。OS 非依存で syscall を持たない）。テーブルと BPF 構築
 //!   （TASK-38.1.2・#838）は実装済み。フィルタ適用（TASK-38.2）と起動フローへの組み込み（TASK-38.3）も実装済み
@@ -75,8 +82,10 @@
 //!
 //! # プラットフォーム対応（TASK-27.5・CORE-1）
 //!
-//! - `exec`・`sys` は `lib.rs` の `#[cfg(target_os = "linux")]` でビルド対象から外れ、
-//!   `sys.rs` も内側の `#![cfg]` で二重に隔離している。`traits` は OS 非依存で 3 OS に公開される
+//! - `exec`・`sys`（`sys.rs`）は `lib.rs` の `#[cfg(target_os = "linux")]` でビルド対象から外れ、
+//!   `sys.rs` も内側の `#![cfg]` で二重に隔離している。macOS には別ファイル `sys/macos.rs`
+//!   （実効 UID・`O_NOFOLLOW | O_NONBLOCK`・拡張 ACL の検出のみ。`state_store` 用。#2247・OCI-5）を
+//!   `#[cfg(target_os = "macos")]` で取り込み、Linux の宣言は macOS に漏らさない。`traits` は OS 非依存で 3 OS に公開される
 //! - `sys` の `extern "C"` 宣言と `unsafe` は glibc / musl の型幅・syscall 番号を前提とするため、
 //!   前提の成り立たない macOS / Windows でコンパイル・リンクさせない（安全上の理由での隔離）
 //! - 新しい Linux 専用コードは `exec` / `sys` 配下に置く。それ以外に置く場合は
@@ -124,6 +133,10 @@ pub mod sanitize;
 pub mod seccomp;
 pub mod state_store;
 #[cfg(target_os = "linux")]
+mod sys;
+// macOS 向けの `sys` は別ファイル（Linux の宣言を macOS へ漏らさない。#2247・OCI-5）。
+#[cfg(target_os = "macos")]
+#[path = "sys/macos.rs"]
 mod sys;
 #[cfg(test)]
 mod test_support;

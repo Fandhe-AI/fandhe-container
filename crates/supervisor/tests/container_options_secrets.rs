@@ -148,6 +148,10 @@ fn sup12_task169_4_2_destination_is_validated_like_tmpfs() {
             "/proc/self/f",
             "injected files must not be placed on /proc or below",
         ),
+        (
+            "/sys/f",
+            "injected files must not be placed on /sys or below",
+        ),
         ("/dev/f", "injected files must not be placed on /dev itself"),
     ] {
         let e = bad(target);

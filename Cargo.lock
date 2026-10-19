@@ -409,6 +409,9 @@ dependencies = [
 [[package]]
 name = "fandhe-container-plugin-cri"
 version = "0.0.0"
+dependencies = [
+ "fandhe-container-plugin",
+]
 
 [[package]]
 name = "fandhe-container-plugin-macos"

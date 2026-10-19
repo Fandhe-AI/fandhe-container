@@ -1,8 +1,10 @@
-//! `oci_runtime::start` の結合試験（OCI-4・CORE-1・CORE-2・SEC-1・REPAIR-5・TASK-29.3）。
+//! `oci_runtime::start` の結合試験（OCI-4・CORE-1・CORE-2・OCI-5・SUP-6・SEC-1・REPAIR-5・TASK-29.3）。
 //!
 //! 公開 API（`create`・`start`・`recover_interrupted_start`・`StateStore`・`ProcessLauncher`・
 //! `LaunchedProcess`）だけを crate の外から呼び、create → start の状態遷移・launcher との連携・
 //! 応答待ちの上限超過時の後始末を具体値で確かめる。実プロセスは起動しない（launcher は模擬）。
+//! 状態ストアは既定でインメモリの模擬だが、`launch_isolation` の往復（OCI-5・SUP-6・#2239）だけは
+//! 実 `FileStateStore`（`state.json`）を使う（Linux 限定）。
 //!
 //! rootfs を fd で固定する start の成功経路は Linux 限定（Linux 以外は起動前に `Unimplemented`）のため、
 //! 成功を前提とする試験と中断回復（起動権の所有ロックも Linux 限定）の試験は `cfg(target_os = "linux")`、
@@ -19,11 +21,22 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use fandhe_container_core::dev_mounts::ImplicitDevMount;
+use fandhe_container_core::launch_isolation::LaunchIsolationRecord;
+#[cfg(target_os = "linux")]
+use fandhe_container_core::launch_isolation::{
+    RecordedLandlock, RecordedLandlockAudit, RecordedRule, RecordedTarget, RootIdentity,
+};
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
     LaunchSpec, LaunchedProcess, LifecycleOp, ProcessExit, ProcessLauncher, StartTimeouts, create,
     recover_interrupted_start, start,
 };
+#[cfg(target_os = "linux")]
+use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+#[cfg(target_os = "linux")]
+use fandhe_container_core::traits::SupervisionState;
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, ContainerStatus, CreateRequest, CreateStateRequest,
     DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest, ListStateRequest,
@@ -199,6 +212,9 @@ struct FakeLauncher {
     /// 起動した模擬プロセスの terminate を失敗させるか。
     fail_terminate: AtomicBool,
     gate: Gate,
+    /// 起動した模擬プロセスが返す launch 時の分離の記録（既定は `None`）。
+    #[cfg(target_os = "linux")]
+    isolation: Mutex<Option<LaunchIsolationRecord>>,
 }
 
 impl FakeLauncher {
@@ -210,7 +226,29 @@ impl FakeLauncher {
             confirms_no_process: AtomicBool::new(true),
             fail_terminate: AtomicBool::new(false),
             gate: Gate::new(true),
+            #[cfg(target_os = "linux")]
+            isolation: Mutex::new(None),
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_isolation(&self, rec: LaunchIsolationRecord) {
+        *self.isolation.lock().unwrap_or_else(|e| e.into_inner()) = Some(rec);
+    }
+
+    /// 模擬プロセスへ持たせる分離の記録（Linux 以外では常に `None`）。
+    fn current_isolation(&self) -> Option<LaunchIsolationRecord> {
+        #[cfg(target_os = "linux")]
+        {
+            self.isolation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
     }
 
     fn launches(&self) -> usize {
@@ -228,11 +266,15 @@ impl FakeLauncher {
 
 /// 模擬プロセス（terminate の回数を数え、terminate 後は SIGKILL 相当で終了済みになる。第 2 要素が
 /// 真なら terminate は失敗を返す）。
-struct FakeProcess(Arc<AtomicUsize>, bool);
+struct FakeProcess(Arc<AtomicUsize>, bool, Option<LaunchIsolationRecord>);
 
 impl LaunchedProcess for FakeProcess {
     fn pid(&self) -> NonZeroU32 {
         NonZeroU32::new(7).expect("nonzero")
+    }
+
+    fn launch_isolation(&self) -> Option<&LaunchIsolationRecord> {
+        self.2.as_ref()
     }
 
     fn wait(&self, _timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
@@ -276,6 +318,7 @@ impl ProcessLauncher for FakeLauncher {
         Ok(Box::new(FakeProcess(
             self.terminated.clone(),
             self.fail_terminate.load(Ordering::SeqCst),
+            self.current_isolation(),
         )))
     }
 
@@ -314,7 +357,7 @@ impl Bundle {
         Self { dir }
     }
 
-    fn create(&self, store: &MemStateStore, id: &str) {
+    fn create(&self, store: &dyn StateStore, id: &str) {
         let req = CreateRequest::new(ContainerId::new(id).expect("id"), self.dir.clone())
             .expect("absolute bundle");
         create(store, &OpRecorder::new(), &req).expect("create");
@@ -751,4 +794,252 @@ fn err2_start_rejects_invalid_bind_mount_with_structured_error() {
         store.status_of("it-badbind").state(),
         ContainerState::Created
     );
+}
+
+/// 試験用の launch 時の分離の記録。`/`（先頭必須）と暗黙の `/dev` の 2 ルールで、監査の記録も載せる。
+#[cfg(target_os = "linux")]
+fn iso_record(
+    dev: u64,
+    ino: u64,
+    dev_allowed: u64,
+    audit: RecordedLandlockAudit,
+) -> LaunchIsolationRecord {
+    let landlock = RecordedLandlock::new(
+        0x3f,
+        vec![
+            RecordedRule::new(RecordedTarget::Root, 0x0f),
+            RecordedRule::new(RecordedTarget::Implicit(ImplicitDevMount::Dev), dev_allowed),
+        ],
+    )
+    .expect("landlock")
+    .with_audit(audit)
+    .expect("audit");
+    LaunchIsolationRecord::from_parts(RootIdentity::new(dev, ino), landlock)
+}
+
+/// 記録の中身を `==`（`Debug` が値を出さない）とは別に、値ごとに照合する。
+#[cfg(target_os = "linux")]
+fn assert_iso_values(
+    rec: Option<&LaunchIsolationRecord>,
+    dev: u64,
+    ino: u64,
+    dev_allowed: u64,
+    audit: RecordedLandlockAudit,
+) {
+    let rec = rec.expect("launch isolation recorded");
+    assert_eq!((rec.root().dev(), rec.root().ino()), (dev, ino));
+    assert_eq!(rec.landlock().handled(), 0x3f);
+    let rules: Vec<(String, u64)> = rec
+        .landlock()
+        .rules()
+        .iter()
+        .map(|r| (r.target().as_str().to_owned(), r.allowed()))
+        .collect();
+    assert_eq!(
+        rules,
+        [("/".to_owned(), 0x0f), ("/dev".to_owned(), dev_allowed)]
+    );
+    assert_eq!(rec.landlock().audit(), audit);
+}
+
+/// 実 `FileStateStore` 用の状態ルートの親（終了時に削除）。ルート本体は `open` が 0700 で作る。
+#[cfg(target_os = "linux")]
+struct StateDir {
+    dir: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl StateDir {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "fandhe-core-start-it-state-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create state parent");
+        // 状態ルートの祖先は group / other 書き込み不可でなければ `open` が拒否する（umask に依らず 0700 にする）。
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod state parent");
+        }
+        Self { dir }
+    }
+
+    fn root(&self) -> PathBuf {
+        self.dir.join("state")
+    }
+
+    /// 同じルートを開き直す（別プロセスからの読み戻しのモデル）。
+    fn open_store(&self) -> FileStateStore {
+        FileStateStore::open(StateRoot::from_override(self.root()).expect("state root"))
+            .expect("open state store")
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for StateDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_record(store: &FileStateStore, id: &str) -> StateRecord {
+    store
+        .get(&GetStateRequest::new(ContainerId::new(id).expect("id")))
+        .expect("get")
+}
+
+/// OCI-5・SUP-6・CORE-2・REPAIR-12（#2239）: `start` が書いた `launch_isolation` が、実 `FileStateStore` の
+/// `state.json` を経て同じ値で読み戻せる（同じストア・開き直したストア・生の JSON の 3 経路）。
+#[cfg(target_os = "linux")]
+#[test]
+fn core2_oci5_sup6_start_persists_launch_isolation_through_file_state_store() {
+    let b = Bundle::ready("fiso", &valid_config());
+    let sd = StateDir::new("fiso");
+    let store = sd.open_store();
+    b.create(&store, "it-fiso");
+    let launcher = FakeLauncher::new();
+    let audit = RecordedLandlockAudit::KernelAuditRequested;
+    let rec1 = iso_record(7, 11, 0x3f, audit);
+    launcher.set_isolation(rec1.clone());
+    let started = start(
+        &store,
+        &OpRecorder::new(),
+        &dynl(&launcher),
+        &start_req("it-fiso"),
+        &StartTimeouts::default(),
+    )
+    .expect("start");
+    assert_eq!(started.record().status().state(), ContainerState::Running);
+    assert_eq!(started.record().status().pid(), NonZeroU32::new(7));
+    assert_eq!(started.record().launch_isolation(), Some(&rec1));
+
+    let same = get_record(&store, "it-fiso");
+    assert_eq!(same.launch_isolation(), Some(&rec1));
+    let reopened = get_record(&sd.open_store(), "it-fiso");
+    assert_eq!(reopened.status().state(), ContainerState::Running);
+    assert_eq!(reopened.launch_isolation(), Some(&rec1));
+    assert_iso_values(reopened.launch_isolation(), 7, 11, 0x3f, audit);
+
+    let raw = std::fs::read(sd.root().join("it-fiso").join("state.json")).expect("state.json");
+    let json: Value = serde_json::from_slice(&raw).expect("json");
+    assert_eq!(
+        json["launchIsolation"],
+        json!({
+            "root": {"dev": 7, "ino": 11},
+            "landlock": {
+                "handled": 0x3f,
+                "rules": [
+                    {"path": "/", "allowed": 0x0f, "origin": "root"},
+                    {"path": "/dev", "allowed": 0x3f, "origin": "implicit"}
+                ],
+                "audit": {"mode": "kernel_audit_requested"}
+            }
+        })
+    );
+
+    let (_, process) = started.into_parts();
+    process
+        .terminate(Duration::from_secs(1))
+        .expect("terminate");
+}
+
+/// OCI-5・SUP-6・CORE-2・REPAIR-12（#2239）: restart がストアへ出す書き込みの後も `launch_isolation` が
+/// 契約 12 どおりに保たれ・置き換わる。supervisor の `write_relaunched` そのものではなく、それが出す
+/// `UpdateStateRequest` を同じ公開型で再現したモデル（supervisor 経由の通し試験は #2238・#2043 の範囲）。
+///
+/// 注意（#2238 未決定）: 段 2 の「記録の指定が無い Running 更新は前の記録を引き継ぐ」は現行の契約 12 の
+/// 照合で、#2238 で「記録の無い再 launch では消す」へ契約が変わるとこのアサーションは反転する。
+#[cfg(target_os = "linux")]
+#[test]
+fn core2_oci5_sup6_launch_isolation_survives_and_is_replaced_across_restart_writes() {
+    let b = Bundle::ready("riso", &valid_config());
+    let sd = StateDir::new("riso");
+    let store = sd.open_store();
+    b.create(&store, "it-riso");
+    let launcher = FakeLauncher::new();
+    let rec1 = iso_record(7, 11, 0x3f, RecordedLandlockAudit::KernelAuditRequested);
+    launcher.set_isolation(rec1.clone());
+    let started = start(
+        &store,
+        &OpRecorder::new(),
+        &dynl(&launcher),
+        &start_req("it-riso"),
+        &StartTimeouts::default(),
+    )
+    .expect("start");
+    let id = ContainerId::new("it-riso").expect("id");
+    let (_, process) = started.into_parts();
+    process
+        .terminate(Duration::from_secs(1))
+        .expect("terminate");
+
+    // 段 1: supervisor の終了記録（Stopped。記録の指定なし）では消えない。
+    let rev = get_record(&sd.open_store(), "it-riso").revision();
+    store
+        .update(&UpdateStateRequest::new(
+            ContainerStatus::stopped(id.clone(), Some(1)),
+            rev,
+        ))
+        .expect("stopped");
+    let got = get_record(&sd.open_store(), "it-riso");
+    assert_eq!(got.status().state(), ContainerState::Stopped);
+    assert_iso_values(
+        got.launch_isolation(),
+        7,
+        11,
+        0x3f,
+        RecordedLandlockAudit::KernelAuditRequested,
+    );
+
+    // 段 2: 記録を持たない再 launch のモデル（Running(8)・記録の指定なし）。現行の契約 12 は引き継ぎ。
+    // #2238 で契約が変わると、このアサーションは `None` へ反転する。
+    let sup1 = SupervisionState::new(None, None, 1);
+    let rev = got.revision();
+    store
+        .update(
+            &UpdateStateRequest::new(
+                ContainerStatus::running(id.clone(), NonZeroU32::new(8)),
+                rev,
+            )
+            .with_supervision(sup1),
+        )
+        .expect("relaunch without record");
+    let got = get_record(&sd.open_store(), "it-riso");
+    assert_eq!(got.status().pid(), NonZeroU32::new(8));
+    assert_eq!(got.launch_isolation(), Some(&rec1));
+
+    // 段 3: 記録を持つ再 launch（本番 launcher のモデル）は置き換える。
+    let audit2 = RecordedLandlockAudit::Unavailable { detected_abi: 5 };
+    let rec2 = iso_record(8, 12, 0x1f, audit2);
+    let rev = got.revision();
+    store
+        .update(
+            &UpdateStateRequest::new(
+                ContainerStatus::running(id.clone(), NonZeroU32::new(9)),
+                rev,
+            )
+            .with_supervision(SupervisionState::new(None, None, 2))
+            .with_launch_isolation(rec2.clone()),
+        )
+        .expect("relaunch with record");
+    let got = get_record(&sd.open_store(), "it-riso");
+    assert_eq!(got.status().pid(), NonZeroU32::new(9));
+    assert_eq!(got.restart_count(), 2);
+    assert_eq!(got.launch_isolation(), Some(&rec2));
+    assert!(got.launch_isolation() != Some(&rec1));
+    assert_iso_values(got.launch_isolation(), 8, 12, 0x1f, audit2);
+
+    // 段 4: restart 後の監視の更新（記録の指定なし）でも置き換え後の記録は消えない。
+    let rev = got.revision();
+    store
+        .update(
+            &UpdateStateRequest::new(ContainerStatus::running(id, NonZeroU32::new(9)), rev)
+                .with_supervision(SupervisionState::new(None, None, 2)),
+        )
+        .expect("status update");
+    let got = get_record(&sd.open_store(), "it-riso");
+    assert_eq!(got.launch_isolation(), Some(&rec2));
 }

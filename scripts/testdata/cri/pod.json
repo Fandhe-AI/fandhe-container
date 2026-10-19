@@ -1,0 +1,8 @@
+{
+  "metadata": {
+    "name": "crictl-smoke-pod",
+    "namespace": "crictl-smoke",
+    "uid": "crictl-smoke-uid-0001",
+    "attempt": 0
+  }
+}

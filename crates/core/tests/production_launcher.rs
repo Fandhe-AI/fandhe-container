@@ -1,9 +1,10 @@
 //! 本番 `ProcessLauncher`（`oci_runtime::ProductionLauncher`）を `create` → `start` 経由で実プロセスに通す結合試験
 //! （CORE-1・CORE-2・CORE-5・SEC-1・SEC-5・REPAIR-3・REPAIR-12。TASK-29 追補・#1818）。
 //!
-//! 既存の `oci_start.rs` / `oci_lifecycle.rs` は launcher が模擬、`rootless.rs` は自前の代役 init で、
-//! 本番 launcher を実プロセスで通した試験が無かった。本試験は `start` が検証して組み立てた `LaunchSpec` を
-//! 本番 launcher が中間プロセス経由で PID 1 として起動するところまでを、親から具体値で照合する。
+//! 既存の `oci_start.rs` / `oci_lifecycle.rs` は launcher が模擬で、本番 launcher を実プロセスで通した試験が
+//! 無かった（`rootless.rs`・`rootless_file_owner.rs` も #2246 で本番 launcher 経由へ移行済み）。
+//! 本試験は `start` が検証して組み立てた `LaunchSpec` を本番 launcher が中間プロセス経由で PID 1 として
+//! 起動するところまでを、親から具体値で照合する。
 //!
 //! # 照合項目
 //! - シナリオ A（正常起動。非 root）: `StartedContainer` の状態が Running で pid が `process().pid()` と一致する。
@@ -80,8 +81,8 @@
 //! - Landlock の適用は、コンテナ内で `NoNewPrivs`・`Seccomp` を読む間接証拠に留まる。パス単位の拒否を直接観測する
 //!   には `core` の公開 API の追加が要るため、本試験の範囲外（`landlock_implicit_dev` 等が単体で観測している）。
 //!   capability と seccomp の実効はシナリオ J・K が exec 後のプロセスで直接照合する
-//! - seccomp の識別的な errno（`kcmp` が `EPERM` 等）を exec 後に照合するには `exec` の test 限定の入口の追加が要るため、
-//!   errno の拒否は `mount` の網羅確認に留め、識別はシナリオ K の SIGSYS が担う
+//! - seccomp の識別は、シナリオ J の exec 後の `kcmp` の `EPERM`（test 限定の入口 `probe_denied_syscalls_for_test`。
+//!   適用前の `kcmp` 対照は親側で要求し、満たさなければ前提欠如として失敗）とシナリオ K の SIGSYS が担う。`mount` の `EPERM` は網羅確認
 //! - bind 以外の `mounts[]` の種類、`ro` の bind（#1917）、段ごとの個別観測（#1916）、`linux.resources`、
 //!   supervisor 経由の起動（#1819）は対象外
 //! - 実機での実行結果の記録は #1621（Phase 3 の分離系結合試験の実機実行。人間担当）
@@ -122,6 +123,19 @@ fn main() {
     }
 }
 
+// rootfs 構築の部品（`mkdir`・`install_binary_at`）を rootless 系の試験と共有する（#2246・REPAIR-1）。
+// 本試験が使うのはその 2 つだけで、直接ステージ経路の起動・報告の部品は `rootless_uid_mapping` 専用のため、
+// 未使用になる項目は real_entry.rs 側で個別に理由つきの dead_code 抑止を付けている（モジュール全体には抑止しない）。
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[path = "support/real_entry.rs"]
+mod real_entry;
+
 #[cfg(all(
     target_os = "linux",
     all(
@@ -130,6 +144,7 @@ fn main() {
     )
 ))]
 mod linux {
+    use super::real_entry;
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
@@ -141,7 +156,9 @@ mod linux {
     use fandhe_container_core::capabilities::OCI_DEFAULT_CAPABILITIES;
     use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup, DelegatedCgroup};
     use fandhe_container_core::exec::{
-        EscapeSyscallProbe, IsolationPrivilege, escape_probe_mount, probe_escape_syscall,
+        EscapeSyscallProbe, IsolationPrivilege, ProbeOutcome, SeccompProbeRecord,
+        escape_probe_mount, probe_denied_syscalls_for_test, probe_escape_syscall,
+        probe_kcmp_self_for_test,
     };
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
@@ -350,6 +367,15 @@ mod linux {
             }
             // PID 1 かつ `Seccomp: 2` のときだけ発行される安全な入口。`mount` は seccomp が `EPERM` で拒否する。
             emit(format!("SECCOMP_MOUNT {:?}", escape_probe_mount()));
+            // exec 後の PID 1 の記録（`kcmp` の errno を識別的に照合する。#2234）。入口は PID 1 かつ `Seccomp: 2` でだけ発行する。
+            match probe_denied_syscalls_for_test() {
+                Ok(rec) => {
+                    for line in rec.render().lines() {
+                        emit(format!("SECCOMP_RECORD {line}"));
+                    }
+                }
+                Err(e) => emit(format!("SECCOMP_RECORD_ERROR {:?}", e.code)),
+            }
             // 許可された syscall（`openat`・`read`）の対照。拒否一辺倒のフィルタ（全拒否）と区別する。
             let control = std::fs::read_to_string("/proc/thread-self/status");
             emit(format!(
@@ -428,124 +454,20 @@ mod linux {
         }
     }
 
-    fn mkdir(path: &Path) {
-        // `create_dir_all` は途中の symlink を辿るため、祖先を 1 階層ずつ `lstat` して非 symlink のみ許容し、
-        // 無ければ `create_dir` で作る（基点の bundle は排他作成済みの 0700。#2324・SEC-2）。
-        let mut chain: Vec<&Path> = path.ancestors().filter(|a| a.parent().is_some()).collect();
-        chain.reverse();
-        for dir in chain {
-            match std::fs::symlink_metadata(dir) {
-                Ok(md) => assert!(
-                    md.is_dir() && !md.file_type().is_symlink(),
-                    "{} exists and is not a plain directory",
-                    dir.display()
-                ),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::create_dir(dir)
-                        .unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
-                }
-                Err(e) => panic!("lstat {}: {e}", dir.display()),
-            }
-        }
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-            .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
-    }
-
-    /// `host` のファイルを rootfs 内の同じ絶対パスへ（実体の内容を通常ファイルとして）コピーする。
-    fn copy_into(rootfs: &Path, host: &Path, mode: u32) {
-        let dest = rootfs.join(host.strip_prefix("/").expect("absolute path"));
-        mkdir(dest.parent().expect("parent"));
-        let _ = std::fs::remove_file(&dest);
-        std::fs::copy(host, &dest)
-            .unwrap_or_else(|e| panic!("copy {} -> {}: {e}", host.display(), dest.display()));
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(mode))
-            .unwrap_or_else(|e| panic!("chmod {}: {e}", dest.display()));
-    }
-
-    /// ELF64（リトルエンディアン）の `PT_INTERP`（動的ローダのパス）を返す。範囲は `get()` で検査する。
-    fn elf_interp(exe: &[u8]) -> Option<String> {
-        let u16_at = |o: usize| Some(u16::from_le_bytes(exe.get(o..o + 2)?.try_into().ok()?));
-        let u32_at = |o: usize| Some(u32::from_le_bytes(exe.get(o..o + 4)?.try_into().ok()?));
-        let u64_at = |o: usize| Some(u64::from_le_bytes(exe.get(o..o + 8)?.try_into().ok()?));
-        if exe.get(0..4)? != b"\x7fELF" {
-            return None;
-        }
-        let phoff = usize::try_from(u64_at(0x20)?).ok()?;
-        let phentsize = usize::from(u16_at(0x36)?);
-        let phnum = usize::from(u16_at(0x38)?);
-        for i in 0..phnum {
-            let base = phoff.checked_add(i.checked_mul(phentsize)?)?;
-            if u32_at(base)? == 3 {
-                let off = usize::try_from(u64_at(base + 8)?).ok()?;
-                let len = usize::try_from(u64_at(base + 32)?).ok()?;
-                let raw = exe.get(off..off.checked_add(len)?)?;
-                let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-                return String::from_utf8(raw.get(..end)?.to_vec()).ok();
-            }
-        }
-        None
-    }
-
-    /// 自プロセスに読み込み済みの共有ライブラリの実パス（`/proc/self/maps` から。重複なし）。
-    fn loaded_libraries(exe: &Path) -> Vec<PathBuf> {
-        let maps = std::fs::read_to_string("/proc/self/maps").expect("read /proc/self/maps");
-        let mut libs: Vec<PathBuf> = Vec::new();
-        for line in maps.lines() {
-            let Some(path) = line.split_whitespace().nth(5) else {
-                continue;
-            };
-            let p = PathBuf::from(path);
-            if !path.starts_with('/')
-                || p == exe
-                || ["/dev/", "/proc/", "/sys/", "/tmp/", "/memfd:"]
-                    .iter()
-                    .any(|pre| path.starts_with(pre))
-                || libs.contains(&p)
-            {
-                continue;
-            }
-            if std::fs::metadata(&p).is_ok_and(|m| m.is_file()) {
-                libs.push(p);
-            }
-        }
-        libs
-    }
-
     /// 最小 rootfs を作る。`with_proc` が false なら `proc/` を作らない（シナリオ B の失敗注入）。
-    /// 戻り値はプローブが使う `LD_LIBRARY_PATH` の値。
+    /// 実体は `real_entry::install_binary_at`（rootless 系の試験と共有）。戻り値はプローブが使う
+    /// `LD_LIBRARY_PATH` の値。
     fn make_rootfs(rootfs: &Path, with_proc: bool) -> String {
-        mkdir(rootfs);
         let dirs: &[&str] = if with_proc {
             &["proc", "dev", "tmp", "etc"]
         } else {
             &["dev", "tmp", "etc"]
         };
-        for d in dirs {
-            mkdir(&rootfs.join(d));
-        }
-        let exe = std::env::current_exe().expect("current_exe");
-        let exe = std::fs::canonicalize(exe).expect("canonicalize exe");
-        let probe = rootfs.join("probe");
-        std::fs::copy(&exe, &probe).expect("copy probe binary");
-        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod probe");
+        real_entry::install_binary_at(rootfs, "probe", dirs)
+    }
 
-        let bytes = std::fs::read(&exe).expect("read exe");
-        let mut lib_dirs: Vec<String> = Vec::new();
-        if let Some(interp) = elf_interp(&bytes) {
-            // ローダは PT_INTERP のパスのまま（シンボリックリンクを辿らず）rootfs 内で開かれるため、
-            // 実体の内容をそのパスへ置く。
-            copy_into(rootfs, Path::new(&interp), 0o755);
-        }
-        for lib in loaded_libraries(&exe) {
-            copy_into(rootfs, &lib, 0o755);
-            if let Some(dir) = lib.parent().and_then(Path::to_str)
-                && !lib_dirs.iter().any(|d| d == dir)
-            {
-                lib_dirs.push(dir.to_string());
-            }
-        }
-        lib_dirs.join(":")
+    fn mkdir(path: &Path) {
+        real_entry::mkdir(path);
     }
 
     fn write_config(
@@ -856,6 +778,30 @@ mod linux {
             let host_cgroup =
                 std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("cgroup");
             assert_eq!(host_cgroup.trim(), expected_cgroup);
+
+            // SEC-4・#2024: PID 1 が NEW_LISTENER で得た listener を launcher が検証して持っている。種別は notify で、
+            // 1 回だけ取り出せ、PID 1 側（コンテナ内）には残らない（ホストから見た PID 1 の fd に notify が無い）。
+            let listener = started
+                .process()
+                .take_seccomp_listener()
+                .expect("seccomp listener handed over");
+            let kind = std::fs::read_link(format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&listener.as_fd())
+            ))
+            .expect("readlink of the listener");
+            assert_eq!(kind.to_str(), Some("anon_inode:seccomp notify"));
+            assert!(started.process().take_seccomp_listener().is_none());
+            let pid1_fds: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .expect("pid1 fd dir")
+                .filter_map(Result::ok)
+                .filter_map(|e| std::fs::read_link(e.path()).ok())
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !pid1_fds.iter().any(|p| p.contains("seccomp notify")),
+                "the workload must not hold the listener: {pid1_fds:?}"
+            );
 
             let output = started.process().take_output().expect("container output");
             let stdout = output.stdout.expect("container stdout");
@@ -1704,6 +1650,15 @@ mod linux {
         const OCI_DEFAULT_MASK: u64 = 0x0000_0000_a804_25fb;
         assert_eq!(from_api, OCI_DEFAULT_MASK, "OCI default capability mask");
 
+        // 適用前の kcmp 対照（親は組み込みフィルタを載せていない）。外側が拒否する環境は前提欠如として失敗させる（#2234）。
+        let kcmp_before = probe_kcmp_self_for_test();
+        assert_eq!(
+            kcmp_before,
+            ProbeOutcome::Ok,
+            "precondition failed: kcmp(self, self) must succeed before the built-in seccomp stage (got {kcmp_before:?}, Seccomp: {}); the outer environment already denies kcmp, so EPERM inside the container cannot be attributed to the built-in filter",
+            status_field("/proc/self/status", "Seccomp:").unwrap_or_default()
+        );
+
         let bundle = Bundle::new("j");
         let ld = make_rootfs(&bundle.rootfs(), true);
         write_config(&bundle, &ld, &["--with-restrictions"], json!([]));
@@ -1752,6 +1707,32 @@ mod linux {
             // 拒否される syscall と、許可される syscall の対照。
             assert_eq!(value_of(&lines, "SECCOMP_MOUNT"), "Ok(Errno(1))");
             assert_eq!(value_of(&lines, "SECCOMP_CONTROL"), "ok");
+            // 識別的な照合: kcmp の EPERM は seccomp 以外では生じない（親側の適用前の対照が成功している前提）。
+            assert!(
+                !lines.iter().any(|l| l.starts_with("SECCOMP_RECORD_ERROR")),
+                "seccomp record probe failed: {lines:?}"
+            );
+            let record_text = lines
+                .iter()
+                .filter_map(|l| l.strip_prefix("SECCOMP_RECORD "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let rec = SeccompProbeRecord::parse(&record_text)
+                .unwrap_or_else(|e| panic!("parse post-exec seccomp record: {e}; {lines:?}"));
+            assert_eq!(rec.kcmp, ProbeOutcome::Errno(1), "post-exec kcmp EPERM");
+            assert_eq!(rec.seccomp_mode, "2", "post-exec SECCOMP_MODE_FILTER");
+            assert_eq!(rec.control, ProbeOutcome::Ok, "post-exec control read");
+            assert_eq!(rec.mount, ProbeOutcome::Errno(1), "post-exec mount EPERM");
+            assert_eq!(
+                rec.pivot_root,
+                ProbeOutcome::Errno(1),
+                "post-exec pivot_root EPERM"
+            );
+            assert_eq!(
+                rec.umount2,
+                ProbeOutcome::Errno(1),
+                "post-exec umount2 EPERM"
+            );
             println!("production_launcher: scenario=j pid={pid} post-exec caps and seccomp ok");
         }));
         finish_started(started, verified);

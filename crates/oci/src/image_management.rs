@@ -12,7 +12,9 @@
 //! 数えるための構成情報であり、無参照の manifest が含むだけの blob は参照なしと判定する。
 //!
 //! ストア単位の排他（TASK-183.2・OCI-7・#473）は [`ImageStore`] が担う。テーブルはそのガード越しにだけ
-//! 変更でき、永続化前はプロセスごとのメモリ上の別物である（契約と前提は `store` モジュールの doc）。
+//! 変更できる（契約と前提は `store` モジュールの doc）。コンテナ参照（エントリと世代カウンタ）は root 直下の
+//! ファイルへ永続化済み（#2341。`container_ref_persist`）で、manifest の在庫・タグ・リースは
+//! プロセスごとのメモリ上の別物のままである。
 //!
 //! 未実装（後続 issue の担当。実装済みを装わない。REPAIR-3）:
 //! - テーブル（manifest の在庫・タグ・リース）自体のディスクへの永続化。削除の永続化完了確認と再試行
@@ -25,7 +27,8 @@
 //!   `usage`（#478・TASK-183.3）で実装済み（staging の容量・コンテナ容量の受け口・展開後サイズの二段階 API は #2222。CLI 経路は未実装）
 //! - pull のリース登録・ステージング書き込み（#474・TASK-183.9）と、公開・失敗時のロールバック
 //!   （#475・TASK-183.10）は `pull` で実装済み（cri からの配線は未実装）
-//! - テーブル全体の件数上限（永続化の読み込み側で判断する）
+//! - コンテナ参照以外（manifest・タグ・リース）の件数上限は永続化と合わせて判断する（コンテナ参照は
+//!   `MAX_CONTAINER_REFS` で上限済み）。タグは `MAX_TAG_REFS` で書き込み側が検査済み（#2316）
 //!
 //! core の `ContainerId` との対応づけ（#853・TASK-183.8.1）: core は oci に依存せず、core 側の
 //! `ContainerImageRefs`（`oci_runtime`）を、oci と core の両方に依存するアダプタが
@@ -35,6 +38,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+
+mod container_ref_persist;
+pub use container_ref_persist::{
+    CONTAINER_REFS_FILE_NAME, MAX_CONTAINER_REFS, MAX_CONTAINER_REFS_FILE_BYTES,
+};
 
 mod container_ref;
 pub use container_ref::{ContainerRefRegistration, ContainerRefRelease};
@@ -74,7 +82,7 @@ pub use pull::{
 };
 
 mod tag;
-pub use tag::{ImageTagChange, ImageTagOutcome, ImageTagSource};
+pub use tag::{ImageTagChange, ImageTagOutcome, ImageTagSource, MAX_TAG_REFS};
 
 mod store;
 pub use store::{
@@ -447,12 +455,16 @@ impl ReferenceTable {
     }
 
     /// タグ → manifest を登録する（既存タグは付け替え）。直前の付け先を返す。manifest 不在は `NotFound`。
+    ///
+    /// 新規キーでタグ件数が [`MAX_TAG_REFS`] に達していれば `ResourceExhausted`（テーブルは変えない）。
+    /// 既存キーの付け替え・再付与は上限に達していても通す。
     pub fn register_tag(
         &mut self,
         key: TagKey,
         manifest: &Digest,
     ) -> Result<Option<Digest>, OciError> {
         self.require_manifest(manifest)?;
+        self.ensure_tag_capacity([&key])?;
         Ok(self.tag_refs.insert(key, manifest.clone()))
     }
 

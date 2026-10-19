@@ -414,6 +414,13 @@ mod tests {
             .expect_err("reserved");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
         assert_eq!(e.message(), "tmpfs must not be mounted on /proc or below");
+        // SEC-2・#2233: /sys 配下も拒否する（RDONLY が子マウントに及ばないため）。
+        let sys = MountOptions::default()
+            .with_tmpfs(TmpfsOption::parse("/sys/fs/cgroup").expect("sys"))
+            .expect("add");
+        let e = sys.to_tmpfs_set(IpcMode::Private).expect_err("sys");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "tmpfs must not be mounted on /sys or below");
     }
 
     /// SUP-12・TASK-169.5.2: 公開 `to_tmpfs_set` 単独でも host IPC と /dev/shm 指定の併用を拒否する。

@@ -103,8 +103,8 @@ mod supported {
     // ---------------------------------------------------------------------------------------
 
     use fandhe_container_plugin::{
-        Frame, OneShotPlugin, PLUGIN_SOCKET_ENV, ResidentPlugin, ResidentStartTimeout, RpcTimeout,
-        UdsStream,
+        Frame, PLUGIN_SOCKET_ENV, PluginLaunchSpec, ResidentPlugin, ResidentStartTimeout,
+        RpcTimeout, UdsStream,
     };
     use std::ffi::OsString;
     use std::io::Read;
@@ -259,7 +259,7 @@ mod supported {
                 .iter()
                 .map(OsString::from)
                 .collect();
-                let plugin = OneShotPlugin::new(crate::exe_target(), args, dir.clone()).unwrap();
+                let plugin = PluginLaunchSpec::new(crate::exe_target(), args, dir.clone()).unwrap();
                 let mut session = ResidentPlugin::start(
                     &plugin,
                     ResidentStartTimeout::default(),
@@ -477,7 +477,7 @@ mod supported {
     mod resident {
         use super::{EXPECTED_SOURCE, rss_guard};
         use fandhe_container_plugin::{
-            Frame, OneShotPlugin, OneShotTermination, PLUGIN_SOCKET_ENV, ResidentPlugin,
+            Frame, OneShotTermination, PLUGIN_SOCKET_ENV, PluginLaunchSpec, ResidentPlugin,
             ResidentStartTimeout, ResidentState, RpcTimeout, UdsStream, rss,
         };
         use std::ffi::OsString;
@@ -556,7 +556,7 @@ mod supported {
             .iter()
             .map(OsString::from)
             .collect();
-            let plugin = OneShotPlugin::new(crate::exe_target(), args, dir.0.clone()).unwrap();
+            let plugin = PluginLaunchSpec::new(crate::exe_target(), args, dir.0.clone()).unwrap();
             let mut session = ResidentPlugin::start(
                 &plugin,
                 ResidentStartTimeout::new(OP_TIMEOUT).unwrap(),

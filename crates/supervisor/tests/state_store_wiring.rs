@@ -30,8 +30,8 @@ fn task_157_3_supervisor_has_no_own_serialization() {
     }
 }
 
-/// OCI-5・CLI-1: Linux 以外では状態ルートを作らずに `Unimplemented` を返す。
-#[cfg(not(target_os = "linux"))]
+/// OCI-5・CLI-1: Linux・macOS 以外（Windows）では状態ルートを作らずに `Unimplemented` を返す。
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn sup1_task157_3_open_default_store_is_unimplemented_outside_linux() {
     use fandhe_container_core::traits::ErrorCode;
@@ -41,6 +41,23 @@ fn sup1_task157_3_open_default_store_is_unimplemented_outside_linux() {
     let e = open_default_store(Some(root.clone())).err().unwrap();
     assert_eq!(e.code(), ErrorCode::Unimplemented);
     assert!(!root.exists());
+}
+
+/// OCI-5・CLI-1・SEC-4（#2247）: macOS では `open_default_store` が通り、状態ルートが 0700 で作られる
+/// （実行時の確認は main の macOS 実行が担う）。
+#[cfg(target_os = "macos")]
+#[test]
+fn oci5_open_default_store_works_on_macos() {
+    use fandhe_container_supervisor::state::open_default_store;
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = std::fs::canonicalize(std::env::temp_dir())
+        .expect("temp dir")
+        .join(format!("fandhe-sup-macos-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    open_default_store(Some(root.clone())).expect("open on macOS");
+    let mode = std::fs::metadata(&root).expect("root").permissions().mode();
+    assert_eq!(mode & 0o777, 0o700);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[cfg(target_os = "linux")]

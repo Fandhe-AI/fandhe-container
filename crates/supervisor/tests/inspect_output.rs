@@ -788,7 +788,7 @@ mod linux {
 }
 
 /// Linux 以外では core が `Unimplemented` を返し、そのまま伝播する（CLI-1）。
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn sup11_task168_1_open_store_is_unimplemented_outside_linux() {
     use fandhe_container_core::traits::ErrorCode;

@@ -4,7 +4,7 @@
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
 //! 構文は runc 互換: `fandhe-container [--root <dir>] create --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] <id>` / `... list` / `... logs <id>`。
-//! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
+//! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `image tag --image-root <dir> <source> <target>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
 use std::ffi::OsString;
@@ -73,6 +73,19 @@ pub(super) enum ImageArgs {
     Ls(ImageLsArgs),
     /// `image rm [--force] --image-root <dir> <ref>`。
     Rm(ImageRmArgs),
+    /// `image tag --image-root <dir> <source> <target>`（#2316）。
+    Tag(ImageTagArgs),
+}
+
+/// `image tag` の引数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ImageTagArgs {
+    /// イメージストアの root（絶対パス）。
+    pub(super) image_root: PathBuf,
+    /// 付け元（既存タグまたは manifest digest。未検証の文字列。意味検証は `image` モジュールが oci に委ねる）。
+    pub(super) source: String,
+    /// 付けるタグ（未検証の文字列。タグ参照だけを受ける検証は `image` モジュールが行う）。
+    pub(super) target: String,
 }
 
 /// `image ls` の引数。
@@ -243,7 +256,7 @@ pub(super) fn parse_logs(args: Vec<OsString>) -> Result<LogsArgs, UsageError> {
     })
 }
 
-/// `image <ls|rm> ...` を解析する（サブコマンド無し・未知は使い方エラー）。
+/// `image <ls|rm|tag> ...` を解析する（サブコマンド無し・未知は使い方エラー）。
 pub(super) fn parse_image(args: Vec<OsString>) -> Result<ImageArgs, UsageError> {
     let mut it = args.into_iter();
     let sub = it.next().ok_or(UsageError)?;
@@ -260,6 +273,14 @@ pub(super) fn parse_image(args: Vec<OsString>) -> Result<ImageArgs, UsageError> 
             image_root,
             force,
             reference: single_id(positional)?,
+        }))
+    } else if sub == "tag" {
+        let (image_root, _, positional) = parse_image_options(rest, false)?;
+        let (source, target) = two_positionals(positional)?;
+        Ok(ImageArgs::Tag(ImageTagArgs {
+            image_root,
+            source,
+            target,
         }))
     } else {
         Err(UsageError)
@@ -352,6 +373,15 @@ fn single_id(mut positional: Vec<OsString>) -> Result<String, UsageError> {
         .pop()
         .and_then(|v| v.into_string().ok())
         .ok_or(UsageError)
+}
+
+/// 位置引数がちょうど 2 個の UTF-8 文字列であることを確かめる（`image tag <source> <target>`）。
+fn two_positionals(positional: Vec<OsString>) -> Result<(String, String), UsageError> {
+    let [a, b]: [OsString; 2] = positional.try_into().map_err(|_| UsageError)?;
+    Ok((
+        a.into_string().map_err(|_| UsageError)?,
+        b.into_string().map_err(|_| UsageError)?,
+    ))
 }
 
 #[cfg(test)]
@@ -652,5 +682,63 @@ mod tests {
         ] {
             assert_eq!(parse_image(bad.clone()), Err(UsageError), "{bad:?}");
         }
+    }
+
+    /// CLI-1・OCI-7: image tag の構文（順不同・`--` 以降は位置引数・位置引数はちょうど 2 個・--force は不可）。
+    #[test]
+    fn cli1_oci7_parse_image_tag() {
+        let root = std::env::temp_dir();
+        let r = root.to_str().expect("utf8").to_owned();
+        let expect = Ok(ImageArgs::Tag(ImageTagArgs {
+            image_root: root.clone(),
+            source: "busybox".into(),
+            target: "busybox:v2".into(),
+        }));
+        assert_eq!(
+            parse_image(v(&["tag", "--image-root", &r, "busybox", "busybox:v2"])),
+            expect
+        );
+        assert_eq!(
+            parse_image(v(&["tag", "busybox", "busybox:v2", "--image-root", &r])),
+            expect
+        );
+        assert_eq!(
+            parse_image(v(&[
+                "tag",
+                "--image-root",
+                &r,
+                "--",
+                "busybox",
+                "busybox:v2"
+            ])),
+            expect
+        );
+        for bad in [
+            v(&["tag", "--image-root", &r, "a"]),
+            v(&["tag", "--image-root", &r, "a", "b", "c"]),
+            v(&["tag", "--force", "--image-root", &r, "a", "b"]),
+            v(&["tag", "a", "b"]),
+            v(&["tag", "--image-root", "rel/dir", "a", "b"]),
+            v(&["tag", "--image-root", &r, "--image-root", &r, "a", "b"]),
+            v(&["tag", "--bogus", "--image-root", &r, "a", "b"]),
+        ] {
+            assert_eq!(parse_image(bad.clone()), Err(UsageError), "{bad:?}");
+        }
+    }
+
+    /// CLI-1: 非 UTF-8 の位置引数は image tag で使い方エラー。
+    #[cfg(unix)]
+    #[test]
+    fn cli1_parse_image_tag_rejects_non_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = std::env::temp_dir();
+        let bad = vec![
+            OsString::from("tag"),
+            OsString::from("--image-root"),
+            root.into_os_string(),
+            OsString::from("a"),
+            OsString::from_vec(vec![0x62, 0xff]),
+        ];
+        assert_eq!(parse_image(bad), Err(UsageError));
     }
 }

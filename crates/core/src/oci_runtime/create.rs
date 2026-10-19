@@ -411,6 +411,16 @@ pub(super) fn check_rootfs(bundle: &Path, root_path: &Path) -> Result<PathBuf, T
     if super::image_rootfs::has_staging_component(root_path) {
         return Err(invalid("root.path must not use a reserved staging name"));
     }
+    // bundle 自体が展開途中の木（またはその配下）でも採用しない。`root.path` を `.` にすれば root.path
+    // の検査を素通りできるため、bundle の表記と実体（symlink 解決後）の両方を見る（OCI-7）。
+    let resolved_bundle = std::fs::canonicalize(bundle).ok();
+    if super::image_rootfs::has_staging_component(bundle)
+        || resolved_bundle
+            .as_deref()
+            .is_some_and(super::image_rootfs::has_staging_component)
+    {
+        return Err(invalid("bundle must not use a reserved staging name"));
+    }
     if root_path
         .components()
         .any(|c| matches!(c, Component::ParentDir))
@@ -1525,5 +1535,28 @@ mod tests {
             };
             assert!(b.dir.join(expected).is_dir(), "{spelling}");
         }
+    }
+
+    /// OCI-7: 展開途中の `.fandhe-unpack-*` を bundle に指定し `root.path` を `.` にしても拒否する。
+    /// symlink 経由の別表記でも、実体が予約名なら拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_check_rootfs_rejects_staging_dir_as_bundle() {
+        let base = std::env::temp_dir().join(format!("fandhe-oci7-bundle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let staging = base.join(".fandhe-unpack-1-0");
+        std::fs::create_dir_all(staging.join("sub")).expect("dirs");
+        for root in [".", "sub"] {
+            let e = check_rootfs(&staging, Path::new(root)).expect_err("staging bundle");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{root}");
+        }
+        let alias = base.join("alias");
+        std::os::unix::fs::symlink(&staging, &alias).expect("symlink");
+        let e = check_rootfs(&alias, Path::new(".")).expect_err("alias of staging");
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        let ok = base.join("bundle");
+        std::fs::create_dir_all(&ok).expect("ok");
+        assert!(check_rootfs(&ok, Path::new(".")).is_ok());
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

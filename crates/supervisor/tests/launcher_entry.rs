@@ -27,7 +27,17 @@ struct Outcome {
 
 /// ランチャーを起動して完了を待つ。`CHILD_TIMEOUT` を超えたら強制終了して失敗にする。
 fn run(args: &[&str], envs: &[(&str, &str)]) -> Outcome {
+    run_with(args, envs, false)
+}
+
+/// `run` の本体。`new_process_group` が真なら子を新しいプロセスグループのリーダーとして起動する
+/// （`setsid` が `EPERM` になる経路の再現用）。期限と子の回収は両経路で同じ。
+fn run_with(args: &[&str], envs: &[(&str, &str)], new_process_group: bool) -> Outcome {
+    use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(LAUNCHER);
+    if new_process_group {
+        cmd.process_group(0);
+    }
     cmd.args(args)
         .env_clear()
         .stdin(Stdio::null())
@@ -116,23 +126,14 @@ fn sup14_task1719_invalid_arguments_stop_before_elevation() {
 
 /// プロセスグループのリーダーとして起動されると、ランチャーの `setsid` が `EPERM` になり、読み戻しでも
 /// セッションのリーダーでないため、昇格にも exec にも進まず `FAILED_PRECONDITION` で止まる（SUP-14・TASK-171.2・#537）。
-/// 報告は 1 行だけで、メッセージは `session detach failed: ` で始まる。
+/// 報告は 1 行だけで、メッセージは `session detach failed:` で始まる。
 #[test]
 fn sup14_task171_2_process_group_leader_is_rejected() {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = Command::new(LAUNCHER);
-    cmd.args(["start", "--root", "/var/lib/fandhe-container", "c1"])
-        .env_clear()
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let out = cmd.output().unwrap();
-    let o = Outcome {
-        stdout: out.stdout,
-        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        code: out.status.code().unwrap(),
-    };
+    let o = run_with(
+        &["start", "--root", "/var/lib/fandhe-container", "c1"],
+        &[],
+        true,
+    );
     let (code, msg) = failed(&o);
     assert_eq!(code, ErrorCode::FailedPrecondition, "{msg}");
     assert!(msg.starts_with("session detach failed: "), "{msg}");

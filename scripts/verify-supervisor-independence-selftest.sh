@@ -271,8 +271,12 @@ if grep -q 'info: cli-stop: 0/4' "$ERR"; then pass "stop_ignore: cli-stop info l
 
 # 1d. stop がハングする → 呼び出しごとの期限と段全体の期限で打ち切られ、全体が上限内に終わる。
 hang_t0=$SECONDS
-STUB_STOP=hang run_case normal --timeout 3
+# --timeout 3 では残り時間から強制終了猶予 3 秒を引くと 0 以下になり stop が一度も呼ばれないため、stop が実際に
+# 送られる 8 秒を使う（最初の stop は上限 5 秒で打ち切られ、残りは段全体の期限で送られない）。
+STUB_STOP=hang run_case normal --timeout 8
 hang_el=$((SECONDS - hang_t0))
+expect_eq "stop_hang: the hanging stop was entered (cli.log)" 1 "$(grep -c '^stop ' "$(dirname "$OUT")/cli.log")"
+if [ "$hang_el" -ge 4 ]; then pass "stop_hang: per-call deadline was waited for (${hang_el}s >= 4s)"; else fail "stop_hang: returned in ${hang_el}s without waiting for the stop deadline"; fi
 expect_eq "stop_hang: exit code" 0 "$RC"
 expect_eq "stop_hang: result" pass "$(json_get result "$OUT")"
 if [ "$hang_el" -le 60 ]; then pass "stop_hang: finished within the bound (${hang_el}s <= 60s)"; else fail "stop_hang: took ${hang_el}s"; fi

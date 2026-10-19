@@ -46,8 +46,26 @@ const REPORT_MAX_BYTES: u64 = 16 * 1024;
 /// 報告ファイルの行数の上限。
 const REPORT_MAX_LINES: usize = 128;
 
-fn mkdir(path: &Path) {
-    std::fs::create_dir_all(path).unwrap_or_else(|e| panic!("mkdir {}: {e}", path.display()));
+/// `path` までの祖先を 1 階層ずつ `lstat` して非 symlink のディレクトリだけを許容し、無ければ `create_dir` で作って
+/// 0755 にする（`create_dir_all` は途中の symlink を辿るため使わない。基点の bundle は呼び出し元が 0700 で排他作成済み。
+/// #2324・SEC-2）。rootfs 構築の 4 本の試験（`production_launcher`・`rootless`・`rootless_file_owner`・
+/// `rootless_uid_mapping`）が共有する。失敗は panic。
+pub fn mkdir(path: &Path) {
+    let mut chain: Vec<&Path> = path.ancestors().filter(|a| a.parent().is_some()).collect();
+    chain.reverse();
+    for dir in chain {
+        match std::fs::symlink_metadata(dir) {
+            Ok(md) => assert!(
+                md.is_dir() && !md.file_type().is_symlink(),
+                "{} exists and is not a plain directory",
+                dir.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+            }
+            Err(e) => panic!("lstat {}: {e}", dir.display()),
+        }
+    }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
         .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
 }
@@ -112,18 +130,21 @@ fn loaded_libraries(exe: &Path) -> Vec<PathBuf> {
     libs
 }
 
-/// 試験バイナリ自身を rootfs の `/entry` へ置き、動的ローダと読み込み済みの共有ライブラリを同じ絶対パスへ
-/// コピーする。`rootfs/proc`（pivot 後に proc を載せる先）も作る。戻り値は config の `env` に渡す
-/// `LD_LIBRARY_PATH` の値。
-pub fn install_entry(rootfs: &Path) -> String {
+/// 試験バイナリ自身を `rootfs/<dest_name>`（0755）へ置き、動的ローダと読み込み済みの共有ライブラリを同じ絶対パスへ
+/// コピーする。`rootfs` と `dirs`（rootfs 直下のディレクトリ名。`proc` など）を先に作る。作成の順序は
+/// 「ディレクトリ → バイナリ → ローダ・共有ライブラリ」。戻り値は config の `env` に渡す `LD_LIBRARY_PATH` の値。
+/// `production_launcher`（`/probe`）と rootless 系 3 本（`/entry`）が配置名とディレクトリ構成だけを変えて呼ぶ。
+pub fn install_binary_at(rootfs: &Path, dest_name: &str, dirs: &[&str]) -> String {
     mkdir(rootfs);
-    mkdir(&rootfs.join("proc"));
+    for d in dirs {
+        mkdir(&rootfs.join(d));
+    }
     let exe = std::env::current_exe().expect("current_exe");
     let exe = std::fs::canonicalize(exe).expect("canonicalize exe");
-    let dest = rootfs.join(ENTRY_PATH.trim_start_matches('/'));
-    std::fs::copy(&exe, &dest).expect("copy the entrypoint binary");
+    let dest = rootfs.join(dest_name);
+    std::fs::copy(&exe, &dest).expect("copy the test binary");
     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod the entrypoint");
+        .expect("chmod the test binary");
 
     let bytes = std::fs::read(&exe).expect("read exe");
     let mut lib_dirs: Vec<String> = Vec::new();
@@ -141,6 +162,42 @@ pub fn install_entry(rootfs: &Path) -> String {
         }
     }
     lib_dirs.join(":")
+}
+
+/// 試験バイナリ自身を rootfs の `/entry` へ置く（実エントリポイント）。`rootfs/proc`（pivot 後に proc を載せる先）
+/// も作る。戻り値は config の `env` に渡す `LD_LIBRARY_PATH` の値。
+#[allow(dead_code)] // 取り込み元によっては使わない（`production_launcher` は `install_binary_at` を直接呼ぶ）
+pub fn install_entry(rootfs: &Path) -> String {
+    install_binary_at(rootfs, ENTRY_PATH.trim_start_matches('/'), &["proc"])
+}
+
+/// rootless 系 2 本（`rootless`・`rootless_file_owner`）が本番 `ProductionLauncher` へ渡す最小の `config.json` を
+/// `bundle/config.json` へ書く（`create_new`）。`root.readonly=false`・`process.user` 0/0・`cwd` `/`・namespaces は
+/// pid / mount / uts / ipc / user。`linux.uidMappings` は書かない（start が拒否する。写像は launcher の責務）。
+/// `args` / `env` は `entry_args` / `entry_env` を渡す。
+#[allow(dead_code)] // 取り込み元によっては使わない（`rootless_uid_mapping`・`production_launcher` は使わない）
+pub fn write_rootless_config(bundle: &Path, hostname: &str, args: &[String], env: &[String]) {
+    let config = serde_json::json!({
+        "ociVersion": "1.2.0",
+        "root": {"path": "rootfs", "readonly": false},
+        "process": {
+            "user": {"uid": 0, "gid": 0},
+            "args": args,
+            "env": env,
+            "cwd": "/"
+        },
+        "hostname": hostname,
+        "linux": {"namespaces": [
+            {"type": "pid"}, {"type": "mount"}, {"type": "uts"}, {"type": "ipc"}, {"type": "user"}
+        ]}
+    });
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(bundle.join("config.json"))
+        .expect("create config.json");
+    f.write_all(&serde_json::to_vec(&config).expect("serialize config"))
+        .expect("write config.json");
 }
 
 /// 実エントリポイントの argv（`/entry --entry <mode>`）。`config.json` の `process.args` と

@@ -132,7 +132,7 @@ impl ImageStore {
     /// ほど長い場合は `InvalidArgument`。
     pub fn lock(&self) -> Result<ImageStoreGuard<'_>, OciError> {
         record_oci_op(&*self.recorder, OciOpKind::AcquireImageStoreLock, || {
-            self.lock_inner().map(|(guard, _)| guard)
+            self.lock_inner()
         })
     }
 
@@ -143,13 +143,11 @@ impl ImageStore {
     /// CLI / CRI からの配線は未実装（REPAIR-3）。
     pub fn recover_pending_deletion(&self) -> Result<Option<PendingDeletionRecovery>, OciError> {
         record_oci_op(&*self.recorder, OciOpKind::AcquireImageStoreLock, || {
-            self.lock_inner().map(|(_, recovered)| recovered)
+            self.lock_inner().map(|mut g| g.recovered.take())
         })
     }
 
-    fn lock_inner(
-        &self,
-    ) -> Result<(ImageStoreGuard<'_>, Option<PendingDeletionRecovery>), OciError> {
+    fn lock_inner(&self) -> Result<ImageStoreGuard<'_>, OciError> {
         let deadline = Instant::now().checked_add(self.timeout).ok_or_else(|| {
             OciError::new(
                 OciErrorCode::InvalidArgument,
@@ -159,7 +157,11 @@ impl ImageStore {
         let table = self.lock_table_until(deadline)?;
         let file = open_lock_file(&self.root)?;
         lock_file_until(&file, deadline)?;
-        let mut guard = ImageStoreGuard { _file: file, table };
+        let mut guard = ImageStoreGuard {
+            _file: file,
+            table,
+            recovered: None,
+        };
         // 区間に入るたびにディスクのコンテナ参照を正とする（#2341）。壊れた参照表は fail-closed で拒否する。
         if let Some(persisted) = load_container_refs(&self.root)? {
             guard.table.apply_persisted_container_refs(persisted);
@@ -173,7 +175,8 @@ impl ImageStore {
         } else {
             None
         };
-        Ok((guard, recovered))
+        guard.recovered = recovered;
+        Ok(guard)
     }
 
     fn lock_table_until(
@@ -202,6 +205,17 @@ impl ImageStore {
 pub struct ImageStoreGuard<'a> {
     _file: File,
     table: MutexGuard<'a, ReferenceTable>,
+    /// この取得時に行った中断削除の復旧結果（無ければ `None`）。`Abandoned` で孤児として残った blob
+    /// （`undeleted_blobs`）や `Pending` の状態を、呼び出し側が構造化された形で受け取るために保持する
+    /// （OCI-7・REPAIR-4。ジャーナルは片づいていても運用者の確認が要る情報を捨てない）。
+    recovered: Option<PendingDeletionRecovery>,
+}
+
+impl ImageStoreGuard<'_> {
+    /// この取得時に行った中断削除の復旧結果。ジャーナルが無かったときは `None`。
+    pub fn recovery(&self) -> Option<&PendingDeletionRecovery> {
+        self.recovered.as_ref()
+    }
 }
 
 impl Deref for ImageStoreGuard<'_> {

@@ -30,6 +30,8 @@
 //!   pull リースのテーブル自体はまだメモリ上の別物で、テーブルの永続化は別 issue の担当。
 //!   そのため再試行時の新しいプロセスのテーブルには、ジャーナルの manifest が既に無いことが多い。
 //! - Windows ではディレクトリを std で開けないため、ディレクトリの fsync は行わない（no-op）。
+//!   そのため Windows では削除が完了しても [`DeletionDurability::Confirmed`] は返さず
+//!   [`DeletionDurability::Unconfirmed`] を返す（永続化を確認できていない）。
 //! - コンテナ参照テーブルの未解決（unresolved）参照の考慮は、その永続化が入ってから足す。
 
 use std::fs::{self, File, OpenOptions};
@@ -77,6 +79,21 @@ pub enum DeletionDurability {
     /// 再試行の上限に達しても消せない blob を孤児として残し、ジャーナルは片づけた。
     /// 残った blob は `undeleted_blobs` で報告され、運用者の手動確認が要る。
     Abandoned,
+    /// blob の unlink とジャーナル削除は完了したが、このプラットフォームではディレクトリの fsync が
+    /// できないため永続化を確認できていない（Windows。ベストエフォート）。`Confirmed` と同等には扱わない。
+    Unconfirmed,
+}
+
+/// ディレクトリの fsync でディレクトリエントリの永続化を確認できるプラットフォームか。
+const DIR_SYNC_SUPPORTED: bool = cfg!(unix);
+
+/// 全件片づいて最後の fsync まで成功したときの永続化状態。fsync できない環境では `Confirmed` を返さない。
+fn success_durability(dir_sync_supported: bool) -> DeletionDurability {
+    if dir_sync_supported {
+        DeletionDurability::Confirmed
+    } else {
+        DeletionDurability::Unconfirmed
+    }
 }
 
 /// 永続化する削除の意図。
@@ -94,6 +111,7 @@ pub(super) struct GcJournal {
 
 impl GcJournal {
     /// 何も消さない空のジャーナル（削除確定の fsync が未了であることを示す墓標）か。
+    #[cfg(test)]
     fn is_tombstone(&self) -> bool {
         self.manifests.is_empty() && self.untag.is_empty() && self.delete_blobs.is_empty()
     }
@@ -285,17 +303,17 @@ pub(super) fn write_journal(root: &Path, journal: &GcJournal) -> Result<(), OciE
             Err(err(OciErrorCode::Internal, "failed to persist gc journal"))
         }
         Err(PublishError::AfterPublish) => {
-            // rename 済みで root の fsync だけが失敗した。ジャーナルは見えているが永続化は未確定。
-            // 取り消せれば「削除前に収束」として Err を返す。取り消せなければ、見えているジャーナルが
-            // 自分のものである限り操作を続行する（次の lock のロールフォワードと整合し、最後の
-            // `settle` が fsync の成功まで Pending で保持する）。
-            if remove_journal(root).is_ok() {
-                return Err(err(OciErrorCode::Internal, "failed to persist gc journal"));
-            }
-            match read_journal(root) {
-                Ok(Some(j)) if !j.is_tombstone() => Ok(()),
-                _ => Err(err(OciErrorCode::Internal, "failed to persist gc journal")),
-            }
+            // rename 済みで root の fsync だけが失敗した。ジャーナルは見えているが、ディレクトリエントリの
+            // 永続化は未確定である。読み戻せても永続化の証明にならないため、削除（テーブル更新・unlink）は
+            // 始めずに必ず Err を返す。取り消せれば「削除前に収束」、取り消せなければ残ったジャーナルか墓標を
+            // 次の lock の復旧が片づける（複数回の fsync 失敗でも blob は消えないので余分に残す側にだけ誤る）。
+            let revoked = remove_journal(root).is_ok();
+            let msg = if revoked {
+                "failed to persist gc journal"
+            } else {
+                "failed to persist gc journal and could not revoke it; the next store lock recovers it"
+            };
+            Err(err(OciErrorCode::Internal, msg))
         }
     }
 }
@@ -534,7 +552,7 @@ pub(super) fn settle(
         return DeletionDurability::Pending;
     }
     match remove_journal(root) {
-        Ok(()) => DeletionDurability::Confirmed,
+        Ok(()) => success_durability(DIR_SYNC_SUPPORTED),
         Err(_) => DeletionDurability::Pending,
     }
 }
@@ -769,7 +787,7 @@ mod tests {
         assert_eq!(rec.removed_manifests, vec![d(0xa0)]);
         assert_eq!(rec.untagged, vec![tk("v1")]);
         assert_eq!(rec.deleted_blobs, vec![d(0x11), d(0xc1)]);
-        assert_eq!(rec.durability, DeletionDurability::Confirmed);
+        assert_eq!(rec.durability, success_durability(DIR_SYNC_SUPPORTED));
         after_state(&root, &store.lock().unwrap());
     }
 
@@ -807,7 +825,7 @@ mod tests {
         let rec = store.recover_pending_deletion().unwrap().unwrap();
         assert_eq!(rec.absent_blobs, vec![d(0x11), d(0xc1)]);
         assert!(rec.deleted_blobs.is_empty());
-        assert_eq!(rec.durability, DeletionDurability::Confirmed);
+        assert_eq!(rec.durability, success_durability(DIR_SYNC_SUPPORTED));
         assert!(!root.journal());
     }
 
@@ -884,11 +902,11 @@ mod tests {
             .unwrap();
         assert_eq!(out.kind, ImageRmKind::Deleted);
         assert_eq!(out.deleted_blobs, vec![d(0x11), d(0xc1)]);
-        assert_eq!(out.durability, DeletionDurability::Confirmed);
+        assert_eq!(out.durability, success_durability(DIR_SYNC_SUPPORTED));
         assert!(!root.journal());
         let out = t.execute_image_prune(&root.0).unwrap();
         assert_eq!(out.removed_manifests, vec![d(0xb0)]);
-        assert_eq!(out.durability, DeletionDurability::Confirmed);
+        assert_eq!(out.durability, success_durability(DIR_SYNC_SUPPORTED));
         assert!(!root.journal());
     }
 
@@ -917,7 +935,7 @@ mod tests {
         fs::remove_dir(&p).unwrap();
         let rec = store.recover_pending_deletion().unwrap().unwrap();
         assert_eq!(rec.absent_blobs, vec![d(0x11)]);
-        assert_eq!(rec.durability, DeletionDurability::Confirmed);
+        assert_eq!(rec.durability, success_durability(DIR_SYNC_SUPPORTED));
         assert!(!root.journal());
     }
 
@@ -1016,7 +1034,7 @@ mod tests {
         assert!(root.exists(&d(0x12)));
         let store = ImageStore::with_table(&root.0, table()).unwrap();
         let rec = store.recover_pending_deletion().unwrap().unwrap();
-        assert_eq!(rec.durability, DeletionDurability::Confirmed);
+        assert_eq!(rec.durability, success_durability(DIR_SYNC_SUPPORTED));
         assert!(rec.deleted_blobs.is_empty());
         assert!(root.exists(&d(0x12)));
         assert!(!root.journal());
@@ -1042,9 +1060,40 @@ mod tests {
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
         let store = ImageStore::with_table(&root.0, table()).unwrap();
         let rec = store.recover_pending_deletion().unwrap().unwrap();
-        assert_eq!(rec.durability, DeletionDurability::Confirmed);
+        assert_eq!(rec.durability, success_durability(DIR_SYNC_SUPPORTED));
         assert!(!root.journal());
         ensure_no_pending_journal(&root.0).unwrap();
+    }
+
+    /// OCI-7: 通常の lock 経路でも復旧結果（Abandoned と孤児 blob）が guard から取れる。
+    #[test]
+    fn oci7_lock_exposes_abandoned_recovery() {
+        let root = Root::new();
+        files(&root);
+        // 消せない blob にする（通常ファイルをディレクトリに差し替える）。
+        let victim = blob_path(&root.0, &d(0x11)).unwrap();
+        fs::remove_file(&victim).unwrap();
+        fs::create_dir(&victim).unwrap();
+        let store = ImageStore::with_table(&root.0, table()).unwrap();
+        let out = store.lock().unwrap().execute_image_prune(&root.0).unwrap();
+        assert_eq!(out.durability, DeletionDurability::Pending);
+        // 1 回目は prune、以降は lock 時の再試行。上限の手前までは結果を捨てて回す。
+        for _ in 2..MAX_GC_RETRY_ATTEMPTS {
+            drop(store.lock().unwrap());
+        }
+        let g = store.lock().unwrap();
+        let rec = g.recovery().expect("recovery must be reported");
+        assert_eq!(rec.durability, DeletionDurability::Abandoned);
+        assert_eq!(rec.undeleted_blobs, vec![d(0x11)]);
+        drop(g);
+        assert!(store.recover_pending_deletion().unwrap().is_none());
+    }
+
+    /// OCI-7: fsync できない環境では削除が完了しても Confirmed を返さない。
+    #[test]
+    fn oci7_success_without_dir_sync_is_unconfirmed() {
+        assert_eq!(success_durability(true), DeletionDurability::Confirmed);
+        assert_eq!(success_durability(false), DeletionDurability::Unconfirmed);
     }
 
     /// OCI-7: 書き込み中のクラッシュで残った一時ファイルは lock 時に回収される。

@@ -68,7 +68,7 @@ pub struct ImagePruneOutcome {
     pub undeleted_blobs: Vec<Digest>,
     /// 消した blob ファイルの合計バイト数。
     pub reclaimed_bytes: u64,
-    /// 削除の永続化の状態（消す blob があってジャーナルを使ったときだけ `Confirmed` / `Pending`。#851）。
+    /// 削除の永続化の状態（消す blob があってジャーナルを使ったときだけ `Confirmed` / `Pending` / `Unconfirmed`（fsync 不可の環境）。#851）。
     pub durability: DeletionDurability,
 }
 

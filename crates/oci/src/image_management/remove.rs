@@ -262,7 +262,7 @@ pub struct ImageRmOutcome {
     pub kept_blobs: Vec<Digest>,
     /// 通常ファイルでない・削除に失敗したため残した blob（削除ジャーナルに残り、次の lock の再試行〔#851〕で回収する）。
     pub undeleted_blobs: Vec<Digest>,
-    /// 削除の永続化の状態（完全削除でジャーナルを使ったときだけ `Confirmed` / `Pending`。#851）。
+    /// 削除の永続化の状態（完全削除でジャーナルを使ったときだけ `Confirmed` / `Pending` / `Unconfirmed`（fsync 不可の環境）。#851）。
     pub durability: DeletionDurability,
 }
 

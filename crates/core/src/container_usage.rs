@@ -107,7 +107,14 @@ fn measure_bundles(count: usize, bundles: Vec<PathBuf>) -> Result<ContainerDiskU
             }
         }
         let rootfs = match load_config(&bundle.join("config.json")) {
-            Ok(cfg) => Some(bundle.join(cfg.root().path())),
+            Ok(cfg) => match rootfs_within_bundle(bundle, cfg.root().path()) {
+                Some(p) => Some(p),
+                None => {
+                    // bundle 外を指す root.path は走査しない（SEC-1。create 側と整合）。
+                    w.usage.unreadable_configs += 1;
+                    None
+                }
+            },
             Err(_) => {
                 w.usage.unreadable_configs += 1;
                 None
@@ -119,6 +126,26 @@ fn measure_bundles(count: usize, bundles: Vec<PathBuf>) -> Result<ContainerDiskU
         }
     }
     Ok(w.usage)
+}
+
+/// `root.path` を bundle に結合し、bundle 配下に収まる場合だけ返す（SEC-1・OCI-7）。
+/// `..` 成分、および symlink 解決後に bundle の外へ出る経路は `None`（改ざん config.json による
+/// 任意ディレクトリの走査を防ぐ）。rootfs が未作成で解決できない場合は字句上のパスを返す。
+fn rootfs_within_bundle(bundle: &Path, root_path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    if root_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
+    {
+        return None;
+    }
+    let joined = bundle.join(root_path);
+    let canon_bundle = fs::canonicalize(bundle).ok()?;
+    match fs::canonicalize(&joined) {
+        Ok(c) if c.starts_with(&canon_bundle) => Some(joined),
+        Ok(_) => None,
+        Err(_) => joined.starts_with(bundle).then_some(joined),
+    }
 }
 
 #[cfg(unix)]
@@ -330,17 +357,45 @@ mod tests {
         assert_eq!(u.mount_points_skipped, 0);
     }
 
-    /// OCI-7: bundle 外の絶対パスの rootfs と、同じ bundle を共有する 2 コンテナ。
+    /// OCI-7・SEC-1: 同じ bundle を共有する 2 コンテナは 1 回だけ数える。
     #[test]
-    fn oci7_container_usage_external_rootfs_and_shared_bundle_counted_once() {
-        let t = Tmp::new("ext");
-        let ext = t.0.join("ext-rootfs");
-        fs::create_dir_all(&ext).unwrap();
-        fs::write(ext.join("f"), vec![0u8; 2000]).unwrap();
-        let (b, cfg_len) = make_bundle(&t.0, "b1", ext.to_str().unwrap());
+    fn oci7_container_usage_shared_bundle_counted_once() {
+        let t = Tmp::new("shared");
+        let (b, cfg_len) = make_bundle(&t.0, "b1", "rootfs");
+        fs::write(b.join("rootfs/f"), vec![0u8; 2000]).unwrap();
         let u = measure_container_usage(&FakeStore(vec![rec(&b, 1), rec(&b, 2)])).unwrap();
         assert_eq!(u.count, 2);
         assert_eq!(u.bytes, 2000 + cfg_len);
+        assert_eq!(u.unreadable_configs, 0);
+    }
+
+    /// OCI-7・SEC-1: `..` と bundle 外の絶対パスの root.path は走査せず unreadable_configs に数える。
+    #[test]
+    fn oci7_container_usage_rejects_escaping_root_path() {
+        let t = Tmp::new("escape");
+        let ext = t.0.join("ext-rootfs");
+        fs::create_dir_all(&ext).unwrap();
+        fs::write(ext.join("f"), vec![0u8; 2000]).unwrap();
+        let (b1, len1) = make_bundle(&t.0, "b1", ext.to_str().unwrap());
+        let (b2, len2) = make_bundle(&t.0, "b2", "../ext-rootfs");
+        let u = measure_container_usage(&FakeStore(vec![rec(&b1, 1), rec(&b2, 2)])).unwrap();
+        assert_eq!(u.unreadable_configs, 2);
+        assert_eq!(u.bytes, len1 + len2);
+    }
+
+    /// OCI-7・SEC-1: bundle 内の symlink 経由で外へ出る root.path も走査しない。
+    #[test]
+    fn oci7_container_usage_rejects_symlink_escape() {
+        let t = Tmp::new("symesc");
+        let ext = t.0.join("ext-rootfs");
+        fs::create_dir_all(&ext).unwrap();
+        fs::write(ext.join("f"), vec![0u8; 2000]).unwrap();
+        let (b, len) = make_bundle(&t.0, "b1", "link/sub");
+        fs::create_dir_all(ext.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&ext, b.join("link")).unwrap();
+        let u = measure_container_usage(&FakeStore(vec![rec(&b, 1)])).unwrap();
+        assert_eq!(u.unreadable_configs, 1);
+        assert_eq!(u.bytes, len);
     }
 
     /// OCI-7: bundle が無ければ missing_bundles、config.json が不正なら unreadable_configs。

@@ -1250,6 +1250,9 @@ pub struct IsolationPlan {
 /// 保ったまま**分離する。コンテナ内 root はホスト root そのものであり、SEC-5（非 root 起動時に
 /// コンテナ内 root をホストの非特権 UID へ写す）の保護は受けない。
 ///
+/// 本番の launcher と supervisor はこの権限モデルを拒否する（許すかは #2241 で判断待ち。
+/// `docs/design/rootful-host-root.md`）。この経路は分離の下位 API で、結合試験の構成が使う。
+///
 /// **用途**: CORE-7・CORE-9 の rootful 分離（spec 上、dev-box02 の PoC-14・15・17 で実機実証済みの
 /// 構成）。root 起動でもコンテナ内 root を非特権 UID へ写す構成は未実装（TASK-40.2 の
 /// [`plan_rootless_subordinate`] は非 root 起動に限る）で、それまでの暫定経路ではなく明示的に選ぶ別経路として分けている。

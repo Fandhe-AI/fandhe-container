@@ -18,7 +18,9 @@
 //! # ループの意味論（spec の確定値ではなく本実装の判断）
 //! - 固定遅延: 初回はループ開始から interval 後、以降は前回の判定が戻った時刻から interval 後。
 //!   前回と重ならないので `ProbeRunner` の「同時に走る判定は最大 1 本」と整合する。
-//! - `FailedPrecondition`（Running でない・所有権を失った。SUP-1）が返ったら [`HealthcheckLoopOutcome::Halted`] で止める。
+//! - `FailedPrecondition`（Running でない・所有権を失った。SUP-1）が返り、かつ最新レコードでも前提が崩れていれば
+//!   [`HealthcheckLoopOutcome::Halted`] で止める。前提が保たれている `FailedPrecondition`（書き込み競合の使い切り）は
+//!   一時的な失敗として tick の結果に載せ、次の tick へ継続する。
 //!   `Unavailable`（前回の判定が未終了）は次の tick へ進む。その他の失敗は tick の結果に載せて継続する。
 //!   このため [`crate::health::HealthProbe`] の実装は、コマンドの失敗に `FailedPrecondition` を使ってはならない。
 //! - 待ちはすべて有限（期限つき `sleep_until`・`probe_and_record` の timeout）で、[`StopToken`] で止められる。
@@ -32,7 +34,9 @@ use fandhe_container_core::traits::{ErrorCode, StateRecord, TraitError};
 
 use super::HealthcheckDefinition;
 use crate::health::{ProbeFailure, ProbeRunner, probe_and_record};
-use crate::run::{MAX_POLL_INTERVAL, MonitorObserver, StopToken};
+use crate::run::{
+    MAX_POLL_INTERVAL, MonitorObserver, StopToken, ensure_owner, is_running_with_pid,
+};
 use crate::state::SupervisedState;
 
 /// 停止要求を確かめる待ちの刻み（`restart` のバックオフ待ちと同じ方式）。
@@ -167,8 +171,11 @@ pub fn run_periodic(
         let result = probe_and_record(state, process, runner, schedule.timeout, obs);
         ticks = ticks.saturating_add(1);
         let finished = clock.now();
+        // 書き込み競合の使い切りも `FailedPrecondition` で返るため、最新レコードで前提（Running・pid・所有）が
+        // 実際に崩れているときだけ止める。保たれていれば一時的な競合として次の tick へ継続する（SUP-1・SUP-4）。
         if let Err(f) = &result
             && f.error().code() == ErrorCode::FailedPrecondition
+            && !still_owned(state, process)
         {
             return HealthcheckLoopOutcome::Halted {
                 error: f.error().clone(),
@@ -185,6 +192,16 @@ pub fn run_periodic(
         };
         next = t;
     }
+}
+
+/// 最新レコードで Running・起動 pid 一致・自 supervisor 所有がまだ成り立つか。読み直せない場合は偽（安全側で止める）。
+fn still_owned(state: &mut SupervisedState, process: &dyn LaunchedProcess) -> bool {
+    let Some(self_pid) = std::num::NonZeroU32::new(std::process::id()) else {
+        return false;
+    };
+    state.refresh().is_ok()
+        && is_running_with_pid(state.record(), process.pid())
+        && ensure_owner(state.record(), self_pid).is_ok()
 }
 
 /// exec の終了状態を health へ写す（SUP-4・SUP-6）。`FailedPrecondition` は返さない（ループの停止条件と区別するため）。
@@ -224,7 +241,7 @@ mod tests {
     use std::num::NonZeroU32;
     use std::sync::{Arc, Mutex};
 
-    struct MemStore(Mutex<StateRecord>);
+    struct MemStore(Mutex<StateRecord>, std::sync::atomic::AtomicBool);
 
     impl StateStore for MemStore {
         fn create(&self, _: &CreateStateRequest) -> Result<StateRecord, TraitError> {
@@ -232,7 +249,9 @@ mod tests {
         }
         fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
             let mut g = self.0.lock().unwrap();
-            if g.revision() != req.expected_revision() {
+            if self.1.load(std::sync::atomic::Ordering::SeqCst)
+                || g.revision() != req.expected_revision()
+            {
                 return Err(TraitError::new(ErrorCode::FailedPrecondition, "stale"));
             }
             let sup = req.supervision().unwrap_or_else(|| g.supervision());
@@ -335,6 +354,11 @@ mod tests {
     }
 
     fn state(owner: Option<NonZeroU32>, running: bool) -> SupervisedState {
+        state_with(owner, running, false)
+    }
+
+    /// `always_stale` なら update が常に revision 競合（`FailedPrecondition`）を返す。
+    fn state_with(owner: Option<NonZeroU32>, running: bool, always_stale: bool) -> SupervisedState {
         let id = ContainerId::new("c1").unwrap();
         let status = if running {
             ContainerStatus::running(id.clone(), NonZeroU32::new(42))
@@ -348,7 +372,10 @@ mod tests {
         )
         .unwrap()
         .with_supervision(SupervisionState::new(owner, None, 0));
-        let store: Arc<dyn StateStore> = Arc::new(MemStore(Mutex::new(rec)));
+        let store: Arc<dyn StateStore> = Arc::new(MemStore(
+            Mutex::new(rec),
+            std::sync::atomic::AtomicBool::new(always_stale),
+        ));
         SupervisedState::attach(store, id).unwrap()
     }
 
@@ -488,6 +515,28 @@ mod tests {
         }
         assert!(probe.starts.lock().unwrap().is_empty());
         assert!(seen.is_empty());
+    }
+
+    /// SUP-1・SUP-4: 書き込み競合の使い切り（FailedPrecondition）でも、所有・Running が保たれていれば Halted にせず継続する。
+    #[test]
+    fn sup4_periodic_continues_on_stale_write_conflict() {
+        let clock = FakeClock::new(None);
+        let probe = Arc::new(TimedProbe {
+            clock: clock.clone(),
+            starts: Mutex::new(Vec::new()),
+            cost: Duration::ZERO,
+            result: ok_healthy,
+        });
+        let mut st = state_with(Some(me()), true, true);
+        let (out, seen) = run(&schedule("10s", "5s"), &mut st, &clock, probe.clone(), 3);
+        assert_eq!(out, HealthcheckLoopOutcome::Stopped { ticks: 3 });
+        assert_eq!(probe.starts.lock().unwrap().len(), 3);
+        for t in &seen {
+            assert_eq!(
+                t.result.as_ref().unwrap_err().error().code(),
+                ErrorCode::FailedPrecondition
+            );
+        }
     }
 
     /// SUP-4: probe の失敗は止まらず継続し、tick の結果へ失敗が載る。

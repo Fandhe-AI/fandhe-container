@@ -58,7 +58,7 @@ OCI の既定 config にある `{"destination":"/sys","type":"sysfs"}` を受け
 | 供給方式 | 初期 user namespace（ホスト root の試験経路）は新しい sysfs。user namespace の中（本番の `start` 経路）はホストの `/sys` を再帰 bind し、切り離したまま再帰で `ro`・`nosuid`・`nodev`・`noexec` を付けてから載せる |
 | 事後検証 | 載せた後に mountinfo で、`/sys` が sysfs であり、`/sys` とその配下のすべてのマウントが `ro,nosuid,nodev,noexec` であることを確かめる。満たさなければ起動しない |
 
-方式は結果ではなく user namespace で事前に決め、失敗しても別の方式へ縮退しない（想定外の拒否を隠さないため）。コンテナは自前の network namespace を持たないため、user namespace の中では新しい sysfs を載せられず、本番では常にホストの `/sys` の読み取り専用の再帰 bind になる。この場合、ホストの `/sys` とその配下のマウント（cgroup2・securityfs・bpf・debugfs・tracefs など）が読み取り専用で見える。`/sys` 配下の個別項目（`/sys/firmware` など）の覆いは #2014、`/sys` 配下への tmpfs・注入ファイルは #2233 で扱う。Landlock には `/sys` のルールを足さない（実効の権利は root と同じで、書き込みの禁止は VFS の `ro` が担う）。
+方式は結果ではなく user namespace で事前に決め、失敗しても別の方式へ縮退しない（想定外の拒否を隠さないため）。コンテナは自前の network namespace を持たないため、user namespace の中では新しい sysfs を載せられず、本番では常にホストの `/sys` の読み取り専用の再帰 bind になる。この場合、ホストの `/sys` とその配下のマウント（cgroup2・securityfs・bpf・debugfs・tracefs など）が読み取り専用で見える。sysfs を供給する構成では、`/sys/devices/virtual/powercap`・`/sys/firmware`・`/sys/devices/system/cpu/cpuN/thermal_throttle`（`possible` が示す CPU のうち存在するもの。上限 8192 件。存在しないものは飛ばす）を読み取り専用の空 tmpfs で覆う（moby の既定の覆いと同じ集合。#2014）。sysfs を供給しない構成では覆わない。debugfs・tracefs・securityfs・bpf 等の擬似 FS は覆わない（moby も覆わず、rootless ではコンテナ内 root がホストの非特権 UID に写り、すべて読み取り専用のため。範囲を広げるかはオーナー判断待ち）。`/sys` 配下への tmpfs・注入ファイルは #2233 で扱う。Landlock には `/sys` のルールを足さない（実効の権利は root と同じで、書き込みの禁止は VFS の `ro` が担う）。
 
 Docker / runc との差: 本実装は方式を事前に決め、縮退しない。runc・moby が rootless で sysfs をどの条件で bind に差し替えるかは一次資料の確認が済んでおらず（未確認）、確定したら本節を更新する。
 

@@ -429,7 +429,24 @@ mod linux {
     }
 
     fn mkdir(path: &Path) {
-        std::fs::create_dir_all(path).unwrap_or_else(|e| panic!("mkdir {}: {e}", path.display()));
+        // `create_dir_all` は途中の symlink を辿るため、祖先を 1 階層ずつ `lstat` して非 symlink のみ許容し、
+        // 無ければ `create_dir` で作る（基点の bundle は排他作成済みの 0700。#2324・SEC-2）。
+        let mut chain: Vec<&Path> = path.ancestors().filter(|a| a.parent().is_some()).collect();
+        chain.reverse();
+        for dir in chain {
+            match std::fs::symlink_metadata(dir) {
+                Ok(md) => assert!(
+                    md.is_dir() && !md.file_type().is_symlink(),
+                    "{} exists and is not a plain directory",
+                    dir.display()
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir(dir)
+                        .unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+                }
+                Err(e) => panic!("lstat {}: {e}", dir.display()),
+            }
+        }
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
             .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
     }

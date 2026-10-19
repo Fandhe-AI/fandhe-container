@@ -63,7 +63,7 @@ use super::create_start::{OP_LOG_ENV, export_ops, open_store, production_runtime
 const LIST_HEADER: &str = "ID\tSTATUS\tPID\n";
 
 /// 走査するページ数の上限（REPAIR-5）。不正なストア実装が `next_cursor` を返し続けても無期限に回らない。
-const MAX_LIST_PAGES: u32 = 100_000;
+pub(super) const MAX_LIST_PAGES: u32 = 100_000;
 
 /// 1 レコードを 1 行（LF 終端）で `out` へ追記する。PID が無ければ `-`。
 fn format_record_line(record: &StateRecord, out: &mut String) {
@@ -147,7 +147,7 @@ fn container_exists(store: &dyn StateStore, id: &ContainerId) -> Result<(), Trai
 }
 
 /// 計測へ成功・失敗を 1 回だけ記録する（core の list / get は記録しないため CLI 側で記録する。REPAIR-4）。
-fn record_op(recorder: &OpRecorder, op_name: &str, ok: bool, started: Instant) {
+pub(super) fn record_op(recorder: &OpRecorder, op_name: &str, ok: bool, started: Instant) {
     if let Ok(name) = OpName::new(op_name) {
         let outcome = if ok {
             OpOutcome::Success
@@ -165,7 +165,7 @@ fn record_op(recorder: &OpRecorder, op_name: &str, ok: bool, started: Instant) {
 /// 拒否」などを区別できる固定文言の識別子で出す（C1・TASK-79.4 追補）。照合は `plugin_backend` の固定文言表との
 /// 完全一致のみで、一致時に出すのはその `&'static str` 定数だけ。core の `TraitError::message`
 /// （`--root` 不正・発見の I/O エラー等を含む）は出力へ流さず、表に無い失敗は従来の汎用文言に落とす。
-fn store_open_failure(e: &TraitError) -> CliExit {
+pub(super) fn store_open_failure(e: &TraitError) -> CliExit {
     #[cfg(not(target_os = "linux"))]
     if let Some(kind) = super::plugin_backend::BackendFailure::classify(e) {
         return CliExit::Error(crate::error::CliError::new(kind.code(), kind.message()));

@@ -9,9 +9,28 @@
 //! 各呼び出しは内側で [`ImageStore::lock`]（期限つき。REPAIR-5）を取り、返る前に解放する。
 //! `StateStore` の操作や start の所有ロックをまたいで排他を持たないため、デッドロックの経路を作らない。
 //!
+//! # 未確定・確定と登録世代（#2315・core の `ContainerImageRefs` の契約）
+//!
+//! 登録は未確定で入り、[`ImageStore::bind_container_ref`]（create の状態作成の成功直後）で確定する。
+//! 世代は新規登録ごとに採番され、外して登録し直しても過去の値を再発行しない。世代の比較と解除は
+//! [`ImageStore::release_container_ref_if`] が 1 回の排他の中で行う。
+//!
+//! # 未確定参照の回収と #854 との分担
+//!
+//! 状態作成の曖昧な失敗（`Internal`・`Timeout`）で未確定のまま残った参照は、ID 指定の delete では外れず、
+//! 同じ ID の再作成を `AlreadyExists` で塞ぐ。これを外す部品が [`ImageStore::release_unbound_container_ref_if`]
+//! （未確定かつ世代一致のときだけ外す）。呼び出し元は「その ID の create が進行中でない」ことを保証できる
+//! 場合だけに限る。起動点は #854（再起動時の照合）が持ち、順序は「進行中の create が無いことの保証 →
+//! `StateStore` で状態が無いことを確認 → `unbound_containers` で読んだ世代つきで回収」とする。
+//! `register` 時に未確定を置き換えない理由は、並行する同じ ID の create の未確定参照と区別できるのが
+//! 世代だけで、競合側のロールバック（ID 指定の `release`）が勝った側の参照を外しうるため。
+//!
+//! 参照テーブルはプロセスごとのメモリ上で永続化されない（未実装。REPAIR-3）。永続化を入れるときは、
+//! エントリだけでなく世代カウンタも保存する（再起動後に過去の世代を再発行しないため）。
+//!
 //! 排他の取得は `AcquireImageStoreLock` として記録済みなので、ここでは別の操作種別を増やさない。
 
-use super::{ContainerRefId, ImageStore};
+use super::{ContainerRefGeneration, ContainerRefId, ImageStore};
 use crate::error::{OciError, OciErrorCode};
 use crate::reference::Digest;
 
@@ -46,13 +65,82 @@ impl ImageStore {
         manifest: &Digest,
     ) -> Result<ContainerRefRegistration, OciError> {
         let mut guard = self.lock()?;
-        let already = guard.container_refs.get(id) == Some(manifest);
+        let already = guard.container_refs.get(id).map(|e| &e.manifest) == Some(manifest);
         guard.register_container(id.clone(), manifest)?;
         Ok(if already {
             ContainerRefRegistration::AlreadyRegistered
         } else {
             ContainerRefRegistration::Registered
         })
+    }
+
+    /// 未確定の登録だけを確定し、その登録世代を返す（`ContainerImageRefs::bind`）。
+    ///
+    /// 登録が無い、または確定済みなら `NotFound`（二重の確定を許さない）。
+    pub fn bind_container_ref(
+        &self,
+        id: &ContainerRefId,
+    ) -> Result<ContainerRefGeneration, OciError> {
+        let mut guard = self.lock()?;
+        match guard.container_refs.get_mut(id) {
+            Some(e) if !e.bound => {
+                e.bound = true;
+                Ok(e.generation)
+            }
+            _ => Err(OciError::new(
+                OciErrorCode::NotFound,
+                "no unbound container reference",
+            )),
+        }
+    }
+
+    /// 確定済みの登録の世代を返す。登録が無い・未確定なら `None`（`ContainerImageRefs::registration`）。
+    pub fn container_ref_registration(
+        &self,
+        id: &ContainerRefId,
+    ) -> Result<Option<ContainerRefGeneration>, OciError> {
+        let guard = self.lock()?;
+        Ok(guard
+            .container_refs
+            .get(id)
+            .filter(|e| e.bound)
+            .map(|e| e.generation))
+    }
+
+    /// 登録世代が `expected` のときだけ外す。比較と解除は同じ排他の中（`ContainerImageRefs::release_if`）。
+    ///
+    /// 世代が違う・登録が無ければテーブルを変えず `NotRegistered`。
+    pub fn release_container_ref_if(
+        &self,
+        id: &ContainerRefId,
+        expected: ContainerRefGeneration,
+    ) -> Result<ContainerRefRelease, OciError> {
+        let mut guard = self.lock()?;
+        if guard.container_refs.get(id).map(|e| e.generation) != Some(expected) {
+            return Ok(ContainerRefRelease::NotRegistered);
+        }
+        let removed = guard.unregister_container(id)?;
+        Ok(ContainerRefRelease::Released(removed))
+    }
+
+    /// 未確定かつ世代が `expected` のときだけ外す（確定済みには触れない）。未確定参照の回収の部品。
+    ///
+    /// 呼び出し元は、その ID の create が進行中でないことを保証できる場合だけ使う（モジュール doc、#854）。
+    pub fn release_unbound_container_ref_if(
+        &self,
+        id: &ContainerRefId,
+        expected: ContainerRefGeneration,
+    ) -> Result<ContainerRefRelease, OciError> {
+        let mut guard = self.lock()?;
+        let matches = guard
+            .container_refs
+            .get(id)
+            .is_some_and(|e| !e.bound && e.generation == expected);
+        if !matches {
+            return Ok(ContainerRefRelease::NotRegistered);
+        }
+        let removed = guard.unregister_container(id)?;
+        Ok(ContainerRefRelease::Released(removed))
     }
 
     /// コンテナ `id` の参照を、排他の下で外す。登録が無ければ `NotRegistered`（エラーにしない）。
@@ -187,6 +275,117 @@ mod tests {
         drop(s.lock().expect("lock after release"));
         let _ = s.register_container_ref(&cid("c2"), &d(0xee));
         drop(s.lock().expect("lock after failed register"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// OCI-7: 登録直後は未確定（registration は None）、bind で確定し世代を返す。二重の bind と未登録は NotFound。
+    #[test]
+    fn oci7_bind_confirms_and_rejects_twice() {
+        let (s, dir) = store("bind");
+        s.register_container_ref(&cid("c1"), &d(0xa0)).expect("reg");
+        assert_eq!(s.container_ref_registration(&cid("c1")).expect("r"), None);
+        let g = s.bind_container_ref(&cid("c1")).expect("bind");
+        assert_eq!(g.as_raw(), 1);
+        assert_eq!(
+            s.container_ref_registration(&cid("c1")).expect("r"),
+            Some(g)
+        );
+        assert_eq!(
+            s.bind_container_ref(&cid("c1")).expect_err("twice").code(),
+            OciErrorCode::NotFound
+        );
+        assert_eq!(
+            s.bind_container_ref(&cid("none")).expect_err("none").code(),
+            OciErrorCode::NotFound
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// OCI-7: release_if は世代違いでテーブルを変えず、一致で外す。再登録の世代は前より大きい。
+    #[test]
+    fn oci7_release_if_checks_generation_and_never_reissues() {
+        let (s, dir) = store("relif");
+        s.register_container_ref(&cid("c1"), &d(0xa0)).expect("reg");
+        let g1 = s.bind_container_ref(&cid("c1")).expect("bind");
+        let stale = ContainerRefGeneration::from_raw(g1.as_raw() + 5);
+        assert_eq!(
+            s.release_container_ref_if(&cid("c1"), stale)
+                .expect("stale"),
+            ContainerRefRelease::NotRegistered
+        );
+        assert_eq!(
+            s.container_ref_registration(&cid("c1")).expect("r"),
+            Some(g1)
+        );
+        assert_eq!(
+            s.release_container_ref_if(&cid("c1"), g1).expect("match"),
+            ContainerRefRelease::Released(d(0xa0))
+        );
+        assert_eq!(
+            s.release_container_ref_if(&cid("c1"), g1).expect("again"),
+            ContainerRefRelease::NotRegistered
+        );
+        s.register_container_ref(&cid("c1"), &d(0xa0)).expect("re");
+        let g2 = s.bind_container_ref(&cid("c1")).expect("bind2");
+        assert_eq!((g1.as_raw(), g2.as_raw()), (1, 2));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// OCI-7: 回収の部品は未確定かつ世代一致だけを外し、確定済みには触れない。未確定も GC の参照数に入る。
+    #[test]
+    fn oci7_release_unbound_only_touches_unbound_matching_generation() {
+        let (s, dir) = store("unbound");
+        s.register_container_ref(&cid("c1"), &d(0xa0)).expect("reg");
+        s.register_container_ref(&cid("c2"), &d(0xb0)).expect("reg");
+        let g2 = s.bind_container_ref(&cid("c2")).expect("bind");
+        let (g1, listed) = {
+            let g = s.lock().expect("lock");
+            let v: Vec<_> = g
+                .unbound_containers()
+                .map(|(i, gen_, m)| (i.clone(), gen_, m.clone()))
+                .collect();
+            assert_eq!(g.manifest_references(&d(0xa0)).containers, vec![cid("c1")]);
+            (v[0].1, v)
+        };
+        assert_eq!(listed, vec![(cid("c1"), g1, d(0xa0))]);
+        // 確定済みは世代が合っても外れない。
+        assert_eq!(
+            s.release_unbound_container_ref_if(&cid("c2"), g2)
+                .expect("bound"),
+            ContainerRefRelease::NotRegistered
+        );
+        // 世代違いは外れない。
+        assert_eq!(
+            s.release_unbound_container_ref_if(&cid("c1"), g2)
+                .expect("stale"),
+            ContainerRefRelease::NotRegistered
+        );
+        assert_eq!(
+            s.release_unbound_container_ref_if(&cid("c1"), g1)
+                .expect("ok"),
+            ContainerRefRelease::Released(d(0xa0))
+        );
+        s.register_container_ref(&cid("c1"), &d(0xa0))
+            .expect("re-create");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// OCI-7・REPAIR-5: 新しい入口も返る前に排他を解放する。
+    #[test]
+    fn oci7_new_container_ref_ops_release_lock() {
+        let (s, dir) = store("lock2");
+        s.register_container_ref(&cid("c1"), &d(0xa0)).expect("reg");
+        let g = s.bind_container_ref(&cid("c1")).expect("bind");
+        drop(s.lock().expect("after bind"));
+        let _ = s.bind_container_ref(&cid("c1"));
+        drop(s.lock().expect("after failed bind"));
+        s.container_ref_registration(&cid("c1")).expect("r");
+        drop(s.lock().expect("after registration"));
+        s.release_unbound_container_ref_if(&cid("c1"), g)
+            .expect("u");
+        drop(s.lock().expect("after unbound"));
+        s.release_container_ref_if(&cid("c1"), g).expect("i");
+        drop(s.lock().expect("after release_if"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

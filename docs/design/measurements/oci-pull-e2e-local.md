@@ -4,7 +4,7 @@
 
 - 対象ビヘイビア: OCI-1（イメージの pull・展開・実行）
 - 関連タスク: TASK-55.1（#420・PR #2190。ハーネス本体）・TASK-55.2（#421。本書）。親は TASK-55（#419）・MS-4
-- ステータス: **pull・digest 検証・展開は 4 イメージで成功（4/5）。run 段（コンテナ実行・終了コード 0 の確認）は AppArmor による非特権 user namespace の制限で 4 件とも `PERMISSION_DENIED` のため未達。`redis:alpine` は計測時点では config 段で `INVALID_ARGUMENT`（#2314 で core とハーネスを修正済み。修正後の実測は未実施。所見参照）。終了コード 0 の確認は人間へ引き継ぐ**（成功を装わない。REPAIR-3）
+- ステータス: **pull・digest 検証・展開は 4 イメージで成功（4/5）。run 段（コンテナ実行・終了コード 0 の確認）は AppArmor による非特権 user namespace の制限で 4 件とも `PERMISSION_DENIED` のため未達。`redis:alpine` は計測時点では config 段で `INVALID_ARGUMENT`（#2314 で core とハーネスを修正済み。修正後の実測は未実施。所見参照）。終了コード 0 の確認は人間へ引き継ぐ（#2313 で追跡）**（成功を装わない。REPAIR-3）
 
 ## 必要環境・必要権限
 
@@ -77,13 +77,35 @@ systemd-run --user --scope -p Delegate=yes <上で得た実行ファイル> --ig
 
 - 展開時のデバイス・FIFO・hardlink 制限による失敗は出なかった（ハーネスでの回避なし）。debian の `stripped_special_bits: 11` は setuid / setgid / sticky を既定で落とした数（`docs/design/oci-layer-special-bits.md`）
 - `redis:alpine` は config 段で `INVALID_ARGUMENT`。原因はハーネスの `derive_process`（`crates/oci/tests/pull_e2e.rs`）のコード上の挙動から特定した。args を Entrypoint ++ cmd で組み立てるが、`redis:alpine` の Entrypoint は相対パスの `docker-entrypoint.sh` で `args[0]` が絶対パスにならず、`--cmd` で上書きしても Entrypoint は残る（実行での再現確認は未実施）。当時は core の launch が絶対パスの `args[0]` しか受けず（`start` の検査と `Entrypoint::new`）、ハーネスも同じ制約を持っていた。#2314（OCI-1）で、名前だけの `args[0]` を core が pivot 後に `process.env` の `PATH` で解決するようになり（runtime-spec・runc と同じ。`crates/core/src/exec/path_lookup.rs`）、ハーネスも受けるようにした。`redis:alpine` は config 段を通る見込みだが、実機での再実行は未実施（成功を装わない。REPAIR-3）。`/` を含む相対パスの `args[0]` は未対応のまま。pull と verify は成功しているため、受け入れ条件の 3 種以上には既定の 3 種（alpine・debian・nginx:alpine）を用いる
-- 既知の制約（ハーネスの `//!` と同じ）: `User`・`WorkingDir` は無視、`diff_id` は未検証、レイヤーは gzip のみ
+- 既知の制約（ハーネスの `//!` と同じ）: `WorkingDir` を `process.cwd`、数値形式の `User` を `process.user` へ写す（名前形式は `UNIMPLEMENTED`、非 root の `User` は `FANDHE_CONTAINER_TEST_ID_HELPER=1` 無しでは `FAILED_PRECONDITION`）、`diff_id` は未検証、レイヤーは gzip のみ
 
 ## 引き継ぎ（人間担当）
 
-受け入れ条件の「終了コード 0 の確認」は未達で、#421 を open のまま維持して追跡する（人間担当の引き継ぎ Issue は別途起票しない。起票は承認が要るため）。次を人間が実機で行い、結果を本書へ追記する。#1621 でも同じ sysctl の緩和が要るため、同じ作業の中で実施するとよい。
+受け入れ条件の「終了コード 0 の確認」は未達で、#421 は PR #2256 で close 済みのため、#2313（人間担当）で追跡する。次を人間が実機で行い、結果を本書へ追記する。#1621 でも同じ sysctl の緩和が要るため、同じ作業の中で実施するとよい。
 
 1. `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
-2. 上記「実行手順」のコマンドを実行する
-3. 結果の表の run 列と exit を本書へ追記する（`redis:alpine` を加えて config 段を通ることも確かめる。上記のとおり終了するコマンドで上書きする）
+2. `unshare -Ur true` が成功することを確かめ、上記「実行手順」のコマンドを実行する（非 root の `User` で `FAILED_PRECONDITION` が出たら `FANDHE_CONTAINER_TEST_ID_HELPER=1` を付けて再実行する）
+3. 結果の表の run 列と exit を本書へ追記する（`redis:alpine` を加えて config 段を通ることも確かめる）
 4. `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1` で元に戻す
+5. `sysctl kernel.apparmor_restrict_unprivileged_userns` の出力を下記「run 段の実機記録」へ記入する
+
+## run 段の実機記録（#2313。未実施）
+
+人間が実機で記入する欄。ホスト名・IP アドレス・ユーザー名は書かない（カーネル版と sysctl 値など環境の条件だけ）。失敗時は `stdout_tail` / `stderr_tail` と原因を書く。manifest digest が上の記録と変わった場合はその値も注記する。
+
+| 項目 | 値 |
+| ---- | -- |
+| 実行日時 | 未記入 |
+| uid | 未記入 |
+| カーネル版 | 未記入 |
+| 緩和前の sysctl 値 | 未記入 |
+| 緩和後の sysctl 値 | 未記入 |
+| `unshare -Ur true` の結果 | 未記入 |
+| 戻した後の sysctl 値 | 未記入 |
+
+| イメージ | run (ms) | exit kind | exit code | stage_failed | error_code | 成否 |
+| -------- | -------- | --------- | --------- | ------------ | ---------- | ---- |
+| alpine | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 |
+| debian:bookworm-slim | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 |
+| nginx:alpine | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 |
+| busybox | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 |

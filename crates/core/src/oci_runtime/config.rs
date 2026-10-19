@@ -1254,7 +1254,7 @@ impl OciConfig {
         self.resources.as_ref()
     }
 
-    /// `linux.cgroupsPath`（値の検証と受理は #2010。現状は指定があれば create / start が拒否する）。
+    /// `linux.cgroupsPath`（値は配置に使わない方針で、指定があれば create / start が拒否する。#2010）。
     pub fn cgroups_path(&self) -> Option<&CgroupsPath> {
         self.cgroups_path.as_ref()
     }

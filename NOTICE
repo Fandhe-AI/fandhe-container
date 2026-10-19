@@ -16,9 +16,13 @@ Commit:  9fabd6dfbb926381278c436a866bc8d6ac222274
 What was derived: only the path strings of the default OCI
 linux.readonlyPaths (5 entries: /proc/bus, /proc/fs, /proc/irq,
 /proc/sys, /proc/sysrq-trigger) and the /proc entries (10 entries) of
-the default linux.maskedPaths. No logic was copied. The corresponding
-definition file in this repository for both the readonlyPaths entries
-(issue #1850) and the maskedPaths entries (issue #1851) is
+the default linux.maskedPaths, plus the two fixed /sys entries of the
+default linux.maskedPaths (/sys/devices/virtual/powercap and
+/sys/firmware) and the per-CPU path form
+/sys/devices/system/cpu/cpuN/thermal_throttle (issue #2014). No logic
+was copied. The corresponding definition file in this repository for
+the readonlyPaths entries (issue #1850), the maskedPaths entries
+(issue #1851) and the /sys entries (issue #2014) is
 crates/core/src/path_masks.rs.
 
 The attribution lines of the moby NOTICE file at that commit:

@@ -15,11 +15,14 @@
 //!
 //! # 未実装（REPAIR-3: 実装済みを装わない）
 //!
-//! - `/sys` 配下の個別項目: moby の一覧に `/sys` 配下は無い。`/sys` 配下の覆いは #2014 で扱う。
-//!   `mounts[]` の sysfs の供給は `exec::mount_sysfs`（#2020）で実装済みだが、`/sys` の保護は mount top ごと読み取り専用に
-//!   するだけ（[`READONLY_SYS_PATH`]）
+//! - 読み取り専用化の側の `/sys` 配下の個別項目: moby の `ReadonlyPaths` に `/sys` 配下は無く、`/sys` は mount top ごと
+//!   読み取り専用にするだけ（[`READONLY_SYS_PATH`]）
+//! - debugfs・tracefs・securityfs・bpf・configfs・pstore 等の擬似 FS の覆い: moby の一覧に無いため本集合に含めない
+//!   （rootless の再帰 ro bind が見せるホスト側の子マウントは、コンテナ内 root がホストの非特権 UID に写る〔SEC-5〕ため
+//!   利用者がホストで読める範囲を超えず、すべて読み取り専用。範囲を広げるかはオーナー判断待ち。#2014）
 //!
-//! 覆う側（`maskedPaths` 相当）の固定集合は同じ置き場所の [`MASKED_PROC_PATHS`]（#1851）。
+//! 覆う側（`maskedPaths` 相当）の固定集合は同じ置き場所の [`MASKED_PROC_PATHS`]（#1851）と、sysfs を供給する構成での
+//! `/sys` 配下の [`MASKED_SYS_PATHS`]・[`thermal_throttle_path`]（#2014）。
 //!
 //! # config の指定（追加のみ。#1852・TASK-29 追補）
 //!
@@ -27,6 +30,8 @@
 //! [`readonly_targets`] / [`masked_targets`] で固定集合の後ろへ足す（和集合）。固定集合を外す・緩める手段は無い。
 //! 固定集合や config 内で重複する指定は後ろを捨てる（覆い済みのパスは `/dev/null` の char device になり、
 //! 2 回目の適用が `TargetKind::Other` で拒否されるため）。
+
+use std::borrow::Cow;
 
 /// `/proc` 配下の読み取り専用にするパス（moby の `ReadonlyPaths` の写し。適用順もこの並び）。
 pub const READONLY_PROC_PATHS: [&str; 5] = [
@@ -49,10 +54,10 @@ pub const READONLY_PROC_PATHS: [&str; 5] = [
 /// 既定も同じ 10 件で、並びだけが違う。写したのはパス文字列だけで、ロジックは写していない。帰属表示はルートの
 /// `NOTICE` を参照する。
 ///
-/// # 未実装（REPAIR-3: 実装済みを装わない）
+/// # `/sys` 配下
 ///
-/// moby の `/sys/devices/virtual/powercap`・`/sys/firmware`・`/sys/devices/system/cpu/cpuN/thermal_throttle` は
-/// 対象外（`/sys` 配下の覆いは #2014 で扱う。sysfs の供給は #2020 で実装済み）。
+/// moby の `/sys` 配下の項目は本定数に含めない。sysfs を供給する構成（`exec::mount_sysfs`。#2020）でだけ
+/// [`MASKED_SYS_PATHS`] と [`thermal_throttle_path`] を [`masked_targets`] が足す（#2014）。
 pub const MASKED_PROC_PATHS: [&str; 10] = [
     "/proc/acpi",
     "/proc/asound",
@@ -65,6 +70,90 @@ pub const MASKED_PROC_PATHS: [&str; 10] = [
     "/proc/timer_list",
     "/proc/timer_stats",
 ];
+
+/// sysfs を供給する構成で覆う `/sys` 配下の固定のパス（SEC-2・TASK-29 追補・#2014）。
+///
+/// # 出典
+///
+/// moby/moby の `daemon/pkg/oci/defaults.go`（commit `9fabd6dfbb926381278c436a866bc8d6ac222274`、Apache-2.0）の
+/// `MaskedPaths` のうち `/sys` 配下の 2 件を写した（並びも同じ。`/sys/devices/virtual/powercap` は GHSA-jq35-85cj-fj4p）。
+/// 写したのはパス文字列だけで、ロジックは写していない。帰属表示はルートの `NOTICE` を参照する。
+pub const MASKED_SYS_PATHS: [&str; 2] = ["/sys/devices/virtual/powercap", "/sys/firmware"];
+
+/// `/sys/devices/system/cpu/possible` から受ける CPU 番号の件数の上限（`NR_CPUS` の最大値）。
+///
+/// Linux v6.12 の `arch/x86/Kconfig`（X86_64 の `NR_CPUS_RANGE_END`）は 8192、`arch/arm64/Kconfig` の `NR_CPUS` は
+/// 2〜4096。より大きい値は不正として拒否し、無制限の確保・tmpfs の載せすぎを防ぐ（#2014）。
+pub const MAX_SYSFS_CPUS: u32 = 8192;
+
+/// `possible` の読み取りバイト数の上限（`0-8191` 級の範囲リストには十分）。
+pub const MAX_POSSIBLE_BYTES: usize = 4096;
+
+/// CPU `cpu` の `thermal_throttle` ディレクトリ（moby の GHSA-6fw5-f8r9-fgfm 対応と同じ形）。
+pub fn thermal_throttle_path(cpu: u32) -> String {
+    format!("/sys/devices/system/cpu/cpu{cpu}/thermal_throttle")
+}
+
+/// `possible` の解釈の失敗。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PossibleCpusError {
+    /// 書式違反（空の要素・数値でない・`a > b`・重複や重なり・昇順でない）。
+    Malformed,
+    /// 件数または番号が上限を超える。
+    TooMany,
+}
+
+/// `/sys/devices/system/cpu/possible` の範囲リスト（`0-3,8-11` 形式。末尾の改行は 1 つ許す）を CPU 番号の昇順の列にする。
+///
+/// 展開する前に各範囲の件数を checked 演算で足し上げ、合計が `max` を超える、または番号が `max` 以上なら
+/// [`PossibleCpusError::TooMany`] で拒否する（アロケーションの前に検証）。範囲は昇順で互いに素でなければならない。
+pub fn parse_possible_cpus(text: &str, max: u32) -> Result<Vec<u32>, PossibleCpusError> {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    if body.is_empty() {
+        return Err(PossibleCpusError::Malformed);
+    }
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    let mut total: u64 = 0;
+    let mut next_min: u64 = 0;
+    for part in body.split(',') {
+        let (lo, hi) = match part.split_once('-') {
+            Some((a, b)) => (parse_cpu_number(a)?, parse_cpu_number(b)?),
+            None => {
+                let n = parse_cpu_number(part)?;
+                (n, n)
+            }
+        };
+        if lo > hi || u64::from(lo) < next_min {
+            return Err(PossibleCpusError::Malformed);
+        }
+        if hi >= max {
+            return Err(PossibleCpusError::TooMany);
+        }
+        total = total
+            .checked_add(u64::from(hi) - u64::from(lo) + 1)
+            .ok_or(PossibleCpusError::TooMany)?;
+        if total > u64::from(max) {
+            return Err(PossibleCpusError::TooMany);
+        }
+        next_min = u64::from(hi) + 1;
+        ranges.push((lo, hi));
+    }
+    let cap = usize::try_from(total).map_err(|_| PossibleCpusError::TooMany)?;
+    let mut out = Vec::with_capacity(cap);
+    for (lo, hi) in ranges {
+        out.extend(lo..=hi);
+    }
+    Ok(out)
+}
+
+/// 10 進の非負整数（符号・空白・空文字を許さない）。桁あふれは `TooMany`。
+fn parse_cpu_number(s: &str) -> Result<u32, PossibleCpusError> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(PossibleCpusError::Malformed);
+    }
+    s.parse::<u32>().map_err(|_| PossibleCpusError::TooMany)
+}
 
 /// 覆う対象の種別（`fstat` の結果を OS 非依存の値にしたもの。適用側が写す）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,12 +291,26 @@ pub fn readonly_targets(extra: &[ProtectedPath]) -> Vec<ReadonlyTarget<'_>> {
     out
 }
 
-/// 覆う対象の全体。固定集合（[`MASKED_PROC_PATHS`]）の後ろに config 由来を足す（重複は後ろを捨てる）。
-pub fn masked_targets(extra: &[ProtectedPath]) -> Vec<&str> {
-    let mut out: Vec<&str> = MASKED_PROC_PATHS.to_vec();
+/// 覆う対象の全体。並びは [`MASKED_PROC_PATHS`] -> （sysfs ありのとき）[`MASKED_SYS_PATHS`] -> `thermal_throttle`
+/// （CPU 番号の昇順）-> config 由来。重複は後ろを捨てる。
+///
+/// `sys_cpus` は sysfs を供給したときだけ `Some`（`possible` から [`parse_possible_cpus`] で得た番号。`possible` が
+/// 無ければ `Some(&[])`）。`None` なら `/sys` 配下は足さない（供給しない構成では image の内容を解釈しない。#2014）。
+pub fn masked_targets<'a>(
+    sys_cpus: Option<&[u32]>,
+    extra: &'a [ProtectedPath],
+) -> Vec<Cow<'a, str>> {
+    let mut out: Vec<Cow<'a, str>> = MASKED_PROC_PATHS
+        .iter()
+        .map(|p| Cow::Borrowed(*p))
+        .collect();
+    if let Some(cpus) = sys_cpus {
+        out.extend(MASKED_SYS_PATHS.iter().map(|p| Cow::Borrowed(*p)));
+        out.extend(cpus.iter().map(|c| Cow::Owned(thermal_throttle_path(*c))));
+    }
     for e in extra {
-        if !out.contains(&e.as_str()) {
-            out.push(e.as_str());
+        if !out.iter().any(|t| t.as_ref() == e.as_str()) {
+            out.push(Cow::Borrowed(e.as_str()));
         }
     }
     out
@@ -331,7 +434,7 @@ mod tests {
     /// SEC-2（#1852）: config が空でも固定集合は同じ順序で全件残る（外せない）。
     #[test]
     fn sec2_targets_without_extra_equal_fixed_sets() {
-        assert_eq!(masked_targets(&[]), MASKED_PROC_PATHS.to_vec());
+        assert_eq!(masked_targets(None, &[]), MASKED_PROC_PATHS.to_vec());
         let ro = readonly_targets(&[]);
         assert_eq!(ro.len(), 6);
         assert_eq!(ro[0].path, "/proc/bus");
@@ -344,14 +447,107 @@ mod tests {
     #[test]
     fn sec2_targets_append_extra_and_dedup() {
         let extra = [pp("/proc/kcore"), pp("/extra"), pp("/extra/"), pp("/sys")];
-        let m = masked_targets(&extra);
+        let m = masked_targets(None, &extra);
         assert_eq!(m.len(), 12);
         assert_eq!(&m[..10], &MASKED_PROC_PATHS[..]);
-        assert_eq!((m[10], m[11]), ("/extra", "/sys"));
+        assert_eq!((m[10].as_ref(), m[11].as_ref()), ("/extra", "/sys"));
         let r = readonly_targets(&extra);
         assert_eq!(r.len(), 8);
         assert_eq!((r[5].path, r[5].dir_only), ("/sys", true));
         assert_eq!((r[6].path, r[6].dir_only), ("/proc/kcore", false));
         assert_eq!((r[7].path, r[7].dir_only), ("/extra", false));
+    }
+
+    /// SEC-2（#2014）: `/sys` 配下の固定の 2 件は moby の値と並びで、正規形である。
+    #[test]
+    fn sec2_masked_sys_paths_are_the_moby_two_in_order() {
+        assert_eq!(
+            MASKED_SYS_PATHS,
+            ["/sys/devices/virtual/powercap", "/sys/firmware"]
+        );
+        assert_eq!(components(MASKED_SYS_PATHS[0]).map(|c| c.len()), Some(4));
+        assert_eq!(components(MASKED_SYS_PATHS[1]).map(|c| c.len()), Some(2));
+    }
+
+    /// SEC-2（#2014）: `thermal_throttle` のパスは具体値。
+    #[test]
+    fn sec2_thermal_throttle_path_values() {
+        assert_eq!(
+            thermal_throttle_path(0),
+            "/sys/devices/system/cpu/cpu0/thermal_throttle"
+        );
+        assert_eq!(
+            thermal_throttle_path(17),
+            "/sys/devices/system/cpu/cpu17/thermal_throttle"
+        );
+    }
+
+    /// SEC-2（#2014）: `possible` の展開（範囲・単一・改行）の具体値。
+    #[test]
+    fn sec2_parse_possible_cpus_expands_ranges() {
+        assert_eq!(parse_possible_cpus("0", 8192), Ok(vec![0]));
+        assert_eq!(parse_possible_cpus("0-3\n", 8192), Ok(vec![0, 1, 2, 3]));
+        assert_eq!(parse_possible_cpus("0-1,4-5", 8192), Ok(vec![0, 1, 4, 5]));
+        assert_eq!(parse_possible_cpus("0-3,8", 8192), Ok(vec![0, 1, 2, 3, 8]));
+        let all = parse_possible_cpus("0-8191", MAX_SYSFS_CPUS).expect("max");
+        assert_eq!(all.len(), 8192);
+        assert_eq!(all.last(), Some(&8191));
+    }
+
+    /// SEC-2（#2014）: 書式違反は `Malformed`、上限超えは展開前に `TooMany`。
+    #[test]
+    fn sec2_parse_possible_cpus_rejects_bad_input() {
+        for bad in [
+            "", "\n", "a", "3-1", "0-", "-1", "0,,1", "0-1,1-2", "2,1", "0-1\n\n", " 0", "+1",
+            "0-1,",
+        ] {
+            assert_eq!(
+                parse_possible_cpus(bad, 8192),
+                Err(PossibleCpusError::Malformed),
+                "{bad:?}"
+            );
+        }
+        for big in [
+            "0-8192",
+            "8192",
+            "0-4294967295",
+            "0-99999999999",
+            "0-4095,4096-8191,8192",
+        ] {
+            assert_eq!(
+                parse_possible_cpus(big, 8192),
+                Err(PossibleCpusError::TooMany),
+                "{big:?}"
+            );
+        }
+        assert_eq!(
+            parse_possible_cpus("0-4", 4),
+            Err(PossibleCpusError::TooMany)
+        );
+    }
+
+    /// SEC-2（#2014）: sysfs ありのとき `/proc` 10 件 -> `/sys` 2 件 -> thermal_throttle -> config の並び。
+    /// config の `/sys/firmware` は重複として除かれ、sysfs なしでは末尾に残る。
+    #[test]
+    fn sec2_masked_targets_with_sysfs_orders_and_dedups() {
+        let extra = [pp("/sys/firmware"), pp("/extra")];
+        let m = masked_targets(Some(&[0, 2]), &extra);
+        let m: Vec<&str> = m.iter().map(|c| c.as_ref()).collect();
+        assert_eq!(m.len(), 15);
+        assert_eq!(&m[..10], &MASKED_PROC_PATHS[..]);
+        assert_eq!(
+            &m[10..],
+            [
+                "/sys/devices/virtual/powercap",
+                "/sys/firmware",
+                "/sys/devices/system/cpu/cpu0/thermal_throttle",
+                "/sys/devices/system/cpu/cpu2/thermal_throttle",
+                "/extra",
+            ]
+        );
+        let without = masked_targets(None, &extra);
+        assert_eq!(without.len(), 12);
+        assert_eq!(without[10], "/sys/firmware");
+        assert_eq!(masked_targets(Some(&[]), &[]).len(), 12);
     }
 }

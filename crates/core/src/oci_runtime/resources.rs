@@ -146,8 +146,8 @@ impl LinuxResourceLimits {
 
 /// `linux.cgroupsPath`（上限つきの文字列。空と NUL は拒否済み）。
 ///
-/// 値を配置に使う実装はまだ無い。受理の可否と値の検証（スコープ外へ出る経路の拒否）は #2010 が
-/// `cgroup_requirement::check_cgroups_path` に差し込む。
+/// 値を配置に使わない方針（#2010）で、指定があれば `cgroup_requirement::check_cgroups_path` が拒否する。
+/// 受理に開くなら委譲スコープ配下に閉じる検証（スコープ外へ出る経路の拒否）が前提になる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CgroupsPath(pub(super) String);
 

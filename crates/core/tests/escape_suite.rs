@@ -107,6 +107,10 @@
 //! 攻撃クロージャ・ハーネスは `unsafe` を書かない。raw syscall が要る攻撃は core 側の `#[doc(hidden)]`
 //! プローブ（syscall 本体は `sys` モジュール）を経由する。
 
+#[cfg(target_os = "linux")]
+#[path = "support/temp_rootfs.rs"]
+mod temp_rootfs;
+
 use std::fmt;
 
 /// errno / シグナル番号（asm-generic の値で x86_64・aarch64 とも共通）。
@@ -1178,6 +1182,7 @@ fn main() {
     )
 ))]
 mod linux {
+    use crate::temp_rootfs;
     use std::io::{PipeWriter, Read as _, Write as _};
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
@@ -2016,8 +2021,8 @@ mod linux {
         let target = ESC04_TARGET_REL
             .iter()
             .fold(rootfs.0.clone(), |p, c| p.join(c));
-        let dir = target.parent().expect("release_agent has a parent dir");
-        std::fs::create_dir_all(dir).expect("create rootfs/sys/fs/cgroup");
+        let parent_rel = &ESC04_TARGET_REL[..ESC04_TARGET_REL.len() - 1];
+        temp_rootfs::create_dir_chain(&rootfs.0, parent_rel);
         std::fs::write(&target, b"").expect("create rootfs release_agent stand-in");
         rootfs
     }

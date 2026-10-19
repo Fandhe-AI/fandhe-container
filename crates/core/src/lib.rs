@@ -48,6 +48,7 @@
 //! - `seccomp`: 禁止 syscall の一覧 `DeniedSyscall` と x86_64 / aarch64 別の番号テーブル（CORE-5・
 //!   TASK-38.1.1・#837。OS 非依存で syscall を持たない）。テーブルと BPF 構築
 //!   （TASK-38.1.2・#838）は実装済み。フィルタ適用（TASK-38.2）と起動フローへの組み込み（TASK-38.3）も実装済み
+//! - `container_usage`: `system df` 向けのコンテナ（bundle・rootfs）使用容量の読み取り専用計測（OCI-7・TASK-183・#2222。OS 非依存で `std` のみ。oci へは依存せず呼び出し側が合成する）
 //! - `sys`: syscall・FFI の薄いラッパー（Linux 限定・非公開。`unsafe` の事前承認範囲）
 //! - `oci_runtime`: OCI Runtime のライフサイクル。`config.json` の型・パーサ
 //!   （TASK-29.1.1）と create（プロセス未起動の状態初期化。TASK-29.2）は実装済み・OS 非依存。
@@ -99,6 +100,7 @@ pub mod audit_log;
 pub mod capabilities;
 #[cfg(target_os = "linux")]
 pub mod cgroups;
+pub mod container_usage;
 pub mod dev_mounts;
 #[cfg(target_os = "linux")]
 pub mod exec;

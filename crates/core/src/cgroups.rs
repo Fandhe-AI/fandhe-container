@@ -98,7 +98,7 @@
 //! - OCI `linux.resources`（memory・cpu・pids・blockIO の weight と throttle）の反映は #2019 で
 //!   `ResourceLimitPlan` と start の連鎖（`start_chain`）に入った。setter が無い項目（`memory.reservation`・
 //!   `cpu.shares`・cpuset・hugetlb・`unified`・`devices` ほか）は未適用として拒否する（#2019。追跡 issue は PR 本文に記す）
-//! - OCI `linux.cgroupsPath` の反映（#2010）
+//! - OCI `linux.cgroupsPath` の反映は行わない方針（コンテナの cgroup は常に委譲スコープ配下。指定は拒否。#2010）
 //! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）
 
 use std::collections::BTreeSet;

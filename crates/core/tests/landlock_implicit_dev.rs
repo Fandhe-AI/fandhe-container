@@ -42,6 +42,10 @@ fn main() {
     println!("landlock_implicit_dev: x86_64/aarch64 only, not applicable on this architecture");
 }
 
+#[cfg(target_os = "linux")]
+#[path = "support/temp_rootfs.rs"]
+mod temp_rootfs;
+
 #[cfg(all(
     target_os = "linux",
     all(
@@ -68,6 +72,7 @@ fn main() {
     )
 ))]
 mod linux {
+    use crate::temp_rootfs;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -145,12 +150,11 @@ mod linux {
     }
 
     fn make_rootfs() -> Rootfs {
-        let base = std::fs::canonicalize(std::env::temp_dir())
-            .expect("canonicalize temp_dir")
-            .join(format!("fandhe-landlock-dev-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
+        // 共有 /tmp 上の推測可能なパスを削除・再利用すると、競合で置かれた symlink を root が辿りうる。
+        // 一意名で排他作成し、既存パスは削除も採用もせず、配下も 1 階層ずつ作る（#2324・SEC-2・CORE-5）。
+        let base = temp_rootfs::exclusive_temp_dir("fandhe-landlock-dev", 0o755);
         for d in ["proc", "etc"] {
-            std::fs::create_dir_all(base.join(d)).expect("create rootfs dir");
+            temp_rootfs::create_dir_chain(&base, &[d]);
         }
         Rootfs(base)
     }

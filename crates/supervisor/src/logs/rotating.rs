@@ -717,7 +717,7 @@ fn open_existing_regular_read(path: &Path, deny_delete: bool) -> Result<File, Tr
     {
         use std::os::unix::fs::MetadataExt;
         if before.dev() != after.dev() || before.ino() != after.ino() {
-            return Err(not_regular());
+            return Err(replaced_during_open());
         }
     }
     Ok(file)
@@ -747,10 +747,7 @@ fn open_existing_regular_read(path: &Path, deny_delete: bool) -> Result<File, Tr
             .share_mode(share_mode)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
-            .map_err(|e| match e.kind() {
-                ErrorKind::NotFound => TraitError::new(ErrorCode::NotFound, "log file not found"),
-                _ => internal("log file open failed"),
-            })?;
+            .map_err(map_open_error)?;
         let meta = file
             .metadata()
             .map_err(|_| internal("log file open failed"))?;
@@ -769,7 +766,7 @@ fn open_existing_regular_read(path: &Path, deny_delete: bool) -> Result<File, Tr
     let a = crate::sys::file_identity(&file).map_err(|_| internal("log file open failed"))?;
     let b = crate::sys::file_identity(&again).map_err(|_| internal("log file open failed"))?;
     if a != b {
-        return Err(not_regular());
+        return Err(replaced_during_open());
     }
     Ok(file)
 }
@@ -857,6 +854,21 @@ fn map_open_error(e: io::Error) -> TraitError {
     } else {
         internal("log file open failed")
     }
+}
+
+/// 検査（lstat）と open の間に、同じパスが別の通常ファイルへ差し替わったときのメッセージ。
+/// ローテーションの rename が割り込んだ競合なので、読み出し側は [`is_replaced_during_open`] で見分けて
+/// スナップショットをやり直す。symlink・種別違反（別のメッセージの `InvalidArgument`）とは区別する（SUP-7・REPAIR-5）。
+const REPLACED_DURING_OPEN_MSG: &str = "log file was replaced while opening";
+
+fn replaced_during_open() -> TraitError {
+    TraitError::new(ErrorCode::InvalidArgument, REPLACED_DURING_OPEN_MSG)
+}
+
+/// [`open_for_read`] の失敗が「通常ファイルの実体の入れ替わり（競合）」か。再試行の対象にしてよい。
+#[cfg(unix)]
+pub(crate) fn is_replaced_during_open(e: &TraitError) -> bool {
+    e.code() == ErrorCode::InvalidArgument && e.message() == REPLACED_DURING_OPEN_MSG
 }
 
 fn map_lstat_error(e: io::Error) -> TraitError {

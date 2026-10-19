@@ -107,7 +107,9 @@ mod imp {
 
     use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
-    use super::super::rotating::{RotationConfig, log_file_paths, open_for_read};
+    use super::super::rotating::{
+        RotationConfig, is_replaced_during_open, log_file_paths, open_for_read,
+    };
     use super::{LogReadFailure, LogReadReport, MAX_SNAPSHOT_ATTEMPTS, source};
 
     /// 流すときの固定バッファ。
@@ -159,6 +161,8 @@ mod imp {
                 Ok(f) => f,
                 // 一覧の後にローテーションで消えた。やり直す。
                 Err(e) if e.code() == ErrorCode::NotFound => return Ok(Attempt::Retry),
+                // lstat と open の間に同じ世代パスが別の通常ファイルへ入れ替わった（ローテーション）。やり直す。
+                Err(e) if is_replaced_during_open(&e) => return Ok(Attempt::Retry),
                 Err(e) => return Err(read_error(e)),
             };
             let meta = file

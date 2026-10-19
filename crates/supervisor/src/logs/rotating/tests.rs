@@ -1543,3 +1543,14 @@ fn open_enoent_after_lstat_maps_to_not_found() {
     let other = map_open_error(io::Error::from(ErrorKind::PermissionDenied));
     assert_eq!(other.code(), ErrorCode::Internal);
 }
+
+/// SUP-7・REPAIR-5: 実体の入れ替わり（競合）だけが再試行対象で、種別違反・symlink 拒否は対象外。
+#[test]
+#[cfg(unix)]
+fn replaced_during_open_is_distinguishable_from_kind_violation() {
+    assert!(is_replaced_during_open(&replaced_during_open()));
+    assert!(!is_replaced_during_open(&invalid(
+        "log path is not a regular file"
+    )));
+    assert!(!is_replaced_during_open(&internal("log file open failed")));
+}

@@ -1,15 +1,27 @@
 //! 起動レイテンシの計測本体（Linux・x86_64 / aarch64 限定。TASK-190・REPAIR-8・REPAIR-5・CORE-10）。
 //!
 //! 1 試行は「core の `oci_runtime::create` → 本番の `start` と同じ包み込み（`USER_SCOPE_WRAPPER_ARGS`・`scope_wrap`）の
-//! `systemd-run` で supervisor の bin を起動 → 結果チャネルの `FCSUP1 OK` を読み終える」までで、CLI は経由しない。
+//! `systemd-run` で supervisor の bin を起動 → 結果チャネルの `FCSUP1 OK` を読み終える」までで、計測区間の起動経路は
+//! CLI を経由しない（MS-2 / MS-6 の依存の向き）。CLI を呼ぶのは区間の外の後始末の `delete` だけ（下記）。
 //! scope 取得（D-Bus の往復）は本番が起動ごとに払う費用のため区間に含める（#2081・#2122・#2089）。supervisor は本番 launcher（#1819）まで到達するため、分離
 //! （user namespace・cgroup・Landlock）込みの起動を測る。分離を弱める経路は持たず、失敗は失敗として数える（REPAIR-3）。
 //!
-//! # 後始末（core の `delete` を使わない理由）
-//! ベンチのプロセスは試行ごとの systemd スコープの外にいるため、`delete` は委譲スコープの照合で
-//! `FailedPrecondition` になる（#2049 の観察と同じ）。記録済みのスコープを外から開く core の API の変更は
-//! #1314 の決定の変更にあたるため範囲外とし、状態・cgroup・プローブの消滅を検証してから状態ルートごと消す。
-//! 検証できなければ ID を `leftover_ids` に積み、以後の試行を止めて非ゼロで終わる（fail-closed）。
+//! # 後始末（CLI の `delete` を委譲スコープで呼ぶ。OCI-6・#2157）
+//! 試行の後始末は計測区間の外（標本の `total` は OK 行を読んだ時点で確定済み）で行い、所要時間は計測値に入らない。
+//! 状態・cgroup の削除は手書きせず、CLI の実バイナリ（`--cli-bin`）の `delete` に任せる。呼び出しは本番の `start` と
+//! 同じ包み込み（`scope_wrap::scoped_cli_delete_command`）で委譲スコープの中に入れる。包むと `delete` の委譲スコープ検出が
+//! 成功し、検出したスコープが試行のスコープと食い違うため core は記録済みスコープを fd 起点で開く `remove_recorded` へ回る
+//! （#2096）。ログインセッションから直接呼ぶと検出が失敗するので包みは必須。
+//!
+//! - 正常系（`delete` が終了コード 0）: 記録の cgroup が消えたこと・`delete` 用スコープが空であること・プローブが 0 件で
+//!   あることだけを確かめ、状態ルート（`delete` が消さないロックファイル等を含む）を消す。
+//! - 異常系（拒否・期限超過・起動失敗）: 拒否コード（CLI の `code`。読めなければ `UNPARSED`、期限超過は `TIMEOUT`、
+//!   起動失敗は `SPAWN`）を `failures.cleanup_delete_rejected` / `cleanup_delete_codes` に残し（握りつぶさない）、metric を
+//!   空にする。そのうえで従来の強制後始末（GC 猶予 → `cgroup.kill` → `rmdir`・プローブの消滅確認・状態ルート削除）を
+//!   行い、ホストに残骸を残さない。強制後始末も失敗したら ID を `leftover_ids` に積み、以後の試行を止めて非ゼロで終わる
+//!   （fail-closed）。
+//! - 採らなかった案: ベンチ内で core の `oci_runtime::delete` を直接呼ぶ案（検出失敗を記録の経路へ回すかは
+//!   オーナー判断待ちで、ベンチ側で先取りしない）。
 
 use super::StartupLatencyError;
 use super::args::Plan;
@@ -18,17 +30,18 @@ use super::bundle::build_bundle;
 use super::output::{Failures, Params, RunResult, Sample, render_json};
 use super::probe_env::{detect_host_kind, effective_uid};
 use super::report::{ReportOutcome, classify, spawn_report_reader};
-use super::scope_wrap::{scoped_command, user_manager_env};
+use super::scope_wrap::{scoped_cli_delete_command, scoped_command, user_manager_env};
 use crate::sys;
 use fandhe_container_core::cgroups::CgroupName;
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{StartTimeouts, create};
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, CreateRequest, GetStateRequest, StateStore,
+    ContainerId, ContainerState, CreateRequest, ErrorCode, GetStateRequest, StateStore,
 };
 use fandhe_container_supervisor::start_contract::cli_receive_deadline;
 use fandhe_container_supervisor::state::open_default_store;
-use std::os::unix::fs::DirBuilderExt as _;
+use std::io::Read as _;
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
@@ -77,6 +90,8 @@ struct Trial {
     sample: Option<Sample>,
     fails: Vec<Fail>,
     leftover: bool,
+    /// 後始末の CLI `delete` が拒否・期限超過・起動失敗したときの固定語彙のコード（OCI-6）。
+    delete_rejected: Option<&'static str>,
 }
 
 struct Ctx<'a> {
@@ -335,10 +350,78 @@ fn scope_unit(id_str: &str) -> String {
     format!("fcsl-scope-{id_str}")
 }
 
+/// 後始末の `delete` 用の systemd スコープの名前（試行のスコープとは別。ID は実行ごとに一意）。
+fn delete_unit(id_str: &str) -> String {
+    format!("fcsl-del-{id_str}")
+}
+
+/// CLI の stderr から読む最大バイト数（外部入力の上限。先頭だけを見る）。
+const DELETE_STDERR_MAX: u64 = 4096;
+
+/// CLI の `delete` が stderr へ出す 1 行 JSON（`{"code":"..","message":".."}` か ERR-2 の `op` 付き形式）から `code` だけを
+/// 取り出し、既知のコード（`ErrorCode::as_str`）なら固定文字列で返す。読めない・未知なら `UNPARSED`。
+/// message・パス・errno は返さない（出力へ載せない。外部入力は信頼しない）。
+fn delete_error_code(bytes: &[u8]) -> &'static str {
+    const KNOWN: [ErrorCode; 9] = [
+        ErrorCode::InvalidArgument,
+        ErrorCode::NotFound,
+        ErrorCode::AlreadyExists,
+        ErrorCode::FailedPrecondition,
+        ErrorCode::Unimplemented,
+        ErrorCode::Internal,
+        ErrorCode::PermissionDenied,
+        ErrorCode::Timeout,
+        ErrorCode::Unavailable,
+    ];
+    const KEY: &str = "\"code\":\"";
+    let text = String::from_utf8_lossy(bytes);
+    let Some(start) = text.find(KEY).map(|i| i + KEY.len()) else {
+        return "UNPARSED";
+    };
+    let Some(rest) = text.get(start..) else {
+        return "UNPARSED";
+    };
+    let Some(end) = rest.find('"') else {
+        return "UNPARSED";
+    };
+    let Some(code) = rest.get(..end) else {
+        return "UNPARSED";
+    };
+    KNOWN
+        .iter()
+        .map(ErrorCode::as_str)
+        .find(|k| *k == code)
+        .unwrap_or("UNPARSED")
+}
+
+/// 一時 stderr ファイルの先頭を読んで拒否コードにする（読めなければ `UNPARSED`）。
+fn read_delete_error_code(path: &Path) -> &'static str {
+    let mut buf = Vec::new();
+    match std::fs::File::open(path) {
+        Ok(f) => {
+            if f.take(DELETE_STDERR_MAX).read_to_end(&mut buf).is_err() {
+                return "UNPARSED";
+            }
+            delete_error_code(&buf)
+        }
+        Err(_) => "UNPARSED",
+    }
+}
+
+/// ユーザーマネージャ配下のスコープ（`<unit>.scope`）の cgroup を探す（`Ok(None)` は無いと確かめられた場合だけ）。
+fn user_scope_dir(euid: u32, unit: &str) -> Result<Option<PathBuf>, std::io::Error> {
+    let base = PathBuf::from(format!(
+        "/sys/fs/cgroup/user.slice/user-{euid}.slice/user@{euid}.service"
+    ));
+    find_dir(&base, &format!("{unit}.scope"), 3)
+}
+
 /// 試行後の状態の照合結果。
 struct Settled {
     /// 状態・cgroup・プローブが期待どおりで、状態ルートを消せた。
     ok: bool,
+    /// 後始末の CLI `delete` が拒否・期限超過・起動失敗したときのコード（固定語彙。無ければ `None`。OCI-6）。
+    delete_rejected: Option<&'static str>,
     /// 記録されたワークロードの終了コード（`Stopped` のとき成功判定に使う。未記録なら `None`）。
     workload_exit: Option<i32>,
 }
@@ -417,11 +500,7 @@ struct RealWaiter {
 impl RealWaiter {
     /// ユーザーマネージャ配下のスコープ（`<unit>.scope`）の cgroup を探す。
     fn scope_dir(&self) -> Result<Option<PathBuf>, std::io::Error> {
-        let base = PathBuf::from(format!(
-            "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service",
-            uid = self.euid
-        ));
-        find_dir(&base, &format!("{}.scope", self.unit), 3)
+        user_scope_dir(self.euid, &self.unit)
     }
 }
 
@@ -530,12 +609,14 @@ impl Host for RealHost {
         })
     }
 
-    /// 試行後の状態・cgroup・プローブを検証し、全部満たしたときだけ状態ルートを消す。
+    /// 試行後の後始末。記録を読んで期待状態を照合し、CLI の `delete` で状態・cgroup を消す（OCI-6）。
+    /// 正常系は消えたことの確認だけ、`delete` が拒否されたら拒否コードを結果に残して強制後始末へ進む。
     fn settle(&self, ctx: &Ctx<'_>, created: &Created<RealHandle>, expect: Expect) -> Settled {
         let RealHandle { store, id } = &created.handle;
         let Ok(record) = store.get(&GetStateRequest::new(id.clone())) else {
             return Settled {
                 ok: false,
+                delete_rejected: None,
                 workload_exit: None,
             };
         };
@@ -549,16 +630,30 @@ impl Host for RealHost {
             Expect::Any => true,
         };
         let mut ok = state_ok;
+        // 区間の外。委譲スコープで包んだ CLI の delete に状態・cgroup の削除を任せる。
+        let delete_rejected = self.cli_delete(ctx, created).err();
         if let Some(placement) = record.cgroup() {
             match CgroupName::for_instance(id, placement.instance()) {
                 Ok(name) => {
                     let scope = placement.scope().as_str().trim_start_matches('/');
                     let dir = Path::new("/sys/fs/cgroup").join(scope).join(name.as_str());
-                    ok &= remove_container_cgroup(&dir);
+                    ok &= if delete_rejected.is_none() {
+                        // delete が成功したなら記録の cgroup は消えているはず（残っていれば製品側の不具合）。
+                        wait_until(CGROUP_GC_GRACE, || path_gone(&dir))
+                    } else {
+                        // 拒否された場合だけ、ホストに残骸を残さないよう強制的に消す。
+                        remove_container_cgroup(&dir)
+                    };
                 }
                 Err(_) => ok = false,
             }
         }
+        // delete 用スコープが空であること（残る CLI 子孫は落とす）。見つけられない・確認不能は後始末失敗。
+        ok &= match user_scope_dir(self.euid, &delete_unit(&created.id_str)) {
+            Ok(Some(dir)) => kill_and_drain(&dir),
+            Ok(None) => true,
+            Err(_) => false,
+        };
         let probes_gone = wait_until(ctx.cap(CLEANUP_TIMEOUT), || {
             probe_count(ctx.nonce) == Some(0)
         });
@@ -566,7 +661,54 @@ impl Host for RealHost {
         if ok {
             ok = std::fs::remove_dir_all(&created.root).is_ok();
         }
-        Settled { ok, workload_exit }
+        Settled {
+            ok,
+            delete_rejected,
+            workload_exit,
+        }
+    }
+}
+
+impl RealHost {
+    /// 委譲スコープで包んだ CLI の `delete` を期限つきで 1 回呼ぶ。成功は `Ok`、拒否・期限超過・起動失敗は
+    /// 固定語彙のコードを `Err` で返す（`delete_error_code`・`TIMEOUT`・`SPAWN`。message・パスは返さない）。
+    /// stdin・stdout は `/dev/null`、stderr は作業ディレクトリ（0700）内の排他作成ファイルへ書かせる（pipe の詰まりで止まらない）。
+    fn cli_delete(&self, ctx: &Ctx<'_>, created: &Created<RealHandle>) -> Result<(), &'static str> {
+        let Some(mut cmd) = scoped_cli_delete_command(
+            &ctx.plan.systemd_run,
+            &delete_unit(&created.id_str),
+            &ctx.plan.cli_bin,
+            &created.root,
+            &created.id_str,
+            &self.xdg_runtime_dir,
+        ) else {
+            return Err("SPAWN");
+        };
+        // 親がブロックした中断シグナルを子へ継承させない（`spawn` と同じ）。
+        sys::unblock_termination_signals_in_child(&mut cmd);
+        let err_path = ctx.work.join(format!("delete-{}.err", created.id_str));
+        let err_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&err_path)
+            .map_err(|_| "SPAWN")?;
+        let spawned = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(err_file))
+            .process_group(0)
+            .spawn();
+        let result = match spawned {
+            Err(_) => Err("SPAWN"),
+            Ok(mut child) => match wait_for_exit(&mut child, ctx.cap(CLEANUP_TIMEOUT)) {
+                ExitWait::Exited(Some(0)) => Ok(()),
+                ExitWait::Exited(_) => Err(read_delete_error_code(&err_path)),
+                ExitWait::TimedOut { .. } => Err("TIMEOUT"),
+            },
+        };
+        let _ = std::fs::remove_file(&err_path);
+        result
     }
 }
 
@@ -583,6 +725,7 @@ fn run_trial<H: Host>(
                     sample: None,
                     fails: vec![Fail::Create],
                     leftover,
+                    delete_rejected: None,
                 },
                 id_str,
             ));
@@ -594,12 +737,18 @@ fn run_trial<H: Host>(
         Ok(l) => l,
         Err(SpawnFailed { clean }) => {
             fails.push(Fail::Spawn);
-            let leftover = !(clean && host.settle(ctx, &created, Expect::Created).ok);
+            let (leftover, delete_rejected) = if clean {
+                let settled = host.settle(ctx, &created, Expect::Created);
+                (!settled.ok, settled.delete_rejected)
+            } else {
+                (true, None)
+            };
             return Ok((
                 Trial {
                     sample: None,
                     fails,
                     leftover,
+                    delete_rejected,
                 },
                 id_str,
             ));
@@ -651,6 +800,7 @@ fn run_trial<H: Host>(
     // waiter だけでなくスコープ内の supervisor も止めて空を確かめる。残っていれば後始末失敗（以後の試行を止める）。
     let scope_clean = waiter.stop_scope();
     let mut settled_ok = false;
+    let mut delete_rejected = None;
     if reaped && scope_clean {
         // 中断で kill した試行は状態が Stopped にならないため、期待を緩めて残存だけを確かめる。
         let expect_state = if interrupted() {
@@ -660,6 +810,7 @@ fn run_trial<H: Host>(
         };
         let settled = host.settle(ctx, &created, expect_state);
         settled_ok = settled.ok;
+        delete_rejected = settled.delete_rejected;
         // 起動報告のあとに exec や動的ローダが失敗した標本を有効にしない（終了コード 0 を要求。計測の終点は変えない）。
         if expect_state == Expect::Stopped && settled.workload_exit != Some(0) {
             fails.push(Fail::SupervisorExit);
@@ -673,11 +824,17 @@ fn run_trial<H: Host>(
             sample,
             fails,
             leftover: !settled_ok,
+            delete_rejected,
         },
         id_str,
     ))
 }
-fn tally(failures: &mut Failures, fails: &[Fail], leftover: bool) {
+fn tally(
+    failures: &mut Failures,
+    fails: &[Fail],
+    leftover: bool,
+    delete_rejected: Option<&'static str>,
+) {
     for f in fails {
         match f {
             Fail::Create => failures.create += 1,
@@ -694,6 +851,10 @@ fn tally(failures: &mut Failures, fails: &[Fail], leftover: bool) {
     }
     if leftover {
         failures.cleanup += 1;
+    }
+    if let Some(code) = delete_rejected {
+        failures.cleanup_delete_rejected += 1;
+        *failures.cleanup_delete_codes.entry(code).or_insert(0) += 1;
     }
 }
 
@@ -729,7 +890,12 @@ fn run_trials<H: Host>(host: &H, ctx: &Ctx<'_>) -> Result<RunResult, StartupLate
             }
             return Err(interrupted_error());
         }
-        tally(&mut failures, &trial.fails, trial.leftover);
+        tally(
+            &mut failures,
+            &trial.fails,
+            trial.leftover,
+            trial.delete_rejected,
+        );
         if n >= ctx.plan.warmup
             && let Some(s) = trial.sample
         {
@@ -790,6 +956,7 @@ pub fn run(mut plan: Plan) -> Result<super::Execution, StartupLatencyError> {
     // 検証済みの実体パスで置き換え、起動には字面のパスを使わない（symlink 解決途中の差し替え対策）。
     plan.supervisor_bin = verify_executable(&plan.supervisor_bin, euid)?;
     plan.systemd_run = verify_executable(&plan.systemd_run, euid)?;
+    plan.cli_bin = verify_executable(&plan.cli_bin, euid)?;
 
     // 作業ディレクトリの親は全祖先の所有者・書き込み権限を検証し、実体パスだけを使う。
     let base: PathBuf = verify_work_base(
@@ -868,6 +1035,8 @@ mod tests {
         exit: ExitScript,
         stop_ok: bool,
         settle_ok: bool,
+        /// 後始末の CLI `delete` の拒否コード（OCI-6）。`None` は成功。
+        delete_rejected: Option<&'static str>,
         workload_exit: Option<i32>,
         /// 後始末で待つ時間（期限超過の再現用）。
         settle_delay: Duration,
@@ -888,6 +1057,7 @@ mod tests {
                 exit: ExitScript::Exited(0),
                 stop_ok: true,
                 settle_ok: true,
+                delete_rejected: None,
                 workload_exit: Some(0),
                 settle_delay: Duration::ZERO,
                 interrupt: false,
@@ -990,6 +1160,7 @@ mod tests {
             std::thread::sleep(script.settle_delay);
             Settled {
                 ok: script.settle_ok,
+                delete_rejected: script.delete_rejected,
                 workload_exit: script.workload_exit,
             }
         }
@@ -1001,6 +1172,7 @@ mod tests {
             warmup,
             timeout_secs: 60,
             supervisor_bin: PathBuf::from("/nonexistent/supervisor"),
+            cli_bin: PathBuf::from("/nonexistent/cli"),
             systemd_run: PathBuf::from("/nonexistent/systemd-run"),
             work_dir: None,
             output: None,
@@ -1112,6 +1284,105 @@ mod tests {
         assert_eq!(*host.created.lock().expect("lock"), vec![0, 1]);
         assert!(!r.is_clean());
         assert!(render_json(&r).expect("render").contains("\"metrics\":{},"));
+    }
+
+    /// OCI-6: 後始末の delete が拒否されても強制後始末が成功すれば試行は続く。拒否コードは結果に残り、metric は空になる。
+    #[test]
+    fn oci6_delete_rejection_is_recorded_and_empties_metrics() {
+        let mut rejected = Script::ok();
+        rejected.delete_rejected = Some("FAILED_PRECONDITION");
+        let (host, r) = run_with(
+            vec![Script::ok(), rejected, Script::ok()],
+            3,
+            0,
+            Duration::from_secs(30),
+        );
+        let r = r.expect("run");
+        assert_eq!(r.failures.cleanup_delete_rejected, 1);
+        assert_eq!(
+            r.failures.cleanup_delete_codes.get("FAILED_PRECONDITION"),
+            Some(&1)
+        );
+        assert_eq!(r.failures.cleanup, 0);
+        assert!(r.leftover_ids.is_empty());
+        assert_eq!(*host.created.lock().expect("lock"), vec![0, 1, 2]);
+        assert_eq!(r.failures.total(), 1);
+        assert!(!r.is_clean());
+        let json = render_json(&r).expect("render");
+        assert!(json.contains("\"metrics\":{},"), "{json}");
+        assert!(
+            json.contains("\"cleanup_delete_codes\":{\"FAILED_PRECONDITION\":1}"),
+            "{json}"
+        );
+    }
+
+    /// OCI-6: delete が拒否され、強制後始末も失敗したら残りとして以後の試行を止める（拒否コードも残る）。
+    #[test]
+    fn oci6_delete_rejection_with_failed_forced_cleanup_stops_trials() {
+        let mut broken = Script::ok();
+        broken.delete_rejected = Some("TIMEOUT");
+        broken.settle_ok = false;
+        let (host, r) = run_with(vec![broken, Script::ok()], 2, 0, Duration::from_secs(30));
+        let r = r.expect("run");
+        assert_eq!(r.leftover_ids, vec!["fake0".to_string()]);
+        assert_eq!(r.failures.cleanup, 1);
+        assert_eq!(r.failures.cleanup_delete_codes.get("TIMEOUT"), Some(&1));
+        assert_eq!(*host.created.lock().expect("lock"), vec![0]);
+    }
+
+    /// REPAIR-8・CORE-10・OCI-6: 後始末（delete を含む）の所要時間は標本に入らない。
+    /// 標本の `total` は OK 行を読んだ時点で確定し、後始末はその後に走る。
+    #[test]
+    fn repair8_core10_cleanup_time_is_not_in_the_sample() {
+        let mut slow = Script::ok();
+        slow.settle_delay = Duration::from_millis(300);
+        let (_, r) = run_with(vec![slow; 2], 2, 0, Duration::from_secs(30));
+        let r = r.expect("run");
+        assert_eq!(r.samples.len(), 2);
+        for s in &r.samples {
+            assert!(
+                s.total < Duration::from_millis(300),
+                "cleanup time leaked into the sample: {:?}",
+                s.total
+            );
+        }
+        assert!(r.is_clean());
+    }
+
+    /// OCI-6: CLI の stderr からは既知の `code` だけを固定語彙で取り出し、message・パスは捨てる。
+    #[test]
+    fn oci6_delete_error_code_keeps_only_known_codes() {
+        assert_eq!(
+            delete_error_code(b"{\"code\":\"FAILED_PRECONDITION\",\"message\":\"x\"}\n"),
+            "FAILED_PRECONDITION"
+        );
+        // ERR-2 の op 付き形式。
+        assert_eq!(
+            delete_error_code(
+                b"{\"op\":\"delete\",\"code\":\"PERMISSION_DENIED\",\"message\":\"m\"}\n"
+            ),
+            "PERMISSION_DENIED"
+        );
+        // 未知のコード・不正な文字・空・閉じない・非 UTF-8 は UNPARSED。
+        for bad in [
+            &b"{\"code\":\"WHATEVER\"}"[..],
+            b"{\"code\":\"/home/u/secret\"}",
+            b"",
+            b"{\"code\":\"NOT_FOUND",
+            b"\xff\xfe",
+            b"plain text",
+        ] {
+            assert_eq!(delete_error_code(bad), "UNPARSED", "{bad:?}");
+        }
+        // message にパスを含んでも code 以外は返さない。
+        let got = delete_error_code(
+            b"{\"code\":\"INTERNAL\",\"message\":\"failed at /home/u/.local/share\"}",
+        );
+        assert_eq!(got, "INTERNAL");
+        // 4096 バイト超でも先頭の code を読める（読み取り側が先頭だけを渡す）。
+        let mut big = b"{\"code\":\"NOT_FOUND\",\"message\":\"".to_vec();
+        big.extend(std::iter::repeat_n(b'a', 8192));
+        assert_eq!(delete_error_code(&big), "NOT_FOUND");
     }
 
     /// スコープに supervisor が残る（止められない）: 後始末失敗として打ち切り、状態を消す settle には進まない。

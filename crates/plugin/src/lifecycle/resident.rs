@@ -2,7 +2,7 @@
 //!
 //! plugin プロセスを 1 回だけ起動し、確立した接続を保持したまま複数の要求を順次処理する。
 //! 呼び出し元は core 側の plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 ほか。依存方向は `core -> plugin` のため、本モジュールは
-//! core の登録表を参照せず、検証済みの起動対象（fd）を持つ起動仕様 [`OneShotPlugin`] を受け取る。
+//! core の登録表を参照せず、検証済みの起動対象（fd）を持つ起動仕様 [`PluginLaunchSpec`] を受け取る。
 //! 起動仕様の型は都度起動モードと共用。モード選択 API は TASK-110.3 の `mode`。型名の中立化は未実施）。
 //!
 //! # 契約
@@ -23,7 +23,7 @@
 //!   できたがプロセスグループを停止できなかった場合は、元のエラーの code を保ち message に
 //!   `process group could not be killed` の付記（pid なし）を加えて返し、状態は
 //!   [`ResidentState::GroupKillFailed`] になる（shutdown は未回収とは別の `Internal` を返す）。
-//! - 子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] と、既定は空で `OneShotPlugin::with_env` が明示した組のみ（`lifecycle` の契約）。stdin / stdout は null、stderr は
+//! - 子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] と、既定は空で `PluginLaunchSpec::with_env` が明示した組のみ（`lifecycle` の契約）。stdin / stdout は null、stderr は
 //!   セッション全期間で 1 本の読み取りスレッドが上限つきで収集し、[`ResidentPlugin::shutdown`] の結果
 //!   （失敗時も [`ResidentShutdownError`] に載せる）でのみ返す（untrusted）。[`ResidentPlugin`] の破棄（panic 等を含む）でも子の kill・回収とスレッド停止を行う。
 //! - 親の強制終了時の停止（#1514・PLUG-7・REPAIR-5・CORE-1）: Linux では plugin に `PR_SET_PDEATHSIG`
@@ -51,10 +51,10 @@
 //!   要求 ID と応答 ID の対応づけ（#1869 の設計）。
 
 use super::{
-    ChildGuard, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT, OneShotPlugin, OneShotStderr,
-    OneShotTermination, Reap, StderrCapture, classify_reaped, group_kill_failed_error,
-    launch_spawn_error, plugin_command, rpc_timeout, spawn_registered, stderr_channel,
-    unreaped_error, with_group_kill_failure,
+    ChildGuard, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT, OneShotStderr,
+    OneShotTermination, PluginLaunchSpec, Reap, StderrCapture, classify_reaped,
+    group_kill_failed_error, launch_spawn_error, plugin_command, rpc_timeout, spawn_registered,
+    stderr_channel, unreaped_error, with_group_kill_failure,
 };
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
@@ -311,7 +311,7 @@ impl ResidentPlugin {
     /// `audit` に渡る `PeerAuthRejectReason` で判別する。
     /// 接続の確立後（`call` 系）は peer 認証を行わないため、受け手は起動時にのみ使う。
     pub fn start(
-        plugin: &OneShotPlugin,
+        plugin: &PluginLaunchSpec,
         timeout: ResidentStartTimeout,
         audit: &mut dyn crate::audit::PeerAuthObserver,
     ) -> Result<Self, PluginError> {
@@ -320,7 +320,7 @@ impl ResidentPlugin {
 
     /// [`Self::start`] の本体。シグナル転送の登録表を引数に取る（テストが局所の表を渡すため）。
     pub(crate) fn start_in(
-        plugin: &OneShotPlugin,
+        plugin: &PluginLaunchSpec,
         timeout: ResidentStartTimeout,
         audit: &mut dyn crate::audit::PeerAuthObserver,
         registry: &'static Registry,
@@ -753,7 +753,7 @@ mod tests {
     #[test]
     fn plug7_resident_start_reports_bind_failure_without_spawn() {
         let dir = std::env::temp_dir().join("fcos-nonexistent-resident-dir");
-        let plugin = OneShotPlugin::new(
+        let plugin = PluginLaunchSpec::new(
             super::super::launch_target::current_exe_target(),
             vec![],
             dir,

@@ -35,8 +35,8 @@
 //! 所有者がステージング領域と同じ・ハードリンク数 1・group / other 書き込み不可（unix）。ステージングの
 //! blob は検証時に開いたハンドルで確認し、権限だけ 0600 へ狭める（所有者・リンク数は変えられないので拒否）。
 //! 公開直前と既存宛先の受け入れでも同じ条件を確かめ、満たさない宛先は受け入れず検証済みの実体で置き換える。
-//! Windows の再ハッシュは排他区間の外で行う: 共有拒否（書き込み・削除）で開いたハンドルに実体を固定し、
-//! その内容を検証してから、排他区間では固定済みの実体の `hard_link` だけを行う。
+//! Windows の再ハッシュは排他区間の外で行う: 検証済みの内容を私的な一時名へ `hard_link` で結び付け、
+//! 書き込み共有拒否で開いたまま再ハッシュし、排他区間では一時名の `rename` だけを行う。
 //!
 //! 公開の移動は `hard_link` で宛先を置き換えずに作り、成功後にステージング側の名前を消す
 //! （公開後のハードリンク数を 1 に保つ。cri の `check_blob_trust` の条件と整合）。宛先が既にある
@@ -194,16 +194,6 @@ impl FileIdent {
         let m = fs::symlink_metadata(path)?;
         Ok(m.is_file().then(|| Self::of(&m)))
     }
-}
-
-/// 公開（リンク・置換）した後 / 置換の前の実体を再ハッシュして digest を照合する（OCI-1・OCI-7）。
-///
-/// Windows の固定（`FILE_SHARE_DELETE` あり）はステージング名の差し替えを許し、指紋は size / mtime
-/// だけで同一性を保証できない。そのため `hard_link` が実際に結び付けた実体を、公開の名前の側で
-/// 検証してから確定する。不一致は `DataLoss`（呼び出し側が作った宛先を消す）。
-/// 全 OS で呼べる検証であり、現状は Windows の公開経路だけが使う。
-fn verify_published_blob(path: &Path, digest: &Digest, size: u64) -> Result<(), OciError> {
-    crate::layer::verify_blob_digest(path, digest, size).map(|_| ())
 }
 
 /// 公開してよい blob の信頼条件の違反を返す（OCI-1・SEC。unix のみ。違反なしは `None`）。
@@ -642,19 +632,28 @@ impl PullSession<'_> {
         Ok(())
     }
 
-    /// 非 unix では排他区間の外で実体を固定し、その内容を検証する（Windows）。
+    /// Windows では排他区間の外で、検証済みの内容を公開専用の私的な名前へ固定する。
     ///
-    /// 書き込みを共有拒否（`FILE_SHARE_READ | FILE_SHARE_DELETE`。値 5）で開いたハンドルを返す。
-    /// ハンドルを保持する間は内容を書き換えられないため、検証した内容がそのまま公開される。
-    /// `FILE_SHARE_DELETE` を含めるのは、Windows の `hard_link` が元ファイルへの DELETE / 属性アクセスを
-    /// 要し、`FILE_SHARE_READ` のみの固定は自分の `hard_link` を共有違反で失敗させるため。名前の差し替えは
-    /// 許すため、リンク直前に名前側の指紋を照合したうえで、リンク後の実体（新規の宛先・修復用の一時名）を
-    /// 再ハッシュして確定する（`verify_published_blob`）。既存の宛先が正しい内容なら置換しない。
-    /// これは Windows の `FileIdent` が size / mtime だけで同一性を保証できないための fail-closed の対策
-    /// （ファイル ID の照合は `windows-sys` が oci の依存に無く FFI を足せないため採らない。OCI-1・OCI-7）。
+    /// 手順は、(1) ステージング名の指紋を照合して `hard_link` で私的な一時名（宛先と同じディレクトリ）へ
+    /// 結び付け、(2) 一時名を書き込み共有拒否（`FILE_SHARE_READ | FILE_SHARE_DELETE`。値 5）で開いたまま
+    /// 再ハッシュして digest を確定する。排他区間の中では再ハッシュせず、この一時名を `rename` で
+    /// 宛先へ移すだけ（メタデータ操作のみ。ガード保持を期限内に収める）。
+    ///
+    /// 方式の理由: Windows の `FileIdent` は size / mtime だけで差し替えを検出できず、`hard_link` で
+    /// 実体のハンドルを直接渡す API も無い（`windows-sys` は oci の依存に無く FFI は足さない）。
+    /// そこで「検証した実体そのもの」を一時名で保持して宛先へ rename すれば、宛先の内容は常に digest
+    /// 検証済みになる。既存の宛先は置換するが、置換後の内容は同じ digest で検証済みのため害は無い
+    /// （検証前の内容で共有の `blobs/sha256` を上書きしない。fail-closed。OCI-1・OCI-7）。
+    /// `FILE_SHARE_DELETE` を含めるのは自分の `rename` / `hard_link` を共有違反にしないため。
+    /// 残る差し替えの窓は、所有者専用のストア内の私的な一時名に限られる。
     #[cfg(windows)]
-    fn pin_staged_blobs(&self, to_move: &[Digest]) -> Result<BTreeMap<Digest, fs::File>, OciError> {
+    fn pin_staged_blobs(
+        &self,
+        to_move: &[Digest],
+        tmps: &mut PublishTmpCleanup,
+    ) -> Result<BTreeMap<Digest, fs::File>, OciError> {
         use std::os::windows::fs::OpenOptionsExt;
+        let root = self.store.root();
         let mut pinned = BTreeMap::new();
         for b in to_move {
             let src = self.staging_dir.join(hex_of(b)?);
@@ -664,18 +663,23 @@ impl PullSession<'_> {
                     "blob is neither leased nor verified by this pull",
                 ));
             };
+            let tmp = publish_tmp_path(&blob_path(root, b)?);
+            let _ = fs::remove_file(&tmp);
+            fs::hard_link(&src, &tmp)
+                .map_err(|e| io_err(&e, "failed to stage blob for publish"))?;
+            tmps.add(tmp.clone());
             let file = fs::OpenOptions::new()
                 .read(true)
                 .share_mode(5)
-                .open(&src)
+                .open(&tmp)
                 .map_err(|e| io_err(&e, "failed to pin staged blob"))?;
             let m = file
                 .metadata()
                 .map_err(|e| io_err(&e, "failed to stat staged blob"))?;
-            if !m.is_file() || FileIdent::of(&m) != entry.ident {
+            if !m.is_file() {
                 return Err(err(
-                    OciErrorCode::DataLoss,
-                    "staged blob changed after verification",
+                    OciErrorCode::FailedPrecondition,
+                    "staged blob is not a regular file",
                 ));
             }
             verify_blob_file_digest_with(self.store.recorder(), &file, b, entry.size)?;
@@ -689,6 +693,7 @@ impl PullSession<'_> {
     fn pin_staged_blobs(
         &self,
         _to_move: &[Digest],
+        _tmps: &mut PublishTmpCleanup,
     ) -> Result<BTreeMap<Digest, fs::File>, OciError> {
         Ok(BTreeMap::new())
     }
@@ -793,16 +798,20 @@ impl PullSession<'_> {
         let root = self.store.root().to_path_buf();
         let owner = dir_owner(&self.staging_dir)?;
         // Windows: 実体を共有拒否のハンドルで固定して検証する（ガードの外。以降は固定済みの実体を公開する）。
-        let mut pinned = self.pin_staged_blobs(&to_move)?;
+        let mut tmps = PublishTmpCleanup::default();
+        let mut pinned = self.pin_staged_blobs(&to_move, &mut tmps)?;
         // 既存の宛先の内容検証（再ハッシュ）はガードの外で済ませ、検証した実体の指紋を控える。
         // 排他区間の中では指紋の照合だけを行う（大容量 blob でガード保持が期限を超えないように。
         // ロックの規律）。
         let mut dst_checked: BTreeMap<Digest, Option<FileIdent>> = BTreeMap::new();
         for b in &to_move {
             let dst = blob_path(&root, b)?;
-            // Windows でも既存の宛先は digest を検証し、正しい内容ならそのまま受け入れる。
-            // 共有の `blobs/sha256` の正しいオブジェクトを、名前の差し替えを許す固定の下で
-            // 公開する実体（検証済みと同じとは限らない）で上書きしない（fail-closed。OCI-1・OCI-7）。
+            if !cfg!(unix) {
+                // unix 以外は指紋で書き換えを検出できないため、既存の宛先は受け入れの対象にしない。
+                // 公開は digest 検証済みの一時名（`pin_staged_blobs`）の rename で行う（OCI-1・OCI-7）。
+                dst_checked.insert(b.clone(), None);
+                continue;
+            }
             let size = self.verified.get(b).map_or(0, |v| v.size);
             let ident = match FileIdent::of_regular(&dst) {
                 Ok(Some(_)) if !is_trusted_regular(&dst, owner) => None,
@@ -853,19 +862,35 @@ impl PullSession<'_> {
                 let dst = blob_path(&root, b)?;
                 // 検証後にステージングのファイルが差し替わっても未検証の内容を公開しないよう、
                 // 排他区間の下では再ハッシュせず、検証した実体の指紋と信頼条件を照合する（OCI-1・OCI-7）。
-                // Windows は指紋が size / mtime だけのため、ガードの外で固定したハンドル（`pinned`）の
-                // 内容を検証済みとする（ガード内で再ハッシュしない）。
+                // Windows は指紋が size / mtime だけのため、ガードの外で digest 検証済みの一時名へ結び付けて
+                // 固定してあり（`pin_staged_blobs`）、ここではその一時名を rename で宛先へ移すだけにする
+                // （ガード内で再ハッシュしない。既存の宛先は同じ digest の検証済みの内容で置換される）。
                 self.check_staged_ident(&src, b)?;
+                if cfg!(windows) {
+                    let existed = match fs::symlink_metadata(&dst) {
+                        Ok(m) if m.is_file() => true,
+                        Ok(_) => {
+                            return Err(err(
+                                OciErrorCode::FailedPrecondition,
+                                "blob destination is not a regular file",
+                            ));
+                        }
+                        Err(_) => false,
+                    };
+                    fs::rename(publish_tmp_path(&dst), &dst)
+                        .map_err(|_| err(OciErrorCode::Internal, "failed to publish blob"))?;
+                    if !existed {
+                        created.push(dst);
+                    }
+                    moved.push(b.clone());
+                    pinned.remove(b);
+                    fs::remove_file(&src)
+                        .map_err(|_| err(OciErrorCode::Internal, "failed to remove staged blob"))?;
+                    continue;
+                }
                 match fs::hard_link(&src, &dst) {
                     Ok(()) => {
-                        created.push(dst.clone());
-                        // Windows: 固定は名前の差し替えを許す（`FILE_SHARE_DELETE`）ため、リンクした実体を
-                        // 再ハッシュして、検証済みと別の内容を公開していないことを確かめる。違えば今作った
-                        // 宛先を `created` から消す（失敗時のロールバックで消える）。
-                        if cfg!(windows) {
-                            let size = self.verified.get(b).map_or(0, |v| v.size);
-                            verify_published_blob(&dst, b, size)?;
-                        }
+                        created.push(dst);
                         moved.push(b.clone());
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -881,29 +906,6 @@ impl PullSession<'_> {
                                     && is_trusted_regular(&dst, owner)
                                 {
                                     present.push(b.clone());
-                                } else if cfg!(windows) {
-                                    // Windows: 既存の宛先は消さず、同じディレクトリの一時名へ固定済みの実体を
-                                    // hard_link し、rename で原子的に置き換える。途中で失敗しても既存の宛先は
-                                    // 残る（他のイメージが参照する blob を失わない。OCI-1）。
-                                    let tmp = repair_tmp_path(&dst);
-                                    let _ = fs::remove_file(&tmp);
-                                    let size = self.verified.get(b).map_or(0, |v| v.size);
-                                    // 置き換える前に一時名の内容を再ハッシュし、未検証の内容で
-                                    // 既存の宛先を上書きしない（名前の差し替え対策。OCI-1）。
-                                    let repaired = fs::hard_link(&src, &tmp)
-                                        .map_err(|_| ())
-                                        .and_then(|()| {
-                                            verify_published_blob(&tmp, b, size).map_err(|_| ())
-                                        })
-                                        .and_then(|()| fs::rename(&tmp, &dst).map_err(|_| ()));
-                                    if repaired.is_err() {
-                                        let _ = fs::remove_file(&tmp);
-                                        return Err(err(
-                                            OciErrorCode::Internal,
-                                            "failed to repair corrupt blob",
-                                        ));
-                                    }
-                                    moved.push(b.clone());
                                 } else {
                                     fs::rename(&src, &dst).map_err(|_| {
                                         err(OciErrorCode::Internal, "failed to repair corrupt blob")
@@ -1025,11 +1027,31 @@ impl PullSession<'_> {
     }
 }
 
-/// Windows の修復用の一時名（宛先と同じディレクトリ。同一ボリュームで rename できる）。
-fn repair_tmp_path(dst: &Path) -> PathBuf {
+/// Windows の公開用の私的な一時名（宛先と同じディレクトリ。同一ボリュームで rename できる）。
+fn publish_tmp_path(dst: &Path) -> PathBuf {
     let mut name = dst.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".repair-{}", std::process::id()));
+    name.push(format!(".publish-{}", std::process::id()));
     dst.with_file_name(name)
+}
+
+/// 公開用の一時名の後始末。drop で残っている一時名を消す（成功時は rename 済みで no-op）。
+/// `publish_inner` の途中で失敗・早期 return しても一時名を残さないためのガード（OCI-7）。
+#[derive(Default)]
+struct PublishTmpCleanup(Vec<PathBuf>);
+
+impl PublishTmpCleanup {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn add(&mut self, p: PathBuf) {
+        self.0.push(p);
+    }
+}
+
+impl Drop for PublishTmpCleanup {
+    fn drop(&mut self) {
+        for p in &self.0 {
+            let _ = fs::remove_file(p);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1863,20 +1885,23 @@ mod tests {
         assert!(!root.blob(&dg).exists());
     }
 
-    /// 公開後の再ハッシュ（Windows の公開経路が使う）は、内容が違う実体を `DataLoss` で拒否する。
-    /// Linux でも検証できる部分を全 OS の試験にする（OCI-1・OCI-7）。
+    /// 公開用の一時名の後始末は、drop で残った一時名を消し、無い名前があっても失敗しない（OCI-7）。
     #[test]
-    fn oci1_verify_published_blob_rejects_swapped_content() {
-        let root = Root::new("pub-reverify");
-        let p = root.0.join("blob");
-        fs::write(&p, b"config-body").unwrap();
-        let dg = sha_of(b"config-body");
-        verify_published_blob(&p, &dg, 11).unwrap();
-        fs::write(&p, b"config-BODY").unwrap();
+    fn oci7_publish_tmp_cleanup_removes_leftovers() {
+        let root = Root::new("pub-tmp-cleanup");
+        let dst = root.0.join("abc");
+        let tmp = publish_tmp_path(&dst);
         assert_eq!(
-            verify_published_blob(&p, &dg, 11).unwrap_err().code(),
-            OciErrorCode::DataLoss
+            tmp.file_name().unwrap().to_string_lossy(),
+            format!("abc.publish-{}", std::process::id())
         );
+        fs::write(&tmp, b"x").unwrap();
+        {
+            let mut c = PublishTmpCleanup::default();
+            c.add(tmp.clone());
+            c.add(root.0.join("missing"));
+        }
+        assert!(!tmp.exists());
     }
 
     /// 既に正しい内容で存在する宛先は、全 OS で置き換えずそのまま受け入れる（OCI-1・OCI-7）。
@@ -1898,9 +1923,15 @@ mod tests {
         let out = s
             .publish(PullPublishRequest::new(manifest_digest(), comp))
             .unwrap();
-        assert_eq!(out.already_present_blobs, vec![dg.clone()]);
-        assert!(out.moved_blobs.is_empty());
+        // Windows は既存の宛先を検証済みの一時名の rename で置換する（moved）。内容は同一。
+        if cfg!(unix) {
+            assert_eq!(out.already_present_blobs, vec![dg.clone()]);
+            assert!(out.moved_blobs.is_empty());
+        } else {
+            assert_eq!(out.moved_blobs, vec![dg.clone()]);
+        }
         assert_eq!(fs::read(&dst).unwrap(), b"config-body");
+        assert!(!publish_tmp_path(&dst).exists());
     }
 
     /// group / other 書き込み可能なステージングの blob は 0600 へ狭めてから検証・公開する。

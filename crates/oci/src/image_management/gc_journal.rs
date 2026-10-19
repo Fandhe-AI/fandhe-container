@@ -653,7 +653,15 @@ impl ReferenceTable {
                 ..Sweep::default()
             },
         };
-        let deleted_digests: Vec<Digest> = sweep.deleted.iter().map(|(d, _)| d.clone()).collect();
+        // 既に不在の blob も「unlink 済み」に含める。前回プロセスが unlink 後・ディレクトリ fsync 前に
+        // 落ちた blob で、fsync 失敗時に書き直すジャーナルから落ちると、電源断で unlink が巻き戻っても
+        // 再削除できなくなるため（OCI-7）。
+        let deleted_digests: Vec<Digest> = sweep
+            .deleted
+            .iter()
+            .map(|(d, _)| d.clone())
+            .chain(sweep.absent.iter().cloned())
+            .collect();
         out.durability = settle(
             root,
             &sweep.undeleted,
@@ -980,6 +988,31 @@ mod tests {
         let j = read_journal(&root.0).unwrap().unwrap();
         assert_eq!(j.delete_blobs, vec![d(0x11), d(0x22)]);
         assert_eq!(j.attempts, 1);
+    }
+
+    /// OCI-7: 復旧で fsync が失敗し消せない blob もあるとき、既に不在の blob も再試行一覧に残す。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_resume_keeps_absent_blobs_when_blob_dir_fsync_fails() {
+        let root = Root::new();
+        files(&root);
+        write_journal(&root.0, &journal_a()).unwrap();
+        // 0x11 は前回プロセスが unlink 済み（不在）、0xc1 は消せない（ディレクトリ）。
+        fs::remove_file(blob_path(&root.0, &d(0x11)).unwrap()).unwrap();
+        let p = blob_path(&root.0, &d(0xc1)).unwrap();
+        fs::remove_file(&p).unwrap();
+        fs::create_dir(&p).unwrap();
+        let mut t = table();
+        t.register_tag(tk("v1"), &d(0xa0)).unwrap();
+        let store = ImageStore::with_table(&root.0, t).unwrap();
+        test_hook::fail_sync_of(&blob_dir(&root.0), 8);
+        let rec = store.recover_pending_deletion().unwrap().unwrap();
+        test_hook::clear();
+        assert_eq!(rec.durability, DeletionDurability::Pending);
+        assert_eq!(rec.absent_blobs, vec![d(0x11)]);
+        assert_eq!(rec.undeleted_blobs, vec![d(0xc1)]);
+        let j = read_journal(&root.0).unwrap().unwrap();
+        assert_eq!(j.delete_blobs, vec![d(0x11), d(0xc1)]);
     }
 
     /// OCI-7: ジャーナルの書き直しに失敗しても上限判定を諦めず、断念して片づける。

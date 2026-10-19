@@ -92,6 +92,9 @@ fn main() {
             .arg(": > \"$1\"")
             .arg("sh")
             .arg(dir.join("denied").join(MARKER))
+            // strerror の文言はロケールに従うため C に固定する（非英語ロケールでの誤失敗を防ぐ）。
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()

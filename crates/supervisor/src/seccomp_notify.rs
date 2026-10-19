@@ -177,6 +177,10 @@ pub struct Counters {
     target_gone: AtomicU64,
     pid_unresolved: AtomicU64,
     respond_failed: AtomicU64,
+    wait_failed: AtomicU64,
+    receive_failed: AtomicU64,
+    /// listener スレッドが最終ログで報告済みとした時点の値（回収後に recorder の増分だけを出すため）。
+    reported_at_exit: Mutex<Option<CounterSnapshot>>,
 }
 
 /// [`Counters`] の時点の値。
@@ -196,6 +200,10 @@ pub struct CounterSnapshot {
     pub pid_unresolved: u64,
     /// 応答の送信が失敗した件数。
     pub respond_failed: u64,
+    /// listener の待機（poll）が失敗してループを終えた件数。以後の禁止 syscall は ENOSYS になる（監査配送の停止）。
+    pub wait_failed: u64,
+    /// 通知の受信が失敗してループを終えた件数。意味は `wait_failed` と同じ。
+    pub receive_failed: u64,
 }
 
 impl Counters {
@@ -208,6 +216,8 @@ impl Counters {
             target_gone: self.target_gone.load(Ordering::Relaxed),
             pid_unresolved: self.pid_unresolved.load(Ordering::Relaxed),
             respond_failed: self.respond_failed.load(Ordering::Relaxed),
+            wait_failed: self.wait_failed.load(Ordering::Relaxed),
+            receive_failed: self.receive_failed.load(Ordering::Relaxed),
         }
     }
 }
@@ -232,6 +242,16 @@ fn report_events(now: CounterSnapshot, prev: CounterSnapshot) -> Vec<(&'static s
             "seccomp_audit_respond_failed",
             now.respond_failed,
             prev.respond_failed,
+        ),
+        (
+            "seccomp_audit_wait_failed",
+            now.wait_failed,
+            prev.wait_failed,
+        ),
+        (
+            "seccomp_audit_receive_failed",
+            now.receive_failed,
+            prev.receive_failed,
         ),
     ]
     .into_iter()
@@ -455,7 +475,10 @@ fn listener_main<S: NotifySource>(
                 continue;
             }
             // 読めない状態。以後の完了待ちは見届けず応答して終わる。
-            Err(SourceError) => break,
+            Err(SourceError) => {
+                counters.wait_failed.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
         }
         let (id, notified) = match source.receive() {
             Ok(Some(n)) => n,
@@ -463,7 +486,10 @@ fn listener_main<S: NotifySource>(
                 counters.target_gone.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            Err(SourceError) => break,
+            Err(SourceError) => {
+                counters.receive_failed.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
         };
         match handle_one(
             source,
@@ -485,7 +511,12 @@ fn listener_main<S: NotifySource>(
         report_if_due(counters, &mut reported, &mut last_report);
     }
     drain_in_flight(source, counters, &mut in_flight);
-    emit_report(&report_events(counters.snapshot(), reported));
+    let last = counters.snapshot();
+    emit_report(&report_events(last, reported));
+    *counters
+        .reported_at_exit
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = Some(last);
 }
 
 fn report_if_due(counters: &Counters, reported: &mut CounterSnapshot, last: &mut Instant) {
@@ -743,7 +774,17 @@ fn stop_and_join(live: Live, timeout: Duration) -> CounterSnapshot {
         let line = "{\"component\":\"supervisor\",\"event\":\"seccomp_notify_join_timeout\"}\n";
         let _ = crate::stderr_sink::stderr().emit(line.as_bytes().to_vec());
     }
-    counters.snapshot()
+    let last = counters.snapshot();
+    // listener の最終ログより後に recorder が確定した記録失敗などの増分を、回収後に出す（REPAIR-4）。
+    if listener_done {
+        let reported = counters
+            .reported_at_exit
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .unwrap_or_default();
+        emit_report(&report_events(last, reported));
+    }
+    last
 }
 
 #[cfg(target_os = "linux")]
@@ -828,6 +869,8 @@ mod tests {
         pending: bool,
         answered: Arc<Mutex<Vec<u64>>>,
         gone_on_send: bool,
+        /// 1: wait が失敗する / 2: receive が失敗する。
+        fail_at: u8,
     }
 
     impl Fake {
@@ -839,6 +882,7 @@ mod tests {
                     pending: true,
                     answered: Arc::clone(&answered),
                     gone_on_send: false,
+                    fail_at: 0,
                 },
                 answered,
             )
@@ -848,6 +892,9 @@ mod tests {
     impl NotifySource for Fake {
         type Id = u64;
         fn wait(&self, _t: Duration) -> Result<Ready, SourceError> {
+            if self.fail_at == 1 {
+                return Err(SourceError);
+            }
             if self.script.lock().unwrap().is_empty() {
                 Ok(Ready::Closed)
             } else {
@@ -855,6 +902,9 @@ mod tests {
             }
         }
         fn receive(&self) -> Result<Option<(u64, Notified)>, SourceError> {
+            if self.fail_at == 2 {
+                return Err(SourceError);
+            }
             Ok(self.script.lock().unwrap().pop_front().flatten())
         }
         fn is_pending(&self, _id: u64) -> Result<bool, SourceError> {
@@ -1181,6 +1231,23 @@ mod tests {
         assert!(b.take(later));
         assert!(b.take(later));
         assert!(!b.take(later));
+    }
+
+    /// REPAIR-4・#2025: wait / receive の失敗は正常な Closed と区別して数える。
+    #[test]
+    fn repair4_2025_source_failures_are_counted_separately_from_close() {
+        let sink = Arc::new(Sink::default());
+        let (mut fake, _a) = Fake::new(vec![Some((1, n(10)))]);
+        fake.fail_at = 1;
+        let snap = run(&sink, NotifyConfig::default(), fake, identity());
+        assert_eq!((snap.wait_failed, snap.receive_failed), (1, 0));
+        let (mut fake, _a) = Fake::new(vec![Some((1, n(10)))]);
+        fake.fail_at = 2;
+        let snap = run(&sink, NotifyConfig::default(), fake, identity());
+        assert_eq!((snap.wait_failed, snap.receive_failed), (0, 1));
+        let (fake, _a) = Fake::new(vec![]);
+        let snap = run(&sink, NotifyConfig::default(), fake, identity());
+        assert_eq!((snap.wait_failed, snap.receive_failed), (0, 0));
     }
 
     /// 構造化ログの語彙は固定で、増分のあるものだけを出す。

@@ -251,7 +251,7 @@ fn oci2_opaque_marker_keeps_same_layer_children() {
     assert_eq!(tree(&t.root()), set(&["d", "d/after", "d/before", "other"]));
 }
 
-/// OCI-2: マーカー名のディレクトリや予約名は拒否される。
+/// OCI-2: マーカー名のディレクトリは拒否される。`.wh..wh.` の予約名は拒否せず読み飛ばす（#2183）。
 #[test]
 fn oci2_invalid_markers_are_rejected() {
     let t = Tmp::new("bad");
@@ -261,11 +261,9 @@ fn oci2_invalid_markers_are_rejected() {
         OciErrorCode::InvalidArgument
     );
     let t = Tmp::new("bad2");
-    let bad = layer_gz(&[marker(".wh..wh.plnk")]);
-    assert_eq!(
-        extract(&t, &[bad]).unwrap_err(),
-        OciErrorCode::InvalidArgument
-    );
+    let aufs = layer_gz(&[marker(".wh..wh.plnk"), E::File("keep", 0o644, b"k")]);
+    extract(&t, &[aufs]).unwrap();
+    assert_eq!(tree(&t.root()), set(&["keep"]));
 }
 
 /// OCI-2: symlink への whiteout はリンク自体だけを消し、リンク先は残る。

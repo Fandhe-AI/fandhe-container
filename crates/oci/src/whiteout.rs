@@ -5,6 +5,7 @@
 //!
 //! - `classify`: tar エントリの最終コンポーネントを whiteout / 不透明マーカー / 通常名へ分類する。
 //!   `extract_one_layer` のパス 1（収集・検証）とパス 3（展開。マーカーは書かずに読み飛ばす）が各エントリに対して呼ぶ。
+//!   `.wh..wh.` 予約名（AUFS メタデータ）は `Reserved` として読み飛ばしの対象にする（#2183）。
 //! - `remove_tree_nofollow`: symlink を追従せずに実体（ファイル・symlink・ディレクトリの木）を再帰削除する。
 //!   パス 2（whiteout の適用）と、パス 3 で下位レイヤー由来のノードを置き換えるとき（image-spec の
 //!   「Changeset over existing files」）に `Extractor` から呼ばれる。
@@ -25,7 +26,10 @@ use crate::layer::extract::{err, map_fs_err};
 const WHITEOUT_PREFIX: &[u8] = b".wh.";
 /// 不透明ディレクトリのマーカー名（処理部品は `remove_dir_contents_nofollow`。TASK-53.2）。
 const OPAQUE_MARKER: &[u8] = b".wh..wh..opq";
-/// `.wh..wh.` で始まる名前は image-spec が予約する（`.wh..wh..opq` 以外は拒否する）。
+/// `.wh..wh.` で始まる名前は AUFS のメタデータ（`.wh..wh.plnk`・`.wh..wh.aufs`・`.wh..wh.orph` 等）。
+///
+/// image-spec v1.1.1 `layer.md` に予約接頭辞の定めは無く、moby の慣例（moby/go-archive `diff.go`
+/// `UnpackLayer` が "Skip AUFS metadata dirs" として読み飛ばす。commit a9a82af9）に従って扱う（OCI-2）。
 const RESERVED_PREFIX: &[u8] = b".wh..wh.";
 /// 1 コンポーネントの最大バイト数（`NAME_MAX`）。
 const MAX_NAME_BYTES: usize = 255;
@@ -42,11 +46,19 @@ pub(crate) enum NameClass {
     Whiteout { target: Vec<u8> },
     /// `.wh..wh..opq`（不透明ディレクトリ。中身の削除は `remove_dir_contents_nofollow`・TASK-53.2）。
     Opaque,
+    /// `.wh..wh.` で始まり `.wh..wh..opq` ではない名前（AUFS のメタデータ）。
+    /// 呼び出し側 `plan_entry` がエントリ全体を rootfs へ書かずに読み飛ばす（何も消さない）。
+    Reserved,
 }
 
 /// 最終コンポーネント（バイト列）を分類する。
 ///
-/// 不正な whiteout（対象が空・`.`・`..`・`/` や NUL を含む・長すぎる、`.wh..wh.` の未知の予約名）は
+/// `.wh..wh.` の予約名（`.wh..wh..opq` 以外）は `Reserved` を返す。AUFS ストレージドライバ時代の古い
+/// イメージを展開できるよう、moby / containerd と同様に失敗させず読み飛ばす。image-spec 上 `.wh.` で始まる
+/// 名前は FS に実在できず whiteout 自体も隠す決まりなので、読み飛ばしても仕様に反しない。rootfs へ何も書かない
+/// ため分離の攻撃面は増えない。親の位置の whiteout など fail-closed の除外は `plan_entry` が担う。
+///
+/// 不正な whiteout（対象が空・`.`・`..`・`/` や NUL を含む・長すぎる）は
 /// `InvalidArgument` で拒否する（`.wh...` を `..` の whiteout として解釈し親を消す事故を防ぐ）。
 /// `extract_one_layer` が各エントリの最終コンポーネントに対して呼ぶ（TASK-53.3）。
 pub(crate) fn classify(name: &[u8]) -> Result<NameClass, OciError> {
@@ -54,10 +66,7 @@ pub(crate) fn classify(name: &[u8]) -> Result<NameClass, OciError> {
         return Ok(NameClass::Opaque);
     }
     if name.starts_with(RESERVED_PREFIX) {
-        return Err(err(
-            OciErrorCode::InvalidArgument,
-            "whiteout name uses a reserved prefix",
-        ));
+        return Ok(NameClass::Reserved);
     }
     let Some(target) = name.strip_prefix(WHITEOUT_PREFIX) else {
         return Ok(NameClass::Regular);
@@ -200,12 +209,15 @@ mod tests {
         assert_eq!(classify(b".wh").unwrap(), NameClass::Regular);
     }
 
-    /// OCI-2: 不透明マーカーは分類のみ（処理は TASK-53.2）。未知の `.wh..wh.` 予約名は拒否。
+    /// OCI-2: 不透明マーカーは分類のみ（処理は TASK-53.2）。`.wh..wh.` 予約名は `Reserved`（読み飛ばし。#2183）。
     #[test]
     fn oci2_classify_opaque_and_reserved() {
         assert_eq!(classify(b".wh..wh..opq").unwrap(), NameClass::Opaque);
-        invalid(b".wh..wh.plnk");
-        invalid(b".wh..wh.");
+        assert_eq!(classify(b".wh..wh.plnk").unwrap(), NameClass::Reserved);
+        assert_eq!(classify(b".wh..wh.aufs").unwrap(), NameClass::Reserved);
+        assert_eq!(classify(b".wh..wh.").unwrap(), NameClass::Reserved);
+        // 大文字小文字は区別する（moby と同じ）。
+        assert_eq!(classify(b".WH..WH.plnk").unwrap(), NameClass::Regular);
     }
 
     /// OCI-2: 対象が空・`.`・`..`・`/`・NUL・過長の whiteout は拒否する。

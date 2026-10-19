@@ -2,14 +2,14 @@
 //!
 //! 「plugin 起動 → UDS 接続 → WSL2 起動（create / start）→ 停止（stop・切断）」を 1 本の流れで通す。
 //! `fandhe-container-plugin` の UDS 実体は unix のみで、実バックエンド（`wsl.exe`）は Windows のみのため、
-//! 両者を同時に満たす経路は現時点で存在しない（Windows ホスト上の接続経路は TASK-114 で確定予定）。
+//! 両者を同時に満たす経路は現時点で存在しない（Windows ホスト上の接続経路は windows-execution-layout.md〔#1862。承認待ち〕で確定予定）。
 //! そのため試験を 2 層に分ける（実装済みを装わない。REPAIR-3）。
 //!
 //! - 層 A（`mock_core`・unix・既定集合 6 件）: 試験本体が core 役（`UdsListener::accept`）、別スレッドが
 //!   plugin 役（peer 認証つき `UdsStream::connect` → `serve_session`。`main.rs` と同じ実行順）となり、
 //!   偽バックエンドで create → start → stop → 切断を実 UDS 上で往復する。
 //! - 層 B（`real_wsl2`・Windows・`#[ignore]` 1 件）: 実 `wsl.exe` と実 WSL2 に対し、アダプタをプロセス内で
-//!   駆動する。UDS ホップは含まない（TASK-114 待ち）。手順は AGENTS.md「実機前提テスト」節。
+//!   駆動する。UDS ホップは含まない（windows-execution-layout.md〔#1862。承認待ち〕待ち）。手順は AGENTS.md「実機前提テスト」節。
 //!
 //! 層 A で扱わないもの（既存試験の担当）: 実バイナリ spawn・フレーム破損・実 SIGTERM（`frame_loop.rs`）、
 //! 停止フラグ時の `release_all`（`shutdown_cleanup.rs`）、peer 認証（`peer_auth.rs`）。
@@ -417,7 +417,7 @@ mod mock_core {
 #[cfg(target_os = "windows")]
 mod real_wsl2 {
     //! 層 B。実 `wsl.exe` と実 WSL2 に対し、plugin の要求経路（`RequestHandler::handle`）を
-    //! プロセス内で駆動する。UDS ホップは含まない（Windows ホスト上の UDS は TASK-114 待ち。REPAIR-3）。
+    //! プロセス内で駆動する。UDS ホップは含まない（Windows ホスト上の UDS は windows-execution-layout.md〔#1862。承認待ち〕待ち。REPAIR-3）。
     //! 環境変数は `platform-windows/tests/wsl2_virtiofs.rs` と同名（新設しない）。
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};

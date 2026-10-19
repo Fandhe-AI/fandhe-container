@@ -81,8 +81,10 @@
 //! - symlink 経由の検証は実体の正規パスの取得に `/proc` を要する。未マウント環境では `Io` で
 //!   拒否する（fail-closed）
 //! - 署名の照合は未実装（切替点はあるが [`PluginVerificationMethod::Signature`] は常に拒否する）。ハッシュ照合は「計算時点」の内容を保証するもので、信頼された所有者
-//!   （root / 実効 UID）自身が計算後に内容を書き換える場合は防げない。起動も照合済み fd 経由
-//!   （fexecve 相当）にしない限り保証は切れる（配線は後続）
+//!   （root / 実効 UID）自身が計算後に内容を書き換える場合は防げない。照合済み fd から起動対象を作る変換
+//!   `HashVerifiedPluginFile::into_launch_target`（`plugin` feature 配下の `crate::plugin`・#1857）はあり、
+//!   Linux ではその fd の実体が実行される。ただし本番で起動を呼ぶ配線は未実装（#1869）で、
+//!   macOS 等は起動直前の同一性確認が未実装（#1866）。それまでは保証が切れる
 //! - 許可一覧ファイルの置き場所・指定方法（CLI フラグ / 固定パス）と、一覧ファイル自体の
 //!   所有者・モード検証の配線は未実装（呼び出し側の契約。上記）。設計案は
 //!   `docs/design/plugin-hash-allowlist.md`（#1868。オーナー承認待ちで未確定）
@@ -572,6 +574,9 @@ impl VerifiedPluginFile {
 /// 所有者・モード検証に加えて sha256 許可一覧との照合を通った plugin ファイル（type-state）。
 /// 構築は [`VerifiedPluginFile::verify_hash`] のみ。後続のレジストリ配線が型でハッシュ照合済みを
 /// 要求できる（TASK-122.3）。
+///
+/// 起動対象への変換 `into_launch_target`（`plugin` feature 配下の `crate::plugin`・#1857）は
+/// この型の値だけを受ける。
 #[derive(Debug)]
 pub struct HashVerifiedPluginFile {
     file: VerifiedPluginFile,

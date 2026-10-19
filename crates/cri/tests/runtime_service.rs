@@ -112,7 +112,7 @@ fn is_sandbox_id(id: &str) -> bool {
 fn task_57_1_run_pod_sandbox_returns_distinct_ids() {
     let service = CriRuntimeService::new();
     let first = run(&service, Some(config("pod-a")), "").expect("first sandbox");
-    let second = run(&service, Some(config("pod-a")), "").expect("second sandbox");
+    let second = run(&service, Some(config("pod-b")), "").expect("second sandbox");
     assert_eq!(first.len(), 64);
     assert!(is_sandbox_id(&first), "{first}");
     assert!(is_sandbox_id(&second), "{second}");
@@ -232,12 +232,13 @@ fn task_57_1_sandbox_count_limit_returns_failed_precondition() {
 fn task_57_1_default_limit_accepts_1024_sandboxes() {
     let service = CriRuntimeService::new();
     let mut ids = std::collections::HashSet::new();
-    for _ in 0..1024 {
-        ids.insert(run(&service, Some(config("pod-a")), "").expect("within the limit"));
+    // 同一 metadata は ALREADY_EXISTS になるため、name を変えて別の Pod にする。
+    for i in 0..1024 {
+        ids.insert(run(&service, Some(config(&format!("pod-{i}"))), "").expect("within the limit"));
     }
     assert_eq!(ids.len(), 1024);
     assert_eq!(
-        run(&service, Some(config("pod-a")), ""),
+        run(&service, Some(config("pod-over")), ""),
         Err((Code::FailedPrecondition, "too many sandboxes".to_owned()))
     );
 }
@@ -259,10 +260,11 @@ fn task_57_1_retained_config_limit_returns_failed_precondition() {
     assert_eq!(limits.max_retained_bytes(), 2 * per_sandbox);
     let service = CriRuntimeService::with_limits_and_recorder(limits, Arc::new(Collect::default()));
 
-    run(&service, Some(pod.clone()), "").expect("first sandbox");
-    run(&service, Some(pod.clone()), "").expect("second sandbox fills the budget exactly");
+    // 同じ長さの別名にして、見積もりの値を変えずに同一 metadata の重複を避ける。
+    run(&service, Some(pod), "").expect("first sandbox");
+    run(&service, Some(config("pod-b")), "").expect("second sandbox fills the budget exactly");
     assert_eq!(
-        run(&service, Some(pod), ""),
+        run(&service, Some(config("pod-c")), ""),
         Err((
             Code::FailedPrecondition,
             "sandbox config storage is full".to_owned()
@@ -286,6 +288,12 @@ fn task_57_1_recorder_receives_every_outcome() {
 
     run(&service, Some(secret.clone()), "").expect("first sandbox");
     assert_eq!(run(&service, None, ""), invalid("config is required"));
+    // 同一 metadata は上限検査より先に ALREADY_EXISTS になる（ERR-3）。
+    assert_eq!(
+        run(&service, Some(secret.clone()), ""),
+        Err((Code::AlreadyExists, "sandbox already exists".to_owned()))
+    );
+    secret.metadata.as_mut().expect("metadata").name = "pod-b".into();
     assert_eq!(
         run(&service, Some(secret), ""),
         Err((Code::FailedPrecondition, "too many sandboxes".to_owned()))
@@ -296,6 +304,7 @@ fn task_57_1_recorder_receives_every_outcome() {
         vec![
             ("cri.run_pod_sandbox", "success", "OK"),
             ("cri.run_pod_sandbox", "failure", "INVALID_ARGUMENT"),
+            ("cri.run_pod_sandbox", "failure", "ALREADY_EXISTS"),
             ("cri.run_pod_sandbox", "failure", "FAILED_PRECONDITION"),
         ]
     );
@@ -311,6 +320,11 @@ fn task_57_1_recorder_receives_every_outcome() {
                 CriOpKind::RunPodSandbox,
                 CriOpOutcome::Failure,
                 Code::InvalidArgument
+            ),
+            (
+                CriOpKind::RunPodSandbox,
+                CriOpOutcome::Failure,
+                Code::AlreadyExists
             ),
             (
                 CriOpKind::RunPodSandbox,

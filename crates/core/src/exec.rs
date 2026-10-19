@@ -136,6 +136,7 @@ mod seccomp;
 mod setns;
 mod stages;
 mod subreaper;
+mod sysfs;
 mod tmpfs;
 mod violation;
 #[cfg(test)]
@@ -240,7 +241,8 @@ pub use process::{StandardFd, close_standard_fds_for_test};
 #[doc(hidden)]
 pub use process::{
     spawn_container_probe, spawn_container_probe_with_config_paths,
-    spawn_container_probe_with_devices, spawn_container_probe_with_tmpfs_and_config_paths,
+    spawn_container_probe_with_devices, spawn_container_probe_with_sysfs,
+    spawn_container_probe_with_tmpfs_and_config_paths,
 };
 /// supervisor の結合試験 `tests/exec_audit.rs` 専用の再公開（SEC-4・SEC-1・#1614 の事後監査。通常の利用者は
 /// 呼ばない。詳細は定義側）。`exec-test-support` feature を付けたビルドにだけ存在する。
@@ -283,6 +285,7 @@ pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
 pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 pub use subreaper::ChildSubreaper;
+pub use sysfs::{SysfsReport, SysfsSource, mount_sysfs, select_sysfs_source};
 pub use tmpfs::{TmpfsMountOutcome, TmpfsReport, mount_tmpfs};
 /// 結合試験 `tests/tmpfs_mount.rs` 専用の再公開（SUP-12・TASK-169 追補・#1472・#1669 事後監査 P2。通常の利用者は呼ばない。
 /// 詳細は定義側）。
@@ -750,6 +753,8 @@ pub enum IsolationStage {
     MountMaskedPaths,
     /// 検証済みの bind mount（`mounts[]` の bind。fd 起点で rootfs へ適用する段。CORE-1・SEC-1・TASK-29 追補・#1913）。
     MountBinds,
+    /// `/sys` への読み取り専用の sysfs の供給（`mounts[]` の sysfs。新しい sysfs または再帰 ro の rbind。SEC-2・OCI-4・#2020）。
+    MountSysfs,
     /// pivot 後の作業ディレクトリへの `chdir`（`process.cwd`。fd 起点で 1 要素ずつ symlink 非追従に辿る。OCI-1・TASK-29）。
     WorkingDir,
 }

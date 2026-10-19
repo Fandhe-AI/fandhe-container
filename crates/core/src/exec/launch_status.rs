@@ -55,6 +55,8 @@ pub(super) enum PrePivotStep {
     PrepareRootfs,
     /// 固定した rootfs との実体の照合。
     VerifyPinned,
+    /// `/sys` への sysfs の供給（`mounts[]` の sysfs の指定時のみ。#2020・SEC-2）。`readonly_paths` より前に載せる。
+    MountSysfs,
     /// 専用 `/dev` の作成。
     CreateDefaultDevices,
     /// tmpfs のマウント。
@@ -76,10 +78,11 @@ pub(super) enum PrePivotStep {
 }
 
 impl PrePivotStep {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::Establish,
         Self::PrepareRootfs,
         Self::VerifyPinned,
+        Self::MountSysfs,
         Self::CreateDefaultDevices,
         Self::MountTmpfs,
         Self::InjectFiles,
@@ -96,6 +99,7 @@ impl PrePivotStep {
             Self::Establish => "establish",
             Self::PrepareRootfs => "prepare_rootfs",
             Self::VerifyPinned => "verify_pinned",
+            Self::MountSysfs => "mount_sysfs",
             Self::CreateDefaultDevices => "create_default_devices",
             Self::MountTmpfs => "mount_tmpfs",
             Self::InjectFiles => "inject_files",
@@ -116,6 +120,7 @@ impl PrePivotStep {
         match self {
             Self::Establish => IsolationStage::MountPrivate,
             Self::PrepareRootfs | Self::VerifyPinned => IsolationStage::PrepareRootfs,
+            Self::MountSysfs => IsolationStage::MountSysfs,
             Self::CreateDefaultDevices => IsolationStage::CreateDevices,
             Self::MountTmpfs => IsolationStage::MountTmpfs,
             Self::InjectFiles => IsolationStage::InjectFiles,
@@ -155,7 +160,7 @@ fn launch_violation(step: PrePivotStep, token: &str) -> Option<ViolationReason> 
             .into_iter()
             .find(|r| r.as_str() == token),
         // 保護の適用失敗は、自分の段の理由だけを通す（段と理由の食い違いは `Malformed`。#2013）。
-        PrePivotStep::ReadonlyPaths | PrePivotStep::MaskedPaths => {
+        PrePivotStep::ReadonlyPaths | PrePivotStep::MaskedPaths | PrePivotStep::MountSysfs => {
             ViolationReason::PROTECTED_PATH_APPLY_REASONS
                 .into_iter()
                 .find(|r| r.as_str() == token && r.stage() == step.stage())
@@ -528,14 +533,15 @@ fn step_ordinal(step: PrePivotStep) -> usize {
         PrePivotStep::Establish => 0,
         PrePivotStep::PrepareRootfs => 1,
         PrePivotStep::VerifyPinned => 2,
-        PrePivotStep::CreateDefaultDevices => 3,
-        PrePivotStep::MountTmpfs => 4,
-        PrePivotStep::InjectFiles => 5,
-        PrePivotStep::MountBinds => 6,
-        PrePivotStep::ReadonlyPaths => 7,
-        PrePivotStep::MaskedPaths => 8,
-        PrePivotStep::PivotRoot => 9,
-        PrePivotStep::WorkingDir => 10,
+        PrePivotStep::MountSysfs => 3,
+        PrePivotStep::CreateDefaultDevices => 4,
+        PrePivotStep::MountTmpfs => 5,
+        PrePivotStep::InjectFiles => 6,
+        PrePivotStep::MountBinds => 7,
+        PrePivotStep::ReadonlyPaths => 8,
+        PrePivotStep::MaskedPaths => 9,
+        PrePivotStep::PivotRoot => 10,
+        PrePivotStep::WorkingDir => 11,
     }
 }
 
@@ -601,7 +607,7 @@ mod tests {
         for (i, s) in PrePivotStep::ALL.into_iter().enumerate() {
             assert_eq!(step_ordinal(s), i);
         }
-        assert_eq!(PrePivotStep::ALL.len(), 11);
+        assert_eq!(PrePivotStep::ALL.len(), 12);
     }
 
     /// 具体値の符号化（ワイヤー形式の固定。SEC-4・REPAIR-2）。
@@ -1000,6 +1006,14 @@ mod tests {
                 IsolationStage::MountMaskedPaths,
                 "failed to apply a masked path protection",
             ),
+            (
+                PrePivotStep::MountSysfs,
+                ViolationReason::SysfsApplyFailed,
+                ErrorCode::FailedPrecondition,
+                "sysfs_apply_failed",
+                IsolationStage::MountSysfs,
+                "failed to apply the read-only sysfs mount",
+            ),
         ] {
             let sink = VecSink::new(false);
             let r = resolve_pre_pivot_status(
@@ -1028,6 +1042,28 @@ mod tests {
             assert!(matches!(r.delivery, AuditDelivery::SinkFailed(_)));
             assert_eq!(r.error.code, code);
             assert_eq!(r.error.stage, stage);
+        }
+    }
+
+    /// 監査（SEC-4・SEC-2・#2020）: sysfs の適用失敗の理由は段 `mount_sysfs` でだけ許可リストを通り、
+    /// 他の段・他の保護の理由は段の食い違いとして落ちる（`launch_violation` は子と親で共有）。
+    #[test]
+    fn sec4_2020_sysfs_apply_reason_passes_only_at_its_own_step() {
+        let t = "sysfs_apply_failed";
+        assert_eq!(
+            launch_violation(PrePivotStep::MountSysfs, t),
+            Some(ViolationReason::SysfsApplyFailed)
+        );
+        for step in [
+            PrePivotStep::ReadonlyPaths,
+            PrePivotStep::MaskedPaths,
+            PrePivotStep::MountBinds,
+            PrePivotStep::PivotRoot,
+        ] {
+            assert_eq!(launch_violation(step, t), None, "{}", step.as_str());
+        }
+        for t in ["readonly_path_apply_failed", "masked_path_apply_failed"] {
+            assert_eq!(launch_violation(PrePivotStep::MountSysfs, t), None);
         }
     }
 

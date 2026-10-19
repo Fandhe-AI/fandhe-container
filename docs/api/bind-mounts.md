@@ -40,9 +40,27 @@ Linux の fandhe-container は、OCI `config.json` の `mounts[]` に書いた b
 | `/proc`・`/sys`・`/dev` とその配下の `destination` | 暗黙のマウントと固定の保護パスがあるため |
 | bind 同士で同一・入れ子の `destination` | 子の宛先がホストのディレクトリになるのを防ぐ |
 | `linux.readonlyPaths` / `maskedPaths` と重なる `destination` | 保護パスを覆えないようにする |
-| bind 以外の種類（`proc`・`tmpfs` など） | 未対応（`UNIMPLEMENTED`） |
+| bind 以外の種類（`proc`・`tmpfs` など。`/sys` の sysfs を除く） | 未対応（`UNIMPLEMENTED`） |
 
 拒否する疑似 FS（mountinfo の fstype 名）は、`proc`・`sysfs`・`debugfs`・`tracefs`・`securityfs`・`cgroup`（v1）・`cgroup2`・`bpf`・`configfs`・`pstore`・`efivarfs`・`selinuxfs`・`smackfs`・`binfmt_misc`・`fusectl`・`resctrl`・`xenfs`・`nsfs`・`mqueue`・`devpts`・`binder`・`devtmpfs` の 22 種である。`devtmpfs`（ホストの `/dev`）は `f_type` が tmpfs と同じため、付け替えた木の mountinfo の fstype 名だけで判定する（SEC-1・#2129）。根拠と Linux v7.0 での出典（ファイル:行）と magic 値は `crates/core/src/exec/bind_mounts.rs` の `PSEUDO_FS_DENYLIST`。ext4・xfs・btrfs・tmpfs・overlayfs・NFS などデータを持つ通常の FS は受ける。
+
+## `/sys` の sysfs（bind 以外に受ける種類）
+
+OCI の既定 config にある `{"destination":"/sys","type":"sysfs"}` を受け、コンテナの `/sys` に**読み取り専用**の sysfs を供給する（SEC-2・OCI-4・TASK-29 追補・#2020）。
+
+| 項目 | 内容 |
+| ---- | ---- |
+| 宛先 | `/sys` のみ。それ以外の宛先の sysfs は `INVALID_ARGUMENT` で拒否する |
+| `source` | 無指定または `sysfs` のみ（ホストのパスとしては使わない） |
+| 受けるオプション | `ro`・`nosuid`・`nodev`・`noexec`（いずれも常に付くので指定しても同じ） |
+| 拒否するオプション | `rw`・`suid`・`dev`・`exec`（黙って読み取り専用に丸めず拒否する）、伝播系（`shared`・`private` など）、`defaults`・`rro` など許可集合外すべて |
+| 件数 | sysfs は 1 件まで（2 件目は拒否） |
+| 供給方式 | 初期 user namespace（ホスト root の試験経路）は新しい sysfs。user namespace の中（本番の `start` 経路）はホストの `/sys` を再帰 bind し、切り離したまま再帰で `ro`・`nosuid`・`nodev`・`noexec` を付けてから載せる |
+| 事後検証 | 載せた後に mountinfo で、`/sys` が sysfs であり、`/sys` とその配下のすべてのマウントが `ro,nosuid,nodev,noexec` であることを確かめる。満たさなければ起動しない |
+
+方式は結果ではなく user namespace で事前に決め、失敗しても別の方式へ縮退しない（想定外の拒否を隠さないため）。コンテナは自前の network namespace を持たないため、user namespace の中では新しい sysfs を載せられず、本番では常にホストの `/sys` の読み取り専用の再帰 bind になる。この場合、ホストの `/sys` とその配下のマウント（cgroup2・securityfs・bpf・debugfs・tracefs など）が読み取り専用で見える。`/sys` 配下の個別項目（`/sys/firmware` など）の覆いは #2014、`/sys` 配下への tmpfs・注入ファイルは #2233 で扱う。Landlock には `/sys` のルールを足さない（実効の権利は root と同じで、書き込みの禁止は VFS の `ro` が担う）。
+
+Docker / runc との差: 本実装は方式を事前に決め、縮退しない。runc・moby が rootless で sysfs をどの条件で bind に差し替えるかは一次資料の確認が済んでおらず（未確認）、確定したら本節を更新する。
 
 ## Docker / runc と異なる既定
 
@@ -58,7 +76,7 @@ Linux の fandhe-container は、OCI `config.json` の `mounts[]` に書いた b
 ## 制約と未対応
 
 - `ro` の bind は、root が書き込み可能な構成では Landlock が書き込み制限を保証できないため、起動前に拒否される。解消は #1917
-- bind 以外の `mounts[]` の種類は未対応
+- bind と `/sys` の sysfs（下記）以外の `mounts[]` の種類は未対応
 - 状態ルート（`StateStore::host_state_root`）と同一・祖先・子孫の `source` は start が拒否する（字句比較と `canonicalize` した実体の比較。SEC-1）。状態ルートを示せないストアでは bind つきの start を拒否する。適用の段も、固定した元に対して状態ルートとの重なりを毎回再検証する（元の属するマウントは fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントも照合する。保護対象と同じファイルシステム上でリンク数 2 以上の通常ファイルは状態ファイルへのハードリンクかもしれないため拒否する。start は状態ルート配下の通常ファイルのリンク数を上限つきで走査し、リンク数 2 以上のものがある〔または走査できない〕場合は、同じファイルシステム上のディレクトリ元も適用の段で拒否する）。元のマウント ID は `O_PATH` で固定した fd から取り、FIFO への差し替えでもブロックしない（REPAIR-5）。mountinfo は読み取りバイト数と行数に上限を設け、超過は構造化エラーで拒否する
 - 疑似 FS の拒否は拒否リストの方式のため、リストにない未知の疑似 FS は受ける。許可リスト方式にすると zfs・ceph・9p・virtiofs などを壊すため採らず、リストの見直しはカーネルの版を上げるときに行う（SEC-1・#2129）。実機での確認は #1916
 - FUSE（`fuse`・`fuseblk`・`fuse.lxcfs` などの派生名）はデータを持つ FS として受ける。FUSE デーモンが見せる中身は検出しない。中身はデーモンの資格情報の範囲を超えないためである

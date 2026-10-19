@@ -21,6 +21,8 @@
 //! - 暗黙の固定集合（`/dev`・`/dev/pts`・`/dev/shm`。オーナー判断 #1609）は `mounts[]` に関係なく常に載るため、
 //!   [`crate::dev_mounts`] の定義（実マウントの属性）から導いた権利のルールを rootfs の次に足す（#1657）。
 //!   `mounts[]` が同じマウント先を指す場合は拒否する（統合の規則は TASK-127）
+//! - `/sys` の sysfs（`mounts[]`。#2020）はルールを作らない（実効の権利は root と同じ。書き込みの禁止は VFS の ro が担う。
+//!   理由は `build_path_rules_with_dev` の実装コメント）
 //! - `linux.readonlyPaths` / `maskedPaths` は参照しない（VFS のマウントが担うためルールは足さない。解釈は
 //!   `OciConfig::readonly_paths` / `masked_paths`、適用は `exec` の pivot 前段。#1852）。暗黙の `/dev` 系と同じか
 //!   祖先を指す保護パスは、ここ（予約・fork の後）ではなく start が fork 前に `InvalidArgument` で拒否する（#2015）
@@ -36,7 +38,8 @@ use std::fmt;
 use super::{LandlockAuditMode, LandlockSupport, landlock_audit_mode_for_abi};
 use crate::dev_mounts::{IMPLICIT_DEV_MOUNT_COUNT, ImplicitDevMount, ImplicitDevMounts};
 use crate::oci_runtime::{
-    CONFIG_MAX_MOUNTS, CONFIG_MAX_PATH_BYTES, MountDestination, OciConfig, OciMount, OciRoot,
+    CONFIG_MAX_MOUNTS, CONFIG_MAX_PATH_BYTES, MountDestination, OciConfig, OciMount, OciMountKind,
+    OciRoot,
 };
 use crate::traits::ErrorCode;
 
@@ -608,6 +611,14 @@ pub fn build_path_rules_with_dev(
             let p = r.path.as_str();
             p != dest.as_str() && !is_ancestor(dest.as_str(), p)
         });
+        // `/sys` の sysfs はルールを作らない（#2020・SEC-2・CORE-5）。Landlock は祖先の root の権利を子で狭められず、
+        // 作っても `/sys` の実効の権利は root と同じになる（疑似 FS として書き込みを落としても、書き込み可能な root の
+        // 下では `WriteRestrictionShadowed` で拒否されるだけで、sysfs の供給を妨げる）。書き込みの禁止は VFS の裏付け
+        // （`exec::mount_sysfs` が載せる ro・事後条件の mountinfo 検証と `readonly_paths` の再帰 ro bind）が担う。
+        // 先行マウントを覆うための `retain` は上で済んでいる。`/sys` 以外の sysfs は従来どおりルールを作る。
+        if OciMountKind::of(m) == OciMountKind::Sysfs && dest.as_str() == "/sys" {
+            continue;
+        }
         rules.push(PathRule {
             path: RulePath::Beneath(dest.clone()),
             allowed: mount_rights(m),
@@ -958,11 +969,11 @@ mod tests {
             true,
             json!([
                 {"destination": "/proc", "type": "proc"},
-                {"destination": "/sys", "type": "sysfs", "options": ["rw"]}
+                {"destination": "/mnt/sys", "type": "sysfs", "options": ["rw"]}
             ]),
         ));
         assert_eq!(rule(&rs, "/proc").allowed.bits(), 0x000D);
-        assert_eq!(rule(&rs, "/sys").allowed.bits(), 0x000D);
+        assert_eq!(rule(&rs, "/mnt/sys").allowed.bits(), 0x000D);
         assert!(rs.shadowed().is_empty());
     }
 
@@ -1017,6 +1028,50 @@ mod tests {
         ));
         assert_eq!(rs.rules().len(), 2);
         assert!(rs.shadowed().is_empty());
+    }
+
+    /// CORE-5・SEC-2（#2020）: `/sys` の sysfs はルールを作らず、書き込み可能な root でも拒否されない。
+    /// `/sys` 以外の sysfs は従来どおり書き込み可能な root の下で拒否される。
+    #[test]
+    fn core5_sec2_sysfs_at_sys_makes_no_rule() {
+        let s = evaluate_abi(6).expect("abi6");
+        for readonly in [true, false] {
+            let c = cfg(
+                readonly,
+                json!([{"destination": "/sys", "type": "sysfs", "options": ["ro"]}]),
+            );
+            let rs = build_path_rules_with_dev(&s, c.root(), c.mounts(), ImplicitDevMounts::None)
+                .expect("rules");
+            assert_eq!(summary(&rs).len(), 1, "readonly={readonly}");
+            assert_eq!(rs.rules()[0].path.as_str(), "/");
+            assert!(rs.shadowed().is_empty());
+        }
+        // 先行のマウントが `/sys` の sysfs に覆われると、そのルールは外れる。
+        let c = cfg(
+            true,
+            json!([
+                {"destination": "/sys/x", "options": ["rw"]},
+                {"destination": "/sys", "type": "sysfs", "options": ["ro"]},
+                {"destination": "/data", "options": ["rw"]},
+            ]),
+        );
+        let rs = build(&c);
+        let paths: Vec<_> = rs.rules().iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, ["/", "/data"]);
+        // `/sys` 以外の sysfs は従来どおり（書き込み可能な root の下では拒否）。
+        let c = cfg(
+            false,
+            json!([{"destination": "/mnt/sys", "type": "sysfs", "options": ["ro"]}]),
+        );
+        let e = build_path_rules_with_dev(&s, c.root(), c.mounts(), ImplicitDevMounts::None)
+            .expect_err("rejected");
+        assert_eq!(
+            e.kind,
+            LandlockRuleErrorKind::WriteRestrictionShadowed {
+                index: 0,
+                granted: AccessFs::WRITE,
+            }
+        );
     }
 
     #[test]

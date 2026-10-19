@@ -34,9 +34,12 @@
 //! - **同一性照合の前提（変更時は見直すこと）**: この照合は「コンテナの中から cgroupfs に書けない」ことに
 //!   依存している。rootless ではコンテナ内 root が委譲スコープの所有者と同じ euid に写るため、コンテナから
 //!   cgroupfs に書ける構成では、コンテナ内のプロセスが兄弟の `fc-*` cgroup の `cgroup.procs` へ自分を移し、
-//!   別コンテナの期待パスに一致させ得る。現在これが成り立たないのは、cgroupfs / sysfs をコンテナへマウント
-//!   しておらず、cgroup namespace も導入していないからである。cgroupfs のマウント・`CLONE_NEWCGROUP`・
-//!   `/sys/fs/cgroup` の bind mount を導入する変更では、本照合に同一性を依存させず、[`Pid1Target::open`]
+//!   別コンテナの期待パスに一致させ得る。現在これが成り立つのは、書き込み可能な cgroupfs をコンテナへマウント
+//!   しておらず、cgroup namespace も導入していないからである。`mounts[]` の sysfs を供給する構成（`exec::mount_sysfs`。
+//!   #2020）でも、`/sys` とその配下（rbind が持ち込むホストの `/sys/fs/cgroup` の cgroup2 を含む）は再帰の読み取り専用で、
+//!   載せた直後に mountinfo で全件の `ro,nosuid,nodev,noexec` を事後検証しており（満たさなければ起動しない）、コンテナの
+//!   `CAP_SYS_ADMIN` の削減と seccomp の mount 系の拒否が ro の外し直しを塞ぐ。書き込み可能な cgroupfs のマウント・
+//!   `CLONE_NEWCGROUP`・`/sys/fs/cgroup` の rw の bind mount を導入する変更では、本照合に同一性を依存させず、[`Pid1Target::open`]
 //!   （記録 pid から開く縮退経路）を拒否へ切り替えること。恒久策は、supervisor がコンテナの起動時（fork 直後・
 //!   回収前）から保持する pidfd で対象を固定する [`Pid1Target::open_with_launch_pidfd`]（#1461）で、pidfd の
 //!   `Pid:`（`/proc/self/fdinfo`）と記録 pid の一致を同一性の根拠にする。この入口でも期待 cgroup の照合は

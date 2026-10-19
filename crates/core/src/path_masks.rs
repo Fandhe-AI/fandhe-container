@@ -15,8 +15,9 @@
 //!
 //! # 未実装（REPAIR-3: 実装済みを装わない）
 //!
-//! - `/sys` 配下の個別項目: moby の一覧に `/sys` 配下は無い。実行層が sysfs を供給する時点（TASK-127）で
-//!   足す。現状は rootfs の `/sys` を mount top ごと読み取り専用にするだけ（[`READONLY_SYS_PATH`]）
+//! - `/sys` 配下の個別項目: moby の一覧に `/sys` 配下は無い。`/sys` 配下の覆いは #2014 で扱う。
+//!   `mounts[]` の sysfs の供給は `exec::mount_sysfs`（#2020）で実装済みだが、`/sys` の保護は mount top ごと読み取り専用に
+//!   するだけ（[`READONLY_SYS_PATH`]）
 //!
 //! 覆う側（`maskedPaths` 相当）の固定集合は同じ置き場所の [`MASKED_PROC_PATHS`]（#1851）。
 //!
@@ -51,7 +52,7 @@ pub const READONLY_PROC_PATHS: [&str; 5] = [
 /// # 未実装（REPAIR-3: 実装済みを装わない）
 ///
 /// moby の `/sys/devices/virtual/powercap`・`/sys/firmware`・`/sys/devices/system/cpu/cpuN/thermal_throttle` は
-/// 対象外。実行層が sysfs を供給する時点（TASK-127）で足す。
+/// 対象外（`/sys` 配下の覆いは #2014 で扱う。sysfs の供給は #2020 で実装済み）。
 pub const MASKED_PROC_PATHS: [&str; 10] = [
     "/proc/acpi",
     "/proc/asound",

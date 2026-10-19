@@ -50,14 +50,16 @@
 //!   再帰 bind と `MOUNT_ATTR_RDONLY` はその procfs の上に新しいマウントを作る。保護は見えている実 procfs に効く
 //! - launch 経路では pivot 後に `/proc`・`/sys` へマウントしない（後からマウントすると保護のマウントを覆い隠す）。
 //!   コンテナ内のプロセスは seccomp の mount 拒否と `CAP_SYS_ADMIN` の除去で `/proc` を載せ直せない
-//! - 将来 sysfs（TASK-127）や OCI `mounts[]` の proc / sysfs を受ける場合は、本段より前に載せなければならない
+//! - `mounts[]` の sysfs（`exec::mount_sysfs`。#2020）は `verify_pinned` の直後（本段より前）に載せ済みで、本段の再帰 bind と
+//!   `MOUNT_ATTR_RDONLY` はその sysfs（またはホストの `/sys` の rbind）の上に載る。OCI `mounts[]` の proc を受ける場合も、
+//!   本段より前に載せなければならない
 //! - 順序は `run_pre_pivot` の 1 か所で固定し、単体テスト `core1_run_pre_pivot_order_is_fixed` と、結合試験
 //!   `readonly_paths`・`masked_paths` の最上位マウントの照合（親が見えている procfs であること）で検査する
 //!
 //! # 未実装（REPAIR-3: 実装済みを装わない）
 //!
-//! - `/sys` 配下の個別項目と sysfs の供給（TASK-127）。`/sys` は mount top だけを読み取り専用にする。将来 OCI
-//!   `mounts[]` で sysfs を `/sys` に載せる場合は、本段より前に載せること
+//! - `/sys` 配下の個別項目（`/sys/firmware` 等。#2014）。`/sys` は mount top だけを読み取り専用にする。sysfs の供給は
+//!   `exec::mount_sysfs`（#2020。`mounts[]` に sysfs がある起動のみ。本段より前に載せる）
 //! - `/proc` の供給（procfs マウント）。現状は本段より後に procfs をマウントする実装がない。将来 OCI `mounts[]`
 //!   等で procfs を `/proc` に載せる場合は、`/sys` と同様に本段より前に載せること（後から載せると読み取り専用の bind が隠れる）
 //! - 記録に段のフィールドを足すこと: 経路検査の拒否は汎用理由（`path_symlink_or_not_directory` 等）で記録され、

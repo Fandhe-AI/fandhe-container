@@ -183,6 +183,14 @@ name = "readonly_paths"
 path = "tests/readonly_paths.rs"
 harness = false
 
+# `mounts[]` の sysfs を読み取り専用で /sys に供給する段の結合試験（SEC-2・OCI-4・TASK-29 追補・#2020）。
+# 上と同じ理由で harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（Linux 5.12 以降・root もしくは
+# 非特権 user namespace を許すホスト。AGENTS.md）。
+[[test]]
+name = "sysfs_mount"
+path = "tests/sysfs_mount.rs"
+harness = false
+
 # 覆うパスの固定集合（/proc 配下の 10 件）の結合試験（SEC-2・TASK-29 追補・#1851）。
 # 上と同じ理由で harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（Linux 5.12 以降・root もしくは
 # 非特権 user namespace を許すホスト。AGENTS.md）。

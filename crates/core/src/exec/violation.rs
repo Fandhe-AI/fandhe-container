@@ -285,15 +285,22 @@ pub enum ViolationReason {
     /// 覆うパス（固定集合または `config.json` 由来）の保護を載せる操作・事後検証が失敗した
     /// （SEC-2・SEC-4・TASK-41 追補・#2013）。
     MaskedPathApplyFailed,
+    /// `/sys` の sysfs（`mounts[]` の sysfs）を読み取り専用で供給する操作・事後検証が失敗した（新しい sysfs・
+    /// ホスト `/sys` の ro rbind・配下に rw のマウントが残る等の事後条件違反。対象の検査〔symlink・shared〕の
+    /// 拒否は含まない。SEC-2・SEC-4・OCI-4・#2020）。
+    SysfsApplyFailed,
 }
 
 impl ViolationReason {
-    /// 種別 [`ViolationKind::ProtectedPathApply`] の理由の全一覧（読み取り専用化・覆いの適用失敗。SEC-2・SEC-4）。
+    /// 種別 [`ViolationKind::ProtectedPathApply`] の理由の全一覧（読み取り専用化・覆い・sysfs の適用失敗。SEC-2・SEC-4）。
     ///
-    /// 親は段つきの許可リスト（`launch_status`）で、`readonly_paths` 段には前者だけ、`masked_paths` 段には後者だけを
-    /// 通す。理由の集合の唯一の定義。
-    pub(super) const PROTECTED_PATH_APPLY_REASONS: [Self; 2] =
-        [Self::ReadonlyPathApplyFailed, Self::MaskedPathApplyFailed];
+    /// 親は段つきの許可リスト（`launch_status`）で、`readonly_paths` 段には `ReadonlyPathApplyFailed` だけ、
+    /// `masked_paths` 段には `MaskedPathApplyFailed` だけ、`mount_sysfs` 段には `SysfsApplyFailed` だけを通す。理由の集合の唯一の定義。
+    pub(super) const PROTECTED_PATH_APPLY_REASONS: [Self; 3] = [
+        Self::ReadonlyPathApplyFailed,
+        Self::MaskedPathApplyFailed,
+        Self::SysfsApplyFailed,
+    ];
 
     /// 種別 [`ViolationKind::ExecTarget`] の理由の全一覧（exec の対象の拒否。SUP-6・SEC-1）。
     ///
@@ -417,7 +424,7 @@ impl ViolationReason {
     ///
     /// 手書きの理由リストを別に持たず、種別（[`Self::kind`]）で絞って使う（[`Self::from_launch_token`]）。
     /// 足し忘れは単体テスト（`ALL` の件数が `as_str` の分岐数と一致すること）が検出する。
-    pub(super) const ALL: [ViolationReason; 63] = [
+    pub(super) const ALL: [ViolationReason; 64] = [
         Self::NoNamespaces,
         Self::HostnameWithoutUts,
         Self::PidWithoutMount,
@@ -481,6 +488,7 @@ impl ViolationReason {
         Self::ExecTargetPidfdMismatch,
         Self::ReadonlyPathApplyFailed,
         Self::MaskedPathApplyFailed,
+        Self::SysfsApplyFailed,
     ];
 
     /// pivot 前段の子が状態 pipe で運んだ理由コード `token` から理由を引き直す（許可リスト照合。SEC-4・#1815）。
@@ -636,6 +644,7 @@ impl ViolationReason {
             Self::ExecTargetPidfdMismatch => "exec_target_pidfd_mismatch",
             Self::ReadonlyPathApplyFailed => "readonly_path_apply_failed",
             Self::MaskedPathApplyFailed => "masked_path_apply_failed",
+            Self::SysfsApplyFailed => "sysfs_apply_failed",
         }
     }
 
@@ -704,9 +713,9 @@ impl ViolationReason {
             | Self::ExecJoinedPidNamespaceMismatch
             | Self::ExecJoinedCgroupMismatch
             | Self::ExecTargetPidfdMismatch => ViolationKind::ExecTarget,
-            Self::ReadonlyPathApplyFailed | Self::MaskedPathApplyFailed => {
-                ViolationKind::ProtectedPathApply
-            }
+            Self::ReadonlyPathApplyFailed
+            | Self::MaskedPathApplyFailed
+            | Self::SysfsApplyFailed => ViolationKind::ProtectedPathApply,
         }
     }
 
@@ -737,7 +746,9 @@ impl ViolationReason {
             | Self::BindSourcePseudoFs
             | Self::BindTargetKindMismatch => "SEC-1",
             Self::LandlockMountIdentityMismatch | Self::LandlockMountNotRoot => "CORE-5",
-            Self::ReadonlyPathApplyFailed | Self::MaskedPathApplyFailed => "SEC-2",
+            Self::ReadonlyPathApplyFailed
+            | Self::MaskedPathApplyFailed
+            | Self::SysfsApplyFailed => "SEC-2",
             Self::ExecTargetNotNestedPid1
             | Self::ExecTargetSharesPidNamespace
             | Self::ExecTargetSharesMountNamespace
@@ -808,7 +819,8 @@ impl ViolationReason {
             | Self::ExecProcNotProcfs
             | Self::EntrypointCopySealUnverified
             | Self::ReadonlyPathApplyFailed
-            | Self::MaskedPathApplyFailed => ErrorCode::FailedPrecondition,
+            | Self::MaskedPathApplyFailed
+            | Self::SysfsApplyFailed => ErrorCode::FailedPrecondition,
             Self::EntrypointIsRuntimeBinary
             | Self::StdioNullNotNullDevice
             | Self::EntrypointInterpreterIsRuntimeBinary
@@ -829,6 +841,7 @@ impl ViolationReason {
             ViolationKind::ExecTarget => IsolationStage::SetNs,
             ViolationKind::ProtectedPathApply => match self {
                 Self::MaskedPathApplyFailed => IsolationStage::MountMaskedPaths,
+                Self::SysfsApplyFailed => IsolationStage::MountSysfs,
                 _ => IsolationStage::MountReadonlyPaths,
             },
             _ => IsolationStage::MountProc,
@@ -990,6 +1003,7 @@ impl ViolationReason {
             }
             Self::ReadonlyPathApplyFailed => "failed to apply a read-only path protection",
             Self::MaskedPathApplyFailed => "failed to apply a masked path protection",
+            Self::SysfsApplyFailed => "failed to apply the read-only sysfs mount",
         }
     }
 }
@@ -1158,8 +1172,14 @@ mod tests {
                 IsolationStage::MountMaskedPaths,
                 "failed to apply a masked path protection",
             ),
+            (
+                ViolationReason::SysfsApplyFailed,
+                "sysfs_apply_failed",
+                IsolationStage::MountSysfs,
+                "failed to apply the read-only sysfs mount",
+            ),
         ];
-        assert_eq!(ViolationReason::PROTECTED_PATH_APPLY_REASONS.len(), 2);
+        assert_eq!(ViolationReason::PROTECTED_PATH_APPLY_REASONS.len(), 3);
         for (r, token, stage, msg) in table {
             assert!(ViolationReason::PROTECTED_PATH_APPLY_REASONS.contains(&r));
             assert_eq!(r.as_str(), token);

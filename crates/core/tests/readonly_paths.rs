@@ -27,8 +27,9 @@
 //!   `proc` で、親が `/proc` の最上位のマウントであること。保護の後に `/proc` へ新しい procfs が載ると、隠れた古い
 //!   `/proc/sys` の行は `ro` のまま残るが、親が最上位の procfs と食い違うため検出できる（#2005・SEC-2。pivot 前に
 //!   procfs をマウントし、保護をその上に載せる順序は `run_pre_pivot` で固定）
-//! - `/sys` は最上位のマウントが `ro`。sysfs の供給（TASK-127）はまだ無く、`/sys` は rootfs 上のディレクトリのため
-//!   fstype は `sysfs` ではない（観測値として出力のみ。供給後にこの期待を見直す）。この期待は `/sys` 配下に tmpfs を
+//! - `/sys` は最上位のマウントが `ro`。本試験は `setup` なしの最小構成で動き `exec::mount_sysfs` の段を通らないため、`/sys` は
+//!   rootfs 上のディレクトリで fstype は `sysfs` ではない（観測値として出力のみ）。sysfs を供給した後の fstype と `ro` は
+//!   `tests/sysfs_mount.rs` が照合する（#2020）。この期待は `/sys` 配下に tmpfs を
 //!   載せない構成に限る
 //!
 //! # 判定ロジックの自己照合（REPAIR-12）

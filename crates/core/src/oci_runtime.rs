@@ -44,6 +44,7 @@ mod mount_destination;
 pub(crate) mod mountinfo_identity;
 mod resources;
 mod start;
+mod sysfs_mount;
 mod working_dir;
 
 #[cfg(target_os = "linux")]
@@ -94,5 +95,10 @@ pub use resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
 pub use start::{
     ClaimedStart, LAUNCHER_REPLY_GRACE, StartedContainer, claim_start, launch_claimed,
     recover_interrupted_start, start, take_unreaped_processes,
+};
+#[cfg(target_os = "linux")]
+pub(crate) use sysfs_mount::OciMountKind;
+pub use sysfs_mount::{
+    SysfsMountError, SysfsMountErrorKind, SysfsMountSpec, audit_sysfs_mount_error,
 };
 pub use working_dir::ContainerWorkingDir;

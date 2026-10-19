@@ -283,6 +283,10 @@ pub use seccomp::{
 };
 #[doc(hidden)]
 pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
+/// 結合試験 `tests/seccomp.rs`・`tests/production_launcher.rs` 専用の再公開（CORE-5・ESC-06・#2234。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub use seccomp::{probe_denied_syscalls_for_test, probe_kcmp_self_for_test};
 pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 pub use subreaper::ChildSubreaper;

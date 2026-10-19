@@ -60,13 +60,16 @@
 //!   [`ContainerCgroup::apply_default_device_policy`]（`device_policy` サブモジュール）。rootful では事前問い合わせ →
 //!   ロード → アタッチ（flags 0）→ 事後問い合わせの照合を行い、rootless では何も試さず
 //!   [`DevicePolicyOutcome::NotApplied`] を返す。start の連鎖の制限の段（[`CgroupPrepared::apply_limits`]）から呼ぶ
-//!   （#1716。`IsolationPrivilege` からの変換は `From` 実装。supervisor からの呼び出しは #1717）
+//!   （#1716。`IsolationPrivilege` からの変換は `From` 実装。supervisor の `ProductionStartDeps::prepare_cgroup` から結線済み。#1717・#1819）
 //!   層ごとの errno の実機照合（デバイス cgroup の `EPERM`・rootfs の `nodev` の `EACCES`。#1681）は `tests/device_cgroup_layers.rs`
 //!   （実機前提・root。実行は人間担当で記録先は #1621）
 //!
 //! - delete 時の cgroup 削除（TASK-30.3・OCI-6）: [`DelegatedCgroup::open_child`] で名前から既存の子 cgroup を
 //!   検証つきで開き、`oci_runtime::ContainerCgroupRemover` の実装として [`DelegatedCgroup::remove_child`] へ渡す
-//!   （`oci_runtime::delete` が状態記録の削除の前に呼ぶ。本番の呼び出し元による結線は未実装）。
+//!   （`oci_runtime::delete` が状態記録を消す前に `remove` / `remove_recorded` を呼ぶ。本番の呼び出し元は CLI の
+//!   `delete`〔`stop_delete::production_cgroup_remover`〕で結線済み。Linux では `DetectedCgroupRemover` が
+//!   `DelegatedCgroup::detect` を遅延で呼び、非 Linux では `Unimplemented` で fail-closed になる。supervisor の
+//!   後始末は delete を通らず `remove_child` で行う）。
 //!   `ContainerCgroupRemover::scope` は検出した委譲パス（[`DelegatedCgroup::path`] と同じ文字列）を返し、
 //!   delete は状態に記録された配置（`StateRecord::cgroup`）のスコープと一致するときは、記録された instance の
 //!   名前（`fc-<id>@<n>`）で削除・不存在確認を行う。一致しないとき（別の端末・スコープの回収後）は、#2060 の
@@ -87,15 +90,13 @@
 //! （1 setter = 1 操作。`memory.max` と
 //! `memory.swap.max` の 2 書き込みは 1 操作）。
 //! 呼び出し側で包まず setter 側で計装する理由: (a) `oci_runtime::kill` と同じ依存注入の形に揃う、
-//! (b) 本番 launcher が未実装で操作名の所有者が setter 側にしか置けず、呼び出し箇所ごとに名前と計装の
+//! (b) 設計した時点では本番 launcher が未実装で、操作名の所有者が setter 側にしか置けず、呼び出し箇所ごとに名前と計装の
 //! 有無が分かれる非対称の再発を防ぐ、(c) 事前検証を含む全終了経路を漏れなく数えられる。
 //!
 //! # 未実装（REPAIR-3）
 //! - GPU の `deviceNodes` の追加（#562）
-//! - OCI `linux.resources` から `set_memory_limits` / `set_cpu_max` への反映、本番 launcher での
-//!   `detect` → `prepare` → `join_hook` の結線（TASK-29 / TASK-157 系）
-//! - OCI `linux.cgroupsPath` の反映・start 時の委譲スコープの追記の連鎖（`start_chain`。#1716）の supervisor
-//!   からの呼び出しと、delete への本番の呼び出し元（CLI / plugin / supervisor）からの結線（#1717）
+//! - OCI `linux.resources` から `set_memory_limits` / `set_cpu_max` への反映（#2019。TASK-29 / TASK-157 系）
+//! - OCI `linux.cgroupsPath` の反映（#2010）
 //! - OCI `linux.resources.pids` / `blockIO`（weight を含む）からの `set_pids_max` / `set_io_max` /
 //!   `set_io_weight` への反映（TASK-170.3 ほか）
 //! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）

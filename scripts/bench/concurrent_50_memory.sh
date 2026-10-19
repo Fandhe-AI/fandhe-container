@@ -88,7 +88,7 @@
 #     収集プロセスは launcher の子孫ではないので PSS・RSS の集計には入らない（参考値の
 #     mem_available_delta_kb には、コンテナごとに 2 プロセス程度の分が含まれる）。
 #   - 停止: 直接の子へ SIGTERM、期限内に終了しなければ SIGKILL。supervisor に SIGTERM のハンドラは無くコンテナを
-#     止めないため（CLI の stop も未実装）、記録済みの子孫（record_tree）へ起動時刻を照合して SIGKILL を送り回収する
+#     止めないため（CLI の stop は結線済み〔#2059〕だが SIGTERM のみで猶予後の SIGKILL が無く〔#1545〕、root の本スクリプトからは降格して呼ぶ配線が要るため未切り替え。別 issue）、記録済みの子孫（record_tree）へ起動時刻を照合して SIGKILL を送り回収する
 #     （CLI の delete は呼ばない。状態ルート・bundle の複製は mktemp の一時ディレクトリごと削除する）。シグナルは、起動直後に記録した起動時刻（/proc/<pid>/stat の 22 番目）と親 pid が
 #     一致する場合にだけ送る（launcher の終了後に pid が再利用されても無関係なプロセスへ送らない）。
 #     launcher が先に死んで子孫が再親化（孤児化）しても回収できるよう、起動時に環境変数

@@ -104,6 +104,8 @@ helper_pids+=("$!")
 # 新コンテナ起動までの待ちを順に与える時間制御入力（observed の下限が決定的になる）。
 cat >"${root}/bin/fandhe-container" <<'STUB'
 #!/usr/bin/env bash
+# 呼び出しの記録（サブコマンド名のみ）。stop・delete が呼ばれないことを正常系で照合する（#2163・SUP-9 待ち）。
+[ -z "${STUB_DIR:-}" ] || echo "${3:-}" >>"$STUB_DIR/cli.log"
 [ "$1" = --root ] && [ "$3" = create ] && [ "$4" = --bundle ] && [ "$#" -eq 6 ] || exit 2
 [ -d "$5" ] || exit 2
 mkdir -p "$2/$6"
@@ -335,6 +337,10 @@ if run_case normal 0 normal "200000 101000 102000 103000 104000 105000" --trials
   jq_eq normal "$o" '.task' '"TASK-160"'
   jq_eq normal "$o" '[.trials, .warmup, .backoff_ms_assumed, .label, .unit]' '[5,1,100,"selftest","ms"]'
   jq_eq normal "$o" '.observed.samples' '5'
+  # 後始末に CLI の stop・delete を使わない（--restart の下では SIGTERM の終了が restart の対象になる。SUP-9・#2162）。
+  # 計測の起点は SIGKILL のまま変わらず、CLI は create の 1 回だけ。
+  cli_calls="$(sort "${root}/d-normal/cli.log" | uniq -c | sed 's/^ *//; s/ /:/' | tr '\n' ' ' | sed 's/ $//')"
+  if [ "$cli_calls" = "1:create" ]; then pass "normal: CLI was called only for create (no stop/delete)"; else fail "normal: unexpected CLI calls: ${cli_calls}"; fi
   jq_eq normal "$o" '(.observed.values | length)' '5'
   jq_eq normal "$o" '(.observed.median > 0)' 'true'
   jq_eq normal "$o" '.supervisor_reported | [.samples, .median, .p95, .min, .max]' '[5,103,105,101,105]'

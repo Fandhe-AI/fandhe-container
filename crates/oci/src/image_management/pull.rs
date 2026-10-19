@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::usage::check_blob_dirs;
 use super::{ImageStore, MAX_COMPOSITION_LAYERS, PullId};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{OciOpKind, OciOpRecorder, record_oci_op};
@@ -256,6 +257,9 @@ impl PullSession<'_> {
                 "blob is already leased by this pull",
             ));
         }
+        // `blobs` / `blobs/sha256` が symlink・非ディレクトリなら、ストア外を指すため stat せず拒否する
+        // （ls / df / prune / rm と同じ fail-closed）。リース登録の前に判定し、拒否時は何も残さない。
+        let dirs_exist = check_blob_dirs(self.store.root())?;
         let path = self
             .store
             .root()
@@ -267,6 +271,7 @@ impl PullSession<'_> {
             guard.acquire_lease(digest.clone(), self.id.clone());
         }
         let miss = match fs::symlink_metadata(&path) {
+            _ if !dirs_exist => Some(BlobReuse::Absent),
             Ok(m) if m.is_file() => None,
             Ok(_) => Some(BlobReuse::NotRegularFile),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(BlobReuse::Absent),
@@ -610,6 +615,55 @@ mod tests {
             assert_eq!(leases(&store, &d(3)), vec![]);
             assert_eq!(fs::read(&target).unwrap(), b"x");
         }
+    }
+
+    /// OCI-7・REPAIR-4: `blobs` / `blobs/sha256` が symlink なら lease は FailedPrecondition で拒否され、
+    /// リースは残らず、失敗が記録に残る（ストア外のファイルをキャッシュヒットにしない）。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_lease_rejects_symlinked_blob_dirs() {
+        use crate::instrument::OciOpOutcome;
+        use crate::instrument::testing::Collect;
+        for (tag, top) in [("symtop", true), ("symsha", false)] {
+            let root = Root::new(tag);
+            let outside = root.0.join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(outside.join(hex_of(&d(1)).unwrap()), b"x").unwrap();
+            if top {
+                fs::remove_dir_all(root.0.join("blobs")).unwrap();
+                std::os::unix::fs::symlink(&outside, root.0.join("blobs")).unwrap();
+            } else {
+                fs::remove_dir(root.0.join("blobs").join("sha256")).unwrap();
+                std::os::unix::fs::symlink(&outside, root.0.join("blobs").join("sha256")).unwrap();
+            }
+            let rec = std::sync::Arc::new(Collect::default());
+            let store = ImageStore::open(&root.0)
+                .unwrap()
+                .with_recorder(rec.clone());
+            let mut s = store.begin_pull(pid("p1")).unwrap();
+            let e = s.lease_existing_blob(&d(1)).err().unwrap();
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+            let items = rec.items();
+            let last = items.last().unwrap();
+            assert_eq!(last.kind(), OciOpKind::LeaseBlob);
+            assert_eq!(last.outcome(), OciOpOutcome::Failure);
+            assert_eq!(last.error_code(), Some(OciErrorCode::FailedPrecondition));
+            assert_eq!(leases(&store, &d(1)), vec![]);
+        }
+    }
+
+    /// OCI-7: blobs ディレクトリ自体が無いストアでは lease は Absent（リースを残さない）。
+    #[test]
+    fn oci7_lease_without_blob_dirs_is_absent() {
+        let root = Root::new("nodirs");
+        fs::remove_dir_all(root.0.join("blobs")).unwrap();
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        assert!(matches!(
+            s.lease_existing_blob(&d(1)).unwrap(),
+            BlobReuse::Absent
+        ));
+        assert_eq!(leases(&store, &d(1)), vec![]);
     }
 
     /// OCI-7: ステージングへ書き込み中の blob は `image ls` にも GC 走査にも現れない。

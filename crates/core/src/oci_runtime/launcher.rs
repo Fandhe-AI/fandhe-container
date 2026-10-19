@@ -595,6 +595,8 @@ struct Spawned {
     child: ContainerChild,
     stdout: std::io::PipeReader,
     stderr: std::io::PipeReader,
+    /// PID 1 から受け取った seccomp の listener(SEC-4・#2024)。本番の入口は必ず `Some`。偽の launcher は `None`。
+    listener: Option<crate::exec::SeccompListener>,
 }
 
 /// コンテナ ID ごとの起動結果(起動台帳の 1 件。モジュール doc「起動台帳と `confirm_no_process`」)。
@@ -913,6 +915,7 @@ impl Inner {
             child,
             stdout,
             stderr,
+            listener,
         } = spawned;
         // pid 0 は実在する子ではない(`kill(0)` は自プロセスグループへ届くため、触らずに拒否する)。
         if child.pid() == 0 {
@@ -933,6 +936,7 @@ impl Inner {
         let owner = id.clone();
         let process = super::launch::ContainerChildProcess::new(child)?
             .with_output(stdout, stderr)
+            .with_seccomp_listener(listener)
             .with_launch_isolation(isolation_record)
             .with_exit_audit(Arc::clone(&self.audit_sink), id.clone())
             .with_reap_notice(Box::new(move || {
@@ -1358,7 +1362,7 @@ impl LaunchOps for RealOps {
             status: None,
             working_dir: Some(input.spec.working_dir()),
         };
-        let child = spawn_container_via_intermediate(
+        let launched = spawn_container_via_intermediate(
             IntermediateSpec {
                 plan: isolation_plan,
                 rootfs: input.spec.rootfs(),
@@ -1372,9 +1376,10 @@ impl LaunchOps for RealOps {
             input.timeout,
         )?;
         Ok(Spawned {
-            child,
+            child: launched.child,
             stdout,
             stderr,
+            listener: launched.listener,
         })
     }
 
@@ -1586,6 +1591,7 @@ mod tests {
                 child,
                 stdout,
                 stderr,
+                listener: None,
             })
         }
 

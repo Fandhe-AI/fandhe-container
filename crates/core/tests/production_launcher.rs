@@ -857,6 +857,30 @@ mod linux {
                 std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("cgroup");
             assert_eq!(host_cgroup.trim(), expected_cgroup);
 
+            // SEC-4・#2024: PID 1 が NEW_LISTENER で得た listener を launcher が検証して持っている。種別は notify で、
+            // 1 回だけ取り出せ、PID 1 側（コンテナ内）には残らない（ホストから見た PID 1 の fd に notify が無い）。
+            let listener = started
+                .process()
+                .take_seccomp_listener()
+                .expect("seccomp listener handed over");
+            let kind = std::fs::read_link(format!(
+                "/proc/self/fd/{}",
+                std::os::fd::AsRawFd::as_raw_fd(&listener.as_fd())
+            ))
+            .expect("readlink of the listener");
+            assert_eq!(kind.to_str(), Some("anon_inode:seccomp notify"));
+            assert!(started.process().take_seccomp_listener().is_none());
+            let pid1_fds: Vec<String> = std::fs::read_dir(format!("/proc/{pid}/fd"))
+                .expect("pid1 fd dir")
+                .filter_map(Result::ok)
+                .filter_map(|e| std::fs::read_link(e.path()).ok())
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            assert!(
+                !pid1_fds.iter().any(|p| p.contains("seccomp notify")),
+                "the workload must not hold the listener: {pid1_fds:?}"
+            );
+
             let output = started.process().take_output().expect("container output");
             let stdout = output.stdout.expect("container stdout");
             let (rx, reader) = spawn_reader(stdout);

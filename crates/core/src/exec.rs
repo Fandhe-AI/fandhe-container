@@ -134,6 +134,7 @@ mod rlimits;
 mod rootfs;
 mod sealed_copy;
 mod seccomp;
+mod seccomp_listener;
 mod setns;
 mod stages;
 mod subreaper;
@@ -283,6 +284,7 @@ pub use seccomp::{
 };
 #[doc(hidden)]
 pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
+pub use seccomp_listener::SeccompListener;
 pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 pub use subreaper::ChildSubreaper;

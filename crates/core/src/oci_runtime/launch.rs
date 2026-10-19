@@ -688,6 +688,17 @@ pub trait LaunchedProcess: Send {
         None
     }
 
+    /// seccomp の listener fd を 1 回だけ取り出す(Linux。SEC-4・TASK-41 追補・#2024。監査配送 2/6)。
+    ///
+    /// 本番 launcher は PID 1 が `NEW_LISTENER` 付きで filter を載せて渡した fd を、検証のうえ持たせる。supervisor が
+    /// 起動・再起動のたびに呼び、監視の間保持する(閉じると `USER_NOTIF` 側の待機中の syscall が `ENOSYS` になる)。
+    /// 通知を読んで応答するループは #2025。当面の filter は ERRNO 版で通知は生じない。2 回目以降と、listener を
+    /// 持たない実装は `None`(既定)。`LaunchedProcess` を包み直す実装は内側へ転送すること(`take_output` と同じ注意)。
+    #[cfg(target_os = "linux")]
+    fn take_seccomp_listener(&self) -> Option<crate::exec::SeccompListener> {
+        None
+    }
+
     /// launch が確定した分離の記録（`/` の識別子と適用した Landlock ルール）。start が Running の更新と同じ
     /// `update` で、restart が Running(新 pid) の更新で `state.json` へ書く（SUP-6・CORE-5・SEC-1・#2007）。
     ///
@@ -714,6 +725,8 @@ pub struct ContainerChildProcess {
     /// `take_output` で 1 回だけ取り出す stdout / stderr の読み取り側（無ければ `None`）。`take_output` が
     /// `&self` のため `Mutex` で保持する。
     output: std::sync::Mutex<Option<ContainerOutput>>,
+    /// `take_seccomp_listener` で 1 回だけ取り出す listener(SEC-4・#2024)。`&self` のため `Mutex` で保持する。
+    seccomp_listener: std::sync::Mutex<Option<crate::exec::SeccompListener>>,
     /// `terminate` が成功（回収を確かめられた）したときに 1 回呼ぶ通知。本番 launcher が起動台帳へ回収の
     /// 証跡を引き継ぐために付ける（CORE-2）。
     reap_notice: Option<ReapNotice>,
@@ -771,6 +784,7 @@ impl ContainerChildProcess {
             child,
             pid,
             output: std::sync::Mutex::new(None),
+            seccomp_listener: std::sync::Mutex::new(None),
             reap_notice: None,
             launch_isolation: None,
             exit_audit: None,
@@ -864,6 +878,19 @@ impl ContainerChildProcess {
         self
     }
 
+    /// PID 1 から受け取った seccomp の listener を持たせる(`LaunchedProcess::take_seccomp_listener` で 1 回だけ返る)。
+    #[must_use]
+    pub(crate) fn with_seccomp_listener(
+        self,
+        listener: Option<crate::exec::SeccompListener>,
+    ) -> Self {
+        *self
+            .seccomp_listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = listener;
+        self
+    }
+
     /// 包んでいる子のハンドル（終了待ち `wait_timeout` 等に使う）。
     pub fn child(&self) -> &crate::exec::ContainerChild {
         &self.child
@@ -886,6 +913,13 @@ impl LaunchedProcess for ContainerChildProcess {
 
     fn take_output(&self) -> Option<ContainerOutput> {
         self.output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    fn take_seccomp_listener(&self) -> Option<crate::exec::SeccompListener> {
+        self.seccomp_listener
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()

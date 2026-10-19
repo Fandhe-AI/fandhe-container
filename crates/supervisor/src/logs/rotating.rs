@@ -706,7 +706,7 @@ fn open_existing_regular_read(path: &Path, deny_delete: bool) -> Result<File, Tr
     let opened = open_read_nofollow_nonblocking(path);
     #[cfg(not(unix))]
     let opened = OpenOptions::new().read(true).open(path);
-    let file = opened.map_err(|_| internal("log file open failed"))?;
+    let file = opened.map_err(map_open_error)?;
     let after = file
         .metadata()
         .map_err(|_| internal("log file open failed"))?;
@@ -846,6 +846,17 @@ pub(crate) fn open_read_nofollow_nonblocking(path: &Path) -> io::Result<File> {
         .read(true)
         .custom_flags(crate::container_options::env::O_NONBLOCK | O_NOFOLLOW)
         .open(path)
+}
+
+/// lstat 成功後の open 失敗の写像。ENOENT はローテーションの rename が lstat と open の間に割り込んだ
+/// 競合なので `NotFound` にし、読み出し側のスナップショットが再試行できるようにする（SUP-7）。
+/// それ以外はパス・errno を含めない `Internal`（ERR-1）。
+fn map_open_error(e: io::Error) -> TraitError {
+    if e.kind() == ErrorKind::NotFound {
+        TraitError::new(ErrorCode::NotFound, "log file not found")
+    } else {
+        internal("log file open failed")
+    }
 }
 
 fn map_lstat_error(e: io::Error) -> TraitError {

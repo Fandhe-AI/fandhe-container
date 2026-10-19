@@ -24,7 +24,7 @@
 //!
 //! - 非 Linux の記録先: 非 Linux では `FileStateStore::open` が `Unimplemented` を返すため記録先を作れず、検証が
 //!   常に返す `unsupported` の拒否の記録も `SinkFailed` になる（`FileStateStore` の非 Linux 実装待ち）
-//! - レジストリ登録・spawn の経路（TASK-114）への配線: 現状の呼び出し元は CLI の plugin バックエンドだけ
+//! - レジストリ登録・spawn の経路（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）への配線: 現状の呼び出し元は CLI の plugin バックエンドだけ
 //!
 //! # `container_id` を付けない理由（R4）
 //!

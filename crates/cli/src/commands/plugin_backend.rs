@@ -28,7 +28,7 @@
 //! - 許可済みハッシュ一覧の配置・指定方法が未確定のため一覧は既定の空（全件拒否）のままで、読み込み経路は無い
 //!   （設計案は `docs/design/plugin-hash-allowlist.md`・#1868。承認待ち）。
 //! - 検証を通過した plugin の起動と RPC は未実装。core 側の型つき `ContainerRuntime` proxy と spawn の配線は
-//!   TASK-114、CLI 経由の 3 OS 最終確認は TASK-125。RPC を配線する際は REPAIR-5 のタイムアウトを必須とする。
+//!   #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕、CLI 経由の 3 OS 最終確認は TASK-125。RPC を配線する際は REPAIR-5 のタイムアウトを必須とする。
 //!
 //! したがって [`backend_failure`] は現状必ず失敗を返す。
 //!
@@ -40,7 +40,7 @@
 //! 表に無い失敗（`--root` 不正・発見の I/O エラー等）は従来どおり汎用文言に落とし、core の
 //! `TraitError::message` を出力へ流さない。
 //!
-//! # 配線時に再評価する事項（TASK-114・TASK-122）
+//! # 配線時に再評価する事項（#1869 の設計・TASK-122）
 //!
 //! - PATH 由来の候補の扱い（A1）: [`backend_failure`] は `PluginDirKind::Path` の候補も
 //!   `PluginRegistry::from_candidates` へ渡しており、現状は許可一覧が空で全件拒否になることに頼っている。
@@ -165,7 +165,7 @@ pub(super) fn host_backend() -> Option<BackendPlugin> {
 /// 検証・ハッシュ照合の拒否 → `PermissionDenied`、全検証通過後（起動未実装）→ `Unimplemented`。
 /// 同名候補の shadowed へは自動フォールバックしない（レジストリの契約どおり）。
 ///
-/// PATH 由来の候補もレジストリへ渡す。許可一覧の配線時に採否を再評価する（モジュール doc 参照。TASK-114・TASK-122）。
+/// PATH 由来の候補もレジストリへ渡す。許可一覧の配線時に採否を再評価する（モジュール doc 参照。#1869 の設計・TASK-122）。
 ///
 /// 信頼性検証の拒否は `sink` へ 1 件記録する（SEC-4・#2013。モジュール doc の「監査」）。記録の成否は戻り値を変えない。
 pub(super) fn backend_failure(

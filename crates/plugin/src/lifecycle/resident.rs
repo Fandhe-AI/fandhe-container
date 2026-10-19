@@ -1,7 +1,7 @@
 //! plugin プロセスの常駐モード（PLUG-7・TASK-110.2・#259）。
 //!
 //! plugin プロセスを 1 回だけ起動し、確立した接続を保持したまま複数の要求を順次処理する。
-//! 呼び出し元は core 側の plugin proxy（TASK-114 ほか。依存方向は `core -> plugin` のため、本モジュールは
+//! 呼び出し元は core 側の plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 ほか。依存方向は `core -> plugin` のため、本モジュールは
 //! core の登録表を参照せず、検証済みの起動対象（fd）を持つ起動仕様 [`OneShotPlugin`] を受け取る。
 //! 起動仕様の型は都度起動モードと共用。モード選択 API は TASK-110.3 の `mode`。型名の中立化は未実施）。
 //!
@@ -23,7 +23,7 @@
 //!   できたがプロセスグループを停止できなかった場合は、元のエラーの code を保ち message に
 //!   `process group could not be killed` の付記（pid なし）を加えて返し、状態は
 //!   [`ResidentState::GroupKillFailed`] になる（shutdown は未回収とは別の `Internal` を返す）。
-//! - 子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ。stdin / stdout は null、stderr は
+//! - 子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] と、既定は空で `OneShotPlugin::with_env` が明示した組のみ（`lifecycle` の契約）。stdin / stdout は null、stderr は
 //!   セッション全期間で 1 本の読み取りスレッドが上限つきで収集し、[`ResidentPlugin::shutdown`] の結果
 //!   （失敗時も [`ResidentShutdownError`] に載せる）でのみ返す（untrusted）。[`ResidentPlugin`] の破棄（panic 等を含む）でも子の kill・回収とスレッド停止を行う。
 //! - 親の強制終了時の停止（#1514・PLUG-7・REPAIR-5・CORE-1）: Linux では plugin に `PR_SET_PDEATHSIG`
@@ -43,12 +43,12 @@
 //! # 未実装（REPAIR-3）
 //!
 //! - core の別プロセス起動をまたいで外部管理の常駐 plugin へ再接続する経路（attach）。plugin 発見・
-//!   登録（TASK-109）と proxy（TASK-114）側の責務とする。PLUG-7 は「呼び出しごとに接続のみ行う」と
+//!   登録（TASK-109）と proxy（#1869 の設計・TASK-114）側の責務とする。PLUG-7 は「呼び出しごとに接続のみ行う」と
 //!   記すが、本実装は起動後に接続を保持する形である（spec 側の表現との差は PR で報告）。
 //! - 起動対象の信頼性検証そのもの（TASK-122・PLUG-11。core 側の責務で、本 API は検証済みの起動対象
 //!   [`super::PluginLaunchTarget`] の fd を受け取るだけ）。検証から spawn までの差し替え（TOCTOU）は、Linux は
 //!   fd の実体を実行して防ぐ。macOS は実体のパスで起動し、直前の同一性確認は未実装（#1866）。
-//!   要求 ID と応答 ID の対応づけ（TASK-114）。
+//!   要求 ID と応答 ID の対応づけ（#1869 の設計）。
 
 use super::{
     ChildGuard, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT, OneShotPlugin, OneShotStderr,

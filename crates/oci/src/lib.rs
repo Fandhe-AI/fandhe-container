@@ -25,7 +25,11 @@
 //!
 //! 実装済み: レイヤー blob の gzip 展開（TASK-52.2・OCI-1・MS-4・#407。`layer::decompress_layer_to_writer`・
 //! `layer::GzipLayerReader`）。展開後サイズの上限を必須引数とし、超過で中断する（decompression bomb 対策）。
-//! 展開後 tar の diff_id 検証は未実装。
+//! 展開後 tar の diff_id 検証は `layer::extract::extract_image_layers` が行う（#2017。下記）。
+//!
+//! 対応するレイヤーの mediaType は `application/vnd.oci.image.layer.v1.tar+gzip`・
+//! `application/vnd.docker.image.rootfs.diff.tar.gzip` の 2 種のみ。それ以外（zstd は #2029 で保留中）は
+//! manifest 解決の時点で blob 取得前に `Unimplemented` で拒否する（`manifest::ensure_supported_layer_media_types`。#2037）。
 //!
 //! 実装済み: レイヤー tar のルート配下への安全な展開（TASK-52.3・OCI-1・MS-4・#409。`layer::extract`）。
 //! パス検証、ルートに閉じ込めた symlink 解決、hardlink の制限、エントリ数・累積サイズの上限を持つ。
@@ -39,6 +43,8 @@
 //! `whiteout`・`layer::extract`）。
 //! 通常ファイルの setuid / setgid / sticky は既定で落として件数を返し、`SpecialBitsPolicy::PreserveIfOwnerMapped` を
 //! 渡した rootless 経路だけ所有者の写像に合わせて保持する（SEC-5・#1810。`docs/design/oci-layer-special-bits.md`）。
+//! image config の `rootfs.diff_ids` の読み取り（`config`）と、レイヤーの `mediaType`（gzip / 非圧縮 tar。zstd は
+//! `Unimplemented`・#2029）による入口の選択と diff_id の突合（`layer::extract::extract_image_layers`。#2017・OCI-1）。
 //! 展開物の所有者は、既定では実行ユーザーのままで、`OwnershipPolicy::ChownMapped` と複数行の写像 `IdMap` を渡すと
 //! tar の uid / gid を写像してホストの ID へ `chown` する（Linux のみ。権限の主体と順序は `layer::extract` のモジュール
 //! doc を参照）。`SpecialBitsPolicy::PreserveIfChowned` は rootful（ホスト root）で `chown` 後の所有者が写像と一致する
@@ -51,11 +57,12 @@
 //! 未実装（スタブではなく後続 issue の担当）: キャッシュ・`image ls`/`rm`/`tag`（TASK-52〜55・TASK-183〜184）。`RegistryClient` の通信は匿名トークン取得・
 //! manifest 取得・blob 取得のみ。
 //! 実装済み: ローカルイメージ管理の参照テーブルのデータ構造と登録・解除・カウント API（TASK-183.1・OCI-7・MS-4・#472。
-//! `image_management`）と、ストア単位の排他区間（TASK-183.2・OCI-7・#473。`image_management::ImageStore`）。`image ls`/`system df` の集計 API（TASK-183.3・#478）も実装済み。
+//! `image_management`）と、ストア単位の排他区間（TASK-183.2・OCI-7・#473。`image_management::ImageStore`）。`image ls`/`system df` の集計 API（TASK-183.3・#478）と `image tag` の API（TASK-183.4・#479）も実装済み。
 //! 永続化・GC・`image rm`/`tag`/`prune` の CLI 経路は未実装。
 //! PLUG-1 区分は core（crate-naming.md）。
 
 pub mod auth;
+pub mod config;
 pub mod error;
 pub mod image_management;
 pub mod instrument;

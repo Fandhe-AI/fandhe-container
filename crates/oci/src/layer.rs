@@ -18,9 +18,13 @@
 //! 後続の tar 展開（TASK-52.3）へ tar バイトストリームとして渡す。展開後サイズの上限は必須引数で、
 //! 超過した最初の読み取りで中断する（decompression bomb 対策。メモリ使用量は展開サイズに依存しない）。
 //! 呼び出し契約: 展開の前に `verify_blob_digest` を通すこと。digest は圧縮 blob に対する値であり、
-//! 展開後 tar の diff_id（config の `rootfs.diff_ids`）との突合は未実装（後続 issue）。gzip トレーラ
-//! （CRC32・ISIZE）は EOF まで読み切ったときにだけ検証されるため、tar 側は EOF まで読むこと。
-//! zstd 圧縮・非圧縮レイヤーの分岐は本モジュールの対象外。
+//! 展開後 tar の diff_id（config の `rootfs.diff_ids`）との突合は `extract::extract_image_layers` が行う
+//! （#2017・OCI-1）。gzip トレーラ（CRC32・ISIZE）は EOF まで読み切ったときにだけ検証されるため、
+//! tar 側は EOF まで読むこと。
+//!
+//! レイヤーの `mediaType` による入口の選択（#2017・OCI-1）: `LayerMediaType::parse` が gzip / 非圧縮 tar を
+//! 区別し、非圧縮は `PlainLayerReader`（gzip と同じ展開後サイズ上限つき）で開く。zstd など未対応の
+//! `mediaType` は推測で開かず `Unimplemented` で拒否する（zstd 対応の要否は #2029 で判断）。
 //!
 //! tar 展開（TASK-52.3・OCI-1・#409）は子モジュール `extract` が担う（呼び出し契約と未実装項目はそちらを参照）。
 //! 複数レイヤーの重ね合わせ展開（TASK-52.4・#410）も同モジュールの `extract_layers` / `extract_layer_blobs`。
@@ -331,6 +335,41 @@ pub struct DecompressedLayer {
     pub size: u64,
 }
 
+/// レイヤー blob の `mediaType` から決まる読み取り方式（#2017・OCI-1）。
+///
+/// image-spec のレイヤー `mediaType` のうち対応するものだけを持つ。マジックバイトからの推測はしない
+/// （宣言と実体が食い違えば、その後の gzip / tar 解析で失敗して拒否される）。
+/// zstd（`...tar+zstd`）は #2029 の判断まで未対応で、[`LayerMediaType::parse`] が `Unimplemented` を返す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LayerMediaType {
+    /// 非圧縮の tar。
+    Tar,
+    /// gzip 圧縮の tar。
+    TarGzip,
+}
+
+impl LayerMediaType {
+    /// `mediaType` 文字列（完全一致。パラメータ・大文字小文字の揺れは受けない）から読み取り方式を決める。
+    ///
+    /// OCI の `layer.v1.tar`・`layer.v1.tar+gzip`、nondistributable 版、Docker の `rootfs.diff.tar.gzip`・
+    /// `rootfs.foreign.diff.tar.gzip` に対応する。それ以外（zstd を含む）は `Unimplemented`。
+    pub fn parse(media_type: &str) -> Result<Self, OciError> {
+        match media_type {
+            "application/vnd.oci.image.layer.v1.tar"
+            | "application/vnd.oci.image.layer.nondistributable.v1.tar" => Ok(Self::Tar),
+            "application/vnd.oci.image.layer.v1.tar+gzip"
+            | "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip"
+            | "application/vnd.docker.image.rootfs.diff.tar.gzip"
+            | "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip" => Ok(Self::TarGzip),
+            _ => Err(OciError::new(
+                OciErrorCode::Unimplemented,
+                "unsupported layer mediaType",
+            )),
+        }
+    }
+}
+
 /// 展開後サイズ上限の超過を `io::Error` の source として運ぶ内部マーカー。
 #[derive(Debug)]
 struct LayerLimitExceeded;
@@ -407,6 +446,61 @@ impl<R: Read> Read for GzipLayerReader<R> {
     }
 }
 
+/// 非圧縮 tar レイヤーを逐次読み、`GzipLayerReader` と同じ上限規則（ちょうど上限は成功・超過は中断し
+/// 以降も失敗）を強制する `Read`（#2017・OCI-1）。
+pub struct PlainLayerReader<R: Read> {
+    inner: R,
+    max: u64,
+    total: u64,
+    exceeded: bool,
+}
+
+impl<R: Read> PlainLayerReader<R> {
+    /// 入力 `src` と読み取りバイト数の上限 `max_bytes` から作る。
+    pub fn new(src: R, max_bytes: u64) -> Self {
+        Self {
+            inner: src,
+            max: max_bytes,
+            total: 0,
+            exceeded: false,
+        }
+    }
+
+    /// これまでに返したバイト数。
+    pub fn total_out(&self) -> u64 {
+        self.total
+    }
+}
+
+impl<R: Read> Read for PlainLayerReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.exceeded {
+            return Err(limit_exceeded_io_error());
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = self.max.saturating_sub(self.total);
+        if remaining == 0 {
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => {
+                    self.exceeded = true;
+                    Err(limit_exceeded_io_error())
+                }
+            };
+        }
+        let cap = usize::try_from(remaining).map_or(buf.len(), |r| r.min(buf.len()));
+        let Some(dst) = buf.get_mut(..cap) else {
+            return Ok(0);
+        };
+        let n = self.inner.read(dst)?;
+        self.total = self.total.saturating_add(n as u64);
+        Ok(n)
+    }
+}
+
 /// レイヤー読み取りの `io::Error` を構造化エラーへ写す（tar 展開側も共用できる）。
 ///
 /// 上限超過は `ResourceExhausted`、gzip の形式不正・CRC32 / ISIZE 不一致・途中切れは `DataLoss`、
@@ -435,6 +529,12 @@ pub fn open_gzip_layer(
 ) -> Result<GzipLayerReader<File>, OciError> {
     let file = open_regular_blob(path)?;
     Ok(GzipLayerReader::new(file, max_uncompressed_bytes))
+}
+
+/// 非圧縮レイヤー blob を開いて `PlainLayerReader` を返す。通常ファイル以外は `InvalidArgument`。
+pub fn open_plain_layer(path: &Path, max_bytes: u64) -> Result<PlainLayerReader<File>, OciError> {
+    let file = open_regular_blob(path)?;
+    Ok(PlainLayerReader::new(file, max_bytes))
 }
 
 /// 計装なしの `decompress_layer_to_writer_with`（`NoopOciOpRecorder`）。
@@ -1025,5 +1125,73 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(copy_decompressed(&mut ok, &mut out).unwrap().size, 3);
         assert_eq!(out, b"abc");
+    }
+
+    /// OCI-1: mediaType の対応表（成功 6 種・未対応は Unimplemented）。
+    #[test]
+    fn oci1_layer_media_type_table() {
+        for (m, want) in [
+            (
+                "application/vnd.oci.image.layer.v1.tar",
+                LayerMediaType::Tar,
+            ),
+            (
+                "application/vnd.oci.image.layer.nondistributable.v1.tar",
+                LayerMediaType::Tar,
+            ),
+            (
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+                LayerMediaType::TarGzip,
+            ),
+            (
+                "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
+                LayerMediaType::TarGzip,
+            ),
+            (
+                "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                LayerMediaType::TarGzip,
+            ),
+            (
+                "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip",
+                LayerMediaType::TarGzip,
+            ),
+        ] {
+            assert_eq!(LayerMediaType::parse(m).unwrap(), want, "{m}");
+        }
+        for m in [
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            "application/vnd.oci.image.layer.nondistributable.v1.tar+zstd",
+            "application/octet-stream",
+            "",
+            "application/vnd.oci.image.layer.v1.tar+GZIP",
+            "application/vnd.oci.image.layer.v1.tar+gzip; q=1",
+        ] {
+            assert_eq!(
+                LayerMediaType::parse(m).unwrap_err().code(),
+                OciErrorCode::Unimplemented,
+                "{m}"
+            );
+        }
+    }
+
+    /// OCI-1: 非圧縮レイヤーの上限境界（ちょうどは成功・1 バイト超過で中断し以降も失敗）。
+    #[test]
+    fn oci1_plain_layer_reader_limit_boundary() {
+        let data = [7u8; 10];
+        let mut ok = PlainLayerReader::new(&data[..], 10);
+        let mut out = Vec::new();
+        ok.read_to_end(&mut out).unwrap();
+        assert_eq!(out.len(), 10);
+        assert_eq!(ok.total_out(), 10);
+
+        let mut over = PlainLayerReader::new(&data[..], 9);
+        let mut out = Vec::new();
+        let e = over.read_to_end(&mut out).unwrap_err();
+        assert_eq!(
+            oci_error_from_layer_io(e).code(),
+            OciErrorCode::ResourceExhausted
+        );
+        let mut b = [0u8; 4];
+        assert!(over.read(&mut b).is_err());
     }
 }

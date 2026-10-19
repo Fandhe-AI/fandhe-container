@@ -9,7 +9,7 @@
 //! # 契約
 //!
 //! - 構築口は [`PluginLaunchTarget::from_verified_file`] のみ。本番で呼んでよいのは core の
-//!   `HashVerifiedPluginFile` からの変換 1 か所（#1857。機械判定は #1857 で導入するまで doc の契約のみ）。
+//!   `HashVerifiedPluginFile` からの変換 1 か所（#1857。`make check-launch-target`〔`scripts/check-plugin-launch-target-construction.sh`〕が CI で判定する）。
 //!   それ以外で呼んでよいのは試験コードだけ。検証そのものは本型では行わない（呼び出し側の責務）。
 //!   依存方向（core -> plugin）を保つため、型は本 crate に置き、core 側の型は参照しない。
 //! - Linux: 保持した fd の実体を `/proc/self/fd/<N>` 経由で実行する。実行できない場合は
@@ -26,7 +26,6 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - core の `HashVerifiedPluginFile` からの変換と構築箇所の機械判定（#1857）。
 //! - macOS の起動直前の同一性確認（#1866）。
 //! - 検証後の起動と RPC の本番配線（#1869）。
 
@@ -92,7 +91,7 @@ impl PluginLaunchTarget {
     /// 書き込み可能だと Linux の exec が `ETXTBSY` で失敗する（fail-closed）。
     ///
     /// 内容の同一性（hash）の確認は呼び出し側の責務。本関数の dev / ino の確認は同一 inode の
-    /// 書き換えを防がない（hash 許可リストの結線は #1857）。
+    /// 書き換えを防がない（core の変換は `HashVerifiedPluginFile` だけを受ける。許可一覧の読み込みは #1868、本番の配線は #1869）。
     ///
     /// 通常ファイルでないもの・`#!` スクリプトは `InvalidArgument`。fd の検査の失敗は `Internal`。
     /// 固定の英語文言で、パスや内容は含めない。

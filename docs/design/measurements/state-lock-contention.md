@@ -1,6 +1,6 @@
 # 状態ストア `@lock` の取り直しによる飢えの計測と対策
 
-#2229（SUP-1・REPAIR-5・TASK-157.9・OCI-5）の記録。対象は `crates/core/src/state_store.rs` の `FileStateStore::lock`。
+Issue #2229（SUP-1・REPAIR-5・TASK-157.9・OCI-5）の記録。対象は `crates/core/src/state_store.rs` の `FileStateStore::lock`。
 
 ## 問題
 

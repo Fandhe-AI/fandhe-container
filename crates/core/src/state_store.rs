@@ -31,7 +31,7 @@
 //!   TASK-157.9・SUP-1）。排他は上記の `@lock` が担い、同じ ID への同時 `update` は直列化され、
 //!   後着は古い `expected_revision` のため `FAILED_PRECONDITION` になる（黙って上書きしない）。
 //!   後着側は `get` で最新の revision を取り直して再試行する（再試行の方針は呼び出し側の責務）。
-//!   同じプロセスが続けて取り直すときは、解放から [`LOCK_HANDOFF_GAP`] を空けて別プロセスへ譲る
+//!   同じプロセスが続けて取り直すときは、解放から `LOCK_HANDOFF_GAP` を空けて別プロセスへ譲る
 //!   （待ち順の仕組みが無く飢えるため。期限は変わらない。複数の待ち手の間の FIFO は保証しない。#2229）。
 //!   ロックはストア全体で 1 つで、保持は 1 操作の間だけ。保持プロセスが死ねば OS が解放する
 //! - 既存のエントリ（`@lock`・`@revision`・`state.json`・fsync するディレクトリ）は
@@ -83,7 +83,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -133,12 +133,65 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(1);
 /// 計測は `docs/design/measurements/state-lock-contention.md`。
 const LOCK_HANDOFF_GAP: Duration = Duration::from_millis(2);
 
-/// このプロセスが `@lock` を最後に解放した時刻（状態ルートをまたいだプロセス全体で 1 つ）。
+/// 状態ルートごとに、プロセス内の全インスタンスで共有する取得ゲート（#2229・SUP-1）。
 ///
-/// CLI は同じ状態ルートのストアを複数回開くことがあるため、インスタンスではなく static に持つ。
-static LAST_FILE_LOCK_RELEASE: Mutex<Option<Instant>> = Mutex::new(None);
+/// 同じ状態ルートを開いた別インスタンス（CLI は複数回開く）の間でも、`@lock` の保持中は
+/// 次の取得を待たせ、解放から `LOCK_HANDOFF_GAP` が経つまで取得させない。`held` はファイルロックの
+/// 取得前から解放後（`StoreGuard` の drop）まで立て続け、解放時刻の確認と取得を原子的に直列化する。
+#[derive(Debug, Default)]
+struct RootGate {
+    state: Mutex<GateState>,
+}
 
-/// 前回の解放から [`LOCK_HANDOFF_GAP`] が経つまでの残り時間を返す（結果は `deadline` までの残りで頭打ち）。
+#[derive(Debug, Default)]
+struct GateState {
+    held: bool,
+    last_release: Option<Instant>,
+}
+
+impl RootGate {
+    /// ゲートを取る。保持中、または解放から `LOCK_HANDOFF_GAP` 未満なら待つ。`deadline` で `Timeout`（REPAIR-5）。
+    fn acquire(&self, deadline: Instant) -> Result<(), TraitError> {
+        loop {
+            let pause = {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                if st.held {
+                    if Instant::now() >= deadline {
+                        return Err(err(
+                            ErrorCode::Timeout,
+                            "timed out waiting for the state lock",
+                        ));
+                    }
+                    LOCK_RETRY_INTERVAL
+                } else {
+                    let wait = handoff_wait(st.last_release, Instant::now(), deadline);
+                    if wait.is_zero() {
+                        st.held = true;
+                        return Ok(());
+                    }
+                    wait
+                }
+            };
+            std::thread::sleep(pause);
+        }
+    }
+
+    /// ゲートを解放し、解放時刻を記録する。
+    fn release(&self) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.held = false;
+        st.last_release = Some(Instant::now());
+    }
+}
+
+/// 状態ルート（正規パス）から共有ゲートを引く。ルートごとに 1 つ作り、プロセス終了まで保持する。
+fn root_gate(root: &Path) -> Arc<RootGate> {
+    static GATES: Mutex<BTreeMap<PathBuf, Arc<RootGate>>> = Mutex::new(BTreeMap::new());
+    let mut map = GATES.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(map.entry(root.to_path_buf()).or_default())
+}
+
+/// 前回の解放から `LOCK_HANDOFF_GAP` が経つまでの残り時間を返す（結果は `deadline` までの残りで頭打ち）。
 ///
 /// `FileStateStore::lock` が `@lock` の最初の `try_lock` の前に眠る長さを決める純関数。
 /// 期限を過ぎていれば 0 を返し、期限切れの判定は `lock_file_until` に任せる（REPAIR-5）。
@@ -312,6 +365,8 @@ pub struct FileStateStore {
     /// プロセス内の排他と、その下で読み書きするインスタンス固有の状態。プロセス間は `@lock` の
     /// ファイルロックが担う。
     process_lock: Mutex<LockedState>,
+    /// 同じ状態ルートを開いた全インスタンスで共有する取得ゲート（#2229）。
+    gate: Arc<RootGate>,
 }
 
 /// プロセス内ミューテックスで守る、インスタンス固有の状態。
@@ -325,19 +380,17 @@ struct LockedState {
 /// ロックの RAII ガード。drop でファイルロックとミューテックスが解放される。
 struct StoreGuard<'a> {
     process: MutexGuard<'a, LockedState>,
+    gate: Arc<RootGate>,
     /// drop で最初に閉じる（`@lock` の解放）。`Option` なのは `Drop` で取り出すため。
     file: Option<File>,
 }
 
 impl Drop for StoreGuard<'_> {
-    /// 解放の順序: `@lock` を閉じる -> 解放時刻を記録する -> （フィールド drop で）プロセス内
-    /// `Mutex` を解放する。次の取得側が [`LOCK_HANDOFF_GAP`] を空けられるようにする（#2229）。
+    /// 解放の順序: `@lock` を閉じる -> 共有ゲートを解放して時刻を記録する -> （フィールド drop で）
+    /// プロセス内 `Mutex` を解放する。次の取得側が `LOCK_HANDOFF_GAP` を空けられるようにする（#2229）。
     fn drop(&mut self) {
         drop(self.file.take());
-        let mut last = LAST_FILE_LOCK_RELEASE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        *last = Some(Instant::now());
+        self.gate.release();
     }
 }
 
@@ -393,9 +446,11 @@ impl FileStateStore {
         if fresh {
             init_revision_file(&root)?;
         }
+        let gate = root_gate(&root);
         Ok(Self {
             root,
             process_lock: Mutex::new(LockedState::default()),
+            gate,
         })
     }
 
@@ -423,14 +478,13 @@ impl FileStateStore {
                 }
             }
         };
-        // 直前にこのプロセスが解放していれば、別プロセスが取れるよう間隔を空ける（#2229）。
-        let last_release = *LAST_FILE_LOCK_RELEASE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let wait = handoff_wait(last_release, Instant::now(), deadline);
-        if !wait.is_zero() {
-            std::thread::sleep(wait);
-        }
+        // 同じ状態ルートの他インスタンスとも直列化し、直前の解放から間隔を空ける（#2229）。
+        self.gate.acquire(deadline)?;
+        let mut guard = StoreGuard {
+            process,
+            gate: Arc::clone(&self.gate),
+            file: None,
+        };
         let path = self.root.join(LOCK_FILE_NAME);
         reject_symlink(&path)?;
         let mut opts = OpenOptions::new();
@@ -449,10 +503,8 @@ impl FileStateStore {
             return Err(internal("state lock file is not a regular file"));
         }
         lock_file_until(&file, deadline)?;
-        Ok(StoreGuard {
-            process,
-            file: Some(file),
-        })
+        guard.file = Some(file);
+        Ok(guard)
     }
 
     fn record_dir(&self, id: &ContainerId) -> PathBuf {
@@ -1721,7 +1773,7 @@ impl StateDto {
 /// 保持している間は [`LOCK_RETRY_INTERVAL`]（1ms）間隔で再試行し、`deadline` を過ぎたら `Timeout` で失敗する（無期限に待たない）。
 /// std の `File::try_lock` のみを使うため追加依存なしで 3 OS で動く。ロックは `file` を閉じると解放され、
 /// 保持プロセスが死んでも OS が解放する。待ち順は保証しない（公平性は解放側の
-/// [`LOCK_HANDOFF_GAP`] で補う。期限は変わらない。#2229）。
+/// `LOCK_HANDOFF_GAP` で補う。期限は変わらない。#2229）。
 fn lock_file_until(file: &File, deadline: Instant) -> Result<(), TraitError> {
     loop {
         match file.try_lock() {
@@ -1776,6 +1828,33 @@ mod platform_tests {
         let near = now + Duration::from_millis(1);
         assert_eq!(handoff_wait(Some(now), now, near), Duration::from_millis(1));
         assert_eq!(handoff_wait(Some(now), now, now), Duration::ZERO);
+    }
+
+    /// SUP-1・#2229: 同じ状態ルートを共有するゲートは、保持中は取れず、解放後も間隔が経つまで取れない。
+    #[test]
+    fn sup1_2229_root_gate_enforces_gap_across_acquirers() {
+        let gate = RootGate::default();
+        let far = || Instant::now() + STATE_LOCK_TIMEOUT;
+        gate.acquire(far()).unwrap();
+        // 保持中は期限で Timeout になる。
+        let short = Instant::now() + Duration::from_millis(5);
+        assert_eq!(code(gate.acquire(short)), "TIMEOUT");
+        gate.release();
+        // 解放直後の取得は、少なくとも間隔の残りだけ待たされる。
+        let start = Instant::now();
+        gate.acquire(far()).unwrap();
+        assert!(start.elapsed() >= LOCK_HANDOFF_GAP - Duration::from_micros(500));
+        gate.release();
+    }
+
+    /// SUP-1・#2229: 同じ正規ルートは同じゲートを共有し、別ルートは別ゲートになる。
+    #[test]
+    fn sup1_2229_root_gate_is_shared_per_root() {
+        let a1 = root_gate(Path::new("/gate-test/a"));
+        let a2 = root_gate(Path::new("/gate-test/a"));
+        let b = root_gate(Path::new("/gate-test/b"));
+        assert!(Arc::ptr_eq(&a1, &a2));
+        assert!(!Arc::ptr_eq(&a1, &b));
     }
 
     fn code<T: std::fmt::Debug>(r: Result<T, TraitError>) -> &'static str {

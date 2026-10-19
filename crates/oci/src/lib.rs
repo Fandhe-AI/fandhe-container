@@ -25,7 +25,7 @@
 //!
 //! 実装済み: レイヤー blob の gzip 展開（TASK-52.2・OCI-1・MS-4・#407。`layer::decompress_layer_to_writer`・
 //! `layer::GzipLayerReader`）。展開後サイズの上限を必須引数とし、超過で中断する（decompression bomb 対策）。
-//! 展開後 tar の diff_id 検証は未実装。
+//! 展開後 tar の diff_id 検証は `layer::extract::extract_image_layers` が行う（#2017。下記）。
 //!
 //! 対応するレイヤーの mediaType は `application/vnd.oci.image.layer.v1.tar+gzip`・
 //! `application/vnd.docker.image.rootfs.diff.tar.gzip` の 2 種のみ。それ以外（zstd は #2029 で保留中）は
@@ -43,6 +43,8 @@
 //! `whiteout`・`layer::extract`）。
 //! 通常ファイルの setuid / setgid / sticky は既定で落として件数を返し、`SpecialBitsPolicy::PreserveIfOwnerMapped` を
 //! 渡した rootless 経路だけ所有者の写像に合わせて保持する（SEC-5・#1810。`docs/design/oci-layer-special-bits.md`）。
+//! image config の `rootfs.diff_ids` の読み取り（`config`）と、レイヤーの `mediaType`（gzip / 非圧縮 tar。zstd は
+//! `Unimplemented`・#2029）による入口の選択と diff_id の突合（`layer::extract::extract_image_layers`。#2017・OCI-1）。
 //! 未実装: ディレクトリ fd 起点の解決（TOCTOU 対策）、uid / gid の適用（`chown`・複数範囲の写像・rootful で特殊ビットを
 //! 残す経路。SEC-5）、綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する別表記は衝突として扱わない。IO-5）。
 //!
@@ -54,6 +56,7 @@
 //! PLUG-1 区分は core（crate-naming.md）。
 
 pub mod auth;
+pub mod config;
 pub mod error;
 pub mod image_management;
 pub mod instrument;

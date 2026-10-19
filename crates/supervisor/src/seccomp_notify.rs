@@ -309,18 +309,30 @@ impl Bucket {
 
 /// `/proc/<pid>/status` の本文から `NSpid` の末尾（対象自身の PID namespace での pid）を取り出す。
 /// 行が無い・空・0・壊れた値は `None`（捏造しない）。
-pub fn parse_nspid_innermost(status: &str) -> Option<u32> {
-    let line = status.lines().find_map(|l| l.strip_prefix("NSpid:"))?;
-    let last = line.split_whitespace().last()?;
-    last.parse::<u32>().ok().filter(|n| *n > 0)
+///
+/// 本文はバイト列で受ける。`Name:` 行はワークロードが `prctl(PR_SET_NAME)` で非 UTF-8 の
+/// バイトを入れられるため、全体を UTF-8 として検証すると `NSpid` が正常でも変換に失敗し、
+/// 監査記録を回避できてしまう（SEC-4）。ASCII の `NSpid:` 行だけを解析する。
+pub fn parse_nspid_innermost(status: &[u8]) -> Option<u32> {
+    let line = status
+        .split(|b| *b == b'\n')
+        .find_map(|l| l.strip_prefix(b"NSpid:".as_slice()))?;
+    let last = line
+        .split(|b| b.is_ascii_whitespace())
+        .rfind(|t| !t.is_empty())?;
+    std::str::from_utf8(last)
+        .ok()?
+        .parse::<u32>()
+        .ok()
+        .filter(|n| *n > 0)
 }
 
 /// 本番の pid 変換: `/proc/<tid>/status` を上限つきで読み、`NSpid` の末尾を返す。
 fn resolve_pid_from_proc(pid_in_listener_ns: u32) -> Option<u32> {
     let file = std::fs::File::open(format!("/proc/{pid_in_listener_ns}/status")).ok()?;
-    let mut body = String::new();
+    let mut body = Vec::new();
     file.take(PROC_STATUS_READ_LIMIT)
-        .read_to_string(&mut body)
+        .read_to_end(&mut body)
         .ok()?;
     parse_nspid_innermost(&body)
 }
@@ -1203,16 +1215,22 @@ mod tests {
     #[test]
     fn sec4_2025_nspid_parsing() {
         assert_eq!(
-            parse_nspid_innermost("Name:\tx\nNSpid:\t4242\t17\t1\nUmask:\t0022\n"),
+            parse_nspid_innermost(b"Name:\tx\nNSpid:\t4242\t17\t1\nUmask:\t0022\n"),
             Some(1)
         );
-        assert_eq!(parse_nspid_innermost("NSpid:\t77\n"), Some(77));
-        assert_eq!(parse_nspid_innermost("NSpid:\t77\t0\n"), None);
-        assert_eq!(parse_nspid_innermost("NSpid:\t77\tabc\n"), None);
-        assert_eq!(parse_nspid_innermost("NSpid:\n"), None);
-        assert_eq!(parse_nspid_innermost("Pid:\t1\n"), None);
-        assert_eq!(parse_nspid_innermost("NSpid:\t-3\n"), None);
-        assert_eq!(parse_nspid_innermost("NSpid:\t99999999999\n"), None);
+        assert_eq!(parse_nspid_innermost(b"NSpid:\t77\n"), Some(77));
+        assert_eq!(parse_nspid_innermost(b"NSpid:\t77\t0\n"), None);
+        assert_eq!(parse_nspid_innermost(b"NSpid:\t77\tabc\n"), None);
+        assert_eq!(parse_nspid_innermost(b"NSpid:\n"), None);
+        assert_eq!(parse_nspid_innermost(b"Pid:\t1\n"), None);
+        assert_eq!(parse_nspid_innermost(b"NSpid:\t-3\n"), None);
+        assert_eq!(parse_nspid_innermost(b"NSpid:\t99999999999\n"), None);
+        // SEC-4: prctl(PR_SET_NAME) で Name に非 UTF-8 のバイトを入れても NSpid は読める。
+        assert_eq!(
+            parse_nspid_innermost(b"Name:\t\xff\xfe\x80x\nNSpid:\t4242\t17\t1\nUmask:\t0022\n"),
+            Some(1)
+        );
+        assert_eq!(parse_nspid_innermost(b"Name:\t\xff\nPid:\t1\n"), None);
     }
 
     /// トークンバケットは時間経過で補充され、バースト以上には溜まらない。

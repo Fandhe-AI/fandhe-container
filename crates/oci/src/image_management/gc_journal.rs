@@ -92,6 +92,13 @@ pub(super) struct GcJournal {
     pub attempts: u32,
 }
 
+impl GcJournal {
+    /// 何も消さない空のジャーナル（削除確定の fsync が未了であることを示す墓標）か。
+    fn is_tombstone(&self) -> bool {
+        self.manifests.is_empty() && self.untag.is_empty() && self.delete_blobs.is_empty()
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawJournal {
@@ -117,14 +124,54 @@ fn journal_path(root: &Path) -> PathBuf {
 }
 
 /// ディレクトリの fsync（unix）。Windows では std で開けないため何もしない。
-#[cfg(unix)]
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if test_hook::should_fail(dir) {
+        return Err(std::io::Error::other("injected directory fsync failure"));
+    }
+    sync_dir_os(dir)
+}
+
+#[cfg(unix)]
+fn sync_dir_os(dir: &Path) -> std::io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> std::io::Result<()> {
+fn sync_dir_os(_dir: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+/// テスト専用: 指定ディレクトリの fsync を回数限定で失敗させる（OCI-7 の fsync 失敗経路の検証用）。
+#[cfg(test)]
+mod test_hook {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        static FAIL: RefCell<Option<(PathBuf, u32)>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn fail_sync_of(dir: &Path, times: u32) {
+        FAIL.with(|f| *f.borrow_mut() = Some((dir.to_path_buf(), times)));
+    }
+
+    pub(super) fn clear() {
+        FAIL.with(|f| *f.borrow_mut() = None);
+    }
+
+    pub(super) fn should_fail(dir: &Path) -> bool {
+        FAIL.with(|f| {
+            let mut f = f.borrow_mut();
+            match f.as_mut() {
+                Some((p, n)) if p == dir && *n > 0 => {
+                    *n -= 1;
+                    true
+                }
+                _ => false,
+            }
+        })
+    }
 }
 
 fn to_raw(j: &GcJournal) -> RawJournal {
@@ -232,13 +279,43 @@ pub(super) fn write_journal(root: &Path, journal: &GcJournal) -> Result<(), OciE
             "gc journal is too large",
         ));
     }
+    match publish_journal(root, &bytes) {
+        Ok(()) => Ok(()),
+        Err(PublishError::BeforePublish) => {
+            Err(err(OciErrorCode::Internal, "failed to persist gc journal"))
+        }
+        Err(PublishError::AfterPublish) => {
+            // rename 済みで root の fsync だけが失敗した。ジャーナルは見えているが永続化は未確定。
+            // 取り消せれば「削除前に収束」として Err を返す。取り消せなければ、見えているジャーナルが
+            // 自分のものである限り操作を続行する（次の lock のロールフォワードと整合し、最後の
+            // `settle` が fsync の成功まで Pending で保持する）。
+            if remove_journal(root).is_ok() {
+                return Err(err(OciErrorCode::Internal, "failed to persist gc journal"));
+            }
+            match read_journal(root) {
+                Ok(Some(j)) if !j.is_tombstone() => Ok(()),
+                _ => Err(err(OciErrorCode::Internal, "failed to persist gc journal")),
+            }
+        }
+    }
+}
+
+/// ジャーナルの公開（rename）より前に失敗したか、後に失敗したか。
+enum PublishError {
+    /// 公開前の失敗。一時ファイルは掃除済みで、既存のジャーナルは変わらない。
+    BeforePublish,
+    /// rename 後の root の fsync の失敗。ジャーナルは公開済みで、永続化だけが未確定。
+    AfterPublish,
+}
+
+/// 一時ファイル → fsync → rename → root の fsync。失敗を公開の前後で区別して返す。
+fn publish_journal(root: &Path, bytes: &[u8]) -> Result<(), PublishError> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let tmp = root.join(format!(
         "{TMP_PREFIX}{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    let io = |_: std::io::Error| err(OciErrorCode::Internal, "failed to persist gc journal");
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -246,19 +323,18 @@ pub(super) fn write_journal(root: &Path, journal: &GcJournal) -> Result<(), OciE
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let result = (|| {
+    let before = (|| {
         let mut f = opts.open(&tmp)?;
-        f.write_all(&bytes)?;
+        f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        fs::rename(&tmp, journal_path(root))?;
-        sync_dir(root)
+        fs::rename(&tmp, journal_path(root))
     })();
-    if let Err(e) = result {
+    if before.is_err() {
         let _ = fs::remove_file(&tmp);
-        return Err(io(e));
+        return Err(PublishError::BeforePublish);
     }
-    Ok(())
+    sync_dir(root).map_err(|_| PublishError::AfterPublish)
 }
 
 /// 書き込み中のクラッシュで残った一時ファイルを回収する（通常ファイルだけ。ストアの排他区間内で、`lock` が取得直後に呼ぶ）。
@@ -279,13 +355,24 @@ pub(super) fn reap_stale_tmp(root: &Path) {
 }
 
 /// ジャーナルを削除して root を fsync する。この成功が削除確定のコミット点。
+///
+/// unlink 後に root の fsync が失敗したときは、削除が未確定のまま次の lock に見えなくならないよう、
+/// 空のジャーナル（墓標）を公開して `Err` を返す。墓標は次の lock の復旧が読み、何も消さずに
+/// `blobs/sha256` と root の fsync をやり直して片づける（fsync が成功するまで残る）。
 pub(super) fn remove_journal(root: &Path) -> std::io::Result<()> {
     match fs::remove_file(journal_path(root)) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    sync_dir(root)
+    let synced = sync_dir(root);
+    if synced.is_err() {
+        // 墓標の公開が失敗しても打つ手が無い（root に書けない）。呼び出し側は Pending として扱う。
+        if let Ok(bytes) = serde_json::to_vec(&to_raw(&GcJournal::default())) {
+            let _ = publish_journal(root, &bytes);
+        }
+    }
+    synced
 }
 
 fn untrusted(msg: &str) -> OciError {
@@ -890,6 +977,74 @@ mod tests {
         if !writable {
             assert_eq!(st, DeletionDurability::Abandoned);
         }
+    }
+
+    /// OCI-7: ジャーナルの rename 後に root の fsync が失敗しても、取り消せなければ
+    /// ジャーナルは残り、操作は続行できる（次の lock のロールフォワードと整合する）。
+    #[test]
+    fn oci7_publish_then_root_fsync_failure_revokes_journal_when_possible() {
+        let root = Root::new();
+        files(&root);
+        // 1 回目（公開後の fsync）だけ失敗、取り消しの fsync は成功 -> 削除前に収束して Err。
+        test_hook::fail_sync_of(&root.0, 1);
+        let e = write_journal(&root.0, &journal_a()).unwrap_err();
+        test_hook::clear();
+        assert_eq!(e.code(), OciErrorCode::Internal);
+        assert!(!root.journal());
+        // 一時ファイルも残さない。
+        assert!(
+            fs::read_dir(&root.0)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().starts_with(TMP_PREFIX))
+        );
+    }
+
+    /// OCI-7: 公開後の fsync も取り消しの fsync も失敗したら、削除は始めず（Err）、
+    /// 墓標（空のジャーナル）を残す。次の lock が何も消さずに片づける。
+    #[test]
+    fn oci7_publish_fsync_failure_and_revoke_fsync_failure_leaves_tombstone() {
+        let root = Root::new();
+        files(&root);
+        test_hook::fail_sync_of(&root.0, 2);
+        let e = write_journal(&root.0, &journal_a()).unwrap_err();
+        test_hook::clear();
+        assert_eq!(e.code(), OciErrorCode::Internal);
+        let j = read_journal(&root.0).unwrap().unwrap();
+        assert!(j.is_tombstone());
+        // 失敗した操作の blob は消えない。
+        assert!(root.exists(&d(0x12)));
+        let store = ImageStore::with_table(&root.0, table()).unwrap();
+        let rec = store.recover_pending_deletion().unwrap().unwrap();
+        assert_eq!(rec.durability, DeletionDurability::Confirmed);
+        assert!(rec.deleted_blobs.is_empty());
+        assert!(root.exists(&d(0x12)));
+        assert!(!root.journal());
+    }
+
+    /// OCI-7: ジャーナル削除後の root の fsync が失敗したら Pending で、墓標が残り、
+    /// 次の lock が復旧して再試行するまで新しい削除は拒否される。
+    #[test]
+    fn oci7_journal_removal_fsync_failure_keeps_pending_until_next_lock() {
+        let root = Root::new();
+        files(&root);
+        write_journal(&root.0, &journal_a()).unwrap();
+        for n in [0x10u8, 0x11, 0x12] {
+            let _ = fs::remove_file(blob_path(&root.0, &d(n)).unwrap());
+        }
+        test_hook::fail_sync_of(&root.0, 1);
+        let st = settle(&root.0, &[], &[d(0x10)], 0, false);
+        test_hook::clear();
+        assert_eq!(st, DeletionDurability::Pending);
+        // 墓標が見えるので次の削除は拒否され、lock が復旧する。
+        assert!(root.journal());
+        let e = ensure_no_pending_journal(&root.0).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        let store = ImageStore::with_table(&root.0, table()).unwrap();
+        let rec = store.recover_pending_deletion().unwrap().unwrap();
+        assert_eq!(rec.durability, DeletionDurability::Confirmed);
+        assert!(!root.journal());
+        ensure_no_pending_journal(&root.0).unwrap();
     }
 
     /// OCI-7: 書き込み中のクラッシュで残った一時ファイルは lock 時に回収される。

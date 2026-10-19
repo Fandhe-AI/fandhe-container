@@ -21,13 +21,15 @@
 //! 競合: スナップショットの後にガードを取るまでの間に停止中のコンテナが起動しても、untag 経路は blob を
 //! 消さないのでデータを失わない。完全削除はガードの下でコンテナ参照が 0 件のときに限る。
 //!
-//! 順序は「テーブル更新 → ファイル削除」で、途中で失敗してもファイルが余分に残る側にだけ倒れる。
+//! 完全削除の順序は「削除ジャーナルの永続化 → テーブル更新 → ファイル削除 → fsync → ジャーナル削除」
+//! （`gc_journal`。#851）。途中で失敗・クラッシュしてもファイルが余分に残る側にだけ倒れ、次の
+//! `ImageStore::lock` が参照を数え直して削除をやり直す。
 //! manifest 本文はディスクに保存していない（config と layer の blob だけ）ため、manifest の削除は
 //! 在庫（テーブル）から外すことを指す。
 //!
-//! 未実装（実装済みを装わない。REPAIR-3）: 永続化・ディレクトリの fsync・削除途中のクラッシュの
-//! 再試行（#851）、CLI の `image rm [--force]` 配線と `StateStore` からのスナップショット作成（#853 以降）、
-//! dangling な blob の回収（`image prune`。#476）。
+//! 未実装（実装済みを装わない。REPAIR-3）: manifest の在庫・タグ・リースのテーブル自体の永続化
+//! （削除の永続化が保証するのはジャーナルと blob ファイルの unlink の範囲だけ）、
+//! CLI の `image rm [--force]` 配線と `StateStore` からのスナップショット作成（#853 以降）。
 //!
 //! Docker の `rmi <tag>` はタグが複数あるイメージなら untag して成功するが、既定経路は OCI-7 に従い
 //! コンテナ参照があれば拒否する。pull リースは blob を守るもので manifest は守らないため、判定には
@@ -35,11 +37,13 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::fs;
-use std::io::ErrorKind;
 use std::path::Path;
 
-use super::usage::{blob_path, check_blob_dirs};
+use super::gc_journal::{
+    DeletionDurability, GcJournal, ensure_no_pending_journal, remove_journal, settle, sweep_blobs,
+    write_journal,
+};
+use super::usage::check_blob_dirs;
 use super::{ContainerRefId, ReferenceTable, TagKey};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
@@ -256,8 +260,10 @@ pub struct ImageRmOutcome {
     pub absent_blobs: Vec<Digest>,
     /// 他の manifest またはリースが守るため残した blob。
     pub kept_blobs: Vec<Digest>,
-    /// 通常ファイルでない・削除に失敗したため残した blob（prune〔#476〕や #851 の再試行で回収する）。
+    /// 通常ファイルでない・削除に失敗したため残した blob（削除ジャーナルに残り、次の lock の再試行〔#851〕で回収する）。
     pub undeleted_blobs: Vec<Digest>,
+    /// 削除の永続化の状態（完全削除でジャーナルを使ったときだけ `Confirmed` / `Pending`。#851）。
+    pub durability: DeletionDurability,
 }
 
 fn internal(msg: &str) -> OciError {
@@ -360,15 +366,44 @@ impl ReferenceTable {
             ImageRmPlan::UntagOnly(a) => (a, false),
             ImageRmPlan::Delete(a) => (a, true),
         };
+        if delete {
+            // 片づいていない削除が残っているうちは新しい削除を始めない（lock 時の再試行が先に片づける）。
+            ensure_no_pending_journal(root)?;
+        }
         // テーブルを変える前にディレクトリを検証する（symlink なら何も変えない）。
         let dirs_present = if delete {
             check_blob_dirs(root)?
         } else {
             false
         };
+        // テーブルを変える前に削除の意図を永続化する。書けなければ何も変えずに返す（削除前に収束）。
+        let planned = if delete && dirs_present {
+            self.blobs_deletable_after_removal(&action.manifest)
+        } else {
+            Vec::new()
+        };
+        let journaled = !planned.is_empty();
+        if journaled {
+            write_journal(
+                root,
+                &GcJournal {
+                    manifests: vec![action.manifest.clone()],
+                    untag: action
+                        .untag
+                        .iter()
+                        .map(|k| (k.clone(), action.manifest.clone()))
+                        .collect(),
+                    delete_blobs: planned,
+                },
+            )?;
+        }
         for key in &action.untag {
-            self.unregister_tag(key)
-                .map_err(|_| internal("planned tag vanished during image removal"))?;
+            if self.unregister_tag(key).is_err() {
+                if journaled {
+                    let _ = remove_journal(root);
+                }
+                return Err(internal("planned tag vanished during image removal"));
+            }
         }
         let mut outcome = ImageRmOutcome {
             manifest: action.manifest.clone(),
@@ -378,44 +413,39 @@ impl ReferenceTable {
             absent_blobs: Vec::new(),
             kept_blobs: Vec::new(),
             undeleted_blobs: Vec::new(),
+            durability: DeletionDurability::NotApplicable,
         };
         if !delete {
             return Ok(outcome);
         }
-        let composition = self.remove_manifest(&action.manifest)?;
+        let composition = match self.remove_manifest(&action.manifest) {
+            Ok(c) => c,
+            Err(e) => {
+                if journaled {
+                    let _ = remove_journal(root);
+                }
+                return Err(e);
+            }
+        };
         outcome.kind = ImageRmKind::Deleted;
+        let mut to_sweep = Vec::new();
         // blobs() は BTreeSet のため昇順で決定的。
         for blob in composition.blobs() {
             let refs = self.blob_references(blob);
             if !refs.referencing_manifests.is_empty() || !refs.leases.is_empty() {
                 outcome.kept_blobs.push(blob.clone());
-                continue;
+            } else {
+                to_sweep.push(blob.clone());
             }
-            if !dirs_present {
-                outcome.absent_blobs.push(blob.clone());
-                continue;
-            }
-            remove_blob_file(root, blob, &mut outcome);
         }
+        let sweep = sweep_blobs(root, &to_sweep, dirs_present);
+        if journaled {
+            outcome.durability = settle(root, &sweep.undeleted, !sweep.deleted.is_empty());
+        }
+        outcome.deleted_blobs = sweep.deleted.into_iter().map(|(d, _)| d).collect();
+        outcome.absent_blobs = sweep.absent;
+        outcome.undeleted_blobs = sweep.undeleted;
         Ok(outcome)
-    }
-}
-
-/// blob 1 件のファイルを消す。通常ファイルだけを `remove_file` し、symlink 等は辿らず残す。
-fn remove_blob_file(root: &Path, blob: &Digest, outcome: &mut ImageRmOutcome) {
-    let Ok(path) = blob_path(root, blob) else {
-        outcome.undeleted_blobs.push(blob.clone());
-        return;
-    };
-    match fs::symlink_metadata(&path) {
-        Ok(m) if m.is_file() => match fs::remove_file(&path) {
-            Ok(()) => outcome.deleted_blobs.push(blob.clone()),
-            Err(e) if e.kind() == ErrorKind::NotFound => outcome.absent_blobs.push(blob.clone()),
-            Err(_) => outcome.undeleted_blobs.push(blob.clone()),
-        },
-        Ok(_) => outcome.undeleted_blobs.push(blob.clone()),
-        Err(e) if e.kind() == ErrorKind::NotFound => outcome.absent_blobs.push(blob.clone()),
-        Err(_) => outcome.undeleted_blobs.push(blob.clone()),
     }
 }
 
@@ -423,7 +453,9 @@ fn remove_blob_file(root: &Path, blob: &Digest, outcome: &mut ImageRmOutcome) {
 mod tests {
     use super::*;
     use crate::image_management::ManifestComposition;
+    use crate::image_management::usage::blob_path;
     use crate::reference::{RegistryHost, Repository, Tag};
+    use std::fs;
 
     fn d(n: u8) -> Digest {
         Digest::parse(&format!("sha256:{}", format!("{n:02x}").repeat(32))).unwrap()

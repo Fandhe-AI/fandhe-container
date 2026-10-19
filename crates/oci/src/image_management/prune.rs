@@ -13,22 +13,25 @@
 //! 2. 削除する blob = 上記 manifest の構成 blob のうち、残る manifest の構成にも pull リースにも入っていないもの。
 //!    共有とリースの両方に当たる blob は `kept_shared_blobs` に分類する。
 //!
-//! 実行順序: 先にテーブルから manifest を外し、その後 blob ファイルを消す。途中で失敗してもファイルが
-//! 余分に残る側にだけ誤る。失敗した blob があっても全体は失敗させず `undeleted_blobs` に載せる。
+//! 実行順序: 削除ジャーナル（`gc_journal`。#851）を永続化し、テーブルから manifest を外し、blob ファイルを
+//! 消し、`blobs/sha256` を fsync してジャーナルを削除する。途中で失敗・クラッシュしてもファイルが
+//! 余分に残る側にだけ誤り、次の `ImageStore::lock` が参照を数え直して削除をやり直す。失敗した blob があっても全体は失敗させず `undeleted_blobs` に載せる。
 //! `blobs` / `blobs/sha256` が symlink・非ディレクトリなら何も変えず `FailedPrecondition`。
 //! blob は `symlink_metadata` で調べ、通常ファイルだけを消す（symlink は辿らず触らない）。
 //!
-//! 未実装（実装済みを装わない。REPAIR-3）: 永続化・ディレクトリの fsync・削除途中のクラッシュからの再試行
-//! （#477・#851）、pull のステージングとリースの組み込み（#474・#475）、CLI 配線、どの構成にも入っていない
+//! 未実装（実装済みを装わない。REPAIR-3）: manifest の在庫・タグ・リースのテーブル自体の永続化
+//! （削除の永続化が保証するのはジャーナルと blob ファイルの unlink の範囲だけ）、pull のステージングとリースの組み込み（#474・#475）、CLI 配線、どの構成にも入っていない
 //! 未登録 blob の回収（pull の書き込み途中のファイルかもしれないため消さない）。
 
 use std::collections::BTreeSet;
-use std::fs;
-use std::io::ErrorKind;
 use std::path::Path;
 
 use super::ReferenceTable;
-use super::usage::{blob_path, check_blob_dirs};
+use super::gc_journal::{
+    DeletionDurability, GcJournal, ensure_no_pending_journal, remove_journal, settle, sweep_blobs,
+    write_journal,
+};
+use super::usage::check_blob_dirs;
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 use crate::reference::Digest;
@@ -65,35 +68,12 @@ pub struct ImagePruneOutcome {
     pub undeleted_blobs: Vec<Digest>,
     /// 消した blob ファイルの合計バイト数。
     pub reclaimed_bytes: u64,
+    /// 削除の永続化の状態（消す blob があってジャーナルを使ったときだけ `Confirmed` / `Pending`。#851）。
+    pub durability: DeletionDurability,
 }
 
 fn err(code: OciErrorCode, msg: &str) -> OciError {
     OciError::new(code, msg)
-}
-
-/// blob ファイル 1 件の削除結果。
-enum BlobRemoval {
-    Deleted(u64),
-    Absent,
-    Kept,
-}
-
-/// 通常ファイルだけを消す。symlink・その他は辿らず触らない（`Kept`）。
-fn remove_blob(root: &Path, digest: &Digest) -> Result<BlobRemoval, OciError> {
-    let path = blob_path(root, digest)?;
-    match fs::symlink_metadata(&path) {
-        Ok(m) if m.is_file() => {
-            let len = m.len();
-            match fs::remove_file(&path) {
-                Ok(()) => Ok(BlobRemoval::Deleted(len)),
-                Err(e) if e.kind() == ErrorKind::NotFound => Ok(BlobRemoval::Absent),
-                Err(_) => Ok(BlobRemoval::Kept),
-            }
-        }
-        Ok(_) => Ok(BlobRemoval::Kept),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(BlobRemoval::Absent),
-        Err(_) => Ok(BlobRemoval::Kept),
-    }
 }
 
 impl ReferenceTable {
@@ -145,13 +125,31 @@ impl ReferenceTable {
     }
 
     fn execute_image_prune_inner(&mut self, root: &Path) -> Result<ImagePruneOutcome, OciError> {
+        // 片づいていない削除が残っているうちは新しい削除を始めない（lock 時の再試行が先に片づける）。
+        ensure_no_pending_journal(root)?;
         // テーブルもファイルも触る前にディレクトリ構成を検証する。
-        check_blob_dirs(root)?;
+        let dirs_present = check_blob_dirs(root)?;
         let plan = self.plan_image_prune();
+        // テーブルを変える前に削除の意図を永続化する。書けなければ何も変えずに返す（削除前に収束）。
+        let journaled = dirs_present && !plan.delete_blobs.is_empty();
+        if journaled {
+            write_journal(
+                root,
+                &GcJournal {
+                    manifests: plan.manifests.clone(),
+                    untag: Vec::new(),
+                    delete_blobs: plan.delete_blobs.clone(),
+                },
+            )?;
+        }
         for digest in &plan.manifests {
             // 区間内で数え直した直後なので失敗しない想定。panic は Mutex を毒化させるため Result で返す。
-            self.remove_manifest(digest)
-                .map_err(|_| err(OciErrorCode::Internal, "failed to remove manifest"))?;
+            if self.remove_manifest(digest).is_err() {
+                if journaled {
+                    let _ = remove_journal(root);
+                }
+                return Err(err(OciErrorCode::Internal, "failed to remove manifest"));
+            }
         }
         let mut out = ImagePruneOutcome {
             removed_manifests: plan.manifests,
@@ -159,19 +157,19 @@ impl ReferenceTable {
             kept_leased_blobs: plan.kept_leased_blobs,
             ..ImagePruneOutcome::default()
         };
-        for blob in plan.delete_blobs {
-            match remove_blob(root, &blob)? {
-                BlobRemoval::Deleted(n) => {
-                    out.reclaimed_bytes = out
-                        .reclaimed_bytes
-                        .checked_add(n)
-                        .ok_or_else(|| err(OciErrorCode::Internal, "size overflow"))?;
-                    out.deleted_blobs.push(blob);
-                }
-                BlobRemoval::Absent => out.absent_blobs.push(blob),
-                BlobRemoval::Kept => out.undeleted_blobs.push(blob),
-            }
+        let sweep = sweep_blobs(root, &plan.delete_blobs, dirs_present);
+        for (_, n) in &sweep.deleted {
+            out.reclaimed_bytes = out
+                .reclaimed_bytes
+                .checked_add(*n)
+                .ok_or_else(|| err(OciErrorCode::Internal, "size overflow"))?;
         }
+        if journaled {
+            out.durability = settle(root, &sweep.undeleted, !sweep.deleted.is_empty());
+        }
+        out.deleted_blobs = sweep.deleted.into_iter().map(|(d, _)| d).collect();
+        out.absent_blobs = sweep.absent;
+        out.undeleted_blobs = sweep.undeleted;
         Ok(out)
     }
 }
@@ -179,9 +177,11 @@ impl ReferenceTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_management::usage::blob_path;
     use crate::image_management::{ContainerRefId, ManifestComposition, PullId, TagKey};
     use crate::instrument::OciOpOutcome;
     use crate::reference::{RegistryHost, Repository, Tag};
+    use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

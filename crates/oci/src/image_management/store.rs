@@ -23,7 +23,8 @@
 //!
 //! # 未実装・前提（実装済みを装わない。REPAIR-3）
 //!
-//! - 永続化（#851）が入るまで、テーブルはプロセスごとのメモリ上の別物である。
+//! - 削除の永続化（削除ジャーナルと、取得時の再試行。`gc_journal`・#851）は実装済みだが、テーブル
+//!   （manifest の在庫・タグ・リース）自体の永続化は未実装で、テーブルはプロセスごとのメモリ上の別物である。
 //!   プロセス間ロックは各プロセスの排他区間の順序を直列化するだけで、内容は同期しない。
 //! - root の解決・作成・所有者 / 権限（0700）検査・祖先検査は永続化側の担当。`open` は存在する
 //!   ディレクトリ（symlink でない）であることしか見ない。oci には `sys` モジュールが無く
@@ -38,6 +39,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::ReferenceTable;
+use super::gc_journal::{PendingDeletionRecovery, journal_exists};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 
@@ -127,11 +129,24 @@ impl ImageStore {
     /// ほど長い場合は `InvalidArgument`。
     pub fn lock(&self) -> Result<ImageStoreGuard<'_>, OciError> {
         record_oci_op(&*self.recorder, OciOpKind::AcquireImageStoreLock, || {
-            self.lock_inner()
+            self.lock_inner().map(|(guard, _)| guard)
         })
     }
 
-    fn lock_inner(&self) -> Result<ImageStoreGuard<'_>, OciError> {
+    /// 排他区間を取得し、残っている削除ジャーナルがあれば参照を数え直して削除をやり直す
+    /// （OCI-7・TASK-183.11.1・#851）。結果（無ければ `None`）を返して区間を閉じる。
+    ///
+    /// `lock` も取得時に同じ再試行を行うため、起動時に明示的に呼ぶのは結果を知りたい場合だけでよい。
+    /// CLI / CRI からの配線は未実装（REPAIR-3）。
+    pub fn recover_pending_deletion(&self) -> Result<Option<PendingDeletionRecovery>, OciError> {
+        record_oci_op(&*self.recorder, OciOpKind::AcquireImageStoreLock, || {
+            self.lock_inner().map(|(_, recovered)| recovered)
+        })
+    }
+
+    fn lock_inner(
+        &self,
+    ) -> Result<(ImageStoreGuard<'_>, Option<PendingDeletionRecovery>), OciError> {
         let deadline = Instant::now().checked_add(self.timeout).ok_or_else(|| {
             OciError::new(
                 OciErrorCode::InvalidArgument,
@@ -141,7 +156,16 @@ impl ImageStore {
         let table = self.lock_table_until(deadline)?;
         let file = open_lock_file(&self.root)?;
         lock_file_until(&file, deadline)?;
-        Ok(ImageStoreGuard { _file: file, table })
+        let mut guard = ImageStoreGuard { _file: file, table };
+        // 他の操作が割り込む前に、前回の中断した削除を片づける。ジャーナルがあったときだけ記録する。
+        let recovered = if journal_exists(&self.root) {
+            record_oci_op(&*self.recorder, OciOpKind::RecoverPendingDeletion, || {
+                guard.table.resume_pending_deletion(&self.root)
+            })?
+        } else {
+            None
+        };
+        Ok((guard, recovered))
     }
 
     fn lock_table_until(

@@ -15,9 +15,11 @@
 //! 変更でき、永続化前はプロセスごとのメモリ上の別物である（契約と前提は `store` モジュールの doc）。
 //!
 //! 未実装（後続 issue の担当。実装済みを装わない。REPAIR-3）:
-//! - ディスクへの永続化（#851）。再起動時の照合 API は `reconcile` で実装済み（#854）。本番 probe と起動時の配線は未実装（#2315）
+//! - テーブル（manifest の在庫・タグ・リース）自体のディスクへの永続化。削除の永続化完了確認と再試行
+//!   （削除ジャーナル `gc_journal`。fsync と取得時のロールフォワード）は実装済み（#851）だが、保証するのは
+//!   ジャーナルと blob ファイルの unlink の範囲だけ。再起動時の照合 API は `reconcile` で実装済み（#854）。本番 probe と起動時の配線は未実装（#2315）
 //! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force` と実削除（untag・`remove_manifest`・非共有 blob の削除。TASK-183.6・#481）も
-//!   `remove` で実装済み（永続化・fsync・削除途中のクラッシュの再試行は #851、CLI 配線は未実装）
+//!   `remove` で実装済み（削除の永続化と再試行は #851 で実装済み、CLI 配線は未実装）
 //! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（CLI 経路と永続化は未実装）
 //! - `image prune` 本体は `prune` モジュールで実装済み（#476）。`rm`・`prune` の CLI 配線（#476・#480・#481）。`image ls`/`system df` の集計 API は
 //!   `usage`（#478・TASK-183.3）で実装済み（staging の容量・コンテナ容量の受け口・展開後サイズの二段階 API は #2222。CLI 経路は未実装）
@@ -39,6 +41,12 @@ pub use container_ref::{ContainerRefRegistration, ContainerRefRelease};
 
 mod reconcile;
 pub use reconcile::{ContainerRefReconciliation, ContainerStatePresence};
+
+mod gc_journal;
+pub use gc_journal::{
+    DeletionDurability, GC_JOURNAL_FILE_NAME, MAX_GC_JOURNAL_BYTES, MAX_GC_JOURNAL_ENTRIES,
+    PendingDeletionRecovery,
+};
 
 mod remove;
 pub use remove::{

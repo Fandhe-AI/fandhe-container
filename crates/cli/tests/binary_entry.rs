@@ -236,7 +236,15 @@ fn exclusive_dir(parent: &std::path::Path, prefix: &str) -> std::path::PathBuf {
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         let p = parent.join(format!("{prefix}-{}-{nanos}-{attempt}", std::process::id()));
-        match std::fs::create_dir(&p) {
+        #[cfg(unix)]
+        let created = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            // 作成時から 0700 にし、chmod までの隙間で他ユーザーが書き込めないようにする。
+            std::fs::DirBuilder::new().mode(0o700).create(&p)
+        };
+        #[cfg(not(unix))]
+        let created = std::fs::create_dir(&p);
+        match created {
             Ok(()) => return p,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => panic!("exclusively create {}: {e}", p.display()),

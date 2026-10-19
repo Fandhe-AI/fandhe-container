@@ -36,6 +36,19 @@ fn layer_gz() -> Vec<u8> {
     e.finish().unwrap()
 }
 
+/// 作成時から 0700 でディレクトリを作る（Unix は `DirBuilderExt::mode`。umask 000 の root でも chmod までの隙間を作らない）。
+fn mkdir_private(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
+    }
+}
+
 /// 一時 base を排他的に作る。共有 /tmp 上の推測可能な固定名を削除・再利用すると、競合で置かれた symlink を
 /// root が辿りうる（#2324・SEC-2）。PID・時刻・試行番号の一意名を `create_dir` で作り、既存パスは採用しない。
 fn exclusive_base(prefix: &str) -> std::path::PathBuf {
@@ -46,16 +59,8 @@ fn exclusive_base(prefix: &str) -> std::path::PathBuf {
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
         let path = tmp.join(format!("{prefix}-{}-{nanos}-{attempt}", std::process::id()));
-        match std::fs::create_dir(&path) {
-            Ok(()) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-                        .unwrap();
-                }
-                return path;
-            }
+        match mkdir_private(&path) {
+            Ok(()) => return path,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => panic!("exclusively create {}: {e}", path.display()),
         }

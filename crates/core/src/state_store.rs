@@ -1545,12 +1545,43 @@ fn sync_dir(dir: &Path) -> Result<(), TraitError> {
         if !d.metadata().is_ok_and(|m| m.is_dir()) {
             return Err(internal("state directory is not a directory"));
         }
-        d.sync_all()
-            .map_err(|_| internal("failed to sync the state directory"))?;
+        #[cfg(target_os = "macos")]
+        let result = sync_with_fallback(
+            || d.sync_all(),
+            || crate::sys::fsync_file(&d),
+            &crate::sys::FULLFSYNC_FALLBACK_ERRNOS,
+        );
+        // macOS 以外は代替を持たない（Linux の `sync_all` は fsync(2) そのもの）。
+        #[cfg(not(target_os = "macos"))]
+        let result = sync_with_fallback(|| d.sync_all(), || Ok(()), &[]);
+        result.map_err(|_| internal("failed to sync the state directory"))?;
     }
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
+}
+
+/// `full` が `fallback_errnos` に含まれる errno で失敗したときだけ `plain` へ切り替える。
+///
+/// macOS の `File::sync_all` は `F_FULLFSYNC` で、ディレクトリ fd に対して `EINVAL` / `ENOTSUP` に
+/// なることがある（その場合は `fsync(2)` で dirent を永続化する）。それ以外の失敗（`EIO` 等）は
+/// そのまま返し、fail-closed にする（OCI-5・IO-3）。分類を注入可能にして 3 OS で試験できるようにしている。
+#[cfg_attr(not(unix), allow(dead_code))]
+fn sync_with_fallback(
+    full: impl FnOnce() -> std::io::Result<()>,
+    plain: impl FnOnce() -> std::io::Result<()>,
+    fallback_errnos: &[i32],
+) -> std::io::Result<()> {
+    match full() {
+        Ok(()) => Ok(()),
+        Err(e)
+            if e.raw_os_error()
+                .is_some_and(|n| fallback_errnos.contains(&n)) =>
+        {
+            plain()
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// 最終要素の symlink を辿らず（`O_NOFOLLOW`）、FIFO 等でも `open(2)` 自体が相手を待たない
@@ -1975,6 +2006,56 @@ fn lock_file_until(file: &File, deadline: Instant) -> Result<(), TraitError> {
 #[cfg(test)]
 mod platform_tests {
     use super::*;
+
+    /// OCI-5・IO-3: 許可リストの errno（EINVAL=22・ENOTSUP=45）で失敗したときだけ代替の fsync へ切り替える。
+    #[test]
+    fn oci5_sync_falls_back_only_on_listed_errnos() {
+        use std::cell::Cell;
+        use std::io::Error;
+        let list = [22, 45];
+        for errno in list {
+            let called = Cell::new(0);
+            let r = sync_with_fallback(
+                || Err(Error::from_raw_os_error(errno)),
+                || {
+                    called.set(called.get() + 1);
+                    Ok(())
+                },
+                &list,
+            );
+            assert!(r.is_ok(), "errno {errno}");
+            assert_eq!(called.get(), 1, "errno {errno}");
+        }
+        // 代替も失敗したらその失敗を返す。
+        let r = sync_with_fallback(
+            || Err(Error::from_raw_os_error(22)),
+            || Err(Error::from_raw_os_error(5)),
+            &list,
+        );
+        assert_eq!(r.unwrap_err().raw_os_error(), Some(5));
+    }
+
+    /// OCI-5・IO-3: 許可リスト外の errno（EIO=5）・errno なしの失敗・空リストは切り替えずに失敗（fail-closed）。
+    #[test]
+    fn oci5_sync_does_not_fall_back_on_other_errors() {
+        use std::cell::Cell;
+        use std::io::{Error, ErrorKind};
+        let called = Cell::new(0);
+        let plain = || {
+            called.set(called.get() + 1);
+            Ok(())
+        };
+        let r = sync_with_fallback(|| Err(Error::from_raw_os_error(5)), plain, &[22, 45]);
+        assert_eq!(r.unwrap_err().raw_os_error(), Some(5));
+        let r = sync_with_fallback(|| Err(Error::from(ErrorKind::Other)), plain, &[22, 45]);
+        assert_eq!(r.unwrap_err().kind(), ErrorKind::Other);
+        let r = sync_with_fallback(|| Err(Error::from_raw_os_error(22)), plain, &[]);
+        assert_eq!(r.unwrap_err().raw_os_error(), Some(22));
+        assert_eq!(called.get(), 0);
+        // 成功時は代替を呼ばない。
+        assert!(sync_with_fallback(|| Ok(()), plain, &[22]).is_ok());
+        assert_eq!(called.get(), 0);
+    }
 
     /// SUP-1・REPAIR-5・#2229: 参照が無く解放から間隔が経ったゲートだけを回収する。
     #[test]

@@ -8,6 +8,7 @@
 //! - 実効 UID（`geteuid(2)`）
 //! - `O_NOFOLLOW | O_NONBLOCK` の値（`open_nowait` が使う）
 //! - 拡張 ACL の有無（`acl_get_link_np(3)`。symlink を辿らない）
+//! - `fsync(2)`（ディレクトリ fd への `F_FULLFSYNC` が `EINVAL` / `ENOTSUP` になる場合の代替。`sync_dir` 用）
 //!
 //! # 契約
 //! - `unsafe fn` は外へ公開しない。すべての `unsafe` に `// SAFETY:` を付ける
@@ -22,6 +23,7 @@
 #![cfg(target_os = "macos")]
 
 use std::ffi::{CString, c_char, c_int, c_void};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -47,15 +49,22 @@ const ACL_TYPE_EXTENDED: u32 = 0x0000_0100;
 const ACL_FIRST_ENTRY: c_int = 0;
 /// `EINVAL`（`sys/errno.h`。`acl_get_entry` が「エントリなし」で返す）。
 const EINVAL: i32 = 22;
+/// `ENOTSUP`（`sys/errno.h`）。
+const ENOTSUP: i32 = 45;
+
+/// `File::sync_all`（macOS では `fcntl(F_FULLFSYNC)`）が失敗したとき `fsync(2)` へ切り替えてよい errno。
+/// ディレクトリ fd や一部のファイルシステムで `F_FULLFSYNC` が非対応を返すため。これ以外は fail-closed。
+pub(crate) const FULLFSYNC_FALLBACK_ERRNOS: [i32; 2] = [EINVAL, ENOTSUP];
 
 // SAFETY（宣言そのものの妥当性）: いずれも libSystem の関数。`uid_t geteuid(void)`、
 // `acl_t acl_get_link_np(const char *, acl_type_t)`（`acl_t` は不透明ポインタ・`acl_type_t` は
-// `unsigned int`）、`int acl_free(void *)` と同じ型幅。
+// `unsigned int`）、`int acl_free(void *)`、`int fsync(int)` と同じ型幅。
 unsafe extern "C" {
     fn geteuid() -> u32;
     fn acl_get_link_np(path: *const c_char, acl_type: u32) -> *mut c_void;
     fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry_p: *mut *mut c_void) -> c_int;
     fn acl_free(obj: *mut c_void) -> c_int;
+    fn fsync(fd: c_int) -> c_int;
 }
 
 /// 自プロセスの実効 uid。
@@ -109,5 +118,19 @@ pub(crate) fn has_extended_acl(path: &Path) -> Result<bool, SysError> {
         Ok(false)
     } else {
         Err(SysError::Os)
+    }
+}
+
+/// `file` に対して `fsync(2)` を呼ぶ（`F_FULLFSYNC` ではないため、ドライブのキャッシュまでは保証しない）。
+///
+/// `sync_dir` が `sync_all` の `EINVAL` / `ENOTSUP` に対する代替としてだけ使う。失敗は `io::Error` で返す。
+pub(crate) fn fsync_file(file: &std::fs::File) -> std::io::Result<()> {
+    // SAFETY: fd は呼び出しの間生きている `file` から借りた有効な descriptor で、`fsync` はそれを閉じも
+    // 保持もしない。ポインタ引数は無い。
+    let rc = unsafe { fsync(file.as_raw_fd()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }

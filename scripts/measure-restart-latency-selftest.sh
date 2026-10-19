@@ -5,6 +5,9 @@
 # 1 つ起動し、kill されたらバックオフ 100ms 後に再起動して state.json とログを更新する。環境変数 STUB_MODE で挙動を切り替える）を生成し、終了コード・
 # 出力 JSON・後始末（スタブ由来プロセスの残存 0）を具体値で照合する。実コンテナ・実ランタイム・root は
 # 使わない（実機での実測と SUP-3 の判定は #491・TASK-160.h1 で人間が行う）。
+# 後始末の delete（OCI-6・#2157）: CLI スタブは `--root R delete <id>` も受理し、STUB_DELETE（ok / reject / hang / slow）で
+# 拒否・ハング・遅延を注入する。supervisor スタブは `--restart on-failure:N` で再起動回数が N に達した後の終了で stopped を
+# 記録して自分で終わる（実 supervisor の RetriesExhausted 相当）。
 # 呼び出し元は Makefile の `restart-latency-selftest` と CI の bench-regression ジョブ。
 # 1 件でも期待と異なれば非ゼロで終了する（fail-closed）。Linux・非 root 限定で、前提を満たさない環境では
 # skip せず失敗する（ci.md「skip で CI を通さない」）。
@@ -33,6 +36,9 @@ done
 
 root="$(mktemp -d)"
 foreign_pid=""
+# 後始末の待ち上限を短くする（本体の既定は 10 秒・20 秒。ハング注入のケースで待ちを短縮する）。
+export RESTART_LATENCY_STOP_WAIT_S=2
+export RESTART_LATENCY_DELETE_TIMEOUT_S=2
 # 自己テスト自身が起動した補助プロセス（直接の子）。途中で中断しても残さない。
 helper_pids=()
 # pid が自己テスト（$$）の直接の子として今も存在するか（wait 済みの pid が再利用されていても送らないため）。
@@ -104,6 +110,27 @@ helper_pids+=("$!")
 # 新コンテナ起動までの待ちを順に与える時間制御入力（observed の下限が決定的になる）。
 cat >"${root}/bin/fandhe-container" <<'STUB'
 #!/usr/bin/env bash
+if [ "$1" = --root ] && [ "$3" = delete ] && [ "$#" -eq 4 ]; then
+  # 呼び出しの記録: 呼び出し時点で生存しているスタブ由来プロセス（STUB_DIR/pids）の数。delete は回収の後に呼ばれる契約。
+  alive=0
+  if [ -f "${STUB_DIR}/pids" ]; then
+    while read -r p; do
+      if [ -r "/proc/$p/stat" ]; then
+        st="$(<"/proc/$p/stat")" 2>/dev/null || continue
+        [[ "$st" == *") Z "* ]] || alive=$((alive + 1))
+      fi
+    done <"${STUB_DIR}/pids"
+  fi
+  echo "delete alive=${alive}" >>"${STUB_DIR}/delete.calls"
+  case "${STUB_DELETE:-ok}" in
+    reject) echo '{"code":"FAILED_PRECONDITION","message":"stub rejected at /secret/path"}' >&2; exit 1 ;;
+    hang) exec sleep 300 ;;
+    slow) sleep 2 ;;
+  esac
+  grep -q '"status":"stopped"' "$2/$4/state.json" || { echo '{"code":"FAILED_PRECONDITION","message":"not stopped"}' >&2; exit 1; }
+  rm -rf -- "${2:?}/$4"
+  exit 0
+fi
 [ "$1" = --root ] && [ "$3" = create ] && [ "$4" = --bundle ] && [ "$#" -eq 6 ] || exit 2
 [ -d "$5" ] || exit 2
 mkdir -p "$2/$6"
@@ -201,6 +228,11 @@ write_state() {
     "$id" "$shown_pid" "$count" >"${sd}/state.tmp"
   mv "${sd}/state.tmp" "${sd}/state.json"
 }
+write_stopped() {
+  printf '{"ociVersion":"1.0.2","id":"%s","status":"stopped","bundle":"/x","revision":1,"restartCount":%s,"exitCode":137}\n' \
+    "$id" "$count" >"${sd}/state.tmp"
+  mv "${sd}/state.tmp" "${sd}/state.json"
+}
 term_handler() {
   [ -z "$pending" ] || logline "$pending"
   kill "$child" 2>/dev/null
@@ -245,6 +277,16 @@ while :; do
   if [ "$STUB_MODE" = no_restart ]; then
     while :; do sleep 0.2; done
   fi
+  # 実 supervisor は on-failure:N の再起動を使い切った後の終了で Stopped を記録して自分で終わる（RetriesExhausted）。
+  case "$5" in
+    on-failure:*)
+      if [ "$count" -ge "${5#on-failure:}" ]; then
+        [ -z "$pending" ] || logline "$pending"
+        write_stopped
+        exit 0
+      fi
+      ;;
+  esac
   [ "$STUB_MODE" = no_backoff ] || sleep 0.1
   d="${delays[$didx]:-}"
   didx=$((didx + 1))
@@ -335,6 +377,9 @@ if run_case normal 0 normal "200000 101000 102000 103000 104000 105000" --trials
   jq_eq normal "$o" '.task' '"TASK-160"'
   jq_eq normal "$o" '[.trials, .warmup, .backoff_ms_assumed, .label, .unit]' '[5,1,100,"selftest","ms"]'
   jq_eq normal "$o" '.observed.samples' '5'
+  # 後始末の正常系は CLI の delete（OCI-6）。delete は 1 回だけ、プロセスの回収の後（生存 0）に呼ばれる。
+  jq_eq normal "$o" '.cleanup' '{"delete":"ok"}'
+  if [ "$(cat "${root}/d-normal/delete.calls" 2>/dev/null || true)" = "delete alive=0" ]; then pass "normal: delete called once after the processes were reclaimed"; else fail "normal: delete.calls got '$(cat "${root}/d-normal/delete.calls" 2>/dev/null || true)', want 'delete alive=0'"; fi
   jq_eq normal "$o" '(.observed.values | length)' '5'
   jq_eq normal "$o" '(.observed.median > 0)' 'true'
   jq_eq normal "$o" '.supervisor_reported | [.samples, .median, .p95, .min, .max]' '[5,103,105,101,105]'
@@ -367,10 +412,10 @@ STUB_DELAY=""
 run_case deep 0 deep "101000 101000" --trials 2 --warmup 0 --timeout 10 || true
 
 # launcher が SIGTERM 時に環境変数を継承しない新コンテナを起動しても、state.json の pid から回収される
-run_case late_start 0 late_start "" --trials 1 --warmup 0 --timeout 10 || true
+RESTART_LATENCY_STOP_WAIT_S=0 run_case late_start 0 late_start "" --trials 1 --warmup 0 --timeout 10 || true
 
 # 全コンテナが環境変数を継承しない場合も、追跡した全 pid（再起動後の生存コンテナ）と SIGTERM 時の新コンテナを回収する
-run_case late_two 0 late_two "101000" --trials 1 --warmup 0 --timeout 10 || true
+RESTART_LATENCY_STOP_WAIT_S=0 run_case late_two 0 late_two "101000" --trials 1 --warmup 0 --timeout 10 || true
 # 以降の「意図的に生存プロセスが残る」ケース用。run_case と同じだが残存検査をせず、終了コードだけ照合する。
 run_leftover_case() { # <名前> <期待終了コード> <STUB_MODE> <script 引数...>
   local name="$1" want="$2" mode="$3" rc=0
@@ -408,7 +453,7 @@ expect_warning() { # <名前>: 帰属不明の警告と cleanup-failed を出し
 
 # SIGTERM 時に別 session・トークンなしで起動された新 pid は本計測への帰属を証明できないため kill しない
 # （起動時刻が launcher 以降というだけでは回収しない。警告を出して終了コード 4・結果は公開しない）
-run_leftover_case late_session 4 late_session --trials 1 --warmup 0 --timeout 10
+RESTART_LATENCY_STOP_WAIT_S=0 run_leftover_case late_session 4 late_session --trials 1 --warmup 0 --timeout 10
 expect_unpublished late_session
 expect_survivor late_session "${root}/d-late_session/leftover"
 expect_warning late_session
@@ -416,7 +461,7 @@ reclaim_kept late_session
 
 # SIGTERM 時に既存コンテナを止めてから同じ session で起動された新 pid は、session の継続を証明できる追跡済みの
 # 生存プロセスが無いため帰属不明（session 番号の一致だけでは回収しない）。kill せず終了コード 4
-run_leftover_case late_orphan 4 late_orphan --trials 1 --warmup 0 --timeout 10
+RESTART_LATENCY_STOP_WAIT_S=0 run_leftover_case late_orphan 4 late_orphan --trials 1 --warmup 0 --timeout 10
 expect_unpublished late_orphan
 expect_survivor late_orphan "${root}/d-late_orphan/leftover"
 expect_warning late_orphan
@@ -440,14 +485,41 @@ if grep -q 'cannot be tracked' "${root}/mid_only.err"; then pass "mid_only: untr
 reclaim_kept mid_only
 
 # 所有トークンを部分文字列として含む環境変数を持つ無関係プロセスは、完全一致しないため kill しない
-run_leftover_case decoy 0 decoy --trials 1 --warmup 0 --timeout 10
+RESTART_LATENCY_STOP_WAIT_S=0 run_leftover_case decoy 0 decoy --trials 1 --warmup 0 --timeout 10
 expect_survivor decoy "${root}/d-decoy/decoy"
 if no_residue "${root}/d-decoy"; then pass "decoy: no stub residue"; else fail "decoy: stub processes remain"; fi
 
 # launcher の子孫だがトークンを継承せず別 session で state.json にも現れない補助プロセスは、launcher 停止前の
 # 子孫スナップショットで帰属を証明して回収する（run_case が pids の残存 0 を照合する）
-run_case stray 0 stray "" --trials 1 --warmup 0 --timeout 10 || true
+RESTART_LATENCY_STOP_WAIT_S=0 run_case stray 0 stray "" --trials 1 --warmup 0 --timeout 10 || true
 if [ "$(wc -l <"${root}/d-stray/pids" 2>/dev/null || echo 0)" -ge 3 ]; then pass "stray: stray pid recorded"; else fail "stray: stub did not record the stray pid"; fi
+
+# --- 後始末の delete（OCI-6・#2157） ---
+# 拒否: 終了コード 4・結果は公開しない・状態を残す・stderr の固定書式の行にコードだけを出す（message のパスは出さない）
+STUB_DELETE=reject run_case del_reject 4 normal "101000 101000" --trials 1 --warmup 0 --timeout 10 || true
+expect_unpublished del_reject
+if grep -q 'cleanup-failed: delete was rejected (FAILED_PRECONDITION)' "${root}/del_reject.err"; then pass "del_reject: rejection code reported"; else fail "del_reject: rejection line missing"; fi
+if grep -q '/secret/path' "${root}/del_reject.err"; then fail "del_reject: CLI message leaked"; else pass "del_reject: CLI message not echoed"; fi
+reclaim_kept del_reject
+# ハング: 上限（2 秒）で打ち切って TIMEOUT・終了コード 4
+STUB_DELETE=hang run_case del_hang 4 normal "101000 101000" --trials 1 --warmup 0 --timeout 10 || true
+expect_unpublished del_hang
+if grep -q 'cleanup-failed: delete was rejected (TIMEOUT)' "${root}/del_hang.err"; then pass "del_hang: timeout reported"; else fail "del_hang: timeout line missing"; fi
+reclaim_kept del_hang
+# always: 自然に止まらないので delete は呼ばず、従来どおり回収して成功。skipped を結果に残す
+if run_case del_always 0 normal "101000 101000" --trials 1 --warmup 0 --timeout 10 --policy always; then
+  jq_eq del_always "${root}/del_always.out" '.cleanup' '{"delete":"skipped","reason":"state-not-stopped"}'
+  if [ -e "${root}/d-del_always/delete.calls" ]; then fail "del_always: delete must not be called"; else pass "del_always: delete not called"; fi
+fi
+# 自然停止を試みない設定（STOP_WAIT_S=0）も skipped
+if RESTART_LATENCY_STOP_WAIT_S=0 run_case del_disabled 0 normal "101000 101000" --trials 1 --warmup 0 --timeout 10; then
+  jq_eq del_disabled "${root}/del_disabled.out" '.cleanup' '{"delete":"skipped","reason":"state-not-stopped"}'
+fi
+# 遅い delete: 後始末の時間は計測値に入らない（delete は値の確定後。REPAIR-8・CORE-10）
+if STUB_DELETE=slow RESTART_LATENCY_DELETE_TIMEOUT_S=10 run_case del_slow 0 normal "101000 101000" --trials 1 --warmup 0 --timeout 10; then
+  jq_eq del_slow "${root}/del_slow.out" '.cleanup' '{"delete":"ok"}'
+  jq_eq del_slow "${root}/del_slow.out" '(.observed.max < 1000)' 'true'
+fi
 
 # 計測中に SIGTERM を受けたら後始末を終えてから 143 で終わり、結果を公開しない（外側 timeout の期限切れと同じ経路）
 mkdir -p "${root}/d-term"
@@ -588,7 +660,7 @@ if grep -q 'warning: RESTART_LATENCY_TIMEOUT=2s is shorter than the worst-case d
 expect_unpublished make_timeout
 if no_residue "${root}/d-make_timeout"; then pass "make_timeout: no stub residue"; else fail "make_timeout: stub processes remain"; fi
 # 後始末失敗の 4 は make 経由でも 4（Error 4）のまま返る
-make_case make_leftover late_session TRIALS=1
+RESTART_LATENCY_STOP_WAIT_S=0 make_case make_leftover late_session TRIALS=1
 if [ "$MAKE_RC" -ne 0 ] && grep -q 'Error 4$' "${root}/make_leftover.err"; then pass "make_leftover: recipe exit 4"; else fail "make_leftover: make exit ${MAKE_RC} or Error 4 missing"; fi
 expect_unpublished make_leftover
 expect_survivor make_leftover "${root}/d-make_leftover/leftover"
@@ -673,7 +745,10 @@ foreign_pid=""
 mkdir -m 0700 "${root}/sr"
 run_case state_root 0 normal "101000 101000" --trials 1 --warmup 0 --timeout 10 --state-root "${root}/sr" || true
 if [ -s "${root}/state_root.out" ]; then pass "state_root: result published"; else fail "state_root: no result"; fi
-if [ "$(find "${root}/sr" -name state.json | wc -l)" -eq 1 ]; then pass "state_root: state.json created under --state-root"; else fail "state_root: state.json missing under --state-root"; fi
+# 後始末の delete が <id>/ を消すので、state.json は残らず「left state entry」の note も出ない（OCI-6）。
+if [ "$(find "${root}/sr" -name state.json | wc -l)" -eq 0 ]; then pass "state_root: delete removed the entry under --state-root"; else fail "state_root: state entry left under --state-root"; fi
+if grep -q 'left state entry' "${root}/state_root.err"; then fail "state_root: left-entry note after a successful delete"; else pass "state_root: no left-entry note after delete"; fi
+jq_eq state_root "${root}/state_root.out" '.cleanup' '{"delete":"ok"}'
 
 # 大文字と '_' を含む --id-prefix でも、符号化されたログのファイル名から副系列を読める（REPAIR-4・IO-5）
 run_case id_prefix_enc 0 normal "101000 101000" --trials 1 --warmup 0 --timeout 10 --id-prefix Foo_bar || true

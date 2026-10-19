@@ -6,12 +6,15 @@
 //! `start_contract` は OS 非依存の純ロジックを置く方針のため、unix 専用の本モジュールは別に置く。
 //!
 //! 判定は `<XDG_RUNTIME_DIR>/systemd/private`（systemd-run `--user` の直結先）が、symlink を辿らない lstat で
-//! 自 euid 所有のソケットであることの確認に限る。実際に connect はしない（死んだソケットは見分けられない。未実装）。
+//! 自 euid 所有のソケットであることの確認に限る（[`user_manager_env`]。`start` とベンチはこれだけを使う）。
+//! 死んだソケット（ファイルは残るが listener がいない）を見分ける実 connect は [`probe_user_manager_socket`] が
+//! 担い、`doctor` だけが呼ぶ（`start` への追加は別判断。#2158）。
 //! エラー値は固定文言のみで、値（パス・`XDG_RUNTIME_DIR` の内容）を載せない。
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// user マネージャへ届かない理由（固定文言は [`UserManagerError::message`]。値〔パス〕は載せない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +57,78 @@ pub fn user_manager_env(xdg: Option<&OsStr>, euid: u32) -> Result<OsString, User
         return Err(UserManagerError::Unreachable);
     }
     Ok(xdg.to_os_string())
+}
+
+/// connect の再試行間隔（listen backlog 満杯のときだけ待つ。REPAIR-5）。
+const CONNECT_BACKLOG_INTERVAL: Duration = Duration::from_millis(5);
+
+/// user マネージャのソケットへ実際に接続できなかった理由（固定文言は [`UserManagerConnectError::message`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UserManagerConnectError {
+    /// `ECONNREFUSED`: ソケットのファイルは残っているが listener がいない（死んだソケット）。
+    Refused,
+    /// listen backlog が満杯のまま期限を過ぎた（生きているが応答しない）。
+    TimedOut,
+    /// 接続を試みられなかった（パスが `sun_path` に収まらない・NUL を含む・対象外アーキテクチャ）。
+    Unsupported,
+    /// 上記以外の I/O エラー（lstat と connect の間に消えた場合を含む）。
+    Failed,
+}
+
+impl UserManagerConnectError {
+    /// 利用者へ出す固定の英語文言（パス・errno を載せない）。
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::Refused => {
+                "systemd user manager socket exists but nothing is listening on it (stale socket)"
+            }
+            Self::TimedOut => {
+                "systemd user manager socket did not accept a connection before the deadline"
+            }
+            Self::Unsupported => {
+                "a connection to the systemd user manager socket could not be attempted"
+            }
+            Self::Failed => "connecting to the systemd user manager socket failed",
+        }
+    }
+}
+
+/// `<runtime_dir>/systemd/private` へ実際に接続して閉じる（CORE-3・CORE-4・REPAIR-5・#2158）。
+///
+/// 呼び出し元は [`user_manager_env`] が成功した後の `doctor` で、その戻り値を `runtime_dir` に渡す。
+/// データは送らず、接続に成功したら直ちに閉じる（副作用は相手の accept と EOF の観測だけ）。`SOCK_NONBLOCK` の
+/// `connect(2)` を `deadline` まで繰り返し、`ECONNREFUSED` と `ENOENT` は再試行せず即答する（診断が目的）。
+/// lstat と connect の間にソケットを差し替えられるのは同じ uid の書き手だけで、権限の境界は増えない。
+pub fn probe_user_manager_socket(
+    runtime_dir: &OsStr,
+    deadline: Instant,
+) -> Result<(), UserManagerConnectError> {
+    use std::io::ErrorKind;
+    let sock = Path::new(runtime_dir).join("systemd").join("private");
+    loop {
+        match crate::sys::connect_unix_nonblocking(&sock) {
+            // 接続を保持せず、すぐ閉じる。
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(e) => match e.kind() {
+                ErrorKind::ConnectionRefused => return Err(UserManagerConnectError::Refused),
+                ErrorKind::InvalidInput | ErrorKind::Unsupported => {
+                    return Err(UserManagerConnectError::Unsupported);
+                }
+                ErrorKind::WouldBlock => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(UserManagerConnectError::TimedOut);
+                    }
+                    std::thread::sleep(CONNECT_BACKLOG_INTERVAL.min(remaining));
+                }
+                _ => return Err(UserManagerConnectError::Failed),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -124,5 +199,59 @@ mod tests {
             Err(UserManagerError::Unreachable)
         );
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// CORE-3・CORE-4・REPAIR-5: listen 中のソケットには接続でき、listener が消えたソケットは `Refused`。
+    #[test]
+    fn core3_core4_repair5_probe_live_and_stale() {
+        let d = tmp("probe");
+        std::fs::create_dir(d.join("systemd")).expect("mkdir");
+        let l = std::os::unix::net::UnixListener::bind(d.join("systemd/private")).expect("bind");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(probe_user_manager_socket(d.as_os_str(), deadline), Ok(()));
+        drop(l);
+        assert_eq!(
+            probe_user_manager_socket(d.as_os_str(), deadline),
+            Err(UserManagerConnectError::Refused)
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// REPAIR-5: ソケットが無ければ `Failed`、108 バイト以上のパスは `Unsupported`。
+    #[test]
+    fn repair5_probe_missing_and_too_long() {
+        let d = tmp("probe2");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(
+            probe_user_manager_socket(d.as_os_str(), deadline),
+            Err(UserManagerConnectError::Failed)
+        );
+        let long = OsString::from("/".to_owned() + &"a".repeat(120));
+        assert_eq!(
+            probe_user_manager_socket(&long, deadline),
+            Err(UserManagerConnectError::Unsupported)
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// CORE-3: 固定文言が決まっており、パスを載せない。
+    #[test]
+    fn core3_connect_error_messages_are_fixed() {
+        assert_eq!(
+            UserManagerConnectError::Refused.message(),
+            "systemd user manager socket exists but nothing is listening on it (stale socket)"
+        );
+        assert_eq!(
+            UserManagerConnectError::TimedOut.message(),
+            "systemd user manager socket did not accept a connection before the deadline"
+        );
+        assert_eq!(
+            UserManagerConnectError::Unsupported.message(),
+            "a connection to the systemd user manager socket could not be attempted"
+        );
+        assert_eq!(
+            UserManagerConnectError::Failed.message(),
+            "connecting to the systemd user manager socket failed"
+        );
     }
 }

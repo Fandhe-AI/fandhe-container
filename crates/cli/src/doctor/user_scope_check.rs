@@ -9,13 +9,26 @@
 //! - 事実の収集（[`collect`]。Linux のみ）と評価（[`evaluate`]。純粋関数で全 OS で単体テストできる）を分ける。
 //! - 出力は NET-10 の診断（`super`）と同じ JSON Lines で、各行に `check` と `state` のトークンを付ける。
 //!   パス・`XDG_RUNTIME_DIR` の値・ユーザー名などホスト固有の値は出力に載せない。
-//! - 終了ステータス: Warning が 1 件でもあれば `Warning`（3）、そうでなく判定不能なら `Inconclusive`（4）、それ以外は `Ok`（0）。
-//!   `systemd-run` が無い・信頼できないことは `start` の前提の不成立なので Warning に入れる。rootful で検査を省いた通知と
-//!   対象外 OS は 0 に寄与する。
+//! - 終了ステータス: Warning が 1 件でもあれば `Warning`（3）、そうでなく判定不能の要因があれば `Inconclusive`（4）、
+//!   それ以外は `Ok`（0）。`systemd-run` が無い・信頼できないことは `start` の前提の不成立なので Warning に入れる。
+//!   rootful で検査を省いた通知と対象外 OS は 0 に寄与する。
+//!
+//! # 実 connect と cgroup の委譲の検査（#2158）
+//! - user マネージャのソケットは lstat の検証に続けて `supervisor::user_scope::probe_user_manager_socket` で期限つきに
+//!   接続して閉じる（データは送らない）。死んだソケット（`ECONNREFUSED`）は `start` の `systemd-run` が失敗するので Warning、
+//!   backlog 満杯・試せなかった場合は判定不能の通知にする。
+//! - CLI 自身の cgroup は `delete` と同じ `DelegatedCgroup::detect()` で検査する（食い違いを構造上作らない）。
+//!   `start` は `systemd-run --user --scope` で包むため委譲されていないログインシェルからでも通り、委譲が要るのは
+//!   cgroup の配置を記録したコンテナの `delete` だけである。終了コード 0 を「`start` が通る」の意味に保つため、
+//!   `CGROUP_NOT_DELEGATED` は通知（0 に寄与）とし、委譲スコープとして使えない `CGROUP_NOT_DOMAIN` と cgroup v2 が
+//!   無い `CGROUP_V2_UNAVAILABLE`（CORE-4）は Warning とする。判定できなかった場合は `CGROUP_INCONCLUSIVE`（4）。
 //!
 //! # 未実装（REPAIR-3）
-//! - user マネージャのソケットへ実際に connect して死んだソケットを見分ける検査（現状は lstat での存在・種別・所有者のみ）。
-//! - CLI 自身の cgroup の委譲の検査（`delete` が検出に失敗する環境の診断。`commands::stop_delete` の doc 参照）。
+//! - `start` の事前検査への connect の追加（`start` の挙動の変更になるため別判断）。
+//! - `delete` が検出に失敗したときに記録の経路へ回すこと（`commands::stop_delete` の doc 参照）。
+
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 use super::{DoctorExitStatus, DoctorSeverity};
 use crate::json::json_escape;
@@ -111,12 +124,35 @@ pub enum SystemdRunState {
 /// user マネージャへの到達の状態。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserManagerState {
-    /// `<XDG_RUNTIME_DIR>/systemd/private` が自分のソケットとして存在する。
+    /// `<XDG_RUNTIME_DIR>/systemd/private` が自分のソケットとして存在し、実際に接続できた。
     Reachable,
+    /// ソケットのファイルはあるが listener がいない（死んだソケット）。
+    SocketRefused,
+    /// listen backlog が満杯のまま期限を過ぎた。
+    ConnectTimedOut,
+    /// 接続を試みられなかった・その他の I/O エラー。
+    ConnectInconclusive,
     /// `XDG_RUNTIME_DIR` が未設定・空・相対パス。
     RuntimeDirUnset,
     /// `systemd/private` に届かない。
     Unreachable,
+    /// 検査しなかった（rootful・判定不能・対象外 OS）。
+    NotChecked,
+}
+
+/// CLI 自身の cgroup の委譲の状態（`DelegatedCgroup::detect()` の結果の写像。`delete` と同じ検出）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CgroupDelegationState {
+    /// 委譲されている。
+    Delegated,
+    /// 委譲されていない（root cgroup を非 root で使う・所有者の不一致）。
+    NotDelegated,
+    /// `cgroup.type` が `domain` でない等、委譲スコープとして使えない。
+    NotDomain,
+    /// cgroup v2 の unified hierarchy が無い。
+    NoCgroup2,
+    /// 読み取り・open の失敗等で判定できない。
+    Unreadable,
     /// 検査しなかった（rootful・判定不能・対象外 OS）。
     NotChecked,
 }
@@ -130,6 +166,8 @@ pub struct UserScopeFindings {
     pub systemd_run: SystemdRunState,
     /// user マネージャの状態。
     pub user_manager: UserManagerState,
+    /// CLI 自身の cgroup の委譲の状態。
+    pub cgroup: CgroupDelegationState,
 }
 
 /// 結論。
@@ -156,7 +194,7 @@ pub struct UserScopeDiagnostic {
     pub message: &'static str,
     /// 対処の案内。
     pub remediation: Vec<&'static str>,
-    /// どの検査か（`privilege` / `systemd_run` / `user_manager`）。
+    /// どの検査か（`privilege` / `systemd_run` / `user_manager` / `cgroup`）。
     pub check: &'static str,
     /// 状態のトークン。
     pub state: &'static str,
@@ -235,6 +273,8 @@ pub fn evaluate(f: &UserScopeFindings) -> UserScopeReport {
         PrivilegeState::Rootless => {}
     }
     let mut diagnostics = Vec::new();
+    // 判定不能の要因（Warning が無いときだけ結論 `Inconclusive` になる）。
+    let mut inconclusive = false;
     match f.systemd_run {
         SystemdRunState::NotFound { on_path } => {
             diagnostics.push(diag(
@@ -292,10 +332,95 @@ pub fn evaluate(f: &UserScopeFindings) -> UserScopeReport {
             "user_manager",
             "unreachable",
         )),
+        UserManagerState::SocketRefused => diagnostics.push(diag(
+            Warning,
+            "USER_MANAGER_SOCKET_REFUSED",
+            "the systemd user manager private socket exists but nothing is listening on it (stale socket); starting a container fails",
+            vec![
+                "Check the user manager with \"systemctl --user status\"",
+                "Restart the user manager by logging in again, or enable lingering with \"loginctl enable-linger\" and re-login",
+            ],
+            "user_manager",
+            "socket_refused",
+        )),
+        UserManagerState::ConnectTimedOut => {
+            inconclusive = true;
+            diagnostics.push(diag(
+                Notice,
+                "USER_MANAGER_CONNECT_TIMED_OUT",
+                "the systemd user manager private socket did not accept a connection before the deadline",
+                vec![
+                    "Check the load of the user manager with \"systemctl --user status\" and re-run fandhe-container doctor",
+                ],
+                "user_manager",
+                "connect_timed_out",
+            ));
+        }
+        UserManagerState::ConnectInconclusive => {
+            inconclusive = true;
+            diagnostics.push(diag(
+                Notice,
+                "USER_MANAGER_CONNECT_INCONCLUSIVE",
+                "a connection to the systemd user manager private socket could not be attempted or failed for an unexpected reason",
+                vec![
+                    "Check the user manager with \"systemctl --user status\" and re-run fandhe-container doctor",
+                ],
+                "user_manager",
+                "connect_inconclusive",
+            ));
+        }
         UserManagerState::Reachable | UserManagerState::NotChecked => {}
+    }
+    match f.cgroup {
+        CgroupDelegationState::NotDelegated => diagnostics.push(diag(
+            Notice,
+            "CGROUP_NOT_DELEGATED",
+            "the cgroup of this process is not delegated to the current user; start is unaffected but delete of a container with a recorded cgroup placement fails from here",
+            vec![
+                "Run delete inside a delegated scope: systemd-run --user --scope -p Delegate=yes -- fandhe-container delete <id>",
+            ],
+            "cgroup",
+            "not_delegated",
+        )),
+        CgroupDelegationState::NotDomain => diagnostics.push(diag(
+            Warning,
+            "CGROUP_NOT_DOMAIN",
+            "the cgroup of this process is not a domain cgroup and cannot be used as a delegated scope",
+            vec![
+                "Run fandhe-container inside a delegated scope: systemd-run --user --scope -p Delegate=yes -- fandhe-container <command>",
+            ],
+            "cgroup",
+            "not_domain",
+        )),
+        CgroupDelegationState::NoCgroup2 => diagnostics.push(diag(
+            Warning,
+            "CGROUP_V2_UNAVAILABLE",
+            "the cgroup v2 unified hierarchy is not available; only cgroups v2 is supported",
+            vec![
+                "Boot with the cgroup v2 unified hierarchy (systemd.unified_cgroup_hierarchy=1) or use a distribution that defaults to it",
+            ],
+            "cgroup",
+            "no_cgroup2",
+        )),
+        CgroupDelegationState::Unreadable => {
+            inconclusive = true;
+            diagnostics.push(diag(
+                Notice,
+                "CGROUP_INCONCLUSIVE",
+                "the cgroup delegation of this process could not be determined",
+                vec![
+                    "Check that /proc and /sys/fs/cgroup are mounted and readable, then re-run fandhe-container doctor",
+                ],
+                "cgroup",
+                "unreadable",
+            ));
+        }
+        CgroupDelegationState::Delegated | CgroupDelegationState::NotChecked => {}
     }
     let outcome = if diagnostics.iter().any(|d| d.severity == Warning) {
         UserScopeOutcome::Warning
+    } else if inconclusive {
+        UserScopeOutcome::Inconclusive
     } else {
         UserScopeOutcome::Ok
     };
@@ -369,6 +494,7 @@ pub fn collect() -> UserScopeFindings {
                 privilege: PrivilegeState::Rootful,
                 systemd_run: SystemdRunState::NotChecked,
                 user_manager: UserManagerState::NotChecked,
+                cgroup: CgroupDelegationState::NotChecked,
             };
         }
         Identity::Unreadable => {
@@ -376,6 +502,7 @@ pub fn collect() -> UserScopeFindings {
                 privilege: PrivilegeState::Unreadable,
                 systemd_run: SystemdRunState::NotChecked,
                 user_manager: UserManagerState::NotChecked,
+                cgroup: CgroupDelegationState::NotChecked,
             };
         }
     };
@@ -404,10 +531,20 @@ pub fn collect() -> UserScopeFindings {
             }
         }),
     };
-    use fandhe_container_supervisor::user_scope::{UserManagerError, user_manager_env};
+    use fandhe_container_supervisor::user_scope::{
+        UserManagerConnectError, UserManagerError, probe_user_manager_socket, user_manager_env,
+    };
     let user_manager = match user_manager_env(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), euid)
     {
-        Ok(_) => UserManagerState::Reachable,
+        Ok(xdg) => {
+            match probe_user_manager_socket(&xdg, Instant::now() + USER_MANAGER_CONNECT_TIMEOUT) {
+                Ok(()) => UserManagerState::Reachable,
+                Err(UserManagerConnectError::Refused) => UserManagerState::SocketRefused,
+                Err(UserManagerConnectError::TimedOut) => UserManagerState::ConnectTimedOut,
+                // 試せなかった・その他の I/O エラー、および将来追加される理由は判定不能（fail-closed）。
+                Err(_) => UserManagerState::ConnectInconclusive,
+            }
+        }
         Err(UserManagerError::RuntimeDirUnset) => UserManagerState::RuntimeDirUnset,
         Err(_) => UserManagerState::Unreachable,
     };
@@ -415,6 +552,35 @@ pub fn collect() -> UserScopeFindings {
         privilege: PrivilegeState::Rootless,
         systemd_run,
         user_manager,
+        cgroup: collect_cgroup(),
+    }
+}
+
+/// user マネージャのソケットへの接続の期限（REPAIR-5）。
+#[cfg(target_os = "linux")]
+const USER_MANAGER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `delete` と同じ `DelegatedCgroup::detect()` を呼び、`code` と `step` だけを状態へ写す（読み取りのみ。
+/// `message` は載せない）。未知の段・コードは `Unreadable`（fail-closed）。
+#[cfg(target_os = "linux")]
+fn collect_cgroup() -> CgroupDelegationState {
+    use fandhe_container_core::cgroups::{CgroupStep, DelegatedCgroup};
+    use fandhe_container_core::traits::ErrorCode;
+    match DelegatedCgroup::detect() {
+        Ok(_) => CgroupDelegationState::Delegated,
+        Err(e) => match (e.code, e.step) {
+            (ErrorCode::PermissionDenied, CgroupStep::CheckDelegation) => {
+                CgroupDelegationState::NotDelegated
+            }
+            (ErrorCode::FailedPrecondition, CgroupStep::CheckDelegation) => {
+                CgroupDelegationState::NotDomain
+            }
+            (
+                ErrorCode::FailedPrecondition,
+                CgroupStep::ReadSelfCgroup | CgroupStep::VerifyCgroup2,
+            ) => CgroupDelegationState::NoCgroup2,
+            _ => CgroupDelegationState::Unreadable,
+        },
     }
 }
 
@@ -425,6 +591,7 @@ pub fn collect() -> UserScopeFindings {
         privilege: PrivilegeState::Unsupported,
         systemd_run: SystemdRunState::NotChecked,
         user_manager: UserManagerState::NotChecked,
+        cgroup: CgroupDelegationState::NotChecked,
     }
 }
 
@@ -441,6 +608,21 @@ mod tests {
             privilege,
             systemd_run,
             user_manager,
+            cgroup: CgroupDelegationState::Delegated,
+        }
+    }
+
+    fn with_cgroup(
+        user_manager: UserManagerState,
+        cgroup: CgroupDelegationState,
+    ) -> UserScopeFindings {
+        UserScopeFindings {
+            cgroup,
+            ..findings(
+                PrivilegeState::Rootless,
+                SystemdRunState::Trusted,
+                user_manager,
+            )
         }
     }
 
@@ -613,6 +795,131 @@ mod tests {
         );
     }
 
+    /// CORE-3・REPAIR-5: 死んだソケットは Warning（3）、backlog 満杯・試せなかった場合は通知で判定不能（4）。
+    #[test]
+    fn core3_repair5_connect_states() {
+        let r = evaluate(&with_cgroup(
+            UserManagerState::SocketRefused,
+            CgroupDelegationState::Delegated,
+        ));
+        assert_eq!(codes(&r), ["USER_MANAGER_SOCKET_REFUSED"]);
+        assert_eq!(r.diagnostics[0].severity, DoctorSeverity::Warning);
+        assert_eq!(r.diagnostics[0].check, "user_manager");
+        assert_eq!(r.diagnostics[0].state, "socket_refused");
+        assert_eq!(r.diagnostics[0].remediation.len(), 2);
+        assert_eq!(r.exit_status().code(), 3);
+
+        for (st, code, token) in [
+            (
+                UserManagerState::ConnectTimedOut,
+                "USER_MANAGER_CONNECT_TIMED_OUT",
+                "connect_timed_out",
+            ),
+            (
+                UserManagerState::ConnectInconclusive,
+                "USER_MANAGER_CONNECT_INCONCLUSIVE",
+                "connect_inconclusive",
+            ),
+        ] {
+            let r = evaluate(&with_cgroup(st, CgroupDelegationState::Delegated));
+            assert_eq!(codes(&r), [code]);
+            assert_eq!(r.diagnostics[0].severity, DoctorSeverity::Notice);
+            assert_eq!(r.diagnostics[0].state, token);
+            assert_eq!(r.diagnostics[0].remediation.len(), 1);
+            assert_eq!(r.outcome, UserScopeOutcome::Inconclusive);
+            assert_eq!(r.exit_status().code(), 4);
+        }
+    }
+
+    /// OCI-6・CORE-3・CORE-4: cgroup の状態ごとのコード・重大度・終了コード。委譲されていないだけなら 0。
+    #[test]
+    fn oci6_core4_cgroup_states() {
+        let cases = [
+            (
+                CgroupDelegationState::NotDelegated,
+                "CGROUP_NOT_DELEGATED",
+                DoctorSeverity::Notice,
+                "not_delegated",
+                0,
+            ),
+            (
+                CgroupDelegationState::NotDomain,
+                "CGROUP_NOT_DOMAIN",
+                DoctorSeverity::Warning,
+                "not_domain",
+                3,
+            ),
+            (
+                CgroupDelegationState::NoCgroup2,
+                "CGROUP_V2_UNAVAILABLE",
+                DoctorSeverity::Warning,
+                "no_cgroup2",
+                3,
+            ),
+            (
+                CgroupDelegationState::Unreadable,
+                "CGROUP_INCONCLUSIVE",
+                DoctorSeverity::Notice,
+                "unreadable",
+                4,
+            ),
+        ];
+        for (st, code, sev, token, exit) in cases {
+            let r = evaluate(&with_cgroup(UserManagerState::Reachable, st));
+            assert_eq!(codes(&r), [code]);
+            assert_eq!(r.diagnostics[0].severity, sev);
+            assert_eq!(r.diagnostics[0].check, "cgroup");
+            assert_eq!(r.diagnostics[0].state, token);
+            assert_eq!(r.diagnostics[0].remediation.len(), 1);
+            assert_eq!(r.exit_status().code(), exit, "{code}");
+        }
+        let r = evaluate(&with_cgroup(
+            UserManagerState::Reachable,
+            CgroupDelegationState::NotChecked,
+        ));
+        assert!(r.diagnostics.is_empty());
+    }
+
+    /// CORE-3・OCI-6: 重大度の合成は Warning > 判定不能 > 通知のみ。
+    #[test]
+    fn core3_outcome_composition() {
+        let r = evaluate(&with_cgroup(
+            UserManagerState::SocketRefused,
+            CgroupDelegationState::NotDelegated,
+        ));
+        assert_eq!(
+            codes(&r),
+            ["USER_MANAGER_SOCKET_REFUSED", "CGROUP_NOT_DELEGATED"]
+        );
+        assert_eq!(r.exit_status().code(), 3);
+        let r = evaluate(&with_cgroup(
+            UserManagerState::ConnectTimedOut,
+            CgroupDelegationState::NotDomain,
+        ));
+        assert_eq!(r.exit_status().code(), 3);
+        let r = evaluate(&with_cgroup(
+            UserManagerState::ConnectTimedOut,
+            CgroupDelegationState::NotDelegated,
+        ));
+        assert_eq!(r.exit_status().code(), 4);
+    }
+
+    /// REPAIR-2・ERR-1: cgroup 診断の JSON Lines の 1 行を全文で固定する。
+    #[test]
+    fn oci6_cgroup_json_lines_shape() {
+        let r = evaluate(&with_cgroup(
+            UserManagerState::Reachable,
+            CgroupDelegationState::NotDelegated,
+        ));
+        let mut buf = Vec::new();
+        r.write_json_lines(&mut buf).expect("write");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert_eq!(
+            text,
+            "{\"severity\":\"notice\",\"code\":\"CGROUP_NOT_DELEGATED\",\"message\":\"the cgroup of this process is not delegated to the current user; start is unaffected but delete of a container with a recorded cgroup placement fails from here\",\"remediation\":[\"Run delete inside a delegated scope: systemd-run --user --scope -p Delegate=yes -- fandhe-container delete <id>\"],\"check\":\"cgroup\",\"state\":\"not_delegated\"}\n"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     mod linux {
         use super::super::*;
@@ -640,6 +947,10 @@ mod tests {
                 f.privilege,
                 PrivilegeState::Rootless | PrivilegeState::Rootful
             ));
+            // GitHub ホステッドランナーは root 所有の cgroup にいて `NotDelegated` になりうるため、具体値は固定しない。
+            if f.privilege == PrivilegeState::Rootless {
+                assert_ne!(f.cgroup, CgroupDelegationState::NotChecked);
+            }
         }
     }
 }

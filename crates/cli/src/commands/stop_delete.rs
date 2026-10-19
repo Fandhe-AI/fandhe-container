@@ -39,7 +39,7 @@
 //!   （案 B）は「検出は成功したがスコープが食い違う」場合だけを対象にしている。技術的には `remove_recorded` は
 //!   `RecordedCgroupScope::open` が委譲（所有者・`cgroup.type`）を独立に検証し直すため、検出の失敗を回しても検証が抜ける
 //!   わけではない。なお、通常のログインセッション（SSH・TTY ログイン。`session-N.scope` が root 所有）から `delete` すると
-//!   検出が失敗し、cgroup の配置を記録したコンテナは消せない。回避策は委譲されたスコープの中で実行すること
+//!   検出が失敗し、cgroup の配置を記録したコンテナは消せない（`doctor` の `CGROUP_NOT_DELEGATED` で事前に確かめられる。#2158）。回避策は委譲されたスコープの中で実行すること
 //!   （`systemd-run --user --scope -p Delegate=yes -- fandhe-container delete <id>`。検出が成功し、スコープの不一致から
 //!   記録の経路へ入る）。検出の失敗を記録の経路へ回すかはオーナー判断待ち（core の契約の変更になる）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4）。非 Linux では `production_runtime` が

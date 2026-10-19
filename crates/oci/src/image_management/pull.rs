@@ -22,7 +22,7 @@
 //!   不可分に行う）と、失敗・中断時のロールバック（リース解放とステージング削除）は #475。
 //!   `PullSession` に `Drop` は実装しない。drop 後もリースとステージングは残る（余分に残す側）。
 //! - クラッシュ後に残ったリース・ステージングの回収 GC は #852・#477。
-//! - `system df` でのステージング容量の集計。永続化は #853・#854・#851。
+//! - 永続化は #853・#854・#851（`system df` のステージング容量の集計は `usage` で実装済み。#2222）。
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -37,7 +37,7 @@ use crate::instrument::{OciOpKind, OciOpRecorder, record_oci_op};
 use crate::reference::Digest;
 
 /// ストア root 直下のステージング領域名。GC・`image ls` の走査対象外。
-const STAGING_DIR_NAME: &str = "staging";
+pub(super) const STAGING_DIR_NAME: &str = "staging";
 
 /// 1 つの pull セッションが触れる blob 件数の上限（config 1 件 + layers）。
 const MAX_SESSION_BLOBS: usize = MAX_COMPOSITION_LAYERS + 1;

@@ -1,7 +1,7 @@
 //! `image ls` / `system df` 集計 API の結合試験（OCI-7・TASK-183.3・#478）。
 //!
 //! 公開 API だけを通し、既知サイズの blob を持つフィクスチャの実サイズと表示値を照合する。
-//! CLI 経路・展開後サイズ・containers の容量は未実装のため対象外。
+//! 展開後サイズ・staging・containers の合成は `system_df_containers.rs`（#2222）、CLI 経路は未実装のため対象外（#2221）。
 
 use std::fs;
 use std::path::PathBuf;
@@ -96,6 +96,23 @@ fn oci7_ls_returns_repository_tag_digest_size() {
     assert_eq!(e.digest, d(0xa0));
     assert_eq!(e.size_bytes, 4096 + 123_457 + 10_000);
     assert!(e.missing_blobs.is_empty());
+}
+
+/// OCI-7・#2222: 公開 API の `disk_usage` は staging を別計上し、未計測の containers・expanded は `None`。
+#[test]
+fn oci7_df_reports_staging_separately_and_leaves_unmeasured_none() {
+    let f = fixture("df-staging");
+    let pull = f.root.join("staging").join("p1");
+    fs::create_dir_all(&pull).expect("mkdir");
+    fs::write(pull.join("aa"), vec![0u8; 321]).expect("write");
+    let u = f.table.disk_usage(&f.root).expect("df");
+    assert_eq!(u.staging.pulls, 1);
+    assert_eq!(u.staging.file_count, 1);
+    assert_eq!(u.staging.bytes, 321);
+    assert_eq!(u.cache.bytes, 141_656);
+    assert_eq!(u.images.bytes, 141_656);
+    assert!(u.containers.is_none());
+    assert!(u.expanded.is_none());
 }
 
 /// OCI-7: `blobs/sha256` が通常ファイルなら `system df` は FailedPrecondition（公開契約）。

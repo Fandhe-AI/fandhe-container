@@ -20,7 +20,7 @@
 //!   `remove` で実装済み（永続化・fsync・削除途中のクラッシュの再試行は #851、CLI 配線は未実装）
 //! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（CLI 経路と永続化は未実装）
 //! - `image prune` 本体は `prune` モジュールで実装済み（#476）。`rm`・`prune` の CLI 配線（#476・#480・#481）。`image ls`/`system df` の集計 API は
-//!   `usage`（#478・TASK-183.3）で実装済み（CLI 経路は未実装）
+//!   `usage`（#478・TASK-183.3）で実装済み（staging の容量・コンテナ容量の受け口・展開後サイズの二段階 API は #2222。CLI 経路は未実装）
 //! - pull のリース登録とステージング書き込みは `pull`（#474・TASK-183.9）で実装済み。公開と
 //!   失敗時のロールバックは #475
 //! - テーブル全体の件数上限（永続化の読み込み側で判断する）
@@ -54,7 +54,10 @@ pub use prune::{ImagePruneOutcome, ImagePrunePlan};
 
 mod usage;
 
-pub use usage::{CacheUsage, DiskUsage, ImageEntry, ImageList, ImageUsage, MAX_CACHE_SCAN_ENTRIES};
+pub use usage::{
+    CacheUsage, ContainersUsage, DiskUsage, ExpandedSizePlan, ExpandedUsage, ImageEntry, ImageList,
+    ImageUsage, MAX_CACHE_SCAN_ENTRIES, MAX_EXPANDED_SCAN_BYTES, StagingUsage,
+};
 
 mod pull;
 pub use pull::{BlobReuse, LeasedBlob, PullSession};

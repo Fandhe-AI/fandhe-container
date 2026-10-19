@@ -589,6 +589,16 @@ impl FileStateStore {
         let Ok(dto) = serde_json::from_slice::<StateDto>(&bytes) else {
             return Ok(RecordHealth::Corrupted(internal("state file is corrupted")));
         };
+        // 大文字小文字を区別しないファイルシステム（macOS の既定の APFS）では `Web` と `web` が同じ
+        // ディレクトリに解決される。中身が「大文字小文字だけ違う別の ID」の健全な記録なら、破損では
+        // なく ID の衝突なので `Err` で返す（`purge_corrupted` が他 ID の健全な記録を消さない。
+        // IO-5・OCI-5。fail-closed）。
+        if dto.id != id.as_str() && dto.id.eq_ignore_ascii_case(id.as_str()) {
+            return Err(err(
+                ErrorCode::FailedPrecondition,
+                "state directory is shared with a container id that differs only in case",
+            ));
+        }
         match dto.into_record(id) {
             Ok(record) => Ok(RecordHealth::Healthy(record)),
             Err(e) => Ok(RecordHealth::Corrupted(e)),
@@ -3772,6 +3782,21 @@ mod tests {
             store.purge_corrupted(&cid(id)).unwrap();
         }
         assert!(store.list(&list_req(10)).unwrap().records().is_empty());
+    }
+
+    /// IO-5・OCI-5: 大文字小文字だけ違う ID が同じディレクトリに解決される環境（macOS の既定の APFS）を
+    /// ディレクトリの改名で再現し、`web` の回復操作が `Web` の健全な記録を消さないことを確かめる。
+    #[test]
+    fn io5_case_colliding_id_does_not_purge_healthy_record() {
+        let t = TmpDir::new("casecollide");
+        let store = t.open();
+        create(&store, "Web");
+        fs::rename(t.path().join("Web"), t.path().join("web")).unwrap();
+        assert_eq!(
+            code(store.purge_corrupted(&cid("web"))),
+            "FAILED_PRECONDITION"
+        );
+        assert!(t.path().join("web").join("state.json").exists());
     }
 
     /// OCI-5: 書き込み側の上限を超える bundle を持つ state.json は破損として扱い、回復できる。

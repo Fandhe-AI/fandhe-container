@@ -43,6 +43,10 @@ const O_NOFOLLOW: i32 = 0x0100;
 
 /// `ACL_TYPE_EXTENDED`（`sys/acl.h`）。
 const ACL_TYPE_EXTENDED: u32 = 0x0000_0100;
+/// `ACL_FIRST_ENTRY`（`sys/acl.h`。`acl_get_entry` の `entry_id`）。
+const ACL_FIRST_ENTRY: c_int = 0;
+/// `EINVAL`（`sys/errno.h`。`acl_get_entry` が「エントリなし」で返す）。
+const EINVAL: i32 = 22;
 
 // SAFETY（宣言そのものの妥当性）: いずれも libSystem の関数。`uid_t geteuid(void)`、
 // `acl_t acl_get_link_np(const char *, acl_type_t)`（`acl_t` は不透明ポインタ・`acl_type_t` は
@@ -50,6 +54,7 @@ const ACL_TYPE_EXTENDED: u32 = 0x0000_0100;
 unsafe extern "C" {
     fn geteuid() -> u32;
     fn acl_get_link_np(path: *const c_char, acl_type: u32) -> *mut c_void;
+    fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry_p: *mut *mut c_void) -> c_int;
     fn acl_free(obj: *mut c_void) -> c_int;
 }
 
@@ -89,8 +94,20 @@ pub(crate) fn has_extended_acl(path: &Path) -> Result<bool, SysError> {
             Err(SysError::Os)
         };
     }
+    // 成功しても空の ACL（エントリ 0 件）は「ACL なし」の結果なので、エントリの有無を確かめる。
+    let mut entry: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `acl` は直前に得た非 NULL の `acl_t`（まだ解放していない）、`entry` は有効な書き込み先。
+    let rc = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &mut entry) };
+    let errno = std::io::Error::last_os_error().raw_os_error();
     // SAFETY: `acl` は `acl_get_link_np` が返した非 NULL の `acl_t` で、他に所有者がいない。
-    // ここで 1 回だけ解放し、以後は使わない（リーク防止）。
+    // ここで 1 回だけ解放し、以後は使わない（リーク防止）。`entry` は `acl` の内部を指すため解放後は使わない。
     let _ = unsafe { acl_free(acl) };
-    Ok(true)
+    if rc == 0 {
+        Ok(!entry.is_null())
+    } else if errno == Some(EINVAL) {
+        // 先頭エントリが無い（空の ACL）。
+        Ok(false)
+    } else {
+        Err(SysError::Os)
+    }
 }

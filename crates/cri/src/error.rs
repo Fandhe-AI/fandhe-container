@@ -11,6 +11,9 @@
 //!
 //! `PermissionDenied`・`ResourceExhausted` は既存の CRI 実装が返しているが ERR-3 の表に無い拡張で、
 //! spec への反映要否は報告事項とする。
+//!
+//! `PullError` の `AlreadyExists` は意図して `INTERNAL` に写す（`ALREADY_EXISTS` にしない。
+//! 理由は `From<PullError> for CriError` の doc。ERR-3・TASK-97・#2321）。
 
 use std::fmt;
 
@@ -188,6 +191,16 @@ impl From<&TraitError> for CriError {
 }
 
 /// image pull の失敗を写す。未知の区分は fail-closed で `Internal`。
+///
+/// `OciErrorCode::AlreadyExists` は意図して `Internal`（gRPC `INTERNAL`）に写す（ERR-3・CRI-3・TASK-97・#2321）。
+/// ERR-3 の `ALREADY_EXISTS` は Create 系の同一コンテナ・同一 Pod サンドボックス専用で、CRI の
+/// `PullImage` は冪等（取得済みでも成功）なため当たらない。`ALREADY_EXISTS` を返すと
+/// 「既にある＝成功」と取り違えられる余地も生じる。将来の発生源（レイヤー展開の IO-5 名前衝突、
+/// `image_management` のリース・manifest 衝突。TASK-183・OCI-7）はイメージ内容の不整合かランタイム内部の
+/// 整合性の問題で、`INVALID_ARGUMENT` にも `FAILED_PRECONDITION` にも当たらず、ERR-3 の
+/// 「いずれにも分類されない内部エラー」に属する。別の区分が要る発生源は、oci 側か配線する側で
+/// 区分を変換してから渡す（`registry.rs` が io の `AlreadyExists` を `FailedPrecondition` へ
+/// 変換する先例と同様）。
 impl From<PullError> for CriError {
     fn from(err: PullError) -> Self {
         let code = match err.code() {
@@ -200,6 +213,7 @@ impl From<PullError> for CriError {
             OciErrorCode::DataLoss => CriErrorCode::DataLoss,
             OciErrorCode::ResourceExhausted => CriErrorCode::ResourceExhausted,
             OciErrorCode::FailedPrecondition => CriErrorCode::FailedPrecondition,
+            OciErrorCode::AlreadyExists => CriErrorCode::Internal,
             _ => CriErrorCode::Internal,
         };
         Self::new(code, err.message())
@@ -355,6 +369,7 @@ mod tests {
             (OciErrorCode::DataLoss, Code::DataLoss),
             (OciErrorCode::ResourceExhausted, Code::ResourceExhausted),
             (OciErrorCode::FailedPrecondition, Code::FailedPrecondition),
+            (OciErrorCode::AlreadyExists, Code::Internal),
         ];
         for (oc, expected) in cases {
             let pe = PullError::new(oc, "msg");

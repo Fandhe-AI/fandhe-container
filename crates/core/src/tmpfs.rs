@@ -11,8 +11,10 @@
 //! # 契約
 //!
 //! - `nosuid`・`nodev` は常に付与し、外せない（SEC-1 の fail-closed）
-//! - マウント先は [`MountDestination`]（字句正規化・`..` 拒否）で検証する。`/proc` とその配下・`/dev`
-//!   そのものは覆い隠しになるため拒否する。重複と件数上限（[`TMPFS_MAX_MOUNTS`]）も拒否する
+//! - マウント先は [`MountDestination`]（字句正規化・`..` 拒否）で検証する。`/proc` とその配下・`/sys` とその配下・`/dev`
+//!   そのものは覆い隠しになるため拒否する（`/sys` 配下は `readonly_paths` の RDONLY が子マウントに及ばず
+//!   書き込み可能のまま残るため。黙って読み取り専用へ丸めず拒否する。Docker の `--tmpfs` は受けるが本実装は
+//!   差がある。SEC-2・#2233。受け入れを広げる場合も必ず本 `push` を通すこと）。重複と件数上限（[`TMPFS_MAX_MOUNTS`]）も拒否する
 //! - `/dev/shm` は暗黙の固定集合として常に載せる（オーナー判断 2・`docs/design/dev-default-mounts.md` 3.4・
 //!   TASK-29 追補・#1654）。[`TmpfsMountSet::ensure_default_dev_shm`] が、集合に `/dev/shm` が無いときだけ
 //!   既定（[`DEFAULT_DEV_SHM_SIZE_BYTES`]）の件を足す。`--shm-size` も `--tmpfs /dev/shm` も利用者の指定として
@@ -201,6 +203,11 @@ impl TmpfsMountSet {
         if dest == "/proc" || dest.starts_with("/proc/") {
             return Err(invalid("tmpfs must not be mounted on /proc or below"));
         }
+        // `/sys` 配下の利用者 tmpfs は sysfs を覆い隠し、`readonly_paths` の RDONLY（mount top のみ）が
+        // 子マウントへ及ばず書き込み可能のまま残る。黙って ro に丸めず拒否する（SEC-2・#2233）。
+        if dest == "/sys" || dest.starts_with("/sys/") {
+            return Err(invalid("tmpfs must not be mounted on /sys or below"));
+        }
         if dest == "/dev" {
             return Err(invalid("tmpfs must not be mounted on /dev itself"));
         }
@@ -387,6 +394,14 @@ mod tests {
         let below_proc = "tmpfs must not be mounted on /proc or below";
         assert_eq!(rejected(&mut set, "/proc"), invalid(below_proc));
         assert_eq!(rejected(&mut set, "/proc/sys"), invalid(below_proc));
+        let below_sys = "tmpfs must not be mounted on /sys or below";
+        for d in ["/sys", "/sys/fs/cgroup", "/sys/kernel/x"] {
+            assert_eq!(rejected(&mut set, d), invalid(below_sys), "{d}");
+        }
+        // 前方一致するだけの兄弟は拒否しない。
+        let mut siblings = TmpfsMountSet::new();
+        siblings.push(spec("/sysx")).expect("sibling sysx");
+        siblings.push(spec("/system")).expect("sibling system");
         assert_eq!(
             rejected(&mut set, "/dev"),
             invalid("tmpfs must not be mounted on /dev itself")

@@ -20,9 +20,9 @@ fn exe_target() -> fandhe_container_plugin::PluginLaunchTarget {
 #[test]
 fn plug7_mode_selection_requires_unix_transport() {
     use fandhe_container_plugin::{Frame, PluginModeKind};
-    use fandhe_container_plugin::{OneShotPlugin, PluginErrorCode, PluginMode, PluginSession};
+    use fandhe_container_plugin::{PluginErrorCode, PluginLaunchSpec, PluginMode, PluginSession};
     let dir = std::env::temp_dir();
-    let plugin = OneShotPlugin::new(exe_target(), vec![], dir).unwrap();
+    let plugin = PluginLaunchSpec::new(exe_target(), vec![], dir).unwrap();
     let err = PluginSession::start(
         &plugin,
         PluginMode::resident(),
@@ -49,8 +49,8 @@ fn plug7_mode_selection_requires_unix_transport() {
 #[cfg(unix)]
 mod unix {
     use fandhe_container_plugin::{
-        Frame, OneShotPlugin, OneShotTermination, PLUGIN_SOCKET_ENV, PluginErrorCode, PluginMode,
-        PluginModeKind, PluginSession, PluginSessionShutdown, RpcTimeout, UdsStream,
+        Frame, OneShotTermination, PLUGIN_SOCKET_ENV, PluginErrorCode, PluginLaunchSpec,
+        PluginMode, PluginModeKind, PluginSession, PluginSessionShutdown, RpcTimeout, UdsStream,
     };
     use std::ffi::OsString;
     use std::os::unix::fs::DirBuilderExt;
@@ -120,12 +120,12 @@ mod unix {
         }
     }
 
-    fn plugin_for(dir: &TempDir) -> OneShotPlugin {
+    fn plugin_for(dir: &TempDir) -> PluginLaunchSpec {
         let args: Vec<OsString> = ["--exact", "unix::plugin_child_entry", "--test-threads=1"]
             .iter()
             .map(OsString::from)
             .collect();
-        OneShotPlugin::new(super::exe_target(), args, dir.0.clone()).unwrap()
+        PluginLaunchSpec::new(super::exe_target(), args, dir.0.clone()).unwrap()
     }
 
     fn ping() -> Frame {
@@ -352,7 +352,7 @@ mod unix {
             program,
         )
         .unwrap();
-        let plugin = OneShotPlugin::new(target, vec![], dir.0.clone()).unwrap();
+        let plugin = PluginLaunchSpec::new(target, vec![], dir.0.clone()).unwrap();
 
         let e = PluginSession::start(
             &plugin,

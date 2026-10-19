@@ -61,7 +61,8 @@
 //! # 単体テストの安全策
 //!
 //! 新マウント API は `cfg(test)` では dry-run に差し替わる（`mount_tmpfs_syscall`）。実機での挙動は結合試験
-//! `tests/tmpfs_mount.rs`（`-- --ignored`）で確認する。
+//! `tests/tmpfs_mount.rs`（`-- --ignored`）で確認する。マウントの失敗は `tests::MOUNT_FAIL` で注入できる
+//! （#2248・SEC-2・REPAIR-12）。
 
 use std::ffi::{CString, OsStr};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
@@ -602,11 +603,16 @@ pub(super) fn mount_tmpfs_syscall(
 
 /// dry-run: 新マウント API を呼ばず、(付け替え先の fd が指す実体・attr フラグ・`mode`/`size` の表記) を記録し、
 /// 付け替え先の fd の複製を「自分のマウント」として返す（実機の挙動は結合試験で確かめる）。
+/// `tests::MOUNT_FAIL` に積んだ失敗は、記録の前に 1 回だけ返す（マウント失敗の注入口。#2248・SEC-2・
+/// REPAIR-12。失敗したマウントは `CALLS` に載らない）。
 #[cfg(test)]
 pub(super) fn mount_tmpfs_syscall(
     target_dir: BorrowedFd<'_>,
     create: sys::TmpfsCreate,
 ) -> Result<OwnedFd, SysError> {
+    if let Some(e) = tests::MOUNT_FAIL.with(|f| f.take()) {
+        return Err(e);
+    }
     let resolved = std::fs::read_link(format!("/proc/thread-self/fd/{}", target_dir.as_raw_fd()))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -655,6 +661,13 @@ pub(super) mod tests {
     thread_local! {
         pub(in crate::exec) static UMOUNTS: std::cell::RefCell<Vec<String>> =
             const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    thread_local! {
+        /// 次の `mount_tmpfs_syscall` に返させる失敗（tmpfs マウント失敗の注入用。1 回で消える。
+        /// #2248・SEC-2・REPAIR-12）。
+        pub(in crate::exec) static MOUNT_FAIL: std::cell::Cell<Option<SysError>> =
+            const { std::cell::Cell::new(None) };
     }
 
     thread_local! {
@@ -1094,6 +1107,39 @@ pub(super) mod tests {
                 plain.message
             )
         );
+    }
+
+    /// SEC-2・REPAIR-12（#2248）: 注入したマウント失敗は、失敗した件を記録せず、先にマウントした分だけを
+    /// 外して自動作成した先を消し、errno 由来の code と message を返す。
+    #[test]
+    fn sec2_repair12_2248_injected_mount_failure_rolls_back_earlier_mounts() {
+        let tmp = Tmp::new("mountfail");
+        let _ = take_calls();
+        let _ = take_umounts();
+        let fd = tmp.fd();
+        let s = set(&[("/scratch/a", None), ("/scratch/b", None)]);
+        let count = std::cell::Cell::new(0usize);
+        let hook = || {
+            count.set(count.get() + 1);
+            if count.get() == 2 {
+                MOUNT_FAIL.with(|f| f.set(Some(SysError::Os(sys::EPERM))));
+            }
+        };
+        let err = mount_tmpfs_at(fd.as_fd(), &s, &not_shared, &hook).expect_err("mount fail");
+        MOUNT_FAIL.with(|f| f.set(None));
+        assert_eq!(err.stage, IsolationStage::MountTmpfs);
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert!(err.violation.is_none());
+        assert_eq!(
+            err.message,
+            "mount(tmpfs on /scratch/b) failed: Operation not permitted (os error 1)"
+        );
+        assert_eq!(take_calls().len(), 1);
+        assert_eq!(
+            take_umounts(),
+            vec![tmp.0.join("scratch/a").to_string_lossy().into_owned()]
+        );
+        assert!(!tmp.0.join("scratch").exists());
     }
 
     /// REPAIR-4（#1620）: 併記する宛先は違反記録と同じエスケープを通す（ログ注入の防止）。

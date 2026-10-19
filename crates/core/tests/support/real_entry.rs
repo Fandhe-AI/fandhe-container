@@ -1,5 +1,5 @@
-//! rootless 系の結合試験（`rootless`・`rootless_file_owner`・`rootless_uid_mapping`）が、代役の init ではなく
-//! 実エントリポイントを exec まで通すための共有部品（CORE-6・SEC-5・SEC-1・CORE-5・REPAIR-3・REPAIR-12。
+//! rootless 系の結合試験（`rootless`・`rootless_file_owner`・`rootless_uid_mapping`）と `production_launcher` の
+//! rootfs 構築の共有部品、および rootless 系が代役の init ではなく実エントリポイントを exec まで通すための共有部品（CORE-6・SEC-5・SEC-1・CORE-5・REPAIR-3・REPAIR-12。
 //! TASK-40.4 追補・#2012）。
 //!
 //! # 背景
@@ -8,12 +8,19 @@
 //! 本モジュールは `StagePipeline::with_landlock` を載せたステージ列で exec まで到達させ、試験バイナリ自身を
 //! rootfs の `/entry` へコピーして `--entry <mode>` で再入させる（実エントリポイント）。
 //!
+//! # 本番 launcher 経由の部品（#2246）
+//! `rootless`・`rootless_file_owner` は本番 `ProductionLauncher` を通すため、launcher の組み立て
+//! （`rootless_launcher`）・単一スレッドへの戻りの待ち（`wait_single_thread`）・範囲写像の期待値
+//! （`helper_mappings`）・rootfs 構築（`install_entry`・`write_rootless_config`）をここに集約する。
+//! 本番 launcher 経由でも観測値は `/entry-report` のファイルで受ける（実エントリポイントの標準入出力は
+//! `/dev/null` へ置換されるため）。直接ステージ経路（`spawn_real_entry`）は `rootless_uid_mapping` が使う。
+//!
 //! # 取り込み方
 //! 各テストのクレート直下（`#[cfg(target_os = "linux")]`）で `#[path = "support/real_entry.rs"] mod real_entry;`
 //! として取り込む。`tests/support/` には `main.rs` が無いため cargo の自動検出の対象にならない。
 //!
 //! # 契約
-//! - 実エントリポイントの標準入出力は `/dev/null` へ置換される（`StdioNulling::ALL`）ため、観測値は pivot 後の
+//! - 実エントリポイントの標準入出力は `/dev/null` へ置換される（`StdioNulling::ALL`。`spawn_real_entry` と本番 launcher の両方）ため、観測値は pivot 後の
 //!   `/` 直下の報告ファイル（`/entry-report`。`key=value` 行。最終行は `done=1`）へ書き、ホスト側は
 //!   `<rootfs>/entry-report` として読む。rename は使わない（Landlock の REFER 権限に依存しないため）
 //! - Landlock の ABI 6 以上（Linux 6.12 以上）を要する。満たさない環境は検出の失敗で panic（失敗）にし、
@@ -24,30 +31,58 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
 use fandhe_container_core::dev_mounts::ImplicitDevMounts;
 use fandhe_container_core::exec::{
-    ContainerChild, DevptsGidSource, Entrypoint, StagePipeline,
+    ContainerChild, DevptsGidSource, Entrypoint, IsolationPrivilege, StagePipeline,
     spawn_container_with_stages_and_devices,
 };
 use fandhe_container_core::landlock::{
     LandlockRuleset, build_path_rules_with_dev, detect_landlock_abi,
 };
-use fandhe_container_core::oci_runtime::parse_config_bytes;
-use fandhe_container_core::rootless::IdMapSet;
+use fandhe_container_core::oci_runtime::{
+    ProcessLauncher, ProductionLauncher, SubordinateIdSource, parse_config_bytes,
+};
+use fandhe_container_core::rootless::{
+    IdMapSet, SubIdOwner, load_subordinate_ids, rootless_mapping,
+};
+use fandhe_container_core::traits::TraitError;
 
 /// コンテナ内のエントリポイントのパス（rootfs の `/entry`）。
 pub const ENTRY_PATH: &str = "/entry";
 /// エントリポイントが書く報告ファイルの名前（コンテナ内では `/entry-report`）。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub const REPORT_FILE: &str = "entry-report";
 /// 報告ファイル全体の上限（バイト）。無制限の読み取りを避ける。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 const REPORT_MAX_BYTES: u64 = 16 * 1024;
 /// 報告ファイルの行数の上限。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 const REPORT_MAX_LINES: usize = 128;
 
-fn mkdir(path: &Path) {
-    std::fs::create_dir_all(path).unwrap_or_else(|e| panic!("mkdir {}: {e}", path.display()));
+/// `path` までの祖先を 1 階層ずつ `lstat` して非 symlink のディレクトリだけを許容し、無ければ `create_dir` で作って
+/// 0755 にする（`create_dir_all` は途中の symlink を辿るため使わない。基点の bundle は呼び出し元が 0700 で排他作成済み。
+/// #2324・SEC-2）。rootfs 構築の 4 本の試験（`production_launcher`・`rootless`・`rootless_file_owner`・
+/// `rootless_uid_mapping`）が共有する。失敗は panic。
+pub fn mkdir(path: &Path) {
+    let mut chain: Vec<&Path> = path.ancestors().filter(|a| a.parent().is_some()).collect();
+    chain.reverse();
+    for dir in chain {
+        match std::fs::symlink_metadata(dir) {
+            Ok(md) => assert!(
+                md.is_dir() && !md.file_type().is_symlink(),
+                "{} exists and is not a plain directory",
+                dir.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(dir).unwrap_or_else(|e| panic!("mkdir {}: {e}", dir.display()));
+            }
+            Err(e) => panic!("lstat {}: {e}", dir.display()),
+        }
+    }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
         .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
 }
@@ -112,18 +147,21 @@ fn loaded_libraries(exe: &Path) -> Vec<PathBuf> {
     libs
 }
 
-/// 試験バイナリ自身を rootfs の `/entry` へ置き、動的ローダと読み込み済みの共有ライブラリを同じ絶対パスへ
-/// コピーする。`rootfs/proc`（pivot 後に proc を載せる先）も作る。戻り値は config の `env` に渡す
-/// `LD_LIBRARY_PATH` の値。
-pub fn install_entry(rootfs: &Path) -> String {
+/// 試験バイナリ自身を `rootfs/<dest_name>`（0755）へ置き、動的ローダと読み込み済みの共有ライブラリを同じ絶対パスへ
+/// コピーする。`rootfs` と `dirs`（rootfs 直下のディレクトリ名。`proc` など）を先に作る。作成の順序は
+/// 「ディレクトリ → バイナリ → ローダ・共有ライブラリ」。戻り値は config の `env` に渡す `LD_LIBRARY_PATH` の値。
+/// `production_launcher`（`/probe`）と rootless 系 3 本（`/entry`）が配置名とディレクトリ構成だけを変えて呼ぶ。
+pub fn install_binary_at(rootfs: &Path, dest_name: &str, dirs: &[&str]) -> String {
     mkdir(rootfs);
-    mkdir(&rootfs.join("proc"));
+    for d in dirs {
+        mkdir(&rootfs.join(d));
+    }
     let exe = std::env::current_exe().expect("current_exe");
     let exe = std::fs::canonicalize(exe).expect("canonicalize exe");
-    let dest = rootfs.join(ENTRY_PATH.trim_start_matches('/'));
-    std::fs::copy(&exe, &dest).expect("copy the entrypoint binary");
+    let dest = rootfs.join(dest_name);
+    std::fs::copy(&exe, &dest).expect("copy the test binary");
     std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod the entrypoint");
+        .expect("chmod the test binary");
 
     let bytes = std::fs::read(&exe).expect("read exe");
     let mut lib_dirs: Vec<String> = Vec::new();
@@ -143,8 +181,45 @@ pub fn install_entry(rootfs: &Path) -> String {
     lib_dirs.join(":")
 }
 
+/// 試験バイナリ自身を rootfs の `/entry` へ置く（実エントリポイント）。`rootfs/proc`（pivot 後に proc を載せる先）と
+/// `rootfs/dev`（暗黙の /dev のマウント先。無いと本番 launcher が fail-closed で拒否する）も作る。戻り値は config の `env` に渡す `LD_LIBRARY_PATH` の値。
+#[allow(dead_code)] // 取り込み元によっては使わない（`production_launcher` は `install_binary_at` を直接呼ぶ）
+pub fn install_entry(rootfs: &Path) -> String {
+    install_binary_at(rootfs, ENTRY_PATH.trim_start_matches('/'), &["proc", "dev"])
+}
+
+/// rootless 系 2 本（`rootless`・`rootless_file_owner`）が本番 `ProductionLauncher` へ渡す最小の `config.json` を
+/// `bundle/config.json` へ書く（`create_new`）。`root.readonly=false`・`process.user` 0/0・`cwd` `/`・namespaces は
+/// pid / mount / uts / ipc / user。`linux.uidMappings` は書かない（start が拒否する。写像は launcher の責務）。
+/// `args` / `env` は `entry_args` / `entry_env` を渡す。
+#[allow(dead_code)] // 取り込み元によっては使わない（`rootless_uid_mapping`・`production_launcher` は使わない）
+pub fn write_rootless_config(bundle: &Path, hostname: &str, args: &[String], env: &[String]) {
+    let config = serde_json::json!({
+        "ociVersion": "1.2.0",
+        "root": {"path": "rootfs", "readonly": false},
+        "process": {
+            "user": {"uid": 0, "gid": 0},
+            "args": args,
+            "env": env,
+            "cwd": "/"
+        },
+        "hostname": hostname,
+        "linux": {"namespaces": [
+            {"type": "pid"}, {"type": "mount"}, {"type": "uts"}, {"type": "ipc"}, {"type": "user"}
+        ]}
+    });
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(bundle.join("config.json"))
+        .expect("create config.json");
+    f.write_all(&serde_json::to_vec(&config).expect("serialize config"))
+        .expect("write config.json");
+}
+
 /// 実エントリポイントの argv（`/entry --entry <mode>`）。`config.json` の `process.args` と
 /// `entrypoint_from` の入力に使う。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub fn entry_args(mode: &str) -> Vec<String> {
     vec![
         ENTRY_PATH.to_string(),
@@ -154,6 +229,7 @@ pub fn entry_args(mode: &str) -> Vec<String> {
 }
 
 /// 実エントリポイントの環境変数（`PATH=/` と、コピーした共有ライブラリの `LD_LIBRARY_PATH`）。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub fn entry_env(ld_library_path: &str) -> Vec<String> {
     vec![
         "PATH=/".to_string(),
@@ -163,6 +239,7 @@ pub fn entry_env(ld_library_path: &str) -> Vec<String> {
 
 /// argv の先頭をパスとする `Entrypoint` を作る（`rootless` は launcher が受け取った `LaunchSpec` の
 /// `args` / `env`、他の 2 本は `entry_args` / `entry_env` を渡す）。検証（NUL・件数・長さ）は `Entrypoint::new` が行う。
+#[allow(dead_code)] // 直接ステージ経路を使う `rootless_uid_mapping` だけが使う（本番 launcher 経由の試験は使わない）
 pub fn entrypoint_from(args: &[String], env: &[String]) -> Entrypoint {
     let path = args.first().expect("argv must not be empty");
     Entrypoint::new(path, args, env).expect("entrypoint")
@@ -171,6 +248,7 @@ pub fn entrypoint_from(args: &[String], env: &[String]) -> Entrypoint {
 /// `root.readonly=false`・追加 mounts なしの config から、実カーネルの ABI を検出して Landlock ruleset を作る
 /// （fork 前に親が作る）。専用の `/dev` を pivot 前に載せるため `/dev/shm` を除く暗黙の許可を足す
 /// （`fork_exec_isolation` の `landlock-exec` と同じ。#1657）。
+#[allow(dead_code)] // 直接ステージ経路を使う `rootless_uid_mapping` だけが使う（本番 launcher 経由の試験は使わない）
 pub fn landlock_ruleset() -> LandlockRuleset {
     let json = r#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":false},"mounts":[]}"#;
     let config = parse_config_bytes(json.as_bytes()).expect("valid config");
@@ -187,6 +265,7 @@ pub fn landlock_ruleset() -> LandlockRuleset {
 
 /// `with_landlock` を載せたステージ列で実エントリポイントを PID 1 として起動する。呼び出し元は分離
 /// （`isolate_rootless_subordinate`）済みの単一スレッドプロセスであること。失敗は panic。
+#[allow(dead_code)] // 直接ステージ経路を使う `rootless_uid_mapping` だけが使う（本番 launcher 経由の試験は使わない）
 pub fn spawn_real_entry(rootfs: &Path, entry: &Entrypoint, gid_map: &IdMapSet) -> ContainerChild {
     let stages = StagePipeline::new()
         .with_landlock(landlock_ruleset())
@@ -212,6 +291,7 @@ fn status_value(key: &str) -> String {
 }
 
 /// 実エントリポイント側の共通観測（`pid`・実効 `uid` / `gid`・`nonewprivs`・`seccomp`）。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub fn entry_observations() -> Vec<(&'static str, String)> {
     let id = |key: &str| {
         status_value(key)
@@ -230,6 +310,7 @@ pub fn entry_observations() -> Vec<(&'static str, String)> {
 }
 
 /// 実エントリポイント側: `/entry-report` へ `key=value` 行と最後の `done=1` を書く（`create_new`。`sync_all` 済み）。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub fn write_report(lines: &[(&str, String)]) {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -249,6 +330,7 @@ pub fn write_report(lines: &[(&str, String)]) {
 
 /// ホスト側: `path` の報告ファイルが `done=1` まで書き終わっていれば読んで返す（無ければ・書きかけなら `None`）。
 /// 大きさ・行数に上限を設け、重複キー・未知の書式は panic にする（外部入力として扱う）。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub fn try_read_report(path: &Path) -> Option<BTreeMap<String, String>> {
     use std::io::Read as _;
     let f = std::fs::File::open(path).ok()?;
@@ -262,6 +344,7 @@ pub fn try_read_report(path: &Path) -> Option<BTreeMap<String, String>> {
 }
 
 /// ホスト側: `path` の報告ファイルを `done=1` が現れるまで `limit` を上限にポーリングして読む（REPAIR-5）。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub fn read_report(path: &Path, limit: Duration) -> BTreeMap<String, String> {
     let deadline = Instant::now() + limit;
     loop {
@@ -277,6 +360,7 @@ pub fn read_report(path: &Path, limit: Duration) -> BTreeMap<String, String> {
     }
 }
 
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 fn parse_report(text: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for (i, line) in text.lines().enumerate() {
@@ -290,4 +374,82 @@ fn parse_report(text: &str) -> BTreeMap<String, String> {
         );
     }
     map
+}
+
+/// 監査レコードをメモリへ追記するだけの sink（本試験群は監査内容を照合しない。監査の配送は別の試験が担う）。
+pub struct MemSink(Mutex<Vec<String>>);
+
+impl AuditSink for MemSink {
+    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(format!("{record:?}"));
+        Ok(())
+    }
+}
+
+/// rootless 系の試験が `start` へ渡す本番 `ProductionLauncher` を組む（CORE-6・SEC-5。#2246）。
+/// `subordinate` が false なら `RootlessSingleId`（`0 <euid> 1`）、true なら `RootlessSubordinateIds`
+/// （`SubordinateIdSource::system(USER)`。`/etc/subuid`・`/etc/subgid` の範囲写像。`uidmap` が要る）。
+/// cgroup には参加させない（config に `linux.resources`・`cgroupsPath` が無いため `cgroup_join_source` 不要）。
+/// root で `RootlessSubordinateIds` を組むと `PermissionDenied` で拒否される（SEC-5。root 実行時の照合用に
+/// `Result` のまま返す）。
+#[allow(dead_code)] // 取り込み元によっては使わない（`rootless_uid_mapping`・`production_launcher` は使わない）
+pub fn build_rootless_launcher(subordinate: bool) -> Result<ProductionLauncher, TraitError> {
+    let builder =
+        ProductionLauncher::builder().audit_sink(Arc::new(MemSink(Mutex::new(Vec::new()))));
+    if subordinate {
+        builder
+            .privilege(IsolationPrivilege::RootlessSubordinateIds)
+            .subordinate_ids(SubordinateIdSource::system(std::env::var("USER").ok())?)
+            .build()
+    } else {
+        builder
+            .privilege(IsolationPrivilege::RootlessSingleId)
+            .build()
+    }
+}
+
+/// `build_rootless_launcher` の失敗を panic（失敗）にした版。opt-in 時に前提（`USER`・`uidmap`・自ユーザーの行）が
+/// 無ければここで失敗する。
+#[allow(dead_code)] // 取り込み元によっては使わない
+pub fn rootless_launcher(subordinate: bool) -> Arc<dyn ProcessLauncher> {
+    Arc::new(
+        build_rootless_launcher(subordinate)
+            .unwrap_or_else(|e| panic!("build production launcher: {e:?}")),
+    )
+}
+
+/// 呼び出しプロセスが単一スレッドに戻るのを待つ（`ProductionLauncher` は単一スレッドを要求し、複数スレッドなら
+/// `FailedPrecondition` で拒否する。join 済みスレッドの消滅は僅かに遅れ得る。REPAIR-5 で期限つき）。
+#[allow(dead_code)] // 取り込み元によっては使わない
+pub fn wait_single_thread() {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while status_value("Threads:") != "1" {
+        assert!(
+            Instant::now() < deadline,
+            "the test process must be single-threaded before a launch"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `/etc/subuid`・`/etc/subgid` の自ユーザー行から、launcher と同じ規則で範囲写像の期待値を求める。
+/// 所有者の照合は subuid・subgid のどちらにも `euid`（と `USER`）を使う（launcher の `resolve_privilege` と同じ。
+/// shadow-utils の subgid の第 1 欄はユーザー名か uid で、gid ではない）。
+#[allow(dead_code)] // 取り込み元によっては使わない
+pub fn helper_mappings(euid: u32, egid: u32) -> (IdMapSet, IdMapSet) {
+    let name = std::env::var("USER").ok();
+    let owner = SubIdOwner::new(euid, name).expect("subid owner");
+    let uranges = load_subordinate_ids(Path::new("/etc/subuid"), &owner).expect("load /etc/subuid");
+    let granges = load_subordinate_ids(Path::new("/etc/subgid"), &owner).expect("load /etc/subgid");
+    assert!(
+        !uranges.is_empty() && !granges.is_empty(),
+        "helper case requires subuid/subgid entries for the current user"
+    );
+    (
+        rootless_mapping(euid, &uranges).expect("uid range mapping"),
+        rootless_mapping(egid, &granges).expect("gid range mapping"),
+    )
 }

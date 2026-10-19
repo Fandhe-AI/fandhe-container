@@ -25,12 +25,22 @@
 //! `register` 時に未確定を置き換えない理由は、並行する同じ ID の create の未確定参照と区別できるのが
 //! 世代だけで、競合側のロールバック（ID 指定の `release`）が勝った側の参照を外しうるため。
 //!
-//! 参照テーブルはプロセスごとのメモリ上で永続化されない（未実装。REPAIR-3）。永続化を入れるときは、
-//! エントリだけでなく世代カウンタも保存する（再起動後に過去の世代を再発行しないため）。
+//! # 永続化（#2341）
+//!
+//! コンテナ参照のエントリと世代カウンタは、変更する入口が排他の中で `container_ref_persist` へ保存してから
+//! 結果を返す（変更 → 保存 → 失敗したら元へ戻して保存のエラーを返す）。返した世代を含む状態は
+//! 保存済みなので、ディスク上のカウンタは発行済みのどの世代よりも大きい。何も変わらない結果
+//! （`AlreadyRegistered`・`NotRegistered`・エラー）では書かない。保存の最後の親ディレクトリ `fsync` だけが
+//! 失敗した場合は、ディスクは新しい状態でメモリは戻り、呼び出し元はエラーを受け取る。次の排他取得で
+//! ディスクの内容に揃い、誤りは「余分に残す」側（未確定の参照が残る・外れているのに解除がエラー）に限り、
+//! 世代は再発行しない。永続化されるのはこれらの入口を通った変更だけで、ガードから
+//! `ReferenceTable::register_container` 等を直接呼んだ変更は保存されない（ファイルがあれば次の排他取得で
+//! 上書きされる。試験と `with_table` の種入れ用の口）。manifest・タグ・リースは永続化しない（#851）。
 //!
 //! 排他の取得は `AcquireImageStoreLock` として記録済みなので、ここでは別の操作種別を増やさない。
 
-use super::{ContainerRefGeneration, ContainerRefId, ImageStore};
+use super::container_ref_persist::{ContainerPortion, MAX_CONTAINER_REFS, save_container_refs};
+use super::{ContainerRefGeneration, ContainerRefId, ImageStore, ImageStoreGuard};
 use crate::error::{OciError, OciErrorCode};
 use crate::reference::Digest;
 
@@ -55,6 +65,21 @@ pub enum ContainerRefRelease {
 }
 
 impl ImageStore {
+    /// 排他の中でコンテナ参照を保存する。失敗したら `before` へ戻して保存のエラーを返す（#2341）。
+    pub(super) fn persist_container_refs(
+        &self,
+        guard: &mut ImageStoreGuard<'_>,
+        before: ContainerPortion,
+    ) -> Result<(), OciError> {
+        match save_container_refs(self.root(), guard) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                guard.restore_container_portion(before);
+                Err(e)
+            }
+        }
+    }
+
     /// コンテナ `id` から `manifest` への参照を、排他の下で登録する。
     ///
     /// manifest が在庫に無ければ `NotFound`、同じ ID が別の manifest を指していれば `AlreadyExists`
@@ -66,12 +91,21 @@ impl ImageStore {
     ) -> Result<ContainerRefRegistration, OciError> {
         let mut guard = self.lock()?;
         let already = guard.container_refs.get(id).map(|e| &e.manifest) == Some(manifest);
+        if !guard.container_refs.contains_key(id)
+            && guard.container_refs.len() >= MAX_CONTAINER_REFS
+        {
+            return Err(OciError::new(
+                OciErrorCode::ResourceExhausted,
+                "too many container refs",
+            ));
+        }
+        let before = guard.container_portion();
         guard.register_container(id.clone(), manifest)?;
-        Ok(if already {
-            ContainerRefRegistration::AlreadyRegistered
-        } else {
-            ContainerRefRegistration::Registered
-        })
+        if already {
+            return Ok(ContainerRefRegistration::AlreadyRegistered);
+        }
+        self.persist_container_refs(&mut guard, before)?;
+        Ok(ContainerRefRegistration::Registered)
     }
 
     /// 未確定の登録だけを確定し、その登録世代を返す（`ContainerImageRefs::bind`）。
@@ -82,16 +116,21 @@ impl ImageStore {
         id: &ContainerRefId,
     ) -> Result<ContainerRefGeneration, OciError> {
         let mut guard = self.lock()?;
-        match guard.container_refs.get_mut(id) {
+        let before = guard.container_portion();
+        let generation = match guard.container_refs.get_mut(id) {
             Some(e) if !e.bound => {
                 e.bound = true;
-                Ok(e.generation)
+                e.generation
             }
-            _ => Err(OciError::new(
-                OciErrorCode::NotFound,
-                "no unbound container reference",
-            )),
-        }
+            _ => {
+                return Err(OciError::new(
+                    OciErrorCode::NotFound,
+                    "no unbound container reference",
+                ));
+            }
+        };
+        self.persist_container_refs(&mut guard, before)?;
+        Ok(generation)
     }
 
     /// 確定済みの登録の世代を返す。登録が無い・未確定なら `None`（`ContainerImageRefs::registration`）。
@@ -119,7 +158,9 @@ impl ImageStore {
         if guard.container_refs.get(id).map(|e| e.generation) != Some(expected) {
             return Ok(ContainerRefRelease::NotRegistered);
         }
+        let before = guard.container_portion();
         let removed = guard.unregister_container(id)?;
+        self.persist_container_refs(&mut guard, before)?;
         Ok(ContainerRefRelease::Released(removed))
     }
 
@@ -139,7 +180,9 @@ impl ImageStore {
         if !matches {
             return Ok(ContainerRefRelease::NotRegistered);
         }
+        let before = guard.container_portion();
         let removed = guard.unregister_container(id)?;
+        self.persist_container_refs(&mut guard, before)?;
         Ok(ContainerRefRelease::Released(removed))
     }
 
@@ -149,8 +192,12 @@ impl ImageStore {
         id: &ContainerRefId,
     ) -> Result<ContainerRefRelease, OciError> {
         let mut guard = self.lock()?;
+        let before = guard.container_portion();
         match guard.unregister_container(id) {
-            Ok(digest) => Ok(ContainerRefRelease::Released(digest)),
+            Ok(digest) => {
+                self.persist_container_refs(&mut guard, before)?;
+                Ok(ContainerRefRelease::Released(digest))
+            }
             Err(e) if e.code() == OciErrorCode::NotFound => Ok(ContainerRefRelease::NotRegistered),
             Err(e) => Err(e),
         }

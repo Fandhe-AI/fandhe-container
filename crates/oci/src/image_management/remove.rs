@@ -385,9 +385,11 @@ impl ReferenceTable {
         let composition = self.remove_manifest(&action.manifest)?;
         outcome.kind = ImageRmKind::Deleted;
         // blobs() は BTreeSet のため昇順で決定的。
+        // 構成が分からない参照（在庫に無い manifest）がある間は blob を消さない（#2341）。
+        let unresolved = self.has_unresolved_container_refs();
         for blob in composition.blobs() {
             let refs = self.blob_references(blob);
-            if !refs.referencing_manifests.is_empty() || !refs.leases.is_empty() {
+            if unresolved || !refs.referencing_manifests.is_empty() || !refs.leases.is_empty() {
                 outcome.kept_blobs.push(blob.clone());
                 continue;
             }

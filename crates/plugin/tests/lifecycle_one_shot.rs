@@ -24,10 +24,10 @@ fn exe_target() -> fandhe_container_plugin::PluginLaunchTarget {
 #[test]
 fn plug7_one_shot_requires_unix_transport() {
     use fandhe_container_plugin::{
-        Frame, OneShotPlugin, OneShotTimeout, PluginErrorCode, call_once,
+        Frame, OneShotTimeout, PluginErrorCode, PluginLaunchSpec, call_once,
     };
     let dir = std::env::temp_dir();
-    let plugin = OneShotPlugin::new(exe_target(), vec![], dir).unwrap();
+    let plugin = PluginLaunchSpec::new(exe_target(), vec![], dir).unwrap();
     let req = Frame::new(b"ping".to_vec()).unwrap();
     let err = call_once(
         &plugin,
@@ -42,8 +42,8 @@ fn plug7_one_shot_requires_unix_transport() {
 #[cfg(unix)]
 mod unix {
     use fandhe_container_plugin::{
-        Frame, ONE_SHOT_STDERR_MAX_BYTES, OneShotPlugin, OneShotRecord, OneShotTermination,
-        OneShotTimeout, PLUGIN_SOCKET_ENV, PluginError, PluginErrorCode, RpcTimeout, UdsStream,
+        Frame, ONE_SHOT_STDERR_MAX_BYTES, OneShotRecord, OneShotTermination, OneShotTimeout,
+        PLUGIN_SOCKET_ENV, PluginError, PluginErrorCode, PluginLaunchSpec, RpcTimeout, UdsStream,
         call_once, call_once_observed,
     };
     use std::ffi::OsString;
@@ -312,12 +312,12 @@ mod unix {
             .unwrap()
     }
 
-    fn plugin_for(dir: &TempDir) -> OneShotPlugin {
+    fn plugin_for(dir: &TempDir) -> PluginLaunchSpec {
         let args: Vec<OsString> = ["--exact", "unix::plugin_child_entry", "--test-threads=1"]
             .iter()
             .map(OsString::from)
             .collect();
-        OneShotPlugin::new(super::exe_target(), args, dir.0.clone()).unwrap()
+        PluginLaunchSpec::new(super::exe_target(), args, dir.0.clone()).unwrap()
     }
 
     fn run(
@@ -698,7 +698,7 @@ mod unix {
             program,
         )
         .unwrap();
-        let plugin = OneShotPlugin::new(target, vec![], dir.0.clone()).unwrap();
+        let plugin = PluginLaunchSpec::new(target, vec![], dir.0.clone()).unwrap();
         let req = Frame::new(b"ping".to_vec()).unwrap();
         let err = call_once(
             &plugin,
@@ -797,7 +797,7 @@ mod unix {
             .iter()
             .map(OsString::from)
             .collect();
-        let plugin = OneShotPlugin::new(fx.target(), args, dir.0.clone()).unwrap();
+        let plugin = PluginLaunchSpec::new(fx.target(), args, dir.0.clone()).unwrap();
         fx.replace_with_script();
         let req = Frame::new(b"ping".to_vec()).unwrap();
         let out = with_watchdog("call_once", move || {
@@ -827,7 +827,7 @@ mod unix {
     fn plug11_one_shot_fails_when_inode_rewritten_to_script() {
         let dir = TempDir::new("respond");
         let fx = crate::swap::Fixture::new_rewritable();
-        let plugin = OneShotPlugin::new(fx.target(), vec![], dir.0.clone()).unwrap();
+        let plugin = PluginLaunchSpec::new(fx.target(), vec![], dir.0.clone()).unwrap();
         fx.rewrite_in_place_to_script();
         let req = Frame::new(b"ping".to_vec()).unwrap();
         let err = with_watchdog("call_once", move || {

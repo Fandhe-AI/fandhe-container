@@ -1,5 +1,5 @@
 //! plugin プロセスの都度起動モード（PLUG-7・TASK-110.1・#258）と、子モジュール `resident` の常駐モード
-//! （TASK-110.2・#259。起動仕様 [`OneShotPlugin`]・stderr 収集・子の回収ガードを共用する）と、
+//! （TASK-110.2・#259。起動仕様 [`PluginLaunchSpec`]・stderr 収集・子の回収ガードを共用する）と、
 //! 子モジュール `mode` のモード選択 API（TASK-110.3・#260）。
 //!
 //! 呼び出しごとに plugin プロセスを spawn し、1 往復（要求フレーム送信 -> 応答フレーム受信）の
@@ -39,7 +39,7 @@
 //!   載せない。`unreaped_error` で報告済みの子と、`Drop` の前に明示的な経路で手放した子（回収済み・他所で回収された
 //!   `Lost`。そこで返したグループ停止の失敗を含む）は記録しない。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] を設定する（資格情報を継承させない）。
-//!   追加は [`OneShotPlugin::with_env`] で呼び出し側が名前と値を明示した組だけで、親の環境を暗黙に
+//!   追加は [`PluginLaunchSpec::with_env`] で呼び出し側が名前と値を明示した組だけで、親の環境を暗黙に
 //!   継承する指定は無い。`FANDHE_CONTAINER_PLUGIN_`・`LD_`・`DYLD_` 始まりの名前・規則外の名前・重複・
 //!   NUL を含む値・上限超過（[`ONE_SHOT_ENV_MAX_COUNT`] 等）は `InvalidArgument` で拒否し、spawn しない
 //!   （#1858・#1319・PLUG-7）。
@@ -207,16 +207,16 @@ impl TryFrom<Duration> for OneShotTimeout {
     }
 }
 
-/// 都度起動する plugin の起動仕様。検証済みの値のみ保持する。
+/// 都度起動・常駐（`PluginSession` を含む）で共用する plugin の起動仕様。検証済みの値のみ保持する。
 #[derive(Debug, Clone)]
-pub struct OneShotPlugin {
+pub struct PluginLaunchSpec {
     target: PluginLaunchTarget,
     args: Vec<OsString>,
     socket_dir: PathBuf,
     env: env::PluginEnvVars,
 }
 
-impl OneShotPlugin {
+impl PluginLaunchSpec {
     /// `target` は検証済みの fd を持つ起動対象（パスだけでは起動できない。`PATH` 探索もしない。
     /// PLUG-11・#1856）。引数は件数・合計バイト数を検証する。
     /// `socket_dir` は listener を置く 0700 ディレクトリ（通常は `RuntimeDir::path()`）。
@@ -1156,7 +1156,7 @@ fn spawn_error(e: &io::Error) -> PluginError {
 /// （UID・pid の取得失敗は即エラー。#1861）。peer 認証による拒否かどうかは、返るエラーのコードでなく
 /// `audit` に渡る `PeerAuthRejectReason` で判別する。
 pub fn call_once(
-    plugin: &OneShotPlugin,
+    plugin: &PluginLaunchSpec,
     request: &Frame,
     timeout: OneShotTimeout,
     audit: &mut dyn crate::audit::PeerAuthObserver,
@@ -1220,7 +1220,7 @@ impl OneShotRecord {
 /// 実行されるため、長時間ブロックしないこと。`audit` は [`call_once`] と同じ（peer 認証の拒否イベントの
 /// 受け手。必須）。
 pub fn call_once_observed(
-    plugin: &OneShotPlugin,
+    plugin: &PluginLaunchSpec,
     request: &Frame,
     timeout: OneShotTimeout,
     audit: &mut dyn crate::audit::PeerAuthObserver,
@@ -1262,7 +1262,7 @@ fn bind_to_parent_lifetime(_cmd: &mut Command) -> Result<(), PluginError> {
 }
 
 /// 都度起動・常駐の両モードが共用する plugin の `Command` を組み立てる（起動条件を 1 か所に置く。
-/// REPAIR-1）。子の環境は `env_clear()` 後に [`OneShotPlugin::with_env`] で検証済みの組、最後に
+/// REPAIR-1）。子の環境は `env_clear()` 後に [`PluginLaunchSpec::with_env`] で検証済みの組、最後に
 /// [`PLUGIN_SOCKET_ENV`]（socket の変数が必ず勝つ）、stdin / stdout は null、stderr は
 /// 呼び出し側が用意した収集用の端、Linux では親死亡シグナルを設定する。
 ///
@@ -1271,7 +1271,7 @@ fn bind_to_parent_lifetime(_cmd: &mut Command) -> Result<(), PluginError> {
 /// それ以外はパス（`exec_path`）で起動する（macOS の起動直前の同一性確認は未実装。#1866）。
 /// `argv[0]` は OS を問わず実体の正規パス。
 fn plugin_command(
-    plugin: &OneShotPlugin,
+    plugin: &PluginLaunchSpec,
     socket_path: &Path,
     child_stderr: Stdio,
 ) -> Result<Command, PluginError> {
@@ -1310,7 +1310,7 @@ fn launch_spawn_error(e: PluginError) -> PluginError {
 /// listener の bind・子の spawn・stderr の収集・往復・回収までを行う。戻り値の第 2 要素は、
 /// 成功・失敗のどちらでも子の回収後に確定した stderr の収集結果（spawn 前の失敗は空）。
 fn call_once_inner(
-    plugin: &OneShotPlugin,
+    plugin: &PluginLaunchSpec,
     request: &Frame,
     timeout: OneShotTimeout,
     audit: &mut dyn crate::audit::PeerAuthObserver,
@@ -2216,7 +2216,8 @@ mod tests {
     #[test]
     fn repair4_observer_receives_failure_record() {
         let dir = std::env::temp_dir().join("fcos-nonexistent-observer-dir");
-        let plugin = OneShotPlugin::new(launch_target::current_exe_target(), vec![], dir).unwrap();
+        let plugin =
+            PluginLaunchSpec::new(launch_target::current_exe_target(), vec![], dir).unwrap();
         let req = Frame::new(Vec::new()).unwrap();
         let mut records = Vec::new();
         let r = call_once_observed(
@@ -2998,15 +2999,17 @@ mod tests {
     #[test]
     fn plug7_plugin_rejects_too_many_or_too_long_args() {
         let many = vec![OsString::from("a"); ONE_SHOT_ARGS_MAX_COUNT + 1];
-        let e = OneShotPlugin::new(launch_target::current_exe_target(), many, "/tmp".into())
+        let e = PluginLaunchSpec::new(launch_target::current_exe_target(), many, "/tmp".into())
             .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         let long = vec![OsString::from("a".repeat(ONE_SHOT_ARGS_MAX_BYTES + 1))];
-        let e = OneShotPlugin::new(launch_target::current_exe_target(), long, "/tmp".into())
+        let e = PluginLaunchSpec::new(launch_target::current_exe_target(), long, "/tmp".into())
             .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
         let ok = vec![OsString::from("a"); ONE_SHOT_ARGS_MAX_COUNT];
-        assert!(OneShotPlugin::new(launch_target::current_exe_target(), ok, "/tmp".into()).is_ok());
+        assert!(
+            PluginLaunchSpec::new(launch_target::current_exe_target(), ok, "/tmp".into()).is_ok()
+        );
     }
 
     /// 応答者を pid で限定する: 同一 UID でも pid が異なる接続は受理しない（PLUG-7）。

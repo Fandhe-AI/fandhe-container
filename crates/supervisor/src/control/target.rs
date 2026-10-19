@@ -166,10 +166,9 @@ impl SignalSlot {
                 if *held != pid {
                     Err(ControlReason::PidMismatch)
                 } else {
-                    // 終了済みでも Stop の意図は記録する（再 launch の判定が読む。SUP-9）。
-                    if let (RequestKind::Stop, Some(token)) = (kind, &inner.stop_intent) {
-                        token.mark_explicit_stop();
-                    }
+                    // 終了済みの Stop では意図を立てない（意図は StopToken に残り、再 launch 後の新しい
+                    // インスタンスの restart を無効化してしまうため。クラッシュとの競合に負けた stop は
+                    // 何も止めない。SUP-9・#2162）。
                     Err(ControlReason::ContainerExited)
                 }
             }
@@ -227,15 +226,20 @@ impl ControlledProcess {
                 Ok(req) => {
                     let reason = match fixed {
                         Some(r) => {
-                            // 終了を観測済みでも、同時に来た Stop の意図は記録する（SUP-9。記録しないと
-                            // restart の判定が `always` / `unless-stopped` で再 launch してしまう）。
-                            if req.kind == RequestKind::Stop {
+                            // 終了を観測済みでも、受け箱に入っていた期限内の Stop の意図は記録する（SUP-9。
+                            // 記録しないと restart の判定が `always` / `unless-stopped` で再 launch してしまう）。
+                            // 期限切れの Stop は Timeout で断る要求なので意図を立てない（REPAIR-5）。
+                            if req.kind == RequestKind::Stop && Instant::now() < req.deadline {
                                 let token = self.slot.lock().stop_intent.clone();
                                 if let Some(token) = token {
                                     token.mark_explicit_stop();
                                 }
                             }
-                            r
+                            if req.kind == RequestKind::Stop && Instant::now() >= req.deadline {
+                                ControlReason::Timeout
+                            } else {
+                                r
+                            }
                         }
                         None => self.handle(&req),
                     };
@@ -792,22 +796,34 @@ mod tests {
         assert_eq!(token.explicit_stop_state(), ExplicitStopState::Requested);
     }
 
-    /// SUP-9: `Exited` スロットへの Stop の submit でも、意図を記録する。Signal は記録しない。
+    /// SUP-9: `Exited` スロットへの Stop の submit は意図を立てない（再 launch 後の新インスタンスの restart を
+    /// 無効化しないため。#2162）。Signal も立てない。
     #[test]
-    fn sup9_stop_submit_to_exited_slot_marks_intent() {
+    fn sup9_stop_submit_to_exited_slot_does_not_mark_intent() {
         let (slot, cp, token, _) = probe_setup(false, ErrorCode::Internal);
         slot.mark_exited(cp.generation);
-        assert_eq!(
-            slot.submit(RequestKind::Signal, pid(100), Signal::SIGTERM, far())
-                .unwrap_err(),
-            ControlReason::ContainerExited
-        );
+        for kind in [RequestKind::Signal, RequestKind::Stop] {
+            assert_eq!(
+                slot.submit(kind, pid(100), Signal::SIGTERM, far())
+                    .unwrap_err(),
+                ControlReason::ContainerExited
+            );
+            assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
+        }
+    }
+
+    /// SUP-9・REPAIR-5: 終了観測後の drain で、期限切れの Stop は Timeout で断り意図を立てない。
+    #[test]
+    fn sup9_expired_stop_in_drain_after_exit_does_not_mark_intent() {
+        let (slot, cp, token, _) = probe_setup(false, ErrorCode::Internal);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let rx = slot
+            .submit(RequestKind::Stop, pid(100), Signal::SIGTERM, deadline)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        slot.mark_exited(cp.generation);
+        cp.drain(Some(ControlReason::ContainerExited));
+        assert_eq!(rx.recv().unwrap(), ControlReason::Timeout);
         assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
-        assert_eq!(
-            slot.submit(RequestKind::Stop, pid(100), Signal::SIGTERM, far())
-                .unwrap_err(),
-            ControlReason::ContainerExited
-        );
-        assert_eq!(token.explicit_stop_state(), ExplicitStopState::Requested);
     }
 }

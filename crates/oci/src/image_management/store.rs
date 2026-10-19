@@ -39,7 +39,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::ReferenceTable;
-use super::gc_journal::{PendingDeletionRecovery, journal_exists};
+use super::gc_journal::{PendingDeletionRecovery, journal_exists, reap_stale_tmp};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 
@@ -158,6 +158,7 @@ impl ImageStore {
         lock_file_until(&file, deadline)?;
         let mut guard = ImageStoreGuard { _file: file, table };
         // 他の操作が割り込む前に、前回の中断した削除を片づける。ジャーナルがあったときだけ記録する。
+        reap_stale_tmp(&self.root);
         let recovered = if journal_exists(&self.root) {
             record_oci_op(&*self.recorder, OciOpKind::RecoverPendingDeletion, || {
                 guard.table.resume_pending_deletion(&self.root)

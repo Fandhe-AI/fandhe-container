@@ -12,6 +12,17 @@
 //! 収束する。数え直しで参照・リースが見つかった blob は消さない（余分に残す側にだけ誤る）。
 //! ジャーナルの検証に失敗したら、ファイルに触らず fail-closed（lock 自体を失敗させる）。
 //!
+//! 永続的に消せない blob（symlink・非通常ファイル・`remove_file` が恒久的に失敗する等）で
+//! 新しい削除が恒久的に拒否されないよう、消せなかった blob の再試行には上限
+//! （[`MAX_GC_RETRY_ATTEMPTS`] 回）を設ける。上限に達したらその blob はジャーナルから外して
+//! 孤児として残し（余分に残す側にだけ誤る）、[`DeletionDurability::Abandoned`] で報告する。
+//! 残った孤児ファイルは運用者がストアの `blobs/sha256` から手動で確認・削除する。
+//!
+//! 信頼境界: ジャーナルの読み込みは種別・group/other の書き込み権限・サイズ・件数・未知フィールドを
+//! 検査するが、所有者（uid）は検査しない。ストア root 自体の所有者・権限の検査は `store.rs` の
+//! 永続化側の担当で、root が信頼できることを前提とする。
+//! 書き込み中のクラッシュで残る一時ファイル `@gc-pending.json.tmp-*` は、lock 取得時に回収する。
+//!
 //! 呼び出し元: `remove`（`execute_image_rm`）・`prune`（`execute_image_prune`）・`store`（lock 時の再試行）。
 //!
 //! 未実装・保証範囲（実装済みを装わない。REPAIR-3）:
@@ -42,7 +53,11 @@ pub const MAX_GC_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
 /// ジャーナルの各配列の件数の上限。
 pub const MAX_GC_JOURNAL_ENTRIES: usize = 65_536;
 
+/// 消せなかった blob を再試行する回数の上限（初回の削除を 1 回目と数える）。到達したら断念する。
+pub const MAX_GC_RETRY_ATTEMPTS: u32 = 5;
+
 const JOURNAL_VERSION: u32 = 1;
+const TMP_PREFIX: &str = "@gc-pending.json.tmp-";
 
 fn err(code: OciErrorCode, msg: &str) -> OciError {
     OciError::new(code, msg)
@@ -59,6 +74,9 @@ pub enum DeletionDurability {
     Confirmed,
     /// fsync の失敗や消せなかった blob のためジャーナルが残っている。次の lock で再試行される。
     Pending,
+    /// 再試行の上限に達しても消せない blob を孤児として残し、ジャーナルは片づけた。
+    /// 残った blob は `undeleted_blobs` で報告され、運用者の手動確認が要る。
+    Abandoned,
 }
 
 /// 永続化する削除の意図。
@@ -70,6 +88,8 @@ pub(super) struct GcJournal {
     pub untag: Vec<(TagKey, Digest)>,
     /// 消す blob（昇順）。
     pub delete_blobs: Vec<Digest>,
+    /// 消せなかった blob を再試行した回数（0 なら初回）。
+    pub attempts: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -79,6 +99,8 @@ struct RawJournal {
     manifests: Vec<String>,
     untag: Vec<RawTag>,
     delete_blobs: Vec<String>,
+    #[serde(default)]
+    attempts: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -120,6 +142,7 @@ fn to_raw(j: &GcJournal) -> RawJournal {
             })
             .collect(),
         delete_blobs: j.delete_blobs.iter().map(|d| d.to_string()).collect(),
+        attempts: j.attempts,
     }
 }
 
@@ -165,6 +188,7 @@ fn from_raw(raw: RawJournal) -> Result<GcJournal, OciError> {
             .iter()
             .map(|s| parse_digest(s))
             .collect::<Result<_, _>>()?,
+        attempts: raw.attempts,
     })
 }
 
@@ -210,7 +234,7 @@ pub(super) fn write_journal(root: &Path, journal: &GcJournal) -> Result<(), OciE
     }
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let tmp = root.join(format!(
-        "{GC_JOURNAL_FILE_NAME}.tmp-{}-{}",
+        "{TMP_PREFIX}{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
@@ -235,6 +259,23 @@ pub(super) fn write_journal(root: &Path, journal: &GcJournal) -> Result<(), OciE
         return Err(io(e));
     }
     Ok(())
+}
+
+/// 書き込み中のクラッシュで残った一時ファイルを回収する（通常ファイルだけ。ストアの排他区間内で、`lock` が取得直後に呼ぶ）。
+pub(super) fn reap_stale_tmp(root: &Path) {
+    let Ok(rd) = fs::read_dir(root) else {
+        return;
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        if !name.to_string_lossy().starts_with(TMP_PREFIX) {
+            continue;
+        }
+        let path = ent.path();
+        if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 /// ジャーナルを削除して root を fsync する。この成功が削除確定のコミット点。
@@ -362,11 +403,26 @@ pub(super) fn sweep_blobs(root: &Path, blobs: &[Digest], dirs_present: bool) -> 
 /// 1 件でも unlink したら `blobs/sha256` を fsync する。消せなかった blob があれば、その分だけで
 /// ジャーナルを書き直して保持する（書き直しに失敗しても元のジャーナルが上位集合として残る）。
 /// 全件片づいたらジャーナルを削除して root を fsync し、成功すれば `Confirmed`。
-pub(super) fn settle(root: &Path, undeleted: &[Digest], unlinked_any: bool) -> DeletionDurability {
+/// 消せない blob が `MAX_GC_RETRY_ATTEMPTS` 回目に達したらジャーナルを削除して `Abandoned`。
+pub(super) fn settle(
+    root: &Path,
+    undeleted: &[Digest],
+    unlinked_any: bool,
+    prior_attempts: u32,
+) -> DeletionDurability {
     let blobs_synced = !unlinked_any || sync_dir(&blob_dir(root)).is_ok();
     if !undeleted.is_empty() {
+        let attempts = prior_attempts.saturating_add(1);
+        if attempts >= MAX_GC_RETRY_ATTEMPTS {
+            // 断念: 消せない blob は孤児として残し、ジャーナルを片づけて新しい削除を再び通す。
+            return match remove_journal(root) {
+                Ok(()) => DeletionDurability::Abandoned,
+                Err(_) => DeletionDurability::Pending,
+            };
+        }
         let rest = GcJournal {
             delete_blobs: undeleted.to_vec(),
+            attempts,
             ..GcJournal::default()
         };
         let _ = write_journal(root, &rest);
@@ -467,7 +523,12 @@ impl ReferenceTable {
                 ..Sweep::default()
             },
         };
-        out.durability = settle(root, &sweep.undeleted, !sweep.deleted.is_empty());
+        out.durability = settle(
+            root,
+            &sweep.undeleted,
+            !sweep.deleted.is_empty(),
+            journal.attempts,
+        );
         out.deleted_blobs = sweep.deleted.into_iter().map(|(d, _)| d).collect();
         out.absent_blobs = sweep.absent;
         out.undeleted_blobs = sweep.undeleted;
@@ -550,6 +611,7 @@ mod tests {
             manifests: vec![d(0xa0)],
             untag: vec![(tk("v1"), d(0xa0))],
             delete_blobs: vec![d(0x11), d(0xc1)],
+            attempts: 0,
         }
     }
     fn after_state(root: &Root, t: &ReferenceTable) {
@@ -743,6 +805,49 @@ mod tests {
         assert_eq!(rec.absent_blobs, vec![d(0x11)]);
         assert_eq!(rec.durability, DeletionDurability::Confirmed);
         assert!(!root.journal());
+    }
+
+    /// OCI-7: 永続的に消せない blob は再試行の上限で断念し、ジャーナルが片づいて新しい削除が通る。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_permanently_undeletable_blob_is_abandoned_after_retry_limit() {
+        let root = Root::new();
+        files(&root);
+        let p = blob_path(&root.0, &d(0x11)).unwrap();
+        fs::remove_file(&p).unwrap();
+        fs::create_dir(&p).unwrap();
+        let store = ImageStore::with_table(&root.0, table()).unwrap();
+        let out = store.lock().unwrap().execute_image_prune(&root.0).unwrap();
+        assert_eq!(out.durability, DeletionDurability::Pending);
+        // 1 回目は prune、以降は lock 時の再試行。上限の手前までは Pending のまま残る。
+        for _ in 2..MAX_GC_RETRY_ATTEMPTS {
+            let rec = store.recover_pending_deletion().unwrap().unwrap();
+            assert_eq!(rec.durability, DeletionDurability::Pending);
+            assert!(root.journal());
+        }
+        let rec = store.recover_pending_deletion().unwrap().unwrap();
+        assert_eq!(rec.durability, DeletionDurability::Abandoned);
+        assert_eq!(rec.undeleted_blobs, vec![d(0x11)]);
+        assert!(!root.journal());
+        // 孤児として残り、新しい削除は拒否されない。
+        assert!(fs::symlink_metadata(&p).is_ok());
+        ensure_no_pending_journal(&root.0).unwrap();
+        assert!(store.recover_pending_deletion().unwrap().is_none());
+    }
+
+    /// OCI-7: 書き込み中のクラッシュで残った一時ファイルは lock 時に回収される。
+    #[test]
+    fn oci7_stale_journal_tmp_is_reaped_on_lock() {
+        let root = Root::new();
+        files(&root);
+        let stale = root.0.join(format!("{TMP_PREFIX}99999-0"));
+        fs::write(&stale, b"partial").unwrap();
+        let other = root.0.join("unrelated.tmp");
+        fs::write(&other, b"keep").unwrap();
+        let store = ImageStore::with_table(&root.0, table()).unwrap();
+        assert!(store.recover_pending_deletion().unwrap().is_none());
+        assert!(fs::symlink_metadata(&stale).is_err());
+        assert!(other.exists());
     }
 
     /// OCI-7: 片づかないジャーナルがある間、rm は FailedPrecondition でテーブルもファイルも変えない。

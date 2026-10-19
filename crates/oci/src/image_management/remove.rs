@@ -394,6 +394,7 @@ impl ReferenceTable {
                         .map(|k| (k.clone(), action.manifest.clone()))
                         .collect(),
                     delete_blobs: planned,
+                    attempts: 0,
                 },
             )?;
         }
@@ -440,7 +441,7 @@ impl ReferenceTable {
         }
         let sweep = sweep_blobs(root, &to_sweep, dirs_present);
         if journaled {
-            outcome.durability = settle(root, &sweep.undeleted, !sweep.deleted.is_empty());
+            outcome.durability = settle(root, &sweep.undeleted, !sweep.deleted.is_empty(), 0);
         }
         outcome.deleted_blobs = sweep.deleted.into_iter().map(|(d, _)| d).collect();
         outcome.absent_blobs = sweep.absent;

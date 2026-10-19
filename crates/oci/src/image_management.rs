@@ -45,7 +45,7 @@ pub use reconcile::{ContainerRefReconciliation, ContainerStatePresence};
 mod gc_journal;
 pub use gc_journal::{
     DeletionDurability, GC_JOURNAL_FILE_NAME, MAX_GC_JOURNAL_BYTES, MAX_GC_JOURNAL_ENTRIES,
-    PendingDeletionRecovery,
+    MAX_GC_RETRY_ATTEMPTS, PendingDeletionRecovery,
 };
 
 mod remove;

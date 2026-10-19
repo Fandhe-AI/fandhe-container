@@ -139,6 +139,7 @@ impl ReferenceTable {
                     manifests: plan.manifests.clone(),
                     untag: Vec::new(),
                     delete_blobs: plan.delete_blobs.clone(),
+                    attempts: 0,
                 },
             )?;
         }
@@ -165,7 +166,7 @@ impl ReferenceTable {
                 .ok_or_else(|| err(OciErrorCode::Internal, "size overflow"))?;
         }
         if journaled {
-            out.durability = settle(root, &sweep.undeleted, !sweep.deleted.is_empty());
+            out.durability = settle(root, &sweep.undeleted, !sweep.deleted.is_empty(), 0);
         }
         out.deleted_blobs = sweep.deleted.into_iter().map(|(d, _)| d).collect();
         out.absent_blobs = sweep.absent;

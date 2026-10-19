@@ -196,6 +196,16 @@ impl FileIdent {
     }
 }
 
+/// 公開（リンク・置換）した後 / 置換の前の実体を再ハッシュして digest を照合する（OCI-1・OCI-7）。
+///
+/// Windows の固定（`FILE_SHARE_DELETE` あり）はステージング名の差し替えを許し、指紋は size / mtime
+/// だけで同一性を保証できない。そのため `hard_link` が実際に結び付けた実体を、公開の名前の側で
+/// 検証してから確定する。不一致は `DataLoss`（呼び出し側が作った宛先を消す）。
+/// 全 OS で呼べる検証であり、現状は Windows の公開経路だけが使う。
+fn verify_published_blob(path: &Path, digest: &Digest, size: u64) -> Result<(), OciError> {
+    crate::layer::verify_blob_digest(path, digest, size).map(|_| ())
+}
+
 /// 公開してよい blob の信頼条件の違反を返す（OCI-1・SEC。unix のみ。違反なしは `None`）。
 ///
 /// 条件は通常ファイル・所有者が `owner`・ハードリンク数 1（ストア外の名前から同じ inode を書き換えられない）・
@@ -638,7 +648,10 @@ impl PullSession<'_> {
     /// ハンドルを保持する間は内容を書き換えられないため、検証した内容がそのまま公開される。
     /// `FILE_SHARE_DELETE` を含めるのは、Windows の `hard_link` が元ファイルへの DELETE / 属性アクセスを
     /// 要し、`FILE_SHARE_READ` のみの固定は自分の `hard_link` を共有違反で失敗させるため。名前の差し替えは
-    /// 許すため、リンク直前に名前側の指紋を検証時のものと照合する（`check_staged_ident`。OCI-1）。
+    /// 許すため、リンク直前に名前側の指紋を照合したうえで、リンク後の実体（新規の宛先・修復用の一時名）を
+    /// 再ハッシュして確定する（`verify_published_blob`）。既存の宛先が正しい内容なら置換しない。
+    /// これは Windows の `FileIdent` が size / mtime だけで同一性を保証できないための fail-closed の対策
+    /// （ファイル ID の照合は `windows-sys` が oci の依存に無く FFI を足せないため採らない。OCI-1・OCI-7）。
     #[cfg(windows)]
     fn pin_staged_blobs(&self, to_move: &[Digest]) -> Result<BTreeMap<Digest, fs::File>, OciError> {
         use std::os::windows::fs::OpenOptionsExt;
@@ -787,12 +800,9 @@ impl PullSession<'_> {
         let mut dst_checked: BTreeMap<Digest, Option<FileIdent>> = BTreeMap::new();
         for b in &to_move {
             let dst = blob_path(&root, b)?;
-            if !cfg!(unix) {
-                // unix 以外は指紋で書き換えを検出できないため、既存の宛先は常に未検証として扱い、
-                // 検証済みのステージングで置き換える（OCI-1）。
-                dst_checked.insert(b.clone(), None);
-                continue;
-            }
+            // Windows でも既存の宛先は digest を検証し、正しい内容ならそのまま受け入れる。
+            // 共有の `blobs/sha256` の正しいオブジェクトを、名前の差し替えを許す固定の下で
+            // 公開する実体（検証済みと同じとは限らない）で上書きしない（fail-closed。OCI-1・OCI-7）。
             let size = self.verified.get(b).map_or(0, |v| v.size);
             let ident = match FileIdent::of_regular(&dst) {
                 Ok(Some(_)) if !is_trusted_regular(&dst, owner) => None,
@@ -848,7 +858,14 @@ impl PullSession<'_> {
                 self.check_staged_ident(&src, b)?;
                 match fs::hard_link(&src, &dst) {
                     Ok(()) => {
-                        created.push(dst);
+                        created.push(dst.clone());
+                        // Windows: 固定は名前の差し替えを許す（`FILE_SHARE_DELETE`）ため、リンクした実体を
+                        // 再ハッシュして、検証済みと別の内容を公開していないことを確かめる。違えば今作った
+                        // 宛先を `created` から消す（失敗時のロールバックで消える）。
+                        if cfg!(windows) {
+                            let size = self.verified.get(b).map_or(0, |v| v.size);
+                            verify_published_blob(&dst, b, size)?;
+                        }
                         moved.push(b.clone());
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -870,8 +887,15 @@ impl PullSession<'_> {
                                     // 残る（他のイメージが参照する blob を失わない。OCI-1）。
                                     let tmp = repair_tmp_path(&dst);
                                     let _ = fs::remove_file(&tmp);
+                                    let size = self.verified.get(b).map_or(0, |v| v.size);
+                                    // 置き換える前に一時名の内容を再ハッシュし、未検証の内容で
+                                    // 既存の宛先を上書きしない（名前の差し替え対策。OCI-1）。
                                     let repaired = fs::hard_link(&src, &tmp)
-                                        .and_then(|()| fs::rename(&tmp, &dst));
+                                        .map_err(|_| ())
+                                        .and_then(|()| {
+                                            verify_published_blob(&tmp, b, size).map_err(|_| ())
+                                        })
+                                        .and_then(|()| fs::rename(&tmp, &dst).map_err(|_| ()));
                                     if repaired.is_err() {
                                         let _ = fs::remove_file(&tmp);
                                         return Err(err(
@@ -1837,6 +1861,46 @@ mod tests {
                 .is_err()
         );
         assert!(!root.blob(&dg).exists());
+    }
+
+    /// 公開後の再ハッシュ（Windows の公開経路が使う）は、内容が違う実体を `DataLoss` で拒否する。
+    /// Linux でも検証できる部分を全 OS の試験にする（OCI-1・OCI-7）。
+    #[test]
+    fn oci1_verify_published_blob_rejects_swapped_content() {
+        let root = Root::new("pub-reverify");
+        let p = root.0.join("blob");
+        fs::write(&p, b"config-body").unwrap();
+        let dg = sha_of(b"config-body");
+        verify_published_blob(&p, &dg, 11).unwrap();
+        fs::write(&p, b"config-BODY").unwrap();
+        assert_eq!(
+            verify_published_blob(&p, &dg, 11).unwrap_err().code(),
+            OciErrorCode::DataLoss
+        );
+    }
+
+    /// 既に正しい内容で存在する宛先は、全 OS で置き換えずそのまま受け入れる（OCI-1・OCI-7）。
+    #[test]
+    fn oci7_publish_keeps_existing_verified_destination() {
+        let root = Root::new("pub-keep-dst");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let dg = stage(&mut s, b"config-body");
+        let dst = root.blob(&dg);
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::write(&dst, b"config-body").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dst, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let comp = ManifestComposition::new(dg.clone(), vec![]).unwrap();
+        let out = s
+            .publish(PullPublishRequest::new(manifest_digest(), comp))
+            .unwrap();
+        assert_eq!(out.already_present_blobs, vec![dg.clone()]);
+        assert!(out.moved_blobs.is_empty());
+        assert_eq!(fs::read(&dst).unwrap(), b"config-body");
     }
 
     /// group / other 書き込み可能なステージングの blob は 0600 へ狭めてから検証・公開する。

@@ -1293,7 +1293,9 @@ fn doctor_rejects_extra_arguments() {
     assert!(out.stdout.is_empty());
     assert_eq!(String::from_utf8(out.stderr).expect("utf8"), USAGE_JSON);
 }
+
 /// `image` 系の stderr 1 行 JSON（op なし）を組み立てる。
+#[cfg(target_os = "linux")]
 fn image_err(code: &str, message: &str) -> String {
     format!("{{\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
 }

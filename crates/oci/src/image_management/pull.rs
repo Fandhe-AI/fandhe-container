@@ -875,7 +875,10 @@ impl PullSession<'_> {
                                 "blob destination is not a regular file",
                             ));
                         }
-                        Err(_) => false,
+                        // 「不在」と確定できるのは NotFound のときだけ。共有違反・アクセス拒否などは
+                        // 存在の有無が不明なため、失敗にして共有の blob をロールバックで消さない。
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                        Err(e) => return Err(io_err(&e, "failed to stat blob destination")),
                     };
                     fs::rename(publish_tmp_path(&dst, nonce), &dst)
                         .map_err(|_| err(OciErrorCode::Internal, "failed to publish blob"))?;

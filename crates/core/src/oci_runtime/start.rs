@@ -3016,6 +3016,10 @@ mod tests {
         rewritten["linux"]["cgroupsPath"] = json!("/x");
         let err = start_rejected_after_rewrite("resources-path", &rewritten);
         assert_eq!(err.code(), ErrorCode::Unimplemented);
+        // 委譲スコープの外へ出る指定（`..`）も値を見ずに起動前に拒否する（#2010・SEC-1）。
+        rewritten["linux"]["cgroupsPath"] = json!("../escape");
+        let err = start_rejected_after_rewrite("resources-path-dotdot", &rewritten);
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
     }
 
     /// SEC-1: bundle の祖先が symlink なら（create は受理しても）start は起動前に拒否し、予約もしない。

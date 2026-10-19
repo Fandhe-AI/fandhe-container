@@ -651,6 +651,7 @@ impl PullSession<'_> {
         &self,
         to_move: &[Digest],
         tmps: &mut PublishTmpCleanup,
+        nonce: u64,
     ) -> Result<BTreeMap<Digest, fs::File>, OciError> {
         use std::os::windows::fs::OpenOptionsExt;
         let root = self.store.root();
@@ -663,7 +664,7 @@ impl PullSession<'_> {
                     "blob is neither leased nor verified by this pull",
                 ));
             };
-            let tmp = publish_tmp_path(&blob_path(root, b)?);
+            let tmp = publish_tmp_path(&blob_path(root, b)?, nonce);
             let _ = fs::remove_file(&tmp);
             fs::hard_link(&src, &tmp)
                 .map_err(|e| io_err(&e, "failed to stage blob for publish"))?;
@@ -694,6 +695,7 @@ impl PullSession<'_> {
         &self,
         _to_move: &[Digest],
         _tmps: &mut PublishTmpCleanup,
+        _nonce: u64,
     ) -> Result<BTreeMap<Digest, fs::File>, OciError> {
         Ok(BTreeMap::new())
     }
@@ -798,8 +800,9 @@ impl PullSession<'_> {
         let root = self.store.root().to_path_buf();
         let owner = dir_owner(&self.staging_dir)?;
         // Windows: 実体を共有拒否のハンドルで固定して検証する（ガードの外。以降は固定済みの実体を公開する）。
+        let nonce = next_publish_nonce();
         let mut tmps = PublishTmpCleanup::default();
-        let mut pinned = self.pin_staged_blobs(&to_move, &mut tmps)?;
+        let mut pinned = self.pin_staged_blobs(&to_move, &mut tmps, nonce)?;
         // 既存の宛先の内容検証（再ハッシュ）はガードの外で済ませ、検証した実体の指紋を控える。
         // 排他区間の中では指紋の照合だけを行う（大容量 blob でガード保持が期限を超えないように。
         // ロックの規律）。
@@ -874,7 +877,7 @@ impl PullSession<'_> {
                         }
                         Err(_) => false,
                     };
-                    fs::rename(publish_tmp_path(&dst), &dst)
+                    fs::rename(publish_tmp_path(&dst, nonce), &dst)
                         .map_err(|_| err(OciErrorCode::Internal, "failed to publish blob"))?;
                     if !existed {
                         created.push(dst);
@@ -1030,10 +1033,19 @@ impl PullSession<'_> {
 }
 
 /// Windows の公開用の私的な一時名（宛先と同じディレクトリ。同一ボリュームで rename できる）。
-fn publish_tmp_path(dst: &Path) -> PathBuf {
+///
+/// 同一プロセス内の並行する公開（別セッション・同じ digest）と衝突しないよう、`nonce`（公開ごとに
+/// 採番。[`next_publish_nonce`]）を名前に含める。
+fn publish_tmp_path(dst: &Path, nonce: u64) -> PathBuf {
     let mut name = dst.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".publish-{}", std::process::id()));
+    name.push(format!(".publish-{}-{nonce}", std::process::id()));
     dst.with_file_name(name)
+}
+
+/// 公開ごとに一意な採番（プロセス内で単調増加）。
+fn next_publish_nonce() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// 公開用の一時名の後始末。drop で残っている一時名を消す（成功時は rename 済みで no-op）。
@@ -1892,11 +1904,13 @@ mod tests {
     fn oci7_publish_tmp_cleanup_removes_leftovers() {
         let root = Root::new("pub-tmp-cleanup");
         let dst = root.0.join("abc");
-        let tmp = publish_tmp_path(&dst);
+        let tmp = publish_tmp_path(&dst, 7);
         assert_eq!(
             tmp.file_name().unwrap().to_string_lossy(),
-            format!("abc.publish-{}", std::process::id())
+            format!("abc.publish-{}-7", std::process::id())
         );
+        assert_ne!(publish_tmp_path(&dst, 8), tmp);
+        assert_ne!(next_publish_nonce(), next_publish_nonce());
         fs::write(&tmp, b"x").unwrap();
         {
             let mut c = PublishTmpCleanup::default();
@@ -1928,7 +1942,7 @@ mod tests {
         assert_eq!(out.already_present_blobs, vec![dg.clone()]);
         assert!(out.moved_blobs.is_empty());
         assert_eq!(fs::read(&dst).unwrap(), b"config-body");
-        assert!(!publish_tmp_path(&dst).exists());
+        assert!(!publish_tmp_path(&dst, 0).exists());
     }
 
     /// group / other 書き込み可能なステージングの blob は 0600 へ狭めてから検証・公開する。

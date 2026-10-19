@@ -1582,6 +1582,18 @@ fn isolate_rootless_subordinate_with(
             None,
         ));
     }
+    // 公開 API は呼び出し元が明示した non-dumpable の保護を外さない。写像の書き込みには対象が dumpable である
+    // ことが要る(下の `restore_non_dumpable` の理由)ため、non-dumpable のままなら fork の前に拒否する
+    // (fail-closed。CORE-6・SEC-5・SEC-1)。dumpable を一時的に上げてよいのは、保護を自分で作り直せる本番 launcher
+    // の中間プロセス I だけである。
+    if caller == MapperCaller::Standalone && matches!(sys::is_dumpable(), Ok(false)) {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::UserNamespaceMap,
+            "the caller is non-dumpable; newuidmap/newgidmap cannot map it (make the process dumpable \
+             before calling, or use the production launcher)",
+        ));
+    }
     let (mut parent_sock, mapper_sock) = std::os::unix::net::UnixStream::pair()
         .map_err(|e| ExecError::from_io(&e, IsolationStage::UserNamespaceMap, "socketpair"))?;
     let parent_pid = std::process::id();
@@ -1608,9 +1620,12 @@ fn isolate_rootless_subordinate_with(
     let mapper = ContainerChild::spawned(mapper_pid);
 
     // 写像の対象(このプロセス)が non-dumpable だと `/proc/<pid>` が root 所有になり、`newuidmap` / `newgidmap` の
-    // 所有者検査が拒否する(supervisor は入口で non-dumpable にする。CORE-6・SEC-5・#2243)。書き込みの間だけ
-    // dumpable にし、元が non-dumpable だったときは、成否によらず握手の後に戻す。
-    let restore_non_dumpable = matches!(sys::is_dumpable(), Ok(false));
+    // 所有者検査が拒否する(supervisor は入口で non-dumpable にする。CORE-6・SEC-5・#2243)。launcher の中間プロセス
+    // I(写像の対象。supervisor 本体 C ではなく fork した子で、C は non-dumpable のまま)に限り、書き込みの間だけ
+    // dumpable にし、成否によらず握手の後に戻す。窓の間に同一 uid のホスト側プロセスが I を ptrace できる点は
+    // newuidmap / newgidmap の仕様上避けられない(I の fd は起動入口で close_range 済みで、PID 1 の fork より前に戻す)。
+    let restore_non_dumpable =
+        caller == MapperCaller::Launcher && matches!(sys::is_dumpable(), Ok(false));
     // mapper を fork した後は、どの失敗も下の回収の分岐を通す(`?` で早期 return すると mapper がゾンビで残る。
     // `ContainerChild` は drop で回収しない。CORE-2)。
     let make_dumpable = if restore_non_dumpable {
@@ -2228,6 +2243,47 @@ mod tests {
             namespaces,
             hostname: hostname.map(|h| Hostname::new(h).unwrap()),
         }
+    }
+
+    /// CORE-6・SEC-5・SEC-1(#2243): non-dumpable の呼び出し元に対する公開 API は、dumpable に戻さず(保護を外さず)
+    /// fork の前に `FailedPrecondition` で拒否する。`PR_SET_DUMPABLE` はプロセス単位でテストの他の試験に残るため、
+    /// 自分自身を再実行した使い捨てプロセスの中で確かめる。
+    #[test]
+    fn core6_sec5_standalone_rejects_non_dumpable_caller_without_weakening_it() {
+        const MARK: &str = "FANDHE_TEST_NON_DUMPABLE_CHILD";
+        if std::env::var_os(MARK).is_some() {
+            assert_eq!(sys::set_non_dumpable(), Ok(()));
+            let plan = plan_rootless_subordinate(
+                &cfg(NamespaceSet::empty().with(Namespace::User), None),
+                crate::rootless::single_id_mapping(sys::effective_uid()).unwrap(),
+                crate::rootless::single_id_mapping(sys::effective_gid()).unwrap(),
+                IdMapWriter::Direct,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let err = isolate_rootless_subordinate(&plan).unwrap_err();
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{err}");
+            assert!(err.to_string().contains("non-dumpable"), "{err}");
+            // 保護は外れておらず、user namespace にも入っていない(副作用なし)。
+            assert_eq!(sys::is_dumpable(), Ok(false));
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "exec::tests::core6_sec5_standalone_rejects_non_dumpable_caller_without_weakening_it",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(MARK, "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// CORE-1: 5 種の集合と単体の所属判定。

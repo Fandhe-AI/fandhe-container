@@ -7,7 +7,7 @@
 //! 関数呼び出し → 応答本体 / [`PluginError`]」だけを担う。呼び出し先の VM 操作は [`MacosBackend`] 越しにし、
 //! 実 VM を起動できない 3 OS の CI でも偽実装でテストできるようにする。
 //!
-//! # 暫定ワイヤー契約（spec 未規定。型つき本体への置換は core 側 proxy の TASK-114）
+//! # 暫定ワイヤー契約（spec 未規定。型つき本体への置換は core 側 proxy の #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）
 //!
 //! | 操作 | 要求本体 | 成功応答本体 |
 //! | ---- | -------- | ------------ |
@@ -25,7 +25,7 @@
 //! 対象外（PLUG-4）。
 //!
 //! `id` は core の `ContainerId` と同じ規則（空・`.`・`..` 不可、255 バイト以下、`[A-Za-z0-9._-]`）で
-//! 検証する（TASK-114 で core 型へ置換）。create は検証と登録のみ、start が `Vm::launch`、stop が
+//! 検証する（#1869 の設計で core 型へ置換）。create は検証と登録のみ、start が `Vm::launch`、stop が
 //! `Vm::stop` と登録解除（delete が無いため stop が資源をすべて手放す）。
 //!
 //! # エラー対応表（[`to_plugin_error`] が唯一の変換箇所）
@@ -120,7 +120,7 @@
 //!   終了）の挙動は実機未確認。
 //!
 //! # 未実装範囲（実装済みを装わない。REPAIR-3）
-//! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（TASK-114 待ち）。
+//! - 型つき本体と core の `ContainerRuntime` トレイトへの接続・kill / delete / state（#1869 の設計待ち）。
 //!   コンソールログの削除（現在のログと全世代。`VmConfigSpec::remove_console_logs`）は delete の実装時に呼ぶ予定で、
 //!   現時点では呼び出し元が無い（ログは stop 後も残る。#2138）。
 //! - virtiofs 共有は、マウント先とコンソールログを指定すればゲスト init の報告を待つ（上の節）。initrd へのゲスト init の梱包
@@ -134,7 +134,7 @@
 //!   core の終了処理に委ね、完了は保証しない。
 //! - 1 コンテナ = 1 VM。MAC-4 は確定（既定は常駐 VM 共用 + 軽量プロセス分離）だが、既定方式は未実装（TASK-191。設計の確定は #1905）。状態はプロセス内メモリのみ（都度起動モードでは引き継げない）。
 //! - VM 操作の期限は core 側 RPC・都度起動の合計期限（10 秒）と終了猶予（5 秒）に収まる固定値
-//!   （[`LAUNCH_START_TIMEOUT`] 等・[`SHUTDOWN_BUDGET`]）。core からの期限伝達（要求本体への期限指定）は TASK-114。
+//!   （[`LAUNCH_START_TIMEOUT`] 等・[`SHUTDOWN_BUDGET`]）。core からの期限伝達（要求本体への期限指定）は #1869 の設計。
 //!   既定の `OpTimeouts`（start 30 秒・guest mount 60 秒・stop 15 秒）は使わない。
 
 use std::collections::BTreeMap;
@@ -795,7 +795,7 @@ fn build_spec(
     Ok(spec)
 }
 
-/// core の `ContainerId` と同じ規則（TASK-114 で core 型へ置換予定）。
+/// core の `ContainerId` と同じ規則（#1869 の設計で core 型へ置換予定）。
 fn validate_id(id: &str) -> Result<(), PluginError> {
     let ok = !id.is_empty()
         && id.len() <= ID_MAX_BYTES

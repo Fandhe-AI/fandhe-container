@@ -10,7 +10,9 @@
 //! `kill`（TASK-30.1。送信は依存注入する `ProcessSignaler` に委ね、本番実装は supervisor〔TASK-157〕待ち）
 //! も実装済み。`delete`（TASK-30.2・TASK-30.3）は cgroup（依存注入する `ContainerCgroupRemover`。Linux の
 //! 本番実装は `cgroups::DelegatedCgroup`）と `StateStore` のレコード（状態ファイル）を削除する。OCI-7 の
-//! 参照解除は TASK-183 で未実装である（REPAIR-3: 実装済みを装わない）。モジュールは
+//! 参照登録・解除は `create_with_image` / `delete_releasing_image_ref`（TASK-183.8.1。依存注入する
+//! `ContainerImageRefs` 経由）が担い、本番のアダプタと CLI / plugin からの配線は未実装である
+//! （REPAIR-3: 実装済みを装わない）。モジュールは
 //! `cfg(target_os)` を付けず 3 OS でビルドされる（CLI-1）。
 //! create / start / kill / delete は依存注入された `OpRecorder` へ固定の操作名（`create`・`start`・`kill`・
 //! `delete`）で成功 / 失敗と所要時間を記録する（REPAIR-4・TASK-84.4。delete は TASK-30.2 で同じ
@@ -34,6 +36,7 @@ mod config;
 mod create;
 mod delete;
 mod error;
+mod image_refs;
 mod kill;
 mod launch;
 mod launcher;
@@ -58,13 +61,17 @@ pub use config::{
     OciIdMapping, OciMount, OciNamespace, OciProcess, OciRoot, OciUser, OciVersion, UnappliedField,
     load_config, parse_config_bytes,
 };
-pub use create::create;
-pub use delete::{CgroupRemoval, ContainerCgroupRemover, delete};
+pub use create::{create, create_with_image};
+pub use delete::{CgroupRemoval, ContainerCgroupRemover, delete, delete_releasing_image_ref};
 pub use error::{
     LifecycleOp, OCI_ERROR_MESSAGE_MAX_BYTES, OCI_EXIT_ALREADY_EXISTS,
     OCI_EXIT_FAILED_PRECONDITION, OCI_EXIT_INTERNAL, OCI_EXIT_INVALID_ARGUMENT, OCI_EXIT_NOT_FOUND,
     OCI_EXIT_PERMISSION_DENIED, OCI_EXIT_TIMEOUT, OCI_EXIT_UNAVAILABLE, OCI_EXIT_UNIMPLEMENTED,
     OciRuntimeError, exit_code_for,
+};
+pub use image_refs::{
+    ContainerImage, ContainerImageRefs, ImageManifestDigest, ImageRefGeneration,
+    ImageRefRegistration, ImageRefRelease,
 };
 pub use kill::{KillTimeout, ProcessSignaler, kill};
 #[cfg(target_os = "linux")]

@@ -86,7 +86,9 @@
 //! `open_tree(OPEN_TREE_CLONE)` の fd は匿名 namespace の root なのでいずれも通る。それでも使わないのは、複製（`clone_mnt`）が元の
 //! 伝播（`mnt_group_id`・`mnt_master`）を引き継ぐためで、**複製が private であることは `establish` の `MS_REC|MS_PRIVATE`
 //! に依存する**（これを外す改修は手順 4・9 の照合で検出されるが、前提として維持すること）。`MS_PRIVATE` を同じ呼び出しで設定する
-//! 変更は別 issue で扱う（本 issue ではコード不変）。
+//! 変更は #2165 で検討し、見送った（伝播の前提は `establish` の無条件の private 化・手順 4 の shared 拒否・手順 9 の照合の 3 段で
+//! 守られ、いずれも fail-closed のため）。再検討するのは、`establish` の private 化を条件付き・順序替え・除去する改修や、
+//! 手順 4・9 が伝播の不備を検出したとき（SEC-1・OCI-4）。
 //!
 //! **属性とロックの一次情報**（#2064 で版つきに確認。Linux v5.12・v6.12・v7.0 の `fs/namespace.c`・`fs/pnode.c`、man-pages 6.17）:
 //!
@@ -139,15 +141,30 @@
 //!   適用の段が start の記録したホスト側パスを `/` から辿り直し（`O_NOFOLLOW`。`resolve_fresh_state_chains`）、固定した実体と
 //!   一致しなければ `FAILED_PRECONDITION` で拒否する（#2129。restart を含む）。一致した新しい鎖でも元を照合する。
 //!   残余は、祖先の bind mount を別の経路から改名するなど、パスが同じ inode に解決したまま FS 内パスだけが変わる場合で、
-//!   mountinfo の `(dev, path)`（状態ルートと子マウント）は適用時に作り直さない。`rbind` で公開される子マウントと状態ルート配下の
-//!   子マウントは mountinfo の照合（start 時点の FS 内パス）だけで見ており、start の後の改名には追随しない。
-//!   PID 1 と start（CLI）が同じ資格情報でパスを辿れるという前提（subordinate 写像を含む）は実機の結合試験（#1916）で確かめる。別の superblock を通して同じデータを見せるもの
-//!   （overlayfs の lowerdir・FUSE 系）はどちらの層でも検出しない。bundle の実体は rootfs の鎖と mountinfo の `contained` で照合済み
-//!   （ホスト側の bind による別名を含む）。実機での別名の確認は #1916
+//!   mountinfo の `(dev, path)` は、適用の段が毎回作り直す（#2166。`check_source_not_protected`。記録した `chain_path` を開き直し、
+//!   fd の `mnt_id` で行を引いて `fs_identity` を作る。本番は `fresh_state_identity`、単体テストは `BindDeps::state_identity`）。
+//!   記録した値と作り直した値の**両方**と、`chain_path` 配下の子マウントを現在の mountinfo から取り直したものを照合し、作り直せない・dev が
+//!   記録と食い違う場合は `FAILED_PRECONDITION`。判定が厳しくなる方向だけの変更で、記録した値での判定は残す。必要な理由は、
+//!   start の後に下層の実パス（マウントポイントを通らない経路）で状態ルートが改名されると、`chain_path` は同じ inode に解決し続けて
+//!   辿り直しを通る一方、記録した FS 内パスだけが古くなり、改名後の親を元にした bind が inode の鎖にも mountinfo にも映らないため。
+//!   start の後に子マウントが増えた場合も、取り直した結果で元との重なりを見る（ハードリンクの走査対象〔`scan_root`〕は start の記録のまま）。
+//!   PID 1 と start（CLI）が同じ資格情報でパスを辿れるという前提（subordinate 写像を含む）は実機の結合試験（#1916）で確かめる。
+//!   別の superblock を通して同じデータを見せるもののうち、overlayfs の層は付け替えた木の mountinfo の super_options から照合する
+//!   （手順 9 の直後。`check_overlay_layers`・`overlay_layers`。#2166）。FUSE 系の中身は検出しない。bundle の実体は rootfs の鎖と
+//!   mountinfo の `contained` で照合済み（ホスト側の bind による別名を含む）。実機での別名の確認は #1916
+//! - overlayfs の層の照合（#2166）は、付け替えた自分のマウント（`rbind` なら配下全体）のうち fstype が `overlay` のものの
+//!   `lowerdir`・`lowerdir+`・`datadir+`・`upperdir`・`workdir` を `/` から `O_NOFOLLOW` で辿り、rootfs・状態ルートの鎖と inode で照合する。
+//!   相対パス・現在の namespace で解決できない層（Docker のように `/` が overlay で下層が見えない環境を含む）・symlink・解析できない
+//!   super_options・上限（層 500・1 層 4096 バイト・1 件の bind で合計 4096 層）超過・層が別の overlay の上にある入れ子は、
+//!   `FAILED_PRECONDITION` で拒否する。残余は、入れ子の overlay の再帰的な照合（拒否で代える）と、照合から `pivot_root` までの間の
+//!   層の差し替え
+//!   （overlay の層は開き直しが実際の backing directory と同一とは限らない〔lowerdir のパスを後から別の bind で覆う等〕ため、
+//!   層の属するマウントの `(dev, path)` による照合〔#2166 の再指摘〕の後も、overlayfs を含む元は同一性を保証できず fail-closed で拒否する）
 //! - 疑似 FS の元は `f_type`（と配下の mountinfo の fstype）の**拒否リスト**で拒否する（#2098・#2065 案 B）。リストにない未知の
 //!   疑似 FS は受ける。devtmpfs（ホストの `/dev`）は `f_type` が tmpfs と同じで区別できないため、付け替えた自分のマウントの
 //!   mountinfo の fstype 名 `devtmpfs` で拒否する（#2129。手順 9）。FUSE（lxcfs のように `/proc` に似た内容を作るもの）・
-//!   overlayfs の下層の中身・別の superblock 経由の別名は検出しない（#2129 で既知の制約として文書化。`docs/api/bind-mounts.md`）。実機（user namespace と実際のマウント）での確認は #1916
+//!   別の superblock 経由の別名のうち FUSE の中身は検出しない（overlayfs の層は #2166 で照合する）。見直しの手順は
+//!   `docs/api/bind-mounts.md`。実機（user namespace と実際のマウント）での確認は #1916
 //!
 //! # 単体テストの安全策
 //!
@@ -162,8 +179,9 @@ use std::path::{Path, PathBuf};
 
 use crate::oci_runtime::ProtectedFsRoot;
 use crate::oci_runtime::mountinfo_identity::{
-    FsIdentity, dir_identity_chain, exposed_devs, fs_identity, parse_fdinfo_mnt_id,
-    parse_mountinfo, source_contains, source_reaches,
+    FsIdentity, MountRow, dir_identity_chain, dir_identity_chain_with_mnt_id, exposed_devs,
+    fs_identity, mounts_under, parse_fdinfo_mnt_id, parse_mountinfo, path_mount_id,
+    source_contains, source_reaches,
 };
 use crate::oci_runtime::{BindMountSet, BindMountSpec};
 use crate::rootless::parse_id_map;
@@ -173,6 +191,7 @@ use crate::sys::{
 };
 use crate::traits::types::ErrorCode;
 
+use super::overlay_layers::overlay_layer_paths;
 use super::tmpfs::{DIR_MODE, display_destination, open_chain, root_display};
 use super::{
     ExecError, IdMapping, IsolationStage, MountIsolation, PreparedRootfs, USER_NS_INIT_INO,
@@ -293,6 +312,7 @@ fn mount_binds_checked(
         source_mnt_id: &pinned_source_mnt_id,
         umount: &umount_fd,
         source_fs_type: &|src| sys::fs_type(src.as_fd()),
+        state_identity: &fresh_state_identity,
         before_attach,
     };
     mount_binds_at(prepared.new_root(), set, &deps)
@@ -324,6 +344,9 @@ struct BindDeps<'a> {
     umount: &'a dyn Fn(BorrowedFd<'_>) -> Result<(), SysError>,
     /// 固定した元の `statfs.f_type`（疑似 FS の拒否用。#2098）。
     source_fs_type: &'a dyn Fn(&VerifiedBindSourceFd) -> Result<i64, SysError>,
+    /// 状態ルートの (dev, path) を適用の時点の mountinfo から作り直す（記録した `chain_path` を辿り直し、fd の `mnt_id` で行を引く。
+    /// 作り直せなければ `None`。start の後の下層の改名で FS 内パスが変わっても追従するため。SEC-1・#2166）。
+    state_identity: &'a dyn Fn(&ProtectedFsRoot, &[MountRow]) -> Option<FsIdentity>,
     /// 移動検査の後・付け替えの直前に呼ぶ（本番は空。結合試験専用の入口だけが差し込む）。
     before_attach: &'a dyn Fn(),
 }
@@ -361,8 +384,9 @@ struct PseudoFs {
 /// なるため `magic` は `None`。適用後の mountinfo（`find_pseudo_fs_in_subtree`。自分のマウント自身の fstype 欄も照合するため
 /// 非再帰の bind でも効く）の名前だけで判定する。
 ///
-/// **拒否しないもの（文書化済みの限界。#2129）**: FUSE（`fuse`・`fuseblk`・`fuse.<subtype>`）と overlayfs は、データを持つ FS として
-/// 受ける。下層・FUSE デーモンが見せる中身と、別の superblock 経由の別名は検出しない（`docs/api/bind-mounts.md`）。ホストのプロセス・カーネル・LSM・cgroup 階層・BPF・
+/// **拒否しないもの（文書化済みの限界。#2129・#2166）**: FUSE（`fuse`・`fuseblk`・`fuse.<subtype>`）と overlayfs は、データを持つ FS として
+/// 受ける。overlayfs の層は `check_overlay_layers` が super_options から照合する（#2166）。FUSE デーモンが見せる中身は検出しない。
+/// カーネルの版を上げるときの見直し手順は `docs/api/bind-mounts.md`。ホストのプロセス・カーネル・LSM・cgroup 階層・BPF・
 /// 名前空間などの情報や制御口を見せる FS を並べる。`proc` は `linux.maskedPaths`・`readonlyPaths` が効かない別の宛先から
 /// 見えること、`nsfs` は `ip netns` などが通常ファイルへ bind した名前空間の固定（`/run/netns/*`）を辿れてしまうこと、
 /// `mqueue` はホストの IPC namespace の分離を越えること、`devpts`・`binder` は `nodev` で開けないが安全側に倒すこと、
@@ -725,7 +749,94 @@ fn apply_one(
         Ok(Some(fs)) => return Err(pseudo_fs_violation(spec, fs)),
         Err(why) => return Err(failed(spec, &why)),
     }
+    // 付け替えた木の overlayfs の層（lowerdir・upperdir・workdir）が rootfs・状態ルートの別名でないかを照合する（#2166）。
+    check_overlay_layers(ctx, spec, &info, observed.own_mnt_id)?;
     Ok(kind)
+}
+
+/// 1 件の bind で照合する overlayfs の層の合計の上限。`rbind` の配下に overlay が多数あっても、パスを辿る回数を頭打ちにする。
+const OVERLAY_LAYER_BUDGET: usize = 4096;
+
+/// 付け替えた自分のマウント（`rbind` なら配下全体）のうち fstype が `overlay` のものについて、層のパスを各々 `/` から
+/// `O_NOFOLLOW` で辿り、rootfs・状態ルートの実体と同一・祖先・子孫でないことを inode で照合する（SEC-1・OCI-4・#2166）。
+///
+/// overlayfs は別の superblock なので、元が overlay 上にあると inode の照合も mountinfo の `(dev, path)` の照合も
+/// 下層の実体を見ない。照合は付け替えた木そのものに対して行い、検査から複製までの TOCTOU が無い。違反は既存の理由
+/// （`BindSourceReachesStateRoot`・`BindSourceContainsRootfs`）で返し、message・監査には層のパスを載せない（SEC-4）。
+/// 解析できない・現在の namespace で解決できない（相対パス・消えた層・symlink・ディレクトリでない）・上限超過・
+/// 層が別の overlay の上にある（入れ子。再帰的には照合しない）場合は fail-closed の `FAILED_PRECONDITION`。
+fn check_overlay_layers(
+    ctx: &Ctx<'_>,
+    spec: &BindMountSpec,
+    info: &str,
+    own_id: u64,
+) -> Result<(), ExecError> {
+    let entries = parse_all_mountinfo(info).map_err(|why| failed(spec, &why))?;
+    let members =
+        subtree_members(&entries, own_id, spec.recursive()).map_err(|why| failed(spec, &why))?;
+    let unchecked = || {
+        failed(
+            spec,
+            "the overlay layers of the bind mount source cannot be checked",
+        )
+    };
+    let rows = parse_mountinfo(info)
+        .ok_or_else(|| failed(spec, "malformed or oversized /proc/thread-self/mountinfo"))?;
+    let mut budget = OVERLAY_LAYER_BUDGET;
+    let mut found_overlay = false;
+    // inode の照合をすべての層で終えてから、mountinfo の照合に進む（違反の理由を inode 側で先に確定させる）。
+    let mut resolved: Vec<(u64, String)> = Vec::new();
+    for member in members.iter().filter(|e| e.fstype == "overlay") {
+        found_overlay = true;
+        let layers = overlay_layer_paths(member.super_options).map_err(|_| unchecked())?;
+        budget = budget.checked_sub(layers.len()).ok_or_else(unchecked)?;
+        for layer in layers {
+            let (chain, mnt_id) = dir_identity_chain_with_mnt_id(&layer).ok_or_else(unchecked)?;
+            // 層が別の overlay の上にある場合は、その層の実体をさらに辿る必要があるため拒否で代える。
+            if entries
+                .iter()
+                .any(|e| e.id == mnt_id && e.fstype == "overlay")
+            {
+                return Err(unchecked());
+            }
+            let Some((&layer_id, layer_dirs)) = chain.split_first() else {
+                return Err(unchecked());
+            };
+            let mut state_chains: Vec<&[(u64, u64)]> = ctx.state_chains.clone();
+            if let Some(fresh) = &ctx.fresh_state_chains {
+                state_chains.extend(fresh.iter().map(Vec::as_slice));
+            }
+            if let Some(reason) =
+                judge_source_inodes(layer_id, layer_dirs, &ctx.rootfs_ids, &state_chains)
+            {
+                return Err(violation(spec, reason));
+            }
+            // mountinfo の (dev, path) でも照合する。inode の鎖は bind mount を挟んだ祖先関係（状態ルートの別名の配下を指す層など）を
+            // 映さないため、層の属するマウントの ID から (dev, path) を求め、保護対象・子マウントと突き合わせる（再帰的に配下も見る）。
+            // `.`・`..`・連続スラッシュを含むパスは文字列の接頭辞照合が成り立たないため拒否する。
+            if layer
+                .split('/')
+                .skip(1)
+                .any(|c| c == "." || c == ".." || (c.is_empty() && layer != "/"))
+            {
+                return Err(unchecked());
+            }
+            resolved.push((mnt_id, layer));
+        }
+    }
+    for (mnt_id, layer) in &resolved {
+        check_place_not_protected(ctx, spec, &rows, *mnt_id, layer, true, true)?;
+    }
+    // 層のパスの開き直しは、overlay が保持する実際の backing directory と同一とは限らない（overlay を作った後に lowerdir の
+    // パスを別の bind mount で覆うと、開き直しは覆った側を安全と判定し、実際には元の層が公開される）。overlayfs は層の
+    // 実体を識別できる情報を公開しないため、同一性を保証できない overlay の元は、上の照合に通っても fail-closed で拒否する。
+    if found_overlay {
+        return Err(failed(
+            spec,
+            "the overlay layers of the bind mount source cannot be verified to be the directories they were created from",
+        ));
+    }
+    Ok(())
 }
 
 /// 固定した元（と再帰 bind で一緒に公開される配下のマウント）が保護対象（状態ストアのルート）に到達しないことを、
@@ -764,12 +875,34 @@ fn check_source_not_protected(
     {
         return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
     }
+    check_place_not_protected(
+        ctx,
+        spec,
+        &mounts,
+        mnt_id,
+        &real,
+        spec.recursive(),
+        src.kind() == BindSourceKind::Directory,
+    )
+}
+
+/// 固定した場所（`mnt_id` のマウントの `real`。`recursive` なら配下のマウントも）が保護対象に到達しないことを mountinfo の
+/// `(dev, path)` で照合する（`check_source_not_protected` の本体。overlayfs の層の照合にも使う。SEC-1・#1915・#2166）。
+fn check_place_not_protected(
+    ctx: &Ctx<'_>,
+    spec: &BindMountSpec,
+    mounts: &[MountRow],
+    mnt_id: u64,
+    real: &str,
+    recursive: bool,
+    is_dir: bool,
+) -> Result<(), ExecError> {
     // ディレクトリ元の配下にある状態ファイルの別名は走査では見つけられない。代わりに start の段が状態ルート側の
     // 状態ファイルのリンク数を調べており（`has_hard_linked_files`）、別名を持つ状態ファイルがあるなら、同じ FS 上の
     // ディレクトリ元は別名を含み得るため拒否する（fail-closed。SEC-1）。
     // 再帰 bind では子マウント（別 FS を含む）も一緒に公開されるため、公開されるすべてのデバイスで照合する。
-    if src.kind() == BindSourceKind::Directory {
-        let Some(devs) = exposed_devs(&mounts, mnt_id, &real, spec.recursive()) else {
+    if is_dir {
+        let Some(devs) = exposed_devs(mounts, mnt_id, real, recursive) else {
             return Err(failed(
                 spec,
                 "the pinned bind mount source cannot be located in mountinfo",
@@ -788,25 +921,60 @@ fn check_source_not_protected(
             dev: p.dev().to_owned(),
             path: p.path().to_owned(),
         };
-        let reached = if p.is_containment_only() {
-            source_contains(&mounts, mnt_id, &real, spec.recursive(), &state)
-        } else {
-            source_reaches(&mounts, mnt_id, &real, spec.recursive(), &state)
-        };
-        match reached {
-            Some(false) => {}
-            Some(true) => {
-                return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
-            }
-            None => {
+        // 照合する保護対象の実体。記録したもの（start の時点）に加え、状態ルートは適用の時点の mountinfo から作り直した
+        // (dev, path) と子マウントも照合する（下層の実パスでの改名では `chain_path` は同じ inode に解決し続け、
+        // 記録した FS 内パスだけが古くなる。判定が厳しくなる方向のみ。#2166）。
+        let mut targets = vec![state];
+        if !p.is_containment_only()
+            && let Some(chain_path) = p.chain_path()
+        {
+            let Some(fresh) = (ctx.deps.state_identity)(p, mounts) else {
                 return Err(failed(
                     spec,
-                    "the pinned bind mount source cannot be located in mountinfo",
+                    "the state store root cannot be located in mountinfo again",
                 ));
+            };
+            if fresh.dev != p.dev() {
+                return Err(failed(
+                    spec,
+                    "the state store root moved to another filesystem after start",
+                ));
+            }
+            targets.push(fresh);
+            targets.extend(
+                mounts_under(mounts, chain_path)
+                    .into_iter()
+                    .map(|(id, _)| id),
+            );
+        }
+        for target in &targets {
+            let reached = if p.is_containment_only() {
+                source_contains(mounts, mnt_id, real, recursive, target)
+            } else {
+                source_reaches(mounts, mnt_id, real, recursive, target)
+            };
+            match reached {
+                Some(false) => {}
+                Some(true) => {
+                    return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
+                }
+                None => {
+                    return Err(failed(
+                        spec,
+                        "the pinned bind mount source cannot be located in mountinfo",
+                    ));
+                }
             }
         }
     }
     Ok(())
+}
+
+/// 状態ルートの (dev, path) を適用の時点の mountinfo で作り直す本番の実装（記録した `chain_path` を開き直し、fd の `mnt_id` で行を引く）。
+fn fresh_state_identity(p: &ProtectedFsRoot, mounts: &[MountRow]) -> Option<FsIdentity> {
+    let chain_path = p.chain_path()?;
+    let mnt = path_mount_id(chain_path)?;
+    fs_identity(mounts, mnt, chain_path)
 }
 
 /// 固定した元の属するマウントの ID（`/proc/thread-self/fdinfo/N` の `mnt_id`）。
@@ -1230,6 +1398,8 @@ struct MountInfoEntry<'a> {
     optional: Vec<&'a str>,
     /// 区切り `-` の次の fstype 欄（疑似 FS の照合に使う。出力へは写さない）。
     fstype: &'a str,
+    /// fstype・source の次の super_options 欄（overlayfs の層の照合に使う。出力へは写さない。#2166）。
+    super_options: &'a str,
 }
 
 /// mountinfo の 1 行に必須の固定フィールド数（`id parent major:minor root mount_point options`）。
@@ -1244,7 +1414,8 @@ fn parse_mountinfo_line(line: &str) -> Option<MountInfoEntry<'_>> {
         .skip(MOUNTINFO_FIXED_FIELDS)
         .position(|f| *f == "-")?
         + MOUNTINFO_FIXED_FIELDS;
-    if fields.len() < sep + 1 + MOUNTINFO_TAIL_FIELDS {
+    // 区切りの後ろは `fstype source super_options` の 3 つちょうど。余るフィールドは壊れた行として拒否する（fail-closed）。
+    if fields.len() != sep + 1 + MOUNTINFO_TAIL_FIELDS {
         return None;
     }
     Some(MountInfoEntry {
@@ -1253,6 +1424,7 @@ fn parse_mountinfo_line(line: &str) -> Option<MountInfoEntry<'_>> {
         options: fields.get(5)?,
         optional: fields.get(MOUNTINFO_FIXED_FIELDS..sep)?.to_vec(),
         fstype: fields.get(sep + 1)?,
+        super_options: fields.get(sep + 3)?,
     })
 }
 
@@ -1963,6 +2135,8 @@ mod tests {
         umount_fail: bool,
         /// 固定した元の `f_type` を差し替える（`None` は本番と同じ `sys::fs_type`）。
         source_fs_type: Option<Result<i64, SysError>>,
+        /// 状態ルートの (dev, path) の作り直しを差し替える（`None` は記録した値をそのまま返す。#2166）。
+        state_identity: Option<fn(&ProtectedFsRoot) -> Option<FsIdentity>>,
     }
 
     fn bits(read_only: bool, noexec: bool) -> i64 {
@@ -2069,6 +2243,13 @@ mod tests {
             source_fs_type: &|src| {
                 k.source_fs_type
                     .unwrap_or_else(|| sys::fs_type(src.as_fd()))
+            },
+            state_identity: &|p, _| match k.state_identity {
+                Some(f) => f(p),
+                None => Some(FsIdentity {
+                    dev: p.dev().to_owned(),
+                    path: p.path().to_owned(),
+                }),
             },
             before_attach: &|| push("before_attach".into()),
         };
@@ -3730,6 +3911,7 @@ mod tests {
             source_mnt_id: &|_| Ok(0),
             umount: &|_| Ok(()),
             source_fs_type: &|_| Ok(0),
+            state_identity: &|_, _| None,
             before_attach: &|| {},
         };
         let ctx = Ctx {
@@ -3769,6 +3951,7 @@ mod tests {
             source_mnt_id: &|_| Ok(0),
             umount: &|_| Ok(()),
             source_fs_type: &|_| Ok(0),
+            state_identity: &|_, _| None,
             before_attach: &|| {},
         };
         let ctx = Ctx {
@@ -3795,5 +3978,282 @@ mod tests {
             "{}",
             err.message
         );
+    }
+    // ---- #2166: overlayfs の層の照合と、状態ルートの (dev, path) の再解決（SEC-1・OCI-4・SEC-5） ----
+
+    /// 親（`/`）と自分のマウント（id 200）の 2 行。自分のマウントの fstype を overlay にして super_options を差し替える。
+    fn overlay_knobs(super_options: &str) -> Knobs {
+        Knobs {
+            mountinfo: Some(format!(
+                "1 0 0:1 / / rw - tmpfs none rw\n\
+                 200 1 0:2 / /x rw,nosuid,nodev - overlay overlay {super_options}\n"
+            )),
+            ..Knobs::default()
+        }
+    }
+
+    /// 状態ルート（`src/state/sub` を持つ）を保護対象にした集合。保護対象の FS 内パス・dev は無関係な値にして、
+    /// mountinfo の層では拒否されない条件にする。
+    fn overlay_state_set(fx: &Fx, opts: &[&str]) -> (BindMountSet, String) {
+        let state = fx.src.join("state");
+        std::fs::create_dir_all(state.join("sub")).expect("state/sub");
+        let state_s = state.to_str().expect("utf8").to_owned();
+        let chain = dir_identity_chain(&state_s).expect("chain");
+        let set = one("/mnt/d", &fx.src("dir"), opts).with_protected_roots(vec![
+            ProtectedFsRoot::new("9:9".to_owned(), "/registered/state".to_owned(), false)
+                .with_inode_chain(state_s.clone(), chain),
+        ]);
+        (set, state_s)
+    }
+
+    /// SEC-1・#2166: overlay の lowerdir・upperdir・workdir が状態ルートの同一・祖先・子孫なら拒否し、rootfs の祖先は
+    /// `BindSourceContainsRootfs`。無関係な層も同一性を保証できないため `FAILED_PRECONDITION`。拒否のときは自分のマウントを外す（後始末）。
+    #[test]
+    fn sec1_2166_overlay_layers_aliasing_state_or_rootfs_are_rejected() {
+        let fx = fx();
+        let (set, state) = overlay_state_set(&fx, &[]);
+        let other = fx.tmp.path().join("other");
+        std::fs::create_dir(&other).expect("other");
+        let other = other.to_str().expect("utf8").to_owned();
+        let parent = fx.src.to_str().expect("utf8").to_owned();
+        let tmp = fx.tmp.path().to_str().expect("utf8").to_owned();
+        let reaches = Some(ViolationReason::BindSourceReachesStateRoot);
+        let cases = [
+            (format!("lowerdir={state}"), reaches),
+            (format!("lowerdir={other}:{state}"), reaches),
+            (
+                format!("lowerdir={other},upperdir={state},workdir={other}"),
+                reaches,
+            ),
+            (
+                format!("lowerdir={other},upperdir={other},workdir={state}"),
+                reaches,
+            ),
+            (format!("lowerdir+={state}"), reaches),
+            (format!("lowerdir={other}::{state}"), reaches),
+            (format!("lowerdir={parent}"), reaches),
+            (format!("lowerdir={state}/sub"), reaches),
+            (
+                format!("lowerdir={tmp}"),
+                Some(ViolationReason::BindSourceContainsRootfs),
+            ),
+            (
+                format!("lowerdir={other},upperdir={other},workdir={other},redirect_dir=off"),
+                None,
+            ),
+        ];
+        for (opts, want) in cases {
+            let (r, log) = run(&fx, &set, &overlay_knobs(&opts));
+            match want {
+                Some(reason) => {
+                    let err = r.expect_err(&opts);
+                    assert_eq!(reason_of(&err), Some(reason), "{opts}");
+                    assert!(
+                        log.iter().any(|l| l.starts_with("umount(")),
+                        "{opts}: {log:?}"
+                    );
+                    assert!(!err.message.contains(&state), "{}", err.message);
+                }
+                None => {
+                    // 無関係な層でも、実際の backing directory との同一性を保証できないため fail-closed で拒否する（#2166）。
+                    let err = r.expect_err(&opts);
+                    assert_eq!(err.code, ErrorCode::FailedPrecondition, "{opts}");
+                    assert!(err.violation.is_none(), "{opts}");
+                    assert!(
+                        log.iter().any(|l| l.starts_with("umount(")),
+                        "{opts}: {log:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// SEC-1・#2166: 解析できない・解決できない・入れ子・上限超過の層は `FAILED_PRECONDITION`（fail-closed）。
+    #[test]
+    fn sec1_2166_unresolvable_overlay_layers_fail_closed() {
+        let fx = fx();
+        let (set, _) = overlay_state_set(&fx, &[]);
+        let dir = fx.tmp.path().join("layer");
+        std::fs::create_dir(&dir).expect("layer");
+        let link = fx.tmp.path().join("layer-link");
+        std::os::unix::fs::symlink(&dir, &link).expect("symlink");
+        let file = fx.tmp.path().join("layer-file");
+        std::fs::write(&file, b"f").expect("file");
+        let p = |p: &Path| p.to_str().expect("utf8").to_owned();
+        let many = (0..=500)
+            .map(|i| format!("/l{i}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        for opts in [
+            "lowerdir=relative/layer".to_owned(),
+            format!("lowerdir={}/missing", p(fx.tmp.path())),
+            format!("lowerdir={}", p(&link)),
+            format!("lowerdir={}", p(&file)),
+            format!("lowerdir={}\\x", p(&dir)),
+            "rw".to_owned(),
+            format!("lowerdir={many}"),
+        ] {
+            let (r, log) = run(&fx, &set, &overlay_knobs(&opts));
+            let err = r.expect_err(&opts);
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{opts}");
+            assert!(err.violation.is_none(), "{opts}");
+            assert!(
+                err.message.contains("overlay layers"),
+                "{opts}: {}",
+                err.message
+            );
+            assert!(
+                log.iter().any(|l| l.starts_with("umount(")),
+                "{opts}: {log:?}"
+            );
+        }
+        // 層が別の overlay の上にある（入れ子）。層の属するマウントの行を overlay にする。
+        let n = path_mount_id(&p(&dir)).expect("mnt id");
+        let info = format!(
+            "1 0 0:1 / / rw - tmpfs none rw\n\
+             200 1 0:2 / /x rw,nosuid,nodev - overlay overlay lowerdir={}\n\
+             {n} 1 0:3 / /y rw - overlay overlay lowerdir=/zz\n",
+            p(&dir)
+        );
+        let knobs = Knobs {
+            mountinfo: Some(info),
+            ..Knobs::default()
+        };
+        let (r, _) = run(&fx, &set, &knobs);
+        let err = r.expect_err("nested overlay");
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+    }
+
+    /// SEC-1・#2166: `rbind` では配下の overlay の層も照合し、`bind`（非再帰）は自分のマウントだけを見る。
+    #[test]
+    fn sec1_2166_overlay_below_the_mount_is_checked_only_when_recursive() {
+        let fx = fx();
+        let info = |state: &str| Knobs {
+            mountinfo: Some(format!(
+                "1 0 0:1 / / rw - tmpfs none rw\n\
+                 200 1 0:2 / /x rw,nosuid,nodev - tmpfs none rw\n\
+                 300 200 0:3 / /x/sub rw,nosuid,nodev - overlay overlay lowerdir={state}\n"
+            )),
+            ..Knobs::default()
+        };
+        let (set, state) = overlay_state_set(&fx, &["rbind"]);
+        let (r, _) = run(&fx, &set, &info(&state));
+        assert_eq!(
+            reason_of(&r.expect_err("rbind")),
+            Some(ViolationReason::BindSourceReachesStateRoot)
+        );
+        let (set, state) = overlay_state_set(&fx, &["bind"]);
+        // 非再帰では配下の行は自分のマウントではない。
+        let (r, _) = run(&fx, &set, &info(&state));
+        r.expect("non-recursive bind ignores the child overlay");
+    }
+
+    /// SEC-4・#2166: overlay の層による拒否の監査レコードには、コンテナ内の宛先だけが載り、層のパスは載らない。
+    #[test]
+    fn sec4_2166_overlay_rejection_audit_has_destination_only() {
+        let fx = fx();
+        let (set, state) = overlay_state_set(&fx, &[]);
+        let (r, _) = run(&fx, &set, &overlay_knobs(&format!("lowerdir={state}")));
+        let err = r.expect_err("rejected");
+        let sink = VecSink::new(false);
+        let out = audit_mount_violation(err, None, &sink);
+        assert_eq!(out.delivery, AuditDelivery::Recorded);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].reason().map(crate::audit_log::AuditReason::as_str),
+            Some("bind_source_reaches_state_root")
+        );
+        assert_eq!(recs[0].path(), Some(Path::new("/mnt/d")));
+        assert!(!format!("{:?}", recs[0]).contains(&state));
+    }
+
+    /// mountinfo の super_options 欄を取り出し、区切りの後ろに余るフィールドがある行は拒否する。
+    #[test]
+    fn sec1_2166_mountinfo_entry_exposes_super_options() {
+        let line = "200 1 0:2 / /x rw - overlay overlay rw,lowerdir=/a:/b,upperdir=/u";
+        let e = parse_mountinfo_line(line).expect("parse");
+        assert_eq!(e.fstype, "overlay");
+        assert_eq!(e.super_options, "rw,lowerdir=/a:/b,upperdir=/u");
+        assert!(parse_mountinfo_line(&format!("{line} extra")).is_none());
+        assert!(parse_mountinfo_line("200 1 0:2 / /x rw - overlay overlay").is_none());
+    }
+
+    /// 反例の土台。start の時点の記録は状態ルート `8:1 /srv/state`、元は `8:1` 上の `src/dir`（記録とは無関係に見える）。
+    fn rebuilt_state_set(fx: &Fx) -> (BindMountSet, Knobs) {
+        let state = fx.tmp.path().join("state");
+        std::fs::create_dir(&state).expect("state");
+        let state_s = state.to_str().expect("utf8").to_owned();
+        let chain = dir_identity_chain(&state_s).expect("chain");
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(vec![
+            ProtectedFsRoot::new("8:1".to_owned(), "/srv/state".to_owned(), false)
+                .with_inode_chain(state_s, chain),
+        ]);
+        let knobs = Knobs {
+            mountinfo: Some(
+                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                 200 1 8:1 / /x rw,nosuid,nodev - ext4 /dev/sda1 rw\n"
+                    .to_owned(),
+            ),
+            ..Knobs::default()
+        };
+        (set, knobs)
+    }
+
+    /// SEC-1・#2166: 下層の実パスで状態ルートが改名され、記録した FS 内パスが古くなっても、適用の時点で作り直した
+    /// (dev, path) で照合して拒否する。記録と同じ値なら従来どおり受ける。
+    #[test]
+    fn sec1_2166_rebuilt_state_identity_catches_a_stale_recorded_path() {
+        let fx = fx();
+        let (set, knobs) = rebuilt_state_set(&fx);
+        run(&fx, &set, &knobs)
+            .0
+            .expect("recorded identity does not overlap");
+        // 改名後の状態ルートは、元（`src/dir`）の祖先の位置にある。
+        fn renamed(_: &ProtectedFsRoot) -> Option<FsIdentity> {
+            Some(FsIdentity {
+                dev: "8:1".to_owned(),
+                path: "/".to_owned(),
+            })
+        }
+        let knobs = Knobs {
+            state_identity: Some(renamed),
+            ..knobs
+        };
+        let (r, _) = run(&fx, &set, &knobs);
+        assert_eq!(
+            reason_of(&r.expect_err("rejected")),
+            Some(ViolationReason::BindSourceReachesStateRoot)
+        );
+    }
+
+    /// SEC-1・#2166: 作り直せない・dev が記録と食い違う場合は `FAILED_PRECONDITION`（fail-closed）。
+    #[test]
+    fn sec1_2166_unrebuildable_or_changed_state_identity_fails_closed() {
+        let fx = fx();
+        let (set, knobs) = rebuilt_state_set(&fx);
+        fn missing(_: &ProtectedFsRoot) -> Option<FsIdentity> {
+            None
+        }
+        fn other_dev(_: &ProtectedFsRoot) -> Option<FsIdentity> {
+            Some(FsIdentity {
+                dev: "8:2".to_owned(),
+                path: "/srv/state".to_owned(),
+            })
+        }
+        for f in [
+            missing as fn(&ProtectedFsRoot) -> Option<FsIdentity>,
+            other_dev,
+        ] {
+            let k = Knobs {
+                mountinfo: knobs.mountinfo.clone(),
+                state_identity: Some(f),
+                ..Knobs::default()
+            };
+            let (r, _) = run(&fx, &set, &k);
+            let err = r.expect_err("fail closed");
+            assert_eq!(err.code, ErrorCode::FailedPrecondition);
+            assert!(err.violation.is_none());
+        }
     }
 }

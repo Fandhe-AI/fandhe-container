@@ -132,10 +132,32 @@ pub(crate) fn apply_default_seccomp_with_listener_threads(
     sender: ListenerSender,
     threads: &mut ThreadCountSource,
 ) -> Result<SeccompReport, ExecError> {
-    let program = build_default_program()?;
-    apply_single_threaded_with_listener(&program, &mut RealKernel { threads }, |fd| {
-        sender.hand_over(fd, ACK_TIMEOUT)
-    })
+    let program = match build_default_program() {
+        Ok(p) => p,
+        Err(e) => {
+            sender.report_failure(&e);
+            return Err(e);
+        }
+    };
+    // 送り手は受け渡しの closure が取り出す。適用が先に失敗して残っていたら、失敗を C へ知らせる(EOF 由来の
+    // `Internal` に潰さない。SEC-4・#2024)。
+    let slot = std::cell::RefCell::new(Some(sender));
+    let result =
+        apply_single_threaded_with_listener(&program, &mut RealKernel { threads }, |fd| match slot
+            .borrow_mut()
+            .take()
+        {
+            Some(sender) => sender.hand_over(fd, ACK_TIMEOUT),
+            None => Err(ExecError::new(
+                ErrorCode::Internal,
+                IsolationStage::Seccomp,
+                "the listener sender was already consumed",
+            )),
+        });
+    if let (Err(e), Some(sender)) = (&result, slot.borrow().as_ref()) {
+        sender.report_failure(e);
+    }
+    result
 }
 
 /// [`apply_default_seccomp`] のスレッド数取得元を差し替える版（SUP-6・TASK-163.3・#502）。

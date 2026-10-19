@@ -52,6 +52,8 @@ use crate::traits::types::ErrorCode;
 
 /// listener を送るときの本文（1 バイト）。
 pub(crate) const TOKEN_LISTENER: u8 = b'L';
+/// listener を渡す前の適用失敗を知らせる本文の先頭(`E` + コード 1 バイト。fd は伴わない。受信の本文上限は 8 バイト。SEC-4・#2024)。
+pub(crate) const TOKEN_FAILURE: u8 = b'E';
 /// 受領の確認応答の本文（1 バイト）。
 pub(crate) const ACK: u8 = b'A';
 /// 子が ACK を待つ上限（C は受信直後に返すため通常は即時。launch の開始ゲートと同じ値。REPAIR-5）。
@@ -80,6 +82,22 @@ pub(crate) struct ListenerSender(OwnedFd);
 impl ListenerSender {
     pub(crate) fn new(child_end: OwnedFd) -> Self {
         Self(child_end)
+    }
+
+    /// listener を得る前の適用失敗(`EBUSY` 等)を `E` + コード 1 バイト(`F` FailedPrecondition・`P` PermissionDenied・
+    /// `U` Unimplemented・`T` Timeout・その他 `I`)の 1 通で C へ知らせる(ベストエフォート。SEC-4・#2024)。
+    ///
+    /// 運ぶのは `ErrorCode` の分類 1 バイトだけ(メッセージ・errno は運ばない)。C は [`receive_listener`] で段 `Seccomp` の
+    /// 同じコードの失敗に復元し、EOF 由来の `Internal` に潰れない。送れなくても(C が既に閉じた等)失敗は変わらない。
+    pub(crate) fn report_failure(&self, error: &ExecError) {
+        let code = match error.code {
+            ErrorCode::FailedPrecondition => b'F',
+            ErrorCode::PermissionDenied => b'P',
+            ErrorCode::Unimplemented => b'U',
+            ErrorCode::Timeout => b'T',
+            _ => b'I',
+        };
+        let _ = sys::send_nonblocking_unix(self.0.as_fd(), &[TOKEN_FAILURE, code]);
     }
 
     /// `listener` を C へ送り、自分の fd を閉じ、C の ACK を期限つきで待つ。どれかが失敗したら exec に進ませない
@@ -183,6 +201,50 @@ fn validate(
     Ok(fd)
 }
 
+/// 適用失敗の通知(`E` + コード 1 バイト。fd 無し・送信元が期待の pid)なら、段 `Seccomp` の同じコードの `ExecError` に復元する。
+/// 許可リスト外の語は `Internal`。通知でなければ `None`(通常の検証へ進む)。
+fn decode_failure(
+    received: &sys::seccomp_notify::ReceivedFd,
+    expected_pid: u32,
+) -> Option<ExecError> {
+    if received.payload.first() != Some(&TOKEN_FAILURE) || !received.fds.is_empty() {
+        return None;
+    }
+    let from_expected = received
+        .creds
+        .as_ref()
+        .is_some_and(|c| u32::try_from(c.pid).ok() == Some(expected_pid));
+    if received.truncated || !from_expected {
+        return None;
+    }
+    if received.payload.len() != 2 {
+        return None;
+    }
+    let (code, message) = match received.payload.get(1).copied() {
+        Some(b'F') => (
+            ErrorCode::FailedPrecondition,
+            "seccomp listener unavailable: an ancestor filter already has a listener, or the process state forbids it",
+        ),
+        Some(b'P') => (
+            ErrorCode::PermissionDenied,
+            "the container init was denied while applying the seccomp filter",
+        ),
+        Some(b'U') => (
+            ErrorCode::Unimplemented,
+            "the seccomp filter is not supported on this target",
+        ),
+        Some(b'T') => (
+            ErrorCode::Timeout,
+            "the container init timed out while applying the seccomp filter",
+        ),
+        _ => (
+            ErrorCode::Internal,
+            "the container init failed to apply the seccomp filter",
+        ),
+    };
+    Some(ExecError::new(code, IsolationStage::Seccomp, message))
+}
+
 /// 子の端と対になる C の端から listener を受け取って検証し、ACK を返す。
 ///
 /// `expected_pid` は C が起動した子（launch は PID 1、exec は worker）の pid。`deadline` までに届かなければ
@@ -212,6 +274,9 @@ pub(crate) fn receive_listener(
     }
     let received = sys::seccomp_notify::recv_fd_with_creds(sock)
         .map_err(|e| ExecError::from_sys(e, STAGE, "receive of the seccomp listener"))?;
+    if let Some(e) = decode_failure(&received, expected_pid) {
+        return Err(e);
+    }
     let fd = validate(received, expected_pid)
         .map_err(|why| ExecError::new(ErrorCode::Internal, STAGE, why))?;
     sys::send_nonblocking_unix(sock, &[ACK])

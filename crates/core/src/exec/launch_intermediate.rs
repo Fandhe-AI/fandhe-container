@@ -1686,6 +1686,8 @@ mod tests {
         WrongFd,
         /// PID 1 ではなく中間プロセスが listener を送る(送信元 pid の不一致)。
         WrongSender,
+        /// listener を得る前の適用失敗(`EBUSY` 相当の `FailedPrecondition`)を構造化して送り、0 で終了する。
+        ReportBusy,
     }
 
     /// 実 listener を載せた状態の fd を作る(forked 単一スレッドの子の中でだけ呼ぶ。filter は子に残る)。
@@ -1734,6 +1736,14 @@ mod tests {
                             }
                         }
                         Handoff::NoSend | Handoff::WrongSender => 0,
+                        Handoff::ReportBusy => {
+                            sender.report_failure(&ExecError::new(
+                                ErrorCode::FailedPrecondition,
+                                IsolationStage::Seccomp,
+                                "busy",
+                            ));
+                            0
+                        }
                         Handoff::WrongFd => {
                             let (r, _w) = std::io::pipe().expect("pipe");
                             match sender
@@ -1799,6 +1809,23 @@ mod tests {
         assert_eq!(failure.rejection.error.code, ErrorCode::Internal);
         assert_eq!(failure.rejection.error.stage, IsolationStage::Seccomp);
         assert!(failure.unreaped.is_empty());
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    /// SEC-4・#2024: listener 取得前の適用失敗(祖先に listener がある `EBUSY`)は EOF 由来の `Internal` に潰れず、
+    /// 段 `Seccomp` の `FailedPrecondition` として C に復元され、PID 1 は回収される。
+    #[test]
+    fn sec4_2024_launch_restores_failed_precondition_from_pre_listener_failure() {
+        let (result, elapsed, pid1) = run_handoff(Handoff::ReportBusy, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Seccomp);
+        assert_eq!(
+            failure.rejection.error.message,
+            "seccomp listener unavailable: an ancestor filter already has a listener, or the process state forbids it"
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
         assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
     }
 

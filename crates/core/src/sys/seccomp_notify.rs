@@ -187,8 +187,10 @@ pub(crate) fn unix_seqpacket_pair() -> Result<(OwnedFd, OwnedFd), SysError> {
     if rc == -1 {
         return Err(last_error());
     }
+    // 配列をパターンで分解して取り出す(カーネル応答の添字アクセスを避ける)。
+    let [first, second] = sv;
     // SAFETY: 成功時の 2 要素はカーネルが新規に確保した fd で、他に所有者がいない。
-    Ok(unsafe { (OwnedFd::from_raw_fd(sv[0]), OwnedFd::from_raw_fd(sv[1])) })
+    Ok(unsafe { (OwnedFd::from_raw_fd(first), OwnedFd::from_raw_fd(second)) })
 }
 
 /// `SO_PASSCRED` を有効にする（受信側が、送信側の資格情報を `SCM_CREDENTIALS` で受け取るため。送信の前に設定する）。

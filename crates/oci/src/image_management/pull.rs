@@ -242,6 +242,13 @@ impl PullSession<'_> {
     ///
     /// 同じ digest のトークンが未解放のうちに再度呼ぶと `AlreadyExists`（1 リース = 1 トークン）。
     pub fn lease_existing_blob(&mut self, digest: &Digest) -> Result<BlobReuse, OciError> {
+        let recorder = self.store.recorder();
+        record_oci_op(recorder, OciOpKind::LeaseBlob, || {
+            self.lease_existing_blob_inner(digest)
+        })
+    }
+
+    fn lease_existing_blob_inner(&mut self, digest: &Digest) -> Result<BlobReuse, OciError> {
         self.note_blob(digest)?;
         if self.leased.contains(digest) {
             return Err(err(
@@ -288,6 +295,13 @@ impl PullSession<'_> {
     ///
     /// 別セッション・別ストアが発行したトークンは `PermissionDenied` で拒否し、テーブルを変えない。
     pub fn release_leased(&mut self, blob: LeasedBlob) -> Result<(), OciError> {
+        let recorder = self.store.recorder();
+        record_oci_op(recorder, OciOpKind::ReleaseBlobLease, || {
+            self.release_leased_inner(blob)
+        })
+    }
+
+    fn release_leased_inner(&mut self, blob: LeasedBlob) -> Result<(), OciError> {
         if blob.session != self.session || !self.leased.contains(&blob.digest) {
             return Err(err(
                 OciErrorCode::PermissionDenied,
@@ -376,6 +390,56 @@ mod tests {
         assert_eq!(items[1].outcome(), OciOpOutcome::Failure);
         assert_eq!(items[1].error_code(), Some(dup.code()));
         assert_eq!(items[2].outcome(), OciOpOutcome::Success);
+    }
+
+    /// REPAIR-4: リースの登録・返却が操作単位で記録される（成功・AlreadyExists・PermissionDenied）。
+    #[test]
+    fn repair4_lease_and_release_are_recorded() {
+        use crate::instrument::OciOpOutcome;
+        use crate::instrument::testing::Collect;
+        let root = Root::new("rec-lease");
+        root.put(&d(1), 5);
+        let rec = std::sync::Arc::new(Collect::default());
+        let store = ImageStore::open(&root.0)
+            .unwrap()
+            .with_recorder(rec.clone());
+        let mut s1 = store.begin_pull(pid("p1")).unwrap();
+        let mut s2 = store.begin_pull(pid("p2")).unwrap();
+        let BlobReuse::Leased(b1) = s1.lease_existing_blob(&d(1)).unwrap() else {
+            panic!("expected Leased");
+        };
+        let dup = s1.lease_existing_blob(&d(1)).err().unwrap();
+        assert_eq!(dup.code(), OciErrorCode::AlreadyExists);
+        let denied = s2.release_leased(b1).err().unwrap();
+        assert_eq!(denied.code(), OciErrorCode::PermissionDenied);
+        let BlobReuse::Leased(b2) = s2.lease_existing_blob(&d(1)).unwrap() else {
+            panic!("expected Leased");
+        };
+        s2.release_leased(b2).unwrap();
+        let got: Vec<_> = rec
+            .items()
+            .iter()
+            .filter(|i| matches!(i.kind(), OciOpKind::LeaseBlob | OciOpKind::ReleaseBlobLease))
+            .map(|i| (i.kind(), i.outcome(), i.error_code()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (OciOpKind::LeaseBlob, OciOpOutcome::Success, None),
+                (
+                    OciOpKind::LeaseBlob,
+                    OciOpOutcome::Failure,
+                    Some(OciErrorCode::AlreadyExists)
+                ),
+                (
+                    OciOpKind::ReleaseBlobLease,
+                    OciOpOutcome::Failure,
+                    Some(OciErrorCode::PermissionDenied)
+                ),
+                (OciOpKind::LeaseBlob, OciOpOutcome::Success, None),
+                (OciOpKind::ReleaseBlobLease, OciOpOutcome::Success, None),
+            ]
+        );
     }
 
     /// OCI-7: 既存 blob の再利用は、使う前に自分の pull ID でリースを登録する。

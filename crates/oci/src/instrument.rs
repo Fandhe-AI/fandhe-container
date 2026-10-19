@@ -46,6 +46,12 @@ pub enum OciOpKind {
     AcquireImageStoreLock,
     /// pull セッションの開始とステージングディレクトリの作成（TASK-183.9・OCI-7）。
     BeginPull,
+    /// pull による既存 blob のリース登録と実体確認（stat 失敗・重複取得を含む操作全体。TASK-183.9・OCI-7）。
+    LeaseBlob,
+    /// pull がリーストークンを返却して自分のリースを外す操作（他セッションのトークン拒否を含む。TASK-183.9・OCI-7）。
+    ReleaseBlobLease,
+    /// `image prune` の実行（無参照イメージ・レイヤーの回収。TASK-183.7・OCI-7）。
+    PruneImages,
     /// `image tag` のタグ登録（TASK-183.4・OCI-7）。
     TagImage,
 }
@@ -68,6 +74,9 @@ impl OciOpKind {
             OciOpKind::RemoveImage => "oci.image.rm",
             OciOpKind::AcquireImageStoreLock => "oci.store.lock",
             OciOpKind::BeginPull => "oci.pull.begin",
+            OciOpKind::LeaseBlob => "oci.pull.lease",
+            OciOpKind::ReleaseBlobLease => "oci.pull.release",
+            OciOpKind::PruneImages => "oci.image.prune",
             OciOpKind::TagImage => "oci.image.tag",
         }
     }

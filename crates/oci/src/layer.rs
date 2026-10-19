@@ -30,6 +30,7 @@
 //! 複数レイヤーの重ね合わせ展開（TASK-52.4・#410）も同モジュールの `extract_layers` / `extract_layer_blobs`。
 
 pub mod extract;
+pub mod idmap;
 
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};

@@ -62,15 +62,15 @@
 //! `Unimplemented` で拒否する（指定より強い権限・弱い分離での起動を防ぐ）。後続タスクが適用を
 //! 実装した時点で該当検査を外す。
 //!
-//! - `process.cwd` が `/` 以外（exec フローが cwd 未対応）
-//! - `process.user` が uid 0・gid 0・追加 gid なし以外（ユーザー切替は未実装）
+//! - `process.user.additionalGids` が空でない（補助グループの適用は未実装。`process.cwd` は pivot 直後に fd 起点で適用し、
+//!   `process.user` の uid・gid は launcher が user namespace の写像と照合して適用する。OCI-1・SEC-5）
 //! - `process.terminal` が true（端末受け渡し未実装）
 //! - `mounts` のうち bind 以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
 //!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind〔#1917〕は未対応）
 //! - `linux.namespaces[].path` の指定（既存 namespace への join 未実装）
 //! - `network`・`cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）
-//! - `linux.namespaces` に user namespace が無い（`process.user` は root 必須のため、ホスト root での
-//!   起動になる。`PermissionDenied`。SEC-5）
+//! - `linux.namespaces` に user namespace が無い（`process.user` がホストの uid として働いてしまう。
+//!   `PermissionDenied`。SEC-5）
 //! - `linux.namespaces` に IPC namespace が無い（ホストの IPC を共有する起動を防ぐ。共有の明示許可は
 //!   未実装のため必須。`InvalidArgument`。SEC-1）
 //! - `linux.namespaces` に PID・mount・UTS namespace が無い（CORE-1 の最小分離〔PID/mount/UTS/IPC〕を
@@ -136,6 +136,7 @@ use super::mountinfo_identity::{
     FsIdentity, MountinfoReadError, dir_identity_chain, fs_identity, mounts_under, parse_mountinfo,
     path_mount_id, read_mountinfo_bounded, source_contains, source_reaches,
 };
+use super::working_dir::ContainerWorkingDir;
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
@@ -792,18 +793,24 @@ fn build_spec(
     }
     validate_entrypoint_limits(process.args(), process.env())?;
     let user = process.user();
-    if process.cwd() != Path::new("/") {
-        return Err(unsupported("process.cwd other than /"));
-    }
-    if user.uid() != 0 || user.gid() != 0 || !user.additional_gids().is_empty() {
-        return Err(unsupported("process.user other than root"));
+    let ids = (user.uid(), user.gid());
+    // cwd は字句検証だけここで行い、適用は子が pivot 直後に fd 起点で行う（不在・非ディレクトリは launch 側の拒否。OCI-1）。
+    let working_dir = ContainerWorkingDir::parse(process.cwd()).ok_or_else(|| {
+        TraitError::new(
+            ErrorCode::InvalidArgument,
+            "process.cwd must be a normalized absolute path without .. components",
+        )
+    })?;
+    // uid・gid は launcher が写像と照合して適用する（SEC-5）。補助グループは未実装のため拒否する（REPAIR-3）。
+    if !user.additional_gids().is_empty() {
+        return Err(unsupported("process.user.additionalGids"));
     }
     if process.terminal() {
         return Err(unsupported("process.terminal"));
     }
     reject_unsupported_linux(&config)?;
     reject_protected_paths_over_implicit_dev(&config)?;
-    // process.user は root 必須のため、user namespace が無いとホスト root で起動してしまう（SEC-5）。
+    // user namespace が無いと process.user がホストの uid として働いてしまう（SEC-5）。
     if !config
         .namespaces()
         .iter()
@@ -811,7 +818,7 @@ fn build_spec(
     {
         return Err(TraitError::new(
             ErrorCode::PermissionDenied,
-            "a user namespace is required to run as root",
+            "a user namespace is required (SEC-5)",
         ));
     }
 
@@ -857,6 +864,8 @@ fn build_spec(
         Arc::new(config),
         id.clone(),
         bind_mounts,
+        working_dir,
+        ids,
     ))
 }
 
@@ -1947,15 +1956,6 @@ mod tests {
     #[test]
     fn sec1_start_rejects_unsupported_fields() {
         let cases: Vec<Case> = vec![
-            ("cwd", Box::new(|c| c["process"]["cwd"] = json!("/work"))),
-            (
-                "uid",
-                Box::new(|c| c["process"]["user"]["uid"] = json!(1000)),
-            ),
-            (
-                "gid",
-                Box::new(|c| c["process"]["user"]["gid"] = json!(1000)),
-            ),
             (
                 "addgid",
                 Box::new(|c| c["process"]["user"]["additionalGids"] = json!([5])),
@@ -1991,6 +1991,33 @@ mod tests {
                 err.message()
             );
         }
+    }
+
+    /// OCI-1・SEC-5: `process.cwd` と非 root の `process.user`（uid・gid）は start で拒否せず、検証済みの値として
+    /// launcher へ渡る（適用は子と launcher が行う）。`cwd` の正規化と、`..` を含む `cwd` の拒否も確かめる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci1_start_passes_cwd_and_user_to_launcher() {
+        let mut cfg = valid_config();
+        cfg["process"]["cwd"] = json!("//work/./dir/");
+        cfg["process"]["user"]["uid"] = json!(1000);
+        cfg["process"]["user"]["gid"] = json!(1001);
+        let spec = build_spec_with_state_root("cwd-user", &cfg, None).expect("spec");
+        assert_eq!(
+            spec.working_dir(),
+            &ContainerWorkingDir::parse(Path::new("/work/dir")).expect("parse")
+        );
+        assert_eq!(spec.working_dir().components(), ["work", "dir"]);
+        assert_eq!(spec.user(), (1000, 1001));
+
+        let mut cfg = valid_config();
+        cfg["process"]["cwd"] = json!("/a/../b");
+        let err = build_spec_with_state_root("cwd-dotdot", &cfg, None).expect_err("must fail");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "process.cwd must be a normalized absolute path without .. components"
+        );
     }
 
     /// bind mount つきの config（宛先・元・オプションを指定）。
@@ -2509,7 +2536,7 @@ mod tests {
         cfg["linux"]["namespaces"] = json!([{"type": "pid"}, {"type": "mount"}]);
         let err = start_rejected_after_rewrite("no-userns", &cfg);
         assert_eq!(err.code(), ErrorCode::PermissionDenied);
-        assert_eq!(err.message(), "a user namespace is required to run as root");
+        assert_eq!(err.message(), "a user namespace is required (SEC-5)");
     }
 
     /// CORE-2: 同一 ID の start が進行中なら二重に launch せず FailedPrecondition を返す。
@@ -2896,6 +2923,35 @@ mod tests {
         assert_eq!((held.dev(), held.ino()), (named.dev(), named.ino()));
         // CORE-3: cgroup 指定の無い config では要件なし。
         assert!(!spec.cgroup_requirement().is_required());
+    }
+
+    /// #2019・CORE-3: 資源つきの config を start すると、launcher へ渡る `LaunchSpec` は cgroup 要件ありで、
+    /// config の `linux.resources` が具体値で載る。create 後に `cgroupsPath` を足されたら起動前に拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core3_start_carries_resources_and_requires_cgroup() {
+        use crate::oci_runtime::ByteLimit;
+        let b = Bundle::new("resources");
+        let mut cfg = valid_config();
+        cfg["linux"]["resources"] = json!({"memory": {"limit": 67108864}, "pids": {"limit": 64}});
+        b.write_config(&cfg);
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        let store = MemStateStore::new(None);
+        create(&store, &OpRecorder::new(), &b.create_req("resources")).expect("create");
+        let launcher = RecordingLauncher::new(false);
+        run(&store, &launcher, "resources").expect("start");
+        let specs = launcher.specs.lock().expect("lock");
+        let spec = specs.first().expect("spec");
+        assert!(spec.cgroup_requirement().is_required());
+        assert_eq!(spec.cgroup_requirement().reasons(), vec!["linux.resources"]);
+        let limits = spec.config().linux_resources().expect("resources");
+        assert_eq!(limits.memory_max(), Some(ByteLimit::Bytes(67_108_864)));
+        assert_eq!(limits.pids_limit(), Some(64));
+
+        let mut rewritten = valid_config();
+        rewritten["linux"]["cgroupsPath"] = json!("/x");
+        let err = start_rejected_after_rewrite("resources-path", &rewritten);
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
     }
 
     /// SEC-1: bundle の祖先が symlink なら（create は受理しても）start は起動前に拒否し、予約もしない。

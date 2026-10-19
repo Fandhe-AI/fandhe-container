@@ -14,8 +14,9 @@
 //! | `linux.cgroupsPath` | キーがあれば cgroup を使う |
 //! | どちらも無し | 使わない（join の手段が無くても拒否しない） |
 //!
-//! パーサは値を読まず指定の有無だけを保持する（`OciConfig::unapplied_fields`）。値で区別すると未知の
-//! 制限の見逃し（fail-open）になるため、存在だけで要件とする（SEC-1）。
+//! 判定は型つきのアクセサ（`OciConfig::linux_resources` / `cgroups_path`）の有無で行う（#2019。以前は
+//! `unapplied_fields` の記録で判定していた。resources を解釈済みへ移したため）。値で区別すると未知の
+//! 制限の見逃し（fail-open）になるため、存在だけで要件とする（SEC-1。`resources: {}` の精緻化は #2010）。
 //!
 //! # 契約・制約
 //!
@@ -28,13 +29,12 @@
 //!
 //! # 現状（REPAIR-3）
 //!
-//! `create` / `start` は `unapplied_fields()` が空でない config を `Unimplemented` で先に拒否するため、
-//! 現状 `LaunchSpec` に載る要件は常に「不要」である。resources の写像（TASK-170.3）が入って
-//! `LinuxResources` / `LinuxCgroupsPath` を受理するようになったときに効く土台で、そのとき
-//! `resources: {}` を「不要」へ精緻化できる。モジュールは 3 OS でビルドされ（CLI-1）、`CgroupJoin` への
-//! 依存は Linux 限定の `From` 実装に局所化している。
+//! `linux.resources` は #2019（TASK-29 追補）で受理に移り、要件が実際に効く。`linux.cgroupsPath` は値を配置に
+//! 使う実装が無いため [`check_cgroups_path`] が create / start で拒否する（受理に開く検証は #2010 が
+//! その関数に差し込む）。したがって `LaunchSpec` に載る要件の `cgroups_path` は当面常に偽である。
+//! モジュールは 3 OS でビルドされ（CLI-1）、`CgroupJoin` への依存は Linux 限定の `From` 実装に局所化している。
 
-use super::config::{OciConfig, UnappliedField};
+use super::config::OciConfig;
 use crate::traits::{ErrorCode, TraitError};
 
 /// config が cgroup を使う設定かどうか（指定の有無のみ。値は保持しない）。
@@ -50,10 +50,9 @@ pub struct CgroupRequirement {
 impl CgroupRequirement {
     /// `config` の `linux.resources` / `linux.cgroupsPath` の指定の有無から要件を求める。
     pub fn of_config(config: &OciConfig) -> Self {
-        let has = |f: UnappliedField| config.unapplied_fields().contains(&f);
         Self {
-            resources: has(UnappliedField::LinuxResources),
-            cgroups_path: has(UnappliedField::LinuxCgroupsPath),
+            resources: config.linux_resources().is_some(),
+            cgroups_path: config.cgroups_path().is_some(),
         }
     }
 
@@ -74,13 +73,30 @@ impl CgroupRequirement {
     pub fn reasons(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
         if self.resources {
-            out.push(UnappliedField::LinuxResources.as_str());
+            out.push("linux.resources");
         }
         if self.cgroups_path {
-            out.push(UnappliedField::LinuxCgroupsPath.as_str());
+            out.push("linux.cgroupsPath");
         }
         out
     }
+}
+
+/// `linux.cgroupsPath` の受理の入口（#2019・TASK-29 追補。`create::validate_bundle` から呼ばれ、create と start の
+/// 両方に効く）。
+///
+/// コンテナの cgroup は常に委譲スコープ配下の `fc-<id>@<n>` に置かれ、config の値を配置に使う実装は無い。
+/// 値を黙って無視すると、指定した場所に置かれないまま起動する（SEC-1）ため、指定があれば `Unimplemented` で
+/// 拒否する。パスの検証（スコープの外へ出る経路の拒否）を伴う受理は #2010 がこの関数を書き換えて行う。
+/// メッセージはキー名だけで、値を含めない（ERR-1）。
+pub fn check_cgroups_path(config: &OciConfig) -> Result<(), TraitError> {
+    if config.cgroups_path().is_none() {
+        return Ok(());
+    }
+    Err(TraitError::new(
+        ErrorCode::Unimplemented,
+        "linux.cgroupsPath is not supported yet; the container cgroup is placed under the delegated scope",
+    ))
 }
 
 /// launcher が cgroup へ入る手段を持っているか。
@@ -227,6 +243,20 @@ mod tests {
             launch_after_cgroup_check(CgroupRequirement::none(), CgroupJoinMeans::Absent, spawn);
         assert_eq!(r.expect("ok"), 7);
         assert_eq!(calls.get(), 2);
+    }
+
+    /// #2019・CORE-3: `check_cgroups_path` は指定があれば `Unimplemented`（値は載せない）、無ければ `Ok`。
+    #[test]
+    fn core3_cgroups_path_is_refused_until_accepted() {
+        assert!(check_cgroups_path(&config(json!({}))).is_ok());
+        assert!(check_cgroups_path(&config(json!({"resources": {}}))).is_ok());
+        let err = check_cgroups_path(&config(json!({"cgroupsPath": "/secret/path"})))
+            .expect_err("refuse");
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        assert_eq!(
+            err.message(),
+            "linux.cgroupsPath is not supported yet; the container cgroup is placed under the delegated scope"
+        );
     }
 
     #[cfg(target_os = "linux")]

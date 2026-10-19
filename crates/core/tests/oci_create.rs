@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use fandhe_container_core::observability::{OpName, OpRecorder};
-use fandhe_container_core::oci_runtime::{LifecycleOp, create};
+use fandhe_container_core::oci_runtime::{ByteLimit, LifecycleOp, create, load_resource_limits};
 use fandhe_container_core::traits::{
     ContainerId, ContainerState, CreateRequest, CreateStateRequest, DeleteStateRequest,
     DeleteStateResponse, ErrorCode, GetStateRequest, ListStateRequest, StateList, StateRecord,
@@ -210,6 +210,117 @@ fn sec2_create_accepts_masked_and_readonly_paths() {
         !err.message().contains("linux.maskedPaths"),
         "{}",
         err.message()
+    );
+    assert_eq!(store.len(), 0);
+}
+
+/// #2019・CORE-3: 対応する `linux.resources`（memory・cpu・pids・blockIO）を含む config は create でき、
+/// `load_resource_limits` が具体値を返す。`linux.resources` が無い bundle は `None`。
+#[test]
+fn core3_create_accepts_supported_resources_and_exposes_values() {
+    let b = ready_bundle("resources-ok");
+    let mut cfg = valid_config();
+    cfg["linux"] = json!({"resources": {
+        "memory": {"limit": 67108864, "swap": 67108864},
+        "cpu": {"quota": 50000, "period": 100000},
+        "pids": {"limit": 64},
+        "blockIO": {
+            "weight": 500,
+            "throttleReadBpsDevice": [{"major": 8, "minor": 0, "rate": 1048576}]
+        }
+    }});
+    b.write_config(&cfg);
+    let store = MemStateStore::new();
+    create(&store, &OpRecorder::new(), &b.request("c1")).expect("must succeed");
+    assert_eq!(store.len(), 1);
+
+    let limits = load_resource_limits(&b.dir)
+        .expect("loads")
+        .expect("resources present");
+    assert_eq!(limits.memory_max(), Some(ByteLimit::Bytes(67_108_864)));
+    assert_eq!(limits.memory_swap_max(), Some(ByteLimit::Bytes(0)));
+    assert_eq!(limits.cpu_quota(), Some(50_000));
+    assert_eq!(limits.cpu_period(), Some(100_000));
+    assert_eq!(limits.pids_limit(), Some(64));
+    assert_eq!(limits.blkio_weight(), Some(500));
+    assert_eq!(limits.io_throttles().len(), 1);
+    assert_eq!(limits.io_throttles()[0].rbps(), Some(1_048_576));
+
+    b.write_config(&valid_config());
+    assert_eq!(load_resource_limits(&b.dir).expect("loads"), None);
+}
+
+/// #2019・SEC-1: setter の無い resources の項目と、未知のキーは構造化エラーで拒否し、ストアへ書かない。
+#[test]
+fn sec1_create_rejects_unsupported_and_unknown_resources() {
+    let b = ready_bundle("resources-unsupported");
+    let store = MemStateStore::new();
+    let mut cfg = valid_config();
+    cfg["linux"] = json!({"resources": {
+        "memory": {"limit": 67108864},
+        "hugepageLimits": [{"pageSize": "2MB", "limit": 1}]
+    }});
+    b.write_config(&cfg);
+    let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
+    assert_eq!(err.code(), ErrorCode::Unimplemented);
+    assert_eq!(
+        err.message(),
+        "unsupported config fields: linux.resources.hugepageLimits"
+    );
+
+    cfg["linux"] = json!({"resources": {"cpu": {"shares": 512}, "devices": []}});
+    b.write_config(&cfg);
+    let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
+    assert_eq!(err.code(), ErrorCode::Unimplemented);
+    assert_eq!(
+        err.message(),
+        "unsupported config fields: linux.resources.cpu.shares, linux.resources.devices"
+    );
+
+    cfg["linux"] = json!({"resources": {"someFutureLimit": 1}});
+    b.write_config(&cfg);
+    let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    assert!(
+        !err.message().contains("someFutureLimit"),
+        "{}",
+        err.message()
+    );
+    assert_eq!(store.len(), 0);
+}
+
+/// #2019・CORE-3: cgroup v2 の範囲外の値（`cpu.period` の範囲）は Linux では create の時点で拒否する。
+#[cfg(target_os = "linux")]
+#[test]
+fn core3_create_rejects_resources_outside_the_cgroup_range() {
+    let b = ready_bundle("resources-range");
+    let mut cfg = valid_config();
+    cfg["linux"] = json!({"resources": {"cpu": {"quota": 50000, "period": 0}}});
+    b.write_config(&cfg);
+    let store = MemStateStore::new();
+    let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    assert_eq!(
+        err.message(),
+        "config.json: linux.resources has a value outside the cgroup v2 range"
+    );
+    assert_eq!(store.len(), 0);
+}
+
+/// #2019・CORE-3: `linux.cgroupsPath` は値を配置に使う実装が無いため、指定があれば Unimplemented で拒否する
+/// （黙って無視しない。受理は #2010）。値はメッセージに載せない。
+#[test]
+fn core3_create_rejects_cgroups_path_until_accepted() {
+    let b = ready_bundle("cgroups-path");
+    let mut cfg = valid_config();
+    cfg["linux"] = json!({"cgroupsPath": "/machine.slice/secret-name"});
+    b.write_config(&cfg);
+    let store = MemStateStore::new();
+    let err = create(&store, &OpRecorder::new(), &b.request("c1")).expect_err("must fail");
+    assert_eq!(err.code(), ErrorCode::Unimplemented);
+    assert_eq!(
+        err.message(),
+        "linux.cgroupsPath is not supported yet; the container cgroup is placed under the delegated scope"
     );
     assert_eq!(store.len(), 0);
 }

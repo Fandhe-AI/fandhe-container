@@ -11,9 +11,12 @@
 //! # fail-closed の判断（config.rs が本タスクへ委ねた判断の結果）
 //!
 //! 1. [`OciConfig::unapplied_fields`] が空でない config は [`ErrorCode::Unimplemented`] で拒否する。
-//!    capabilities・seccomp・resources 等を黙って無視すると、指定より弱い分離で起動する経路になる
+//!    capabilities・seccomp 等を黙って無視すると、指定より弱い分離で起動する経路になる
 //!    （SEC-1・CORE-5）。個別フィールドの許可は、それを実際に適用する後続タスクが
-//!    パーサ側で解釈済みに移すことで行う。
+//!    パーサ側で解釈済みに移すことで行う。`linux.resources` の memory / cpu / pids / blockIO（weight・throttle）
+//!    は #2019 で解釈済みに移り、cgroup v2 の範囲外の値は Linux では create の時点で `InvalidArgument` で
+//!    拒否する（`cgroups::ResourceLimitPlan`）。それ以外の resources の項目は未適用として拒否する。
+//!    `linux.cgroupsPath` は [`check_cgroups_path`] が拒否する（受理は #2010）。
 //! 2. `process` を持たない config は拒否する。start で起動できない config を created にしない。
 //! 3. `root.path` は `..` 要素と、bundle 配下の全パス要素（中間要素を含む）の symlink・Windows junction（reparse point）を拒否し、
 //!    存在するディレクトリであることを確認する。bundle 内の link 経由で bundle 外を rootfs に
@@ -38,9 +41,11 @@
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use super::cgroup_requirement::check_cgroups_path;
 use super::config::{OciConfig, OciConfigError, load_config};
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::image_refs::{ContainerImage, ImageRefRegistration};
+use super::resources::LinuxResourceLimits;
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, GetStateRequest, StateRecord,
@@ -197,11 +202,48 @@ fn rollback_image_ref(recorder: &OpRecorder, image: ContainerImage<'_>, req: &Cr
 pub(super) fn validate_bundle(bundle: &Path) -> Result<(OciConfig, PathBuf), TraitError> {
     let config = load_config(&bundle.join(CONFIG_FILE_NAME)).map_err(config_error)?;
     reject_unapplied(&config)?;
+    check_cgroups_path(&config)?;
+    check_resource_ranges(&config)?;
     if config.process().is_none() {
         return Err(invalid("config.json: process is required"));
     }
     let rootfs = check_rootfs(bundle, config.root().path())?;
     Ok((config, rootfs))
+}
+
+/// `linux.resources` が cgroup v2 の値として表せる範囲か確かめる（Linux のみ。範囲外は `InvalidArgument`）。
+///
+/// 変換は `cgroups::ResourceLimitPlan` と共有し、start が書く値と同じ規則で create の時点に拒否する。
+/// メッセージは固定文言で、値を含めない（ERR-1）。他 OS は cgroup を持たず start も拒否されるため何もしない。
+#[cfg(target_os = "linux")]
+fn check_resource_ranges(config: &OciConfig) -> Result<(), TraitError> {
+    if let Some(limits) = config.linux_resources() {
+        crate::cgroups::ResourceLimitPlan::try_from(limits).map_err(|e| {
+            TraitError::new(
+                e.code,
+                format!(
+                    "{CONFIG_FILE_NAME}: linux.resources has a value outside the cgroup v2 range"
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_resource_ranges(_config: &OciConfig) -> Result<(), TraitError> {
+    Ok(())
+}
+
+/// bundle の `config.json` を検証して `linux.resources`（解釈済みの項目）を返す（#2019）。
+///
+/// supervisor の start 経路（`ProductionStartDeps::prepare_cgroup`）が、cgroup の連鎖で制限ファイルへ書く値を
+/// 取り出すために呼ぶ。検証は create / start と同一（`validate_bundle`）で、`linux.resources` が無ければ
+/// `None`。launcher は fork の前に、この値と `oci_runtime::start` が読む config の値の一致を確かめる
+/// （手順 5 と手順 8 の間の書き換え対策）。
+pub fn load_resource_limits(bundle: &Path) -> Result<Option<LinuxResourceLimits>, TraitError> {
+    let (config, _rootfs) = validate_bundle(bundle)?;
+    Ok(config.linux_resources().cloned())
 }
 
 fn invalid(message: &str) -> TraitError {

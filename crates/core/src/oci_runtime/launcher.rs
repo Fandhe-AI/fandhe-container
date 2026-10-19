@@ -64,6 +64,10 @@
 //!
 //! # 未実装・残余(REPAIR-3)
 //!
+//! - **`process.cwd` と `process.user`(OCI-1・TASK-29・SEC-5)**: cwd は子が pivot 直後に fd 起点・symlink 非追従で
+//!   適用する(symlink を含む cwd は追従せず拒否。Docker/runc と異なる)。uid・gid は fork の前に `check_user_mapped` で
+//!   user namespace の写像と照合し(単一 ID 写像は 0/0 のみ)、capability 削減段が既存の資格情報の切り替えで適用する。
+//!   補助グループ(`additionalGids`)・名前形式の `User` の解決・exec 経路の非 root は未対応
 //! - **権限モデル**: `RootlessSingleId` と `RootlessSubordinateIds`(#2009)を扱う。`RootfulHostRoot`
 //!   (SEC-5・CORE-7・CORE-9。start が user namespace を必須とするため、start を通る構成では到達しない。整合は
 //!   spec 側の判断事項)は `Unimplemented` で拒否する
@@ -110,6 +114,8 @@ use super::cgroup_requirement::{CgroupJoinMeans, launch_after_cgroup_check};
 #[cfg(target_os = "linux")]
 use super::config::NamespaceKind;
 use super::launch::{LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher};
+#[cfg(target_os = "linux")]
+use super::resources::LinuxResourceLimits;
 use crate::audit_log::AuditSink;
 #[cfg(target_os = "linux")]
 use crate::audit_log::AuditedRejection;
@@ -191,6 +197,8 @@ pub struct ProductionLauncherBuilder {
     cgroup_join_source: Option<JoinSource>,
     #[cfg(target_os = "linux")]
     subordinate_ids: Option<SubordinateIdSource>,
+    #[cfg(target_os = "linux")]
+    applied_resources: Option<LinuxResourceLimits>,
 }
 
 impl std::fmt::Debug for ProductionLauncherBuilder {
@@ -237,6 +245,17 @@ impl ProductionLauncherBuilder {
         self
     }
 
+    /// start の cgroup 連鎖(手順 5)で制限ファイルへ書いた `linux.resources` の値(#2019・CORE-3・SEC-1)。
+    ///
+    /// launch は fork の前に `spec.config()` の `linux.resources` とこの値の一致を確かめ、食い違えば
+    /// `FailedPrecondition` で拒否する(手順 5 と手順 8 の間に `config.json` が書き換えられても、書いた値と違う
+    /// 制限のまま起動しない)。`linux.resources` が無い config では渡さない(`None` どうしが一致)。
+    #[must_use]
+    pub fn applied_resource_limits(mut self, applied: Option<LinuxResourceLimits>) -> Self {
+        self.applied_resources = applied;
+        self
+    }
+
     /// 起動のたびに cgroup 参加フックを作る源(`ContainerCgroup::join_hook` を呼ぶクロージャ等。CORE-3)。
     #[must_use]
     pub fn cgroup_join_source(
@@ -276,15 +295,15 @@ impl ProductionLauncherBuilder {
                     "failed to become a child subreaper for the launcher",
                 )
             })?;
-            Ok(ProductionLauncher {
-                inner: Inner::new(
-                    Box::new(RealOps { subreaper }),
-                    privilege,
-                    subordinate,
-                    audit_sink,
-                    self.cgroup_join_source,
-                ),
-            })
+            let mut inner = Inner::new(
+                Box::new(RealOps { subreaper }),
+                privilege,
+                subordinate,
+                audit_sink,
+                self.cgroup_join_source,
+            );
+            inner.applied_resources = self.applied_resources;
+            Ok(ProductionLauncher { inner })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -675,6 +694,34 @@ impl Ledger {
     }
 }
 
+/// `process.user` の (uid, gid) が user namespace の写像に含まれることを fork の前に確かめる(純関数。副作用なし。
+/// OCI-1・SEC-5)。
+///
+/// 写像の外の id で `setresuid` すると子で `EINVAL` になり構造化されないため、ここで `FailedPrecondition` の
+/// 固定文言にする。`RootlessSingleId` は 0 だけが写る(0/0 以外は拒否)。`RootlessSubordinateIds` は
+/// `ranges`(uid の写像, gid の写像)が対象の id を含む場合だけ許す。`RootfulHostRoot` は launcher が別途拒否する。
+#[cfg(target_os = "linux")]
+fn check_user_mapped(
+    privilege: IsolationPrivilege,
+    ranges: Option<(&IdMapSet, &IdMapSet)>,
+    (uid, gid): (u32, u32),
+) -> Result<(), TraitError> {
+    let mapped = match (privilege, ranges) {
+        (IsolationPrivilege::RootlessSubordinateIds, Some((u, g))) => {
+            u.host_id_of(uid).is_some() && g.host_id_of(gid).is_some()
+        }
+        _ => uid == 0 && gid == 0,
+    };
+    if mapped {
+        Ok(())
+    } else {
+        Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "process.user is not mapped in the user namespace (SEC-5)",
+        ))
+    }
+}
+
 /// Linux の launcher 本体(拒否の判定・順序・写像・起動台帳)。
 #[cfg(target_os = "linux")]
 struct Inner {
@@ -684,6 +731,8 @@ struct Inner {
     subordinate: Option<SubordinateIds>,
     audit_sink: Arc<dyn AuditSink>,
     cgroup_join_source: Option<JoinSource>,
+    /// cgroup 連鎖で書いた `linux.resources`(`ProductionLauncherBuilder::applied_resource_limits`)。
+    applied_resources: Option<LinuxResourceLimits>,
     /// ハンドルの回収通知（`ContainerChildProcess::with_reap_notice`）と共有するため `Arc`。
     ledger: Arc<Mutex<Ledger>>,
     /// `Handed` の世代の採番。
@@ -708,6 +757,7 @@ impl Inner {
             subordinate,
             audit_sink,
             cgroup_join_source,
+            applied_resources: None,
             ledger: Arc::new(Mutex::new(Ledger::default())),
             next_generation: std::sync::atomic::AtomicU64::new(0),
             left_process: AtomicBool::new(false),
@@ -725,14 +775,33 @@ impl Inner {
     ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
         self.left_process.store(false, Ordering::SeqCst);
         self.check_privilege()?;
+        check_user_mapped(
+            self.privilege,
+            self.subordinate.as_ref().map(|s| (&s.uid, &s.gid)),
+            spec.user(),
+        )?;
         let means = if self.cgroup_join_source.is_some() {
             CgroupJoinMeans::Provided
         } else {
             CgroupJoinMeans::Absent
         };
         launch_after_cgroup_check(spec.cgroup_requirement(), means, || {
+            self.check_applied_resources(spec)?;
             self.launch_checked(spec, timeout)
         })
+    }
+
+    /// 制限ファイルへ書いた `linux.resources` と、これから起動する `spec` の config の値の一致を確かめる
+    /// (fork の前。#2019・CORE-3・SEC-1)。片方だけ指定がある場合も不一致として拒否する。
+    /// メッセージは固定文言で、値を含めない(ERR-1)。
+    fn check_applied_resources(&self, spec: &LaunchSpec) -> Result<(), TraitError> {
+        if spec.config().linux_resources() == self.applied_resources.as_ref() {
+            return Ok(());
+        }
+        Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "the cgroup limits applied before start do not match config.json",
+        ))
     }
 
     /// 権限モデルの検査。未対応のモデルは fork より前に拒否する(権限を黙って広げない。SEC-5)。
@@ -777,7 +846,9 @@ impl Inner {
             self.ops.root_identity(spec.rootfs_dir()),
         )
         .map_err(|e| to_trait_error(&e))?;
+        let (uid, gid) = spec.user();
         let mut stages = StagePipeline::new()
+            .with_process_ids(uid, gid)
             .with_landlock(ruleset)
             .map_err(|e| to_trait_error(&e))?;
         if let Some(source) = &self.cgroup_join_source {
@@ -1263,6 +1334,7 @@ impl LaunchOps for RealOps {
                 masked: input.spec.config().masked_paths(),
             },
             status: None,
+            working_dir: Some(input.spec.working_dir()),
         };
         let child = spawn_container_via_intermediate(
             IntermediateSpec {
@@ -1601,9 +1673,52 @@ mod tests {
             Arc::new(config),
             ContainerId::new(name).unwrap(),
             binds,
+            super::super::working_dir::ContainerWorkingDir::root(),
+            (0, 0),
         );
         let _ = std::fs::remove_dir_all(&dir);
         spec
+    }
+
+    /// OCI-1・SEC-5: 単一 ID 写像は 0/0 だけを許し、範囲写像は uid・gid の両方が写像内の場合だけ許す(境界値を具体値で確認)。
+    #[test]
+    fn oci1_check_user_mapped_boundaries() {
+        use crate::exec::IdMapping;
+        use crate::rootless::IdMapSet;
+        let map = |host| {
+            IdMapSet::new(vec![
+                IdMapping {
+                    container_id: 0,
+                    host_id: 1000,
+                    count: 1,
+                },
+                IdMapping {
+                    container_id: 1,
+                    host_id: host,
+                    count: 65535,
+                },
+            ])
+            .unwrap()
+        };
+        let (uid_map, gid_map) = (map(100_000), map(200_000));
+        let single = IsolationPrivilege::RootlessSingleId;
+        let sub = IsolationPrivilege::RootlessSubordinateIds;
+        let r = Some((&uid_map, &gid_map));
+        assert!(check_user_mapped(single, None, (0, 0)).is_ok());
+        for ids in [(1000, 1000), (0, 1), (1, 0)] {
+            let e = check_user_mapped(single, None, ids).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition, "{ids:?}");
+            assert_eq!(
+                e.message(),
+                "process.user is not mapped in the user namespace (SEC-5)"
+            );
+        }
+        for ok in [(0, 0), (1, 1), (1000, 1000), (65535, 65535)] {
+            assert!(check_user_mapped(sub, r, ok).is_ok(), "{ok:?}");
+        }
+        for bad in [(65536, 1), (1, 65536), (65536, 65536), (u32::MAX, 0)] {
+            assert!(check_user_mapped(sub, r, bad).is_err(), "{bad:?}");
+        }
     }
 
     fn events() -> Arc<Mutex<Vec<String>>> {
@@ -1778,6 +1893,60 @@ mod tests {
             ev.lock().unwrap().is_empty(),
             "nothing must run before the refusal"
         );
+    }
+
+    fn dummy_join_source() -> JoinSource {
+        Box::new(|| {
+            let fd = std::fs::File::open("/").unwrap();
+            Ok(CgroupJoin::from_dir_for_test(
+                crate::cgroups::CgroupName::new(&crate::traits::ContainerId::new("c").unwrap())
+                    .unwrap(),
+                std::os::fd::OwnedFd::from(fd),
+            ))
+        })
+    }
+
+    /// #2019・CORE-3・SEC-1: cgroup 連鎖で書いた `linux.resources` と config の値が食い違えば(書いていない場合・
+    /// 値が違う場合・config に無いのに書いた場合)、スレッド確認・Landlock・fork より前に拒否する。一致すれば進む。
+    #[test]
+    fn core3_applied_resource_limits_must_match_config_before_anything() {
+        let resources = serde_json::json!({"resources": {"memory": {"limit": 67108864}}});
+        let spec = spec_for("applied-res", resources.clone());
+        let other = spec_for(
+            "applied-res-other",
+            serde_json::json!({"resources": {"memory": {"limit": 134217728}}}),
+        );
+        let plain = spec_for("applied-res-plain", serde_json::json!({}));
+        let applied = |s: &LaunchSpec| s.config().linux_resources().cloned();
+        for (label, spec, applied_value) in [
+            ("not applied", &spec, None),
+            ("different value", &spec, applied(&other)),
+            ("applied but not in config", &plain, applied(&spec)),
+        ] {
+            let ev = events();
+            let mut l = launcher(FakeOps::new(&ev), rootless(), Some(dummy_join_source()));
+            l.inner.applied_resources = applied_value;
+            let err = l
+                .launch(spec, Duration::from_secs(1))
+                .err()
+                .unwrap_or_else(|| panic!("{label}: must be refused"));
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition, "{label}");
+            assert_eq!(
+                err.message(),
+                "the cgroup limits applied before start do not match config.json",
+                "{label}"
+            );
+            assert!(ev.lock().unwrap().is_empty(), "{label}: nothing may run");
+        }
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.run_stages = false;
+        let mut l = launcher(ops, rootless(), Some(dummy_join_source()));
+        l.inner.applied_resources = applied(&spec);
+        l.launch(&spec, Duration::from_secs(1))
+            .expect("matching limits launch")
+            .terminate(Duration::from_secs(5))
+            .expect("terminate");
     }
 
     /// CORE-3: 参加の源は launch のたびに 1 回呼ばれ(restart で再利用できる)、ステージ列へ登録される。

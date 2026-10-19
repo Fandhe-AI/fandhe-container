@@ -14,8 +14,9 @@
 //!
 //! - **許可しない**: 応答は `-EPERM` の 1 種類だけ（core の `SeccompListener::deny_eperm`）。通知の引数・命令ポインタは
 //!   core が公開しないので、ポインタ先を判断に使う TOCTOU の余地が無い。記録の可否に関わらず必ず応答する
-//! - **対象を止め続けない（REPAIR-5）**: 記録の完了は `NotifyConfig` の応答の期限 まで待ち、超えても応答する。
-//!   記録は別スレッド（recorder）で行うので、sink が詰まっても listener スレッドは止まらない
+//! - **対象を止め続けない（REPAIR-5）**: 記録の完了は通知ごとに `NotifyConfig` の応答の期限まで待ち、超えても応答する。
+//!   記録は別スレッド（recorder）で行い、listener は受信と完了待ちを分けて有界(`MAX_IN_FLIGHT`)の待ち行列で管理する。
+//!   sink が詰まっても後続の受信と応答期限は遅れず、上限を超えた分は待たずに拒否応答する
 //! - **洪水で DoS されない**: 記録の段にだけトークンバケットと有界キューを置き、超えた分は記録せず待たずに応答して
 //!   集計する（間引きは応答を遅らせない）。集計は固定語彙と数値だけの構造化ログを間隔を空けてまとめて出す
 //! - **取り違えない**: `/proc/<tid>/status` を読んだ **後** に `ID_VALID` で cookie を検証し、pid の再利用や対象の終了で
@@ -29,9 +30,10 @@
 //! listener 受け渡しは #2385。restart の再 launch を本番で成り立たせること自体は #2043（本モジュールの差し替えは
 //! 偽の launcher でだけ試している）。
 
+use std::collections::VecDeque;
 use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -341,7 +343,71 @@ fn recorder_main(
     }
 }
 
-/// listener スレッドの本体。
+/// 記録の完了待ちの通知(応答は完了か期限のどちらか早い方で返す)。
+struct InFlight<I> {
+    id: I,
+    deadline: Instant,
+    finished: Receiver<()>,
+}
+
+/// 完了待ちの通知の上限。recorder のキュー容量(`RECORD_QUEUE_CAPACITY`)と recorder が処理中の 1 件までしか入らないが、
+/// 受信と待ちを分けた構造の上限として明示する。超える分は待たずに拒否応答する(REPAIR-5)。
+const MAX_IN_FLIGHT: usize = RECORD_QUEUE_CAPACITY + 1;
+/// 完了待ちがあるときに listener を待つ 1 回の長さ(完了は poll を起こさないため短く刻んで確かめる)。
+const IN_FLIGHT_POLL: Duration = Duration::from_millis(2);
+
+/// `-EPERM` で応答して結果を数える。
+fn respond<S: NotifySource>(source: &S, counters: &Counters, id: S::Id) {
+    match source.deny_eperm(id) {
+        Ok(Responded::Sent) => {}
+        Ok(Responded::TargetGone) => {
+            counters.target_gone.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(SourceError) => {
+            counters.respond_failed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 先頭から、記録が完了したか期限を過ぎた通知に応答する。FIFO の recorder と同じ期限幅のため先頭だけ見れば足りる。
+fn settle_in_flight<S: NotifySource>(
+    source: &S,
+    counters: &Counters,
+    in_flight: &mut VecDeque<InFlight<S::Id>>,
+) {
+    while let Some(front) = in_flight.front() {
+        match front.finished.try_recv() {
+            Ok(()) => {}
+            Err(TryRecvError::Empty) => {
+                if Instant::now() < front.deadline {
+                    return;
+                }
+                // 期限切れ: 先に応答する。記録は recorder で続く。
+                counters.late.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(TryRecvError::Disconnected) => {
+                counters.unrecorded.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if let Some(done) = in_flight.pop_front() {
+            respond(source, counters, done.id);
+        }
+    }
+}
+
+/// 待たずに全件へ応答する(停止要求・供給元の異常)。記録は recorder で続くか、捨てられる。
+fn drain_in_flight<S: NotifySource>(
+    source: &S,
+    counters: &Counters,
+    in_flight: &mut VecDeque<InFlight<S::Id>>,
+) {
+    while let Some(done) = in_flight.pop_front() {
+        counters.late.fetch_add(1, Ordering::Relaxed);
+        respond(source, counters, done.id);
+    }
+}
+
+/// listener スレッドの本体。受信と記録の完了待ちを分け、1 件の記録の遅れが後続の応答期限に響かないようにする(REPAIR-5)。
 // 理由: ループは供給元・pid 変換・設定・キュー・集計・停止フラグを毎回使う独立した入力で、束ねる型を作っても
 // 呼び出しが増えるだけのため引数のまま渡す。
 #[allow(clippy::too_many_arguments)]
@@ -356,19 +422,40 @@ fn listener_main<S: NotifySource>(
     let mut bucket = Bucket::new(config.rate_per_sec, config.burst, Instant::now());
     let mut reported = CounterSnapshot::default();
     let mut last_report = Instant::now();
+    let mut in_flight: VecDeque<InFlight<S::Id>> = VecDeque::new();
+    // 供給元が閉じた後は、完了待ちの分だけ期限まで見届けてから終わる(対象は既にいないが記録は残す)。
+    let mut closing = false;
     loop {
-        // 通知が連続していても毎反復で停止要求を確かめる（REPAIR-5）。
+        // 通知が連続していても毎反復で停止要求を確かめる(REPAIR-5)。
         if stop.load(Ordering::Acquire) {
             break;
         }
-        match source.wait(POLL_INTERVAL) {
+        settle_in_flight(source, counters, &mut in_flight);
+        if closing {
+            if in_flight.is_empty() {
+                break;
+            }
+            std::thread::sleep(IN_FLIGHT_POLL);
+            continue;
+        }
+        let wait = if in_flight.is_empty() {
+            POLL_INTERVAL
+        } else {
+            IN_FLIGHT_POLL
+        };
+        match source.wait(wait) {
             Ok(Ready::Readable) => {}
             Ok(Ready::Idle) => {
                 report_if_due(counters, &mut reported, &mut last_report);
                 continue;
             }
-            // 利用者の消滅（コンテナの全プロセスが終了）か、読めない状態。以後通知は来ない。
-            Ok(Ready::Closed) | Err(SourceError) => break,
+            // 利用者の消滅(コンテナの全プロセスが終了)。以後通知は来ない。
+            Ok(Ready::Closed) => {
+                closing = true;
+                continue;
+            }
+            // 読めない状態。以後の完了待ちは見届けず応答して終わる。
+            Err(SourceError) => break,
         }
         let (id, notified) = match source.receive() {
             Ok(Some(n)) => n,
@@ -378,18 +465,26 @@ fn listener_main<S: NotifySource>(
             }
             Err(SourceError) => break,
         };
-        handle_one(
+        match handle_one(
             source,
             resolve,
-            config,
             jobs,
             counters,
             &mut bucket,
             id,
             notified,
-        );
+            in_flight.len(),
+        ) {
+            Handled::Done => {}
+            Handled::Waiting(finished) => in_flight.push_back(InFlight {
+                id,
+                deadline: Instant::now() + config.response_deadline,
+                finished,
+            }),
+        }
         report_if_due(counters, &mut reported, &mut last_report);
     }
+    drain_in_flight(source, counters, &mut in_flight);
     emit_report(&report_events(counters.snapshot(), reported));
 }
 
@@ -403,29 +498,37 @@ fn report_if_due(counters: &Counters, reported: &mut CounterSnapshot, last: &mut
     *reported = now;
 }
 
-/// 受け取った 1 件の処理: 変換 → 検証 → 記録（期限つき）→ 応答。必ず応答する（検証が無効のときを除く）。
+/// [`handle_one`] の結果。
+enum Handled {
+    /// 応答まで済んだ。
+    Done,
+    /// 記録の完了待ち(応答は呼び出し側が完了か期限で返す)。
+    Waiting(Receiver<()>),
+}
+
+/// 受け取った 1 件の処理: 変換 → 検証 → 記録の依頼。記録を待たない場合はその場で応答する。必ず応答する(検証が無効のときを除く)。
 // 理由: listener_main と同じく、毎回使う独立した入力のため引数のまま渡す。
 #[allow(clippy::too_many_arguments)]
 fn handle_one<S: NotifySource>(
     source: &S,
     resolve: &PidResolver,
-    config: NotifyConfig,
     jobs: &SyncSender<Job>,
     counters: &Counters,
     bucket: &mut Bucket,
     id: S::Id,
     notified: Notified,
-) {
-    // /proc を読んだ後に cookie を検証する（読んでいる間に対象が消えて pid が再利用されていないことの確認）。
+    in_flight_len: usize,
+) -> Handled {
+    // /proc を読んだ後に cookie を検証する(読んでいる間に対象が消えて pid が再利用されていないことの確認)。
     let resolved = resolve(notified.pid_in_listener_ns);
     let valid = match source.is_pending(id) {
         Ok(true) => true,
-        // 応答待ちでない通知には応答できない（対象は既に消えた）。記録もしない。
+        // 応答待ちでない通知には応答できない(対象は既に消えた)。記録もしない。
         Ok(false) => {
             counters.target_gone.fetch_add(1, Ordering::Relaxed);
-            return;
+            return Handled::Done;
         }
-        // 検証できなかったときは記録しない（取り違えの恐れ）。ただし対象は止まっているので応答は試みる。
+        // 検証できなかったときは記録しない(取り違えの恐れ)。ただし対象は止まっているので応答は試みる。
         Err(SourceError) => false,
     };
     if valid {
@@ -436,58 +539,51 @@ fn handle_one<S: NotifySource>(
             None => {
                 counters.pid_unresolved.fetch_add(1, Ordering::Relaxed);
             }
-            Some(report) => record_with_deadline(config, jobs, counters, bucket, report),
+            Some(report) => {
+                if let Some(finished) = submit_record(jobs, counters, bucket, report, in_flight_len)
+                {
+                    return Handled::Waiting(finished);
+                }
+            }
         }
     } else {
         counters.unrecorded.fetch_add(1, Ordering::Relaxed);
     }
-    match source.deny_eperm(id) {
-        Ok(Responded::Sent) => {}
-        Ok(Responded::TargetGone) => {
-            counters.target_gone.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(SourceError) => {
-            counters.respond_failed.fetch_add(1, Ordering::Relaxed);
-        }
-    }
+    respond(source, counters, id);
+    Handled::Done
 }
 
-/// 記録を recorder へ渡し、完了を期限まで待つ。レート超過・キュー満杯は待たずに数える。
-fn record_with_deadline(
-    config: NotifyConfig,
+/// 記録を recorder へ渡す。完了待ちにするときは受け取り口を返す。レート超過・キュー満杯・完了待ちの上限超えは
+/// 待たずに数えて `None`(その場で応答させる)。
+fn submit_record(
     jobs: &SyncSender<Job>,
     counters: &Counters,
     bucket: &mut Bucket,
     report: SeccompDenialReport,
-) {
+    in_flight_len: usize,
+) -> Option<Receiver<()>> {
+    if in_flight_len >= MAX_IN_FLIGHT {
+        counters.suppressed.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     if !bucket.take(Instant::now()) {
         counters.suppressed.fetch_add(1, Ordering::Relaxed);
-        return;
+        return None;
     }
     let Ok(at) = AuditTimestamp::now() else {
         counters.unrecorded.fetch_add(1, Ordering::Relaxed);
-        return;
+        return None;
     };
     let (done, finished) = sync_channel(1);
     match jobs.try_send(Job { report, at, done }) {
-        Ok(()) => {}
+        Ok(()) => Some(finished),
         Err(TrySendError::Full(_)) => {
             counters.suppressed.fetch_add(1, Ordering::Relaxed);
-            return;
+            None
         }
         Err(TrySendError::Disconnected(_)) => {
             counters.unrecorded.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-    }
-    match finished.recv_timeout(config.response_deadline) {
-        Ok(()) => {}
-        // 期限切れ: 先に応答する。記録は recorder で続く。
-        Err(RecvTimeoutError::Timeout) => {
-            counters.late.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(RecvTimeoutError::Disconnected) => {
-            counters.unrecorded.fetch_add(1, Ordering::Relaxed);
+            None
         }
     }
 }
@@ -921,6 +1017,28 @@ mod tests {
         let snap = h.finish(Duration::from_secs(10)).expect("live");
         assert_eq!((snap.late, snap.recorded), (1, 1));
         assert_eq!(sink.records.lock().unwrap().len(), 1);
+    }
+
+    /// REPAIR-5・#2025: sink が詰まっていても、2 件目の応答は自分の受信から期限以内(1 件目の完了待ちに積まれない)。
+    #[test]
+    fn repair5_2025_stuck_sink_does_not_delay_the_second_response() {
+        let sink = Arc::new(Sink::closed());
+        let (fake, answered) = Fake::new(vec![Some((1, n(55))), Some((2, n(56)))]);
+        let config = NotifyConfig::default()
+            .with_response_deadline(Duration::from_millis(200))
+            .unwrap();
+        let h = hub(Arc::clone(&sink), config);
+        h.attach_with(fake, identity()).unwrap();
+        let started = Instant::now();
+        while answered.lock().unwrap().len() < 2 {
+            assert!(started.elapsed() < Duration::from_secs(5), "no response");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let waited = started.elapsed();
+        assert!(waited < Duration::from_millis(380), "{waited:?}");
+        sink.open();
+        let snap = h.finish(Duration::from_secs(10)).expect("live");
+        assert_eq!(snap.late, 2);
     }
 
     /// #2025: sink の失敗は `unrecorded` に数え、応答は止めない。

@@ -48,6 +48,7 @@
 //! - Linux 5.0 未満は対象外
 
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{ExecError, IsolationStage};
@@ -70,7 +71,7 @@ const NOTIFY_FD_KIND: &str = "anon_inode:seccomp notify";
 /// 検証付きの受信でしか作れない（公開コンストラクタを持たない）。`Clone` を持たず、drop で閉じる。閉じると
 /// カーネルは `USER_NOTIF` 側の待機中の syscall を `ENOSYS` にする。
 #[derive(Debug)]
-pub struct SeccompListener(OwnedFd);
+pub struct SeccompListener(OwnedFd, AtomicBool);
 
 impl SeccompListener {
     /// fd の借用(種別の確認・試験用)。通知の読み書きは下の安全 API を使う。
@@ -97,8 +98,19 @@ impl SeccompListener {
     ///
     /// 返す [`SeccompNotification`] は記録に要る値(通知 ID・PID・syscall 番号・arch)だけを持つ。引数と命令ポインタは
     /// 公開しない(ポインタ先を許可の判断に使うと TOCTOU になるため。応答は常に `-EPERM` の 1 種類)。
+    ///
+    /// `SECCOMP_IOCTL_NOTIF_RECV` は `O_NONBLOCK` を見ず、カーネル内の要求セマフォで待つ。待機は「通知が無いのに RECV
+    /// を呼んだ」ときにだけ起き、`wait` が `Readable` を返した直後の単独の読み手では起きない(通知が取り消されても
+    /// セマフォは先に up 済みで、RECV は `ENOENT` で戻る。Linux v6.12 `seccomp_notify_recv`)。無期限待機の唯一の経路は
+    /// 複数の読み手が同じ fd を競うことなので、同時の受信を 1 本に限り、2 本目は待たずに `None` を返す(REPAIR-5)。
+    /// `EINTR` も再試行せず `None` で戻し、呼び出し側のループが停止要求を確かめてから再び `wait` する。
     pub fn receive(&self) -> Result<Option<SeccompNotification>, ExecError> {
-        sys::seccomp_notify::notif_recv(self.0.as_fd())
+        if self.1.swap(true, Ordering::AcqRel) {
+            return Ok(None);
+        }
+        let result = sys::seccomp_notify::notif_recv(self.0.as_fd());
+        self.1.store(false, Ordering::Release);
+        result
             .map(|n| {
                 n.map(|n| SeccompNotification {
                     id: NotificationId(n.id),
@@ -425,7 +437,7 @@ pub(crate) fn receive_listener(
     // `RECV` が poll の後の通知の取り消しで無期限にブロックしないようにする（REPAIR-5）。
     sys::seccomp_notify::set_nonblocking(fd.as_fd())
         .map_err(|e| ExecError::from_sys(e, STAGE, "set the seccomp listener non-blocking"))?;
-    Ok(SeccompListener(fd))
+    Ok(SeccompListener(fd, AtomicBool::new(false)))
 }
 
 /// 新しい socketpair（C の端、子の端）。C の端には `SO_PASSCRED` を設定済み（送信の前に必要）。
@@ -566,7 +578,7 @@ pub fn user_notif_probe_for_test() -> Result<UserNotifProbe, String> {
     let (fd, tid) = ready_rx.recv().map_err(|e| e.to_string())??;
     sys::seccomp_notify::set_nonblocking(fd.as_fd()).map_err(|e| format!("nonblock: {e:?}"))?;
     Ok(UserNotifProbe {
-        listener: Some(SeccompListener(fd)),
+        listener: Some(SeccompListener(fd, AtomicBool::new(false))),
         tid,
         commands: Some(cmd_tx),
         thread: Some(thread),

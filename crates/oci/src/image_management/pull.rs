@@ -547,6 +547,8 @@ impl PullSession<'_> {
         max_bytes: u64,
     ) -> Result<VerifiedBlob, OciError> {
         self.note_blob(digest)?;
+        // 再検証の開始時に以前の検証結果を無効化する（信頼性検査を含め、失敗した再検証の前の登録を残さない）。
+        self.verified.remove(digest);
         let path = self.staging_dir.join(hex_of(digest)?);
         match fs::symlink_metadata(&path) {
             Ok(m) if m.is_file() => {}
@@ -564,8 +566,6 @@ impl PullSession<'_> {
         // 開いたハンドルで信頼条件を確認し、権限を 0600 へ狭める（公開前に必ず行う。OCI-1・SEC）。
         #[cfg(unix)]
         self.secure_staged_blob(&path)?;
-        // 再検証の開始時に以前の検証結果を無効化する（失敗した再検証の前の登録を残さない）。
-        self.verified.remove(digest);
         // 検証の前後で指紋が一致することを確かめ、検証した実体を固定する（公開直前の再ハッシュの代わり）。
         let before = FileIdent::of_regular(&path)
             .map_err(|e| io_err(&e, "failed to stat staged blob"))?
@@ -606,9 +606,10 @@ impl PullSession<'_> {
         let m = file
             .metadata()
             .map_err(|e| io_err(&e, "failed to stat staged blob"))?;
-        // 権限以外の違反は直せない。
+        // 権限以外の違反（種別・所有者・リンク数）は直せないので、権限を変える前に何も変えず拒否する。
+        // ストア外へのハードリンクなど他者の実体の権限を 0600 に変えてしまわないため。
         if let Some(v) = blob_trust_violation(&m, owner)
-            && m.mode() & 0o022 == 0
+            && (!m.is_file() || owner.is_some_and(|o| m.uid() != o) || m.nlink() != 1)
         {
             return Err(unsafe_blob(v));
         }
@@ -860,9 +861,17 @@ impl PullSession<'_> {
                                     && is_trusted_regular(&dst, owner)
                                 {
                                     present.push(b.clone());
+                                } else if cfg!(windows) {
+                                    // Windows: 固定したハンドルを保ったまま、未検証の宛先を消して固定済みの実体へ
+                                    // hard_link し直す（固定を外してパスで改名しない。OCI-1）。
+                                    fs::remove_file(&dst).map_err(|_| {
+                                        err(OciErrorCode::Internal, "failed to repair corrupt blob")
+                                    })?;
+                                    fs::hard_link(&src, &dst).map_err(|_| {
+                                        err(OciErrorCode::Internal, "failed to repair corrupt blob")
+                                    })?;
+                                    moved.push(b.clone());
                                 } else {
-                                    // 固定を外してから置き換える（Windows は開いたままだと改名できない）。
-                                    pinned.remove(b);
                                     fs::rename(&src, &dst).map_err(|_| {
                                         err(OciErrorCode::Internal, "failed to repair corrupt blob")
                                     })?;
@@ -1772,6 +1781,28 @@ mod tests {
             s.verify_staged_blob(&dg, 1 << 20).unwrap_err().code(),
             OciErrorCode::FailedPrecondition
         );
+    }
+
+    /// ハードリンク付きで group 書き込み可の blob は、権限を変えずに拒否する（外側の名前の権限を巻き込まない）。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_verify_does_not_chmod_hard_linked_blob() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new("pub-nlink-nochmod");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let dg = sha_of(b"config-body");
+        let path = s.staged_blob_path(&dg).unwrap();
+        fs::write(&path, b"config-body").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        let outside = root.0.join("outside");
+        fs::hard_link(&path, &outside).unwrap();
+        assert_eq!(
+            s.verify_staged_blob(&dg, 1 << 20).unwrap_err().code(),
+            OciErrorCode::FailedPrecondition
+        );
+        let mode = fs::metadata(&outside).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o666);
     }
 
     /// 検証後にハードリンクが足されたら公開を拒否し、外側の名前は公開物と無関係のまま残る。

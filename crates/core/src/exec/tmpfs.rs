@@ -56,7 +56,7 @@
 //! # 未対応（REPAIR-3: 実装済みを装わない）
 //!
 //! 本番 launcher・CLI・stack（TOML）からの配線（TASK-79・TASK-169 の後続）、`--shm-size` 未指定時の
-//! `/dev/shm` 既定 64 MiB の常時マウント、OCI `mounts[]` の bind 以外の種類（bind は `mount_binds`〔#1915〕。TASK-127・TASK-29 系）。
+//! `/dev/shm` 既定 64 MiB の常時マウント、OCI `mounts[]` の bind 以外の種類（bind は `mount_binds`〔#1915〕。TASK-29 追補。#1910 の判断では拒否のまま。sysfs は #2020、tmpfs 等は追跡 issue が未起票）。
 //!
 //! # 単体テストの安全策
 //!

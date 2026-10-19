@@ -20,7 +20,7 @@
 //!   `noexec` / `nodev` が必ず効くため許容し、[`LandlockRuleset::shadowed`] に記録する（監査は TASK-41・SEC-4）
 //! - 暗黙の固定集合（`/dev`・`/dev/pts`・`/dev/shm`。オーナー判断 #1609）は `mounts[]` に関係なく常に載るため、
 //!   [`crate::dev_mounts`] の定義（実マウントの属性）から導いた権利のルールを rootfs の次に足す（#1657）。
-//!   `mounts[]` が同じマウント先を指す場合は拒否する（統合の規則は TASK-127）
+//!   `mounts[]` が同じマウント先を指す場合は拒否する（固定集合と一致する項目を供給済みとして受ける統合は、TASK-29 追補の #1910 の判断で見送り）
 //! - `/sys` の sysfs（`mounts[]`。#2020）はルールを作らない（実効の権利は root と同じ。書き込みの禁止は VFS の ro が担う。
 //!   理由は `build_path_rules_with_dev` の実装コメント）
 //! - `linux.readonlyPaths` / `maskedPaths` は参照しない（VFS のマウントが担うためルールは足さない。解釈は
@@ -329,7 +329,7 @@ pub enum LandlockRuleErrorKind {
         granted: AccessFs,
     },
     /// `mounts[index]` が暗黙の固定集合（`/dev`・`/dev/pts`・`/dev/shm`）と同じマウント先を指している。
-    /// 後勝ちで統合すると固定集合が黙って崩れるため拒否する（統合の規則は TASK-127 で決める）。
+    /// 後勝ちで統合すると固定集合が黙って崩れるため拒否する（統合は TASK-29 追補の #1910 の判断で見送り）。
     ImplicitMountConflict {
         /// config の `mounts` 内の位置。
         index: usize,

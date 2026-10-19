@@ -32,7 +32,7 @@
 //! 字句的な正規化のみで、rootfs 内の symlink は解決しない。[`MountDestination::resolve_in`] の返り値は
 //! 「字句上 rootfs 配下」の保証であり、symlink 経由の脱出や検証からマウントまでの TOCTOU は防げない。
 //! 実マウントは rootfs の fd を起点に `O_NOFOLLOW` で 1 要素ずつ辿る方式（`exec` の `open_dir_beneath` と同じ）で
-//! 行う必要がある。bind の宛先は適用の段（`exec::mount_binds`。#1913・#1915 で結線済み）がその方式で適用する。bind 以外の種類は TASK-29.2・TASK-127 の担当とする。文字列パスで直接 `mount(2)` してはならない。
+//! 行う必要がある。bind の宛先は適用の段（`exec::mount_binds`。#1913・#1915 で結線済み）がその方式で適用する。bind 以外の種類は TASK-29 追補（#1910 の判断で拒否のまま。sysfs は #2020）の担当とする。文字列パスで直接 `mount(2)` してはならない。
 
 use std::path::{Component, Path, PathBuf};
 

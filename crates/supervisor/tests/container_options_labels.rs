@@ -120,7 +120,7 @@ mod linux {
 }
 
 /// Linux 以外では実ストアは core が `Unimplemented`（CLI-1）。変換までを上のテストで照合している。
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[test]
 fn sup12_task169_5_1_store_is_unimplemented_outside_linux() {
     use fandhe_container_core::traits::ErrorCode;

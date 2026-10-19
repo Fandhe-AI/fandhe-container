@@ -23,8 +23,9 @@
 //! 未実装・簡易実装（REPAIR-3。実装済みを装わない）:
 //! - 非 Linux の既定探索先は空（core が未確定のため）で、実環境では「候補なし」になる。
 //! - 非 Linux の信頼性検証は core が常に `Unsupported` で拒否する（PLUG-11 の非 Linux 実装待ち）。この拒否も
-//!   `unsupported` として記録を試みるが、非 Linux では `FileStateStore::open` が `Unimplemented` を返し記録先が
-//!   作れないため、記録は `SinkFailed` になる（`FileStateStore` の非 Linux 実装待ち）。
+//!   `unsupported` として記録を試みる。macOS は `FileStateStore` 対応済み（OCI-5）で記録先を作れる。
+//!   Windows は `FileStateStore::open` が `Unimplemented` を返し記録先が作れないため、記録は `SinkFailed` になる
+//!   （`FileStateStore` の Windows 実装待ち）。
 //! - 許可済みハッシュ一覧の配置・指定方法が未確定のため一覧は既定の空（全件拒否）のままで、読み込み経路は無い
 //!   （設計案は `docs/design/plugin-hash-allowlist.md`・#1868。承認待ち）。
 //! - 検証を通過した plugin の起動と RPC は未実装。core 側の型つき `ContainerRuntime` proxy と spawn の配線は

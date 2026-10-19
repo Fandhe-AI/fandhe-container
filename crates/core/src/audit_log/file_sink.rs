@@ -86,7 +86,14 @@
 //! # 未実装（REPAIR-3）
 //!
 //! `/run` は tmpfs のため再起動を越える保持は保証しない。永続的な置き場所（`/var/log` 等）・ローテーション・
-//! 常時の二重記録（tee）は未実装。非 Linux では `FileStateStore::open` が `Unimplemented` を返すため
+//! 常時の二重記録（tee）は未実装。
+//!
+//! 非 Linux の記録先（#2247 の後も未達。SEC-4）: macOS は `FileStateStore::open` が通る（#2247）ため構築入口
+//! （`open_in_state_root`）は成功するが、記録は `SinkFailed` のままである。塞がっているのは主経路の隔離
+//! （`run_isolated` が非 Linux で常に失敗し `IsolationUnavailable` になる。fork を使う）・
+//! `file_writer.rs` の `open_checked`（非 Linux は `Unsupported`。macOS の fd 相対 open は #1864）・
+//! `kernel_audit.rs` の代替経路（非 Linux は `UnsupportedTransport`）の 3 か所。Windows は
+//! `FileStateStore::open` が `Unimplemented`（所有者 SID・DACL の検査に Win32 FFI が要るため）を返し、
 //! 構築入口も fail-closed になる。
 //!
 //! `@audit.log` にはサイズ上限もローテーションも無い。entrypoint 層の理由（`stdio_null_not_null_device` 等）は
@@ -770,8 +777,9 @@ impl FileAuditSink {
     ///
     /// 呼び出し元: supervisor の `exec::default_audit_sink`（委譲）と、CLI の plugin バックエンド（plugin 信頼検証の
     /// 拒否の記録先）。`root_override` が `None` なら [`StateRoot::resolve`] の既定規則に従う。ストアを開く順序は
-    /// [`Self::in_state_store`] の型による固定と同じ。Linux 以外では `FileStateStore::open` が `Unimplemented` を
-    /// 返す（作成の前に拒否するため副作用は無い。REPAIR-3: 非 Linux の記録先は未提供）。
+    /// [`Self::in_state_store`] の型による固定と同じ。Windows では `FileStateStore::open` が `Unimplemented` を
+    /// 返す（作成の前に拒否するため副作用は無い）。macOS はストアを開けるが、記録は主経路・代替経路が
+    /// 未実装のため `SinkFailed` になる（REPAIR-3・#2247。上の「未実装」節）。
     pub fn open_in_state_root(root_override: Option<PathBuf>) -> Result<Self, TraitError> {
         let root = StateRoot::resolve(root_override)?;
         let store = FileStateStore::open(root)?;

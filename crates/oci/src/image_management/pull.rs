@@ -623,7 +623,7 @@ impl PullSession<'_> {
         }
         for b in &to_move {
             let src = self.staging_dir.join(hex_of(b)?);
-            self.check_staged_ident(&src, b)?;
+            self.check_staged_ident(&src, b, false)?;
         }
         if !to_move.is_empty() {
             self.ensure_blob_dirs()?;
@@ -636,6 +636,12 @@ impl PullSession<'_> {
         let mut dst_checked: BTreeMap<Digest, Option<FileIdent>> = BTreeMap::new();
         for b in &to_move {
             let dst = blob_path(&root, b)?;
+            if !cfg!(unix) {
+                // unix 以外は指紋で書き換えを検出できないため、既存の宛先は常に未検証として扱い、
+                // 検証済みのステージングで置き換える（OCI-1）。
+                dst_checked.insert(b.clone(), None);
+                continue;
+            }
             let size = self.verified.get(b).map_or(0, |v| v.size);
             let ident = match FileIdent::of_regular(&dst) {
                 Ok(Some(before)) => match verify_blob_digest(&dst, b, size) {
@@ -646,10 +652,14 @@ impl PullSession<'_> {
                             _ => None,
                         }
                     }
+                    // NotFound は並行 prune が未参照の blob を消した場合。「宛先は未検証」として扱い、
+                    // 排他区間の下の hard_link で公開を続ける（OCI-7）。
                     Err(e)
                         if matches!(
                             e.code(),
-                            OciErrorCode::DataLoss | OciErrorCode::ResourceExhausted
+                            OciErrorCode::DataLoss
+                                | OciErrorCode::ResourceExhausted
+                                | OciErrorCode::NotFound
                         ) =>
                     {
                         None
@@ -681,7 +691,9 @@ impl PullSession<'_> {
                 let dst = blob_path(&root, b)?;
                 // 検証後にステージングのファイルが差し替わっても未検証の内容を公開しないよう、
                 // 排他区間の下では再ハッシュせず、検証した実体の指紋を照合する（OCI-1・OCI-7）。
-                self.check_staged_ident(&src, b)?;
+                // unix 以外（Windows）の指紋は size / mtime だけで、mtime を戻した同サイズの書き換えを
+                // 検出できない。そのためガード内で再ハッシュして公開物を確定する（`rehash = true`）。
+                self.check_staged_ident(&src, b, !cfg!(unix))?;
                 match fs::hard_link(&src, &dst) {
                     Ok(()) => {
                         created.push(dst);
@@ -764,7 +776,14 @@ impl PullSession<'_> {
     /// ステージングのファイルが検証時と同じ実体（指紋が一致）であることを確かめる。再ハッシュはしない。
     /// 通常ファイルでない・指紋が違う（差し替え・書き換え）なら `DataLoss`（通常ファイルでなければ
     /// `FailedPrecondition`）。
-    fn check_staged_ident(&self, src: &Path, digest: &Digest) -> Result<(), OciError> {
+    /// `rehash = true` のときは指紋の一致に加えて digest を再計算する（指紋で書き換えを検出できない
+    /// unix 以外の公開用）。
+    fn check_staged_ident(
+        &self,
+        src: &Path,
+        digest: &Digest,
+        rehash: bool,
+    ) -> Result<(), OciError> {
         let Some(entry) = self.verified.get(digest) else {
             return Err(err(
                 OciErrorCode::FailedPrecondition,
@@ -772,7 +791,12 @@ impl PullSession<'_> {
             ));
         };
         match FileIdent::of_regular(src) {
-            Ok(Some(now)) if now == entry.ident => Ok(()),
+            Ok(Some(now)) if now == entry.ident => {
+                if rehash {
+                    verify_blob_digest(src, digest, entry.size)?;
+                }
+                Ok(())
+            }
             Ok(Some(_)) => Err(err(
                 OciErrorCode::DataLoss,
                 "staged blob changed after verification",

@@ -2,8 +2,8 @@
 //!
 //! CRI サーバー層（`fandhe-container-cri`）・将来の containerd shim v2（CRI-5）は、
 //! この内部トレイトを呼ぶアダプタとなる想定（PoC-7 の原案）。実装は本 crate には置かず、
-//! 別プロセス plugin（`fandhe-container-plugin-cri` 等。TASK-114）が担い、core 側の
-//! proxy（G8・TASK-107/114）が UDS＋長さ接頭辞フレームの RPC へ変換して
+//! 別プロセス plugin（`fandhe-container-plugin-cri` 等は TASK-114、バックエンド plugin は #1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕）が担い、core 側の
+//! proxy（G8・TASK-107。バックエンド plugin 向けは #1869 の設計の 4.1・4.3）が UDS＋長さ接頭辞フレームの RPC へ変換して
 //! `Box<dyn ContainerRuntime>` として呼び出し側へ渡す（PLUG-1）。
 //!
 //! シグネチャは人間のアーキテクチャレビュー（#19・TASK-4.h1）前の暫定版であり、
@@ -25,7 +25,7 @@ use super::types::{ContainerId, ErrorCode, TraitError};
 /// 3. `Send + Sync` を要求する。呼び出し側は `Arc<dyn ContainerRuntime>` として複数スレッド
 ///    から共有できることを前提にしてよい。
 /// 4. 本 crate（core）にはこのトレイトの実装を置かない。実装は plugin 側にある
-///    （PLUG-1・TASK-114）。「実装済みを装わない」という REPAIR-3 の方針に基づく。
+///    （PLUG-1・#1869 の設計・TASK-114）。「実装済みを装わない」という REPAIR-3 の方針に基づく。
 /// 5. plugin の信頼境界（UDS の所有者・権限検証、別 UID からの接続切断等。PLUG-11・PLUG-12）
 ///    はこのトレイトの外側、境界機構（`fandhe-container-plugin`）の責務であり、
 ///    `ContainerRuntime` の呼び出し側はそれらが検証済みであることを前提にしてよい。
@@ -118,7 +118,7 @@ impl CreateRequest {
     ///
     /// `bundle` が絶対パスでない場合は [`ErrorCode::InvalidArgument`] を返す。plugin
     /// プロセスは呼び出し元と作業ディレクトリが異なるため、相対パスは解決先が曖昧になる
-    /// （fail-closed）。rootfs の外を指していないか等の詳しい検証は実装側（TASK-114・G3）の
+    /// （fail-closed）。rootfs の外を指していないか等の詳しい検証は実装側（#1869 の設計・TASK-114・G3）の
     /// 責務であり、本トレイトは形式検証のみを行う。
     pub fn new(id: ContainerId, bundle: PathBuf) -> Result<Self, TraitError> {
         if !bundle.is_absolute() {

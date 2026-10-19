@@ -3,7 +3,7 @@
 //! 子モジュール `mode` のモード選択 API（TASK-110.3・#260）。
 //!
 //! 呼び出しごとに plugin プロセスを spawn し、1 往復（要求フレーム送信 -> 応答フレーム受信）の
-//! 完了後に終了させる。呼び出し元は core 側の plugin proxy（TASK-114 ほか。依存方向は
+//! 完了後に終了させる。呼び出し元は core 側の plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 ほか。依存方向は
 //! `core -> plugin` のため、本モジュールは core の登録表を参照せず、検証済みの fd を持つ起動対象 [`PluginLaunchTarget`] を受け取る。#1856）。
 //!
 //! # 契約
@@ -35,10 +35,14 @@
 //!   他の socket・pipe・端末・通常ファイル・macOS）と、即時書き込みが全部は書けなかった場合は、固定長の延期表
 //!   （`drop_report`）へ積み、ホストが終了時に `take_pending_child_cleanup_failures` で取り出して出す。
 //!   即時に全部書けた記録は表へ積まない（重複させない）。SIGKILL・abort・シグナル再送出による終了と、取り出しを
-//!   呼ばないホスト（core の plugin proxy は TASK-114 で配線予定）では延期した記録は残らない（REPAIR-3）。plugin 由来の文字列は
+//!   呼ばないホスト（core の plugin proxy は #1869 の設計・TASK-114 で配線予定）では延期した記録は残らない（REPAIR-3）。plugin 由来の文字列は
 //!   載せない。`unreaped_error` で報告済みの子と、`Drop` の前に明示的な経路で手放した子（回収済み・他所で回収された
 //!   `Lost`。そこで返したグループ停止の失敗を含む）は記録しない。
-//! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
+//! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] を設定する（資格情報を継承させない）。
+//!   追加は [`OneShotPlugin::with_env`] で呼び出し側が名前と値を明示した組だけで、親の環境を暗黙に
+//!   継承する指定は無い。`FANDHE_CONTAINER_PLUGIN_`・`LD_`・`DYLD_` 始まりの名前・規則外の名前・重複・
+//!   NUL を含む値・上限超過（[`ONE_SHOT_ENV_MAX_COUNT`] 等）は `InvalidArgument` で拒否し、spawn しない
+//!   （#1858・#1319・PLUG-7）。
 //!   stdin / stdout は null。stderr は親へ継承させず、専用の UNIX ソケット対で受けて
 //!   [`OneShotStderr`] として返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は
 //!   読み捨てて件数だけ数える）。親の stderr・構造化ログへ内容を転記しない（量の上限なしの出力・
@@ -81,13 +85,18 @@
 //!   `signal_forward` 経由でグループ宛て（`kill(-pid)`）に転送し、孫まで届く（#1513）。親が SIGKILL・
 //!   abort で落ちた場合は転送されず、Linux の `PR_SET_PDEATHSIG` が止めるのは plugin 本体だけで孫は
 //!   残留し得る。macOS では plugin 本体も孫も残留し得る（kqueue `NOTE_EXIT` は将来課題）。
-//! - 要求 ID と応答 ID の対応づけ（TASK-114）。
+//! - 要求 ID と応答 ID の対応づけ（#1869 の設計）。
 
 mod drop_report;
+mod env;
 mod launch_target;
 mod mode;
 mod resident;
 
+pub use env::{
+    ONE_SHOT_ENV_MAX_BYTES, ONE_SHOT_ENV_MAX_COUNT, ONE_SHOT_ENV_NAME_MAX_BYTES,
+    ONE_SHOT_ENV_VALUE_MAX_BYTES,
+};
 #[cfg(unix)]
 pub use launch_target::PluginFileIdentity;
 pub use launch_target::PluginLaunchTarget;
@@ -204,6 +213,7 @@ pub struct OneShotPlugin {
     target: PluginLaunchTarget,
     args: Vec<OsString>,
     socket_dir: PathBuf,
+    env: env::PluginEnvVars,
 }
 
 impl OneShotPlugin {
@@ -228,7 +238,19 @@ impl OneShotPlugin {
             target,
             args,
             socket_dir,
+            env: env::PluginEnvVars::default(),
         })
+    }
+
+    /// 子へ追加で渡す環境変数の組を検証して設定する（既定は空。呼ぶたびに組全体を置き換え、空の
+    /// `Vec` で既定へ戻る）。都度起動・常駐・[`PluginSession`] のすべての経路で同じ組が渡る。
+    ///
+    /// 違反は `InvalidArgument`（固定の英語文言。名前も値も載せない）で、spawn しない。規則は
+    /// `lifecycle` の契約と [`ONE_SHOT_ENV_MAX_COUNT`] 等の上限を参照。親の環境は読まない。
+    /// どの plugin に何を渡すかは呼び出し側（core）が決める（#1869）。PLUG-7・#1858。
+    pub fn with_env(mut self, vars: Vec<(String, OsString)>) -> Result<Self, PluginError> {
+        self.env = env::validate(vars)?;
+        Ok(self)
     }
 
     /// 起動する実行ファイルの実体の絶対パス（表示専用。開き直し・起動には使わない。Linux は fd の
@@ -1240,7 +1262,8 @@ fn bind_to_parent_lifetime(_cmd: &mut Command) -> Result<(), PluginError> {
 }
 
 /// 都度起動・常駐の両モードが共用する plugin の `Command` を組み立てる（起動条件を 1 か所に置く。
-/// REPAIR-1）。子の環境は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ、stdin / stdout は null、stderr は
+/// REPAIR-1）。子の環境は `env_clear()` 後に [`OneShotPlugin::with_env`] で検証済みの組、最後に
+/// [`PLUGIN_SOCKET_ENV`]（socket の変数が必ず勝つ）、stdin / stdout は null、stderr は
 /// 呼び出し側が用意した収集用の端、Linux では親死亡シグナルを設定する。
 ///
 /// 実行するプログラムは起動対象から決める（#1856・PLUG-11）。Linux は保持した fd の実体を
@@ -1265,6 +1288,7 @@ fn plugin_command(
     }
     cmd.args(&plugin.args)
         .env_clear()
+        .envs(plugin.env.iter())
         .env(PLUGIN_SOCKET_ENV, socket_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

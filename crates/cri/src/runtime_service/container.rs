@@ -6,7 +6,7 @@
 //! 有限の上限を課す。`envs` に秘密値が入り得るため、エラー文言・計装へ `config` の内容を出さない。
 //!
 //! ListContainers・ContainerStatus（TASK-58.3・#435）の応答への変換（`to_summary`・`to_status`）と
-//! フィルタ検証（`ValidatedContainerFilter`）もここに置く。`exit_code`・`reason`・`image_ref` 等は空・0 のスタブ。
+//! フィルタ検証（`ValidatedContainerFilter`）もここに置く。`image_ref`・`message` 等は空のスタブ。`exit_code`・`reason` は実行層の報告に基づく（`exit_reason`）。
 //!
 //! **スタブの明示（REPAIR-3）**: 状態はプロセス内メモリにあるだけで、実行層（core）には未接続。
 //! `Running` は記録上の状態で、プロセスは起動しない。StopContainer / RemoveContainer（TASK-58.2・#434）も
@@ -131,8 +131,8 @@ pub(super) struct ContainerRecord {
     pub(super) started_at_nanos: i64,
     /// 停止（`Exited` 遷移）の時刻。未停止は 0（TASK-58.2。ContainerStatus〔TASK-58.3〕が応答に使う）。
     pub(super) finished_at_nanos: i64,
-    /// 実行層が停止応答で返した終了コード。未停止・不明は 0（CRI-2。ContainerStatus.exit_code に反映する）。
-    pub(super) exit_code: i32,
+    /// 実行層が報告した終了コード（CRI-2）。未停止・不明は None（ContainerStatus.exit_code は 0、reason は空）。
+    pub(super) exit_code: Option<i32>,
     pub(super) retained_bytes: usize,
     /// 実行層（`ContainerRuntime`）の create・start・stop・delete を呼び出し中（TASK-59.2・#438、TASK-59.3・#439）。
     ///
@@ -143,16 +143,36 @@ pub(super) struct ContainerRecord {
     /// 実行層に資源（コンテナ・bundle）がある（Create 成功、または結果不明で残りうる。TASK-59.2）。
     ///
     /// 真の間、Stop・Remove は記録上の遷移ではなく実行層の stop・delete を経由する（TASK-59.3）。
-    /// 名前は変更せず（差分最小化）、意味は「実行層が所有する」。
-    pub(super) runtime_leaked: bool,
+    /// 意味は「実行層が所有する」。
+    pub(super) runtime_owned: bool,
+}
+
+/// 終了コード 0 の `ContainerStatus.reason`（containerd・kubelet の慣例に合わせた CamelCase。CRI-2）。
+const REASON_COMPLETED: &str = "Completed";
+/// 非 0 の終了コード（シグナル終了の 137・143 を含む）の `ContainerStatus.reason`（CRI-2）。
+const REASON_ERROR: &str = "Error";
+
+/// 実行層が報告した終了コードから `ContainerStatus.reason` を導く（CRI-2）。
+///
+/// `to_status` から呼ばれる。終了コードが不明（`None`）または未終了のときは空を返し、不明な終了を
+/// `Completed` と見せない（fail-closed。REPAIR-3）。`OOMKilled` は実行層が OOM の事実を返す経路が無いため
+/// 未対応（スタブ。cri-api の規定は `api.proto` の `ContainerStatus.reason`）。値は固定文字列のみで、
+/// 実行層の応答文字列を外へ出さない。
+fn exit_reason(state: ContainerState, exit_code: Option<i32>) -> &'static str {
+    match (state, exit_code) {
+        (ContainerState::Exited, Some(0)) => REASON_COMPLETED,
+        (ContainerState::Exited, Some(_)) => REASON_ERROR,
+        _ => "",
+    }
 }
 
 impl ContainerRecord {
     /// ContainerStatus 応答用の変換（CRI-1・TASK-58.3・#435）。
     ///
     /// labels・annotations・mounts・log_path は保持した値を無改変で返す。`envs`・`command`・`args` は
-    /// 応答項目に無く（秘密値が入り得る）、返さない。**スタブの明示（REPAIR-3）**: `reason`・
-    /// `message`・`image_ref`・`image_id`・`user` は実行層未接続のため空・0 で、実値は TASK-59（CRI-2）で埋める。
+    /// 応答項目に無く（秘密値が入り得る）、返さない。**スタブの明示（REPAIR-3）**:
+    /// `message`・`image_ref`・`image_id`・`user` は空で、実値は TASK-59（CRI-2）で埋める。`exit_code` は実行層が
+    /// 報告した値（不明は 0）、`reason` は `exit_reason` で導く。
     pub(super) fn to_status(&self, id: &str) -> v1::ContainerStatus {
         let linux = self
             .config
@@ -176,10 +196,10 @@ impl ContainerRecord {
             created_at: self.created_at_nanos,
             started_at: self.started_at_nanos,
             finished_at: self.finished_at_nanos,
-            exit_code: self.exit_code,
+            exit_code: self.exit_code.unwrap_or(0),
             image: self.config.image.clone(),
             image_ref: String::new(),
-            reason: String::new(),
+            reason: exit_reason(self.state, self.exit_code).to_owned(),
             message: String::new(),
             labels: self.config.labels.clone(),
             annotations: self.config.annotations.clone(),
@@ -647,6 +667,19 @@ mod tests {
             config,
             sandbox_config: None,
         }
+    }
+
+    /// CRI-2・REPAIR-3: 終了コードから reason を導く。不明・未終了は空。
+    #[test]
+    fn cri_2_repair_3_exit_reason_mapping() {
+        use ContainerState::*;
+        assert_eq!(exit_reason(Exited, Some(0)), "Completed");
+        assert_eq!(exit_reason(Exited, Some(137)), "Error");
+        assert_eq!(exit_reason(Exited, Some(-1)), "Error");
+        assert_eq!(exit_reason(Exited, None), "");
+        assert_eq!(exit_reason(Running, None), "");
+        assert_eq!(exit_reason(Created, None), "");
+        assert_eq!(exit_reason(Unknown, None), "");
     }
 
     fn code_of(req: v1::CreateContainerRequest) -> Code {

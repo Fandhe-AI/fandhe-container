@@ -25,6 +25,7 @@ SHELL := /bin/bash
 
 .PHONY: help setup rustup submodule hooks lint-md lint-yaml lint-editorconfig lint-commits lint-docs \
 	check-workspace-manifest fmt fmt-check lint test doc poc-venus-jig-check check-cli-backend-deps \
+	check-launch-target check-launch-target-selftest \
 	test-core-no-plugin plugin-feature-size plug4-core-invariance plug4-core-invariance-selftest \
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \
 	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest crash-summary-check \
@@ -109,6 +110,12 @@ poc-venus-jig-check: ## venus 試験治具（poc/venus-decoder/jig）の fmt-che
 
 check-cli-backend-deps: ## cli の依存ツリー（normal/build/dev・全ターゲット）に platform-* / plugin-macos / plugin-windows / microvm 系が含まれないことを検証する
 	@scripts/targets/check-cli-backend-deps.sh
+
+check-launch-target: ## plugin 起動対象の構築口 from_verified_file を呼ぶのが core の変換と許可した試験コードだけか判定する（PLUG-11・#1857）
+	@scripts/targets/check-launch-target.sh
+
+check-launch-target-selftest: ## check-launch-target の自己テスト（REPAIR-12。fixture のみ）
+	@scripts/check-plugin-launch-target-construction-selftest.sh
 
 test-core-no-plugin: ## core を --no-default-features でテストし plugin 依存が入らないことを検証する
 	@scripts/targets/test-core-no-plugin.sh

@@ -2,7 +2,7 @@
 //!
 //! core 側が plugin プロセスからの接続を待ち受ける `UdsListener`（bind / listen / accept）と、
 //! accept / connect で得た検証済み 1 接続を表す `UdsStream` を提供する。待ち受けは core 側
-//! （TASK-109・TASK-114）、接続（`UdsStream::connect`）は plugin プロセス側が使う。フレーム符号化（#245・#247）は本型の `Read` / `Write`
+//! （TASK-109・#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114）、接続（`UdsStream::connect`）は plugin プロセス側が使う。フレーム符号化（#245・#247）は本型の `Read` / `Write`
 //! の上に載る。
 //!
 //! # PLUG-12 の保護（本モジュールで実施する範囲）
@@ -27,7 +27,7 @@
 //!   同一 UID は脅威モデル外（socket と同一性の照合は行わず、ディレクトリ fd 基準で名前を操作する）
 //! - peer 認証で拒否した接続は 1 件ごとに監査イベントとして通知する（`crate::audit`。
 //!   `accept` / `connect` は受け手 `PeerAuthObserver` を必須引数に取り、既定の出力先は持たない。
-//!   SEC-4・TASK-124.5・#1388）。永続的な監査ログへの配線は core 側 proxy（TASK-114）で未実装（REPAIR-3）
+//!   SEC-4・TASK-124.5・#1388）。永続的な監査ログへの配線は core 側 proxy（#1869 の設計・TASK-114）で未実装（REPAIR-3）
 //! - accept した接続の peer credential（`SO_PEERCRED` / `getpeereid`。`crate::sys`）を検証し、
 //!   自 UID 以外は切断する。公開の [`UdsListener::accept`] は `PermissionDenied` を返す。起動経路
 //!   （`accept_peer_pid`）は UID 不一致も pid 不一致と同様に切断して待ち受けを続け、合算で
@@ -54,7 +54,7 @@
 //!   手で削除する。手順は `docs/setup/plugin-socket-recovery.md`。#1859）、bind ロックを取得でき管理下の
 //!   自 UID 所有 stale socket のみ削除して再 bind する（詳細は `uds_security` モジュール doc）
 //! - gRPC（TASK-108）
-//! - 要求 ID と応答 ID の対応づけ・要求→応答の 1 往復ヘルパー（core 側 proxy。TASK-114）
+//! - 要求 ID と応答 ID の対応づけ・要求→応答の 1 往復ヘルパー（core 側 proxy。#1869 の設計）
 //! - ACK 専用のワイヤー種別（`ControlMessage` のワイヤー形変更を伴うため行わない。本 crate での
 //!   「ACK / RPC 応答待ち」は [`UdsStream::read_frame`] を指す）
 //!
@@ -192,7 +192,7 @@ impl UdsListener {
     /// 1 接続を期限付きで受け付ける（REPAIR-5）。
     ///
     /// `timeout` が 0 または [`UDS_ACCEPT_TIMEOUT_MAX`] 超なら `InvalidArgument`、期限切れは `Timeout`。
-    /// 1 呼び出しで 1 接続まで。受付ループ・同時接続数の上限は呼び出し側（TASK-109・TASK-114）の責務。
+    /// 1 呼び出しで 1 接続まで。受付ループ・同時接続数の上限は呼び出し側（TASK-109・#1869 の設計・TASK-114）の責務。
     /// 返す接続は peer credential が自 UID であることを確認済み。不一致は接続を切断して
     /// `PermissionDenied` を返す（呼び出し側の受付ループは継続してよい）。本メソッドは拒否 1 件で必ず返り、
     /// 自ら待ち受けを続けない（続けるのは起動経路の `accept_peer_pid` のみ）。peer 認証による拒否かどうかは

@@ -5,9 +5,10 @@
 //! OCI default devices と `/dev/ptmx`・`/dev/pts/*` を表す封印した許可リスト（[`DeviceAllowList`]）から、
 //! cgroup v2 のデバイス制御用 eBPF プログラム（[`DeviceProgram`]）の命令列を組み立てる。
 //! syscall を呼ばない純粋な組み立て層で、`unsafe` を持たない。ロードのラッパー（`sys::bpf`。#1679）・
-//! アタッチと事後検証（`BPF_CGROUP_DEVICE`。#1680）・実機の verifier 照合（#1681）・起動経路への結線
-//! （#1314）・GPU の CDI `deviceNodes` の追加入口（TASK-129・GPU-4・#561）は別 issue の担当で、
-//! 現状は未結線（REPAIR-3）。
+//! アタッチと事後検証（`device_policy` サブモジュール。#1680）は実装済みで、起動経路へは start の連鎖の
+//! 制限の段（`apply_limits`）から使い、supervisor の `prepare_cgroup` 経由で結線済み（#1716・#1717・#1819）。
+//! 実機の verifier 照合の試験（#1681。`tests/device_cgroup_layers.rs`）はあるが、実機での実行と記録は人間担当
+//! （#1621）。GPU の CDI `deviceNodes` の追加入口（TASK-129・GPU-4・#561・#562）は未実装（REPAIR-3）。
 //!
 //! # 命令列のレイアウト
 //! `r1` は `struct bpf_cgroup_dev_ctx`（`u32 access_type`〔`(ACC << 16) | DEV`〕・`u32 major`・`u32 minor`）

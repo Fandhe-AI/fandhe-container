@@ -716,6 +716,41 @@ mod tests {
         .unwrap();
     }
 
+    /// SEC-4（#2023）: listener 無し（`NEW_LISTENER` を付けない通常の適用）で USER_NOTIF 版を載せると、
+    /// ERRNO 側の禁止 syscall はカーネルが `ENOSYS` で拒否し、実行されない（拒否は維持される）。
+    /// `EPERM` ではないため、listener の配線（#2024・#2025）前は本番に載せない。
+    ///
+    /// 適用前の対照として kcmp が通ることを要求する。外側の seccomp（開発コンテナの既定プロファイル等）が
+    /// kcmp を拒否する環境では、skip せず前提不成立として失敗させる。
+    #[test]
+    fn sec4_user_notif_without_listener_returns_enosys_real_thread() {
+        std::thread::spawn(|| {
+            assert_eq!(
+                sys::kcmp_self_probe(),
+                Ok(()),
+                "outer seccomp rejects kcmp; no valid control for this test"
+            );
+            let p = crate::seccomp::build_filter_for_target_arch_with(
+                crate::seccomp::ErrnoDelivery::UserNotif,
+            )
+            .unwrap();
+            assert_eq!(sys::set_no_new_privs(), Ok(()));
+            apply_filter(
+                &p,
+                &mut RealKernel {
+                    threads: &mut ThreadCountSource::ProcSelf,
+                },
+            )
+            .unwrap();
+            assert_eq!(thread_status_field("Seccomp:"), "2");
+            assert_eq!(sys::kcmp_self_probe(), Err(SysError::Os(sys::ENOSYS)));
+            // 禁止対象外の syscall は動作し続ける。
+            let _ = sys::effective_uid();
+        })
+        .join()
+        .unwrap();
+    }
+
     /// CORE-5: NNP 未設定の実スレッドでは適用が FailedPrecondition。NNP が環境から継承済み（sandbox 等）
     /// の場合は前提検証を再現できないため照合しない。決定的なカバレッジは偽カーネルテストが担う。
     #[test]

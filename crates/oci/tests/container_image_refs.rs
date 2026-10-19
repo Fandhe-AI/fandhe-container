@@ -1,6 +1,6 @@
 //! create / delete とイメージ参照テーブルの結合試験（OCI-7・TASK-183.8.1・#853）。
 //!
-//! core の `ContainerImageRefs` を `ImageStore` で満たす試験用アダプタ（本番のアダプタは後続。core は
+//! core の `ContainerImageRefs` を `ImageStore` の入口で満たす試験用アダプタ（本番のアダプタを置く crate は未決。core は
 //! oci に依存しないため、oci 側の試験が dev 依存の core を使って通しを確かめる）を介し、
 //! `create_with_image` の後は参照が 1 件、`delete_releasing_image_ref` の後は 0 件になることを確かめる。
 //!
@@ -23,7 +23,8 @@ use fandhe_container_core::traits::{
 };
 use fandhe_container_oci::error::{OciError, OciErrorCode};
 use fandhe_container_oci::image_management::{
-    ContainerRefId, ContainerRefRegistration, ContainerRefRelease, ImageStore, ManifestComposition,
+    ContainerRefGeneration, ContainerRefId, ContainerRefRegistration, ContainerRefRelease,
+    ImageStore, ManifestComposition,
 };
 use fandhe_container_oci::reference::Digest;
 
@@ -44,45 +45,46 @@ fn map_err(e: OciError) -> TraitError {
     TraitError::new(code, "image store error")
 }
 
-/// 登録 1 件分の試験用の記録（世代と、状態作成まで済んで確定したか）。
-type Entry = (u64, bool);
-
 /// core のトレイトを `ImageStore` で満たす試験用アダプタ。
 ///
-/// 登録世代と状態への結び付けは `ImageStore` がまだ持たないため、アダプタ側で持つ（試験専用。
-/// 世代の比較と解除が 1 回の排他にならないので、本番のアダプタは oci 側で原子的に行う）。
+/// 世代・確定・世代つき解除はすべて `ImageStore` の入口（排他の内側で原子的）に任せ、ここでは
+/// ID・digest・世代・エラーコードの変換だけを行う（#2315。本番のアダプタを置く crate は未決）。
 struct StoreRefs<'a> {
     store: &'a ImageStore,
-    generations: std::sync::Mutex<(u64, std::collections::HashMap<String, Entry>)>,
 }
 
 impl<'a> StoreRefs<'a> {
     fn new(store: &'a ImageStore) -> Self {
-        Self {
-            store,
-            generations: std::sync::Mutex::new((0, std::collections::HashMap::new())),
-        }
+        Self { store }
+    }
+}
+
+fn ref_id(id: &ContainerId) -> Result<ContainerRefId, TraitError> {
+    ContainerRefId::new(id.as_str()).map_err(map_err)
+}
+
+fn release_result(r: ContainerRefRelease) -> ImageRefRelease {
+    match r {
+        ContainerRefRelease::Released(_) => ImageRefRelease::Released,
+        _ => ImageRefRelease::NotRegistered,
     }
 }
 
 impl ContainerImageRefs for StoreRefs<'_> {
     fn bind(&self, id: &ContainerId) -> Result<ImageRefGeneration, TraitError> {
-        let mut g = self.generations.lock().unwrap_or_else(|e| e.into_inner());
-        match g.1.get_mut(id.as_str()) {
-            Some(entry) if !entry.1 => {
-                entry.1 = true;
-                Ok(ImageRefGeneration::from_raw(entry.0))
-            }
-            _ => Err(TraitError::new(ErrorCode::NotFound, "no unbound reference")),
-        }
+        let g = self
+            .store
+            .bind_container_ref(&ref_id(id)?)
+            .map_err(map_err)?;
+        Ok(ImageRefGeneration::from_raw(g.as_raw()))
     }
 
     fn registration(&self, id: &ContainerId) -> Result<Option<ImageRefGeneration>, TraitError> {
-        let g = self.generations.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(g.1
-            .get(id.as_str())
-            .filter(|e| e.1)
-            .map(|e| ImageRefGeneration::from_raw(e.0)))
+        Ok(self
+            .store
+            .container_ref_registration(&ref_id(id)?)
+            .map_err(map_err)?
+            .map(|g| ImageRefGeneration::from_raw(g.as_raw())))
     }
 
     fn release_if(
@@ -90,16 +92,14 @@ impl ContainerImageRefs for StoreRefs<'_> {
         id: &ContainerId,
         expected: ImageRefGeneration,
     ) -> Result<ImageRefRelease, TraitError> {
-        {
-            let mut g = self.generations.lock().unwrap_or_else(|e| e.into_inner());
-            match g.1.get(id.as_str()) {
-                Some(e) if e.0 == expected.as_raw() => {
-                    g.1.remove(id.as_str());
-                }
-                _ => return Ok(ImageRefRelease::NotRegistered),
-            }
-        }
-        self.release(id)
+        let r = self
+            .store
+            .release_container_ref_if(
+                &ref_id(id)?,
+                ContainerRefGeneration::from_raw(expected.as_raw()),
+            )
+            .map_err(map_err)?;
+        Ok(release_result(r))
     }
 
     fn register(
@@ -107,8 +107,7 @@ impl ContainerImageRefs for StoreRefs<'_> {
         id: &ContainerId,
         manifest: &ImageManifestDigest,
     ) -> Result<ImageRefRegistration, TraitError> {
-        let cid = id;
-        let id = ContainerRefId::new(id.as_str()).map_err(map_err)?;
+        let id = ref_id(id)?;
         let digest = Digest::parse(manifest.as_str()).map_err(map_err)?;
         Ok(
             match self
@@ -116,26 +115,18 @@ impl ContainerImageRefs for StoreRefs<'_> {
                 .register_container_ref(&id, &digest)
                 .map_err(map_err)?
             {
-                ContainerRefRegistration::Registered => {
-                    let mut g = self.generations.lock().unwrap_or_else(|e| e.into_inner());
-                    g.0 += 1;
-                    let n = g.0;
-                    g.1.insert(cid.as_str().to_owned(), (n, false));
-                    ImageRefRegistration::Registered
-                }
+                ContainerRefRegistration::Registered => ImageRefRegistration::Registered,
                 _ => ImageRefRegistration::AlreadyRegistered,
             },
         )
     }
 
     fn release(&self, id: &ContainerId) -> Result<ImageRefRelease, TraitError> {
-        let id = ContainerRefId::new(id.as_str()).map_err(map_err)?;
-        Ok(
-            match self.store.release_container_ref(&id).map_err(map_err)? {
-                ContainerRefRelease::Released(_) => ImageRefRelease::Released,
-                _ => ImageRefRelease::NotRegistered,
-            },
-        )
+        Ok(release_result(
+            self.store
+                .release_container_ref(&ref_id(id)?)
+                .map_err(map_err)?,
+        ))
     }
 }
 
@@ -470,4 +461,81 @@ fn oci7_reference_released_after_state_update_and_recreate_succeeds() {
         containers_of(&images),
         vec![ContainerRefId::new("c1").expect("id")]
     );
+}
+
+/// OCI-7・#2315: 状態作成の曖昧な失敗で残った未確定の参照は同じ ID の再作成を AlreadyExists で塞ぎ、
+/// 状態が無いことを確かめて世代つきで回収すれば再作成できる。確定済みの参照は回収の部品で外れない。
+#[test]
+fn oci7_unbound_reference_blocks_recreate_until_reclaimed_by_generation() {
+    let tmp = Tmp::new("unbound");
+    let bundle = tmp.sub("bundle");
+    make_bundle(&bundle);
+    let state = FileStateStore::open(
+        StateRoot::from_override(tmp.private_sub("state")).expect("state root"),
+    )
+    .expect("state store");
+    let images = ImageStore::open(&tmp.sub("images")).expect("image store");
+    images
+        .lock()
+        .expect("lock")
+        .register_manifest(
+            digest(MANIFEST),
+            ManifestComposition::new(
+                digest("sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"),
+                vec![],
+            )
+            .expect("comp"),
+        )
+        .expect("register manifest");
+    let refs = StoreRefs::new(&images);
+    let manifest = ImageManifestDigest::new(MANIFEST).expect("manifest");
+    let id = ContainerId::new("c1").expect("id");
+    let rec = OpRecorder::new();
+
+    // 登録だけ済んで確定しない参照（状態作成の曖昧な失敗の後の取り残しに相当）。
+    refs.register(&id, &manifest).expect("register");
+    assert_eq!(refs.registration(&id).expect("registration"), None);
+    let err = create_with_image(
+        &state,
+        &rec,
+        ContainerImage::new(&refs, &manifest),
+        &CreateRequest::new(id.clone(), bundle.clone()).expect("req"),
+    )
+    .expect_err("blocked by the unbound reference");
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+
+    let (cref, generation) = {
+        let g = images.lock().expect("lock");
+        let v: Vec<_> = g
+            .unbound_containers()
+            .map(|(i, g, _)| (i.clone(), g))
+            .collect();
+        assert_eq!(v.len(), 1);
+        v[0].clone()
+    };
+    assert_eq!(
+        images
+            .release_unbound_container_ref_if(&cref, generation)
+            .expect("reclaim"),
+        ContainerRefRelease::Released(digest(MANIFEST))
+    );
+    create_with_image(
+        &state,
+        &rec,
+        ContainerImage::new(&refs, &manifest),
+        &CreateRequest::new(id, bundle).expect("req"),
+    )
+    .expect("recreate after reclaim");
+    // 確定済みの参照は、世代が合っても回収の部品では外れない。
+    let bound = images
+        .container_ref_registration(&cref)
+        .expect("registration")
+        .expect("bound");
+    assert_eq!(
+        images
+            .release_unbound_container_ref_if(&cref, bound)
+            .expect("bound"),
+        ContainerRefRelease::NotRegistered
+    );
+    assert_eq!(containers_of(&images), vec![cref]);
 }

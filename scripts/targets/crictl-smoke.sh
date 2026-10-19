@@ -21,14 +21,15 @@ script="${CRICTL_SMOKE_SCRIPT:-scripts/cri/crictl-smoke.sh}"
 args=()
 if [ -n "${STEP_TIMEOUT:-}" ]; then args+=(--step-timeout "${STEP_TIMEOUT}"); fi
 budget="$(bash "${script}" --print-budget ${args[@]+"${args[@]}"})" || exit 2
-case "${budget}" in '' | *[!0-9]* | ???????*)
+# 算出予算は STEP_TIMEOUT（最大 999999）の数倍になり 7 桁以上もありうるため、桁数の上限は 9 桁（timeout が受ける範囲）とする。
+case "${budget}" in '' | *[!0-9]* | ??????????*)
   echo "error: invalid-input: cannot compute the time budget" >&2
   exit 2
   ;;
 esac
+# 利用者が明示した全体期限だけ 1〜999999 を検査する。算出予算は本体が受理した STEP_TIMEOUT から導くため再検査しない（REPAIR-5）。
 t="${CRICTL_SMOKE_TIMEOUT:-}"
-if [ -z "${t}" ]; then t="${budget}"; fi
-validate_timeout CRICTL_SMOKE_TIMEOUT "${t}"
+if [ -z "${t}" ]; then t="${budget}"; else validate_timeout CRICTL_SMOKE_TIMEOUT "${t}"; fi
 if [ "${t}" -lt "${budget}" ]; then
   echo "warning: CRICTL_SMOKE_TIMEOUT=${t}s is shorter than the worst-case duration ${budget}s; a slow but valid run may be cut off" >&2
 fi

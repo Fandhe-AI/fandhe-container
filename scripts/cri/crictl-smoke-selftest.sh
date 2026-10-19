@@ -235,6 +235,15 @@ assert_eq "target: a signal-terminated run is normalized to 1" 1 "${RC}"
 RC=0
 (cd "${ROOT}" && CRICTL_SMOKE_SCRIPT="${T}/fake-exit3.sh" CRI_ENDPOINT="${EP}" bash "${TARGET}" >/dev/null 2>&1) || RC=$?
 assert_eq "target: exit code 3 is passed through" 3 "${RC}"
+# 算出予算が 7 桁（STEP_TIMEOUT=125000 相当）でも入口は拒否せず実行する（REPAIR-5）。
+# shellcheck disable=SC2016
+printf '#!/usr/bin/env bash\ncase "$1" in --print-budget) echo 1000070 ;; *) exit 3 ;; esac\n' >"${T}/fake-big.sh"
+RC=0
+(cd "${ROOT}" && CRICTL_SMOKE_SCRIPT="${T}/fake-big.sh" CRI_ENDPOINT="${EP}" bash "${TARGET}" >/dev/null 2>&1) || RC=$?
+assert_eq "target: a 7-digit computed budget is accepted" 3 "${RC}"
+RC=0
+(cd "${ROOT}" && CRICTL_SMOKE_SCRIPT="${T}/fake-big.sh" CRICTL_SMOKE_TIMEOUT=1000000 CRI_ENDPOINT="${EP}" bash "${TARGET}" >/dev/null 2>&1) || RC=$?
+assert_eq "target: an explicit 7-digit CRICTL_SMOKE_TIMEOUT is still rejected" 2 "${RC}"
 (cd "${ROOT}" && CRICTL_SMOKE_SCRIPT="${T}/fake-exit3.sh" make --no-print-directory crictl-smoke CRI_ENDPOINT="${EP}" >"${T}/make.out" 2>&1) || true
 assert_has "make: the target's exit code is shown as Error 3" "${T}/make.out" "Error 3"
 

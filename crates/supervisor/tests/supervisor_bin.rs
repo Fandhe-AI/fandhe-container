@@ -30,11 +30,31 @@ struct Env {
 
 impl Env {
     fn new(tag: &str) -> Self {
+        use std::os::unix::fs::DirBuilderExt as _;
         use std::os::unix::fs::PermissionsExt;
-        let base =
-            std::env::temp_dir().join(format!("fandhe-sup-bin-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("bundle/rootfs")).unwrap();
+        // 共有 /tmp 上の推測可能なパスの削除・再利用は、競合で置かれた symlink を root が辿りうる。
+        // 一意名を 0700 で排他作成し（既存は採用しない）、配下も 1 階層ずつ `create_dir` で作る（#2324・SEC-2）。
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let mut attempt = 0u32;
+        let base = loop {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let candidate = tmp.join(format!(
+                "fandhe-sup-bin-{tag}-{}-{nanos}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
+                Ok(()) => break candidate,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
+                    attempt += 1;
+                }
+                Err(e) => panic!("exclusively create {}: {e}", candidate.display()),
+            }
+        };
+        std::fs::create_dir(base.join("bundle")).unwrap();
+        std::fs::create_dir(base.join("bundle/rootfs")).unwrap();
         std::fs::write(
             base.join("bundle/config.json"),
             br#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},
@@ -44,7 +64,7 @@ impl Env {
         .unwrap();
         std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = base.join("state");
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         Self { base, root }
     }

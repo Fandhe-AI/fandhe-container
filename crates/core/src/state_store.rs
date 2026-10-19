@@ -870,6 +870,39 @@ impl FileStateStore {
     }
 }
 
+/// `root` 直下に名前が `name` と完全一致するエントリがあることを確認する。
+///
+/// 大文字小文字非区別 FS で別表記の残骸ディレクトリを `create` が再利用しないための検査。
+/// 完全一致が無く、大文字小文字だけ違うエントリがあれば `FailedPrecondition` で拒否する
+/// （名前は書き換えない。IO-5・OCI-5。fail-closed）。
+fn ensure_exact_dir_name(root: &Path, name: &str) -> Result<(), TraitError> {
+    let entries = fs::read_dir(root).map_err(|_| internal("failed to read the state root"))?;
+    let mut case_variant = false;
+    for entry in entries {
+        let entry = entry.map_err(|_| internal("failed to read the state root"))?;
+        let Some(found) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if found == name {
+            return Ok(());
+        }
+        if found.eq_ignore_ascii_case(name) {
+            case_variant = true;
+        }
+    }
+    if case_variant {
+        return Err(err(
+            ErrorCode::FailedPrecondition,
+            "leftover state directory differs only in case from the requested id",
+        ));
+    }
+    // 列挙に現れない（競合で消えた等）場合は安全側に倒して拒否する。
+    Err(err(
+        ErrorCode::FailedPrecondition,
+        "leftover state directory could not be confirmed",
+    ))
+}
+
 impl StateStore for FileStateStore {
     fn host_state_root(&self) -> Option<&Path> {
         Some(&self.root)
@@ -902,6 +935,10 @@ impl StateStore for FileStateStore {
                         ));
                     }
                 }
+                // 大文字小文字を区別しない FS では、別表記の残骸（中断した create("Web") の空 `Web/`）に
+                // 解決され得る。再利用すると `read_dir` の名前と記録の ID が食い違い、list 等が失敗する
+                // ため、実ディレクトリ名が要求 ID と完全一致するときだけ再利用する（IO-5・OCI-5）。
+                ensure_exact_dir_name(&self.root, req.id().as_str())?;
             }
             Err(_) => return Err(internal("failed to create the state directory")),
         }
@@ -2319,6 +2356,21 @@ mod tests {
 
     fn bundle() -> PathBuf {
         std::env::temp_dir().join("fandhe-bundle")
+    }
+
+    /// 残骸ディレクトリの再利用は実名が要求 ID と完全一致するときだけ（IO-5・OCI-5）。
+    #[test]
+    fn ensure_exact_dir_name_rejects_case_variant_leftover() {
+        let tmp = std::env::temp_dir().join(format!("fandhe-exact-name-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir(&tmp).unwrap();
+        fs::create_dir(tmp.join("Web")).unwrap();
+        assert_eq!(
+            code(ensure_exact_dir_name(&tmp, "web")),
+            "FAILED_PRECONDITION"
+        );
+        assert!(ensure_exact_dir_name(&tmp, "Web").is_ok());
+        fs::remove_dir_all(&tmp).unwrap();
     }
 
     fn create(store: &FileStateStore, id: &str) -> StateRecord {

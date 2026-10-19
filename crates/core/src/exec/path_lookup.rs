@@ -85,7 +85,11 @@ pub(super) fn candidates_from_env(
         .rev()
         .find_map(|var| var.to_bytes().strip_prefix(b"PATH="))
         .ok_or_else(|| invalid("process.env has no PATH to search the entrypoint name in"))?;
-    let dirs: Vec<&[u8]> = path_value.split(|b| *b == b':').collect();
+    // 上限 + 1 件で打ち切って収集する（巨大な ':' 連続でも確保を上限内に抑える。外部入力の件数上限）。
+    let dirs: Vec<&[u8]> = path_value
+        .split(|b| *b == b':')
+        .take(PATH_SEARCH_MAX_DIRS + 1)
+        .collect();
     if dirs.len() > PATH_SEARCH_MAX_DIRS {
         return Err(invalid("PATH has too many elements"));
     }
@@ -191,6 +195,10 @@ mod tests {
             assert_eq!(err.stage, IsolationStage::Validate, "{name:?}");
         }
         let err = candidates_from_env(OsStr::new("a\0b"), &env(&["PATH=/bin"])).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        // 巨大な ':' 連続は上限超過として拒否する（収集は上限 + 1 件で打ち切り）。
+        let huge = format!("PATH=/a{}", ":".repeat(130_000));
+        let err = candidates_from_env(OsStr::new("a"), &env(&[huge.as_str()])).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 

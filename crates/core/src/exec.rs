@@ -1607,8 +1607,22 @@ fn isolate_rootless_subordinate_with(
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
     let mapper = ContainerChild::spawned(mapper_pid);
 
+    // 写像の対象(このプロセス)が non-dumpable だと `/proc/<pid>` が root 所有になり、`newuidmap` / `newgidmap` の
+    // 所有者検査が拒否する(supervisor は入口で non-dumpable にする。CORE-6・SEC-5・#2243)。書き込みの間だけ
+    // dumpable にし、元が non-dumpable だったときは、成否によらず握手の後に戻す。
+    let restore_non_dumpable = matches!(sys::is_dumpable(), Ok(false));
+    if restore_non_dumpable {
+        sys::set_dumpable_user().map_err(|e| {
+            ExecError::from_sys(e, IsolationStage::UserNamespaceMap, "PR_SET_DUMPABLE")
+        })?;
+    }
     let handshake = rootless_handshake(&mut parent_sock, plan);
     drop(parent_sock);
+    if restore_non_dumpable {
+        sys::set_non_dumpable().map_err(|e| {
+            ExecError::from_sys(e, IsolationStage::UserNamespaceMap, "PR_SET_DUMPABLE")
+        })?;
+    }
     match handshake {
         // 応答(Ok)は mapper が helper を回収し終えた後にだけ届くため、ここで mapper を kill しても helper は残らない。
         Ok(()) => {

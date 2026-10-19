@@ -490,22 +490,14 @@ mod linux {
         for (file, host, ranges) in [("uid_map", uid, &su), ("gid_map", gid, &sg)] {
             let map = read(file);
             if subordinate {
-                assert_eq!(
-                    map.first().copied(),
-                    Some((0, u64::from(host), 1)),
-                    "{file}: first extent"
-                );
-                let total: u64 = map.iter().skip(1).map(|e| e.2).sum();
-                let want: u64 = ranges.iter().map(|r| r.1).sum();
-                assert_eq!(
-                    total, want,
-                    "{file}: subordinate extents must sum to the configured ranges"
-                );
-                assert_eq!(
-                    map.get(1).map(|e| e.0),
-                    Some(1),
-                    "{file}: ranges start at container id 1"
-                );
+                // 期待する全行: (0, 実効 ID, 1) の後に、設定の範囲を順に container id 1.. へ連結（rootless_mapping と同じ規則）。
+                let mut want = vec![(0u64, u64::from(host), 1u64)];
+                let mut next = 1u64;
+                for &(start, count) in ranges.iter() {
+                    want.push((next, start, count));
+                    next += count;
+                }
+                assert_eq!(map, want, "{file}: every extent (container, host, count)");
             } else {
                 assert_eq!(
                     map,

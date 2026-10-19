@@ -62,7 +62,8 @@ use super::capabilities::apply_default_capabilities_for_launch;
 #[cfg(not(test))]
 use super::landlock::apply_landlock_stage;
 #[cfg(not(test))]
-use super::seccomp::apply_default_seccomp;
+use super::seccomp::{apply_default_seccomp, apply_default_seccomp_with_listener};
+use super::seccomp_listener::ListenerSender;
 use super::{CapabilityReport, ExecError, IsolationStage, no_new_privs, rlimits};
 // テストでは本物（`Threads: 1` を要求）の代わりに偽カーネルで走る関数へ差し替える。
 #[cfg(test)]
@@ -70,7 +71,7 @@ use super::capabilities::testing::apply_default_capabilities_ids;
 #[cfg(test)]
 use super::landlock::testing::apply_landlock_stage;
 #[cfg(test)]
-use super::seccomp::testing::apply_default_seccomp;
+use super::seccomp::testing::{apply_default_seccomp, apply_default_seccomp_with_listener};
 use crate::landlock::{LandlockRuleset, MountCheck, MountedTargets};
 use crate::rlimits::Rlimits;
 use crate::traits::types::ErrorCode;
@@ -346,6 +347,9 @@ pub struct StagePipeline {
     /// `process.user` の uid・gid（0/0 以外のときだけ `Some`）。組み込みの capability 削減段が、補助グループの
     /// 消去の後・bounding set の削減の前に切り替える（#1462 の経路。OCI-1・SEC-5・TASK-29）。
     process_ids: Option<ProcessIds>,
+    /// seccomp の listener fd を C へ渡す送り手（SEC-4・#2024）。あれば組み込みの `Seccomp` 段が `NEW_LISTENER` 付きで
+    /// 適用して渡し、ACK を待つ。無ければ従来の `prctl` 適用（旧経路・観測用の入口）。
+    listener_sender: Option<ListenerSender>,
 }
 
 impl Default for StagePipeline {
@@ -389,7 +393,14 @@ impl StagePipeline {
             landlock: None,
             mounts: MountedTargets::new(),
             process_ids: None,
+            listener_sender: None,
         }
+    }
+
+    /// seccomp の listener fd を C へ渡す送り手を登録する（本番 launch 経路だけが呼ぶ。SEC-4・#2024）。
+    pub(crate) fn with_listener_sender(mut self, sender: ListenerSender) -> Self {
+        self.listener_sender = Some(sender);
+        self
     }
 
     /// `process.user` の uid・gid を capability 削減段で適用させる（launch の非 root 指定。OCI-1・SEC-5）。
@@ -603,8 +614,11 @@ impl StagePipeline {
                     no_new_privs_ev = Some(NoNewPrivsSet { _private: () });
                 }
                 StageKind::Seccomp => {
-                    let _report =
-                        apply_default_seccomp().map_err(|e| e.at_stage(kind.isolation_stage()))?;
+                    let _report = match self.listener_sender.take() {
+                        Some(sender) => apply_default_seccomp_with_listener(sender),
+                        None => apply_default_seccomp(),
+                    }
+                    .map_err(|e| e.at_stage(kind.isolation_stage()))?;
                     seccomp_ev = Some(SeccompApplied { _private: () });
                 }
                 StageKind::Landlock => {

@@ -29,8 +29,10 @@
 //!   procfs をマウントし、保護をその上に載せる順序は `run_pre_pivot` で固定）
 //! - `/sys` は最上位のマウントが `ro`。本試験は `setup` なしの最小構成で動き `exec::mount_sysfs` の段を通らないため、`/sys` は
 //!   rootfs 上のディレクトリで fstype は `sysfs` ではない（観測値として出力のみ）。sysfs を供給した後の fstype と `ro` は
-//!   `tests/sysfs_mount.rs` が照合する（#2020）。この期待は `/sys` 配下に tmpfs を
-//!   載せない構成に限る
+//!   `tests/sysfs_mount.rs` が照合する（#2020。依存注記への回答として、本試験の `/sys` の
+//!   fstype は観測値の出力のみとする）
+//! - `/sys` の最上位とその配下のマウントに `ro` の無いものは 0 件（`sys_rw_submounts=0`）。利用者指定の tmpfs・注入ファイルは
+//!   型の段で `/sys` 配下を拒否される（#2233・SEC-2）ため、本試験は pivot 後にその状態を観測する
 //!
 //! # 判定ロジックの自己照合（REPAIR-12）
 //! mountinfo の積み方の判定（`stacking_violations`）は特権なしの純関数で、合成 fixture による自己照合を `--ignored`
@@ -208,6 +210,18 @@ mod linux {
         Ok(v)
     }
 
+    /// `/sys` の最上位のマウントと `/sys/` 配下のマウントのうち `ro` の無いものの数（SEC-2・#2233）。
+    /// 前方一致だけの兄弟（`/sysx`）は数えない。壊れた mountinfo は `Err`。
+    fn sys_rw_submounts(mountinfo: &str) -> Result<usize, String> {
+        let mnts = parse_mountinfo(mountinfo)?;
+        let top_id = top_mount(&mnts, READONLY_SYS_PATH).map(|m| m.id);
+        Ok(mnts
+            .iter()
+            .filter(|m| Some(m.id) == top_id || m.mountpoint.starts_with("/sys/"))
+            .filter(|m| !m.opts.iter().any(|o| o == "ro"))
+            .count())
+    }
+
     /// `stacking_violations` の合成 fixture による自己照合（特権不要。毎回実行する）。
     pub fn self_check() {
         let t = ["/proc/sys", "/sys"];
@@ -226,6 +240,13 @@ mod linux {
         let v = stacking_violations(&not_proc, &t).expect("parse");
         assert_eq!(v, vec!["the top mount of /proc/sys is not procfs"]);
         assert!(stacking_violations("10 1 0:5 / /proc rw\n", &t).is_err());
+        // `/sys` 部分木の rw 数: 全部 ro は 0、rw の子 1 件は 1、`/sysx` は数えない。
+        assert_eq!(sys_rw_submounts(good), Ok(0));
+        let rw_child = format!("{good}14 12 0:8 / /sys/x rw,nosuid - tmpfs t rw\n");
+        assert_eq!(sys_rw_submounts(&rw_child), Ok(1));
+        let sibling = format!("{good}15 1 0:9 / /sysx rw - tmpfs t rw\n");
+        assert_eq!(sys_rw_submounts(&sibling), Ok(0));
+        assert!(sys_rw_submounts("garbage\n").is_err());
         println!("readonly_paths: mountinfo stacking self-check passed");
     }
 
@@ -250,6 +271,9 @@ mod linux {
         for (i, msg) in violations.iter().enumerate() {
             writeln!(writer, "stack_violation:{i}={msg}").expect("write");
         }
+        let rw_subs = sys_rw_submounts(&mountinfo)
+            .map_or_else(|e| format!("malformed: {e}"), |n| n.to_string());
+        writeln!(writer, "sys_rw_submounts={rw_subs}").expect("write");
         let fstype_of = |mp: &str| {
             parse_mountinfo(&mountinfo)
                 .ok()
@@ -354,6 +378,12 @@ mod linux {
             "Some(\"proc\")",
             "the visible /proc must be procfs"
         );
+        assert_eq!(
+            lookup(text, "sys_rw_submounts"),
+            "0",
+            "no writable mount may remain at or under /sys:\n{text}"
+        );
+        println!("readonly_paths: no writable mount under /sys (sys_rw_submounts=0)");
         println!(
             "readonly_paths: top mounts verified (/proc fstype {}, /sys fstype {})",
             lookup(text, "top_fstype:/proc"),

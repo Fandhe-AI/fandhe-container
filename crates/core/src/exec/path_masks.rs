@@ -59,6 +59,8 @@
 //! # 未実装（REPAIR-3: 実装済みを装わない）
 //!
 //! - 読み取り専用化の側の `/sys` 配下の個別項目（moby の `ReadonlyPaths` に無い）。`/sys` は mount top だけを読み取り専用にする。
+//!   利用者指定の tmpfs・注入ファイル・bind は型の段で `/sys` 配下を拒否し（#2233・SEC-2）、残る子マウント（供給した rbind の子）は
+//!   ro 済み。top だけの RDONLY で足りることを、RDONLY 後に部分木の全マウントの `ro` を観測して担保する（無ければ起動を止める）
 //!   sysfs の供給は `exec::mount_sysfs`（#2020。`mounts[]` に sysfs がある起動のみ。本段より前に載せる）。`/sys/firmware` 等の
 //!   覆いは後段の `masked_paths` が担う（`exec::masked_paths`。#2014）
 //! - `/proc` の供給（procfs マウント）。現状は本段より後に procfs をマウントする実装がない。将来 OCI `mounts[]`
@@ -249,6 +251,13 @@ fn apply_one(
                 format!("the mount at {path} is not read-only after mount_setattr"),
             ));
         }
+        if path == path_masks::READONLY_SYS_PATH && !observe_subtree_read_only(&reopened)? {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                STAGE,
+                format!("a mount under {path} is not read-only after mount_setattr"),
+            ));
+        }
         Ok(Outcome::Applied)
     };
     apply().map_err(|e| e.or_violation(ViolationReason::ReadonlyPathApplyFailed, Some(&subject)))
@@ -364,6 +373,58 @@ fn observe_read_only(dir: &OwnedFd) -> Result<bool, ExecError> {
     let mnt_id = fd_mount_id(dir, STAGE)?;
     let info = super::read_thread_mountinfo(STAGE)?;
     super::mount_is_read_only_in(&info, mnt_id).map_err(|e| e.at_stage(STAGE))
+}
+
+/// `dir`（`/sys` の新しい mount top）とその配下のすべてのマウントが読み取り専用かを観測する（#2233・SEC-2）。
+///
+/// top だけに RDONLY を掛けても、先に載った子マウントは rw のまま残る。利用者の tmpfs・注入・bind は
+/// 型の段で `/sys` 配下を拒否するが、別経路が足されても pivot 前に検出するための多層防御。
+#[cfg(not(test))]
+fn observe_subtree_read_only(dir: &OwnedFd) -> Result<bool, ExecError> {
+    let mnt_id = fd_mount_id(dir, STAGE)?;
+    let info = super::read_thread_mountinfo(STAGE)?;
+    match check_subtree_read_only(&info, mnt_id) {
+        Ok(()) => Ok(true),
+        Err(SUBTREE_RW) => Ok(false),
+        Err(m) => Err(ExecError::new(ErrorCode::FailedPrecondition, STAGE, m)),
+    }
+}
+
+/// dry-run: 実マウントが無いため、`FORCE_RW` でなければ読み取り専用とみなす。
+#[cfg(test)]
+fn observe_subtree_read_only(_dir: &OwnedFd) -> Result<bool, ExecError> {
+    Ok(!tests::FORCE_RW.with(|c| c.get()))
+}
+
+/// 部分木に `ro` の無いマウントがあるときの固定文言。
+const SUBTREE_RW: &str = "a mount under the target has no ro option";
+
+/// `top_mnt_id` のマウントとそのマウントポイント以下の全マウントに `ro` があるかの判定（純関数。fail-closed）。
+///
+/// 書式に反する行・top の不在・mount ID の重複は拒否する。前方一致だけの兄弟（`/sysx`）は数えない。
+/// 返す文字列は固定の英文で mountinfo の値を含めない。
+fn check_subtree_read_only(info: &str, top_mnt_id: u64) -> Result<(), &'static str> {
+    let mut entries = Vec::new();
+    for line in info.lines() {
+        entries.push(
+            super::sysfs::parse_entry(line)
+                .ok_or("malformed line in /proc/thread-self/mountinfo")?,
+        );
+    }
+    let mut tops = entries.iter().filter(|e| e.id == top_mnt_id);
+    let top = tops.next().ok_or("no mount entry found for the mount")?;
+    if tops.next().is_some() {
+        return Err("duplicate mount ID in /proc/thread-self/mountinfo");
+    }
+    let prefix = format!("{}/", top.mount_point.trim_end_matches('/'));
+    for e in &entries {
+        if (e.mount_point == top.mount_point || e.mount_point.starts_with(&prefix))
+            && !e.options.split(',').any(|o| o == "ro")
+        {
+            return Err(SUBTREE_RW);
+        }
+    }
+    Ok(())
 }
 
 /// dry-run: 実マウントが無いため、既定は読み取り専用を観測したことにする（失敗経路は `FORCE_RW` で作る）。
@@ -736,5 +797,35 @@ mod tests {
             "the mount at /proc/bus is not read-only after mount_setattr"
         );
         assert_eq!(take_events().len(), 2);
+    }
+
+    /// mountinfo の 1 行（id parent dev root mp opts - fstype src super）。
+    fn mi(id: u64, mp: &str, opts: &str) -> String {
+        format!("{id} 1 0:1 / {mp} {opts} - sysfs sysfs rw\n")
+    }
+
+    /// SEC-2・#2233: top だけ ro で子が rw の部分木は拒否し、全部 ro なら通す。
+    #[test]
+    fn sec2_subtree_read_only_check() {
+        let all_ro = [mi(10, "/sys", "ro,nosuid"), mi(11, "/sys/fs/cgroup", "ro")].concat();
+        assert_eq!(check_subtree_read_only(&all_ro, 10), Ok(()));
+        let child_rw = [mi(10, "/sys", "ro"), mi(11, "/sys/x", "rw,nosuid")].concat();
+        assert_eq!(check_subtree_read_only(&child_rw, 10), Err(SUBTREE_RW));
+        // 前方一致だけの兄弟 /sysx は部分木に数えない。
+        let sibling = [mi(10, "/sys", "ro"), mi(11, "/sysx", "rw")].concat();
+        assert_eq!(check_subtree_read_only(&sibling, 10), Ok(()));
+        assert_eq!(
+            check_subtree_read_only(&all_ro, 99),
+            Err("no mount entry found for the mount")
+        );
+        let dup = [mi(10, "/sys", "ro"), mi(10, "/sys", "ro")].concat();
+        assert_eq!(
+            check_subtree_read_only(&dup, 10),
+            Err("duplicate mount ID in /proc/thread-self/mountinfo")
+        );
+        assert_eq!(
+            check_subtree_read_only("garbage\n", 10),
+            Err("malformed line in /proc/thread-self/mountinfo")
+        );
     }
 }

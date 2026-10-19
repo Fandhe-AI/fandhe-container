@@ -2433,7 +2433,10 @@ fn plan_entry<R: Read>(entry: &tar::Entry<'_, R>) -> Result<Plan, OciError> {
     let ty = entry.header().entry_type();
     let raw_path = entry.path_bytes();
     let is_dir_name = raw_path.last() == Some(&b'/');
-    let comps = normalize_entry_path(&raw_path)?;
+    // 構造の検査（`..`・絶対パス・NUL・長さ）は全 OS 共通。Windows ホスト固有の名前規則（末尾の `.` / 空白・予約デバイス名）
+    // は予約名の読み飛ばしの判定後に適用する。読み飛ばすエントリは FS へ触れず、`.wh..wh.` のような末尾 `.` の
+    // 予約名を Windows だけ拒否すると OS 間で挙動が分かれるため（OCI-1・OCI-2・#2325）。
+    normalize_entry_path_for(&raw_path, false)?;
     let mut raw_comps = raw_path
         .split(|b| *b == b'/')
         .filter(|c| !c.is_empty() && *c != b".")
@@ -2457,6 +2460,8 @@ fn plan_entry<R: Read>(entry: &tar::Entry<'_, R>) -> Result<Plan, OciError> {
             ));
         }
     }
+    // 読み飛ばさないエントリには、ホスト固有の名前規則を含む正規化を必ず適用する（fail-closed）。
+    let comps = normalize_entry_path(&raw_path)?;
     if class != NameClass::Regular {
         // マーカーは中身の無い通常ファイルに限る。他の型・ディレクトリ名のマーカー名は、実体として展開もせず
         // 意図不明のまま黙って落としもしないよう拒否する（fail-closed）。

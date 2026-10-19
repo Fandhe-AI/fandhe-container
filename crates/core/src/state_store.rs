@@ -1590,10 +1590,11 @@ impl LandlockAuditDto {
     fn into_record(self) -> Result<RecordedLandlockAudit, ()> {
         match (self.mode.as_str(), self.detected_abi) {
             ("kernel_audit_requested", None) => Ok(RecordedLandlockAudit::KernelAuditRequested),
-            ("unavailable_abi_too_old", Some(abi))
-                if abi > 0 && abi < crate::launch_isolation::MIN_LANDLOCK_AUDIT_ABI =>
-            {
-                Ok(RecordedLandlockAudit::Unavailable { detected_abi: abi })
+            // 範囲の規則は書き込み側（`with_audit`）と同じ `validate` が唯一の定義。
+            ("unavailable_abi_too_old", Some(abi)) => {
+                RecordedLandlockAudit::Unavailable { detected_abi: abi }
+                    .validate()
+                    .map_err(|_| ())
             }
             _ => Err(()),
         }
@@ -1660,7 +1661,8 @@ impl LaunchIsolationDto {
         };
         let landlock = RecordedLandlock::new(self.landlock.handled, rules)
             .map_err(|_| ())?
-            .with_audit(audit);
+            .with_audit(audit)
+            .map_err(|_| ())?;
         Ok(LaunchIsolationRecord::from_parts(
             RootIdentity::new(self.root.dev, self.root.ino),
             landlock,
@@ -2700,7 +2702,8 @@ mod tests {
             base.root(),
             RecordedLandlock::new(0xFFFF, base.landlock().rules().to_vec())
                 .unwrap()
-                .with_audit(a),
+                .with_audit(a)
+                .unwrap(),
         )
     }
 

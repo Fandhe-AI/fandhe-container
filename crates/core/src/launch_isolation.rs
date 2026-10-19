@@ -177,6 +177,25 @@ pub enum RecordedLandlockAudit {
     NotRecorded,
 }
 
+impl RecordedLandlockAudit {
+    /// 永続化して読み戻せる値かを検証する（`state.json` の読み出し側の規則と同一。SEC-4・#2026）。
+    ///
+    /// `Unavailable` は縮退の記録なので、`detected_abi` は 1 以上かつ [`MIN_LANDLOCK_AUDIT_ABI`] 未満に限る
+    /// （0 は ABI を検出できていない値、要求 ABI 以上は縮退していない値で、どちらも矛盾する）。
+    pub fn validate(self) -> Result<Self, LaunchIsolationError> {
+        match self {
+            Self::Unavailable { detected_abi }
+                if detected_abi == 0 || detected_abi >= MIN_LANDLOCK_AUDIT_ABI =>
+            {
+                Err(LaunchIsolationError(
+                    "landlock audit degraded ABI is out of range",
+                ))
+            }
+            other => Ok(other),
+        }
+    }
+}
+
 /// launch が適用した Landlock の handled access とルール（`LandlockRuleset` の素の型での写し）。
 #[derive(Clone, PartialEq, Eq)]
 pub struct RecordedLandlock {
@@ -223,9 +242,17 @@ impl RecordedLandlock {
     }
 
     /// カーネル監査の要求の記録を添える（SEC-4・#2026）。
-    pub fn with_audit(mut self, audit: RecordedLandlockAudit) -> Self {
+    ///
+    /// [`RecordedLandlockAudit::validate`] を通らない値（`Unavailable` の ABI が 0、または要求 ABI
+    /// [`MIN_LANDLOCK_AUDIT_ABI`] 以上）は拒否する。保存できても `state.json` から読み戻せない値を作らないため
+    /// （永続化できる値は必ず読み戻せる）。
+    pub fn with_audit(
+        mut self,
+        audit: RecordedLandlockAudit,
+    ) -> Result<Self, LaunchIsolationError> {
+        audit.validate()?;
         self.audit = audit;
-        self
+        Ok(self)
     }
 
     /// カーネル監査の要求の記録。
@@ -321,8 +348,8 @@ mod linux {
                     }
                 }
             };
-            let landlock =
-                RecordedLandlock::new(ruleset.handled_access_fs().bits(), rules)?.with_audit(audit);
+            let landlock = RecordedLandlock::new(ruleset.handled_access_fs().bits(), rules)?
+                .with_audit(audit)?;
             Ok(Self::from_parts(root, landlock))
         }
 
@@ -403,6 +430,27 @@ mod tests {
             },
             allowed,
         )
+    }
+
+    /// SEC-4・#2026: `with_audit` は永続化して読み戻せる値だけを受ける。縮退の ABI は 1〜6 のみで、0 と 7 以上は拒否する
+    /// （`LandlockAuditDto::into_record` と同じ規則。読み戻せない記録を保存させない）。
+    #[test]
+    fn sec4_2026_with_audit_rejects_unreadable_values() {
+        let base = || RecordedLandlock::new(0xFFFF, vec![root_rule(0x7)]).unwrap();
+        for ok in [
+            RecordedLandlockAudit::NotRecorded,
+            RecordedLandlockAudit::KernelAuditRequested,
+            RecordedLandlockAudit::Unavailable { detected_abi: 1 },
+            RecordedLandlockAudit::Unavailable { detected_abi: 6 },
+        ] {
+            assert_eq!(base().with_audit(ok).unwrap().audit(), ok);
+        }
+        for bad in [0, 7, 8, u32::MAX] {
+            let err = base()
+                .with_audit(RecordedLandlockAudit::Unavailable { detected_abi: bad })
+                .unwrap_err();
+            assert_eq!(err.message(), "landlock audit degraded ABI is out of range");
+        }
     }
 
     /// SUP-6・CORE-5・#1468: 件数・ビット範囲・先頭・重複の検証を具体値で照合する。

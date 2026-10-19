@@ -65,7 +65,7 @@ git clone git@github.com:Fandhe-AI/fandhe-container.git   # SSH の場合
 cd fandhe-container
 git submodule update --init   # docs/spec（private・要アクセス権）
 make hooks                    # git hooks のみ導入する場合
-make docker-ci                # 開発コンテナ内で make ci を実行（環境非依存の検証）
+make docker-ci                # 開発コンテナ内で make ci を実行（環境非依存の検証。seccomp の結合試験の前提を満たすため ci サービスは seccomp unconfined。docker-shell は既定のまま）
 ```
 
 `docs/spec`（`fandhe-container-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗します（`make setup` は警告のみで続行します）。実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。

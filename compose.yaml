@@ -1,4 +1,4 @@
-# 開発コンテナの compose 定義（make docker-build / docker-shell / docker-ci から利用）。
+# 開発コンテナの compose 定義（dev は make docker-build / docker-shell、ci は make docker-ci から利用）。
 # 詳細は Dockerfile 冒頭のコメント参照。Fandhe-AI/rust-ai-library と同一方針。
 services:
   dev:
@@ -19,6 +19,17 @@ services:
     command: bash
     stdin_open: true
     tty: true
+
+  # make docker-ci 専用。dev と同じ設定で seccomp だけ外す（CORE-5・REPAIR-7・#2235）。
+  # seccomp_enforcement / exec_restrictions_reapply は「外側に seccomp フィルタが無い」
+  # ことを対照の前提にし、Docker 既定プロファイルでは kcmp が EPERM・Seccomp: 2 になって
+  # 失敗するため。テストの skip・弱体化はしない。非 root・privileged 無し・cap_add 無しは
+  # dev から引き継ぐ。docker-shell（dev）は既定 seccomp のまま。
+  ci:
+    extends:
+      service: dev
+    security_opt:
+      - seccomp=unconfined
 
 volumes:
   cargo-registry:

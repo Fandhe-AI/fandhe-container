@@ -179,7 +179,7 @@ cat <<'EOF'
                                         開発コンテナイメージをビルドする
   docker-shell                        docker compose run --rm dev
                                         開発コンテナのシェルに入る
-  docker-ci                           docker compose run --rm dev make ci
+  docker-ci                           docker compose run --rm ci make ci
                                         コンテナ内で make ci を実行する（環境非依存の検証）
 
 入力が要るターゲットは環境変数で渡す（例: TARGET_DIR=... LABEL=... scripts/targets/fio-bench.sh）。

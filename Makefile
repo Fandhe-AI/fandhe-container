@@ -326,5 +326,5 @@ docker-build: ## 開発コンテナイメージをビルドする
 docker-shell: ## 開発コンテナのシェルに入る
 	docker compose run --rm dev
 
-docker-ci: ## コンテナ内で make ci を実行する（環境非依存の検証）
-	docker compose run --rm dev make ci
+docker-ci: ## seccomp unconfined の ci サービスで make ci を実行する（環境非依存の検証）
+	docker compose run --rm ci make ci

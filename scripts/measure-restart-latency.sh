@@ -830,7 +830,12 @@ deadline_wait() { # <説明> : 条件関数 "$@" が真になるまで --timeout
   up_cs
   end=$((REPLY_CS + timeout_s * 100))
   while ! "$@"; do
-    launcher_ok || fail "launcher exited while waiting for $what"
+    if ! launcher_ok; then
+      # launcher が報告の直後に終了した場合、ERR の行が FIFO に残っている。先に読んで原因（エラーコード）を報告する。
+      # ERR・書式不正なら sup_report 内の fail で終了する。
+      if [ "$what" = "FCSUP1 OK" ]; then sup_report || true; fi
+      fail "launcher exited while waiting for $what"
+    fi
     up_cs
     [ "$REPLY_CS" -lt "$end" ] || fail "timed out waiting for $what"
     snapshot_throttled

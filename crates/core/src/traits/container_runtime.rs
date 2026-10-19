@@ -324,6 +324,14 @@ impl ContainerState {
 /// よる異常終了等、実装側が終了コードを取得できないまま「停止済み」の事実
 /// だけは確認できるケースがあり、`i32` 必須では実装が値を捏造するか
 /// 停止状態そのものを返せなくなってしまう（codex レビュー指摘・PR #1074）。
+///
+/// `termination` は [`ContainerState::Stopped`] のときにのみ意味を持つ「特別な終了理由」で、
+/// 終了コードとは独立に報告する（OOM による kill は終了コードだけでは見分けられないため。
+/// CRI-2・CORE-4）。`None` は「特別な理由を報告していない」であり、「OOM ではない」と
+/// 「検出していない」を区別しない。報告経路は supervisor が終了検知時に cgroup v2 の
+/// `memory.events` の `oom_kill` の増分を読んで [`Self::stopped_with_reason`] で記録する設計で、
+/// 検出側の実装は本型の追加より後続の分割 issue（TASK-59 追補・CRI-2・CORE-4・SUP-1）で行う
+/// （現状は読み取りが未実装のため、既存の実装は常に `None` を返す。REPAIR-3）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ContainerStatus {
@@ -331,6 +339,35 @@ pub struct ContainerStatus {
     state: ContainerState,
     pid: Option<NonZeroU32>,
     exit_code: Option<i32>,
+    termination: Option<TerminationReason>,
+}
+
+/// コンテナの終了に付く特別な理由（CRI の `ContainerStatus.reason` の `OOMKilled` の元。CRI-2・CORE-4）。
+///
+/// 終了コードと独立に報告される。将来、起動失敗等の理由を足せるよう `#[non_exhaustive]` にする。
+/// state.json には [`Self::as_str`] の固定文字列で永続化する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TerminationReason {
+    /// cgroup の OOM killer がコンテナ内のプロセスを kill した（`memory.events` の `oom_kill` の増分）。
+    OomKilled,
+}
+
+impl TerminationReason {
+    /// 状態ファイル・ログで使う固定の文字列表現を返す。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OomKilled => "oomKilled",
+        }
+    }
+
+    /// [`Self::as_str`] の逆変換。未知の文字列（大文字小文字違いを含む）は `None`。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "oomKilled" => Some(Self::OomKilled),
+            _ => None,
+        }
+    }
 }
 
 impl ContainerStatus {
@@ -347,6 +384,7 @@ impl ContainerStatus {
             state,
             pid,
             exit_code,
+            termination: None,
         }
     }
 
@@ -375,6 +413,20 @@ impl ContainerStatus {
         Self::build(id, ContainerState::Stopped, None, exit_code)
     }
 
+    /// 特別な終了理由つきの終了済み状態を作る（CRI-2・CORE-4）。
+    ///
+    /// OOM による終了のように、終了コードと独立に理由を報告したいときに使う。
+    /// `Stopped` 以外は理由を持てない（矛盾した組み合わせを作らせない）。
+    pub fn stopped_with_reason(
+        id: ContainerId,
+        exit_code: Option<i32>,
+        reason: TerminationReason,
+    ) -> Self {
+        let mut status = Self::stopped(id, exit_code);
+        status.termination = Some(reason);
+        status
+    }
+
     /// コンテナ ID を返す。
     pub fn id(&self) -> &ContainerId {
         &self.id
@@ -394,6 +446,11 @@ impl ContainerStatus {
     /// 終了コード（未設定なら `None`）を返す。
     pub fn exit_code(&self) -> Option<i32> {
         self.exit_code
+    }
+
+    /// 特別な終了理由（報告が無ければ `None`。`Stopped` 以外は常に `None`）を返す。
+    pub fn termination_reason(&self) -> Option<TerminationReason> {
+        self.termination
     }
 }
 
@@ -451,6 +508,39 @@ mod tests {
         fn state(&self, req: &StateRequest) -> Result<ContainerStatus, TraitError> {
             Ok(ContainerStatus::running(req.id().clone(), None))
         }
+    }
+
+    /// CRI-2・REPAIR-3: OOM の停止は終了コードと独立に理由を持ち、他の状態は持たない。
+    #[test]
+    fn cri_2_stopped_with_reason_carries_oom() {
+        let s = ContainerStatus::stopped_with_reason(
+            sample_id(),
+            Some(137),
+            TerminationReason::OomKilled,
+        );
+        assert_eq!(s.state(), ContainerState::Stopped);
+        assert_eq!(s.exit_code(), Some(137));
+        assert_eq!(s.termination_reason(), Some(TerminationReason::OomKilled));
+        assert_eq!(
+            ContainerStatus::stopped(sample_id(), Some(0)).termination_reason(),
+            None
+        );
+        assert_eq!(
+            ContainerStatus::running(sample_id(), None).termination_reason(),
+            None
+        );
+    }
+
+    /// CRI-2: 終了理由の文字列表現は往復し、未知の値は拒否する。
+    #[test]
+    fn cri_2_termination_reason_str_roundtrip() {
+        assert_eq!(TerminationReason::OomKilled.as_str(), "oomKilled");
+        assert_eq!(
+            TerminationReason::parse("oomKilled"),
+            Some(TerminationReason::OomKilled)
+        );
+        assert_eq!(TerminationReason::parse("OOMKilled"), None);
+        assert_eq!(TerminationReason::parse(""), None);
     }
 
     fn sample_id() -> ContainerId {

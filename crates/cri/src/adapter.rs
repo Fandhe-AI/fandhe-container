@@ -25,7 +25,8 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::{
     ContainerId, ContainerRuntime, ContainerState, ContainerStatus, CreateRequest, DeleteRequest,
-    DeleteResponse, KillRequest, Signal, StartRequest, StateRequest, StopRequest, TraitError,
+    DeleteResponse, KillRequest, Signal, StartRequest, StateRequest, StopRequest,
+    TerminationReason, TraitError,
 };
 use tonic::Status;
 
@@ -53,6 +54,27 @@ pub enum RuntimeLifecycle {
     Unknown,
 }
 
+/// 実行層が報告した特別な終了理由（core の `TerminationReason` を写した値。CRI-2・CORE-4）。
+///
+/// core の型を cri の公開 API へ漏らさないための型。`ContainerStatus.reason` の `OOMKilled` の元になる。
+/// 将来の理由追加に備えて `#[non_exhaustive]` とする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RuntimeTerminationReason {
+    /// cgroup の OOM killer によって kill された。
+    OomKilled,
+}
+
+impl RuntimeTerminationReason {
+    /// core の理由を写す。未知の理由（将来追加分）は `None`（理由なしとして扱い、reason を捏造しない）。
+    fn from_core(reason: TerminationReason) -> Option<Self> {
+        match reason {
+            TerminationReason::OomKilled => Some(Self::OomKilled),
+            _ => None,
+        }
+    }
+}
+
 /// `ContainerRuntime` の状態照会結果を CRI 側の語彙へ写した値（CRI-2）。
 ///
 /// core の型を cri の公開 API へ漏らさないための型。将来の拡張に備えて `#[non_exhaustive]` とする。
@@ -70,6 +92,8 @@ pub struct RuntimeContainerStatus {
     pub pid: Option<u32>,
     /// 終了コード（Stopped で判明していれば）。
     pub exit_code: Option<i32>,
+    /// 特別な終了理由（実行層が報告したときだけ。`None` は「OOM ではない」と「未検出」を区別しない。CRI-2・CORE-4）。
+    pub termination: Option<RuntimeTerminationReason>,
 }
 
 impl From<&ContainerStatus> for RuntimeContainerStatus {
@@ -102,6 +126,9 @@ impl From<&ContainerStatus> for RuntimeContainerStatus {
             lifecycle,
             pid: s.pid().map(|p| p.get()),
             exit_code: s.exit_code(),
+            termination: s
+                .termination_reason()
+                .and_then(RuntimeTerminationReason::from_core),
         }
     }
 }
@@ -298,7 +325,18 @@ mod tests {
             assert_eq!(got.state, state);
             assert_eq!(got.pid, pid);
             assert_eq!(got.exit_code, code);
+            assert_eq!(got.termination, None);
         }
+    }
+
+    /// CRI-2・CORE-4: 実行層が報告した OOM の停止は終了コードと独立に写る。
+    #[test]
+    fn cri2_oom_termination_is_mapped() {
+        let src =
+            ContainerStatus::stopped_with_reason(cid("a"), Some(137), TerminationReason::OomKilled);
+        let got = RuntimeContainerStatus::from(&src);
+        assert_eq!(got.exit_code, Some(137));
+        assert_eq!(got.termination, Some(RuntimeTerminationReason::OomKilled));
     }
 
     /// CRI-2: 応答の ID が要求と異なれば拒否する。

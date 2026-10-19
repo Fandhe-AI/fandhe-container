@@ -6,7 +6,7 @@
 //! 有限の上限を課す。`envs` に秘密値が入り得るため、エラー文言・計装へ `config` の内容を出さない。
 //!
 //! ListContainers・ContainerStatus（TASK-58.3・#435）の応答への変換（`to_summary`・`to_status`）と
-//! フィルタ検証（`ValidatedContainerFilter`）もここに置く。`image_ref`・`message` 等は空のスタブ。`exit_code`・`reason` は実行層の報告に基づく（`exit_reason`）。
+//! フィルタ検証（`ValidatedContainerFilter`）もここに置く。`image_ref`・`image_id`・`user`・`message`・`info` は空のスタブ（REPAIR-3。項目ごとの将来仕様は `to_status` の doc）。`exit_code`・`reason` は実行層の報告に基づく（`exit_reason`）。
 //!
 //! **スタブの明示（REPAIR-3）**: 状態はプロセス内メモリにあるだけで、実行層（core）には未接続。
 //! `Running` は記録上の状態で、プロセスは起動しない。StopContainer / RemoveContainer（TASK-58.2・#434）も
@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use crate::adapter::RuntimeTerminationReason;
 use crate::error::CriError;
 use prost::Message;
 
@@ -133,6 +134,8 @@ pub(super) struct ContainerRecord {
     pub(super) finished_at_nanos: i64,
     /// 実行層が報告した終了コード（CRI-2）。未停止・不明は None（ContainerStatus.exit_code は 0、reason は空）。
     pub(super) exit_code: Option<i32>,
+    /// 実行層が報告した特別な終了理由（OOM 等。CRI-2・CORE-4）。未報告は None。
+    pub(super) termination: Option<RuntimeTerminationReason>,
     pub(super) retained_bytes: usize,
     /// 実行層（`ContainerRuntime`）の create・start・stop・delete を呼び出し中（TASK-59.2・#438、TASK-59.3・#439）。
     ///
@@ -151,17 +154,32 @@ pub(super) struct ContainerRecord {
 const REASON_COMPLETED: &str = "Completed";
 /// 非 0 の終了コード（シグナル終了の 137・143 を含む）の `ContainerStatus.reason`（CRI-2）。
 const REASON_ERROR: &str = "Error";
+/// 実行層が OOM による終了を報告したときの `ContainerStatus.reason`（containerd・kubelet の慣例。CRI-2・CORE-4）。
+const REASON_OOM_KILLED: &str = "OOMKilled";
+
+/// 実行層が報告した終了の内容（終了コードと特別な終了理由）。guard から記録へ反映する単位（CRI-2）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct ExitReport {
+    pub(super) code: Option<i32>,
+    pub(super) termination: Option<RuntimeTerminationReason>,
+}
 
 /// 実行層が報告した終了コードから `ContainerStatus.reason` を導く（CRI-2）。
 ///
-/// `to_status` から呼ばれる。終了コードが不明（`None`）または未終了のときは空を返し、不明な終了を
-/// `Completed` と見せない（fail-closed。REPAIR-3）。`OOMKilled` は実行層が OOM の事実を返す経路が無いため
-/// 未対応（スタブ。cri-api の規定は `api.proto` の `ContainerStatus.reason`）。値は固定文字列のみで、
-/// 実行層の応答文字列を外へ出さない。
-fn exit_reason(state: ContainerState, exit_code: Option<i32>) -> &'static str {
-    match (state, exit_code) {
-        (ContainerState::Exited, Some(0)) => REASON_COMPLETED,
-        (ContainerState::Exited, Some(_)) => REASON_ERROR,
+/// `to_status` から呼ばれる。終了済みで実行層が OOM を報告していれば、終了コードに関係なく（不明でも）
+/// `OOMKilled` にする（containerd・kubelet の慣例）。それ以外は終了コードで決め、不明（`None`）または
+/// 未終了のときは空を返して不明な終了を `Completed` と見せない（fail-closed。REPAIR-3）。
+/// OOM の検出（`memory.events` の読み取り）は実行層・supervisor 側の責務で、本関数は報告を写すだけ
+/// （cri-api の規定は `api.proto` の `ContainerStatus.reason`）。値は固定文字列のみで、実行層の応答文字列を外へ出さない。
+fn exit_reason(
+    state: ContainerState,
+    exit_code: Option<i32>,
+    termination: Option<RuntimeTerminationReason>,
+) -> &'static str {
+    match (state, exit_code, termination) {
+        (ContainerState::Exited, _, Some(RuntimeTerminationReason::OomKilled)) => REASON_OOM_KILLED,
+        (ContainerState::Exited, Some(0), _) => REASON_COMPLETED,
+        (ContainerState::Exited, Some(_), _) => REASON_ERROR,
         _ => "",
     }
 }
@@ -170,9 +188,18 @@ impl ContainerRecord {
     /// ContainerStatus 応答用の変換（CRI-1・TASK-58.3・#435）。
     ///
     /// labels・annotations・mounts・log_path は保持した値を無改変で返す。`envs`・`command`・`args` は
-    /// 応答項目に無く（秘密値が入り得る）、返さない。**スタブの明示（REPAIR-3）**:
-    /// `message`・`image_ref`・`image_id`・`user` は空で、実値は TASK-59（CRI-2）で埋める。`exit_code` は実行層が
-    /// 報告した値（不明は 0）、`reason` は `exit_reason` で導く。
+    /// 応答項目に無く（秘密値が入り得る）、返さない。`exit_code` は実行層が報告した値（不明は 0）、
+    /// `reason` は `exit_reason` で導く（`Completed`・`Error`・`OOMKilled`）。
+    ///
+    /// **スタブの明示（REPAIR-3・CRI-2）**: 次の項目は返せる情報源が無く、空・`None` のまま。
+    /// - `image_ref`・`image_id`: `CriRuntimeService` が `ImageStore` を持たない。将来は CreateContainer 時に
+    ///   `ImageStore` で解決して記録へ保持した digest 等を返す（未注入・未解決は空のまま）。
+    /// - `user`: 実プロセスの uid / gid / 補助 group が必要。将来は `BundleProvider` の本番実装
+    ///   （TASK-114）が作った bundle の `process.user` から返す。
+    /// - `message`: 実行層の応答文字列を外へ出さない方針のため固定文字列のみ許す。OOM でも空。
+    /// - `info`（verbose）: 固定キーの診断情報を将来返す。現状は空。
+    ///
+    /// これらの実装は TASK-59 追補（#2322）の分割 issue で追う。
     pub(super) fn to_status(&self, id: &str) -> v1::ContainerStatus {
         let linux = self
             .config
@@ -199,7 +226,7 @@ impl ContainerRecord {
             exit_code: self.exit_code.unwrap_or(0),
             image: self.config.image.clone(),
             image_ref: String::new(),
-            reason: exit_reason(self.state, self.exit_code).to_owned(),
+            reason: exit_reason(self.state, self.exit_code, self.termination).to_owned(),
             message: String::new(),
             labels: self.config.labels.clone(),
             annotations: self.config.annotations.clone(),
@@ -673,13 +700,19 @@ mod tests {
     #[test]
     fn cri_2_repair_3_exit_reason_mapping() {
         use ContainerState::*;
-        assert_eq!(exit_reason(Exited, Some(0)), "Completed");
-        assert_eq!(exit_reason(Exited, Some(137)), "Error");
-        assert_eq!(exit_reason(Exited, Some(-1)), "Error");
-        assert_eq!(exit_reason(Exited, None), "");
-        assert_eq!(exit_reason(Running, None), "");
-        assert_eq!(exit_reason(Created, None), "");
-        assert_eq!(exit_reason(Unknown, None), "");
+        let oom = Some(RuntimeTerminationReason::OomKilled);
+        assert_eq!(exit_reason(Exited, Some(0), None), "Completed");
+        assert_eq!(exit_reason(Exited, Some(137), None), "Error");
+        assert_eq!(exit_reason(Exited, Some(-1), None), "Error");
+        assert_eq!(exit_reason(Exited, None, None), "");
+        assert_eq!(exit_reason(Running, None, None), "");
+        assert_eq!(exit_reason(Created, None, None), "");
+        assert_eq!(exit_reason(Unknown, None, None), "");
+        // OOM は終了コードに関係なく OOMKilled（未終了では空のまま）。
+        assert_eq!(exit_reason(Exited, Some(137), oom), "OOMKilled");
+        assert_eq!(exit_reason(Exited, Some(0), oom), "OOMKilled");
+        assert_eq!(exit_reason(Exited, None, oom), "OOMKilled");
+        assert_eq!(exit_reason(Running, None, oom), "");
     }
 
     fn code_of(req: v1::CreateContainerRequest) -> Code {

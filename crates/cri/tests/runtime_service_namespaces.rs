@@ -5,9 +5,10 @@
 //! 既定のテスト集合で動くのは `task_59_3_remove_container_terminates_process`（分離なしの `sleep` を使い、
 //! Linux であれば GitHub ホステッド runner でも動く）。namespace の解放を確かめる試験は実機前提で、
 //! 必要環境: Linux・`unshare`（util-linux）・非特権 user namespace の許可
-//! （`kernel.apparmor_restrict_unprivileged_userns=0` 等が要る場合がある）。GitHub ホステッド runner では
-//! 動かないため `#[ignore]` で既定のテスト集合から分離している。実行は
-//! `cargo test -p fandhe-container-cri --test runtime_service_namespaces -- --ignored`。
+//! （`kernel.apparmor_restrict_unprivileged_userns=0` 等が要る場合がある）。既定では許可されていない
+//! 環境があるため `#[ignore]` で既定のテスト集合から分離している。CI は `platform-ci`（ubuntu）が AppArmor を
+//! 緩めた後に `--ignored --test-threads=1` で実行する（#2220）。実行は
+//! `cargo test -p fandhe-container-cri --test runtime_service_namespaces -- --ignored --test-threads=1`。
 //!
 //! 未実装・差分（REPAIR-3）: core の本番 launcher（`ProductionLauncher`）は呼び出しプロセスが単一スレッドで
 //! あることを要求する（CORE-1）一方、`spawn_blocking` は tokio のスレッドプールを作るため CRI サービスと

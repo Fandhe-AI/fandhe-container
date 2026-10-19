@@ -48,7 +48,7 @@
 //!   `Drop` は危険なため）。publish も abort もせずに drop すると、リースとステージングが残る
 //!   （余分に残す側）。呼び出し側は失敗経路で [`PullSession::abort`] を呼ぶ契約である。
 //! - クラッシュ後に残ったリース・ステージングの回収 GC は #852・#477。
-//! - `system df` でのステージング容量の集計。永続化・fsync は #853・#854・#851。
+//! - 永続化は #853・#854・#851（`system df` のステージング容量の集計は `usage` で実装済み。#2222）。
 //! - cri の `image_pull` からの配線。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -70,7 +70,7 @@ use crate::layer::{VerifiedBlob, verify_blob_digest, verify_blob_digest_with};
 use crate::reference::Digest;
 
 /// ストア root 直下のステージング領域名。GC・`image ls` の走査対象外。
-const STAGING_DIR_NAME: &str = "staging";
+pub(super) const STAGING_DIR_NAME: &str = "staging";
 
 /// 1 つの pull セッションが触れる blob 件数の上限（config 1 件 + layers）。
 const MAX_SESSION_BLOBS: usize = MAX_COMPOSITION_LAYERS + 1;

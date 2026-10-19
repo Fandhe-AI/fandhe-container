@@ -1231,7 +1231,14 @@ fn entrypoint_of(spec: &LaunchSpec) -> Result<Entrypoint, TraitError> {
     let first = spec.args().first().ok_or_else(|| {
         TraitError::new(ErrorCode::InvalidArgument, "process.args must not be empty")
     })?;
-    Entrypoint::new(first, spec.args(), spec.env()).map_err(|e| to_trait_error(&e))
+    // `/` で始まれば絶対パス。`/` を含まない名前は pivot 後に `process.env` の `PATH` で解決する(OCI-1・#2314。
+    // runtime-spec は `args[0]` を `execvp` の file と同じ意味とする)。`/` を含む相対パスは `new` が拒否する。
+    let built = if first.contains('/') {
+        Entrypoint::new(first, spec.args(), spec.env())
+    } else {
+        Entrypoint::search_path(first, spec.args(), spec.env())
+    };
+    built.map_err(|e| to_trait_error(&e))
 }
 
 /// `LaunchSpec` の namespace・hostname から分離の設定を作る(`start` が検証済み。未対応の種別は拒否)。
@@ -1647,6 +1654,23 @@ mod tests {
         linux_extra: serde_json::Value,
         mounts: serde_json::Value,
     ) -> LaunchSpec {
+        spec_with_process(
+            name,
+            linux_extra,
+            mounts,
+            &["/bin/echo", "hi"],
+            &["PATH=/bin"],
+        )
+    }
+
+    /// `spec_with_mounts` の `process.args` / `process.env` を選べる版。
+    fn spec_with_process(
+        name: &str,
+        linux_extra: serde_json::Value,
+        mounts: serde_json::Value,
+        args: &[&str],
+        env: &[&str],
+    ) -> LaunchSpec {
         use super::super::cgroup_requirement::CgroupRequirement;
         use super::super::launch::RootfsDir;
         use crate::traits::ContainerId;
@@ -1680,8 +1704,8 @@ mod tests {
         let spec = LaunchSpec::new(
             rootfs,
             rootfs_dir,
-            vec!["/bin/echo".to_owned(), "hi".to_owned()],
-            vec!["PATH=/bin".to_owned()],
+            args.iter().map(|a| (*a).to_owned()).collect(),
+            env.iter().map(|e| (*e).to_owned()).collect(),
             Some("box".to_owned()),
             namespaces,
             CgroupRequirement::of_config(&config),
@@ -1693,6 +1717,36 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
         spec
+    }
+
+    /// OCI-1（#2314）: `entrypoint_of` は名前だけの `args[0]` を `PATH` 探索の対象にし、絶対パスは従来どおり、
+    /// `PATH` が無い名前と `/` を含む相対パスは `InvalidArgument` で拒否する。
+    #[test]
+    fn oci1_entrypoint_of_bare_name_search_and_rejections() {
+        let ok = |args: &[&str], env: &[&str]| {
+            entrypoint_of(&spec_with_process(
+                "ep",
+                serde_json::json!({}),
+                serde_json::json!([]),
+                args,
+                env,
+            ))
+        };
+        let e = ok(
+            &["docker-entrypoint.sh", "redis-server"],
+            &["PATH=/usr/local/bin:/bin"],
+        )
+        .expect("bare name with PATH");
+        assert_eq!(e.path(), std::path::Path::new("docker-entrypoint.sh"));
+        let e = ok(&["/bin/sh"], &[]).expect("absolute path");
+        assert_eq!(e.path(), std::path::Path::new("/bin/sh"));
+        for (args, env) in [
+            (&["docker-entrypoint.sh"][..], &["HOME=/"][..]),
+            (&["bin/app"][..], &["PATH=/bin"][..]),
+        ] {
+            let err = ok(args, env).expect_err("rejected");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{args:?}");
+        }
     }
 
     /// OCI-1・SEC-5: 単一 ID 写像は 0/0 だけを許し、範囲写像は uid・gid の両方が写像内の場合だけ許す(境界値を具体値で確認)。

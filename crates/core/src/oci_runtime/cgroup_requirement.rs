@@ -16,7 +16,17 @@
 //!
 //! 判定は型つきのアクセサ（`OciConfig::linux_resources` / `cgroups_path`）の有無で行う（#2019。以前は
 //! `unapplied_fields` の記録で判定していた。resources を解釈済みへ移したため）。値で区別すると未知の
-//! 制限の見逃し（fail-open）になるため、存在だけで要件とする（SEC-1。`resources: {}` の精緻化は #2010）。
+//! 制限の見逃し（fail-open）になるため、存在だけで要件とする（SEC-1）。
+//!
+//! # 判断の記録（#2010・TASK-29 追補。基盤は TASK-32〔CORE-3〕・TASK-170〔SUP-13〕）
+//!
+//! - `resources: {}` も「cgroup が必要」のままにし、値による「不要」判定への精緻化はしない。未対応の既知キー
+//!   （`{"memory":{"reservation":1}}` 等）は `LinuxResourceLimits::default()` に正規化されて空に見えるため、
+//!   値だけで判定すると fail-open になる。本番の start は常に supervisor の cgroup 連鎖で join の手段を渡すので、
+//!   精緻化の実益も無い
+//! - `linux.cgroupsPath` は配置に使わず、受理しない。cgroup は常に委譲スコープ配下の `fc-<id>@<n>` に置かれ、
+//!   状態記録・記録済みスコープの検証つき削除（CORE-4・SEC-6）がその配置を前提にする。値を受理に開くなら、
+//!   委譲スコープ配下に閉じる検証（`..`・絶対パス・symlink・別表記の拒否）と状態記録との整合が前提になる
 //!
 //! # 契約・制約
 //!
@@ -30,8 +40,7 @@
 //! # 現状（REPAIR-3）
 //!
 //! `linux.resources` は #2019（TASK-29 追補）で受理に移り、要件が実際に効く。`linux.cgroupsPath` は値を配置に
-//! 使う実装が無いため [`check_cgroups_path`] が create / start で拒否する（受理に開く検証は #2010 が
-//! その関数に差し込む）。したがって `LaunchSpec` に載る要件の `cgroups_path` は当面常に偽である。
+//! 使わない方針のため [`check_cgroups_path`] が create / start で拒否する（#2010 で方針を確定）。したがって `LaunchSpec` に載る要件の `cgroups_path` は当面常に偽である。
 //! モジュールは 3 OS でビルドされ（CLI-1）、`CgroupJoin` への依存は Linux 限定の `From` 実装に局所化している。
 
 use super::config::OciConfig;
@@ -87,7 +96,8 @@ impl CgroupRequirement {
 ///
 /// コンテナの cgroup は常に委譲スコープ配下の `fc-<id>@<n>` に置かれ、config の値を配置に使う実装は無い。
 /// 値を黙って無視すると、指定した場所に置かれないまま起動する（SEC-1）ため、指定があれば `Unimplemented` で
-/// 拒否する。パスの検証（スコープの外へ出る経路の拒否）を伴う受理は #2010 がこの関数を書き換えて行う。
+/// 拒否する。値は配置に使わない方針（#2010）で、指定があれば値に関わらず（`..`・絶対パス・別表記を含め）拒否するため、
+/// 委譲スコープの外へ出る経路は生じない。受理に開くなら委譲スコープ配下に閉じる検証が前提になる。
 /// メッセージはキー名だけで、値を含めない（ERR-1）。
 pub fn check_cgroups_path(config: &OciConfig) -> Result<(), TraitError> {
     if config.cgroups_path().is_none() {
@@ -184,17 +194,59 @@ mod tests {
         assert_eq!(r, CgroupRequirement::none());
     }
 
-    /// CORE-3・SEC-1: `linux.resources` は中身に関わらず要件（`{}` も fail-closed）。
+    /// CORE-3・SEC-1: `linux.resources` は中身に関わらず要件（`{}`・入れ子が空・制限ありのどれも同じ）。
     #[test]
     fn core3_resources_key_is_required_even_if_empty() {
-        let r = CgroupRequirement::of_config(&config(
-            json!({"resources": {"memory": {"limit": 1048576}}}),
-        ));
-        assert!(r.is_required());
-        assert_eq!(r.reasons(), vec!["linux.resources"]);
-        let r = CgroupRequirement::of_config(&config(json!({"resources": {}})));
-        assert!(r.is_required());
-        assert_eq!(r.reasons(), vec!["linux.resources"]);
+        for resources in [
+            json!({}),
+            json!({"memory": {}}),
+            json!({"cpu": {}}),
+            json!({"memory": {"limit": 1048576}, "pids": {"limit": 64}}),
+        ] {
+            let r = CgroupRequirement::of_config(&config(json!({ "resources": resources })));
+            assert!(r.is_required(), "{resources}");
+            assert_eq!(r.reasons(), vec!["linux.resources"], "{resources}");
+        }
+    }
+
+    /// SEC-1: 未対応の既知キーは制限が空に見えても要件あり（「不要」と誤判定しない）。
+    #[test]
+    fn sec1_resources_with_unsupported_known_key_is_required() {
+        for resources in [
+            json!({"hugepageLimits": []}),
+            json!({"memory": {"reservation": 1}}),
+        ] {
+            let c = config(json!({ "resources": resources }));
+            assert_eq!(
+                c.linux_resources(),
+                Some(&crate::oci_runtime::LinuxResourceLimits::default()),
+                "{resources}"
+            );
+            assert!(!c.unapplied_fields().is_empty(), "{resources}");
+            let r = CgroupRequirement::of_config(&c);
+            assert!(r.is_required(), "{resources}");
+            assert_eq!(r.reasons(), vec!["linux.resources"], "{resources}");
+        }
+    }
+
+    /// SEC-1: 未知のキーと null はパース段で拒否され、要件の計算まで進まない。
+    #[test]
+    fn sec1_resources_with_unknown_key_is_rejected_at_parse() {
+        for resources in [
+            json!({"futureLimit": 1}),
+            json!({"memory": {"futureKnob": 1}}),
+            Value::Null,
+        ] {
+            let v = json!({
+                "ociVersion": "1.2.0",
+                "root": {"path": "rootfs"},
+                "process": {"args": ["/bin/true"], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+                "linux": {"namespaces": [{"type": "pid"}], "resources": resources}
+            });
+            let err = parse_config_bytes(&serde_json::to_vec(&v).expect("serialize"))
+                .expect_err("reject");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{resources}");
+        }
     }
 
     /// CORE-3: `linux.cgroupsPath` のみ、および両方の理由列。
@@ -245,18 +297,31 @@ mod tests {
         assert_eq!(calls.get(), 2);
     }
 
-    /// #2019・CORE-3: `check_cgroups_path` は指定があれば `Unimplemented`（値は載せない）、無ければ `Ok`。
+    /// #2010・CORE-3・SEC-1: `check_cgroups_path` は値に関わらず指定があれば `Unimplemented`（値は載せない）、
+    /// 無ければ `Ok`。`..`・絶対パス・別表記でも受理しない。
     #[test]
-    fn core3_cgroups_path_is_refused_until_accepted() {
+    fn core3_sec1_cgroups_path_is_never_accepted() {
         assert!(check_cgroups_path(&config(json!({}))).is_ok());
         assert!(check_cgroups_path(&config(json!({"resources": {}}))).is_ok());
-        let err = check_cgroups_path(&config(json!({"cgroupsPath": "/secret/path"})))
-            .expect_err("refuse");
-        assert_eq!(err.code(), ErrorCode::Unimplemented);
-        assert_eq!(
-            err.message(),
-            "linux.cgroupsPath is not supported yet; the container cgroup is placed under the delegated scope"
-        );
+        for path in [
+            "/secret/path",
+            "../escape",
+            "a/../../b",
+            "/sys/fs/cgroup",
+            "/user.slice/other",
+            "fc/child",
+            "machine.slice:prefix:name",
+            "./a//b",
+        ] {
+            let err =
+                check_cgroups_path(&config(json!({ "cgroupsPath": path }))).expect_err("refuse");
+            assert_eq!(err.code(), ErrorCode::Unimplemented, "{path}");
+            assert_eq!(
+                err.message(),
+                "linux.cgroupsPath is not supported yet; the container cgroup is placed under the delegated scope",
+                "{path}"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

@@ -67,9 +67,10 @@
 //! `ContainerStatus` は空 ID を `INVALID_ARGUMENT`、未知 ID（Remove 済みを含む）を `NOT_FOUND` にする。
 //! `ListContainers` は一致なし・未知 ID・`CONTAINER_UNKNOWN` を空の一覧とし、未知の state 値と過大な
 //! `label_selector` だけを `INVALID_ARGUMENT` にする。並びは `(created_at, id)` の昇順。labels・annotations は
-//! 無改変で返し、`envs` は返さない。`image_ref`・`user`・`info`・`message` は空・0 のスタブで、
-//! 実値は TASK-59（CRI-2）で埋める（REPAIR-3）。`exit_code` は実行層が報告した値を反映し、`reason` は
-//! その終了コードから導く（0 は `Completed`、非 0 は `Error`、不明は空。`OOMKilled` は未対応）。
+//! 無改変で返し、`envs` は返さない。`image_ref`・`image_id`・`user`・`info`・`message` は空・0 のスタブ
+//! （REPAIR-3。項目ごとの将来仕様は `container::ContainerRecord::to_status` の doc、追跡は TASK-59 追補 #2322 の分割 issue）。
+//! `exit_code` は実行層が報告した値を反映し、`reason` は実行層の報告から導く（OOM の報告があれば `OOMKilled`、
+//! 0 は `Completed`、非 0 は `Error`、不明は空）。
 //!
 //! **スタブの明示（REPAIR-3）**: サンドボックスの状態はプロセス内メモリのレジストリにだけ持つ。
 //! 実行層（core）には未接続で、永続化もしない。TASK-59 で `StateStore` / `ContainerRuntime` へ置き換える
@@ -106,7 +107,7 @@ use tonic::{Request, Response, Status};
 
 use crate::error::{CriError, CriErrorCode};
 
-use crate::adapter::{BundleProvider, RuntimeAdapter, RuntimeLifecycle};
+use crate::adapter::{BundleProvider, RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle};
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpTimer, NoopCriOpRecorder};
 use crate::runtime::v1::{
     self, ContainerState as CriContainerState, PodSandboxConfig, PodSandboxState,
@@ -114,7 +115,7 @@ use crate::runtime::v1::{
 };
 use config_limits::BoundedConfig;
 use container::{
-    ContainerRecord, ContainerState, ValidatedContainerFilter, ValidatedCreate,
+    ContainerRecord, ContainerState, ExitReport, ValidatedContainerFilter, ValidatedCreate,
     validate_create_request,
 };
 
@@ -339,9 +340,9 @@ struct InFlightGuard {
     outcome_unknown: bool,
     /// 実行層が停止済みと報告した（Start の応答が Stopped）。破棄時に結果不明ではなく exited へ反映する。
     confirmed_exited: bool,
-    /// 実行層が報告した終了コード（Stop の commit と Start の終了済み応答の後始末で記録へ反映する。
-    /// 不明は None のままで、reason を空にする。CRI-2・REPAIR-3）。
-    exit_code: Option<i32>,
+    /// 実行層が報告した終了の内容（終了コードと OOM 等の終了理由。Stop の commit と Start の終了済み応答の
+    /// 後始末で記録へ反映する。不明は None のままで、reason を空にする。CRI-2・CORE-4・REPAIR-3）。
+    exit: ExitReport,
 }
 
 impl InFlightGuard {
@@ -354,13 +355,16 @@ impl InFlightGuard {
             bundles: None,
             outcome_unknown: false,
             confirmed_exited: false,
-            exit_code: None,
+            exit: ExitReport::default(),
         }
     }
 
-    /// 実行層が報告した終了コードを、commit または破棄時の exited 反映で記録へ書くよう保持する（CRI-2）。
-    fn set_exit_code(&mut self, exit_code: Option<i32>) {
-        self.exit_code = exit_code;
+    /// 実行層が報告した終了コードと終了理由を、commit または破棄時の exited 反映で記録へ書くよう保持する（CRI-2・CORE-4）。
+    fn set_exit(&mut self, status: &RuntimeContainerStatus) {
+        self.exit = ExitReport {
+            code: status.exit_code,
+            termination: status.termination,
+        };
     }
 
     /// 実行層が停止済みと報告した。破棄時に exited（終了時刻つき）へ反映する（結果不明の unknown にしない）。
@@ -390,7 +394,7 @@ impl InFlightGuard {
 
     /// 実行層の成功を記録へ反映して確定する。反映に失敗したら巻き戻される。
     fn commit(&mut self) -> Result<(), CriError> {
-        commit_in_flight(&self.registry, &self.id, self.kind, self.exit_code)?;
+        commit_in_flight(&self.registry, &self.id, self.kind, self.exit)?;
         self.committed = true;
         Ok(())
     }
@@ -418,7 +422,7 @@ impl Drop for InFlightGuard {
                 self.kind,
                 self.outcome_unknown,
                 self.confirmed_exited,
-                self.exit_code,
+                self.exit,
             );
         }
     }
@@ -609,7 +613,7 @@ fn commit_in_flight(
     registry: &Mutex<SandboxRegistry>,
     id: &str,
     kind: InFlightKind,
-    exit_code: Option<i32>,
+    exit: ExitReport,
 ) -> Result<(), CriError> {
     let at_nanos = now_nanos()?;
     if kind == InFlightKind::Remove {
@@ -646,7 +650,8 @@ fn commit_in_flight(
         record.state = ContainerState::Exited;
         record.finished_at_nanos = at_nanos;
         // 実行層が返した終了コード（137 等）を保持する。不明（None）は None のままで reason は空になる。
-        record.exit_code = exit_code;
+        record.exit_code = exit.code;
+        record.termination = exit.termination;
     }
     if kind == InFlightKind::Start {
         record.state = ContainerState::Running;
@@ -674,7 +679,7 @@ fn rollback_in_flight(
     kind: InFlightKind,
     outcome_unknown: bool,
     confirmed_exited: bool,
-    exit_code: Option<i32>,
+    exit: ExitReport,
 ) {
     match kind {
         InFlightKind::Create if !outcome_unknown => {
@@ -715,7 +720,8 @@ fn rollback_in_flight(
                     record.state = ContainerState::Exited;
                     record.finished_at_nanos = finished_at_nanos;
                     // 実行層が終了済みと報告した応答の終了コード。不明（None）は reason を空のままにする。
-                    record.exit_code = exit_code;
+                    record.exit_code = exit.code;
+                    record.termination = exit.termination;
                 } else if outcome_unknown {
                     // 停止を確認できないため exited にせず unknown で保持する（終了時刻・終了コードは設定しない。
                     // 生存中のプロセスを終了済みと公開して重複実行を招かない。CRI-2・REPAIR-5）。
@@ -1144,6 +1150,7 @@ impl CriRuntimeService {
                 started_at_nanos: 0,
                 finished_at_nanos: 0,
                 exit_code: None,
+                termination: None,
                 retained_bytes,
                 in_flight,
                 runtime_owned: false,
@@ -1321,7 +1328,7 @@ impl CriRuntimeService {
                 }
                 // 終了済みは created へ戻さず、guard の破棄で exited へ反映する（再 Start を実行層へ届けない）。
                 CriContainerState::ContainerExited => {
-                    guard.set_exit_code(status.exit_code);
+                    guard.set_exit(&status);
                     guard.mark_confirmed_exited();
                     Err(CriError::failed_precondition(
                         "container has already exited",
@@ -1411,7 +1418,7 @@ impl CriRuntimeService {
                 guard.mark_dispatched();
                 match adapter.stop(&id, grace_secs) {
                     Ok(status) if status.lifecycle == RuntimeLifecycle::Stopped => {
-                        guard.set_exit_code(status.exit_code);
+                        guard.set_exit(&status);
                         guard.commit()
                     }
                     Ok(_) => Err(CriError::internal("runtime returned an unexpected state")),

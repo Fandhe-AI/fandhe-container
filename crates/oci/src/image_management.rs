@@ -15,12 +15,12 @@
 //! 変更でき、永続化前はプロセスごとのメモリ上の別物である（契約と前提は `store` モジュールの doc）。
 //!
 //! 未実装（後続 issue の担当。実装済みを装わない。REPAIR-3）:
-//! - ディスクへの永続化・再起動時の照合（#853・#854・#851）
+//! - ディスクへの永続化（#851）。再起動時の照合 API は `reconcile` で実装済み（#854）。本番 probe と起動時の配線は未実装（#2315）
 //! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force` と実削除（untag・`remove_manifest`・非共有 blob の削除。TASK-183.6・#481）も
 //!   `remove` で実装済み（永続化・fsync・削除途中のクラッシュの再試行は #851、CLI 配線は未実装）
 //! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（CLI 経路と永続化は未実装）
 //! - `image prune` 本体は `prune` モジュールで実装済み（#476）。`rm`・`prune` の CLI 配線（#476・#480・#481）。`image ls`/`system df` の集計 API は
-//!   `usage`（#478・TASK-183.3）で実装済み（CLI 経路は未実装）
+//!   `usage`（#478・TASK-183.3）で実装済み（staging の容量・コンテナ容量の受け口・展開後サイズの二段階 API は #2222。CLI 経路は未実装）
 //! - pull のリース登録・ステージング書き込み（#474・TASK-183.9）と、公開・失敗時のロールバック
 //!   （#475・TASK-183.10）は `pull` で実装済み（cri からの配線は未実装）
 //! - テーブル全体の件数上限（永続化の読み込み側で判断する）
@@ -37,6 +37,9 @@ use std::fmt;
 mod container_ref;
 pub use container_ref::{ContainerRefRegistration, ContainerRefRelease};
 
+mod reconcile;
+pub use reconcile::{ContainerRefReconciliation, ContainerStatePresence};
+
 mod remove;
 pub use remove::{
     ImageInUse, ImageRmAction, ImageRmCandidate, ImageRmDecision, ImageRmKind, ImageRmOptions,
@@ -51,7 +54,10 @@ pub use prune::{ImagePruneOutcome, ImagePrunePlan};
 
 mod usage;
 
-pub use usage::{CacheUsage, DiskUsage, ImageEntry, ImageList, ImageUsage, MAX_CACHE_SCAN_ENTRIES};
+pub use usage::{
+    CacheUsage, ContainersUsage, DiskUsage, ExpandedSizePlan, ExpandedUsage, ImageEntry, ImageList,
+    ImageUsage, MAX_CACHE_SCAN_ENTRIES, MAX_EXPANDED_SCAN_BYTES, StagingUsage,
+};
 
 mod pull;
 pub use pull::{
@@ -280,11 +286,43 @@ pub struct LeaseAcquired {
     pub newly_added: bool,
 }
 
+/// コンテナ参照の登録世代（不透明な単調増加の識別子。OCI-7・TASK-183.8 追補・#2315）。
+///
+/// 同じ ID の参照が外されて登録し直されると別の（より大きい）値になり、過去の値を再発行しない。
+/// core の `ContainerImageRefs` を満たすアダプタが `ImageRefGeneration::from_raw` へ写す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ContainerRefGeneration(u64);
+
+impl ContainerRefGeneration {
+    /// アダプタが core の世代型へ写すための採番値。
+    pub fn as_raw(&self) -> u64 {
+        self.0
+    }
+
+    /// 採番値から作る（アダプタが core の世代を oci の世代へ戻す用）。
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+/// コンテナ参照 1 件分（manifest・登録世代・状態作成まで済んだ確定か）。
+///
+/// 未確定（`bound == false`）は、登録しただけで状態作成の前（または状態作成の曖昧な失敗）で止まった
+/// create の参照。GC の参照数には確定・未確定とも数える（余分に残す方向にだけ誤る。OCI-7）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerRefEntry {
+    manifest: Digest,
+    generation: ContainerRefGeneration,
+    bound: bool,
+}
+
 /// 参照テーブル本体。単体では排他を持たない。ストアとしては [`ImageStore::lock`] のガード越しに使う。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReferenceTable {
     manifests: BTreeMap<Digest, ManifestComposition>,
-    container_refs: BTreeMap<ContainerRefId, Digest>,
+    container_refs: BTreeMap<ContainerRefId, ContainerRefEntry>,
+    /// 次に発行するコンテナ参照の登録世代（1 始まり。再発行しない。溢れたら登録を拒否する）。
+    next_container_generation: u64,
     tag_refs: BTreeMap<TagKey, Digest>,
     pull_leases: BTreeMap<Digest, BTreeSet<PullId>>,
 }
@@ -353,13 +391,29 @@ impl ReferenceTable {
     ) -> Result<(), OciError> {
         self.require_manifest(manifest)?;
         match self.container_refs.get(&id) {
-            Some(cur) if cur == manifest => Ok(()),
+            Some(cur) if &cur.manifest == manifest => Ok(()),
             Some(cur) => Err(err(
                 OciErrorCode::AlreadyExists,
-                format!("container {id} already references {cur}"),
+                format!("container {id} already references {}", cur.manifest),
             )),
             None => {
-                self.container_refs.insert(id, manifest.clone());
+                // 世代は溢れても巻き戻して再発行しない（fail-closed。登録も増やさない）。
+                let generation = self.next_container_generation.max(1);
+                let next = generation.checked_add(1).ok_or_else(|| {
+                    err(
+                        OciErrorCode::Internal,
+                        "container reference generation exhausted",
+                    )
+                })?;
+                self.next_container_generation = next;
+                self.container_refs.insert(
+                    id,
+                    ContainerRefEntry {
+                        manifest: manifest.clone(),
+                        generation: ContainerRefGeneration(generation),
+                        bound: false,
+                    },
+                );
                 Ok(())
             }
         }
@@ -369,7 +423,19 @@ impl ReferenceTable {
     pub fn unregister_container(&mut self, id: &ContainerRefId) -> Result<Digest, OciError> {
         self.container_refs
             .remove(id)
+            .map(|e| e.manifest)
             .ok_or_else(|| err(OciErrorCode::NotFound, format!("container {id} not found")))
+    }
+
+    /// 未確定（状態作成まで済んでいない）のコンテナ参照を ID 昇順で返す
+    /// （`(id, 登録世代, manifest)`。#854 の起動時照合と試験の読み取り口）。
+    pub fn unbound_containers(
+        &self,
+    ) -> impl Iterator<Item = (&ContainerRefId, ContainerRefGeneration, &Digest)> {
+        self.container_refs
+            .iter()
+            .filter(|(_, e)| !e.bound)
+            .map(|(id, e)| (id, e.generation, &e.manifest))
     }
 
     /// タグ → manifest を登録する（既存タグは付け替え）。直前の付け先を返す。manifest 不在は `NotFound`。
@@ -430,7 +496,7 @@ impl ReferenceTable {
             containers: self
                 .container_refs
                 .iter()
-                .filter(|(_, d)| *d == digest)
+                .filter(|(_, e)| &e.manifest == digest)
                 .map(|(id, _)| id.clone())
                 .collect(),
             tags: self

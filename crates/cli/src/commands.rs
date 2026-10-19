@@ -1,4 +1,4 @@
-//! 統一 CLI の基本コマンド（create / start / stop / delete / list / logs）の入口（TASK-79.1・TASK-79.2.1・TASK-79.2.2・CLI-1・MS-6）。
+//! 統一 CLI の基本コマンド（create / start / stop / delete / list / logs / image / system）の入口（TASK-79.1・TASK-79.2.1・TASK-79.2.2・CLI-1・MS-6）。
 //!
 //! `main.rs`（bin `fandhe-container`）から [`run`] が呼ばれ、argv の先頭（グローバル `--root` の後）をコマンド名として判定する。
 //! `create` / `start` は core の `oci_runtime::create` / `start` を直接呼ぶ（TASK-79.2.1・#866。`create_start` module）。
@@ -11,6 +11,10 @@
 //! `list` は core の状態ストアを読んで stdout へタブ区切りで一覧を出し、`logs` は引数・ID・存在確認までを行う
 //! （TASK-79.3・#640。`list_logs` module）。ログ内容の読み出しは未実装で、対象が存在しても `UNIMPLEMENTED`（8）で
 //! 失敗する（REPAIR-3）。
+//! `image ls` / `system df` / `image rm [--force]` は oci の管理 API（`image_management`）を呼ぶ（#2221・CLI-1・OCI-7。`image` module）。
+//! イメージストアの root は必須オプション `--image-root`。参照テーブルの永続化が oci 側で未実装のため、現状は `image ls` が
+//! 常にヘッダのみ・`image rm` が常に `NOT_FOUND` になる。既定 root・非 Linux の実行経路・`image tag` / `image prune` は未配線
+//! （詳細は `image` module の doc。REPAIR-3）。
 //! `setup` は OS 固有設定のステップ提示で `setup` module にのみ委譲する（日常操作コマンドは OS 固有設定を持たない。TASK-80.1・CLI-2）。
 //! 終了コードは core の ERR-2 表（`OCI_EXIT_*`）に揃える。
 //!
@@ -46,6 +50,7 @@ use crate::error::CliError;
 
 mod args;
 mod create_start;
+mod image;
 mod list_logs;
 // Linux は plugin を介さず core を直接呼ぶため、本番ビルドでは除外する（単体テストは OS 非依存ロジックの検証に使う）。
 #[cfg(any(not(target_os = "linux"), test))]
@@ -56,14 +61,14 @@ mod stop_delete;
 mod supervisor_start;
 
 use args::{
-    parse_create, parse_delete, parse_doctor, parse_global, parse_list, parse_logs, parse_setup,
-    parse_start, parse_stop,
+    parse_create, parse_delete, parse_doctor, parse_global, parse_image, parse_list, parse_logs,
+    parse_setup, parse_start, parse_stop, parse_system,
 };
 
 /// コマンドの区分（CLI-2・TASK-80.2）。日常操作は OS 固有設定を持たず、OS 固有設定は `setup` にのみ置く。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandKind {
-    /// 日常操作（create / start / stop / delete / list / logs）。`crate::setup` を参照しない。
+    /// 日常操作（create / start / stop / delete / list / logs / image / system）。`crate::setup` を参照しない。
     Daily,
     /// OS 固有設定のセットアップ（`setup`）。
     Setup,
@@ -80,6 +85,10 @@ pub enum Command {
     Delete,
     List,
     Logs,
+    /// イメージ管理（`image ls` / `image rm`。#2221・CLI-1・OCI-7。サブコマンドは `args::ImageArgs`）。
+    Image,
+    /// システム情報（`system df`。#2221・CLI-1・OCI-7。サブコマンドは `args::SystemArgs`）。
+    System,
     /// OS 固有設定のセットアップ（TASK-80.1・CLI-2。日常操作ではない）。
     Setup,
     /// 読み取り専用の診断（NET-10・CORE-3。#2133。状態ルートを開かず plugin も解決しない）。
@@ -88,25 +97,29 @@ pub enum Command {
 
 impl Command {
     /// 全コマンド（コマンド名の列挙順の SSOT）。
-    pub const ALL: [Command; 8] = [
+    pub const ALL: [Command; 10] = [
         Command::Create,
         Command::Start,
         Command::Stop,
         Command::Delete,
         Command::List,
         Command::Logs,
+        Command::Image,
+        Command::System,
         Command::Setup,
         Command::Doctor,
     ];
 
     /// 日常操作コマンドのみ（`ALL` から `Setup` と `Doctor` を除いたもの。分離の照合の列挙元。TASK-80.2・TASK-80.3）。
-    pub const DAILY: [Command; 6] = [
+    pub const DAILY: [Command; 8] = [
         Command::Create,
         Command::Start,
         Command::Stop,
         Command::Delete,
         Command::List,
         Command::Logs,
+        Command::Image,
+        Command::System,
     ];
 
     /// コマンドの区分。ワイルドカードを使わず、コマンド追加時に分類漏れをコンパイルエラーにする。
@@ -117,7 +130,9 @@ impl Command {
             | Command::Stop
             | Command::Delete
             | Command::List
-            | Command::Logs => CommandKind::Daily,
+            | Command::Logs
+            | Command::Image
+            | Command::System => CommandKind::Daily,
             Command::Setup => CommandKind::Setup,
             Command::Doctor => CommandKind::Diagnostic,
         }
@@ -132,6 +147,8 @@ impl Command {
             Command::Delete => "delete",
             Command::List => "list",
             Command::Logs => "logs",
+            Command::Image => "image",
+            Command::System => "system",
             Command::Setup => "setup",
             Command::Doctor => "doctor",
         }
@@ -249,7 +266,7 @@ impl CliExit {
 }
 
 const USAGE_MESSAGE: &str =
-    "usage: fandhe-container <create|start|stop|delete|list|logs|setup|doctor>";
+    "usage: fandhe-container <create|start|stop|delete|list|logs|image|system|setup|doctor>";
 const STATE_ROOT_PARENT_NOT_FOUND_MESSAGE: &str = "parent of the state root not found";
 /// 回復手段（core の `purge_corrupted`）を管理操作名で示す。通常ファイルの entry や中身のある state.json ディレクトリは core が FailedPrecondition で拒否するため、拒否時は管理者による確認・手動回復を促す（core の削除防御は維持）。CLI に purge サブコマンドは無い（実在しない名を案内しない）。
 const STATE_STORE_CORRUPTED_MESSAGE: &str = "state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually";
@@ -321,6 +338,14 @@ pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write)
             Ok(a) => list_logs::run_logs(&global, &a),
             Err(_) => usage(),
         },
+        Command::Image => match parse_image(tail) {
+            Ok(a) => image::run_image(&global, &a, stdout),
+            Err(_) => usage(),
+        },
+        Command::System => match parse_system(tail) {
+            Ok(a) => image::run_system(&global, &a, stdout),
+            Err(_) => usage(),
+        },
         Command::Setup => run_setup(tail, stdout),
         Command::Doctor => run_doctor(tail, stdout),
     }
@@ -368,11 +393,13 @@ mod tests {
         assert_eq!(Command::parse("delete"), Some(Command::Delete));
         assert_eq!(Command::parse("list"), Some(Command::List));
         assert_eq!(Command::parse("logs"), Some(Command::Logs));
+        assert_eq!(Command::parse("image"), Some(Command::Image));
+        assert_eq!(Command::parse("system"), Some(Command::System));
         assert_eq!(Command::parse("setup"), Some(Command::Setup));
         assert_eq!(Command::parse("doctor"), Some(Command::Doctor));
     }
 
-    /// CLI-2: `setup` だけが `Setup` 区分、`doctor` だけが `Diagnostic` 区分で、他 6 件は日常操作。
+    /// CLI-2: `setup` だけが `Setup` 区分、`doctor` だけが `Diagnostic` 区分で、他 8 件は日常操作。
     #[test]
     fn cli2_command_kind_classification() {
         let daily: Vec<&str> = Command::ALL
@@ -380,7 +407,12 @@ mod tests {
             .filter(|c| c.kind() == CommandKind::Daily)
             .map(|c| c.as_str())
             .collect();
-        assert_eq!(daily, ["create", "start", "stop", "delete", "list", "logs"]);
+        assert_eq!(
+            daily,
+            [
+                "create", "start", "stop", "delete", "list", "logs", "image", "system"
+            ]
+        );
         assert_eq!(Command::Setup.kind(), CommandKind::Setup);
         assert_eq!(Command::Doctor.kind(), CommandKind::Diagnostic);
     }
@@ -389,7 +421,12 @@ mod tests {
     #[test]
     fn cli2_daily_is_all_minus_setup() {
         let names: Vec<&str> = Command::DAILY.iter().map(|c| c.as_str()).collect();
-        assert_eq!(names, ["create", "start", "stop", "delete", "list", "logs"]);
+        assert_eq!(
+            names,
+            [
+                "create", "start", "stop", "delete", "list", "logs", "image", "system"
+            ]
+        );
         let rest: Vec<Command> = Command::ALL
             .into_iter()
             .filter(|c| !matches!(c.kind(), CommandKind::Setup | CommandKind::Diagnostic))
@@ -404,7 +441,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                "create", "start", "stop", "delete", "list", "logs", "setup", "doctor"
+                "create", "start", "stop", "delete", "list", "logs", "image", "system", "setup",
+                "doctor"
             ]
         );
     }
@@ -436,6 +474,14 @@ mod tests {
             args(&["logs", "--x", "a"]),
             args(&["list", "x"]),
             args(&["list", "--all"]),
+            args(&["image"]),
+            args(&["image", "bogus"]),
+            args(&["image", "ls"]),
+            args(&["image", "ls", "--image-root", "rel"]),
+            args(&["image", "rm", "x"]),
+            args(&["system"]),
+            args(&["system", "bogus"]),
+            args(&["system", "df"]),
             args(&["setup", "x"]),
             args(&["setup", "--x"]),
             args(&["doctor", "x"]),
@@ -466,7 +512,7 @@ mod tests {
     /// ワイルドカード無しの match で、コマンド追加時に argv の割り当て漏れをコンパイルエラーにする。
     #[test]
     fn err1_all_commands_error_exit_is_structured_and_nonzero() {
-        let usage_line = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup|doctor>\"}\n";
+        let usage_line = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|image|system|setup|doctor>\"}\n";
         let mut covered = Vec::new();
         for command in Command::ALL {
             // 状態ストアを開く前（引数解析）で失敗する argv。OS に依存しない。
@@ -477,6 +523,8 @@ mod tests {
                 Command::Delete => vec!["delete", "--x", "a"],
                 Command::List => vec!["list", "x"],
                 Command::Logs => vec!["logs"],
+                Command::Image => vec!["image", "bogus"],
+                Command::System => vec!["system", "bogus"],
                 Command::Setup => vec!["setup", "x"],
                 Command::Doctor => vec!["doctor", "x"],
             };
@@ -489,7 +537,8 @@ mod tests {
         assert_eq!(
             covered,
             [
-                "create", "start", "stop", "delete", "list", "logs", "setup", "doctor"
+                "create", "start", "stop", "delete", "list", "logs", "image", "system", "setup",
+                "doctor"
             ]
         );
     }
@@ -546,7 +595,7 @@ mod tests {
         for (exit, line) in [
             (
                 CliExit::usage(),
-                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup|doctor>\"}\n",
+                "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|image|system|setup|doctor>\"}\n",
             ),
             (
                 CliExit::unimplemented(),
@@ -604,6 +653,9 @@ mod tests {
         use super::*;
         use std::path::{Path, PathBuf};
         use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// 空のイメージストアに対する `system df` の出力（固定 9 行。値はすべて 0）。
+        const SYSTEM_DF_EMPTY: &str = "KEY\tVALUE\nimages.count\t0\nimages.bytes\t0\nimages.reclaimable_bytes\t0\nimages.missing_blobs\t0\ncache.blob_count\t0\ncache.bytes\t0\ncache.unregistered_count\t0\ncache.unregistered_bytes\t0\ncache.foreign_entries\t0\n";
 
         struct TmpDir(PathBuf);
 
@@ -1030,6 +1082,10 @@ mod tests {
             let root = base.state_root();
             let bundle = make_bundle(&base);
             let b = bundle.to_str().expect("utf8").to_owned();
+            // image / system 用のイメージストア root（空。blobs/sha256 だけ作る）。
+            let images = base.0.join("images");
+            std::fs::create_dir_all(images.join("blobs").join("sha256")).expect("images");
+            let ir = images.to_str().expect("utf8").to_owned();
             let mut covered = Vec::new();
             for command in Command::ALL {
                 // (argv, 期待終了コード, 期待 code(), 期待 stdout)
@@ -1041,6 +1097,18 @@ mod tests {
                     Command::Delete => (vec!["delete", "none"], 3, Some("NOT_FOUND"), ""),
                     Command::List => (vec!["list"], 0, None, "ID\tSTATUS\tPID\nm1\tcreated\t-\n"),
                     Command::Logs => (vec!["logs", "none"], 3, Some("NOT_FOUND"), ""),
+                    Command::Image => (
+                        vec!["image", "ls", "--image-root", &ir],
+                        0,
+                        None,
+                        "REPOSITORY\tTAG\tDIGEST\tSIZE\tMISSING\n",
+                    ),
+                    Command::System => (
+                        vec!["system", "df", "--image-root", &ir],
+                        0,
+                        None,
+                        SYSTEM_DF_EMPTY,
+                    ),
                     Command::Setup => (vec!["setup"], 0, None, ""),
                     // doctor の終了コードと出力は実行環境に依る（0 / 3 / 4）。具体値は doctor 側の単体テストと
                     // 結合試験で固定し、ここでは診断の終了であること・stderr が空であることだけを照合する。
@@ -1062,7 +1130,8 @@ mod tests {
             assert_eq!(
                 covered,
                 [
-                    "create", "start", "stop", "delete", "list", "logs", "setup", "doctor"
+                    "create", "start", "stop", "delete", "list", "logs", "image", "system",
+                    "setup", "doctor"
                 ]
             );
         }

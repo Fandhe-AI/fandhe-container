@@ -6,7 +6,7 @@
 //! `load_config(<bundle>/config.json)` を呼び、結果を `exec::Entrypoint` や rootfs / mount の
 //! セットアップへ渡す想定。`start` が `mounts[]` の bind を検証して launcher へ渡す（#1915）。bind 以外の種類の適用は未実装。`mounts[].destination` は TASK-29.1.2 で
 //! `MountDestination` に正規化済み（`..` 等を拒否）。rootfs 内 symlink の解決は create 側
-//! （TASK-29.2・TASK-127）の担当で、本モジュールは行わない。bind の宛先は適用の段（`exec::mount_binds`）が fd 起点で辿る。
+//! （TASK-29.2・bind は #1913）の担当で、本モジュールは行わない。bind の宛先は適用の段（`exec::mount_binds`）が fd 起点で辿る。
 //!
 //! # 型設計（REPAIR-2）
 //!
@@ -51,7 +51,8 @@
 //! # 実行ファイルの検証
 //!
 //! `process.args` は 1 件以上であることだけを検証する。`args[0]` の空文字・実行可能性の検証は
-//! `exec::Entrypoint` 側の担当（本モジュールでは行わない）。
+//! `exec::Entrypoint` 側の担当（本モジュールでは行わない）。名前だけの `args[0]` を `process.env` の `PATH` で解決するのも
+//! exec 側（pivot 後の子。OCI-1・#2314）。
 //!
 //! # 入力上限（DoS 防止）
 //!
@@ -1253,7 +1254,7 @@ impl OciConfig {
         self.resources.as_ref()
     }
 
-    /// `linux.cgroupsPath`（値の検証と受理は #2010。現状は指定があれば create / start が拒否する）。
+    /// `linux.cgroupsPath`（値は配置に使わない方針で、指定があれば create / start が拒否する。#2010）。
     pub fn cgroups_path(&self) -> Option<&CgroupsPath> {
         self.cgroups_path.as_ref()
     }

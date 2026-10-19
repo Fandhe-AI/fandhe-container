@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, ErrorCode,
-    KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
+    KillRequest, StartRequest, StateRequest, StopRequest, TerminationReason, TraitError,
 };
 use fandhe_container_cri::adapter::{BundleProvider, RuntimeAdapter};
 use fandhe_container_cri::error::CriError;
@@ -64,6 +64,10 @@ struct FakeRuntime {
     stop_exit_code: std::sync::atomic::AtomicI32,
     /// start が stopped を返すときの終了コード（既定 0。CRI-2・REPAIR-3 の検証用）。
     start_exit_code: std::sync::atomic::AtomicI32,
+    /// true のとき stop が OOM の停止を報告する（CRI-2・CORE-4 の検証用）。
+    stop_oom_killed: AtomicBool,
+    /// true のとき start の stopped 応答が OOM の停止を報告する（同上）。
+    start_oom_killed: AtomicBool,
 }
 
 impl FakeRuntime {
@@ -111,10 +115,15 @@ impl ContainerRuntime for Shared {
             return Ok(ContainerStatus::creating(r.id().clone()));
         }
         if self.0.start_returns_stopped.load(Ordering::SeqCst) {
-            return Ok(ContainerStatus::stopped(
-                r.id().clone(),
-                Some(self.0.start_exit_code.load(Ordering::SeqCst)),
-            ));
+            let code = Some(self.0.start_exit_code.load(Ordering::SeqCst));
+            if self.0.start_oom_killed.load(Ordering::SeqCst) {
+                return Ok(ContainerStatus::stopped_with_reason(
+                    r.id().clone(),
+                    code,
+                    TerminationReason::OomKilled,
+                ));
+            }
+            return Ok(ContainerStatus::stopped(r.id().clone(), code));
         }
         if self.0.start_returns_created.load(Ordering::SeqCst) {
             return Ok(ContainerStatus::created(r.id().clone(), None));
@@ -142,10 +151,15 @@ impl ContainerRuntime for Shared {
         if self.0.stop_returns_running.load(Ordering::SeqCst) {
             return Ok(ContainerStatus::running(r.id().clone(), None));
         }
-        Ok(ContainerStatus::stopped(
-            r.id().clone(),
-            Some(self.0.stop_exit_code.load(Ordering::SeqCst)),
-        ))
+        let code = Some(self.0.stop_exit_code.load(Ordering::SeqCst));
+        if self.0.stop_oom_killed.load(Ordering::SeqCst) {
+            return Ok(ContainerStatus::stopped_with_reason(
+                r.id().clone(),
+                code,
+                TerminationReason::OomKilled,
+            ));
+        }
+        Ok(ContainerStatus::stopped(r.id().clone(), code))
     }
     fn delete(&self, r: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
         self.0.calls.lock().unwrap().push(format!(
@@ -1441,6 +1455,61 @@ async fn task_59_3_stop_exit_code_is_reflected_in_status() {
     assert_eq!(
         (st.state, st.exit_code, st.reason.as_str()),
         (S::ContainerExited as i32, 143, "Error")
+    );
+}
+
+/// CRI-2・CORE-4: 実行層が OOM の停止を報告したら reason は `OOMKilled`（Stop・StopPodSandbox の経路。終了コード 0 でも OOMKilled）。message・image_ref・image_id・user は REPAIR-3 のスタブで空。
+#[tokio::test]
+async fn cri_2_oom_killed_is_reflected_in_reason() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+
+    let id = running_container(&h, &sb, "c").await;
+    h.runtime.stop_exit_code.store(137, Ordering::SeqCst);
+    h.runtime.stop_oom_killed.store(true, Ordering::SeqCst);
+    stop_c(&h.service, &id).await.expect("stop container");
+    let st = status(&h.service, &id).await;
+    assert_eq!(
+        (st.state, st.exit_code, st.reason.as_str()),
+        (S::ContainerExited as i32, 137, "OOMKilled")
+    );
+    assert_eq!(
+        (
+            st.message.as_str(),
+            st.image_ref.as_str(),
+            st.image_id.as_str()
+        ),
+        ("", "", "")
+    );
+    assert_eq!(st.user, None);
+
+    // 終了コード 0 でも OOM の報告があれば OOMKilled。StopPodSandbox の経路。
+    let id2 = running_container(&h, &sb, "d").await;
+    h.runtime.stop_exit_code.store(0, Ordering::SeqCst);
+    stop_sb(&h.service, &sb).await.expect("stop sandbox");
+    let st = status(&h.service, &id2).await;
+    assert_eq!(
+        (st.state, st.exit_code, st.reason.as_str()),
+        (S::ContainerExited as i32, 0, "OOMKilled")
+    );
+}
+
+/// CRI-2・CORE-4: Start の応答が OOM の停止だった経路も `OOMKilled` になる。
+#[tokio::test]
+async fn cri_2_oom_killed_start_response_is_reflected_in_reason() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id3 = create(&h.service, &sb, "e").await.expect("create");
+    h.runtime.start_exit_code.store(137, Ordering::SeqCst);
+    h.runtime
+        .start_returns_stopped
+        .store(true, Ordering::SeqCst);
+    h.runtime.start_oom_killed.store(true, Ordering::SeqCst);
+    start(&h.service, &id3).await.expect_err("start");
+    let st = status(&h.service, &id3).await;
+    assert_eq!(
+        (st.state, st.exit_code, st.reason.as_str()),
+        (S::ContainerExited as i32, 137, "OOMKilled")
     );
 }
 

@@ -17,8 +17,9 @@
 //!   `--image` が 1 つも無いときだけ読む
 //! - どちらも無ければ既定のリスト（alpine〔単一レイヤー〕・debian:bookworm-slim・nginx:alpine〔複数レイヤー〕）
 //! - 件数・引数の数・1 引数の長さに上限がある。`ImageReference::parse` を通らない参照は通信前に引数エラー（exit 2）
-//! - `process.args[0]` は絶対パスが必要（start が PATH 探索を未実装のため）。`bash` のような Cmd のイメージは
-//!   `--cmd /bin/true` のように絶対パスで上書きする
+//! - `process.args[0]` は絶対パスか、`/` を含まない名前(`docker-entrypoint.sh`・`bash` 等)。名前は core の launch が
+//!   pivot 後に `process.env` の `PATH` で解決する(OCI-1・#2314)。`/` を含む相対パス(`bin/app`)は未対応で
+//!   `INVALID_ARGUMENT`(config 段)
 //!
 //! # 出力
 //! イメージごとに 1 行: `{"image","manifest_digest","from_index","layers","config_bytes","layer_bytes",
@@ -412,8 +413,9 @@ mod linux {
         let Some(first) = args.first() else {
             return Err(Failure::new("config", "INVALID_ARGUMENT"));
         };
-        if !first.starts_with('/') {
-            // start は PATH 探索を未実装で、args[0] が絶対パスでなければ拒否する。
+        // 絶対パス、または `/` を含まない名前だけを受ける。名前の `PATH` 探索は core の launch が pivot 後に行う
+        // (OCI-1・#2314)。`/` を含む相対パスは cwd 相対の実行が未対応のため、core と同じく拒否する。
+        if first.is_empty() || (!first.starts_with('/') && first.contains('/')) {
             return Err(Failure::new("config", "INVALID_ARGUMENT"));
         }
         let mut env = cfg.env.clone();
@@ -1352,11 +1354,30 @@ mod linux {
                 derive_process(&empty, None),
                 Err(Failure::new("config", "INVALID_ARGUMENT"))
             );
-            let rel = parse_image_config(br#"{"config":{"Cmd":["bash"]}}"#).expect("rel");
+            // 名前だけの args[0] は受ける(PATH 探索は core の launch。OCI-1・#2314)。`/` を含む相対パスは拒否する。
+            let bare = parse_image_config(br#"{"config":{"Cmd":["bash"]}}"#).expect("bare");
+            let p = derive_process(&bare, None).expect("bare name");
+            assert_eq!(p.args, strs(&["bash"]));
+            assert_eq!(p.env, vec![DEFAULT_PATH_ENV.to_string()]);
+            let rel = parse_image_config(br#"{"config":{"Cmd":["bin/app"]}}"#).expect("rel");
             assert_eq!(
                 derive_process(&rel, None),
                 Err(Failure::new("config", "INVALID_ARGUMENT"))
             );
+            // redis:alpine 相当(Entrypoint が相対名)。--cmd で上書きしても Entrypoint は残る。
+            let redis = parse_image_config(
+                br#"{"config":{"Entrypoint":["docker-entrypoint.sh"],"Cmd":["redis-server"],
+                "Env":["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]}}"#,
+            )
+            .expect("redis");
+            let p = derive_process(&redis, None).expect("redis");
+            assert_eq!(p.args, strs(&["docker-entrypoint.sh", "redis-server"]));
+            assert_eq!(
+                p.env,
+                strs(&["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"])
+            );
+            let p = derive_process(&redis, Some(&strs(&["-v"]))).expect("redis override");
+            assert_eq!(p.args, strs(&["docker-entrypoint.sh", "-v"]));
             assert_eq!(
                 derive_process(&rel, Some(&strs(&["/bin/true"])))
                     .expect("abs")

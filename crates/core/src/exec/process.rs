@@ -72,7 +72,9 @@
 //! - **回収済みの pid へ kill しない**: 回収と期限超過の `SIGKILL` は `ContainerChild` 内の `Mutex`
 //!   の下で回収状態を確認して行い、並行に待っても回収後（pid 再利用され得る）に `SIGKILL` を送らない。
 //!   待機が `Err` で戻ってもハンドルは残り、再試行で kill・回収できる
-//! - **exec は絶対パスのみ**: PATH 探索・（cwd は launch の `setup.working_dir` で pivot 直後に適用。OCI-1）・OCI `process` からの組み立て・`preserve_fds`・
+//! - **exec は絶対パスのみ（launch は名前の `PATH` 探索も可）**: 稼働中コンテナへの exec は [`Entrypoint::new`] の絶対パスのみ。launch は
+//!   名前だけの `args[0]` を [`Entrypoint::search_path`] で pivot 後に `process.env` の `PATH` から解決する（OCI-1・#2314。
+//!   契約は `path_lookup.rs`）。`/` を含む相対パス・（cwd は launch の `setup.working_dir` で pivot 直後に適用。OCI-1）・OCI `process` からの組み立て・`preserve_fds`・
 //!   `LISTEN_FDS` の受け渡しは TASK-29/30 の範囲
 //! - **環境変数と補助グループ**（SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）: `execveat` へは [`Entrypoint`] が持つ
 //!   env だけを envp として明示的に渡し、呼び出しプロセスの環境は引き継がない（既定値の補完もしない）。launch は
@@ -113,6 +115,7 @@ use super::entrypoint_mode::EntrypointExecMode;
 use super::interpreter::reject_runtime_interpreter;
 use super::launch_status::{PrePivotFailure, PrePivotStep, report_failure, report_ready};
 use super::masked_paths;
+use super::path_lookup::{self, CandidateKind};
 use super::path_masks;
 use super::rlimits::apply_rlimits;
 use super::rootfs::PreparedRootfs;
@@ -120,8 +123,8 @@ use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_
 use super::stages::{LaunchNotReady, LaunchReady};
 use super::{
     DeviceReport, DevptsGidSource, ExecError, IsolationStage, MountIsolation, PivotReport,
-    StagePipeline, ViolationReason, describe, enter_working_dir, fd_mount_id, inject_files,
-    mount_sysfs, mount_tmpfs, pivot_root, prepare_rootfs,
+    StagePipeline, SysfsReport, ViolationReason, describe, enter_working_dir, fd_mount_id,
+    inject_files, mount_sysfs, mount_tmpfs, pivot_root, prepare_rootfs,
 };
 use crate::dev_mounts::ImplicitDevMount;
 use crate::injected_files::InjectedFileSet;
@@ -152,9 +155,12 @@ pub const EXIT_EXEC_NOT_FOUND: i32 = 127;
 /// バイト数を検証済みの `CString` 群として保持する（壊れた値を表現できない型。REPAIR-2）。
 #[derive(Clone, PartialEq, Eq)]
 pub struct Entrypoint {
+    /// 絶対パス。[`Entrypoint::search_path`] で作ったときは探索する名前（`/` を含まない）。
     path: CString,
     argv: Vec<CString>,
     env: Vec<CString>,
+    /// 名前を `PATH` で探すときの候補列（`<dir>/<name>`。fork 前に検証済み）。`None` は絶対パス。
+    search: Option<Vec<CString>>,
 }
 
 // env の値は秘密情報を含み得るため、`Debug` には KEY だけを出す（これを包む `ExecCommand` の `Debug` も同じ出力に
@@ -176,6 +182,27 @@ impl std::fmt::Debug for Entrypoint {
             .field("env_keys", &keys)
             .finish()
     }
+}
+
+/// 同じ KEY の重複を後勝ちに正規化する（残すのは各 KEY の最後の要素。残った要素の相対順は保つ）。
+///
+/// runc は `os.Clearenv()` の後に `process.env` を順に `Setenv` し、その環境で exec する（同じ KEY は後勝ちで
+/// 1 件）。`PATH` の探索（`path_lookup`）が使う値と、子の `getenv` が見る値を一致させるため、envp も同じ規則で
+/// 1 件に揃える（OCI-1・#2314）。KEY は最初の `=` までのバイト列で比べる。件数は入力以下なので上限は保たれる。
+fn dedup_env_last_wins(env: Vec<CString>) -> Vec<CString> {
+    let key = |c: &CString| -> Vec<u8> {
+        let b = c.to_bytes();
+        let end = b.iter().position(|x| *x == b'=').unwrap_or(b.len());
+        b.get(..end).unwrap_or_default().to_vec()
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<CString> = env
+        .into_iter()
+        .rev()
+        .filter(|c| seen.insert(key(c)))
+        .collect();
+    out.reverse();
+    out
 }
 
 impl Entrypoint {
@@ -206,6 +233,42 @@ impl Entrypoint {
         }
         let mut total = 0usize;
         let path = to_cstring(path.as_os_str(), &mut total, "entrypoint path")?;
+        Self::assemble(path, total, args, env)
+    }
+
+    /// 名前だけの `process.args[0]` を `process.env` の `PATH` で探すエントリポイントを作る（OCI-1・#2314）。
+    ///
+    /// 探索は子が `pivot_root` した後に rootfs の中でだけ行う（契約と runc との差は `path_lookup.rs`）。
+    /// `name` は空でなく `/`・NUL を含まない（`/` を含む相対パスは `InvalidArgument`。未対応。REPAIR-3）。
+    /// `env` に使える `PATH` が無ければ `InvalidArgument`（既定値は補わない）。`argv` は変えない（`argv[0]` は
+    /// 呼び出し元が渡した名前のまま）。その他の検証と違反の分類は [`Entrypoint::new`] と同じ。
+    pub fn search_path<N, A, E>(name: N, args: A, env: E) -> Result<Self, ExecError>
+    where
+        N: AsRef<OsStr>,
+        A: IntoIterator,
+        A::Item: AsRef<OsStr>,
+        E: IntoIterator,
+        E::Item: AsRef<OsStr>,
+    {
+        let name = name.as_ref();
+        path_lookup::validate_name(name)?;
+        let mut total = 0usize;
+        let path = to_cstring(name, &mut total, "entrypoint name")?;
+        let mut entry = Self::assemble(path, total, args, env)?;
+        entry.search = Some(path_lookup::candidates_from_env(name, &entry.env)?);
+        Ok(entry)
+    }
+
+    /// `new` と `search_path` が共有する argv・env の検証と組み立て。
+    fn assemble<A, E>(path: CString, mut total: usize, args: A, env: E) -> Result<Self, ExecError>
+    where
+        A: IntoIterator,
+        A::Item: AsRef<OsStr>,
+        E: IntoIterator,
+        E::Item: AsRef<OsStr>,
+    {
+        let invalid =
+            |msg: &str| ExecError::new(ErrorCode::InvalidArgument, IsolationStage::Validate, msg);
         let argv = collect_cstrings(args, ENTRYPOINT_MAX_ARGS, &mut total, "argv")?;
         if argv.is_empty() {
             return Err(invalid("argv must contain at least one element"));
@@ -219,10 +282,16 @@ impl Entrypoint {
                 ));
             }
         }
-        Ok(Self { path, argv, env })
+        Ok(Self {
+            path,
+            argv,
+            env: dedup_env_last_wins(env),
+            search: None,
+        })
     }
 
-    /// コンテナ内の絶対パス。
+    /// コンテナ内の絶対パス。[`Entrypoint::search_path`] で作ったときは探索する名前（解決後のパスではない。
+    /// 解決後は `open_entrypoint` が返す）。
     pub fn path(&self) -> &Path {
         Path::new(OsStr::from_bytes(self.path.to_bytes()))
     }
@@ -465,12 +534,12 @@ fn prepare_exec_child(
     // 検査と実行を同じ fd に固定する（パスを再解決する execve では、検査後に差し替えられうる）。
     // 種別（通常ファイル・標準入出力と別の実体）は開く前に確かめる（`setsid` の後は、端末を開くと制御端末に
     // なるため。#1456）。
-    let (file, meta) = open_entrypoint(entry, root.as_fd(), procfs.as_fd())?;
+    let (file, meta, resolved) = open_entrypoint(entry, root.as_fd(), procfs.as_fd())?;
     let runtime = runtime_identity(procfs.as_fd())?;
     if (meta.dev(), meta.ino()) == runtime {
         return Err(ExecError::from_violation_at(
             ViolationReason::EntrypointIsRuntimeBinary,
-            Some(entry.path()),
+            Some(resolved.as_path()),
             STAGE,
         ));
     }
@@ -484,8 +553,13 @@ fn prepare_exec_child(
         EntrypointSource::Pinned => (ExecutableFd::Pinned(file), meta),
         EntrypointSource::Switchable(policy) => match policy.mode() {
             EntrypointExecMode::SealedCopy => {
-                let copy =
-                    seal_entrypoint_copy(&file, &meta, procfs.as_fd(), entry.path(), &policy)?;
+                let copy = seal_entrypoint_copy(
+                    &file,
+                    &meta,
+                    procfs.as_fd(),
+                    resolved.as_path(),
+                    &policy,
+                )?;
                 drop(file);
                 let meta = copy.metadata().clone();
                 (ExecutableFd::Sealed(copy), meta)
@@ -494,7 +568,7 @@ fn prepare_exec_child(
             // 直後の `execveat` が同じ fd・同じ domain で同じ検査（`noexec`・`MAY_EXEC`・Landlock・LSM）を必ず行うため、
             // 事前判定は保証を増やさず、AppArmor 等の拒否の監査イベントを二重にするだけになる。
             EntrypointExecMode::PinnedInode { .. } => {
-                check_not_on_noexec_mount(&file, entry.path())?;
+                check_not_on_noexec_mount(&file, resolved.as_path())?;
                 (ExecutableFd::Pinned(file), meta)
             }
         },
@@ -515,14 +589,14 @@ fn prepare_exec_child(
     }
     // シェバン・`PT_INTERP` の解決先がランタイム自身でないことも確かめる（本体の照合だけでは
     // `#!/proc/self/exe` を通してしまう。#1458。契約と限界は `interpreter.rs`）。
-    reject_runtime_interpreter(file, entry.path(), runtime, procfs.as_fd())?;
+    reject_runtime_interpreter(file, resolved.as_path(), runtime, procfs.as_fd())?;
     // シェバン付きスクリプトは fd が CLOEXEC だと execveat が ENOENT になるため、その場合だけ
     // mark_fds_cloexec の後に fd を継承させる（読み取り専用の同一ファイルの fd のみが漏れる）。
     let mut magic = [0u8; 2];
     let is_script = matches!(file.read_at(&mut magic, 0), Ok(2)) && &magic == b"#!";
     if is_script {
         // インタープリタは `/dev/fd/N` を開き直すため、新 root 内でそれが同じ実体を指すことを確認する。
-        verify_script_fd_path(Path::new("/dev/fd"), file, &meta, entry)?;
+        verify_script_fd_path(Path::new("/dev/fd"), file, &meta, &resolved)?;
     }
 
     mark_fds_cloexec()?;
@@ -594,7 +668,7 @@ fn verify_script_fd_path(
     dev_fd_dir: &Path,
     file: &std::fs::File,
     meta: &std::fs::Metadata,
-    entry: &Entrypoint,
+    shown: &Path,
 ) -> Result<(), ExecError> {
     use std::os::fd::AsRawFd as _;
     let path = dev_fd_dir.join(file.as_raw_fd().to_string());
@@ -605,7 +679,7 @@ fn verify_script_fd_path(
             IsolationStage::Exec,
             format!(
                 "the entrypoint {:?} is a shebang script, but {} does not resolve to it in the new root; shebang scripts require /dev/fd (a symlink to /proc/self/fd)",
-                entry.path(),
+                shown,
                 path.display()
             ),
         )),
@@ -928,36 +1002,80 @@ fn open_entrypoint(
     entry: &Entrypoint,
     root: BorrowedFd<'_>,
     procfs: BorrowedFd<'_>,
-) -> Result<(std::fs::File, std::fs::Metadata), ExecError> {
+) -> Result<(std::fs::File, std::fs::Metadata, std::path::PathBuf), ExecError> {
     const STAGE: IsolationStage = IsolationStage::Exec;
-    let open_error = |e: SysError| {
+    let open_error_for = |shown: &Path, e: SysError| {
         ExecError::new(
             exec_errno_to_code(e),
             STAGE,
-            format!(
-                "open of the entrypoint {:?} failed: {}",
-                entry.path(),
-                describe(e)
-            ),
+            format!("open of the entrypoint {:?} failed: {}", shown, describe(e)),
         )
     };
     // 絶対パスなので解決は呼び出しプロセスの root（= 照合済みの `root`）から始まる。
     // 固定用の fd も 3 以上へ置く（呼び出し元の fd 0〜2 が閉じていると `openat` はその番号を返し、直後の
     // 「継承した標準入出力と同一の実体か」の照合が、固定した fd 自身と一致して通常のファイルを誤って拒否する）。
-    let pinned = sys::open_path_follow_at(root, &entry.path)
-        .map_err(open_error)
-        .and_then(keep_above_stdio)?;
+    let (pinned, resolved) = match &entry.search {
+        None => {
+            let fd = sys::open_path_follow_at(root, &entry.path)
+                .map_err(|e| open_error_for(entry.path(), e))
+                .and_then(keep_above_stdio)?;
+            (fd, entry.path().to_path_buf())
+        }
+        // 名前の探索（OCI-1・#2314）。pivot 後の `/` の下で、候補を `O_PATH` で固定して判定する（ドライバの
+        // `open` を呼ばず制御端末も取得しない。#1456）。不在・権限・`ELOOP` 等は次の候補へ進む。
+        Some(candidates) => {
+            let mut chosen: Option<OwnedFd> = None;
+            let idx = path_lookup::select_candidate(candidates, |cand| {
+                let fd = sys::open_path_follow_at(root, cand)
+                    .ok()
+                    .and_then(|fd| keep_above_stdio(fd).ok())?;
+                let meta = std::fs::File::from(fd.try_clone().ok()?).metadata().ok()?;
+                let kind = if !meta.is_file() {
+                    CandidateKind::NotRegular
+                } else if meta.mode() & 0o111 == 0 {
+                    CandidateKind::NotExecutable
+                } else {
+                    CandidateKind::Executable
+                };
+                if kind == CandidateKind::Executable {
+                    chosen = Some(fd);
+                }
+                Some(kind)
+            })?;
+            let fd = chosen.ok_or_else(|| {
+                ExecError::new(
+                    ErrorCode::Internal,
+                    STAGE,
+                    "the selected entrypoint candidate was not retained",
+                )
+            })?;
+            let picked = candidates.get(idx).ok_or_else(|| {
+                ExecError::new(
+                    ErrorCode::Internal,
+                    STAGE,
+                    "the selected entrypoint candidate index is out of range",
+                )
+            })?;
+            #[cfg(test)]
+            tests::record(format!("lookup(entrypoint)={}", picked.to_string_lossy()));
+            (
+                fd,
+                std::path::PathBuf::from(OsStr::from_bytes(picked.to_bytes())),
+            )
+        }
+    };
+    let open_error = |e: SysError| open_error_for(&resolved, e);
     let meta = pinned
         .try_clone()
         .and_then(|fd| std::fs::File::from(fd).metadata())
-        .map_err(|e| io_exec_error(&e, entry))?;
+        .map_err(|e| io_exec_error(&e, &resolved))?;
     if matches_any_identity((meta.dev(), meta.ino()), &inherited_stdio_identities()?) {
         return Err(ExecError::new(
             ErrorCode::PermissionDenied,
             STAGE,
             format!(
                 "the entrypoint {:?} resolves to an inherited standard stream",
-                entry.path()
+                resolved
             ),
         ));
     }
@@ -965,7 +1083,7 @@ fn open_entrypoint(
         return Err(ExecError::new(
             ErrorCode::PermissionDenied,
             STAGE,
-            format!("the entrypoint {:?} is not a regular file", entry.path()),
+            format!("the entrypoint {:?} is not a regular file", resolved),
         ));
     }
     #[cfg(test)]
@@ -975,18 +1093,18 @@ fn open_entrypoint(
         .and_then(keep_above_stdio)
         .map(std::fs::File::from)?;
     // 開き直した実体が、固定して検査した inode そのものであること（開き直しの経路の多層防御）。
-    let reopened = file.metadata().map_err(|e| io_exec_error(&e, entry))?;
+    let reopened = file.metadata().map_err(|e| io_exec_error(&e, &resolved))?;
     if (reopened.dev(), reopened.ino()) != (meta.dev(), meta.ino()) {
         return Err(ExecError::new(
             ErrorCode::PermissionDenied,
             STAGE,
             format!(
                 "the entrypoint {:?} changed while it was being opened",
-                entry.path()
+                resolved
             ),
         ));
     }
-    Ok((file, meta))
+    Ok((file, meta, resolved))
 }
 
 /// fd が 0〜2 なら 3 以上へ複製して元を閉じる（3 以上ならそのまま返す）。
@@ -1011,14 +1129,14 @@ pub(super) fn keep_above_stdio(fd: OwnedFd) -> Result<OwnedFd, ExecError> {
 }
 
 /// `std::io::Error` を `Exec` 段の `ExecError` に写す。
-fn io_exec_error(e: &std::io::Error, entry: &Entrypoint) -> ExecError {
+fn io_exec_error(e: &std::io::Error, shown: &Path) -> ExecError {
     let err = SysError::Os(e.raw_os_error().unwrap_or(0));
     ExecError::new(
         exec_errno_to_code(err),
         IsolationStage::Exec,
         format!(
             "stat of the entrypoint {:?} failed: {}",
-            entry.path(),
+            shown,
             describe(err)
         ),
     )
@@ -1920,6 +2038,8 @@ trait PrePivotOps {
     type Prepared;
     type Devices;
     type Pivoted;
+    /// `mount_sysfs` の成功の証跡。`masked_paths` 段へ渡し、sysfs を供給したときだけ `/sys` 配下を覆う（#2014）。
+    type Sysfs;
     fn establish(&self) -> Result<Self::Isolation, ExecError>;
     fn prepare_rootfs(
         &self,
@@ -1937,7 +2057,7 @@ trait PrePivotOps {
         isolation: &Self::Isolation,
         prepared: &Self::Prepared,
         spec: &SysfsMountSpec,
-    ) -> Result<(), ExecError>;
+    ) -> Result<Self::Sysfs, ExecError>;
     fn create_default_devices(
         &self,
         isolation: &Self::Isolation,
@@ -1976,6 +2096,7 @@ trait PrePivotOps {
         isolation: &Self::Isolation,
         prepared: &Self::Prepared,
         devices: &Self::Devices,
+        sysfs: Option<&Self::Sysfs>,
         extra: &[ProtectedPath],
     ) -> Result<(), ExecError>;
     fn pivot_root(
@@ -2050,6 +2171,7 @@ impl PrePivotOps for RealPrePivotOps {
     type Prepared = PreparedRootfs;
     type Devices = DeviceSet;
     type Pivoted = PivotReport;
+    type Sysfs = SysfsReport;
 
     fn establish(&self) -> Result<MountIsolation, ExecError> {
         MountIsolation::establish()
@@ -2085,10 +2207,10 @@ impl PrePivotOps for RealPrePivotOps {
         isolation: &MountIsolation,
         prepared: &PreparedRootfs,
         spec: &SysfsMountSpec,
-    ) -> Result<(), ExecError> {
+    ) -> Result<SysfsReport, ExecError> {
         // `/sys` の Landlock ルールは作らない（`landlock::rules` の doc。VFS の ro と `readonly_paths` が書き込みを塞ぐ）ため、
         // `self.record` による識別子の記録はしない。載せたマウントは `readonly_paths` が最上位を入れ替える。
-        mount_sysfs(isolation, prepared, spec).map(|_| ())
+        mount_sysfs(isolation, prepared, spec)
     }
 
     fn create_default_devices(
@@ -2180,9 +2302,11 @@ impl PrePivotOps for RealPrePivotOps {
         isolation: &MountIsolation,
         prepared: &PreparedRootfs,
         devices: &DeviceSet,
+        sysfs: Option<&SysfsReport>,
         extra: &[ProtectedPath],
     ) -> Result<(), ExecError> {
-        masked_paths::apply_masked_paths(isolation, prepared, &devices.null, extra).map(|_| ())
+        masked_paths::apply_masked_paths(isolation, prepared, &devices.null, sysfs, extra)
+            .map(|_| ())
     }
 
     fn pivot_root(
@@ -2296,6 +2420,7 @@ fn run_pre_pivot<O: PrePivotOps>(
         .prepare_rootfs(&isolation, rootfs)
         .map_err(StepError::at(S::PrepareRootfs))?;
     let mut devices = None;
+    let mut sysfs = None;
     let config_paths = setup.map_or(ConfigPaths::NONE, |s| s.config_paths);
     if let Some(setup) = setup {
         if let Some(pinned) = setup.pinned_rootfs {
@@ -2303,8 +2428,10 @@ fn run_pre_pivot<O: PrePivotOps>(
                 .map_err(StepError::at(S::VerifyPinned))?;
         }
         if let Some(spec) = setup.sysfs {
-            ops.mount_sysfs(&isolation, &prepared, spec)
-                .map_err(StepError::at(S::MountSysfs))?;
+            sysfs = Some(
+                ops.mount_sysfs(&isolation, &prepared, spec)
+                    .map_err(StepError::at(S::MountSysfs))?,
+            );
         }
         let created = ops
             .create_default_devices(&isolation, &prepared, setup.devices)
@@ -2329,8 +2456,14 @@ fn run_pre_pivot<O: PrePivotOps>(
     ops.apply_readonly_paths(&isolation, &prepared, config_paths.readonly)
         .map_err(StepError::at(S::ReadonlyPaths))?;
     if let Some(devices) = &devices {
-        ops.apply_masked_paths(&isolation, &prepared, devices, config_paths.masked)
-            .map_err(StepError::at(S::MaskedPaths))?;
+        ops.apply_masked_paths(
+            &isolation,
+            &prepared,
+            devices,
+            sysfs.as_ref(),
+            config_paths.masked,
+        )
+        .map_err(StepError::at(S::MaskedPaths))?;
     }
     let pivoted = ops
         .pivot_root(&isolation, prepared)
@@ -3969,12 +4102,12 @@ mod tests {
         let entry = Entrypoint::new(&script, ["script"], [] as [&str; 0]).unwrap();
 
         // /proc/self/fd は /dev/fd の参照先で、N は開いた fd 自身に解決する。
-        verify_script_fd_path(Path::new("/proc/self/fd"), &file, &meta, &entry).unwrap();
+        verify_script_fd_path(Path::new("/proc/self/fd"), &file, &meta, entry.path()).unwrap();
 
         // /dev/fd の無い rootfs（空ディレクトリ）は拒否する。
         let empty = dir.0.join("empty");
         std::fs::create_dir(&empty).unwrap();
-        let err = verify_script_fd_path(&empty, &file, &meta, &entry).unwrap_err();
+        let err = verify_script_fd_path(&empty, &file, &meta, entry.path()).unwrap_err();
         assert_eq!(
             (err.code, err.stage),
             (ErrorCode::FailedPrecondition, IsolationStage::Exec)
@@ -3989,7 +4122,7 @@ mod tests {
             .create_new(true)
             .open(other.join(file.as_raw_fd().to_string()))
             .unwrap();
-        let err = verify_script_fd_path(&other, &file, &meta, &entry).unwrap_err();
+        let err = verify_script_fd_path(&other, &file, &meta, entry.path()).unwrap_err();
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
     }
 
@@ -4425,7 +4558,7 @@ mod tests {
         std::os::unix::fs::symlink(&file, &link).unwrap();
         let root = dir_fd(Path::new("/"));
         let _ = take_calls();
-        let (opened, meta) = open_entrypoint(
+        let (opened, meta, _) = open_entrypoint(
             &Entrypoint::new(&link, ["x"], [] as [&str; 0]).unwrap(),
             root.as_fd(),
             real_procfs().as_fd(),
@@ -4454,6 +4587,123 @@ mod tests {
             take_calls(),
             vec!["close_range(3,close)".to_string(), "setsid".to_string()]
         );
+    }
+
+    /// OCI-1（#2314）: 名前だけの `args[0]`（redis:alpine の `docker-entrypoint.sh`）を `PATH` で解決する。
+    /// 実行ビットの無い前方の候補は飛ばし、2 件目を採る。argv[0] は名前のまま。
+    #[test]
+    fn oci1_exec_resolves_bare_name_via_path() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = TempDir::create("oci1-path");
+        let sbin = dir.0.join("usr/local/sbin");
+        let bin = dir.0.join("usr/local/bin");
+        std::fs::create_dir_all(&sbin).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let skipped = sbin.join("docker-entrypoint.sh");
+        let target = bin.join("docker-entrypoint.sh");
+        std::fs::write(&skipped, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&skipped, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&target, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path_env = format!("PATH={}:{}:/nonexistent", sbin.display(), bin.display());
+        let entry = Entrypoint::search_path(
+            "docker-entrypoint.sh",
+            ["docker-entrypoint.sh", "redis-server"],
+            [path_env.as_str()],
+        )
+        .unwrap();
+        let _ = take_calls();
+        // dry-run の execve は EINTR を返すので Err になる。記録で解決結果を照合する。
+        let _ = exec_entrypoint_verified(current_root_mnt_id(), &entry);
+        assert_eq!(
+            take_calls(),
+            vec![
+                "close_range(3,close)".to_string(),
+                "setsid".to_string(),
+                format!("lookup(entrypoint)={}", target.display()),
+                "reopen(entrypoint)".to_string(),
+                "close_range(3)".to_string(),
+                "signal(SIGPIPE,SIG_DFL)".to_string(),
+                "stdio->/dev/null".to_string(),
+                // 実行は固定した fd で行う。記録の名前は `Entrypoint::path()`（探索した名前）。
+                "execve(docker-entrypoint.sh)".to_string(),
+                "argv=docker-entrypoint.sh redis-server".to_string(),
+                format!("env={path_env}"),
+            ]
+        );
+    }
+
+    /// OCI-1（#2314）: 重複 KEY は後勝ちの 1 件に正規化され、探索と子へ渡す環境が同じ `PATH` を指す。
+    #[test]
+    fn oci1_duplicate_env_keys_are_last_wins() {
+        let entry = Entrypoint::new(
+            "/bin/app",
+            ["app"],
+            ["PATH=/old", "A=1", "PATH=/new", "B=2", "A=3"],
+        )
+        .unwrap();
+        let got: Vec<String> = entry
+            .env
+            .iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, vec!["PATH=/new", "B=2", "A=3"]);
+        let dir = TempDir::create("oci1-dup");
+        let old = format!("PATH={}/old", dir.0.display());
+        let new = format!("PATH={}/new", dir.0.display());
+        let entry =
+            Entrypoint::search_path("x", ["x"], [old.as_str(), "K=v", new.as_str()]).unwrap();
+        let got: Vec<String> = entry
+            .env
+            .iter()
+            .map(|c| c.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, vec!["K=v".to_string(), new.clone()]);
+        assert_eq!(
+            entry.search.as_ref().unwrap()[0].to_string_lossy(),
+            format!("{}/new/x", dir.0.display())
+        );
+    }
+
+    /// OCI-1（#2314）: `PATH` のどこにも無い名前は `NotFound`（終了コード 127）で、`execve` しない。
+    #[test]
+    fn oci1_exec_bare_name_not_found_in_path() {
+        let dir = TempDir::create("oci1-nf");
+        let path_env = format!("PATH={}", dir.0.display());
+        let entry = Entrypoint::search_path("nope.sh", ["nope.sh"], [path_env.as_str()]).unwrap();
+        let _ = take_calls();
+        let err = exec_entrypoint_verified(current_root_mnt_id(), &entry).unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(err.stage, IsolationStage::Exec);
+        assert_eq!(exit_code_for(&err), EXIT_EXEC_NOT_FOUND);
+        assert_eq!(
+            take_calls(),
+            vec!["close_range(3,close)".to_string(), "setsid".to_string()]
+        );
+    }
+
+    /// OCI-1・CORE-1（#2314）: 名前の探索で当たった候補が既存の検査を通る
+    /// （`PATH=/proc/self` の `exe` はランタイム自身で、違反として拒否する）。
+    #[test]
+    fn oci1_core1_exec_bare_name_resolving_to_runtime_binary_is_rejected() {
+        let entry = Entrypoint::search_path("exe", ["exe"], ["PATH=/proc/self"]).unwrap();
+        let _ = take_calls();
+        let err = exec_entrypoint_verified(current_root_mnt_id(), &entry).unwrap_err();
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        let v = err.violation.expect("violation record");
+        assert_eq!(v.reason, ViolationReason::EntrypointIsRuntimeBinary);
+    }
+
+    /// OCI-1（#2314）: `/` を含む相対パスは従来どおり `InvalidArgument`（`search_path` も同じ）。
+    #[test]
+    fn oci1_entrypoint_relative_with_slash_still_rejected() {
+        let err = Entrypoint::new("bin/app", ["x"], [] as [&str; 0]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        for name in ["./x", "a/b", "bin/app"] {
+            let err = Entrypoint::search_path(name, ["x"], ["PATH=/bin"]).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "{name}");
+            assert_eq!(err.stage, IsolationStage::Validate, "{name}");
+        }
     }
 
     /// `sh -c script` を起動してその pid を返す。std の `Child` は wait せず、回収は被試験対象の
@@ -5319,6 +5569,11 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// `masked_paths` 段が受けた sysfs の証跡の有無（#2014。呼び出し順の記録とは別に持つ）。
+        static SYSFS_PROOF_SEEN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
     impl RecordingOps {
         fn step(&self, name: &'static str) -> Result<(), ExecError> {
             record(name.to_owned());
@@ -5334,6 +5589,7 @@ mod tests {
         type Prepared = ();
         type Devices = ();
         type Pivoted = ();
+        type Sysfs = ();
         fn establish(&self) -> Result<(), ExecError> {
             self.step("establish")
         }
@@ -5376,8 +5632,10 @@ mod tests {
             _: &(),
             _: &(),
             _: &(),
+            sysfs: Option<&()>,
             _: &[ProtectedPath],
         ) -> Result<(), ExecError> {
+            SYSFS_PROOF_SEEN.with(|c| c.set(Some(sysfs.is_some())));
             self.step("masked_paths")
         }
         fn pivot_root(&self, _: &(), _: ()) -> Result<(), ExecError> {
@@ -5458,6 +5716,33 @@ mod tests {
                 "pivot_root",
             ]
         );
+    }
+
+    /// SEC-2（#2014）: `masked_paths` 段へは `mount_sysfs` の証跡が、sysfs の指定があるときだけ渡る。
+    #[test]
+    fn sec2_2014_run_pre_pivot_passes_sysfs_proof_only_when_mounted() {
+        let sysfs = test_sysfs();
+        for (spec, want) in [(Some(&sysfs), Some(true)), (None, Some(false))] {
+            SYSFS_PROOF_SEEN.with(|c| c.set(None));
+            run_pre_pivot(
+                &RecordingOps { fail_at: None },
+                Path::new("/rootfs"),
+                Some(PrePivotSetup {
+                    devices: DevptsGidSource::Rootful,
+                    tmpfs: None,
+                    inject: None,
+                    binds: None,
+                    sysfs: spec,
+                    pinned_rootfs: None,
+                    config_paths: ConfigPaths::NONE,
+                    status: None,
+                    working_dir: None,
+                }),
+            )
+            .unwrap();
+            assert_eq!(SYSFS_PROOF_SEEN.with(|c| c.get()), want);
+        }
+        let _ = take_calls();
     }
 
     /// 指定が無い段は呼ばれず、devices は常に pivot の前に作られる。`None` は最小構成。

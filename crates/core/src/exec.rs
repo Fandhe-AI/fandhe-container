@@ -126,6 +126,7 @@ mod launch_status;
 mod masked_paths;
 mod no_new_privs;
 mod overlay_layers;
+mod path_lookup;
 mod path_masks;
 mod process;
 mod reapply;

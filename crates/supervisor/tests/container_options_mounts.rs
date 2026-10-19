@@ -56,4 +56,13 @@ fn sup12_unsafe_tmpfs_requests_are_rejected() {
         .expect_err("reserved destination");
     assert_eq!(e.code(), ErrorCode::InvalidArgument);
     assert_eq!(e.message(), "tmpfs must not be mounted on /proc or below");
+    // SEC-2・#2233: /sys 配下も拒否する。
+    let opts = MountOptions::default()
+        .with_tmpfs(TmpfsOption::parse("/sys/kernel").expect("parse"))
+        .expect("add tmpfs");
+    let e = opts
+        .to_tmpfs_set(IpcMode::Private)
+        .expect_err("reserved destination");
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
+    assert_eq!(e.message(), "tmpfs must not be mounted on /sys or below");
 }

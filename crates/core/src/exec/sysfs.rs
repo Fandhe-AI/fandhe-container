@@ -266,17 +266,18 @@ fn open_sys_dir(new_root: BorrowedFd<'_>) -> Result<OwnedFd, ExecError> {
 }
 
 /// mountinfo の 1 行の必要な部分。
-struct Entry<'a> {
-    id: u64,
-    mount_point: &'a str,
-    options: &'a str,
-    fstype: &'a str,
+pub(super) struct Entry<'a> {
+    pub(super) id: u64,
+    pub(super) mount_point: &'a str,
+    pub(super) options: &'a str,
+    pub(super) fstype: &'a str,
 }
 
 /// 区切り `-` の前の固定フィールド数（`id parent major:minor root mount_point options`）。
 const FIXED_FIELDS: usize = 6;
 
-fn parse_entry(line: &str) -> Option<Entry<'_>> {
+/// mountinfo の 1 行を解く（`path_masks` の `/sys` 部分木の事後検証と共有。#2233）。
+pub(super) fn parse_entry(line: &str) -> Option<Entry<'_>> {
     let fields: Vec<&str> = line.split(' ').collect();
     let sep = fields
         .iter()

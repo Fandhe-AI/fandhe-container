@@ -47,7 +47,7 @@
 //! - ユーザー名 → `/etc/subuid` 行の NSS 解決は**追加しない**（`getpwuid_r` は新規 FFI のため。
 //!   呼び出し側が [`SubIdOwner`] に数値 uid と検証済みユーザー名を渡す方式を維持する。
 //!   ライブラリコードは `$USER` を読まない）
-//! - `oci_runtime` の `linux.uidMappings` / `gidMappings` の受理（start.rs は現状拒否のまま。SEC-5 に関わるオーナー判断の確認待ち。#2009）
+//! - `oci_runtime` の `linux.uidMappings` / `gidMappings` の受理（start.rs は現状拒否のまま。受けるかは SEC-5 に関わるオーナー判断待ち。#2240・`docs/design/config-id-mappings.md`）
 //!
 //! ファイル所有者の写像（SEC-5。ns 内 0 → ホスト非特権 UID）の照合は `tests/rootless_file_owner.rs`
 //! （TASK-40.3・#189）が担う。

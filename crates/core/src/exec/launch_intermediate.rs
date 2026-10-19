@@ -24,6 +24,16 @@
 //!   pipe の作成のみ)。I は C の単一スレッドの fork 子で、`fork_single_threaded_no_flush` を使うため C の stdio
 //!   バッファを二重に出力しない
 //!
+//! # seccomp の listener の受け渡し(SEC-4・TASK-41 追補・#2024。監査配送 2/6)
+//!
+//! C は fork の前に socketpair(`SOCK_SEQPACKET`。C の端は `SO_PASSCRED`)を作り、子の端を PID 1 へ渡す。I は C の端を
+//! 閉じてから動く。PID 1 は最終段 `Seccomp` で `NEW_LISTENER` 付きの適用をして listener を送り、C の ACK を待ってから
+//! exec する。C は状態(`P`)の判定が成功した後に期限つきで受け取り、検証([`super::seccomp_listener`])に通ったものを
+//! [`LaunchedChild`] に載せる。**EOF・期限切れ・検証の不一致は PID 1 を回収して起動失敗**(listener 無しで走らせない)。
+//! 副作用として、`Seccomp` 段より前の段(Landlock 等)で PID 1 が失敗した場合も、C は listener を受け取れず
+//! 起動失敗として観測する(従来は PID 1 の終了として観測していた。具体的な原因は PID 1 の stderr に残る)。
+//! 応答ループは #2025。本番の filter は当面 ERRNO 版のため通知は生じない。
+//!
 //! # 報告 pipe のワイヤー形式(REPAIR-2。ASCII 1 行・LF 終端・最大 [`REPORT_MAX_BYTES`] バイト)
 //!
 //! ```text
@@ -57,7 +67,7 @@
 
 use std::io::Write as _;
 use std::num::NonZeroU32;
-use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, RawFd};
+use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
@@ -73,6 +83,9 @@ use super::launch_status::{
 use super::process::{
     ChildStdio, ContainerChild, EXIT_SETUP_FAILED, Entrypoint, KILL_REAP_TIMEOUT, PrePivotSetup,
     PreparedLaunchFailure, child_main, exec_status_pipe, report_legacy_tiocsti_to,
+};
+use super::seccomp_listener::{
+    ListenerSender, SeccompListener, listener_socketpair, receive_listener,
 };
 use super::{
     ChildSubreaper, ExecError, IsolationPlan, IsolationStage, StagePipeline,
@@ -404,6 +417,8 @@ struct RealIntermediateOps<'a> {
     report: &'a std::fs::File,
     tag: LaunchTag,
     gate_r: &'a std::fs::File,
+    /// seccomp の listener を C へ渡す socketpair の子の端(借用。PID 1 は複製を `Seccomp` 段へ渡す。SEC-4・#2024)。
+    listener_end: &'a OwnedFd,
 }
 
 impl IntermediateOps for RealIntermediateOps<'_> {
@@ -432,6 +447,12 @@ impl IntermediateOps for RealIntermediateOps<'_> {
             ));
         };
         let (rootfs, entry, setup) = (self.rootfs, self.entry, self.setup);
+        // PID 1 の `Seccomp` 段が listener を送る口。複製は close-on-exec で、段が送信後に閉じる。複製できなければ
+        // PID 1 を作らずに失敗させる(listener 無しで実行させない。fail-closed。SEC-4・#2024)。
+        let sender = ListenerSender::new(self.listener_end.try_clone().map_err(|e| {
+            ExecError::from_io(&e, IsolationStage::Spawn, "duplicate the listener socket")
+        })?);
+        let stages = stages.with_listener_sender(sender);
         let gate_r = self.gate_r;
         let report_fd = self.report.as_raw_fd();
         // 識別子は fork で PID 1 へ継承される。設定できなければ、報告前に失われた PID 1 を C が特定できなく
@@ -513,7 +534,7 @@ pub(crate) fn spawn_container_via_intermediate(
     subreaper: &ChildSubreaper,
     audit: LaunchAudit<'_>,
     timeout: Duration,
-) -> Result<ContainerChild, Box<PreparedLaunchFailure>> {
+) -> Result<LaunchedChild, Box<PreparedLaunchFailure>> {
     let IntermediateSpec {
         plan,
         rootfs,
@@ -523,7 +544,7 @@ pub(crate) fn spawn_container_via_intermediate(
     let tag = LaunchTag::fresh();
     launch_via_intermediate(
         sys::self_is_single_threaded,
-        |status, report, gate_r| {
+        |status, report, gate_r, listener_end| {
             let mut ops = RealIntermediateOps {
                 plan,
                 rootfs,
@@ -537,9 +558,11 @@ pub(crate) fn spawn_container_via_intermediate(
                 report,
                 tag,
                 gate_r,
+                listener_end,
             };
             intermediate_body(&mut ops)
         },
+        true,
         subreaper,
         audit,
         timeout,
@@ -551,20 +574,38 @@ pub(crate) fn spawn_container_via_intermediate(
     )
 }
 
+/// 起動に成功した PID 1 のハンドルと、PID 1 から受け取った seccomp の listener(SEC-4・#2024)。
+#[derive(Debug)]
+pub(crate) struct LaunchedChild {
+    /// PID 1 のハンドル(pidfd つき。呼び出し側が回収の所有者)。
+    pub(crate) child: ContainerChild,
+    /// 検証済みの listener。本番の入口(`spawn_container_via_intermediate`)は必ず `Some`(受け取れなければ
+    /// 起動失敗)。受け渡し無しの試験用経路だけが `None`。
+    pub(crate) listener: Option<SeccompListener>,
+}
+
 /// [`spawn_container_via_intermediate`] の本体。中間プロセスの動作(`intermediate`)と fork 前のスレッド数判定を
 /// 注入できるようにして、成功・各失敗・無報告の期限切れを結合試験で照合する(REPAIR-10・REPAIR-12)。
 ///
-/// `intermediate` は fork した中間プロセスの中で `(状態 pipe の書き込み側, 報告 pipe の書き込み側)` を受けて
-/// 呼ばれ、戻り値が `_exit` の終了コードになる。
+/// `intermediate` は fork した中間プロセスの中で `(状態 pipe の書き込み側, 報告 pipe の書き込み側, 開始ゲートの
+/// 読み取り側, listener socketpair の子の端)` を受けて呼ばれ、戻り値が `_exit` の終了コードになる。
+///
+/// `with_listener` が真なら、状態の判定が成功した後に PID 1 から seccomp の listener を期限つきで受け取って検証し
+/// (EOF・期限切れ・検証の不一致は PID 1 を回収して起動失敗。fail-closed)、ACK を返す。偽は受け渡しの無い試験用の
+/// 立て替え PID 1 のためだけに使い、本番の入口は常に真。
+// 理由: 注入点(スレッド判定・中間プロセス・listener の有無)と、期限・監査・識別子・警告の出力先は独立に差し替える値で、
+// 束ねる型を作ると試験側の組み立てが増えるだけのため引数のまま渡す。
+#[allow(clippy::too_many_arguments)]
 fn launch_via_intermediate(
     is_single_threaded: impl FnOnce() -> bool,
-    intermediate: impl FnOnce(&std::fs::File, &std::fs::File, &std::fs::File) -> i32,
+    intermediate: impl FnOnce(&std::fs::File, &std::fs::File, &std::fs::File, &OwnedFd) -> i32,
+    with_listener: bool,
     subreaper: &ChildSubreaper,
     audit: LaunchAudit<'_>,
     timeout: Duration,
     tag: &LaunchTag,
     legacy: (crate::legacy_tiocsti::LegacyTiocsti, BorrowedFd<'_>),
-) -> Result<ContainerChild, Box<PreparedLaunchFailure>> {
+) -> Result<LaunchedChild, Box<PreparedLaunchFailure>> {
     let not_started = |e: ExecError| {
         Box::new(PreparedLaunchFailure::clean(
             AuditedRejection::not_applicable(e),
@@ -577,12 +618,15 @@ fn launch_via_intermediate(
     // 開始ゲート: C が PID 1 の pid を受領して pidfd を開くまで、PID 1 を exec に進ませない(`comm` の識別子は
     // exec で失われ、報告前の PID 1 を特定できなくなるため。CORE-2)。
     let (gate_r, gate_w) = exec_status_pipe().map_err(not_started)?;
+    // seccomp の listener の受け渡し(SEC-4・#2024)。C の端は `SO_PASSCRED` 設定済み(送信元の pid を受け取る)。
+    let (parent_end, child_end) = listener_socketpair().map_err(not_started)?;
     let (status_ref, report_ref) = (&status_w, &report_w);
-    let gate_r_ref = &gate_r;
-    let (gate_w_fd, report_r_fd, status_r_fd) = (
+    let (gate_r_ref, child_end_ref) = (&gate_r, &child_end);
+    let (gate_w_fd, report_r_fd, status_r_fd, parent_end_fd) = (
         gate_w.as_raw_fd(),
         report_r.as_raw_fd(),
         status_r.as_raw_fd(),
+        parent_end.as_raw_fd(),
     );
     // fork 前の stdout / stderr の同期 flush は無期限に止まり得て、下の期限が効かなくなる(REPAIR-5)ため、
     // flush しない経路を使う。中間プロセスは `_exit` するので二重出力は起きない。
@@ -594,10 +638,11 @@ fn launch_via_intermediate(
             if close_inherited(gate_w_fd).is_err()
                 || close_inherited(report_r_fd).is_err()
                 || close_inherited(status_r_fd).is_err()
+                || close_inherited(parent_end_fd).is_err()
             {
                 return EXIT_SETUP_FAILED;
             }
-            intermediate(status_ref, report_ref, gate_r_ref)
+            intermediate(status_ref, report_ref, gate_r_ref, child_end_ref)
         },
         EXIT_SETUP_FAILED,
     )
@@ -608,6 +653,8 @@ fn launch_via_intermediate(
     drop(status_w);
     drop(report_w);
     drop(gate_r);
+    // 子の端を C が持ち続けると、PID 1 が送る前に死んでも EOF を観測できない。
+    drop(child_end);
     let intermediate_child = ContainerChild::spawned(intermediate_pid);
 
     let report = read_line_bounded::<REPORT_MAX_BYTES>(&report_r, remaining())
@@ -685,7 +732,27 @@ fn launch_via_intermediate(
 
     let status = read_pre_pivot_status(&status_r, remaining());
     match resolve_pre_pivot_status(status, audit) {
-        Ok(()) => Ok(child),
+        Ok(()) if !with_listener => Ok(LaunchedChild {
+            child,
+            listener: None,
+        }),
+        Ok(()) => match receive_listener(parent_end.as_fd(), pid1.get(), deadline) {
+            Ok(listener) => Ok(LaunchedChild {
+                child,
+                listener: Some(listener),
+            }),
+            // 受け渡せなければ listener 無しで走らせない。PID 1 は ACK 待ちか既に終了しているため回収する。
+            Err(e) => match child.kill_and_reap(KILL_REAP_TIMEOUT) {
+                Ok(_) => Err(Box::new(PreparedLaunchFailure::clean(
+                    AuditedRejection::not_applicable(e),
+                ))),
+                Err(reap_error) => Err(Box::new(PreparedLaunchFailure::with_unreaped(
+                    AuditedRejection::not_applicable(e),
+                    child,
+                    reap_error,
+                ))),
+            },
+        },
         Err(rejection) => match child.kill_and_reap(KILL_REAP_TIMEOUT) {
             Ok(_) => Err(Box::new(PreparedLaunchFailure::clean(*rejection))),
             // 回収失敗は握りつぶさず、子のハンドルごと呼び出し側へ返す(孤児化の防止。CORE-2)。
@@ -1498,7 +1565,7 @@ mod tests {
         let tag = LaunchTag::fresh();
         let result = launch_via_intermediate(
             || true,
-            |status, report, gate_r| {
+            |status, report, gate_r, _listener_end| {
                 match behavior {
                     Behavior::Ready => {
                         let pid1 = fork_stand_in(status, &pid_write, |s| {
@@ -1595,12 +1662,14 @@ mod tests {
                 }
                 0
             },
+            false,
             &subreaper,
             audit,
             timeout,
             &tag,
             (legacy, legacy_out),
-        );
+        )
+        .map(|launched| launched.child);
         drop(pid_write);
         let mut seen = Vec::new();
         let mut buf = [0u8; 4];
@@ -1608,6 +1677,185 @@ mod tests {
             seen.push(u32::from_le_bytes(buf));
         }
         (result, sink, seen)
+    }
+
+    /// listener の受け渡しの試験で、代役の PID 1(または中間プロセス)が取る動作。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Handoff {
+        /// 実 listener を載せて送り、ACK を待って 0 で終了する(正常)。
+        Good,
+        /// `P` を報告して何も送らずに終了する(EOF で即時に失敗するはず)。
+        NoSend,
+        /// listener ではない fd(pipe)を送る(種別の不一致)。
+        WrongFd,
+        /// PID 1 ではなく中間プロセスが listener を送る(送信元 pid の不一致)。
+        WrongSender,
+        /// listener を得る前の適用失敗(`EBUSY` 相当の `FailedPrecondition`)を構造化して送り、0 で終了する。
+        ReportBusy,
+    }
+
+    /// 実 listener を載せた状態の fd を作る(forked 単一スレッドの子の中でだけ呼ぶ。filter は子に残る)。
+    fn child_listener() -> std::os::fd::OwnedFd {
+        assert_eq!(sys::set_no_new_privs(), Ok(()));
+        let p = crate::seccomp::build_filter_for_target_arch().expect("filter");
+        sys::seccomp_notify::seccomp_set_filter_new_listener(&p).expect("listener")
+    }
+
+    /// `with_listener = true` で起動し、結果と所要時間を返す。
+    fn run_handoff(
+        mode: Handoff,
+        timeout: Duration,
+    ) -> (
+        Result<LaunchedChild, Box<PreparedLaunchFailure>>,
+        Duration,
+        u32,
+    ) {
+        let subreaper = ChildSubreaper::enable().expect("subreaper");
+        let (mut pid_read, pid_write) = std::io::pipe().unwrap();
+        let pid_write = std::fs::File::from(std::os::fd::OwnedFd::from(pid_write));
+        let sink = VecSink(Mutex::new(Vec::new()));
+        let id = ContainerId::new("c2024").unwrap();
+        let audit = LaunchAudit {
+            sink: &sink,
+            container: Some(&id),
+        };
+        let (out_tx, _out_rx) = UnixStream::pair().unwrap();
+        let tag = LaunchTag::fresh();
+        let started = Instant::now();
+        let result = launch_via_intermediate(
+            || true,
+            |status, report, gate_r, listener_end| {
+                let end = listener_end.try_clone().expect("dup");
+                let pid1 = fork_stand_in(status, &pid_write, move |s| {
+                    if await_start_gate(gate_r, Duration::from_secs(10)).is_err() {
+                        return EXIT_SETUP_FAILED;
+                    }
+                    let _ = report_ready(s);
+                    let sender = ListenerSender::new(end);
+                    match mode {
+                        Handoff::Good => {
+                            match sender.hand_over(child_listener(), Duration::from_secs(10)) {
+                                Ok(()) => 0,
+                                Err(_) => 3,
+                            }
+                        }
+                        Handoff::NoSend | Handoff::WrongSender => 0,
+                        Handoff::ReportBusy => {
+                            sender.report_failure(&ExecError::new(
+                                ErrorCode::FailedPrecondition,
+                                IsolationStage::Seccomp,
+                                "busy",
+                            ));
+                            0
+                        }
+                        Handoff::WrongFd => {
+                            let (r, _w) = std::io::pipe().expect("pipe");
+                            match sender
+                                .hand_over(std::os::fd::OwnedFd::from(r), Duration::from_secs(5))
+                            {
+                                Ok(()) => 0,
+                                Err(_) => 3,
+                            }
+                        }
+                    }
+                });
+                send_report(report, &IntermediateReport::Pid1(pid(pid1)));
+                if mode == Handoff::WrongSender {
+                    // 中間プロセス(PID 1 とは別の pid)が送る。送信後に終了するので、C は回収した後でも読める。
+                    let (r, _w) = std::io::pipe().expect("pipe");
+                    let _ = sys::seccomp_notify::send_fd_with_token(
+                        listener_end.as_fd(),
+                        b'L',
+                        std::os::fd::OwnedFd::from(r).as_fd(),
+                    );
+                }
+                0
+            },
+            true,
+            &subreaper,
+            audit,
+            timeout,
+            &tag,
+            (crate::legacy_tiocsti::LegacyTiocsti::Absent, out_tx.as_fd()),
+        );
+        let elapsed = started.elapsed();
+        drop(pid_write);
+        let mut buf = [0u8; 4];
+        let _ = pid_read.read_exact(&mut buf);
+        (result, elapsed, u32::from_le_bytes(buf))
+    }
+
+    /// SEC-4・#2024: PID 1 が載せた実 listener を C が受け取り、種別・close-on-exec を満たす。PID 1 は ACK を
+    /// 受けて 0 で終了する。
+    #[test]
+    fn sec4_2024_launch_receives_a_verified_listener_and_acks() {
+        let (result, _, _) = run_handoff(Handoff::Good, Duration::from_secs(20));
+        let launched = result.expect("launch must succeed");
+        let listener = launched.listener.expect("listener");
+        let kind =
+            std::fs::read_link(format!("/proc/self/fd/{}", listener.as_fd().as_raw_fd())).unwrap();
+        assert_eq!(kind.to_str(), Some("anon_inode:seccomp notify"));
+        // PID 1 は hand_over の ACK を受けた場合だけ 0 で終了する(失敗は 3)。
+        assert_eq!(
+            launched
+                .child
+                .wait_for_exit(Duration::from_secs(10))
+                .unwrap(),
+            Some(ChildExit::Exited(0))
+        );
+    }
+
+    /// SEC-4・REPAIR-5・#2024: PID 1 が送らずに終了すると、C は期限(20 秒)を待たず EOF で起動を失敗させる。
+    #[test]
+    fn sec4_2024_launch_fails_fast_when_the_listener_never_arrives() {
+        let (result, elapsed, _) = run_handoff(Handoff::NoSend, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::Internal);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Seccomp);
+        assert!(failure.unreaped.is_empty());
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    /// SEC-4・#2024: listener 取得前の適用失敗(祖先に listener がある `EBUSY`)は EOF 由来の `Internal` に潰れず、
+    /// 段 `Seccomp` の `FailedPrecondition` として C に復元され、PID 1 は回収される。
+    #[test]
+    fn sec4_2024_launch_restores_failed_precondition_from_pre_listener_failure() {
+        let (result, elapsed, pid1) = run_handoff(Handoff::ReportBusy, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Seccomp);
+        assert_eq!(
+            failure.rejection.error.message,
+            "seccomp listener unavailable: an ancestor filter already has a listener, or the process state forbids it"
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    /// SEC-4・#2024: listener ではない fd を送ると拒否され、PID 1 は回収される(ACK は返らない)。
+    #[test]
+    fn sec4_2024_launch_rejects_a_non_listener_fd_and_reaps_pid1() {
+        let (result, _, pid1) = run_handoff(Handoff::WrongFd, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(
+            failure.rejection.error.message,
+            "the received fd is not a seccomp notification fd"
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+    }
+
+    /// SEC-4・#2024: PID 1 以外の送信元(pid の不一致)からの fd は拒否される。
+    #[test]
+    fn sec4_2024_launch_rejects_a_sender_other_than_pid1() {
+        let (result, _, pid1) = run_handoff(Handoff::WrongSender, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(
+            failure.rejection.error.message,
+            "the listener message came from an unexpected process"
+        );
+        assert!(gone(pid1));
     }
 
     /// 回収済みなら `/proc/<pid>` は残らない(ゾンビも残さない)。
@@ -2121,7 +2369,7 @@ mod tests {
         let started = Instant::now();
         let result = launch_via_intermediate(
             || true,
-            |status, _report, gate_r| {
+            |status, _report, gate_r, _listener_end| {
                 let _ = sys::fork_single_threaded_with_no_flush(
                     || true,
                     || {
@@ -2138,6 +2386,7 @@ mod tests {
                 // 報告せずに終了する。
                 EXIT_SETUP_FAILED
             },
+            false,
             &_subreaper,
             audit,
             Duration::from_secs(5),
@@ -2379,7 +2628,8 @@ mod tests {
         let (out_tx, _out_rx) = UnixStream::pair().unwrap();
         let result = launch_via_intermediate(
             || false,
-            |_, _, _| panic!("the intermediate must not run"),
+            |_, _, _, _| panic!("the intermediate must not run"),
+            false,
             &subreaper,
             audit,
             Duration::from_secs(1),

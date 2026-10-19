@@ -82,12 +82,9 @@
 //! `NetworkPlugin`〔NET 系〕の担当）、指定があれば作成が未実装のため上記のとおり `Unimplemented`。
 //! cgroup・time も作成が未実装で、指定が無ければ OCI の規定どおりランタイムの namespace を引き継ぐ
 //! （cgroup の分離・制限は TASK-32・CORE-3 の範囲。REPAIR-3: 未実装であることを明示する）。
-//! - `linux.uidMappings` / `gidMappings` が非空（config 指定の写像は subuid 範囲写像とともに
-//!   TASK-40・CORE-6 で対応する。SEC-5 の「コンテナ内 root をホストの非特権 UID へ写す」写像は
-//!   launcher の契約で、本番 launcher は権限モデルに応じて呼び出しプロセスの euid / egid へ写す単一 ID 写像
-//!   (`RootlessSingleId`)か、起動ユーザーの `/etc/subuid`・`/etc/subgid` 由来の範囲写像
-//!   (`RootlessSubordinateIds`。#2009)を使う。config 指定の写像を受理するかは SEC-5 に関わるオーナー判断で
-//!   確認待ちのため、ここでは拒否のまま。`ProcessLauncher` 参照）
+//! - `linux.uidMappings` / `gidMappings` が非空（`reject_config_id_mappings`。SEC-5・CORE-6・TASK-40。
+//!   写像は launcher が権限モデルから導く。受けるかはオーナー判断待ちで #2240 と
+//!   `docs/design/config-id-mappings.md` に判断材料があり、決まるまで拒否のまま）
 //! - `root.readonly` が true（読み取り専用 rootfs 未実装）
 //! - `linux.readonlyPaths` / `maskedPaths` が暗黙の `/dev`・`/dev/pts`・`/dev/shm` と同じか祖先を指す
 //!   （`InvalidArgument`。fork・予約より前。SEC-2・CORE-5・#2015。子孫は受ける）
@@ -1158,13 +1155,27 @@ fn is_same_or_ancestor(candidate: &str, target: &str) -> bool {
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// config の `linux.uidMappings` / `gidMappings` が非空なら `Unimplemented` で拒否する（空配列は受ける）。
+///
+/// `start` の fork・予約より前に呼ばれる。ID 写像は launcher が権限モデルから導く（`RootlessSingleId` は
+/// 呼び出し側の euid / egid の単一写像、`RootlessSubordinateIds` は `/etc/subuid`・`/etc/subgid` の範囲写像）ため、
+/// config 指定を受けると SEC-5（コンテナ内 root をホストの非特権 UID へ写す）の契約を迂回しうる。
+/// 受けるか拒むかはオーナー判断待ち（#2240。SEC-5・CORE-6・TASK-40。判断材料は
+/// `docs/design/config-id-mappings.md`）。未決定のため code は `Unimplemented` のままで、
+/// 「拒むと決まった」場合は `InvalidArgument` へ替える案がある（REPAIR-3）。config の誤りであり
+/// 脱出の試行ではないため監査には記録しない。
+fn reject_config_id_mappings(config: &OciConfig) -> Result<(), TraitError> {
+    if !config.uid_mappings().is_empty() || !config.gid_mappings().is_empty() {
+        return Err(unsupported("linux.uidMappings / linux.gidMappings"));
+    }
+    Ok(())
+}
+
 fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
     if config.root().readonly() {
         return Err(unsupported("root.readonly"));
     }
-    if !config.uid_mappings().is_empty() || !config.gid_mappings().is_empty() {
-        return Err(unsupported("linux.uidMappings / linux.gidMappings"));
-    }
+    reject_config_id_mappings(config)?;
     for ns in config.namespaces() {
         if ns.path().is_some() {
             return Err(unsupported("linux.namespaces[].path"));
@@ -2010,6 +2021,36 @@ mod tests {
                 err.message()
             );
         }
+    }
+
+    /// SEC-5・CORE-6・TASK-40（#2240）: config 指定の ID 写像は uid のみ・gid のみ・両方のどれでも
+    /// `Unimplemented` と固定文言で拒否し（launcher 呼び出し 0 回・状態は Created のまま）、空配列は受ける。
+    #[test]
+    fn sec5_core6_start_rejects_config_id_mappings() {
+        let map = json!([{"containerID": 0, "hostID": 1000, "size": 1}]);
+        let cases: Vec<(&str, Value, Value)> = vec![
+            ("uid", map.clone(), json!([])),
+            ("gid", json!([]), map.clone()),
+            ("both", map.clone(), map.clone()),
+        ];
+        for (name, uid, gid) in cases {
+            let mut cfg = valid_config();
+            cfg["linux"]["uidMappings"] = uid;
+            cfg["linux"]["gidMappings"] = gid;
+            let err = start_rejected_after_rewrite(&format!("idmap-{name}"), &cfg);
+            assert_eq!(err.code(), ErrorCode::Unimplemented, "case {name}");
+            assert_eq!(
+                err.message(),
+                "start does not support yet: linux.uidMappings / linux.gidMappings",
+                "case {name}"
+            );
+        }
+        let mut cfg = valid_config();
+        cfg["linux"]["uidMappings"] = json!([]);
+        cfg["linux"]["gidMappings"] = json!([]);
+        let bytes = serde_json::to_vec(&cfg).expect("json");
+        let parsed = super::super::config::parse_config_bytes(&bytes).expect("parse");
+        reject_config_id_mappings(&parsed).expect("empty arrays are accepted");
     }
 
     /// OCI-1・SEC-5: `process.cwd` と非 root の `process.user`（uid・gid）は start で拒否せず、検証済みの値として

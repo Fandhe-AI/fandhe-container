@@ -15,7 +15,9 @@
 //! # 識別的な検査と網羅確認
 //! - 識別的（capability 不足ではなく seccomp が拒否したことを示せる）: `kcmp(自 pid, 自 pid, KCMP_VM)`
 //!   （フィルタが無ければ成功）・`/proc/thread-self/status` の `Seccomp: 2`。
-//!   禁止対象外の対照（`/proc` の読み出し）が動くことも確認する
+//!   禁止対象外の対照（`/proc` の読み出し）が動くことも確認する。適用前の対照として、組み込み段を載せる前に
+//!   `kcmp(自 pid, 自 pid)` が成功することも要求する（`Seccomp: 0` の検査では見分けられない、seccomp 以外の理由で
+//!   kcmp が通らない環境〔kcmp 非対応のカーネル・LSM〕と外側の拒否を検出する。満たさなければ skip せず前提欠如として失敗。#2234）
 //! - 網羅確認: `mount`・`pivot_root`・`umount2` が `EPERM`。capability 不足でも
 //!   `EPERM` になり得るため、識別的な根拠とは扱わない
 //! - 強制終了: `unshare`・`ptrace`・`kexec_load` は別の子で SIGSYS 終了（`ChildExit::Signaled(31)`）。
@@ -162,7 +164,9 @@ mod linux {
         StagePipeline, isolate, isolate_rootful_host_root, plan, plan_rootful_host_root,
         spawn_container_probe, spawn_container_seccomp_probe,
     };
-    use fandhe_container_core::exec::{EscapeSyscallProbe, probe_escape_syscall};
+    use fandhe_container_core::exec::{
+        EscapeSyscallProbe, probe_escape_syscall, probe_kcmp_self_for_test,
+    };
 
     /// Linux の `EPERM`（x86_64・aarch64 共通で 1）。
     const EPERM: i32 = 1;
@@ -328,6 +332,15 @@ mod linux {
         // 適用前の対照観測: このシナリオ自身（= 組み込み段を載せる前）に seccomp フィルタが無いこと。
         // 継承したフィルタ（コンテナ・サンドボックス上のテストランナー等）が既にあると、後段の
         // `Seccomp: 2` や `EPERM` は組み込みフィルタの成果と区別できないため、失敗として扱う（CORE-5・REPAIR-12）。
+        // 適用前の kcmp 対照: 組み込み段の前で kcmp が成功すること。外側の拒否（seccomp・LSM・kcmp 非対応）は
+        // `Seccomp: 0` の検査では見分けられないため、skip せず前提欠如として失敗させる（CORE-5・ESC-06・#2234）。
+        let kcmp_before = probe_kcmp_self_for_test();
+        assert_eq!(
+            kcmp_before,
+            ProbeOutcome::Ok,
+            "precondition failed: kcmp(self, self) must succeed before the built-in seccomp stage (got {kcmp_before:?}, Seccomp: {}); the outer environment already denies kcmp (e.g. Docker's default seccomp profile, a kernel without kcmp, or an LSM), so EPERM inside the container cannot be attributed to the built-in filter",
+            seccomp_mode_of_self()
+        );
         assert_eq!(
             seccomp_mode_of_self(),
             "0",
@@ -391,7 +404,11 @@ mod linux {
 
         // 識別的な検査（フィルタが無ければ kcmp は成功する）。
         assert_eq!(rec.seccomp_mode, "2", "SECCOMP_MODE_FILTER");
-        assert_eq!(rec.kcmp, ProbeOutcome::Errno(EPERM), "kcmp blocked");
+        assert_eq!(
+            rec.kcmp,
+            ProbeOutcome::Errno(EPERM),
+            "kcmp blocked by the built-in filter (the pre-stage control succeeded)"
+        );
         // 対照: 禁止対象外の操作は引き続き動く。
         assert_eq!(rec.control, ProbeOutcome::Ok, "control read of /proc");
         // 網羅確認（capability 不足でも EPERM になり得るため識別的な根拠ではない）。

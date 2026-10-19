@@ -73,7 +73,7 @@
 //!   許すかはオーナー判断待ちで #2241・`docs/design/rootful-host-root.md`)は、決まるまで `Unimplemented` で拒否する
 //! - **範囲写像の入力元**: `/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap`(`SubordinateIdSource`)
 //!   だけ。config の `linux.uidMappings` / `gidMappings` は `start` が引き続き拒否する(受理は SEC-5 に関わる
-//!   オーナー判断事項で、確認待ち)。supervisor が `RootlessSubordinateIds` を選ぶ経路は結線済み(#2243。subuid / subgid の設定の有無で選ぶ)
+//!   オーナー判断事項で、#2240 で判断待ち。`docs/design/config-id-mappings.md`)。supervisor が `RootlessSubordinateIds` を選ぶ経路は結線済み(#2243。subuid / subgid の設定の有無で選ぶ)
 //! - **mapper と helper の回収**: mapper は I が fork 前に設定した `LaunchTag` を継承するため、I が期限で殺されて
 //!   C へ再親付けされても `rescan` の探索対象になる。I は範囲写像の失敗時に mapper を kill せず `R` を報告し、C が
 //!   I の回収後に同じ探索で回収する。mapper が起動する `newuidmap` / `newgidmap`(helper)は exec で `comm` が
@@ -595,6 +595,8 @@ struct Spawned {
     child: ContainerChild,
     stdout: std::io::PipeReader,
     stderr: std::io::PipeReader,
+    /// PID 1 から受け取った seccomp の listener(SEC-4・#2024)。本番の入口は必ず `Some`。偽の launcher は `None`。
+    listener: Option<crate::exec::SeccompListener>,
 }
 
 /// コンテナ ID ごとの起動結果(起動台帳の 1 件。モジュール doc「起動台帳と `confirm_no_process`」)。
@@ -913,6 +915,7 @@ impl Inner {
             child,
             stdout,
             stderr,
+            listener,
         } = spawned;
         // pid 0 は実在する子ではない(`kill(0)` は自プロセスグループへ届くため、触らずに拒否する)。
         if child.pid() == 0 {
@@ -933,6 +936,7 @@ impl Inner {
         let owner = id.clone();
         let process = super::launch::ContainerChildProcess::new(child)?
             .with_output(stdout, stderr)
+            .with_seccomp_listener(listener)
             .with_launch_isolation(isolation_record)
             .with_exit_audit(Arc::clone(&self.audit_sink), id.clone())
             .with_reap_notice(Box::new(move || {
@@ -1358,7 +1362,7 @@ impl LaunchOps for RealOps {
             status: None,
             working_dir: Some(input.spec.working_dir()),
         };
-        let child = spawn_container_via_intermediate(
+        let launched = spawn_container_via_intermediate(
             IntermediateSpec {
                 plan: isolation_plan,
                 rootfs: input.spec.rootfs(),
@@ -1372,9 +1376,10 @@ impl LaunchOps for RealOps {
             input.timeout,
         )?;
         Ok(Spawned {
-            child,
+            child: launched.child,
             stdout,
             stderr,
+            listener: launched.listener,
         })
     }
 
@@ -1586,6 +1591,7 @@ mod tests {
                 child,
                 stdout,
                 stderr,
+                listener: None,
             })
         }
 

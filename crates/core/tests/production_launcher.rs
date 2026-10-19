@@ -44,6 +44,11 @@
 //! - シナリオ K（exec 後の seccomp の識別的な拒否。#2012・SEC-2・CORE-5）: コンテナ内プローブ（`--seccomp-kill <name>`）が
 //!   `unshare` / `ptrace` / `kexec_load` を 1 件ずつ別の start で発行し、`ProcessExit::Signaled(31)`（SIGSYS。
 //!   `SECCOMP_RET_KILL_PROCESS`）で終了することを照合する。フィルタが無ければ `unshare(0)` は成功して戻るため識別的になる
+//! - シナリオ P（名前だけの `process.args[0]`。#2314・OCI-1・TASK-55 追補）: `args[0]` が `probe`（`/` 無し）、`process.env` の
+//!   `PATH` が `/nonexistent:/opt/bin:/usr/local/bin` で、`/opt/bin/probe` は実行ビット無し・`/usr/local/bin/probe` が実行可能
+//!   （`/probe` は削除して絶対パスの経路を断つ）。pivot 後に解決されて PID 1 として起動し、コンテナ内プローブが `READY` を
+//!   出して終了コード 7（`ProcessExit::Exited(7)`）で終わることを照合する。`PATH` のどこにも無い名前は `start` の失敗
+//!   （状態は Created のまま）か終了コード 127 で、成功起動にならず子も残らない
 //! - root で実行された場合: 主経路は非 root（SEC-5）。launch が拒否され、状態が Created に戻り、子が残らないことだけを
 //!   照合する（コンテナ内 root をホスト root へ写す起動は試さない）
 //!
@@ -375,6 +380,13 @@ mod linux {
             emit(format!("BIND_OPTS {opts}"));
         }
         emit(PROBE_READY.to_string());
+        // シナリオ P（名前だけの args[0]。#2314）: READY の後に指定の終了コードで終わる。
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(pos) = args.iter().position(|a| a == "--exit-code")
+            && let Some(code) = args.get(pos + 1).and_then(|c| c.parse::<i32>().ok())
+        {
+            std::process::exit(code);
+        }
         loop {
             std::thread::sleep(Duration::from_secs(3600));
         }
@@ -783,6 +795,7 @@ mod linux {
         scenario_l_working_dir(&env, tag);
         scenario_m_n_working_dir_refused(&env, tag);
         scenario_o_user_outside_mapping_refused(&env, tag);
+        scenario_p_bare_name_entrypoint(&env, tag);
         if subordinate_requested() {
             scenario_i_user_applied(tag);
         }
@@ -1803,6 +1816,145 @@ mod linux {
                 "no child may remain after terminate"
             );
         }
+    }
+
+    /// シナリオ P（OCI-1・TASK-55 追補・#2314）: 名前だけの `process.args[0]` を、コンテナ内の `process.env` の
+    /// `PATH` で pivot 後に解決して実行する。`PATH` の前方にある実行ビットの無い同名ファイルは飛ばし、後方の
+    /// 実行可能な `probe` を PID 1 として起動し、コンテナ内プローブの `READY` と具体値の終了コード 7 を照合する。
+    /// `PATH` のどこにも無い名前は、`start` が失敗するか子が終了コード 127 で終わる（`exec` 層の `NotFound` と
+    /// 同じ。どちらでも子が残らず、成功起動には決してならない）。
+    fn scenario_p_bare_name_entrypoint(env: &Env, tag: u32) {
+        const EXIT_CODE: i32 = 7;
+        let write_named = |bundle: &Bundle, ld: &str, path_env: &str, name: &str| {
+            let config = json!({
+                "ociVersion": "1.2.0",
+                "root": {"path": "rootfs", "readonly": false},
+                "hostname": HOSTNAME,
+                "process": {
+                    "user": {"uid": 0, "gid": 0},
+                    "args": [name, "--container-probe", "--exit-code", EXIT_CODE.to_string()],
+                    "env": [
+                        format!("PATH={path_env}"),
+                        "TERM=dumb",
+                        format!("LD_LIBRARY_PATH={ld}"),
+                    ],
+                    "cwd": "/"
+                },
+                "mounts": [],
+                "linux": {"namespaces": [
+                    {"type": "pid"}, {"type": "mount"}, {"type": "uts"}, {"type": "ipc"}, {"type": "user"}
+                ]}
+            });
+            std::fs::write(
+                bundle.dir.join("config.json"),
+                serde_json::to_vec(&config).expect("serialize config"),
+            )
+            .expect("write config.json");
+        };
+
+        // P1: 前方の非実行ファイルを飛ばして後方の実行可能ファイルを解決し、終了コード 7 で終わる。
+        let bundle = Bundle::new("p1");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        let root = bundle.rootfs();
+        mkdir(&root.join("opt/bin"));
+        mkdir(&root.join("usr/local/bin"));
+        std::fs::write(root.join("opt/bin/probe"), b"not executable\n").expect("decoy");
+        std::fs::set_permissions(
+            root.join("opt/bin/probe"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .expect("chmod decoy");
+        std::fs::copy(root.join("probe"), root.join("usr/local/bin/probe")).expect("copy probe");
+        std::fs::set_permissions(
+            root.join("usr/local/bin/probe"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .expect("chmod probe");
+        // `/probe` が絶対パスの経路で拾われないよう、名前の解決は PATH だけに頼らせる。
+        std::fs::remove_file(root.join("probe")).expect("remove /probe");
+        write_named(
+            &bundle,
+            &ld,
+            "/nonexistent:/opt/bin:/usr/local/bin",
+            "probe",
+        );
+        let id = ContainerId::new(format!("plp1{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            let output = started.process().take_output().expect("container output");
+            let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+            reader_slot = Some((rx, reader));
+            let exit = started
+                .process()
+                .wait(timeout())
+                .expect("wait for the probe")
+                .expect("the probe did not exit within the timeout");
+            assert_eq!(exit, ProcessExit::Exited(EXIT_CODE), "resolved probe exit");
+            let mut lines = Vec::new();
+            let rx = &reader_slot.as_ref().expect("reader slot").0;
+            let deadline = Instant::now() + timeout();
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match rx.recv_timeout(left) {
+                    Ok(line) => lines.push(line),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        panic!("probe output did not reach EOF; got {lines:?}")
+                    }
+                }
+            }
+            assert_eq!(value_of(&lines, "PID"), "1");
+            assert!(lines.contains(&PROBE_READY.to_string()), "{lines:?}");
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(eventually(|| children_of_self().is_empty()));
+
+        // P2: PATH のどこにも無い名前は成功起動にならない（start の失敗なら Created のまま、起動後なら 127）。
+        let bundle = Bundle::new("p2");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_named(&bundle, &ld, "/nonexistent:/opt/bin", "probe");
+        let id = ContainerId::new(format!("plp2{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        match start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        ) {
+            Err(e) => {
+                println!(
+                    "production_launcher: scenario=p2 start refused code={:?}",
+                    e.code()
+                );
+                assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+            }
+            Ok(started) => {
+                let exit = started.process().wait(timeout());
+                let (_record, process) = started.into_parts();
+                let _ = process.terminate(timeout());
+                assert_eq!(exit.expect("wait"), Some(ProcessExit::Exited(127)));
+            }
+        }
+        assert!(eventually(|| children_of_self().is_empty()));
+        println!(
+            "production_launcher: scenario=bare-name resolved via PATH, exit code {EXIT_CODE}; missing name not started"
+        );
     }
 
     /// root 実行: launch が拒否され、状態は Created に戻り、子が残らない（SEC-5。成功起動は試さない）。

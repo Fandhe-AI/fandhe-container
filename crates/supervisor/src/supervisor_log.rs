@@ -8,7 +8,7 @@
 //!
 //! # 保存先と名前
 //! - ディレクトリ: `<state_root>/@supervisor-logs/`（unix では 0700）。`@` で始まる名前は `ContainerId` にならないため、
-//!   core の `FileStateStore` はコンテナ ID として扱わず、コンテナのログ（`<root>/logs`）とも衝突しない
+//!   core の `FileStateStore` はコンテナ ID として扱わず、コンテナのログ（`<root>/@container-logs`）とも衝突しない
 //! - ファイル: [`RotatingFileSink`] の名前空間どおり `<id>.log`（現在）・`.log.1`・`.log.2`（世代）・`.log.lock`（排他）。
 //!   記録は 1 行ごとに `stderr <JSON 1 行>`（コンテナログと同じ形式と読み出し入口）
 //! - 権限・作成: ファイルは 0600 で `create_new` のみ、既存の現在ログは開かず世代へ退避する。symlink・ディレクトリ・

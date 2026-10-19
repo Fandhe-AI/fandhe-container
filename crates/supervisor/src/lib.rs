@@ -19,7 +19,7 @@
 //! | #493 | TASK-161.1 | healthcheck 定義パース（[`healthcheck`]。実装済み。実行・周期は #495、`health` 反映は #496 で未実装） |
 //! | #241 | TASK-157.7 | logs 捕捉の土台（実装済み。永続化・ローテーションは #506 で実装） |
 //! | #505 | TASK-164.1 | 行単位捕捉（実装は #241。バッファ境界跨ぎを検証済み。ローテーション書き込みは #506） |
-//! | #506 | TASK-164.2 | ローテーションログ書き込み（[`logs::rotating`]。実装済み。Windows の世代 rename の共有違反は有界再試行・ロックのファイル ID 照合・読み出し入口 `open_for_read` は #1470 で追補。フラッシュ制御は #507、100 万行規模の欠落 0・重複 0 検証は #508 で `tests/log_rotation.rs` に実装済み。ロックファイルの掃除は #1469 で `remove_all`・`open` 失敗時の削除を追加。`logs` 読み出し〔ログ名の列挙 `log_file_paths` のみ実装済み〕・実パイプ取得も未実装） |
+//! | #506 | TASK-164.2 | ローテーションログ書き込み（[`logs::rotating`]。実装済み。Windows の世代 rename の共有違反は有界再試行・ロックのファイル ID 照合・読み出し入口 `open_for_read` は #1470 で追補。フラッシュ制御は #507、100 万行規模の欠落 0・重複 0 検証は #508 で `tests/log_rotation.rs` に実装済み。ロックファイルの掃除は #1469 で `remove_all`・`open` 失敗時の削除を追加。`logs` 読み出しは #1543 で `logs::read_container_log` を実装済み・実パイプ取得も未実装） |
 //! | #242 | TASK-157.8 | 結合テスト |
 //! | #500 | TASK-163.1 | exec: pid1 特定・setns（`exec`。実装済み。コマンド実行は未実装） |
 //! | #501 | TASK-163.2 | exec: cgroup join（`exec`。実装済み。コマンド実行は未実装） |
@@ -39,6 +39,7 @@
 //! | #1819 | TASK-157 追補 | `ProductionStartDeps` を core の本番 launcher（`ProductionLauncher`）へ結線（手順 8 は入口スレッドが直接行う）。restart の再 launch は単一スレッドの要求を満たせず fail-closed（#2043）。実機前提の通し試験は `tests/supervisor_bin_real.rs`。REPAIR-3 |
 //! | #1475 | TASK-171.1.3 | 権限昇格の実体 `privilege::elevate`（承認済みの方式〔#1454〕。縮退の syscall 適用と読み戻し検証は実装済み。fd 検証付き exec・入口検証・ランチャー bin は #1719 で実装） |
 //! | #1719 | TASK-171 追補 | 特権ランチャー bin `fandhe-container-launcher`（[`launcher`]。入口検証 → `elevate` → 検証済み fd の `execveat`。hash / 署名照合・ambient の子での解除〔healthcheck exec。#495〕・実機検証〔#538・#539〕は未実装。REPAIR-3） |
+//! | #1543 | TASK-79 追補 | `logs` でコンテナログの内容を読み出す（[`logs::reader`]。ディレクトリは `<root>/@container-logs`。CLI-1・SUP-7） |
 //! | #2067 | TASK-79 追補 | supervisor の構造化ログ（stderr）の保存先（[`supervisor_log`]。`<root>/@supervisor-logs/<id>.log*`。REPAIR-4） |
 //! | #2133 | CORE-3・CORE-4 | systemd user マネージャへの到達検査（`user_scope`。Linux のみ。CLI の start・doctor とベンチが共有） |
 //! | #2243 | TASK-157 追補 | rootless の ID 写像モデルの選択（`RootlessSingleId` か範囲写像 `RootlessSubordinateIds` か。条件と所有者名の取得は `id_model`、結線は `ProductionStartDeps`）。CORE-6・SEC-5。実機での確認は #1621 |

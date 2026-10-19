@@ -371,7 +371,7 @@ mod tests {
                         ""
                     },
                 ),
-                Command::Logs => (vec!["logs", "c1"], if linux { 8 } else { 5 }, ""),
+                Command::Logs => (vec!["logs", "c1"], if linux { 0 } else { 5 }, ""),
                 Command::Image => (
                     vec!["image", "ls", "--image-root", &ir],
                     if linux { 0 } else { 5 },

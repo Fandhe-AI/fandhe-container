@@ -9,9 +9,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|image|system|setup|doctor>\"}\n";
-#[cfg(target_os = "linux")]
-const UNIMPLEMENTED_JSON: &str =
-    "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n";
 
 /// 子プロセスの終了を待つ上限（REPAIR-5）。超過時は kill して失敗させる。
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -923,7 +920,7 @@ fn sec1_stop_delete_fail_closed_off_linux() {
 }
 
 /// CLI-1・ERR-2: Linux で list は stdout にタブ区切りの一覧を出し（0 件はヘッダのみ・ID 昇順）、
-/// logs は不正 ID が 2、未作成が 3、存在する対象は内容未実装のため 8（stdout は空）。
+/// logs は不正 ID が 2、未作成が 3、ログの無い対象は空の成功（0）、世代をまたぐログは古い順にバイト単位で出る（#1543）。
 #[cfg(target_os = "linux")]
 #[test]
 fn cli1_list_logs_flow_on_linux() {
@@ -963,11 +960,23 @@ fn cli1_list_logs_flow_on_linux() {
         3,
         "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
     );
-    assert_failure(
-        &run(&["--root", root_s, "logs", "a1"]),
-        8,
-        UNIMPLEMENTED_JSON,
-    );
+    let out = run(&["--root", root_s, "logs", "a1"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    assert!(out.stderr.is_empty());
+    // 世代をまたぐログ（supervisor が書く `@container-logs` と同じ配置）は古い順に連結される。
+    let dir = fandhe_container_supervisor::logs::container_log_dir(&root);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(&dir).expect("logdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    std::fs::write(dir.join("a1.log.1"), b"stdout one\n").expect("g1");
+    std::fs::write(dir.join("a1.log"), b"stderr two\nstdout three\n").expect("cur");
+    let out = run(&["--root", root_s, "logs", "a1"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"stdout one\nstderr two\nstdout three\n");
+    assert!(out.stderr.is_empty());
     assert_failure(
         &run(&["--root", root_s, "logs", "a/b"]),
         2,

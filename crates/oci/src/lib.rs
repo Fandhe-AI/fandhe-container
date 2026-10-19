@@ -51,7 +51,7 @@
 //! 未実装（スタブではなく後続 issue の担当）: キャッシュ・`image ls`/`rm`/`tag`（TASK-52〜55・TASK-183〜184）。`RegistryClient` の通信は匿名トークン取得・
 //! manifest 取得・blob 取得のみ。
 //! 実装済み: ローカルイメージ管理の参照テーブルのデータ構造と登録・解除・カウント API（TASK-183.1・OCI-7・MS-4・#472。
-//! `image_management`）と、ストア単位の排他区間（TASK-183.2・OCI-7・#473。`image_management::ImageStore`）。`image ls`/`system df` の集計 API（TASK-183.3・#478）と `image tag` の API（TASK-183.4・#479）も実装済み。
+//! `image_management`）と、ストア単位の排他区間（TASK-183.2・OCI-7・#473。`image_management::ImageStore`）。`image ls`/`system df` の集計 API（TASK-183.3・#478）と `image rm`（既定・`--force`・実削除。TASK-183.5/183.6・#480/#481）と `image tag` の API（TASK-183.4・#479）も実装済み。
 //! 永続化・GC・`image rm`/`tag`/`prune` の CLI 経路は未実装。
 //! PLUG-1 区分は core（crate-naming.md）。
 

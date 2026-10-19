@@ -1120,6 +1120,9 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::Mutex;
 
+    // 規約(#2249): 複数スレッドの試験プロセスの fork 子から更に fork するときは flush しない版
+    // (`fork_single_threaded_with_no_flush`)を使う。fork 子は他スレッドが握っていた stdout / stderr の
+    // ロックを引き継ぐため、flush する版だと子の中で永久に止まり得る(本番の spawn_pid1・mapper も flush しない)。
     use super::*;
     use crate::audit_log::{AuditLayer, AuditRecord, AuditSink};
     use crate::exec::ViolationReason;
@@ -1363,8 +1366,9 @@ mod tests {
         pid_write: &std::fs::File,
         body: impl FnOnce(&std::fs::File) -> i32,
     ) -> u32 {
-        let pid = sys::fork_single_threaded_with(|| true, || body(status), EXIT_SETUP_FAILED)
-            .expect("fork the stand-in");
+        let pid =
+            sys::fork_single_threaded_with_no_flush(|| true, || body(status), EXIT_SETUP_FAILED)
+                .expect("fork the stand-in");
         let mut w = pid_write;
         let _ = w.write_all(&pid.to_le_bytes());
         pid
@@ -1435,13 +1439,13 @@ mod tests {
         pid_write: &std::fs::File,
         ready_w: &std::io::PipeWriter,
     ) -> Result<u32, sys::SysError> {
-        sys::fork_single_threaded_with(
+        sys::fork_single_threaded_with_no_flush(
             || true,
             || {
                 if sys::new_session().is_err() {
                     return EXIT_SETUP_FAILED;
                 }
-                let helper = sys::fork_single_threaded_with(
+                let helper = sys::fork_single_threaded_with_no_flush(
                     || true,
                     || {
                         if sys::set_process_comm(b"notatag-helper\0\0").is_err() {
@@ -1629,7 +1633,7 @@ mod tests {
     /// 識別子を設定し、自分のセッションを作って子孫を起動する代役(mapper 相当)を fork する。`body` は代役の中で
     /// 子孫を作り、pid をテストへ渡す。
     fn fork_tagged_session_leader(tag: LaunchTag, body: impl FnOnce() -> i32) -> u32 {
-        sys::fork_single_threaded_with(
+        sys::fork_single_threaded_with_no_flush(
             || true,
             || {
                 if sys::set_process_comm(tag.comm_bytes()).is_err() || sys::new_session().is_err() {
@@ -1671,7 +1675,7 @@ mod tests {
         let (mut ready_read, ready_write) = std::io::pipe().unwrap();
         let ready_write = std::fs::File::from(std::os::fd::OwnedFd::from(ready_write));
         let mapper = fork_tagged_session_leader(tag, || {
-            let helper = sys::fork_single_threaded_with(
+            let helper = sys::fork_single_threaded_with_no_flush(
                 || true,
                 || {
                     if sys::set_process_comm(b"notatag-helper\0\0").is_err() {
@@ -1722,13 +1726,13 @@ mod tests {
         let (mut ready_read, ready_write) = std::io::pipe().unwrap();
         let ready_write = std::fs::File::from(std::os::fd::OwnedFd::from(ready_write));
         let mapper = fork_tagged_session_leader(tag, || {
-            let helper = sys::fork_single_threaded_with(
+            let helper = sys::fork_single_threaded_with_no_flush(
                 || true,
                 || {
                     if sys::set_process_comm(b"notatag-helper\0\0").is_err() {
                         return EXIT_SETUP_FAILED;
                     }
-                    let grandchild = sys::fork_single_threaded_with(
+                    let grandchild = sys::fork_single_threaded_with_no_flush(
                         || true,
                         || {
                             let _ = sys::set_process_comm(b"notatag-grand\0\0\0");
@@ -1825,6 +1829,36 @@ mod tests {
     #[test]
     fn core1_via_intermediate_success_returns_adopted_pid1() {
         let (result, sink, pid1) = run(Behavior::Ready, Duration::from_secs(10));
+        let child = result.unwrap();
+        assert_eq!(Some(child.pid()), pid1);
+        assert!(child.pidfd().is_some());
+        assert_eq!(
+            child.wait_timeout(Duration::from_secs(10)).unwrap(),
+            ChildExit::Exited(0)
+        );
+        assert!(sink.0.lock().unwrap().is_empty());
+    }
+
+    /// CORE-1・REPAIR-5・REPAIR-12(#2249): 他スレッドが stdout / stderr のロックを握っている間に fork しても、
+    /// 入れ子の代役の fork が flush で止まらず成功する(修正前は中間プロセスが報告せず Timeout になった)。
+    #[test]
+    fn repair12_2249_stand_in_fork_ignores_stdio_locks_held_by_other_threads() {
+        use std::sync::mpsc;
+        let (held_tx, held_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _out = std::io::stdout().lock();
+            let _err = std::io::stderr().lock();
+            let _ = held_tx.send(());
+            // 解放の合図か送信側の drop、最長 30 秒で必ず抜ける。
+            let _ = release_rx.recv_timeout(Duration::from_secs(30));
+        });
+        held_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("lock holder ready");
+        let (result, sink, pid1) = run(Behavior::Ready, Duration::from_secs(10));
+        drop(release_tx);
+        holder.join().unwrap();
         let child = result.unwrap();
         assert_eq!(Some(child.pid()), pid1);
         assert!(child.pidfd().is_some());
@@ -1955,7 +1989,7 @@ mod tests {
         let tag = LaunchTag::fresh();
         let (mut ready_read, ready_write) = std::io::pipe().unwrap();
         let ready_write = std::fs::File::from(std::os::fd::OwnedFd::from(ready_write));
-        let pid1 = sys::fork_single_threaded_with(
+        let pid1 = sys::fork_single_threaded_with_no_flush(
             || true,
             || {
                 if sys::set_process_comm(tag.comm_bytes()).is_err() {
@@ -1988,7 +2022,7 @@ mod tests {
         let tag = LaunchTag::fresh();
         let (mut ready_read, ready_write) = std::io::pipe().unwrap();
         let ready_write = std::fs::File::from(std::os::fd::OwnedFd::from(ready_write));
-        let mapper = sys::fork_single_threaded_with(
+        let mapper = sys::fork_single_threaded_with_no_flush(
             || true,
             || {
                 if sys::set_process_comm(tag.comm_bytes()).is_err() {
@@ -1996,7 +2030,7 @@ mod tests {
                 }
                 // 識別子を持たない子(exec 後の helper 相当)。comm を別名にし、設定後に自分の pid を報告する
                 // (comm を継承したままでは、回収漏れがタグ探索で拾われて検出できない。REPAIR-12)。
-                let helper = sys::fork_single_threaded_with(
+                let helper = sys::fork_single_threaded_with_no_flush(
                     || true,
                     || {
                         if sys::set_process_comm(b"notatag-helper\0\0").is_err() {
@@ -2046,7 +2080,7 @@ mod tests {
         let result = launch_via_intermediate(
             || true,
             |status, _report, gate_r| {
-                let _ = sys::fork_single_threaded_with(
+                let _ = sys::fork_single_threaded_with_no_flush(
                     || true,
                     || {
                         let waited = Instant::now();

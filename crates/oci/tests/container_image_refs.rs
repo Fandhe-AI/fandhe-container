@@ -3,6 +3,11 @@
 //! core の `ContainerImageRefs` を `ImageStore` で満たす試験用アダプタ（本番のアダプタは後続。core は
 //! oci に依存しないため、oci 側の試験が dev 依存の core を使って通しを確かめる）を介し、
 //! `create_with_image` の後は参照が 1 件、`delete_releasing_image_ref` の後は 0 件になることを確かめる。
+//!
+//! ファイルベースの `StateStore` は Linux 以外では `Unimplemented` を返す仕様のため、この通し試験は Linux 限定。
+//! Linux 以外で何を確かめるかは `container_image_refs_non_linux.rs` に置く（#2325）。
+
+#![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
 

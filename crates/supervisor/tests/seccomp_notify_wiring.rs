@@ -318,16 +318,21 @@ fn sec4_2025_missing_listener_disposes_the_process_and_fails() {
         launches: AtomicUsize::new(0),
         probes: Mutex::new(Vec::new()),
     });
-    let running = start(&env, &launcher, &hub);
     let started = Instant::now();
-    let code = run_supervised(
-        env.store.clone(),
-        ContainerId::new(&env.id).unwrap(),
-        running,
-        RestartPolicy::No,
+    let mut out = Vec::new();
+    let result = run_start(
+        Box::new(Deps {
+            launcher: launcher.clone(),
+            hub: Arc::clone(&hub),
+        }),
+        &env.store,
+        &Arc::new(OpRecorder::new()),
+        &StartRequest::new(ContainerId::new(&env.id).unwrap()),
         &timeouts(),
-        &StopToken::new(),
+        &mut out,
     );
-    assert_ne!(code, 0);
+    assert!(result.is_err(), "start must fail without a listener");
+    assert_ne!(result.err().map(NonZeroU8::get), Some(0));
+    assert!(!out.is_empty(), "the ERR line must be reported");
     assert!(started.elapsed() < Duration::from_secs(10));
 }

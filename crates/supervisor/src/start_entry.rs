@@ -661,14 +661,8 @@ fn start_reporting(
                 // 応答ハブの開始を成功報告の前に済ませる（報告の後に失敗すると、CLI へ成功を返したコンテナを
                 // 回収して非 0 で終えることになるため。失敗なら回収して ERR を報告する。ERR-1・ERR-2・SEC-4）。
                 #[cfg(target_os = "linux")]
-                let running = match attach_seccomp_before_report(running, store, req.id(), timeouts)
-                {
-                    Ok(r) => r,
-                    Err((error, code)) => {
-                        report(out, &StartReport::failed(&error));
-                        return Err(code);
-                    }
-                };
+                let running =
+                    attach_seccomp_before_report(running, store, req.id(), timeouts, out)?;
                 report(
                     out,
                     &StartReport::Started {
@@ -712,14 +706,16 @@ fn start_reporting(
 }
 
 /// 成功報告の前に seccomp の応答ハブへ初回の listener を渡す。ハブが無い・渡し済みなら何もしない。
-/// 渡せなければ起動したプロセスを回収して `Stopped` を記録し、報告する失敗と終了コードを返す（fail-closed）。
+/// 渡せなければ ERR 行を先に書いてから（回収の待ちで CLI が報告を取り逃さないため）起動したプロセスを回収して
+/// `Stopped` を記録し、終了コードを返す（fail-closed）。
 #[cfg(target_os = "linux")]
 fn attach_seccomp_before_report(
     running: Running,
     store: &Arc<dyn StateStore>,
     id: &ContainerId,
     timeouts: &StartTimeouts,
-) -> Result<Running, (OciRuntimeError, NonZeroU8)> {
+    out: &mut dyn Write,
+) -> Result<Running, NonZeroU8> {
     let Some(hub) = running.seccomp.clone() else {
         return Ok(running);
     };
@@ -737,13 +733,15 @@ fn attach_seccomp_before_report(
         return Ok(running);
     };
     log_event("seccomp_notify_failed", Some(e.code()));
+    let error = op_err(e);
+    report(out, &StartReport::failed(&error));
     let Running {
         process, instance, ..
     } = running;
     let disposed = dispose(Some(process), None, timeouts);
-    let code = finish_disposed(store, id, instance, disposed, exit_code_for(e.code()).get());
+    let code = finish_disposed(store, id, instance, disposed, error.exit_code().get());
     let code = NonZeroU8::new(code).unwrap_or_else(|| exit_code_for(ErrorCode::Internal));
-    Err((op_err(e), code))
+    Err(code)
 }
 
 /// 報告 1 行を書く（失敗はログに出すだけで、監視・後始末は続ける）。

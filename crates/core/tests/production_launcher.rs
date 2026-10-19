@@ -125,7 +125,7 @@ fn main() {
 
 // rootfs 構築の部品（`mkdir`・`install_binary_at`）を rootless 系の試験と共有する（#2246・REPAIR-1）。
 // 本試験が使うのはその 2 つだけで、直接ステージ経路の起動・報告の部品は `rootless_uid_mapping` 専用のため、
-// この取り込みに限って dead_code を許す（他の取り込み元では個別に検出される）。
+// 未使用になる項目は real_entry.rs 側で個別に理由つきの dead_code 抑止を付けている（モジュール全体には抑止しない）。
 #[cfg(all(
     target_os = "linux",
     all(
@@ -133,7 +133,6 @@ fn main() {
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
-#[allow(dead_code)]
 #[path = "support/real_entry.rs"]
 mod real_entry;
 

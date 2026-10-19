@@ -54,10 +54,13 @@ use fandhe_container_core::traits::TraitError;
 /// コンテナ内のエントリポイントのパス（rootfs の `/entry`）。
 pub const ENTRY_PATH: &str = "/entry";
 /// エントリポイントが書く報告ファイルの名前（コンテナ内では `/entry-report`）。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub const REPORT_FILE: &str = "entry-report";
 /// 報告ファイル全体の上限（バイト）。無制限の読み取りを避ける。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 const REPORT_MAX_BYTES: u64 = 16 * 1024;
 /// 報告ファイルの行数の上限。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 const REPORT_MAX_LINES: usize = 128;
 
 /// `path` までの祖先を 1 階層ずつ `lstat` して非 symlink のディレクトリだけを許容し、無ければ `create_dir` で作って
@@ -178,11 +181,11 @@ pub fn install_binary_at(rootfs: &Path, dest_name: &str, dirs: &[&str]) -> Strin
     lib_dirs.join(":")
 }
 
-/// 試験バイナリ自身を rootfs の `/entry` へ置く（実エントリポイント）。`rootfs/proc`（pivot 後に proc を載せる先）
-/// も作る。戻り値は config の `env` に渡す `LD_LIBRARY_PATH` の値。
+/// 試験バイナリ自身を rootfs の `/entry` へ置く（実エントリポイント）。`rootfs/proc`（pivot 後に proc を載せる先）と
+/// `rootfs/dev`（暗黙の /dev のマウント先。無いと本番 launcher が fail-closed で拒否する）も作る。戻り値は config の `env` に渡す `LD_LIBRARY_PATH` の値。
 #[allow(dead_code)] // 取り込み元によっては使わない（`production_launcher` は `install_binary_at` を直接呼ぶ）
 pub fn install_entry(rootfs: &Path) -> String {
-    install_binary_at(rootfs, ENTRY_PATH.trim_start_matches('/'), &["proc"])
+    install_binary_at(rootfs, ENTRY_PATH.trim_start_matches('/'), &["proc", "dev"])
 }
 
 /// rootless 系 2 本（`rootless`・`rootless_file_owner`）が本番 `ProductionLauncher` へ渡す最小の `config.json` を
@@ -216,6 +219,7 @@ pub fn write_rootless_config(bundle: &Path, hostname: &str, args: &[String], env
 
 /// 実エントリポイントの argv（`/entry --entry <mode>`）。`config.json` の `process.args` と
 /// `entrypoint_from` の入力に使う。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub fn entry_args(mode: &str) -> Vec<String> {
     vec![
         ENTRY_PATH.to_string(),
@@ -225,6 +229,7 @@ pub fn entry_args(mode: &str) -> Vec<String> {
 }
 
 /// 実エントリポイントの環境変数（`PATH=/` と、コピーした共有ライブラリの `LD_LIBRARY_PATH`）。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub fn entry_env(ld_library_path: &str) -> Vec<String> {
     vec![
         "PATH=/".to_string(),
@@ -286,6 +291,7 @@ fn status_value(key: &str) -> String {
 }
 
 /// 実エントリポイント側の共通観測（`pid`・実効 `uid` / `gid`・`nonewprivs`・`seccomp`）。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub fn entry_observations() -> Vec<(&'static str, String)> {
     let id = |key: &str| {
         status_value(key)
@@ -304,6 +310,7 @@ pub fn entry_observations() -> Vec<(&'static str, String)> {
 }
 
 /// 実エントリポイント側: `/entry-report` へ `key=value` 行と最後の `done=1` を書く（`create_new`。`sync_all` 済み）。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub fn write_report(lines: &[(&str, String)]) {
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -323,6 +330,7 @@ pub fn write_report(lines: &[(&str, String)]) {
 
 /// ホスト側: `path` の報告ファイルが `done=1` まで書き終わっていれば読んで返す（無ければ・書きかけなら `None`）。
 /// 大きさ・行数に上限を設け、重複キー・未知の書式は panic にする（外部入力として扱う）。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub fn try_read_report(path: &Path) -> Option<BTreeMap<String, String>> {
     use std::io::Read as _;
     let f = std::fs::File::open(path).ok()?;
@@ -336,6 +344,7 @@ pub fn try_read_report(path: &Path) -> Option<BTreeMap<String, String>> {
 }
 
 /// ホスト側: `path` の報告ファイルを `done=1` が現れるまで `limit` を上限にポーリングして読む（REPAIR-5）。
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 pub fn read_report(path: &Path, limit: Duration) -> BTreeMap<String, String> {
     let deadline = Instant::now() + limit;
     loop {
@@ -351,6 +360,7 @@ pub fn read_report(path: &Path, limit: Duration) -> BTreeMap<String, String> {
     }
 }
 
+#[allow(dead_code)] // 本番 launcher 経由の試験（`production_launcher`）は使わない
 fn parse_report(text: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for (i, line) in text.lines().enumerate() {

@@ -543,6 +543,8 @@ mod linux {
 
     /// `start` が返した記録とハンドルのホスト視点の照合（写像・実エントリポイント・コンテナ視点の観測値）と、
     /// kill 以降の流れの照合。
+    // 照合対象（bundle・store・記録・ハンドル・期待値）は呼び出し元の試験が個別に持つ独立した値で、
+    // 構造体へまとめても名前付けが増えるだけのため、この引数数のまま維持する。
     #[allow(clippy::too_many_arguments)]
     fn verify_started_and_kill(
         mode: &str,

@@ -32,7 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::{ImageStore, MAX_COMPOSITION_LAYERS, PullId};
 use crate::error::{OciError, OciErrorCode};
-use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
+use crate::instrument::{OciOpKind, OciOpRecorder, record_oci_op};
 use crate::reference::Digest;
 
 /// ストア root 直下のステージング領域名。GC・`image ls` の走査対象外。
@@ -158,8 +158,9 @@ impl ImageStore {
     ///
     /// 同じ ID のディレクトリが既にあれば `AlreadyExists`（二重利用させない）。`staging` が
     /// symlink・非ディレクトリなら `FailedPrecondition`。
+    /// 記録先は [`ImageStore::with_recorder`] で設定したもの（REPAIR-4）。
     pub fn begin_pull(&self, id: PullId) -> Result<PullSession<'_>, OciError> {
-        self.begin_pull_with(&NoopOciOpRecorder, id)
+        self.begin_pull_with(self.recorder(), id)
     }
 
     /// [`ImageStore::begin_pull`] の全体（重複 ID・非ディレクトリ・作成失敗を含む）を
@@ -200,7 +201,7 @@ impl ImageStore {
 
     /// ID を生成して [`ImageStore::begin_pull`] する。
     pub fn begin_pull_generated(&self) -> Result<PullSession<'_>, OciError> {
-        self.begin_pull(PullId::generate()?)
+        self.begin_pull_generated_with(self.recorder())
     }
 
     /// ID を生成して [`ImageStore::begin_pull_with`] する。
@@ -353,6 +354,28 @@ mod tests {
 
     fn leases(store: &ImageStore, dg: &Digest) -> Vec<PullId> {
         store.lock().unwrap().blob_references(dg).leases
+    }
+
+    /// REPAIR-4: ストアに設定した記録先が begin_pull / begin_pull_generated で使われる。
+    #[test]
+    fn repair4_begin_pull_uses_store_recorder() {
+        use crate::instrument::OciOpOutcome;
+        use crate::instrument::testing::Collect;
+        let root = Root::new("rec");
+        let rec = std::sync::Arc::new(Collect::default());
+        let store = ImageStore::open(&root.0)
+            .unwrap()
+            .with_recorder(rec.clone());
+        let _s = store.begin_pull(pid("p1")).unwrap();
+        let dup = store.begin_pull(pid("p1")).err().unwrap();
+        let _g = store.begin_pull_generated().unwrap();
+        let items = rec.items();
+        assert_eq!(items.len(), 3);
+        assert!(items.iter().all(|i| i.kind() == OciOpKind::BeginPull));
+        assert_eq!(items[0].outcome(), OciOpOutcome::Success);
+        assert_eq!(items[1].outcome(), OciOpOutcome::Failure);
+        assert_eq!(items[1].error_code(), Some(dup.code()));
+        assert_eq!(items[2].outcome(), OciOpOutcome::Success);
     }
 
     /// OCI-7: 既存 blob の再利用は、使う前に自分の pull ID でリースを登録する。

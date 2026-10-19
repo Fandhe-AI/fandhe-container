@@ -102,12 +102,12 @@ fn err(code: OciErrorCode, msg: &str) -> OciError {
 }
 
 /// blob の置き場 `<root>/blobs/sha256`。
-fn blob_dir(root: &Path) -> PathBuf {
+pub(super) fn blob_dir(root: &Path) -> PathBuf {
     root.join("blobs").join("sha256")
 }
 
 /// 検証済み `Digest` の hex 部だけからパスを組み立てる。
-fn blob_path(root: &Path, digest: &Digest) -> Result<PathBuf, OciError> {
+pub(super) fn blob_path(root: &Path, digest: &Digest) -> Result<PathBuf, OciError> {
     let hex = digest
         .as_str()
         .strip_prefix("sha256:")
@@ -301,7 +301,7 @@ fn checked_dir(path: &Path) -> Result<bool, OciError> {
 
 /// `blobs` と `blobs/sha256` を検証する。両方が通常ディレクトリなら `Ok(true)`、
 /// どちらかが存在しなければ `Ok(false)`、symlink・非ディレクトリは `FailedPrecondition`。
-fn check_blob_dirs(root: &Path) -> Result<bool, OciError> {
+pub(super) fn check_blob_dirs(root: &Path) -> Result<bool, OciError> {
     Ok(checked_dir(&root.join("blobs"))? && checked_dir(&blob_dir(root))?)
 }
 

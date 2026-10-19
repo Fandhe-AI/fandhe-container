@@ -16,7 +16,8 @@
 //!
 //! 未実装（後続 issue の担当。実装済みを装わない。REPAIR-3）:
 //! - ディスクへの永続化・再起動時の照合（#853・#854・#851）
-//! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force`・実削除は #481
+//! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force` と実削除（untag・`remove_manifest`・非共有 blob の削除。TASK-183.6・#481）も
+//!   `remove` で実装済み（永続化・fsync・削除途中のクラッシュの再試行は #851、CLI 配線は未実装）
 //! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（CLI 経路と永続化は未実装）
 //! - GC 本体・`prune`・`rm` の CLI 配線（#480・#481・#476）。`image ls`/`system df` の集計 API は
 //!   `usage`（#478・TASK-183.3）で実装済み（CLI 経路は未実装）
@@ -37,7 +38,10 @@ mod container_ref;
 pub use container_ref::{ContainerRefRegistration, ContainerRefRelease};
 
 mod remove;
-pub use remove::{ImageInUse, ImageRmCandidate, ImageRmDecision, ImageRmTarget};
+pub use remove::{
+    ImageInUse, ImageRmAction, ImageRmCandidate, ImageRmDecision, ImageRmKind, ImageRmOptions,
+    ImageRmOutcome, ImageRmPlan, ImageRmTarget, StoppedContainers,
+};
 
 use crate::error::{OciError, OciErrorCode};
 use crate::reference::{Digest, RegistryHost, Repository, Tag};

@@ -400,32 +400,44 @@ pub(super) fn sweep_blobs(root: &Path, blobs: &[Digest], dirs_present: bool) -> 
 
 /// unlink 後の永続化を確定させる。
 ///
-/// 1 件でも unlink したら `blobs/sha256` を fsync する。消せなかった blob があれば、その分だけで
-/// ジャーナルを書き直して保持する（書き直しに失敗しても元のジャーナルが上位集合として残る）。
+/// 1 件でも unlink したら `blobs/sha256` を fsync する。消せなかった blob があれば、その分でジャーナルを
+/// 書き直して保持する。このとき fsync が失敗していたら、unlink 済みの blob（`deleted`）も書き直した
+/// ジャーナルに残す（クラッシュで unlink が巻き戻っても次の再試行で消し直せるようにする）。
+/// 書き直しに失敗したときは attempts を永続化できず上限に届かないため、ジャーナルを削除して
+/// `Abandoned` にする（削除も失敗したら `Pending`）。
 /// 全件片づいたらジャーナルを削除して root を fsync し、成功すれば `Confirmed`。
 /// 消せない blob が `MAX_GC_RETRY_ATTEMPTS` 回目に達したらジャーナルを削除して `Abandoned`。
 pub(super) fn settle(
     root: &Path,
     undeleted: &[Digest],
-    unlinked_any: bool,
+    deleted: &[Digest],
     prior_attempts: u32,
 ) -> DeletionDurability {
-    let blobs_synced = !unlinked_any || sync_dir(&blob_dir(root)).is_ok();
+    let blobs_synced = deleted.is_empty() || sync_dir(&blob_dir(root)).is_ok();
     if !undeleted.is_empty() {
         let attempts = prior_attempts.saturating_add(1);
+        let abandon = || match remove_journal(root) {
+            Ok(()) => DeletionDurability::Abandoned,
+            Err(_) => DeletionDurability::Pending,
+        };
         if attempts >= MAX_GC_RETRY_ATTEMPTS {
             // 断念: 消せない blob は孤児として残し、ジャーナルを片づけて新しい削除を再び通す。
-            return match remove_journal(root) {
-                Ok(()) => DeletionDurability::Abandoned,
-                Err(_) => DeletionDurability::Pending,
-            };
+            return abandon();
         }
+        let mut keep = undeleted.to_vec();
+        if !blobs_synced {
+            keep.extend_from_slice(deleted);
+        }
+        keep.sort();
+        keep.dedup();
         let rest = GcJournal {
-            delete_blobs: undeleted.to_vec(),
+            delete_blobs: keep,
             attempts,
             ..GcJournal::default()
         };
-        let _ = write_journal(root, &rest);
+        if write_journal(root, &rest).is_err() {
+            return abandon();
+        }
         return DeletionDurability::Pending;
     }
     if !blobs_synced {
@@ -523,12 +535,8 @@ impl ReferenceTable {
                 ..Sweep::default()
             },
         };
-        out.durability = settle(
-            root,
-            &sweep.undeleted,
-            !sweep.deleted.is_empty(),
-            journal.attempts,
-        );
+        let deleted_digests: Vec<Digest> = sweep.deleted.iter().map(|(d, _)| d.clone()).collect();
+        out.durability = settle(root, &sweep.undeleted, &deleted_digests, journal.attempts);
         out.deleted_blobs = sweep.deleted.into_iter().map(|(d, _)| d).collect();
         out.absent_blobs = sweep.absent;
         out.undeleted_blobs = sweep.undeleted;
@@ -833,6 +841,36 @@ mod tests {
         assert!(fs::symlink_metadata(&p).is_ok());
         ensure_no_pending_journal(&root.0).unwrap();
         assert!(store.recover_pending_deletion().unwrap().is_none());
+    }
+
+    /// OCI-7: fsync が失敗し消せない blob もあるとき、unlink 済みの blob もジャーナルに残す。
+    #[test]
+    fn oci7_settle_keeps_deleted_blobs_when_blob_dir_fsync_fails() {
+        let root = Root::new();
+        // blobs/sha256 を消して fsync を失敗させる。
+        fs::remove_dir(blob_dir(&root.0)).unwrap();
+        let st = settle(&root.0, &[d(0x22)], &[d(0x11)], 0);
+        assert_eq!(st, DeletionDurability::Pending);
+        let j = read_journal(&root.0).unwrap().unwrap();
+        assert_eq!(j.delete_blobs, vec![d(0x11), d(0x22)]);
+        assert_eq!(j.attempts, 1);
+    }
+
+    /// OCI-7: ジャーナルの書き直しに失敗しても上限判定を諦めず、断念して片づける。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_settle_abandons_when_journal_rewrite_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new();
+        // root を書き込み不可にして、一時ファイルの作成（書き直し）を失敗させる。
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o500)).unwrap();
+        let writable = fs::File::create(root.0.join("probe")).is_ok();
+        let st = settle(&root.0, &[d(0x22)], &[], 0);
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+        // 特権で実行されて書き込めてしまう環境では前提が成り立たないので判定しない。
+        if !writable {
+            assert_eq!(st, DeletionDurability::Abandoned);
+        }
     }
 
     /// OCI-7: 書き込み中のクラッシュで残った一時ファイルは lock 時に回収される。

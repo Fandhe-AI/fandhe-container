@@ -166,7 +166,16 @@ impl ReferenceTable {
                 .ok_or_else(|| err(OciErrorCode::Internal, "size overflow"))?;
         }
         if journaled {
-            out.durability = settle(root, &sweep.undeleted, !sweep.deleted.is_empty(), 0);
+            out.durability = settle(
+                root,
+                &sweep.undeleted,
+                &sweep
+                    .deleted
+                    .iter()
+                    .map(|(d, _)| d.clone())
+                    .collect::<Vec<_>>(),
+                0,
+            );
         }
         out.deleted_blobs = sweep.deleted.into_iter().map(|(d, _)| d).collect();
         out.absent_blobs = sweep.absent;

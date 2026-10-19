@@ -441,7 +441,16 @@ impl ReferenceTable {
         }
         let sweep = sweep_blobs(root, &to_sweep, dirs_present);
         if journaled {
-            outcome.durability = settle(root, &sweep.undeleted, !sweep.deleted.is_empty(), 0);
+            outcome.durability = settle(
+                root,
+                &sweep.undeleted,
+                &sweep
+                    .deleted
+                    .iter()
+                    .map(|(d, _)| d.clone())
+                    .collect::<Vec<_>>(),
+                0,
+            );
         }
         outcome.deleted_blobs = sweep.deleted.into_iter().map(|(d, _)| d).collect();
         outcome.absent_blobs = sweep.absent;

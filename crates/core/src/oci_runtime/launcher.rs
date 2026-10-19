@@ -73,7 +73,7 @@
 //!   spec 側の判断事項)は `Unimplemented` で拒否する
 //! - **範囲写像の入力元**: `/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap`(`SubordinateIdSource`)
 //!   だけ。config の `linux.uidMappings` / `gidMappings` は `start` が引き続き拒否する(受理は SEC-5 に関わる
-//!   オーナー判断事項で、確認待ち)。supervisor が `RootlessSubordinateIds` を選ぶ経路は未結線(後続)
+//!   オーナー判断事項で、確認待ち)。supervisor が `RootlessSubordinateIds` を選ぶ経路は結線済み(#2243。subuid / subgid の設定の有無で選ぶ)
 //! - **mapper と helper の回収**: mapper は I が fork 前に設定した `LaunchTag` を継承するため、I が期限で殺されて
 //!   C へ再親付けされても `rescan` の探索対象になる。I は範囲写像の失敗時に mapper を kill せず `R` を報告し、C が
 //!   I の回収後に同じ探索で回収する。mapper が起動する `newuidmap` / `newgidmap`(helper)は exec で `comm` が
@@ -323,7 +323,7 @@ impl ProductionLauncherBuilder {
 /// `RootlessSubordinateIds` の写像の入力元(`/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap` のパス。
 /// CORE-6・SEC-5・#2009)。
 ///
-/// 呼び出し元は supervisor(将来。現状は未結線)。パスはすべて絶対パスで、`PATH` は探索しない。所有者の名前は
+/// 呼び出し元は supervisor(結線済み。#2243。選ぶ条件と名前の取得は supervisor の start 経路)。パスはすべて絶対パスで、`PATH` は探索しない。所有者の名前は
 /// 呼び出し側が渡す(`rootless` のモジュール doc のとおり、ライブラリは `$USER` を読まず NSS も使わない)。一般的な
 /// `/etc/subuid` はユーザー名で書かれるため、名前を渡さないと数値の uid の行しか一致しない。
 /// 範囲の読み取りと helper の検証は [`ProductionLauncherBuilder::build`] が行う。

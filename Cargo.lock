@@ -410,6 +410,8 @@ dependencies = [
 name = "fandhe-container-plugin-cri"
 version = "0.0.0"
 dependencies = [
+ "fandhe-container-core",
+ "fandhe-container-cri",
  "fandhe-container-plugin",
 ]
 

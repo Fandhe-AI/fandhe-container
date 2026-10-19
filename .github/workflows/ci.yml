@@ -466,6 +466,12 @@ jobs:
       - name: cli のバックエンド直接依存なしの検証
         shell: bash
         run: make check-cli-backend-deps
+      # plugin 起動対象の構築口 from_verified_file を呼ぶのが core の変換と許可した試験コードだけであることの
+      # 機械判定（PLUG-11・#1857）。cargo を使わないソースの走査。既存ジョブへのステップ追加（check-run 件数は不変）
+      - name: plugin 起動対象の構築箇所の検証（PLUG-11・#1857）
+        shell: bash
+        timeout-minutes: 5
+        run: make check-launch-target
       # venus 試験治具（poc/venus-decoder/jig。GPU-6・TASK-172.4・#888）の fmt-check・clippy・test。
       # 治具はルート workspace 外の独立パッケージで cargo build/test --workspace の対象に入らないが、
       # crates/plugin-macos（gpu::venus）へ path 依存するため、plugin-macos 側の変更で治具が壊れても
@@ -801,6 +807,14 @@ jobs:
         if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make lib-selftest
+
+      # plugin 起動対象の構築箇所の判定スクリプトの自己テスト（#1857・REPAIR-12）。fixture の一時ツリーだけを使い、
+      # BSD と Windows のシェルでのツール差（awk・find・grep）を確かめるため 3 OS で回す。
+      # 既存ジョブのステップ（check-run 件数は不変）
+      - name: plugin 起動対象の構築箇所の判定の自己テスト（#1857・REPAIR-12。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make check-launch-target-selftest
 
       - name: AppArmor の非特権 user namespace 制限を緩和（unshare_isolation 用・Linux のみ。CORE-1・SEC-5）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'

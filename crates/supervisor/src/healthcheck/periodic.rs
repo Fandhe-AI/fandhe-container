@@ -50,7 +50,7 @@ pub trait HealthcheckClock: Send + Sync {
     fn sleep_until(&self, deadline: Instant, stop: &StopToken) -> bool;
 }
 
-/// 本番用の時計。`stop` を [`SLEEP_SLICE`] ごとに確かめながら眠る。
+/// 本番用の時計。`stop` を `SLEEP_SLICE` ごとに確かめながら眠る。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
 
@@ -148,6 +148,9 @@ fn overflow(ticks: u64) -> HealthcheckLoopOutcome {
 ///
 /// 専用スレッドで回すこと。`state` は監視ループとは別に `SupervisedState::attach` で得る。
 /// 各 tick の結果は `on_tick` へ渡す（#496 の集約の差し込み口）。
+// 抑止理由: 引数 8 個は、状態・起動済みプロセス・probe 実行器・時計・停止トークン・観測器・tick 通知と、
+// それぞれ別の差し替え点（試験で偽物に替える）を表す。構造体にまとめると差し替え点が隠れて
+// 呼び出し側の見通しが悪くなるため、公開 API は 8 引数のまま維持する。
 #[allow(clippy::too_many_arguments)]
 pub fn run_periodic(
     schedule: &HealthcheckSchedule,

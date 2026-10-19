@@ -634,8 +634,11 @@ impl PullSession<'_> {
 
     /// 非 unix では排他区間の外で実体を固定し、その内容を検証する（Windows）。
     ///
-    /// 書き込み・削除を共有拒否（`FILE_SHARE_READ` のみ）で開いたハンドルを返す。ハンドルを保持する間は
-    /// 内容の書き換え・差し替え・削除ができないため、ここで検証した実体がそのまま公開される。
+    /// 書き込みを共有拒否（`FILE_SHARE_READ | FILE_SHARE_DELETE`。値 5）で開いたハンドルを返す。
+    /// ハンドルを保持する間は内容を書き換えられないため、検証した内容がそのまま公開される。
+    /// `FILE_SHARE_DELETE` を含めるのは、Windows の `hard_link` が元ファイルへの DELETE / 属性アクセスを
+    /// 要し、`FILE_SHARE_READ` のみの固定は自分の `hard_link` を共有違反で失敗させるため。名前の差し替えは
+    /// 許すため、リンク直前に名前側の指紋を検証時のものと照合する（`check_staged_ident`。OCI-1）。
     #[cfg(windows)]
     fn pin_staged_blobs(&self, to_move: &[Digest]) -> Result<BTreeMap<Digest, fs::File>, OciError> {
         use std::os::windows::fs::OpenOptionsExt;
@@ -650,7 +653,7 @@ impl PullSession<'_> {
             };
             let file = fs::OpenOptions::new()
                 .read(true)
-                .share_mode(1)
+                .share_mode(5)
                 .open(&src)
                 .map_err(|e| io_err(&e, "failed to pin staged blob"))?;
             let m = file
@@ -862,14 +865,20 @@ impl PullSession<'_> {
                                 {
                                     present.push(b.clone());
                                 } else if cfg!(windows) {
-                                    // Windows: 固定したハンドルを保ったまま、未検証の宛先を消して固定済みの実体へ
-                                    // hard_link し直す（固定を外してパスで改名しない。OCI-1）。
-                                    fs::remove_file(&dst).map_err(|_| {
-                                        err(OciErrorCode::Internal, "failed to repair corrupt blob")
-                                    })?;
-                                    fs::hard_link(&src, &dst).map_err(|_| {
-                                        err(OciErrorCode::Internal, "failed to repair corrupt blob")
-                                    })?;
+                                    // Windows: 既存の宛先は消さず、同じディレクトリの一時名へ固定済みの実体を
+                                    // hard_link し、rename で原子的に置き換える。途中で失敗しても既存の宛先は
+                                    // 残る（他のイメージが参照する blob を失わない。OCI-1）。
+                                    let tmp = repair_tmp_path(&dst);
+                                    let _ = fs::remove_file(&tmp);
+                                    let repaired = fs::hard_link(&src, &tmp)
+                                        .and_then(|()| fs::rename(&tmp, &dst));
+                                    if repaired.is_err() {
+                                        let _ = fs::remove_file(&tmp);
+                                        return Err(err(
+                                            OciErrorCode::Internal,
+                                            "failed to repair corrupt blob",
+                                        ));
+                                    }
                                     moved.push(b.clone());
                                 } else {
                                     fs::rename(&src, &dst).map_err(|_| {
@@ -990,6 +999,13 @@ impl PullSession<'_> {
             ))
         }
     }
+}
+
+/// Windows の修復用の一時名（宛先と同じディレクトリ。同一ボリュームで rename できる）。
+fn repair_tmp_path(dst: &Path) -> PathBuf {
+    let mut name = dst.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".repair-{}", std::process::id()));
+    dst.with_file_name(name)
 }
 
 #[cfg(test)]

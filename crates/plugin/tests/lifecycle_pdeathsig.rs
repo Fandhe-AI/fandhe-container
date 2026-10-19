@@ -14,7 +14,7 @@
 #![cfg(target_os = "linux")]
 
 use fandhe_container_plugin::{
-    Frame, JsonLinesPeerAuthObserver, OneShotPlugin, OneShotTimeout, PLUGIN_SOCKET_ENV,
+    Frame, JsonLinesPeerAuthObserver, OneShotTimeout, PLUGIN_SOCKET_ENV, PluginLaunchSpec,
     ResidentPlugin, ResidentStartTimeout, UdsStream, call_once,
 };
 use std::ffi::OsString;
@@ -101,7 +101,7 @@ fn intermediate_entry() {
         .iter()
         .map(OsString::from)
         .collect();
-    let plugin = OneShotPlugin::new(crate::exe_target(), args, PathBuf::from(dir)).unwrap();
+    let plugin = PluginLaunchSpec::new(crate::exe_target(), args, PathBuf::from(dir)).unwrap();
     let mut audit = JsonLinesPeerAuthObserver::new();
     if role == "oneshot" {
         // plugin は応答しないので、外側に kill されるまでここで待つ。

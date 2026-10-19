@@ -76,6 +76,7 @@ fandhe-container/
 │   │   ├── measurements/
 │   │   │   └── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
 │   │   ├── macos-vm-strategy.md   # macOS の VM 利用方式（既定: 常駐 VM 共用＋軽量プロセス分離／オプション: 1 コンテナ = 1 VM。TASK-66・MAC-4）
+│   │   ├── macos-shared-vm.md     # macOS 既定方式（常駐 VM 共用）の未決事項の設計案（保持役・bind mount・ゲスト内実行・計測対象。TASK-191・#1905・MAC-4。承認待ち #1906）
 │   │   ├── fs-normalization.md   # FS 正規化（NFC/NFD の別表記の衝突を検出して拒否・名前は書き換えない。TASK-21・IO-5）
 │   │   ├── oci-layer-special-bits.md  # レイヤー展開の setuid / setgid / sticky を所有者の写像に合わせて保持する条件（既定は落とす。#1810・OCI-1・SEC-5）
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）

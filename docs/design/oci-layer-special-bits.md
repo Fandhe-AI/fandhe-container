@@ -1,6 +1,6 @@
 # レイヤー展開の setuid / setgid / sticky の扱い
 
-OCI-1・SEC-5・SEC-1・REPAIR-3・REPAIR-4（#1810。前段は TASK-52.3・#409）。実装は `crates/oci/src/layer/extract.rs`。
+OCI-1・OCI-2・SEC-5・SEC-1・REPAIR-3・REPAIR-4（#1810・#2251。前段は TASK-52.3・#409）。実装は `crates/oci/src/layer/extract.rs`。
 
 ## 背景
 
@@ -16,7 +16,9 @@ tar の値のまま適用する。満たさないものは落とす（fail-close
 新しい入口は `extract_layers_with_policy` / `extract_layer_blobs_with_policy`。
 
 `uid` / `gid` は user namespace の写像（core の `IdMapping` と同じ意味の `container_id host_id count` の 1 行）を
-`IdRange` で渡す。
+`IdRange` で渡す。`host_id` は展開するプロセス自身の user namespace から見える ID（そのプロセスの `fstat` が返す
+uid / gid）で渡す。入れ子の user namespace の中で展開するときは、初期 user namespace のホスト ID ではなく展開プロセスの
+名前空間での ID を渡す（取り違えると所有者の照合が別の ID と一致したり、常に食い違ったりする。#2251 P2-4）。
 
 ## 条件
 
@@ -34,18 +36,29 @@ tar の値のまま適用する。満たさないものは落とす（fail-close
 | ------ | -------- |
 | 共通 | `root` の所有 uid が、書いたファイルの所有 uid と一致する |
 | setuid | ファイルの所有 uid が 0 でなく、`uid.map_to_host(tar の uid) == ファイルの所有 uid` |
-| setgid | ファイルの gid が 0 でなく、`gid.map_to_host(tar の gid) == ファイルの gid` |
+| setgid | ファイルの所有 uid と gid がともに 0 でなく、`gid.map_to_host(tar の gid) == ファイルの gid` |
 | sticky | 共通の条件のみ（Linux の通常ファイルの sticky は権限を与えない） |
+
+- rootful（ファイルの所有 uid が 0）は setuid / setgid を常に落とす。gid が 0 でなくても落とし、sticky は共通の条件だけで決まる（#2251 P2-1）
+- `ExtractLimits::max_entries` にはグローバル PAX ヘッダも数える（`ExtractedLayer::entries` には含めない。パス 1 で書き込み前に
+  拒否する。#2251 P2-3）
 
 - tar の uid / gid は PAX の `uid` / `gid` を優先する。解析できない・u32 に収まらない値は `None` とし、setuid / setgid を落とす
 - 適用後に mode を読み戻し、求めたビットが残っていなければ（所属しない gid への setgid をカーネルが落とす等）、
   適用したことにせず落とした件数に入れる。保持した件数は `SpecialBitsOutcome::preserved_files`
+- ビットごとの件数は `SpecialBitsOutcome::preserved_bits`（読み戻しで残ったビット）と `stripped_bits`（求めたが残らなかったビット）。
+  setuid と setgid を求めて setgid だけが落ちたときは、setuid を `preserved_bits`、setgid だけを `stripped_bits` に数える。
+  ファイル単位の件数（`preserved_files`・`files_with_stripped_special_bits`）は従来どおり、一部でも落ちれば後者に数える（#2251 P2-6）
 - hardlink は inode を共有するため、mode は参照先のものになる
 - ディレクトリの mode（setgid・sticky を含む）はポリシーに関係なくそのまま適用する
 
 ## 呼び出し側の契約
 
-- `root` を排他的に所有し、展開から rootfs として使い終わるまで 0700 を保つ。権限の後からの変更（TOCTOU）は防げない
+- `root` を排他的に所有し、展開から rootfs として使い終わるまで 0700 を保つ。権限の後からの変更（TOCTOU）は防げない。
+  0700 の確認は展開の開始時の 1 回だけで、展開中・展開後には確かめ直さない。呼び出し側は展開中も展開の後も group / other に開かない（#2251 P2-2）
+- 展開の後に呼び出し側が所有者を変えるときは、fchown → fchmod の順にし、所有者と mode を読み戻して確かめる。Linux は `chown` で
+  setuid / setgid を落とすため、mode を先に適用するとビットが失われるか意図しない所有者の setuid が残る。展開内の `chown`
+  （`ChownMapped`）は #2225 でこの順序を実装済み（#2251 P2-5）
 - コンテナ内で setuid が実際に効くかは `process.noNewPrivileges` に依る。本変更はビットの保持までを扱う
 
 ## 所有者の適用（chown。#2225・SEC-5）
@@ -106,7 +119,10 @@ tar の値のまま適用する。満たさないものは落とす（fail-close
 `sec5_special_bits_stripped_when_root_is_accessible_by_others`・`sec5_special_bits_dropped_when_tar_owner_is_not_mapped`・
 `sec5_special_bits_dropped_when_file_owner_is_host_root`・`sec5_special_bits_dropped_when_pax_uid_is_malformed`
 （満たさない経路で落ち、件数が出る）、`oci1_directory_setgid_is_applied`（ディレクトリの setgid）、
-`sec5_special_bits_to_keep_matrix`・`sec5_id_range_maps_with_checked_arithmetic`（純関数の条件の組み合わせ）。
+`sec5_special_bits_to_keep_matrix`・`sec5_id_range_maps_with_checked_arithmetic`（純関数の条件の組み合わせ）、
+#2251: `sec5_setgid_dropped_when_file_owner_uid_is_host_root`・`oci2_global_pax_headers_count_toward_entry_limit`・
+`oci2_global_pax_headers_accumulate_across_layers`・`sec5_readback_setgid_only_drop_does_not_count_setuid_as_stripped`・
+`sec5_special_bit_counts_add_bits`。
 
 chown（#2225）: `extract.rs` の `chown_tests`（`chown` を記録する差し替え口で呼び出しの値・順序を照合。
 `sec5_chown_maps_tar_owner_through_multi_line_map`・`sec5_chown_order_file_before_mode`・

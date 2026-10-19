@@ -18,6 +18,10 @@
 //! listener 側の拒否に別 UID の非 root は使えない（0700 の配置ディレクトリで connect 前に遮断され、
 //! peer 検証へ届かない）ため、connector は root が必要。client 側は親ディレクトリを検証しないので、
 //! 別 UID が listen 中の socket であれば root でなくてもよい。
+//!
+//! 実機前提の観測（macOS のみ・`#[ignore]`）: `plug12_macos_peer_uid_after_client_close_probe` は、
+//! client が connect 直後に close した接続の peer UID 取得結果を JSON 1 行で出す（#2252 P2-2。
+//! 結果の判断は人間担当の #2405）。手順は `AGENTS.md`「実機前提テスト」節。
 
 #[cfg(not(unix))]
 #[test]
@@ -290,5 +294,53 @@ mod unix {
         .unwrap_err();
         assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
         assert_eq!(err.message(), MISMATCH_MESSAGE);
+    }
+
+    /// PLUG-12 / SEC-4（実機前提・観測用。#2252 P2-2・人間担当は #2405）: macOS で client が connect 直後に
+    /// close した接続に対し、listener 側の peer UID 取得（`getpeereid`）が成功するか失敗するかを観測する。
+    ///
+    /// 結果の解釈（`ENOTCONN` で失敗するか。失敗するなら少数回の許容を設けるか）は人間が行う。
+    /// 現状の挙動（取得失敗は即エラー・fail-closed）は変えない。assert はどちらの結果でも成り立つ
+    /// 不変条件に限る（受理なら監査 0 件、失敗なら監査ちょうど 1 件で `peer_uid_unavailable`）。
+    /// 出力は code と reason だけで、UID 値は載せない。
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "observation on a real macOS host; the result is judged by a human; PLUG-12 #2252 P2-2"]
+    fn plug12_macos_peer_uid_after_client_close_probe() {
+        let dir = TempDir::new();
+        let l = UdsListener::bind(&dir.sock()).unwrap();
+        let mut connect_audit = fandhe_container_plugin::JsonLinesPeerAuthObserver::new();
+        let c = UdsStream::connect(l.path(), WAIT, &mut connect_audit).unwrap();
+        drop(c);
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut audit = fandhe_container_plugin::JsonLinesPeerAuthObserver::new();
+        let result = l.accept(Duration::from_secs(2), &mut audit);
+        let lines = audit.drain_lines();
+        match result {
+            Ok(_) => {
+                assert!(lines.is_empty(), "accepted connection must not be audited");
+                println!("{{\"probe\":\"peer_uid_after_close\",\"outcome\":\"ok\"}}");
+            }
+            Err(err) => {
+                assert!(
+                    matches!(
+                        err.code(),
+                        PluginErrorCode::Internal | PluginErrorCode::Unimplemented
+                    ),
+                    "unexpected error code: {:?}",
+                    err.code()
+                );
+                assert_eq!(lines.len(), 1, "exactly one audit event expected");
+                assert!(
+                    lines[0].contains("\"reason\":\"peer_uid_unavailable\""),
+                    "unexpected audit reason"
+                );
+                println!(
+                    "{{\"probe\":\"peer_uid_after_close\",\"outcome\":\"error\",\"code\":\"{:?}\",\"reason\":\"peer_uid_unavailable\"}}",
+                    err.code()
+                );
+            }
+        }
     }
 }

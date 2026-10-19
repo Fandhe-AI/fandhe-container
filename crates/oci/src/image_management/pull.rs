@@ -806,12 +806,9 @@ impl PullSession<'_> {
         let mut dst_checked: BTreeMap<Digest, Option<FileIdent>> = BTreeMap::new();
         for b in &to_move {
             let dst = blob_path(&root, b)?;
-            if !cfg!(unix) {
-                // unix 以外は指紋で書き換えを検出できないため、既存の宛先は受け入れの対象にしない。
-                // 公開は digest 検証済みの一時名（`pin_staged_blobs`）の rename で行う（OCI-1・OCI-7）。
-                dst_checked.insert(b.clone(), None);
-                continue;
-            }
+            // Windows の指紋は size / mtime だけで差し替えを検出できないが、既存の宛先は受け入れの根拠にせず
+            // 報告（already_present か moved か）にだけ使う。宛先の内容は検証済みの一時名の rename で
+            // 常に確定する（OCI-1・OCI-7）。
             let size = self.verified.get(b).map_or(0, |v| v.size);
             let ident = match FileIdent::of_regular(&dst) {
                 Ok(Some(_)) if !is_trusted_regular(&dst, owner) => None,
@@ -881,8 +878,13 @@ impl PullSession<'_> {
                         .map_err(|_| err(OciErrorCode::Internal, "failed to publish blob"))?;
                     if !existed {
                         created.push(dst);
+                        moved.push(b.clone());
+                    } else if dst_checked.get(b).is_some_and(Option::is_some) {
+                        // ガードの外で digest 検証済みだった既存の宛先。同じ内容で置換済みのため報告だけ区別する。
+                        present.push(b.clone());
+                    } else {
+                        moved.push(b.clone());
                     }
-                    moved.push(b.clone());
                     pinned.remove(b);
                     fs::remove_file(&src)
                         .map_err(|_| err(OciErrorCode::Internal, "failed to remove staged blob"))?;
@@ -1923,13 +1925,8 @@ mod tests {
         let out = s
             .publish(PullPublishRequest::new(manifest_digest(), comp))
             .unwrap();
-        // Windows は既存の宛先を検証済みの一時名の rename で置換する（moved）。内容は同一。
-        if cfg!(unix) {
-            assert_eq!(out.already_present_blobs, vec![dg.clone()]);
-            assert!(out.moved_blobs.is_empty());
-        } else {
-            assert_eq!(out.moved_blobs, vec![dg.clone()]);
-        }
+        assert_eq!(out.already_present_blobs, vec![dg.clone()]);
+        assert!(out.moved_blobs.is_empty());
         assert_eq!(fs::read(&dst).unwrap(), b"config-body");
         assert!(!publish_tmp_path(&dst).exists());
     }

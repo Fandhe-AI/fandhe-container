@@ -65,7 +65,9 @@
 //!   制御チャネルの accept スレッドも #2043 で止める対象に 1 本増える（停止の口は `control::server::ControlServer::shutdown`）。
 //! - CLI の `stop`・`kill` からのシグナル送信は `control`（制御チャネル。#2058）が受け、CLI の `stop` は結線済み（#2059）。`kill` への結線（#1902）と
 //!   明示的な stop の意図の伝達（SUP-9）は未実装。
-//! - 権限モデルは `RootlessSingleId` のみ（実効 uid が 0 の rootful 起動は手順 4 で拒否する。SEC-5）。
+//! - 権限モデルは rootless のみ（実効 uid が 0 の rootful 起動は手順 4 で拒否する。SEC-5）。1 対 1 の `RootlessSingleId` か
+//!   範囲写像の `RootlessSubordinateIds` かは `/etc/subuid`・`/etc/subgid` の設定で選ぶ（#2243・CORE-6。規則と所有者名の
+//!   取得は `id_model`）。
 //!
 //! フェイクの [`StartDeps`] を使う試験（`tests/start_entry.rs`）が処理順・報告・後始末・relaunch のアダプタを照合し、
 //! 実プロセスでの通し（bin → 本番 launcher → `monitor`）は `tests/supervisor_bin_real.rs`（実機前提・`--ignored`）が照合する。
@@ -1735,7 +1737,7 @@ mod linux {
     use std::fs::File;
     use std::os::fd::AsFd as _;
     use std::os::unix::fs::FileTypeExt as _;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::ExitCode;
 
     use fandhe_container_core::audit_log::AuditSink;
@@ -1745,10 +1747,16 @@ mod linux {
     use fandhe_container_core::exec::IsolationPrivilege;
     use fandhe_container_core::landlock::detect_landlock_abi;
     use fandhe_container_core::oci_runtime::{
-        LinuxResourceLimits, ProductionLauncher, load_resource_limits,
+        LinuxResourceLimits, ProductionLauncher, ProductionLauncherBuilder, SubordinateIdSource,
+        load_resource_limits,
     };
+    use fandhe_container_core::rootless::{SubIdOwner, load_subordinate_ids};
 
     use super::*;
+    use crate::id_model::{
+        MAX_PASSWD_BYTES, RootlessIdModel, SubIdFileProbe, owner_name_from_passwd,
+        select_rootless_id_model,
+    };
     use crate::privilege::{MAX_STATUS_BYTES, parse_proc_status};
     use crate::start_contract::StartArgs;
 
@@ -1782,12 +1790,23 @@ mod linux {
     /// 構築器へ渡し、restart の再 launch も同じ launcher を使う（起動の経路を 2 つにしない。SUP-3）。
     pub struct ProductionStartDeps {
         root: PathBuf,
-        /// 自プロセスの資格情報から決めた権限モデル。決められなければ手順 4 がそのエラーで止める。
-        privilege: Result<IsolationPrivilege, TraitError>,
+        /// 自プロセスの資格情報と subuid / subgid の設定から決めた権限モデル。決められなければ手順 4 がそのエラーで止める。
+        privilege: Result<LaunchPrivilege, TraitError>,
+        /// 資格情報の検証だけで決めた権限モデル（rootful の拒否のみ。subuid / subgid・passwd に依存しない）。
+        /// 残存確認の launcher（`recover_interrupted`）はこちらだけを使う（CORE-2・CORE-6）。
+        recovery_privilege: Result<IsolationPrivilege, TraitError>,
         cgroup: Option<HeldCgroup>,
         audit: Option<Arc<dyn AuditSink>>,
         /// 退避で一緒に移す同伴プロセスの PID（監査 helper。`DelegatedCgroup::with_companions`）。
         companions: Vec<u32>,
+    }
+
+    /// 決めた権限モデルと、範囲写像のときの入力元（#2243・CORE-6）。
+    #[derive(Clone)]
+    struct LaunchPrivilege {
+        privilege: IsolationPrivilege,
+        /// `RootlessSubordinateIds` のときだけ `Some`（core の launcher 構築が取り違えを拒否する）。
+        subordinate: Option<SubordinateIdSource>,
     }
 
     /// 手順 5 で作った cgroup（`release_cgroup` と launcher の参加フックの源で共有する）。
@@ -1805,6 +1824,9 @@ mod linux {
     /// `RootfulHostRoot` を `Unimplemented` で拒否するのと揃えて、同じコードで拒否する（コンテナ内 root を
     /// ホスト root に写す起動を作らない）。それ以外は `RootlessSingleId`（特権ランチャーの ambient capability 経由でも
     /// uid は非 root）。rootful を許すかは #2241 で判断待ち（`docs/design/rootful-host-root.md`）。読めない・壊れた入力は fail-closed に `FailedPrecondition`。
+    ///
+    /// ここでは rootful の拒否と 1 対 1 写像の既定だけを決める。範囲写像（`RootlessSubordinateIds`）への切り替えは
+    /// `resolve_launch_privilege` が subuid / subgid の設定で行う（選択規則は `crate::id_model` の module doc。#2243）。
     fn privilege_for_status(text: &str) -> Result<IsolationPrivilege, TraitError> {
         let snapshot = parse_proc_status(text)
             .map_err(|e| TraitError::new(e.code, "failed to read the process credentials"))?;
@@ -1816,6 +1838,83 @@ mod linux {
             ));
         }
         Ok(IsolationPrivilege::RootlessSingleId)
+    }
+
+    /// 上限つきでファイルを読む（超過は `None`）。
+    fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        File::open(path)?
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut buf)?;
+        Ok((u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit).then_some(buf))
+    }
+
+    /// subuid / subgid の 1 ファイルを分類する（`ErrorCode::NotFound` はファイル無し。それ以外の失敗は `Unusable`）。
+    fn probe_sub_id_file(path: &Path, owner: &SubIdOwner) -> SubIdFileProbe {
+        match load_subordinate_ids(path, owner) {
+            Ok(ranges) if ranges.is_empty() => SubIdFileProbe::NoOwnerRows,
+            Ok(_) => SubIdFileProbe::Assigned,
+            Err(e) if e.code == ErrorCode::NotFound => SubIdFileProbe::Absent,
+            Err(_) => SubIdFileProbe::Unusable,
+        }
+    }
+
+    /// `/proc/self/status` の内容と 3 つの設定ファイルから権限モデルを決める（#2243・CORE-6・SEC-5）。
+    ///
+    /// 手順: rootful を拒否（`privilege_for_status`）→ `passwd` から実効 uid の名前を得る（NSS を使わない）→ subuid / subgid を
+    /// 分類 → `select_rootless_id_model`。範囲写像のときは `SubordinateIdSource::system` を添える（helper の有無は
+    /// ここでは見ず、core の launcher 構築が検証する。縮退しない）。構造化ログは出さない（手順 8 より前に常駐スレッドを
+    /// 作らない制約のため。選んだモデルは子の `uid_map` で確かめる）。
+    fn resolve_launch_privilege(
+        status_text: &str,
+        passwd: &Path,
+        subuid: &Path,
+        subgid: &Path,
+    ) -> Result<LaunchPrivilege, TraitError> {
+        let single = privilege_for_status(status_text)?;
+        let snapshot = parse_proc_status(status_text)
+            .map_err(|e| TraitError::new(e.code, "failed to read the process credentials"))?;
+        let (real, effective) = (snapshot.uid.real, snapshot.uid.effective);
+        let name = match read_bounded(passwd, MAX_PASSWD_BYTES) {
+            Ok(Some(bytes)) => owner_name_from_passwd(&bytes, effective)?,
+            Ok(None) => {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "the passwd database is unusable",
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "the passwd database is unusable",
+                ));
+            }
+        };
+        // 名前が規則（文字種・長さ）に違反する行は、None へ黙って落とさず拒否する（Single への縮退を避ける）。
+        let owner = SubIdOwner::new(effective, name.clone()).map_err(|_| {
+            TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the owner name is not usable for subordinate ids",
+            )
+        })?;
+        let model = select_rootless_id_model(
+            probe_sub_id_file(subuid, &owner),
+            probe_sub_id_file(subgid, &owner),
+            real,
+            effective,
+        )?;
+        match model {
+            RootlessIdModel::SingleId => Ok(LaunchPrivilege {
+                privilege: single,
+                subordinate: None,
+            }),
+            RootlessIdModel::SubordinateIds => Ok(LaunchPrivilege {
+                privilege: IsolationPrivilege::RootlessSubordinateIds,
+                subordinate: Some(SubordinateIdSource::system(name)?),
+            }),
+        }
     }
 
     /// `/proc/self/status` を上限つきで読む。
@@ -1839,14 +1938,50 @@ mod linux {
         /// 状態ルート（`--root`）から作る。権限モデルは自プロセスの資格情報から決める（`/proc/self/status` は
         /// dumpable 0 の影響を受ける `/proc/self` の所有者ではなく、内容を読む）。
         pub fn new(root: PathBuf) -> Self {
-            let privilege = read_self_status().and_then(|text| privilege_for_status(&text));
+            let status = read_self_status();
+            let recovery_privilege = status.clone().and_then(|text| privilege_for_status(&text));
+            let privilege = status.and_then(|text| {
+                resolve_launch_privilege(
+                    &text,
+                    Path::new("/etc/passwd"),
+                    Path::new("/etc/subuid"),
+                    Path::new("/etc/subgid"),
+                )
+            });
             Self {
                 root,
                 privilege,
+                recovery_privilege,
                 cgroup: None,
                 audit: None,
                 companions: Vec::new(),
             }
+        }
+
+        /// 決めた権限モデル（範囲写像なら入力元つき）を設定した launcher 構築器（構築の箇所をここ 1 つにする。
+        /// start と restart の再 launch が同じ設定を使う。SUP-3・CORE-6）。
+        ///
+        /// `with_mapping` が偽のときは範囲写像の入力元（subuid / subgid・helper）を渡さず、権限モデルも
+        /// `RootlessSingleId` にする。残存確認だけの launcher（`recover_interrupted`）は namespace も写像も作らず、
+        /// helper（`newuidmap` / `newgidmap`）の検証に依存させない（前の supervisor の死後に uidmap が壊れても、
+        /// 記録済みの cgroup 経由の後始末が止まらないように。CORE-2・CORE-6）。
+        fn launcher_builder(
+            &self,
+            with_mapping: bool,
+        ) -> Result<ProductionLauncherBuilder, TraitError> {
+            // 範囲写像なしのときは資格情報の検証だけで決める。subuid / subgid・passwd の検証結果
+            // （`self.privilege`）には依存しない。
+            let (privilege, subordinate) = if with_mapping {
+                let decided = self.privilege.clone()?;
+                (decided.privilege, decided.subordinate)
+            } else {
+                (self.recovery_privilege.clone()?, None)
+            };
+            let builder = ProductionLauncher::builder().privilege(privilege);
+            Ok(match subordinate {
+                Some(source) => builder.subordinate_ids(source),
+                None => builder,
+            })
         }
 
         /// cgroup の退避で自プロセスと一緒に移す同伴プロセス（入口が fork した監査 helper）の PID を宣言する。
@@ -1876,7 +2011,7 @@ mod linux {
             store: &dyn StateStore,
             observed: &StateRecord,
         ) -> Result<Option<StateRevision>, TraitError> {
-            let privilege = self.privilege.clone()?;
+            let privilege = self.privilege.clone()?.privilege;
             let to_trait = |e: fandhe_container_core::cgroups::CgroupError| {
                 TraitError::new(e.code, "failed to prepare the container cgroup")
             };
@@ -1971,7 +2106,6 @@ mod linux {
         /// （core の launcher が必須値の欠落を `InvalidArgument` で拒否する）。呼び出しプロセスは child subreaper に
         /// なる。launch の単一スレッド要求は入口が満たす（モジュール doc「手順 8 を入口スレッドで行う理由」）。
         fn build_launcher(&mut self) -> Result<Arc<dyn ProcessLauncher>, TraitError> {
-            let privilege = self.privilege.clone()?;
             let (Some(held), Some(audit)) = (self.cgroup.as_ref(), self.audit.as_ref()) else {
                 return Err(TraitError::new(
                     ErrorCode::Internal,
@@ -1979,8 +2113,8 @@ mod linux {
                 ));
             };
             let source = Arc::clone(&held.cgroup);
-            let launcher = ProductionLauncher::builder()
-                .privilege(privilege)
+            let launcher = self
+                .launcher_builder(true)?
                 .audit_sink(Arc::clone(audit))
                 .cgroup_join_source(move || source.join_hook())
                 .applied_resource_limits(held.applied_resources.clone())
@@ -1997,11 +2131,9 @@ mod linux {
             id: &ContainerId,
             timeouts: &StartTimeouts,
         ) -> Result<(), TraitError> {
-            let privilege = self.privilege.clone()?;
             let audit = crate::exec::default_audit_sink(Some(self.root.clone()))?;
             let launcher: Arc<dyn ProcessLauncher> = Arc::new(
-                ProductionLauncher::builder()
-                    .privilege(privilege)
+                self.launcher_builder(false)?
                     .audit_sink(Arc::new(audit))
                     .build()?,
             );
@@ -2305,6 +2437,184 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// 一時ディレクトリに passwd / subuid / subgid を置き、`resolve_launch_privilege` を呼ぶ。
+        fn resolve_with(
+            tag: &str,
+            passwd: Option<&str>,
+            subuid: Option<&str>,
+            subgid: Option<&str>,
+            uids: &str,
+        ) -> Result<LaunchPrivilege, TraitError> {
+            let dir = std::env::temp_dir().join(format!("fc-idm-{}-{tag}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let put = |name: &str, body: Option<&str>| {
+                let p = dir.join(name);
+                if let Some(b) = body {
+                    std::fs::write(&p, b).unwrap();
+                }
+                p
+            };
+            let (pw, su, sg) = (
+                put("passwd", passwd),
+                put("subuid", subuid),
+                put("subgid", subgid),
+            );
+            let r =
+                resolve_launch_privilege(&status(uids, "1000\t1000\t1000\t1000"), &pw, &su, &sg);
+            let _ = std::fs::remove_dir_all(&dir);
+            r
+        }
+
+        const ALICE: &str = "alice:x:1000:1000::/home/alice:/bin/sh\n";
+        const UIDS: &str = "1000\t1000\t1000\t1000";
+
+        /// CORE-6・SEC-5・#2243: 名前で書かれた両ファイルの行があれば範囲写像（入力元つき）。
+        #[test]
+        fn core6_subordinate_selected_by_name_rows() {
+            let r = resolve_with(
+                "sub",
+                Some(ALICE),
+                Some("alice:100000:65536\n"),
+                Some("alice:100000:65536\n"),
+                UIDS,
+            )
+            .unwrap();
+            assert_eq!(r.privilege, IsolationPrivilege::RootlessSubordinateIds);
+            assert!(r.subordinate.is_some());
+        }
+
+        /// CORE-6: passwd が無くても数値 uid の行なら範囲写像になる。
+        #[test]
+        fn core6_subordinate_selected_by_numeric_rows_without_passwd() {
+            let r = resolve_with(
+                "num",
+                None,
+                Some("1000:100000:65536\n"),
+                Some("1000:100000:65536\n"),
+                UIDS,
+            )
+            .unwrap();
+            assert_eq!(r.privilege, IsolationPrivilege::RootlessSubordinateIds);
+        }
+
+        /// CORE-6: 設定の無いホストは従来どおり 1 対 1（入力元なし）。
+        #[test]
+        fn core6_single_when_no_configuration() {
+            for subuid in [None, Some("bob:100000:65536\n")] {
+                let r = resolve_with("single", Some(ALICE), subuid, None, UIDS).unwrap();
+                assert_eq!(r.privilege, IsolationPrivilege::RootlessSingleId);
+                assert!(r.subordinate.is_none());
+            }
+        }
+
+        /// SEC-5: 片側だけ・解析不正・名前の規則違反は fail-closed（Single へ縮退しない）。
+        #[test]
+        fn sec5_partial_malformed_and_bad_name_are_rejected() {
+            let e = resolve_with(
+                "part",
+                Some(ALICE),
+                Some("alice:100000:65536\n"),
+                None,
+                UIDS,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), "subordinate id configuration is incomplete");
+            let e = resolve_with("bad", Some(ALICE), Some("alice:x:y\n"), None, UIDS)
+                .err()
+                .unwrap();
+            assert_eq!(e.message(), "subordinate id configuration is unreadable");
+            let e = resolve_with(
+                "name",
+                Some("a b:x:1000:1000::/h:/bin/sh\n"),
+                None,
+                None,
+                UIDS,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(
+                e.message(),
+                "the owner name is not usable for subordinate ids"
+            );
+        }
+
+        /// SEC-5: rootful は従来どおり UNIMPLEMENTED（設定ファイルに依らない）。
+        #[test]
+        fn sec5_rootful_still_rejected_before_any_file_is_read() {
+            let e = resolve_with("root", Some(ALICE), None, None, "0\t0\t0\t0")
+                .err()
+                .unwrap();
+            assert_eq!(e.code(), ErrorCode::Unimplemented);
+        }
+
+        /// REPAIR-1・SUP-3: launcher の構築器は 1 か所（start と restart の再 launch が同じ設定を使う）。
+        #[test]
+        fn launcher_builder_is_constructed_in_one_place() {
+            let src = include_str!("start_entry.rs");
+            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+            assert_eq!(
+                production.matches("ProductionLauncher::builder()").count(),
+                1
+            );
+        }
+
+        /// CORE-2・CORE-6: 中断した start の回復用 launcher は、helper が無くても構築できる（写像の検証に依存しない）。
+        /// 新規 start 用は helper の検証で拒否される。
+        #[test]
+        fn recovery_launcher_does_not_validate_mapping_helpers() {
+            struct NullSink;
+            impl AuditSink for NullSink {
+                fn record(
+                    &self,
+                    _: &fandhe_container_core::audit_log::AuditRecord,
+                ) -> Result<(), TraitError> {
+                    Ok(())
+                }
+            }
+            let dir = std::env::temp_dir().join(format!("fc-rec-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let missing = dir.join("absent");
+            let source = SubordinateIdSource::with_paths(
+                Some("alice".to_owned()),
+                &missing,
+                &missing,
+                &missing,
+                &missing,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            let mut deps = ProductionStartDeps::new(dir.clone());
+            deps.privilege = Ok(LaunchPrivilege {
+                privilege: IsolationPrivilege::RootlessSubordinateIds,
+                subordinate: Some(source),
+            });
+            deps.recovery_privilege = Ok(IsolationPrivilege::RootlessSingleId);
+            let sink: Arc<dyn AuditSink> = Arc::new(NullSink);
+            let strict = deps
+                .launcher_builder(true)
+                .unwrap()
+                .audit_sink(Arc::clone(&sink))
+                .build();
+            assert!(strict.is_err());
+            let recovery = deps
+                .launcher_builder(false)
+                .unwrap()
+                .audit_sink(sink)
+                .build();
+            assert!(recovery.is_ok());
+            // subuid / subgid の設定が壊れて `privilege` が Err でも、回復用の構築器は作れる（CORE-2・CORE-6）。
+            deps.privilege = Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "subordinate id configuration is unusable",
+            ));
+            assert!(deps.launcher_builder(true).is_err());
+            assert!(deps.launcher_builder(false).is_ok());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
 
         /// SEC-1・SUP-1・#2132: fd 0〜2 のどれかが閉じていれば FAILED_PRECONDITION、すべて開いていれば通る。
         #[test]

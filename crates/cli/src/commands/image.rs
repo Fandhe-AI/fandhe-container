@@ -1,13 +1,13 @@
-//! `image ls` / `system df` / `image rm` コマンド本体（oci の管理 API への配線。#2221・CLI-1・OCI-7・TASK-183）。
+//! `image ls` / `system df` / `image rm` / `image tag` コマンド本体（oci の管理 API への配線。#2221・#2316・CLI-1・OCI-7・TASK-183）。
 //!
 //! `commands::run_to` が argv を解析した後に [`run_image`] / [`run_system`] を呼ぶ。実処理は
 //! `fandhe-container-oci` の `image_management`（`ImageStore`・`ReferenceTable::list_images`・`disk_usage`・
-//! `plan_image_rm_with`・`execute_image_rm`）へ委ね、CLI は引数の解析・出力の整形・エラーの写像だけを担う。
+//! `plan_image_rm_with`・`execute_image_rm`・`ImageStore::tag_image`）へ委ね、CLI は引数の解析・出力の整形・エラーの写像だけを担う。
 //! イメージの参照解釈は oci の `ImageReference::parse`（docker.io の正規化・`library/` と `latest` の補完を含む）を唯一の判定とする。
 //!
 //! # 構文
 //!
-//! `image ls --image-root <abs>` / `system df --image-root <abs>` / `image rm [--force] --image-root <abs> <ref>`。
+//! `image ls --image-root <abs>` / `system df --image-root <abs>` / `image rm [--force] --image-root <abs> <ref>` / `image tag --image-root <abs> <source> <target>`。
 //! イメージストアの root は必須オプション `--image-root`（絶対パス）で受ける。既定位置は未決のため発明しない（下記「未実装」）。
 //! root は作らない（`ImageStore::open` が存在するディレクトリ・非 symlink であることだけを見る）。
 //!
@@ -22,6 +22,11 @@
 //! - `image rm`: `untagged\t<ref>`・`deleted\t<manifest>`・`deleted-blob\t<digest>` を 1 行 1 事実で出す。
 //!   blob の削除に失敗したもの（`undeleted_blobs`）があれば `undeleted-blob\t<digest>` を出したうえで `INTERNAL`（1）で失敗する
 //!   （参照テーブルは更新済みのため `Ok` で成功と見せない。REPAIR-4）。
+//! - `image tag`（#2316）: `tagged\t<tag>\t<manifest>`（新規）・`retagged\t<tag>\t<付け替え前>\t<付け替え後>`（付け替え）・
+//!   `unchanged\t<tag>\t<manifest>`（同じ付け先への再付与）を 1 行で出す。いずれも終了コード 0。`source` は既存タグまたは
+//!   manifest digest、`target` はタグ参照のみ（digest は `INVALID_ARGUMENT`）。タグ件数が oci の `MAX_TAG_REFS` を超える
+//!   新規タグは oci が `ResourceExhausted` で拒否し、core の `ErrorCode` に対応が無いため `INTERNAL`（1）と固定文言
+//!   （`MSG_TAG_LIMIT`）で返す（`RESOURCE_EXHAUSTED` の追加は ERR 系 spec の変更にあたり本 issue では行わない）。
 //!
 //! # エラー写像（ERR-1・ERR-2）
 //!
@@ -40,12 +45,12 @@
 //!
 //! - 参照テーブルのディスク永続化と読み込みは oci 側で未実装（#851・#854・#2315）。CLI は空の参照テーブルでしかストアを開けないため、
 //!   現状は `image ls` が常にヘッダのみ、`system df` の images 側が 0 件（キャッシュ側は実ファイルを全件「未登録」として数える）、
-//!   `image rm` が常に `NOT_FOUND` になる。永続化が入ったら `ImageStore::with_table` へ読み込み結果を渡す配線を足す。
+//!   `image rm` と `image tag` が常に `NOT_FOUND` になる（`image tag` は成功してもプロセス終了で消える）。永続化が入ったら `ImageStore::with_table` へ読み込み結果を渡す配線を足す。
 //! - `--image-root` 省略時の既定位置（Linux の root / rootless、macOS / Windows の置き場。MAC-4・WIN-1）は未決。
 //! - macOS / Windows ではイメージキャッシュの置き場（ゲスト VM 内かホストか）が未決のため、ローカルの oci を呼ばず
 //!   他コマンドと同じ plugin 解決の失敗（`list_logs::store_open_failure`）で fail-closed に失敗する。
 //! - `system df` の containers・staging・展開後サイズは oci が未計測のため出さない（#2222）。
-//! - `image tag` / `image prune` の CLI 配線、oci の `OciOpRecorder` と CLI 計測の橋渡しは範囲外。
+//! - `image prune` の CLI 配線、oci の `OciOpRecorder` と CLI 計測の橋渡しは範囲外。
 
 use std::io::Write;
 use std::num::NonZeroU32;
@@ -58,7 +63,8 @@ use fandhe_container_core::traits::{
 use fandhe_container_oci::error::{OciError, OciErrorCode};
 use fandhe_container_oci::image_management::{
     ContainerRefId, DiskUsage, ImageList, ImageRmKind, ImageRmOptions, ImageRmOutcome, ImageRmPlan,
-    ImageRmTarget, ImageStore, StoppedContainers, TagKey,
+    ImageRmTarget, ImageStore, ImageTagChange, ImageTagOutcome, ImageTagSource, StoppedContainers,
+    TagKey,
 };
 use fandhe_container_oci::reference::{Digest, ImageReference, Reference};
 
@@ -83,6 +89,8 @@ const MSG_IN_USE_HINT: &str =
 const MSG_UNDELETED: &str = "image record removed but some blob files could not be deleted";
 const MSG_BLOB_DIR: &str = "image store blob directory is invalid";
 const MSG_SCAN_LIMIT: &str = "image store scan limit exceeded";
+const MSG_TAG_LIMIT: &str = "image tag limit exceeded";
+const MSG_TAG_TARGET: &str = "target must be a tag reference";
 
 /// 失敗が出た段階。同じ `OciErrorCode` でも段階で意味が違う（`NotFound` はストア root の不在か対象イメージの不在か）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +103,8 @@ enum Stage {
     Read,
     /// `image rm` の判定・実行。
     Remove,
+    /// `image tag` の解決・登録（排他の取得失敗も含む）。
+    Tag,
 }
 
 /// oci の分類を core の `ErrorCode` へ写す。`OciErrorCode` は `#[non_exhaustive]` ではないが、将来の追加に備え未知は `Internal`。
@@ -118,7 +128,10 @@ fn failure_message(code: OciErrorCode, stage: Stage) -> &'static str {
         (Stage::Open, OciErrorCode::NotFound) => MSG_ROOT_NOT_FOUND,
         (Stage::Open, OciErrorCode::FailedPrecondition) => MSG_ROOT_NOT_DIRECTORY,
         (Stage::Lock, OciErrorCode::Timeout) => MSG_LOCKED,
-        (Stage::Remove, OciErrorCode::NotFound) => MSG_IMAGE_NOT_FOUND,
+        (Stage::Remove | Stage::Tag, OciErrorCode::NotFound) => MSG_IMAGE_NOT_FOUND,
+        // `ImageStore::tag_image` の Timeout は排他の取得失敗だけ。
+        (Stage::Tag, OciErrorCode::Timeout) => MSG_LOCKED,
+        (Stage::Tag, OciErrorCode::ResourceExhausted) => MSG_TAG_LIMIT,
         (Stage::Read | Stage::Remove, OciErrorCode::FailedPrecondition) => MSG_BLOB_DIR,
         (Stage::Read | Stage::Remove, OciErrorCode::ResourceExhausted) => MSG_SCAN_LIMIT,
         (_, OciErrorCode::InvalidArgument) => "invalid argument",
@@ -221,21 +234,87 @@ fn format_rm_outcome(o: &ImageRmOutcome) -> String {
     s
 }
 
-/// `<ref>` を `image rm` の対象へ変換する。純 digest（`sha256:<hex>`）を先に試し、それ以外は oci の参照解析に委ねる。
+/// 解析済みのイメージ参照（タグ参照か manifest digest か）。`image rm` の対象と `image tag` の source/target が共有する。
+enum ParsedRef {
+    Tag(TagKey),
+    Digest(Digest),
+}
+
+/// 純 digest（`sha256:<hex>`）を先に試し、それ以外は oci の参照解析に委ねる。
 /// `name@digest` は digest 優先（oci の正規化規則）。
-fn parse_target(input: &str) -> Result<ImageRmTarget, OciError> {
+fn parse_ref(input: &str) -> Result<ParsedRef, OciError> {
     if let Ok(d) = Digest::parse(input) {
-        return Ok(ImageRmTarget::Manifest(d));
+        return Ok(ParsedRef::Digest(d));
     }
     let r = ImageReference::parse(input)?;
     Ok(match r.reference() {
-        Reference::Tag(t) => ImageRmTarget::Tag(TagKey::new(
+        Reference::Tag(t) => ParsedRef::Tag(TagKey::new(
             r.registry().clone(),
             r.repository().clone(),
             t.clone(),
         )),
-        Reference::Digest(d) => ImageRmTarget::Manifest(d.clone()),
+        Reference::Digest(d) => ParsedRef::Digest(d.clone()),
     })
+}
+
+/// `<ref>` を `image rm` の対象へ変換する。
+fn parse_target(input: &str) -> Result<ImageRmTarget, OciError> {
+    Ok(match parse_ref(input)? {
+        ParsedRef::Tag(k) => ImageRmTarget::Tag(k),
+        ParsedRef::Digest(d) => ImageRmTarget::Manifest(d),
+    })
+}
+
+/// `image tag` の付け元（既存タグまたは manifest digest）へ変換する。
+fn parse_tag_source(input: &str) -> Result<ImageTagSource, OciError> {
+    Ok(match parse_ref(input)? {
+        ParsedRef::Tag(k) => ImageTagSource::Tag(k),
+        ParsedRef::Digest(d) => ImageTagSource::Manifest(d),
+    })
+}
+
+/// `image tag` の付けるタグへ変換する。digest 指定（`name@digest` を含む）は `INVALID_ARGUMENT`。
+fn parse_tag_target(input: &str) -> Result<TagKey, CliExit> {
+    match parse_ref(input) {
+        Ok(ParsedRef::Tag(k)) => Ok(k),
+        Ok(ParsedRef::Digest(_)) => Err(CliExit::Error(CliError::new(
+            ErrorCode::InvalidArgument,
+            MSG_TAG_TARGET,
+        ))),
+        Err(e) => Err(oci_failure(&e, Stage::Tag)),
+    }
+}
+
+/// `image tag` の結果を 1 行で整形する。未知の区分は `None`（成功を装わず呼び出し側が失敗させる）。
+fn format_tag_outcome(o: &ImageTagOutcome) -> Option<String> {
+    Some(match &o.change {
+        ImageTagChange::Added => format!("tagged\t{}\t{}\n", o.tag, o.manifest),
+        ImageTagChange::Moved { from } => {
+            format!("retagged\t{}\t{}\t{}\n", o.tag, from, o.manifest)
+        }
+        ImageTagChange::Unchanged => format!("unchanged\t{}\t{}\n", o.tag, o.manifest),
+        _ => return None,
+    })
+}
+
+/// `image tag` の実処理。解決・存在確認・登録は oci の排他区間（`ImageStore::tag_image`）で 1 回に行う。
+fn run_image_tag_with(
+    store: &ImageStore,
+    source: &ImageTagSource,
+    target: TagKey,
+    out: &mut dyn Write,
+) -> CliExit {
+    let outcome = match store.tag_image(source, target) {
+        Ok(o) => o,
+        Err(e) => return oci_failure(&e, Stage::Tag),
+    };
+    let Some(text) = format_tag_outcome(&outcome) else {
+        return CliExit::failed(ErrorCode::Internal);
+    };
+    match write_out(out, &text) {
+        Ok(()) => CliExit::Success,
+        Err(e) => e,
+    }
 }
 
 /// `image ls` の実処理（ストアは呼び出し側が開く）。
@@ -420,6 +499,20 @@ pub(super) fn run_image(global: &GlobalArgs, args: &ImageArgs, stdout: &mut dyn 
                     &|| stopped_snapshot(global),
                     stdout,
                 ),
+                Err(e) => e,
+            }
+        }),
+        ImageArgs::Tag(a) => with_ops("image_tag", || {
+            let source = match parse_tag_source(&a.source) {
+                Ok(s) => s,
+                Err(e) => return oci_failure(&e, Stage::Tag),
+            };
+            let target = match parse_tag_target(&a.target) {
+                Ok(t) => t,
+                Err(e) => return e,
+            };
+            match open_image_store(&a.image_root) {
+                Ok(store) => run_image_tag_with(&store, &source, target, stdout),
                 Err(e) => e,
             }
         }),
@@ -815,6 +908,148 @@ mod tests {
         );
     }
 
+    fn tag_store(tmp: &Tmp, tags: &[(&str, char)]) -> ImageStore {
+        let mut t = ReferenceTable::new();
+        add_manifest(&mut t, '1', 'a', &[]);
+        add_manifest(&mut t, '2', 'b', &[]);
+        for (name, m) in tags {
+            t.register_tag(key("library/busybox", name), &dg(*m))
+                .expect("tag");
+        }
+        ImageStore::with_table(tmp.path(), t).expect("open")
+    }
+
+    fn run_tag(store: &ImageStore, source: &str, target: &str) -> (CliExit, String) {
+        let source = parse_tag_source(source).expect("source");
+        let target = parse_tag_target(target).expect("target");
+        out_of(|o| run_image_tag_with(store, &source, target, o))
+    }
+
+    /// CLI-1・OCI-7: タグ source で新規タグを付けると tagged 行を出して 0。
+    #[test]
+    fn cli1_oci7_image_tag_added_by_tag_source() {
+        let tmp = Tmp::new();
+        let store = tag_store(&tmp, &[("latest", '1')]);
+        let (e, out) = run_tag(&store, "busybox:latest", "busybox:v2");
+        assert_eq!(e.exit_code(), 0);
+        assert_eq!(
+            out,
+            format!(
+                "tagged\tregistry-1.docker.io/library/busybox:v2\tsha256:{}\n",
+                "1".repeat(64)
+            )
+        );
+        let g = store.lock().expect("lock");
+        assert_eq!(g.tags().count(), 2);
+    }
+
+    /// CLI-1・OCI-7: digest source でも tagged 行になる。
+    #[test]
+    fn cli1_oci7_image_tag_by_digest_source() {
+        let tmp = Tmp::new();
+        let store = tag_store(&tmp, &[]);
+        let (e, out) = run_tag(&store, &format!("sha256:{}", "1".repeat(64)), "busybox:v1");
+        assert_eq!(e.exit_code(), 0);
+        assert_eq!(
+            out,
+            format!(
+                "tagged\tregistry-1.docker.io/library/busybox:v1\tsha256:{}\n",
+                "1".repeat(64)
+            )
+        );
+    }
+
+    /// CLI-1・OCI-7: 別 manifest を指すタグの付け替えは retagged 行（付け替え前 → 後）。
+    #[test]
+    fn cli1_oci7_image_tag_retag_reports_from_and_to() {
+        let tmp = Tmp::new();
+        let store = tag_store(&tmp, &[("latest", '1'), ("v2", '2')]);
+        let (e, out) = run_tag(&store, "busybox:latest", "busybox:v2");
+        assert_eq!(e.exit_code(), 0);
+        assert_eq!(
+            out,
+            format!(
+                "retagged\tregistry-1.docker.io/library/busybox:v2\tsha256:{}\tsha256:{}\n",
+                "2".repeat(64),
+                "1".repeat(64)
+            )
+        );
+        let g = store.lock().expect("lock");
+        assert_eq!(g.manifest_references(&dg('1')).tags.len(), 2);
+    }
+
+    /// CLI-1・OCI-7: 同じ付け先への再付与は unchanged 行で 0。
+    #[test]
+    fn cli1_oci7_image_tag_unchanged() {
+        let tmp = Tmp::new();
+        let store = tag_store(&tmp, &[("latest", '1'), ("v2", '1')]);
+        let (e, out) = run_tag(&store, "busybox:latest", "busybox:v2");
+        assert_eq!(e.exit_code(), 0);
+        assert_eq!(
+            out,
+            format!(
+                "unchanged\tregistry-1.docker.io/library/busybox:v2\tsha256:{}\n",
+                "1".repeat(64)
+            )
+        );
+    }
+
+    /// CLI-1・OCI-7・ERR-1: 存在しない source は 3 / NOT_FOUND で、stdout は空・テーブル不変・argv を出力しない。
+    #[test]
+    fn cli1_oci7_image_tag_unknown_source_is_not_found() {
+        let tmp = Tmp::new();
+        let store = tag_store(&tmp, &[("latest", '1')]);
+        let (e, out) = run_tag(&store, "nope", "busybox:v2");
+        assert_eq!(e.exit_code(), 3);
+        assert_eq!(e.code(), Some("NOT_FOUND"));
+        assert_eq!(out, "");
+        let err = stderr_of(&e);
+        assert!(err.contains(MSG_IMAGE_NOT_FOUND), "{err}");
+        assert!(!err.contains("nope"), "{err}");
+        assert_eq!(store.lock().expect("lock").tags().count(), 1);
+    }
+
+    /// CLI-1・OCI-7: digest を target にすると 2 / INVALID_ARGUMENT（name@digest も同じ）。
+    #[test]
+    fn cli1_oci7_image_tag_digest_target_is_invalid_argument() {
+        let h = "1".repeat(64);
+        for t in [format!("sha256:{h}"), format!("busybox@sha256:{h}")] {
+            let e = parse_tag_target(&t).expect_err("digest target");
+            assert_eq!(e.exit_code(), 2, "{t}");
+            assert_eq!(e.code(), Some("INVALID_ARGUMENT"), "{t}");
+            assert!(stderr_of(&e).contains(MSG_TAG_TARGET));
+        }
+        let e = parse_tag_target("UPPER CASE").expect_err("invalid");
+        assert_eq!(e.exit_code(), 2);
+        assert_eq!(
+            parse_tag_target("busybox:v2").expect("tag"),
+            key("library/busybox", "v2")
+        );
+    }
+
+    /// CLI-1・OCI-7: タグ件数が上限なら新規タグは 1 / INTERNAL と固定文言、付け替えは成功する。
+    #[test]
+    fn cli1_oci7_image_tag_limit_is_internal_with_fixed_message() {
+        use fandhe_container_oci::image_management::MAX_TAG_REFS;
+        let tmp = Tmp::new();
+        let mut t = ReferenceTable::new();
+        add_manifest(&mut t, '1', 'a', &[]);
+        add_manifest(&mut t, '2', 'b', &[]);
+        for i in 0..MAX_TAG_REFS {
+            t.register_tag(key("library/busybox", &format!("t{i}")), &dg('1'))
+                .expect("tag");
+        }
+        let store = ImageStore::with_table(tmp.path(), t).expect("open");
+        let (e, out) = run_tag(&store, "busybox:t0", "busybox:brand-new");
+        assert_eq!(e.exit_code(), 1);
+        assert_eq!(e.code(), Some("INTERNAL"));
+        assert!(stderr_of(&e).contains(MSG_TAG_LIMIT));
+        assert_eq!(out, "");
+        let (e, out) = run_tag(&store, &format!("sha256:{}", "2".repeat(64)), "busybox:t1");
+        assert_eq!(e.exit_code(), 0);
+        assert!(out.starts_with("retagged\t"), "{out}");
+    }
+
     /// OCI-7: undeleted_blobs が非空のときは INTERNAL で失敗する（整形は undeleted-blob 行を含む）。
     /// `ImageRmOutcome` は構築できないため、権限で削除を失敗させて実際に発生させる。
     #[cfg(unix)]
@@ -855,6 +1090,8 @@ mod tests {
             MSG_UNDELETED,
             MSG_BLOB_DIR,
             MSG_SCAN_LIMIT,
+            MSG_TAG_LIMIT,
+            MSG_TAG_TARGET,
         ] {
             assert!(
                 !m.contains(['"', '\\']) && !m.chars().any(char::is_control),
@@ -875,7 +1112,13 @@ mod tests {
             OciErrorCode::Internal,
         ];
         for c in codes {
-            for s in [Stage::Open, Stage::Lock, Stage::Read, Stage::Remove] {
+            for s in [
+                Stage::Open,
+                Stage::Lock,
+                Stage::Read,
+                Stage::Remove,
+                Stage::Tag,
+            ] {
                 let m = failure_message(c, s);
                 assert!(
                     !m.contains(['"', '\\']) && !m.chars().any(char::is_control),

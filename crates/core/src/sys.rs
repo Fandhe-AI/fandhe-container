@@ -4545,6 +4545,23 @@ pub(crate) fn set_non_dumpable() -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// 呼び出したプロセスを dumpable に戻す（`PR_SET_DUMPABLE` = 1。CORE-6・SEC-5・#2243）。
+///
+/// non-dumpable のプロセスの `/proc/<pid>` は root 所有になり、`newuidmap` / `newgidmap`（setuid helper）の
+/// 「呼び出し元と対象の所有者が一致する」検査が拒否する。subuid / subgid の範囲写像の書き込み
+/// （`isolate_rootless_subordinate`）の間だけ、non-dumpable で起動された呼び出しプロセス（写像の対象）を
+/// この関数で dumpable にし、書き込みの後に [`set_non_dumpable`] で戻す。
+pub(crate) fn set_dumpable_user() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみでポインタを渡さない。可変長部は `unsigned long` に合わせて u64 で渡す
+    // （arg2 = 1 が `SUID_DUMP_USER`。arg3〜5 はカーネルが参照しないが 0 に揃える）。呼び出したプロセスの
+    // `mm` のフラグを変えるだけで、メモリの内容・fd には触れない。
+    let rc = unsafe { prctl(consts::PR_SET_DUMPABLE, 1u64, 0u64, 0u64, 0u64) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
 /// 呼び出したプロセスの名前(`comm`。`PR_SET_NAME`)を設定する(TASK-29 追補・#1816。CORE-2)。
 ///
 /// 本番 launcher の中間プロセスが PID 1 を fork する直前に、起動ごとの識別子を設定する。名前は fork で子へ

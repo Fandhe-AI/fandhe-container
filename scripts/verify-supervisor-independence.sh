@@ -487,9 +487,10 @@ tracked_alive() {
 # 渡すだけで猶予後の SIGKILL を持たず（#1545）、PID 1 の init が SIGTERM を捨てる場合もあるため、成否に関わらず
 # 後続の同一性照合つき SIGTERM／SIGKILL を fallback として必ず残す（失敗は後始末の失敗にしない）。--check-restart
 # （--restart always）では stop の SIGTERM が restart の対象になる（SUP-9・#2162 待ち）ため呼ばない。
-# 呼び出しごと・段全体に期限を付ける（REPAIR-5）。引数は検証済みの id_prefix と連番から配列で組み、出力は捨てる。
+# 呼び出しごと・段全体に期限を付ける（REPAIR-5）。各 stop の上限・強制終了猶予・終了待機はすべて段全体 deadline の
+# 残り時間で制限し、段全体（既定 30 秒）を超えない。引数は検証済みの id_prefix と連番から配列で組み、出力は捨てる。
 cli_stop_survivors() {
-  local i call_s stage_s deadline total=0 ok=0 sid
+  local i call_s stage_s deadline total=0 ok=0 sid rem lim
   local -a stopped=()
   [ "$check_restart" -eq 0 ] || return 0
   call_s=10
@@ -501,14 +502,21 @@ cli_stop_survivors() {
     [ "$i" != "$target_index" ] || continue
     same_proc_alive "${pids[$i]}" "${pstart[$i]:-}" "$$" || continue
     total=$((total + 1))
-    [ "$SECONDS" -lt "$deadline" ] || continue
+    # 残り時間から強制終了猶予（2 秒）と終了待機の最小枠（1 秒）を引いた分を超えない上限で送る。足りなければ送らない。
+    rem=$((deadline - SECONDS - 3))
+    [ "$rem" -ge 1 ] || continue
+    lim="$call_s"
+    [ "$rem" -ge "$lim" ] || lim="$rem"
     sid="${id_prefix}-${i}"
-    if timeout --kill-after=2 "$call_s" "$cli_bin" --root "$state_root" stop "$sid" </dev/null >/dev/null 2>&1; then
+    if timeout --kill-after=2 "$lim" "$cli_bin" --root "$state_root" stop "$sid" </dev/null >/dev/null 2>&1; then
       stopped+=("$i")
     fi
   done
   if [ "${#stopped[@]}" -gt 0 ]; then
-    wait_until "$(( timeout_s < 10 ? timeout_s : 10 ))" _stopped_gone "${stopped[@]}" || true
+    rem=$((deadline - SECONDS))
+    [ "$rem" -le 10 ] || rem=10
+    [ "$rem" -ge 0 ] || rem=0
+    wait_until "$rem" _stopped_gone "${stopped[@]}" || true
     for i in "${stopped[@]}"; do
       if ! same_proc_alive "${pids[$i]}" "${pstart[$i]:-}" "$$"; then ok=$((ok + 1)); fi
     done

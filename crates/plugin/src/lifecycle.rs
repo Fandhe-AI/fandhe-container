@@ -3,7 +3,7 @@
 //! 子モジュール `mode` のモード選択 API（TASK-110.3・#260）。
 //!
 //! 呼び出しごとに plugin プロセスを spawn し、1 往復（要求フレーム送信 -> 応答フレーム受信）の
-//! 完了後に終了させる。呼び出し元は core 側の plugin proxy（TASK-114 ほか。依存方向は
+//! 完了後に終了させる。呼び出し元は core 側の plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 ほか。依存方向は
 //! `core -> plugin` のため、本モジュールは core の登録表を参照せず、検証済みの fd を持つ起動対象 [`PluginLaunchTarget`] を受け取る。#1856）。
 //!
 //! # 契約
@@ -35,7 +35,7 @@
 //!   他の socket・pipe・端末・通常ファイル・macOS）と、即時書き込みが全部は書けなかった場合は、固定長の延期表
 //!   （`drop_report`）へ積み、ホストが終了時に `take_pending_child_cleanup_failures` で取り出して出す。
 //!   即時に全部書けた記録は表へ積まない（重複させない）。SIGKILL・abort・シグナル再送出による終了と、取り出しを
-//!   呼ばないホスト（core の plugin proxy は TASK-114 で配線予定）では延期した記録は残らない（REPAIR-3）。plugin 由来の文字列は
+//!   呼ばないホスト（core の plugin proxy は #1869 の設計・TASK-114 で配線予定）では延期した記録は残らない（REPAIR-3）。plugin 由来の文字列は
 //!   載せない。`unreaped_error` で報告済みの子と、`Drop` の前に明示的な経路で手放した子（回収済み・他所で回収された
 //!   `Lost`。そこで返したグループ停止の失敗を含む）は記録しない。
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] のみ設定する（資格情報を継承させない）。
@@ -81,7 +81,7 @@
 //!   `signal_forward` 経由でグループ宛て（`kill(-pid)`）に転送し、孫まで届く（#1513）。親が SIGKILL・
 //!   abort で落ちた場合は転送されず、Linux の `PR_SET_PDEATHSIG` が止めるのは plugin 本体だけで孫は
 //!   残留し得る。macOS では plugin 本体も孫も残留し得る（kqueue `NOTE_EXIT` は将来課題）。
-//! - 要求 ID と応答 ID の対応づけ（TASK-114）。
+//! - 要求 ID と応答 ID の対応づけ（#1869 の設計）。
 
 mod drop_report;
 mod launch_target;

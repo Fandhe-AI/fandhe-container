@@ -658,6 +658,17 @@ fn start_reporting(
         record_start(recorder, started, matches!(attempt, Attempt::Started(_)));
         return match attempt {
             Attempt::Started(running) => {
+                // 応答ハブの開始を成功報告の前に済ませる（報告の後に失敗すると、CLI へ成功を返したコンテナを
+                // 回収して非 0 で終えることになるため。失敗なら回収して ERR を報告する。ERR-1・ERR-2・SEC-4）。
+                #[cfg(target_os = "linux")]
+                let running = match attach_seccomp_before_report(running, store, req.id(), timeouts)
+                {
+                    Ok(r) => r,
+                    Err((error, code)) => {
+                        report(out, &StartReport::failed(&error));
+                        return Err(code);
+                    }
+                };
                 report(
                     out,
                     &StartReport::Started {
@@ -698,6 +709,41 @@ fn start_reporting(
         }
     }
     Err(exit_code_for(ErrorCode::Internal))
+}
+
+/// 成功報告の前に seccomp の応答ハブへ初回の listener を渡す。ハブが無い・渡し済みなら何もしない。
+/// 渡せなければ起動したプロセスを回収して `Stopped` を記録し、報告する失敗と終了コードを返す（fail-closed）。
+#[cfg(target_os = "linux")]
+fn attach_seccomp_before_report(
+    running: Running,
+    store: &Arc<dyn StateStore>,
+    id: &ContainerId,
+    timeouts: &StartTimeouts,
+) -> Result<Running, (OciRuntimeError, NonZeroU8)> {
+    let Some(hub) = running.seccomp.clone() else {
+        return Ok(running);
+    };
+    if hub.is_attached() {
+        return Ok(running);
+    }
+    let attached = match running.process.take_seccomp_listener() {
+        Some(listener) => hub.attach(listener),
+        None => Err(TraitError::new(
+            ErrorCode::Internal,
+            "the seccomp listener was not delivered",
+        )),
+    };
+    let Err(e) = attached else {
+        return Ok(running);
+    };
+    log_event("seccomp_notify_failed", Some(e.code()));
+    let Running {
+        process, instance, ..
+    } = running;
+    let disposed = dispose(Some(process), None, timeouts);
+    let code = finish_disposed(store, id, instance, disposed, exit_code_for(e.code()).get());
+    let code = NonZeroU8::new(code).unwrap_or_else(|| exit_code_for(ErrorCode::Internal));
+    Err((op_err(e), code))
 }
 
 /// 報告 1 行を書く（失敗はログに出すだけで、監視・後始末は続ける）。
@@ -1620,7 +1666,9 @@ pub fn run_supervised(
     // seccomp の listener を取り出して応答ハブへ渡す（応答者のいない USER_NOTIF は拒否対象の syscall を止めるため、
     // 受け取れない・スレッドを作れないときは起動したプロセスを回収して非 0 で終わる。fail-closed。SEC-4・#2025）。
     #[cfg(target_os = "linux")]
-    if let Some(hub) = &seccomp {
+    if let Some(hub) = &seccomp
+        && !hub.is_attached()
+    {
         let attached = match process.take_seccomp_listener() {
             Some(listener) => hub.attach(listener),
             None => Err(TraitError::new(

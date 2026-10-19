@@ -214,6 +214,25 @@ pub(crate) fn set_passcred(fd: BorrowedFd<'_>) -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `fd` を `O_NONBLOCK` にする（`fcntl(F_GETFL)` + `F_SETFL`）。listener の `RECV` が poll の後の通知の取り消しで
+/// 無期限にブロックしないようにする（REPAIR-5）。open file description の状態なので複製した fd にも効く。
+pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 引数は整数のみ。`fd` は生存中の `BorrowedFd`。
+    let flags = unsafe { fcntl(fd.as_raw_fd(), consts::F_GETFL) };
+    if flags == -1 {
+        return Err(last_error());
+    }
+    // SAFETY: 引数は整数のみ（`F_SETFL` の第 3 引数は `int`）。`fd` は生存中の `BorrowedFd`。
+    let rc = unsafe { fcntl(fd.as_raw_fd(), consts::F_SETFL, flags | consts::O_NONBLOCK) };
+    if rc == -1 {
+        return Err(last_error());
+    }
+    Ok(())
+}
+
 /// `fd` が close-on-exec か（`fcntl(F_GETFD)`）。
 pub(crate) fn fd_is_cloexec(fd: BorrowedFd<'_>) -> Result<bool, SysError> {
     if !consts::SUPPORTED {
@@ -536,8 +555,13 @@ pub(crate) fn poll_listener(fd: BorrowedFd<'_>, timeout_ms: i32) -> Result<Liste
     }
 }
 
-/// 通知を 1 件受信する。対象が既に消えていた（`ENOENT`）ときは `Ok(None)`。
-/// 呼び出し前に [`poll_listener`] で `Readable` を確認する（無ければ到着までブロックする。利用者が 0 になれば戻る）。
+/// `EINTR` の再試行の上限。
+const RECV_EINTR_RETRIES: u32 = 8;
+
+/// 通知を 1 件受信する。対象が既に消えていた（`ENOENT`）か、待機中の通知が無かった（`O_NONBLOCK` の `EAGAIN`）ときは
+/// `Ok(None)`。`EINTR` は上限つきで再試行する。
+/// 呼び出し前に [`poll_listener`] で `Readable` を確認し、fd は [`set_nonblocking`] 済みであること
+/// （そうでないと poll の後に通知が取り消された場合に到着までブロックする）。
 pub(crate) fn notif_recv(fd: BorrowedFd<'_>) -> Result<Option<RawNotification>, SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
@@ -554,20 +578,34 @@ pub(crate) fn notif_recv(fd: BorrowedFd<'_>) -> Result<Option<RawNotification>, 
             args: [0; 6],
         },
     };
-    // SAFETY: `notif` は 80 バイトの `#[repr(C)]` で初期化済み・書き込み可能。`RECV` の要求サイズ（80）と一致し、
-    // カーネルは呼び出しの間だけそれへ書く。`fd` は生存中の `BorrowedFd`。
-    let rc = unsafe {
-        ioctl(
-            fd.as_raw_fd(),
-            SECCOMP_IOCTL_NOTIF_RECV,
-            &raw mut notif as usize as u64,
-        )
-    };
-    if rc == -1 {
-        return match last_error() {
-            SysError::Os(e) if e == ENOENT_ERRNO => Ok(None),
-            other => Err(other),
+    // `EINTR` は致命的にせず再試行する（ループが終わると listener が閉じ、以後の拒否が `ENOSYS` になり監査も止まるため）。
+    // 回数に上限を置き、超えたら `Ok(None)`（呼び出し側のループが停止フラグを見て次の poll へ進む。REPAIR-5）。
+    let mut attempts = 0;
+    loop {
+        // SAFETY: `notif` は 80 バイトの `#[repr(C)]` で初期化済み・書き込み可能。`RECV` の要求サイズ（80）と一致し、
+        // カーネルは呼び出しの間だけそれへ書く。`fd` は生存中の `BorrowedFd`。
+        let rc = unsafe {
+            ioctl(
+                fd.as_raw_fd(),
+                SECCOMP_IOCTL_NOTIF_RECV,
+                &raw mut notif as usize as u64,
+            )
         };
+        if rc != -1 {
+            break;
+        }
+        match last_error() {
+            // 対象が消えた。listener を `O_NONBLOCK` にしてあるので、poll の後に通知が取り消されても待たずに
+            // `EAGAIN` で戻る（無期限ブロックしない。REPAIR-5）。
+            SysError::Os(e) if e == ENOENT_ERRNO || e == super::EAGAIN => return Ok(None),
+            SysError::Os(e) if e == super::EINTR => {
+                attempts += 1;
+                if attempts >= RECV_EINTR_RETRIES {
+                    return Ok(None);
+                }
+            }
+            other => return Err(other),
+        }
     }
     Ok(Some(RawNotification {
         id: notif.id,

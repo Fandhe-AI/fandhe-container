@@ -95,7 +95,14 @@ impl AuditSink for VecSink {
 }
 
 /// 使い捨てスレッドの filter（probe）を包む。listener は 1 回だけ取り出せる。
-struct SharedProbe(Mutex<UserNotifProbe>);
+///
+/// listener の取り出し（`&mut`）だけを mutex で守り、`call_kcmp`（USER_NOTIF の応答待ちでブロックする）は
+/// mutex の外で呼ぶ。両方を同じ mutex の下で呼ぶと、`run_supervised` の `take_seccomp_listener` と
+/// デッドロックする（Bugbot 指摘）。
+struct SharedProbe {
+    listener: Mutex<Option<SeccompListener>>,
+    probe: UserNotifProbe,
+}
 
 /// 実プロセス（`sh -c`）を包み、probe があればその listener を `take_seccomp_listener` で 1 回だけ渡す。
 struct ShProcess {
@@ -130,7 +137,7 @@ impl LaunchedProcess for ShProcess {
     }
 
     fn take_seccomp_listener(&self) -> Option<SeccompListener> {
-        self.probe.as_ref()?.0.lock().unwrap().take_listener()
+        self.probe.as_ref()?.listener.lock().unwrap().take()
     }
 }
 
@@ -158,9 +165,11 @@ impl ProcessLauncher for ScriptLauncher {
             .spawn()
             .expect("spawn sh");
         let probe = if self.with_probe {
-            let p = Arc::new(SharedProbe(Mutex::new(
-                user_notif_probe_for_test().expect("probe"),
-            )));
+            let mut probe = user_notif_probe_for_test().expect("probe");
+            let p = Arc::new(SharedProbe {
+                listener: Mutex::new(probe.take_listener()),
+                probe,
+            });
             self.probes.lock().unwrap().push(Arc::clone(&p));
             Some(p)
         } else {
@@ -263,10 +272,7 @@ fn sec4_2025_first_and_restarted_listeners_are_both_served() {
                     assert!(started.elapsed() < Duration::from_secs(10), "launch {n}");
                     std::thread::sleep(Duration::from_millis(5));
                 };
-                let (errno, tid) = {
-                    let p = probe.0.lock().unwrap();
-                    (p.call_kcmp(), p.tid())
-                };
+                let (errno, tid) = (probe.probe.call_kcmp(), probe.probe.tid());
                 observed.push((errno, tid));
             }
             observed

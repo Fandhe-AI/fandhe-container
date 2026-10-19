@@ -357,12 +357,13 @@ fn listener_main<S: NotifySource>(
     let mut reported = CounterSnapshot::default();
     let mut last_report = Instant::now();
     loop {
+        // 通知が連続していても毎反復で停止要求を確かめる（REPAIR-5）。
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         match source.wait(POLL_INTERVAL) {
             Ok(Ready::Readable) => {}
             Ok(Ready::Idle) => {
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
                 report_if_due(counters, &mut reported, &mut last_report);
                 continue;
             }
@@ -606,6 +607,14 @@ impl SeccompNotifyHub {
         }
     }
 
+    /// 監視が動いているか（listener を渡し済みか）。start の報告の前に attach 済みなら `run_supervised` は渡し直さない。
+    pub fn is_attached(&self) -> bool {
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
+    }
+
     /// 監視を `timeout` まで待って畳む。集計を返す（動いていなければ `None`）。supervisor の全終了経路で呼ぶ。
     pub fn finish(&self, timeout: Duration) -> Option<CounterSnapshot> {
         let live = self
@@ -826,7 +835,19 @@ mod tests {
     ) -> CounterSnapshot {
         let h = hub(Arc::clone(sink), config);
         h.attach_with(fake, resolve).unwrap();
-        // 台本が尽きると Closed でスレッドが終わる。
+        // 台本が尽きると Closed でスレッドが終わる。終わる前に finish（停止要求）を出すと、毎反復の停止確認で
+        // 台本を処理し切る前に抜けるので、先に終了を待つ。
+        let end = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < end
+            && !h
+                .live
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_none_or(|l| l.listener.is_finished())
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
         h.finish(Duration::from_secs(10)).expect("live")
     }
 

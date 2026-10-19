@@ -422,6 +422,9 @@ pub(crate) fn receive_listener(
         .map_err(|why| ExecError::new(ErrorCode::Internal, STAGE, why))?;
     sys::send_nonblocking_unix(sock, &[ACK])
         .map_err(|e| ExecError::from_sys(e, STAGE, "send of the listener ACK"))?;
+    // `RECV` が poll の後の通知の取り消しで無期限にブロックしないようにする（REPAIR-5）。
+    sys::seccomp_notify::set_nonblocking(fd.as_fd())
+        .map_err(|e| ExecError::from_sys(e, STAGE, "set the seccomp listener non-blocking"))?;
     Ok(SeccompListener(fd))
 }
 
@@ -438,6 +441,13 @@ pub(crate) fn listener_socketpair() -> Result<(OwnedFd, OwnedFd), ExecError> {
         super::process::keep_above_stdio(child_end)?,
     ))
 }
+
+/// [`UserNotifProbe::call_kcmp`] が応答を待つ上限。
+#[cfg(any(test, feature = "exec-test-support"))]
+const KCMP_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// [`UserNotifProbe`] の Drop がスレッドの終了を待つ上限。
+#[cfg(any(test, feature = "exec-test-support"))]
+const PROBE_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// USER_NOTIF 版の filter を載せた使い捨てスレッド(試験専用。SEC-4・#2025)。
 ///
@@ -474,7 +484,8 @@ impl UserNotifProbe {
         if !sent {
             return Some(-1);
         }
-        rx.recv().unwrap_or(Some(-1))
+        // 応答者がいないと kcmp は止まり続けるので、有限時間で諦める（REPAIR-5）。
+        rx.recv_timeout(KCMP_REPLY_TIMEOUT).unwrap_or(Some(-1))
     }
 }
 
@@ -482,8 +493,15 @@ impl UserNotifProbe {
 impl Drop for UserNotifProbe {
     fn drop(&mut self) {
         self.commands.take();
+        // プローブスレッドが応答待ちで止まっていても無期限に待たない。期限内に終わらなければ放置する（REPAIR-5）。
         if let Some(t) = self.thread.take() {
-            let _ = t.join();
+            let end = std::time::Instant::now() + PROBE_JOIN_TIMEOUT;
+            while !t.is_finished() && std::time::Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
         }
     }
 }
@@ -546,6 +564,7 @@ pub fn user_notif_probe_for_test() -> Result<UserNotifProbe, String> {
         })
         .map_err(|e| e.to_string())?;
     let (fd, tid) = ready_rx.recv().map_err(|e| e.to_string())??;
+    sys::seccomp_notify::set_nonblocking(fd.as_fd()).map_err(|e| format!("nonblock: {e:?}"))?;
     Ok(UserNotifProbe {
         listener: Some(SeccompListener(fd)),
         tid,

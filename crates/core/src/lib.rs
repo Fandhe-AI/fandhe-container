@@ -44,6 +44,13 @@
 //! - `rootless`: user namespace の UID/GID 写像の設定・読み戻し検証（Linux 限定。CORE-6・SEC-5・
 //!   TASK-40.1）。検証済み写像型・subuid/subgid 解析・`Direct` / `newuidmap` 経由の書き込みが実装済みで、
 //!   `exec::isolate_rootless_subordinate` による起動フローへの組み込みも実装済み（TASK-40.2）。
+//!   本番 launcher（`oci_runtime::ProductionLauncher`）経由の流れ（#2009）: 構築時に `SubordinateIdSource` から
+//!   subuid / subgid の範囲と `newuidmap` / `newgidmap` の絶対パスを解決・検証し（ホスト ID 0 を含む構成と
+//!   helper 欠落は fork 前に拒否）、起動ごとにまず mapper を fork し、その後に中間プロセスが user namespace を unshare する。
+//!   mapper は外側の user namespace に残り、helper で写像を書いて読み戻し、応答後に中間プロセスが PID 1 を fork する。
+//!   責務境界は、`rootless` が写像の検証・書き込み・読み戻し、`exec` が計画・unshare・mapper の fork と失敗時の回収、
+//!   launcher が権限モデルの検査と構築時の解決。supervisor が `RootlessSubordinateIds` を選ぶ経路は未結線（#2243）、
+//!   `RootfulHostRoot` は未実装（`Unimplemented`。#2241）。詳細は `oci_runtime` の launcher と `rootless` のモジュール doc を参照。
 //!   `linux.uidMappings` の受理は後続、ファイル所有者検証（TASK-40.3）は未実装
 //! - `seccomp`: 禁止 syscall の一覧 `DeniedSyscall` と x86_64 / aarch64 別の番号テーブル（CORE-5・
 //!   TASK-38.1.1・#837。OS 非依存で syscall を持たない）。テーブルと BPF 構築

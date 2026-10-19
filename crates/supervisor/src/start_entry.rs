@@ -1804,7 +1804,7 @@ mod linux {
     /// real / effective / saved / fs のいずれかの uid が 0 なら rootful で、core の本番 launcher が
     /// `RootfulHostRoot` を `Unimplemented` で拒否するのと揃えて、同じコードで拒否する（コンテナ内 root を
     /// ホスト root に写す起動を作らない）。それ以外は `RootlessSingleId`（特権ランチャーの ambient capability 経由でも
-    /// uid は非 root）。読めない・壊れた入力は fail-closed に `FailedPrecondition`。
+    /// uid は非 root）。rootful を許すかは #2241 で判断待ち（`docs/design/rootful-host-root.md`）。読めない・壊れた入力は fail-closed に `FailedPrecondition`。
     fn privilege_for_status(text: &str) -> Result<IsolationPrivilege, TraitError> {
         let snapshot = parse_proc_status(text)
             .map_err(|e| TraitError::new(e.code, "failed to read the process credentials"))?;

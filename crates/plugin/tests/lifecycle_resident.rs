@@ -24,10 +24,10 @@ fn exe_target() -> fandhe_container_plugin::PluginLaunchTarget {
 #[test]
 fn plug7_resident_requires_unix_transport() {
     use fandhe_container_plugin::{
-        OneShotPlugin, PluginErrorCode, ResidentPlugin, ResidentStartTimeout,
+        PluginErrorCode, PluginLaunchSpec, ResidentPlugin, ResidentStartTimeout,
     };
     let dir = std::env::temp_dir();
-    let plugin = OneShotPlugin::new(exe_target(), vec![], dir).unwrap();
+    let plugin = PluginLaunchSpec::new(exe_target(), vec![], dir).unwrap();
     let err = ResidentPlugin::start(
         &plugin,
         ResidentStartTimeout::default(),
@@ -40,7 +40,7 @@ fn plug7_resident_requires_unix_transport() {
 #[cfg(unix)]
 mod unix {
     use fandhe_container_plugin::{
-        Frame, OneShotPlugin, OneShotTermination, PLUGIN_SOCKET_ENV, PluginErrorCode,
+        Frame, OneShotTermination, PLUGIN_SOCKET_ENV, PluginErrorCode, PluginLaunchSpec,
         ResidentCallRecord, ResidentPlugin, ResidentStartTimeout, ResidentState, RpcTimeout,
         UdsStream,
     };
@@ -238,12 +238,12 @@ mod unix {
         }
     }
 
-    fn plugin_for(dir: &TempDir) -> OneShotPlugin {
+    fn plugin_for(dir: &TempDir) -> PluginLaunchSpec {
         let args: Vec<OsString> = ["--exact", "unix::plugin_child_entry", "--test-threads=1"]
             .iter()
             .map(OsString::from)
             .collect();
-        OneShotPlugin::new(super::exe_target(), args, dir.0.clone()).unwrap()
+        PluginLaunchSpec::new(super::exe_target(), args, dir.0.clone()).unwrap()
     }
 
     fn start(
@@ -254,7 +254,7 @@ mod unix {
     }
 
     fn start_plugin(
-        plugin: OneShotPlugin,
+        plugin: PluginLaunchSpec,
         ms: u64,
     ) -> Result<ResidentPlugin, fandhe_container_plugin::PluginError> {
         let (r, lines) = start_audited_plugin(plugin, ms);
@@ -338,7 +338,7 @@ mod unix {
     }
 
     fn start_audited_plugin(
-        plugin: OneShotPlugin,
+        plugin: PluginLaunchSpec,
         ms: u64,
     ) -> (
         Result<ResidentPlugin, fandhe_container_plugin::PluginError>,
@@ -737,7 +737,7 @@ mod unix {
             program,
         )
         .unwrap();
-        let plugin = OneShotPlugin::new(target, vec![], dir.0.clone()).unwrap();
+        let plugin = PluginLaunchSpec::new(target, vec![], dir.0.clone()).unwrap();
         let e = ResidentPlugin::start(
             &plugin,
             ResidentStartTimeout::default(),
@@ -820,7 +820,7 @@ mod unix {
             .iter()
             .map(OsString::from)
             .collect();
-        let plugin = OneShotPlugin::new(fx.target(), args, dir.0.clone()).unwrap();
+        let plugin = PluginLaunchSpec::new(fx.target(), args, dir.0.clone()).unwrap();
         fx.replace_with_script();
         let mut session = start_plugin(plugin, 5000).unwrap();
         let child_pid = session.pid().unwrap();

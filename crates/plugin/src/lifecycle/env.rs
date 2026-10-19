@@ -1,6 +1,6 @@
 //! plugin 子プロセスへ追加で渡す環境変数の検証と保持（#1858・#1319・PLUG-7・PLUG-11・PLUG-12）。
 //!
-//! 役割: `OneShotPlugin::with_env` から呼ばれ、呼び出し側（core）が明示した名前と値の組を検証し、
+//! 役割: `PluginLaunchSpec::with_env` から呼ばれ、呼び出し側（core）が明示した名前と値の組を検証し、
 //! 検証済みの値だけを持つ型 `PluginEnvVars` にする。`plugin_command`（都度起動・常駐の共通の
 //! `Command` 組み立て口）が `env_clear()` の後にこの組を設定する。
 //!

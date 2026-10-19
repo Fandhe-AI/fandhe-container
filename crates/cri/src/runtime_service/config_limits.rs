@@ -109,6 +109,11 @@ impl BoundedConfig {
         self.retained_bytes
     }
 
+    /// 保持用に作り直した `config` の metadata（重複判定キーの組み立て用。ERR-3・TASK-57）。
+    pub(super) fn metadata(&self) -> Option<&PodSandboxMetadata> {
+        self.config.metadata.as_ref()
+    }
+
     /// 検証済みの `config` を取り出す。
     pub(super) fn into_config(self) -> PodSandboxConfig {
         self.config

@@ -2,7 +2,7 @@
 
 カーネルが返す seccomp と Landlock の拒否を、`AuditSink`（`FileAuditSink` ほか）へ届ける配送経路の候補を、同じ比較軸で並べた判断資料。
 
-> **位置づけ**: **方式は採用済み・一部実装（`KILL_PROCESS` 側の補助記録は #2004 で実装。ほかは未着手）**。TASK-41 追補・#1835 の設計ドラフトとして作り、2026-10-15 にオーナーが 4 章の組み合わせ案と 7 章の推奨を採用した（判断の記録は #2018 のコメント。11 章の承認事項 1〜4 を含む）。実装は 9 章の issue が担い、本書は実装済みを装わない（REPAIR-3）。SEC-4 の「100% 記録」は記録経路が利用できる環境で満たすと spec に明記した（fandhe-container-spec#21。11 章）。
+> **位置づけ**: **方式は採用済み・一部実装（`KILL_PROCESS` 側の補助記録は #2004 で実装。USER_NOTIF 版のフィルタ構築は #2023 で実装済みだが本番は未適用。ほかは未着手）**。TASK-41 追補・#1835 の設計ドラフトとして作り、2026-10-15 にオーナーが 4 章の組み合わせ案と 7 章の推奨を採用した（判断の記録は #2018 のコメント。11 章の承認事項 1〜4 を含む）。実装は 9 章の issue が担い、本書は実装済みを装わない（REPAIR-3）。SEC-4 の「100% 記録」は記録経路が利用できる環境で満たすと spec に明記した（fandhe-container-spec#21。11 章）。
 
 - 対象ビヘイビア: SEC-4（関連: SEC-2・CORE-1・CORE-5・SUP-2・SUP-6・REPAIR-3・REPAIR-5）
 - タスク: TASK-41 追補、MS-2、#1835（前提: #1834 の seccomp 拒否時の動作。origin/main 9a933113 で反映済み）
@@ -38,6 +38,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 | ---- | ---- | ---- |
 | seccomp 違反の記録の組み立て | フック実装済み。**呼び出し元（SIGSYS ハンドラ・USER_NOTIF の listener）が無く、本番経路から呼ばれない** | `crates/core/src/audit_log/seccomp_hook.rs`（`SeccompDenialReport::from_sigsys`・`from_user_notif`、`record_seccomp_denial`） |
 | 拒否時の動作（#1834） | `unshare`・`ptrace`・`kexec_load` の 3 件は `SECCOMP_RET_KILL_PROCESS`、残り 40 件は `ERRNO(EPERM)`（`mount`・`pivot_root`・`umount2` を含む。ESC-03 が EPERM を要求） | `crates/core/src/seccomp.rs`（`DenyAction`・`DeniedSyscall::deny_action`） |
+| USER_NOTIF 版のフィルタ構築（#2023） | `ErrnoDelivery::UserNotif` で ERRNO 側 40 件を `SECCOMP_RET_USER_NOTIF` にしたフィルタを構築できる（`build_deny_filter_with`）。KILL の 3 件・arch 不一致・x32 は不変。**本番の適用経路は ERRNO 版のまま**（listener 無しでは `ENOSYS` になり ESC-03 と食い違うため。配線は #2024・#2025） | `crates/core/src/seccomp.rs`・`crates/core/src/exec/seccomp.rs`（テスト） |
 | Landlock の記録 | プロセス内で観測した `EACCES` の写像まで（ワークロードの拒否の証拠にしない）。ABI 7 以上では `landlock_restrict_self` に `LOG_NEW_EXEC_ON` を渡してカーネル監査へ要求し、ABI 6 では縮退を `state.json` の `launchIsolation.landlock.audit` と構造化ログに出す（#2026。読み手は外部の auditd 等。ホストの audit 可否の判定と厳格モードは #2027） | `crates/core/src/audit_log/landlock.rs`（`landlock_denial_record`） |
 | 本番 sink | `FileAuditSink`（ファイル主経路と NETLINK_AUDIT フォールバック。常時 tee は未実装）。supervisor の exec 経路は `default_audit_sink` で配線済み（#1594） | `crates/core/src/audit_log/file_sink.rs`・`crates/supervisor/src/exec.rs` |
 | コンテナ ID | `AuditRecord::container_id`（#1618）はあるが、seccomp・Landlock の記録への付与は未実装 | `crates/core/src/audit_log.rs` |
@@ -127,7 +128,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 
 | 案 | 内容 | crate | issue |
 | -- | ---- | ----- | ----- |
-| 1 | `DenyAction` の拡張と USER_NOTIF 用フィルタの構築（命令数の期待値の更新） | core | #2023 |
+| 1 | `DenyAction` の拡張と USER_NOTIF 用フィルタの構築（命令数の期待値の更新） | core | #2023（構築関数とテストは実装済み。本番は未適用） |
 | 2 | listener fd の取得と受け渡し（`sys` のラッパー） | core・supervisor | #2024 |
 | 3 | supervisor の listener ループ（期限・PID 変換・`record_seccomp_denial`・`EPERM` 応答） | supervisor | #2025 |
 | 4 | `KILL_PROCESS` 側の記録（親の終了シグナルとカーネル監査の突き合わせ。レコード型の拡張の要否） | core・supervisor | #2004（実装済み。判断は 9.1） |

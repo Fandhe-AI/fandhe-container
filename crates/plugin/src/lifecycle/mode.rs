@@ -2,7 +2,7 @@
 //!
 //! 都度起動（[`call_once`]。TASK-110.1）と常駐（[`ResidentPlugin`]。TASK-110.2）を、呼び出し側が
 //! 値（[`PluginMode`]）で選べる統一入口 [`PluginSession`] として束ねる。呼び出し元は core 側の
-//! plugin proxy（TASK-114 ほか。依存方向は `core -> plugin`）で、本モジュールは起動・接続・回収・
+//! plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 ほか。依存方向は `core -> plugin`）で、本モジュールは起動・接続・回収・
 //! stderr 収集を自前で行わず、各モードの実装へ委譲する。既存の [`call_once`] / [`ResidentPlugin`] は
 //! 変更せず公開のまま残す。
 //!
@@ -28,7 +28,7 @@
 //!
 //! - 期限は各モード固有の型（[`OneShotTimeout`]・[`ResidentStartTimeout`]・[`RpcTimeout`]）を
 //!   [`PluginMode`] が保持する。無期限待ちや 0 / 上限超過は構築できない（REPAIR-5）。
-//! - 子プロセスの回収・socket の後始末・stderr の扱い・環境変数の遮断は各モードの契約に従う。
+//! - 子プロセスの回収・socket の後始末・stderr の扱い・環境変数の遮断は各モードの契約に従う（`OneShotPlugin::with_env` の組はどちらのモードでも渡る）。
 //!   [`PluginSession`] の破棄でも、常駐の子は [`ResidentPlugin`] の `Drop` で kill・回収される。
 //! - 非 unix では既存 API の挙動をそのまま伝播する（都度起動は `start` が成功し `call` が
 //!   `Unimplemented`、常駐は `start` が `Unimplemented`）。

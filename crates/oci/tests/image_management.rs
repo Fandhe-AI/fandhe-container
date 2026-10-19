@@ -1,11 +1,13 @@
 //! 参照テーブルの結合試験（OCI-7・TASK-183.1）。
 //!
 //! 公開 API（`ReferenceTable` ほか）だけを通し、manifest 登録からコンテナ・タグ・リースの
-//! 登録と解除、共有 blob の保護判定までを流す。永続化・CLI 経路は未実装のため対象外。
+//! 登録と解除、共有 blob の保護判定までを流す。`image tag` の排他下の入口（TASK-183.4）も
+//! `ImageStore` 経由で流す。永続化・CLI 経路は未実装のため対象外。
 
 use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::image_management::{
-    ContainerRefId, ManifestComposition, PullId, ReferenceTable, TagKey,
+    ContainerRefId, ImageStore, ImageTagChange, ImageTagSource, ManifestComposition, PullId,
+    ReferenceTable, TagKey,
 };
 use fandhe_container_oci::reference::{Digest, RegistryHost, Repository, Tag};
 
@@ -101,4 +103,38 @@ fn oci7_missing_targets_report_not_found() {
         .release_lease(&d(0x10), &PullId::new("p").expect("pull"))
         .expect_err("no lease");
     assert_eq!(e.code(), OciErrorCode::NotFound);
+}
+
+/// OCI-7（TASK-183.4）: `ImageStore` 経由のタグ付与 → 付け替え → 未登録 digest の NotFound。
+#[test]
+fn oci7_image_store_tag_flow_through_public_api() {
+    let root = std::env::temp_dir().join(format!("fc-oci-it-tag-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("mkdir");
+    let mut t = ReferenceTable::new();
+    for (m, c, l) in [(0xa0, 0xc1, 0x10), (0xb0, 0xc2, 0x11)] {
+        t.register_manifest(
+            d(m),
+            ManifestComposition::new(d(c), vec![d(l)]).expect("comp"),
+        )
+        .expect("register");
+    }
+    let store = ImageStore::with_table(&root, t).expect("open");
+
+    let added = store
+        .tag_image(&ImageTagSource::Manifest(d(0xa0)), tag("v1"))
+        .expect("add");
+    assert_eq!(added.change, ImageTagChange::Added);
+    let moved = store
+        .tag_image(&ImageTagSource::Manifest(d(0xb0)), tag("v1"))
+        .expect("move");
+    assert_eq!(moved.change, ImageTagChange::Moved { from: d(0xa0) });
+    let missing = store
+        .tag_image(&ImageTagSource::Manifest(d(0xee)), tag("v2"))
+        .unwrap_err();
+    assert_eq!(missing.code(), OciErrorCode::NotFound);
+    let g = store.lock().expect("lock");
+    assert_eq!(g.manifest_references(&d(0xb0)).tags, vec![tag("v1")]);
+    assert_eq!(g.tags().count(), 1);
+    drop(g);
+    std::fs::remove_dir_all(&root).expect("cleanup");
 }

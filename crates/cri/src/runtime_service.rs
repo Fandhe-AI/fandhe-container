@@ -13,6 +13,11 @@
 //! `StartContainer` は created から running へ遷移し、二重起動は `FAILED_PRECONDITION`（冪等にしない）。
 //! 実行層は既定では呼ばず、プロセスも起動しない記録上の遷移である。
 //!
+//! **Pod サンドボックスの重複（CRI-1・ERR-3・TASK-57）**: `RunPodSandboxRequest` にクライアント指定の ID は
+//! なく、ID はサービスが採番する。ERR-3 の対応表に従い、metadata の 4 項目（name・namespace・uid・attempt）が
+//! すべて一致する再作成を `ALREADY_EXISTS` とする（`attempt` などが 1 項目でも違えば別の Pod）。
+//! 記録が残る間は予約が保たれ、`StopPodSandbox` では解放されず、`RemovePodSandbox` で解放される。
+//!
 //! **実行層への接続（CRI-2・CRI-7・TASK-59.2・#438）**: [`CriRuntimeService::with_runtime`] で
 //! [`RuntimeAdapter`] と [`BundleProvider`] を注入すると、`CreateContainer` は bundle を用意して
 //! `ContainerRuntime::create`、`StartContainer` は `ContainerRuntime::start` を専用スレッド上で呼ぶ
@@ -26,7 +31,7 @@
 //! 実行層が running の可能性があるため記録を unknown にして再 Start を拒否する（fail-closed）。
 //!
 //! **Stop・Remove の接続（CRI-2・TASK-59.3・#439）**: 実行層接続時、実行層の資源を持つコンテナ
-//! （`runtime_leaked`）への `StopContainer` は `ContainerRuntime::stop`、`RemoveContainer` は
+//! （`runtime_owned`）への `StopContainer` は `ContainerRuntime::stop`、`RemoveContainer` は
 //! `delete(force)` と bundle の解放を経て記録を除去する。`StopPodSandbox` は配下の running・unknown を
 //! 猶予 0 で停止し、`RemovePodSandbox` は配下を 1 件ずつ回収してから sandbox を除去する。結果不明
 //! （期限超過・想定外の応答）は unknown で記録を保持し、Stop・Remove の再試行で回復できる。待ちは
@@ -61,8 +66,9 @@
 //! `ContainerStatus` は空 ID を `INVALID_ARGUMENT`、未知 ID（Remove 済みを含む）を `NOT_FOUND` にする。
 //! `ListContainers` は一致なし・未知 ID・`CONTAINER_UNKNOWN` を空の一覧とし、未知の state 値と過大な
 //! `label_selector` だけを `INVALID_ARGUMENT` にする。並びは `(created_at, id)` の昇順。labels・annotations は
-//! 無改変で返し、`envs` は返さない。`reason`・`image_ref`・`user`・`info` は空・0 のスタブ（`exit_code` は Stop 応答の値を反映）で、
-//! 実値は TASK-59（CRI-2）で埋める（REPAIR-3）。
+//! 無改変で返し、`envs` は返さない。`image_ref`・`user`・`info`・`message` は空・0 のスタブで、
+//! 実値は TASK-59（CRI-2）で埋める（REPAIR-3）。`exit_code` は実行層が報告した値を反映し、`reason` は
+//! その終了コードから導く（0 は `Completed`、非 0 は `Error`、不明は空。`OOMKilled` は未対応）。
 //!
 //! **スタブの明示（REPAIR-3）**: サンドボックスの状態はプロセス内メモリのレジストリにだけ持つ。
 //! 実行層（core）には未接続で、永続化もしない。TASK-59 で `StateStore` / `ContainerRuntime` へ置き換える
@@ -226,6 +232,11 @@ struct SandboxRecord {
 ///
 /// 不変条件: `retained_bytes` は `records` の、`container_retained_bytes` は `containers` の各記録の
 /// `retained_bytes` の合計に等しい。`container_keys` は `containers` と 1 対 1 に対応する。
+///
+/// サンドボックスの重複判定（ERR-3・CRI-1・TASK-57）は専用の索引を持たず、`records` の metadata
+/// 4 項目（name・namespace・uid・attempt）を走査して行う。件数は上限（既定 1024）で有界で、
+/// 索引を持たないため metadata の写しによる保持量の二重計上と、記録との不整合が起きない。
+/// Stop では記録が残るため解放されず、Remove で記録とともに解放される。
 #[derive(Debug, Default)]
 struct SandboxRegistry {
     records: HashMap<String, SandboxRecord>,
@@ -327,7 +338,8 @@ struct InFlightGuard {
     outcome_unknown: bool,
     /// 実行層が停止済みと報告した（Start の応答が Stopped）。破棄時に結果不明ではなく exited へ反映する。
     confirmed_exited: bool,
-    /// 実行層が停止応答で返した終了コード（Stop の commit で記録へ反映する。判明しなければ 0 のまま。CRI-2）。
+    /// 実行層が報告した終了コード（Stop の commit と Start の終了済み応答の後始末で記録へ反映する。
+    /// 不明は None のままで、reason を空にする。CRI-2・REPAIR-3）。
     exit_code: Option<i32>,
 }
 
@@ -345,7 +357,7 @@ impl InFlightGuard {
         }
     }
 
-    /// 実行層が停止応答で報告した終了コードを、commit で記録へ反映するよう保持する（CRI-2）。
+    /// 実行層が報告した終了コードを、commit または破棄時の exited 反映で記録へ書くよう保持する（CRI-2）。
     fn set_exit_code(&mut self, exit_code: Option<i32>) {
         self.exit_code = exit_code;
     }
@@ -405,6 +417,7 @@ impl Drop for InFlightGuard {
                 self.kind,
                 self.outcome_unknown,
                 self.confirmed_exited,
+                self.exit_code,
             );
         }
     }
@@ -625,14 +638,14 @@ fn commit_in_flight(
     if kind == InFlightKind::Create {
         // 実行層に資源（コンテナ・bundle）が存在する。Remove は実行層の delete 経由で解放し
         // （TASK-59.3）、それまで追跡情報・名前キー・件数枠を保持する。
-        record.runtime_leaked = true;
+        record.runtime_owned = true;
     }
     if kind == InFlightKind::Stop {
         // 実行層が停止済みと報告した。現在時刻を終了時刻とする。
         record.state = ContainerState::Exited;
         record.finished_at_nanos = at_nanos;
-        // 実行層が返した終了コード（137 等）を保持する。不明（None）は 0 のまま。
-        record.exit_code = exit_code.unwrap_or(0);
+        // 実行層が返した終了コード（137 等）を保持する。不明（None）は None のままで reason は空になる。
+        record.exit_code = exit_code;
     }
     if kind == InFlightKind::Start {
         record.state = ContainerState::Running;
@@ -652,7 +665,7 @@ fn commit_in_flight(
 /// unknown（外向きは CONTAINER_UNKNOWN。終了時刻は設定しない）にする（再 Start による二重起動を防ぐ fail-closed。
 /// Stop・Remove の再試行で実状態を照合する〔TASK-59.3〕）。
 ///
-/// Stop・Remove の `outcome_unknown` も unknown で保持する（記録と `runtime_leaked` を残し、再試行で回復できる）。
+/// Stop・Remove の `outcome_unknown` も unknown で保持する（記録と `runtime_owned` を残し、再試行で回復できる）。
 /// 確定失敗は `in_flight` を解くだけで状態を変えない。
 fn rollback_in_flight(
     registry: &Mutex<SandboxRegistry>,
@@ -660,6 +673,7 @@ fn rollback_in_flight(
     kind: InFlightKind,
     outcome_unknown: bool,
     confirmed_exited: bool,
+    exit_code: Option<i32>,
 ) {
     match kind {
         InFlightKind::Create if !outcome_unknown => {
@@ -699,13 +713,15 @@ fn rollback_in_flight(
                 if confirmed_exited {
                     record.state = ContainerState::Exited;
                     record.finished_at_nanos = finished_at_nanos;
+                    // 実行層が終了済みと報告した応答の終了コード。不明（None）は reason を空のままにする。
+                    record.exit_code = exit_code;
                 } else if outcome_unknown {
                     // 停止を確認できないため exited にせず unknown で保持する（終了時刻・終了コードは設定しない。
                     // 生存中のプロセスを終了済みと公開して重複実行を招かない。CRI-2・REPAIR-5）。
                     record.state = ContainerState::Unknown;
                     // Create の結果不明は実行層に資源が残りうる。Remove は実行層の delete 経由で行う（TASK-59.3）。
                     if kind == InFlightKind::Create {
-                        record.runtime_leaked = true;
+                        record.runtime_owned = true;
                     }
                 }
             }
@@ -730,7 +746,7 @@ fn drop_container_in(
             "container operation in progress",
         ));
     }
-    if record.runtime_leaked && !include_in_flight {
+    if record.runtime_owned && !include_in_flight {
         return Err(CriError::failed_precondition(
             "container resources are pending runtime cleanup",
         ));
@@ -881,6 +897,20 @@ impl CriRuntimeService {
             .registry
             .lock()
             .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+        // 重複判定は上限検査より先に行う（満杯でも具体的な ALREADY_EXISTS を返す。ERR-3）。
+        let duplicate = config.metadata().is_some_and(|m| {
+            registry.records.values().any(|r| {
+                r.config.metadata.as_ref().is_some_and(|e| {
+                    e.name == m.name
+                        && e.namespace == m.namespace
+                        && e.uid == m.uid
+                        && e.attempt == m.attempt
+                })
+            })
+        });
+        if duplicate {
+            return Err(CriError::already_exists("sandbox already exists"));
+        }
         if registry.records.len() >= self.limits.max_sandboxes {
             return Err(CriError::failed_precondition("too many sandboxes"));
         }
@@ -938,7 +968,7 @@ impl CriRuntimeService {
         if registry
             .containers
             .values()
-            .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && (c.in_flight || c.runtime_leaked))
+            .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && (c.in_flight || c.runtime_owned))
         {
             return Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
@@ -995,7 +1025,7 @@ impl CriRuntimeService {
         if registry
             .containers
             .values()
-            .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && c.runtime_leaked)
+            .any(|c| c.pod_sandbox_id == req.pod_sandbox_id && c.runtime_owned)
         {
             return Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
@@ -1112,10 +1142,10 @@ impl CriRuntimeService {
                 created_at_nanos,
                 started_at_nanos: 0,
                 finished_at_nanos: 0,
-                exit_code: 0,
+                exit_code: None,
                 retained_bytes,
                 in_flight,
-                runtime_leaked: false,
+                runtime_owned: false,
             },
         );
         registry.container_keys.insert(key);
@@ -1290,6 +1320,7 @@ impl CriRuntimeService {
                 }
                 // 終了済みは created へ戻さず、guard の破棄で exited へ反映する（再 Start を実行層へ届けない）。
                 CriContainerState::ContainerExited => {
+                    guard.set_exit_code(status.exit_code);
                     guard.mark_confirmed_exited();
                     Err(CriError::failed_precondition(
                         "container has already exited",
@@ -1305,7 +1336,7 @@ impl CriRuntimeService {
 
     /// 実行層接続時の `StopContainer`（TASK-59.3・CRI-2）。
     ///
-    /// 実行層の資源を持つ記録（`runtime_leaked`）だけを `ContainerRuntime::stop` へ渡す。それ以外
+    /// 実行層の資源を持つ記録（`runtime_owned`）だけを `ContainerRuntime::stop` へ渡す。それ以外
     /// （スタブ経路の記録）は従来の記録上の遷移。exited は冪等に成功し実行層を呼ばず、created は
     /// `FAILED_PRECONDITION`。running と unknown（結果不明の回復）は仮登録して実行層を呼ぶ。
     async fn stop_container_runtime(
@@ -1331,7 +1362,7 @@ impl CriRuntimeService {
                 .containers
                 .get_mut(&req.container_id)
                 .ok_or_else(|| CriError::not_found("container not found"))?;
-            if !record.runtime_leaked {
+            if !record.runtime_owned {
                 drop(registry);
                 return self.stop_container_impl(req);
             }
@@ -1417,7 +1448,7 @@ impl CriRuntimeService {
             let Some(record) = registry.containers.get_mut(&req.container_id) else {
                 return Ok(v1::RemoveContainerResponse {});
             };
-            if !record.runtime_leaked {
+            if !record.runtime_owned {
                 drop(registry);
                 return self.remove_container_impl(req);
             }
@@ -1518,7 +1549,7 @@ impl CriRuntimeService {
                 .iter_mut()
                 .filter(|(_, c)| c.pod_sandbox_id == req.pod_sandbox_id)
             {
-                match (c.runtime_leaked, c.state) {
+                match (c.runtime_owned, c.state) {
                     (
                         true,
                         ContainerState::Running | ContainerState::Unknown | ContainerState::Created,
@@ -1585,7 +1616,7 @@ impl CriRuntimeService {
             for (id, c) in registry
                 .containers
                 .iter_mut()
-                .filter(|(_, c)| c.pod_sandbox_id == req.pod_sandbox_id && c.runtime_leaked)
+                .filter(|(_, c)| c.pod_sandbox_id == req.pod_sandbox_id && c.runtime_owned)
             {
                 c.in_flight = true;
                 ids.push(id.clone());
@@ -1632,7 +1663,7 @@ impl CriRuntimeService {
         // 実行層の資源を持つ記録の停止は `stop_container_runtime`（実行層の stop）が担う。この経路は
         // 実行層未接続のスタブ用で、記録だけ Exited にすると実プロセスが生存したまま「停止済み」と返るため
         // 念のため拒否する（CRI-1・REPAIR-3。fail-closed。Remove 系と同じ code）。
-        if record.runtime_leaked {
+        if record.runtime_owned {
             return Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
             ));
@@ -1647,7 +1678,7 @@ impl CriRuntimeService {
             ContainerState::Created => Err(CriError::failed_precondition(
                 "container is not in running state",
             )),
-            // 結果不明は停止を確認できないため拒否する（通常は runtime_leaked の拒否が先に効く）。
+            // 結果不明は停止を確認できないため拒否する（通常は runtime_owned の拒否が先に効く）。
             ContainerState::Unknown => Err(CriError::failed_precondition(
                 "container resources are pending runtime cleanup",
             )),
@@ -1971,6 +2002,7 @@ impl RuntimeService for CriRuntimeService {
 
     /// サンドボックス ID を採番し、状態 ready で登録する（CRI-1・TASK-57.1）。
     ///
+    /// 同一 metadata（name・namespace・uid・attempt の 4 項目）の再作成は `ALREADY_EXISTS`（ERR-3）。
     /// 失敗時はレジストリを変更しない。成功・失敗のどちらでも、結果のステータスコードと所要時間を
     /// 記録先へ 1 件渡す（REPAIR-4。未確定のまま抜けた場合はガードが `Internal` として記録する）。
     async fn run_pod_sandbox(
@@ -2584,7 +2616,7 @@ mod tests {
             .unwrap()
             .into_inner()
             .pod_sandbox_id;
-        let b = run(&svc, Some(config("p")), "")
+        let b = run(&svc, Some(config("q")), "")
             .unwrap()
             .into_inner()
             .pod_sandbox_id;
@@ -2614,7 +2646,7 @@ mod tests {
     fn task_57_1_limit_returns_failed_precondition() {
         let svc = CriRuntimeService::with_max_sandboxes(1);
         run(&svc, Some(config("p")), "").unwrap();
-        let err = run(&svc, Some(config("p")), "").unwrap_err();
+        let err = run(&svc, Some(config("q")), "").unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert_eq!(svc.sandbox_count(), 1);
     }
@@ -2665,9 +2697,10 @@ mod tests {
         let cfg = config("p");
         // `config()` は labels 1 件・annotations 1 件を持つ。
         let per_sandbox = cfg.encoded_len() + 2 * 256 + 4096;
-        run(&svc, Some(cfg.clone()), "").unwrap();
-        assert_eq!(svc.retained_bytes(), per_sandbox);
         run(&svc, Some(cfg), "").unwrap();
+        assert_eq!(svc.retained_bytes(), per_sandbox);
+        // 同じ長さの別名（同一 metadata は ALREADY_EXISTS になるため）。
+        run(&svc, Some(config("q")), "").unwrap();
         assert_eq!(svc.retained_bytes(), 2 * per_sandbox);
         let reg = svc.registry.lock().unwrap();
         let sum: usize = reg.records.values().map(|r| r.retained_bytes).sum();
@@ -2689,16 +2722,16 @@ mod tests {
 
         let exact = service(2 * per_sandbox);
         run(&exact, Some(cfg.clone()), "").unwrap();
-        run(&exact, Some(cfg.clone()), "").unwrap();
-        let err = run(&exact, Some(cfg.clone()), "").unwrap_err();
+        run(&exact, Some(config("q")), "").unwrap();
+        let err = run(&exact, Some(config("r")), "").unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert_eq!(err.message(), "sandbox config storage is full");
         assert_eq!(exact.sandbox_count(), 2);
         assert_eq!(exact.retained_bytes(), 2 * per_sandbox);
 
         let one_short = service(2 * per_sandbox - 1);
-        run(&one_short, Some(cfg.clone()), "").unwrap();
-        let err = run(&one_short, Some(cfg), "").unwrap_err();
+        run(&one_short, Some(cfg), "").unwrap();
+        let err = run(&one_short, Some(config("q")), "").unwrap_err();
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert_eq!(one_short.sandbox_count(), 1);
         assert_eq!(one_short.retained_bytes(), per_sandbox);
@@ -2746,6 +2779,8 @@ mod tests {
         let svc = service(SandboxLimits::new().with_max_sandboxes(1));
         run(&svc, Some(cfg.clone()), "").unwrap();
         run(&svc, None, "").unwrap_err();
+        run(&svc, Some(config("q")), "").unwrap_err();
+        // 同一 metadata の重複は ALREADY_EXISTS（件数超過より先に判定する。ERR-3）。
         run(&svc, Some(cfg.clone()), "").unwrap_err();
 
         let svc = service(SandboxLimits::new().with_max_retained_bytes(per_sandbox - 1));
@@ -2773,6 +2808,7 @@ mod tests {
                 (kind, CriOpOutcome::Success, Code::Ok),
                 (kind, CriOpOutcome::Failure, Code::InvalidArgument),
                 (kind, CriOpOutcome::Failure, Code::FailedPrecondition),
+                (kind, CriOpOutcome::Failure, Code::AlreadyExists),
                 (kind, CriOpOutcome::Failure, Code::FailedPrecondition),
                 (kind, CriOpOutcome::Failure, Code::Internal),
             ]
@@ -2838,8 +2874,11 @@ mod tests {
         )
     }
 
+    /// 呼び出しごとに一意な name で Run する（同一 metadata は ALREADY_EXISTS になるため。ERR-3）。
     fn run_id(svc: &CriRuntimeService) -> String {
-        run(svc, Some(config("p")), "")
+        static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        run(svc, Some(config(&format!("p{}", n % 10_000))), "")
             .unwrap()
             .into_inner()
             .pod_sandbox_id
@@ -2864,12 +2903,13 @@ mod tests {
         let svc = CriRuntimeService::new();
         let id = run_id(&svc);
         let retained = svc.retained_bytes();
+        let original = svc.registry.lock().unwrap().records[&id].config.clone();
         for _ in 0..2 {
             stop(&svc, &id).unwrap();
             let reg = svc.registry.lock().unwrap();
             let rec = reg.records.get(&id).unwrap();
             assert_eq!(rec.state.to_proto(), PodSandboxState::SandboxNotready);
-            assert_eq!(rec.config, config("p"));
+            assert_eq!(rec.config, original);
             assert_eq!(rec.retained_bytes, retained);
         }
         assert_eq!(svc.retained_bytes(), retained);
@@ -2936,6 +2976,87 @@ mod tests {
     fn task_57_2_remove_frees_slot_for_new_run() {
         let svc = CriRuntimeService::with_max_sandboxes(1);
         let id = run_id(&svc);
+        remove(&svc, &id).unwrap();
+        run(&svc, Some(config("p")), "").unwrap();
+        assert_eq!(svc.sandbox_count(), 1);
+    }
+
+    /// ERR-3・CRI-1・TASK-57.1: metadata 4 項目が一致する 2 回目の Run は ALREADY_EXISTS で、
+    /// 件数と保持量は増えない。
+    #[test]
+    fn task_57_1_duplicate_metadata_returns_already_exists() {
+        let svc = CriRuntimeService::new();
+        run(&svc, Some(config("p")), "").unwrap();
+        let (count, bytes) = (svc.sandbox_count(), svc.retained_bytes());
+        let err = run(&svc, Some(config("p")), "").unwrap_err();
+        assert_eq!(err.code(), Code::AlreadyExists);
+        assert_eq!(err.message(), "sandbox already exists");
+        assert_eq!((svc.sandbox_count(), svc.retained_bytes()), (count, bytes));
+    }
+
+    /// ERR-3・TASK-57.1: 4 項目のうち 1 つだけ違う要求は別の Pod として受け付ける。
+    #[test]
+    fn task_57_1_metadata_differing_in_one_field_is_accepted() {
+        let svc = CriRuntimeService::new();
+        run(&svc, Some(config("p")), "").unwrap();
+        for field in 0..4 {
+            let mut c = config("p");
+            let m = c.metadata.as_mut().unwrap();
+            match field {
+                0 => m.name = "other".into(),
+                1 => m.namespace = "other".into(),
+                2 => m.uid = "other".into(),
+                _ => m.attempt += 1,
+            }
+            run(&svc, Some(c), "").unwrap();
+        }
+        assert_eq!(svc.sandbox_count(), 5);
+    }
+
+    /// ERR-3・TASK-57.1: 件数上限に達していても、同一 metadata は ALREADY_EXISTS を優先する。
+    #[test]
+    fn task_57_1_duplicate_is_checked_before_limit() {
+        let svc = CriRuntimeService::with_max_sandboxes(1);
+        run(&svc, Some(config("p")), "").unwrap();
+        let err = run(&svc, Some(config("p")), "").unwrap_err();
+        assert_eq!(err.code(), Code::AlreadyExists);
+    }
+
+    /// ERR-3・TASK-57.1: 同じ要求が並行しても成功は 1 件だけで、残りは ALREADY_EXISTS。
+    #[test]
+    fn task_57_1_concurrent_duplicate_run_succeeds_once() {
+        let svc = CriRuntimeService::new();
+        let results: Vec<Result<_, Status>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| {
+                    let svc = &svc;
+                    scope.spawn(move || run(svc, Some(config("p")), ""))
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        for err in results.iter().filter_map(|r| r.as_ref().err()) {
+            assert_eq!(err.code(), Code::AlreadyExists);
+        }
+        assert_eq!(svc.sandbox_count(), 1);
+        assert_eq!(
+            svc.retained_bytes(),
+            config("p").encoded_len() + 2 * 256 + 4096
+        );
+    }
+
+    /// ERR-3・CRI-1・TASK-57.2: Stop では同一 metadata の予約が残り、Remove で解放されて作り直せる。
+    #[test]
+    fn task_57_2_remove_releases_metadata_reservation() {
+        let svc = CriRuntimeService::new();
+        let id = run(&svc, Some(config("p")), "")
+            .unwrap()
+            .into_inner()
+            .pod_sandbox_id;
+        stop(&svc, &id).unwrap();
+        let err = run(&svc, Some(config("p")), "").unwrap_err();
+        assert_eq!(err.code(), Code::AlreadyExists);
         remove(&svc, &id).unwrap();
         run(&svc, Some(config("p")), "").unwrap();
         assert_eq!(svc.sandbox_count(), 1);
@@ -4052,6 +4173,7 @@ mod tests {
         assert_eq!(exited.state, 2);
         assert_eq!(exited.started_at, running.started_at);
         assert!(exited.finished_at >= exited.started_at);
+        assert_eq!((exited.exit_code, exited.reason.as_str()), (0, ""));
         let resp = block_on(
             svc.container_status(Request::new(v1::ContainerStatusRequest {
                 container_id: id,

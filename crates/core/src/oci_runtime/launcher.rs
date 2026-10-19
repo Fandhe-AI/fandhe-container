@@ -12,7 +12,7 @@
 //!
 //! # 起動の順序(固定。いずれの拒否も fork より前で、副作用は無い)
 //!
-//! 1. 権限モデルの検査(`RootfulHostRoot` は `Unimplemented`。`RootlessSubordinateIds` の写像の解決は構築時に済み、
+//! 1. 権限モデルの検査(`RootfulHostRoot` は `Unimplemented`。許すかはオーナー判断待ちで #2241・`docs/design/rootful-host-root.md`。`RootlessSubordinateIds` の写像の解決は構築時に済み、
 //!    ホスト ID 0 を含む・helper が無い構成は構築が拒否する。CORE-6・SEC-5・#2009)
 //! 2. cgroup 要件の検査(`launch_after_cgroup_check`。要件ありで参加の源が無ければ `FailedPrecondition`。CORE-3)
 //! 3. 呼び出しプロセスが単一スレッドであることの確認(`FailedPrecondition`。CORE-1)
@@ -69,8 +69,8 @@
 //!   user namespace の写像と照合し(単一 ID 写像は 0/0 のみ)、capability 削減段が既存の資格情報の切り替えで適用する。
 //!   補助グループ(`additionalGids`)・名前形式の `User` の解決・exec 経路の非 root は未対応
 //! - **権限モデル**: `RootlessSingleId` と `RootlessSubordinateIds`(#2009)を扱う。`RootfulHostRoot`
-//!   (SEC-5・CORE-7・CORE-9。start が user namespace を必須とするため、start を通る構成では到達しない。整合は
-//!   spec 側の判断事項)は `Unimplemented` で拒否する
+//!   (SEC-5・CORE-7・CORE-9。start が user namespace を必須とするため、start を通る構成では到達しない。
+//!   許すかはオーナー判断待ちで #2241・`docs/design/rootful-host-root.md`)は、決まるまで `Unimplemented` で拒否する
 //! - **範囲写像の入力元**: `/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap`(`SubordinateIdSource`)
 //!   だけ。config の `linux.uidMappings` / `gidMappings` は `start` が引き続き拒否する(受理は SEC-5 に関わる
 //!   オーナー判断事項で、確認待ち)。supervisor が `RootlessSubordinateIds` を選ぶ経路は未結線(後続)
@@ -228,7 +228,7 @@ impl ProductionLauncher {
 #[cfg(target_os = "linux")]
 impl ProductionLauncherBuilder {
     /// 分離の権限モデル。`RootlessSingleId` と `RootlessSubordinateIds`(要 [`Self::subordinate_ids`])を扱い、
-    /// `RootfulHostRoot` は launch が `Unimplemented` で拒否する(モジュール doc)。
+    /// `RootfulHostRoot` は launch が `Unimplemented` で拒否する(モジュール doc。許すかは #2241 で判断待ち)。
     #[must_use]
     pub fn privilege(mut self, privilege: IsolationPrivilege) -> Self {
         self.privilege = Some(privilege);

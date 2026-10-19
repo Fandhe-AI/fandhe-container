@@ -852,6 +852,8 @@ impl PullSession<'_> {
                 "manifest is already registered with a different composition",
             ));
         }
+        // タグ件数の上限は blob の移動より前に検査する（ループ途中の失敗で半端なタグを残さない。#2316）。
+        guard.ensure_tag_capacity(req.tags.iter())?;
         // 移動。この呼び出しで作った宛先だけを記録し、失敗時はそれだけを消す。
         let mut created: Vec<PathBuf> = Vec::new();
         let mut moved = Vec::new();
@@ -2071,6 +2073,54 @@ mod tests {
             OciErrorCode::ResourceExhausted
         );
         assert_eq!(store.lock().unwrap().tags().count(), 0);
+    }
+
+    /// OCI-7: テーブルのタグ件数が上限を超える公開は、blob の移動前に ResourceExhausted で拒否する（#2316）。
+    #[test]
+    fn oci7_publish_rejects_when_table_tag_limit_would_be_exceeded() {
+        use crate::image_management::MAX_TAG_REFS;
+        let root = Root::new("pub-tablecap");
+        let store = ImageStore::open(&root.0).unwrap();
+        let old = sha_of(b"old-manifest");
+        {
+            let mut g = store.lock().unwrap();
+            g.register_manifest(
+                old.clone(),
+                ManifestComposition::new(sha_of(b"old-config"), vec![]).unwrap(),
+            )
+            .unwrap();
+            for i in 0..MAX_TAG_REFS - 1 {
+                g.register_tag(tag(&format!("f{i}")), &old).unwrap();
+            }
+        }
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let cfg = stage(&mut s, b"config-body");
+        let req = PullPublishRequest::new(
+            manifest_digest(),
+            ManifestComposition::new(cfg.clone(), vec![]).unwrap(),
+        )
+        .with_tag(tag("n1"))
+        .with_tag(tag("n2"));
+        assert_eq!(
+            s.publish(req).unwrap_err().code(),
+            OciErrorCode::ResourceExhausted
+        );
+        {
+            let g = store.lock().unwrap();
+            assert_eq!(g.tags().count(), MAX_TAG_REFS - 1);
+            assert_eq!(g.manifests().count(), 1);
+        }
+        assert!(!root.blob(&cfg).exists());
+        // 新規 1 件なら上限ちょうどで成功する。
+        let mut s = store.begin_pull(pid("p2")).unwrap();
+        let cfg = stage(&mut s, b"config-body");
+        let req = PullPublishRequest::new(
+            manifest_digest(),
+            ManifestComposition::new(cfg, vec![]).unwrap(),
+        )
+        .with_tag(tag("n1"));
+        s.publish(req).unwrap();
+        assert_eq!(store.lock().unwrap().tags().count(), MAX_TAG_REFS);
     }
 
     /// REPAIR-4: publish・abort が成否つきで記録される（失敗時は publish の後に abort も記録）。

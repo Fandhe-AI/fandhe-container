@@ -631,7 +631,10 @@ impl Host for RealHost {
         };
         let mut ok = state_ok;
         // 区間の外。委譲スコープで包んだ CLI の delete に状態・cgroup の削除を任せる。
-        let delete_rejected = self.cli_delete(ctx, created).err();
+        let (delete_result, delete_reaped) = self.cli_delete(ctx, created);
+        let delete_rejected = delete_result.err();
+        // delete の子を回収できていなければ後始末失敗（状態ルートを残して打ち切る。REPAIR-5）。
+        ok &= delete_reaped;
         if let Some(placement) = record.cgroup() {
             match CgroupName::for_instance(id, placement.instance()) {
                 Ok(name) => {
@@ -673,7 +676,12 @@ impl RealHost {
     /// 委譲スコープで包んだ CLI の `delete` を期限つきで 1 回呼ぶ。成功は `Ok`、拒否・期限超過・起動失敗は
     /// 固定語彙のコードを `Err` で返す（`delete_error_code`・`TIMEOUT`・`SPAWN`。message・パスは返さない）。
     /// stdin・stdout は `/dev/null`、stderr は作業ディレクトリ（0700）内の排他作成ファイルへ書かせる（pipe の詰まりで止まらない）。
-    fn cli_delete(&self, ctx: &Ctx<'_>, created: &Created<RealHandle>) -> Result<(), &'static str> {
+    /// 第 2 要素は子プロセスを回収できたか（SIGKILL 後も回収できなければ `false`）。
+    fn cli_delete(
+        &self,
+        ctx: &Ctx<'_>,
+        created: &Created<RealHandle>,
+    ) -> (Result<(), &'static str>, bool) {
         let Some(mut cmd) = scoped_cli_delete_command(
             &ctx.plan.systemd_run,
             &delete_unit(&created.id_str),
@@ -682,17 +690,19 @@ impl RealHost {
             &created.id_str,
             &self.xdg_runtime_dir,
         ) else {
-            return Err("SPAWN");
+            return (Err("SPAWN"), true);
         };
         // 親がブロックした中断シグナルを子へ継承させない（`spawn` と同じ）。
         sys::unblock_termination_signals_in_child(&mut cmd);
         let err_path = ctx.work.join(format!("delete-{}.err", created.id_str));
-        let err_file = std::fs::OpenOptions::new()
+        let Ok(err_file) = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&err_path)
-            .map_err(|_| "SPAWN")?;
+        else {
+            return (Err("SPAWN"), true);
+        };
         let spawned = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -700,15 +710,27 @@ impl RealHost {
             .process_group(0)
             .spawn();
         let result = match spawned {
-            Err(_) => Err("SPAWN"),
-            Ok(mut child) => match wait_for_exit(&mut child, ctx.cap(CLEANUP_TIMEOUT)) {
-                ExitWait::Exited(Some(0)) => Ok(()),
-                ExitWait::Exited(_) => Err(read_delete_error_code(&err_path)),
-                ExitWait::TimedOut { .. } => Err("TIMEOUT"),
-            },
+            Err(_) => (Err("SPAWN"), true),
+            Ok(mut child) => {
+                let wait = wait_for_exit(&mut child, ctx.cap(CLEANUP_TIMEOUT));
+                classify_delete_wait(wait, || read_delete_error_code(&err_path))
+            }
         };
         let _ = std::fs::remove_file(&err_path);
         result
+    }
+}
+
+/// `delete` 子の待ち結果を（結果コード, 回収済みか）へ分類する。期限超過は `TIMEOUT`、
+/// 回収できなかった場合（`reaped: false`）は後始末失敗として呼び出し側に伝える（REPAIR-5）。
+fn classify_delete_wait(
+    wait: ExitWait,
+    err_code: impl FnOnce() -> &'static str,
+) -> (Result<(), &'static str>, bool) {
+    match wait {
+        ExitWait::Exited(Some(0)) => (Ok(()), true),
+        ExitWait::Exited(_) => (Err(err_code()), true),
+        ExitWait::TimedOut { reaped } => (Err("TIMEOUT"), reaped),
     }
 }
 
@@ -1514,6 +1536,26 @@ mod real_process_tests {
             ExitWait::Exited(code) => assert_eq!(code, Some(3)),
             ExitWait::TimedOut { .. } => panic!("must not time out"),
         }
+    }
+
+    #[test]
+    fn delete_wait_reports_unreaped_child() {
+        assert_eq!(
+            classify_delete_wait(ExitWait::TimedOut { reaped: false }, || "X"),
+            (Err("TIMEOUT"), false)
+        );
+        assert_eq!(
+            classify_delete_wait(ExitWait::TimedOut { reaped: true }, || "X"),
+            (Err("TIMEOUT"), true)
+        );
+        assert_eq!(
+            classify_delete_wait(ExitWait::Exited(Some(0)), || "X"),
+            (Ok(()), true)
+        );
+        assert_eq!(
+            classify_delete_wait(ExitWait::Exited(Some(2)), || "X"),
+            (Err("X"), true)
+        );
     }
 
     #[test]

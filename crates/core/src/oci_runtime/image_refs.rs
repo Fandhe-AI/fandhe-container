@@ -15,7 +15,10 @@
 //! `ContainerId` と oci の `ContainerRefId` は同じ規則、[`ImageManifestDigest`] は oci の `Digest::parse` と
 //! 同じ形（`sha256:` ＋ 64 桁の小文字 hex）だけを受けるので、アダプタの変換は失敗しない。
 //! 本番のアダプタと CLI / plugin からの配線は後続の作業で、未実装である（REPAIR-3）。
+//! 上位のアダプタは [`ContainerImageRefs`] と [`ImageRootfsUnpacker`] の両方を `ImageStore` で満たし、
+//! `ContainerImage::new(..).with_unpacker(..)` で create へ渡す（展開の順序・展開先の作成・後始末は core の担当。#2342・#2315）。
 
+use super::image_rootfs::ImageRootfsUnpacker;
 use crate::traits::{ContainerId, ErrorCode, TraitError};
 
 /// manifest digest の文字列の長さ（`sha256:` ＋ 64 桁）。
@@ -145,12 +148,28 @@ pub trait ContainerImageRefs {
 pub struct ContainerImage<'a> {
     refs: &'a dyn ContainerImageRefs,
     manifest: &'a ImageManifestDigest,
+    unpacker: Option<&'a dyn ImageRootfsUnpacker>,
 }
 
 impl<'a> ContainerImage<'a> {
     /// 参照テーブルの入口と、使うイメージの manifest を束ねる。
     pub fn new(refs: &'a dyn ContainerImageRefs, manifest: &'a ImageManifestDigest) -> Self {
-        Self { refs, manifest }
+        Self {
+            refs,
+            manifest,
+            unpacker: None,
+        }
+    }
+
+    /// レイヤーを rootfs へ展開する展開器を足す（#2342）。指定しない場合、bundle の rootfs は
+    /// 展開済みの前提で、create は従来どおり検証だけを行う。
+    pub fn with_unpacker(mut self, unpacker: &'a dyn ImageRootfsUnpacker) -> Self {
+        self.unpacker = Some(unpacker);
+        self
+    }
+
+    pub(super) fn unpacker(&self) -> Option<&'a dyn ImageRootfsUnpacker> {
+        self.unpacker
     }
 
     pub(super) fn refs(&self) -> &'a dyn ContainerImageRefs {

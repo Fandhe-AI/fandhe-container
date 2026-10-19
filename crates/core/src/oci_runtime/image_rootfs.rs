@@ -48,7 +48,7 @@ pub struct ImageRootfsUnpacked {
 ///   展開先は固定したディレクトリのままで bundle 外へ書かない（SEC-1）。展開器は `rootfs` を開くとき
 ///   最終要素の symlink を辿ること（`O_NOFOLLOW` を付けて開かない）。以降の要素は `rootfs` 配下を fd 相対・
 ///   リンク非追従で扱うこと。この経路は展開の呼び出しの間だけ有効で、保持・保存してはならない
-///   （Linux 以外は bundle 配下の経路そのもの。後始末は拒否されるため展開物が残りうる）
+///   （Linux 以外は作成の前に `Unimplemented` で拒否されるため、この経路は渡されない）
 /// - 展開中の rootfs は、Linux では最終の `root.path` とは別の非公開の名前にあり、展開の成功後に core が
 ///   最終の名前へ公開する（展開中に別の create が rootfs を使用中と見なして成功する競合を防ぐ。OCI-7）
 /// - 展開器は `rootfs` 自体を作り直したり別の場所へ移したりしない
@@ -73,7 +73,7 @@ pub trait ImageRootfsUnpacker {
 /// `renameat2` / `unlinkat` 等の fd 相対・リンク非追従の操作だけで行う（作成後に親を symlink へ差し替えられても
 /// bundle 外に作用しない）。展開は非公開の名前で行い、成功後に [`CreatedRootfs::publish`] で最終の名前へ
 /// 改名する。Linux 以外（macOS 等の Unix・Windows）は fd 相対の操作が未実装で、経路を再解決する
-/// 後始末は差し替えで bundle 外を消しうるため、後始末を拒否する（fail-closed。展開物が残る。REPAIR-3）。
+/// 後始末は差し替えで bundle 外を消しうるため、作成の前に `Unimplemented` で拒否する（fail-closed。何も作らないので展開物は残らない。REPAIR-3）。
 #[derive(Debug)]
 pub(super) struct CreatedRootfs {
     path: PathBuf,
@@ -166,7 +166,7 @@ impl CreatedRootfs {
     /// 展開済みの rootfs を最終の名前（`root.path`）へ公開する。公開後は他の create が rootfs として見る。
     ///
     /// Linux は固定した親の下で `renameat2(RENAME_NOREPLACE)` により改名し、最終の名前が既にあれば
-    /// `AlreadyExists`（置き換えない）。Linux 以外は作成時から最終の名前にあるため何もしない。
+    /// `AlreadyExists`（置き換えない）。Linux 以外は作成自体が拒否されるため到達しない。
     pub(super) fn publish(&mut self) -> Result<(), TraitError> {
         imp::publish(&mut self.backing)
     }

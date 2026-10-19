@@ -38,16 +38,17 @@
 //! - 参照の登録を展開より前に置くのは OCI-7 の順序（未登録のレイヤーを使わない）。展開中、登録した参照が
 //!   GC から blob を守るので、展開器はイメージストアの排他を展開の全体で保持しなくてよい
 //!
-//! 失敗時の後始末は「rootfs の削除 → 参照の解除」の順。展開以降の失敗（展開・bundle 検証・`root.path` の
-//! 書き換わり・状態作成の `AlreadyExists` / `InvalidArgument`）では両方を行う。状態作成の書き込みの
-//! 有無が曖昧な失敗（`Internal`・`Timeout` 等）では、状態が rootfs を指す可能性があるため rootfs も参照も残す。
+//! 失敗時の後始末は、公開前と公開後で分ける。rootfs を削除するのは公開前（展開・公開の失敗）だけで、公開後
+//! （bundle 検証・`root.path` の書き換わり・状態作成の失敗）は rootfs を常に保持し、解除するのは参照だけである
+//! （状態作成の `AlreadyExists` / `InvalidArgument` では参照を解除し、`Internal`・`Timeout` 等の書き込みの
+//! 有無が曖昧な失敗では参照も残す）。公開後の rootfs は使用中かを確定できないため、状態一覧による使用中判定も
+//! 行わず消さない。公開後の失敗の後に同じ bundle で再試行すると、残った rootfs により `AlreadyExists` になる。
 //! Linux は展開先を `root.path` ではなく非公開の名前（同じ親の下）に作り、固定した親の fd からの fd 相対の操作だけで
 //! 作成・公開（`renameat2(RENAME_NOREPLACE)`）・後始末を行い、展開器へは rootfs の fd を指す `/proc/self/fd/N` を渡す
 //! （bundle 内の中間要素を差し替えられても bundle 外へ書かない・消さない。SEC-1）。展開中は `root.path` が無いので、
-//! 並行する通常の create が未完成の rootfs で成功することはなく、展開の失敗は非公開の展開先だけを消す。公開後の失敗では、
-//! 同じ bundle を指す状態が見える（または一覧を読めない）ときは rootfs を消さずに残す。確認から削除までの極小の窓は
-//! 残る（create 間の排他は未実装。REPAIR-3）。Linux 以外は fd 相対の操作が未実装で、経路を再解決する削除は
-//! 差し替えで bundle 外を消しうるため、後始末は拒否して展開物を残す（fail-closed）。
+//! 並行する通常の create が未完成の rootfs で成功することはなく、展開の失敗は非公開の展開先だけを消す。
+//! 公開後の失敗では rootfs を消さずに残す（create 間の排他が未実装のため。REPAIR-3）。Linux 以外は
+//! 展開先を固定できないため、展開開始前（作成の前）に `Unimplemented` で拒否し、何も作らない（fail-closed）。
 //! create の途中でプロセスが落ちて残った部分的な rootfs は自動では回収せず、次の同じ bundle の create は
 //! `AlreadyExists` で止まる（fail-closed。利用者のデータを消さない）。delete は bundle と rootfs を消さない。
 //! 展開器なしの [`create_with_image`] は従来どおり、bundle の rootfs が展開済みの前提で動く。
@@ -189,7 +190,7 @@ fn create_with_image_inner(
         Some(unpacker) => match unpack_rootfs(store, recorder, image, unpacker, req) {
             Ok(created) => Some(created),
             Err(e) => {
-                // 展開済みの rootfs は unpack_rootfs が消した後。残るのは未確定の参照だけ。
+                // 公開前の失敗では rootfs は unpack_rootfs が消した後（公開後の失敗はここへ来ない）。残るのは未確定の参照だけ。
                 rollback_image_ref(recorder, image, req);
                 return Err(e);
             }
@@ -225,9 +226,8 @@ fn create_with_image_inner(
                 e.code(),
                 ErrorCode::AlreadyExists | ErrorCode::InvalidArgument
             ) {
-                // 順序は「rootfs の削除 → 参照の解除」。間で止まっても残るのは未確定の参照だけで、
-                // #854 の起動時照合が回収できる（逆順だと参照の無い孤立 rootfs が次の create を塞ぐ）。
-                // 公開済みの rootfs は使用中かを確定できないため消さずに残す（`unpack_rootfs` の注記）。
+                // 公開済みの rootfs は使用中かを確定できないため消さずに残し、解除するのは参照だけ
+                // （`unpack_rootfs` の注記）。残った rootfs は #854 の起動時照合・手動で回収する。
                 rollback_image_ref(recorder, image, req);
             }
             Err(e)
@@ -239,7 +239,7 @@ fn create_with_image_inner(
 ///
 /// 検証を展開の前後に分ける理由: config の検証（不正な config で展開しない・`root.path` を知る）は展開の
 /// 前に、rootfs の実在・種類の検査（`check_rootfs`）は展開の後の実体に対して行う。後者は start の TOCTOU
-/// 再検証と同じ規則を create でも成り立たせる。失敗時は作った rootfs をここで消す（参照の解除は呼び出し元）。
+/// 再検証と同じ規則を create でも成り立たせる。公開前の失敗では作った rootfs をここで消し、公開後は消さない（参照の解除は呼び出し元）。
 fn unpack_rootfs(
     store: &dyn StateStore,
     recorder: &OpRecorder,
@@ -257,7 +257,7 @@ fn unpack_rootfs(
     }
     // Linux は非公開の名前で展開し、成功後に最終の名前へ公開する（展開中は `root.path` が存在せず、
     // 並行する別の create は rootfs を使用中として成功できない。展開途中の失敗の後始末は他から参照されない
-    // 非公開の rootfs だけを消す）。Linux 以外は最初から最終の名前に作るが、後始末は拒否される（残る）。
+    // 非公開の rootfs だけを消す）。Linux 以外は作成の前に Unimplemented で拒否する。
     let mut created = prepare_rootfs_target(req.bundle(), config.root().path())?;
     let unpack_name = OpName::new(IMAGE_ROOTFS_UNPACK_OP_NAME)?;
     // 展開器へは固定した rootfs を指す経路を渡す（作成後の bundle 内の差し替えで bundle 外へ書かせない。SEC-1）。

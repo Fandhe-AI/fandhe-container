@@ -152,6 +152,13 @@ fn normalize_in_place(value: &mut String, layout: &UsrMergeLayout) {
 
 fn normalize_edits(edits: &mut ContainerEdits, layouts: &PathLayouts) {
     for node in &mut edits.device_nodes {
+        // hostPath 省略時は path がホスト側の参照先も兼ねる。path を書き換える前に
+        // 元の path をホスト側の参照先として明示化し、ホスト用レイアウトで独立に正規化する。
+        if node.host_path.is_none()
+            && normalize_usr_merge_path(&node.path, &layouts.container) != node.path.as_str()
+        {
+            node.host_path = Some(node.path.clone());
+        }
         normalize_in_place(&mut node.path, &layouts.container);
         if let Some(host) = node.host_path.as_mut() {
             normalize_in_place(host, &layouts.host);
@@ -325,6 +332,40 @@ containerEdits:
         let m = &spec.devices[0].container_edits.mounts[0];
         assert_eq!(m.host_path, "/lib/firmware/a");
         assert_eq!(m.container_path, "/usr/lib/firmware/a");
+    }
+
+    const NODE_SPEC: &str = "\
+cdiVersion: 0.6.0
+kind: vendor.com/gpu
+devices:
+  - name: \"0\"
+    containerEdits:
+      deviceNodes:
+        - path: /lib/x
+  - name: \"1\"
+    containerEdits:
+      deviceNodes:
+        - path: /usr/lib/x
+";
+
+    #[test]
+    fn gpu1_implicit_host_path_is_kept_when_layouts_differ() {
+        let mut spec = parse_cdi_spec(NODE_SPEC).unwrap();
+        let layouts = PathLayouts::new(UsrMergeLayout::split(), UsrMergeLayout::merged());
+        normalize_cdi_spec_paths(&mut spec, &layouts);
+        let n0 = &spec.devices[0].container_edits.device_nodes[0];
+        assert_eq!(n0.path, "/usr/lib/x");
+        assert_eq!(n0.host_path.as_deref(), Some("/lib/x"));
+        let n1 = &spec.devices[1].container_edits.device_nodes[0];
+        assert_eq!(n1.path, "/usr/lib/x");
+        assert_eq!(n1.host_path, None);
+        // 暗黙のホスト参照先が異なるノードは畳まれず拒否される。
+        assert_eq!(
+            aggregate_container_edits(&spec, &["0", "1"])
+                .map(|a| a.device_nodes().len())
+                .map_err(|e| e.code()),
+            Err(CdiSpecErrorCode::InvalidArgument)
+        );
     }
 
     #[cfg(unix)]

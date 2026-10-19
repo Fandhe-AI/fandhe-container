@@ -1,6 +1,6 @@
 //! plugin の起動対象 [`PluginLaunchTarget`]（PLUG-11・PLUG-7・REPAIR-1・#1856・TASK-110 追補）。
 //!
-//! 起動 API（[`super::OneShotPlugin`]・[`super::call_once`]・[`super::ResidentPlugin`]・
+//! 起動 API（[`super::PluginLaunchSpec`]・[`super::call_once`]・[`super::ResidentPlugin`]・
 //! [`super::PluginSession`]）が受け取る唯一の起動対象。パスではなく、信頼性検証（所有者・モード・
 //! sha256。TASK-122・PLUG-11）を通した**開いたファイル記述子**を持つ。これにより「検証を通したものだけが
 //! 起動される」ことを型で表し、検証から起動までのパス差し替え（TOCTOU）を Linux では防ぐ（#1320 の

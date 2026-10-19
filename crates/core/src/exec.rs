@@ -1250,6 +1250,9 @@ pub struct IsolationPlan {
 /// 保ったまま**分離する。コンテナ内 root はホスト root そのものであり、SEC-5（非 root 起動時に
 /// コンテナ内 root をホストの非特権 UID へ写す）の保護は受けない。
 ///
+/// 本番の launcher と supervisor はこの権限モデルを拒否する（許すかは #2241 で判断待ち。
+/// `docs/design/rootful-host-root.md`）。この経路は分離の下位 API で、結合試験の構成が使う。
+///
 /// **用途**: CORE-7・CORE-9 の rootful 分離（spec 上、dev-box02 の PoC-14・15・17 で実機実証済みの
 /// 構成）。root 起動でもコンテナ内 root を非特権 UID へ写す構成は未実装（TASK-40.2 の
 /// [`plan_rootless_subordinate`] は非 root 起動に限る）で、それまでの暫定経路ではなく明示的に選ぶ別経路として分けている。
@@ -2268,7 +2271,12 @@ mod tests {
             assert_eq!(sys::is_dumpable(), Ok(false));
             return;
         }
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
+        // 期限なしの `output()` は子が止まると試験ごと止まる(REPAIR-5)。出力は一時ファイルへ向け、期限つきで待つ。
+        let dir = std::env::temp_dir().join(format!("fandhe-nondumpable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("child.log");
+        let file = std::fs::File::create(&log).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "exec::tests::core6_sec5_standalone_rejects_non_dumpable_caller_without_weakening_it",
@@ -2276,14 +2284,27 @@ mod tests {
                 "--test-threads=1",
             ])
             .env(MARK, "1")
-            .output()
+            .stdin(std::process::Stdio::null())
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .spawn()
             .unwrap();
-        assert!(
-            out.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break Some(st);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let output = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+        let status = status.unwrap_or_else(|| panic!("child timed out (killed)\n{output}"));
+        assert!(status.success(), "{output}");
     }
 
     /// CORE-1: 5 種の集合と単体の所属判定。

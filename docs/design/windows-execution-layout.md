@@ -7,7 +7,7 @@ Windows で core・CLI・supervisor を WSL2 ゲストの中で動かし、Windo
 - 対象ビヘイビア: WIN-1・WIN-2（関連: PLUG-1・PLUG-7・PLUG-11・PLUG-12・OCI-5・CLI-1・ERR-1・ERR-2・REPAIR-3・REPAIR-5・CORE-10）
 - タスク: TASK-116（#391）の追補・TASK-67（#352）の追補（MS-5）
 - 関連 issue: #1862（本書）・#1415（構成 C の決定）・#1539（plugin の発見を Windows ホストで行わない）・#1319（Windows ホスト用の環境変数を扱わない）・#1412（共有マウントの回収）・#1629（plugin-windows の E2E。人間担当）・#27（Windows 実機）
-- 出典: spec の `api-platform-windows.md`（WIN-1・WIN-2）・`plugin-system.md`（PLUG-1・PLUG-11）・`05-tasks.md`（TASK-116）。本書の作成時点では `docs/spec` を読み込めない環境だったため、spec との差分確認は未実施（spec と食い違う場合は spec を正とする）
+- 出典: spec の `api-platform-windows.md`（WIN-1・WIN-2）・`plugin-system.md`（PLUG-1・PLUG-11）・`05-tasks.md`（TASK-116）。本書の作成時点では `docs/spec` を読み込めない環境だったが、spec `fe33bef` の時点で差分を確認した（結果は 11 節。spec と食い違う場合は spec を正とする）
 - 作成日: 2026-10-18
 
 ## 1. 決定済みの事項（確定。#1415・#1539）
@@ -157,12 +157,12 @@ Ctrl+C
 
 ## 11. spec 側の課題（spec リポ側の変更案。本リポからは編集しない）
 
-承認後に spec リポ側で次を直す案（本書の作成時点で spec の版を確認できていないため、現行の記述との差分は spec 側で確かめる）。
+spec `fe33bef` の時点で差分を確認した結果と、承認後に spec リポ側で直す案（#2230 で確認）。
 
-- `05-tasks.md` の TASK-116: 成果物を承認後の形に合わせる（推奨の 2a なら、起動役の補助の bin と中継、共有の準備と解除）
-- `plugin-system.md` の PLUG-11: 「Windows はゲスト内の規則による」旨が入っているかを確かめ、無ければ追記する
-- 境界表と PLUG-1: 「詳細は #1862」を、確定した内容への参照に置き換える
-- `api-platform-windows.md` の WIN-1: 起動役の crate と導入方法の補足
+- `05-tasks.md` の TASK-116: 2026-10-12 の追補は反映済みだが、成果物欄は `crates/plugin-windows/src/adapter.rs`（仮称）のまま。承認後の形に合わせる（推奨の 2a なら、起動役の補助の bin と中継、共有の準備と解除）
+- `plugin-system.md` の PLUG-11: 「Windows ホストでは plugin の発見も信頼性検証も行わず、ゲスト内の Linux の規則で検証する」旨が #1539 の決定として記載済みのため、追記は不要（確認済み）
+- 境界表と PLUG-1: #1415 の構成は反映済み。残るのは「#1862 で確定する」の参照を、確定した内容への参照に置き換えること（承認後）
+- `api-platform-windows.md` の WIN-1: #1415 の補足は反映済み。残るのは起動役の crate と導入方法の補足（承認後）
 
 ## 12. 確定後に起こす実装 issue の一覧（本 PR では起票しない）
 
@@ -196,7 +196,7 @@ Ctrl+C
 
 ## 15. 承認事項・報告事項
 
-オーナーに承認してほしい事項:
+オーナーに承認してほしい事項（承認の窓口は #2230。いずれも承認待ちのまま）:
 
 - 論点 1〜5（推奨案）と、中継の契約
 - `crate-naming.md` の表 #17（案によっては #7）の役割・区分の変更、crate 名の変更の要否

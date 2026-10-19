@@ -1823,7 +1823,7 @@ mod linux {
     /// real / effective / saved / fs のいずれかの uid が 0 なら rootful で、core の本番 launcher が
     /// `RootfulHostRoot` を `Unimplemented` で拒否するのと揃えて、同じコードで拒否する（コンテナ内 root を
     /// ホスト root に写す起動を作らない）。それ以外は `RootlessSingleId`（特権ランチャーの ambient capability 経由でも
-    /// uid は非 root）。読めない・壊れた入力は fail-closed に `FailedPrecondition`。
+    /// uid は非 root）。rootful を許すかは #2241 で判断待ち（`docs/design/rootful-host-root.md`）。読めない・壊れた入力は fail-closed に `FailedPrecondition`。
     ///
     /// ここでは rootful の拒否と 1 対 1 写像の既定だけを決める。範囲写像（`RootlessSubordinateIds`）への切り替えは
     /// `resolve_launch_privilege` が subuid / subgid の設定で行う（選択規則は `crate::id_model` の module doc。#2243）。

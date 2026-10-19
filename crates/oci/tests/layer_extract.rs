@@ -36,14 +36,45 @@ fn layer_gz() -> Vec<u8> {
     e.finish().unwrap()
 }
 
+/// 作成時から 0700 でディレクトリを作る（Unix は `DirBuilderExt::mode`。umask 000 の root でも chmod までの隙間を作らない）。
+fn mkdir_private(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(path)
+    }
+}
+
+/// 一時 base を排他的に作る。共有 /tmp 上の推測可能な固定名を削除・再利用すると、競合で置かれた symlink を
+/// root が辿りうる（#2324・SEC-2）。PID・時刻・試行番号の一意名を `create_dir` で作り、既存パスは採用しない。
+fn exclusive_base(prefix: &str) -> std::path::PathBuf {
+    let tmp = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+    for attempt in 0..16u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let path = tmp.join(format!("{prefix}-{}-{nanos}-{attempt}", std::process::id()));
+        match mkdir_private(&path) {
+            Ok(()) => return path,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => panic!("exclusively create {}: {e}", path.display()),
+        }
+    }
+    panic!("could not exclusively create a temp dir for {prefix}");
+}
+
 /// OCI-1: 検証済み blob を展開でき、内容と件数が一致する。上限超過は ResourceExhausted。
 #[test]
 fn oci1_verify_then_extract() {
     let z = layer_gz();
-    let base = std::env::temp_dir().join(format!("fc-oci-tar-it-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let base = exclusive_base("fc-oci-tar-it");
     let root = base.join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir(&root).unwrap();
     let blob = base.join("layer.tar.gz");
     std::fs::write(&blob, &z).unwrap();
 
@@ -63,7 +94,7 @@ fn oci1_verify_then_extract() {
     assert_eq!(std::fs::read(root.join("bin/sh")).unwrap(), b"#!");
 
     let root2 = base.join("root2");
-    std::fs::create_dir_all(&root2).unwrap();
+    std::fs::create_dir(&root2).unwrap();
     let e = extract_layer_blob(
         &blob,
         &root2,
@@ -87,10 +118,9 @@ fn sec5_special_bits_via_public_api_with_real_owner() {
         IdRange, SpecialBitsDecision, SpecialBitsPolicy, extract_layers_with_policy,
     };
 
-    let base = std::env::temp_dir().join(format!("fc-oci-sec5-it-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let base = exclusive_base("fc-oci-sec5-it");
     let root = base.join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir(&root).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     // 展開物の実際の所有者（このプロセスの euid / egid）を、root 配下に作ったプローブから得る。
     let probe = root.join(".probe");
@@ -200,10 +230,9 @@ fn owned_tar(uid: u64, gid: u64, file_mode: u32) -> Vec<u8> {
 #[cfg(target_os = "linux")]
 fn chown_sandbox(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, u32, u32) {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let base = std::env::temp_dir().join(format!("fc-oci-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&base);
+    let base = exclusive_base(&format!("fc-oci-{tag}"));
     let root = base.join("root");
-    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir(&root).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
     let md = std::fs::metadata(&root).unwrap();
     (base, root, md.uid(), md.gid())

@@ -267,8 +267,10 @@ mod linux {
     /// `setns(0, 0)` の `-EINVAL`。seccomp 適用前なので `data/unshare_ok` が作られ `data/unshare_denied` は作られない）を確かめる。
     fn verify_probe_on_host(bundle: &Bundle) {
         let work = bundle.dir.join("selfcheck");
-        fs::create_dir_all(work.join("data")).expect("mkdir selfcheck/data");
-        fs::create_dir_all(work.join("deny")).expect("mkdir selfcheck/deny");
+        // bundle は排他作成済み。配下は `create_dir` で 1 階層ずつ作る（#2324・SEC-2）。
+        fs::create_dir(&work).expect("mkdir selfcheck");
+        fs::create_dir(work.join("data")).expect("mkdir selfcheck/data");
+        fs::create_dir(work.join("deny")).expect("mkdir selfcheck/deny");
         let mut child = Command::new(bundle.rootfs().join(PROBE))
             .current_dir(&work)
             .stdin(Stdio::null())

@@ -59,7 +59,12 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/temp_rootfs.rs"]
+mod temp_rootfs;
+
+#[cfg(target_os = "linux")]
 mod linux {
+    use crate::temp_rootfs;
     use std::io::{Read as _, Write as _};
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
@@ -107,13 +112,12 @@ mod linux {
     }
 
     fn make_rootfs() -> Rootfs {
-        let base = std::fs::canonicalize(std::env::temp_dir())
-            .expect("canonicalize temp_dir")
-            .join(format!("fandhe-readonly-paths-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("proc")).expect("create rootfs/proc");
+        // 共有 /tmp 上の推測可能なパスを削除・再利用すると、競合で置かれた symlink を root が辿りうる。
+        // 一意名で排他作成し、既存パスは削除も採用もせず、配下も 1 階層ずつ作る（#2324・SEC-2・CORE-5）。
+        let base = temp_rootfs::exclusive_temp_dir("fandhe-readonly-paths", 0o755);
+        temp_rootfs::create_dir_chain(&base, &["proc"]);
         let fixture = FIXTURE_REL.iter().fold(base.clone(), |p, c| p.join(c));
-        std::fs::create_dir_all(fixture.parent().expect("parent")).expect("create sys/fs/cgroup");
+        temp_rootfs::create_dir_chain(&base, &FIXTURE_REL[..FIXTURE_REL.len() - 1]);
         std::fs::write(&fixture, b"").expect("create fixture");
         std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o644))
             .expect("chmod fixture");

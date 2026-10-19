@@ -95,10 +95,10 @@
 //!
 //! # 未実装（REPAIR-3）
 //! - GPU の `deviceNodes` の追加（#562）
-//! - OCI `linux.resources` から `set_memory_limits` / `set_cpu_max` への反映（#2019。TASK-29 / TASK-157 系）
+//! - OCI `linux.resources`（memory・cpu・pids・blockIO の weight と throttle）の反映は #2019 で
+//!   `ResourceLimitPlan` と start の連鎖（`start_chain`）に入った。setter が無い項目（`memory.reservation`・
+//!   `cpu.shares`・cpuset・hugetlb・`unified`・`devices` ほか）は未適用として拒否する（#2019。追跡 issue は PR 本文に記す）
 //! - OCI `linux.cgroupsPath` の反映（#2010）
-//! - OCI `linux.resources.pids` / `blockIO`（weight を含む）からの `set_pids_max` / `set_io_max` /
-//!   `set_io_weight` への反映（TASK-170.3 ほか）
 //! - cgroup v1 / hybrid は非対応（CORE-4。v2 以外は fail-closed）
 
 use std::collections::BTreeSet;
@@ -142,10 +142,12 @@ pub use device_policy::{
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub use device_policy::{DeviceProgramQueryForTest, query_device_programs_for_test};
+mod resource_plan;
+pub use resource_plan::ResourceLimitPlan;
 mod start_chain;
 pub use start_chain::{
-    CgroupLimitPlan, CgroupLimitReport, CgroupLimited, CgroupPrepared, CgroupScopeRecorded,
-    StartCgroup,
+    AppliedResourceLimits, CgroupLimitPlan, CgroupLimitReport, CgroupLimited, CgroupPrepared,
+    CgroupScopeRecorded, StartCgroup,
 };
 mod exec_join;
 mod exec_kill;

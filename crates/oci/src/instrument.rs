@@ -44,6 +44,8 @@ pub enum OciOpKind {
     RemoveImage,
     /// イメージストアの排他区間の取得（待機・Timeout・毒化・ロックファイル異常を含む。TASK-183.2・OCI-7）。
     AcquireImageStoreLock,
+    /// `image prune` の実行（無参照イメージ・レイヤーの回収。TASK-183.7・OCI-7）。
+    PruneImages,
     /// `image tag` のタグ登録（TASK-183.4・OCI-7）。
     TagImage,
 }
@@ -65,6 +67,7 @@ impl OciOpKind {
             OciOpKind::DiskUsage => "oci.image.df",
             OciOpKind::RemoveImage => "oci.image.rm",
             OciOpKind::AcquireImageStoreLock => "oci.store.lock",
+            OciOpKind::PruneImages => "oci.image.prune",
             OciOpKind::TagImage => "oci.image.tag",
         }
     }

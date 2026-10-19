@@ -11,7 +11,7 @@
 //! ```text
 //! DelegatedCgroup::record_scope(store, observed)   -> CgroupScopeRecorded   （状態記録へ追記）
 //!   .create_cgroup()                               -> CgroupPrepared        （prepare = mkdir・退避・検証）
-//!   .apply_limits(recorder, plan)                  -> CgroupLimited         （デバイス許可プログラム）
+//!   .apply_limits(recorder, plan)                  -> CgroupLimited         （デバイス許可プログラム・資源制限）
 //!   .into_join()                                   -> StartCgroup           （CgroupJoin の取得）
 //! ```
 //!
@@ -29,13 +29,21 @@
 //! - 待機はストアの I/O とファイル I/O のみ。ストア側のタイムアウトは `StateStore` の契約 2 による
 //! - エラーは [`CgroupError`]。ストア由来のメッセージ（plugin が返しうる）は外へ流さず固定文言にする
 //!
+//! # 資源制限（#2019・TASK-29 追補。CORE-3・CORE-4・SUP-13）
+//! [`CgroupLimitPlan::with_resources`] で渡された [`ResourceLimitPlan`]（OCI `linux.resources` の memory・cpu・
+//! pids・blockIO を cgroup v2 の型へ変換したもの）は、段 3 の [`CgroupPrepared::apply_limits`] が書く。
+//! `enable_controllers` を呼べるのは退避済みの証明 [`Evacuated`] を持つ段 2 の結果だけなので、controller の
+//! 有効化と setter の呼び出しはここに置く。controller が委譲に無ければ `FailedPrecondition` で止まり、制限なしでは
+//! 起動しない（fail-closed）。
+//!
 //! # 未実装（REPAIR-3）
-//! - OCI `linux.resources` の資源制限（memory・cpu・pids・io）の写像。[`CgroupLimitPlan`] に項目を足す形で
-//!   拡張する（`#[non_exhaustive]`。TASK-170.3 ほか）。`enable_controllers` の呼び出しもそのときに足す
+//! - `memory.reservation`・`cpu.shares`・cpuset・hugetlb・`io.weight` のデバイス別・`unified`・`devices` は
+//!   パーサが未適用として拒否する（対応する setter が無い。追跡 issue は #2019 の PR 本文に記す）
 
 use super::{
-    CgroupError, CgroupJoin, CgroupName, CgroupStep, ContainerCgroup, DelegatedCgroup,
-    DevicePolicyMode, DevicePolicyOutcome, Evacuated,
+    AppliedMemoryLimits, BlkioWeightTarget, CgroupError, CgroupJoin, CgroupName, CgroupStep,
+    ContainerCgroup, ControllerSet, CpuMax, DelegatedCgroup, DevicePolicyMode, DevicePolicyOutcome,
+    Evacuated, IoMax, PidsMax, ResourceLimitPlan,
 };
 use crate::exec::IsolationPrivilege;
 use crate::observability::OpRecorder;
@@ -154,7 +162,7 @@ impl CgroupPrepared<'_> {
         &self.cgroup
     }
 
-    /// 退避済みの証明。将来 `enable_controllers` を呼ぶ段（資源制限の写像。TASK-170.3）が使う。
+    /// 退避済みの証明。`enable_controllers` を呼ぶ段（`apply_limits`。#2019）が使う。
     pub fn evacuation_proof(&self) -> &Evacuated {
         &self.evacuated
     }
@@ -164,8 +172,10 @@ impl CgroupPrepared<'_> {
         self.delegated
     }
 
-    /// `plan` に従って制限を設定する（段 3）。今はデバイス許可プログラムだけ（rootful では適用、rootless では
-    /// `NotApplied(Rootless)` を結果として返す。SEC-1）。失敗しても巻き戻さない（delete が回収する）。
+    /// `plan` に従って制限を設定する（段 3）。デバイス許可プログラム（rootful では適用、rootless では
+    /// `NotApplied(Rootless)` を結果として返す。SEC-1）の後、`plan` に資源制限があれば必要な controller を
+    /// 有効化して memory → cpu → pids → blkio weight → io.max（デバイス順）の順に書く（#2019）。
+    /// 失敗しても巻き戻さない（delete が回収する）。
     pub fn apply_limits(
         self,
         recorder: &OpRecorder,
@@ -174,26 +184,77 @@ impl CgroupPrepared<'_> {
         let device_policy = self
             .cgroup
             .apply_default_device_policy(recorder, plan.device_policy)?;
+        let resources = match &plan.resources {
+            Some(resources) => Some(self.apply_resources(recorder, resources)?),
+            None => None,
+        };
         Ok(CgroupLimited {
             cgroup: self.cgroup,
             record: self.record,
-            report: CgroupLimitReport { device_policy },
+            report: CgroupLimitReport {
+                device_policy,
+                resources,
+            },
         })
+    }
+
+    /// 資源制限を書く。controller の有効化（親の `cgroup.subtree_control`）→ 各 setter の順で、setter は読み戻した
+    /// 実効値を返す。必要な controller が無ければ書かずに `FailedPrecondition`。
+    fn apply_resources(
+        &self,
+        recorder: &OpRecorder,
+        plan: &ResourceLimitPlan,
+    ) -> Result<AppliedResourceLimits, CgroupError> {
+        let want = plan.required_controllers();
+        let enabled = if want.is_empty() {
+            ControllerSet::default()
+        } else {
+            self.delegated.enable_controllers(&self.evacuated, &want)?
+        };
+        let mut applied = AppliedResourceLimits::default();
+        if let Some(memory) = &plan.memory {
+            applied.memory = Some(self.cgroup.set_memory_limits(recorder, &enabled, memory)?);
+        }
+        if let Some(cpu) = &plan.cpu {
+            applied.cpu = Some(self.cgroup.set_cpu_max(recorder, cpu)?);
+        }
+        if let Some(pids) = &plan.pids {
+            applied.pids = Some(self.cgroup.set_pids_max(recorder, pids)?);
+        }
+        if let Some(weight) = &plan.blkio_weight {
+            applied.blkio_weight = Some(self.cgroup.set_blkio_weight(recorder, weight)?);
+        }
+        for io in &plan.io_max {
+            applied.io_max.push(self.cgroup.set_io_max(recorder, io)?);
+        }
+        Ok(applied)
     }
 }
 
-/// 設定する制限の計画。今はデバイス許可の経路だけを持つ（REPAIR-3: 資源制限は未実装でフィールドを足して拡張する）。
+/// 設定する制限の計画。デバイス許可の経路と、OCI `linux.resources` 由来の資源制限（#2019）を持つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct CgroupLimitPlan {
     /// デバイス許可プログラムの適用経路。
     pub device_policy: DevicePolicyMode,
+    /// 資源制限（memory・cpu・pids・blockIO）。`None` なら controller の有効化もしない。
+    pub resources: Option<ResourceLimitPlan>,
 }
 
 impl CgroupLimitPlan {
-    /// 適用経路を直接指定して作る。
+    /// 適用経路を直接指定して作る（資源制限なし）。
     pub fn new(device_policy: DevicePolicyMode) -> Self {
-        Self { device_policy }
+        Self {
+            device_policy,
+            resources: None,
+        }
+    }
+
+    /// 資源制限の計画を載せる。`linux.resources` の指定が無い config では呼ばない。
+    #[must_use]
+    pub fn with_resources(mut self, resources: ResourceLimitPlan) -> Self {
+        self.resources = Some(resources);
+        self
     }
 
     /// launcher がこれから使う権限モデルから作る（子の `isolate` の結果ではなく、fork 前に決めた値を渡す）。
@@ -208,6 +269,24 @@ impl CgroupLimitPlan {
 pub struct CgroupLimitReport {
     /// デバイス許可プログラムの結果（適用した、または適用しなかった理由）。
     pub device_policy: DevicePolicyOutcome,
+    /// 資源制限を書いた結果（各 setter が読み戻した実効値）。計画に資源制限が無ければ `None`。
+    pub resources: Option<AppliedResourceLimits>,
+}
+
+/// 書いた資源制限の読み戻し値（指定しなかった項目は `None` / 空）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AppliedResourceLimits {
+    /// `memory.max` / `memory.swap.max` の実効値。
+    pub memory: Option<AppliedMemoryLimits>,
+    /// `cpu.max` の実効値。
+    pub cpu: Option<CpuMax>,
+    /// `pids.max` の実効値。
+    pub pids: Option<PidsMax>,
+    /// blkio weight の書き込み先と実効値。
+    pub blkio_weight: Option<BlkioWeightTarget>,
+    /// デバイスごとの `io.max` の実効値。
+    pub io_max: Vec<IoMax>,
 }
 
 /// 段 3 の結果: 制限の設定済み。

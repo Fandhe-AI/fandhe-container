@@ -9,8 +9,8 @@
 //! 別設定を書かせる経路はない。
 //!
 //! # 呼び出し文脈・契約
-//! - 呼び出し元: 起動フロー（`--device-read-bps` 等の受け付けと launcher への結線は TASK-170.3・
-//!   TASK-29 / TASK-157 系の担当）。本モジュールは単体の API で、起動フローからはまだ呼ばれない
+//! - 呼び出し元: start の cgroup 連鎖（`start_chain` の `apply_limits`。OCI `linux.resources.blockIO` の
+//!   throttle の反映。TASK-29 追補・#2019）。CLI の `--device-read-bps` 等の受け付けは TASK-170.3・#534
 //! - 前提: 親 cgroup の `cgroup.subtree_control` で `io` controller が有効化済み
 //!   （[`super::DelegatedCgroup::enable_controllers`]）。未有効なら `io.max` が存在せず `FailedPrecondition`
 //! - 書き込み先は保持している O_PATH ディレクトリ fd 起点の `openat`（`O_NOFOLLOW`）で、
@@ -30,7 +30,8 @@
 //! # 未実装（REPAIR-3）
 //! - `--blkio-weight`（比例配分の重み）は絶対値スロットルの `io.max` では表現できない。cgroup v2 での
 //!   実体は `io.weight` で、`io_weight` サブモジュールが担う（TASK-170.4）。本モジュールは `io.max` のみを扱う
-//! - OCI `linux.resources.blockIO` からの反映と launcher への結線（TASK-170.3・TASK-29 / TASK-157 系）
+//! - OCI `linux.resources.blockIO` の反映は #2019 で入った（`ResourceLimitPlan`）。`weightDevice`（デバイス別の
+//!   `io.weight`）は未対応で、パーサが未適用として拒否する
 
 use std::fs::File;
 use std::io::Write as _;
@@ -50,6 +51,14 @@ const ENODEV: i32 = 19;
 const MAJOR_LIMIT: u32 = 1 << 12;
 /// Linux の `dev_t` における minor の上限（20 bit）。
 const MINOR_LIMIT: u32 = 1 << 20;
+
+/// 1 コンテナの `io.max` に設定できるデバイス数の上限（CORE-3・TASK-29 追補・#2019）。
+///
+/// `set_io_max` は毎回 `io.max` 全体を [`SMALL_FILE_LIMIT`] で読み戻す。1 行の最大長は
+/// `"4095:1048575"`（12）+ 4 項目（`" rbps="` 等 6〜7 + u64 最大 20 桁）+ 改行 = 119 バイトで、
+/// `4096 / 119 = 34` デバイスまでなら読み戻しが必ず収まる。計画の作成時（`ResourceLimitPlan`）にこの件数を
+/// 超える指定を拒否し、適用の途中で `FailedPrecondition` になることを防ぐ。
+pub(super) const IO_MAX_DEVICES_LIMIT: usize = 34;
 
 fn invalid(message: String) -> CgroupError {
     CgroupError::new(ErrorCode::InvalidArgument, CgroupStep::SetIoMax, message)
@@ -324,6 +333,25 @@ fn write_io_max_at(dir: BorrowedFd<'_>, limit: &IoMax) -> Result<IoMax, CgroupEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CORE-3: 最大幅のデバイス・値の行を `IO_MAX_DEVICES_LIMIT` 件並べても読み戻し上限に収まり、1 件増えると超える。
+    #[test]
+    fn core3_io_max_devices_limit_fits_read_back_limit() {
+        let line = IoMax::new(
+            BlockDevice::new(MAJOR_LIMIT - 1, MINOR_LIMIT - 1).unwrap(),
+            IoLimit::Value(u64::MAX - 1),
+            IoLimit::Value(u64::MAX - 1),
+            IoLimit::Value(u64::MAX - 1),
+            IoLimit::Value(u64::MAX - 1),
+        )
+        .unwrap()
+        .to_file_content()
+        .len()
+            + 1; // カーネル出力の改行
+        let limit = SMALL_FILE_LIMIT as usize;
+        assert!(IO_MAX_DEVICES_LIMIT * line <= limit, "line={line}");
+        assert!((IO_MAX_DEVICES_LIMIT + 1) * line > limit, "line={line}");
+    }
 
     fn dev(major: u32, minor: u32) -> BlockDevice {
         BlockDevice::new(major, minor).unwrap()

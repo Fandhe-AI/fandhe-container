@@ -1739,10 +1739,14 @@ mod linux {
     use std::process::ExitCode;
 
     use fandhe_container_core::audit_log::AuditSink;
-    use fandhe_container_core::cgroups::{CgroupLimitPlan, ContainerCgroup, DelegatedCgroup};
+    use fandhe_container_core::cgroups::{
+        CgroupLimitPlan, ContainerCgroup, DelegatedCgroup, ResourceLimitPlan,
+    };
     use fandhe_container_core::exec::IsolationPrivilege;
     use fandhe_container_core::landlock::detect_landlock_abi;
-    use fandhe_container_core::oci_runtime::ProductionLauncher;
+    use fandhe_container_core::oci_runtime::{
+        LinuxResourceLimits, ProductionLauncher, load_resource_limits,
+    };
 
     use super::*;
     use crate::privilege::{MAX_STATUS_BYTES, parse_proc_status};
@@ -1790,6 +1794,9 @@ mod linux {
     struct HeldCgroup {
         delegated: DelegatedCgroup,
         cgroup: Arc<ContainerCgroup>,
+        /// 制限ファイルへ書いた `linux.resources`。launcher が fork の前に config の値との一致を確かめる
+        /// （手順 5 と手順 8 の間の書き換え対策。#2019・CORE-3・SEC-1）。
+        applied_resources: Option<LinuxResourceLimits>,
     }
 
     /// `/proc/self/status` の内容から launcher の権限モデルを決める（純関数。#1819・SEC-5・CORE-6）。
@@ -1876,7 +1883,20 @@ mod linux {
             let delegated = DelegatedCgroup::detect()
                 .map_err(to_trait)?
                 .with_companions(&self.companions);
-            let plan = CgroupLimitPlan::for_privilege(privilege);
+            // 手順 5 の時点の config から `linux.resources` を読み、cgroup v2 の型の計画にする（#2019）。
+            // 範囲外の値は create でも拒否済みだが、書き換えに備えここでも同じ変換で検証する。mkdir の前に
+            // 失敗させるので後始末は要らない。
+            let resources = load_resource_limits(observed.bundle())?;
+            let mut plan = CgroupLimitPlan::for_privilege(privilege);
+            if let Some(limits) = &resources {
+                let resource_plan = ResourceLimitPlan::try_from(limits).map_err(|e| {
+                    TraitError::new(
+                        e.code,
+                        "linux.resources has a value outside the cgroup v2 range",
+                    )
+                })?;
+                plan = plan.with_resources(resource_plan);
+            }
             let recorder = OpRecorder::new();
             let prepared = delegated
                 .record_scope(store, observed)
@@ -1910,6 +1930,7 @@ mod linux {
             self.cgroup = Some(HeldCgroup {
                 delegated,
                 cgroup: Arc::new(cgroup),
+                applied_resources: resources,
             });
             Ok(instance)
         }
@@ -1962,6 +1983,7 @@ mod linux {
                 .privilege(privilege)
                 .audit_sink(Arc::clone(audit))
                 .cgroup_join_source(move || source.join_hook())
+                .applied_resource_limits(held.applied_resources.clone())
                 .build()?;
             Ok(Arc::new(launcher))
         }

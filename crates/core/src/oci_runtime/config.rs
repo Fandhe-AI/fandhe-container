@@ -12,7 +12,8 @@
 //!
 //! - 2 層構成: 非公開の raw 層（`#[derive(Deserialize)]`）で JSON を受け、検証を通過した値だけを
 //!   公開型に詰める。公開型のフィールドは非公開で、生成経路はパース関数のみ。
-//! - OCI Runtime Spec の拡張性規則に従い、未知のプロパティはエラーにせず無視する。
+//! - OCI Runtime Spec の拡張性規則に従い、未知のプロパティはエラーにせず無視する（例外: `linux.resources` と
+//!   その下の object は、新しい版の制限を黙って落とさないよう未知のキーを `Data` で拒否する。#2019・SEC-1）。
 //!   ただし既知フィールドの重複キー・必須欠落・型不一致・未知の namespace type はエラーにする。
 //!   既知フィールドの省略はキーが無い場合に限り、キーがあって値が `null` のものは省略とみなさず
 //!   型不一致（`Data`）として拒否する（OCI の JSON Schema に `null` を許すフィールドが無いため。
@@ -26,7 +27,8 @@
 //! パースの成功（`Ok`）は「形式が正しく上限内である」ことだけを意味し、「そのまま実行してよい」
 //! ことは意味しない。OCI Runtime Spec が定義するプロパティのうち本パーサが解釈しないもの
 //! （`process.capabilities`・`process.noNewPrivileges`・`process.rlimits`〔SEC-1・TASK-27.4.3 系〕、
-//! `linux.seccomp`〔CORE-5・TASK-38〕、`linux.resources`〔CORE-3/4・TASK-32〜〕、
+//! `linux.seccomp`〔CORE-5・TASK-38〕、`linux.resources` のうち setter が無い項目〔#2019。memory / cpu / pids /
+//! blockIO の weight・throttle は解釈済みで、`resources.rs` の型に正規化する〕、
 //! `mounts[].uidMappings` / `gidMappings`、`hooks` 等）は、
 //! 値を読み飛ばすが指定の有無を [`UnappliedField`] として保持し、[`OciConfig::unapplied_fields`] で
 //! 返す（黙って破棄しない）。TASK-29.2 の `create` はこの一覧が空でない config を
@@ -63,6 +65,7 @@
 //! serde_json のエラー文字列は不正な入力値（例: `env` の値）をそのまま含むため、保持・出力しない。
 //! [`OciConfigError`] は分類・位置（行・列）・固定文言・検証で判明した自前のフィールド名だけを持つ。
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
@@ -74,6 +77,7 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use super::mount_destination::MountDestination;
+use super::resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
 use crate::path_masks::ProtectedPath;
 use crate::traits::ErrorCode;
 
@@ -112,6 +116,8 @@ pub const CONFIG_MAX_ID_MAPPINGS: usize = 340;
 pub const CONFIG_MAX_OCI_VERSION_BYTES: usize = 64;
 /// `hostname` の最大バイト長（`HOST_NAME_MAX` 相当）。
 pub const CONFIG_MAX_HOSTNAME_BYTES: usize = 64;
+/// `linux.resources.blockIO.throttle*Device` 1 リストあたりの最大件数（1 件ごとに `io.max` へ書くため抑える。#2019）。
+pub const CONFIG_MAX_THROTTLE_DEVICES: usize = 64;
 /// マウント種別（`mounts[].type`）の最大バイト長。
 const MOUNT_TYPE_MAX_BYTES: usize = 256;
 
@@ -355,6 +361,23 @@ limits! {
     MaskedPathLimit => ("linux.maskedPaths[]", CONFIG_MAX_PATH_BYTES),
     ReadonlyPathsLimit => ("linux.readonlyPaths", CONFIG_MAX_READONLY_PATHS),
     ReadonlyPathLimit => ("linux.readonlyPaths[]", CONFIG_MAX_PATH_BYTES),
+    CgroupsPathLimit => ("linux.cgroupsPath", CONFIG_MAX_PATH_BYTES),
+    ThrottleReadBpsLimit => (
+        "linux.resources.blockIO.throttleReadBpsDevice",
+        CONFIG_MAX_THROTTLE_DEVICES
+    ),
+    ThrottleWriteBpsLimit => (
+        "linux.resources.blockIO.throttleWriteBpsDevice",
+        CONFIG_MAX_THROTTLE_DEVICES
+    ),
+    ThrottleReadIopsLimit => (
+        "linux.resources.blockIO.throttleReadIOPSDevice",
+        CONFIG_MAX_THROTTLE_DEVICES
+    ),
+    ThrottleWriteIopsLimit => (
+        "linux.resources.blockIO.throttleWriteIOPSDevice",
+        CONFIG_MAX_THROTTLE_DEVICES
+    ),
 }
 
 /// 件数上限付きの配列。`L::MAX` 件を読んだ後に次の要素があれば、その要素を型 `T` として
@@ -542,8 +565,28 @@ unapplied_fields! {
     MountGidMappings => "mounts[].gidMappings",
     LinuxDevices => "linux.devices",
     LinuxNetDevices => "linux.netDevices",
-    LinuxResources => "linux.resources",
-    LinuxCgroupsPath => "linux.cgroupsPath",
+    LinuxResourcesMemoryReservation => "linux.resources.memory.reservation",
+    LinuxResourcesMemoryKernel => "linux.resources.memory.kernel",
+    LinuxResourcesMemoryKernelTcp => "linux.resources.memory.kernelTCP",
+    LinuxResourcesMemorySwappiness => "linux.resources.memory.swappiness",
+    LinuxResourcesMemoryDisableOomKiller => "linux.resources.memory.disableOOMKiller",
+    LinuxResourcesMemoryUseHierarchy => "linux.resources.memory.useHierarchy",
+    LinuxResourcesMemoryCheckBeforeUpdate => "linux.resources.memory.checkBeforeUpdate",
+    LinuxResourcesCpuShares => "linux.resources.cpu.shares",
+    LinuxResourcesCpuCpus => "linux.resources.cpu.cpus",
+    LinuxResourcesCpuMems => "linux.resources.cpu.mems",
+    LinuxResourcesCpuRealtimeRuntime => "linux.resources.cpu.realtimeRuntime",
+    LinuxResourcesCpuRealtimePeriod => "linux.resources.cpu.realtimePeriod",
+    LinuxResourcesCpuBurst => "linux.resources.cpu.burst",
+    LinuxResourcesCpuIdle => "linux.resources.cpu.idle",
+    LinuxResourcesBlockIoLeafWeight => "linux.resources.blockIO.leafWeight",
+    LinuxResourcesBlockIoWeightDevice => "linux.resources.blockIO.weightDevice",
+    LinuxResourcesBlockIoLeafWeightDevice => "linux.resources.blockIO.leafWeightDevice",
+    LinuxResourcesHugepageLimits => "linux.resources.hugepageLimits",
+    LinuxResourcesNetwork => "linux.resources.network",
+    LinuxResourcesRdma => "linux.resources.rdma",
+    LinuxResourcesUnified => "linux.resources.unified",
+    LinuxResourcesDevices => "linux.resources.devices",
     LinuxRootfsPropagation => "linux.rootfsPropagation",
     LinuxSeccomp => "linux.seccomp",
     LinuxSysctl => "linux.sysctl",
@@ -689,10 +732,10 @@ struct RawLinux {
     devices: Seen,
     #[serde(default)]
     net_devices: Seen,
-    #[serde(default)]
-    resources: Seen,
-    #[serde(default)]
-    cgroups_path: Seen,
+    #[serde(default, deserialize_with = "present")]
+    resources: Option<Obj<RawResources>>,
+    #[serde(default, deserialize_with = "present")]
+    cgroups_path: Option<BoundedStr<CgroupsPathLimit>>,
     #[serde(default)]
     rootfs_propagation: Seen,
     #[serde(default)]
@@ -713,6 +756,124 @@ struct RawLinux {
     personality: Seen,
     #[serde(default)]
     time_offsets: Seen,
+}
+
+/// `linux.resources`（#2019・CORE-3・CORE-4）。cgroup v2 で表せて setter がある項目だけを解釈し、
+/// 残りの既知項目は [`UnappliedField`] に記録して `create` / `start` が拒否する。
+///
+/// 未知のキーは OCI の拡張性規則（無視）に従わず、`deny_unknown_fields` で `Data` として拒否する。新しい版の
+/// spec にある制限を黙って落とすと、指定より弱い資源制限で起動する経路になるため（SEC-1・fail-closed）。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawResources {
+    #[serde(default, deserialize_with = "present")]
+    memory: Option<Obj<RawMemory>>,
+    #[serde(default, deserialize_with = "present")]
+    cpu: Option<Obj<RawCpu>>,
+    #[serde(default, deserialize_with = "present")]
+    pids: Option<Obj<RawPids>>,
+    #[serde(default, rename = "blockIO", deserialize_with = "present")]
+    block_io: Option<Obj<RawBlockIo>>,
+    #[serde(default)]
+    hugepage_limits: Seen,
+    #[serde(default)]
+    network: Seen,
+    #[serde(default)]
+    rdma: Seen,
+    #[serde(default)]
+    unified: Seen,
+    #[serde(default)]
+    devices: Seen,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMemory {
+    #[serde(default, deserialize_with = "present")]
+    limit: Option<i64>,
+    #[serde(default, deserialize_with = "present")]
+    swap: Option<i64>,
+    #[serde(default)]
+    reservation: Seen,
+    #[serde(default)]
+    kernel: Seen,
+    #[serde(default, rename = "kernelTCP")]
+    kernel_tcp: Seen,
+    #[serde(default)]
+    swappiness: Seen,
+    #[serde(default, rename = "disableOOMKiller")]
+    disable_oom_killer: Seen,
+    #[serde(default, rename = "useHierarchy")]
+    use_hierarchy: Seen,
+    #[serde(default, rename = "checkBeforeUpdate")]
+    check_before_update: Seen,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCpu {
+    #[serde(default, deserialize_with = "present")]
+    quota: Option<i64>,
+    #[serde(default, deserialize_with = "present")]
+    period: Option<u64>,
+    #[serde(default)]
+    shares: Seen,
+    #[serde(default)]
+    cpus: Seen,
+    #[serde(default)]
+    mems: Seen,
+    #[serde(default, rename = "realtimeRuntime")]
+    realtime_runtime: Seen,
+    #[serde(default, rename = "realtimePeriod")]
+    realtime_period: Seen,
+    #[serde(default)]
+    burst: Seen,
+    #[serde(default)]
+    idle: Seen,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPids {
+    #[serde(default, deserialize_with = "present")]
+    limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawBlockIo {
+    #[serde(default, deserialize_with = "present")]
+    weight: Option<u16>,
+    #[serde(default, deserialize_with = "present")]
+    throttle_read_bps_device: Option<Bounded<Obj<RawThrottleDevice>, ThrottleReadBpsLimit>>,
+    #[serde(default, deserialize_with = "present")]
+    throttle_write_bps_device: Option<Bounded<Obj<RawThrottleDevice>, ThrottleWriteBpsLimit>>,
+    #[serde(
+        default,
+        rename = "throttleReadIOPSDevice",
+        deserialize_with = "present"
+    )]
+    throttle_read_iops_device: Option<Bounded<Obj<RawThrottleDevice>, ThrottleReadIopsLimit>>,
+    #[serde(
+        default,
+        rename = "throttleWriteIOPSDevice",
+        deserialize_with = "present"
+    )]
+    throttle_write_iops_device: Option<Bounded<Obj<RawThrottleDevice>, ThrottleWriteIopsLimit>>,
+    #[serde(default)]
+    leaf_weight: Seen,
+    #[serde(default)]
+    weight_device: Seen,
+    #[serde(default)]
+    leaf_weight_device: Seen,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawThrottleDevice {
+    major: i64,
+    minor: i64,
+    rate: u64,
 }
 
 #[derive(Deserialize)]
@@ -1060,6 +1221,8 @@ pub struct OciConfig {
     gid_mappings: Vec<OciIdMapping>,
     masked_paths: Vec<ProtectedPath>,
     readonly_paths: Vec<ProtectedPath>,
+    resources: Option<LinuxResourceLimits>,
+    cgroups_path: Option<CgroupsPath>,
     unapplied: Vec<UnappliedField>,
 }
 
@@ -1082,6 +1245,17 @@ impl OciConfig {
     /// SEC-2・TASK-29 追補・#1852）。
     pub fn readonly_paths(&self) -> &[ProtectedPath] {
         &self.readonly_paths
+    }
+
+    /// `linux.resources`（解釈済みの項目のみ。キーが無ければ `None`、`{}` は全項目 `None` の `Some`。
+    /// cgroup v2 への反映は start の cgroup 連鎖が行う。#2019・CORE-3・CORE-4）。
+    pub fn linux_resources(&self) -> Option<&LinuxResourceLimits> {
+        self.resources.as_ref()
+    }
+
+    /// `linux.cgroupsPath`（値の検証と受理は #2010。現状は指定があれば create / start が拒否する）。
+    pub fn cgroups_path(&self) -> Option<&CgroupsPath> {
+        self.cgroups_path.as_ref()
     }
 
     /// `ociVersion`。
@@ -1210,6 +1384,166 @@ fn convert_protected_paths<L: Limit>(
         .collect()
 }
 
+/// `linux.resources` の未対応の既知項目の指定の有無を記録する（`UnappliedField`）。
+fn mark_resources(r: &RawResources, mark: &mut impl FnMut(Seen, UnappliedField)) {
+    mark(
+        r.hugepage_limits,
+        UnappliedField::LinuxResourcesHugepageLimits,
+    );
+    mark(r.network, UnappliedField::LinuxResourcesNetwork);
+    mark(r.rdma, UnappliedField::LinuxResourcesRdma);
+    mark(r.unified, UnappliedField::LinuxResourcesUnified);
+    mark(r.devices, UnappliedField::LinuxResourcesDevices);
+    if let Some(Obj(m)) = &r.memory {
+        mark(
+            m.reservation,
+            UnappliedField::LinuxResourcesMemoryReservation,
+        );
+        mark(m.kernel, UnappliedField::LinuxResourcesMemoryKernel);
+        mark(m.kernel_tcp, UnappliedField::LinuxResourcesMemoryKernelTcp);
+        mark(m.swappiness, UnappliedField::LinuxResourcesMemorySwappiness);
+        mark(
+            m.disable_oom_killer,
+            UnappliedField::LinuxResourcesMemoryDisableOomKiller,
+        );
+        mark(
+            m.use_hierarchy,
+            UnappliedField::LinuxResourcesMemoryUseHierarchy,
+        );
+        mark(
+            m.check_before_update,
+            UnappliedField::LinuxResourcesMemoryCheckBeforeUpdate,
+        );
+    }
+    if let Some(Obj(c)) = &r.cpu {
+        mark(c.shares, UnappliedField::LinuxResourcesCpuShares);
+        mark(c.cpus, UnappliedField::LinuxResourcesCpuCpus);
+        mark(c.mems, UnappliedField::LinuxResourcesCpuMems);
+        mark(
+            c.realtime_runtime,
+            UnappliedField::LinuxResourcesCpuRealtimeRuntime,
+        );
+        mark(
+            c.realtime_period,
+            UnappliedField::LinuxResourcesCpuRealtimePeriod,
+        );
+        mark(c.burst, UnappliedField::LinuxResourcesCpuBurst);
+        mark(c.idle, UnappliedField::LinuxResourcesCpuIdle);
+    }
+    if let Some(Obj(b)) = &r.block_io {
+        mark(
+            b.leaf_weight,
+            UnappliedField::LinuxResourcesBlockIoLeafWeight,
+        );
+        mark(
+            b.weight_device,
+            UnappliedField::LinuxResourcesBlockIoWeightDevice,
+        );
+        mark(
+            b.leaf_weight_device,
+            UnappliedField::LinuxResourcesBlockIoLeafWeightDevice,
+        );
+    }
+}
+
+/// 1 つの throttle リストを `(major, minor)` ごとの表へ詰める。同じリスト内の重複デバイス・不正な番号・
+/// 範囲外の rate（`0`・`u64::MAX`）は `Invalid`（`field` はリストのキー名）。
+fn merge_throttles<L: Limit>(
+    list: Option<Bounded<Obj<RawThrottleDevice>, L>>,
+    field: &'static str,
+    table: &mut BTreeMap<(u32, u32), IoThrottle>,
+    set: impl Fn(&mut IoThrottle, u64),
+) -> Result<(), OciConfigError> {
+    let mut seen = BTreeSet::new();
+    for Obj(d) in list.map(|b| b.0).unwrap_or_default() {
+        let major = u32::try_from(d.major).map_err(|_| OciConfigError::invalid(field))?;
+        let minor = u32::try_from(d.minor).map_err(|_| OciConfigError::invalid(field))?;
+        if d.rate == 0 || d.rate == u64::MAX || !seen.insert((major, minor)) {
+            return Err(OciConfigError::invalid(field));
+        }
+        set(
+            table
+                .entry((major, minor))
+                .or_insert_with(|| IoThrottle::new(major, minor)),
+            d.rate,
+        );
+    }
+    Ok(())
+}
+
+/// `linux.resources` を検証済みの [`LinuxResourceLimits`] に正規化する（#2019。規則は `resources.rs` の doc）。
+fn convert_resources(raw: RawResources) -> Result<LinuxResourceLimits, OciConfigError> {
+    let mut out = LinuxResourceLimits::default();
+    if let Some(Obj(m)) = raw.memory {
+        out.memory_max = match m.limit {
+            None => None,
+            Some(-1) => Some(ByteLimit::Max),
+            Some(n) if n > 0 => Some(ByteLimit::Bytes(n.unsigned_abs())),
+            Some(_) => return Err(OciConfigError::invalid("linux.resources.memory.limit")),
+        };
+        out.memory_swap_max = match (m.swap, out.memory_max) {
+            (None, _) => None,
+            (Some(-1), _) => Some(ByteLimit::Max),
+            // OCI の swap は「メモリ + swap」の合計。cgroup v2 の `memory.swap.max` は swap 単体なので差を書く。
+            (Some(total), Some(ByteLimit::Bytes(limit)))
+                if total > 0 && total.unsigned_abs() >= limit =>
+            {
+                Some(ByteLimit::Bytes(total.unsigned_abs() - limit))
+            }
+            (Some(_), _) => return Err(OciConfigError::invalid("linux.resources.memory.swap")),
+        };
+    }
+    if let Some(Obj(c)) = raw.cpu {
+        if let Some(q) = c.quota
+            && q != -1
+            && q <= 0
+        {
+            return Err(OciConfigError::invalid("linux.resources.cpu.quota"));
+        }
+        out.cpu_quota = c.quota;
+        out.cpu_period = c.period;
+    }
+    if let Some(Obj(p)) = raw.pids {
+        if let Some(l) = p.limit
+            && l != -1
+            && l <= 0
+        {
+            return Err(OciConfigError::invalid("linux.resources.pids.limit"));
+        }
+        out.pids_limit = p.limit;
+    }
+    if let Some(Obj(b)) = raw.block_io {
+        out.blkio_weight = b.weight;
+        let mut table = BTreeMap::new();
+        merge_throttles(
+            b.throttle_read_bps_device,
+            "linux.resources.blockIO.throttleReadBpsDevice",
+            &mut table,
+            |t, r| t.rbps = Some(r),
+        )?;
+        merge_throttles(
+            b.throttle_write_bps_device,
+            "linux.resources.blockIO.throttleWriteBpsDevice",
+            &mut table,
+            |t, r| t.wbps = Some(r),
+        )?;
+        merge_throttles(
+            b.throttle_read_iops_device,
+            "linux.resources.blockIO.throttleReadIOPSDevice",
+            &mut table,
+            |t, r| t.riops = Some(r),
+        )?;
+        merge_throttles(
+            b.throttle_write_iops_device,
+            "linux.resources.blockIO.throttleWriteIOPSDevice",
+            &mut table,
+            |t, r| t.wiops = Some(r),
+        )?;
+        out.io_throttles = table.into_values().collect();
+    }
+    Ok(out)
+}
+
 impl RawConfig {
     fn validate(self) -> Result<OciConfig, OciConfigError> {
         let oci_version = OciVersion::parse(self.oci_version.0)?;
@@ -1252,8 +1586,9 @@ impl RawConfig {
         if let Some(Obj(l)) = &self.linux {
             mark(l.devices, UnappliedField::LinuxDevices);
             mark(l.net_devices, UnappliedField::LinuxNetDevices);
-            mark(l.resources, UnappliedField::LinuxResources);
-            mark(l.cgroups_path, UnappliedField::LinuxCgroupsPath);
+            if let Some(Obj(r)) = &l.resources {
+                mark_resources(r, &mut mark);
+            }
             mark(l.rootfs_propagation, UnappliedField::LinuxRootfsPropagation);
             mark(l.seccomp, UnappliedField::LinuxSeccomp);
             mark(l.sysctl, UnappliedField::LinuxSysctl);
@@ -1279,6 +1614,7 @@ impl RawConfig {
         let (mut namespaces, mut uid_mappings, mut gid_mappings) =
             (Vec::new(), Vec::new(), Vec::new());
         let (mut masked_paths, mut readonly_paths) = (Vec::new(), Vec::new());
+        let (mut resources, mut cgroups_path) = (None, None);
         if let Some(Obj(linux)) = self.linux {
             for Obj(ns) in linux.namespaces.map(|b| b.0).unwrap_or_default() {
                 namespaces.push(OciNamespace {
@@ -1291,6 +1627,19 @@ impl RawConfig {
             }
             uid_mappings = convert_mappings(linux.uid_mappings, "linux.uidMappings")?;
             gid_mappings = convert_mappings(linux.gid_mappings, "linux.gidMappings")?;
+            resources = linux
+                .resources
+                .map(|Obj(r)| convert_resources(r))
+                .transpose()?;
+            cgroups_path = linux
+                .cgroups_path
+                .map(|p| {
+                    if p.0.is_empty() || p.0.contains('\0') {
+                        return Err(OciConfigError::invalid("linux.cgroupsPath"));
+                    }
+                    Ok(CgroupsPath(p.0))
+                })
+                .transpose()?;
             masked_paths = convert_protected_paths(linux.masked_paths, "linux.maskedPaths[]")?;
             readonly_paths =
                 convert_protected_paths(linux.readonly_paths, "linux.readonlyPaths[]")?;
@@ -1307,6 +1656,8 @@ impl RawConfig {
             gid_mappings,
             masked_paths,
             readonly_paths,
+            resources,
+            cgroups_path,
             unapplied,
         })
     }
@@ -1879,7 +2230,7 @@ mod tests {
     /// 値が `null` でも「指定あり」とみなす（fail-closed 側）。未指定なら空。
     #[test]
     fn sec1_each_unapplied_field_is_reported() {
-        assert_eq!(UNAPPLIED_FIELDS.len(), 34);
+        assert_eq!(UNAPPLIED_FIELDS.len(), 54);
         let none: [UnappliedField; 0] = [];
         assert_eq!(parse(&base()).expect("valid").unapplied_fields(), none);
         for &field in UNAPPLIED_FIELDS {
@@ -1888,6 +2239,13 @@ mod tests {
             let (last, parent) = keys.split_last().expect("non-empty path");
             for value in [json!({"any": [1]}), Value::Null] {
                 let mut v = base();
+                // `linux.resources.memory` のように base に無い中間 object は作る。
+                for depth in 1..=parent.len() {
+                    let slot = value_at(&mut v, &parent[..depth]);
+                    if slot.is_null() {
+                        *slot = json!({});
+                    }
+                }
                 value_at(&mut v, parent)
                     .as_object_mut()
                     .expect("object")
@@ -1923,6 +2281,229 @@ mod tests {
         v["linux"] = json!({"maskedPaths": []});
         assert!(parse(&v).expect("valid").masked_paths().is_empty());
         assert!(parse(&base()).expect("valid").readonly_paths().is_empty());
+    }
+
+    fn with_resources(resources: Value) -> Value {
+        let mut v = base();
+        v["linux"]["resources"] = resources;
+        v
+    }
+
+    /// #2019・CORE-3: 受理する項目は具体値に正規化され、未適用に残らない。swap は合計表現から差へ変換する。
+    #[test]
+    fn core3_resources_are_interpreted_into_concrete_values() {
+        let cfg = parse(&with_resources(json!({
+            "memory": {"limit": 67108864, "swap": 134217728},
+            "cpu": {"quota": 50000},
+            "pids": {"limit": -1},
+            "blockIO": {
+                "weight": 500,
+                "throttleReadBpsDevice": [
+                    {"major": 8, "minor": 16, "rate": 1048576},
+                    {"major": 8, "minor": 0, "rate": 2097152}
+                ],
+                "throttleWriteBpsDevice": [{"major": 8, "minor": 0, "rate": 4096}],
+                "throttleReadIOPSDevice": [{"major": 8, "minor": 0, "rate": 100}],
+                "throttleWriteIOPSDevice": [{"major": 8, "minor": 16, "rate": 200}]
+            }
+        })))
+        .expect("valid");
+        let none: [UnappliedField; 0] = [];
+        assert_eq!(cfg.unapplied_fields(), none);
+        let r = cfg.linux_resources().expect("resources");
+        assert_eq!(r.memory_max(), Some(ByteLimit::Bytes(67_108_864)));
+        assert_eq!(r.memory_swap_max(), Some(ByteLimit::Bytes(67_108_864)));
+        assert_eq!((r.cpu_quota(), r.cpu_period()), (Some(50_000), None));
+        assert_eq!(r.pids_limit(), Some(-1));
+        assert_eq!(r.blkio_weight(), Some(500));
+        let t = r.io_throttles();
+        assert_eq!(t.len(), 2);
+        assert_eq!((t[0].major(), t[0].minor()), (8, 0));
+        assert_eq!(
+            (t[0].rbps(), t[0].wbps(), t[0].riops(), t[0].wiops()),
+            (Some(2_097_152), Some(4096), Some(100), None)
+        );
+        assert_eq!((t[1].major(), t[1].minor()), (8, 16));
+        assert_eq!(
+            (t[1].rbps(), t[1].wbps(), t[1].riops(), t[1].wiops()),
+            (Some(1_048_576), None, None, Some(200))
+        );
+        // swap の特殊値と、`{}`（指定ありで全項目なし）。
+        let cfg = parse(&with_resources(
+            json!({"memory": {"limit": 1048576, "swap": -1}}),
+        ))
+        .expect("valid");
+        let r = cfg.linux_resources().expect("resources");
+        assert_eq!(r.memory_swap_max(), Some(ByteLimit::Max));
+        let cfg = parse(&with_resources(json!({"memory": {"limit": -1}}))).expect("valid");
+        assert_eq!(
+            cfg.linux_resources().expect("resources").memory_max(),
+            Some(ByteLimit::Max)
+        );
+        let cfg = parse(&with_resources(
+            json!({"memory": {"limit": 4096, "swap": 4096}}),
+        ))
+        .expect("valid");
+        assert_eq!(
+            cfg.linux_resources().expect("resources").memory_swap_max(),
+            Some(ByteLimit::Bytes(0))
+        );
+        let cfg = parse(&with_resources(json!({}))).expect("valid");
+        assert_eq!(cfg.linux_resources(), Some(&LinuxResourceLimits::default()));
+        assert_eq!(parse(&base()).expect("valid").linux_resources(), None);
+    }
+
+    /// #2019・SEC-1: 意味的に不正な値は `Invalid`（固定のキー名つき）で拒否する。
+    #[test]
+    fn sec1_resources_reject_invalid_values() {
+        let dup = json!([
+            {"major": 8, "minor": 0, "rate": 1},
+            {"major": 8, "minor": 0, "rate": 2}
+        ]);
+        for (resources, field) in [
+            (
+                json!({"memory": {"limit": 0}}),
+                "linux.resources.memory.limit",
+            ),
+            (
+                json!({"memory": {"limit": -2}}),
+                "linux.resources.memory.limit",
+            ),
+            (
+                json!({"memory": {"swap": 1048576}}),
+                "linux.resources.memory.swap",
+            ),
+            (
+                json!({"memory": {"limit": -1, "swap": 1048576}}),
+                "linux.resources.memory.swap",
+            ),
+            (
+                json!({"memory": {"limit": 2048, "swap": 1024}}),
+                "linux.resources.memory.swap",
+            ),
+            (
+                json!({"memory": {"limit": 2048, "swap": 0}}),
+                "linux.resources.memory.swap",
+            ),
+            (json!({"cpu": {"quota": 0}}), "linux.resources.cpu.quota"),
+            (json!({"cpu": {"quota": -5}}), "linux.resources.cpu.quota"),
+            (json!({"pids": {"limit": 0}}), "linux.resources.pids.limit"),
+            (json!({"pids": {"limit": -2}}), "linux.resources.pids.limit"),
+            (
+                json!({"blockIO": {"throttleReadBpsDevice": dup}}),
+                "linux.resources.blockIO.throttleReadBpsDevice",
+            ),
+            (
+                json!({"blockIO": {"throttleWriteBpsDevice": [{"major": -1, "minor": 0, "rate": 1}]}}),
+                "linux.resources.blockIO.throttleWriteBpsDevice",
+            ),
+            (
+                json!({"blockIO": {"throttleReadIOPSDevice": [{"major": 8, "minor": 0, "rate": 0}]}}),
+                "linux.resources.blockIO.throttleReadIOPSDevice",
+            ),
+            (
+                json!({"blockIO": {"throttleWriteIOPSDevice": [{"major": 8, "minor": 0, "rate": u64::MAX}]}}),
+                "linux.resources.blockIO.throttleWriteIOPSDevice",
+            ),
+        ] {
+            let e = err_of(&with_resources(resources));
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{field}");
+            assert_eq!(e.kind(), &OciConfigErrorKind::Invalid { field }, "{field}");
+            assert_eq!(
+                e.message(),
+                format!("config.json has an invalid value for `{field}`")
+            );
+        }
+    }
+
+    /// #2019・SEC-1: 未知のキー・`null`・型不一致は `Data`、throttle の件数超過は `LimitExceeded`。
+    /// 入力値もキー名もメッセージに出さない。
+    #[test]
+    fn sec1_resources_reject_unknown_keys_null_and_oversized_lists() {
+        for resources in [
+            json!({"someFutureLimit": 1}),
+            json!({"memory": {"someFutureLimit": 1}}),
+            json!({"cpu": {"quotas": 1}}),
+            json!({"pids": {"max": 1}}),
+            json!({"blockIO": {"weights": 1}}),
+            json!({"blockIO": {"throttleReadBpsDevice": [{"major": 8, "minor": 0, "rate": 1, "x": 1}]}}),
+            json!({"memory": null}),
+            json!({"memory": {"limit": null}}),
+            json!({"memory": {"limit": "1"}}),
+            json!({"memory": []}),
+        ] {
+            let e = err_of(&with_resources(resources.clone()));
+            assert_eq!(e.kind(), &OciConfigErrorKind::Data, "{resources}");
+            assert_eq!(
+                e.message(),
+                "config.json has a missing field, a type mismatch, or an invalid value"
+            );
+        }
+        let many: Vec<Value> = (0..=CONFIG_MAX_THROTTLE_DEVICES)
+            .map(|i| json!({"major": 8, "minor": i, "rate": 1}))
+            .collect();
+        let e = err_of(&with_resources(
+            json!({"blockIO": {"throttleReadBpsDevice": many}}),
+        ));
+        assert_eq!(
+            e.kind(),
+            &OciConfigErrorKind::LimitExceeded {
+                field: "linux.resources.blockIO.throttleReadBpsDevice".to_owned(),
+                limit: CONFIG_MAX_THROTTLE_DEVICES,
+            }
+        );
+    }
+
+    /// #2019・SEC-1: setter が無い既知の項目は未適用として記録される（create / start が拒否する）。
+    #[test]
+    fn sec1_resources_unsupported_known_keys_are_unapplied() {
+        let cfg = parse(&with_resources(json!({
+            "memory": {"limit": 1048576, "reservation": 1024},
+            "cpu": {"shares": 512},
+            "hugepageLimits": [{"pageSize": "2MB", "limit": 1}]
+        })))
+        .expect("valid");
+        assert_eq!(
+            cfg.unapplied_fields(),
+            [
+                UnappliedField::LinuxResourcesMemoryReservation,
+                UnappliedField::LinuxResourcesCpuShares,
+                UnappliedField::LinuxResourcesHugepageLimits
+            ]
+        );
+        assert_eq!(
+            UnappliedField::LinuxResourcesHugepageLimits.as_str(),
+            "linux.resources.hugepageLimits"
+        );
+    }
+
+    /// #2019: `linux.cgroupsPath` は型で保持する。空・NUL・長すぎる値は拒否する。
+    #[test]
+    fn core3_cgroups_path_is_kept_as_a_typed_value() {
+        let mut v = base();
+        v["linux"]["cgroupsPath"] = json!("/machine.slice/x");
+        let cfg = parse(&v).expect("valid");
+        assert_eq!(
+            cfg.cgroups_path().map(|p| p.as_str()),
+            Some("/machine.slice/x")
+        );
+        let none: [UnappliedField; 0] = [];
+        assert_eq!(cfg.unapplied_fields(), none);
+        assert!(parse(&base()).expect("valid").cgroups_path().is_none());
+        for bad in [json!(""), json!("a\0b")] {
+            v["linux"]["cgroupsPath"] = bad;
+            assert_eq!(
+                err_of(&v).kind(),
+                &OciConfigErrorKind::Invalid {
+                    field: "linux.cgroupsPath"
+                }
+            );
+        }
+        v["linux"]["cgroupsPath"] = json!("a".repeat(CONFIG_MAX_PATH_BYTES + 1));
+        assert!(matches!(
+            err_of(&v).kind(),
+            OciConfigErrorKind::LimitExceeded { field, .. } if field == "linux.cgroupsPath"
+        ));
     }
 
     /// OCI-4（#1852）: 不正な要素は `Invalid`（フィールド名つき）で拒否する。

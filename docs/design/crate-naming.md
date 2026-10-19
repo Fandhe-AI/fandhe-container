@@ -127,7 +127,7 @@ D-14（`01-brainstorm.md`「設計上の論点」6）の推奨に合わせ、com
 
 - supervisor は 2 つ目の実装を持たず、core の既定実装を使う（supervisor → core の一方向依存）
 - `state.json` の形式と、supervisor が使う項目（`supervisor_pid`・`health`・`restart_count`）は core の型に含める
-- CLI と supervisor の書き込みの排他は core の既定実装内で完結する（TASK-157.9・#1069）。ストア全体の `@lock` に対する std `File::try_lock` を期限つき（`STATE_LOCK_TIMEOUT`。超過は `TIMEOUT`）で再試行して直列化し、同じ ID への同時 `update` は `expected_revision` による楽観的排他で後着が `FAILED_PRECONDITION` になる。追加依存なし。後着側の再試行方針は呼び出し側（supervisor・CLI）の責務
+- CLI と supervisor の書き込みの排他は core の既定実装内で完結する（TASK-157.9・#1069）。ストア全体の `@lock` に対する std `File::try_lock` を期限つき（`STATE_LOCK_TIMEOUT`。超過は `TIMEOUT`）で再試行して直列化し、同じ ID への同時 `update` は `expected_revision` による楽観的排他で後着が `FAILED_PRECONDITION` になる。追加依存なし。後着側の再試行方針は呼び出し側（supervisor・CLI）の責務。同じプロセスが続けて取るときは解放から `LOCK_HANDOFF_GAP`（2ms）を空けて別プロセスへ譲り、取り直しによる飢えを防ぐ（#2229・SUP-1・REPAIR-5。計測は [state-lock-contention.md](measurements/state-lock-contention.md)）
 - spec の TASK-157 の記述（現状 `crates/supervisor/src/state.rs` を `StateStore` トレイトの実装として記載）の修正は、spec リポジトリ側で行う
 
 ### 決定 7: `benches/` の置き場所

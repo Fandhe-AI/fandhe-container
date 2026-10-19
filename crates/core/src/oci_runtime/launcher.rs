@@ -118,6 +118,8 @@ use super::cgroup_requirement::{CgroupJoinMeans, launch_after_cgroup_check};
 use super::config::NamespaceKind;
 use super::launch::{LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher};
 #[cfg(target_os = "linux")]
+use super::resources::LinuxResourceLimits;
+#[cfg(target_os = "linux")]
 use super::sysfs_mount::SysfsMountSpec;
 use crate::audit_log::AuditSink;
 #[cfg(target_os = "linux")]
@@ -200,6 +202,8 @@ pub struct ProductionLauncherBuilder {
     cgroup_join_source: Option<JoinSource>,
     #[cfg(target_os = "linux")]
     subordinate_ids: Option<SubordinateIdSource>,
+    #[cfg(target_os = "linux")]
+    applied_resources: Option<LinuxResourceLimits>,
 }
 
 impl std::fmt::Debug for ProductionLauncherBuilder {
@@ -246,6 +250,17 @@ impl ProductionLauncherBuilder {
         self
     }
 
+    /// start の cgroup 連鎖(手順 5)で制限ファイルへ書いた `linux.resources` の値(#2019・CORE-3・SEC-1)。
+    ///
+    /// launch は fork の前に `spec.config()` の `linux.resources` とこの値の一致を確かめ、食い違えば
+    /// `FailedPrecondition` で拒否する(手順 5 と手順 8 の間に `config.json` が書き換えられても、書いた値と違う
+    /// 制限のまま起動しない)。`linux.resources` が無い config では渡さない(`None` どうしが一致)。
+    #[must_use]
+    pub fn applied_resource_limits(mut self, applied: Option<LinuxResourceLimits>) -> Self {
+        self.applied_resources = applied;
+        self
+    }
+
     /// 起動のたびに cgroup 参加フックを作る源(`ContainerCgroup::join_hook` を呼ぶクロージャ等。CORE-3)。
     #[must_use]
     pub fn cgroup_join_source(
@@ -285,15 +300,15 @@ impl ProductionLauncherBuilder {
                     "failed to become a child subreaper for the launcher",
                 )
             })?;
-            Ok(ProductionLauncher {
-                inner: Inner::new(
-                    Box::new(RealOps { subreaper }),
-                    privilege,
-                    subordinate,
-                    audit_sink,
-                    self.cgroup_join_source,
-                ),
-            })
+            let mut inner = Inner::new(
+                Box::new(RealOps { subreaper }),
+                privilege,
+                subordinate,
+                audit_sink,
+                self.cgroup_join_source,
+            );
+            inner.applied_resources = self.applied_resources;
+            Ok(ProductionLauncher { inner })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -723,6 +738,8 @@ struct Inner {
     subordinate: Option<SubordinateIds>,
     audit_sink: Arc<dyn AuditSink>,
     cgroup_join_source: Option<JoinSource>,
+    /// cgroup 連鎖で書いた `linux.resources`(`ProductionLauncherBuilder::applied_resource_limits`)。
+    applied_resources: Option<LinuxResourceLimits>,
     /// ハンドルの回収通知（`ContainerChildProcess::with_reap_notice`）と共有するため `Arc`。
     ledger: Arc<Mutex<Ledger>>,
     /// `Handed` の世代の採番。
@@ -747,6 +764,7 @@ impl Inner {
             subordinate,
             audit_sink,
             cgroup_join_source,
+            applied_resources: None,
             ledger: Arc::new(Mutex::new(Ledger::default())),
             next_generation: std::sync::atomic::AtomicU64::new(0),
             left_process: AtomicBool::new(false),
@@ -775,8 +793,22 @@ impl Inner {
             CgroupJoinMeans::Absent
         };
         launch_after_cgroup_check(spec.cgroup_requirement(), means, || {
+            self.check_applied_resources(spec)?;
             self.launch_checked(spec, timeout)
         })
+    }
+
+    /// 制限ファイルへ書いた `linux.resources` と、これから起動する `spec` の config の値の一致を確かめる
+    /// (fork の前。#2019・CORE-3・SEC-1)。片方だけ指定がある場合も不一致として拒否する。
+    /// メッセージは固定文言で、値を含めない(ERR-1)。
+    fn check_applied_resources(&self, spec: &LaunchSpec) -> Result<(), TraitError> {
+        if spec.config().linux_resources() == self.applied_resources.as_ref() {
+            return Ok(());
+        }
+        Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "the cgroup limits applied before start do not match config.json",
+        ))
     }
 
     /// 権限モデルの検査。未対応のモデルは fork より前に拒否する(権限を黙って広げない。SEC-5)。
@@ -1870,6 +1902,60 @@ mod tests {
             ev.lock().unwrap().is_empty(),
             "nothing must run before the refusal"
         );
+    }
+
+    fn dummy_join_source() -> JoinSource {
+        Box::new(|| {
+            let fd = std::fs::File::open("/").unwrap();
+            Ok(CgroupJoin::from_dir_for_test(
+                crate::cgroups::CgroupName::new(&crate::traits::ContainerId::new("c").unwrap())
+                    .unwrap(),
+                std::os::fd::OwnedFd::from(fd),
+            ))
+        })
+    }
+
+    /// #2019・CORE-3・SEC-1: cgroup 連鎖で書いた `linux.resources` と config の値が食い違えば(書いていない場合・
+    /// 値が違う場合・config に無いのに書いた場合)、スレッド確認・Landlock・fork より前に拒否する。一致すれば進む。
+    #[test]
+    fn core3_applied_resource_limits_must_match_config_before_anything() {
+        let resources = serde_json::json!({"resources": {"memory": {"limit": 67108864}}});
+        let spec = spec_for("applied-res", resources.clone());
+        let other = spec_for(
+            "applied-res-other",
+            serde_json::json!({"resources": {"memory": {"limit": 134217728}}}),
+        );
+        let plain = spec_for("applied-res-plain", serde_json::json!({}));
+        let applied = |s: &LaunchSpec| s.config().linux_resources().cloned();
+        for (label, spec, applied_value) in [
+            ("not applied", &spec, None),
+            ("different value", &spec, applied(&other)),
+            ("applied but not in config", &plain, applied(&spec)),
+        ] {
+            let ev = events();
+            let mut l = launcher(FakeOps::new(&ev), rootless(), Some(dummy_join_source()));
+            l.inner.applied_resources = applied_value;
+            let err = l
+                .launch(spec, Duration::from_secs(1))
+                .err()
+                .unwrap_or_else(|| panic!("{label}: must be refused"));
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition, "{label}");
+            assert_eq!(
+                err.message(),
+                "the cgroup limits applied before start do not match config.json",
+                "{label}"
+            );
+            assert!(ev.lock().unwrap().is_empty(), "{label}: nothing may run");
+        }
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.run_stages = false;
+        let mut l = launcher(ops, rootless(), Some(dummy_join_source()));
+        l.inner.applied_resources = applied(&spec);
+        l.launch(&spec, Duration::from_secs(1))
+            .expect("matching limits launch")
+            .terminate(Duration::from_secs(5))
+            .expect("terminate");
     }
 
     /// CORE-3: 参加の源は launch のたびに 1 回呼ばれ(restart で再利用できる)、ステージ列へ登録される。

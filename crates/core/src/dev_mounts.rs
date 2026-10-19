@@ -13,6 +13,8 @@
 //! - `crate::tmpfs`: `/dev/shm` の既定の仕様（`read_only`・`exec`）を [`ImplicitDevMount::attrs`] から設定する
 //! - `crate::exec`（`devices`）: `/dev`・`/dev/pts` の事後検証で [`ImplicitDevMount::destination`] を使う。
 //!   fsmount の属性ビットは `sys` が固定で持ち、`sys` の単体テストが本定義との一致を照合する
+//! - `crate::oci_runtime::start`: `linux.readonlyPaths` / `maskedPaths` が暗黙のマウント先と同じか祖先を指す config を
+//!   fork 前に拒否する（#2015）
 //! - `crate::landlock`: [`ImplicitDevMounts`] に従い、実マウントの属性から導いた最小の権利でルールを足す
 //!
 //! # `/dev/shm` を載せない構成（#1672 事後監査 P2）

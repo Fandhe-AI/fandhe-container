@@ -4,7 +4,7 @@
 //! 排他区間で行い、その間に参照テーブルを変える操作（create の参照登録・delete の参照解除・
 //! `image tag` のタグ登録・`image rm` の untag・pull のリース登録 / 公開 / 解放）を割り込ませない。
 //! 本モジュールはその区間を `ImageStore::lock` の RAII ガードとして提供する。
-//! 後続の #474・#475（pull）・#476（prune）・#479（tag）・#480 / #481（rm）・#853（create / delete）が使う。
+//! 後続の #474・#475（pull）・#476（prune）・#479（tag）・#480 / #481（rm）・#853（create / delete。入口は `register_container_ref` / `release_container_ref`）が使う。
 //!
 //! # 契約
 //!
@@ -109,6 +109,11 @@ impl ImageStore {
     pub fn with_recorder(mut self, recorder: Arc<dyn OciOpRecorder>) -> Self {
         self.recorder = recorder;
         self
+    }
+
+    /// 記録先。`tag` 等の同モジュール階層の操作入口が、ガード取得後の操作を計装するために使う。
+    pub(super) fn recorder(&self) -> &dyn OciOpRecorder {
+        &*self.recorder
     }
 
     /// ストア root。

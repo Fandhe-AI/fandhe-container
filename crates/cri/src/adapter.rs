@@ -14,7 +14,7 @@
 //!
 //! **未実装・簡易実装（REPAIR-3）**: 本モジュールは呼び出し境界だけを提供する。RPC ハンドラへの接続は
 //! create・start が TASK-59.2（#438。`CriRuntimeService::with_runtime` で注入したときだけ有効）、
-//! stop・delete が TASK-59.3（#439。接続済み）、結合試験は TASK-59.4（#440）で行い、
+//! stop・delete が TASK-59.3（#439。接続済み）、全ライフサイクルの結合試験は TASK-59.4（#440。`tests/adapter_integration.rs`）で実施済みで、
 //! `ContainerRuntime` の実装（plugin 側。TASK-114）と OCI bundle の生成の本体も本モジュールの範囲外である
 //! （bundle の供給は [`BundleProvider`] の注入点だけを定義する）。
 

@@ -2245,7 +2245,8 @@ fn check_bind_overlaps(
 /// `run_child_then` が Landlock 段へ渡す。Landlock の適用時に、Mount 由来のルールの対象がその記録と一致する
 /// （宛先の最上位のマウントが載せたもののままである）ことを確かめる（#2071・CORE-5・SEC-1）。なお
 /// `readonly_paths` / `masked_paths` の config 由来の追加分が `/dev` 系の宛先と重なる構成では、宛先の最上位のマウントが
-/// 入れ替わるため、この照合で拒否される。
+/// 入れ替わるため、この照合で拒否される。ただし本番の start は同じ重なりを fork・予約より前に
+/// `InvalidArgument` で拒否する（`oci_runtime::start`。#2015）ため、この照合は後ろ盾である。
 ///
 /// デバイスノードと tmpfs は pivot の前に、`PreparedRootfs` の fd を起点に作る（pivot 後は旧 root が
 /// 切り離され、ホスト側の `/dev` を再解決できないため）。`setup` が `None` なら
@@ -2531,6 +2532,52 @@ pub fn spawn_container_probe_with_config_paths<F>(
 where
     F: FnOnce(),
 {
+    spawn_container_probe_inner(rootfs, stages, devices, None, readonly, masked, probe)
+}
+
+/// [`spawn_container_probe_with_config_paths`] に tmpfs の集合（`/dev/shm` 等）も載せる版。結合試験
+/// `tests/config_paths_implicit_dev.rs` 専用（SEC-2・CORE-5・#2015）。`PrePivotSetup.tmpfs` を渡すため、
+/// 本番と同じ順序（デバイス -> tmpfs -> readonlyPaths -> maskedPaths -> pivot）で適用する。本番 launcher
+/// （Landlock 必須）には依存せず、`exec_entrypoint` の fail-closed は変えない。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub fn spawn_container_probe_with_tmpfs_and_config_paths<F>(
+    rootfs: &Path,
+    stages: StagePipeline,
+    devices: DevptsGidSource<'_>,
+    tmpfs: &TmpfsMountSet,
+    readonly: &[&str],
+    masked: &[&str],
+    probe: F,
+) -> Result<ContainerChild, ExecError>
+where
+    F: FnOnce(),
+{
+    spawn_container_probe_inner(
+        rootfs,
+        stages,
+        devices,
+        Some(tmpfs),
+        readonly,
+        masked,
+        probe,
+    )
+}
+
+/// 上の 2 つの probe の共通本体（`tmpfs` の有無だけが違う）。
+#[cfg(feature = "escape-probe")]
+fn spawn_container_probe_inner<F>(
+    rootfs: &Path,
+    stages: StagePipeline,
+    devices: DevptsGidSource<'_>,
+    tmpfs: Option<&TmpfsMountSet>,
+    readonly: &[&str],
+    masked: &[&str],
+    probe: F,
+) -> Result<ContainerChild, ExecError>
+where
+    F: FnOnce(),
+{
     let parse = |list: &[&str]| -> Result<Vec<ProtectedPath>, ExecError> {
         list.iter()
             .map(|p| {
@@ -2551,7 +2598,7 @@ where
         move || {
             let setup = PrePivotSetup {
                 devices,
-                tmpfs: None,
+                tmpfs,
                 inject: None,
                 binds: None,
                 pinned_rootfs: None,

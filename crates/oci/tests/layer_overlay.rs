@@ -287,6 +287,96 @@ fn oci1_overlay_across_entry_types_and_modes() {
     assert_eq!(std::fs::read(root.join("ro/x")).unwrap(), b"x");
 }
 
+/// OCI-1: 中身のある下位ディレクトリを、上位レイヤーの通常ファイルが置き換える（image-spec の
+/// Changeset over existing files。#1996 で実装済み、#2017 で公開 API 経由の結合試験を追加）。
+#[test]
+fn oci1_upper_file_replaces_lower_dir_with_contents() {
+    let t = Tmp::new("dir2file");
+    let l1 = layer_gz(&[
+        E::Dir("d/", 0o755),
+        E::File("d/x", 0o644, b"x"),
+        E::File("d/sub/y", 0o644, b"y"),
+        E::File("keep", 0o644, b"k"),
+    ]);
+    let l2 = layer_gz(&[E::File("d", 0o644, b"file-d")]);
+    let b1 = t.blob("l1.tar.gz", &l1);
+    let b2 = t.blob("l2.tar.gz", &l2);
+    extract_layer_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap();
+    let root = t.root();
+    assert_eq!(std::fs::read(root.join("d")).unwrap(), b"file-d");
+    let expected: BTreeSet<String> = ["d", "keep"].iter().map(|s| (*s).to_string()).collect();
+    assert_eq!(tree(&root), expected);
+}
+
+/// OCI-1: 下位ディレクトリを上位の symlink が置き換える。
+#[cfg(unix)]
+#[test]
+fn oci1_upper_symlink_replaces_lower_dir() {
+    let t = Tmp::new("dir2link");
+    let l1 = layer_gz(&[E::File("d/x", 0o644, b"x"), E::File("keep", 0o644, b"k")]);
+    let l2 = layer_gz(&[E::Symlink("d", "keep")]);
+    let b1 = t.blob("l1.tar.gz", &l1);
+    let b2 = t.blob("l2.tar.gz", &l2);
+    extract_layer_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap();
+    assert_eq!(
+        std::fs::read_link(t.root().join("d")).unwrap(),
+        Path::new("keep")
+    );
+    let expected: BTreeSet<String> = ["d", "keep"].iter().map(|s| (*s).to_string()).collect();
+    assert_eq!(tree(&t.root()), expected);
+}
+
+/// OCI-1: 下位の絶対 symlink を経由する置換も root の内側に閉じ、root の外は変わらない。
+#[cfg(unix)]
+#[test]
+fn oci1_replacement_through_lower_symlink_stays_in_root() {
+    let t = Tmp::new("repl-escape");
+    let l1 = layer_gz(&[E::Symlink("out", "/"), E::File("d/x", 0o644, b"x")]);
+    let l2 = layer_gz(&[E::File("out/d", 0o644, b"file-d")]);
+    let b1 = t.blob("l1.tar.gz", &l1);
+    let b2 = t.blob("l2.tar.gz", &l2);
+    extract_layer_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits()).unwrap();
+    assert_eq!(std::fs::read(t.root().join("d")).unwrap(), b"file-d");
+    let outside: BTreeSet<String> = std::fs::read_dir(&t.base)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(
+        outside,
+        ["l1.tar.gz", "l2.tar.gz", "root"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    );
+}
+
+/// OCI-1: 置換エントリが `..` で root の外を指すレイヤーは拒否され、下位の内容は残る。
+#[test]
+fn oci1_replacement_entry_with_parent_dir_is_rejected() {
+    let t = Tmp::new("repl-dotdot");
+    let l1 = layer_gz(&[E::File("d/x", 0o644, b"x")]);
+    let b1 = t.blob("l1.tar.gz", &l1);
+    // tar crate の builder は `..` を拒否するため、ヘッダを直接組む。
+    let mut raw = vec![0u8; 512];
+    raw[..4].copy_from_slice(b"../d");
+    raw[100..107].copy_from_slice(b"0000644");
+    raw[124..135].copy_from_slice(b"00000000000");
+    raw[136..147].copy_from_slice(b"00000000000");
+    raw[148..156].copy_from_slice(b"        ");
+    raw[156] = b'0';
+    raw[257..263].copy_from_slice(b"ustar\0");
+    let sum: u32 = raw.iter().map(|b| u32::from(*b)).sum();
+    raw[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    raw.extend_from_slice(&[0u8; 1024]);
+    let mut z = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    z.write_all(&raw).unwrap();
+    let b2 = t.blob("l2.tar.gz", &z.finish().unwrap());
+    let e = extract_layer_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits())
+        .unwrap_err();
+    assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+    assert_eq!(std::fs::read(t.root().join("d/x")).unwrap(), b"x");
+}
+
 /// OCI-1: 下位の symlink を経由してもルート外へは書けない（上位レイヤーの絶対 symlink 先もルートに閉じる）。
 #[cfg(unix)]
 #[test]

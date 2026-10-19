@@ -37,6 +37,7 @@ use std::time::Duration;
 use super::bind_mounts::BindMountSet;
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
+use super::working_dir::ContainerWorkingDir;
 use crate::traits::{CgroupPlacement, ContainerId, ErrorCode, Signal, TraitError};
 
 /// [`StartTimeouts`] の各上限が取れる最大値（無期限相当の値を型で拒否する。REPAIR-5）。
@@ -447,6 +448,10 @@ pub struct LaunchSpec {
     container_id: ContainerId,
     /// `config` と同じ `mounts[]` から `start` が検証した bind mount の集合（#1915）。
     bind_mounts: BindMountSet,
+    /// `process.cwd`（start が字句検証済み。pivot 後に移る。OCI-1・TASK-29）。
+    working_dir: ContainerWorkingDir,
+    /// `process.user` の (uid, gid)（名前空間内の値。写像との整合は launcher が fork 前に検査する。OCI-1・SEC-5）。
+    user: (u32, u32),
 }
 
 impl LaunchSpec {
@@ -464,6 +469,8 @@ impl LaunchSpec {
         config: std::sync::Arc<OciConfig>,
         container_id: ContainerId,
         bind_mounts: BindMountSet,
+        working_dir: ContainerWorkingDir,
+        user: (u32, u32),
     ) -> Self {
         Self {
             rootfs,
@@ -476,7 +483,19 @@ impl LaunchSpec {
             config,
             container_id,
             bind_mounts,
+            working_dir,
+            user,
         }
+    }
+
+    /// 検証済みの作業ディレクトリ（`process.cwd`。OCI-1・TASK-29）。
+    pub fn working_dir(&self) -> &ContainerWorkingDir {
+        &self.working_dir
+    }
+
+    /// `process.user` の (uid, gid)（コンテナ内の値。OCI-1・SEC-5）。
+    pub fn user(&self) -> (u32, u32) {
+        self.user
     }
 
     /// `start` が検証した bind mount の集合（`mounts[]` の指定順。TASK-29 追補・#1915・OCI-4・SEC-1）。

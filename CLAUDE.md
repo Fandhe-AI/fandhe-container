@@ -75,11 +75,12 @@ fandhe-container/
 │   │   ├── bench-calibration.md   # ベンチ基準値の校正記録・試行ログ（TASK-88.2・REPAIR-8。実測は前提ベンチ未実装のため保留）
 │   │   ├── measurements/
 │   │   │   ├── idle-memory-local.md  # アイドル時常駐メモリのローカル実測レポート（TASK-45.2・CORE-7。root 権限での確定計測は TASK-47）
+│   │   │   ├── state-lock-contention.md  # 状態ストア `@lock` の取り直しによる飢えの計測と対策（#2229・SUP-1・REPAIR-5）
 │   │   │   └── oci-pull-e2e-local.md  # pull_e2e の公開イメージ 5 種での実行記録（TASK-55.2・OCI-1・#421。run 段の終了コード 0 は人間へ引き継ぎ）
 │   │   ├── macos-vm-strategy.md   # macOS の VM 利用方式（既定: 常駐 VM 共用＋軽量プロセス分離／オプション: 1 コンテナ = 1 VM。TASK-66・MAC-4）
 │   │   ├── macos-shared-vm.md     # macOS 既定方式（常駐 VM 共用）の未決事項の設計案（保持役・bind mount・ゲスト内実行・計測対象。TASK-191・#1905・MAC-4。承認待ち #1906）
 │   │   ├── fs-normalization.md   # FS 正規化（NFC/NFD の別表記の衝突を検出して拒否・名前は書き換えない。TASK-21・IO-5）
-│   │   ├── oci-layer-special-bits.md  # レイヤー展開の setuid / setgid / sticky を所有者の写像に合わせて保持する条件（既定は落とす。#1810・OCI-1・SEC-5）
+│   │   ├── oci-layer-special-bits.md  # レイヤー展開の setuid / setgid / sticky を所有者の写像に合わせて保持する条件（既定は落とす。#1810・OCI-1・SEC-5）と、tar の uid/gid を subuid 範囲へ写像して chown する経路・rootful で特殊ビットを残す条件（#2225）
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   │   ├── rootless-network.md    # rootless ネットワーク外部ヘルパーの判断記録（TASK-147・NET-9。pasta を採用〔#340〕。実装・実証は #341）
 │   │   ├── privilege-separation.md  # 権限分離方式の比較と必要最小権限の設計書（TASK-171.1.1・SUP-14。方式承認済み〔#1454〕）

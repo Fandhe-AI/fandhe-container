@@ -48,13 +48,57 @@ tar の値のまま適用する。満たさないものは落とす（fail-close
 - `root` を排他的に所有し、展開から rootfs として使い終わるまで 0700 を保つ。権限の後からの変更（TOCTOU）は防げない
 - コンテナ内で setuid が実際に効くかは `process.noNewPrivileges` に依る。本変更はビットの保持までを扱う
 
+## 所有者の適用（chown。#2225・SEC-5）
+
+`ExtractOptions { ownership, special_bits }` を受ける入口 `extract_layers_with_options` /
+`extract_layer_blobs_with_options` を足した（既存の `*_with_policy` はこれへ委譲し、挙動は変えない）。
+`OwnershipPolicy::ChownMapped { uid, gid }`（複数行の写像 `IdMap`。core の `IdMapSet::new` と同じ検証規則で、
+`tests/idmap_core_parity.rs` が同じ入力の表で照合する）を渡すと、tar の uid / gid を写像してホストの ID へ `chown` する。
+既定は `Keep`（`chown` しない）。
+
+| 項目 | 決定 |
+| ---- | ---- |
+| 呼び出し側 | 初期 user namespace で `CAP_CHOWN` を持つプロセス（典型はホスト root）。ホストの非特権ユーザーは subuid 範囲へ `chown` できず、`EPERM` は `PermissionDenied`（fail-closed）。写像はコンテナ起動時の user namespace の写像と同じものを渡す |
+| 非 Linux | 開始前に `Unimplemented`（黙って飛ばさない）。特殊ビットは従来どおり `UnsupportedHost`（Strip 相当） |
+| 範囲外・不正な ID | 写像に無い ID は `PermissionDenied`、解析できない ID（PAX の不正値を含む）は `InvalidArgument`。パス 1 で書き込み前に拒否 |
+| ホスト ID 0 | `IdMap::new` が `PermissionDenied` で拒否する（コンテナ root をホスト root に写さない。SEC-5） |
+| 通常ファイル | 書き込み後に `fchown` → 所有者を読み戻して照合（不一致は `FailedPrecondition`）→ 特殊ビット判定 → `fchmod`。`chown` を先にするのは Linux が `chown` で setuid / setgid を落とすため |
+| ディレクトリ | 全レイヤーの後に深い順で `lchown` し、直後に mode を適用する。子の作成を妨げないため |
+| 暗黙のディレクトリ | tar に所有者が無いため、コンテナ内 0:0 を写した ID にする |
+| symlink | `lchown`（追従しない）。mode は扱わない |
+| hardlink | `chown` しない。inode を共有する参照先の所有者と特殊ビットを書き換えないため。所有者は参照先のエントリのもの |
+| `root` | 最後にコンテナ内 0:0 を写した ID へ `chown`。mode は 0700 のまま（ホスト root 所有のままだとコンテナ root が `/` を辿れない） |
+| PAX `uname` / `gname` | 使わない（読まない）。数値の uid / gid だけを正とする。名前はイメージの `/etc/passwd` に属し、ホストの NSS で引くと別のユーザーに写りうるため。NSS 解決の FFI も要る |
+| xattr | 扱わない |
+
+結果は `ExtractedLayer::ownership`（`OwnershipOutcome { decision, chowned_entries }`）。ディレクトリと `root` の件数は
+最後のレイヤーに数える。
+
+## rootful で特殊ビットを残す条件（`SpecialBitsPolicy::PreserveIfChowned`）
+
+`ChownMapped` と組み合わせたときだけ有効（`Keep` との組み合わせは開始前に `InvalidArgument`）。`chown` と読み戻しの後の
+所有者で判定する。ポリシー全体の条件は `PreserveIfOwnerMapped` と同じ（Linux・`root` が 0700）。
+
+| ビット | 残す条件 |
+| ------ | -------- |
+| setuid | 読み戻した所有 uid が 0 でなく、`uid.map_to_host(tar の uid) == 所有 uid` |
+| setgid | 読み戻した所有 gid が 0 でなく、`gid.map_to_host(tar の gid) == 所有 gid` |
+| sticky | ポリシー全体の条件のみ |
+
+- 「`root` の所有 uid と一致」の共通条件は使わない（`chown` 後の所有者は写像先のため）
+- 根拠: `IdMap` はホスト ID 0 を含む写像を拒否するため、残る setuid / setgid はホスト上で非特権の subuid / subgid にしか
+  効かない。`root` が 0700 なのでほかのホストユーザーは辿れない。コンテナ内で setuid が効くかは `process.noNewPrivileges` 次第
+- 適用後に mode を読み戻し、残っていなければ落とした件数に入れる（既存の規則と同じ）
+- TOCTOU（ディレクトリ fd 起点の解決が未実装）は既存の制限のまま。呼び出し側が `root` を排他的に所有する契約に依る
+
 ## 未実装（REPAIR-3）
 
-- tar の uid / gid の適用（`chown`・subuid の複数範囲への写像）。展開物は常に実行ユーザー所有のため、rootless
-  （コンテナ内 0 → 実行ユーザーの 1 行の写像）のように、所有者が写像先と一致する経路だけを保持の対象にしている
-- rootful（ホスト uid 0）で特殊ビットを残す経路。ファイルの所有 uid が 0 のため常に落とす。`chown` と idmap の導入後に再検討する
-- 写像が複数行の場合の `IdRange` の拡張
-- PAX の `uname` / `gname` は使わない
+- rootless で写像済みの user namespace の中から展開する経路。ns 内の ID の見え方が変わり、「所有 uid が 0 でない」条件と
+  host 0 の拒否との両立を設計し直す必要がある。`PreserveIfOwnerMapped` の rootless 経路（`chown` しない 1 行の写像）は従来どおり
+- 0700 の祖先ディレクトリで閉じ込めを判定する方式。`root` が 0700 のため、複数範囲の写像でもコンテナ内の非 root ユーザーは
+  `/` を辿れない
+- 本番の呼び出し元（pull → 展開 → 起動の経路）から `ExtractOptions` を渡す配線
+- `IdMap` と core の `IdMapSet` を下位 crate へ共通化するかどうか（crate 境界の判断）
 
 ## 試験との対応
 
@@ -63,3 +107,14 @@ tar の値のまま適用する。満たさないものは落とす（fail-close
 `sec5_special_bits_dropped_when_file_owner_is_host_root`・`sec5_special_bits_dropped_when_pax_uid_is_malformed`
 （満たさない経路で落ち、件数が出る）、`oci1_directory_setgid_is_applied`（ディレクトリの setgid）、
 `sec5_special_bits_to_keep_matrix`・`sec5_id_range_maps_with_checked_arithmetic`（純関数の条件の組み合わせ）。
+
+chown（#2225）: `extract.rs` の `chown_tests`（`chown` を記録する差し替え口で呼び出しの値・順序を照合。
+`sec5_chown_maps_tar_owner_through_multi_line_map`・`sec5_chown_order_file_before_mode`・
+`sec5_chown_dirs_deepest_first_before_mode`・`sec5_hardlink_is_not_chowned`・
+`sec5_owner_outside_map_is_rejected_before_layer_writes`・`sec5_malformed_pax_owner_is_rejected_when_chowning`・
+`sec5_chown_readback_mismatch_is_failed_precondition`・`sec5_chown_eperm_is_permission_denied`・
+`sec5_preserve_if_chowned_*`・`sec5_special_bits_to_keep_chowned_matrix`・`sec5_keep_policy_does_not_chown`）、
+非 Linux の `sec5_chown_is_unimplemented_off_linux`・`sec5_non_linux_preserve_policy_strips_everything`（main の 3 OS 実行で確認）、
+`idmap.rs` の単体試験、`tests/idmap_core_parity.rs`（core との照合）、`tests/layer_extract.rs` の
+`sec5_chown_via_public_api_with_real_syscalls`・`sec5_chown_outside_map_and_without_privilege_fail_closed`
+（実 syscall。権限なしで通る）。実機前提（root）の `sec5_chown_subuid_range_as_root` は `#[ignore]`（AGENTS.md「実機前提テスト」）。

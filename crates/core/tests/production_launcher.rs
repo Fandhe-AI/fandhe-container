@@ -81,8 +81,8 @@
 //! - Landlock の適用は、コンテナ内で `NoNewPrivs`・`Seccomp` を読む間接証拠に留まる。パス単位の拒否を直接観測する
 //!   には `core` の公開 API の追加が要るため、本試験の範囲外（`landlock_implicit_dev` 等が単体で観測している）。
 //!   capability と seccomp の実効はシナリオ J・K が exec 後のプロセスで直接照合する
-//! - seccomp の識別的な errno（`kcmp` が `EPERM` 等）を exec 後に照合するには `exec` の test 限定の入口の追加が要るため、
-//!   errno の拒否は `mount` の網羅確認に留め、識別はシナリオ K の SIGSYS が担う
+//! - seccomp の識別は、シナリオ J の exec 後の `kcmp` の `EPERM`（test 限定の入口 `probe_denied_syscalls_for_test`。
+//!   適用前の `kcmp` 対照は親側で要求し、満たさなければ前提欠如として失敗）とシナリオ K の SIGSYS が担う。`mount` の `EPERM` は網羅確認
 //! - bind 以外の `mounts[]` の種類、`ro` の bind（#1917）、段ごとの個別観測（#1916）、`linux.resources`、
 //!   supervisor 経由の起動（#1819）は対象外
 //! - 実機での実行結果の記録は #1621（Phase 3 の分離系結合試験の実機実行。人間担当）
@@ -156,7 +156,9 @@ mod linux {
     use fandhe_container_core::capabilities::OCI_DEFAULT_CAPABILITIES;
     use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup, DelegatedCgroup};
     use fandhe_container_core::exec::{
-        EscapeSyscallProbe, IsolationPrivilege, escape_probe_mount, probe_escape_syscall,
+        EscapeSyscallProbe, IsolationPrivilege, ProbeOutcome, SeccompProbeRecord,
+        escape_probe_mount, probe_denied_syscalls_for_test, probe_escape_syscall,
+        probe_kcmp_self_for_test,
     };
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
@@ -365,6 +367,15 @@ mod linux {
             }
             // PID 1 かつ `Seccomp: 2` のときだけ発行される安全な入口。`mount` は seccomp が `EPERM` で拒否する。
             emit(format!("SECCOMP_MOUNT {:?}", escape_probe_mount()));
+            // exec 後の PID 1 の記録（`kcmp` の errno を識別的に照合する。#2234）。入口は PID 1 かつ `Seccomp: 2` でだけ発行する。
+            match probe_denied_syscalls_for_test() {
+                Ok(rec) => {
+                    for line in rec.render().lines() {
+                        emit(format!("SECCOMP_RECORD {line}"));
+                    }
+                }
+                Err(e) => emit(format!("SECCOMP_RECORD_ERROR {:?}", e.code)),
+            }
             // 許可された syscall（`openat`・`read`）の対照。拒否一辺倒のフィルタ（全拒否）と区別する。
             let control = std::fs::read_to_string("/proc/thread-self/status");
             emit(format!(
@@ -1639,6 +1650,15 @@ mod linux {
         const OCI_DEFAULT_MASK: u64 = 0x0000_0000_a804_25fb;
         assert_eq!(from_api, OCI_DEFAULT_MASK, "OCI default capability mask");
 
+        // 適用前の kcmp 対照（親は組み込みフィルタを載せていない）。外側が拒否する環境は前提欠如として失敗させる（#2234）。
+        let kcmp_before = probe_kcmp_self_for_test();
+        assert_eq!(
+            kcmp_before,
+            ProbeOutcome::Ok,
+            "precondition failed: kcmp(self, self) must succeed before the built-in seccomp stage (got {kcmp_before:?}, Seccomp: {}); the outer environment already denies kcmp, so EPERM inside the container cannot be attributed to the built-in filter",
+            status_field("/proc/self/status", "Seccomp:").unwrap_or_default()
+        );
+
         let bundle = Bundle::new("j");
         let ld = make_rootfs(&bundle.rootfs(), true);
         write_config(&bundle, &ld, &["--with-restrictions"], json!([]));
@@ -1687,6 +1707,32 @@ mod linux {
             // 拒否される syscall と、許可される syscall の対照。
             assert_eq!(value_of(&lines, "SECCOMP_MOUNT"), "Ok(Errno(1))");
             assert_eq!(value_of(&lines, "SECCOMP_CONTROL"), "ok");
+            // 識別的な照合: kcmp の EPERM は seccomp 以外では生じない（親側の適用前の対照が成功している前提）。
+            assert!(
+                !lines.iter().any(|l| l.starts_with("SECCOMP_RECORD_ERROR")),
+                "seccomp record probe failed: {lines:?}"
+            );
+            let record_text = lines
+                .iter()
+                .filter_map(|l| l.strip_prefix("SECCOMP_RECORD "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let rec = SeccompProbeRecord::parse(&record_text)
+                .unwrap_or_else(|e| panic!("parse post-exec seccomp record: {e}; {lines:?}"));
+            assert_eq!(rec.kcmp, ProbeOutcome::Errno(1), "post-exec kcmp EPERM");
+            assert_eq!(rec.seccomp_mode, "2", "post-exec SECCOMP_MODE_FILTER");
+            assert_eq!(rec.control, ProbeOutcome::Ok, "post-exec control read");
+            assert_eq!(rec.mount, ProbeOutcome::Errno(1), "post-exec mount EPERM");
+            assert_eq!(
+                rec.pivot_root,
+                ProbeOutcome::Errno(1),
+                "post-exec pivot_root EPERM"
+            );
+            assert_eq!(
+                rec.umount2,
+                ProbeOutcome::Errno(1),
+                "post-exec umount2 EPERM"
+            );
             println!("production_launcher: scenario=j pid={pid} post-exec caps and seccomp ok");
         }));
         finish_started(started, verified);

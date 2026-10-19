@@ -424,6 +424,7 @@ impl SeccompProbeRecord {
 /// # 将来仕様（記録のみ）
 ///
 /// exec が許可されたら（証跡配線後。後続作業）、エントリポイント側のプローブ実行へ置き換える（REPAIR-3）。
+/// exec 後の PID 1 からは test 限定の [`probe_denied_syscalls_for_test`] 経由で呼べる（#2234）。
 pub(crate) fn probe_denied_syscalls() -> Result<SeccompProbeRecord, ExecError> {
     let fail =
         |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Seccomp, m.to_string());
@@ -537,6 +538,46 @@ fn probe_context_is_isolated() -> bool {
         .find_map(|l| l.strip_prefix("Seccomp:"))
         .and_then(|v| v.trim().parse::<u32>().ok())
         == Some(2)
+}
+
+/// seccomp 段を載せる前の対照として `kcmp(自 pid, 自 pid, KCMP_VM)` の結果を返す（CORE-5・ESC-06・SEC-1・#2234）。
+///
+/// `tests/seccomp.rs`・`tests/production_launcher.rs` の試験プロセス（組み込みフィルタを載せる前）が呼び、
+/// `kcmp` が成功することを前提として要求する。外側の seccomp・LSM・kcmp 非対応のカーネルでは `EPERM` / `ENOSYS`
+/// になり、コンテナ内の `EPERM` を組み込みフィルタの成果と見なせないため、試験側が前提欠如として失敗させる。
+/// `kcmp` は比較のみで副作用が無いため、PID・seccomp の前提検査は付けない。
+///
+/// # 将来仕様（記録のみ）
+///
+/// エントリポイント内のプローブへ置き換えて本関数を廃止する（REPAIR-3）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub fn probe_kcmp_self_for_test() -> ProbeOutcome {
+    ProbeOutcome::from_result(sys::kcmp_self_probe())
+}
+
+/// exec 後のコンテナ PID 1 から [`probe_denied_syscalls`] を呼ぶ test 限定の入口（CORE-5・ESC-06・SEC-1・#2234）。
+///
+/// `tests/production_launcher.rs` のシナリオ J のプローブ（exec 後の PID 1）が呼び、`kcmp` の `EPERM` を識別的に
+/// 照合する。`probe_denied_syscalls` は `mount`・`pivot_root`・`umount2` も発行するため、[`escape_probe_mount`]
+/// と同じ前提検査で fail-closed にする。PID 1 かつ `Seccomp: 2` でなければ syscall を発行せず
+/// `FailedPrecondition` を返す（ホストの `/` の propagation を変えない）。新規 `unsafe`・新規 `sys` 宣言は無い。
+///
+/// # 将来仕様（記録のみ）
+///
+/// エントリポイント内のプローブへ置き換えて本関数を廃止する（REPAIR-3）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub fn probe_denied_syscalls_for_test() -> Result<SeccompProbeRecord, ExecError> {
+    if std::process::id() != 1 || !probe_context_is_isolated() {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Seccomp,
+            "probe_denied_syscalls_for_test must run as PID 1 with the seccomp filter active"
+                .to_string(),
+        ));
+    }
+    probe_denied_syscalls()
 }
 
 /// 単一スレッド条件を適用の前後で検査して [`apply_filter`] を呼ぶ。事前検査は副作用の前に行う。
@@ -781,6 +822,24 @@ mod tests {
         k.mode = Some(Ok(0));
         let e = apply_single_threaded(&program(), &mut k).unwrap_err();
         assert_eq!(e.code, ErrorCode::Internal);
+    }
+
+    /// CORE-5・#2234: 試験プロセス（PID 1 ではない）からは syscall を発行せず `FailedPrecondition`（fail-closed）。
+    #[cfg(feature = "escape-probe")]
+    #[test]
+    fn core5_probe_denied_syscalls_for_test_refuses_outside_container() {
+        let e = probe_denied_syscalls_for_test().unwrap_err();
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+    }
+
+    /// CORE-5・#2234: 適用前の対照は `sys` のプローブ結果と一致する。
+    #[cfg(feature = "escape-probe")]
+    #[test]
+    fn core5_probe_kcmp_self_for_test_matches_sys_probe() {
+        assert_eq!(
+            probe_kcmp_self_for_test(),
+            ProbeOutcome::from_result(sys::kcmp_self_probe())
+        );
     }
 
     /// CORE-5: スレッド数の事前・事後検査。

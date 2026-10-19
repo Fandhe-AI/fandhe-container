@@ -25,7 +25,7 @@
 #![cfg(unix)]
 
 use fandhe_container_plugin::{
-    Frame, JsonLinesPeerAuthObserver, OneShotPlugin, OneShotTimeout, PLUGIN_SOCKET_ENV,
+    Frame, JsonLinesPeerAuthObserver, OneShotTimeout, PLUGIN_SOCKET_ENV, PluginLaunchSpec,
     ResidentPlugin, ResidentStartTimeout, UdsStream, call_once,
 };
 use std::ffi::OsString;
@@ -181,12 +181,12 @@ fn plugin_entry() {
     }
 }
 
-fn plugin_spec(dir: &Path) -> OneShotPlugin {
+fn plugin_spec(dir: &Path) -> PluginLaunchSpec {
     let args: Vec<OsString> = ["--exact", "plugin_entry", "--test-threads=1"]
         .iter()
         .map(OsString::from)
         .collect();
-    OneShotPlugin::new(crate::exe_target(), args, dir.to_path_buf()).unwrap()
+    PluginLaunchSpec::new(crate::exe_target(), args, dir.to_path_buf()).unwrap()
 }
 
 struct TempDir(PathBuf);

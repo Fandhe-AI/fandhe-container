@@ -19,6 +19,8 @@
 //! - 覆い（#2014）: `/sys/firmware`・`/sys/devices/virtual/powercap`・`/sys/devices/system/cpu/cpuN/thermal_throttle` の
 //!   うち存在するものはすべて、そのパスが `tmpfs` かつ `ro,nosuid,nodev,noexec` のマウントポイントで、`read_dir` が空。
 //!   存在しない対象は飛ばされる。rootful（新しい sysfs）では `/sys` 配下の子マウントは覆いの tmpfs だけ
+//! - 存在する覆いの tmpfs の直下への新規作成（`O_CREAT|O_EXCL`）は、rootful・rootless とも `EROFS`（`/sys` 配下に書き込み可能な
+//!   tmpfs が残らないことの確認。#2233・SEC-2）
 //! - `/sys/kernel/uevent_helper` 等の既存ファイルへの書き込み `open` は `EROFS`（30）。rootless はホストの root 所有の
 //!   ファイルでパーミッション検査が先に `EACCES`（13）になり得るため `EROFS` か `EACCES` を要求し、観測値を出力する
 //!   （mountinfo の `ro` が主な保証。`readonly_paths` と同じ流儀）
@@ -420,6 +422,22 @@ mod linux {
         for (i, msg) in unexpected.iter().enumerate() {
             writeln!(writer, "mask_unexpected:{i}={msg}").expect("write");
         }
+        // 覆いの tmpfs への新規作成の errno（SEC-2・#2233。作れてしまったら 0 で、消してから失敗として扱わせる）。
+        for t in &present {
+            let probe = format!("{t}/.fandhe-probe");
+            let errno = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&probe)
+            {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&probe);
+                    0
+                }
+                Err(e) => e.raw_os_error().unwrap_or(-1),
+            };
+            writeln!(writer, "mask_create_errno:{t}={errno}").expect("write");
+        }
         let has = |p: &str| present.iter().any(|x| x == p);
         let thermal = present
             .iter()
@@ -565,6 +583,27 @@ mod linux {
                 "child mounts must be exactly the masks"
             );
         }
+        // `/sys` 配下に実在する唯一の tmpfs（覆い）にも、新しいファイルは作れない（EROFS。SEC-2・#2233）。
+        let mut create_checked = 0usize;
+        for l in text.lines() {
+            if let Some(rest) = l.strip_prefix("mask_create_errno:") {
+                let (path, errno) = rest.rsplit_once('=').expect("key=value");
+                assert_eq!(
+                    errno,
+                    EROFS.to_string(),
+                    "creating a file under {path} must fail with EROFS"
+                );
+                create_checked += 1;
+            }
+        }
+        assert_eq!(
+            create_checked.to_string(),
+            lookup(text, "mask_present"),
+            "every masked entry must have a create probe"
+        );
+        println!(
+            "sysfs_mount: creating a file under {create_checked} masked tmpfs refused with EROFS"
+        );
         assert_eq!(
             lookup(text, "read_ok:/sys/kernel"),
             "true",

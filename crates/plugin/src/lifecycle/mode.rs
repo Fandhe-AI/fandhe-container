@@ -22,13 +22,13 @@
 //!
 //! セッションに可変のモード切替メソッドは持たせない（切替途中の失敗状態を型に持ち込まないため）。
 //! 切り替えるときは [`PluginSession::shutdown`] で現在のセッションを閉じてから、同じ
-//! [`OneShotPlugin`] に別の [`PluginMode`] で [`PluginSession::start`] する。
+//! [`PluginLaunchSpec`] に別の [`PluginMode`] で [`PluginSession::start`] する。
 //!
 //! # 契約
 //!
 //! - 期限は各モード固有の型（[`OneShotTimeout`]・[`ResidentStartTimeout`]・[`RpcTimeout`]）を
 //!   [`PluginMode`] が保持する。無期限待ちや 0 / 上限超過は構築できない（REPAIR-5）。
-//! - 子プロセスの回収・socket の後始末・stderr の扱い・環境変数の遮断は各モードの契約に従う（`OneShotPlugin::with_env` の組はどちらのモードでも渡る）。
+//! - 子プロセスの回収・socket の後始末・stderr の扱い・環境変数の遮断は各モードの契約に従う（`PluginLaunchSpec::with_env` の組はどちらのモードでも渡る）。
 //!   [`PluginSession`] の破棄でも、常駐の子は [`ResidentPlugin`] の `Drop` で kill・回収される。
 //! - 非 unix では既存 API の挙動をそのまま伝播する（都度起動は `start` が成功し `call` が
 //!   `Unimplemented`、常駐は `start` が `Unimplemented`）。
@@ -36,11 +36,11 @@
 //! # 未実装（REPAIR-3）
 //!
 //! - 起動対象の信頼性検証（TASK-122・PLUG-11）との結線。本 API は検証せず、呼び出し側が検証済みの
-//!   fd を持つ起動対象（[`super::PluginLaunchTarget`]。#1856）から作った [`OneShotPlugin`] を渡す前提とする。
-//! - 外部管理の常駐 plugin への attach、[`OneShotPlugin`] の中立名への改名。
+//!   fd を持つ起動対象（[`super::PluginLaunchTarget`]。#1856）から作った [`PluginLaunchSpec`] を渡す前提とする。
+//! - 外部管理の常駐 plugin への attach。
 
 use super::{
-    OneShotPlugin, OneShotStderr, OneShotTermination, OneShotTimeout, ResidentPlugin,
+    OneShotStderr, OneShotTermination, OneShotTimeout, PluginLaunchSpec, ResidentPlugin,
     ResidentShutdown, ResidentShutdownError, ResidentStartTimeout, call_once_observed,
 };
 use crate::error::PluginError;
@@ -209,7 +209,7 @@ impl PluginCallRecord {
 
 enum Inner {
     OneShot {
-        plugin: OneShotPlugin,
+        plugin: PluginLaunchSpec,
         timeout: OneShotTimeout,
         stats: OneShotStats,
     },
@@ -246,7 +246,7 @@ impl PluginSession {
     /// `audit` は peer 認証で拒否した接続の監査イベントの受け手（PLUG-12・SEC-4・TASK-124.5。必須）。
     /// 常駐は起動時の受付でのみ使い、都度起動はここでは使わない（受付は `call` ごと）。
     pub fn start(
-        plugin: &OneShotPlugin,
+        plugin: &PluginLaunchSpec,
         mode: PluginMode,
         audit: &mut dyn crate::audit::PeerAuthObserver,
     ) -> Result<Self, PluginError> {
@@ -462,7 +462,7 @@ mod tests {
             program.clone(),
         );
         let _ = std::fs::remove_file(&program);
-        let plugin = OneShotPlugin::new(target.unwrap(), vec![], dir).unwrap();
+        let plugin = PluginLaunchSpec::new(target.unwrap(), vec![], dir).unwrap();
         let session = PluginSession::start(
             &plugin,
             PluginMode::one_shot(),

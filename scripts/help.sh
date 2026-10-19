@@ -121,6 +121,8 @@ cat <<'EOF'
                                         restart レイテンシ計測スクリプトの自己テスト（SUP-3・REPAIR-12。スタブのみ）
   install-launcher-selftest           scripts/install-privileged-launcher-selftest.sh
                                         特権ランチャーのインストールスクリプトの自己テスト（SUP-14・SEC-1・REPAIR-12。スタブのみ・root 不要）
+  crictl-smoke-selftest               scripts/cri/crictl-smoke-selftest.sh
+                                        crictl 疎通確認スクリプトの自己テスト（CRI-1・TASK-60・REPAIR-12。スタブの crictl のみ・python3 が必要）
   deny                                scripts/targets/deny.sh
                                         cargo deny check advisories bans licenses sources（ルート workspace と venus 試験治具の依存監査。cargo-deny 未導入なら自動導入）
   deny-poc-venus-jig                  scripts/targets/deny-poc-venus-jig.sh
@@ -175,6 +177,8 @@ cat <<'EOF'
                                         監視プロセス 1 個を kill して他の継続と孤児の稼働継続を確認する（実機前提・timeout 付き。BIN_DIR=<絶対パス> BUNDLE=<dir> 必須。SUP-5）
   restart-latency                     scripts/targets/restart-latency.sh
                                         restart レイテンシを計測する（既定バックオフ 100ms 差し引き値も出す）（実機前提・timeout 付き。BIN_DIR=<絶対パス> BUNDLE=<dir> 必須。[TRIALS= WARMUP= OUTPUT= RESTART_LATENCY_WAIT_TIMEOUT=]。SUP-3）
+  crictl-smoke                        scripts/targets/crictl-smoke.sh
+                                        crictl の runp→create→start の疎通確認（実機前提・timeout 付き。CRI_ENDPOINT=unix:///<絶対パス> 必須。[CRICTL= POD_CONFIG= CONTAINER_CONFIG= LOG_DIR= STEP_TIMEOUT= CRICTL_TIMEOUT= KEEP=1]。CRI-1・TASK-60）
   docker-build                        docker compose build
                                         開発コンテナイメージをビルドする
   docker-shell                        docker compose run --rm dev

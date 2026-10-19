@@ -85,20 +85,25 @@ impl ExpandedSizePlan {
     pub fn measure(&self, root: &Path) -> Result<ExpandedUsage, OciError> {
         let dirs_exist = check_blob_dirs(root)?;
         let mut usage = ExpandedUsage::default();
+        // 成功・失敗を問わず実際に展開した量の累計（報告用の `expanded_bytes` とは別に予算を管理する）。
+        let mut scanned: u64 = 0;
         for digest in &self.layers {
             if !dirs_exist {
                 usage.missing_layers += 1;
                 continue;
             }
-            match measure_layer(root, digest)? {
+            let remaining = MAX_EXPANDED_SCAN_BYTES.saturating_sub(scanned);
+            let (outcome, consumed) = measure_layer(root, digest, remaining)?;
+            scanned = add(scanned, consumed)?;
+            if scanned > MAX_EXPANDED_SCAN_BYTES {
+                return Err(err(
+                    OciErrorCode::ResourceExhausted,
+                    "expanded size scan exceeds the total budget",
+                ));
+            }
+            match outcome {
                 LayerOutcome::Measured(n) => {
                     usage.expanded_bytes = add(usage.expanded_bytes, n)?;
-                    if usage.expanded_bytes > MAX_EXPANDED_SCAN_BYTES {
-                        return Err(err(
-                            OciErrorCode::ResourceExhausted,
-                            "expanded size scan exceeds the total budget",
-                        ));
-                    }
                     usage.measured_layers += 1;
                 }
                 LayerOutcome::Missing => usage.missing_layers += 1,
@@ -109,7 +114,13 @@ impl ExpandedSizePlan {
     }
 }
 
-fn measure_layer(root: &Path, digest: &Digest) -> Result<LayerOutcome, OciError> {
+/// 1 レイヤーを計測し、結果と実際に展開した量（失敗時も含む）を返す。`remaining` は総予算の残りで、
+/// 展開側の上限をこれに絞る（残りを 1 バイト超えた時点で打ち切り、呼び出し側が総予算超過を判定する）。
+fn measure_layer(
+    root: &Path,
+    digest: &Digest,
+    remaining: u64,
+) -> Result<(LayerOutcome, u64), OciError> {
     let path = blob_path(root, digest)?;
     let mut file = match open_blob_nofollow(&path) {
         Ok(f) => f,
@@ -122,7 +133,7 @@ fn measure_layer(root: &Path, digest: &Digest) -> Result<LayerOutcome, OciError>
                     | OciErrorCode::FailedPrecondition
             ) =>
         {
-            return Ok(LayerOutcome::Missing);
+            return Ok((LayerOutcome::Missing, 0));
         }
         Err(e) => return Err(e),
     };
@@ -135,14 +146,18 @@ fn measure_layer(root: &Path, digest: &Digest) -> Result<LayerOutcome, OciError>
     // 同じハンドルを先頭へ戻す（パスを解決し直さない）。
     file.seek(SeekFrom::Start(0)).map_err(io_internal)?;
     if header.starts_with(&[0x1f, 0x8b]) {
-        let mut reader = GzipLayerReader::new(file, DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES);
-        return match io::copy(&mut reader, &mut io::sink()) {
-            Ok(_) => Ok(LayerOutcome::Measured(reader.total_out())),
+        let limit = DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES.min(remaining.saturating_add(1));
+        let mut reader = GzipLayerReader::new(file, limit);
+        let res = io::copy(&mut reader, &mut io::sink());
+        // 失敗（上限超過・CRC 不一致）でも、そこまでに展開した量は総予算へ計上する。
+        let consumed = reader.total_out();
+        return match res {
+            Ok(_) => Ok((LayerOutcome::Measured(consumed), consumed)),
             Err(e) => {
                 let oe = oci_error_from_layer_io(e);
                 match oe.code() {
                     OciErrorCode::ResourceExhausted | OciErrorCode::DataLoss => {
-                        Ok(LayerOutcome::Unmeasured)
+                        Ok((LayerOutcome::Unmeasured, consumed))
                     }
                     _ => Err(oe),
                 }
@@ -151,10 +166,10 @@ fn measure_layer(root: &Path, digest: &Digest) -> Result<LayerOutcome, OciError>
     }
     if header.get(257..262) == Some(b"ustar".as_slice()) {
         let len = file.metadata().map_err(io_internal)?.len();
-        return Ok(LayerOutcome::Measured(len));
+        return Ok((LayerOutcome::Measured(len), len));
     }
     // zstd（28 b5 2f fd）とその他: 展開側も未実装なので推測しない。
-    Ok(LayerOutcome::Unmeasured)
+    Ok((LayerOutcome::Unmeasured, 0))
 }
 
 #[cfg(all(test, unix))]

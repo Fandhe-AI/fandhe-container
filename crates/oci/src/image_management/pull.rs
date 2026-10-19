@@ -31,6 +31,13 @@
 //! ガードの内側でリースを数え直すため、登録後に blob が消されることはない
 //! （OCI-7 の「余分に残す方向にのみ誤る」）。
 //!
+//! 公開する blob の信頼条件（OCI-1・SEC。cri の `check_blob_trust` と同じ条件）: 通常ファイル・
+//! 所有者がステージング領域と同じ・ハードリンク数 1・group / other 書き込み不可（unix）。ステージングの
+//! blob は検証時に開いたハンドルで確認し、権限だけ 0600 へ狭める（所有者・リンク数は変えられないので拒否）。
+//! 公開直前と既存宛先の受け入れでも同じ条件を確かめ、満たさない宛先は受け入れず検証済みの実体で置き換える。
+//! Windows の再ハッシュは排他区間の外で行う: 共有拒否（書き込み・削除）で開いたハンドルに実体を固定し、
+//! その内容を検証してから、排他区間では固定済みの実体の `hard_link` だけを行う。
+//!
 //! 公開の移動は `hard_link` で宛先を置き換えずに作り、成功後にステージング側の名前を消す
 //! （公開後のハードリンク数を 1 に保つ。cri の `check_blob_trust` の条件と整合）。宛先が既にある
 //! 通常ファイル（並行 pull が先に公開した同 digest）は、ガードの外で内容を検証した実体と
@@ -55,6 +62,10 @@ use super::usage::{blob_path, check_blob_dirs};
 use super::{ImageStore, MAX_COMPOSITION_LAYERS, ManifestComposition, PullId, TagKey};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{OciOpKind, OciOpRecorder, record_oci_op};
+#[cfg(unix)]
+use crate::layer::open_blob_nofollow;
+#[cfg(windows)]
+use crate::layer::verify_blob_file_digest_with;
 use crate::layer::{VerifiedBlob, verify_blob_digest, verify_blob_digest_with};
 use crate::reference::Digest;
 
@@ -182,6 +193,54 @@ impl FileIdent {
     fn of_regular(path: &Path) -> std::io::Result<Option<Self>> {
         let m = fs::symlink_metadata(path)?;
         Ok(m.is_file().then(|| Self::of(&m)))
+    }
+}
+
+/// 公開してよい blob の信頼条件の違反を返す（OCI-1・SEC。unix のみ。違反なしは `None`）。
+///
+/// 条件は通常ファイル・所有者が `owner`・ハードリンク数 1（ストア外の名前から同じ inode を書き換えられない）・
+/// group / other 書き込み不可。非 unix は所有者・リンク数を標準ライブラリで取得できないため通常ファイルかだけを見る。
+fn blob_trust_violation(m: &fs::Metadata, owner: Option<u32>) -> Option<&'static str> {
+    if !m.is_file() {
+        return Some("blob is not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if owner.is_some_and(|o| m.uid() != o) {
+            return Some("blob has an unexpected owner");
+        }
+        if m.nlink() != 1 {
+            return Some("blob has extra hard links");
+        }
+        if m.mode() & 0o022 != 0 {
+            return Some("blob is writable by group or others");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = owner;
+    None
+}
+
+/// パスが信頼条件を満たす通常ファイル（symlink を辿らない）か。
+fn is_trusted_regular(path: &Path, owner: Option<u32>) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| blob_trust_violation(&m, owner).is_none())
+        .unwrap_or(false)
+}
+
+/// ステージング領域の所有者（このプロセスが作った 0700 のディレクトリの uid）。unix 以外は `None`。
+fn dir_owner(dir: &Path) -> Result<Option<u32>, OciError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = fs::symlink_metadata(dir).map_err(|e| io_err(&e, "failed to stat staging"))?;
+        Ok(Some(m.uid()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(None)
     }
 }
 
@@ -502,6 +561,9 @@ impl PullSession<'_> {
             }
             Err(e) => return Err(io_err(&e, "failed to stat staged blob")),
         }
+        // 開いたハンドルで信頼条件を確認し、権限を 0600 へ狭める（公開前に必ず行う。OCI-1・SEC）。
+        #[cfg(unix)]
+        self.secure_staged_blob(&path)?;
         // 再検証の開始時に以前の検証結果を無効化する（失敗した再検証の前の登録を残さない）。
         self.verified.remove(digest);
         // 検証の前後で指紋が一致することを確かめ、検証した実体を固定する（公開直前の再ハッシュの代わり）。
@@ -530,6 +592,88 @@ impl PullSession<'_> {
             },
         );
         Ok(v)
+    }
+
+    /// ステージングの blob を symlink を辿らず開き、ハンドルの fstat で信頼条件を確認する（unix）。
+    /// 権限は 0600 へ狭めて確認し直す。所有者・種別・リンク数の違反は変えられないので拒否する。
+    /// 開いたファイルがパスの指す実体と同一（dev / inode）であることも確かめる。
+    #[cfg(unix)]
+    fn secure_staged_blob(&self, path: &Path) -> Result<(), OciError> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let unsafe_blob = |msg: &str| err(OciErrorCode::FailedPrecondition, msg);
+        let owner = dir_owner(&self.staging_dir)?;
+        let file = open_blob_nofollow(path)?;
+        let m = file
+            .metadata()
+            .map_err(|e| io_err(&e, "failed to stat staged blob"))?;
+        // 権限以外の違反は直せない。
+        if let Some(v) = blob_trust_violation(&m, owner)
+            && m.mode() & 0o022 == 0
+        {
+            return Err(unsafe_blob(v));
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| io_err(&e, "failed to restrict staged blob permissions"))?;
+        let m2 = file
+            .metadata()
+            .map_err(|e| io_err(&e, "failed to stat staged blob"))?;
+        if let Some(v) = blob_trust_violation(&m2, owner) {
+            return Err(unsafe_blob(v));
+        }
+        let at_path =
+            fs::symlink_metadata(path).map_err(|e| io_err(&e, "failed to stat staged blob"))?;
+        if (at_path.dev(), at_path.ino()) != (m2.dev(), m2.ino()) {
+            return Err(err(
+                OciErrorCode::FailedPrecondition,
+                "staged blob changed while being opened",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 非 unix では排他区間の外で実体を固定し、その内容を検証する（Windows）。
+    ///
+    /// 書き込み・削除を共有拒否（`FILE_SHARE_READ` のみ）で開いたハンドルを返す。ハンドルを保持する間は
+    /// 内容の書き換え・差し替え・削除ができないため、ここで検証した実体がそのまま公開される。
+    #[cfg(windows)]
+    fn pin_staged_blobs(&self, to_move: &[Digest]) -> Result<BTreeMap<Digest, fs::File>, OciError> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut pinned = BTreeMap::new();
+        for b in to_move {
+            let src = self.staging_dir.join(hex_of(b)?);
+            let Some(entry) = self.verified.get(b) else {
+                return Err(err(
+                    OciErrorCode::FailedPrecondition,
+                    "blob is neither leased nor verified by this pull",
+                ));
+            };
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .open(&src)
+                .map_err(|e| io_err(&e, "failed to pin staged blob"))?;
+            let m = file
+                .metadata()
+                .map_err(|e| io_err(&e, "failed to stat staged blob"))?;
+            if !m.is_file() || FileIdent::of(&m) != entry.ident {
+                return Err(err(
+                    OciErrorCode::DataLoss,
+                    "staged blob changed after verification",
+                ));
+            }
+            verify_blob_file_digest_with(self.store.recorder(), &file, b, entry.size)?;
+            pinned.insert(b.clone(), file);
+        }
+        Ok(pinned)
+    }
+
+    /// unix では固定しない（指紋と信頼条件の照合で足りる）。
+    #[cfg(not(windows))]
+    fn pin_staged_blobs(
+        &self,
+        _to_move: &[Digest],
+    ) -> Result<BTreeMap<Digest, fs::File>, OciError> {
+        Ok(BTreeMap::new())
     }
 
     /// 公開する（OCI-7 (C)）。排他区間の下で、ステージングからの移動・manifest とタグの登録・
@@ -623,13 +767,16 @@ impl PullSession<'_> {
         }
         for b in &to_move {
             let src = self.staging_dir.join(hex_of(b)?);
-            self.check_staged_ident(&src, b, false)?;
+            self.check_staged_ident(&src, b)?;
         }
         if !to_move.is_empty() {
             self.ensure_blob_dirs()?;
         }
 
         let root = self.store.root().to_path_buf();
+        let owner = dir_owner(&self.staging_dir)?;
+        // Windows: 実体を共有拒否のハンドルで固定して検証する（ガードの外。以降は固定済みの実体を公開する）。
+        let mut pinned = self.pin_staged_blobs(&to_move)?;
         // 既存の宛先の内容検証（再ハッシュ）はガードの外で済ませ、検証した実体の指紋を控える。
         // 排他区間の中では指紋の照合だけを行う（大容量 blob でガード保持が期限を超えないように。
         // ロックの規律）。
@@ -644,6 +791,7 @@ impl PullSession<'_> {
             }
             let size = self.verified.get(b).map_or(0, |v| v.size);
             let ident = match FileIdent::of_regular(&dst) {
+                Ok(Some(_)) if !is_trusted_regular(&dst, owner) => None,
                 Ok(Some(before)) => match verify_blob_digest(&dst, b, size) {
                     Ok(_) => {
                         // 検証中に変わっていれば「未検証」として扱い、ガード内で置き換える。
@@ -690,10 +838,10 @@ impl PullSession<'_> {
                 let src = self.staging_dir.join(hex_of(b)?);
                 let dst = blob_path(&root, b)?;
                 // 検証後にステージングのファイルが差し替わっても未検証の内容を公開しないよう、
-                // 排他区間の下では再ハッシュせず、検証した実体の指紋を照合する（OCI-1・OCI-7）。
-                // unix 以外（Windows）の指紋は size / mtime だけで、mtime を戻した同サイズの書き換えを
-                // 検出できない。そのためガード内で再ハッシュして公開物を確定する（`rehash = true`）。
-                self.check_staged_ident(&src, b, !cfg!(unix))?;
+                // 排他区間の下では再ハッシュせず、検証した実体の指紋と信頼条件を照合する（OCI-1・OCI-7）。
+                // Windows は指紋が size / mtime だけのため、ガードの外で固定したハンドル（`pinned`）の
+                // 内容を検証済みとする（ガード内で再ハッシュしない）。
+                self.check_staged_ident(&src, b)?;
                 match fs::hard_link(&src, &dst) {
                     Ok(()) => {
                         created.push(dst);
@@ -709,9 +857,12 @@ impl PullSession<'_> {
                                 if verified_dst.is_some()
                                     && FileIdent::of_regular(&dst).ok().flatten().as_ref()
                                         == verified_dst
+                                    && is_trusted_regular(&dst, owner)
                                 {
                                     present.push(b.clone());
                                 } else {
+                                    // 固定を外してから置き換える（Windows は開いたままだと改名できない）。
+                                    pinned.remove(b);
                                     fs::rename(&src, &dst).map_err(|_| {
                                         err(OciErrorCode::Internal, "failed to repair corrupt blob")
                                     })?;
@@ -729,7 +880,9 @@ impl PullSession<'_> {
                     }
                     Err(_) => return Err(err(OciErrorCode::Internal, "failed to publish blob")),
                 }
-                // 公開後のハードリンク数を 1 に保つため、ステージング側の名前を消す。
+                // 公開後のハードリンク数を 1 に保つため、ステージング側の名前を消す
+                // （Windows は固定を外してから。公開は固定した実体への hard_link で済んでいる）。
+                pinned.remove(b);
                 fs::remove_file(&src)
                     .map_err(|_| err(OciErrorCode::Internal, "failed to remove staged blob"))?;
             }
@@ -776,14 +929,8 @@ impl PullSession<'_> {
     /// ステージングのファイルが検証時と同じ実体（指紋が一致）であることを確かめる。再ハッシュはしない。
     /// 通常ファイルでない・指紋が違う（差し替え・書き換え）なら `DataLoss`（通常ファイルでなければ
     /// `FailedPrecondition`）。
-    /// `rehash = true` のときは指紋の一致に加えて digest を再計算する（指紋で書き換えを検出できない
-    /// unix 以外の公開用）。
-    fn check_staged_ident(
-        &self,
-        src: &Path,
-        digest: &Digest,
-        rehash: bool,
-    ) -> Result<(), OciError> {
+    /// unix では所有者・ハードリンク数・group / other 書き込みの信頼条件も確かめる（OCI-1・SEC）。
+    fn check_staged_ident(&self, src: &Path, digest: &Digest) -> Result<(), OciError> {
         let Some(entry) = self.verified.get(digest) else {
             return Err(err(
                 OciErrorCode::FailedPrecondition,
@@ -792,10 +939,13 @@ impl PullSession<'_> {
         };
         match FileIdent::of_regular(src) {
             Ok(Some(now)) if now == entry.ident => {
-                if rehash {
-                    verify_blob_digest(src, digest, entry.size)?;
+                let owner = dir_owner(&self.staging_dir)?;
+                let m = fs::symlink_metadata(src)
+                    .map_err(|e| io_err(&e, "failed to stat staged blob"))?;
+                match blob_trust_violation(&m, owner) {
+                    None => Ok(()),
+                    Some(v) => Err(err(OciErrorCode::FailedPrecondition, v)),
                 }
-                Ok(())
             }
             Ok(Some(_)) => Err(err(
                 OciErrorCode::DataLoss,
@@ -1283,6 +1433,16 @@ mod tests {
         dg
     }
 
+    /// 試験用: 公開済み相当の宛先（0600）を置く。umask に依らず信頼条件を満たす。
+    fn place_trusted(path: &Path, data: &[u8]) {
+        fs::write(path, data).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
     fn manifest_digest() -> Digest {
         sha_of(b"manifest-body")
     }
@@ -1427,7 +1587,7 @@ mod tests {
         let store = ImageStore::open(&root.0).unwrap();
         let mut s = store.begin_pull(pid("p1")).unwrap();
         let cfg = stage(&mut s, b"config-body");
-        fs::write(root.blob(&cfg), b"config-body").unwrap();
+        place_trusted(&root.blob(&cfg), b"config-body");
         let comp = ManifestComposition::new(cfg.clone(), vec![]).unwrap();
         let out = s
             .publish(PullPublishRequest::new(manifest_digest(), comp))
@@ -1485,7 +1645,7 @@ mod tests {
         fs::write(s.staged_blob_path(&dg).unwrap(), &data).unwrap();
         s.verify_staged_blob(&dg, 1 << 30).unwrap();
         // 既存の宛先にも同内容を置く（ガード外で検証され、ガード内では指紋照合のみ）。
-        fs::write(root.blob(&dg), &data).unwrap();
+        place_trusted(&root.blob(&dg), &data);
         let comp = ManifestComposition::new(dg.clone(), vec![]).unwrap();
         let start = std::time::Instant::now();
         let hold = std::thread::scope(|sc| {
@@ -1594,6 +1754,119 @@ mod tests {
         assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
         assert_eq!(fs::read(&target).unwrap(), b"config-body");
         assert!(!staged.exists());
+    }
+
+    /// 検証時にストア外のハードリンクがあるステージングの blob は拒否する（OCI-1・SEC）。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_verify_rejects_hard_linked_staged_blob() {
+        let root = Root::new("pub-nlink-verify");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let dg = sha_of(b"config-body");
+        let path = s.staged_blob_path(&dg).unwrap();
+        fs::write(&path, b"config-body").unwrap();
+        let outside = root.0.join("outside");
+        fs::hard_link(&path, &outside).unwrap();
+        assert_eq!(
+            s.verify_staged_blob(&dg, 1 << 20).unwrap_err().code(),
+            OciErrorCode::FailedPrecondition
+        );
+    }
+
+    /// 検証後にハードリンクが足されたら公開を拒否し、外側の名前は公開物と無関係のまま残る。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_publish_rejects_blob_hard_linked_after_verify() {
+        let root = Root::new("pub-nlink-publish");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let dg = stage(&mut s, b"config-body");
+        let outside = root.0.join("outside");
+        fs::hard_link(s.staged_blob_path(&dg).unwrap(), &outside).unwrap();
+        let comp = ManifestComposition::new(dg.clone(), vec![]).unwrap();
+        assert!(
+            s.publish(PullPublishRequest::new(manifest_digest(), comp))
+                .is_err()
+        );
+        assert!(!root.blob(&dg).exists());
+    }
+
+    /// group / other 書き込み可能なステージングの blob は 0600 へ狭めてから検証・公開する。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_verify_narrows_group_writable_staged_blob() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new("pub-mode");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let dg = sha_of(b"config-body");
+        let path = s.staged_blob_path(&dg).unwrap();
+        fs::write(&path, b"config-body").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        s.verify_staged_blob(&dg, 1 << 20).unwrap();
+        let comp = ManifestComposition::new(dg.clone(), vec![]).unwrap();
+        s.publish(PullPublishRequest::new(manifest_digest(), comp))
+            .unwrap();
+        let mode = fs::metadata(root.blob(&dg)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// 検証後に group 書き込み権限が付いたら公開を拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_publish_rejects_blob_made_group_writable_after_verify() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new("pub-mode-after");
+        let store = ImageStore::open(&root.0).unwrap();
+        let mut s = store.begin_pull(pid("p1")).unwrap();
+        let dg = stage(&mut s, b"config-body");
+        fs::set_permissions(
+            s.staged_blob_path(&dg).unwrap(),
+            fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        let comp = ManifestComposition::new(dg.clone(), vec![]).unwrap();
+        assert!(
+            s.publish(PullPublishRequest::new(manifest_digest(), comp))
+                .is_err()
+        );
+        assert!(!root.blob(&dg).exists());
+    }
+
+    /// 既存の宛先がハードリンクを持つ・group 書き込み可能なら受け入れず、検証済みの実体で置き換える。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_publish_replaces_untrusted_existing_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new("pub-dst-untrusted");
+        let store = ImageStore::open(&root.0).unwrap();
+        for (i, linked) in [true, false].into_iter().enumerate() {
+            let mut s = store.begin_pull(pid(&format!("p{i}"))).unwrap();
+            let data: &[u8] = if linked {
+                b"cfg-linked"
+            } else {
+                b"cfg-writable"
+            };
+            let dg = stage(&mut s, data);
+            let dst = root.blob(&dg);
+            fs::write(&dst, data).unwrap();
+            let outside = root.0.join(format!("outside{i}"));
+            if linked {
+                fs::hard_link(&dst, &outside).unwrap();
+            } else {
+                fs::set_permissions(&dst, fs::Permissions::from_mode(0o666)).unwrap();
+            }
+            let comp = ManifestComposition::new(dg.clone(), vec![]).unwrap();
+            let out = s
+                .publish(PullPublishRequest::new(sha_of(data), comp))
+                .unwrap();
+            assert_eq!(out.moved_blobs, vec![dg.clone()]);
+            assert_eq!(out.already_present_blobs, vec![]);
+            let m = fs::metadata(&dst).unwrap();
+            assert_eq!(std::os::unix::fs::MetadataExt::nlink(&m), 1);
+            assert_eq!(m.permissions().mode() & 0o022, 0);
+        }
     }
 
     /// 既存タグの付け替えは Moved、同じ manifest なら Unchanged を返す。

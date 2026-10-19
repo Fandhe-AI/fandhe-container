@@ -2233,12 +2233,25 @@ mod macos_tests {
         let root = d.0.join("root");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        let status = std::process::Command::new("chmod")
+        // REPAIR-5: 子プロセスの待機には期限を設け、超過時は kill して回収し失敗させる。
+        let mut child = std::process::Command::new("chmod")
             .arg("+a")
             .arg("everyone allow write")
             .arg(&root)
-            .status()
+            .spawn()
             .expect("chmod +a");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(st) = child.try_wait().expect("try_wait") {
+                break st;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("chmod +a timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
         assert!(status.success());
         let e = open_at(root).unwrap_err();
         assert_eq!(e.code(), ErrorCode::PermissionDenied);

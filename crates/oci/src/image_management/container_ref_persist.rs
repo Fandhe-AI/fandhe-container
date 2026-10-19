@@ -13,8 +13,10 @@
 //!
 //! manifest の在庫と構成・タグ・pull リースは永続化しない（#851）。このため読み直した直後のエントリは、
 //! メモリ上のテーブルに無い manifest を指しうる。読み込みでは在庫を確かめない。参照数の集計・未確定の
-//! 一覧・照合・`remove_manifest` の参照確認は manifest の在庫が無くても正しく動き、誤る方向は
-//! 「余分に残す」側だけである。残ったままの一時ファイル（クラッシュ時の `*.tmp-*`）の回収は未実装
+//! 一覧・照合・`remove_manifest` の参照確認は manifest の在庫が無くても正しく動く。一方 blob の参照は
+//! manifest の構成から数えるため、在庫に無い manifest への参照は構成が分からず、その manifest だけが
+//! 使う blob を守れない。このため `has_unresolved_container_refs` が真の間は `image rm` / `image prune` が
+//! blob ファイルを一切削除しない（残す側へ倒す。manifest の外し自体は従来どおり）。残ったままの一時ファイル（クラッシュ時の `*.tmp-*`）の回収は未実装
 //! （読み込みは固定名のファイルしか見ないので害はない）。
 //!
 //! # 形式と安全性
@@ -33,6 +35,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use std::cell::Cell;
+use std::fmt;
+
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
 use super::{ContainerRefEntry, ContainerRefGeneration, ContainerRefId, ReferenceTable};
@@ -68,8 +74,6 @@ struct RawEntryOut<'a> {
     bound: bool,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct RawIn {
     version: u32,
     next_generation: u64,
@@ -116,6 +120,14 @@ impl ReferenceTable {
     pub(super) fn restore_container_portion(&mut self, p: ContainerPortion) {
         self.container_refs = p.entries;
         self.next_container_generation = p.next_generation;
+    }
+
+    /// 構成が分からない（在庫に無い manifest を指す）コンテナ参照があるか。真の間は、どの blob が
+    /// その manifest の構成に含まれるか分からないため、blob の削除を拒否する（OCI-7 fail-closed。#2341）。
+    pub fn has_unresolved_container_refs(&self) -> bool {
+        self.container_refs
+            .values()
+            .any(|en| !self.manifests.contains_key(&en.manifest))
     }
 
     /// 読み込んだ内容で置き換える。世代カウンタは単調性を保つため大きい方を採る。
@@ -217,23 +229,111 @@ fn load_with_limits(
     parse(&buf, max_entries).map(Some)
 }
 
+/// 件数上限つきで `RawIn` を読む種。`entries` は上限を超える要素を蓄積する前に拒否する
+/// （通常の `Vec` で読むと全件確保した後でしか件数を検査できない）。
+struct RawInSeed<'a> {
+    max_entries: usize,
+    exceeded: &'a Cell<bool>,
+}
+
+struct EntriesSeed<'a> {
+    max_entries: usize,
+    exceeded: &'a Cell<bool>,
+}
+
+impl<'de> DeserializeSeed<'de> for EntriesSeed<'_> {
+    type Value = Vec<RawEntryIn>;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        struct V<'a>(usize, &'a Cell<bool>);
+        impl<'de> Visitor<'de> for V<'_> {
+            type Value = Vec<RawEntryIn>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a list of container refs")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut v = Vec::new();
+                while let Some(item) = seq.next_element::<RawEntryIn>()? {
+                    if v.len() >= self.0 {
+                        self.1.set(true);
+                        return Err(de::Error::custom("too many container refs"));
+                    }
+                    v.push(item);
+                }
+                Ok(v)
+            }
+        }
+        d.deserialize_seq(V(self.max_entries, self.exceeded))
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for RawInSeed<'_> {
+    type Value = RawIn;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        struct V<'a>(usize, &'a Cell<bool>);
+        impl<'de> Visitor<'de> for V<'_> {
+            type Value = RawIn;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a container refs object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let (mut version, mut next, mut entries) = (None, None, None);
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "version" if version.is_none() => version = Some(map.next_value()?),
+                        "next_generation" if next.is_none() => next = Some(map.next_value()?),
+                        "entries" if entries.is_none() => {
+                            entries = Some(map.next_value_seed(EntriesSeed {
+                                max_entries: self.0,
+                                exceeded: self.1,
+                            })?);
+                        }
+                        _ => return Err(de::Error::custom("unknown or duplicate field")),
+                    }
+                }
+                match (version, next, entries) {
+                    (Some(version), Some(next_generation), Some(entries)) => Ok(RawIn {
+                        version,
+                        next_generation,
+                        entries,
+                    }),
+                    _ => Err(de::Error::custom("missing field")),
+                }
+            }
+        }
+        d.deserialize_map(V(self.max_entries, self.exceeded))
+    }
+}
+
 fn parse(buf: &[u8], max_entries: usize) -> Result<PersistedContainerRefs, OciError> {
-    let raw: RawIn = serde_json::from_slice(buf).map_err(|_| {
-        e(
-            OciErrorCode::DataLoss,
-            "container refs file is not valid JSON",
-        )
-    })?;
+    let exceeded = Cell::new(false);
+    let mut de = serde_json::Deserializer::from_slice(buf);
+    let parsed = RawInSeed {
+        max_entries,
+        exceeded: &exceeded,
+    }
+    .deserialize(&mut de)
+    .and_then(|r| de.end().map(|()| r));
+    let raw = match parsed {
+        Ok(r) => r,
+        Err(_) if exceeded.get() => {
+            return Err(e(
+                OciErrorCode::ResourceExhausted,
+                "too many container refs",
+            ));
+        }
+        Err(_) => {
+            return Err(e(
+                OciErrorCode::DataLoss,
+                "container refs file is not valid JSON",
+            ));
+        }
+    };
     if raw.version != FORMAT_VERSION {
         return Err(e(
             OciErrorCode::FailedPrecondition,
             "unsupported container refs file version",
-        ));
-    }
-    if raw.entries.len() > max_entries {
-        return Err(e(
-            OciErrorCode::ResourceExhausted,
-            "too many container refs",
         ));
     }
     if raw.next_generation == 0 {
@@ -286,8 +386,19 @@ fn tmp_path(root: &Path, nonce: u64) -> PathBuf {
     ))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 試験用: 真の間、`save_container_refs` は書かずに失敗する。
+    static FAIL_SAVE: Cell<bool> = const { Cell::new(false) };
+}
+
 /// テーブルのコンテナ参照部分を保存する（一時ファイル → fsync → rename → 親ディレクトリ fsync）。
 pub(super) fn save_container_refs(root: &Path, table: &ReferenceTable) -> Result<(), OciError> {
+    #[cfg(test)]
+    if FAIL_SAVE.with(Cell::get) {
+        // 権限に依存せず（root・DAC 迂回環境でも）保存失敗を再現する試験用の注入。
+        return Err(e(OciErrorCode::Internal, "injected save failure"));
+    }
     save_with_limits(
         root,
         table,
@@ -718,32 +829,88 @@ mod tests {
     }
 
     /// OCI-7・#2341: 保存に失敗したら登録を戻して保存のエラーを返し、件数と次の世代が変わらない。
-    #[cfg(unix)]
     #[test]
     fn oci7_failed_save_rolls_back_table() {
-        use std::os::unix::fs::PermissionsExt;
+        /// 失敗注入を必ず解除する（assert が失敗しても他の試験へ漏らさない）。
+        struct FailGuard;
+        impl FailGuard {
+            fn on() -> Self {
+                FAIL_SAVE.with(|f| f.set(true));
+                FailGuard
+            }
+        }
+        impl Drop for FailGuard {
+            fn drop(&mut self) {
+                FAIL_SAVE.with(|f| f.set(false));
+            }
+        }
         let r = root("rollback");
         let a = open(&r);
         a.register_container_ref(&cid("c1"), &d(0xa0)).expect("c1");
-        // root を読み取り専用にして一時ファイルの作成を失敗させる（既存ファイルと @lock は開ける）。
-        fs::set_permissions(&r, fs::Permissions::from_mode(0o500)).expect("chmod");
-        let writable = File::create(r.join("probe")).is_ok();
-        if writable {
-            // root 権限等でディレクトリの権限が効かない環境では失敗を作れない。
-            fs::set_permissions(&r, fs::Permissions::from_mode(0o700)).expect("restore");
-            let _ = fs::remove_dir_all(r);
-            return;
+        let before = fs::read(r.join(CONTAINER_REFS_FILE_NAME)).expect("read");
+        {
+            let _fail = FailGuard::on();
+            let err = a
+                .register_container_ref(&cid("c2"), &d(0xa0))
+                .expect_err("save fails");
+            assert_eq!(err.code(), OciErrorCode::Internal);
+            let g = a.lock().expect("lock");
+            assert_eq!(g.container_refs.len(), 1);
+            assert_eq!(g.next_container_generation, 2);
         }
-        let err = a
-            .register_container_ref(&cid("c2"), &d(0xa0))
-            .expect_err("save fails");
-        assert_eq!(err.code(), OciErrorCode::Internal);
-        let g = a.lock().expect("lock");
-        assert_eq!(g.container_refs.len(), 1);
-        assert_eq!(g.next_container_generation, 2);
-        drop(g);
-        fs::set_permissions(&r, fs::Permissions::from_mode(0o700)).expect("restore");
+        assert_eq!(
+            fs::read(r.join(CONTAINER_REFS_FILE_NAME)).expect("read"),
+            before
+        );
         assert_eq!(containers_of(&open(&r), 0xa0), vec![cid("c1")]);
         let _ = fs::remove_dir_all(r);
+    }
+
+    /// OCI-7・#2341: 在庫に無い manifest への参照が残る間は、`image rm` / `image prune` が blob を消さない。
+    #[test]
+    fn oci7_unresolved_container_ref_blocks_blob_deletion() {
+        let r = root("unresolved");
+        // 別プロセスが manifest B（レイヤー 0x10 を共有）へのコンテナ参照を保存した状態を作る。
+        write_file(
+            &r,
+            &format!(
+                r#"{{"version":1,"next_generation":2,"entries":[{{"id":"other","manifest":"sha256:{}","generation":1,"bound":true}}]}}"#,
+                "b0".repeat(32)
+            ),
+        );
+        let s = open(&r);
+        let g = s.lock().expect("lock");
+        assert!(g.has_unresolved_container_refs());
+        let plan = g.plan_image_prune();
+        assert_eq!(plan.delete_blobs, Vec::<Digest>::new());
+        assert_eq!(plan.manifests, vec![d(0xa0)]);
+        assert_eq!(plan.kept_shared_blobs, vec![d(0x10), d(0xc1)]);
+        drop(g);
+        let _ = fs::remove_dir_all(r);
+    }
+
+    /// OCI-7・#2341: 件数上限は要素を蓄積する前に効く（上限 + 1 件目で打ち切る）。
+    #[test]
+    fn oci7_entries_limit_applies_while_deserializing() {
+        let many: Vec<String> = (1..=50).map(|i| entry_json(&format!("c{i}"), i)).collect();
+        let json = format!(
+            r#"{{"version":1,"next_generation":100,"entries":[{}]}}"#,
+            many.join(",")
+        );
+        assert_eq!(
+            parse(json.as_bytes(), 3).expect_err("over").code(),
+            OciErrorCode::ResourceExhausted
+        );
+        assert_eq!(parse(json.as_bytes(), 50).expect("ok").entries.len(), 50);
+        // 未知のフィールドと末尾のゴミは DataLoss。
+        assert_eq!(
+            parse(
+                br#"{"version":1,"next_generation":1,"entries":[],"x":1}"#,
+                3
+            )
+            .expect_err("unknown")
+            .code(),
+            OciErrorCode::DataLoss
+        );
     }
 }

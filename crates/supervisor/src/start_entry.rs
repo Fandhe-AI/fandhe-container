@@ -1969,14 +1969,16 @@ mod linux {
             &self,
             with_mapping: bool,
         ) -> Result<ProductionLauncherBuilder, TraitError> {
-            if !with_mapping {
-                // 資格情報の検証だけで作る。subuid / subgid・passwd の検証結果（`self.privilege`）には依存しない。
-                let privilege = self.recovery_privilege.clone()?;
-                return Ok(ProductionLauncher::builder().privilege(privilege));
-            }
-            let decided = self.privilege.clone()?;
-            let builder = ProductionLauncher::builder().privilege(decided.privilege);
-            Ok(match decided.subordinate {
+            // 範囲写像なしのときは資格情報の検証だけで決める。subuid / subgid・passwd の検証結果
+            // （`self.privilege`）には依存しない。
+            let (privilege, subordinate) = if with_mapping {
+                let decided = self.privilege.clone()?;
+                (decided.privilege, decided.subordinate)
+            } else {
+                (self.recovery_privilege.clone()?, None)
+            };
+            let builder = ProductionLauncher::builder().privilege(privilege);
+            Ok(match subordinate {
                 Some(source) => builder.subordinate_ids(source),
                 None => builder,
             })

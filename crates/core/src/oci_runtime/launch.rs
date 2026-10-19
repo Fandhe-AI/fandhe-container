@@ -539,7 +539,7 @@ impl LaunchSpec {
 
     /// config が cgroup を使う設定かどうか（CORE-3・#1814）。必要なのに join の手段が無ければ、
     /// launcher は fork の前に `require_cgroup_join` で拒否する。`linux.resources` の指定（`{}` を含む）で必要に
-    /// なる（#2019）。`linux.cgroupsPath` は `start` が先に拒否するため、その由来では必要にならない（#2010 で受理）。
+    /// なる（#2019）。`linux.cgroupsPath` は `start` が先に拒否するため、その由来では必要にならない（値は配置に使わない方針。#2010）。
     pub fn cgroup_requirement(&self) -> CgroupRequirement {
         self.cgroup
     }

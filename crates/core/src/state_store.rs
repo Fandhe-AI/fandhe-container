@@ -99,7 +99,7 @@ use crate::traits::{
     Annotations, CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, CreateStateRequest,
     DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest, HealthStatus,
     ListStateRequest, StateList, StateListCursor, StateRecord, StateRevision, StateStore,
-    SupervisionState, TraitError, UpdateStateRequest,
+    SupervisionState, TerminationReason, TraitError, UpdateStateRequest,
 };
 
 /// 各コンテナの状態ファイル名（OCI-5）。
@@ -1523,6 +1523,9 @@ struct StateDto {
     revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exit_code: Option<i32>,
+    /// 特別な終了理由（`oomKilled`。CRI-2・CORE-4）。`stopped` のときだけ許し、キー欠落は `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    termination_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cgroup_scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1725,6 +1728,7 @@ impl StateDto {
             bundle,
             revision: record.revision().value(),
             exit_code: status.exit_code(),
+            termination_reason: status.termination_reason().map(|r| r.as_str().to_owned()),
             cgroup_scope: record.cgroup().map(|c| c.scope().as_str().to_owned()),
             cgroup_instance: record.cgroup().map(|c| c.instance().value()),
             supervisor_pid: record.supervisor_pid().map(NonZeroU32::get),
@@ -1764,13 +1768,24 @@ impl StateDto {
             Some(p) => Some(NonZeroU32::new(p).ok_or_else(corrupted)?),
             None => None,
         };
+        let termination = match self.termination_reason.as_deref() {
+            Some(r) => Some(TerminationReason::parse(r).ok_or_else(corrupted)?),
+            None => None,
+        };
         let status = match (self.status.as_str(), pid, self.exit_code) {
             ("creating", None, None) => ContainerStatus::creating(id),
             ("created", p, None) => ContainerStatus::created(id, p),
             ("running", p, None) => ContainerStatus::running(id, p),
-            ("stopped", None, code) => ContainerStatus::stopped(id, code),
+            ("stopped", None, code) => match termination {
+                Some(reason) => ContainerStatus::stopped_with_reason(id, code, reason),
+                None => ContainerStatus::stopped(id, code),
+            },
             _ => return Err(corrupted()),
         };
+        // 終了理由は stopped のときだけ持てる（それ以外での出現は破損）。
+        if termination.is_some() && status.termination_reason().is_none() {
+            return Err(corrupted());
+        }
         let cgroup = match (self.cgroup_scope.as_deref(), self.cgroup_instance) {
             (None, None) => None,
             (Some(scope), Some(instance)) if instance <= self.revision => {
@@ -3976,6 +3991,11 @@ mod tests {
             ContainerStatus::running(cid("s3"), NonZeroU32::new(8)),
             ContainerStatus::stopped(cid("s4"), Some(-9)),
             ContainerStatus::stopped(cid("s5"), None),
+            ContainerStatus::stopped_with_reason(
+                cid("s6"),
+                Some(137),
+                TerminationReason::OomKilled,
+            ),
         ];
         for status in cases {
             let req = CreateStateRequest::new(status.clone(), bundle()).unwrap();
@@ -3985,6 +4005,51 @@ mod tests {
                 .unwrap();
             assert_eq!(got.status(), &status);
         }
+    }
+
+    /// CRI-2・CORE-4: 終了理由のキーが無い既存ファイルは `None`、`stopped` 以外での出現・未知の値は破損。
+    #[test]
+    fn cri2_termination_reason_key_is_backward_compatible_and_strict() {
+        let t = TmpDir::new("termreason");
+        let store = t.open();
+        let write = |id: &str, status: &str, extra: &str| {
+            create(&store, id);
+            let body = format!(
+                r#"{{"ociVersion":"1.2.0","id":"{id}","status":"{status}","bundle":"/b","revision":10{extra}}}"#
+            );
+            fs::write(t.path().join(id).join("state.json"), body).unwrap();
+        };
+        write("a", "stopped", r#","exitCode":137"#);
+        let got = store.get(&GetStateRequest::new(cid("a"))).unwrap();
+        assert_eq!(got.status().termination_reason(), None);
+        write(
+            "b",
+            "stopped",
+            r#","exitCode":0,"terminationReason":"oomKilled""#,
+        );
+        let got = store.get(&GetStateRequest::new(cid("b"))).unwrap();
+        assert_eq!(
+            got.status().termination_reason(),
+            Some(TerminationReason::OomKilled)
+        );
+        write("c", "running", r#","terminationReason":"oomKilled""#);
+        assert_eq!(
+            store
+                .get(&GetStateRequest::new(cid("c")))
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "INTERNAL"
+        );
+        write("d", "stopped", r#","terminationReason":"unknown""#);
+        assert_eq!(
+            store
+                .get(&GetStateRequest::new(cid("d")))
+                .unwrap_err()
+                .code()
+                .as_str(),
+            "INTERNAL"
+        );
     }
 
     /// OCI-5: symlink・0700 以外の既存ルートを拒否し、新規ルートは 0700 で作る。

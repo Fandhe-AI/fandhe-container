@@ -15,7 +15,10 @@
 //! # 期待値
 //! - `/sys` の最上位のマウントの fstype は `sysfs`、per-mount options に `ro`・`nosuid`・`nodev`・`noexec` がある
 //! - `/sys` 配下のすべてのマウントも同じ 4 つを持つ（rootless はホストの `/sys` の再帰 bind のため、`/sys/fs/cgroup` 等が
-//!   あればその行も含めて照合する）。rootful（新しい sysfs）では `/sys` 配下に子マウントが無い
+//!   あればその行も含めて照合する）
+//! - 覆い（#2014）: `/sys/firmware`・`/sys/devices/virtual/powercap`・`/sys/devices/system/cpu/cpuN/thermal_throttle` の
+//!   うち存在するものはすべて、そのパスが `tmpfs` かつ `ro,nosuid,nodev,noexec` のマウントポイントで、`read_dir` が空。
+//!   存在しない対象は飛ばされる。rootful（新しい sysfs）では `/sys` 配下の子マウントは覆いの tmpfs だけ
 //! - `/sys/kernel/uevent_helper` 等の既存ファイルへの書き込み `open` は `EROFS`（30）。rootless はホストの root 所有の
 //!   ファイルでパーミッション検査が先に `EACCES`（13）になり得るため `EROFS` か `EACCES` を要求し、観測値を出力する
 //!   （mountinfo の `ro` が主な保証。`readonly_paths` と同じ流儀）
@@ -191,8 +194,134 @@ mod linux {
         Ok((violations, children))
     }
 
-    /// `sys_tree_violations` の合成 fixture による自己照合（特権不要。毎回実行する）。
+    /// 覆いの照合結果（`sys_mask_check`）。
+    #[derive(Debug, PartialEq, Eq)]
+    struct MaskCheck {
+        /// 存在する対象が覆われていない等の違反（空なら合格）。
+        violations: Vec<String>,
+        /// 覆いの対象ではない `/sys` 配下のマウントポイント（rootful では空でなければならない）。
+        unexpected_children: Vec<String>,
+    }
+
+    /// `present`（pivot 後に存在した覆い対象のパス）が、それぞれ最上位で `tmpfs` かつ `ro,nosuid,nodev,noexec` の
+    /// マウントポイントであることと、覆いの対象でない `/sys` 配下のマウントを数える（特権不要の純関数）。
+    fn sys_mask_check(mountinfo: &str, present: &[String]) -> Result<MaskCheck, String> {
+        let mnts = parse_mountinfo(mountinfo)?;
+        let mut violations = Vec::new();
+        for target in present {
+            match mnts.iter().rev().find(|m| &m.mountpoint == target) {
+                None => violations.push(format!("{target} has no mount")),
+                Some(m) => {
+                    if m.fstype != "tmpfs" {
+                        violations.push(format!("{target} is not masked by tmpfs"));
+                    }
+                    for flag in ["ro", "nosuid", "nodev", "noexec"] {
+                        if !m.opts.iter().any(|o| o == flag) {
+                            violations.push(format!("{target} lacks {flag}"));
+                        }
+                    }
+                }
+            }
+        }
+        let mut unexpected_children = Vec::new();
+        for m in &mnts {
+            if m.mountpoint.starts_with("/sys/") && !present.contains(&m.mountpoint) {
+                unexpected_children.push(m.mountpoint.clone());
+            }
+        }
+        Ok(MaskCheck {
+            violations,
+            unexpected_children,
+        })
+    }
+
+    /// `cpu` ディレクトリの 1 件の名前が `cpu<10 進数>` か。
+    fn is_cpu_dir_name(name: &str) -> bool {
+        name.strip_prefix("cpu")
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    }
+
+    /// 覆い対象のうち pivot 後の `/sys` に存在するもの（`cpu*` の走査は 8192 件で打ち切り、超えたら `Err`）。
+    fn present_mask_targets() -> Result<Vec<String>, String> {
+        const MAX_CPUS: usize = 8192;
+        let mut out = Vec::new();
+        for p in ["/sys/devices/virtual/powercap", "/sys/firmware"] {
+            if std::fs::symlink_metadata(p).is_ok() {
+                out.push(p.to_string());
+            }
+        }
+        let Ok(rd) = std::fs::read_dir("/sys/devices/system/cpu") else {
+            return Ok(out);
+        };
+        let mut names = Vec::new();
+        for e in rd {
+            let name = e
+                .map_err(|e| format!("read_dir(cpu): {e}"))?
+                .file_name()
+                .to_string_lossy()
+                .into_owned();
+            if is_cpu_dir_name(&name) {
+                names.push(name);
+                if names.len() > MAX_CPUS {
+                    return Err("too many cpu directories".to_string());
+                }
+            }
+        }
+        names.sort();
+        for n in names {
+            let p = format!("/sys/devices/system/cpu/{n}/thermal_throttle");
+            if std::fs::symlink_metadata(&p).is_ok() {
+                out.push(p);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `sys_tree_violations` と `sys_mask_check` の合成 fixture による自己照合（特権不要。毎回実行する）。
     pub fn self_check() {
+        let masks = "20 11 0:20 / /sys/firmware ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n\
+                     21 11 0:21 / /sys/devices/system/cpu/cpu0/thermal_throttle ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n";
+        let present = vec![
+            "/sys/firmware".to_string(),
+            "/sys/devices/system/cpu/cpu0/thermal_throttle".to_string(),
+        ];
+        assert_eq!(
+            sys_mask_check(masks, &present),
+            Ok(MaskCheck {
+                violations: vec![],
+                unexpected_children: vec![]
+            })
+        );
+        let unmasked = "20 11 0:20 / /sys/firmware ro,nosuid,nodev,noexec - tmpfs tmpfs ro\n";
+        assert_eq!(
+            sys_mask_check(unmasked, &present).map(|c| c.violations),
+            Ok(vec![
+                "/sys/devices/system/cpu/cpu0/thermal_throttle has no mount".to_string()
+            ])
+        );
+        let rw = masks.replace("/sys/firmware ro,", "/sys/firmware rw,");
+        assert_eq!(
+            sys_mask_check(&rw, &present).map(|c| c.violations),
+            Ok(vec!["/sys/firmware lacks ro".to_string()])
+        );
+        let not_tmpfs = masks.replace("tmpfs tmpfs ro\n21", "sysfs sysfs ro\n21");
+        assert_eq!(
+            sys_mask_check(&not_tmpfs, &present).map(|c| c.violations),
+            Ok(vec!["/sys/firmware is not masked by tmpfs".to_string()])
+        );
+        let extra = format!(
+            "{masks}22 11 0:22 / /sys/fs/cgroup ro,nosuid,nodev,noexec - cgroup2 cgroup2 rw\n"
+        );
+        assert_eq!(
+            sys_mask_check(&extra, &present).map(|c| c.unexpected_children),
+            Ok(vec!["/sys/fs/cgroup".to_string()])
+        );
+        assert!(sys_mask_check("bad\n", &present).is_err());
+        assert!(is_cpu_dir_name("cpu0") && is_cpu_dir_name("cpu127"));
+        for bad in ["cpu", "cpufreq", "cpuidle", "cpu0x", "possible"] {
+            assert!(!is_cpu_dir_name(bad), "{bad}");
+        }
+
         let good = "10 1 0:5 / /proc rw - proc proc rw\n\
                     11 1 0:6 / /sys ro,nosuid,nodev,noexec - sysfs sysfs rw\n\
                     12 11 0:7 / /sys/fs/cgroup ro,nosuid,nodev,noexec - cgroup2 cgroup2 rw\n\
@@ -248,6 +377,7 @@ mod linux {
                 writeln!(writer, "open_w_errno:{p}={}", open_for_write_errno(p)).expect("write");
             }
         }
+        observe_masks(&mut writer, &mountinfo);
         let cgroup_procs = "/sys/fs/cgroup/cgroup.procs";
         let exists = std::fs::symlink_metadata(cgroup_procs).is_ok();
         writeln!(writer, "exists:{cgroup_procs}={exists}").expect("write");
@@ -261,6 +391,49 @@ mod linux {
         }
         let readable = std::fs::read_dir("/sys/kernel").is_ok();
         writeln!(writer, "read_ok:/sys/kernel={readable}").expect("write");
+    }
+
+    /// 覆い（#2014）の観測。存在する対象のマウントと中身が空であることを照合し、結果を `key=value` で書く。
+    fn observe_masks(writer: &mut std::io::PipeWriter, mountinfo: &str) {
+        let (present, mut violations, unexpected) = match present_mask_targets() {
+            Ok(present) => match sys_mask_check(mountinfo, &present) {
+                Ok(c) => (present, c.violations, c.unexpected_children),
+                Err(e) => (present, vec![format!("malformed: {e}")], Vec::new()),
+            },
+            Err(e) => (Vec::new(), vec![e], Vec::new()),
+        };
+        for t in &present {
+            match std::fs::read_dir(t) {
+                Ok(mut rd) => {
+                    if rd.next().is_some() {
+                        violations.push(format!("{t} is not empty"));
+                    }
+                }
+                Err(e) => violations.push(format!("read_dir({t}): {e}")),
+            }
+        }
+        writeln!(writer, "mask_violations={}", violations.len()).expect("write");
+        for (i, msg) in violations.iter().enumerate() {
+            writeln!(writer, "mask_violation:{i}={msg}").expect("write");
+        }
+        writeln!(writer, "mask_unexpected_children={}", unexpected.len()).expect("write");
+        for (i, msg) in unexpected.iter().enumerate() {
+            writeln!(writer, "mask_unexpected:{i}={msg}").expect("write");
+        }
+        let has = |p: &str| present.iter().any(|x| x == p);
+        let thermal = present
+            .iter()
+            .filter(|p| p.ends_with("/thermal_throttle"))
+            .count();
+        writeln!(writer, "mask_present={}", present.len()).expect("write");
+        writeln!(writer, "mask_firmware={}", has("/sys/firmware")).expect("write");
+        writeln!(
+            writer,
+            "mask_powercap={}",
+            has("/sys/devices/virtual/powercap")
+        )
+        .expect("write");
+        writeln!(writer, "mask_thermal_throttle={thermal}").expect("write");
     }
 
     pub fn run() {
@@ -330,6 +503,13 @@ mod linux {
         println!(
             "sysfs_mount: /sys is a read-only sysfs (nosuid,nodev,noexec), writes refused, reads allowed (root={root})"
         );
+        println!(
+            "sysfs_mount: {} /sys entries masked (firmware={}, powercap={}, thermal_throttle={}) (root={root})",
+            lookup(&text, "mask_present"),
+            lookup(&text, "mask_firmware"),
+            lookup(&text, "mask_powercap"),
+            lookup(&text, "mask_thermal_throttle"),
+        );
     }
 
     /// OCI 既定の sysfs の指定（`start` が検証するのと同じ変換）。
@@ -367,8 +547,23 @@ mod linux {
         );
         let children = lookup(text, "children");
         println!("sysfs_mount: {children} child mount(s) under /sys (root={root})");
+        assert_eq!(
+            lookup(text, "mask_violations"),
+            "0",
+            "every existing masked /sys entry must be an empty read-only tmpfs:\n{text}"
+        );
         if root {
-            assert_eq!(children, "0", "a fresh sysfs has no child mounts");
+            // 新しい sysfs の子マウントは、覆いの tmpfs だけ（#2014。覆いの前は 0 件だった）。
+            assert_eq!(
+                lookup(text, "mask_unexpected_children"),
+                "0",
+                "a fresh sysfs has no child mounts other than the masks:\n{text}"
+            );
+            assert_eq!(
+                children,
+                lookup(text, "mask_present"),
+                "child mounts must be exactly the masks"
+            );
         }
         assert_eq!(
             lookup(text, "read_ok:/sys/kernel"),

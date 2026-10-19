@@ -120,8 +120,8 @@ use super::sealed_copy::{SealPolicy, check_not_on_noexec_mount, seal_entrypoint_
 use super::stages::{LaunchNotReady, LaunchReady};
 use super::{
     DeviceReport, DevptsGidSource, ExecError, IsolationStage, MountIsolation, PivotReport,
-    StagePipeline, ViolationReason, describe, enter_working_dir, fd_mount_id, inject_files,
-    mount_sysfs, mount_tmpfs, pivot_root, prepare_rootfs,
+    StagePipeline, SysfsReport, ViolationReason, describe, enter_working_dir, fd_mount_id,
+    inject_files, mount_sysfs, mount_tmpfs, pivot_root, prepare_rootfs,
 };
 use crate::dev_mounts::ImplicitDevMount;
 use crate::injected_files::InjectedFileSet;
@@ -1920,6 +1920,8 @@ trait PrePivotOps {
     type Prepared;
     type Devices;
     type Pivoted;
+    /// `mount_sysfs` の成功の証跡。`masked_paths` 段へ渡し、sysfs を供給したときだけ `/sys` 配下を覆う（#2014）。
+    type Sysfs;
     fn establish(&self) -> Result<Self::Isolation, ExecError>;
     fn prepare_rootfs(
         &self,
@@ -1937,7 +1939,7 @@ trait PrePivotOps {
         isolation: &Self::Isolation,
         prepared: &Self::Prepared,
         spec: &SysfsMountSpec,
-    ) -> Result<(), ExecError>;
+    ) -> Result<Self::Sysfs, ExecError>;
     fn create_default_devices(
         &self,
         isolation: &Self::Isolation,
@@ -1976,6 +1978,7 @@ trait PrePivotOps {
         isolation: &Self::Isolation,
         prepared: &Self::Prepared,
         devices: &Self::Devices,
+        sysfs: Option<&Self::Sysfs>,
         extra: &[ProtectedPath],
     ) -> Result<(), ExecError>;
     fn pivot_root(
@@ -2050,6 +2053,7 @@ impl PrePivotOps for RealPrePivotOps {
     type Prepared = PreparedRootfs;
     type Devices = DeviceSet;
     type Pivoted = PivotReport;
+    type Sysfs = SysfsReport;
 
     fn establish(&self) -> Result<MountIsolation, ExecError> {
         MountIsolation::establish()
@@ -2085,10 +2089,10 @@ impl PrePivotOps for RealPrePivotOps {
         isolation: &MountIsolation,
         prepared: &PreparedRootfs,
         spec: &SysfsMountSpec,
-    ) -> Result<(), ExecError> {
+    ) -> Result<SysfsReport, ExecError> {
         // `/sys` の Landlock ルールは作らない（`landlock::rules` の doc。VFS の ro と `readonly_paths` が書き込みを塞ぐ）ため、
         // `self.record` による識別子の記録はしない。載せたマウントは `readonly_paths` が最上位を入れ替える。
-        mount_sysfs(isolation, prepared, spec).map(|_| ())
+        mount_sysfs(isolation, prepared, spec)
     }
 
     fn create_default_devices(
@@ -2180,9 +2184,11 @@ impl PrePivotOps for RealPrePivotOps {
         isolation: &MountIsolation,
         prepared: &PreparedRootfs,
         devices: &DeviceSet,
+        sysfs: Option<&SysfsReport>,
         extra: &[ProtectedPath],
     ) -> Result<(), ExecError> {
-        masked_paths::apply_masked_paths(isolation, prepared, &devices.null, extra).map(|_| ())
+        masked_paths::apply_masked_paths(isolation, prepared, &devices.null, sysfs, extra)
+            .map(|_| ())
     }
 
     fn pivot_root(
@@ -2296,6 +2302,7 @@ fn run_pre_pivot<O: PrePivotOps>(
         .prepare_rootfs(&isolation, rootfs)
         .map_err(StepError::at(S::PrepareRootfs))?;
     let mut devices = None;
+    let mut sysfs = None;
     let config_paths = setup.map_or(ConfigPaths::NONE, |s| s.config_paths);
     if let Some(setup) = setup {
         if let Some(pinned) = setup.pinned_rootfs {
@@ -2303,8 +2310,10 @@ fn run_pre_pivot<O: PrePivotOps>(
                 .map_err(StepError::at(S::VerifyPinned))?;
         }
         if let Some(spec) = setup.sysfs {
-            ops.mount_sysfs(&isolation, &prepared, spec)
-                .map_err(StepError::at(S::MountSysfs))?;
+            sysfs = Some(
+                ops.mount_sysfs(&isolation, &prepared, spec)
+                    .map_err(StepError::at(S::MountSysfs))?,
+            );
         }
         let created = ops
             .create_default_devices(&isolation, &prepared, setup.devices)
@@ -2329,8 +2338,14 @@ fn run_pre_pivot<O: PrePivotOps>(
     ops.apply_readonly_paths(&isolation, &prepared, config_paths.readonly)
         .map_err(StepError::at(S::ReadonlyPaths))?;
     if let Some(devices) = &devices {
-        ops.apply_masked_paths(&isolation, &prepared, devices, config_paths.masked)
-            .map_err(StepError::at(S::MaskedPaths))?;
+        ops.apply_masked_paths(
+            &isolation,
+            &prepared,
+            devices,
+            sysfs.as_ref(),
+            config_paths.masked,
+        )
+        .map_err(StepError::at(S::MaskedPaths))?;
     }
     let pivoted = ops
         .pivot_root(&isolation, prepared)
@@ -5319,6 +5334,11 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// `masked_paths` 段が受けた sysfs の証跡の有無（#2014。呼び出し順の記録とは別に持つ）。
+        static SYSFS_PROOF_SEEN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+
     impl RecordingOps {
         fn step(&self, name: &'static str) -> Result<(), ExecError> {
             record(name.to_owned());
@@ -5334,6 +5354,7 @@ mod tests {
         type Prepared = ();
         type Devices = ();
         type Pivoted = ();
+        type Sysfs = ();
         fn establish(&self) -> Result<(), ExecError> {
             self.step("establish")
         }
@@ -5376,8 +5397,10 @@ mod tests {
             _: &(),
             _: &(),
             _: &(),
+            sysfs: Option<&()>,
             _: &[ProtectedPath],
         ) -> Result<(), ExecError> {
+            SYSFS_PROOF_SEEN.with(|c| c.set(Some(sysfs.is_some())));
             self.step("masked_paths")
         }
         fn pivot_root(&self, _: &(), _: ()) -> Result<(), ExecError> {
@@ -5458,6 +5481,33 @@ mod tests {
                 "pivot_root",
             ]
         );
+    }
+
+    /// SEC-2（#2014）: `masked_paths` 段へは `mount_sysfs` の証跡が、sysfs の指定があるときだけ渡る。
+    #[test]
+    fn sec2_2014_run_pre_pivot_passes_sysfs_proof_only_when_mounted() {
+        let sysfs = test_sysfs();
+        for (spec, want) in [(Some(&sysfs), Some(true)), (None, Some(false))] {
+            SYSFS_PROOF_SEEN.with(|c| c.set(None));
+            run_pre_pivot(
+                &RecordingOps { fail_at: None },
+                Path::new("/rootfs"),
+                Some(PrePivotSetup {
+                    devices: DevptsGidSource::Rootful,
+                    tmpfs: None,
+                    inject: None,
+                    binds: None,
+                    sysfs: spec,
+                    pinned_rootfs: None,
+                    config_paths: ConfigPaths::NONE,
+                    status: None,
+                    working_dir: None,
+                }),
+            )
+            .unwrap();
+            assert_eq!(SYSFS_PROOF_SEEN.with(|c| c.get()), want);
+        }
+        let _ = take_calls();
     }
 
     /// 指定が無い段は呼ばれず、devices は常に pivot の前に作られる。`None` は最小構成。

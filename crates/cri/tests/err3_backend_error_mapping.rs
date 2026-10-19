@@ -453,3 +453,56 @@ async fn err3_pull_image_maps_pull_error_codes() {
         assert_eq!(recorded, vec![name], "{oci:?}");
     }
 }
+
+/// ERR-3・CRI-3・CRI-4・#2321: `PullImage` で puller が `AlreadyExists` を返すと `INTERNAL` と固定文言
+/// `image pull failed` で届く。`ALREADY_EXISTS` にはしない（ERR-3 の `ALREADY_EXISTS` は Create 系専用で、
+/// 冪等な `PullImage` には当たらない）。上流の文言は漏れず、ストアにも何も残らない。
+#[tokio::test]
+async fn err3_pull_image_already_exists_maps_to_internal() {
+    let puller = Arc::new(FakePuller {
+        err: PullError::from_oci(&OciError::new(
+            OciErrorCode::AlreadyExists,
+            "upstream detail private.example.com/team/app token=dummy",
+        )),
+        calls: AtomicUsize::new(0),
+    });
+    let recorder = Arc::new(Collect::default());
+    let svc = CriImageService::with_store_and_recorder(
+        Arc::new(InMemoryImageStore::new()),
+        recorder.clone(),
+    )
+    .with_puller(puller.clone());
+    let req = v1::PullImageRequest {
+        image: Some(ImageSpec {
+            image: "private.example.com/team/app:1".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let err = ImageService::pull_image(&svc, Request::new(req))
+        .await
+        .expect_err("pull must fail");
+    assert_eq!(
+        pair(&err),
+        (Code::Internal, "image pull failed".to_string())
+    );
+    for leaked in ["private.example.com", "upstream detail", "token="] {
+        assert!(!err.message().contains(leaked), "leaked {leaked}");
+    }
+    assert_eq!(puller.calls.load(Ordering::SeqCst), 1);
+    let listed = ImageService::list_images(&svc, Request::new(v1::ListImagesRequest::default()))
+        .await
+        .expect("list")
+        .into_inner()
+        .images;
+    assert!(listed.is_empty());
+    let recorded: Vec<&str> = recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|s| s.kind() == CriOpKind::PullImage)
+        .map(|s| code_name(s.code()))
+        .collect();
+    assert_eq!(recorded, vec!["INTERNAL"]);
+}

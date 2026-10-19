@@ -16,7 +16,7 @@
 //!    パーサ側で解釈済みに移すことで行う。`linux.resources` の memory / cpu / pids / blockIO（weight・throttle）
 //!    は #2019 で解釈済みに移り、cgroup v2 の範囲外の値は Linux では create の時点で `InvalidArgument` で
 //!    拒否する（`cgroups::ResourceLimitPlan`）。それ以外の resources の項目は未適用として拒否する。
-//!    `linux.cgroupsPath` は [`check_cgroups_path`] が拒否する（受理は #2010）。
+//!    `linux.cgroupsPath` は [`check_cgroups_path`] が拒否する（値は配置に使わない方針。#2010）。
 //! 2. `process` を持たない config は拒否する。start で起動できない config を created にしない。
 //! 3. `root.path` は `..` 要素と、bundle 配下の全パス要素（中間要素を含む）の symlink・Windows junction（reparse point）を拒否し、
 //!    存在するディレクトリであることを確認する。bundle 内の link 経由で bundle 外を rootfs に

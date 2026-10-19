@@ -14,8 +14,19 @@
 //! 3 OS 共通の API で取れ、フィクスチャの既知合計と一致するため、割り当てブロック数は使わない。
 //! 報告するサイズは digest 検証を兼ねない（内容の検証済みを装わない）。
 //!
-//! 未実装（実装済みを装わない。REPAIR-3）: 展開後サイズ、コンテナ（rootfs・bundle は core の領域）と
-//! ステージング（配置は `<root>/staging/<pull-id>/` で確定済み・走査対象外。容量の集計は未実装）の使用容量、CLI 経路（`image ls` / `system df` のサブコマンド）。
+//! ステージング（`<root>/staging/<pull-id>/`）の使用容量は `disk_usage` が `DiskUsage::staging` に載せる
+//! （`staging` サブモジュール。#2222）。コンテナ（bundle・rootfs）は core の領域で oci は core に依存しないため、
+//! core の `measure_container_usage` の結果を呼び出し側が [`ContainersUsage`] に写して
+//! [`DiskUsage::with_containers`] で合成する。展開後サイズは重いので `disk_usage` には含めず、
+//! `expanded_size_plan`（ガードの内側）と `ExpandedSizePlan::measure`（ガードの外）の二段階 API で取り、
+//! [`DiskUsage::with_expanded`] で合成する（`expanded` サブモジュール）。containers・展開後の計測は
+//! `ImageStoreGuard` を持ったまま行わない（他の操作が Timeout する。REPAIR-5）。
+//! 手順は「ガードの外で core を計測 → ガードの内側で `disk_usage` と plan → ガードの外で `measure`」。
+//!
+//! 圧縮済みのバイト数（`ImageUsage::bytes`・`CacheUsage::bytes`）と展開後サイズ・コンテナの容量は別の項目で、足し合わせない。
+//!
+//! 未実装（実装済みを装わない。REPAIR-3）: CLI 経路（`image ls` / `system df` のサブコマンド。#2221）、
+//! 展開後サイズ・staging 走査の計装（#2223）。
 //!
 //! 計装（REPAIR-4）: `list_images_with` / `disk_usage_with` が `OciOpRecorder` へ成功・失敗と
 //! 所要時間を渡す。`list_images` / `disk_usage` は何も記録しない `NoopOciOpRecorder` 版。
@@ -26,9 +37,14 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use super::{ReferenceTable, TagKey};
+
+mod expanded;
+mod staging;
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 use crate::reference::Digest;
+pub use expanded::{ExpandedSizePlan, ExpandedUsage, MAX_EXPANDED_SCAN_BYTES};
+pub use staging::StagingUsage;
 
 /// `blobs/sha256` 走査で数えるエントリ数の上限（無制限の走査を避ける。100 万件超は異常とみなす）。
 pub const MAX_CACHE_SCAN_ENTRIES: usize = 1_048_576;
@@ -87,7 +103,50 @@ pub struct CacheUsage {
     pub foreign_entries: usize,
 }
 
-/// `system df` 相当の結果。containers・staging は oci では測れないため持たない（未計測）。
+/// コンテナ領域（bundle・rootfs）の使用容量。core の `ContainerDiskUsage` と同じ意味の値型で、
+/// oci は core に依存しないため呼び出し側が写して [`DiskUsage::with_containers`] へ渡す。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ContainersUsage {
+    /// コンテナ数。
+    pub count: usize,
+    /// bundle と rootfs の通常ファイルの見かけのサイズの合計（ハードリンクは 1 回）。
+    pub bytes: u64,
+    /// bundle が存在しない件数。
+    pub missing_bundles: usize,
+    /// `config.json` を読めず rootfs を特定できなかった件数。
+    pub unreadable_configs: usize,
+    /// 権限不足などで読めなかったエントリ数。
+    pub inaccessible_entries: usize,
+    /// 別のファイルシステムのため降りなかったディレクトリ数。
+    pub mount_points_skipped: usize,
+}
+
+impl ContainersUsage {
+    /// 各値から作る（`#[non_exhaustive]` のため外部 crate はこの入口で組み立てる）。
+    pub fn new(
+        count: usize,
+        bytes: u64,
+        missing_bundles: usize,
+        unreadable_configs: usize,
+        inaccessible_entries: usize,
+        mount_points_skipped: usize,
+    ) -> Self {
+        Self {
+            count,
+            bytes,
+            missing_bundles,
+            unreadable_configs,
+            inaccessible_entries,
+            mount_points_skipped,
+        }
+    }
+}
+
+/// `system df` 相当の結果。
+///
+/// `images.bytes`・`cache.bytes` は圧縮済み blob の見かけのサイズ。`containers`・`expanded` は oci 単独では
+/// 測れない・重いため `None`（未計測）で始まり、呼び出し側が `with_*` で合成する。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct DiskUsage {
@@ -95,6 +154,26 @@ pub struct DiskUsage {
     pub images: ImageUsage,
     /// キャッシュ側。
     pub cache: CacheUsage,
+    /// pull 中のステージング領域。
+    pub staging: StagingUsage,
+    /// コンテナ領域。`None` は未計測。
+    pub containers: Option<ContainersUsage>,
+    /// 展開後サイズ。`None` は未計測。
+    pub expanded: Option<ExpandedUsage>,
+}
+
+impl DiskUsage {
+    /// コンテナ領域の計測結果を合成する。
+    pub fn with_containers(mut self, containers: ContainersUsage) -> Self {
+        self.containers = Some(containers);
+        self
+    }
+
+    /// 展開後サイズの計測結果を合成する。
+    pub fn with_expanded(mut self, expanded: ExpandedUsage) -> Self {
+        self.expanded = Some(expanded);
+        self
+    }
 }
 
 fn err(code: OciErrorCode, msg: &str) -> OciError {
@@ -219,7 +298,8 @@ impl ReferenceTable {
         Ok(ImageList { entries })
     }
 
-    /// `system df` 相当。イメージ側とキャッシュ側の使用容量を返す。排他の内側で呼ぶこと。
+    /// `system df` 相当。イメージ側・キャッシュ側・ステージングの使用容量を返す。排他の内側で呼ぶこと。
+    /// `containers` と `expanded` は `None`（呼び出し側が `with_*` で合成する）。
     ///
     /// `blobs` / `blobs/sha256` が symlink・非ディレクトリなら辿らず `FailedPrecondition`。
     /// 走査が `MAX_CACHE_SCAN_ENTRIES` を超えたら `ResourceExhausted`。
@@ -275,9 +355,13 @@ impl ReferenceTable {
         } else {
             CacheUsage::default()
         };
+        // staging は 1 階層・メタデータだけの走査なのでガードの内側でも軽い（#2222）。
+        let staging = staging::scan_staging(root)?;
         Ok(DiskUsage {
             images,
             cache: cache_usage,
+            staging,
+            ..DiskUsage::default()
         })
     }
 }
@@ -526,6 +610,29 @@ mod tests {
         assert_eq!(u.cache.unregistered_count, 1);
         assert_eq!(u.cache.unregistered_bytes, 500);
         assert_eq!(u.cache.foreign_entries, 2);
+    }
+
+    /// OCI-7・#2222: staging のファイルは `cache` / `images` に混ざらず、`staging` に別計上される。
+    /// containers・expanded は未計測の `None` で、`with_*` で合成した値が具体値で残る。
+    #[test]
+    fn oci7_df_staging_is_separate_and_containers_compose() {
+        let root = Root::new("df-staging");
+        let t = fixture(&root);
+        let sdir = root.0.join("staging").join("p1");
+        fs::create_dir_all(&sdir).unwrap();
+        fs::write(sdir.join("aa"), vec![0u8; 777]).unwrap();
+        let u = t.disk_usage(&root.0).unwrap();
+        assert_eq!(u.images.bytes, 3130);
+        assert_eq!(u.cache.bytes, 3130);
+        assert_eq!(u.staging.pulls, 1);
+        assert_eq!(u.staging.file_count, 1);
+        assert_eq!(u.staging.bytes, 777);
+        assert_eq!(u.containers, None);
+        assert_eq!(u.expanded, None);
+        let c = ContainersUsage::new(2, 4096, 1, 0, 0, 0);
+        let u = u.with_containers(c.clone());
+        assert_eq!(u.containers, Some(c));
+        assert_eq!(u.images.bytes, 3130);
     }
 
     /// OCI-7: blob ディレクトリが無ければキャッシュ側は 0。

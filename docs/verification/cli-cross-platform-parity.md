@@ -12,6 +12,7 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 | ---- | ---- |
 | 非 Linux の plugin 起動・RPC | 発見 → 登録 → 信頼性検証までは配線済みだが、plugin の起動と RPC は未実装（TASK-114）。macOS / Windows ではバックエンド解決が必ず失敗する。よって B 層（挙動）の非 Linux 欄は **前提未達** であり、合格として記入しない |
 | Linux 経路の未実装 | `start` の本番 launcher、`logs`、cgroup 配置つき `delete` は未実装（REPAIR-3）。pid ありの `stop` は Linux では supervisor の制御チャネル経由で結線済み（#2059。supervisor に届かなければ `UNAVAILABLE`（9））。Linux 側の現行値（`start` = 8 など）は「現行実装での参考値」で、launcher 提供後に変わる。固定の合格基準にしない |
+| イメージ管理の現状（C 層） | 参照テーブルのディスク永続化が oci 側で未実装（#851・#854・#2315）のため、Linux でも `image ls` は 0 件（ヘッダのみ）・`image rm` は `NOT_FOUND`（3）が現行値で、`system df` の images 側は 0 件。`--image-root` は必須で既定位置は未決（#2221）。非 Linux はイメージキャッシュの置き場が未決のため他コマンドと同じ plugin 解決の失敗（5 など）で fail-closed。`scripts/cli-parity-check.sh` は C 層を自動収集しないため、手動で実行して記録する |
 | Windows の自動化 | `scripts/cli-parity-check.sh` は Git Bash で実行する。スタブ CLI による自己テストは CI の 3 OS（ubuntu・macos・windows）で実行しているが、製品バイナリ（ネイティブ exe）に対する capture は CI で確かめていない（実機確認の範囲）。タイムアウト時の子孫回収だけはヘルパー exe で CI 実測する（#1548） |
 
 期待値の正は「Linux ネイティブ実行と同一」。Linux の capture を基準にして他 OS を突き合わせる。
@@ -126,6 +127,44 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | B13 | `delete nonexist` | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B14 | `logs nonexist` | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B15 | `list`（状態ルートの親ディレクトリも不在） | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+
+## C 層: イメージ管理（`image ls`・`system df`・`image rm`。#2221・CLI-1・OCI-7）
+
+`scripts/cli-parity-check.sh` は本層を自動収集しない。手動で実行し、結果欄だけを記入する（#661）。パス・ホスト名は記録しない（記録ルールは上記）。`<dir>` は事前に作った空のイメージストア root（絶対パス。`blobs/sha256` を持つ）。
+
+### 3 コマンドの比較項目
+
+| コマンド | 受理される構文 | 比較項目 |
+| -------- | -------------- | -------- |
+| `image ls` | `image ls --image-root <dir>` | 終了コード・stdout の形式（ヘッダ `REPOSITORY<TAB>TAG<TAB>DIGEST<TAB>SIZE<TAB>MISSING`、0 件はヘッダのみで 0） |
+| `system df` | `system df --image-root <dir>` | 終了コード・stdout の形式（ヘッダ `KEY<TAB>VALUE` と固定順 9 行） |
+| `image rm` | `image rm [--force] --image-root <dir> <ref>` | 終了コード・`code`・未知の参照は `NOT_FOUND`（3）・使用中は `FAILED_PRECONDITION`（5） |
+
+### C 層の構文ケース（3 OS で 2 / `INVALID_ARGUMENT` を期待）
+
+| ID | 構文 | 期待 | Linux | macOS | Windows | 一致 | 備考 |
+| -- | ---- | ---- | ----- | ----- | ------- | ---- | ---- |
+| C01 | `image`（サブコマンドなし） | 2 / `INVALID_ARGUMENT` | | | | | |
+| C02 | `image bogus` | 2 / `INVALID_ARGUMENT` | | | | | |
+| C03 | `system` / `system bogus` | 2 / `INVALID_ARGUMENT` | | | | | |
+| C04 | `image ls`（`--image-root` 欠落） | 2 / `INVALID_ARGUMENT` | | | | | |
+| C05 | `image ls --image-root`（値欠落） | 2 / `INVALID_ARGUMENT` | | | | | |
+| C06 | `image ls --image-root <相対パス>` | 2 / `INVALID_ARGUMENT` | | | | | |
+| C07 | `image ls --image-root <dir> extra` / `system df --image-root <dir> extra` | 2 / `INVALID_ARGUMENT` | | | | | |
+| C08 | `image rm --image-root <dir>`（参照欠落） | 2 / `INVALID_ARGUMENT` | | | | | |
+| C09 | `image rm --image-root <dir> a b`（余剰） | 2 / `INVALID_ARGUMENT` | | | | | |
+| C10 | `image rm --force --force --image-root <dir> x`（重複） | 2 / `INVALID_ARGUMENT` | | | | | |
+| C11 | `image rm --image-root <dir> 'bad ref!'`（不正な参照） | 2 / `INVALID_ARGUMENT` | | | | | Linux のみ到達（非 Linux は解決の失敗が先） |
+
+### C 層の挙動ケース（Linux の参考期待値のみ。macOS / Windows は「前提未達」が既定）
+
+| ID | コマンドと前提 | Linux の参考期待値 | Linux | macOS | Windows | 一致 | 備考 |
+| -- | -------------- | ------------------ | ----- | ----- | ------- | ---- | ---- |
+| C20 | `image ls --image-root <dir>`（空） | 0 / ヘッダのみ | | 前提未達 | 前提未達 | | |
+| C21 | `system df --image-root <dir>`（空） | 0 / 固定 9 行（値は 0） | | 前提未達 | 前提未達 | | |
+| C22 | `image rm --image-root <dir> busybox:latest` | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 永続化未実装のため常にこの値 |
+| C23 | `image ls --image-root <存在しない dir>` | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | |
+| C24 | `image ls --image-root <通常ファイル>` | 5 / `FAILED_PRECONDITION` | | 前提未達 | 前提未達 | | |
 
 ## 差異のフィードバック先
 

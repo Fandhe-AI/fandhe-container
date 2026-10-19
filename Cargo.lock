@@ -293,6 +293,7 @@ dependencies = [
  "fandhe-container-cli",
  "fandhe-container-core",
  "fandhe-container-net",
+ "fandhe-container-oci",
  "fandhe-container-plugin",
  "fandhe-container-supervisor",
 ]

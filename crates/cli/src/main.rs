@@ -1,6 +1,6 @@
 //! バイナリ `fandhe-container` の入口（薄いラッパー。ロジックは lib 側の `fandhe_container_cli::commands`。TASK-79.1・TASK-79.2.1・CLI-1・MS-6）。
 //!
-//! 終了コードは core の ERR-2 表に従う: 0 は成功（出力なし。`list` のみ stdout へ一覧を出す）、2 は使い方エラー・不正引数、
+//! 終了コードは core の ERR-2 表に従う: 0 は成功（出力なし。`list` と `image ls` / `system df` / `image rm` のみ stdout へ表を出す）、2 は使い方エラー・不正引数、
 //! 3 は対象なし、8 は未実装など。
 //! `setup`（CLI-2）は OS 固有設定の要求ステップを stdout へ出す（Linux は要求なしで 0・出力なし）。`start` は同じディレクトリの supervisor を起動して結果を受け取る（#1718）。supervisor は core の本番 launcher で起動する（rootless のみ。rootful は `UNIMPLEMENTED`（8））。
 //! unix では起動時に SIGINT・SIGTERM・SIGHUP のハンドラを登録し、起動中の plugin へ転送してから終了する（#1513・PLUG-7）。
@@ -232,7 +232,7 @@ mod tests {
         assert_eq!(fallback_bytes(true, &usage), expected);
         assert_eq!(
             String::from_utf8(line).unwrap(),
-            "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|setup|doctor>\"}\n"
+            "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|image|system|setup|doctor>\"}\n"
         );
     }
 }

@@ -10,7 +10,8 @@
 //!
 //! - 呼び出し元は将来の SIGSYS ハンドラ、または supervisor の USER_NOTIF listener。**どちらも未実装**
 //!   （REPAIR-3）。現行の `seccomp::build_deny_filter` は禁止 syscall に `ERRNO(EPERM)`
-//!   （`unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS`。ESC-06）を返すため、どちらも報告が発生せず、
+//!   （`unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS`。ESC-06。USER_NOTIF 版の構築関数
+//!   `build_deny_filter_with` は #2023 で実装済みだが本番は未配線。配線は #2024・#2025）を返すため、どちらも報告が発生せず、
 //!   本フックは本番経路からまだ呼ばれない。`KILL_PROCESS` では終了するプロセス自身が記録を書けず、
 //!   プロセス内の SIGSYS ハンドラ経由の `SeccompDenialReport::from_sigsys` も使えない。そのため KILL 側では
 //!   本フックを使わない（正の記録はカーネルの `AUDIT_SECCOMP`、補助は親の回収点が出す

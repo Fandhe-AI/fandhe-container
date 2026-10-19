@@ -169,6 +169,19 @@ mod unix {
                         use std::os::unix::ffi::OsStrExt;
                         let a0 = std::env::args_os().next().unwrap();
                         [b"argv0=".as_slice(), a0.as_bytes()].concat()
+                    } else if mode == "env_dump" {
+                        // 子の環境変数の全集合を `name=value` の改行区切りで応答する（#1858）。
+                        use std::os::unix::ffi::OsStrExt;
+                        let mut vars: Vec<_> = std::env::vars_os().collect();
+                        vars.sort();
+                        let mut out = Vec::new();
+                        for (k, v) in vars {
+                            out.extend_from_slice(k.as_bytes());
+                            out.push(b'=');
+                            out.extend_from_slice(v.as_bytes());
+                            out.push(b'\n');
+                        }
+                        out
                     } else {
                         format!("pid={} seq={seq}", std::process::id()).into_bytes()
                     };
@@ -734,6 +747,51 @@ mod unix {
         assert_eq!(e.code(), PluginErrorCode::PermissionDenied);
         assert_eq!(e.message(), "permission denied spawning plugin program");
         no_socket_left(&dir);
+    }
+
+    fn env_dump(vars: Vec<(String, OsString)>) -> std::collections::BTreeMap<String, String> {
+        let dir = TempDir::new("env_dump");
+        let plugin = plugin_for(&dir).with_env(vars).unwrap();
+        let mut session = start_plugin(plugin, 5000).unwrap();
+        let resp = session.call(&ping(), rpc(5000)).unwrap();
+        session.shutdown().unwrap();
+        let map: std::collections::BTreeMap<String, String> = std::str::from_utf8(resp.payload())
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let (k, v) = l.split_once('=').unwrap();
+                (k.to_string(), v.to_string())
+            })
+            .collect();
+        let sock = map.get(PLUGIN_SOCKET_ENV).unwrap();
+        assert_eq!(
+            std::path::Path::new(sock).parent().unwrap(),
+            dir.0.as_path()
+        );
+        map
+    }
+
+    /// 指定なしなら常駐 plugin の環境は socket の変数だけ（#1858・PLUG-7）。
+    #[test]
+    fn plug7_resident_env_default_is_socket_only() {
+        assert!(std::env::var_os("PATH").is_some());
+        let map = env_dump(vec![]);
+        let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec![PLUGIN_SOCKET_ENV]);
+    }
+
+    /// 明示した 2 件だけが socket の変数に加わって常駐 plugin へ渡る（#1858・PLUG-7）。
+    #[test]
+    fn plug7_resident_env_passes_explicit_vars_only() {
+        assert!(std::env::var_os("HOME").is_some());
+        let map = env_dump(vec![
+            ("HOME".to_string(), OsString::from("/nonexistent/fcos-home")),
+            ("FCOS_ENV_B".to_string(), OsString::from("beta value")),
+        ]);
+        let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec![PLUGIN_SOCKET_ENV, "FCOS_ENV_B", "HOME"]);
+        assert_eq!(map["HOME"], "/nonexistent/fcos-home");
+        assert_eq!(map["FCOS_ENV_B"], "beta value");
     }
 
     /// plugin が受け取る `argv[0]` は起動対象の `exec_path`（Linux でも `/proc/self/fd/N` ではない。#1856）。

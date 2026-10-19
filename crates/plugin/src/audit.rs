@@ -33,7 +33,7 @@
 //! # 範囲と未実装（REPAIR-3）
 //! 本 crate が担うのは「拒否 1 件につきイベント 1 件を呼び出し側のフックへ渡す」ところまでで、これを
 //! TASK-124.5 の「拒否 1 件ごとに監査イベントを 1 件記録」の定義とする。永続的な SEC-4 監査ログ
-//! （`crates/core` の監査ログ）への書き込みは core 側 proxy（TASK-114）の責務で、本 crate では未実装。
+//! （`crates/core` の監査ログ）への書き込みは core 側 proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114）の責務で、本 crate では未実装。
 //! [`JsonLinesPeerAuthObserver`] は I/O をしない一時的なメモリバッファである。フックを渡した呼び出し側が
 //! [`JsonLinesPeerAuthObserver::drain_lines`] で回収して自分の出力先へ書かないまま終了すれば、イベントは
 //! 失われる（回収と永続化は呼び出し側の契約）。

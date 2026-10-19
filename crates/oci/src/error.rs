@@ -6,7 +6,8 @@
 //!
 //! `message` の契約: 英語で書き、トークン・`Authorization` ヘッダ・資格情報・レジストリ応答の本文を載せない
 //! （security.md）。HTTP ステータスは `message` に埋めず `http_status` に数値で持つ。長さは
-//! [`OCI_ERROR_MESSAGE_MAX_BYTES`] で切り詰め、制御文字は空白へ置換する。
+//! [`OCI_ERROR_MESSAGE_MAX_BYTES`] で切り詰め、制御文字は空白へ置換する。例外として、未対応のレイヤーの
+//! mediaType だけは、長さを制限し文字を置き換えた値を載せる（`manifest` モジュール。#2037）。
 
 use std::error::Error;
 use std::fmt;

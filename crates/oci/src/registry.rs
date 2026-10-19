@@ -29,7 +29,7 @@ use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_
 use crate::manifest::{
     Descriptor, ImageManifest, MANIFEST_MAX_BYTES, MEDIA_TYPE_DOCKER_LIST,
     MEDIA_TYPE_DOCKER_MANIFEST, MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_MANIFEST, ParsedManifest,
-    Platform, parse_manifest, select_manifest,
+    Platform, ensure_supported_layer_media_types, parse_manifest, select_manifest,
 };
 use crate::reference::{Digest, Reference, RegistryHost, Repository};
 use crate::tls;
@@ -320,6 +320,9 @@ impl RegistryClient {
     /// `Authorization` は `auth` が Bearer のときだけ接続先レジストリへ送り、リダイレクトは追従しない。
     /// 期限切れの Bearer は通信せず `PermissionDenied`（再取得は呼び出し側）。各リクエストに
     /// `manifest_request_timeout` の全体期限と `max_manifest_bytes` の本文上限がある（REPAIR-5）。
+    ///
+    /// 未対応のレイヤーの mediaType（gzip 以外。zstd は #2029 で保留中）は、blob を取得する前に
+    /// `Unimplemented` で拒否する（#2037・ERR-1）。
     ///
     /// 戻り値は本文 digest 未検証（本文ハッシュと参照 digest の突合は未実装）。成功・失敗とエラー code・所要時間は
     /// `with_recorder` の記録先へ 1 件記録する（REPAIR-4）。
@@ -675,6 +678,10 @@ fn fetch_manifest_flow(
             ));
         }
         let parsed = parse_manifest(&resp.body, resp.content_type.as_deref())?;
+        // 未対応のレイヤー（zstd 等）は blob を取得する前に拒否する（#2037・OCI-1・ERR-1）。
+        if let ParsedManifest::Image(m) = &parsed {
+            ensure_supported_layer_media_types(m)?;
+        }
         Ok((parsed, actual))
     };
     match fetch_one(reference)? {
@@ -1305,6 +1312,7 @@ fn map_ureq_error(e: ureq::Error) -> OciError {
 mod tests {
     use super::*;
     use crate::error::OciErrorCode;
+    use crate::manifest::MEDIA_TYPE_OCI_LAYER_GZIP;
     use crate::reference::ImageReference;
     use rustls_native_certs::CertificateResult;
 
@@ -1663,7 +1671,7 @@ mod tests {
 
     fn image_body() -> String {
         format!(
-            r#"{{"schemaVersion":2,"mediaType":"{MEDIA_TYPE_OCI_MANIFEST}","config":{{"mediaType":"c","digest":"sha256:{HX}","size":1}},"layers":[{{"mediaType":"l","digest":"sha256:{HX}","size":2}}]}}"#
+            r#"{{"schemaVersion":2,"mediaType":"{MEDIA_TYPE_OCI_MANIFEST}","config":{{"mediaType":"c","digest":"sha256:{HX}","size":1}},"layers":[{{"mediaType":"{MEDIA_TYPE_OCI_LAYER_GZIP}","digest":"sha256:{HX}","size":2}}]}}"#
         )
     }
 
@@ -1722,6 +1730,41 @@ mod tests {
             ),
         ]);
         run(&t).expect("auth")
+    }
+
+    /// OCI-1・ERR-1: 未対応のレイヤーは blob を取得する前に `Unimplemented` で拒否する（#2037）。
+    #[test]
+    fn manifest_rejects_unsupported_layer_before_blob_fetch() {
+        for mt in [
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            "application/vnd.oci.image.layer.v1.tar",
+            "application/x-unknown",
+        ] {
+            let body = image_body().replace(MEDIA_TYPE_OCI_LAYER_GZIP, mt);
+            let t = FakeTransport::new(vec![manifest_resp(200, &body)]);
+            let e = fetch(&t, &bearer(300), "x86_64").expect_err(mt);
+            assert_eq!(e.code(), OciErrorCode::Unimplemented);
+            assert!(e.message().contains(mt), "{}", e.message());
+            let seen = t.seen.lock().expect("lock");
+            assert_eq!(seen.len(), 1, "only the manifest GET may happen");
+            assert!(seen[0].0.ends_with("/manifests/latest"), "{}", seen[0].0);
+        }
+    }
+
+    /// OCI-1: index から選ばれた manifest の zstd レイヤーも blob 取得前に拒否する。
+    #[test]
+    fn manifest_index_selected_manifest_with_zstd_layer_is_rejected() {
+        let zstd = "application/vnd.oci.image.layer.v1.tar+zstd";
+        let amd = image_body().replace(MEDIA_TYPE_OCI_LAYER_GZIP, zstd);
+        let (ha, hb) = (sha_hex(&amd), sha_hex(&image_body_arm()));
+        let index = index_body()
+            .replace(&sha_hex(&image_body()), &ha)
+            .replace(&sha_hex(&image_body_arm()), &hb);
+        let t = FakeTransport::new(vec![manifest_resp(200, &index), manifest_resp(200, &amd)]);
+        let e = fetch(&t, &bearer(300), "x86_64").expect_err("reject");
+        assert_eq!(e.code(), OciErrorCode::Unimplemented);
+        assert!(e.message().contains(zstd), "{}", e.message());
+        assert_eq!(t.seen.lock().expect("lock").len(), 2);
     }
 
     /// OCI-1: tag の image manifest は 1 回の GET で解決し、Accept と Authorization を送る。

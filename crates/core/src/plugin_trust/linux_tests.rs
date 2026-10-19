@@ -752,3 +752,77 @@ fn plug11_task122_5_audited_allowlist_method_records_hash_mismatch() {
     assert_eq!(rej.error.kind(), PluginTrustErrorKind::HashMismatch);
     assert_eq!(sink.snapshot().len(), 1);
 }
+/// 照合済み fd から起動対象を作る変換の試験（PLUG-11・#1857）。
+#[cfg(feature = "plugin")]
+mod launch_target {
+    use super::*;
+    use crate::plugin::PluginErrorCode;
+    use std::os::unix::fs::MetadataExt;
+
+    /// 変換後の起動対象が照合に使った fd と同じ実体（dev / ino）を指し、パスは検証時のまま。
+    #[test]
+    fn plug11_1857_conversion_keeps_same_inode_and_paths() {
+        let (_t, v) = verified("lt-ok");
+        let hv = v.verify_hash(&allow(&[PAYLOAD_SHA])).expect("allowed");
+        let meta = hv.file().file().metadata().unwrap();
+        let (path, resolved) = (hv.path().to_path_buf(), hv.resolved_path().to_path_buf());
+        let target = hv.into_launch_target().expect("converted");
+        assert_eq!(target.identity().dev(), meta.dev());
+        assert_eq!(target.identity().ino(), meta.ino());
+        assert_eq!(target.display_path(), path.as_path());
+        assert_eq!(target.exec_path(), resolved.as_path());
+    }
+
+    /// 照合後にパスが別ファイルへ差し替わっても、変換は保持 fd を使い、パスを開き直さない。
+    #[test]
+    fn plug11_1857_conversion_does_not_reopen_path() {
+        let (t, v) = verified("lt-swap");
+        let hv = v.verify_hash(&allow(&[PAYLOAD_SHA])).expect("allowed");
+        let orig = hv.file().file().metadata().unwrap();
+        let other = t.0.join("other");
+        fs::write(&other, b"evil").unwrap();
+        chmod(&other, 0o755);
+        let new_ino = fs::metadata(&other).unwrap().ino();
+        fs::rename(&other, t.0.join(NAME)).unwrap();
+        let target = hv.into_launch_target().expect("converted");
+        assert_eq!(target.identity().ino(), orig.ino());
+        assert_ne!(target.identity().ino(), new_ino);
+    }
+
+    /// symlink 候補は表示用が symlink 側、実行用が実体側になる。
+    #[test]
+    fn plug11_1857_conversion_symlink_candidate_paths() {
+        let tmp = Tmp::new("lt-link");
+        fs::write(tmp.0.join("real"), b"payload").unwrap();
+        chmod(&tmp.0.join("real"), 0o755);
+        symlink("real", tmp.0.join(NAME)).unwrap();
+        let v = verify_dir(&tmp.0)
+            .expect("dir ok")
+            .verify_file(OsStr::new(NAME))
+            .expect("file ok");
+        let hv = v.verify_hash(&allow(&[PAYLOAD_SHA])).expect("allowed");
+        let (path, resolved) = (hv.path().to_path_buf(), hv.resolved_path().to_path_buf());
+        assert_ne!(path, resolved);
+        let target = hv.into_launch_target().expect("converted");
+        assert_eq!(target.display_path(), path.as_path());
+        assert_eq!(target.exec_path(), resolved.as_path());
+    }
+
+    /// `#!` スクリプトは照合を通っても変換で拒否される（パス起動へ縮退しない）。
+    #[test]
+    fn plug11_1857_conversion_rejects_script() {
+        let tmp = Tmp::new("lt-script");
+        fs::write(tmp.0.join(NAME), b"#!/bin/sh\n").unwrap();
+        chmod(&tmp.0.join(NAME), 0o755);
+        let v = verify_dir(&tmp.0)
+            .expect("dir ok")
+            .verify_file(OsStr::new(NAME))
+            .expect("file ok");
+        let sha = v.sha256().expect("sha");
+        let hv = v
+            .verify_hash(&AllowedPluginHashes::from_digests([sha]))
+            .expect("allowed");
+        let e = hv.into_launch_target().expect_err("script rejected");
+        assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
+    }
+}

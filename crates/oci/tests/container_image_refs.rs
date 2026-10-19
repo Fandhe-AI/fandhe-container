@@ -252,6 +252,74 @@ fn oci7_create_then_delete_registers_and_releases_reference() {
     assert_eq!(containers_of(&images), vec![]);
 }
 
+/// OCI-7・TASK-183.8.2: 実在の `FileStateStore` で再起動時の照合を行うと、状態の無い参照だけが外れ、
+/// 状態のある参照と判定不能の参照は残る。
+#[test]
+fn oci7_reconcile_against_file_state_store_drops_stateless_refs() {
+    use fandhe_container_core::traits::{GetStateRequest, StateStore};
+    use fandhe_container_oci::image_management::ContainerStatePresence;
+
+    let tmp = Tmp::new("reconcile");
+    let bundle = tmp.sub("bundle");
+    make_bundle(&bundle);
+    let state = FileStateStore::open(
+        StateRoot::from_override(tmp.private_sub("state")).expect("state root"),
+    )
+    .expect("state store");
+    let images = ImageStore::open(&tmp.sub("images")).expect("image store");
+    images
+        .lock()
+        .expect("lock")
+        .register_manifest(
+            digest(MANIFEST),
+            ManifestComposition::new(
+                digest("sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"),
+                vec![],
+            )
+            .expect("comp"),
+        )
+        .expect("register manifest");
+    let refs = StoreRefs::new(&images);
+    let manifest = ImageManifestDigest::new(MANIFEST).expect("manifest");
+    let rec = OpRecorder::new();
+
+    create_with_image(
+        &state,
+        &rec,
+        ContainerImage::new(&refs, &manifest),
+        &CreateRequest::new(ContainerId::new("c-live").expect("id"), bundle).expect("req"),
+    )
+    .expect("create");
+    // クラッシュの名残（状態の無い参照）と、判定不能を模す参照。
+    for id in ["c-crashed", "c-unsure"] {
+        images
+            .register_container_ref(&ContainerRefId::new(id).expect("id"), &digest(MANIFEST))
+            .expect("register");
+    }
+
+    let r = images
+        .reconcile_container_refs(|id| {
+            if id.as_str() == "c-unsure" {
+                return ContainerStatePresence::Undetermined;
+            }
+            let Ok(cid) = ContainerId::new(id.as_str()) else {
+                return ContainerStatePresence::Undetermined;
+            };
+            match state.get(&GetStateRequest::new(cid)) {
+                Ok(_) => ContainerStatePresence::Present,
+                Err(e) if e.code() == ErrorCode::NotFound => ContainerStatePresence::Absent,
+                Err(_) => ContainerStatePresence::Undetermined,
+            }
+        })
+        .expect("reconcile");
+
+    let rid = |s: &str| ContainerRefId::new(s).expect("id");
+    assert_eq!(r.removed(), &[(rid("c-crashed"), digest(MANIFEST))]);
+    assert_eq!(r.kept_present(), &[rid("c-live")]);
+    assert_eq!(r.kept_undetermined(), &[rid("c-unsure")]);
+    assert_eq!(containers_of(&images), vec![rid("c-live"), rid("c-unsure")]);
+}
+
 /// OCI-7: 在庫に無いイメージの create は NotFound で、状態も参照も残らない。
 #[test]
 fn oci7_create_with_unknown_manifest_leaves_nothing() {

@@ -15,7 +15,7 @@
 //! 変更でき、永続化前はプロセスごとのメモリ上の別物である（契約と前提は `store` モジュールの doc）。
 //!
 //! 未実装（後続 issue の担当。実装済みを装わない。REPAIR-3）:
-//! - ディスクへの永続化・再起動時の照合（#853・#854・#851）
+//! - ディスクへの永続化（#851）。再起動時の照合 API は `reconcile` で実装済み（#854）。本番 probe と起動時の配線は未実装（#2315）
 //! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force` と実削除（untag・`remove_manifest`・非共有 blob の削除。TASK-183.6・#481）も
 //!   `remove` で実装済み（永続化・fsync・削除途中のクラッシュの再試行は #851、CLI 配線は未実装）
 //! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（CLI 経路と永続化は未実装）
@@ -36,6 +36,9 @@ use std::fmt;
 
 mod container_ref;
 pub use container_ref::{ContainerRefRegistration, ContainerRefRelease};
+
+mod reconcile;
+pub use reconcile::{ContainerRefReconciliation, ContainerStatePresence};
 
 mod remove;
 pub use remove::{

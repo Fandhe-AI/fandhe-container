@@ -412,6 +412,9 @@ mod linux {
         )
         .expect("create");
         real_entry::wait_single_thread();
+        // PID 1 の寿命タイマーは entry_init の開始から数えるため、基準点は start() の前で採る
+        // （start() の戻りが遅れても下限判定がフレークしない）。
+        let began = Instant::now();
         let started = match start(
             &store,
             &rec,
@@ -428,7 +431,6 @@ mod linux {
                 children_of_self()
             ),
         };
-        let began = Instant::now();
         let (_record, handle) = started.into_parts();
         let pid = handle.pid().get();
         let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

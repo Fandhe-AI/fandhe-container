@@ -11,9 +11,9 @@
 //! `list` は core の状態ストアを読んで stdout へタブ区切りで一覧を出し、`logs` は引数・ID・存在確認までを行う
 //! （TASK-79.3・#640。`list_logs` module）。ログ内容の読み出しは未実装で、対象が存在しても `UNIMPLEMENTED`（8）で
 //! 失敗する（REPAIR-3）。
-//! `image ls` / `system df` / `image rm [--force]` は oci の管理 API（`image_management`）を呼ぶ（#2221・CLI-1・OCI-7。`image` module）。
+//! `image ls` / `system df` / `image rm [--force]` / `image tag` は oci の管理 API（`image_management`）を呼ぶ（#2221・CLI-1・OCI-7。`image` module）。
 //! イメージストアの root は必須オプション `--image-root`。参照テーブルの永続化が oci 側で未実装のため、現状は `image ls` が
-//! 常にヘッダのみ・`image rm` が常に `NOT_FOUND` になる。既定 root・非 Linux の実行経路・`image tag` / `image prune` は未配線
+//! 常にヘッダのみ・`image rm` が常に `NOT_FOUND` になる。既定 root・非 Linux の実行経路・`image prune` は未配線
 //! （詳細は `image` module の doc。REPAIR-3）。
 //! `setup` は OS 固有設定のステップ提示で `setup` module にのみ委譲する（日常操作コマンドは OS 固有設定を持たない。TASK-80.1・CLI-2）。
 //! 終了コードは core の ERR-2 表（`OCI_EXIT_*`）に揃える。
@@ -85,7 +85,7 @@ pub enum Command {
     Delete,
     List,
     Logs,
-    /// イメージ管理（`image ls` / `image rm`。#2221・CLI-1・OCI-7。サブコマンドは `args::ImageArgs`）。
+    /// イメージ管理（`image ls` / `image rm` / `image tag`。#2221・#2316・CLI-1・OCI-7。サブコマンドは `args::ImageArgs`）。
     Image,
     /// システム情報（`system df`。#2221・CLI-1・OCI-7。サブコマンドは `args::SystemArgs`）。
     System,
@@ -479,6 +479,7 @@ mod tests {
             args(&["image", "ls"]),
             args(&["image", "ls", "--image-root", "rel"]),
             args(&["image", "rm", "x"]),
+            args(&["image", "tag", "x"]),
             args(&["system"]),
             args(&["system", "bogus"]),
             args(&["system", "df"]),

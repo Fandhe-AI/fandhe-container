@@ -160,7 +160,7 @@ fn launch_violation(step: PrePivotStep, token: &str) -> Option<ViolationReason> 
             .into_iter()
             .find(|r| r.as_str() == token),
         // 保護の適用失敗は、自分の段の理由だけを通す（段と理由の食い違いは `Malformed`。#2013）。
-        PrePivotStep::ReadonlyPaths | PrePivotStep::MaskedPaths => {
+        PrePivotStep::ReadonlyPaths | PrePivotStep::MaskedPaths | PrePivotStep::MountSysfs => {
             ViolationReason::PROTECTED_PATH_APPLY_REASONS
                 .into_iter()
                 .find(|r| r.as_str() == token && r.stage() == step.stage())
@@ -607,7 +607,7 @@ mod tests {
         for (i, s) in PrePivotStep::ALL.into_iter().enumerate() {
             assert_eq!(step_ordinal(s), i);
         }
-        assert_eq!(PrePivotStep::ALL.len(), 11);
+        assert_eq!(PrePivotStep::ALL.len(), 12);
     }
 
     /// 具体値の符号化（ワイヤー形式の固定。SEC-4・REPAIR-2）。
@@ -1006,6 +1006,14 @@ mod tests {
                 IsolationStage::MountMaskedPaths,
                 "failed to apply a masked path protection",
             ),
+            (
+                PrePivotStep::MountSysfs,
+                ViolationReason::SysfsApplyFailed,
+                ErrorCode::FailedPrecondition,
+                "sysfs_apply_failed",
+                IsolationStage::MountSysfs,
+                "failed to apply the read-only sysfs mount",
+            ),
         ] {
             let sink = VecSink::new(false);
             let r = resolve_pre_pivot_status(
@@ -1034,6 +1042,28 @@ mod tests {
             assert!(matches!(r.delivery, AuditDelivery::SinkFailed(_)));
             assert_eq!(r.error.code, code);
             assert_eq!(r.error.stage, stage);
+        }
+    }
+
+    /// 監査（SEC-4・SEC-2・#2020）: sysfs の適用失敗の理由は段 `mount_sysfs` でだけ許可リストを通り、
+    /// 他の段・他の保護の理由は段の食い違いとして落ちる（`launch_violation` は子と親で共有）。
+    #[test]
+    fn sec4_2020_sysfs_apply_reason_passes_only_at_its_own_step() {
+        let t = "sysfs_apply_failed";
+        assert_eq!(
+            launch_violation(PrePivotStep::MountSysfs, t),
+            Some(ViolationReason::SysfsApplyFailed)
+        );
+        for step in [
+            PrePivotStep::ReadonlyPaths,
+            PrePivotStep::MaskedPaths,
+            PrePivotStep::MountBinds,
+            PrePivotStep::PivotRoot,
+        ] {
+            assert_eq!(launch_violation(step, t), None, "{}", step.as_str());
+        }
+        for t in ["readonly_path_apply_failed", "masked_path_apply_failed"] {
+            assert_eq!(launch_violation(PrePivotStep::MountSysfs, t), None);
         }
     }
 

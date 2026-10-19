@@ -206,6 +206,21 @@ fn mount_sysfs_with<O: SysfsOps>(
     new_root: BorrowedFd<'_>,
     spec: &SysfsMountSpec,
 ) -> Result<SysfsReport, ExecError> {
+    // 区間の末尾で一度だけ `SysfsApplyFailed` を付け、状態 pipe で親へ届けて監査へ記録させる（SEC-4・#2020）。
+    // 対象の検査の拒否（symlink・shared 等）は既に自分の理由を持つため上書きしない。
+    mount_sysfs_inner(ops, new_root, spec).map_err(|e| {
+        e.or_violation(
+            ViolationReason::SysfsApplyFailed,
+            Some(Path::new(DESTINATION)),
+        )
+    })
+}
+
+fn mount_sysfs_inner<O: SysfsOps>(
+    ops: &O,
+    new_root: BorrowedFd<'_>,
+    spec: &SysfsMountSpec,
+) -> Result<SysfsReport, ExecError> {
     // 型が `ro,nosuid,nodev,noexec` を常に真にする。外す入口は無いが、不変条件を明示して退行を検出する。
     debug_assert!(spec.read_only() && spec.nosuid() && spec.nodev() && spec.noexec());
     let source = select_sysfs_source(ops.user_ns_inode()?);
@@ -479,6 +494,10 @@ mod tests {
                 "verify failed"
             )
         );
+        // 事後検証の失敗は専用の理由で子の状態 pipe 経由の監査へ届く（SEC-4・#2020）。
+        let v = err.violation.as_ref().expect("violation");
+        assert_eq!(v.reason, ViolationReason::SysfsApplyFailed);
+        assert_eq!(v.reason.as_str(), "sysfs_apply_failed");
     }
 
     /// SEC-1: 宛先が shared のマウント上なら何も載せずに拒否する。

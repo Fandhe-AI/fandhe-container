@@ -12,6 +12,12 @@
 //! `(dev, ino)` で 1 回だけ数える。起点と `st_dev` が違うディレクトリ（マウント点）には降りない。
 //! Docker の writable layer の差分容量とは定義が異なる。
 //!
+//! # 対応 OS
+//!
+//! Linux のみ。bundle 起点で固定 fd（openat・`O_NOFOLLOW`）により走査し、想定外の errno
+//! （EMFILE・EIO 等）は黙殺せず `Internal` で返す。その他の OS は `Unimplemented`（fd 起点の走査と
+//! Windows のファイル ID による重複排除が未実装のため。OCI-7・SEC-1）。
+//!
 //! # 呼び出し文脈と排他
 //!
 //! 読み取り専用。取るロックは `StateStore::list` の内部のものだけで、走査はロックの外で行う
@@ -24,19 +30,30 @@
 //! ディレクトリは全体を失敗させず `inaccessible_entries` に数える（過少計上は件数で示す）。
 //! 所有者専用の blob キャッシュを「過少計上せず失敗」とする oci 側とは前提が異なる。
 
+#[cfg(target_os = "linux")]
 use std::collections::BTreeSet;
+#[cfg(target_os = "linux")]
 use std::fs::{self, Metadata};
+#[cfg(target_os = "linux")]
 use std::io::ErrorKind;
+#[cfg(target_os = "linux")]
 use std::num::NonZeroU32;
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "linux")]
 use crate::oci_runtime::load_config;
-use crate::traits::{ErrorCode, ListStateRequest, MAX_PAGE_SIZE, StateStore, TraitError};
+#[cfg(not(target_os = "linux"))]
+use crate::traits::ErrorCode;
+#[cfg(target_os = "linux")]
+use crate::traits::{ErrorCode, ListStateRequest, MAX_PAGE_SIZE};
+use crate::traits::{StateStore, TraitError};
 
 /// 走査するエントリ数の上限（無制限の走査と集合の膨張を避ける。超えたら失敗）。
 pub const MAX_CONTAINER_SCAN_ENTRIES: usize = 16_777_216;
 
 /// 一覧のページ送りの上限回数（`StateStore` の応答が終わらない場合の保護。REPAIR-5）。
+#[cfg(target_os = "linux")]
 const MAX_LIST_PAGES: usize = 100_000;
 
 /// コンテナ領域の使用容量。件数は「数えられなかった・降りなかった」ものを示し、黙った過少計上を防ぐ。
@@ -67,6 +84,20 @@ fn terr(code: ErrorCode, msg: &'static str) -> TraitError {
 ///
 /// `list` の失敗（破損レコードの fail-closed を含む）はそのまま返す。走査が
 /// [`MAX_CONTAINER_SCAN_ENTRIES`] を超えたら `FailedPrecondition`。
+///
+/// Linux 以外は `Unimplemented`。検証した実体を固定して走査する手段（fd 起点の openat）と、ハードリンクの
+/// 識別子（Windows のファイル ID）による重複排除を未実装のため、異なる意味の値を正常結果として返さない
+/// （OCI-7・SEC-1。将来仕様は platform 層で fd 起点の走査と識別子の取得を足す）。
+#[cfg(not(target_os = "linux"))]
+pub fn measure_container_usage(_store: &dyn StateStore) -> Result<ContainerDiskUsage, TraitError> {
+    Err(terr(
+        ErrorCode::Unimplemented,
+        "container usage measurement is only supported on Linux",
+    ))
+}
+
+/// `store` の全コンテナの bundle・rootfs の使用容量を計測する（読み取り専用。Linux 実装）。
+#[cfg(target_os = "linux")]
 pub fn measure_container_usage(store: &dyn StateStore) -> Result<ContainerDiskUsage, TraitError> {
     // Linux の走査は固定 fd を `/proc/self/fd/N` で読む。procfs が無ければ黙って過少計上せず失敗させる。
     #[cfg(target_os = "linux")]
@@ -93,6 +124,7 @@ pub fn measure_container_usage(store: &dyn StateStore) -> Result<ContainerDiskUs
     Err(terr(ErrorCode::FailedPrecondition, "too many list pages"))
 }
 
+#[cfg(target_os = "linux")]
 fn measure_bundles(count: usize, bundles: Vec<PathBuf>) -> Result<ContainerDiskUsage, TraitError> {
     let mut w = Walker::default();
     w.usage.count = count;
@@ -109,13 +141,14 @@ fn measure_bundles(count: usize, bundles: Vec<PathBuf>) -> Result<ContainerDiskU
                 w.usage.inaccessible_entries += 1;
                 continue;
             }
-            Err(_) => {
+            Err(e) if e.kind() == ErrorKind::NotFound => {
                 w.usage.missing_bundles += 1;
                 continue;
             }
+            Err(_) => return Err(terr(ErrorCode::Internal, "failed to stat bundle")),
         }
-        let rootfs = match load_config(&bundle.join("config.json")) {
-            Ok(cfg) => match rootfs_within_bundle(bundle, cfg.root().path()) {
+        let rootfs_rel = match load_config(&bundle.join("config.json")) {
+            Ok(cfg) => match rootfs_relative_to_bundle(bundle, cfg.root().path()) {
                 Some(p) => Some(p),
                 None => {
                     // bundle 外を指す root.path は走査しない（SEC-1。create 側と整合）。
@@ -128,24 +161,25 @@ fn measure_bundles(count: usize, bundles: Vec<PathBuf>) -> Result<ContainerDiskU
                 None
             }
         };
-        w.walk_root(bundle)?;
-        // rootfs は bundle 配下に限るため bundle の走査で数え済み。個別に歩くのは、bundle 側が
-        // マウント点として降りなかった rootfs を拾う Unix だけ（`(dev, ino)` で二重計上を防げる）。
-        // 非 Unix は識別子が無く重複を判定できないため、二度目の走査をしない（二重計上の防止）。
-        #[cfg(unix)]
-        if let Some(rootfs) = rootfs {
-            w.walk_root(&rootfs)?;
+        w.walk_root(bundle, None)?;
+        // rootfs は bundle 配下に限るが、bundle 側がマウント点として降りなかった rootfs を拾うため、
+        // bundle の固定 fd から 1 要素ずつ nofollow で開いて個別に歩く（`(dev, ino)` で二重計上を防ぐ）。
+        // 途中が symlink に差し替えられていたら bundle 外へ出うるため走査せず、計測不能として数える。
+        if let Some(rel) = rootfs_rel
+            && w.walk_root(bundle, Some(&rel))? == RootOutcome::Rejected
+        {
+            w.usage.unreadable_configs += 1;
         }
-        #[cfg(not(unix))]
-        let _ = rootfs;
     }
     Ok(w.usage)
 }
 
-/// `root.path` を bundle に結合し、bundle 配下に収まる場合だけ返す（SEC-1・OCI-7）。
-/// `..` 成分、および symlink 解決後に bundle の外へ出る経路は `None`（改ざん config.json による
-/// 任意ディレクトリの走査を防ぐ）。rootfs が未作成で解決できない場合は字句上のパスを返す。
-fn rootfs_within_bundle(bundle: &Path, root_path: &Path) -> Option<PathBuf> {
+/// `root.path` を bundle からの相対パスへ字句的に正規化する（SEC-1・OCI-7）。`..`・Windows 風の接頭辞・
+/// bundle 外の絶対パスは `None`（改ざん config.json による任意ディレクトリの走査を防ぐ）。
+/// symlink の検査はここでは行わない。走査側が bundle の固定 fd から各要素を `O_NOFOLLOW` で開くため、
+/// 検査と使用の間で解決が分かれない（TOCTOU 対策）。
+#[cfg(target_os = "linux")]
+fn rootfs_relative_to_bundle(bundle: &Path, root_path: &Path) -> Option<PathBuf> {
     use std::path::Component;
     if root_path
         .components()
@@ -153,36 +187,48 @@ fn rootfs_within_bundle(bundle: &Path, root_path: &Path) -> Option<PathBuf> {
     {
         return None;
     }
-    let joined = bundle.join(root_path);
-    let canon_bundle = fs::canonicalize(bundle).ok()?;
-    match fs::canonicalize(&joined) {
-        Ok(c) if c.starts_with(&canon_bundle) => Some(joined),
-        Ok(_) => None,
-        Err(_) => joined.starts_with(bundle).then_some(joined),
+    let rel = if root_path.is_absolute() {
+        root_path.strip_prefix(bundle).ok()?
+    } else {
+        root_path
+    };
+    let mut out = PathBuf::new();
+    for c in rel.components() {
+        if let Component::Normal(n) = c {
+            out.push(n);
+        }
     }
+    Some(out)
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn identity(m: &Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     Some((m.dev(), m.ino()))
 }
-#[cfg(not(unix))]
-fn identity(_: &Metadata) -> Option<(u64, u64)> {
-    None
-}
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn nlink(m: &Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     m.nlink()
 }
-#[cfg(not(unix))]
-fn nlink(_: &Metadata) -> u64 {
-    1
+
+/// 起点を固定 fd で開いた結果（`walk_root` の戻り値）。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootOutcome {
+    /// 走査した（訪問済みで飛ばした場合を含む）。
+    Walked,
+    /// 起点・途中の要素が存在しない（rootfs 未作成など）。
+    Missing,
+    /// 起点・途中の要素が symlink・非ディレクトリ（差し替えの可能性）。走査しない。
+    Rejected,
+    /// 権限不足（`inaccessible_entries` に数え済み）。
+    Denied,
 }
 
 /// 全コンテナで共有する走査状態（訪問済みディレクトリとハードリンクの集合を跨いで持つ）。
+#[cfg(target_os = "linux")]
 #[derive(Default)]
 struct Walker {
     usage: ContainerDiskUsage,
@@ -190,6 +236,7 @@ struct Walker {
     seen_links: BTreeSet<(u64, u64)>,
 }
 
+#[cfg(target_os = "linux")]
 impl Walker {
     fn tick(&mut self) -> Result<(), TraitError> {
         self.usage.entries_scanned += 1;
@@ -237,57 +284,99 @@ impl Walker {
         }
     }
 
-    /// 起点ディレクトリから深さ優先で歩く（再帰なし・symlink は辿らない）。
+    /// `parent` 起点（`None` なら絶対パス）で `name` を nofollow の固定 fd として開く。
+    ///
+    /// 想定済みの失敗（不在・symlink／非ディレクトリへの差し替え・権限不足）は `Err(RootOutcome)` で
+    /// 返し、権限不足は `inaccessible_entries` に数える。それ以外の errno（EMFILE・ENFILE・EIO 等）と
+    /// 非対応は黙殺せず構造化エラーで返す（過少計上を成功として返さない。OCI-7）。
+    fn open_pinned(
+        &mut self,
+        parent: Option<std::os::fd::BorrowedFd<'_>>,
+        name: &std::ffi::CStr,
+    ) -> Result<Result<std::os::fd::OwnedFd, RootOutcome>, TraitError> {
+        use crate::sys::{self, SysError};
+        match sys::open_dir_path_nofollow(parent, name) {
+            Ok(fd) => Ok(Ok(fd)),
+            Err(SysError::Os(e)) if e == sys::ENOENT => Ok(Err(RootOutcome::Missing)),
+            Err(SysError::Os(e)) if e == sys::ELOOP || e == sys::ENOTDIR => {
+                Ok(Err(RootOutcome::Rejected))
+            }
+            Err(SysError::Os(e)) if e == sys::EACCES => {
+                self.usage.inaccessible_entries += 1;
+                Ok(Err(RootOutcome::Denied))
+            }
+            Err(SysError::Unsupported) => Err(terr(
+                ErrorCode::Unimplemented,
+                "pinned directory open is not supported",
+            )),
+            Err(_) => Err(terr(ErrorCode::Internal, "failed to open directory")),
+        }
+    }
+
+    /// 固定 fd の実体を `/proc/self/fd/N` で stat する。消えた（NotFound）は `None`、権限不足は
+    /// 数えて `None`、それ以外（procfs の異常を含む）は構造化エラー。
+    fn stat_fd(&mut self, fd: &std::os::fd::OwnedFd) -> Result<Option<Metadata>, TraitError> {
+        match fs::metadata(fd_path(fd)) {
+            Ok(m) => Ok(Some(m)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                self.usage.inaccessible_entries += 1;
+                Ok(None)
+            }
+            Err(_) => Err(terr(ErrorCode::Internal, "failed to stat pinned directory")),
+        }
+    }
+
+    /// `bundle` を起点（`rel` があれば、そこから 1 要素ずつ nofollow で開いた先）として深さ優先で歩く
+    /// （再帰なし・symlink は辿らない）。
     ///
     /// Linux では各ディレクトリを `O_PATH|O_DIRECTORY|O_NOFOLLOW` の fd で固定し、子は親 fd 起点で
-    /// 開く。走査中にコンテナ側がディレクトリを symlink へ差し替えても、固定済みの実体だけを読む
-    /// （TOCTOU 対策。SEC-1・OCI-7）。起点が存在しない・ディレクトリでない・訪問済みなら何もしない。
+    /// 開く。検証と使用でパスを解決し直さないため、走査中や検証後にコンテナ側がディレクトリを symlink へ
+    /// 差し替えても、固定済みの実体だけを読む（TOCTOU 対策。SEC-1・OCI-7）。
     /// procfs（`/proc/self/fd`）が無い環境では呼び出し側（[`measure_container_usage`]）が事前に失敗させる。
-    #[cfg(target_os = "linux")]
-    fn walk_root(&mut self, root: &Path) -> Result<(), TraitError> {
+    fn walk_root(&mut self, bundle: &Path, rel: Option<&Path>) -> Result<RootOutcome, TraitError> {
         use std::ffi::CString;
         use std::os::fd::{AsFd, OwnedFd};
         use std::os::unix::ffi::OsStrExt;
         use std::rc::Rc;
 
-        use crate::sys::{self, SysError};
-
-        let Ok(croot) = CString::new(root.as_os_str().as_bytes()) else {
-            return Ok(());
+        let Ok(cbundle) = CString::new(bundle.as_os_str().as_bytes()) else {
+            return Ok(RootOutcome::Rejected);
         };
-        let root_fd = match sys::open_dir_path_nofollow(None, &croot) {
+        let mut root_fd = match self.open_pinned(None, &cbundle)? {
             Ok(fd) => fd,
-            Err(SysError::Os(e)) if e == sys::EACCES => {
-                self.usage.inaccessible_entries += 1;
-                return Ok(());
-            }
-            // 不在・symlink・非ディレクトリ（ENOENT・ENOTDIR 等）は何もしない。
-            Err(_) => return Ok(()),
+            Err(o) => return Ok(o),
         };
-        let Ok(root_meta) = fs::metadata(fd_path(&root_fd)) else {
-            return Ok(());
+        if let Some(rel) = rel {
+            for comp in rel.components() {
+                let Ok(c) = CString::new(comp.as_os_str().as_bytes()) else {
+                    return Ok(RootOutcome::Rejected);
+                };
+                root_fd = match self.open_pinned(Some(root_fd.as_fd()), &c)? {
+                    Ok(fd) => fd,
+                    Err(o) => return Ok(o),
+                };
+            }
+        }
+        let Some(root_meta) = self.stat_fd(&root_fd)? else {
+            return Ok(RootOutcome::Missing);
         };
         let root_id = identity(&root_meta);
         if let Some(id) = root_id
             && !self.visited_dirs.insert(id)
         {
-            return Ok(());
+            return Ok(RootOutcome::Walked);
         }
         // 未処理の子ディレクトリ。親 fd を共有して保持し、子は取り出す時に開く（開いたままの fd 数は深さに比例）。
         let mut pending: Vec<(Rc<OwnedFd>, CString)> = Vec::new();
         self.scan_dir(&Rc::new(root_fd), &mut pending)?;
         while let Some((parent, name)) = pending.pop() {
-            let fd = match sys::open_dir_path_nofollow(Some(parent.as_fd()), &name) {
-                Ok(fd) => fd,
-                Err(SysError::Os(e)) if e == sys::EACCES => {
-                    self.usage.inaccessible_entries += 1;
-                    continue;
-                }
-                // 差し替えられた（symlink・非ディレクトリ）・消えた子は辿らない。
-                Err(_) => continue,
+            // 差し替えられた（symlink・非ディレクトリ）・消えた子は辿らない。権限不足は数える。
+            let Ok(fd) = self.open_pinned(Some(parent.as_fd()), &name)? else {
+                continue;
             };
             // 固定した fd 自身の実体で dev / ino を判定する（パスを引き直さない）。
-            let Ok(m) = fs::metadata(fd_path(&fd)) else {
+            let Some(m) = self.stat_fd(&fd)? else {
                 continue;
             };
             if !self.should_descend(&m, root_id) {
@@ -295,11 +384,10 @@ impl Walker {
             }
             self.scan_dir(&Rc::new(fd), &mut pending)?;
         }
-        Ok(())
+        Ok(RootOutcome::Walked)
     }
 
     /// 固定済みのディレクトリ fd 1 つの直下を読み、通常ファイルを加算し、子ディレクトリを `pending` へ積む。
-    #[cfg(target_os = "linux")]
     fn scan_dir(
         &mut self,
         dfd: &std::rc::Rc<std::os::fd::OwnedFd>,
@@ -349,67 +437,6 @@ impl Walker {
         }
         Ok(())
     }
-
-    /// 起点ディレクトリから深さ優先で歩く（再帰なし・symlink は辿らない）。Linux 以外の fd 起点 API を
-    /// 使わない経路で、検査後にパスを解決し直す（Linux では固定 fd で行うため差し替え競合を避けている。
-    /// 非 Linux は暫定。OCI-7）。起点が存在しない・ディレクトリでない・訪問済みなら何もしない。
-    #[cfg(not(target_os = "linux"))]
-    fn walk_root(&mut self, root: &Path) -> Result<(), TraitError> {
-        let Ok(meta) = fs::symlink_metadata(root) else {
-            return Ok(());
-        };
-        if !meta.is_dir() {
-            return Ok(());
-        }
-        let root_id = identity(&meta);
-        if let Some(id) = root_id
-            && !self.visited_dirs.insert(id)
-        {
-            return Ok(());
-        }
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let rd = match fs::read_dir(&dir) {
-                Ok(rd) => rd,
-                Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                    self.usage.inaccessible_entries += 1;
-                    continue;
-                }
-                Err(_) => return Err(terr(ErrorCode::Internal, "failed to read directory")),
-            };
-            for ent in rd {
-                let ent = match ent {
-                    Ok(e) => e,
-                    Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                    Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                        self.usage.inaccessible_entries += 1;
-                        continue;
-                    }
-                    Err(_) => return Err(terr(ErrorCode::Internal, "failed to read entry")),
-                };
-                self.tick()?;
-                let path = ent.path();
-                let m = match fs::symlink_metadata(&path) {
-                    Ok(m) => m,
-                    Err(e) if e.kind() == ErrorKind::NotFound => continue,
-                    Err(e) if e.kind() == ErrorKind::PermissionDenied => {
-                        self.usage.inaccessible_entries += 1;
-                        continue;
-                    }
-                    Err(_) => return Err(terr(ErrorCode::Internal, "failed to stat entry")),
-                };
-                if m.is_dir() {
-                    if self.should_descend(&m, root_id) {
-                        stack.push(path);
-                    }
-                } else if m.is_file() {
-                    self.account_file(&m)?;
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 /// fd が指す実体を `/proc/self/fd/N` 経由で引くパス（パス文字列は再解決されない）。
@@ -418,8 +445,7 @@ fn fd_path(fd: &std::os::fd::OwnedFd) -> PathBuf {
     use std::os::fd::AsRawFd;
     PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd()))
 }
-
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::traits::{

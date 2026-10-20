@@ -44,7 +44,7 @@
 //!
 //! 未実装（将来仕様と対応ビヘイビア ID）:
 //! - 本番 `ProcessLauncher` による再 launch の実機での成立（結線は済み〔[`crate::restart::LauncherRelauncher`]〕だが、単一スレッドの要求を満たせず拒否される。#2043・SUP-3）。
-//! - 明示的な停止（`stop`）の検知と異常終了の区別、停止シグナル・猶予時間、再 launch 時の `unless-stopped` と `always` の差（SUP-9）。
+//! - 停止シグナルの猶予時間（#517）と、再 launch 時の `unless-stopped` と `always` の差（「明示 stop 済み」の state.json への持続化を要する。SUP-9・SUP-3）。明示 stop の意図は制御チャネルが [`StopToken::mark_explicit_stop`] で立てる（#2162）。
 //! - 指数バックオフ等の高度な間隔制御（現状は固定のバックオフ。SUP-3）。
 //! - [`MonitorOutcome::ExitedUnrecorded`] の回復（SUP-3）。
 //!
@@ -155,11 +155,39 @@ impl Default for MonitorConfig {
     }
 }
 
+/// [`StopToken::mark_explicit_stop`] の記録結果（SUP-9・#2162）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExplicitStopRecord {
+    /// この呼び出しで初めて意図を立てた。
+    NewlyRecorded,
+    /// 既に別の呼び出しが意図を立てていた。
+    AlreadyRecorded,
+}
+
+/// 明示 stop の意図の状態（[`StopToken::explicit_stop_state`]。SUP-9・#2162）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExplicitStopState {
+    /// 意図は立っていない。
+    NotRequested,
+    /// 明示 stop の意図が立っている。
+    Requested,
+}
+
 /// 監視ループを有限時間で止めるための取り消しトークン（複製して共有できる）。
 ///
-/// テストと将来の停止経路（SUP 系）が使う。
+/// 2 つの独立したフラグを持つ。
+///
+/// - 停止要求（[`Self::request_stop`]）: 監視を打ち切る。[`monitor`] が読み、呼び出し側の terminate（即時の SIGKILL）へ進む。
+/// - 明示 stop の意図（[`Self::mark_explicit_stop`]。SUP-9・#2162）: 制御チャネルの StopRequest が、シグナルを送る前に
+///   立てる。監視は止めず（[`monitor`] は読まない）、restart の判定（[`crate::restart::supervise_with_restart`]）だけが
+///   読んで、その後の終了を再起動の対象から外す。
 #[derive(Debug, Clone, Default)]
-pub struct StopToken(Arc<AtomicBool>);
+pub struct StopToken {
+    stop: Arc<AtomicBool>,
+    explicit: Arc<AtomicBool>,
+}
 
 impl StopToken {
     /// 停止要求のないトークンを作る。
@@ -169,12 +197,36 @@ impl StopToken {
 
     /// 停止を要求する。
     pub fn request_stop(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.stop.store(true, Ordering::SeqCst);
     }
 
     /// 停止が要求済みか。
     pub fn is_stop_requested(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// 明示 stop の意図を立て、直前の状態を返す。監視は止めない（[`Self::request_stop`] との違い）。
+    pub fn mark_explicit_stop(&self) -> ExplicitStopRecord {
+        if self.explicit.swap(true, Ordering::SeqCst) {
+            ExplicitStopRecord::AlreadyRecorded
+        } else {
+            ExplicitStopRecord::NewlyRecorded
+        }
+    }
+
+    /// 明示 stop の意図の状態を返す。
+    pub fn explicit_stop_state(&self) -> ExplicitStopState {
+        if self.explicit.load(Ordering::SeqCst) {
+            ExplicitStopState::Requested
+        } else {
+            ExplicitStopState::NotRequested
+        }
+    }
+
+    /// 明示 stop の意図を戻す。直前が `false` だったときに立てた分を、シグナルの送信失敗で取り消すために使う
+    /// （別の成功した stop の意図は消さない。呼び出し側が直前の値で判断する）。
+    pub(crate) fn revert_explicit_stop(&self) {
+        self.explicit.store(false, Ordering::SeqCst);
     }
 }
 
@@ -723,6 +775,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SUP-9・#2162: 明示 stop の意図は停止要求と独立で、複製と共有され、直前の値を返す。
+    #[test]
+    fn sup9_explicit_stop_flag_is_independent_and_shared() {
+        let t = StopToken::new();
+        let c = t.clone();
+        assert_eq!(t.explicit_stop_state(), ExplicitStopState::NotRequested);
+        assert_eq!(c.mark_explicit_stop(), ExplicitStopRecord::NewlyRecorded);
+        assert_eq!(t.explicit_stop_state(), ExplicitStopState::Requested);
+        assert_eq!(c.mark_explicit_stop(), ExplicitStopRecord::AlreadyRecorded);
+        assert!(!t.is_stop_requested());
+        t.revert_explicit_stop();
+        assert_eq!(c.explicit_stop_state(), ExplicitStopState::NotRequested);
+        c.request_stop();
+        assert!(t.is_stop_requested());
+        assert_eq!(t.explicit_stop_state(), ExplicitStopState::NotRequested);
+    }
     use std::sync::Mutex;
     use std::sync::atomic::AtomicU32;
 

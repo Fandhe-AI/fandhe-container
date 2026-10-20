@@ -19,7 +19,7 @@
 //!
 //! `begin_pull` はストアの排他区間（[`ImageStore::lock`]）の内側でロックファイルの作成とロックまでを済ませる。
 //! 本 GC も判定（ロックの試行）とリースの解放を同じ排他区間で行うため、「作成途中でまだロックされていない」
-//! ロックファイルを見て誤って回収することはない。`remove_dir_all` も排他区間を保持したまま行う。手放すと別の GC が
+//! ロックファイルを見て誤って回収することはない。回収の削除も排他区間を保持したまま行う。手放すと別の GC が
 //! 同じ残骸を回収対象に確定し、先行の削除後に `begin_pull` が同 ID で作った新しいステージングを遅れて消すため。
 //! `abort` / `publish` も自分のステージングの削除が終わるまで排他を保持する。
 //!
@@ -30,9 +30,18 @@
 //! ディレクトリである前提で、ロックファイルは symlink を辿らず、unix では開いた後に dev / inode を照合して
 //! 差し替えを検出する（`store` の `@lock` と同じ）。
 //!
-//! 既知の残り（いずれも「余分に残す」側）: `abort` が排他の取得に失敗するとリースはメモリに残るがステージングは
-//! 消えるため、本 GC はその pull ID を見つけられない（プロセス終了で消える）。`@pull.lock` を持たない
-//! （#852 より前に作られた）ステージングは回収されない。
+//! `abort` は排他を取れなければステージングを消さずエラーを返す（残骸は本 GC が回収し、メモリに残ったリースも
+//! 解放する）。
+//!
+//! # 回収の順序（部分削除・クラッシュ後の再試行）
+//!
+//! 生存判定の証跡である `@pull.lock` は最後に消す。他の子エントリを先に消し、1 つでも失敗したら `@pull.lock` を
+//! 残して失敗として返す（次回も同じ判定で再試行できる）。`@pull.lock` を消した後にクラッシュ・`rmdir` 失敗が
+//! あっても、空のディレクトリは `begin_pull` の排他区間の外では「作成途中」にならない（作成はストア排他の内側）ため、
+//! 排他下で見た空ディレクトリは不在として回収する。
+//!
+//! 既知の残り（「余分に残す」側）: `@pull.lock` を持たない（#852 より前に作られた）空でないステージングは
+//! 回収されない。
 //!
 //! 未実装（REPAIR-3）: 起動時の呼び出しの配線と結果のログ出力は、cri・core と oci の両方に依存するアダプタの
 //! 担当（#2315）。ここでは新しい操作種別を増やさず、結果を構造化された戻り値で返す。
@@ -91,7 +100,7 @@ impl StalePullRecovery {
 /// pull 1 件の判定。`Absent` だけがロックを持ったまま回収へ進む。
 enum PullLiveness {
     Live,
-    Absent(File),
+    Absent(Option<File>),
     Undetermined,
 }
 
@@ -100,6 +109,13 @@ fn probe_pull(dir: &std::path::Path) -> PullLiveness {
     let lock_path = dir.join(PULL_LOCK_FILE_NAME);
     let pre = match fs::symlink_metadata(&lock_path) {
         Ok(m) if m.is_file() => m,
+        // 回収の途中で `@pull.lock` を消した後に落ちた残骸。排他下の空ディレクトリは不在とみなす。
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return match fs::read_dir(dir).map(|mut r| r.next().is_none()) {
+                Ok(true) => PullLiveness::Absent(None),
+                _ => PullLiveness::Undetermined,
+            };
+        }
         _ => return PullLiveness::Undetermined,
     };
     // Windows の LockFileEx は読み書き権限が要る。作成はしない（無ければ確認できない扱い）。
@@ -126,9 +142,54 @@ fn probe_pull(dir: &std::path::Path) -> PullLiveness {
     #[cfg(not(unix))]
     let _ = (&pre, &post);
     match file.try_lock() {
-        Ok(()) => PullLiveness::Absent(file),
+        Ok(()) => PullLiveness::Absent(Some(file)),
         Err(TryLockError::WouldBlock) => PullLiveness::Live,
         Err(TryLockError::Error(_)) => PullLiveness::Undetermined,
+    }
+}
+
+/// 回収対象と確定したステージングを消す。`@pull.lock` は最後に消し、それ以前に失敗したら残して返す
+/// （部分削除の後も次回の判定・再試行ができるように。モジュール doc「回収の順序」）。
+fn reclaim_dir(dir: &std::path::Path) -> Result<(), OciErrorCode> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(OciErrorCode::Internal),
+    };
+    let mut failed = false;
+    for ent in rd {
+        let Ok(ent) = ent else {
+            failed = true;
+            continue;
+        };
+        if ent.file_name() == PULL_LOCK_FILE_NAME {
+            continue;
+        }
+        let path = ent.path();
+        let is_dir = fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
+        let r = if is_dir {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        match r {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => failed = true,
+        }
+    }
+    if failed {
+        return Err(OciErrorCode::Internal);
+    }
+    match fs::remove_file(dir.join(PULL_LOCK_FILE_NAME)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(OciErrorCode::Internal),
+    }
+    match fs::remove_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(OciErrorCode::Internal),
     }
 }
 
@@ -167,7 +228,7 @@ impl ImageStore {
     fn recover_stale_pulls_inner(&self) -> Result<StalePullRecovery, OciError> {
         let mut result = StalePullRecovery::default();
         let staging = self.root().join(STAGING_DIR_NAME);
-        let mut absent: Vec<(PullId, File)> = Vec::new();
+        let mut absent: Vec<(PullId, Option<File>)> = Vec::new();
 
         let mut guard = self.lock()?;
         match fs::symlink_metadata(&staging) {
@@ -223,10 +284,9 @@ impl ImageStore {
             // Windows は開いたハンドルがディレクトリ削除を妨げるため、先に閉じる。
             drop(file);
             let dir = staging.join(id.as_str());
-            match fs::remove_dir_all(&dir) {
+            match reclaim_dir(&dir) {
                 Ok(()) => result.reclaimed.push(id),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => result.reclaimed.push(id),
-                Err(_) => result.failed.push((id, OciErrorCode::Internal)),
+                Err(code) => result.failed.push((id, code)),
             }
         }
         drop(guard);
@@ -568,8 +628,8 @@ mod tests {
         fs::set_permissions(&sub, fs::Permissions::from_mode(0o500)).unwrap();
         let (store, rec) = recorded_store(&root);
         let r = store.recover_stale_pulls().unwrap();
-        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
         if r.failed().is_empty() {
+            // root 等で削除できた場合は skip（`sub` は既に無い可能性があるため権限は戻さない）。
             return;
         }
         assert_eq!(r.failed(), &[(pid("p1"), OciErrorCode::Internal)]);
@@ -577,5 +637,23 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].outcome(), crate::instrument::OciOpOutcome::Failure);
         assert_eq!(s[0].error_code(), Some(OciErrorCode::Internal));
+        // 証跡の `@pull.lock` は残り、権限を戻した後の再試行で回収できる。
+        assert!(dir.join(PULL_LOCK_FILE_NAME).exists());
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+        let r2 = store.recover_stale_pulls().unwrap();
+        assert_eq!(r2.reclaimed(), &[pid("p1")]);
+        assert!(!dir.exists());
+    }
+
+    /// OCI-7: `@pull.lock` を消した後に落ちた空のステージングも回収される。
+    #[test]
+    fn oci7_recover_reclaims_empty_staging_dir() {
+        let root = Root::new("emptydir");
+        let dir = root.staging().join("p1");
+        fs::create_dir_all(&dir).unwrap();
+        let store = ImageStore::open(&root.0).unwrap();
+        let r = store.recover_stale_pulls().unwrap();
+        assert_eq!(r.reclaimed(), &[pid("p1")]);
+        assert!(!dir.exists());
     }
 }

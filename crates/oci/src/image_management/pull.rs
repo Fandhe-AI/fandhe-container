@@ -769,7 +769,8 @@ impl PullSession<'_> {
     /// 呼び出し側の明示的な中断。自分のリースを解放し、ステージングを削除する。
     ///
     /// ロックを取れない（Timeout・毒化）場合はリースが残り（余分に残す側。#852・#477 が回収）、
-    /// ステージングは削除したうえでそのエラーを返す。
+    /// ステージングも削除せずそのエラーを返す（同 ID を再利用した新しい pull を遅れて消さないため。
+    /// 残骸は回収 GC が拾う）。
     pub fn abort(mut self) -> Result<PullAbortOutcome, OciError> {
         let store = self.store;
         record_oci_op(store.recorder(), OciOpKind::AbortPull, || {
@@ -779,18 +780,26 @@ impl PullSession<'_> {
 
     fn abort_inner(&mut self) -> Result<PullAbortOutcome, OciError> {
         // 削除が終わるまでストア排他を保持し、回収 GC・begin_pull による同 ID の再利用と交差させない（OCI-7）。
-        let mut guard = self.store.lock();
-        let released = guard
-            .as_mut()
-            .map(|g| g.release_all_leases(&self.id).len())
-            .map_err(|e| e.clone());
+        // 排他を取れなければステージングは消さない。排他なしで消すと、回収 GC が先に残骸を回収して
+        // `begin_pull` が同 ID を再利用した後に、遅れた abort が新しい生存中の pull のディレクトリを
+        // 消しうるため（OCI-7「余分に残す方向にのみ誤る」）。残骸は pull_lock の解放後に GC が回収する。
+        let mut guard = match self.store.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                self.leased.clear();
+                self.verified.clear();
+                self.pull_lock.take();
+                return Err(e);
+            }
+        };
+        let released = guard.release_all_leases(&self.id).len();
         self.leased.clear();
         self.verified.clear();
         self.pull_lock.take();
         let staging = self.remove_staging();
         drop(guard);
-        released.map(|released_leases| PullAbortOutcome {
-            released_leases,
+        Ok(PullAbortOutcome {
+            released_leases: released,
             staging,
         })
     }
@@ -2222,9 +2231,10 @@ mod tests {
         );
     }
 
-    /// ロックを取れない abort は Timeout を返し、リースは残るがステージングは消える（余分に残す側）。
+    /// ロックを取れない abort は Timeout を返し、リースもステージングも残る（余分に残す側）。
+    /// 続く回収 GC がその残骸とリースを回収する。
     #[test]
-    fn oci7_abort_under_lock_timeout_keeps_lease_but_removes_staging() {
+    fn oci7_abort_under_lock_timeout_keeps_lease_and_staging() {
         let root = Root::new("abort-timeout");
         let cached = sha_of(b"cached-layer");
         fs::write(root.blob(&cached), b"cached-layer").unwrap();
@@ -2238,6 +2248,11 @@ mod tests {
         assert_eq!(s.abort().unwrap_err().code(), OciErrorCode::Timeout);
         drop(held);
         assert_eq!(leases(&store, &cached), vec![pid("p1")]);
+        assert!(staged.exists());
+        let store = store.with_timeout(std::time::Duration::from_secs(5));
+        let r = store.recover_stale_pulls().unwrap();
+        assert_eq!(r.reclaimed(), &[pid("p1")]);
         assert!(!staged.exists());
+        assert!(leases(&store, &cached).is_empty());
     }
 }

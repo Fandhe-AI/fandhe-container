@@ -26,20 +26,32 @@
 //!   code と終了コードは list のものを保つ。ID・パスは出さない。list はページごとにストア全体を走査する
 //!   （効率化は規模が課題になった時点で扱う）。
 //!
-//! # logs の判定表（fail-closed。実装済みを装わない。REPAIR-3）
+//! # logs の出力と判定表（fail-closed。CLI-1・SUP-7・#1543）
+//!
+//! 読み出しは supervisor の `logs::read_container_log` が担い、本 module は状態ルートからログのディレクトリ
+//! （`<state_root>/@container-logs`）を決めて呼び、stdout へ渡すだけにする。stdout には古い世代から現在ログの順に、
+//! ファイルのバイト列をそのまま出す（`stdout ` / `stderr ` のタグと LF を残す）。コンテナの出力は CLI の stderr へ
+//! 出さない（stderr は失敗時の 1 行 JSON の契約。ERR-1・ERR-2）。
+//!
+//! 端末制御文字はエスケープしない。ログはコンテナ利用者のデータで、docker / kubectl と同じく加工しないためである。
+//! 端末へ直接出すと ESC 系のシーケンスが解釈され得るので、信頼できないコンテナのログは `| cat -v` 等を通して見ること
+//! （エスケープ表示のオプションは未提供）。
 //!
 //! | 条件 | 結果 |
 //! | ---- | ---- |
 //! | ID の文字種違反 | 2（`INVALID_ARGUMENT`） |
 //! | 状態ルートの親が無い | 3（`NOT_FOUND`。文言は `parent of the state root not found`） |
 //! | 状態ルートを開けない（非 Linux は plugin 解決の失敗） | core のコードどおり（非 Linux は候補なしで 5、他は 8 / 6） |
-//! | 対象の状態レコードが無い | 3（`NOT_FOUND`） |
-//! | 対象が存在する | 8（`UNIMPLEMENTED`。stdout には何も出さない） |
+//! | 対象の状態レコードが無い | 3（`NOT_FOUND`。`container not found`） |
+//! | ログが無い（ディレクトリが無い・ファイルが 0 件・0 バイト） | 0（stdout は空） |
+//! | ログがある | 0（stdout はレコード列） |
+//! | ログを読めない（名前空間に受理できない名前・symlink・権限・I/O エラー） | 1（`INTERNAL`。`container log could not be read`） |
+//! | 世代の入れ替わりが収まらない | 9（`UNAVAILABLE`。`container log is rotating; retry`） |
+//! | 読む量の上限を超えた | 5（`FAILED_PRECONDITION`。`container log exceeds the read limit`） |
+//! | stdout への書き込みに失敗した | 1（`INTERNAL`） |
 //!
 //! 未実装・簡易実装（REPAIR-3）:
-//! - logs の内容読み出し: コンテナログのディレクトリ契約が未決で、書き手（supervisor への stdout / stderr 受け渡し。
-//!   #1471・本番 launcher #1314）も未提供。読み出しの正規入口は supervisor 側にあり、`cli -> supervisor` の依存辺は
-//!   #1718 で `docs/architecture.md` に確定したが、ログの読み出し契約は未決。確定後に実装する（CLI-1）。
+//! - logs の `--follow` / `--tail` / ストリーム別出力 / エスケープ表示: 未提供（CLI-1 の拡張）。
 //! - list の JSON 出力・bundle 列: JSON を手組みしない（REPAIR-2）ため serde 系の配線か core の公開ライタが前提
 //!   （TASK-95・TASK-98）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4）。非 Linux では状態ストアを開けず core 側が
@@ -53,6 +65,10 @@ use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::traits::{
     ContainerId, ErrorCode, GetStateRequest, ListStateRequest, MAX_PAGE_SIZE, StateRecord,
     StateStore, TraitError,
+};
+
+use fandhe_container_supervisor::logs::{
+    LogReadFailure, container_log_dir, container_log_rotation_config, read_container_log,
 };
 
 use super::CliExit;
@@ -195,8 +211,18 @@ pub(super) fn run_list(global: &GlobalArgs, _args: &ListArgs, stdout: &mut dyn W
     }
 }
 
-/// 本番入口の `logs`。ログ内容の読み出しは未実装のため、対象が存在しても `UNIMPLEMENTED` で失敗する（REPAIR-3）。
-pub(super) fn run_logs(global: &GlobalArgs, args: &LogsArgs) -> CliExit {
+/// `logs` のコンテナログ読み出しの失敗を終了値へ写す。ログ側の `NotFound` は「コンテナ不在」ではないため
+/// `Internal` へ寄せる（`container not found` と誤報しない。出力に core のメッセージ・パスは流さない。ERR-1）。
+fn log_read_failure(f: &LogReadFailure) -> CliExit {
+    match f {
+        LogReadFailure::Output => CliExit::failed(ErrorCode::Internal),
+        LogReadFailure::Source(e) => CliExit::container_log_failed(e.code()),
+    }
+}
+
+/// 本番入口の `logs`。対象の存在を確かめ、supervisor の読み出し入口でコンテナログを古い順に stdout へ出す
+/// （CLI-1・SUP-7・#1543）。ログが無ければ何も出さず成功する。
+pub(super) fn run_logs(global: &GlobalArgs, args: &LogsArgs, stdout: &mut dyn Write) -> CliExit {
     let started = Instant::now();
     let prepared = production_runtime(global, OpRecorder::new(), "logs", started, || {
         ContainerId::new(args.id.as_str())
@@ -205,10 +231,19 @@ pub(super) fn run_logs(global: &GlobalArgs, args: &LogsArgs) -> CliExit {
         Ok(v) => v,
         Err(e) => return store_open_failure(&e),
     };
-    // 計測は最終結果（未実装を含む）から 1 回だけ決める。存在確認が通っても未実装で終わるため Failure（REPAIR-4）。
     let exit = match container_exists(rt.store.as_ref(), &id) {
-        Ok(()) => CliExit::unimplemented(),
         Err(e) => CliExit::failed(e.code()),
+        Ok(()) => match rt.store.host_state_root() {
+            // `FileStateStore` では起きない防御。ログの置き場が決められなければ読めない（fail-closed）。
+            None => CliExit::unimplemented(),
+            Some(root) => {
+                let dir = container_log_dir(root);
+                match read_container_log(&dir, &id, container_log_rotation_config(), stdout) {
+                    Ok(_) => CliExit::Success,
+                    Err(f) => log_read_failure(&f),
+                }
+            }
+        },
     };
     record_op(
         &rt.recorder,

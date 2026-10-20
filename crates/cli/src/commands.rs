@@ -8,9 +8,9 @@
 //! `stop` / `delete` は core の `oci_runtime::kill`（SIGTERM）/ `delete` を直接呼ぶ（TASK-79.2.2・#867。`stop_delete` module）。
 //! `stop` の本番 `ProcessSignaler` は supervisor の制御チャネル経由（`stop_delete::production_signaler`。#2059・SEC-1）で、
 //! supervisor に届かなければ構造化エラー（UNAVAILABLE 等）で失敗する。非 Linux は `UNIMPLEMENTED`（8）で fail-closed（REPAIR-3）。
-//! `list` は core の状態ストアを読んで stdout へタブ区切りで一覧を出し、`logs` は引数・ID・存在確認までを行う
-//! （TASK-79.3・#640。`list_logs` module）。ログ内容の読み出しは未実装で、対象が存在しても `UNIMPLEMENTED`（8）で
-//! 失敗する（REPAIR-3）。
+//! `list` は core の状態ストアを読んで stdout へタブ区切りで一覧を出し、`logs` は存在確認の後に supervisor の
+//! `logs::read_container_log` でコンテナログ（`<state_root>/@container-logs`）を古い順に stdout へ出す
+//! （TASK-79.3・#640・#1543。`list_logs` module）。
 //! `image ls` / `system df` / `image rm [--force]` / `image tag` は oci の管理 API（`image_management`）を呼ぶ（#2221・CLI-1・OCI-7。`image` module）。
 //! イメージストアの root は必須オプション `--image-root`。参照テーブルの永続化が oci 側で未実装のため、現状は `image ls` が
 //! 常にヘッダのみ・`image rm` が常に `NOT_FOUND` になる。既定 root・非 Linux の実行経路・`image prune` は未配線
@@ -27,7 +27,7 @@
 //! 将来仕様（本実装の範囲外）:
 //! - start: ランチャー経由の特権起動の選択（#1719・#1722）。
 //! - stop の猶予 → SIGKILL（#1545）・stop の意図の伝達（SUP-9）・`kill` コマンド（#1902。`production_signaler` を共用）。
-//! - logs の内容読み出し・list の JSON 出力: ログ契約と crate 境界の決定後（`list_logs` module の doc 参照。TASK-95・TASK-98）。
+//! - list の JSON 出力: serde 系の配線か core の公開ライタが前提（`list_logs` module の doc 参照。TASK-95・TASK-98）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・#641・PLUG-4。`plugin_backend` module）。発見 → 登録 → 信頼性検証までを
 //!   配線済みで、platform-* へは直接依存しない（`make check-cli-backend-deps`）。非 Linux の信頼性検証（PLUG-11）・plugin の
 //!   起動と RPC（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-125）は未実装のため、非 Linux の全コマンドは候補なしで `FAILED_PRECONDITION`（5）、
@@ -230,6 +230,22 @@ impl CliExit {
         CliExit::Error(CliError::new(code, STATE_STORE_CORRUPTED_MESSAGE))
     }
 
+    /// `logs` のコンテナログ読み出しの失敗（#1543・CLI-1・SUP-7）。`code` は supervisor の読み出しが返したもの
+    /// （`Internal` / `Unavailable` / `FailedPrecondition`）で、終了コードはそれに従う。文言は固定表のみ。
+    /// ログ側の `NotFound` は「コンテナ不在」と誤報しないよう、呼び出し側で `Internal` へ寄せてから渡す。
+    pub(crate) fn container_log_failed(code: ErrorCode) -> Self {
+        let message = match code {
+            ErrorCode::Unavailable => CONTAINER_LOG_ROTATING_MESSAGE,
+            ErrorCode::FailedPrecondition => CONTAINER_LOG_LIMIT_MESSAGE,
+            _ => CONTAINER_LOG_UNREADABLE_MESSAGE,
+        };
+        let code = match code {
+            ErrorCode::Unavailable | ErrorCode::FailedPrecondition => code,
+            _ => ErrorCode::Internal,
+        };
+        CliExit::Error(CliError::new(code, message))
+    }
+
     /// プロセスの終了コード。
     pub fn exit_code(&self) -> u8 {
         match self {
@@ -271,6 +287,9 @@ const STATE_ROOT_PARENT_NOT_FOUND_MESSAGE: &str = "parent of the state root not 
 /// 回復手段（core の `purge_corrupted`）を管理操作名で示す。通常ファイルの entry や中身のある state.json ディレクトリは core が FailedPrecondition で拒否するため、拒否時は管理者による確認・手動回復を促す（core の削除防御は維持）。CLI に purge サブコマンドは無い（実在しない名を案内しない）。
 const STATE_STORE_CORRUPTED_MESSAGE: &str = "state store has a corrupted record; recover it with the purge_corrupted management operation, or if that is refused, ask an administrator to inspect and repair it manually";
 const UNIMPLEMENTED_MESSAGE: &str = "command is not implemented yet";
+const CONTAINER_LOG_UNREADABLE_MESSAGE: &str = "container log could not be read";
+const CONTAINER_LOG_ROTATING_MESSAGE: &str = "container log is rotating; retry";
+const CONTAINER_LOG_LIMIT_MESSAGE: &str = "container log exceeds the read limit";
 
 /// [`CliExit::failed`] の固定文言表。引用符・バックスラッシュ・制御文字を含まない定数のみ（テストで固定）。
 /// `ErrorCode` は `#[non_exhaustive]` のため、未知のコードは汎用文言に落とす。
@@ -335,7 +354,7 @@ pub fn run_to<I: IntoIterator<Item = OsString>>(args: I, stdout: &mut dyn Write)
             Err(_) => usage(),
         },
         Command::Logs => match parse_logs(tail) {
-            Ok(a) => list_logs::run_logs(&global, &a),
+            Ok(a) => list_logs::run_logs(&global, &a, stdout),
             Err(_) => usage(),
         },
         Command::Image => match parse_image(tail) {
@@ -875,7 +894,8 @@ mod tests {
             assert_eq!(o.stderr, "");
         }
 
-        /// CLI-1・ERR-2・REPAIR-3: logs は未作成で NOT_FOUND（3）、作成済みでも内容読み出し未実装で UNIMPLEMENTED（8）。
+        /// CLI-1・SUP-7・ERR-2: logs は未作成で NOT_FOUND（3）、作成済みでログが無ければ空の成功（0）、
+        /// 世代をまたぐログは古い順にバイト単位で出る。symlink の世代は INTERNAL（1）の固定文言。
         #[test]
         fn cli1_run_logs_on_linux() {
             let base = TmpDir::new("logs");
@@ -891,12 +911,34 @@ mod tests {
 
             create_ok(&base, "c1");
             let o = invoke(&root, &["logs", "c1"]);
-            assert_eq!(o.exit, 8);
+            assert_eq!((o.exit, o.stdout.as_str(), o.stderr.as_str()), (0, "", ""));
+
+            let dir = fandhe_container_supervisor::logs::container_log_dir(&root);
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::create_dir_all(&dir).expect("logdir");
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod");
+            }
+            std::fs::write(dir.join("c1.log.2"), b"stdout a\n").expect("g2");
+            std::fs::write(dir.join("c1.log.1"), b"stderr b\n").expect("g1");
+            std::fs::write(dir.join("c1.log"), b"stdout c\x1b[0m\n").expect("cur");
+            std::fs::write(dir.join("c1.log.lock"), b"").expect("lock");
+            let o = invoke(&root, &["logs", "c1"]);
+            assert_eq!(o.exit, 0);
+            assert_eq!(o.stdout, "stdout a\nstderr b\nstdout c\x1b[0m\n");
+            assert_eq!(o.stderr, "");
+
+            std::fs::remove_file(dir.join("c1.log.1")).expect("rm");
+            std::fs::write(dir.join("target"), b"secret\n").expect("target");
+            std::os::unix::fs::symlink(dir.join("target"), dir.join("c1.log.1")).expect("link");
+            let o = invoke(&root, &["logs", "c1"]);
+            assert_eq!(o.exit, 1);
+            assert_eq!(o.stdout, "");
             assert_eq!(
                 o.stderr,
-                "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n"
+                "{\"code\":\"INTERNAL\",\"message\":\"container log could not be read\"}\n"
             );
-            assert_eq!(o.stdout, "");
 
             let o = invoke(&root, &["logs", "a/b"]);
             assert_eq!(o.exit, 2);

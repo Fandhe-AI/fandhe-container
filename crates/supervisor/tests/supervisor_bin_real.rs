@@ -545,7 +545,7 @@ mod linux {
         );
         assert!(no_probe_remains(), "no probe process may remain");
         // コンテナの出力が捕捉されてログ sink のファイルに残る（SUP-7）。
-        let logs = env.root().join("logs");
+        let logs = fandhe_container_supervisor::logs::container_log_dir(&env.root());
         let captured = std::fs::read_dir(&logs)
             .expect("log directory")
             .flatten()

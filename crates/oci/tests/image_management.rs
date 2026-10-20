@@ -57,8 +57,8 @@ fn oci7_shared_blob_lifecycle_through_public_api() {
 
     // pull リースは参照の無い blob も保護する。
     assert!(!t.blob_references(&d(0x99)).is_referenced());
-    assert!(t.acquire_lease(d(0x99), pull.clone()).newly_added);
-    assert!(!t.acquire_lease(d(0x99), pull.clone()).newly_added);
+    assert!(t.acquire_lease(d(0x99), pull.clone()).unwrap().newly_added);
+    assert!(!t.acquire_lease(d(0x99), pull.clone()).unwrap().newly_added);
     assert_eq!(t.blob_references(&d(0x99)).leases, vec![pull.clone()]);
     assert!(t.blob_references(&d(0x99)).is_referenced());
 

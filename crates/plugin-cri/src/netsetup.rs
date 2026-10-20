@@ -350,6 +350,15 @@ fn not_found_netns() -> TraitError {
     )
 }
 
+/// 取り残しがある間はネットワーク削除を拒否する失敗（契約 9。bridge による所有証明を保つ）。
+fn delete_blocked_by_unreclaimed() -> TraitError {
+    TraitError::new(
+        ErrorCode::FailedPrecondition,
+        "network has containers with unreclaimed resources from a failed attach; \
+         the network is kept so they stay provably owned; manual reclaim required",
+    )
+}
+
 /// ネットワーク削除でほかの資源は解放したが、取り残しの記録が残るときの失敗（契約 9）。
 fn delete_incomplete(count: usize) -> TraitError {
     TraitError::new(
@@ -564,6 +573,11 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let reg = &mut *guard;
         let name = req.name().as_str();
         let network = reg.networks.get_mut(name).ok_or_else(not_found_network)?;
+        // 取り残しの veth は bridge への master で自分のものと証明される。bridge を消すと証明を失い
+        // 二度と回収できないため、取り残しが残る間はバックエンドを呼ばず何も解放しない（記録も保持）。
+        if !network.backend_deleted && network_has_unreclaimed(&reg.containers, name) {
+            return Err(delete_blocked_by_unreclaimed());
+        }
         // 以降は成功して記録ごと消えるまで、失敗しても deleting を保つ（部分削除済みのまま再利用させない）。
         network.deleting = true;
         let linked: Vec<String> = reg

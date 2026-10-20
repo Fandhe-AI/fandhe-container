@@ -519,10 +519,10 @@ fn contract6_leftover_attach_keeps_record_and_blocks_cleanup() {
     );
 }
 
-/// 契約 9: 取り残しのコンテナがあっても delete_network は所有確認できる資源の解放を続行し、
-/// 取り残しの記録を保持して Internal を返す。再試行はバックエンドを再度呼ばない。
+/// 契約 9: 取り残しのコンテナがあるネットワークは削除しない（bridge の所有証明を保つ）。
+/// バックエンドを呼ばず何も解放せず、再試行しても同じ結果で、記録は残る。
 #[test]
-fn contract9_delete_continues_past_unreclaimed_container() {
+fn contract9_delete_blocked_while_unreclaimed_container_remains() {
     let fake = Fake::default();
     let net = NetsetupNetwork::new(fake.clone());
     net.create_network(&CreateNetworkRequest::new(nname("a"), subnet()))
@@ -540,18 +540,12 @@ fn contract9_delete_continues_past_unreclaimed_container() {
     }
     net.attach(&AttachRequest::new(nname("a"), cid("c2")))
         .expect_err("attach c2 fails");
-    let e = net
-        .delete_network(&DeleteNetworkRequest::new(nname("a")))
-        .expect_err("delete");
-    assert_eq!(e.code(), ErrorCode::Internal);
-    assert_eq!(
-        fake.calls().last().map(String::as_str),
-        Some("delete_network a [c1]")
-    );
     let before = fake.calls().len();
-    let e = net
-        .delete_network(&DeleteNetworkRequest::new(nname("a")))
-        .expect_err("retry");
-    assert_eq!(e.code(), ErrorCode::Internal);
-    assert_eq!(fake.calls().len(), before, "backend is not called twice");
+    for _ in 0..2 {
+        let e = net
+            .delete_network(&DeleteNetworkRequest::new(nname("a")))
+            .expect_err("delete blocked");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(fake.calls().len(), before, "backend is not called");
+    }
 }

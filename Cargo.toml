@@ -52,6 +52,7 @@ undocumented_unsafe_blocks = "deny"
 # ureq / rustls / rustls-graviola / rustls-native-certs（#399・TASK-51.hdep1。crates/oci のレジストリクライアント用）。
 # tonic-prost-build / protox（#425・TASK-56.hdep1。build 時のみ）・tonic / tonic-prost / prost（#425。crates/cri の実行時依存。TASK-56.4）・
 # tokio（#425 のオーナー判断 2026-10-10 で承認、workspace への追加は #453・TASK-108.1。crates/plugin の feature `grpc` のみ）・hyper-util（#425 の承認、追加は #454・TASK-108.2。同 feature のみ）。
+# toml（#582・TASK-149.hdep1。crates/stack の独自 TOML スタック定義用。追加は #583・TASK-149.1）。
 # workspace 内 crate の path 依存は外部クレートの追加ではない（TASK-111.1・#262・PLUG-3。core の optional 依存用）。
 [workspace.dependencies]
 fandhe-container-plugin = { path = "crates/plugin" }
@@ -116,6 +117,10 @@ tar = { version = "=0.4.46", default-features = false }
 # YAML（CDI spec。GPU-1・TASK-126.1）。承認: Issue #540（2026-10-10）。配置は crates/gpu と crates/compose-convert に限り core には入れない。
 # default-features を無効化し deserialize のみ有効にする。パースは from_str_with_options で Budget を明示し duplicate_keys: Error を維持する。
 serde-saphyr = { version = "=1.3.0", default-features = false, features = ["deserialize"] }
+# 独自 TOML スタック定義の parse / serialize（STACK-1・CLI-4）。承認: Issue #582・TASK-149.hdep1（オーナー判断 2026-10-10）。追加は #583・TASK-149.1。
+# 配置は crates/stack（crates/compose-convert は必要になったときに限る）。`unbounded` は有効にせず既定の再帰上限 80 を保つ（深いネストによる DoS への備え）。
+# crates.io 上の版は `1.1.8+spec-1.1.0` で、`=1.1.8` で一致する。
+toml = { version = "=1.1.8", default-features = false, features = ["std", "serde", "parse", "display"] }
 
 # 依存クレート（workspace メンバー以外）のデバッグ情報を行番号のみにする。
 # ローカルの `target/` は依存グラフ全体（tonic / prost・protox・objc2 系等）の full debuginfo が

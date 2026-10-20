@@ -474,12 +474,32 @@ impl AuditFileWriter {
         timeout: Duration,
     ) -> Result<(), AuditWriteError> {
         let _turn = self.lock_exclusive(queue, Instant::now() + timeout)?;
-        let result = match &self.dir {
+        let result = self.check_fsize_room().and_then(|()| match &self.dir {
             Some(dir) => probe_scratch_write(dir),
             None => Err(AuditWriteError::new(AuditWriteErrorKind::Write)),
-        };
+        });
         let _ = self.file.unlock();
         result
+    }
+
+    /// 既存ログに 1 レコード分の追記余地があるか、継承した `RLIMIT_FSIZE` の soft と照合する
+    /// (一時ファイルの書き込みでは、ログ固有の上限到達を検出できないため。SEC-4・#2027)。読めなければ `Write`。
+    #[cfg(target_os = "linux")]
+    fn check_fsize_room(&self) -> Result<(), AuditWriteError> {
+        let write_err = || AuditWriteError::new(AuditWriteErrorKind::Write);
+        let (soft, _hard) = crate::sys::get_rlimit_self(crate::rlimits::RlimitKind::Fsize)
+            .map_err(|_| write_err())?;
+        let len = self.file.metadata().map_err(|_| write_err())?.len();
+        if fits_fsize_limit(len, soft) {
+            Ok(())
+        } else {
+            Err(write_err())
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn check_fsize_room(&self) -> Result<(), AuditWriteError> {
+        Ok(())
     }
 
     /// プロセス内の順番待ち → `flock` のポーリングの順に、共通の `deadline` までに排他を取る。
@@ -536,37 +556,64 @@ impl AuditFileWriter {
     }
 }
 
-/// `dir` の信頼検査済み fd 経由で一時ファイルを作り、直ちに unlink してから 1 バイトを書いて `sync_data` する
-/// (共有ログに触れない書き込み可能性の確認。[`AuditFileWriter::probe_append`])。
+/// `dir` の信頼検査済み fd 配下に **名前を持たない** 一時ファイル(`O_TMPFILE`)を作り、1 バイトを書いて
+/// `sync_data` する(共有ログに触れない書き込み可能性の確認。[`AuditFileWriter::probe_append`])。
+///
+/// 名前が一度も付かないため、確認の途中で子が SIGKILL されても残骸は残らない(作成と unlink の間の窓が無い)。
+/// `O_TMPFILE` に対応しない FS・カーネル(`EOPNOTSUPP`・`EISDIR`・`EINVAL`)では確認できないとして
+/// `Unsupported` で失敗する(名前付きファイルへ落とすと残骸の窓が戻るため。fail-closed)。
 #[cfg(target_os = "linux")]
 fn probe_scratch_write(dir: &Path) -> Result<(), AuditWriteError> {
+    let mut scratch = open_unnamed_scratch(dir)?;
+    scratch
+        .write_all(b"\n")
+        .map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Write))?;
+    scratch
+        .sync_data()
+        .map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Sync))
+}
+
+/// `dir`(信頼検査つきで辿る)の FS に無名の一時ファイルを作って返す。
+#[cfg(target_os = "linux")]
+fn open_unnamed_scratch(dir: &Path) -> Result<File, AuditWriteError> {
     use std::fs::OpenOptions;
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let write_err = || AuditWriteError::new(AuditWriteErrorKind::Write);
-    let flags = crate::sys::nofollow_nonblock_open_flags()
+    let flag = crate::sys::tmpfile_open_flag()
         .ok_or_else(|| AuditWriteError::new(AuditWriteErrorKind::Unsupported))?;
     let parent_fd = open_trusted_parent(dir)?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    let name = format!(".audit-probe-{}-{nanos}", std::process::id());
-    let via_fd =
-        std::path::PathBuf::from(format!("/proc/self/fd/{}", parent_fd.as_raw_fd())).join(name);
-    let mut scratch = OpenOptions::new()
+    // 最終要素は検査済みの親ディレクトリ自身(`/proc/self/fd/N` は magic link で、O_NOFOLLOW は付けない。
+    // `O_TMPFILE` は無名ファイルを作るだけで、既存ファイルを開かない)。
+    let via_fd = std::path::PathBuf::from(format!("/proc/self/fd/{}", parent_fd.as_raw_fd()));
+    OpenOptions::new()
         .write(true)
-        .create_new(true)
         .mode(0o600)
-        .custom_flags(flags)
+        .custom_flags(flag)
         .open(&via_fd)
-        .map_err(|_| write_err())?;
-    // 名前を先に消す(以降に子が打ち切られても残らない)。消せなければ残骸を避けるため失敗にする。
-    std::fs::remove_file(&via_fd).map_err(|_| write_err())?;
-    scratch.write_all(b"\n").map_err(|_| write_err())?;
-    scratch
-        .sync_data()
-        .map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Sync))
+        .map_err(|e| {
+            // EOPNOTSUPP(95)・EISDIR(21: O_TMPFILE を知らない古いカーネル)・EINVAL(22)。
+            let unsupported = matches!(e.raw_os_error(), Some(95 | 21 | 22));
+            AuditWriteError::new(if unsupported {
+                AuditWriteErrorKind::Unsupported
+            } else {
+                AuditWriteErrorKind::Write
+            })
+        })
+}
+
+/// 既存ログの長さ `len` に最大 1 レコード(先頭の LF を含む [`AUDIT_LINE_MAX_BYTES`] + 1)を足しても、継承した
+/// ファイルサイズ制限 `soft`(`RLIMIT_FSIZE` の soft。`u64::MAX` は無制限)に収まるか。
+/// 収まらなければ実際の追記は `EFBIG`(または `SIGXFSZ`)になる(SEC-4・#2027)。
+#[cfg(target_os = "linux")]
+fn fits_fsize_limit(len: u64, soft: u64) -> bool {
+    if soft == u64::MAX {
+        return true;
+    }
+    let record = u64::try_from(AUDIT_LINE_MAX_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    len.saturating_add(record) <= soft
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -902,6 +949,61 @@ mod tests {
         }
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-4・#2027: 継承したファイルサイズ制限に 1 レコード分の余地が無ければ失敗し、あれば(無制限を含め)通る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2027_fsize_limit_is_checked_against_existing_log_length() {
+        let record = AUDIT_LINE_MAX_BYTES as u64 + 1;
+        assert!(fits_fsize_limit(0, u64::MAX));
+        assert!(fits_fsize_limit(u64::MAX - 1, u64::MAX));
+        assert!(fits_fsize_limit(100, 100 + record));
+        assert!(!fits_fsize_limit(101, 100 + record));
+        assert!(!fits_fsize_limit(0, record - 1));
+        assert!(!fits_fsize_limit(u64::MAX, 1 << 40));
+    }
+
+    /// SEC-4・#2027: `probe_append` は実際の `RLIMIT_FSIZE` の soft を読んで照合する(現在値の下で空のログは通る)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2027_probe_reads_inherited_fsize_limit() {
+        let (soft, _) = crate::sys::get_rlimit_self(crate::rlimits::RlimitKind::Fsize).unwrap();
+        let dir = std::env::temp_dir().join(format!("fc-probe-fsize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut w = AuditFileWriter::open(&dir.join("audit.log")).unwrap();
+        // 現在の制限で、空のログには余地がある(無制限または十分大きい)ことだけを確かめる。
+        assert_eq!(w.check_fsize_room().is_ok(), fits_fsize_limit(0, soft));
+        w.probe_append().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-4・REPAIR-5・#2027: 書き込み確認の一時ファイルは名前を持たない(`O_TMPFILE`)。開いている間もディレクトリには
+    /// 何も現れず、確認の途中で SIGKILL されても残骸の窓が無い。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_repair5_probe_scratch_is_unnamed_while_open() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fc-probe-tmpfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        match open_unnamed_scratch(&dir) {
+            Ok(mut scratch) => {
+                scratch.write_all(b"\n").unwrap();
+                assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+            }
+            // この FS が O_TMPFILE に対応しない環境では fail-closed の `Unsupported` になる。
+            Err(e) => assert_eq!(e.kind(), AuditWriteErrorKind::Unsupported),
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

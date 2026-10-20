@@ -6,7 +6,7 @@
 //! `create` は core を直接呼ぶ（TASK-79.2.1・#866）。`start` は supervisor の bin を起動して結果を期限付きで受け取る（#1718。supervisor が core の本番 launcher で起動する。rootless のみ）。
 //! `stop` / `delete` は TASK-79.2.2、`list` は状態ストアから一覧を出し、`logs` は存在確認の後に supervisor の読み出し入口でコンテナログを出す（TASK-79.3・#640・#1543）。
 //! [`error`] は ERR-1 の構造化エラー型と stderr 出力（TASK-95.1・#649）。各コマンドの終了経路（`commands::CliExit`）へ配線済み（TASK-95.2・#650）。
-//! `setup` は OS 固有設定の要求ステップを提示する（TASK-80.1・CLI-2。検出・適用は未実装。日常操作コマンドからは到達しない。TASK-80.2）。
+//! `setup` は OS 固有設定の要求ステップを提示する（TASK-80.1・CLI-2。Linux は rootful の特権ランチャーのインストール手順の表示のみ〔#1722〕。検出・適用は未実装。日常操作コマンドからは到達しない。TASK-80.2）。
 //! `signals` は親が受けた SIGINT・SIGTERM・SIGHUP を起動中の plugin へ転送してから終了する（#1513・PLUG-7。unix のみ）。
 //! それ以外は雛形のまま実装がない（TASK-1.3・REPAIR-1）。
 //! 本体は G6（TASK-79〜98 の一部。crate の中核成果物は TASK-79〔基本コマンド〕・TASK-95〔エラー形式〕）で

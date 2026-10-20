@@ -26,7 +26,9 @@
 //! - `image prune` 本体は `prune` モジュールで実装済み（#476）。`rm`・`prune` の CLI 配線（#476・#480・#481）。`image ls`/`system df` の集計 API は
 //!   `usage`（#478・TASK-183.3）で実装済み（staging の容量・コンテナ容量の受け口・展開後サイズの二段階 API は #2222。CLI 経路は未実装）
 //! - pull のリース登録・ステージング書き込み（#474・TASK-183.9）と、公開・失敗時のロールバック
-//!   （#475・TASK-183.10）は `pull` で実装済み（cri からの配線は未実装）
+//!   （#475・TASK-183.10）は `pull` で実装済み（cri からの配線は未実装）。クラッシュで残った pull の
+//!   リース・ステージングの回収 GC は `pull_recovery`（`recover_stale_pulls`。#852・TASK-183.11.2）で
+//!   実装済み（起動時の呼び出しの配線は未実装・#2315）
 //! - コンテナ参照以外（manifest・タグ・リース）の件数上限は永続化と合わせて判断する（コンテナ参照は
 //!   `MAX_CONTAINER_REFS` で上限済み）。タグは `MAX_TAG_REFS` で書き込み側が検査済み（#2316）
 //!
@@ -78,9 +80,12 @@ pub use usage::{
 
 mod pull;
 pub use pull::{
-    BlobReuse, LeasedBlob, MAX_PUBLISH_TAGS, PullAbortOutcome, PullPublishOutcome,
-    PullPublishRequest, PullSession, StagingCleanup,
+    BlobReuse, LeasedBlob, MAX_PUBLISH_TAGS, PULL_LOCK_FILE_NAME, PullAbortOutcome,
+    PullPublishOutcome, PullPublishRequest, PullSession, StagingCleanup,
 };
+
+mod pull_recovery;
+pub use pull_recovery::StalePullRecovery;
 
 mod tag;
 pub use tag::{ImageTagChange, ImageTagOutcome, ImageTagSource, MAX_TAG_REFS};
@@ -158,7 +163,7 @@ impl fmt::Display for ContainerRefId {
 }
 
 /// 進行中の `pull` の識別子（検証済みの不透明値）。新規の生成は `PullId::generate`
-/// （`<pid>-<UNIX 時刻ナノ秒>-<連番>`。#474）。クラッシュ後の回収の判断は #852。
+/// （`<pid>-<UNIX 時刻ナノ秒>-<連番>`。#474）。クラッシュ後の回収は PID ではなくステージングのロックファイルで判定する（#852）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PullId(String);
 

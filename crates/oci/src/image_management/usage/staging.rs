@@ -97,6 +97,10 @@ pub(super) fn scan_staging(root: &Path) -> Result<StagingUsage, OciError> {
                     ));
                 }
             };
+            // 生存確認用のロックファイル（#852）は blob ではないので数えない。
+            if f.file_name() == super::super::pull::PULL_LOCK_FILE_NAME && m.is_file() {
+                continue;
+            }
             if m.is_file() {
                 usage.file_count += 1;
                 usage.bytes = add(usage.bytes, m.len())?;
@@ -156,6 +160,26 @@ mod tests {
                 pulls: 2,
                 file_count: 3,
                 bytes: 345,
+                foreign_entries: 0
+            }
+        );
+    }
+
+    /// OCI-7: `@pull.lock`（#852）は file_count・bytes・foreign_entries のいずれにも入らない。
+    #[test]
+    fn oci7_staging_ignores_pull_lock_file() {
+        let r = Root::new("lockfile");
+        let s = r.0.join("staging");
+        fs::create_dir_all(s.join("p1")).unwrap();
+        fs::write(s.join("p1").join("@pull.lock"), vec![0u8; 9]).unwrap();
+        fs::write(s.join("p1").join("aa"), vec![0u8; 10]).unwrap();
+        let u = scan_staging(&r.0).unwrap();
+        assert_eq!(
+            u,
+            StagingUsage {
+                pulls: 1,
+                file_count: 1,
+                bytes: 10,
                 foreign_entries: 0
             }
         );

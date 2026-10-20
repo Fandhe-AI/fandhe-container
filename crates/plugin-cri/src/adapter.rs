@@ -3,7 +3,7 @@
 //!
 //! 呼び出し元: 将来は `main.rs` の `Run`（サーバーの起動。TASK-114.3 以降の #459・#849・#850）が
 //! [`CriPluginBackends::production`] で組み立て、[`CriPluginBackends::runtime_service`] で
-//! `fandhe-container-cri` の `CriRuntimeService` を得る。現状 `main.rs` はまだ呼ばない（REPAIR-3）。
+//! `fandhe-container-cri` の `CriRuntimeService` を得る。`main.rs` の `Serve`（`--socket`）が `server::serve` で UDS＋gRPC にサーブする（#849）。
 //!
 //! 依存の向きは plugin-cri → cri・core の一方向で、core・cri から plugin-cri への辺は無い（CRI-7）。
 //! [`CriPluginBackends`] は trait object だけを持ち、具象型を型として露出しない。
@@ -157,7 +157,7 @@ impl CriPluginBackends {
         &self.recorder
     }
 
-    /// 実行層を接続した `CriRuntimeService` を作る。serve はしない（起動は #459 以降）。
+    /// 実行層を接続した `CriRuntimeService` を作る。サーブは `server::serve` が担う（#849）。
     ///
     /// CRI 側の計測は共有記録器（[`Self::op_recorder`]）へ `cri.*` の操作名で記録する。
     pub fn runtime_service(&self, bundles: Arc<dyn BundleProvider>) -> CriRuntimeService {

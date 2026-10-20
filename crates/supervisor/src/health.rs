@@ -6,6 +6,9 @@
 //! # 実装範囲の線引き（REPAIR-3）
 //! - 提供するもの: 判定結果を書く [`record_health`]、判定処理の拡張点 [`HealthProbe`]、
 //!   fail-closed のスタブ [`UnimplementedHealthProbe`]、1 回分の判定と記録をつなぐ [`probe_and_record`]。
+//! - 周期実行は [`probe_aggregate_and_record`]（retries・start_period の集約を通して書く。TASK-161.3・#496）と
+//!   [`record_starting`]（開始時の `Starting`）を使う。[`probe_and_record`] は 1 回分の素の判定と記録で、
+//!   Err で即降格・同じ値でも毎回書く従来の挙動を保つ。集約の経路は Err でも `Healthy` を retries まで保つ。
 //! - **未実装**: healthcheck コマンドの実行、`monitor` ループからの呼び出し（周期実行は `crate::healthcheck::run_periodic`・#495）。
 //!   将来は TASK-161（SUP-4）が exec と共通のコードパス（TASK-163・SUP-6）で [`HealthProbe`] を実装し、
 //!   監視ループの生存確認の周回（`crate::run::monitor` の手順 3）から周期的に [`probe_and_record`] を呼ぶ。
@@ -140,11 +143,27 @@ pub enum Demotion {
 pub struct ProbeFailure {
     error: TraitError,
     demotion: Demotion,
+    record_error: Option<TraitError>,
 }
 
 impl ProbeFailure {
     fn new(error: TraitError, demotion: Demotion) -> Self {
-        Self { error, demotion }
+        Self {
+            error,
+            demotion,
+            record_error: None,
+        }
+    }
+
+    /// 判定の失敗と記録の失敗が重なったとき、記録側のエラーも保持する（破棄しない。SUP-4）。
+    fn with_record_error(mut self, record_error: TraitError) -> Self {
+        self.record_error = Some(record_error);
+        self
+    }
+
+    /// 判定が失敗し、集約結果の記録も失敗した場合の記録側のエラー（[`Self::error`] は判定側）。
+    pub fn record_error(&self) -> Option<&TraitError> {
+        self.record_error.as_ref()
     }
 
     /// 失敗の原因（判定側のエラー・事前検証の失敗・記録の失敗）。
@@ -428,6 +447,120 @@ pub fn probe_and_record(
             Err(ProbeFailure::new(e, demotion))
         }
     }
+}
+
+/// 周期実行（`crate::healthcheck::run_periodic`）が probe の結果から書く値を決める閉包。
+///
+/// 引数は probe の結果と最新レコードの `health`、戻り値は書くべき `health`（集約は `crate::healthcheck::HealthAggregator`）。
+pub type HealthDecider<'a> =
+    &'a mut dyn FnMut(&Result<HealthStatus, TraitError>, Option<HealthStatus>) -> HealthStatus;
+
+/// `probe` を 1 回実行し、結果を `decide`（retries・start_period の集約）に通してから書く（TASK-161.3・#496・SUP-4）。
+///
+/// [`probe_and_record`] との違い: probe の結果をそのまま書かず、1 回の失敗で `Unhealthy` を公開しない
+/// （`depends_on` が誤って読むのを防ぐ）。**probe が `Err` でも `Healthy` をすぐ降格しない。** retries を満たすまで
+/// `Healthy` を保つのが retries の意味だからで、降格は集約の結果を書けなかったときの予備に限る。
+/// 書く値が最新レコードの `health` と同じなら書かない（無駄な revision 更新とロック競合を避ける）。
+/// 排他区間・所有確認・timeout の検証は [`probe_and_record`] と同じ。区間を取れない・所有を確認できない場合は
+/// probe せず、`decide` も呼ばない（観測していないので数えない）。
+/// probe が `Ok` なら最新レコード、`Err` なら元のエラーと降格の結果を [`ProbeFailure`] で返す。
+pub fn probe_aggregate_and_record(
+    state: &mut SupervisedState,
+    process: &dyn LaunchedProcess,
+    probe: &ProbeRunner,
+    timeout: Duration,
+    obs: &dyn MonitorObserver,
+    decide: HealthDecider<'_>,
+) -> Result<StateRecord, ProbeFailure> {
+    if timeout.is_zero() || timeout > MAX_POLL_INTERVAL {
+        return Err(ProbeFailure::new(
+            TraitError::new(ErrorCode::InvalidArgument, "probe timeout is out of range"),
+            Demotion::NotNeeded,
+        ));
+    }
+    let pid = process.pid();
+    let self_pid = NonZeroU32::new(std::process::id()).ok_or_else(|| {
+        ProbeFailure::new(
+            TraitError::new(ErrorCode::Internal, "own pid is zero"),
+            Demotion::NotNeeded,
+        )
+    })?;
+    let Some(session) = probe.try_begin() else {
+        let busy = TraitError::new(ErrorCode::Unavailable, "another healthcheck is in progress");
+        let _ = observed(obs, MonitorOperation::Probe, || {
+            Err::<HealthStatus, _>(busy.clone())
+        });
+        return Err(ProbeFailure::new(busy, Demotion::NotNeeded));
+    };
+    verify_owned(state, pid, self_pid).map_err(|e| ProbeFailure::new(e, Demotion::NotNeeded))?;
+    let result = observed(obs, MonitorOperation::Probe, || session.run(timeout));
+    // probe の間に他の経路が書き換えた可能性があるため、最新レコードで Running・起動 pid・所有を
+    // 再検証してから decide と省略判定を行う（書き込み省略時も record_health の前提検証を迂回しない。SUP-1）。
+    let current = match verify_owned(state, pid, self_pid) {
+        Ok(()) => state.record().health(),
+        Err(e) => return Err(ProbeFailure::new(e, Demotion::NotNeeded)),
+    };
+    let desired = decide(&result, current);
+    let written = if current == Some(desired) {
+        Ok(state.record().clone())
+    } else {
+        record_health(state, process, desired, obs)
+    };
+    // `Unhealthy` への遷移を書けず、降格も走らなかった場合は、遷移の失敗を `Demotion::Failed` で識別可能にする。
+    let demote = |state: &mut SupervisedState, werr: &TraitError| match demote_if_healthy(
+        state, pid, self_pid, obs,
+    ) {
+        Demotion::NotNeeded if desired == HealthStatus::Unhealthy => Demotion::Failed(werr.clone()),
+        d => d,
+    };
+    match (result, written) {
+        (Ok(_), Ok(rec)) => Ok(rec),
+        (Ok(_), Err(e)) if desired != HealthStatus::Healthy => {
+            let demotion = demote(state, &e);
+            Err(ProbeFailure::new(e, demotion))
+        }
+        (Ok(_), Err(e)) => Err(ProbeFailure::new(e, Demotion::NotNeeded)),
+        (Err(e), Ok(_)) => {
+            let demotion =
+                if desired == HealthStatus::Unhealthy && current == Some(HealthStatus::Healthy) {
+                    Demotion::Applied
+                } else {
+                    Demotion::NotNeeded
+                };
+            Err(ProbeFailure::new(e, demotion))
+        }
+        (Err(e), Err(w)) => {
+            let demotion = demote(state, &w);
+            Err(ProbeFailure::new(e, demotion).with_record_error(w))
+        }
+    }
+}
+
+/// 周期実行の開始時に `health` を `Starting` へ戻す（再起動後に前の process の `Healthy` を引き継がない。fail-closed）。
+///
+/// `Starting` が既に書かれていれば何もしない。排他区間は [`probe_aggregate_and_record`] と同じ [`ProbeRunner`] のものを
+/// 通す（同じコンテナの `health` を書く経路を 1 つに揃える契約）。区間を取れない・所有を確認できない場合は書かずに
+/// 失敗を返す（呼び出し元の `run_periodic` は有界に再試行し、使い切ったら集約へ進まず `Halted` で止める。SUP-4）。
+pub fn record_starting(
+    state: &mut SupervisedState,
+    process: &dyn LaunchedProcess,
+    probe: &ProbeRunner,
+    obs: &dyn MonitorObserver,
+) -> Result<StateRecord, TraitError> {
+    let pid = process.pid();
+    let self_pid = NonZeroU32::new(std::process::id())
+        .ok_or_else(|| TraitError::new(ErrorCode::Internal, "own pid is zero"))?;
+    let Some(_session) = probe.try_begin() else {
+        return Err(TraitError::new(
+            ErrorCode::Unavailable,
+            "another healthcheck is in progress",
+        ));
+    };
+    verify_owned(state, pid, self_pid)?;
+    if state.record().health() == Some(HealthStatus::Starting) {
+        return Ok(state.record().clone());
+    }
+    record_health(state, process, HealthStatus::Starting, obs)
 }
 
 #[cfg(test)]
@@ -955,6 +1088,78 @@ mod tests {
             Demotion::Failed(d) => assert_eq!(d.code(), ErrorCode::Internal),
             other => panic!("unexpected demotion: {other:?}"),
         }
+    }
+
+    /// SUP-4・TASK-161.3: Starting から retries 回目の失敗で Unhealthy を書けないとき、判定側と記録側の
+    /// エラーを両方返し、遷移の失敗を Demotion::Failed で識別できる（NotNeeded で消さない）。
+    #[test]
+    fn sup4_task161_3_aggregate_keeps_probe_and_write_errors() {
+        let inner = store_with(
+            ContainerStatus::running(cid(), Some(pid(42))),
+            SupervisionState::new(Some(me()), Some(HealthStatus::Starting), 0),
+            0,
+        );
+        let rec = inner.rec.lock().unwrap().clone();
+        let store = Arc::new(FailingWriteStore(FakeStore {
+            rec: Mutex::new(rec),
+            conflicts: Mutex::new(0),
+            updates: AtomicU32::new(0),
+        }));
+        let mut s = SupervisedState::attach(store, cid()).unwrap();
+        let p = ProbeRunner::new(Arc::new(FailingProbe));
+        let e = probe_aggregate_and_record(
+            &mut s,
+            &FakeProc,
+            &p,
+            Duration::from_secs(1),
+            &RecObs::default(),
+            &mut |_, _| HealthStatus::Unhealthy,
+        )
+        .unwrap_err();
+        assert_eq!(e.error().message(), "boom");
+        assert_eq!(e.error().code(), ErrorCode::Internal);
+        assert_eq!(
+            e.record_error().map(|w| w.code()),
+            Some(ErrorCode::Internal)
+        );
+        assert!(matches!(e.demotion(), Demotion::Failed(d) if d.message() == "disk full"));
+    }
+
+    /// 判定中に所有権が失われる probe（Healthy を返す）。
+    struct StealOwnerProbe(Arc<FakeStore>);
+
+    impl HealthProbe for StealOwnerProbe {
+        fn probe(&self, _: Duration) -> Result<HealthStatus, TraitError> {
+            let mut g = self.0.rec.lock().unwrap();
+            let s = SupervisionState::new(None, g.health(), g.restart_count());
+            *g = next_record(&g, g.status().clone(), s);
+            Ok(HealthStatus::Healthy)
+        }
+    }
+
+    /// SUP-1・TASK-161.3: 書き込みを省略できる（現在値 = 書く値）場合でも、probe 後の所有権を再検証し、
+    /// 失っていれば decide を呼ばず FailedPrecondition を返す。
+    #[test]
+    fn sup1_task161_3_aggregate_verifies_ownership_even_when_write_skipped() {
+        let store = healthy_store();
+        let mut s = attach(&store);
+        let p = ProbeRunner::new(Arc::new(StealOwnerProbe(store.clone())));
+        let mut called = false;
+        let e = probe_aggregate_and_record(
+            &mut s,
+            &FakeProc,
+            &p,
+            Duration::from_secs(1),
+            &RecObs::default(),
+            &mut |_, cur| {
+                called = true;
+                cur.unwrap_or(HealthStatus::Starting)
+            },
+        )
+        .unwrap_err();
+        assert_eq!(e.error().code(), ErrorCode::FailedPrecondition);
+        assert!(!called);
+        assert_eq!(e.demotion(), &Demotion::NotNeeded);
     }
 
     /// SUP-4: 古いキャッシュが Healthy でも最新が Unhealthy なら降格書き込みをしない（読み直して再判定）。

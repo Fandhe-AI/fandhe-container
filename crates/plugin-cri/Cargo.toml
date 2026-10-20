@@ -15,13 +15,21 @@ publish = false
 [dependencies]
 # workspace 内の path 依存（外部クレートの追加ではない。PLUG-1: 境界機構 plugin crate を使う側）。
 # TASK-114.2（#458）: adapter 用に cri・core への path 依存を足した（外部クレートの追加ではない。依存は plugin-cri → cri → core の一方向。CRI-7）。
-fandhe-container-plugin = { workspace = true }
+# TASK-114.3.1（#849）: UDS＋gRPC のサーバー結線のため feature `grpc` を有効にし、tokio（rt・net・time）と tonic を足す。
+# 承認: #425 のオーナー判断（2026-10-10。配置に plugin-cri を含む）。workspace 既存の版で新規パッケージなし。
+# core には入れない（PLUG-3・PLUG-4）。signal・sync・rt-multi-thread は承認範囲外のため使わない。
+fandhe-container-plugin = { workspace = true, features = ["grpc"] }
+tokio = { workspace = true, features = ["rt", "net", "time"] }
+tonic = { workspace = true }
 fandhe-container-cri = { path = "../cri" }
 # core は plugin feature を有効にしない（feature 統合で core の成果物が変わらないよう cri と揃える。PLUG-4）。
 fandhe-container-core = { path = "../core", default-features = false }
 # TASK-114.4（#460・MS-4）: NetworkPlugin の実装が TASK-139 の統合 API（create_network・attach_container・delete_network）を呼ぶ。
 # workspace 内 path 依存で外部クレートの追加ではない。net は依存を持たない core 側ライブラリで、辺は plugin-cri → net の一方向（PLUG-1・CRI-7）。
 fandhe-container-net = { path = "../net" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "net", "time"] }
 
 [[bin]]
 name = "fandhe-container-plugin-cri"

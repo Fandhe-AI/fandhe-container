@@ -443,6 +443,33 @@ impl AuditFileWriter {
         result
     }
 
+    /// レコードを 1 件も書かずに、本番の記録経路と同じ手順（排他 `flock` の取得 → 書き込み → `sync_data`）が通るかを確かめる
+    /// （起動前の記録経路の確認。SEC-4・REPAIR-5・#2027）。
+    ///
+    /// 別プロセスが `flock` を保持していれば [`AUDIT_LOCK_TIMEOUT`] で `Lock` になり、追記・永続化できない保存先
+    /// （読み取り専用・満杯など）は `Write` / `Sync` になる。監査ログへ確認用の行は残さない（0 バイトの書き込み）。
+    pub fn probe_append(&mut self) -> Result<(), AuditWriteError> {
+        self.probe_append_with(&AUDIT_WRITE_QUEUE, AUDIT_LOCK_TIMEOUT)
+    }
+
+    /// [`Self::probe_append`] の本体(順番待ちの列と `flock` の待ち上限を差し替えられる。単体試験が共有の列を塞がないため)。
+    fn probe_append_with(
+        &mut self,
+        queue: &TurnQueue,
+        timeout: Duration,
+    ) -> Result<(), AuditWriteError> {
+        let _turn = self.lock_exclusive(queue, Instant::now() + timeout)?;
+        let result = if self.file.write_all(&[]).is_err() {
+            Err(AuditWriteError::new(AuditWriteErrorKind::Write))
+        } else if self.file.sync_data().is_err() {
+            Err(AuditWriteError::new(AuditWriteErrorKind::Sync))
+        } else {
+            Ok(())
+        };
+        let _ = self.file.unlock();
+        result
+    }
+
     /// プロセス内の順番待ち → `flock` のポーリングの順に、共通の `deadline` までに排他を取る。
     fn lock_exclusive<'q>(
         &self,
@@ -763,6 +790,43 @@ pub fn write_with_fallback(
 
 #[cfg(test)]
 mod tests {
+    /// SEC-4・#2027: 別の open file description が排他 `flock` を保持していれば `probe_append` は `Lock` で失敗し、
+    /// 解放後は監査ログへ 1 バイトも書かずに成功する(open できるだけでは記録経路の確認にならない)。
+    #[cfg(unix)]
+    #[test]
+    fn sec4_2027_probe_append_fails_while_locked_elsewhere() {
+        let dir = std::env::temp_dir().join(format!("fc-probe-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("audit.log");
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        let queue = TurnQueue::new();
+        let holder = file.try_clone().unwrap();
+        // 別の open file description(`open` し直す)で保持する。
+        let other = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        other.lock().unwrap();
+        let mut writer = AuditFileWriter::from_file_unchecked(holder);
+        let e = writer
+            .probe_append_with(&queue, Duration::from_millis(200))
+            .unwrap_err();
+        assert_eq!(e.kind(), AuditWriteErrorKind::Lock);
+        drop(other);
+        // 並行する他の試験の fork が fd の複製を持つ間は解放されないため、解放後は長めに待つ。
+        writer
+            .probe_append_with(&queue, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use crate::audit_log::{AuditPath, AuditPid, AuditSyscallArch, AuditSyscallNr, AuditTimestamp};
     use std::time::Duration;

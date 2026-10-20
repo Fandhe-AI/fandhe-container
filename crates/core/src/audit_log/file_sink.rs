@@ -871,9 +871,9 @@ impl FileAuditSink {
         }
     }
 
-    /// 主経路の保存先を、記録を 1 件も書かずに開けるかだけ確かめる（起動前の記録経路の確認。SEC-4・REPAIR-5・#2027）。
+    /// 主経路の保存先へ、記録を 1 件も残さずに本番と同じ手順(open → 排他 flock → 書き込み → sync_data)で記録できるかを確かめる（起動前の記録経路の確認。SEC-4・REPAIR-5・#2027）。
     ///
-    /// 隔離した子で [`AuditFileWriter::open`] と同じ検査つきの open を行い、時間切れは `PRIMARY_WRITE_TIMEOUT` で打ち切る。
+    /// 隔離した子で [`AuditFileWriter::open`] と [`AuditFileWriter::probe_append`] を行い(別プロセスが flock を保持していれば拒否する)、時間切れは `PRIMARY_WRITE_TIMEOUT` で打ち切る。
     /// `@audit.log` がディレクトリ・symlink・権限不足などで開けなければ失敗を返す。代替経路（カーネル監査）は書かずに
     /// 確かめられないため対象外で、確かめられるのは主経路だけ（呼び出し元は失敗を起動拒否に使う）。
     pub fn probe_primary(&self) -> Result<(), TraitError> {
@@ -885,11 +885,15 @@ impl FileAuditSink {
         };
         match self.isolation {
             #[cfg(test)]
-            Isolation::InProcess => AuditFileWriter::open(&self.path).map(drop).map_err(fail),
+            Isolation::InProcess => AuditFileWriter::open(&self.path)
+                .and_then(|mut w| w.probe_append())
+                .map_err(fail),
             Isolation::Process { timeout } => {
-                let run = run_isolated(timeout, |_| match AuditFileWriter::open(&self.path) {
-                    Ok(_) => 0,
-                    Err(e) => kind_to_exit(e.kind()),
+                let run = run_isolated(timeout, |_| {
+                    match AuditFileWriter::open(&self.path).and_then(|mut w| w.probe_append()) {
+                        Ok(()) => 0,
+                        Err(e) => kind_to_exit(e.kind()),
+                    }
                 });
                 primary_result(run.outcome).map_err(fail)
             }

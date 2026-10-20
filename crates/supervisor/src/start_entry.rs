@@ -2548,11 +2548,6 @@ mod linux {
             Err(e) => return fail(&mut out, op_err(e)),
         };
         let req = StartRequest::new(args.id.clone());
-        // 記録先の probe（保存先の open を待つ同期処理）を含め、起動全体で同じ期限を共有する。
-        // probe より前に作り、probe の待機を期限へ含める（CLI の固定受信期限を超えない。REPAIR-5）。
-        let deadline =
-            Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
-        out.limit_until(deadline);
         // 制御チャネルの認証境界の拒否の記録先（SEC-4）。制御チャネルのサーバスレッドは監視スレッドと並行して動くため、
         // 複数スレッドでは `FileAuditSink` の隔離（fork）が使えない。そこで監査専用の helper プロセスを fork し、以後の
         // 記録はそこへ渡して期限付きで永続化する（`ControlAuditRelay`）。`spawn` は単一スレッドのときだけ成功するので、
@@ -2564,31 +2559,37 @@ mod linux {
             // 起動前に helper へ保存先を開かせ、期限つきで確かめる。開けなければ記録経路なしとして起動を拒否する（SEC-4・#2027）。
             .and_then(|relay| relay.probe().map(|()| relay))
             .map_err(|e| e.code());
+        // 結果の期限の起点は probe の後に置く。probe は最大 `PRIMARY_WRITE_TIMEOUT` ほど保存先を待ち得て、その待ちを
+        // 期限に含めると launch の見込み(手順 8)が残らず、probe に成功しても期限超過で launch が省かれるため
+        // (SEC-4・REPAIR-5・#2027)。probe 自体は有限(helper が応答しなければ打ち切る)で、通常は即座に済む。
+        let deadline =
+            Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
+        out.limit_until(deadline);
         // helper は fork 時点で委譲 cgroup に属するため、cgroup の準備（自プロセスの退避）へ同伴プロセスとして宣言し、
         // 一緒に退避リーフへ移す（宣言しないと「他のプロセスがいる」として起動が拒否される。CORE-3・SUP-1）。
         let companions: Vec<u32> = relay.as_ref().map(|r| vec![r.pid()]).unwrap_or_default();
-        // 以後の記録の通り道（relay）を共有できる形にする。記録先を作れなければ、確実な層（seccomp の USER_NOTIF の記録）を
-        // 満たせないので起動を拒否する（fail-closed。cgroup にも launch にも触れる前に止まる。SEC-4・#2027）。
-        let audit =
-            match require_seccomp_audit_sink(relay.map(|relay| {
+        // 以後の記録の通り道（relay）を共有できる形にする。記録先を作れなかった（確認用の記録も通らなかった）場合も
+        // ここでは返さない: 手順 3 の中断起動の回復(`recover_interrupted`。CORE-2)を先に通すため、ハブなしの deps で
+        // 進める。ハブが無いと手順 4 の `check_launcher_available` が確実な層を満たせないとして拒否するので、cgroup にも
+        // launch にも触れる前に止まる(fail-closed。新規の launch は監査経路が必須のまま。SEC-4・#2027)。
+        let audit: Option<Arc<dyn fandhe_container_core::audit_log::AuditSink>> =
+            require_seccomp_audit_sink(relay.map(|relay| {
                 Arc::new(relay) as Arc<dyn fandhe_container_core::audit_log::AuditSink>
-            })) {
-                Ok(sink) => sink,
-                Err(e) => return fail(&mut out, op_err(e)),
-            };
+            }))
+            .ok();
         // seccomp の通知への応答ハブ（SEC-4・REPAIR-5・#2025）。スレッドは attach まで作らないので、launch の単一スレッド要求に
         // 触れない。
-        let hub = Arc::new(SeccompNotifyHub::new(
-            Arc::clone(&audit),
-            args.id.clone(),
-            crate::seccomp_notify::NotifyConfig::default(),
-        ));
-        let deps = Box::new(
-            ProductionStartDeps::new(args.root.clone())
-                .with_companions(companions)
-                .with_audit_policy(args.audit_policy)
-                .with_seccomp_hub(hub),
-        );
+        let deps = ProductionStartDeps::new(args.root.clone())
+            .with_companions(companions)
+            .with_audit_policy(args.audit_policy);
+        let deps = Box::new(match &audit {
+            Some(audit) => deps.with_seccomp_hub(Arc::new(SeccompNotifyHub::new(
+                Arc::clone(audit),
+                args.id.clone(),
+                crate::seccomp_notify::NotifyConfig::default(),
+            ))),
+            None => deps,
+        });
         // 2b: supervisor の構造化ログの保存先を開き、stderr の出口の書き先を差し替える（#2067・REPAIR-4）。
         // 期限つきの作業スレッドで行い、終了を確認してから先へ進む。開けなければ fail-closed で、手順 3 より前に止まる。
         if let Err(e) = prepare_supervisor_log(&store, &args.root, &args.id, deadline) {
@@ -2613,10 +2614,9 @@ mod linux {
         // 報告の後に作るのでスレッドの制約に触れない。作成に失敗したら install が停止を要求し、既存の停止経路が
         // コンテナを終了させて Stopped を記録する（停止できないコンテナを残さない）。
         let stop = StopToken::new();
-        // 記録先は手順 3 より前に必須として確かめ済み（作れなければ起動していない）ので、常に `Some` を渡す。
-        // `install` の `None`（記録先なしで拒否だけ行う）の受け口は、他の呼び出し元と試験のために残している。
+        // 記録先が無い構成は手順 4 で拒否済み(起動していない)ので、ここへ届くときは `Some`。
         let (running, control) =
-            crate::control::install(&args.root, &args.id, running, &stop, Some(audit));
+            crate::control::install(&args.root, &args.id, running, &stop, audit);
         let code = run_supervised(store, args.id, running, args.restart, &timeouts, &stop);
         // 制御チャネルの作成に失敗していたら、回収に成功しても非 0 で終える（SUP-1）。
         let code = control.exit_code(code);

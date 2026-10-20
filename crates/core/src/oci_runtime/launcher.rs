@@ -877,8 +877,6 @@ impl Inner {
         timeout: Duration,
     ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
         let id = spec.container_id();
-        // 縮退記録の同期配送などで消費した時間を spawn の期限から差し引くための起点(REPAIR-5・SEC-4)。
-        let started = Instant::now();
         self.admit(id)?;
         if !self.ops.is_single_threaded() {
             return Err(TraitError::new(
@@ -900,6 +898,10 @@ impl Inner {
         .map_err(|e| to_trait_error(&e))?;
         // 監査の網羅(カーネル監査頼みの層)を評価し、厳格モードの縮退は子を作る前に拒否する(SEC-4・#2027)。
         let isolation_record = self.assess_audit_coverage(id, isolation_record)?;
+        // spawn の期限の起点は coverage 記録の同期配送の後に置く。配送は `RECORD_WAIT_LIMIT`(約 11 秒)まで待ち得て、
+        // 既定の launch 期限(10 秒)を超えるため、差し引くと既定モードでも遅い記録だけで launch が失敗する
+        // (配送の待ちは別枠で有限。REPAIR-5・SEC-4・#2027)。以降の fork 前の準備だけを期限に含める。
+        let started = Instant::now();
         let (uid, gid) = spec.user();
         let mut stages = StagePipeline::new()
             .with_seccomp_delivery(self.seccomp_delivery)

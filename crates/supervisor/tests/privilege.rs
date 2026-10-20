@@ -52,23 +52,25 @@ mod linux {
             Some("role-attached") => role_simple("attached"),
             Some("role-detach-on-pty") => role_detach_on_pty(),
             _ => {
-                check_script_available();
-                detached_descendants_survive_sigkill_of_pty_holder();
-                pty_stdio_is_refused_inside_pty_session();
-                println!("privilege: all scenarios passed");
+                // 各シナリオは Result を返し、Work を破棄（後始末）した後にここで非ゼロ終了する。
+                let result = check_script_available()
+                    .and_then(|()| detached_descendants_survive_sigkill_of_pty_holder())
+                    .and_then(|()| pty_stdio_is_refused_inside_pty_session());
+                match result {
+                    Ok(()) => println!("privilege: all scenarios passed"),
+                    Err(msg) => {
+                        eprintln!("privilege: FAILED: {msg}");
+                        std::process::exit(1);
+                    }
+                }
             }
         }
     }
 
-    fn fail(msg: &str) -> ! {
-        eprintln!("privilege: FAILED: {msg}");
-        std::process::exit(1);
-    }
+    type Res<T = ()> = Result<T, String>;
 
-    fn check(ok: bool, msg: &str) {
-        if !ok {
-            fail(msg);
-        }
+    fn check(ok: bool, msg: &str) -> Res {
+        if ok { Ok(()) } else { Err(msg.to_string()) }
     }
 
     // ---- 共通の小関数 ----
@@ -188,13 +190,32 @@ mod linux {
             std::process::exit(2)
         };
         heartbeat_loop(&dir, "detached");
-        wait_child(&mut child, GONE_TIMEOUT);
+        if wait_child(&mut child, GONE_TIMEOUT).is_err() {
+            std::process::exit(2);
+        }
     }
 
-    fn wait_child(child: &mut Child, limit: Duration) {
-        if !wait_until(limit, || matches!(child.try_wait(), Ok(Some(_)))) {
-            let _ = child.kill();
-            let _ = child.wait();
+    /// 子の終了を期限付きで待つ。期限内に終わらなければ強制終了し、回収も有限時間で打ち切る（REPAIR-5）。
+    /// 回収できなかった・kill に失敗した場合は Err を返す。
+    fn wait_child(child: &mut Child, limit: Duration) -> Res {
+        if wait_until(limit, || matches!(child.try_wait(), Ok(Some(_)))) {
+            return Ok(());
+        }
+        kill_and_reap(child)
+    }
+
+    /// 子を SIGKILL して、有限時間で回収する。すでに終了済みの子は成功として扱う。
+    fn kill_and_reap(child: &mut Child) -> Res {
+        if let Err(e) = child.kill() {
+            // 終了済みなら kill は InvalidInput を返す。回収できるなら問題にしない。
+            if !matches!(child.try_wait(), Ok(Some(_))) {
+                return Err(format!("cannot kill child: {e}"));
+            }
+        }
+        if wait_until(GONE_TIMEOUT, || matches!(child.try_wait(), Ok(Some(_)))) {
+            Ok(())
+        } else {
+            Err("child was not reaped after SIGKILL within the timeout".to_string())
         }
     }
 
@@ -216,19 +237,36 @@ mod linux {
 
     // ---- 試験側 ----
 
-    fn check_script_available() {
-        let ok = Command::new("script")
+    fn check_script_available() -> Res {
+        // `status()` は期限なしで待つため、spawn と期限付き try_wait で確かめる。
+        let ok = match Command::new("script")
             .arg("--version")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .spawn()
+        {
+            Ok(mut c) => {
+                let mut success = false;
+                let done = wait_until(READY_TIMEOUT, || match c.try_wait() {
+                    Ok(Some(st)) => {
+                        success = st.success();
+                        true
+                    }
+                    Ok(None) => false,
+                    Err(_) => true,
+                });
+                if !done {
+                    kill_and_reap(&mut c)?;
+                }
+                success
+            }
+            Err(_) => false,
+        };
         check(
             ok,
             "util-linux `script` is required (the test needs a pty holder to kill)",
-        );
+        )
     }
 
     /// 作業ディレクトリ。Drop で stop を作って役を止め、ディレクトリを消す。
@@ -239,7 +277,7 @@ mod linux {
     }
 
     impl Work {
-        fn new(tag: &str) -> Self {
+        fn new(tag: &str) -> Res<Self> {
             use std::os::unix::fs::PermissionsExt;
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -247,19 +285,17 @@ mod linux {
                 .unwrap_or(0);
             let dir = std::env::temp_dir()
                 .join(format!("fandhe-t538-{tag}-{}-{nanos}", std::process::id()));
-            if fs::create_dir(&dir).is_err() {
-                fail("cannot create work dir");
-            }
+            fs::create_dir(&dir).map_err(|e| format!("cannot create work dir: {e}"))?;
             let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-            Work {
+            Ok(Work {
                 dir,
                 child: None,
                 _stdin: None,
-            }
+            })
         }
 
-        fn start_script(&mut self, inner: &str) {
-            let me = std::env::current_exe().unwrap_or_else(|_| fail("current_exe"));
+        fn start_script(&mut self, inner: &str) -> Res {
+            let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
             let mut child = Command::new("script")
                 .args(["-qec", inner, "/dev/null"])
                 .env("SHELL", "/bin/sh")
@@ -269,27 +305,28 @@ mod linux {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
-                .unwrap_or_else(|e| fail(&format!("cannot spawn script: {e}")));
+                .map_err(|e| format!("cannot spawn script: {e}"))?;
             // stdin を保持して EOF による script の早期終了を防ぐ。
             self._stdin = child.stdin.take();
             self.child = Some(child);
+            Ok(())
         }
 
-        fn read_ready(&self, name: &str) -> Vec<i64> {
+        fn read_ready(&self, name: &str) -> Res<Vec<i64>> {
             let path = self.dir.join(format!("{name}.ready"));
             if !wait_until(READY_TIMEOUT, || path.exists()) {
-                fail(&format!("{name}.ready did not appear"));
+                return Err(format!("{name}.ready did not appear"));
             }
             let text = fs::read_to_string(&path).unwrap_or_default();
             if text.starts_with("error") {
-                fail(&format!("{name} reported: {text}"));
+                return Err(format!("{name} reported: {text}"));
             }
             let v: Vec<i64> = text
                 .split_whitespace()
                 .filter_map(|s| s.parse().ok())
                 .collect();
-            check(v.len() == 6, &format!("{name}.ready malformed: {text:?}"));
-            v
+            check(v.len() == 6, &format!("{name}.ready malformed: {text:?}"))?;
+            Ok(v)
         }
 
         fn hb(&self, name: &str) -> u64 {
@@ -303,8 +340,10 @@ mod linux {
     impl Drop for Work {
         fn drop(&mut self) {
             let _ = fs::write(self.dir.join("stop"), "");
-            if let Some(c) = self.child.as_mut() {
-                wait_child(c, GONE_TIMEOUT);
+            if let Some(c) = self.child.as_mut()
+                && let Err(e) = wait_child(c, GONE_TIMEOUT)
+            {
+                eprintln!("privilege: cleanup: {e}");
             }
             // 役が stop を見て終わるのを待ってから消す。
             std::thread::sleep(Duration::from_millis(200));
@@ -313,75 +352,75 @@ mod linux {
     }
 
     /// SUP-14・TASK-171.3: pty の保持者を SIGKILL しても、切り離した子孫は動き続ける（切り離さない対照は消える）。
-    fn detached_descendants_survive_sigkill_of_pty_holder() {
-        let mut w = Work::new("a");
+    fn detached_descendants_survive_sigkill_of_pty_holder() -> Res {
+        let mut w = Work::new("a")?;
         // exec は使わない（代役がセッションリーダーになり tty_nr != 0 で拒否されるため）。
         w.start_script(
             "\"$FANDHE_T538_SELF\" role-attached & \
              \"$FANDHE_T538_SELF\" role-detached </dev/null >/dev/null 2>&1 & wait",
-        );
-        let att = w.read_ready("attached");
-        let det = w.read_ready("detached");
-        let wl = w.read_ready("workload");
+        )?;
+        let att = w.read_ready("attached")?;
+        let det = w.read_ready("detached")?;
+        let wl = w.read_ready("workload")?;
         // [pid, session, pgrp, tty_nr, starttime, sighup_ignored]
         check(
             att.get(3).copied().unwrap_or(0) != 0,
             "attached has no controlling tty",
-        );
+        )?;
         check(
             att.get(5).copied() == Some(0),
             "SIGHUP is ignored; the negative control is invalid",
-        );
+        )?;
         check(
             det.first() == det.get(1) && det.first() == det.get(2) && det.get(3) == Some(&0),
             "detached is not a session leader without a tty",
-        );
-        check(det.get(1) != att.get(1), "detached shares the pty session");
+        )?;
+        check(det.get(1) != att.get(1), "detached shares the pty session")?;
         check(
             wl.get(1) == det.first() && wl.get(3) == Some(&0),
             "workload is not in the detached session",
-        );
+        )?;
 
         if let Some(c) = w.child.as_mut() {
-            let _ = c.kill();
-            let _ = c.wait();
+            kill_and_reap(c)?;
         }
 
         let (ap, at) = (att[0] as u32, att[4] as u64);
         check(
             wait_until(GONE_TIMEOUT, || !is_alive(ap, at)),
             "negative control survived: pty hangup did not propagate",
-        );
+        )?;
 
         let (d0, w0) = (w.hb("detached"), w.hb("workload"));
         std::thread::sleep(Duration::from_millis(500));
         check(
             w.hb("detached") > d0,
             "detached stopped after SIGKILL of the pty holder",
-        );
+        )?;
         check(
             w.hb("workload") > w0,
             "workload stopped after SIGKILL of the pty holder",
-        );
+        )?;
         check(
             is_alive(det[0] as u32, det[4] as u64),
             "detached is not alive in /proc",
-        );
+        )?;
         check(
             is_alive(wl[0] as u32, wl[4] as u64),
             "workload is not alive in /proc",
-        );
+        )?;
+        Ok(())
     }
 
     /// SUP-14・#537: pty 経由の標準入出力は昇格前に拒否される（sudo の use_pty 起動は設計どおり弾く）。
-    fn pty_stdio_is_refused_inside_pty_session() {
-        let mut w = Work::new("b");
-        w.start_script("\"$FANDHE_T538_SELF\" role-detach-on-pty");
+    fn pty_stdio_is_refused_inside_pty_session() -> Res {
+        let mut w = Work::new("b")?;
+        w.start_script("\"$FANDHE_T538_SELF\" role-detach-on-pty")?;
         let path = w.dir.join("pty.result");
         check(
             wait_until(READY_TIMEOUT, || path.exists()),
             "pty.result did not appear",
-        );
+        )?;
         let text = fs::read_to_string(&path).unwrap_or_default();
         let want = format!(
             "error {:?} {:?} stdin, stdout and stderr must not be terminals",
@@ -391,6 +430,6 @@ mod linux {
         check(
             text.starts_with(&want),
             &format!("unexpected result: {text:?}"),
-        );
+        )
     }
 }

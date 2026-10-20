@@ -191,7 +191,8 @@ fn sup1_task161_2_it_halts_when_not_owner() {
     match out {
         HealthcheckLoopOutcome::Halted { error, ticks } => {
             assert_eq!(error.code(), ErrorCode::FailedPrecondition);
-            assert_eq!(ticks, 1);
+            // 所有していないため開始時の Starting 記録（record_starting）で止まり、tick は進まない。
+            assert_eq!(ticks, 0);
         }
         other => panic!("unexpected outcome: {other:?}"),
     }

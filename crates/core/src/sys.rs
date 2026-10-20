@@ -413,6 +413,9 @@ mod consts {
     #[cfg_attr(not(test), allow(dead_code))]
     pub const F_GETFD: i32 = 1;
     pub const F_SETFD: i32 = 2;
+    // include/uapi/asm-generic/fcntl.h の `F_GETFL`・`F_SETFL`。
+    pub const F_GETFL: i32 = 3;
+    pub const F_SETFL: i32 = 4;
     pub const FD_CLOEXEC: i32 = 1;
     // include/uapi/linux/fcntl.h の `F_DUPFD_CLOEXEC`（`F_LINUX_SPECIFIC_BASE` 1024 + 6）。
     pub const F_DUPFD_CLOEXEC: i32 = 1030;
@@ -754,6 +757,9 @@ mod consts {
     #[cfg_attr(not(test), allow(dead_code))]
     pub const F_GETFD: i32 = 1;
     pub const F_SETFD: i32 = 2;
+    // include/uapi/asm-generic/fcntl.h の `F_GETFL`・`F_SETFL`。
+    pub const F_GETFL: i32 = 3;
+    pub const F_SETFL: i32 = 4;
     pub const FD_CLOEXEC: i32 = 1;
     // include/uapi/linux/fcntl.h の `F_DUPFD_CLOEXEC`（`F_LINUX_SPECIFIC_BASE` 1024 + 6）。
     pub const F_DUPFD_CLOEXEC: i32 = 1030;
@@ -1035,6 +1041,8 @@ mod consts {
     #[cfg_attr(not(test), allow(dead_code))]
     pub const F_GETFD: i32 = 0;
     pub const F_SETFD: i32 = 0;
+    pub const F_GETFL: i32 = 0;
+    pub const F_SETFL: i32 = 0;
     pub const FD_CLOEXEC: i32 = 0;
     pub const F_DUPFD_CLOEXEC: i32 = 0;
     pub const EPERM: i32 = -1;

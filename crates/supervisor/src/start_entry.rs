@@ -97,6 +97,7 @@ use crate::restart::{
     SpecCapturingLauncher, SuperviseOutcome, supervise_with_restart,
 };
 use crate::run::{MonitorConfig, StderrLogObserver, StopToken};
+use crate::seccomp_notify::SeccompNotifyHub;
 use crate::start_contract::{StartReport, launch_step_budget};
 use crate::state::SupervisedState;
 
@@ -135,6 +136,12 @@ pub trait StartDeps {
     fn open_log_sink(&mut self, id: &ContainerId) -> Result<Option<Arc<dyn LogSink>>, TraitError> {
         let _ = id;
         Ok(None)
+    }
+
+    /// seccomp の通知に応答するハブ（SEC-4・REPAIR-5・#2025）。`Some` を返す実装は、launcher を `UserNotif` 版の filter で
+    /// 構築し、入口が起動・再起動のたびに listener を受け取ってハブへ渡す。既定は `None`（従来の ERRNO 版。通知なし）。
+    fn seccomp_hub(&self) -> Option<Arc<SeccompNotifyHub>> {
+        None
     }
 
     /// 手順 7: launcher を構築する（保持している cgroup の参加フックと監査 sink を使う）。
@@ -176,6 +183,9 @@ pub struct Running {
     /// コンテナ出力の捕捉ハブ（ログ sink を開いたときだけ。`run_supervised` が初回の出力を渡し、全終了経路で畳む。
     /// 再起動後の出力は `relauncher` が同じハブへ渡す。TASK-164 追補・#1471・SUP-7）。
     pub logs: Option<Arc<CaptureHub>>,
+    /// seccomp の通知への応答ハブ（`StartDeps::seccomp_hub` が `Some` のときだけ。`run_supervised` が初回の listener を
+    /// 渡し、全終了経路で畳む。再起動後の listener は `relauncher` が同じハブへ渡す。SEC-4・#2025）。
+    pub seccomp: Option<Arc<SeccompNotifyHub>>,
 }
 
 /// spec を捕捉できなかったときの再 launch（常に失敗させる。fail-closed）。
@@ -645,9 +655,24 @@ fn start_reporting(
         let worker_exited = worker.join();
         let attempt =
             launch_after_prepare(outcome, worker_exited, store, recorder, timeouts, deadline);
-        record_start(recorder, started, matches!(attempt, Attempt::Started(_)));
+        // Started 以外はここで確定する。Started はハブへの引き渡しまで含めた最終結果で記録する（二重計上しない。REPAIR-4）。
+        if !matches!(attempt, Attempt::Started(_)) {
+            record_start(recorder, started, false);
+        }
         return match attempt {
             Attempt::Started(running) => {
+                // 応答ハブの開始を成功報告の前に済ませる（報告の後に失敗すると、CLI へ成功を返したコンテナを
+                // 回収して非 0 で終えることになるため。失敗なら回収して ERR を報告する。ERR-1・ERR-2・SEC-4）。
+                #[cfg(target_os = "linux")]
+                let running =
+                    match attach_seccomp_before_report(running, store, req.id(), timeouts, out) {
+                        Ok(r) => r,
+                        Err(code) => {
+                            record_start(recorder, started, false);
+                            return Err(code);
+                        }
+                    };
+                record_start(recorder, started, true);
                 report(
                     out,
                     &StartReport::Started {
@@ -688,6 +713,45 @@ fn start_reporting(
         }
     }
     Err(exit_code_for(ErrorCode::Internal))
+}
+
+/// 成功報告の前に seccomp の応答ハブへ初回の listener を渡す。ハブが無い・渡し済みなら何もしない。
+/// 渡せなければ ERR 行を先に書いてから（回収の待ちで CLI が報告を取り逃さないため）起動したプロセスを回収して
+/// `Stopped` を記録し、終了コードを返す（fail-closed）。
+#[cfg(target_os = "linux")]
+fn attach_seccomp_before_report(
+    running: Running,
+    store: &Arc<dyn StateStore>,
+    id: &ContainerId,
+    timeouts: &StartTimeouts,
+    out: &mut dyn Write,
+) -> Result<Running, NonZeroU8> {
+    let Some(hub) = running.seccomp.clone() else {
+        return Ok(running);
+    };
+    if hub.is_attached() {
+        return Ok(running);
+    }
+    let attached = match running.process.take_seccomp_listener() {
+        Some(listener) => hub.attach(listener),
+        None => Err(TraitError::new(
+            ErrorCode::Internal,
+            "the seccomp listener was not delivered",
+        )),
+    };
+    let Err(e) = attached else {
+        return Ok(running);
+    };
+    log_event("seccomp_notify_failed", Some(e.code()));
+    let error = op_err(e);
+    report(out, &StartReport::failed(&error));
+    let Running {
+        process, instance, ..
+    } = running;
+    let disposed = dispose(Some(process), None, timeouts);
+    let code = finish_disposed(store, id, instance, disposed, error.exit_code().get());
+    let code = NonZeroU8::new(code).unwrap_or_else(|| exit_code_for(ErrorCode::Internal));
+    Err(code)
 }
 
 /// 報告 1 行を書く（失敗はログに出すだけで、監視・後始末は続ける）。
@@ -769,6 +833,8 @@ struct Prepared {
     launcher: Arc<dyn ProcessLauncher>,
     /// コンテナ出力の捕捉ハブ。
     logs: Option<Arc<CaptureHub>>,
+    /// seccomp の通知への応答ハブ。
+    seccomp: Option<Arc<SeccompNotifyHub>>,
     /// 起動権の予約済みの状態（bundle の検証・所有ロック・予約の更新は作業スレッドで済ませてある。#1819）。
     claimed: Box<ClaimedStart>,
 }
@@ -1155,6 +1221,7 @@ fn prepare_start(
         })))),
         Err(e) => return fail(e, Cleanup::ReleaseCgroup),
     };
+    let seccomp = deps.seccomp_hub();
     let inner = match deps.build_launcher() {
         Ok(l) => l,
         Err(e) => return fail(e, Cleanup::ReleaseCgroup),
@@ -1201,6 +1268,7 @@ fn prepare_start(
         capturing,
         launcher,
         logs,
+        seccomp,
         claimed,
     })
 }
@@ -1218,6 +1286,7 @@ fn launch_prepared(
         capturing,
         launcher,
         logs,
+        seccomp,
         claimed,
     } = prepared;
     // launch の後の状態 I/O（Running の記録・失敗時の予約の解放）は期限（報告の書き込み分を除く）で打ち切る。
@@ -1239,11 +1308,14 @@ fn launch_prepared(
             let instance = record.cgroup().map(|c| c.instance());
             let relauncher: Arc<dyn Relauncher> = match capturing.captured_spec() {
                 Some(spec) => {
-                    let relauncher = LauncherRelauncher::new(inner, spec);
-                    match &logs {
-                        Some(hub) => Arc::new(relauncher.with_capture(Arc::clone(hub))),
-                        None => Arc::new(relauncher),
+                    let mut relauncher = LauncherRelauncher::new(inner, spec);
+                    if let Some(hub) = &logs {
+                        relauncher = relauncher.with_capture(Arc::clone(hub));
                     }
+                    if let Some(hub) = &seccomp {
+                        relauncher = relauncher.with_seccomp(Arc::clone(hub));
+                    }
+                    Arc::new(relauncher)
                 }
                 None => Arc::new(NoSpecRelauncher),
             };
@@ -1252,6 +1324,7 @@ fn launch_prepared(
                 relauncher,
                 instance,
                 logs,
+                seccomp,
             })
         }
         // Timeout を含むすべての失敗を同じ確認に通す。呼び出し境界の期限超過なら予約（Running・pid なし）が残るので
@@ -1581,6 +1654,7 @@ pub fn run_supervised(
         relauncher,
         instance,
         logs,
+        seccomp,
     } = running;
     // 捕捉ハブが無いときは読み取り側を取り出さない（取り出して捨てるとコンテナが SIGPIPE を受ける）。
     if let Some(hub) = &logs
@@ -1597,9 +1671,38 @@ pub fn run_supervised(
             exit_code_for(e.code()).get(),
         );
     }
+    // seccomp の listener を取り出して応答ハブへ渡す（応答者のいない USER_NOTIF は拒否対象の syscall を止めるため、
+    // 受け取れない・スレッドを作れないときは起動したプロセスを回収して非 0 で終わる。fail-closed。SEC-4・#2025）。
+    #[cfg(target_os = "linux")]
+    if let Some(hub) = &seccomp
+        && !hub.is_attached()
+    {
+        let attached = match process.take_seccomp_listener() {
+            Some(listener) => hub.attach(listener),
+            None => Err(TraitError::new(
+                ErrorCode::Internal,
+                "the seccomp listener was not delivered",
+            )),
+        };
+        if let Err(e) = attached {
+            log_event("seccomp_notify_failed", Some(e.code()));
+            let disposed = dispose(Some(process), None, timeouts);
+            return finish_disposed(
+                &store,
+                &id,
+                instance,
+                disposed,
+                exit_code_for(e.code()).get(),
+            );
+        }
+    }
     let code = supervise_running(
         store, id, process, relauncher, instance, restart, timeouts, stop,
     );
+    // コンテナの回収の後に畳む（利用者が消えて listener が Closed になり、スレッドが終わる）。
+    if let Some(hub) = seccomp {
+        let _ = hub.finish(timeouts.terminate().min(crate::logs::MAX_DRAIN_TIMEOUT));
+    }
     if let Some(hub) = logs {
         // 失敗（集計内の error_code を含む）は finish が構造化ログへ報告する。
         let _ = hub.finish(timeouts.terminate());
@@ -1799,6 +1902,8 @@ mod linux {
         audit: Option<Arc<dyn AuditSink>>,
         /// 退避で一緒に移す同伴プロセスの PID（監査 helper。`DelegatedCgroup::with_companions`）。
         companions: Vec<u32>,
+        /// seccomp の通知に応答するハブ（`with_seccomp_hub`。持つときだけ start の launcher が USER_NOTIF 版になる。#2025）。
+        seccomp: Option<Arc<SeccompNotifyHub>>,
     }
 
     /// 決めた権限モデルと、範囲写像のときの入力元（#2243・CORE-6）。
@@ -1955,7 +2060,16 @@ mod linux {
                 cgroup: None,
                 audit: None,
                 companions: Vec::new(),
+                seccomp: None,
             }
+        }
+
+        /// seccomp の通知に応答するハブを持たせる。持たせると start の launcher が ERRNO 側を `UserNotif` にし、
+        /// 入口が listener をハブへ渡す（SEC-4・REPAIR-5・#2025）。持たせなければ従来の ERRNO 版のまま。
+        #[must_use]
+        pub fn with_seccomp_hub(mut self, hub: Arc<SeccompNotifyHub>) -> Self {
+            self.seccomp = Some(hub);
+            self
         }
 
         /// 決めた権限モデル（範囲写像なら入力元つき）を設定した launcher 構築器（構築の箇所をここ 1 つにする。
@@ -1978,6 +2092,15 @@ mod linux {
                 (self.recovery_privilege.clone()?, None)
             };
             let builder = ProductionLauncher::builder().privilege(privilege);
+            // 応答者（ハブ）がいるときの start の launcher だけが USER_NOTIF にする。残存確認の launcher は launch しない
+            // が、同じく応答者がいない構成は ERRNO のまま（応答者のいない USER_NOTIF は拒否対象の syscall を止める）。
+            let builder = if with_mapping && self.seccomp.is_some() {
+                builder.seccomp_errno_delivery(
+                    fandhe_container_core::seccomp::ErrnoDelivery::UserNotif,
+                )
+            } else {
+                builder
+            };
             Ok(match subordinate {
                 Some(source) => builder.subordinate_ids(source),
                 None => builder,
@@ -1993,6 +2116,10 @@ mod linux {
     }
 
     impl StartDeps for ProductionStartDeps {
+        fn seccomp_hub(&self) -> Option<Arc<SeccompNotifyHub>> {
+            self.seccomp.clone()
+        }
+
         /// 権限モデルが決められること、Landlock ABI が 6 以上であることを確かめる（副作用なし）。launcher は同じ条件を
         /// fork の前に拒否するが、cgroup の連鎖（取り消せないスコープの追記）の前に止めるためここで前倒しする（CORE-5）。
         /// `ProductionLauncherBuilder::build` は child subreaper 化の副作用を持つため、ここでは呼ばない。
@@ -2381,8 +2508,25 @@ mod linux {
         // helper は fork 時点で委譲 cgroup に属するため、cgroup の準備（自プロセスの退避）へ同伴プロセスとして宣言し、
         // 一緒に退避リーフへ移す（宣言しないと「他のプロセスがいる」として起動が拒否される。CORE-3・SUP-1）。
         let companions: Vec<u32> = audit.as_ref().map(|r| vec![r.pid()]).unwrap_or_default();
-        let deps =
-            Box::new(ProductionStartDeps::new(args.root.clone()).with_companions(companions));
+        // 以後の記録の通り道（relay）を共有できる形にする。失敗の記録は従来どおり launch の後まで保留する。
+        let audit = audit
+            .map(|relay| Arc::new(relay) as Arc<dyn fandhe_container_core::audit_log::AuditSink>);
+        // seccomp の通知への応答ハブ（SEC-4・REPAIR-5・#2025）。記録先が無くても作る（応答は止めず `unrecorded` に数える。
+        // 起動の拒否・縮退の表示は #2027）。スレッドは attach まで作らないので、launch の単一スレッド要求に触れない。
+        let hub_sink: Arc<dyn fandhe_container_core::audit_log::AuditSink> = match &audit {
+            Ok(relay) => Arc::clone(relay),
+            Err(_) => Arc::new(crate::seccomp_notify::UnavailableAuditSink),
+        };
+        let hub = Arc::new(SeccompNotifyHub::new(
+            hub_sink,
+            args.id.clone(),
+            crate::seccomp_notify::NotifyConfig::default(),
+        ));
+        let deps = Box::new(
+            ProductionStartDeps::new(args.root.clone())
+                .with_companions(companions)
+                .with_seccomp_hub(hub),
+        );
         // 回復・回収と報告の書き込みで同じ期限を共有し、報告を内部上限内に収める（REPAIR-5）。
         let deadline =
             Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
@@ -2413,9 +2557,7 @@ mod linux {
         let stop = StopToken::new();
         // 失敗は握りつぶさず、構造化ログに固定語彙で残す（拒否の判定自体は fail-closed のまま。SEC-4）。
         let audit = match audit {
-            Ok(relay) => {
-                Some(Arc::new(relay) as Arc<dyn fandhe_container_core::audit_log::AuditSink>)
-            }
+            Ok(relay) => Some(relay),
             Err(code) => {
                 log_event("control_audit_relay_unavailable", Some(code));
                 None

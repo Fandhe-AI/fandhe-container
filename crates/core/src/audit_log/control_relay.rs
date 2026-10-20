@@ -1,4 +1,4 @@
-//! 複数スレッドのプロセスから制御チャネルの拒否を期限付きで永続化する中継（Linux。SEC-4・REPAIR-5・SUP-1・SEC-1・#2058）。
+//! 複数スレッドのプロセスから制御チャネルの拒否と seccomp の拒否を期限付きで永続化する中継（Linux。SEC-4・REPAIR-5・SUP-1・SEC-1・#2058）。
 //!
 //! # 役割
 //!
@@ -13,8 +13,10 @@
 //!
 //! - 構築（[`ControlAuditRelay::spawn`]）は呼び出しプロセスが単一スレッドのときだけ成功する（`FailedPrecondition`）。
 //!   制御チャネルの listener を bind する前に呼ぶこと（helper は fd 3 以上を閉じるため listener を持たない）
-//! - 運べるのは [`AuditEvent::ControlPeer`] の記録だけ（他の層は `InvalidArgument`）。時刻・PID・コンテナ ID・理由トークンを
-//!   固定の枠で送り、helper が [`AuditRecord`] を組み直す（生のバイト列を記録として扱わない。REPAIR-2）
+//! - 運べるのは [`AuditEvent::ControlPeer`] と [`AuditEvent::Seccomp`] の記録だけ（他の層は `InvalidArgument`）。時刻・PID・
+//!   コンテナ ID・理由トークン（seccomp は種別トークンと syscall 番号・arch）を固定の枠で送り、helper が [`AuditRecord`] を
+//!   組み直す（生のバイト列を記録として扱わない。REPAIR-2）。seccomp の記録は supervisor の seccomp 通知ループ
+//!   （`record_seccomp_denial_for` 経由。SEC-4・REPAIR-5・#2025）が書く
 //! - `record` は helper の応答を [`RECORD_WAIT_LIMIT`] まで待つ（helper の sink の最悪待ち時間と同じ）。応答が無ければ
 //!   helper を SIGKILL して以後の `record` を `Unavailable` で拒否する（ずれた応答を次の要求へ取り違えない。fail-closed）。
 //!   拒否の判定自体は呼び出し側で既に確定しており、本中継の失敗は判定を覆さない
@@ -34,8 +36,8 @@ use crate::sys;
 use crate::traits::{ContainerId, ErrorCode, TraitError};
 
 use super::{
-    AuditEvent, AuditPid, AuditRecord, AuditSink, AuditTimestamp, ControlPeerRejection,
-    FileAuditSink, RECORD_WAIT_LIMIT,
+    AuditEvent, AuditPid, AuditRecord, AuditSink, AuditSyscallArch, AuditSyscallNr, AuditTimestamp,
+    ControlPeerRejection, FileAuditSink, RECORD_WAIT_LIMIT,
 };
 
 /// 枠の固定部: 理由 1・秒 8・ナノ秒 4・PID 4・コンテナ ID 長 1。
@@ -49,6 +51,11 @@ const CLOSE_FDS_FAILED_EXIT: i32 = 3;
 /// 回収待ちの上限（drop 時）。
 const REAP_WAIT: Duration = Duration::from_secs(1);
 
+/// seccomp の記録を示す先頭バイト（`REJECTIONS` の添字と重ならない値）。コンテナ ID の後に syscall 番号（u32）と arch（u32）が付く。
+const TAG_SECCOMP: u8 = 0x80;
+/// seccomp の枠だけが持つ追加部（番号 4・arch 4）。
+const SECCOMP_EXTRA_LEN: usize = 8;
+
 /// 運べる拒否理由（枠の先頭バイトが添字）。
 const REJECTIONS: [ControlPeerRejection; 2] = [
     ControlPeerRejection::PeerUidMismatch,
@@ -61,21 +68,27 @@ fn err(code: ErrorCode, message: &'static str) -> TraitError {
 
 /// 記録を枠へ符号化する。`ControlPeer` 以外・長すぎるコンテナ ID は拒否する。
 fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
-    let AuditEvent::ControlPeer { reason } = record.event() else {
-        return Err(err(
-            ErrorCode::InvalidArgument,
-            "the audit relay only carries control channel records",
-        ));
-    };
-    let Some(tag) = REJECTIONS
-        .iter()
-        .position(|r| r.as_str() == reason.as_str())
-        .and_then(|i| u8::try_from(i).ok())
-    else {
-        return Err(err(
-            ErrorCode::InvalidArgument,
-            "the audit relay does not know this rejection reason",
-        ));
+    let (tag, extra) = match record.event() {
+        AuditEvent::ControlPeer { reason } => {
+            let Some(tag) = REJECTIONS
+                .iter()
+                .position(|r| r.as_str() == reason.as_str())
+                .and_then(|i| u8::try_from(i).ok())
+            else {
+                return Err(err(
+                    ErrorCode::InvalidArgument,
+                    "the audit relay does not know this rejection reason",
+                ));
+            };
+            (tag, None)
+        }
+        AuditEvent::Seccomp { syscall, arch } => (TAG_SECCOMP, Some((syscall.get(), arch.get()))),
+        _ => {
+            return Err(err(
+                ErrorCode::InvalidArgument,
+                "the audit relay only carries control channel and seccomp records",
+            ));
+        }
     };
     let id = record.container_id().map_or("", ContainerId::as_str);
     let Ok(id_len) = u8::try_from(id.len()) else {
@@ -92,6 +105,10 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
     frame.extend_from_slice(&record.pid().get().to_be_bytes());
     frame.push(id_len);
     frame.extend_from_slice(id.as_bytes());
+    if let Some((nr, arch)) = extra {
+        frame.extend_from_slice(&nr.to_be_bytes());
+        frame.extend_from_slice(&arch.to_be_bytes());
+    }
     Ok(frame)
 }
 
@@ -102,14 +119,34 @@ fn decode(frame: &[u8]) -> Option<AuditRecord> {
     let nanos = u32::from_be_bytes(frame.get(9..13)?.try_into().ok()?);
     let pid = u32::from_be_bytes(frame.get(13..17)?.try_into().ok()?);
     let id_len = usize::from(*frame.get(17)?);
-    let id = frame.get(FIXED_LEN..)?;
-    if id.len() != id_len || nanos >= 1_000_000_000 {
+    let rest = frame.get(FIXED_LEN..)?;
+    if nanos >= 1_000_000_000 {
         return None;
     }
-    let rejection = *REJECTIONS.get(usize::from(tag))?;
+    let (id, event) = if tag == TAG_SECCOMP {
+        // 長さは厳密に一致させる（余りも不足も壊れた枠）。
+        if rest.len() != id_len.checked_add(SECCOMP_EXTRA_LEN)? {
+            return None;
+        }
+        let (id, extra) = rest.split_at(id_len);
+        let nr = u32::from_be_bytes(extra.get(0..4)?.try_into().ok()?);
+        let arch = u32::from_be_bytes(extra.get(4..8)?.try_into().ok()?);
+        (
+            id,
+            AuditEvent::Seccomp {
+                syscall: AuditSyscallNr::from_seccomp_data_nr(nr.cast_signed()),
+                arch: AuditSyscallArch::from_raw(arch),
+            },
+        )
+    } else {
+        if rest.len() != id_len {
+            return None;
+        }
+        (rest, REJECTIONS.get(usize::from(tag))?.audit_event())
+    };
     let at = AuditTimestamp::from_unix_duration(Duration::new(secs, nanos));
     let pid = AuditPid::new(i32::try_from(pid).ok()?).ok()?;
-    let mut record = AuditRecord::new(at, pid, rejection.audit_event());
+    let mut record = AuditRecord::new(at, pid, event);
     if !id.is_empty() {
         record = record.with_container_id(ContainerId::new(std::str::from_utf8(id).ok()?).ok()?);
     }
@@ -124,8 +161,13 @@ fn serve(mut stream: UnixStream, sink: &FileAuditSink) -> i32 {
             return 0;
         }
         let id_len = usize::from(head.last().copied().unwrap_or(0));
+        let extra = if head.first() == Some(&TAG_SECCOMP) {
+            SECCOMP_EXTRA_LEN
+        } else {
+            0
+        };
         let mut frame = head.to_vec();
-        frame.resize(FIXED_LEN + id_len, 0);
+        frame.resize(FIXED_LEN + id_len + extra, 0);
         if let Some(body) = frame.get_mut(FIXED_LEN..)
             && stream.read_exact(body).is_err()
         {
@@ -375,19 +417,73 @@ mod tests {
         }
     }
 
-    /// SEC-4: 制御チャネル以外の層は運ばない。
+    /// SEC-4: 運ぶのは制御チャネルと seccomp だけ。それ以外の層（Mount）は拒否する。
     #[test]
-    fn sec4_non_control_records_are_rejected() {
-        use super::super::{AuditSyscallArch, AuditSyscallNr};
+    fn sec4_other_layers_are_rejected() {
         let rec = AuditRecord::new(
             AuditTimestamp::from_unix_duration(Duration::new(1, 0)),
             AuditPid::new(1).unwrap(),
-            AuditEvent::Seccomp {
-                syscall: AuditSyscallNr::new(1).unwrap(),
-                arch: AuditSyscallArch::from_raw(0xC000_003E),
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
             },
         );
         assert_eq!(encode(&rec).unwrap_err().code(), ErrorCode::InvalidArgument);
+    }
+
+    fn seccomp_sample(nr: i32, arch: u32, id: Option<&str>) -> AuditRecord {
+        let r = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 7)),
+            AuditPid::new(77).unwrap(),
+            AuditEvent::Seccomp {
+                syscall: AuditSyscallNr::from_seccomp_data_nr(nr),
+                arch: AuditSyscallArch::from_raw(arch),
+            },
+        );
+        match id {
+            Some(id) => r.with_container_id(ContainerId::new(id).unwrap()),
+            None => r,
+        }
+    }
+
+    /// SEC-4・#2025: seccomp の枠は番号・arch・PID・コンテナ ID が往復で一致する（負の番号のビット列も保つ）。
+    #[test]
+    fn sec4_2025_seccomp_frame_round_trips() {
+        for (nr, arch, id) in [
+            (312, 0xC000_003E, Some("web-1")),
+            (272, 0xC000_00B7, None),
+            (-1, 0xDEAD_BEEF, Some("a")),
+        ] {
+            let rec = seccomp_sample(nr, arch, id);
+            let frame = encode(&rec).unwrap();
+            assert_eq!(
+                frame.len(),
+                FIXED_LEN + id.map_or(0, str::len) + SECCOMP_EXTRA_LEN
+            );
+            let back = decode(&frame).unwrap();
+            assert_eq!(
+                back.syscall().map(AuditSyscallNr::get),
+                Some(nr.cast_unsigned())
+            );
+            assert_eq!(back.seccomp_arch().map(AuditSyscallArch::get), Some(arch));
+            assert_eq!(back.pid(), rec.pid());
+            assert_eq!(back.timestamp(), rec.timestamp());
+            assert_eq!(back.container_id(), rec.container_id());
+        }
+    }
+
+    /// REPAIR-2・#2025: seccomp の壊れた枠（追加部の不足・余り・ID 長の不一致）は記録にしない。
+    #[test]
+    fn repair2_2025_malformed_seccomp_frames_are_not_decoded() {
+        let good = encode(&seccomp_sample(312, 0xC000_003E, Some("ab"))).unwrap();
+        assert!(decode(&good).is_some());
+        assert!(decode(&good[..good.len() - 1]).is_none());
+        let mut longer = good.clone();
+        longer.push(0);
+        assert!(decode(&longer).is_none());
+        let mut wrong_len = good;
+        wrong_len[17] = 3;
+        assert!(decode(&wrong_len).is_none());
     }
 
     /// REPAIR-2: 壊れた枠（短い・未知の理由・不正な時刻・PID 0）は記録にしない。

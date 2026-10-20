@@ -433,6 +433,7 @@ fn running_with(fake: Fake) -> Running {
         relauncher: Arc::new(NoRelaunch),
         instance: None,
         logs: None,
+        seccomp: None,
     }
 }
 

@@ -492,9 +492,17 @@ mod linux {
         assert!(threads() >= 2);
         let late = ControlAuditRelay::spawn(sink_for_late(&marker));
         assert_eq!(late.unwrap_err().code(), ErrorCode::FailedPrecondition);
-        // 非 ControlPeer の層は運ばない。
+        // 制御チャネルと seccomp（#2025）以外の層は運ばない。
+        let mount = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
+            AuditPid::new(4242).unwrap(),
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
+        );
         assert_eq!(
-            relay.record(&record()).unwrap_err().code(),
+            relay.record(&mount).unwrap_err().code(),
             ErrorCode::InvalidArgument
         );
         drop(release_tx);

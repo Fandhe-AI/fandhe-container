@@ -47,13 +47,14 @@
 //! 引数ベースのフィルタ（`clone`・`clone3` の `CLONE_NEW*`、`personality` 等）、moby 既定プロファイルの
 //! 許可リスト方式への発展（TASK-128・GPU-3）は扱わない。
 //! 監査ログ連携のうち拒否報告からレコードを作るフックは `audit_log`（TASK-41.2・SEC-4）にある。
-//! ただし `ERRNO(EPERM)` も `KILL_PROCESS` もユーザー空間へ報告しないため、ERRNO 側の配送経路は未実装。
-//! ERRNO 側 40 件を `SECCOMP_RET_USER_NOTIF` で返すフィルタは [`build_deny_filter_with`] /
-//! [`build_filter_for_target_arch_with`]（[`ErrnoDelivery::UserNotif`]）で構築できる（#2023・SEC-4。
-//! 方式は `docs/design/audit-delivery.md` 4 章・#2018）。ただし本番の適用経路（`exec/seccomp.rs`）は
-//! 従来どおり ERRNO 版のままで、listener fd の取得・受け渡しは #2024、listener ループと `-EPERM` 応答は
-//! #2025 が担う。listener 無しで USER_NOTIF 版を載せると 40 件は `EPERM` ではなく `ENOSYS` になり
-//! （syscall は実行されず拒否は維持される）、ESC-03 の期待と食い違うため、配線前は本番に載せない。
+//! ただし `ERRNO(EPERM)` も `KILL_PROCESS` もユーザー空間へ報告しないため、既定（ERRNO 版）では ERRNO 側の記録は残らない。
+//! ERRNO 側 40 件を `SECCOMP_RET_USER_NOTIF` で返すフィルタは、crate 内の `build_deny_filter_with` /
+//! `build_filter_for_target_arch_with`（[`ErrnoDelivery::UserNotif`]）で構築する（#2023・SEC-4。
+//! 方式は `docs/design/audit-delivery.md` 4 章・#2018）。外部からは `ProductionLauncherBuilder::seccomp_errno_delivery` の
+//! opt-in だけが選べる（誤って応答者のいない構成にしないため構築関数は公開しない。#2025）。supervisor の start 経路が
+//! opt-in し、listener fd の取得・受け渡し（#2024）と listener ループ・`-EPERM` 応答（#2025）が揃っている。
+//! listener 無しで USER_NOTIF 版を載せると 40 件は `EPERM` ではなく `ENOSYS` になり
+//! （syscall は実行されず拒否は維持される）、ESC-03 の期待と食い違うため、応答者のいない構成には載せない。
 //! 応答側は `SECCOMP_USER_NOTIF_FLAG_CONTINUE` を使ってはならない（許可に化けるため。#2025 への契約）。
 //! `KILL_PROCESS` 側の正の記録はカーネルの `AUDIT_SECCOMP` が出す（`actions_logged` に `kill_process` が
 //! ある限り記録され、`FILTER_FLAG_LOG` は不要。外部の読み手が要る。`docs/design/audit-delivery.md`・#2004）。
@@ -112,11 +113,13 @@ pub enum DenyAction {
 /// 拒否方針が `Errno` の syscall のフィルタ上の届け方（SEC-4・CORE-5。#2023）。真偽値にせず型で選ぶ。
 ///
 /// `KillProcess` の 3 件と arch 不一致・x32 の `KILL_PROCESS` はどちらでも変わらない。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ErrnoDelivery {
     /// 従来どおり `ERRNO(EPERM)` を返す（本番の既定）。
+    #[default]
     Errno,
-    /// ERRNO 側を `SECCOMP_RET_USER_NOTIF` に置き換える（listener の配線は #2024・#2025）。
+    /// ERRNO 側を `SECCOMP_RET_USER_NOTIF` に置き換える。listener に応答する者がいる本番 launcher の opt-in だけが使う
+    /// （`ProductionLauncherBuilder::seccomp_errno_delivery`。#2025）。
     UserNotif,
 }
 
@@ -687,7 +690,7 @@ pub fn build_deny_filter(table: &ArchSyscallTable) -> Result<SeccompProgram, Sec
 ///
 /// arch 検査・x32 拒否・`KILL_PROCESS` の 3 件・末尾の `ALLOW` と命令数は `delivery` に依らず同一で、
 /// `UserNotif` では ERRNO 側の `RET` の値だけが `SECCOMP_RET_USER_NOTIF` に変わる。
-pub fn build_deny_filter_with(
+pub(crate) fn build_deny_filter_with(
     table: &ArchSyscallTable,
     delivery: ErrnoDelivery,
 ) -> Result<SeccompProgram, SeccompBuildError> {
@@ -758,7 +761,7 @@ pub fn build_filter_for_target_arch() -> Result<SeccompProgram, SeccompBuildErro
 }
 
 /// [`build_filter_for_target_arch`] の届け方指定版（SEC-4・#2023）。対応外アーキは `Err(UnsupportedArch)`。
-pub fn build_filter_for_target_arch_with(
+pub(crate) fn build_filter_for_target_arch_with(
     delivery: ErrnoDelivery,
 ) -> Result<SeccompProgram, SeccompBuildError> {
     build_deny_filter_with(table_for_target_arch()?, delivery)

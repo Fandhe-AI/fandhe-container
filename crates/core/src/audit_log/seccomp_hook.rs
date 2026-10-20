@@ -8,19 +8,19 @@
 //!
 //! # 呼び出し元・契約
 //!
-//! - 呼び出し元は将来の SIGSYS ハンドラ、または supervisor の USER_NOTIF listener。**どちらも未実装**
-//!   （REPAIR-3）。現行の `seccomp::build_deny_filter` は禁止 syscall に `ERRNO(EPERM)`
-//!   （`unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS`。ESC-06。USER_NOTIF 版の構築関数
-//!   `build_deny_filter_with` は #2023 で実装済みだが本番は未配線。配線は #2024・#2025）を返すため、どちらも報告が発生せず、
-//!   本フックは本番経路からまだ呼ばれない。`KILL_PROCESS` では終了するプロセス自身が記録を書けず、
+//! - 呼び出し元は supervisor の USER_NOTIF listener ループ（`fandhe-container-supervisor` の `seccomp_notify`。#2025）。
+//!   SIGSYS ハンドラ経由（`from_sigsys`）は未実装（REPAIR-3）。supervisor の start 経路は `ProductionLauncherBuilder::
+//!   seccomp_errno_delivery(UserNotif)` で ERRNO 側の 40 件を通知にし、ループが PID を変換して本フックで記録してから
+//!   `-EPERM` で応答する。それ以外の launcher（既定の `Errno`）や exec 経路（#2385）は従来どおり `ERRNO(EPERM)` で、
+//!   報告が発生しない。`unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS`（ESC-06）。`KILL_PROCESS` では終了するプロセス自身が記録を書けず、
 //!   プロセス内の SIGSYS ハンドラ経由の `SeccompDenialReport::from_sigsys` も使えない。そのため KILL 側では
 //!   本フックを使わない（正の記録はカーネルの `AUDIT_SECCOMP`、補助は親の回収点が出す
-//!   `AuditEvent::ExitSignal`。#2004）。ERRNO 側の配送経路と実カーネルでの end-to-end 試験は後続作業で行う
+//!   `AuditEvent::ExitSignal`。#2004）
 //! - カーネル報告値は untrusted。構築子で検証し、panic しない。syscall 番号・arch は拒否された試行を
 //!   落とさないよう値を保存する（SEC-4 の 100% 記録）
 //! - シンクの失敗は握りつぶさず `Err` で伝播する。リトライ・フォールバックは呼び出し側（`write_with_fallback`・#840 の `KernelAuditFallback`）の担当
 
-use crate::traits::TraitError;
+use crate::traits::{ContainerId, TraitError};
 
 use super::{
     AuditEvent, AuditPid, AuditRecord, AuditRecordError, AuditRecordErrorKind, AuditSink,
@@ -121,23 +121,38 @@ impl SeccompDenialReport {
     }
 }
 
-/// 拒否報告 1 件につき [`AuditRecord`] をちょうど 1 件作り、`sink.record` を 1 回だけ呼ぶ。
+/// 拒否報告 1 件につき [`AuditRecord`] をちょうど 1 件作り、`sink.record` を 1 回だけ呼ぶ（コンテナ ID なし）。
 ///
 /// タイムスタンプは呼び出し側が `AuditTimestamp::now()` で渡す（テストで固定値を注入するため）。
-/// シンクのエラーはそのまま返す。
+/// シンクのエラーはそのまま返す。コンテナ ID を載せるなら [`record_seccomp_denial_for`]。
 pub fn record_seccomp_denial<S: AuditSink + ?Sized>(
     report: &SeccompDenialReport,
     timestamp: AuditTimestamp,
     sink: &S,
 ) -> Result<(), TraitError> {
-    sink.record(&AuditRecord::new(
+    record_seccomp_denial_for(report, timestamp, None, sink)
+}
+
+/// [`record_seccomp_denial`] にコンテナ ID を載せる版（SEC-4・#2025）。呼び出し元は supervisor の seccomp 通知ループで、
+/// 自分が監視するコンテナの ID を渡す（記録をコンテナに結び付ける。ID は検証済みの [`ContainerId`]）。
+pub fn record_seccomp_denial_for<S: AuditSink + ?Sized>(
+    report: &SeccompDenialReport,
+    timestamp: AuditTimestamp,
+    container_id: Option<&ContainerId>,
+    sink: &S,
+) -> Result<(), TraitError> {
+    let record = AuditRecord::new(
         timestamp,
         report.pid,
         AuditEvent::Seccomp {
             syscall: report.syscall,
             arch: report.arch,
         },
-    ))
+    );
+    sink.record(&match container_id {
+        Some(id) => record.with_container_id(id.clone()),
+        None => record,
+    })
 }
 
 #[cfg(test)]
@@ -304,5 +319,22 @@ mod tests {
             assert_eq!(r.syscall().map(AuditSyscallNr::get), Some(want));
             assert_eq!(r.seccomp_arch().map(AuditSyscallArch::get), Some(arch));
         }
+    }
+
+    /// SEC-4・#2025: コンテナ ID を載せる版は記録に ID・番号・arch・PID をそのまま載せる。
+    #[test]
+    fn sec4_2025_record_for_carries_the_container_id() {
+        let sink = VecSink::default();
+        let report = SeccompDenialReport::from_user_notif(4242, 312, 0xC000_003E).unwrap();
+        let id = ContainerId::new("web-1").unwrap();
+        record_seccomp_denial_for(&report, ts(), Some(&id), &sink).unwrap();
+        let recs = sink.records.lock().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].container_id().map(ContainerId::as_str),
+            Some("web-1")
+        );
+        assert_eq!(recs[0].pid().get(), 4242);
+        assert_eq!(recs[0].syscall().map(AuditSyscallNr::get), Some(312));
     }
 }

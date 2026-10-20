@@ -165,6 +165,86 @@ fn repair5_exit_is_bounded_when_stderr_reader_stalls() {
     assert!(elapsed < Duration::from_secs(15), "exit took {elapsed:?}");
 }
 
+/// 試験専用の登録失敗の注入（feature `signal-test-support`。`signals.rs` の `TEST_INSTALL_FAILURE_ENV`）。
+#[cfg(unix)]
+const SIGNAL_INSTALL_FAILURE_ENV: &str = "FANDHE_CONTAINER_TEST_SIGNAL_INSTALL_FAILURE";
+
+/// REPAIR-5・ERR-1・#1778: シグナル転送の登録に失敗したら、コマンドを実行せず終了コード 1（`INTERNAL`）と
+/// 構造化エラーの 1 行を、期限付きの出力経路経由で stderr へ出す（行が失われない）。
+#[cfg(unix)]
+#[test]
+fn repair5_signal_install_failure_reports_via_deferred_path() {
+    let out = run_env(
+        &[],
+        &[(SIGNAL_INSTALL_FAILURE_ENV, std::ffi::OsStr::new("1"))],
+    );
+    assert_failure(
+        &out,
+        1,
+        "{\"code\":\"INTERNAL\",\"message\":\"failed to install the signal handler for plugin forwarding\"}\n",
+    );
+}
+
+/// REPAIR-5・#1778: 登録失敗の出力も、stderr が読み手の読まない満杯の socket なら期限（2 秒）で打ち切られ、
+/// 終了コード 1 を保って終了する（main スレッドで無期限に書かない）。
+#[cfg(unix)]
+#[test]
+fn repair5_signal_install_failure_exit_is_bounded_when_stderr_reader_stalls() {
+    use std::os::unix::net::UnixStream;
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    a.set_nonblocking(true).expect("set_nonblocking");
+    let chunk = [b'x'; 4096];
+    let mut filled = false;
+    for _ in 0..1_000_000 {
+        match std::io::Write::write(&mut &a, &chunk) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                filled = true;
+                break;
+            }
+            Err(e) => panic!("fill failed: {e}"),
+        }
+    }
+    assert!(filled, "socket buffer was not filled");
+    a.set_nonblocking(false).expect("set_nonblocking");
+
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
+        .env_remove("FANDHE_CONTAINER_PLUGIN_PATH_SEARCH")
+        .env(SIGNAL_INSTALL_FAILURE_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::os::fd::OwnedFd::from(a)))
+        .spawn()
+        .expect("failed to spawn fandhe-container");
+    let deadline = start + CHILD_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            other => {
+                let _ = child.kill();
+                let reap_deadline = Instant::now() + REAP_TIMEOUT;
+                while Instant::now() < reap_deadline {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                panic!("fandhe-container did not exit within {CHILD_TIMEOUT:?}: {other:?}");
+            }
+        }
+    };
+    let elapsed = start.elapsed();
+    drop(b);
+    assert_eq!(status.code(), Some(1));
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "exited before the report timeout: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(15), "exit took {elapsed:?}");
+}
+
 /// CLI-1: 引数なしは使い方エラー（終了コード 2）。
 #[test]
 fn cli1_no_args_is_usage_error() {

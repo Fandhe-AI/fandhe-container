@@ -50,6 +50,11 @@ const FORWARDED: [i32; 3] = sys::FORWARDED_SIGNALS;
 /// 1 回だけ、`main` から呼ぶこと。ハンドラ本体は
 /// `sys` の固定ハンドラ（転送して再送する）で、呼び出し側は差し替えられない。
 pub fn install_signal_forwarding() -> Result<(), CliError> {
+    // 試験専用の失敗注入。シグナル設定に触れる前に本番と同じエラーで戻る（#1778）。
+    #[cfg(feature = "signal-test-support")]
+    if std::env::var_os(TEST_INSTALL_FAILURE_ENV).is_some() {
+        return Err(install_handler_error());
+    }
     // 転送の前提（登録表の pid が回収前の子を指すこと）を保つため、先に SIGCHLD を既定へ戻す。
     sys::reset_child_signal_if_ignored().map_err(|_| {
         CliError::new(
@@ -58,15 +63,24 @@ pub fn install_signal_forwarding() -> Result<(), CliError> {
         )
     })?;
     for sig in FORWARDED {
-        sys::install_forwarding_handler(sig).map_err(|_| {
-            CliError::new(
-                ErrorCode::Internal,
-                "failed to install the signal handler for plugin forwarding",
-            )
-        })?;
+        sys::install_forwarding_handler(sig).map_err(|_| install_handler_error())?;
     }
     Ok(())
 }
+
+/// ハンドラ登録の失敗を表す構造化エラー。本番の失敗と試験専用の失敗注入が同じ行を出すよう共通化する（#1778）。
+fn install_handler_error() -> CliError {
+    CliError::new(
+        ErrorCode::Internal,
+        "failed to install the signal handler for plugin forwarding",
+    )
+}
+
+/// 試験専用: この環境変数が設定されていると [`install_signal_forwarding`] が登録前に失敗する（値は見ない。
+/// 実バイナリの登録失敗時の stderr 出力が期限付きの経路を通ることを結合試験で確かめるため。#1778・REPAIR-5。
+/// feature `signal-test-support` のときだけ存在し、リリースビルドには無い）。
+#[cfg(feature = "signal-test-support")]
+const TEST_INSTALL_FAILURE_ENV: &str = "FANDHE_CONTAINER_TEST_SIGNAL_INSTALL_FAILURE";
 
 /// 結合試験の plugin 役が受信シグナルを記録するための固定ハンドラを登録する（#1513・PLUG-7。テスト専用。
 /// feature `signal-test-support` のときだけ存在する）。

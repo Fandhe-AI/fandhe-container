@@ -471,7 +471,7 @@ impl PullSession<'_> {
             .join(hex_of(digest)?);
         {
             let mut guard = self.store.lock()?;
-            guard.acquire_lease(digest.clone(), self.id.clone());
+            guard.acquire_lease(digest.clone(), self.id.clone())?;
         }
         let miss = match fs::symlink_metadata(&path) {
             _ if !dirs_exist => Some(BlobReuse::Absent),
@@ -843,6 +843,8 @@ impl PullSession<'_> {
             dst_checked.insert(b.clone(), ident);
         }
         let mut guard = self.store.lock()?;
+        // blob を置く前に未完了の削除が無いことを確かめる（OCI-7。lock も拒否するが入口として明示する）。
+        guard.ensure_no_pending_deletion()?;
         if guard
             .manifests()
             .any(|(d, c)| d == &req.manifest && c != &req.composition)

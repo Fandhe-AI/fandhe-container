@@ -128,7 +128,7 @@ impl ReferenceTable {
 
     fn execute_image_prune_inner(&mut self, root: &Path) -> Result<ImagePruneOutcome, OciError> {
         // 未完了のテーブル操作が残る間は prune を始めない（OCI-7）。
-        self.ensure_no_pending_table_ops()?;
+        self.ensure_no_pending_deletion()?;
         // 片づいていない削除が残っているうちは新しい削除を始めない（lock 時の再試行が先に片づける）。
         ensure_no_pending_journal(root)?;
         // テーブルもファイルも触る前にディレクトリ構成を検証する。
@@ -337,7 +337,8 @@ mod tests {
     fn oci7_prune_keeps_leased_blob() {
         let root = Root::new();
         let mut t = fixture(&root);
-        t.acquire_lease(d(0x11), PullId::new("p1").unwrap());
+        t.acquire_lease(d(0x11), PullId::new("p1").unwrap())
+            .unwrap();
         let out = t.execute_image_prune(&root.0).unwrap();
         assert_eq!(out.kept_leased_blobs, vec![d(0x11)]);
         assert!(root.exists(&d(0x11)));

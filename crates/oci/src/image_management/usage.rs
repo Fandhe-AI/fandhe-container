@@ -589,7 +589,8 @@ mod tests {
             .unwrap();
         assert_eq!(t.disk_usage(&root.0).unwrap().images.reclaimable_bytes, 0);
         let mut t2 = fixture(&root);
-        t2.acquire_lease(d(0x12), PullId::new("p1").unwrap());
+        t2.acquire_lease(d(0x12), PullId::new("p1").unwrap())
+            .unwrap();
         assert_eq!(
             t2.disk_usage(&root.0).unwrap().images.reclaimable_bytes,
             1130

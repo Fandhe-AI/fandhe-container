@@ -362,7 +362,7 @@ impl ReferenceTable {
         stopped: &StoppedContainers,
     ) -> Result<ImageRmOutcome, OciError> {
         // 未完了のテーブル操作が残る間は rm を始めない（OCI-7）。
-        self.ensure_no_pending_table_ops()?;
+        self.ensure_no_pending_deletion()?;
         let (action, delete) = match self.plan_image_rm_with(target, opts, stopped)? {
             ImageRmPlan::Refuse(u) => return Err(u.to_error()),
             ImageRmPlan::UntagOnly(a) => (a, false),
@@ -894,7 +894,8 @@ mod tests {
     fn oci7_rm_keeps_leased_blob() {
         let root = Root::new("lease");
         let mut t = fixture(&root);
-        t.acquire_lease(d(0x11), PullId::new("p1").unwrap());
+        t.acquire_lease(d(0x11), PullId::new("p1").unwrap())
+            .unwrap();
         let out = t
             .execute_image_rm(
                 &root.0,

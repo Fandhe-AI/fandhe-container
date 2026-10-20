@@ -380,7 +380,7 @@ impl ReferenceTable {
         digest: Digest,
         composition: ManifestComposition,
     ) -> Result<(), OciError> {
-        self.ensure_no_pending_table_ops()?;
+        self.ensure_no_pending_deletion()?;
         match self.manifests.get(&digest) {
             Some(existing) if existing == &composition => Ok(()),
             Some(_) => Err(err(
@@ -396,7 +396,7 @@ impl ReferenceTable {
 
     /// 在庫から manifest を外し、構成を返す。参照が残る場合は `FailedPrecondition`、無ければ `NotFound`。
     pub fn remove_manifest(&mut self, digest: &Digest) -> Result<ManifestComposition, OciError> {
-        self.ensure_no_pending_table_ops()?;
+        self.ensure_no_pending_deletion()?;
         self.remove_manifest_unchecked(digest)
     }
 
@@ -430,7 +430,7 @@ impl ReferenceTable {
         id: ContainerRefId,
         manifest: &Digest,
     ) -> Result<(), OciError> {
-        self.ensure_no_pending_table_ops()?;
+        self.ensure_no_pending_deletion()?;
         self.require_manifest(manifest)?;
         match self.container_refs.get(&id) {
             Some(cur) if &cur.manifest == manifest => Ok(()),
@@ -463,7 +463,7 @@ impl ReferenceTable {
 
     /// コンテナの参照を解除し、参照していた manifest を返す。無ければ `NotFound`。
     pub fn unregister_container(&mut self, id: &ContainerRefId) -> Result<Digest, OciError> {
-        self.ensure_no_pending_table_ops()?;
+        self.ensure_no_pending_deletion()?;
         self.container_refs
             .remove(id)
             .map(|e| e.manifest)
@@ -490,7 +490,7 @@ impl ReferenceTable {
         key: TagKey,
         manifest: &Digest,
     ) -> Result<Option<Digest>, OciError> {
-        self.ensure_no_pending_table_ops()?;
+        self.ensure_no_pending_deletion()?;
         self.require_manifest(manifest)?;
         self.ensure_tag_capacity([&key])?;
         Ok(self.tag_refs.insert(key, manifest.clone()))
@@ -498,7 +498,7 @@ impl ReferenceTable {
 
     /// タグを解除し、外した manifest を返す。無ければ `NotFound`。
     pub fn unregister_tag(&mut self, key: &TagKey) -> Result<Digest, OciError> {
-        self.ensure_no_pending_table_ops()?;
+        self.ensure_no_pending_deletion()?;
         self.unregister_tag_unchecked(key)
     }
 
@@ -510,9 +510,12 @@ impl ReferenceTable {
     }
 
     /// blob に pull リースを登録する。同じ pull ID の重複は冪等。
-    pub fn acquire_lease(&mut self, blob: Digest, pull: PullId) -> LeaseAcquired {
+    ///
+    /// 削除ジャーナルがディスクに残っている間は `FailedPrecondition`（参照の追加を禁じる。OCI-7）。
+    pub fn acquire_lease(&mut self, blob: Digest, pull: PullId) -> Result<LeaseAcquired, OciError> {
+        self.ensure_no_pending_deletion()?;
         let newly_added = self.pull_leases.entry(blob).or_default().insert(pull);
-        LeaseAcquired { newly_added }
+        Ok(LeaseAcquired { newly_added })
     }
 
     /// 指定の pull ID のリースだけを解放する。登録が無ければ `NotFound`（他の pull ID には触れない）。
@@ -713,9 +716,9 @@ mod tests {
     fn oci7_pull_leases_are_released_independently() {
         let mut t = ReferenceTable::new();
         let x = d(0x01);
-        assert!(t.acquire_lease(x.clone(), pid("p1")).newly_added);
-        assert!(t.acquire_lease(x.clone(), pid("p2")).newly_added);
-        assert!(!t.acquire_lease(x.clone(), pid("p2")).newly_added);
+        assert!(t.acquire_lease(x.clone(), pid("p1")).unwrap().newly_added);
+        assert!(t.acquire_lease(x.clone(), pid("p2")).unwrap().newly_added);
+        assert!(!t.acquire_lease(x.clone(), pid("p2")).unwrap().newly_added);
         assert_eq!(t.blob_references(&x).leases, vec![pid("p1"), pid("p2")]);
         t.release_lease(&x, &pid("p1")).unwrap();
         let r = t.blob_references(&x);
@@ -737,9 +740,9 @@ mod tests {
     fn oci7_release_all_leases_only_affects_own_pull_id() {
         let mut t = ReferenceTable::new();
         let (x, y) = (d(0x01), d(0x02));
-        t.acquire_lease(x.clone(), pid("p1"));
-        t.acquire_lease(y.clone(), pid("p1"));
-        t.acquire_lease(y.clone(), pid("p2"));
+        t.acquire_lease(x.clone(), pid("p1")).unwrap();
+        t.acquire_lease(y.clone(), pid("p1")).unwrap();
+        t.acquire_lease(y.clone(), pid("p2")).unwrap();
         assert_eq!(t.release_all_leases(&pid("p1")), vec![x.clone(), y.clone()]);
         assert_eq!(t.blob_references(&x).leases, vec![]);
         assert_eq!(t.blob_references(&y).leases, vec![pid("p2")]);
@@ -749,7 +752,7 @@ mod tests {
     #[test]
     fn oci7_lease_only_blob_is_referenced_without_manifest() {
         let mut t = ReferenceTable::new();
-        t.acquire_lease(d(0x77), pid("p1"));
+        t.acquire_lease(d(0x77), pid("p1")).unwrap();
         let r = t.blob_references(&d(0x77));
         assert_eq!(r.referencing_manifests, vec![]);
         assert!(r.is_referenced());

@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use super::ReferenceTable;
 use super::container_ref_persist::load_container_refs;
 use super::gc_journal::{
-    PendingDeletionRecovery, journal_exists, journal_has_table_ops, reap_stale_tmp,
+    PendingDeletionRecovery, journal_exists, journal_has_pending_deletions, reap_stale_tmp,
 };
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
@@ -135,9 +135,9 @@ impl ImageStore {
     pub fn lock(&self) -> Result<ImageStoreGuard<'_>, OciError> {
         record_oci_op(&*self.recorder, OciOpKind::AcquireImageStoreLock, || {
             let guard = self.lock_inner()?;
-            // 復旧後もテーブル操作入りのジャーナルが残るなら、変更を許さない（OCI-7）。
+            // 復旧後も削除対象入りのジャーナルが残るなら、変更を許さない（OCI-7）。
             // 古い untag・manifest 除去が再登録と両立しないため、障害が除かれて復旧が完了するまで拒否する。
-            if journal_has_table_ops(&self.root)? {
+            if journal_has_pending_deletions(&self.root)? {
                 return Err(OciError::new(
                     OciErrorCode::FailedPrecondition,
                     "a pending image deletion could not be completed; retry after it is recovered",
@@ -390,7 +390,8 @@ mod tests {
                 let _ = t.unregister_tag(&tag("keep"));
             }),
             ("acquire_lease", |t| {
-                t.acquire_lease(d(0x10), PullId::new("p1").expect("pull"));
+                t.acquire_lease(d(0x10), PullId::new("p1").expect("pull"))
+                    .unwrap();
             }),
             ("release_lease", |t| {
                 let _ = t.release_lease(&d(0x10), &PullId::new("p1").expect("pull"));

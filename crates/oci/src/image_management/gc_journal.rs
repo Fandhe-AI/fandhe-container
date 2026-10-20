@@ -295,14 +295,18 @@ pub(super) fn journal_exists(root: &Path) -> bool {
     }
 }
 
-/// 片づいていないジャーナルがあれば `FailedPrecondition`。新しい削除を始める前に呼ぶ。
-/// テーブル操作（manifest 除去・タグ解除）を含むジャーナルが残っているか。
+/// 削除の対象（manifest・タグ・blob のいずれか）を持つジャーナルが残っているか。
 ///
-/// 不変条件（OCI-7）: 残っている間はストアの変更系の入口を開けない。復旧が再実行する古い untag・
-/// manifest 除去が、その間に再登録されたタグ・manifest と両立しないため。blobs だけのジャーナルと
-/// 墓標は復旧が現在の参照を数え直すので該当しない。読めないジャーナルは `Err`（fail-closed）。
-pub(super) fn journal_has_table_ops(root: &Path) -> Result<bool, OciError> {
-    Ok(read_journal(root)?.is_some_and(|j| !j.manifests.is_empty() || !j.untag.is_empty()))
+/// 不変条件（OCI-7）: 残っている間は、どのプロセスからも参照の追加（manifest・タグ・コンテナ参照の登録、
+/// blob の公開・配置、pull リースの取得）と新しい削除の開始を拒否する。ジャーナルの作成から完了までの間に
+/// 新たな参照が生まれないので、復旧が消すのは作成時点で無参照だった blob に限られる。別プロセスの
+/// 復旧は manifest・タグ・リースの表が空（それらは永続化されずプロセス内のみ。既存の設計上の制約で、
+/// 永続化は TASK-183 の親 issue #471 の未実装範囲）でも、この拒否のおかげで再公開された blob を消さない。
+/// 対象の無い墓標（fsync 未確定の印）は何も消さないので該当しない。読めないジャーナルは `Err`（fail-closed）。
+pub(super) fn journal_has_pending_deletions(root: &Path) -> Result<bool, OciError> {
+    Ok(read_journal(root)?.is_some_and(|j| {
+        !j.manifests.is_empty() || !j.untag.is_empty() || !j.delete_blobs.is_empty()
+    }))
 }
 
 pub(super) fn ensure_no_pending_journal(root: &Path) -> Result<(), OciError> {
@@ -664,16 +668,17 @@ impl ReferenceTable {
         self.journal_root = super::JournalRoot(Some(root.to_path_buf()));
     }
 
-    /// テーブル操作（manifest 除去・タグ解除）入りの削除ジャーナルがディスクに残っていれば
-    /// `FailedPrecondition` で拒否する（OCI-7）。
+    /// 削除対象（manifest・タグ・blob）を持つジャーナルがディスクに残っていれば
+    /// `FailedPrecondition` で拒否する（OCI-7。論証は [`journal_has_pending_deletions`]）。
     ///
-    /// 契約: テーブルや blob を書く変更系の入口は、先頭でこれを呼ぶこと。取得済みのガードの中で
-    /// rm / prune が Pending を返した後も、残ったジャーナルを復旧が再実行するため、再登録と両立しない。
+    /// 契約: 参照を増やす・blob を書く変更系の入口（リース取得を含む）は、先頭でこれを呼ぶこと。
+    /// 取得済みのガードの中で rm / prune が Pending を返した後も、残ったジャーナルを復旧が再実行する
+    /// ため、再登録・リース取得と両立しない。
     /// 変更系を新設するときは必ず付ける（rm / prune が自分のジャーナルを書いた後の実行用の
     /// `*_unchecked` を除く）。root が未設定の単体テーブルでは何もしない。
-    pub(super) fn ensure_no_pending_table_ops(&self) -> Result<(), OciError> {
+    pub(super) fn ensure_no_pending_deletion(&self) -> Result<(), OciError> {
         match &self.journal_root.0 {
-            Some(root) if journal_has_table_ops(root)? => Err(err(
+            Some(root) if journal_has_pending_deletions(root)? => Err(err(
                 OciErrorCode::FailedPrecondition,
                 "a pending image deletion has not been completed; the store is read-only until it is recovered",
             )),
@@ -953,7 +958,8 @@ mod tests {
             ManifestComposition::new(d(0xc2), vec![d(0x11)]).unwrap(),
         )
         .unwrap();
-        t.acquire_lease(d(0xc1), PullId::new("p1").unwrap());
+        t.acquire_lease(d(0xc1), PullId::new("p1").unwrap())
+            .unwrap();
         let store = ImageStore::with_table(&root.0, t).unwrap();
         let rec = store.recover_pending_deletion().unwrap().unwrap();
         assert_eq!(rec.kept_blobs, vec![d(0x11), d(0xc1)]);
@@ -1304,7 +1310,7 @@ mod tests {
         test_hook::fail_unlink(100);
         let st = settle(&root.0, &[], &[d(0x11), d(0xc1)], 0, false);
         assert_eq!(st, DeletionDurability::Pending);
-        assert!(journal_has_table_ops(&root.0).unwrap());
+        assert!(journal_has_pending_deletions(&root.0).unwrap());
         let store = ImageStore::with_table(&root.0, table()).unwrap();
         let e = store.lock().unwrap_err();
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
@@ -1385,7 +1391,7 @@ mod tests {
             .unwrap();
         test_hook::clear();
         assert_eq!(out.durability, DeletionDurability::Pending);
-        assert!(journal_has_table_ops(&root.0).unwrap());
+        assert!(journal_has_pending_deletions(&root.0).unwrap());
         let comp = ManifestComposition::new(d(0xc1), vec![d(0x10), d(0x11)]).unwrap();
         for code in [
             g.register_manifest(d(0xa0), comp.clone())
@@ -1429,6 +1435,47 @@ mod tests {
         assert_eq!(g.manifests().count(), 1);
     }
 
+    /// OCI-7: blob のみのジャーナルが Pending で残る間は、参照の追加（register_manifest・
+    /// register_tag・acquire_lease）が FailedPrecondition になり、新しい lock も拒否される。
+    /// 障害を除いて再 lock すると復旧が完了し、その後は通る。
+    #[test]
+    fn oci7_blob_only_pending_blocks_reference_additions() {
+        let root = Root::new();
+        files(&root);
+        // 消せない blob（ディレクトリ）を残して blob のみのジャーナルを Pending にする。
+        let victim = blob_path(&root.0, &d(0x11)).unwrap();
+        fs::remove_file(&victim).unwrap();
+        fs::create_dir(&victim).unwrap();
+        let store = ImageStore::with_table(&root.0, table()).unwrap();
+        let mut g = store.lock().unwrap();
+        let out = g.execute_image_prune(&root.0).unwrap();
+        assert_eq!(out.durability, DeletionDurability::Pending);
+        let j = read_journal(&root.0).unwrap().unwrap();
+        assert!(j.manifests.is_empty() && j.untag.is_empty());
+        assert_eq!(j.delete_blobs, vec![d(0x11)]);
+        // 同じガード: 参照の追加はすべて拒否される。
+        let comp = ManifestComposition::new(d(0xc1), vec![d(0x10), d(0x11)]).unwrap();
+        let e = g.register_manifest(d(0xa0), comp.clone()).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        let e = g.register_tag(tk("v1"), &d(0xa0)).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        let pull = PullId::new("p1").unwrap();
+        let e = g.acquire_lease(d(0x11), pull.clone()).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        drop(g);
+        // 新しい lock も拒否される（復旧が試みられるが blob が消せない間）。
+        let e = store.lock().unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert!(root.journal());
+        // 障害を除くと復旧が完了し、以後は通る。
+        fs::remove_dir(&victim).unwrap();
+        let mut g = store.lock().unwrap();
+        assert!(!root.journal());
+        g.register_manifest(d(0xa0), comp).unwrap();
+        g.register_tag(tk("v1"), &d(0xa0)).unwrap();
+        assert!(g.acquire_lease(d(0x11), pull).unwrap().newly_added);
+    }
+
     /// OCI-7: 通常の lock 経路でも復旧結果（Abandoned と孤児 blob）が guard から取れる。
     #[test]
     fn oci7_lock_exposes_abandoned_recovery() {
@@ -1441,9 +1488,10 @@ mod tests {
         let store = ImageStore::with_table(&root.0, table()).unwrap();
         let out = store.lock().unwrap().execute_image_prune(&root.0).unwrap();
         assert_eq!(out.durability, DeletionDurability::Pending);
-        // 1 回目は prune、以降は lock 時の再試行。上限の手前までは結果を捨てて回す。
+        // 1 回目は prune、以降は lock 時の再試行。上限の手前までは Pending のため lock は拒否される（OCI-7）。
         for _ in 2..MAX_GC_RETRY_ATTEMPTS {
-            drop(store.lock().unwrap());
+            let e = store.lock().unwrap_err();
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
         }
         let g = store.lock().unwrap();
         let rec = g.recovery().expect("recovery must be reported");

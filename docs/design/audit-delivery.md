@@ -29,7 +29,7 @@ SEC-4（Must）は分離違反の試行の 100% 記録を要求する。現状�
 | `unix(7)` | 手元の版 | `SO_PASSCRED`・`SCM_CREDENTIALS` | 受信側が `SO_PASSCRED` を有効にすると、送信側が付けなくても送信元の資格情報が届く。pid は受信側の PID namespace の値に変換される。socketpair の `SO_PEERCRED` は作成者を返す | 確認済み（PID namespace の変換は実機の `production_launcher` で #2024 の照合が未実行のため、実機確認は未完） |
 | 同上 | 同上 | 通知の `pid` の名前空間 | 通知の `pid` が listener 側の PID namespace の値であること、`/proc/<pid>` の参照に PID 再利用の競合があることの両方は、本書で原文を確認しきれていない | **確認済み（2026-10-19。#2025）**: v6.12 `seccomp_notify_recv` は `unotif.pid = task_pid_vnr(knotif->task)`（RECV を呼んだ側の PID namespace の TID）。`ID_VALID` は RECV 済み（応答待ち）の通知が存在するとき 0、無ければ `ENOENT`。`poll` は未処理の通知で `EPOLLIN`、filter の利用者が 0 で `EPOLLHUP`。利用者が 0 の RECV は待たず `ENOENT`。supervisor は `/proc/<TID>/status` の `NSpid` 末尾へ変換し、読んだ後に `ID_VALID` で検証する |
 | Linux `userspace-api/landlock`（docs.kernel.org） | - | 監査ログ（`AUDIT_LANDLOCK_ACCESS`・`AUDIT_LANDLOCK_DOMAIN`）と `landlock_restrict_self` のログ制御フラグ | ABI 7（Linux 6.15 の見込み）で監査ログに対応し、`landlock_restrict_self` のログ制御フラグ（`LANDLOCK_RESTRICT_SELF_LOG_*`）を持つ見込み。execve の後の拒否を記録する指定が必要な見込み。本リポの Landlock は ABI 6・Linux 6.12 前提で差がある | 一部確認済み（2026-10-18）。`linux/landlock.h` で `LOG_SAME_EXEC_OFF`(1)・`LOG_NEW_EXEC_ON`(2)・`LOG_SUBDOMAINS_OFF`(4) を確認し、既定では execve の後の拒否が記録されないため `LOG_NEW_EXEC_ON` だけを渡す。ABI 7 と Linux 版数の対応・`CONFIG_AUDIT=n` のときの扱いは未確認 |
-| Linux カーネル監査（`AUDIT_SECCOMP`〔1326〕） | - | 記録項目・有効化・読み出し権限 | pid・syscall・arch・signal・ip・comm・exe が記録される見込み。`audit_enabled` が無効なら出ない。audit netlink の読み出しは `CAP_AUDIT_READ` 等の権限が要る見込み。コンテナ識別子（`contid`）の取り込み状況 | **未確認**。`audit.h`・auditd のドキュメントで確かめる。rootless で読めるかも同時に確かめる |
+| Linux カーネル監査（`AUDIT_SECCOMP`〔1326〕） | v6.12 | 記録項目・有効化・読み出し権限 | `auid uid gid ses pid comm exe sig arch syscall compat ip code` が記録される。`audit_seccomp` は `audit_enabled` に関係なく記録を強制する。`CONFIG_AUDITSYSCALL` が無い・起動時 `audit=0`・exclude 規則・backlog 超過では出ない。読み出し（`AUDIT_NLGRP_READLOG`）は初期 user namespace の `CAP_AUDIT_READ` と初期 network namespace が要る。`contid` は無い | **確認済み（2026-10-20。v6.12 の原文。#2237）**。詳細と読み手の判断材料は `audit-seccomp-reader.md` |
 | moby / containerd | - | seccomp の拒否の記録 | 既定は auditd 任せの見込み（moby 既定プロファイルは KILL 系を使わない。`seccomp.rs` のコメントと整合） | **未確認** |
 
 Landlock には USER_NOTIF に相当するユーザー空間への通知経路が無い見込み（`EACCES` は呼び出したプロセスにしか返らない）。この点も上記 Landlock 文書で確かめる（未確認）。
@@ -150,7 +150,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 
 縮退の判定に使う観測は、非特権で読める 3 点に限る。`/proc/sys/kernel/seccomp/actions_logged` に `kill_process` が無い（`seccomp_kill_not_logged`）、`/proc/cmdline` の `audit=0` 系（`kernel_audit_disabled_at_boot`）、`/proc/self/loginuid` が無い（`kernel_audit_not_built`。`CONFIG_AUDIT` なしのカーネル）、Landlock ABI 7 未満（`landlock_audit_abi_too_old`）。読めなかった観測は `unknown`（理由 `probe_failed`）とし、縮退と同じに扱う。procfs の読み取りは 4 KiB までに上限を設ける。出力は固定語彙だけで、`/proc/cmdline` などホスト由来の文字列は転記しない。
 
-**残余（REPAIR-3）**: `kernel_audit_requested` は「観測できる範囲に否定する証拠が無く、記録を要求した」だけを意味し、「記録された」ではない。ホストの `audit_enabled` の実行時の値（auditd が有効にしていないと `AUDIT_SECCOMP` は出ない見込み）と、外部の読み手がいるかは、`AUDIT_GET` に `CAP_AUDIT_CONTROL` 等が要り最小権限集合（`privilege-separation.md`）を変えるため判定に使っていない。上記 3 点の観測の条件（`actions_logged` の語彙、`loginuid` が `CONFIG_AUDIT` で作られること、`audit=0` の効き方）は、カーネルソースの原文での確認を済ませていない（本書 2 章の「未確認」のまま）。CLI の `start` / `run` から `--audit-policy` を渡す配線は未実装（`--restart` と同じく supervisor の契約までで、後続 issue）。起動した後に relay や recorder が失われた場合は、従来どおり `unrecorded` の集計と構造化ログで、停止はしない。
+**残余（REPAIR-3）**: `kernel_audit_requested` は「観測できる範囲に否定する証拠が無く、記録を要求した」だけを意味し、「記録された」ではない。外部の読み手がいるか（居ないと記録は間引かれうる dmesg の 1 行しか残らない。`AUDIT_SECCOMP` は `audit_enabled` に依存せず、v6.12 の原文で確認済み。#2237）、exclude 規則と backlog 超過（非特権では観測できない）は、`AUDIT_GET` に `CAP_AUDIT_CONTROL` 等が要り最小権限集合（`privilege-separation.md`）を変えるため判定に使っていない。上記 3 点の観測の条件（`actions_logged` の語彙、`loginuid` が `CONFIG_AUDIT` で作られること、`audit=0` の効き方）は、v6.12 の原文で確認済み（`audit-seccomp-reader.md` 2 章。#2237）。CLI の `start` / `run` から `--audit-policy` を渡す配線は未実装（`--restart` と同じく supervisor の契約までで、後続 issue）。起動した後に relay や recorder が失われた場合は、従来どおり `unrecorded` の集計と構造化ログで、停止はしない。
 
 **完了の条件**に含める: ESC-01・03・06・10 の `AuditExpectation::Deferred` を `Required` へ切り替える。ESC-07・08 が試験の側で作っている記録（`record_landlock_denial`、`audit_mount_config_error` の直接呼び出し）を、本番の配送経路が出した記録に置き換える。本番 sink の出力ファイルを親が回収して照合する形を含める。
 
@@ -163,6 +163,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 - **補助の `exit_signal` レコード**: 本番 launcher の回収点（`ContainerChildProcess` の `wait` / `terminate`）が SIGSYS の終了をちょうど 1 回、層 `exit_signal`（`AuditEvent::ExitSignal`。シグナルと回収側の PID namespace の対象 pid だけを持つ）で記録する。コンテナ内の `kill(SIGSYS)` と区別できないため seccomp 由来とは断定せず、syscall・arch は型として持たない（親の側で syscall を推測した記録は作れない）
 - **縮退**: カーネル監査を使えない環境では補助レコードだけが残る（syscall は残らない）。検出と表示は #2027（7.1）
 - **制約（後続）**: supervisor は監視の時点で複数スレッドのため `FileAuditSink` の隔離（fork）が使えず、代替のカーネル監査送信（`CAP_AUDIT_WRITE` が要る）に回る。rootless では補助レコードが残らない場合がある。複数スレッドからの配送は `ControlAuditRelay` を `ExitSignal` も運べるよう広げる後続で直す。pid 1 以外の子孫と supervisor の exec コマンドの SIGSYS 終了は親から見えない
+- **読み手と `CAP_AUDIT_READ` の判断材料**: 記録されない条件・rootless・選択肢 A/B は `audit-seccomp-reader.md`（#2237・オーナー承認待ち）。上の「カーネルソースでの確認は未実施」は同書 2 章で確認済み（v6.12）
 - **実機試験**: `crates/core/tests/seccomp_kill_audit.rs`（`--ignored`。root と auditd が前提。`AGENTS.md` 参照）
 
 ### 9.2 保証範囲（ワークロードの追加フィルタ。#2404 の指摘）

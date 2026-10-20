@@ -95,7 +95,7 @@ fandhe-container/
 │   │   ├── linux.md               # Linux の配置手順（CLI・supervisor・launcher を同じディレクトリに置く。rootful はインストールスクリプト、rootless は利用者所有のディレクトリ。`PATH` 上の symlink。#2068・SUP-14・CORE-6）
 │   │   ├── windows.md             # Windows セットアップ前提条件（WSL2・Developer Mode・`.wslconfig` の virtiofs。TASK-69・WIN-5。NTFS セマンティクス差異への対応〔TASK-68・WIN-4〕を統合）
 │   │   └── plugin-socket-recovery.md  # plugin socket の `ALREADY_EXISTS` の見分け方と記録の無い socket の手動削除の手順（#1859・PLUG-12）
-│   ├── verification/              # 実機確認の記録雛形（crictl-smoke.md: crictl runp→create→start の疎通確認の手順書と結果雛形。TASK-60・CRI-1。結果記入は #442。cli-cross-platform-parity.md: CLI 基本 6 コマンドの 3 OS 同一構文・挙動チェックリスト。TASK-125.1・CLI-1。結果記入は #661。supervisor-measurement-runbook.md: 監視プロセス系の実機計測〔#499・#485・#491・#219〕の実行手順。#1820）
+│   ├── verification/              # 実機確認の記録雛形（crictl-smoke.md: crictl runp→create→start の疎通確認の手順書と結果雛形。TASK-60・CRI-1。結果記入は #442。cli-cross-platform-parity.md: CLI 基本 6 コマンドの 3 OS 同一構文・挙動チェックリスト。TASK-125.1・CLI-1。結果記入は #661。supervisor-measurement-runbook.md: 監視プロセス系の実機計測〔#499・#485・#491・#219〕の実行手順。#1820。rootless-start-cgroup.md: 本番の rootless start と委譲 cgroup の prepare の実機確認・delete の通し試験の手順と結果雛形。#2062・CORE-3・CORE-6・SEC-1・CLI-1）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）
 ├── .github/workflows/             # ai-review・update-external・ci（稼働）/ release（発火条件無効化中）
 ├── .agents/skills/                # npx skills add の導入実体

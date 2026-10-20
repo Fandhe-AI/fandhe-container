@@ -12,3 +12,4 @@ pub mod adapter;
 #[cfg(unix)]
 pub mod server;
 pub mod startup;
+pub mod telemetry;

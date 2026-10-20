@@ -40,7 +40,7 @@ fn fail_err(e: &PluginError) -> ExitCode {
 fn serve(socket: &std::path::Path) -> ExitCode {
     use fandhe_container_plugin::grpc::GrpcServerConfig;
     use fandhe_container_plugin_cri::adapter::{CriPluginBackends, UnimplementedBundleProvider};
-    use fandhe_container_plugin_cri::server;
+    use fandhe_container_plugin_cri::{server, telemetry};
 
     let backends = match CriPluginBackends::production() {
         Ok(b) => b,
@@ -53,6 +53,7 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     };
+    let recorder = std::sync::Arc::clone(backends.op_recorder());
     let svc = backends.runtime_service(std::sync::Arc::new(UnimplementedBundleProvider));
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -62,12 +63,22 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         Ok(rt) => rt,
         Err(_) => return fail(PluginErrorCode::Internal, "failed to start the runtime"),
     };
-    let result = rt.block_on(server::serve(
-        socket,
-        svc,
-        &GrpcServerConfig::new(),
-        std::future::pending(),
-    ));
+    let result = rt.block_on(async {
+        // 操作の件数・レイテンシを定期的に構造化ログとして stderr へ出す（REPAIR-4）。
+        let stats = tokio::spawn(telemetry::op_stats_export_loop(
+            recorder,
+            telemetry::OP_STATS_EXPORT_INTERVAL,
+        ));
+        let r = server::serve(
+            socket,
+            svc,
+            &GrpcServerConfig::new(),
+            std::future::pending(),
+        )
+        .await;
+        stats.abort();
+        r
+    });
     match result {
         // pending() は完了しないため通常ここへは来ない。成功を装わず失敗扱いにする。
         Ok(()) => fail(PluginErrorCode::Internal, "server stopped unexpectedly"),

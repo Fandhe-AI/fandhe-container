@@ -48,6 +48,23 @@ fn invalid(msg: &'static str) -> PluginError {
     PluginError::new(PluginErrorCode::InvalidArgument, msg)
 }
 
+/// `--socket=<PATH>` の接頭辞をバイト列のまま除く（非 UTF-8 の有効な Unix パスを拒否しない）。
+fn strip_socket_prefix(a: &OsString) -> Option<OsString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        a.as_bytes()
+            .strip_prefix(b"--socket=")
+            .map(|v| OsString::from_vec(v.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        a.to_str()
+            .and_then(|s| s.strip_prefix("--socket="))
+            .map(OsString::from)
+    }
+}
+
 /// socket パスを検証する（空でない・NUL なし・絶対・`..` なし）。
 fn validate_socket(value: OsString) -> Result<PathBuf, PluginError> {
     #[cfg(unix)]
@@ -97,8 +114,8 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocatio
         let value = if a == "--socket" {
             // 値の欠落は不正（None のまま下で socket_error になる）。
             iter.next()
-        } else if let Some(v) = a.to_str().and_then(|s| s.strip_prefix("--socket=")) {
-            Some(OsString::from(v))
+        } else if let Some(v) = strip_socket_prefix(&a) {
+            Some(v)
         } else {
             other = true;
             continue;
@@ -136,6 +153,21 @@ mod tests {
     fn msg(r: Result<Invocation, PluginError>) -> (PluginErrorCode, String) {
         let e = r.expect_err("must fail");
         (e.code(), e.message().to_string())
+    }
+
+    /// 非 UTF-8 のバイト列を含む `--socket=<PATH>` も受ける。
+    #[cfg(unix)]
+    #[test]
+    fn socket_equals_form_accepts_non_utf8_path() {
+        use std::os::unix::ffi::OsStringExt;
+        let arg = OsString::from_vec(b"--socket=/run/\xff.sock".to_vec());
+        let r = parse_args([arg]).expect("must parse");
+        match r {
+            Invocation::Serve { socket } => {
+                assert_eq!(socket.as_os_str().as_encoded_bytes(), b"/run/\xff.sock")
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     /// PLUG-1: 引数なしは Run。

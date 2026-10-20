@@ -1,4 +1,4 @@
-//! Pod 単位のライフサイクルを `NetworkPlugin` の呼び出しへ写す層（TASK-114.4・#460・CRI-7・CRI-2）。
+//! Pod 単位のライフサイクルを `NetworkPlugin` の呼び出しへ写す層（TASK-114.4・#460・MS-4・CRI-7・CRI-2）。
 //!
 //! 呼び出し元: 将来は `fandhe-container-cri` の `RunPodSandbox`・`CreateContainer`・`RemovePodSandbox`
 //! の配線（#459 以降）が使う。現状は CRI の RPC からの呼び出しが無く、plugin 層で「PodSandbox の作成で
@@ -13,8 +13,8 @@
 
 use fandhe_container_core::traits::{
     AttachRequest, AttachResponse, ContainerId, CreateNetnsRequest, CreateNetworkRequest,
-    DeleteNetworkRequest, DetachRequest, ErrorCode, IpCidr, NetworkName, NetworkPlugin,
-    NetworkStatus, TraitError,
+    DeleteNetworkRequest, DeleteNetworkResponse, DetachRequest, ErrorCode, IpCidr, NetworkName,
+    NetworkPlugin, NetworkStatus, TraitError,
 };
 
 /// PodSandbox のネットワークを作る（`net-create`）。
@@ -56,8 +56,10 @@ pub fn set_up_container(
     }
 }
 
-/// PodSandbox のネットワークを削除する（`net-delete`）。
-pub fn tear_down_pod(net: &dyn NetworkPlugin, name: &NetworkName) -> Result<(), TraitError> {
+/// PodSandbox のネットワークを削除する（`net-delete`）。`NetworkPlugin` の応答をそのまま返す。
+pub fn tear_down_pod(
+    net: &dyn NetworkPlugin,
+    name: &NetworkName,
+) -> Result<DeleteNetworkResponse, TraitError> {
     net.delete_network(&DeleteNetworkRequest::new(name.clone()))
-        .map(|_| ())
 }

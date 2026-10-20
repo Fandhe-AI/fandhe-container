@@ -19,7 +19,7 @@ fandhe-container-plugin = { workspace = true }
 fandhe-container-cri = { path = "../cri" }
 # core は plugin feature を有効にしない（feature 統合で core の成果物が変わらないよう cri と揃える。PLUG-4）。
 fandhe-container-core = { path = "../core", default-features = false }
-# TASK-114.4（#460）: NetworkPlugin の実装が TASK-139 の統合 API（create_network・attach_container・delete_network）を呼ぶ。
+# TASK-114.4（#460・MS-4）: NetworkPlugin の実装が TASK-139 の統合 API（create_network・attach_container・delete_network）を呼ぶ。
 # workspace 内 path 依存で外部クレートの追加ではない。net は依存を持たない core 側ライブラリで、辺は plugin-cri → net の一方向（PLUG-1・CRI-7）。
 fandhe-container-net = { path = "../net" }
 

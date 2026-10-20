@@ -1,6 +1,6 @@
 //! `NetworkPlugin` の実装を PoC-15 netsetup の操作単位へ対応づけ、`fandhe-container-net` の統合 API
 //! （TASK-139。`create_network`・`attach_container`・`delete_network`）へ委ねる層
-//! （TASK-114.4・#460・PLUG-1・CRI-2・CRI-7。ネットワーク側は NET-1〜NET-4）。
+//! （TASK-114.4・#460・MS-4・PLUG-1・CRI-2・CRI-7。ネットワーク側は NET-1〜NET-4・TASK-139・MS-8）。
 //!
 //! 呼び出し元: [`crate::adapter::CriPluginBackends::production`] が Linux のときだけ
 //! [`NetsetupNetwork`]（`LinuxNetsetup` 付き）を `NetworkPlugin` として差す。Pod 単位の呼び出し順は
@@ -23,7 +23,8 @@
 //! - 契約 6: カーネル資源の巻き戻しは net が行う。取り残しがあれば件数を `message` に載せた `Internal` を返す
 //! - 契約 7・8・12: 本モジュールのレジストリで判定する。`attach` は契約 12 を最初に判定し、続けて
 //!   ネットワーク未作成、netns 未登録（いずれも `NotFound`）、紐付けネットワーク不一致（`FailedPrecondition`）の順
-//! - 契約 9: `delete_network` は net が残りを続行する。失敗時は再試行用のハンドルをレジストリへ戻す
+//! - 契約 9: `delete_network` は net が残りを続行する。失敗時は再試行用のハンドルをレジストリへ戻し、
+//!   ネットワークを削除中として印を残す（完了まで `create_netns`・`attach` は `FailedPrecondition`。再試行の `delete_network` は可）
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //!
@@ -130,22 +131,13 @@ fn to_endpoint(container: &ContainerId) -> Result<EndpointId, TraitError> {
     EndpointId::new(container.as_str()).map_err(|e| net_error_to_trait(&e))
 }
 
-/// コンテナ ID から netns 名を導出する（`netns-` + `.`・`_` を `-` へ置換。切り詰めは衝突するため行わない）。
+/// コンテナ ID から netns 名を導出する。
+///
+/// net の pin 先は `<netns_dir>/<エンドポイント ID>`（`ContainerAttachSpec::netns_path`）で、返す名前をその
+/// ファイル名と一致させるため ID をそのまま使う（接頭辞・置換・切り詰めは対応を壊し衝突するため行わない）。
+/// `NetnsName` が受けない文字（`.`・`_`）を含む ID は `InvalidArgument`（fail-closed）。
 fn derive_netns_name(container: &ContainerId) -> Result<NetnsName, TraitError> {
-    const PREFIX: &str = "netns-";
-    const MAX: usize = 64;
-    let sanitized: String = container
-        .as_str()
-        .chars()
-        .map(|c| if c == '.' || c == '_' { '-' } else { c })
-        .collect();
-    // 導出名は NetnsStatus で返すだけで net には渡さない。前置して 64 バイトに収まるときだけ前置し、
-    // 収まらない長い ID（標準の 64 桁 hex を含む）は前置せずそのまま使う。
-    if sanitized.len() + PREFIX.len() <= MAX {
-        NetnsName::new(format!("{PREFIX}{sanitized}"))
-    } else {
-        NetnsName::new(sanitized)
-    }
+    NetnsName::new(container.as_str())
 }
 
 /// サブネットから gateway（ネットワークアドレス + 1、prefix 長は同じ）を導出する。IPv4 の `/1`〜`/30` のみ。
@@ -233,6 +225,8 @@ struct ContainerEntry<C> {
 
 /// 作成済みネットワーク 1 件の記録。
 struct NetworkEntry<N> {
+    /// 削除を始めたら立てる。完了（記録の除去）まで下ろさず、その間の新規登録・接続を拒否する（契約 9）。
+    deleting: bool,
     gateway: IpPrefix,
     handle: N,
 }
@@ -316,6 +310,13 @@ fn not_found_netns() -> TraitError {
     )
 }
 
+fn network_deleting() -> TraitError {
+    TraitError::new(
+        ErrorCode::FailedPrecondition,
+        "network deletion is in progress or incomplete; retry delete_network",
+    )
+}
+
 fn network_mismatch() -> TraitError {
     TraitError::new(
         ErrorCode::FailedPrecondition,
@@ -344,7 +345,11 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let handle = self.backend.create_network(&name, gateway)?;
         reg.networks.insert(
             req.name().as_str().to_owned(),
-            NetworkEntry { gateway, handle },
+            NetworkEntry {
+                deleting: false,
+                gateway,
+                handle,
+            },
         );
         Ok(NetworkStatus::new(req.name().clone(), req.subnet()))
     }
@@ -354,8 +359,10 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let netns = derive_netns_name(req.container())?;
         let mut guard = self.lock()?;
         let reg = &mut *guard;
-        if !reg.networks.contains_key(req.network().as_str()) {
-            return Err(not_found_network());
+        match reg.networks.get(req.network().as_str()) {
+            None => return Err(not_found_network()),
+            Some(n) if n.deleting => return Err(network_deleting()),
+            Some(_) => {}
         }
         if reg.containers.contains_key(req.container().as_str()) {
             return Err(TraitError::new(
@@ -404,6 +411,9 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             .networks
             .get_mut(req.network().as_str())
             .ok_or_else(not_found_network)?;
+        if network.deleting {
+            return Err(network_deleting());
+        }
         let container = reg
             .containers
             .get_mut(req.container().as_str())
@@ -462,6 +472,8 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let reg = &mut *guard;
         let name = req.name().as_str();
         let network = reg.networks.get_mut(name).ok_or_else(not_found_network)?;
+        // 以降は成功して記録ごと消えるまで、失敗しても deleting を保つ（部分削除済みのまま再利用させない）。
+        network.deleting = true;
         let linked: Vec<String> = reg
             .containers
             .iter()
@@ -772,24 +784,23 @@ mod tests {
         assert_eq!(with_leftover(base.clone(), 0), base);
     }
 
-    /// netns 名の導出: `.`・`_` は `-` に置換し、長すぎる ID は切り詰めず拒否する。
+    /// netns 名の導出: pin のファイル名（コンテナ ID）と一致し、別 ID は別名になる（衝突しない）。
+    /// `NetnsName` が受けない文字を含む ID は拒否する。
     #[test]
-    fn netns_name_derivation() {
-        let id = ContainerId::new("web_1.a").expect("id");
-        assert_eq!(
-            derive_netns_name(&id).expect("name").as_str(),
-            "netns-web-1-a"
+    fn netns_name_matches_pin_file_name() {
+        let id = ContainerId::new("web-1-a").expect("id");
+        assert_eq!(derive_netns_name(&id).expect("name").as_str(), "web-1-a");
+        // 58 文字 ID と、その先頭に netns- を付けた 64 文字 ID は別名のまま。
+        let short = ContainerId::new("a".repeat(58)).expect("id");
+        let long = ContainerId::new(format!("netns-{}", "a".repeat(58))).expect("id");
+        assert_ne!(
+            derive_netns_name(&short).expect("short").as_str(),
+            derive_netns_name(&long).expect("long").as_str()
         );
-        // 58 文字までは前置し、超える ID（64 桁 hex を含む）は前置せずに通す。
-        let edge = ContainerId::new("a".repeat(58)).expect("id");
+        let dotted = ContainerId::new("web_1.a").expect("id");
         assert_eq!(
-            derive_netns_name(&edge).expect("edge").as_str(),
-            format!("netns-{}", "a".repeat(58))
-        );
-        let hex = ContainerId::new("a1".repeat(32)).expect("id");
-        assert_eq!(
-            derive_netns_name(&hex).expect("hex").as_str(),
-            "a1".repeat(32)
+            derive_netns_name(&dotted).expect_err("dotted").code(),
+            ErrorCode::InvalidArgument
         );
     }
 }

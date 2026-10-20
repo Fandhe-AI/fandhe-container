@@ -15,7 +15,7 @@
 //! - `StateStore`: 既定実装 `FileStateStore` は core にある。本モジュールは二つ目の実装を作らず、
 //!   選んで開き注入するだけ（別実装への差し替えは [`CriPluginBackends::new`] の注入口）
 //! - `NetworkPlugin`: Linux では [`crate::netsetup::NetsetupNetwork`]（netsetup の操作単位へ対応づけ、`fandhe-container-net` の
-//!   TASK-139 統合 API を呼ぶ。TASK-114.4・#460）。他 OS は `production()` 自体が `Unimplemented` で、
+//!   TASK-139 統合 API を呼ぶ。TASK-114.4・#460・MS-4）。他 OS は `production()` 自体が `Unimplemented` で、
 //!   注入口では [`UnimplementedNetwork`] を差せる
 //! - `VolumeProvider`: 実装は core 側に置く（データパスに接するため。ここには置かない）
 //!

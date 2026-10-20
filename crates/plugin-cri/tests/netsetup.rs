@@ -1,4 +1,4 @@
-//! `NetsetupNetwork`（netsetup の操作単位への写像。TASK-114.4・#460）と `pod_network` の振る舞い試験。
+//! `NetsetupNetwork`（netsetup の操作単位への写像。TASK-114.4・#460・MS-4）と `pod_network` の振る舞い試験。
 //!
 //! カーネルを触らない fake の `NetsetupBackend` で、`NetworkPlugin` の契約 6〜9・12 の分岐と、
 //! PodSandbox 作成 → コンテナ作成 → PodSandbox 削除で net の操作が正しい順序で呼ばれることを
@@ -283,7 +283,24 @@ fn contract9_failed_delete_is_retryable() {
     fake.0.lock().expect("lock").fail_delete = 1;
     let e = pod_network::tear_down_pod(&net, &nname("a")).expect_err("fail");
     assert_eq!(e.code(), ErrorCode::Internal);
-    pod_network::tear_down_pod(&net, &nname("a")).expect("retry");
+    // 契約 9: 部分削除済みのネットワークへは、完了まで新規登録・接続を許さない。
+    assert_eq!(
+        net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c3")))
+            .expect_err("deleting")
+            .code(),
+        ErrorCode::FailedPrecondition
+    );
+    assert_eq!(
+        net.attach(&AttachRequest::new(nname("a"), cid("c2")))
+            .expect_err("deleting")
+            .code(),
+        ErrorCode::FailedPrecondition
+    );
+    let resp = pod_network::tear_down_pod(&net, &nname("a")).expect("retry");
+    assert_eq!(
+        resp,
+        fandhe_container_core::traits::DeleteNetworkResponse::new()
+    );
     let calls = fake.calls();
     assert_eq!(
         calls[calls.len() - 2..],

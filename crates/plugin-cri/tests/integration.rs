@@ -343,6 +343,8 @@ async fn task114_5_plug12_rejects_other_uid_connection_to_cri_plugin() {
         let ch = connect_when_ready(&sock, &mut server).await;
         drop(ch);
 
+        // 回収不能時は同期 wait() で無期限に待たず panic で報告するため、zombie 警告を許可する（REPAIR-5）。
+        #[allow(clippy::zombie_processes)]
         let mut child = Command::new(&cmd)
             .arg(&sock)
             .stdin(Stdio::null())
@@ -368,11 +370,21 @@ async fn task114_5_plug12_rejects_other_uid_connection_to_cri_plugin() {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         if !exited {
-            let _ = child.kill();
-        }
-        let _ = child.wait();
-        if !exited {
-            panic!("connector did not exit after the connection was rejected");
+            // 強制終了後の回収にも期限を設ける（REPAIR-5）。同期 wait() は使わない。
+            let kill_result = child.kill();
+            let reap_deadline = Instant::now() + REAP_GRACE;
+            let mut reaped = false;
+            while Instant::now() < reap_deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    reaped = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!(
+                "connector did not exit after the connection was rejected \
+                 (kill result: {kill_result:?}, reaped within grace: {reaped})"
+            );
         }
         let received = rx
             .recv_timeout(Duration::from_secs(5))

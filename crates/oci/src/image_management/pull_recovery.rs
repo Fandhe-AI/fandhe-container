@@ -241,7 +241,6 @@ impl ImageStore {
     fn recover_stale_pulls_inner(&self) -> Result<StalePullRecovery, OciError> {
         let mut result = StalePullRecovery::default();
         let staging = self.root().join(STAGING_DIR_NAME);
-        let mut absent: Vec<(PullId, Option<File>)> = Vec::new();
 
         let mut guard = self.lock()?;
         match fs::symlink_metadata(&staging) {
@@ -277,8 +276,13 @@ impl ImageStore {
         }
         ids.sort();
 
+        // 1 件ずつ「判定 → リース解放 → ハンドル解放 → 削除」を行い、開いた `@pull.lock` の同時保持数を
+        // 1 に抑える（残骸が多くても fd 上限に達しない）。ストア排他は削除が終わるまで保持する。
+        // 手放すと別の GC が同じ残骸を確定し、この削除の後に `begin_pull` が同 ID で作った新しい
+        // ステージングを遅れて消しうる（OCI-7）。
         for id in ids {
-            match probe_pull(&staging.join(id.as_str())) {
+            let dir = staging.join(id.as_str());
+            match probe_pull(&dir) {
                 PullLiveness::Live => result.kept_live.push(id),
                 PullLiveness::Undetermined => result.kept_undetermined.push(id),
                 PullLiveness::Absent(file) => {
@@ -287,19 +291,13 @@ impl ImageStore {
                     if n > 0 {
                         result.released_leases.push((id.clone(), n));
                     }
-                    absent.push((id, file));
+                    // Windows は開いたハンドルがディレクトリ削除を妨げるため、先に閉じる。
+                    drop(file);
+                    match reclaim_dir(&dir) {
+                        Ok(()) => result.reclaimed.push(id),
+                        Err(code) => result.failed.push((id, code)),
+                    }
                 }
-            }
-        }
-        // 削除が終わるまでストア排他を保持する。手放すと別の GC が同じ残骸を確定し、この削除の後に
-        // `begin_pull` が同 ID で作った新しいステージングを遅れて消しうる（OCI-7）。
-        for (id, file) in absent {
-            // Windows は開いたハンドルがディレクトリ削除を妨げるため、先に閉じる。
-            drop(file);
-            let dir = staging.join(id.as_str());
-            match reclaim_dir(&dir) {
-                Ok(()) => result.reclaimed.push(id),
-                Err(code) => result.failed.push((id, code)),
             }
         }
         drop(guard);

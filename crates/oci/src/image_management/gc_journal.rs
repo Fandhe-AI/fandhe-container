@@ -280,6 +280,24 @@ pub(super) fn ensure_no_pending_journal(root: &Path) -> Result<(), OciError> {
 ///
 /// 失敗しても既存のジャーナルは壊さない。上限超過は `ResourceExhausted`。
 pub(super) fn write_journal(root: &Path, journal: &GcJournal) -> Result<(), OciError> {
+    persist_journal(root, journal, true)
+}
+
+/// 削除開始後にジャーナルを書き直す（`settle` 専用）。
+///
+/// 初回公開の [`write_journal`] と違い、rename 後に root の fsync だけが失敗しても取り消さない。
+/// 取り消すと削除対象を持つジャーナルが消え、電源断で unlink が巻き戻っても再削除できなくなる（OCI-7）。
+/// その場合は `Ok` を返す（書き直したジャーナルは見えており、永続化は未確定）。呼び出し側は
+/// 常に `Pending` を返し、次の lock の復旧が再試行する。公開前の失敗は元のジャーナルが残る `Err`。
+fn rewrite_journal(root: &Path, journal: &GcJournal) -> Result<(), OciError> {
+    persist_journal(root, journal, false)
+}
+
+fn persist_journal(
+    root: &Path,
+    journal: &GcJournal,
+    revoke_on_unsynced: bool,
+) -> Result<(), OciError> {
     if journal.manifests.len() > MAX_GC_JOURNAL_ENTRIES
         || journal.untag.len() > MAX_GC_JOURNAL_ENTRIES
         || journal.delete_blobs.len() > MAX_GC_JOURNAL_ENTRIES
@@ -302,6 +320,7 @@ pub(super) fn write_journal(root: &Path, journal: &GcJournal) -> Result<(), OciE
         Err(PublishError::BeforePublish) => {
             Err(err(OciErrorCode::Internal, "failed to persist gc journal"))
         }
+        Err(PublishError::AfterPublish) if !revoke_on_unsynced => Ok(()),
         Err(PublishError::AfterPublish) => {
             // rename 済みで root の fsync だけが失敗した。ジャーナルは見えているが、ディレクトリエントリの
             // 永続化は未確定である。読み戻せても永続化の証明にならないため、削除（テーブル更新・unlink）は
@@ -543,7 +562,7 @@ pub(super) fn settle(
             attempts,
             ..GcJournal::default()
         };
-        if write_journal(root, &rest).is_err() {
+        if rewrite_journal(root, &rest).is_err() {
             return abandon();
         }
         return DeletionDurability::Pending;
@@ -561,7 +580,7 @@ pub(super) fn settle(
             attempts: prior_attempts,
             ..GcJournal::default()
         };
-        let _ = write_journal(root, &rest);
+        let _ = rewrite_journal(root, &rest);
         return DeletionDurability::Pending;
     }
     match remove_journal(root) {
@@ -1176,6 +1195,30 @@ mod tests {
         drop(g);
         assert!(root.exists(&d(0x11)));
         assert!(root.exists(&d(0xc1)));
+        assert!(!root.journal());
+    }
+
+    /// OCI-7: 削除開始後のジャーナル書き直しで rename 後に root の fsync が失敗しても、
+    /// ジャーナルを取り消さず Pending を返し、次の復旧が delete_blobs を消す。
+    #[test]
+    fn oci7_rewrite_root_fsync_failure_keeps_journal_and_recovers() {
+        let root = Root::new();
+        files(&root);
+        write_journal(&root.0, &journal_a()).unwrap();
+        // 0x11 は unlink 済み、0xc1 は今回は消せなかった扱い。書き直しの root fsync だけ失敗させる。
+        fs::remove_file(blob_path(&root.0, &d(0x11)).unwrap()).unwrap();
+        test_hook::fail_sync_of(&root.0, 1);
+        let st = settle(&root.0, &[d(0xc1)], &[d(0x11)], 0, false);
+        test_hook::clear();
+        assert_eq!(st, DeletionDurability::Pending);
+        let j = read_journal(&root.0).unwrap().unwrap();
+        assert_eq!(j.delete_blobs, vec![d(0xc1)]);
+        assert_eq!(j.attempts, 1);
+        // テーブル更新は済んでいる（A は無い）状態で復旧する。
+        let store = ImageStore::with_table(&root.0, ReferenceTable::new()).unwrap();
+        let rec = store.recover_pending_deletion().unwrap().unwrap();
+        assert_eq!(rec.deleted_blobs, vec![d(0xc1)]);
+        assert!(!root.exists(&d(0xc1)));
         assert!(!root.journal());
     }
 

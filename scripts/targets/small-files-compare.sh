@@ -22,6 +22,10 @@ if [ -z "${harness}" ]; then
   require_cmd jq
   RUN_LIMITED_DIR="$(mktemp -d)"
   trap 'run_limited_abort; rm -rf "${RUN_LIMITED_DIR}"' EXIT
+  # 中断シグナルでも EXIT trap（ビルドの子の回収）へ到達させる（REPAIR-5）。
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
   build_out="${RUN_LIMITED_DIR}/build.jsonl"
   run_limited 1800 cargo bench --no-run --message-format=json -p fandhe-container-benches --bench small_files >"${build_out}"
   exes="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "small_files" and .executable != null) | .executable' "${build_out}")"
@@ -43,4 +47,21 @@ if [ -n "${TIMEOUT_SECS:-}" ]; then args+=(--timeout-secs "${TIMEOUT_SECS}"); fi
 if [ -n "${OUTPUT:-}" ]; then args+=(--output "${OUTPUT}"); fi
 # lib.sh の run は実行前にコマンド行を stdout へ出し、OUTPUT 未指定時の結果 JSON（stdout は JSON のみ）を壊すため使わない。
 printf '%s\n' "running: small_files_compare.sh" >&2
-bash "${DIR}/../bench/small_files_compare.sh" "${args[@]}"
+# 比較スクリプトは子として起動し、中断シグナルを転送して自身の後始末（ハーネスの回収）を走らせる（REPAIR-5）。
+bash "${DIR}/../bench/small_files_compare.sh" "${args[@]}" &
+child=$!
+forward_abort() { # <終了コード>
+  kill -TERM "${child}" 2>/dev/null || true
+  wait "${child}" 2>/dev/null || true
+  exit "$1"
+}
+trap 'forward_abort 130' INT
+trap 'forward_abort 143' TERM
+trap 'forward_abort 129' HUP
+rc=0
+while :; do
+  wait "${child}" && rc=0 || rc=$?
+  # シグナルで wait が中断された場合は trap 側が exit する。子が終了していればここで抜ける。
+  kill -0 "${child}" 2>/dev/null || break
+done
+exit "${rc}"

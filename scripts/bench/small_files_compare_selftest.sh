@@ -216,6 +216,29 @@ fi
 STUB_MODE=ok
 export STUB_MODE
 
+# --- 中断シグナル: TERM で後始末が走り、ハーネスの子孫が残らない（REPAIR-5） ---
+STUB_MODE=hang-nv
+export STUB_MODE
+rm -f "$STUB_PIDFILE"
+: >"$log"
+"$bash_bin" "$target_script" $(base_args) >/dev/null 2>&1 &
+sig_pid=$!
+n=0
+while [ ! -s "$STUB_PIDFILE" ] && [ "$n" -lt 50 ]; do sleep 0.2; n=$((n + 1)); done
+if [ -s "$STUB_PIDFILE" ]; then
+  kill -TERM "$sig_pid" 2>/dev/null || true
+  sig_rc=0
+  wait "$sig_pid" 2>/dev/null || sig_rc=$?
+  sleep 1
+  if [ "$sig_rc" -eq 143 ]; then pass "signal: rc=143 on TERM"; else fail "signal: expected rc=143, got $sig_rc"; fi
+  if kill -0 "$(cat "$STUB_PIDFILE")" 2>/dev/null; then fail "signal: stub descendant still alive after TERM"; else pass "signal: no descendant left after TERM"; fi
+else
+  kill -KILL "$sig_pid" 2>/dev/null || true
+  fail "signal: stub did not record its child pid"
+fi
+STUB_MODE=ok
+export STUB_MODE
+
 # --- 前提ツール欠如（3）: jq を含まない PATH ---
 nojq="${tmp_root}/nojq-bin"
 mkdir -p "$nojq"

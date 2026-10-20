@@ -149,6 +149,11 @@ cleanup() {
   rm -rf "${work}"
 }
 trap cleanup EXIT
+# 中断シグナルでも EXIT trap（cleanup）へ到達させる。run_limited はハーネスを独立したプロセスグループで
+# 起動するため、親が TERM / INT / HUP で落ちるだけではハーネスと見張り役が残る（REPAIR-5）。
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 fail_measure() {
   echo "error: code=measurement-failed message=$1" >&2

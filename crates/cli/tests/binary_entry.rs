@@ -1314,6 +1314,141 @@ fn doctor_reports_unreachable_user_manager_without_leaking_the_path() {
     assert_eq!(out.status.code(), Some(3));
 }
 
+/// 一時ディレクトリに `systemd/private` の UNIX ソケットを `listen` 状態で作り、`XDG_RUNTIME_DIR` にできる
+/// ディレクトリ（`TmpDir` 直下の `xdg`）とリスナーを返す。ディレクトリは 0700 で所有者は自分。
+#[cfg(target_os = "linux")]
+fn user_manager_socket_dir(tmp: &TmpDir) -> (std::path::PathBuf, std::os::unix::net::UnixListener) {
+    use std::os::unix::fs::DirBuilderExt;
+    let xdg = tmp.0.join("xdg");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&xdg)
+        .expect("mkdir xdg");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(xdg.join("systemd"))
+        .expect("mkdir systemd");
+    let l =
+        std::os::unix::net::UnixListener::bind(xdg.join("systemd").join("private")).expect("bind");
+    (xdg, l)
+}
+
+/// stdout の JSON Lines に重大度 `warning` の行があるか（あれば終了コードは 3）。
+#[cfg(target_os = "linux")]
+fn doctor_has_warning(stdout: &str) -> bool {
+    stdout
+        .lines()
+        .any(|l| l.starts_with("{\"severity\":\"warning\","))
+}
+
+/// root では検査を省くため、結合試験は何もしない（`doctor_reports_unset_xdg_runtime_dir` が通知を照合する）。
+#[cfg(target_os = "linux")]
+fn is_root() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").expect("meta").uid() == 0
+}
+
+/// CORE-3・CORE-4・REPAIR-5（#2158）: 生きているソケットには実 connect が成功し、user マネージャ系の診断は出ない。
+/// listener を落としてファイルだけ残すと `USER_MANAGER_SOCKET_REFUSED`（warning・`socket_refused`）で終了コード 3。
+#[cfg(target_os = "linux")]
+#[test]
+fn core3_repair5_doctor_connects_live_and_dead_socket() {
+    if is_root() {
+        return;
+    }
+    let tmp = TmpDir::new("doctor-live-dead");
+    let (xdg, listener) = user_manager_socket_dir(&tmp);
+
+    // 生存ソケット。
+    let out = run_env(&["doctor"], &[("XDG_RUNTIME_DIR", xdg.as_os_str())]);
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    assert!(!stdout.contains("\"check\":\"user_manager\""), "{stdout}");
+    let code = out.status.code().expect("code");
+    if doctor_has_warning(&stdout) {
+        assert_eq!(code, 3, "{stdout}");
+    } else {
+        assert!([0, 4].contains(&code), "{stdout}");
+    }
+
+    // 死んだソケット（listener を落としてもファイルは残る）。
+    drop(listener);
+    let out = run_env(&["doctor"], &[("XDG_RUNTIME_DIR", xdg.as_os_str())]);
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let line = doctor_line_with_code(&stdout, "USER_MANAGER_SOCKET_REFUSED").expect("refused line");
+    assert!(line.starts_with("{\"severity\":\"warning\","), "{line}");
+    assert!(line.ends_with("\"check\":\"user_manager\",\"state\":\"socket_refused\"}"));
+    assert_eq!(out.status.code(), Some(3));
+    assert!(!stdout.contains(&xdg.display().to_string()), "{stdout}");
+}
+
+/// REPAIR-5・CORE-3（#2158）: listen backlog が満杯で accept されないソケットでも、`doctor` は期限（1 秒）の後に
+/// 終了し、`USER_MANAGER_CONNECT_TIMED_OUT`（notice・`connect_timed_out`）を出す。他に warning が無ければ
+/// 終了コードは 4（判定不能）、あれば 3。ハングしないことを経過時間（10 秒未満）で照合する。
+#[cfg(target_os = "linux")]
+#[test]
+fn repair5_core3_doctor_times_out_on_full_backlog() {
+    use fandhe_container_supervisor::user_scope::{
+        UserManagerConnectError, probe_user_manager_socket,
+    };
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    if is_root() {
+        return;
+    }
+    let tmp = TmpDir::new("doctor-backlog");
+    let (xdg, listener) = user_manager_socket_dir(&tmp);
+    let sock = xdg.join("systemd").join("private");
+
+    // accept しないまま接続を積み、backlog が満杯になるまで続ける。満杯の判定は「接続スレッドの数」ではなく、
+    // doctor と同じ非ブロッキング connect（`probe_user_manager_socket`）が期限内に `TimedOut`（= `EAGAIN` が続く）に
+    // なったことで行う。スレッドの未スケジュール・connect の失敗に左右されず、観測した時点のカーネルの状態だけに依る。
+    let (tx, rx) = mpsc::channel::<UnixStream>();
+    let mut held = Vec::new();
+    let mut spawned = 0usize;
+    let mut full = false;
+    while spawned < 20_000 && !full {
+        for _ in 0..64 {
+            let tx = tx.clone();
+            let sock = sock.clone();
+            std::thread::Builder::new()
+                .stack_size(64 * 1024)
+                .spawn(move || {
+                    if let Ok(s) = UnixStream::connect(&sock) {
+                        let _ = tx.send(s);
+                    }
+                })
+                .expect("spawn");
+            spawned += 1;
+        }
+        while let Ok(s) = rx.try_recv() {
+            held.push(s);
+        }
+        full =
+            probe_user_manager_socket(xdg.as_os_str(), Instant::now() + Duration::from_millis(100))
+                == Err(UserManagerConnectError::TimedOut);
+    }
+    assert!(full, "backlog did not fill within the connection cap");
+
+    let start = Instant::now();
+    let out = run_env(&["doctor"], &[("XDG_RUNTIME_DIR", xdg.as_os_str())]);
+    let elapsed = start.elapsed();
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    drop(listener);
+    drop(held);
+
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let line =
+        doctor_line_with_code(&stdout, "USER_MANAGER_CONNECT_TIMED_OUT").expect("timed out line");
+    assert!(line.starts_with("{\"severity\":\"notice\","), "{line}");
+    assert!(line.ends_with("\"check\":\"user_manager\",\"state\":\"connect_timed_out\"}"));
+    let expected = if doctor_has_warning(&stdout) { 3 } else { 4 };
+    assert_eq!(out.status.code(), Some(expected), "{stdout}");
+}
+
 /// CLI-1（#2133）: `doctor` に余計な引数を渡すと使い方エラー（2）。stdout は空。
 #[test]
 fn doctor_rejects_extra_arguments() {

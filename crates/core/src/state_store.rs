@@ -75,6 +75,7 @@
 //!   同じ方針）。実効 UID・`O_NOFOLLOW | O_NONBLOCK`・ACL の検出は `sys/macos.rs` の薄いラッパー。
 //!   制約: 既定で deny の ACL が付いた場所（ホームディレクトリ等）の下には状態ルートを置けない。既定の
 //!   状態ルート（[`StateRoot::resolve`]）は Linux のみで、macOS では上書き指定が必須
+//!   （macOS の既定はオーナー判断待ち。#2431・`docs/design/macos-state-root.md`）
 //! - Windows: [`FileStateStore::open`] は何も作らずに `Unimplemented`（fail-closed）。所有者 SID の照合と
 //!   保護 DACL でのディレクトリ作成には Win32 FFI が要り、core は `windows-sys` に依存しないため
 //!   （依存の追加はユーザー承認事項。REPAIR-3）
@@ -298,6 +299,7 @@ impl StateRoot {
     ///
     /// 既定の解決は Linux のみ（macOS / Windows ではゲスト VM 内の Linux パスとして同じ規則を
     /// 使う。OCI-5）。Linux 以外で上書き指定がなければ `Unimplemented`（fail-closed）。
+    /// macOS の既定の置き場はオーナー判断待ち（#2431・`docs/design/macos-state-root.md`）。
     pub fn resolve(override_root: Option<PathBuf>) -> Result<Self, TraitError> {
         if let Some(path) = override_root {
             return Self::from_override(path);

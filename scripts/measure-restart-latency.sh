@@ -527,19 +527,31 @@ sup_create() {
 }
 
 # 結果チャネル（FIFO）から FCSUP1 の 1 行を読み、OK なら report_pid を記録して 0。ERR・書式不正は計測失敗。未到着は 1。
+# 引数 <1 バイトあたりの待ち秒>（既定 0.01。launcher 終了後の読み切りだけ長めを渡す）。
+# 1 バイトずつ `read -N 1` で読む（Issue #2213・SUP-3・REPAIR-5）。旧実装の `read -r -n 640 -t 0.01` は、bash 5.2 の
+# read.def が区切り文字（改行）を読んで break した後の check_read_timeout で期限切れを検知すると、改行を消費して
+# 完全な行を変数へ入れたまま終了コード 142 を返す。これを「行の途中」と見て改行を待ち続けると、supervisor は
+# 1 行しか書かないため改行は二度と来ず、FCSUP1 OK 待ちが --timeout まで固まった（並列負荷で読みがプリエンプトされると起きる）。
+# -N は区切りを無視して改行もデータとして変数へ入れるため、期限切れの longjmp でも取りこぼさない。
+# 終了コードより先に ch を見る（期限切れでも ch に入ったバイトは有効なデータ）。-n 640 -t に戻さないこと。
+# -N は bash 4.1 以上が必要だが、本スクリプトは {var} の fd 割り当てを使う Linux 限定で要件は変わらない。
+# 行は 640 バイトを上限とし、行の途中で切れても report_buf は呼び出しをまたいで保持して次回に継ぎ足す。
 sup_report() {
-  local chunk="" rc=0 line
+  local wait_s="${1:-0.01}" ch rc line
   [ -z "$report_pid" ] || return 0
-  # read -t は期限切れのとき、それまでに読めた途中の文字列を chunk へ返して消費する（終了コード 128 超）。
-  # 負荷でバイトの到着が 10ms を超えて分かれると途中で切れた行を誤って書式不正にするため、改行が来るまで
-  # report_buf へ継ぎ足す（行は supervisor が 1 回の書き込みで出すが、読み側は 1 バイトずつ読む）。
-  IFS= read -r -n 640 -t 0.01 -u "$outfd" chunk || rc=$?
-  report_buf+="$chunk"
-  if [ "$rc" -gt 128 ] && [ "${#report_buf}" -lt 640 ]; then
-    return 1
-  fi
-  line="$report_buf"
-  [ -n "$line" ] || return 1
+  while :; do
+    ch="" rc=0
+    IFS= read -r -N 1 -t "$wait_s" -u "$outfd" ch || rc=$?
+    [ -n "$ch" ] || return 1
+    if [ "$ch" != $'\n' ]; then
+      report_buf+="$ch"
+      [ "${#report_buf}" -lt 640 ] || fail "supervisor printed an unrecognized report line"
+      continue
+    fi
+    line="$report_buf"
+    report_buf=""
+    break
+  done
   if [[ "$line" =~ ^FCSUP1\ OK\ ([1-9][0-9]{0,9})$ ]]; then
     report_pid="${BASH_REMATCH[1]}"
     return 0
@@ -833,7 +845,11 @@ deadline_wait() { # <説明> : 条件関数 "$@" が真になるまで --timeout
     if ! launcher_ok; then
       # launcher が報告の直後に終了した場合、ERR の行が FIFO に残っている。先に読んで原因（エラーコード）を報告する。
       # ERR・書式不正なら sup_report 内の fail で終了する。
-      if [ "$what" = "FCSUP1 OK" ]; then sup_report || true; fi
+      # 書き手は終了済みで残りは FIFO 内にある。負荷で 1 回の読みが途中までになっても入力が尽きるまで読み切る
+      # （read -t 0 は消費せず入力の有無だけ確かめる。毎回 1 バイト以上消費するか 640 バイト上限で fail するため有限。Issue #2213）。
+      if [ "$what" = "FCSUP1 OK" ]; then
+        while [ -z "$report_pid" ] && read -r -t 0 -u "$outfd"; do sup_report 1 || break; done
+      fi
       fail "launcher exited while waiting for $what"
     fi
     up_cs

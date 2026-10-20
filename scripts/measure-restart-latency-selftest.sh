@@ -85,7 +85,7 @@ helper_pids+=("$!")
 # `start --root R --restart <p> <id>`（create 済みで、標準出力が FIFO のときだけ受理し、`FCSUP1 OK <コンテナ pid>` を出す）だけを
 # 受理し、他は終了コード 2 にする。supervisor スタブは kill 検知後に既定のバックオフ 100ms（restart.rs の DEFAULT_BACKOFF 相当）
 # を眠ってから再起動する（no_backoff はそれを省く）。
-# STUB_MODE: normal / err_report（FCSUP1 ERR を出して終了）/ bad_report（書式不正の報告）/ no_backoff（バックオフを眠らない）/ foreign_new（再起動後の state.json の pid が子孫でない無関係プロセス）/ no_ready / early_exit / no_restart / same_pid / count_jump / foreign_pid /
+# STUB_MODE: normal / split_report（OK 行を STUB_REPORT_GAP 秒の間隔で 3 分割して書く）/ err_split（ERR 行を分割して書き終了）/ err_report（FCSUP1 ERR を出して終了）/ bad_report（書式不正の報告）/ no_backoff（バックオフを眠らない）/ foreign_new（再起動後の state.json の pid が子孫でない無関係プロセス）/ no_ready / early_exit / no_restart / same_pid / count_jump / foreign_pid /
 # error_line / log_missing / log_short / log_garbage / deep（state.json の pid が孫プロセス）/
 # late_start（SIGTERM 時に環境変数を継承しない新コンテナを起動して state.json へ書く）/
 # late_two（全コンテナが環境変数を継承せず、SIGTERM 時にさらに新コンテナを起動。追跡済み pid も回収されること）/
@@ -129,6 +129,9 @@ mkdir -p "${3}/@supervisor-logs"
 logline() { printf 'stderr %s\n' "$1" >>"$logfile"; }
 if [ ! -p /dev/stdout ]; then echo "FCSUP1 ERR INVALID_ARGUMENT 2 stdout is not a fifo"; exit 2; fi
 if [ "$STUB_MODE" = err_report_slow ]; then mkfifo "$sd/hold" && exec 3<>"$sd/hold" && read -r -t 1 -u 3 _ || true; echo "FCSUP1 ERR FAILED_PRECONDITION 1 stub"; exit 1; fi
+if [ "$STUB_MODE" = err_split ]; then
+  printf 'FCSUP1 ERR '; sleep "${STUB_REPORT_GAP:-0.02}"; printf 'FAILED_PRECONDITION 1 '; sleep "${STUB_REPORT_GAP:-0.02}"; printf 'stub\n'; exit 1
+fi
 if [ "$STUB_MODE" = err_report ]; then echo "FCSUP1 ERR FAILED_PRECONDITION 1 stub"; exit 1; fi
 count=0
 idx=0
@@ -237,6 +240,7 @@ write_state "$shown"
 case "$STUB_MODE" in
   no_ready) ;;
   bad_report) echo "FCSUP1 OK pid" ;;
+  split_report) printf 'FCSUP1 OK '; sleep "${STUB_REPORT_GAP:-0.02}"; printf '%s' "$shown"; sleep "${STUB_REPORT_GAP:-0.02}"; printf '\n' ;;
   *) echo "FCSUP1 OK $shown" ;;
 esac
 [ "$STUB_MODE" != early_exit ] || exit 1
@@ -309,7 +313,7 @@ run_case() {
   local name="$1" want="$2" mode="$3" elapsed="$4" rc=0
   shift 4
   mkdir -p "${root}/d-${name}"
-  STUB_MODE="$mode" STUB_ELAPSED="$elapsed" STUB_DELAY="${STUB_DELAY:-}" STUB_DIR="${root}/d-${name}" STUB_FOREIGN="${root}/foreign.pid" STUB_SPAWN="${root}/spawn.req" \
+  STUB_MODE="$mode" STUB_ELAPSED="$elapsed" STUB_DELAY="${STUB_DELAY:-}" STUB_REPORT_GAP="${STUB_REPORT_GAP:-0.02}" STUB_DIR="${root}/d-${name}" STUB_FOREIGN="${root}/foreign.pid" STUB_SPAWN="${root}/spawn.req" \
     timeout --preserve-status --kill-after=10 120 bash "$target" --bin-dir "${root}/bin" --systemd-run "${root}/systemd-run" --bundle "${root}/bundle" --settle-ms 5 "$@" \
     >"${root}/${name}.out" 2>"${root}/${name}.err" </dev/null || rc=$?
   if [ "$rc" -ne "$want" ]; then
@@ -632,6 +636,19 @@ if grep -q 'cleanup-failed' "${root}/err_report.err"; then pass "err_report: cle
 kept="$(sed -n 's/.*state kept at \(\/[^)]*\))*$/\1/p' "${root}/err_report.err" | head -n 1)"
 if [ -n "$kept" ] && [ -d "$kept" ]; then pass "err_report: state kept"; rm -rf -- "$kept"; else fail "err_report: state not kept"; fi
 # 起動中に空の snapshot が取られてから ERR で終了しても、子孫を 1 つも記録できていなければ追跡不能（終了コード 4・状態保持）
+# 報告行が 10ms のポーリングを跨いで分割到着しても、継ぎ足して解析できること（Issue #2213・SUP-3）。
+# 注意: 改行消失（bash 5.2 の read -t が消費済みの改行を捨てる競合）そのものはスタブから決定的に起こせない。
+# 本ケースは新しい読み方の形（途中の継ぎ足し・改行のデータ扱い・終了後の読み切り）を固定するガードである。
+for gap in 0.012 0.025; do
+  if STUB_REPORT_GAP="$gap" run_case "split_report_${gap}" 0 split_report "101000" --trials 1 --warmup 0 --timeout 10; then
+    jq_eq "split_report_${gap}" "${root}/split_report_${gap}.out" '.observed.samples' '1'
+  fi
+done
+run_case err_split 4 err_split "" --trials 1 --warmup 0 --timeout 5 || true
+if grep -q 'FAILED_PRECONDITION' "${root}/err_split.err"; then pass "err_split: error code reported"; else fail "err_split: error code missing"; fi
+kept="$(sed -n 's/.*state kept at \(\/[^)]*\))*$/\1/p' "${root}/err_split.err" | head -n 1)"
+if [ -n "$kept" ] && [ -d "$kept" ]; then pass "err_split: state kept"; rm -rf -- "$kept"; else fail "err_split: state not kept"; fi
+
 run_case err_report_slow 4 err_report_slow "" --trials 1 --warmup 0 --timeout 5 || true
 if grep -q 'cannot be tracked' "${root}/err_report_slow.err"; then pass "err_report_slow: untracked warning"; else fail "err_report_slow: untracked warning missing"; fi
 kept="$(sed -n 's/.*state kept at \(\/[^)]*\))*$/\1/p' "${root}/err_report_slow.err" | head -n 1)"
@@ -642,7 +659,7 @@ run_case reported_below 1 normal "1000 2000" --trials 2 --warmup 0 --timeout 5 |
 if grep -q 'FAILED_PRECONDITION' "${root}/err_report.err"; then pass "err_report: error code reported"; else fail "err_report: error code missing"; fi
 if grep -q 'below the supervisor backoff' "${root}/no_backoff.err"; then pass "no_backoff: negative subtraction rejected"; else fail "no_backoff: message missing"; fi
 if grep -q 'below the supervisor backoff' "${root}/reported_below.err"; then pass "reported_below: negative subtraction rejected"; else fail "reported_below: message missing"; fi
-for m in no_ready early_exit no_restart same_pid count_jump dead_new error_line foreign_pid err_report err_report_slow bad_report no_backoff reported_below; do
+for m in no_ready early_exit no_restart same_pid count_jump dead_new error_line foreign_pid err_report err_report_slow err_split bad_report no_backoff reported_below; do
   if [ -s "${root}/${m}.out" ]; then fail "${m}: stdout must be empty on failure"; else pass "${m}: no result published"; fi
 done
 

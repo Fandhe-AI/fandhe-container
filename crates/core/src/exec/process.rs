@@ -2657,6 +2657,52 @@ where
     Ok(ContainerChild::new(pid))
 }
 
+/// [`spawn_container_probe`] に、ERRNO 側の禁止 syscall の拒否を `USER_NOTIF` で受け取る listener を足した版。
+/// 結合試験 `tests/escape_suite.rs` の ESC-03 専用（SEC-2・SEC-4・TASK-42・#2028。監査配送 7/7）。
+///
+/// 子は本番の launch 経路と同じ `Seccomp` 段（`ErrnoDelivery::UserNotif` ＋ `NEW_LISTENER`）で filter を適用し、
+/// listener を `SCM_RIGHTS` で親へ渡して ACK を待つ。親は `receive_listener`（`SCM_CREDENTIALS` の pid・fd の種別・
+/// `O_CLOEXEC`・fd がちょうど 1 本を検証して ACK を返す本番と同じ検証）を通ってから listener を返す。子は ACK を
+/// 受けるまで `probe` に進めないため、呼び出し側が応答者を立てる前に `probe` が拒否対象の syscall を発行して
+/// `ENOSYS` になることはない（通知は応答者が読むまでカーネル内で保留される）。
+///
+/// 戻り値の listener は呼び出し側（試験）が持つ応答者の入力で、応答は `-EPERM` だけにする（許可へ覆さない）。
+/// 受け渡せなければ子を期限つきで kill して回収し `Err` を返す（listener 無しで走らせない。fail-closed）。
+/// 制限適用証跡の例外・契約・将来仕様は [`spawn_container_probe`] と同じ（REPAIR-3）。
+/// 呼び出し元は `escape_suite` の ESC-03 だけで、応答ハブ（supervisor の `SeccompNotifyHub`）そのものの試験ではない。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub fn spawn_container_probe_with_seccomp_listener<F>(
+    rootfs: &Path,
+    stages: StagePipeline,
+    probe: F,
+) -> Result<(ContainerChild, super::SeccompListener), ExecError>
+where
+    F: FnOnce(),
+{
+    use super::seccomp_listener::{ListenerSender, listener_socketpair, receive_listener};
+    /// 子が filter を適用して listener を渡すまでの親の待ち上限（REPAIR-5）。
+    const HANDOVER_TIMEOUT: Duration = Duration::from_secs(30);
+    /// 受け渡し失敗時の子の回収の待ち上限。
+    const REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+    let (parent_end, child_end) = listener_socketpair()?;
+    let delivery = crate::seccomp::ErrnoDelivery::UserNotif;
+    let stages = stages
+        .with_seccomp_delivery(delivery)
+        .with_listener_sender(ListenerSender::new(child_end).with_delivery(delivery));
+    let child = spawn_container_probe(rootfs, stages, probe)?;
+    let deadline = Instant::now() + HANDOVER_TIMEOUT;
+    match receive_listener(parent_end.as_fd(), child.pid(), deadline) {
+        Ok(listener) => Ok((child, listener)),
+        Err(err) => {
+            // 受け渡せない子は ACK 待ちか終了済み。回収できなくても元の失敗を返す（孤児化は kill で避ける）。
+            let _ = child.kill_and_reap(REAP_TIMEOUT);
+            Err(err)
+        }
+    }
+}
+
 /// [`spawn_container_probe`] の `setup` 付き版。子が専用 `/dev`（`create_default_devices`）を作り、続く
 /// `masked_paths` 段（覆うパスの固定集合。SEC-2・TASK-29 追補・#1851）まで本番と同じ順序で適用してから、pivot 後に
 /// `probe` を実行する。結合試験 `tests/masked_paths.rs` 専用で、本番 launcher には依存しない（`exec_entrypoint` の

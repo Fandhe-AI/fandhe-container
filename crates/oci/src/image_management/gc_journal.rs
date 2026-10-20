@@ -659,6 +659,28 @@ pub struct PendingDeletionRecovery {
 }
 
 impl ReferenceTable {
+    /// 検査用の root を設定する（`ImageStore::lock` が区間ごとに呼ぶ）。
+    pub(super) fn set_journal_root(&mut self, root: &Path) {
+        self.journal_root = super::JournalRoot(Some(root.to_path_buf()));
+    }
+
+    /// テーブル操作（manifest 除去・タグ解除）入りの削除ジャーナルがディスクに残っていれば
+    /// `FailedPrecondition` で拒否する（OCI-7）。
+    ///
+    /// 契約: テーブルや blob を書く変更系の入口は、先頭でこれを呼ぶこと。取得済みのガードの中で
+    /// rm / prune が Pending を返した後も、残ったジャーナルを復旧が再実行するため、再登録と両立しない。
+    /// 変更系を新設するときは必ず付ける（rm / prune が自分のジャーナルを書いた後の実行用の
+    /// `*_unchecked` を除く）。root が未設定の単体テーブルでは何もしない。
+    pub(super) fn ensure_no_pending_table_ops(&self) -> Result<(), OciError> {
+        match &self.journal_root.0 {
+            Some(root) if journal_has_table_ops(root)? => Err(err(
+                OciErrorCode::FailedPrecondition,
+                "a pending image deletion has not been completed; the store is read-only until it is recovered",
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// manifest をテーブルから外した場合に消してよくなる blob（昇順）。副作用は無い。
     pub(super) fn blobs_deletable_after_removal(&self, manifest: &Digest) -> Vec<Digest> {
         // 構成が分からないコンテナ参照が残る間は blob を 1 つも削除候補にしない（#2341・OCI-7）。
@@ -1340,6 +1362,71 @@ mod tests {
         assert_eq!(g.manifests().count(), 2);
         drop(g);
         assert!(!root.journal());
+    }
+
+    /// OCI-7: 取得済みのガードで rm が Pending（ジャーナル unlink 失敗）を返した後は、同じガードでの
+    /// 変更系が FailedPrecondition になる。障害を除いて再 lock すると復旧が完了し登録が通る。
+    #[test]
+    fn oci7_rm_pending_blocks_mutations_in_same_guard() {
+        let root = Root::new();
+        files(&root);
+        let mut t = table();
+        t.register_tag(tk("v1"), &d(0xa0)).unwrap();
+        let store = ImageStore::with_table(&root.0, t).unwrap();
+        let mut g = store.lock().unwrap();
+        test_hook::fail_unlink(1);
+        let out = g
+            .execute_image_rm(
+                &root.0,
+                &ImageRmTarget::Tag(tk("v1")),
+                &ImageRmOptions::default(),
+                &StoppedContainers::new(),
+            )
+            .unwrap();
+        test_hook::clear();
+        assert_eq!(out.durability, DeletionDurability::Pending);
+        assert!(journal_has_table_ops(&root.0).unwrap());
+        let comp = ManifestComposition::new(d(0xc1), vec![d(0x10), d(0x11)]).unwrap();
+        for code in [
+            g.register_manifest(d(0xa0), comp.clone())
+                .unwrap_err()
+                .code(),
+            g.register_tag(tk("v9"), &d(0xb0)).unwrap_err().code(),
+            g.unregister_tag(&tk("v9")).unwrap_err().code(),
+            g.remove_manifest(&d(0xb0)).unwrap_err().code(),
+        ] {
+            assert_eq!(code, OciErrorCode::FailedPrecondition);
+        }
+        assert_eq!(g.tags().count(), 0);
+        drop(g);
+        let mut g = store.lock().unwrap();
+        assert!(!root.journal());
+        g.register_manifest(d(0xa0), comp).unwrap();
+        g.register_tag(tk("v1"), &d(0xa0)).unwrap();
+        assert_eq!(g.tags().count(), 1);
+    }
+
+    /// OCI-7: prune が Pending を返した後も、同じガードでの変更系は FailedPrecondition になる。
+    #[test]
+    fn oci7_prune_pending_blocks_mutations_in_same_guard() {
+        let root = Root::new();
+        files(&root);
+        let store = ImageStore::with_table(&root.0, table()).unwrap();
+        let mut g = store.lock().unwrap();
+        test_hook::fail_unlink(1);
+        let out = g.execute_image_prune(&root.0).unwrap();
+        test_hook::clear();
+        assert_eq!(out.removed_manifests, vec![d(0xa0), d(0xb0)]);
+        assert_eq!(out.durability, DeletionDurability::Pending);
+        let comp = ManifestComposition::new(d(0xc2), vec![d(0x10), d(0x12)]).unwrap();
+        let e = g.register_manifest(d(0xb0), comp.clone()).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(g.manifests().count(), 0);
+        drop(g);
+        let mut g = store.lock().unwrap();
+        assert!(!root.journal());
+        g.register_manifest(d(0xb0), comp).unwrap();
+        assert_eq!(g.manifests().count(), 1);
     }
 
     /// OCI-7: 通常の lock 経路でも復旧結果（Abandoned と孤児 blob）が guard から取れる。

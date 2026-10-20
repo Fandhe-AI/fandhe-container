@@ -127,6 +127,8 @@ impl ReferenceTable {
     }
 
     fn execute_image_prune_inner(&mut self, root: &Path) -> Result<ImagePruneOutcome, OciError> {
+        // 未完了のテーブル操作が残る間は prune を始めない（OCI-7）。
+        self.ensure_no_pending_table_ops()?;
         // 片づいていない削除が残っているうちは新しい削除を始めない（lock 時の再試行が先に片づける）。
         ensure_no_pending_journal(root)?;
         // テーブルもファイルも触る前にディレクトリ構成を検証する。
@@ -147,7 +149,7 @@ impl ReferenceTable {
         }
         for digest in &plan.manifests {
             // 区間内で数え直した直後なので失敗しない想定。panic は Mutex を毒化させるため Result で返す。
-            if self.remove_manifest(digest).is_err() {
+            if self.remove_manifest_unchecked(digest).is_err() {
                 if journaled {
                     let _ = remove_journal(root);
                 }

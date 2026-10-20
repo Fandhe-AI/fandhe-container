@@ -38,6 +38,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::PathBuf;
 
 mod container_ref_persist;
 pub use container_ref_persist::{
@@ -341,7 +342,21 @@ pub struct ReferenceTable {
     next_container_generation: u64,
     tag_refs: BTreeMap<TagKey, Digest>,
     pull_leases: BTreeMap<Digest, BTreeSet<PullId>>,
+    /// 排他区間の中で、未完了の削除ジャーナルをディスクで検査するための root（OCI-7）。
+    /// `ImageStore::lock` が区間ごとに設定する。単体のテーブルでは `None`（検査しない）。
+    journal_root: JournalRoot,
 }
+
+/// `ReferenceTable` に載せる検査用の root。等価比較・複製には影響しない（テーブルの内容ではないため）。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JournalRoot(Option<PathBuf>);
+
+impl PartialEq for JournalRoot {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for JournalRoot {}
 
 impl ReferenceTable {
     /// 空のテーブルを作る。
@@ -365,6 +380,7 @@ impl ReferenceTable {
         digest: Digest,
         composition: ManifestComposition,
     ) -> Result<(), OciError> {
+        self.ensure_no_pending_table_ops()?;
         match self.manifests.get(&digest) {
             Some(existing) if existing == &composition => Ok(()),
             Some(_) => Err(err(
@@ -380,6 +396,15 @@ impl ReferenceTable {
 
     /// 在庫から manifest を外し、構成を返す。参照が残る場合は `FailedPrecondition`、無ければ `NotFound`。
     pub fn remove_manifest(&mut self, digest: &Digest) -> Result<ManifestComposition, OciError> {
+        self.ensure_no_pending_table_ops()?;
+        self.remove_manifest_unchecked(digest)
+    }
+
+    /// 未完了のテーブル操作の検査なしの除去。rm / prune が自分のジャーナルを書いた後の実行専用。
+    pub(super) fn remove_manifest_unchecked(
+        &mut self,
+        digest: &Digest,
+    ) -> Result<ManifestComposition, OciError> {
         if !self.manifests.contains_key(digest) {
             return Err(err(
                 OciErrorCode::NotFound,
@@ -405,6 +430,7 @@ impl ReferenceTable {
         id: ContainerRefId,
         manifest: &Digest,
     ) -> Result<(), OciError> {
+        self.ensure_no_pending_table_ops()?;
         self.require_manifest(manifest)?;
         match self.container_refs.get(&id) {
             Some(cur) if &cur.manifest == manifest => Ok(()),
@@ -437,6 +463,7 @@ impl ReferenceTable {
 
     /// コンテナの参照を解除し、参照していた manifest を返す。無ければ `NotFound`。
     pub fn unregister_container(&mut self, id: &ContainerRefId) -> Result<Digest, OciError> {
+        self.ensure_no_pending_table_ops()?;
         self.container_refs
             .remove(id)
             .map(|e| e.manifest)
@@ -463,6 +490,7 @@ impl ReferenceTable {
         key: TagKey,
         manifest: &Digest,
     ) -> Result<Option<Digest>, OciError> {
+        self.ensure_no_pending_table_ops()?;
         self.require_manifest(manifest)?;
         self.ensure_tag_capacity([&key])?;
         Ok(self.tag_refs.insert(key, manifest.clone()))
@@ -470,6 +498,12 @@ impl ReferenceTable {
 
     /// タグを解除し、外した manifest を返す。無ければ `NotFound`。
     pub fn unregister_tag(&mut self, key: &TagKey) -> Result<Digest, OciError> {
+        self.ensure_no_pending_table_ops()?;
+        self.unregister_tag_unchecked(key)
+    }
+
+    /// 未完了のテーブル操作の検査なしの解除。rm が自分のジャーナルを書いた後の実行専用。
+    pub(super) fn unregister_tag_unchecked(&mut self, key: &TagKey) -> Result<Digest, OciError> {
         self.tag_refs
             .remove(key)
             .ok_or_else(|| err(OciErrorCode::NotFound, format!("tag {key} not found")))

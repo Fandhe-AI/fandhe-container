@@ -361,6 +361,8 @@ impl ReferenceTable {
         opts: &ImageRmOptions,
         stopped: &StoppedContainers,
     ) -> Result<ImageRmOutcome, OciError> {
+        // 未完了のテーブル操作が残る間は rm を始めない（OCI-7）。
+        self.ensure_no_pending_table_ops()?;
         let (action, delete) = match self.plan_image_rm_with(target, opts, stopped)? {
             ImageRmPlan::Refuse(u) => return Err(u.to_error()),
             ImageRmPlan::UntagOnly(a) => (a, false),
@@ -399,7 +401,7 @@ impl ReferenceTable {
             )?;
         }
         for key in &action.untag {
-            if self.unregister_tag(key).is_err() {
+            if self.unregister_tag_unchecked(key).is_err() {
                 if journaled {
                     let _ = remove_journal(root);
                 }
@@ -419,7 +421,7 @@ impl ReferenceTable {
         if !delete {
             return Ok(outcome);
         }
-        let composition = match self.remove_manifest(&action.manifest) {
+        let composition = match self.remove_manifest_unchecked(&action.manifest) {
             Ok(c) => c,
             Err(e) => {
                 if journaled {

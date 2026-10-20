@@ -173,6 +173,7 @@ impl ImageStore {
             table,
             recovered: None,
         };
+        guard.table.set_journal_root(&self.root);
         // 区間に入るたびにディスクのコンテナ参照を正とする（#2341）。壊れた参照表は fail-closed で拒否する。
         if let Some(persisted) = load_container_refs(&self.root)? {
             guard.table.apply_persisted_container_refs(persisted);

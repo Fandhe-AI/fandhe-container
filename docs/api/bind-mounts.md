@@ -40,7 +40,7 @@ Linux の fandhe-container は、OCI `config.json` の `mounts[]` に書いた b
 | `/proc`・`/sys`・`/dev` とその配下の `destination` | 暗黙のマウントと固定の保護パスがあるため |
 | bind 同士で同一・入れ子の `destination` | 子の宛先がホストのディレクトリになるのを防ぐ |
 | `linux.readonlyPaths` / `maskedPaths` と重なる `destination` | 保護パスを覆えないようにする |
-| bind 以外の種類（`proc`・`tmpfs` など。`/sys` の sysfs を除く） | 未対応（`UNIMPLEMENTED`） |
+| bind 以外の種類（`proc`・`tmpfs` など。`/sys` の sysfs を除く） | 未対応（`UNIMPLEMENTED`。受けるかは [#2347](https://github.com/Fandhe-AI/fandhe-container/issues/2347) で判断待ち。[判断記録](../design/oci-mounts-implicit-entries.md)） |
 
 拒否する疑似 FS（mountinfo の fstype 名）は、`proc`・`sysfs`・`debugfs`・`tracefs`・`securityfs`・`cgroup`（v1）・`cgroup2`・`bpf`・`configfs`・`pstore`・`efivarfs`・`selinuxfs`・`smackfs`・`binfmt_misc`・`fusectl`・`resctrl`・`xenfs`・`nsfs`・`mqueue`・`devpts`・`binder`・`devtmpfs` の 22 種である。`devtmpfs`（ホストの `/dev`）は `f_type` が tmpfs と同じため、付け替えた木の mountinfo の fstype 名だけで判定する（SEC-1・#2129）。根拠と Linux v7.0 での出典（ファイル:行）と magic 値は `crates/core/src/exec/bind_mounts.rs` の `PSEUDO_FS_DENYLIST`。ext4・xfs・btrfs・tmpfs・overlayfs・NFS などデータを持つ通常の FS は受ける。
 

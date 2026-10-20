@@ -8,4 +8,6 @@
 //! PLUG-1 区分は plugin（crate-naming.md）。
 
 pub mod adapter;
+pub mod netsetup;
+pub mod pod_network;
 pub mod startup;

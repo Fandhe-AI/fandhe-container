@@ -49,6 +49,10 @@ pub struct Failures {
     pub report_invalid: u32,
     pub supervisor_exit: u32,
     pub cleanup: u32,
+    /// 後始末の CLI `delete` が拒否・期限超過・起動失敗した件数（握りつぶさず残す。OCI-6・#2157）。
+    pub cleanup_delete_rejected: u32,
+    /// `cleanup_delete_rejected` のコード別内訳（CLI の `code` か固定語彙 `UNPARSED`・`TIMEOUT`・`SPAWN`）。
+    pub cleanup_delete_codes: BTreeMap<&'static str, u32>,
 }
 
 impl Failures {
@@ -62,6 +66,7 @@ impl Failures {
             self.report_invalid,
             self.supervisor_exit,
             self.cleanup,
+            self.cleanup_delete_rejected,
         ]
         .iter()
         .fold(0u32, |acc, v| acc.saturating_add(*v))
@@ -185,9 +190,21 @@ pub fn render_json(result: &RunResult) -> Result<String, StartupLatencyError> {
     }
     let _ = write!(
         out,
-        "}},\"report_timeout\":{},\"report_eof\":{},\"report_invalid\":{},\"supervisor_exit\":{},\"cleanup\":{}}},\"leftover_ids\":[",
-        f.report_timeout, f.report_eof, f.report_invalid, f.supervisor_exit, f.cleanup
+        "}},\"report_timeout\":{},\"report_eof\":{},\"report_invalid\":{},\"supervisor_exit\":{},\"cleanup\":{},\"cleanup_delete_rejected\":{},\"cleanup_delete_codes\":{{",
+        f.report_timeout,
+        f.report_eof,
+        f.report_invalid,
+        f.supervisor_exit,
+        f.cleanup,
+        f.cleanup_delete_rejected
     );
+    for (i, (code, n)) in f.cleanup_delete_codes.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "\"{code}\":{n}");
+    }
+    out.push_str("}},\"leftover_ids\":[");
     for (i, id) in result.leftover_ids.iter().enumerate() {
         if i > 0 {
             out.push(',');
@@ -270,7 +287,7 @@ mod tests {
             "\"params\":{\"trials\":20,\"warmup\":3,\"timeout_secs\":1800,\"report_timeout_ms\":36000,\"exit_timeout_ms\":30000,\"cleanup_timeout_ms\":10000},",
             "\"summary\":{\"samples\":2,\"p50_ms\":1.000,\"p95_ms\":2.000,\"max_ms\":2.000},",
             "\"trials\":[{\"total_ms\":1.000,\"create_ms\":0.500},{\"total_ms\":2.000,\"create_ms\":0.500}],",
-            "\"failures\":{\"total\":0,\"create\":0,\"spawn\":0,\"report_err\":0,\"report_err_codes\":{},\"report_timeout\":0,\"report_eof\":0,\"report_invalid\":0,\"supervisor_exit\":0,\"cleanup\":0},",
+            "\"failures\":{\"total\":0,\"create\":0,\"spawn\":0,\"report_err\":0,\"report_err_codes\":{},\"report_timeout\":0,\"report_eof\":0,\"report_invalid\":0,\"supervisor_exit\":0,\"cleanup\":0,\"cleanup_delete_rejected\":0,\"cleanup_delete_codes\":{}},",
             "\"leftover_ids\":[],\"arch\":\"x86_64\",\"host_kind\":\"vm\"}\n"
         );
         assert_eq!(render_json(&r).expect("render"), expected);
@@ -287,6 +304,23 @@ mod tests {
         assert!(json.contains("\"metrics\":{},"), "{json}");
         assert!(
             json.contains("\"failures\":{\"total\":3,\"create\":0,\"spawn\":0,\"report_err\":2,\"report_err_codes\":{\"FAILED_PRECONDITION\":2},\"report_timeout\":1,"),
+            "{json}"
+        );
+    }
+
+    /// OCI-6: 後始末の delete の拒否は metric を空にし、コード別の件数を残す（握りつぶさない）。
+    #[test]
+    fn oci6_delete_rejection_empties_metrics_and_reports_codes() {
+        let mut r = clean();
+        r.failures.cleanup_delete_rejected = 1;
+        r.failures
+            .cleanup_delete_codes
+            .insert("FAILED_PRECONDITION", 1);
+        assert_eq!(r.failures.total(), 1);
+        let json = render_json(&r).expect("render");
+        assert!(json.contains("\"metrics\":{},"), "{json}");
+        assert!(
+            json.contains("\"cleanup\":0,\"cleanup_delete_rejected\":1,\"cleanup_delete_codes\":{\"FAILED_PRECONDITION\":1}},"),
             "{json}"
         );
     }

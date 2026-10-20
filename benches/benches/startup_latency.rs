@@ -8,7 +8,7 @@
 //! （`docs/design/bench-calibration.md`「CI の扱いの決定（TASK-190）」）。回帰ゲートへは未登録（#1901）。
 //!
 //! 呼び出し例: `cargo bench -p fandhe-container-benches --bench startup_latency -- --supervisor-bin <絶対パス>
-//! --output <path>`。引数なし（`--bench` は無視）は何も起動しないスモークで、終了コード 0。
+//! --cli-bin <絶対パス> --output <path>`（`--cli-bin` は区間の外の後始末の `delete` 用。OCI-6）。引数なし（`--bench` は無視）は何も起動しないスモークで、終了コード 0。
 //! `--startup-latency-probe <nonce>` はコンテナ内のワークロード（同じ実行ファイルの再実行）。
 //! エラーは標準エラーへ 1 行の JSON（`code` / `message`）で出し、非ゼロで終わる。
 

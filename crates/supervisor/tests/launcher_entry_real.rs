@@ -51,12 +51,30 @@ mod linux {
         println!("launcher_entry_real: all scenarios passed");
     }
 
-    /// supervisor の代役。`Cap*` 行だけを書く。
+    /// supervisor の代役。`Cap*` 行と、セッション関連（`Sess pid pgrp session tty_nr`）、fd 0〜2 が端末かを書く
+    /// （TASK-171.2・#537）。exec で置き換わるため pid はランチャーの pid と同じ。
     fn stand_in() {
+        use std::io::IsTerminal;
         let status = std::fs::read_to_string("/proc/self/status").unwrap();
         for l in status.lines().filter(|l| l.starts_with("Cap")) {
             println!("{l}");
         }
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let rest = stat.rsplit_once(')').map(|(_, r)| r).unwrap_or_default();
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        println!(
+            "Sess: {} {} {} {}",
+            std::process::id(),
+            f.get(2).copied().unwrap_or("?"),
+            f.get(3).copied().unwrap_or("?"),
+            f.get(4).copied().unwrap_or("?")
+        );
+        println!(
+            "Tty: {} {} {}",
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+            std::io::stderr().is_terminal()
+        );
     }
 
     fn require(ok: bool, msg: &str) {
@@ -94,6 +112,14 @@ mod linux {
         for name in ["CapPrm:", "CapEff:", "CapAmb:", "CapBnd:"] {
             assert_eq!(field(&o, name), MIN_HEX, "{name}\nstdout: {o}");
         }
+        // セッションの切り離し（SUP-14 の要素 (B)）: pgrp == session == pid、制御端末なし、標準入出力が端末でない。
+        let sess = field(&o, "Sess:");
+        let v: Vec<&str> = sess.split_whitespace().collect();
+        assert_eq!(v.len(), 4, "Sess: {sess}");
+        assert_eq!(v[0], v[1], "pgrp must equal pid: {sess}");
+        assert_eq!(v[0], v[2], "session must equal pid: {sess}");
+        assert_eq!(v[3], "0", "tty_nr must be 0: {sess}");
+        assert_eq!(field(&o, "Tty:"), "false false false", "stdout: {o}");
     }
 
     /// 一時ディレクトリを構成してランチャーを非特権 uid で起動し、終了状態・stdout・stderr を返す（後始末は呼び出し側）。

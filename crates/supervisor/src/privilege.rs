@@ -23,6 +23,12 @@
 //!   スレッド数の増加のいずれも `Ok` にしない。keepcaps は `/proc/<pid>/status` に現れないため、
 //!   `prctl(PR_GET_KEEPCAPS)` で読み戻した値を [`KeepCapsState`] として [`verify_elevation`] へ渡す
 //!
+//! # セッション切り離し（要素 (B)。TASK-171.2・#537）
+//! 昇格の方式によらず、起動経路が pty を経由しないことも SUP-14 の要件である。[`detach_session`] が `setsid` で
+//! 新しいセッションへ移り、標準入出力が端末でないこと・制御端末が無いこと・自分がセッションとプロセスグループの
+//! リーダーであることを `/proc/self/stat` の読み戻しで検証する（純ロジックは [`parse_proc_stat`]・
+//! [`verify_session_detached`]）。ランチャーの入口で [`elevate`] より前に呼ばれる。
+//!
 //! # 本モジュールの範囲外（REPAIR-3。実装済みを装わない）
 //! - fd 検証付き exec（`execveat`・所有者 / 権限の検証）・引数 / 環境変数 / cwd / 継承 fd の入口検証・ランチャー bin:
 //!   `crate::launcher`（#1719。実装済み）
@@ -109,6 +115,12 @@ pub enum PrivilegeErrorReason {
     MethodMismatch,
     /// 縮退手順または読み戻しの syscall が失敗した（message に手順名と errno を入れる）。
     SyscallFailed,
+    /// 標準入出力のいずれかが端末（pty を含む）を指している。pty 経由の起動は拒否する（SUP-14。#537）。
+    StdioIsTerminal,
+    /// 制御端末が残っている（`/proc/self/stat` の `tty_nr` が 0 でない。#537）。
+    ControllingTerminalAttached,
+    /// 自分のセッション / プロセスグループのリーダーになれていない（#537）。
+    NotSessionLeader,
 }
 
 /// 権限昇格の検証・計画エラー（ERR-1 の `code` と英語 `message`）。
@@ -999,7 +1011,8 @@ impl PrivilegeKernel for RealKernel {
 /// - 方式 (c)［`PrivilegeMethod::LauncherAmbient`］では、file capability に `RUNTIME_REQUIRED_CAPABILITIES` に加えて、
 ///   補助グループを持つ利用者向けに `CAP_SETGID` を effective 付きで持たせる必要がある（`plan_reduction` の前提。
 ///   必要最小集合は広げない。付与は `scripts/install-privileged-launcher.sh`〔#1721〕が行う）
-/// - ambient は exec 後の子孫へ引き継がれる。子での解除は #537 以降の範囲
+/// - ambient は exec 後の子孫へ引き継がれる。子での解除は本関数の範囲外（コンテナの子は core の制限段、
+///   supervisor が起動する子は TASK-161.2・#495）
 ///
 /// fd 検証付き exec・入口検証は本関数の範囲外（#1719）。非 Linux では常に `Unimplemented`（SUP-14 の対象は Linux の
 /// rootful 経路で、macOS / Windows は VM 内で動く）。
@@ -1019,6 +1032,231 @@ pub fn elevate(method: PrivilegeMethod) -> Result<ElevationReport, PrivilegeErro
     }
 }
 
+// ---------------------------------------------------------------------------
+// セッション切り離し（SUP-14 の要素 (B)。TASK-171.2・#537）
+// ---------------------------------------------------------------------------
+
+/// `/proc/self/stat` として受け入れる最大バイト数（無制限確保の防止。実際の行は数百バイト）。
+pub const MAX_STAT_BYTES: usize = 4 * 1024;
+
+/// `/proc/<pid>/stat` から取り出したセッション関連のフィールド（`pid`・`pgrp`・`session`・`tty_nr`）。
+///
+/// `sudo`（`use_pty`）を `SIGKILL` したとき pty の閉鎖が supervisor 以下へシグナルとして波及する（PoC-17 の発見事項 1）。
+/// その経路を断てているかの判定材料で、[`verify_session_detached`] が具体値で検証する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    /// プロセス ID（呼び出し元の pid namespace から見た値）。
+    pub pid: u32,
+    /// プロセスグループ ID。
+    pub pgrp: u32,
+    /// セッション ID。
+    pub session: u32,
+    /// 制御端末のデバイス番号。0 は制御端末なし。
+    pub tty_nr: i64,
+}
+
+/// 標準入出力（fd 0〜2）がそれぞれ端末（pty を含む）を指しているか。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StdioTerminals {
+    /// fd 0 が端末か。
+    pub stdin: bool,
+    /// fd 1 が端末か。
+    pub stdout: bool,
+    /// fd 2 が端末か。
+    pub stderr: bool,
+}
+
+impl StdioTerminals {
+    fn any(self) -> bool {
+        self.stdin || self.stdout || self.stderr
+    }
+}
+
+fn session_error(reason: PrivilegeErrorReason, message: &str) -> PrivilegeError {
+    PrivilegeError::new(ErrorCode::FailedPrecondition, reason, message)
+}
+
+/// `/proc/<pid>/stat` を解釈する。`comm` は空白や `)` を含みうるため、最後の `)` で分割してから空白区切りにする。
+///
+/// 長さを先に検証し、取り出しは `get()` と `parse()` だけで行う（添字・`unwrap` なし）。不正なら `MalformedStatus`。
+pub fn parse_proc_stat(text: &str) -> Result<SessionSnapshot, PrivilegeError> {
+    if text.len() > MAX_STAT_BYTES {
+        return Err(PrivilegeError::malformed(
+            "process stat exceeds the size limit",
+        ));
+    }
+    let bad = || PrivilegeError::malformed("process stat is malformed");
+    let open = text.find(" (").ok_or_else(bad)?;
+    let close = text.rfind(')').ok_or_else(bad)?;
+    if open >= close {
+        return Err(bad());
+    }
+    let pid = text
+        .get(..open)
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .ok_or_else(bad)?;
+    let rest = text.get(close + 1..).ok_or_else(bad)?;
+    // state ppid pgrp session tty_nr
+    let mut it = rest.split_whitespace();
+    let _state = it.next().ok_or_else(bad)?;
+    let _ppid = it.next().ok_or_else(bad)?;
+    let pgrp = it
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(bad)?;
+    let session = it
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(bad)?;
+    let tty_nr = it
+        .next()
+        .and_then(|s| s.parse::<i64>().ok())
+        .ok_or_else(bad)?;
+    Ok(SessionSnapshot {
+        pid,
+        pgrp,
+        session,
+        tty_nr,
+    })
+}
+
+fn check_stdio(t: StdioTerminals) -> Result<(), PrivilegeError> {
+    if t.any() {
+        return Err(session_error(
+            PrivilegeErrorReason::StdioIsTerminal,
+            "stdin, stdout and stderr must not be terminals (a pty-backed start is refused)",
+        ));
+    }
+    Ok(())
+}
+
+/// セッションの切り離しが済んだことを fail-closed で検証する。
+///
+/// 判定順: 標準入出力が端末でない → 制御端末なし（`tty_nr == 0`）→ セッションリーダー（`session == pid`）→
+/// プロセスグループのリーダー（`pgrp == pid`）。最初に当たった失敗を返す。
+pub fn verify_session_detached(
+    snap: &SessionSnapshot,
+    stdio: StdioTerminals,
+) -> Result<(), PrivilegeError> {
+    check_stdio(stdio)?;
+    if snap.tty_nr != 0 {
+        return Err(session_error(
+            PrivilegeErrorReason::ControllingTerminalAttached,
+            "a controlling terminal is still attached",
+        ));
+    }
+    if snap.session != snap.pid {
+        return Err(session_error(
+            PrivilegeErrorReason::NotSessionLeader,
+            "the process is not the leader of its own session",
+        ));
+    }
+    if snap.pgrp != snap.pid {
+        return Err(session_error(
+            PrivilegeErrorReason::NotSessionLeader,
+            "the process is not the leader of its own process group",
+        ));
+    }
+    Ok(())
+}
+
+/// [`detach_session_with`] が使うカーネル操作の抽象（テストでは偽物に差し替え、本番は Linux 版の `RealSession`）。
+#[cfg(any(target_os = "linux", test))]
+trait SessionKernel {
+    /// fd 0〜2 が端末か（副作用なし）。
+    fn stdio_terminals(&mut self) -> StdioTerminals;
+    /// `setsid(2)`。失敗は errno 付きの `io::Error`。
+    fn setsid(&mut self) -> std::io::Result<()>;
+    /// `/proc/self/stat` を上限付きで読む。
+    fn read_self_stat(&mut self) -> std::io::Result<String>;
+}
+
+/// 順序: 標準入出力の端末判定（端末なら `setsid` の前に拒否）→ `setsid` → `/proc/self/stat` の読み戻し → [`verify_session_detached`]。
+///
+/// `setsid` が `EPERM`（呼び出し元がプロセスグループのリーダー）のときは、読み戻しで `session == pid == pgrp` かつ
+/// 制御端末なしなら「既に切り離されている」として成功にする（systemd のサービスや `setsid(1)` 経由）。それ以外は拒否する。
+/// fork で回避しない（ランチャーの「exec で置き換わる・待機しない」契約を保つため）。
+#[cfg(any(target_os = "linux", test))]
+fn detach_session_with<K: SessionKernel>(k: &mut K) -> Result<SessionSnapshot, PrivilegeError> {
+    let stdio = k.stdio_terminals();
+    check_stdio(stdio)?;
+    match k.setsid() {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(1) => {}
+        Err(e) => return Err(syscall_failed("setsid", &e)),
+    }
+    let text = k
+        .read_self_stat()
+        .map_err(|e| syscall_failed("reading process stat", &e))?;
+    let snap = parse_proc_stat(&text)?;
+    verify_session_detached(&snap, stdio)?;
+    Ok(snap)
+}
+
+/// Linux の本番実装。`crate::sys::new_session` の薄いラッパーと std の端末判定を使う。
+#[cfg(target_os = "linux")]
+struct RealSession;
+
+#[cfg(target_os = "linux")]
+impl SessionKernel for RealSession {
+    fn stdio_terminals(&mut self) -> StdioTerminals {
+        use std::io::IsTerminal;
+        StdioTerminals {
+            stdin: std::io::stdin().is_terminal(),
+            stdout: std::io::stdout().is_terminal(),
+            stderr: std::io::stderr().is_terminal(),
+        }
+    }
+
+    fn setsid(&mut self) -> std::io::Result<()> {
+        crate::sys::new_session()
+    }
+
+    fn read_self_stat(&mut self) -> std::io::Result<String> {
+        use std::io::Read;
+        let mut text = String::new();
+        let limit = u64::try_from(MAX_STAT_BYTES + 1).unwrap_or(u64::MAX);
+        std::fs::File::open("/proc/self/stat")?
+            .take(limit)
+            .read_to_string(&mut text)?;
+        if text.len() > MAX_STAT_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process stat exceeds the size limit",
+            ));
+        }
+        Ok(text)
+    }
+}
+
+/// 呼び出しプロセスを新しいセッションへ移し、制御端末と pty 経由の標準入出力が無いことを読み戻しで確認する
+/// （SUP-14 の要素 (B)。TASK-171.2・#537）。
+///
+/// 特権ランチャー（`crate::launcher`）が入口で [`elevate`] より前に呼ぶ。`sudo`（`use_pty`）が pty 越しに子孫を
+/// fork している状態で `sudo` が `SIGKILL` されても、pty の閉鎖によるシグナル配送が supervisor 以下へ波及しない
+/// ことを保証する側。端末を指す標準入出力・制御端末の残存・別セッションのプロセスグループリーダーはいずれも
+/// `Err`（fail-closed）で、呼び出し元は昇格も exec もせず非ゼロで終了する。
+///
+/// # 契約
+/// - 呼び出し元は自分を `process_group(0)` 等でプロセスグループのリーダーにして起動してはならない
+///   （`setsid` が `EPERM` になる。既に切り離されている場合に限り成功扱い）
+/// - 標準入出力に端末（pty）を渡して起動してはならない
+///
+/// 非 Linux では常に `Unimplemented`（SUP-14 の対象は Linux の rootful 経路）。
+pub fn detach_session() -> Result<SessionSnapshot, PrivilegeError> {
+    #[cfg(target_os = "linux")]
+    {
+        detach_session_with(&mut RealSession)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(PrivilegeError::new(
+            ErrorCode::Unimplemented,
+            PrivilegeErrorReason::Unimplemented,
+            "session detachment is only supported on Linux",
+        ))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1784,5 +2022,191 @@ mod tests {
                 .unwrap()
                 .unknown_bits_present()
         );
+    }
+}
+/// セッション切り離しの単体テスト（SUP-14・TASK-171.2・#537）。偽の kernel で手順と失敗注入を具体値で照合する。
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    const NO_TTY: StdioTerminals = StdioTerminals {
+        stdin: false,
+        stdout: false,
+        stderr: false,
+    };
+
+    fn stat(pid: u32, pgrp: u32, sid: u32, tty: i64) -> String {
+        format!(
+            "{pid} (fandhe) S 1 {pgrp} {sid} {tty} -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 5 1000 50\n"
+        )
+    }
+
+    fn snap(pid: u32, pgrp: u32, session: u32, tty_nr: i64) -> SessionSnapshot {
+        SessionSnapshot {
+            pid,
+            pgrp,
+            session,
+            tty_nr,
+        }
+    }
+
+    #[test]
+    fn sup14_task171_2_parse_proc_stat_values() {
+        assert_eq!(
+            parse_proc_stat(&stat(4242, 4242, 4242, 0)).unwrap(),
+            snap(4242, 4242, 4242, 0)
+        );
+        assert_eq!(
+            parse_proc_stat(&stat(10, 20, 30, 34816)).unwrap(),
+            snap(10, 20, 30, 34816)
+        );
+        // comm に空白と ')' を含んでも最後の ')' で分割する。
+        let tricky = "77 (a) (b c) S 1 77 77 0 -1 0\n";
+        assert_eq!(parse_proc_stat(tricky).unwrap(), snap(77, 77, 77, 0));
+    }
+
+    #[test]
+    fn sup14_task171_2_parse_proc_stat_rejects_malformed() {
+        let big = format!("1 (x) S 1 1 1 0 {}", "0 ".repeat(MAX_STAT_BYTES));
+        let cases = [
+            "",
+            "1 x S 1 1 1 0",
+            "1 (x S 1 1 1 0",
+            "abc (x) S 1 1 1 0",
+            "1 (x) S 1 1",
+            "1 (x) S 1 q 1 0",
+            "1 (x) S 1 1 -2 0",
+            "1 (x) S 1 1 1 zz",
+            ") (",
+            big.as_str(),
+        ];
+        for c in cases {
+            let e = parse_proc_stat(c).unwrap_err();
+            assert_eq!(e.reason, PrivilegeErrorReason::MalformedStatus, "{c:?}");
+            assert_eq!(e.code, ErrorCode::FailedPrecondition, "{c:?}");
+        }
+    }
+
+    #[test]
+    fn sup14_task171_2_verify_session_detached_ok_and_rejects() {
+        assert!(verify_session_detached(&snap(5, 5, 5, 0), NO_TTY).is_ok());
+        for (i, t) in [
+            StdioTerminals {
+                stdin: true,
+                ..NO_TTY
+            },
+            StdioTerminals {
+                stdout: true,
+                ..NO_TTY
+            },
+            StdioTerminals {
+                stderr: true,
+                ..NO_TTY
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let e = verify_session_detached(&snap(5, 5, 5, 0), t).unwrap_err();
+            assert_eq!(e.reason, PrivilegeErrorReason::StdioIsTerminal, "fd {i}");
+            assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        }
+        let e = verify_session_detached(&snap(5, 5, 5, 34816), NO_TTY).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::ControllingTerminalAttached);
+        let e = verify_session_detached(&snap(5, 5, 4, 0), NO_TTY).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::NotSessionLeader);
+        let e = verify_session_detached(&snap(5, 4, 5, 0), NO_TTY).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::NotSessionLeader);
+    }
+
+    struct Fake {
+        stdio: StdioTerminals,
+        setsid: Option<i32>,
+        stat: Result<String, i32>,
+        setsid_calls: u32,
+    }
+
+    impl SessionKernel for Fake {
+        fn stdio_terminals(&mut self) -> StdioTerminals {
+            self.stdio
+        }
+        fn setsid(&mut self) -> std::io::Result<()> {
+            self.setsid_calls += 1;
+            match self.setsid {
+                None => Ok(()),
+                Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+            }
+        }
+        fn read_self_stat(&mut self) -> std::io::Result<String> {
+            match &self.stat {
+                Ok(s) => Ok(s.clone()),
+                Err(errno) => Err(std::io::Error::from_raw_os_error(*errno)),
+            }
+        }
+    }
+
+    fn fake(setsid: Option<i32>, stat_text: String) -> Fake {
+        Fake {
+            stdio: NO_TTY,
+            setsid,
+            stat: Ok(stat_text),
+            setsid_calls: 0,
+        }
+    }
+
+    #[test]
+    fn sup14_task171_2_detach_with_terminal_stdio_never_calls_setsid() {
+        let mut k = fake(None, stat(9, 9, 9, 0));
+        k.stdio.stdout = true;
+        let e = detach_session_with(&mut k).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::StdioIsTerminal);
+        assert_eq!(k.setsid_calls, 0);
+    }
+
+    #[test]
+    fn sup14_task171_2_detach_succeeds_after_setsid() {
+        let mut k = fake(None, stat(9, 9, 9, 0));
+        assert_eq!(detach_session_with(&mut k).unwrap(), snap(9, 9, 9, 0));
+        assert_eq!(k.setsid_calls, 1);
+    }
+
+    #[test]
+    fn sup14_task171_2_detach_eperm_is_ok_only_when_already_detached() {
+        // EPERM かつ既に自分のセッションのリーダーで制御端末なし: 成功。
+        let mut k = fake(Some(1), stat(9, 9, 9, 0));
+        assert_eq!(detach_session_with(&mut k).unwrap(), snap(9, 9, 9, 0));
+        // EPERM かつ別セッション: 拒否。
+        let mut k = fake(Some(1), stat(9, 9, 3, 0));
+        let e = detach_session_with(&mut k).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::NotSessionLeader);
+        // EPERM かつ制御端末あり: 拒否。
+        let mut k = fake(Some(1), stat(9, 9, 9, 34816));
+        let e = detach_session_with(&mut k).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::ControllingTerminalAttached);
+    }
+
+    #[test]
+    fn sup14_task171_2_detach_other_errno_and_read_failures() {
+        let mut k = fake(Some(22), stat(9, 9, 9, 0));
+        let e = detach_session_with(&mut k).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::SyscallFailed);
+        assert_eq!(e.code, ErrorCode::Internal);
+        assert_eq!(e.message, "setsid failed (errno 22)");
+        let mut k = fake(None, String::new());
+        k.stat = Err(5);
+        let e = detach_session_with(&mut k).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::SyscallFailed);
+        assert_eq!(e.message, "reading process stat failed (errno 5)");
+        let mut k = fake(None, "garbage".to_owned());
+        let e = detach_session_with(&mut k).unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::MalformedStatus);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn sup14_task171_2_detach_is_unimplemented_off_linux() {
+        let e = detach_session().unwrap_err();
+        assert_eq!(e.reason, PrivilegeErrorReason::Unimplemented);
+        assert_eq!(e.code, ErrorCode::Unimplemented);
     }
 }

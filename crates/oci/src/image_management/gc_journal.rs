@@ -549,6 +549,19 @@ pub(super) fn settle(
         return DeletionDurability::Pending;
     }
     if !blobs_synced {
+        // テーブル更新（タグ解除・manifest 除去）は済んでいるため、元のジャーナルを残すと
+        // 再 pull で再登録された同じタグ・manifest を次の復旧が外してしまう（OCI-7）。
+        // 段階を進めた「unlink 済み blob の fsync 待ち」だけのジャーナルへ原子的に置き換える。
+        // 置換に失敗したら元のジャーナルのまま Pending にする（保持する以外に手段が無い）。
+        let mut keep = deleted.to_vec();
+        keep.sort();
+        keep.dedup();
+        let rest = GcJournal {
+            delete_blobs: keep,
+            attempts: prior_attempts,
+            ..GcJournal::default()
+        };
+        let _ = write_journal(root, &rest);
         return DeletionDurability::Pending;
     }
     match remove_journal(root) {
@@ -1125,6 +1138,45 @@ mod tests {
         assert_eq!(rec.durability, success_durability(DIR_SYNC_SUPPORTED));
         assert!(!root.journal());
         ensure_no_pending_journal(&root.0).unwrap();
+    }
+
+    /// OCI-7: 全 blob を unlink した後に blob ディレクトリの fsync が失敗して Pending のとき、
+    /// 再 pull で同じ manifest・タグが再登録されても、次の復旧はそれらを外さず消さない。
+    #[test]
+    fn oci7_pending_after_table_update_does_not_remove_reregistered_tag() {
+        let root = Root::new();
+        files(&root);
+        write_journal(&root.0, &journal_a()).unwrap();
+        // 削除対象の blob を全部 unlink 済みにして、blob ディレクトリの fsync だけ失敗させる。
+        for n in [0x11u8, 0xc1] {
+            fs::remove_file(blob_path(&root.0, &d(n)).unwrap()).unwrap();
+        }
+        test_hook::fail_sync_of(&blob_dir(&root.0), 1);
+        let st = settle(&root.0, &[], &[d(0x11), d(0xc1)], 0, false);
+        test_hook::clear();
+        assert_eq!(st, DeletionDurability::Pending);
+        // 残ったジャーナルは unlink 済み blob の fsync 待ちだけで、manifest・untag を含まない。
+        let j = read_journal(&root.0).unwrap().unwrap();
+        assert!(j.manifests.is_empty());
+        assert!(j.untag.is_empty());
+        assert_eq!(j.delete_blobs, vec![d(0x11), d(0xc1)]);
+        // 同じ manifest・タグ・blob が再登録された状態で復旧する。
+        root.put(&d(0x11));
+        root.put(&d(0xc1));
+        let mut t = table();
+        t.register_tag(tk("v1"), &d(0xa0)).unwrap();
+        let store = ImageStore::with_table(&root.0, t).unwrap();
+        let rec = store.recover_pending_deletion().unwrap().unwrap();
+        assert!(rec.untagged.is_empty());
+        assert!(rec.removed_manifests.is_empty());
+        assert_eq!(rec.kept_blobs, vec![d(0x11), d(0xc1)]);
+        let g = store.lock().unwrap();
+        assert_eq!(g.tags().count(), 1);
+        assert_eq!(g.manifests().count(), 2);
+        drop(g);
+        assert!(root.exists(&d(0x11)));
+        assert!(root.exists(&d(0xc1)));
+        assert!(!root.journal());
     }
 
     /// OCI-7: 通常の lock 経路でも復旧結果（Abandoned と孤児 blob）が guard から取れる。

@@ -8,9 +8,10 @@
 //!
 //! # 起動のしかた（呼び出し側の責務。#1718・#1719）
 //! - 実行ファイルは固定のインストール先から解決する（`PATH` 探索をしない）。
-//! - argv: `fandhe-container-supervisor start --root <状態ルートの絶対パス> [--restart <policy>] <container-id>`。
+//! - argv: `fandhe-container-supervisor start --root <状態ルートの絶対パス> [--restart <policy>] [--audit-policy <best-effort|strict>] <container-id>`。
 //!   `--root` は必須（CLI が `StateRoot::resolve` で解決した値を渡す。supervisor は状態ルートを環境変数から決めない）。
-//!   `--restart` は任意で既定は `no`。各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
+//!   `--restart` は任意で既定は `no`。`--audit-policy` は任意で既定は `best-effort`（カーネル監査頼みの層が縮退した
+//!   環境の扱い。`strict` は縮退を起動前に拒否する。SEC-4・#2027。CLI からの受け渡しは未実装）。各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
 //! - 契約の fd は 0〜2 のみ。supervisor は入口（`start_entry`）で fd [`FIRST_INHERITED_FD`] 以降を閉じる
 //!   （特権ランチャーと同じ処理。#2070・SEC-1）。呼び出し側が追加の fd を渡しても使われない。exec から入口までの
 //!   短い窓は残る（CLI は CLOEXEC の無い fd を自分では閉じない）。
@@ -58,6 +59,7 @@ use fandhe_container_core::oci_runtime::{
 use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
 use crate::restart::RestartPolicy;
+use fandhe_container_core::audit_log::AuditCoveragePolicy;
 
 /// supervisor の入口とランチャーが閉じ始める fd 番号（0〜2 は契約の stdin / stdout / stderr。SEC-1・#2070）。
 pub const FIRST_INHERITED_FD: u32 = 3;
@@ -253,6 +255,8 @@ pub struct StartArgs {
     pub root: PathBuf,
     /// restart ポリシー（既定 `no`）。
     pub restart: RestartPolicy,
+    /// 監査の網羅を満たせない環境への方針（既定 `best-effort`。SEC-4・#2027）。
+    pub audit_policy: AuditCoveragePolicy,
     /// 起動するコンテナの ID。
     pub id: ContainerId,
 }
@@ -281,17 +285,18 @@ impl StartArgs {
         }
         let mut root: Option<String> = None;
         let mut restart: Option<String> = None;
+        let mut audit_policy: Option<String> = None;
         let mut id: Option<String> = None;
         while let Some(tok) = it.next() {
             match tok.as_str() {
-                "--root" | "--restart" => {
+                "--root" | "--restart" | "--audit-policy" => {
                     let value = it
                         .next()
                         .ok_or_else(|| invalid("option value is missing"))?;
-                    let slot = if tok == "--root" {
-                        &mut root
-                    } else {
-                        &mut restart
+                    let slot = match tok.as_str() {
+                        "--root" => &mut root,
+                        "--restart" => &mut restart,
+                        _ => &mut audit_policy,
                     };
                     if slot.replace(value).is_some() {
                         return Err(invalid("option given more than once"));
@@ -313,9 +318,18 @@ impl StartArgs {
             Some(p) => p.parse::<RestartPolicy>()?,
             None => RestartPolicy::No,
         };
+        let audit_policy = match audit_policy {
+            Some(p) => p.parse::<AuditCoveragePolicy>()?,
+            None => AuditCoveragePolicy::default(),
+        };
         let id =
             ContainerId::new(id.ok_or_else(|| invalid("exactly one container id is required"))?)?;
-        Ok(Self { root, restart, id })
+        Ok(Self {
+            root,
+            restart,
+            audit_policy,
+            id,
+        })
     }
 }
 
@@ -521,6 +535,51 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(c.restart, "on-failure:3".parse::<RestartPolicy>().unwrap());
+    }
+
+    /// SEC-4・#2027: `--audit-policy` の既定は best-effort、`strict` を受理し、順不同で渡せる。
+    #[test]
+    fn sec4_2027_args_audit_policy() {
+        let a = StartArgs::parse(os(&["start", "--root", ROOT, "c1"])).unwrap();
+        assert_eq!(a.audit_policy, AuditCoveragePolicy::BestEffort);
+        let b = StartArgs::parse(os(&[
+            "start",
+            "--audit-policy",
+            "strict",
+            "--root",
+            ROOT,
+            "c1",
+        ]))
+        .unwrap();
+        assert_eq!(b.audit_policy, AuditCoveragePolicy::Strict);
+        let c = StartArgs::parse(os(&[
+            "start",
+            "c1",
+            "--audit-policy",
+            "best-effort",
+            "--root",
+            ROOT,
+        ]))
+        .unwrap();
+        assert_eq!(c.audit_policy, AuditCoveragePolicy::BestEffort);
+        for bad in [
+            vec!["start", "--root", ROOT, "--audit-policy", "Strict", "c1"],
+            vec!["start", "--root", ROOT, "--audit-policy", "c1"],
+            vec!["start", "--root", ROOT, "c1", "--audit-policy"],
+            vec![
+                "start",
+                "--root",
+                ROOT,
+                "--audit-policy",
+                "strict",
+                "--audit-policy",
+                "strict",
+                "c1",
+            ],
+        ] {
+            let e = StartArgs::parse(os(&bad)).expect_err("must be rejected");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "input: {bad:?}");
+        }
     }
 
     /// SUP-1: 不正な argv はすべて InvalidArgument。

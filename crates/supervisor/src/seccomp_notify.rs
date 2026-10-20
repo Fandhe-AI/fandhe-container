@@ -32,7 +32,8 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! 記録経路が使えないときの起動拒否・縮退の表示（#2027）は扱わず、`unrecorded` の集計とログまで。exec 経路（SUP-6）の
+//! 記録先を作れないときの起動拒否は入口（`start_entry::require_seccomp_audit_sink`。#2027）が行い、本モジュールは
+//! 起動した後に記録に失敗した分の `unrecorded` の集計とログまで。exec 経路（SUP-6）の
 //! listener 受け渡しは #2385。restart の再 launch を本番で成り立たせること自体は #2043（本モジュールの差し替えは
 //! 偽の launcher でだけ試している）。
 
@@ -45,7 +46,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::audit_log::{
-    AuditRecord, AuditSink, AuditTimestamp, SeccompDenialReport, record_seccomp_denial_for,
+    AuditSink, AuditTimestamp, SeccompDenialReport, record_seccomp_denial_for,
 };
 use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
@@ -350,19 +351,6 @@ struct Job {
     report: SeccompDenialReport,
     at: AuditTimestamp,
     done: SyncSender<()>,
-}
-
-/// 記録先が無いときの sink（ループは止めず、`unrecorded` として数える。起動の拒否は #2027）。
-#[derive(Debug, Default)]
-pub struct UnavailableAuditSink;
-
-impl AuditSink for UnavailableAuditSink {
-    fn record(&self, _record: &AuditRecord) -> Result<(), TraitError> {
-        Err(TraitError::new(
-            ErrorCode::Unavailable,
-            "no audit sink is available for seccomp records",
-        ))
-    }
 }
 
 /// recorder スレッドの本体。依頼ごとに sink へ記録し、完了を知らせる。sender が全部消えたら終わる。
@@ -895,6 +883,7 @@ impl SeccompNotifyHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_core::audit_log::AuditRecord;
     use std::collections::VecDeque;
     use std::sync::Condvar;
 

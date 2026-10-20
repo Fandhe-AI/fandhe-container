@@ -245,7 +245,8 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         | AuditEvent::ExecTarget { .. }
         | AuditEvent::Entrypoint { .. }
         | AuditEvent::ControlPeer { .. }
-        | AuditEvent::ExitSignal { .. } => None,
+        | AuditEvent::ExitSignal { .. }
+        | AuditEvent::AuditCoverageDegraded { .. } => None,
         AuditEvent::Landlock { path, .. } => Some(path),
         AuditEvent::Mount { path, .. } => path.as_ref(),
         AuditEvent::PluginTrust { path, .. } => Some(path),
@@ -266,6 +267,17 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
             signal.get(),
             target_pid.get()
         ));
+    }
+    // `audit_coverage` 層のみ: 縮退した層の理由（固定トークン。#2027）。
+    if let Some((seccomp_kill, landlock)) = record.coverage_reasons() {
+        if let Some(r) = seccomp_kill {
+            tail.push_str(" seccomp_kill_reason=");
+            tail.push_str(r.as_str());
+        }
+        if let Some(r) = landlock {
+            tail.push_str(" landlock_reason=");
+            tail.push_str(r.as_str());
+        }
     }
     match record.container_id() {
         Some(id) => {
@@ -651,6 +663,25 @@ mod tests {
             encode_payload(&r).unwrap(),
             "op=fandhe-audit layer=exit_signal ts=1700000000.000000005 pid=1234 syscall=? arch=? \
              path=? path_truncated=? path_original_len=? signal=31 target_pid=4321 container_id=c1"
+        );
+    }
+
+    /// SEC-4・#2027: audit_coverage レコードの key=value は縮退した層の理由を固定トークンで続ける。
+    #[test]
+    fn sec4_2027_payload_audit_coverage_reasons() {
+        let r = rec(AuditEvent::AuditCoverageDegraded {
+            seccomp_kill: Some(crate::audit_log::AuditReason::new(
+                "seccomp_kill_not_logged",
+            )),
+            landlock: Some(crate::audit_log::AuditReason::new(
+                "landlock_audit_abi_too_old",
+            )),
+        });
+        assert_eq!(
+            encode_payload(&r).unwrap(),
+            "op=fandhe-audit layer=audit_coverage ts=1700000000.000000005 pid=1234 syscall=? arch=? \
+             path=? path_truncated=? path_original_len=? seccomp_kill_reason=seccomp_kill_not_logged \
+             landlock_reason=landlock_audit_abi_too_old container_id=?"
         );
     }
 

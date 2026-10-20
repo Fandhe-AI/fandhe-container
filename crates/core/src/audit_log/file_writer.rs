@@ -345,6 +345,12 @@ struct AuditLineDto<'a> {
     /// `exit_signal` 層のみ: 終了したプロセスの PID（回収した側の PID namespace の値。他レイヤーでは出力しない）。
     #[serde(skip_serializing_if = "Option::is_none")]
     target_pid: Option<u32>,
+    /// `audit_coverage` 層のみ: 縮退した seccomp KILL 側の理由トークン（他レイヤーでは出力しない。#2027）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seccomp_kill_reason: Option<&'static str>,
+    /// `audit_coverage` 層のみ: 縮退した Landlock 側の理由トークン（他レイヤーでは出力しない。#2027）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    landlock_reason: Option<&'static str>,
     /// 検証済みの `ContainerId`（`[A-Za-z0-9._-]`・255 バイト以下）の生の値。不明なら `null`（省略しない）。
     /// 末尾に置く（既存キーの値と順序は変えない。#1618）。
     container_id: Option<&'a str>,
@@ -362,7 +368,8 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         AuditEvent::ExecTarget { .. }
         | AuditEvent::Entrypoint { .. }
         | AuditEvent::ControlPeer { .. }
-        | AuditEvent::ExitSignal { .. } => (None, None),
+        | AuditEvent::ExitSignal { .. }
+        | AuditEvent::AuditCoverageDegraded { .. } => (None, None),
     };
     let ts = record.timestamp().as_unix_duration();
     let dto = AuditLineDto {
@@ -379,6 +386,14 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         reason: record.reason().map(|r| r.as_str()),
         signal: record.exit_signal().map(|s| s.get()),
         target_pid: record.target_pid().map(|p| p.get()),
+        seccomp_kill_reason: record
+            .coverage_reasons()
+            .and_then(|(s, _)| s)
+            .map(|r| r.as_str()),
+        landlock_reason: record
+            .coverage_reasons()
+            .and_then(|(_, l)| l)
+            .map(|r| r.as_str()),
         container_id: record.container_id().map(|c| c.as_str()),
     };
     let mut line =
@@ -837,6 +852,24 @@ mod tests {
         assert_eq!(
             text(&r),
             "{\"event\":\"audit\",\"layer\":\"exit_signal\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":9,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"signal\":31,\"target_pid\":1234,\"container_id\":\"c1\"}\n"
+        );
+    }
+
+    /// SEC-4・#2027: audit_coverage レコードは縮退した層の理由だけを持ち、縮退していない層のキーは出さない。
+    #[test]
+    fn sec4_2027_encode_audit_coverage_has_layer_reasons() {
+        let r = rec(
+            12,
+            AuditEvent::AuditCoverageDegraded {
+                seccomp_kill: None,
+                landlock: Some(crate::audit_log::AuditReason::new(
+                    "landlock_audit_abi_too_old",
+                )),
+            },
+        );
+        assert_eq!(
+            text(&r),
+            "{\"event\":\"audit\",\"layer\":\"audit_coverage\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":12,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"landlock_reason\":\"landlock_audit_abi_too_old\",\"container_id\":null}\n"
         );
     }
 

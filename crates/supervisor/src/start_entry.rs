@@ -1843,7 +1843,9 @@ mod linux {
     use std::path::{Path, PathBuf};
     use std::process::ExitCode;
 
-    use fandhe_container_core::audit_log::AuditSink;
+    use fandhe_container_core::audit_log::{
+        AuditCoveragePolicy, AuditSink, KernelAuditProbe, assess,
+    };
     use fandhe_container_core::cgroups::{
         CgroupLimitPlan, ContainerCgroup, DelegatedCgroup, ResourceLimitPlan,
     };
@@ -1904,6 +1906,8 @@ mod linux {
         companions: Vec<u32>,
         /// seccomp の通知に応答するハブ（`with_seccomp_hub`。持つときだけ start の launcher が USER_NOTIF 版になる。#2025）。
         seccomp: Option<Arc<SeccompNotifyHub>>,
+        /// 監査の網羅を満たせない環境への方針（`with_audit_policy`。既定 `BestEffort`。SEC-4・#2027）。
+        audit_policy: AuditCoveragePolicy,
     }
 
     /// 決めた権限モデルと、範囲写像のときの入力元（#2243・CORE-6）。
@@ -2061,7 +2065,16 @@ mod linux {
                 audit: None,
                 companions: Vec::new(),
                 seccomp: None,
+                audit_policy: AuditCoveragePolicy::default(),
             }
+        }
+
+        /// 監査の網羅を満たせない環境への方針を設定する（`--audit-policy`。start と restart の再 launch が同じ launcher を
+        /// 使うので同じ方針が効く。SEC-4・#2027）。
+        #[must_use]
+        pub fn with_audit_policy(mut self, policy: AuditCoveragePolicy) -> Self {
+            self.audit_policy = policy;
+            self
         }
 
         /// seccomp の通知に応答するハブを持たせる。持たせると start の launcher が ERRNO 側を `UserNotif` にし、
@@ -2091,7 +2104,9 @@ mod linux {
             } else {
                 (self.recovery_privilege.clone()?, None)
             };
-            let builder = ProductionLauncher::builder().privilege(privilege);
+            let builder = ProductionLauncher::builder()
+                .privilege(privilege)
+                .audit_coverage_policy(self.audit_policy);
             // 応答者（ハブ）がいるときの start の launcher だけが USER_NOTIF にする。残存確認の launcher は launch しない
             // が、同じく応答者がいない構成は ERRNO のまま（応答者のいない USER_NOTIF は拒否対象の syscall を止める）。
             let builder = if with_mapping && self.seccomp.is_some() {
@@ -2125,12 +2140,23 @@ mod linux {
         /// `ProductionLauncherBuilder::build` は child subreaper 化の副作用を持つため、ここでは呼ばない。
         fn check_launcher_available(&self) -> Result<(), TraitError> {
             self.privilege.clone()?;
-            detect_landlock_abi().map(drop).map_err(|e| {
+            // 確実な層（seccomp の ERRNO 側の USER_NOTIF）の応答者が無い構成は起動しない（fail-closed。SEC-4・#2027）。
+            if self.seccomp.is_none() {
+                return Err(seccomp_audit_unavailable());
+            }
+            let support = detect_landlock_abi().map_err(|e| {
                 TraitError::new(
                     e.code,
                     "Landlock ABI 6 or newer is required to start a container",
                 )
-            })
+            })?;
+            // 厳格モードの縮退は cgroup の連鎖（取り消せないスコープの追記）の前に拒否する。launcher も fork の前に同じ判定を
+            // 持つ（観測の時点がずれる場合の多重防御。SEC-4・#2027）。
+            precheck_audit_coverage(
+                &KernelAuditProbe::read_host(),
+                support.audit_mode().into(),
+                self.audit_policy,
+            )
         }
 
         fn prepare_cgroup(
@@ -2410,6 +2436,31 @@ mod linux {
         store.host_state_root().unwrap_or(root)
     }
 
+    /// 確実な層の記録先を作れないときの拒否（固定文言。元のエラーの詳細は載せない。SEC-4・#2027）。
+    fn seccomp_audit_unavailable() -> TraitError {
+        TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "the seccomp audit record path is unavailable",
+        )
+    }
+
+    /// 確実な層（seccomp の ERRNO 側 40 件を USER_NOTIF で記録する経路）の記録先が作れたかを判定する（純関数）。
+    /// 作れなければ `FailedPrecondition` で起動を拒否する（fail-closed。記録先なしで続行しない。SEC-4・#2027）。
+    pub(crate) fn require_seccomp_audit_sink(
+        sink: Result<Arc<dyn AuditSink>, ErrorCode>,
+    ) -> Result<Arc<dyn AuditSink>, TraitError> {
+        sink.map_err(|_| seccomp_audit_unavailable())
+    }
+
+    /// 手順 4 の前倒し判定（純関数）。カーネル監査頼みの層が縮退していて、方針が厳格なら拒否する（SEC-4・#2027）。
+    pub(crate) fn precheck_audit_coverage(
+        probe: &KernelAuditProbe,
+        landlock: fandhe_container_core::launch_isolation::RecordedLandlockAudit,
+        policy: AuditCoveragePolicy,
+    ) -> Result<(), TraitError> {
+        assess(probe, landlock).enforce(policy)
+    }
+
     /// supervisor の bin の入口（`src/main.rs` から呼ぶ）。`args` はプログラム名を除いた argv。
     ///
     /// 終了の前に、それまでの stderr のログが書かれるのを期限つきで待つ（読み手が止まっていても期限で終わる）。
@@ -2502,29 +2553,32 @@ mod linux {
         // 記録はそこへ渡して期限付きで永続化する（`ControlAuditRelay`）。`spawn` は単一スレッドのときだけ成功するので、
         // `run_start_until` が `stderr_sink` の常駐スレッドを作る前のここで作る（launch の単一スレッド要求にも触れない。
         // helper は fork 子で親にスレッドを増やさない）。失敗の記録は常駐スレッドを作れる launch の後まで保留する。
-        let audit = crate::exec::default_audit_sink(Some(args.root.clone()))
+        let relay = crate::exec::default_audit_sink(Some(args.root.clone()))
             .and_then(fandhe_container_core::audit_log::ControlAuditRelay::spawn)
             .map_err(|e| e.code());
         // helper は fork 時点で委譲 cgroup に属するため、cgroup の準備（自プロセスの退避）へ同伴プロセスとして宣言し、
         // 一緒に退避リーフへ移す（宣言しないと「他のプロセスがいる」として起動が拒否される。CORE-3・SUP-1）。
-        let companions: Vec<u32> = audit.as_ref().map(|r| vec![r.pid()]).unwrap_or_default();
-        // 以後の記録の通り道（relay）を共有できる形にする。失敗の記録は従来どおり launch の後まで保留する。
-        let audit = audit
-            .map(|relay| Arc::new(relay) as Arc<dyn fandhe_container_core::audit_log::AuditSink>);
-        // seccomp の通知への応答ハブ（SEC-4・REPAIR-5・#2025）。記録先が無くても作る（応答は止めず `unrecorded` に数える。
-        // 起動の拒否・縮退の表示は #2027）。スレッドは attach まで作らないので、launch の単一スレッド要求に触れない。
-        let hub_sink: Arc<dyn fandhe_container_core::audit_log::AuditSink> = match &audit {
-            Ok(relay) => Arc::clone(relay),
-            Err(_) => Arc::new(crate::seccomp_notify::UnavailableAuditSink),
-        };
+        let companions: Vec<u32> = relay.as_ref().map(|r| vec![r.pid()]).unwrap_or_default();
+        // 以後の記録の通り道（relay）を共有できる形にする。記録先を作れなければ、確実な層（seccomp の USER_NOTIF の記録）を
+        // 満たせないので起動を拒否する（fail-closed。cgroup にも launch にも触れる前に止まる。SEC-4・#2027）。
+        let audit =
+            match require_seccomp_audit_sink(relay.map(|relay| {
+                Arc::new(relay) as Arc<dyn fandhe_container_core::audit_log::AuditSink>
+            })) {
+                Ok(sink) => sink,
+                Err(e) => return fail(&mut out, op_err(e)),
+            };
+        // seccomp の通知への応答ハブ（SEC-4・REPAIR-5・#2025）。スレッドは attach まで作らないので、launch の単一スレッド要求に
+        // 触れない。
         let hub = Arc::new(SeccompNotifyHub::new(
-            hub_sink,
+            Arc::clone(&audit),
             args.id.clone(),
             crate::seccomp_notify::NotifyConfig::default(),
         ));
         let deps = Box::new(
             ProductionStartDeps::new(args.root.clone())
                 .with_companions(companions)
+                .with_audit_policy(args.audit_policy)
                 .with_seccomp_hub(hub),
         );
         // 回復・回収と報告の書き込みで同じ期限を共有し、報告を内部上限内に収める（REPAIR-5）。
@@ -2555,16 +2609,10 @@ mod linux {
         // 報告の後に作るのでスレッドの制約に触れない。作成に失敗したら install が停止を要求し、既存の停止経路が
         // コンテナを終了させて Stopped を記録する（停止できないコンテナを残さない）。
         let stop = StopToken::new();
-        // 失敗は握りつぶさず、構造化ログに固定語彙で残す（拒否の判定自体は fail-closed のまま。SEC-4）。
-        let audit = match audit {
-            Ok(relay) => Some(relay),
-            Err(code) => {
-                log_event("control_audit_relay_unavailable", Some(code));
-                None
-            }
-        };
+        // 記録先は手順 3 より前に必須として確かめ済み（作れなければ起動していない）ので、常に `Some` を渡す。
+        // `install` の `None`（記録先なしで拒否だけ行う）の受け口は、他の呼び出し元と試験のために残している。
         let (running, control) =
-            crate::control::install(&args.root, &args.id, running, &stop, audit);
+            crate::control::install(&args.root, &args.id, running, &stop, Some(audit));
         let code = run_supervised(store, args.id, running, args.restart, &timeouts, &stop);
         // 制御チャネルの作成に失敗していたら、回収に成功しても非 0 で終える（SUP-1）。
         let code = control.exit_code(code);
@@ -2678,6 +2726,78 @@ mod linux {
             assert_eq!(
                 e.message(),
                 "the owner name is not usable for subordinate ids"
+            );
+        }
+
+        struct OkSink;
+        impl AuditSink for OkSink {
+            fn record(
+                &self,
+                _: &fandhe_container_core::audit_log::AuditRecord,
+            ) -> Result<(), TraitError> {
+                Ok(())
+            }
+        }
+
+        /// SEC-4・#2027: 確実な層の記録先を作れなければ `FailedPrecondition` の固定文言で起動を拒否し、作れていれば
+        /// 同じ sink をそのまま返す。
+        #[test]
+        fn sec4_2027_seccomp_audit_sink_unavailable_refuses_start() {
+            let err = require_seccomp_audit_sink(Err(ErrorCode::PermissionDenied))
+                .err()
+                .expect("refused");
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(
+                err.message(),
+                "the seccomp audit record path is unavailable"
+            );
+            let sink: Arc<dyn AuditSink> = Arc::new(OkSink);
+            let got = require_seccomp_audit_sink(Ok(Arc::clone(&sink))).expect("kept");
+            assert!(Arc::ptr_eq(&sink, &got));
+        }
+
+        /// SEC-4・#2027: 応答者（ハブ）の無い本番の deps は手順 4 で拒否する（確実な層を満たせない構成は起動しない）。
+        #[test]
+        fn sec4_2027_deps_without_seccomp_hub_refuse_at_step_4() {
+            let mut deps = ProductionStartDeps::new(std::env::temp_dir());
+            deps.privilege = Ok(LaunchPrivilege {
+                privilege: IsolationPrivilege::RootlessSingleId,
+                subordinate: None,
+            });
+            let err = deps.check_launcher_available().unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(
+                err.message(),
+                "the seccomp audit record path is unavailable"
+            );
+        }
+
+        /// SEC-4・#2027: 前倒し判定。縮退（`kill_process` が記録されない・Landlock ABI 6）は厳格モードだけが拒否し、
+        /// 既定では通す。全項目が揃っていれば厳格モードでも通る。
+        #[test]
+        fn sec4_2027_precheck_audit_coverage_by_policy() {
+            use fandhe_container_core::launch_isolation::RecordedLandlockAudit;
+            let mut degraded = KernelAuditProbe::all_clear();
+            degraded.actions_logged = Some("kill_thread trap errno".to_owned());
+            let abi6 = RecordedLandlockAudit::Unavailable { detected_abi: 6 };
+            let abi7 = RecordedLandlockAudit::KernelAuditRequested;
+            assert!(
+                precheck_audit_coverage(&degraded, abi6, AuditCoveragePolicy::BestEffort).is_ok()
+            );
+            let err =
+                precheck_audit_coverage(&degraded, abi6, AuditCoveragePolicy::Strict).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(
+                err.message(),
+                "audit coverage is degraded and the strict audit policy refuses to start"
+            );
+            assert!(
+                precheck_audit_coverage(
+                    &KernelAuditProbe::all_clear(),
+                    abi7,
+                    AuditCoveragePolicy::Strict
+                )
+                .is_ok()
             );
         }
 

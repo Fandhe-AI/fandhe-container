@@ -877,7 +877,12 @@ impl Inner {
         timeout: Duration,
     ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
         // 期限は入口で 1 回だけ取り、以降のすべての待ち(再回収・監査配送・spawn)をここから導く(REPAIR-5・SEC-4)。
-        let deadline = Instant::now() + timeout;
+        // 上限なしの `Instant + Duration` は `Duration::MAX` 等で panic するため、確認系と同じ上限で丸めて `checked_add` する。
+        let deadline = Instant::now()
+            .checked_add(timeout.min(CONFIRM_TIMEOUT_MAX))
+            .ok_or_else(|| {
+                TraitError::new(ErrorCode::InvalidArgument, "launch timeout is out of range")
+            })?;
         let id = spec.container_id();
         self.admit(id)?;
         if !self.ops.is_single_threaded() {
@@ -2204,6 +2209,29 @@ mod tests {
             std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
             Err(TraitError::new(ErrorCode::Timeout, "slow sink timed out"))
         }
+    }
+
+    /// SEC-4・REPAIR-5: 上限のない `Duration::MAX` を渡しても期限の算出で panic せず、上限で丸めた期限で起動が完了する。
+    #[test]
+    fn sec4_repair5_launch_with_max_timeout_does_not_panic() {
+        let spec = spec_for("cov-maxtimeout", serde_json::json!({}));
+        let ev = events();
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+        let l = audit_launcher(
+            FakeOps::new(&ev),
+            crate::audit_log::AuditCoveragePolicy::BestEffort,
+            sink,
+        );
+        let p = l.launch(&spec, Duration::MAX).expect("launched");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert_eq!(
+            ev.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.starts_with("spawn"))
+                .count(),
+            1
+        );
     }
 
     /// SEC-4・REPAIR-5: 縮退の監査配送が遅くても、launch 全体が引数 timeout の近傍内に `Timeout` で返り、

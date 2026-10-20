@@ -2899,9 +2899,18 @@ mod linux {
         #[test]
         fn sec4_audit_relay_is_spawned_before_the_first_logging_thread() {
             let src = include_str!("start_entry.rs");
-            let entry = src
-                .find("let audit = crate::exec::default_audit_sink(")
+            // テスト自身の文字列リテラルに一致しないよう、`run_main_inner` の本体から探す(宣言はテストより前にある)。
+            let body = src
+                .find("fn run_main_inner<")
+                .expect("run_main_inner in the entry");
+            let entry = src[body..]
+                .find("let relay = crate::exec::default_audit_sink(")
+                .map(|p| p + body)
                 .expect("relay construction in the entry");
+            assert!(
+                entry < src.find("mod tests").unwrap_or(usize::MAX),
+                "relay construction must be found in the production code"
+            );
             let spawn = src[entry..]
                 .find("ControlAuditRelay::spawn")
                 .map(|p| p + entry)

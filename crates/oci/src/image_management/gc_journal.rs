@@ -1018,18 +1018,28 @@ mod tests {
     }
 
     /// OCI-7・#851: blob ディレクトリが無いとき、全件を不在として回復を完了しジャーナルを消す。
+    /// `blobs` ごと無い場合と `blobs/sha256` だけ無い場合の両方を、実際に取り除いて確かめる。
     #[test]
     fn oci7_resume_completes_when_blob_dirs_missing() {
-        let root = Root::new();
-        write_journal(&root.0, &journal_a()).unwrap();
-        let mut t = table();
-        t.register_tag(tk("v1"), &d(0xa0)).unwrap();
-        let store = ImageStore::with_table(&root.0, t).unwrap();
-        let rec = store.recover_pending_deletion().unwrap().unwrap();
-        assert!(!rec.absent_blobs.is_empty());
-        assert!(rec.undeleted_blobs.is_empty());
-        assert_ne!(rec.durability, DeletionDurability::Pending);
-        assert!(read_journal(&root.0).unwrap().is_none());
+        for remove_whole_blobs in [true, false] {
+            let root = Root::new();
+            write_journal(&root.0, &journal_a()).unwrap();
+            let target = if remove_whole_blobs {
+                root.0.join("blobs")
+            } else {
+                blob_dir(&root.0)
+            };
+            fs::remove_dir_all(&target).unwrap();
+            assert!(!blob_dir(&root.0).exists());
+            let mut t = table();
+            t.register_tag(tk("v1"), &d(0xa0)).unwrap();
+            let store = ImageStore::with_table(&root.0, t).unwrap();
+            let rec = store.recover_pending_deletion().unwrap().unwrap();
+            assert!(!rec.absent_blobs.is_empty());
+            assert!(rec.undeleted_blobs.is_empty());
+            assert_ne!(rec.durability, DeletionDurability::Pending);
+            assert!(read_journal(&root.0).unwrap().is_none());
+        }
     }
 
     /// OCI-7: ジャーナルの書き直しに失敗しても上限判定を諦めず、断念して片づける。

@@ -78,7 +78,7 @@
 //!   （macOS の既定はオーナー判断待ち。#2431・`docs/design/macos-state-root.md`）
 //! - Windows: [`FileStateStore::open`] は何も作らずに `Unimplemented`（fail-closed）。所有者 SID の照合と
 //!   保護 DACL でのディレクトリ作成には Win32 FFI が要り、core は `windows-sys` に依存しないため
-//!   （依存の追加はユーザー承認事項。REPAIR-3）
+//!   （依存の追加はユーザー承認事項。REPAIR-3）。実装方式は #2428 で判断待ち（`docs/design/windows-state-store-acl.md`）
 //! - Linux・macOS でも、`open(2)` フラグの値を `sys` が持たないアーキテクチャ（x86_64・aarch64 以外）では
 //!   同様に `Unimplemented`
 //!
@@ -1125,6 +1125,7 @@ fn ensure_supported_platform() -> Result<(), TraitError> {
 
 /// Linux・macOS 以外（Windows）では状態ルートの信頼境界（所有者 SID・DACL）を検査できないため
 /// 拒否する（fail-closed。検査には Win32 FFI が要り、core は `windows-sys` に依存しない）。
+/// 実装方式は #2428 で判断待ち（`docs/design/windows-state-store-acl.md`）。
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn ensure_supported_platform() -> Result<(), TraitError> {
     Err(err(

@@ -18,6 +18,10 @@
 //! listener 側の拒否に別 UID の非 root は使えない（0700 の配置ディレクトリで connect 前に遮断され、
 //! peer 検証へ届かない）ため、connector は root が必要。client 側は親ディレクトリを検証しないので、
 //! 別 UID が listen 中の socket であれば root でなくてもよい。
+//!
+//! 実機前提の観測（macOS のみ・`#[ignore]`）: `plug12_macos_peer_uid_after_client_close_probe` は、
+//! client が connect 直後に close した接続の peer UID 取得結果を JSON 行で出す（accept の結果・監査 reason と getpeereid の errno。UID は含まない）（#2252 P2-2。
+//! 結果の判断は人間担当の #2405）。手順は `AGENTS.md`「実機前提テスト」節。
 
 #[cfg(not(unix))]
 #[test]
@@ -290,5 +294,67 @@ mod unix {
         .unwrap_err();
         assert_eq!(err.code(), PluginErrorCode::PermissionDenied);
         assert_eq!(err.message(), MISMATCH_MESSAGE);
+    }
+
+    /// PLUG-12 / SEC-4（実機前提・観測用。#2252 P2-2・人間担当は #2405）: macOS で client が connect 直後に
+    /// close した接続に対し、listener 側の peer UID 取得（`getpeereid`）が成功するか失敗するかを観測する。
+    ///
+    /// 結果の解釈（`ENOTCONN` で失敗するか。失敗するなら少数回の許容を設けるか）は人間が行う。
+    /// 現状の挙動（取得失敗は即エラー・fail-closed）は変えない。assert はどちらの結果でも成り立つ
+    /// 不変条件（受理なら監査 0 件）に限り、失敗は panic せず観測として記録する。
+    /// 出力は code・監査 reason・errno だけで、UID 値は載せない。
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "observation on a real macOS host; the result is judged by a human; PLUG-12 #2252 P2-2"]
+    fn plug12_macos_peer_uid_after_client_close_probe() {
+        let dir = TempDir::new();
+        let l = UdsListener::bind(&dir.sock()).unwrap();
+        let mut connect_audit = fandhe_container_plugin::JsonLinesPeerAuthObserver::new();
+        let c = UdsStream::connect(l.path(), WAIT, &mut connect_audit).unwrap();
+        drop(c);
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut audit = fandhe_container_plugin::JsonLinesPeerAuthObserver::new();
+        let result = l.accept(Duration::from_secs(2), &mut audit);
+        let lines = audit.drain_lines();
+        // 観測専用: 結果は panic せずそのまま JSON に記録する（Internal で監査なし〔set_io_timeout 由来〕・
+        // Timeout 等も観測対象。#2252 P2-1/P2-2）。assert は「受理なら監査 0 件」だけに限る。
+        let reasons: Vec<&str> = lines
+            .iter()
+            .map(|l| {
+                if l.contains("\"reason\":\"peer_uid_unavailable\"") {
+                    "peer_uid_unavailable"
+                } else {
+                    "other"
+                }
+            })
+            .collect();
+        let (outcome, code) = match &result {
+            Ok(_) => {
+                assert!(lines.is_empty(), "accepted connection must not be audited");
+                ("ok", String::new())
+            }
+            Err(err) => ("error", format!("{:?}", err.code())),
+        };
+        println!(
+            "{{\"probe\":\"peer_uid_after_close\",\"outcome\":\"{outcome}\",\"code\":\"{code}\",\"audit_count\":{},\"audit_reasons\":{:?}}}",
+            lines.len(),
+            reasons
+        );
+
+        // getpeereid の失敗 errno を、UID を含めず別の接続で観測する（ENOTCONN 等の区別用。#2405 の判断材料）。
+        let sl_dir = TempDir::new();
+        let std_l = std::os::unix::net::UnixListener::bind(sl_dir.sock()).unwrap();
+        let client = std::os::unix::net::UnixStream::connect(sl_dir.sock()).unwrap();
+        drop(client);
+        std::thread::sleep(Duration::from_millis(50));
+        let (accepted, _) = std_l.accept().unwrap();
+        let errno = fandhe_container_plugin::observe_peer_uid_errno(&accepted);
+        match errno {
+            Some(e) => println!(
+                "{{\"probe\":\"peer_uid_errno_after_close\",\"outcome\":\"error\",\"errno\":{e}}}"
+            ),
+            None => println!("{{\"probe\":\"peer_uid_errno_after_close\",\"outcome\":\"ok\"}}"),
+        }
     }
 }

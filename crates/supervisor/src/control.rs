@@ -155,12 +155,14 @@ mod install {
             relauncher,
             instance,
             logs,
+            seccomp,
         } = running;
         let running = Running {
             process: Box::new(ControlledProcess::new(process, slot.clone())),
             relauncher: Arc::new(ControlledRelauncher::new(relauncher, slot.clone())),
             instance,
             logs,
+            seccomp,
         };
         let observer = Arc::new(ControlObserver::new(audit, Some(id.clone())));
         let server = listener

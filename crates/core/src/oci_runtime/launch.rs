@@ -692,7 +692,8 @@ pub trait LaunchedProcess: Send {
     ///
     /// 本番 launcher は PID 1 が `NEW_LISTENER` 付きで filter を載せて渡した fd を、検証のうえ持たせる。supervisor が
     /// 起動・再起動のたびに呼び、監視の間保持する(閉じると `USER_NOTIF` 側の待機中の syscall が `ENOSYS` になる)。
-    /// 通知を読んで応答するループは #2025。当面の filter は ERRNO 版で通知は生じない。2 回目以降と、listener を
+    /// 通知を読んで応答するのは supervisor の `SeccompNotifyHub`（#2025）。filter が `UserNotif` 版（builder の opt-in）のとき
+    /// 応答者がいないと拒否対象の syscall が止まる。既定の ERRNO 版では通知は生じない。2 回目以降と、listener を
     /// 持たない実装は `None`(既定)。`LaunchedProcess` を包み直す実装は内側へ転送すること(`take_output` と同じ注意)。
     #[cfg(target_os = "linux")]
     fn take_seccomp_listener(&self) -> Option<crate::exec::SeccompListener> {

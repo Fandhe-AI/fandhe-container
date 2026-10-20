@@ -288,7 +288,11 @@ pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub use seccomp::{probe_denied_syscalls_for_test, probe_kcmp_self_for_test};
-pub use seccomp_listener::SeccompListener;
+pub use seccomp_listener::{
+    DenyOutcome, ListenerReadiness, NotificationId, SeccompListener, SeccompNotification,
+};
+#[cfg(feature = "exec-test-support")]
+pub use seccomp_listener::{UserNotifProbe, kcmp_self_errno_for_test, user_notif_probe_for_test};
 pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 pub use subreaper::ChildSubreaper;

@@ -183,3 +183,11 @@ harness = false
 name = "control_audit_delivery"
 path = "tests/control_audit_delivery.rs"
 harness = false
+
+# seccomp の通知を受けて記録し EPERM で応答する経路の実カーネル end-to-end 試験（SEC-4・REPAIR-5・#2025）。
+# 監査 helper の fork は単一スレッドの呼び出し元を要求するため、単一スレッドの独自 main（harness = false）で動かす。
+# root 不要で既定のテスト集合で実行する（`exec-test-support` の probe を使う。依存は不変）。
+[[test]]
+name = "seccomp_notify_audit"
+path = "tests/seccomp_notify_audit.rs"
+harness = false

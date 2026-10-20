@@ -21,6 +21,12 @@
 //!   集計する（間引きは応答を遅らせない）。集計は固定語彙と数値だけの構造化ログを間隔を空けてまとめて出す
 //! - **取り違えない**: `/proc/<tid>/status` を読んだ **後** に `ID_VALID` で cookie を検証し、pid の再利用や対象の終了で
 //!   別プロセスの情報を記録しない（無効なら記録しない）
+//! - **応答を送れなくなったら閉じる**: 拒否応答の送信は上限つきで再送し、それでも送れないときは `respond_failed` を数えて
+//!   ループを終える。受信済みの通知は再受信できないため、listener を閉じてカーネルに `ENOSYS` で解かせる(許可に倒れない)
+//! - **監査の保証範囲(SEC-4)**: 記録されるのはランタイムが載せた最終フィルタ(`USER_NOTIF`)による拒否だけ。既定フィルタは
+//!   Docker / OCI 互換のため `seccomp(2)`・`prctl(PR_SET_SECCOMP)` を許可しており、ワークロードが自分で追加した
+//!   フィルタ(例: `kcmp` に `ERRNO`)は `USER_NOTIF` より優先されて先に拒否する。これはワークロード自身の制限であり
+//!   ランタイムの分離違反ではないため監査対象外(`audit-delivery.md`「保証範囲」)
 //! - **応答者の不在でも拒否は保たれる**: スレッドが終了して listener が閉じると、カーネルは待機中の syscall を
 //!   `ENOSYS` にする（許可に倒れない）
 //!
@@ -177,6 +183,8 @@ pub struct Counters {
     target_gone: AtomicU64,
     pid_unresolved: AtomicU64,
     respond_failed: AtomicU64,
+    /// 拒否応答を再送の上限まで試しても送れなかった(以後 listener を閉じて待機中の syscall を `ENOSYS` で解く)。
+    respond_broken: AtomicBool,
     wait_failed: AtomicU64,
     receive_failed: AtomicU64,
     /// listener スレッドが最終ログで報告済みとした時点の値（回収後に recorder の増分だけを出すため）。
@@ -388,17 +396,25 @@ const MAX_IN_FLIGHT: usize = RECORD_QUEUE_CAPACITY + 1;
 /// 完了待ちがあるときに listener を待つ 1 回の長さ(完了は poll を起こさないため短く刻んで確かめる)。
 const IN_FLIGHT_POLL: Duration = Duration::from_millis(2);
 
-/// `-EPERM` で応答して結果を数える。
+/// 拒否応答の送信を試す回数の上限(一過性の失敗〔`EINTR` 等〕を吸収する。無限には再試行しない。REPAIR-5)。
+const RESPOND_ATTEMPTS: u32 = 3;
+
+/// `-EPERM` で応答して結果を数える。送信に失敗しても通知は受信済みで再受信できないため、上限つきで再送する。
+/// 使い切っても送れないときは `respond_broken` を立てる。listener ループはそれを見て終了し、listener を閉じる
+/// (カーネルが待機中の syscall を `ENOSYS` で解く。許可には倒れない。SEC-4・REPAIR-5)。
 fn respond<S: NotifySource>(source: &S, counters: &Counters, id: S::Id) {
-    match source.deny_eperm(id) {
-        Ok(Responded::Sent) => {}
-        Ok(Responded::TargetGone) => {
-            counters.target_gone.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(SourceError) => {
-            counters.respond_failed.fetch_add(1, Ordering::Relaxed);
+    for _ in 0..RESPOND_ATTEMPTS {
+        match source.deny_eperm(id) {
+            Ok(Responded::Sent) => return,
+            Ok(Responded::TargetGone) => {
+                counters.target_gone.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Err(SourceError) => {}
         }
     }
+    counters.respond_failed.fetch_add(1, Ordering::Relaxed);
+    counters.respond_broken.store(true, Ordering::Release);
 }
 
 /// 先頭から、記録が完了したか期限を過ぎた通知に応答する。FIFO の recorder と同じ期限幅のため先頭だけ見れば足りる。
@@ -463,6 +479,10 @@ fn listener_main<S: NotifySource>(
             break;
         }
         settle_in_flight(source, counters, &mut in_flight);
+        // 応答を送れなくなったら終了して listener を閉じる(取りこぼした通知を保持し続けない。fail-closed)。
+        if counters.respond_broken.load(Ordering::Acquire) {
+            break;
+        }
         if closing {
             if in_flight.is_empty() {
                 break;
@@ -519,6 +539,9 @@ fn listener_main<S: NotifySource>(
                 deadline: Instant::now() + config.response_deadline,
                 finished,
             }),
+        }
+        if counters.respond_broken.load(Ordering::Acquire) {
+            break;
         }
         report_if_due(counters, &mut reported, &mut last_report);
     }
@@ -883,6 +906,8 @@ mod tests {
         gone_on_send: bool,
         /// 1: wait が失敗する / 2: receive が失敗する。
         fail_at: u8,
+        /// 応答の送信を失敗させる残り回数(`u32::MAX` は常に失敗)。
+        send_failures: std::sync::atomic::AtomicU32,
     }
 
     impl Fake {
@@ -895,6 +920,7 @@ mod tests {
                     answered: Arc::clone(&answered),
                     gone_on_send: false,
                     fail_at: 0,
+                    send_failures: std::sync::atomic::AtomicU32::new(0),
                 },
                 answered,
             )
@@ -923,6 +949,13 @@ mod tests {
             Ok(self.pending)
         }
         fn deny_eperm(&self, id: u64) -> Result<Responded, SourceError> {
+            let left = self.send_failures.load(Ordering::SeqCst);
+            if left > 0 {
+                if left != u32::MAX {
+                    self.send_failures.store(left - 1, Ordering::SeqCst);
+                }
+                return Err(SourceError);
+            }
             self.answered.lock().unwrap().push(id);
             Ok(if self.gone_on_send {
                 Responded::TargetGone
@@ -1128,6 +1161,30 @@ mod tests {
         assert_eq!(snap.recorded, 2);
         assert_eq!(snap.suppressed, 3);
         assert_eq!(sink.records.lock().unwrap().len(), 2);
+    }
+
+    /// REPAIR-5・SEC-4・#2025: 応答の送信が一過性に失敗しても上限つきで再送し、通知を取りこぼさない。
+    #[test]
+    fn repair5_2025_transient_send_failure_is_retried() {
+        let sink = Arc::new(Sink::default());
+        let (fake, answered) = Fake::new(vec![Some((7, n(8)))]);
+        fake.send_failures.store(2, Ordering::SeqCst);
+        let snap = run(&sink, NotifyConfig::default(), fake, identity());
+        assert_eq!(answered.lock().unwrap().as_slice(), &[7]);
+        assert_eq!(snap.respond_failed, 0);
+    }
+
+    /// REPAIR-5・SEC-4・#2025: 再送の上限まで送れないときは `respond_failed` を数えてループを終え、listener を閉じる
+    /// (待機中の syscall は `ENOSYS` で解かれる)。後続の通知を受けたまま黙って保持しない。
+    #[test]
+    fn repair5_2025_persistent_send_failure_ends_the_loop() {
+        let sink = Arc::new(Sink::default());
+        let (fake, answered) = Fake::new(vec![Some((1, n(8))), Some((2, n(9)))]);
+        fake.send_failures.store(u32::MAX, Ordering::SeqCst);
+        let snap = run(&sink, NotifyConfig::default(), fake, identity());
+        assert!(answered.lock().unwrap().is_empty());
+        // 完了待ちに積まれていた分の drain 時の再失敗も数えるため 1 以上(2 件目は受信されない)。
+        assert!(snap.respond_failed >= 1, "{snap:?}");
     }
 
     /// REPAIR-5: 受信時点で消えていた通知（`None`）と、応答時に消えた対象は `target_gone`。

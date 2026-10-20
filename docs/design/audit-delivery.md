@@ -151,6 +151,12 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 - **制約（後続）**: supervisor は監視の時点で複数スレッドのため `FileAuditSink` の隔離（fork）が使えず、代替のカーネル監査送信（`CAP_AUDIT_WRITE` が要る）に回る。rootless では補助レコードが残らない場合がある。複数スレッドからの配送は `ControlAuditRelay` を `ExitSignal` も運べるよう広げる後続で直す。pid 1 以外の子孫と supervisor の exec コマンドの SIGSYS 終了は親から見えない
 - **実機試験**: `crates/core/tests/seccomp_kill_audit.rs`（`--ignored`。root と auditd が前提。`AGENTS.md` 参照）
 
+### 9.2 保証範囲（ワークロードの追加フィルタ。#2404 の指摘）
+
+- 既定フィルタは Docker / OCI 互換のため `seccomp(2)` と `prctl(PR_SET_SECCOMP)` を許可する（`NO_NEW_PRIVS` は設定済みで、特権なしで追加フィルタを載せられる）。カーネルは複数フィルタの結果を `KILL` > `TRAP` > `ERRNO` > `USER_NOTIF` > `TRACE` > `LOG` > `ALLOW` の優先順位で採るため、ワークロードが自分で `kcmp` 等に `ERRNO` を返すフィルタを載せると、`USER_NOTIF` の通知は出ず supervisor の記録も残らない
+- **契約**: 本経路（SEC-4）が記録するのは、ランタイムが載せた最終フィルタが `USER_NOTIF` で拒否した syscall だけである。ワークロード自身が追加した制限による拒否は分離違反ではなく、ランタイムの監査対象に含めない。いずれにせよ拒否は保たれ（許可に倒れない）、失われるのは記録だけ
+- **未採用の案**: `seccomp` / `prctl(PR_SET_SECCOMP)` の一律禁止、または両方を `USER_NOTIF` にして追加フィルタの導入を監査する案。前者は Chrome のサンドボックスや systemd 系など追加フィルタを使う正規のワークロードを壊し、Docker 既定との互換を大きく変える。後者は通知側がフィルタ本体のポインタを読む TOCTOU を避けられない。どちらもオーナー判断が要るため実装していない
+
 ## 10. セキュリティ上の論点
 
 - USER_NOTIF の応答に `SECCOMP_USER_NOTIF_FLAG_CONTINUE` を使わない。通知の cookie を `NOTIF_ID_VALID` で検証し、`pid` の PID namespace を変換する

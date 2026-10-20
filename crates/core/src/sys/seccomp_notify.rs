@@ -636,23 +636,33 @@ pub(crate) fn notif_send_eperm(fd: BorrowedFd<'_>, id: u64) -> Result<bool, SysE
         error: -EPERM_ERRNO,
         flags: 0,
     };
-    // SAFETY: `resp` はスタック上の 24 バイトの `#[repr(C)]` で、`SEND` が読むサイズ（24）と一致する。
-    // カーネルは呼び出しの間だけ読み、ポインタを保持しない。
-    let rc = unsafe {
-        ioctl(
-            fd.as_raw_fd(),
-            SECCOMP_IOCTL_NOTIF_SEND,
-            &raw mut resp as usize as u64,
-        )
-    };
-    if rc == 0 {
-        return Ok(true);
-    }
-    match last_error() {
-        SysError::Os(e) if e == ENOENT_ERRNO => Ok(false),
-        other => Err(other),
+    // `EINTR` は応答が届いていないだけなので、上限つきで同じ応答を再送する(受信済みの通知は再受信できず、
+    // 応答を落とすと対象が待ち続けるため。REPAIR-5)。
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        // SAFETY: `resp` はスタック上の 24 バイトの `#[repr(C)]` で、`SEND` が読むサイズ（24）と一致する。
+        // カーネルは呼び出しの間だけ読み、ポインタを保持しない。
+        let rc = unsafe {
+            ioctl(
+                fd.as_raw_fd(),
+                SECCOMP_IOCTL_NOTIF_SEND,
+                &raw mut resp as usize as u64,
+            )
+        };
+        if rc == 0 {
+            return Ok(true);
+        }
+        match last_error() {
+            SysError::Os(e) if e == ENOENT_ERRNO => return Ok(false),
+            SysError::Os(e) if e == super::EINTR && attempts < SEND_EINTR_ATTEMPTS => {}
+            other => return Err(other),
+        }
     }
 }
+
+/// `SEND` が `EINTR` で戻ったときの再送の上限。
+const SEND_EINTR_ATTEMPTS: u32 = 8;
 
 #[cfg(all(
     test,

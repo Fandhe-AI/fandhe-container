@@ -15,12 +15,14 @@ use std::time::Duration;
 const DEFERRED_REPORT_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
-    // 親が受けたシグナルを起動中の plugin へ転送する（登録に失敗したら fail-closed で終了する）。
+    // 親が受けたシグナルを起動中の plugin へ転送する。登録に失敗したらコマンドを実行せず（fail-closed）、
+    // その失敗もコマンド結果と同じ期限付きの出力経路へ流す（main で無期限に書かない。REPAIR-5・#1778）。
     #[cfg(unix)]
-    if let Err(e) = fandhe_container_cli::signals::install_signal_forwarding() {
-        let _ = e.write_stderr(&mut std::io::stderr());
-        return ExitCode::from(e.exit_code().get());
-    }
+    let exit = match fandhe_container_cli::signals::install_signal_forwarding() {
+        Ok(()) => fandhe_container_cli::commands::run(std::env::args_os().skip(1)),
+        Err(e) => fandhe_container_cli::commands::CliExit::Error(e),
+    };
+    #[cfg(not(unix))]
     let exit = fandhe_container_cli::commands::run(std::env::args_os().skip(1));
     let code = exit.exit_code();
     let mut pending = fandhe_container_plugin::take_pending_child_cleanup_failures();

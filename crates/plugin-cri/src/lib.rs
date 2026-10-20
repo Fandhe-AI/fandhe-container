@@ -7,6 +7,7 @@
 //! 未実装（REPAIR-3）: 既定の socket パスの解決と lifecycle からの起動（#459・#1869）、`ImageService` の UDS サーブ、
 //! SIGTERM の正常停止、本番の `BundleProvider`（#2433）、start / kill / stop と cgroup remover の本番結線（#2434）。
 //! Container 系 4 RPC の UDS＋gRPC 境界越しの到達と、注入したフェイクでの一連の成功は `tests/container_grpc.rs` で照合済み（#850）。
+//! PLUG-12 の別 UID 拒否（実機前提）と正規クライアントの一連は `tests/integration.rs` で照合する（#461）。
 //! PLUG-1 区分は plugin（crate-naming.md）。
 
 pub mod adapter;

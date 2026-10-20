@@ -60,7 +60,7 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
    | ---------- | ------ | ------ |
    | 0 | なし | 成功 |
    | 5 | `FAILED_PRECONDITION` | 前提不備。`prepare` の拒否でも、本番 supervisor の `prepare_cgroup`（`crates/supervisor/src/start_entry.rs`）が detect・scope 記録・cgroup 作成のエラーを固定文言に変換するため、message は `failed to prepare the container cgroup` になる（同居による拒否の内部メッセージ `delegated cgroup contains other processes; refusing to move them` は stderr に出ない）。同居が原因かどうかは、stderr だけでは判別できず、親 scope の `cgroup.procs` に自分以外の PID がいるかを追加で観察して特定する（結果記録の「親 scope の `cgroup.procs`」と同じ） |
-   | 7 | `TIMEOUT` | 結果不明（受信期限 36 秒）。`state`・`list` で確かめる |
+   | 7 | `TIMEOUT` | 結果不明（受信期限 58.9 秒）。`state`・`list` で確かめる |
    | 8 | `UNIMPLEMENTED` | rootful で実行した等 |
    | 1 | `INTERNAL` | その他 |
 

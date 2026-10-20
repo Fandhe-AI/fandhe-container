@@ -53,6 +53,7 @@ use std::num::{NonZeroU8, NonZeroU32};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use fandhe_container_core::audit_log::RECORD_WAIT_LIMIT;
 use fandhe_container_core::oci_runtime::{
     LAUNCHER_REPLY_GRACE, OciRuntimeError, StartTimeouts, exit_code_for,
 };
@@ -333,23 +334,36 @@ impl StartArgs {
     }
 }
 
+/// 監査の記録経路の確認（起動前の `probe`。supervisor の入口が `launch` の前に 1 回行う）に見込む時間。
+///
+/// `probe` は helper の応答を [`RECORD_WAIT_LIMIT`] まで待ち得るため、同じ値を見込む（SEC-4・REPAIR-5・#2027）。
+/// [`result_deadline`] に含め、期限の起点を `probe` の前に置いても launch の見込みを食わないようにする。
+pub const AUDIT_PROBE_ALLOWANCE: Duration = RECORD_WAIT_LIMIT;
+
+/// launch の直前に行う監査の網羅の記録（縮退の同期配送）に見込む時間（[`RECORD_WAIT_LIMIT`] と同じ）。
+///
+/// launcher（`SelfBounded`）は配送の後に `launch` の期限を数え始めるため、入口が見込む手順 8 の時間へ別枠で足す
+/// （SEC-4・REPAIR-5・#2027）。
+pub const AUDIT_DELIVERY_ALLOWANCE: Duration = RECORD_WAIT_LIMIT;
+
 /// 起動手順 8（`oci_runtime::start`。launch・失敗時の terminate・確認）に見込む時間:
-/// `launch + terminate + confirm + 3 × LAUNCHER_REPLY_GRACE`（あふれたら `Duration::MAX` に張り付く）。
+/// `launch + terminate + confirm + 3 × LAUNCHER_REPLY_GRACE + AUDIT_DELIVERY_ALLOWANCE`（あふれたら `Duration::MAX` に張り付く）。
 ///
 /// 手順 8 は入口スレッドが直接行う（本番 launcher は単一スレッドの呼び出しを要求するため。#1819・CORE-1）。
 /// launcher 自身が上限を守る（`SelfBounded`）ので、入口は launch の前にこの時間が期限内に残っているかを確かめ、
 /// 足りなければ launch せず `INTERNAL`（期限超過）を報告する（期限内に終わらない launch を始めない。REPAIR-5）。
-/// 既定値で 28s。
+/// 既定値で 39.45s（28s + 11.45s）。
 pub fn launch_step_budget(timeouts: &StartTimeouts) -> Duration {
     timeouts
         .launch()
+        .saturating_add(AUDIT_DELIVERY_ALLOWANCE)
         .saturating_add(timeouts.terminate())
         .saturating_add(timeouts.confirm())
         .saturating_add(LAUNCHER_REPLY_GRACE.saturating_mul(3))
 }
 
-/// supervisor が結果を書くまでの内部上限: [`launch_step_budget`] + [`CGROUP_PREPARE_ALLOWANCE`]
-/// （既定値で 34s。あふれたら `Duration::MAX` に張り付く）。
+/// supervisor が結果を書くまでの内部上限: [`launch_step_budget`] + [`CGROUP_PREPARE_ALLOWANCE`] + [`AUDIT_PROBE_ALLOWANCE`]
+/// （既定値で 56.9s。あふれたら `Duration::MAX` に張り付く）。起点は記録経路の確認（`probe`）の前に置く。
 ///
 /// supervisor（`start_entry::run_start`）は手順 3〜7（状態の確認・cgroup の連鎖・監査 sink・launcher の構築）を
 /// 作業スレッドで行い、開始時刻にこの値を足した期限から報告の書き込み分（`start_entry::REPORT_RESERVE`）を引いた
@@ -358,7 +372,9 @@ pub fn launch_step_budget(timeouts: &StartTimeouts) -> Duration {
 /// 手順 3〜7 が長引いて手順 8 の見込みが残らなければ launch せず `INTERNAL`（期限超過）を報告するため、報告は
 /// この上限内に届く。失敗後の後始末は報告の後に行う（REPAIR-5）。
 pub fn result_deadline(timeouts: &StartTimeouts) -> Duration {
-    launch_step_budget(timeouts).saturating_add(CGROUP_PREPARE_ALLOWANCE)
+    launch_step_budget(timeouts)
+        .saturating_add(CGROUP_PREPARE_ALLOWANCE)
+        .saturating_add(AUDIT_PROBE_ALLOWANCE)
 }
 
 /// CLI の受信期限: [`result_deadline`] + [`CLI_RECEIVE_GRACE`]。
@@ -618,23 +634,25 @@ mod tests {
         }
     }
 
-    /// REPAIR-5・#1819: 手順 8 の見込みは既定で 28s で、内部上限はそれに cgroup の準備の見込み（6s）を足した値。
+    /// REPAIR-5・SEC-4・#1819・#2027: 手順 8 の見込みは既定で 28s + 監査配送 11.45s。内部上限はそれに cgroup の準備（6s）と
+    /// 記録経路の確認（11.45s）を足した値。
     #[test]
-    fn repair5_launch_step_budget_default_is_28s() {
+    fn repair5_launch_step_budget_default_includes_audit_delivery() {
         let t = StartTimeouts::default();
-        assert_eq!(launch_step_budget(&t), Duration::from_secs(28));
+        assert_eq!(RECORD_WAIT_LIMIT, Duration::from_millis(11_450));
+        assert_eq!(launch_step_budget(&t), Duration::from_millis(39_450));
         assert_eq!(
             result_deadline(&t),
-            launch_step_budget(&t) + CGROUP_PREPARE_ALLOWANCE
+            launch_step_budget(&t) + CGROUP_PREPARE_ALLOWANCE + AUDIT_PROBE_ALLOWANCE
         );
     }
 
-    /// REPAIR-5: 既定の内部上限は 34s で、CLI の受信期限はそれより厳密に長い。
+    /// REPAIR-5: 既定の内部上限は 56.9s で、CLI の受信期限はそれより厳密に長い。
     #[test]
-    fn repair5_result_deadline_default_is_34s() {
+    fn repair5_result_deadline_default_is_56_9s() {
         let t = StartTimeouts::default();
-        assert_eq!(result_deadline(&t), Duration::from_secs(34));
-        assert_eq!(cli_receive_deadline(&t), Duration::from_secs(36));
+        assert_eq!(result_deadline(&t), Duration::from_millis(56_900));
+        assert_eq!(cli_receive_deadline(&t), Duration::from_millis(58_900));
         assert!(cli_receive_deadline(&t) > result_deadline(&t));
     }
 }

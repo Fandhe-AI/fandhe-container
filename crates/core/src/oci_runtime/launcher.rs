@@ -900,7 +900,7 @@ impl Inner {
         let isolation_record = self.assess_audit_coverage(id, isolation_record)?;
         // spawn の期限の起点は coverage 記録の同期配送の後に置く。配送は `RECORD_WAIT_LIMIT`(約 11 秒)まで待ち得て、
         // 既定の launch 期限(10 秒)を超えるため、差し引くと既定モードでも遅い記録だけで launch が失敗する
-        // (配送の待ちは別枠で有限。REPAIR-5・SEC-4・#2027)。以降の fork 前の準備だけを期限に含める。
+        // (配送の待ちは別枠で有限。入口側の全体期限は `start_contract::AUDIT_DELIVERY_ALLOWANCE` として手順 8 の見込みへ別途算入する。REPAIR-5・SEC-4・#2027)。以降の fork 前の準備だけを期限に含める。
         let started = Instant::now();
         let (uid, gid) = spec.user();
         let mut stages = StagePipeline::new()

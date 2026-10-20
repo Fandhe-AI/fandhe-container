@@ -2548,6 +2548,11 @@ mod linux {
             Err(e) => return fail(&mut out, op_err(e)),
         };
         let req = StartRequest::new(args.id.clone());
+        // 結果の期限の起点は記録経路の確認(`probe`)の前に置く。`probe` は最大 `AUDIT_PROBE_ALLOWANCE` ほど待ち得るが、
+        // その分は `result_deadline` に見込み済みで、CLI の受信期限(同じ起点 + 猶予)にも含まれる(SEC-4・REPAIR-5・#2027)。
+        let deadline =
+            Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
+        out.limit_until(deadline);
         // 制御チャネルの認証境界の拒否の記録先（SEC-4）。制御チャネルのサーバスレッドは監視スレッドと並行して動くため、
         // 複数スレッドでは `FileAuditSink` の隔離（fork）が使えない。そこで監査専用の helper プロセスを fork し、以後の
         // 記録はそこへ渡して期限付きで永続化する（`ControlAuditRelay`）。`spawn` は単一スレッドのときだけ成功するので、
@@ -2559,12 +2564,6 @@ mod linux {
             // 起動前に helper へ保存先を開かせ、期限つきで確かめる。開けなければ記録経路なしとして起動を拒否する（SEC-4・#2027）。
             .and_then(|relay| relay.probe().map(|()| relay))
             .map_err(|e| e.code());
-        // 結果の期限の起点は probe の後に置く。probe は最大 `PRIMARY_WRITE_TIMEOUT` ほど保存先を待ち得て、その待ちを
-        // 期限に含めると launch の見込み(手順 8)が残らず、probe に成功しても期限超過で launch が省かれるため
-        // (SEC-4・REPAIR-5・#2027)。probe 自体は有限(helper が応答しなければ打ち切る)で、通常は即座に済む。
-        let deadline =
-            Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
-        out.limit_until(deadline);
         // helper は fork 時点で委譲 cgroup に属するため、cgroup の準備（自プロセスの退避）へ同伴プロセスとして宣言し、
         // 一緒に退避リーフへ移す（宣言しないと「他のプロセスがいる」として起動が拒否される。CORE-3・SUP-1）。
         let companions: Vec<u32> = relay.as_ref().map(|r| vec![r.pid()]).unwrap_or_default();

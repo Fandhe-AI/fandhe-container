@@ -28,7 +28,7 @@
 //! systemd-run は scope の登録後に同じプロセスで `execvpe` する（`man systemd-run` の「scope として実行するコマンドは
 //! systemd-run 自身が親プロセスとして実行し〜同期的」の段落と systemd の `src/run/run.c` の `start_transient_scope`）。
 //! したがって spawn した `Child` の pid・`process_group(0)`・stdio・渡した環境はそのまま supervisor のものになり、
-//! CLI は scope に居残らない。scope の取得時間も受信期限（36 秒）に含まれる。
+//! CLI は scope に居残らない。scope の取得時間も受信期限（58.9 秒）に含まれる。
 //! fail-closed（案 B の「CLI の cgroup の下に子 cgroup を作る」へは落とさない）の判定はすべて spawn の前に行う。
 //! - rootful（`/proc/self/status` の uid のどれかが 0）: `UNIMPLEMENTED`（supervisor の判定と同じ文）。
 //! - `systemd-run` が固定候補（`/usr/sbin`・`/usr/bin`・`/sbin`・`/bin`・NixOS の `/run/current-system/sw/bin`。`PATH` 探索は
@@ -41,7 +41,7 @@
 //! - 委譲が効いていない場合の判定は supervisor の `detect` / `prepare` が行い、その報告を `map_received` が写す。
 //!
 //! # 期限と子の扱い（REPAIR-5）
-//! - 受信期限は `cli_receive_deadline`（既定 36 秒）。期限内に 1 行が来なければ `TIMEOUT`（結果不明）、1 行も無いまま EOF なら
+//! - 受信期限は `cli_receive_deadline`（既定 58.9 秒）。期限内に 1 行が来なければ `TIMEOUT`（結果不明）、1 行も無いまま EOF なら
 //!   `INTERNAL`。読み込みは `MAX_REPORT_LEN` バイトで頭打ちにし、改行の無い出力で無制限に確保しない。
 //! - supervisor は報告の後も生き続け stdout を閉じないため、EOF を待たず 1 行の受信で完了とみなす。
 //! - どの枝でも子を `wait` しない。supervisor は CLI より長く生きる前提で、期限切れでも kill しない
@@ -279,7 +279,7 @@ fn launch_and_receive(
     (map_received(received), Some(child))
 }
 
-/// CLI の受信期限（既定 36 秒。supervisor の内部上限 34 秒（手順 8 の見込み 28 秒 + cgroup 準備 6 秒。`result_deadline` 参照） + 受信の猶予 2 秒。REPAIR-5）。
+/// CLI の受信期限（既定 58.9 秒。supervisor の内部上限 56.9 秒（手順 8 の見込み 39.45 秒〔監査配送 11.45 秒を含む〕+ cgroup 準備 6 秒 + 記録経路の確認 11.45 秒。`result_deadline` 参照） + 受信の猶予 2 秒。REPAIR-5）。
 fn production_deadline() -> Duration {
     cli_receive_deadline(&StartTimeouts::default())
 }
@@ -621,10 +621,10 @@ mod tests {
         }
     }
 
-    /// REPAIR-5: 本番の受信期限は 36 秒。
+    /// REPAIR-5: 本番の受信期限は 58.9 秒。
     #[test]
-    fn repair5_production_deadline_is_36s() {
-        assert_eq!(production_deadline(), Duration::from_secs(36));
+    fn repair5_production_deadline_is_58_9s() {
+        assert_eq!(production_deadline(), Duration::from_millis(58_900));
     }
 
     /// 契約: stdout 以外は null、環境は PATH だけ、cwd は `/`、argv は契約の順。

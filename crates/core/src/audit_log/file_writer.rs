@@ -443,11 +443,13 @@ impl AuditFileWriter {
         result
     }
 
-    /// レコードを 1 件も書かずに、本番の記録経路と同じ手順（排他 `flock` の取得 → 書き込み → `sync_data`）が通るかを確かめる
+    /// 本番の記録経路と同じ手順（排他 `flock` の取得 → 実バイトの書き込み → `sync_data`）が通るかを確かめる
     /// （起動前の記録経路の確認。SEC-4・REPAIR-5・#2027）。
     ///
-    /// 別プロセスが `flock` を保持していれば [`AUDIT_LOCK_TIMEOUT`] で `Lock` になり、追記・永続化できない保存先
-    /// （読み取り専用・満杯など）は `Write` / `Sync` になる。監査ログへ確認用の行は残さない（0 バイトの書き込み）。
+    /// 別プロセスが `flock` を保持していれば `AUDIT_LOCK_TIMEOUT` で `Lock` になり、追記・永続化できない保存先
+    /// （読み取り専用・満杯〔ENOSPC / EDQUOT〕など）は `Write` / `Sync` になる。0 バイトの `write` は何も呼ばず満杯を
+    /// 検出できないため、確認用に LF 1 バイトを実際に追記して `sync_data` し、排他を持ったまま元の長さへ戻す
+    /// （ログ形式を壊さない: 確認の LF が行として残らない）。戻せなければ `Write` で失敗にする（fail-closed）。
     pub fn probe_append(&mut self) -> Result<(), AuditWriteError> {
         self.probe_append_with(&AUDIT_WRITE_QUEUE, AUDIT_LOCK_TIMEOUT)
     }
@@ -459,12 +461,22 @@ impl AuditFileWriter {
         timeout: Duration,
     ) -> Result<(), AuditWriteError> {
         let _turn = self.lock_exclusive(queue, Instant::now() + timeout)?;
-        let result = if self.file.write_all(&[]).is_err() {
-            Err(AuditWriteError::new(AuditWriteErrorKind::Write))
-        } else if self.file.sync_data().is_err() {
-            Err(AuditWriteError::new(AuditWriteErrorKind::Sync))
-        } else {
-            Ok(())
+        // 長さが読めなければ確認用の追記をしない(戻せない書き込みを残さない)。
+        let result = match self.file.metadata().map(|m| m.len()) {
+            Err(_) => Err(AuditWriteError::new(AuditWriteErrorKind::Write)),
+            Ok(original) => {
+                let written = self.file.write_all(b"\n").is_ok();
+                let synced = written && self.file.sync_data().is_ok();
+                // 書けたかどうかに関わらず、排他を持ったまま元の長さへ戻す(途中まで書かれた場合も含む)。
+                let restored = self.file.set_len(original).is_ok();
+                if !written || !restored {
+                    Err(AuditWriteError::new(AuditWriteErrorKind::Write))
+                } else if !synced {
+                    Err(AuditWriteError::new(AuditWriteErrorKind::Sync))
+                } else {
+                    Ok(())
+                }
+            }
         };
         let _ = self.file.unlock();
         result

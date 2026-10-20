@@ -112,6 +112,30 @@ pub(crate) fn deliver_until(
     }
 }
 
+/// 親が回収したプロセスの終了シグナルを、補助の `exit_signal` レコード（[`AuditEvent::ExitSignal`]）にして 1 件記録する
+/// （SEC-4・ESC-06・#2004・#2236）。
+///
+/// 呼び出し元: launcher の回収点（`ContainerChildProcess::wait` / `terminate`）と、supervisor の exec の親プロセス
+/// （worker が回収したコマンドの終了状態の記録）。`target_pid` は**回収した側**の PID namespace の値で、syscall・arch は
+/// 持たない。`signal` が `1..=64` の範囲外、`target_pid` が 0 または `i32` を超える場合はレコードを作らず
+/// [`AuditDelivery::RecordUnavailable`] を返す（panic しない）。記録の成否は呼び出し側の終了状態を覆さない。
+pub fn record_exit_signal(
+    signal: i32,
+    target_pid: u32,
+    container: Option<&ContainerId>,
+    sink: &dyn AuditSink,
+) -> AuditDelivery {
+    let event = match (
+        super::AuditSignal::new(signal),
+        // `i32` を超える値は 0 に倒し、`AuditPid::new` が `PidNotPositive` で拒否する。
+        AuditPid::new(i32::try_from(target_pid).unwrap_or(0)),
+    ) {
+        (Ok(signal), Ok(target_pid)) => AuditEvent::ExitSignal { signal, target_pid },
+        (Err(e), _) | (_, Err(e)) => return AuditDelivery::RecordUnavailable(e),
+    };
+    deliver(event, container, sink)
+}
+
 /// マウント拒否 `error` を `Mount` レコードとして記録し、`error` をそのまま返す。
 ///
 /// `path` は分かる場合のみ（計画段階の拒否は `None`）。
@@ -232,5 +256,40 @@ pub(crate) mod tests {
             AuditPid::new(0).map_err(|e| e.kind()),
             Err(AuditRecordErrorKind::PidNotPositive)
         );
+    }
+
+    /// SEC-4・ESC-06・#2236: `record_exit_signal` は 1 件だけ記録し、syscall・arch を持たない。範囲外の入力は
+    /// レコードを作らず `RecordUnavailable`（sink へ 0 件）。sink の失敗は `SinkFailed` で返る。
+    #[test]
+    fn sec4_2236_record_exit_signal_validates_and_records_once() {
+        let sink = VecSink::new(false);
+        let id = ContainerId::new("c1").unwrap();
+        assert_eq!(
+            record_exit_signal(31, 4321, Some(&id), &sink),
+            AuditDelivery::Recorded
+        );
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), AuditLayer::ExitSignal);
+        assert_eq!(recs[0].exit_signal().map(|s| s.get()), Some(31));
+        assert_eq!(recs[0].target_pid().map(|p| p.get()), Some(4321));
+        assert_eq!(recs[0].syscall(), None);
+        for (signal, pid, kind) in [
+            (0, 1, AuditRecordErrorKind::SignalOutOfRange),
+            (65, 1, AuditRecordErrorKind::SignalOutOfRange),
+            (31, 0, AuditRecordErrorKind::PidNotPositive),
+            (31, u32::MAX, AuditRecordErrorKind::PidNotPositive),
+        ] {
+            match record_exit_signal(signal, pid, None, &sink) {
+                AuditDelivery::RecordUnavailable(e) => assert_eq!(e.kind(), kind),
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(sink.snapshot().len(), 1);
+        let failing = VecSink::new(true);
+        assert!(matches!(
+            record_exit_signal(31, 1, None, &failing),
+            AuditDelivery::SinkFailed(_)
+        ));
     }
 }

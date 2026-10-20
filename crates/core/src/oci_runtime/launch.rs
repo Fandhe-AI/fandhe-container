@@ -845,20 +845,13 @@ impl ContainerChildProcess {
         if audit.recorded.swap(true, Ordering::SeqCst) {
             return;
         }
-        let event = match (
-            crate::audit_log::AuditSignal::new(SIGSYS),
-            i32::try_from(self.pid.get())
-                .map_err(|_| ())
-                .and_then(|p| crate::audit_log::AuditPid::new(p).map_err(|_| ())),
-        ) {
-            (Ok(signal), Ok(target_pid)) => {
-                crate::audit_log::AuditEvent::ExitSignal { signal, target_pid }
-            }
-            _ => return,
-        };
         // 配送結果は呼び出し側の終了状態に影響させない（失敗の通知は sink の責務）。
-        let _ =
-            crate::audit_log::mount::deliver(event, Some(&audit.container), audit.sink.as_ref());
+        let _ = crate::audit_log::record_exit_signal(
+            SIGSYS,
+            self.pid.get(),
+            Some(&audit.container),
+            audit.sink.as_ref(),
+        );
     }
 
     /// `terminate` が成功したときに呼ぶ通知を持たせる（起動台帳への回収の証跡の引き継ぎ。CORE-2）。

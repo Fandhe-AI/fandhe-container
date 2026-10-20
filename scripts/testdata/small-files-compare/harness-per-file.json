@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "metrics": { "small_files_files_per_sec": { "value": 4000.000, "unit": "files/s" } },
+  "method": "server-api-direct/flush-per-file",
+  "wire_path": false,
+  "io2_guaranteed": true,
+  "note": "server API called directly, not the wire path; each file is flushed individually",
+  "aggregate": "median",
+  "persist_support": "supported",
+  "params": { "count": 2000, "batch_size": 1, "file_size_bytes": 2, "layout": "flat", "config": "bind", "trials": 5, "trial_timeout_secs": 1800, "timeout_secs": 10800 },
+  "trials": [
+    { "elapsed_ns": 500000000, "files_per_sec": 4000.000 },
+    { "elapsed_ns": 490000000, "files_per_sec": 4081.633 },
+    { "elapsed_ns": 510000000, "files_per_sec": 3921.569 },
+    { "elapsed_ns": 505000000, "files_per_sec": 3960.396 },
+    { "elapsed_ns": 495000000, "files_per_sec": 4040.404 }
+  ]
+}

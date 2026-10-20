@@ -4,7 +4,14 @@
 //! 日常操作コマンドには現れない」ことを求める。OS 固有設定に関するステップ定義と OS 分岐は本 module に局所化し、
 //! `commands::run_to` の `Command::Setup` の腕からだけ [`run`] を呼ぶ（日常操作コマンドからは到達しない）。
 //!
-//! 現状は要求ステップの提示までで、OS 設定の検出・適用は行わない（実装済みを装わない。REPAIR-3）。
+//! Linux は rootful のときだけ要る特権ランチャーのインストール手順をステップ `privileged-launcher-install` として 1 行表示して 0 で終わる
+//! （表示が完成形。#1454 の決定・SUP-14・CORE-6。rootless の既定では不要）。CLI は `setcap`・`chmod`・sudo・インストールスクリプトの
+//! 実行をせず、本 module は外部コマンドを起動しない（単体テスト `cli2_setup_does_not_spawn_processes` で照合）。
+//! 表示する使い方と `scripts/install-privileged-launcher.sh` の食い違いは単体テスト `sup14_launcher_install_instructions_match_script_usage` が検出する。
+//!
+//! 終了コードの規則: 条件なし（どの構成でも要る）のステップが残れば `UNIMPLEMENTED`（8）、条件つき（[`SetupCondition`]）のステップだけなら 0。
+//!
+//! macOS / Windows は要求ステップの提示までで、OS 設定の検出・適用は行わない（実装済みを装わない。REPAIR-3）。
 //! - cli は platform-* へ依存できない（CLI-1・PLUG-4・`make check-cli-backend-deps`）ため、検出・適用は将来 plugin 境界経由になる。
 //! - WSL2 有効化・Developer Mode は管理者権限を要し、macOS の entitlement はビルド / 署名時の属性で実行時には付与できない。
 //!   CLI からの昇格・シェル / 外部コマンド起動・設定ファイル / レジストリの変更は行わない。
@@ -19,6 +26,10 @@ use fandhe_container_core::traits::ErrorCode;
 use crate::commands::CliExit;
 use crate::json::json_escape_into;
 
+/// 特権ランチャーのインストール手順の固定文言（sudo は案内しない。root で直接実行する。#1454）。
+/// 引数は `scripts/install-privileged-launcher.sh` の使い方（#2137 の sha256 3 引数を含む）に合わせる。
+const LAUNCHER_INSTALL_INSTRUCTIONS: &str = "rootful only; rootless (default) needs no install. As root, run scripts/install-privileged-launcher.sh --launcher <file> --launcher-sha256 <hex> --supervisor <file> --supervisor-sha256 <hex> --cli <file> --cli-sha256 <hex> [--dest-dir <absolute path>] (default dest-dir /usr/local/libexec/fandhe-container). fandhe-container does not run it. See docs/setup/linux.md";
+
 /// `setup` が要求する OS 固有ステップ（閉じた列挙。外部入力からは構築しない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupStep {
@@ -32,6 +43,25 @@ pub enum SetupStep {
     VirtualizationEntitlement,
     /// macOS: macOS 13 以上であること（CLI-2・MAC-1。spec は最小 macOS 版数を定義していないため、13 以上は本実装の暫定要件で、版数が確定した時点で spec 側の更新をユーザーへ報告する）。
     MacosMinVersion,
+    /// Linux の rootful だけ: `scripts/install-privileged-launcher.sh` を root で実行する手順の表示（CLI は実行しない。
+    /// #1721・#1722・SUP-14・CORE-6・CLI-2・#1454）。
+    PrivilegedLauncherInstall,
+}
+
+/// ステップが要る構成の条件（閉じた列挙）。条件つきのステップは、その構成でなければ不要なので終了コードを失敗にしない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupCondition {
+    /// rootful で使うときだけ要る（CORE-6 の既定は rootless）。
+    Rootful,
+}
+
+impl SetupCondition {
+    /// 機械可読な固定 ID（出力の `condition` フィールド）。
+    pub fn id(self) -> &'static str {
+        match self {
+            SetupCondition::Rootful => "rootful",
+        }
+    }
 }
 
 impl SetupStep {
@@ -43,12 +73,40 @@ impl SetupStep {
             SetupStep::WslconfigVirtiofs => "wslconfig-virtiofs",
             SetupStep::VirtualizationEntitlement => "virtualization-entitlement",
             SetupStep::MacosMinVersion => "macos-min-version",
+            SetupStep::PrivilegedLauncherInstall => "privileged-launcher-install",
+        }
+    }
+
+    /// ステップが要る構成の条件。`None` はどの構成でも要る（未適用なら `run_for` は失敗を返す）。
+    pub fn condition(self) -> Option<SetupCondition> {
+        match self {
+            SetupStep::Wsl2Enable
+            | SetupStep::DeveloperMode
+            | SetupStep::WslconfigVirtiofs
+            | SetupStep::VirtualizationEntitlement
+            | SetupStep::MacosMinVersion => None,
+            SetupStep::PrivilegedLauncherInstall => Some(SetupCondition::Rootful),
+        }
+    }
+
+    /// 手順の固定文言（出力の `instructions` フィールド。英語・外部入力を含まない）。無いステップは `None`。
+    pub fn instructions(self) -> Option<&'static str> {
+        match self {
+            SetupStep::Wsl2Enable
+            | SetupStep::DeveloperMode
+            | SetupStep::WslconfigVirtiofs
+            | SetupStep::VirtualizationEntitlement
+            | SetupStep::MacosMinVersion => None,
+            SetupStep::PrivilegedLauncherInstall => Some(LAUNCHER_INSTALL_INSTRUCTIONS),
         }
     }
 
     /// 管理者権限（昇格）を要するか。
     pub fn requires_admin(self) -> bool {
-        matches!(self, SetupStep::Wsl2Enable | SetupStep::DeveloperMode)
+        matches!(
+            self,
+            SetupStep::Wsl2Enable | SetupStep::DeveloperMode | SetupStep::PrivilegedLauncherInstall
+        )
     }
 }
 
@@ -74,7 +132,7 @@ fn host_platform() -> SetupPlatform {
     }
 }
 
-/// 区分ごとに要求されるステップ（Linux と未対応 OS は空）。
+/// 区分ごとに要求されるステップ（未対応 OS は空）。
 pub fn required_steps(platform: SetupPlatform) -> &'static [SetupStep] {
     match platform {
         SetupPlatform::Windows => &[
@@ -86,7 +144,8 @@ pub fn required_steps(platform: SetupPlatform) -> &'static [SetupStep] {
             SetupStep::VirtualizationEntitlement,
             SetupStep::MacosMinVersion,
         ],
-        SetupPlatform::Linux | SetupPlatform::Other => &[],
+        SetupPlatform::Linux => &[SetupStep::PrivilegedLauncherInstall],
+        SetupPlatform::Other => &[],
     }
 }
 
@@ -94,7 +153,7 @@ pub fn required_steps(platform: SetupPlatform) -> &'static [SetupStep] {
 /// `json` モジュールのエスケープを通して組み立てる（将来ステップ ID に可変値が入っても注入しない。
 /// REPAIR-2・CLI-2）。
 fn step_line(step: SetupStep) -> String {
-    let mut line = String::with_capacity(80);
+    let mut line = String::with_capacity(512);
     line.push_str("{\"step\":\"");
     json_escape_into(&mut line, step.id());
     line.push_str("\",\"requires_admin\":");
@@ -103,13 +162,24 @@ fn step_line(step: SetupStep) -> String {
     } else {
         "false"
     });
-    line.push_str(",\"status\":\"manual\"}\n");
+    line.push_str(",\"status\":\"manual\"");
+    if let Some(c) = step.condition() {
+        line.push_str(",\"condition\":\"");
+        json_escape_into(&mut line, c.id());
+        line.push('"');
+    }
+    if let Some(text) = step.instructions() {
+        line.push_str(",\"instructions\":\"");
+        json_escape_into(&mut line, text);
+        line.push('"');
+    }
+    line.push_str("}\n");
     line
 }
 
 /// 区分を指定して `setup` を実行する（テスト用の入口）。
 ///
-/// - Linux: 要求ステップなしで成功（出力なし）。
+/// - Linux: rootful のときだけ要る手順を 1 行出して成功（表示が完成形。#1454・SUP-14）。
 /// - macOS / Windows: 要求ステップを 1 行ずつ stdout へ出し、自動適用が未実装のため `UNIMPLEMENTED`（8）で失敗する。
 /// - その他 OS: 対応外のため `UNIMPLEMENTED`（8）。
 pub fn run_for(platform: SetupPlatform, stdout: &mut dyn Write) -> CliExit {
@@ -123,10 +193,11 @@ pub fn run_for(platform: SetupPlatform, stdout: &mut dyn Write) -> CliExit {
             return CliExit::failed(ErrorCode::Internal);
         }
     }
-    if steps.is_empty() {
-        CliExit::Success
-    } else {
+    // 条件なしのステップが残る（どの構成でも要るのに自動適用が無い）ときだけ失敗にする。
+    if steps.iter().any(|s| s.condition().is_none()) {
         CliExit::failed(ErrorCode::Unimplemented)
+    } else {
+        CliExit::Success
     }
 }
 
@@ -145,10 +216,20 @@ mod tests {
         (r.exit_code(), String::from_utf8(buf).expect("utf8"))
     }
 
-    /// CLI-2: Linux は OS 固有の要求ステップを持たない。
+    /// 期待する Linux の出力行（具体値）。
+    const LINUX_LINE: &str = "{\"step\":\"privileged-launcher-install\",\"requires_admin\":true,\"status\":\"manual\",\"condition\":\"rootful\",\"instructions\":\"rootful only; rootless (default) needs no install. As root, run scripts/install-privileged-launcher.sh --launcher <file> --launcher-sha256 <hex> --supervisor <file> --supervisor-sha256 <hex> --cli <file> --cli-sha256 <hex> [--dest-dir <absolute path>] (default dest-dir /usr/local/libexec/fandhe-container). fandhe-container does not run it. See docs/setup/linux.md\"}\n";
+
+    /// CLI-2・SUP-14・CORE-6: Linux は rootful だけ要る特権ランチャーのインストール手順を返し、未対応 OS は空。
     #[test]
-    fn cli2_required_steps_linux_is_empty() {
-        assert_eq!(required_steps(SetupPlatform::Linux), &[]);
+    fn cli2_sup14_required_steps_linux_is_launcher_install() {
+        let got: Vec<(&str, bool, Option<&str>)> = required_steps(SetupPlatform::Linux)
+            .iter()
+            .map(|s| (s.id(), s.requires_admin(), s.condition().map(|c| c.id())))
+            .collect();
+        assert_eq!(
+            got,
+            [("privileged-launcher-install", true, Some("rootful"))]
+        );
         assert_eq!(required_steps(SetupPlatform::Other), &[]);
     }
 
@@ -188,7 +269,11 @@ mod tests {
     /// CLI-2: 出力行は JSON 安全な固定文言で、1 行 1 ステップ・LF 終端。
     #[test]
     fn cli2_step_lines_are_json_safe() {
-        for p in [SetupPlatform::Windows, SetupPlatform::Macos] {
+        for p in [
+            SetupPlatform::Windows,
+            SetupPlatform::Macos,
+            SetupPlatform::Linux,
+        ] {
             for s in required_steps(p) {
                 assert!(
                     s.id()
@@ -206,12 +291,13 @@ mod tests {
             step_line(SetupStep::Wsl2Enable),
             "{\"step\":\"wsl2-enable\",\"requires_admin\":true,\"status\":\"manual\"}\n"
         );
+        assert_eq!(step_line(SetupStep::PrivilegedLauncherInstall), LINUX_LINE);
     }
 
     /// CLI-2・REPAIR-3: 区分ごとの出力と終了コード。要求ステップが残る OS では成功を返さない。
     #[test]
     fn cli2_run_output_per_platform() {
-        assert_eq!(out_of(SetupPlatform::Linux), (0, String::new()));
+        assert_eq!(out_of(SetupPlatform::Linux), (0, LINUX_LINE.to_owned()));
         assert_eq!(out_of(SetupPlatform::Other), (8, String::new()));
         let mac = concat!(
             "{\"step\":\"virtualization-entitlement\",\"requires_admin\":false,\"status\":\"manual\"}\n",
@@ -299,7 +385,11 @@ mod tests {
         let line = step_line(SetupStep::Wsl2Enable);
         let prefix = line.split(':').next().unwrap_or("").to_owned() + ":";
         let mut needles: Vec<String> = vec![prefix];
-        for p in [SetupPlatform::Windows, SetupPlatform::Macos] {
+        for p in [
+            SetupPlatform::Windows,
+            SetupPlatform::Macos,
+            SetupPlatform::Linux,
+        ] {
             needles.extend(required_steps(p).iter().map(|s| s.id().to_owned()));
         }
         needles.extend(AUX_MARKERS.iter().map(|s| (*s).to_owned()));
@@ -371,7 +461,7 @@ mod tests {
                         ""
                     },
                 ),
-                Command::Logs => (vec!["logs", "c1"], if linux { 8 } else { 5 }, ""),
+                Command::Logs => (vec!["logs", "c1"], if linux { 0 } else { 5 }, ""),
                 Command::Image => (
                     vec!["image", "ls", "--image-root", &ir],
                     if linux { 0 } else { 5 },
@@ -452,6 +542,69 @@ mod tests {
         assert!(
             setup_markers_in(&step_line(SetupStep::Wsl2Enable)).contains(&"{\"step\":".to_owned())
         );
+        let (_, linux) = out_of(SetupPlatform::Linux);
+        assert!(setup_markers_in(&linux).contains(&"privileged-launcher-install".to_owned()));
+        assert!(setup_markers_in(&linux).contains(&"{\"step\":".to_owned()));
         assert_eq!(setup_markers_in("created c1"), Vec::<String>::new());
+    }
+
+    /// CLI-2・SUP-14: 本 module の本番コードは外部コマンドを起動しない（setcap・chmod・スクリプト実行をしない）。
+    #[test]
+    fn cli2_setup_does_not_spawn_processes() {
+        let src = include_str!("setup.rs");
+        let marker = ["#[cfg(", "test)]"].concat();
+        let prod = src.split(marker.as_str()).next().expect("split");
+        assert!(prod.len() < src.len(), "test boundary not found");
+        let banned = [
+            ["process", "::Command"].concat(),
+            ["Command", "::new"].concat(),
+            [".spa", "wn("].concat(),
+            ["set", "cap"].concat(),
+        ];
+        for token in &banned {
+            // doc コメントは「setcap を実行しない」と述べるため、コメント行以外のコードだけを見る。
+            let hit = prod
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .any(|l| l.contains(token.as_str()));
+            assert!(!hit, "banned token {token}");
+        }
+    }
+
+    /// SUP-14・REPAIR-12: 表示する使い方の引数がインストールスクリプトの実際の引数と食い違わない。
+    #[test]
+    fn sup14_launcher_install_instructions_match_script_usage() {
+        let script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("scripts")
+            .join("install-privileged-launcher.sh");
+        let script = std::fs::read_to_string(&script_path).expect("read script");
+        let text = SetupStep::PrivilegedLauncherInstall
+            .instructions()
+            .expect("instructions");
+        let mut opts: Vec<&str> = text
+            .split_whitespace()
+            .map(|w| w.trim_start_matches('['))
+            .filter(|w| w.starts_with("--"))
+            .collect();
+        opts.sort_unstable();
+        assert_eq!(
+            opts,
+            [
+                "--cli",
+                "--cli-sha256",
+                "--dest-dir",
+                "--launcher",
+                "--launcher-sha256",
+                "--supervisor",
+                "--supervisor-sha256"
+            ]
+        );
+        for o in &opts {
+            assert!(script.contains(&format!("    {o}) ")), "script lacks {o}");
+        }
+        assert!(script.contains("DEFAULT_DEST_DIR=\"/usr/local/libexec/fandhe-container\""));
+        assert!(text.contains("default dest-dir /usr/local/libexec/fandhe-container"));
     }
 }

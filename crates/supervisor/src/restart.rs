@@ -20,8 +20,10 @@
 //!   単一スレッドの要求を満たせないため、`FailedPrecondition` で拒否されて [`SuperviseOutcome::RelaunchFailed`] になる
 //!   （fail-closed。新しい子は作られない）。実機で成立させる再構成は #2043（SUP-3・CORE-1）で、レイテンシ実測・合否判定
 //!   （#490・#491。TASK-160）はその後になる。
-//! - 明示的な stop の検知は SUP-9 の担当で、本モジュールは [`StopToken`] を [`StopIntent`] へ写すだけ。
-//!   再 launch 時の `unless-stopped` と `always` の差（stop 済みを復帰させるか）も未実装（SUP-3・SUP-9）。
+//! - 明示的な stop の意図は制御チャネルの StopRequest が [`StopToken::mark_explicit_stop`] で立て（#2162・SUP-9）、本モジュールは
+//!   [`StopToken`] を [`StopIntent`] へ写すだけ。supervisor の寿命の中では、`always`・`unless-stopped` を含む全ポリシーで
+//!   明示 stop の後は再起動しない。「明示 stop 済み」を state.json に残して再 launch 時に `unless-stopped` と `always` を
+//!   分ける挙動は未実装（core の `SupervisionState` の変更を要する。SUP-3・SUP-9）。
 //! - [`crate::run::MonitorOutcome::ExitedUnrecorded`]（終了は回収済みだが記録失敗）の回復は未実装で、
 //!   再 launch せずに [`SuperviseOutcome::MonitorFailed`] で返す（状態が不確かなまま再起動しない。fail-closed）。
 //! - 指数バックオフ等の高度な間隔制御は未実装（固定の [`RestartConfig::backoff`] のみ）。
@@ -161,7 +163,7 @@ impl FromStr for RestartPolicy {
     }
 }
 
-/// 明示的 stop の有無（[`evaluate_restart`] の入力）。検知は SUP-9 の担当で、本モジュールは行わない。
+/// 明示的 stop の有無（[`evaluate_restart`] の入力）。検知は制御チャネルの StopRequest（SUP-9・#2162）が [`StopToken`] に記録し、本モジュールは写すだけ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StopIntent {
@@ -896,7 +898,9 @@ pub fn supervise_with_restart(
                 });
             }
         };
-        let intent = if stop.is_stop_requested() {
+        let intent = if stop.is_stop_requested()
+            || stop.explicit_stop_state() == crate::run::ExplicitStopState::Requested
+        {
             StopIntent::Requested
         } else {
             StopIntent::NotRequested
@@ -1999,6 +2003,33 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    /// SUP-9・SUP-3: 明示 stop の意図が立った後の終了は、`always` でも再 launch せず `ExplicitStop` で終わる。
+    #[test]
+    fn sup9_explicit_stop_intent_prevents_relaunch() {
+        let st = store(0, 42);
+        let q = Arc::new(Queue::new(&[(43, FAIL)]));
+        let obs = Events::default();
+        let stop = StopToken::new();
+        assert_eq!(
+            stop.mark_explicit_stop(),
+            crate::run::ExplicitStopRecord::NewlyRecorded
+        );
+        let out = run(&st, "always", ProcessExit::Signaled(15), &q, &stop, &obs);
+        let SuperviseOutcome::Finished {
+            reason, restarts, ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(reason, NoRestartReason::ExplicitStop);
+        assert_eq!(restarts, 0);
+        assert_eq!(obs.count(MonitorOperation::Restart), 0);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.restart_count(), 0);
+        assert_eq!(g.status().state(), ContainerState::Stopped);
+        assert_eq!(g.status().exit_code(), Some(143));
     }
 
     /// SUP-3・TASK-159.3: `on-failure:2` は異常終了 3 回で再起動 2 回、restart_count == 2、RetriesExhausted。

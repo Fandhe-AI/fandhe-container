@@ -3,7 +3,7 @@
 fandhe-container の実行ファイル（CLI・supervisor・特権ランチャー）を Linux に置く手順を定める。CLI の `start` は自分の実体と同じディレクトリの `fandhe-container-supervisor` を起動するため、CLI と supervisor は必ず同じディレクトリに置く。
 
 - 対象ビヘイビア: SUP-14・CORE-6（関連: CLI-1・CLI-2・SEC-1・REPAIR-5）
-- タスク: TASK-171 追補（#1721）・#2068。`start` の解決規則は TASK-79 追補（#1718）、`setup` が表示する手順は #1722
+- タスク: TASK-171 追補（#1721）・#2068。`start` の解決規則は TASK-79 追補（#1718）、`fandhe-container setup` はステップ `privileged-launcher-install` として rootful の手順を表示する（実行はしない。#1722）
 - 設計: [privilege-separation.md](../design/privilege-separation.md) の「インストールスクリプト」
 
 > 未検証の注記（REPAIR-3）: rootful の手順は `scripts/install-privileged-launcher.sh` の自己テスト（スタブのみ・root 不要）で確かめたもので、root での実機実行と検証は未実施である（#538・#539）。rootless の手順は CLI の結合試験（symlink 経由の `start`）に基づくが、実機での手順全体の通し確認は未実施である。rootless の範囲写像（subuid / subgid）の実機確認も未実施である（#1621）。rootless の `start` は supervisor が core の本番 launcher で起動するが（#1819）、委譲 cgroup の準備を含む実機での確認は未実施である（#2062）。rootful の `start` は CLI からランチャーを選ぶ規則が未実装のため `UNIMPLEMENTED`（終了コード 8）で終わる（#1719・#1722）。
@@ -82,7 +82,7 @@ rootless の `start` は、`/etc/subuid` と `/etc/subgid` の設定で ID 写�
 rootless の `start` は supervisor を `systemd-run --user --scope` で包んで起動する（CORE-3・CORE-4）。次を満たす環境が前提になる。
 
 - `systemd-run` が固定の場所（`/usr/sbin`・`/usr/bin`・`/sbin`・`/bin`・NixOS の `/run/current-system/sw/bin`）にある。`PATH` は探さない。実体が root か実行ユーザー所有の通常ファイルで、group / other から書き込めず、祖先ディレクトリも同じ条件であること（plugin の信頼の基準 PLUG-11 と同じ。sticky bit は例外にしない）。マルチユーザー構成の Nix の `/nix/store`（group 書き込み可・sticky）は祖先として拒否される可能性があり、実機では確かめていない
-- `XDG_RUNTIME_DIR` が絶対パスで、`$XDG_RUNTIME_DIR/systemd/private` に自分のソケットがある（systemd のログインセッションまたは `loginctl enable-linger` で user マネージャが動いている）
+- `XDG_RUNTIME_DIR` が絶対パスで、`$XDG_RUNTIME_DIR/systemd/private` に自分のソケットがあり、実際に接続できる（systemd のログインセッションまたは `loginctl enable-linger` で user マネージャが動いている）。ファイルだけ残って listener がいない死んだソケットは、doctor が `USER_MANAGER_SOCKET_REFUSED` で報告する
 
 満たしているかは読み取り専用の診断で確かめられる。
 
@@ -90,9 +90,9 @@ rootless の `start` は supervisor を `systemd-run --user --scope` で包ん�
 fandhe-container doctor
 ```
 
-診断は stdout に JSON Lines で出る（`code` と対処 `remediation` つき）。終了コードは、前提が満たされない警告があれば 3、判定できなければ 4、問題がなければ 0 である。root で実行すると検査を省く。
+診断は stdout に JSON Lines で出る（`code` と対処 `remediation` つき）。終了コードは、前提が満たされない警告があれば 3、判定できなければ 4、問題がなければ 0 である。root で実行すると検査を省く。doctor は実行した CLI 自身の cgroup が委譲されているかも検査する（`delete` と同じ検出）。委譲されていないこと（`CGROUP_NOT_DELEGATED`）は `start` に影響しないため通知のみで、終了コードは 0 のままである。
 
-`delete` は cgroup の配置を記録したコンテナを消すとき、実行中の cgroup が委譲されている必要がある。通常のログインセッション（SSH・TTY ログイン）の cgroup は委譲されていないため、そのまま実行すると失敗する。委譲されたスコープの中で実行する。
+`delete` は cgroup の配置を記録したコンテナを消すとき、実行中の cgroup が委譲されている必要がある。通常のログインセッション（SSH・TTY ログイン）の cgroup は委譲されていないため、そのまま実行すると失敗する（事前に doctor の `CGROUP_NOT_DELEGATED` で確かめられる）。委譲されたスコープの中で実行する。
 
 ```bash
 systemd-run --user --scope -p Delegate=yes -- fandhe-container delete <id>

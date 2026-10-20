@@ -32,12 +32,12 @@ SHELL := /bin/bash
 	crash-summary-check-selftest lib-selftest \
 	vz-virtio-gpu-guest-check-selftest guest-kernel-build guest-kernel-build-selftest guest-initrd-build guest-initrd-build-selftest third-party-licenses-selftest deny-license-fail-closed-selftest \
 	bench-check-selftest bench-baseline-selftest fio-bench-selftest fio-baseline-ratio-selftest \
-	startup-latency-selftest net-setup-timing-selftest dns-helper-measure-selftest idle-memory-selftest \
+	startup-latency-selftest net-setup-timing-selftest small-files-compare-selftest dns-helper-measure-selftest idle-memory-selftest \
 	idle-memory-supervised-selftest supervisor-pss-selftest concurrent-memory-selftest \
 	supervisor-independence-selftest restart-latency-selftest install-launcher-selftest crictl-smoke-selftest deny deny-poc-venus-jig \
 	third-party-licenses install-cargo-about ci bench-check bench-check-manual bench-baseline-manual bench-plugin-boundary \
 	bench-macos-cold-start bench-baseline cli-parity fio-bench fio-baseline-ratio startup-latency \
-	startup-latency-docker startup-latency-report net-setup-timing dns-helper-measure idle-memory \
+	startup-latency-docker startup-latency-report net-setup-timing small-files-compare dns-helper-measure idle-memory \
 	idle-memory-supervised supervisor-pss concurrent-memory concurrent-memory-docker \
 	concurrent-memory-report supervisor-independence restart-latency crictl-smoke docker-build docker-shell \
 	docker-ci
@@ -196,6 +196,9 @@ startup-latency-selftest: ## 起動時間計測スクリプトの自己テスト
 net-setup-timing-selftest: ## ネットワーク作成/接続/削除の所要時間計測スクリプトの自己テスト（NET-4・REPAIR-12。実機不要）
 	@scripts/with-tools.sh jq scripts/bench/net_setup_timing_selftest.sh
 
+small-files-compare-selftest: ## bind / named volume 比較スクリプトの自己テスト（IO-7・REPAIR-12。実ハーネス不要）
+	@scripts/with-tools.sh jq scripts/bench/small_files_compare_selftest.sh
+
 dns-helper-measure-selftest: ## DNS ヘルパー計測スクリプトの自己テスト（NET-5・REPAIR-12。実機不要）
 	@scripts/with-tools.sh jq scripts/bench/dns_helper_measure_selftest.sh
 
@@ -291,6 +294,9 @@ startup-latency-report: ## own と Docker の起動時間の結果を 1 つの�
 
 net-setup-timing: ## ネットワーク作成/接続/削除の所要時間を JSON で出力する（実機前提。EXE=<絶対パス> 必須。NET-4・TASK-139.5）
 	@scripts/targets/net-setup-timing.sh
+
+small-files-compare: ## bind / named volume の 2 構成で small_files を回し JSON で出力する（実機前提。BIND_ROOT・VOLUME_ROOT 必須。IO-7・TASK-24.1）
+	@scripts/targets/small-files-compare.sh
 
 dns-helper-measure: ## DNS ヘルパーの正答率・レイテンシ・常駐 PSS を JSON で出力する（実機前提。EXE=<絶対パス> 必須。NET-5・TASK-141.3）
 	@scripts/targets/dns-helper-measure.sh

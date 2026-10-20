@@ -7,7 +7,7 @@
 //!
 //! 設計判断（fail-closed）:
 //! - `stop` は core の `kill` に `SIGTERM` で写像する。core に stop（猶予 → SIGKILL）は無い。
-//! - 本番の [`ProcessSignaler`] は [`production_signaler`] が返す supervisor の `ControlSignaler`
+//! - 本番の [`ProcessSignaler`] は [`production_stop_signaler`] が返す supervisor の `ControlSignaler`
 //!   （`<state_root>/<id>/supervisor.sock` の制御チャネル。#2059）で、supervisor が保持する起動ハンドルへ
 //!   シグナルを渡す。supervisor に届かない・期限切れ・接続元の検証で拒否・pid 不一致のときは ERR-2 の構造化エラー
 //!   （UNAVAILABLE・TIMEOUT・PERMISSION_DENIED・FAILED_PRECONDITION）で失敗する。`state.json` の pid へ生の
@@ -29,9 +29,12 @@
 //! 未実装・簡易実装（REPAIR-3）:
 //! - stop の失敗 JSON の `op` は `kill` になる（core に `LifecycleOp::Stop` が無いため。core 到達前の失敗も
 //!   `kill` に揃える）。猶予待ち → SIGKILL・Stopped への遷移確認は TASK-157 の範囲。
-//! - stop の猶予後の SIGKILL と Stopped への遷移確認（#1545）、stop の意図の supervisor への伝達（SUP-9。
-//!   SIGTERM による終了は今も restart ポリシーの評価に入る）、`kill` コマンド（#1902。同じ
-//!   [`production_signaler`] を使う）は未実装。
+//! - stop の SIGTERM は意図つき（StopRequest）で送る。supervisor は意図を記録してから送るので、stop による終了は
+//!   `always`・`on-failure`・`unless-stopped` でも再起動されない（SUP-9・SUP-3・#2162）。意図を記録できない supervisor
+//!   （書き先なし・古い版）にはシグナルを送らず、構造化エラーで失敗する（fail-closed）。「明示 stop 済み」の state.json
+//!   への持続化と再 launch 時の `unless-stopped` / `always` の差は未実装。
+//! - stop の猶予後の SIGKILL と Stopped への遷移確認（#1545。同じ stop 用 signaler を使う。意図は一度立てば残るので 2 回目は
+//!   無害）、`kill` コマンド（#1902。[`production_signaler`] を使い、意図は立てない）は未実装。
 //! - `delete` が最初に照合する委譲スコープは CLI 自身の cgroup から検出したもの。start 時に supervisor が記録した
 //!   スコープと一致すれば従来の経路、食い違えば記録のスコープを直接開く経路（#2096）で消す。検出自体の失敗は
 //!   記録の経路へ回さず失敗させる（壊れた環境で使わない安全側の判断）。#2133 で再検討し、挙動を変えず維持した:
@@ -39,7 +42,7 @@
 //!   （案 B）は「検出は成功したがスコープが食い違う」場合だけを対象にしている。技術的には `remove_recorded` は
 //!   `RecordedCgroupScope::open` が委譲（所有者・`cgroup.type`）を独立に検証し直すため、検出の失敗を回しても検証が抜ける
 //!   わけではない。なお、通常のログインセッション（SSH・TTY ログイン。`session-N.scope` が root 所有）から `delete` すると
-//!   検出が失敗し、cgroup の配置を記録したコンテナは消せない。回避策は委譲されたスコープの中で実行すること
+//!   検出が失敗し、cgroup の配置を記録したコンテナは消せない（`doctor` の `CGROUP_NOT_DELEGATED` で事前に確かめられる。#2158）。回避策は委譲されたスコープの中で実行すること
 //!   （`systemd-run --user --scope -p Delegate=yes -- fandhe-container delete <id>`。検出が成功し、スコープの不一致から
 //!   記録の経路へ入る）。検出の失敗を記録の経路へ回すかはオーナー判断待ち（core の契約の変更になる）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4）。非 Linux では `production_runtime` が
@@ -69,16 +72,27 @@ use super::create_start::{OP_LOG_ENV, export_ops, production_runtime};
 /// `state.json` の pid への縮退を防ぐ（SEC-1・CORE-1）。
 struct UnavailableSignaler;
 
-/// 本番の signaler（stop・kill 共通の注入点。#2059・#1902。CLI-1・SEC-1・CORE-1）。
+/// 本番の signaler（stop の意図を記録させない版。`kill` 用の注入点。#2059・#1902。CLI-1・SEC-1・CORE-1）。
 ///
-/// `run_stop`（将来は #1902 の kill）から呼ばれる。`<host_state_root>/<id>/supervisor.sock` の supervisor へ
+/// 将来の `kill`（#1902）から呼ばれる。stop の意図は立てない（kind 2）。現状の呼び出しは試験だけ。`<host_state_root>/<id>/supervisor.sock` の supervisor へ
 /// 依頼する `ControlSignaler` を返し、到達できなければ構造化エラーで失敗する。`state.json` の pid へ
 /// `kill(2)` する縮退は持たない。ルートに `host_state_root()` を使うのは、supervisor のログルートや
 /// `remove_supervisor_log` と揃い、cfg を CLI に持ち込まないため。supervisor の bind 側（`args.root`）との違いは
 /// 親の symlink の解決だけで、`<root>/<id>` は同じディレクトリを指す。
+#[allow(dead_code)]
 pub(super) fn production_signaler(store: &dyn StateStore) -> Arc<dyn ProcessSignaler> {
     match store.host_state_root() {
         Some(root) => Arc::new(ControlSignaler::new(root.to_path_buf())),
+        None => Arc::new(UnavailableSignaler),
+    }
+}
+
+/// 本番の `stop` 用 signaler（SUP-9・#2162）。[`production_signaler`] と同じ到達先・縮退なしの規則だが、
+/// `ControlSignaler::for_stop` で StopRequest を送り、supervisor に明示 stop の意図を記録させてから SIGTERM を渡す。
+/// 意図を記録できない supervisor（書き先なし・古い版）には送らず、構造化エラーで失敗する（fail-closed）。
+pub(super) fn production_stop_signaler(store: &dyn StateStore) -> Arc<dyn ProcessSignaler> {
+    match store.host_state_root() {
+        Some(root) => Arc::new(ControlSignaler::for_stop(root.to_path_buf())),
         None => Arc::new(UnavailableSignaler),
     }
 }
@@ -279,7 +293,7 @@ pub(super) fn run_stop(global: &GlobalArgs, args: &StopArgs) -> CliExit {
         Ok(v) => v,
         Err(e) => return CliExit::Runtime(e),
     };
-    let signaler = production_signaler(rt.store.as_ref());
+    let signaler = production_stop_signaler(rt.store.as_ref());
     let result = stop_container(
         rt.store.as_ref(),
         &rt.recorder,
@@ -1036,7 +1050,7 @@ mod tests {
             let rec = OpRecorder::new();
             do_create(&base, &st, &rec, "sd-stop-unavail");
             let _handle = do_start(&st, &rec, "sd-stop-unavail");
-            let e = stop_with(&st, &rec, production_signaler(&st), "sd-stop-unavail")
+            let e = stop_with(&st, &rec, production_stop_signaler(&st), "sd-stop-unavail")
                 .expect_err("unavailable");
             assert_eq!(e.code(), ErrorCode::Unavailable);
             assert_eq!(e.exit_code().get(), 9);
@@ -1138,7 +1152,7 @@ mod tests {
             let e = stop_container(
                 &st,
                 &rec,
-                &production_signaler(&st),
+                &production_stop_signaler(&st),
                 &req,
                 &KillTimeout::new(Duration::from_millis(300)).expect("timeout"),
             )

@@ -51,11 +51,14 @@
 //! いない可能性があり、その行は [`StreamSummary::lines`] に数えたままで [`StreamSummary::discarded_lines`] には
 //! 計上されない（遡って数え直せないため。`error_code` が設定されることで失敗を知らせる）。
 //!
+//! # 読み出し（#1543・CLI-1・SUP-7）
+//! `logs` コマンドの読み出しは [`reader::read_container_log`] が担う。ディレクトリ契約は [`container_log_dir`]
+//! （`<state_root>/@container-logs`）、世代の並びは [`rotating`] の名前空間に従う。
+//!
 //! # 未実装（将来仕様。REPAIR-3）
 //! 本モジュールは捕捉経路とファイル sink までで、次は未実装である。
 //! - flush ごとの fsync・同期ポリシーの設定化・タイマーによる定期 flush（read ごとの flush で代替している）: SUP-7。
 //! - stdout / stderr 混在での大規模な欠落 0・重複 0 の検証（stdout 単独の 100 万行検証は `tests/log_rotation.rs` に実装済み）: SUP-7・TASK-164.4（#508）。
-//! - `logs` コマンドからの読み出し経路: TASK-164 以降 / CLI 側（ログ名の列挙は [`log_file_paths`] が実装済みで、ロックファイルを含めない。内容の読み出し・CLI 配線は未実装。TASK-164 追補・#1469）。
 //! - コンテナ削除経路からの [`RotatingFileSink::remove_all`]（ログ・ロックファイルの一括削除）の呼び出し配線: SUP-7・TASK-164 追補（#1469）。
 //! - 本番 launcher からの呼び出し配線: 子の stdout / stderr をパイプへ接続する機構（core の `exec::ChildStdio`）と、
 //!   読み取り側を受け取って起動・再起動をまたいで捕捉する配線（[`crate::log_pipeline::CaptureHub`]）は実装済みで
@@ -65,9 +68,26 @@
 //!
 //! 既定の [`MemoryLogSink`] はメモリ保持のみ（上限付き）で、supervisor 終了時に失われる。永続化には [`rotating::RotatingFileSink`] を注入する。
 
+pub mod reader;
 pub mod rotating;
 
+pub use reader::{LogReadFailure, LogReadReport, read_container_log};
 pub use rotating::{RemovedLogs, RotatingFileSink, RotationConfig, log_file_paths};
+
+/// コンテナログのディレクトリ名（状態ルート直下）。`@` 始まりはストアのメタデータ用の名前空間で、コンテナ ID
+/// （`[A-Za-z0-9._-]`）と衝突しない。`logs` という ID の `create` がログ置き場を踏まないための名前（#1543・SUP-7）。
+pub const CONTAINER_LOG_DIR_NAME: &str = "@container-logs";
+
+/// 状態ルート `root` 配下のコンテナログのディレクトリ。書き手（supervisor の bin）と読み手（CLI の `logs`）が
+/// 共有する唯一の定義で、二重管理しない（REPAIR-1）。旧配置 `<root>/logs` からの移行はしない（未リリース）。
+pub fn container_log_dir(root: &std::path::Path) -> std::path::PathBuf {
+    root.join(CONTAINER_LOG_DIR_NAME)
+}
+
+/// コンテナログのローテーション設定（既定 1MiB × 3 世代）。書き手と読み手が同じ値を使う。
+pub fn container_log_rotation_config() -> RotationConfig {
+    RotationConfig::default()
+}
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read};

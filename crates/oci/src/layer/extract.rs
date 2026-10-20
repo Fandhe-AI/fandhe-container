@@ -135,9 +135,12 @@
 //! 適用する（それ以外は落とす。fail-closed）。条件と根拠は `docs/design/oci-layer-special-bits.md`。
 //! - ホストが Linux で、`root` が実行ユーザー所有の 0700（group / other に権限なし）であること。
 //! - setuid: 書いたファイルの所有 uid が 0 でなく、tar の uid を写像（`IdRange`）した host uid と一致すること。
-//! - setgid: 同様に gid で判定すること。
+//! - setgid: 書いたファイルの所有 uid と gid がともに 0 でなく、tar の gid を写像した host gid と一致すること
+//!   （rootful〔所有 uid 0〕は setuid / setgid を常に落とす。#2251 P2-1）。
 //! - sticky: 上記のポリシー全体の条件を満たすこと。
-//! - 適用後に mode を読み戻し、ビットが残っていなければ適用したことにしない。
+//! - 適用後に mode を読み戻し、ビットが残っていなければ適用したことにしない。ビットごとの件数は
+//!   `SpecialBitsOutcome::preserved_bits` / `stripped_bits` に返す（一部のビットだけが落ちても残ったビットを
+//!   「落とした」と数えない。#2251 P2-6）。
 //!
 //! `SpecialBitsPolicy::PreserveIfChowned`（`ChownMapped` と組み合わせたときだけ有効。`Keep` との組み合わせは開始前に
 //! `InvalidArgument`）は rootful で残す経路で、`chown` と読み戻しの後の所有者で判定する。条件は次のとおり。
@@ -202,7 +205,8 @@ const COPY_BUF_LEN: usize = 64 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ExtractLimits {
-    /// 受け付けるエントリ数の上限（超過は `ResourceExhausted`）。
+    /// 受け付けるエントリ数の上限（超過は `ResourceExhausted`）。グローバル PAX ヘッダも数える
+    /// （`ExtractedLayer::entries` には含めない。#2251 P2-3）。
     pub max_entries: u64,
     /// 累積展開バイト数の上限（ヘッダ宣言サイズで書き込み前に検査。超過は `ResourceExhausted`）。
     pub max_total_bytes: u64,
@@ -285,7 +289,8 @@ pub enum SpecialBitsPolicy {
     Strip,
     /// 所有者が user namespace の写像に収まるファイルだけ、tar の値を適用する。条件はモジュール冒頭を参照。
     ///
-    /// `chown` しない 1 行の写像の経路（rootless）。rootful（ホスト uid 0）は所有 uid が 0 のため常に落とす。
+    /// `chown` しない 1 行の写像の経路（rootless）。rootful（ホスト uid 0）は所有 uid が 0 のため setuid / setgid を
+    /// 常に落とす（sticky は共通の条件のみ。#2251 P2-1）。`uid` / `gid` の ID の見え方は `IdRange` を参照。
     /// rootful で残す経路は `PreserveIfChowned`。
     PreserveIfOwnerMapped {
         /// uid の写像。
@@ -402,6 +407,47 @@ pub struct SpecialBitsOutcome {
     pub decision: SpecialBitsDecision,
     /// 特殊ビットを tar の値どおりに適用した（読み戻しで確認した）通常ファイルのエントリ数。
     pub preserved_files: u64,
+    /// 読み戻しでディスクに残ったビットのビットごとの件数（REPAIR-4・#2251 P2-6）。
+    pub preserved_bits: SpecialBitCounts,
+    /// 求めたが読み戻しで残らなかったビットのビットごとの件数。一部のビットだけが落ちたファイルでも、
+    /// 残ったビットは `preserved_bits`、落ちたビットだけがここに数えられる。
+    pub stripped_bits: SpecialBitCounts,
+}
+
+/// 通常ファイルの特殊ビットのビットごとの件数（REPAIR-4・#2251 P2-6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct SpecialBitCounts {
+    /// setuid の件数。
+    pub setuid: u64,
+    /// setgid の件数。
+    pub setgid: u64,
+    /// sticky の件数。
+    pub sticky: u64,
+}
+
+impl SpecialBitCounts {
+    /// `bits` に立っている特殊ビットごとに 1 を足す。
+    fn add_bits(&mut self, bits: u32) {
+        if bits & S_ISUID != 0 {
+            self.setuid = self.setuid.saturating_add(1);
+        }
+        if bits & S_ISGID != 0 {
+            self.setgid = self.setgid.saturating_add(1);
+        }
+        if bits & S_ISVTX != 0 {
+            self.sticky = self.sticky.saturating_add(1);
+        }
+    }
+
+    /// レイヤーごとの差分（`self - base`）。
+    fn saturating_sub(self, base: Self) -> Self {
+        Self {
+            setuid: self.setuid.saturating_sub(base.setuid),
+            setgid: self.setgid.saturating_sub(base.setgid),
+            sticky: self.sticky.saturating_sub(base.sticky),
+        }
+    }
 }
 
 /// 計装なしの `extract_tar_with`（`NoopOciOpRecorder`）。
@@ -1058,6 +1104,15 @@ struct Extractor<'a> {
     ignored_reserved: u64,
     /// 特殊ビットを tar の値どおりに適用した通常ファイルのエントリ数。
     preserved_special: u64,
+    /// `max_entries` と比べる件数。tar crate が返す全エントリ（`XGlobalHeader` を含む）を全レイヤーで累積する
+    /// （#2251 P2-3）。公開の `entries`（グローバルヘッダを除く）とは別に持つ。
+    metered_entries: u64,
+    /// 読み戻しでディスクに残った特殊ビットのビットごとの件数。
+    preserved_bits: SpecialBitCounts,
+    /// 求めたが残らなかった特殊ビットのビットごとの件数。
+    stripped_bits: SpecialBitCounts,
+    /// 書いたファイルの特殊ビットの読み戻し（試験だけが差し替える）。
+    mode_readback: fn(&fs::File) -> u32,
     /// 特殊ビットのポリシーの評価結果（展開の開始時に 1 回決める）。
     special: SpecialCtx,
     /// 所有者の rwx が欠けるディレクトリの（物理パス, mode）。子の作成を妨げないよう全レイヤーの処理後に適用する。
@@ -1590,6 +1645,8 @@ struct OwnerCtx {
 struct SpecialSetup {
     policy: SpecialBitsPolicy,
     owner_of: OwnerOf,
+    /// 書いたファイルの特殊ビットの読み戻し（試験だけが差し替える。既定は `special_bits_of`）。
+    mode_readback: fn(&fs::File) -> u32,
     ownership: OwnershipPolicy,
     chown: ChownFns,
 }
@@ -1599,6 +1656,7 @@ impl SpecialSetup {
         Self {
             policy,
             owner_of: host_owner,
+            mode_readback: special_bits_of,
             ownership: OwnershipPolicy::Keep,
             chown: ChownFns::host(),
         }
@@ -1709,7 +1767,9 @@ fn special_bits_to_keep(
     {
         keep |= S_ISUID;
     }
+    // rootful（所有 uid 0）は setuid / setgid を常に落とす。gid が 0 でなくても落とす（SEC-5・#2251 P2-1）。
     if requested & S_ISGID != 0
+        && owner.0 != 0
         && owner.1 != 0
         && tar_ids.1.and_then(|g| gid_map.map_to_host(g)) == Some(owner.1)
     {
@@ -2176,7 +2236,12 @@ impl Extractor<'_> {
         apply_file_mode(&f, mode & (FILE_MODE_MASK | keep))?;
         if requested != 0 {
             // カーネルが黙って落とした場合（所属しない gid への setgid 等）は適用したことにしない。
-            if keep == requested && special_bits_of(&f) == requested {
+            // 一部のビットだけが落ちた場合、残ったビットは preserved_bits、落ちたビットだけを stripped_bits に
+            // 数える（ファイル単位では落とした側。#2251 P2-6）。読み戻せなければ 0（残ったと偽らない）。
+            let actual = (self.mode_readback)(&f) & requested;
+            self.preserved_bits.add_bits(actual);
+            self.stripped_bits.add_bits(requested & !actual);
+            if actual == requested {
                 self.preserved_special = self.preserved_special.saturating_add(1);
             } else {
                 self.stripped_special = self.stripped_special.saturating_add(1);
@@ -2541,25 +2606,26 @@ fn collect_markers<R: Read>(
     };
     let mut markers = Vec::new();
     {
-        let mut seen = x.entries;
+        let mut seen = x.metered_entries;
         let mut bytes = x.bytes;
         let mut archive = Archive::new(TarGuard::new(&mut src));
         // `ChownMapped` のときだけ、所有者を書き込み前に検証する（範囲外の ID はそのレイヤーの書き込みより前に拒否。SEC-5）。
         let mut global_owner = GlobalOwner::default();
         for entry in archive.entries().map_err(map_stream_err)? {
             let mut entry = entry.map_err(map_stream_err)?;
-            if entry.header().entry_type() == EntryType::XGlobalHeader {
-                if x.own.is_some() {
-                    global_owner.absorb(&mut entry)?;
-                }
-                continue;
-            }
+            // グローバル PAX ヘッダも件数に数える（件数の上限の迂回を防ぐ。#2251 P2-3）。
             seen = seen.saturating_add(1);
             if seen > x.limits.max_entries {
                 return Err(err(
                     OciErrorCode::ResourceExhausted,
                     "layer exceeds the entry count limit",
                 ));
+            }
+            if entry.header().entry_type() == EntryType::XGlobalHeader {
+                if x.own.is_some() {
+                    global_owner.absorb(&mut entry)?;
+                }
+                continue;
             }
             let plan = plan_entry(&entry)?;
             if let Some(o) = &x.own
@@ -2605,6 +2671,7 @@ fn extract_one_layer<S: LayerSource>(
 ) -> Result<(ExtractedLayer, u64), OciError> {
     let (entries0, bytes0, stripped0) = (x.entries, x.bytes, x.stripped_special);
     let (preserved0, chowned0, ignored0) = (x.preserved_special, x.chowned, x.ignored_reserved);
+    let (preserved_bits0, stripped_bits0) = (x.preserved_bits, x.stripped_bits);
     let max_entries = x.limits.max_entries;
     let (markers, diff_id) = collect_markers(x, src.open()?, input_budget)?;
     // 突合はパス 2 の前に行う。不一致のレイヤーは rootfs を変更しない（#2017・OCI-1）。
@@ -2631,17 +2698,18 @@ fn extract_one_layer<S: LayerSource>(
         for entry in archive.entries().map_err(map_stream_err)? {
             let mut entry = entry.map_err(map_stream_err)?;
             let ty = entry.header().entry_type();
-            if ty == EntryType::XGlobalHeader {
-                global_owner.absorb(&mut entry)?;
-                continue;
-            }
-            x.entries += 1;
-            if x.entries > max_entries {
+            x.metered_entries = x.metered_entries.saturating_add(1);
+            if x.metered_entries > max_entries {
                 return Err(err(
                     OciErrorCode::ResourceExhausted,
                     "layer exceeds the entry count limit",
                 ));
             }
+            if ty == EntryType::XGlobalHeader {
+                global_owner.absorb(&mut entry)?;
+                continue;
+            }
+            x.entries = x.entries.saturating_add(1);
             match plan_entry(&entry)? {
                 // マーカーはパス 2 で適用済み。rootfs へは書かない（OCI-2）。
                 Plan::Marker(_) => {}
@@ -2690,6 +2758,8 @@ fn extract_one_layer<S: LayerSource>(
             special_bits: SpecialBitsOutcome {
                 decision: x.special.decision,
                 preserved_files: x.preserved_special.saturating_sub(preserved0),
+                preserved_bits: x.preserved_bits.saturating_sub(preserved_bits0),
+                stripped_bits: x.stripped_bits.saturating_sub(stripped_bits0),
             },
             ownership: OwnershipOutcome {
                 decision: if x.own.is_some() {
@@ -2744,6 +2814,10 @@ fn extract_stack<S: LayerSource>(
                     stripped_special: 0,
                     ignored_reserved: 0,
                     preserved_special: 0,
+                    metered_entries: 0,
+                    preserved_bits: SpecialBitCounts::default(),
+                    stripped_bits: SpecialBitCounts::default(),
+                    mode_readback: setup.mode_readback,
                     special: eval_special_ctx(&setup, root)?,
                     deferred_dirs: HashMap::new(),
                     own,
@@ -4113,6 +4187,19 @@ mod tests {
         policy: SpecialBitsPolicy,
         owner_of: OwnerOf,
     ) -> ExtractedLayer {
+        run_setup(
+            sb,
+            entries,
+            SpecialSetup {
+                owner_of,
+                ..SpecialSetup::host(policy)
+            },
+        )
+    }
+
+    /// `SpecialSetup` を丸ごと渡して 1 レイヤーを展開する（読み戻しの差し替え用。#2251 P2-6）。
+    #[cfg(unix)]
+    fn run_setup(sb: &Sandbox, entries: &[Vec<u8>], setup: SpecialSetup) -> ExtractedLayer {
         let tar = archive(entries);
         single(
             extract_stack(
@@ -4121,10 +4208,7 @@ mod tests {
                 &sb.root,
                 LIM(),
                 host_lstat,
-                SpecialSetup {
-                    owner_of,
-                    ..SpecialSetup::host(policy)
-                },
+                setup,
             )
             .unwrap(),
         )
@@ -4182,6 +4266,8 @@ mod tests {
         );
         assert_eq!(r.special_bits.preserved_files, 0);
         assert_eq!(r.files_with_stripped_special_bits, 4);
+        let sb_bits = r.special_bits.stripped_bits;
+        assert_eq!((sb_bits.setuid, sb_bits.setgid, sb_bits.sticky), (2, 2, 1));
         for (name, want) in [
             ("suid", 0o755),
             ("sgid", 0o755),
@@ -4466,10 +4552,162 @@ mod tests {
             special_bits_to_keep(all, (Some(0), Some(0)), (0, 0), &root_ctx),
             S_ISVTX
         );
+        // rootful（所有 uid 0）は gid が 0 でなく写像と一致しても setgid を残さない（#2251 P2-1）。
+        let gid_map = IdRange {
+            container_id: 0,
+            host_id: 1000,
+            count: 1,
+        };
+        let rootful_ctx = SpecialCtx {
+            ranges: Some((root_map, gid_map)),
+            root_uid: 0,
+            ..ctx
+        };
+        assert_eq!(
+            special_bits_to_keep(all, (Some(0), Some(0)), (0, 1000), &rootful_ctx),
+            S_ISVTX
+        );
         let strip = SpecialCtx::strip();
         assert_eq!(
             special_bits_to_keep(all, (Some(0), Some(0)), (1000, 1000), &strip),
             0
+        );
+    }
+
+    /// 特殊ビットのビットごとの件数の加算（#2251 P2-6）。
+    #[test]
+    fn sec5_special_bit_counts_add_bits() {
+        let mut c = SpecialBitCounts::default();
+        c.add_bits(0o7000);
+        c.add_bits(0o4000);
+        c.add_bits(0);
+        assert_eq!((c.setuid, c.setgid, c.sticky), (2, 1, 1));
+    }
+
+    /// OCI-2: グローバル PAX ヘッダも `max_entries` の件数に数える。公開の `entries` には含めない（#2251 P2-3）。
+    #[test]
+    fn oci2_global_pax_headers_count_toward_entry_limit() {
+        let body = pax_record("comment", "x");
+        let mut es: Vec<Vec<u8>> = (0..3)
+            .map(|_| {
+                raw_entry(
+                    b"pax_global",
+                    EntryType::XGlobalHeader,
+                    b"",
+                    0o644,
+                    body.len() as u64,
+                    &body,
+                )
+            })
+            .collect();
+        es.push(file("a", 0o644, b"1"));
+        let sb = Sandbox::new();
+        let r = extract_tar(
+            Cursor::new(archive(&es)),
+            &sb.root,
+            ExtractLimits::new(4, 100, 1 << 30, 1 << 20),
+        )
+        .unwrap();
+        assert_eq!(r.entries, 1);
+
+        let sb = Sandbox::new();
+        let e = extract_tar(
+            Cursor::new(archive(&es)),
+            &sb.root,
+            ExtractLimits::new(3, 100, 1 << 30, 1 << 20),
+        )
+        .expect_err("limit");
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        assert_eq!(e.message(), "layer exceeds the entry count limit");
+        assert!(names_in(&sb.root).is_empty());
+    }
+
+    /// OCI-2: グローバル PAX ヘッダの件数は複数レイヤーで累積する（#2251 P2-3）。
+    #[test]
+    fn oci2_global_pax_headers_accumulate_across_layers() {
+        let body = pax_record("comment", "x");
+        let layer = || -> Vec<Vec<u8>> {
+            (0..2)
+                .map(|_| {
+                    raw_entry(
+                        b"pax_global",
+                        EntryType::XGlobalHeader,
+                        b"",
+                        0o644,
+                        body.len() as u64,
+                        &body,
+                    )
+                })
+                .collect()
+        };
+        let sb = Sandbox::new();
+        let e = run_stack(
+            &sb,
+            &[layer(), layer()],
+            ExtractLimits::new(3, 100, 1 << 30, 1 << 20),
+            host_lstat,
+        )
+        .expect_err("limit");
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+    }
+
+    /// SEC-5: 所有 uid が host root のファイルは、gid が 0 でなくても setgid を落とす（#2251 P2-1）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec5_setgid_dropped_when_file_owner_uid_is_host_root() {
+        fn owner_root_uid(_m: &fs::Metadata) -> (u32, u32) {
+            (0, 1000)
+        }
+        let sb = Sandbox::new();
+        chmod_root(&sb, 0o700);
+        let r = run_policy(
+            &sb,
+            &[file_owned("sgid", 0o2755, 0, 0, b"a")],
+            policy_1000(),
+            owner_root_uid,
+        );
+        assert_eq!(mode_of(&sb.root.join("sgid")), 0o755);
+        assert_eq!(r.files_with_stripped_special_bits, 1);
+        assert_eq!(r.special_bits.preserved_files, 0);
+        assert_eq!(r.special_bits.stripped_bits.setgid, 1);
+    }
+
+    /// REPAIR-4: setgid だけが読み戻しで落ちたとき、残った setuid を「落とした」と数えない（#2251 P2-6）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec5_readback_setgid_only_drop_does_not_count_setuid_as_stripped() {
+        fn without_setgid(f: &fs::File) -> u32 {
+            special_bits_of(f) & !S_ISGID
+        }
+        let sb = Sandbox::new();
+        chmod_root(&sb, 0o700);
+        let r = run_setup(
+            &sb,
+            &[file_owned("both", 0o6755, 0, 0, b"a")],
+            SpecialSetup {
+                owner_of: owner_1000,
+                mode_readback: without_setgid,
+                ..SpecialSetup::host(policy_1000())
+            },
+        );
+        let b = r.special_bits;
+        assert_eq!(b.preserved_files, 0);
+        assert_eq!(r.files_with_stripped_special_bits, 1);
+        assert_eq!(
+            (
+                b.stripped_bits.setuid,
+                b.stripped_bits.setgid,
+                b.stripped_bits.sticky
+            ),
+            (0, 1, 0)
+        );
+        assert_eq!(
+            (
+                b.preserved_bits.setuid,
+                b.preserved_bits.setgid,
+                b.preserved_bits.sticky
+            ),
+            (1, 0, 0)
         );
     }
     // ---- 複数レイヤーの重ね合わせ（TASK-52.4・OCI-1・#410） ----
@@ -4817,6 +5055,10 @@ mod tests {
             stripped_special: 0,
             ignored_reserved: 0,
             preserved_special: 0,
+            metered_entries: 0,
+            preserved_bits: SpecialBitCounts::default(),
+            stripped_bits: SpecialBitCounts::default(),
+            mode_readback: special_bits_of,
             special: SpecialCtx::strip(),
             deferred_dirs: HashMap::new(),
             own: None,

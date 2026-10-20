@@ -29,7 +29,16 @@ root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
 
 pass() { echo "PASS: $1"; }
-fail() { echo "FAIL: $1" >&2; failures=$((failures + 1)); }
+# 失敗時は現在の case の stderr を 1 case につき 1 回だけ出す（CI ログから原因を辿れるようにする。#2154・REPAIR-4）。
+err_shown=""
+fail() {
+  echo "FAIL: $1" >&2
+  failures=$((failures + 1))
+  if [ -n "${ERR:-}" ] && [ "$err_shown" != "$ERR" ] && [ -s "$ERR" ]; then
+    err_shown="$ERR"
+    sed "s/^/  [case ${case_no:-0} err] /" "$ERR" >&2 || true
+  fi
+}
 
 # スタブ群。実バイナリの契約（#1717・#1819）に合わせ、CLI は `--root R create --bundle B <id>`、systemd-run は
 # `--user --scope --quiet -p Delegate=yes -- <cmd...>`（exec するので pid は変わらない）、supervisor は
@@ -38,6 +47,7 @@ fail() { echo "FAIL: $1" >&2; failures=$((failures + 1)); }
 # STUB_MODE: normal（監視プロセスが死んでもコンテナは残る）/ collateral（対象の死で他の監視プロセスも死ぬ）/
 # die_with_target（対象のコンテナが監視プロセスと共に死ぬ）/ other_dies（他コンテナが対象の死で死ぬ）/
 # scrub_env（コンテナ側プロセスが環境変数を継承しない）/ no_ready（報告を出さない）/ err_report（FCSUP1 ERR）/ bad_report（書式不正）/ short_start（最後の launcher が起動直後に終了）/ restart（コンテナを再起動する）/ restart_aux（補助プロセスだけ増やす）/ restart_short（再起動後すぐ終了）/ restart_sup_dies（再起動後に監視プロセスが終了）/ restart_alias（同名・別コマンドの補助プロセスだけ増やす）/ many_kids（子孫が走査上限 512 件を超える）/ mid_only（対象だけ、一時的な中間プロセスを観測させた後、報告なしで終了し、木の外の init を残す）。
+# split_report（対象の報告行を pid の途中で 2 回に分けて書く。#2154）。
 # 待機はすべて組み込みの read -t（fork しない）で行い、一過性の子プロセスを作らない。
 mkdir -m 0755 "${root}/bin"
 cat >"${root}/bin/fandhe-container" <<'STUB'
@@ -126,6 +136,15 @@ trap 'kill "$c" 2>/dev/null; exit 0' TERM
 case "$STUB_MODE" in
   no_ready) ;;
   bad_report) echo "FCSUP1 OK pid" ;;
+  split_report)
+    if [ "$role" = t ]; then
+      # 本体の read -t 0.05 より長くあけ、期限切れが必ず行の途中で起きるようにする。
+      printf 'FCSUP1 OK %s' "${c:0:1}"
+      read -t 0.3 -u 9 || true
+      echo "${c:1}"
+    else
+      echo "FCSUP1 OK $c"
+    fi ;;
   *) echo "FCSUP1 OK $c" ;;
 esac
 while :; do
@@ -287,6 +306,13 @@ expect_eq "collateral: exit code" 1 "$RC"
 expect_eq "collateral: supervisors_alive_after_kill" 0 "$(json_get supervisors_alive_after_kill "$OUT")"
 expect_eq "collateral: result" fail "$(json_get result "$OUT")"
 if [ -e "${root}/c2-result.json" ]; then fail "collateral: --output must not be created on failure"; else pass "collateral: no --output on failure"; fi
+
+# 2b. 報告行が pid の途中で分かれて届いても、完全な 1 行になるまで待って受理する（#2154・SUP-5・REPAIR-5）。
+run_case split_report
+expect_eq "split_report: exit code" 0 "$RC"
+expect_eq "split_report: supervisors_alive_after_kill" 4 "$(json_get supervisors_alive_after_kill "$OUT")"
+expect_eq "split_report: target_container_alive" true "$(json_get target_container_alive "$OUT")"
+expect_eq "split_report: result" pass "$(json_get result "$OUT")"
 
 # 3. 対象のコンテナが監視プロセスと共に死ぬ（AC2 の検出）。
 run_case die_with_target

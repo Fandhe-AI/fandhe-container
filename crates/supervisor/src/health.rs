@@ -6,7 +6,7 @@
 //! # 実装範囲の線引き（REPAIR-3）
 //! - 提供するもの: 判定結果を書く [`record_health`]、判定処理の拡張点 [`HealthProbe`]、
 //!   fail-closed のスタブ [`UnimplementedHealthProbe`]、1 回分の判定と記録をつなぐ [`probe_and_record`]。
-//! - **未実装**: healthcheck コマンドの実行、周期実行、`monitor` ループからの呼び出し。
+//! - **未実装**: healthcheck コマンドの実行、`monitor` ループからの呼び出し（周期実行は `crate::healthcheck::run_periodic`・#495）。
 //!   将来は TASK-161（SUP-4）が exec と共通のコードパス（TASK-163・SUP-6）で [`HealthProbe`] を実装し、
 //!   監視ループの生存確認の周回（`crate::run::monitor` の手順 3）から周期的に [`probe_and_record`] を呼ぶ。
 //!   healthcheck 定義の検証・シェル連結の禁止は [`crate::healthcheck`]（TASK-161.1）で決定済み。

@@ -312,6 +312,12 @@ impl ControlAuditRelay {
 
     /// 枠を helper へ送り、応答を [`RECORD_WAIT_LIMIT`] まで待つ。
     fn exchange(&self, frame: &[u8]) -> Result<(), TraitError> {
+        self.exchange_within(frame, RECORD_WAIT_LIMIT)
+    }
+
+    /// [`Self::exchange`] の待ちを `limit`(最大 [`RECORD_WAIT_LIMIT`])へ絞った版(REPAIR-5)。
+    fn exchange_within(&self, frame: &[u8], limit: Duration) -> Result<(), TraitError> {
+        let limit = limit.min(RECORD_WAIT_LIMIT).max(Duration::from_millis(1));
         let Ok(mut state) = self.state.lock() else {
             return Err(err(ErrorCode::Internal, "the audit relay lock is poisoned"));
         };
@@ -321,12 +327,9 @@ impl ControlAuditRelay {
                 "the audit relay is unavailable",
             ));
         }
-        let deadline = Instant::now() + RECORD_WAIT_LIMIT;
+        let deadline = Instant::now() + limit;
         let mut ack = [0u8; 1];
-        let sent = state
-            .stream
-            .set_write_timeout(Some(RECORD_WAIT_LIMIT))
-            .is_ok()
+        let sent = state.stream.set_write_timeout(Some(limit)).is_ok()
             && state.stream.write_all(frame).is_ok();
         let remaining = deadline
             .saturating_duration_since(Instant::now())
@@ -358,6 +361,18 @@ impl AuditSink for ControlAuditRelay {
     fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
         let frame = encode(record)?;
         self.exchange(&frame)
+    }
+
+    fn record_until(&self, record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(err(
+                ErrorCode::Timeout,
+                "the audit record was not delivered within the deadline",
+            ));
+        }
+        let frame = encode(record)?;
+        self.exchange_within(&frame, remaining)
     }
 }
 

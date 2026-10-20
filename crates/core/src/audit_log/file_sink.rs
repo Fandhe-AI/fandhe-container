@@ -902,10 +902,20 @@ impl FileAuditSink {
 
     /// 主経路を 1 回試す。隔離した子の結果（終了コード・時間切れ・fork 不能）を主経路の失敗へ写す。
     fn write_primary(&self, record: &AuditRecord) -> Result<(), AuditWriteError> {
+        self.write_primary_capped(record, None)
+    }
+
+    /// [`Self::write_primary`] の子の待ちを `cap`(あれば)へ絞った版(REPAIR-5)。
+    fn write_primary_capped(
+        &self,
+        record: &AuditRecord,
+        cap: Option<Duration>,
+    ) -> Result<(), AuditWriteError> {
         match self.isolation {
             #[cfg(test)]
             Isolation::InProcess => (self.primary)(&self.path, record),
             Isolation::Process { timeout } => {
+                let timeout = cap.map_or(timeout, |c| timeout.min(c));
                 let run = run_isolated(timeout, |_| match (self.primary)(&self.path, record) {
                     Ok(()) => 0,
                     Err(e) => kind_to_exit(e.kind()),
@@ -929,6 +939,35 @@ impl AuditSink for FileAuditSink {
             Err(primary) => primary,
         };
         // 主経路の失敗（open・時間切れ・隔離不能を含む）は代替経路へ回す。代替経路はストレージに触れない。
+        let mut fallback = (self.fallback)();
+        let failure = match fallback.record_fallback(record, &primary) {
+            Ok(()) => return Ok(()),
+            Err(fb) => AuditWriteFailure::new(primary, fb),
+        };
+        (self.notify)(&failure);
+        Err(TraitError::new(failure.error_code(), failure.message()))
+    }
+
+    /// 主経路の子の待ちを残り時間へ絞り、期限が尽きていれば代替経路へ進まず `Timeout` を返す(REPAIR-5)。
+    /// 代替経路の ACK 待ち(上限 [`KERNEL_AUDIT_ACK_TIMEOUT`])は絞れないため、期限を最大でその分超え得る。
+    fn record_until(&self, record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
+        let timed_out = || {
+            TraitError::new(
+                crate::traits::ErrorCode::Timeout,
+                "the audit record was not delivered within the deadline",
+            )
+        };
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(timed_out());
+        }
+        let primary = match self.write_primary_capped(record, Some(remaining)) {
+            Ok(()) => return Ok(()),
+            Err(primary) => primary,
+        };
+        if Instant::now() >= deadline {
+            return Err(timed_out());
+        }
         let mut fallback = (self.fallback)();
         let failure = match fallback.record_fallback(record, &primary) {
             Ok(()) => return Ok(()),

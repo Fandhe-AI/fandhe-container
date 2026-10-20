@@ -876,6 +876,8 @@ impl Inner {
         spec: &LaunchSpec,
         timeout: Duration,
     ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        // 期限は入口で 1 回だけ取り、以降のすべての待ち(再回収・監査配送・spawn)をここから導く(REPAIR-5・SEC-4)。
+        let deadline = Instant::now() + timeout;
         let id = spec.container_id();
         self.admit(id)?;
         if !self.ops.is_single_threaded() {
@@ -897,11 +899,7 @@ impl Inner {
         )
         .map_err(|e| to_trait_error(&e))?;
         // 監査の網羅(カーネル監査頼みの層)を評価し、厳格モードの縮退は子を作る前に拒否する(SEC-4・#2027)。
-        let isolation_record = self.assess_audit_coverage(id, isolation_record)?;
-        // spawn の期限の起点は coverage 記録の同期配送の後に置く。配送は `RECORD_WAIT_LIMIT`(約 11 秒)まで待ち得て、
-        // 既定の launch 期限(10 秒)を超えるため、差し引くと既定モードでも遅い記録だけで launch が失敗する
-        // (配送の待ちは別枠で有限。入口側の全体期限は `start_contract::AUDIT_DELIVERY_ALLOWANCE` として手順 8 の見込みへ別途算入する。REPAIR-5・SEC-4・#2027)。以降の fork 前の準備だけを期限に含める。
-        let started = Instant::now();
+        let isolation_record = self.assess_audit_coverage(id, isolation_record, deadline)?;
         let (uid, gid) = spec.user();
         let mut stages = StagePipeline::new()
             .with_seccomp_delivery(self.seccomp_delivery)
@@ -944,8 +942,8 @@ impl Inner {
             sink: self.audit_sink.as_ref(),
             container: Some(id),
         };
-        // 配送などで消費した分を引いた残りを spawn に渡す。尽きていれば子を作らず拒否する(fail-closed)。
-        let timeout = timeout.saturating_sub(started.elapsed());
+        // 入口の期限までの残りを spawn に渡す。尽きていれば子を作らず拒否する(fail-closed)。
+        let timeout = deadline.saturating_duration_since(Instant::now());
         if timeout.is_zero() {
             return Err(TraitError::new(
                 ErrorCode::Timeout,
@@ -1024,6 +1022,7 @@ impl Inner {
         &self,
         id: &ContainerId,
         record: crate::launch_isolation::LaunchIsolationRecord,
+        deadline: Instant,
     ) -> Result<crate::launch_isolation::LaunchIsolationRecord, TraitError> {
         let coverage =
             crate::audit_log::assess(&self.ops.kernel_audit_probe(), record.landlock().audit());
@@ -1032,8 +1031,14 @@ impl Inner {
             self.ops.emit_warning(&line);
         }
         if let Some(event) = coverage.degraded_event() {
-            let delivery =
-                crate::audit_log::mount::deliver(event, Some(id), self.audit_sink.as_ref());
+            // 同期配送の待ちも launch の入口の期限へ絞る。尽きたときは記録できなかった扱い(警告のみ)にし、
+            // 続く spawn 直前の残り時間の確認で `Timeout` として拒否する(REPAIR-5・SEC-4)。
+            let delivery = crate::audit_log::mount::deliver_until(
+                event,
+                Some(id),
+                self.audit_sink.as_ref(),
+                Some(deadline),
+            );
             if !matches!(delivery, crate::audit_log::AuditDelivery::Recorded) {
                 self.ops.emit_warning(AUDIT_COVERAGE_RECORD_FAILED_LINE);
             }
@@ -2180,6 +2185,63 @@ mod tests {
                 DEGRADED_LINE.to_owned(),
                 AUDIT_COVERAGE_RECORD_FAILED_LINE.to_owned()
             ]
+        );
+    }
+
+    /// 期限まで眠ってから `Timeout` を返す遅い sink。`record`(期限を知らない経路)は期限と無関係に長く眠る。
+    struct SlowSink {
+        record_calls: AtomicUsize,
+    }
+
+    impl AuditSink for SlowSink {
+        fn record(&self, _record: &AuditRecord) -> Result<(), TraitError> {
+            self.record_calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(())
+        }
+
+        fn record_until(&self, _record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            Err(TraitError::new(ErrorCode::Timeout, "slow sink timed out"))
+        }
+    }
+
+    /// SEC-4・REPAIR-5: 縮退の監査配送が遅くても、launch 全体が引数 timeout の近傍内に `Timeout` で返り、
+    /// 配送の待ちが入口の期限の外へ出ず、子(spawn)も作られない。
+    #[test]
+    fn sec4_repair5_slow_audit_delivery_stays_within_launch_timeout() {
+        let spec = spec_for("cov-slow", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.probe = degraded_probe();
+        let sink = Arc::new(SlowSink {
+            record_calls: AtomicUsize::new(0),
+        });
+        let mut inner = Inner::new(
+            Box::new(ops),
+            rootless(),
+            None,
+            Arc::clone(&sink) as _,
+            None,
+        );
+        inner.audit_policy = crate::audit_log::AuditCoveragePolicy::BestEffort;
+        let l = ProductionLauncher { inner };
+        let started = Instant::now();
+        let err = l
+            .launch(&spec, Duration::from_millis(300))
+            .err()
+            .expect("timed out");
+        let elapsed = started.elapsed();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        assert_eq!(sink.record_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            ev.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.starts_with("spawn"))
+                .count(),
+            0
         );
     }
 

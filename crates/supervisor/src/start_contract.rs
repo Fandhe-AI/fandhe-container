@@ -342,8 +342,9 @@ pub const AUDIT_PROBE_ALLOWANCE: Duration = RECORD_WAIT_LIMIT;
 
 /// launch の直前に行う監査の網羅の記録（縮退の同期配送）に見込む時間（[`RECORD_WAIT_LIMIT`] と同じ）。
 ///
-/// launcher（`SelfBounded`）は配送の後に `launch` の期限を数え始めるため、入口が見込む手順 8 の時間へ別枠で足す
-/// （SEC-4・REPAIR-5・#2027）。
+/// launcher（`SelfBounded`）は入口の単一期限（引数 `timeout`）から配送を含む待ちを導き、配送は残り時間で打ち切られる
+/// ため、この分は launch の上限を広げない（遅い配送は `TIMEOUT` で拒否される）。入口が見込む手順 8 の時間への
+/// 余裕としてのみ残す（SEC-4・REPAIR-5・#2027）。
 pub const AUDIT_DELIVERY_ALLOWANCE: Duration = RECORD_WAIT_LIMIT;
 
 /// 起動手順 8（`oci_runtime::start`。launch・失敗時の terminate・確認）に見込む時間:

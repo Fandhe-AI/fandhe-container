@@ -409,6 +409,9 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
 #[derive(Debug)]
 pub struct AuditFileWriter {
     file: File,
+    /// 開いたときの親ディレクトリ(書き込み可能性の確認用の一時ファイルを同じ FS に作るため)。
+    /// 検査なしで包んだ試験用の writer では `None`(確認は fail-closed で `Write`)。
+    dir: Option<std::path::PathBuf>,
 }
 
 impl AuditFileWriter {
@@ -426,7 +429,16 @@ impl AuditFileWriter {
     /// テスト用: 検査なしで `File` を包む（読み取り専用ファイルで書き込み失敗を再現する）。
     #[cfg(test)]
     pub(crate) fn from_file_unchecked(file: File) -> Self {
-        Self { file }
+        Self { file, dir: None }
+    }
+
+    /// テスト用: 検査なしで `File` と確認用の親ディレクトリを包む。
+    #[cfg(test)]
+    pub(crate) fn from_file_unchecked_in(file: File, dir: std::path::PathBuf) -> Self {
+        Self {
+            file,
+            dir: Some(dir),
+        }
     }
 
     /// 1 レコードを排他ロック下で `write_all` し、`sync_data` まで行う。
@@ -446,10 +458,11 @@ impl AuditFileWriter {
     /// 本番の記録経路と同じ手順（排他 `flock` の取得 → 実バイトの書き込み → `sync_data`）が通るかを確かめる
     /// （起動前の記録経路の確認。SEC-4・REPAIR-5・#2027）。
     ///
-    /// 別プロセスが `flock` を保持していれば `AUDIT_LOCK_TIMEOUT` で `Lock` になり、追記・永続化できない保存先
-    /// （読み取り専用・満杯〔ENOSPC / EDQUOT〕など）は `Write` / `Sync` になる。0 バイトの `write` は何も呼ばず満杯を
-    /// 検出できないため、確認用に LF 1 バイトを実際に追記して `sync_data` し、排他を持ったまま元の長さへ戻す
-    /// （ログ形式を壊さない: 確認の LF が行として残らない）。戻せなければ `Write` で失敗にする（fail-closed）。
+    /// 別プロセスが `flock` を保持していれば `AUDIT_LOCK_TIMEOUT` で `Lock` になる。追記・永続化できない保存先
+    /// （読み取り専用・満杯〔ENOSPC / EDQUOT〕など）は、**共有ログには一切書かず**、同じディレクトリ(同じ FS)に
+    /// 作った一時ファイルへ 1 バイト書いて `sync_data` することで検出し、`Write` / `Sync` にする。一時ファイルは
+    /// 作成直後・書き込み前に unlink するため、確認の途中で子が SIGKILL されても残骸は残らない。共有ログを巻き戻す
+    /// 必要が無く、`flock` を取らない追尾型の読み手にも確認用のバイトは見えない（SEC-4・REPAIR-5）。
     pub fn probe_append(&mut self) -> Result<(), AuditWriteError> {
         self.probe_append_with(&AUDIT_WRITE_QUEUE, AUDIT_LOCK_TIMEOUT)
     }
@@ -461,22 +474,9 @@ impl AuditFileWriter {
         timeout: Duration,
     ) -> Result<(), AuditWriteError> {
         let _turn = self.lock_exclusive(queue, Instant::now() + timeout)?;
-        // 長さが読めなければ確認用の追記をしない(戻せない書き込みを残さない)。
-        let result = match self.file.metadata().map(|m| m.len()) {
-            Err(_) => Err(AuditWriteError::new(AuditWriteErrorKind::Write)),
-            Ok(original) => {
-                let written = self.file.write_all(b"\n").is_ok();
-                let synced = written && self.file.sync_data().is_ok();
-                // 書けたかどうかに関わらず、排他を持ったまま元の長さへ戻す(途中まで書かれた場合も含む)。
-                let restored = self.file.set_len(original).is_ok();
-                if !written || !restored {
-                    Err(AuditWriteError::new(AuditWriteErrorKind::Write))
-                } else if !synced {
-                    Err(AuditWriteError::new(AuditWriteErrorKind::Sync))
-                } else {
-                    Ok(())
-                }
-            }
+        let result = match &self.dir {
+            Some(dir) => probe_scratch_write(dir),
+            None => Err(AuditWriteError::new(AuditWriteErrorKind::Write)),
         };
         let _ = self.file.unlock();
         result
@@ -534,6 +534,44 @@ impl AuditFileWriter {
         }
         Ok(())
     }
+}
+
+/// `dir` の信頼検査済み fd 経由で一時ファイルを作り、直ちに unlink してから 1 バイトを書いて `sync_data` する
+/// (共有ログに触れない書き込み可能性の確認。[`AuditFileWriter::probe_append`])。
+#[cfg(target_os = "linux")]
+fn probe_scratch_write(dir: &Path) -> Result<(), AuditWriteError> {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let write_err = || AuditWriteError::new(AuditWriteErrorKind::Write);
+    let flags = crate::sys::nofollow_nonblock_open_flags()
+        .ok_or_else(|| AuditWriteError::new(AuditWriteErrorKind::Unsupported))?;
+    let parent_fd = open_trusted_parent(dir)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let name = format!(".audit-probe-{}-{nanos}", std::process::id());
+    let via_fd =
+        std::path::PathBuf::from(format!("/proc/self/fd/{}", parent_fd.as_raw_fd())).join(name);
+    let mut scratch = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(flags)
+        .open(&via_fd)
+        .map_err(|_| write_err())?;
+    // 名前を先に消す(以降に子が打ち切られても残らない)。消せなければ残骸を避けるため失敗にする。
+    std::fs::remove_file(&via_fd).map_err(|_| write_err())?;
+    scratch.write_all(b"\n").map_err(|_| write_err())?;
+    scratch
+        .sync_data()
+        .map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Sync))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_scratch_write(_dir: &Path) -> Result<(), AuditWriteError> {
+    Err(AuditWriteError::new(AuditWriteErrorKind::Unsupported))
 }
 
 /// ファイル末尾が LF で終わっていない（空ファイルは終端済み扱い）か。読めない場合は安全側で `true`。
@@ -665,7 +703,10 @@ fn open_checked(path: &Path) -> Result<AuditFileWriter, AuditWriteError> {
         return Err(AuditWriteError::new(AuditWriteErrorKind::InsecureFile));
     }
     // 末尾が LF でない（torn line）場合の隔離は、書き込みごとにロック下で判定する。
-    Ok(AuditFileWriter { file })
+    Ok(AuditFileWriter {
+        file,
+        dir: Some(parent.to_path_buf()),
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -810,6 +851,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fc-probe-append-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        // 確認用の一時ファイルは信頼検査済みの親に作る(umask に依らず 0700 にする)。
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
         let path = dir.join("audit.log");
         let file = std::fs::OpenOptions::new()
             .append(true)
@@ -824,7 +868,7 @@ mod tests {
             .open(&path)
             .unwrap();
         other.lock().unwrap();
-        let mut writer = AuditFileWriter::from_file_unchecked(holder);
+        let mut writer = AuditFileWriter::from_file_unchecked_in(holder, dir.clone());
         let e = writer
             .probe_append_with(&queue, Duration::from_millis(200))
             .unwrap_err();
@@ -836,6 +880,40 @@ mod tests {
             .unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-4・REPAIR-5・#2027: 確認(`probe_append`)は共有ログを巻き戻さない。確認の前後で長さは変わらず(減らず)、
+    /// 続けて書いた記録は確認の前の末尾にそのまま連なる。同じディレクトリに一時ファイルの残骸も残らない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_repair5_probe_never_rewinds_shared_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fc-probe-mono-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("audit.log");
+        let mut w = AuditFileWriter::open(&path).unwrap();
+        let r = rec(
+            9,
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
+        );
+        let line_len = encode_json_line(&r).unwrap().len() as u64;
+        w.write_record(&r).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), line_len);
+        w.probe_append().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), line_len);
+        w.write_record(&r).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), line_len * 2);
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec!["audit.log".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

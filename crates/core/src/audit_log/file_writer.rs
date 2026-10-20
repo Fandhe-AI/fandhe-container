@@ -722,6 +722,18 @@ pub trait AuditFallback {
         record: &AuditRecord,
         primary: &AuditWriteError,
     ) -> Result<(), AuditWriteError>;
+
+    /// [`Self::record_fallback`] の絶対期限つき版(REPAIR-5・SEC-4。`AuditSink::record_until` から呼ぶ)。
+    ///
+    /// 既定は `deadline` を見ずに委譲する。応答を待つ実装は、待ちを `deadline` までに絞るよう上書きすること。
+    fn record_fallback_until(
+        &mut self,
+        record: &AuditRecord,
+        primary: &AuditWriteError,
+        _deadline: std::time::Instant,
+    ) -> Result<(), AuditWriteError> {
+        self.record_fallback(record, primary)
+    }
 }
 
 /// カーネル監査を使わない構成・テスト用の代替経路。常に `FallbackUnavailable`（`Unimplemented`）を返す。

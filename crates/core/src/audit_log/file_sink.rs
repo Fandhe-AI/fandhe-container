@@ -160,7 +160,8 @@ pub const RECORD_WAIT_LIMIT: Duration = PRIMARY_WRITE_TIMEOUT
     .saturating_add(NOTIFY_THREAD_EXIT_WAIT);
 
 type FallbackFactory = Arc<dyn Fn() -> Box<dyn AuditFallback> + Send + Sync>;
-type FailureNotifier = Arc<dyn Fn(&AuditWriteFailure) + Send + Sync>;
+/// 失敗通知器。第 2 引数は絶対期限（`record_until` 経由のとき `Some`。通知の全段階がこれを超えない）。
+type FailureNotifier = Arc<dyn Fn(&AuditWriteFailure, Option<Instant>) + Send + Sync>;
 /// 主経路の 1 回分の書き込み（パスを開いて 1 件追記）。隔離した子の中で実行される。
 type PrimaryStep = Arc<dyn Fn(&Path, &AuditRecord) -> Result<(), AuditWriteError> + Send + Sync>;
 /// 通知の出力先の生成関数（隔離した子の中で呼ぶ）。
@@ -394,6 +395,20 @@ fn settle(rx: &std::fs::File, otherwise: IsolatedOutcome) -> Isolated {
 ///   `clone3(CLONE_PIDFD)` で fork と同時に pidfd を得ること（未実装）
 #[cfg(target_os = "linux")]
 fn run_isolated(timeout: Duration, child: impl FnOnce(&dyn Fn()) -> i32) -> Isolated {
+    run_isolated_until(timeout, None, child)
+}
+
+/// [`run_isolated`] に絶対期限 `hard`（あれば）を足した版（REPAIR-5・SEC-4。`record_until` 用）。
+///
+/// 待ちの期限は `timeout` と `hard` の早い方、kill 後の回収待ちも `hard` を超えない。`hard` までに回収できない
+/// 子は待たずに [`pending`] へ追跡して戻る（未回収の 1 件として数え、後続の呼び出しで回収する。ゾンビは
+/// [`MAX_UNREAPED`] で頭打ちのため無制限には増えない。fail-closed の向き）。
+#[cfg(target_os = "linux")]
+fn run_isolated_until(
+    timeout: Duration,
+    hard: Option<Instant>,
+    child: impl FnOnce(&dyn Fn()) -> i32,
+) -> Isolated {
     use std::io::Write as _;
     use std::os::fd::AsFd;
     if pending::reap_and_count() >= MAX_UNREAPED {
@@ -431,7 +446,8 @@ fn run_isolated(timeout: Duration, child: impl FnOnce(&dyn Fn()) -> i32) -> Isol
     };
     // 回収前に開くので、以後 pid が回収・再利用されても元の子を指す。開けなければ `None`（kill(2) へ退避）。
     let pidfd = sys::pidfd_open(pid).ok();
-    let deadline = Instant::now() + timeout;
+    let clamp = |t: Instant| hard.map_or(t, |h| t.min(h));
+    let deadline = clamp(Instant::now() + timeout);
     loop {
         match sys::wait_pid_nohang(pid) {
             Ok(Some(status)) => return settle(&rx, decode_status(status)),
@@ -451,7 +467,8 @@ fn run_isolated(timeout: Duration, child: impl FnOnce(&dyn Fn()) -> i32) -> Isol
         if Instant::now() >= deadline {
             break;
         }
-        std::thread::sleep(POLL_INTERVAL);
+        let left = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(POLL_INTERVAL.min(left));
     }
     // 期限超過。pidfd 経由で送る。無ければ未回収の自分の子であることを確かめてから kill(2) する。
     match &pidfd {
@@ -466,12 +483,13 @@ fn run_isolated(timeout: Duration, child: impl FnOnce(&dyn Fn()) -> i32) -> Isol
             Err(_) => return settle(&rx, IsolatedOutcome::TimedOut),
         },
     }
-    let reap_deadline = Instant::now() + KILL_REAP_WAIT;
+    let reap_deadline = clamp(Instant::now() + KILL_REAP_WAIT);
     while Instant::now() < reap_deadline {
         if !matches!(sys::wait_pid_nohang(pid), Ok(None)) {
             return settle(&rx, IsolatedOutcome::TimedOut);
         }
-        std::thread::sleep(POLL_INTERVAL);
+        let left = reap_deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(POLL_INTERVAL.min(left));
     }
     // SIGKILL でも回収できない子（D 状態等）。追跡して後続の呼び出しで回収する。
     pending::track(pid, pidfd);
@@ -482,6 +500,16 @@ fn run_isolated(timeout: Duration, child: impl FnOnce(&dyn Fn()) -> i32) -> Isol
 /// 呼び出し側は主経路を `IsolationUnavailable` として代替経路へ進む。
 #[cfg(not(target_os = "linux"))]
 fn run_isolated(_timeout: Duration, _child: impl FnOnce(&dyn Fn()) -> i32) -> Isolated {
+    Isolated::not_run(IsolatedOutcome::Failed)
+}
+
+/// 非 Linux では [`run_isolated`] と同じく常に `Failed`。
+#[cfg(not(target_os = "linux"))]
+fn run_isolated_until(
+    _timeout: Duration,
+    _hard: Option<Instant>,
+    _child: impl FnOnce(&dyn Fn()) -> i32,
+) -> Isolated {
     Isolated::not_run(IsolatedOutcome::Failed)
 }
 
@@ -614,12 +642,16 @@ fn isolated_notifier(out: NotifyOut, wait: Duration) -> FailureNotifier {
         let out = Arc::clone(&out);
         thread_line_emitter(move || out(), NOTIFY_QUEUE_CAP, wait)
     };
-    Arc::new(move |failure| {
+    Arc::new(move |failure, hard| {
+        if hard.is_some_and(|h| Instant::now() >= h) {
+            // 期限が尽きていれば開始しない（通知は欠ける。呼び出し側は Timeout を返す。REPAIR-5）。
+            return;
+        }
         let mut line = Vec::new();
         if failure.write_json_line(&mut line).is_err() {
             return;
         }
-        let run = run_isolated(wait, |mark_started| {
+        let run = run_isolated_until(wait, hard, |mark_started| {
             let mut sink = out();
             mark_started();
             match sink.write_all(&line).and_then(|()| sink.flush()) {
@@ -629,12 +661,12 @@ fn isolated_notifier(out: NotifyOut, wait: Duration) -> FailureNotifier {
         });
         match notify_retry(run) {
             NotifyRetry::Skip => {}
-            NotifyRetry::Line => threaded(line),
+            NotifyRetry::Line => threaded(line, hard),
             NotifyRetry::AfterNewline => {
                 let mut separated = Vec::with_capacity(line.len().saturating_add(1));
                 separated.push(b'\n');
                 separated.extend_from_slice(&line);
-                threaded(separated);
+                threaded(separated, hard);
             }
         }
     })
@@ -653,7 +685,7 @@ impl Write for StderrLine {
 }
 
 /// 符号化済みの通知（1 行分のバイト列）を出す関数。
-type LineEmitter = Arc<dyn Fn(Vec<u8>) + Send + Sync>;
+type LineEmitter = Arc<dyn Fn(Vec<u8>, Option<Instant>) + Send + Sync>;
 
 /// 呼び出しプロセスの現在のスレッド数（Linux 以外は数えない）。
 fn current_threads() -> Option<u64> {
@@ -672,11 +704,14 @@ fn current_threads() -> Option<u64> {
 ///
 /// 起動前の数を基準にするのは、複数スレッドのプロセス（libtest 等）では 1 に戻らないため。数えられなければ
 /// 待たない。上限を超えても失敗にはしない（続く fork が `MultiThreaded` で拒否される fail-closed の向き）。
-fn wait_thread_released(baseline: Option<u64>) {
+fn wait_thread_released(baseline: Option<u64>, hard: Option<Instant>) {
     let Some(baseline) = baseline else {
         return;
     };
-    let deadline = Instant::now() + NOTIFY_THREAD_EXIT_WAIT;
+    let mut deadline = Instant::now() + NOTIFY_THREAD_EXIT_WAIT;
+    if let Some(h) = hard {
+        deadline = deadline.min(h);
+    }
     while current_threads().is_some_and(|n| n > baseline) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -695,7 +730,11 @@ fn thread_line_emitter(
 ) -> LineEmitter {
     let make = Arc::new(make);
     let in_flight = Arc::new(AtomicUsize::new(0));
-    Arc::new(move |line: Vec<u8>| {
+    Arc::new(move |line: Vec<u8>, hard: Option<Instant>| {
+        // 期限が尽きていれば開始しない（REPAIR-5）。
+        if hard.is_some_and(|h| Instant::now() >= h) {
+            return;
+        }
         // 満杯なら待たずに捨てる。
         if in_flight.fetch_add(1, Ordering::AcqRel) >= cap {
             in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -718,9 +757,12 @@ fn thread_line_emitter(
         match spawned {
             Ok(handle) => {
                 // 完了を確認できたら join してスレッドを確実に消す。時間切れなら切り離す。
+                let wait = hard.map_or(wait, |h| {
+                    wait.min(h.saturating_duration_since(Instant::now()))
+                });
                 if ack_rx.recv_timeout(wait).is_ok() {
                     let _ = handle.join();
-                    wait_thread_released(baseline);
+                    wait_thread_released(baseline, hard);
                 }
             }
             Err(_) => {
@@ -738,10 +780,10 @@ fn notifier_to(
     wait: Duration,
 ) -> FailureNotifier {
     let emit = thread_line_emitter(make, cap, wait);
-    Arc::new(move |failure| {
+    Arc::new(move |failure, hard| {
         let mut line = Vec::new();
         if failure.write_json_line(&mut line).is_ok() {
-            emit(line);
+            emit(line, hard);
         }
     })
 }
@@ -902,23 +944,27 @@ impl FileAuditSink {
 
     /// 主経路を 1 回試す。隔離した子の結果（終了コード・時間切れ・fork 不能）を主経路の失敗へ写す。
     fn write_primary(&self, record: &AuditRecord) -> Result<(), AuditWriteError> {
-        self.write_primary_capped(record, None)
+        self.write_primary_capped(record, None, None)
     }
 
-    /// [`Self::write_primary`] の子の待ちを `cap`(あれば)へ絞った版(REPAIR-5)。
+    /// [`Self::write_primary`] の子の待ちを `cap`(あれば)へ絞り、kill 後の回収待ちも絶対期限 `hard`(あれば)を
+    /// 超えないようにした版(REPAIR-5)。
     fn write_primary_capped(
         &self,
         record: &AuditRecord,
         cap: Option<Duration>,
+        hard: Option<Instant>,
     ) -> Result<(), AuditWriteError> {
         match self.isolation {
             #[cfg(test)]
             Isolation::InProcess => (self.primary)(&self.path, record),
             Isolation::Process { timeout } => {
                 let timeout = cap.map_or(timeout, |c| timeout.min(c));
-                let run = run_isolated(timeout, |_| match (self.primary)(&self.path, record) {
-                    Ok(()) => 0,
-                    Err(e) => kind_to_exit(e.kind()),
+                let run = run_isolated_until(timeout, hard, |_| {
+                    match (self.primary)(&self.path, record) {
+                        Ok(()) => 0,
+                        Err(e) => kind_to_exit(e.kind()),
+                    }
                 });
                 primary_result(run.outcome)
             }
@@ -944,12 +990,15 @@ impl AuditSink for FileAuditSink {
             Ok(()) => return Ok(()),
             Err(fb) => AuditWriteFailure::new(primary, fb),
         };
-        (self.notify)(&failure);
+        (self.notify)(&failure, None);
         Err(TraitError::new(failure.error_code(), failure.message()))
     }
 
-    /// 主経路の子の待ちを残り時間へ絞り、期限が尽きていれば代替経路へ進まず `Timeout` を返す(REPAIR-5)。
-    /// 代替経路の ACK 待ち(上限 [`KERNEL_AUDIT_ACK_TIMEOUT`])は絞れないため、期限を最大でその分超え得る。
+    /// 全段階(主経路の子の待ちと kill 後の回収待ち・代替経路の ACK 待ち・失敗通知)に同じ絶対期限を通す
+    /// (REPAIR-5・SEC-4)。残り時間が無い段階は開始せず `Timeout` を返す。
+    ///
+    /// 回収待ちが期限を超える子は待たずに追跡へ回す(未回収として数え、後続の呼び出しで回収する)。
+    /// 戻りは期限 + ポーリング間隔・スケジューリングの端数以内(代替経路の送信 `send` は非ブロッキング前提)。
     fn record_until(&self, record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
         let timed_out = || {
             TraitError::new(
@@ -961,7 +1010,7 @@ impl AuditSink for FileAuditSink {
         if remaining.is_zero() {
             return Err(timed_out());
         }
-        let primary = match self.write_primary_capped(record, Some(remaining)) {
+        let primary = match self.write_primary_capped(record, Some(remaining), Some(deadline)) {
             Ok(()) => return Ok(()),
             Err(primary) => primary,
         };
@@ -969,11 +1018,15 @@ impl AuditSink for FileAuditSink {
             return Err(timed_out());
         }
         let mut fallback = (self.fallback)();
-        let failure = match fallback.record_fallback(record, &primary) {
+        let failure = match fallback.record_fallback_until(record, &primary, deadline) {
             Ok(()) => return Ok(()),
             Err(fb) => AuditWriteFailure::new(primary, fb),
         };
-        (self.notify)(&failure);
+        // 代替経路の待ちで期限が尽きていれば、通知は開始せず Timeout を返す(通知は欠ける)。
+        (self.notify)(&failure, Some(deadline));
+        if Instant::now() >= deadline {
+            return Err(timed_out());
+        }
         Err(TraitError::new(failure.error_code(), failure.message()))
     }
 }
@@ -999,7 +1052,7 @@ mod tests {
             // 直接の親は group/other 書き込み不可でなければ拒否される（umask に依らず 0700 にする）。
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let noop: FailureNotifier = Arc::new(|_| {});
+        let noop: FailureNotifier = Arc::new(|_, _| {});
         let fb: FallbackFactory = Arc::new(|| Box::new(NoAuditFallback));
         let bad = FileAuditSink::with_parts(dir.join("dirlog"), Arc::clone(&fb), Arc::clone(&noop));
         assert_eq!(
@@ -1065,7 +1118,7 @@ mod tests {
                     ok,
                 })
             }),
-            Arc::new(move |f| {
+            Arc::new(move |f, _| {
                 let mut g = n.lock().unwrap();
                 f.write_json_line(&mut *g).unwrap();
             }),
@@ -1118,7 +1171,7 @@ mod tests {
     #[test]
     fn sec4_task163_both_fail_keeps_rejection() {
         let f: FallbackFactory = Arc::new(|| Box::new(NoAuditFallback));
-        let sink = FileAuditSink::with_parts(missing_path(), f, Arc::new(|_| {}));
+        let sink = FileAuditSink::with_parts(missing_path(), f, Arc::new(|_, _| {}));
         let r = record_mount_rejection("denied", None, None, &sink);
         assert_eq!(r.error, "denied");
         assert!(matches!(
@@ -1227,6 +1280,41 @@ mod tests {
             start.elapsed()
         );
         drop(hold_tx);
+    }
+
+    /// REPAIR-5・SEC-4: 通知先が詰まり、代替経路も失敗しても、`record_until` は渡された絶対期限 + 小さな許容差
+    /// 以内に `Timeout` で戻る(通知の出し直しの待ち `wait` が 5 秒でも期限へ絞られる)。
+    #[test]
+    fn repair5_sec4_record_until_returns_within_deadline_with_stuck_notifier() {
+        let (hold_tx, hold_rx) = mpsc::channel::<()>();
+        let hold_rx = Arc::new(Mutex::new(hold_rx));
+        let notify = notifier_to(
+            move || Box::new(Stuck(Arc::clone(&hold_rx))),
+            2,
+            Duration::from_secs(5),
+        );
+        let f: FallbackFactory = Arc::new(|| Box::new(NoAuditFallback));
+        let sink = FileAuditSink::with_parts(missing_path(), f, notify);
+        let budget = Duration::from_millis(150);
+        let start = Instant::now();
+        let e = sink.record_until(&sample(), start + budget).unwrap_err();
+        let took = start.elapsed();
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert!(took >= budget, "{took:?}");
+        assert!(took < budget + Duration::from_millis(250), "{took:?}");
+        drop(hold_tx);
+    }
+
+    /// 期限を見ずに待つ代替経路(既定の `record_fallback_until` は委譲のみ)を、期限切れ後は呼ばない。
+    #[test]
+    fn repair5_sec4_record_until_skips_fallback_and_notify_after_deadline() {
+        let (sink, calls, notes) = sink_with(missing_path(), true);
+        let e = sink
+            .record_until(&sample(), Instant::now() - Duration::from_millis(1))
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert!(calls.lock().unwrap().is_empty());
+        assert!(notes.lock().unwrap().is_empty());
     }
 
     /// REPAIR-5・SEC-4・TASK-163: 隔離した子の終了コードと主経路の失敗種別が往復し、未知のコードは `Write`。

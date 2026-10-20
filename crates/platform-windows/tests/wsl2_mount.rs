@@ -399,6 +399,49 @@ fn recover_leaves_other_containers_alone() {
     assert_eq!(mounted(&exe), ["/mnt/fandhe/data"]);
 }
 
+/// 偽 `wsl.exe` のゲスト内の記録に、所有者欄が `marker`（`@legacy` / `@bad`）の行を直接足す。
+fn add_marked_record(exe: &Path, marker: &str) {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(exe.with_extension("records"))
+        .unwrap();
+    writeln!(f, "00ee\t99\t/mnt/fandhe/old\t{marker}").unwrap();
+}
+
+/// WIN-2・PLUG-7（#1412）: 旧形式 1 行の記録が混在しても、新形式の所有者の回収は成功する。壊れた記録は拒否する。
+#[test]
+fn recover_skips_legacy_record_but_rejects_bad_record() {
+    let exe = fresh_fake("mount_recover_other");
+    let p = prepare_virtiofs_launch_with_program(
+        &exe,
+        VirtiofsState::Enabled,
+        &owned_request("web", "C:\\work", "work"),
+        TIMEOUT,
+    )
+    .unwrap();
+    drop(p);
+    add_marked_record(&exe, "@legacy");
+    let web = OwnerId::parse("web").unwrap();
+    let report = release_container_mounts_with_program(&exe, &ubuntu(), &web, TIMEOUT).unwrap();
+    assert_eq!((report.found, report.released), (1, 1));
+    assert!(mounted(&exe).is_empty());
+
+    let p = prepare_virtiofs_launch_with_program(
+        &exe,
+        VirtiofsState::Enabled,
+        &owned_request("web", "C:\\work", "work"),
+        TIMEOUT,
+    )
+    .unwrap();
+    drop(p);
+    add_marked_record(&exe, "@bad");
+    let e = release_container_mounts_with_program(&exe, &ubuntu(), &web, TIMEOUT).unwrap_err();
+    assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+    assert_eq!(mounted(&exe), ["/mnt/fandhe/work"]);
+}
+
 /// REPAIR-5（#1412 の A4）: 回収は検索・mountinfo の読み取り・各 umount で 1 つの合計期限を共有する。偽 `wsl.exe`
 /// （`mount_recover_slow`）は検索と全 mountinfo の応答前に 600 ms ずつ眠るため、合計期限 1 秒では検索（600 ms 以上）の
 /// 後に残る 400 ms 未満で mountinfo を読み切れず `TIMEOUT` で止まり、何も外さない（呼び出しごとに 1 秒を持つ実装では

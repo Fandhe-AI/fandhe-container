@@ -1915,7 +1915,9 @@ fn release_recorded(
 /// `lock.*`・`*.tmp`・`*.claim`・`*.done` は読まない。各エントリは symlink でない通常ファイルで root 所有・
 /// 他者書き込み不可のものだけを読む。所有者で絞る前に、全エントリについて「512 バイト未満で、空でない
 /// ちょうど 3 行（`read` がすべて成功し 4 行目が無い）」を検証し、行の欠落・余分な行・上限での切り詰め・読み取り
-/// 失敗は `bad <nonce>` で報告する（所有者が別でも形式違反は黙って落とさない。#1412）。形式を満たし 3 行目
+/// 失敗は `bad <nonce>` で報告する（所有者が別でも形式違反は黙って落とさない。#1412）。ただし、旧形式の記録
+/// （マウント ID の 10 進または `none` だけの 1 行。WSL を再起動せずに更新すると残る）は所有者を持たないため
+/// `old <nonce>` で報告して読み飛ばす（`bad` にしない。他のコンテナの回収を止めない）。形式を満たし 3 行目
 /// （所有者）が `$1` と一致するものを `rec <nonce> <マウント ID|none> <マウント先>` の 1 行で出力する。基準を満たさないエントリは読まずに
 /// `bad <nonce>` の行で報告する（ホスト側 [`parse_lookup_output`] が改ざんとして扱い、何も外さない）。
 ///
@@ -1938,6 +1940,9 @@ const LOOKUP_SCRIPT: &str = concat!(
     "n=$((n + 1)); [ \"$n\" -le 4096 ] || exit 215; ",
     "if ! fchk \"$f\"; then printf 'bad %s\\n' \"$b\"; continue; fi; ",
     "[ \"$(stat -c %s -- \"$f\")\" -lt 512 ] || { printf 'bad %s\\n' \"$b\"; continue; }; ",
+    "if { IFS= read -r a && ! IFS= read -r t; } < \"$f\" 2>/dev/null && ",
+    "{ [ \"$a\" = none ] || case \"$a\" in \"\"|*[!0-9]*) false ;; *) true ;; esac; }; then ",
+    "printf 'old %s\\n' \"$b\"; continue; fi; ",
     "x=; if { IFS= read -r a && IFS= read -r t && IFS= read -r o && ! IFS= read -r x ",
     "&& [ -z \"$x\" ] && [ -n \"$a\" ] && [ -n \"$t\" ] && [ -n \"$o\" ]; } < \"$f\" 2>/dev/null; then ",
     "if [ \"$o\" = \"$O\" ]; then printf 'rec %s %s %s\\n' \"$b\" \"$a\" \"$t\"; fi; ",
@@ -1970,6 +1975,8 @@ struct LookupOutput {
     records: Vec<RecoveredRecord>,
     /// `bad` の行・形式違反・マウント先が固定基底配下の検証済み名でないもの・重複の件数。1 件でもあれば何も外さない。
     rejected: usize,
+    /// `old` の行（旧形式 1 行の正常な記録）の件数。所有者を持たないので回収の対象外で、触れない。
+    legacy: usize,
 }
 
 /// 記録のマウント先が `<GUEST_MOUNT_BASE>/<MountName>` の形（`..`・`/`・基底の外を含まない）か。
@@ -2001,6 +2008,10 @@ fn parse_lookup_output(bytes: &[u8]) -> Result<LookupOutput, Wsl2Error> {
         }
         let fields: Vec<&str> = line.split(' ').collect();
         let rec = match fields.as_slice() {
+            ["old", nonce] if parse_nonce(nonce) => {
+                out.legacy += 1;
+                continue;
+            }
             ["rec", nonce, id, target] => parse_record(nonce, id, target),
             _ => None,
         };
@@ -2025,13 +2036,16 @@ fn parse_lookup_output(bytes: &[u8]) -> Result<LookupOutput, Wsl2Error> {
     Ok(out)
 }
 
-fn parse_record(nonce: &str, id: &str, target: &str) -> Option<RecoveredRecord> {
-    let nonce_ok = !nonce.is_empty()
+fn parse_nonce(nonce: &str) -> bool {
+    !nonce.is_empty()
         && nonce.len() <= MAX_NONCE_LEN
         && nonce
             .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    if !nonce_ok {
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn parse_record(nonce: &str, id: &str, target: &str) -> Option<RecoveredRecord> {
+    if !parse_nonce(nonce) {
         return None;
     }
     let mount_id = if id == "none" {
@@ -2805,6 +2819,8 @@ mod tests {
         meta: std::collections::HashMap<String, (String, String)>,
         /// LOOKUP_SCRIPT の模擬が `bad <nonce>` で報告する nonce（symlink・root 以外の所有の記録の模擬）。
         lookup_bad: Vec<String>,
+        /// 検索が `old <nonce>`（旧形式 1 行の記録）として報告する nonce。
+        lookup_old: Vec<String>,
         /// `Some(code)` なら LOOKUP_SCRIPT の模擬がその終了コードで失敗する。
         lookup_exit: Option<i32>,
         /// LOOKUP_SCRIPT の呼び出し回数。
@@ -2893,6 +2909,7 @@ mod tests {
                 records: std::collections::HashMap::new(),
                 meta: std::collections::HashMap::new(),
                 lookup_bad: vec![],
+                lookup_old: vec![],
                 lookup_exit: None,
                 lookups: 0,
                 claims: std::collections::HashSet::new(),
@@ -3246,6 +3263,9 @@ mod tests {
                     }
                     for n in &self.lookup_bad {
                         text.push_str(&format!("bad {n}\n"));
+                    }
+                    for n in &self.lookup_old {
+                        text.push_str(&format!("old {n}\n"));
                     }
                     ok(text)
                 }
@@ -4838,6 +4858,29 @@ mod tests {
         assert!(g.umounts.is_empty());
         assert!(g.mounts.iter().any(|(p, _)| p == "/mnt/fandhe/a"));
         assert_eq!(g.records.len(), 1);
+    }
+
+    /// #1412: 旧形式 1 行の記録（`old` の報告）は所有者を持たないので読み飛ばし、別コンテナの回収を止めない。
+    /// 壊れた記録（`bad`）は従来どおり拒否する。
+    #[test]
+    fn recover_skips_legacy_records_but_rejects_bad_ones() {
+        let mut g = Guest::new("virtiofs");
+        drop(prepare_owned(&mut g, "web", vec![sm("C:\\a", "a", false)]));
+        g.lookup_old.push("00aa".to_string());
+        assert_eq!(recover(&mut g, "web").unwrap().released, 1);
+        assert!(g.umounts.contains(&"/mnt/fandhe/a".to_string()));
+
+        let mut g = Guest::new("virtiofs");
+        drop(prepare_owned(&mut g, "web", vec![sm("C:\\a", "a", false)]));
+        g.lookup_old.push("00aa".to_string());
+        g.lookup_bad.push("00ff".to_string());
+        let e = recover(&mut g, "web").unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), failed_validation(1));
+        assert!(g.umounts.is_empty());
+
+        let out = parse_lookup_output(b"old 00aa\nold zz\n").unwrap();
+        assert_eq!((out.legacy, out.rejected), (1, 1));
     }
 
     /// SEC・WIN-2（A3）: 改ざんされた記録（`bad` の報告・不正なマウント先・形式違反）が 1 件でもあれば、

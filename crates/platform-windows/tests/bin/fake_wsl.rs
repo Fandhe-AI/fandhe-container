@@ -233,10 +233,16 @@ fn guest_exec(mode: &str, cmd: &[&str]) -> ExitCode {
             let Some(records) = load_records() else {
                 return ExitCode::from(3);
             };
+            // 所有者欄が `@legacy`（旧形式 1 行の記録）・`@bad`（壊れた記録）の行は、所有者に依らず
+            // それぞれ `old <nonce>`・`bad <nonce>` で報告する（検索スクリプトの模擬）。
             let text: String = records
                 .iter()
-                .filter(|r| r.3 == *owner)
-                .map(|(n, id, t, _)| format!("rec {n} {id} {t}\n"))
+                .filter_map(|(n, id, t, o)| match o.as_str() {
+                    "@legacy" => Some(format!("old {n}\n")),
+                    "@bad" => Some(format!("bad {n}\n")),
+                    _ if o == *owner => Some(format!("rec {n} {id} {t}\n")),
+                    _ => None,
+                })
                 .collect();
             emit(text.as_bytes(), 0)
         }

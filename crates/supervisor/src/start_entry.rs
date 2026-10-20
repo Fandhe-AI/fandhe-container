@@ -2555,6 +2555,9 @@ mod linux {
         // helper は fork 子で親にスレッドを増やさない）。失敗の記録は常駐スレッドを作れる launch の後まで保留する。
         let relay = crate::exec::default_audit_sink(Some(args.root.clone()))
             .and_then(fandhe_container_core::audit_log::ControlAuditRelay::spawn)
+            // sink と helper を作れただけでは記録できるとは限らない（`@audit.log` がディレクトリ等だと記録時に初めて失敗する）。
+            // 起動前に helper へ保存先を開かせ、期限つきで確かめる。開けなければ記録経路なしとして起動を拒否する（SEC-4・#2027）。
+            .and_then(|relay| relay.probe().map(|()| relay))
             .map_err(|e| e.code());
         // helper は fork 時点で委譲 cgroup に属するため、cgroup の準備（自プロセスの退避）へ同伴プロセスとして宣言し、
         // 一緒に退避リーフへ移す（宣言しないと「他のプロセスがいる」として起動が拒否される。CORE-3・SUP-1）。

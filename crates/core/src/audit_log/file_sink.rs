@@ -871,6 +871,31 @@ impl FileAuditSink {
         }
     }
 
+    /// 主経路の保存先を、記録を 1 件も書かずに開けるかだけ確かめる（起動前の記録経路の確認。SEC-4・REPAIR-5・#2027）。
+    ///
+    /// 隔離した子で [`AuditFileWriter::open`] と同じ検査つきの open を行い、時間切れは `PRIMARY_WRITE_TIMEOUT` で打ち切る。
+    /// `@audit.log` がディレクトリ・symlink・権限不足などで開けなければ失敗を返す。代替経路（カーネル監査）は書かずに
+    /// 確かめられないため対象外で、確かめられるのは主経路だけ（呼び出し元は失敗を起動拒否に使う）。
+    pub fn probe_primary(&self) -> Result<(), TraitError> {
+        let fail = |_: AuditWriteError| {
+            TraitError::new(
+                crate::traits::ErrorCode::Unavailable,
+                "the audit log cannot be opened for appending",
+            )
+        };
+        match self.isolation {
+            #[cfg(test)]
+            Isolation::InProcess => AuditFileWriter::open(&self.path).map(drop).map_err(fail),
+            Isolation::Process { timeout } => {
+                let run = run_isolated(timeout, |_| match AuditFileWriter::open(&self.path) {
+                    Ok(_) => 0,
+                    Err(e) => kind_to_exit(e.kind()),
+                });
+                primary_result(run.outcome).map_err(fail)
+            }
+        }
+    }
+
     /// 主経路を 1 回試す。隔離した子の結果（終了コード・時間切れ・fork 不能）を主経路の失敗へ写す。
     fn write_primary(&self, record: &AuditRecord) -> Result<(), AuditWriteError> {
         match self.isolation {
@@ -918,6 +943,31 @@ mod tests {
     };
     use crate::traits::ErrorCode;
     use std::sync::Mutex;
+
+    /// SEC-4・#2027: 保存先がディレクトリなら `probe_primary` は失敗し、通常ファイルなら記録を書かずに成功する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2027_probe_primary_fails_when_audit_log_is_a_directory() {
+        let dir = std::env::temp_dir().join(format!("fc-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("dirlog")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // 直接の親は group/other 書き込み不可でなければ拒否される（umask に依らず 0700 にする）。
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let noop: FailureNotifier = Arc::new(|_| {});
+        let fb: FallbackFactory = Arc::new(|| Box::new(NoAuditFallback));
+        let bad = FileAuditSink::with_parts(dir.join("dirlog"), Arc::clone(&fb), Arc::clone(&noop));
+        assert_eq!(
+            bad.probe_primary().unwrap_err().code(),
+            ErrorCode::Unavailable
+        );
+        let ok = FileAuditSink::with_parts(dir.join("audit.log"), fb, noop);
+        ok.probe_primary().unwrap();
+        assert_eq!(std::fs::metadata(dir.join("audit.log")).unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn sample() -> AuditRecord {
         AuditRecord::new(

@@ -267,7 +267,7 @@ impl AuditCoverage {
 
 /// ホストのカーネル監査まわりの観測値(読めなかったものは `None`)。
 ///
-/// 値を持たせるだけの素の構造体で、試験は fixture から作る。Linux では [`Self::read_host`] が procfs から読む。
+/// 値を持たせるだけの素の構造体で、試験は fixture から作る。Linux では `Self::read_host` が procfs から読む。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct KernelAuditProbe {
     /// `/proc/sys/kernel/seccomp/actions_logged` の内容(空白区切りの語彙)。

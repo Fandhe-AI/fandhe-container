@@ -53,6 +53,8 @@ const REAP_WAIT: Duration = Duration::from_secs(1);
 
 /// seccomp の記録を示す先頭バイト（`REJECTIONS` の添字と重ならない値）。コンテナ ID の後に syscall 番号（u32）と arch（u32）が付く。
 const TAG_SECCOMP: u8 = 0x80;
+/// 記録先の確認要求を示す先頭バイト（本体は固定部だけ。何も書かず、helper の sink が保存先を開けるかだけを確かめる）。
+const TAG_PROBE: u8 = 0x81;
 /// seccomp の枠だけが持つ追加部（番号 4・arch 4）。
 const SECCOMP_EXTRA_LEN: usize = 8;
 
@@ -173,7 +175,11 @@ fn serve(mut stream: UnixStream, sink: &FileAuditSink) -> i32 {
         {
             return 1;
         }
-        let ok = decode(&frame).is_some_and(|r| sink.record(&r).is_ok());
+        let ok = if head.first() == Some(&TAG_PROBE) {
+            id_len == 0 && sink.probe_primary().is_ok()
+        } else {
+            decode(&frame).is_some_and(|r| sink.record(&r).is_ok())
+        };
         if stream
             .write_all(&[if ok { ACK_OK } else { ACK_FAIL }])
             .is_err()
@@ -291,9 +297,21 @@ fn kill_if_unreaped<E>(
     true
 }
 
-impl AuditSink for ControlAuditRelay {
-    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
-        let frame = encode(record)?;
+impl ControlAuditRelay {
+    /// helper に記録先（`@audit.log`）を開けるかを期限つきで確かめさせる。記録は 1 件も書かない（SEC-4・REPAIR-5・#2027）。
+    ///
+    /// 呼び出し元: supervisor の `start`（記録経路を前提に起動してよいかの確認。失敗なら起動を拒否する）。応答が無ければ
+    /// [`AuditSink::record`] と同じく helper を SIGKILL して `Timeout`、開けなければ `Internal` を返す。
+    pub fn probe(&self) -> Result<(), TraitError> {
+        let mut frame = vec![0u8; FIXED_LEN];
+        if let Some(tag) = frame.first_mut() {
+            *tag = TAG_PROBE;
+        }
+        self.exchange(&frame)
+    }
+
+    /// 枠を helper へ送り、応答を [`RECORD_WAIT_LIMIT`] まで待つ。
+    fn exchange(&self, frame: &[u8]) -> Result<(), TraitError> {
         let Ok(mut state) = self.state.lock() else {
             return Err(err(ErrorCode::Internal, "the audit relay lock is poisoned"));
         };
@@ -309,7 +327,7 @@ impl AuditSink for ControlAuditRelay {
             .stream
             .set_write_timeout(Some(RECORD_WAIT_LIMIT))
             .is_ok()
-            && state.stream.write_all(&frame).is_ok();
+            && state.stream.write_all(frame).is_ok();
         let remaining = deadline
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
@@ -333,6 +351,13 @@ impl AuditSink for ControlAuditRelay {
                 "the audit record was not persisted",
             ))
         }
+    }
+}
+
+impl AuditSink for ControlAuditRelay {
+    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+        let frame = encode(record)?;
+        self.exchange(&frame)
     }
 }
 

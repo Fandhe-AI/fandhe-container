@@ -11,29 +11,53 @@
 //!   EACCES（Landlock 適用下）で拒否されることを確認する。EACCES は DAC でも返り得るため層の厳密な証跡ではない
 //! - ESC-02（ホスト PID namespace）: 監査記録は要求しない（拒否ではなく不可視であることの観測）
 //! - ESC-03（`mount(2)`）: 拒否主体は組み込み seccomp の `ERRNO(EPERM)`（と capability 削減）
-//! - 監査（SEC-4）: 本番の監査配送経路（`AuditSink` を fork 後の子へ渡す経路・seccomp ERRNO の報告経路）は
-//!   未配線のため、攻撃コード自身が記録ヘルパを呼んで記録を作る方式は監査成功の証拠にならない。
-//!   ESC-01・03 は `AuditExpectation::Deferred` とし、監査レコードの有無を合否に使わない（攻撃の拒否検証と
-//!   監査配送経路の検証を分離）。ヘルパ自体の契約は core 側ユニットテストが担う。配送経路の配線後に
-//!   本番経路の実出力を回収して照合する `Required` へ切り替える
+//! - 監査（SEC-4）: 攻撃コード自身が記録ヘルパを呼んで作った記録は監査成功の証拠にならない。監査の証拠は
+//!   コンテナの外で回収した本番の配送経路の出力だけで、子の記録（pipe）の `audit=` 行は拒否する。
+//!   ESC-03 は `USER_NOTIF` 版の filter の通知を応答者が本番の記録先へ記録した `@audit.log` の行、ESC-01 は
+//!   カーネル監査の `LANDLOCK_ACCESS`（opt-in の段）で照合する（#2028。下の「監査の照合」節）
 //!
 //! # 共通関数の流れ（コンテナ起動 → 攻撃 → 判定 → 後始末）
 //! `linux::run_case`（ディスパッチャ）が排他作成した一時 rootfs を用意し、自身を
 //! `--scenario <case-id> <rootfs>` で再起動する（`unshare(CLONE_NEWPID)` の後に PID 1 になれるのは最初の
 //! 子だけのため、ケースごとに別プロセスにする）。シナリオは分離（`isolate`）→
 //! `spawn_container_probe`（制限ステージ通過後の子で攻撃クロージャを実行）→ 子の終了待ち（期限付き）→
-//! 子が pipe へ書いた記録（攻撃の結果・監査レコード）の回収 → `judge` による判定を行い、終了後に
-//! rootfs を削除する。結果は構造化型（`CaseVerdict`）で返す。
+//! 子が pipe へ書いた記録（攻撃の結果のみ）の回収 → stdout の 1 行（`escape_suite-meta`。終了状態・結果・
+//! 子の pid・開始時刻）でディスパッチャへ報告する。ディスパッチャが本番の監査記録を回収して `judge` で判定し、
+//! 終了後に rootfs と状態ルートを削除する。結果は構造化型（`CaseVerdict`）で返す。
 //!
 //! # 判定の対象
 //! - 攻撃の結果: 許可された結果の集合（`Expectation::allowed`）に入るか。ESC-06 のようにシグナル終了を
 //!   期待するケースは `Expectation::signal` で指定する
-//! - 監査ログ: `AuditExpectation::Required(layer)` のケースは、そのレイヤーの記録が 0 件なら必ず失敗する。
-//!   `AuditExpectation::Deferred(layer)` は spec 上は要求するが本番の配送経路が未配線のため合否に使わない。
-//!   監査ログの本番配線（`AuditSink` を fork 後の子へ渡す経路）は未実装（REPAIR-3）のため、現状は攻撃
-//!   クロージャが記録ヘルパで作った記録は ESC-07 など一部ケースの暫定方式であり、ESC-10 は
-//!   `Deferred`（起動ステージ適用済みの子で追加の Landlock 適用をせず、ステージ自体の回帰を攻撃結果で検出）。
-//!   配線完了後は本番経路の出力を照合する形へ置き換える
+//! - 監査ログ: `AuditExpectation::Required` のケースは、本番の配送経路の出力（`AuditSource`）が期待どおりで
+//!   なければ失敗する。`AuditExpectation::Deferred` は spec 上は要求するが、この試験からは本番の経路を駆動
+//!   できないため合否に使わない（現状は ESC-06 だけ）。判定はコンテナの外（ディスパッチャ）で `judge` が行う
+//!
+//! # 監査の照合（SEC-4・TASK-41 追補・TASK-43・#2028。監査配送 7/7）
+//! - `AuditSource::StateRootLog`（既定の `--ignored` の段。root 不要）: ケースごとに排他作成する 0700 の一時状態ルート
+//!   の `@audit.log` を、シナリオ終了後にディスパッチャが上限つきで回収し、件数（ちょうど）・層・コンテナ ID・
+//!   seccomp 層の syscall 番号と arch と攻撃した子の pid を具体値で照合する。
+//!   - ESC-03: `spawn_container_probe_with_seccomp_listener`（`ErrnoDelivery::UserNotif` ＋ `NEW_LISTENER` ＋ `SCM_RIGHTS`
+//!     による listener の受け渡し〔本番と同じ検証〕）で子を起動し、応答者のスレッドが通知ごとに
+//!     `record_seccomp_denial_for` → `ControlAuditRelay` → `FileAuditSink` で記録して `-EPERM` で応答する。
+//!     応答ループ自体は試験側が core の公開 API だけで組む（supervisor の `SeccompNotifyHub` の試験ではない。
+//!     それは `crates/supervisor/tests/seccomp_notify_audit.rs` が担う）
+//!   - ESC-08（bind の元）: `create` → `start` に、マウント元が rootfs・bundle・状態ルートの bind を渡し、
+//!     本番の `start` の拒否経路（`validate_bind_mounts` → `audit_bind_mount_error` →
+//!     `ProcessLauncher::rejection_audit_sink` → `FileAuditSink`）が出した mount 層の記録を要求ごとに 1 行（計 3 行）
+//!     照合する。launcher は `rejection_audit_sink` を返すだけの最小実装（本番の `ProductionLauncher` は構築に
+//!     ホストの前提を要する）。`ControlAuditRelay` は `Mount` の記録を運ばないため使えない（残余。
+//!     `docs/design/audit-delivery.md`）
+//! - `AuditSource::KernelAudit`（opt-in の段。環境変数 `FANDHE_CONTAINER_TEST_KERNEL_AUDIT=1`）: Landlock の拒否の
+//!   本番の記録はカーネル監査の `AUDIT_LANDLOCK_ACCESS` だけ（core は `LOG_SAME_EXEC_OFF` を渡さない）。ESC-01・ESC-07
+//!   （Landlock 帰属）・ESC-10 は、ホストの `/var/log/audit/audit.log` のケース開始後の追記から、`blockers=` の
+//!   要素・同じイベント連番の `SYSCALL` の `pid`（攻撃した子のホスト pid）・時刻の下限をフィールド完全一致で
+//!   照合する。root か audit ログの読み取り権限・auditd・Landlock ABI 7（Linux 6.15 以降）が要る。
+//!   opt-in なしでは攻撃結果だけを照合し、監査は `verdict=audit-not-verified` として出力する（合格に数えない）。
+//!   opt-in で前提が欠けたら skip せず失敗にする
+//! - 残余（実装済みを装わない。REPAIR-3）: ESC-06（`KILL_PROCESS` の 3 件）の監査は `Deferred`（追跡: #2236・#2237）。
+//!   `USER_NOTIF` では届かず、補助の `exit_signal` は本番 launcher の回収点が出し、正の記録はカーネルの
+//!   `AUDIT_SECCOMP` で fandhe は自前の読み手を持たない。`create` のパース時の destination 拒否は本番で監査されない
+//!   （`audit_mount_config_error` を呼ぶ本番コードが無い）ため `esc-08-config-destination` は攻撃結果だけを照合する
 //!
 //! # 構成
 //! - 常に走る部分（3 OS 共通・既定のテスト集合）: 判定ロジック `judge` と記録パーサの自己テスト
@@ -75,17 +99,13 @@
 //! - ESC-06（禁止 syscall の SIGSYS 強制終了＋監査記録）: SIGSYS での強制終了は spec の期待どおり必須とする。
 //!   現行の CORE-5 フィルタは `unshare`・`ptrace`・`kexec_load` を `SECCOMP_RET_KILL_PROCESS` で拒否する
 //!   （`DeniedSyscall::deny_action`。#1834）ため、子は SIGSYS で終了する。戻って終了コード 0 になれば失敗（fail-closed）。
-//! - ESC-06 の監査（SEC-4）は `AuditExpectation::Deferred("seccomp")` とし、合否に使わない（ESC-03 と同じ扱い）。
-//!   理由: 子が SIGSYS で終了すると子からは記録を書けず、親側で取得できる本番の監査経路がまだない。
-//!   既存の記録経路はどれも使えない。`ExecError::violation`（`IsolationViolation`）は親側の分離確立時の拒否だけを
-//!   表し、seccomp の種別を持たない。`record_seccomp_denial` は SIGSYS の siginfo（`si_syscall`・`si_arch`）か
-//!   USER_NOTIF の通知から作る報告を要するが、その配送元（TRAP の SIGSYS ハンドラ / supervisor の USER_NOTIF
-//!   listener）は未実装で、親が `waitpid` で得られるのは終了シグナルだけである。親側で記録を推測生成すると
-//!   監査の偽造になるため行わない。
-//! - 将来仕様（REPAIR-3）: フィルタのアクションを TRAP / USER_NOTIF へ変える設計判断と配送経路の配線
-//!   （`audit_log/seccomp_hook.rs`）の後に、その本番経路が出力した記録を親側で回収して照合する
-//!   `Required("seccomp")` へ切り替える。`SECCOMP_RET_KILL` 系では子が記録を書く前に終了するため、親側の
-//!   listener か TRAP ハンドラ内の記録が前提になる
+//! - ESC-06 の監査（SEC-4）は `AuditExpectation::Deferred`（追跡: #2236・#2237）とし、合否に使わない。
+//!   理由: `KILL_PROCESS` の 3 件は `USER_NOTIF` に載らず（ERRNO 側の 40 件だけが載る）、子が SIGSYS で終了すると
+//!   子からは記録を書けない。本番の記録は、本番 launcher の回収点が出す補助の `exit_signal`（この試験の入口
+//!   `spawn_container_probe` では作られない）と、カーネルの `AUDIT_SECCOMP`（fandhe は自前の読み手を持たず、
+//!   読み手の設計と複数スレッド・rootless・子孫でも確実に残す条件が #2236・#2237 の結論待ち）である。
+//!   親側で記録を推測生成すると監査の偽造になるため行わない。
+//! - 将来仕様（REPAIR-3）: #2236・#2237 の結論が出たら、その本番経路の出力を回収して照合する `Required` へ切り替える
 //!
 //! # ESC-09・ESC-10（TASK-42.5・#203）
 //! - `esc-09-userns-owner`（SEC-5）: コンテナ内 root が作成したファイルの所有者を、ディスパッチャ（分離なし・
@@ -96,8 +116,8 @@
 //!   subuid 範囲の写像は `rootless_uid_mapping.rs`（TASK-44）の担当で、
 //!   本ケースは既定経路（単一 ID 写像）を対象にする
 //! - `esc-10-landlock-outside`（CORE-5・SEC-4）: readonly root（READ のみ許可）の下で許可外の作成が `EACCES` で
-//!   拒否されること。Landlock ABI 6+（Linux 6.12+）が必須。spec が求める landlock レイヤーの監査記録は、本番の
-//!   配送経路が未配線のため `AuditExpectation::Deferred` とし合否に使わない（SEC-4・REPAIR-3）
+//!   拒否されること。Landlock ABI 6+（Linux 6.12+）が必須。spec が求める landlock レイヤーの監査記録は、
+//!   カーネル監査の `LANDLOCK_ACCESS`（`blockers=fs.make_reg`）を opt-in の段で回収して照合する（SEC-4・#2028）
 //! - `control-esc-10-no-landlock`: 同じ操作が Landlock なしでは成功する否定対照（拒否が DAC 等ではなく Landlock
 //!   に帰属することの裏付け）
 //!
@@ -151,13 +171,19 @@ const ESC05_EXPECT: Expectation = Expectation {
 
 /// ESC-06 の期待（SEC-2・SEC-4・TASK-42.3・MS-2）。SIGSYS での強制終了を要求する。
 ///
-/// spec は seccomp 監査記録も要求するが、子が SIGSYS で終了した後に親側で取得できる本番の監査経路がまだ
-/// ないため、監査は `Deferred("seccomp")` とし合否に使わない（ESC-03 と同じ扱い。SEC-4・REPAIR-3）。
-/// 経路の配線後に `Required("seccomp")` へ切り替える（詳細はモジュール doc の ESC-04〜ESC-06 節）。
+/// spec は seccomp 監査記録も要求するが、`KILL_PROCESS` の 3 件は子が SIGSYS で終了するため `USER_NOTIF` では
+/// 届かず、正の記録はカーネルの `AUDIT_SECCOMP`（fandhe は自前の読み手を持たない）と、補助の `exit_signal` レコード
+/// （本番 launcher の回収点が出す）になる。どちらもこの試験の入口（`spawn_container_probe`）からは駆動できず、
+/// 読み手の設計と複数スレッド・rootless・子孫での確実な記録の結論が出ていないため、監査は
+/// `Deferred`（#2236・#2237）とし合否に使わない（SEC-4・REPAIR-3）。結論が出たら `Required` へ切り替える
+/// （詳細はモジュール doc の ESC-04〜ESC-06 節）。
 const ESC06_EXPECT: Expectation = Expectation {
     allowed: &[],
     signal: Some(SIGSYS),
-    audit: AuditExpectation::Deferred("seccomp"),
+    audit: AuditExpectation::Deferred {
+        layer: "seccomp",
+        tracking: "#2236, #2237",
+    },
 };
 
 /// ESC-06 が発行する禁止 syscall 名（`DeniedSyscall::ALL` の名前と一致していること）。
@@ -202,18 +228,66 @@ impl AttackOutcome {
     }
 }
 
-/// 監査ログの期待。
+/// 監査ログの期待（SEC-4。本番の配送経路が出した記録で照合する。#2028）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuditExpectation {
     /// 監査レコードを要求しない。
     None,
-    /// 指定レイヤー（`AuditLayer::as_str()` の値: `seccomp` / `landlock` / `mount`）の記録を 1 件以上要求する。
-    /// 記録は本番の配送経路が出力したものに限る（テスト側が生成した記録を証拠にしてはならない）。
-    Required(&'static str),
-    /// 指定レイヤーの監査を spec 上は要求するが、本番の配送経路が未配線のため合否に使わない（REPAIR-3・SEC-4）。
-    /// 配線完了後に `Required` へ置き換える。判定は攻撃結果のみで行う。
-    Deferred(&'static str),
+    /// 指定レイヤー（`AuditLayer::as_str()` の値: `seccomp` / `landlock` / `mount`）の記録を要求する。
+    /// 記録は本番の配送経路がコンテナの外へ出したものに限る（テスト側が生成した記録を証拠にしてはならない）。
+    Required {
+        layer: &'static str,
+        source: AuditSource,
+    },
+    /// 指定レイヤーの監査を spec 上は要求するが、本番の配送経路をこの試験からは駆動できないため合否に使わない
+    /// （REPAIR-3・SEC-4）。`tracking` は追跡先の issue。追跡先の結論が出たら `Required` へ置き換える。
+    Deferred {
+        layer: &'static str,
+        tracking: &'static str,
+    },
 }
+
+/// `Required` の記録の出所（どの本番経路の出力を回収して照合するか）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditSource {
+    /// 状態ルート直下の `@audit.log`（`ControlAuditRelay` → `FileAuditSink` が書く行）。ちょうど `count` 行を要求する。
+    /// `seccomp` は seccomp 層のときの syscall 番号と arch（`None` なら照合しない）。
+    StateRootLog {
+        count: usize,
+        seccomp: Option<SeccompSpec>,
+    },
+    /// ホストのカーネル監査ログの `LANDLOCK_ACCESS`（`AUDIT_LANDLOCK_ACCESS`）。`blockers` はその行の `blockers=`
+    /// に現れるべき拒否種別（例: `fs.make_reg`）。opt-in の段（`KERNEL_AUDIT_ENV`）でだけ回収できる。
+    KernelAudit { blockers: &'static str },
+}
+
+/// seccomp 層の記録で照合する syscall 番号と arch（`AUDIT_ARCH_*`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SeccompSpec {
+    syscall: u64,
+    arch: u64,
+}
+
+/// `mount(2)` の syscall 番号（x86_64 は 165、aarch64 は 40。アーキテクチャ間で流用しない）。
+#[cfg(target_arch = "aarch64")]
+const MOUNT_SYSCALL_NR: u64 = 40;
+#[cfg(not(target_arch = "aarch64"))]
+const MOUNT_SYSCALL_NR: u64 = 165;
+/// 上の syscall 番号の `AUDIT_ARCH_*`（x86_64 は `0xC000_003E`、aarch64 は `0xC000_00B7`）。
+#[cfg(target_arch = "aarch64")]
+const AUDIT_ARCH_NATIVE: u64 = 0xC000_00B7;
+#[cfg(not(target_arch = "aarch64"))]
+const AUDIT_ARCH_NATIVE: u64 = 0xC000_003E;
+
+/// 状態ルートの `@audit.log` を使うケースが、記録に載せるコンテナ ID（ハーネス固定。照合に使う）。
+const AUDIT_CONTAINER_ID: &str = "escape-suite";
+
+/// カーネル監査の回収を有効にする環境変数（opt-in の段。root か audit ログの読み取り権限・auditd・Landlock ABI 7 が要る）。
+/// `1` のときだけ有効。前提が欠けたら skip せず失敗にする。
+const KERNEL_AUDIT_ENV: &str = "FANDHE_CONTAINER_TEST_KERNEL_AUDIT";
+
+/// カーネル監査を回収しなかった理由（opt-in なし。出力と `AuditNotVerified` に載せる固定語彙）。
+const KERNEL_AUDIT_NOT_ENABLED: &str = "kernel audit collection is not enabled";
 
 /// ケースの期待。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,12 +316,39 @@ impl fmt::Display for ObservedExit {
     }
 }
 
+/// `@audit.log` の 1 行（`encode_json_line` の出力）から照合に要る項目だけを取り出したもの。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuditLine {
+    layer: String,
+    pid: u64,
+    syscall: Option<u64>,
+    arch: Option<u64>,
+    container_id: Option<String>,
+}
+
+/// コンテナの外で回収した監査の証拠（本番の配送経路の出力だけ。子の記録からは作らない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuditEvidence {
+    /// このケースは監査を回収しない（`None` / `Deferred`）。
+    NotApplicable,
+    /// 状態ルートの `@audit.log` の全行。`subject_pid` は seccomp 層の記録の pid と突き合わせる、
+    /// 攻撃した子の（記録者から見た）pid。
+    StateRootLog {
+        lines: Vec<AuditLine>,
+        subject_pid: Option<u64>,
+    },
+    /// カーネル監査ログで、期待する `blockers`・子の pid・時刻の下限に合った `LANDLOCK_ACCESS` の件数。
+    KernelAudit { matched: usize },
+    /// 回収の前提が無く読まなかった（opt-in なし）。合格ではなく「監査は未検証」を表す。
+    NotCollected { reason: &'static str },
+}
+
 /// 観測結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Observation {
     exit: ObservedExit,
     outcome: Option<AttackOutcome>,
-    audit_layers: Vec<String>,
+    audit: AuditEvidence,
 }
 
 /// 期待との不一致。
@@ -260,8 +361,14 @@ enum Mismatch {
     UnexpectedOutcome {
         got: AttackOutcome,
     },
+    /// 要求した層の記録が 1 件も回収できなかった。
     MissingAudit {
         layer: &'static str,
+    },
+    /// 記録はあるが件数・層・コンテナ ID・syscall 番号・arch・pid のいずれかが期待と違う。
+    AuditDetail {
+        layer: &'static str,
+        detail: String,
     },
     /// シナリオ側の失敗（ディスパッチャが子プロセスの失敗を報告する）。実プロセス部（Linux）でのみ構築される。
     #[cfg(all(
@@ -303,9 +410,74 @@ enum Mismatch {
 enum CaseVerdict {
     Pass,
     Fail(Vec<Mismatch>),
+    /// 攻撃の結果は期待どおりだが、要求された監査を回収できず照合していない（合格ではない。ESC-09 の
+    /// `NotApplicable` と同じく「検証していない」ことを表す。SEC-4）。
+    AuditNotVerified {
+        layer: &'static str,
+        reason: &'static str,
+    },
 }
 
-/// 観測が期待に合うかを判定する。監査必須のケースでレコード 0 件なら必ず `Fail`（SEC-2・SEC-4）。
+/// 状態ルートの `@audit.log` の証拠を期待（件数・層・コンテナ ID・seccomp の値）で照合し、不一致の一覧を返す。
+fn check_state_root_log(
+    layer: &'static str,
+    count: usize,
+    seccomp: Option<SeccompSpec>,
+    lines: &[AuditLine],
+    subject_pid: Option<u64>,
+) -> Vec<Mismatch> {
+    if lines.is_empty() {
+        return vec![Mismatch::MissingAudit { layer }];
+    }
+    let mut problems = Vec::new();
+    if lines.len() != count {
+        problems.push(format!(
+            "expected exactly {count} record(s), got {}",
+            lines.len()
+        ));
+    }
+    for (i, line) in lines.iter().enumerate() {
+        if line.layer != layer {
+            problems.push(format!(
+                "record {i}: layer {:?}, expected {layer:?}",
+                line.layer
+            ));
+        }
+        if line.container_id.as_deref() != Some(AUDIT_CONTAINER_ID) {
+            problems.push(format!(
+                "record {i}: container_id {:?}, expected {AUDIT_CONTAINER_ID:?}",
+                line.container_id
+            ));
+        }
+        if let Some(spec) = seccomp {
+            if line.syscall != Some(spec.syscall) {
+                problems.push(format!(
+                    "record {i}: syscall {:?}, expected {}",
+                    line.syscall, spec.syscall
+                ));
+            }
+            if line.arch != Some(spec.arch) {
+                problems.push(format!(
+                    "record {i}: arch {:?}, expected {}",
+                    line.arch, spec.arch
+                ));
+            }
+            if subject_pid != Some(line.pid) {
+                problems.push(format!(
+                    "record {i}: pid {}, expected the probe child's pid {subject_pid:?}",
+                    line.pid
+                ));
+            }
+        }
+    }
+    problems
+        .into_iter()
+        .map(|detail| Mismatch::AuditDetail { layer, detail })
+        .collect()
+}
+
+/// 観測が期待に合うかを判定する。監査必須のケースで記録が無ければ必ず `Fail`、記録を回収できていなければ
+/// `AuditNotVerified`（合格にしない。SEC-2・SEC-4）。
 fn judge(expect: &Expectation, obs: &Observation) -> CaseVerdict {
     let mut mismatches = Vec::new();
     match expect.signal {
@@ -332,45 +504,67 @@ fn judge(expect: &Expectation, obs: &Observation) -> CaseVerdict {
             }
         }
     }
-    if let AuditExpectation::Required(layer) = expect.audit
-        && !obs.audit_layers.iter().any(|l| l == layer)
-    {
-        mismatches.push(Mismatch::MissingAudit { layer });
+    let mut not_verified = None;
+    if let AuditExpectation::Required { layer, source } = expect.audit {
+        match (source, &obs.audit) {
+            (
+                AuditSource::StateRootLog { count, seccomp },
+                AuditEvidence::StateRootLog { lines, subject_pid },
+            ) => mismatches.extend(check_state_root_log(
+                layer,
+                count,
+                seccomp,
+                lines,
+                *subject_pid,
+            )),
+            (AuditSource::KernelAudit { .. }, AuditEvidence::KernelAudit { matched }) => {
+                if *matched == 0 {
+                    mismatches.push(Mismatch::MissingAudit { layer });
+                }
+            }
+            (AuditSource::KernelAudit { .. }, AuditEvidence::NotCollected { reason }) => {
+                not_verified = Some((layer, *reason));
+            }
+            // 証拠の種類が期待の出所と合わない（ハーネスの不備）。合格にしない。
+            (_, other) => mismatches.push(Mismatch::AuditDetail {
+                layer,
+                detail: format!("evidence kind does not match the expected source: {other:?}"),
+            }),
+        }
     }
-    if mismatches.is_empty() {
-        CaseVerdict::Pass
-    } else {
+    if !mismatches.is_empty() {
         CaseVerdict::Fail(mismatches)
+    } else if let Some((layer, reason)) = not_verified {
+        CaseVerdict::AuditNotVerified { layer, reason }
+    } else {
+        CaseVerdict::Pass
     }
 }
 
 /// 子が書く記録の累計バイト上限（pipe 容量 64 KiB より十分小さくし、子の書き込みブロックを避ける）。
 const RECORD_MAX_BYTES: usize = 16 * 1024;
-/// 記録の行数上限（audit 行の無制限な蓄積を防ぐ）。
-const RECORD_MAX_LINES: usize = 64;
 
 /// 子から回収した記録の解析結果。
+///
+/// 監査の記録は子からは受け取らない（`audit=` 行は拒否する）。攻撃側が書いた記録は SEC-4 の証拠にならないため、
+/// 監査の証拠はコンテナの外で回収した本番の記録（`@audit.log`・カーネル監査）に限る（#2028）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedRecord {
     /// outcome 行が無ければ `None`。シグナル終了では outcome 行の前に停止し得るため、欠落の可否は
     /// 終了状態を見る `judge` が決める（`Exited` なら `MissingOutcome`。`Signaled` なら許容）。
     outcome: Option<AttackOutcome>,
-    audit_layers: Vec<String>,
 }
 
 /// 記録（行指向テキスト）を厳格に解析する。子の出力は untrusted として扱い、欠落・重複・未知キー・
-/// 不正値・上限超過を拒否する。形式: `outcome=<ok|errno=N|absent|failed>` を高々 1 行（省略可）、
-/// `audit=<encode_json_line の 1 行>` を 0 行以上。
+/// 不正値・上限超過を拒否する。形式: `outcome=<ok|errno=N|absent|failed>` を高々 1 行（省略可）。
+/// `audit=` を含むそれ以外のキーは未知キーとして拒否する。
 fn parse_record(text: &str) -> Result<ParsedRecord, String> {
     if text.len() > RECORD_MAX_BYTES {
         return Err("record exceeds the size limit".to_string());
     }
     let mut outcome = None;
-    let mut audit_layers = Vec::new();
-    for (i, line) in text.lines().enumerate() {
-        if i >= RECORD_MAX_LINES {
-            return Err("record exceeds the line limit".to_string());
-        }
+    // 許す行は outcome の 1 行だけなので、行数は重複・未知キーの拒否で、量はバイト上限で抑える。
+    for line in text.lines() {
         let (key, value) = line
             .split_once('=')
             .ok_or_else(|| format!("malformed line {line:?}"))?;
@@ -381,23 +575,269 @@ fn parse_record(text: &str) -> Result<ParsedRecord, String> {
                 }
                 outcome = Some(AttackOutcome::parse(value)?);
             }
-            "audit" => {
-                let json: serde_json::Value =
-                    serde_json::from_str(value).map_err(|e| format!("invalid audit json: {e}"))?;
-                let layer = json
-                    .get("layer")
-                    .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| "audit line without a string \"layer\"".to_string())?;
-                audit_layers.push(layer.to_string());
-            }
             other => return Err(format!("unknown key {other:?}")),
         }
     }
-    Ok(ParsedRecord {
-        outcome,
-        audit_layers,
-    })
+    Ok(ParsedRecord { outcome })
 }
+
+/// `@audit.log` の読み出し上限（バイト）。
+const STATE_LOG_MAX_BYTES: usize = 1024 * 1024;
+/// `@audit.log` の行数上限。
+const STATE_LOG_MAX_LINES: usize = 256;
+
+/// `@audit.log` の全文を厳格に解析する（untrusted 入力として、上限超過・JSON 不正・必須項目欠落・型違いを拒否）。
+fn parse_state_root_log(text: &str) -> Result<Vec<AuditLine>, String> {
+    if text.len() > STATE_LOG_MAX_BYTES {
+        return Err("audit log exceeds the size limit".to_string());
+    }
+    let mut lines = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        if i >= STATE_LOG_MAX_LINES {
+            return Err("audit log exceeds the line limit".to_string());
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| format!("line {i}: invalid json: {e}"))?;
+        let layer = json
+            .get("layer")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("line {i}: no string \"layer\""))?;
+        let pid = json
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| format!("line {i}: no unsigned \"pid\""))?;
+        let optional_u64 = |key: &str| -> Result<Option<u64>, String> {
+            match json.get(key) {
+                None | Some(serde_json::Value::Null) => Ok(None),
+                Some(v) => v
+                    .as_u64()
+                    .map(Some)
+                    .ok_or_else(|| format!("line {i}: \"{key}\" is not an unsigned integer")),
+            }
+        };
+        let container_id = match json.get("container_id") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(
+                v.as_str()
+                    .ok_or_else(|| format!("line {i}: \"container_id\" is not a string"))?
+                    .to_string(),
+            ),
+        };
+        lines.push(AuditLine {
+            layer: layer.to_string(),
+            pid,
+            syscall: optional_u64("syscall")?,
+            arch: optional_u64("arch")?,
+            container_id,
+        });
+    }
+    Ok(lines)
+}
+
+/// カーネル監査の行 `msg=audit(<秒>.<ミリ秒>:<連番>)` から（秒, 連番）を取り出す。
+fn kernel_audit_stamp(line: &str) -> Option<(u64, u64)> {
+    let rest = line.split("msg=audit(").nth(1)?;
+    let stamp = rest.split(')').next()?;
+    let (time, seq) = stamp.split_once(':')?;
+    let secs = time.split('.').next()?.parse().ok()?;
+    Some((secs, seq.parse().ok()?))
+}
+
+/// カーネル監査ログの本文から、`blocker` を含む `LANDLOCK_ACCESS` で、同じイベント連番の `SYSCALL` 記録の
+/// `pid` が `child_pid` に一致し、時刻が `min_epoch_secs` 以上のものの件数を数える（連番の重複は 1 件）。
+///
+/// 照合は空白区切りのフィールドの完全一致に限る（`blockers=` の値はカンマ区切りの要素の完全一致。
+/// 部分一致はしない。`comm`・`exe`・`path` などコンテナが左右できる値は解釈しない）。`min_epoch_secs` は
+/// ケースの開始前に取った時刻で、PID の再利用による過去の記録を除く（SEC-4・REPAIR-12）。
+fn count_landlock_access_records(
+    log: &str,
+    child_pid: u32,
+    blocker: &str,
+    min_epoch_secs: u64,
+) -> usize {
+    let mut seqs = std::collections::BTreeSet::new();
+    for line in log.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if !fields.contains(&"type=LANDLOCK_ACCESS") {
+            continue;
+        }
+        let blocked = fields.iter().any(|f| {
+            f.strip_prefix("blockers=")
+                .is_some_and(|v| v.split(',').any(|b| b == blocker))
+        });
+        if let Some((secs, seq)) = kernel_audit_stamp(line)
+            && blocked
+            && secs >= min_epoch_secs
+        {
+            seqs.insert(seq);
+        }
+    }
+    let want_pid = format!("pid={child_pid}");
+    let mut matched = std::collections::BTreeSet::new();
+    for line in log.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.contains(&"type=SYSCALL")
+            && fields.contains(&want_pid.as_str())
+            && let Some((_, seq)) = kernel_audit_stamp(line)
+            && seqs.contains(&seq)
+        {
+            matched.insert(seq);
+        }
+    }
+    matched.len()
+}
+
+/// シナリオがディスパッチャへ返す 1 行（stdout）。判定の材料のうち、コンテナ内で確定する事実だけを運ぶ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScenarioMeta {
+    exit: ObservedExit,
+    outcome: Option<AttackOutcome>,
+    /// 攻撃した子の（シナリオから見た）pid。子を作らないケース（start の拒否）は `None`。
+    child_pid: Option<u32>,
+    /// 攻撃した子自身の PID namespace での pid（`/proc/<child_pid>/status` の `NSpid` の末尾）。seccomp 層の
+    /// 記録の `pid` はこの値になる（本番の supervisor の変換と同じ。SEC-4）。カーネル監査はホストの `child_pid` で照合する。
+    pid_in_ns: Option<u32>,
+    /// ケース開始の UNIX 秒（カーネル監査の時刻の下限）。
+    started_at: u64,
+}
+
+/// `ScenarioMeta` の行の先頭語。
+const META_PREFIX: &str = "escape_suite-meta";
+
+impl ScenarioMeta {
+    fn render(&self) -> String {
+        let exit = match self.exit {
+            ObservedExit::Exited(c) => format!("exited:{c}"),
+            ObservedExit::Signaled(s) => format!("signaled:{s}"),
+        };
+        let outcome = self
+            .outcome
+            .map_or_else(|| "none".to_string(), AttackOutcome::render);
+        let pid = self
+            .child_pid
+            .map_or_else(|| "none".to_string(), |p| p.to_string());
+        let inner = self
+            .pid_in_ns
+            .map_or_else(|| "none".to_string(), |p| p.to_string());
+        format!(
+            "{META_PREFIX} exit={exit} outcome={outcome} child_pid={pid} pid_in_ns={inner} started_at={}",
+            self.started_at
+        )
+    }
+
+    /// シナリオの stdout から meta 行をちょうど 1 行取り出して解析する。コンテナの子は stdout を継承するため、
+    /// 偽の行を書かれても 2 行目以降が現れて拒否される（0 行・2 行以上・未知キー・欠落・不正値は `Err`。fail-closed）。
+    fn parse_from_stdout(stdout: &str) -> Result<Self, String> {
+        let mut found = stdout
+            .lines()
+            .filter(|l| l.split(' ').next() == Some(META_PREFIX));
+        let line = found.next().ok_or("no meta line")?;
+        if found.next().is_some() {
+            return Err("more than one meta line".to_string());
+        }
+        let (mut exit, mut outcome, mut pid, mut inner, mut started) =
+            (None, None, None, None, None);
+        for field in line.split(' ').skip(1) {
+            let (key, value) = field
+                .split_once('=')
+                .ok_or_else(|| format!("malformed field {field:?}"))?;
+            let dup = |name: &str| format!("duplicate key {name:?}");
+            match key {
+                "exit" => {
+                    let (kind, n) = value.split_once(':').ok_or("malformed exit")?;
+                    let n: i32 = n.parse().map_err(|_| "invalid exit number".to_string())?;
+                    let parsed = match kind {
+                        "exited" => ObservedExit::Exited(n),
+                        "signaled" => ObservedExit::Signaled(n),
+                        _ => return Err("invalid exit kind".to_string()),
+                    };
+                    if exit.replace(parsed).is_some() {
+                        return Err(dup("exit"));
+                    }
+                }
+                "outcome" => {
+                    let parsed = if value == "none" {
+                        None
+                    } else {
+                        Some(AttackOutcome::parse(value)?)
+                    };
+                    if outcome.replace(parsed).is_some() {
+                        return Err(dup("outcome"));
+                    }
+                }
+                "child_pid" => {
+                    let parsed = if value == "none" {
+                        None
+                    } else {
+                        Some(
+                            value
+                                .parse::<u32>()
+                                .map_err(|_| "invalid child_pid".to_string())?,
+                        )
+                    };
+                    if pid.replace(parsed).is_some() {
+                        return Err(dup("child_pid"));
+                    }
+                }
+                "pid_in_ns" => {
+                    let parsed = if value == "none" {
+                        None
+                    } else {
+                        Some(
+                            value
+                                .parse::<u32>()
+                                .map_err(|_| "invalid pid_in_ns".to_string())?,
+                        )
+                    };
+                    if inner.replace(parsed).is_some() {
+                        return Err(dup("pid_in_ns"));
+                    }
+                }
+                "started_at" => {
+                    let parsed = value
+                        .parse::<u64>()
+                        .map_err(|_| "invalid started_at".to_string())?;
+                    if started.replace(parsed).is_some() {
+                        return Err(dup("started_at"));
+                    }
+                }
+                other => return Err(format!("unknown key {other:?}")),
+            }
+        }
+        Ok(ScenarioMeta {
+            exit: exit.ok_or("missing exit")?,
+            outcome: outcome.ok_or("missing outcome")?,
+            child_pid: pid.ok_or("missing child_pid")?,
+            pid_in_ns: inner.ok_or("missing pid_in_ns")?,
+            started_at: started.ok_or("missing started_at")?,
+        })
+    }
+}
+/// 監査を回収しないケース（`None` / `Deferred`）の観測。
+fn obs_plain(exit: ObservedExit, outcome: Option<AttackOutcome>) -> Observation {
+    Observation {
+        exit,
+        outcome,
+        audit: AuditEvidence::NotApplicable,
+    }
+}
+
+/// 状態ルートの `@audit.log` の証拠（コンテナ ID はハーネス固定値）の 1 行。
+fn state_line(layer: &str, pid: u64, syscall: Option<u64>, arch: Option<u64>) -> AuditLine {
+    AuditLine {
+        layer: layer.to_string(),
+        pid,
+        syscall,
+        arch,
+        container_id: Some(AUDIT_CONTAINER_ID.to_string()),
+    }
+}
+
+/// ESC-03 の seccomp の期待値（`mount` の番号と arch）。
+const ESC03_SECCOMP: SeccompSpec = SeccompSpec {
+    syscall: MOUNT_SYSCALL_NR,
+    arch: AUDIT_ARCH_NATIVE,
+};
 
 /// SEC-2・TASK-42.1: 判定ロジックの自己テスト（具体値で照合。REPAIR-12）。
 fn sec2_task42_1_judge_selftest() {
@@ -406,97 +846,120 @@ fn sec2_task42_1_judge_selftest() {
         signal: None,
         audit: AuditExpectation::None,
     };
-    let deny = Expectation {
+    let kernel = Expectation {
         allowed: &[AttackOutcome::Errno(1), AttackOutcome::Errno(13)],
         signal: None,
-        audit: AuditExpectation::Required("landlock"),
+        audit: AuditExpectation::Required {
+            layer: "landlock",
+            source: AuditSource::KernelAudit {
+                blockers: "fs.make_reg",
+            },
+        },
     };
     let sig = Expectation {
         allowed: &[],
         signal: Some(31),
         audit: AuditExpectation::None,
     };
-    let obs = |exit, outcome, layers: &[&str]| Observation {
-        exit,
-        outcome,
-        audit_layers: layers.iter().map(|s| s.to_string()).collect(),
-    };
     let ok_exit = ObservedExit::Exited(0);
-
-    // シグナル終了 + 監査必須: outcome 行なし・audit 行のみの記録でも判定できる。
-    let sig_audit = Expectation {
-        allowed: &[],
-        signal: Some(31),
-        audit: AuditExpectation::Required("seccomp"),
+    let with = |outcome, audit| Observation {
+        exit: ok_exit,
+        outcome: Some(outcome),
+        audit,
     };
-    assert_eq!(
-        judge(
-            &sig_audit,
-            &obs(ObservedExit::Signaled(31), None, &["seccomp"])
-        ),
-        CaseVerdict::Pass
-    );
-    assert_eq!(
-        judge(&sig_audit, &obs(ObservedExit::Signaled(31), None, &[])),
-        CaseVerdict::Fail(vec![Mismatch::MissingAudit { layer: "seccomp" }])
-    );
 
     assert_eq!(
         judge(
             &allow_ok,
-            &obs(ok_exit, Some(AttackOutcome::Succeeded), &[])
+            &obs_plain(ok_exit, Some(AttackOutcome::Succeeded))
+        ),
+        CaseVerdict::Pass
+    );
+    // カーネル監査: 照合できた記録 1 件で合格。0 件は不合格、攻撃結果の不一致は不合格のまま。
+    assert_eq!(
+        judge(
+            &kernel,
+            &with(
+                AttackOutcome::Errno(13),
+                AuditEvidence::KernelAudit { matched: 1 }
+            )
         ),
         CaseVerdict::Pass
     );
     assert_eq!(
         judge(
-            &deny,
-            &obs(ok_exit, Some(AttackOutcome::Succeeded), &["landlock"])
+            &kernel,
+            &with(
+                AttackOutcome::Errno(13),
+                AuditEvidence::KernelAudit { matched: 0 }
+            )
+        ),
+        CaseVerdict::Fail(vec![Mismatch::MissingAudit { layer: "landlock" }])
+    );
+    assert_eq!(
+        judge(
+            &kernel,
+            &with(
+                AttackOutcome::Succeeded,
+                AuditEvidence::KernelAudit { matched: 1 }
+            )
         ),
         CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
             got: AttackOutcome::Succeeded
         }])
     );
-    assert_eq!(
-        judge(&deny, &obs(ok_exit, Some(AttackOutcome::Errno(13)), &[])),
-        CaseVerdict::Fail(vec![Mismatch::MissingAudit { layer: "landlock" }])
-    );
-    assert_eq!(
-        judge(
-            &deny,
-            &obs(ok_exit, Some(AttackOutcome::Errno(13)), &["seccomp"])
-        ),
-        CaseVerdict::Fail(vec![Mismatch::MissingAudit { layer: "landlock" }])
-    );
+    // 回収していない（opt-in なし）: 合格にせず「監査は未検証」。攻撃結果が不一致なら不合格が優先される。
+    let not_collected = AuditEvidence::NotCollected {
+        reason: "kernel audit not enabled",
+    };
     assert_eq!(
         judge(
-            &deny,
-            &obs(ok_exit, Some(AttackOutcome::Errno(13)), &["landlock"])
+            &kernel,
+            &with(AttackOutcome::Errno(13), not_collected.clone())
         ),
-        CaseVerdict::Pass
+        CaseVerdict::AuditNotVerified {
+            layer: "landlock",
+            reason: "kernel audit not enabled"
+        }
     );
     assert_eq!(
-        judge(&allow_ok, &obs(ok_exit, None, &[])),
+        judge(&kernel, &with(AttackOutcome::Succeeded, not_collected)),
+        CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
+            got: AttackOutcome::Succeeded
+        }])
+    );
+    // 証拠の種類が期待の出所と違う（ハーネスの不備）は不合格。
+    assert!(matches!(
+        judge(
+            &kernel,
+            &with(
+                AttackOutcome::Errno(13),
+                AuditEvidence::StateRootLog {
+                    lines: vec![state_line("landlock", 1, None, None)],
+                    subject_pid: None,
+                }
+            )
+        ),
+        CaseVerdict::Fail(ref m) if matches!(m.as_slice(), [Mismatch::AuditDetail { layer: "landlock", .. }])
+    ));
+    assert_eq!(
+        judge(&allow_ok, &obs_plain(ok_exit, None)),
         CaseVerdict::Fail(vec![Mismatch::MissingOutcome])
     );
     assert_eq!(
-        judge(&sig, &obs(ObservedExit::Exited(0), None, &[])),
+        judge(&sig, &obs_plain(ObservedExit::Exited(0), None)),
         CaseVerdict::Fail(vec![Mismatch::UnexpectedExit {
             got: ObservedExit::Exited(0)
         }])
     );
     assert_eq!(
-        judge(&sig, &obs(ObservedExit::Signaled(31), None, &[])),
+        judge(&sig, &obs_plain(ObservedExit::Signaled(31), None)),
         CaseVerdict::Pass
     );
     assert_eq!(
         judge(
             &sig,
-            &obs(
-                ObservedExit::Signaled(31),
-                Some(AttackOutcome::Succeeded),
-                &[]
-            )
+            &obs_plain(ObservedExit::Signaled(31), Some(AttackOutcome::Succeeded))
         ),
         CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
             got: AttackOutcome::Succeeded
@@ -504,31 +967,305 @@ fn sec2_task42_1_judge_selftest() {
     );
 }
 
+/// SEC-4・#2028: 状態ルートの `@audit.log` の照合（ESC-03 の seccomp 1 行・ESC-08 の mount 3 行）の自己テスト。
+/// 件数はちょうど、層・コンテナ ID・syscall 番号・arch・pid は具体値で照合する（REPAIR-12）。
+fn sec4_2028_state_root_log_selftest() {
+    let esc03 = &ESC03_EXPECTATION;
+    let ok_exit = ObservedExit::Exited(0);
+    let obs = |lines: Vec<AuditLine>, pid: Option<u64>| Observation {
+        exit: ok_exit,
+        outcome: Some(AttackOutcome::Errno(EPERM)),
+        audit: AuditEvidence::StateRootLog {
+            lines,
+            subject_pid: pid,
+        },
+    };
+    let good = state_line(
+        "seccomp",
+        4242,
+        Some(MOUNT_SYSCALL_NR),
+        Some(AUDIT_ARCH_NATIVE),
+    );
+    assert_eq!(
+        judge(esc03, &obs(vec![good.clone()], Some(4242))),
+        CaseVerdict::Pass
+    );
+    // 0 行は MissingAudit。2 行（余分な記録）・層違い・コンテナ ID 違い・syscall/arch/pid 違いは不合格。
+    assert_eq!(
+        judge(esc03, &obs(vec![], Some(4242))),
+        CaseVerdict::Fail(vec![Mismatch::MissingAudit { layer: "seccomp" }])
+    );
+    let detail = |verdict: CaseVerdict| -> Vec<String> {
+        match verdict {
+            CaseVerdict::Fail(m) => m
+                .into_iter()
+                .map(|m| match m {
+                    Mismatch::AuditDetail { detail, .. } => detail,
+                    other => panic!("unexpected mismatch {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected a failure, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        detail(judge(
+            esc03,
+            &obs(vec![good.clone(), good.clone()], Some(4242))
+        )),
+        vec!["expected exactly 1 record(s), got 2".to_string()]
+    );
+    let mut wrong_layer = good.clone();
+    wrong_layer.layer = "mount".to_string();
+    assert_eq!(
+        detail(judge(esc03, &obs(vec![wrong_layer], Some(4242)))),
+        vec!["record 0: layer \"mount\", expected \"seccomp\"".to_string()]
+    );
+    let mut wrong_id = good.clone();
+    wrong_id.container_id = Some("other".to_string());
+    assert_eq!(
+        detail(judge(esc03, &obs(vec![wrong_id], Some(4242)))),
+        vec![format!(
+            "record 0: container_id Some(\"other\"), expected {AUDIT_CONTAINER_ID:?}"
+        )]
+    );
+    let mut wrong_nr = good.clone();
+    wrong_nr.syscall = Some(MOUNT_SYSCALL_NR + 1);
+    assert_eq!(
+        detail(judge(esc03, &obs(vec![wrong_nr], Some(4242)))),
+        vec![format!(
+            "record 0: syscall Some({}), expected {MOUNT_SYSCALL_NR}",
+            MOUNT_SYSCALL_NR + 1
+        )]
+    );
+    let mut wrong_arch = good.clone();
+    wrong_arch.arch = Some(0);
+    assert_eq!(
+        detail(judge(esc03, &obs(vec![wrong_arch], Some(4242)))),
+        vec![format!(
+            "record 0: arch Some(0), expected {AUDIT_ARCH_NATIVE}"
+        )]
+    );
+    assert_eq!(
+        detail(judge(esc03, &obs(vec![good.clone()], Some(1)))),
+        vec!["record 0: pid 4242, expected the probe child's pid Some(1)".to_string()]
+    );
+    assert_eq!(
+        detail(judge(esc03, &obs(vec![good], None))),
+        vec!["record 0: pid 4242, expected the probe child's pid None".to_string()]
+    );
+
+    // ESC-08: mount 層の 3 行（要求ごとに 1 行）。syscall・arch・pid は照合しない。
+    let mount = |n: usize| Observation {
+        exit: ok_exit,
+        outcome: Some(AttackOutcome::Failed),
+        audit: AuditEvidence::StateRootLog {
+            lines: (0..n).map(|_| state_line("mount", 7, None, None)).collect(),
+            subject_pid: None,
+        },
+    };
+    assert_eq!(judge(&ESC08_EXPECT, &mount(3)), CaseVerdict::Pass);
+    assert_eq!(
+        judge(&ESC08_EXPECT, &mount(0)),
+        CaseVerdict::Fail(vec![Mismatch::MissingAudit { layer: "mount" }])
+    );
+    assert_eq!(
+        detail(judge(&ESC08_EXPECT, &mount(2))),
+        vec!["expected exactly 3 record(s), got 2".to_string()]
+    );
+    // StateRootLog を要求するケースで「未回収」の証拠は不合格（合格にも未検証にもしない）。
+    let not_collected = Observation {
+        exit: ok_exit,
+        outcome: Some(AttackOutcome::Failed),
+        audit: AuditEvidence::NotCollected { reason: "x" },
+    };
+    assert!(matches!(
+        judge(&ESC08_EXPECT, &not_collected),
+        CaseVerdict::Fail(_)
+    ));
+
+    // `@audit.log` の解析: 本番の出力形式（`encode_json_line`）の具体値と、拒否する入力。
+    let text = format!(
+        "{{\"event\":\"audit\",\"layer\":\"seccomp\",\"ts_sec\":1,\"ts_nsec\":2,\"pid\":4242,\"syscall\":{MOUNT_SYSCALL_NR},\"arch\":{AUDIT_ARCH_NATIVE},\"container_id\":\"{AUDIT_CONTAINER_ID}\"}}\n\
+         {{\"event\":\"audit\",\"layer\":\"mount\",\"pid\":7,\"path\":\"/data\",\"container_id\":null}}\n"
+    );
+    assert_eq!(
+        parse_state_root_log(&text),
+        Ok(vec![
+            state_line(
+                "seccomp",
+                4242,
+                Some(MOUNT_SYSCALL_NR),
+                Some(AUDIT_ARCH_NATIVE)
+            ),
+            AuditLine {
+                layer: "mount".to_string(),
+                pid: 7,
+                syscall: None,
+                arch: None,
+                container_id: None
+            },
+        ])
+    );
+    assert_eq!(parse_state_root_log(""), Ok(vec![]));
+    assert!(parse_state_root_log("{broken\n").is_err());
+    assert_eq!(
+        parse_state_root_log("{\"pid\":1}\n"),
+        Err("line 0: no string \"layer\"".to_string())
+    );
+    assert_eq!(
+        parse_state_root_log("{\"layer\":\"mount\",\"pid\":-1}\n"),
+        Err("line 0: no unsigned \"pid\"".to_string())
+    );
+    assert_eq!(
+        parse_state_root_log("{\"layer\":\"mount\",\"pid\":1,\"syscall\":\"x\"}\n"),
+        Err("line 0: \"syscall\" is not an unsigned integer".to_string())
+    );
+    assert_eq!(
+        parse_state_root_log("{\"layer\":\"mount\",\"pid\":1,\"container_id\":5}\n"),
+        Err("line 0: \"container_id\" is not a string".to_string())
+    );
+    let many = "{\"layer\":\"mount\",\"pid\":1}\n".repeat(STATE_LOG_MAX_LINES + 1);
+    assert_eq!(
+        parse_state_root_log(&many),
+        Err("audit log exceeds the line limit".to_string())
+    );
+    let big = "x".repeat(STATE_LOG_MAX_BYTES + 1);
+    assert_eq!(
+        parse_state_root_log(&big),
+        Err("audit log exceeds the size limit".to_string())
+    );
+}
+
+/// SEC-4・#2028: カーネル監査ログの `LANDLOCK_ACCESS` の照合（フィールドの完全一致・連番による SYSCALL との結合・
+/// 時刻の下限・部分一致の拒否）の fixture での自己テスト（REPAIR-12）。
+fn sec4_2028_kernel_audit_selftest() {
+    let log = "\
+type=LANDLOCK_ACCESS msg=audit(100.5:10): domain=1 blockers=fs.make_reg path=\"/x\" dev=\"sda1\" ino=5\n\
+type=SYSCALL msg=audit(100.5:10): arch=c000003e syscall=257 success=no exit=-13 pid=4242 ppid=1 comm=\"pid=9999\"\n\
+type=LANDLOCK_ACCESS msg=audit(100.9:11): domain=1 blockers=fs.read_file,fs.write_file path=\"/y\"\n\
+type=SYSCALL msg=audit(100.9:11): arch=c000003e syscall=257 success=no exit=-13 pid=4242 ppid=1\n\
+type=LANDLOCK_ACCESS msg=audit(100.9:12): domain=1 blockers=fs.make_reg_extra path=\"/z\"\n\
+type=SYSCALL msg=audit(100.9:12): pid=4242\n\
+type=LANDLOCK_ACCESS msg=audit(100.9:13): domain=1 blockers=fs.make_reg path=\"/w\"\n\
+type=SYSCALL msg=audit(100.9:13): pid=5555\n\
+type=LANDLOCK_ACCESS msg=audit(50.0:14): domain=1 blockers=fs.make_reg path=\"/old\"\n\
+type=SYSCALL msg=audit(50.0:14): pid=4242\n";
+    // 連番 10 だけが「blockers に完全一致・pid 一致・時刻 OK」。
+    assert_eq!(
+        count_landlock_access_records(log, 4242, "fs.make_reg", 100),
+        1
+    );
+    // カンマ区切りの要素は完全一致で数える（連番 11 の write_file）。
+    assert_eq!(
+        count_landlock_access_records(log, 4242, "fs.write_file", 100),
+        1
+    );
+    assert_eq!(
+        count_landlock_access_records(log, 4242, "fs.read_file", 100),
+        1
+    );
+    // 部分一致（`fs.make_reg_extra`・`fs.make`）と comm の中の `pid=9999` は数えない。
+    assert_eq!(count_landlock_access_records(log, 4242, "fs.make", 100), 0);
+    assert_eq!(
+        count_landlock_access_records(log, 9999, "fs.make_reg", 100),
+        0
+    );
+    // 別 pid の記録は数えず、時刻の下限より前の記録（PID 再利用で残る過去分）も数えない。
+    assert_eq!(
+        count_landlock_access_records(log, 5555, "fs.make_reg", 100),
+        1
+    );
+    assert_eq!(
+        count_landlock_access_records(log, 4242, "fs.make_reg", 40),
+        2
+    );
+    assert_eq!(
+        count_landlock_access_records(log, 4242, "fs.make_reg", 101),
+        0
+    );
+    assert_eq!(count_landlock_access_records("", 1, "fs.make_reg", 0), 0);
+    assert_eq!(
+        kernel_audit_stamp("type=X msg=audit(1700000000.123:456): a=b"),
+        Some((1_700_000_000, 456))
+    );
+    assert_eq!(kernel_audit_stamp("type=X nothing"), None);
+}
+
+/// SEC-4・#2028: シナリオの meta 行の往復と拒否の自己テスト（子が stdout を継承するため偽造行を拒否する）。
+fn sec4_2028_meta_selftest() {
+    // opt-in の環境変数名は AGENTS.md の手順と一致させる（名前を変えたら文書も直す）。
+    assert_eq!(KERNEL_AUDIT_ENV, "FANDHE_CONTAINER_TEST_KERNEL_AUDIT");
+    let meta = ScenarioMeta {
+        exit: ObservedExit::Signaled(31),
+        outcome: None,
+        child_pid: Some(4242),
+        pid_in_ns: Some(1),
+        started_at: 1_700_000_000,
+    };
+    assert_eq!(
+        meta.render(),
+        "escape_suite-meta exit=signaled:31 outcome=none child_pid=4242 pid_in_ns=1 started_at=1700000000"
+    );
+    let stdout = format!("noise\n{}\nmore\n", meta.render());
+    assert_eq!(ScenarioMeta::parse_from_stdout(&stdout), Ok(meta));
+    let exited = ScenarioMeta {
+        exit: ObservedExit::Exited(0),
+        outcome: Some(AttackOutcome::Errno(1)),
+        child_pid: None,
+        pid_in_ns: None,
+        started_at: 5,
+    };
+    assert_eq!(
+        ScenarioMeta::parse_from_stdout(&exited.render()),
+        Ok(exited)
+    );
+    assert_eq!(
+        ScenarioMeta::parse_from_stdout("nothing\n"),
+        Err("no meta line".to_string())
+    );
+    // 2 行ある（コンテナの子が偽の行を書いた）場合は、どちらも採用せず拒否する。
+    let forged = format!("{}\n{}\n", exited.render(), meta.render());
+    assert_eq!(
+        ScenarioMeta::parse_from_stdout(&forged),
+        Err("more than one meta line".to_string())
+    );
+    for bad in [
+        "escape_suite-meta exit=exited:0 outcome=ok child_pid=none pid_in_ns=none",
+        "escape_suite-meta exit=exited:0 outcome=ok child_pid=none started_at=1",
+        "escape_suite-meta exit=exited:0 outcome=ok child_pid=none pid_in_ns=none started_at=1 extra=1",
+        "escape_suite-meta exit=exited:0 exit=exited:0 outcome=ok child_pid=none pid_in_ns=none started_at=1",
+        "escape_suite-meta exit=gone:0 outcome=ok child_pid=none pid_in_ns=none started_at=1",
+        "escape_suite-meta exit=exited:0 outcome=bogus child_pid=none pid_in_ns=none started_at=1",
+        "escape_suite-meta exit=exited:0 outcome=ok child_pid=-1 started_at=1",
+    ] {
+        assert!(
+            ScenarioMeta::parse_from_stdout(bad).is_err(),
+            "must reject: {bad}"
+        );
+    }
+}
+
 /// SEC-2・TASK-42.1: 記録パーサの自己テスト（正常系・欠落・重複・未知キー・不正値・上限超過）。
 fn sec2_task42_1_record_parser_selftest() {
-    let audit = r#"audit={"event":"audit","layer":"landlock","pid":1}"#;
-    let ok = format!("outcome=errno=13\n{audit}\n");
     assert_eq!(
-        parse_record(&ok),
+        parse_record("outcome=errno=13\n"),
         Ok(ParsedRecord {
             outcome: Some(AttackOutcome::Errno(13)),
-            audit_layers: vec!["landlock".to_string()],
         })
     );
     assert_eq!(
         parse_record("outcome=ok\n"),
         Ok(ParsedRecord {
             outcome: Some(AttackOutcome::Succeeded),
-            audit_layers: vec![],
         })
     );
     assert_eq!(AttackOutcome::Errno(13).render(), "errno=13");
+    assert_eq!(parse_record(""), Ok(ParsedRecord { outcome: None }));
+    // 子からの `audit=` 行は証拠にならないため、形式が正しくても未知キーとして拒否する（SEC-4・#2028）。
+    let audit = r#"audit={"event":"audit","layer":"landlock","pid":1}"#;
     assert_eq!(
-        parse_record(&format!("{audit}\n")),
-        Ok(ParsedRecord {
-            outcome: None,
-            audit_layers: vec!["landlock".to_string()],
-        })
+        parse_record(&format!("outcome=errno=13\n{audit}\n")),
+        Err("unknown key \"audit\"".to_string())
     );
     assert_eq!(
         parse_record("outcome=ok\noutcome=absent\n"),
@@ -546,11 +1283,6 @@ fn sec2_task42_1_record_parser_selftest() {
         parse_record("outcome=errno=0\n"),
         Err("invalid outcome \"errno=0\"".to_string())
     );
-    assert!(parse_record("outcome=ok\naudit={broken\n").is_err());
-    assert_eq!(
-        parse_record("outcome=ok\naudit={\"layer\":1}\n"),
-        Err("audit line without a string \"layer\"".to_string())
-    );
     assert_eq!(
         parse_record("garbage\n"),
         Err("malformed line \"garbage\"".to_string())
@@ -560,16 +1292,7 @@ fn sec2_task42_1_record_parser_selftest() {
         parse_record(&too_long),
         Err("record exceeds the size limit".to_string())
     );
-    let many = format!(
-        "outcome=ok\n{}",
-        format!("{audit}\n").repeat(RECORD_MAX_LINES)
-    );
-    assert_eq!(
-        parse_record(&many),
-        Err("record exceeds the line limit".to_string())
-    );
 }
-
 /// ESC-06 が発行する syscall 名が CORE-5 の禁止表に含まれることを照合する。
 fn sec2_task42_3_esc06_probed_names_in_deny_table() {
     let names: Vec<&str> = fandhe_container_core::seccomp::DeniedSyscall::ALL
@@ -586,11 +1309,8 @@ fn sec2_task42_3_esc06_probed_names_in_deny_table() {
 
 /// ESC-04〜06 の期待が意図どおりに判定されること（現行実装の観測が失敗になることを含む）を具体値で照合する。
 fn sec2_task42_3_case_expectation_selftest() {
-    let obs = |exit, outcome, layers: &[&str]| Observation {
-        exit,
-        outcome,
-        audit_layers: layers.iter().map(|s| s.to_string()).collect(),
-    };
+    // 第 3 引数は子が運ぶ監査の記録の名残で無視する（監査の証拠はコンテナの外で回収した記録だけ。#2028）。
+    let obs = |exit, outcome, _layers: &[&str]| obs_plain(exit, outcome);
     let ok_exit = ObservedExit::Exited(0);
     for pass in [AttackOutcome::Absent, AttackOutcome::Errno(EACCES)] {
         assert_eq!(
@@ -662,11 +1382,18 @@ fn sec2_task42_3_case_expectation_selftest() {
 
 /// ESC-01: ホスト FS への書き込みは成功せず（ホスト側 canary 無変更）、readonly root への書き込みは EACCES（Landlock）。
 ///
-/// `landlock` 層の監査は配送経路未配線のため `Deferred`（SEC-4・REPAIR-3）。
+/// 監査（SEC-4）は Landlock の本番の記録であるカーネル監査 `LANDLOCK_ACCESS`（`blockers=fs.write_file`）を、
+/// opt-in の段（`KERNEL_AUDIT_ENV`）で回収して照合する。opt-in なしでは攻撃結果だけを照合し、
+/// 監査は `audit-not-verified` として出力する（合格にしない。#2028）。
 const ESC01_EXPECTATION: Expectation = Expectation {
     allowed: &[AttackOutcome::Errno(13)],
     signal: None,
-    audit: AuditExpectation::Deferred("landlock"),
+    audit: AuditExpectation::Required {
+        layer: "landlock",
+        source: AuditSource::KernelAudit {
+            blockers: "fs.write_file",
+        },
+    },
 };
 
 /// ESC-02: ホストの PID namespace が参照できない（`/proc/1` はコンテナ内の自分自身）。監査記録は要求しない。
@@ -677,12 +1404,20 @@ const ESC02_EXPECTATION: Expectation = Expectation {
 };
 
 /// ESC-03: 既定 capability セット下の `mount(2)` は EPERM（1）で拒否される。拒否主体は組み込み seccomp の
-/// `ERRNO(EPERM)`（と capability 削減）で `AuditLayer::Mount` ではないため、`seccomp` 層の監査を
-/// 配送経路未配線のため `Deferred` とする（SEC-4・REPAIR-3）。
+/// `ERRNO(EPERM)`（と capability 削減）で `AuditLayer::Mount` ではない。監査（SEC-4）は、`USER_NOTIF` 版の filter が
+/// 出す通知を応答者が `record_seccomp_denial_for` → `ControlAuditRelay` → `FileAuditSink` で記録した状態ルートの
+/// `@audit.log` の seccomp 層の行を、ちょうど 1 行（`mount` の syscall 番号・arch・攻撃した子の pid・コンテナ ID）
+/// 照合する（#2028）。応答者の本体は試験側（core の公開 API だけで組む。supervisor の応答ハブそのものではない）。
 const ESC03_EXPECTATION: Expectation = Expectation {
     allowed: &[AttackOutcome::Errno(1)],
     signal: None,
-    audit: AuditExpectation::Deferred("seccomp"),
+    audit: AuditExpectation::Required {
+        layer: "seccomp",
+        source: AuditSource::StateRootLog {
+            count: 1,
+            seccomp: Some(ESC03_SECCOMP),
+        },
+    },
 };
 
 /// ESC-02 の判定: コンテナ内から見える PID 空間を分類する（OS 非依存の純粋関数）。
@@ -713,51 +1448,80 @@ fn sec2_task42_2_selftest() {
     assert_eq!(classify_pid_view(1, "57", &[1]), AttackOutcome::Succeeded);
     assert_eq!(classify_pid_view(1, "1", &[]), AttackOutcome::Succeeded);
 
-    let obs = |outcome, layers: &[&str]| Observation {
+    let plain = |outcome| obs_plain(ObservedExit::Exited(0), Some(outcome));
+    let kernel = |outcome, matched| Observation {
         exit: ObservedExit::Exited(0),
         outcome: Some(outcome),
-        audit_layers: layers.iter().map(|s| s.to_string()).collect(),
+        audit: AuditEvidence::KernelAudit { matched },
     };
-    // Deferred: 監査記録の有無は合否に影響しない（テスト側生成の記録を証拠にしない。SEC-4）。
+    let seccomp_log = |outcome| Observation {
+        exit: ObservedExit::Exited(0),
+        outcome: Some(outcome),
+        audit: AuditEvidence::StateRootLog {
+            lines: vec![state_line(
+                "seccomp",
+                4242,
+                Some(MOUNT_SYSCALL_NR),
+                Some(AUDIT_ARCH_NATIVE),
+            )],
+            subject_pid: Some(4242),
+        },
+    };
+    // ESC-03: 攻撃結果が EPERM でも、本番の記録が無ければ合格にしない。成功してしまえば記録があっても不合格。
     assert_eq!(
-        judge(&ESC03_EXPECTATION, &obs(AttackOutcome::Errno(1), &[])),
+        judge(&ESC03_EXPECTATION, &seccomp_log(AttackOutcome::Errno(1))),
         CaseVerdict::Pass
     );
     assert_eq!(
-        judge(
-            &ESC03_EXPECTATION,
-            &obs(AttackOutcome::Errno(1), &["mount"])
-        ),
-        CaseVerdict::Pass
+        judge(&ESC03_EXPECTATION, &plain(AttackOutcome::Errno(1))),
+        CaseVerdict::Fail(vec![Mismatch::AuditDetail {
+            layer: "seccomp",
+            detail: "evidence kind does not match the expected source: NotApplicable".to_string()
+        }])
     );
     assert_eq!(
-        judge(
-            &ESC03_EXPECTATION,
-            &obs(AttackOutcome::Succeeded, &["mount"])
-        ),
+        judge(&ESC03_EXPECTATION, &seccomp_log(AttackOutcome::Succeeded)),
         CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
             got: AttackOutcome::Succeeded
         }])
     );
+    // ESC-01: カーネル監査の記録（write_file）が照合できて合格。opt-in なしは未検証で、合格にはならない。
     assert_eq!(
-        judge(&ESC01_EXPECTATION, &obs(AttackOutcome::Errno(13), &[])),
+        judge(&ESC01_EXPECTATION, &kernel(AttackOutcome::Errno(13), 1)),
         CaseVerdict::Pass
+    );
+    assert_eq!(
+        judge(&ESC01_EXPECTATION, &kernel(AttackOutcome::Errno(13), 0)),
+        CaseVerdict::Fail(vec![Mismatch::MissingAudit { layer: "landlock" }])
     );
     assert_eq!(
         judge(
             &ESC01_EXPECTATION,
-            &obs(AttackOutcome::Errno(1), &["landlock"])
+            &Observation {
+                exit: ObservedExit::Exited(0),
+                outcome: Some(AttackOutcome::Errno(13)),
+                audit: AuditEvidence::NotCollected {
+                    reason: KERNEL_AUDIT_NOT_ENABLED
+                },
+            }
         ),
+        CaseVerdict::AuditNotVerified {
+            layer: "landlock",
+            reason: KERNEL_AUDIT_NOT_ENABLED
+        }
+    );
+    assert_eq!(
+        judge(&ESC01_EXPECTATION, &kernel(AttackOutcome::Errno(1), 1)),
         CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
             got: AttackOutcome::Errno(1)
         }])
     );
     assert_eq!(
-        judge(&ESC02_EXPECTATION, &obs(AttackOutcome::Absent, &[])),
+        judge(&ESC02_EXPECTATION, &plain(AttackOutcome::Absent)),
         CaseVerdict::Pass
     );
     assert_eq!(
-        judge(&ESC02_EXPECTATION, &obs(AttackOutcome::Succeeded, &[])),
+        judge(&ESC02_EXPECTATION, &plain(AttackOutcome::Succeeded)),
         CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
             got: AttackOutcome::Succeeded
         }])
@@ -799,7 +1563,8 @@ const ESC07_WRITE_EXPECT: Expectation = Expectation {
     audit: AuditExpectation::None,
 };
 
-/// ESC-07 の Landlock 帰属確認（読み取り open。ETXTBSY に覆われない）。EACCES と landlock 層の記録が必須。
+/// ESC-07 の Landlock 帰属確認（読み取り open。ETXTBSY に覆われない）。EACCES と、カーネル監査の
+/// `LANDLOCK_ACCESS`（`blockers=fs.read_file`。opt-in の段で回収。#2028）が必須。
 #[cfg_attr(
     not(all(
         target_os = "linux",
@@ -813,10 +1578,18 @@ const ESC07_WRITE_EXPECT: Expectation = Expectation {
 const ESC07_LANDLOCK_EXPECT: Expectation = Expectation {
     allowed: &[AttackOutcome::Errno(EACCES)],
     signal: None,
-    audit: AuditExpectation::Required("landlock"),
+    audit: AuditExpectation::Required {
+        layer: "landlock",
+        source: AuditSource::KernelAudit {
+            blockers: "fs.read_file",
+        },
+    },
 };
 
-/// ESC-08: マウント先ホワイトリスト外の要求は拒否（`Failed`）され、mount 層の監査記録が必須。
+/// ESC-08: マウント元が状態ルート・rootfs・bundle の bind の `start` は `InvalidArgument` で拒否され（`Failed`）、
+/// 要求ごとに mount 層の監査記録がちょうど 1 行（計 3 行）、状態ルートの `@audit.log` に届く（#2028）。
+/// 記録を作るのは本番の `start` の拒否経路（`validate_bind_mounts` → `audit_bind_mount_error` →
+/// `ProcessLauncher::rejection_audit_sink` → `ControlAuditRelay` → `FileAuditSink`）で、試験は記録を作らない。
 #[cfg_attr(
     not(all(
         target_os = "linux",
@@ -830,18 +1603,25 @@ const ESC07_LANDLOCK_EXPECT: Expectation = Expectation {
 const ESC08_EXPECT: Expectation = Expectation {
     allowed: &[AttackOutcome::Failed],
     signal: None,
-    audit: AuditExpectation::Required("mount"),
+    audit: AuditExpectation::Required {
+        layer: "mount",
+        source: AuditSource::StateRootLog {
+            count: 3,
+            seccomp: None,
+        },
+    },
 };
 
 /// ESC-07・ESC-08 の期待値の機械照合（REPAIR-12・SEC-2・TASK-42.4）。非 Linux でも定数を使う。
 fn sec2_task42_4_expectation_selftest() {
-    let obs = |outcome: AttackOutcome, layers: &[&str]| Observation {
+    let plain = |outcome| obs_plain(ObservedExit::Exited(0), Some(outcome));
+    let kernel = |outcome, matched| Observation {
         exit: ObservedExit::Exited(0),
         outcome: Some(outcome),
-        audit_layers: layers.iter().map(|l| (*l).to_string()).collect(),
+        audit: AuditEvidence::KernelAudit { matched },
     };
     assert_eq!(
-        judge(&ESC07_WRITE_EXPECT, &obs(AttackOutcome::Succeeded, &[])),
+        judge(&ESC07_WRITE_EXPECT, &plain(AttackOutcome::Succeeded)),
         CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
             got: AttackOutcome::Succeeded
         }])
@@ -852,41 +1632,46 @@ fn sec2_task42_4_expectation_selftest() {
         AttackOutcome::Errno(EPERM),
         AttackOutcome::Absent,
     ] {
-        assert_eq!(judge(&ESC07_WRITE_EXPECT, &obs(o, &[])), CaseVerdict::Pass);
+        assert_eq!(judge(&ESC07_WRITE_EXPECT, &plain(o)), CaseVerdict::Pass);
     }
     assert_eq!(
         judge(
             &ESC07_LANDLOCK_EXPECT,
-            &obs(AttackOutcome::Errno(EACCES), &["landlock"])
+            &kernel(AttackOutcome::Errno(EACCES), 1)
         ),
         CaseVerdict::Pass
     );
     assert_eq!(
         judge(
             &ESC07_LANDLOCK_EXPECT,
-            &obs(AttackOutcome::Errno(EACCES), &[])
+            &kernel(AttackOutcome::Errno(EACCES), 0)
         ),
         CaseVerdict::Fail(vec![Mismatch::MissingAudit { layer: "landlock" }])
     );
     assert_eq!(
         judge(
             &ESC07_LANDLOCK_EXPECT,
-            &obs(AttackOutcome::Errno(ETXTBSY), &["landlock"])
+            &kernel(AttackOutcome::Errno(ETXTBSY), 1)
         ),
         CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
             got: AttackOutcome::Errno(ETXTBSY)
         }])
     );
+    // ESC-08: 攻撃結果が成功（拒否されなかった）なら、記録が 3 行あっても不合格。
+    let mount_log = |outcome| Observation {
+        exit: ObservedExit::Exited(0),
+        outcome: Some(outcome),
+        audit: AuditEvidence::StateRootLog {
+            lines: (0..3).map(|_| state_line("mount", 7, None, None)).collect(),
+            subject_pid: None,
+        },
+    };
     assert_eq!(
-        judge(&ESC08_EXPECT, &obs(AttackOutcome::Failed, &["mount"])),
+        judge(&ESC08_EXPECT, &mount_log(AttackOutcome::Failed)),
         CaseVerdict::Pass
     );
     assert_eq!(
-        judge(&ESC08_EXPECT, &obs(AttackOutcome::Failed, &[])),
-        CaseVerdict::Fail(vec![Mismatch::MissingAudit { layer: "mount" }])
-    );
-    assert_eq!(
-        judge(&ESC08_EXPECT, &obs(AttackOutcome::Succeeded, &["mount"])),
+        judge(&ESC08_EXPECT, &mount_log(AttackOutcome::Succeeded)),
         CaseVerdict::Fail(vec![Mismatch::UnexpectedOutcome {
             got: AttackOutcome::Succeeded
         }])
@@ -1122,6 +1907,9 @@ fn sec2_task42_5_launcher_selftest() {
 fn always() {
     sec2_task42_1_judge_selftest();
     sec2_task42_1_record_parser_selftest();
+    sec4_2028_state_root_log_selftest();
+    sec4_2028_kernel_audit_selftest();
+    sec4_2028_meta_selftest();
     sec2_task42_2_selftest();
     sec2_task42_3_esc06_probed_names_in_deny_table();
     sec2_task42_3_case_expectation_selftest();
@@ -1187,28 +1975,43 @@ mod linux {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitStatus, Stdio};
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::audit_log::{
-        AuditDelivery, AuditRecord, AuditSink, encode_json_line, landlock_denial_record_now,
+        AUDIT_LOG_FILE_NAME, AuditSink, AuditTimestamp, ControlAuditRelay, FileAuditSink,
+        SeccompDenialReport, record_seccomp_denial_for,
     };
     use fandhe_container_core::dev_mounts::ImplicitDevMounts;
     use fandhe_container_core::exec::{
-        ChildExit, EscapeSyscallProbe, IsolationConfig, Namespace, NamespaceSet, ProbeOutcome,
-        StagePipeline, escape_probe_mount, isolate, isolate_rootful_host_root, plan,
-        plan_rootful_host_root, probe_escape_syscall, spawn_container_probe,
+        ChildExit, EscapeSyscallProbe, IsolationConfig, ListenerReadiness, Namespace, NamespaceSet,
+        ProbeOutcome, SeccompListener, StagePipeline, escape_probe_mount, isolate,
+        isolate_rootful_host_root, plan, plan_rootful_host_root, probe_escape_syscall,
+        spawn_container_probe, spawn_container_probe_with_seccomp_listener,
     };
-    use fandhe_container_core::landlock::{build_path_rules_with_dev, detect_landlock_abi};
-    use fandhe_container_core::oci_runtime::{audit_mount_config_error, parse_config_bytes};
-    use fandhe_container_core::traits::{ErrorCode, TraitError};
+    use fandhe_container_core::landlock::{
+        MIN_LANDLOCK_AUDIT_ABI, build_path_rules_with_dev, detect_landlock_abi,
+    };
+    use fandhe_container_core::observability::OpRecorder;
+    use fandhe_container_core::oci_runtime::{
+        LaunchSpec, LaunchedProcess, ProcessLauncher, StartTimeouts, create, parse_config_bytes,
+        start,
+    };
+    use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+    use fandhe_container_core::traits::{
+        ContainerId, ContainerState, CreateRequest, ErrorCode, GetStateRequest, StartRequest,
+        StateStore, TraitError,
+    };
 
     use super::{
-        AttackOutcome, AuditExpectation, CaseVerdict, ENOENT, ESC01_EXPECTATION, ESC02_EXPECTATION,
-        ESC03_EXPECTATION, ESC04_EXPECT, ESC05_EXPECT, ESC06_EXPECT, ESC07_LANDLOCK_EXPECT,
-        ESC07_WRITE_EXPECT, ESC08_EXPECT, ESC09_LAUNCHER, Expectation, LauncherRequirement,
-        Mismatch, NotApplicable, Observation, ObservedExit, RECORD_MAX_BYTES, classify_pid_view,
-        judge, launcher_applicability, parse_record,
+        AUDIT_CONTAINER_ID, AttackOutcome, AuditEvidence, AuditExpectation, AuditSource,
+        CaseVerdict, ENOENT, ESC01_EXPECTATION, ESC02_EXPECTATION, ESC03_EXPECTATION, ESC04_EXPECT,
+        ESC05_EXPECT, ESC06_EXPECT, ESC07_LANDLOCK_EXPECT, ESC07_WRITE_EXPECT, ESC08_EXPECT,
+        ESC09_LAUNCHER, Expectation, KERNEL_AUDIT_NOT_ENABLED, LauncherRequirement, Mismatch,
+        NotApplicable, Observation, ObservedExit, RECORD_MAX_BYTES, ScenarioMeta,
+        classify_pid_view, count_landlock_access_records, judge, launcher_applicability,
+        parse_record,
     };
 
     /// ESC-04 の攻撃対象（rootfs 内の相対パス）。rootfs 作成時に実在させる（`make_rootfs`）。
@@ -1223,6 +2026,8 @@ mod linux {
     struct EscapeCase {
         /// `--scenario` に渡す識別子（例: `esc-01-mount`）。
         id: &'static str,
+        /// ケースの実行の仕方（コンテナ内の probe か、`start` の拒否か）。
+        body: CaseBody,
         expectation: Expectation,
         /// 子の制限ステージ列（Landlock を伴うケースは `with_landlock` を載せて返す）。
         stages: fn() -> StagePipeline,
@@ -1237,6 +2042,17 @@ mod linux {
         launcher: LauncherRequirement,
     }
 
+    /// ケースの実行の仕方（シナリオが分岐する）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CaseBody {
+        /// 分離 → `spawn_container_probe`（制限ステージ通過後の子で攻撃クロージャを実行）。
+        Probe,
+        /// `Probe` に、ERRNO 側の拒否を `USER_NOTIF` で受けて記録・応答する応答者を足す（ESC-03。SEC-4・#2028）。
+        ProbeWithSeccompListener,
+        /// 分離もコンテナ probe もせず、`create` → `start` の拒否を実行する（ESC-08。SEC-4・#2028）。
+        StartRejection,
+    }
+
     /// ホスト視点の検査関数の型。
     type HostCheck = fn(&HostView) -> Result<(), String>;
 
@@ -1248,10 +2064,18 @@ mod linux {
         is_root: bool,
     }
 
+    /// ESC-08 のパース時の拒否の期待（攻撃結果のみ。本番では監査されないため監査は要求しない）。
+    const ESC08_CONFIG_EXPECT: Expectation = Expectation {
+        allowed: &[AttackOutcome::Failed],
+        signal: None,
+        audit: AuditExpectation::None,
+    };
+
     /// 登録済みケース。対照ケースと ESC-01〜03（#200）・ESC-04〜06（#201）・ESC-07〜08（#202）・ESC-09〜10（#203）。
     const CASES: &[EscapeCase] = &[
         EscapeCase {
             id: "control-read-proc",
+            body: CaseBody::Probe,
             expectation: Expectation {
                 allowed: &[AttackOutcome::Succeeded],
                 signal: None,
@@ -1266,6 +2090,7 @@ mod linux {
         // 否定対照: Landlock なしなら ESC-10 と同じ作成が成功する（拒否の Landlock への帰属の裏付け）。
         EscapeCase {
             id: "control-esc-10-no-landlock",
+            body: CaseBody::Probe,
             expectation: Expectation {
                 allowed: &[AttackOutcome::Succeeded],
                 signal: None,
@@ -1280,11 +2105,18 @@ mod linux {
         // ESC-10（CORE-5・SEC-4・SEC-2）。
         EscapeCase {
             id: "esc-10-landlock-outside",
+            body: CaseBody::Probe,
             expectation: Expectation {
                 allowed: &[AttackOutcome::Errno(13)],
                 signal: None,
-                // 配送経路未配線のため Deferred（テスト側生成の記録を合格証拠にしない。SEC-4・REPAIR-3）。
-                audit: AuditExpectation::Deferred("landlock"),
+                // 監査は本番のカーネル監査 `LANDLOCK_ACCESS`（`blockers=fs.make_reg`）を opt-in の段で回収して照合する
+                // （テスト側が作った記録を証拠にしない。SEC-4・#2028）。
+                audit: AuditExpectation::Required {
+                    layer: "landlock",
+                    source: AuditSource::KernelAudit {
+                        blockers: "fs.make_reg",
+                    },
+                },
             },
             stages: esc10_stages,
             attack: attack_esc10_create_outside,
@@ -1295,6 +2127,7 @@ mod linux {
         // ESC-09（SEC-5・SEC-2）。
         EscapeCase {
             id: "esc-09-userns-owner",
+            body: CaseBody::Probe,
             expectation: Expectation {
                 allowed: &[AttackOutcome::Succeeded],
                 signal: None,
@@ -1308,6 +2141,7 @@ mod linux {
         },
         EscapeCase {
             id: "esc-01-host-fs-write",
+            body: CaseBody::Probe,
             expectation: ESC01_EXPECTATION,
             stages: esc01_stages,
             attack: attack_esc01_host_fs_write,
@@ -1317,6 +2151,7 @@ mod linux {
         },
         EscapeCase {
             id: "esc-02-host-pid-ns",
+            body: CaseBody::Probe,
             expectation: ESC02_EXPECTATION,
             stages: StagePipeline::new,
             attack: attack_esc02_host_pid_ns,
@@ -1326,6 +2161,7 @@ mod linux {
         },
         EscapeCase {
             id: "esc-03-cap-sys-admin-mount",
+            body: CaseBody::ProbeWithSeccompListener,
             expectation: ESC03_EXPECTATION,
             stages: StagePipeline::new,
             attack: attack_esc03_cap_sys_admin_mount,
@@ -1335,6 +2171,7 @@ mod linux {
         },
         EscapeCase {
             id: "esc-04-release-agent",
+            body: CaseBody::Probe,
             expectation: ESC04_EXPECT,
             stages: StagePipeline::new,
             attack: attack_esc04_release_agent,
@@ -1344,6 +2181,7 @@ mod linux {
         },
         EscapeCase {
             id: "esc-05-proc-sys-core-pattern",
+            body: CaseBody::Probe,
             expectation: ESC05_EXPECT,
             stages: StagePipeline::new,
             attack: attack_esc05_proc_sys_core_pattern,
@@ -1353,6 +2191,7 @@ mod linux {
         },
         EscapeCase {
             id: "esc-05-sysrq-trigger",
+            body: CaseBody::Probe,
             expectation: ESC05_EXPECT,
             stages: StagePipeline::new,
             attack: attack_esc05_sysrq_trigger,
@@ -1362,6 +2201,7 @@ mod linux {
         },
         EscapeCase {
             id: "esc-06-unshare",
+            body: CaseBody::Probe,
             expectation: ESC06_EXPECT,
             stages: StagePipeline::new,
             attack: attack_esc06_unshare,
@@ -1371,6 +2211,7 @@ mod linux {
         },
         EscapeCase {
             id: "esc-06-ptrace",
+            body: CaseBody::Probe,
             expectation: ESC06_EXPECT,
             stages: StagePipeline::new,
             attack: attack_esc06_ptrace,
@@ -1380,6 +2221,7 @@ mod linux {
         },
         EscapeCase {
             id: "esc-06-kexec-load",
+            body: CaseBody::Probe,
             expectation: ESC06_EXPECT,
             stages: StagePipeline::new,
             attack: attack_esc06_kexec_load,
@@ -1390,6 +2232,7 @@ mod linux {
         // ESC-07〜08（TASK-42.4・#202）
         EscapeCase {
             id: "esc-07-runtime-binary-write",
+            body: CaseBody::Probe,
             expectation: ESC07_WRITE_EXPECT,
             stages: landlock_rootfs_only_stages,
             attack: attack_esc07_runtime_binary_write,
@@ -1399,6 +2242,7 @@ mod linux {
         },
         EscapeCase {
             id: "esc-07-runtime-binary-landlock",
+            body: CaseBody::Probe,
             expectation: ESC07_LANDLOCK_EXPECT,
             stages: landlock_rootfs_only_stages,
             attack: attack_esc07_runtime_binary_landlock,
@@ -1408,9 +2252,22 @@ mod linux {
         },
         EscapeCase {
             id: "esc-08-mount-outside-whitelist",
+            body: CaseBody::StartRejection,
             expectation: ESC08_EXPECT,
             stages: StagePipeline::new,
-            attack: attack_esc08_mount_outside_whitelist,
+            attack: attack_unused,
+            precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
+        },
+        // ESC-08 の `create` のパース時の destination 拒否。本番では監査されない（`audit_mount_config_error` を
+        // 呼ぶ本番コードが無い）ため、攻撃結果の拒否だけを照合し監査は要求しない（追跡: docs/design/audit-delivery.md）。
+        EscapeCase {
+            id: "esc-08-config-destination",
+            body: CaseBody::Probe,
+            expectation: ESC08_CONFIG_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_esc08_config_destination,
             precondition: no_precondition,
             host_check: None,
             launcher: LauncherRequirement::Any,
@@ -1475,7 +2332,8 @@ mod linux {
     ///    拒否されることを確認する。ここは Landlock の拒否の観測であり、ホスト FS への到達検査は 1 が担う。
     ///
     /// 制限が欠けて 2 が成功してもマーカーは一時 rootfs 内に作られ `Rootfs::drop` で削除される。
-    /// 監査記録は作らない（攻撃側生成の記録は SEC-4 の証拠にならない。期待は `Deferred`）。
+    /// 監査記録は作らない（攻撃側生成の記録は SEC-4 の証拠にならない。期待はコンテナの外で回収する
+    /// カーネル監査の `LANDLOCK_ACCESS`。#2028）。
     fn attack_esc01_host_fs_write(rec: &Recorder, host_canary: &Path) {
         // 対照経路: pivot 後の rootfs 内の既存ファイル（シナリオが fork 前に作成）への書き込みオープン。
         // パス解決・オープンの経路自体は機能しており Landlock（readonly root）が EACCES で拒否する、
@@ -1555,10 +2413,9 @@ mod linux {
     ///
     /// core の `escape_probe_mount`（PID 1 限定・propagation 変更のみで新規マウントを作らない）を呼ぶ。
     ///
-    /// 監査（SEC-4・REPAIR-3）: 実際の拒否主体は組み込み seccomp の `ERRNO(EPERM)`（と capability 削減）で、
-    /// seccomp ERRNO にはユーザー空間への報告経路がまだない。攻撃側で記録を作ると監査の証拠にならないため
-    /// 記録せず、期待は `Deferred`。配送経路の配線後に本番経路の出力照合（`Required`）へ置き換える。
-    /// `SeccompDenialReport` は偽造しない。
+    /// 監査（SEC-4・#2028）: 実際の拒否主体は組み込み seccomp の `ERRNO(EPERM)`（と capability 削減）。このケースは
+    /// `USER_NOTIF` 版の filter で起動され（`CaseBody::ProbeWithSeccompListener`）、通知を受けた応答者（シナリオ側）が
+    /// 本番の記録先へ記録する。攻撃側では記録を作らない（攻撃側生成の記録は SEC-4 の証拠にならない）。
     fn attack_esc03_cap_sys_admin_mount(rec: &Recorder, _host_canary: &Path) {
         let probe = escape_probe_mount().unwrap_or_else(|e| panic!("escape_probe_mount: {e}"));
         let outcome = match probe {
@@ -1661,7 +2518,7 @@ mod linux {
     /// 追加の Landlock 適用をせずに許可外の作成（MAKE_REG）をそのまま試みる。
     /// 起動ステージの Landlock が欠落・回帰すれば作成が成功し、`Errno(13)` 期待に反してケースが失敗する
     /// （ステージ自体の回帰検出。CORE-5）。監査レコードは作らない（テスト側生成の記録は SEC-4 の証拠にならない）。
-    /// 期待は `Deferred`。本番の監査配送経路の配線後（REPAIR-3）に実出力を回収して `Required` へ切り替える。
+    /// 期待はコンテナの外で回収するカーネル監査の `LANDLOCK_ACCESS`（`blockers=fs.make_reg`。#2028）。
     fn attack_esc10_create_outside(rec: &Recorder, _host_canary: &Path) {
         rec.outcome(try_create(ESC10_PROBE));
     }
@@ -1710,17 +2567,6 @@ mod linux {
         }
     }
 
-    /// EACCES なら Landlock 拒否の監査レコードを記録する（SEC-4 の記録経路との整合）。
-    fn record_landlock_denial(rec: &Recorder, outcome: AttackOutcome, path: &str) {
-        if let AttackOutcome::Errno(n) = outcome {
-            match landlock_denial_record_now(Path::new(path), Some(n)) {
-                Ok(Some(r)) => rec.record(&r).expect("record landlock denial"),
-                Ok(None) => {}
-                Err(e) => panic!("build landlock audit record: {e:?}"),
-            }
-        }
-    }
-
     /// ESC-07（SEC-2・TASK-42.4・#202。CVE-2019-5736 系）: `/proc/self/exe`（fork しただけの子ではホスト側
     /// テスト実行ファイル＝ランタイムバイナリの代役。magic link のため pivot 後もホストの実体へ解決される）を
     /// 書き込みモードで開こうとする。truncate・create・append は付けず、開けても即 drop して 1 バイトも
@@ -1734,7 +2580,6 @@ mod linux {
             Ok(_) => AttackOutcome::Succeeded,
             Err(e) => outcome_of_error(&e),
         };
-        record_landlock_denial(rec, outcome, "/proc/self/exe");
         rec.outcome(outcome);
     }
 
@@ -1745,19 +2590,21 @@ mod linux {
             Ok(_) => AttackOutcome::Succeeded,
             Err(e) => outcome_of_error(&e),
         };
-        record_landlock_denial(rec, outcome, "/proc/self/exe");
         rec.outcome(outcome);
     }
 
-    /// ESC-08（SEC-2・SEC-4・TASK-42.4・#202）: マウント先ホワイトリスト外の要求（rootfs 外への遡り・rootfs
-    /// 全体・相対 `..`。source はホストの機密パスを例示）を API 層（config パース）で検証し、拒否と Mount
-    /// 監査記録を確認する。実マウントは行わない（純粋関数のみ）。
-    /// 注意（実装済みを装わない）: マウント元（source）側のホワイトリストは未実装で、start は空でない mounts
-    /// を一律 `Unimplemented` で拒否するが監査されない。コンテナ内から生の `mount(2)` を試すケースは
-    /// raw syscall プローブが必要なため範囲外。本ケースは監査経路が実装済みの destination 側を検証する。
-    fn attack_esc08_mount_outside_whitelist(rec: &Recorder, _host_canary: &Path) {
+    /// 何もしない攻撃（`CaseBody::StartRejection` は子で攻撃を実行しないため、フィールドを埋めるためだけに使う）。
+    fn attack_unused(_rec: &Recorder, _host_canary: &Path) {}
+
+    /// ESC-08 のパース時の拒否（SEC-2・TASK-42.4・#202）: マウント先ホワイトリスト外の要求（rootfs 外への遡り・rootfs
+    /// 全体・相対 `..`。source はホストの機密パスを例示）を API 層（config パース）で検証し、`InvalidArgument` で
+    /// 拒否されることを確かめる。実マウントは行わない（純粋関数のみ）。
+    ///
+    /// 監査は要求しない: `create` のパース時の拒否を `Mount` 監査レコードにする本番コード
+    /// （`audit_mount_config_error` の呼び出し）が無く、このパスは本番では監査されない（SEC-4。REPAIR-3。追跡は
+    /// `docs/design/audit-delivery.md`）。本番で監査される bind の元の拒否は `esc-08-mount-outside-whitelist` が担う。
+    fn attack_esc08_config_destination(rec: &Recorder, _host_canary: &Path) {
         for dest in ["/../../run/fandhe-container", "/", "run/../../../etc"] {
-            let before = rec.audit_count();
             let json = format!(
                 r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs"}},"mounts":[{{"destination":"{dest}","type":"bind","source":"/run/fandhe-container","options":["bind"]}}]}}"#
             );
@@ -1766,24 +2613,11 @@ mod linux {
                     rec.outcome(AttackOutcome::Succeeded);
                     return;
                 }
-                Err(err) => {
-                    assert_eq!(
-                        err.code(),
-                        ErrorCode::InvalidArgument,
-                        "mount rejection must be InvalidArgument"
-                    );
-                    let audited = audit_mount_config_error(err, None, rec);
-                    assert_eq!(
-                        audited.delivery,
-                        AuditDelivery::Recorded,
-                        "mount rejection must be audited"
-                    );
-                    assert_eq!(
-                        rec.audit_count(),
-                        before + 1,
-                        "each rejected mount request ({dest}) must add exactly one audit record"
-                    );
-                }
+                Err(err) => assert_eq!(
+                    err.code(),
+                    ErrorCode::InvalidArgument,
+                    "mount rejection must be InvalidArgument"
+                ),
             }
         }
         rec.outcome(AttackOutcome::Failed);
@@ -1884,7 +2718,7 @@ mod linux {
 
     /// ESC-06（SEC-2・TASK-42.3・#201・MS-2）: `unshare(0)`（副作用なし）。期待は spec どおり SIGSYS 終了。
     /// 戻ってきた場合（フィルタの退行）は結果を記録し、判定側が失敗にする。seccomp 監査は親側の本番経路が
-    /// 未配線のため `Deferred`（SEC-4・REPAIR-3）で、攻撃側で監査レコードを作らない（偽造しない）。
+    /// 未配線のため `Deferred`（#2236・#2237。SEC-4・REPAIR-3）で、攻撃側で監査レコードを作らない（偽造しない）。
     fn attack_esc06_unshare(rec: &Recorder, _host_canary: &Path) {
         rec.outcome(probe_to_attack(probe_escape_syscall(
             EscapeSyscallProbe::Unshare,
@@ -1905,8 +2739,8 @@ mod linux {
         )));
     }
 
-    /// 子側の記録器。攻撃結果を 1 回だけ、監査レコードを 0 件以上、pipe へ書く。`AuditSink` として
-    /// 既存の記録ヘルパへ渡せる。累計量は `RECORD_MAX_BYTES` で打ち切る。
+    /// 子側の記録器。攻撃結果を 1 回だけ pipe へ書く。累計量は `RECORD_MAX_BYTES` で打ち切る。
+    /// 監査レコードは書かない（攻撃側が書いた記録は SEC-4 の証拠にならない。#2028）。
     pub struct Recorder {
         inner: Mutex<RecorderState>,
     }
@@ -1915,7 +2749,6 @@ mod linux {
         writer: PipeWriter,
         written: usize,
         outcome_written: bool,
-        audits: usize,
     }
 
     impl Recorder {
@@ -1925,7 +2758,6 @@ mod linux {
                     writer,
                     written: 0,
                     outcome_written: false,
-                    audits: 0,
                 }),
             }
         }
@@ -1944,11 +2776,6 @@ mod linux {
             Ok(())
         }
 
-        /// これまでに記録した監査レコードの件数（要求ごとの記録確認用）。
-        fn audit_count(&self) -> usize {
-            self.inner.lock().expect("recorder lock").audits
-        }
-
         /// 攻撃の結果を記録する（1 回だけ。2 回目は panic し、子の異常終了として失敗にする）。
         pub fn outcome(&self, outcome: AttackOutcome) {
             {
@@ -1958,18 +2785,6 @@ mod linux {
             }
             self.write_line(&format!("outcome={}", outcome.render()))
                 .expect("write outcome");
-        }
-    }
-
-    impl AuditSink for Recorder {
-        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
-            let bytes = encode_json_line(record)
-                .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to encode record"))?;
-            let text = String::from_utf8(bytes)
-                .map_err(|_| TraitError::new(ErrorCode::Internal, "record is not UTF-8"))?;
-            self.write_line(&format!("audit={}", text.trim_end_matches('\n')))?;
-            self.inner.lock().expect("recorder lock").audits += 1;
-            Ok(())
         }
     }
 
@@ -1988,7 +2803,8 @@ mod linux {
             Some(i) => {
                 let id = args.get(i + 1).expect("case id after --scenario");
                 let rootfs = args.get(i + 2).expect("rootfs path after the case id");
-                scenario(id, Path::new(rootfs));
+                let state_root = args.get(i + 3).expect("state root path after the rootfs");
+                scenario(id, Path::new(rootfs), Path::new(state_root));
             }
             None => dispatcher(),
         }
@@ -2088,10 +2904,94 @@ mod linux {
         rx
     }
 
-    /// 共通関数（ディスパッチャ側）: 1 ケースを「起動 → 攻撃 → 判定 → 後始末」で実行する。
+    /// 状態ルート（ケースごとに排他作成する 0700 のディレクトリ。`@audit.log` と状態ストアの置き場。drop で削除）を
+    /// `rootfs` の隣に作る。名前は rootfs と同じ接頭辞に `-state` を付ける（canary の `-canary` と同じ規則）。
+    fn make_state_root(rootfs: &Path) -> Rootfs {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let path = state_root_for(rootfs);
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .expect("exclusively create the state root");
+        Rootfs(path)
+    }
+
+    fn state_root_for(rootfs: &Path) -> PathBuf {
+        let mut name = rootfs.as_os_str().to_os_string();
+        name.push("-state");
+        PathBuf::from(name)
+    }
+
+    /// カーネル監査ログの置き場（auditd の既定）。
+    const KERNEL_AUDIT_LOG: &str = "/var/log/audit/audit.log";
+    /// カーネル監査ログの読み出し上限（ケース 1 件の開始後に増えた分）。
+    const KERNEL_AUDIT_READ_MAX: u64 = 16 * 1024 * 1024;
+    /// 記録が audit ログに現れるのを待つ上限（REPAIR-5）。
+    const KERNEL_AUDIT_WAIT: Duration = Duration::from_secs(10);
+
+    /// opt-in の段（`KERNEL_AUDIT_ENV=1`）が有効か。
+    fn kernel_audit_enabled() -> bool {
+        std::env::var(super::KERNEL_AUDIT_ENV).is_ok_and(|v| v == "1")
+    }
+
+    /// opt-in の段の前提（Landlock ABI 7 以上・audit ログの可読）を確かめる。欠けたら skip せず panic（失敗）にする。
+    fn require_kernel_audit_prerequisites() {
+        let support = detect_landlock_abi()
+            .unwrap_or_else(|e| panic!("{}=1 needs Landlock: {e}", super::KERNEL_AUDIT_ENV));
+        assert!(
+            support.abi.get() >= MIN_LANDLOCK_AUDIT_ABI,
+            "{}=1 needs Landlock ABI {MIN_LANDLOCK_AUDIT_ABI}+, detected {}",
+            super::KERNEL_AUDIT_ENV,
+            support.abi.get()
+        );
+        std::fs::File::open(KERNEL_AUDIT_LOG).unwrap_or_else(|e| {
+            panic!(
+                "{}=1 needs a readable {KERNEL_AUDIT_LOG} (auditd + permission): {e}",
+                super::KERNEL_AUDIT_ENV
+            )
+        });
+    }
+
+    /// カーネル監査ログの現在の長さ（ケースの開始前に取り、増えた分だけを読む）。
+    fn kernel_audit_len() -> u64 {
+        std::fs::metadata(KERNEL_AUDIT_LOG)
+            .unwrap_or_else(|e| panic!("stat {KERNEL_AUDIT_LOG}: {e}"))
+            .len()
+    }
+
+    /// `start` 以降に追記されたカーネル監査ログを上限つきで読む。
+    fn read_kernel_audit_since(start: u64) -> String {
+        use std::io::{Seek as _, SeekFrom};
+        let mut file = std::fs::File::open(KERNEL_AUDIT_LOG)
+            .unwrap_or_else(|e| panic!("open {KERNEL_AUDIT_LOG}: {e}"));
+        file.seek(SeekFrom::Start(start))
+            .unwrap_or_else(|e| panic!("seek {KERNEL_AUDIT_LOG}: {e}"));
+        let mut bytes = Vec::new();
+        file.take(KERNEL_AUDIT_READ_MAX)
+            .read_to_end(&mut bytes)
+            .unwrap_or_else(|e| panic!("read {KERNEL_AUDIT_LOG}: {e}"));
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// 状態ルートの `@audit.log` を上限つきで読んで解析する（無ければ空）。読めない・不正なら `Err`。
+    fn collect_state_root_log(state_root: &Path) -> Result<Vec<super::AuditLine>, String> {
+        let path = state_root.join(AUDIT_LOG_FILE_NAME);
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("open {}: {e}", path.display())),
+        };
+        let mut text = String::new();
+        file.take(super::STATE_LOG_MAX_BYTES as u64 + 1)
+            .read_to_string(&mut text)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        super::parse_state_root_log(&text)
+    }
+
+    /// 共通関数（ディスパッチャ側）: 1 ケースを「起動 → 攻撃 → 回収 → 判定 → 後始末」で実行する。
     ///
-    /// rootfs の作成・自身のシナリオ再起動・期限付き待機・出力回収を行い、rootfs は drop で削除する。
-    /// 判定そのものはシナリオ内（`scenario`）で `judge` により行い、終了コード 0 を `Pass` とする。
+    /// rootfs・状態ルートの作成、自身のシナリオ再起動、期限付き待機、出力と監査の証拠の回収を行い、
+    /// 判定（`judge`）はここ（コンテナの外・ホスト視点）で行う。rootfs と状態ルートは drop で削除する。
     /// 起動ユーザーの前提（`EscapeCase::launcher`）が成立しなければ、シナリオを起動せず `NotApplicable` を返す。
     fn run_case(case: &EscapeCase) -> CaseRun {
         // 前提の判定はディスパッチャ自身（分離前・ホスト側）の実効 UID で行う。user namespace 内では
@@ -2108,16 +3008,67 @@ mod linux {
         NotApplicable(NotApplicable),
     }
 
+    /// 監査の証拠をコンテナの外で回収する。`NotApplicable` 以外は本番の配送経路の出力だけから作る。
+    fn collect_evidence(
+        case: &EscapeCase,
+        state_root: &Path,
+        meta: &ScenarioMeta,
+        kernel_start: Option<u64>,
+    ) -> Result<AuditEvidence, String> {
+        let AuditExpectation::Required { source, .. } = case.expectation.audit else {
+            return Ok(AuditEvidence::NotApplicable);
+        };
+        match source {
+            AuditSource::StateRootLog { .. } => Ok(AuditEvidence::StateRootLog {
+                lines: collect_state_root_log(state_root)?,
+                subject_pid: meta.pid_in_ns.map(u64::from),
+            }),
+            AuditSource::KernelAudit { blockers } => {
+                let Some(start) = kernel_start else {
+                    return Ok(AuditEvidence::NotCollected {
+                        reason: KERNEL_AUDIT_NOT_ENABLED,
+                    });
+                };
+                let pid = meta.child_pid.ok_or_else(|| {
+                    "harness invariant violated: a kernel-audit case has no child pid".to_string()
+                })?;
+                // 記録は非同期に audit ログへ届くため、見つかるか期限まで待つ（REPAIR-5）。
+                let deadline = Instant::now() + KERNEL_AUDIT_WAIT;
+                loop {
+                    let log = read_kernel_audit_since(start);
+                    let matched =
+                        count_landlock_access_records(&log, pid, blockers, meta.started_at);
+                    if matched > 0 || Instant::now() >= deadline {
+                        return Ok(AuditEvidence::KernelAudit { matched });
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    }
+
     /// `run_case` の本体: 起動前提の成立済みのケースを起動・判定・後始末する。
     fn run_scenario(case: &EscapeCase) -> CaseVerdict {
         let exe = std::env::current_exe().expect("current_exe");
         let rootfs = make_rootfs();
+        let state_root = make_state_root(&rootfs.0);
         // シナリオの異常終了・panic でも canary ディレクトリが残らないよう、ディスパッチャ側でも
         // 全終了経路（drop）で削除する（未作成なら no-op）。
         let _canary_cleanup = Rootfs(canary_dir_for(&rootfs.0));
+        // 開始前のカーネル監査ログの長さ（opt-in の段のみ）。
+        let kernel_start = (kernel_audit_enabled()
+            && matches!(
+                case.expectation.audit,
+                AuditExpectation::Required {
+                    source: AuditSource::KernelAudit { .. },
+                    ..
+                }
+            ))
+        .then(kernel_audit_len);
         let mut child = Command::new(&exe)
             .args(["--scenario", case.id])
             .arg(&rootfs.0)
+            .arg(&state_root.0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2141,41 +3092,74 @@ mod linux {
             stderr = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
         }
         print!("{stdout}");
+        let failed = |detail: String| CaseVerdict::Fail(vec![Mismatch::ScenarioFailed { detail }]);
         match status {
-            Some(st) if st.code() == Some(0) => match case.host_check {
-                None => CaseVerdict::Pass,
-                Some(check) => {
-                    let (euid, egid) = effective_ids();
-                    let view = HostView {
-                        rootfs: &rootfs.0,
-                        euid,
-                        egid,
-                        is_root: euid == 0,
-                    };
-                    match check(&view) {
-                        Ok(()) => CaseVerdict::Pass,
-                        Err(detail) => {
-                            CaseVerdict::Fail(vec![Mismatch::HostCheckFailed { detail }])
-                        }
-                    }
-                }
-            },
-            Some(st) => CaseVerdict::Fail(vec![Mismatch::ScenarioFailed {
-                detail: format!("scenario exited with {st}; stderr:\n{stderr}"),
-            }]),
-            None => CaseVerdict::Fail(vec![Mismatch::ScenarioFailed {
-                detail: format!("scenario did not exit within {limit:?}; stderr:\n{stderr}"),
-            }]),
+            Some(st) if st.code() == Some(0) => {}
+            Some(st) => return failed(format!("scenario exited with {st}; stderr:\n{stderr}")),
+            None => {
+                return failed(format!(
+                    "scenario did not exit within {limit:?}; stderr:\n{stderr}"
+                ));
+            }
         }
+        let meta = match ScenarioMeta::parse_from_stdout(&stdout) {
+            Ok(m) => m,
+            Err(e) => return failed(format!("invalid scenario result: {e}; stderr:\n{stderr}")),
+        };
+        let audit = match collect_evidence(case, &state_root.0, &meta, kernel_start) {
+            Ok(a) => a,
+            Err(e) => return failed(format!("audit evidence could not be collected: {e}")),
+        };
+        let mut verdict = judge(
+            &case.expectation,
+            &Observation {
+                exit: meta.exit,
+                outcome: meta.outcome,
+                audit,
+            },
+        );
+        if let Some(check) = case.host_check {
+            let (euid, egid) = effective_ids();
+            let view = HostView {
+                rootfs: &rootfs.0,
+                euid,
+                egid,
+                is_root: euid == 0,
+            };
+            if let Err(detail) = check(&view) {
+                let mismatch = Mismatch::HostCheckFailed { detail };
+                verdict = match verdict {
+                    CaseVerdict::Fail(mut m) => {
+                        m.push(mismatch);
+                        CaseVerdict::Fail(m)
+                    }
+                    _ => CaseVerdict::Fail(vec![mismatch]),
+                };
+            }
+        }
+        verdict
     }
 
     fn dispatcher() {
+        let kernel_audit = kernel_audit_enabled();
+        if kernel_audit {
+            require_kernel_audit_prerequisites();
+        }
         let mut failed = 0usize;
         let mut verified = 0usize;
         let mut not_applicable = Vec::new();
+        let mut audit_not_verified = Vec::new();
         for case in CASES {
             match run_case(case) {
                 CaseRun::Ran(CaseVerdict::Pass) => verified += 1,
+                CaseRun::Ran(CaseVerdict::AuditNotVerified { layer, reason }) => {
+                    // 攻撃の結果は期待どおりだが、要求された監査は照合していない。合格として数えない（SEC-4）。
+                    println!(
+                        "escape_suite: {} verdict=audit-not-verified behavior=SEC-4 layer={layer} reason={reason:?}",
+                        case.id
+                    );
+                    audit_not_verified.push(case.id);
+                }
                 CaseRun::Ran(verdict) => {
                     failed += 1;
                     eprintln!("escape_suite: {} verdict=fail {verdict:?}", case.id);
@@ -2196,11 +3180,18 @@ mod linux {
             is_root() || not_applicable.is_empty(),
             "non-root launcher must run every case: {not_applicable:?}"
         );
+        // opt-in の段では、監査を照合できなかったケースがあってはならない（ハーネスの不変条件）。
+        assert!(
+            !kernel_audit || audit_not_verified.is_empty(),
+            "kernel audit was enabled but these cases were not verified: {audit_not_verified:?}"
+        );
         println!(
-            "escape_suite: SEC-2 harness verified {verified} of {} case(s), not applicable {:?} (root={})",
+            "escape_suite: SEC-2 harness verified {verified} of {} case(s), not applicable {:?}, audit not verified {:?} (root={}, kernel_audit={})",
             CASES.len(),
             not_applicable,
-            is_root()
+            audit_not_verified,
+            is_root(),
+            kernel_audit
         );
     }
 
@@ -2230,19 +3221,143 @@ mod linux {
         }
     }
 
-    /// シナリオ: 分離 → 子で攻撃 → 記録回収 → 判定。結果は 1 行出力し、不合格は終了コード 1 にする。
-    fn scenario(case_id: &str, rootfs: &Path) {
+    /// 現在の UNIX 秒。
+    fn unix_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// 本番の監査配送の入口（`FileAuditSink` ← `ControlAuditRelay`）を作る。`ControlAuditRelay::spawn` は単一スレッドの
+    /// 呼び出し元を要求し helper プロセスを fork するため、`isolate()` とスレッドの作成より前に呼ぶ（複数スレッドに
+    /// なった後の `FileAuditSink` は NETLINK_AUDIT の代替経路へ回り、非 root では記録を失う）。
+    fn spawn_relay(state_root: &Path) -> Arc<ControlAuditRelay> {
+        let sink = FileAuditSink::open_in_state_root(Some(state_root.to_path_buf()))
+            .unwrap_or_else(|e| panic!("open the audit sink in the state root: {e}"));
+        Arc::new(
+            ControlAuditRelay::spawn(sink).unwrap_or_else(|e| panic!("spawn the audit relay: {e}")),
+        )
+    }
+
+    /// シナリオ: 分離 → 子で攻撃 → 記録回収 → meta 行の出力。判定はディスパッチャが行う
+    /// （監査の証拠はシナリオの外で回収するため）。canary の変化はここで検出して失敗（終了コード 1）にする。
+    fn scenario(case_id: &str, rootfs: &Path, state_root: &Path) {
         let case = CASES
             .iter()
             .find(|c| c.id == case_id)
             .unwrap_or_else(|| panic!("unknown escape case {case_id:?}"));
-        let is_root = is_root();
         // 継承した seccomp フィルタがあると拒否を組み込み段へ帰属できないため、事前条件として失敗扱いにする。
         assert_eq!(
             seccomp_mode_of_self(),
             "0",
             "precondition: the test process must not inherit a seccomp filter (cannot attribute the denial to the built-in stage)"
         );
+        let started_at = unix_secs();
+        // seccomp の記録を運ぶ本番の監査配送の入口（relay）は、最初に（`isolate()`・スレッドより前に）作る。
+        let relay =
+            (case.body == CaseBody::ProbeWithSeccompListener).then(|| spawn_relay(state_root));
+        let meta = match case.body {
+            CaseBody::StartRejection => start_rejection(rootfs, state_root, started_at),
+            CaseBody::Probe | CaseBody::ProbeWithSeccompListener => {
+                probe_scenario(case, rootfs, relay, started_at)
+            }
+        };
+        println!("{}", meta.render());
+    }
+
+    /// `/proc/<pid>/status` の `NSpid` の末尾（対象自身の PID namespace での pid）を返す。本番の supervisor の変換
+    /// （`seccomp_notify::parse_nspid_innermost`）と同じ規則で、行が無い・0・壊れた値は `None`（記録しない）。
+    /// `seccomp_notif.pid` は listener の PID namespace の値で、無変換では記録に渡せない（`SeccompDenialReport::from_user_notif`）。
+    fn pid_in_own_ns(pid_in_listener_ns: u32) -> Option<u32> {
+        let status = std::fs::read(format!("/proc/{pid_in_listener_ns}/status")).ok()?;
+        let line = status
+            .split(|b| *b == b'\n')
+            .find_map(|l| l.strip_prefix(b"NSpid:".as_slice()))?;
+        let last = line
+            .split(|b| b.is_ascii_whitespace())
+            .rfind(|t| !t.is_empty())?;
+        std::str::from_utf8(last)
+            .ok()?
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n > 0)
+    }
+
+    /// 応答者（ESC-03）: seccomp の listener の通知を受けて、`record_seccomp_denial_for` → 本番の sink で記録し、
+    /// `-EPERM` で応答する。試験側の応答ループで、supervisor の `SeccompNotifyHub` そのものではない（core の公開 API
+    /// だけで組む）。記録の成否にかかわらず応答は必ず返し、許可（`CONTINUE`）には覆さない。
+    fn respond_loop(
+        listener: &SeccompListener,
+        sink: &dyn AuditSink,
+        container: &ContainerId,
+        stop: &AtomicBool,
+    ) {
+        const POLL: Duration = Duration::from_millis(100);
+        // どの経路でも有限時間で抜ける（REPAIR-5）。子の待ち上限より少し長くする。
+        let deadline = Instant::now() + timeout() + Duration::from_secs(5);
+        while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+            match listener.wait(POLL) {
+                Ok(ListenerReadiness::Readable) => {}
+                Ok(ListenerReadiness::Idle) => continue,
+                // 利用者の消滅（子の終了）か読めない状態。以後の通知は来ない。
+                _ => break,
+            }
+            let notification = match listener.receive() {
+                Ok(Some(n)) => n,
+                Ok(None) => continue,
+                Err(_) => break,
+            };
+            let id = notification.id();
+            // 対象がまだ応答待ちであることを確かめてから記録する（pid の再利用で別プロセスを記録しない）。
+            if listener.is_pending(id).unwrap_or(false)
+                && let Some(pid_in_process_ns) = pid_in_own_ns(notification.pid_in_listener_ns())
+                && let Ok(report) = SeccompDenialReport::from_user_notif(
+                    pid_in_process_ns,
+                    notification.nr(),
+                    notification.arch(),
+                )
+                && let Ok(at) = AuditTimestamp::now()
+            {
+                let _ = record_seccomp_denial_for(&report, at, Some(container), sink);
+            }
+            let _ = listener.deny_eperm(id);
+        }
+    }
+
+    /// 応答者のスレッドの停止用ハンドル。
+    struct Responder {
+        stop: Arc<AtomicBool>,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    impl Responder {
+        /// 応答者を起動する。`fork` の後（子を作った後）に呼ぶこと（`fork_single_threaded` は単一スレッドを要求する）。
+        fn start(listener: SeccompListener, relay: Arc<ControlAuditRelay>) -> Self {
+            let stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let container = ContainerId::new(AUDIT_CONTAINER_ID).expect("harness container id");
+            let handle = std::thread::spawn(move || {
+                respond_loop(&listener, relay.as_ref(), &container, &flag);
+            });
+            Responder { stop, handle }
+        }
+
+        /// 停止を指示して join する。ループは 100 ms ごとに停止を見る。
+        fn finish(self) {
+            self.stop.store(true, Ordering::Release);
+            self.handle.join().expect("the responder thread panicked");
+        }
+    }
+
+    /// 子（コンテナ）で攻撃を実行するシナリオ（`CaseBody::Probe` / `ProbeWithSeccompListener`）。
+    fn probe_scenario(
+        case: &EscapeCase,
+        rootfs: &Path,
+        relay: Option<Arc<ControlAuditRelay>>,
+        started_at: u64,
+    ) -> ScenarioMeta {
+        let is_root = is_root();
         let mut namespaces = NamespaceSet::empty()
             .with(Namespace::Pid)
             .with(Namespace::Mount)
@@ -2278,11 +3393,34 @@ mod linux {
         let attack = case.attack;
         let attack_canary = canary.clone();
         // 親側の writer 端は fork 時に閉じられる（クロージャは子にだけ残る）ため、子の終了で EOF になる。
-        let child = spawn_container_probe(rootfs, (case.stages)(), move || {
+        let probe = move || {
             let recorder = Recorder::new(writer);
             attack(&recorder, &attack_canary);
-        })
-        .unwrap_or_else(|e| panic!("spawn: {e}"));
+        };
+        let stages = (case.stages)();
+        let (child, responder) = match case.body {
+            CaseBody::ProbeWithSeccompListener => {
+                let (child, listener) =
+                    spawn_container_probe_with_seccomp_listener(rootfs, stages, probe)
+                        .unwrap_or_else(|e| panic!("spawn with the seccomp listener: {e}"));
+                // 応答者は子を作った後に立てる。子は listener の ACK を受けた後に拒否対象の syscall を発行し、
+                // 通知は応答者が読むまでカーネル内で保留される（ENOSYS にならない）。
+                let relay = relay.expect("a listener case records to the state root");
+                (child, Some(Responder::start(listener, relay)))
+            }
+            CaseBody::Probe => (
+                spawn_container_probe(rootfs, stages, probe)
+                    .unwrap_or_else(|e| panic!("spawn: {e}")),
+                None,
+            ),
+            CaseBody::StartRejection => unreachable!("handled by start_rejection"),
+        };
+        let child_pid = child.pid();
+        // seccomp の記録の期待値: 子自身の PID namespace での pid。応答者が通知を読むまで子の最初の拒否は
+        // 保留されるが、念のため応答者の起動前（ここ）に外側から独立に読む。listener を使わないケースは不要。
+        let pid_in_ns = (case.body == CaseBody::ProbeWithSeccompListener)
+            .then(|| pid_in_own_ns(child_pid))
+            .flatten();
         // パイプ容量を超える記録でも子が write で詰まらないよう、子の待機と並行して別スレッドで読む（REPAIR-5）。
         // fork は単一スレッド必須（`fork_single_threaded` が Threads: 1 を要求）のため、読み取りスレッドは fork の後に起動する。
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2298,6 +3436,9 @@ mod linux {
             let _ = child.kill_and_reap(Duration::from_secs(5));
             panic!("wait: {e}")
         });
+        if let Some(responder) = responder {
+            responder.finish();
+        }
         let exit = match exit {
             ChildExit::Exited(c) => ObservedExit::Exited(c),
             ChildExit::Signaled(s) => ObservedExit::Signaled(s),
@@ -2310,36 +3451,156 @@ mod linux {
             .recv_timeout(Duration::from_secs(5))
             .unwrap_or_else(|e| panic!("record read did not finish in time: {e}"))
             .expect("read record");
-        let observation = match parse_record(&text) {
-            // outcome 欠落は `judge` が終了状態と突き合わせて判定する（シグナル終了では audit 行のみが残り得る）。
-            Ok(rec) => Observation {
-                exit,
-                outcome: rec.outcome,
-                audit_layers: rec.audit_layers,
-            },
-            Err(e) => panic!("invalid record from the container: {e}"),
-        };
-        let mut verdict = judge(&case.expectation, &observation);
+        // outcome 欠落は `judge` が終了状態と突き合わせて判定する（シグナル終了では行が残らないことがある）。
+        let record = parse_record(&text)
+            .unwrap_or_else(|e| panic!("invalid record from the container: {e}"));
         // ホスト側 canary の無変更を、コンテナ外から観測する（到達・書き込みの副作用の有無）。
         if let Some(detail) = canary_violation(&canary_dir.0, &canary) {
-            let mismatch = Mismatch::HostTargetModified { detail };
-            verdict = match verdict {
-                CaseVerdict::Pass => CaseVerdict::Fail(vec![mismatch]),
-                CaseVerdict::Fail(mut m) => {
-                    m.push(mismatch);
-                    CaseVerdict::Fail(m)
-                }
-            };
+            eprintln!(
+                "escape_suite: {} verdict=fail {:?}",
+                case.id,
+                Mismatch::HostTargetModified { detail }
+            );
+            drop(canary_dir);
+            std::process::exit(1);
         }
-        match verdict {
-            CaseVerdict::Pass => {
-                println!("escape_suite: {} verdict=pass exit={}", case.id, exit);
+        ScenarioMeta {
+            exit,
+            outcome: record.outcome,
+            child_pid: Some(child_pid),
+            pid_in_ns,
+            started_at,
+        }
+    }
+
+    /// `start` の拒否で何も起動しないことの確認用 launcher。拒否の監査 sink として本番の `FileAuditSink`
+    /// （状態ルートの `@audit.log` が主経路）を返す。`launch` に到達したら（＝拒否されなかったら）回数を数えて
+    /// 失敗を返す。
+    ///
+    /// 本番の `ProductionLauncher` は構築にホストの前提（cgroup 等）を要するため使わない。`rejection_audit_sink` が
+    /// 構築時の sink をそのまま返すことは `launcher.rs` の単体試験（`sec4_rejection_audit_sink_is_the_launcher_sink`）
+    /// が担い、ここでは `start` の拒否経路から本番の sink 経由で `@audit.log` に届くまでを照合する（#2028）。
+    ///
+    /// `ControlAuditRelay` は使わない: relay は制御チャネルと seccomp の記録しか運ばず、`Mount` の記録を
+    /// `InvalidArgument` で拒否する（supervisor の `start` は launcher の sink に relay を渡しているため、本番の
+    /// supervisor 経由では bind の元の拒否の監査が落ちる。残余として追跡する。docs/design/audit-delivery.md）。
+    struct RejectionOnlyLauncher {
+        sink: FileAuditSink,
+        launches: AtomicUsize,
+    }
+
+    impl ProcessLauncher for RejectionOnlyLauncher {
+        fn rejection_audit_sink(&self) -> Option<&dyn AuditSink> {
+            Some(&self.sink)
+        }
+
+        fn launch(
+            &self,
+            _spec: &LaunchSpec,
+            _timeout: Duration,
+        ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            Err(TraitError::new(
+                ErrorCode::Internal,
+                "the escape suite launcher never launches",
+            ))
+        }
+    }
+
+    /// ESC-08 の本体: マウント元が rootfs・bundle・状態ルートの bind を持つ config の `start` が、いずれも
+    /// `InvalidArgument` で拒否されること（launcher に到達しない・状態は Created のまま）を確かめる。
+    /// 記録は本番の拒否経路が出す（ここでは作らない）。ディスパッチャが `@audit.log` の mount 層 3 行を照合する。
+    fn start_rejection(bundle: &Path, state_root: &Path, started_at: u64) -> ScenarioMeta {
+        let id = ContainerId::new(AUDIT_CONTAINER_ID).expect("harness container id");
+        // `FileAuditSink` は単一スレッドの呼び出し元から記録するとき、書き込みを fork した子で行う（複数スレッドでは
+        // NETLINK_AUDIT の代替経路へ回る）。このシナリオは `start` の拒否までスレッドを作らない。
+        let sink = FileAuditSink::open_in_state_root(Some(state_root.to_path_buf()))
+            .unwrap_or_else(|e| panic!("open the audit sink in the state root: {e}"));
+        std::fs::create_dir(bundle.join("rootfs")).expect("create bundle/rootfs");
+        let store = FileStateStore::open(
+            StateRoot::from_override(state_root.to_path_buf()).expect("state root"),
+        )
+        .unwrap_or_else(|e| panic!("open the state store: {e}"));
+        let recorder = OpRecorder::new();
+        let config = |mounts: serde_json::Value| {
+            serde_json::to_vec(&serde_json::json!({
+                "ociVersion": "1.2.0",
+                "root": {"path": "rootfs"},
+                "process": {"user": {"uid": 0, "gid": 0}, "args": ["/bin/echo", "it"], "cwd": "/"},
+                "mounts": mounts,
+                "linux": {"namespaces": [
+                    {"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "uts"}, {"type": "ipc"}
+                ]}
+            }))
+            .expect("serialize config")
+        };
+        let config_path = bundle.join("config.json");
+        std::fs::write(&config_path, config(serde_json::json!([]))).expect("write config");
+        create(
+            &store,
+            &recorder,
+            &CreateRequest::new(id.clone(), bundle.to_path_buf()).expect("absolute bundle"),
+        )
+        .unwrap_or_else(|e| panic!("create: {e}"));
+
+        let launcher = Arc::new(RejectionOnlyLauncher {
+            sink,
+            launches: AtomicUsize::new(0),
+        });
+        let dyn_launcher: Arc<dyn ProcessLauncher> = launcher.clone();
+        let host_state_root = store
+            .host_state_root()
+            .expect("the file store knows its root")
+            .to_path_buf();
+        let sources = [bundle.join("rootfs"), bundle.to_path_buf(), host_state_root];
+        let mut outcome = AttackOutcome::Failed;
+        for source in &sources {
+            let mounts = serde_json::json!([{
+                "destination": "/data",
+                "type": "bind",
+                "source": source.to_str().expect("utf-8 path"),
+                "options": ["rbind", "rw"]
+            }]);
+            std::fs::write(&config_path, config(mounts)).expect("rewrite config");
+            match start(
+                &store,
+                &recorder,
+                &dyn_launcher,
+                &StartRequest::new(id.clone()),
+                &StartTimeouts::default(),
+            ) {
+                // 拒否されなかった（bind の元の制限の欠落）。残りは試さず、成功として失敗にする。
+                Ok(_) => {
+                    outcome = AttackOutcome::Succeeded;
+                    break;
+                }
+                Err(err) => assert_eq!(
+                    err.code(),
+                    ErrorCode::InvalidArgument,
+                    "bind source {} must be rejected as InvalidArgument: {err}",
+                    source.display()
+                ),
             }
-            CaseVerdict::Fail(ref m) => {
-                println!("escape_suite: {} verdict=fail {m:?}", case.id);
-                drop(canary_dir);
-                std::process::exit(1);
-            }
+        }
+        assert_eq!(
+            launcher.launches.load(Ordering::SeqCst),
+            0,
+            "a rejected start must never reach the launcher"
+        );
+        let state = store
+            .get(&GetStateRequest::new(id))
+            .expect("state after the rejected starts");
+        assert_eq!(
+            state.status().state(),
+            ContainerState::Created,
+            "a rejected start leaves the container Created"
+        );
+        ScenarioMeta {
+            exit: ObservedExit::Exited(0),
+            outcome: Some(outcome),
+            child_pid: None,
+            pid_in_ns: None,
+            started_at,
         }
     }
 }

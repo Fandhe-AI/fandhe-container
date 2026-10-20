@@ -13,7 +13,7 @@
 | 終点 | supervisor の bin が結果チャネル（stdout の pipe）へ書く `FCSUP1 OK <pid>` の 1 行を、読み取りスレッドが読み終えた直後の時刻（チャネルの待ちは区間に入れない）。復号は `StartReport::decode` だけで行う |
 | 経路 | core `create` → `systemd-run`（`USER_SCOPE_WRAPPER_ARGS`。本番の start と同じ包み込み・環境・cwd。下の「包み込みの一致」）→ supervisor の bin → core の本番 launcher。CLI は経由しない（CLI の start は MS-6 のため、経由すると MS-2 の TASK-88 と依存が逆転する） |
 | 区間に入るもの | create（状態の作成・bundle 検証）・user スコープの取得（D-Bus 往復。本番の start が起動のたびに払う費用〔#2081・#2122〕のため含める）・supervisor の手順 1〜9（argv 検証・cgroup の連鎖・監査 sink・本番 launcher による中間プロセス → PID 1・Landlock・pre-pivot 段・開始ゲート・Running の記録・報告） |
-| 区間に入らないもの | bundle の作成・試行後の後始末（scope・cgroup・プローブの回収）・ワークロードの睡眠・CLI と `state` の往復・`XDG_RUNTIME_DIR` の検査など計測前の検証 |
+| 区間に入らないもの | bundle の作成・試行後の後始末（CLI の `delete`・scope・cgroup・プローブの回収。所要時間は標本に入らない。OCI-6）・ワークロードの睡眠・CLI と `state` の往復・`XDG_RUNTIME_DIR` の検査など計測前の検証 |
 | metric | `startup_create_to_supervisor_ok_p95_ms`（ms）。`startup_latency_p50_ms`（TASK-46.1）とは区間・統計量が違う。区間の始点・終点・中身は変わらず包み込みの忠実度だけが上がったため、metric 名と `method` は変えない（#2089） |
 
 ### 包み込みの一致（#2089・CORE-3・CORE-4）
@@ -49,24 +49,30 @@
 | ---- | ---- |
 | `--trials` | 既定 30・範囲 20〜200（20 未満だと p95 が最大値と同じ順位になる） |
 | `--warmup` | 既定 3・範囲 0〜20（標本に入れない。失敗は数える） |
+| `--cli-bin` | 後始末の `delete` を呼ぶ CLI（`fandhe-container`）の絶対パス。計測では必須で、`PATH` からは探さない。`--supervisor-bin` と同じ検証（通常ファイル・所有者が自分か root・group/other 書き込み不可・祖先も安全）を通す。`--scope-only` とは併用できない |
 | `--timeout-secs` | 全体の期限。既定 1800・範囲 60〜7200。各試行の前と、各試行の後始末を終えた直後（結果の公開前）に照合し、超えたら成功結果・metric を出さず `deadline-exceeded` で失敗する |
 | p95 | nearest-rank 法。昇順に並べ、順位 `ceil(95·n/100)` の要素。p50・max は診断用 |
 
 ## 失敗の扱い（REPAIR-3・fail-closed）
 
-- 失敗は種別ごとに数える: `create` / `spawn` / `report_err`（`CODE` 別の内訳つき）/ `report_timeout` / `report_eof` / `report_invalid` / `supervisor_exit`（supervisor の終了コード不一致・ワークロードの終了コードが 0 でない場合を含む）/ `cleanup`
+- 失敗は種別ごとに数える: `create` / `spawn` / `report_err`（`CODE` 別の内訳つき）/ `report_timeout` / `report_eof` / `report_invalid` / `supervisor_exit`（supervisor の終了コード不一致・ワークロードの終了コードが 0 でない場合を含む）/ `cleanup` / `cleanup_delete_rejected`（後始末の `delete` の拒否・期限超過・起動失敗。`cleanup_delete_codes` にコード別の内訳。OCI-6・#2157）
 - 1 件でも失敗または後始末の残りがあれば、`metrics` を空 `{}` にして `failures` を載せた JSON を出し、終了コード 1 で終わる。部分的な標本の p95 をゲートへ流さない
 - 分離を弱める経路（Landlock なし・フェイクの launcher・supervisor の迂回）は実装しない。launcher が拒否したら `report_err` として数える
 
 ## 後始末と期限（REPAIR-5）
 
-core の `delete` は使わない。ベンチのプロセスは試行ごとの systemd スコープの外にいるため、`delete` は委譲スコープの照合で `FailedPrecondition` になる（#2049 の観察と同じ）。記録済みのスコープを外から開く core の API は #2096（#2060 案 B による #1314 の決定の変更）で入ったが、ベンチの後始末をそれへ寄せる変更は別 issue の範囲で、現状は検証してから状態ルートごと消す（空でない cgroup への `cgroup.kill` は core の `delete` が契約上拒否するため、寄せられるのは正常系だけである）。
+後始末は計測区間の外で行う（標本の `total` は OK 行を読んだ時点で確定済みで、後始末の所要時間は入らない。REPAIR-8・CORE-10）。状態と cgroup の削除は手書きせず、CLI の実バイナリ（`--cli-bin`）の `delete` に任せる（OCI-6・#2157）。区間の起動経路は CLI を経由しない（MS-2 / MS-6 の依存の向き）という決まりは変わらず、CLI を呼ぶのは区間の外の `delete` だけである。
+
+`delete` は本番の `start` と同じ包み込み（`USER_SCOPE_WRAPPER_ARGS` ＋ `--unit=fcsl-del-<id>`）で `<cli> --root <状態ルート> delete <id>` を実行する。包むことで CLI 自身が委譲スコープの中で動き、委譲スコープの検出が成功する。検出したスコープは試行のスコープと食い違うため、core の `delete` は記録済みスコープを fd 起点で検証して開く `remove_recorded`（#2096）へ回り、試行スコープの外からでも記録の cgroup を消せる。ログインセッションから直接呼ぶと検出が失敗するので、包みは必須である。stdin・stdout は `/dev/null`、stderr は作業ディレクトリ（0700）内の排他作成ファイルへ書かせ、先頭 4096 バイトだけを読む。
 
 1. supervisor の終了を 30 秒まで待つ（成功は終了コード 0、ERR は報告の終了コードと一致）。超えたら kill し、回収を 10 秒まで待つ
-2. 状態を確かめる（成功は `Stopped`、ERR は `Created` かつ pid なし）
-3. 記録の cgroup（`fc-<id>@<instance>`。`CgroupName` で作る）が消えているか。残っていれば空の cgroup を `rmdir` し、空でなければ `cgroup.kill` の後に消す。スコープ・cgroup の空判定は子孫を含む `cgroup.events` の `populated` で行い、読み取り失敗は後始末失敗とする
-4. `/proc` を走査し、nonce を持つプローブが 0 件になるまで 10 秒まで待つ
-5. すべて満たしたときだけ状態ルートを消す。満たせなければ ID を `leftover_ids` に積み、以後の試行を止め、作業ディレクトリは調査用に残す（相対名だけを stderr へ出す）。systemd-run の stderr は捨てる（絶対パス・OS のエラー文字列を出さない）
+2. スコープ内の残存を `cgroup.kill` で止めて空を確かめる。残れば後始末失敗
+3. 状態を確かめる（成功は `Stopped`、ERR は `Created` かつ pid なし）
+4. CLI の `delete` を 10 秒を上限に 1 回呼ぶ
+5. 正常系（`delete` が終了コード 0）: 記録の cgroup（`fc-<id>@<instance>`）が消えたこと、`delete` 用スコープ（`fcsl-del-<id>`）が空であること、`/proc` の nonce を持つプローブが 0 件であること（10 秒まで待つ）だけを確かめる。cgroup の手書きの削除はしない。残っていれば製品側の不具合のしるしとして後始末失敗にする。満たしたら状態ルート（`delete` が消さないロックファイル等を含む）を消す
+6. 異常系（`delete` の拒否・期限超過・起動失敗）: 拒否は握りつぶさず `failures.cleanup_delete_rejected` と `cleanup_delete_codes` に残し、`metrics` を空にする。コードは CLI の stderr の JSON の `code`（既知の `ErrorCode` のときだけ。それ以外・読めない場合は `UNPARSED`）、期限超過は `TIMEOUT`、起動失敗は `SPAWN` の固定語彙で、message・パス・errno は出さない。そのうえで従来の強制後始末（GC 猶予 → `cgroup.kill` → `rmdir`、プローブの消滅確認、状態ルートの削除）を行い、ホストに残骸を残さない。強制後始末が成功すれば試行は続くが、結果は clean にならない。強制後始末も失敗したら ID を `leftover_ids` に積み、以後の試行を止める（fail-closed）。作業ディレクトリは調査用に残す（相対名だけを stderr へ出す）。systemd-run の stderr は捨てる（絶対パス・OS のエラー文字列を出さない）
+
+採らなかった案: ベンチ内で core の `oci_runtime::delete` を直接呼び、ベンチ専用の `ContainerCgroupRemover` を作る案。`scope()` に検証していない値を返すことになり、「委譲スコープの検出の失敗を記録の経路へ回すか」というオーナー判断待ち（#2133）をベンチ側で先取りしてしまうため採らない。
 
 応答待ち（結果 1 行・supervisor の終了・回収・cgroup・プローブ）はすべて期限つきで、全体の期限の残りで切り詰める。
 
@@ -86,7 +92,7 @@ core の `delete` は使わない。ベンチのプロセスは試行ごとの s
 
 scope 取得だけを測る。本計測と同じ包み込み（`scope_wrap::scoped_noop_command`）で、自分自身の `--startup-latency-noop`（すぐ終了コード 0 で終わる）を起動し、`systemd-run` の起動から終了を回収するまでを試行ごとに測る。create・supervisor・ランチャー・Landlock は含まない。
 
-- 実行: `cargo bench -p fandhe-container-benches --bench startup_latency -- --scope-only [--trials N] [--warmup N] [--timeout-secs S] [--systemd-run <絶対パス>] [--output <絶対パス>]`。`--supervisor-bin`・`--work-dir` は受け付けない。実機前提（Linux・非 root・`systemd-run --user`）で CI では実行しない
+- 実行: `cargo bench -p fandhe-container-benches --bench startup_latency -- --scope-only [--trials N] [--warmup N] [--timeout-secs S] [--systemd-run <絶対パス>] [--output <絶対パス>]`。`--supervisor-bin`・`--cli-bin`・`--work-dir` は受け付けない。実機前提（Linux・非 root・`systemd-run --user`）で CI では実行しない
 - 出力: `kind: "diagnostic"`・`metrics` は常に空（`bench-check-manual`・`bench-baseline-manual` の入力にならず、渡しても metric の集合が合わず 2 で拒否される）。統計は `summary`（p50・p95・max）に入る。失敗・scope の残りがあれば終了コード 1
 - 読み方: 本計測の p95 と診断の p95 を同じホストで並べる。両方悪化していれば systemd・D-Bus の揺れ、本計測だけ悪化していれば製品側の回帰
 
@@ -97,6 +103,6 @@ scope 取得だけを測る。本計測と同じ包み込み（`scope_wrap::scop
 ## 残余・フォローアップ
 
 - `user_manager_env` の判定の CLI との共通化（`start_contract` 等）
-- 記録済みスコープを外から開いて `delete` できる core の API（#1314 の決定の変更を伴う）
+- 委譲スコープの検出が失敗したときに記録の経路へ回すか（core の `delete` の契約の変更。オーナー判断待ち。#2133）
 - restart の再 launch（#2043）は対象外
 - CI の回帰ゲートへの接続は、オーナー判断（[bench-calibration.md](bench-calibration.md) の選択肢 (c)/(d)/(e)。#230）待ち。#1901 は暫定の実機前提として登録した

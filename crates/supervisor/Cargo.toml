@@ -2,6 +2,7 @@
 # 雛形は TASK-1.3（#11・REPAIR-1・MS-0）。本体は G12（TASK-157〜171）で実装する。
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
 # #2070 で bin の入口の継承 fd の整理を追加した（依存は不変）。
+# TASK-171.2（#537）でランチャーの入口にセッション切り離し（setsid・pty 非経由の検証）を追加した（依存は不変）。
 # TASK-163 追補（#1594）で exec の本番用 AuditSink の構築入口 default_audit_sink を追加した（依存は不変）。
 # TASK-163 追補（#1698）で exec の entrypoint_mode のログを core の待たない出力経路へ載せ替えた（依存は不変）。
 # TASK-164 追補（#1469）でロックファイルの掃除経路（remove_all・open 失敗時の削除）を追加した（依存は不変）。

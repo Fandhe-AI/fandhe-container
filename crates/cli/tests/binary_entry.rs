@@ -9,9 +9,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|image|system|setup|doctor>\"}\n";
-#[cfg(target_os = "linux")]
-const UNIMPLEMENTED_JSON: &str =
-    "{\"code\":\"UNIMPLEMENTED\",\"message\":\"command is not implemented yet\"}\n";
 
 /// 子プロセスの終了を待つ上限（REPAIR-5）。超過時は kill して失敗させる。
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -158,6 +155,86 @@ fn repair5_exit_is_bounded_when_stderr_reader_stalls() {
     drop(b);
     assert_eq!(status.code(), Some(2));
     // 書き込みが止まったまま期限で打ち切られたこと（即座に終わったなら出力が止まっていない）。
+    assert!(
+        elapsed >= Duration::from_millis(1500),
+        "exited before the report timeout: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(15), "exit took {elapsed:?}");
+}
+
+/// 試験専用の登録失敗の注入（feature `signal-test-support`。`signals.rs` の `TEST_INSTALL_FAILURE_ENV`）。
+#[cfg(unix)]
+const SIGNAL_INSTALL_FAILURE_ENV: &str = "FANDHE_CONTAINER_TEST_SIGNAL_INSTALL_FAILURE";
+
+/// REPAIR-5・ERR-1・#1778: シグナル転送の登録に失敗したら、コマンドを実行せず終了コード 1（`INTERNAL`）と
+/// 構造化エラーの 1 行を、期限付きの出力経路経由で stderr へ出す（行が失われない）。
+#[cfg(unix)]
+#[test]
+fn repair5_signal_install_failure_reports_via_deferred_path() {
+    let out = run_env(
+        &[],
+        &[(SIGNAL_INSTALL_FAILURE_ENV, std::ffi::OsStr::new("1"))],
+    );
+    assert_failure(
+        &out,
+        1,
+        "{\"code\":\"INTERNAL\",\"message\":\"failed to install the signal handler for plugin forwarding\"}\n",
+    );
+}
+
+/// REPAIR-5・#1778: 登録失敗の出力も、stderr が読み手の読まない満杯の socket なら期限（2 秒）で打ち切られ、
+/// 終了コード 1 を保って終了する（main スレッドで無期限に書かない）。
+#[cfg(unix)]
+#[test]
+fn repair5_signal_install_failure_exit_is_bounded_when_stderr_reader_stalls() {
+    use std::os::unix::net::UnixStream;
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    a.set_nonblocking(true).expect("set_nonblocking");
+    let chunk = [b'x'; 4096];
+    let mut filled = false;
+    for _ in 0..1_000_000 {
+        match std::io::Write::write(&mut &a, &chunk) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                filled = true;
+                break;
+            }
+            Err(e) => panic!("fill failed: {e}"),
+        }
+    }
+    assert!(filled, "socket buffer was not filled");
+    a.set_nonblocking(false).expect("set_nonblocking");
+
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
+        .env_remove("FANDHE_CONTAINER_PLUGIN_PATH_SEARCH")
+        .env(SIGNAL_INSTALL_FAILURE_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(std::os::fd::OwnedFd::from(a)))
+        .spawn()
+        .expect("failed to spawn fandhe-container");
+    let deadline = start + CHILD_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            other => {
+                let _ = child.kill();
+                let reap_deadline = Instant::now() + REAP_TIMEOUT;
+                while Instant::now() < reap_deadline {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                panic!("fandhe-container did not exit within {CHILD_TIMEOUT:?}: {other:?}");
+            }
+        }
+    };
+    let elapsed = start.elapsed();
+    drop(b);
+    assert_eq!(status.code(), Some(1));
     assert!(
         elapsed >= Duration::from_millis(1500),
         "exited before the report timeout: {elapsed:?}"
@@ -923,7 +1000,7 @@ fn sec1_stop_delete_fail_closed_off_linux() {
 }
 
 /// CLI-1・ERR-2: Linux で list は stdout にタブ区切りの一覧を出し（0 件はヘッダのみ・ID 昇順）、
-/// logs は不正 ID が 2、未作成が 3、存在する対象は内容未実装のため 8（stdout は空）。
+/// logs は不正 ID が 2、未作成が 3、ログの無い対象は空の成功（0）、世代をまたぐログは古い順にバイト単位で出る（#1543）。
 #[cfg(target_os = "linux")]
 #[test]
 fn cli1_list_logs_flow_on_linux() {
@@ -963,11 +1040,23 @@ fn cli1_list_logs_flow_on_linux() {
         3,
         "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
     );
-    assert_failure(
-        &run(&["--root", root_s, "logs", "a1"]),
-        8,
-        UNIMPLEMENTED_JSON,
-    );
+    let out = run(&["--root", root_s, "logs", "a1"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    assert!(out.stderr.is_empty());
+    // 世代をまたぐログ（supervisor が書く `@container-logs` と同じ配置）は古い順に連結される。
+    let dir = fandhe_container_supervisor::logs::container_log_dir(&root);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(&dir).expect("logdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    std::fs::write(dir.join("a1.log.1"), b"stdout one\n").expect("g1");
+    std::fs::write(dir.join("a1.log"), b"stderr two\nstdout three\n").expect("cur");
+    let out = run(&["--root", root_s, "logs", "a1"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"stdout one\nstderr two\nstdout three\n");
+    assert!(out.stderr.is_empty());
     assert_failure(
         &run(&["--root", root_s, "logs", "a/b"]),
         2,
@@ -1110,11 +1199,17 @@ fn cli2_setup_usage_errors() {
     }
 }
 
-/// CLI-2: Linux の setup は要求ステップがなく、終了コード 0・出力なし。
+/// CLI-2・SUP-14・CORE-6: Linux の setup は rootful のインストール手順を 1 行表示して 0 で終わる（実行はしない）。
 #[cfg(target_os = "linux")]
 #[test]
-fn cli2_setup_on_linux_is_noop() {
-    assert_failure_free(&run(&["setup"]));
+fn cli2_sup14_setup_on_linux_lists_launcher_install_step() {
+    let out = run(&["setup"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(out.stdout).expect("utf8"),
+        "{\"step\":\"privileged-launcher-install\",\"requires_admin\":true,\"status\":\"manual\",\"condition\":\"rootful\",\"instructions\":\"rootful only; rootless (default) needs no install. As root, run scripts/install-privileged-launcher.sh --launcher <file> --launcher-sha256 <hex> --supervisor <file> --supervisor-sha256 <hex> --cli <file> --cli-sha256 <hex> [--dest-dir <absolute path>] (default dest-dir /usr/local/libexec/fandhe-container). fandhe-container does not run it. See docs/setup/linux.md\"}\n"
+    );
+    assert_eq!(String::from_utf8(out.stderr).expect("utf8"), "");
 }
 
 /// CLI-2・REPAIR-3: macOS / Windows の setup は要求ステップを stdout へ出し、自動適用未実装のため 8 で失敗する。
@@ -1303,6 +1398,141 @@ fn doctor_reports_unreachable_user_manager_without_leaking_the_path() {
     assert!(doctor_line_with_code(&stdout, "USER_MANAGER_UNREACHABLE").is_some());
     assert!(!stdout.contains("doctor-marker"), "{stdout}");
     assert_eq!(out.status.code(), Some(3));
+}
+
+/// 一時ディレクトリに `systemd/private` の UNIX ソケットを `listen` 状態で作り、`XDG_RUNTIME_DIR` にできる
+/// ディレクトリ（`TmpDir` 直下の `xdg`）とリスナーを返す。ディレクトリは 0700 で所有者は自分。
+#[cfg(target_os = "linux")]
+fn user_manager_socket_dir(tmp: &TmpDir) -> (std::path::PathBuf, std::os::unix::net::UnixListener) {
+    use std::os::unix::fs::DirBuilderExt;
+    let xdg = tmp.0.join("xdg");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&xdg)
+        .expect("mkdir xdg");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(xdg.join("systemd"))
+        .expect("mkdir systemd");
+    let l =
+        std::os::unix::net::UnixListener::bind(xdg.join("systemd").join("private")).expect("bind");
+    (xdg, l)
+}
+
+/// stdout の JSON Lines に重大度 `warning` の行があるか（あれば終了コードは 3）。
+#[cfg(target_os = "linux")]
+fn doctor_has_warning(stdout: &str) -> bool {
+    stdout
+        .lines()
+        .any(|l| l.starts_with("{\"severity\":\"warning\","))
+}
+
+/// root では検査を省くため、結合試験は何もしない（`doctor_reports_unset_xdg_runtime_dir` が通知を照合する）。
+#[cfg(target_os = "linux")]
+fn is_root() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").expect("meta").uid() == 0
+}
+
+/// CORE-3・CORE-4・REPAIR-5（#2158）: 生きているソケットには実 connect が成功し、user マネージャ系の診断は出ない。
+/// listener を落としてファイルだけ残すと `USER_MANAGER_SOCKET_REFUSED`（warning・`socket_refused`）で終了コード 3。
+#[cfg(target_os = "linux")]
+#[test]
+fn core3_repair5_doctor_connects_live_and_dead_socket() {
+    if is_root() {
+        return;
+    }
+    let tmp = TmpDir::new("doctor-live-dead");
+    let (xdg, listener) = user_manager_socket_dir(&tmp);
+
+    // 生存ソケット。
+    let out = run_env(&["doctor"], &[("XDG_RUNTIME_DIR", xdg.as_os_str())]);
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    assert!(!stdout.contains("\"check\":\"user_manager\""), "{stdout}");
+    let code = out.status.code().expect("code");
+    if doctor_has_warning(&stdout) {
+        assert_eq!(code, 3, "{stdout}");
+    } else {
+        assert!([0, 4].contains(&code), "{stdout}");
+    }
+
+    // 死んだソケット（listener を落としてもファイルは残る）。
+    drop(listener);
+    let out = run_env(&["doctor"], &[("XDG_RUNTIME_DIR", xdg.as_os_str())]);
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let line = doctor_line_with_code(&stdout, "USER_MANAGER_SOCKET_REFUSED").expect("refused line");
+    assert!(line.starts_with("{\"severity\":\"warning\","), "{line}");
+    assert!(line.ends_with("\"check\":\"user_manager\",\"state\":\"socket_refused\"}"));
+    assert_eq!(out.status.code(), Some(3));
+    assert!(!stdout.contains(&xdg.display().to_string()), "{stdout}");
+}
+
+/// REPAIR-5・CORE-3（#2158）: listen backlog が満杯で accept されないソケットでも、`doctor` は期限（1 秒）の後に
+/// 終了し、`USER_MANAGER_CONNECT_TIMED_OUT`（notice・`connect_timed_out`）を出す。他に warning が無ければ
+/// 終了コードは 4（判定不能）、あれば 3。ハングしないことを経過時間（10 秒未満）で照合する。
+#[cfg(target_os = "linux")]
+#[test]
+fn repair5_core3_doctor_times_out_on_full_backlog() {
+    use fandhe_container_supervisor::user_scope::{
+        UserManagerConnectError, probe_user_manager_socket,
+    };
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    if is_root() {
+        return;
+    }
+    let tmp = TmpDir::new("doctor-backlog");
+    let (xdg, listener) = user_manager_socket_dir(&tmp);
+    let sock = xdg.join("systemd").join("private");
+
+    // accept しないまま接続を積み、backlog が満杯になるまで続ける。満杯の判定は「接続スレッドの数」ではなく、
+    // doctor と同じ非ブロッキング connect（`probe_user_manager_socket`）が期限内に `TimedOut`（= `EAGAIN` が続く）に
+    // なったことで行う。スレッドの未スケジュール・connect の失敗に左右されず、観測した時点のカーネルの状態だけに依る。
+    let (tx, rx) = mpsc::channel::<UnixStream>();
+    let mut held = Vec::new();
+    let mut spawned = 0usize;
+    let mut full = false;
+    while spawned < 20_000 && !full {
+        for _ in 0..64 {
+            let tx = tx.clone();
+            let sock = sock.clone();
+            std::thread::Builder::new()
+                .stack_size(64 * 1024)
+                .spawn(move || {
+                    if let Ok(s) = UnixStream::connect(&sock) {
+                        let _ = tx.send(s);
+                    }
+                })
+                .expect("spawn");
+            spawned += 1;
+        }
+        while let Ok(s) = rx.try_recv() {
+            held.push(s);
+        }
+        full =
+            probe_user_manager_socket(xdg.as_os_str(), Instant::now() + Duration::from_millis(100))
+                == Err(UserManagerConnectError::TimedOut);
+    }
+    assert!(full, "backlog did not fill within the connection cap");
+
+    let start = Instant::now();
+    let out = run_env(&["doctor"], &[("XDG_RUNTIME_DIR", xdg.as_os_str())]);
+    let elapsed = start.elapsed();
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    drop(listener);
+    drop(held);
+
+    assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let line =
+        doctor_line_with_code(&stdout, "USER_MANAGER_CONNECT_TIMED_OUT").expect("timed out line");
+    assert!(line.starts_with("{\"severity\":\"notice\","), "{line}");
+    assert!(line.ends_with("\"check\":\"user_manager\",\"state\":\"connect_timed_out\"}"));
+    let expected = if doctor_has_warning(&stdout) { 3 } else { 4 };
+    assert_eq!(out.status.code(), Some(expected), "{stdout}");
 }
 
 /// CLI-1（#2133）: `doctor` に余計な引数を渡すと使い方エラー（2）。stdout は空。

@@ -1,4 +1,4 @@
-//! `stop` の本番 signaler（supervisor の制御チャネル経由）の結合試験（CLI-1・SEC-1・ERR-2・SUP-1・#2059）。
+//! `stop` の本番 signaler（supervisor の制御チャネル経由）の結合試験（CLI-1・SEC-1・ERR-2・SUP-1・SUP-9・#2059・#2162）。
 //!
 //! 本番入口 `commands::run_to` から、フェイクの supervisor（`ControlServer` と模擬の起動ハンドル）の UDS までを
 //! 実際に通し、終了コードと stderr の JSON を具体値で照合する。root・実コンテナは不要で既定のテスト集合で動く。
@@ -29,6 +29,7 @@ use fandhe_container_supervisor::control::listener::{ControlListener, effective_
 use fandhe_container_supervisor::control::observe::ControlObserver;
 use fandhe_container_supervisor::control::server::{ControlServer, ServeConfig};
 use fandhe_container_supervisor::control::target::{ControlledProcess, SignalSlot};
+use fandhe_container_supervisor::run::{ExplicitStopState, StopToken};
 
 /// 送られたシグナル番号を記録する模擬の起動ハンドル（supervisor が保持する側）。
 struct Fake {
@@ -105,6 +106,8 @@ impl Drop for Tmp {
 /// フェイクの supervisor（制御チャネルのサーバと監視役）。Drop で止める。
 struct FakeSupervisor {
     signals: Arc<Mutex<Vec<u8>>>,
+    /// stop の意図の書き先（restart の判定に渡すトークンに当たる）。
+    intent: StopToken,
     stop: Arc<AtomicBool>,
     monitor: Option<std::thread::JoinHandle<()>>,
     server: Option<ControlServer>,
@@ -113,8 +116,24 @@ struct FakeSupervisor {
 
 impl FakeSupervisor {
     fn start(root: &Path, id: &ContainerId, pid: u32, with_handle: bool) -> Self {
+        Self::start_with(root, id, pid, with_handle, true)
+    }
+
+    /// `with_intent_sink` が false なら、stop の意図の書き先を持たない supervisor（古い版に相当）。
+    fn start_with(
+        root: &Path,
+        id: &ContainerId,
+        pid: u32,
+        with_handle: bool,
+        with_intent_sink: bool,
+    ) -> Self {
         let listener = ControlListener::bind(root, id).unwrap();
-        let slot = SignalSlot::new();
+        let intent = StopToken::new();
+        let slot = if with_intent_sink {
+            SignalSlot::with_stop_intent(intent.clone())
+        } else {
+            SignalSlot::new()
+        };
         let signals = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let monitor = with_handle.then(|| {
@@ -142,6 +161,7 @@ impl FakeSupervisor {
         .unwrap();
         Self {
             signals,
+            intent,
             stop,
             monitor,
             server: Some(server),
@@ -241,6 +261,34 @@ fn cli1_sec1_stop_delivers_sigterm_via_supervisor() {
     let (code, out, err) = stop(&env);
     assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
     assert_eq!(sup.recorded(), vec![15]);
+    // SUP-9: stop は意図を記録してから送る（監視の打ち切りではない）。
+    assert_eq!(
+        sup.intent.explicit_stop_state(),
+        ExplicitStopState::Requested
+    );
+    assert!(!sup.intent.is_stop_requested());
+}
+
+/// SUP-9・ERR-2: 意図を記録できない supervisor には SIGTERM を送らず、FAILED_PRECONDITION（5）で失敗する。
+#[test]
+fn sup9_err2_stop_without_intent_sink_fails_closed_and_sends_nothing() {
+    let env = running_container("stopnosink", 4242);
+    let sup = FakeSupervisor::start_with(&env.root, &env.id, 4242, true, false);
+    let (code, out, err) = stop(&env);
+    assert_eq!(code, 5);
+    assert_eq!(out, "");
+    assert_eq!(
+        err,
+        err_line(
+            "FAILED_PRECONDITION",
+            "the supervisor cannot record the stop intent"
+        )
+    );
+    assert!(sup.recorded().is_empty());
+    assert_eq!(
+        sup.intent.explicit_stop_state(),
+        ExplicitStopState::NotRequested
+    );
 }
 
 /// SEC-1・ERR-2: supervisor が無ければ UNAVAILABLE（9）で失敗し、pid へ kill(2) で縮退しない。

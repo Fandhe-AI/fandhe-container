@@ -552,7 +552,7 @@ mod linux {
         );
         assert!(no_probe_remains(), "no probe process may remain");
         // コンテナの出力が捕捉されてログ sink のファイルに残る（SUP-7）。
-        let logs = env.root().join("logs");
+        let logs = fandhe_container_supervisor::logs::container_log_dir(&env.root());
         let captured = std::fs::read_dir(&logs)
             .expect("log directory")
             .flatten()
@@ -570,7 +570,7 @@ mod linux {
     /// `KCMP_ERRNO=1`)、`<状態ルート>/@audit.log` に seccomp 層の行がちょうど 1 行(コンテナ ID つき・pid はコンテナ内の 1)
     /// 届くことを具体値で照合する。
     fn verify_seccomp_audit(env: &Env, id: &str) {
-        let logs = env.root().join("logs");
+        let logs = fandhe_container_supervisor::logs::container_log_dir(&env.root());
         let denied = std::fs::read_dir(&logs)
             .expect("log directory")
             .flatten()

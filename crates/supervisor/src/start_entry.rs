@@ -2203,14 +2203,14 @@ mod linux {
             Ok(())
         }
 
-        /// 暫定の配置: `--root` 配下の `logs/`（0700）に `<id>.log`（既定 1MiB × 3 世代）を置く。ログのディレクトリ契約は
-        /// `logs` コマンド側（#1543）で確定する事項で、確定したらここを合わせる。
+        /// `--root` 配下の `@container-logs/`（0700。[`crate::logs::container_log_dir`]）に `<id>.log`（既定 1MiB × 3 世代）を
+        /// 置く。`logs` コマンド（CLI）が同じ定義で読む（#1543・SUP-7）。
         fn open_log_sink(
             &mut self,
             id: &ContainerId,
         ) -> Result<Option<Arc<dyn LogSink>>, TraitError> {
             use std::os::unix::fs::DirBuilderExt as _;
-            let dir = self.root.join("logs");
+            let dir = crate::logs::container_log_dir(&self.root);
             match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -2221,10 +2221,7 @@ mod linux {
                     ));
                 }
             }
-            let config = crate::logs::RotationConfig::new(
-                crate::logs::rotating::DEFAULT_LOG_FILE_BYTES,
-                crate::logs::rotating::DEFAULT_LOG_GENERATIONS,
-            )?;
+            let config = crate::logs::container_log_rotation_config();
             let sink = crate::logs::RotatingFileSink::open(&dir, id, config)?;
             Ok(Some(Arc::new(sink)))
         }

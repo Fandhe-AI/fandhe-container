@@ -1,5 +1,5 @@
 //! supervisor の制御チャネル（コンテナごとの UDS。SUP-1・SEC-1・CORE-1・PLUG-12・REPAIR-2・REPAIR-5・
-//! TASK-157 追補・#2058）。
+//! TASK-157 追補・#2058・SUP-9・#2162）。
 //!
 //! # なぜ存在するか
 //!
@@ -12,7 +12,7 @@
 //!
 //! | モジュール | 役割 |
 //! | ---------- | ---- |
-//! | `protocol` | 固定長 frame（Hello・SignalRequest・Response）と理由コード。全 OS |
+//! | `protocol` | 固定長 frame（Hello・SignalRequest・StopRequest・Response）と理由コード。全 OS |
 //! | `target` | 起動ハンドルの包み（`ControlledProcess`）と共有状態（`SignalSlot`）。全 OS |
 //! | `listener` | 置き場所の検証・bind・削除（Linux） |
 //! | `server` | accept ループ・接続元の検証・期限（Linux） |
@@ -26,9 +26,12 @@
 //!
 //! # 未実装・残余（REPAIR-3）
 //!
-//! - CLI の `kill` への結線（`stop` は `stop_delete::production_signaler` で結線済み。#2059。`kill` は #1902 が同じ注入点を使う）
-//! - 明示的な stop の意図の伝達（SUP-9・#1545）: CLI の stop による SIGTERM の終了は、今は通常の終了として
-//!   restart ポリシーの評価に入る。protocol の kind を拡張して `StopToken` を立てる op を足すのは別 issue
+//! - CLI の `kill` への結線（`stop` は `stop_delete::production_stop_signaler` で結線済み。#2059・#2162。`kill` は #1902 が
+//!   `ControlSignaler::new`〔stop の意図を立てない kind 2〕を使う。`kill` が意図を立てるかは #1902 の判断）
+//! - 明示 stop の意図は StopRequest（kind 4）が `StopToken::mark_explicit_stop` で立て、restart の判定が読む（SUP-9・#2162）。
+//!   supervisor の寿命の中では `always`・`unless-stopped` を含む全ポリシーで、stop 後は再起動しない。「明示 stop 済み」を
+//!   state.json に残して再 launch 時に `unless-stopped` と `always` を分けること、バックオフ中の stop で保留中の再起動を
+//!   取り消すことは未実装（core の `SupervisionState` の変更を要する）
 //! - restart の再 launch を単一スレッドで行う再構成（#2043）では、制御チャネルのスレッドも止める対象になる
 //!   （停止の口は `ControlServer::shutdown` に用意済み）
 //! - 異常終了で残った `supervisor.sock` は、core の `StateStore::delete`（`FileStateStore`）が `<id>/` を開いた fd を
@@ -146,7 +149,7 @@ mod install {
                 return (running, failed_handle(e));
             }
         };
-        let slot = SignalSlot::new();
+        let slot = SignalSlot::with_stop_intent(stop.clone());
         let Running {
             process,
             relauncher,

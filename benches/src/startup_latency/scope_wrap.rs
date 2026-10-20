@@ -69,6 +69,23 @@ pub fn scoped_command(
     Some(cmd)
 }
 
+/// 後始末の `delete`（OCI-6・#2157）を委譲スコープの中で呼ぶ `Command` を組む。
+/// 本番の `start` と同じ包み込み（`wrapper_command`）で `<cli> --root <root> delete <id>` を実行する。包むことで CLI 自身が
+/// 委譲 cgroup の中で動き、core の `delete` が記録済みスコープを fd 起点で開く経路（`remove_recorded`）へ回れる。
+/// 計測区間の外で呼ぶ後始末専用で、起動経路の計測には使わない。
+pub fn scoped_cli_delete_command(
+    systemd_run: &Path,
+    unit: &str,
+    cli: &Path,
+    root: &Path,
+    id: &str,
+    xdg: &OsStr,
+) -> Option<Command> {
+    let mut cmd = wrapper_command(systemd_run, unit, xdg)?;
+    cmd.arg(cli).arg("--root").arg(root).arg("delete").arg(id);
+    Some(cmd)
+}
+
 /// scope 取得だけを測る診断（`--scope-only`。`scope_only` モジュール）用に、`scoped_command` と同じ包み込みで
 /// 自明なコマンド（`<program> --startup-latency-noop`。すぐ終了コード 0 で終わる）を起動する `Command` を組む。
 /// supervisor・create・ランチャー・Landlock を含まないので、scope 取得（D-Bus の往復）だけの費用が残る。
@@ -169,6 +186,40 @@ mod tests {
             [
                 ("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"),
                 ("XDG_RUNTIME_DIR", "/run/user/1000")
+            ]
+        );
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
+    }
+
+    /// OCI-6: 後始末の delete は本番と同じ包み込みで `<cli> --root <root> delete <id>` を実行する。
+    #[test]
+    fn oci6_scoped_cli_delete_command_wraps_the_cli_delete() {
+        let cmd = scoped_cli_delete_command(
+            Path::new("/usr/bin/systemd-run"),
+            "fcsl-del-x",
+            Path::new("/opt/cli"),
+            Path::new("/r"),
+            "cid",
+            OsStr::new("/run/user/1000"),
+        )
+        .unwrap();
+        assert_eq!(cmd.get_program(), "/usr/bin/systemd-run");
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "-p",
+                "Delegate=yes",
+                "--unit=fcsl-del-x",
+                "--",
+                "/opt/cli",
+                "--root",
+                "/r",
+                "delete",
+                "cid"
             ]
         );
         assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));

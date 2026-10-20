@@ -20,13 +20,15 @@ macOS ホスト側で、状態ルートの既定をどこに置くか（そも�
 
 OCI-5 (4) は「macOS / Windows では状態ファイルをゲスト VM 内の Linux パスに置く」とする。macos-shared-vm.md（承認待ち #1906）も、ホストに置くのは保持役のロックと所属記録だけで、状態ファイル本体はゲスト内としている。
 
-一方、macOS ホスト側で `resolve(None)` に届く呼び出し元が現にある。
+一方、macOS ホスト側で `resolve(None)` に届く呼び出し元が現にある（下表に主な呼び出し元を挙げる。網羅ではなく、新規の呼び出し元も同じ影響を受ける）。
 
 | 呼び出し元 | 用途 |
 | ---------- | ---- |
 | `crates/cli` の `production_audit_sink` → `FileAuditSink::open_in_state_root` | plugin 信頼検証の拒否の記録先（PLUG-11・SEC-4）。`--root` が無いと `UnavailableAuditSink` |
 | `crates/plugin-mcp` の `CoreBackend::production()` | `root: None` で既定解決 |
 | `crates/plugin-cri` のアダプタ | 既定に固定で既定解決 |
+| `crates/cli/src/commands/create_start.rs` の `open_store`（96 行目付近）・`launch_supervisor`（558 行目付近）→ `StateRoot::resolve(global.root.clone())` | `--root` なしの `create` / `start` の状態ストア解決。案 A ではここが `Unimplemented` 等になる主経路 |
+| `crates/supervisor/src/state.rs` の `open_default_store` → `StateRoot::resolve(root_override)` | supervisor の状態ストア解決（41 行目付近） |
 
 OCI-5 (4) の字面ではホストの既定は不要だが、上の呼び出し元は既定を要求する。「ホストに持つか、持つなら用途を監査の記録先などに限るか」は OCI-5 (4) だけでは答えられず、spec の明確化が要るかもしれない。spec 側の変更は本リポでは決めず、オーナーへ報告する。
 

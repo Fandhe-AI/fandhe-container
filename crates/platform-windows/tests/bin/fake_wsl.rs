@@ -27,7 +27,7 @@
 //! | `hang` | 60 秒眠る | 60 秒眠る |
 //! | `flood` | 128 KiB を出力（0） | 同左（0） |
 //!
-//! # マウント系モード（`mount_ok` / `mount_9p` / `mount_9p_unset` / `mount_9p_applied` / `mount_9p_launch` / `mount_launch` / `mount_unset` / `mount_slow` / `mount_recover` / `mount_recover_other` / `mount_recover_slow`）
+//! # マウント系モード（`mount_ok` / `mount_9p` / `mount_9p_unset` / `mount_9p_applied` / `mount_9p_launch` / `mount_launch` / `mount_unset` / `mount_slow` / `mount_recover` / `mount_recover_other` / `mount_recover_legacy` / `mount_recover_slow`）
 //!
 //! `--version` / `-l -v` は `ok` と同じ。`mount_slow` だけは `--version` と、共有マウントが 1 件も無い状態での
 //! `cat /proc/self/mountinfo`（準備の最初の読み取り）の応答前に [`SLOW_STEP`] だけ眠る（検出と準備が 1 つの合計期限を共有することの確認用。REPAIR-5）。加えて `--distribution Ubuntu --user root --exec <コマンド>` を受け付け、
@@ -311,6 +311,7 @@ fn main() -> ExitCode {
             | "mount_slow"
             | "mount_recover"
             | "mount_recover_other"
+            | "mount_recover_legacy"
             | "mount_recover_slow"
             | "mount_recover_ro_run"
     );

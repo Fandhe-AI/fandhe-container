@@ -28,7 +28,7 @@ use fandhe_container_platform_windows::wslconfig::VirtiofsState;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 偽 `wsl.exe` のマウント系モード（テストごとに別の状態ファイルを使うため 1 テスト 1 モード）。
-const MODES: [&str; 12] = [
+const MODES: [&str; 13] = [
     "mount_ok",
     "mount_9p",
     "mount_9p_unset",
@@ -39,6 +39,7 @@ const MODES: [&str; 12] = [
     "mount_slow",
     "mount_recover",
     "mount_recover_other",
+    "mount_recover_legacy",
     "mount_recover_slow",
     "mount_recover_ro_run",
 ];
@@ -413,7 +414,7 @@ fn add_marked_record(exe: &Path, marker: &str) {
 /// WIN-2・PLUG-7（#1412）: 旧形式 1 行の記録が混在しても、新形式の所有者の回収は成功する。壊れた記録は拒否する。
 #[test]
 fn recover_skips_legacy_record_but_rejects_bad_record() {
-    let exe = fresh_fake("mount_recover_other");
+    let exe = fresh_fake("mount_recover_legacy");
     let p = prepare_virtiofs_launch_with_program(
         &exe,
         VirtiofsState::Enabled,

@@ -630,6 +630,7 @@ const MOUNT_SCRIPT: &str = concat!(
     "mkdir -- \"$R/$4.claim\" 2>/dev/null || exit 205; ",
     "pre=$(ids \"$T\"); rc=0; ",
     "mount -t drvfs -o \"$3\" \"$1\" \"$T\" >&2 9>&- || rc=$?; ",
+    "umask 077; ",
     "new=; n=0; for i in $(ids \"$T\"); do case \" $pre \" in *\" $i \"*) ;; *) new=$i; n=$((n + 1)) ;; esac; done; ",
     "[ \"$n\" = 1 ] || new=none; ",
     "if printf '%s\\n%s\\n%s\\n' \"$new\" \"$T\" \"$5\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" ",
@@ -1940,7 +1941,7 @@ const LOOKUP_SCRIPT: &str = concat!(
     "n=$((n + 1)); [ \"$n\" -le 4096 ] || exit 215; ",
     "if ! fchk \"$f\"; then printf 'bad %s\\n' \"$b\"; continue; fi; ",
     "[ \"$(stat -c %s -- \"$f\")\" -lt 512 ] || { printf 'bad %s\\n' \"$b\"; continue; }; ",
-    "if { IFS= read -r a && ! IFS= read -r t; } < \"$f\" 2>/dev/null && ",
+    "if { IFS= read -r a && t= && ! IFS= read -r t && [ -z \"$t\" ]; } < \"$f\" 2>/dev/null && ",
     "{ [ \"$a\" = none ] || case \"$a\" in \"\"|*[!0-9]*) false ;; *) true ;; esac; }; then ",
     "printf 'old %s\\n' \"$b\"; continue; fi; ",
     "x=; if { IFS= read -r a && IFS= read -r t && IFS= read -r o && ! IFS= read -r x ",
@@ -2637,6 +2638,8 @@ mod tests {
         assert!(MOUNT_SCRIPT.contains(
             "mkdir -m 700 -- \"$R\" 2>/dev/null || [ -d \"$R\" ] || exit 201; chk \"$R\" || exit 202; "
         ));
+        // 記録はゲストの umask に依らず他者書き込み不可で作る（LOOKUP_SCRIPT の検査と契約を揃える）。
+        assert!(MOUNT_SCRIPT.contains("|| rc=$?; umask 077; new=; "));
         assert!(MOUNT_SCRIPT.contains(
             "[ \"$n\" = 1 ] || new=none; if printf '%s\\n%s\\n%s\\n' \"$new\" \"$T\" \"$5\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" && mkdir -- \"$R/$4.done\" 2>/dev/null; then [ \"$new\" = none ] || printf '%s\\n' \"$new\"; exit \"$rc\"; fi; "
         ));
@@ -4731,6 +4734,10 @@ mod tests {
         fs::write(dir.join("0a7"), "a".repeat(600)).unwrap();
         // 改行なしの余分な末尾データ（4 回目の read は失敗するが x に残る）も形式違反。
         fs::write(dir.join("9a8"), "100\n/mnt/fandhe/g\nweb\nextra").unwrap();
+        // 改行なしの 2 行目だけの壊れた記録は旧形式として読み飛ばさない（fail-closed）。
+        fs::write(dir.join("1b9"), "100\n/mnt/fandhe/a").unwrap();
+        // 正常な旧形式 1 行の記録は読み飛ばす。
+        fs::write(dir.join("2c0"), "100\n").unwrap();
         for entry in fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
@@ -4756,11 +4763,13 @@ mod tests {
             lines,
             [
                 "bad 0a7",
+                "bad 1b9",
                 "bad 9a8",
                 "bad bb2",
                 "bad cc3",
                 "bad dd4",
                 "bad ff6",
+                "old 2c0",
                 "rec aa1 none /mnt/fandhe/a"
             ]
         );

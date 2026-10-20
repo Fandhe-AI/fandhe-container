@@ -281,25 +281,45 @@ pub struct KernelAuditProbe {
 impl KernelAuditProbe {
     /// 起動引数(`/proc/cmdline` の内容)が監査を無効にしているかを判定する(純関数)。
     ///
-    /// カーネルの `audit=` は最後の指定が効き、数値として 0 になる値(`0`・`off` など数字で始まらない値)で無効になる。
-    /// 判定が曖昧な値(`0x` 始まり)は無効とみなさない(誤って縮退と判定しない)。
-    pub fn cmdline_disables_audit(cmdline: &str) -> bool {
+    /// カーネルの `audit=` は最後の指定が効く。数値として解釈できる値は 10 進・`0x` 始まりの 16 進・
+    /// 先頭 `0` の 8 進のいずれでも、値が 0 なら無効になる(`0`・`00`・`0x0`・`0X0`)。数字で始まらない値(`off` など)も
+    /// 無効とみなす。数値としての解釈を保証できない値(`0x` のみ・16 進に使えない文字・数字の後の余分な文字)は
+    /// `None`(不明)を返し、呼び出し側は観測できなかったものとして縮退と同じに扱う。
+    pub fn cmdline_audit_disabled(cmdline: &str) -> Option<bool> {
         let Some(value) = cmdline
             .split_whitespace()
             .filter_map(|t| t.strip_prefix("audit="))
             .next_back()
         else {
-            return false;
+            return Some(false);
         };
-        if value.starts_with("0x") || value.starts_with("0X") {
-            return false;
+        let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+        if let Some(hex) = unsigned
+            .strip_prefix("0x")
+            .or_else(|| unsigned.strip_prefix("0X"))
+        {
+            if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
+            return Some(hex.chars().all(|c| c == '0'));
         }
-        match value.chars().next() {
-            None => true,
-            Some(c) if c.is_ascii_digit() => value.chars().all(|c| c == '0'),
-            Some('+') | Some('-') => value[1..].chars().all(|c| c == '0'),
-            Some(_) => true,
+        match unsigned.chars().next() {
+            None => Some(value.is_empty()),
+            Some(c) if c.is_ascii_digit() => {
+                if unsigned.chars().all(|c| c.is_ascii_digit()) {
+                    Some(unsigned.chars().all(|c| c == '0'))
+                } else {
+                    None
+                }
+            }
+            Some(_) if value.starts_with(['+', '-']) => None,
+            Some(_) => Some(true),
         }
+    }
+
+    /// [`Self::cmdline_audit_disabled`] の真偽版(解釈できない値は無効とみなさない)。
+    pub fn cmdline_disables_audit(cmdline: &str) -> bool {
+        Self::cmdline_audit_disabled(cmdline) == Some(true)
     }
 
     /// 全項目が揃い、否定する証拠が無い観測値(試験の対照用)。
@@ -340,7 +360,7 @@ impl KernelAuditProbe {
         Self {
             actions_logged: read_limited("/proc/sys/kernel/seccomp/actions_logged"),
             audit_disabled_at_boot: read_limited("/proc/cmdline")
-                .map(|c| Self::cmdline_disables_audit(&c)),
+                .and_then(|c| Self::cmdline_audit_disabled(&c)),
             // 存在だけを見る(中身は読まない)。EACCES など存在を判断できない失敗は不明にする。
             loginuid_present: match std::fs::metadata("/proc/self/loginuid") {
                 Ok(_) => Some(true),
@@ -551,6 +571,21 @@ mod tests {
         assert!(!dis("quiet ro"));
         assert!(!dis("audit=1"));
         assert!(!dis("audit=0x1"));
+        // 16 進・8 進のゼロ表記は数値 0 で無効(SEC-4・#2027)。
+        assert!(dis("audit=0x0"));
+        assert!(dis("audit=0X0"));
+        assert!(dis("audit=0x00"));
+        assert!(dis("audit=00"));
+        let opt = KernelAuditProbe::cmdline_audit_disabled;
+        assert_eq!(opt("audit=0x0"), Some(true));
+        assert_eq!(opt("audit=0x1f"), Some(false));
+        assert_eq!(opt("audit=1"), Some(false));
+        // 解釈を保証できない値は不明。
+        assert_eq!(opt("audit=0x"), None);
+        assert_eq!(opt("audit=0xzz"), None);
+        assert_eq!(opt("audit=0x0z"), None);
+        assert_eq!(opt("audit=0abc"), None);
+        assert_eq!(opt("audit=1,2"), None);
         assert!(!dis("noaudit=0 xaudit=0"));
     }
 

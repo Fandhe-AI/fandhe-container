@@ -350,7 +350,7 @@ enum RecordHealth {
     /// レコードがない（残骸ディレクトリのみも含む）。
     Absent,
     /// 読めて内容も整合している。
-    Healthy(StateRecord),
+    Healthy(Box<StateRecord>),
     /// 内容が使えない（JSON 破損・サイズ超過・ociVersion 不正・ID 不一致・状態と PID の矛盾）、
     /// またはファイル種別が異常（`<id>` がディレクトリでない・`state.json` が通常ファイルでない）。
     Corrupted(TraitError),
@@ -611,7 +611,7 @@ impl FileStateStore {
             };
         }
         match dto.into_record(id) {
-            Ok(record) => Ok(RecordHealth::Healthy(record)),
+            Ok(record) => Ok(RecordHealth::Healthy(Box::new(record))),
             Err(e) => Ok(RecordHealth::Corrupted(e)),
         }
     }
@@ -620,7 +620,7 @@ impl FileStateStore {
     fn read_record(&self, id: &ContainerId) -> Result<Option<StateRecord>, TraitError> {
         match self.inspect_record(id)? {
             RecordHealth::Absent => Ok(None),
-            RecordHealth::Healthy(record) => Ok(Some(record)),
+            RecordHealth::Healthy(record) => Ok(Some(*record)),
             RecordHealth::Corrupted(e) => Err(e),
         }
     }

@@ -1,4 +1,4 @@
-//! 制御チャネルのワイヤー形式（固定長・big-endian。REPAIR-2・SUP-1・SEC-1・#2058）。
+//! 制御チャネルのワイヤー形式（固定長・big-endian。REPAIR-2・SUP-1・SUP-9・SEC-1・#2058・#2162）。
 //!
 //! CLI（クライアント。[`super::client`]）と supervisor（サーバ。`control::server`）が UDS 上で交わす 3 種類の
 //! frame を、壊れた値を表現できない型で組み立てる。生の `Vec<u8>` を手で組まず、encode は固定長の配列を返し、
@@ -13,6 +13,10 @@
 //! | Hello | サーバ → クライアント | 1 | なし | 8 |
 //! | SignalRequest | クライアント → サーバ | 2 | pid `u32`・signal `u8`・deadline_ns `u64` | 21 |
 //! | Response | サーバ → クライアント | 3 | reason `u8` | 9 |
+//! | StopRequest | クライアント → サーバ | 4 | SignalRequest と同じ（pid・signal・deadline_ns） | 21 |
+//!
+//! StopRequest は「シグナルを送る」に加えて「これは利用者の明示的な stop である」という意図を supervisor に記録させる
+//! （SUP-9・#2162）。supervisor は意図を記録してからシグナルを送り、その後の終了を restart ポリシーの対象から外す。
 //!
 //! 1 接続 1 要求。Hello はサーバが接続元の uid を検証した後に送る。クライアントは Hello を受けてから
 //! 「自分の期限 − 余裕」を `CLOCK_MONOTONIC` のナノ秒（同一ホストの別プロセスと比較できる絶対時刻）で要求に載せ、
@@ -21,7 +25,12 @@
 //!
 //! 応答は理由コード（[`ControlReason`]）だけを返す。文言はクライアントの固定表が決め、入力値は反射しない。
 //!
-//! 将来拡張: kind の値域は、明示的な stop の意図の伝達（SUP-9。別 issue）等の追加に備えて残してある（未実装。REPAIR-3）。
+//! # 互換性（#2162）
+//!
+//! 版（`VERSION`）は 1 のまま上げず、kind 4 を足して互換を保つ。新しい CLI と古い supervisor の組では、古い側が kind 4 を
+//! `Malformed` として拒否し、クライアントは `InvalidArgument` を返す（シグナルは送られない。fail-closed）。古い CLI と
+//! 新しい supervisor の組では kind 2 が従来どおり処理され、stop の意図は立たない。CLI と supervisor は同じ配布物から
+//! 一緒に入る前提で、版の不一致は上のとおり安全側に倒れる。
 
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -50,6 +59,26 @@ pub const MAX_SIGNAL_BUDGET: Duration = Duration::from_secs(10);
 const KIND_HELLO: u8 = 1;
 const KIND_SIGNAL_REQUEST: u8 = 2;
 const KIND_RESPONSE: u8 = 3;
+const KIND_STOP_REQUEST: u8 = 4;
+
+/// 要求の種類。payload は共通で、supervisor が stop の意図を記録するかどうかだけが違う（SUP-9）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RequestKind {
+    /// シグナルを送るだけ（将来の `kill`。意図は記録しない）。
+    Signal,
+    /// 明示的な stop。意図を記録してからシグナルを送る。
+    Stop,
+}
+
+impl RequestKind {
+    fn wire(self) -> u8 {
+        match self {
+            Self::Signal => KIND_SIGNAL_REQUEST,
+            Self::Stop => KIND_STOP_REQUEST,
+        }
+    }
+}
 
 /// 応答の理由コード。サーバは値だけを返し、クライアントが固定文言へ写す（[`ControlReason::to_error`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +107,8 @@ pub enum ControlReason {
     SignalFailed = 9,
     /// supervisor の内部エラー。
     Internal = 10,
+    /// stop の意図を記録できない（書き先が無い supervisor）。シグナルは送らない（fail-closed。SUP-9）。
+    StopIntentUnavailable = 11,
 }
 
 impl ControlReason {
@@ -95,6 +126,7 @@ impl ControlReason {
             8 => Self::UnsupportedVersion,
             9 => Self::SignalFailed,
             10 => Self::Internal,
+            11 => Self::StopIntentUnavailable,
             _ => return None,
         })
     }
@@ -113,6 +145,7 @@ impl ControlReason {
             Self::UnsupportedVersion => "unsupported_version",
             Self::SignalFailed => "signal_failed",
             Self::Internal => "internal",
+            Self::StopIntentUnavailable => "stop_intent_unavailable",
         }
     }
 
@@ -148,6 +181,10 @@ impl ControlReason {
             Self::UnsupportedVersion => (
                 ErrorCode::FailedPrecondition,
                 "the supervisor control protocol version does not match",
+            ),
+            Self::StopIntentUnavailable => (
+                ErrorCode::FailedPrecondition,
+                "the supervisor cannot record the stop intent",
             ),
             Self::SignalFailed | Self::Internal => (
                 ErrorCode::Internal,
@@ -232,9 +269,16 @@ impl FrameHeader {
         Ok(())
     }
 
-    /// SignalRequest のヘッダとして正しいか確かめる（サーバが payload を読む前に呼ぶ）。
-    pub fn expect_signal_request(self) -> Result<(), ControlReason> {
-        self.expect(KIND_SIGNAL_REQUEST, SIGNAL_REQUEST_PAYLOAD_LEN)
+    /// 要求（SignalRequest・StopRequest）のヘッダとして正しいか確かめ、種類を返す（サーバが payload を読む前に呼ぶ）。
+    /// それ以外の kind・payload 長の不一致は `Malformed`。
+    pub fn expect_request(self) -> Result<RequestKind, ControlReason> {
+        let kind = match self.kind {
+            KIND_SIGNAL_REQUEST => RequestKind::Signal,
+            KIND_STOP_REQUEST => RequestKind::Stop,
+            _ => return Err(ControlReason::Malformed),
+        };
+        self.expect(kind.wire(), SIGNAL_REQUEST_PAYLOAD_LEN)?;
+        Ok(kind)
     }
 
     /// Hello のヘッダとして正しいか確かめる。
@@ -253,9 +297,11 @@ pub fn encode_hello() -> [u8; HEADER_LEN] {
     FrameHeader::encode(KIND_HELLO, 0)
 }
 
-/// SignalRequest frame。pid・signal・deadline の値域は型が保証する。
+/// 要求 frame（SignalRequest・StopRequest）。pid・signal・deadline の値域は型が保証する。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignalRequestFrame {
+    /// 要求の種類（ヘッダの kind）。
+    pub kind: RequestKind,
     /// 対象の pid（起動ハンドルの pid と一致したときだけ送る）。
     pub pid: NonZeroU32,
     /// 送るシグナル（1..=64）。
@@ -268,7 +314,7 @@ impl SignalRequestFrame {
     /// 21 バイトに encode する。
     pub fn encode(&self) -> [u8; SIGNAL_REQUEST_LEN] {
         let [h0, h1, h2, h3, h4, h5, h6, h7] =
-            FrameHeader::encode(KIND_SIGNAL_REQUEST, SIGNAL_REQUEST_PAYLOAD_LEN as u16);
+            FrameHeader::encode(self.kind.wire(), SIGNAL_REQUEST_PAYLOAD_LEN as u16);
         let [p0, p1, p2, p3] = self.pid.get().to_be_bytes();
         let [b0, b1, b2, b3, b4, b5, b6, b7] = self.deadline.as_nanos().to_be_bytes();
         [
@@ -296,8 +342,10 @@ impl SignalRequestFrame {
         ]
     }
 
-    /// 検証済みヘッダの後ろの payload 13 バイトを読む。pid 0・signal 範囲外・deadline 0 は `Malformed`。
+    /// 検証済みヘッダ（[`FrameHeader::expect_request`] が返した `kind`）の後ろの payload 13 バイトを読む。
+    /// pid 0・signal 範囲外・deadline 0 は `Malformed`。
     pub fn decode_payload(
+        kind: RequestKind,
         payload: &[u8; SIGNAL_REQUEST_PAYLOAD_LEN],
     ) -> Result<Self, ControlReason> {
         let [p0, p1, p2, p3, signal, b0, b1, b2, b3, b4, b5, b6, b7] = *payload;
@@ -307,6 +355,7 @@ impl SignalRequestFrame {
         let deadline =
             SignalDeadline::from_nanos(u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]))?;
         Ok(Self {
+            kind,
             pid,
             signal,
             deadline,
@@ -344,6 +393,7 @@ mod tests {
 
     fn request() -> SignalRequestFrame {
         SignalRequestFrame {
+            kind: RequestKind::Signal,
             pid: NonZeroU32::new(4242).unwrap(),
             signal: Signal::new(15).unwrap(),
             deadline: SignalDeadline::from_nanos(1_500_000_000).unwrap(),
@@ -365,12 +415,74 @@ mod tests {
         );
         let (head, payload) = bytes.split_first_chunk::<HEADER_LEN>().unwrap();
         let header = FrameHeader::decode(head).unwrap();
-        header.expect_signal_request().unwrap();
+        let kind = header.expect_request().unwrap();
+        assert_eq!(kind, RequestKind::Signal);
         let payload: [u8; SIGNAL_REQUEST_PAYLOAD_LEN] = payload.try_into().unwrap();
         assert_eq!(
-            SignalRequestFrame::decode_payload(&payload).unwrap(),
+            SignalRequestFrame::decode_payload(kind, &payload).unwrap(),
             request()
         );
+    }
+
+    /// SUP-9・REPAIR-2: StopRequest は kind 4 で、payload は SignalRequest と同じ。具体バイトで往復する。
+    #[test]
+    fn sup9_repair2_stop_request_roundtrip_concrete_bytes() {
+        let frame = SignalRequestFrame {
+            kind: RequestKind::Stop,
+            ..request()
+        };
+        let bytes = frame.encode();
+        assert_eq!(
+            bytes,
+            [
+                b'F', b'C', b'S', b'C', 1, 4, 0, 13, // ヘッダ
+                0, 0, 0x10, 0x92, // pid 4242
+                15,   // signal
+                0, 0, 0, 0, 0x59, 0x68, 0x2f, 0x00, // deadline 1_500_000_000ns
+            ]
+        );
+        let (head, payload) = bytes.split_first_chunk::<HEADER_LEN>().unwrap();
+        let kind = FrameHeader::decode(head).unwrap().expect_request().unwrap();
+        assert_eq!(kind, RequestKind::Stop);
+        let payload: [u8; SIGNAL_REQUEST_PAYLOAD_LEN] = payload.try_into().unwrap();
+        assert_eq!(
+            SignalRequestFrame::decode_payload(kind, &payload).unwrap(),
+            frame
+        );
+    }
+
+    /// SUP-9: 要求として受けるのは kind 2・4 だけ。1・3・5 以上は `Malformed`。
+    #[test]
+    fn sup9_expect_request_rejects_other_kinds() {
+        for kind in [0u8, 1, 3, 5, 255] {
+            let head = [b'F', b'C', b'S', b'C', 1, kind, 0, 13];
+            assert_eq!(
+                FrameHeader::decode(&head).unwrap().expect_request(),
+                Err(ControlReason::Malformed),
+                "kind {kind}"
+            );
+        }
+        let head = [b'F', b'C', b'S', b'C', 1, 4, 0, 12];
+        assert_eq!(
+            FrameHeader::decode(&head).unwrap().expect_request(),
+            Err(ControlReason::Malformed)
+        );
+    }
+
+    /// SUP-9: 新しい理由コードの値・語彙・固定文言。
+    #[test]
+    fn sup9_stop_intent_unavailable_reason() {
+        assert_eq!(
+            ControlReason::from_u8(11),
+            Some(ControlReason::StopIntentUnavailable)
+        );
+        assert_eq!(
+            ControlReason::StopIntentUnavailable.name(),
+            "stop_intent_unavailable"
+        );
+        let e = ControlReason::StopIntentUnavailable.to_error().unwrap();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "the supervisor cannot record the stop intent");
     }
 
     #[test]
@@ -419,21 +531,21 @@ mod tests {
         assert!(
             FrameHeader::decode(&edge)
                 .unwrap()
-                .expect_signal_request()
+                .expect_request()
                 .is_err()
         );
 
         // len = 8 は Malformed。
         head[7] = 8;
         assert_eq!(
-            FrameHeader::decode(&head).unwrap().expect_signal_request(),
+            FrameHeader::decode(&head).unwrap().expect_request(),
             Err(ControlReason::Malformed)
         );
 
         // kind 違い（Hello を要求として受けた）。
         let hello = encode_hello();
         assert_eq!(
-            FrameHeader::decode(&hello).unwrap().expect_signal_request(),
+            FrameHeader::decode(&hello).unwrap().expect_request(),
             Err(ControlReason::Malformed)
         );
         FrameHeader::decode(&hello).unwrap().expect_hello().unwrap();
@@ -447,11 +559,13 @@ mod tests {
             let [e, f, g, h, i, j, k, l] = ns.to_be_bytes();
             [a, b, c, d, sig, e, f, g, h, i, j, k, l]
         };
-        assert!(SignalRequestFrame::decode_payload(&p(1, 9, 1)).is_ok());
-        assert!(SignalRequestFrame::decode_payload(&p(1, 64, u64::MAX)).is_ok());
+        assert!(SignalRequestFrame::decode_payload(RequestKind::Signal, &p(1, 9, 1)).is_ok());
+        assert!(
+            SignalRequestFrame::decode_payload(RequestKind::Signal, &p(1, 64, u64::MAX)).is_ok()
+        );
         for bad in [p(0, 9, 100), p(1, 0, 100), p(1, 65, 100), p(1, 9, 0)] {
             assert_eq!(
-                SignalRequestFrame::decode_payload(&bad),
+                SignalRequestFrame::decode_payload(RequestKind::Signal, &bad),
                 Err(ControlReason::Malformed)
             );
         }

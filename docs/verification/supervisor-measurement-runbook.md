@@ -41,7 +41,7 @@ export BIN_DIR="$PWD/target/release"
 
 - 計測専用の使い捨てのテンプレートを作る。コンテナごとの複製は `cp -a --reflink=auto` で作る（inode を共有しない。複製に失敗すると終了コード 2）
 - `cp -al` は使わない。複製が rootfs 外にもリンクを持つ inode になり、製品の `check_no_external_hardlinks` が起動前に拒否するため。reflink 非対応の FS では複製ごとに page cache が別になり、PSS が Docker の lower 共有より大きく出うる（比較条件として結果に記す）
-- `config.json` を置く。user namespace（UID マッピング）を入れる。`process.args` は長時間動き続けるものにする（restart 計測では即時終了しないもの）。静的リンクのバイナリか、共有ライブラリを rootfs へコピーしたものにする
+- `config.json` を置く。user namespace（UID マッピング）を入れる（`linux.namespaces` に user namespace を指定する意味。`linux.uidMappings` / `linux.gidMappings` は省略か空配列にする。非空だと core が `UNIMPLEMENTED` で拒否する。写像は launcher が権限モデルから導出する）。`process.args` は長時間動き続けるものにする（restart 計測では即時終了しないもの）。静的リンクのバイナリか、共有ライブラリを rootfs へコピーしたものにする
 - 並列起動するスクリプトは、コンテナごとに bundle 全体を `cp -a --reflink=auto` で複製して使う（supervisor は start 中に bundle へ flock を取るため、同じ bundle を共有できない）
 
 ## #499 監視プロセス独立性（SUP-5・TASK-162）
@@ -194,7 +194,9 @@ make restart-latency BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> TRIALS=20 WA
   - `supervisor_reported`: ログの `elapsed_us`（終了検知から Running 記録完了まで。バックオフを含む）。件数が合わなければ `null`
   - `observed_minus_backoff`・`supervisor_reported_minus_backoff`: 上の値から `backoff_ms_assumed`（100ms）を差し引いた値。supervisor はバックオフ以上眠るので「バックオフを除いた遅延の上側の推定」（寝過ごし分を含む保守側）。負になったら計測異常で終了コード 1
   - SUP-3 の目標（バックオフ 0 で中央値 100ms 以下）との比較と合否は #491 の担当。PoC-17 は区間が異なるため直接比較しない
-- 終了コード: 0 = 成功、1 = 計測失敗、2 = 引数エラー、3 = 前提欠如、4 = 後始末失敗
+- 後始末（OCI-6・#2157）: 計測値の確定後に、最後のコンテナ側プロセスへ SIGKILL を 1 回送って supervisor を `Stopped` で終わらせ、プロセスの回収を確認してから CLI の `delete`（`systemd-run --user --scope -p Delegate=yes -- fandhe-container --root <dir> delete <id>`）で状態を消す。結果の `cleanup.delete` が `ok` なら delete で消えている。`skipped`（`reason: state-not-stopped`）は自然停止しなかった場合（`--policy always` は SUP-9〔#2408〕の明示 stop の意図が入るまでこうなる）で、delete は呼ばず従来どおり回収する
+- delete が拒否・期限超過になったら終了コード 4 で結果は出ず、stderr に `cleanup-failed: delete was rejected (<CODE>)` と残した状態の場所が出る。手動で回収するときは同じ包み込みで `systemd-run --user --scope -p Delegate=yes -- <bin-dir>/fandhe-container --root <残った状態の state ディレクトリ> delete <id>` を実行する（直接呼ぶと委譲スコープの検出が失敗する）
+- 終了コード: 0 = 成功、1 = 計測失敗、2 = 引数エラー、3 = 前提欠如、4 = 後始末失敗（delete の拒否・期限超過を含む）
 
 ## #219 50 コンテナ同時起動の集約メモリ（CORE-9・SUP-1・TASK-50）
 

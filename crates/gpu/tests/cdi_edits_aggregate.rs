@@ -1,7 +1,8 @@
 //! `parse_cdi_spec` / `read_cdi_spec_file` から `aggregate_container_edits` までの結合試験
 //! （TASK-126.2・GPU-1）。公開 API のみを使う。
 use fandhe_container_gpu::cdi_edits::{
-    CDI_EDITS_MAX_DEVICE_NAME_BYTES, CDI_EDITS_MAX_REQUESTED_DEVICES, aggregate_container_edits,
+    CDI_EDITS_MAX_DEVICE_NAME_BYTES, CDI_EDITS_MAX_REQUESTED_DEVICES, CdiDeviceRequest,
+    aggregate_container_edits, aggregate_container_edits_across_specs,
 };
 use fandhe_container_gpu::cdi_spec::{CdiSpecErrorCode, parse_cdi_spec, read_cdi_spec_file};
 
@@ -30,7 +31,7 @@ fn gpu1_parse_then_aggregate_two_devices() {
     let spec = parse_cdi_spec(YAML).unwrap();
     let a = aggregate_container_edits(&spec, &["0", "1"]).unwrap();
     let paths: Vec<&str> = a.device_nodes().iter().map(|n| n.path.as_str()).collect();
-    assert_eq!(paths, ["/dev/nvidia0", "/dev/nvidia1", "/dev/nvidiactl"]);
+    assert_eq!(paths, ["/dev/nvidiactl", "/dev/nvidia0", "/dev/nvidia1"]);
     assert_eq!(a.env().len(), 2);
     assert_eq!(a.mounts().len(), 1);
     assert_eq!(a.hooks().len(), 0);
@@ -73,7 +74,7 @@ fn gpu1_too_many_requested_device_names_are_rejected_before_lookup() {
     let repeated = vec!["1"; CDI_EDITS_MAX_REQUESTED_DEVICES];
     let a = aggregate_container_edits(&spec, &repeated).unwrap();
     let paths: Vec<&str> = a.device_nodes().iter().map(|n| n.path.as_str()).collect();
-    assert_eq!(paths, ["/dev/nvidia1", "/dev/nvidiactl"]);
+    assert_eq!(paths, ["/dev/nvidiactl", "/dev/nvidia1"]);
 }
 
 /// GPU-1・「リソース上限」: 長すぎる要求名（上限 +1 バイト）は `ResourceExhausted`、上限ちょうどは
@@ -90,4 +91,39 @@ fn gpu1_too_long_requested_device_name_is_rejected() {
     let at_limit = "x".repeat(256);
     let e = aggregate_container_edits(&spec, &[at_limit.as_str()]).unwrap_err();
     assert_eq!(e.code(), CdiSpecErrorCode::NotFound);
+}
+/// GPU-1・TASK-126.2・#1888: 2 つの spec を parse して跨いで集計すると、spec の初参照位置にトップレベルが入る。
+#[test]
+fn gpu1_two_specs_aggregate_interleaves_top_level() {
+    let other = "cdiVersion: 0.5.0
+kind: vendor.example/gpu
+devices:
+  - name: \"9\"
+    containerEdits:
+      deviceNodes:
+        - path: /dev/other9
+containerEdits:
+  deviceNodes:
+    - path: /dev/other-ctl
+";
+    let a = parse_cdi_spec(YAML).unwrap();
+    let b = parse_cdi_spec(other).unwrap();
+    let reqs = [
+        CdiDeviceRequest::new(&b, "9"),
+        CdiDeviceRequest::new(&a, "1"),
+        CdiDeviceRequest::new(&b, "9"),
+        CdiDeviceRequest::new(&a, "0"),
+    ];
+    let agg = aggregate_container_edits_across_specs(&reqs).unwrap();
+    let paths: Vec<&str> = agg.device_nodes().iter().map(|n| n.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            "/dev/other-ctl",
+            "/dev/other9",
+            "/dev/nvidiactl",
+            "/dev/nvidia1",
+            "/dev/nvidia0"
+        ]
+    );
 }

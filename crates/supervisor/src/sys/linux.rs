@@ -8,6 +8,8 @@
 //! `crates/core/src/sys.rs` の同等関数は `pub(crate)` で crate をまたげないため、supervisor 側に同等のものを持つ
 //! （重複は #1454 で許容済み。依存は増やさない）。
 //!
+//! `privilege::detach_session`（SUP-14 の要素 (B)。TASK-171.2・#537）向けに、新しいセッションを作る `setsid(2)` も持つ。
+//!
 //! # 不変条件
 //! - `unsafe` は本モジュール内に閉じ、公開するのは安全な関数のみ（`unsafe fn` を外へ出さない）。
 //! - capability / keepcaps の操作は呼び出したスレッドだけに効く。`setresuid` 等は glibc / musl のラッパーが全スレッドへ
@@ -110,6 +112,10 @@ unsafe extern "C" {
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int close(int fd)`。
     fn close(fd: i32) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `pid_t setsid(void)`（`pid_t` は Linux で i32）。引数なし・ポインタなし。
+    // `libc` との機械照合はこの crate では未導入（dev-dependencies に `libc` が無い。coding-rust.md「照合が未導入の
+    // crate には、その crate の実装 issue が済んでから効く」）。#537 で追加。
+    fn setsid() -> i32;
     // SAFETY（宣言そのものの妥当性）: `int getsockopt(int sockfd, int level, int optname, void *optval,
     // socklen_t *optlen)`（`socklen_t` は Linux で u32）。制御チャネルの `SO_PEERCRED` 取得だけに使う（#2058）。
     fn getsockopt(
@@ -602,6 +608,16 @@ pub(crate) fn connect_unix_nonblocking(path: &Path) -> io::Result<UnixStream> {
 /// #2058・REPAIR-5）。負の値・桁あふれは `EINVAL`。LP64 の x86_64 / aarch64 以外は `Unsupported`（#2140）。
 pub(crate) fn monotonic_now_ns() -> io::Result<u64> {
     control_ffi::monotonic_now_ns()
+}
+
+/// 新しいセッションを作り、呼び出しプロセスをそのリーダー兼新しいプロセスグループのリーダーにする（`setsid(2)`）。
+/// 制御端末は外れる。SUP-14 の要素 (B)（pty 非経由の起動。TASK-171.2・#537）で、`privilege::detach_session` が
+/// ランチャーの入口で呼ぶ。既にプロセスグループのリーダーなら `EPERM`（呼び出し元が扱う）。
+pub(crate) fn new_session() -> io::Result<()> {
+    // SAFETY: 引数もポインタも無い。影響は呼び出しプロセスのセッション・プロセスグループ・制御端末の関係だけで、
+    // メモリ安全性に影響しない。単一スレッドである必要は無い。
+    let rc = unsafe { setsid() };
+    check(i64::from(rc)).map(|_| ())
 }
 
 /// `PR_SET_DUMPABLE` を設定する。0 にすると ptrace attach・core dump・`/proc/<pid>/mem` 等の読み取りを

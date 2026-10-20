@@ -32,6 +32,8 @@
 //!   自 UID 以外は切断する。公開の [`UdsListener::accept`] は `PermissionDenied` を返す。起動経路
 //!   （`accept_peer_pid`）は UID 不一致も pid 不一致と同様に切断して待ち受けを続け、合算で
 //!   [`UDS_ACCEPT_PEER_REJECTION_LIMIT`] を超えたら `PermissionDenied` で打ち切る（取得失敗は即エラー）。
+//!   この打ち切りで、同一 UID の peer が上限 + 1 回 connect すれば起動を失敗させられることは仕様上の許容
+//!   （理由は同定数の doc。#2252 P2-1）
 //!   peer 認証による拒否かどうかは、返るエラーのコードでなく observer に渡る `PeerAuthRejectReason` で判別する
 //! - 受け付けた接続には既定の read / write 期限を付ける（REPAIR-5）
 //! - client 接続（`UdsStream::connect`）は connect 自体に期限を付け、接続直後に server の peer
@@ -83,6 +85,18 @@ pub const UDS_ACCEPT_TIMEOUT_MAX: Duration = Duration::from_secs(600);
 /// `PermissionDenied` で打ち切る。1 回の受付で出る監査イベントは最大でも上限 + 1 件。
 /// 値の制約: 既存試験の pid 不一致の件数より十分大きく、listen backlog（128）と監査枠
 /// （`PEER_AUTH_AUDIT_LOG_CAPACITY` の 256）を下回ること。
+///
+/// # 上限で打ち切ることは仕様上の許容（#2252 P2-1・PLUG-12・REPAIR-5）
+///
+/// 同一 UID のプロセスが上限 + 1 回 connect すれば、起動（都度起動・常駐の起動）を `PermissionDenied` で
+/// 失敗させられる。これは既知の挙動で、次の理由により許容する（期限まで受け続ける案は採らない）。
+///
+/// - socket の配置ディレクトリは 0700 の自 UID 所有のため、届く peer は同一 UID か root だけで、
+///   どちらも脅威モデル外。同一 UID の peer はもともと socket の差し替えなど、より強い操作ができる
+/// - 打ち切りは起動しない側へ倒れる fail-closed で、誤った相手を受理することはない
+/// - 受け続けると、1 回の受付の監査イベントの上限（上限 + 1 件）・監査枠 256・REPAIR-5 の有界性が崩れる
+///
+/// 再試行するかどうかは起動 API の利用者（呼び出し側）の責務。
 pub const UDS_ACCEPT_PEER_REJECTION_LIMIT: u32 = 16;
 
 /// `UdsStream::connect` の期限の上限（600 秒）。これを超える指定は `InvalidArgument`（REPAIR-5）。
@@ -193,6 +207,12 @@ impl UdsListener {
     ///
     /// `timeout` が 0 または [`UDS_ACCEPT_TIMEOUT_MAX`] 超なら `InvalidArgument`、期限切れは `Timeout`。
     /// 1 呼び出しで 1 接続まで。受付ループ・同時接続数の上限は呼び出し側（TASK-109・#1869 の設計・TASK-114）の責務。
+    /// 常駐の受付ループで繰り返し呼ぶ呼び出し側は、拒否（`PermissionDenied`・`Internal` 等）が続く場合に備えて
+    /// レート制限かバックオフ（拒否のたびに間隔を延ばす・単位時間あたりの拒否件数に上限を設ける等）を自前で
+    /// 入れること。本メソッドは拒否 1 件で即返るため、無対策のループは busy loop になる（#2252 P2-4）。
+    /// observer への通知も呼び出しごとに出て件数の上限が無いため、observer にはあふれを集約する
+    /// 有界な実装（`JsonLinesPeerAuthObserver` 等）を使う。既存の例として、`grpc::UdsIncoming` は accept
+    /// エラーの後に短いバックオフを挟む（peer 拒否の後のバックオフは未実装）。
     /// 返す接続は peer credential が自 UID であることを確認済み。不一致は接続を切断して
     /// `PermissionDenied` を返す（呼び出し側の受付ループは継続してよい）。本メソッドは拒否 1 件で必ず返り、
     /// 自ら待ち受けを続けない（続けるのは起動経路の `accept_peer_pid` のみ）。peer 認証による拒否かどうかは
@@ -229,6 +249,10 @@ impl UdsListener {
     /// 一致しない接続は、切断して受付を継続する（期限内に限る。#1861）。継続する拒否は合算で
     /// [`UDS_ACCEPT_PEER_REJECTION_LIMIT`] 件まで、超えた接続は切断・監査通知の後 `PermissionDenied`
     /// （固定文言）で打ち切る。UID・pid を取得できない場合は fail-closed で即エラー（継続しない）。
+    /// この打ち切りは同一 UID の peer による起動失敗を許す仕様上の許容（定数の doc。#2252 P2-1）。
+    /// UID・pid の取得失敗を即エラーにするのは暫定で、macOS で connect 直後に close された接続の
+    /// `getpeereid` が `ENOTCONN` で失敗しうるかは実機未確認（現状の即エラーを維持。確認は #2405、
+    /// 確認用の実機前提試験は `plug12_macos_peer_uid_after_client_close_probe`。#2252 P2-2）。
     /// 継続する前に必ず `abort` を確認する。拒否した接続のフレームは読まない。pid 照合は数値比較のため、子の終了後に
     /// 同じ pid が再利用される窓が残る（pidfd 等での緩和は将来課題。`crate::sys` の「限界」・PLUG-12）。接続待ちの間は `abort` を
     /// 繰り返し呼び、`Some(err)` を返したらその `err` で受付を中断する。保留中の接続がある場合は

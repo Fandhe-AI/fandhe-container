@@ -168,20 +168,29 @@ run_one() {
   local size
   size="$(wc -c <"$res" | tr -d ' ')"
   if [ "$size" -gt "$MAX_RESULT_BYTES" ]; then fail_measure "$cfg: result file is too large"; fi
+  # 結果の layout は解決済みの値（auto は count 2000 以下で flat、超えると tree。ハーネスの AUTO_FLAT_MAX）。
+  local want_layout="$layout"
+  if [ "$layout" = auto ]; then
+    if [ "$count" -le 2000 ]; then want_layout=flat; else want_layout=tree; fi
+  fi
   # method と io2_guaranteed の整合・wire_path false・単位・config・引数・試行の中身を照合する（fail-closed）。
   jq -e --arg cfg "$cfg" --argjson count "$count" --argjson bs "$batch_size" \
-    --argjson fs "$file_size" --argjson trials "$trials" '
+    --argjson fs "$file_size" --argjson trials "$trials" --arg layout "$want_layout" \
+    --argjson tt "$trial_timeout" --argjson total "$total_timeout" '
     def posint: type == "number" and . > 0 and . == floor;
     .schema_version == 1
     and (.metrics.small_files_files_per_sec.unit == "files/s")
     and (.metrics.small_files_files_per_sec.value | type == "number" and . > 0)
-    and ((.method == "server-api-direct/flush-per-file" and .io2_guaranteed == true)
-      or (.method == "server-api-direct/flush-every-k" and .io2_guaranteed == false))
+    and (if $bs == 1
+      then (.method == "server-api-direct/flush-per-file" and .io2_guaranteed == true)
+      else (.method == "server-api-direct/flush-every-k" and .io2_guaranteed == false) end)
     and .wire_path == false
     and .aggregate == "median"
     and .params.config == $cfg
     and .params.count == $count and .params.batch_size == $bs
     and .params.file_size_bytes == $fs and .params.trials == $trials
+    and .params.layout == $layout
+    and .params.trial_timeout_secs == $tt and .params.timeout_secs == $total
     and (.trials | length) == $trials
     and all(.trials[]; (.elapsed_ns | posint) and (.files_per_sec | type == "number" and . > 0))
   ' "$res" >/dev/null 2>&1 || fail_measure "$cfg: harness result failed validation"

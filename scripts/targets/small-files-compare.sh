@@ -41,4 +41,6 @@ if [ -n "${LAYOUT:-}" ]; then args+=(--layout "${LAYOUT}"); fi
 if [ -n "${TRIAL_TIMEOUT_SECS:-}" ]; then args+=(--trial-timeout-secs "${TRIAL_TIMEOUT_SECS}"); fi
 if [ -n "${TIMEOUT_SECS:-}" ]; then args+=(--timeout-secs "${TIMEOUT_SECS}"); fi
 if [ -n "${OUTPUT:-}" ]; then args+=(--output "${OUTPUT}"); fi
-run bash scripts/bench/small_files_compare.sh "${args[@]}"
+# lib.sh の run は実行前にコマンド行を stdout へ出し、OUTPUT 未指定時の結果 JSON（stdout は JSON のみ）を壊すため使わない。
+printf '%s\n' "running: small_files_compare.sh" >&2
+bash "${DIR}/../bench/small_files_compare.sh" "${args[@]}"

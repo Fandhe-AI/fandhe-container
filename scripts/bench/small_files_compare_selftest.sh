@@ -37,7 +37,7 @@ cat >"$stub" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 args=("$@")
-cfg="" trials="" out="" bs=""
+cfg="" trials="" out="" bs="" tt="" total=""
 line=""
 i=0
 while [ "$i" -lt "${#args[@]}" ]; do
@@ -48,6 +48,8 @@ while [ "$i" -lt "${#args[@]}" ]; do
     --trials) trials="$v" ;;
     --output) out="$v"; v="OUT" ;;
     --batch-size) bs="$v" ;;
+    --trial-timeout-secs) tt="$v" ;;
+    --timeout-secs) total="$v" ;;
   esac
   line="${line}${line:+ }${a} ${v}"
   i=$((i + 2))
@@ -67,7 +69,7 @@ if [ "$cfg" = "named-volume" ]; then
   esac
 fi
 mk() { # jq フィルタ
-  jq --arg cfg "$cfg" --argjson t "$trials" '.params.config = $cfg | .params.trials = $t | .trials = [range(0; $t) as $i | .trials[$i % 5]] | '"$1" "$fixture" >"$out"
+  jq --arg cfg "$cfg" --argjson t "$trials" --argjson tt "$tt" --argjson total "$total" '.params.config = $cfg | .params.trials = $t | .params.trial_timeout_secs = $tt | .params.timeout_secs = $total | .trials = [range(0; $t) as $i | .trials[$i % 5]] | '"$1" "$fixture" >"$out"
 }
 case "$mode" in
   bad-json) echo '{not json' >"$out" ;;
@@ -75,6 +77,10 @@ case "$mode" in
   bad-trials) mk 'del(.trials[0])' ;;
   bad-unit) mk '.metrics.small_files_files_per_sec.unit = "ms"' ;;
   wire) mk '.wire_path = true' ;;
+  bad-layout) mk '.params.layout = "tree"' ;;
+  bad-trial-timeout) mk '.params.trial_timeout_secs = 1' ;;
+  bad-total-timeout) mk '.params.timeout_secs = 1' ;;
+  bad-method) mk '.method = (if .params.batch_size == 1 then "server-api-direct/flush-every-k" else "server-api-direct/flush-per-file" end)' ;;
   bad-io2) mk '.io2_guaranteed = (.io2_guaranteed | not)' ;;
   mismatch) if [ "$cfg" = "named-volume" ]; then mk '.method = "server-api-direct/flush-per-file" | .io2_guaranteed = true'; else mk '.'; fi ;;
   *) mk '.' ;;
@@ -182,7 +188,7 @@ expect_rc "same root via symlink" 2 --harness "$stub" --bind-root "$bind_real" -
 expect_no_harness_call "same root via symlink"
 
 # --- 計測失敗（1） ---
-for m in fail-nv bad-json bad-config bad-trials bad-unit wire bad-io2 mismatch; do
+for m in fail-nv bad-json bad-config bad-trials bad-unit wire bad-io2 bad-layout bad-trial-timeout bad-total-timeout bad-method mismatch; do
   STUB_MODE="$m"
   export STUB_MODE
   out_f="${tmp_root}/fail-${m}.json"

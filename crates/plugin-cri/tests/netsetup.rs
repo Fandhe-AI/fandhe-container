@@ -9,13 +9,15 @@ use std::num::NonZeroU16;
 use std::sync::{Arc, Mutex};
 
 use fandhe_container_core::traits::{
-    AttachRequest, ContainerId, CreateNetnsRequest, CreateNetworkRequest, DetachRequest, ErrorCode,
-    IpCidr, NetworkName, NetworkPlugin, Protocol, PublishPortRequest, TraitError,
+    AttachRequest, ContainerId, CreateNetnsRequest, CreateNetworkRequest, DeleteNetworkRequest,
+    DetachRequest, ErrorCode, IpCidr, NetworkName, NetworkPlugin, Protocol, PublishPortRequest,
+    TraitError,
 };
 use fandhe_container_net::netlink_route::IpPrefix;
 use fandhe_container_net::network::{EndpointId, NetworkName as NetName};
 use fandhe_container_plugin_cri::netsetup::{
-    AttachOutcome, DeleteFailure, MAX_NETWORKS, NetsetupBackend, NetsetupContainer, NetsetupNetwork,
+    AttachFailure, AttachOutcome, DeleteFailure, MAX_NETWORKS, NetsetupBackend, NetsetupContainer,
+    NetsetupNetwork,
 };
 use fandhe_container_plugin_cri::pod_network;
 
@@ -33,6 +35,8 @@ struct Script {
     calls: Vec<String>,
     fail_create: bool,
     fail_attach: bool,
+    /// attach 失敗時に巻き戻しで取り残す資源の件数。
+    attach_leftover: usize,
     /// 次の delete_network を失敗させ、渡されたハンドルを全部 retry に返す回数。
     fail_delete: u32,
 }
@@ -68,12 +72,15 @@ impl NetsetupBackend for Fake {
         &self,
         network: &mut String,
         endpoint: &EndpointId,
-    ) -> Result<AttachOutcome<FakeContainer>, TraitError> {
+    ) -> Result<AttachOutcome<FakeContainer>, AttachFailure> {
         let mut s = self.0.lock().expect("lock");
         s.calls
             .push(format!("attach {network} {}", endpoint.as_str()));
         if s.fail_attach {
-            return Err(TraitError::new(ErrorCode::Internal, "attach failed"));
+            return Err(AttachFailure {
+                error: TraitError::new(ErrorCode::Internal, "attach failed"),
+                leftover: s.attach_leftover,
+            });
         }
         Ok(AttachOutcome {
             container: FakeContainer(endpoint.as_str().to_owned()),
@@ -376,8 +383,8 @@ fn poisoned_lock_returns_internal() {
             &self,
             _: &mut (),
             _: &EndpointId,
-        ) -> Result<AttachOutcome<FakeContainer>, TraitError> {
-            Err(TraitError::new(ErrorCode::Internal, "unused"))
+        ) -> Result<AttachOutcome<FakeContainer>, AttachFailure> {
+            Err(TraitError::new(ErrorCode::Internal, "unused").into())
         }
         fn delete_network(
             &self,
@@ -474,4 +481,37 @@ fn repair4_public_ops_are_recorded() {
         .find(|s| s.name().as_str() == "net.create_network")
         .expect("stats");
     assert_eq!((s.success(), s.failure()), (1, 1));
+}
+
+/// 契約 6・後始末: attach の巻き戻しで資源を取り残したら、記録を残し detach・再 attach・ネットワーク削除を拒否する。
+#[test]
+fn contract6_leftover_attach_keeps_record_and_blocks_cleanup() {
+    let fake = Fake::default();
+    let net = NetsetupNetwork::new(fake.clone());
+    net.create_network(&CreateNetworkRequest::new(nname("a"), subnet()))
+        .expect("net");
+    net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c1")))
+        .expect("netns");
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_attach = true;
+        s.attach_leftover = 1;
+    }
+    let req = AttachRequest::new(nname("a"), cid("c1"));
+    net.attach(&req).expect_err("attach fails");
+    fake.0.lock().expect("lock").fail_attach = false;
+    // detach は記録を消して成功を装わない。
+    let e = net
+        .detach(&DetachRequest::new(nname("a"), cid("c1")))
+        .expect_err("detach");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    // 再 attach も、ネットワーク削除も拒否する（記録は残る）。
+    assert_eq!(
+        net.attach(&req).expect_err("reattach").code(),
+        ErrorCode::FailedPrecondition
+    );
+    let e = net
+        .delete_network(&DeleteNetworkRequest::new(nname("a")))
+        .expect_err("delete");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
 }

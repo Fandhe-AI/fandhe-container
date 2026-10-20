@@ -174,6 +174,22 @@ pub struct AttachOutcome<C> {
     pub address: IpPrefix,
 }
 
+/// [`NetsetupBackend::attach`] の失敗。巻き戻しで取り残した資源の件数を握りつぶさず運ぶ（契約 6・SEC 後始末）。
+#[derive(Debug)]
+pub struct AttachFailure {
+    /// 失敗の原因（取り残しがあれば件数入りの `Internal`）。
+    pub error: TraitError,
+    /// 巻き戻しで回収できずカーネルに残った資源の件数（0 なら回収済み）。
+    pub leftover: usize,
+}
+
+impl From<TraitError> for AttachFailure {
+    /// 取り残しなしの失敗。
+    fn from(error: TraitError) -> Self {
+        Self { error, leftover: 0 }
+    }
+}
+
 /// [`NetsetupBackend::delete_network`] の失敗。解放を完了できなかったハンドルを手放さずに返す。
 #[derive(Debug)]
 pub struct DeleteFailure<C> {
@@ -204,7 +220,7 @@ pub trait NetsetupBackend: Send + Sync {
         &self,
         network: &mut Self::Network,
         endpoint: &EndpointId,
-    ) -> Result<AttachOutcome<Self::Container>, TraitError>;
+    ) -> Result<AttachOutcome<Self::Container>, AttachFailure>;
 
     /// ネットワークと、渡した attach 済みコンテナを解放する（契約 9）。
     fn delete_network(
@@ -221,6 +237,9 @@ struct ContainerEntry<C> {
     endpoint: EndpointId,
     /// attach 済みならハンドル（未 attach ならカーネル資源は無い）。
     attached: Option<C>,
+    /// attach の巻き戻しで資源を取り残した印。立っている間は記録を消さず、attach・detach・
+    /// ネットワーク削除を fail-closed で拒否する（net に所有確認つきの個別回収 API が入るまでの保持）。
+    unreclaimed: bool,
 }
 
 /// 作成済みネットワーク 1 件の記録。
@@ -310,6 +329,14 @@ fn not_found_netns() -> TraitError {
     )
 }
 
+/// attach の巻き戻しで取り残した資源が残っているコンテナへの操作の拒否（記録を消して成功を装わない）。
+fn unreclaimed() -> TraitError {
+    TraitError::new(
+        ErrorCode::FailedPrecondition,
+        "container has unreclaimed network resources from a failed attach; manual reclaim required",
+    )
+}
+
 fn network_deleting() -> TraitError {
     TraitError::new(
         ErrorCode::FailedPrecondition,
@@ -387,6 +414,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 network: req.network().as_str().to_owned(),
                 endpoint,
                 attached: None,
+                unreclaimed: false,
             },
         );
         Ok(NetnsStatus::new(req.container().clone(), netns))
@@ -407,6 +435,13 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             ));
         }
         // 契約 8: ネットワーク未作成 → netns 未登録 → 紐付けネットワーク不一致。
+        if reg
+            .containers
+            .get(req.container().as_str())
+            .is_some_and(|c| c.unreclaimed)
+        {
+            return Err(unreclaimed());
+        }
         let network = reg
             .networks
             .get_mut(req.network().as_str())
@@ -427,9 +462,18 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 MSG_STATIC_ADDRESS_UNAVAILABLE,
             ));
         }
-        let outcome = self
+        let outcome = match self
             .backend
-            .attach(&mut network.handle, &container.endpoint)?;
+            .attach(&mut network.handle, &container.endpoint)
+        {
+            Ok(o) => o,
+            Err(f) => {
+                if f.leftover > 0 {
+                    container.unreclaimed = true;
+                }
+                return Err(f.error);
+            }
+        };
         let address = IpCidr::new(outcome.address.addr(), outcome.address.prefix_len())?;
         container.attached = Some(outcome.container);
         Ok(AttachResponse::new(
@@ -453,6 +497,9 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         if container.network != req.network().as_str() {
             return Err(network_mismatch());
         }
+        if container.unreclaimed {
+            return Err(unreclaimed());
+        }
         if container.attached.is_some() {
             return Err(TraitError::new(
                 ErrorCode::Unimplemented,
@@ -471,6 +518,13 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let mut guard = self.lock()?;
         let reg = &mut *guard;
         let name = req.name().as_str();
+        if reg
+            .containers
+            .values()
+            .any(|c| c.network == name && c.unreclaimed)
+        {
+            return Err(unreclaimed());
+        }
         let network = reg.networks.get_mut(name).ok_or_else(not_found_network)?;
         // 以降は成功して記録ごと消えるまで、失敗しても deleting を保つ（部分削除済みのまま再利用させない）。
         network.deleting = true;
@@ -663,7 +717,7 @@ mod linux {
             &self,
             network: &mut Self::Network,
             endpoint: &EndpointId,
-        ) -> Result<AttachOutcome<Self::Container>, TraitError> {
+        ) -> Result<AttachOutcome<Self::Container>, AttachFailure> {
             self.ensure_netns_dir()?;
             let spec = ContainerAttachSpec::new(
                 endpoint.clone(),
@@ -680,7 +734,13 @@ mod linux {
                 &mut network.ports,
                 NETSETUP_REQUEST_TIMEOUT,
             )
-            .map_err(|e| with_leftover(net_error_to_trait(&e.error), e.rollback.leftover.len()))?;
+            .map_err(|e| {
+                let leftover = e.rollback.leftover.len();
+                AttachFailure {
+                    error: with_leftover(net_error_to_trait(&e.error), leftover),
+                    leftover,
+                }
+            })?;
             Ok(AttachOutcome {
                 address: attached.address,
                 container: attached,

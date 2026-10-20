@@ -778,14 +778,17 @@ impl PullSession<'_> {
     }
 
     fn abort_inner(&mut self) -> Result<PullAbortOutcome, OciError> {
-        let released = self
-            .store
-            .lock()
-            .map(|mut g| g.release_all_leases(&self.id).len());
+        // 削除が終わるまでストア排他を保持し、回収 GC・begin_pull による同 ID の再利用と交差させない（OCI-7）。
+        let mut guard = self.store.lock();
+        let released = guard
+            .as_mut()
+            .map(|g| g.release_all_leases(&self.id).len())
+            .map_err(|e| e.clone());
         self.leased.clear();
         self.verified.clear();
         self.pull_lock.take();
         let staging = self.remove_staging();
+        drop(guard);
         released.map(|released_leases| PullAbortOutcome {
             released_leases,
             staging,
@@ -1014,11 +1017,11 @@ impl PullSession<'_> {
             }
         };
         let released_leases = guard.release_all_leases(&self.id).len();
-        drop(guard);
         self.leased.clear();
         self.verified.clear();
         self.pull_lock.take();
         let staging = self.remove_staging();
+        drop(guard);
         Ok(PullPublishOutcome {
             manifest: req.manifest.clone(),
             tags: changes,

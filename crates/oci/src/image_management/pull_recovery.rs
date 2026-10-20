@@ -19,9 +19,9 @@
 //!
 //! `begin_pull` はストアの排他区間（[`ImageStore::lock`]）の内側でロックファイルの作成とロックまでを済ませる。
 //! 本 GC も判定（ロックの試行）とリースの解放を同じ排他区間で行うため、「作成途中でまだロックされていない」
-//! ロックファイルを見て誤って回収することはない。重い `remove_dir_all` は排他区間の外で行う。外してよい理由は、
-//! その pull ID の保持者が不在で、ディレクトリが残る間は `begin_pull` が同じ ID を `AlreadyExists` で拒否し、
-//! 新しい利用者が現れないため。
+//! ロックファイルを見て誤って回収することはない。`remove_dir_all` も排他区間を保持したまま行う。手放すと別の GC が
+//! 同じ残骸を回収対象に確定し、先行の削除後に `begin_pull` が同 ID で作った新しいステージングを遅れて消すため。
+//! `abort` / `publish` も自分のステージングの削除が終わるまで排他を保持する。
 //!
 //! # 呼び出し文脈と前提
 //!
@@ -42,6 +42,7 @@ use std::fs::{self, File, TryLockError};
 use super::pull::{PULL_LOCK_FILE_NAME, STAGING_DIR_NAME};
 use super::{ImageStore, MAX_CACHE_SCAN_ENTRIES, PullId};
 use crate::error::{OciError, OciErrorCode};
+use crate::instrument::{OciOpKind, record_oci_op};
 
 /// [`ImageStore::recover_stale_pulls`] の結果。各一覧は pull ID の昇順で決定的（将来の拡張に備え非網羅）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -142,7 +143,28 @@ impl ImageStore {
     /// 排他の取得が失敗したら何も触らずエラーを返す。`staging` が symlink・非ディレクトリなら
     /// `FailedPrecondition`、エントリ数が `MAX_CACHE_SCAN_ENTRIES` を超えたら（何も消す前に）`ResourceExhausted`。
     /// 判定の規則と排他の規律はモジュール doc を参照。
+    ///
+    /// 操作全体の成否と所要時間を記録する（REPAIR-4）。一部のステージング削除が失敗した場合（`failed()` が
+    /// 空でない）は、結果を `Ok` で返しつつ記録上は最初の失敗の code で失敗として数える。
     pub fn recover_stale_pulls(&self) -> Result<StalePullRecovery, OciError> {
+        let mut out: Option<StalePullRecovery> = None;
+        let r = record_oci_op(self.recorder(), OciOpKind::RecoverStalePulls, || {
+            let res = self.recover_stale_pulls_inner()?;
+            let partial = res.failed.first().map(|(_, c)| *c);
+            out = Some(res);
+            match partial {
+                Some(code) => Err(OciError::new(code, "failed to remove some stale staging")),
+                None => Ok(()),
+            }
+        });
+        match (out, r) {
+            (Some(res), _) => Ok(res),
+            (None, Err(e)) => Err(e),
+            (None, Ok(())) => Err(scan_err("recovery result missing")),
+        }
+    }
+
+    fn recover_stale_pulls_inner(&self) -> Result<StalePullRecovery, OciError> {
         let mut result = StalePullRecovery::default();
         let staging = self.root().join(STAGING_DIR_NAME);
         let mut absent: Vec<(PullId, File)> = Vec::new();
@@ -195,8 +217,8 @@ impl ImageStore {
                 }
             }
         }
-        drop(guard);
-
+        // 削除が終わるまでストア排他を保持する。手放すと別の GC が同じ残骸を確定し、この削除の後に
+        // `begin_pull` が同 ID で作った新しいステージングを遅れて消しうる（OCI-7）。
         for (id, file) in absent {
             // Windows は開いたハンドルがディレクトリ削除を妨げるため、先に閉じる。
             drop(file);
@@ -207,6 +229,7 @@ impl ImageStore {
                 Err(_) => result.failed.push((id, OciErrorCode::Internal)),
             }
         }
+        drop(guard);
         Ok(result)
     }
 }
@@ -481,5 +504,78 @@ mod tests {
         let dir = s.staging_dir().to_path_buf();
         s.abort().unwrap();
         assert!(!dir.exists());
+    }
+
+    fn recorded_store(
+        root: &Root,
+    ) -> (
+        ImageStore,
+        std::sync::Arc<crate::instrument::testing::Collect>,
+    ) {
+        let rec = std::sync::Arc::new(crate::instrument::testing::Collect::default());
+        let store = ImageStore::open(&root.0)
+            .unwrap()
+            .with_recorder(rec.clone());
+        (store, rec)
+    }
+
+    fn gc_samples(
+        rec: &crate::instrument::testing::Collect,
+    ) -> Vec<crate::instrument::OciOpSample> {
+        rec.items()
+            .into_iter()
+            .filter(|s| s.kind() == OciOpKind::RecoverStalePulls)
+            .collect()
+    }
+
+    /// REPAIR-4・OCI-7: 回収全体の成功が 1 件記録される。
+    #[test]
+    fn oci7_recover_records_success() {
+        let root = Root::new("recsucc");
+        mk_stale(&root, "p1", true);
+        let (store, rec) = recorded_store(&root);
+        let r = store.recover_stale_pulls().unwrap();
+        assert_eq!(r.reclaimed(), &[pid("p1")]);
+        let s = gc_samples(&rec);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].outcome(), crate::instrument::OciOpOutcome::Success);
+    }
+
+    /// REPAIR-4・OCI-7: 非ディレクトリの staging は失敗として code つきで 1 件記録される。
+    #[test]
+    fn oci7_recover_records_failure_for_non_directory_staging() {
+        let root = Root::new("recfail");
+        fs::write(root.staging(), b"x").unwrap();
+        let (store, rec) = recorded_store(&root);
+        let e = store.recover_stale_pulls().unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        let s = gc_samples(&rec);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].outcome(), crate::instrument::OciOpOutcome::Failure);
+        assert_eq!(s[0].error_code(), Some(OciErrorCode::FailedPrecondition));
+    }
+
+    /// REPAIR-4・OCI-7: 一部の削除失敗は結果を返しつつ失敗として記録される（root では削除できるため skip）。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_recover_records_partial_removal_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new("recpartial");
+        let dir = mk_stale(&root, "p1", true);
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("f"), b"x").unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o500)).unwrap();
+        let (store, rec) = recorded_store(&root);
+        let r = store.recover_stale_pulls().unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
+        if r.failed().is_empty() {
+            return;
+        }
+        assert_eq!(r.failed(), &[(pid("p1"), OciErrorCode::Internal)]);
+        let s = gc_samples(&rec);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].outcome(), crate::instrument::OciOpOutcome::Failure);
+        assert_eq!(s[0].error_code(), Some(OciErrorCode::Internal));
     }
 }

@@ -395,7 +395,12 @@ mod tests {
     fn record(with_cgroup: bool) -> StateRecord {
         let r = StateRecord::new(
             ContainerStatus::created(cid("c1"), None),
-            PathBuf::from("/bundle"),
+            // Windows では `/bundle` が絶対パスにならないため、OS ごとの絶対パスを使う。
+            PathBuf::from(if cfg!(windows) {
+                r"C:\bundle"
+            } else {
+                "/bundle"
+            }),
             StateRevision::INITIAL,
         )
         .expect("record");

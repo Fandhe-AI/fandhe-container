@@ -287,26 +287,27 @@ fn from_raw(raw: RawJournal) -> Result<GcJournal, OciError> {
     })
 }
 
-/// ジャーナルが（種別を問わず）存在するか。
+/// ジャーナルのパスにファイルが 1 つでも在る（墓標・壊れた・通常ファイル以外を含む）か。
+///
+/// 不変条件（OCI-7）。論証:
+/// 1. **内容に依らない検査**: パスに何かが見えている間は、どのプロセスからも参照の追加（manifest・タグ・
+///    コンテナ参照の登録、blob の公開・配置、pull リースの取得）と新しい削除の開始を拒否する。見えて
+///    いることは永続化済みであることを意味しないので、root の fsync を確定させて消えるまで、墓標も
+///    無害とはみなさない。stat に失敗した場合も存在とみなす（fail-closed）。
+/// 2. **単調で fsync 確定済みの遷移**: 削除意図は縮む方向にしか動かない（テーブル操作入り → blob のみ →
+///    墓標 → 消滅）。各段は rename → root の fsync で進め、削除意図を持つジャーナルを直接 unlink しない
+///    （[`remove_journal`] は墓標への置換を fsync で確定してから、墓標だけを unlink する）。
+///
+/// したがって、クラッシュで復活し得るのは最後に fsync で確定した状態以下の削除意図だけで、消滅の直前に
+/// 確定する状態は墓標（意図なし）である。消滅していない状態は(1)で参照の追加を拒否するので、ジャーナル
+/// 作成後に追加された参照が、復活したジャーナルで消されることはない。別プロセスの復旧は
+/// manifest・タグ・リースの表が空（それらは永続化されずプロセス内のみ。既存の設計上の制約で、永続化は
+/// TASK-183 の親 issue #471 の未実装範囲）でも、再公開された blob を消さない。
 pub(super) fn journal_exists(root: &Path) -> bool {
     match fs::symlink_metadata(journal_path(root)) {
         Ok(_) => true,
         Err(e) => e.kind() != ErrorKind::NotFound,
     }
-}
-
-/// 削除の対象（manifest・タグ・blob のいずれか）を持つジャーナルが残っているか。
-///
-/// 不変条件（OCI-7）: 残っている間は、どのプロセスからも参照の追加（manifest・タグ・コンテナ参照の登録、
-/// blob の公開・配置、pull リースの取得）と新しい削除の開始を拒否する。ジャーナルの作成から完了までの間に
-/// 新たな参照が生まれないので、復旧が消すのは作成時点で無参照だった blob に限られる。別プロセスの
-/// 復旧は manifest・タグ・リースの表が空（それらは永続化されずプロセス内のみ。既存の設計上の制約で、
-/// 永続化は TASK-183 の親 issue #471 の未実装範囲）でも、この拒否のおかげで再公開された blob を消さない。
-/// 対象の無い墓標（fsync 未確定の印）は何も消さないので該当しない。読めないジャーナルは `Err`（fail-closed）。
-pub(super) fn journal_has_pending_deletions(root: &Path) -> Result<bool, OciError> {
-    Ok(read_journal(root)?.is_some_and(|j| {
-        !j.manifests.is_empty() || !j.untag.is_empty() || !j.delete_blobs.is_empty()
-    }))
 }
 
 pub(super) fn ensure_no_pending_journal(root: &Path) -> Result<(), OciError> {
@@ -371,8 +372,9 @@ fn persist_journal(
         Err(PublishError::AfterPublish) => {
             // rename 済みで root の fsync だけが失敗した。ジャーナルは見えているが、ディレクトリエントリの
             // 永続化は未確定である。読み戻せても永続化の証明にならないため、削除（テーブル更新・unlink）は
-            // 始めずに必ず Err を返す。取り消せれば「削除前に収束」、取り消せなければ残ったジャーナルか墓標を
-            // 次の lock の復旧が片づける（複数回の fsync 失敗でも blob は消えないので余分に残す側にだけ誤る）。
+            // 始めずに必ず Err を返す。取り消しは直接 unlink せず、墓標への置換を確定してから行う
+            // （`remove_journal`）。確定できなければ見えているジャーナルか墓標が残り、変更は拒否され続け、
+            // 次の lock の復旧が片づける（blob は消えないので余分に残す側にだけ誤る）。
             let revoked = remove_journal(root).is_ok();
             let msg = if revoked {
                 "failed to persist gc journal"
@@ -438,29 +440,46 @@ pub(super) fn reap_stale_tmp(root: &Path) {
     }
 }
 
-/// ジャーナルを削除して root を fsync する。この成功が削除確定のコミット点。
+/// ジャーナルを消滅させる。この成功が削除確定のコミット点。
 ///
-/// unlink 後に root の fsync が失敗したときは、削除が未確定のまま次の lock に見えなくならないよう、
-/// 空のジャーナル（墓標）を公開して `Err` を返す。墓標は次の lock の復旧が読み、何も消さずに
-/// `blobs/sha256` と root の fsync をやり直して片づける（fsync が成功するまで残る）。
+/// 削除意図を持つジャーナルを直接 unlink しない（unlink が永続化されずに古い意図が復活し、後の再登録に
+/// 適用されるのを防ぐ。OCI-7）。手順は (1) 墓標（意図なし）へ rename → root の fsync で置換して確定、
+/// (2) 墓標の unlink、(3) root の fsync。(1) か (2) が失敗したら `Err` で、見えているジャーナル
+/// （古い内容か墓標）が残り、[`journal_exists`] により変更は拒否され続ける。(3) が失敗したら墓標を
+/// 再公開して `Err`（再公開も失敗しても、復活し得るのは意図なしの墓標だけで無害）。
+/// 次の lock の復旧が墓標を読み、何も消さずに `blobs/sha256` と root の fsync をやり直して片づける。
 pub(super) fn remove_journal(root: &Path) -> std::io::Result<()> {
-    #[cfg(test)]
-    if test_hook::should_fail_unlink() {
-        return Err(std::io::Error::other("injected journal unlink failure"));
+    if journal_exists(root) {
+        let tombstone = tombstone_bytes()?;
+        // (1) 墓標へ置換して確定する。失敗したら unlink に進まない。
+        publish_journal(root, &tombstone)
+            .map_err(|_| std::io::Error::other("failed to confirm gc journal tombstone"))?;
+        // (2) 確定した墓標だけを unlink する。
+        #[cfg(test)]
+        if test_hook::should_fail_unlink() {
+            return Err(std::io::Error::other("injected journal unlink failure"));
+        }
+        match fs::remove_file(journal_path(root)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
-    match fs::remove_file(journal_path(root)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
+    // (3) unlink の永続化。
     let synced = sync_dir(root);
     if synced.is_err() {
-        // 墓標の公開が失敗しても打つ手が無い（root に書けない）。呼び出し側は Pending として扱う。
-        if let Ok(bytes) = serde_json::to_vec(&to_raw(&GcJournal::default())) {
+        // 再公開が失敗しても、復活し得るのは意図なしの墓標だけで無害。呼び出し側は Pending として扱う。
+        if let Ok(bytes) = tombstone_bytes() {
             let _ = publish_journal(root, &bytes);
         }
     }
     synced
+}
+
+/// 削除意図を持たない空のジャーナル（墓標）のバイト列。
+fn tombstone_bytes() -> std::io::Result<Vec<u8>> {
+    serde_json::to_vec(&to_raw(&GcJournal::default()))
+        .map_err(|_| std::io::Error::other("failed to encode gc journal tombstone"))
 }
 
 fn untrusted(msg: &str) -> OciError {
@@ -668,8 +687,8 @@ impl ReferenceTable {
         self.journal_root = super::JournalRoot(Some(root.to_path_buf()));
     }
 
-    /// 削除対象（manifest・タグ・blob）を持つジャーナルがディスクに残っていれば
-    /// `FailedPrecondition` で拒否する（OCI-7。論証は [`journal_has_pending_deletions`]）。
+    /// 削除ジャーナル（墓標を含む）がディスクに見えていれば
+    /// `FailedPrecondition` で拒否する（OCI-7。論証は [`journal_exists`]）。
     ///
     /// 契約: 参照を増やす・blob を書く変更系の入口（リース取得を含む）は、先頭でこれを呼ぶこと。
     /// 取得済みのガードの中で rm / prune が Pending を返した後も、残ったジャーナルを復旧が再実行する
@@ -678,7 +697,7 @@ impl ReferenceTable {
     /// `*_unchecked` を除く）。root が未設定の単体テーブルでは何もしない。
     pub(super) fn ensure_no_pending_deletion(&self) -> Result<(), OciError> {
         match &self.journal_root.0 {
-            Some(root) if journal_has_pending_deletions(root)? => Err(err(
+            Some(root) if journal_exists(root) => Err(err(
                 OciErrorCode::FailedPrecondition,
                 "a pending image deletion has not been completed; the store is read-only until it is recovered",
             )),
@@ -1310,14 +1329,14 @@ mod tests {
         test_hook::fail_unlink(100);
         let st = settle(&root.0, &[], &[d(0x11), d(0xc1)], 0, false);
         assert_eq!(st, DeletionDurability::Pending);
-        assert!(journal_has_pending_deletions(&root.0).unwrap());
+        assert!(root.journal());
         let store = ImageStore::with_table(&root.0, table()).unwrap();
         let e = store.lock().unwrap_err();
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
         test_hook::clear();
-        // 復旧は A を外し終えている。再登録（pull 相当）が通り、以後は外されない。
+        // 意図は墓標へ縮んでから確定済みのため、復旧は何も外さない。再登録（pull 相当）が通り、以後も外されない。
         let mut g = store.lock().unwrap();
-        assert_eq!(g.manifests().count(), 1);
+        assert_eq!(g.manifests().count(), 2);
         g.register_manifest(
             d(0xa0),
             ManifestComposition::new(d(0xc1), vec![d(0x10), d(0x11)]).unwrap(),
@@ -1391,7 +1410,7 @@ mod tests {
             .unwrap();
         test_hook::clear();
         assert_eq!(out.durability, DeletionDurability::Pending);
-        assert!(journal_has_pending_deletions(&root.0).unwrap());
+        assert!(root.journal());
         let comp = ManifestComposition::new(d(0xc1), vec![d(0x10), d(0x11)]).unwrap();
         for code in [
             g.register_manifest(d(0xa0), comp.clone())
@@ -1474,6 +1493,60 @@ mod tests {
         g.register_manifest(d(0xa0), comp).unwrap();
         g.register_tag(tk("v1"), &d(0xa0)).unwrap();
         assert!(g.acquire_lease(d(0x11), pull).unwrap().newly_added);
+    }
+
+    /// OCI-7: 墓標の公開後に root の fsync が失敗しても、墓標が見えている間は lock と変更系が
+    /// FailedPrecondition になる。障害を除くと復旧が完了して変更が通る。
+    #[test]
+    fn oci7_tombstone_visible_blocks_lock_and_mutations() {
+        let root = Root::new();
+        files(&root);
+        write_journal(&root.0, &journal_a()).unwrap();
+        for n in [0x11u8, 0xc1] {
+            fs::remove_file(blob_path(&root.0, &d(n)).unwrap()).unwrap();
+        }
+        // root の fsync を全部失敗させる: 墓標への置換は rename されるが確定できない。
+        test_hook::fail_sync_of(&root.0, 100);
+        let st = settle(&root.0, &[], &[d(0x11), d(0xc1)], 0, false);
+        assert_eq!(st, DeletionDurability::Pending);
+        // 削除意図を持つジャーナルは unlink されず、見えているのは墓標。
+        let j = read_journal(&root.0).unwrap().unwrap();
+        assert!(j.is_tombstone());
+        let mut t = table();
+        t.set_journal_root(&root.0);
+        let e = t.register_tag(tk("v1"), &d(0xa0)).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        let store = ImageStore::with_table(&root.0, table()).unwrap();
+        let e = store.lock().unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert!(root.journal());
+        test_hook::clear();
+        let mut g = store.lock().unwrap();
+        assert!(!root.journal());
+        g.register_tag(tk("v1"), &d(0xa0)).unwrap();
+        assert_eq!(g.tags().count(), 1);
+    }
+
+    /// OCI-7: 初回の write_journal の公開後に root の fsync が失敗しても、ジャーナルを直接 unlink せず
+    /// 墓標へ置換する。確定できない間は見えている墓標で変更が拒否され、障害を除くと変更が通る。
+    #[test]
+    fn oci7_initial_publish_fsync_failure_tombstones_instead_of_unlink() {
+        let root = Root::new();
+        files(&root);
+        test_hook::fail_sync_of(&root.0, 100);
+        let e = write_journal(&root.0, &journal_a()).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Internal);
+        // 取り消しの unlink は走らず、見えているのは（確定できていない）墓標。
+        let j = read_journal(&root.0).unwrap().unwrap();
+        assert!(j.is_tombstone());
+        let store = ImageStore::with_table(&root.0, table()).unwrap();
+        let e = store.lock().unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        test_hook::clear();
+        let mut g = store.lock().unwrap();
+        assert!(!root.journal());
+        g.register_tag(tk("v1"), &d(0xa0)).unwrap();
+        assert_eq!(g.tags().count(), 1);
     }
 
     /// OCI-7: 通常の lock 経路でも復旧結果（Abandoned と孤児 blob）が guard から取れる。

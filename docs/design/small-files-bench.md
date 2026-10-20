@@ -66,6 +66,9 @@ cargo bench -p fandhe-container-benches --bench small_files -- \
 
 - IO-6（#107）: `--count 50000` で実機の値を採る。Docker 側は同じ件数のフルサイクルの時間から `docker run` の起動時間を引いた「FS 操作のみ」の値と比べる。合否をこの値だけで出すかは未決
 - IO-7（#110）: bind / named volume の 2 構成で同じ引数を使い、中央値の比を出す
+  - 2 構成の実行は `make small-files-compare BIND_ROOT=<絶対パス> VOLUME_ROOT=<絶対パス> [TRIALS=<5〜20>] [OUTPUT=<新規ファイル>]`（TASK-24.1。`scripts/bench/small_files_compare.sh`）。同一引数で `--config bind` → `--config named-volume` の順に各 5 試行以上回し、ハーネスの結果 JSON（`method`・`note`・`wire_path`・`io2_guaranteed` を含む）を `results.bind` / `results["named-volume"]` に丸ごと残した 1 つの JSON（schema `fandhe-container.small-files-compare/v1`）にまとめる。形式は CSV ではなく JSON にした（ハーネスの出力が JSON で、`method`・`note` の文字列を欠けなく運べるため）
+  - このスクリプトは合否も中央値の比も出さない。比と 1.5 倍の判定は #110（TASK-24.2）で行う。実機での実測は #107（人間）
+  - 既知の限界: 実行順は bind → named-volume で固定（順序の偏りは交互化していない。必要なら #110 で判断する）。2 つのルートは別ディレクトリであることだけを確かめ、別の file system かどうかは確かめない
 
 ## 既知の限界
 

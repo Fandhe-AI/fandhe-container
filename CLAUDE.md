@@ -66,6 +66,7 @@ fandhe-container/
 │   │   ├── declarative-config.md  # 宣言的起動設定の方針メモ（TASK-82・CLI-4）
 │   │   ├── small-model-repair-policy.md  # 小型モデル自己補修方針（TASK-92・REPAIR-11/13/14）
 │   │   ├── cgroups.md             # cgroups v2 単独対応・v1 / systemd cgroup driver 非対応（TASK-34・CORE-4）
+│   │   ├── ffi-libc-check.md      # 自前 FFI 宣言と libc の機械照合の方式（dev-dependencies のみ・const 評価。適用状況・CI での評価箇所。#1838・#1837・MVM-4・REPAIR-7・REPAIR-12）
 │   │   ├── io-protocol.md         # I/O 共有層のワイヤーフレーム・チェックサム（TASK-11・IO-1・REPAIR-2）
 │   │   ├── license-deny-fail-closed-report.md  # 非許可ライセンス検出の fail-closed 確認記録（TASK-90.2・OSS-4・OSS-5・REPAIR-9）
 │   │   ├── break-detection-ci-report.md  # BREAK-1/BREAK-2 の CI 検出実証レポート（TASK-89.2・REPAIR-7）

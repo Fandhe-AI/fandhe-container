@@ -296,6 +296,7 @@ dependencies = [
  "fandhe-container-oci",
  "fandhe-container-plugin",
  "fandhe-container-supervisor",
+ "libc",
 ]
 
 [[package]]

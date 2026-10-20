@@ -17,6 +17,11 @@
 //! WSL の再起動で消える。取り下げた mount とゲスト内で外せなかった mount は、記録の nonce を
 //! [`MountError::unreleased`]（マウント ID 未確定）で返し、既存の [`release_virtiofs_launch`] で回収する。
 //!
+//! 別プロセスからの回収（#1412・WIN-1・WIN-2・PLUG-7）: [`LaunchRequest::with_owner`] でコンテナ ID を付けて準備すると、
+//! ゲスト内の記録に ID とマウント先が残る。[`release_container_mounts`] は同じディストリとコンテナ ID だけを手がかりに、
+//! 記録を検証して（改ざんがあれば何も外さず）自分のマウントだけを外す。呼び出し側（plugin の stop・起動役の delete）
+//! への接続は `docs/design/windows-execution-layout.md` の論点 4（#2230）の承認待ちで未実装（REPAIR-3）。
+//!
 //! 検証の本体はマウント後の fstype 確認である。`.wslconfig` の `virtiofs=true` はファイル上の設定に過ぎず、
 //! `wsl --shutdown` までは稼働中の VM に反映されないため、設定の確認だけでは virtiofs の成立を保証できない。
 //!
@@ -220,6 +225,46 @@ impl DistroName {
     }
 }
 
+/// コンテナ ID（[`OwnerId`]）の最大バイト数。
+pub const MAX_OWNER_ID_LEN: usize = 255;
+
+/// ゲスト内の記録で「所有するコンテナ ID が無い」ことを表す印。コンテナ ID の規則（[`OwnerId::parse`]）が
+/// `.` 単独を拒否するため、実在の ID と衝突しない。
+const NO_OWNER_MARK: &str = ".";
+
+/// 検証済みのコンテナ ID（共有マウントの所有者。ゲスト内の記録に書き、後から ID だけで引くための鍵。
+/// WIN-1・WIN-2・PLUG-7・#1412）。
+///
+/// 規則は core の `ContainerId::new` と `fandhe-container-plugin-windows` の ID 検証と同じ
+/// （`[A-Za-z0-9._-]`・1〜[`MAX_OWNER_ID_LEN`] バイト・`.` / `..` 不可）。本 crate は core に依存しない
+/// ため同じ規則を自前で持つ。ゲスト内のシェルスクリプトへは位置引数としてのみ渡し、値は文字種が限られるので
+/// 記録の行区切りや空白を含められない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerId(String);
+
+impl OwnerId {
+    /// 文字列を検証して作る。違反は `INVALID_ARGUMENT`（メッセージに入力は含めない）。
+    pub fn parse(s: &str) -> Result<Self, Wsl2Error> {
+        let ok = !s.is_empty()
+            && s.len() <= MAX_OWNER_ID_LEN
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        if !ok {
+            return Err(invalid(
+                "owner id must be 1-255 characters of [A-Za-z0-9._-], not '.' or '..'",
+            ));
+        }
+        Ok(Self(s.to_string()))
+    }
+
+    /// 検証済みの文字列。
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// 共有マウント 1 件（ホストディレクトリ・ゲスト内の名前・読み取り専用か）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -268,6 +313,7 @@ pub struct LaunchRequest {
     distro: DistroName,
     mounts: Vec<SharedMount>,
     policy: TransportPolicy,
+    owner: Option<OwnerId>,
 }
 
 impl LaunchRequest {
@@ -290,7 +336,25 @@ impl LaunchRequest {
             distro,
             mounts,
             policy: TransportPolicy::default(),
+            owner: None,
         })
+    }
+
+    /// 共有マウントの所有者（コンテナ ID）を設定した要求を返す。
+    ///
+    /// 設定すると、ゲスト内の記録（`/run/fandhe/<nonce>`）にコンテナ ID とマウント先が書かれ、作成したプロセスと
+    /// 別のプロセスでも [`release_container_mounts`] でコンテナ ID だけを手がかりに回収できる
+    /// （WIN-1・WIN-2・PLUG-7・#1412）。未設定の記録は ID で引けない（fail-closed。回収は
+    /// [`release_virtiofs_launch`] に [`PreparedLaunch`] を渡す経路のみ）。
+    #[must_use]
+    pub fn with_owner(mut self, owner: OwnerId) -> Self {
+        self.owner = Some(owner);
+        self
+    }
+
+    /// 設定された所有者（コンテナ ID）。
+    pub fn owner(&self) -> Option<&OwnerId> {
+        self.owner.as_ref()
     }
 
     /// 輸送方式の方針を差し替えた要求を返す（既定は [`TransportPolicy::PreferVirtiofs`]）。
@@ -488,7 +552,7 @@ fn exec_argv(distro: &DistroName, cmd: &[&str]) -> Vec<String> {
 /// 差し替えて検証外の場所へ root でマウントさせられる（TOCTOU）。そのため全工程を単一プロセスに拘束し、
 /// 検証から `mount` までの窓を最小にする。位置引数は `$1`=ホストディレクトリ・`$2`=マウント名・`$3`=オプション・
 /// `$4`=呼び出しごとの nonce（固定スクリプトに値を埋め込まず引数で渡すため、シェルのインジェクションは起きない。
-/// 入力は検証済み newtype と 16 進の nonce）。
+/// 入力は検証済み newtype と 16 進の nonce）。`$5`=所有者のコンテナ ID（[`OwnerId`]。無ければ印 `.`）。
 ///
 /// 所有の証拠: `mount` の直前と直後に同じプロセス内でマウント先のマウント ID を読み、新しく現れたものが
 /// ちょうど 1 件ならそれを自分のマウントとして標準出力へ書く（`mount` 自身の標準出力は標準エラーへ回し、
@@ -496,7 +560,9 @@ fn exec_argv(distro: &DistroName, cmd: &[&str]) -> Vec<String> {
 /// マウント ID（特定できなければ `none`）を一時ファイル経由の rename で書く。`mount` の終了コードによらず記録する
 /// （`mount(8)` はマウント成立後の処理でも失敗を返しうるため）。`wsl.exe` の待機がタイムアウトして標準出力を
 /// 失っても、呼び出し側は記録（[`RECORD_SCRIPT`]）で自分のマウントを特定できる。`none` なら呼び出し側は所有を
-/// 確認できないものとして扱い、外さない。残る窓（同一プロセス内の `mount` の前後の読み取りの間）に同じマウント先へ
+/// 確認できないものとして扱い、外さない。記録は 3 行で、1 行目がマウント ID（または `none`）、2 行目がマウント先
+/// （`/mnt/fandhe/<名前>`）、3 行目が `$5`（コンテナ ID または印 `.`）。既存の読み手は 1 行目だけを読む。2・3 行目は
+/// [`LOOKUP_SCRIPT`] がコンテナ ID から記録を引くために使う（別プロセスからの回収。#1412）。残る窓（同一プロセス内の `mount` の前後の読み取りの間）に同じマウント先へ
 /// マウントできるのはゲスト内の root（CAP_SYS_ADMIN）に限られる。
 ///
 /// 遅れての成立の防止: `mount` の直前に `mkdir /run/fandhe/<nonce>.claim` で実行権を確保する（`mkdir` は原子的）。
@@ -566,14 +632,14 @@ const MOUNT_SCRIPT: &str = concat!(
     "mount -t drvfs -o \"$3\" \"$1\" \"$T\" >&2 9>&- || rc=$?; ",
     "new=; n=0; for i in $(ids \"$T\"); do case \" $pre \" in *\" $i \"*) ;; *) new=$i; n=$((n + 1)) ;; esac; done; ",
     "[ \"$n\" = 1 ] || new=none; ",
-    "if printf '%s\\n' \"$new\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" ",
+    "if printf '%s\\n%s\\n%s\\n' \"$new\" \"$T\" \"$5\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" ",
     "&& mkdir -- \"$R/$4.done\" 2>/dev/null; then ",
     "[ \"$new\" = none ] || printf '%s\\n' \"$new\"; exit \"$rc\"; fi; ",
     "x=209; if [ \"$n\" = 1 ]; then ",
     "if [ \"$(top \"$T\")\" = \"$new\" ]; then umount \"$T\" >&2 9>&- || x=210; else x=210; fi; ",
     "elif [ \"$n\" != 0 ]; then x=210; fi; ",
     "if [ \"$x\" = 209 ]; then rm -f -- \"$R/$4\" \"$R/$4.tmp\"; rmdir -- \"$R/$4.claim\" \"$R/$4.done\" 2>/dev/null || :; ",
-    "else printf '%s\\n' \"$new\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" || :; mkdir -- \"$R/$4.done\" 2>/dev/null || :; fi; ",
+    "else printf '%s\\n%s\\n%s\\n' \"$new\" \"$T\" \"$5\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" || :; mkdir -- \"$R/$4.done\" 2>/dev/null || :; fi; ",
     "exit \"$x\""
 );
 /// [`MOUNT_SCRIPT`] の終了コード（`/`・`/mnt`・`/run` 不正 / ディレクトリ作成失敗 / パス要素が危険 /
@@ -602,7 +668,12 @@ fn new_nonce() -> String {
 }
 
 /// 検証込みマウントコマンドの組み立て。`-t drvfs` が virtiofs で成立するかは実機未検証（TASK-67.6・#377。REPAIR-3）。
-fn mount_argv(distro: &DistroName, m: &SharedMount, nonce: &str) -> Vec<String> {
+fn mount_argv(
+    distro: &DistroName,
+    m: &SharedMount,
+    nonce: &str,
+    owner: Option<&OwnerId>,
+) -> Vec<String> {
     let opts = if m.read_only {
         "nosuid,nodev,ro"
     } else {
@@ -619,6 +690,7 @@ fn mount_argv(distro: &DistroName, m: &SharedMount, nonce: &str) -> Vec<String> 
             m.name.as_str(),
             opts,
             nonce,
+            owner.map_or(NO_OWNER_MARK, OwnerId::as_str),
         ],
     )
 }
@@ -921,12 +993,25 @@ enum Evidence {
 }
 
 /// [`MOUNT_SCRIPT`] の標準出力・記録の中身（10 進のマウント ID 1 行）を解析する。それ以外は `None`。
+///
+/// 記録は 3 行（マウント ID・マウント先・コンテナ ID）になったため、最初の改行までだけを読む
+/// （2 行目以降は [`parse_lookup_output`] の経路が扱う）。
 fn parse_recorded_id(bytes: &[u8]) -> Option<u32> {
-    let text = std::str::from_utf8(bytes).ok()?.trim();
+    let text = first_line(bytes)?.trim();
     if text.is_empty() || text.len() > 10 || !text.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     text.parse().ok()
+}
+
+/// 記録・標準出力の最初の行（UTF-8 でなければ `None`）。
+fn first_line(bytes: &[u8]) -> Option<&str> {
+    std::str::from_utf8(bytes).ok()?.split('\n').next()
+}
+
+/// 記録の 1 行目が `none`（自分のマウントを特定できなかった）か。
+fn is_none_record(bytes: &[u8]) -> bool {
+    first_line(bytes).is_some_and(|t| t.trim() == "none")
 }
 
 /// [`MOUNT_SCRIPT`] の標準出力からマウント ID を読めなかったとき（`wsl.exe` の待機タイムアウト等）に、
@@ -940,7 +1025,7 @@ fn parse_recorded_id(bytes: &[u8]) -> Option<u32> {
 /// [`MOUNT_SCRIPT`] が担う）、それもできなければ `Unreadable`（所有を確認できない）。
 fn read_record(distro: &DistroName, nonce: &str, exec: Exec<'_>) -> Evidence {
     let from_record = |stdout: &[u8]| {
-        if std::str::from_utf8(stdout).is_ok_and(|t| t.trim() == "none") {
+        if is_none_record(stdout) {
             Evidence::Missing
         } else {
             parse_recorded_id(stdout).map_or(Evidence::Unreadable, Evidence::Mine)
@@ -1233,7 +1318,7 @@ fn resolve_pending(distro: &DistroName, nonce: &str, exec: Exec<'_>) -> Pending 
     for _ in 0..MAX_RECOVERY_READS {
         match exec(&status_argv(distro, nonce), MAX_OUTPUT_BYTES) {
             Ok(out) if out.success => {
-                if std::str::from_utf8(&out.stdout).is_ok_and(|t| t.trim() == "none") {
+                if is_none_record(&out.stdout) {
                     return Pending::NotAttributed;
                 }
                 return parse_recorded_id(&out.stdout)
@@ -1291,13 +1376,14 @@ fn with_rollback_note(e: Wsl2Error, outcome: &RollbackOutcome) -> Wsl2Error {
 fn mount_one(
     distro: &DistroName,
     m: &SharedMount,
+    owner: Option<&OwnerId>,
     before_ids: &[u32],
     owned: &mut Vec<OwnedMount>,
     exec: Exec<'_>,
     mut recovery: Option<Exec<'_>>,
 ) -> Result<(), Wsl2Error> {
     let nonce = new_nonce();
-    let (failure, evidence) = match exec(&mount_argv(distro, m, &nonce), MAX_OUTPUT_BYTES) {
+    let (failure, evidence) = match exec(&mount_argv(distro, m, &nonce, owner), MAX_OUTPUT_BYTES) {
         Ok(out) => {
             // 200〜202・205・207・208 は MOUNT_SCRIPT が `mount` の前に返し、209・210 は記録を確定できずゲスト内で
             // 後始末を終えた結果（いずれも `mount(8)`・シグナル終了のコードと重ならない）。
@@ -1550,6 +1636,7 @@ fn prepare_with_exec_cancel(
         if let Err(e) = mount_one(
             distro,
             m,
+            req.owner.as_ref(),
             &before_ids,
             &mut owned,
             &mut *exec,
@@ -1753,6 +1840,20 @@ pub(super) fn release_with_program(
     if outcome.failures() == 0 {
         return Ok(());
     }
+    Err(release_failure(
+        &prepared.distro,
+        &outcome,
+        prepared.transport,
+    ))
+}
+
+/// 解除の失敗（外せなかった件数と所有を確かめられなかった件数のみをメッセージに載せ、やり直せるマウントを
+/// [`MountError::unreleased`] に載せる）。[`release_with_program`] と [`recover_with_exec`] で共有する。
+fn release_failure(
+    distro: &DistroName,
+    outcome: &RollbackOutcome,
+    transport: Option<SharedTransport>,
+) -> MountError {
     let mut message = format!("{} unmount(s) failed", outcome.retry.len());
     if outcome.unconfirmed > 0 {
         message.push_str(&format!(
@@ -1760,11 +1861,11 @@ pub(super) fn release_with_program(
             outcome.unconfirmed
         ));
     }
-    Err(MountError {
+    MountError {
         error: precondition(message),
-        unreleased: unreleased_launch(&prepared.distro, &outcome.retry, prepared.transport),
+        unreleased: unreleased_launch(distro, &outcome.retry, transport),
         warning: None,
-    })
+    }
 }
 
 /// [`release_with_exec`] を [`WinOpKind::Wsl2UnmountShared`] として 1 件記録する（1 件でも解除できなければ失敗）。
@@ -1781,6 +1882,306 @@ fn release_recorded(
         Err(())
     });
     outcome
+}
+
+// ---- コンテナ ID からの回収（別プロセスから。#1412） ----
+
+/// ゲスト内で、コンテナ ID（`$1`）を所有者とする記録（`/run/fandhe/<nonce>`）だけを列挙するスクリプト。
+///
+/// [`prepare_virtiofs_launch`] を呼んだプロセスが解除に失敗したまま終わっても、別のプロセスが同じディストリと
+/// コンテナ ID だけを手がかりに自分のマウントを見つけられるようにする（WIN-1・WIN-2・PLUG-7・#1412）。所有情報を
+/// ホスト側に置かず、ゲスト内の記録を正とする（VM の再起動で記録ごと消えるため、古い記録で別のマウントを外さない）。
+///
+/// 読む前に `/`・`/run`・`/run/fandhe` が root 所有・他者書き込み不可・symlink でないことを [`MOUNT_SCRIPT`] と同じ
+/// 基準で確かめる（`/run/fandhe` が無ければ記録は無い）。対象は名前が 16 進の nonce だけのエントリで、
+/// `lock.*`・`*.tmp`・`*.claim`・`*.done` は読まない。各エントリは symlink でない通常ファイルで root 所有・
+/// 他者書き込み不可のものだけを先頭 512 バイト読み、3 行目（所有者）が `$1` と一致するものを
+/// `rec <nonce> <マウント ID|none> <マウント先>` の 1 行で出力する。基準を満たさないエントリは読まずに
+/// `bad <nonce>` の行で報告する（ホスト側 [`parse_lookup_output`] が改ざんとして扱い、何も外さない）。
+///
+/// 終了コード: 200=`/`・`/run` が不正・202=`/run/fandhe` が不正・215=走査するエントリ数が上限（4096）超過。
+/// それ以外の失敗はシェルや `head` の終了コード。
+const LOOKUP_SCRIPT: &str = concat!(
+    "set -u; O=$1; R=/run/fandhe; ",
+    "chk() { [ ! -L \"$1\" ] && [ -d \"$1\" ] || return 1; ",
+    "set -- $(stat -c '%u %f' -- \"$1\"); ",
+    "[ \"$1\" = 0 ] && [ $((0x$2 & 18)) -eq 0 ]; }; ",
+    "fchk() { [ ! -L \"$1\" ] && [ -f \"$1\" ] || return 1; ",
+    "set -- $(stat -c '%u %f' -- \"$1\"); ",
+    "[ \"$1\" = 0 ] && [ $((0x$2 & 18)) -eq 0 ]; }; ",
+    "chk / || exit 200; chk /run || exit 200; ",
+    "[ -L \"$R\" ] || [ -e \"$R\" ] || exit 0; ",
+    "chk \"$R\" || exit 202; ",
+    "n=0; for f in \"$R\"/*; do ",
+    "[ -e \"$f\" ] || [ -L \"$f\" ] || continue; ",
+    "b=${f##*/}; case \"$b\" in *[!0-9a-f]*) continue ;; esac; ",
+    "n=$((n + 1)); [ \"$n\" -le 4096 ] || exit 215; ",
+    "if ! fchk \"$f\"; then printf 'bad %s\\n' \"$b\"; continue; fi; ",
+    "head -c 512 -- \"$f\" | { IFS= read -r a; IFS= read -r t; IFS= read -r o; ",
+    "if [ \"$o\" = \"$O\" ]; then printf 'rec %s %s %s\\n' \"$b\" \"$a\" \"$t\"; fi; }; ",
+    "done; exit 0"
+);
+/// [`LOOKUP_SCRIPT`] の終了コード（走査するエントリ数が上限を超えた）。
+const EXIT_TOO_MANY_RECORDS: i32 = 215;
+/// [`LOOKUP_SCRIPT`] の出力として受け付ける最大行数（[`MAX_OUTPUT_BYTES`] と二重の有界化。REPAIR-5）。
+const MAX_LOOKUP_LINES: usize = 4096;
+/// 記録の nonce として受け付ける最大文字数（[`new_nonce`] は 56 文字）。
+const MAX_NONCE_LEN: usize = 64;
+
+fn lookup_argv(distro: &DistroName, owner: &OwnerId) -> Vec<String> {
+    exec_argv(distro, &["sh", "-c", LOOKUP_SCRIPT, "sh", owner.as_str()])
+}
+
+/// [`LOOKUP_SCRIPT`] が報告した、検証前の記録 1 件（マウント先は [`GUEST_MOUNT_BASE`] 配下の検証済みの形）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoveredRecord {
+    nonce: String,
+    /// `None` は記録が `none`（自分のマウントを特定できなかった。外さない）。
+    mount_id: Option<u32>,
+    guest_path: String,
+}
+
+/// [`parse_lookup_output`] の結果: 形式を満たした記録と、満たさなかった行の件数。
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LookupOutput {
+    records: Vec<RecoveredRecord>,
+    /// `bad` の行・形式違反・マウント先が固定基底配下の検証済み名でないもの・重複の件数。1 件でもあれば何も外さない。
+    rejected: usize,
+}
+
+/// 記録のマウント先が `<GUEST_MOUNT_BASE>/<MountName>` の形（`..`・`/`・基底の外を含まない）か。
+///
+/// [`UMOUNT_SCRIPT`] はマウント先の末尾要素でロック名を決めるため、改ざんされた記録のマウント先を通すと別の
+/// ロックや別のパスに作用しうる。ここで固定基底の完全一致の接頭辞と [`MountName`] の規則を必須にして防ぐ。
+fn parse_record_target(target: &str) -> Option<String> {
+    let name = target.strip_prefix(GUEST_MOUNT_BASE)?.strip_prefix('/')?;
+    MountName::parse(name).ok()?;
+    Some(target.to_string())
+}
+
+/// [`LOOKUP_SCRIPT`] の出力を解析する（ゲストの出力は untrusted。上限を超える行数は `RESOURCE_EXHAUSTED`、UTF-8
+/// でなければ `DATA_LOSS`、記録の件数が [`MAX_SHARED_MOUNTS`] を超えても `RESOURCE_EXHAUSTED`）。
+fn parse_lookup_output(bytes: &[u8]) -> Result<LookupOutput, Wsl2Error> {
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        Wsl2Error::new(
+            Wsl2ErrorCode::DataLoss,
+            "guest mount record listing is not valid UTF-8",
+        )
+    })?;
+    let mut out = LookupOutput::default();
+    for (n, line) in text.lines().enumerate() {
+        if n >= MAX_LOOKUP_LINES {
+            return Err(Wsl2Error::new(
+                Wsl2ErrorCode::ResourceExhausted,
+                "guest mount record listing exceeds the line limit",
+            ));
+        }
+        let fields: Vec<&str> = line.split(' ').collect();
+        let rec = match fields.as_slice() {
+            ["rec", nonce, id, target] => parse_record(nonce, id, target),
+            _ => None,
+        };
+        match rec {
+            Some(r)
+                if !out
+                    .records
+                    .iter()
+                    .any(|o| o.nonce == r.nonce || o.guest_path == r.guest_path) =>
+            {
+                if out.records.len() >= MAX_SHARED_MOUNTS {
+                    return Err(Wsl2Error::new(
+                        Wsl2ErrorCode::ResourceExhausted,
+                        "too many guest mount records for one owner",
+                    ));
+                }
+                out.records.push(r);
+            }
+            _ => out.rejected += 1,
+        }
+    }
+    Ok(out)
+}
+
+fn parse_record(nonce: &str, id: &str, target: &str) -> Option<RecoveredRecord> {
+    let nonce_ok = !nonce.is_empty()
+        && nonce.len() <= MAX_NONCE_LEN
+        && nonce
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !nonce_ok {
+        return None;
+    }
+    let mount_id = if id == "none" {
+        None
+    } else {
+        Some(parse_recorded_id(id.as_bytes())?)
+    };
+    Some(RecoveredRecord {
+        nonce: nonce.to_string(),
+        mount_id,
+        guest_path: parse_record_target(target)?,
+    })
+}
+
+/// 記録がゲストの現在のマウント状態と矛盾しないか（改ざん・差し替えの検出）。
+///
+/// マウント ID が確定している記録は、マウント先の最上位のマウント ID が記録と一致するか、マウント先にも
+/// マウント ID にも対応するマウントがどこにも無い（外れ済みの古い記録。後始末で記録だけを消す）ときに限り
+/// 矛盾なしとする。他者のマウントが積まれている・マウント先を確定できない・記録のマウント ID が別の場所に
+/// ある場合は矛盾として扱い、何も外さない（fail-closed）。`none` の記録は外さないので常に矛盾なし。
+fn record_matches_mounts(rec: &RecoveredRecord, entries: &[MountEntry]) -> bool {
+    let Some(id) = rec.mount_id else {
+        return true;
+    };
+    match find_mount(entries, &rec.guest_path) {
+        Some(top) => top.mount_id == id,
+        None => {
+            !entries.iter().any(|e| e.mount_point == rec.guest_path)
+                && !entries.iter().any(|e| e.mount_id == id)
+        }
+    }
+}
+
+fn lookup_failed(out: &run::Captured) -> Wsl2Error {
+    match out.code {
+        Some(EXIT_PARENT_BAD) => {
+            precondition("the mount base parent directory is missing or unsafe")
+        }
+        Some(EXIT_PATH_UNSAFE) => precondition(
+            "a mount path component is not a root-owned, non-writable directory (symlinks are rejected)",
+        ),
+        Some(EXIT_TOO_MANY_RECORDS) => Wsl2Error::new(
+            Wsl2ErrorCode::ResourceExhausted,
+            "too many guest mount records to scan",
+        ),
+        _ => step_failed("looking up mount records", out),
+    }
+}
+
+/// [`release_container_mounts`] の結果（拡張できる構造。真偽値だけにしない）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RecoveryReport {
+    /// コンテナ ID に対応する、検証を通った記録の件数（0 なら回収するものが無かった）。
+    pub found: usize,
+    /// そのうち解除（外れ済みの記録の掃除を含む）を完了した件数。`Ok` のときは `found` と等しい。
+    pub released: usize,
+}
+
+/// 検証つきの回収の本体（実行器を差し替え可能にしたもの）。
+///
+/// 手順: ① [`LOOKUP_SCRIPT`] でコンテナ ID の記録を引く ② 形式・マウント先を検証（1 件でも改ざんがあれば何も外さず
+/// `FAILED_PRECONDITION`）③ mountinfo と照合（矛盾があれば同様に何も外さない）④ 検証を通った記録だけを、
+/// [`release_virtiofs_launch`] と同じ [`rollback`]（`UMOUNT_SCRIPT` がロックの下でマウント ID を再照合する 1 本の
+/// 経路）で解除する。umount の経路は増やさない。`exec` の合計期限は検索・mountinfo・各 umount で共有する
+/// （REPAIR-5）。[`PreparedLaunch`] は組み立てず、crate 内の [`OwnedMount`] から直接解除する。
+fn recover_with_exec(
+    distro: &DistroName,
+    owner: &OwnerId,
+    exec: Exec<'_>,
+) -> Result<RecoveryReport, MountError> {
+    let out = exec(&lookup_argv(distro, owner), MAX_OUTPUT_BYTES)?;
+    if !out.success {
+        return Err(lookup_failed(&out).into());
+    }
+    let parsed = parse_lookup_output(&out.stdout)?;
+    if parsed.rejected > 0 {
+        return Err(precondition(format!(
+            "{} guest mount record(s) failed validation; nothing was released",
+            parsed.rejected
+        ))
+        .into());
+    }
+    if parsed.records.is_empty() {
+        return Ok(RecoveryReport::default());
+    }
+    let entries = read_mountinfo(distro, &mut *exec)?;
+    let mismatched = parsed
+        .records
+        .iter()
+        .filter(|r| !record_matches_mounts(r, &entries))
+        .count();
+    if mismatched > 0 {
+        return Err(precondition(format!(
+            "{mismatched} guest mount record(s) do not match the mounted state; nothing was released"
+        ))
+        .into());
+    }
+    let owned: Vec<OwnedMount> = parsed
+        .records
+        .iter()
+        .map(|r| OwnedMount {
+            guest_path: r.guest_path.clone(),
+            mount_id: r.mount_id,
+            nonce: r.nonce.clone(),
+            // 記録は読み取り専用かを持たない。未解除として返す情報にだけ使う値で、解除の判断には使わない。
+            read_only: false,
+        })
+        .collect();
+    let outcome = rollback(distro, &owned, exec);
+    if outcome.failures() == 0 {
+        return Ok(RecoveryReport {
+            found: owned.len(),
+            released: owned.len(),
+        });
+    }
+    Err(release_failure(distro, &outcome, None))
+}
+
+/// `program` を `wsl.exe` として使う [`release_container_mounts`] の本体（結合試験用の `wsl2::test_support` から使う）。
+pub(super) fn recover_with_program(
+    program: &Path,
+    distro: &DistroName,
+    owner: &OwnerId,
+    timeout: Duration,
+) -> Result<RecoveryReport, MountError> {
+    check_timeout(timeout)?;
+    let mut exec = program_exec(program, timeout);
+    recover_with_exec(distro, owner, &mut exec)
+}
+
+/// コンテナ ID `owner` が所有する共有マウントを、作成したプロセスとは別のプロセスから検証つきで回収する
+/// （WIN-1・WIN-2・PLUG-7・REPAIR-5・#1412）。
+///
+/// [`LaunchRequest::with_owner`] で ID を付けて準備したマウントは、ゲスト内の記録にコンテナ ID とマウント先が
+/// 残る。[`PreparedLaunch`] を失った（作成したプロセスが解除に失敗したまま終わった等）場合でも、同じ `distro` と
+/// `owner` だけを手がかりに、記録を検証してから自分のマウントだけを外す。別のコンテナ ID のマウントと記録には
+/// 触れない。起動時の一括解除はしない。
+///
+/// - 記録が 1 件も無い: `Ok`（[`RecoveryReport::found`] が 0。呼び出し側が「回収するものが無い」と判断できる）。
+/// - 記録が改ざんされている（symlink・root 以外の所有・不正なマウント先・形式違反・マウント ID の不一致）:
+///   `FAILED_PRECONDITION`。どれが正しいか分からない状態で部分的に解除しないため、同じ ID の他の記録も外さない。
+///   同じ nonce・同じマウント先を主張する重複した記録も改ざんとして扱う（古い記録と新しい記録が同じマウント先に
+///   並ぶ場合は手動で片方を消すまで回収できない。fail-closed）。
+/// - 解除に失敗: `FAILED_PRECONDITION`（件数のみ）。外せなかったマウントは [`MountError::unreleased`] に載せる。
+/// - 期限切れ: `TIMEOUT`。`timeout` は検索・mountinfo の読み取り・各 umount で共有する合計期限。
+///
+/// # 未実装範囲（REPAIR-3）
+///
+/// 本関数の呼び出し側（`fandhe-container-plugin-windows` の stop、または起動役の delete）への接続は未実装。
+/// 回収の主体の決定は `docs/design/windows-execution-layout.md` の論点 4（#2230・オーナー承認待ち）にあり、
+/// 承認後の別 issue で接続する。ID を付けずに準備したマウントは本関数では引けない。
+pub fn release_container_mounts(
+    distro: &DistroName,
+    owner: &OwnerId,
+    timeout: Duration,
+) -> Result<RecoveryReport, MountError> {
+    release_container_mounts_with_recorder(distro, owner, timeout, &NoopWinOpRecorder)
+}
+
+/// [`release_container_mounts`] の計装版（全体の成否と所要時間を [`WinOpKind::Wsl2UnmountShared`] として 1 件記録する。
+/// REPAIR-4）。
+pub fn release_container_mounts_with_recorder(
+    distro: &DistroName,
+    owner: &OwnerId,
+    timeout: Duration,
+    recorder: &dyn WinOpRecorder,
+) -> Result<RecoveryReport, MountError> {
+    record_win_op(recorder, WinOpKind::Wsl2UnmountShared, || {
+        check_timeout(timeout)?;
+        let program = wsl_exe_path()?;
+        recover_with_program(&program, distro, owner, timeout)
+    })
 }
 
 /// [`launch_with`] の成功時の結果: 起動ステップの戻り値と、解除に使う準備済みマウント。
@@ -2136,7 +2537,7 @@ mod tests {
         let rw = sm("C:\\a b", "data", false);
         let ro = sm("C:\\a b", "data", true);
         let script_args = |m: &SharedMount| {
-            let v = mount_argv(&d, m, "00ff");
+            let v = mount_argv(&d, m, "00ff", None);
             (
                 v.get(..7).map(<[String]>::to_vec),
                 v.get(8..).map(<[String]>::to_vec),
@@ -2163,7 +2564,8 @@ mod tests {
                 "C:\\a b".to_string(),
                 "data".to_string(),
                 "nosuid,nodev".to_string(),
-                "00ff".to_string()
+                "00ff".to_string(),
+                ".".to_string()
             ])
         );
         let (h, t) = script_args(&ro);
@@ -2185,7 +2587,7 @@ mod tests {
             "mkdir -m 700 -- \"$R\" 2>/dev/null || [ -d \"$R\" ] || exit 201; chk \"$R\" || exit 202; "
         ));
         assert!(MOUNT_SCRIPT.contains(
-            "[ \"$n\" = 1 ] || new=none; if printf '%s\\n' \"$new\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" && mkdir -- \"$R/$4.done\" 2>/dev/null; then [ \"$new\" = none ] || printf '%s\\n' \"$new\"; exit \"$rc\"; fi; "
+            "[ \"$n\" = 1 ] || new=none; if printf '%s\\n%s\\n%s\\n' \"$new\" \"$T\" \"$5\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" && mkdir -- \"$R/$4.done\" 2>/dev/null; then [ \"$new\" = none ] || printf '%s\\n' \"$new\"; exit \"$rc\"; fi; "
         ));
         // 記録を確定できない（取り下げを含む）ときは、自分のマウントが最上位なら自分で外して終える。
         assert!(MOUNT_SCRIPT.contains(
@@ -2193,7 +2595,7 @@ mod tests {
         ));
         // 210 では記録（ID または none）と .done を残し、後の release が STATUS_SCRIPT で回収できるようにする。
         assert!(MOUNT_SCRIPT.contains(
-            "else printf '%s\\n' \"$new\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" || :; mkdir -- \"$R/$4.done\" 2>/dev/null || :; fi; exit \"$x\""
+            "else printf '%s\\n%s\\n%s\\n' \"$new\" \"$T\" \"$5\" > \"$R/$4.tmp\" && mv -f -- \"$R/$4.tmp\" \"$R/$4\" || :; mkdir -- \"$R/$4.done\" 2>/dev/null || :; fi; exit \"$x\""
         ));
         assert!(
             STATUS_SCRIPT
@@ -2354,6 +2756,15 @@ mod tests {
         reverse_mountinfo: bool,
         /// ゲスト内の所有の記録（nonce → マウント ID または `none`）。
         records: std::collections::HashMap<String, String>,
+        /// 記録の 2・3 行目（nonce → (マウント先, 所有者のコンテナ ID または印 `.`)）。`records` に記録がある
+        /// nonce にだけ意味がある（読み手は 1 行目だけを読む既存経路と、LOOKUP_SCRIPT の模擬が使う）。
+        meta: std::collections::HashMap<String, (String, String)>,
+        /// LOOKUP_SCRIPT の模擬が `bad <nonce>` で報告する nonce（symlink・root 以外の所有の記録の模擬）。
+        lookup_bad: Vec<String>,
+        /// `Some(code)` なら LOOKUP_SCRIPT の模擬がその終了コードで失敗する。
+        lookup_exit: Option<i32>,
+        /// LOOKUP_SCRIPT の呼び出し回数。
+        lookups: usize,
         /// ゲスト内の実行権（claim）を確保済みの nonce。
         claims: std::collections::HashSet<String>,
         /// true なら mount 呼び出しをゲスト内で実行しないまま `TIMEOUT` にし、引数を `deferred` に残す
@@ -2432,6 +2843,10 @@ mod tests {
                 force_ro: false,
                 reverse_mountinfo: false,
                 records: std::collections::HashMap::new(),
+                meta: std::collections::HashMap::new(),
+                lookup_bad: vec![],
+                lookup_exit: None,
+                lookups: 0,
                 claims: std::collections::HashSet::new(),
                 defer_mount: false,
                 deferred: None,
@@ -2469,6 +2884,17 @@ mod tests {
                 .filter(|((p, _), _)| p == target)
                 .map(|(_, id)| *id)
                 .collect()
+        }
+
+        /// 記録ファイルの中身（3 行: マウント ID または `none`・マウント先・所有者）。
+        fn record_text(&self, nonce: &str) -> Option<String> {
+            let id = self.records.get(nonce)?;
+            let (target, owner) = self
+                .meta
+                .get(nonce)
+                .cloned()
+                .unwrap_or_else(|| (String::new(), ".".to_string()));
+            Some(format!("{id}\n{target}\n{owner}\n"))
         }
 
         /// マウントを積む（`extra_on_mount` なら他者のマウントも積む）。
@@ -2595,7 +3021,9 @@ mod tests {
                     }
                     ok(lines.concat())
                 }
-                ["sh", "-c", script, "sh", _host, name, opts, nonce] if *script == MOUNT_SCRIPT => {
+                ["sh", "-c", script, "sh", _host, name, opts, nonce, owner]
+                    if *script == MOUNT_SCRIPT =>
+                {
                     // MOUNT_SCRIPT の模擬: / → /mnt → /run → 記録ディレクトリ → 基底 → マウント先を検証し
                     // （無ければ作成）、mount の前後の差分で自分のマウントを特定して標準出力と記録に書く。
                     let fail = |code: i32| {
@@ -2655,6 +3083,10 @@ mod tests {
                     if !self.claims.insert((*nonce).to_string()) {
                         return fail(EXIT_CLAIM_FAILED);
                     }
+                    self.meta.insert(
+                        (*nonce).to_string(),
+                        (target.to_string(), (*owner).to_string()),
+                    );
                     if self.hang_mount {
                         self.pending = Some((
                             (*nonce).to_string(),
@@ -2715,8 +3147,8 @@ mod tests {
                     if self.claims.insert((*nonce).to_string()) {
                         return fail_cat(EXIT_NO_RECORD);
                     }
-                    match self.records.get(*nonce) {
-                        Some(v) => ok(format!("{v}\n")),
+                    match self.record_text(nonce) {
+                        Some(v) => ok(v),
                         None => fail_cat(206),
                     }
                 }
@@ -2732,19 +3164,40 @@ mod tests {
                     if self.dones.insert((*nonce).to_string()) {
                         return fail_cat(EXIT_ABANDONED);
                     }
-                    match self.records.get(*nonce) {
-                        Some(v) => ok(format!("{v}\n")),
+                    match self.record_text(nonce) {
+                        Some(v) => ok(v),
                         None => fail_cat(206),
                     }
                 }
                 ["sh", "-c", script, "sh", nonce] if *script == STATUS_SCRIPT => {
                     // STATUS_SCRIPT の模擬: 記録があれば中身、claim だけなら 206、どちらも無ければ 212。
                     self.status_reads += 1;
-                    match self.records.get(*nonce) {
-                        Some(v) => ok(format!("{v}\n")),
+                    match self.record_text(nonce) {
+                        Some(v) => ok(v),
                         None if self.claims.contains(*nonce) => fail_cat(EXIT_PENDING),
                         None => fail_cat(EXIT_GONE),
                     }
+                }
+                ["sh", "-c", script, "sh", owner] if *script == LOOKUP_SCRIPT => {
+                    // LOOKUP_SCRIPT の模擬: 所有者が一致する記録を `rec <nonce> <ID|none> <マウント先>` で、
+                    // 基準を満たさないエントリを `bad <nonce>` で出力する（nonce の昇順）。
+                    self.lookups += 1;
+                    if let Some(code) = self.lookup_exit {
+                        return fail_cat(code);
+                    }
+                    let mut nonces: Vec<&String> = self.records.keys().collect();
+                    nonces.sort();
+                    let mut text = String::new();
+                    for n in nonces {
+                        if let Some((target, _)) = self.meta.get(n).filter(|(_, o)| o == owner) {
+                            let id = self.records.get(n).map_or("none", String::as_str);
+                            text.push_str(&format!("rec {n} {id} {target}\n"));
+                        }
+                    }
+                    for n in &self.lookup_bad {
+                        text.push_str(&format!("bad {n}\n"));
+                    }
+                    ok(text)
                 }
                 ["sh", "-c", script, "sh", nonce] if *script == CLEAR_SCRIPT => {
                     // CLEAR_SCRIPT の模擬: 記録・claim・done を消す。
@@ -4057,6 +4510,527 @@ mod tests {
         assert_eq!(
             e.unreleased().map(summary),
             Some(vec![("/mnt/fandhe/a", Some(100), false)])
+        );
+    }
+    // ---- コンテナ ID からの回収（#1412。WIN-1・WIN-2・PLUG-7・REPAIR-5） ----
+
+    fn owner(s: &str) -> OwnerId {
+        OwnerId::parse(s).expect("valid owner id")
+    }
+
+    /// ID 付きで準備する（返った `PreparedLaunch` は呼び出し側が捨てる前提で、模擬ゲストの状態だけが残る）。
+    fn prepare_owned(g: &mut Guest, id: &str, mounts: Vec<SharedMount>) -> PreparedLaunch {
+        let r = req(mounts).with_owner(owner(id));
+        drive(g, &r, VirtiofsState::Enabled).expect("prepare")
+    }
+
+    /// 別プロセスからの回収（`PreparedLaunch` を持たず、ディストリとコンテナ ID だけを渡す）。
+    fn recover(g: &mut Guest, id: &str) -> Result<RecoveryReport, MountError> {
+        recover_with_exec(&distro_name(), &owner(id), &mut |a, m| g.run(a, m))
+    }
+
+    /// 検証失敗・不一致のメッセージ（件数だけ。パス・ID・生出力を含めない）。
+    fn failed_validation(n: usize) -> String {
+        format!("{n} guest mount record(s) failed validation; nothing was released")
+    }
+
+    /// WIN-2・REPAIR-2: コンテナ ID は `[A-Za-z0-9._-]` の 1〜255 バイトで、`.` / `..` を含め危険な値は拒否する。
+    #[test]
+    fn owner_id_accepts_and_rejects() {
+        let long = "x".repeat(MAX_OWNER_ID_LEN);
+        for ok in ["web", "a.b_c-1", "0", "-", "..a", long.as_str()] {
+            assert_eq!(OwnerId::parse(ok).unwrap().as_str(), ok);
+        }
+        let too_long = "x".repeat(MAX_OWNER_ID_LEN + 1);
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a b",
+            "a/b",
+            "a\nb",
+            "a$(id)",
+            "コンテナ",
+            too_long.as_str(),
+        ] {
+            let e = OwnerId::parse(bad).unwrap_err();
+            assert_eq!(e.code(), Wsl2ErrorCode::InvalidArgument, "{bad:?}");
+            assert_eq!(
+                e.message(),
+                "owner id must be 1-255 characters of [A-Za-z0-9._-], not '.' or '..'"
+            );
+        }
+    }
+
+    /// #1412: コンテナ ID は mount スクリプトの `$5` に渡り、未設定は印 `.`（実在の ID と衝突しない）。
+    #[test]
+    fn mount_argv_passes_owner_as_fifth_positional() {
+        let d = distro_name();
+        let m = sm("C:\\a", "data", false);
+        let with = mount_argv(&d, &m, "00ff", Some(&owner("web")));
+        assert_eq!(with.last().map(String::as_str), Some("web"));
+        assert_eq!(with.len(), 14);
+        let without = mount_argv(&d, &m, "00ff", None);
+        assert_eq!(without.last().map(String::as_str), Some("."));
+        assert_eq!(
+            lookup_argv(&d, &owner("web")).get(5..),
+            Some(
+                &[
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    LOOKUP_SCRIPT.to_string(),
+                    "sh".to_string(),
+                    "web".to_string()
+                ][..]
+            )
+        );
+        // 記録は 3 行（ID・マウント先・コンテナ ID）で書き、検索は名前が 16 進の nonce のエントリだけを読む。
+        assert!(MOUNT_SCRIPT.contains("printf '%s\\n%s\\n%s\\n' \"$new\" \"$T\" \"$5\""));
+        assert!(LOOKUP_SCRIPT.contains("*[!0-9a-f]*) continue"));
+    }
+
+    /// #1412: 記録は 3 行になっても、1 行目だけを読む既存の読み手はマウント ID を取り出せる。
+    #[test]
+    fn record_is_three_lines_and_first_line_readers_still_work() {
+        let mut g = Guest::new("virtiofs");
+        let p = prepare_owned(&mut g, "web", vec![sm("C:\\a", "a", false)]);
+        let nonce = p.mounts().first().map(|m| m.nonce.clone()).unwrap();
+        let text = g.record_text(&nonce).unwrap();
+        assert_eq!(text, "100\n/mnt/fandhe/a\nweb\n");
+        assert_eq!(parse_recorded_id(text.as_bytes()), Some(100));
+        assert!(!is_none_record(text.as_bytes()));
+        assert!(is_none_record(b"none\n/mnt/fandhe/a\n.\n"));
+        assert!(is_none_record(b"none\n"));
+        assert_eq!(parse_recorded_id(b"12 13\n/mnt/fandhe/a\n.\n"), None);
+        // 通常の解除（PreparedLaunch 経路）も 3 行の記録で従来どおり動く。
+        assert_eq!(release_with_exec(&p, &mut |a, m| g.run(a, m)).failures(), 0);
+        assert!(g.records.is_empty());
+        // ID なしの準備は印 `.` を書く。
+        let mut g = Guest::new("virtiofs");
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let p = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
+        let nonce = p.mounts().first().map(|m| m.nonce.clone()).unwrap();
+        assert_eq!(
+            g.record_text(&nonce).as_deref(),
+            Some("100\n/mnt/fandhe/a\n.\n")
+        );
+    }
+
+    /// WIN-2・PLUG-7・REPAIR-5（A1・A2）: 作成したプロセスの `PreparedLaunch` を失っても、別の実行器が
+    /// コンテナ ID だけで自分のマウントを外す。別の ID のマウントと記録には触れない。
+    #[test]
+    fn recover_releases_only_the_requested_owner() {
+        let mut g = Guest::new("virtiofs");
+        drop(prepare_owned(&mut g, "web", vec![sm("C:\\a", "a", false)]));
+        drop(prepare_owned(&mut g, "api", vec![sm("C:\\b", "b", true)]));
+        assert_eq!(g.records.len(), 2);
+
+        let report = recover(&mut g, "web").unwrap();
+        assert_eq!((report.found, report.released), (1, 1));
+        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+        assert!(g.mounts.iter().all(|(p, _)| p != "/mnt/fandhe/a"));
+        assert!(g.mounts.iter().any(|(p, _)| p == "/mnt/fandhe/b"));
+        // 残る記録は api のものだけ。
+        let left: Vec<&(String, String)> = g
+            .meta
+            .iter()
+            .filter_map(|(n, v)| g.records.get(n).map(|_| v))
+            .collect();
+        assert_eq!(left, [&("/mnt/fandhe/b".to_string(), "api".to_string())]);
+
+        // 二重回収は何もしない（記録が無い）。
+        assert_eq!(recover(&mut g, "web").unwrap(), RecoveryReport::default());
+        assert_eq!(g.umounts, ["/mnt/fandhe/a"]);
+
+        let report = recover(&mut g, "api").unwrap();
+        assert_eq!((report.found, report.released), (1, 1));
+        assert_eq!(g.umounts, ["/mnt/fandhe/a", "/mnt/fandhe/b"]);
+        assert!(g.records.is_empty() && g.claims.is_empty());
+    }
+
+    /// #1412: 1 つのコンテナ ID に複数の共有マウントがあれば、全部を外す（検索 1 回・mountinfo 1 回・umount 各 1 回）。
+    #[test]
+    fn recover_releases_every_mount_of_the_owner() {
+        let mut g = Guest::new("virtiofs");
+        drop(prepare_owned(
+            &mut g,
+            "web",
+            vec![sm("C:\\a", "a", false), sm("C:\\b", "b", true)],
+        ));
+        let cats = g.cat_calls;
+        let report = recover(&mut g, "web").unwrap();
+        assert_eq!((report.found, report.released), (2, 2));
+        assert_eq!(g.lookups, 1);
+        assert_eq!(g.umounts.len(), 2);
+        assert!(g.umounts.contains(&"/mnt/fandhe/a".to_string()));
+        assert!(g.umounts.contains(&"/mnt/fandhe/b".to_string()));
+        assert!(g.records.is_empty());
+        assert!(g.cat_calls > cats);
+    }
+
+    /// #1412: 記録が 1 件も無ければ `Ok`（found 0）。mountinfo も読まず何も外さない。ID なしで準備した
+    /// マウントは ID では引けず、触れない（fail-closed）。
+    #[test]
+    fn recover_with_no_records_does_nothing() {
+        let mut g = Guest::new("virtiofs");
+        let r = req(vec![sm("C:\\a", "a", false)]);
+        let _ = drive(&mut g, &r, VirtiofsState::Enabled).unwrap();
+        let cats = g.cat_calls;
+        assert_eq!(recover(&mut g, "web").unwrap(), RecoveryReport::default());
+        assert_eq!(g.cat_calls, cats);
+        assert!(g.umounts.is_empty());
+        assert!(g.mounts.iter().any(|(p, _)| p == "/mnt/fandhe/a"));
+        assert_eq!(g.records.len(), 1);
+    }
+
+    /// SEC・WIN-2（A3）: 改ざんされた記録（`bad` の報告・不正なマウント先・形式違反）が 1 件でもあれば、
+    /// 構造化エラーを返して何も外さない。同じ ID の他の正しい記録も外さない。
+    #[test]
+    fn recover_refuses_tampered_records_and_releases_nothing() {
+        // ゲスト側の基準違反（symlink・root 以外の所有・他者書き込み可）は `bad` の行で報告される。
+        let mut g = Guest::new("virtiofs");
+        drop(prepare_owned(&mut g, "web", vec![sm("C:\\a", "a", false)]));
+        g.lookup_bad.push("00ff".to_string());
+        let e = recover(&mut g, "web").unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), failed_validation(1));
+        assert!(e.unreleased().is_none());
+        assert!(g.umounts.is_empty());
+        assert_eq!(g.records.len(), 1);
+
+        // 固定基底の外・`..`・深い階層・基底そのもの・名前規則違反のマウント先。
+        for bad_target in [
+            "/etc",
+            "/mnt/fandhe/../x",
+            "/mnt/fandhe/a/b",
+            "/mnt/fandhe/",
+            "/mnt/fandhe",
+            "/mnt/fandhe2/a",
+            "/mnt/fandhe/-a",
+            "/mnt/fandhe/a b",
+        ] {
+            let mut g = Guest::new("virtiofs");
+            drop(prepare_owned(&mut g, "web", vec![sm("C:\\a", "a", false)]));
+            for v in g.meta.values_mut() {
+                v.0 = bad_target.to_string();
+            }
+            let e = recover(&mut g, "web").unwrap_err();
+            assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition, "{bad_target}");
+            assert_eq!(e.message(), failed_validation(1), "{bad_target}");
+            assert!(g.umounts.is_empty(), "{bad_target}");
+            assert_eq!(g.records.len(), 1, "{bad_target}");
+        }
+
+        // 同じ ID の 2 件のうち 1 件が改ざんされていたら、正しい方も外さない。
+        let mut g = Guest::new("virtiofs");
+        drop(prepare_owned(
+            &mut g,
+            "web",
+            vec![sm("C:\\a", "a", false), sm("C:\\b", "b", false)],
+        ));
+        let victim = g
+            .meta
+            .iter()
+            .find(|(_, v)| v.0 == "/mnt/fandhe/b")
+            .map(|(n, _)| n.clone())
+            .unwrap();
+        g.meta.get_mut(&victim).unwrap().0 = "/root".to_string();
+        let e = recover(&mut g, "web").unwrap_err();
+        assert_eq!(e.message(), failed_validation(1));
+        assert!(g.umounts.is_empty());
+        assert_eq!(g.records.len(), 2);
+    }
+
+    /// SEC・WIN-2（A3）: 記録のマウント ID がマウント先の最上位と一致しない（記録の差し替え・他者のマウントが
+    /// 積まれている）ときは、何も外さず `FAILED_PRECONDITION`。
+    #[test]
+    fn recover_refuses_records_that_do_not_match_mountinfo() {
+        // 記録のマウント ID をずらす。
+        let mut g = Guest::new("virtiofs");
+        drop(prepare_owned(&mut g, "web", vec![sm("C:\\a", "a", false)]));
+        for v in g.records.values_mut() {
+            *v = "150".to_string();
+        }
+        let e = recover(&mut g, "web").unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "1 guest mount record(s) do not match the mounted state; nothing was released"
+        );
+        assert!(g.umounts.is_empty());
+        assert_eq!(g.records.len(), 1);
+
+        // 他者のマウントが最上位に積まれた。
+        let mut g = Guest::new("virtiofs");
+        drop(prepare_owned(&mut g, "web", vec![sm("C:\\a", "a", false)]));
+        g.mounts.push(("/mnt/fandhe/a".into(), "tmpfs".into()));
+        g.ids.push(777);
+        g.opts.push("rw".into());
+        let e = recover(&mut g, "web").unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert!(g.umounts.is_empty());
+        assert_eq!(g.mounts.len(), 3);
+
+        // 記録のマウント ID が別のマウント先に存在する（マウント先の書き換え）。
+        let mut g = Guest::new("virtiofs");
+        drop(prepare_owned(
+            &mut g,
+            "web",
+            vec![sm("C:\\a", "a", false), sm("C:\\b", "b", false)],
+        ));
+        let rec_a = g
+            .meta
+            .iter()
+            .find(|(_, v)| v.0 == "/mnt/fandhe/a")
+            .map(|(n, _)| n.clone())
+            .unwrap();
+        g.meta.get_mut(&rec_a).unwrap().0 = "/mnt/fandhe/c".to_string();
+        let e = recover(&mut g, "web").unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert!(g.umounts.is_empty());
+    }
+
+    /// WIN-2: 外れ済みの古い記録（マウントも ID も mountinfo に無い）は、記録だけを消して完了とする。
+    #[test]
+    fn recover_cleans_a_stale_record_without_unmounting() {
+        let mut g = Guest::new("virtiofs");
+        g.records.insert("00ab".into(), "150".into());
+        g.claims.insert("00ab".into());
+        g.meta
+            .insert("00ab".into(), ("/mnt/fandhe/a".into(), "web".into()));
+        let report = recover(&mut g, "web").unwrap();
+        assert_eq!((report.found, report.released), (1, 1));
+        assert!(g.umounts.is_empty());
+        assert!(g.records.is_empty() && g.claims.is_empty());
+    }
+
+    /// WIN-2: 自分のマウントを特定できなかった記録（`none`）は外さず、件数だけを報告する（fail-closed）。
+    #[test]
+    fn recover_does_not_unmount_unattributed_records() {
+        let mut g = Guest::new("virtiofs");
+        g.mounts.push(("/mnt/fandhe/a".into(), "virtiofs".into()));
+        g.ids.push(300);
+        g.opts.push("rw,nosuid,nodev".into());
+        g.records.insert("00ab".into(), "none".into());
+        g.claims.insert("00ab".into());
+        g.meta
+            .insert("00ab".into(), ("/mnt/fandhe/a".into(), "web".into()));
+        let e = recover(&mut g, "web").unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.message(),
+            "0 unmount(s) failed (1 mount(s) could not be attributed and may have been left in place)"
+        );
+        assert!(g.umounts.is_empty());
+        assert!(g.mounts.iter().any(|(p, _)| p == "/mnt/fandhe/a"));
+    }
+
+    /// REPAIR-5・WIN-2: 外せなかったマウントは `MountError::unreleased` に載せ、同じ関数で再試行できる。
+    #[test]
+    fn recover_returns_unreleased_mounts_and_can_retry() {
+        let mut g = Guest::new("virtiofs");
+        drop(prepare_owned(&mut g, "web", vec![sm("C:\\a", "a", false)]));
+        g.umount_timeout = Some(false);
+        let e = recover(&mut g, "web").unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "1 unmount(s) failed");
+        assert_eq!(
+            e.unreleased().map(summary),
+            Some(vec![("/mnt/fandhe/a", Some(100), false)])
+        );
+        assert_eq!(g.records.len(), 1);
+        g.umount_timeout = None;
+        let report = recover(&mut g, "web").unwrap();
+        assert_eq!((report.found, report.released), (1, 1));
+        assert!(g.records.is_empty());
+    }
+
+    /// REPAIR-5・ERR-1: 検索・mountinfo の読み取りが期限切れ（`wsl.exe` のタイムアウト）なら `TIMEOUT` で止まり、
+    /// 何も外さない。検索のスクリプトの失敗は終了コードごとの固定文言になる。
+    #[test]
+    fn recover_maps_timeouts_and_script_failures() {
+        let timeout = || Err(Wsl2Error::new(Wsl2ErrorCode::Timeout, "slow"));
+        let mut g = Guest::new("virtiofs");
+        drop(prepare_owned(&mut g, "web", vec![sm("C:\\a", "a", false)]));
+        // 検索が期限切れ。
+        let e = recover_with_exec(&distro_name(), &owner("web"), &mut |a, m| {
+            if a.get(7).map(String::as_str) == Some(LOOKUP_SCRIPT) {
+                return timeout();
+            }
+            g.run(a, m)
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        // 検索の後の mountinfo の読み取りが期限切れ。
+        let e = recover_with_exec(&distro_name(), &owner("web"), &mut |a, m| {
+            if a.get(5).map(String::as_str) == Some("cat") {
+                return timeout();
+            }
+            g.run(a, m)
+        })
+        .unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
+        assert!(g.umounts.is_empty());
+        assert_eq!(g.records.len(), 1);
+
+        for (code, expected, message) in [
+            (
+                200,
+                Wsl2ErrorCode::FailedPrecondition,
+                "the mount base parent directory is missing or unsafe",
+            ),
+            (
+                202,
+                Wsl2ErrorCode::FailedPrecondition,
+                "a mount path component is not a root-owned, non-writable directory (symlinks are rejected)",
+            ),
+            (
+                215,
+                Wsl2ErrorCode::ResourceExhausted,
+                "too many guest mount records to scan",
+            ),
+            (
+                1,
+                Wsl2ErrorCode::FailedPrecondition,
+                "looking up mount records failed in the distribution (exit code 1)",
+            ),
+        ] {
+            g.lookup_exit = Some(code);
+            let e = recover(&mut g, "web").unwrap_err();
+            assert_eq!((e.code(), e.message()), (expected, message), "{code}");
+        }
+        assert!(g.umounts.is_empty());
+    }
+
+    /// REPAIR-2・REPAIR-5: 検索の出力はゲスト由来の untrusted として、形式・マウント先・件数・重複を検証する。
+    #[test]
+    fn lookup_output_parsing() {
+        let ok = parse_lookup_output(b"rec 00ff 100 /mnt/fandhe/a\nrec 0a none /mnt/fandhe/b-1\n")
+            .unwrap();
+        assert_eq!(ok.rejected, 0);
+        assert_eq!(
+            ok.records,
+            vec![
+                RecoveredRecord {
+                    nonce: "00ff".into(),
+                    mount_id: Some(100),
+                    guest_path: "/mnt/fandhe/a".into()
+                },
+                RecoveredRecord {
+                    nonce: "0a".into(),
+                    mount_id: None,
+                    guest_path: "/mnt/fandhe/b-1".into()
+                },
+            ]
+        );
+        assert_eq!(parse_lookup_output(b"").unwrap(), LookupOutput::default());
+
+        for bad in [
+            "bad 00ff",
+            "rec 00FF 100 /mnt/fandhe/a",
+            "rec 00ff 100",
+            "rec 00ff 100 /mnt/fandhe/a extra",
+            "rec 00ff x1 /mnt/fandhe/a",
+            "rec 00ff 4294967296 /mnt/fandhe/a",
+            "rec 00ff -1 /mnt/fandhe/a",
+            "rec  100 /mnt/fandhe/a",
+            "rec 00ff 100 /mnt/fandhe/../etc",
+            "rec 00ff 100 /mnt/fandhe/a/b",
+            "rec 00ff 100 relative",
+            "garbage",
+            "rec 00ff 100  /mnt/fandhe/a",
+        ] {
+            let got = parse_lookup_output(bad.as_bytes()).unwrap();
+            assert_eq!((got.records.len(), got.rejected), (0, 1), "{bad}");
+        }
+        let long_nonce = format!("rec {} 1 /mnt/fandhe/a", "a".repeat(MAX_NONCE_LEN + 1));
+        assert_eq!(
+            parse_lookup_output(long_nonce.as_bytes()).unwrap().rejected,
+            1
+        );
+
+        // 同じ nonce・同じマウント先を二重に主張する記録は拒否する。
+        let dup = parse_lookup_output(
+            b"rec 00ff 100 /mnt/fandhe/a\nrec 00ff 101 /mnt/fandhe/b\nrec 00fe 102 /mnt/fandhe/a\n",
+        )
+        .unwrap();
+        assert_eq!((dup.records.len(), dup.rejected), (1, 2));
+
+        assert_eq!(
+            parse_lookup_output(&[0xff, 0xfe]).unwrap_err().code(),
+            Wsl2ErrorCode::DataLoss
+        );
+        let many: String = (0..=MAX_SHARED_MOUNTS)
+            .map(|i| format!("rec {i:02x} {i} /mnt/fandhe/m{i}\n"))
+            .collect();
+        assert_eq!(
+            parse_lookup_output(many.as_bytes()).unwrap_err().code(),
+            Wsl2ErrorCode::ResourceExhausted
+        );
+        let lines = "bad 00\n".repeat(MAX_LOOKUP_LINES + 1);
+        assert_eq!(
+            parse_lookup_output(lines.as_bytes()).unwrap_err().code(),
+            Wsl2ErrorCode::ResourceExhausted
+        );
+    }
+
+    /// WIN-2: 記録と mountinfo の照合規則（最上位の ID 一致・外れ済みの掃除・矛盾の拒否）。
+    #[test]
+    fn record_matches_mounts_cases() {
+        let entry = |id: u32, parent: u32, mp: &str| MountEntry {
+            mount_id: id,
+            parent_id: parent,
+            mount_point: mp.into(),
+            options: "rw".into(),
+            fstype: "virtiofs".into(),
+        };
+        let rec = |id: Option<u32>| RecoveredRecord {
+            nonce: "00ff".into(),
+            mount_id: id,
+            guest_path: "/mnt/fandhe/a".into(),
+        };
+        let base = vec![entry(1, 0, "/")];
+        // 外れ済み（どこにも無い）は一致扱い。
+        assert!(record_matches_mounts(&rec(Some(5)), &base));
+        // `none` は外さないので常に矛盾なし。
+        assert!(record_matches_mounts(&rec(None), &base));
+        let mounted = vec![entry(1, 0, "/"), entry(5, 1, "/mnt/fandhe/a")];
+        assert!(record_matches_mounts(&rec(Some(5)), &mounted));
+        assert!(!record_matches_mounts(&rec(Some(6)), &mounted));
+        // 他者のマウントが積まれている（最上位は 6）。
+        let stacked = vec![
+            entry(1, 0, "/"),
+            entry(5, 1, "/mnt/fandhe/a"),
+            entry(6, 5, "/mnt/fandhe/a"),
+        ];
+        assert!(!record_matches_mounts(&rec(Some(5)), &stacked));
+        // マウント先に無いが、記録の ID は別の場所にある。
+        let moved = vec![entry(1, 0, "/"), entry(5, 1, "/mnt/fandhe/z")];
+        assert!(!record_matches_mounts(&rec(Some(5)), &moved));
+        // マウント先に別のマウントがあり、記録の ID は無い。
+        let replaced = vec![entry(1, 0, "/"), entry(9, 1, "/mnt/fandhe/a")];
+        assert!(!record_matches_mounts(&rec(Some(5)), &replaced));
+    }
+
+    /// REPAIR-4: 公開の計装版は回収全体を `wsl2.unmount_shared` として 1 件記録する（`wsl.exe` が無い環境では
+    /// 実行器に到達する前の失敗として記録される）。
+    #[test]
+    fn release_container_mounts_is_instrumented() {
+        use crate::instrument::testing::Collect;
+        let rec = Collect::default();
+        let r = release_container_mounts_with_recorder(
+            &distro_name(),
+            &owner("web"),
+            Duration::ZERO,
+            &rec,
+        );
+        assert_eq!(r.unwrap_err().code(), Wsl2ErrorCode::InvalidArgument);
+        assert_eq!(
+            rec.kinds(),
+            [(
+                WinOpKind::Wsl2UnmountShared,
+                crate::instrument::WinOpOutcome::Failure
+            )]
         );
     }
 }

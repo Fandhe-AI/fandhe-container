@@ -6,7 +6,7 @@
 //! - 既定集合（3 件）: 実 Windows のパス規約（一時ディレクトリ・`canonicalize` の `\\?\` 形式・
 //!   `USERPROFILE`）と `HostDir` / `wslconfig::default_path` の契約を具体値で固定する。windows-latest の
 //!   runner に WSL があるかどうかで結果が変わらないよう、`detect` などの WSL 呼び出しは含めない。
-//! - 実機前提（`#[ignore]` の 1 件）: 実 WSL2 ディストリに対し `detect` と
+//! - 実機前提（`#[ignore]` の 2 件。うち 1 件は #1412 のコンテナ ID による回収で、末尾のテスト）: 実 WSL2 ディストリに対し `detect` と
 //!   `prepare_virtiofs_launch` / `release_virtiofs_launch` を通し、`mount -t drvfs` が virtiofs で成立すること・
 //!   `nosuid,nodev,ro` が受理されること・9P フォールバック時の fstype を確かめる（`src/wsl2/mount.rs` の
 //!   「実機未検証」の前提を確認する入口）。手順は AGENTS.md「実機前提テスト」節。
@@ -23,9 +23,9 @@ use std::time::Duration;
 
 use fandhe_container_platform_windows::instrument::WinWarningCode;
 use fandhe_container_platform_windows::wsl2::{
-    DistroName, HostDir, LaunchRequest, MAX_WSL_TIMEOUT, MIN_WSL_TIMEOUT, MountName,
+    DistroName, HostDir, LaunchRequest, MAX_WSL_TIMEOUT, MIN_WSL_TIMEOUT, MountName, OwnerId,
     PreparedLaunch, SharedMount, SharedTransport, Wsl2ErrorCode, detect, prepare_virtiofs_launch,
-    release_virtiofs_launch,
+    release_container_mounts, release_virtiofs_launch,
 };
 use fandhe_container_platform_windows::wslconfig;
 
@@ -391,6 +391,89 @@ fn win1_win2_shared_mount_on_real_wsl2() {
     assert!(
         released,
         "release failed; shared source retained at {}",
+        tmp.path().display()
+    );
+}
+
+/// WIN-1・WIN-2・PLUG-7・REPAIR-5（#1412）: 実 WSL2 で、コンテナ ID を付けて準備したマウントの `PreparedLaunch` を
+/// 捨てても、ディストリとコンテナ ID だけで記録を引いて検証し、マウントを外せること（別のコンテナ ID の
+/// 記録には触れないことも確かめる）。
+#[test]
+#[ignore = "requires real Windows with WSL2 and a WSL2 distribution; see AGENTS.md"]
+fn win2_recover_shared_mount_by_container_id_on_real_wsl2() {
+    let timeout = test_timeout();
+    let distro_name = std::env::var(ENV_DISTRO)
+        .unwrap_or_else(|_| panic!("{ENV_DISTRO} must be set to a WSL2 distribution name"));
+    let tmp = TempDir::new("real-wsl2-recover");
+    let dir = tmp.path().join("rw");
+    std::fs::create_dir_all(&dir).expect("create share dir");
+    let host = HostDir::parse(dir.to_str().expect("UTF-8 path")).expect("host dir");
+    let owner = OwnerId::parse(&format!("fc-it-recover-{}", std::process::id())).expect("owner id");
+    let distro = DistroName::parse(&distro_name).expect("distro name");
+    let req = LaunchRequest::new(
+        distro.clone(),
+        vec![SharedMount::new(
+            host,
+            MountName::parse("fc-it-recover").expect("mount name"),
+            false,
+        )],
+    )
+    .expect("launch request")
+    .with_owner(owner.clone());
+
+    let prepared = prepare_virtiofs_launch(&req, timeout).unwrap_or_else(|e| {
+        tmp.retain_flag().store(true, Ordering::SeqCst);
+        panic!(
+            "prepare failed: code={} message={}",
+            e.code().as_str(),
+            e.message()
+        )
+    });
+    let guest_path = prepared.mounts()[0].guest_path.clone();
+    // 作成したプロセスの所有情報を失った状況を模す（以後はディストリとコンテナ ID だけを使う）。
+    drop(prepared);
+
+    // 別のコンテナ ID の回収は、このマウントに触れない。
+    let other = OwnerId::parse("fc-it-recover-other").expect("owner id");
+    let report = release_container_mounts(&distro, &other, timeout).unwrap_or_else(|e| {
+        tmp.retain_flag().store(true, Ordering::SeqCst);
+        panic!(
+            "recover (other id) failed: code={} message={}",
+            e.code().as_str(),
+            e.message()
+        )
+    });
+    assert_eq!(report.found, 0);
+    let mounted = |tmp: &TempDir| {
+        let probe = guest_sh(
+            &distro_name,
+            &format!("grep -c ' {guest_path} ' /proc/self/mountinfo"),
+            timeout,
+        );
+        if probe.1.trim() == "0" {
+            return false;
+        }
+        tmp.retain_flag().store(true, Ordering::SeqCst);
+        true
+    };
+    assert!(
+        mounted(&tmp),
+        "the mount must remain after another id's recovery"
+    );
+    tmp.retain_flag().store(false, Ordering::SeqCst);
+
+    let report = release_container_mounts(&distro, &owner, timeout).unwrap_or_else(|e| {
+        tmp.retain_flag().store(true, Ordering::SeqCst);
+        panic!(
+            "recover failed: code={} message={}",
+            e.code().as_str(),
+            e.message()
+        )
+    });
+    assert_eq!((report.found, report.released), (1, 1));
+    assert!(
+        !mounted(&tmp),
+        "the mount must be gone; shared source retained at {}",
         tmp.path().display()
     );
 }

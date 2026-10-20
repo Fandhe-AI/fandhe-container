@@ -27,19 +27,25 @@
 //! | `hang` | 60 秒眠る | 60 秒眠る |
 //! | `flood` | 128 KiB を出力（0） | 同左（0） |
 //!
-//! # マウント系モード（`mount_ok` / `mount_9p` / `mount_9p_unset` / `mount_9p_applied` / `mount_9p_launch` / `mount_launch` / `mount_unset` / `mount_slow`）
+//! # マウント系モード（`mount_ok` / `mount_9p` / `mount_9p_unset` / `mount_9p_applied` / `mount_9p_launch` / `mount_launch` / `mount_unset` / `mount_slow` / `mount_recover` / `mount_recover_other` / `mount_recover_slow`）
 //!
 //! `--version` / `-l -v` は `ok` と同じ。`mount_slow` だけは `--version` と、共有マウントが 1 件も無い状態での
 //! `cat /proc/self/mountinfo`（準備の最初の読み取り）の応答前に [`SLOW_STEP`] だけ眠る（検出と準備が 1 つの合計期限を共有することの確認用。REPAIR-5）。加えて `--distribution Ubuntu --user root --exec <コマンド>` を受け付け、
 //! ゲストのマウント表を実行ファイルと同じ場所の `<実行ファイル名>.state`（行ごとに `ID<TAB>マウント先<TAB>
 //! オプション<TAB>fstype`）に保持して、呼び出しをまたいで状態を持つ。状態ファイルが無ければ `/`（ID 1・ext4）
 //! だけの表から始める。結合試験はモードごとに別の状態ファイルを使い、開始時に削除して初期化する。
+//! ゲスト内の所有の記録（`/run/fandhe/<nonce>` の模擬）は同じ場所の `<実行ファイル名>.records`（行ごとに
+//! `nonce<TAB>ID<TAB>マウント先<TAB>コンテナ ID`）に保持する。プロセスをまたいで残るので、別プロセスからの
+//! コンテナ ID による回収（#1412）の結合試験に使える。`mount_recover_slow` だけは、記録の検索（#1412）と
+//! すべての `cat /proc/self/mountinfo` の応答前に [`SLOW_STEP`] だけ眠る（検索・mountinfo・umount が 1 つの合計期限を
+//! 共有することの確認用。REPAIR-5）。
 //!
 //! | コマンド | 振る舞い |
 //! | ---- | ---- |
 //! | `cat /proc/self/mountinfo` | マウント表を mountinfo 形式で出力（0） |
-//! | `sh -c <検証込み mount スクリプト> sh <ホスト> <名前> <オプション> <nonce>` | `/mnt/fandhe/<名前>` に新しい ID でマウントを積み、その ID を出力する（`mount_9p*` は fstype `9p`、他は `virtiofs`。0。9P フォールバックの結合試験が並列でも状態ファイルが衝突しないよう別名のモードを持つ） |
-//! | `sh -c <ID 照合付き umount スクリプト> sh <マウント先> <ID> <nonce>` | 最上位の ID が一致すれば外す（0）、不一致は 203 |
+//! | `sh -c <検証込み mount スクリプト> sh <ホスト> <名前> <オプション> <nonce> <コンテナ ID>` | `/mnt/fandhe/<名前>` に新しい ID でマウントを積み、その ID を出力する（`mount_9p*` は fstype `9p`、他は `virtiofs`。0。9P フォールバックの結合試験が並列でも状態ファイルが衝突しないよう別名のモードを持つ）。あわせて記録（nonce・ID・マウント先・コンテナ ID）を残す |
+//! | `sh -c <ID 照合付き umount スクリプト> sh <マウント先> <ID> <nonce>` | 最上位の ID が一致すれば外す（0）。その nonce の記録も消す。不一致は 203 |
+//! | `sh -c <記録の検索スクリプト> sh <コンテナ ID>` | コンテナ ID が一致する記録を `rec <nonce> <ID> <マウント先>` の行で出力する（0） |
 //!
 //! スクリプト本文はゲストのシェルで解釈せず、`mount -t drvfs` / `umount "$1"` を含むかだけを確かめる
 //! （本文の振る舞いはユニットテストの模擬ゲストと実機確認 TASK-67.6・#377 の担当）。
@@ -71,6 +77,38 @@ enum Call {
 
 /// マウント表の 1 行（ID・マウント先・オプション・fstype）。
 type MountRow = (u32, String, String, String);
+
+/// ゲスト内の所有の記録 1 件（nonce・ID・マウント先・コンテナ ID）。
+type RecordRow = (String, u32, String, String);
+
+fn records_path() -> Option<std::path::PathBuf> {
+    Some(std::env::current_exe().ok()?.with_extension("records"))
+}
+
+fn load_records() -> Option<Vec<RecordRow>> {
+    let Ok(text) = std::fs::read_to_string(records_path()?) else {
+        return Some(Vec::new());
+    };
+    text.lines()
+        .map(|l| {
+            let mut f = l.split('\t');
+            Some((
+                f.next()?.to_string(),
+                f.next()?.parse().ok()?,
+                f.next()?.to_string(),
+                f.next()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn save_records(rows: &[RecordRow]) -> Option<()> {
+    let text: String = rows
+        .iter()
+        .map(|(n, id, t, o)| format!("{n}\t{id}\t{t}\t{o}\n"))
+        .collect();
+    std::fs::write(records_path()?, text).ok()
+}
 
 fn state_path() -> Option<std::path::PathBuf> {
     Some(std::env::current_exe().ok()?.with_extension("state"))
@@ -110,7 +148,7 @@ fn guest_exec(mode: &str, cmd: &[&str]) -> ExitCode {
     match cmd {
         ["cat", "/proc/self/mountinfo"] => {
             // 共有マウントがまだ無いとき（準備の最初の読み取り）だけ遅らせる。
-            if mode == "mount_slow" && rows.len() <= 1 {
+            if (mode == "mount_slow" && rows.len() <= 1) || mode == "mount_recover_slow" {
                 std::thread::sleep(SLOW_STEP);
             }
             let text: String = rows
@@ -120,7 +158,7 @@ fn guest_exec(mode: &str, cmd: &[&str]) -> ExitCode {
                 .collect();
             emit(text.as_bytes(), 0)
         }
-        ["sh", "-c", script, "sh", _host, name, opts, _nonce]
+        ["sh", "-c", script, "sh", _host, name, opts, nonce, owner]
             if script.contains("mount -t drvfs") =>
         {
             let id = rows.iter().map(|r| r.0).max().unwrap_or(0).max(99) + 1;
@@ -143,18 +181,52 @@ fn guest_exec(mode: &str, cmd: &[&str]) -> ExitCode {
             if save_state(&rows).is_none() {
                 return ExitCode::from(3);
             }
+            let Some(mut records) = load_records() else {
+                return ExitCode::from(3);
+            };
+            records.push((
+                (*nonce).to_string(),
+                id,
+                format!("/mnt/fandhe/{name}"),
+                (*owner).to_string(),
+            ));
+            if save_records(&records).is_none() {
+                return ExitCode::from(3);
+            }
             // 本物のスクリプトと同じく、自分のマウント ID（mount 前後の差分）を標準出力へ書く。
             emit(format!("{id}\n").as_bytes(), 0)
         }
-        ["sh", "-c", script, "sh", target, id, _nonce] if script.contains("umount \"$1\"") => {
+        ["sh", "-c", script, "sh", target, id, nonce] if script.contains("umount \"$1\"") => {
             let top = rows.iter().rposition(|r| r.1 == *target);
             match top {
                 Some(i) if rows.get(i).is_some_and(|r| r.0.to_string() == *id) => {
                     rows.remove(i);
+                    // 本物のスクリプトと同じく、外せたらその nonce の記録も消す。
+                    let Some(mut records) = load_records() else {
+                        return ExitCode::from(3);
+                    };
+                    records.retain(|r| r.0 != *nonce);
+                    if save_records(&records).is_none() {
+                        return ExitCode::from(3);
+                    }
                     save_state(&rows).map_or(ExitCode::from(3), |()| ExitCode::SUCCESS)
                 }
                 _ => ExitCode::from(203),
             }
+        }
+        ["sh", "-c", script, "sh", owner] if script.contains("head -c 512") => {
+            if mode == "mount_recover_slow" {
+                std::thread::sleep(SLOW_STEP);
+            }
+            let Some(records) = load_records() else {
+                return ExitCode::from(3);
+            };
+            let text: String = records
+                .iter()
+                .filter(|r| r.3 == *owner)
+                .map(|(n, id, t, _)| format!("rec {n} {id} {t}\n"))
+                .collect();
+            emit(text.as_bytes(), 0)
         }
         _ => ExitCode::from(64),
     }
@@ -219,6 +291,9 @@ fn main() -> ExitCode {
             | "mount_launch"
             | "mount_unset"
             | "mount_slow"
+            | "mount_recover"
+            | "mount_recover_other"
+            | "mount_recover_slow"
     );
     match (mode.as_str(), call) {
         (_, Call::Exec(cmd)) if mount_mode => {

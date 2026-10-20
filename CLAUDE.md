@@ -90,6 +90,7 @@ fandhe-container/
 │   │   ├── audit-delivery.md      # seccomp・Landlock の拒否を監査の記録先へ届ける配送経路の設計（2026-10-15 に方式を採用・#2018。実装は #2023〜#2028・#2004。TASK-41 追補・#1835・SEC-4）
 │   │   ├── plugin-backend-wiring.md  # バックエンド plugin の検証後の起動と RPC の配線の設計案（#1869・TASK-115・TASK-79 追補・PLUG-1・PLUG-7。承認待ち）
 │   │   ├── config-id-mappings.md  # config の linux.uidMappings / gidMappings を受けるかの判断記録（#2240・SEC-5・CORE-6。オーナー承認待ち）
+│   │   ├── oci-mounts-implicit-entries.md  # mounts[] の bind・sysfs 以外（暗黙に供給済みの /proc・/dev 系・tmpfs 等）を受けるかの判断記録（#2347・TASK-29 追補・OCI-4・SEC-1。オーナー承認待ち）
 │   │   └── plugin-hash-allowlist.md  # plugin の許可済みハッシュ一覧の置き場所・読み込み経路・一覧ファイル自体の検証の設計案（TASK-122 追補・#1868・PLUG-11。オーナー承認待ち）
 │   ├── setup/                     # 利用者向けセットアップ手順
 │   │   ├── linux.md               # Linux の配置手順（CLI・supervisor・launcher を同じディレクトリに置く。rootful はインストールスクリプト、rootless は利用者所有のディレクトリ。`PATH` 上の symlink。#2068・SUP-14・CORE-6）

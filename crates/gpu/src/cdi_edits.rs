@@ -4,15 +4,28 @@
 //! [`AggregatedEdits`] にまとめる純粋関数の層。結果は TASK-126.3（usr-merge パス正規化）、
 //! TASK-126.4（PoC-14 実測値との一致検証）、TASK-127（OCI spec への適用）が入力として使う。
 //!
-//! 集計規則（CDI 参照実装の InjectDevices に倣う。hooks の実行順の前提になる）:
-//! - 要求デバイス順に各デバイスの edits を連結し、その後ろにトップレベル edits を 1 回だけ連結する。
+//! 集計規則（CDI 参照実装の `Cache.InjectDevices` と同じ順序。hooks の実行順の前提になる）:
+//! - 要求デバイス順にたどり、そのデバイスが属する spec に初めて出会ったときだけ、その spec のトップレベル
+//!   edits を先に連結し、続けてデバイス自身の edits を連結する（トップレベル → デバイス）。spec が 1 つなら
+//!   「トップレベル → デバイス（要求順）」、複数なら spec を初めて参照した位置にトップレベルが入る。
+//!   CDI の SPEC.md は連結順を規定しておらず、順序の SSOT は GPU-1（TASK-126・MS-10。fandhe-container-spec#14）。
+//! - 上流の出典（cncf-tags/container-device-interface）: v1.1.1（`cb98bcf66dc68530012483bd56e33e14d815e167`）の
+//!   `pkg/cdi/cache.go` L233-270（走査は L246-258）と `container-edits.go` の `Append` L218-240、
+//!   v0.7.0（`780f60f5e4ac27d7b1c729a986ed7edbb6af7c12`。`cdi_spec.rs` が指すフィールド集合の版）の
+//!   `cache.go` L226-264・`container-edits.go` L199-220。両版でロジックは同一。
+//! - 上流の `Append` は衝突を検出せず、`intelRdt` は後勝ちで上書きする。本実装は下記のとおり、より厳しく
+//!   fail-closed で拒否する（GPU-1 に明記された意図的な差）。
+//! - spec の同一性は `&CdiSpec` のアドレス（ポインタ同一性。上流の `map[*Spec]` と同じ）で判定する。内容が
+//!   同じでもアドレスの違う spec は別の spec として扱い、トップレベルをそれぞれ連結する（完全一致の要素は
+//!   下記の規則で畳まれる）。
 //! - `deviceNodes` は `path`、`mounts` は `containerPath`、`env` は `=` より前のキーで同一性を判定する。
 //!   完全に同一なら先勝ちで 1 件に畳み、同一キーで内容が異なれば黙って上書きせず `InvalidArgument`
 //!   で拒否する（fail-closed）。
 //! - `hooks` は完全一致のものだけ畳み、それ以外は順序を保って全て残す。
 //! - `additionalGids` は値の重複を除き初出順。`intelRdt` は 1 つだけ採用し、内容が異なる複数は拒否する。
 //!
-//! 責務境界（将来仕様。REPAIR-3）: `all` の展開やセレクタ（`vendor/class=name`）の分解、パス正規化
+//! 責務境界（将来仕様。REPAIR-3）: `all` の展開やセレクタ（`vendor/class=name`）の分解、`/var/run/cdi` の
+//! 走査と名前から spec への解決（本層は解決済みの (spec, 名前) の列を受ける）、パス正規化
 //! （TASK-126.3）、パスの組み立て・hooks の実行（TASK-127）は行わない。値は文字列のまま保持する。
 //! エラーの `message` は固定文言で、`env` の値などの内容を含めない。
 //!
@@ -21,10 +34,11 @@
 //! そのため件数（[`CDI_EDITS_MAX_REQUESTED_DEVICES`]）と各名前の長さ（[`CDI_EDITS_MAX_DEVICE_NAME_BYTES`]）を、
 //! 確保・重複除去・存在確認のどれよりも前に検証し、超過は `ResourceExhausted` で拒否する。
 //! 検証後の計算量は、要求件数 R・spec のデバイス数 D・集計対象の要素数 N に対して
-//! O((R + D) log R + N log N) 回の比較で、二乗時間の処理を持たない。各デバイスの edits は高々 1 回しか
-//! 連結しない（要求名の重複は畳む）ため、出力の要素数は呼び出し側がすでに保持している spec の要素数を
-//! 超えない。
+//! O((R + D) log R + N log N) 回の比較で、二乗時間の処理を持たない（D は参照された distinct な spec の
+//! デバイス数の総和）。各デバイスの edits と各 spec のトップレベル edits は高々 1 回しか連結しない
+//! （要求の重複は畳む）ため、出力の要素数は呼び出し側がすでに保持している spec の要素数を超えない。
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cdi_spec::{
@@ -62,7 +76,7 @@ pub struct AggregatedEdits {
 }
 
 impl AggregatedEdits {
-    /// 重複除去済みのデバイスノード（デバイス順 → トップレベル順）。
+    /// 重複除去済みのデバイスノード（spec 初出時のトップレベル → デバイスの順）。
     pub fn device_nodes(&self) -> &[DeviceNode] {
         &self.device_nodes
     }
@@ -199,7 +213,7 @@ fn merge_intel_rdt(all: &[&ContainerEdits]) -> Result<Option<IntelRdt>, CdiSpecE
     Ok(chosen.cloned())
 }
 
-/// 要求名 1 件を spec のデバイスと突き合わせた結果（[`aggregate_container_edits`] の内部状態）。
+/// 要求 1 件を spec のデバイスと突き合わせた結果（[`aggregate_container_edits_across_specs`] の内部状態）。
 #[derive(Clone, Copy)]
 enum DeviceLookup<'a> {
     /// spec に該当するデバイスが無い。
@@ -210,7 +224,64 @@ enum DeviceLookup<'a> {
     Ambiguous,
 }
 
+/// 解決済みの (spec, デバイス名) 1 件（TASK-126.2 追補・#1888・GPU-1）。
+///
+/// 完全修飾名の分解と名前から spec への解決は呼び出し側（TASK-127 以降）の責務で、本型はその結果を
+/// [`aggregate_container_edits_across_specs`] へ渡す。spec は借用で、同じ spec を指す要求は同じ参照
+/// （アドレス）で渡すこと（同一性はアドレスで判定する）。
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct CdiDeviceRequest<'a> {
+    spec: &'a CdiSpec,
+    name: &'a str,
+}
+
+impl<'a> CdiDeviceRequest<'a> {
+    /// `spec` 内のデバイス名 `name` を要求する。
+    pub fn new(spec: &'a CdiSpec, name: &'a str) -> Self {
+        Self { spec, name }
+    }
+
+    /// 要求先の spec。
+    pub fn spec(&self) -> &'a CdiSpec {
+        self.spec
+    }
+
+    /// 要求するデバイス名。
+    pub fn name(&self) -> &'a str {
+        self.name
+    }
+}
+
+/// 要求の件数と各名前の長さを検証する。確保・重複除去・存在確認のどれよりも前に呼ぶ。
+fn validate_request_limits<'n>(
+    count: usize,
+    mut names: impl Iterator<Item = &'n str>,
+) -> Result<(), CdiSpecError> {
+    if count == 0 {
+        return Err(err(
+            CdiSpecErrorCode::InvalidArgument,
+            "no CDI device name was requested",
+        ));
+    }
+    if count > CDI_EDITS_MAX_REQUESTED_DEVICES {
+        return Err(err(
+            CdiSpecErrorCode::ResourceExhausted,
+            "too many CDI device names were requested",
+        ));
+    }
+    if names.any(|n| n.len() > CDI_EDITS_MAX_DEVICE_NAME_BYTES) {
+        return Err(err(
+            CdiSpecErrorCode::ResourceExhausted,
+            "requested CDI device name is too long",
+        ));
+    }
+    Ok(())
+}
+
 /// 指定デバイス群の `containerEdits` とトップレベル `containerEdits` を集計する（GPU-1）。
+///
+/// 単一 spec 用の入口で、[`aggregate_container_edits_across_specs`] の薄いラッパー。
 ///
 /// - `device_names` が空なら `InvalidArgument`。件数が [`CDI_EDITS_MAX_REQUESTED_DEVICES`] を超える、
 ///   またはいずれかの名前が [`CDI_EDITS_MAX_DEVICE_NAME_BYTES`] を超えるなら `ResourceExhausted`
@@ -219,59 +290,72 @@ enum DeviceLookup<'a> {
 ///   `InvalidArgument`（要求順で最初に該当した名前のエラーを返す）。要求名の重複は除いて扱う（冪等）。
 /// - `all` は通常のデバイス名として扱い、自動展開しない。
 ///
-/// 集計順序と衝突の扱いはモジュール doc を参照。パニックしない。
+/// 集計順序（トップレベル → デバイス）と衝突の扱いはモジュール doc を参照。パニックしない。
 pub fn aggregate_container_edits(
     spec: &CdiSpec,
     device_names: &[&str],
 ) -> Result<AggregatedEdits, CdiSpecError> {
-    if device_names.is_empty() {
-        return Err(err(
-            CdiSpecErrorCode::InvalidArgument,
-            "no CDI device name was requested",
-        ));
-    }
-    // 上限の検証は確保・重複除去・存在確認より前に行う（ここまで何も確保しない）。
-    if device_names.len() > CDI_EDITS_MAX_REQUESTED_DEVICES {
-        return Err(err(
-            CdiSpecErrorCode::ResourceExhausted,
-            "too many CDI device names were requested",
-        ));
-    }
-    if device_names
+    validate_request_limits(device_names.len(), device_names.iter().copied())?;
+    // 件数は上限検証済み（1024 以下）。
+    let requests: Vec<CdiDeviceRequest<'_>> = device_names
         .iter()
-        .any(|n| n.len() > CDI_EDITS_MAX_DEVICE_NAME_BYTES)
-    {
-        return Err(err(
-            CdiSpecErrorCode::ResourceExhausted,
-            "requested CDI device name is too long",
-        ));
-    }
+        .map(|n| CdiDeviceRequest::new(spec, n))
+        .collect();
+    aggregate_requests(&requests)
+}
 
-    // 要求名 → 要求順の位置（重複は初出の位置へ畳む）。件数は上限検証済みで、O(R log R)。
-    let mut slot_of: BTreeMap<&str, usize> = BTreeMap::new();
-    for name in device_names {
+/// 複数の spec にまたがる (spec, 名前) の列を、上流の `InjectDevices` と同じ順序で集計する（GPU-1）。
+///
+/// 要求順にたどり、spec を初めて参照した位置でその spec のトップレベル edits を先に連結し、続けて
+/// デバイスの edits を連結する。上限検証・エラーの意味は [`aggregate_container_edits`] と同じ。
+/// 同名のデバイスが別々の spec にあっても曖昧ではない（曖昧になるのは 1 つの spec 内で同名が複数あり、
+/// かつ要求されたときだけ）。要求の重複は (spec のアドレス, 名前) 単位で初出へ畳む。パニックしない。
+pub fn aggregate_container_edits_across_specs(
+    requests: &[CdiDeviceRequest<'_>],
+) -> Result<AggregatedEdits, CdiSpecError> {
+    validate_request_limits(requests.len(), requests.iter().map(|r| r.name))?;
+    aggregate_requests(requests)
+}
+
+/// 上限検証済みの要求列を集計する共通実装。計算量は O((R + D) log R + N log N)。
+fn aggregate_requests(requests: &[CdiDeviceRequest<'_>]) -> Result<AggregatedEdits, CdiSpecError> {
+    // (spec のアドレス, 名前) → 要求順の位置（重複は初出の位置へ畳む）。アドレスは比較するだけで参照外しはしない。
+    let mut slot_of: BTreeMap<(*const CdiSpec, &str), usize> = BTreeMap::new();
+    let mut slot_specs: Vec<&CdiSpec> = Vec::new();
+    for req in requests {
         let next = slot_of.len();
-        slot_of.entry(name).or_insert(next);
+        if let Entry::Vacant(v) = slot_of.entry((std::ptr::from_ref(req.spec), req.name)) {
+            v.insert(next);
+            slot_specs.push(req.spec);
+        }
     }
-    // spec のデバイスを 1 回だけ走査して要求名と突き合わせる（O(D log R)）。要求されていない名前の
-    // 重複は見ない（従来どおり、要求された名前が曖昧なときだけ拒否する）。
+    // 参照された distinct な spec ごとにデバイスを 1 回だけ走査して突き合わせる。要求されていない名前の
+    // 重複は見ない（要求された名前が曖昧なときだけ拒否する）。
     let mut lookups: Vec<DeviceLookup<'_>> = vec![DeviceLookup::Missing; slot_of.len()];
-    for device in &spec.devices {
-        let Some(lookup) = slot_of
-            .get(device.name.as_str())
-            .and_then(|slot| lookups.get_mut(*slot))
-        else {
+    let mut scanned: BTreeSet<*const CdiSpec> = BTreeSet::new();
+    for spec in &slot_specs {
+        if !scanned.insert(std::ptr::from_ref(*spec)) {
             continue;
-        };
-        *lookup = match lookup {
-            DeviceLookup::Missing => DeviceLookup::Unique(&device.container_edits),
-            DeviceLookup::Unique(_) | DeviceLookup::Ambiguous => DeviceLookup::Ambiguous,
-        };
+        }
+        for device in &spec.devices {
+            let Some(lookup) = slot_of
+                .get(&(std::ptr::from_ref(*spec), device.name.as_str()))
+                .and_then(|slot| lookups.get_mut(*slot))
+            else {
+                continue;
+            };
+            *lookup = match lookup {
+                DeviceLookup::Missing => DeviceLookup::Unique(&device.container_edits),
+                DeviceLookup::Unique(_) | DeviceLookup::Ambiguous => DeviceLookup::Ambiguous,
+            };
+        }
     }
-    let mut all: Vec<&ContainerEdits> = Vec::with_capacity(lookups.len().saturating_add(1));
-    for lookup in &lookups {
-        match lookup {
-            DeviceLookup::Unique(edits) => all.push(edits),
+    // 要求順にたどり、spec の初出時にトップレベルを先に、続けてデバイスの edits を積む。
+    let mut all: Vec<&ContainerEdits> = Vec::with_capacity(lookups.len().saturating_mul(2));
+    let mut emitted: BTreeSet<*const CdiSpec> = BTreeSet::new();
+    for (lookup, spec) in lookups.iter().zip(slot_specs.iter()) {
+        let edits = match lookup {
+            DeviceLookup::Unique(edits) => edits,
             DeviceLookup::Missing => {
                 return Err(err(
                     CdiSpecErrorCode::NotFound,
@@ -284,9 +368,12 @@ pub fn aggregate_container_edits(
                     "CDI spec has duplicate device names",
                 ));
             }
+        };
+        if emitted.insert(std::ptr::from_ref(*spec)) {
+            all.push(&spec.container_edits);
         }
+        all.push(edits);
     }
-    all.push(&spec.container_edits);
 
     Ok(AggregatedEdits {
         device_nodes: merge_device_nodes(&all)?,
@@ -297,7 +384,6 @@ pub fn aggregate_container_edits(
         intel_rdt: merge_intel_rdt(&all)?,
     })
 }
-
 #[cfg(test)]
 mod tests {
     //! GPU-1（TASK-126.2）の集計規則を具体値で確認する。
@@ -374,28 +460,283 @@ mod tests {
         let a = aggregate_container_edits(&s, &["0", "GPU-00000000-0000-0000-0000-000000000000"])
             .unwrap();
         assert_eq!(a.hooks().len(), 7);
-        assert_eq!(a.device_nodes().len(), 7);
         assert_eq!(a.env().len(), 2);
-    }
-
-    #[test]
-    fn gpu1_device_edits_precede_top_level() {
-        let a = aggregate_container_edits(&spec(&poc_like()), &["all", "0"]).unwrap();
-        let paths: Vec<&str> = a.device_nodes().iter().map(|n| n.path.as_str()).collect();
         assert_eq!(
-            paths,
+            node_paths(&a),
             [
-                "/dev/nvidia0",
-                "/dev/dri/card0",
-                "/dev/dri/renderD128",
                 "/dev/nvidiactl",
                 "/dev/nvidia-uvm",
                 "/dev/nvidia-uvm-tools",
-                "/dev/nvidia-modeset"
+                "/dev/nvidia-modeset",
+                "/dev/nvidia0",
+                "/dev/dri/card0",
+                "/dev/dri/renderD128"
             ]
         );
-        let first_hook_arg = a.hooks().first().and_then(|h| h.args.last()).cloned();
-        assert_eq!(first_hook_arg.as_deref(), Some("a::b"));
+        assert_eq!(
+            hook_last_args(&a),
+            ["c1", "c2", "c3", "c4", "c5", "update-ldcache", "a::b"]
+        );
+    }
+
+    fn node_paths(a: &AggregatedEdits) -> Vec<&str> {
+        a.device_nodes().iter().map(|n| n.path.as_str()).collect()
+    }
+
+    fn hook_last_args(a: &AggregatedEdits) -> Vec<&str> {
+        a.hooks()
+            .iter()
+            .filter_map(|h| h.args.last().map(String::as_str))
+            .collect()
+    }
+
+    /// GPU-1・TASK-126.2・#1888: トップレベル → デバイス（要求順）。
+    #[test]
+    fn gpu1_top_level_edits_precede_device_edits() {
+        let a = aggregate_container_edits(&spec(&poc_like()), &["all", "0"]).unwrap();
+        assert_eq!(
+            node_paths(&a),
+            [
+                "/dev/nvidiactl",
+                "/dev/nvidia-uvm",
+                "/dev/nvidia-uvm-tools",
+                "/dev/nvidia-modeset",
+                "/dev/nvidia0",
+                "/dev/dri/card0",
+                "/dev/dri/renderD128"
+            ]
+        );
+        assert_eq!(
+            hook_last_args(&a),
+            ["c1", "c2", "c3", "c4", "c5", "update-ldcache", "a::b"]
+        );
+        let env: Vec<&str> = a.env().iter().map(String::as_str).collect();
+        assert_eq!(
+            env,
+            [
+                "NVIDIA_CTK_LIBCUDA_DIR=/usr/lib/x86_64-linux-gnu",
+                "NVIDIA_VISIBLE_DEVICES=void"
+            ]
+        );
+    }
+
+    fn named_spec(tag: &str, devices: &[&str]) -> CdiSpec {
+        let mut y = String::from("cdiVersion: '0.5.0'\nkind: v/c\ndevices:\n");
+        for d in devices {
+            y.push_str(&format!(
+                "  - name: {d}\n    containerEdits:\n      deviceNodes: [{{path: /dev/{tag}-{d}}}]\n      hooks: [{{hookName: createContainer, path: /h, args: [{tag}-{d}]}}]\n      env: [E_{tag}_{d}=1]\n"
+            ));
+        }
+        y.push_str(&format!(
+            "containerEdits:\n  deviceNodes: [{{path: /dev/{tag}-top}}]\n  hooks: [{{hookName: createContainer, path: /h, args: [{tag}-top]}}]\n  env: [E_{tag}_top=1]\n"
+        ));
+        spec(&y)
+    }
+
+    /// GPU-1・#1888: 1 つの spec から 2 デバイスを要求順に並べる。
+    #[test]
+    fn gpu1_single_spec_order_is_top_then_devices_in_request_order() {
+        let s = named_spec("s", &["a", "b"]);
+        let a = aggregate_container_edits(&s, &["b", "a"]).unwrap();
+        assert_eq!(node_paths(&a), ["/dev/s-top", "/dev/s-b", "/dev/s-a"]);
+        assert_eq!(hook_last_args(&a), ["s-top", "s-b", "s-a"]);
+        let env: Vec<&str> = a.env().iter().map(String::as_str).collect();
+        assert_eq!(env, ["E_s_top=1", "E_s_b=1", "E_s_a=1"]);
+    }
+
+    /// GPU-1・#1888: 2 つの spec にまたがると、spec を初めて参照した位置にトップレベルが入る。
+    #[test]
+    fn gpu1_two_specs_interleave_top_level_at_first_reference() {
+        let sa = named_spec("A", &["x", "z"]);
+        let sb = named_spec("B", &["y"]);
+        let reqs = [
+            CdiDeviceRequest::new(&sa, "x"),
+            CdiDeviceRequest::new(&sb, "y"),
+            CdiDeviceRequest::new(&sa, "z"),
+        ];
+        let a = aggregate_container_edits_across_specs(&reqs).unwrap();
+        let expect = [
+            "/dev/A-top",
+            "/dev/A-x",
+            "/dev/B-top",
+            "/dev/B-y",
+            "/dev/A-z",
+        ];
+        assert_eq!(node_paths(&a), expect);
+        assert_eq!(hook_last_args(&a), ["A-top", "A-x", "B-top", "B-y", "A-z"]);
+
+        let rev = [
+            CdiDeviceRequest::new(&sb, "y"),
+            CdiDeviceRequest::new(&sa, "x"),
+        ];
+        let a = aggregate_container_edits_across_specs(&rev).unwrap();
+        assert_eq!(
+            node_paths(&a),
+            ["/dev/B-top", "/dev/B-y", "/dev/A-top", "/dev/A-x"]
+        );
+    }
+
+    /// GPU-1・#1888: トップレベルだけにある hooks は 1 回だけ、spec の初参照順に現れる。
+    #[test]
+    fn gpu1_top_level_only_hooks_appear_once_in_first_reference_order() {
+        let y = |tag: &str| {
+            spec(&format!(
+                "cdiVersion: '0.5.0'\nkind: v/c\ndevices:\n  - name: a\n    containerEdits: {{}}\n  - name: b\n    containerEdits: {{}}\ncontainerEdits:\n  hooks:\n    - {{hookName: createContainer, path: /h, args: [{tag}1]}}\n    - {{hookName: createContainer, path: /h, args: [{tag}2]}}\n"
+            ))
+        };
+        let s = y("t");
+        let a = aggregate_container_edits(&s, &["a", "b"]).unwrap();
+        assert_eq!(hook_last_args(&a), ["t1", "t2"]);
+
+        let (p, q) = (y("p"), y("q"));
+        let reqs = [
+            CdiDeviceRequest::new(&q, "a"),
+            CdiDeviceRequest::new(&p, "a"),
+            CdiDeviceRequest::new(&q, "b"),
+        ];
+        let a = aggregate_container_edits_across_specs(&reqs).unwrap();
+        assert_eq!(hook_last_args(&a), ["q1", "q2", "p1", "p2"]);
+    }
+
+    /// GPU-1・#1888: 同一要素がトップレベルとデバイスにあれば 1 件に畳み、トップレベルの位置に置く。
+    #[test]
+    fn gpu1_identical_node_folds_to_top_level_position() {
+        let s = spec(
+            "cdiVersion: '0.5.0'\nkind: v/c\ndevices:\n  - name: a\n    containerEdits:\n      deviceNodes: [{path: /dev/own}, {path: /dev/shared, major: 1}]\ncontainerEdits:\n  deviceNodes: [{path: /dev/top}, {path: /dev/shared, major: 1}]\n",
+        );
+        let a = aggregate_container_edits(&s, &["a"]).unwrap();
+        assert_eq!(node_paths(&a), ["/dev/top", "/dev/shared", "/dev/own"]);
+    }
+
+    /// GPU-1: 衝突のメッセージは固定文言で、env の値を含まない。
+    #[test]
+    fn gpu1_conflict_messages_are_fixed_strings() {
+        let cases = [
+            (
+                two_part(
+                    "deviceNodes: [{path: /dev/x, major: 1}]",
+                    "deviceNodes: [{path: /dev/x, major: 2}]",
+                ),
+                "conflicting deviceNodes entries for the same path",
+            ),
+            (
+                two_part(
+                    "mounts: [{hostPath: /h1, containerPath: /c}]",
+                    "mounts: [{hostPath: /h2, containerPath: /c}]",
+                ),
+                "conflicting mounts entries for the same containerPath",
+            ),
+            (
+                two_part("env: [K=DUMMY_SECRET_A]", "env: [K=DUMMY_SECRET_B]"),
+                "conflicting env entries for the same key",
+            ),
+        ];
+        for (s, msg) in &cases {
+            let e = aggregate_container_edits(s, &["a"]).unwrap_err();
+            assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument);
+            assert_eq!(e.message(), *msg);
+        }
+    }
+
+    /// GPU-1・#1888: spec をまたぐ衝突は拒否し、同一値は初出の位置に畳む。
+    #[test]
+    fn gpu1_cross_spec_conflict_and_fold() {
+        let mk = |v: &str| {
+            spec(&format!(
+                "cdiVersion: '0.5.0'\nkind: v/c\ndevices:\n  - name: a\n    containerEdits: {{}}\ncontainerEdits:\n  env: [K={v}, O_{v}=1]\n"
+            ))
+        };
+        let (a1, b1) = (mk("1"), mk("2"));
+        let reqs = [
+            CdiDeviceRequest::new(&a1, "a"),
+            CdiDeviceRequest::new(&b1, "a"),
+        ];
+        let e = aggregate_container_edits_across_specs(&reqs).unwrap_err();
+        assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "conflicting env entries for the same key");
+
+        let (c1, d1) = (mk("1"), mk("1"));
+        let reqs = [
+            CdiDeviceRequest::new(&c1, "a"),
+            CdiDeviceRequest::new(&d1, "a"),
+        ];
+        let a = aggregate_container_edits_across_specs(&reqs).unwrap();
+        let env: Vec<&str> = a.env().iter().map(String::as_str).collect();
+        assert_eq!(env, ["K=1", "O_1=1"]);
+    }
+
+    /// GPU-1・#1888: 複数 spec 入口の上限・曖昧さ・重複・同一性。
+    #[test]
+    fn gpu1_across_specs_boundaries() {
+        let s = many_devices(CDI_EDITS_MAX_REQUESTED_DEVICES + 1);
+        let over: Vec<CdiDeviceRequest<'_>> = (0..=CDI_EDITS_MAX_REQUESTED_DEVICES)
+            .map(|_| CdiDeviceRequest::new(&s, "d0"))
+            .collect();
+        assert_eq!(over.len(), 1025);
+        let e = aggregate_container_edits_across_specs(&over).unwrap_err();
+        assert_eq!(e.code(), CdiSpecErrorCode::ResourceExhausted);
+        assert_eq!(e.message(), "too many CDI device names were requested");
+        let at = over.get(..1024).unwrap_or_default();
+        let a = aggregate_container_edits_across_specs(at).unwrap();
+        assert_eq!(node_paths(&a), ["/dev/n0"]);
+
+        let long = "x".repeat(257);
+        let e = aggregate_container_edits_across_specs(&[CdiDeviceRequest::new(&s, &long)])
+            .unwrap_err();
+        assert_eq!(e.code(), CdiSpecErrorCode::ResourceExhausted);
+        let e = aggregate_container_edits_across_specs(&[]).unwrap_err();
+        assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument);
+
+        // 別 spec の同名は曖昧でなく、同一 spec 内の同名だけが曖昧。
+        let p = named_spec("P", &["n"]);
+        let q = named_spec("Q", &["n"]);
+        let a = aggregate_container_edits_across_specs(&[
+            CdiDeviceRequest::new(&p, "n"),
+            CdiDeviceRequest::new(&q, "n"),
+        ])
+        .unwrap();
+        assert_eq!(
+            node_paths(&a),
+            ["/dev/P-top", "/dev/P-n", "/dev/Q-top", "/dev/Q-n"]
+        );
+        let dup = spec(
+            "cdiVersion: '0.5.0'\nkind: v/c\ndevices:\n  - name: n\n    containerEdits: {}\n  - name: n\n    containerEdits: {}\n",
+        );
+        let e = aggregate_container_edits_across_specs(&[
+            CdiDeviceRequest::new(&p, "n"),
+            CdiDeviceRequest::new(&dup, "n"),
+        ])
+        .unwrap_err();
+        assert_eq!(e.message(), "CDI spec has duplicate device names");
+
+        // (spec, 名前) の重複は畳む。clone は別 spec だが完全一致は畳まれる。
+        let once = aggregate_container_edits_across_specs(&[CdiDeviceRequest::new(&p, "n")]);
+        let twice = aggregate_container_edits_across_specs(&[
+            CdiDeviceRequest::new(&p, "n"),
+            CdiDeviceRequest::new(&p, "n"),
+        ]);
+        assert_eq!(once, twice);
+        let p2 = p.clone();
+        let cloned = aggregate_container_edits_across_specs(&[
+            CdiDeviceRequest::new(&p, "n"),
+            CdiDeviceRequest::new(&p2, "n"),
+        ]);
+        assert_eq!(once, cloned);
+        assert_eq!(cloned.map(|a| a.hooks().len()), Ok(2));
+    }
+
+    /// GPU-1: 単一 spec 入口と複数 spec 入口は同じ結果を返す。
+    #[test]
+    fn gpu1_wrapper_equals_across_specs() {
+        let s = spec(&poc_like());
+        let reqs = [
+            CdiDeviceRequest::new(&s, "all"),
+            CdiDeviceRequest::new(&s, "0"),
+        ];
+        assert_eq!(
+            aggregate_container_edits(&s, &["all", "0"]),
+            aggregate_container_edits_across_specs(&reqs)
+        );
     }
 
     #[test]
@@ -469,7 +810,7 @@ mod tests {
             "additionalGids: [3, 7]\n  intelRdt: {closID: c1}",
         );
         let a = aggregate_container_edits(&s, &["a"]).unwrap();
-        assert_eq!(a.additional_gids(), [5, 3, 7]);
+        assert_eq!(a.additional_gids(), [3, 7, 5]);
         assert_eq!(a.intel_rdt().and_then(|r| r.clos_id.as_deref()), Some("c1"));
 
         let bad = two_part("intelRdt: {closID: c1}", "intelRdt: {closID: c2}");
@@ -666,11 +1007,11 @@ mod tests {
         assert_eq!(
             seen,
             [
-                ("createContainer", None, vec![]),
-                ("createContainer", Some(5), vec![]),
-                ("createContainer", None, vec!["K=1"]),
                 ("createContainer", None, vec!["K=2"]),
+                ("createContainer", Some(5), vec![]),
                 ("poststop", None, vec![]),
+                ("createContainer", None, vec![]),
+                ("createContainer", None, vec!["K=1"]),
             ]
         );
     }

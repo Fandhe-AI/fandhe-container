@@ -4,7 +4,7 @@
 
 - 対象ビヘイビア: OCI-1（イメージの pull・展開・実行）
 - 関連タスク: TASK-55.1（#420・PR #2190。ハーネス本体）・TASK-55.2（#421。本書）。親は TASK-55（#419）・MS-4
-- ステータス: **pull・digest 検証・展開は 4 イメージで成功（4/5）。run 段（コンテナ実行・終了コード 0 の確認）は AppArmor による非特権 user namespace の制限で 4 件とも `PERMISSION_DENIED` のため未達。`redis:alpine` は計測時点では config 段で `INVALID_ARGUMENT`（#2314 で core とハーネスを修正済み。修正後の実測は未実施。所見参照）。終了コード 0 の確認は人間へ引き継ぐ（#2313 で追跡）**（成功を装わない。REPAIR-3）
+- ステータス: **pull・digest 検証・展開は 4 イメージで成功（4/5）。run 段（コンテナ実行・終了コード 0 の確認）は AppArmor による非特権 user namespace の制限で 4 件とも `PERMISSION_DENIED` のため未達。`redis:alpine` は計測時点では config 段で `INVALID_ARGUMENT`（#2314 で core とハーネスを修正済み。修正後の実測は未実施で、run 段の実測対象に含める。所見参照）。終了コード 0 の確認は人間へ引き継ぐ（#2313 で追跡）**（成功を装わない。REPAIR-3）
 
 ## 必要環境・必要権限
 
@@ -21,10 +21,11 @@ systemd-run --user --scope -p Delegate=yes <上で得た実行ファイル> --ig
   --image alpine \
   --image debian:bookworm-slim --cmd /bin/true \
   --image nginx:alpine --cmd /usr/sbin/nginx -v \
-  --image busybox --cmd /bin/true
+  --image busybox --cmd /bin/true \
+  --image redis:alpine --cmd redis-server --version
 ```
 
-- `redis:alpine` は計測時点では手順に含めなかった（Entrypoint が相対名の `docker-entrypoint.sh` で config 段が `INVALID_ARGUMENT` になるため）。#2314 で解消済みの見込みだが実測は未実施。`--cmd redis-server` のままだと `redis-server` が常駐して試験の期限で失敗するため、終了するコマンドで上書きして試す（例: `--image redis:alpine --cmd redis-server --version`。Entrypoint の `docker-entrypoint.sh` が引数をそのまま exec する前提も実測で確かめる）
+- `redis:alpine` は計測時点では config 段が `INVALID_ARGUMENT`（Entrypoint が相対名の `docker-entrypoint.sh`）だったため手順に含めなかったが、#2314・#2331 で修正したので手順に含めた。実測は未実施。`--cmd redis-server` のままだと `redis-server` が常駐して試験の期限で失敗するため、終了するコマンドで上書きして試す。Entrypoint の `docker-entrypoint.sh` が引数をそのまま exec する前提も実測で確かめる
 
 - cargo 経由で実行すると cargo が同じ cgroup に入り `prepare` が失敗するため、実行ファイルを直接起動する
 - `FANDHE_CONTAINER_TEST_TIMEOUT_SECS` で待ち時間の上限を変更できる
@@ -85,7 +86,7 @@ systemd-run --user --scope -p Delegate=yes <上で得た実行ファイル> --ig
 
 1. `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
 2. `unshare -Ur true` が成功することを確かめ、上記「実行手順」のコマンドを実行する（非 root の `User` で `FAILED_PRECONDITION` が出たら `FANDHE_CONTAINER_TEST_ID_HELPER=1` を付けて再実行する）
-3. 結果の表の run 列と exit を本書へ追記する（`redis:alpine` を加えて config 段を通ることも確かめる）
+3. 下記「run 段の実機記録」のイメージ表（`redis:alpine` の行を含む）へ run 列と exit を記入する（`redis:alpine` は config 段を通ることも確かめる）
 4. `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1` で元に戻す
 5. `sysctl kernel.apparmor_restrict_unprivileged_userns` の出力を下記「run 段の実機記録」へ記入する
 
@@ -109,3 +110,4 @@ systemd-run --user --scope -p Delegate=yes <上で得た実行ファイル> --ig
 | debian:bookworm-slim | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 |
 | nginx:alpine | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 |
 | busybox | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 |
+| redis:alpine | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 | 未実施 |

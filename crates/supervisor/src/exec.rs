@@ -177,8 +177,8 @@
 //! 1. 完了を型で強制する: core の `spawn_exec_command` は `ExecReady` だけを値で受け取る
 //! 2. capability 削減と rlimit 適用を実装し、未適用の一覧は空
 //! 3. 制限を exec の対象へ束縛する（mount namespace・子が入る PID namespace・所属 cgroup の照合）
-//! 4. `setns` を伴う通し試験: `tests/exec.rs`（実機前提。AGENTS.md。root を要し、CI ではビルドのみで実行して
-//!    いない）。pivot 済みの対象へ参加した後の `/` が記録した `/` と一致することだけは、CI で実行する
+//! 4. `setns` を伴う通し試験: `tests/exec.rs`（実機前提。AGENTS.md。rootful は root を要し、rootless〔`--rootless`。
+//!    非 root・委譲 cgroup・Landlock ABI 6+。#1887〕と併せて、CI ではビルドのみで実行していない）。pivot 済みの対象へ参加した後の `/` が記録した `/` と一致することだけは、CI で実行する
 //!    `tests/exec_setns_join.rs` が非特権の user namespace で照合する（bundle の rootfs と一致しない
 //!    mount namespace 内で組み立てた rootfs の場合を含む）
 //!    （既定の入口 [`identify_pid1`] が実 cgroup の記録から成功すること・別 instance と特定後の cgroup 移動を拒否
@@ -214,8 +214,9 @@
 //!   （`setns` が拒否する）
 //! - rootless の exec の通しの確認。user namespace への参加（[`enter_namespaces`] が、対象が別の user namespace に
 //!   いるときだけ 5 種に先立って参加する。#1462）と参加後の資格情報は `tests/exec_setns_join.rs` が非特権の
-//!   user namespace で照合するが、制限の再適用を含む通しの経路（Landlock ABI 6+）は実機前提の `tests/exec.rs`
-//!   （rootful）のみで、rootless での通しは未確認
+//!   user namespace で照合する。制限の再適用を含む通し（Landlock ABI 6+）は実機前提の `tests/exec.rs` の
+//!   rootless の場面（`--ignored --rootless`。#1887）が担うが、実機での実行結果の記録は人間担当の issue（案は #1453）で
+//!   行う（記録が済むまで rootless での通しは未確認）
 //! - コマンドの標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と
 //!   同じく `/dev/null` へ固定し、cwd・ユーザーの指定も未対応（cwd はコンテナの rootfs の根。`config.json` の
 //!   `process.user.additionalGids` の解釈〔指定したグループの付与〕も launch・exec とも未実装で、補助グループは

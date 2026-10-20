@@ -1,8 +1,10 @@
-//! 制御チャネルのクライアント入口（SUP-1・SEC-1・REPAIR-5・#2058）。
+//! 制御チャネルのクライアント入口（SUP-1・SUP-9・SEC-1・REPAIR-5・#2058・#2162）。
 //!
 //! CLI の `stop`（と `kill`）が、起動ハンドルを持つ supervisor へシグナル送信を依頼するための公開 API。core の
 //! `ProcessSignaler`（`oci_runtime::kill` の送信境界）を実装する。CLI の `stop_delete::production_signaler` が
-//! これを使う（`stop` は結線済み。#2059。`kill` は #1902 が同じ注入点を使う。#1544 の段 C）。
+//! これを使う（`stop` は [`ControlSignaler::for_stop`] で結線済み。#2059・#2162。`kill` は #1902 が [`ControlSignaler::new`] を使う。#1544 の段 C）。
+//! `for_stop` は StopRequest（kind 4）を送り、supervisor に明示 stop の意図を記録させる（SUP-9）。意図を記録できない
+//! supervisor（書き先なし・古い版）は、シグナルを送らずに構造化エラーを返す（fail-closed）。
 //! `state.json` の pid へ生の `kill(2)` は送らない（pid 再利用で無関係なプロセスを止めない。SEC-1・CORE-1）。
 //!
 //! # 手順（Linux）
@@ -29,16 +31,31 @@ use std::time::Instant;
 use fandhe_container_core::oci_runtime::ProcessSignaler;
 use fandhe_container_core::traits::{ContainerId, Signal, TraitError};
 
+use super::protocol::RequestKind;
+
 /// supervisor の制御チャネルへシグナル送信を依頼する `ProcessSignaler`。
 #[derive(Debug, Clone)]
 pub struct ControlSignaler {
     state_root: PathBuf,
+    kind: RequestKind,
 }
 
 impl ControlSignaler {
-    /// 状態ルート（`<state_root>/<id>/supervisor.sock` の `<state_root>`）から作る。
+    /// 状態ルート（`<state_root>/<id>/supervisor.sock` の `<state_root>`）から作る。シグナルを送るだけで、
+    /// stop の意図は記録させない（`kill` 用。#1902）。
     pub fn new(state_root: PathBuf) -> Self {
-        Self { state_root }
+        Self {
+            state_root,
+            kind: RequestKind::Signal,
+        }
+    }
+
+    /// 明示 stop 用に作る。送るシグナルの前に、supervisor に stop の意図を記録させる（SUP-9・#2162）。
+    pub fn for_stop(state_root: PathBuf) -> Self {
+        Self {
+            state_root,
+            kind: RequestKind::Stop,
+        }
     }
 }
 
@@ -51,7 +68,7 @@ impl ProcessSignaler for ControlSignaler {
         signal: Signal,
         deadline: Instant,
     ) -> Result<(), TraitError> {
-        linux::signal(&self.state_root, id, pid, signal, deadline)
+        linux::signal(&self.state_root, self.kind, id, pid, signal, deadline)
     }
 }
 
@@ -64,7 +81,7 @@ impl ProcessSignaler for ControlSignaler {
         signal: Signal,
         deadline: Instant,
     ) -> Result<(), TraitError> {
-        let _ = (&self.state_root, id, pid, signal, deadline);
+        let _ = (&self.state_root, self.kind, id, pid, signal, deadline);
         Err(TraitError::new(
             fandhe_container_core::traits::ErrorCode::Unimplemented,
             "the supervisor control channel requires Linux",
@@ -88,7 +105,7 @@ mod linux {
     };
     use crate::control::protocol::{
         ControlReason, FrameHeader, HEADER_LEN, MAX_SIGNAL_BUDGET, RESPONSE_PAYLOAD_LEN,
-        ResponseFrame, SignalDeadline, SignalRequestFrame,
+        RequestKind, ResponseFrame, SignalDeadline, SignalRequestFrame,
     };
     use crate::control::server::{peer_allowed, read_exact_until};
 
@@ -120,6 +137,7 @@ mod linux {
     /// 残った fd も無い。REPAIR-5）。
     pub(super) fn signal(
         state_root: &Path,
+        kind: RequestKind,
         id: &ContainerId,
         pid: NonZeroU32,
         signal: Signal,
@@ -130,7 +148,7 @@ mod linux {
             // 期限が迫っているときは接続せず、送らない（期限後にシグナルが届かない。REPAIR-5）。
             return Err(timeout());
         }
-        exchange(state_root, id, pid, signal, deadline)
+        exchange(state_root, kind, id, pid, signal, deadline)
     }
 
     fn connect_until(path: &Path, deadline: Instant) -> Result<UnixStream, TraitError> {
@@ -173,6 +191,7 @@ mod linux {
 
     fn exchange(
         state_root: &Path,
+        kind: RequestKind,
         id: &ContainerId,
         pid: NonZeroU32,
         signal: Signal,
@@ -222,6 +241,7 @@ mod linux {
             .ok_or_else(unavailable)?;
         let deadline_frame = SignalDeadline::from_nanos(abs_ns).map_err(|_| unavailable())?;
         let frame = SignalRequestFrame {
+            kind,
             pid,
             signal,
             deadline: deadline_frame,

@@ -2119,6 +2119,19 @@ pub(crate) fn peer_pid(stream: &UnixStream) -> Result<u32, PluginError> {
 /// accept / connect）は `?` で返して stream を drop し、フレームを読まずに切断する（fail-closed）。
 #[cfg(target_os = "macos")]
 pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, PluginError> {
+    match peer_uid_raw_errno(stream) {
+        Ok(euid) => peer_uid_from_raw(euid),
+        Err(_) => Err(PluginError::new(
+            PluginErrorCode::Internal,
+            "failed to obtain peer credential",
+        )),
+    }
+}
+
+/// `getpeereid` を呼び、失敗時は直後の errno を返す（macOS）。`peer_uid` の本体で、観測専用の
+/// [`observe_peer_uid_errno`] も使う。成功時の値は番兵検査前の生の値（PLUG-12・SEC-4・#2252 P2-1）。
+#[cfg(target_os = "macos")]
+fn peer_uid_raw_errno(stream: &UnixStream) -> Result<u32, i32> {
     use std::os::unix::io::AsRawFd;
     let mut euid: u32 = PEER_ID_SENTINEL;
     let mut egid: u32 = PEER_ID_SENTINEL;
@@ -2127,12 +2140,18 @@ pub(crate) fn peer_uid(stream: &UnixStream) -> Result<u32, PluginError> {
     // 成功時に必ず書くため防御的措置）。
     let rc = unsafe { getpeereid(stream.as_raw_fd(), &raw mut euid, &raw mut egid) };
     if rc != 0 {
-        return Err(PluginError::new(
-            PluginErrorCode::Internal,
-            "failed to obtain peer credential",
-        ));
+        // errno は失敗した syscall の直後に読む（間に他の libc 呼び出しを挟まない）。
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(-1));
     }
-    peer_uid_from_raw(euid)
+    Ok(euid)
+}
+
+/// `getpeereid` が失敗したときの errno を返す観測専用の入口（macOS。値の取得に成功したら `None`）。
+/// UID 値は返さない。実機前提の観測試験（`crate::observe_peer_uid_errno` 経由）だけが使い、製品の
+/// 判定経路（`peer_uid`）の挙動は変えない（PLUG-12・SEC-4・#2252 P2-1・REPAIR-4）。
+#[cfg(target_os = "macos")]
+pub(crate) fn observe_peer_uid_errno(stream: &UnixStream) -> Option<i32> {
+    peer_uid_raw_errno(stream).err()
 }
 
 /// 接続元の pid を返す（macOS。`LOCAL_PEERPID`）。初期値は -1 で、書き込まれなければ `try_from` で失敗する。

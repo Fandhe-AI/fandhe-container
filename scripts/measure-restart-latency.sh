@@ -30,7 +30,8 @@
 #   直接の子になり、子孫の帰属証明と後始末が成立する。
 #   コンテナ側プロセスは supervisor の子孫で、state.json（<状態ルート>/<id>/state.json。camelCase の
 #   status・pid・restartCount）に実行中 pid と再起動回数が反映される。状態ルートは --state-root の値、省略時は
-#   本スクリプトが mktemp で作る 0700 のディレクトリ（実行後に削除する。CLI の delete は呼ばない）。
+#   本スクリプトが mktemp で作る 0700 のディレクトリ（後始末の正常系では CLI の delete が <id>/ を消し、一時ディレクトリは
+#   rm -rf する。下記「後始末の delete」）。
 #   restart のたびに構造化ログ {"component":"supervisor.monitor","operation":"restart","result":"ok",
 #   "elapsed_us":N} が<状態ルート>/@supervisor-logs/<id>.log へ `stderr ` 接頭辞つきで残る（無ければ supervisor_reported は null）。--bundle は計測専用の使い捨てを使う。
 #   標準エラーはファイルへ記録する。ulimit での肥大化防止は、コンテナへ継承され計測条件が変わるため行わない
@@ -67,7 +68,7 @@
 #   結果は後始末の成功を確認した後にだけ公開する（失敗・中断・後始末失敗では標準出力・--output とも出さない）。
 # 終了コード: 0 = 成功 / 1 = 計測失敗（FCSUP1 OK なし・期限切れ・再起動未観測・時計変更・launcher 異常終了・想定外の
 #   内部エラー）/ 2 = 引数・入力・出力先エラー / 3 = 前提欠如（非 Linux・bash 5 未満・jq・/proc。0 で合格に見せない）/
-#   4 = 後始末失敗（残存プロセス・帰属を証明できない生存 pid・報告 pid か state.json の pid を記録できず追跡不能な場合。launcher の生存を問わない。最優先）/ 129・130・143 = HUP・INT・TERM による中断
+#   4 = 後始末失敗（delete の拒否・期限超過・残存プロセス・帰属を証明できない生存 pid・報告 pid か state.json の pid を記録できず追跡不能な場合。launcher の生存を問わない。最優先）/ 129・130・143 = HUP・INT・TERM による中断
 #   （後始末の完了後）。set -e による想定外の中断は、そのコマンドの終了コードに関わらず 1 に正規化する。
 # 期限: 各待機（create・FCSUP1・running・試行ごとの再起動観測）は --timeout を上限とし、単調時計（/proc/uptime）で判定する。
 #   実行全体の上限は --print-budget の値（既定の 20 試行・warmup 1・--timeout 30 で 843 秒）。本スクリプト自身は
@@ -89,6 +90,19 @@
 #     直前に「記録した起動時刻のまま生存している同一プロセスか」を再照合する。
 #   - 証明できない生存 pid（state.json にあるが子孫でも (c)(d) でもない）にはシグナルを送らず、警告を出して
 #     終了コード 4 にする（結果は公開しない）。launcher より前から動いていたプロセスは無関係と確定するので 4 にしない。
+# 後始末の delete（OCI-6・#2157）: 正常系（--policy on-failure で、最後の試行の再起動で再起動回数を使い切っているため、
+#   最後のコンテナ側プロセスへ SIGKILL を 1 回送って supervisor が RetriesExhausted で Stopped を記録して自分で終わる）は、
+#   計測値を確定した後（計測区間の外）に、プロセスの回収を確認してから CLI の delete を呼んで状態を消す。
+#   呼び出しは本番の start と同じ包み込み（<systemd-run> --user --scope --quiet -p Delegate=yes -- <cli> --root <状態ルート>
+#   delete <id>。配列で直接 exec）で、CLI 自身を委譲スコープの中に入れる。こうすると core の delete は記録済みスコープを
+#   fd 起点で開く経路（remove_recorded。#2096）で試行スコープの外からでも cgroup を消せる。
+#   stopped にならない場合（--policy always は SUP-9〔#2408〕の明示 stop の意図が入るまで自然に止まらず、on-failure でも
+#   期限内に stopped にならなければ）delete は呼ばず（必ず FAILED_PRECONDITION になるため）、従来どおりプロセスを回収して
+#   一時ディレクトリを rm -rf する。結果 JSON の cleanup.delete に ok / skipped（reason: state-not-stopped）を載せて隠さない。
+#   delete の拒否・期限超過は後始末失敗（終了コード 4）にし、状態を残す（結果は公開しない契約のため、拒否は stderr の
+#   固定書式の行 `cleanup-failed: delete was rejected (<CODE>)` と終了コードで残す。CODE は CLI の stderr の JSON の code か
+#   UNPARSED・TIMEOUT）。上限: 自然停止の待ち RESTART_LATENCY_STOP_WAIT_S 秒（既定 10。0 は自然停止を試みず delete を
+#   スキップ。実機では使わない）、delete RESTART_LATENCY_DELETE_TIMEOUT_S 秒（既定 20。いずれも後始末の枠 60 秒に収まる）。
 # 後始末: launcher の子孫を記録 → launcher へ SIGTERM（5 秒で止まらなければ SIGKILL）→ 帰属不明 pid の再判定 →
 #   所有トークン一致と記録済みのプロセスへ SIGKILL（最大 5 秒再試行）→ 最終走査で 1 つでも生存していれば 4。
 #   restart ログの副系列は launcher 停止後に集計する（最後の restart ログが状態更新より遅れても欠損にしない）。
@@ -179,6 +193,11 @@ if [ "$print_budget" -eq 1 ]; then
   printf '%s\n' "$(((trials + warmup + 3) * timeout_s + (trials + warmup) * ((settle_ms + 999) / 1000 + 2) + 60))"
   exit 0
 fi
+# 後始末の delete の上限（環境変数。--print-budget の後始末枠 60 秒に収まる値に限る）。
+stop_wait_s="${RESTART_LATENCY_STOP_WAIT_S:-10}"
+delete_timeout_s="${RESTART_LATENCY_DELETE_TIMEOUT_S:-20}"
+check_range "RESTART_LATENCY_STOP_WAIT_S" "$stop_wait_s" 0 20
+check_range "RESTART_LATENCY_DELETE_TIMEOUT_S" "$delete_timeout_s" 1 30
 [ -n "$bin_dir" ] || { err "invalid-argument" "--bin-dir is required"; exit 2; }
 [ -n "$bundle" ] || { err "invalid-argument" "--bundle is required"; exit 2; }
 case "$policy" in on-failure | always) ;; *) err "invalid-argument" "--policy must be on-failure or always"; exit 2 ;; esac
@@ -300,6 +319,11 @@ reported_err=0
 collect_log=0
 snap_seen=0
 keep_state=0
+# 後始末の delete（OCI-6）。delete_wanted=1 は「stopped を確認できた」ことを表す。delete_result は結果 JSON の
+# cleanup.delete（ok / skipped）、delete_reason は skipped の理由。
+delete_wanted=0
+delete_result=""
+delete_reason=""
 last_snap_cs=0
 # 本計測への帰属を証明済みのプロセスの「pid → 起動時刻」（試行で kill 対象にしたコンテナ側プロセスと、launcher の
 # 生存中に採取した子孫のスナップショット）。後始末で全件を同一性照合のうえ回収する。
@@ -512,6 +536,50 @@ validate_state_strict() { # <観測した新 pid> <期待 restartCount>
     <<<"$ST_RAW" >/dev/null 2>&1
 }
 
+# 後始末の delete（OCI-6）。本番の start と同じ包み込みで CLI の delete を 1 回呼ぶ。成功は 0、拒否・期限超過は 1。
+# stdin・stdout は /dev/null、stderr は作業ディレクトリ（0700）内のファイルへ。コードは先頭 4096 バイトから
+# `"code":"[A-Z_]{1,32}"` だけを取り出す（message・パスは出さない。外部入力は信頼しない）。
+run_delete() {
+  local rc=0 code="" errf="$workdir/delete.err"
+  : >"$errf" || return 1
+  timeout --kill-after=5 "$delete_timeout_s" "$systemd_run" --user --scope --quiet -p Delegate=yes -- \
+    "$cli_bin" --root "$state_dir" delete "$container_id" </dev/null >/dev/null 2>"$errf" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    delete_result="ok"
+    return 0
+  fi
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    code="TIMEOUT"
+  else
+    code="$(head -c 4096 -- "$errf" 2>/dev/null | grep -o '"code":"[A-Z_]\{1,32\}"' | head -n 1 | cut -d'"' -f4 || true)"
+    [ -n "$code" ] || code="UNPARSED"
+  fi
+  err "cleanup-failed" "delete was rejected ($code)"
+  return 1
+}
+
+# 計測区間の外で、delete できる状態（stopped）まで進める。on-failure は最後の再起動で回数を使い切っているので、最後の
+# コンテナ側プロセスへ SIGKILL を 1 回送る（同一性を再照合する sig_same_proc 経由）。supervisor は RetriesExhausted で
+# Stopped を記録して自分で終わる。stopped と launcher の終了を期限内に確認できたときだけ delete_wanted=1 にする。
+stop_for_delete() {
+  local end
+  if [ "$policy" = "on-failure" ] && [ "$stop_wait_s" -gt 0 ] && [ -n "${new_pid:-}" ]; then
+    sig_same_proc KILL "$new_pid" "$new_start" || true
+    up_cs; end=$((REPLY_CS + stop_wait_s * 100))
+    while :; do
+      if read_state && [ "$ST_STATUS" = "stopped" ] && ! launcher_ok; then
+        delete_wanted=1
+        return 0
+      fi
+      up_cs
+      [ "$REPLY_CS" -lt "$end" ] || break
+      nap "$poll_s"
+    done
+  fi
+  delete_result="skipped"
+  delete_reason="state-not-stopped"
+}
+
 # 起動契約の差し替え点（根拠は冒頭コメント）。supervisor の起動行を LAUNCH_CMD へ組む。
 build_launch_cmd() {
   local pol="$policy"
@@ -527,19 +595,31 @@ sup_create() {
 }
 
 # 結果チャネル（FIFO）から FCSUP1 の 1 行を読み、OK なら report_pid を記録して 0。ERR・書式不正は計測失敗。未到着は 1。
+# 引数 <1 バイトあたりの待ち秒>（既定 0.01。launcher 終了後の読み切りだけ長めを渡す）。
+# 1 バイトずつ `read -N 1` で読む（Issue #2213・SUP-3・REPAIR-5）。旧実装の `read -r -n 640 -t 0.01` は、bash 5.2 の
+# read.def が区切り文字（改行）を読んで break した後の check_read_timeout で期限切れを検知すると、改行を消費して
+# 完全な行を変数へ入れたまま終了コード 142 を返す。これを「行の途中」と見て改行を待ち続けると、supervisor は
+# 1 行しか書かないため改行は二度と来ず、FCSUP1 OK 待ちが --timeout まで固まった（並列負荷で読みがプリエンプトされると起きる）。
+# -N は区切りを無視して改行もデータとして変数へ入れるため、期限切れの longjmp でも取りこぼさない。
+# 終了コードより先に ch を見る（期限切れでも ch に入ったバイトは有効なデータ）。-n 640 -t に戻さないこと。
+# -N は bash 4.1 以上が必要だが、本スクリプトは {var} の fd 割り当てを使う Linux 限定で要件は変わらない。
+# 行は 640 バイトを上限とし、行の途中で切れても report_buf は呼び出しをまたいで保持して次回に継ぎ足す。
 sup_report() {
-  local chunk="" rc=0 line
+  local wait_s="${1:-0.01}" ch rc line
   [ -z "$report_pid" ] || return 0
-  # read -t は期限切れのとき、それまでに読めた途中の文字列を chunk へ返して消費する（終了コード 128 超）。
-  # 負荷でバイトの到着が 10ms を超えて分かれると途中で切れた行を誤って書式不正にするため、改行が来るまで
-  # report_buf へ継ぎ足す（行は supervisor が 1 回の書き込みで出すが、読み側は 1 バイトずつ読む）。
-  IFS= read -r -n 640 -t 0.01 -u "$outfd" chunk || rc=$?
-  report_buf+="$chunk"
-  if [ "$rc" -gt 128 ] && [ "${#report_buf}" -lt 640 ]; then
-    return 1
-  fi
-  line="$report_buf"
-  [ -n "$line" ] || return 1
+  while :; do
+    ch="" rc=0
+    IFS= read -r -N 1 -t "$wait_s" -u "$outfd" ch || rc=$?
+    [ -n "$ch" ] || return 1
+    if [ "$ch" != $'\n' ]; then
+      report_buf+="$ch"
+      [ "${#report_buf}" -lt 640 ] || fail "supervisor printed an unrecognized report line"
+      continue
+    fi
+    line="$report_buf"
+    report_buf=""
+    break
+  done
   if [[ "$line" =~ ^FCSUP1\ OK\ ([1-9][0-9]{0,9})$ ]]; then
     report_pid="${BASH_REMATCH[1]}"
     return 0
@@ -737,13 +817,18 @@ do_cleanup() {
       wait "$launcher_pid" 2>/dev/null || true
     fi
   fi
+  # 7. 後始末の正常系: プロセスの回収を確認できた（rc=0）うえで stopped を確認済みなら、CLI の delete で状態を消す。
+  #    拒否・期限超過は後始末失敗（4）にして状態を残す（握りつぶさない）。
+  if [ "$delete_wanted" -eq 1 ] && [ "$rc" -eq 0 ]; then
+    if ! run_delete; then rc=4; fi
+  fi
   # 回収失敗（rc=4）の全経路で作業ディレクトリを残し、手動回収のため場所を通知する（SUP-5）。
   if [ "$rc" -eq 4 ] && [ -n "$workdir" ] && [ "${keep_state:-0}" -eq 0 ]; then
     keep_state=1
     printf 'warning: cleanup incomplete; state kept at %s\n' "$workdir" >&2 || true
   fi
   if [ -n "$workdir" ] && [ "${keep_state:-0}" -eq 0 ]; then rm -rf -- "$workdir" 2>/dev/null || true; fi
-  if [ -n "$state_root" ] && [ -n "$container_id" ] && [ "$rc" -eq 0 ]; then
+  if [ -n "$state_root" ] && [ -n "$container_id" ] && [ "$rc" -eq 0 ] && [ "$delete_result" != "ok" ]; then
     # --state-root は操作者の領域。<id>/ は削除しない（残置を通知する）。
     printf 'note: left state entry for id %s under --state-root (operator-owned)\n' "$container_id" >&2 || true
   fi
@@ -833,7 +918,11 @@ deadline_wait() { # <説明> : 条件関数 "$@" が真になるまで --timeout
     if ! launcher_ok; then
       # launcher が報告の直後に終了した場合、ERR の行が FIFO に残っている。先に読んで原因（エラーコード）を報告する。
       # ERR・書式不正なら sup_report 内の fail で終了する。
-      if [ "$what" = "FCSUP1 OK" ]; then sup_report || true; fi
+      # 書き手は終了済みで残りは FIFO 内にある。負荷で 1 回の読みが途中までになっても入力が尽きるまで読み切る
+      # （read -t 0 は消費せず入力の有無だけ確かめる。毎回 1 バイト以上消費するか 640 バイト上限で fail するため有限。Issue #2213）。
+      if [ "$what" = "FCSUP1 OK" ]; then
+        while [ -z "$report_pid" ] && read -r -t 0 -u "$outfd"; do sup_report 1 || break; done
+      fi
       fail "launcher exited while waiting for $what"
     fi
     up_cs
@@ -912,6 +1001,9 @@ for ((n = 1; n <= total; n++)); do
   nap "$settle_s"
 done
 
+# --- 計測区間の外: delete できる状態（stopped）まで進める。値は上で確定済み（vals）でここでの時間は入らない ---
+stop_for_delete
+
 # --- 副系列は launcher 停止後（do_cleanup 内の collect_reported）に集計する。ここで停止・回収を先に行う ---
 collect_log=1
 if ! do_cleanup; then
@@ -952,11 +1044,13 @@ result="$(jq -n \
   --arg label "$label" --arg policy "$policy" --argjson backoff "$supervisor_backoff_ms" \
   --argjson trials "$trials" --argjson warmup "$warmup" \
   --argjson observed "$observed_json" --argjson reported "$reported_json" \
-  --argjson observed_net "$observed_net_json" --argjson reported_net "$reported_net_json" '
+  --argjson observed_net "$observed_net_json" --argjson reported_net "$reported_net_json" \
+  --arg dres "$delete_result" --arg dreason "$delete_reason" '
   { schema: "fandhe-container.restart-latency/v1", behavior: "SUP-3", task: "TASK-160", unit: "ms",
     label: $label, trials: $trials, warmup: $warmup, policy: $policy, backoff_ms_assumed: $backoff,
     observed: $observed, supervisor_reported: $reported,
     observed_minus_backoff: $observed_net, supervisor_reported_minus_backoff: $reported_net,
+    cleanup: ({delete: $dres} + (if $dreason != "" then {reason: $dreason} else {} end)),
     method: {
       observed: "SIGKILL to the container process until state.json shows running, a new pid and restartCount+1; includes the supervisor restart backoff, the pre-signal identity check, signal delivery, exit detection and the polling granularity of this script (upper bound)",
       supervisor_reported: "elapsed_us of the supervisor.monitor restart log line (exit detected until the new Running state is recorded, including the restart backoff); null when the supervisor log does not provide trials+warmup ok lines",

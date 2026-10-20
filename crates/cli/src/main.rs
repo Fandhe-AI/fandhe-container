@@ -2,7 +2,7 @@
 //!
 //! 終了コードは core の ERR-2 表に従う: 0 は成功（出力なし。`list` と `image ls` / `system df` / `image rm` / `image tag` のみ stdout へ表を出す）、2 は使い方エラー・不正引数、
 //! 3 は対象なし、8 は未実装など。
-//! `setup`（CLI-2）は OS 固有設定の要求ステップを stdout へ出す（Linux は要求なしで 0・出力なし）。`start` は同じディレクトリの supervisor を起動して結果を受け取る（#1718）。supervisor は core の本番 launcher で起動する（rootless のみ。rootful は `UNIMPLEMENTED`（8））。
+//! `setup`（CLI-2）は OS 固有設定の要求ステップを stdout へ出す（Linux は rootful のときだけ要る特権ランチャーのインストール手順を 1 行表示して 0。表示のみで実行しない。#1454・#1722）。`start` は同じディレクトリの supervisor を起動して結果を受け取る（#1718）。supervisor は core の本番 launcher で起動する（rootless のみ。rootful は `UNIMPLEMENTED`（8））。
 //! unix では起動時に SIGINT・SIGTERM・SIGHUP のハンドラを登録し、起動中の plugin へ転送してから終了する（#1513・PLUG-7）。
 //! 失敗時は stderr へ英語 1 行 JSON（`code` / `message`。core 由来は `op` も）を出す。
 //! 終了時に、plugin の後始末の失敗のうち `Drop` で即時に書けなかった記録（`fandhe_container_plugin::take_pending_child_cleanup_failures`）を
@@ -15,12 +15,14 @@ use std::time::Duration;
 const DEFERRED_REPORT_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
-    // 親が受けたシグナルを起動中の plugin へ転送する（登録に失敗したら fail-closed で終了する）。
+    // 親が受けたシグナルを起動中の plugin へ転送する。登録に失敗したらコマンドを実行せず（fail-closed）、
+    // その失敗もコマンド結果と同じ期限付きの出力経路へ流す（main で無期限に書かない。REPAIR-5・#1778）。
     #[cfg(unix)]
-    if let Err(e) = fandhe_container_cli::signals::install_signal_forwarding() {
-        let _ = e.write_stderr(&mut std::io::stderr());
-        return ExitCode::from(e.exit_code().get());
-    }
+    let exit = match fandhe_container_cli::signals::install_signal_forwarding() {
+        Ok(()) => fandhe_container_cli::commands::run(std::env::args_os().skip(1)),
+        Err(e) => fandhe_container_cli::commands::CliExit::Error(e),
+    };
+    #[cfg(not(unix))]
     let exit = fandhe_container_cli::commands::run(std::env::args_os().skip(1));
     let code = exit.exit_code();
     let mut pending = fandhe_container_plugin::take_pending_child_cleanup_failures();

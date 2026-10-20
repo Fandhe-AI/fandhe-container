@@ -1,4 +1,4 @@
-//! 制御チャネルのサーバと、起動ハンドルを持つ監視スレッドの橋渡し（SUP-1・SEC-1・CORE-1・REPAIR-5・#2058）。
+//! 制御チャネルのサーバと、起動ハンドルを持つ監視スレッドの橋渡し（SUP-1・SUP-9・SEC-1・CORE-1・REPAIR-5・#2058・#2162）。
 //!
 //! `LaunchedProcess` は `Send` だけで `Sync` ではなく、別スレッドから同じハンドルを触れない（core のトレイトを
 //! `Sync` に広げるとすべてのフェイクへ波及し、core と supervisor の境界も変わる）。そこで次の形にする。
@@ -10,6 +10,16 @@
 //!   監視スレッドを待たずに即答するために使う。世代番号で、再起動後の新しいハンドルを古いハンドルの `Drop` から守る。
 //! - [`ControlledRelauncher`]: restart の再 launch で得た新しいハンドルを、新しい世代の [`ControlledProcess`] として
 //!   登録する（古い世代の受け箱の要求は新しいプロセスへ届かない）。
+//!
+//! # 明示 stop の意図（SUP-9・#2162）
+//!
+//! StopRequest（`RequestKind::Stop`）は、シグナルを送る前に `StopToken::mark_explicit_stop` で意図を立てる
+//! （書き先は [`SignalSlot::with_stop_intent`]。無ければ送らずに `StopIntentUnavailable`。fail-closed）。送信が失敗したら、
+//! この要求で立てた分だけ戻す（先に別の stop が立てていた意図は消さない）。回収済み（`FailedPrecondition`）は、
+//! 止めたい対象がもう終わっているので意図を残す。競合しない理由: 意図の設定・取り消しと、restart の判定
+//! （`supervise_with_restart` が `monitor` から戻った後に読む）は、どちらも監視スレッドの上で順に起きる。
+//! [`ControlledProcess`] の `wait` は内側の `wait` の前に受け箱を処理するので、SIGTERM による終了が観測されるのは必ず
+//! 意図が立った後になる。`RequestKind::Signal`（将来の `kill`。#1902）は意図に触れない。
 //!
 //! 応答の遅れは最大で監視ループの poll 間隔（`start_entry::POLL_INTERVAL`、100ms）。`run.rs`・`restart.rs` の
 //! 公開関数のシグネチャは変えない（REPAIR-1）。全 OS でコンパイル・テストする（std のみ）。
@@ -24,14 +34,16 @@ use std::time::{Duration, Instant};
 use fandhe_container_core::oci_runtime::{ContainerOutput, LaunchedProcess, ProcessExit};
 use fandhe_container_core::traits::{ErrorCode, Signal, TraitError};
 
-use super::protocol::ControlReason;
+use super::protocol::{ControlReason, RequestKind};
 use crate::restart::{LateOrphan, Relauncher};
+use crate::run::{ExplicitStopRecord, StopToken};
 
 /// 受け箱の容量（超えたら `Busy`。資源の使用量を固定に抑える）。
 pub const INBOX_CAPACITY: usize = 4;
 
 /// 監視スレッドへ渡す 1 件のシグナル送信要求。
 struct PendingSignal {
+    kind: RequestKind,
     pid: NonZeroU32,
     signal: Signal,
     /// この時刻以降は送らない（`Timeout` を返す）。
@@ -56,6 +68,8 @@ enum SlotState {
 struct SlotInner {
     next_generation: u64,
     state: SlotState,
+    /// 明示 stop の意図の書き先（SUP-9）。`None` なら StopRequest は受けられない。
+    stop_intent: Option<StopToken>,
 }
 
 /// サーバと監視スレッドが共有する、起動ハンドルの有無・世代の状態。
@@ -69,11 +83,21 @@ impl Default for SignalSlot {
 }
 
 impl SignalSlot {
-    /// ハンドルなし（`Empty`）の状態で作る。
+    /// ハンドルなし（`Empty`）の状態で作る。stop の意図の書き先は無く、StopRequest は `StopIntentUnavailable` で断る。
     pub fn new() -> Self {
+        Self::build(None)
+    }
+
+    /// stop の意図の書き先 `stop` を持つ状態で作る（本番。`stop` は restart の判定に渡すトークンと同じもの。SUP-9）。
+    pub fn with_stop_intent(stop: StopToken) -> Self {
+        Self::build(Some(stop))
+    }
+
+    fn build(stop_intent: Option<StopToken>) -> Self {
         Self(Arc::new(Mutex::new(SlotInner {
             next_generation: 1,
             state: SlotState::Empty,
+            stop_intent,
         })))
     }
 
@@ -123,19 +147,28 @@ impl SignalSlot {
     }
 
     /// サーバから要求を預ける。受け付けたら返信用の受け口を返し、その場で断れるものは理由コードを返す。
+    ///
+    /// `RequestKind::Stop` で意図の書き先が無ければ、受け箱に入れず `StopIntentUnavailable` を返す（シグナルは送らない）。
     pub fn submit(
         &self,
+        kind: RequestKind,
         pid: NonZeroU32,
         signal: Signal,
         deadline: Instant,
     ) -> Result<Receiver<ControlReason>, ControlReason> {
         let inner = self.lock();
+        if kind == RequestKind::Stop && inner.stop_intent.is_none() {
+            return Err(ControlReason::StopIntentUnavailable);
+        }
         match &inner.state {
             SlotState::Empty => Err(ControlReason::NoHandle),
             SlotState::Exited { pid: held, .. } => {
                 if *held != pid {
                     Err(ControlReason::PidMismatch)
                 } else {
+                    // 終了済みの Stop では意図を立てない（意図は StopToken に残り、再 launch 後の新しい
+                    // インスタンスの restart を無効化してしまうため。クラッシュとの競合に負けた stop は
+                    // 何も止めない。SUP-9・#2162）。
                     Err(ControlReason::ContainerExited)
                 }
             }
@@ -147,6 +180,7 @@ impl SignalSlot {
                 }
                 let (reply, rx) = sync_channel(1);
                 match inbox.try_send(PendingSignal {
+                    kind,
                     pid,
                     signal,
                     deadline,
@@ -191,7 +225,22 @@ impl ControlledProcess {
             match self.inbox.try_recv() {
                 Ok(req) => {
                     let reason = match fixed {
-                        Some(r) => r,
+                        Some(r) => {
+                            // 終了を観測済みでも、受け箱に入っていた期限内の Stop の意図は記録する（SUP-9。
+                            // 記録しないと restart の判定が `always` / `unless-stopped` で再 launch してしまう）。
+                            // 期限切れの Stop は Timeout で断る要求なので意図を立てない（REPAIR-5）。
+                            if req.kind == RequestKind::Stop && Instant::now() < req.deadline {
+                                let token = self.slot.lock().stop_intent.clone();
+                                if let Some(token) = token {
+                                    token.mark_explicit_stop();
+                                }
+                            }
+                            if req.kind == RequestKind::Stop && Instant::now() >= req.deadline {
+                                ControlReason::Timeout
+                            } else {
+                                r
+                            }
+                        }
                         None => self.handle(&req),
                     };
                     // 受け手（サーバ）が期限で諦めていても詰まらない（容量 1・送信は 1 回）。
@@ -210,14 +259,35 @@ impl ControlledProcess {
         if req.pid != self.inner.pid() {
             return ControlReason::PidMismatch;
         }
-        match self.inner.signal(req.signal, req.deadline) {
+        // 明示 stop は、シグナルを送る前に意図を立てる（終了の観測より必ず先。モジュール doc）。
+        let intent = if req.kind == RequestKind::Stop {
+            let Some(token) = self.slot.lock().stop_intent.clone() else {
+                return ControlReason::StopIntentUnavailable;
+            };
+            let record = token.mark_explicit_stop();
+            #[cfg(target_os = "linux")]
+            super::log_control_event("stop_intent_recorded", None);
+            Some((token, record))
+        } else {
+            None
+        };
+        let reason = match self.inner.signal(req.signal, req.deadline) {
             Ok(()) => ControlReason::Ok,
             Err(e) => match e.code() {
                 ErrorCode::FailedPrecondition => ControlReason::ContainerExited,
                 ErrorCode::Timeout => ControlReason::Timeout,
                 _ => ControlReason::SignalFailed,
             },
+        };
+        // 送れなかったとき、この要求で立てた意図だけ戻す。回収済みは止めたい対象が終わっているので残す。
+        if let Some((token, ExplicitStopRecord::NewlyRecorded)) = &intent
+            && !matches!(reason, ControlReason::Ok | ControlReason::ContainerExited)
+        {
+            token.revert_explicit_stop();
+            #[cfg(target_os = "linux")]
+            super::log_control_event("stop_intent_reverted", Some(reason.name()));
         }
+        reason
     }
 }
 
@@ -266,7 +336,7 @@ impl LaunchedProcess for ControlledProcess {
         self.inner.take_output()
     }
 
-    /// seccomp の listener を内側へ転送する(転送しないと、包み直した後は取り出せず #2025 の応答ループが
+    /// seccomp の listener を内側へ転送する(転送しないと、包み直した後は取り出せず #2025 の応答ハブが
     /// listener を得られない。`take_output` と同じ注意。SEC-4・#2024)。
     #[cfg(target_os = "linux")]
     fn take_seccomp_listener(&self) -> Option<fandhe_container_core::exec::SeccompListener> {
@@ -326,6 +396,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+    use crate::run::ExplicitStopState;
 
     /// 送られたシグナル番号を記録する模擬プロセス。
     struct Fake {
@@ -408,7 +479,12 @@ mod tests {
         sig: u8,
         deadline: Instant,
     ) -> ControlReason {
-        let rx = match slot.submit(pid(p), Signal::new(sig).unwrap(), deadline) {
+        let rx = match slot.submit(
+            RequestKind::Signal,
+            pid(p),
+            Signal::new(sig).unwrap(),
+            deadline,
+        ) {
             Ok(rx) => rx,
             Err(r) => return r,
         };
@@ -465,7 +541,9 @@ mod tests {
         let (fake, signals, _) = Fake::new(100);
         let cp = ControlledProcess::new(Box::new(fake), slot.clone());
         let deadline = Instant::now() + Duration::from_millis(20);
-        let rx = slot.submit(pid(100), Signal::SIGTERM, deadline).unwrap();
+        let rx = slot
+            .submit(RequestKind::Signal, pid(100), Signal::SIGTERM, deadline)
+            .unwrap();
         std::thread::sleep(Duration::from_millis(60));
         let _ = cp.wait(Duration::from_millis(1));
         assert_eq!(rx.recv().unwrap(), ControlReason::Timeout);
@@ -477,25 +555,30 @@ mod tests {
     fn sup1_exited_then_dropped_then_empty() {
         let slot = SignalSlot::new();
         assert_eq!(
-            slot.submit(pid(100), Signal::SIGTERM, far()).unwrap_err(),
+            slot.submit(RequestKind::Signal, pid(100), Signal::SIGTERM, far())
+                .unwrap_err(),
             ControlReason::NoHandle
         );
         let (fake, signals, exited) = Fake::new(100);
         let cp = ControlledProcess::new(Box::new(fake), slot.clone());
         // 受け箱に要求が残ったまま終了を検知したら、送らずに ContainerExited を返す。
-        let rx = slot.submit(pid(100), Signal::SIGTERM, far()).unwrap();
+        let rx = slot
+            .submit(RequestKind::Signal, pid(100), Signal::SIGTERM, far())
+            .unwrap();
         exited.store(true, Ordering::SeqCst);
         assert!(cp.wait(Duration::from_millis(1)).unwrap().is_some());
         // drain(None) が先に走るが、模擬は終了済みなら FailedPrecondition を返すので同じ結果になる。
         assert_eq!(rx.recv().unwrap(), ControlReason::ContainerExited);
         assert!(signals.lock().unwrap().is_empty());
         assert_eq!(
-            slot.submit(pid(100), Signal::SIGTERM, far()).unwrap_err(),
+            slot.submit(RequestKind::Signal, pid(100), Signal::SIGTERM, far())
+                .unwrap_err(),
             ControlReason::ContainerExited
         );
         drop(cp);
         assert_eq!(
-            slot.submit(pid(100), Signal::SIGTERM, far()).unwrap_err(),
+            slot.submit(RequestKind::Signal, pid(100), Signal::SIGTERM, far())
+                .unwrap_err(),
             ControlReason::NoHandle
         );
     }
@@ -513,7 +596,8 @@ mod tests {
         assert_eq!(*signals.lock().unwrap(), vec![2]);
         // 古い pid へは届かない。
         assert_eq!(
-            slot.submit(pid(100), Signal::SIGTERM, far()).unwrap_err(),
+            slot.submit(RequestKind::Signal, pid(100), Signal::SIGTERM, far())
+                .unwrap_err(),
             ControlReason::PidMismatch
         );
     }
@@ -526,10 +610,14 @@ mod tests {
         let _cp = ControlledProcess::new(Box::new(fake), slot.clone());
         let mut held = Vec::new();
         for _ in 0..INBOX_CAPACITY {
-            held.push(slot.submit(pid(100), Signal::SIGTERM, far()).unwrap());
+            held.push(
+                slot.submit(RequestKind::Signal, pid(100), Signal::SIGTERM, far())
+                    .unwrap(),
+            );
         }
         assert_eq!(
-            slot.submit(pid(100), Signal::SIGTERM, far()).unwrap_err(),
+            slot.submit(RequestKind::Signal, pid(100), Signal::SIGTERM, far())
+                .unwrap_err(),
             ControlReason::Busy
         );
     }
@@ -558,5 +646,184 @@ mod tests {
         let cp = ControlledProcess::new(Box::new(fake), slot);
         assert!(cp.take_output().is_some());
         assert!(taken.load(Ordering::SeqCst));
+    }
+
+    /// 送られたシグナルの時点の意図フラグを記録する模擬（順序の照合用）。
+    struct IntentProbe {
+        token: StopToken,
+        seen: Arc<Mutex<Vec<bool>>>,
+        outcome: ErrorCode,
+        fail: bool,
+    }
+
+    impl LaunchedProcess for IntentProbe {
+        fn pid(&self) -> NonZeroU32 {
+            NonZeroU32::new(100).unwrap()
+        }
+        fn wait(&self, _timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
+            Ok(None)
+        }
+        fn terminate(&self, _timeout: Duration) -> Result<(), TraitError> {
+            Ok(())
+        }
+        fn signal(&self, _signal: Signal, _deadline: Instant) -> Result<(), TraitError> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(self.token.explicit_stop_state() == ExplicitStopState::Requested);
+            if self.fail {
+                Err(TraitError::new(self.outcome, "x"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    type Probe = (
+        SignalSlot,
+        ControlledProcess,
+        StopToken,
+        Arc<Mutex<Vec<bool>>>,
+    );
+
+    fn probe_setup(fail: bool, outcome: ErrorCode) -> Probe {
+        let token = StopToken::new();
+        let slot = SignalSlot::with_stop_intent(token.clone());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let probe = IntentProbe {
+            token: token.clone(),
+            seen: Arc::clone(&seen),
+            outcome,
+            fail,
+        };
+        let cp = ControlledProcess::new(Box::new(probe), slot.clone());
+        (slot, cp, token, seen)
+    }
+
+    fn stop_roundtrip(slot: &SignalSlot, cp: &ControlledProcess) -> ControlReason {
+        let rx = match slot.submit(RequestKind::Stop, pid(100), Signal::SIGTERM, far()) {
+            Ok(rx) => rx,
+            Err(r) => return r,
+        };
+        let _ = cp.wait(Duration::from_millis(1));
+        rx.recv_timeout(Duration::from_secs(5)).unwrap()
+    }
+
+    /// SUP-9: Stop は、シグナルを送る時点で意図が立っている（順序）。停止要求（監視の打ち切り）は立たない。
+    #[test]
+    fn sup9_stop_marks_intent_before_signal() {
+        let (slot, cp, token, seen) = probe_setup(false, ErrorCode::Internal);
+        assert_eq!(stop_roundtrip(&slot, &cp), ControlReason::Ok);
+        assert_eq!(*seen.lock().unwrap(), vec![true]);
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::Requested);
+        assert!(!token.is_stop_requested());
+    }
+
+    /// SUP-9: Signal 要求は意図を立てない。
+    #[test]
+    fn sup9_signal_request_does_not_mark_intent() {
+        let (slot, cp, token, seen) = probe_setup(false, ErrorCode::Internal);
+        assert_eq!(roundtrip(&slot, &cp, 100, 15, far()), ControlReason::Ok);
+        assert_eq!(*seen.lock().unwrap(), vec![false]);
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
+    }
+
+    /// SUP-9: 書き先の無い slot の Stop は、送らずに `StopIntentUnavailable`（fail-closed）。
+    #[test]
+    fn sup9_stop_without_intent_sink_is_refused() {
+        let slot = SignalSlot::new();
+        let (fake, signals, _) = Fake::new(100);
+        let cp = ControlledProcess::new(Box::new(fake), slot.clone());
+        assert_eq!(
+            slot.submit(RequestKind::Stop, pid(100), Signal::SIGTERM, far())
+                .unwrap_err(),
+            ControlReason::StopIntentUnavailable
+        );
+        let _ = cp.wait(Duration::from_millis(1));
+        assert!(signals.lock().unwrap().is_empty());
+    }
+
+    /// SUP-9: 送信が失敗したら、この要求で立てた意図を戻す。
+    #[test]
+    fn sup9_failed_signal_reverts_intent() {
+        let (slot, cp, token, _) = probe_setup(true, ErrorCode::Internal);
+        assert_eq!(stop_roundtrip(&slot, &cp), ControlReason::SignalFailed);
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
+    }
+
+    /// SUP-9: 先に別の stop が立てた意図は、後の stop の失敗で消さない。
+    #[test]
+    fn sup9_failed_signal_keeps_prior_intent() {
+        let (slot, cp, token, _) = probe_setup(true, ErrorCode::Timeout);
+        token.mark_explicit_stop();
+        assert_eq!(stop_roundtrip(&slot, &cp), ControlReason::Timeout);
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::Requested);
+    }
+
+    /// SUP-9・REPAIR-5: 期限切れの Stop は意図を立てず、送らない。
+    #[test]
+    fn sup9_expired_stop_does_not_mark_intent() {
+        let (slot, cp, token, seen) = probe_setup(false, ErrorCode::Internal);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let rx = slot
+            .submit(RequestKind::Stop, pid(100), Signal::SIGTERM, deadline)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        let _ = cp.wait(Duration::from_millis(1));
+        assert_eq!(rx.recv().unwrap(), ControlReason::Timeout);
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// SUP-9: 回収済み（FailedPrecondition）の Stop は意図を残す（止めたい対象はもう終わっている）。
+    #[test]
+    fn sup9_reaped_stop_keeps_intent() {
+        let (slot, cp, token, _) = probe_setup(true, ErrorCode::FailedPrecondition);
+        assert_eq!(stop_roundtrip(&slot, &cp), ControlReason::ContainerExited);
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::Requested);
+    }
+
+    /// SUP-9: 終了を観測した `wait` の後始末で返す `ContainerExited` の Stop でも、意図を記録する。
+    #[test]
+    fn sup9_stop_answered_container_exited_in_drain_marks_intent() {
+        let (slot, cp, token, _) = probe_setup(false, ErrorCode::Internal);
+        let rx = slot
+            .submit(RequestKind::Stop, pid(100), Signal::SIGTERM, far())
+            .unwrap();
+        slot.mark_exited(cp.generation);
+        cp.drain(Some(ControlReason::ContainerExited));
+        assert_eq!(rx.recv().unwrap(), ControlReason::ContainerExited);
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::Requested);
+    }
+
+    /// SUP-9: `Exited` スロットへの Stop の submit は意図を立てない（再 launch 後の新インスタンスの restart を
+    /// 無効化しないため。#2162）。Signal も立てない。
+    #[test]
+    fn sup9_stop_submit_to_exited_slot_does_not_mark_intent() {
+        let (slot, cp, token, _) = probe_setup(false, ErrorCode::Internal);
+        slot.mark_exited(cp.generation);
+        for kind in [RequestKind::Signal, RequestKind::Stop] {
+            assert_eq!(
+                slot.submit(kind, pid(100), Signal::SIGTERM, far())
+                    .unwrap_err(),
+                ControlReason::ContainerExited
+            );
+            assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
+        }
+    }
+
+    /// SUP-9・REPAIR-5: 終了観測後の drain で、期限切れの Stop は Timeout で断り意図を立てない。
+    #[test]
+    fn sup9_expired_stop_in_drain_after_exit_does_not_mark_intent() {
+        let (slot, cp, token, _) = probe_setup(false, ErrorCode::Internal);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let rx = slot
+            .submit(RequestKind::Stop, pid(100), Signal::SIGTERM, deadline)
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        slot.mark_exited(cp.generation);
+        cp.drain(Some(ControlReason::ContainerExited));
+        assert_eq!(rx.recv().unwrap(), ControlReason::Timeout);
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
     }
 }

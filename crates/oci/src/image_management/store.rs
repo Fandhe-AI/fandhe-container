@@ -25,8 +25,9 @@
 //!
 //! - コンテナ参照（エントリと世代カウンタ）は #2341 で root 直下の `@container-refs.json` へ永続化済み。
 //!   排他区間に入るたびにディスクから読み直し（ファイルが無ければメモリ上の内容を保つ）、読み込みに失敗
-//!   したら `lock` 自体がエラーを返す。manifest の在庫・タグ・pull リースは永続化されず（#851）、
-//!   プロセスごとのメモリ上の別物のままで、プロセス間ロックはそれらの内容を同期しない。
+//!   したら `lock` 自体がエラーを返す。削除の永続化（削除ジャーナルと取得時の再試行。`gc_journal`・#851）は
+//!   実装済みだが、manifest の在庫・タグ・pull リースは永続化されず、プロセスごとのメモリ上の別物のままで、
+//!   プロセス間ロックはそれらの内容を同期しない。
 //! - root の解決・作成・所有者 / 権限（0700）検査・祖先検査は永続化側の担当。`open` は存在する
 //!   ディレクトリ（symlink でない）であることしか見ない。oci には `sys` モジュールが無く
 //!   `O_NOFOLLOW` / `O_NONBLOCK` を使えないため、`@lock` の検査から open までの差し替えは
@@ -41,6 +42,7 @@ use std::time::{Duration, Instant};
 
 use super::ReferenceTable;
 use super::container_ref_persist::load_container_refs;
+use super::gc_journal::{PendingDeletionRecovery, journal_exists, reap_stale_tmp};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 
@@ -130,7 +132,27 @@ impl ImageStore {
     /// ほど長い場合は `InvalidArgument`。
     pub fn lock(&self) -> Result<ImageStoreGuard<'_>, OciError> {
         record_oci_op(&*self.recorder, OciOpKind::AcquireImageStoreLock, || {
-            self.lock_inner()
+            let guard = self.lock_inner()?;
+            // 復旧後もジャーナル（墓標を含む）が見えているなら、変更を許さない（OCI-7）。
+            // 古い untag・manifest 除去が再登録と両立しないため、障害が除かれて復旧が完了するまで拒否する。
+            if journal_exists(&self.root) {
+                return Err(OciError::new(
+                    OciErrorCode::FailedPrecondition,
+                    "a pending image deletion could not be completed; retry after it is recovered",
+                ));
+            }
+            Ok(guard)
+        })
+    }
+
+    /// 排他区間を取得し、残っている削除ジャーナルがあれば参照を数え直して削除をやり直す
+    /// （OCI-7・TASK-183.11.1・#851）。結果（無ければ `None`）を返して区間を閉じる。
+    ///
+    /// `lock` も取得時に同じ再試行を行うため、起動時に明示的に呼ぶのは結果を知りたい場合だけでよい。
+    /// CLI / CRI からの配線は未実装（REPAIR-3）。
+    pub fn recover_pending_deletion(&self) -> Result<Option<PendingDeletionRecovery>, OciError> {
+        record_oci_op(&*self.recorder, OciOpKind::AcquireImageStoreLock, || {
+            self.lock_inner().map(|mut g| g.recovered.take())
         })
     }
 
@@ -144,13 +166,27 @@ impl ImageStore {
         let table = self.lock_table_until(deadline)?;
         let file = open_lock_file(&self.root)?;
         lock_file_until(&file, deadline)?;
-        let mut table = table;
-        // 区間に入るたびにディスクのコンテナ参照を正とする。別プロセスの登録・世代を見て、
-        // 世代の二重発行と他プロセスの参照の見落としを防ぐ（#2341）。壊れた参照表は fail-closed で拒否する。
+        let mut guard = ImageStoreGuard {
+            _file: file,
+            table,
+            recovered: None,
+        };
+        guard.table.set_journal_root(&self.root);
+        // 区間に入るたびにディスクのコンテナ参照を正とする（#2341）。壊れた参照表は fail-closed で拒否する。
         if let Some(persisted) = load_container_refs(&self.root)? {
-            table.apply_persisted_container_refs(persisted);
+            guard.table.apply_persisted_container_refs(persisted);
         }
-        Ok(ImageStoreGuard { _file: file, table })
+        // 他の操作が割り込む前に、前回の中断した削除を片づける。ジャーナルがあったときだけ記録する。
+        reap_stale_tmp(&self.root);
+        let recovered = if journal_exists(&self.root) {
+            record_oci_op(&*self.recorder, OciOpKind::RecoverPendingDeletion, || {
+                guard.table.resume_pending_deletion(&self.root)
+            })?
+        } else {
+            None
+        };
+        guard.recovered = recovered;
+        Ok(guard)
     }
 
     fn lock_table_until(
@@ -179,6 +215,17 @@ impl ImageStore {
 pub struct ImageStoreGuard<'a> {
     _file: File,
     table: MutexGuard<'a, ReferenceTable>,
+    /// この取得時に行った中断削除の復旧結果（無ければ `None`）。`Abandoned` で孤児として残った blob
+    /// （`undeleted_blobs`）や `Pending` の状態を、呼び出し側が構造化された形で受け取るために保持する
+    /// （OCI-7・REPAIR-4。ジャーナルは片づいていても運用者の確認が要る情報を捨てない）。
+    recovered: Option<PendingDeletionRecovery>,
+}
+
+impl ImageStoreGuard<'_> {
+    /// この取得時に行った中断削除の復旧結果。ジャーナルが無かったときは `None`。
+    pub fn recovery(&self) -> Option<&PendingDeletionRecovery> {
+        self.recovered.as_ref()
+    }
 }
 
 impl Deref for ImageStoreGuard<'_> {
@@ -341,7 +388,8 @@ mod tests {
                 let _ = t.unregister_tag(&tag("keep"));
             }),
             ("acquire_lease", |t| {
-                t.acquire_lease(d(0x10), PullId::new("p1").expect("pull"));
+                t.acquire_lease(d(0x10), PullId::new("p1").expect("pull"))
+                    .unwrap();
             }),
             ("release_lease", |t| {
                 let _ = t.release_lease(&d(0x10), &PullId::new("p1").expect("pull"));

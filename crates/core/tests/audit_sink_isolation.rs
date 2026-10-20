@@ -290,6 +290,7 @@ mod linux {
         assert_eq!(threads(), 1, "the test binary must start single-threaded");
         healthy_primary_is_persisted_by_the_child();
         stuck_primary_falls_back_within_the_limit();
+        record_until_returns_within_the_deadline();
         primary_error_kind_reaches_the_fallback();
         child_does_not_inherit_caller_fds();
         stuck_notifier_leaves_no_thread_and_next_record_works();
@@ -340,6 +341,22 @@ mod linux {
             *seen.lock().unwrap(),
             vec![AuditWriteErrorKind::IsolationTimeout]
         );
+        assert_eq!(threads(), 1);
+    }
+
+    /// REPAIR-5・SEC-4: 主経路が止まり通知先も詰まっていても、`record_until` は絶対期限 + 許容差以内に
+    /// `Timeout` で戻り(主経路の上限は 5 秒だが期限へ絞られる)、親にスレッドを残さない。
+    fn record_until_returns_within_the_deadline() {
+        let primary: Primary = Arc::new(|_, _| hang());
+        let (sink, _seen) = sink(primary, false, Notify::Stuck, tmp_marker("until"));
+        let budget = Duration::from_millis(300);
+        let start = Instant::now();
+        let e = sink.record_until(&record(), start + budget).unwrap_err();
+        let took = start.elapsed();
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert!(took >= budget, "{took:?}");
+        assert!(took < budget + Duration::from_millis(400), "{took:?}");
+        wait_unreaped_cleared();
         assert_eq!(threads(), 1);
     }
 
@@ -492,9 +509,17 @@ mod linux {
         assert!(threads() >= 2);
         let late = ControlAuditRelay::spawn(sink_for_late(&marker));
         assert_eq!(late.unwrap_err().code(), ErrorCode::FailedPrecondition);
-        // 非 ControlPeer の層は運ばない。
+        // 制御チャネルと seccomp（#2025）以外の層は運ばない。
+        let mount = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
+            AuditPid::new(4242).unwrap(),
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
+        );
         assert_eq!(
-            relay.record(&record()).unwrap_err().code(),
+            relay.record(&mount).unwrap_err().code(),
             ErrorCode::InvalidArgument
         );
         drop(release_tx);

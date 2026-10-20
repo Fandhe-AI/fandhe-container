@@ -1534,3 +1534,23 @@ fn sup7_task164_1469_replaced_lock_file_is_not_accepted() {
     let e = verify_lock_is_current(&held, &path).unwrap_err();
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);
 }
+
+/// lstat 成功後の open の ENOENT（ローテーション競合）は `NotFound` に写り、読み出し側が再試行できる（SUP-7）。
+#[test]
+fn open_enoent_after_lstat_maps_to_not_found() {
+    let e = map_open_error(io::Error::from(ErrorKind::NotFound));
+    assert_eq!(e.code(), ErrorCode::NotFound);
+    let other = map_open_error(io::Error::from(ErrorKind::PermissionDenied));
+    assert_eq!(other.code(), ErrorCode::Internal);
+}
+
+/// SUP-7・REPAIR-5: 実体の入れ替わり（競合）だけが再試行対象で、種別違反・symlink 拒否は対象外。
+#[test]
+#[cfg(unix)]
+fn replaced_during_open_is_distinguishable_from_kind_violation() {
+    assert!(is_replaced_during_open(&replaced_during_open()));
+    assert!(!is_replaced_during_open(&invalid(
+        "log path is not a regular file"
+    )));
+    assert!(!is_replaced_during_open(&internal("log file open failed")));
+}

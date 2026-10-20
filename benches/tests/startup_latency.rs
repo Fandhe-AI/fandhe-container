@@ -110,11 +110,14 @@ mod linux {
         let d = Dir::new("bin");
         let sup = d.exe("sup", 0o777);
         let sd = d.exe("sd", 0o755);
+        let cli = d.exe("cli", 0o755);
         let e = measure_err(&[
             "--supervisor-bin",
             sup.to_str().expect("utf8"),
             "--systemd-run",
             sd.to_str().expect("utf8"),
+            "--cli-bin",
+            cli.to_str().expect("utf8"),
         ]);
         let want = if is_root() {
             "unsupported-environment"
@@ -133,12 +136,15 @@ mod linux {
         let d = Dir::new("out");
         let sup = d.exe("sup", 0o755);
         let sd = d.exe("sd", 0o755);
+        let cli = d.exe("cli", 0o755);
         let existing = d.exe("r.json", 0o600);
         let e = measure_err(&[
             "--supervisor-bin",
             sup.to_str().expect("utf8"),
             "--systemd-run",
             sd.to_str().expect("utf8"),
+            "--cli-bin",
+            cli.to_str().expect("utf8"),
             "--output",
             existing.to_str().expect("utf8"),
         ]);
@@ -155,6 +161,7 @@ mod linux {
         let d = Dir::new("wd");
         let sup = d.exe("sup", 0o755);
         let sd = d.exe("sd", 0o755);
+        let cli = d.exe("cli", 0o755);
         let base = d.0.join("base");
         std::fs::create_dir(&base).expect("mkdir");
         chmod(&base, 0o777);
@@ -163,6 +170,8 @@ mod linux {
             sup.to_str().expect("utf8"),
             "--systemd-run",
             sd.to_str().expect("utf8"),
+            "--cli-bin",
+            cli.to_str().expect("utf8"),
             "--work-dir",
             base.to_str().expect("utf8"),
         ]);
@@ -226,7 +235,7 @@ mod linux {
 #[cfg(unix)]
 #[test]
 fn measure_is_unsupported_off_linux() {
-    let cmd = parse_args(&args(&["--supervisor-bin", "/x"])).expect("plan");
+    let cmd = parse_args(&args(&["--supervisor-bin", "/x", "--cli-bin", "/y"])).expect("plan");
     assert!(matches!(execute(cmd), Ok(Execution::Unsupported)));
 }
 

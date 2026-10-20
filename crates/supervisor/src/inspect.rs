@@ -163,8 +163,40 @@ impl InspectReport {
             None => s.push_str("null"),
         }
         let _ = write!(s, ",\"restartCount\":{}", self.restart_count());
+        s.push_str(",\"auditCoverage\":");
+        self.push_audit_coverage(&mut s);
         s.push('}');
         s
+    }
+
+    /// 監査の網羅（SEC-4・#2027）。launch が評価した方針とカーネル監査頼みの 2 層の状態。記録が無ければ `null`。
+    /// 値はすべて core の固定語彙（エスケープ不要）。`kernel_audit_requested` は「要求した」だけで「記録された」ではない。
+    fn push_audit_coverage(&self, s: &mut String) {
+        use fandhe_container_core::launch_isolation::RecordedAuditCoverage;
+        let Some(RecordedAuditCoverage::Evaluated { policy, coverage }) =
+            self.record.launch_isolation().map(|l| l.audit_coverage())
+        else {
+            s.push_str("null");
+            return;
+        };
+        let layer =
+            |s: &mut String, st: fandhe_container_core::audit_log::KernelAuditLayerStatus| {
+                s.push_str("{\"mode\":");
+                push_str_value(s, st.mode());
+                s.push_str(",\"reason\":");
+                match st.reason() {
+                    Some(r) => push_str_value(s, r.as_str()),
+                    None => s.push_str("null"),
+                }
+                s.push('}');
+            };
+        s.push_str("{\"policy\":");
+        push_str_value(s, policy.as_str());
+        s.push_str(",\"seccompKill\":");
+        layer(s, coverage.seccomp_kill());
+        s.push_str(",\"landlock\":");
+        layer(s, coverage.landlock());
+        s.push('}');
     }
 
     /// [`Self::to_json`] に LF を 1 個付けて書き出す。
@@ -274,7 +306,7 @@ mod tests {
         .unwrap()
         .with_supervision(SupervisionState::new(nz(7), Some(HealthStatus::Healthy), 2));
         let expected = format!(
-            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2}}",
+            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2,\"auditCoverage\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -293,7 +325,7 @@ mod tests {
         )
         .unwrap();
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0}}",
+            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -316,7 +348,7 @@ mod tests {
             StateRevision::from_raw(2),
         ));
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0}}",
+            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(

@@ -345,6 +345,12 @@ struct AuditLineDto<'a> {
     /// `exit_signal` 層のみ: 終了したプロセスの PID（回収した側の PID namespace の値。他レイヤーでは出力しない）。
     #[serde(skip_serializing_if = "Option::is_none")]
     target_pid: Option<u32>,
+    /// `audit_coverage` 層のみ: 縮退した seccomp KILL 側の理由トークン（他レイヤーでは出力しない。#2027）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seccomp_kill_reason: Option<&'static str>,
+    /// `audit_coverage` 層のみ: 縮退した Landlock 側の理由トークン（他レイヤーでは出力しない。#2027）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    landlock_reason: Option<&'static str>,
     /// 検証済みの `ContainerId`（`[A-Za-z0-9._-]`・255 バイト以下）の生の値。不明なら `null`（省略しない）。
     /// 末尾に置く（既存キーの値と順序は変えない。#1618）。
     container_id: Option<&'a str>,
@@ -362,7 +368,8 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         AuditEvent::ExecTarget { .. }
         | AuditEvent::Entrypoint { .. }
         | AuditEvent::ControlPeer { .. }
-        | AuditEvent::ExitSignal { .. } => (None, None),
+        | AuditEvent::ExitSignal { .. }
+        | AuditEvent::AuditCoverageDegraded { .. } => (None, None),
     };
     let ts = record.timestamp().as_unix_duration();
     let dto = AuditLineDto {
@@ -379,6 +386,14 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         reason: record.reason().map(|r| r.as_str()),
         signal: record.exit_signal().map(|s| s.get()),
         target_pid: record.target_pid().map(|p| p.get()),
+        seccomp_kill_reason: record
+            .coverage_reasons()
+            .and_then(|(s, _)| s)
+            .map(|r| r.as_str()),
+        landlock_reason: record
+            .coverage_reasons()
+            .and_then(|(_, l)| l)
+            .map(|r| r.as_str()),
         container_id: record.container_id().map(|c| c.as_str()),
     };
     let mut line =
@@ -394,6 +409,9 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
 #[derive(Debug)]
 pub struct AuditFileWriter {
     file: File,
+    /// 開いたときの親ディレクトリ(書き込み可能性の確認用の一時ファイルを同じ FS に作るため)。
+    /// 検査なしで包んだ試験用の writer では `None`(確認は fail-closed で `Write`)。
+    dir: Option<std::path::PathBuf>,
 }
 
 impl AuditFileWriter {
@@ -411,7 +429,16 @@ impl AuditFileWriter {
     /// テスト用: 検査なしで `File` を包む（読み取り専用ファイルで書き込み失敗を再現する）。
     #[cfg(test)]
     pub(crate) fn from_file_unchecked(file: File) -> Self {
-        Self { file }
+        Self { file, dir: None }
+    }
+
+    /// テスト用: 検査なしで `File` と確認用の親ディレクトリを包む。
+    #[cfg(all(test, unix))]
+    pub(crate) fn from_file_unchecked_in(file: File, dir: std::path::PathBuf) -> Self {
+        Self {
+            file,
+            dir: Some(dir),
+        }
     }
 
     /// 1 レコードを排他ロック下で `write_all` し、`sync_data` まで行う。
@@ -426,6 +453,53 @@ impl AuditFileWriter {
         // 解放失敗は致命的ではない（fd を閉じれば解放される）。結果は書き込みの成否で決める。
         let _ = self.file.unlock();
         result
+    }
+
+    /// 本番の記録経路と同じ手順（排他 `flock` の取得 → 実バイトの書き込み → `sync_data`）が通るかを確かめる
+    /// （起動前の記録経路の確認。SEC-4・REPAIR-5・#2027）。
+    ///
+    /// 別プロセスが `flock` を保持していれば `AUDIT_LOCK_TIMEOUT` で `Lock` になる。追記・永続化できない保存先
+    /// （読み取り専用・満杯〔ENOSPC / EDQUOT〕など）は、**共有ログには一切書かず**、同じディレクトリ(同じ FS)に
+    /// 作った一時ファイルへ 1 バイト書いて `sync_data` することで検出し、`Write` / `Sync` にする。一時ファイルは
+    /// 作成直後・書き込み前に unlink するため、確認の途中で子が SIGKILL されても残骸は残らない。共有ログを巻き戻す
+    /// 必要が無く、`flock` を取らない追尾型の読み手にも確認用のバイトは見えない（SEC-4・REPAIR-5）。
+    pub fn probe_append(&mut self) -> Result<(), AuditWriteError> {
+        self.probe_append_with(&AUDIT_WRITE_QUEUE, AUDIT_LOCK_TIMEOUT)
+    }
+
+    /// [`Self::probe_append`] の本体(順番待ちの列と `flock` の待ち上限を差し替えられる。単体試験が共有の列を塞がないため)。
+    fn probe_append_with(
+        &mut self,
+        queue: &TurnQueue,
+        timeout: Duration,
+    ) -> Result<(), AuditWriteError> {
+        let _turn = self.lock_exclusive(queue, Instant::now() + timeout)?;
+        let result = self.check_fsize_room().and_then(|()| match &self.dir {
+            Some(dir) => probe_scratch_write(dir),
+            None => Err(AuditWriteError::new(AuditWriteErrorKind::Write)),
+        });
+        let _ = self.file.unlock();
+        result
+    }
+
+    /// 既存ログに 1 レコード分の追記余地があるか、継承した `RLIMIT_FSIZE` の soft と照合する
+    /// (一時ファイルの書き込みでは、ログ固有の上限到達を検出できないため。SEC-4・#2027)。読めなければ `Write`。
+    #[cfg(target_os = "linux")]
+    fn check_fsize_room(&self) -> Result<(), AuditWriteError> {
+        let write_err = || AuditWriteError::new(AuditWriteErrorKind::Write);
+        let (soft, _hard) = crate::sys::get_rlimit_self(crate::rlimits::RlimitKind::Fsize)
+            .map_err(|_| write_err())?;
+        let len = self.file.metadata().map_err(|_| write_err())?.len();
+        if fits_fsize_limit(len, soft) {
+            Ok(())
+        } else {
+            Err(write_err())
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn check_fsize_room(&self) -> Result<(), AuditWriteError> {
+        Ok(())
     }
 
     /// プロセス内の順番待ち → `flock` のポーリングの順に、共通の `deadline` までに排他を取る。
@@ -480,6 +554,71 @@ impl AuditFileWriter {
         }
         Ok(())
     }
+}
+
+/// `dir` の信頼検査済み fd 配下に **名前を持たない** 一時ファイル(`O_TMPFILE`)を作り、1 バイトを書いて
+/// `sync_data` する(共有ログに触れない書き込み可能性の確認。[`AuditFileWriter::probe_append`])。
+///
+/// 名前が一度も付かないため、確認の途中で子が SIGKILL されても残骸は残らない(作成と unlink の間の窓が無い)。
+/// `O_TMPFILE` に対応しない FS・カーネル(`EOPNOTSUPP`・`EISDIR`・`EINVAL`)では確認できないとして
+/// `Unsupported` で失敗する(名前付きファイルへ落とすと残骸の窓が戻るため。fail-closed)。
+#[cfg(target_os = "linux")]
+fn probe_scratch_write(dir: &Path) -> Result<(), AuditWriteError> {
+    let mut scratch = open_unnamed_scratch(dir)?;
+    scratch
+        .write_all(b"\n")
+        .map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Write))?;
+    scratch
+        .sync_data()
+        .map_err(|_| AuditWriteError::new(AuditWriteErrorKind::Sync))
+}
+
+/// `dir`(信頼検査つきで辿る)の FS に無名の一時ファイルを作って返す。
+#[cfg(target_os = "linux")]
+fn open_unnamed_scratch(dir: &Path) -> Result<File, AuditWriteError> {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let flag = crate::sys::tmpfile_open_flag()
+        .ok_or_else(|| AuditWriteError::new(AuditWriteErrorKind::Unsupported))?;
+    let parent_fd = open_trusted_parent(dir)?;
+    // 最終要素は検査済みの親ディレクトリ自身(`/proc/self/fd/N` は magic link で、O_NOFOLLOW は付けない。
+    // `O_TMPFILE` は無名ファイルを作るだけで、既存ファイルを開かない)。
+    let via_fd = std::path::PathBuf::from(format!("/proc/self/fd/{}", parent_fd.as_raw_fd()));
+    OpenOptions::new()
+        .write(true)
+        .mode(0o600)
+        .custom_flags(flag)
+        .open(&via_fd)
+        .map_err(|e| {
+            // EOPNOTSUPP(95)・EISDIR(21: O_TMPFILE を知らない古いカーネル)・EINVAL(22)。
+            let unsupported = matches!(e.raw_os_error(), Some(95 | 21 | 22));
+            AuditWriteError::new(if unsupported {
+                AuditWriteErrorKind::Unsupported
+            } else {
+                AuditWriteErrorKind::Write
+            })
+        })
+}
+
+/// 既存ログの長さ `len` に最大 1 レコード(先頭の LF を含む [`AUDIT_LINE_MAX_BYTES`] + 1)を足しても、継承した
+/// ファイルサイズ制限 `soft`(`RLIMIT_FSIZE` の soft。`u64::MAX` は無制限)に収まるか。
+/// 収まらなければ実際の追記は `EFBIG`(または `SIGXFSZ`)になる(SEC-4・#2027)。
+#[cfg(target_os = "linux")]
+fn fits_fsize_limit(len: u64, soft: u64) -> bool {
+    if soft == u64::MAX {
+        return true;
+    }
+    let record = u64::try_from(AUDIT_LINE_MAX_BYTES)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    len.saturating_add(record) <= soft
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_scratch_write(_dir: &Path) -> Result<(), AuditWriteError> {
+    Err(AuditWriteError::new(AuditWriteErrorKind::Unsupported))
 }
 
 /// ファイル末尾が LF で終わっていない（空ファイルは終端済み扱い）か。読めない場合は安全側で `true`。
@@ -611,7 +750,10 @@ fn open_checked(path: &Path) -> Result<AuditFileWriter, AuditWriteError> {
         return Err(AuditWriteError::new(AuditWriteErrorKind::InsecureFile));
     }
     // 末尾が LF でない（torn line）場合の隔離は、書き込みごとにロック下で判定する。
-    Ok(AuditFileWriter { file })
+    Ok(AuditFileWriter {
+        file,
+        dir: Some(parent.to_path_buf()),
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -627,6 +769,18 @@ pub trait AuditFallback {
         record: &AuditRecord,
         primary: &AuditWriteError,
     ) -> Result<(), AuditWriteError>;
+
+    /// [`Self::record_fallback`] の絶対期限つき版(REPAIR-5・SEC-4。`AuditSink::record_until` から呼ぶ)。
+    ///
+    /// 既定は `deadline` を見ずに委譲する。応答を待つ実装は、待ちを `deadline` までに絞るよう上書きすること。
+    fn record_fallback_until(
+        &mut self,
+        record: &AuditRecord,
+        primary: &AuditWriteError,
+        _deadline: std::time::Instant,
+    ) -> Result<(), AuditWriteError> {
+        self.record_fallback(record, primary)
+    }
 }
 
 /// カーネル監査を使わない構成・テスト用の代替経路。常に `FallbackUnavailable`（`Unimplemented`）を返す。
@@ -748,6 +902,145 @@ pub fn write_with_fallback(
 
 #[cfg(test)]
 mod tests {
+    /// SEC-4・#2027: 別の open file description が排他 `flock` を保持していれば `probe_append` は `Lock` で失敗し、
+    /// 解放後は監査ログへ 1 バイトも書かずに成功する(open できるだけでは記録経路の確認にならない)。
+    #[cfg(unix)]
+    #[test]
+    fn sec4_2027_probe_append_fails_while_locked_elsewhere() {
+        let dir = std::env::temp_dir().join(format!("fc-probe-append-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 確認用の一時ファイルは信頼検査済みの親に作る(umask に依らず 0700 にする)。
+        std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .unwrap();
+        let path = dir.join("audit.log");
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        let queue = TurnQueue::new();
+        let holder = file.try_clone().unwrap();
+        // 別の open file description(`open` し直す)で保持する。
+        let other = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        other.lock().unwrap();
+        let mut writer = AuditFileWriter::from_file_unchecked_in(holder, dir.clone());
+        let e = writer
+            .probe_append_with(&queue, Duration::from_millis(200))
+            .unwrap_err();
+        assert_eq!(e.kind(), AuditWriteErrorKind::Lock);
+        drop(other);
+        // 並行する他の試験の fork が fd の複製を持つ間は解放されないため、解放後は長めに待つ。
+        let released = writer.probe_append_with(&queue, Duration::from_secs(5));
+        #[cfg(target_os = "linux")]
+        {
+            released.unwrap();
+        }
+        // Linux 以外では確認用の一時ファイル書き込みを実装しておらず、fail-closed で `Unsupported` を返す。
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(
+                released.unwrap_err().kind(),
+                AuditWriteErrorKind::Unsupported
+            );
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-4・#2027: 継承したファイルサイズ制限に 1 レコード分の余地が無ければ失敗し、あれば(無制限を含め)通る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2027_fsize_limit_is_checked_against_existing_log_length() {
+        let record = AUDIT_LINE_MAX_BYTES as u64 + 1;
+        assert!(fits_fsize_limit(0, u64::MAX));
+        assert!(fits_fsize_limit(u64::MAX - 1, u64::MAX));
+        assert!(fits_fsize_limit(100, 100 + record));
+        assert!(!fits_fsize_limit(101, 100 + record));
+        assert!(!fits_fsize_limit(0, record - 1));
+        assert!(!fits_fsize_limit(u64::MAX, 1 << 40));
+    }
+
+    /// SEC-4・#2027: `probe_append` は実際の `RLIMIT_FSIZE` の soft を読んで照合する(現在値の下で空のログは通る)。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2027_probe_reads_inherited_fsize_limit() {
+        let (soft, _) = crate::sys::get_rlimit_self(crate::rlimits::RlimitKind::Fsize).unwrap();
+        let dir = std::env::temp_dir().join(format!("fc-probe-fsize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut w = AuditFileWriter::open(&dir.join("audit.log")).unwrap();
+        // 現在の制限で、空のログには余地がある(無制限または十分大きい)ことだけを確かめる。
+        assert_eq!(w.check_fsize_room().is_ok(), fits_fsize_limit(0, soft));
+        w.probe_append().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-4・REPAIR-5・#2027: 書き込み確認の一時ファイルは名前を持たない(`O_TMPFILE`)。開いている間もディレクトリには
+    /// 何も現れず、確認の途中で SIGKILL されても残骸の窓が無い。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_repair5_probe_scratch_is_unnamed_while_open() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fc-probe-tmpfile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        match open_unnamed_scratch(&dir) {
+            Ok(mut scratch) => {
+                scratch.write_all(b"\n").unwrap();
+                assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+            }
+            // この FS が O_TMPFILE に対応しない環境では fail-closed の `Unsupported` になる。
+            Err(e) => assert_eq!(e.kind(), AuditWriteErrorKind::Unsupported),
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SEC-4・REPAIR-5・#2027: 確認(`probe_append`)は共有ログを巻き戻さない。確認の前後で長さは変わらず(減らず)、
+    /// 続けて書いた記録は確認の前の末尾にそのまま連なる。同じディレクトリに一時ファイルの残骸も残らない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_repair5_probe_never_rewinds_shared_log() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fc-probe-mono-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = dir.join("audit.log");
+        let mut w = AuditFileWriter::open(&path).unwrap();
+        let r = rec(
+            9,
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
+        );
+        let line_len = encode_json_line(&r).unwrap().len() as u64;
+        w.write_record(&r).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), line_len);
+        w.probe_append().unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), line_len);
+        w.write_record(&r).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), line_len * 2);
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec!["audit.log".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use crate::audit_log::{AuditPath, AuditPid, AuditSyscallArch, AuditSyscallNr, AuditTimestamp};
     use std::time::Duration;
@@ -837,6 +1130,24 @@ mod tests {
         assert_eq!(
             text(&r),
             "{\"event\":\"audit\",\"layer\":\"exit_signal\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":9,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"signal\":31,\"target_pid\":1234,\"container_id\":\"c1\"}\n"
+        );
+    }
+
+    /// SEC-4・#2027: audit_coverage レコードは縮退した層の理由だけを持ち、縮退していない層のキーは出さない。
+    #[test]
+    fn sec4_2027_encode_audit_coverage_has_layer_reasons() {
+        let r = rec(
+            12,
+            AuditEvent::AuditCoverageDegraded {
+                seccomp_kill: None,
+                landlock: Some(crate::audit_log::AuditReason::new(
+                    "landlock_audit_abi_too_old",
+                )),
+            },
+        );
+        assert_eq!(
+            text(&r),
+            "{\"event\":\"audit\",\"layer\":\"audit_coverage\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":12,\"syscall\":null,\"arch\":null,\"path\":null,\"path_truncated\":null,\"path_original_len\":null,\"landlock_reason\":\"landlock_audit_abi_too_old\",\"container_id\":null}\n"
         );
     }
 

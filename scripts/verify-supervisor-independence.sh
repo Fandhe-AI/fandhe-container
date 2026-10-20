@@ -37,10 +37,16 @@
 # 複製の失敗時は 2。複製の前に config.json の root.path を検証し、絶対パス・bundle 外へ出る相対パス・外を指す symlink は
 # 2 で拒否する（cp -a は root.path を書き換えず、全コンテナが元の同じ rootfs を共有してしまうため。書き換えはしない）。reflink 対応の FS では複製どうしがデータブロックを共有しうるが、page cache の共有条件は
 # 実行ごとに異なりうる（メモリ比較の前提として記録する）。
+# 後始末の第 1 段: 既定（--check-restart なし・restart ポリシー no）では、生存している監視プロセス（対象を除く）へ
+# CLI の stop（制御チャネル経由。Linux で結線済み・#2059・#2142）を期限付きで送る。対象は SIGKILL 済みで制御チャネルの
+# 相手がいないため stop を呼ばず、記録した pid での回収に任せる。--check-restart では stop の SIGTERM が restart の対象に
+# なる（SUP-9・#2162 待ち）ため呼ばない。stop は SIGTERM のみ（猶予後の SIGKILL は #1545 で未実装）で、init が SIGTERM を
+# 捨てうるため、以降の同一性照合つき回収を fallback として必ず残す。stop の成否は後始末の成否に影響しない。
+# 計測の起点（対象への SIGKILL）は変えない。CLI の delete は呼ばない（委譲スコープ外では cgroup 検出に失敗する・#2133）。
 # 後始末: 環境変数 FANDHE_BENCH_OWNER に実行ごとの乱数トークンを渡し、/proc/*/environ のトークン一致で孤児化した
 # 子孫も回収する。supervisor は dumpable=0 で environ を読めないため、記録した pid・起動時刻の同一性で追跡して回収する
 # （回収できなければ終了コード 4）。停止は SIGTERM、期限超過で SIGKILL。状態ルート・bundle の複製・FIFO は
-# 本スクリプトが mktemp で作った配下だけを削除する（CLI の delete は呼ばない）。
+# 本スクリプトが mktemp で作った配下だけを削除する。
 # supervisor の標準エラーは一時ファイルへ記録する（実行後に削除する）。
 #
 # 使い方:
@@ -476,7 +482,57 @@ tracked_alive() {
   return 1
 }
 
-# 後始末。子孫を記録 → launcher へ SIGTERM → 期限超過で SIGKILL → トークン一致の所有プロセスと記録済みの
+# CLI の stop を第 1 段にした後始末（CLI-1・SUP-5。#2163）。生存している監視プロセスのうち、対象（SIGKILL 済みで制御
+# チャネルの相手がいない）以外へ `fandhe-container stop <id>` を送り、監視プロセスの終了を待つ。stop は SIGTERM を
+# 渡すだけで猶予後の SIGKILL を持たず（#1545）、PID 1 の init が SIGTERM を捨てる場合もあるため、成否に関わらず
+# 後続の同一性照合つき SIGTERM／SIGKILL を fallback として必ず残す（失敗は後始末の失敗にしない）。--check-restart
+# （--restart always）では stop の SIGTERM が restart の対象になる（SUP-9・#2162 待ち）ため呼ばない。
+# 呼び出しごと・段全体に期限を付ける（REPAIR-5）。各 stop の上限・強制終了猶予・終了待機はすべて段全体 deadline の
+# 残り時間で制限し、段全体（既定 30 秒）を超えない。引数は検証済みの id_prefix と連番から配列で組み、出力は捨てる。
+cli_stop_survivors() {
+  local i call_s stage_s deadline total=0 ok=0 sid rem lim
+  local -a stopped=()
+  [ "$check_restart" -eq 0 ] || return 0
+  call_s=10
+  [ "$timeout_s" -ge "$call_s" ] || call_s="$timeout_s"
+  stage_s=30
+  [ "$timeout_s" -ge "$stage_s" ] || stage_s="$timeout_s"
+  deadline=$((SECONDS + stage_s))
+  for i in "${!pids[@]}"; do
+    [ "$i" != "$target_index" ] || continue
+    same_proc_alive "${pids[$i]}" "${pstart[$i]:-}" "$$" || continue
+    total=$((total + 1))
+    # 残り時間から強制終了猶予（2 秒）と終了待機の最小枠（1 秒）を引いた分を超えない上限で送る。足りなければ送らない。
+    rem=$((deadline - SECONDS - 3))
+    [ "$rem" -ge 1 ] || continue
+    lim="$call_s"
+    [ "$rem" -ge "$lim" ] || lim="$rem"
+    sid="${id_prefix}-${i}"
+    if timeout --kill-after=2 "$lim" "$cli_bin" --root "$state_root" stop "$sid" </dev/null >/dev/null 2>&1; then
+      stopped+=("$i")
+    fi
+  done
+  if [ "${#stopped[@]}" -gt 0 ]; then
+    rem=$((deadline - SECONDS))
+    [ "$rem" -le 10 ] || rem=10
+    [ "$rem" -ge 0 ] || rem=0
+    wait_until "$rem" _stopped_gone "${stopped[@]}" || true
+    for i in "${stopped[@]}"; do
+      if ! same_proc_alive "${pids[$i]}" "${pstart[$i]:-}" "$$"; then ok=$((ok + 1)); fi
+    done
+  fi
+  printf 'info: cli-stop: %d/%d supervisors exited after stop\n' "$ok" "$total" >&2 || true
+}
+# 引数に渡した index の監視プロセスがすべて消えていれば 0。
+_stopped_gone() {
+  local i
+  for i in "$@"; do
+    if same_proc_alive "${pids[$i]}" "${pstart[$i]:-}" "$$"; then return 1; fi
+  done
+  return 0
+}
+
+# 後始末。子孫を記録 → （CLI の stop）→ launcher へ SIGTERM → 期限超過で SIGKILL → トークン一致の所有プロセスと記録済みの
 # コンテナ側プロセス（孤児を含む）を回収し、残存があるか追跡不能（untracked）なら 1 を返す。EXIT trap から必ず呼ぶ。
 cleanup_procs() {
   local i round
@@ -488,6 +544,7 @@ cleanup_procs() {
     sup_report "$i" || true
     if [ -z "${REP_PID[$i]:-}" ] || [ -z "${TRK[${REP_PID[$i]}]:-}" ]; then untracked=1; fi
   done
+  cli_stop_survivors
   for i in "${!pids[@]}"; do sig_same_proc TERM "${pids[$i]}" "${pstart[$i]:-}" "$$"; done
   wait_until 10 _none_alive || true
   for i in "${!pids[@]}"; do sig_same_proc KILL "${pids[$i]}" "${pstart[$i]:-}" "$$"; done
@@ -556,7 +613,7 @@ logdir="$(mktemp -d)" || { err "unsupported-os" "cannot create a temporary direc
 state_root="${logdir}/state"
 work="${logdir}/work"
 mkdir -m 0700 "$state_root" "$work" "${work}/bundles" "${work}/fifos" || { err "unsupported-os" "cannot create a work directory"; exit 3; }
-declare -A REP_PID FDS
+declare -A REP_PID FDS REP_BUF
 
 # --- 起動契約の差し替え点（契約の根拠は冒頭コメント）。起動行・報告行の解釈はこの関数群に閉じる ---
 
@@ -596,10 +653,20 @@ sup_spawn() { # <i>
 # （exit しない。EXIT trap 内の cleanup_procs からも呼ばれるため、後始末を中断させない。終了コードの決定は呼び出し側が
 # 後始末の前に行う）。未到着は 1。
 sup_report() { # <i>
-  local i="$1" line=""
+  local i="$1" chunk="" line="" rc=0
   [ -z "${REP_PID[$i]:-}" ] || return 0
   [ -z "${BADREP[$i]:-}" ] || return 2
-  IFS= read -r -n 640 -t 0.05 -u "${FDS[$i]}" line || true
+  # read -t は期限切れのとき、それまでに読めた途中の文字列を chunk へ返して消費する（終了コード 128 超）。
+  # 読み側は FIFO を 1 バイトずつ読むため、負荷で到着が 50ms を超えて分かれると途中の行を完全な行と誤認する
+  # （pid の途中切れを別 pid として受理し、追跡不能の終了コード 4 になる。#2154・SUP-5・REPAIR-5）。
+  # 改行が来るまで REP_BUF へ継ぎ足し、上限 640 バイトに達したら 1 行として照合する（measure-restart-latency.sh と同じ規則）。
+  IFS= read -r -n 640 -t 0.05 -u "${FDS[$i]}" chunk || rc=$?
+  REP_BUF[$i]="${REP_BUF[$i]:-}${chunk}"
+  if [ "$rc" -gt 128 ] && [ "${#REP_BUF[$i]}" -lt 640 ]; then
+    return 1
+  fi
+  line="${REP_BUF[$i]}"
+  REP_BUF[$i]=""
   [ -n "$line" ] || return 1
   if [[ "$line" =~ ^FCSUP1\ OK\ ([1-9][0-9]{0,9})$ ]]; then
     REP_PID[$i]="${BASH_REMATCH[1]}"

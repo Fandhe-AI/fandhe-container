@@ -1,7 +1,8 @@
 //! 起動レイテンシベンチの引数解析（TASK-190・REPAIR-5・REPAIR-8）。
 //!
-//! 引数なし（`--bench` は cargo が付けるので無視）は何も起動しないスモーク。計測には `--supervisor-bin`（絶対パス）が
-//! 必須で、`PATH` からは探さない（信頼できない実行ファイルを起動しないため）。
+//! 引数なし（`--bench` は cargo が付けるので無視）は何も起動しないスモーク。計測には `--supervisor-bin` と
+//! `--cli-bin`（どちらも絶対パス）が必須で、`PATH` からは探さない（信頼できない実行ファイルを起動しないため）。
+//! `--cli-bin` は後始末の `delete`（OCI-6・#2157）だけに使い、計測区間の起動経路には入らない。
 
 use super::StartupLatencyError;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,8 @@ pub struct Plan {
     pub warmup: u32,
     pub timeout_secs: u64,
     pub supervisor_bin: PathBuf,
+    /// 後始末の `delete` を呼ぶ CLI の実バイナリ（`fandhe-container`。計測区間の外でだけ使う。OCI-6）。
+    pub cli_bin: PathBuf,
     pub systemd_run: PathBuf,
     pub work_dir: Option<PathBuf>,
     pub output: Option<PathBuf>,
@@ -110,6 +113,7 @@ pub fn parse_args(args: &[String]) -> Result<Command, StartupLatencyError> {
     let mut warmup = None;
     let mut timeout_secs = None;
     let mut supervisor_bin = None;
+    let mut cli_bin = None;
     let mut systemd_run = None;
     let mut work_dir = None;
     let mut output = None;
@@ -161,6 +165,12 @@ pub fn parse_args(args: &[String]) -> Result<Command, StartupLatencyError> {
                     return Err(dup());
                 }
             }
+            "--cli-bin" => {
+                let v = absolute("--cli-bin", value()?)?;
+                if cli_bin.replace(v).is_some() {
+                    return Err(dup());
+                }
+            }
             "--systemd-run" => {
                 let v = absolute("--systemd-run", value()?)?;
                 if systemd_run.replace(v).is_some() {
@@ -187,9 +197,9 @@ pub fn parse_args(args: &[String]) -> Result<Command, StartupLatencyError> {
     }
     if scope_only {
         // 診断は supervisor も作業ディレクトリも使わない。指定は取り違えなので拒否する。
-        if supervisor_bin.is_some() || work_dir.is_some() {
+        if supervisor_bin.is_some() || cli_bin.is_some() || work_dir.is_some() {
             return Err(bad(
-                "--scope-only does not accept --supervisor-bin or --work-dir",
+                "--scope-only does not accept --supervisor-bin, --cli-bin or --work-dir",
             ));
         }
         return Ok(Command::ScopeOnly(ScopePlan {
@@ -201,11 +211,13 @@ pub fn parse_args(args: &[String]) -> Result<Command, StartupLatencyError> {
         }));
     }
     let supervisor_bin = supervisor_bin.ok_or_else(|| bad("--supervisor-bin is required"))?;
+    let cli_bin = cli_bin.ok_or_else(|| bad("--cli-bin is required"))?;
     Ok(Command::Measure(Plan {
         trials: trials.unwrap_or(DEFAULT_TRIALS),
         warmup: warmup.unwrap_or(DEFAULT_WARMUP),
         timeout_secs: timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
         supervisor_bin,
+        cli_bin,
         systemd_run: systemd_run.unwrap_or_else(|| PathBuf::from(DEFAULT_SYSTEMD_RUN)),
         work_dir,
         output,
@@ -276,6 +288,10 @@ mod tests {
             code(&["--scope-only", "--supervisor-bin", "/opt/sup"]),
             "invalid-args"
         );
+        assert_eq!(
+            code(&["--scope-only", "--cli-bin", "/opt/cli"]),
+            "invalid-args"
+        );
         assert_eq!(code(&["--scope-only", "--work-dir", "/w"]), "invalid-args");
         assert_eq!(code(&["--scope-only", "--scope-only"]), "invalid-args");
     }
@@ -283,7 +299,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn defaults_are_applied() {
-        let got = parse_args(&a(&["--bench", "--supervisor-bin", "/opt/sup"])).expect("plan");
+        let got = parse_args(&a(&[
+            "--bench",
+            "--supervisor-bin",
+            "/opt/sup",
+            "--cli-bin",
+            "/opt/cli",
+        ]))
+        .expect("plan");
         assert_eq!(
             got,
             Command::Measure(Plan {
@@ -291,6 +314,7 @@ mod tests {
                 warmup: 3,
                 timeout_secs: 1800,
                 supervisor_bin: PathBuf::from("/opt/sup"),
+                cli_bin: PathBuf::from("/opt/cli"),
                 systemd_run: PathBuf::from("/usr/bin/systemd-run"),
                 work_dir: None,
                 output: None,
@@ -304,6 +328,8 @@ mod tests {
         let got = parse_args(&a(&[
             "--supervisor-bin",
             "/opt/sup",
+            "--cli-bin",
+            "/opt/cli",
             "--trials",
             "20",
             "--warmup",
@@ -345,7 +371,13 @@ mod tests {
             code(&["--supervisor-bin", "/a", "--supervisor-bin", "/b"]),
             "invalid-args"
         );
-        // 計測には --supervisor-bin が必須（PATH からは探さない）。
+        // 計測には --supervisor-bin と --cli-bin が必須（PATH からは探さない。OCI-6）。
         assert_eq!(code(&["--trials", "20"]), "invalid-args");
+        assert_eq!(code(&["--supervisor-bin", "/opt/sup"]), "invalid-args");
+        assert_eq!(code(&["--cli-bin", "rel/cli"]), "invalid-args");
+        assert_eq!(
+            code(&["--cli-bin", "/a", "--cli-bin", "/b"]),
+            "invalid-args"
+        );
     }
 }

@@ -79,6 +79,17 @@ pub(crate) fn deliver(
     container: Option<&ContainerId>,
     sink: &dyn AuditSink,
 ) -> AuditDelivery {
+    deliver_until(event, container, sink, None)
+}
+
+/// [`deliver`] に絶対期限を付けた版。`deadline` が `Some` なら `AuditSink::record_until` で待ちを期限へ絞る
+/// (入口の単一期限から待ちを導く launch 用。REPAIR-5・SEC-4)。
+pub(crate) fn deliver_until(
+    event: AuditEvent,
+    container: Option<&ContainerId>,
+    sink: &dyn AuditSink,
+    deadline: Option<std::time::Instant>,
+) -> AuditDelivery {
     let timestamp = match AuditTimestamp::now() {
         Ok(t) => t,
         Err(e) => return AuditDelivery::RecordUnavailable(e),
@@ -91,7 +102,11 @@ pub(crate) fn deliver(
     if let Some(id) = container {
         record = record.with_container_id(id.clone());
     }
-    match sink.record(&record) {
+    let result = match deadline {
+        Some(deadline) => sink.record_until(&record, deadline),
+        None => sink.record(&record),
+    };
+    match result {
         Ok(()) => AuditDelivery::Recorded,
         Err(e) => AuditDelivery::SinkFailed(e),
     }

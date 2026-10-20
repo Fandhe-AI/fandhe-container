@@ -58,6 +58,10 @@ pub enum OciOpKind {
     PruneImages,
     /// `image tag` のタグ登録（TASK-183.4・OCI-7）。
     TagImage,
+    /// 削除ジャーナルが残っていたときの再試行（ロールフォワード。TASK-183.11.1・OCI-7・#851）。
+    RecoverPendingDeletion,
+    /// クラッシュで残った pull のリース・ステージングの回収 GC（走査・リース解放・削除の全体。一部の削除失敗は失敗として記録する。TASK-183.11.2・OCI-7・#852）。
+    RecoverStalePulls,
 }
 
 impl OciOpKind {
@@ -84,6 +88,8 @@ impl OciOpKind {
             OciOpKind::AbortPull => "oci.pull.abort",
             OciOpKind::PruneImages => "oci.image.prune",
             OciOpKind::TagImage => "oci.image.tag",
+            OciOpKind::RecoverPendingDeletion => "oci.image.gc_recover",
+            OciOpKind::RecoverStalePulls => "oci.pull.gc_recover",
         }
     }
 }

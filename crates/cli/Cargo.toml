@@ -33,7 +33,7 @@ fandhe-container-oci = { path = "../oci" }
 # 原子変数へ store するだけ）の登録と読み出し（`signals::install_recording_handler_for_test`・
 # `signals::recorded_signal_for_test`）と、継承した SIG_IGN を上書きする記録ハンドラの登録・fork した子でシグナルを
 # 受ける入口（`signals::install_recording_handler_overriding_ignore_for_test`・`signals::fork_and_raise_for_test`。
-# #1605）を公開する（#1513・PLUG-7・PR #1572 事後監査の P2）。既定のビルドには
+# #1605）と、環境変数 `FANDHE_CONTAINER_TEST_SIGNAL_INSTALL_FAILURE` による登録失敗の注入（#1778）を公開する（#1513・PLUG-7・PR #1572 事後監査の P2）。既定のビルドには
 # 含めない。リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。依存は増えない。
 [features]
 signal-test-support = []
@@ -48,6 +48,11 @@ start-test-support = []
 # 解決しないため、feature は無効のまま。
 [dev-dependencies]
 fandhe-container-cli = { path = ".", features = ["signal-test-support", "start-test-support"] }
+
+# `sys.rs` の自前 FFI 宣言を libc と照合する試験専用の依存（#1838・#1318・MVM-4・REPAIR-12）。製品の依存には入れない
+# （cargo tree -e normal,build に現れない）。`sys.rs` は `cfg(unix)` のため unix に限る。方式は docs/design/ffi-libc-check.md。
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
 
 # workspace の lint 設定を継承する（ルート Cargo.toml の [workspace.lints]。#1138）。
 [lints]

@@ -132,7 +132,7 @@ pub(crate) fn apply_default_seccomp_with_listener_threads(
     sender: ListenerSender,
     threads: &mut ThreadCountSource,
 ) -> Result<SeccompReport, ExecError> {
-    let program = match build_default_program() {
+    let program = match build_default_program_with(sender.delivery()) {
         Ok(p) => p,
         Err(e) => {
             sender.report_failure(&e);
@@ -170,7 +170,14 @@ pub(crate) fn apply_default_seccomp_with(
 
 /// ビルド対象アーキの既定 deny フィルタを構築する（構築失敗は段 `Seccomp` の `ExecError`）。
 fn build_default_program() -> Result<SeccompProgram, ExecError> {
-    crate::seccomp::build_filter_for_target_arch().map_err(|e| {
+    build_default_program_with(crate::seccomp::ErrnoDelivery::Errno)
+}
+
+/// [`build_default_program`] の届け方指定版(listener 付きの適用だけが `UserNotif` を指定し得る。SEC-4・#2025)。
+fn build_default_program_with(
+    delivery: crate::seccomp::ErrnoDelivery,
+) -> Result<SeccompProgram, ExecError> {
+    crate::seccomp::build_filter_for_target_arch_with(delivery).map_err(|e| {
         let code = match e {
             crate::seccomp::SeccompBuildError::UnsupportedArch => ErrorCode::Unimplemented,
             _ => ErrorCode::Internal,

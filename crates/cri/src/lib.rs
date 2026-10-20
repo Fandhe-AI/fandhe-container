@@ -26,7 +26,7 @@ pub mod runtime {
     ///
     /// `build.rs` が無改変の `proto/api.proto` から生成した `OUT_DIR/runtime.v1.rs` を取り込む。
     /// proto 由来の doc コメントが rustdoc / clippy の lint に触れるため、この生成コードに限り該当 lint を許可する
-    /// （crate 全体へは広げない）。後続の TASK-57 以降と `fandhe-container-plugin-cri`（TASK-108）が使う。
+    /// （crate 全体へは広げない）。後続の TASK-57 以降と `fandhe-container-plugin-cri`（TASK-108。組み立て口は `adapter`・TASK-114.2）が使う。
     #[allow(
         clippy::doc_overindented_list_items,
         clippy::doc_lazy_continuation,

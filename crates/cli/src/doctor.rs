@@ -12,7 +12,8 @@
 //! # CORE-3 の前提の診断（#2133）
 //!
 //! NET-10 の診断に続けて、`start` が必要とする `systemd-run` の有無・信頼と systemd の user マネージャへの到達を
-//! 検査する（`user_scope_check`。CORE-3・CORE-4）。終了ステータスは 2 つの結果の合成で、Warning（3）が 1 件でもあれば 3、
+//! 検査する（`user_scope_check`。CORE-3・CORE-4）。user マネージャのソケットへは期限つきで実際に接続して死んだソケットを見分け、
+//! CLI 自身の cgroup の委譲は `delete` と同じ `DelegatedCgroup::detect()` で検査する（#2158）。終了ステータスは 2 つの結果の合成で、Warning（3）が 1 件でもあれば 3、
 //! そうでなく判定不能（4）があれば 4、それ以外は 0。
 //!
 //! # 確認方法

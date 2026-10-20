@@ -243,8 +243,8 @@ pub use process::{StandardFd, close_standard_fds_for_test};
 #[doc(hidden)]
 pub use process::{
     spawn_container_probe, spawn_container_probe_with_config_paths,
-    spawn_container_probe_with_devices, spawn_container_probe_with_sysfs,
-    spawn_container_probe_with_tmpfs_and_config_paths,
+    spawn_container_probe_with_devices, spawn_container_probe_with_seccomp_listener,
+    spawn_container_probe_with_sysfs, spawn_container_probe_with_tmpfs_and_config_paths,
 };
 /// supervisor の結合試験 `tests/exec_audit.rs` 専用の再公開（SEC-4・SEC-1・#1614 の事後監査。通常の利用者は
 /// 呼ばない。詳細は定義側）。`exec-test-support` feature を付けたビルドにだけ存在する。
@@ -288,7 +288,11 @@ pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub use seccomp::{probe_denied_syscalls_for_test, probe_kcmp_self_for_test};
-pub use seccomp_listener::SeccompListener;
+pub use seccomp_listener::{
+    DenyOutcome, ListenerReadiness, NotificationId, SeccompListener, SeccompNotification,
+};
+#[cfg(feature = "exec-test-support")]
+pub use seccomp_listener::{UserNotifProbe, kcmp_self_errno_for_test, user_notif_probe_for_test};
 pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 pub use subreaper::ChildSubreaper;

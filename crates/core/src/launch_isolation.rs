@@ -33,6 +33,7 @@
 
 use std::fmt;
 
+use crate::audit_log::{AuditCoverage, AuditCoveragePolicy};
 use crate::dev_mounts::{IMPLICIT_DEV_MOUNT_COUNT, ImplicitDevMount};
 use crate::oci_runtime::{CONFIG_MAX_MOUNTS, MountDestination};
 
@@ -279,6 +280,25 @@ impl fmt::Debug for RecordedLandlock {
     }
 }
 
+/// launch が評価した監査の網羅の記録（SEC-4・#2027。OS 非依存の語彙）。
+///
+/// 方針と、カーネル監査頼みの 2 層の状態を残す。`inspect` の `auditCoverage` と `state.json` の
+/// `launchIsolation.auditCoverage` の元になる。`Requested` は「要求した」だけで「記録された」ではない
+/// （`audit_log::coverage` の契約）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecordedAuditCoverage {
+    /// 記録が無い（このフィールドが入る前の `state.json`）。欠落を「網羅している」と解釈しない。
+    NotRecorded,
+    /// launch が評価した結果。
+    Evaluated {
+        /// 評価時の方針。
+        policy: AuditCoveragePolicy,
+        /// 2 層の状態。
+        coverage: AuditCoverage,
+    },
+}
+
 /// launch 時の分離の記録（コンテナの `/` の同一性 + 適用した Landlock）。
 ///
 /// 1 つの値にして「記録がある」ことを一体で判定できるようにする（片方だけの記録を表現できない）。
@@ -286,12 +306,33 @@ impl fmt::Debug for RecordedLandlock {
 pub struct LaunchIsolationRecord {
     root: RootIdentity,
     landlock: RecordedLandlock,
+    audit_coverage: RecordedAuditCoverage,
 }
 
 impl LaunchIsolationRecord {
     /// 検証済みの部品から作る。
     pub fn from_parts(root: RootIdentity, landlock: RecordedLandlock) -> Self {
-        Self { root, landlock }
+        Self {
+            root,
+            landlock,
+            audit_coverage: RecordedAuditCoverage::NotRecorded,
+        }
+    }
+
+    /// 監査の網羅の評価結果を添える（SEC-4・#2027）。添えなければ [`RecordedAuditCoverage::NotRecorded`]。
+    #[must_use]
+    pub fn with_audit_coverage(
+        mut self,
+        policy: AuditCoveragePolicy,
+        coverage: AuditCoverage,
+    ) -> Self {
+        self.audit_coverage = RecordedAuditCoverage::Evaluated { policy, coverage };
+        self
+    }
+
+    /// 監査の網羅の記録。
+    pub fn audit_coverage(&self) -> RecordedAuditCoverage {
+        self.audit_coverage
     }
 
     /// launch 時の pivot 後の `/` の識別子。
@@ -324,6 +365,18 @@ mod linux {
         AccessFs, LandlockAuditMode, LandlockRuleset, PathRule, RuleOrigin, RulePath,
     };
 
+    impl From<LandlockAuditMode> for RecordedLandlockAudit {
+        /// 実行時のモードを OS 非依存の記録の語彙へ写す（launcher と supervisor 手順 4 の前倒し判定が共有する。#2027）。
+        fn from(mode: LandlockAuditMode) -> Self {
+            match mode {
+                LandlockAuditMode::KernelAuditRequested => Self::KernelAuditRequested,
+                LandlockAuditMode::Unavailable { detected, .. } => Self::Unavailable {
+                    detected_abi: detected,
+                },
+            }
+        }
+    }
+
     impl LaunchIsolationRecord {
         /// launch が適用する `ruleset` と、launch 後の `/` の識別子から記録を作る。
         ///
@@ -338,16 +391,7 @@ mod linux {
                 .iter()
                 .map(recorded_rule)
                 .collect::<Result<Vec<_>, _>>()?;
-            let audit = match ruleset.audit_mode() {
-                LandlockAuditMode::KernelAuditRequested => {
-                    RecordedLandlockAudit::KernelAuditRequested
-                }
-                LandlockAuditMode::Unavailable { detected, .. } => {
-                    RecordedLandlockAudit::Unavailable {
-                        detected_abi: detected,
-                    }
-                }
-            };
+            let audit = RecordedLandlockAudit::from(ruleset.audit_mode());
             let landlock = RecordedLandlock::new(ruleset.handled_access_fs().bits(), rules)?
                 .with_audit(audit)?;
             Ok(Self::from_parts(root, landlock))

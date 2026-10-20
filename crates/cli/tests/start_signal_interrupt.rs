@@ -19,7 +19,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// スタブの pid ファイルが現れるまで・CLI の終了を待つ上限（REPAIR-5。CLI の受信期限 36 秒より十分短い）。
+/// スタブの pid ファイルが現れるまで・CLI の終了を待つ上限（REPAIR-5。CLI の受信期限 58.9 秒より十分短い）。
 const STUB_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const CLI_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL: Duration = Duration::from_millis(10);

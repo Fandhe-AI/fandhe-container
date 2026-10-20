@@ -4,7 +4,7 @@
 //! `harness = false` の単一 `main` で、同じ実行ファイルが 2 つの役を持つ。
 //! - 親（既定）: `-- --ignored` のときだけ実機シナリオを動かす（それ以外は案内を出して成功。既定のテスト集合に
 //!   実機前提を混ぜないため）。
-//! - コンテナ内のプローブ（`--container-probe`）: `READY` を 1 行出し、約 2 秒待って終了コード 7 で終わる。
+//! - コンテナ内のプローブ（`--container-probe`）: 禁止 syscall（`kcmp`）を 1 回呼んで `KCMP_ERRNO=<errno>` と `READY` を出し、約 2 秒待って終了コード 7 で終わる。
 //!
 //! # 照合項目
 //! - シナリオ A の起動直後、PID 1 の `uid_map`・`gid_map` が選択規則（subuid / subgid の自分の行が両方あれば範囲写像、
@@ -12,7 +12,10 @@
 //!   `FANDHE_CONTAINER_TEST_ID_HELPER=1` では範囲写像を必須にする（設定・`uidmap` が無ければ失敗）
 //! - シナリオ A（正常起動 → 監視 → 記録）: bin が `FCSUP1 OK <pid>` を報告し、状態が Running（pid 一致）で、ホストの
 //!   `/proc/<pid>/status` の `NSpid` 末尾が 1。プローブの終了を `monitor` が回収して状態が Stopped（終了コード 7）に
-//!   なり、bin が終了コード 0 で終わり、`/proc/<pid>` が消え、コンテナの出力（`READY`）がログ sink のファイルに残る
+//!   なり、bin が終了コード 0 で終わり、`/proc/<pid>` が消え、コンテナの出力（`READY`）がログ sink のファイルに残る。
+//!   あわせて seccomp の通知経路を照合する（SEC-4・REPAIR-5・#2025）: プローブが呼んだ `kcmp` が `EPERM`（ログ sink の
+//!   `KCMP_ERRNO=1`）で返り、`<状態ルート>/@audit.log` に seccomp 層の行がちょうど 1 行（syscall 番号・arch・pid=1・コンテナ ID）
+//!   届く。成功行の前に `seccomp denial returned EPERM and left exactly 1 record in @audit.log` を出す
 //! - シナリオ B（起動失敗で何も残らない。A6）: rootfs から `proc/` を除いて pre-pivot 段で失敗させ、報告が ERR・bin の
 //!   終了コードが非 0・状態が Created（pid なし）・作った cgroup が消え・プローブのプロセスが残らないことを照合する
 //! - シナリオ C（restart の fail-closed。SUP-3・#2043）: `--restart always` でプローブが終了した後、再 launch は
@@ -41,7 +44,7 @@
 //! ```
 //!
 //! 成功時の最終行: `supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped(7), logs
-//! captured; failed start left no process; restart fails closed until #2043`。
+//! captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043`。
 //! 実行と結果の記録は人間担当（#499・#485・#491・#219 のうち該当するもの、または PR）。Linux 限定。
 
 #[cfg(not(target_os = "linux"))]
@@ -119,6 +122,10 @@ mod linux {
     /// コンテナ内で動くプローブ。`READY` を出して一定時間待ち、`PROBE_EXIT` で終わる。
     pub fn probe() {
         let mut out = std::io::stdout();
+        // ERRNO 側の禁止 syscall(kcmp)を 1 回呼ぶ。本番の launcher は USER_NOTIF 版の filter を載せ、supervisor の応答ハブが
+        // 記録して EPERM(1) で応答する(SEC-4・#2025)。出力はログ sink に捕捉され、親が errno を照合する。
+        let errno = fandhe_container_core::exec::kcmp_self_errno_for_test();
+        let _ = writeln!(out, "KCMP_ERRNO={}", errno.unwrap_or(0));
         let _ = writeln!(out, "READY");
         let _ = out.flush();
         std::thread::sleep(PROBE_LIFETIME);
@@ -423,7 +430,7 @@ mod linux {
         scenario_b_failed_start_leaves_nothing();
         scenario_c_restart_fails_closed();
         println!(
-            "supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped({PROBE_EXIT}), logs captured; failed start left no process; restart fails closed until #2043"
+            "supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped({PROBE_EXIT}), logs captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043"
         );
     }
 
@@ -545,7 +552,7 @@ mod linux {
         );
         assert!(no_probe_remains(), "no probe process may remain");
         // コンテナの出力が捕捉されてログ sink のファイルに残る（SUP-7）。
-        let logs = env.root().join("logs");
+        let logs = fandhe_container_supervisor::logs::container_log_dir(&env.root());
         let captured = std::fs::read_dir(&logs)
             .expect("log directory")
             .flatten()
@@ -555,7 +562,53 @@ mod linux {
                     .is_ok_and(|t| t.lines().any(|l| l.contains("READY")))
             });
         assert!(captured, "READY must be captured in the log sink");
+        verify_seccomp_audit(&env, &id);
         println!("supervisor_bin_real: scenario=A ok pid={pid} nspid={nspid:?}");
+    }
+
+    /// seccomp の拒否の end-to-end(SEC-4・REPAIR-5・#2025): プローブが呼んだ `kcmp` が EPERM(1) で返り(ログ sink の
+    /// `KCMP_ERRNO=1`)、`<状態ルート>/@audit.log` に seccomp 層の行がちょうど 1 行(コンテナ ID つき・pid はコンテナ内の 1)
+    /// 届くことを具体値で照合する。
+    fn verify_seccomp_audit(env: &Env, id: &str) {
+        let logs = fandhe_container_supervisor::logs::container_log_dir(&env.root());
+        let denied = std::fs::read_dir(&logs)
+            .expect("log directory")
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(id))
+            .any(|e| {
+                std::fs::read_to_string(e.path())
+                    .is_ok_and(|t| t.lines().any(|l| l.contains("KCMP_ERRNO=1")))
+            });
+        assert!(
+            denied,
+            "the denied kcmp must return EPERM (KCMP_ERRNO=1 in the log sink)"
+        );
+        let audit = std::fs::read_to_string(env.root().join("@audit.log")).unwrap_or_default();
+        let lines: Vec<&str> = audit
+            .lines()
+            .filter(|l| l.contains("\"layer\":\"seccomp\""))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one seccomp record expected: {audit:?}"
+        );
+        let line = lines.first().copied().unwrap_or_default();
+        #[cfg(target_arch = "x86_64")]
+        let (nr, arch) = (312u32, 0xC000_003Eu32);
+        #[cfg(target_arch = "aarch64")]
+        let (nr, arch) = (272u32, 0xC000_00B7u32);
+        for needle in [
+            format!("\"syscall\":{nr}"),
+            format!("\"arch\":{arch}"),
+            "\"pid\":1,".to_string(),
+            format!("\"container_id\":\"{id}\""),
+        ] {
+            assert!(line.contains(&needle), "{needle} missing: {line}");
+        }
+        println!(
+            "supervisor_bin_real: seccomp denial returned EPERM and left exactly 1 record in @audit.log"
+        );
     }
 
     /// シナリオ B: pre-pivot 段の失敗で、子を残さず、Created のまま、作った cgroup を消す。

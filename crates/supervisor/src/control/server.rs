@@ -1,4 +1,4 @@
-//! 制御チャネルのサーバ（Linux。SUP-1・SEC-1・REPAIR-2・REPAIR-5・#2058）。
+//! 制御チャネルのサーバ（Linux。SUP-1・SUP-9・SEC-1・REPAIR-2・REPAIR-5・#2058・#2162）。
 //!
 //! supervisor がコンテナの起動ハンドルを持っている間だけ、別スレッドで accept し、1 接続 1 要求を直列に処理する
 //! （資源の使用量を固定に抑える）。要求は [`super::protocol`] の固定長 frame で、シグナルの送信は
@@ -8,7 +8,7 @@
 //!
 //! - accept の直後に `SO_PEERCRED` で接続元の uid を取り、実効 uid と違えば何も書かずに切断する
 //!   （多層防御。ソケットは 0600・0700 の `<id>/` の中にあり、別 uid は通常 connect 自体ができない）。
-//! - 要求は 17 バイト固定で、ヘッダの payload_len が上限（64）を超えれば payload を読まずに拒否する。
+//! - 要求（SignalRequest・StopRequest）は 21 バイト固定で、ヘッダの payload_len が上限（64）を超えれば payload を読まずに拒否する。
 //! - 読み取りは絶対期限（[`ServeConfig::read_deadline`]）、返信待ちは送信期限 + 猶予、書き込みは
 //!   [`ServeConfig::write_timeout`] で打ち切る（REPAIR-5）。
 //! - 拒否は固定語彙の構造化ログ（理由名のみ。入力値・uid・パス・errno は出さない）。応答は理由コードだけ。
@@ -159,15 +159,15 @@ fn handle_request(
     if read_exact_until(&mut stream, &mut header, read_deadline).is_err() {
         return respond(&mut stream, ControlReason::Malformed);
     }
-    let parsed = FrameHeader::decode(&header).and_then(|h| h.expect_signal_request().map(|()| h));
-    if let Err(reason) = parsed {
-        return respond(&mut stream, reason);
-    }
+    let kind = match FrameHeader::decode(&header).and_then(FrameHeader::expect_request) {
+        Ok(kind) => kind,
+        Err(reason) => return respond(&mut stream, reason),
+    };
     let mut payload = [0u8; SIGNAL_REQUEST_PAYLOAD_LEN];
     if read_exact_until(&mut stream, &mut payload, read_deadline).is_err() {
         return respond(&mut stream, ControlReason::Malformed);
     }
-    let request = match SignalRequestFrame::decode_payload(&payload) {
+    let request = match SignalRequestFrame::decode_payload(kind, &payload) {
         Ok(r) => r,
         Err(reason) => return respond(&mut stream, reason),
     };
@@ -184,7 +184,7 @@ fn handle_request(
         Err(reason) => return respond(&mut stream, reason),
     };
     let deadline = base + remaining;
-    let reason = match slot.submit(request.pid, request.signal, deadline) {
+    let reason = match slot.submit(request.kind, request.pid, request.signal, deadline) {
         Ok(rx) => wait_reply(&rx, deadline, config.reply_grace),
         Err(reason) => reason,
     };

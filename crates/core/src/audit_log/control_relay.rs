@@ -1,4 +1,4 @@
-//! 複数スレッドのプロセスから制御チャネルの拒否を期限付きで永続化する中継（Linux。SEC-4・REPAIR-5・SUP-1・SEC-1・#2058）。
+//! 複数スレッドのプロセスから制御チャネルの拒否と seccomp の拒否を期限付きで永続化する中継（Linux。SEC-4・REPAIR-5・SUP-1・SEC-1・#2058）。
 //!
 //! # 役割
 //!
@@ -13,8 +13,10 @@
 //!
 //! - 構築（[`ControlAuditRelay::spawn`]）は呼び出しプロセスが単一スレッドのときだけ成功する（`FailedPrecondition`）。
 //!   制御チャネルの listener を bind する前に呼ぶこと（helper は fd 3 以上を閉じるため listener を持たない）
-//! - 運べるのは [`AuditEvent::ControlPeer`] の記録だけ（他の層は `InvalidArgument`）。時刻・PID・コンテナ ID・理由トークンを
-//!   固定の枠で送り、helper が [`AuditRecord`] を組み直す（生のバイト列を記録として扱わない。REPAIR-2）
+//! - 運べるのは [`AuditEvent::ControlPeer`] と [`AuditEvent::Seccomp`] の記録だけ（他の層は `InvalidArgument`）。時刻・PID・
+//!   コンテナ ID・理由トークン（seccomp は種別トークンと syscall 番号・arch）を固定の枠で送り、helper が [`AuditRecord`] を
+//!   組み直す（生のバイト列を記録として扱わない。REPAIR-2）。seccomp の記録は supervisor の seccomp 通知ループ
+//!   （`record_seccomp_denial_for` 経由。SEC-4・REPAIR-5・#2025）が書く
 //! - `record` は helper の応答を [`RECORD_WAIT_LIMIT`] まで待つ（helper の sink の最悪待ち時間と同じ）。応答が無ければ
 //!   helper を SIGKILL して以後の `record` を `Unavailable` で拒否する（ずれた応答を次の要求へ取り違えない。fail-closed）。
 //!   拒否の判定自体は呼び出し側で既に確定しており、本中継の失敗は判定を覆さない
@@ -34,8 +36,8 @@ use crate::sys;
 use crate::traits::{ContainerId, ErrorCode, TraitError};
 
 use super::{
-    AuditEvent, AuditPid, AuditRecord, AuditSink, AuditTimestamp, ControlPeerRejection,
-    FileAuditSink, RECORD_WAIT_LIMIT,
+    AuditEvent, AuditPid, AuditRecord, AuditSink, AuditSyscallArch, AuditSyscallNr, AuditTimestamp,
+    ControlPeerRejection, FileAuditSink, RECORD_WAIT_LIMIT,
 };
 
 /// 枠の固定部: 理由 1・秒 8・ナノ秒 4・PID 4・コンテナ ID 長 1。
@@ -49,6 +51,13 @@ const CLOSE_FDS_FAILED_EXIT: i32 = 3;
 /// 回収待ちの上限（drop 時）。
 const REAP_WAIT: Duration = Duration::from_secs(1);
 
+/// seccomp の記録を示す先頭バイト（`REJECTIONS` の添字と重ならない値）。コンテナ ID の後に syscall 番号（u32）と arch（u32）が付く。
+const TAG_SECCOMP: u8 = 0x80;
+/// 記録先の確認要求を示す先頭バイト（本体は固定部だけ。何も書かず、helper の sink が保存先を開けるかだけを確かめる）。
+const TAG_PROBE: u8 = 0x81;
+/// seccomp の枠だけが持つ追加部（番号 4・arch 4）。
+const SECCOMP_EXTRA_LEN: usize = 8;
+
 /// 運べる拒否理由（枠の先頭バイトが添字）。
 const REJECTIONS: [ControlPeerRejection; 2] = [
     ControlPeerRejection::PeerUidMismatch,
@@ -61,21 +70,27 @@ fn err(code: ErrorCode, message: &'static str) -> TraitError {
 
 /// 記録を枠へ符号化する。`ControlPeer` 以外・長すぎるコンテナ ID は拒否する。
 fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
-    let AuditEvent::ControlPeer { reason } = record.event() else {
-        return Err(err(
-            ErrorCode::InvalidArgument,
-            "the audit relay only carries control channel records",
-        ));
-    };
-    let Some(tag) = REJECTIONS
-        .iter()
-        .position(|r| r.as_str() == reason.as_str())
-        .and_then(|i| u8::try_from(i).ok())
-    else {
-        return Err(err(
-            ErrorCode::InvalidArgument,
-            "the audit relay does not know this rejection reason",
-        ));
+    let (tag, extra) = match record.event() {
+        AuditEvent::ControlPeer { reason } => {
+            let Some(tag) = REJECTIONS
+                .iter()
+                .position(|r| r.as_str() == reason.as_str())
+                .and_then(|i| u8::try_from(i).ok())
+            else {
+                return Err(err(
+                    ErrorCode::InvalidArgument,
+                    "the audit relay does not know this rejection reason",
+                ));
+            };
+            (tag, None)
+        }
+        AuditEvent::Seccomp { syscall, arch } => (TAG_SECCOMP, Some((syscall.get(), arch.get()))),
+        _ => {
+            return Err(err(
+                ErrorCode::InvalidArgument,
+                "the audit relay only carries control channel and seccomp records",
+            ));
+        }
     };
     let id = record.container_id().map_or("", ContainerId::as_str);
     let Ok(id_len) = u8::try_from(id.len()) else {
@@ -92,6 +107,10 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
     frame.extend_from_slice(&record.pid().get().to_be_bytes());
     frame.push(id_len);
     frame.extend_from_slice(id.as_bytes());
+    if let Some((nr, arch)) = extra {
+        frame.extend_from_slice(&nr.to_be_bytes());
+        frame.extend_from_slice(&arch.to_be_bytes());
+    }
     Ok(frame)
 }
 
@@ -102,14 +121,34 @@ fn decode(frame: &[u8]) -> Option<AuditRecord> {
     let nanos = u32::from_be_bytes(frame.get(9..13)?.try_into().ok()?);
     let pid = u32::from_be_bytes(frame.get(13..17)?.try_into().ok()?);
     let id_len = usize::from(*frame.get(17)?);
-    let id = frame.get(FIXED_LEN..)?;
-    if id.len() != id_len || nanos >= 1_000_000_000 {
+    let rest = frame.get(FIXED_LEN..)?;
+    if nanos >= 1_000_000_000 {
         return None;
     }
-    let rejection = *REJECTIONS.get(usize::from(tag))?;
+    let (id, event) = if tag == TAG_SECCOMP {
+        // 長さは厳密に一致させる（余りも不足も壊れた枠）。
+        if rest.len() != id_len.checked_add(SECCOMP_EXTRA_LEN)? {
+            return None;
+        }
+        let (id, extra) = rest.split_at(id_len);
+        let nr = u32::from_be_bytes(extra.get(0..4)?.try_into().ok()?);
+        let arch = u32::from_be_bytes(extra.get(4..8)?.try_into().ok()?);
+        (
+            id,
+            AuditEvent::Seccomp {
+                syscall: AuditSyscallNr::from_seccomp_data_nr(nr.cast_signed()),
+                arch: AuditSyscallArch::from_raw(arch),
+            },
+        )
+    } else {
+        if rest.len() != id_len {
+            return None;
+        }
+        (rest, REJECTIONS.get(usize::from(tag))?.audit_event())
+    };
     let at = AuditTimestamp::from_unix_duration(Duration::new(secs, nanos));
     let pid = AuditPid::new(i32::try_from(pid).ok()?).ok()?;
-    let mut record = AuditRecord::new(at, pid, rejection.audit_event());
+    let mut record = AuditRecord::new(at, pid, event);
     if !id.is_empty() {
         record = record.with_container_id(ContainerId::new(std::str::from_utf8(id).ok()?).ok()?);
     }
@@ -124,14 +163,23 @@ fn serve(mut stream: UnixStream, sink: &FileAuditSink) -> i32 {
             return 0;
         }
         let id_len = usize::from(head.last().copied().unwrap_or(0));
+        let extra = if head.first() == Some(&TAG_SECCOMP) {
+            SECCOMP_EXTRA_LEN
+        } else {
+            0
+        };
         let mut frame = head.to_vec();
-        frame.resize(FIXED_LEN + id_len, 0);
+        frame.resize(FIXED_LEN + id_len + extra, 0);
         if let Some(body) = frame.get_mut(FIXED_LEN..)
             && stream.read_exact(body).is_err()
         {
             return 1;
         }
-        let ok = decode(&frame).is_some_and(|r| sink.record(&r).is_ok());
+        let ok = if head.first() == Some(&TAG_PROBE) {
+            id_len == 0 && sink.probe_primary().is_ok()
+        } else {
+            decode(&frame).is_some_and(|r| sink.record(&r).is_ok())
+        };
         if stream
             .write_all(&[if ok { ACK_OK } else { ACK_FAIL }])
             .is_err()
@@ -249,26 +297,79 @@ fn kill_if_unreaped<E>(
     true
 }
 
-impl AuditSink for ControlAuditRelay {
-    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
-        let frame = encode(record)?;
-        let Ok(mut state) = self.state.lock() else {
-            return Err(err(ErrorCode::Internal, "the audit relay lock is poisoned"));
+impl ControlAuditRelay {
+    /// helper に記録先（`@audit.log`）を開けるかを期限つきで確かめさせる。記録は 1 件も書かない（SEC-4・REPAIR-5・#2027）。
+    ///
+    /// 呼び出し元: supervisor の `start`（記録経路を前提に起動してよいかの確認。失敗なら起動を拒否する）。応答が無ければ
+    /// [`AuditSink::record`] と同じく helper を SIGKILL して `Timeout`、開けなければ `Internal` を返す。
+    pub fn probe(&self) -> Result<(), TraitError> {
+        let mut frame = vec![0u8; FIXED_LEN];
+        if let Some(tag) = frame.first_mut() {
+            *tag = TAG_PROBE;
+        }
+        self.exchange(&frame)
+    }
+
+    /// 枠を helper へ送り、応答を [`RECORD_WAIT_LIMIT`] まで待つ。
+    fn exchange(&self, frame: &[u8]) -> Result<(), TraitError> {
+        self.exchange_until(frame, None)
+    }
+
+    /// [`Self::exchange`] を絶対期限 `deadline`(あれば)へ絞った版(REPAIR-5・SEC-4)。
+    ///
+    /// ロック取得も期限内で打ち切り(別の記録が helper の応答待ちで保持している間は `try_lock` を
+    /// 短い間隔で試す)、取得後に残り時間を再計算する。残りが無ければ送信せず `Timeout`。
+    /// 期限なしのときは従来どおり無期限にロックを待ち、応答待ちは [`RECORD_WAIT_LIMIT`] まで。
+    fn exchange_until(&self, frame: &[u8], deadline: Option<Instant>) -> Result<(), TraitError> {
+        let timed_out = || {
+            err(
+                ErrorCode::Timeout,
+                "the audit record was not delivered within the deadline",
+            )
         };
+        let mut state = match deadline {
+            None => match self.state.lock() {
+                Ok(g) => g,
+                Err(_) => return Err(err(ErrorCode::Internal, "the audit relay lock is poisoned")),
+            },
+            Some(d) => loop {
+                match self.state.try_lock() {
+                    Ok(g) => break g,
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(err(ErrorCode::Internal, "the audit relay lock is poisoned"));
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        let left = d.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            return Err(timed_out());
+                        }
+                        std::thread::sleep(left.min(Duration::from_millis(1)));
+                    }
+                }
+            },
+        };
+        let limit = match deadline {
+            None => RECORD_WAIT_LIMIT,
+            Some(d) => {
+                let left = d.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(timed_out());
+                }
+                left.min(RECORD_WAIT_LIMIT)
+            }
+        };
+        let limit = limit.max(Duration::from_millis(1));
         if state.broken {
             return Err(err(
                 ErrorCode::Unavailable,
                 "the audit relay is unavailable",
             ));
         }
-        let deadline = Instant::now() + RECORD_WAIT_LIMIT;
+        let answer_by = Instant::now() + limit;
         let mut ack = [0u8; 1];
-        let sent = state
-            .stream
-            .set_write_timeout(Some(RECORD_WAIT_LIMIT))
-            .is_ok()
-            && state.stream.write_all(&frame).is_ok();
-        let remaining = deadline
+        let sent = state.stream.set_write_timeout(Some(limit)).is_ok()
+            && state.stream.write_all(frame).is_ok();
+        let remaining = answer_by
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
         let answered = sent
@@ -294,6 +395,24 @@ impl AuditSink for ControlAuditRelay {
     }
 }
 
+impl AuditSink for ControlAuditRelay {
+    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+        let frame = encode(record)?;
+        self.exchange(&frame)
+    }
+
+    fn record_until(&self, record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
+        if Instant::now() >= deadline {
+            return Err(err(
+                ErrorCode::Timeout,
+                "the audit record was not delivered within the deadline",
+            ));
+        }
+        let frame = encode(record)?;
+        self.exchange_until(&frame, Some(deadline))
+    }
+}
+
 impl Drop for ControlAuditRelay {
     fn drop(&mut self) {
         self.kill_helper();
@@ -310,6 +429,51 @@ impl Drop for ControlAuditRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REPAIR-5・SEC-4: 別の記録がロックを保持している間に短い絶対期限で呼んでも、期限 + 許容差以内に
+    /// `Timeout` で戻り、helper へは何も送らない(取得後の再計算と、ロック取得自体の期限打ち切り)。
+    #[test]
+    fn repair5_sec4_record_until_gives_up_lock_wait_at_deadline() {
+        let (parent, mut peer) = UnixStream::pair().unwrap();
+        // 非実在の pid(自分の子ではないため Drop の kill は確認で止まる)。
+        let relay = std::sync::Arc::new(ControlAuditRelay {
+            state: Mutex::new(State {
+                stream: parent,
+                broken: false,
+            }),
+            pid: 0x3fff_fff0,
+            pidfd: None,
+        });
+        let holder = std::sync::Arc::clone(&relay);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            let _g = holder.state.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        let record = sample(ControlPeerRejection::PeerUidMismatch, None);
+        let budget = Duration::from_millis(100);
+        let start = Instant::now();
+        let e = relay.record_until(&record, start + budget).unwrap_err();
+        let took = start.elapsed();
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert!(took >= budget, "{took:?}");
+        assert!(took < budget + Duration::from_millis(300), "{took:?}");
+        release_tx.send(()).unwrap();
+        t.join().unwrap();
+        // 何も送っていない(読み出しは即座に WouldBlock/EOF 相当)。
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 1];
+        assert!(peer.read(&mut buf).is_err());
+        // 期限切れなら、ロックが空いていても送信しない。
+        let e = relay
+            .record_until(&record, Instant::now() - Duration::from_millis(1))
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert!(peer.read(&mut buf).is_err());
+    }
 
     /// SUP-1・SEC-4・CORE-1: 確認できない場合は送信 0 回（pidfd・pid どちらの送信手段でも同じ）。
     #[test]
@@ -375,19 +539,73 @@ mod tests {
         }
     }
 
-    /// SEC-4: 制御チャネル以外の層は運ばない。
+    /// SEC-4: 運ぶのは制御チャネルと seccomp だけ。それ以外の層（Mount）は拒否する。
     #[test]
-    fn sec4_non_control_records_are_rejected() {
-        use super::super::{AuditSyscallArch, AuditSyscallNr};
+    fn sec4_other_layers_are_rejected() {
         let rec = AuditRecord::new(
             AuditTimestamp::from_unix_duration(Duration::new(1, 0)),
             AuditPid::new(1).unwrap(),
-            AuditEvent::Seccomp {
-                syscall: AuditSyscallNr::new(1).unwrap(),
-                arch: AuditSyscallArch::from_raw(0xC000_003E),
+            AuditEvent::Mount {
+                path: None,
+                reason: None,
             },
         );
         assert_eq!(encode(&rec).unwrap_err().code(), ErrorCode::InvalidArgument);
+    }
+
+    fn seccomp_sample(nr: i32, arch: u32, id: Option<&str>) -> AuditRecord {
+        let r = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 7)),
+            AuditPid::new(77).unwrap(),
+            AuditEvent::Seccomp {
+                syscall: AuditSyscallNr::from_seccomp_data_nr(nr),
+                arch: AuditSyscallArch::from_raw(arch),
+            },
+        );
+        match id {
+            Some(id) => r.with_container_id(ContainerId::new(id).unwrap()),
+            None => r,
+        }
+    }
+
+    /// SEC-4・#2025: seccomp の枠は番号・arch・PID・コンテナ ID が往復で一致する（負の番号のビット列も保つ）。
+    #[test]
+    fn sec4_2025_seccomp_frame_round_trips() {
+        for (nr, arch, id) in [
+            (312, 0xC000_003E, Some("web-1")),
+            (272, 0xC000_00B7, None),
+            (-1, 0xDEAD_BEEF, Some("a")),
+        ] {
+            let rec = seccomp_sample(nr, arch, id);
+            let frame = encode(&rec).unwrap();
+            assert_eq!(
+                frame.len(),
+                FIXED_LEN + id.map_or(0, str::len) + SECCOMP_EXTRA_LEN
+            );
+            let back = decode(&frame).unwrap();
+            assert_eq!(
+                back.syscall().map(AuditSyscallNr::get),
+                Some(nr.cast_unsigned())
+            );
+            assert_eq!(back.seccomp_arch().map(AuditSyscallArch::get), Some(arch));
+            assert_eq!(back.pid(), rec.pid());
+            assert_eq!(back.timestamp(), rec.timestamp());
+            assert_eq!(back.container_id(), rec.container_id());
+        }
+    }
+
+    /// REPAIR-2・#2025: seccomp の壊れた枠（追加部の不足・余り・ID 長の不一致）は記録にしない。
+    #[test]
+    fn repair2_2025_malformed_seccomp_frames_are_not_decoded() {
+        let good = encode(&seccomp_sample(312, 0xC000_003E, Some("ab"))).unwrap();
+        assert!(decode(&good).is_some());
+        assert!(decode(&good[..good.len() - 1]).is_none());
+        let mut longer = good.clone();
+        longer.push(0);
+        assert!(decode(&longer).is_none());
+        let mut wrong_len = good;
+        wrong_len[17] = 3;
+        assert!(decode(&wrong_len).is_none());
     }
 
     /// REPAIR-2: 壊れた枠（短い・未知の理由・不正な時刻・PID 0）は記録にしない。

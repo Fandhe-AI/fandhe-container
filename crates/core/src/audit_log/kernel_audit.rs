@@ -245,7 +245,8 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         | AuditEvent::ExecTarget { .. }
         | AuditEvent::Entrypoint { .. }
         | AuditEvent::ControlPeer { .. }
-        | AuditEvent::ExitSignal { .. } => None,
+        | AuditEvent::ExitSignal { .. }
+        | AuditEvent::AuditCoverageDegraded { .. } => None,
         AuditEvent::Landlock { path, .. } => Some(path),
         AuditEvent::Mount { path, .. } => path.as_ref(),
         AuditEvent::PluginTrust { path, .. } => Some(path),
@@ -266,6 +267,17 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
             signal.get(),
             target_pid.get()
         ));
+    }
+    // `audit_coverage` 層のみ: 縮退した層の理由（固定トークン。#2027）。
+    if let Some((seccomp_kill, landlock)) = record.coverage_reasons() {
+        if let Some(r) = seccomp_kill {
+            tail.push_str(" seccomp_kill_reason=");
+            tail.push_str(r.as_str());
+        }
+        if let Some(r) = landlock {
+            tail.push_str(" landlock_reason=");
+            tail.push_str(r.as_str());
+        }
     }
     match record.container_id() {
         Some(id) => {
@@ -508,14 +520,18 @@ impl KernelAuditFallback {
     }
 
     /// 送信して ACK を待つ。接続の後始末は呼び出し側（`record_fallback`）が行う。
-    fn exchange(&mut self, record: &AuditRecord) -> Result<(), AuditWriteError> {
+    fn exchange(
+        &mut self,
+        record: &AuditRecord,
+        ack_timeout: Duration,
+    ) -> Result<(), AuditWriteError> {
         let payload = encode_payload(record)?;
         self.seq = self.seq.wrapping_add(1);
         let frame = AuditNetlinkFrame::new(self.seq, payload.as_bytes())?;
         self.transport
             .send(frame.as_bytes())
             .map_err(AuditWriteError::new)?;
-        let deadline = Instant::now() + self.ack_timeout;
+        let deadline = Instant::now() + ack_timeout;
         for _ in 0..MAX_ACK_ATTEMPTS {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -546,7 +562,23 @@ impl AuditFallback for KernelAuditFallback {
         record: &AuditRecord,
         _primary: &AuditWriteError,
     ) -> Result<(), AuditWriteError> {
-        let result = self.exchange(record);
+        let result = self.exchange(record, self.ack_timeout);
+        self.transport.close();
+        result
+    }
+
+    /// ACK 待ちを `deadline` までの残りへ絞る(残りが無ければ送信せず `KernelAuditTimeout`。REPAIR-5・SEC-4)。
+    fn record_fallback_until(
+        &mut self,
+        record: &AuditRecord,
+        _primary: &AuditWriteError,
+        deadline: Instant,
+    ) -> Result<(), AuditWriteError> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(AuditWriteError::new(Kind::KernelAuditTimeout));
+        }
+        let result = self.exchange(record, self.ack_timeout.min(remaining));
         self.transport.close();
         result
     }
@@ -651,6 +683,25 @@ mod tests {
             encode_payload(&r).unwrap(),
             "op=fandhe-audit layer=exit_signal ts=1700000000.000000005 pid=1234 syscall=? arch=? \
              path=? path_truncated=? path_original_len=? signal=31 target_pid=4321 container_id=c1"
+        );
+    }
+
+    /// SEC-4・#2027: audit_coverage レコードの key=value は縮退した層の理由を固定トークンで続ける。
+    #[test]
+    fn sec4_2027_payload_audit_coverage_reasons() {
+        let r = rec(AuditEvent::AuditCoverageDegraded {
+            seccomp_kill: Some(crate::audit_log::AuditReason::new(
+                "seccomp_kill_not_logged",
+            )),
+            landlock: Some(crate::audit_log::AuditReason::new(
+                "landlock_audit_abi_too_old",
+            )),
+        });
+        assert_eq!(
+            encode_payload(&r).unwrap(),
+            "op=fandhe-audit layer=audit_coverage ts=1700000000.000000005 pid=1234 syscall=? arch=? \
+             path=? path_truncated=? path_original_len=? seccomp_kill_reason=seccomp_kill_not_logged \
+             landlock_reason=landlock_audit_abi_too_old container_id=?"
         );
     }
 
@@ -941,6 +992,7 @@ mod tests {
         replies: VecDeque<MockReply>,
         send_result: Option<Kind>,
         closes: usize,
+        recv_timeouts: Vec<Duration>,
     }
 
     struct Mock(Rc<RefCell<MockState>>);
@@ -951,8 +1003,10 @@ mod tests {
             s.sent.push(frame.to_vec());
             s.send_result.map_or(Ok(()), Err)
         }
-        fn recv(&mut self, buf: &mut [u8], _t: Duration) -> Result<Option<(usize, u32)>, Kind> {
-            match self.0.borrow_mut().replies.pop_front() {
+        fn recv(&mut self, buf: &mut [u8], t: Duration) -> Result<Option<(usize, u32)>, Kind> {
+            self.0.borrow_mut().recv_timeouts.push(t);
+            let next = self.0.borrow_mut().replies.pop_front();
+            match next {
                 None => Ok(None),
                 Some(Err(k)) => Err(k),
                 Some(Ok(None)) => Ok(None),
@@ -1087,6 +1141,32 @@ mod tests {
                 primary_error: AuditWriteError::new(Kind::Write)
             }
         );
+    }
+
+    /// REPAIR-5・SEC-4: `record_fallback_until` は ACK 待ちを絶対期限の残りへ絞り、尽きていれば送信しない。
+    #[test]
+    fn repair5_sec4_fallback_until_bounds_ack_wait_by_deadline() {
+        let state = Rc::new(RefCell::new(MockState::default()));
+        let mut fb = fallback_with(&state);
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let e = fb
+            .record_fallback_until(&seccomp(), &primary_err(), deadline)
+            .unwrap_err();
+        assert_eq!(e.kind(), Kind::KernelAuditTimeout);
+        {
+            let s = state.borrow();
+            assert_eq!(s.sent.len(), 1);
+            let first = s.recv_timeouts.first().copied().unwrap();
+            assert!(first <= Duration::from_millis(50), "{first:?}");
+        }
+        let expired = Rc::new(RefCell::new(MockState::default()));
+        let mut fb = fallback_with(&expired);
+        let past = Instant::now() - Duration::from_millis(1);
+        let e = fb
+            .record_fallback_until(&seccomp(), &primary_err(), past)
+            .unwrap_err();
+        assert_eq!(e.kind(), Kind::KernelAuditTimeout);
+        assert!(expired.borrow().sent.is_empty());
     }
 
     #[test]

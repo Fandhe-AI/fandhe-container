@@ -853,7 +853,7 @@ mod uds {
 
     /// UDS の待ち受けを tonic の incoming ストリームにする（サーバー側。PLUG-2・PLUG-12）。
     ///
-    /// 呼び出し元は将来の `fandhe-container-plugin-cri`（TASK-114 周辺）で、[`serve_router`] へ渡す。
+    /// 呼び出し元は `fandhe-container-plugin-cri` の `server`（#849）で、[`serve_router`] へ渡す。
     /// 配置検証（自 UID 所有・0700 相当・symlink 不可）・0600 化・stale 掃除・`sun_path` 長検査は
     /// `UdsListener::bind` が行い、本型は再実装しない。`UdsListener` を所有するため、drop で
     /// socket ファイルと bind ロックが後始末される。

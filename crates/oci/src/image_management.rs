@@ -17,14 +17,18 @@
 //! プロセスごとのメモリ上の別物のままである。
 //!
 //! 未実装（後続 issue の担当。実装済みを装わない。REPAIR-3）:
-//! - manifest の在庫・タグ・pull リースのディスクへの永続化（#851。コンテナ参照だけは #2341 で永続化済み）。再起動時の照合 API は `reconcile` で実装済み（#854）。本番 probe と起動時の配線は未実装（#2315）
+//! - テーブル（manifest の在庫・タグ・リース）自体のディスクへの永続化。削除の永続化完了確認と再試行
+//!   （削除ジャーナル `gc_journal`。fsync と取得時のロールフォワード）は実装済み（#851）だが、保証するのは
+//!   ジャーナルと blob ファイルの unlink の範囲だけ。再起動時の照合 API は `reconcile` で実装済み（#854）。本番 probe と起動時の配線は未実装（#2315）
 //! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force` と実削除（untag・`remove_manifest`・非共有 blob の削除。TASK-183.6・#481）も
-//!   `remove` で実装済み（永続化・fsync・削除途中のクラッシュの再試行は #851、CLI 配線は未実装）
-//! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（永続化は未実装。CLI 配線は #2316）
+//!   `remove` で実装済み（削除の永続化と再試行は #851 で実装済み、CLI 配線は未実装）
+//! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（CLI 経路と永続化は未実装）
 //! - `image prune` 本体は `prune` モジュールで実装済み（#476）。`rm`・`prune` の CLI 配線（#476・#480・#481）。`image ls`/`system df` の集計 API は
 //!   `usage`（#478・TASK-183.3）で実装済み（staging の容量・コンテナ容量の受け口・展開後サイズの二段階 API は #2222。CLI 経路は未実装）
 //! - pull のリース登録・ステージング書き込み（#474・TASK-183.9）と、公開・失敗時のロールバック
-//!   （#475・TASK-183.10）は `pull` で実装済み（cri からの配線は未実装）
+//!   （#475・TASK-183.10）は `pull` で実装済み（cri からの配線は未実装）。クラッシュで残った pull の
+//!   リース・ステージングの回収 GC は `pull_recovery`（`recover_stale_pulls`。#852・TASK-183.11.2）で
+//!   実装済み（起動時の呼び出しの配線は未実装・#2315）
 //! - コンテナ参照以外（manifest・タグ・リース）の件数上限は永続化と合わせて判断する（コンテナ参照は
 //!   `MAX_CONTAINER_REFS` で上限済み）。タグは `MAX_TAG_REFS` で書き込み側が検査済み（#2316）
 //!
@@ -36,6 +40,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::path::PathBuf;
 
 mod container_ref_persist;
 pub use container_ref_persist::{
@@ -47,6 +52,12 @@ pub use container_ref::{ContainerRefRegistration, ContainerRefRelease};
 
 mod reconcile;
 pub use reconcile::{ContainerRefReconciliation, ContainerStatePresence};
+
+mod gc_journal;
+pub use gc_journal::{
+    DeletionDurability, GC_JOURNAL_FILE_NAME, MAX_GC_JOURNAL_BYTES, MAX_GC_JOURNAL_ENTRIES,
+    MAX_GC_RETRY_ATTEMPTS, PendingDeletionRecovery,
+};
 
 mod remove;
 pub use remove::{
@@ -69,9 +80,12 @@ pub use usage::{
 
 mod pull;
 pub use pull::{
-    BlobReuse, LeasedBlob, MAX_PUBLISH_TAGS, PullAbortOutcome, PullPublishOutcome,
-    PullPublishRequest, PullSession, StagingCleanup,
+    BlobReuse, LeasedBlob, MAX_PUBLISH_TAGS, PULL_LOCK_FILE_NAME, PullAbortOutcome,
+    PullPublishOutcome, PullPublishRequest, PullSession, StagingCleanup,
 };
+
+mod pull_recovery;
+pub use pull_recovery::StalePullRecovery;
 
 mod tag;
 pub use tag::{ImageTagChange, ImageTagOutcome, ImageTagSource, MAX_TAG_REFS};
@@ -149,7 +163,7 @@ impl fmt::Display for ContainerRefId {
 }
 
 /// 進行中の `pull` の識別子（検証済みの不透明値）。新規の生成は `PullId::generate`
-/// （`<pid>-<UNIX 時刻ナノ秒>-<連番>`。#474）。クラッシュ後の回収の判断は #852。
+/// （`<pid>-<UNIX 時刻ナノ秒>-<連番>`。#474）。クラッシュ後の回収は PID ではなくステージングのロックファイルで判定する（#852）。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PullId(String);
 
@@ -333,7 +347,21 @@ pub struct ReferenceTable {
     next_container_generation: u64,
     tag_refs: BTreeMap<TagKey, Digest>,
     pull_leases: BTreeMap<Digest, BTreeSet<PullId>>,
+    /// 排他区間の中で、未完了の削除ジャーナルをディスクで検査するための root（OCI-7）。
+    /// `ImageStore::lock` が区間ごとに設定する。単体のテーブルでは `None`（検査しない）。
+    journal_root: JournalRoot,
 }
+
+/// `ReferenceTable` に載せる検査用の root。等価比較・複製には影響しない（テーブルの内容ではないため）。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JournalRoot(Option<PathBuf>);
+
+impl PartialEq for JournalRoot {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for JournalRoot {}
 
 impl ReferenceTable {
     /// 空のテーブルを作る。
@@ -357,6 +385,7 @@ impl ReferenceTable {
         digest: Digest,
         composition: ManifestComposition,
     ) -> Result<(), OciError> {
+        self.ensure_no_pending_deletion()?;
         match self.manifests.get(&digest) {
             Some(existing) if existing == &composition => Ok(()),
             Some(_) => Err(err(
@@ -372,6 +401,15 @@ impl ReferenceTable {
 
     /// 在庫から manifest を外し、構成を返す。参照が残る場合は `FailedPrecondition`、無ければ `NotFound`。
     pub fn remove_manifest(&mut self, digest: &Digest) -> Result<ManifestComposition, OciError> {
+        self.ensure_no_pending_deletion()?;
+        self.remove_manifest_unchecked(digest)
+    }
+
+    /// 未完了のテーブル操作の検査なしの除去。rm / prune が自分のジャーナルを書いた後の実行専用。
+    pub(super) fn remove_manifest_unchecked(
+        &mut self,
+        digest: &Digest,
+    ) -> Result<ManifestComposition, OciError> {
         if !self.manifests.contains_key(digest) {
             return Err(err(
                 OciErrorCode::NotFound,
@@ -397,6 +435,7 @@ impl ReferenceTable {
         id: ContainerRefId,
         manifest: &Digest,
     ) -> Result<(), OciError> {
+        self.ensure_no_pending_deletion()?;
         self.require_manifest(manifest)?;
         match self.container_refs.get(&id) {
             Some(cur) if &cur.manifest == manifest => Ok(()),
@@ -429,6 +468,7 @@ impl ReferenceTable {
 
     /// コンテナの参照を解除し、参照していた manifest を返す。無ければ `NotFound`。
     pub fn unregister_container(&mut self, id: &ContainerRefId) -> Result<Digest, OciError> {
+        self.ensure_no_pending_deletion()?;
         self.container_refs
             .remove(id)
             .map(|e| e.manifest)
@@ -455,6 +495,7 @@ impl ReferenceTable {
         key: TagKey,
         manifest: &Digest,
     ) -> Result<Option<Digest>, OciError> {
+        self.ensure_no_pending_deletion()?;
         self.require_manifest(manifest)?;
         self.ensure_tag_capacity([&key])?;
         Ok(self.tag_refs.insert(key, manifest.clone()))
@@ -462,15 +503,24 @@ impl ReferenceTable {
 
     /// タグを解除し、外した manifest を返す。無ければ `NotFound`。
     pub fn unregister_tag(&mut self, key: &TagKey) -> Result<Digest, OciError> {
+        self.ensure_no_pending_deletion()?;
+        self.unregister_tag_unchecked(key)
+    }
+
+    /// 未完了のテーブル操作の検査なしの解除。rm が自分のジャーナルを書いた後の実行専用。
+    pub(super) fn unregister_tag_unchecked(&mut self, key: &TagKey) -> Result<Digest, OciError> {
         self.tag_refs
             .remove(key)
             .ok_or_else(|| err(OciErrorCode::NotFound, format!("tag {key} not found")))
     }
 
     /// blob に pull リースを登録する。同じ pull ID の重複は冪等。
-    pub fn acquire_lease(&mut self, blob: Digest, pull: PullId) -> LeaseAcquired {
+    ///
+    /// 削除ジャーナルがディスクに残っている間は `FailedPrecondition`（参照の追加を禁じる。OCI-7）。
+    pub fn acquire_lease(&mut self, blob: Digest, pull: PullId) -> Result<LeaseAcquired, OciError> {
+        self.ensure_no_pending_deletion()?;
         let newly_added = self.pull_leases.entry(blob).or_default().insert(pull);
-        LeaseAcquired { newly_added }
+        Ok(LeaseAcquired { newly_added })
     }
 
     /// 指定の pull ID のリースだけを解放する。登録が無ければ `NotFound`（他の pull ID には触れない）。
@@ -671,9 +721,9 @@ mod tests {
     fn oci7_pull_leases_are_released_independently() {
         let mut t = ReferenceTable::new();
         let x = d(0x01);
-        assert!(t.acquire_lease(x.clone(), pid("p1")).newly_added);
-        assert!(t.acquire_lease(x.clone(), pid("p2")).newly_added);
-        assert!(!t.acquire_lease(x.clone(), pid("p2")).newly_added);
+        assert!(t.acquire_lease(x.clone(), pid("p1")).unwrap().newly_added);
+        assert!(t.acquire_lease(x.clone(), pid("p2")).unwrap().newly_added);
+        assert!(!t.acquire_lease(x.clone(), pid("p2")).unwrap().newly_added);
         assert_eq!(t.blob_references(&x).leases, vec![pid("p1"), pid("p2")]);
         t.release_lease(&x, &pid("p1")).unwrap();
         let r = t.blob_references(&x);
@@ -695,9 +745,9 @@ mod tests {
     fn oci7_release_all_leases_only_affects_own_pull_id() {
         let mut t = ReferenceTable::new();
         let (x, y) = (d(0x01), d(0x02));
-        t.acquire_lease(x.clone(), pid("p1"));
-        t.acquire_lease(y.clone(), pid("p1"));
-        t.acquire_lease(y.clone(), pid("p2"));
+        t.acquire_lease(x.clone(), pid("p1")).unwrap();
+        t.acquire_lease(y.clone(), pid("p1")).unwrap();
+        t.acquire_lease(y.clone(), pid("p2")).unwrap();
         assert_eq!(t.release_all_leases(&pid("p1")), vec![x.clone(), y.clone()]);
         assert_eq!(t.blob_references(&x).leases, vec![]);
         assert_eq!(t.blob_references(&y).leases, vec![pid("p2")]);
@@ -707,7 +757,7 @@ mod tests {
     #[test]
     fn oci7_lease_only_blob_is_referenced_without_manifest() {
         let mut t = ReferenceTable::new();
-        t.acquire_lease(d(0x77), pid("p1"));
+        t.acquire_lease(d(0x77), pid("p1")).unwrap();
         let r = t.blob_references(&d(0x77));
         assert_eq!(r.referencing_manifests, vec![]);
         assert!(r.is_referenced());

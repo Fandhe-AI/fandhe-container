@@ -141,6 +141,7 @@ flowchart LR
     compose_convert["compose-convert"] -->|確定| stack
     supervisor -->|確定| core
     plugin_cri["plugin-cri"] -->|確定| cri
+    plugin_cri -->|確定| net
     cri -->|確定| oci
     plugin_macos["plugin-macos"] -->|確定| platform_macos["platform-macos"]
     plugin_windows["plugin-windows"] -->|確定| platform_windows["platform-windows"]
@@ -167,7 +168,8 @@ flowchart LR
 | `oci` →(dev) `core` | 実機前提ハーネス `tests/pull_e2e.rs` の実行段が TASK-29 の `create` / `start` と `ProductionLauncher` を使う（OCI-1・TASK-55.1・#420。dev-dependencies のみで、通常の依存には入れない。外部クレートの追加ではない。将来 `core` が `oci` に通常依存すると dev 循環になるため、その時はハーネスの置き場所を見直す） | 確定 |
 | `core` →(通常) `oci` は張らない | create / delete の OCI-7 参照登録・解除（TASK-183.8.1・#853・#2315）は、core が `oci_runtime::ContainerImageRefs`（依存注入のトレイト。`register` / `release` / `bind` / `registration` / `release_if` の 5 メソッド）を定義する。参照には登録ごとに採番する世代（oci の `ContainerRefGeneration` と core の `ImageRefGeneration`。`from_raw` / `as_raw` で写す）と確定・未確定の状態があり、メソッドは `ImageStore` の `register_container_ref`（未確定で登録する。`Registered` / `AlreadyRegistered` を返し、世代は返さない）・`release_container_ref`（ID 指定。create の失敗経路の巻き戻し用）・`bind_container_ref`（状態作成の成功直後に確定し、世代を返す）・`container_ref_registration`（確定済みの世代だけを返す）・`release_container_ref_if`（世代が一致するときだけ外す。delete 用）に対応する。未確定のまま残った参照の回収（`release_unbound_container_ref_if`・`reconcile_container_refs`）は再起動時の照合（#854・TASK-183.8.2）が起動点を持ち、トレイトには含めない（本番 probe と起動時の配線はアダプタ側の担当）。このトレイトを満たすアダプタを oci と core の両方に通常依存する上位 crate に置く（後続。置き場所は未決で、依存の追加はユーザー承認が要る）。core の依存ツリーに oci の通信・展開系クレートを入れず、`pull_e2e` の dev 依存との循環も作らないため。`oci` の結合試験 `tests/container_image_refs.rs` は dev 依存の core で試験用アダプタを使う | 確定 |
 | `supervisor` → `core` | crate-naming.md 決定 6（`StateStore` 既定実装を core に一本化。supervisor は 2 つ目の実装を持たない） | 確定 |
-| `plugin-cri` → `cri` | crate-naming.md 表 #15（`cri` の実装を別プロセス化。TASK-114） | 確定 |
+| `plugin-cri` → `cri` | crate-naming.md 表 #15（`cri` の実装を別プロセス化。TASK-114）。`adapter` が `CriRuntimeService` を組み立てる（TASK-114.2・#458。workspace 内 path 依存で外部クレートの追加なし） | 確定 |
+| `plugin-cri` → `core` | `adapter` が `ContainerRuntime`・`StateStore`・`NetworkPlugin` の実装を選んで注入し、`oci_runtime`・`state_store` のライブラリ関数を使う（CRI-7・PLUG-1・TASK-114.2・#458。`default-features = false`・workspace 内 path 依存で外部クレートの追加なし）。core・cri から plugin-cri への辺は無い | 確定 |
 | `cri` → `oci` | `PullImage` が oci の pull 経路（認証・manifest・blob 取得・digest 検証）を呼ぶ（CRI-4・OCI-1・TASK-61.3・#446。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド実装ライブラリ → core 側で、規則 2 の逆向き（core 側が `cri` に依存しない）のため抵触しない | 確定 |
 | `cri` → `core` | `RuntimeAdapter` が `ContainerRuntime` トレイト（`traits` のみ。具象の実行層は参照しない）を呼ぶ（CRI-2・CRI-7・TASK-59.1・#437。workspace 内 path 依存・`default-features = false` で外部クレートの追加なし）。向きはバックエンド実装ライブラリ → core 側で、規則 2 の逆向き（core 側が `cri` に依存しない）のため抵触しない | 確定 |
 | `plugin-macos` → `platform-macos` | crate-naming.md 表 #16（TASK-115） | 確定 |
@@ -176,7 +178,7 @@ flowchart LR
 | `plugin`（境界基盤） | crate-naming.md 表 #10（core 側・plugin 側双方が依存する境界基盤） | 確定（依存の向きは双方向的な基盤利用であり、上記フローチャートでは個別の辺として描かない） |
 | `core` → `io` | `VolumeProvider`（core 実装）がデータパスで I/O 共有層を使う想定（D-14。G2/G3 で確定） | 想定 |
 | `cli` → `core` | 統一 CLI が実行層を呼ぶ。Linux は core を直接、macOS は core の plugin 発見・登録機構（PLUG-4）経由で（Windows は、ゲスト内の CLI が core を直接呼ぶ Linux の経路を使い、ホストの CLI は隣の起動役の補助を起動するだけにする案。承認待ち。[windows-execution-layout.md](design/windows-execution-layout.md)）、platform-* / microvm 系へは直接依存しない（`make check-cli-backend-deps` で normal / build / dev 辺・全ターゲットを機械判定。TASK-79.2〜79.4） | 確定（Windows 部分は設計ドラフト・承認待ち） |
-| `cli` → `supervisor` | `start` が supervisor の bin を起動し、結果の 1 行を契約の型（`start_contract::StartReport`）で復号する。実行ファイルの固定名（`launcher::SUPERVISOR_FILE_NAME`）もここから得る（TASK-79 追補・#1718・REPAIR-2。workspace 内 path 依存で実装済み。外部クレートの追加ではない。supervisor は core にのみ依存し循環しない） | 確定 |
+| `cli` → `supervisor` | `start` が supervisor の bin を起動し、結果の 1 行を契約の型（`start_contract::StartReport`）で復号する。`logs` が `logs::read_container_log` でコンテナログ（`<state_root>/@container-logs`）を読む（#1543・CLI-1・SUP-7）。実行ファイルの固定名（`launcher::SUPERVISOR_FILE_NAME`）もここから得る（TASK-79 追補・#1718・REPAIR-2。workspace 内 path 依存で実装済み。外部クレートの追加ではない。supervisor は core にのみ依存し循環しない） | 確定 |
 | `cli` → `oci` | `image ls`・`system df`・`image rm [--force]`・`image tag` が oci の管理 API（`image_management`）を呼ぶ（#2221・#2316・CLI-1・OCI-7・TASK-183。workspace 内 path 依存で実装済み。外部クレートの追加ではない。oci は cli に依存せず循環しない）。参照テーブルの永続化は oci 側で未実装（#851・#854・#2315）のため、現状の観測値は `image ls` がヘッダのみ・`image rm` / `image tag` が `NOT_FOUND` | 確定 |
 | `platform-macos` → `io` | virtiofs 共有の I/O 共有プロトコルクライアント（`PipelineClient`）を使う（MAC-1・TASK-65.2。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド → core 側で、規則 2 の逆向きのため抵触しない | 確定 |
 | `cli` → `net` | `doctor` が br_netfilter・ホストの `ip filter FORWARD` policy の判定材料を net の読み取り照会（GETCHAIN）で取得する（NET-10・TASK-148.1。workspace 内 path 依存で実装済み。組み合わせ判定・警告・DOCKER-USER 案内・終了コードの評価層は TASK-148.2 で実装済み。CLI 配線は TASK-79） | 確定 |
@@ -188,7 +190,7 @@ flowchart LR
 | `core` → `plugin`（境界基盤） | core の `plugin` feature（既定で有効）で optional 依存。`--no-default-features` で除外できる（PLUG-3・TASK-111.1・#262）。plugin 候補の探索は core 側の `crates/core/src/plugin_discovery.rs` に実装済み。登録の成果物も core 側に置く想定（TASK-109） | 確定（optional 辺。探索は実装済み・登録は未実装） |
 | `stack` → `core` | `up` コマンドが core の CLI／ライブラリ API を呼ぶ想定（PLUG-1 境界表の stack 行・TASK-155） | 想定 |
 | `supervisor` → `net` | rootless ネットワーク転送の pasta の起動・監視・回収をコンテナごとの supervisor が行う（NET-9・CORE-1・#1940。`net` は core 側のライブラリに確定〔2026-10-12 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)〕。辺は `Cargo.toml` にまだ無く、依存の向き・feature の切り方は #1870 の設計で決める） | 想定 |
-| `NetworkPlugin` の実装（plugin 側）→ `net` | DNS ヘルパーの起動・停止を `NetworkPlugin` の実装が行う（NET-5・NET-7・TASK-114。plugin 側の crate はまだ存在せず、辺も `Cargo.toml` に無い） | 想定 |
+| `plugin-cri` → `net` | `NetworkPlugin` の実装（`netsetup`）が TASK-139 の統合 API（`create_network`・`attach_container`・`delete_network`）を呼ぶ（CRI-7・PLUG-1・NET-1〜NET-3・TASK-114.4・#460・MS-4。workspace 内 path 依存で外部クレートの追加なし。`net` は依存を持たない core 側ライブラリで、辺は一方向）。DNS ヘルパーの起動・停止（NET-5・NET-7）は未実装 | 確定 |
 | `gpu` の GPU-1〜4 以外を含む辺 | GPU-5・7・8 は境界表に明示判定なし、GPU-9 は「検討中」（`api-gpu.md`） | 未確定 |
 | macOS Venus（GPU-6）関連の辺 | 成果物は `plugin-macos` 側に置く定義のみが確定しており、依存の詳細な方向は未確定 | 未確定 |
 
@@ -259,7 +261,10 @@ MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である�
 
 ## 設計ドラフト（採否未決）
 
+- macOS の既定の状態ルート（OCI-5・SEC-4）: [macos-state-root.md](design/macos-state-root.md)（#2431。オーナー承認待ち。決まるまで `resolve(None)` は `Unimplemented`）
 - Windows の実行構成（ゲスト内の core とホストの起動役。WIN-1・TASK-116 追補）: [windows-execution-layout.md](design/windows-execution-layout.md)（#1862。#1415・#1539 の決定部分以外はオーナー承認待ち）
+- Windows の `FileStateStore` の所有者 SID・保護 DACL の実装方式（OCI-5・SEC-4）: [windows-state-store-acl.md](design/windows-state-store-acl.md)（#2428。オーナー承認待ち）
+- 非 Linux の監査の記録経路（Windows の主経路の隔離・代替経路。SEC-4・REPAIR-3）: [audit-non-linux.md](design/audit-non-linux.md)（#2430。オーナー承認待ち）
 
 ## 見直し
 

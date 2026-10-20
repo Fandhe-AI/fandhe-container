@@ -413,6 +413,9 @@ mod consts {
     #[cfg_attr(not(test), allow(dead_code))]
     pub const F_GETFD: i32 = 1;
     pub const F_SETFD: i32 = 2;
+    // include/uapi/asm-generic/fcntl.h の `F_GETFL`・`F_SETFL`。
+    pub const F_GETFL: i32 = 3;
+    pub const F_SETFL: i32 = 4;
     pub const FD_CLOEXEC: i32 = 1;
     // include/uapi/linux/fcntl.h の `F_DUPFD_CLOEXEC`（`F_LINUX_SPECIFIC_BASE` 1024 + 6）。
     pub const F_DUPFD_CLOEXEC: i32 = 1030;
@@ -754,6 +757,9 @@ mod consts {
     #[cfg_attr(not(test), allow(dead_code))]
     pub const F_GETFD: i32 = 1;
     pub const F_SETFD: i32 = 2;
+    // include/uapi/asm-generic/fcntl.h の `F_GETFL`・`F_SETFL`。
+    pub const F_GETFL: i32 = 3;
+    pub const F_SETFL: i32 = 4;
     pub const FD_CLOEXEC: i32 = 1;
     // include/uapi/linux/fcntl.h の `F_DUPFD_CLOEXEC`（`F_LINUX_SPECIFIC_BASE` 1024 + 6）。
     pub const F_DUPFD_CLOEXEC: i32 = 1030;
@@ -1035,6 +1041,8 @@ mod consts {
     #[cfg_attr(not(test), allow(dead_code))]
     pub const F_GETFD: i32 = 0;
     pub const F_SETFD: i32 = 0;
+    pub const F_GETFL: i32 = 0;
+    pub const F_SETFL: i32 = 0;
     pub const FD_CLOEXEC: i32 = 0;
     pub const F_DUPFD_CLOEXEC: i32 = 0;
     pub const EPERM: i32 = -1;
@@ -5094,6 +5102,14 @@ pub(crate) fn kexec_load_invalid_probe() -> Result<(), SysError> {
 /// fail-closed にする）。syscall を呼ばない定数の組み立てのみで、`unsafe` を含まない。
 pub(crate) fn nofollow_nonblock_open_flags() -> Option<i32> {
     consts::SUPPORTED.then_some(consts::O_NOFOLLOW | consts::O_NONBLOCK)
+}
+
+/// `O_TMPFILE`（`__O_TMPFILE | O_DIRECTORY`。アーキテクチャ別の `O_DIRECTORY` を使う）。名前を持たない一時ファイルを
+/// ディレクトリの FS に作るために、`OpenOptions::custom_flags` へ渡す（監査ログの書き込み確認。SEC-4・#2027）。
+/// `__O_TMPFILE` は include/uapi/asm-generic/fcntl.h の `020000000`（x86_64・arm64 とも上書きしない）。
+/// 対応外アーキテクチャでは `None`（fail-closed）。定数を返すだけで syscall を呼ばない。
+pub(crate) fn tmpfile_open_flag() -> Option<i32> {
+    consts::SUPPORTED.then_some(consts::O_DIRECTORY | 0o20_000_000)
 }
 
 /// `O_NONBLOCK` 単体（アーキテクチャ別の値）。`/proc/self/fd` 経由の開き直しで FIFO 等に止まらないために使う。

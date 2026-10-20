@@ -449,9 +449,11 @@ impl IntermediateOps for RealIntermediateOps<'_> {
         let (rootfs, entry, setup) = (self.rootfs, self.entry, self.setup);
         // PID 1 の `Seccomp` 段が listener を送る口。複製は close-on-exec で、段が送信後に閉じる。複製できなければ
         // PID 1 を作らずに失敗させる(listener 無しで実行させない。fail-closed。SEC-4・#2024)。
+        let delivery = stages.seccomp_delivery();
         let sender = ListenerSender::new(self.listener_end.try_clone().map_err(|e| {
             ExecError::from_io(&e, IsolationStage::Spawn, "duplicate the listener socket")
-        })?);
+        })?)
+        .with_delivery(delivery);
         let stages = stages.with_listener_sender(sender);
         let gate_r = self.gate_r;
         let report_fd = self.report.as_raw_fd();

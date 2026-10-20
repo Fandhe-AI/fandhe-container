@@ -20,8 +20,10 @@
 //!   単一スレッドの要求を満たせないため、`FailedPrecondition` で拒否されて [`SuperviseOutcome::RelaunchFailed`] になる
 //!   （fail-closed。新しい子は作られない）。実機で成立させる再構成は #2043（SUP-3・CORE-1）で、レイテンシ実測・合否判定
 //!   （#490・#491。TASK-160）はその後になる。
-//! - 明示的な stop の検知は SUP-9 の担当で、本モジュールは [`StopToken`] を [`StopIntent`] へ写すだけ。
-//!   再 launch 時の `unless-stopped` と `always` の差（stop 済みを復帰させるか）も未実装（SUP-3・SUP-9）。
+//! - 明示的な stop の意図は制御チャネルの StopRequest が [`StopToken::mark_explicit_stop`] で立て（#2162・SUP-9）、本モジュールは
+//!   [`StopToken`] を [`StopIntent`] へ写すだけ。supervisor の寿命の中では、`always`・`unless-stopped` を含む全ポリシーで
+//!   明示 stop の後は再起動しない。「明示 stop 済み」を state.json に残して再 launch 時に `unless-stopped` と `always` を
+//!   分ける挙動は未実装（core の `SupervisionState` の変更を要する。SUP-3・SUP-9）。
 //! - [`crate::run::MonitorOutcome::ExitedUnrecorded`]（終了は回収済みだが記録失敗）の回復は未実装で、
 //!   再 launch せずに [`SuperviseOutcome::MonitorFailed`] で返す（状態が不確かなまま再起動しない。fail-closed）。
 //! - 指数バックオフ等の高度な間隔制御は未実装（固定の [`RestartConfig::backoff`] のみ）。
@@ -53,6 +55,7 @@ use crate::run::{
     MonitorConfig, MonitorEvent, MonitorObserver, MonitorOperation, MonitorOutcome, StopToken,
     ensure_owner, is_running_with_pid, monitor_with_observer, precondition, write_with_retry_when,
 };
+use crate::seccomp_notify::SeccompNotifyHub;
 use crate::state::SupervisedState;
 
 /// 終了の分類結果（SUP-3・TASK-159.1）。
@@ -161,7 +164,7 @@ impl FromStr for RestartPolicy {
     }
 }
 
-/// 明示的 stop の有無（[`evaluate_restart`] の入力）。検知は SUP-9 の担当で、本モジュールは行わない。
+/// 明示的 stop の有無（[`evaluate_restart`] の入力）。検知は制御チャネルの StopRequest（SUP-9・#2162）が [`StopToken`] に記録し、本モジュールは写すだけ。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StopIntent {
@@ -896,7 +899,9 @@ pub fn supervise_with_restart(
                 });
             }
         };
-        let intent = if stop.is_stop_requested() {
+        let intent = if stop.is_stop_requested()
+            || stop.explicit_stop_state() == crate::run::ExplicitStopState::Requested
+        {
             StopIntent::Requested
         } else {
             StopIntent::NotRequested
@@ -1211,6 +1216,8 @@ pub struct LauncherRelauncher {
     launcher: Arc<dyn ProcessLauncher>,
     spec: LaunchSpec,
     capture: Option<Arc<CaptureHub>>,
+    /// seccomp の通知への応答ハブ（`with_seccomp`。再 launch のたびに listener を差し替える。SEC-4・#2025）。
+    seccomp: Option<Arc<SeccompNotifyHub>>,
     /// 捕捉開始に失敗し terminate も失敗したプロセスのハンドル（[`Relauncher::take_stranded`] が引き渡す）。
     stranded: Mutex<Vec<LateOrphan>>,
 }
@@ -1222,8 +1229,21 @@ impl LauncherRelauncher {
             launcher,
             spec,
             capture: None,
+            seccomp: None,
             stranded: Mutex::new(Vec::new()),
         }
+    }
+
+    /// 再 launch したプロセスの seccomp の listener を `hub` へ渡す（SEC-4・REPAIR-5・#2025）。
+    ///
+    /// 再 launch の直前に [`SeccompNotifyHub::quiesce`] でスレッドを 0 本にし（core の launch は `Threads: 1` を要する）、
+    /// 直後に新プロセスの listener を取り出して `attach` する。受け取れない・スレッドを作れないときは新プロセスを
+    /// terminate して `Err`（応答者のいない USER_NOTIF は拒否対象の syscall を止めるため動かさない。fail-closed）。
+    /// 注意: 本番 launcher の再 launch が成り立つかは #2043 で、差し替えは偽の launcher でだけ試している。
+    #[must_use]
+    pub fn with_seccomp(mut self, hub: Arc<SeccompNotifyHub>) -> Self {
+        self.seccomp = Some(hub);
+        self
     }
 
     /// 再 launch したプロセスの出力を `hub` へ渡す。
@@ -1240,7 +1260,32 @@ impl Relauncher for LauncherRelauncher {
             // 旧プロセスは回収済み。読み取りスレッドを残したまま fork しない（SUP-7）。
             hub.quiesce();
         }
+        if let Some(hub) = &self.seccomp {
+            hub.quiesce();
+        }
         let process = self.launcher.launch(&self.spec, timeout)?;
+        #[cfg(target_os = "linux")]
+        if let Some(hub) = &self.seccomp {
+            let attached = match process.take_seccomp_listener() {
+                Some(listener) => hub.attach(listener),
+                None => Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "the seccomp listener was not delivered",
+                )),
+            };
+            if let Err(e) = attached {
+                return match process.terminate(timeout) {
+                    Ok(()) => Err(e),
+                    Err(t) => {
+                        self.stranded
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push((process, t.clone()));
+                        Err(t)
+                    }
+                };
+            }
+        }
         // 捕捉ハブが無いときは読み取り側を取り出さない（取り出して捨てるとコンテナが SIGPIPE を受ける）。
         if let Some(hub) = &self.capture
             && let Some(output) = process.take_output()
@@ -1999,6 +2044,33 @@ mod tests {
                 .count(),
             3
         );
+    }
+
+    /// SUP-9・SUP-3: 明示 stop の意図が立った後の終了は、`always` でも再 launch せず `ExplicitStop` で終わる。
+    #[test]
+    fn sup9_explicit_stop_intent_prevents_relaunch() {
+        let st = store(0, 42);
+        let q = Arc::new(Queue::new(&[(43, FAIL)]));
+        let obs = Events::default();
+        let stop = StopToken::new();
+        assert_eq!(
+            stop.mark_explicit_stop(),
+            crate::run::ExplicitStopRecord::NewlyRecorded
+        );
+        let out = run(&st, "always", ProcessExit::Signaled(15), &q, &stop, &obs);
+        let SuperviseOutcome::Finished {
+            reason, restarts, ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(reason, NoRestartReason::ExplicitStop);
+        assert_eq!(restarts, 0);
+        assert_eq!(obs.count(MonitorOperation::Restart), 0);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.restart_count(), 0);
+        assert_eq!(g.status().state(), ContainerState::Stopped);
+        assert_eq!(g.status().exit_code(), Some(143));
     }
 
     /// SUP-3・TASK-159.3: `on-failure:2` は異常終了 3 回で再起動 2 回、restart_count == 2、RetriesExhausted。

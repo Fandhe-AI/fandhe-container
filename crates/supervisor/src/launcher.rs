@@ -13,6 +13,9 @@
 //!   `crate::sys` の `execveat_fd`（検証済み fd の exec）、[`crate::stderr_sink`]（期限つきの報告）
 //!
 //! # 入口の検証（設計書 7 章）
+//! - セッション: 何よりも先に `setsid` で新しいセッションへ移り、標準入出力が端末（pty）でないこと・制御端末が無いこと・
+//!   自分がセッションとプロセスグループのリーダーであることを読み戻しで確認する（SUP-14 の要素 (B)。TASK-171.2・#537。
+//!   [`crate::privilege::detach_session`]）。`sudo`（`use_pty`）経由の起動は標準入出力が pty になるため拒否される
 //! - 引数: supervisor と同じ `StartArgs::parse` で構造検証し、通った列だけをそのまま転送する。`argv[0]` は固定
 //! - 環境変数: `std::env` を書き換えず、exec に渡す環境を新規に組み立てる（許可リスト方式。[`sanitize_env`]）。
 //!   ambient 付きの exec では AT_SECURE が立たず ld.so が `LD_PRELOAD` 等を除去しないことがあるため、
@@ -23,6 +26,12 @@
 //!   `fstat` をかけて同じ条件を確かめ、検証した同じ fd を `execveat(AT_EMPTY_PATH)` で exec する（TOCTOU 回避）
 //! - 継承 fd・cwd・ダンプ: fd 0〜2 が開いていることを確認し、fd 3 以降を閉じ（supervisor の入口でも同じ処理を行う。#2070）、cwd を `/` にし、
 //!   `PR_SET_DUMPABLE=0` を `elevate` の前に設定する（設計書 7 章の「実装時に決める」項目をここで確定した）
+//!
+//! # 起動側（呼び出し元）への契約（#537）
+//! - ランチャーを `process_group(0)` で起動しない。ランチャーがプロセスグループのリーダーだと `setsid` が `EPERM` に
+//!   なり拒否される（ランチャーの `setsid` が新しいセッションとプロセスグループを作るので代わりになる）。CLI が
+//!   ランチャーを選ぶ規則を入れる際の前提とする（現状 CLI はランチャーを起動しない）
+//! - 標準入出力に端末（pty）を渡さない（pipe・`/dev/null`・ファイルを渡す）
 //!
 //! # 失敗時の契約（fail-closed）
 //! 昇格できない場合（file capability も setuid も無い・`nosuid`・`no_new_privs`）は構造化エラーで非ゼロ終了し、
@@ -39,7 +48,8 @@
 //!   （`fandhe_container_core::exec` の capability 段。ambient を全消去してから bounding / capset）。(2) supervisor の
 //!   healthcheck コマンド実行は未実装（TASK-161.2・#495）で、実装時に子で ambient を落としてから exec する要件を
 //!   #495 へ記録する（設計書 5 章 5・10 章）。取りこぼしがないことの確認は実機検証（#538・#539。人間担当）
-//! - setcap / setuid の付与（`scripts/install-privileged-launcher.sh`。#1721 で実装済み）・CLI `setup` の表示（#1722）・`setsid` と pty 非経由の確認（#537）
+//! - setcap / setuid の付与（`scripts/install-privileged-launcher.sh`。#1721 で実装済み）・CLI `setup` の表示（#1722）
+//!   （`setsid` と pty 非経由の確認〔#537〕は実装済み。実機での確認は #539）
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -102,6 +112,9 @@ pub enum LauncherErrorReason {
     Elevation,
     /// 昇格後の exec に失敗した。
     ExecFailed,
+    /// 新しいセッションへ切り離せなかった、または pty 経由の起動だった（標準入出力が端末・制御端末の残存・
+    /// プロセスグループのリーダーとして起動された。SUP-14・TASK-171.2・#537）。
+    SessionNotDetached,
     /// 事前処理（fd の整理・dumpable・cwd）に失敗した。
     SetupFailed,
     /// この OS / アーキテクチャでは未対応。
@@ -155,6 +168,17 @@ impl From<PrivilegeError> for LauncherError {
             format!("privilege elevation failed: {}", e.message),
         )
     }
+}
+
+/// セッション切り離し（[`crate::privilege::detach_session`]）の失敗を `SessionNotDetached` に写す。
+/// コードは検証の拒否が `FAILED_PRECONDITION`、syscall の失敗が `INTERNAL` で、`PrivilegeError` のものをそのまま引き継ぐ。
+#[cfg(any(target_os = "linux", test))]
+fn session_error(e: PrivilegeError) -> LauncherError {
+    LauncherError::new(
+        e.code,
+        LauncherErrorReason::SessionNotDetached,
+        format!("session detach failed: {}", e.message),
+    )
 }
 
 impl From<TraitError> for LauncherError {
@@ -551,6 +575,9 @@ mod linux {
         args: Vec<OsString>,
         vars: Vec<(OsString, OsString)>,
     ) -> Result<std::convert::Infallible, LauncherError> {
+        // セッションの切り離し（SUP-14 の要素 (B)。#537）。pty 経由の起動・制御端末の残存・プロセスグループの
+        // リーダーとしての起動はここで拒否する。何よりも先に行い、拒否時は昇格にも exec にも進まない。
+        crate::privilege::detach_session().map_err(session_error)?;
         // 継承 fd・cwd の整理。
         crate::sys::close_fds_from(crate::start_contract::FIRST_INHERITED_FD)
             .map_err(|e| setup_failed("closing inherited fds", &e))?;
@@ -1077,6 +1104,21 @@ mod tests {
         assert_eq!(le.code, ErrorCode::PermissionDenied);
         assert_eq!(le.reason, LauncherErrorReason::Elevation);
         assert_eq!(le.message, "privilege elevation failed: no capabilities");
+    }
+
+    /// SUP-14・TASK-171.2・#537: セッション切り離しの失敗は `SessionNotDetached` と固有の接頭辞に写る（`Elevation` ではない）。
+    #[test]
+    fn sup14_task171_2_session_error_maps_to_session_not_detached() {
+        use crate::privilege::PrivilegeErrorReason;
+        let pe = PrivilegeError {
+            code: ErrorCode::FailedPrecondition,
+            reason: PrivilegeErrorReason::StdioIsTerminal,
+            message: "stdio is a terminal".to_owned(),
+        };
+        let le = session_error(pe);
+        assert_eq!(le.code, ErrorCode::FailedPrecondition);
+        assert_eq!(le.reason, LauncherErrorReason::SessionNotDetached);
+        assert_eq!(le.message, "session detach failed: stdio is a terminal");
     }
 
     #[test]

@@ -42,6 +42,14 @@ pub mod signal_forward;
 #[cfg(unix)]
 #[allow(unsafe_code)]
 pub(crate) mod sys;
+
+/// 実機前提の観測試験専用（macOS）: `getpeereid` の失敗時 errno を返す。UID は返さない。
+/// 製品経路から呼ばない。PLUG-12・SEC-4・#2252 P2-1（結果の判断は #2405）。
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub fn observe_peer_uid_errno(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+    sys::observe_peer_uid_errno(stream)
+}
 pub mod transport;
 pub mod uds_security;
 

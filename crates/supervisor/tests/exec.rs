@@ -36,12 +36,31 @@
 //!
 //! 通しは 5 回繰り返し、1 回でも不一致なら失敗する（リトライで隠さない）。
 //!
+//! # 2 つの場面
+//! - rootful（`--ignored`。上記すべて）: root で `isolate_rootful_host_root` したコンテナ
+//! - rootless（`--ignored --rootless`。TASK-163 追補・#1887・SUP-6・SEC-1・SEC-5・CORE-5・CORE-6・REPAIR-12）: 非 root で
+//!   `unshare(1)` の `--user --map-root-user --pid --fork --kill-child --mount --uts --ipc --net`（`exec_setns_join` の rootless の
+//!   場面と同じ構成。単一 ID の写像 `0 <euid> 1`）で起動し、launch と同じ手順で `pivot_root` した pid1 へ、
+//!   rootful と同じ入口（`run_command`）で user namespace を含めて参加する。cgroup への join・rlimit・capability 削減・
+//!   `NO_NEW_PRIVS`・Landlock・seccomp を経て `execve` するまでを 5 回通し、rootful と同じ項目を具体値で照合する。
+//!   rootless 固有の期待値は [`RoundExpect`] に集める: `ns/user` が pid1 と一致して orchestrator と異なる・`Uid:` / `Gid:` が
+//!   orchestrator の euid / egid（名前空間内の 0 が所有者へ写る）・`uid_map` / `gid_map` が `0 <id> 1`・`Groups:` が joiner の
+//!   ままで結果が `kept_setgroups_denied`（所有者は初期 user namespace で `CAP_SETGID` を持たず、参加先は `setgroups` が
+//!   `deny` のため）。capability の値は rootful と同じ `00000000a80425fb` だが、これはコンテナの user namespace に対する
+//!   権限で、host に対する権限ではない（`ns/user` の不一致と `uid_map` で裏づける）。
+//!   範囲は成功経路の 5 回に限り、拒否経路（`/dev/null` の差し替え・インタープリタ経由・別コンテナ・pivot していない対象）は
+//!   rootful の場面だけが照合する。
+//!
 //! # 構成（再入）
 //! `harness = false` の単一スレッド `main` で、自身を次の役で再実行する。
-//! - 親（`--ignored`）: bundle を作り、コンテナ `A` / `B` を起動して観測する
+//! - 親（`--ignored`）: bundle を作り、コンテナ `A` / `B` を起動して観測する。`--ignored --rootless` は rootless の場面
 //! - `--container`: `isolate_rootful_host_root`（pid / mnt / uts / ipc）→ pid1 を子として生成して待機
-//! - `--pid1`: 新しい PID namespace の PID 1。`establish` → `prepare_rootfs` → `create_default_devices` →
-//!   `pivot_root` の後、合図ファイルを置いて待機する（launch の exec は証跡未結線で拒否されるため exec しない）
+//! - rootless のコンテナ役は再入ではなく `unshare(1)` を直接起動する。core の単一 ID 経路（`plan` → `isolate`）を使わないのは、
+//!   `Namespace` に network が無く（rootless の起動経路への netns の追加は #1939）、core の `join_namespaces` が 5 種を必ず
+//!   `setns` するため、user namespace へ参加した後は初期 user namespace が所有する netns へ入れないから（`--net` が要る）
+//! - `--pid1` / `--pid1-rootless`: 新しい PID namespace の PID 1。`establish` → `prepare_rootfs` → `create_default_devices` →
+//!   `pivot_root` の後、合図ファイルを置いて待機する（launch の exec は証跡未結線で拒否されるため exec しない）。
+//!   rootless は `DevptsGidSource::Rootless`（本番 launcher の単一 ID 経路と同じ。host の gid は argv で受ける）
 //! - `--joiner`: 単一スレッドで `run_command` 等を呼ぶ exec 専用プロセス
 //!
 //! # 試験専用の入口（`exec-test-support` feature）
@@ -53,7 +72,15 @@
 //! root・cgroup v2 の書き込み（`/sys/fs/cgroup`）・Landlock（Linux 6.12+・ABI 6+）・`unshare`（util-linux）が必要で、
 //! x86_64 のみ（手組みのプローブが x86_64 の機械語のため）。GitHub ホステッド runner では保証できないため
 //! `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」。AGENTS.md に実行コマンドを記す）。実行された
-//! 場合は拒否を含むあらゆる失敗を失敗として扱う。rootless（user namespace への参加。#1462）は非特権で動く `exec_setns_join` が照合し、本試験は rootful のみ。
+//! 場合は拒否を含むあらゆる失敗を失敗として扱う。
+//!
+//! rootless の場面（`--rootless`）は root ではなく、非 root・非特権 user namespace が作れるホスト（
+//! `kernel.apparmor_restrict_unprivileged_userns` が 1 でない）・Landlock ABI 6+・委譲された cgroup v2
+//! （`systemd-run --user --scope -p Delegate=yes` の下で実行する）・`cgroup.kill`（Linux 5.14+）・`unshare` / `prlimit`
+//! （util-linux）を要する。満たさないときは副作用の前に「検証していない」ことを `exit 2` と
+//! `exec: not verified (rootless): <理由>` で知らせ、成功を装わない。事前検査を通った後の不一致はすべて失敗とする。
+//! feature なしのビルドは `--rootless` を付けても同じく `exit 2`（`--ignored` で判定するため）。
+//! user namespace への参加と資格情報の処理だけは、非特権で動く `exec_setns_join` も照合する（#1462）。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -121,6 +148,7 @@ mod linux {
     };
     use fandhe_container_core::oci_runtime::{load_config, pin_bundle_rootfs};
     use fandhe_container_core::rlimits::{Rlimit, RlimitKind, Rlimits};
+    use fandhe_container_core::rootless::single_id_mapping;
     use fandhe_container_core::tmpfs::TmpfsMountSet;
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, StateRecord, StateRevision,
@@ -178,6 +206,12 @@ mod linux {
             Some("--pid1") => pid1(
                 Path::new(arg(2).expect("rootfs")),
                 arg(3).expect("ready name"),
+                None,
+            ),
+            Some("--pid1-rootless") => pid1(
+                Path::new(arg(2).expect("rootfs")),
+                arg(3).expect("ready name"),
+                Some(arg(4).expect("host egid").parse().expect("host egid")),
             ),
             Some("--joiner") => joiner(&args[2..]),
             // root 不要の補助: 手組みのプローブだけをホスト上で自己検証する（`orchestrate` も最初に行う）。
@@ -186,6 +220,12 @@ mod linux {
                 verify_bundle_definition(&bundle);
                 verify_probe_on_host(&bundle);
                 println!("exec: probe self-check ok");
+            }
+            // `--rootless` の判定は `--ignored` だけの分岐より先に置く（rootful の挙動は変えない）。
+            _ if args.iter().any(|a| a == "--ignored")
+                && args.iter().any(|a| a == "--rootless") =>
+            {
+                orchestrate_rootless()
             }
             _ if args.iter().any(|a| a == "--ignored") => orchestrate(),
             _ => println!(
@@ -279,8 +319,7 @@ mod linux {
         wait_until("the host probe to finish its steps", || {
             work.join("data/unshare_ok").exists()
         });
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_and_reap(&mut child);
         assert!(
             !work.join("data/unshare_denied").exists(),
             "the host probe must see -EINVAL from setns(0, 0), not -EPERM"
@@ -392,17 +431,24 @@ mod linux {
         // 親（orchestrator）が stdin を閉じるまで待つ。
         let mut sink = Vec::new();
         let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
-        let _ = pid1.kill();
-        let _ = pid1.wait();
+        kill_and_reap(&mut pid1);
     }
 
     /// `--pid1`: launch と同じ手順で `pivot_root` まで進み、合図ファイルを置いて待機する。
     /// launch の exec は証跡未結線で拒否されるため exec しない。
-    fn pid1(rootfs: &Path, ready: &str) {
+    ///
+    /// `rootless_host_egid` が `Some` なら rootless（`--pid1-rootless`）で、本番 launcher の単一 ID 経路と同じ
+    /// `DevptsGidSource::Rootless(single_id_mapping(host の egid))` を使う（host の `/dev` のノードを bind して供給する）。
+    fn pid1(rootfs: &Path, ready: &str, rootless_host_egid: Option<u32>) {
         assert_eq!(std::process::id(), 1, "must be PID 1 of the new namespace");
         let isolation = MountIsolation::establish().expect("establish mount isolation");
         let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
-        let devices = create_default_devices(&isolation, &prepared, DevptsGidSource::Rootful)
+        let gid_map =
+            rootless_host_egid.map(|egid| single_id_mapping(egid).expect("single id gid map"));
+        let gid_source = gid_map
+            .as_ref()
+            .map_or(DevptsGidSource::Rootful, DevptsGidSource::Rootless);
+        let devices = create_default_devices(&isolation, &prepared, gid_source)
             .expect("create default devices");
         // 暗黙の `/dev/shm` を載せる（本番の順序: create_default_devices の後。#1654）。Landlock の暗黙分の
         // ルール（`/dev/shm`。#1657）が存在するパスを指すために必要。
@@ -423,6 +469,8 @@ mod linux {
     /// 起動済みのコンテナ（A プロセスとその pid1・cgroup）。drop で pid1 を止め、cgroup を消す。
     struct Container {
         stdin: Option<ChildStdin>,
+        /// rootless のコンテナ役は `unshare --kill-child` で、stdin の EOF では終わらない（drop で kill する）。
+        rootless: bool,
         a: Child,
         pid1: u32,
         cgroup_dir: PathBuf,
@@ -433,16 +481,43 @@ mod linux {
     impl Drop for Container {
         fn drop(&mut self) {
             drop(self.stdin.take());
+            if self.rootless {
+                // `--kill-child` が pid1 を道連れにする。
+                kill_and_reap(&mut self.a);
+            }
             let deadline = Instant::now() + Duration::from_secs(10);
             while self.a.try_wait().ok().flatten().is_none() {
                 if Instant::now() >= deadline {
-                    let _ = self.a.kill();
-                    let _ = self.a.wait();
+                    kill_and_reap(&mut self.a);
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            remove_cgroup(&self.cgroup_dir);
+            // cgroup 作成前（起動途中の失敗）は空のまま。
+            if !self.cgroup_dir.as_os_str().is_empty() {
+                remove_cgroup(&self.cgroup_dir);
+            }
+        }
+    }
+
+    /// 子を kill し、期限つきで回収する（`Child::wait()` は期限なしのため使わない。REPAIR-5）。
+    /// 回収できなければ標準エラーに記録して戻る（drop 内からも呼ぶため panic しない）。
+    fn kill_and_reap(child: &mut Child) {
+        let _ = child.kill();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                eprintln!(
+                    "exec: child {} was not reaped within 10s after kill",
+                    child.id()
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -481,8 +556,11 @@ mod linux {
         };
         let dir = PathBuf::from(format!("/sys/fs/cgroup{path}"));
         fs::create_dir(&dir).unwrap_or_else(|e| panic!("create the container cgroup: {e}"));
-        fs::write(dir.join("cgroup.procs"), pid.to_string())
-            .unwrap_or_else(|e| panic!("move pid1 into the container cgroup: {e}"));
+        if let Err(e) = fs::write(dir.join("cgroup.procs"), pid.to_string()) {
+            // 作った cgroup を残さない。
+            let _ = fs::remove_dir(&dir);
+            panic!("move pid1 into the container cgroup: {e}");
+        }
         (dir, path)
     }
 
@@ -525,28 +603,88 @@ mod linux {
 
     /// コンテナ（pivot 済みの pid1）を起動して cgroup へ入れる。`tag` は合図・pid ファイルの識別子。
     fn start_container(bundle: &Bundle, tag: &str, instance: u64) -> Container {
+        start_container_as(bundle, tag, instance, false)
+    }
+
+    /// [`start_container`] の本体。cgroup の作成と `prlimit` の 2 段は共通で、rootless でも orchestrator（pid1 の所有者）が
+    /// 非特権で行える。
+    ///
+    /// `rootless` のコンテナ役は `unshare(1)`（`--user --map-root-user --pid --fork --kill-child --mount --uts --ipc --net`）で、
+    /// `exec_setns_join` の rootless の場面と同じ構成。core の単一 ID 経路（`plan` → `isolate`）を使わないのは、
+    /// `Namespace` に network が無く（#1939）、user namespace へ参加した後は初期 user namespace が所有する netns へ
+    /// `setns` できない（core の `join_namespaces` は 5 種を必ず `setns` する）ため、netns を自前で分離する必要があるから。
+    /// uid_map / gid_map は `0 <euid> 1` / `0 <egid> 1`（setgroups は deny）で、launcher の単一 ID 経路と同じ写像になる。
+    /// pid1 の host 側 pid は、`unshare` の子のうち入れ子の PID 1（[`nested_pid1_child`]）として探す。
+    fn start_container_as(bundle: &Bundle, tag: &str, instance: u64, rootless: bool) -> Container {
         let exe = std::env::current_exe().expect("current_exe");
-        let mut a = Command::new(exe)
-            .arg("--container")
+        let ready_name = format!("ready-{tag}");
+        let mut a = if rootless {
+            let mut cmd = Command::new("unshare");
+            cmd.args([
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--kill-child",
+                "--mount",
+                "--uts",
+                "--ipc",
+                "--net",
+            ])
+            .arg(exe)
+            .arg("--pid1-rootless")
             .arg(bundle.rootfs())
-            .arg(format!("ready-{tag}"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .expect("spawn container process");
+            .arg(&ready_name)
+            // 名前空間内の egid は 0 になるため、host の egid を pid1 へ渡す（devpts の gid= の決定元）。
+            .arg(own_status_ids().1.to_string())
+            .stdin(Stdio::null());
+            cmd
+        } else {
+            let mut cmd = Command::new(exe);
+            cmd.arg("--container")
+                .arg(bundle.rootfs())
+                .arg(&ready_name)
+                .stdin(Stdio::piped());
+            cmd
+        }
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn container process");
+        // spawn 直後から RAII ガードで保持する。以降の panic（待ち合わせ・cgroup 作成・prlimit の失敗）でも
+        // drop が期限つきで kill・回収し、作成済みの cgroup を消す（pid1 と名前空間を残さない）。
         let stdin = a.stdin.take();
-        let ready = bundle.rootfs().join(format!("ready-{tag}"));
+        let mut container = Container {
+            stdin,
+            rootless,
+            a,
+            pid1: 0,
+            cgroup_dir: PathBuf::new(),
+            cgroup_path: String::new(),
+        };
+        let ready = bundle.rootfs().join(&ready_name);
         let pid_file = bundle.dir.join(format!("pid1-ready-{tag}"));
+        let mut found = None;
         wait_until("pid1 to pivot into the rootfs", || {
-            ready.exists() && pid_file.exists()
+            if rootless {
+                found = nested_pid1_child(container.a.id());
+                ready.exists() && found.is_some()
+            } else {
+                ready.exists() && pid_file.exists()
+            }
         });
-        let pid1: u32 = fs::read_to_string(&pid_file)
-            .expect("read pid1 pid")
-            .trim()
-            .parse()
-            .expect("pid1 pid");
+        let pid1: u32 = match found {
+            Some(pid) => pid,
+            None => fs::read_to_string(&pid_file)
+                .expect("read pid1 pid")
+                .trim()
+                .parse()
+                .expect("pid1 pid"),
+        };
         let scope = own_cgroup_path();
+        container.pid1 = pid1;
         let (cgroup_dir, cgroup_path) = create_container_cgroup(&scope, instance, pid1);
+        container.cgroup_dir = cgroup_dir;
+        container.cgroup_path = cgroup_path;
         // launch の `--ulimit` 相当: pid1 の NOFILE を既定と異なる値にし、exec プロセスが「pid1 と同じ値」を
         // 受け取ること（呼び出し元の既定値のままではないこと）を区別できるようにする。
         let prlimit = Command::new("prlimit")
@@ -576,13 +714,7 @@ mod linux {
             Some(0),
             "prlimit must raise pid1's NOFILE soft limit"
         );
-        Container {
-            stdin,
-            a,
-            pid1,
-            cgroup_dir,
-            cgroup_path,
-        }
+        container
     }
 
     // ---------------------------------------------------------------- joiner（再入）
@@ -870,8 +1002,7 @@ mod linux {
                 break s;
             }
             if Instant::now() >= deadline {
-                let _ = joiner.kill();
-                let _ = joiner.wait();
+                kill_and_reap(&mut joiner);
                 panic!("joiner did not exit within {:?}", timeout());
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -906,8 +1037,89 @@ mod linux {
         (mode.to_owned(), reason.to_owned())
     }
 
+    /// 1 回ぶんの通しの場面別の期待値（rootful と rootless で切り替える。#1887）。rootful は従来の照合を 1 つも
+    /// 弱めない値で組み立てる（[`RoundExpect::rootful`]）。
+    struct RoundExpect {
+        /// プローブの `Groups:`（空白区切りを 1 つの空白に正規化した値）。
+        groups: String,
+        /// 結果の `groups=`（`SupplementaryGroups::as_str`）。
+        groups_outcome: &'static str,
+        /// pid1 と一致を照合する `ns/` の種類。
+        namespaces: &'static [&'static str],
+        /// rootless のときだけ `Some`。
+        rootless: Option<RootlessExpect>,
+    }
+
+    /// rootless に固有の期待値。host の `/proc` から読む値は読み手（初期 user namespace）から見た値になる。
+    struct RootlessExpect {
+        /// orchestrator の euid / egid。`process.user` は 0:0 で、名前空間内の 0 が所有者へ写る。
+        euid: u32,
+        egid: u32,
+        /// orchestrator の `ns/user` のリンク先（コンテナの user namespace とは異なる）。
+        host_user_ns: String,
+    }
+
+    impl RoundExpect {
+        /// rootful: `Groups:` は空、結果は `cleared` / `already_empty`、`ns/user` は照合しない（user namespace を作らない）。
+        fn rootful() -> Self {
+            Self {
+                groups: String::new(),
+                groups_outcome: expected_groups_outcome(),
+                namespaces: &["mnt", "uts", "ipc", "net", "pid"],
+                rootless: None,
+            }
+        }
+
+        /// rootless: 所有者は初期 user namespace で `CAP_SETGID` を持たず、参加先は `setgroups` が `deny` のため、
+        /// 補助グループは joiner のまま（結果は `kept_setgroups_denied`、無ければ `already_empty`。`exec/reapply.rs`・#1457・#1462）。
+        fn rootless() -> Self {
+            let status = fs::read_to_string("/proc/self/status").expect("own status");
+            let groups = normalize_ws(&status_field(&status, "Groups:"));
+            let (euid, egid) = own_status_ids();
+            Self {
+                groups_outcome: if groups.is_empty() {
+                    "already_empty"
+                } else {
+                    "kept_setgroups_denied"
+                },
+                groups,
+                namespaces: &["user", "mnt", "uts", "ipc", "net", "pid"],
+                rootless: Some(RootlessExpect {
+                    euid,
+                    egid,
+                    host_user_ns: link("/proc/self/ns/user"),
+                }),
+            }
+        }
+    }
+
+    /// 空白区切りの値を 1 つの空白に正規化する。
+    fn normalize_ws(v: &str) -> String {
+        v.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// 自プロセスの `(euid, egid)`（`/proc/self/status` の `Uid:` / `Gid:` の 2 番目）。
+    fn own_status_ids() -> (u32, u32) {
+        let status = fs::read_to_string("/proc/self/status").expect("own status");
+        let second = |name: &str| -> u32 {
+            status_field(&status, name)
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} effective id missing"))
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} effective id"))
+        };
+        (second("Uid:"), second("Gid:"))
+    }
+
     /// 1 回ぶんの通し: `run_command` で参加・制限・exec し、稼働中のプローブをホスト側の `/proc` から観測する。
-    fn one_round(bundle: &Bundle, c: &Container, round: u32, original_cgroup: &str) {
+    fn one_round(
+        bundle: &Bundle,
+        c: &Container,
+        round: u32,
+        original_cgroup: &str,
+        expect: &RoundExpect,
+    ) {
         clean_probe_files(bundle);
         let probe = bundle.rootfs().join(PROBE);
         let scope = own_cgroup_path();
@@ -980,14 +1192,41 @@ mod linux {
             EXPECTED_ENVIRON,
             "{ctx}"
         );
-        assert_eq!(status_field(&status, "Groups:"), "", "{ctx}");
-        // namespace は pid1 と一致する（pid は参加後に fork した子の値）。
-        for ns in ["mnt", "uts", "ipc", "net", "pid"] {
+        assert_eq!(
+            normalize_ws(&status_field(&status, "Groups:")),
+            expect.groups,
+            "{ctx}"
+        );
+        // namespace は pid1 と一致する（pid は参加後に fork した子の値）。rootless は user namespace も含む。
+        for ns in expect.namespaces {
             assert_eq!(
                 link(&format!("/proc/{pid}/ns/{ns}")),
                 link(&format!("/proc/{}/ns/{ns}", c.pid1)),
                 "{ns} {ctx}"
             );
+        }
+        if let Some(r) = &expect.rootless {
+            // SEC-1・SEC-5: capability の値はコンテナの user namespace に対する権限で、host に対する権限ではない。
+            // コマンドの user namespace は orchestrator（初期 user namespace）と異なり、名前空間内の 0 が所有者へ写る。
+            assert_ne!(
+                link(&format!("/proc/{pid}/ns/user")),
+                r.host_user_ns,
+                "the command must be in the container's user namespace; {ctx}"
+            );
+            let uid = format!("{0} {0} {0} {0}", r.euid);
+            let gid = format!("{0} {0} {0} {0}", r.egid);
+            assert_eq!(normalize_ws(&status_field(&status, "Uid:")), uid, "{ctx}");
+            assert_eq!(normalize_ws(&status_field(&status, "Gid:")), gid, "{ctx}");
+            for (file, host_id) in [("uid_map", r.euid), ("gid_map", r.egid)] {
+                let map = |p: u32| {
+                    normalize_ws(
+                        &fs::read_to_string(format!("/proc/{p}/{file}"))
+                            .unwrap_or_else(|e| panic!("read {file} of {p}: {e}")),
+                    )
+                };
+                assert_eq!(map(pid), format!("0 {host_id} 1"), "{file} {ctx}");
+                assert_eq!(map(pid), map(c.pid1), "{file} equals pid1's; {ctx}");
+            }
         }
         // cgroup: コマンドはコンテナ用 cgroup の直下の exec 用の子 cgroup（`exec-<nonce>` の 1 要素。#1466）に
         // いて、joiner が元いた cgroup と異なる。通しの後に子 cgroup は削除済み（コンテナ cgroup 直下に残らない）。
@@ -1061,7 +1300,7 @@ mod linux {
                 ExecExit::Command(ChildExit::Signaled(15)),
                 parse_after(&out, "caps_dropped="),
                 parse_after(&out, "seccomp_instructions="),
-                expected_groups_outcome(),
+                expect.groups_outcome,
             ),
             "{ctx}"
         );
@@ -1122,8 +1361,7 @@ mod linux {
         struct Guard(Child);
         impl Drop for Guard {
             fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
+                kill_and_reap(&mut self.0);
             }
         }
         let guard = Guard(unshare);
@@ -1313,7 +1551,7 @@ mod linux {
                 .and_then(|r| r.split_whitespace().nth(1).map(str::to_owned))
                 .as_deref(),
             Some("0"),
-            "this test needs root (rootful pivot_root, cgroup v2 writes); rootless exec is not implemented"
+            "this scenario needs root (rootful pivot_root, cgroup v2 writes); for the non-root scenario run with `--ignored --rootless` (see AGENTS.md)"
         );
         let bundle = make_bundle();
         verify_bundle_definition(&bundle);
@@ -1323,7 +1561,13 @@ mod linux {
         let a = start_container(&bundle, "a", 1000);
         // 5 回の通し（本番の `identify_pid1` 経路。記録の cgroup 配置から期待 cgroup を導く）。
         for round in 1..=ROUNDS {
-            one_round(&bundle, &a, round, &original_cgroup);
+            one_round(
+                &bundle,
+                &a,
+                round,
+                &original_cgroup,
+                &RoundExpect::rootful(),
+            );
             // #1466: 通しの後に exec 用の子 cgroup は削除済み（コンテナ cgroup 直下に残らない）。
             let left: Vec<String> = fs::read_dir(&a.cgroup_dir)
                 .expect("read the container cgroup")
@@ -1341,5 +1585,111 @@ mod linux {
         drop(b);
         unpivoted_target_is_rejected(&bundle);
         println!("exec: {ROUNDS}/{ROUNDS} exec verified");
+    }
+
+    /// 検証できない環境を知らせて終了する（`exit 2`。成功を装わない。rootless の事前検査用）。
+    fn not_verified(reason: &str) -> ! {
+        eprintln!("exec: not verified (rootless): {reason}");
+        std::process::exit(2);
+    }
+
+    /// rootless の場面の事前検査（副作用の前。満たさなければ `exit 2`）。この後の不一致はすべて試験の失敗とする。
+    fn rootless_preconditions() {
+        let (euid, _) = own_status_ids();
+        if euid == 0 {
+            not_verified(
+                "running as root; use the rootful scenario (`--ignored` without `--rootless`)",
+            );
+        }
+        let proc_sys = |p: &str| fs::read_to_string(p).ok().map(|v| v.trim().to_owned());
+        if proc_sys("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").as_deref()
+            == Some("1")
+        {
+            not_verified(
+                "kernel.apparmor_restrict_unprivileged_userns=1 forbids unprivileged user namespaces",
+            );
+        }
+        if proc_sys("/proc/sys/user/max_user_namespaces").as_deref() == Some("0") {
+            not_verified("user.max_user_namespaces=0");
+        }
+        // 実際に試す（期限つき。REPAIR-5）。
+        let probe = Command::new("unshare")
+            .args(["--user", "--map-root-user", "true"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        match probe {
+            Ok(child) => {
+                if finish_joiner(child).0 != Some(0) {
+                    not_verified(
+                        "an unprivileged user namespace cannot be created (`unshare --user --map-root-user`)",
+                    );
+                }
+            }
+            Err(e) => not_verified(&format!("cannot run `unshare` (util-linux): {e}")),
+        }
+        if let Err(e) = fandhe_container_core::landlock::detect_landlock_abi() {
+            not_verified(&format!("Landlock ABI 6+ is required (Linux 6.12+): {e}"));
+        }
+        if let Err(e) = fandhe_container_core::cgroups::DelegatedCgroup::detect() {
+            not_verified(&format!(
+                "not inside a delegated cgroup v2 (run under `systemd-run --user --scope -p Delegate=yes`): {e}"
+            ));
+        }
+        let own = own_cgroup_path();
+        let kill = PathBuf::from(format!("/sys/fs/cgroup{own}")).join("cgroup.kill");
+        if !kill.exists() {
+            not_verified("cgroup.kill is missing in the own cgroup (Linux 5.14+ is required)");
+        }
+        let prlimit = Command::new("prlimit")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .ok()
+            .map(|child| finish_joiner(child).0);
+        if prlimit != Some(Some(0)) {
+            not_verified("`prlimit` (util-linux) is not available");
+        }
+        // 削減後の期待値（OCI 既定集合）が成り立つには、joiner の bounding set がそれを含む必要がある。
+        let status = fs::read_to_string("/proc/self/status").expect("own status");
+        let bnd = u64::from_str_radix(&status_field(&status, "CapBnd:"), 16).expect("CapBnd");
+        let want = u64::from_str_radix(OCI_DEFAULT_CAPS, 16).expect("default caps");
+        if bnd & want != want {
+            not_verified("the bounding set does not contain the OCI default capability set");
+        }
+    }
+
+    /// rootless の場面（`--ignored --rootless`。#1887・SUP-6・SEC-1・SEC-5・CORE-5・CORE-6・REPAIR-12）。
+    ///
+    /// 分離の理由: 非 root・非特権 user namespace・Landlock ABI 6+・委譲 cgroup v2・x86_64 を要し、GitHub ホステッド
+    /// runner では保証できない。環境が揃わないときは [`rootless_preconditions`] が `exit 2` で「検証していない」ことを
+    /// 知らせる。成功経路の 5 回に限り、拒否経路は rootful の場面が担う。
+    fn orchestrate_rootless() {
+        rootless_preconditions();
+        let bundle = make_bundle();
+        verify_bundle_definition(&bundle);
+        verify_probe_on_host(&bundle);
+        let original_cgroup = own_cgroup_path();
+
+        let a = start_container_as(&bundle, "a", 1000, true);
+        for round in 1..=ROUNDS {
+            one_round(
+                &bundle,
+                &a,
+                round,
+                &original_cgroup,
+                &RoundExpect::rootless(),
+            );
+            // #1466: 通しの後に exec 用の子 cgroup は削除済み。
+            let left: Vec<String> = fs::read_dir(&a.cgroup_dir)
+                .expect("read the container cgroup")
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.starts_with("exec-"))
+                .collect();
+            assert_eq!(left, Vec::<String>::new(), "round {round}");
+        }
+        println!("exec: {ROUNDS}/{ROUNDS} rootless exec verified");
     }
 }

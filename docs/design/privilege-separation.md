@@ -2,11 +2,11 @@
 
 sudo＋pty に頼らない権限昇格方式（setuid バイナリ・capability ベース）の選択肢と、本リポが rootful で必要とする最小権限を整理する（SUP-14）。
 
-> **位置づけ**: 方式は承認済み（オーナー判断 2026-10-10・[#1454](https://github.com/Fandhe-AI/fandhe-container/issues/1454)）。(c) 特権ランチャー＋ ambient capability を既定とし、xattr 非対応の環境に限り (a) setuid root を代わりに認める。どちらも失敗したら fail-closed にし、sudo へは戻らない。`unsafe` の syscall ラッパーは `crates/supervisor/src/sys`（Linux 版）に置く（事前承認の範囲）。ランチャーは `crates/supervisor` の bin（`fandhe-container-launcher`）とし、実装は #1719 で行う。9 章を採用方式として更新した。7 章に supervisor の入口の dumpable=0 を追記した（SUP-14 の 2026-10-16 明記・#2102）。縮退の適用と読み戻し検証は TASK-171.1.3（#1475）で `privilege::elevate` として実装済みで、境界は 10 章末尾の補足を参照。
+> **位置づけ**: 方式は承認済み（オーナー判断 2026-10-10・[#1454](https://github.com/Fandhe-AI/fandhe-container/issues/1454)）。(c) 特権ランチャー＋ ambient capability を既定とし、xattr 非対応の環境に限り (a) setuid root を代わりに認める。どちらも失敗したら fail-closed にし、sudo へは戻らない。`unsafe` の syscall ラッパーは `crates/supervisor/src/sys`（Linux 版）に置く（事前承認の範囲）。ランチャーは `crates/supervisor` の bin（`fandhe-container-launcher`）とし、実装は #1719 で行う。9 章を採用方式として更新した。7 章に supervisor の入口の dumpable=0 を追記した（SUP-14 の 2026-10-16 明記・#2102）。縮退の適用と読み戻し検証は TASK-171.1.3（#1475）で `privilege::elevate` として実装済みで、境界は 10 章末尾の補足を参照。要素 (B)（セッション切り離しと pty 非経由の検証）は TASK-171.2（#537）で `privilege::detach_session` として実装済み（5 章 1・10 章末尾の補足）。
 
 - 対象ビヘイビア: SUP-14（Must・確定。関連: SUP-1・CORE-1・CORE-5・CORE-6・SEC-1・SEC-5・PLUG-11・ERR-1・REPAIR-5・D-19）
 - タスク: TASK-171（MS-9・G12・担当: 共同）。本書は TASK-171.1.1（#857。親 #536・#535）
-- 後続: #858（TASK-171.1.2。成果物 `crates/supervisor/src/privilege.rs`〔仮称〕）・#537（TASK-171.2 pty 非経由の起動経路）・#538（TASK-171.3 SIGKILL 継続テスト）・#539（TASK-171.h1。実装後のセキュリティレビュー・実機検証。人間担当）
+- 後続: #858（TASK-171.1.2。成果物 `crates/supervisor/src/privilege.rs`〔仮称〕）・#537（TASK-171.2 pty 非経由の起動経路）・#538（TASK-171.3 SIGKILL 継続テスト。`crates/supervisor/tests/privilege.rs` で `script` による模擬として実装済み）・#539（TASK-171.h1。実装後のセキュリティレビュー・実機検証。人間担当）
 - 出典: `docs/spec/04-behavior/api-supervisor.md` の `SUP-14`、`03-poc/supervisor-model/README.md` の発見事項 1（PoC-17）、`05-tasks.md` の TASK-171、`api-runtime-core.md` の `CORE-6`、`security-isolation.md` の `SEC-1`・`SEC-5`（submodule リビジョン `984f8a2`。7 章の supervisor の dumpable=0 は SUP-14 の 2026-10-16 明記〔spec#23・リビジョン `6a3e546`〕による）。外部事実の出典は 3 章末尾に URL と確認日（2026-10-06）を付す
 
 ## 1. 問題の整理
@@ -20,7 +20,7 @@ PoC-17 発見事項 1: コンテナごとに `sudo <supervisor> run ...` を起�
 | (A) 権限の取得手段 | 非特権ユーザーが必要な権限をどう得るか | setuid か capability（2 章） |
 | (B) セッション切り離し | supervisor が呼び出し元の制御端末・セッションに紐づかない | `setsid`・制御端末なし・標準入出力が pty を指さない |
 
-- **(B) はどの方式を選んでも必須**である。「capability 方式を選べば SUP-14 が解決する」わけではない。(B) の実装は #537（TASK-171.2）の範囲である
+- **(B) はどの方式を選んでも必須**である。「capability 方式を選べば SUP-14 が解決する」わけではない。(B) の実装は #537（TASK-171.2）の範囲で、ランチャーの入口に実装済み（5 章 1）
 - (A) は pty を介さないことで、昇格プロセスの kill が子孫に波及する経路そのものを除く。(B) は呼び出し元端末の消滅（SIGHUP）に対する独立性を与える
 
 ## 2. 前提と制約
@@ -50,7 +50,7 @@ PoC-17 発見事項 1: コンテナごとに `sudo <supervisor> run ...` を起�
 | 必要最小権限 | 縮退後の集合は他案と同じ（4 章）。縮退までの時間だけ root | 4 章の集合を保持 | 4 章の集合。ランチャーは短命、supervisor は集合を保持 |
 | 主な攻撃面 | `LD_*`・`PATH` 等の環境変数、引数、fd 継承、cwd、core dump・ptrace | 同左（安全実行モードの扱いは未確認） | 同左（ランチャー側）。ambient 継承の取りこぼし |
 | `nosuid` / `no_new_privs` の影響 | `nosuid` マウント上や `no_new_privs` 下では昇格しない（fail-closed に倒せる。未照合は 12 章） | file caps も同様に効かない（同） | ランチャーのみが影響を受ける |
-| テスト容易性 | 属性付与に root が必要。GitHub ホステッド runner では昇格の実動作検証が難しい（実機は #538・#539） | 同左 | 同左。縮退ロジックは属性なしでも単体テストできる |
+| テスト容易性 | 属性付与に root が必要。GitHub ホステッド runner では昇格の実動作検証が難しい（実機は #539。SIGKILL の継続は #538 の `tests/privilege.rs` で模擬済み） | 同左 | 同左。縮退ロジックは属性なしでも単体テストできる |
 
 外部事実（capabilities(7)。https://man7.org/linux/man-pages/man7/capabilities.7.html。確認日 2026-10-06）:
 
@@ -84,7 +84,7 @@ rootful 時に、本リポのコードが行う特権操作と、それに要す
 
 ## 5. 権限の保持期間と縮退手順
 
-1. ランチャーが `setsid` し、制御端末・標準入出力が pty でないことを確認する（(B)。#537）
+1. ランチャーが `setsid` し、制御端末・標準入出力が pty でないことを確認する（(B)。#537。実装済み）。順序は、標準入出力が端末でないことの判定（端末なら `setsid` の前に拒否）→ `setsid` → `/proc/self/stat` の読み戻しで `session == pid`・`pgrp == pid`・`tty_nr == 0` を確認、とする。`setsid` が `EPERM`（プロセスグループのリーダーとして起動された）のときは、読み戻しで上の 3 条件を満たす場合に限り「既に切り離されている」として成功扱いにし、それ以外は拒否する。fork で回避しない（ランチャーは exec で置き換わり待機しない契約のため）。**起動側の契約**: ランチャーを `process_group(0)` で起動しない（`setsid` が新しいセッションとプロセスグループを作るので代わりになる）。標準入出力に pty を渡さない。CLI の `supervisor_start.rs` は supervisor を `process_group(0)` で起動するが、ランチャーを選ぶ規則はまだ無く（rootful は spawn 前に `UNIMPLEMENTED`）、その規則を入れる際にこの契約を守る
 2. 環境変数をサニタイズ（`LD_*`・`PATH` 等を信用しない）し、引数・cwd・継承 fd を検証する
 3. 必要最小集合以外を bounding set から落とす（`CAP_SETPCAP` が要る）
 4. 必要最小集合だけを inheritable・ambient に載せ、supervisor を exec する（(c)）。(a) の場合は uid を非特権へ戻す前に `PR_SET_KEEPCAPS` を 1 にして、setuid 遷移で permitted が失われないようにする。`setresuid` で非特権 UID へ戻した直後は effective が落ちるため、`capset` で permitted・effective・inheritable を必要最小集合に再設定し、ambient へ載せたうえで `PR_SET_KEEPCAPS` を 0 に戻す。`capget`・`/proc/self/status` の `CapPrm`・`CapEff`・`CapAmb` が期待集合と一致することを exec 前に検証し、不一致なら 6 章に従い fail-closed とする
@@ -132,14 +132,14 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 
 - 特権付きファイル属性を持つバイナリを最小のランチャー 1 つに限定でき、supervisor 本体はコピー・更新の自由度を保てる（3 章比較）
 - uid 0 にならず、4 章の集合だけを保持できる（(a) は縮退を誤ると全権限が残る）
-- pty を経由しないため SUP-14 の巻き添え経路を除ける。(B) は #537 で併せて実装する
+- pty を経由しないため SUP-14 の巻き添え経路を除ける。(B) は #537 で実装済み
 
 採らない理由・留意点:
 
 - (a) setuid: 常に完全な root である期間が生じる。ただし xattr 非対応環境では唯一の選択肢になりうる
 - (b) supervisor 本体への file caps: 特権付きバイナリが大きくなり、配布の自由度も下がる
 - 現状の暫定（sudo＋`setsid`）: sudo と pty に依存し続ける
-- (c) の欠点（ambient の子への継承）は 5 章の手順で落とす。取りこぼしがないことは #538・#539 の実機検証が必要で、本書では確認していない
+- (c) の欠点（ambient の子への継承）は 5 章の手順で落とす。取りこぼしがないことは #539 の実機検証が必要で、本書では確認していない
 
 方式の承認は #1454 のオーナー判断（2026-10-10）で記録済み。
 
@@ -153,14 +153,14 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 
 補足:
 
-- 方式非依存の純ロジック（必要最小集合・`/proc/<pid>/status` のパースと昇格結果の fail-closed 検証・縮退計画の算出。縮退後は uid・gid 0 と補助グループの残存も拒否し、補助グループは空のみ許可する。縮退計画は 5 章 4 のとおり uid 遷移がある場合に `PR_SET_KEEPCAPS` の設定と解除を対で含み、解除を最終手順とする。検証は `PR_GET_KEEPCAPS` の読み戻し結果を入力に取り、残存・未確認を拒否する）は `crates/supervisor/src/privilege.rs` に実装済み（TASK-171.1.2・#858）。縮退を実際に適用する `privilege::elevate`（単一スレッドの確認 → 方式の前提確認 → `plan_reduction` → `ReductionPlan::steps` の順に適用〔補助グループ消去・`setresgid`・bounding 削除・`PR_SET_KEEPCAPS`・`setresuid`・`capset`・ambient 載せ〕→ `PR_GET_KEEPCAPS` と `/proc/self/status` の読み戻し → `verify_elevation`）は TASK-171.1.3（#1475）で実装済み。どの段で失敗しても `Err` を返し、`Err` のときプロセスは部分的に縮退した状態にあるため、呼び出し元は exec も特権操作もせず非ゼロで終了する。目標の uid / gid は呼び出し元の real から決める。方式 (c) の file capability には最小集合に加えて、補助グループを持つ利用者向けに `CAP_SETGID`（effective）が要る。ランチャー bin（入口検証・fd 検証付き `execveat`）は #1719 で実装済み（7 章の「実装の対応」）。file capability / setuid の付与は `scripts/install-privileged-launcher.sh`（#1721。下記「インストールスクリプト」）で実装済み。未実装は子での ambient 解除である。ambient を落とす箇所は、コンテナの子は core の制限段（capability 段で ambient を全消去）、supervisor の healthcheck コマンド実行は未実装（TASK-161.2・#495。実装時に子で ambient を落としてから exec する）。取りこぼしがないことの確認は実機検証（#538・#539）で行う。実機のランチャー試験は `crates/supervisor/tests/launcher_entry_real.rs`（`-- --ignored`）実機の縮退試験は `crates/supervisor/tests/privilege_elevate.rs`（`-- --ignored`。実行は #539）
+- 方式非依存の純ロジック（必要最小集合・`/proc/<pid>/status` のパースと昇格結果の fail-closed 検証・縮退計画の算出。縮退後は uid・gid 0 と補助グループの残存も拒否し、補助グループは空のみ許可する。縮退計画は 5 章 4 のとおり uid 遷移がある場合に `PR_SET_KEEPCAPS` の設定と解除を対で含み、解除を最終手順とする。検証は `PR_GET_KEEPCAPS` の読み戻し結果を入力に取り、残存・未確認を拒否する）は `crates/supervisor/src/privilege.rs` に実装済み（TASK-171.1.2・#858）。縮退を実際に適用する `privilege::elevate`（単一スレッドの確認 → 方式の前提確認 → `plan_reduction` → `ReductionPlan::steps` の順に適用〔補助グループ消去・`setresgid`・bounding 削除・`PR_SET_KEEPCAPS`・`setresuid`・`capset`・ambient 載せ〕→ `PR_GET_KEEPCAPS` と `/proc/self/status` の読み戻し → `verify_elevation`）は TASK-171.1.3（#1475）で実装済み。どの段で失敗しても `Err` を返し、`Err` のときプロセスは部分的に縮退した状態にあるため、呼び出し元は exec も特権操作もせず非ゼロで終了する。目標の uid / gid は呼び出し元の real から決める。方式 (c) の file capability には最小集合に加えて、補助グループを持つ利用者向けに `CAP_SETGID`（effective）が要る。ランチャー bin（入口検証・fd 検証付き `execveat`）は #1719 で実装済み（7 章の「実装の対応」）。file capability / setuid の付与は `scripts/install-privileged-launcher.sh`（#1721。下記「インストールスクリプト」）で実装済み。(B) のセッション切り離しは TASK-171.2（#537）で `privilege::detach_session` として実装済み（ランチャーの入口で `elevate` より前に実行。拒否は `FAILED_PRECONDITION`、syscall の失敗は `INTERNAL`、メッセージの接頭辞は `session detach failed:`）。未実装は子での ambient 解除である。ambient を落とす箇所は、コンテナの子は core の制限段（capability 段で ambient を全消去）、supervisor の healthcheck コマンド実行は未実装（TASK-161.2・#495。実装時に子で ambient を落としてから exec する）。取りこぼしがないことの確認は実機検証（#539）で行う。実機のランチャー試験は `crates/supervisor/tests/launcher_entry_real.rs`（`-- --ignored`）実機の縮退試験は `crates/supervisor/tests/privilege_elevate.rs`（`-- --ignored`。実行は #539）
 - setuid ビット・`setcap` の付与はインストール時の操作で、`scripts/install-privileged-launcher.sh` が行う（下記「インストールスクリプト」）
 - 事前承認の範囲は各 crate の `sys` モジュール内の syscall ラッパーに限られる（`elevate` のラッパーは `crates/supervisor/src/sys/linux.rs`。#1719 の `execveat` 等も同じ `sys` に足す）
-- 実機検証（sudo の `SIGKILL` 再現・昇格の実動作）は #538・#539 で扱い、本書の範囲外とする
+- `sudo` の `SIGKILL` 後の子孫の継続は `crates/supervisor/tests/privilege.rs`（#538。util-linux の `script` による模擬で既定集合）で確認済み。実 `sudo` での再現・昇格の実動作の実機検証は #539 で扱い、本書の範囲外とする
 
 ### インストールスクリプト（#1721・TASK-171 追補）
 
-`scripts/install-privileged-launcher.sh --launcher <file> --launcher-sha256 <hex> --supervisor <file> --supervisor-sha256 <hex> --cli <file> --cli-sha256 <hex> [--dest-dir <絶対パス>]` を root で実行する（パッケージの postinst からも `--dest-dir` を渡して呼べる）。スクリプト内で sudo は呼ばない。自己テストは `make install-launcher-selftest`（スタブのみ・root 不要）。root での実機実行と検証は人間担当（#538・#539）。
+`scripts/install-privileged-launcher.sh --launcher <file> --launcher-sha256 <hex> --supervisor <file> --supervisor-sha256 <hex> --cli <file> --cli-sha256 <hex> [--dest-dir <絶対パス>]` を root で実行する（パッケージの postinst からも `--dest-dir` を渡して呼べる）。スクリプト内で sudo は呼ばない。自己テストは `make install-launcher-selftest`（スタブのみ・root 不要）。root での実機実行と検証は人間担当（#539）。
 
 - 配置先は既定 `/usr/local/libexec/fandhe-container`。根から配置先までの全要素が root 所有・g/o 書き込み不可の通常ディレクトリ（symlink 不可）でなければ、補修も上書きもせず終了コード 3 で止まる（7 章）。supervisor と CLI（`fandhe-container`）もランチャーと同じ条件で、同じディレクトリに置く（#2068）。CLI の `start` は自分の実体と同じディレクトリの supervisor を起動する（#1718）ため、CLI を別の場所に置くと見つけられない。CLI と supervisor は起動契約（`FCSUP1`）の版が揃っている必要があり、`--cli` は必須にして 3 つを一組で更新する。CLI には capability も setuid も付けず、supervisor と同じく付いていないことと `755` を読み戻す。`PATH` 上の symlink（例: `/usr/local/bin/fandhe-container` から配置先の CLI）はスクリプトでは作らず、root の手作業とする（手順は [docs/setup/linux.md](../setup/linux.md)）。symlink から起動しても、`current_exe()` は実体のパスを返すので実体のディレクトリの supervisor が使われる（CLI の結合試験で照合）。symlink はインストーラの信頼チェーンの外にあるが、CLI と supervisor の間に権限の境界は無く（同一ユーザーで起動する）、特権経路はランチャーが自分の実体の隣の supervisor を自前で検証する（#1719）ため、昇格の経路にはならない。rootless 向けの置き場所も同じ文書に書く。
 - 入力元の照合（#2137。SUP-14、方式は PLUG-11 の「許可済み sha256 ハッシュ一覧が既定・署名は opt-in の将来拡張」に倣う）: 3 つの入力元それぞれの許可済み sha256（64 桁の 16 進。大文字は小文字へ正規化）を `--launcher-sha256`・`--supervisor-sha256`・`--cli-sha256` で渡す。3 つとも必須で、省く既定は無い（欠落は終了コード 2）。照合するのは入力元のパスではなく、fd から複製した配置先の一時ファイルである。入力元は開いた後にパスの先を差し替えられうるが、一時ファイルは root 所有の配置先の中にあり root しか変えられず、rename は inode を保つので、照合した中身がそのまま最終名になる（rename 後の再ハッシュはしない）。照合は属性の変更（chown・chmod・setcap）より前に行い、不一致は `error: source-hash-mismatch`（終了コード 3。期待値と実際の値を示す）で属性の変更も置換もせずに止まる。`sha256sum` が無ければ `error: sha256sum-unavailable`（終了コード 3）で、別のツールへは替えない。`sha256sum` の想定外の出力は終了コード 1 の `install-failed`、期限超過は `operation-timeout`。防ぐのはビルドとインストールの間の差し替え・破損・取り違えで、期待値は入力元とは別の経路（リリースの SHA256SUMS、または信頼できるビルドホストで取った値）から得ることが前提になる（入力元と同じ時点で計算し直した値では保護にならない）。期待値をマニフェストファイルで渡す方式は採らない（親シェルが開くファイルが増え、ファイル自体の信頼性検証が要るため）。署名の検証は未実装で、PLUG-11 の opt-in の将来拡張とする。差し込む位置は「一時ファイルへの複製の後、属性の変更の前」で、ハッシュ照合と置き換えるか併用するかは決めていない（形式・鍵の管理も未定）。
@@ -183,10 +183,12 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 | ---- | ---- |
 | `prctl(2)`・`execve(2)`・`setsid(2)`・`mount(8)` の `nosuid`・sudoers `use_pty` の原文照合 | 未確認 |
 | `CAP_SYS_CHROOT`・UTS namespace・cgroup 書き込み権限の要否 | 未確認（4 章の「想定」） |
+| セッションリーダーが `O_NOCTTY` を付けずに tty を `open` すると制御端末を再取得しうる | 未確認（supervisor は状態ルート配下のファイルとソケットしか開かない前提。実機での確認は #539） |
+| `sudo`（`use_pty`）経由で起動すると標準入出力が pty になりランチャーが拒否する | 設計どおり（「sudo へ戻らない」の帰結。回避手段は設けない） |
 | file capabilities 付きバイナリの AppArmor 等の LSM 下の挙動 | 未確認 |
 | macOS・Windows（VM 内）で本方式が不要であること | 要確認（MAC・WIN 系ビヘイビア） |
 | rootless（CORE-6）経路との関係 | PoC 未検証 |
 | ランチャーの実行時の supervisor の hash / 署名照合の要否（PLUG-11 との整合） | 未確認（#1719 は所有権と書き込み権限のみで信頼を判断） |
 | インストール時の入力元のハッシュ照合 | 決定・実装済み（#2137。許可済み sha256 を引数で渡し、複製した一時ファイルを照合する。10 章） |
 | インストール時の署名検証 | 未採用（PLUG-11 の opt-in の将来拡張。差し込む位置は 10 章） |
-| 再検証条件 | 実機（root 権限・対象カーネル）で #538・#539 を実施するとき |
+| 再検証条件 | 実機（root 権限・対象カーネル）で #539 を実施するとき |

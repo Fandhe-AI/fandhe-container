@@ -174,12 +174,12 @@ fn sec5_special_bits_via_public_api_with_real_owner() {
             .mode()
             & 0o7777
     };
-    // special_bits_to_keep は setuid / setgid を独立に判定する（所有者が host root のビットだけ落ちる）。
+    // setuid は uid、setgid は uid と gid の両方で判定する（所有 uid が host root なら setgid も落ちる。#2251 P2-1）。
     let mut expected_mapped = 0o755;
     if uid != 0 {
         expected_mapped |= 0o4000;
     }
-    if gid != 0 {
+    if uid != 0 && gid != 0 {
         expected_mapped |= 0o2000;
     }
     // preserved_files は要求した特殊ビットをすべて保持したファイルだけを数える（一部でも落ちれば除去側）。
@@ -190,6 +190,14 @@ fn sec5_special_bits_via_public_api_with_real_owner() {
         r.files_with_stripped_special_bits,
         2 + u64::from(mapped_stripped)
     );
+    // ビットごとの件数: 残ったビットは preserved_bits、残らなかったビットだけが stripped_bits に数えられる（P2-6）。
+    let (kept_uid, kept_gid) = (u64::from(uid != 0), u64::from(uid != 0 && gid != 0));
+    let bits = r.special_bits;
+    assert_eq!(bits.preserved_bits.setuid, kept_uid);
+    assert_eq!(bits.preserved_bits.setgid, kept_gid);
+    // 求めたのは setuid・setgid ともに 2 件（mapped と other_*）。
+    assert_eq!(bits.stripped_bits.setuid, 2 - kept_uid);
+    assert_eq!(bits.stripped_bits.setgid, 2 - kept_gid);
     assert_eq!(mode("mapped"), expected_mapped);
     assert_eq!(mode("other_uid"), 0o755);
     assert_eq!(mode("other_gid"), 0o755);

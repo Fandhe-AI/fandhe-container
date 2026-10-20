@@ -29,7 +29,16 @@ root="$(mktemp -d)"
 trap 'rm -rf "$root"' EXIT
 
 pass() { echo "PASS: $1"; }
-fail() { echo "FAIL: $1" >&2; failures=$((failures + 1)); }
+# 失敗時は現在の case の stderr を 1 case につき 1 回だけ出す（CI ログから原因を辿れるようにする。#2154・REPAIR-4）。
+err_shown=""
+fail() {
+  echo "FAIL: $1" >&2
+  failures=$((failures + 1))
+  if [ -n "${ERR:-}" ] && [ "$err_shown" != "$ERR" ] && [ -s "$ERR" ]; then
+    err_shown="$ERR"
+    sed "s/^/  [case ${case_no:-0} err] /" "$ERR" >&2 || true
+  fi
+}
 
 # スタブ群。実バイナリの契約（#1717・#1819）に合わせ、CLI は `--root R create --bundle B <id>`、systemd-run は
 # `--user --scope --quiet -p Delegate=yes -- <cmd...>`（exec するので pid は変わらない）、supervisor は
@@ -38,12 +47,31 @@ fail() { echo "FAIL: $1" >&2; failures=$((failures + 1)); }
 # STUB_MODE: normal（監視プロセスが死んでもコンテナは残る）/ collateral（対象の死で他の監視プロセスも死ぬ）/
 # die_with_target（対象のコンテナが監視プロセスと共に死ぬ）/ other_dies（他コンテナが対象の死で死ぬ）/
 # scrub_env（コンテナ側プロセスが環境変数を継承しない）/ no_ready（報告を出さない）/ err_report（FCSUP1 ERR）/ bad_report（書式不正）/ short_start（最後の launcher が起動直後に終了）/ restart（コンテナを再起動する）/ restart_aux（補助プロセスだけ増やす）/ restart_short（再起動後すぐ終了）/ restart_sup_dies（再起動後に監視プロセスが終了）/ restart_alias（同名・別コマンドの補助プロセスだけ増やす）/ many_kids（子孫が走査上限 512 件を超える）/ mid_only（対象だけ、一時的な中間プロセスを観測させた後、報告なしで終了し、木の外の init を残す）。
+# split_report（対象の報告行を pid の途中で 2 回に分けて書く。#2154）。
 # 待機はすべて組み込みの read -t（fork しない）で行い、一過性の子プロセスを作らない。
 mkdir -m 0755 "${root}/bin"
 cat >"${root}/bin/fandhe-container" <<'STUB'
 #!/usr/bin/env bash
+if [ "$1" = --root ] && [ "$3" = stop ] && [ "$#" -eq 4 ]; then
+  # stop スタブ。呼び出しを記録し、STUB_STOP で挙動を切り替える（ok / fail / ignore / hang）。
+  echo "stop $4" >>"$STUB_DIR/cli.log"
+  case "${STUB_STOP:-ok}" in
+    ok)
+      : >"$STUB_DIR/$4.stopped"
+      read -r cp <"$STUB_DIR/$4.cpid" 2>/dev/null && kill -TERM "$cp" 2>/dev/null
+      exit 0 ;;
+    fail) echo '{"code":"UNAVAILABLE","message":"stub"}' >&2; exit 9 ;;
+    ignore) exit 0 ;;
+    hang)
+      # fork せずに待つ（期限で打ち切られたとき、孤児の子を残さない）。
+      mkfifo "$STUB_DIR/hang.$$" && exec 8<>"$STUB_DIR/hang.$$" && read -t 300 -u 8
+      exit 0 ;;
+  esac
+  exit 2
+fi
 [ "$1" = --root ] && [ "$3" = create ] && [ "$4" = --bundle ] && [ "$#" -eq 6 ] || exit 2
 [ -f "$5/config.json" ] && [ -d "$5/rootfs" ] || exit 2
+echo "create $6" >>"$STUB_DIR/cli.log"
 mkdir -p "$2/$6" && echo '{"status":"created"}' >"$2/$6/state.json"
 STUB
 cat >"${root}/systemd-run" <<'STUB'
@@ -108,6 +136,15 @@ trap 'kill "$c" 2>/dev/null; exit 0' TERM
 case "$STUB_MODE" in
   no_ready) ;;
   bad_report) echo "FCSUP1 OK pid" ;;
+  split_report)
+    if [ "$role" = t ]; then
+      # 本体の read -t 0.05 より長くあけ、期限切れが必ず行の途中で起きるようにする。
+      printf 'FCSUP1 OK %s' "${c:0:1}"
+      read -t 0.3 -u 9 || true
+      echo "${c:1}"
+    else
+      echo "FCSUP1 OK $c"
+    fi ;;
   *) echo "FCSUP1 OK $c" ;;
 esac
 while :; do
@@ -118,6 +155,8 @@ while :; do
     continue
   fi
   wait "$c" || true
+  # CLI の stop 経由でコンテナが止められたとき（stop スタブが .stopped を作る）は終了コード 0 で終わる。
+  if [ -e "$STUB_DIR/$id.stopped" ]; then exit 0; fi
   if [ "$STUB_MODE" = restart ] || [ "$STUB_MODE" = restart_sup_dies ]; then
     sleep 300 &
     c=$!
@@ -229,6 +268,37 @@ else
   fail "normal: target_container_reparented_to is not a pid ($(json_get target_container_reparented_to "$OUT"))"
 fi
 if grep -q -e '/fandhe-container-supervisor' -e "${root}" "$OUT" "$ERR"; then fail "normal: output leaks a path"; else pass "normal: output has no binary/bundle path"; fi
+# stop 経由の後始末（#2163・CLI-1・SUP-5）: 対象（-3）を除く 4 個へ stop を呼び、create の後に呼ぶ。
+expect_eq "normal: stop calls" "selfsi-1 selfsi-2 selfsi-4 selfsi-5" "$(sed -n 's/^stop //p' "$(dirname "$OUT")/cli.log" | tr '\n' ' ' | sed 's/ $//')"
+expect_eq "normal: create calls" 5 "$(grep -c '^create ' "$(dirname "$OUT")/cli.log")"
+expect_eq "normal: first stop comes after the last create" "stop" "$(sed -n '6p' "$(dirname "$OUT")/cli.log" | cut -d' ' -f1)"
+if grep -q 'info: cli-stop: 4/4 supervisors exited after stop' "$ERR"; then pass "normal: cli-stop info line is 4/4"; else fail "normal: cli-stop info line missing"; fi
+
+# 1b. stop が失敗する（UNAVAILABLE 相当）→ fallback の SIGTERM／SIGKILL で回収され、判定は変わらない。
+STUB_STOP=fail run_case normal
+expect_eq "stop_fail: exit code" 0 "$RC"
+expect_eq "stop_fail: result" pass "$(json_get result "$OUT")"
+expect_eq "stop_fail: supervisors_alive_after_kill" 4 "$(json_get supervisors_alive_after_kill "$OUT")"
+expect_eq "stop_fail: stop calls" 4 "$(grep -c '^stop ' "$(dirname "$OUT")/cli.log")"
+if grep -q 'info: cli-stop: 0/4' "$ERR"; then pass "stop_fail: cli-stop info line is 0/4"; else fail "stop_fail: cli-stop info line missing"; fi
+
+# 1c. stop が成功を返すが何も止まらない（PID 1 が SIGTERM を捨てる場合の模擬）→ fallback で回収される。
+STUB_STOP=ignore run_case normal
+expect_eq "stop_ignore: exit code" 0 "$RC"
+expect_eq "stop_ignore: result" pass "$(json_get result "$OUT")"
+if grep -q 'info: cli-stop: 0/4' "$ERR"; then pass "stop_ignore: cli-stop info line is 0/4"; else fail "stop_ignore: cli-stop info line missing"; fi
+
+# 1d. stop がハングする → 呼び出しごとの期限と段全体の期限で打ち切られ、全体が上限内に終わる。
+hang_t0=$SECONDS
+# --timeout 3 では残り時間から強制終了猶予 3 秒を引くと 0 以下になり stop が一度も呼ばれないため、stop が実際に
+# 送られる 8 秒を使う（最初の stop は上限 5 秒で打ち切られ、残りは段全体の期限で送られない）。
+STUB_STOP=hang run_case normal --timeout 8
+hang_el=$((SECONDS - hang_t0))
+expect_eq "stop_hang: the hanging stop was entered (cli.log)" 1 "$(grep -c '^stop ' "$(dirname "$OUT")/cli.log")"
+if [ "$hang_el" -ge 4 ]; then pass "stop_hang: per-call deadline was waited for (${hang_el}s >= 4s)"; else fail "stop_hang: returned in ${hang_el}s without waiting for the stop deadline"; fi
+expect_eq "stop_hang: exit code" 0 "$RC"
+expect_eq "stop_hang: result" pass "$(json_get result "$OUT")"
+if [ "$hang_el" -le 60 ]; then pass "stop_hang: finished within the bound (${hang_el}s <= 60s)"; else fail "stop_hang: took ${hang_el}s"; fi
 
 # 2. 巻き添え死: 対象の kill で他の監視プロセスも死ぬ → 判定不成立。--output は作られない。
 run_case collateral --output "${root}/c2-result.json"
@@ -236,6 +306,13 @@ expect_eq "collateral: exit code" 1 "$RC"
 expect_eq "collateral: supervisors_alive_after_kill" 0 "$(json_get supervisors_alive_after_kill "$OUT")"
 expect_eq "collateral: result" fail "$(json_get result "$OUT")"
 if [ -e "${root}/c2-result.json" ]; then fail "collateral: --output must not be created on failure"; else pass "collateral: no --output on failure"; fi
+
+# 2b. 報告行が pid の途中で分かれて届いても、完全な 1 行になるまで待って受理する（#2154・SUP-5・REPAIR-5）。
+run_case split_report
+expect_eq "split_report: exit code" 0 "$RC"
+expect_eq "split_report: supervisors_alive_after_kill" 4 "$(json_get supervisors_alive_after_kill "$OUT")"
+expect_eq "split_report: target_container_alive" true "$(json_get target_container_alive "$OUT")"
+expect_eq "split_report: result" pass "$(json_get result "$OUT")"
 
 # 3. 対象のコンテナが監視プロセスと共に死ぬ（AC2 の検出）。
 run_case die_with_target
@@ -278,6 +355,7 @@ run_case restart --check-restart
 expect_eq "restart: exit code" 0 "$RC"
 expect_eq "restart: restart_check" pass "$(json_get restart_check "$OUT")"
 expect_eq "restart: restart_confirmed" 4 "$(json_get restart_confirmed "$OUT")"
+expect_eq "restart: stop is not called under --check-restart (SUP-9)" 0 "$(grep -c '^stop ' "$(dirname "$OUT")/cli.log")"
 
 # 8. --check-restart: 再起動しないスタブ（現行 supervisor 相当）→ 失敗。
 run_case normal --check-restart --timeout 3

@@ -47,12 +47,14 @@
 //! - `PullSession` に `Drop` は実装しない（ロック待ちの Timeout・panic 中の毒化があり、ロックを取る
 //!   `Drop` は危険なため）。publish も abort もせずに drop すると、リースとステージングが残る
 //!   （余分に残す側）。呼び出し側は失敗経路で [`PullSession::abort`] を呼ぶ契約である。
-//! - クラッシュ後に残ったリース・ステージングの回収 GC は #852・#477。
-//! - リースとステージングの永続化は #851（コンテナ参照だけは #2341 で永続化済み。`system df` のステージング容量の集計は `usage` で実装済み。#2222）。
+//! - 回収 GC の起動時の呼び出しの配線（#2315 のアダプタ側）。回収 GC 本体は
+//!   `ImageStore::recover_stale_pulls`（#852）で実装済みで、drop またはクラッシュでステージングの
+//!   `@pull.lock` のロックが外れたものを回収する。
+//! - テーブルの永続化は未実装（削除の永続化は #851 で実装済み。ほかは #853・#854）（`system df` のステージング容量の集計は `usage` で実装済み。#2222）。
 //! - cri の `image_pull` からの配線。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -72,6 +74,13 @@ use crate::reference::Digest;
 /// ストア root 直下のステージング領域名。GC・`image ls` の走査対象外。
 pub(super) const STAGING_DIR_NAME: &str = "staging";
 
+/// `<root>/staging/<pull-id>/` に置く pull 生存確認用のロックファイル名（OCI-7・TASK-183.11.2・#852）。
+///
+/// pull セッションが開いている間 OS の排他ロックを保持し、プロセスのクラッシュで OS が解放する。
+/// 回収 GC（`ImageStore::recover_stale_pulls`）はこのロックを取れたときだけ「pull プロセスの不在を
+/// 確認できた」とみなす。PID の生存確認は PID 再利用・PID namespace 越しで誤判定しうるため使わない。
+pub const PULL_LOCK_FILE_NAME: &str = "@pull.lock";
+
 /// 1 つの pull セッションが触れる blob 件数の上限（config 1 件 + layers）。
 const MAX_SESSION_BLOBS: usize = MAX_COMPOSITION_LAYERS + 1;
 
@@ -90,8 +99,8 @@ fn err(code: OciErrorCode, msg: &str) -> OciError {
 impl PullId {
     /// 新しい pull ID を作る。形式は `<pid>-<UNIX 時刻ナノ秒>-<プロセス内連番>`（数字と `-` だけ）。
     ///
-    /// PID を含めるのは、クラッシュ回収（#852）が pull プロセスの不在確認の手がかりにできるため。
-    /// PID の再利用への対処は #852 の判断に残す。
+    /// PID は診断用の情報で、クラッシュ回収（#852）の生存判定には使わない（PID 再利用・PID namespace
+    /// 越しで誤判定しうるため）。生存判定はステージング内のロックファイル（[`PULL_LOCK_FILE_NAME`]）で行う。
     pub fn generate() -> Result<Self, OciError> {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -152,6 +161,10 @@ pub struct PullSession<'a> {
     /// 公開できる新規 blob はこの集合にあるものに限る。
     /// 値は検証で確定したサイズ。公開直前の再ハッシュの読み取り上限に使う。
     verified: BTreeMap<Digest, VerifiedEntry>,
+    /// 生存確認用の `@pull.lock` の排他ロックを持つハンドル（OCI-7・#852）。drop（クラッシュを含む）で
+    /// ロックが外れ、以後の回収 GC が回収できる。公開・中止ではステージング削除の前に閉じる
+    /// （Windows は開いたハンドルがディレクトリ削除を妨げるため）。
+    pull_lock: Option<File>,
 }
 
 /// 検証で確定したサイズと、検証した実体の同一性（[`FileIdent`]）。
@@ -343,6 +356,23 @@ fn make_dir(path: &Path) -> std::io::Result<()> {
     b.create(path)
 }
 
+/// `<dir>/@pull.lock` を新規作成（0600）して排他ロックを取る。保持している間が「pull が生きている」印。
+fn create_pull_lock(dir: &Path) -> Result<File, OciError> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts
+        .open(dir.join(PULL_LOCK_FILE_NAME))
+        .map_err(|_| err(OciErrorCode::Internal, "failed to create pull lock file"))?;
+    file.try_lock()
+        .map_err(|_| err(OciErrorCode::Internal, "failed to lock pull lock file"))?;
+    Ok(file)
+}
+
 /// `staging` が symlink でない通常ディレクトリであることを確かめる。
 fn check_staging_is_dir(staging: &Path) -> Result<(), OciError> {
     let m = fs::symlink_metadata(staging).map_err(|e| io_err(&e, "failed to stat staging"))?;
@@ -361,6 +391,10 @@ impl ImageStore {
     ///
     /// 同じ ID のディレクトリが既にあれば `AlreadyExists`（二重利用させない）。`staging` が
     /// symlink・非ディレクトリなら `FailedPrecondition`。
+    ///
+    /// ステージングに生存確認用の `@pull.lock`（[`PULL_LOCK_FILE_NAME`]）を作って排他ロックを保持する
+    /// （回収 GC の判定材料。#852）。作成とロックはストアの排他区間の内側で行うため、排他待ちの `Timeout`・
+    /// 毒化の `Internal`、保留中の削除ジャーナルによる `FailedPrecondition` を返しうる。
     /// 記録先は [`ImageStore::with_recorder`] で設定したもの（REPAIR-4）。
     pub fn begin_pull(&self, id: PullId) -> Result<PullSession<'_>, OciError> {
         self.begin_pull_with(self.recorder(), id)
@@ -377,6 +411,9 @@ impl ImageStore {
     }
 
     fn begin_pull_inner(&self, id: PullId) -> Result<PullSession<'_>, OciError> {
+        // ロックファイルを作ってから排他ロックを取るまでの間を回収 GC に見せないため、ストアの排他区間で
+        // 行う（内側はメタデータ操作だけ）。排他待ちの Timeout・毒化はそのままエラーになる。
+        let _guard = self.lock()?;
         let staging = self.root().join(STAGING_DIR_NAME);
         match fs::symlink_metadata(&staging) {
             Ok(_) => check_staging_is_dir(&staging)?,
@@ -392,6 +429,14 @@ impl ImageStore {
         }
         let dir = staging.join(id.as_str());
         make_dir(&dir).map_err(|e| io_err(&e, "failed to create pull staging directory"))?;
+        let pull_lock = match create_pull_lock(&dir) {
+            Ok(f) => f,
+            Err(e) => {
+                // 作成直後で他者はまだ使っていないので消してよい。
+                let _ = fs::remove_dir_all(&dir);
+                return Err(e);
+            }
+        };
         Ok(PullSession {
             store: self,
             id,
@@ -400,6 +445,7 @@ impl ImageStore {
             touched: BTreeSet::new(),
             leased: BTreeSet::new(),
             verified: BTreeMap::new(),
+            pull_lock: Some(pull_lock),
         })
     }
 
@@ -471,7 +517,7 @@ impl PullSession<'_> {
             .join(hex_of(digest)?);
         {
             let mut guard = self.store.lock()?;
-            guard.acquire_lease(digest.clone(), self.id.clone());
+            guard.acquire_lease(digest.clone(), self.id.clone())?;
         }
         let miss = match fs::symlink_metadata(&path) {
             _ if !dirs_exist => Some(BlobReuse::Absent),
@@ -723,7 +769,8 @@ impl PullSession<'_> {
     /// 呼び出し側の明示的な中断。自分のリースを解放し、ステージングを削除する。
     ///
     /// ロックを取れない（Timeout・毒化）場合はリースが残り（余分に残す側。#852・#477 が回収）、
-    /// ステージングは削除したうえでそのエラーを返す。
+    /// ステージングも削除せずそのエラーを返す（同 ID を再利用した新しい pull を遅れて消さないため。
+    /// 残骸は回収 GC が拾う）。
     pub fn abort(mut self) -> Result<PullAbortOutcome, OciError> {
         let store = self.store;
         record_oci_op(store.recorder(), OciOpKind::AbortPull, || {
@@ -732,15 +779,27 @@ impl PullSession<'_> {
     }
 
     fn abort_inner(&mut self) -> Result<PullAbortOutcome, OciError> {
-        let released = self
-            .store
-            .lock()
-            .map(|mut g| g.release_all_leases(&self.id).len());
+        // 削除が終わるまでストア排他を保持し、回収 GC・begin_pull による同 ID の再利用と交差させない（OCI-7）。
+        // 排他を取れなければステージングは消さない。排他なしで消すと、回収 GC が先に残骸を回収して
+        // `begin_pull` が同 ID を再利用した後に、遅れた abort が新しい生存中の pull のディレクトリを
+        // 消しうるため（OCI-7「余分に残す方向にのみ誤る」）。残骸は pull_lock の解放後に GC が回収する。
+        let mut guard = match self.store.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                self.leased.clear();
+                self.verified.clear();
+                self.pull_lock.take();
+                return Err(e);
+            }
+        };
+        let released = guard.release_all_leases(&self.id).len();
         self.leased.clear();
         self.verified.clear();
+        self.pull_lock.take();
         let staging = self.remove_staging();
-        released.map(|released_leases| PullAbortOutcome {
-            released_leases,
+        drop(guard);
+        Ok(PullAbortOutcome {
+            released_leases: released,
             staging,
         })
     }
@@ -756,10 +815,10 @@ impl PullSession<'_> {
             Err(_) => return failed(OciErrorCode::Internal),
         }
         match fs::symlink_metadata(&self.staging_dir) {
-            Ok(m) if m.is_dir() => match fs::remove_dir_all(&self.staging_dir) {
+            Ok(m) if m.is_dir() => match super::pull_recovery::reclaim_dir(&self.staging_dir) {
+                // `@pull.lock` は他の内容を消し終えるまで残す（中断時も GC が回収できる。OCI-7・#852）。
                 Ok(()) => StagingCleanup::Removed,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => StagingCleanup::Removed,
-                Err(_) => failed(OciErrorCode::Internal),
+                Err(code) => failed(code),
             },
             Ok(_) => failed(OciErrorCode::FailedPrecondition),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => StagingCleanup::Removed,
@@ -843,6 +902,8 @@ impl PullSession<'_> {
             dst_checked.insert(b.clone(), ident);
         }
         let mut guard = self.store.lock()?;
+        // blob を置く前に未完了の削除が無いことを確かめる（OCI-7。lock も拒否するが入口として明示する）。
+        guard.ensure_no_pending_deletion()?;
         if guard
             .manifests()
             .any(|(d, c)| d == &req.manifest && c != &req.composition)
@@ -965,10 +1026,11 @@ impl PullSession<'_> {
             }
         };
         let released_leases = guard.release_all_leases(&self.id).len();
-        drop(guard);
         self.leased.clear();
         self.verified.clear();
+        self.pull_lock.take();
         let staging = self.remove_staging();
+        drop(guard);
         Ok(PullPublishOutcome {
             manifest: req.manifest.clone(),
             tags: changes,
@@ -1126,9 +1188,13 @@ mod tests {
         let _s = store.begin_pull(pid("p1")).unwrap();
         let dup = store.begin_pull(pid("p1")).err().unwrap();
         let _g = store.begin_pull_generated().unwrap();
-        let items = rec.items();
+        // begin_pull は排他区間の内側で行うため、排他の取得も別の操作として記録される（#852）。
+        let items: Vec<_> = rec
+            .items()
+            .into_iter()
+            .filter(|i| i.kind() == OciOpKind::BeginPull)
+            .collect();
         assert_eq!(items.len(), 3);
-        assert!(items.iter().all(|i| i.kind() == OciOpKind::BeginPull));
         assert_eq!(items[0].outcome(), OciOpOutcome::Success);
         assert_eq!(items[1].outcome(), OciOpOutcome::Failure);
         assert_eq!(items[1].error_code(), Some(dup.code()));
@@ -2165,9 +2231,10 @@ mod tests {
         );
     }
 
-    /// ロックを取れない abort は Timeout を返し、リースは残るがステージングは消える（余分に残す側）。
+    /// ロックを取れない abort は Timeout を返し、リースもステージングも残る（余分に残す側）。
+    /// 続く回収 GC がその残骸とリースを回収する。
     #[test]
-    fn oci7_abort_under_lock_timeout_keeps_lease_but_removes_staging() {
+    fn oci7_abort_under_lock_timeout_keeps_lease_and_staging() {
         let root = Root::new("abort-timeout");
         let cached = sha_of(b"cached-layer");
         fs::write(root.blob(&cached), b"cached-layer").unwrap();
@@ -2181,6 +2248,11 @@ mod tests {
         assert_eq!(s.abort().unwrap_err().code(), OciErrorCode::Timeout);
         drop(held);
         assert_eq!(leases(&store, &cached), vec![pid("p1")]);
+        assert!(staged.exists());
+        let store = store.with_timeout(std::time::Duration::from_secs(5));
+        let r = store.recover_stale_pulls().unwrap();
+        assert_eq!(r.reclaimed(), &[pid("p1")]);
         assert!(!staged.exists());
+        assert!(leases(&store, &cached).is_empty());
     }
 }

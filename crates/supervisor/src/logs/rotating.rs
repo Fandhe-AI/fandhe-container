@@ -79,9 +79,8 @@
 //! - flush ごとの fsync・設定可能な同期ポリシー・タイマーによる定期 flush（短い read を契機とする flush で代替）。
 //!   [`RotatingFileSink::sync`] をコンテナ終了時などに呼ぶ配線も未実装（配線側の責務）。
 //! - 両ストリーム混在での大規模検証（stdout 単独の 100 万行検証は `tests/log_rotation.rs`〔TASK-164.4・#508〕で実装済み）。
-//! - `logs` コマンド本体（読み出し経路の配線）。ログ名の列挙 [`log_file_paths`] は実装済みでロックファイルを含めず、
-//!   入口 [`open_for_read`] を用意した。内容の読み出し・CLI 配線は未実装。open 後に差し替えられた
-//!   世代が symlink の可能性は残るため、読み出し側は [`open_for_read`] か同等の「辿らず開く」手段を使うこと。
+//! - `logs` コマンドの読み出しは [`crate::logs::read_container_log`]（#1543）が [`log_file_paths`] と
+//!   [`open_for_read`] で行う。読み出し側は [`open_for_read`] か同等の「辿らず開く」手段を使うこと。
 //! - 親ディレクトリ経路の検証後の差し替え（TOCTOU）と所有者（uid）の照合は、core の安全 open へ寄せられない
 //!   ため未対応のまま残す（#1470 の判断）。core の fd 相対 open は `pub(crate)` かつ Linux 限定で、supervisor
 //!   から呼べず、3 OS で動く sink の経路を置き換えられない。公開には OS 非依存の「ディレクトリハンドル相対
@@ -94,7 +93,7 @@
 //! - Windows のロックファイル削除は、自分のハンドルを閉じてから消すため、その間に別の sink が開くと
 //!   削除が失敗してロックファイルが残る（排他は保たれる）。
 //! - `dir`（状態ルート配下のどこか）の決定は配線側の責務で、本モジュールは決めない。コンテナのログは
-//!   `<root>/logs`、supervisor 自身の構造化ログは `<root>/@supervisor-logs`（`supervisor_log` モジュール。#2067）。
+//!   `<root>/@container-logs`、supervisor 自身の構造化ログは `<root>/@supervisor-logs`（`supervisor_log` モジュール。#2067）。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, ErrorKind, Write};
@@ -707,7 +706,7 @@ fn open_existing_regular_read(path: &Path, deny_delete: bool) -> Result<File, Tr
     let opened = open_read_nofollow_nonblocking(path);
     #[cfg(not(unix))]
     let opened = OpenOptions::new().read(true).open(path);
-    let file = opened.map_err(|_| internal("log file open failed"))?;
+    let file = opened.map_err(map_open_error)?;
     let after = file
         .metadata()
         .map_err(|_| internal("log file open failed"))?;
@@ -718,7 +717,7 @@ fn open_existing_regular_read(path: &Path, deny_delete: bool) -> Result<File, Tr
     {
         use std::os::unix::fs::MetadataExt;
         if before.dev() != after.dev() || before.ino() != after.ino() {
-            return Err(not_regular());
+            return Err(replaced_during_open());
         }
     }
     Ok(file)
@@ -748,10 +747,7 @@ fn open_existing_regular_read(path: &Path, deny_delete: bool) -> Result<File, Tr
             .share_mode(share_mode)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
-            .map_err(|e| match e.kind() {
-                ErrorKind::NotFound => TraitError::new(ErrorCode::NotFound, "log file not found"),
-                _ => internal("log file open failed"),
-            })?;
+            .map_err(map_open_error)?;
         let meta = file
             .metadata()
             .map_err(|_| internal("log file open failed"))?;
@@ -770,7 +766,7 @@ fn open_existing_regular_read(path: &Path, deny_delete: bool) -> Result<File, Tr
     let a = crate::sys::file_identity(&file).map_err(|_| internal("log file open failed"))?;
     let b = crate::sys::file_identity(&again).map_err(|_| internal("log file open failed"))?;
     if a != b {
-        return Err(not_regular());
+        return Err(replaced_during_open());
     }
     Ok(file)
 }
@@ -849,6 +845,32 @@ pub(crate) fn open_read_nofollow_nonblocking(path: &Path) -> io::Result<File> {
         .open(path)
 }
 
+/// lstat 成功後の open 失敗の写像。ENOENT はローテーションの rename が lstat と open の間に割り込んだ
+/// 競合なので `NotFound` にし、読み出し側のスナップショットが再試行できるようにする（SUP-7）。
+/// それ以外はパス・errno を含めない `Internal`（ERR-1）。
+fn map_open_error(e: io::Error) -> TraitError {
+    if e.kind() == ErrorKind::NotFound {
+        TraitError::new(ErrorCode::NotFound, "log file not found")
+    } else {
+        internal("log file open failed")
+    }
+}
+
+/// 検査（lstat）と open の間に、同じパスが別の通常ファイルへ差し替わったときのメッセージ。
+/// ローテーションの rename が割り込んだ競合なので、読み出し側は [`is_replaced_during_open`] で見分けて
+/// スナップショットをやり直す。symlink・種別違反（別のメッセージの `InvalidArgument`）とは区別する（SUP-7・REPAIR-5）。
+const REPLACED_DURING_OPEN_MSG: &str = "log file was replaced while opening";
+
+fn replaced_during_open() -> TraitError {
+    TraitError::new(ErrorCode::InvalidArgument, REPLACED_DURING_OPEN_MSG)
+}
+
+/// [`open_for_read`] の失敗が「通常ファイルの実体の入れ替わり（競合）」か。再試行の対象にしてよい。
+#[cfg(unix)]
+pub(crate) fn is_replaced_during_open(e: &TraitError) -> bool {
+    e.code() == ErrorCode::InvalidArgument && e.message() == REPLACED_DURING_OPEN_MSG
+}
+
 fn map_lstat_error(e: io::Error) -> TraitError {
     if e.kind() == ErrorKind::NotFound {
         TraitError::new(ErrorCode::NotFound, "log file not found")
@@ -868,7 +890,7 @@ const READ_SHARE_MODE: u32 = 0x1 | 0x2 | 0x4;
 /// symlink / reparse point を辿らず通常ファイルだけを読み取りで開く。Windows では削除共有つき
 /// （`FILE_SHARE_DELETE`）で開くため、読み手が開いたままでも sink の rename を妨げない。読み出し側が独自に
 /// 削除共有なしで開くと、sink の世代 rename が有界の再試行（`RenameRetry`）のあと失敗し、sink は失敗状態に
-/// 固定される。`logs` コマンド本体は未実装（REPAIR-3）で、現状の呼び出し元は無い。
+/// 固定される。呼び出し元は [`crate::logs::read_container_log`]（`logs` コマンド。#1543）。
 /// 種別違反は `InvalidArgument`、存在しなければ `NotFound`。
 pub fn open_for_read(path: &Path) -> Result<File, TraitError> {
     open_existing_regular_read(path, false)
@@ -1096,7 +1118,7 @@ fn remove_log_files(dir: &Path, base: &str) -> (u32, Result<(), TraitError>) {
 /// ロックファイル・他 ID・無関係なファイルは含めない（`logs` 読み出し側が使う契約。SUP-7・TASK-164 追補・#1469）。
 ///
 /// ロックは取らない（sink の生存中も呼べる）。ローテーションと並行すると、列挙後に世代の名前がずれ得る
-/// （読み出し側の責務。REPAIR-3: 内容の読み出し・`logs` コマンドへの配線は未実装）。名前空間に受理できない名前・
+/// （読み出し側の責務。[`crate::logs::read_container_log`] が再確認でやり直す。#1543）。名前空間に受理できない名前・
 /// ディレクトリ・symlink があれば `InvalidArgument`（読み出し側が symlink を辿らない入口）。
 pub fn log_file_paths(dir: &Path, id: &ContainerId) -> Result<Vec<PathBuf>, TraitError> {
     let dir = check_dir(dir)?;

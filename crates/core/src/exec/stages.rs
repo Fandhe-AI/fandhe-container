@@ -350,6 +350,8 @@ pub struct StagePipeline {
     /// seccomp の listener fd を C へ渡す送り手（SEC-4・#2024）。あれば組み込みの `Seccomp` 段が `NEW_LISTENER` 付きで
     /// 適用して渡し、ACK を待つ。無ければ従来の `prctl` 適用（旧経路・観測用の入口）。
     listener_sender: Option<ListenerSender>,
+    /// 送り手に載せる ERRNO 側の拒否の届け方(SEC-4・#2025。既定 `Errno`)。
+    seccomp_delivery: crate::seccomp::ErrnoDelivery,
 }
 
 impl Default for StagePipeline {
@@ -394,7 +396,19 @@ impl StagePipeline {
             mounts: MountedTargets::new(),
             process_ids: None,
             listener_sender: None,
+            seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
         }
+    }
+
+    /// ERRNO 側の拒否の届け方を設定する(本番 launcher だけが呼ぶ。送り手があるときだけ効く。SEC-4・#2025)。
+    pub(crate) fn with_seccomp_delivery(mut self, delivery: crate::seccomp::ErrnoDelivery) -> Self {
+        self.seccomp_delivery = delivery;
+        self
+    }
+
+    /// 設定済みの ERRNO 側の拒否の届け方。
+    pub(crate) fn seccomp_delivery(&self) -> crate::seccomp::ErrnoDelivery {
+        self.seccomp_delivery
     }
 
     /// seccomp の listener fd を C へ渡す送り手を登録する（本番 launch 経路だけが呼ぶ。SEC-4・#2024）。

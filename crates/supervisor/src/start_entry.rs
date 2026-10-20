@@ -1928,6 +1928,10 @@ mod linux {
         recovery_privilege: Result<IsolationPrivilege, TraitError>,
         cgroup: Option<HeldCgroup>,
         audit: Option<Arc<dyn AuditSink>>,
+        /// launcher の回収点（`wait` / `terminate`。複数スレッドから呼ばれる）が出す補助の `exit_signal` 監査だけの記録先
+        /// （`with_exit_audit_sink`。入口が単一スレッドの間に作った `ControlAuditRelay`。SEC-4・ESC-06・#2236）。
+        /// 無ければ `audit`（`FileAuditSink`）を使う。
+        exit_audit: Option<Arc<dyn AuditSink>>,
         /// 退避で一緒に移す同伴プロセスの PID（監査 helper。`DelegatedCgroup::with_companions`）。
         companions: Vec<u32>,
         /// seccomp の通知に応答するハブ（`with_seccomp_hub`。持つときだけ start の launcher が USER_NOTIF 版になる。#2025）。
@@ -2089,6 +2093,7 @@ mod linux {
                 recovery_privilege,
                 cgroup: None,
                 audit: None,
+                exit_audit: None,
                 companions: Vec::new(),
                 seccomp: None,
                 audit_policy: AuditCoveragePolicy::default(),
@@ -2100,6 +2105,17 @@ mod linux {
         #[must_use]
         pub fn with_audit_policy(mut self, policy: AuditCoveragePolicy) -> Self {
             self.audit_policy = policy;
+            self
+        }
+
+        /// 回収点の `exit_signal` 監査（SIGSYS 終了の補助記録。#2004）の記録先を設定する（SEC-4・ESC-06・#2236）。
+        ///
+        /// 回収点は監視スレッドなど複数スレッドから呼ばれ、`FileAuditSink` の fork 隔離が使えない（rootless では代替経路も
+        /// 失敗する）。入口が単一スレッドの間に作った `ControlAuditRelay` を渡す。launch の時点の記録（監査網羅の縮退・
+        /// bind 拒否）は単一スレッドなので `build_audit_sink` の `FileAuditSink` のままにする（relay は運べない層がある）。
+        #[must_use]
+        pub fn with_exit_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
+            self.exit_audit = Some(sink);
             self
         }
 
@@ -2289,9 +2305,12 @@ mod linux {
                 ));
             };
             let source = Arc::clone(&held.cgroup);
-            let launcher = self
-                .launcher_builder(true)?
-                .audit_sink(Arc::clone(audit))
+            let builder = self.launcher_builder(true)?.audit_sink(Arc::clone(audit));
+            let builder = match &self.exit_audit {
+                Some(sink) => builder.exit_audit_sink(Arc::clone(sink)),
+                None => builder,
+            };
+            let launcher = builder
                 .cgroup_join_source(move || source.join_hook())
                 .applied_resource_limits(held.applied_resources.clone())
                 .build()?;
@@ -2608,11 +2627,14 @@ mod linux {
             .with_companions(companions)
             .with_audit_policy(args.audit_policy);
         let deps = Box::new(match &audit {
-            Some(audit) => deps.with_seccomp_hub(Arc::new(SeccompNotifyHub::new(
-                Arc::clone(audit),
-                args.id.clone(),
-                crate::seccomp_notify::NotifyConfig::default(),
-            ))),
+            // relay は launcher の回収点（複数スレッド）の `exit_signal` 監査の記録先にも渡す（#2236）。
+            Some(audit) => deps
+                .with_exit_audit_sink(Arc::clone(audit))
+                .with_seccomp_hub(Arc::new(SeccompNotifyHub::new(
+                    Arc::clone(audit),
+                    args.id.clone(),
+                    crate::seccomp_notify::NotifyConfig::default(),
+                ))),
             None => deps,
         });
         // 2b: supervisor の構造化ログの保存先を開き、stderr の出口の書き先を差し替える（#2067・REPAIR-4）。
@@ -2955,6 +2977,46 @@ mod linux {
                 spawn < deps && deps < run,
                 "helper must be declared as a cgroup companion before run_start_until"
             );
+        }
+
+        /// SEC-4・ESC-06・#2236: 本番の入口は relay を launcher の回収点の記録先（`exit_audit_sink`）へ渡し、launch の時点の
+        /// 記録先（`audit_sink`）は `FileAuditSink` のままにする。実プロセスの結線は単一スレッド条件のためソースで固定する。
+        #[test]
+        fn sec4_2236_relay_is_wired_to_the_exit_audit_only() {
+            let src = include_str!("start_entry.rs");
+            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+            let entry = production
+                .find("fn run_main_inner<")
+                .expect("run_main_inner in the entry");
+            let wire = production[entry..]
+                .find(".with_exit_audit_sink(Arc::clone(audit))")
+                .map(|p| p + entry)
+                .expect("relay is passed as the exit audit sink");
+            let run = production[entry..]
+                .find("run_start_until(\n")
+                .map(|p| p + entry)
+                .expect("run_start_until call in the entry");
+            assert!(wire < run, "relay must be wired before run_start_until");
+            let build = production
+                .find("fn build_launcher(")
+                .expect("build_launcher");
+            let body = &production[build..];
+            let exit = body
+                .find("builder.exit_audit_sink(Arc::clone(sink))")
+                .expect("exit audit sink passed to the launcher builder");
+            let main = body
+                .find(".audit_sink(Arc::clone(audit))")
+                .expect("launch-time audit sink");
+            assert!(main < exit);
+            // 回復用の launcher は launch しないので、exit 監査の記録先を渡さない。
+            let recover = production
+                .find("self.launcher_builder(false)?")
+                .expect("recover_interrupted builds the recovery launcher");
+            let recover_end = production[recover..]
+                .find("recover_interrupted_start(store")
+                .map(|p| p + recover)
+                .expect("recovery call follows the builder");
+            assert!(!production[recover..recover_end].contains("exit_audit_sink("));
         }
 
         /// 資格情報だけを変えた `/proc/self/status` の fixture（必須項目は縮退後の非特権プロセス相当）。

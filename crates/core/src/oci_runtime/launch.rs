@@ -846,11 +846,14 @@ impl ContainerChildProcess {
             return;
         }
         // 配送結果は呼び出し側の終了状態に影響させない（失敗の通知は sink の責務）。
-        let _ = crate::audit_log::record_exit_signal(
+        // 共有の relay のロック待ちを含め、配送全体を絶対期限で制限する（REPAIR-5・SEC-4・ESC-06・#2236）。
+        let deadline = std::time::Instant::now() + crate::audit_log::RECORD_WAIT_LIMIT;
+        let _ = crate::audit_log::record_exit_signal_until(
             SIGSYS,
             self.pid.get(),
             Some(&audit.container),
             audit.sink.as_ref(),
+            Some(deadline),
         );
     }
 

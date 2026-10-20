@@ -13,7 +13,7 @@
 //!
 //! # 受け入れ規則
 //!
-//! - 種類: bind のみ（`type == "bind"`、または options に `bind` / `rbind`）。それ以外は `UNIMPLEMENTED`。
+//! - 種類: bind のみ（`type == "bind"`、または options に `bind` / `rbind`）。それ以外は `UNIMPLEMENTED`（受けるかは #2347 で判断待ち。docs/design/oci-mounts-implicit-entries.md）。
 //!   ただし bind でない `type == "sysfs"` は読み飛ばし（位置は元のまま）、`SysfsMountSpec` が受ける（#2020）
 //! - 受けるオプション: `bind`・`rbind`・`ro`・`rw`・`nosuid`・`nodev`・`noexec`・`exec`・`private`・`rprivate`
 //! - 拒否: `suid`・`dev`（制限を外す側。SEC-1）、`shared`・`rshared`・`slave`・`rslave`・`unbindable`・

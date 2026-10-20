@@ -130,8 +130,9 @@ resolve_dir() { # name value -> 実体の絶対パスを stdout へ
 }
 [ -n "$bind_root" ] || usage_error "--bind-root is required"
 [ -n "$volume_root" ] || usage_error "--volume-root is required"
-bind_real="$(resolve_dir --bind-root "$bind_root")"
-volume_real="$(resolve_dir --volume-root "$volume_root")"
+bind_real="$(resolve_dir --bind-root "$bind_root")" || exit 2
+volume_real="$(resolve_dir --volume-root "$volume_root")" || exit 2
+[ -n "$bind_real" ] && [ -n "$volume_real" ] || exit 2
 [ "$bind_real" != "$volume_real" ] || usage_error "--bind-root and --volume-root must be different directories"
 
 if [ -n "$output" ]; then

@@ -655,12 +655,14 @@ impl ReferenceTable {
         };
         // 既に不在の blob も「unlink 済み」に含める。前回プロセスが unlink 後・ディレクトリ fsync 前に
         // 落ちた blob で、fsync 失敗時に書き直すジャーナルから落ちると、電源断で unlink が巻き戻っても
-        // 再削除できなくなるため（OCI-7）。
+        // 再削除できなくなるため（OCI-7）。ただし blob ディレクトリ自体が無いときは fsync する対象が
+        // 無く、含めると存在しないディレクトリの fsync が失敗して回復が止まるため含めない（#851）。
+        let absent_as_deleted = if force_sync { &sweep.absent[..] } else { &[] };
         let deleted_digests: Vec<Digest> = sweep
             .deleted
             .iter()
             .map(|(d, _)| d.clone())
-            .chain(sweep.absent.iter().cloned())
+            .chain(absent_as_deleted.iter().cloned())
             .collect();
         out.durability = settle(
             root,
@@ -1013,6 +1015,21 @@ mod tests {
         assert_eq!(rec.undeleted_blobs, vec![d(0xc1)]);
         let j = read_journal(&root.0).unwrap().unwrap();
         assert_eq!(j.delete_blobs, vec![d(0x11), d(0xc1)]);
+    }
+
+    /// OCI-7・#851: blob ディレクトリが無いとき、全件を不在として回復を完了しジャーナルを消す。
+    #[test]
+    fn oci7_resume_completes_when_blob_dirs_missing() {
+        let root = Root::new();
+        write_journal(&root.0, &journal_a()).unwrap();
+        let mut t = table();
+        t.register_tag(tk("v1"), &d(0xa0)).unwrap();
+        let store = ImageStore::with_table(&root.0, t).unwrap();
+        let rec = store.recover_pending_deletion().unwrap().unwrap();
+        assert!(!rec.absent_blobs.is_empty());
+        assert!(rec.undeleted_blobs.is_empty());
+        assert_ne!(rec.durability, DeletionDurability::Pending);
+        assert!(read_journal(&root.0).unwrap().is_none());
     }
 
     /// OCI-7: ジャーナルの書き直しに失敗しても上限判定を諦めず、断念して片づける。

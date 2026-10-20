@@ -1110,11 +1110,17 @@ fn cli2_setup_usage_errors() {
     }
 }
 
-/// CLI-2: Linux の setup は要求ステップがなく、終了コード 0・出力なし。
+/// CLI-2・SUP-14・CORE-6: Linux の setup は rootful のインストール手順を 1 行表示して 0 で終わる（実行はしない）。
 #[cfg(target_os = "linux")]
 #[test]
-fn cli2_setup_on_linux_is_noop() {
-    assert_failure_free(&run(&["setup"]));
+fn cli2_sup14_setup_on_linux_lists_launcher_install_step() {
+    let out = run(&["setup"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(out.stdout).expect("utf8"),
+        "{\"step\":\"privileged-launcher-install\",\"requires_admin\":true,\"status\":\"manual\",\"condition\":\"rootful\",\"instructions\":\"rootful only; rootless (default) needs no install. As root, run scripts/install-privileged-launcher.sh --launcher <file> --launcher-sha256 <hex> --supervisor <file> --supervisor-sha256 <hex> --cli <file> --cli-sha256 <hex> [--dest-dir <absolute path>] (default dest-dir /usr/local/libexec/fandhe-container). fandhe-container does not run it. See docs/setup/linux.md\"}\n"
+    );
+    assert_eq!(String::from_utf8(out.stderr).expect("utf8"), "");
 }
 
 /// CLI-2・REPAIR-3: macOS / Windows の setup は要求ステップを stdout へ出し、自動適用未実装のため 8 で失敗する。

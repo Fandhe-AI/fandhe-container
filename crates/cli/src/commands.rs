@@ -1110,7 +1110,12 @@ mod tests {
                         None,
                         SYSTEM_DF_EMPTY,
                     ),
-                    Command::Setup => (vec!["setup"], 0, None, ""),
+                    Command::Setup => (
+                        vec!["setup"],
+                        0,
+                        None,
+                        "{\"step\":\"privileged-launcher-install\",\"requires_admin\":true,\"status\":\"manual\",\"condition\":\"rootful\",\"instructions\":\"rootful only; rootless (default) needs no install. As root, run scripts/install-privileged-launcher.sh --launcher <file> --launcher-sha256 <hex> --supervisor <file> --supervisor-sha256 <hex> --cli <file> --cli-sha256 <hex> [--dest-dir <absolute path>] (default dest-dir /usr/local/libexec/fandhe-container). fandhe-container does not run it. See docs/setup/linux.md\"}\n",
+                    ),
                     // doctor の終了コードと出力は実行環境に依る（0 / 3 / 4）。具体値は doctor 側の単体テストと
                     // 結合試験で固定し、ここでは診断の終了であること・stderr が空であることだけを照合する。
                     Command::Doctor => {

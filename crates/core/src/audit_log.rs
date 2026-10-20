@@ -93,7 +93,8 @@ mod seccomp_hook;
 mod sink;
 
 pub use mount::{
-    AuditDelivery, AuditedRejection, current_pid, record_exit_signal, record_mount_rejection,
+    AuditDelivery, AuditedRejection, current_pid, record_exit_signal, record_exit_signal_until,
+    record_mount_rejection,
 };
 pub use seccomp_hook::{
     SeccompDenialReport, SeccompReportSource, record_seccomp_denial, record_seccomp_denial_for,

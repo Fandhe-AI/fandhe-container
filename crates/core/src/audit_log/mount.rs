@@ -125,6 +125,20 @@ pub fn record_exit_signal(
     container: Option<&ContainerId>,
     sink: &dyn AuditSink,
 ) -> AuditDelivery {
+    record_exit_signal_until(signal, target_pid, container, sink, None)
+}
+
+/// [`record_exit_signal`] に絶対期限を付けた版（`deadline` が `Some` なら `AuditSink::record_until` で sink のロック待ちと
+/// 応答待ちの両方を期限へ絞る。REPAIR-5・SEC-4・ESC-06・#2236）。
+///
+/// 呼び出し元: supervisor の exec の親プロセス（`ControlAuditRelay` の別の記録が保持するロックを無期限に待たないため）。
+pub fn record_exit_signal_until(
+    signal: i32,
+    target_pid: u32,
+    container: Option<&ContainerId>,
+    sink: &dyn AuditSink,
+    deadline: Option<std::time::Instant>,
+) -> AuditDelivery {
     let event = match (
         super::AuditSignal::new(signal),
         // `i32` を超える値は 0 に倒し、`AuditPid::new` が `PidNotPositive` で拒否する。
@@ -133,7 +147,7 @@ pub fn record_exit_signal(
         (Ok(signal), Ok(target_pid)) => AuditEvent::ExitSignal { signal, target_pid },
         (Err(e), _) | (_, Err(e)) => return AuditDelivery::RecordUnavailable(e),
     };
-    deliver(event, container, sink)
+    deliver_until(event, container, sink, deadline)
 }
 
 /// マウント拒否 `error` を `Mount` レコードとして記録し、`error` をそのまま返す。

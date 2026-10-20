@@ -263,7 +263,8 @@ use std::os::fd::{AsFd as _, BorrowedFd};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::audit_log::{
-    AuditDelivery, AuditSink, AuditedRejection, FileAuditSink, record_exit_signal,
+    AuditDelivery, AuditSink, AuditedRejection, FileAuditSink, RECORD_WAIT_LIMIT,
+    record_exit_signal_until,
 };
 use fandhe_container_core::exec::{
     ChildExit, ContainerEnv, DiagnosticDelivery, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
@@ -813,7 +814,14 @@ fn audit_worker_result(
             ExecExit::Command(ChildExit::Signaled(SIGSYS)) => {
                 // 補助の記録。親（単一スレッドの exec 専用プロセス）で worker の回収後に 1 回だけ出す。
                 let exit_audit = match outcome.command_pid {
-                    Some(pid) => record_exit_signal(SIGSYS, pid.get(), container, audit),
+                    Some(pid) => record_exit_signal_until(
+                        SIGSYS,
+                        pid.get(),
+                        container,
+                        audit,
+                        // ロック待ちから応答待ちまでを 1 つの絶対期限で縛る（REPAIR-5）。
+                        Some(std::time::Instant::now() + RECORD_WAIT_LIMIT),
+                    ),
                     None => AuditDelivery::NotApplicable,
                 };
                 Ok(AuditedOutcome {
@@ -1503,8 +1511,9 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         }
         _ => return Err(malformed()),
     };
-    if it.next().is_some() || matches!(exit, ExecExit::SetupFailed { .. }) && command_pid.is_some()
-    {
+    // 起動したコマンド（`command`）には PID が必須で、起動していない（`setup`）のに PID があるのも不正（双方向。SEC-4・ESC-06）。
+    let pid_consistent = matches!(exit, ExecExit::SetupFailed { .. }) != command_pid.is_some();
+    if it.next().is_some() || !pid_consistent {
         return Err(malformed());
     }
     Ok(ExecOutcome {
@@ -2591,6 +2600,9 @@ mod tests {
             b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - +5\n",
             b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - abc\n",
             b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 4294967296\n",
+            // 起動したコマンドの PID 欠落（`-`）は拒否する（exit_signal の監査が黙って省略されるのを防ぐ）。
+            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok command - signaled 15 15 1 23 3 120 cleared 4 sealed_copy - -\n",
             b"ok setup - exited 126 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
             // 持ち越した rlimit 数の値域外（契約は 0 か 1。欄はすべて揃っている）。
             b"ok command - exited 0 1 2 2 3 4 cleared 1 sealed_copy - 7\n",

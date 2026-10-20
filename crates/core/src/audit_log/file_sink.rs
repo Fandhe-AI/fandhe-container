@@ -95,6 +95,8 @@
 //! `kernel_audit.rs` の代替経路（非 Linux は `UnsupportedTransport`）の 3 か所。Windows は
 //! `FileStateStore::open` が `Unimplemented`（所有者 SID・DACL の検査に Win32 FFI が要るため）を返し、
 //! 構築入口も fail-closed になる。
+//! Windows の主経路の隔離と非 Linux の代替経路の選択肢は `docs/design/audit-non-linux.md`（#2430・オーナー承認待ち）
+//! の判断資料にあり、方式は未決定である。
 //!
 //! `@audit.log` にはサイズ上限もローテーションも無い。entrypoint 層の理由（`stdio_null_not_null_device` 等）は
 //! コンテナの中身で引き起こせるため、定期 exec（healthcheck。TASK-161）を配線すると、コンテナ起点で tmpfs の

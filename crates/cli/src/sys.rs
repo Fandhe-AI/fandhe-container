@@ -9,8 +9,10 @@
 //! （plugin へ転送した後、既定動作へ戻った同じシグナルを自分へ再送する `forward_and_reraise`）は
 //! 本モジュールが持つ。同じ起動時に、継承した `SIGCHLD` の `SIG_IGN` を `SIG_DFL` へ戻す
 //! （[`reset_child_signal_if_ignored`]。plugin の子が自動回収されて pid が再利用され、転送が無関係な
-//! プロセスへ届く窓を閉じる。#1513・PLUG-7・PR #1572 事後監査の P2）。`libc` は依存追加が禁止（dependency-policy）の
-//! ため、`crates/plugin/src/sys.rs` と同じ流儀で必要最小限の `extern "C"` 宣言と構造体を自前で持つ。
+//! プロセスへ届く窓を閉じる。#1513・PLUG-7・PR #1572 事後監査の P2）。製品の依存に `libc` は入れない
+//! （dependency-policy）ため、`crates/plugin/src/sys.rs` と同じ流儀で必要最小限の `extern "C"` 宣言と構造体を自前で
+//! 持つ。宣言の正しさは dev-dependencies の `libc` との機械照合で守る（#1318・#1838。`imp::libc_abi` と
+//! `tests::libc_abi_fixtures`。方式は `docs/design/ffi-libc-check.md`）。
 //!
 //! # 構造体レイアウトと定数（一次情報）
 //! - Linux（`target_env = "gnu"` の glibc のみ。x86_64 / aarch64 とも同一）: `bits/sigaction.h` の `struct sigaction` は
@@ -524,6 +526,128 @@ mod imp {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
+
+    /// 自前の FFI 宣言を `libc` と照合する試験専用モジュール（#1838・#1318・MVM-4・REPAIR-7・REPAIR-12）。
+    ///
+    /// 役割: 宣言の誤り（構造体のずれ・定数の取り違え・引数型の違い）をコンパイル時に検出する。`imp` の
+    /// 非公開の宣言を直接参照するため、`imp` の子として置く。値は常に `libc::X` を期待値にし、リテラルや他
+    /// ターゲットの値を流用しない。関数は呼ばない（関数ポインタ定数への代入で型だけを照合する）。新しい
+    /// `unsafe` は無い。食い違いが出たら試験を合わせず、宣言の誤りとして別 issue で直す。
+    /// 方式と標準形は `docs/design/ffi-libc-check.md`。`libc` は dev-dependencies のみ。
+    ///
+    /// 照合する宣言と対象外:
+    /// - 照合する: `FORWARDED_SIGNALS`・`SIG_IGN`・`SIG_DFL`・`layout` の定数と `SigAction`（size・align・各
+    ///   フィールドのオフセットとサイズ）・`sigaction`・`raise`・`fork`・`_exit`・`waitpid`・`kill` の型・
+    ///   `WNOHANG`・`SIGKILL`・`EINTR`・ハンドラ 2 種の引数型
+    /// - 対象外（FFI ではない）: `REAP_LIMIT`（`Duration`）
+    /// - 対象外（照合には `sigaddset` 等の呼び出しが要り、関数を呼ばない方針に反する）: `mask_of` のビット規則。
+    ///   読み戻し試験 `plug7_installed_handler_reads_back_with_forwarded_signal_mask` が 0x4003 で検証している
+    /// - ハンドラ（`forward_and_reraise`・`record_for_test`）は `libc` に型付きのハンドラ型が無い
+    ///   （`sighandler_t` は `size_t`）ため、引数の型 `c_int` だけを照合する
+    #[cfg(test)]
+    mod libc_abi {
+        use super::{FORWARDED_SIGNALS, SIG_DFL, SIG_IGN, layout};
+        use std::mem::{align_of, offset_of, size_of};
+
+        // --- 定数 ---
+        const _: () = assert!(FORWARDED_SIGNALS[0] == libc::SIGHUP);
+        const _: () = assert!(FORWARDED_SIGNALS[1] == libc::SIGINT);
+        const _: () = assert!(FORWARDED_SIGNALS[2] == libc::SIGTERM);
+        // `sighandler_t` は `size_t`。自前は `usize`（同じ幅）。
+        const _: () = assert!(SIG_IGN == libc::SIG_IGN);
+        const _: () = assert!(SIG_DFL == libc::SIG_DFL);
+        const _: () = assert!(layout::SA_RESTART == libc::SA_RESTART);
+        const _: () = assert!(layout::SA_NOCLDWAIT == libc::SA_NOCLDWAIT);
+        const _: () = assert!(layout::SA_RESETHAND == libc::SA_RESETHAND);
+        const _: () = assert!(layout::SIGCHLD == libc::SIGCHLD);
+        // 試験関数内のローカル定数（項目として参照できない）: `plug7_installed_handler_reads_back_with_forwarded_signal_mask`
+        // の `SIGPROF`（27）と `plug7_forwarding_is_limited_to_the_registering_process` のリテラル 26（SIGVTALRM）。
+        const _: () = assert!(libc::SIGPROF == 27);
+        const _: () = assert!(libc::SIGVTALRM == 26);
+
+        // --- `struct sigaction`（Linux gnu）---
+        // `handler` は `sa_sigaction`（`sighandler_t`）、`restorer` は `Option<extern "C" fn()>`（同サイズ）。`sigset_t` の
+        // 中身は `libc` 側で非公開のため、`mask` はサイズ・オフセットで照合する。
+        #[cfg(target_os = "linux")]
+        const _: () = {
+            assert!(size_of::<layout::SigAction>() == size_of::<libc::sigaction>());
+            assert!(align_of::<layout::SigAction>() == align_of::<libc::sigaction>());
+            assert!(
+                offset_of!(layout::SigAction, handler) == offset_of!(libc::sigaction, sa_sigaction)
+            );
+            assert!(offset_of!(layout::SigAction, mask) == offset_of!(libc::sigaction, sa_mask));
+            assert!(offset_of!(layout::SigAction, flags) == offset_of!(libc::sigaction, sa_flags));
+            assert!(
+                offset_of!(layout::SigAction, restorer) == offset_of!(libc::sigaction, sa_restorer)
+            );
+            assert!(size_of::<usize>() == size_of::<libc::sighandler_t>());
+            assert!(size_of::<[u64; 16]>() == size_of::<libc::sigset_t>());
+            assert!(size_of::<i32>() == size_of::<libc::c_int>());
+            assert!(size_of::<usize>() == size_of::<Option<extern "C" fn()>>());
+        };
+
+        // --- `struct sigaction`（macOS）---
+        // `handler` は `__sigaction_u`（union。`sa_sigaction` として `sighandler_t`）、`mask` は `sigset_t`（`u32`）。
+        #[cfg(target_os = "macos")]
+        const _: () = {
+            assert!(size_of::<layout::SigAction>() == size_of::<libc::sigaction>());
+            assert!(align_of::<layout::SigAction>() == align_of::<libc::sigaction>());
+            assert!(
+                offset_of!(layout::SigAction, handler) == offset_of!(libc::sigaction, sa_sigaction)
+            );
+            assert!(offset_of!(layout::SigAction, mask) == offset_of!(libc::sigaction, sa_mask));
+            assert!(offset_of!(layout::SigAction, flags) == offset_of!(libc::sigaction, sa_flags));
+            assert!(size_of::<usize>() == size_of::<libc::sighandler_t>());
+            assert!(size_of::<u32>() == size_of::<libc::sigset_t>());
+            assert!(size_of::<i32>() == size_of::<libc::c_int>());
+        };
+
+        // --- 関数の型（呼ばない）---
+        // 構造体へのポインタを含む `sigaction` は、自前側を自前の構造体、`libc` 側を `libc::sigaction` で書く
+        // （構造体の同一性は上のレイアウト照合が保証する）。
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const layout::SigAction,
+            *mut layout::SigAction,
+        ) -> libc::c_int = super::sigaction;
+        const _: unsafe extern "C" fn(
+            libc::c_int,
+            *const libc::sigaction,
+            *mut libc::sigaction,
+        ) -> libc::c_int = libc::sigaction;
+        const _: unsafe extern "C" fn(libc::c_int) -> libc::c_int = super::raise;
+        const _: unsafe extern "C" fn(libc::c_int) -> libc::c_int = libc::raise;
+        const _: extern "C" fn(libc::c_int) = super::forward_and_reraise;
+
+        // feature `signal-test-support` のときだけある宣言（`fork` 系と試験用の定数・ハンドラ）。
+        #[cfg(feature = "signal-test-support")]
+        mod test_support {
+            use super::super::{EINTR, SIGKILL, WNOHANG};
+
+            const _: () = assert!(WNOHANG == libc::WNOHANG);
+            const _: () = assert!(SIGKILL == libc::SIGKILL);
+            const _: () = assert!(EINTR == libc::EINTR);
+
+            const _: unsafe extern "C" fn() -> libc::pid_t = super::super::fork;
+            const _: unsafe extern "C" fn() -> libc::pid_t = libc::fork;
+            const _: unsafe extern "C" fn(libc::c_int) -> ! = super::super::_exit;
+            const _: unsafe extern "C" fn(libc::c_int) -> ! = libc::_exit;
+            const _: unsafe extern "C" fn(
+                libc::pid_t,
+                *mut libc::c_int,
+                libc::c_int,
+            ) -> libc::pid_t = super::super::waitpid;
+            const _: unsafe extern "C" fn(
+                libc::pid_t,
+                *mut libc::c_int,
+                libc::c_int,
+            ) -> libc::pid_t = libc::waitpid;
+            const _: unsafe extern "C" fn(libc::pid_t, libc::c_int) -> libc::c_int =
+                super::super::kill;
+            const _: unsafe extern "C" fn(libc::pid_t, libc::c_int) -> libc::c_int = libc::kill;
+            const _: extern "C" fn(libc::c_int) = super::super::record_for_test;
+        }
+    }
 }
 
 #[cfg(not(any(
@@ -740,5 +864,14 @@ mod tests {
         assert_eq!(layout::SIGCHLD, 17);
         #[cfg(target_os = "macos")]
         assert_eq!(layout::SIGCHLD, 20);
+    }
+    /// 試験側の非公開定数を `libc` と照合する（#1838。方式は `docs/design/ffi-libc-check.md`）。`imp` 側の照合は
+    /// `imp::libc_abi`。試験関数内のローカル定数（`SIGPROF`・26）は `imp::libc_abi` で照合している。
+    mod libc_abi_fixtures {
+        use super::*;
+
+        const _: () = assert!(EINVAL == libc::EINVAL);
+        const _: () = assert!(SIGWINCH == libc::SIGWINCH);
+        const _: () = assert!(SIGURG == libc::SIGURG);
     }
 }

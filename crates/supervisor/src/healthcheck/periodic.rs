@@ -11,9 +11,10 @@
 //!   理由は、(1) exec は fork 直前に単一スレッドを要求し、スレッドを持つ supervisor 本体からは必ず拒否される、
 //!   (2) argv[0] の絶対パス要求と PATH 解決の方針が未決、(3) 監査の記録先の配線が別 issue、(4) 出力の受け渡しが未実装。
 //!   実行基盤が未結線の間は [`crate::health::UnimplementedHealthProbe`] が `Unimplemented` を返し `Healthy` を装わない。
-//! - **未実装**: retries 回連続失敗での unhealthy 遷移・start_period・Starting への集約（#496・TASK-161.3）。
-//!   現状は各 tick の結果を `probe_and_record` がそのまま記録する。tick の結果は `on_tick` で渡すので、
-//!   #496 はスケジューラを変えずにカウンタを差し込める。
+//! - 提供するもの（TASK-161.3・#496）: retries 回連続失敗での unhealthy 遷移・start_period・開始時の `Starting` を、
+//!   [`super::HealthAggregator`] と `crate::health::probe_aggregate_and_record` で `state.json` の `health` へ反映する。
+//!   集約は probe の結果と記録の間（`ProbeRunner` の排他区間の内側）で行い、1 回の失敗が `Unhealthy` として
+//!   先に公開されない。遷移の規則は `aggregate` サブモジュールの doc（spec の確定値ではなく本実装の判断）。
 //!
 //! # ループの意味論（spec の確定値ではなく本実装の判断）
 //! - 固定遅延: 初回はループ開始から interval 後、以降は前回の判定が戻った時刻から interval 後。
@@ -27,13 +28,15 @@
 //! - 同じコンテナの `health` を書く経路は 1 つの [`ProbeRunner`] に揃える（clone は排他を共有する）。
 //!   command の中身はエラー・ログへ出さない。
 
+use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::oci_runtime::LaunchedProcess;
 use fandhe_container_core::traits::{ErrorCode, StateRecord, TraitError};
 
+use super::HealthAggregator;
 use super::HealthcheckDefinition;
-use crate::health::{ProbeFailure, ProbeRunner, probe_and_record};
+use crate::health::{ProbeFailure, ProbeRunner, probe_aggregate_and_record, record_starting};
 use crate::run::{
     MAX_POLL_INTERVAL, MonitorObserver, StopToken, ensure_owner, is_running_with_pid,
 };
@@ -41,6 +44,9 @@ use crate::state::SupervisedState;
 
 /// 停止要求を確かめる待ちの刻み（`restart` のバックオフ待ちと同じ方式）。
 const SLEEP_SLICE: Duration = Duration::from_millis(50);
+
+/// 開始時の `Starting` 記録を試みる最大回数（REPAIR-5。使い切ったら `Halted` で返す）。
+const START_ATTEMPTS: u32 = 3;
 
 /// 周期実行の時刻源と、停止要求で打ち切れる待ち（テストで偽の時計に差し替える）。
 pub trait HealthcheckClock: Send + Sync {
@@ -73,11 +79,13 @@ impl HealthcheckClock for SystemClock {
     }
 }
 
-/// 検証済みの周期実行スケジュール（interval と 1 回の timeout）。
+/// 検証済みの周期実行スケジュール（interval・1 回の timeout・start_period・retries）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthcheckSchedule {
     interval: Duration,
     timeout: Duration,
+    start_period: Duration,
+    retries: NonZeroU32,
 }
 
 impl HealthcheckSchedule {
@@ -93,6 +101,8 @@ impl HealthcheckSchedule {
         Ok(Self {
             interval: def.interval(),
             timeout: def.timeout(),
+            start_period: def.start_period(),
+            retries: def.retries(),
         })
     }
 
@@ -105,6 +115,16 @@ impl HealthcheckSchedule {
     pub fn timeout(&self) -> Duration {
         self.timeout
     }
+
+    /// 失敗を数え始めるまでの猶予。
+    pub fn start_period(&self) -> Duration {
+        self.start_period
+    }
+
+    /// unhealthy と判定する連続失敗回数。
+    pub fn retries(&self) -> NonZeroU32 {
+        self.retries
+    }
 }
 
 /// 1 回の tick（判定と記録の 1 回分）の報告。
@@ -115,6 +135,8 @@ pub struct HealthcheckTick {
     pub index: u64,
     /// ループ開始からの経過（判定が戻った時点）。
     pub elapsed: Duration,
+    /// この tick 後の連続失敗数（集約器の内部の数。公開状態との同期の照合用。TASK-161.3）。
+    pub consecutive_failures: u32,
     /// 記録に成功したレコード、または失敗（降格の結果つき）。
     pub result: Result<StateRecord, ProbeFailure>,
 }
@@ -144,10 +166,10 @@ fn overflow(ticks: u64) -> HealthcheckLoopOutcome {
     }
 }
 
-/// interval ごとに `probe_and_record` を呼ぶ（意味論はモジュール doc）。
+/// interval ごとに `probe_aggregate_and_record` を呼ぶ（意味論はモジュール doc）。
 ///
 /// 専用スレッドで回すこと。`state` は監視ループとは別に `SupervisedState::attach` で得る。
-/// 各 tick の結果は `on_tick` へ渡す（#496 の集約の差し込み口）。
+/// 各 tick の結果は `on_tick` へ渡す。
 // 抑止理由: 引数 8 個は、状態・起動済みプロセス・probe 実行器・時計・停止トークン・観測器・tick 通知と、
 // それぞれ別の差し替え点（試験で偽物に替える）を表す。構造体にまとめると差し替え点が隠れて
 // 呼び出し側の見通しが悪くなるため、公開 API は 8 引数のまま維持する。
@@ -163,6 +185,26 @@ pub fn run_periodic(
     on_tick: &mut dyn FnMut(&HealthcheckTick),
 ) -> HealthcheckLoopOutcome {
     let start = clock.now();
+    let mut agg = HealthAggregator::from_schedule(schedule);
+    // 開始時に `Starting` へ戻す。成功するまで集約へ進まない（失敗を無視すると前の process の `Healthy` が
+    // 残り、depends_on の healthy 条件を誤って満たす。SUP-4 の fail-closed）。有界に再試行し、使い切ったら
+    // 止めて失敗を返す。
+    let mut starting_err = None;
+    for _ in 0..START_ATTEMPTS {
+        if stop.is_stop_requested() {
+            return HealthcheckLoopOutcome::Stopped { ticks: 0 };
+        }
+        match record_starting(state, process, runner, obs) {
+            Ok(_) => {
+                starting_err = None;
+                break;
+            }
+            Err(e) => starting_err = Some(e),
+        }
+    }
+    if let Some(error) = starting_err {
+        return HealthcheckLoopOutcome::Halted { error, ticks: 0 };
+    }
     let mut ticks: u64 = 0;
     let Some(mut next) = start.checked_add(schedule.interval) else {
         return overflow(ticks);
@@ -171,7 +213,15 @@ pub fn run_periodic(
         if stop.is_stop_requested() || !clock.sleep_until(next, stop) || stop.is_stop_requested() {
             return HealthcheckLoopOutcome::Stopped { ticks };
         }
-        let result = probe_and_record(state, process, runner, schedule.timeout, obs);
+        let elapsed_at_probe = clock.now().saturating_duration_since(start);
+        let result = probe_aggregate_and_record(
+            state,
+            process,
+            runner,
+            schedule.timeout,
+            obs,
+            &mut |r, cur| agg.observe(r, elapsed_at_probe, cur),
+        );
         ticks = ticks.saturating_add(1);
         let finished = clock.now();
         // 書き込み競合の使い切りも `FailedPrecondition` で返るため、最新レコードで前提（Running・pid・所有）が
@@ -188,6 +238,7 @@ pub fn run_periodic(
         on_tick(&HealthcheckTick {
             index: ticks,
             elapsed: finished.saturating_duration_since(start),
+            consecutive_failures: agg.consecutive_failures(),
             result,
         });
         let Some(t) = finished.checked_add(schedule.interval) else {
@@ -368,13 +419,15 @@ mod tests {
         } else {
             ContainerStatus::running(id.clone(), NonZeroU32::new(7))
         };
+        // 常に競合するストアでは Starting を書けないため、Starting を初期値にして開始時の記録を不要にする。
+        let init_health = always_stale.then_some(HealthStatus::Starting);
         let rec = StateRecord::new(
             status,
             std::env::temp_dir().join("healthcheck-periodic-ut"),
             StateRevision::from_raw(1),
         )
         .unwrap()
-        .with_supervision(SupervisionState::new(owner, None, 0));
+        .with_supervision(SupervisionState::new(owner, init_health, 0));
         let store: Arc<dyn StateStore> = Arc::new(MemStore(
             Mutex::new(rec),
             std::sync::atomic::AtomicBool::new(always_stale),
@@ -512,7 +565,8 @@ mod tests {
         match out {
             HealthcheckLoopOutcome::Halted { error, ticks } => {
                 assert_eq!(error.code(), ErrorCode::FailedPrecondition);
-                assert_eq!(ticks, 1);
+                // 所有していないため開始時の Starting 記録で止まる（tick 0）。
+                assert_eq!(ticks, 0);
             }
             other => panic!("unexpected outcome: {other:?}"),
         }
@@ -564,6 +618,63 @@ mod tests {
                 ErrorCode::Internal
             );
         }
+    }
+
+    /// SUP-4・TASK-161.3: ループ開始時（最初の判定の前）に health が Starting になる。
+    #[test]
+    fn sup4_periodic_records_starting_at_start() {
+        let clock = FakeClock::new(Some(1));
+        let probe = Arc::new(TimedProbe {
+            clock: clock.clone(),
+            starts: Mutex::new(Vec::new()),
+            cost: Duration::ZERO,
+            result: ok_healthy,
+        });
+        let mut st = state(Some(me()), true);
+        let (out, _) = run(&schedule("10s", "5s"), &mut st, &clock, probe.clone(), 5);
+        assert_eq!(out, HealthcheckLoopOutcome::Stopped { ticks: 0 });
+        assert!(probe.starts.lock().unwrap().is_empty());
+        assert_eq!(st.refresh().unwrap().health(), Some(HealthStatus::Starting));
+    }
+
+    /// SUP-4・TASK-161.3: Starting を書けない（常に競合）と、古い Healthy を残したまま集約へ進まず Halted(tick 0)。
+    #[test]
+    fn sup4_periodic_halts_when_starting_cannot_be_recorded() {
+        let clock = FakeClock::new(None);
+        let probe = Arc::new(TimedProbe {
+            clock: clock.clone(),
+            starts: Mutex::new(Vec::new()),
+            cost: Duration::ZERO,
+            result: ok_healthy,
+        });
+        // 初期値を Healthy に差し替えた（再起動前の値が残った）状態を作る。
+        let id = ContainerId::new("c1").unwrap();
+        let rec = StateRecord::new(
+            ContainerStatus::running(id.clone(), NonZeroU32::new(42)),
+            std::env::temp_dir().join("healthcheck-periodic-ut"),
+            StateRevision::from_raw(1),
+        )
+        .unwrap()
+        .with_supervision(SupervisionState::new(
+            Some(me()),
+            Some(HealthStatus::Healthy),
+            0,
+        ));
+        let store: Arc<dyn StateStore> = Arc::new(MemStore(
+            Mutex::new(rec),
+            std::sync::atomic::AtomicBool::new(true),
+        ));
+        let mut st = SupervisedState::attach(store, id).unwrap();
+        let (out, seen) = run(&schedule("10s", "5s"), &mut st, &clock, probe.clone(), 3);
+        match out {
+            HealthcheckLoopOutcome::Halted { error, ticks } => {
+                assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+                assert_eq!(ticks, 0);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+        assert!(probe.starts.lock().unwrap().is_empty());
+        assert!(seen.is_empty());
     }
 
     /// SUP-4: timeout は 60s まで受理し、61s は構築時に InvalidArgument。

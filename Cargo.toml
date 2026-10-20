@@ -121,6 +121,11 @@ serde-saphyr = { version = "=1.3.0", default-features = false, features = ["dese
 # 配置は crates/stack（crates/compose-convert は必要になったときに限る）。`unbounded` は有効にせず既定の再帰上限 80 を保つ（深いネストによる DoS への備え）。
 # crates.io 上の版は `1.1.8+spec-1.1.0` で、`=1.1.8` で一致する。
 toml = { version = "=1.1.8", default-features = false, features = ["std", "serde", "parse", "display"] }
+# 自前 FFI 宣言（各 crate の `sys`）と libc の機械照合（MVM-4・REPAIR-7・REPAIR-12）。承認: Issue #86・#1318（オーナー判断 2026-10-12）。
+# dev-dependencies 専用。製品コードの依存（[dependencies]・[build-dependencies]）に入れない。製品の syscall・ioctl は各 crate の
+# `sys` の自前宣言のままで、libc へは切り替えない。照合の方式は docs/design/ffi-libc-check.md（#1838）。
+# 照合に使うのは定数・型・関数宣言だけで `std` feature は要らないため default-features を無効化する。
+libc = { version = "=0.2.189", default-features = false }
 
 # 依存クレート（workspace メンバー以外）のデバッグ情報を行番号のみにする。
 # ローカルの `target/` は依存グラフ全体（tonic / prost・protox・objc2 系等）の full debuginfo が

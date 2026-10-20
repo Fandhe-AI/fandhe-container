@@ -207,3 +207,143 @@ fn sup4_task161_2_it_timeout_over_probe_limit_rejected() {
         ErrorCode::InvalidArgument
     );
 }
+
+// ---- TASK-161.3・#496: health の集約と state.json への反映 ----
+
+/// 用意した結果を順に返す probe（尽きたら `Healthy`）。
+struct Script(Mutex<std::collections::VecDeque<Result<HealthStatus, TraitError>>>);
+
+impl HealthProbe for Script {
+    fn probe(&self, _: Duration) -> Result<HealthStatus, TraitError> {
+        self.0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(HealthStatus::Healthy))
+    }
+}
+
+fn unhealthy() -> Result<HealthStatus, TraitError> {
+    Ok(HealthStatus::Unhealthy)
+}
+
+fn healthy() -> Result<HealthStatus, TraitError> {
+    Ok(HealthStatus::Healthy)
+}
+
+fn schedule_full(interval: &str, start_period: &str, retries: i64) -> HealthcheckSchedule {
+    let def = HealthcheckDefinition::parse(&RawHealthcheck {
+        command: vec!["pg_isready".into()],
+        interval: Some(interval.into()),
+        timeout: Some("2s".into()),
+        start_period: Some(start_period.into()),
+        retries: Some(retries),
+    })
+    .unwrap();
+    HealthcheckSchedule::from_definition(&def).unwrap()
+}
+
+/// 各 tick 後に別に持ったストアから読んだ (health, revision, tick の連続失敗数)。
+type Seen = Vec<(Option<HealthStatus>, u64, u32)>;
+
+fn drive(sched: &HealthcheckSchedule, script: Vec<Result<HealthStatus, TraitError>>) -> Seen {
+    let id = ContainerId::new("c1").unwrap();
+    let rec = StateRecord::new(
+        ContainerStatus::running(id.clone(), NonZeroU32::new(42)),
+        std::env::temp_dir().join("healthcheck-periodic-it"),
+        StateRevision::from_raw(1),
+    )
+    .unwrap()
+    .with_supervision(SupervisionState::new(
+        Some(NonZeroU32::new(std::process::id()).unwrap()),
+        None,
+        0,
+    ));
+    let mem = Arc::new(MemStore(Mutex::new(rec)));
+    let store: Arc<dyn StateStore> = mem.clone();
+    let mut st = SupervisedState::attach(store, id).unwrap();
+    let n = script.len() as u64;
+    let clock = Arc::new(FakeClock(Mutex::new(Instant::now())));
+    let runner = ProbeRunner::new(Arc::new(Script(Mutex::new(script.into()))));
+    let stop = StopToken::new();
+    let mut seen = Vec::new();
+    run_periodic(
+        sched,
+        &mut st,
+        &Proc,
+        &runner,
+        clock.as_ref(),
+        &stop,
+        &NoObs,
+        &mut |t| {
+            let g = mem.0.lock().unwrap();
+            seen.push((g.health(), g.revision().value(), t.consecutive_failures));
+            if t.index >= n {
+                stop.request_stop();
+            }
+        },
+    );
+    seen
+}
+
+const ST: Option<HealthStatus> = Some(HealthStatus::Starting);
+const HE: Option<HealthStatus> = Some(HealthStatus::Healthy);
+const UN: Option<HealthStatus> = Some(HealthStatus::Unhealthy);
+
+fn healths(v: &Seen) -> Vec<Option<HealthStatus>> {
+    v.iter().map(|x| x.0).collect()
+}
+
+/// SUP-4・TASK-161.3: retries=3 で失敗が続くと、各 tick 後の state.json の health は Starting・Starting・Unhealthy。
+#[test]
+fn sup4_task161_3_it_unhealthy_after_retries() {
+    let seen = drive(
+        &schedule_full("5s", "0s", 3),
+        vec![unhealthy(), unhealthy(), unhealthy()],
+    );
+    assert_eq!(healths(&seen), vec![ST, ST, UN]);
+    let fails: Vec<u32> = seen.iter().map(|x| x.2).collect();
+    assert_eq!(fails, vec![1, 2, 3]);
+}
+
+/// SUP-4・TASK-161.3: 成功 → 失敗 3 回で Healthy が retries まで保たれ、成功で戻る。
+#[test]
+fn sup4_task161_3_it_healthy_then_unhealthy() {
+    let seen = drive(
+        &schedule_full("5s", "0s", 3),
+        vec![healthy(), unhealthy(), unhealthy(), unhealthy(), healthy()],
+    );
+    assert_eq!(healths(&seen), vec![HE, HE, HE, UN, HE]);
+}
+
+/// SUP-4・TASK-161.3: interval 5s・start_period 12s・retries 2 で、tick 1・2（5s・10s）は数えず、tick 3・4 で Unhealthy。
+#[test]
+fn sup4_task161_3_it_start_period() {
+    let seen = drive(
+        &schedule_full("5s", "12s", 2),
+        vec![unhealthy(), unhealthy(), unhealthy(), unhealthy()],
+    );
+    assert_eq!(healths(&seen), vec![ST, ST, ST, UN]);
+    let fails: Vec<u32> = seen.iter().map(|x| x.2).collect();
+    assert_eq!(fails, vec![0, 0, 1, 2]);
+}
+
+/// SUP-4・TASK-161.3: Timeout も失敗に数え、retries 回で Starting から Unhealthy へ移る。
+#[test]
+fn sup4_task161_3_it_timeout_counts() {
+    let t = || Err(TraitError::new(ErrorCode::Timeout, "t"));
+    let seen = drive(&schedule_full("5s", "0s", 2), vec![t(), t()]);
+    assert_eq!(healths(&seen), vec![ST, UN]);
+}
+
+/// SUP-4・TASK-161.3: 値が変わらない tick では revision が増えない。
+#[test]
+fn sup4_task161_3_it_no_redundant_write() {
+    let seen = drive(
+        &schedule_full("5s", "0s", 3),
+        vec![healthy(), healthy(), healthy()],
+    );
+    let revs: Vec<u64> = seen.iter().map(|x| x.1).collect();
+    // 初期 1 → Starting で 2 → Healthy で 3 → 以降は 3 のまま。
+    assert_eq!(revs, vec![3, 3, 3]);
+}

@@ -16,8 +16,9 @@
 //! | #238 | TASK-157.4 | 監視ループ基本（実装済み） |
 //! | #239 | TASK-157.5 | restart の土台（実装済み。ポリシーと加算は #487〜#489 で実装） |
 //! | #240 | TASK-157.6 | healthcheck フックの土台（実装済み。コマンド実行・周期実行は TASK-161） |
-//! | #493 | TASK-161.1 | healthcheck 定義パース（[`healthcheck`]。実装済み。`health` 反映は #496 で未実装） |
+//! | #493 | TASK-161.1 | healthcheck 定義パース（[`healthcheck`]。実装済み） |
 //! | #495 | TASK-161.2 | healthcheck 周期実行エンジン（[`healthcheck::run_periodic`]。実装済み。exec を呼ぶ判定の実装・`monitor` ループへの組み込みは未実装。REPAIR-3） |
+//! | #496 | TASK-161.3 | `health` の state.json 反映（[`healthcheck::HealthAggregator`]・[`health::probe_aggregate_and_record`]。retries・start_period・`Starting`。実装済み。SUP-4） |
 //! | #241 | TASK-157.7 | logs 捕捉の土台（実装済み。永続化・ローテーションは #506 で実装） |
 //! | #505 | TASK-164.1 | 行単位捕捉（実装は #241。バッファ境界跨ぎを検証済み。ローテーション書き込みは #506） |
 //! | #506 | TASK-164.2 | ローテーションログ書き込み（[`logs::rotating`]。実装済み。Windows の世代 rename の共有違反は有界再試行・ロックのファイル ID 照合・読み出し入口 `open_for_read` は #1470 で追補。フラッシュ制御は #507、100 万行規模の欠落 0・重複 0 検証は #508 で `tests/log_rotation.rs` に実装済み。ロックファイルの掃除は #1469 で `remove_all`・`open` 失敗時の削除を追加。`logs` 読み出しは #1543 で `logs::read_container_log` を実装済み・実パイプ取得も未実装） |

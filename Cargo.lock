@@ -413,6 +413,8 @@ dependencies = [
  "fandhe-container-core",
  "fandhe-container-cri",
  "fandhe-container-plugin",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]

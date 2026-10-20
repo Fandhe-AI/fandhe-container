@@ -430,6 +430,13 @@ fn win2_recover_shared_mount_by_container_id_on_real_wsl2() {
         )
     });
     let guest_path = prepared.mounts()[0].guest_path.clone();
+    // 途中で panic しても残置しないよう、控えを持つガードを置く（回収に成功したら外す）。
+    let mut guard = ReleaseGuard {
+        prepared: Some(prepared.clone()),
+        timeout,
+        retain: tmp.retain_flag(),
+        source_root: tmp.path().to_path_buf(),
+    };
     // 作成したプロセスの所有情報を失った状況を模す（以後はディストリとコンテナ ID だけを使う）。
     drop(prepared);
 
@@ -471,6 +478,7 @@ fn win2_recover_shared_mount_by_container_id_on_real_wsl2() {
         )
     });
     assert_eq!((report.found, report.released), (1, 1));
+    guard.prepared = None;
     assert!(
         !mounted(&tmp),
         "the mount must be gone; shared source retained at {}",

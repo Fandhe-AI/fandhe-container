@@ -1895,7 +1895,8 @@ fn release_recorded(
 /// 読む前に `/`・`/run`・`/run/fandhe` が root 所有・他者書き込み不可・symlink でないことを [`MOUNT_SCRIPT`] と同じ
 /// 基準で確かめる（`/run/fandhe` が無ければ記録は無い）。対象は名前が 16 進の nonce だけのエントリで、
 /// `lock.*`・`*.tmp`・`*.claim`・`*.done` は読まない。各エントリは symlink でない通常ファイルで root 所有・
-/// 他者書き込み不可のものだけを先頭 512 バイト読み、3 行目（所有者）が `$1` と一致するものを
+/// 他者書き込み不可のものだけを先頭 512 バイト読み（`head` が失敗して読めなかったものは `bad <nonce>` で報告し、
+/// 検索成功として黙って落とさない）、3 行目（所有者）が `$1` と一致するものを
 /// `rec <nonce> <マウント ID|none> <マウント先>` の 1 行で出力する。基準を満たさないエントリは読まずに
 /// `bad <nonce>` の行で報告する（ホスト側 [`parse_lookup_output`] が改ざんとして扱い、何も外さない）。
 ///
@@ -1917,7 +1918,8 @@ const LOOKUP_SCRIPT: &str = concat!(
     "b=${f##*/}; case \"$b\" in *[!0-9a-f]*) continue ;; esac; ",
     "n=$((n + 1)); [ \"$n\" -le 4096 ] || exit 215; ",
     "if ! fchk \"$f\"; then printf 'bad %s\\n' \"$b\"; continue; fi; ",
-    "head -c 512 -- \"$f\" | { IFS= read -r a; IFS= read -r t; IFS= read -r o; ",
+    "h=$(head -c 512 -- \"$f\") || { printf 'bad %s\\n' \"$b\"; continue; }; ",
+    "printf '%s\\n' \"$h\" | { IFS= read -r a; IFS= read -r t; IFS= read -r o; ",
     "if [ \"$o\" = \"$O\" ]; then printf 'rec %s %s %s\\n' \"$b\" \"$a\" \"$t\"; fi; }; ",
     "done; exit 0"
 );
@@ -2118,14 +2120,27 @@ fn recover_with_exec(
             read_only: false,
         })
         .collect();
-    let outcome = rollback(distro, &owned, exec);
+    // 解除段階で期限切れ（`wsl.exe` のタイムアウト）があったかを実行器の結果から拾う（REPAIR-5・ERR-1）。
+    let mut timed_out = false;
+    let outcome = rollback(distro, &owned, &mut |argv, max| {
+        let r = exec(argv, max);
+        if matches!(&r, Err(e) if e.code() == Wsl2ErrorCode::Timeout) {
+            timed_out = true;
+        }
+        r
+    });
     if outcome.failures() == 0 {
         return Ok(RecoveryReport {
             found: owned.len(),
             released: owned.len(),
         });
     }
-    Err(release_failure(distro, &outcome, None))
+    let mut failure = release_failure(distro, &outcome, None);
+    if timed_out {
+        // 公開 API の約束どおり期限切れは `TIMEOUT` のまま返す。未解除の情報とメッセージは保つ。
+        failure.error = Wsl2Error::new(Wsl2ErrorCode::Timeout, failure.error.message());
+    }
+    Err(failure)
 }
 
 /// `program` を `wsl.exe` として使う [`release_container_mounts`] の本体（結合試験用の `wsl2::test_support` から使う）。
@@ -2154,7 +2169,8 @@ pub(super) fn recover_with_program(
 ///   同じ nonce・同じマウント先を主張する重複した記録も改ざんとして扱う（古い記録と新しい記録が同じマウント先に
 ///   並ぶ場合は手動で片方を消すまで回収できない。fail-closed）。
 /// - 解除に失敗: `FAILED_PRECONDITION`（件数のみ）。外せなかったマウントは [`MountError::unreleased`] に載せる。
-/// - 期限切れ: `TIMEOUT`。`timeout` は検索・mountinfo の読み取り・各 umount で共有する合計期限。
+/// - 期限切れ: `TIMEOUT`。`timeout` は検索・mountinfo の読み取り・各 umount で共有する合計期限。解除段階で
+///   期限切れになった場合も `TIMEOUT` のまま返し、未解除のマウントは [`MountError::unreleased`] に載せる。
 ///
 /// # 未実装範囲（REPAIR-3）
 ///
@@ -4587,6 +4603,11 @@ mod tests {
         // 記録は 3 行（ID・マウント先・コンテナ ID）で書き、検索は名前が 16 進の nonce のエントリだけを読む。
         assert!(MOUNT_SCRIPT.contains("printf '%s\\n%s\\n%s\\n' \"$new\" \"$T\" \"$5\""));
         assert!(LOOKUP_SCRIPT.contains("*[!0-9a-f]*) continue"));
+        // `head` の失敗は検索成功として落とさず、`bad` で報告して解除前に拒否させる。
+        assert!(
+            LOOKUP_SCRIPT
+                .contains("h=$(head -c 512 -- \"$f\") || { printf 'bad %s\\n' \"$b\"; continue; }")
+        );
     }
 
     /// #1412: 記録は 3 行になっても、1 行目だけを読む既存の読み手はマウント ID を取り出せる。
@@ -4832,7 +4853,8 @@ mod tests {
         drop(prepare_owned(&mut g, "web", vec![sm("C:\\a", "a", false)]));
         g.umount_timeout = Some(false);
         let e = recover(&mut g, "web").unwrap_err();
-        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        // 解除段階の期限切れは `TIMEOUT` のまま返り、未解除の情報も残る（REPAIR-5・ERR-1）。
+        assert_eq!(e.code(), Wsl2ErrorCode::Timeout);
         assert_eq!(e.message(), "1 unmount(s) failed");
         assert_eq!(
             e.unreleased().map(summary),

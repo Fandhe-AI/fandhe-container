@@ -1380,6 +1380,9 @@ fn core3_repair5_doctor_connects_live_and_dead_socket() {
 #[cfg(target_os = "linux")]
 #[test]
 fn repair5_core3_doctor_times_out_on_full_backlog() {
+    use fandhe_container_supervisor::user_scope::{
+        UserManagerConnectError, probe_user_manager_socket,
+    };
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -1390,7 +1393,9 @@ fn repair5_core3_doctor_times_out_on_full_backlog() {
     let (xdg, listener) = user_manager_socket_dir(&tmp);
     let sock = xdg.join("systemd").join("private");
 
-    // accept しないまま接続を積み、backlog が満杯になるまで続ける（ブロックした接続が現れたら満杯）。
+    // accept しないまま接続を積み、backlog が満杯になるまで続ける。満杯の判定は「接続スレッドの数」ではなく、
+    // doctor と同じ非ブロッキング connect（`probe_user_manager_socket`）が期限内に `TimedOut`（= `EAGAIN` が続く）に
+    // なったことで行う。スレッドの未スケジュール・connect の失敗に左右されず、観測した時点のカーネルの状態だけに依る。
     let (tx, rx) = mpsc::channel::<UnixStream>();
     let mut held = Vec::new();
     let mut spawned = 0usize;
@@ -1409,19 +1414,14 @@ fn repair5_core3_doctor_times_out_on_full_backlog() {
                 .expect("spawn");
             spawned += 1;
         }
-        std::thread::sleep(Duration::from_millis(30));
         while let Ok(s) = rx.try_recv() {
             held.push(s);
         }
-        full = held.len() < spawned;
+        full =
+            probe_user_manager_socket(xdg.as_os_str(), Instant::now() + Duration::from_millis(100))
+                == Err(UserManagerConnectError::TimedOut);
     }
     assert!(full, "backlog did not fill within the connection cap");
-    // 満杯の判定が一時的でないことを確かめる（少し待っても追いつかない）。
-    std::thread::sleep(Duration::from_millis(200));
-    while let Ok(s) = rx.try_recv() {
-        held.push(s);
-    }
-    assert!(held.len() < spawned);
 
     let start = Instant::now();
     let out = run_env(&["doctor"], &[("XDG_RUNTIME_DIR", xdg.as_os_str())]);

@@ -20,8 +20,9 @@
 //! - CLI 自身の cgroup は `delete` と同じ `DelegatedCgroup::detect()` で検査する（食い違いを構造上作らない）。
 //!   `start` は `systemd-run --user --scope` で包むため委譲されていないログインシェルからでも通り、委譲が要るのは
 //!   cgroup の配置を記録したコンテナの `delete` だけである。終了コード 0 を「`start` が通る」の意味に保つため、
-//!   `CGROUP_NOT_DELEGATED` は通知（0 に寄与）とし、委譲スコープとして使えない `CGROUP_NOT_DOMAIN` と cgroup v2 が
-//!   無い `CGROUP_V2_UNAVAILABLE`（CORE-4）は Warning とする。判定できなかった場合は `CGROUP_INCONCLUSIVE`（4）。
+//!   `CGROUP_NOT_DELEGATED` と `CGROUP_NOT_DOMAIN`（threaded 等）は通知（0 に寄与。`start` は supervisor を新しい
+//!   委譲 scope へ移すので CLI 自身の cgroup 種別は影響しない）とし、cgroup v2 が無い `CGROUP_V2_UNAVAILABLE`（CORE-4）は
+//!   Warning とする。判定できなかった場合は `CGROUP_INCONCLUSIVE`（4）。
 //!
 //! # 未実装（REPAIR-3）
 //! - `start` の事前検査への connect の追加（`start` の挙動の変更になるため別判断）。
@@ -383,11 +384,11 @@ pub fn evaluate(f: &UserScopeFindings) -> UserScopeReport {
             "not_delegated",
         )),
         CgroupDelegationState::NotDomain => diagnostics.push(diag(
-            Warning,
+            Notice,
             "CGROUP_NOT_DOMAIN",
-            "the cgroup of this process is not a domain cgroup and cannot be used as a delegated scope",
+            "the cgroup of this process is not a domain cgroup and cannot be used as a delegated scope; start is unaffected but delete of a container with a recorded cgroup placement fails from here",
             vec![
-                "Run fandhe-container inside a delegated scope: systemd-run --user --scope -p Delegate=yes -- fandhe-container <command>",
+                "Run delete inside a delegated scope: systemd-run --user --scope -p Delegate=yes -- fandhe-container delete <id>",
             ],
             "cgroup",
             "not_domain",
@@ -845,9 +846,9 @@ mod tests {
             (
                 CgroupDelegationState::NotDomain,
                 "CGROUP_NOT_DOMAIN",
-                DoctorSeverity::Warning,
+                DoctorSeverity::Notice,
                 "not_domain",
-                3,
+                0,
             ),
             (
                 CgroupDelegationState::NoCgroup2,
@@ -894,9 +895,15 @@ mod tests {
         assert_eq!(r.exit_status().code(), 3);
         let r = evaluate(&with_cgroup(
             UserManagerState::ConnectTimedOut,
-            CgroupDelegationState::NotDomain,
+            CgroupDelegationState::NoCgroup2,
         ));
         assert_eq!(r.exit_status().code(), 3);
+        // 委譲スコープとして使えない cgroup（threaded 等）は通知で、判定不能の要因が無ければ 0。
+        let r = evaluate(&with_cgroup(
+            UserManagerState::Reachable,
+            CgroupDelegationState::NotDomain,
+        ));
+        assert_eq!(r.exit_status().code(), 0);
         let r = evaluate(&with_cgroup(
             UserManagerState::ConnectTimedOut,
             CgroupDelegationState::NotDelegated,

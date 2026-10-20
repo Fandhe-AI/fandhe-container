@@ -12,7 +12,7 @@
 | ---- | ---- |
 | restart の再 launch（#491） | supervisor の再 launch は本番 launcher の単一スレッド要求で拒否される（#2043）。#2043 が入るまで `make restart-latency` は再起動未観測（終了コード 1）になり数値は出ない。`make supervisor-independence` の `--check-restart` も同じ |
 | 計測の権限（#485・#219） | supervisor は入口で `PR_SET_DUMPABLE=0` にする（SUP-14）。同じ利用者の非 root からも `/proc/<pid>/exe`・`smaps_rollup` を読めない。一方 supervisor は rootful 起動を拒否する（SEC-5）。両立のため #2090 のオーナー決定（案 A）に従い、**計測（`/proc` の読み取りとシグナル送信）だけを root で行い、create・`systemd-run`・supervisor の起動は対象の利用者（`RUN_AS`）へ降格する**。#485 は「root が計測し、supervisor は対象の利用者が起動する」2 つのシェルで行う（これが案 A そのもの）。#219 の own は 1 つのスクリプトが root で動き、起動だけを `setpriv` で降格する（実装は #2099。自己テストはスタブのみで、**実機〔root〕での実行・検証は #485・#219 の人間担当が行う。結果は未取得**）。製品の `dumpable=0`・rootful 拒否は変えない |
-| supervisor の停止 | SIGTERM のハンドラは無くコンテナを止めない。CLI の `stop` は未実装（#1544）。スクリプトは記録した pid・起動時刻の同一性を照合して子孫へ SIGKILL を送り、状態ルートごと削除する。CLI の `delete` は呼ばない |
+| supervisor の停止 | CLI の `stop` は Linux で制御チャネル経由に結線済み（#2059・#2142）だが、SIGTERM を渡すだけで猶予後の SIGKILL は無く（#1545）、restart ポリシーの下では終了が再起動の対象になる（SUP-9・#2162 待ち）。コンテナの PID 1 の init はハンドラが無いと SIGTERM を捨てる。このため restart ポリシー `no` の後始末（#499 の既定・#485 の手順 1）だけ `stop` を第 1 段にし、記録した pid・起動時刻の同一性を照合して子孫へ SIGKILL を送る既存の回収を fallback として残す。#491 と #499 の `--check-restart` は `stop` を使わない。`stop` は supervisor と同じ利用者のシェルから呼ぶ（制御チャネルは別 uid の接続元を拒否する）。CLI の `delete` は委譲スコープの外では cgroup の検出に失敗するため呼ばず（#2133）、状態ルートごと削除する |
 | バックオフ（#491） | supervisor の bin にバックオフを指定する引数は無く、既定 100ms 固定（`crates/supervisor/src/restart.rs` の `DEFAULT_BACKOFF`）。計測値はバックオフを含むため、スクリプトは差し引いた値も出す |
 
 ## 共通の必要環境
@@ -42,6 +42,8 @@ export BIN_DIR="$PWD/target/release"
 - 計測専用の使い捨てのテンプレートを作る。コンテナごとの複製は `cp -a --reflink=auto` で作る（inode を共有しない。複製に失敗すると終了コード 2）
 - `cp -al` は使わない。複製が rootfs 外にもリンクを持つ inode になり、製品の `check_no_external_hardlinks` が起動前に拒否するため。reflink 非対応の FS では複製ごとに page cache が別になり、PSS が Docker の lower 共有より大きく出うる（比較条件として結果に記す）
 - `config.json` を置く。user namespace（UID マッピング）を入れる（`linux.namespaces` に user namespace を指定する意味。`linux.uidMappings` / `linux.gidMappings` は省略か空配列にする。非空だと core が `UNIMPLEMENTED` で拒否する。写像は launcher が権限モデルから導出する）。`process.args` は長時間動き続けるものにする（restart 計測では即時終了しないもの）。静的リンクのバイナリか、共有ライブラリを rootfs へコピーしたものにする
+- `stop` で止められるコンテナにするには、`process.args` の init が SIGTERM のハンドラを持つこと。持たない場合は `stop` が効かず fallback の SIGKILL で回収されるだけで、計測結果には影響しない
+
 - 並列起動するスクリプトは、コンテナごとに bundle 全体を `cp -a --reflink=auto` で複製して使う（supervisor は start 中に bundle へ flock を取るため、同じ bundle を共有できない）
 
 ## #499 監視プロセス独立性（SUP-5・TASK-162）
@@ -54,6 +56,7 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
 - 出力の読み方: JSON の `result` が `pass` なら全判定成立。`supervisors_alive_after_kill`・`monitored_containers_alive` は期待値 N-1。`target_container_reparented_to` は孤児化後の親 pid（参考値）
 - 終了コード: 0 = 全判定成立、1 = 判定不成立・起動数不足・期限切れ、2 = 引数・入力エラー、3 = 前提欠如（root 実行を含む）、4 = 後始末失敗
 - `--check-restart` は #2043 の後に有効（既定 off）
+- 後始末: 既定では残り N-1 個を CLI の `stop`（期限つき）で止めてから、記録した pid・起動時刻での回収を fallback として行う。対象の個体は SIGKILL 済みで `stop` が届かないため、記録した pid で回収する。`--check-restart` では `stop` を使わない（SUP-9 待ち）。stderr の `info: cli-stop: <成功>/<対象> supervisors exited after stop` は stop 後に監視プロセスが終了した数で、計測値ではない（0 でも fallback で回収され、判定は変わらない）
 - 実機でだけ確認できること: `systemd-run --scope` が pid・親子関係を変えずに supervisor を exec すること。実行後に `systemctl --user list-units --type=scope` へ残骸が無いこと
 
 ## #485 監視プロセスの常駐メモリ（SUP-2・TASK-158）
@@ -139,6 +142,20 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
        echo "sup-$i: container init not recorded (cannot prove no container process remains)" >&2; untracked=1
      fi
    done
+   # 1b. CLI の stop を第 1 段にする（restart ポリシー no の個体のみ。このシェルは supervisor と同じ利用者。SUP-5・CLI-1）。
+   #     失敗しても次の fallback（2 以降）で回収するので、止まらなくても中断しない。期限は呼び出しごと 10 秒。
+   for i in $(seq 1 50); do
+     timeout --kill-after=2 10 "$BIN_DIR/fandhe-container" --root "$root/state" stop "sup-$i" </dev/null >/dev/null 2>&1 || echo "sup-$i: stop failed; falling back" >&2
+   done
+   for _ in $(seq 1 100); do
+     alive=0
+     for f in "$root"/sup*.pid; do
+       read -r sp st pp <"$f" 2>/dev/null || continue
+       [ -n "$st" ] && [ "$(pstat "$sp" | awk '{print $20, $2}')" = "$st $pp" ] && alive=1
+     done
+     [ "$alive" -eq 0 ] && break
+     sleep 0.1
+   done
    # 2. supervisor を終了させる。送信直前に pid・起動時刻・親 pid（このシェルの $$）の一致を確認する（pid 再利用の取り違え防止）。
    #    保存した pid が同じ起動時刻のまま生きていれば SIGKILL
    for f in "$root"/sup*.pid; do
@@ -184,6 +201,8 @@ make supervisor-independence BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> COUN
 
 前提: #2043 が入っていること。入っていなければ再起動未観測で終了コード 1 になる。
 
+後始末で CLI の `stop` は使わない（`--restart` の下では SIGTERM の終了が restart の対象になる〔SUP-9・#2162 待ち〕ため）。計測の起点はコンテナ側プロセスへの SIGKILL のままで、`stop` 経由にはしない。後始末の正常系は下記のとおり CLI の `delete`。
+
 ```bash
 make restart-latency BIN_DIR="$BIN_DIR" BUNDLE=<テンプレート> TRIALS=20 WARMUP=1 OUTPUT=<新規ファイル>
 ```
@@ -210,6 +229,7 @@ make concurrent-memory-report OWN_RESULT=<own の出力> DOCKER_RESULT=<docker �
 - 前提: `RUN_AS` の利用者が `BUNDLE` のテンプレートを読めること。`OUTPUT` は root 所有のディレクトリ配下の新規ファイル（祖先を含む所有者・書き込み権を検査する）。バイナリ（`BIN_DIR`）は symlink でない通常ファイルで、`RUN_AS` の利用者が実行できること（root は直接実行しない）。`--no-new-privs` は付けない（rootless の user namespace の設定が setuid の `newuidmap` / `newgidmap` を使うため）
 - 後始末: 中断（HUP / INT / TERM）・失敗でも、supervisor・スコープ・状態ルート・利用者所有の一時ディレクトリを回収する。利用者の領域に root 所有のファイルがあれば削除せず、スコープや一時ディレクトリが残れば識別子（スコープ名・パス）つきで報告して終了コード 4
 - 実機（root）での実行と検証は未実施。自己テスト（スタブの `setpriv`・疑似 `/proc`）は root 不要で、実機の結果はこの手順書に書かない
+- 後始末は SIGTERM → SIGKILL のまま（CLI の `stop` へは未切り替え。root の本スクリプトからは `RUN_AS` の利用者へ降格して呼ぶ配線が要るため。別 issue）
 - 集計の対象は supervisor を根とする子孫全体（コンテナ側プロセスを含む）。コンテナ側プロセスは環境変数を継承しないため、所有の証明は生存中に記録した pid・起動時刻の同一性で行う
 - 出力の読み方・SUP-1（Docker の 80% 以下）の判定は #219 の担当。スクリプトは合否を出さない
 - 終了コード: 0 = 全試行 N/N 起動、1 = 計測失敗、2 = 引数エラー（bundle の複製失敗を含む）、3 = 前提欠如（非 root 実行・降格の不一致〔`demotion-mismatch`〕・対象の利用者の user マネージャの bus が無い）、4 = 後始末失敗（残存プロセス・スコープ・利用者の一時ディレクトリ、利用者の領域の root 所有ファイル）

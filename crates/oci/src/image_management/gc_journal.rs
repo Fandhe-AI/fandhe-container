@@ -163,11 +163,39 @@ fn sync_dir_os(_dir: &Path) -> std::io::Result<()> {
 /// テスト専用: 指定ディレクトリの fsync を回数限定で失敗させる（OCI-7 の fsync 失敗経路の検証用）。
 #[cfg(test)]
 mod test_hook {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::path::{Path, PathBuf};
 
     thread_local! {
         static FAIL: RefCell<Option<(PathBuf, u32)>> = const { RefCell::new(None) };
+        static FAIL_UNLINK: Cell<u32> = const { Cell::new(0) };
+        static FAIL_REWRITE: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// ジャーナルの unlink を `times` 回失敗させる。
+    pub(super) fn fail_unlink(times: u32) {
+        FAIL_UNLINK.with(|c| c.set(times));
+    }
+
+    /// 削除開始後のジャーナル書き直しを公開前に `times` 回失敗させる。
+    pub(super) fn fail_rewrite(times: u32) {
+        FAIL_REWRITE.with(|c| c.set(times));
+    }
+
+    fn take(c: &'static std::thread::LocalKey<Cell<u32>>) -> bool {
+        c.with(|c| {
+            let n = c.get();
+            c.set(n.saturating_sub(1));
+            n > 0
+        })
+    }
+
+    pub(super) fn should_fail_unlink() -> bool {
+        take(&FAIL_UNLINK)
+    }
+
+    pub(super) fn should_fail_rewrite() -> bool {
+        take(&FAIL_REWRITE)
     }
 
     pub(super) fn fail_sync_of(dir: &Path, times: u32) {
@@ -175,6 +203,8 @@ mod test_hook {
     }
 
     pub(super) fn clear() {
+        FAIL_UNLINK.with(|c| c.set(0));
+        FAIL_REWRITE.with(|c| c.set(0));
         FAIL.with(|f| *f.borrow_mut() = None);
     }
 
@@ -266,6 +296,15 @@ pub(super) fn journal_exists(root: &Path) -> bool {
 }
 
 /// 片づいていないジャーナルがあれば `FailedPrecondition`。新しい削除を始める前に呼ぶ。
+/// テーブル操作（manifest 除去・タグ解除）を含むジャーナルが残っているか。
+///
+/// 不変条件（OCI-7）: 残っている間はストアの変更系の入口を開けない。復旧が再実行する古い untag・
+/// manifest 除去が、その間に再登録されたタグ・manifest と両立しないため。blobs だけのジャーナルと
+/// 墓標は復旧が現在の参照を数え直すので該当しない。読めないジャーナルは `Err`（fail-closed）。
+pub(super) fn journal_has_table_ops(root: &Path) -> Result<bool, OciError> {
+    Ok(read_journal(root)?.is_some_and(|j| !j.manifests.is_empty() || !j.untag.is_empty()))
+}
+
 pub(super) fn ensure_no_pending_journal(root: &Path) -> Result<(), OciError> {
     if journal_exists(root) {
         return Err(err(
@@ -290,6 +329,10 @@ pub(super) fn write_journal(root: &Path, journal: &GcJournal) -> Result<(), OciE
 /// その場合は `Ok` を返す（書き直したジャーナルは見えており、永続化は未確定）。呼び出し側は
 /// 常に `Pending` を返し、次の lock の復旧が再試行する。公開前の失敗は元のジャーナルが残る `Err`。
 fn rewrite_journal(root: &Path, journal: &GcJournal) -> Result<(), OciError> {
+    #[cfg(test)]
+    if test_hook::should_fail_rewrite() {
+        return Err(err(OciErrorCode::Internal, "injected rewrite failure"));
+    }
     persist_journal(root, journal, false)
 }
 
@@ -397,6 +440,10 @@ pub(super) fn reap_stale_tmp(root: &Path) {
 /// 空のジャーナル（墓標）を公開して `Err` を返す。墓標は次の lock の復旧が読み、何も消さずに
 /// `blobs/sha256` と root の fsync をやり直して片づける（fsync が成功するまで残る）。
 pub(super) fn remove_journal(root: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if test_hook::should_fail_unlink() {
+        return Err(std::io::Error::other("injected journal unlink failure"));
+    }
     match fs::remove_file(journal_path(root)) {
         Ok(()) => {}
         Err(e) if e.kind() == ErrorKind::NotFound => {}
@@ -1219,6 +1266,79 @@ mod tests {
         let rec = store.recover_pending_deletion().unwrap().unwrap();
         assert_eq!(rec.deleted_blobs, vec![d(0xc1)]);
         assert!(!root.exists(&d(0xc1)));
+        assert!(!root.journal());
+    }
+
+    /// OCI-7: 削除完了時のジャーナル unlink が失敗してテーブル操作入りのジャーナルが残る間は、
+    /// lock が FailedPrecondition で拒否され、障害を除くと復旧が完了して変更が通る。
+    #[test]
+    fn oci7_unlink_failure_blocks_lock_until_recovered() {
+        let root = Root::new();
+        files(&root);
+        write_journal(&root.0, &journal_a()).unwrap();
+        for n in [0x11u8, 0xc1] {
+            fs::remove_file(blob_path(&root.0, &d(n)).unwrap()).unwrap();
+        }
+        test_hook::fail_unlink(100);
+        let st = settle(&root.0, &[], &[d(0x11), d(0xc1)], 0, false);
+        assert_eq!(st, DeletionDurability::Pending);
+        assert!(journal_has_table_ops(&root.0).unwrap());
+        let store = ImageStore::with_table(&root.0, table()).unwrap();
+        let e = store.lock().unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        test_hook::clear();
+        // 復旧は A を外し終えている。再登録（pull 相当）が通り、以後は外されない。
+        let mut g = store.lock().unwrap();
+        assert_eq!(g.manifests().count(), 1);
+        g.register_manifest(
+            d(0xa0),
+            ManifestComposition::new(d(0xc1), vec![d(0x10), d(0x11)]).unwrap(),
+        )
+        .unwrap();
+        g.register_tag(tk("v1"), &d(0xa0)).unwrap();
+        assert_eq!(g.tags().count(), 1);
+        drop(g);
+        let g = store.lock().unwrap();
+        assert_eq!(g.tags().count(), 1);
+        assert_eq!(g.manifests().count(), 2);
+        drop(g);
+        assert!(!root.journal());
+    }
+
+    /// OCI-7: blobs だけへの書き直しが公開前に失敗して元のジャーナルが残る間も、lock は拒否される。
+    #[test]
+    fn oci7_rewrite_failure_blocks_lock_until_recovered() {
+        let root = Root::new();
+        files(&root);
+        write_journal(&root.0, &journal_a()).unwrap();
+        for n in [0x11u8, 0xc1] {
+            fs::remove_file(blob_path(&root.0, &d(n)).unwrap()).unwrap();
+        }
+        test_hook::fail_sync_of(&blob_dir(&root.0), 100);
+        test_hook::fail_rewrite(100);
+        let st = settle(&root.0, &[], &[d(0x11), d(0xc1)], 0, false);
+        assert_eq!(st, DeletionDurability::Pending);
+        let j = read_journal(&root.0).unwrap().unwrap();
+        assert_eq!(j, journal_a());
+        let store = ImageStore::with_table(&root.0, table()).unwrap();
+        let e = store.lock().unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        test_hook::clear();
+        // 復旧は A を外し終えている。再登録（pull 相当）が通り、以後は外されない。
+        let mut g = store.lock().unwrap();
+        assert_eq!(g.manifests().count(), 1);
+        g.register_manifest(
+            d(0xa0),
+            ManifestComposition::new(d(0xc1), vec![d(0x10), d(0x11)]).unwrap(),
+        )
+        .unwrap();
+        g.register_tag(tk("v1"), &d(0xa0)).unwrap();
+        assert_eq!(g.tags().count(), 1);
+        drop(g);
+        let g = store.lock().unwrap();
+        assert_eq!(g.tags().count(), 1);
+        assert_eq!(g.manifests().count(), 2);
+        drop(g);
         assert!(!root.journal());
     }
 

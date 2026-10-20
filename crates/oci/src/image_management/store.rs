@@ -42,7 +42,9 @@ use std::time::{Duration, Instant};
 
 use super::ReferenceTable;
 use super::container_ref_persist::load_container_refs;
-use super::gc_journal::{PendingDeletionRecovery, journal_exists, reap_stale_tmp};
+use super::gc_journal::{
+    PendingDeletionRecovery, journal_exists, journal_has_table_ops, reap_stale_tmp,
+};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 
@@ -132,7 +134,16 @@ impl ImageStore {
     /// ほど長い場合は `InvalidArgument`。
     pub fn lock(&self) -> Result<ImageStoreGuard<'_>, OciError> {
         record_oci_op(&*self.recorder, OciOpKind::AcquireImageStoreLock, || {
-            self.lock_inner()
+            let guard = self.lock_inner()?;
+            // 復旧後もテーブル操作入りのジャーナルが残るなら、変更を許さない（OCI-7）。
+            // 古い untag・manifest 除去が再登録と両立しないため、障害が除かれて復旧が完了するまで拒否する。
+            if journal_has_table_ops(&self.root)? {
+                return Err(OciError::new(
+                    OciErrorCode::FailedPrecondition,
+                    "a pending image deletion could not be completed; retry after it is recovered",
+                ));
+            }
+            Ok(guard)
         })
     }
 

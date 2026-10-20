@@ -73,15 +73,15 @@ MVP では方式を選ぶ設定を置かず `Sha256Allowlist` 固定とする。
 
 | 項目 | 推奨 | 状態 |
 | ---- | ---- | ---- |
-| 置き場所 | 探索先ごとに `allowed-sha256sums`（案 A） | 承認待ち |
-| 合成 | スコープ対応 | 承認待ち |
-| 指定方法 | 固定パスのみ。上書き不可 | 承認待ち |
-| 一覧の検証 | `verify_file` の fd から上限 + 1 で読む | 承認待ち |
-| 無い | 全件拒否（reason で区別） | 承認待ち |
-| 読めない・不正 | エラーで停止（空にしない） | 承認待ち |
-| `PATH` 由来 | 登録前に除外 | 承認待ち |
-| 読み込み | 呼び出しごと。キャッシュなし | 承認待ち |
-| 方式の切替 | MVP は固定。未知の方式名は拒否 | 承認待ち |
+| (1) 置き場所 | 探索先ごとに `allowed-sha256sums`（案 A） | 承認待ち |
+| (2) 合成 | スコープ対応 | 承認待ち |
+| (3) 指定方法 | 固定パスのみ。上書き不可 | 承認待ち |
+| (4) 一覧の検証 | `verify_file` の fd から上限 + 1 で読む | 承認待ち |
+| (5) 無い | 全件拒否（reason で区別） | 承認待ち |
+| (6) 読めない・不正 | エラーで停止（空にしない） | 承認待ち |
+| (7) `PATH` 由来 | 登録前に除外 | 承認待ち |
+| (8) 読み込み | 呼び出しごと。キャッシュなし | 承認待ち |
+| (9) 方式の切替 | MVP は固定。未知の方式名は拒否 | 承認待ち |
 | (10) 一覧用の `BackendFailure` | 2 つ（missing と untrusted / malformed）。wiring 設計 4.10 の `AllowlistUnavailable` 1 つにはしない | 承認待ち |
 | (11) I5 と W8（#2232） | 別 issue のまま | 承認待ち |
 | (12) I7 と #1923 | 別 issue で相互参照 | 承認待ち |
@@ -105,8 +105,8 @@ MVP では方式を選ぶ設定を置かず `Sha256Allowlist` 固定とする。
 | I4 | feat(core): 登録前に `PATH` 由来の候補を除き、スコープ対応で照合する | I3 | 3.1・3.5 の決定どおり。PATH の警告は残す |
 | I5 | feat(cli): plugin_backend に一覧の読み込みを配線し `BackendFailure` に一覧用の種別を足す | I3・I4・#1867・W4（#2232 の承認後に起票。未起票の間は #2232） | 固定文言表の試験を更新し、パスを出力しないことを確かめる |
 | I6 | docs(setup): Linux・macOS の一覧の作り方と更新手順を書く | I5・#1867 | `docs/setup/linux.md` と macOS の文書 |
-| I8 | docs: 承認後に「承認待ち」記述を直す（(13) が承認された場合のみ） | I1〜I7 の方針が確定した後 | 本書の 4 章の状態列と冒頭、`CLAUDE.md` の該当行、`crates/core/src/plugin_trust.rs`・`crates/core/src/plugin_discovery.rs`・`crates/cli/src/commands/plugin_backend.rs` の doc コメントの「承認待ち」記述を直す（C8） |
 | I7 | test: 一覧ファイルの別 UID 所有・書き込み可の拒否を実機で確かめる（人間担当） | I3 | 実機の結果を PR に記録。推奨: #1923 と別 issue で相互参照し、macOS 分の依存に #1865 を足す（C7） |
+| I8 | docs: 承認後に「承認待ち」記述を直す（(13) が承認された場合のみ） | I1〜I7 の方針が確定した後 | 本書の 4 章の状態列と冒頭、`CLAUDE.md` の該当行、`crates/core/src/plugin_trust.rs`・`crates/core/src/plugin_discovery.rs`・`crates/cli/src/commands/plugin_backend.rs` の doc コメントの「承認待ち」記述を直す（C8） |
 
 ## 7. 他設計との整合（#2232・#1867・#1863・#1865・#1923）
 

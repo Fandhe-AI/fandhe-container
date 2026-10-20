@@ -1895,9 +1895,10 @@ fn release_recorded(
 /// 読む前に `/`・`/run`・`/run/fandhe` が root 所有・他者書き込み不可・symlink でないことを [`MOUNT_SCRIPT`] と同じ
 /// 基準で確かめる（`/run/fandhe` が無ければ記録は無い）。対象は名前が 16 進の nonce だけのエントリで、
 /// `lock.*`・`*.tmp`・`*.claim`・`*.done` は読まない。各エントリは symlink でない通常ファイルで root 所有・
-/// 他者書き込み不可のものだけを先頭 512 バイト読み（`head` が失敗して読めなかったものは `bad <nonce>` で報告し、
-/// 検索成功として黙って落とさない）、3 行目（所有者）が `$1` と一致するものを
-/// `rec <nonce> <マウント ID|none> <マウント先>` の 1 行で出力する。基準を満たさないエントリは読まずに
+/// 他者書き込み不可のものだけを読む。所有者で絞る前に、全エントリについて「512 バイト未満で、空でない
+/// ちょうど 3 行（`read` がすべて成功し 4 行目が無い）」を検証し、行の欠落・余分な行・上限での切り詰め・読み取り
+/// 失敗は `bad <nonce>` で報告する（所有者が別でも形式違反は黙って落とさない。#1412）。形式を満たし 3 行目
+/// （所有者）が `$1` と一致するものを `rec <nonce> <マウント ID|none> <マウント先>` の 1 行で出力する。基準を満たさないエントリは読まずに
 /// `bad <nonce>` の行で報告する（ホスト側 [`parse_lookup_output`] が改ざんとして扱い、何も外さない）。
 ///
 /// 終了コード: 200=`/`・`/run` が不正・202=`/run/fandhe` が不正・215=走査するエントリ数が上限（4096）超過。
@@ -1918,9 +1919,11 @@ const LOOKUP_SCRIPT: &str = concat!(
     "b=${f##*/}; case \"$b\" in *[!0-9a-f]*) continue ;; esac; ",
     "n=$((n + 1)); [ \"$n\" -le 4096 ] || exit 215; ",
     "if ! fchk \"$f\"; then printf 'bad %s\\n' \"$b\"; continue; fi; ",
-    "h=$(head -c 512 -- \"$f\") || { printf 'bad %s\\n' \"$b\"; continue; }; ",
-    "printf '%s\\n' \"$h\" | { IFS= read -r a; IFS= read -r t; IFS= read -r o; ",
-    "if [ \"$o\" = \"$O\" ]; then printf 'rec %s %s %s\\n' \"$b\" \"$a\" \"$t\"; fi; }; ",
+    "[ \"$(stat -c %s -- \"$f\")\" -lt 512 ] || { printf 'bad %s\\n' \"$b\"; continue; }; ",
+    "if { IFS= read -r a && IFS= read -r t && IFS= read -r o && ! IFS= read -r x ",
+    "&& [ -n \"$a\" ] && [ -n \"$t\" ] && [ -n \"$o\" ]; } < \"$f\" 2>/dev/null; then ",
+    "if [ \"$o\" = \"$O\" ]; then printf 'rec %s %s %s\\n' \"$b\" \"$a\" \"$t\"; fi; ",
+    "else printf 'bad %s\\n' \"$b\"; fi; ",
     "done; exit 0"
 );
 /// [`LOOKUP_SCRIPT`] の終了コード（走査するエントリ数が上限を超えた）。
@@ -4603,10 +4606,64 @@ mod tests {
         // 記録は 3 行（ID・マウント先・コンテナ ID）で書き、検索は名前が 16 進の nonce のエントリだけを読む。
         assert!(MOUNT_SCRIPT.contains("printf '%s\\n%s\\n%s\\n' \"$new\" \"$T\" \"$5\""));
         assert!(LOOKUP_SCRIPT.contains("*[!0-9a-f]*) continue"));
-        // `head` の失敗は検索成功として落とさず、`bad` で報告して解除前に拒否させる。
-        assert!(
-            LOOKUP_SCRIPT
-                .contains("h=$(head -c 512 -- \"$f\") || { printf 'bad %s\\n' \"$b\"; continue; }")
+        // 所有者で絞る前に 3 行構造・読み取りの成功・512 バイト未満を検証し、違反は `bad` で報告する。
+        assert!(LOOKUP_SCRIPT.contains("! IFS= read -r x"));
+        assert!(LOOKUP_SCRIPT.contains("-lt 512 ] || { printf 'bad %s\\n'"));
+        assert!(LOOKUP_SCRIPT.contains("else printf 'bad %s\\n' \"$b\"; fi"));
+    }
+
+    /// #1412: 実際の `sh` で LOOKUP_SCRIPT の記録の選別を回す（所有者・root 検査だけを一時ディレクトリ向けに外す）。
+    /// 所有者行の欠落・余分な行・空行・512 バイト以上は、所有者が別でも `bad`、正常な記録だけが `rec` になる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn lookup_script_reports_malformed_records_as_bad() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fandhe-lookup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // umask に依らず他者書き込み不可にする（スクリプトの基準）。
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(dir.join("aa1"), "none\n/mnt/fandhe/a\nweb\n").unwrap();
+        fs::write(dir.join("bb2"), "none\n/mnt/fandhe/b\n").unwrap();
+        fs::write(dir.join("cc3"), "none\n/mnt/fandhe/c\nweb\nextra\n").unwrap();
+        fs::write(dir.join("dd4"), "none\n/mnt/fandhe/d\nweb\n\n").unwrap();
+        fs::write(dir.join("ee5"), "none\n/mnt/fandhe/e\nother\n").unwrap();
+        fs::write(dir.join("ff6"), "").unwrap();
+        fs::write(dir.join("0a7"), "a".repeat(600)).unwrap();
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let from = "R=/run/fandhe;";
+        let skip = "chk / || exit 200; chk /run || exit 200; ";
+        assert!(LOOKUP_SCRIPT.contains(from) && LOOKUP_SCRIPT.contains(skip));
+        let script = LOOKUP_SCRIPT
+            .replace(from, &format!("R={};", dir.display()))
+            .replace(skip, "")
+            .replace("[ \"$1\" = 0 ] && ", "");
+        let out = std::process::Command::new("sh")
+            .args(["-c", &script, "sh", "web"])
+            .output()
+            .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let mut lines: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            [
+                "bad 0a7",
+                "bad bb2",
+                "bad cc3",
+                "bad dd4",
+                "bad ff6",
+                "rec aa1 none /mnt/fandhe/a"
+            ]
         );
     }
 

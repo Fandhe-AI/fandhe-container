@@ -201,6 +201,11 @@ fn guest_exec(mode: &str, cmd: &[&str]) -> ExitCode {
             match top {
                 Some(i) if rows.get(i).is_some_and(|r| r.0.to_string() == *id) => {
                     rows.remove(i);
+                    if mode == "mount_recover_ro_run" {
+                        // `/run` が読み取り専用の模擬: umount は成立するが記録を消せず 213 で終わる。
+                        return save_state(&rows)
+                            .map_or(ExitCode::from(3), |()| ExitCode::from(213));
+                    }
                     // 本物のスクリプトと同じく、外せたらその nonce の記録も消す。
                     let Some(mut records) = load_records() else {
                         return ExitCode::from(3);
@@ -213,6 +218,13 @@ fn guest_exec(mode: &str, cmd: &[&str]) -> ExitCode {
                 }
                 _ => ExitCode::from(203),
             }
+        }
+        ["sh", "-c", script, "sh", _nonce]
+            if script.starts_with("rm -f -- \"/run/fandhe/$1\"")
+                && mode == "mount_recover_ro_run" =>
+        {
+            // CLEAR_SCRIPT の模擬: `/run` が読み取り専用で記録を消せない。
+            ExitCode::from(213)
         }
         ["sh", "-c", script, "sh", owner] if script.contains("fchk()") => {
             if mode == "mount_recover_slow" {
@@ -294,6 +306,7 @@ fn main() -> ExitCode {
             | "mount_recover"
             | "mount_recover_other"
             | "mount_recover_slow"
+            | "mount_recover_ro_run"
     );
     match (mode.as_str(), call) {
         (_, Call::Exec(cmd)) if mount_mode => {

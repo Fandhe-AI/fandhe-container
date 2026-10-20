@@ -28,7 +28,7 @@ use fandhe_container_platform_windows::wslconfig::VirtiofsState;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 偽 `wsl.exe` のマウント系モード（テストごとに別の状態ファイルを使うため 1 テスト 1 モード）。
-const MODES: [&str; 11] = [
+const MODES: [&str; 12] = [
     "mount_ok",
     "mount_9p",
     "mount_9p_unset",
@@ -40,6 +40,7 @@ const MODES: [&str; 11] = [
     "mount_recover",
     "mount_recover_other",
     "mount_recover_slow",
+    "mount_recover_ro_run",
 ];
 
 /// モードごとの名前で偽 `wsl.exe` を置いたディレクトリ（`tests/wsl2_detect.rs` と同じ用意の仕方。
@@ -432,4 +433,25 @@ fn recover_shares_one_deadline_across_calls() {
     assert_eq!((report.found, report.released), (1, 1));
     assert!(mounted(&exe).is_empty());
     assert!(records(&exe).is_empty());
+}
+
+/// REPAIR-5・#1412: `/run` が読み取り専用で記録を消せない場合、umount が成立しても `Ok` にせず未完了
+/// （`FAILED_PRECONDITION`）で返し、記録を保持する。何度やり直しても記録が残る限り完了を装わない。
+#[test]
+fn recover_reports_incomplete_when_record_cannot_be_removed() {
+    let exe = fresh_fake("mount_recover_ro_run");
+    let req = owned_request("web-ro", "C:\\work", "work");
+    let prepared =
+        prepare_virtiofs_launch_with_program(&exe, VirtiofsState::Enabled, &req, TIMEOUT).unwrap();
+    drop(prepared);
+    let owner = OwnerId::parse("web-ro").unwrap();
+    for _ in 0..2 {
+        let e =
+            release_container_mounts_with_program(&exe, &ubuntu(), &owner, TIMEOUT).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(
+            records(&exe),
+            [("/mnt/fandhe/work".to_string(), "web-ro".to_string())]
+        );
+    }
 }

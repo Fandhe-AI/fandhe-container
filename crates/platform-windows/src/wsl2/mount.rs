@@ -764,8 +764,9 @@ fn abandon_argv(distro: &DistroName, nonce: &str) -> Vec<String> {
 /// しれない場合に claim を消すと、遅れて動き出した処理が claim を取り直して mount しうるため使わない
 /// （回復時に [`RECORD_SCRIPT`] が取った claim は柵として残す。`/run` は tmpfs で WSL の再起動時に消える）。
 const CLEAR_SCRIPT: &str = concat!(
-    "rm -f -- \"/run/fandhe/$1\" \"/run/fandhe/$1.tmp\"; ",
-    "rmdir -- \"/run/fandhe/$1.claim\" \"/run/fandhe/$1.done\" 2>/dev/null; exit 0"
+    "rm -f -- \"/run/fandhe/$1\" \"/run/fandhe/$1.tmp\" || exit 213; ",
+    "for d in \"/run/fandhe/$1.claim\" \"/run/fandhe/$1.done\"; do ",
+    "rmdir -- \"$d\" 2>/dev/null || [ ! -e \"$d\" ] && [ ! -L \"$d\" ] || exit 213; done; exit 0"
 );
 
 fn clear_argv(distro: &DistroName, nonce: &str) -> Vec<String> {
@@ -774,7 +775,7 @@ fn clear_argv(distro: &DistroName, nonce: &str) -> Vec<String> {
 
 /// [`CLEAR_SCRIPT`] を 1 回実行し、削除を確認できたか（実行が成功終了したか）を返す。
 ///
-/// 失敗してもマウントの安全性には影響しないが、記録が残ったまま「回収済み」と報告しないよう、
+/// 失敗してもマウントの安全性には影響しないが（スクリプトは削除失敗を 213 で伝える）、記録が残ったまま「回収済み」と報告しないよう、
 /// 呼び出し側（[`rollback`]）は `false` を未完了として数える（期限切れは実行器の結果として呼び出し側に伝わる）。
 fn clear_record(distro: &DistroName, nonce: &str, exec: Exec<'_>) -> bool {
     matches!(
@@ -807,7 +808,9 @@ const UMOUNT_SCRIPT: &str = concat!(
     "done < /proc/self/mountinfo; ",
     "top=; n=0; for i in $ids; do case \" $pars \" in *\" $i \"*) ;; *) top=$i; n=$((n + 1)) ;; esac; done; ",
     "[ \"$n\" = 1 ] && [ \"$top\" = \"$2\" ] || exit 203; ",
-    "umount \"$1\" || exit $?; rm -f -- \"/run/fandhe/$3\"; rmdir -- \"/run/fandhe/$3.claim\" \"/run/fandhe/$3.done\" 2>/dev/null || :; exit 0"
+    "umount \"$1\" || exit $?; rm -f -- \"/run/fandhe/$3\" || exit 213; ",
+    "for d in \"/run/fandhe/$3.claim\" \"/run/fandhe/$3.done\"; do ",
+    "rmdir -- \"$d\" 2>/dev/null || [ ! -e \"$d\" ] && [ ! -L \"$d\" ] || exit 213; done; exit 0"
 );
 
 fn umount_argv(distro: &DistroName, guest_path: &str, mount_id: u32, nonce: &str) -> Vec<String> {
@@ -1252,8 +1255,9 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> Rollba
                 Pending::Recorded(id) => id,
                 Pending::Gone => continue,
                 Pending::NotAttributed => {
-                    // MOUNT_SCRIPT は終了済み（記録が確定）なので記録は消してよい。マウントは外さない。
-                    let _ = clear_record(distro, &o.nonce, exec);
+                    // 所有を確認できないので、マウントは外さず記録も消さない。記録を消すと、マウントが残っていても
+                    // 同じ ID の再試行が「記録なし」（Gone / found=0）になり残置を検出できなくなる。解除を確認できる
+                    // まで記録を保持し、再試行でも未完了（unconfirmed）として報告する（fail-closed）。
                     out.unconfirmed += 1;
                     continue;
                 }
@@ -1495,19 +1499,25 @@ fn mount_one(
             ))
         }
         Evidence::Missing | Evidence::Fenced => {
-            if evidence == Evidence::Missing {
-                // MOUNT_SCRIPT は終了済みで本呼び出しのマウントは無いので、記録と claim を消す
-                // （Fenced の claim は遅れて動き出す処理を止める柵なので残す）。
-                let _ = clear_record(distro, &nonce, pick_recovery(&mut recovery, &mut *exec));
-            }
-            match failure {
-                None => Err(unconfirmed(not_identified())),
-                Some(e) => match count_fresh_mounts(
+            let fresh = match &failure {
+                // mount が成功を返したのに特定できなかった: マウントは残っている。
+                None => None,
+                Some(_) => count_fresh_mounts(
                     distro,
                     &guest_path,
                     before_ids,
                     pick_recovery(&mut recovery, &mut *exec),
-                ) {
+                ),
+            };
+            if evidence == Evidence::Missing && fresh == Some(0) {
+                // MOUNT_SCRIPT は終了済みで本呼び出しのマウントが残っていないと確認できたので、記録と claim を消す
+                // （Fenced の claim は遅れて動き出す処理を止める柵なので残す）。マウントが残りうる間（新しい
+                // マウントがある・確認できない）は `none` の記録を保持し、by-owner の回収が残置を検出できるようにする。
+                let _ = clear_record(distro, &nonce, pick_recovery(&mut recovery, &mut *exec));
+            }
+            match failure {
+                None => Err(unconfirmed(not_identified())),
+                Some(e) => match fresh {
                     Some(0) => Err(e),
                     _ => Err(unconfirmed(e)),
                 },
@@ -2670,8 +2680,15 @@ mod tests {
                 .contains("chk / || exit 200; chk /mnt || exit 200; chk /run || exit 200; ")
         );
         assert!(UMOUNT_SCRIPT.contains(
-            "[ \"$n\" = 1 ] && [ \"$top\" = \"$2\" ] || exit 203; umount \"$1\" || exit $?; rm -f -- \"/run/fandhe/$3\"; rmdir -- \"/run/fandhe/$3.claim\" \"/run/fandhe/$3.done\" 2>/dev/null || :; exit 0"
+            "[ \"$n\" = 1 ] && [ \"$top\" = \"$2\" ] || exit 203; umount \"$1\" || exit $?; rm -f -- \"/run/fandhe/$3\" || exit 213; "
         ));
+        // 記録の削除失敗は成功に丸めず非ゼロ（213）で伝える（呼び出し側が未完了として保持する）。
+        assert!(UMOUNT_SCRIPT.ends_with("|| exit 213; done; exit 0"));
+        assert!(
+            CLEAR_SCRIPT
+                .starts_with("rm -f -- \"/run/fandhe/$1\" \"/run/fandhe/$1.tmp\" || exit 213; ")
+        );
+        assert!(CLEAR_SCRIPT.ends_with("|| exit 213; done; exit 0"));
         assert_eq!(
             record_argv(&d, "00ff").get(5..),
             Some(
@@ -2801,6 +2818,10 @@ mod tests {
         deferred: Option<Vec<String>>,
         /// CLEAR_SCRIPT の呼び出し回数。
         clears: usize,
+        /// true なら CLEAR_SCRIPT が記録を消せず 213 で失敗する（`/run` が読み取り専用の模擬）。
+        clear_fails: bool,
+        /// true なら UMOUNT_SCRIPT は umount に成功するが記録を消せず 213 で終わる。
+        umount_record_rm_fails: bool,
         /// 記録の読み取り回数。
         record_reads: usize,
         /// true なら記録の読み取り・取り下げを `TIMEOUT` にする。
@@ -2878,6 +2899,8 @@ mod tests {
                 defer_mount: false,
                 deferred: None,
                 clears: 0,
+                clear_fails: false,
+                umount_record_rm_fails: false,
                 record_reads: 0,
                 fail_record_read: false,
                 dones: std::collections::HashSet::new(),
@@ -3229,6 +3252,9 @@ mod tests {
                 ["sh", "-c", script, "sh", nonce] if *script == CLEAR_SCRIPT => {
                     // CLEAR_SCRIPT の模擬: 記録・claim・done を消す。
                     self.clears += 1;
+                    if self.clear_fails {
+                        return fail_cat(213);
+                    }
                     self.records.remove(*nonce);
                     self.claims.remove(*nonce);
                     self.dones.remove(*nonce);
@@ -3260,6 +3286,9 @@ mod tests {
                         self.mounts.remove(i);
                         self.ids.remove(i);
                         self.opts.remove(i);
+                    }
+                    if self.umount_record_rm_fails {
+                        return fail_cat(213);
                     }
                     self.records.remove(*nonce);
                     self.claims.remove(*nonce);
@@ -3380,7 +3409,7 @@ mod tests {
         // 失敗した c は成立していない（他者のマウントかもしれない）ので外さず、成立済みの b・a だけを外す。
         assert_eq!(g.umounts, ["/mnt/fandhe/b", "/mnt/fandhe/a"]);
         assert_eq!(g.mounts.len(), 1);
-        // 解除した a・b の記録も、成立しなかった c の記録（none）も残らない。
+        // 解除した a・b の記録も、マウントが残っていないと確認できた c の記録（none）も残らない。
         assert!(g.records.is_empty() && g.claims.is_empty());
     }
 
@@ -3522,9 +3551,10 @@ mod tests {
         assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
         assert!(e.message().contains("ownership unconfirmed"));
         assert!(g.umounts.is_empty());
-        // MOUNT_SCRIPT は終了済み（記録は none）なので、記録と claim は消す。
-        assert_eq!(g.clears, 1);
-        assert!(g.records.is_empty() && g.claims.is_empty());
+        // 所有を確認できない（記録は none）ので、マウントが残りうる間は記録を消さない。
+        assert_eq!(g.clears, 0);
+        assert_eq!(g.records.len(), 1);
+        assert!(g.records.values().all(|v| v == "none"));
     }
 
     /// SEC: 読み取り専用要求なのに ro でマウントされていなければ解除してエラーにする。
@@ -4221,7 +4251,8 @@ mod tests {
         assert_eq!(e.unreleased(), None);
         assert!(g.umounts.is_empty());
         assert_eq!(g.ids, [1, 100, 101]);
-        assert!(g.records.is_empty() && g.claims.is_empty());
+        // 所有を確認できないので記録は保持される（消すと再試行で残置を検出できない）。
+        assert!(g.records.values().all(|v| v == "none"));
     }
 
     /// WIN-2: `decide_transport` の表（ポリシー × 設定状態 × fstype）。期待値は具体値で照合する。
@@ -4928,6 +4959,61 @@ mod tests {
         assert_eq!((report.found, report.released), (1, 1));
         assert!(g.umounts.is_empty());
         assert!(g.records.is_empty() && g.claims.is_empty());
+    }
+
+    /// WIN-2・#1412: `none` の記録は消さないので、再試行しても残置を検出して未完了のまま報告する（found=0 にならない）。
+    #[test]
+    fn recover_keeps_unattributed_record_and_reports_again_on_retry() {
+        let mut g = Guest::new("virtiofs");
+        g.mounts.push(("/mnt/fandhe/a".into(), "virtiofs".into()));
+        g.ids.push(300);
+        g.opts.push("rw,nosuid,nodev".into());
+        g.records.insert("00ab".into(), "none".into());
+        g.claims.insert("00ab".into());
+        g.meta
+            .insert("00ab".into(), ("/mnt/fandhe/a".into(), "web".into()));
+        for _ in 0..2 {
+            let e = recover(&mut g, "web").unwrap_err();
+            assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+            assert_eq!(g.records.get("00ab").map(String::as_str), Some("none"));
+            assert_eq!(g.clears, 0);
+        }
+    }
+
+    /// REPAIR-5・#1412: 記録の削除に失敗（`/run` が読み取り専用等）したら `Ok(released)` にせず未完了として保持する。
+    #[test]
+    fn recover_reports_incomplete_when_stale_record_cannot_be_removed() {
+        let mut g = Guest::new("virtiofs");
+        g.records.insert("00ab".into(), "150".into());
+        g.claims.insert("00ab".into());
+        g.meta
+            .insert("00ab".into(), ("/mnt/fandhe/a".into(), "web".into()));
+        g.clear_fails = true;
+        let e = recover(&mut g, "web").unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert!(g.records.contains_key("00ab"));
+        // 直ってからの再試行で完了する。
+        g.clear_fails = false;
+        let report = recover(&mut g, "web").unwrap();
+        assert_eq!((report.found, report.released), (1, 1));
+        assert!(g.records.is_empty());
+    }
+
+    /// REPAIR-5・#1412: umount は成功したが UMOUNT_SCRIPT が記録を消せなかった（213）場合も、完了にせず保持する。
+    #[test]
+    fn recover_reports_incomplete_when_umount_script_cannot_remove_record() {
+        let mut g = Guest::new("virtiofs");
+        prepare_owned(&mut g, "web", vec![sm("C:\\a", "a", false)]);
+        g.umount_record_rm_fails = true;
+        g.clear_fails = true;
+        let e = recover(&mut g, "web").unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(g.records.len(), 1);
+        g.umount_record_rm_fails = false;
+        g.clear_fails = false;
+        let report = recover(&mut g, "web").unwrap();
+        assert_eq!((report.found, report.released), (1, 1));
+        assert!(g.records.is_empty());
     }
 
     /// WIN-2: 自分のマウントを特定できなかった記録（`none`）は外さず、件数だけを報告する（fail-closed）。

@@ -29,18 +29,19 @@ fn container_paths(layout: UsrMergeLayout) -> Vec<String> {
 
 #[test]
 fn gpu1_parse_normalize_aggregate() {
+    // 集約順はトップレベル → デバイス（上流の InjectDevices に合わせる。GPU-1・#1888）。
     assert_eq!(
         container_paths(UsrMergeLayout::merged()),
         [
-            "/usr/lib/firmware/nvidia/595.91.07/gsp_ga10x.bin",
-            "/usr/bin/nvidia-smi"
+            "/usr/bin/nvidia-smi",
+            "/usr/lib/firmware/nvidia/595.91.07/gsp_ga10x.bin"
         ]
     );
     assert_eq!(
         container_paths(UsrMergeLayout::split()),
         [
-            "/lib/firmware/nvidia/595.91.07/gsp_ga10x.bin",
-            "/usr/bin/nvidia-smi"
+            "/usr/bin/nvidia-smi",
+            "/lib/firmware/nvidia/595.91.07/gsp_ga10x.bin"
         ]
     );
 }

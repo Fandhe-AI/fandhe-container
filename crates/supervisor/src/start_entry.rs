@@ -300,6 +300,31 @@ fn log_legacy_tiocsti(observe: fn() -> fandhe_container_core::legacy_tiocsti::Le
     let _ = log_legacy_tiocsti_to(crate::stderr_sink::stderr(), observe());
 }
 
+/// launch が評価した監査の網羅(`launchIsolation.auditCoverage`)が縮退していれば、固定の警告 1 行を `sink` へ待たずに入れる
+/// (SEC-4・REPAIR-4・REPAIR-5・#2027)。縮退していない・評価の記録が無いときは何もせず `None`。
+/// キュー満杯でも待たず、結果は起動の可否に使わない。
+fn log_audit_coverage_to(
+    sink: &crate::stderr_sink::StderrSink,
+    record: Option<&fandhe_container_core::launch_isolation::LaunchIsolationRecord>,
+) -> Option<crate::stderr_sink::EmitOutcome> {
+    use fandhe_container_core::launch_isolation::RecordedAuditCoverage;
+    let RecordedAuditCoverage::Evaluated { coverage, .. } = record?.audit_coverage() else {
+        return None;
+    };
+    let line = coverage.log_line()?;
+    Some(sink.emit(format!("{line}\n").into_bytes()))
+}
+
+/// start の成功後に、launch が評価した監査の網羅の縮退警告を supervisor のログ(`@supervisor-logs`)へ 1 行残す(#2027)。
+///
+/// core の launch 中の出力(`emit_diagnostic_line`)は fd 2 が AF_UNIX の socket のときだけ届き、CLI の `start`(stderr が
+/// null)では捨てられるため、`legacy_tiocsti` と同じく成功後に supervisor が起動結果の評価値から出し直す。
+/// `stderr_sink` の常駐スレッドを作るので、単一スレッド前提の区間が終わった後にだけ呼ぶ。restart の再 launch では
+/// 再出力しない(初回に記録済み)。
+fn log_audit_coverage(process: &dyn LaunchedProcess) {
+    let _ = log_audit_coverage_to(crate::stderr_sink::stderr(), process.launch_isolation());
+}
+
 /// 回収を確かめられなかったハンドルの保管先（`Drop` は回収しないため、捨てずに保持する。REPAIR-5）。
 static STRANDED: Mutex<Vec<Box<dyn LaunchedProcess>>> = Mutex::new(Vec::new());
 
@@ -680,6 +705,7 @@ fn start_reporting(
                     },
                 );
                 log_legacy_tiocsti(observe);
+                log_audit_coverage(running.process.as_ref());
                 Ok(running)
             }
             Attempt::Failed { error, cleanup } => {
@@ -3100,6 +3126,58 @@ mod tests {
             buf.0.lock().unwrap().as_slice(),
             format!("{LEGACY_LINE}\n").as_bytes()
         );
+    }
+
+    /// SEC-4・REPAIR-4(#2027): 縮退した監査の網羅の評価値は固定 1 行が改行付きでログへ入り、縮退なし・記録なしでは入らない。
+    #[test]
+    fn sec4_2027_degraded_audit_coverage_reaches_the_supervisor_log() {
+        use crate::stderr_sink::{EmitOutcome, StderrSink};
+        use fandhe_container_core::audit_log::{
+            AuditCoverage, AuditCoveragePolicy, DegradeReason, KernelAuditLayerStatus,
+        };
+        use fandhe_container_core::launch_isolation::{
+            LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+        };
+        let base = || {
+            LaunchIsolationRecord::from_parts(
+                RootIdentity::new(44, 1234),
+                RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)])
+                    .unwrap(),
+            )
+        };
+        let degraded = base().with_audit_coverage(
+            AuditCoveragePolicy::BestEffort,
+            AuditCoverage::new(
+                KernelAuditLayerStatus::Degraded(DegradeReason::SeccompKillNotLogged),
+                KernelAuditLayerStatus::Degraded(DegradeReason::LandlockAuditAbiTooOld),
+            ),
+        );
+        let buf = SharedBuf::default();
+        let sink = StderrSink::spawn(buf.clone(), 4);
+        assert_eq!(
+            log_audit_coverage_to(&sink, Some(&degraded)),
+            Some(EmitOutcome::Queued)
+        );
+        assert_eq!(sink.flush(Duration::from_secs(5)), EmitOutcome::Written);
+        assert_eq!(
+            buf.0.lock().unwrap().as_slice(),
+            concat!(
+                r#"{"component":"core.audit","operation":"audit_coverage","outcome":"degraded","#,
+                r#""seccomp_kill":"seccomp_kill_not_logged","landlock":"landlock_audit_abi_too_old"}"#,
+                "\n"
+            )
+            .as_bytes()
+        );
+        let clear = base().with_audit_coverage(
+            AuditCoveragePolicy::BestEffort,
+            AuditCoverage::new(
+                KernelAuditLayerStatus::Requested,
+                KernelAuditLayerStatus::Requested,
+            ),
+        );
+        assert_eq!(log_audit_coverage_to(&sink, Some(&clear)), None);
+        assert_eq!(log_audit_coverage_to(&sink, Some(&base())), None);
+        assert_eq!(log_audit_coverage_to(&sink, None), None);
     }
 
     /// CORE-5(#2008): 対象外の状態では何も入れない。

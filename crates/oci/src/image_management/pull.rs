@@ -815,10 +815,10 @@ impl PullSession<'_> {
             Err(_) => return failed(OciErrorCode::Internal),
         }
         match fs::symlink_metadata(&self.staging_dir) {
-            Ok(m) if m.is_dir() => match fs::remove_dir_all(&self.staging_dir) {
+            Ok(m) if m.is_dir() => match super::pull_recovery::reclaim_dir(&self.staging_dir) {
+                // `@pull.lock` は他の内容を消し終えるまで残す（中断時も GC が回収できる。OCI-7・#852）。
                 Ok(()) => StagingCleanup::Removed,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => StagingCleanup::Removed,
-                Err(_) => failed(OciErrorCode::Internal),
+                Err(code) => failed(code),
             },
             Ok(_) => failed(OciErrorCode::FailedPrecondition),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => StagingCleanup::Removed,

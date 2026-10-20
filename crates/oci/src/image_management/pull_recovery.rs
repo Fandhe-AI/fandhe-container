@@ -150,7 +150,27 @@ fn probe_pull(dir: &std::path::Path) -> PullLiveness {
 
 /// 回収対象と確定したステージングを消す。`@pull.lock` は最後に消し、それ以前に失敗したら残して返す
 /// （部分削除の後も次回の判定・再試行ができるように。モジュール doc「回収の順序」）。
-fn reclaim_dir(dir: &std::path::Path) -> Result<(), OciErrorCode> {
+///
+/// pull 自身の abort / publish 後の後始末（`pull` モジュールの `remove_staging`）も同じ関数を使い、
+/// 通常の後始末の中断でも証跡を失わず本 GC が回収できるようにする（OCI-7・#852）。
+pub(super) fn reclaim_dir(dir: &std::path::Path) -> Result<(), OciErrorCode> {
+    reclaim_dir_with(dir, &remove_entry)
+}
+
+/// 子エントリ 1 件の削除（ディレクトリは再帰）。
+fn remove_entry(path: &std::path::Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+/// [`reclaim_dir`] の本体。子エントリの削除手段を差し替えられる（削除失敗の注入試験用）。
+fn reclaim_dir_with(
+    dir: &std::path::Path,
+    remove: &dyn Fn(&std::path::Path) -> std::io::Result<()>,
+) -> Result<(), OciErrorCode> {
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -165,14 +185,7 @@ fn reclaim_dir(dir: &std::path::Path) -> Result<(), OciErrorCode> {
         if ent.file_name() == PULL_LOCK_FILE_NAME {
             continue;
         }
-        let path = ent.path();
-        let is_dir = fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir());
-        let r = if is_dir {
-            fs::remove_dir_all(&path)
-        } else {
-            fs::remove_file(&path)
-        };
-        match r {
+        match remove(&ent.path()) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => failed = true,
@@ -615,12 +628,37 @@ mod tests {
         assert_eq!(s[0].error_code(), Some(OciErrorCode::FailedPrecondition));
     }
 
-    /// REPAIR-4・OCI-7: 一部の削除失敗は結果を返しつつ失敗として記録される（root では削除できるため skip）。
+    /// REPAIR-4・OCI-7: 一部の削除失敗は結果を返しつつ失敗として記録される。
+    /// 失敗は `reclaim_dir_with` の注入で確実に起こす（root でも成立）ため、アサーションは常に実行される。
+    #[test]
+    fn oci7_reclaim_keeps_lock_on_injected_failure_and_retry_succeeds() {
+        let root = Root::new("recpartial");
+        let dir = mk_stale(&root, "p1", true);
+        fs::write(dir.join("keep"), b"x").unwrap();
+        let fail = std::cell::Cell::new(true);
+        let inject = |p: &std::path::Path| -> std::io::Result<()> {
+            if fail.get() && p.file_name().is_some_and(|n| n == "keep") {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            remove_entry(p)
+        };
+        assert_eq!(reclaim_dir_with(&dir, &inject), Err(OciErrorCode::Internal));
+        // 証跡の `@pull.lock` と失敗した子は残る。
+        assert!(dir.join(PULL_LOCK_FILE_NAME).exists());
+        assert!(dir.join("keep").exists());
+        // 注入を止めた再試行で回収できる。
+        fail.set(false);
+        assert_eq!(reclaim_dir_with(&dir, &inject), Ok(()));
+        assert!(!dir.exists());
+    }
+
+    /// REPAIR-4・OCI-7: `recover_stale_pulls` が削除失敗を `failed()` と失敗記録に反映する
+    /// （unix の非 root では実際の権限エラーで確認。root では上の注入試験が契約を担保する）。
     #[cfg(unix)]
     #[test]
     fn oci7_recover_records_partial_removal_failure() {
         use std::os::unix::fs::PermissionsExt;
-        let root = Root::new("recpartial");
+        let root = Root::new("recpartial2");
         let dir = mk_stale(&root, "p1", true);
         let sub = dir.join("sub");
         fs::create_dir_all(&sub).unwrap();
@@ -629,7 +667,8 @@ mod tests {
         let (store, rec) = recorded_store(&root);
         let r = store.recover_stale_pulls().unwrap();
         if r.failed().is_empty() {
-            // root 等で削除できた場合は skip（`sub` は既に無い可能性があるため権限は戻さない）。
+            // root では権限で拒否されない。後始末のみ行い、契約は注入試験が担保する。
+            assert_eq!(r.reclaimed(), &[pid("p1")]);
             return;
         }
         assert_eq!(r.failed(), &[(pid("p1"), OciErrorCode::Internal)]);
@@ -637,7 +676,6 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].outcome(), crate::instrument::OciOpOutcome::Failure);
         assert_eq!(s[0].error_code(), Some(OciErrorCode::Internal));
-        // 証跡の `@pull.lock` は残り、権限を戻した後の再試行で回収できる。
         assert!(dir.join(PULL_LOCK_FILE_NAME).exists());
         fs::set_permissions(&sub, fs::Permissions::from_mode(0o700)).unwrap();
         let r2 = store.recover_stale_pulls().unwrap();

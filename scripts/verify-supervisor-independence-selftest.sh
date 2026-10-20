@@ -52,8 +52,26 @@ fail() {
 mkdir -m 0755 "${root}/bin"
 cat >"${root}/bin/fandhe-container" <<'STUB'
 #!/usr/bin/env bash
+if [ "$1" = --root ] && [ "$3" = stop ] && [ "$#" -eq 4 ]; then
+  # stop スタブ。呼び出しを記録し、STUB_STOP で挙動を切り替える（ok / fail / ignore / hang）。
+  echo "stop $4" >>"$STUB_DIR/cli.log"
+  case "${STUB_STOP:-ok}" in
+    ok)
+      : >"$STUB_DIR/$4.stopped"
+      read -r cp <"$STUB_DIR/$4.cpid" 2>/dev/null && kill -TERM "$cp" 2>/dev/null
+      exit 0 ;;
+    fail) echo '{"code":"UNAVAILABLE","message":"stub"}' >&2; exit 9 ;;
+    ignore) exit 0 ;;
+    hang)
+      # fork せずに待つ（期限で打ち切られたとき、孤児の子を残さない）。
+      mkfifo "$STUB_DIR/hang.$$" && exec 8<>"$STUB_DIR/hang.$$" && read -t 300 -u 8
+      exit 0 ;;
+  esac
+  exit 2
+fi
 [ "$1" = --root ] && [ "$3" = create ] && [ "$4" = --bundle ] && [ "$#" -eq 6 ] || exit 2
 [ -f "$5/config.json" ] && [ -d "$5/rootfs" ] || exit 2
+echo "create $6" >>"$STUB_DIR/cli.log"
 mkdir -p "$2/$6" && echo '{"status":"created"}' >"$2/$6/state.json"
 STUB
 cat >"${root}/systemd-run" <<'STUB'
@@ -137,6 +155,8 @@ while :; do
     continue
   fi
   wait "$c" || true
+  # CLI の stop 経由でコンテナが止められたとき（stop スタブが .stopped を作る）は終了コード 0 で終わる。
+  if [ -e "$STUB_DIR/$id.stopped" ]; then exit 0; fi
   if [ "$STUB_MODE" = restart ] || [ "$STUB_MODE" = restart_sup_dies ]; then
     sleep 300 &
     c=$!
@@ -248,6 +268,37 @@ else
   fail "normal: target_container_reparented_to is not a pid ($(json_get target_container_reparented_to "$OUT"))"
 fi
 if grep -q -e '/fandhe-container-supervisor' -e "${root}" "$OUT" "$ERR"; then fail "normal: output leaks a path"; else pass "normal: output has no binary/bundle path"; fi
+# stop 経由の後始末（#2163・CLI-1・SUP-5）: 対象（-3）を除く 4 個へ stop を呼び、create の後に呼ぶ。
+expect_eq "normal: stop calls" "selfsi-1 selfsi-2 selfsi-4 selfsi-5" "$(sed -n 's/^stop //p' "$(dirname "$OUT")/cli.log" | tr '\n' ' ' | sed 's/ $//')"
+expect_eq "normal: create calls" 5 "$(grep -c '^create ' "$(dirname "$OUT")/cli.log")"
+expect_eq "normal: first stop comes after the last create" "stop" "$(sed -n '6p' "$(dirname "$OUT")/cli.log" | cut -d' ' -f1)"
+if grep -q 'info: cli-stop: 4/4 supervisors exited after stop' "$ERR"; then pass "normal: cli-stop info line is 4/4"; else fail "normal: cli-stop info line missing"; fi
+
+# 1b. stop が失敗する（UNAVAILABLE 相当）→ fallback の SIGTERM／SIGKILL で回収され、判定は変わらない。
+STUB_STOP=fail run_case normal
+expect_eq "stop_fail: exit code" 0 "$RC"
+expect_eq "stop_fail: result" pass "$(json_get result "$OUT")"
+expect_eq "stop_fail: supervisors_alive_after_kill" 4 "$(json_get supervisors_alive_after_kill "$OUT")"
+expect_eq "stop_fail: stop calls" 4 "$(grep -c '^stop ' "$(dirname "$OUT")/cli.log")"
+if grep -q 'info: cli-stop: 0/4' "$ERR"; then pass "stop_fail: cli-stop info line is 0/4"; else fail "stop_fail: cli-stop info line missing"; fi
+
+# 1c. stop が成功を返すが何も止まらない（PID 1 が SIGTERM を捨てる場合の模擬）→ fallback で回収される。
+STUB_STOP=ignore run_case normal
+expect_eq "stop_ignore: exit code" 0 "$RC"
+expect_eq "stop_ignore: result" pass "$(json_get result "$OUT")"
+if grep -q 'info: cli-stop: 0/4' "$ERR"; then pass "stop_ignore: cli-stop info line is 0/4"; else fail "stop_ignore: cli-stop info line missing"; fi
+
+# 1d. stop がハングする → 呼び出しごとの期限と段全体の期限で打ち切られ、全体が上限内に終わる。
+hang_t0=$SECONDS
+# --timeout 3 では残り時間から強制終了猶予 3 秒を引くと 0 以下になり stop が一度も呼ばれないため、stop が実際に
+# 送られる 8 秒を使う（最初の stop は上限 5 秒で打ち切られ、残りは段全体の期限で送られない）。
+STUB_STOP=hang run_case normal --timeout 8
+hang_el=$((SECONDS - hang_t0))
+expect_eq "stop_hang: the hanging stop was entered (cli.log)" 1 "$(grep -c '^stop ' "$(dirname "$OUT")/cli.log")"
+if [ "$hang_el" -ge 4 ]; then pass "stop_hang: per-call deadline was waited for (${hang_el}s >= 4s)"; else fail "stop_hang: returned in ${hang_el}s without waiting for the stop deadline"; fi
+expect_eq "stop_hang: exit code" 0 "$RC"
+expect_eq "stop_hang: result" pass "$(json_get result "$OUT")"
+if [ "$hang_el" -le 60 ]; then pass "stop_hang: finished within the bound (${hang_el}s <= 60s)"; else fail "stop_hang: took ${hang_el}s"; fi
 
 # 2. 巻き添え死: 対象の kill で他の監視プロセスも死ぬ → 判定不成立。--output は作られない。
 run_case collateral --output "${root}/c2-result.json"
@@ -304,6 +355,7 @@ run_case restart --check-restart
 expect_eq "restart: exit code" 0 "$RC"
 expect_eq "restart: restart_check" pass "$(json_get restart_check "$OUT")"
 expect_eq "restart: restart_confirmed" 4 "$(json_get restart_confirmed "$OUT")"
+expect_eq "restart: stop is not called under --check-restart (SUP-9)" 0 "$(grep -c '^stop ' "$(dirname "$OUT")/cli.log")"
 
 # 8. --check-restart: 再起動しないスタブ（現行 supervisor 相当）→ 失敗。
 run_case normal --check-restart --timeout 3

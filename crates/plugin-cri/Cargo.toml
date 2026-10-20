@@ -14,8 +14,11 @@ publish = false
 
 [dependencies]
 # workspace 内の path 依存（外部クレートの追加ではない。PLUG-1: 境界機構 plugin crate を使う側）。
-# `fandhe-container-cri` への辺は adapter を移す TASK-114.2（#458）で足す。
+# TASK-114.2（#458）: adapter 用に cri・core への path 依存を足した（外部クレートの追加ではない。依存は plugin-cri → cri → core の一方向。CRI-7）。
 fandhe-container-plugin = { workspace = true }
+fandhe-container-cri = { path = "../cri" }
+# core は plugin feature を有効にしない（feature 統合で core の成果物が変わらないよう cri と揃える。PLUG-4）。
+fandhe-container-core = { path = "../core", default-features = false }
 
 [[bin]]
 name = "fandhe-container-plugin-cri"

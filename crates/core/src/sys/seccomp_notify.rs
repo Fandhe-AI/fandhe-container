@@ -214,8 +214,10 @@ pub(crate) fn set_passcred(fd: BorrowedFd<'_>) -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
-/// `fd` を `O_NONBLOCK` にする（`fcntl(F_GETFL)` + `F_SETFL`）。listener の `RECV` が poll の後の通知の取り消しで
-/// 無期限にブロックしないようにする（REPAIR-5）。open file description の状態なので複製した fd にも効く。
+/// `fd` を `O_NONBLOCK` にする（`fcntl(F_GETFL)` + `F_SETFL`）。`SECCOMP_IOCTL_NOTIF_RECV` は `O_NONBLOCK` を見ないため
+/// これでは RECV のブロックは防げない（RECV のブロック防止は listener の単独の読み手と、受信直前の `poll(0)` の
+/// 再確認で行う。REPAIR-5）。ここでの `O_NONBLOCK` は、他の読み出し系（`read` 等）が将来使われたときの保険。
+/// open file description の状態なので複製した fd にも効く。
 pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
@@ -798,5 +800,11 @@ mod tests {
         assert_eq!(SECCOMP_IOCTL_NOTIF_SEND, 0xC018_2101);
         assert_eq!(SECCOMP_IOCTL_NOTIF_ID_VALID, 0x4008_2102);
         assert_eq!((POLLERR, POLLHUP), (0x08, 0x10));
+    }
+
+    /// `fcntl` の固定値は x86_64・aarch64 とも asm-generic の値（`F_GETFL`=3・`F_SETFL`=4）と一致する。
+    #[test]
+    fn sec4_2025_fcntl_flag_constants_match_uapi() {
+        assert_eq!((consts::F_GETFL, consts::F_SETFL), (3, 4));
     }
 }

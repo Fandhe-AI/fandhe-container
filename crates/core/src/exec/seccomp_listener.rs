@@ -450,12 +450,29 @@ pub(crate) fn receive_listener(
     }
     let fd = validate(received, expected_pid)
         .map_err(|why| ExecError::new(ErrorCode::Internal, STAGE, why))?;
-    sys::send_nonblocking_unix(sock, &[ACK])
-        .map_err(|e| ExecError::from_sys(e, STAGE, "send of the listener ACK"))?;
-    // `RECV` が poll の後の通知の取り消しで無期限にブロックしないようにする（REPAIR-5）。
-    sys::seccomp_notify::set_nonblocking(fd.as_fd())
-        .map_err(|e| ExecError::from_sys(e, STAGE, "set the seccomp listener non-blocking"))?;
+    // 設定の失敗で ACK を返さない(子が exec へ進んだまま listener だけ捨てられるのを防ぐ。fail-closed)。
+    ack_after_nonblocking(
+        || {
+            sys::seccomp_notify::set_nonblocking(fd.as_fd())
+                .map_err(|e| ExecError::from_sys(e, STAGE, "set the seccomp listener non-blocking"))
+        },
+        || {
+            sys::send_nonblocking_unix(sock, &[ACK])
+                .map(|_| ())
+                .map_err(|e| ExecError::from_sys(e, STAGE, "send of the listener ACK"))
+        },
+    )?;
     Ok(SeccompListener(fd, AtomicBool::new(false)))
+}
+
+/// listener の後処理(`set_nonblocking`)を先に行い、成功したときだけ ACK を送る。順序を試験で固定するため分離している。
+fn ack_after_nonblocking<S, A>(set_nonblocking: S, ack: A) -> Result<(), ExecError>
+where
+    S: FnOnce() -> Result<(), ExecError>,
+    A: FnOnce() -> Result<(), ExecError>,
+{
+    set_nonblocking()?;
+    ack()
 }
 
 /// 新しい socketpair（C の端、子の端）。C の端には `SO_PASSCRED` を設定済み（送信の前に必要）。
@@ -607,6 +624,43 @@ pub fn user_notif_probe_for_test() -> Result<UserNotifProbe, String> {
 mod tests {
     use super::*;
     use sys::seccomp_notify::{ReceivedFd, Ucred};
+
+    /// SEC-4・REPAIR-5: 非ブロック化が先で ACK が後。非ブロック化が失敗したら ACK を送らず、そのエラーを返す。
+    #[test]
+    fn sec4_2025_ack_is_sent_only_after_nonblocking_succeeds() {
+        use std::cell::RefCell;
+        let order = RefCell::new(Vec::new());
+        ack_after_nonblocking(
+            || {
+                order.borrow_mut().push("nonblock");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("ack");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(order.into_inner(), ["nonblock", "ack"]);
+
+        let acked = RefCell::new(false);
+        let err = ack_after_nonblocking(
+            || {
+                Err(ExecError::new(
+                    ErrorCode::Internal,
+                    IsolationStage::Seccomp,
+                    "nonblock failed",
+                ))
+            },
+            || {
+                *acked.borrow_mut() = true;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert!(!acked.into_inner());
+    }
 
     fn me() -> u32 {
         std::process::id()

@@ -14,7 +14,9 @@
 //!   （`oci_runtime::create` / `delete` と状態ストアの読み取り）へ委ねる
 //! - `StateStore`: 既定実装 `FileStateStore` は core にある。本モジュールは二つ目の実装を作らず、
 //!   選んで開き注入するだけ（別実装への差し替えは [`CriPluginBackends::new`] の注入口）
-//! - `NetworkPlugin`: [`UnimplementedNetwork`]（netsetup への対応付けは TASK-114.4・#460）
+//! - `NetworkPlugin`: Linux では [`crate::netsetup::NetsetupNetwork`]（netsetup の操作単位へ対応づけ、`fandhe-container-net` の
+//!   TASK-139 統合 API を呼ぶ。TASK-114.4・#460・MS-4）。他 OS は `production()` 自体が `Unimplemented` で、
+//!   注入口では [`UnimplementedNetwork`] を差せる
 //! - `VolumeProvider`: 実装は core 側に置く（データパスに接するため。ここには置かない）
 //!
 //! # 未実装・簡易実装（REPAIR-3）
@@ -31,6 +33,8 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+use crate::netsetup::{LinuxNetsetup, NetsetupNetwork};
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{
     self, CgroupRemoval, ContainerCgroupRemover, OciRuntimeError,
@@ -104,24 +108,32 @@ impl CriPluginBackends {
         }
     }
 
-    /// 既定の組み合わせを作る（`FileStateStore`・[`CoreLifecycleRuntime`]・[`UnimplementedNetwork`]）。
+    /// 既定の組み合わせを作る（`FileStateStore`・[`CoreLifecycleRuntime`]・`NetworkPlugin` は Linux で
+    /// [`crate::netsetup::NetsetupNetwork`]、他 OS では状態ルートの解決が `Unimplemented` で失敗する）。
     ///
     /// 状態ルートは既定の解決（`StateRoot::resolve(None)`）に固定する。解決できない OS では
     /// `Unimplemented` をそのまま返す（fail-closed）。
     pub fn production() -> Result<Self, TraitError> {
         let root = StateRoot::resolve(None)?;
-        let state: Arc<dyn StateStore> = Arc::new(FileStateStore::open(root)?);
         let recorder = Arc::new(OpRecorder::new());
+        // netns の pin の置き場は状態ルート配下の固定の場所（要求の入力からは受けない。TASK-114.4）。
+        // 先頭が `.` のため、英数字始まりの `ContainerId` の状態ディレクトリと衝突しない。
+        #[cfg(target_os = "linux")]
+        let network: Arc<dyn NetworkPlugin> = Arc::new(NetsetupNetwork::with_recorder(
+            LinuxNetsetup::with_recorder(
+                root.path().join(".netns"),
+                Arc::new(CoreNetRecorder(Arc::clone(&recorder))),
+            ),
+            Arc::clone(&recorder),
+        ));
+        #[cfg(not(target_os = "linux"))]
+        let network: Arc<dyn NetworkPlugin> = Arc::new(UnimplementedNetwork);
+        let state: Arc<dyn StateStore> = Arc::new(FileStateStore::open(root)?);
         let runtime = Arc::new(CoreLifecycleRuntime::with_recorder(
             Arc::clone(&state),
             Arc::clone(&recorder),
         ));
-        Ok(Self::with_recorder(
-            runtime,
-            state,
-            Arc::new(UnimplementedNetwork),
-            recorder,
-        ))
+        Ok(Self::with_recorder(runtime, state, network, recorder))
     }
 
     /// `ContainerRuntime` の実装。
@@ -134,7 +146,7 @@ impl CriPluginBackends {
         &self.state
     }
 
-    /// `NetworkPlugin` の実装（SetUpPod 系への配線は TASK-114.4・#460。現状は呼び出し元が無い）。
+    /// `NetworkPlugin` の実装（CRI の RPC からの呼び出しは #459 以降。写像は [`crate::pod_network`]。現状は呼び出し元が無い）。
     pub fn network(&self) -> &Arc<dyn NetworkPlugin> {
         &self.network
     }
@@ -174,6 +186,25 @@ impl CriOpRecorder for CoreCriRecorder {
         };
         let outcome = match sample.outcome() {
             CriOpOutcome::Success => OpOutcome::Success,
+            _ => OpOutcome::Failure,
+        };
+        let _ = self.0.record(&name, outcome, sample.latency());
+    }
+}
+
+/// net の計測結果を core の `OpRecorder` へ流す橋渡し（操作名は `NetOpKind::as_str`。REPAIR-4）。
+#[cfg(target_os = "linux")]
+struct CoreNetRecorder(Arc<OpRecorder>);
+
+#[cfg(target_os = "linux")]
+impl fandhe_container_net::instrument::NetOpRecorder for CoreNetRecorder {
+    fn record_net_op(&self, sample: &fandhe_container_net::instrument::NetOpSample) {
+        use fandhe_container_net::instrument::NetOpOutcome;
+        let Ok(name) = OpName::new(sample.kind().as_str()) else {
+            return;
+        };
+        let outcome = match sample.outcome() {
+            NetOpOutcome::Success => OpOutcome::Success,
             _ => OpOutcome::Failure,
         };
         let _ = self.0.record(&name, outcome, sample.latency());

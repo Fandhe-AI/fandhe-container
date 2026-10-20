@@ -9,6 +9,8 @@
 //! PLUG-1 区分は plugin（crate-naming.md）。
 
 pub mod adapter;
+pub mod netsetup;
+pub mod pod_network;
 #[cfg(unix)]
 pub mod server;
 pub mod startup;

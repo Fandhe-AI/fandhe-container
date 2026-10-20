@@ -413,6 +413,7 @@ version = "0.0.0"
 dependencies = [
  "fandhe-container-core",
  "fandhe-container-cri",
+ "fandhe-container-net",
  "fandhe-container-plugin",
  "tokio",
  "tonic",

@@ -304,9 +304,19 @@ impl KernelAuditProbe {
             return Some(hex.chars().all(|c| c == '0'));
         }
         match unsigned.chars().next() {
-            None => Some(value.is_empty()),
+            // 符号だけ(`audit=+`・`audit=-`)は数値として不正。値が空(`audit=`)だけは従来どおり無効扱い。
+            None => {
+                if value.is_empty() {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
             Some(c) if c.is_ascii_digit() => {
-                if unsigned.chars().all(|c| c.is_ascii_digit()) {
+                // 先頭 `0` の複数桁は 8 進。8 進に使えない桁(`08`・`09`)は解釈を保証できないため `None`。
+                let octal_ok = !(unsigned.starts_with('0') && unsigned.len() > 1)
+                    || unsigned.chars().all(|c| ('0'..='7').contains(&c));
+                if octal_ok && unsigned.chars().all(|c| c.is_ascii_digit()) {
                     Some(unsigned.chars().all(|c| c == '0'))
                 } else {
                     None
@@ -586,6 +596,11 @@ mod tests {
         assert_eq!(opt("audit=0x0z"), None);
         assert_eq!(opt("audit=0abc"), None);
         assert_eq!(opt("audit=1,2"), None);
+        assert_eq!(opt("audit=08"), None);
+        assert_eq!(opt("audit=09"), None);
+        assert_eq!(opt("audit=07"), Some(false));
+        assert_eq!(opt("audit=+"), None);
+        assert_eq!(opt("audit=-"), None);
         assert!(!dis("noaudit=0 xaudit=0"));
     }
 

@@ -877,6 +877,8 @@ impl Inner {
         timeout: Duration,
     ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
         let id = spec.container_id();
+        // 縮退記録の同期配送などで消費した時間を spawn の期限から差し引くための起点(REPAIR-5・SEC-4)。
+        let started = Instant::now();
         self.admit(id)?;
         if !self.ops.is_single_threaded() {
             return Err(TraitError::new(
@@ -940,6 +942,14 @@ impl Inner {
             sink: self.audit_sink.as_ref(),
             container: Some(id),
         };
+        // 配送などで消費した分を引いた残りを spawn に渡す。尽きていれば子を作らず拒否する(fail-closed)。
+        let timeout = timeout.saturating_sub(started.elapsed());
+        if timeout.is_zero() {
+            return Err(TraitError::new(
+                ErrorCode::Timeout,
+                "container launch did not complete within the timeout",
+            ));
+        }
         let spawned = self
             .ops
             .spawn(SpawnInput {

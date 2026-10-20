@@ -2548,6 +2548,11 @@ mod linux {
             Err(e) => return fail(&mut out, op_err(e)),
         };
         let req = StartRequest::new(args.id.clone());
+        // 記録先の probe（保存先の open を待つ同期処理）を含め、起動全体で同じ期限を共有する。
+        // probe より前に作り、probe の待機を期限へ含める（CLI の固定受信期限を超えない。REPAIR-5）。
+        let deadline =
+            Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
+        out.limit_until(deadline);
         // 制御チャネルの認証境界の拒否の記録先（SEC-4）。制御チャネルのサーバスレッドは監視スレッドと並行して動くため、
         // 複数スレッドでは `FileAuditSink` の隔離（fork）が使えない。そこで監査専用の helper プロセスを fork し、以後の
         // 記録はそこへ渡して期限付きで永続化する（`ControlAuditRelay`）。`spawn` は単一スレッドのときだけ成功するので、
@@ -2584,10 +2589,6 @@ mod linux {
                 .with_audit_policy(args.audit_policy)
                 .with_seccomp_hub(hub),
         );
-        // 回復・回収と報告の書き込みで同じ期限を共有し、報告を内部上限内に収める（REPAIR-5）。
-        let deadline =
-            Instant::now().checked_add(crate::start_contract::result_deadline(&timeouts));
-        out.limit_until(deadline);
         // 2b: supervisor の構造化ログの保存先を開き、stderr の出口の書き先を差し替える（#2067・REPAIR-4）。
         // 期限つきの作業スレッドで行い、終了を確認してから先へ進む。開けなければ fail-closed で、手順 3 より前に止まる。
         if let Err(e) = prepare_supervisor_log(&store, &args.root, &args.id, deadline) {

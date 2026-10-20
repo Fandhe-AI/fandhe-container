@@ -6,10 +6,13 @@
 //! （#496・TASK-161.3）が読む。
 //!
 //! # 実装範囲の線引き（REPAIR-3）
-//! - 提供するもの: 時間文字列の解釈 [`parse_duration`]・定義の検証 [`HealthcheckDefinition::parse`]。
-//! - **未実装**: コマンド実行・周期実行（#495）、`health` 遷移と書き込み（#496）、TOML / compose からの
-//!   デシリアライズ（`crates/stack`・`crates/compose-convert`。STACK-1・STACK-3）。実行時の分離
-//!   （seccomp / Landlock 再適用の fail-closed）は TASK-163（SUP-6）の責務で、本モジュールは純粋な値検証のみを行う。
+//! - 提供するもの: 時間文字列の解釈 [`parse_duration`]・定義の検証 [`HealthcheckDefinition::parse`]・
+//!   周期実行エンジン [`run_periodic`]（TASK-161.2・#495。意味論と未実装の範囲は `periodic` サブモジュールの doc）。
+//! - **未実装**: exec を呼ぶ判定の実装と `monitor` ループへの組み込み（#495 の残り・#492）、retries / start_period の
+//!   集約と `health` 遷移（#496）、TOML / compose からのデシリアライズ（`crates/stack`・`crates/compose-convert`。
+//!   STACK-1・STACK-3）。実行時の分離（seccomp / Landlock 再適用の fail-closed）は TASK-163（SUP-6）の責務。
+//! - 既知の食い違い: 定義の timeout 上限（[`MAX_TIMEOUT`] 1 時間）は `probe_and_record` の上限（60 秒）より大きく、
+//!   [`HealthcheckSchedule::from_definition`] が 60 秒超を拒否する。解消は別 issue。
 //!
 //! # 設計判断（spec の SUP-4 は既定値・上限値を定めていないため、本実装の判断であり spec 確定値ではない）
 //! - コマンドは argv のみ。シェル文字列と compose の予約語（`CMD-SHELL` / `CMD` / `NONE`）は拒否する
@@ -19,10 +22,19 @@
 //! - 時間文字列は 10 進整数 + 単位（`ms`・`s`・`m`・`h`）の連結のみ。小数・`us` / `ns` は未対応。
 //! - エラーメッセージには不正だった項目名と理由のみを入れ、command の中身は出さない（秘密情報の漏えい防止）。
 
+mod periodic;
+
 use std::num::NonZeroU32;
 use std::time::Duration;
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};
+
+#[cfg(target_os = "linux")]
+pub use periodic::health_from_exec_exit;
+pub use periodic::{
+    HealthcheckClock, HealthcheckLoopOutcome, HealthcheckSchedule, HealthcheckTick, SystemClock,
+    run_periodic,
+};
 
 /// argv の最大要素数。
 pub const MAX_COMMAND_ARGS: usize = 256;

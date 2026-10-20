@@ -25,46 +25,54 @@ enum V {
     Null,
     Num(i64),
     Str(String),
+    /// 入れ子のオブジェクト（`auditCoverage` 用。出現順を保つ。SEC-4・#2027）。
+    Obj(Vec<(String, V)>),
 }
 
 /// 出現順を保ったまま `{"k":v,...}` 形式（値は文字列・整数・null のみ）を RFC 8259 の文法どおり厳密にパースする。
 ///
-/// 空白・入れ子・小数は `inspect` の出力契約に無いため受け付けない。不正な入力は理由つきの `Err` にし、
+/// 空白・小数は `inspect` の出力契約に無いため受け付けない。入れ子のオブジェクトは `auditCoverage`（#2027）だけが使う。不正な入力は理由つきの `Err` にし、
 /// 添字の範囲外も panic させず `Err` にする（パーサ自体の厳密さを下の試験で具体値照合するため）。
 fn parse_flat_object_ordered(text: &str) -> Result<Vec<(String, V)>, String> {
     let b = text.as_bytes();
     let mut i = 0;
-    expect(b, &mut i, b'{')?;
+    let map = parse_object(b, &mut i)?;
+    if i != b.len() {
+        return Err(format!("trailing bytes at {i}"));
+    }
+    Ok(map)
+}
+
+fn parse_object(b: &[u8], i: &mut usize) -> Result<Vec<(String, V)>, String> {
+    expect(b, i, b'{')?;
     let mut map: Vec<(String, V)> = Vec::new();
     loop {
-        let key = parse_str(b, &mut i)?;
-        expect(b, &mut i, b':')?;
-        let v = match peek(b, i)? {
-            b'"' => V::Str(parse_str(b, &mut i)?),
+        let key = parse_str(b, i)?;
+        expect(b, i, b':')?;
+        let v = match peek(b, *i)? {
+            b'"' => V::Str(parse_str(b, i)?),
+            b'{' => V::Obj(parse_object(b, i)?),
             b'n' => {
-                if b.get(i..i + 4) != Some(b"null".as_slice()) {
-                    return Err(format!("invalid literal at {i}"));
+                if b.get(*i..*i + 4) != Some(b"null".as_slice()) {
+                    return Err(format!("invalid literal at {}", *i));
                 }
-                i += 4;
+                *i += 4;
                 V::Null
             }
-            _ => V::Num(parse_int(b, &mut i)?),
+            _ => V::Num(parse_int(b, i)?),
         };
         map.push((key.clone(), v));
         if map.iter().filter(|(k, _)| *k == key).count() > 1 {
             return Err(format!("duplicate key {key}"));
         }
-        match peek(b, i)? {
-            b',' => i += 1,
+        match peek(b, *i)? {
+            b',' => *i += 1,
             b'}' => {
-                i += 1;
+                *i += 1;
                 break;
             }
-            c => return Err(format!("unexpected byte 0x{c:02x} at {i}")),
+            c => return Err(format!("unexpected byte 0x{c:02x} at {}", *i)),
         }
-    }
-    if i != b.len() {
-        return Err(format!("trailing bytes at {i}"));
     }
     Ok(map)
 }
@@ -171,7 +179,7 @@ fn s(v: &str) -> V {
     V::Str(v.to_string())
 }
 /// 契約上の出力キー順（`src/inspect.rs` の `to_json` と同じ。SUP-11）。
-const ORDERED_KEYS: [&str; 11] = [
+const ORDERED_KEYS: [&str; 12] = [
     "id",
     "status",
     "pid",
@@ -183,6 +191,7 @@ const ORDERED_KEYS: [&str; 11] = [
     "supervisorPid",
     "health",
     "restartCount",
+    "auditCoverage",
 ];
 
 /// 固定レコードを返すメモリ上のフェイク（`get` のみ。3 OS で `inspect` の経路を通すため）。
@@ -290,6 +299,10 @@ fn assert_schema(m: &BTreeMap<String, V>) {
         ),
         other => panic!("health: expected string or null, got {other:?}"),
     }
+    match m.get("auditCoverage") {
+        Some(V::Null | V::Obj(_)) => {}
+        other => panic!("auditCoverage: expected object or null, got {other:?}"),
+    }
     assert_eq!(
         matches!(m.get("cgroupScope"), Some(V::Null)),
         matches!(m.get("cgroupInstance"), Some(V::Null)),
@@ -324,6 +337,69 @@ fn sup11_task168_2_key_order_is_fixed() {
         let v = render_ordered(&FakeStore(rec), id);
         assert_eq!(v.len(), ORDERED_KEYS.len());
     }
+}
+
+/// SEC-4・#2027: 監査の網羅は、記録があれば方針と 2 層の状態（モード・理由）を固定語彙の入れ子オブジェクトで、
+/// 無ければ `null` で出す。
+#[test]
+fn sec4_2027_audit_coverage_is_reported() {
+    use fandhe_container_core::audit_log::{
+        AuditCoverage, AuditCoveragePolicy, DegradeReason, KernelAuditLayerStatus,
+    };
+    use fandhe_container_core::launch_isolation::{
+        LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+    };
+    let iso = LaunchIsolationRecord::from_parts(
+        RootIdentity::new(44, 1234),
+        RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)]).unwrap(),
+    );
+    let none = record(ContainerStatus::created(cid("c"), None), 1);
+    assert_eq!(
+        render_map(&FakeStore(none.clone()), "c")["auditCoverage"],
+        V::Null
+    );
+    let legacy = none.clone().with_launch_isolation(iso.clone());
+    assert_eq!(
+        render_map(&FakeStore(legacy), "c")["auditCoverage"],
+        V::Null
+    );
+
+    let coverage = AuditCoverage::new(
+        KernelAuditLayerStatus::Requested,
+        KernelAuditLayerStatus::Degraded(DegradeReason::LandlockAuditAbiTooOld),
+    );
+    let rec =
+        none.with_launch_isolation(iso.with_audit_coverage(AuditCoveragePolicy::Strict, coverage));
+    let m = render_map(&FakeStore(rec), "c");
+    assert_schema(&m);
+    let obj = |fields: Vec<(&str, V)>| {
+        V::Obj(
+            fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
+        )
+    };
+    assert_eq!(
+        m["auditCoverage"],
+        obj(vec![
+            ("policy", s("strict")),
+            (
+                "seccompKill",
+                obj(vec![
+                    ("mode", s("kernel_audit_requested")),
+                    ("reason", V::Null)
+                ])
+            ),
+            (
+                "landlock",
+                obj(vec![
+                    ("mode", s("degraded")),
+                    ("reason", s("landlock_audit_abi_too_old"))
+                ])
+            ),
+        ])
+    );
 }
 
 /// 状態 x health x cgroup の組み合わせすべてで型・値域が守られ、値が入力と一致する（G2・G3）。
@@ -547,7 +623,8 @@ mod linux {
         }
     }
     /// キー集合（アルファベット順。`BTreeMap` のキー列との照合用）。
-    const KEYS: [&str; 11] = [
+    const KEYS: [&str; 12] = [
+        "auditCoverage",
         "bundle",
         "cgroupInstance",
         "cgroupScope",

@@ -59,6 +59,7 @@
 
 #[cfg(target_os = "linux")]
 mod control_relay;
+mod coverage;
 mod file_sink;
 mod file_writer;
 mod kernel_audit;
@@ -66,6 +67,10 @@ mod landlock;
 
 #[cfg(target_os = "linux")]
 pub use control_relay::ControlAuditRelay;
+pub use coverage::{
+    AUDIT_COVERAGE_STRICT_REFUSAL, AuditCoverage, AuditCoveragePolicy, CoverageLayer,
+    DegradeReason, KernelAuditLayerStatus, KernelAuditProbe, assess,
+};
 pub use file_sink::{AUDIT_LOG_FILE_NAME, FileAuditSink, RECORD_WAIT_LIMIT};
 pub use file_writer::{
     AUDIT_LINE_MAX_BYTES, AuditFallback, AuditFileWriter, AuditWriteError, AuditWriteErrorKind,
@@ -402,6 +407,8 @@ pub enum AuditLayer {
     ///
     /// seccomp 由来とは断定しない（コンテナ内の `kill(SIGSYS)` と区別できない）ため、層は `Seccomp` と別にする。
     ExitSignal,
+    /// 監査の記録を 100% 満たせない環境で起動を続けた縮退の記録（SEC-4・#2027）。
+    AuditCoverage,
 }
 
 impl AuditLayer {
@@ -416,6 +423,7 @@ impl AuditLayer {
             AuditLayer::Entrypoint => "entrypoint",
             AuditLayer::ControlChannel => "control_channel",
             AuditLayer::ExitSignal => "exit_signal",
+            AuditLayer::AuditCoverage => "audit_coverage",
         }
     }
 }
@@ -508,6 +516,17 @@ pub enum AuditEvent {
         /// `pid=` と一致する。記録した側の PID は [`AuditRecord::pid`]。
         target_pid: AuditPid,
     },
+    /// カーネル監査頼みの層が縮退したまま起動を続けた記録（SEC-4・TASK-41 追補・#2027。監査配送 6/6）。
+    ///
+    /// 固定語彙の理由トークンだけを持ち、パス・ホスト由来の文字列は持たない（型で保証する。REPAIR-2）。
+    /// 縮退していない層は `None`。構築は [`AuditCoverage::degraded_event`]（両方 `None` の値を作らない）。
+    /// #2018 の承認事項 3（方式の実装に必要な範囲の `AuditEvent` の変更）による追加。
+    AuditCoverageDegraded {
+        /// `KILL_PROCESS` の `AUDIT_SECCOMP` が縮退している場合の理由。
+        seccomp_kill: Option<AuditReason>,
+        /// Landlock の `AUDIT_LANDLOCK_*` が縮退している場合の理由。
+        landlock: Option<AuditReason>,
+    },
 }
 
 /// 制御チャネルが接続元を拒否した理由（SEC-4・SEC-1・SUP-1・#2058）。固定語彙で、入力値を載せない。
@@ -549,6 +568,7 @@ impl AuditEvent {
             AuditEvent::Entrypoint { .. } => AuditLayer::Entrypoint,
             AuditEvent::ControlPeer { .. } => AuditLayer::ControlChannel,
             AuditEvent::ExitSignal { .. } => AuditLayer::ExitSignal,
+            AuditEvent::AuditCoverageDegraded { .. } => AuditLayer::AuditCoverage,
         }
     }
 }
@@ -639,7 +659,8 @@ impl AuditRecord {
             | AuditEvent::ExecTarget { .. }
             | AuditEvent::Entrypoint { .. }
             | AuditEvent::ControlPeer { .. }
-            | AuditEvent::ExitSignal { .. } => None,
+            | AuditEvent::ExitSignal { .. }
+            | AuditEvent::AuditCoverageDegraded { .. } => None,
         }
     }
 
@@ -674,10 +695,22 @@ impl AuditRecord {
             | AuditEvent::ExecTarget { .. }
             | AuditEvent::Entrypoint { .. }
             | AuditEvent::ControlPeer { .. }
-            | AuditEvent::ExitSignal { .. } => None,
+            | AuditEvent::ExitSignal { .. }
+            | AuditEvent::AuditCoverageDegraded { .. } => None,
             AuditEvent::Landlock { path, .. } => Some(path.as_path()),
             AuditEvent::Mount { path, .. } => path.as_ref().map(AuditPath::as_path),
             AuditEvent::PluginTrust { path, .. } => Some(path.as_path()),
+        }
+    }
+
+    /// 縮退の理由トークン（[`AuditEvent::AuditCoverageDegraded`] のみ。`(seccomp_kill, landlock)`）。
+    pub fn coverage_reasons(&self) -> Option<(Option<AuditReason>, Option<AuditReason>)> {
+        match &self.event {
+            AuditEvent::AuditCoverageDegraded {
+                seccomp_kill,
+                landlock,
+            } => Some((*seccomp_kill, *landlock)),
+            _ => None,
         }
     }
 

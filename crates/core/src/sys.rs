@@ -5104,6 +5104,14 @@ pub(crate) fn nofollow_nonblock_open_flags() -> Option<i32> {
     consts::SUPPORTED.then_some(consts::O_NOFOLLOW | consts::O_NONBLOCK)
 }
 
+/// `O_TMPFILE`（`__O_TMPFILE | O_DIRECTORY`。アーキテクチャ別の `O_DIRECTORY` を使う）。名前を持たない一時ファイルを
+/// ディレクトリの FS に作るために、`OpenOptions::custom_flags` へ渡す（監査ログの書き込み確認。SEC-4・#2027）。
+/// `__O_TMPFILE` は include/uapi/asm-generic/fcntl.h の `020000000`（x86_64・arm64 とも上書きしない）。
+/// 対応外アーキテクチャでは `None`（fail-closed）。定数を返すだけで syscall を呼ばない。
+pub(crate) fn tmpfile_open_flag() -> Option<i32> {
+    consts::SUPPORTED.then_some(consts::O_DIRECTORY | 0o20_000_000)
+}
+
 /// `O_NONBLOCK` 単体（アーキテクチャ別の値）。`/proc/self/fd` 経由の開き直しで FIFO 等に止まらないために使う。
 ///
 /// `crate::open_flags` が呼ぶ。対応外アーキテクチャでは `None`（fail-closed）。`unsafe` を含まない。

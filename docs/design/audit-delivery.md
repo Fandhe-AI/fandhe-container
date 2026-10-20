@@ -42,8 +42,8 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 | 拒否時の動作（#1834） | `unshare`・`ptrace`・`kexec_load` の 3 件は `SECCOMP_RET_KILL_PROCESS`、残り 40 件は `ERRNO(EPERM)`（`mount`・`pivot_root`・`umount2` を含む。ESC-03 が EPERM を要求） | `crates/core/src/seccomp.rs`（`DenyAction`・`DeniedSyscall::deny_action`） |
 | USER_NOTIF 版のフィルタ構築（#2023） | `ErrnoDelivery::UserNotif` で ERRNO 側 40 件を `SECCOMP_RET_USER_NOTIF` にしたフィルタを構築できる（`build_deny_filter_with`）。KILL の 3 件・arch 不一致・x32 は不変。**本番の適用経路は ERRNO 版のまま**（listener が開いたまま誰も応答しないと `USER_NOTIF` 側の syscall が止まり、閉じると `ENOSYS` になり ESC-03 と食い違うため。応答側は #2025） | `crates/core/src/seccomp.rs`・`crates/core/src/exec/seccomp.rs`（テスト） |
 | listener の取得と受け渡し（#2024） | 本番の起動（PID 1）は `NEW_LISTENER` 付きで ERRNO 版の filter を載せ、listener fd を socketpair（`SOCK_SEQPACKET`）の `SCM_RIGHTS` で起動側 C へ渡す。C は `SCM_CREDENTIALS` の pid・fd の種別（`anon_inode:seccomp notify`）・close-on-exec・fd がちょうど 1 本であることを検証してから ACK を返す。PID 1 は ACK を待ってから exec に進む。取得・送信・受信・検証・ACK のどれが失敗しても起動を失敗にし（fail-closed）、PID 1 を回収する。受け取った listener は `LaunchedProcess::take_seccomp_listener` で 1 回だけ取り出せる。**既定の launcher は ERRNO 版のまま（通知は生じない）。supervisor の start 経路だけが `ProductionLauncherBuilder::seccomp_errno_delivery(UserNotif)` で opt-in し、listener は #2025 のループ（下の行）が読んで応答する**。制約: ワークロード、または祖先の filter が既に listener を持つ環境（例: syscall の intercept を有効にした Incus のコンテナ）では `EBUSY` となり launch が `FailedPrecondition`（段 `Seccomp`）で失敗する。稼働中コンテナへの exec（SUP-6）の再適用 worker は受け渡し無しのまま（後続） | `crates/core/src/exec/seccomp_listener.rs`・`crates/core/src/sys/seccomp_notify.rs`・`crates/core/src/exec/launch_intermediate.rs` |
-| listener ループ（#2025） | supervisor の `SeccompNotifyHub`（listener スレッド 1 本と recorder スレッド 1 本）が、通知を読んで「`/proc` で PID を変換 → `ID_VALID` で cookie 検証 → `ControlAuditRelay` へ記録（期限 1 秒。超えても応答する）→ `-EPERM` で応答」を行う。応答は `-EPERM` の 1 種類だけで、引数・命令ポインタは core が公開しない（TOCTOU）。記録の段にだけトークンバケット（20 件/秒・バースト 64）と有界キュー（64）を置き、超えた分は記録せず待たずに応答して集計し、固定語彙の構造化ログ（`seccomp_audit_suppressed` 等）を 1 秒以上の間隔で出す。start と restart の再 launch で listener を差し替える（再 launch が本番で成り立つかは #2043）。listener が届かない・スレッドを作れないときは起動を失敗にする。応答者が消えると拒否は `ENOSYS` のまま保たれる。**exec 経路（SUP-6）は未対応（#2385）、記録経路が使えないときの起動拒否は #2027** | `crates/supervisor/src/seccomp_notify.rs`・`crates/core/src/exec/seccomp_listener.rs`・`crates/core/src/audit_log/control_relay.rs`（seccomp の枠） |
-| Landlock の記録 | プロセス内で観測した `EACCES` の写像まで（ワークロードの拒否の証拠にしない）。ABI 7 以上では `landlock_restrict_self` に `LOG_NEW_EXEC_ON` を渡してカーネル監査へ要求し、ABI 6 では縮退を `state.json` の `launchIsolation.landlock.audit` と構造化ログに出す（#2026。読み手は外部の auditd 等。ホストの audit 可否の判定と厳格モードは #2027） | `crates/core/src/audit_log/landlock.rs`（`landlock_denial_record`） |
+| listener ループ（#2025） | supervisor の `SeccompNotifyHub`（listener スレッド 1 本と recorder スレッド 1 本）が、通知を読んで「`/proc` で PID を変換 → `ID_VALID` で cookie 検証 → `ControlAuditRelay` へ記録（期限 1 秒。超えても応答する）→ `-EPERM` で応答」を行う。応答は `-EPERM` の 1 種類だけで、引数・命令ポインタは core が公開しない（TOCTOU）。記録の段にだけトークンバケット（20 件/秒・バースト 64）と有界キュー（64）を置き、超えた分は記録せず待たずに応答して集計し、固定語彙の構造化ログ（`seccomp_audit_suppressed` 等）を 1 秒以上の間隔で出す。start と restart の再 launch で listener を差し替える（再 launch が本番で成り立つかは #2043）。listener が届かない・スレッドを作れないときは起動を失敗にする。応答者が消えると拒否は `ENOSYS` のまま保たれる。**exec 経路（SUP-6）は未対応（#2385）。記録先（`ControlAuditRelay`）を作れないとき、または応答者（ハブ）の無い構成は起動を拒否する（`FailedPrecondition`。#2027、7.1）** | `crates/supervisor/src/seccomp_notify.rs`・`crates/core/src/exec/seccomp_listener.rs`・`crates/core/src/audit_log/control_relay.rs`（seccomp の枠） |
+| Landlock の記録 | プロセス内で観測した `EACCES` の写像まで（ワークロードの拒否の証拠にしない）。ABI 7 以上では `landlock_restrict_self` に `LOG_NEW_EXEC_ON` を渡してカーネル監査へ要求し、ABI 6 では縮退を `state.json` の `launchIsolation.landlock.audit` と構造化ログに出す（#2026。読み手は外部の auditd 等）。ホストの縮退の判定・警告・厳格モードは #2027（7.1） | `crates/core/src/audit_log/landlock.rs`（`landlock_denial_record`） |
 | 本番 sink | `FileAuditSink`（ファイル主経路と NETLINK_AUDIT フォールバック。常時 tee は未実装）。supervisor の exec 経路は `default_audit_sink` で配線済み（#1594） | `crates/core/src/audit_log/file_sink.rs`・`crates/supervisor/src/exec.rs` |
 | コンテナ ID | `AuditRecord::container_id`（#1618）。seccomp は #2025 で付与（`record_seccomp_denial_for`）。Landlock の記録への付与は未実装 | `crates/core/src/audit_log.rs` |
 | 型の制約 | `AuditEvent::Seccomp` は syscall 番号と arch が必須で、「syscall の無い seccomp 違反」を構築できない | `crates/core/src/audit_log.rs` |
@@ -137,17 +137,29 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 | 3 | supervisor の listener ループ（期限・PID 変換・`record_seccomp_denial`・`EPERM` 応答） | supervisor | #2025（実装済み。start の経路で結線。exec 経路は #2385） |
 | 4 | `KILL_PROCESS` 側の記録（親の終了シグナルとカーネル監査の突き合わせ。レコード型の拡張の要否） | core・supervisor | #2004（実装済み。判断は 9.1） |
 | 5 | Landlock のカーネル監査対応（ABI 7 のログ制御フラグ）と縮退時の状態表示 | core | #2026 |
-| 6 | 縮退時の挙動（起動拒否／警告）の実装 | core・supervisor | #2027 |
+| 6 | 縮退時の挙動（起動拒否／警告）の実装 | core・supervisor | #2027（実装済み。7.1。CLI からの `--audit-policy` の受け渡しは後続） |
 | 7 | `escape_suite.rs` の整備 | core | #2028 |
+
+### 7.1 実装した挙動（#2027。SEC-4・TASK-41 追補。監査配送 6/6）
+
+| 層 | 使えないとき | 実装 |
+| -- | ------------ | ---- |
+| 確実な層（seccomp の ERRNO 側 40 件を USER_NOTIF で supervisor が記録） | **起動を拒否**（`FailedPrecondition`、文言は固定の `the seccomp audit record path is unavailable`） | supervisor の入口（`require_seccomp_audit_sink`）が、記録先 `ControlAuditRelay` を作れなければ手順 3 より前に止める。応答者（ハブ）の無い構成も手順 4 で拒否する。listener の取得・受け渡し失敗は #2024・#2025 の fail-closed のまま |
+| カーネル監査頼みの層（`KILL_PROCESS` の `AUDIT_SECCOMP` 3 件、Landlock の `AUDIT_LANDLOCK_*`） | **警告して続行**。縮退を 3 か所に出す | core の launcher が fork の前に `audit_log::assess` で評価する。(1) 構造化ログの 1 行（`core.audit` / `audit_coverage` / `degraded`）、(2) 監査記録（層 `audit_coverage`、縮退した層の理由トークン。1 launch につき最大 1 件）、(3) `state.json` の `launchIsolation.audit_coverage` と supervisor の inspect の `auditCoverage` |
+| 厳格モード | 縮退（調べられなかった場合を含む）を**拒否**（`FailedPrecondition`、固定文言） | opt-in。supervisor の argv `--audit-policy strict`（既定 `best-effort`）。手順 4（cgroup の追記より前）と launcher（fork の前）の 2 か所で判定する |
+
+縮退の判定に使う観測は、非特権で読める 3 点に限る。`/proc/sys/kernel/seccomp/actions_logged` に `kill_process` が無い（`seccomp_kill_not_logged`）、`/proc/cmdline` の `audit=0` 系（`kernel_audit_disabled_at_boot`）、`/proc/self/loginuid` が無い（`kernel_audit_not_built`。`CONFIG_AUDIT` なしのカーネル）、Landlock ABI 7 未満（`landlock_audit_abi_too_old`）。読めなかった観測は `unknown`（理由 `probe_failed`）とし、縮退と同じに扱う。procfs の読み取りは 4 KiB までに上限を設ける。出力は固定語彙だけで、`/proc/cmdline` などホスト由来の文字列は転記しない。
+
+**残余（REPAIR-3）**: `kernel_audit_requested` は「観測できる範囲に否定する証拠が無く、記録を要求した」だけを意味し、「記録された」ではない。ホストの `audit_enabled` の実行時の値（auditd が有効にしていないと `AUDIT_SECCOMP` は出ない見込み）と、外部の読み手がいるかは、`AUDIT_GET` に `CAP_AUDIT_CONTROL` 等が要り最小権限集合（`privilege-separation.md`）を変えるため判定に使っていない。上記 3 点の観測の条件（`actions_logged` の語彙、`loginuid` が `CONFIG_AUDIT` で作られること、`audit=0` の効き方）は、カーネルソースの原文での確認を済ませていない（本書 2 章の「未確認」のまま）。CLI の `start` / `run` から `--audit-policy` を渡す配線は未実装（`--restart` と同じく supervisor の契約までで、後続 issue）。起動した後に relay や recorder が失われた場合は、従来どおり `unrecorded` の集計と構造化ログで、停止はしない。
 
 **完了の条件**に含める: ESC-01・03・06・10 の `AuditExpectation::Deferred` を `Required` へ切り替える。ESC-07・08 が試験の側で作っている記録（`record_landlock_denial`、`audit_mount_config_error` の直接呼び出し）を、本番の配送経路が出した記録に置き換える。本番 sink の出力ファイルを親が回収して照合する形を含める。
 
 ### 9.1 案 4（#2004）の判断と結果
 
 - **正の記録はカーネルの `AUDIT_SECCOMP`**: 読むには `NETLINK_AUDIT` の `AUDIT_NLGRP_READLOG` の購読が要り、初期 user namespace の `CAP_AUDIT_READ` が必要。supervisor の承認済みの最小権限集合（`privilege-separation.md`）に含まれないため、プロセス内の読み手は作らず、auditd 等の外部の読み手に任せる（4 章 (c) と整合）。`CAP_AUDIT_READ` の付与は権限分離の設計変更でオーナー承認が要るため承認事項として残す
-- **`SECCOMP_FILTER_FLAG_LOG` は不要**: `seccomp(2)` の Audit logging 節のとおり、`KILL_PROCESS` は `actions_logged` に載っていれば記録される。現行の適用経路（`prctl(PR_SET_SECCOMP)`）はフラグを渡せず、フィルタは変えない。**カーネルソース（`kernel/seccomp.c` の `seccomp_log` 等）での記録が出なくなる条件・pid の名前空間・rootless での記録有無の一次資料確認は未実施**（man ページ以外は未確認。#2027 の縮退判定の前に確かめる）
+- **`SECCOMP_FILTER_FLAG_LOG` は不要**: `seccomp(2)` の Audit logging 節のとおり、`KILL_PROCESS` は `actions_logged` に載っていれば記録される。現行の適用経路（`prctl(PR_SET_SECCOMP)`）はフラグを渡せず、フィルタは変えない。**カーネルソース（`kernel/seccomp.c` の `seccomp_log` 等）での記録が出なくなる条件・pid の名前空間・rootless での記録有無の一次資料確認は未実施**（man ページ以外は未確認。#2027 の縮退判定は、確認できた観測だけを使い、できないものは 7.1 の残余とした）
 - **補助の `exit_signal` レコード**: 本番 launcher の回収点（`ContainerChildProcess` の `wait` / `terminate`）が SIGSYS の終了をちょうど 1 回、層 `exit_signal`（`AuditEvent::ExitSignal`。シグナルと回収側の PID namespace の対象 pid だけを持つ）で記録する。コンテナ内の `kill(SIGSYS)` と区別できないため seccomp 由来とは断定せず、syscall・arch は型として持たない（親の側で syscall を推測した記録は作れない）
-- **縮退**: カーネル監査を使えない環境では補助レコードだけが残る（syscall は残らない）。検出と表示は #2027 が担う
+- **縮退**: カーネル監査を使えない環境では補助レコードだけが残る（syscall は残らない）。検出と表示は #2027（7.1）
 - **制約（後続）**: supervisor は監視の時点で複数スレッドのため `FileAuditSink` の隔離（fork）が使えず、代替のカーネル監査送信（`CAP_AUDIT_WRITE` が要る）に回る。rootless では補助レコードが残らない場合がある。複数スレッドからの配送は `ControlAuditRelay` を `ExitSignal` も運べるよう広げる後続で直す。pid 1 以外の子孫と supervisor の exec コマンドの SIGSYS 終了は親から見えない
 - **実機試験**: `crates/core/tests/seccomp_kill_audit.rs`（`--ignored`。root と auditd が前提。`AGENTS.md` 参照）
 

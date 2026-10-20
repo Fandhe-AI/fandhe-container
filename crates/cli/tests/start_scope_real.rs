@@ -52,8 +52,8 @@ mod linux {
     use fandhe_container_core::cgroups::{CgroupName, DelegatedCgroup};
     use fandhe_container_core::traits::ContainerId;
 
-    /// 子プロセスを待つ上限（REPAIR-5。CLI の受信期限 36 秒より長く、無期限にはしない）。
-    const WAIT: Duration = Duration::from_secs(60);
+    /// 子プロセスを待つ上限（REPAIR-5。CLI の受信期限 58.9 秒より長く、無期限にはしない）。
+    const WAIT: Duration = Duration::from_secs(90);
     const POLL: Duration = Duration::from_millis(20);
 
     pub fn main() -> ExitCode {

@@ -17,7 +17,9 @@
 //!   （REPAIR-5。実装側の責務）
 //! - 記録内容のパスは生バイトのまま渡る。改行・制御文字のエスケープは書き込み側の責務（ログ注入対策）
 
-use crate::traits::TraitError;
+use std::time::Instant;
+
+use crate::traits::{ErrorCode, TraitError};
 
 use super::AuditRecord;
 
@@ -25,4 +27,19 @@ use super::AuditRecord;
 pub trait AuditSink: Send + Sync {
     /// レコードを 1 件記録する。失敗は構造化エラーで返す（panic しない）。
     fn record(&self, record: &AuditRecord) -> Result<(), TraitError>;
+
+    /// [`Self::record`] を、絶対期限 `deadline` を超えて待たない約束で行う(REPAIR-5・SEC-4)。
+    ///
+    /// 呼び出し元: 入口の単一期限から待ちを導く経路(`oci_runtime` の launch の縮退記録など)。既定実装は期限切れなら
+    /// 何もせず `Timeout` を返し、そうでなければ `record` に委ねる(待ちの上限は `record` 側の既定のまま)。
+    /// 待ちを期限へ絞れる実装(`FileAuditSink`・`ControlAuditRelay`)は上書きする。
+    fn record_until(&self, record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
+        if Instant::now() >= deadline {
+            return Err(TraitError::new(
+                ErrorCode::Timeout,
+                "the audit record was not delivered within the deadline",
+            ));
+        }
+        self.record(record)
+    }
 }

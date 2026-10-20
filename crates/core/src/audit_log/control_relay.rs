@@ -53,6 +53,8 @@ const REAP_WAIT: Duration = Duration::from_secs(1);
 
 /// seccomp の記録を示す先頭バイト（`REJECTIONS` の添字と重ならない値）。コンテナ ID の後に syscall 番号（u32）と arch（u32）が付く。
 const TAG_SECCOMP: u8 = 0x80;
+/// 記録先の確認要求を示す先頭バイト（本体は固定部だけ。何も書かず、helper の sink が保存先を開けるかだけを確かめる）。
+const TAG_PROBE: u8 = 0x81;
 /// seccomp の枠だけが持つ追加部（番号 4・arch 4）。
 const SECCOMP_EXTRA_LEN: usize = 8;
 
@@ -173,7 +175,11 @@ fn serve(mut stream: UnixStream, sink: &FileAuditSink) -> i32 {
         {
             return 1;
         }
-        let ok = decode(&frame).is_some_and(|r| sink.record(&r).is_ok());
+        let ok = if head.first() == Some(&TAG_PROBE) {
+            id_len == 0 && sink.probe_primary().is_ok()
+        } else {
+            decode(&frame).is_some_and(|r| sink.record(&r).is_ok())
+        };
         if stream
             .write_all(&[if ok { ACK_OK } else { ACK_FAIL }])
             .is_err()
@@ -291,26 +297,79 @@ fn kill_if_unreaped<E>(
     true
 }
 
-impl AuditSink for ControlAuditRelay {
-    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
-        let frame = encode(record)?;
-        let Ok(mut state) = self.state.lock() else {
-            return Err(err(ErrorCode::Internal, "the audit relay lock is poisoned"));
+impl ControlAuditRelay {
+    /// helper に記録先（`@audit.log`）を開けるかを期限つきで確かめさせる。記録は 1 件も書かない（SEC-4・REPAIR-5・#2027）。
+    ///
+    /// 呼び出し元: supervisor の `start`（記録経路を前提に起動してよいかの確認。失敗なら起動を拒否する）。応答が無ければ
+    /// [`AuditSink::record`] と同じく helper を SIGKILL して `Timeout`、開けなければ `Internal` を返す。
+    pub fn probe(&self) -> Result<(), TraitError> {
+        let mut frame = vec![0u8; FIXED_LEN];
+        if let Some(tag) = frame.first_mut() {
+            *tag = TAG_PROBE;
+        }
+        self.exchange(&frame)
+    }
+
+    /// 枠を helper へ送り、応答を [`RECORD_WAIT_LIMIT`] まで待つ。
+    fn exchange(&self, frame: &[u8]) -> Result<(), TraitError> {
+        self.exchange_until(frame, None)
+    }
+
+    /// [`Self::exchange`] を絶対期限 `deadline`(あれば)へ絞った版(REPAIR-5・SEC-4)。
+    ///
+    /// ロック取得も期限内で打ち切り(別の記録が helper の応答待ちで保持している間は `try_lock` を
+    /// 短い間隔で試す)、取得後に残り時間を再計算する。残りが無ければ送信せず `Timeout`。
+    /// 期限なしのときは従来どおり無期限にロックを待ち、応答待ちは [`RECORD_WAIT_LIMIT`] まで。
+    fn exchange_until(&self, frame: &[u8], deadline: Option<Instant>) -> Result<(), TraitError> {
+        let timed_out = || {
+            err(
+                ErrorCode::Timeout,
+                "the audit record was not delivered within the deadline",
+            )
         };
+        let mut state = match deadline {
+            None => match self.state.lock() {
+                Ok(g) => g,
+                Err(_) => return Err(err(ErrorCode::Internal, "the audit relay lock is poisoned")),
+            },
+            Some(d) => loop {
+                match self.state.try_lock() {
+                    Ok(g) => break g,
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(err(ErrorCode::Internal, "the audit relay lock is poisoned"));
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        let left = d.saturating_duration_since(Instant::now());
+                        if left.is_zero() {
+                            return Err(timed_out());
+                        }
+                        std::thread::sleep(left.min(Duration::from_millis(1)));
+                    }
+                }
+            },
+        };
+        let limit = match deadline {
+            None => RECORD_WAIT_LIMIT,
+            Some(d) => {
+                let left = d.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(timed_out());
+                }
+                left.min(RECORD_WAIT_LIMIT)
+            }
+        };
+        let limit = limit.max(Duration::from_millis(1));
         if state.broken {
             return Err(err(
                 ErrorCode::Unavailable,
                 "the audit relay is unavailable",
             ));
         }
-        let deadline = Instant::now() + RECORD_WAIT_LIMIT;
+        let answer_by = Instant::now() + limit;
         let mut ack = [0u8; 1];
-        let sent = state
-            .stream
-            .set_write_timeout(Some(RECORD_WAIT_LIMIT))
-            .is_ok()
-            && state.stream.write_all(&frame).is_ok();
-        let remaining = deadline
+        let sent = state.stream.set_write_timeout(Some(limit)).is_ok()
+            && state.stream.write_all(frame).is_ok();
+        let remaining = answer_by
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
         let answered = sent
@@ -336,6 +395,24 @@ impl AuditSink for ControlAuditRelay {
     }
 }
 
+impl AuditSink for ControlAuditRelay {
+    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+        let frame = encode(record)?;
+        self.exchange(&frame)
+    }
+
+    fn record_until(&self, record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
+        if Instant::now() >= deadline {
+            return Err(err(
+                ErrorCode::Timeout,
+                "the audit record was not delivered within the deadline",
+            ));
+        }
+        let frame = encode(record)?;
+        self.exchange_until(&frame, Some(deadline))
+    }
+}
+
 impl Drop for ControlAuditRelay {
     fn drop(&mut self) {
         self.kill_helper();
@@ -352,6 +429,51 @@ impl Drop for ControlAuditRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REPAIR-5・SEC-4: 別の記録がロックを保持している間に短い絶対期限で呼んでも、期限 + 許容差以内に
+    /// `Timeout` で戻り、helper へは何も送らない(取得後の再計算と、ロック取得自体の期限打ち切り)。
+    #[test]
+    fn repair5_sec4_record_until_gives_up_lock_wait_at_deadline() {
+        let (parent, mut peer) = UnixStream::pair().unwrap();
+        // 非実在の pid(自分の子ではないため Drop の kill は確認で止まる)。
+        let relay = std::sync::Arc::new(ControlAuditRelay {
+            state: Mutex::new(State {
+                stream: parent,
+                broken: false,
+            }),
+            pid: 0x3fff_fff0,
+            pidfd: None,
+        });
+        let holder = std::sync::Arc::clone(&relay);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            let _g = holder.state.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+        let record = sample(ControlPeerRejection::PeerUidMismatch, None);
+        let budget = Duration::from_millis(100);
+        let start = Instant::now();
+        let e = relay.record_until(&record, start + budget).unwrap_err();
+        let took = start.elapsed();
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert!(took >= budget, "{took:?}");
+        assert!(took < budget + Duration::from_millis(300), "{took:?}");
+        release_tx.send(()).unwrap();
+        t.join().unwrap();
+        // 何も送っていない(読み出しは即座に WouldBlock/EOF 相当)。
+        peer.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 1];
+        assert!(peer.read(&mut buf).is_err());
+        // 期限切れなら、ロックが空いていても送信しない。
+        let e = relay
+            .record_until(&record, Instant::now() - Duration::from_millis(1))
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert!(peer.read(&mut buf).is_err());
+    }
 
     /// SUP-1・SEC-4・CORE-1: 確認できない場合は送信 0 回（pidfd・pid どちらの送信手段でも同じ）。
     #[test]

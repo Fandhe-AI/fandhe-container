@@ -98,10 +98,11 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::audit_log::{AuditCoverage, AuditCoveragePolicy, CoverageLayer, KernelAuditLayerStatus};
 use crate::dev_mounts::ImplicitDevMount;
 use crate::launch_isolation::{
-    LaunchIsolationRecord, MAX_RECORDED_RULES, RecordedLandlock, RecordedLandlockAudit,
-    RecordedRule, RecordedTarget, RootIdentity,
+    LaunchIsolationRecord, MAX_RECORDED_RULES, RecordedAuditCoverage, RecordedLandlock,
+    RecordedLandlockAudit, RecordedRule, RecordedTarget, RootIdentity,
 };
 use crate::oci_runtime::MountDestination;
 use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
@@ -351,7 +352,7 @@ enum RecordHealth {
     /// レコードがない（残骸ディレクトリのみも含む）。
     Absent,
     /// 読めて内容も整合している。
-    Healthy(StateRecord),
+    Healthy(Box<StateRecord>),
     /// 内容が使えない（JSON 破損・サイズ超過・ociVersion 不正・ID 不一致・状態と PID の矛盾）、
     /// またはファイル種別が異常（`<id>` がディレクトリでない・`state.json` が通常ファイルでない）。
     Corrupted(TraitError),
@@ -612,7 +613,7 @@ impl FileStateStore {
             };
         }
         match dto.into_record(id) {
-            Ok(record) => Ok(RecordHealth::Healthy(record)),
+            Ok(record) => Ok(RecordHealth::Healthy(Box::new(record))),
             Err(e) => Ok(RecordHealth::Corrupted(e)),
         }
     }
@@ -621,7 +622,7 @@ impl FileStateStore {
     fn read_record(&self, id: &ContainerId) -> Result<Option<StateRecord>, TraitError> {
         match self.inspect_record(id)? {
             RecordHealth::Absent => Ok(None),
-            RecordHealth::Healthy(record) => Ok(Some(record)),
+            RecordHealth::Healthy(record) => Ok(Some(*record)),
             RecordHealth::Corrupted(e) => Err(e),
         }
     }
@@ -1675,6 +1676,61 @@ struct StateDto {
 struct LaunchIsolationDto {
     root: RootDto,
     landlock: LandlockDto,
+    /// launch が評価した監査の網羅（SEC-4・#2027）。無ければ `NotRecorded`（旧記録を「網羅している」と読まない）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    audit_coverage: Option<AuditCoverageDto>,
+}
+
+/// 監査の網羅の記録。`policy` は `best-effort` / `strict`、各層は `{mode, reason?}`。
+#[derive(Debug, Serialize, Deserialize)]
+struct AuditCoverageDto {
+    policy: String,
+    seccomp_kill: CoverageLayerDto,
+    landlock: CoverageLayerDto,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CoverageLayerDto {
+    mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+impl CoverageLayerDto {
+    fn from_status(s: KernelAuditLayerStatus) -> Self {
+        Self {
+            mode: s.mode().to_owned(),
+            reason: s.reason().map(|r| r.as_str().to_owned()),
+        }
+    }
+
+    fn into_status(self, layer: CoverageLayer) -> Result<KernelAuditLayerStatus, ()> {
+        KernelAuditLayerStatus::from_wire(layer, &self.mode, self.reason.as_deref()).ok_or(())
+    }
+}
+
+impl AuditCoverageDto {
+    fn from_record(r: RecordedAuditCoverage) -> Option<Self> {
+        match r {
+            RecordedAuditCoverage::Evaluated { policy, coverage } => Some(Self {
+                policy: policy.as_str().to_owned(),
+                seccomp_kill: CoverageLayerDto::from_status(coverage.seccomp_kill()),
+                landlock: CoverageLayerDto::from_status(coverage.landlock()),
+            }),
+            _ => None,
+        }
+    }
+
+    /// untrusted な入力を検証して戻す。未知の語彙・層と矛盾する理由は破損として拒否する。
+    fn into_record(self) -> Result<RecordedAuditCoverage, ()> {
+        let policy = self.policy.parse::<AuditCoveragePolicy>().map_err(|_| ())?;
+        let seccomp_kill = self.seccomp_kill.into_status(CoverageLayer::SeccompKill)?;
+        let landlock = self.landlock.into_status(CoverageLayer::Landlock)?;
+        Ok(RecordedAuditCoverage::Evaluated {
+            policy,
+            coverage: AuditCoverage::new(seccomp_kill, landlock),
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1770,6 +1826,7 @@ impl LaunchIsolationDto {
                 rules,
                 audit: LandlockAuditDto::from_record(record.landlock().audit()),
             },
+            audit_coverage: AuditCoverageDto::from_record(record.audit_coverage()),
         }
     }
 
@@ -1792,10 +1849,19 @@ impl LaunchIsolationDto {
             .map_err(|_| ())?
             .with_audit(audit)
             .map_err(|_| ())?;
-        Ok(LaunchIsolationRecord::from_parts(
+        let record = LaunchIsolationRecord::from_parts(
             RootIdentity::new(self.root.dev, self.root.ino),
             landlock,
-        ))
+        );
+        Ok(match self.audit_coverage {
+            Some(c) => match c.into_record()? {
+                RecordedAuditCoverage::Evaluated { policy, coverage } => {
+                    record.with_audit_coverage(policy, coverage)
+                }
+                _ => record,
+            },
+            None => record,
+        })
     }
 }
 
@@ -3143,6 +3209,52 @@ mod tests {
         ] {
             let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
             v["landlock"]["audit"] = bad;
+            let dto: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+            assert!(dto.into_record().is_err());
+        }
+    }
+
+    /// SEC-4・#2027: 監査の網羅の記録が JSON の具体値で往復し、無い旧記録は `NotRecorded`、
+    /// 矛盾する語彙は破損として拒否される。
+    #[test]
+    fn sec4_2027_state_audit_coverage_roundtrip() {
+        use crate::audit_log::DegradeReason;
+        let coverage = AuditCoverage::new(
+            KernelAuditLayerStatus::Degraded(DegradeReason::SeccompKillNotLogged),
+            KernelAuditLayerStatus::Unknown,
+        );
+        let rec = iso(100).with_audit_coverage(AuditCoveragePolicy::Strict, coverage);
+        let v = serde_json::to_value(LaunchIsolationDto::from_record(&rec)).unwrap();
+        assert_eq!(
+            v["audit_coverage"],
+            serde_json::json!({
+                "policy": "strict",
+                "seccomp_kill": {"mode": "degraded", "reason": "seccomp_kill_not_logged"},
+                "landlock": {"mode": "unknown", "reason": "probe_failed"}
+            })
+        );
+        let back: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.into_record().unwrap().audit_coverage(),
+            RecordedAuditCoverage::Evaluated {
+                policy: AuditCoveragePolicy::Strict,
+                coverage
+            }
+        );
+        let legacy = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+        assert!(legacy.get("audit_coverage").is_none());
+        let back: LaunchIsolationDto = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            back.into_record().unwrap().audit_coverage(),
+            RecordedAuditCoverage::NotRecorded
+        );
+        for bad in [
+            serde_json::json!({"policy":"bogus","seccomp_kill":{"mode":"kernel_audit_requested"},"landlock":{"mode":"kernel_audit_requested"}}),
+            serde_json::json!({"policy":"strict","seccomp_kill":{"mode":"degraded","reason":"landlock_audit_abi_too_old"},"landlock":{"mode":"kernel_audit_requested"}}),
+            serde_json::json!({"policy":"strict","seccomp_kill":{"mode":"kernel_audit_requested"},"landlock":{"mode":"degraded"}}),
+        ] {
+            let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+            v["audit_coverage"] = bad;
             let dto: LaunchIsolationDto = serde_json::from_value(v).unwrap();
             assert!(dto.into_record().is_err());
         }

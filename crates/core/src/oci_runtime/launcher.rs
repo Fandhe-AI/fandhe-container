@@ -206,6 +206,8 @@ pub struct ProductionLauncherBuilder {
     applied_resources: Option<LinuxResourceLimits>,
     #[cfg(target_os = "linux")]
     seccomp_delivery: crate::seccomp::ErrnoDelivery,
+    #[cfg(target_os = "linux")]
+    audit_policy: crate::audit_log::AuditCoveragePolicy,
 }
 
 impl std::fmt::Debug for ProductionLauncherBuilder {
@@ -274,6 +276,15 @@ impl ProductionLauncherBuilder {
         self
     }
 
+    /// 監査の網羅を満たせない環境(カーネル監査頼みの層の縮退)への方針(SEC-4・#2027)。既定は
+    /// [`crate::audit_log::AuditCoveragePolicy::BestEffort`](警告して起動を続け、縮退を `launchIsolation` と監査記録に残す)。
+    /// `Strict` は縮退(調べられなかった場合を含む)を fork の前に `FailedPrecondition` で拒否する(opt-in)。
+    #[must_use]
+    pub fn audit_coverage_policy(mut self, policy: crate::audit_log::AuditCoveragePolicy) -> Self {
+        self.audit_policy = policy;
+        self
+    }
+
     /// 起動のたびに cgroup 参加フックを作る源(`ContainerCgroup::join_hook` を呼ぶクロージャ等。CORE-3)。
     #[must_use]
     pub fn cgroup_join_source(
@@ -322,6 +333,7 @@ impl ProductionLauncherBuilder {
             );
             inner.applied_resources = self.applied_resources;
             inner.seccomp_delivery = self.seccomp_delivery;
+            inner.audit_policy = self.audit_policy;
             Ok(ProductionLauncher { inner })
         }
         #[cfg(not(target_os = "linux"))]
@@ -555,6 +567,11 @@ impl ProcessLauncher for ProductionLauncher {
     }
 }
 
+/// 縮退の監査記録を書けなかったときの診断行(固定語彙のみ。SEC-4・#2027)。
+#[cfg(target_os = "linux")]
+const AUDIT_COVERAGE_RECORD_FAILED_LINE: &str =
+    r#"{"component":"core.audit","operation":"audit_coverage_record","outcome":"failed"}"#;
+
 /// 起動の実体(fork・Landlock の検出・スレッド数の観測)を差し替えられる継ぎ目(単体テストが順序と拒否を
 /// フォーク無し・ABI 非依存で照合できるようにする)。本番の実装は [`RealOps`]。
 #[cfg(target_os = "linux")]
@@ -569,6 +586,10 @@ trait LaunchOps: Send + Sync {
     /// pin 済みの rootfs の `(st_dev, st_ino)`（launch 時の分離の記録の `/`。fstat できなければ `None`。
     /// SUP-6・#2007）。
     fn root_identity(&self, rootfs: &super::launch::RootfsDir) -> Option<RootIdentity>;
+    /// カーネル監査まわりの観測値(procfs。読めない項目は `None`。SEC-4・#2027)。
+    fn kernel_audit_probe(&self) -> crate::audit_log::KernelAuditProbe;
+    /// 縮退の警告 1 行(構造化ログ。固定語彙のみ)を出す。launch の単一スレッド要求のため `log_event` 系は使えない。
+    fn emit_warning(&self, line: &str);
     /// 中間プロセス経由で PID 1 を起動する。
     fn spawn(&self, input: SpawnInput<'_>) -> Result<Spawned, Box<PreparedLaunchFailure>>;
     /// 報告前に失われた PID 1 を、起動識別子で `/proc` から探して回収する(`confirm_no_process` が、中間プロセスの
@@ -758,6 +779,8 @@ struct Inner {
     applied_resources: Option<LinuxResourceLimits>,
     /// ERRNO 側の拒否の届け方(`ProductionLauncherBuilder::seccomp_errno_delivery`。既定 `Errno`。SEC-4・#2025)。
     seccomp_delivery: crate::seccomp::ErrnoDelivery,
+    /// 監査の網羅を満たせない環境への方針(`ProductionLauncherBuilder::audit_coverage_policy`。既定 `BestEffort`。SEC-4・#2027)。
+    audit_policy: crate::audit_log::AuditCoveragePolicy,
     /// ハンドルの回収通知（`ContainerChildProcess::with_reap_notice`）と共有するため `Arc`。
     ledger: Arc<Mutex<Ledger>>,
     /// `Handed` の世代の採番。
@@ -784,6 +807,7 @@ impl Inner {
             cgroup_join_source,
             applied_resources: None,
             seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
+            audit_policy: crate::audit_log::AuditCoveragePolicy::BestEffort,
             ledger: Arc::new(Mutex::new(Ledger::default())),
             next_generation: std::sync::atomic::AtomicU64::new(0),
             left_process: AtomicBool::new(false),
@@ -852,6 +876,13 @@ impl Inner {
         spec: &LaunchSpec,
         timeout: Duration,
     ) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+        // 期限は入口で 1 回だけ取り、以降のすべての待ち(再回収・監査配送・spawn)をここから導く(REPAIR-5・SEC-4)。
+        // 上限なしの `Instant + Duration` は `Duration::MAX` 等で panic するため、確認系と同じ上限で丸めて `checked_add` する。
+        let deadline = Instant::now()
+            .checked_add(timeout.min(CONFIRM_TIMEOUT_MAX))
+            .ok_or_else(|| {
+                TraitError::new(ErrorCode::InvalidArgument, "launch timeout is out of range")
+            })?;
         let id = spec.container_id();
         self.admit(id)?;
         if !self.ops.is_single_threaded() {
@@ -872,6 +903,8 @@ impl Inner {
             self.ops.root_identity(spec.rootfs_dir()),
         )
         .map_err(|e| to_trait_error(&e))?;
+        // 監査の網羅(カーネル監査頼みの層)を評価し、厳格モードの縮退は子を作る前に拒否する(SEC-4・#2027)。
+        let isolation_record = self.assess_audit_coverage(id, isolation_record, deadline)?;
         let (uid, gid) = spec.user();
         let mut stages = StagePipeline::new()
             .with_seccomp_delivery(self.seccomp_delivery)
@@ -914,6 +947,14 @@ impl Inner {
             sink: self.audit_sink.as_ref(),
             container: Some(id),
         };
+        // 入口の期限までの残りを spawn に渡す。尽きていれば子を作らず拒否する(fail-closed)。
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            return Err(TraitError::new(
+                ErrorCode::Timeout,
+                "container launch did not complete within the timeout",
+            ));
+        }
         let spawned = self
             .ops
             .spawn(SpawnInput {
@@ -973,6 +1014,41 @@ impl Inner {
             }));
         self.ledger().set(id, LaunchRecord::Handed(generation));
         Ok(Box::new(process))
+    }
+
+    /// 監査の網羅を評価する(fork の前。SEC-4・#2027)。
+    ///
+    /// 1. 観測値と Landlock の記録から [`crate::audit_log::assess`] で 2 層を評価する
+    /// 2. 厳格モードで縮退(不明を含む)なら `FailedPrecondition` で拒否する(副作用なし)
+    /// 3. 縮退していれば警告 1 行と監査記録(層 `audit_coverage`)を 1 件出す。記録先へ書けなくても
+    ///    既定のモードでは起動の可否を変えず、固定語彙の診断行だけを出す
+    /// 4. 評価結果を分離の記録に添える(`state.json` の `launchIsolation` と inspect の元)
+    fn assess_audit_coverage(
+        &self,
+        id: &ContainerId,
+        record: crate::launch_isolation::LaunchIsolationRecord,
+        deadline: Instant,
+    ) -> Result<crate::launch_isolation::LaunchIsolationRecord, TraitError> {
+        let coverage =
+            crate::audit_log::assess(&self.ops.kernel_audit_probe(), record.landlock().audit());
+        coverage.enforce(self.audit_policy)?;
+        if let Some(line) = coverage.log_line() {
+            self.ops.emit_warning(&line);
+        }
+        if let Some(event) = coverage.degraded_event() {
+            // 同期配送の待ちも launch の入口の期限へ絞る。尽きたときは記録できなかった扱い(警告のみ)にし、
+            // 続く spawn 直前の残り時間の確認で `Timeout` として拒否する(REPAIR-5・SEC-4)。
+            let delivery = crate::audit_log::mount::deliver_until(
+                event,
+                Some(id),
+                self.audit_sink.as_ref(),
+                Some(deadline),
+            );
+            if !matches!(delivery, crate::audit_log::AuditDelivery::Recorded) {
+                self.ops.emit_warning(AUDIT_COVERAGE_RECORD_FAILED_LINE);
+            }
+        }
+        Ok(record.with_audit_coverage(self.audit_policy, coverage))
     }
 
     /// launch の前に、同じ ID の確かめられていない起動を再回収する。確かめられなければ fork 前に拒否する
@@ -1312,8 +1388,8 @@ impl LaunchOps for RealOps {
         config: &super::config::OciConfig,
     ) -> Result<LandlockRuleset, ExecError> {
         let ruleset = crate::exec::landlock_ruleset_from_config(config)?;
-        // ABI 7 未満ではカーネル監査へ拒否を残せない。縮退を構造化ログに出して続行する（SEC-4・#2026。
-        // 起動拒否や厳格モードは #2027）。送れなくても起動の可否は変えない。
+        // ABI 7 未満ではカーネル監査へ拒否を残せない。縮退を構造化ログに出して続行する（SEC-4・#2026）。
+        // 縮退の拒否(厳格モード)と 3 か所への表示は `Inner::assess_audit_coverage`（#2027）。送れなくても起動の可否は変えない。
         if let Some(line) = ruleset.audit_mode().log_line() {
             let _ = crate::exec::emit_diagnostic_line(&line);
         }
@@ -1322,6 +1398,15 @@ impl LaunchOps for RealOps {
 
     fn root_identity(&self, rootfs: &super::launch::RootfsDir) -> Option<RootIdentity> {
         RootIdentity::of_dir_fd(rootfs.as_fd())
+    }
+
+    fn kernel_audit_probe(&self) -> crate::audit_log::KernelAuditProbe {
+        crate::audit_log::KernelAuditProbe::read_host()
+    }
+
+    fn emit_warning(&self, line: &str) {
+        // 送れなくても起動の可否は変えない(警告は縮退の表示であって判定ではない)。
+        let _ = crate::exec::emit_diagnostic_line(line);
     }
 
     fn spawn(&self, input: SpawnInput<'_>) -> Result<Spawned, Box<PreparedLaunchFailure>> {
@@ -1491,6 +1576,10 @@ mod tests {
         /// `ensure_no_process_in_recorded` が順に返す結果(尽きたら `AlreadyAbsent`)と、受け取った配置の記録(#2011)。
         recorded_script: Mutex<VecDeque<Result<RecordedCgroupOutcome, ErrorCode>>>,
         recorded_calls: Arc<Mutex<Vec<(ContainerId, CgroupPlacement)>>>,
+        /// `kernel_audit_probe` が返す観測値(既定は否定する証拠なし)。
+        probe: crate::audit_log::KernelAuditProbe,
+        /// `emit_warning` に渡った縮退の警告行(順序の照合に使う `events` とは分ける。#2027)。
+        warnings: Arc<Mutex<Vec<String>>>,
     }
 
     impl FakeOps {
@@ -1509,6 +1598,8 @@ mod tests {
                 fail_root_identity: false,
                 recorded_script: Mutex::new(VecDeque::new()),
                 recorded_calls: Arc::new(Mutex::new(Vec::new())),
+                probe: crate::audit_log::KernelAuditProbe::all_clear(),
+                warnings: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -1530,6 +1621,14 @@ mod tests {
             push(&self.events, "landlock");
             let detected = crate::landlock::evaluate_abi(self.abi.unwrap_or(6));
             crate::exec::ruleset_from_detection(detected, config)
+        }
+
+        fn kernel_audit_probe(&self) -> crate::audit_log::KernelAuditProbe {
+            self.probe.clone()
+        }
+
+        fn emit_warning(&self, line: &str) {
+            self.warnings.lock().unwrap().push(line.to_owned());
         }
 
         fn root_identity(&self, rootfs: &super::super::launch::RootfsDir) -> Option<RootIdentity> {
@@ -1893,6 +1992,13 @@ mod tests {
                 .expect("ruleset");
         let expected = crate::launch_isolation::LaunchIsolationRecord::new(want_root, &ruleset)
             .expect("expected record");
+        // 監査の網羅の評価結果(#2027)は同じ観測値から導かれる値を添える。
+        let coverage = crate::audit_log::assess(
+            &crate::audit_log::KernelAuditProbe::all_clear(),
+            expected.landlock().audit(),
+        );
+        let expected = expected
+            .with_audit_coverage(crate::audit_log::AuditCoveragePolicy::BestEffort, coverage);
         assert!(
             record == expected,
             "record must come from the applied ruleset"
@@ -1964,6 +2070,207 @@ mod tests {
             "must not spawn"
         );
         assert!(!l.last_launch_may_have_left_process());
+    }
+
+    /// 縮退した環境を模す観測値(`kill_process` が `actions_logged` に無い)。ABI 6 の Landlock と合わせて 2 層とも縮退する。
+    fn degraded_probe() -> crate::audit_log::KernelAuditProbe {
+        let mut p = crate::audit_log::KernelAuditProbe::all_clear();
+        p.actions_logged = Some("kill_thread trap errno".to_owned());
+        p
+    }
+
+    fn audit_launcher(
+        ops: FakeOps,
+        policy: crate::audit_log::AuditCoveragePolicy,
+        sink: Arc<crate::audit_log::mount::tests::VecSink>,
+    ) -> ProductionLauncher {
+        let mut inner = Inner::new(Box::new(ops), rootless(), None, sink, None);
+        inner.audit_policy = policy;
+        ProductionLauncher { inner }
+    }
+
+    const DEGRADED_LINE: &str = r#"{"component":"core.audit","operation":"audit_coverage","outcome":"degraded","seccomp_kill":"seccomp_kill_not_logged","landlock":"landlock_audit_abi_too_old"}"#;
+
+    /// SEC-4・#2027: 既定のモード(BestEffort)では、縮退していても警告して起動を続け、縮退を分離の記録と監査記録に残す。
+    #[test]
+    fn sec4_2027_best_effort_degraded_launches_with_warning() {
+        use crate::audit_log::{
+            AuditCoveragePolicy, AuditLayer, DegradeReason, KernelAuditLayerStatus,
+        };
+        let spec = spec_for("cov-best", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.probe = degraded_probe();
+        let warnings = Arc::clone(&ops.warnings);
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+        let l = audit_launcher(ops, AuditCoveragePolicy::BestEffort, Arc::clone(&sink));
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launched");
+        let record = p.launch_isolation().expect("record").clone();
+        match record.audit_coverage() {
+            crate::launch_isolation::RecordedAuditCoverage::Evaluated { policy, coverage } => {
+                assert_eq!(policy, AuditCoveragePolicy::BestEffort);
+                assert_eq!(
+                    coverage.seccomp_kill(),
+                    KernelAuditLayerStatus::Degraded(DegradeReason::SeccompKillNotLogged)
+                );
+                assert_eq!(
+                    coverage.landlock(),
+                    KernelAuditLayerStatus::Degraded(DegradeReason::LandlockAuditAbiTooOld)
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let events = ev.lock().unwrap();
+        assert_eq!(events.iter().filter(|e| e.starts_with("spawn")).count(), 1);
+        assert_eq!(*warnings.lock().unwrap(), vec![DEGRADED_LINE.to_owned()]);
+        let recs = sink.records.lock().unwrap();
+        let cov: Vec<_> = recs
+            .iter()
+            .filter(|r| r.layer() == AuditLayer::AuditCoverage)
+            .collect();
+        assert_eq!(cov.len(), 1);
+        let (s, ll) = cov[0].coverage_reasons().expect("reasons");
+        assert_eq!(s.map(|r| r.as_str()), Some("seccomp_kill_not_logged"));
+        assert_eq!(ll.map(|r| r.as_str()), Some("landlock_audit_abi_too_old"));
+    }
+
+    /// SEC-4・#2027: 厳格モードでは縮退を fork の前に `FailedPrecondition` で拒否し、記録も警告も出さない。
+    /// 対照として、全項目が揃っていれば厳格モードでも起動できる。
+    #[test]
+    fn sec4_2027_strict_degraded_refuses_before_fork() {
+        use crate::audit_log::AuditCoveragePolicy;
+        let spec = spec_for("cov-strict", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.probe = degraded_probe();
+        let warnings = Arc::clone(&ops.warnings);
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+        let l = audit_launcher(ops, AuditCoveragePolicy::Strict, Arc::clone(&sink));
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "audit coverage is degraded and the strict audit policy refuses to start"
+        );
+        assert!(!ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")));
+        assert!(sink.records.lock().unwrap().is_empty());
+        assert!(warnings.lock().unwrap().is_empty());
+        assert!(!l.last_launch_may_have_left_process());
+
+        // 対照: ABI 7 と否定する証拠の無い観測値なら、厳格モードでも起動し、縮退の記録は出ない。
+        let spec = spec_for("cov-strict-ok", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.abi = Some(7);
+        let warnings = Arc::clone(&ops.warnings);
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+        let l = audit_launcher(ops, AuditCoveragePolicy::Strict, Arc::clone(&sink));
+        l.launch(&spec, Duration::from_secs(1)).expect("launched");
+        assert!(sink.records.lock().unwrap().is_empty());
+        assert!(warnings.lock().unwrap().is_empty());
+    }
+
+    /// SEC-4・#2027: 既定のモードでは、縮退の監査記録を書けなくても起動の可否を変えず、固定語彙の診断行だけを出す。
+    #[test]
+    fn sec4_2027_best_effort_record_failure_still_launches() {
+        let spec = spec_for("cov-sinkfail", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.probe = degraded_probe();
+        let warnings = Arc::clone(&ops.warnings);
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(true));
+        let l = audit_launcher(ops, crate::audit_log::AuditCoveragePolicy::BestEffort, sink);
+        l.launch(&spec, Duration::from_secs(1)).expect("launched");
+        assert_eq!(
+            *warnings.lock().unwrap(),
+            vec![
+                DEGRADED_LINE.to_owned(),
+                AUDIT_COVERAGE_RECORD_FAILED_LINE.to_owned()
+            ]
+        );
+    }
+
+    /// 期限まで眠ってから `Timeout` を返す遅い sink。`record`(期限を知らない経路)は期限と無関係に長く眠る。
+    struct SlowSink {
+        record_calls: AtomicUsize,
+    }
+
+    impl AuditSink for SlowSink {
+        fn record(&self, _record: &AuditRecord) -> Result<(), TraitError> {
+            self.record_calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_secs(5));
+            Ok(())
+        }
+
+        fn record_until(&self, _record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            Err(TraitError::new(ErrorCode::Timeout, "slow sink timed out"))
+        }
+    }
+
+    /// SEC-4・REPAIR-5: 上限のない `Duration::MAX` を渡しても期限の算出で panic せず、上限で丸めた期限で起動が完了する。
+    #[test]
+    fn sec4_repair5_launch_with_max_timeout_does_not_panic() {
+        let spec = spec_for("cov-maxtimeout", serde_json::json!({}));
+        let ev = events();
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+        let l = audit_launcher(
+            FakeOps::new(&ev),
+            crate::audit_log::AuditCoveragePolicy::BestEffort,
+            sink,
+        );
+        let p = l.launch(&spec, Duration::MAX).expect("launched");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert_eq!(
+            ev.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.starts_with("spawn"))
+                .count(),
+            1
+        );
+    }
+
+    /// SEC-4・REPAIR-5: 縮退の監査配送が遅くても、launch 全体が引数 timeout の近傍内に `Timeout` で返り、
+    /// 配送の待ちが入口の期限の外へ出ず、子(spawn)も作られない。
+    #[test]
+    fn sec4_repair5_slow_audit_delivery_stays_within_launch_timeout() {
+        let spec = spec_for("cov-slow", serde_json::json!({}));
+        let ev = events();
+        let mut ops = FakeOps::new(&ev);
+        ops.probe = degraded_probe();
+        let sink = Arc::new(SlowSink {
+            record_calls: AtomicUsize::new(0),
+        });
+        let mut inner = Inner::new(
+            Box::new(ops),
+            rootless(),
+            None,
+            Arc::clone(&sink) as _,
+            None,
+        );
+        inner.audit_policy = crate::audit_log::AuditCoveragePolicy::BestEffort;
+        let l = ProductionLauncher { inner };
+        let started = Instant::now();
+        let err = l
+            .launch(&spec, Duration::from_millis(300))
+            .err()
+            .expect("timed out");
+        let elapsed = started.elapsed();
+        assert_eq!(err.code(), ErrorCode::Timeout);
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        assert_eq!(sink.record_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            ev.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.starts_with("spawn"))
+                .count(),
+            0
+        );
     }
 
     /// CORE-3: cgroup 要件ありで参加の源が無ければ、スレッド確認・Landlock・fork より前に拒否する。

@@ -8,9 +8,10 @@
 //!
 //! # 起動のしかた（呼び出し側の責務。#1718・#1719）
 //! - 実行ファイルは固定のインストール先から解決する（`PATH` 探索をしない）。
-//! - argv: `fandhe-container-supervisor start --root <状態ルートの絶対パス> [--restart <policy>] <container-id>`。
+//! - argv: `fandhe-container-supervisor start --root <状態ルートの絶対パス> [--restart <policy>] [--audit-policy <best-effort|strict>] <container-id>`。
 //!   `--root` は必須（CLI が `StateRoot::resolve` で解決した値を渡す。supervisor は状態ルートを環境変数から決めない）。
-//!   `--restart` は任意で既定は `no`。各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
+//!   `--restart` は任意で既定は `no`。`--audit-policy` は任意で既定は `best-effort`（カーネル監査頼みの層が縮退した
+//!   環境の扱い。`strict` は縮退を起動前に拒否する。SEC-4・#2027。CLI からの受け渡しは未実装）。各オプションは 1 回まで・順不同で、`<container-id>` は末尾の位置引数 1 個。
 //! - 契約の fd は 0〜2 のみ。supervisor は入口（`start_entry`）で fd [`FIRST_INHERITED_FD`] 以降を閉じる
 //!   （特権ランチャーと同じ処理。#2070・SEC-1）。呼び出し側が追加の fd を渡しても使われない。exec から入口までの
 //!   短い窓は残る（CLI は CLOEXEC の無い fd を自分では閉じない）。
@@ -52,12 +53,14 @@ use std::num::{NonZeroU8, NonZeroU32};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use fandhe_container_core::audit_log::RECORD_WAIT_LIMIT;
 use fandhe_container_core::oci_runtime::{
     LAUNCHER_REPLY_GRACE, OciRuntimeError, StartTimeouts, exit_code_for,
 };
 use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
 use crate::restart::RestartPolicy;
+use fandhe_container_core::audit_log::AuditCoveragePolicy;
 
 /// supervisor の入口とランチャーが閉じ始める fd 番号（0〜2 は契約の stdin / stdout / stderr。SEC-1・#2070）。
 pub const FIRST_INHERITED_FD: u32 = 3;
@@ -253,6 +256,8 @@ pub struct StartArgs {
     pub root: PathBuf,
     /// restart ポリシー（既定 `no`）。
     pub restart: RestartPolicy,
+    /// 監査の網羅を満たせない環境への方針（既定 `best-effort`。SEC-4・#2027）。
+    pub audit_policy: AuditCoveragePolicy,
     /// 起動するコンテナの ID。
     pub id: ContainerId,
 }
@@ -281,17 +286,18 @@ impl StartArgs {
         }
         let mut root: Option<String> = None;
         let mut restart: Option<String> = None;
+        let mut audit_policy: Option<String> = None;
         let mut id: Option<String> = None;
         while let Some(tok) = it.next() {
             match tok.as_str() {
-                "--root" | "--restart" => {
+                "--root" | "--restart" | "--audit-policy" => {
                     let value = it
                         .next()
                         .ok_or_else(|| invalid("option value is missing"))?;
-                    let slot = if tok == "--root" {
-                        &mut root
-                    } else {
-                        &mut restart
+                    let slot = match tok.as_str() {
+                        "--root" => &mut root,
+                        "--restart" => &mut restart,
+                        _ => &mut audit_policy,
                     };
                     if slot.replace(value).is_some() {
                         return Err(invalid("option given more than once"));
@@ -313,29 +319,52 @@ impl StartArgs {
             Some(p) => p.parse::<RestartPolicy>()?,
             None => RestartPolicy::No,
         };
+        let audit_policy = match audit_policy {
+            Some(p) => p.parse::<AuditCoveragePolicy>()?,
+            None => AuditCoveragePolicy::default(),
+        };
         let id =
             ContainerId::new(id.ok_or_else(|| invalid("exactly one container id is required"))?)?;
-        Ok(Self { root, restart, id })
+        Ok(Self {
+            root,
+            restart,
+            audit_policy,
+            id,
+        })
     }
 }
 
+/// 監査の記録経路の確認（起動前の `probe`。supervisor の入口が `launch` の前に 1 回行う）に見込む時間。
+///
+/// `probe` は helper の応答を [`RECORD_WAIT_LIMIT`] まで待ち得るため、同じ値を見込む（SEC-4・REPAIR-5・#2027）。
+/// [`result_deadline`] に含め、期限の起点を `probe` の前に置いても launch の見込みを食わないようにする。
+pub const AUDIT_PROBE_ALLOWANCE: Duration = RECORD_WAIT_LIMIT;
+
+/// launch の直前に行う監査の網羅の記録（縮退の同期配送）に見込む時間（[`RECORD_WAIT_LIMIT`] と同じ）。
+///
+/// launcher（`SelfBounded`）は入口の単一期限（引数 `timeout`）から配送を含む待ちを導き、配送は残り時間で打ち切られる
+/// ため、この分は launch の上限を広げない（遅い配送は `TIMEOUT` で拒否される）。入口が見込む手順 8 の時間への
+/// 余裕としてのみ残す（SEC-4・REPAIR-5・#2027）。
+pub const AUDIT_DELIVERY_ALLOWANCE: Duration = RECORD_WAIT_LIMIT;
+
 /// 起動手順 8（`oci_runtime::start`。launch・失敗時の terminate・確認）に見込む時間:
-/// `launch + terminate + confirm + 3 × LAUNCHER_REPLY_GRACE`（あふれたら `Duration::MAX` に張り付く）。
+/// `launch + terminate + confirm + 3 × LAUNCHER_REPLY_GRACE + AUDIT_DELIVERY_ALLOWANCE`（あふれたら `Duration::MAX` に張り付く）。
 ///
 /// 手順 8 は入口スレッドが直接行う（本番 launcher は単一スレッドの呼び出しを要求するため。#1819・CORE-1）。
 /// launcher 自身が上限を守る（`SelfBounded`）ので、入口は launch の前にこの時間が期限内に残っているかを確かめ、
 /// 足りなければ launch せず `INTERNAL`（期限超過）を報告する（期限内に終わらない launch を始めない。REPAIR-5）。
-/// 既定値で 28s。
+/// 既定値で 39.45s（28s + 11.45s）。
 pub fn launch_step_budget(timeouts: &StartTimeouts) -> Duration {
     timeouts
         .launch()
+        .saturating_add(AUDIT_DELIVERY_ALLOWANCE)
         .saturating_add(timeouts.terminate())
         .saturating_add(timeouts.confirm())
         .saturating_add(LAUNCHER_REPLY_GRACE.saturating_mul(3))
 }
 
-/// supervisor が結果を書くまでの内部上限: [`launch_step_budget`] + [`CGROUP_PREPARE_ALLOWANCE`]
-/// （既定値で 34s。あふれたら `Duration::MAX` に張り付く）。
+/// supervisor が結果を書くまでの内部上限: [`launch_step_budget`] + [`CGROUP_PREPARE_ALLOWANCE`] + [`AUDIT_PROBE_ALLOWANCE`]
+/// （既定値で 56.9s。あふれたら `Duration::MAX` に張り付く）。起点は記録経路の確認（`probe`）の前に置く。
 ///
 /// supervisor（`start_entry::run_start`）は手順 3〜7（状態の確認・cgroup の連鎖・監査 sink・launcher の構築）を
 /// 作業スレッドで行い、開始時刻にこの値を足した期限から報告の書き込み分（`start_entry::REPORT_RESERVE`）を引いた
@@ -344,7 +373,9 @@ pub fn launch_step_budget(timeouts: &StartTimeouts) -> Duration {
 /// 手順 3〜7 が長引いて手順 8 の見込みが残らなければ launch せず `INTERNAL`（期限超過）を報告するため、報告は
 /// この上限内に届く。失敗後の後始末は報告の後に行う（REPAIR-5）。
 pub fn result_deadline(timeouts: &StartTimeouts) -> Duration {
-    launch_step_budget(timeouts).saturating_add(CGROUP_PREPARE_ALLOWANCE)
+    launch_step_budget(timeouts)
+        .saturating_add(CGROUP_PREPARE_ALLOWANCE)
+        .saturating_add(AUDIT_PROBE_ALLOWANCE)
 }
 
 /// CLI の受信期限: [`result_deadline`] + [`CLI_RECEIVE_GRACE`]。
@@ -523,6 +554,51 @@ mod tests {
         assert_eq!(c.restart, "on-failure:3".parse::<RestartPolicy>().unwrap());
     }
 
+    /// SEC-4・#2027: `--audit-policy` の既定は best-effort、`strict` を受理し、順不同で渡せる。
+    #[test]
+    fn sec4_2027_args_audit_policy() {
+        let a = StartArgs::parse(os(&["start", "--root", ROOT, "c1"])).unwrap();
+        assert_eq!(a.audit_policy, AuditCoveragePolicy::BestEffort);
+        let b = StartArgs::parse(os(&[
+            "start",
+            "--audit-policy",
+            "strict",
+            "--root",
+            ROOT,
+            "c1",
+        ]))
+        .unwrap();
+        assert_eq!(b.audit_policy, AuditCoveragePolicy::Strict);
+        let c = StartArgs::parse(os(&[
+            "start",
+            "c1",
+            "--audit-policy",
+            "best-effort",
+            "--root",
+            ROOT,
+        ]))
+        .unwrap();
+        assert_eq!(c.audit_policy, AuditCoveragePolicy::BestEffort);
+        for bad in [
+            vec!["start", "--root", ROOT, "--audit-policy", "Strict", "c1"],
+            vec!["start", "--root", ROOT, "--audit-policy", "c1"],
+            vec!["start", "--root", ROOT, "c1", "--audit-policy"],
+            vec![
+                "start",
+                "--root",
+                ROOT,
+                "--audit-policy",
+                "strict",
+                "--audit-policy",
+                "strict",
+                "c1",
+            ],
+        ] {
+            let e = StartArgs::parse(os(&bad)).expect_err("must be rejected");
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "input: {bad:?}");
+        }
+    }
+
     /// SUP-1: 不正な argv はすべて InvalidArgument。
     #[test]
     fn sup1_args_parse_rejects_invalid() {
@@ -559,23 +635,25 @@ mod tests {
         }
     }
 
-    /// REPAIR-5・#1819: 手順 8 の見込みは既定で 28s で、内部上限はそれに cgroup の準備の見込み（6s）を足した値。
+    /// REPAIR-5・SEC-4・#1819・#2027: 手順 8 の見込みは既定で 28s + 監査配送 11.45s。内部上限はそれに cgroup の準備（6s）と
+    /// 記録経路の確認（11.45s）を足した値。
     #[test]
-    fn repair5_launch_step_budget_default_is_28s() {
+    fn repair5_launch_step_budget_default_includes_audit_delivery() {
         let t = StartTimeouts::default();
-        assert_eq!(launch_step_budget(&t), Duration::from_secs(28));
+        assert_eq!(RECORD_WAIT_LIMIT, Duration::from_millis(11_450));
+        assert_eq!(launch_step_budget(&t), Duration::from_millis(39_450));
         assert_eq!(
             result_deadline(&t),
-            launch_step_budget(&t) + CGROUP_PREPARE_ALLOWANCE
+            launch_step_budget(&t) + CGROUP_PREPARE_ALLOWANCE + AUDIT_PROBE_ALLOWANCE
         );
     }
 
-    /// REPAIR-5: 既定の内部上限は 34s で、CLI の受信期限はそれより厳密に長い。
+    /// REPAIR-5: 既定の内部上限は 56.9s で、CLI の受信期限はそれより厳密に長い。
     #[test]
-    fn repair5_result_deadline_default_is_34s() {
+    fn repair5_result_deadline_default_is_56_9s() {
         let t = StartTimeouts::default();
-        assert_eq!(result_deadline(&t), Duration::from_secs(34));
-        assert_eq!(cli_receive_deadline(&t), Duration::from_secs(36));
+        assert_eq!(result_deadline(&t), Duration::from_millis(56_900));
+        assert_eq!(cli_receive_deadline(&t), Duration::from_millis(58_900));
         assert!(cli_receive_deadline(&t) > result_deadline(&t));
     }
 }

@@ -79,7 +79,7 @@ impl RestrictSelfFlags {
 ///
 /// カーネル監査の読み手は外部（auditd 等）で、本ランタイムは記録を要求するだけである。ワークロードの拒否の
 /// 証拠に `audit_log::landlock` のレコード（ランタイム自身のプローブの写像）を使わない。ホスト側の audit が
-/// 無効なら実際の記録は出ないため、`KernelAuditRequested` は「要求した」ことだけを表す（その判定は #2027）。
+/// 無効なら実際の記録は出ないため、`KernelAuditRequested` は「要求した」ことだけを表す（ホストの縮退の判定と方針は `audit_log::coverage`。#2027）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LandlockAuditMode {

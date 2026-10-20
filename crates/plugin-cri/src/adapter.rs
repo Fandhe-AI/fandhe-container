@@ -115,15 +115,20 @@ impl CriPluginBackends {
     /// `Unimplemented` をそのまま返す（fail-closed）。
     pub fn production() -> Result<Self, TraitError> {
         let root = StateRoot::resolve(None)?;
+        let recorder = Arc::new(OpRecorder::new());
         // netns の pin の置き場は状態ルート配下の固定の場所（要求の入力からは受けない。TASK-114.4）。
+        // 先頭が `.` のため、英数字始まりの `ContainerId` の状態ディレクトリと衝突しない。
         #[cfg(target_os = "linux")]
-        let network: Arc<dyn NetworkPlugin> = Arc::new(NetsetupNetwork::new(LinuxNetsetup::new(
-            root.path().join("netns"),
-        )));
+        let network: Arc<dyn NetworkPlugin> = Arc::new(NetsetupNetwork::with_recorder(
+            LinuxNetsetup::with_recorder(
+                root.path().join(".netns"),
+                Arc::new(CoreNetRecorder(Arc::clone(&recorder))),
+            ),
+            Arc::clone(&recorder),
+        ));
         #[cfg(not(target_os = "linux"))]
         let network: Arc<dyn NetworkPlugin> = Arc::new(UnimplementedNetwork);
         let state: Arc<dyn StateStore> = Arc::new(FileStateStore::open(root)?);
-        let recorder = Arc::new(OpRecorder::new());
         let runtime = Arc::new(CoreLifecycleRuntime::with_recorder(
             Arc::clone(&state),
             Arc::clone(&recorder),
@@ -181,6 +186,25 @@ impl CriOpRecorder for CoreCriRecorder {
         };
         let outcome = match sample.outcome() {
             CriOpOutcome::Success => OpOutcome::Success,
+            _ => OpOutcome::Failure,
+        };
+        let _ = self.0.record(&name, outcome, sample.latency());
+    }
+}
+
+/// net の計測結果を core の `OpRecorder` へ流す橋渡し（操作名は `NetOpKind::as_str`。REPAIR-4）。
+#[cfg(target_os = "linux")]
+struct CoreNetRecorder(Arc<OpRecorder>);
+
+#[cfg(target_os = "linux")]
+impl fandhe_container_net::instrument::NetOpRecorder for CoreNetRecorder {
+    fn record_net_op(&self, sample: &fandhe_container_net::instrument::NetOpSample) {
+        use fandhe_container_net::instrument::NetOpOutcome;
+        let Ok(name) = OpName::new(sample.kind().as_str()) else {
+            return;
+        };
+        let outcome = match sample.outcome() {
+            NetOpOutcome::Success => OpOutcome::Success,
             _ => OpOutcome::Failure,
         };
         let _ = self.0.record(&name, outcome, sample.latency());

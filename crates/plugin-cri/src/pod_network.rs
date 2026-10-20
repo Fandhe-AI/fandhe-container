@@ -13,8 +13,8 @@
 
 use fandhe_container_core::traits::{
     AttachRequest, AttachResponse, ContainerId, CreateNetnsRequest, CreateNetworkRequest,
-    DeleteNetworkRequest, DetachRequest, IpCidr, NetworkName, NetworkPlugin, NetworkStatus,
-    TraitError,
+    DeleteNetworkRequest, DetachRequest, ErrorCode, IpCidr, NetworkName, NetworkPlugin,
+    NetworkStatus, TraitError,
 };
 
 /// PodSandbox のネットワークを作る（`net-create`）。
@@ -29,7 +29,8 @@ pub fn set_up_pod(
 /// コンテナの netns を用意して接続する（`netns-create` → `veth-attach`）。
 ///
 /// `attach` が失敗したら、`create_netns` で作った記録を `detach` で戻す（再試行が `AlreadyExists` で
-/// 恒久的に失敗しないようにする。契約 6）。巻き戻し自体の失敗は元のエラーを優先して返す。
+/// 恒久的に失敗しないようにする。契約 6）。巻き戻し自体も失敗したら `Internal` を返し、元の attach エラーと detach エラー、
+/// 記録が残っている旨をメッセージへ残す（契約 6・9。エラーを握りつぶさない）。
 pub fn set_up_container(
     net: &dyn NetworkPlugin,
     name: &NetworkName,
@@ -38,11 +39,20 @@ pub fn set_up_container(
     net.create_netns(&CreateNetnsRequest::new(name.clone(), container.clone()))?;
     match net.attach(&AttachRequest::new(name.clone(), container.clone())) {
         Ok(resp) => Ok(resp),
-        Err(e) => {
-            // 元のエラーを優先する。巻き戻しの結果は呼び出し側へは伝えない。
-            let _ = net.detach(&DetachRequest::new(name.clone(), container.clone()));
-            Err(e)
-        }
+        Err(e) => match net.detach(&DetachRequest::new(name.clone(), container.clone())) {
+            Ok(_) => Err(e),
+            Err(d) => Err(TraitError::new(
+                ErrorCode::Internal,
+                format!(
+                    "attach failed ({}: {}); rollback detach also failed ({}: {}); \
+                         the netns record for the container may remain",
+                    e.code().as_str(),
+                    e.message(),
+                    d.code().as_str(),
+                    d.message()
+                ),
+            )),
+        },
     }
 }
 

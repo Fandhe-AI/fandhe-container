@@ -382,3 +382,79 @@ fn poisoned_lock_returns_internal() {
         .expect_err("poisoned");
     assert_eq!(e.code(), ErrorCode::Internal);
 }
+/// attach も巻き戻しの detach も失敗する NetworkPlugin（契約 6・9 の握りつぶし防止の照合用）。
+struct FailingRollback;
+
+impl NetworkPlugin for FailingRollback {
+    fn create_network(
+        &self,
+        _req: &CreateNetworkRequest,
+    ) -> Result<fandhe_container_core::traits::NetworkStatus, TraitError> {
+        Err(TraitError::new(ErrorCode::Internal, "unused"))
+    }
+    fn create_netns(
+        &self,
+        req: &CreateNetnsRequest,
+    ) -> Result<fandhe_container_core::traits::NetnsStatus, TraitError> {
+        let name = fandhe_container_core::traits::NetnsName::new("netns-x").expect("name");
+        Ok(fandhe_container_core::traits::NetnsStatus::new(
+            req.container().clone(),
+            name,
+        ))
+    }
+    fn attach(
+        &self,
+        _req: &AttachRequest,
+    ) -> Result<fandhe_container_core::traits::AttachResponse, TraitError> {
+        Err(TraitError::new(ErrorCode::Timeout, "attach timed out"))
+    }
+    fn publish_port(
+        &self,
+        _req: &PublishPortRequest,
+    ) -> Result<fandhe_container_core::traits::PortMapping, TraitError> {
+        Err(TraitError::new(ErrorCode::Internal, "unused"))
+    }
+    fn detach(
+        &self,
+        _req: &DetachRequest,
+    ) -> Result<fandhe_container_core::traits::DetachResponse, TraitError> {
+        Err(TraitError::new(ErrorCode::Internal, "detach broke"))
+    }
+    fn delete_network(
+        &self,
+        _req: &fandhe_container_core::traits::DeleteNetworkRequest,
+    ) -> Result<fandhe_container_core::traits::DeleteNetworkResponse, TraitError> {
+        Err(TraitError::new(ErrorCode::Internal, "unused"))
+    }
+}
+
+/// 契約 6・9: attach 失敗後の detach も失敗したら Internal で両方のエラーを残す。
+#[test]
+fn set_up_container_reports_failed_rollback() {
+    let e = pod_network::set_up_container(&FailingRollback, &nname("pod1"), &cid("c1"))
+        .expect_err("fail");
+    assert_eq!(e.code(), ErrorCode::Internal);
+    assert!(e.message().contains("attach failed (") && e.message().contains("attach timed out"));
+    assert!(e.message().contains("detach broke"));
+    assert!(e.message().contains("may remain"));
+}
+
+/// REPAIR-4: 入力拒否を含む公開操作の結果が共有の記録器に件数で残る。
+#[test]
+fn repair4_public_ops_are_recorded() {
+    use fandhe_container_core::observability::OpRecorder;
+    let rec = Arc::new(OpRecorder::new());
+    let net = NetsetupNetwork::with_recorder(Fake::default(), Arc::clone(&rec));
+    net.create_network(&CreateNetworkRequest::new(nname("pod1"), subnet()))
+        .expect("create");
+    // IPv6 のサブネットは入力拒否になるが失敗として記録される。
+    let v6 = IpCidr::new("fd00::".parse().expect("v6"), 64).expect("cidr");
+    net.create_network(&CreateNetworkRequest::new(nname("pod2"), v6))
+        .expect_err("v6");
+    let snap = rec.snapshot();
+    let s = snap
+        .iter()
+        .find(|s| s.name().as_str() == "net.create_network")
+        .expect("stats");
+    assert_eq!((s.success(), s.failure()), (1, 1));
+}

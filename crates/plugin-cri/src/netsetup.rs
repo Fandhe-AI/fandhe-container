@@ -46,13 +46,14 @@
 //!
 //! Linux のカーネル操作は `CAP_NET_ADMIN`（netlink）と `CAP_SYS_ADMIN`（netns の pin の bind mount）を要し、
 //! 本 crate は権限を上げない。権限が無ければ `PermissionDenied` をそのまま返す（fail-closed）。netns の pin の置き場は
-//! 状態ルート配下の固定の場所（`<状態ルート>/netns`）で、要求の入力からは受けない。置き場は private な mount に
+//! 状態ルート配下の固定の場所（`<状態ルート>/.netns`）で、要求の入力からは受けない。置き場は private な mount に
 //! しておく前提で、`shared` は net が拒否する。
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use fandhe_container_core::observability::{OpName, OpRecorder};
 use fandhe_container_core::traits::{
     AttachRequest, AttachResponse, ContainerId, CreateNetnsRequest, CreateNetworkRequest,
     DeleteNetworkRequest, DeleteNetworkResponse, DetachRequest, DetachResponse, ErrorCode, IpCidr,
@@ -138,13 +139,13 @@ fn derive_netns_name(container: &ContainerId) -> Result<NetnsName, TraitError> {
         .chars()
         .map(|c| if c == '.' || c == '_' { '-' } else { c })
         .collect();
-    if sanitized.len() > MAX.saturating_sub(PREFIX.len()) {
-        return Err(TraitError::new(
-            ErrorCode::InvalidArgument,
-            "container id is too long to derive a netns name",
-        ));
+    // 導出名は NetnsStatus で返すだけで net には渡さない。前置して 64 バイトに収まるときだけ前置し、
+    // 収まらない長い ID（標準の 64 桁 hex を含む）は前置せずそのまま使う。
+    if sanitized.len() + PREFIX.len() <= MAX {
+        NetnsName::new(format!("{PREFIX}{sanitized}"))
+    } else {
+        NetnsName::new(sanitized)
     }
-    NetnsName::new(format!("{PREFIX}{sanitized}"))
 }
 
 /// サブネットから gateway（ネットワークアドレス + 1、prefix 長は同じ）を導出する。IPv4 の `/1`〜`/30` のみ。
@@ -253,6 +254,8 @@ type BackendRegistry<B> =
 pub struct NetsetupNetwork<B: NetsetupBackend> {
     backend: B,
     state: Mutex<BackendRegistry<B>>,
+    /// 公開操作（入力拒否を含む）の成功・失敗件数とレイテンシの記録先（REPAIR-4）。
+    recorder: Option<Arc<OpRecorder>>,
 }
 
 impl<B: NetsetupBackend> std::fmt::Debug for NetsetupNetwork<B> {
@@ -264,12 +267,34 @@ impl<B: NetsetupBackend> std::fmt::Debug for NetsetupNetwork<B> {
 impl<B: NetsetupBackend> NetsetupNetwork<B> {
     /// バックエンドを差して空のレジストリで始める。
     pub fn new(backend: B) -> Self {
+        Self::build(backend, None)
+    }
+
+    /// 共有の記録器を差して作る。各公開操作の結果（入力拒否を含む）を `net.<操作名>` で記録する（REPAIR-4）。
+    pub fn with_recorder(backend: B, recorder: Arc<OpRecorder>) -> Self {
+        Self::build(backend, Some(recorder))
+    }
+
+    fn build(backend: B, recorder: Option<Arc<OpRecorder>>) -> Self {
         Self {
             backend,
             state: Mutex::new(Registry {
                 networks: HashMap::new(),
                 containers: HashMap::new(),
             }),
+            recorder,
+        }
+    }
+
+    /// 記録器があれば `name` で計測して実行する。操作名が不正なら計測せず実行だけする。
+    fn timed<T>(
+        &self,
+        name: &str,
+        f: impl FnOnce() -> Result<T, TraitError>,
+    ) -> Result<T, TraitError> {
+        match (&self.recorder, OpName::new(name)) {
+            (Some(r), Ok(n)) => r.record_op(&n, f),
+            _ => f(),
         }
     }
 
@@ -298,8 +323,8 @@ fn network_mismatch() -> TraitError {
     )
 }
 
-impl<B: NetsetupBackend> NetworkPlugin for NetsetupNetwork<B> {
-    fn create_network(&self, req: &CreateNetworkRequest) -> Result<NetworkStatus, TraitError> {
+impl<B: NetsetupBackend> NetsetupNetwork<B> {
+    fn create_network_impl(&self, req: &CreateNetworkRequest) -> Result<NetworkStatus, TraitError> {
         let name = to_net_name(req.name())?;
         let gateway = gateway_for(req.subnet())?;
         let mut guard = self.lock()?;
@@ -324,7 +349,7 @@ impl<B: NetsetupBackend> NetworkPlugin for NetsetupNetwork<B> {
         Ok(NetworkStatus::new(req.name().clone(), req.subnet()))
     }
 
-    fn create_netns(&self, req: &CreateNetnsRequest) -> Result<NetnsStatus, TraitError> {
+    fn create_netns_impl(&self, req: &CreateNetnsRequest) -> Result<NetnsStatus, TraitError> {
         let endpoint = to_endpoint(req.container())?;
         let netns = derive_netns_name(req.container())?;
         let mut guard = self.lock()?;
@@ -360,7 +385,7 @@ impl<B: NetsetupBackend> NetworkPlugin for NetsetupNetwork<B> {
         Ok(NetnsStatus::new(req.container().clone(), netns))
     }
 
-    fn attach(&self, req: &AttachRequest) -> Result<AttachResponse, TraitError> {
+    fn attach_impl(&self, req: &AttachRequest) -> Result<AttachResponse, TraitError> {
         let mut guard = self.lock()?;
         let reg = &mut *guard;
         // 契約 12: attach 済みなら対象ネットワークを問わず最初に AlreadyExists。
@@ -405,14 +430,7 @@ impl<B: NetsetupBackend> NetworkPlugin for NetsetupNetwork<B> {
         ))
     }
 
-    fn publish_port(&self, _req: &PublishPortRequest) -> Result<PortMapping, TraitError> {
-        Err(TraitError::new(
-            ErrorCode::Unimplemented,
-            MSG_PUBLISH_PORT_UNAVAILABLE,
-        ))
-    }
-
-    fn detach(&self, req: &DetachRequest) -> Result<DetachResponse, TraitError> {
+    fn detach_impl(&self, req: &DetachRequest) -> Result<DetachResponse, TraitError> {
         let mut guard = self.lock()?;
         let reg = &mut *guard;
         if !reg.networks.contains_key(req.network().as_str()) {
@@ -436,7 +454,7 @@ impl<B: NetsetupBackend> NetworkPlugin for NetsetupNetwork<B> {
         Ok(DetachResponse::new())
     }
 
-    fn delete_network(
+    fn delete_network_impl(
         &self,
         req: &DeleteNetworkRequest,
     ) -> Result<DeleteNetworkResponse, TraitError> {
@@ -486,6 +504,40 @@ impl<B: NetsetupBackend> NetworkPlugin for NetsetupNetwork<B> {
     }
 }
 
+impl<B: NetsetupBackend> NetworkPlugin for NetsetupNetwork<B> {
+    fn create_network(&self, req: &CreateNetworkRequest) -> Result<NetworkStatus, TraitError> {
+        self.timed("net.create_network", || self.create_network_impl(req))
+    }
+
+    fn create_netns(&self, req: &CreateNetnsRequest) -> Result<NetnsStatus, TraitError> {
+        self.timed("net.create_netns", || self.create_netns_impl(req))
+    }
+
+    fn attach(&self, req: &AttachRequest) -> Result<AttachResponse, TraitError> {
+        self.timed("net.attach", || self.attach_impl(req))
+    }
+
+    fn publish_port(&self, _req: &PublishPortRequest) -> Result<PortMapping, TraitError> {
+        self.timed("net.publish_port", || {
+            Err(TraitError::new(
+                ErrorCode::Unimplemented,
+                MSG_PUBLISH_PORT_UNAVAILABLE,
+            ))
+        })
+    }
+
+    fn detach(&self, req: &DetachRequest) -> Result<DetachResponse, TraitError> {
+        self.timed("net.detach", || self.detach_impl(req))
+    }
+
+    fn delete_network(
+        &self,
+        req: &DeleteNetworkRequest,
+    ) -> Result<DeleteNetworkResponse, TraitError> {
+        self.timed("net.delete_network", || self.delete_network_impl(req))
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub use linux::{LinuxNetsetup, NETSETUP_REQUEST_TIMEOUT};
 
@@ -493,8 +545,10 @@ pub use linux::{LinuxNetsetup, NETSETUP_REQUEST_TIMEOUT};
 mod linux {
     use std::os::unix::fs::DirBuilderExt as _;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use fandhe_container_net::instrument::{NetOpRecorder, NoopNetOpRecorder};
     use fandhe_container_net::netlink_route::NetlinkRouteSocket;
     use fandhe_container_net::netns::ContainerNetns;
     use fandhe_container_net::network::{
@@ -523,15 +577,39 @@ mod linux {
 
     /// net の統合 API を呼ぶバックエンド。ソケットは呼び出しごとに開く（起動時に `CAP_NET_ADMIN` が
     /// 無くても `production()` を失敗させないため）。
-    #[derive(Debug, Clone)]
+    #[derive(Clone)]
     pub struct LinuxNetsetup {
         netns_dir: PathBuf,
+        /// netlink / nftables ソケットの計測先（REPAIR-4）。
+        recorder: Arc<dyn NetOpRecorder>,
+    }
+
+    impl std::fmt::Debug for LinuxNetsetup {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("LinuxNetsetup").finish_non_exhaustive()
+        }
     }
 
     impl LinuxNetsetup {
         /// netns の pin の置き場（絶対パス。状態ルート配下の固定の場所）を指定して作る。
         pub fn new(netns_dir: PathBuf) -> Self {
-            Self { netns_dir }
+            Self::with_recorder(netns_dir, Arc::new(NoopNetOpRecorder))
+        }
+
+        /// 置き場と、ソケットの計測先を指定して作る（REPAIR-4）。
+        pub fn with_recorder(netns_dir: PathBuf, recorder: Arc<dyn NetOpRecorder>) -> Self {
+            Self {
+                netns_dir,
+                recorder,
+            }
+        }
+
+        fn open_sockets(&self) -> Result<(NetlinkRouteSocket, NetlinkNetfilterSocket), TraitError> {
+            let route = NetlinkRouteSocket::open_with_recorder(Arc::clone(&self.recorder))
+                .map_err(|e| net_error_to_trait(&e))?;
+            let nft = NetlinkNetfilterSocket::open_with_recorder(Arc::clone(&self.recorder))
+                .map_err(|e| net_error_to_trait(&e))?;
+            Ok((route, nft))
         }
 
         fn ensure_netns_dir(&self) -> Result<(), TraitError> {
@@ -545,12 +623,6 @@ mod linux {
         }
     }
 
-    fn open_sockets() -> Result<(NetlinkRouteSocket, NetlinkNetfilterSocket), TraitError> {
-        let route = NetlinkRouteSocket::open().map_err(|e| net_error_to_trait(&e))?;
-        let nft = NetlinkNetfilterSocket::open().map_err(|e| net_error_to_trait(&e))?;
-        Ok((route, nft))
-    }
-
     impl NetsetupBackend for LinuxNetsetup {
         type Network = LinuxNetwork;
         type Container = AttachedContainer<ContainerNetns>;
@@ -562,7 +634,7 @@ mod linux {
         ) -> Result<Self::Network, TraitError> {
             let spec = NetworkCreateSpec::new(name.clone(), gateway)
                 .map_err(|e| net_error_to_trait(&e))?;
-            let (route, nft) = open_sockets()?;
+            let (route, nft) = self.open_sockets()?;
             let created =
                 create_network(&route, &nft, &spec, NETSETUP_REQUEST_TIMEOUT).map_err(|e| {
                     with_leftover(net_error_to_trait(&e.error), e.rollback.leftover.len())
@@ -587,7 +659,7 @@ mod linux {
                 self.netns_dir.clone(),
             )
             .map_err(|e| net_error_to_trait(&e))?;
-            let (route, nft) = open_sockets()?;
+            let (route, nft) = self.open_sockets()?;
             let attached = attach_container(
                 &route,
                 &nft,
@@ -608,7 +680,7 @@ mod linux {
             network: &mut Self::Network,
             containers: Vec<Self::Container>,
         ) -> Result<(), DeleteFailure<Self::Container>> {
-            let (route, nft) = match open_sockets() {
+            let (route, nft) = match self.open_sockets() {
                 Ok(s) => s,
                 Err(error) => {
                     return Err(DeleteFailure {
@@ -708,10 +780,16 @@ mod tests {
             derive_netns_name(&id).expect("name").as_str(),
             "netns-web-1-a"
         );
-        let long = ContainerId::new("a".repeat(59)).expect("id");
+        // 58 文字までは前置し、超える ID（64 桁 hex を含む）は前置せずに通す。
+        let edge = ContainerId::new("a".repeat(58)).expect("id");
         assert_eq!(
-            derive_netns_name(&long).expect_err("long").code(),
-            ErrorCode::InvalidArgument
+            derive_netns_name(&edge).expect("edge").as_str(),
+            format!("netns-{}", "a".repeat(58))
+        );
+        let hex = ContainerId::new("a1".repeat(32)).expect("id");
+        assert_eq!(
+            derive_netns_name(&hex).expect("hex").as_str(),
+            "a1".repeat(32)
         );
     }
 }

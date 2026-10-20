@@ -433,7 +433,7 @@ impl AuditFileWriter {
     }
 
     /// テスト用: 検査なしで `File` と確認用の親ディレクトリを包む。
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn from_file_unchecked_in(file: File, dir: std::path::PathBuf) -> Self {
         Self {
             file,
@@ -875,9 +875,19 @@ mod tests {
         assert_eq!(e.kind(), AuditWriteErrorKind::Lock);
         drop(other);
         // 並行する他の試験の fork が fd の複製を持つ間は解放されないため、解放後は長めに待つ。
-        writer
-            .probe_append_with(&queue, Duration::from_secs(5))
-            .unwrap();
+        let released = writer.probe_append_with(&queue, Duration::from_secs(5));
+        #[cfg(target_os = "linux")]
+        {
+            released.unwrap();
+        }
+        // Linux 以外では確認用の一時ファイル書き込みを実装しておらず、fail-closed で `Unsupported` を返す。
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(
+                released.unwrap_err().kind(),
+                AuditWriteErrorKind::Unsupported
+            );
+        }
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
         drop(file);
         let _ = std::fs::remove_dir_all(&dir);

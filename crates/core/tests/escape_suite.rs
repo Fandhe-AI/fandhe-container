@@ -694,6 +694,9 @@ struct ScenarioMeta {
     outcome: Option<AttackOutcome>,
     /// 攻撃した子の（シナリオから見た）pid。子を作らないケース（start の拒否）は `None`。
     child_pid: Option<u32>,
+    /// 攻撃した子自身の PID namespace での pid（`/proc/<child_pid>/status` の `NSpid` の末尾）。seccomp 層の
+    /// 記録の `pid` はこの値になる（本番の supervisor の変換と同じ。SEC-4）。カーネル監査はホストの `child_pid` で照合する。
+    pid_in_ns: Option<u32>,
     /// ケース開始の UNIX 秒（カーネル監査の時刻の下限）。
     started_at: u64,
 }
@@ -713,8 +716,11 @@ impl ScenarioMeta {
         let pid = self
             .child_pid
             .map_or_else(|| "none".to_string(), |p| p.to_string());
+        let inner = self
+            .pid_in_ns
+            .map_or_else(|| "none".to_string(), |p| p.to_string());
         format!(
-            "{META_PREFIX} exit={exit} outcome={outcome} child_pid={pid} started_at={}",
+            "{META_PREFIX} exit={exit} outcome={outcome} child_pid={pid} pid_in_ns={inner} started_at={}",
             self.started_at
         )
     }
@@ -729,7 +735,8 @@ impl ScenarioMeta {
         if found.next().is_some() {
             return Err("more than one meta line".to_string());
         }
-        let (mut exit, mut outcome, mut pid, mut started) = (None, None, None, None);
+        let (mut exit, mut outcome, mut pid, mut inner, mut started) =
+            (None, None, None, None, None);
         for field in line.split(' ').skip(1) {
             let (key, value) = field
                 .split_once('=')
@@ -772,6 +779,20 @@ impl ScenarioMeta {
                         return Err(dup("child_pid"));
                     }
                 }
+                "pid_in_ns" => {
+                    let parsed = if value == "none" {
+                        None
+                    } else {
+                        Some(
+                            value
+                                .parse::<u32>()
+                                .map_err(|_| "invalid pid_in_ns".to_string())?,
+                        )
+                    };
+                    if inner.replace(parsed).is_some() {
+                        return Err(dup("pid_in_ns"));
+                    }
+                }
                 "started_at" => {
                     let parsed = value
                         .parse::<u64>()
@@ -787,6 +808,7 @@ impl ScenarioMeta {
             exit: exit.ok_or("missing exit")?,
             outcome: outcome.ok_or("missing outcome")?,
             child_pid: pid.ok_or("missing child_pid")?,
+            pid_in_ns: inner.ok_or("missing pid_in_ns")?,
             started_at: started.ok_or("missing started_at")?,
         })
     }
@@ -1177,11 +1199,12 @@ fn sec4_2028_meta_selftest() {
         exit: ObservedExit::Signaled(31),
         outcome: None,
         child_pid: Some(4242),
+        pid_in_ns: Some(1),
         started_at: 1_700_000_000,
     };
     assert_eq!(
         meta.render(),
-        "escape_suite-meta exit=signaled:31 outcome=none child_pid=4242 started_at=1700000000"
+        "escape_suite-meta exit=signaled:31 outcome=none child_pid=4242 pid_in_ns=1 started_at=1700000000"
     );
     let stdout = format!("noise\n{}\nmore\n", meta.render());
     assert_eq!(ScenarioMeta::parse_from_stdout(&stdout), Ok(meta));
@@ -1189,6 +1212,7 @@ fn sec4_2028_meta_selftest() {
         exit: ObservedExit::Exited(0),
         outcome: Some(AttackOutcome::Errno(1)),
         child_pid: None,
+        pid_in_ns: None,
         started_at: 5,
     };
     assert_eq!(
@@ -1206,11 +1230,12 @@ fn sec4_2028_meta_selftest() {
         Err("more than one meta line".to_string())
     );
     for bad in [
-        "escape_suite-meta exit=exited:0 outcome=ok child_pid=none",
-        "escape_suite-meta exit=exited:0 outcome=ok child_pid=none started_at=1 extra=1",
-        "escape_suite-meta exit=exited:0 exit=exited:0 outcome=ok child_pid=none started_at=1",
-        "escape_suite-meta exit=gone:0 outcome=ok child_pid=none started_at=1",
-        "escape_suite-meta exit=exited:0 outcome=bogus child_pid=none started_at=1",
+        "escape_suite-meta exit=exited:0 outcome=ok child_pid=none pid_in_ns=none",
+        "escape_suite-meta exit=exited:0 outcome=ok child_pid=none started_at=1",
+        "escape_suite-meta exit=exited:0 outcome=ok child_pid=none pid_in_ns=none started_at=1 extra=1",
+        "escape_suite-meta exit=exited:0 exit=exited:0 outcome=ok child_pid=none pid_in_ns=none started_at=1",
+        "escape_suite-meta exit=gone:0 outcome=ok child_pid=none pid_in_ns=none started_at=1",
+        "escape_suite-meta exit=exited:0 outcome=bogus child_pid=none pid_in_ns=none started_at=1",
         "escape_suite-meta exit=exited:0 outcome=ok child_pid=-1 started_at=1",
     ] {
         assert!(
@@ -2996,7 +3021,7 @@ mod linux {
         match source {
             AuditSource::StateRootLog { .. } => Ok(AuditEvidence::StateRootLog {
                 lines: collect_state_root_log(state_root)?,
-                subject_pid: meta.child_pid.map(u64::from),
+                subject_pid: meta.pid_in_ns.map(u64::from),
             }),
             AuditSource::KernelAudit { blockers } => {
                 let Some(start) = kernel_start else {
@@ -3241,6 +3266,24 @@ mod linux {
         println!("{}", meta.render());
     }
 
+    /// `/proc/<pid>/status` の `NSpid` の末尾（対象自身の PID namespace での pid）を返す。本番の supervisor の変換
+    /// （`seccomp_notify::parse_nspid_innermost`）と同じ規則で、行が無い・0・壊れた値は `None`（記録しない）。
+    /// `seccomp_notif.pid` は listener の PID namespace の値で、無変換では記録に渡せない（`SeccompDenialReport::from_user_notif`）。
+    fn pid_in_own_ns(pid_in_listener_ns: u32) -> Option<u32> {
+        let status = std::fs::read(format!("/proc/{pid_in_listener_ns}/status")).ok()?;
+        let line = status
+            .split(|b| *b == b'\n')
+            .find_map(|l| l.strip_prefix(b"NSpid:".as_slice()))?;
+        let last = line
+            .split(|b| b.is_ascii_whitespace())
+            .rfind(|t| !t.is_empty())?;
+        std::str::from_utf8(last)
+            .ok()?
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n > 0)
+    }
+
     /// 応答者（ESC-03）: seccomp の listener の通知を受けて、`record_seccomp_denial_for` → 本番の sink で記録し、
     /// `-EPERM` で応答する。試験側の応答ループで、supervisor の `SeccompNotifyHub` そのものではない（core の公開 API
     /// だけで組む）。記録の成否にかかわらず応答は必ず返し、許可（`CONTINUE`）には覆さない。
@@ -3268,8 +3311,9 @@ mod linux {
             let id = notification.id();
             // 対象がまだ応答待ちであることを確かめてから記録する（pid の再利用で別プロセスを記録しない）。
             if listener.is_pending(id).unwrap_or(false)
+                && let Some(pid_in_process_ns) = pid_in_own_ns(notification.pid_in_listener_ns())
                 && let Ok(report) = SeccompDenialReport::from_user_notif(
-                    notification.pid_in_listener_ns(),
+                    pid_in_process_ns,
                     notification.nr(),
                     notification.arch(),
                 )
@@ -3372,6 +3416,11 @@ mod linux {
             CaseBody::StartRejection => unreachable!("handled by start_rejection"),
         };
         let child_pid = child.pid();
+        // seccomp の記録の期待値: 子自身の PID namespace での pid。応答者が通知を読むまで子の最初の拒否は
+        // 保留されるが、念のため応答者の起動前（ここ）に外側から独立に読む。listener を使わないケースは不要。
+        let pid_in_ns = (case.body == CaseBody::ProbeWithSeccompListener)
+            .then(|| pid_in_own_ns(child_pid))
+            .flatten();
         // パイプ容量を超える記録でも子が write で詰まらないよう、子の待機と並行して別スレッドで読む（REPAIR-5）。
         // fork は単一スレッド必須（`fork_single_threaded` が Threads: 1 を要求）のため、読み取りスレッドは fork の後に起動する。
         let (tx, rx) = std::sync::mpsc::channel();
@@ -3419,6 +3468,7 @@ mod linux {
             exit,
             outcome: record.outcome,
             child_pid: Some(child_pid),
+            pid_in_ns,
             started_at,
         }
     }
@@ -3549,6 +3599,7 @@ mod linux {
             exit: ObservedExit::Exited(0),
             outcome: Some(outcome),
             child_pid: None,
+            pid_in_ns: None,
             started_at,
         }
     }

@@ -12,7 +12,7 @@
 //! | netsetup | メソッド | net の API |
 //! | -------- | -------- | ---------- |
 //! | `net-create` | `create_network` | `network::create_network` と `StaticIpam::for_network` |
-//! | `netns-create` | `create_netns` | 記録のみ（下記「netns の作成時点」） |
+//! | `netns-create` | `create_netns` | Linux バックエンドは `Unimplemented`（下記「netns の作成時点」） |
 //! | `veth-attach` | `attach` | `network::attach_container`（netns の作成と pin を含む） |
 //! | `publish-port` | `publish_port` | 未実装（`Unimplemented`） |
 //! | （なし） | `detach` | 未 attach の記録の取り消しのみ。attach 済みは `Unimplemented` |
@@ -24,15 +24,17 @@
 //! - 契約 7・8・12: 本モジュールのレジストリで判定する。`attach` は契約 12 を最初に判定し、続けて
 //!   ネットワーク未作成、netns 未登録（いずれも `NotFound`）、紐付けネットワーク不一致（`FailedPrecondition`）の順
 //! - 契約 9: `delete_network` は net が残りを続行する。失敗時は再試行用のハンドルをレジストリへ戻し、
-//!   ネットワークを削除中として印を残す（完了まで `create_netns`・`attach` は `FailedPrecondition`。再試行の `delete_network` は可）
+//!   ネットワークを削除中として印を残す（完了まで `create_netns`・`attach` は `FailedPrecondition`。再試行の `delete_network` は可）。
+//!   attach の巻き戻しで取り残した記録があっても、所有を確認できる資源の解放は続行し、取り残しの記録は保持して
+//!   最後に `Internal` を返す。取り残しのあるネットワークへの `create_netns`・`attach` は `FailedPrecondition`
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //!
 //! - netns の作成時点: トレイトの `create_netns` は「netns の作成（lo の up を含む）」だが、net の
 //!   `attach_container` は netns の作成と pin から veth・アドレス設定までを 1 回で行い、先に netns を作ると
-//!   同じ pin パスで `AlreadyExists` になる。そのため `create_netns` は契約 7・8 の検証と対応付けの記録だけを行い
-//!   syscall を呼ばない。netns の実体は `attach` で作る。`create_netns` 済みで未 attach のコンテナにカーネル資源は無い
-//!   （将来、作成済み netns への接続が net に入ったら `create_netns` で実体を作る）
+//!   同じ pin パスで `AlreadyExists` になる。そのため Linux バックエンド（`LinuxNetsetup`）の `create_netns` は
+//!   メモリ上の登録だけで成功を装わず `Unimplemented` を返す（実 netns の事前作成は net の API 分割の後続作業）。
+//!   バックエンドの `create_netns` が成功したときだけ契約 7・8 の記録を作る
 //! - `publish_port`: net はポート公開を attach 時の `ContainerAttachSpec::with_port_publishes` でしか受けず、
 //!   コンテナ単位の公開・解除が未実装のため `Unimplemented`（NET-4）
 //! - `detach`: net にコンテナ単体の切り離しが無いため、attach 済みは `Unimplemented`
@@ -76,6 +78,9 @@ pub const MSG_PUBLISH_PORT_UNAVAILABLE: &str =
 /// attach 済みコンテナの切り離しの未実装文言。
 pub const MSG_DETACH_UNAVAILABLE: &str =
     "detach of an attached container is not available yet: net has no per-container teardown";
+/// netns の事前作成の未実装文言（Linux バックエンド）。
+pub const MSG_NETNS_CREATE_UNAVAILABLE: &str =
+    "netns pre-creation is not available yet: net creates the netns inside attach";
 /// 静的アドレスの未実装文言。
 pub const MSG_STATIC_ADDRESS_UNAVAILABLE: &str =
     "static container addresses are not available yet: net allocates addresses at attach time";
@@ -215,6 +220,19 @@ pub trait NetsetupBackend: Send + Sync {
         gateway: IpPrefix,
     ) -> Result<Self::Network, TraitError>;
 
+    /// コンテナ専用の netns を（lo の up を含めて）作る。既定は何もしない成功（試験用 fake 向け）。
+    ///
+    /// net の `attach_container` は netns の作成と pin から veth の設定までを 1 回で行い、先に netns を作ると
+    /// 同じ pin パスで `AlreadyExists` になる。実体を作れないバックエンドは、成功を装わず `Unimplemented` を
+    /// 返すこと（契約 3・REPAIR-3。実 netns を先に作れるよう net の API を分割する作業は後続）。
+    fn create_netns(
+        &self,
+        _network: &mut Self::Network,
+        _endpoint: &EndpointId,
+    ) -> Result<(), TraitError> {
+        Ok(())
+    }
+
     /// コンテナを接続する。失敗時の巻き戻しは実装が行う（契約 6）。
     fn attach(
         &self,
@@ -246,6 +264,9 @@ struct ContainerEntry<C> {
 struct NetworkEntry<N> {
     /// 削除を始めたら立てる。完了（記録の除去）まで下ろさず、その間の新規登録・接続を拒否する（契約 9）。
     deleting: bool,
+    /// バックエンドでのネットワーク解放が完了した印。取り残しの記録だけが残って再試行されるとき、
+    /// 解放済みのネットワークへ二重に解放を要求しないために使う。
+    backend_deleted: bool,
     gateway: IpPrefix,
     handle: N,
 }
@@ -329,6 +350,16 @@ fn not_found_netns() -> TraitError {
     )
 }
 
+/// ネットワーク削除でほかの資源は解放したが、取り残しの記録が残るときの失敗（契約 9）。
+fn delete_incomplete(count: usize) -> TraitError {
+    TraitError::new(
+        ErrorCode::Internal,
+        format!(
+            "network resources were released except {count} container(s) with unreclaimed resources; manual reclaim required"
+        ),
+    )
+}
+
 /// attach の巻き戻しで取り残した資源が残っているコンテナへの操作の拒否（記録を消して成功を装わない）。
 fn unreclaimed() -> TraitError {
     TraitError::new(
@@ -374,6 +405,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             req.name().as_str().to_owned(),
             NetworkEntry {
                 deleting: false,
+                backend_deleted: false,
                 gateway,
                 handle,
             },
@@ -390,6 +422,10 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             None => return Err(not_found_network()),
             Some(n) if n.deleting => return Err(network_deleting()),
             Some(_) => {}
+        }
+        // 取り残しのあるネットワークへは資源を増やさない（回収できない資源が増え続けるのを防ぐ）。
+        if network_has_unreclaimed(&reg.containers, req.network().as_str()) {
+            return Err(unreclaimed());
         }
         if reg.containers.contains_key(req.container().as_str()) {
             return Err(TraitError::new(
@@ -408,6 +444,12 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 "container limit reached for the network",
             ));
         }
+        let handle = &mut reg
+            .networks
+            .get_mut(req.network().as_str())
+            .ok_or_else(not_found_network)?
+            .handle;
+        self.backend.create_netns(handle, &endpoint)?;
         reg.containers.insert(
             req.container().as_str().to_owned(),
             ContainerEntry {
@@ -448,6 +490,9 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             .ok_or_else(not_found_network)?;
         if network.deleting {
             return Err(network_deleting());
+        }
+        if network_has_unreclaimed(&reg.containers, req.network().as_str()) {
+            return Err(unreclaimed());
         }
         let container = reg
             .containers
@@ -518,13 +563,6 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let mut guard = self.lock()?;
         let reg = &mut *guard;
         let name = req.name().as_str();
-        if reg
-            .containers
-            .values()
-            .any(|c| c.network == name && c.unreclaimed)
-        {
-            return Err(unreclaimed());
-        }
         let network = reg.networks.get_mut(name).ok_or_else(not_found_network)?;
         // 以降は成功して記録ごと消えるまで、失敗しても deleting を保つ（部分削除済みのまま再利用させない）。
         network.deleting = true;
@@ -534,6 +572,12 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             .filter(|(_, c)| c.network == name)
             .map(|(id, _)| id.clone())
             .collect();
+        // 取り残しのあるコンテナはハンドルを持たず回収できないため、記録を保持したまま、
+        // 所有を確認できる残りの資源の解放は続行する（契約 9: 個々の失敗で残りを止めない）。
+        let unreclaimed_count = linked
+            .iter()
+            .filter(|id| reg.containers.get(*id).is_some_and(|c| c.unreclaimed))
+            .count();
         let mut handles = Vec::new();
         let mut attached_ids: Vec<String> = Vec::new();
         for id in &linked {
@@ -542,10 +586,21 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 attached_ids.push(id.clone());
             }
         }
-        match self.backend.delete_network(&mut network.handle, handles) {
+        let result = if network.backend_deleted {
+            Ok(())
+        } else {
+            self.backend.delete_network(&mut network.handle, handles)
+        };
+        match result {
             Ok(()) => {
+                network.backend_deleted = true;
                 for id in &linked {
-                    reg.containers.remove(id);
+                    if !reg.containers.get(id).is_some_and(|c| c.unreclaimed) {
+                        reg.containers.remove(id);
+                    }
+                }
+                if unreclaimed_count > 0 {
+                    return Err(delete_incomplete(unreclaimed_count));
                 }
                 reg.networks.remove(name);
                 Ok(DeleteNetworkResponse::new())
@@ -568,6 +623,13 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             }
         }
     }
+}
+
+/// ネットワークに、attach の巻き戻しで資源を取り残したコンテナがあるか。
+fn network_has_unreclaimed<C>(containers: &HashMap<String, ContainerEntry<C>>, name: &str) -> bool {
+    containers
+        .values()
+        .any(|c| c.network == name && c.unreclaimed)
 }
 
 impl<B: NetsetupBackend> NetworkPlugin for NetsetupNetwork<B> {
@@ -711,6 +773,19 @@ mod linux {
                 ipam,
                 ports: PortRegistry::new(),
             })
+        }
+
+        fn create_netns(
+            &self,
+            _network: &mut Self::Network,
+            _endpoint: &EndpointId,
+        ) -> Result<(), TraitError> {
+            // net の attach_container が netns の作成と pin を含み、先に作ると AlreadyExists になる。
+            // メモリ上の登録だけで成功を装わない（契約 3・REPAIR-3）。
+            Err(TraitError::new(
+                ErrorCode::Unimplemented,
+                MSG_NETNS_CREATE_UNAVAILABLE,
+            ))
         }
 
         fn attach(

@@ -505,13 +505,53 @@ fn contract6_leftover_attach_keeps_record_and_blocks_cleanup() {
         .detach(&DetachRequest::new(nname("a"), cid("c1")))
         .expect_err("detach");
     assert_eq!(e.code(), ErrorCode::FailedPrecondition);
-    // 再 attach も、ネットワーク削除も拒否する（記録は残る）。
+    // 再 attach は拒否する（記録は残る）。
     assert_eq!(
         net.attach(&req).expect_err("reattach").code(),
         ErrorCode::FailedPrecondition
     );
+    // 取り残しのあるネットワークへは、ほかのコンテナの netns 登録も attach も拒否する（資源を増やさない）。
+    assert_eq!(
+        net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c2")))
+            .expect_err("netns")
+            .code(),
+        ErrorCode::FailedPrecondition
+    );
+}
+
+/// 契約 9: 取り残しのコンテナがあっても delete_network は所有確認できる資源の解放を続行し、
+/// 取り残しの記録を保持して Internal を返す。再試行はバックエンドを再度呼ばない。
+#[test]
+fn contract9_delete_continues_past_unreclaimed_container() {
+    let fake = Fake::default();
+    let net = NetsetupNetwork::new(fake.clone());
+    net.create_network(&CreateNetworkRequest::new(nname("a"), subnet()))
+        .expect("net");
+    for c in ["c1", "c2"] {
+        net.create_netns(&CreateNetnsRequest::new(nname("a"), cid(c)))
+            .expect("netns");
+    }
+    net.attach(&AttachRequest::new(nname("a"), cid("c1")))
+        .expect("attach c1");
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_attach = true;
+        s.attach_leftover = 1;
+    }
+    net.attach(&AttachRequest::new(nname("a"), cid("c2")))
+        .expect_err("attach c2 fails");
     let e = net
         .delete_network(&DeleteNetworkRequest::new(nname("a")))
         .expect_err("delete");
-    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(e.code(), ErrorCode::Internal);
+    assert_eq!(
+        fake.calls().last().map(String::as_str),
+        Some("delete_network a [c1]")
+    );
+    let before = fake.calls().len();
+    let e = net
+        .delete_network(&DeleteNetworkRequest::new(nname("a")))
+        .expect_err("retry");
+    assert_eq!(e.code(), ErrorCode::Internal);
+    assert_eq!(fake.calls().len(), before, "backend is not called twice");
 }

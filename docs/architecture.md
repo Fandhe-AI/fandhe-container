@@ -261,6 +261,7 @@ MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である�
 ## 設計ドラフト（採否未決）
 
 - Windows の実行構成（ゲスト内の core とホストの起動役。WIN-1・TASK-116 追補）: [windows-execution-layout.md](design/windows-execution-layout.md)（#1862。#1415・#1539 の決定部分以外はオーナー承認待ち）
+- Windows の `FileStateStore` の所有者 SID・保護 DACL の実装方式（OCI-5・SEC-4）: [windows-state-store-acl.md](design/windows-state-store-acl.md)（#2428。オーナー承認待ち）
 
 ## 見直し
 

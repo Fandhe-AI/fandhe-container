@@ -23,10 +23,10 @@
 //!
 //! - `start`・`kill`・`stop` は `Unimplemented`。本番 launcher は単一スレッドのプロセスを要求し
 //!   （CORE-1）、`ProcessSignaler` の本番実装は supervisor 側にあるため、tokio 上の CRI プロセスから
-//!   直接呼べない。結線は supervisor 起動の経路と #459 以降
+//!   直接呼べない。結線は supervisor 起動の経路（#2434）
 //! - `delete` は cgroup の配置を持つ記録では fail-closed（`UnavailableCgroupRemover`）で、記録を残す
 //! - [`UnimplementedBundleProvider`]: 本番の bundle 供給（image 展開と ContainerConfig → config.json 変換）は
-//!   未実装
+//!   未実装（#2433）
 //! - 状態ルートは既定（`StateRoot::resolve(None)`）に固定し、外部入力から受けない
 
 use std::fmt;

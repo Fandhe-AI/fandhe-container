@@ -45,6 +45,9 @@ use crate::state::SupervisedState;
 /// 停止要求を確かめる待ちの刻み（`restart` のバックオフ待ちと同じ方式）。
 const SLEEP_SLICE: Duration = Duration::from_millis(50);
 
+/// 開始時の `Starting` 記録を試みる最大回数（REPAIR-5。使い切ったら `Halted` で返す）。
+const START_ATTEMPTS: u32 = 3;
+
 /// 周期実行の時刻源と、停止要求で打ち切れる待ち（テストで偽の時計に差し替える）。
 pub trait HealthcheckClock: Send + Sync {
     /// 現在時刻。
@@ -183,8 +186,25 @@ pub fn run_periodic(
 ) -> HealthcheckLoopOutcome {
     let start = clock.now();
     let mut agg = HealthAggregator::from_schedule(schedule);
-    // 開始時に `Starting` へ戻す。失敗しても止めず、最初の tick の判定（所有の確認を含む）に任せる。
-    let _ = record_starting(state, process, runner, obs);
+    // 開始時に `Starting` へ戻す。成功するまで集約へ進まない（失敗を無視すると前の process の `Healthy` が
+    // 残り、depends_on の healthy 条件を誤って満たす。SUP-4 の fail-closed）。有界に再試行し、使い切ったら
+    // 止めて失敗を返す。
+    let mut starting_err = None;
+    for _ in 0..START_ATTEMPTS {
+        if stop.is_stop_requested() {
+            return HealthcheckLoopOutcome::Stopped { ticks: 0 };
+        }
+        match record_starting(state, process, runner, obs) {
+            Ok(_) => {
+                starting_err = None;
+                break;
+            }
+            Err(e) => starting_err = Some(e),
+        }
+    }
+    if let Some(error) = starting_err {
+        return HealthcheckLoopOutcome::Halted { error, ticks: 0 };
+    }
     let mut ticks: u64 = 0;
     let Some(mut next) = start.checked_add(schedule.interval) else {
         return overflow(ticks);
@@ -399,13 +419,15 @@ mod tests {
         } else {
             ContainerStatus::running(id.clone(), NonZeroU32::new(7))
         };
+        // 常に競合するストアでは Starting を書けないため、Starting を初期値にして開始時の記録を不要にする。
+        let init_health = always_stale.then_some(HealthStatus::Starting);
         let rec = StateRecord::new(
             status,
             std::env::temp_dir().join("healthcheck-periodic-ut"),
             StateRevision::from_raw(1),
         )
         .unwrap()
-        .with_supervision(SupervisionState::new(owner, None, 0));
+        .with_supervision(SupervisionState::new(owner, init_health, 0));
         let store: Arc<dyn StateStore> = Arc::new(MemStore(
             Mutex::new(rec),
             std::sync::atomic::AtomicBool::new(always_stale),
@@ -543,7 +565,8 @@ mod tests {
         match out {
             HealthcheckLoopOutcome::Halted { error, ticks } => {
                 assert_eq!(error.code(), ErrorCode::FailedPrecondition);
-                assert_eq!(ticks, 1);
+                // 所有していないため開始時の Starting 記録で止まる（tick 0）。
+                assert_eq!(ticks, 0);
             }
             other => panic!("unexpected outcome: {other:?}"),
         }
@@ -612,6 +635,46 @@ mod tests {
         assert_eq!(out, HealthcheckLoopOutcome::Stopped { ticks: 0 });
         assert!(probe.starts.lock().unwrap().is_empty());
         assert_eq!(st.refresh().unwrap().health(), Some(HealthStatus::Starting));
+    }
+
+    /// SUP-4・TASK-161.3: Starting を書けない（常に競合）と、古い Healthy を残したまま集約へ進まず Halted(tick 0)。
+    #[test]
+    fn sup4_periodic_halts_when_starting_cannot_be_recorded() {
+        let clock = FakeClock::new(None);
+        let probe = Arc::new(TimedProbe {
+            clock: clock.clone(),
+            starts: Mutex::new(Vec::new()),
+            cost: Duration::ZERO,
+            result: ok_healthy,
+        });
+        // 初期値を Healthy に差し替えた（再起動前の値が残った）状態を作る。
+        let id = ContainerId::new("c1").unwrap();
+        let rec = StateRecord::new(
+            ContainerStatus::running(id.clone(), NonZeroU32::new(42)),
+            std::env::temp_dir().join("healthcheck-periodic-ut"),
+            StateRevision::from_raw(1),
+        )
+        .unwrap()
+        .with_supervision(SupervisionState::new(
+            Some(me()),
+            Some(HealthStatus::Healthy),
+            0,
+        ));
+        let store: Arc<dyn StateStore> = Arc::new(MemStore(
+            Mutex::new(rec),
+            std::sync::atomic::AtomicBool::new(true),
+        ));
+        let mut st = SupervisedState::attach(store, id).unwrap();
+        let (out, seen) = run(&schedule("10s", "5s"), &mut st, &clock, probe.clone(), 3);
+        match out {
+            HealthcheckLoopOutcome::Halted { error, ticks } => {
+                assert_eq!(error.code(), ErrorCode::FailedPrecondition);
+                assert_eq!(ticks, 0);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+        assert!(probe.starts.lock().unwrap().is_empty());
+        assert!(seen.is_empty());
     }
 
     /// SUP-4: timeout は 60s まで受理し、61s は構築時に InvalidArgument。

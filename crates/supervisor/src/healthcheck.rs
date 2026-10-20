@@ -7,9 +7,10 @@
 //!
 //! # 実装範囲の線引き（REPAIR-3）
 //! - 提供するもの: 時間文字列の解釈 [`parse_duration`]・定義の検証 [`HealthcheckDefinition::parse`]・
-//!   周期実行エンジン [`run_periodic`]（TASK-161.2・#495。意味論と未実装の範囲は `periodic` サブモジュールの doc）。
-//! - **未実装**: exec を呼ぶ判定の実装と `monitor` ループへの組み込み（#495 の残り・#492）、retries / start_period の
-//!   集約と `health` 遷移（#496）、TOML / compose からのデシリアライズ（`crates/stack`・`crates/compose-convert`。
+//!   周期実行エンジン [`run_periodic`]（TASK-161.2・#495。意味論と未実装の範囲は `periodic` サブモジュールの doc）・
+//!   retries / start_period の集約 [`HealthAggregator`] と `health` の反映（TASK-161.3・#496。遷移の規則は
+//!   `aggregate` サブモジュールの doc）。
+//! - **未実装**: exec を呼ぶ判定の実装と `monitor` ループへの組み込み（#495 の残り・#492）、TOML / compose からのデシリアライズ（`crates/stack`・`crates/compose-convert`。
 //!   STACK-1・STACK-3）。実行時の分離（seccomp / Landlock 再適用の fail-closed）は TASK-163（SUP-6）の責務。
 //! - 既知の食い違い: 定義の timeout 上限（[`MAX_TIMEOUT`] 1 時間）は `probe_and_record` の上限（60 秒）より大きく、
 //!   [`HealthcheckSchedule::from_definition`] が 60 秒超を拒否する。解消は別 issue。
@@ -22,6 +23,7 @@
 //! - 時間文字列は 10 進整数 + 単位（`ms`・`s`・`m`・`h`）の連結のみ。小数・`us` / `ns` は未対応。
 //! - エラーメッセージには不正だった項目名と理由のみを入れ、command の中身は出さない（秘密情報の漏えい防止）。
 
+mod aggregate;
 mod periodic;
 
 use std::num::NonZeroU32;
@@ -29,6 +31,7 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 
+pub use aggregate::HealthAggregator;
 #[cfg(target_os = "linux")]
 pub use periodic::health_from_exec_exit;
 pub use periodic::{

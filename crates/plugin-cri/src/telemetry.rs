@@ -53,6 +53,12 @@ impl PeerAuthObserver for SharedPeerAuthObserver {
 /// 書き出し待ちの行の上限（満杯なら捨てて件数へ集約する。REPAIR-5）。
 pub const SINK_CAPACITY: usize = 256;
 
+/// `bytes` を書いて flush する。どちらかの失敗を呼び出し側へ返す。
+fn write_flushed(w: &mut dyn Write, bytes: &[u8]) -> std::io::Result<()> {
+    w.write_all(bytes)?;
+    w.flush()
+}
+
 /// 出力先が止まってもランタイムを止めない有限容量の書き出し口。
 ///
 /// `main.rs` は current_thread ランタイムのため、stderr への同期書き込みを task 内で行うと、
@@ -78,16 +84,22 @@ impl LineSink {
             .name("cri-telemetry-writer".into())
             .spawn(move || {
                 while let Ok(line) = rx.recv() {
-                    let n = d.swap(0, Ordering::Relaxed);
+                    // 通知は書けた後にだけ件数を引く（書けなければ保持して次回に回す。SEC-4）。
+                    let n = d.load(Ordering::Relaxed);
                     if n > 0 {
                         let notice = format!(
                             "{{\"event\":\"telemetry_dropped\",\"outcome\":\"error\",\"count\":{n}}}\n"
                         );
-                        let _ = w.write_all(notice.as_bytes());
+                        if write_flushed(&mut w, notice.as_bytes()).is_ok() {
+                            d.fetch_sub(n, Ordering::Relaxed);
+                        }
                     }
-                    let _ = w.write_all(line.as_bytes());
-                    let _ = w.write_all(b"\n");
-                    let _ = w.flush();
+                    let mut bytes = line.into_bytes();
+                    bytes.push(b'\n');
+                    // 書き出しに失敗した行も欠落として件数へ加える（SEC-4）。
+                    if write_flushed(&mut w, &bytes).is_err() {
+                        d.fetch_add(1, Ordering::Relaxed);
+                    }
                     p.fetch_sub(1, Ordering::Relaxed);
                 }
             });
@@ -201,6 +213,61 @@ mod tests {
         assert_eq!(sink.dropped(), (20 - accepted) as u64);
         sink.wait_idle(Duration::from_millis(20));
         drop(gate);
+    }
+
+    /// 書き込み失敗は欠落件数へ加算され、復旧後の通知行で報告されて件数が 0 に戻る（SEC-4）。
+    #[test]
+    fn write_failure_is_counted_and_reported_after_recovery() {
+        #[derive(Clone)]
+        struct Flaky(Arc<Mutex<Vec<u8>>>, Arc<std::sync::atomic::AtomicBool>);
+        impl Write for Flaky {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                if self.1.load(Ordering::Relaxed) {
+                    return Err(std::io::Error::other("broken pipe"));
+                }
+                lock(&self.0).extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let failing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let sink = LineSink::spawn(Box::new(Flaky(out.clone(), failing.clone())), 8);
+        assert!(sink.submit("a".into()));
+        assert!(sink.submit("b".into()));
+        sink.wait_idle(Duration::from_secs(5));
+        assert_eq!(sink.dropped(), 2);
+        failing.store(false, Ordering::Relaxed);
+        assert!(sink.submit("c".into()));
+        sink.wait_idle(Duration::from_secs(5));
+        let text = String::from_utf8(lock(&out).clone()).unwrap();
+        assert!(text.contains("\"count\":2"), "{text}");
+        assert!(text.ends_with("c\n"), "{text}");
+        assert_eq!(sink.dropped(), 0);
+    }
+
+    /// 通知行の書き出しに失敗したら件数は保持される（SEC-4）。
+    #[test]
+    fn notice_failure_keeps_dropped_count() {
+        struct FailNotice;
+        impl Write for FailNotice {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                if String::from_utf8_lossy(b).contains("telemetry_dropped") {
+                    return Err(std::io::Error::other("full"));
+                }
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = LineSink::spawn(Box::new(FailNotice), 1);
+        sink.dropped.store(3, Ordering::Relaxed);
+        assert!(sink.submit("x".into()));
+        sink.wait_idle(Duration::from_secs(5));
+        assert_eq!(sink.dropped(), 3);
     }
 
     #[test]

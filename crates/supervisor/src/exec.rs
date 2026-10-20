@@ -221,6 +221,14 @@
 //!   同じく `/dev/null` へ固定し、cwd・ユーザーの指定も未対応（cwd はコンテナの rootfs の根。`config.json` の
 //!   `process.user.additionalGids` の解釈〔指定したグループの付与〕も launch・exec とも未実装で、補助グループは
 //!   常に空）
+//! - **コマンドの SIGSYS 終了の補助記録**（SEC-4・ESC-06・REPAIR-5・#2236）: コマンドが SIGSYS で終了した
+//!   （`ExecExit::Command(Signaled(31))`）と worker が回収して結果行で返したとき、親プロセスが層 `exit_signal` の
+//!   レコードを 1 件記録し、結果を [`AuditedOutcome::exit_audit`] で返す（`audit` とは別の欄。結果は覆らない）。
+//!   `target_pid` は結果行が運ぶコマンドの PID（[`ExecOutcome::command_pid`]。worker・親と同じ PID namespace の値）。
+//!   **補助** であり、`SECCOMP_RET_KILL_PROCESS` の正の記録（syscall・arch）はカーネルの `AUDIT_SECCOMP` が担い、
+//!   コマンド内の `kill(SIGSYS)` と区別できないため seccomp 由来とは断定しない。**未実装（REPAIR-3）**: コマンドの
+//!   子孫の SIGSYS 終了は worker の子ではないため worker も親も観測できず、記録しない
+//!   （`docs/design/audit-delivery.md` 9.1）
 //! - 違反記録（SEC-4）の監査ログへの保存のうち、CLI の exec コマンド・TASK-161 の healthcheck（#492・#495）から
 //!   [`run_command_with_pidfd`] へ [`default_audit_sink`] の sink を渡す配線（本番 launcher の構成〔#1314〕に従う）。本番の
 //!   `AuditSink` の実体（`FileAuditSink`）と生成の入口 [`default_audit_sink`] は実装済み（#1594）。層 `exec_target` と
@@ -250,10 +258,13 @@
 //! - 実機前提の通し試験 `tests/exec.rs` の実行結果の記録（root を要し、CI ではビルドのみで実行していない）
 
 use std::io::{BufRead as _, Read as _, Write as _};
+use std::num::NonZeroU32;
 use std::os::fd::{AsFd as _, BorrowedFd};
 use std::time::{Duration, Instant};
 
-use fandhe_container_core::audit_log::{AuditDelivery, AuditSink, AuditedRejection, FileAuditSink};
+use fandhe_container_core::audit_log::{
+    AuditDelivery, AuditSink, AuditedRejection, FileAuditSink, record_exit_signal,
+};
 use fandhe_container_core::exec::{
     ChildExit, ContainerEnv, DiagnosticDelivery, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EntrypointExecMode, ExecCgroupJoin,
@@ -642,6 +653,11 @@ pub struct ExecOutcome {
     /// 判定すること（healthcheck は `Command` の非 0 を不健全、`SetupFailed` を実行基盤側の失敗として扱える）。
     /// 分離違反による拒否（ランタイム自身のバイナリ・インタープリタ経由・`/dev/null` の差し替え）は理由を持つ。
     pub exit: ExecExit,
+    /// コマンドの子の PID。**worker（回収した側）の PID namespace の値**で、worker は `pid_for_children` だけを
+    /// コンテナの PID namespace へ移すため、exec の親プロセスと同じ PID namespace の値になる（`/proc/<pid>` で引ける）。
+    /// コマンドを起動していない（`SetupFailed`）ときは `None`。補助の `exit_signal` 監査の `target_pid` に使う
+    /// （SEC-4・ESC-06・#2236）。
+    pub command_pid: Option<NonZeroU32>,
     /// exec プロセスへ適用した rlimit の種別数（launch 時の記録。子へ持ち越した `RLIMIT_FSIZE` を除き通常は 15）。
     pub rlimits_applied: usize,
     /// 子へ持ち越した rlimit の種別数（`RLIMIT_FSIZE`。0 か 1。#1531）。exec の子が `execveat` の前に適用して読み戻し、
@@ -681,6 +697,15 @@ pub struct AuditedOutcome {
     /// 監査記録の結果。`SetupFailed` に違反の理由があれば 1 件記録して `Recorded` / `SinkFailed`、
     /// それ以外（コマンドが起動した・理由のない `SetupFailed`）は `NotApplicable`（記録 0 件）。
     pub audit: AuditDelivery,
+    /// コマンドが SIGSYS で終了したときの補助の `exit_signal` 監査（層 `exit_signal`）の結果（SEC-4・ESC-06・#2236）。
+    /// SIGSYS で終了した（`ExecExit::Command(Signaled(31))`）ときだけ 1 件記録して `Recorded` / `SinkFailed` /
+    /// `RecordUnavailable`、それ以外は `NotApplicable`（記録 0 件）。`audit`（`execve` 前の拒否の記録）とは別の欄で、
+    /// 意味の違う記録を 1 欄に混ぜない。
+    ///
+    /// 補助である: `SECCOMP_RET_KILL_PROCESS` で終了したコマンドは自分では記録を書けず、正の記録（syscall・arch）は
+    /// カーネルの `AUDIT_SECCOMP` が担う。コマンド内の `kill(SIGSYS)` と区別できないため seccomp 由来とは断定しない。
+    /// コマンドの子孫の SIGSYS 終了は worker から見えず、記録できない（`docs/design/audit-delivery.md` 9.1）。
+    pub exit_audit: AuditDelivery,
 }
 
 /// 準備から fork までの全体の期限（REPAIR-5）。各段の間で残りを確かめ、超過したら次の段へ進まず `Timeout`。
@@ -748,6 +773,9 @@ pub fn run_command(
     )
 }
 
+/// SIGSYS のシグナル番号。Linux の x86_64・aarch64 とも 31（core の launcher の回収点の記録と同じ値。#2236）。
+const SIGSYS: i32 = 31;
+
 /// worker の結果を受け、拒否なら 1 件記録して返す（親プロセス側の記録点。SEC-4・SUP-6・#1465・#1595）。
 ///
 /// - `Err` で worker の経路の違反の理由があれば 1 件記録する（core の `record_exec_worker_rejection`）。種別
@@ -758,6 +786,8 @@ pub fn run_command(
 ///   記録の成否で結果は変わらない（`AuditedOutcome::audit` に結果を載せる）
 /// - 1 つの拒否が写る層は 1 つだけ（`err` 行と `ok` 行の理由の一覧は交わらない。core の
 ///   `exec/violation_scan.rs` の単体テストが固定する）
+/// - コマンドが SIGSYS で終了したら、補助の `exit_signal` を 1 件記録して `AuditedOutcome::exit_audit` に結果を載せる
+///   （#2236。`audit` の欄とは別。結果は変えない）
 /// - 違反の理由を持たないもの（タイムアウト・システムエラー・前提不成立・コマンドの終了）は記録せず `NotApplicable`
 /// - `container` は記録の `container_id` に載せる検証済みの ID（公開の入口は `record.id()` を渡す）。記録の `pid` は
 ///   この親プロセスのもので、worker・コンテナ内のコマンド・pid1 ではない。対象 pid1 の PID は未検証の候補しか
@@ -777,11 +807,25 @@ fn audit_worker_result(
                 Ok(AuditedOutcome {
                     outcome: rejected.error,
                     audit: rejected.delivery,
+                    exit_audit: AuditDelivery::NotApplicable,
+                })
+            }
+            ExecExit::Command(ChildExit::Signaled(SIGSYS)) => {
+                // 補助の記録。親（単一スレッドの exec 専用プロセス）で worker の回収後に 1 回だけ出す。
+                let exit_audit = match outcome.command_pid {
+                    Some(pid) => record_exit_signal(SIGSYS, pid.get(), container, audit),
+                    None => AuditDelivery::NotApplicable,
+                };
+                Ok(AuditedOutcome {
+                    outcome,
+                    audit: AuditDelivery::NotApplicable,
+                    exit_audit,
                 })
             }
             _ => Ok(AuditedOutcome {
                 outcome,
                 audit: AuditDelivery::NotApplicable,
+                exit_audit: AuditDelivery::NotApplicable,
             }),
         },
         Err(failure) => Err(match failure.violation {
@@ -1275,7 +1319,8 @@ pub fn pin_exec_bundle_with_swap_for_test(
 
 /// worker の結果を pipe 用の 1 行へ符号化する。成功は `ok <command|setup> <違反の理由コードまたは -> <exited|signaled>
 /// <値> <適用した rlimit 数> <子へ持ち越した rlimit 数（0 か 1）> <capability 数> <Landlock 数> <seccomp 命令数>
-/// <補助グループの扱い> <その件数> <実行方式（sealed_copy|pinned_inode）> <現行方式の理由コードまたは ->`、失敗は
+/// <補助グループの扱い> <その件数> <実行方式（sealed_copy|pinned_inode）> <現行方式の理由コードまたは -> <コマンドの
+/// 子の PID（10 進。起動していなければ -）>`、失敗は
 /// `err <ERR-1 コード> <worker の経路の違反の 種別/理由コード または -> <メッセージ>`（改行は空白へ置換。違反の欄は
 /// `exec_target/exec_target_not_nested_pid1`・`rootfs_pivot/rootfs_is_host_root` の形）。
 fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
@@ -1298,7 +1343,7 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
                 other => other.remaining(),
             };
             format!(
-                "ok {started} {violation} {kind} {value} {} {} {} {} {} {} {groups} {} {}\n",
+                "ok {started} {violation} {kind} {value} {} {} {} {} {} {} {groups} {} {} {}\n",
                 o.rlimits_applied,
                 o.rlimits_deferred,
                 o.capability_bounding_dropped,
@@ -1309,6 +1354,8 @@ fn encode_worker_result(result: &Result<ExecOutcome, TraitError>) -> Vec<u8> {
                 o.entrypoint_mode
                     .fallback_reason()
                     .map_or("-", SealedCopyUnavailable::as_str),
+                o.command_pid
+                    .map_or_else(|| "-".to_owned(), |p| p.get().to_string()),
             )
         }
         Err(e) => {
@@ -1447,11 +1494,22 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
     let mode = it.next().ok_or_else(malformed)?;
     let reason = it.next().ok_or_else(malformed)?;
     let entrypoint_mode = EntrypointExecMode::from_tokens(mode, reason).ok_or_else(malformed)?;
-    if it.next().is_some() {
+    // 10 進の正の数だけ受ける（0・負・非数値・先頭の `+` は壊れた行。`-` は起動していない）。起動したコマンドには必須で、
+    // 起動していない（`setup`）のに値があるのも壊れた行とする（fail-closed。記録に使う値を捏造しない）。
+    let command_pid = match it.next().ok_or_else(malformed)? {
+        "-" => None,
+        v if v.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(v.parse::<NonZeroU32>().map_err(|_| malformed())?)
+        }
+        _ => return Err(malformed()),
+    };
+    if it.next().is_some() || matches!(exit, ExecExit::SetupFailed { .. }) && command_pid.is_some()
+    {
         return Err(malformed());
     }
     Ok(ExecOutcome {
         exit,
+        command_pid,
         rlimits_applied,
         rlimits_deferred,
         capability_bounding_dropped,
@@ -1536,6 +1594,8 @@ fn run_in_child_cgroup(
     let ready = require_exec_ready(report)?;
     deadline.remaining("starting the command")?;
     let child = spawn_exec_command(ready, &command, child_cgroup).map_err(from_exec_error)?;
+    // 回収する前に控える（worker の PID namespace の値。`SetupFailed` の判定は `exit` が持つ）。
+    let spawned_pid = NonZeroU32::new(child.pid());
     let exit = wait_or_stop(
         &deadline,
         |left| child.wait_timeout(left).map_err(from_exec_error),
@@ -1545,8 +1605,13 @@ fn run_in_child_cgroup(
             child.kill_and_reap(reap).map_err(from_exec_error)
         },
     )?;
+    let command_pid = match exit {
+        ExecExit::Command(_) => spawned_pid,
+        _ => None,
+    };
     Ok(ExecOutcome {
         exit,
+        command_pid,
         rlimits_applied,
         rlimits_deferred,
         capability_bounding_dropped,
@@ -1681,7 +1746,6 @@ mod tests {
     use fandhe_container_core::traits::{
         CgroupPlacement, CgroupScope, ContainerStatus, StateRevision,
     };
-    use std::num::NonZeroU32;
 
     fn record(status: ContainerStatus) -> StateRecord {
         StateRecord::new(
@@ -2325,6 +2389,7 @@ mod tests {
     fn sup6_task163_4_worker_result_round_trips() {
         let outcome = ExecOutcome {
             exit: ExecExit::Command(ChildExit::Signaled(15)),
+            command_pid: NonZeroU32::new(4321),
             rlimits_applied: 15,
             rlimits_deferred: 1,
             capability_bounding_dropped: 23,
@@ -2337,7 +2402,7 @@ mod tests {
         let line = encode_worker_result(&Ok(outcome));
         assert_eq!(
             line,
-            b"ok command - signaled 15 15 1 23 3 120 cleared 4 sealed_copy -\n"
+            b"ok command - signaled 15 15 1 23 3 120 cleared 4 sealed_copy - 4321\n"
         );
         assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         // 補助グループの扱いは 3 通りとも往復する（TASK-163 追補・#1457）。
@@ -2355,7 +2420,7 @@ mod tests {
             let line = encode_worker_result(&Ok(outcome));
             assert_eq!(
                 String::from_utf8(line.clone()).unwrap(),
-                format!("ok command - signaled 15 15 1 23 3 120 {text} sealed_copy -\n")
+                format!("ok command - signaled 15 15 1 23 3 120 {text} sealed_copy - 4321\n")
             );
             assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         }
@@ -2379,7 +2444,9 @@ mod tests {
             let line = encode_worker_result(&Ok(outcome));
             assert_eq!(
                 String::from_utf8(line.clone()).unwrap(),
-                format!("ok command - signaled 15 15 1 23 3 120 cleared 4 pinned_inode {code}\n")
+                format!(
+                    "ok command - signaled 15 15 1 23 3 120 cleared 4 pinned_inode {code} 4321\n"
+                )
             );
             assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         }
@@ -2462,11 +2529,20 @@ mod tests {
                 "setup - signaled 9",
             ),
         ] {
-            let outcome = ExecOutcome { exit, ..outcome };
+            // コマンドの PID は起動したコマンドにだけ載る（`SetupFailed` は `-`）。
+            let (command_pid, pid) = match exit {
+                ExecExit::Command(_) => (NonZeroU32::new(4321), "4321"),
+                _ => (None, "-"),
+            };
+            let outcome = ExecOutcome {
+                exit,
+                command_pid,
+                ..outcome
+            };
             let line = encode_worker_result(&Ok(outcome));
             assert_eq!(
                 String::from_utf8(line.clone()).unwrap(),
-                format!("ok {text} 15 1 23 3 120 cleared 4 sealed_copy -\n")
+                format!("ok {text} 15 1 23 3 120 cleared 4 sealed_copy - {pid}\n")
             );
             assert_eq!(decode_worker_result(&line).unwrap(), outcome);
         }
@@ -2489,7 +2565,7 @@ mod tests {
         // 対照: 持ち越した rlimit 数が 0・1 なら同じ欄の並びで復号できる（下の値域外の行は値だけで拒否される）。
         for deferred in [0usize, 1] {
             let line =
-                format!("ok command - exited 0 1 {deferred} 2 3 4 cleared 1 sealed_copy -\n");
+                format!("ok command - exited 0 1 {deferred} 2 3 4 cleared 1 sealed_copy - 7\n");
             let o = decode_worker_result(line.as_bytes()).expect("well-formed");
             assert_eq!((o.rlimits_applied, o.rlimits_deferred), (1, deferred));
         }
@@ -2507,20 +2583,28 @@ mod tests {
             b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy kernel_too_old\n",
             b"ok command - exited 0 1 0 2 3 4 cleared 1 pinned_inode -\n",
             b"ok command - exited 0 1 0 2 3 4 cleared 1 pinned_inode lsm_mystery\n",
-            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - extra\n",
+            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7 extra\n",
+            // コマンドの PID の欄（#2236）: 欠落・0・負・非数値・符号つき・`u32` 超過・起動していないのに値がある。
+            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 0\n",
+            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - -5\n",
+            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - +5\n",
+            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - abc\n",
+            b"ok command - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 4294967296\n",
+            b"ok setup - exited 126 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
             // 持ち越した rlimit 数の値域外（契約は 0 か 1。欄はすべて揃っている）。
-            b"ok command - exited 0 1 2 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok command - exited 0 1 2 2 3 4 cleared 1 sealed_copy - 7\n",
             // 持ち越した rlimit 数の欄が無い旧形式（#1579 以前の行。値域の検査で拒否される）。
-            b"ok command - exited 0 1 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok command - exited 0 1 2 3 4 cleared 1 sealed_copy - 7\n",
             // 旧形式（起動の別が無い）・未知の起動の別・コマンドの終了に違反が付く・子が返さない理由コード。
-            b"ok exited 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
-            b"ok started - exited 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
-            b"ok command entrypoint_is_runtime_binary exited 0 1 0 2 3 4 cleared 1 sealed_copy -\n",
-            b"ok setup rootfs_is_host_root exited 126 1 0 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
+            b"ok started - exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
+            b"ok command entrypoint_is_runtime_binary exited 0 1 0 2 3 4 cleared 1 sealed_copy - 7\n",
+            b"ok setup rootfs_is_host_root exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
             // launch だけで生じる `target_moved`・exec 対象の理由は ok 行の違反に載らない（許可リスト外。記録しない。#1595）。
-            b"ok setup target_moved exited 126 1 0 2 3 4 cleared 1 sealed_copy -\n",
-            b"ok setup exec_target_cgroup_mismatch exited 126 1 0 2 3 4 cleared 1 sealed_copy -\n",
-            b"ok setup bogus exited 126 1 0 2 3 4 cleared 1 sealed_copy -\n",
+            b"ok setup target_moved exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok setup exec_target_cgroup_mismatch exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
+            b"ok setup bogus exited 126 1 0 2 3 4 cleared 1 sealed_copy - -\n",
             b"hello\n",
             // 失敗行: 理由の欄が無い旧形式・未知の理由・種別の無い旧形式の理由・worker の経路で生じない理由・
             // 種別の食い違い（どれも記録せず `Internal`。#1614 の事後監査）。
@@ -2769,6 +2853,7 @@ mod tests {
                 exit: ChildExit::Exited(126),
                 violation,
             },
+            command_pid: None,
             rlimits_applied: 15,
             rlimits_deferred: 1,
             capability_bounding_dropped: 23,
@@ -2820,6 +2905,65 @@ mod tests {
             assert_eq!(got.audit, AuditDelivery::NotApplicable);
             assert_eq!(sink.snapshot().len(), 0);
         }
+    }
+
+    /// SEC-4・ESC-06・#2236: コマンドが SIGSYS で終了したら、補助の `exit_signal` を 1 件（signal 31・target_pid・
+    /// コンテナ ID・syscall と arch なし・記録は自 PID）記録し、結果は不変。`audit` の欄は `NotApplicable` のまま。
+    /// SIGSYS 以外（SIGKILL・通常終了・`SetupFailed`）は 0 件。sink の失敗でも結果は変わらず `SinkFailed`。
+    #[test]
+    fn sec4_2236_parent_records_exit_signal_only_for_sigsys() {
+        let sigsys = ExecOutcome {
+            exit: ExecExit::Command(ChildExit::Signaled(31)),
+            command_pid: NonZeroU32::new(4321),
+            ..setup_failed(None)
+        };
+        let sink = RecordingSink::new(false);
+        let got = audit_worker_result(Ok(sigsys), Some(&cid()), &sink).unwrap();
+        assert_eq!(got.outcome, sigsys);
+        assert_eq!(got.audit, AuditDelivery::NotApplicable);
+        assert_eq!(got.exit_audit, AuditDelivery::Recorded);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].layer(), AuditLayer::ExitSignal);
+        assert_eq!(recs[0].exit_signal().map(|s| s.get()), Some(31));
+        assert_eq!(recs[0].target_pid().map(|p| p.get()), Some(4321));
+        assert_eq!(recs[0].syscall(), None);
+        assert_eq!(recs[0].seccomp_arch(), None);
+        assert_eq!(recs[0].pid().get(), std::process::id());
+        assert_eq!(recs[0].container_id().map(|c| c.as_str()), Some("c1"));
+
+        let failing = RecordingSink::new(true);
+        let got = audit_worker_result(Ok(sigsys), Some(&cid()), &failing).unwrap();
+        assert_eq!(got.outcome, sigsys);
+        assert_eq!(
+            got.exit_audit,
+            AuditDelivery::SinkFailed(TraitError::new(ErrorCode::Internal, "sink failed"))
+        );
+
+        for exit in [
+            ExecExit::Command(ChildExit::Signaled(9)),
+            ExecExit::Command(ChildExit::Exited(0)),
+            ExecExit::Command(ChildExit::Exited(31)),
+            ExecExit::SetupFailed {
+                exit: ChildExit::Signaled(31),
+                violation: None,
+            },
+        ] {
+            let outcome = ExecOutcome { exit, ..sigsys };
+            let sink = RecordingSink::new(false);
+            let got = audit_worker_result(Ok(outcome), Some(&cid()), &sink).unwrap();
+            assert_eq!(got.exit_audit, AuditDelivery::NotApplicable, "{exit:?}");
+            assert_eq!(sink.snapshot().len(), 0, "{exit:?}");
+        }
+        // PID が無いと対象を示せないため記録しない（捏造しない）。
+        let no_pid = ExecOutcome {
+            command_pid: None,
+            ..sigsys
+        };
+        let sink = RecordingSink::new(false);
+        let got = audit_worker_result(Ok(no_pid), Some(&cid()), &sink).unwrap();
+        assert_eq!(got.exit_audit, AuditDelivery::NotApplicable);
+        assert_eq!(sink.snapshot().len(), 0);
     }
 
     /// 祖先に symlink を含まない使い捨ての bundle ディレクトリ（rootfs の固定は symlink を辿らない）。

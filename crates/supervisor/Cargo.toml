@@ -3,6 +3,7 @@
 # version は未指定（Cargo の既定で 0.0.0）。公開方針は未決定のため publish = false を明記する。
 # #2070 で bin の入口の継承 fd の整理を追加した（依存は不変）。
 # TASK-171.2（#537）でランチャーの入口にセッション切り離し（setsid・pty 非経由の検証）を追加した（依存は不変）。
+# TASK-171.3（#538）で sudo（pty の保持者）を SIGKILL しても切り離した子孫が動き続ける結合試験 tests/privilege.rs を追加した（依存は不変）。
 # TASK-163 追補（#1594）で exec の本番用 AuditSink の構築入口 default_audit_sink を追加した（依存は不変）。
 # TASK-163 追補（#1698）で exec の entrypoint_mode のログを core の待たない出力経路へ載せ替えた（依存は不変）。
 # TASK-164 追補（#1469）でロックファイルの掃除経路（remove_all・open 失敗時の削除）を追加した（依存は不変）。
@@ -190,4 +191,12 @@ harness = false
 [[test]]
 name = "seccomp_notify_audit"
 path = "tests/seccomp_notify_audit.rs"
+harness = false
+
+# sudo（pty の保持者）の SIGKILL で切り離した子孫が巻き添えにならないことの結合試験（SUP-14・TASK-171.3・#538）。
+# setsid がプロセス全体に効くため、切り離す役は同じ実行ファイルの自己再実行で別プロセスにする独自 main（harness = false）で動かす。
+# root 不要で util-linux の script を使い、既定のテスト集合で実行する（依存は不変）。
+[[test]]
+name = "privilege"
+path = "tests/privilege.rs"
 harness = false

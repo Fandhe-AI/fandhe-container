@@ -214,7 +214,7 @@ fn guest_exec(mode: &str, cmd: &[&str]) -> ExitCode {
                 _ => ExitCode::from(203),
             }
         }
-        ["sh", "-c", script, "sh", owner] if script.contains("head -c 512") => {
+        ["sh", "-c", script, "sh", owner] if script.contains("fchk()") => {
             if mode == "mount_recover_slow" {
                 std::thread::sleep(SLOW_STEP);
             }

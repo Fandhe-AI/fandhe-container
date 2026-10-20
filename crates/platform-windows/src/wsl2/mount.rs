@@ -772,9 +772,15 @@ fn clear_argv(distro: &DistroName, nonce: &str) -> Vec<String> {
     exec_argv(distro, &["sh", "-c", CLEAR_SCRIPT, "sh", nonce])
 }
 
-/// [`CLEAR_SCRIPT`] を best-effort で 1 回実行する（失敗しても記録が残るだけで、マウントの安全性には影響しない）。
-fn clear_record(distro: &DistroName, nonce: &str, exec: Exec<'_>) {
-    let _ = exec(&clear_argv(distro, nonce), MAX_OUTPUT_BYTES);
+/// [`CLEAR_SCRIPT`] を 1 回実行し、削除を確認できたか（実行が成功終了したか）を返す。
+///
+/// 失敗してもマウントの安全性には影響しないが、記録が残ったまま「回収済み」と報告しないよう、
+/// 呼び出し側（[`rollback`]）は `false` を未完了として数える（期限切れは実行器の結果として呼び出し側に伝わる）。
+fn clear_record(distro: &DistroName, nonce: &str, exec: Exec<'_>) -> bool {
+    matches!(
+        exec(&clear_argv(distro, nonce), MAX_OUTPUT_BYTES),
+        Ok(out) if out.success
+    )
 }
 
 /// ゲスト内で「マウント先の最上位のマウント ID が記録値と一致するか確認 → umount → 記録の削除」を 1 つの `sh`
@@ -1247,7 +1253,7 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> Rollba
                 Pending::Gone => continue,
                 Pending::NotAttributed => {
                     // MOUNT_SCRIPT は終了済み（記録が確定）なので記録は消してよい。マウントは外さない。
-                    clear_record(distro, &o.nonce, exec);
+                    let _ = clear_record(distro, &o.nonce, exec);
                     out.unconfirmed += 1;
                     continue;
                 }
@@ -1279,9 +1285,9 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> Rollba
                         .is_some_and(|after| after.iter().all(|e| e.mount_id != id));
                 if !gone {
                     out.retry.push(o);
-                } else if !ok {
-                    // UMOUNT_SCRIPT が記録を消す前に終わったが、マウントは外れている。
-                    clear_record(distro, &o.nonce, exec);
+                } else if !ok && !clear_record(distro, &o.nonce, exec) {
+                    // UMOUNT_SCRIPT が記録を消す前に終わったが、マウントは外れている。記録を消せなければ未完了。
+                    out.retry.push(o);
                 }
             }
             _ => {
@@ -1290,8 +1296,10 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> Rollba
                 if still_mounted {
                     out.retry.push(o);
                 } else {
-                    // 既に外れている（解除済み）ので記録も消す。
-                    clear_record(distro, &o.nonce, exec);
+                    // 既に外れている（解除済み）ので記録も消す。消せなければ未完了として数える。
+                    if !clear_record(distro, &o.nonce, exec) {
+                        out.retry.push(o);
+                    }
                 }
             }
         }
@@ -1490,7 +1498,7 @@ fn mount_one(
             if evidence == Evidence::Missing {
                 // MOUNT_SCRIPT は終了済みで本呼び出しのマウントは無いので、記録と claim を消す
                 // （Fenced の claim は遅れて動き出す処理を止める柵なので残す）。
-                clear_record(distro, &nonce, pick_recovery(&mut recovery, &mut *exec));
+                let _ = clear_record(distro, &nonce, pick_recovery(&mut recovery, &mut *exec));
             }
             match failure {
                 None => Err(unconfirmed(not_identified())),
@@ -1920,8 +1928,8 @@ const LOOKUP_SCRIPT: &str = concat!(
     "n=$((n + 1)); [ \"$n\" -le 4096 ] || exit 215; ",
     "if ! fchk \"$f\"; then printf 'bad %s\\n' \"$b\"; continue; fi; ",
     "[ \"$(stat -c %s -- \"$f\")\" -lt 512 ] || { printf 'bad %s\\n' \"$b\"; continue; }; ",
-    "if { IFS= read -r a && IFS= read -r t && IFS= read -r o && ! IFS= read -r x ",
-    "&& [ -n \"$a\" ] && [ -n \"$t\" ] && [ -n \"$o\" ]; } < \"$f\" 2>/dev/null; then ",
+    "x=; if { IFS= read -r a && IFS= read -r t && IFS= read -r o && ! IFS= read -r x ",
+    "&& [ -z \"$x\" ] && [ -n \"$a\" ] && [ -n \"$t\" ] && [ -n \"$o\" ]; } < \"$f\" 2>/dev/null; then ",
     "if [ \"$o\" = \"$O\" ]; then printf 'rec %s %s %s\\n' \"$b\" \"$a\" \"$t\"; fi; ",
     "else printf 'bad %s\\n' \"$b\"; fi; ",
     "done; exit 0"
@@ -4612,6 +4620,45 @@ mod tests {
         assert!(LOOKUP_SCRIPT.contains("else printf 'bad %s\\n' \"$b\"; fi"));
     }
 
+    /// `sh -c script sh arg` を期限つきで実行して出力を返す（超過時は kill して回収し panic する。REPAIR-5）。
+    #[cfg(target_os = "linux")]
+    fn run_sh_with_deadline(script: &str, arg: &str, limit: Duration) -> std::process::Output {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("sh")
+            .args(["-c", script, "sh", arg])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let (mut o, mut e) = (Vec::new(), Vec::new());
+            let _ = stdout.read_to_end(&mut o);
+            let _ = stderr.read_to_end(&mut e);
+            (o, e)
+        });
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if start.elapsed() >= limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("sh did not finish before the deadline");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let (stdout, stderr) = reader.join().unwrap();
+        std::process::Output {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+
     /// #1412: 実際の `sh` で LOOKUP_SCRIPT の記録の選別を回す（所有者・root 検査だけを一時ディレクトリ向けに外す）。
     /// 所有者行の欠落・余分な行・空行・512 バイト以上は、所有者が別でも `bad`、正常な記録だけが `rec` になる。
     #[cfg(target_os = "linux")]
@@ -4631,6 +4678,8 @@ mod tests {
         fs::write(dir.join("ee5"), "none\n/mnt/fandhe/e\nother\n").unwrap();
         fs::write(dir.join("ff6"), "").unwrap();
         fs::write(dir.join("0a7"), "a".repeat(600)).unwrap();
+        // 改行なしの余分な末尾データ（4 回目の read は失敗するが x に残る）も形式違反。
+        fs::write(dir.join("9a8"), "100\n/mnt/fandhe/g\nweb\nextra").unwrap();
         for entry in fs::read_dir(&dir).unwrap() {
             let path = entry.unwrap().path();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
@@ -4642,10 +4691,8 @@ mod tests {
             .replace(from, &format!("R={};", dir.display()))
             .replace(skip, "")
             .replace("[ \"$1\" = 0 ] && ", "");
-        let out = std::process::Command::new("sh")
-            .args(["-c", &script, "sh", "web"])
-            .output()
-            .unwrap();
+        // 期限つきで実行する（ハング時は kill して回収する。REPAIR-5）。
+        let out = run_sh_with_deadline(&script, "web", Duration::from_secs(20));
         fs::remove_dir_all(&dir).unwrap();
         assert!(out.status.success(), "{out:?}");
         let mut lines: Vec<String> = String::from_utf8(out.stdout)
@@ -4658,6 +4705,7 @@ mod tests {
             lines,
             [
                 "bad 0a7",
+                "bad 9a8",
                 "bad bb2",
                 "bad cc3",
                 "bad dd4",

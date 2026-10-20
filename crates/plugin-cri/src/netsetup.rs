@@ -195,6 +195,23 @@ impl From<TraitError> for AttachFailure {
     }
 }
 
+/// [`NetsetupBackend::create_network`] の失敗。作成途中の取り残し・結果不明の資源の件数を握りつぶさず運ぶ
+/// （契約 6・特権操作の後始末。レジストリが回収待ちとして保持し、上限に数える）。
+#[derive(Debug)]
+pub struct CreateFailure {
+    /// 失敗の原因（取り残しがあれば件数入りの `Internal`）。
+    pub error: TraitError,
+    /// 巻き戻しで回収できず残った・結果不明で削除しなかった資源の件数（0 なら何も残らない）。
+    pub leftover: usize,
+}
+
+impl From<TraitError> for CreateFailure {
+    /// 取り残しなしの失敗。
+    fn from(error: TraitError) -> Self {
+        Self { error, leftover: 0 }
+    }
+}
+
 /// [`NetsetupBackend::delete_network`] の失敗。解放を完了できなかったハンドルを手放さずに返す。
 #[derive(Debug)]
 pub struct DeleteFailure<C> {
@@ -218,7 +235,20 @@ pub trait NetsetupBackend: Send + Sync {
         &self,
         name: &NetName,
         gateway: IpPrefix,
-    ) -> Result<Self::Network, TraitError>;
+    ) -> Result<Self::Network, CreateFailure>;
+
+    /// 作成失敗で取り残した（または結果不明の）資源を、所有を確認したうえで回収する。成功は回収の確認済み。
+    ///
+    /// 既定は回収せず `FailedPrecondition`（成功を装わない）。net に作成失敗後の所有確認つき回収 API
+    /// （ハンドルなしで bridge・nft テーブルを所有トークンで証明して消す口）が入るまで、Linux バックエンドも
+    /// 既定のまま手動回収を求める（REPAIR-3）。
+    fn reclaim_failed_create(&self, _name: &NetName) -> Result<(), TraitError> {
+        Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "network creation left resources behind that cannot be reclaimed automatically; \
+             manual reclaim required",
+        ))
+    }
 
     /// コンテナ専用の netns を（lo の up を含めて）作る。既定は何もしない成功（試験用 fake 向け）。
     ///
@@ -268,7 +298,11 @@ struct NetworkEntry<N> {
     /// 解放済みのネットワークへ二重に解放を要求しないために使う。
     backend_deleted: bool,
     gateway: IpPrefix,
-    handle: N,
+    /// 作成に成功したときのハンドル。作成失敗で取り残した回収待ちの記録（`leaked` が `Some`）では無い。
+    handle: Option<N>,
+    /// 作成失敗で取り残した・結果不明の資源の件数。`Some` の間は回収待ちとして上限に数え、
+    /// 接続系の操作を拒否し、`delete_network` で回収を再試行する（回収確認まで記録を保持する）。
+    leaked: Option<usize>,
 }
 
 struct Registry<N, C> {
@@ -377,6 +411,14 @@ fn unreclaimed() -> TraitError {
     )
 }
 
+/// 作成失敗で取り残した資源の回収待ちのネットワークへの操作の拒否（`delete_network` で回収を再試行する）。
+fn leaked_network() -> TraitError {
+    TraitError::new(
+        ErrorCode::FailedPrecondition,
+        "network creation failed and left resources behind; retry delete_network to reclaim them",
+    )
+}
+
 fn network_deleting() -> TraitError {
     TraitError::new(
         ErrorCode::FailedPrecondition,
@@ -409,7 +451,12 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 "network limit reached",
             ));
         }
-        let handle = self.backend.create_network(&name, gateway)?;
+        let (handle, leaked, result) = match self.backend.create_network(&name, gateway) {
+            Ok(h) => (Some(h), None, Ok(())),
+            Err(f) if f.leftover > 0 => (None, Some(f.leftover), Err(f.error)),
+            Err(f) => return Err(f.error),
+        };
+        // 取り残し・結果不明は回収を確認できるまで記録を保持し、MAX_NETWORKS に数える。
         reg.networks.insert(
             req.name().as_str().to_owned(),
             NetworkEntry {
@@ -417,8 +464,10 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 backend_deleted: false,
                 gateway,
                 handle,
+                leaked,
             },
         );
+        result?;
         Ok(NetworkStatus::new(req.name().clone(), req.subnet()))
     }
 
@@ -429,6 +478,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let reg = &mut *guard;
         match reg.networks.get(req.network().as_str()) {
             None => return Err(not_found_network()),
+            Some(n) if n.leaked.is_some() => return Err(leaked_network()),
             Some(n) if n.deleting => return Err(network_deleting()),
             Some(_) => {}
         }
@@ -453,11 +503,11 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 "container limit reached for the network",
             ));
         }
-        let handle = &mut reg
+        let handle = reg
             .networks
             .get_mut(req.network().as_str())
-            .ok_or_else(not_found_network)?
-            .handle;
+            .and_then(|n| n.handle.as_mut())
+            .ok_or_else(not_found_network)?;
         self.backend.create_netns(handle, &endpoint)?;
         reg.containers.insert(
             req.container().as_str().to_owned(),
@@ -497,6 +547,9 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             .networks
             .get_mut(req.network().as_str())
             .ok_or_else(not_found_network)?;
+        if network.leaked.is_some() {
+            return Err(leaked_network());
+        }
         if network.deleting {
             return Err(network_deleting());
         }
@@ -516,10 +569,8 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 MSG_STATIC_ADDRESS_UNAVAILABLE,
             ));
         }
-        let outcome = match self
-            .backend
-            .attach(&mut network.handle, &container.endpoint)
-        {
+        let handle = network.handle.as_mut().ok_or_else(leaked_network)?;
+        let outcome = match self.backend.attach(handle, &container.endpoint) {
             Ok(o) => o,
             Err(f) => {
                 if f.leftover > 0 {
@@ -573,6 +624,14 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let reg = &mut *guard;
         let name = req.name().as_str();
         let network = reg.networks.get_mut(name).ok_or_else(not_found_network)?;
+        // 作成失敗で取り残した資源の回収待ち: 回収を確認できたときだけ記録を外す（失敗なら保持して再試行）。
+        if network.leaked.is_some() {
+            let net_name = to_net_name(req.name())?;
+            self.backend.reclaim_failed_create(&net_name)?;
+            reg.networks.remove(name);
+            return Ok(DeleteNetworkResponse::new());
+        }
+        let handle = network.handle.as_mut().ok_or_else(not_found_network)?;
         // 取り残しの veth は bridge への master で自分のものと証明される。bridge を消すと証明を失い
         // 二度と回収できないため、取り残しが残る間はバックエンドを呼ばず何も解放しない（記録も保持）。
         if !network.backend_deleted && network_has_unreclaimed(&reg.containers, name) {
@@ -603,7 +662,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let result = if network.backend_deleted {
             Ok(())
         } else {
-            self.backend.delete_network(&mut network.handle, handles)
+            self.backend.delete_network(handle, handles)
         };
         match result {
             Ok(()) => {
@@ -773,15 +832,23 @@ mod linux {
             &self,
             name: &NetName,
             gateway: IpPrefix,
-        ) -> Result<Self::Network, TraitError> {
+        ) -> Result<Self::Network, CreateFailure> {
             let spec = NetworkCreateSpec::new(name.clone(), gateway)
                 .map_err(|e| net_error_to_trait(&e))?;
             let (route, nft) = self.open_sockets()?;
             let created =
                 create_network(&route, &nft, &spec, NETSETUP_REQUEST_TIMEOUT).map_err(|e| {
-                    with_leftover(net_error_to_trait(&e.error), e.rollback.leftover.len())
+                    let leftover = e.rollback.leftover.len();
+                    CreateFailure {
+                        error: with_leftover(net_error_to_trait(&e.error), leftover),
+                        leftover,
+                    }
                 })?;
-            let ipam = StaticIpam::for_network(&created).map_err(|e| net_error_to_trait(&e))?;
+            // 作成は成功済みで、ここで失敗すると bridge と nft テーブル（2 件）をハンドルなしで残す。
+            let ipam = StaticIpam::for_network(&created).map_err(|e| CreateFailure {
+                error: with_leftover(net_error_to_trait(&e), 2),
+                leftover: 2,
+            })?;
             Ok(LinuxNetwork {
                 created,
                 ipam,

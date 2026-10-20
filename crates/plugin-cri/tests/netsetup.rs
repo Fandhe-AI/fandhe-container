@@ -16,8 +16,8 @@ use fandhe_container_core::traits::{
 use fandhe_container_net::netlink_route::IpPrefix;
 use fandhe_container_net::network::{EndpointId, NetworkName as NetName};
 use fandhe_container_plugin_cri::netsetup::{
-    AttachFailure, AttachOutcome, DeleteFailure, MAX_NETWORKS, NetsetupBackend, NetsetupContainer,
-    NetsetupNetwork,
+    AttachFailure, AttachOutcome, CreateFailure, DeleteFailure, MAX_NETWORKS, NetsetupBackend,
+    NetsetupContainer, NetsetupNetwork,
 };
 use fandhe_container_plugin_cri::pod_network;
 
@@ -34,6 +34,10 @@ impl NetsetupContainer for FakeContainer {
 struct Script {
     calls: Vec<String>,
     fail_create: bool,
+    /// create 失敗時に取り残す資源の件数。
+    create_leftover: usize,
+    /// 次の reclaim_failed_create を成功させるか。
+    reclaim_ok: bool,
     fail_attach: bool,
     /// attach 失敗時に巻き戻しで取り残す資源の件数。
     attach_leftover: usize,
@@ -54,7 +58,7 @@ impl NetsetupBackend for Fake {
     type Network = String;
     type Container = FakeContainer;
 
-    fn create_network(&self, name: &NetName, gateway: IpPrefix) -> Result<String, TraitError> {
+    fn create_network(&self, name: &NetName, gateway: IpPrefix) -> Result<String, CreateFailure> {
         let mut s = self.0.lock().expect("lock");
         s.calls.push(format!(
             "create_network {} {}/{}",
@@ -63,9 +67,22 @@ impl NetsetupBackend for Fake {
             gateway.prefix_len()
         ));
         if s.fail_create {
-            return Err(TraitError::new(ErrorCode::Internal, "create failed"));
+            return Err(CreateFailure {
+                error: TraitError::new(ErrorCode::Internal, "create failed"),
+                leftover: s.create_leftover,
+            });
         }
         Ok(name.as_str().to_owned())
+    }
+
+    fn reclaim_failed_create(&self, name: &NetName) -> Result<(), TraitError> {
+        let mut s = self.0.lock().expect("lock");
+        s.calls.push(format!("reclaim {}", name.as_str()));
+        if s.reclaim_ok {
+            Ok(())
+        } else {
+            Err(TraitError::new(ErrorCode::Internal, "reclaim failed"))
+        }
     }
 
     fn attach(
@@ -376,7 +393,7 @@ fn poisoned_lock_returns_internal() {
     impl NetsetupBackend for Panics {
         type Network = ();
         type Container = FakeContainer;
-        fn create_network(&self, _: &NetName, _: IpPrefix) -> Result<(), TraitError> {
+        fn create_network(&self, _: &NetName, _: IpPrefix) -> Result<(), CreateFailure> {
             panic!("injected");
         }
         fn attach(
@@ -548,4 +565,69 @@ fn contract9_delete_blocked_while_unreclaimed_container_remains() {
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
         assert_eq!(fake.calls().len(), before, "backend is not called");
     }
+}
+
+/// NET-1・CRI-7（契約 6・9）: 作成が取り残し付きで失敗したネットワークは回収待ちで残り MAX_NETWORKS に数えられ、
+/// 上限で新規作成が拒否され、delete_network で回収が確認できると登録が消えて新規作成が通る。
+#[test]
+fn contract6_create_leftover_is_tracked_until_reclaimed() {
+    let (net, fake) = plugin();
+    fake.0.lock().expect("lock").fail_create = true;
+    fake.0.lock().expect("lock").create_leftover = 2;
+    for i in 0..MAX_NETWORKS {
+        let e = pod_network::set_up_pod(&net, &nname(&format!("n{i}")), subnet())
+            .expect_err("create fails");
+        assert_eq!(e.message(), "create failed");
+    }
+    fake.0.lock().expect("lock").fail_create = false;
+    // 回収待ちが 128 件で上限に達し、取り残しの無い作成も拒否される。
+    let e = pod_network::set_up_pod(&net, &nname("extra"), subnet()).expect_err("limit");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), "network limit reached");
+    // 回収待ちへの接続系は拒否され、同名の再作成は AlreadyExists。
+    assert_eq!(
+        net.create_netns(&CreateNetnsRequest::new(nname("n0"), cid("c1")))
+            .expect_err("leaked")
+            .code(),
+        ErrorCode::FailedPrecondition
+    );
+    assert_eq!(
+        pod_network::set_up_pod(&net, &nname("n0"), subnet())
+            .expect_err("dup")
+            .code(),
+        ErrorCode::AlreadyExists
+    );
+    // 回収に失敗する間は記録を保持する。
+    assert_eq!(
+        net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
+            .expect_err("reclaim fails")
+            .message(),
+        "reclaim failed"
+    );
+    assert_eq!(
+        pod_network::set_up_pod(&net, &nname("extra"), subnet())
+            .expect_err("still full")
+            .message(),
+        "network limit reached"
+    );
+    // 回収が確認できると登録が消え、新規作成が通る。
+    fake.0.lock().expect("lock").reclaim_ok = true;
+    net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
+        .expect("reclaimed");
+    assert!(fake.calls().iter().any(|c| c == "reclaim n0"));
+    pod_network::set_up_pod(&net, &nname("extra"), subnet()).expect("room again");
+}
+
+/// 取り残しの無い作成失敗は従来どおり何も保持しない。
+#[test]
+fn contract6_create_failure_without_leftover_is_not_tracked() {
+    let (net, fake) = plugin();
+    fake.0.lock().expect("lock").fail_create = true;
+    pod_network::set_up_pod(&net, &nname("p"), subnet()).expect_err("fail");
+    assert_eq!(
+        net.delete_network(&DeleteNetworkRequest::new(nname("p")))
+            .expect_err("none")
+            .code(),
+        ErrorCode::NotFound
+    );
 }

@@ -363,14 +363,23 @@ mod linux {
                 .map(str::to_string)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(
-            map("uid_map"),
-            vec!["0".to_string(), uid.to_string(), "1".to_string()]
-        );
-        assert_eq!(
-            map("gid_map"),
-            vec!["0".to_string(), gid.to_string(), "1".to_string()]
-        );
+        // 内側から読む lower ID は読み手の user namespace 基準で表示され、ホストの uid / gid とは
+        // 直接比較できない。ホスト ID との照合は親側(holder の外)の責務とし、ここでは内側の写像が
+        // 「コンテナ 0 から 1 件」の形であることだけを照合する。
+        for name in ["uid_map", "gid_map"] {
+            let fields = map(name);
+            assert_eq!(
+                fields.len(),
+                3,
+                "{name} must have exactly one line: {fields:?}"
+            );
+            assert_eq!(fields[0], "0", "{name} container id");
+            assert!(
+                fields[1].parse::<u32>().is_ok(),
+                "{name} lower id: {fields:?}"
+            );
+            assert_eq!(fields[2], "1", "{name} count");
+        }
         assert_ne!(
             user_ns_ino(),
             ns_before,

@@ -1181,7 +1181,16 @@ pub(crate) fn run_userns_holder(
 /// `/proc/<pid>` fd を開いたうえで、mapper 自身の親と対象の親がともに `expected_parent`(中間プロセス)
 /// のままであることを確認する（reparent 後に無関係な pid へ書かない。pid 再利用・TOCTOU 対策）→ [`apply_id_maps_to`] を fd に対して実行 → 応答フレームを返す。
 /// 親が死んでも mapper 側の fd は閉じられず EOF を当てにできないため、待ちは read タイムアウトで
-/// 止める（REPAIR-5）。詳細は stderr へ出す（自由形式の文字列は応答に載せない）。
+/// 止める（REPAIR-5）。詳細は呼び出し側が渡す `diag` へ 1 行で出す（自由形式の文字列は応答に載せない）。
+///
+/// `diag`（CORE-6・REPAIR-12・#2393）: 本番（`exec.rs` の mapper の fork 子）は fork 後の子の中で作った
+/// unbuffered の `std::io::stderr()` を渡す。子は `_exit` で終わるため、`BufWriter` 等のバッファ付きは
+/// 渡さない（flush されず出力が失われる）。試験は `Vec<u8>` を渡して内容を具体値で照合する（libtest の
+/// 出力捕捉を通らず成功試験の実行中に雑音が出るのを避ける）。書き込みの失敗は無視し応答は必ず返す。
+/// 書き先は呼び出しごとの引数とし、グローバルな差し替えは採らない（fork 時に他スレッドが持つロックで
+/// 子がデッドロックするため。`eprintln!` も書き込み失敗で panic するため使わない）。
+// 引数 8 個: fork 子の単一呼び出し口で、まとめる構造体への整理は #2393 の対象外(最小変更)。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_id_map_mapper(
     target: u32,
     expected_parent: u32,
@@ -1190,6 +1199,7 @@ pub(crate) fn run_id_map_mapper(
     gid: &IdMapSet,
     writer: &IdMapWriter,
     timeout: Duration,
+    diag: &mut dyn std::io::Write,
 ) -> i32 {
     let outcome = mapper_outcome(
         target,
@@ -1203,7 +1213,7 @@ pub(crate) fn run_id_map_mapper(
     let (reply, code) = match outcome {
         Ok(()) => (MapperReply::Ok, 0),
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "fandhe-container: id map mapper: {e}");
+            let _ = writeln!(diag, "fandhe-container: id map mapper: {e}");
             (
                 MapperReply::Failed {
                     code: e.code,
@@ -1581,6 +1591,7 @@ mod tests {
     fn core6_mapper_times_out_without_go_signal() {
         let (parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
         let (uid, gid) = mapper_fixture();
+        let mut diag: Vec<u8> = Vec::new();
         let code = run_id_map_mapper(
             std::process::id(),
             std::os::unix::process::parent_id(),
@@ -1589,6 +1600,7 @@ mod tests {
             &gid,
             &IdMapWriter::Direct,
             Duration::from_secs(1),
+            &mut diag,
         );
         assert_eq!(code, 1);
         let mut buf = [0u8; MAPPER_REPLY_LEN];
@@ -1601,6 +1613,9 @@ mod tests {
                 stage: RootlessStage::Validate
             }
         );
+        let text = String::from_utf8(diag).expect("utf8");
+        assert_eq!(text.matches('\n').count(), 1);
+        assert!(text.starts_with("fandhe-container: id map mapper: TIMEOUT (validate): did not receive the go signal from the parent: "), "{text}");
     }
 
     /// CORE-6・SEC-5（TASK-40.2）: 親 pid が期待と違えば（reparent 後の pid 再利用を想定）
@@ -1613,6 +1628,7 @@ mod tests {
         // 実在するが親ではない pid（自プロセス）を使う。存在しない pid だと `/proc/<pid>` の open が
         // 先に `NotFound` で失敗し、親不一致の検証まで到達しない。
         let wrong = std::process::id();
+        let mut diag: Vec<u8> = Vec::new();
         let code = run_id_map_mapper(
             wrong,
             wrong,
@@ -1621,6 +1637,7 @@ mod tests {
             &gid,
             &IdMapWriter::Direct,
             Duration::from_secs(1),
+            &mut diag,
         );
         assert_eq!(code, 1);
         let mut buf = [0u8; MAPPER_REPLY_LEN];
@@ -1631,6 +1648,12 @@ mod tests {
                 code: ErrorCode::FailedPrecondition,
                 stage: RootlessStage::Validate
             }
+        );
+        let text = String::from_utf8(diag).expect("utf8");
+        assert_eq!(text.matches('\n').count(), 1);
+        assert_eq!(
+            text,
+            "fandhe-container: id map mapper: FAILED_PRECONDITION (validate): the parent process changed before the mapping was written\n"
         );
     }
 
@@ -1641,6 +1664,7 @@ mod tests {
         let (mut parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
         parent_end.write_all(&[MAPPER_GO]).expect("go");
         let (uid, gid) = mapper_fixture();
+        let mut diag: Vec<u8> = Vec::new();
         let code = run_id_map_mapper(
             1,
             std::os::unix::process::parent_id(),
@@ -1649,6 +1673,7 @@ mod tests {
             &gid,
             &IdMapWriter::Direct,
             Duration::from_secs(1),
+            &mut diag,
         );
         assert_eq!(code, 1);
         let mut buf = [0u8; MAPPER_REPLY_LEN];
@@ -1659,6 +1684,12 @@ mod tests {
                 code: ErrorCode::FailedPrecondition,
                 stage: RootlessStage::Validate
             }
+        );
+        let text = String::from_utf8(diag).expect("utf8");
+        assert_eq!(text.matches('\n').count(), 1);
+        assert_eq!(
+            text,
+            "fandhe-container: id map mapper: FAILED_PRECONDITION (validate): the mapping target is not a child of the expected parent\n"
         );
     }
 
@@ -1678,6 +1709,7 @@ mod tests {
         let (mut parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
         parent_end.write_all(&[9]).expect("byte");
         let (uid, gid) = mapper_fixture();
+        let mut diag: Vec<u8> = Vec::new();
         let code = run_id_map_mapper(
             std::process::id(),
             std::os::unix::process::parent_id(),
@@ -1686,6 +1718,52 @@ mod tests {
             &gid,
             &IdMapWriter::Direct,
             Duration::from_secs(1),
+            &mut diag,
+        );
+        assert_eq!(code, 1);
+        let mut buf = [0u8; MAPPER_REPLY_LEN];
+        parent_end.read_exact(&mut buf).expect("reply");
+        assert_eq!(
+            MapperReply::decode(&buf).expect("decode"),
+            MapperReply::Failed {
+                code: ErrorCode::InvalidArgument,
+                stage: RootlessStage::Validate
+            }
+        );
+        let text = String::from_utf8(diag).expect("utf8");
+        assert_eq!(text.matches('\n').count(), 1);
+        assert_eq!(
+            text,
+            "fandhe-container: id map mapper: INVALID_ARGUMENT (validate): unexpected go signal byte\n"
+        );
+    }
+
+    /// 常に失敗する書き先。
+    struct FailingWriter;
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("sink closed"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("sink closed"))
+        }
+    }
+
+    /// CORE-6・REPAIR-12・REPAIR-5（#2393）: 診断の書き先が失敗しても応答フレームと終了コードは変わらない。
+    #[test]
+    fn core6_mapper_reply_survives_diag_write_failure() {
+        let (mut parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
+        parent_end.write_all(&[9]).expect("byte");
+        let (uid, gid) = mapper_fixture();
+        let code = run_id_map_mapper(
+            std::process::id(),
+            std::os::unix::process::parent_id(),
+            mapper_end,
+            &uid,
+            &gid,
+            &IdMapWriter::Direct,
+            Duration::from_secs(1),
+            &mut FailingWriter,
         );
         assert_eq!(code, 1);
         let mut buf = [0u8; MAPPER_REPLY_LEN];

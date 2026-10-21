@@ -239,17 +239,27 @@ pub fn verify_blob_file_digest_with(
     max_bytes: u64,
 ) -> Result<VerifiedBlob, OciError> {
     record_oci_op(recorder, OciOpKind::VerifyBlobDigest, || {
-        let meta = file.metadata().map_err(map_io_error)?;
-        if !meta.is_file() {
-            return Err(OciError::new(
-                OciErrorCode::InvalidArgument,
-                "blob path is not a regular file",
-            ));
-        }
-        let mut handle = file;
-        handle.seek(SeekFrom::Start(0)).map_err(map_io_error)?;
-        digest_of_open_blob(file, expected, max_bytes)
+        verify_blob_file_digest_inner(file, expected, max_bytes)
     })
+}
+
+/// 計装なしのハンドル検証本体（[`verify_blob_file_digest_with`] と [`VerifiedLayerBlob::open_with`] が
+/// それぞれ自分の計装の内側で呼ぶ。二重に記録しないため記録を持たない）。
+fn verify_blob_file_digest_inner(
+    file: &File,
+    expected: &Digest,
+    max_bytes: u64,
+) -> Result<VerifiedBlob, OciError> {
+    let meta = file.metadata().map_err(map_io_error)?;
+    if !meta.is_file() {
+        return Err(OciError::new(
+            OciErrorCode::InvalidArgument,
+            "blob path is not a regular file",
+        ));
+    }
+    let mut handle = file;
+    handle.seek(SeekFrom::Start(0)).map_err(map_io_error)?;
+    digest_of_open_blob(file, expected, max_bytes)
 }
 
 /// 開いたハンドルを現在位置から EOF まで読み、sha256 を `expected` と比較する（パス・ハンドル両入口の共通部）。
@@ -338,8 +348,8 @@ impl VerifiedLayerBlob {
         Self::open_with(&NoopOciOpRecorder, path, expected, size, owner)
     }
 
-    /// `path` の blob を開いて信頼条件と digest を確かめる。digest の検証は `OciOpKind::VerifyBlobDigest` として
-    /// `recorder` へ記録する（REPAIR-4）。
+    /// `path` の blob を開いて信頼条件と digest を確かめる。open・信頼条件の検査・digest・サイズ照合の全体を
+    /// `OciOpKind::VerifyBlobDigest` として一度だけ `recorder` へ記録する（失敗も記録。REPAIR-4）。
     ///
     /// `expected` と `size` は manifest の descriptor の `digest` と `size`。読み取り上限は `size` で、超過は
     /// `ResourceExhausted`、digest の不一致と実サイズが `size` と違う場合は `DataLoss`。`owner` は blob を置いた
@@ -354,22 +364,24 @@ impl VerifiedLayerBlob {
         size: u64,
         owner: u32,
     ) -> Result<Self, OciError> {
-        let file = open_blob_nofollow(path)?;
-        let meta = file.metadata().map_err(map_io_error)?;
-        if let Some(v) = blob_trust_violation(&meta, Some(owner)) {
-            return Err(OciError::new(OciErrorCode::FailedPrecondition, v));
-        }
-        let verified = verify_blob_file_digest_with(recorder, &file, expected, size)?;
-        if verified.size != size {
-            return Err(OciError::new(
-                OciErrorCode::DataLoss,
-                "layer blob size does not match the descriptor",
-            ));
-        }
-        Ok(Self {
-            file,
-            digest: verified.digest,
-            size: verified.size,
+        record_oci_op(recorder, OciOpKind::VerifyBlobDigest, || {
+            let file = open_blob_nofollow(path)?;
+            let meta = file.metadata().map_err(map_io_error)?;
+            if let Some(v) = blob_trust_violation(&meta, Some(owner)) {
+                return Err(OciError::new(OciErrorCode::FailedPrecondition, v));
+            }
+            let verified = verify_blob_file_digest_inner(&file, expected, size)?;
+            if verified.size != size {
+                return Err(OciError::new(
+                    OciErrorCode::DataLoss,
+                    "layer blob size does not match the descriptor",
+                ));
+            }
+            Ok(Self {
+                file,
+                digest: verified.digest,
+                size: verified.size,
+            })
         })
     }
 
@@ -918,6 +930,37 @@ mod tests {
         assert!(v.iter().all(|s| s.kind() == OciOpKind::VerifyBlobDigest));
         assert_eq!(v[0].outcome(), OciOpOutcome::Success);
         assert_eq!(v[1].error_code(), Some(OciErrorCode::DataLoss));
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// REPAIR-4・#2309: `VerifiedLayerBlob::open_with` は open 失敗・短い blob（digest 一致でもサイズ不一致）を
+    /// 含め、成功 1 件または失敗 1 件だけを記録する（成功の後に DataLoss を返さない）。
+    #[cfg(unix)]
+    #[test]
+    fn repair4_verified_layer_blob_open_records_once_including_failures() {
+        use crate::instrument::OciOpOutcome;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let d = tmp_dir("vlb-rec");
+        let p = d.join("b");
+        std::fs::write(&p, b"abc").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = std::fs::metadata(&p).unwrap().uid();
+        let abc = Digest::parse(ABC).unwrap();
+
+        let c = Collect::default();
+        VerifiedLayerBlob::open_with(&c, &p, &abc, 3, uid).unwrap();
+        VerifiedLayerBlob::open_with(&c, &d.join("missing"), &abc, 3, uid).unwrap_err();
+        let e = VerifiedLayerBlob::open_with(&c, &p, &abc, 10, uid).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        let e = VerifiedLayerBlob::open_with(&c, &p, &abc, 3, uid.wrapping_add(1)).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        let v = c.0.lock().unwrap();
+        assert_eq!(v.len(), 4);
+        assert_eq!(v[0].outcome(), OciOpOutcome::Success);
+        assert_eq!(v[1].error_code(), Some(OciErrorCode::NotFound));
+        assert_eq!(v[2].error_code(), Some(OciErrorCode::DataLoss));
+        assert_eq!(v[3].error_code(), Some(OciErrorCode::FailedPrecondition));
+        drop(v);
         std::fs::remove_dir_all(&d).unwrap();
     }
 

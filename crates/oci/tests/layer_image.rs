@@ -5,24 +5,29 @@
 //! 受ける。その構築は非 Unix で `Unimplemented` になる（API 自体が fail-closed）ため、blob を使う試験は
 //! `#[cfg(unix)]` にする。特定 OS の試験を飛ばして CI を通すためではなく、非 Unix 側は
 //! `oci1_verified_layer_blob_is_unimplemented_off_unix` と blob の要らないレイヤー 0 の試験で確かめる。
-#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
 use std::fmt::Write as _;
+#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 use fandhe_container_oci::config::parse_image_config_rootfs;
 use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::layer::VerifiedLayerBlob;
-use fandhe_container_oci::layer::extract::{
-    ExtractLimits, ImageLayer, extract_image_layers, image_layers_from,
-};
+use fandhe_container_oci::layer::extract::{ExtractLimits, extract_image_layers};
+#[cfg(unix)]
+use fandhe_container_oci::layer::extract::{ImageLayer, image_layers_from};
+#[cfg(unix)]
 use fandhe_container_oci::manifest::{Descriptor, ParsedManifest, parse_manifest};
 use fandhe_container_oci::reference::Digest;
 use sha2::{Digest as _, Sha256};
 
+#[cfg(unix)]
 const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
+#[cfg(unix)]
 const TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+#[cfg(unix)]
 const TAR_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
 
 fn sha(data: &[u8]) -> Digest {
@@ -34,6 +39,7 @@ fn sha(data: &[u8]) -> Digest {
 }
 
 /// 通常ファイルだけの tar（非圧縮）。
+#[cfg(unix)]
 fn tar_of(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut b = tar::Builder::new(Vec::new());
     for (name, data) in files {
@@ -46,6 +52,7 @@ fn tar_of(files: &[(&str, &[u8])]) -> Vec<u8> {
     b.into_inner().unwrap()
 }
 
+#[cfg(unix)]
 fn gzip(data: &[u8]) -> Vec<u8> {
     let mut z = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     z.write_all(data).unwrap();
@@ -108,6 +115,7 @@ fn root_is_empty(root: &Path) -> bool {
 }
 
 /// 指定の layer descriptor を持つ manifest を `parse_manifest` で作り、layers を取り出す。
+#[cfg(unix)]
 fn descriptors(layers: &[(&str, Digest, u64)]) -> Vec<Descriptor> {
     let zero = format!("sha256:{}", "0".repeat(64));
     let list = layers
@@ -124,6 +132,7 @@ fn descriptors(layers: &[(&str, Digest, u64)]) -> Vec<Descriptor> {
     }
 }
 
+#[cfg(unix)]
 fn config_for(ids: &[&Digest]) -> Vec<u8> {
     let list = ids
         .iter()

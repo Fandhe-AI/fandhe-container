@@ -26,6 +26,10 @@ enum E<'a> {
     Dir(&'a str, u32),
     #[cfg(unix)]
     Symlink(&'a str, &'a str),
+    /// hardlink（名前, 参照先）。
+    Hardlink(&'a str, &'a str),
+    /// FIFO（未対応の種別の拒否確認用）。
+    Fifo(&'a str),
 }
 
 fn layer_gz(entries: &[E<'_>]) -> Vec<u8> {
@@ -53,6 +57,20 @@ fn layer_gz(entries: &[E<'_>]) -> Vec<u8> {
                 h.set_mode(0o777);
                 h.set_cksum();
                 b.append_link(&mut h, name, target).unwrap();
+            }
+            E::Hardlink(name, target) => {
+                h.set_entry_type(tar::EntryType::Link);
+                h.set_size(0);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_link(&mut h, name, target).unwrap();
+            }
+            E::Fifo(name) => {
+                h.set_entry_type(tar::EntryType::Fifo);
+                h.set_size(0);
+                h.set_mode(0o644);
+                h.set_cksum();
+                b.append_data(&mut h, name, &b""[..]).unwrap();
             }
         }
     }
@@ -276,4 +294,41 @@ fn oci2_whiteout_of_symlink_keeps_link_target() {
     extract(&t, &[lower, upper]).unwrap();
     assert_eq!(tree(&t.root()), set(&["real", "real/keep"]));
     assert_eq!(std::fs::read(t.root().join("real/keep")).unwrap(), b"k");
+}
+
+/// OCI-2・#2312: AUFS 予約名を含む参照先への hardlink は `Unimplemented` で拒否し、下位レイヤーは変わらない。
+#[test]
+fn oci2_hardlink_into_aufs_metadata_is_unimplemented() {
+    for target in [".wh..wh.plnk/123", "./.wh..wh.plnk/123", ".wh..wh.aufs"] {
+        let t = Tmp::new("plnk");
+        let lower = layer_gz(&[E::File("a", 0o644, b"a"), E::File("b", 0o644, b"b")]);
+        let upper = layer_gz(&[
+            marker(".wh.a"),
+            E::File(".wh..wh.plnk/123", 0o644, b"x"),
+            E::Hardlink("g", target),
+        ]);
+        assert_eq!(
+            extract(&t, &[lower, upper]).unwrap_err(),
+            OciErrorCode::Unimplemented,
+            "{target}"
+        );
+        assert_eq!(tree(&t.root()), set(&["a", "b"]), "{target}");
+        assert_eq!(std::fs::read(t.root().join("a")).unwrap(), b"a");
+    }
+}
+
+/// OCI-2・#2312: 予約名配下の未対応の種別（FIFO）は `PermissionDenied` で拒否し、下位レイヤーは変わらない。
+#[test]
+fn oci2_aufs_reserved_unsupported_type_is_permission_denied() {
+    for name in [".wh..wh.plnk/f", ".wh..wh.orph/f", "d/.wh..wh.aufs"] {
+        let t = Tmp::new("fifo");
+        let lower = layer_gz(&[E::File("a", 0o644, b"a")]);
+        let upper = layer_gz(&[marker(".wh.a"), E::Fifo(name)]);
+        assert_eq!(
+            extract(&t, &[lower, upper]).unwrap_err(),
+            OciErrorCode::PermissionDenied,
+            "{name}"
+        );
+        assert_eq!(tree(&t.root()), set(&["a"]), "{name}");
+    }
 }

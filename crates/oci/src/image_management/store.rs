@@ -42,7 +42,9 @@ use std::time::{Duration, Instant};
 
 use super::ReferenceTable;
 use super::container_ref_persist::load_container_refs;
-use super::gc_journal::{PendingDeletionRecovery, journal_exists, reap_stale_tmp};
+use super::gc_journal::{
+    PendingDeletionRecovery, STALE_TMP_PREFIXES, journal_exists, reap_stale_tmp,
+};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 
@@ -177,7 +179,7 @@ impl ImageStore {
             guard.table.apply_persisted_container_refs(persisted);
         }
         // 他の操作が割り込む前に、前回の中断した削除を片づける。ジャーナルがあったときだけ記録する。
-        reap_stale_tmp(&self.root);
+        reap_stale_tmp(&self.root, STALE_TMP_PREFIXES);
         let recovered = if journal_exists(&self.root) {
             record_oci_op(&*self.recorder, OciOpKind::RecoverPendingDeletion, || {
                 guard.table.resume_pending_deletion(&self.root)

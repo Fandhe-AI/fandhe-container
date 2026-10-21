@@ -78,7 +78,9 @@ pub use image_refs::{
     ContainerImage, ContainerImageRefs, ImageManifestDigest, ImageRefGeneration,
     ImageRefRegistration, ImageRefRelease,
 };
-pub use image_rootfs::{ImageRootfsUnpacked, ImageRootfsUnpacker};
+pub use image_rootfs::{
+    ImageRootfsUnpacked, ImageRootfsUnpacker, StagingReclamation, reap_stale_unpacks,
+};
 pub use kill::{KillTimeout, ProcessSignaler, kill};
 #[cfg(target_os = "linux")]
 pub use launch::ContainerChildProcess;

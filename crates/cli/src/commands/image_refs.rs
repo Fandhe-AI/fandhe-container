@@ -35,6 +35,7 @@ use fandhe_container_core::oci_runtime::{
     ContainerImageRefs, ImageManifestDigest, ImageRefGeneration, ImageRefRegistration,
     ImageRefRelease,
 };
+use fandhe_container_core::state_store::StateRoot;
 use fandhe_container_core::traits::{ContainerId, TraitError};
 use fandhe_container_oci::error::OciError;
 use fandhe_container_oci::image_management::{
@@ -45,23 +46,46 @@ use fandhe_container_oci::reference::Digest;
 
 use super::image::{Stage, trait_failure};
 
-/// `ImageStore` を借りて `ContainerImageRefs` を満たすアダプタ。
+/// 状態ルートの識別子（参照キーの接頭辞）を作る。
+///
+/// イメージストアは状態ルートをまたいで共有できる（`--root` と `--image-root` は独立）。参照キーが
+/// `ContainerId` だけだと、別の状態ルートの同名コンテナの delete が他方の参照を外してしまう（OCI-7 の
+/// 使用中イメージ保護の欠落）。そこで正規化済みの状態ルートのパスから決定的な 32 桁の小文字 hex
+/// （FNV-1a 64 を異なる初期値で 2 本。暗号学的ハッシュではなく、同一利用者の状態ルート同士の区別用）
+/// を作り、キーを `<hex>.<id>` にする。
+pub(super) fn state_scope(root: &StateRoot) -> String {
+    fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
+        bytes.iter().fold(seed, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+    }
+    let bytes = root.path().as_os_str().as_encoded_bytes();
+    format!(
+        "{:016x}{:016x}",
+        fnv1a(0xcbf2_9ce4_8422_2325, bytes),
+        fnv1a(0x8422_2325_cbf2_9ce4, bytes)
+    )
+}
+
+/// `ImageStore` を借りて `ContainerImageRefs` を満たすアダプタ。参照キーは状態ルートごとに分ける。
 pub(super) struct StoreImageRefs<'a> {
     store: &'a ImageStore,
+    scope: &'a str,
 }
 
 impl<'a> StoreImageRefs<'a> {
-    pub(super) fn new(store: &'a ImageStore) -> Self {
-        Self { store }
+    /// `scope` は [`state_scope`] の戻り値（`[0-9a-f]` のみ）。
+    pub(super) fn new(store: &'a ImageStore, scope: &'a str) -> Self {
+        Self { store, scope }
+    }
+
+    fn ref_id(&self, id: &ContainerId) -> Result<ContainerRefId, TraitError> {
+        ContainerRefId::new(&format!("{}.{}", self.scope, id.as_str())).map_err(fail)
     }
 }
 
 fn fail(e: OciError) -> TraitError {
     trait_failure(&e, Stage::Refs)
-}
-
-fn ref_id(id: &ContainerId) -> Result<ContainerRefId, TraitError> {
-    ContainerRefId::new(id.as_str()).map_err(fail)
 }
 
 fn release_result(r: ContainerRefRelease) -> ImageRefRelease {
@@ -77,7 +101,7 @@ impl ContainerImageRefs for StoreImageRefs<'_> {
         id: &ContainerId,
         manifest: &ImageManifestDigest,
     ) -> Result<ImageRefRegistration, TraitError> {
-        let id = ref_id(id)?;
+        let id = self.ref_id(id)?;
         let digest = Digest::parse(manifest.as_str()).map_err(fail)?;
         let r = self
             .store
@@ -92,20 +116,23 @@ impl ContainerImageRefs for StoreImageRefs<'_> {
     fn release(&self, id: &ContainerId) -> Result<ImageRefRelease, TraitError> {
         let r = self
             .store
-            .release_container_ref(&ref_id(id)?)
+            .release_container_ref(&self.ref_id(id)?)
             .map_err(fail)?;
         Ok(release_result(r))
     }
 
     fn bind(&self, id: &ContainerId) -> Result<ImageRefGeneration, TraitError> {
-        let g = self.store.bind_container_ref(&ref_id(id)?).map_err(fail)?;
+        let g = self
+            .store
+            .bind_container_ref(&self.ref_id(id)?)
+            .map_err(fail)?;
         Ok(ImageRefGeneration::from_raw(g.as_raw()))
     }
 
     fn registration(&self, id: &ContainerId) -> Result<Option<ImageRefGeneration>, TraitError> {
         let g = self
             .store
-            .container_ref_registration(&ref_id(id)?)
+            .container_ref_registration(&self.ref_id(id)?)
             .map_err(fail)?;
         Ok(g.map(|g| ImageRefGeneration::from_raw(g.as_raw())))
     }
@@ -118,7 +145,7 @@ impl ContainerImageRefs for StoreImageRefs<'_> {
         let r = self
             .store
             .release_container_ref_if(
-                &ref_id(id)?,
+                &self.ref_id(id)?,
                 ContainerRefGeneration::from_raw(expected.as_raw()),
             )
             .map_err(fail)?;
@@ -135,6 +162,7 @@ mod tests {
     const MANIFEST: &str =
         "sha256:a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
     const OTHER: &str = "sha256:b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
+    const SCOPE: &str = "00000000000000000000000000000001";
     const CONFIG: &str = "sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1";
 
     /// 一意な一時ディレクトリ（終了時に削除）。
@@ -189,7 +217,7 @@ mod tests {
     fn oci7_register_outcomes() {
         let tmp = Tmp::new("register");
         let store = seeded(tmp.path(), &[MANIFEST, OTHER]);
-        let refs = StoreImageRefs::new(&store);
+        let refs = StoreImageRefs::new(&store, SCOPE);
         assert_eq!(
             refs.register(&cid("c1"), &mdigest(MANIFEST)).expect("new"),
             ImageRefRegistration::Registered
@@ -216,7 +244,7 @@ mod tests {
     fn oci7_registration_is_none_until_bound() {
         let tmp = Tmp::new("bind");
         let store = seeded(tmp.path(), &[MANIFEST]);
-        let refs = StoreImageRefs::new(&store);
+        let refs = StoreImageRefs::new(&store, SCOPE);
         refs.register(&cid("c1"), &mdigest(MANIFEST))
             .expect("register");
         assert_eq!(refs.registration(&cid("c1")).expect("unbound"), None);
@@ -229,7 +257,7 @@ mod tests {
     fn oci7_release_if_checks_generation_and_never_reissues() {
         let tmp = Tmp::new("gen");
         let store = seeded(tmp.path(), &[MANIFEST]);
-        let refs = StoreImageRefs::new(&store);
+        let refs = StoreImageRefs::new(&store, SCOPE);
         refs.register(&cid("c1"), &mdigest(MANIFEST))
             .expect("register");
         let g1 = refs.bind(&cid("c1")).expect("bind");
@@ -259,12 +287,39 @@ mod tests {
         );
     }
 
+    /// OCI-7: 状態ルートが違えば同じコンテナ ID でも参照は別物で、他方の delete は外さない。
+    #[test]
+    fn oci7_refs_are_scoped_per_state_root() {
+        let tmp = Tmp::new("scope");
+        let store = seeded(tmp.path(), &[MANIFEST]);
+        let a = StoreImageRefs::new(&store, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let b = StoreImageRefs::new(&store, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        a.register(&cid("c1"), &mdigest(MANIFEST)).expect("a");
+        let g = a.bind(&cid("c1")).expect("bind");
+        assert_eq!(b.registration(&cid("c1")).expect("b none"), None);
+        assert_eq!(
+            b.release(&cid("c1")).expect("b release"),
+            ImageRefRelease::NotRegistered
+        );
+        assert_eq!(a.registration(&cid("c1")).expect("kept"), Some(g));
+    }
+
+    /// OCI-7: 状態ルートの識別子は決定的で、パスが違えば変わり、キー全体が ID の上限に収まる。
+    #[test]
+    fn oci7_state_scope_is_deterministic_and_distinct() {
+        let r1 = StateRoot::from_override(std::env::temp_dir().join("a")).expect("r1");
+        let r2 = StateRoot::from_override(std::env::temp_dir().join("b")).expect("r2");
+        assert_eq!(state_scope(&r1), state_scope(&r1));
+        assert_ne!(state_scope(&r1), state_scope(&r2));
+        assert_eq!(state_scope(&r1).len(), 32);
+    }
+
     /// REPAIR-4・OCI-7: エラーの message は固定文言だけで、ID・パスを含まない。
     #[test]
     fn oci7_error_messages_are_fixed_strings() {
         let tmp = Tmp::new("msg");
         let store = seeded(tmp.path(), &[]);
-        let refs = StoreImageRefs::new(&store);
+        let refs = StoreImageRefs::new(&store, SCOPE);
         let id = cid("secret-container-id");
         let err = refs
             .register(&id, &mdigest(MANIFEST))

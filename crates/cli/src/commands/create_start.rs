@@ -38,7 +38,7 @@ use fandhe_container_core::traits::{
 use super::CliExit;
 use super::args::{CreateArgs, GlobalArgs, StartArgs};
 use super::image::open_image_store_for_lifecycle;
-use super::image_refs::StoreImageRefs;
+use super::image_refs::{StoreImageRefs, state_scope};
 use fandhe_container_oci::image_management::ImageStore;
 
 /// core の操作へ注入する依存の束（`start` は core を呼ばないため、状態ストアの存在確認と計測にだけ使う）。
@@ -59,6 +59,8 @@ pub(super) fn create_container(
 pub(super) struct CreateImage {
     pub(super) store: ImageStore,
     pub(super) manifest: ImageManifestDigest,
+    /// 参照キーの接頭辞（状態ルートごと。`image_refs::state_scope`。別の状態ルートの同名 ID と混ざらないようにする）。
+    pub(super) scope: String,
 }
 
 /// 構築済みの要求で core の `create_with_image` を呼ぶ（OCI-7・#2315）。
@@ -70,7 +72,7 @@ pub(super) fn create_container_with_image(
     image: &CreateImage,
     req: &CreateRequest,
 ) -> Result<StateRecord, OciRuntimeError> {
-    let refs = StoreImageRefs::new(&image.store);
+    let refs = StoreImageRefs::new(&image.store, &image.scope);
     create_with_image(
         rt.store.as_ref(),
         &rt.recorder,
@@ -83,14 +85,24 @@ pub(super) fn create_container_with_image(
 ///
 /// digest の形式は core の `ImageManifestDigest::new` を唯一の判定とし、ストア root は oci の
 /// `ImageStore::open` に検証させる。いずれの失敗も core に入る前（状態ルートを作る前）に固定文言で返す。
-fn build_create(args: &CreateArgs) -> Result<(CreateRequest, Option<CreateImage>), TraitError> {
+fn build_create(
+    global: &GlobalArgs,
+    args: &CreateArgs,
+) -> Result<(CreateRequest, Option<CreateImage>), TraitError> {
     let req = build_create_request(args)?;
     let image = match &args.image {
         None => None,
         Some(i) => {
             let manifest = ImageManifestDigest::new(&i.manifest)?;
             let store = open_image_store_for_lifecycle(&i.image_root)?;
-            Some(CreateImage { store, manifest })
+            let scope = state_scope(&fandhe_container_core::state_store::StateRoot::resolve(
+                global.root.clone(),
+            )?);
+            Some(CreateImage {
+                store,
+                manifest,
+                scope,
+            })
         }
     };
     Ok((req, image))
@@ -550,16 +562,18 @@ pub(super) fn export_ops(recorder: &OpRecorder, path: Option<&std::ffi::OsStr>) 
 pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     let started = Instant::now();
     let recorder = OpRecorder::new();
-    let result = production_runtime(global, recorder, "create", started, || build_create(args))
-        .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))
-        .and_then(|(rt, (req, image))| {
-            let r = match &image {
-                Some(image) => create_container_with_image(&rt, image, &req),
-                None => create_container(&rt, &req),
-            };
-            export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
-            r
-        });
+    let result = production_runtime(global, recorder, "create", started, || {
+        build_create(global, args)
+    })
+    .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))
+    .and_then(|(rt, (req, image))| {
+        let r = match &image {
+            Some(image) => create_container_with_image(&rt, image, &req),
+            None => create_container(&rt, &req),
+        };
+        export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
+        r
+    });
     match result {
         Ok(_) => CliExit::Success,
         Err(e) => CliExit::Runtime(e),
@@ -1276,6 +1290,13 @@ mod tests {
     const IMG_DIGEST: &str =
         "sha256:a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
 
+    fn test_global() -> GlobalArgs {
+        GlobalArgs {
+            root: Some(std::env::temp_dir().join("fc-cli-state-root")),
+            plugin_path_search: false,
+        }
+    }
+
     fn image_args(root: PathBuf, manifest: &str) -> CreateArgs {
         CreateArgs {
             bundle: std::env::temp_dir(),
@@ -1296,7 +1317,9 @@ mod tests {
         for bad in [upper.as_str(), short, sha512.as_str(), ""] {
             // root が存在しなくても digest の拒否が先に起きる（INVALID_ARGUMENT であって NOT_FOUND ではない）。
             let args = image_args(std::env::temp_dir().join("fc-cli-no-such-image-root"), bad);
-            let e = build_create(&args).err().expect("must fail");
+            let e = build_create(&test_global(), &args)
+                .err()
+                .expect("must fail");
             assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
         }
     }
@@ -1305,7 +1328,7 @@ mod tests {
     #[test]
     fn oci7_build_create_missing_image_root_is_fixed_not_found() {
         let root = std::env::temp_dir().join("fc-cli-no-such-image-root-2");
-        let e = build_create(&image_args(root.clone(), IMG_DIGEST))
+        let e = build_create(&test_global(), &image_args(root.clone(), IMG_DIGEST))
             .err()
             .expect("must fail");
         assert_eq!(e.code(), ErrorCode::NotFound);

@@ -69,7 +69,7 @@ use super::CliExit;
 use super::args::{DeleteArgs, GlobalArgs, StopArgs};
 use super::create_start::{OP_LOG_ENV, export_ops, production_runtime};
 use super::image::open_image_store_for_lifecycle;
-use super::image_refs::StoreImageRefs;
+use super::image_refs::{StoreImageRefs, state_scope};
 use fandhe_container_oci::image_management::ImageStore;
 
 /// 状態ルートを公開しないストア用の fail-closed の signaler。常に `Unimplemented` で失敗する（REPAIR-3）。
@@ -296,9 +296,10 @@ pub(super) fn delete_container_releasing_image_ref(
     recorder: &OpRecorder,
     cgroups: &dyn ContainerCgroupRemover,
     images: &ImageStore,
+    scope: &str,
     req: &DeleteRequest,
 ) -> Result<DeleteResponse, OciRuntimeError> {
-    let refs = StoreImageRefs::new(images);
+    let refs = StoreImageRefs::new(images, scope);
     delete_releasing_image_ref(store, recorder, cgroups, &refs, req)
 }
 
@@ -337,7 +338,14 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
         let images = args
             .image_root
             .as_deref()
-            .map(open_image_store_for_lifecycle)
+            .map(|root| {
+                let store = open_image_store_for_lifecycle(root)?;
+                // 参照キーに状態ルートを含め、別の状態ルートの同名コンテナの参照を外さない（OCI-7）。
+                let scope = state_scope(&fandhe_container_core::state_store::StateRoot::resolve(
+                    global.root.clone(),
+                )?);
+                Ok::<_, TraitError>((store, scope))
+            })
             .transpose()?;
         Ok((req, images))
     })
@@ -348,11 +356,12 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
     };
     let remover = production_cgroup_remover();
     let result = match &images {
-        Some(images) => delete_container_releasing_image_ref(
+        Some((images, scope)) => delete_container_releasing_image_ref(
             rt.store.as_ref(),
             &rt.recorder,
             &remover,
             images,
+            scope,
             &req,
         ),
         None => delete_container(rt.store.as_ref(), &rt.recorder, &remover, &req),
@@ -1277,6 +1286,12 @@ mod tests {
         const REF_MANIFEST: &str =
             "sha256:a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
 
+        fn scope_of(base: &TmpDir) -> String {
+            crate::commands::image_refs::state_scope(
+                &StateRoot::from_override(state_root(base)).expect("root"),
+            )
+        }
+
         fn ref_digest() -> fandhe_container_core::oci_runtime::ImageManifestDigest {
             fandhe_container_core::oci_runtime::ImageManifestDigest::new(REF_MANIFEST)
                 .expect("manifest")
@@ -1343,6 +1358,7 @@ mod tests {
             let image = CreateImage {
                 store: images,
                 manifest: ref_digest(),
+                scope: scope_of(base),
             };
             let req = CreateRequest::new(id(name), make_bundle(base)).expect("req");
             create_container_with_image(rt, &image, &req).map(|_| image)
@@ -1354,7 +1370,10 @@ mod tests {
             let base = TmpDir::new("img-flow");
             let rt = runtime_with(store(&base));
             let image = create_image(&base, &rt, images_store(&base, true), "c1").expect("create");
-            assert_eq!(container_refs(&image.store), vec!["c1".to_string()]);
+            assert_eq!(
+                container_refs(&image.store),
+                vec![format!("{}.c1", scope_of(&base))]
+            );
             let remover = DetectedCgroupRemover::new(|| Ok(FakeCgroup::default()));
             let req = build_delete_request(&delete_args("c1", false)).expect("req");
             delete_container_releasing_image_ref(
@@ -1362,6 +1381,7 @@ mod tests {
                 &rt.recorder,
                 &remover,
                 &image.store,
+                &image.scope,
                 &req,
             )
             .expect("delete");
@@ -1375,12 +1395,41 @@ mod tests {
             let rt = runtime_with(store(&base));
             let image = create_image(&base, &rt, images_store(&base, true), "c1").expect("create");
             delete_with(&store(&base), &OpRecorder::new(), "c1", false).expect("delete");
-            assert_eq!(container_refs(&image.store), vec!["c1".to_string()]);
+            assert_eq!(
+                container_refs(&image.store),
+                vec![format!("{}.c1", scope_of(&base))]
+            );
             let gone = rt
                 .store
                 .get(&GetStateRequest::new(id("c1")))
                 .expect_err("gone");
             assert_eq!(gone.code(), ErrorCode::NotFound);
+        }
+
+        /// OCI-7・#2315: 別の状態ルートの同名コンテナの `--image-root` つき delete は、状態ルート A の参照を外さない。
+        #[test]
+        fn oci7_delete_from_other_state_root_keeps_reference() {
+            let base = TmpDir::new("img-other-root");
+            let rt = runtime_with(store(&base));
+            let image = create_image(&base, &rt, images_store(&base, true), "c1").expect("create");
+            let root_b = StateRoot::from_override(base.0.join("state-b")).expect("root b");
+            let store_b = FileStateStore::open(root_b.clone()).expect("open b");
+            do_create(&base, &store_b, &OpRecorder::new(), "c1");
+            let remover = DetectedCgroupRemover::new(|| Ok(FakeCgroup::default()));
+            let req = build_delete_request(&delete_args("c1", false)).expect("req");
+            delete_container_releasing_image_ref(
+                &store_b,
+                &OpRecorder::new(),
+                &remover,
+                &image.store,
+                &crate::commands::image_refs::state_scope(&root_b),
+                &req,
+            )
+            .expect("delete in b");
+            assert_eq!(
+                container_refs(&image.store),
+                vec![format!("{}.c1", scope_of(&base))]
+            );
         }
 
         /// OCI-7・#2315: 在庫に無い manifest の create は NOT_FOUND で、状態も参照も残らない

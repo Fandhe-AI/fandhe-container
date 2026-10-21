@@ -35,7 +35,10 @@ fn main() {
     )
 ))]
 fn main() {
-    use fandhe_container_core::landlock::{LandlockApplyErrorKind, observe_landlock_enforcement};
+    use fandhe_container_core::landlock::{
+        LandlockApplyErrorKind, detect_landlock_abi, landlock_audit_mode_for_abi,
+        observe_landlock_enforcement,
+    };
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -88,6 +91,18 @@ fn main() {
                 assert!(o.applied);
                 assert_eq!(o.create_after, Some(EACCES), "create blocked by Landlock");
                 assert!(o.read_after, "read of existing file is allowed");
+                // 観測のみ（照合しない）: 本番と同じ経路が渡した restrict_self の flags を残す。ABI 7 以上では
+                // 2（LOG_NEW_EXEC_ON）で受理された証跡になる（SEC-4・CORE-5・#2306。実機確認は
+                // docs/verification/landlock-audit-exec.md）。
+                if let Ok(support) = detect_landlock_abi() {
+                    let abi = support.abi.get();
+                    let mode = landlock_audit_mode_for_abi(abi);
+                    println!(
+                        "landlock_enforcement child: abi={abi} restrict_self_flags={} audit_mode={}",
+                        mode.restrict_self_flags().bits(),
+                        mode.as_str()
+                    );
+                }
                 println!("landlock_enforcement child: ok");
             }
             other => panic!("unknown child mode {other}"),

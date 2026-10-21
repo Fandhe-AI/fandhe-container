@@ -554,8 +554,8 @@ wait_children() {
 }
 
 # 直前の run_rt の収集プロセスの終了を待つ。出力を解析する呼び出しの直後にだけ使う。
-# 待機の上限は引数 <budget_us>（省略時は LOG_FLUSH_WAIT_US）と、期限（rt_deadline_us）までの残りの
-# 小さい方。引数: [<budget_us>]
+# 待機の上限は引数 <budget_us>（省略時は LOG_FLUSH_WAIT_US）と、期限（rt_deadline_us。空なら無し）までの
+# 残りの小さい方（観測ループの state 照会だけが期限を外す。query_state 参照）。引数: [<budget_us>]
 # create / start / delete 等の直後には使わない: runc 系の create は init がランタイムの stdio を
 # 保持するため収集プロセスがコンテナの終了まで EOF にならず、待つと create_us が待機上限分だけ
 # 水増しされる（それらの出力は失敗時の診断にしか使わない）。
@@ -661,10 +661,14 @@ show_log() {
 
 # state を 1 回呼び、state_rc・state_status・state_reason・state_raw_rc を設定する。state_status は
 # stdout が単一の OCI state JSON で id が一致するときだけその status、それ以外は空文字。
-# 収集の完了待ちの上限は呼び出しの期限に基づく（観測ループでは期限までの残り、create 前の照会では
-# --timeout 秒。REPAIR-5）。観測点は待ちの前に取るので、待ちは計測値に乗らない。
+# 収集の完了待ちの上限は --timeout 秒。ただし第 2 引数に full-flush を渡さない呼び出し（後始末）では
+# 期限（rt_deadline_us）までの残りで切り詰める（REPAIR-5）。観測ループは full-flush を渡し、最後の
+# 照会の収集待ちが観測期限をまたいでも collector-timeout にしない（期限の判定は待ちの前に取る
+# state の復帰時刻と 124 で行う。負荷時の間欠失敗 #2375・#1687）。待ちの最悪時間は 1 回分
+# （--timeout 秒）で有界。観測点は待ちの前に取るので、待ちは計測値に乗らない。
+# 引数: <id> [full-flush]
 query_state() {
-  local id="$1" out="$tmpdir/state.out" flush_us
+  local id="$1" full="${2:-}" out="$tmpdir/state.out" flush_us saved_deadline flush_rc=0
   state_rc=0
   state_reason=""
   rt_state "$out" "$tmpdir/state.err" "$id" || state_rc=$?
@@ -678,9 +682,15 @@ query_state() {
   if [ "$state_rc" -eq 124 ]; then
     state_reason="call-timeout"
     flush_last_call "$flush_us" || true
-  elif ! flush_last_call "$flush_us"; then
-    state_rc=125
-    state_reason="collector-timeout"
+  else
+    saved_deadline="$rt_deadline_us"
+    [ "$full" = "full-flush" ] && rt_deadline_us=""
+    flush_last_call "$flush_us" || flush_rc=$?
+    rt_deadline_us="$saved_deadline"
+    if [ "$flush_rc" -ne 0 ]; then
+      state_rc=125
+      state_reason="collector-timeout"
+    fi
   fi
   # 切り詰められた応答は不完全なので解析しない（先頭が有効でも後続が捨てられている）。
   if [ "$state_rc" -ne 124 ] && [ -z "$state_reason" ]; then
@@ -1074,7 +1084,7 @@ measure_once() {
     state_polls=$((state_polls + 1))
     # 各照会には観測期限までの残り時間だけを渡す。残りがなければ呼ばずに 124 になる。
     rt_deadline_us="$deadline"
-    query_state "$id"
+    query_state "$id" full-flush
     rt_deadline_us=""
     t2="$state_wall_us"
     m2="$state_mono_us"

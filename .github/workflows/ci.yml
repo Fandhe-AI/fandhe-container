@@ -1074,7 +1074,11 @@ jobs:
 
       # production_launcher・rootless_file_owner・seccomp（`crates/core/tests/`。CORE-1・CORE-5・CORE-6・SEC-1・
       # SEC-4・SEC-5・#2376）: `--ignored` の実機前提テスト（harness = false）を非 root で実行する。
-      # 範囲写像（`FANDHE_CONTAINER_TEST_ID_HELPER=1`。uidmap・subuid）と委譲 cgroup の前提は、`linux-env-probe.yml` の
+      # 範囲写像のケース（`FANDHE_CONTAINER_TEST_ID_HELPER=1`。シナリオ I・I-user-applied・rootless_file_owner の helper）は
+      # CI では回さない: mapper は newuidmap / newgidmap へ pid ではなく `fd:0` を渡す（#2374。TOCTOU 対策）が、
+      # ubuntu-latest の shadow（4.13）はこの形式に未対応で usage を出して失敗する（run 39621233234・fail-closed の設計どおり）。
+      # 組み込みはヘルパーの `fd:N` 対応の版が runner に入ってからで、それまで実機確認は人間担当（#1621 側）に残す。
+      # uidmap・subuid と委譲 cgroup の前提は、`linux-env-probe.yml` の
       # `id-mapping-probe`（run 39295761418・2026-10-19・#2244）で ubuntu-latest が既定で満たすと実測済み。
       # 準備ステップは sudo を使わず確認だけを行い、欠けていれば fail-closed にする（sudo の用途は増やさない）。
       # ubuntu-latest が新しい世代へ変わってここが落ちたら、確認を緩めず `id-mapping-probe` を回し直して判断する。
@@ -1116,15 +1120,15 @@ jobs:
           echo "PL_BIN=${bins}" >> "$GITHUB_ENV"
 
       # cargo を経由せず、委譲スコープの中でバイナリを直接実行する（同じ cgroup に他のプロセスがいると prepare が
-      # 失敗するため。引数は `start_contract::USER_SCOPE_WRAPPER_ARGS` と同じ）。ヘルパー有効の 1 回で全シナリオ
-      # （範囲写像 I・I-user-applied を含む）を通す。
+      # 失敗するため。引数は `start_contract::USER_SCOPE_WRAPPER_ARGS` と同じ）。ヘルパー無効（範囲写像の I・
+      # I-user-applied は対象外）の 1 回で残りの全シナリオを通す。
       - name: production_launcher の実行（実機前提テスト・--ignored・委譲スコープ。CORE-6・SEC-5・#2376）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/production_launcher.log"
-          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
+          USER="$(id -un)" \
             systemd-run --user --scope --quiet -p Delegate=yes -- "${PL_BIN}" --ignored 2>&1 | tee "${log}"
           final='production_launcher: pid1, default /dev nodes, landlock evidence, cgroup join verified;'
           final+=' failed launch left no process; bind mount visible on host;'
@@ -1134,8 +1138,7 @@ jobs:
             exit 1
           fi
           for part in \
-            'production_launcher: subordinate id mapping verified (uid extents=' \
-            'production_launcher: scenario=user-applied uid=gid=1000 host_uid=' \
+            'production_launcher: subordinate id case not requested' \
             'production_launcher: exit_signal recorded once via audit relay (scenario=Q)'; do
             if ! grep -Fq "${part}" "${log}"; then
               echo "::error::production_launcher did not report: ${part} (possibly not executed)" >&2
@@ -1143,7 +1146,6 @@ jobs:
             fi
           done
           for bad in \
-            'subordinate id case not requested' \
             '(root=true)' \
             'production_launcher: ignored'; do
             if grep -Fq "${bad}" "${log}"; then
@@ -1153,8 +1155,6 @@ jobs:
           done
           {
             echo "${final}"
-            grep -F 'production_launcher: subordinate id mapping verified' "${log}" || true
-            grep -F 'production_launcher: scenario=user-applied' "${log}" || true
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::production_launcher verified"
 
@@ -1169,9 +1169,9 @@ jobs:
         run: |
           set -euo pipefail
           log="${RUNNER_TEMP}/rootless_file_owner.log"
-          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
+          USER="$(id -un)" \
             cargo test -p fandhe-container-core --test rootless_file_owner -- --ignored 2>&1 | tee "${log}"
-          for scenario in direct helper; do
+          for scenario in direct; do
             line="rootless_file_owner: scenario ${scenario} verified (host uid=$(id -u), gid=$(id -g))"
             if ! grep -Fxq "${line}" "${log}"; then
               echo "::error::rootless_file_owner did not report: ${line} (possibly not executed)" >&2
@@ -1179,7 +1179,11 @@ jobs:
             fi
             echo "${line}" >> "$GITHUB_STEP_SUMMARY"
           done
-          for bad in 'helper case not requested' 'root=true' 'rootless_file_owner: ignored'; do
+          grep -Fq 'rootless_file_owner: helper case not requested' "${log}" || {
+            echo "::error::rootless_file_owner did not report the skipped helper case (possibly not executed)" >&2
+            exit 1
+          }
+          for bad in 'root=true' 'rootless_file_owner: ignored'; do
             if grep -Fq "${bad}" "${log}"; then
               echo "::error::rootless_file_owner reported an unexpected line: ${bad}" >&2
               exit 1

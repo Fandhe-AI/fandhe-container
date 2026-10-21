@@ -11,6 +11,14 @@
 //! - 子: PID が 1 → `/proc` をマウント → `/proc` の数値ディレクトリが `1` のみ
 //!   （ホストのプロセスが不可視）→ hostname を照合
 //!
+//! # 範囲写像経路で呼び出しプロセスが dumpable にならないこと（CORE-6・SEC-5・SEC-1・#2374）
+//! 非 root のとき、本体の分離より前に自身を `--subordinate-non-dumpable` で再起動する。子は
+//! `PR_SET_DUMPABLE=0` にして `exec::isolate_rootless_subordinate`（`IdMapWriter::Direct`）を呼び、
+//! user namespace 内の uid 0・`uid_map` / `gid_map` の読み戻し・namespace の変化・子プロセス 0 件・
+//! 呼び出し後も non-dumpable であることを照合する。親（子の祖先）は、子の実行中に `/proc/<子>` の所有者 uid を
+//! 繰り返し標本し、全件が 0（non-dumpable のプロセスは root 所有に見える）であることを照合する。
+//! 窓があれば所有者が子の uid に変わり、標本で検出できる。
+//!
 //! # 実機前提テストとしての分離
 //! 実行には root もしくは非特権 user namespace を許可するホストが必要（AppArmor の
 //! `kernel.apparmor_restrict_unprivileged_userns=1` 等の環境では `PermissionDenied` になる）。
@@ -28,7 +36,9 @@ fn main() {
 fn main() {
     // `#[ignore]` 相当: `-- --ignored` を付けたときだけ実行する（`--all-features` を含む
     // 既定の `cargo test --workspace` では実行されない）。子は `--child` で再入する。
-    if std::env::args().any(|a| a == "--ignored" || a == "--child") {
+    if std::env::args()
+        .any(|a| a == "--ignored" || a == "--child" || a == "--subordinate-non-dumpable")
+    {
         linux::run();
     } else {
         println!(
@@ -69,6 +79,8 @@ mod linux {
     pub fn run() {
         if std::env::args().any(|a| a == "--child") {
             child();
+        } else if std::env::args().any(|a| a == "--subordinate-non-dumpable") {
+            subordinate_non_dumpable_child();
         } else {
             parent();
         }
@@ -96,6 +108,16 @@ mod linux {
             namespaces,
             hostname: Some(Hostname::new(HOSTNAME).expect("valid hostname")),
         };
+
+        if is_root {
+            // root は範囲写像経路（ホスト ID 0 を含む写像）を SEC-5 で拒否する。
+            assert!(
+                fandhe_container_core::rootless::single_id_mapping(0).is_err(),
+                "host root identity mapping must be rejected"
+            );
+        } else {
+            subordinate_non_dumpable_dispatch();
+        }
 
         let host_before = read_hostname();
         // root は sudo 起動の rootful 経路（ホスト root のまま・User なし）、非 root は既定経路。
@@ -171,5 +193,205 @@ mod linux {
             "host processes must be invisible"
         );
         assert_eq!(read_hostname(), HOSTNAME);
+    }
+
+    /// `/proc/<pid>` ディレクトリの所有者 uid（non-dumpable なら root 所有に見える）。
+    fn proc_owner_uid(pid: u32) -> Option<u32> {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(format!("/proc/{pid}"))
+            .ok()
+            .map(|m| m.uid())
+    }
+
+    /// `/proc/self/status` の `Uid:` 行の実 uid。
+    fn real_uid() -> u32 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("read status")
+            .lines()
+            .find(|l| l.starts_with("Uid:"))
+            .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
+            .and_then(|v| v.parse().ok())
+            .expect("parse uid")
+    }
+
+    fn user_ns_ino() -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata("/proc/self/ns/user")
+            .expect("stat userns")
+            .ino()
+    }
+
+    /// 親: 子を `--subordinate-non-dumpable` で起動し、実行中の `/proc/<子>` の所有者 uid を標本する。
+    fn subordinate_non_dumpable_dispatch() {
+        use std::io::Write as _;
+        let log = std::env::temp_dir().join(format!(
+            "fandhe-subordinate-non-dumpable-{}.log",
+            std::process::id()
+        ));
+        let file = std::fs::File::create(&log).expect("create log");
+        let mut child = Command::new(std::env::current_exe().expect("current_exe"))
+            .arg("--subordinate-non-dumpable")
+            .stdin(Stdio::piped())
+            .stdout(file.try_clone().expect("clone log"))
+            .stderr(file)
+            .spawn()
+            .expect("spawn subordinate child");
+        let pid = child.id();
+        let overall = Instant::now() + timeout() * 3;
+        let fail = |child: &mut std::process::Child, msg: &str| -> ! {
+            let _ = child.kill();
+            let _ = child.wait();
+            let out = std::fs::read_to_string(&log).unwrap_or_default();
+            let _ = std::fs::remove_file(&log);
+            panic!("{msg}\n{out}");
+        };
+        // 子が non-dumpable にし終えるまで待つ(この前の標本は意味がない)。
+        loop {
+            let out = std::fs::read_to_string(&log).unwrap_or_default();
+            if out.lines().any(|l| l == "subordinate child ready") {
+                break;
+            }
+            if let Some(st) = child.try_wait().expect("try_wait") {
+                let _ = std::fs::remove_file(&log);
+                panic!("subordinate child exited early: {st:?}\n{out}");
+            }
+            if Instant::now() >= overall {
+                fail(&mut child, "subordinate child did not become ready in time");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // 開始の合図(stdin に 1 バイト)を送ってから、終了まで標本する。
+        {
+            let mut stdin = child.stdin.take().expect("child stdin");
+            stdin.write_all(&[1]).expect("send go");
+        }
+        let mut samples = 0u64;
+        let mut observed: Vec<u32> = Vec::new();
+        let status = loop {
+            if let Some(uid) = proc_owner_uid(pid) {
+                samples += 1;
+                if uid != 0 && !observed.contains(&uid) {
+                    observed.push(uid);
+                }
+            }
+            if let Some(st) = child.try_wait().expect("try_wait") {
+                break st;
+            }
+            if Instant::now() >= overall {
+                fail(&mut child, "subordinate child did not finish in time");
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        };
+        let out = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_file(&log);
+        assert_eq!(status.code(), Some(0), "subordinate child failed\n{out}");
+        assert!(samples >= 1, "no /proc/<child> owner sample was taken");
+        assert!(
+            observed.is_empty(),
+            "the caller became dumpable while mapping (owner uids seen: {observed:?}, samples: {samples})"
+        );
+        println!(
+            "unshare_isolation: subordinate isolation kept the caller non-dumpable (samples={samples})"
+        );
+    }
+
+    /// 子: non-dumpable のまま範囲写像経路（Direct）で分離し、結果を具体値で照合する。
+    fn subordinate_non_dumpable_child() {
+        use std::io::{Read as _, Write as _};
+
+        use fandhe_container_core::exec::{
+            is_non_dumpable_for_test, isolate_rootless_subordinate, plan_rootless_subordinate,
+            set_non_dumpable_for_test,
+        };
+        use fandhe_container_core::rootless::{IdMapWriter, single_id_mapping};
+
+        set_non_dumpable_for_test().expect("set non-dumpable");
+        assert_eq!(is_non_dumpable_for_test(), Some(true));
+        assert_eq!(proc_owner_uid(std::process::id()), Some(0));
+        let uid = real_uid();
+        let gid = std::fs::read_to_string("/proc/self/status")
+            .expect("read status")
+            .lines()
+            .find(|l| l.starts_with("Gid:"))
+            .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
+            .and_then(|v| v.parse::<u32>().ok())
+            .expect("parse gid");
+        let ns_before = user_ns_ino();
+        println!("subordinate child ready");
+        let _ = std::io::stdout().flush();
+        // 親が標本を始める合図を待つ(EOF でも進む)。
+        let mut go = [0u8; 1];
+        let _ = std::io::stdin().read(&mut go);
+
+        let config = IsolationConfig {
+            namespaces: NamespaceSet::empty().with(Namespace::User),
+            hostname: None,
+        };
+        let plan = plan_rootless_subordinate(
+            &config,
+            single_id_mapping(uid).expect("uid mapping"),
+            single_id_mapping(gid).expect("gid mapping"),
+            IdMapWriter::Direct,
+            timeout(),
+        )
+        .expect("plan");
+        let report = isolate_rootless_subordinate(&plan).expect("isolate rootless subordinate");
+        assert_eq!(
+            report.isolation.privilege,
+            IsolationPrivilege::RootlessSubordinateIds
+        );
+
+        assert_eq!(real_uid(), 0, "uid inside the user namespace");
+        let map = |name: &str| {
+            std::fs::read_to_string(format!("/proc/self/{name}"))
+                .unwrap_or_else(|e| panic!("read {name}: {e}"))
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            map("uid_map"),
+            vec!["0".to_string(), uid.to_string(), "1".to_string()]
+        );
+        assert_eq!(
+            map("gid_map"),
+            vec!["0".to_string(), gid.to_string(), "1".to_string()]
+        );
+        assert_ne!(
+            user_ns_ino(),
+            ns_before,
+            "must have joined a new user namespace"
+        );
+        assert_eq!(
+            is_non_dumpable_for_test(),
+            Some(true),
+            "caller must stay non-dumpable"
+        );
+
+        // holder と mapper は回収済みで、子プロセスが残っていない。
+        let me = std::process::id();
+        let children: Vec<String> = std::fs::read_dir("/proc")
+            .expect("read /proc")
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            .filter(|n| {
+                std::fs::read(format!("/proc/{n}/stat"))
+                    .ok()
+                    .is_some_and(|b| {
+                        b.iter().rposition(|c| *c == b')').is_some_and(|i| {
+                            String::from_utf8_lossy(&b[i + 1..])
+                                .split_whitespace()
+                                .nth(1)
+                                .and_then(|v| v.parse::<u32>().ok())
+                                == Some(me)
+                        })
+                    })
+            })
+            .collect();
+        assert!(
+            children.is_empty(),
+            "leftover child processes: {children:?}"
+        );
     }
 }

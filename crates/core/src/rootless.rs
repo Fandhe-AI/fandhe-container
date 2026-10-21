@@ -15,14 +15,16 @@
 //! - 起動フローへの組み込みは `exec::isolate_rootless_subordinate`（TASK-40.2・#188）が担う。本番 launcher
 //!   （`oci_runtime::ProductionLauncher`）は `RootlessSubordinateIds` のとき、構築時に `SubordinateIdSource` から
 //!   [`load_subordinate_ids`]・[`rootless_mapping`]・[`HelperPaths`] を解決し、中間プロセスから呼ぶ（#2009）。
-//!   呼び出し元が [`unshare_user_namespace`] し、fork した mapper（`run_id_map_mapper`。外側の
-//!   user namespace に残る）が親 pid へ [`apply_id_maps`] する。応答は型付きの固定 3 バイト
+//!   呼び出し元(中間プロセス I)は自分では [`unshare_user_namespace`] せず、使い捨ての holder(dumpable で構わない
+//!   専用プロセス)に user namespace を作らせる。fork した mapper（`run_id_map_mapper`。外側の user namespace に
+//!   残る）が holder の pid へ [`apply_id_maps`] し、I は写像後に `setns` で参加する。I が dumpable になる窓を
+//!   なくすため(`docs/design/rootless-id-map-holder.md`・#2374)。応答は型付きの固定 3 バイト
 //!   （`MapperReply`）で返す。エラーは `ExecError`（段 `UserNamespaceMap`）へ写す
 //! - 写像はカーネルが write-once（1 回しか受け付けない）。途中で失敗した対象プロセスは
 //!   破棄すること（再設定できない）
 //! - pid 再利用（TOCTOU）対策: 書き込み先は pid 番号ではなく、対象の `/proc/<pid>` ディレクトリ fd
-//!   （[`ProcHandle`]）で固定する。mapper は先に fd を開き、その**後**に `parent_id()` が期待した親のまま
-//!   であることを確認する（開いた時点で pid は生きた親を指していたと言える）。以後の書き込み・読み戻しは
+//!   （[`ProcHandle`]）で固定する。mapper は先に fd を開き、その**後**に mapper 自身の `parent_id()` と対象(holder)の
+//!   親(fd 経由の stat)がともに I のままであることを確認する（開いた時点で pid は生きた親を指していたと言える）。以後の書き込み・読み戻しは
 //!   fd 経由（`/proc/self/fd/N/...`）で、対象が死んで pid が再利用されても別プロセスへは届かず失敗する。
 //!   `newuidmap` / `newgidmap` にも pid 文字列ではなく `fd:0`（stdin に渡した同じ fd）を渡す
 //!   （shadow の `fd:N` 形式。未対応の版ではヘルパーが失敗し fail-closed になる）。新規 FFI は不要
@@ -513,6 +515,34 @@ impl ProcHandle {
         self.pid
     }
 
+    /// fd の指すプロセスの親 pid(`/proc/<pid>/stat` の ppid。fd 経由で読むため pid の再利用に影響されない)。
+    ///
+    /// mapper が「書き込み先の holder が、期待した中間プロセスの子であること」を確かめるために使う
+    /// (CORE-6・SEC-5・#2374)。読み取りは 4096 バイトで打ち切り、comm が `)` を含んでも最後の `)` より後ろ
+    /// だけを解析する。形式が崩れていれば `Internal` で拒否する(fail-closed)。
+    pub(crate) fn parent_pid(&self) -> Result<u32, RootlessError> {
+        use std::io::Read as _;
+        let mut buf = Vec::with_capacity(512);
+        std::fs::File::open(self.proc_file("stat"))
+            .and_then(|f| f.take(4096).read_to_end(&mut buf))
+            .map_err(|e| io_error(RootlessStage::Validate, "read target stat", &e))?;
+        let bad = || {
+            RootlessError::new(
+                ErrorCode::Internal,
+                RootlessStage::Validate,
+                "malformed target stat",
+            )
+        };
+        let close = buf.iter().rposition(|b| *b == b')').ok_or_else(bad)?;
+        let rest = buf.get(close + 1..).ok_or_else(bad)?;
+        let rest = std::str::from_utf8(rest).map_err(|_| bad())?;
+        // `) <state> <ppid> ...`
+        rest.split_whitespace()
+            .nth(1)
+            .and_then(|f| f.parse::<u32>().ok())
+            .ok_or_else(bad)
+    }
+
     /// fd 配下のファイルのパス（`/proc/self/fd/N/<name>`。fd の指すプロセスへ解決される）。
     fn proc_file(&self, name: &str) -> PathBuf {
         use std::os::fd::AsRawFd as _;
@@ -989,7 +1019,7 @@ fn apply_id_maps_as(
     })
 }
 
-/// 親へ「unshare 完了。写像を書いてよい」と知らせる 1 バイト（[`run_id_map_mapper`] が待つ）。
+/// mapper へ「holder の unshare 完了。写像を書いてよい」と知らせる 1 バイト（[`run_id_map_mapper`] が待つ）。
 pub(crate) const MAPPER_GO: u8 = 1;
 
 /// mapper の応答フレーム長（`[tag, code, stage]` の固定 3 バイト）。
@@ -1075,14 +1105,80 @@ impl MapperReply {
     }
 }
 
+/// holder へ「参加が済んだ。終了してよい」と知らせる 1 バイト（[`run_userns_holder`] が待つ）。
+pub(crate) const HOLDER_RELEASE: u8 = 2;
+
+/// user namespace を作って保持するだけの使い捨てプロセス(holder)の処理本体(fork 子が呼ぶ。#2374)。
+///
+/// 中間プロセス I(`exec::isolate_rootless_subordinate`)は non-dumpable のまま保つ必要があるが、
+/// `newuidmap` / `newgidmap` は写像の対象の `/proc/<pid>` の所有者が呼び出し元と一致することを要求し、
+/// non-dumpable な対象は root 所有に見えて拒否される。そこで写像の対象を I ではなくこのプロセスにし、
+/// ここだけを dumpable にする。I は写像の後に `setns` でこの user namespace へ参加する(CORE-6・SEC-5・SEC-1)。
+///
+/// 流れ: fd 3 以上を閉じる(I から継承した報告 pipe・listener 等を持たない)→ `PDEATHSIG` を SIGKILL に
+/// → 親が `expected_parent`(I)のままか確認 → `unshare(CLONE_NEWUSER)` → dumpable にする → READY(`MapperReply::Ok`)
+/// を返す → [`HOLDER_RELEASE`] を `release_wait` まで待って終了する(REPAIR-5。I が死ねば PDEATHSIG で終わる)。
+/// 失敗は `MapperReply::Failed` で返して終了コード 1。exec せず I の `comm`(起動識別子)を引き継ぐため、I が
+/// 報告せずに死んでも C の再探索が回収できる(CORE-2)。
+pub(crate) fn run_userns_holder(
+    expected_parent: u32,
+    mut sock: std::os::unix::net::UnixStream,
+    timeout: Duration,
+    release_wait: Duration,
+) -> i32 {
+    use std::os::fd::AsFd as _;
+
+    let outcome = (|| -> Result<(), RootlessError> {
+        let internal =
+            |m: &str| RootlessError::new(ErrorCode::Internal, RootlessStage::Validate, m);
+        sys::close_fds_from_except(3, sock.as_fd())
+            .map_err(|_| internal("close inherited fds in the holder"))?;
+        sys::set_parent_death_sigkill().map_err(|_| internal("PR_SET_PDEATHSIG in the holder"))?;
+        if std::os::unix::process::parent_id() != expected_parent {
+            return Err(RootlessError::new(
+                ErrorCode::FailedPrecondition,
+                RootlessStage::Validate,
+                "the parent process changed before the holder started",
+            ));
+        }
+        unshare_user_namespace()?;
+        // 写像の書き込み先として、このプロセスだけを dumpable にする(I は終始 non-dumpable)。
+        sys::set_dumpable_user().map_err(|_| internal("PR_SET_DUMPABLE in the holder"))
+    })();
+    let _ = sock.set_write_timeout(Some(timeout));
+    match outcome {
+        Ok(()) => {
+            if sock.write_all(&MapperReply::Ok.encode()).is_err() {
+                return 1;
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "fandhe-container: userns holder: {e}");
+            let reply = MapperReply::Failed {
+                code: e.code,
+                stage: e.stage,
+            };
+            let _ = sock.write_all(&reply.encode());
+            return 1;
+        }
+    }
+    let _ = sock.set_read_timeout(Some(release_wait));
+    let mut b = [0u8; 1];
+    match sock.read_exact(&mut b) {
+        Ok(()) if b[0] == HOLDER_RELEASE => 0,
+        _ => 1,
+    }
+}
+
 /// mapper の処理本体（fork 子が呼ぶ。成功なら終了コード 0、失敗なら 1）。
 ///
-/// 流れ: `sock` から [`MAPPER_GO`] を `timeout` まで待つ → 親の `/proc/<pid>` fd を開いたうえで、親が
-/// 最初の親 `expected_parent` のままであることを `parent_id()` で再確認する（reparent 後に無関係な
-/// pid へ書かない。pid 再利用・TOCTOU 対策）→ [`apply_id_maps_to`] を fd に対して実行 → 応答フレームを返す。
+/// 流れ: `sock` から [`MAPPER_GO`] を `timeout` まで待つ → 対象(`target`。専用の holder プロセス)の
+/// `/proc/<pid>` fd を開いたうえで、mapper 自身の親と対象の親がともに `expected_parent`(中間プロセス)
+/// のままであることを確認する（reparent 後に無関係な pid へ書かない。pid 再利用・TOCTOU 対策）→ [`apply_id_maps_to`] を fd に対して実行 → 応答フレームを返す。
 /// 親が死んでも mapper 側の fd は閉じられず EOF を当てにできないため、待ちは read タイムアウトで
 /// 止める（REPAIR-5）。詳細は stderr へ出す（自由形式の文字列は応答に載せない）。
 pub(crate) fn run_id_map_mapper(
+    target: u32,
     expected_parent: u32,
     mut sock: std::os::unix::net::UnixStream,
     uid: &IdMapSet,
@@ -1090,7 +1186,15 @@ pub(crate) fn run_id_map_mapper(
     writer: &IdMapWriter,
     timeout: Duration,
 ) -> i32 {
-    let outcome = mapper_outcome(expected_parent, &mut sock, uid, gid, writer, timeout);
+    let outcome = mapper_outcome(
+        target,
+        expected_parent,
+        &mut sock,
+        uid,
+        gid,
+        writer,
+        timeout,
+    );
     let (reply, code) = match outcome {
         Ok(()) => (MapperReply::Ok, 0),
         Err(e) => {
@@ -1110,6 +1214,7 @@ pub(crate) fn run_id_map_mapper(
 }
 
 fn mapper_outcome(
+    target: u32,
     expected_parent: u32,
     sock: &mut std::os::unix::net::UnixStream,
     uid: &IdMapSet,
@@ -1133,15 +1238,23 @@ fn mapper_outcome(
             "unexpected go signal byte",
         ));
     }
-    // 先に `/proc/<pid>` fd を確保し、その後で親が変わっていないことを確認する。親が生きていれば
-    // （= reparent されていなければ）fd は確実に元の親を指す。以後の書き込みは fd 経由のため、
-    // 確認後に親が死んで pid が再利用されても別プロセスへは届かない（SEC-5・TASK-40.2）。
-    let handle = ProcHandle::open(TargetPid::new(expected_parent)?)?;
+    // 先に対象の `/proc/<pid>` fd を確保し、その後で次の 2 点を確認する。(1) mapper 自身の親が呼び出し元
+    // (中間プロセス I)のまま(reparent されていない)。(2) 対象(holder)の親が I である。I が生きていて
+    // 対象が I の未回収の子なら pid は再利用されておらず、fd は確実に holder を指す。以後の書き込みは fd 経由の
+    // ため、確認後に対象が死んで pid が再利用されても別プロセスへは届かない(SEC-5・TASK-40.2・#2374)。
+    let handle = ProcHandle::open(TargetPid::new(target)?)?;
     if std::os::unix::process::parent_id() != expected_parent {
         return Err(RootlessError::new(
             ErrorCode::FailedPrecondition,
             RootlessStage::Validate,
             "the parent process changed before the mapping was written",
+        ));
+    }
+    if handle.parent_pid()? != expected_parent {
+        return Err(RootlessError::new(
+            ErrorCode::FailedPrecondition,
+            RootlessStage::Validate,
+            "the mapping target is not a child of the expected parent",
         ));
     }
     apply_id_maps_to(&handle, uid, gid, writer, timeout).map(|_| ())
@@ -1443,6 +1556,7 @@ mod tests {
         let (parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
         let (uid, gid) = mapper_fixture();
         let code = run_id_map_mapper(
+            std::process::id(),
             std::os::unix::process::parent_id(),
             mapper_end,
             &uid,
@@ -1475,6 +1589,7 @@ mod tests {
         let wrong = std::process::id();
         let code = run_id_map_mapper(
             wrong,
+            wrong,
             mapper_end,
             &uid,
             &gid,
@@ -1493,6 +1608,44 @@ mod tests {
         );
     }
 
+    /// CORE-6・SEC-5（#2374）: 対象の親が期待した中間プロセスでなければ(mapper 自身の親は一致していても)
+    /// 書き込まず `FailedPrecondition` を返す。pid 1 の親は 0 で、実在し読めて親が一致しない対象として使う。
+    #[test]
+    fn core6_mapper_refuses_when_target_is_not_child_of_expected_parent() {
+        let (mut parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
+        parent_end.write_all(&[MAPPER_GO]).expect("go");
+        let (uid, gid) = mapper_fixture();
+        let code = run_id_map_mapper(
+            1,
+            std::os::unix::process::parent_id(),
+            mapper_end,
+            &uid,
+            &gid,
+            &IdMapWriter::Direct,
+            Duration::from_secs(1),
+        );
+        assert_eq!(code, 1);
+        let mut buf = [0u8; MAPPER_REPLY_LEN];
+        parent_end.read_exact(&mut buf).expect("reply");
+        assert_eq!(
+            MapperReply::decode(&buf).expect("decode"),
+            MapperReply::Failed {
+                code: ErrorCode::FailedPrecondition,
+                stage: RootlessStage::Validate
+            }
+        );
+    }
+
+    /// SEC-5（#2374）: fd 経由で読んだ親 pid は `parent_id()` と一致する(具体値)。
+    #[test]
+    fn sec5_proc_handle_reads_parent_pid_via_fd() {
+        let h = ProcHandle::open(TargetPid::new(std::process::id()).expect("pid")).expect("open");
+        assert_eq!(
+            h.parent_pid().expect("ppid"),
+            std::os::unix::process::parent_id()
+        );
+    }
+
     /// CORE-6（TASK-40.2）: go 以外のバイトは `InvalidArgument` で拒否する。
     #[test]
     fn core6_mapper_rejects_unexpected_go_byte() {
@@ -1500,6 +1653,7 @@ mod tests {
         parent_end.write_all(&[9]).expect("byte");
         let (uid, gid) = mapper_fixture();
         let code = run_id_map_mapper(
+            std::process::id(),
             std::os::unix::process::parent_id(),
             mapper_end,
             &uid,

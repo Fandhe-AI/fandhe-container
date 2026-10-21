@@ -423,7 +423,8 @@ struct RealIntermediateOps<'a> {
 
 impl IntermediateOps for RealIntermediateOps<'_> {
     fn isolate(&mut self) -> Result<(), ExecError> {
-        // 範囲写像では mapper を I の子として fork する。mapper も識別子を継承させ、起動の期限切れで C が I だけを
+        // 範囲写像では holder(user namespace を作って保持する使い捨てプロセス。I は終始 non-dumpable のまま
+        // holder の namespace へ参加する。#2374)と mapper を I の子として fork する。どちらも識別子を継承させ、起動の期限切れで C が I だけを
         // 殺した場合や、範囲写像の失敗で I が mapper を残して `R` を報告した場合に、再親付けされた mapper を
         // `rescan_unreported_init` が見つけて helper ごと回収できるようにする(CORE-2)。設定できなければ mapper を
         // 作らずに失敗させる(fail-closed)。

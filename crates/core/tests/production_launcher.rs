@@ -22,9 +22,9 @@
 //!   mountinfo 上の `/data` のオプションに `rw`・`nosuid`・`nodev` が含まれることを照合する
 //! - シナリオ E（状態ルートの bind 拒否。#2066・SEC-1）: 状態ルート自身とその symlink 別名を bind の元にした start が
 //!   `InvalidArgument` で拒否され、状態が Created のまま子が残らないことを照合する
-//! - シナリオ F（Landlock の Mount 識別子照合。#2071・CORE-5・SEC-1）: `mounts[]` の bind 先を `linux.readonlyPaths` にも足し、
-//!   記録（`RealPrePivotOps`）より後に `/dev` へ別のマウントが重なる起動が、Landlock 適用時の照合で拒否されて
-//!   失敗し、状態が Created のまま子が残らないことを照合する。記録と一致する側はシナリオ A・D の成功が担う
+//! - シナリオ F（保護パスと重なる bind 先の拒否。SEC-1・SEC-2・OCI-4・#2015）: `mounts[]` の bind 先を `linux.readonlyPaths` にも
+//!   足した config の start が fork 前に `InvalidArgument` で拒否され、状態が Created のまま子が残らないことを照合する。
+//!   Landlock の Mount 識別子照合（CORE-5・#2071）の拒否理由は単体試験が照合する（記録後の差し替えは config では作れない）
 //! - シナリオ G（devtmpfs の bind 拒否。#2129・SEC-1）: ホストの `/dev`（fstype `devtmpfs`。`f_type` は tmpfs と同じで見分けられない）を
 //!   `bind` / `rbind` で元にした start が、付け替えた自分のマウントの mountinfo の fstype 名で拒否される。起動は失敗し、
 //!   状態が Created のまま子が残らず、後始末で bind 先（rootfs 内の `/data`）が残らないことを照合する
@@ -727,7 +727,7 @@ mod linux {
         scenario_c_multithreaded_refused(&env, tag);
         scenario_d_bind_mount(&env, tag);
         scenario_e_state_root_bind_refused(&env, tag);
-        scenario_f_landlock_mount_identity_swapped(&env, tag);
+        scenario_f_bind_over_protected_path_refused(&env, tag);
         scenario_g_devtmpfs_bind_refused(&env, tag);
         scenario_h_state_root_moved_after_start(&env, tag);
         if subordinate_requested() {
@@ -1404,20 +1404,17 @@ mod linux {
         }
     }
 
-    /// シナリオ F: Landlock の Mount 由来のルールの識別子照合を、本番の起動経路（`RealPrePivotOps` の記録 → pivot →
-    /// `StagePipeline` → 本物の Landlock 適用）で通す（CORE-5・SEC-1・SEC-4・REPAIR-10 (d)・REPAIR-12・#2071）。
+    /// シナリオ F: `mounts[]` の bind 先が `linux.readonlyPaths` と重なる config は、fork 前に `InvalidArgument` で拒否される
+    /// （SEC-1・SEC-2・OCI-4・#2015。`check_against_protected_paths`。同一・祖先・子孫を字句で拒否する）。
     ///
-    /// - 一致する場合: シナリオ D（`/data` の bind を記録し、Landlock 適用後も bind 先へ書ける）とシナリオ A
-    ///   （既定の `/dev` 系の記録）が、記録と実マウントが一致したまま起動に成功することで担う
-    /// - 記録後にマウントが変わる場合（本シナリオ）: `mounts[]` の bind（`BIND_DEST`）を記録させたうえで `linux.readonlyPaths` に同じ
-    ///   `BIND_DEST` を足すと、`apply_readonly_paths` が記録より後にそこへ別のマウント（読み取り専用の bind）を重ねる。
-    ///   Landlock の Mount 由来のルールの対象は記録と別のマウントになるため、適用時の照合が拒否し、起動は失敗する。
-    ///   暗黙の `/dev` 系（`/dev`・`/dev/pts`・`/dev/shm`）を保護パスにする config は start 入口が `InvalidArgument` で
-    ///   拒否する（SEC-2・#2015）ため、本シナリオは `/dev` 系を使わない
-    ///   Landlock 段の拒否は pivot 後の子で起き、状態 pipe（pre-pivot 段のみ）では親へ届かない（`docs/design/audit-delivery.md`
-    ///   8 章。#2023〜）ため、親から観測できるのは「起動が失敗し、状態が Created に戻り、子が残らない」ことまで。
-    ///   拒否理由そのものは `exec/landlock.rs` の単体試験が `ViolationReason::LandlockMountIdentityMismatch` で照合する。
-    fn scenario_f_landlock_mount_identity_swapped(env: &Env, tag: u32) {
+    /// 経緯: 旧シナリオ F は Landlock の Mount 識別子照合（CORE-5・#2071）を、`readonlyPaths` に `/dev` または bind 先を足して
+    /// 「記録後に別のマウントが重なる」起動で通そうとしたが、どちらも start 入口の重なり検査が先に拒否するため
+    /// launch 中の照合には到達しなかった。config だけでは記録後のマウント差し替えを作れない（`apply_readonly_paths` は
+    /// symlink を辿らず、重なりは字句で拒否される）ので、本シナリオは入口の拒否の副作用の無さ（状態は Created のまま・
+    /// 子が作られない）を固定する。Landlock 適用時の拒否理由そのもの（`ViolationReason::LandlockMountIdentityMismatch`）は
+    /// `exec/landlock.rs`・`landlock/apply.rs` の単体試験が照合する。本番経路で記録後に差し替える試験は、test 限定の
+    /// 注入口が core に無いため未実装。記録と一致する側はシナリオ A・D の成功が担う。
+    fn scenario_f_bind_over_protected_path_refused(env: &Env, tag: u32) {
         let src = Bundle::new("f-src");
         let bundle = Bundle::new("f");
         let ld = make_rootfs(&bundle.rootfs(), true);
@@ -1449,21 +1446,19 @@ mod linux {
             &StartRequest::new(id.clone()),
             &timeouts(),
         ) {
-            Ok(_) => panic!("start must be refused when a mount is swapped after it was recorded"),
+            Ok(_) => panic!("start must refuse a bind destination that overlaps a readonly path"),
             Err(e) => e,
         };
-        // 検証段階（config の拒否）ではなく、launch 中の拒否であること。
-        assert_ne!(err.code(), ErrorCode::InvalidArgument, "{}", err.message());
-        assert_ne!(err.code(), ErrorCode::Timeout, "{}", err.message());
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{}", err.message());
         assert_eq!(state_of(&env.store, &id), ContainerState::Created);
         assert!(!env.launcher.last_launch_may_have_left_process());
         assert!(
-            eventually(|| children_of_self().is_empty()),
-            "no process may remain after a refused launch: {:?}",
+            children_of_self().is_empty(),
+            "no process may be spawned for a refused config: {:?}",
             children_of_self()
         );
         println!(
-            "production_launcher: scenario=landlock-mount-swapped code={:?} state=created children=0",
+            "production_launcher: scenario=bind-over-protected-path-refused code={:?} state=created children=0",
             err.code()
         );
     }
@@ -1471,7 +1466,7 @@ mod linux {
     /// シナリオ G: ホストの `/dev`（devtmpfs）を `bind` / `rbind` の元にした start は、付け替えた自分のマウントの
     /// fstype 名（`devtmpfs`）で拒否され、後始末で bind 先が残らない（SEC-1・#2129）。`f_type` は tmpfs と同じ値の
     /// ため `fstatfs` の判定では通り、mountinfo の照合だけが拒否する。拒否理由そのものは `exec::bind_mounts` の
-    /// 単体試験が照合する（launch 中の拒否は pivot 後の子で起き、状態 pipe では親へ届かない。シナリオ F と同じ）。
+    /// 単体試験が照合する（launch 中の拒否は pivot 後の子で起き、状態 pipe では親へ届かない）。
     fn scenario_g_devtmpfs_bind_refused(env: &Env, tag: u32) {
         // 前提: ホストの `/dev` が devtmpfs であること（そうでない環境では本シナリオは意味を持たないため失敗させる）。
         let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");

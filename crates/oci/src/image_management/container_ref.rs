@@ -224,6 +224,11 @@ mod tests {
             std::env::temp_dir().join(format!("fandhe-oci-cref-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
         let store = ImageStore::open(&dir)
             .expect("open")
             .with_timeout(Duration::from_millis(200));

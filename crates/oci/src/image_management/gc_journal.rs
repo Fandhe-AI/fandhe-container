@@ -19,8 +19,8 @@
 //! 残った孤児ファイルは運用者がストアの `blobs/sha256` から手動で確認・削除する。
 //!
 //! 信頼境界: ジャーナルの読み込みは種別・group/other の書き込み権限・サイズ・件数・未知フィールドを
-//! 検査するが、所有者（uid）は検査しない。ストア root 自体の所有者・権限の検査は `store.rs` の
-//! 永続化側の担当で、root が信頼できることを前提とする。
+//! 検査するが、所有者（uid）は検査しない。ストア root 自体の所有者・権限・祖先の検査は
+//! `ImageStore::open` が行う（#2381。unix のみ）ため、ここでは root が信頼できることを前提とする。
 //! 書き込み中のクラッシュで残る一時ファイル `@gc-pending.json.tmp-*` は、lock 取得時に回収する。
 //!
 //! 呼び出し元: `remove`（`execute_image_rm`）・`prune`（`execute_image_prune`）・`store`（lock 時の再試行）。
@@ -845,6 +845,11 @@ mod tests {
             let p = std::env::temp_dir().join(format!("fc-oci-gcj-{}-{n}", std::process::id()));
             let _ = fs::remove_dir_all(&p);
             fs::create_dir_all(p.join("blobs").join("sha256")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
+            }
             Root(p)
         }
         fn put(&self, dg: &Digest) {

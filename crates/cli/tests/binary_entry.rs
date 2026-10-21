@@ -1573,6 +1573,11 @@ fn cli1_image_tag_missing_source_is_not_found_on_linux() {
     let tmp = TmpDir::new("tag-nf");
     let root = tmp.0.join("images");
     std::fs::create_dir(&root).expect("mkdir image root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
     let out = run(&[
         "image",
         "tag",
@@ -1596,6 +1601,11 @@ fn cli1_image_tag_digest_target_is_invalid_argument_on_linux() {
     let tmp = TmpDir::new("tag-digest");
     let root = tmp.0.join("images");
     std::fs::create_dir(&root).expect("mkdir image root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
     let target = format!("busybox@sha256:{}", "a".repeat(64));
     let out = run(&[
         "image",
@@ -1755,6 +1765,11 @@ fn oci7_image_failures_keep_state_on_linux() {
     // 在庫に無い digest（空のストア）: 構造化エラーで失敗し、状態は作られない。
     let store = tmp.0.join("images");
     std::fs::create_dir(&store).expect("images");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
     let store_s = store.to_str().expect("utf8");
     let out = run(&[
         "--root",

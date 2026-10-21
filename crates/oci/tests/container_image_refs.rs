@@ -199,7 +199,7 @@ fn containers_of(store: &ImageStore) -> Vec<ContainerRefId> {
 #[test]
 fn oci7_create_then_delete_registers_and_releases_reference() {
     let tmp = Tmp::new("flow");
-    let image_root = tmp.sub("images");
+    let image_root = tmp.private_sub("images");
     let bundle = tmp.sub("bundle");
     make_bundle(&bundle);
     let state = FileStateStore::open(
@@ -257,7 +257,7 @@ fn oci7_reconcile_against_file_state_store_drops_stateless_refs() {
         StateRoot::from_override(tmp.private_sub("state")).expect("state root"),
     )
     .expect("state store");
-    let images = ImageStore::open(&tmp.sub("images")).expect("image store");
+    let images = ImageStore::open(&tmp.private_sub("images")).expect("image store");
     images
         .lock()
         .expect("lock")
@@ -321,7 +321,7 @@ fn oci7_create_with_unknown_manifest_leaves_nothing() {
         StateRoot::from_override(tmp.private_sub("state")).expect("state root"),
     )
     .expect("state store");
-    let images = ImageStore::open(&tmp.sub("images")).expect("image store");
+    let images = ImageStore::open(&tmp.private_sub("images")).expect("image store");
     let refs = StoreRefs::new(&images);
     let manifest = ImageManifestDigest::new(MANIFEST).expect("manifest");
 
@@ -347,7 +347,7 @@ fn oci7_delete_keeps_reference_of_create_stalled_before_state_create() {
         StateRoot::from_override(tmp.private_sub("state")).expect("state root"),
     )
     .expect("state store");
-    let images = ImageStore::open(&tmp.sub("images")).expect("image store");
+    let images = ImageStore::open(&tmp.private_sub("images")).expect("image store");
     images
         .lock()
         .expect("lock")
@@ -404,7 +404,7 @@ fn oci7_reference_released_after_state_update_and_recreate_succeeds() {
         StateRoot::from_override(tmp.private_sub("state")).expect("state root"),
     )
     .expect("state store");
-    let images = ImageStore::open(&tmp.sub("images")).expect("image store");
+    let images = ImageStore::open(&tmp.private_sub("images")).expect("image store");
     images
         .lock()
         .expect("lock")
@@ -474,7 +474,7 @@ fn oci7_unbound_reference_blocks_recreate_until_reclaimed_by_generation() {
         StateRoot::from_override(tmp.private_sub("state")).expect("state root"),
     )
     .expect("state store");
-    let images = ImageStore::open(&tmp.sub("images")).expect("image store");
+    let images = ImageStore::open(&tmp.private_sub("images")).expect("image store");
     images
         .lock()
         .expect("lock")

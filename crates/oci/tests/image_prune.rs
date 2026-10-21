@@ -39,6 +39,11 @@ fn fixture(name: &str) -> Fixture {
     let root = std::env::temp_dir().join(format!("fc-oci-prune-it-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("blobs").join("sha256")).expect("mkdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
     for n in [0xc1u8, 0x10, 0x11, 0xc2, 0x12, 0xc3, 0x13] {
         fs::write(blob(&root, n), vec![1u8; 16]).expect("write");
     }

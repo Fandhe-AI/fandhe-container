@@ -47,6 +47,10 @@ use sha2::{Digest as _, Sha256};
 
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
+use crate::manifest::{
+    MEDIA_TYPE_DOCKER_LAYER_FOREIGN_GZIP, MEDIA_TYPE_DOCKER_LAYER_GZIP, MEDIA_TYPE_OCI_LAYER_GZIP,
+    MEDIA_TYPE_OCI_LAYER_NONDIST_GZIP, MEDIA_TYPE_OCI_LAYER_NONDIST_TAR, MEDIA_TYPE_OCI_LAYER_TAR,
+};
 use crate::reference::Digest;
 use crate::registry::FetchedBlob;
 
@@ -469,24 +473,83 @@ pub enum LayerMediaType {
     TarGzip,
 }
 
+/// レイヤー `mediaType` の受理表の 1 行（#2311・OCI-1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerMediaTypeEntry {
+    /// `mediaType` の文字列（完全一致で照合する）。
+    pub media_type: &'static str,
+    /// 展開側（[`LayerMediaType::parse`]）が使う読み取り方式。
+    pub kind: LayerMediaType,
+    /// pull の事前拒否（`manifest::ensure_supported_layer_media_types`）が受けるか。
+    pub pull: bool,
+}
+
+/// レイヤー `mediaType` の受理集合の単一の真実源（#2311・OCI-1）。
+///
+/// 展開側（[`LayerMediaType::parse`]）は全 6 行を受け、pull の事前拒否は `pull: true` の行だけを受ける。
+/// 両者はこの表から導出するため、食い違いは表の `pull` 列に現れ、試験で固定する（pull は展開の部分集合）。
+///
+/// 暫定の決定（オーナー確認待ち）: pull は現状維持で gzip の 2 種のみ。理由は次のとおり。
+/// - pull の受理範囲を広げない（fail-closed。#2037 の受け入れ条件を変えない）。
+/// - nondistributable / foreign は descriptor の外部 `urls` を参照しうるが、registry の blob 取得は対応しない。
+/// - 非圧縮 tar を pull で受けるかは #2037 の受け入れ条件の変更にあたるため、オーナーが判断する。
+///
+/// 展開側は検証済みハンドル（`VerifiedLayerBlob`）で渡された blob に限って 6 種を受ける。
+/// zstd は #2029 の判断まで表に無い。
+pub const LAYER_MEDIA_TYPES: &[LayerMediaTypeEntry] = &[
+    LayerMediaTypeEntry {
+        media_type: MEDIA_TYPE_OCI_LAYER_TAR,
+        kind: LayerMediaType::Tar,
+        pull: false,
+    },
+    LayerMediaTypeEntry {
+        media_type: MEDIA_TYPE_OCI_LAYER_NONDIST_TAR,
+        kind: LayerMediaType::Tar,
+        pull: false,
+    },
+    LayerMediaTypeEntry {
+        media_type: MEDIA_TYPE_OCI_LAYER_GZIP,
+        kind: LayerMediaType::TarGzip,
+        pull: true,
+    },
+    LayerMediaTypeEntry {
+        media_type: MEDIA_TYPE_OCI_LAYER_NONDIST_GZIP,
+        kind: LayerMediaType::TarGzip,
+        pull: false,
+    },
+    LayerMediaTypeEntry {
+        media_type: MEDIA_TYPE_DOCKER_LAYER_GZIP,
+        kind: LayerMediaType::TarGzip,
+        pull: true,
+    },
+    LayerMediaTypeEntry {
+        media_type: MEDIA_TYPE_DOCKER_LAYER_FOREIGN_GZIP,
+        kind: LayerMediaType::TarGzip,
+        pull: false,
+    },
+];
+
+/// pull の事前拒否が受ける `mediaType` か（[`LAYER_MEDIA_TYPES`] の `pull` 列。完全一致）。
+///
+/// `manifest::ensure_supported_layer_media_types` から blob 取得前に呼ばれる。
+pub fn is_pull_supported_layer_media_type(media_type: &str) -> bool {
+    LAYER_MEDIA_TYPES
+        .iter()
+        .any(|e| e.pull && e.media_type == media_type)
+}
+
 impl LayerMediaType {
     /// `mediaType` 文字列（完全一致。パラメータ・大文字小文字の揺れは受けない）から読み取り方式を決める。
     ///
-    /// OCI の `layer.v1.tar`・`layer.v1.tar+gzip`、nondistributable 版、Docker の `rootfs.diff.tar.gzip`・
-    /// `rootfs.foreign.diff.tar.gzip` に対応する。それ以外（zstd を含む）は `Unimplemented`。
+    /// [`LAYER_MEDIA_TYPES`] の表引き。表に無い値（zstd を含む）は `Unimplemented`。
     pub fn parse(media_type: &str) -> Result<Self, OciError> {
-        match media_type {
-            "application/vnd.oci.image.layer.v1.tar"
-            | "application/vnd.oci.image.layer.nondistributable.v1.tar" => Ok(Self::Tar),
-            "application/vnd.oci.image.layer.v1.tar+gzip"
-            | "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip"
-            | "application/vnd.docker.image.rootfs.diff.tar.gzip"
-            | "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip" => Ok(Self::TarGzip),
-            _ => Err(OciError::new(
-                OciErrorCode::Unimplemented,
-                "unsupported layer mediaType",
-            )),
-        }
+        LAYER_MEDIA_TYPES
+            .iter()
+            .find(|e| e.media_type == media_type)
+            .map(|e| e.kind)
+            .ok_or_else(|| {
+                OciError::new(OciErrorCode::Unimplemented, "unsupported layer mediaType")
+            })
     }
 }
 
@@ -1317,6 +1380,56 @@ mod tests {
                 "{m}"
             );
         }
+    }
+
+    /// OCI-1・#2311: pull の受理集合は展開の部分集合で、両集合は具体値に固定される。
+    #[test]
+    fn oci1_pull_set_is_subset_of_extract_set() {
+        let mut pull: Vec<&str> = Vec::new();
+        let mut extract_only: Vec<&str> = Vec::new();
+        for e in LAYER_MEDIA_TYPES {
+            assert_eq!(
+                LayerMediaType::parse(e.media_type).unwrap(),
+                e.kind,
+                "{}",
+                e.media_type
+            );
+            assert_eq!(is_pull_supported_layer_media_type(e.media_type), e.pull);
+            if e.pull {
+                pull.push(e.media_type);
+            } else {
+                extract_only.push(e.media_type);
+            }
+        }
+        pull.sort_unstable();
+        extract_only.sort_unstable();
+        assert_eq!(
+            pull,
+            vec![
+                "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+            ]
+        );
+        assert_eq!(
+            extract_only,
+            vec![
+                "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip",
+                "application/vnd.oci.image.layer.nondistributable.v1.tar",
+                "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
+                "application/vnd.oci.image.layer.v1.tar",
+            ]
+        );
+    }
+
+    /// OCI-1・#2311: 表に重複する mediaType が無い。
+    #[test]
+    fn oci1_layer_media_type_table_has_no_duplicates() {
+        let mut v: Vec<&str> = LAYER_MEDIA_TYPES.iter().map(|e| e.media_type).collect();
+        v.sort_unstable();
+        let n = v.len();
+        v.dedup();
+        assert_eq!(v.len(), n);
+        assert_eq!(n, 6);
     }
 
     /// OCI-1: 非圧縮レイヤーの上限境界（ちょうどは成功・1 バイト超過で中断し以降も失敗）。

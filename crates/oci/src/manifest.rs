@@ -7,9 +7,12 @@
 //! 対応する `mediaType` は OCI image manifest / image index と Docker schema 2 の manifest / manifest list の
 //! 4 種のみ。これ以外（Docker schema 1 を含む）は `Unimplemented` で拒否する（互換範囲の最終確定は spec で検討中）。
 //!
-//! 対応するレイヤーの `mediaType` は gzip の 2 種（`application/vnd.oci.image.layer.v1.tar+gzip`・
-//! `application/vnd.docker.image.rootfs.diff.tar.gzip`）のみ。それ以外（zstd は #2029 で保留中、非圧縮 tar を含む）は
-//! blob を取得する前に `ensure_supported_layer_media_types` が `Unimplemented` で拒否する（#2037・OCI-1・ERR-1）。
+//! pull で受けるレイヤーの `mediaType` は gzip の 2 種（`application/vnd.oci.image.layer.v1.tar+gzip`・
+//! `application/vnd.docker.image.rootfs.diff.tar.gzip`）のみ。それ以外（zstd は #2029 で保留中、非圧縮 tar・
+//! nondistributable・foreign を含む）は blob を取得する前に `ensure_supported_layer_media_types` が
+//! `Unimplemented` で拒否する（#2037・OCI-1・ERR-1）。この集合は展開側と同じ表
+//! （`crate::layer::LAYER_MEDIA_TYPES`）から導出する（#2311）。非圧縮 tar を pull で受けるかは暫定で
+//! 「受けない」（現状維持）とし、オーナー確認待ち。
 //!
 //! 本文はレジストリが返す非信頼入力として扱う。`unwrap` / `expect` / 添字アクセスを使わず、不正な JSON・
 //! 必須項目の欠落・不正な digest は `DataLoss` に分類する。message は固定文で、本文の断片は載せない
@@ -50,11 +53,17 @@ fn data_loss(msg: &'static str) -> OciError {
 pub const MEDIA_TYPE_OCI_LAYER_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 /// Docker の gzip 圧縮レイヤーの `mediaType`。
 pub const MEDIA_TYPE_DOCKER_LAYER_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
-/// 展開側（`layer`）が扱えるレイヤーの `mediaType` の一覧（現状は gzip のみ。zstd は #2029 で保留中）。
-///
-/// 展開側の対応が増えたとき（#2017）は、この一覧を揃える。
-pub const SUPPORTED_LAYER_MEDIA_TYPES: &[&str] =
-    &[MEDIA_TYPE_OCI_LAYER_GZIP, MEDIA_TYPE_DOCKER_LAYER_GZIP];
+/// OCI の非圧縮レイヤーの `mediaType`（展開のみ対応。pull では拒否）。
+pub const MEDIA_TYPE_OCI_LAYER_TAR: &str = "application/vnd.oci.image.layer.v1.tar";
+/// OCI の nondistributable 非圧縮レイヤーの `mediaType`（展開のみ対応。pull では拒否）。
+pub const MEDIA_TYPE_OCI_LAYER_NONDIST_TAR: &str =
+    "application/vnd.oci.image.layer.nondistributable.v1.tar";
+/// OCI の nondistributable gzip レイヤーの `mediaType`（展開のみ対応。pull では拒否）。
+pub const MEDIA_TYPE_OCI_LAYER_NONDIST_GZIP: &str =
+    "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip";
+/// Docker の foreign gzip レイヤーの `mediaType`（展開のみ対応。pull では拒否）。
+pub const MEDIA_TYPE_DOCKER_LAYER_FOREIGN_GZIP: &str =
+    "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip";
 /// エラー message に載せるレイヤー `mediaType` の最大バイト数（超過分は `...` に置き換える）。
 pub const LAYER_MEDIA_TYPE_DISPLAY_MAX_BYTES: usize = 128;
 
@@ -83,10 +92,11 @@ fn display_media_type(mt: &str) -> String {
 ///
 /// `registry` の manifest 解決（`fetch_manifest`）が image manifest を得た直後に呼ぶ。未対応（zstd・非圧縮 tar・
 /// 未知の値）の最初の 1 件を `Unimplemented` で返し、config / layer の blob 取得を始めさせない。
-/// 判定は完全一致（`SUPPORTED_LAYER_MEDIA_TYPES`）。zstd への対応は #2029 で保留中。
+/// 受理集合は `crate::layer::LAYER_MEDIA_TYPES` の `pull` 列から導出する（展開側と同じ真実源。#2311）。
+/// 判定は完全一致。zstd への対応は #2029 で保留中。
 pub fn ensure_supported_layer_media_types(manifest: &ImageManifest) -> Result<(), OciError> {
     for (i, layer) in manifest.layers.iter().enumerate() {
-        if !SUPPORTED_LAYER_MEDIA_TYPES.contains(&layer.media_type.as_str()) {
+        if !crate::layer::is_pull_supported_layer_media_type(&layer.media_type) {
             return Err(OciError::new(
                 OciErrorCode::Unimplemented,
                 format!(
@@ -567,6 +577,24 @@ mod tests {
         assert_eq!(code_of(b.as_bytes(), None), OciErrorCode::ResourceExhausted);
         let big = vec![b' '; MANIFEST_MAX_BYTES as usize + 1];
         assert_eq!(code_of(&big, None), OciErrorCode::ResourceExhausted);
+    }
+
+    /// OCI-1・#2311: 表の各行について、事前拒否は `pull` 列が真のときだけ通す。
+    #[test]
+    fn oci1_ensure_follows_layer_media_type_table() {
+        for e in crate::layer::LAYER_MEDIA_TYPES {
+            let r = ensure_supported_layer_media_types(&layers_manifest(&[e.media_type]));
+            if e.pull {
+                assert!(r.is_ok(), "{}", e.media_type);
+            } else {
+                assert_eq!(
+                    r.unwrap_err().code(),
+                    OciErrorCode::Unimplemented,
+                    "{}",
+                    e.media_type
+                );
+            }
+        }
     }
 
     fn layers_manifest(types: &[&str]) -> ImageManifest {

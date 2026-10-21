@@ -123,7 +123,8 @@ mod linux {
     use fandhe_container_oci::error::{OciError, OciErrorCode};
     use fandhe_container_oci::layer::extract::{ExtractLimits, extract_layer_blobs};
     use fandhe_container_oci::layer::{
-        DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, verify_blob_digest, verify_fetched_blob,
+        DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, LayerMediaType, verify_blob_digest,
+        verify_fetched_blob,
     };
     use fandhe_container_oci::manifest::Platform;
     use fandhe_container_oci::reference::ImageReference;
@@ -156,11 +157,6 @@ mod linux {
     /// image config が PATH を持たないときの既定値。
     const DEFAULT_PATH_ENV: &str =
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-    /// 受け付ける gzip レイヤーの mediaType。
-    const GZIP_LAYER_TYPES: &[&str] = &[
-        "application/vnd.oci.image.layer.v1.tar+gzip",
-        "application/vnd.docker.image.rootfs.diff.tar.gzip",
-    ];
 
     // ----- 失敗の表現 --------------------------------------------------------------------------------------
 
@@ -946,13 +942,15 @@ mod linux {
         r.manifest_digest = Some(resolved.manifest_digest.as_str().to_string());
         r.from_index = Some(resolved.from_index);
         r.layers = resolved.manifest.layers.len();
-        // 未対応の圧縮は通信の前に失敗にする（実装済みを装わない。REPAIR-3）。
-        if resolved
-            .manifest
-            .layers
-            .iter()
-            .any(|l| !GZIP_LAYER_TYPES.contains(&l.media_type.as_str()))
-        {
+        // 通常は fetch_manifest の事前拒否（layer::LAYER_MEDIA_TYPES の pull 列）が先に効く。ここは、この
+        // harness の展開器が gzip 固定であることに対する防御で、将来 pull の受理集合が広がっても
+        // 非圧縮 tar が gzip デコーダへ届く前に止める（実装済みを装わない。REPAIR-3）。
+        if resolved.manifest.layers.iter().any(|l| {
+            !matches!(
+                LayerMediaType::parse(&l.media_type),
+                Ok(LayerMediaType::TarGzip)
+            )
+        }) {
             return Err(Failure::new(
                 "extract",
                 OciErrorCode::Unimplemented.as_str(),

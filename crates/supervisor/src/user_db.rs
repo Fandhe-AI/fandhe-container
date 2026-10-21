@@ -14,7 +14,9 @@
 //! - 期限（既定 5 秒）を超えたら kill して回収する。期限は子の終了待ちだけでなく標準出力の読み取りにも適用する
 //!   （バックグラウンドの孫が標準出力を継承して EOF が来なくても期限で打ち切る。REPAIR-5）。標準出力は
 //!   `UnixStream` 対の読み取り側を読み取りタイムアウトつきで読む（読み取り用スレッドも `unsafe` も使わない。
-//!   `start_entry` の手順 8 より前に常駐スレッドを作らない制約）。出力は 4 KiB まで。
+//!   `start_entry` の手順 8 より前に常駐スレッドを作らない制約）。出力は 4 KiB まで。全体期限は読み取りのたびに
+//!   確認し、少量ずつ出力され続けても超えて待たない。子は専用プロセスグループで起動し、期限切れ・出力超過時は
+//!   グループごと kill して孫まで後始末する（`sys::kill_process_group`）。
 //! - 終了コード 2（キー無し）は、`/etc/nsswitch.conf` の passwd 系が `files` 等のローカル源だけのときに限り
 //!   「名前なし」とする。LDAP・sssd 等の遠隔源があるときは NSS の障害と区別できないため `Err`（起動拒否）。
 //! - 参照の失敗・不正な出力・期限切れは `Err`（fail-closed）。名前の有無を判定できないまま 1 対 1 写像へ落とさない。
@@ -188,10 +190,12 @@ mod linux {
     /// 期限後の子の回収の猶予。
     const REAP_GRACE: Duration = Duration::from_secs(2);
 
-    /// 子を kill し、有限の猶予内で回収する。回収できなければ `Timeout` を返す（無期限の `wait` はしない。
-    /// 割り込み不能な I/O 待ちの子が SIGKILL 後も残り得るため。REPAIR-5）。kill の失敗は握りつぶさず、
-    /// 子が既に終了していた場合を除いて回収の可否で判定する。
+    /// 子とその子孫（専用プロセスグループ）を kill し、有限の猶予内で子を回収する。回収できなければ `Timeout` を
+    /// 返す（無期限の `wait` はしない。割り込み不能な I/O 待ちの子が SIGKILL 後も残り得るため。REPAIR-5）。
+    /// 孫が標準出力を持ったまま親が先に終了・回収済みでも、グループに孫が残る間は pgid は再利用されないため
+    /// グループ宛ての kill は安全に届く。グループ kill の失敗（既に空）は無視し、回収の可否で判定する。
     fn kill_and_reap(child: &mut std::process::Child) -> Result<(), TraitError> {
+        let _ = crate::sys::kill_process_group(child.id());
         let _ = child.kill();
         let until = Instant::now() + REAP_GRACE;
         loop {
@@ -318,6 +322,8 @@ mod linux {
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)));
+        // 専用プロセスグループで起動し、期限切れ・出力超過時に子孫まで kill する（pgid = 子の pid）。
+        std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
         crate::sys::clear_ambient_caps_on_exec(&mut cmd);
         let spawned = cmd.spawn();
         // Command が持つ親側の書き込み端を閉じる。残ると子の終了後も EOF が来ない。
@@ -329,8 +335,23 @@ mod linux {
         let mut chunk = [0u8; 1024];
         let mut eof = false;
         let mut status = None;
+        let timed_out = |child: &mut std::process::Child| -> TraitError {
+            match kill_and_reap(child) {
+                Err(e) => e,
+                Ok(()) => TraitError::new(ErrorCode::Timeout, "the user database lookup timed out"),
+            }
+        };
         loop {
+            // 出力が少量ずつ届き続けても全体期限を超えて待たない（ループ先頭で毎回確認する）。
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(timed_out(&mut child));
+            }
             if !eof {
+                let slice = POLL_INTERVAL
+                    .min(deadline - now)
+                    .max(Duration::from_millis(1));
+                reader.set_read_timeout(Some(slice)).map_err(|_| failed())?;
                 match reader.read(&mut chunk) {
                     Ok(0) => eof = true,
                     Ok(n) => {
@@ -366,14 +387,11 @@ mod linux {
                 }
             }
             if let (Some(s), true) = (status, eof) {
+                // 成功を返す直前にも期限を確認する（期限後に揃った結果は採らない）。
+                if Instant::now() >= deadline {
+                    return Err(timed_out(&mut child));
+                }
                 return Ok((s.code(), out));
-            }
-            if Instant::now() >= deadline {
-                kill_and_reap(&mut child)?;
-                return Err(TraitError::new(
-                    ErrorCode::Timeout,
-                    "the user database lookup timed out",
-                ));
             }
             if eof {
                 // EOF 後は読み取りが即座に返るため、子の終了待ちの空回りを避ける。
@@ -567,6 +585,53 @@ mod linux {
             let e = resolve(&d, &l).unwrap_err();
             assert_eq!(e.code(), ErrorCode::Timeout);
             assert!(t.elapsed() < Duration::from_secs(4));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        /// REPAIR-5: 少量ずつ出力し続けるヘルパーでも全体期限で打ち切る（出力上限 4 KiB に達する前）。
+        #[test]
+        fn repair5_trickling_output_hits_overall_deadline() {
+            let d = tmp("trickle");
+            let l = stub(&d, "while true; do printf x; sleep 0.02; done");
+            let l = UserDbLookup {
+                timeout: Duration::from_secs(1),
+                ..l
+            };
+            let t = Instant::now();
+            let e = resolve(&d, &l).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::Timeout);
+            assert!(t.elapsed() < Duration::from_secs(3));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        /// REPAIR-5: 期限切れでヘルパーの孫も kill する。
+        #[test]
+        fn repair5_timeout_kills_grandchild() {
+            let d = tmp("gc");
+            let pidfile = d.join("gpid");
+            let l = stub(
+                &d,
+                &format!("sleep 30 &\necho $! > {}\nexit 2", pidfile.display()),
+            );
+            let l = UserDbLookup {
+                timeout: Duration::from_secs(1),
+                ..l
+            };
+            let e = resolve(&d, &l).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::Timeout);
+            let pid = std::fs::read_to_string(&pidfile).unwrap();
+            let proc = format!("/proc/{}", pid.trim());
+            let mut gone = false;
+            for _ in 0..100 {
+                // ゾンビ（init 回収待ち）も終了済みとみなす。
+                let st = std::fs::read_to_string(format!("{proc}/stat")).unwrap_or_default();
+                if st.is_empty() || st.contains(") Z ") {
+                    gone = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(gone);
             let _ = std::fs::remove_dir_all(&d);
         }
 

@@ -1881,12 +1881,12 @@ mod linux {
         LinuxResourceLimits, ProductionLauncher, ProductionLauncherBuilder, SubordinateIdSource,
         load_resource_limits,
     };
-    use fandhe_container_core::rootless::{SubIdOwner, load_subordinate_ids};
+    use fandhe_container_core::rootless::SubIdOwner;
 
     use super::*;
     use crate::id_model::{
-        MAX_PASSWD_BYTES, RootlessIdModel, SubIdFileProbe, owner_name_from_passwd,
-        select_rootless_id_model,
+        RootlessIdModel, SYSTEM_PASSWD, SYSTEM_SUBGID, SYSTEM_SUBUID, probe_sub_id_file,
+        read_owner_name, select_rootless_id_model,
     };
     use crate::privilege::{MAX_STATUS_BYTES, parse_proc_status};
     use crate::start_contract::StartArgs;
@@ -1979,26 +1979,6 @@ mod linux {
         Ok(IsolationPrivilege::RootlessSingleId)
     }
 
-    /// 上限つきでファイルを読む（超過は `None`）。
-    fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
-        use std::io::Read as _;
-        let mut buf = Vec::new();
-        File::open(path)?
-            .take(limit.saturating_add(1))
-            .read_to_end(&mut buf)?;
-        Ok((u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit).then_some(buf))
-    }
-
-    /// subuid / subgid の 1 ファイルを分類する（`ErrorCode::NotFound` はファイル無し。それ以外の失敗は `Unusable`）。
-    fn probe_sub_id_file(path: &Path, owner: &SubIdOwner) -> SubIdFileProbe {
-        match load_subordinate_ids(path, owner) {
-            Ok(ranges) if ranges.is_empty() => SubIdFileProbe::NoOwnerRows,
-            Ok(_) => SubIdFileProbe::Assigned,
-            Err(e) if e.code == ErrorCode::NotFound => SubIdFileProbe::Absent,
-            Err(_) => SubIdFileProbe::Unusable,
-        }
-    }
-
     /// `/proc/self/status` の内容と 3 つの設定ファイルから権限モデルを決める（#2243・CORE-6・SEC-5）。
     ///
     /// 手順: rootful を拒否（`privilege_for_status`）→ `passwd` から実効 uid の名前を得る（NSS を使わない）→ subuid / subgid を
@@ -2015,22 +1995,7 @@ mod linux {
         let snapshot = parse_proc_status(status_text)
             .map_err(|e| TraitError::new(e.code, "failed to read the process credentials"))?;
         let (real, effective) = (snapshot.uid.real, snapshot.uid.effective);
-        let name = match read_bounded(passwd, MAX_PASSWD_BYTES) {
-            Ok(Some(bytes)) => owner_name_from_passwd(&bytes, effective)?,
-            Ok(None) => {
-                return Err(TraitError::new(
-                    ErrorCode::FailedPrecondition,
-                    "the passwd database is unusable",
-                ));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => {
-                return Err(TraitError::new(
-                    ErrorCode::FailedPrecondition,
-                    "the passwd database is unusable",
-                ));
-            }
-        };
+        let name = read_owner_name(passwd, effective)?;
         // 名前が規則（文字種・長さ）に違反する行は、None へ黙って落とさず拒否する（Single への縮退を避ける）。
         let owner = SubIdOwner::new(effective, name.clone()).map_err(|_| {
             TraitError::new(
@@ -2082,9 +2047,9 @@ mod linux {
             let privilege = status.and_then(|text| {
                 resolve_launch_privilege(
                     &text,
-                    Path::new("/etc/passwd"),
-                    Path::new("/etc/subuid"),
-                    Path::new("/etc/subgid"),
+                    Path::new(SYSTEM_PASSWD),
+                    Path::new(SYSTEM_SUBUID),
+                    Path::new(SYSTEM_SUBGID),
                 )
             });
             Self {

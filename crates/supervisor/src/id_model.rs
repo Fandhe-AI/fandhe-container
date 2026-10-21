@@ -26,6 +26,11 @@
 //! 既知の制約: `/etc/passwd` に載らないユーザー（LDAP / sssd 等）は名前なしとなり、数値 uid の行だけで照合される。
 //! `newuidmap` は NSS で呼び出し元を解決するため、NSS と `/etc/passwd` が食い違うと helper が拒否する（fail-closed）。
 //!
+//! # doctor との共用
+//! 設定ファイルの既定位置（`SYSTEM_*`）・passwd の読み取り（`read_owner_name`）・subuid / subgid の分類
+//! （`probe_sub_id_file`）は Linux 限定で公開し、`start`（`start_entry` の `resolve_launch_privilege`）と
+//! CLI の `doctor`（`doctor::id_mapping_check`。#2387）が同じ関数を呼ぶ。診断と `start` の判定を食い違わせない。
+//!
 //! エラー文言は固定の英語で、ユーザー名・パス・errno・ファイルの内容を含めない。
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};
@@ -56,6 +61,16 @@ pub enum RootlessIdModel {
     /// コンテナ 0 → 実効 uid / gid、1.. → subordinate 範囲（`newuidmap` / `newgidmap`）。
     SubordinateIds,
 }
+
+/// `/etc/passwd` の既定位置（NSS は使わない）。
+#[cfg(target_os = "linux")]
+pub const SYSTEM_PASSWD: &str = "/etc/passwd";
+/// `/etc/subuid` の既定位置。
+#[cfg(target_os = "linux")]
+pub const SYSTEM_SUBUID: &str = "/etc/subuid";
+/// `/etc/subgid` の既定位置。
+#[cfg(target_os = "linux")]
+pub const SYSTEM_SUBGID: &str = "/etc/subgid";
 
 fn precondition(message: &'static str) -> TraitError {
     TraitError::new(ErrorCode::FailedPrecondition, message)
@@ -121,6 +136,48 @@ pub fn owner_name_from_passwd(bytes: &[u8], uid: u32) -> Result<Option<String>, 
         };
     }
     Ok(None)
+}
+
+/// 上限つきでファイルを読む（超過は `None`）。
+#[cfg(target_os = "linux")]
+fn read_bounded(path: &std::path::Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    Ok((u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit).then_some(buf))
+}
+
+/// `passwd` を上限つきで読み、`effective` の名前を返す（`start` と `doctor` が共用。#2387）。
+///
+/// ファイルが無ければ `None`（名前なしで数値 uid の行だけ照合する）。上限超過・その他の I/O 失敗・書式不正は
+/// 固定文言の `FailedPrecondition`。
+#[cfg(target_os = "linux")]
+pub fn read_owner_name(
+    passwd: &std::path::Path,
+    effective: u32,
+) -> Result<Option<String>, TraitError> {
+    match read_bounded(passwd, MAX_PASSWD_BYTES) {
+        Ok(Some(bytes)) => owner_name_from_passwd(&bytes, effective),
+        Ok(None) => Err(precondition("the passwd database is unusable")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(precondition("the passwd database is unusable")),
+    }
+}
+
+/// subuid / subgid の 1 ファイルを分類する（`ErrorCode::NotFound` はファイル無し。それ以外の失敗は `Unusable`）。
+#[cfg(target_os = "linux")]
+pub fn probe_sub_id_file(
+    path: &std::path::Path,
+    owner: &fandhe_container_core::rootless::SubIdOwner,
+) -> SubIdFileProbe {
+    match fandhe_container_core::rootless::load_subordinate_ids(path, owner) {
+        Ok(ranges) if ranges.is_empty() => SubIdFileProbe::NoOwnerRows,
+        Ok(_) => SubIdFileProbe::Assigned,
+        Err(e) if e.code == ErrorCode::NotFound => SubIdFileProbe::Absent,
+        Err(_) => SubIdFileProbe::Unusable,
+    }
 }
 
 #[cfg(test)]
@@ -226,5 +283,67 @@ mod tests {
         assert_eq!(run(&big), expect);
         let many = "x:x:1:1\n".repeat(MAX_PASSWD_LINES + 1);
         assert_eq!(run(many.as_bytes()), expect);
+    }
+
+    /// Linux 限定: `read_owner_name`・`probe_sub_id_file` の分類（`doctor` と共用する経路。#2387・CORE-6）。
+    #[cfg(target_os = "linux")]
+    mod linux_shared {
+        use super::super::*;
+        use fandhe_container_core::rootless::SubIdOwner;
+        use std::path::PathBuf;
+
+        fn tmp(tag: &str) -> PathBuf {
+            let d = std::env::temp_dir().join(format!(
+                "fc-idmodel-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        #[test]
+        fn core6_read_owner_name_cases() {
+            let d = tmp("pw");
+            assert_eq!(read_owner_name(&d.join("none"), 1000).unwrap(), None);
+            let pw = d.join("passwd");
+            std::fs::write(&pw, "alice:x:1000:1000::/h:/bin/sh\n").unwrap();
+            assert_eq!(
+                read_owner_name(&pw, 1000).unwrap(),
+                Some("alice".to_owned())
+            );
+            let big = d.join("big");
+            std::fs::write(
+                &big,
+                vec![b'a'; usize::try_from(MAX_PASSWD_BYTES).unwrap() + 1],
+            )
+            .unwrap();
+            let e = read_owner_name(&big, 1000).unwrap_err();
+            assert_eq!(e.message(), "the passwd database is unusable");
+            // ディレクトリは読めない（NotFound 以外の I/O 失敗）。
+            let e = read_owner_name(&d, 1000).unwrap_err();
+            assert_eq!(e.message(), "the passwd database is unusable");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn core6_probe_sub_id_file_cases() {
+            let d = tmp("sub");
+            let owner = SubIdOwner::new(1000, Some("alice".to_owned())).unwrap();
+            assert_eq!(
+                probe_sub_id_file(&d.join("none"), &owner),
+                SubIdFileProbe::Absent
+            );
+            let f = d.join("subuid");
+            std::fs::write(&f, "bob:100000:65536\n").unwrap();
+            assert_eq!(probe_sub_id_file(&f, &owner), SubIdFileProbe::NoOwnerRows);
+            std::fs::write(&f, "alice:100000:65536\n").unwrap();
+            assert_eq!(probe_sub_id_file(&f, &owner), SubIdFileProbe::Assigned);
+            std::fs::write(&f, "alice:bad\n").unwrap();
+            assert_eq!(probe_sub_id_file(&f, &owner), SubIdFileProbe::Unusable);
+            assert_eq!(probe_sub_id_file(&d, &owner), SubIdFileProbe::Unusable);
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 }

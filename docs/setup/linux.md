@@ -76,6 +76,7 @@ rootless の `start` は、`/etc/subuid` と `/etc/subgid` の設定で ID 写�
 - 自分の行は、ユーザー名（`alice:100000:65536`。ダミーの値）か数値の uid で書く。名前は `/etc/passwd` から実効 uid で引く（NSS は使わない。環境変数 `USER` も使わない）
 - `/etc/passwd` に載らないユーザー（LDAP・sssd 等）は名前が分からず、数値 uid の行だけで照合する。`newuidmap` は NSS で呼び出し元を解決するため、食い違うと helper が拒否して起動に失敗する
 - 範囲があるのに `uidmap` が無い・検証に通らないときも起動に失敗する（1 対 1 へ縮退しない）
+- これらの前提は `fandhe-container doctor` で `start` の前に確かめられる（読み取りのみ。`start` と同じ判定を使う。CORE-6・SEC-5・#2387）。主な `code` は、`SUBORDINATE_IDS_INCOMPLETE`（片方だけ）・`SUBUID_UNUSABLE` / `SUBGID_UNUSABLE`（読めない・書式不正）・`SUBORDINATE_ID_RANGE_INVALID`（範囲を写像にできない）・`ID_MAP_HELPER_NOT_FOUND` / `ID_MAP_HELPER_UNTRUSTED`（`newuidmap` / `newgidmap` が無い・信頼できない）で、いずれも警告（終了コード 3）。`SUBORDINATE_IDS_NOT_CONFIGURED`（1 対 1 写像になる）は通知のみで終了コードは 0 のまま
 
 ## 起動の前提（systemd の user マネージャ）
 
@@ -90,7 +91,7 @@ rootless の `start` は supervisor を `systemd-run --user --scope` で包ん�
 fandhe-container doctor
 ```
 
-診断は stdout に JSON Lines で出る（`code` と対処 `remediation` つき）。終了コードは、前提が満たされない警告があれば 3、判定できなければ 4、問題がなければ 0 である。root で実行すると検査を省く。doctor は実行した CLI 自身の cgroup が委譲されているかも検査する（`delete` と同じ検出）。委譲されていないこと（`CGROUP_NOT_DELEGATED`）は `start` に影響しないため通知のみで、終了コードは 0 のままである。
+診断は stdout に JSON Lines で出る（`code` と対処 `remediation` つき）。終了コードは、前提が満たされない警告があれば 3、判定できなければ 4、問題がなければ 0 である。root で実行すると検査を省く。rootless の ID 写像の前提（subuid・subgid・`newuidmap` / `newgidmap`）も検査する（上の節）。doctor は実行した CLI 自身の cgroup が委譲されているかも検査する（`delete` と同じ検出）。委譲されていないこと（`CGROUP_NOT_DELEGATED`）は `start` に影響しないため通知のみで、終了コードは 0 のままである。
 
 `delete` は cgroup の配置を記録したコンテナを消すとき、実行中の cgroup が委譲されている必要がある。通常のログインセッション（SSH・TTY ログイン）の cgroup は委譲されていないため、そのまま実行すると失敗する（事前に doctor の `CGROUP_NOT_DELEGATED` で確かめられる）。委譲されたスコープの中で実行する。
 

@@ -70,7 +70,7 @@ pub mod exec;
 pub mod health;
 pub mod healthcheck;
 #[cfg(any(target_os = "linux", test))]
-mod id_model;
+pub mod id_model;
 pub mod inspect;
 pub mod launcher;
 pub mod log_pipeline;

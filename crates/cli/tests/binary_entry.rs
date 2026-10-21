@@ -1700,6 +1700,131 @@ fn oci7_image_option_usage_errors() {
     }
 }
 
+/// CORE-6・SEC-5・REPAIR-12（#2387）: 実バイナリの `doctor` が rootless ID 写像の前提の診断を本番入口から出し、
+/// JSON Lines の形と終了コードの合成が具体値で一致する。入力元は固定位置のため、実行環境ごとに該当する枝を照合する
+/// （root は通知 1 行、非 root は診断なし〔pass〕か Notice〔pass〕か Warning〔終了コード 3〕のいずれか）。
+#[cfg(target_os = "linux")]
+#[test]
+fn doctor_reports_id_mapping_diagnostics_through_the_real_entry() {
+    // 診断コードと severity・check・state の対応（`id_mapping_check::evaluate` の全件）。
+    const KNOWN: &[(&str, &str, &str, &str)] = &[
+        (
+            "notice",
+            "ID_MAPPING_CHECK_SKIPPED_AS_ROOT",
+            "privilege",
+            "rootful",
+        ),
+        (
+            "notice",
+            "ID_MAPPING_INCONCLUSIVE",
+            "privilege",
+            "unreadable",
+        ),
+        ("warning", "PASSWD_UNUSABLE", "passwd", "unusable"),
+        (
+            "warning",
+            "SUBID_OWNER_NAME_INVALID",
+            "passwd",
+            "invalid_name",
+        ),
+        (
+            "notice",
+            "SUBID_OWNER_NAME_UNRESOLVED",
+            "passwd",
+            "unresolved",
+        ),
+        ("warning", "SUBUID_UNUSABLE", "subuid", "unusable"),
+        ("warning", "SUBGID_UNUSABLE", "subgid", "unusable"),
+        (
+            "warning",
+            "SUBORDINATE_IDS_INCOMPLETE",
+            "id_model",
+            "subuid_only",
+        ),
+        (
+            "warning",
+            "SUBORDINATE_IDS_INCOMPLETE",
+            "id_model",
+            "subgid_only",
+        ),
+        (
+            "warning",
+            "SUBORDINATE_IDS_UID_MISMATCH",
+            "id_model",
+            "uid_mismatch",
+        ),
+        (
+            "notice",
+            "SUBORDINATE_IDS_NOT_CONFIGURED",
+            "id_model",
+            "single_id",
+        ),
+        (
+            "warning",
+            "SUBORDINATE_ID_RANGE_INVALID",
+            "id_model",
+            "range_invalid",
+        ),
+        (
+            "warning",
+            "ID_MAP_HELPER_NOT_FOUND",
+            "id_map_helpers",
+            "not_found",
+        ),
+        (
+            "warning",
+            "ID_MAP_HELPER_UNTRUSTED",
+            "id_map_helpers",
+            "untrusted",
+        ),
+    ];
+    let out = run(&["doctor"]);
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let code = out.status.code().expect("exit code");
+    assert!([0, 3, 4].contains(&code), "{code}");
+    let is_idmap = |l: &str| {
+        KNOWN
+            .iter()
+            .any(|(_, c, _, _)| l.contains(&format!("\"code\":\"{c}\"")))
+    };
+    let idmap_lines: Vec<&str> = stdout.lines().filter(|l| is_idmap(l)).collect();
+    let mut idmap_warning = false;
+    for l in &idmap_lines {
+        let hit = KNOWN.iter().any(|(sev, c, chk, st)| {
+            l.starts_with(&format!("{{\"severity\":\"{sev}\",\"code\":\"{c}\","))
+                && l.ends_with(&format!("\"check\":\"{chk}\",\"state\":\"{st}\"}}"))
+        });
+        assert!(hit, "unexpected id mapping line: {l}");
+        assert!(
+            l.contains("\"message\":\"") && l.contains("\"remediation\":["),
+            "{l}"
+        );
+        idmap_warning |= l.starts_with("{\"severity\":\"warning\",");
+    }
+    if is_root() {
+        assert_eq!(idmap_lines.len(), 1, "{stdout}");
+        assert!(idmap_lines[0].contains("\"code\":\"ID_MAPPING_CHECK_SKIPPED_AS_ROOT\""));
+    }
+    // 終了コードへの合成: ID 写像の Warning があれば全体は 3。
+    if idmap_warning {
+        assert_eq!(code, 3, "{stdout}");
+    }
+    // 全体に Warning が無ければ 3 にならない。
+    if !doctor_has_warning(&stdout) {
+        assert_ne!(code, 3, "{stdout}");
+    }
+    // 出力順: ID 写像の行は他の診断の行の後ろに並ぶ。
+    let all_lines: Vec<&str> = stdout.lines().collect();
+    let first_idmap = all_lines.iter().position(|l| is_idmap(l));
+    let last_other = all_lines
+        .iter()
+        .rposition(|l| !is_idmap(l) && l.starts_with("{\"severity\""));
+    if let (Some(f), Some(o)) = (first_idmap, last_other) {
+        assert!(o < f, "{stdout}");
+    }
+}
+
 /// OCI-7・ERR-1・ERR-2・#2315: Linux で、不正な在庫・ストアルート・digest での create は core に入る前に
 /// 構造化エラーと非ゼロ終了コードで終わり、状態ルートにコンテナを作らない。delete は失敗しても状態を保持する。
 #[cfg(target_os = "linux")]

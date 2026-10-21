@@ -160,6 +160,13 @@
 //!   層の差し替え
 //!   （overlay の層は開き直しが実際の backing directory と同一とは限らない〔lowerdir のパスを後から別の bind で覆う等〕ため、
 //!   層の属するマウントの `(dev, path)` による照合〔#2166 の再指摘〕の後も、overlayfs を含む元は同一性を保証できず fail-closed で拒否する）
+//! - 保護対象（状態ルート・rootfs・bundle）の側が overlayfs の上にある場合の逆方向の別名（#2317）は、適用の時点の mountinfo で
+//!   保護対象の dev の行が `overlay` なら、その層を `resolve_overlay_layers` で解決して保護対象に加え（`protected_overlay_layers`）、
+//!   宛先を作る前に inode（`judge_source_against_layers`）と mountinfo の `(dev, path)` で照合する。rootfs・bundle 由来の層は同一・
+//!   祖先・子孫のすべてを `bind_source_contains_rootfs` で拒否する。層を解決できない場合（Docker のように `/` が overlay で下層が
+//!   見えない環境を含む）は `FAILED_PRECONDITION`。残余は順方向と同じく、開き直した層が実際の backing directory と同一とは限らない点で、
+//!   逆方向では一律拒否にしない（一律拒否にすると保護対象が overlay 上にある限りどの bind も拒否になるため）。入れ子の overlay は拒否で代える。
+//!   `start` の fork 前の一次検査（`MountRow` が fstype を持たない）には足さず、restart を含めて毎回走る適用の段が権威である
 //! - 疑似 FS の元は `f_type`（と配下の mountinfo の fstype）の**拒否リスト**で拒否する（#2098・#2065 案 B）。リストにない未知の
 //!   疑似 FS は受ける。devtmpfs（ホストの `/dev`）は `f_type` が tmpfs と同じで区別できないため、付け替えた自分のマウントの
 //!   mountinfo の fstype 名 `devtmpfs` で拒否する（#2129。手順 9）。FUSE（lxcfs のように `/proc` に似た内容を作るもの）・
@@ -691,7 +698,16 @@ fn apply_one(
     {
         return Err(violation(spec, reason));
     }
-    check_source_not_protected(ctx, spec, &src)?;
+    // 保護対象が overlayfs の上にあるとき、その層（下層 FS 上の実パス）を経由した別名を、宛先に何かを作る前に塞ぐ
+    // （逆方向の照合。#2317・SEC-1）。mountinfo は 1 回だけ読み、続く mountinfo の照合にも使い回す。
+    if !ctx.protected.is_empty() {
+        let info = (deps.mountinfo)()?;
+        let layers = protected_overlay_layers(ctx, spec, &info)?;
+        if let Some(reason) = judge_source_against_layers(src.dev_ino(), &dir_ids, &layers) {
+            return Err(violation(spec, reason));
+        }
+        check_source_not_protected(ctx, spec, &src, &info, &layers)?;
+    }
     let kind = src.kind();
     let dest = pin_target(ctx, spec, kind, state)?;
     if (deps.is_shared)(&dest)? {
@@ -788,18 +804,10 @@ fn check_overlay_layers(
     let mut resolved: Vec<(u64, String)> = Vec::new();
     for member in members.iter().filter(|e| e.fstype == "overlay") {
         found_overlay = true;
-        let layers = overlay_layer_paths(member.super_options).map_err(|_| unchecked())?;
-        budget = budget.checked_sub(layers.len()).ok_or_else(unchecked)?;
+        let layers = resolve_overlay_layers(&entries, member.super_options, &mut budget)
+            .map_err(|()| unchecked())?;
         for layer in layers {
-            let (chain, mnt_id) = dir_identity_chain_with_mnt_id(&layer).ok_or_else(unchecked)?;
-            // 層が別の overlay の上にある場合は、その層の実体をさらに辿る必要があるため拒否で代える。
-            if entries
-                .iter()
-                .any(|e| e.id == mnt_id && e.fstype == "overlay")
-            {
-                return Err(unchecked());
-            }
-            let Some((&layer_id, layer_dirs)) = chain.split_first() else {
+            let Some((&layer_id, layer_dirs)) = layer.chain.split_first() else {
                 return Err(unchecked());
             };
             let mut state_chains: Vec<&[(u64, u64)]> = ctx.state_chains.clone();
@@ -813,23 +821,30 @@ fn check_overlay_layers(
             }
             // mountinfo の (dev, path) でも照合する。inode の鎖は bind mount を挟んだ祖先関係（状態ルートの別名の配下を指す層など）を
             // 映さないため、層の属するマウントの ID から (dev, path) を求め、保護対象・子マウントと突き合わせる（再帰的に配下も見る）。
-            // `.`・`..`・連続スラッシュを含むパスは文字列の接頭辞照合が成り立たないため拒否する。
-            if layer
-                .split('/')
-                .skip(1)
-                .any(|c| c == "." || c == ".." || (c.is_empty() && layer != "/"))
-            {
-                return Err(unchecked());
-            }
-            resolved.push((mnt_id, layer));
+            resolved.push((layer.mnt_id, layer.path));
         }
     }
     for (mnt_id, layer) in &resolved {
-        check_place_not_protected(ctx, spec, &rows, *mnt_id, layer, true, true)?;
+        check_place_not_protected(
+            ctx,
+            spec,
+            &rows,
+            *mnt_id,
+            layer,
+            PlaceScope {
+                recursive: true,
+                is_dir: true,
+            },
+            &ProtectedOverlayLayers::default(),
+        )?;
     }
     // 層のパスの開き直しは、overlay が保持する実際の backing directory と同一とは限らない（overlay を作った後に lowerdir の
     // パスを別の bind mount で覆うと、開き直しは覆った側を安全と判定し、実際には元の層が公開される）。overlayfs は層の
     // 実体を識別できる情報を公開しないため、同一性を保証できない overlay の元は、上の照合に通っても fail-closed で拒否する。
+    //
+    // 注意（#2317）: この判定を外すと fail-open になる。上の照合は必要条件にすぎず、同一性の保証ではない
+    // （層を後から別の bind mount で覆う等で、開き直した層と overlay の実体が食い違う）。外す場合は
+    // `sec1_2317_overlay_source_is_always_rejected_even_when_layers_pass` を見直すこと。
     if found_overlay {
         return Err(failed(
             spec,
@@ -839,6 +854,181 @@ fn check_overlay_layers(
     Ok(())
 }
 
+/// 開き直して解決した overlayfs の層 1 つ。
+struct ResolvedLayer {
+    /// 層自身を先頭、`/` を末尾にした `(st_dev, st_ino)` の鎖。
+    chain: Vec<(u64, u64)>,
+    /// 層の属するマウントの ID（開いた fd の fdinfo の `mnt_id`）。
+    mnt_id: u64,
+    /// 層のパス（`/` からの絶対パス）。
+    path: String,
+}
+
+/// overlayfs の super_options の層を `/` から `O_NOFOLLOW` で辿って解決する（順方向の `check_overlay_layers` と、
+/// 保護対象が overlay 上にあるときの逆方向の `protected_overlay_layers` が共有する。SEC-1・#2166・#2317）。
+///
+/// 解析できない・上限（`budget` は呼び出し側の合計）超過・解決できない（相対パス・消えた層・symlink・ディレクトリでない）・
+/// 層が別の overlay の上にある（入れ子）・`.`/`..`/連続スラッシュを含むパス（文字列の接頭辞照合が成り立たない）は `Err`（fail-closed）。
+fn resolve_overlay_layers(
+    entries: &[MountInfoEntry<'_>],
+    super_options: &str,
+    budget: &mut usize,
+) -> Result<Vec<ResolvedLayer>, ()> {
+    let layers = overlay_layer_paths(super_options).map_err(|_| ())?;
+    *budget = budget.checked_sub(layers.len()).ok_or(())?;
+    let mut out = Vec::with_capacity(layers.len());
+    for layer in layers {
+        let (chain, mnt_id) = dir_identity_chain_with_mnt_id(&layer).ok_or(())?;
+        // 層が別の overlay の上にある場合は、その層の実体をさらに辿る必要があるため拒否で代える。
+        if entries
+            .iter()
+            .any(|e| e.id == mnt_id && e.fstype == "overlay")
+        {
+            return Err(());
+        }
+        if layer
+            .split('/')
+            .skip(1)
+            .any(|c| c == "." || c == ".." || (c.is_empty() && layer != "/"))
+        {
+            return Err(());
+        }
+        out.push(ResolvedLayer {
+            chain,
+            mnt_id,
+            path: layer,
+        });
+    }
+    Ok(out)
+}
+
+/// 保護対象が overlay 上にあるときの層 1 つ（下層 FS 上の実体）。
+#[derive(Clone)]
+struct ProtectedLayer {
+    /// 層自身を先頭、`/` を末尾にした `(st_dev, st_ino)` の鎖。
+    chain: Vec<(u64, u64)>,
+    /// 層の mountinfo 上の `(dev, path)`。bind mount を挟んだ別名の検出に使う。
+    identity: FsIdentity,
+}
+
+/// 保護対象（状態ルート・rootfs・bundle）が overlay 上にあるときの、その層の集合（逆方向の別名の照合。SEC-1・OCI-4・SEC-5・#2317）。
+///
+/// overlay と下層 FS は `st_dev` が異なるため、保護対象が overlay 上にあると、bind の元が層の実パス（下層 FS 上）を指しても
+/// inode の照合も mountinfo の `(dev, path)` の照合も一致しない。層を保護対象に加えて塞ぐ。
+#[derive(Default)]
+struct ProtectedOverlayLayers {
+    /// 状態ルート由来。元が同一・祖先・子孫なら `BindSourceReachesStateRoot`。
+    state: Vec<ProtectedLayer>,
+    /// rootfs・bundle 由来。層の内側の対応（redirect_dir・metacopy）は信頼できず、配下のどこが rootfs の祖先に当たるかを
+    /// 決められないため、同一・祖先・子孫のすべてを `BindSourceContainsRootfs` で拒否する（層は実行基盤の内部の backing storage で、
+    /// 配下を元にできなくても実害は小さい）。
+    contained: Vec<ProtectedLayer>,
+}
+
+impl ProtectedOverlayLayers {
+    /// 状態ルート由来の層が属する FS の dev（ハードリンクの検査で、保護対象の dev と同じ FS とみなす）。
+    fn state_devs(&self) -> impl Iterator<Item = &str> {
+        self.state.iter().map(|l| l.identity.dev.as_str())
+    }
+}
+
+/// `dev` の FS が overlay なら、その層を解決する。overlay でなければ空。同じ dev に overlay と他の fstype が混在する、
+/// または super_options が食い違う場合は `Err`（fail-closed）。
+fn overlay_layers_of_dev(
+    entries: &[MountInfoEntry<'_>],
+    rows: &[MountRow],
+    dev: &str,
+    budget: &mut usize,
+) -> Result<Vec<ProtectedLayer>, ()> {
+    let on_dev: Vec<&MountInfoEntry<'_>> = entries.iter().filter(|e| e.dev == dev).collect();
+    let overlays = on_dev.iter().filter(|e| e.fstype == "overlay").count();
+    let Some(first) = on_dev.first() else {
+        return Ok(Vec::new());
+    };
+    if overlays == 0 {
+        return Ok(Vec::new());
+    }
+    if overlays != on_dev.len()
+        || on_dev
+            .iter()
+            .any(|e| e.super_options != first.super_options)
+    {
+        return Err(());
+    }
+    resolve_overlay_layers(entries, first.super_options, budget)?
+        .into_iter()
+        .map(|l| {
+            let identity = fs_identity(rows, l.mnt_id, &l.path).ok_or(())?;
+            Ok(ProtectedLayer {
+                chain: l.chain,
+                identity,
+            })
+        })
+        .collect()
+}
+
+/// 保護対象の属する FS が overlay なら、その層を解決して保護対象に加える（SEC-1・#2317）。
+///
+/// 保護対象の dev と同じ dev の行が `overlay` かを適用の時点の mountinfo で判定する。解決できない場合（Docker のように `/` が
+/// overlay で下層が見えない環境を含む）は `FAILED_PRECONDITION`。message に層のパスは載せない（SEC-4）。
+/// 残余: 開き直した層が overlay の実際の backing directory と同一とは限らない（#2166 と同じ）。逆方向では一律拒否にせず、
+/// 検出できる範囲を照合する（一律拒否にすると保護対象が overlay 上にある限りどの bind も拒否になるため）。
+fn protected_overlay_layers(
+    ctx: &Ctx<'_>,
+    spec: &BindMountSpec,
+    info: &str,
+) -> Result<ProtectedOverlayLayers, ExecError> {
+    let unchecked = || {
+        failed(
+            spec,
+            "the overlay layers of a protected root cannot be checked",
+        )
+    };
+    let entries = parse_all_mountinfo(info).map_err(|why| failed(spec, &why))?;
+    let rows = parse_mountinfo(info)
+        .ok_or_else(|| failed(spec, "malformed or oversized /proc/thread-self/mountinfo"))?;
+    let mut budget = OVERLAY_LAYER_BUDGET;
+    let mut by_dev: Vec<(&str, Vec<ProtectedLayer>)> = Vec::new();
+    let mut out = ProtectedOverlayLayers::default();
+    for p in ctx.protected {
+        let idx = if let Some(i) = by_dev.iter().position(|(d, _)| *d == p.dev()) {
+            i
+        } else {
+            let layers = overlay_layers_of_dev(&entries, &rows, p.dev(), &mut budget)
+                .map_err(|()| unchecked())?;
+            by_dev.push((p.dev(), layers));
+            by_dev.len() - 1
+        };
+        let Some((_, layers)) = by_dev.get(idx) else {
+            return Err(unchecked());
+        };
+        let dst = if p.is_containment_only() {
+            &mut out.contained
+        } else {
+            &mut out.state
+        };
+        dst.extend(layers.iter().cloned());
+    }
+    Ok(out)
+}
+
+/// 元を保護対象の層と inode で照合する純関数（#2317）。状態ルート由来の層は同一・祖先・子孫で `BindSourceReachesStateRoot`、
+/// rootfs・bundle 由来の層は同一・祖先・子孫のすべてで `BindSourceContainsRootfs`。
+fn judge_source_against_layers(
+    src: (u64, u64),
+    src_dirs: &[(u64, u64)],
+    layers: &ProtectedOverlayLayers,
+) -> Option<ViolationReason> {
+    let chains: Vec<&[(u64, u64)]> = layers.state.iter().map(|l| l.chain.as_slice()).collect();
+    if let Some(reason) = judge_source_inodes(src, src_dirs, &[], &chains) {
+        return Some(reason);
+    }
+    let hit = layers
+        .contained
+        .iter()
+        .any(|l| l.chain.contains(&src) || l.chain.first().is_some_and(|f| src_dirs.contains(f)));
+    hit.then_some(ViolationReason::BindSourceContainsRootfs)
+}
 /// 固定した元（と再帰 bind で一緒に公開される配下のマウント）が保護対象（状態ストアのルート）に到達しないことを、
 /// 適用の時点の mountinfo で照合する（SEC-1・#1915）。start の段の検査は一時点のパス解決に対するもので、
 /// その後の改名・マウントによる差し替え（restart では検査が再実行されない）を、ここで固定した fd の現在位置から塞ぐ。
@@ -847,14 +1037,15 @@ fn check_source_not_protected(
     ctx: &Ctx<'_>,
     spec: &BindMountSpec,
     src: &VerifiedBindSourceFd,
+    info: &str,
+    layers: &ProtectedOverlayLayers,
 ) -> Result<(), ExecError> {
     if ctx.protected.is_empty() {
         return Ok(());
     }
     let real = (ctx.deps.source_path)(src)?;
     let mnt_id = (ctx.deps.source_mnt_id)(src)?;
-    let info = (ctx.deps.mountinfo)()?;
-    let mounts = parse_mountinfo(&info)
+    let mounts = parse_mountinfo(info)
         .ok_or_else(|| failed(spec, "malformed or oversized /proc/thread-self/mountinfo"))?;
     // 元の属するマウントは固定した fd の mnt_id で特定する（パスの最長一致は overmount で食い違い得る）。
     let Some(identity) = fs_identity(&mounts, mnt_id, &real) else {
@@ -865,13 +1056,13 @@ fn check_source_not_protected(
     };
     // 通常ファイルのハードリンクは別名のパスを持たず、パス・マウントの照合では状態ファイルとの同一性が分からない。
     // 保護対象と同じファイルシステム上でリンク数が 2 以上の通常ファイルは、状態ファイルへのリンクかもしれないため拒否する
-    // （fail-closed）。
+    // （fail-closed）。保護対象が overlay 上にあるときは状態ファイルの実体が層の FS 上にあるため、層の dev も同じ FS とみなす（#2317）。
     if src.kind() == BindSourceKind::RegularFile
         && src.nlink() > 1
-        && ctx
-            .protected
-            .iter()
-            .any(|p| !p.is_containment_only() && p.dev() == identity.dev)
+        && ctx.protected.iter().any(|p| {
+            !p.is_containment_only()
+                && (p.dev() == identity.dev || layers.state_devs().any(|d| d == identity.dev))
+        })
     {
         return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
     }
@@ -881,9 +1072,21 @@ fn check_source_not_protected(
         &mounts,
         mnt_id,
         &real,
-        spec.recursive(),
-        src.kind() == BindSourceKind::Directory,
+        PlaceScope {
+            recursive: spec.recursive(),
+            is_dir: src.kind() == BindSourceKind::Directory,
+        },
+        layers,
     )
+}
+
+/// [`check_place_not_protected`] の照合範囲（引数の数を抑えるための束ね）。
+#[derive(Clone, Copy)]
+struct PlaceScope {
+    /// 配下のマウントも照合するか（`rbind`）。
+    recursive: bool,
+    /// 場所がディレクトリか（ハードリンクの検査の対象）。
+    is_dir: bool,
 }
 
 /// 固定した場所（`mnt_id` のマウントの `real`。`recursive` なら配下のマウントも）が保護対象に到達しないことを mountinfo の
@@ -894,9 +1097,10 @@ fn check_place_not_protected(
     mounts: &[MountRow],
     mnt_id: u64,
     real: &str,
-    recursive: bool,
-    is_dir: bool,
+    scope: PlaceScope,
+    layers: &ProtectedOverlayLayers,
 ) -> Result<(), ExecError> {
+    let PlaceScope { recursive, is_dir } = scope;
     // ディレクトリ元の配下にある状態ファイルの別名は走査では見つけられない。代わりに start の段が状態ルート側の
     // 状態ファイルのリンク数を調べており（`has_hard_linked_files`）、別名を持つ状態ファイルがあるなら、同じ FS 上の
     // ディレクトリ元は別名を含み得るため拒否する（fail-closed。SEC-1）。
@@ -908,11 +1112,10 @@ fn check_place_not_protected(
                 "the pinned bind mount source cannot be located in mountinfo",
             ));
         };
-        if ctx
-            .protected
-            .iter()
-            .any(|p| devs.contains(p.dev()) && p.has_hard_linked_files())
-        {
+        if ctx.protected.iter().any(|p| {
+            (devs.contains(p.dev()) || layers.state_devs().any(|d| devs.contains(d)))
+                && p.has_hard_linked_files()
+        }) {
             return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
         }
     }
@@ -964,6 +1167,30 @@ fn check_place_not_protected(
                         "the pinned bind mount source cannot be located in mountinfo",
                     ));
                 }
+            }
+        }
+    }
+    // 保護対象が overlay 上にあるときの層の実体（下層 FS 上の (dev, path)）とも照合する。bind mount を挟んだ別名と、
+    // `rbind` で一緒に公開される子マウントを検出する（#2317）。
+    let layer_checks = layers
+        .state
+        .iter()
+        .map(|l| (l, ViolationReason::BindSourceReachesStateRoot))
+        .chain(
+            layers
+                .contained
+                .iter()
+                .map(|l| (l, ViolationReason::BindSourceContainsRootfs)),
+        );
+    for (layer, reason) in layer_checks {
+        match source_reaches(mounts, mnt_id, real, recursive, &layer.identity) {
+            Some(false) => {}
+            Some(true) => return Err(violation(spec, reason)),
+            None => {
+                return Err(failed(
+                    spec,
+                    "the pinned bind mount source cannot be located in mountinfo",
+                ));
             }
         }
     }
@@ -1394,6 +1621,8 @@ fn check_new_bind(
 struct MountInfoEntry<'a> {
     id: u64,
     parent: u64,
+    /// `major:minor`（保護対象の FS が overlay かの判定に使う。出力へは写さない。#2317）。
+    dev: &'a str,
     options: &'a str,
     optional: Vec<&'a str>,
     /// 区切り `-` の次の fstype 欄（疑似 FS の照合に使う。出力へは写さない）。
@@ -1421,6 +1650,7 @@ fn parse_mountinfo_line(line: &str) -> Option<MountInfoEntry<'_>> {
     Some(MountInfoEntry {
         id: fields.first()?.parse().ok()?,
         parent: fields.get(1)?.parse().ok()?,
+        dev: fields.get(2)?,
         options: fields.get(5)?,
         optional: fields.get(MOUNTINFO_FIXED_FIELDS..sep)?.to_vec(),
         fstype: fields.get(sep + 1)?,
@@ -4174,6 +4404,7 @@ mod tests {
         let line = "200 1 0:2 / /x rw - overlay overlay rw,lowerdir=/a:/b,upperdir=/u";
         let e = parse_mountinfo_line(line).expect("parse");
         assert_eq!(e.fstype, "overlay");
+        assert_eq!(e.dev, "0:2");
         assert_eq!(e.super_options, "rw,lowerdir=/a:/b,upperdir=/u");
         assert!(parse_mountinfo_line(&format!("{line} extra")).is_none());
         assert!(parse_mountinfo_line("200 1 0:2 / /x rw - overlay overlay").is_none());
@@ -4254,6 +4485,346 @@ mod tests {
             let err = r.expect_err("fail closed");
             assert_eq!(err.code, ErrorCode::FailedPrecondition);
             assert!(err.violation.is_none());
+        }
+    }
+    // ---- #2317: 保護対象が overlay 上にあるときの逆方向の別名の照合（SEC-1・OCI-4・SEC-5） ----
+
+    /// 層の置き場。`tmp/ovl/{a,b,c}`（b の配下に `sub`）と無関係な `tmp/other`。
+    struct OvlFx {
+        a: String,
+        b: String,
+        c: String,
+        sub: String,
+        parent: String,
+        other: String,
+        /// 層が属するマウントの実の ID（dry-run の mountinfo にこの ID の行を足す）。
+        mnt: u64,
+    }
+
+    fn ovl_fx(fx: &Fx) -> OvlFx {
+        let base = fx.tmp.path().join("ovl");
+        for d in ["a", "b/sub", "c"] {
+            std::fs::create_dir_all(base.join(d)).expect("layer dir");
+        }
+        let other = fx.tmp.path().join("other");
+        std::fs::create_dir_all(&other).expect("other");
+        let p = |p: &Path| p.to_str().expect("utf8").to_owned();
+        let b = p(&base.join("b"));
+        let mnt = path_mount_id(&b).expect("mnt id of the layer");
+        // dry-run の mountinfo の固定 ID（1・200・300）と衝突すると試験の前提が崩れるため、明示的に失敗させる。
+        assert!(![1, 200, 300].contains(&mnt), "mnt id collision: {mnt}");
+        OvlFx {
+            a: p(&base.join("a")),
+            sub: p(&base.join("b/sub")),
+            c: p(&base.join("c")),
+            parent: p(&base),
+            other: p(&other),
+            b,
+            mnt,
+        }
+    }
+
+    impl OvlFx {
+        fn opts(&self) -> String {
+            format!("lowerdir={},upperdir={},workdir={}", self.a, self.b, self.c)
+        }
+
+        /// 保護対象（dev `9:9`）が `fstype` の FS の上にある mountinfo。層の属するマウントは dev `0:7` の非 overlay。
+        fn info(&self, fstype: &str, super_options: &str) -> String {
+            format!(
+                "1 0 0:1 / / rw - tmpfs none rw\n\
+                 200 1 0:2 / /x rw,nosuid,nodev - tmpfs none rw\n\
+                 {} 1 0:7 / / rw - tmpfs none rw\n\
+                 300 1 9:9 / /var/state rw - {fstype} {fstype} {super_options}\n",
+                self.mnt
+            )
+        }
+
+        fn knobs(&self) -> Knobs {
+            Knobs {
+                mountinfo: Some(self.info("overlay", &self.opts())),
+                ..Knobs::default()
+            }
+        }
+    }
+
+    /// dev `9:9` の状態ルート（inode の鎖は無関係な `/proc`）。
+    fn state_on_9_9() -> ProtectedFsRoot {
+        ProtectedFsRoot::new("9:9".to_owned(), "/state".to_owned(), false).with_inode_chain(
+            "/proc".to_owned(),
+            dir_identity_chain("/proc").expect("chain of /proc"),
+        )
+    }
+
+    /// 宛先に何も作る前に拒否されたこと（rootfs に宛先が無く、付け替え・後始末のマウント操作が無い）。
+    fn assert_rejected_before_target(fx: &Fx, log: &[String], what: &str) {
+        assert!(!fx.rootfs.join("mnt").exists(), "{what}: target created");
+        assert!(
+            !log.iter()
+                .any(|l| l.starts_with("umount(") || l.starts_with("move_mount(")),
+            "{what}: {log:?}"
+        );
+    }
+
+    /// SEC-1・#2317: 状態ルートが overlay 上にあるとき、元が層（lowerdir・upperdir・workdir）の同一・祖先・子孫なら
+    /// `BindSourceReachesStateRoot` で拒否する。宛先は作らない。無関係な元は通る。
+    #[test]
+    fn sec1_2317_state_on_overlay_rejects_layer_aliases() {
+        let fx = fx();
+        let o = ovl_fx(&fx);
+        let cases = [
+            ("upperdir", &o.b),
+            ("upperdir subdir", &o.sub),
+            ("upperdir parent", &o.parent),
+            ("workdir", &o.c),
+            ("lowerdir", &o.a),
+        ];
+        for (what, src) in cases {
+            let set = one("/mnt/d", src, &[]).with_protected_roots(vec![state_on_9_9()]);
+            let (r, log) = run(&fx, &set, &o.knobs());
+            let err = r.expect_err(what);
+            assert_eq!(
+                reason_of(&err),
+                Some(ViolationReason::BindSourceReachesStateRoot),
+                "{what}"
+            );
+            assert!(!err.message.contains(src.as_str()), "{}", err.message);
+            assert_rejected_before_target(&fx, &log, what);
+        }
+        let set = one("/mnt/d", &o.other, &[]).with_protected_roots(vec![state_on_9_9()]);
+        let (r, log) = run(&fx, &set, &o.knobs());
+        r.unwrap_or_else(|e| panic!("unrelated source must pass: {e}; {log:?}"));
+        assert!(fx.rootfs.join("mnt/d").is_dir());
+    }
+
+    /// SEC-1・#2317: rootfs・bundle が overlay 上にあるとき、元が層の同一・祖先・子孫のいずれでも `BindSourceContainsRootfs`。
+    #[test]
+    fn sec1_2317_contained_root_on_overlay_rejects_layer_overlap() {
+        let fx = fx();
+        let o = ovl_fx(&fx);
+        let knobs = Knobs {
+            mountinfo: Some(o.info("overlay", &o.opts()).replace("9:9", "7:7")),
+            ..Knobs::default()
+        };
+        for (what, src) in [
+            ("upper", &o.b),
+            ("upper subdir", &o.sub),
+            ("parent", &o.parent),
+        ] {
+            let roots = pinned(vec![ProtectedFsRoot::contained(
+                "7:7".to_owned(),
+                "/".to_owned(),
+            )]);
+            let set = one("/mnt/d", src, &[]).with_protected_roots(roots);
+            let (r, log) = run(&fx, &set, &knobs);
+            assert_eq!(
+                reason_of(&r.expect_err(what)),
+                Some(ViolationReason::BindSourceContainsRootfs),
+                "{what}"
+            );
+            assert_rejected_before_target(&fx, &log, what);
+        }
+        let roots = pinned(vec![ProtectedFsRoot::contained(
+            "7:7".to_owned(),
+            "/".to_owned(),
+        )]);
+        let set = one("/mnt/d", &o.other, &[]).with_protected_roots(roots);
+        let (r, log) = run(&fx, &set, &knobs);
+        r.unwrap_or_else(|e| panic!("unrelated source must pass: {e}; {log:?}"));
+    }
+
+    /// SEC-1・#2317: 層を bind mount した別名の配下（inode の鎖には映らない形）は、mountinfo の `(dev, path)` の照合で拒否する。
+    #[test]
+    fn sec1_2317_bind_alias_of_layer_is_rejected_by_mountinfo() {
+        let fx = fx();
+        let o = ovl_fx(&fx);
+        // 元の属するマウント（ID 1）を、upperdir の FS 内パスを root にした別名として見せる。
+        let alias = o.info("overlay", &o.opts()).replace(
+            "1 0 0:1 / / rw - tmpfs none rw",
+            &format!(
+                "1 0 0:7 {} {} rw - tmpfs none rw",
+                o.b,
+                fx.src.to_str().expect("utf8")
+            ),
+        );
+        let knobs = Knobs {
+            mountinfo: Some(alias),
+            ..Knobs::default()
+        };
+        let set = one("/mnt/d", &fx.src("dir"), &[]).with_protected_roots(vec![state_on_9_9()]);
+        let (r, log) = run(&fx, &set, &knobs);
+        assert_eq!(
+            reason_of(&r.expect_err("alias of the layer")),
+            Some(ViolationReason::BindSourceReachesStateRoot)
+        );
+        assert_rejected_before_target(&fx, &log, "alias");
+    }
+
+    /// SEC-1・#2317: 状態ルートが overlay 上のとき、層と同じ FS 上のリンク数 2 以上の通常ファイルの元を拒否する
+    /// （保護対象の dev は overlay の値で、実在する元の dev と一致しないため、層の dev を加えて照合する）。
+    #[test]
+    fn sec1_2317_hard_linked_file_on_layer_fs_is_rejected() {
+        let fx = fx();
+        let o = ovl_fx(&fx);
+        std::fs::hard_link(fx.src.join("file"), fx.src.join("file2")).expect("hard link");
+        // 元の属するマウント（ID 1）を層と同じ dev `0:7` にする。
+        let info = o.info("overlay", &o.opts()).replace(
+            "1 0 0:1 / / rw - tmpfs none rw",
+            "1 0 0:7 / / rw - tmpfs none rw",
+        );
+        let knobs = Knobs {
+            mountinfo: Some(info),
+            ..Knobs::default()
+        };
+        let set = one("/mnt/f", &fx.src("file2"), &[]).with_protected_roots(vec![state_on_9_9()]);
+        let (r, log) = run(&fx, &set, &knobs);
+        assert_eq!(
+            reason_of(&r.expect_err("hard linked file")),
+            Some(ViolationReason::BindSourceReachesStateRoot)
+        );
+        assert_rejected_before_target(&fx, &log, "hard link");
+        // 層と別の FS（dev `0:1`）上なら、同じ元は通る（層の dev だけが効いていること）。
+        let set = one("/mnt/f", &fx.src("file2"), &[]).with_protected_roots(vec![state_on_9_9()]);
+        let (r, log) = run(&fx, &set, &o.knobs());
+        r.unwrap_or_else(|e| panic!("file on another fs must pass: {e}; {log:?}"));
+    }
+
+    /// SEC-1・#2317: 層を解決できない・解析できない・入れ子・食い違いは、`FAILED_PRECONDITION`（fail-closed）。
+    /// message は保護対象の層であることだけを示し、層のパスを含まない。
+    #[test]
+    fn sec1_2317_unresolvable_protected_overlay_fails_closed() {
+        let fx = fx();
+        let o = ovl_fx(&fx);
+        let link = fx.tmp.path().join("layer-link");
+        std::os::unix::fs::symlink(&o.a, &link).expect("symlink");
+        let file = fx.tmp.path().join("layer-file");
+        std::fs::write(&file, b"f").expect("file");
+        let p = |p: &Path| p.to_str().expect("utf8").to_owned();
+        let many = (0..=500)
+            .map(|i| format!("/l{i}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        let set = one("/mnt/d", &o.other, &[]).with_protected_roots(vec![state_on_9_9()]);
+        let cases = [
+            "lowerdir=relative/layer".to_owned(),
+            format!("lowerdir={}/missing", o.parent),
+            format!("lowerdir={}", p(&link)),
+            format!("lowerdir={}", p(&file)),
+            format!("lowerdir={}\\x", o.a),
+            "rw".to_owned(),
+            format!("lowerdir={many}"),
+        ];
+        for opts in cases {
+            let knobs = Knobs {
+                mountinfo: Some(o.info("overlay", &opts)),
+                ..Knobs::default()
+            };
+            let (r, log) = run(&fx, &set, &knobs);
+            let err = r.expect_err(&opts);
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{opts}");
+            assert!(err.violation.is_none(), "{opts}");
+            assert!(err.message.contains("protected root"), "{}", err.message);
+            assert!(!err.message.contains(&o.parent), "{}", err.message);
+            assert_rejected_before_target(&fx, &log, &opts);
+        }
+        // 層が別の overlay の上にある（入れ子）。層の属するマウントの行を overlay にする。
+        let nested = o.info("overlay", &o.opts()).replace(
+            "0:7 / / rw - tmpfs none rw",
+            "0:7 / / rw - overlay overlay lowerdir=/zz",
+        );
+        // 同じ dev の overlay の行が 2 つあり super_options が食い違う。
+        let mismatch = format!(
+            "{}301 1 9:9 / /var/other rw - overlay overlay lowerdir={}\n",
+            o.info("overlay", &o.opts()),
+            o.other
+        );
+        // 同じ dev に overlay と他の fstype が混在する。
+        let mixed = format!(
+            "{}301 1 9:9 / /var/other rw - ext4 /dev/sda1 rw\n",
+            o.info("overlay", &o.opts())
+        );
+        for (what, info) in [("nested", nested), ("mismatch", mismatch), ("mixed", mixed)] {
+            let knobs = Knobs {
+                mountinfo: Some(info),
+                ..Knobs::default()
+            };
+            let (r, log) = run(&fx, &set, &knobs);
+            let err = r.expect_err(what);
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{what}");
+            assert!(err.violation.is_none(), "{what}");
+            assert!(err.message.contains("protected root"), "{}", err.message);
+            assert_rejected_before_target(&fx, &log, what);
+        }
+    }
+
+    /// SEC-1・#2317: 保護対象の FS が overlay でなければ層の照合をしない（従来の挙動。層を元にしても通る）。
+    #[test]
+    fn sec1_2317_non_overlay_protected_root_is_unchanged() {
+        let fx = fx();
+        let o = ovl_fx(&fx);
+        let knobs = Knobs {
+            mountinfo: Some(o.info("ext4", "rw")),
+            ..Knobs::default()
+        };
+        let set = one("/mnt/d", &o.b, &[]).with_protected_roots(vec![state_on_9_9()]);
+        let (r, log) = run(&fx, &set, &knobs);
+        r.unwrap_or_else(|e| panic!("non-overlay root must not check layers: {e}; {log:?}"));
+    }
+
+    /// SEC-4・#2317: 逆方向の拒否の監査レコードには、コンテナ内の宛先だけが載り、層のパスは載らない。
+    #[test]
+    fn sec4_2317_reverse_overlay_rejection_audit_has_destination_only() {
+        let fx = fx();
+        let o = ovl_fx(&fx);
+        let set = one("/mnt/d", &o.b, &[]).with_protected_roots(vec![state_on_9_9()]);
+        let (r, _) = run(&fx, &set, &o.knobs());
+        let err = r.expect_err("rejected");
+        let sink = VecSink::new(false);
+        let out = audit_mount_violation(err, None, &sink);
+        assert_eq!(out.delivery, AuditDelivery::Recorded);
+        let recs = sink.snapshot();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].reason().map(crate::audit_log::AuditReason::as_str),
+            Some("bind_source_reaches_state_root")
+        );
+        assert_eq!(recs[0].path(), Some(Path::new("/mnt/d")));
+        assert!(!format!("{:?}", recs[0]).contains(&o.parent));
+    }
+
+    /// SEC-1・#2166・#2317（外すと fail-open になる判定の固定）: 層がすべて無関係で解決でき、inode と mountinfo の照合に通る
+    /// overlay の元でも、同一性を保証できないため必ず `FAILED_PRECONDITION` で拒否し、自分のマウントを外す。`bind`・`rbind` の両方。
+    #[test]
+    fn sec1_2317_overlay_source_is_always_rejected_even_when_layers_pass() {
+        let fx = fx();
+        for opt in ["bind", "rbind"] {
+            let (set, _) = overlay_state_set(&fx, &[opt]);
+            let other = fx.tmp.path().join("unrelated-layer");
+            std::fs::create_dir_all(&other).expect("layer");
+            let other = other.to_str().expect("utf8");
+            let opts = format!("lowerdir={other},upperdir={other},workdir={other}");
+            // 層の属するマウントの行を足し、(dev, path) の照合まで通る条件にする（無いと別の理由で拒否される）。
+            let mnt = path_mount_id(other).expect("mnt id of the layer");
+            assert!(![1, 200].contains(&mnt), "mnt id collision: {mnt}");
+            let mut knobs = overlay_knobs(&opts);
+            if let Some(info) = knobs.mountinfo.as_mut() {
+                info.push_str(&format!("{mnt} 1 0:7 / / rw - tmpfs none rw\n"));
+            }
+            let (r, log) = run(&fx, &set, &knobs);
+            let err = r.expect_err(opt);
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{opt}");
+            assert!(err.violation.is_none(), "{opt}");
+            assert!(
+                err.message.ends_with(
+                    "the overlay layers of the bind mount source cannot be verified to be the directories they were created from"
+                ),
+                "{opt}: {}",
+                err.message
+            );
+            assert!(
+                log.iter().any(|l| l.starts_with("umount(")),
+                "{opt}: {log:?}"
+            );
         }
     }
 }

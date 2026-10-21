@@ -145,6 +145,7 @@ pub(crate) struct MountRow {
 }
 
 /// ファイルシステム内の実体（`major:minor` と FS 内パス）。bind mount の別名は同じ値になる（SEC-1）。
+#[derive(Clone)]
 pub(crate) struct FsIdentity {
     pub(crate) dev: String,
     pub(crate) path: String,

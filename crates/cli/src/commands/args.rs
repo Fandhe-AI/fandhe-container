@@ -3,7 +3,7 @@
 //! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
-//! 構文は runc 互換: `fandhe-container [--root <dir>] create --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] <id>` / `... list` / `... logs <id>`。
+//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest>] --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs <id>`。
 //! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `image tag --image-root <dir> <source> <target>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
@@ -26,6 +26,17 @@ pub(super) struct GlobalArgs {
 pub(super) struct CreateArgs {
     pub(super) bundle: PathBuf,
     pub(super) id: String,
+    /// `--image-root` と `--image` の組（どちらも指定したときだけ `Some`。OCI-7・#2315）。
+    pub(super) image: Option<CreateImageArgs>,
+}
+
+/// `create` のイメージ指定。意味検証（digest の形式・ストア root の存在）は呼び出し元が core / oci の型に委ねる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CreateImageArgs {
+    /// イメージストアの root（絶対パス）。
+    pub(super) image_root: PathBuf,
+    /// 使う manifest digest（未検証の文字列）。
+    pub(super) manifest: String,
 }
 
 /// `start` の引数。
@@ -46,6 +57,8 @@ pub(super) struct DeleteArgs {
     pub(super) id: String,
     /// `--force`（core の `DeleteRequest::with_force` へ素通しする。生存中コンテナへは core が拒否する）。
     pub(super) force: bool,
+    /// `--image-root`（イメージ参照を解除するストアの root。絶対パス。省略時は解除しない。OCI-7・#2315）。
+    pub(super) image_root: Option<PathBuf>,
 }
 
 /// `list` の引数（現状オプションなし。将来のオプション追加に備えて構造体にしておく。TASK-79.3）。
@@ -151,9 +164,12 @@ pub(super) fn parse_global(args: Vec<OsString>) -> Result<(GlobalArgs, Vec<OsStr
     Ok((global, it.collect()))
 }
 
-/// `create --bundle <dir> <id>` を解析する（`--bundle` は必須・順不同・`--` 以降は位置引数）。
+/// `create [--image-root <abs> --image <digest>] --bundle <dir> <id>` を解析する
+/// （`--bundle` は必須・順不同・`--` 以降は位置引数。`--image-root` と `--image` は両方そろったときだけ受け、各 1 回まで）。
 pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError> {
     let mut bundle: Option<PathBuf> = None;
+    let mut image_root: Option<PathBuf> = None;
+    let mut manifest: Option<String> = None;
     let mut positional: Vec<OsString> = Vec::new();
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -166,6 +182,18 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
                 return Err(UsageError);
             }
             bundle = Some(PathBuf::from(value));
+        } else if a == "--image-root" {
+            let value = it.next().ok_or(UsageError)?;
+            if image_root.is_some() {
+                return Err(UsageError);
+            }
+            image_root = Some(PathBuf::from(value));
+        } else if a == "--image" {
+            let value = it.next().ok_or(UsageError)?;
+            if manifest.is_some() {
+                return Err(UsageError);
+            }
+            manifest = Some(value.into_string().map_err(|_| UsageError)?);
         } else if is_option_like(&a) {
             return Err(UsageError);
         } else {
@@ -173,9 +201,24 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
         }
     }
     let id = single_id(positional)?;
+    let image = match (image_root, manifest) {
+        (None, None) => None,
+        (Some(image_root), Some(manifest)) => {
+            // 相対パスは作業ディレクトリ依存で 3 OS の挙動がぶれるため拒否する（`parse_image_options` と同じ）。
+            if !image_root.is_absolute() {
+                return Err(UsageError);
+            }
+            Some(CreateImageArgs {
+                image_root,
+                manifest,
+            })
+        }
+        _ => return Err(UsageError),
+    };
     Ok(CreateArgs {
         bundle: bundle.ok_or(UsageError)?,
         id,
+        image,
     })
 }
 
@@ -193,9 +236,10 @@ pub(super) fn parse_stop(args: Vec<OsString>) -> Result<StopArgs, UsageError> {
     })
 }
 
-/// `delete [--force] <id>` を解析する（`--force` は 1 回だけ・順不同・`--` 以降は位置引数）。
+/// `delete [--force] [--image-root <abs>] <id>` を解析する（各オプションは 1 回だけ・順不同・`--` 以降は位置引数）。
 pub(super) fn parse_delete(args: Vec<OsString>) -> Result<DeleteArgs, UsageError> {
     let mut force = false;
+    let mut image_root: Option<PathBuf> = None;
     let mut positional: Vec<OsString> = Vec::new();
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -207,15 +251,25 @@ pub(super) fn parse_delete(args: Vec<OsString>) -> Result<DeleteArgs, UsageError
                 return Err(UsageError);
             }
             force = true;
+        } else if a == "--image-root" {
+            let value = it.next().ok_or(UsageError)?;
+            if image_root.is_some() {
+                return Err(UsageError);
+            }
+            image_root = Some(PathBuf::from(value));
         } else if is_option_like(&a) {
             return Err(UsageError);
         } else {
             positional.push(a);
         }
     }
+    if image_root.as_ref().is_some_and(|p| !p.is_absolute()) {
+        return Err(UsageError);
+    }
     Ok(DeleteArgs {
         id: single_id(positional)?,
         force,
+        image_root,
     })
 }
 
@@ -432,12 +486,103 @@ mod tests {
         );
     }
 
+    /// OCI-7・CLI-1: create の `--image-root` と `--image` は両方そろったときだけ受け、順不同・各 1 回。
+    #[test]
+    fn oci7_parse_create_image_options() {
+        let d = format!("sha256:{}", "a".repeat(64));
+        let expect = Ok(CreateArgs {
+            bundle: PathBuf::from("/b"),
+            id: "c1".into(),
+            image: Some(CreateImageArgs {
+                image_root: PathBuf::from("/imgs"),
+                manifest: d.clone(),
+            }),
+        });
+        assert_eq!(
+            parse_create(v(&[
+                "--image-root",
+                "/imgs",
+                "--image",
+                &d,
+                "--bundle",
+                "/b",
+                "c1"
+            ])),
+            expect
+        );
+        assert_eq!(
+            parse_create(v(&[
+                "--bundle",
+                "/b",
+                "--image",
+                &d,
+                "--image-root",
+                "/imgs",
+                "--",
+                "c1"
+            ])),
+            expect
+        );
+        for bad in [
+            v(&["--bundle", "/b", "--image", &d, "c1"]),
+            v(&["--bundle", "/b", "--image-root", "/imgs", "c1"]),
+            v(&["--bundle", "/b", "--image-root", "rel", "--image", &d, "c1"]),
+            v(&[
+                "--bundle",
+                "/b",
+                "--image-root",
+                "/i",
+                "--image-root",
+                "/i",
+                "--image",
+                &d,
+                "c1",
+            ]),
+            v(&[
+                "--bundle",
+                "/b",
+                "--image-root",
+                "/i",
+                "--image",
+                &d,
+                "--image",
+                &d,
+                "c1",
+            ]),
+            v(&["--bundle", "/b", "--image-root", "/i", "--image"]),
+            v(&["--bundle", "/b", "--", "--image", "c1"]),
+        ] {
+            assert_eq!(parse_create(bad.clone()), Err(UsageError), "{bad:?}");
+        }
+    }
+
+    /// OCI-7・CLI-1: delete の `--image-root` は任意・絶対パスのみ・1 回まで。
+    #[test]
+    fn oci7_parse_delete_image_root() {
+        assert_eq!(
+            parse_delete(v(&["--image-root", "/imgs", "--force", "c1"])),
+            Ok(DeleteArgs {
+                id: "c1".into(),
+                force: true,
+                image_root: Some(PathBuf::from("/imgs")),
+            })
+        );
+        for bad in [
+            v(&["--image-root", "rel", "c1"]),
+            v(&["--image-root", "/a", "--image-root", "/b", "c1"]),
+            v(&["--image-root"]),
+        ] {
+            assert_eq!(parse_delete(bad.clone()), Err(UsageError), "{bad:?}");
+        }
+    }
+
     /// CLI-1: create の正常系（順不同・`--` 以降は位置引数）。
     #[test]
     fn cli1_parse_create_ok() {
         let expect = CreateArgs {
             bundle: PathBuf::from("/b"),
             id: "c1".into(),
+            image: None,
         };
         assert_eq!(
             parse_create(v(&["--bundle", "/b", "c1"])),
@@ -513,10 +658,12 @@ mod tests {
         let plain = DeleteArgs {
             id: "c1".into(),
             force: false,
+            image_root: None,
         };
         let forced = DeleteArgs {
             id: "c1".into(),
             force: true,
+            image_root: None,
         };
         assert_eq!(parse_delete(v(&["c1"])), Ok(plain));
         assert_eq!(parse_delete(v(&["--force", "c1"])), Ok(forced.clone()));
@@ -525,7 +672,8 @@ mod tests {
             parse_delete(v(&["--force", "--", "-x"])),
             Ok(DeleteArgs {
                 id: "-x".into(),
-                force: true
+                force: true,
+                image_root: None
             })
         );
     }

@@ -27,6 +27,9 @@
 //! list / logs と同じ判断で、読み取り専用 open は足さない（理由は `list_logs` の module doc。#1607 E2）。
 //!
 //! 未実装・簡易実装（REPAIR-3）:
+//! - `delete --image-root <abs>` は core の `delete_releasing_image_ref` で OCI-7 のイメージ参照を外す（#2315）。ストアは core に入る前に
+//!   開き、開けなければ状態を消さずに失敗する。`--image-root` を省いた delete では確定済みの参照が残り、回収は起動時の照合
+//!   （`image_refs` module doc の #854 との分担。起動点は未配線）を待つ（安全側。データは消えない）。
 //! - stop の失敗 JSON の `op` は `kill` になる（core に `LifecycleOp::Stop` が無いため。core 到達前の失敗も
 //!   `kill` に揃える）。猶予待ち → SIGKILL・Stopped への遷移確認は TASK-157 の範囲。
 //! - stop の SIGTERM は意図つき（StopRequest）で送る。supervisor は意図を記録してから送るので、stop による終了は
@@ -54,7 +57,7 @@ use std::time::{Duration, Instant};
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
     CgroupRemoval, ContainerCgroupRemover, KillTimeout, LifecycleOp, OciRuntimeError,
-    ProcessSignaler, delete, kill,
+    ProcessSignaler, delete, delete_releasing_image_ref, kill,
 };
 use fandhe_container_core::traits::{
     CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, DeleteRequest, DeleteResponse,
@@ -65,6 +68,9 @@ use fandhe_container_supervisor::control::ControlSignaler;
 use super::CliExit;
 use super::args::{DeleteArgs, GlobalArgs, StopArgs};
 use super::create_start::{OP_LOG_ENV, export_ops, production_runtime};
+use super::image::open_image_store_for_lifecycle;
+use super::image_refs::StoreImageRefs;
+use fandhe_container_oci::image_management::ImageStore;
 
 /// 状態ルートを公開しないストア用の fail-closed の signaler。常に `Unimplemented` で失敗する（REPAIR-3）。
 ///
@@ -282,6 +288,20 @@ pub(super) fn delete_container(
     delete(store, recorder, cgroups, req)
 }
 
+/// [`delete_container`] に、OCI-7 のイメージ参照の解除を後置したもの（#2315）。
+///
+/// 解除の失敗は戻り値に影響させず、core が操作名 `image_ref_release` で記録する。
+pub(super) fn delete_container_releasing_image_ref(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    cgroups: &dyn ContainerCgroupRemover,
+    images: &ImageStore,
+    req: &DeleteRequest,
+) -> Result<DeleteResponse, OciRuntimeError> {
+    let refs = StoreImageRefs::new(images);
+    delete_releasing_image_ref(store, recorder, cgroups, &refs, req)
+}
+
 /// 本番入口の `stop`。成功時は何も出力しない（OCI の kill 互換）。
 pub(super) fn run_stop(global: &GlobalArgs, args: &StopArgs) -> CliExit {
     let started = Instant::now();
@@ -312,15 +332,31 @@ pub(super) fn run_stop(global: &GlobalArgs, args: &StopArgs) -> CliExit {
 pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
     let started = Instant::now();
     let prepared = production_runtime(global, OpRecorder::new(), "delete", started, || {
-        build_delete_request(args)
+        // ストアを開けなければ core に入る前に失敗させ、状態だけが消えて参照を外す手段を失う経路を作らない（fail-closed）。
+        let req = build_delete_request(args)?;
+        let images = args
+            .image_root
+            .as_deref()
+            .map(open_image_store_for_lifecycle)
+            .transpose()?;
+        Ok((req, images))
     })
     .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Delete, e));
-    let (rt, req) = match prepared {
+    let (rt, (req, images)) = match prepared {
         Ok(v) => v,
         Err(e) => return CliExit::Runtime(e),
     };
     let remover = production_cgroup_remover();
-    let result = delete_container(rt.store.as_ref(), &rt.recorder, &remover, &req);
+    let result = match &images {
+        Some(images) => delete_container_releasing_image_ref(
+            rt.store.as_ref(),
+            &rt.recorder,
+            &remover,
+            images,
+            &req,
+        ),
+        None => delete_container(rt.store.as_ref(), &rt.recorder, &remover, &req),
+    };
     export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
     match result {
         Ok(_) => {
@@ -485,6 +521,7 @@ mod tests {
         DeleteArgs {
             id: id.into(),
             force,
+            image_root: None,
         }
     }
 
@@ -1235,6 +1272,133 @@ mod tests {
                 .snapshot_op(&OpName::new("delete").expect("name"))
                 .expect("delete");
             assert_eq!((del_op.success(), del_op.failure()), (1, 1));
+        }
+
+        const REF_MANIFEST: &str =
+            "sha256:a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0";
+
+        fn ref_digest() -> fandhe_container_core::oci_runtime::ImageManifestDigest {
+            fandhe_container_core::oci_runtime::ImageManifestDigest::new(REF_MANIFEST)
+                .expect("manifest")
+        }
+
+        /// 在庫の有無を選べるイメージストア（在庫は未永続化のため、同じインスタンスを使い回す）。
+        fn images_store(
+            base: &TmpDir,
+            seed: bool,
+        ) -> fandhe_container_oci::image_management::ImageStore {
+            use fandhe_container_oci::image_management::{ImageStore, ManifestComposition};
+            use fandhe_container_oci::reference::Digest;
+            let root = base.0.join("images");
+            std::fs::create_dir_all(&root).expect("images");
+            let images = ImageStore::open(&root).expect("open");
+            if seed {
+                images
+                    .lock()
+                    .expect("lock")
+                    .register_manifest(
+                        Digest::parse(REF_MANIFEST).expect("digest"),
+                        ManifestComposition::new(
+                            Digest::parse(
+                                "sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+                            )
+                            .expect("config"),
+                            vec![],
+                        )
+                        .expect("comp"),
+                    )
+                    .expect("register manifest");
+            }
+            images
+        }
+
+        fn container_refs(
+            images: &fandhe_container_oci::image_management::ImageStore,
+        ) -> Vec<String> {
+            use fandhe_container_oci::reference::Digest;
+            images
+                .lock()
+                .expect("lock")
+                .manifest_references(&Digest::parse(REF_MANIFEST).expect("digest"))
+                .containers
+                .iter()
+                .map(|c| c.as_str().to_string())
+                .collect()
+        }
+
+        fn runtime_with(st: FileStateStore) -> crate::commands::create_start::Runtime {
+            crate::commands::create_start::Runtime {
+                store: Box::new(st),
+                recorder: OpRecorder::new(),
+            }
+        }
+
+        fn create_image(
+            base: &TmpDir,
+            rt: &crate::commands::create_start::Runtime,
+            images: fandhe_container_oci::image_management::ImageStore,
+            name: &str,
+        ) -> Result<crate::commands::create_start::CreateImage, OciRuntimeError> {
+            use crate::commands::create_start::{CreateImage, create_container_with_image};
+            let image = CreateImage {
+                store: images,
+                manifest: ref_digest(),
+            };
+            let req = CreateRequest::new(id(name), make_bundle(base)).expect("req");
+            create_container_with_image(rt, &image, &req).map(|_| image)
+        }
+
+        /// OCI-7・#2315: イメージつき create の後は参照が 1 件、`--image-root` つき delete の後は 0 件。
+        #[test]
+        fn oci7_create_then_delete_with_image_root_releases_reference() {
+            let base = TmpDir::new("img-flow");
+            let rt = runtime_with(store(&base));
+            let image = create_image(&base, &rt, images_store(&base, true), "c1").expect("create");
+            assert_eq!(container_refs(&image.store), vec!["c1".to_string()]);
+            let remover = DetectedCgroupRemover::new(|| Ok(FakeCgroup::default()));
+            let req = build_delete_request(&delete_args("c1", false)).expect("req");
+            delete_container_releasing_image_ref(
+                rt.store.as_ref(),
+                &rt.recorder,
+                &remover,
+                &image.store,
+                &req,
+            )
+            .expect("delete");
+            assert_eq!(container_refs(&image.store), Vec::<String>::new());
+        }
+
+        /// OCI-7・#2315: `--image-root` なしの delete は確定済みの参照を残す（安全側。回収は照合を待つ）。
+        #[test]
+        fn oci7_delete_without_image_root_keeps_reference() {
+            let base = TmpDir::new("img-keep");
+            let rt = runtime_with(store(&base));
+            let image = create_image(&base, &rt, images_store(&base, true), "c1").expect("create");
+            delete_with(&store(&base), &OpRecorder::new(), "c1", false).expect("delete");
+            assert_eq!(container_refs(&image.store), vec!["c1".to_string()]);
+            let gone = rt
+                .store
+                .get(&GetStateRequest::new(id("c1")))
+                .expect_err("gone");
+            assert_eq!(gone.code(), ErrorCode::NotFound);
+        }
+
+        /// OCI-7・#2315: 在庫に無い manifest の create は NOT_FOUND で、状態も参照も残らない
+        /// （本番の現行値。manifest の在庫の永続化は #2380）。
+        #[test]
+        fn oci7_create_with_empty_inventory_is_not_found() {
+            let base = TmpDir::new("img-empty");
+            let rt = runtime_with(store(&base));
+            let images = images_store(&base, false);
+            let e = create_image(&base, &rt, images, "c1").err().expect("nf");
+            assert_eq!(e.code(), ErrorCode::NotFound);
+            assert_eq!(
+                rt.store
+                    .get(&GetStateRequest::new(id("c1")))
+                    .expect_err("none")
+                    .code(),
+                ErrorCode::NotFound
+            );
         }
     }
 }

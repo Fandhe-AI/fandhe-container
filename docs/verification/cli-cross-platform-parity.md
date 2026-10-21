@@ -12,7 +12,7 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 | ---- | ---- |
 | 非 Linux の plugin 起動・RPC | 発見 → 登録 → 信頼性検証までは配線済みだが、plugin の起動と RPC は未実装（TASK-114）。macOS / Windows ではバックエンド解決が必ず失敗する。よって B 層（挙動）の非 Linux 欄は **前提未達** であり、合格として記入しない |
 | Linux 経路の未実装 | `start` の本番 launcher、cgroup 配置つき `delete` は未実装（REPAIR-3）。pid ありの `stop` は Linux では supervisor の制御チャネル経由で結線済み（#2059。supervisor に届かなければ `UNAVAILABLE`（9））。Linux 側の現行値（`start` = 8 など）は「現行実装での参考値」で、launcher 提供後に変わる。固定の合格基準にしない |
-| イメージ管理の現状（C 層） | 参照テーブルのディスク永続化が oci 側で未実装（#851・#854・#2315）のため、Linux でも `image ls` は 0 件（ヘッダのみ）・`image rm` と `image tag` は `NOT_FOUND`（3）が現行値で、`system df` の images 側は 0 件。`--image-root` は必須で既定位置は未決（#2221）。非 Linux はイメージキャッシュの置き場が未決のため他コマンドと同じ plugin 解決の失敗（5 など）で fail-closed。`scripts/cli-parity-check.sh` は C 層を自動収集しないため、手動で実行して記録する |
+| イメージ管理の現状（C 層） | コンテナ参照は永続化済み（#2341・#2352）だが manifest の在庫・タグ・リースの永続化が oci 側で未実装（#2380）のため、Linux でも `image ls` は 0 件（ヘッダのみ）・`image rm` と `image tag` と `create --image-root <dir> --image <digest>` は `NOT_FOUND`（3）が現行値で、`system df` の images 側は 0 件。`--image-root` は必須で既定位置は未決（#2221）。非 Linux はイメージキャッシュの置き場が未決のため他コマンドと同じ plugin 解決の失敗（5 など）で fail-closed。`scripts/cli-parity-check.sh` は C 層を自動収集しないため、手動で実行して記録する |
 | Windows の自動化 | `scripts/cli-parity-check.sh` は Git Bash で実行する。スタブ CLI による自己テストは CI の 3 OS（ubuntu・macos・windows）で実行しているが、製品バイナリ（ネイティブ exe）に対する capture は CI で確かめていない（実機確認の範囲）。タイムアウト時の子孫回収だけはヘルパー exe で CI 実測する（#1548） |
 
 期待値の正は「Linux ネイティブ実行と同一」。Linux の capture を基準にして他 OS を突き合わせる。
@@ -171,6 +171,7 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | C23 | `image ls --image-root <存在しない dir>` | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | |
 | C24 | `image ls --image-root <通常ファイル>` | 5 / `FAILED_PRECONDITION` | | 前提未達 | 前提未達 | | |
 | C25 | `image tag --image-root <dir> busybox:latest busybox:v2` | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 永続化未実装のため常にこの値 |
+| C26 | `create --image-root <dir> --image sha256:<64 hex> --bundle <bundle> <id>`（OCI-7・#2315） | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 在庫の永続化（#2380）まで常にこの値。状態は作られない。`--image` だけ・`--image-root` だけは 2 / `INVALID_ARGUMENT` |
 
 ## 差異のフィードバック先
 

@@ -18,8 +18,13 @@
 //! # 契約と残余（REPAIR-3: 実装済みを装わない）
 //!
 //! - [`KernelAuditLayerStatus::Requested`] は「観測できる範囲に否定する証拠が無く、記録を要求した」だけを意味する。
-//!   ホストの `audit_enabled` の実行時の値と、外部の読み手がいるかは**非特権では確かめられない**（`AUDIT_GET` は
+//!   外部の読み手がいるか・exclude 規則・backlog の超過は**非特権では確かめられない**（`AUDIT_GET` は
 //!   `CAP_AUDIT_CONTROL` / `CAP_AUDIT_READ` が要り、要求しない）ため判定に使わない。「記録された」とは書かない
+//! - `AUDIT_SECCOMP` は `audit_enabled` に依存しない（v6.12 の `audit_seccomp` は有効・無効にかかわらず記録を強制
+//!   する。`docs/design/audit-seccomp-reader.md` 2.2・#2237）。記録が出なくなる条件は `CONFIG_AUDITSYSCALL` の欠如・
+//!   起動時の `audit=0`・exclude 規則・backlog 超過で、前二者を下記の観測が拾う。一方 Landlock の `AUDIT_LANDLOCK_*`
+//!   は v6.15 の `security/landlock/audit.c` が `audit_enabled` を見て早期に戻る箇所を持つ（同書 5 章）。プロセス内の
+//!   読み手と `CAP_AUDIT_READ` の付与は未決（オーナー承認待ち。現状は付与しない）
 //! - 観測は固定の 3 点に限る: `/proc/sys/kernel/seccomp/actions_logged`（`kill_process` を含むか）、`/proc/cmdline`
 //!   の `audit=0` 系、`/proc/self/loginuid` の有無（`CONFIG_AUDIT` を持つカーネルだけが作る）。読めなかった観測は
 //!   [`KernelAuditLayerStatus::Unknown`] とし、縮退と同じに扱う

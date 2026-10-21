@@ -2,7 +2,7 @@
 
 seccomp の `KILL_PROCESS`（`unshare`・`ptrace`・`kexec_load` の 3 件）の正の記録であるカーネルの `AUDIT_SECCOMP` を、プロセス内で読む読み手を入れるか、そのために `CAP_AUDIT_READ` を付与するかの判断材料を整理する（SEC-4・ESC-06・SUP-14。参照: CORE-1・CORE-6・CORE-7・CORE-9。#2237・#2004・#2027・#2028）。
 
-> **位置づけ**: **オーナー承認待ち**。本書は決定ではなく判断材料である。決まるまでは、プロセス内の読み手も `CAP_AUDIT_READ` も入れない現状（#2004 の判断）を保ち、権限分離の承認済みの最小権限集合（`privilege-separation.md`。#1454）を変えない。
+> **位置づけ**: **オーナー承認待ち**。本書は決定ではなく判断材料である。決まるまでは、プロセス内の読み手も `CAP_AUDIT_READ` も入れない現状（#2004 の判断）を保ち、権限分離の承認済みの最小権限集合（`privilege-separation.md`。#1454）を変えない。判断の窓口は #2237（open のまま。6 章に判断シート）。
 
 ## 1. 現状
 
@@ -74,7 +74,21 @@ Linux v6.12 タグの原文で確認した（2026-10-20）。行番号ではな�
 
 | 項目 | 状態 |
 | ---- | ---- |
-| `HAVE_ARCH_AUDITSYSCALL` の有無（`CONFIG_AUDIT=y` でも無いアーキテクチャは loginuid で見分けられない） | 未確認（x86_64・aarch64 は持つ見込み） |
+| `HAVE_ARCH_AUDITSYSCALL` の有無（`CONFIG_AUDIT=y` でも無いアーキテクチャは loginuid で見分けられない） | v6.12 の `arch/x86/Kconfig`・`arch/arm64/Kconfig` に `select HAVE_ARCH_AUDITSYSCALL` があることを確認（2026-10-21）。x86_64・aarch64 では問題にならない |
+| Landlock の `AUDIT_LANDLOCK_*` が `audit_enabled` に依存するか | v6.15 の `security/landlock/audit.c` に `if (!audit_enabled)` の早期 return がある（拒否の記録と domain の記録の関数。2026-10-21 確認）。`AUDIT_SECCOMP` と違い依存する。`audit_enabled` の実行時の値は非特権では確かめられない |
 | (c) exclude 規則・(d) backlog 超過 | 非特権では観測できない |
 | `printk_ratelimit` による間引きの実際 | 未確認 |
 | 実機での `seccomp_kill_audit --ignored`（root と auditd が前提） | 人間の担当 |
+
+## 6. 承認事項（判断シート）
+
+承認の窓口は #2237。すべて**未決**（承認済みのものは無い）。返信は「D1: 推奨どおり / D2: …」のように番号で答えられる。
+
+| 番号 | 判断事項 | 選択肢 | 推奨 | 影響 | 判断 |
+| ---- | -------- | ------ | ---- | ---- | ---- |
+| D1 | プロセス内の読み手と `CAP_AUDIT_READ`（3 章） | A 付与しない / B 付与する | A | A: 最小権限集合は変わらず、残るのは #2027 の縮退表示（`kernel_audit_not_built`・`kernel_audit_disabled_at_boot`・`seccomp_kill_not_logged`・`probe_failed`）と `exit_signal` の補助記録（syscall なし）。B: 3 章の「要るもの」を実装 issue に分ける（親 #2308） | 未決 |
+| D2 | D1 が A のときの ESC-06 の監査の扱い | `Deferred` を保つ / spec の ESC-06・SEC-4 の受け入れ範囲を見直す（spec リポ側の課題）/ opt-in のカーネル監査の段で照合する（auditd が前提。Landlock の `FANDHE_CONTAINER_TEST_KERNEL_AUDIT=1` と同じ形） | なし（spec と関わるためオーナー判断） | #2028 が残した ESC-06 の `Required` 化の可否 | 未決 |
+| D3 | 子孫と exec コマンドの子孫の SIGSYS 終了が親から観測できない残り（`audit-delivery.md` 9.1）を追う issue | 起票する / spec の受け入れ範囲の見直しに含める | なし | 追跡の置き場 | 未決 |
+| D4 | D1 が B のときだけ: READLOG がホスト全体の監査ストリームを各 supervisor に配ること（CORE-1・SUP-1・CORE-7・CORE-9）を受け入れるか | 受け入れる / 受け入れない（= A） | なし（D1 に従属） | 3 章の不利な点 1 | 未決 |
+
+決まった後の作業は 4 章のとおり。この文書の更新時点では、起票も ESC-06 の切り替えも行っていない。

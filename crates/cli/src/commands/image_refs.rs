@@ -28,7 +28,8 @@
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
 //! - レイヤーの展開（本番の展開器）は #2377。展開器なしの `ContainerImage` を使うため、bundle の rootfs は展開済みの前提
-//! - manifest の在庫の永続化は #2380。新しく起動した CLI のストアは在庫が空なので、`register` は常に `NOT_FOUND`
+//! - manifest の在庫の永続化は #2380 で oci 側に実装済み（`ImageStore::lock` が読み直す）。ただし本番で在庫を埋める経路
+//!   （pull → `ImageStore` の配線）が未実装のため、本番のストアの在庫は空で、`register` は常に `NOT_FOUND`
 //! - タグ参照（`name:tag`）の解決はしない。`--image` は manifest digest だけを受ける
 
 use fandhe_container_core::oci_runtime::{

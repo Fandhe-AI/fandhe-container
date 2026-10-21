@@ -1021,6 +1021,13 @@ impl PullSession<'_> {
                 return Err(e);
             }
         };
+        // 在庫を保存する前に、公開した blob 本体とそれを置いたディレクトリ（新設した祖先を含む）を永続化する。
+        // 電源断後に manifest・タグだけが残り blob が欠損する状態を作らない（OCI-7。保存の失敗と同じく、
+        // テーブルは戻し、公開済みの blob は消さない）。
+        if let Err(e) = sync_published_blobs(&root, &to_move) {
+            guard.restore_inventory_portion(before);
+            return Err(e);
+        }
         let released_leases = guard.release_all_leases(&self.id).len();
         // 公開のまとまり（manifest・タグ・リース解放）を 1 回の原子的な保存にする。失敗したらテーブルを戻して
         // エラーを返す。公開済みの blob は消さない（rename まで成功して親ディレクトリの fsync だけ失敗した
@@ -1098,6 +1105,36 @@ impl PullSession<'_> {
             ))
         }
     }
+}
+
+/// 公開した blob の本体と、`blobs/sha256`・`blobs`・ストアルートのディレクトリを fsync する（OCI-7）。
+/// `blobs` 配下は `ensure_blob_dirs` が新設しうるため、祖先のエントリも永続化する。
+/// ディレクトリの fsync は unix のみ（Windows は std で開けない）。
+fn sync_published_blobs(root: &Path, digests: &[Digest]) -> Result<(), OciError> {
+    if digests.is_empty() {
+        return Ok(());
+    }
+    let fail = || err(OciErrorCode::Internal, "failed to sync published blobs");
+    for b in digests {
+        let path = blob_path(root, b)?;
+        // unix は読み取り専用で開いても fsync できる（blob は 0o444 のことがある）。Windows は書き込み権が要る。
+        #[cfg(unix)]
+        let file = fs::File::open(&path);
+        #[cfg(not(unix))]
+        let file = fs::OpenOptions::new().write(true).open(&path);
+        file.and_then(|f| f.sync_all()).map_err(|_| fail())?;
+    }
+    #[cfg(unix)]
+    for dir in [
+        root.join("blobs").join("sha256"),
+        root.join("blobs"),
+        root.to_path_buf(),
+    ] {
+        fs::File::open(&dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|_| fail())?;
+    }
+    Ok(())
 }
 
 /// Windows の公開用の私的な一時名（宛先と同じディレクトリ。同一ボリュームで rename できる）。

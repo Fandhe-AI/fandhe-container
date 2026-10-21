@@ -328,25 +328,34 @@ fn load_with_limits(
 
 /// 件数上限つきで配列を読む種。上限を超える要素は蓄積する前に拒否する
 /// （通常の `Vec` で読むと全件確保した後でしか件数を検査できない）。
-struct CappedSeq<'a, T> {
+/// `make` は要素 1 件ごとの種を作る（入れ子の配列にも上限を掛けるため）。
+struct CappedSeq<'a, F> {
     max: usize,
     exceeded: &'a Cell<bool>,
-    _marker: std::marker::PhantomData<T>,
+    make: F,
 }
 
-impl<'de, T: Deserialize<'de>> DeserializeSeed<'de> for CappedSeq<'_, T> {
-    type Value = Vec<T>;
+impl<'de, S, F> DeserializeSeed<'de> for CappedSeq<'_, F>
+where
+    S: DeserializeSeed<'de>,
+    F: Fn() -> S,
+{
+    type Value = Vec<S::Value>;
 
     fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
-        struct V<'a, T>(usize, &'a Cell<bool>, std::marker::PhantomData<T>);
-        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<'_, T> {
-            type Value = Vec<T>;
+        struct V<'a, F>(usize, &'a Cell<bool>, F);
+        impl<'de, S, F> Visitor<'de> for V<'_, F>
+        where
+            S: DeserializeSeed<'de>,
+            F: Fn() -> S,
+        {
+            type Value = Vec<S::Value>;
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_str("a list of image inventory entries")
             }
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 let mut v = Vec::new();
-                while let Some(item) = seq.next_element::<T>()? {
+                while let Some(item) = seq.next_element_seed((self.2)())? {
                     if v.len() >= self.0 {
                         self.1.set(true);
                         return Err(de::Error::custom("too many image inventory entries"));
@@ -356,7 +365,96 @@ impl<'de, T: Deserialize<'de>> DeserializeSeed<'de> for CappedSeq<'_, T> {
                 Ok(v)
             }
         }
-        d.deserialize_seq(V(self.max, self.exceeded, std::marker::PhantomData))
+        d.deserialize_seq(V(self.max, self.exceeded, self.make))
+    }
+}
+
+/// manifest 1 件の種。`layers` は `MAX_LAYERS` 件を超える要素を確保前に拒否する。
+struct ManifestSeed<'a> {
+    exceeded: &'a Cell<bool>,
+}
+
+impl<'de> DeserializeSeed<'de> for ManifestSeed<'_> {
+    type Value = RawManifestIn;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        struct V<'a>(&'a Cell<bool>);
+        impl<'de> Visitor<'de> for V<'_> {
+            type Value = RawManifestIn;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an image inventory manifest entry")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let (mut digest, mut config, mut layers) = (None, None, None);
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "digest" if digest.is_none() => digest = Some(map.next_value()?),
+                        "config" if config.is_none() => config = Some(map.next_value()?),
+                        "layers" if layers.is_none() => {
+                            layers = Some(map.next_value_seed(CappedSeq {
+                                max: crate::manifest::MAX_LAYERS,
+                                exceeded: self.0,
+                                make: || std::marker::PhantomData::<String>,
+                            })?);
+                        }
+                        _ => return Err(de::Error::custom("unknown or duplicate field")),
+                    }
+                }
+                match (digest, config, layers) {
+                    (Some(digest), Some(config), Some(layers)) => Ok(RawManifestIn {
+                        digest,
+                        config,
+                        layers,
+                    }),
+                    _ => Err(de::Error::custom("missing field")),
+                }
+            }
+        }
+        d.deserialize_map(V(self.exceeded))
+    }
+}
+
+/// リース 1 件の種。`pulls` はファイル全体で共有する残り件数（`remaining`）を超える要素を
+/// 確保前に拒否し、読めた件数を残りから引く。
+struct LeaseSeed<'a> {
+    remaining: &'a Cell<usize>,
+    exceeded: &'a Cell<bool>,
+}
+
+impl<'de> DeserializeSeed<'de> for LeaseSeed<'_> {
+    type Value = RawLeaseIn;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        struct V<'a>(&'a Cell<usize>, &'a Cell<bool>);
+        impl<'de> Visitor<'de> for V<'_> {
+            type Value = RawLeaseIn;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an image inventory lease entry")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let (mut blob, mut pulls) = (None, None);
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "blob" if blob.is_none() => blob = Some(map.next_value()?),
+                        "pulls" if pulls.is_none() => {
+                            let list: Vec<String> = map.next_value_seed(CappedSeq {
+                                max: self.0.get(),
+                                exceeded: self.1,
+                                make: || std::marker::PhantomData::<String>,
+                            })?;
+                            self.0.set(self.0.get().saturating_sub(list.len()));
+                            pulls = Some(list);
+                        }
+                        _ => return Err(de::Error::custom("unknown or duplicate field")),
+                    }
+                }
+                match (blob, pulls) {
+                    (Some(blob), Some(pulls)) => Ok(RawLeaseIn { blob, pulls }),
+                    _ => Err(de::Error::custom("missing field")),
+                }
+            }
+        }
+        d.deserialize_map(V(self.remaining, self.exceeded))
     }
 }
 
@@ -377,28 +475,32 @@ impl<'de> DeserializeSeed<'de> for RawInSeed<'_> {
             }
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
                 let (mut version, mut manifests, mut tags, mut leases) = (None, None, None, None);
+                let remaining = Cell::new(self.0.leases);
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
                         "version" if version.is_none() => version = Some(map.next_value()?),
                         "manifests" if manifests.is_none() => {
-                            manifests = Some(map.next_value_seed(CappedSeq::<RawManifestIn> {
+                            manifests = Some(map.next_value_seed(CappedSeq {
                                 max: self.0.manifests,
                                 exceeded: self.1,
-                                _marker: std::marker::PhantomData,
+                                make: || ManifestSeed { exceeded: self.1 },
                             })?);
                         }
                         "tags" if tags.is_none() => {
-                            tags = Some(map.next_value_seed(CappedSeq::<RawTagIn> {
+                            tags = Some(map.next_value_seed(CappedSeq {
                                 max: self.0.tags,
                                 exceeded: self.1,
-                                _marker: std::marker::PhantomData,
+                                make: || std::marker::PhantomData::<RawTagIn>,
                             })?);
                         }
                         "leases" if leases.is_none() => {
-                            leases = Some(map.next_value_seed(CappedSeq::<RawLeaseIn> {
+                            leases = Some(map.next_value_seed(CappedSeq {
                                 max: self.0.leases,
                                 exceeded: self.1,
-                                _marker: std::marker::PhantomData,
+                                make: || LeaseSeed {
+                                    remaining: &remaining,
+                                    exceeded: self.1,
+                                },
                             })?);
                         }
                         _ => return Err(de::Error::custom("unknown or duplicate field")),
@@ -748,6 +850,47 @@ mod tests {
     fn oci7_missing_file_loads_as_none() {
         let r = root("missing");
         assert!(load_image_inventory(&r).expect("load").is_none());
+    }
+
+    /// OCI-7: 入れ子の `layers`（`MAX_LAYERS` 超）と `pulls`（ファイル全体の残りリース件数超）も
+    /// 確保前に `ResourceExhausted` で拒否する。
+    #[test]
+    fn oci7_load_rejects_over_limit_nested_arrays() {
+        let r = root("nested-limits");
+        let lim = Limits {
+            manifests: 4,
+            tags: 4,
+            leases: 3,
+        };
+        let a = d(0x10).as_str().to_owned();
+        let layers = vec![format!("\"{}\"", d(1).as_str()); crate::manifest::MAX_LAYERS + 1];
+        let body = format!(
+            r#"{{"version":{FORMAT_VERSION},"manifests":[{{"digest":"{}","config":"{}","layers":[{}]}}],"tags":[],"leases":[]}}"#,
+            d(2).as_str(),
+            d(3).as_str(),
+            layers.join(",")
+        );
+        write_raw(&r, &body);
+        assert_eq!(
+            code(load_with_limits(&r, lim, MAX_IMAGE_INVENTORY_FILE_BYTES)),
+            OciErrorCode::ResourceExhausted
+        );
+        // 2 件 + 2 件 = 4 件のリースは上限 3 を超える（2 件目の pulls の途中で拒否される）。
+        let b = d(0x11).as_str().to_owned();
+        let body = format!(
+            r#"{{"version":{FORMAT_VERSION},"manifests":[],"tags":[],"leases":[{{"blob":"{a}","pulls":["p1","p2"]}},{{"blob":"{b}","pulls":["p3","p4"]}}]}}"#
+        );
+        write_raw(&r, &body);
+        assert_eq!(
+            code(load_with_limits(&r, lim, MAX_IMAGE_INVENTORY_FILE_BYTES)),
+            OciErrorCode::ResourceExhausted
+        );
+        // ちょうど 3 件なら受け入れる。
+        let body = format!(
+            r#"{{"version":{FORMAT_VERSION},"manifests":[],"tags":[],"leases":[{{"blob":"{a}","pulls":["p1","p2"]}},{{"blob":"{b}","pulls":["p3"]}}]}}"#
+        );
+        write_raw(&r, &body);
+        assert!(load_with_limits(&r, lim, MAX_IMAGE_INVENTORY_FILE_BYTES).is_ok());
     }
 
     /// OCI-7: 件数の上限超過は蓄積の前に `ResourceExhausted`（小さい上限を注入して確かめる）。

@@ -1984,7 +1984,7 @@ mod linux {
     /// 手順: rootful を拒否（`privilege_for_status`）→ `passwd` から実効 uid の名前を得る（NSS を使わない）→ subuid / subgid を
     /// 分類 → `select_rootless_id_model`。範囲写像のときは `SubordinateIdSource::system` を添える（helper の有無は
     /// ここでは見ず、core の launcher 構築が検証する。縮退しない）。構造化ログは出さない（手順 8 より前に常駐スレッドを
-    /// 作らない制約のため。選んだモデルは子の `uid_map` で確かめる）。
+    /// 作らない制約のため。選んだモデルは子の `uid_map` のほか、launch が残す `state.json` の `launchIsolation.id_mapping` と `inspect` の `idMapping` で確かめられる。#2388）。
     fn resolve_launch_privilege(
         status_text: &str,
         passwd: &Path,

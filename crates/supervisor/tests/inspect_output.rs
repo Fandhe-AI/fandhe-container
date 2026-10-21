@@ -27,6 +27,8 @@ enum V {
     Str(String),
     /// 入れ子のオブジェクト（`auditCoverage` 用。出現順を保つ。SEC-4・#2027）。
     Obj(Vec<(String, V)>),
+    /// オブジェクトの配列（`idMapping` の uid・gid 用。CORE-6・#2388）。
+    Arr(Vec<V>),
 }
 
 /// 出現順を保ったまま `{"k":v,...}` 形式（値は文字列・整数・null のみ）を RFC 8259 の文法どおり厳密にパースする。
@@ -52,6 +54,7 @@ fn parse_object(b: &[u8], i: &mut usize) -> Result<Vec<(String, V)>, String> {
         let v = match peek(b, *i)? {
             b'"' => V::Str(parse_str(b, i)?),
             b'{' => V::Obj(parse_object(b, i)?),
+            b'[' => V::Arr(parse_array(b, i)?),
             b'n' => {
                 if b.get(*i..*i + 4) != Some(b"null".as_slice()) {
                     return Err(format!("invalid literal at {}", *i));
@@ -75,6 +78,23 @@ fn parse_object(b: &[u8], i: &mut usize) -> Result<Vec<(String, V)>, String> {
         }
     }
     Ok(map)
+}
+
+/// `[{...},{...}]` 形式（要素はオブジェクトのみ・空配列は不可）を読む。
+fn parse_array(b: &[u8], i: &mut usize) -> Result<Vec<V>, String> {
+    expect(b, i, b'[')?;
+    let mut out = Vec::new();
+    loop {
+        out.push(V::Obj(parse_object(b, i)?));
+        match peek(b, *i)? {
+            b',' => *i += 1,
+            b']' => {
+                *i += 1;
+                return Ok(out);
+            }
+            c => return Err(format!("unexpected byte 0x{c:02x} at {}", *i)),
+        }
+    }
 }
 
 fn peek(b: &[u8], i: usize) -> Result<u8, String> {
@@ -179,7 +199,7 @@ fn s(v: &str) -> V {
     V::Str(v.to_string())
 }
 /// 契約上の出力キー順（`src/inspect.rs` の `to_json` と同じ。SUP-11）。
-const ORDERED_KEYS: [&str; 12] = [
+const ORDERED_KEYS: [&str; 13] = [
     "id",
     "status",
     "pid",
@@ -192,6 +212,7 @@ const ORDERED_KEYS: [&str; 12] = [
     "health",
     "restartCount",
     "auditCoverage",
+    "idMapping",
 ];
 
 /// 固定レコードを返すメモリ上のフェイク（`get` のみ。3 OS で `inspect` の経路を通すため）。
@@ -303,6 +324,24 @@ fn assert_schema(m: &BTreeMap<String, V>) {
         Some(V::Null | V::Obj(_)) => {}
         other => panic!("auditCoverage: expected object or null, got {other:?}"),
     }
+    match m.get("idMapping") {
+        Some(V::Null) => {}
+        Some(V::Obj(fields)) => {
+            let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(keys, ["model", "uid", "gid"]);
+            assert!(matches!(
+                fields.first().map(|(_, v)| v),
+                Some(V::Str(m)) if m == "single" || m == "subordinate"
+            ));
+            for (_, v) in fields.iter().skip(1) {
+                let V::Arr(rows) = v else {
+                    panic!("idMapping uid/gid must be arrays, got {v:?}");
+                };
+                assert!(!rows.is_empty() && rows.len() <= 340);
+            }
+        }
+        other => panic!("idMapping: expected object or null, got {other:?}"),
+    }
     assert_eq!(
         matches!(m.get("cgroupScope"), Some(V::Null)),
         matches!(m.get("cgroupInstance"), Some(V::Null)),
@@ -399,6 +438,87 @@ fn sec4_2027_audit_coverage_is_reported() {
                 ])
             ),
         ])
+    );
+}
+
+/// CORE-6・SEC-5・REPAIR-4・#2388: 選ばれた ID 写像は、記録があればモデルと uid・gid の範囲（containerId・hostId・
+/// size）を入れ子で、無ければ（記録なし・旧記録）`null` で出す。両モデルを具体値で照合する。
+#[test]
+fn core6_2388_id_mapping_is_reported() {
+    use fandhe_container_core::launch_isolation::{
+        LaunchIsolationRecord, RecordedIdExtent, RecordedIdMapping, RecordedIdModel,
+        RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+    };
+    let iso = LaunchIsolationRecord::from_parts(
+        RootIdentity::new(44, 1234),
+        RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)]).unwrap(),
+    );
+    let none = record(ContainerStatus::created(cid("c"), None), 1);
+    assert_eq!(
+        render_map(&FakeStore(none.clone()), "c")["idMapping"],
+        V::Null
+    );
+    // 記録の無い旧 launchIsolation は「single」と推測せず null。
+    let legacy = none.clone().with_launch_isolation(iso.clone());
+    assert_eq!(render_map(&FakeStore(legacy), "c")["idMapping"], V::Null);
+
+    let ext = |c, h, n| RecordedIdExtent {
+        container_id: c,
+        host_id: h,
+        size: n,
+    };
+    let row = |c: i64, h: i64, n: i64| {
+        V::Obj(vec![
+            ("containerId".to_string(), V::Num(c)),
+            ("hostId".to_string(), V::Num(h)),
+            ("size".to_string(), V::Num(n)),
+        ])
+    };
+    let expect = |model: &str, uid: Vec<V>, gid: Vec<V>| {
+        V::Obj(vec![
+            ("model".to_string(), s(model)),
+            ("uid".to_string(), V::Arr(uid)),
+            ("gid".to_string(), V::Arr(gid)),
+        ])
+    };
+
+    let single = RecordedIdMapping::new(
+        RecordedIdModel::Single,
+        vec![ext(0, 1000, 1)],
+        vec![ext(0, 1001, 1)],
+    )
+    .unwrap();
+    let m = render_map(
+        &FakeStore(
+            none.clone()
+                .with_launch_isolation(iso.clone().with_id_mapping(single)),
+        ),
+        "c",
+    );
+    assert_schema(&m);
+    assert_eq!(
+        m["idMapping"],
+        expect("single", vec![row(0, 1000, 1)], vec![row(0, 1001, 1)])
+    );
+
+    let sub = RecordedIdMapping::new(
+        RecordedIdModel::Subordinate,
+        vec![ext(0, 1000, 1), ext(1, 100_000, 65_536)],
+        vec![ext(0, 1001, 1), ext(1, 200_000, 65_536)],
+    )
+    .unwrap();
+    let m = render_map(
+        &FakeStore(none.with_launch_isolation(iso.with_id_mapping(sub))),
+        "c",
+    );
+    assert_schema(&m);
+    assert_eq!(
+        m["idMapping"],
+        expect(
+            "subordinate",
+            vec![row(0, 1000, 1), row(1, 100_000, 65_536)],
+            vec![row(0, 1001, 1), row(1, 200_000, 65_536)]
+        )
     );
 }
 
@@ -623,7 +743,7 @@ mod linux {
         }
     }
     /// キー集合（アルファベット順。`BTreeMap` のキー列との照合用）。
-    const KEYS: [&str; 12] = [
+    const KEYS: [&str; 13] = [
         "auditCoverage",
         "bundle",
         "cgroupInstance",
@@ -631,6 +751,7 @@ mod linux {
         "exitCode",
         "health",
         "id",
+        "idMapping",
         "pid",
         "restartCount",
         "revision",

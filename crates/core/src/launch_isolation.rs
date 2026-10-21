@@ -299,6 +299,157 @@ pub enum RecordedAuditCoverage {
     },
 }
 
+/// 記録できる ID 写像の範囲（行）数の上限（uid・gid それぞれ。`rootless::MAX_EXTENTS` と同じ値。Linux では単体テストで
+/// 一致を照合する。CORE-6・#2388）。
+pub const MAX_RECORDED_ID_EXTENTS: usize = 340;
+
+/// launch が選んだ ID 写像のモデル（`inspect` の `idMapping.model` の語彙。CORE-6・SEC-5・REPAIR-4・#2388）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RecordedIdModel {
+    /// 1 対 1 写像（起動ユーザーの ID をコンテナ内 0 の 1 件だけへ写す。`RootlessSingleId`）。
+    Single,
+    /// 範囲写像（subuid / subgid の範囲を加える。`RootlessSubordinateIds`）。
+    Subordinate,
+}
+
+impl RecordedIdModel {
+    /// 機械可読な固定語彙（`state.json`・inspect・supervisor のログの `model=` と同じ）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Single => "single",
+            Self::Subordinate => "subordinate",
+        }
+    }
+
+    /// [`Self::as_str`] の逆引き（未知の語彙は `None`）。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "single" => Some(Self::Single),
+            "subordinate" => Some(Self::Subordinate),
+            _ => None,
+        }
+    }
+}
+
+/// ID 写像の 1 行（コンテナ側先頭・ホスト側先頭・個数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedIdExtent {
+    /// コンテナ側の先頭 ID。
+    pub container_id: u32,
+    /// ホスト側の先頭 ID（記録値。権限判断やシグナル送信先に使わない）。
+    pub host_id: u32,
+    /// 個数。
+    pub size: u32,
+}
+
+/// launch が実際に使った ID 写像の記録（モデルと uid・gid の範囲。CORE-6・SEC-5・REPAIR-4・#2388）。
+///
+/// 構築は検証つきの [`Self::new`] だけ。`state.json` から読み戻した値も同じ関数で組み直す（untrusted）。
+/// 観測専用で、モデルの選択や権限判断には使わない。
+#[derive(Clone, PartialEq, Eq)]
+pub struct RecordedIdMapping {
+    model: RecordedIdModel,
+    uid: Vec<RecordedIdExtent>,
+    gid: Vec<RecordedIdExtent>,
+}
+
+fn validate_id_extents(
+    model: RecordedIdModel,
+    extents: &[RecordedIdExtent],
+) -> Result<(), LaunchIsolationError> {
+    let err = LaunchIsolationError;
+    if extents.is_empty() || extents.len() > MAX_RECORDED_ID_EXTENTS {
+        return Err(err("id mapping extent count is out of range"));
+    }
+    let mut container = Vec::with_capacity(extents.len());
+    let mut host = Vec::with_capacity(extents.len());
+    for e in extents {
+        if e.size == 0 {
+            return Err(err("id mapping extent size is zero"));
+        }
+        let c_end = u64::from(e.container_id) + u64::from(e.size);
+        let h_end = u64::from(e.host_id) + u64::from(e.size);
+        if c_end > u64::from(u32::MAX) + 1 || h_end > u64::from(u32::MAX) + 1 {
+            return Err(err("id mapping range overflows u32"));
+        }
+        if e.host_id == 0 {
+            return Err(err("id mapping must not map to host id 0"));
+        }
+        container.push((u64::from(e.container_id), c_end));
+        host.push((u64::from(e.host_id), h_end));
+    }
+    for mut ranges in [container, host] {
+        ranges.sort_unstable();
+        if ranges.windows(2).any(|w| match (w.first(), w.get(1)) {
+            (Some(a), Some(b)) => b.0 < a.1,
+            _ => false,
+        }) {
+            return Err(err("id mapping ranges overlap"));
+        }
+    }
+    if extents.first().map(|e| e.container_id) != Some(0) {
+        return Err(err("container id 0 must be mapped first"));
+    }
+    match model {
+        RecordedIdModel::Single => {
+            if extents.len() != 1 || extents.first().map(|e| e.size) != Some(1) {
+                return Err(err("single id mapping must be exactly one id"));
+            }
+        }
+        RecordedIdModel::Subordinate => {
+            if extents.len() < 2 || extents.first().map(|e| e.size) != Some(1) {
+                return Err(err(
+                    "subordinate id mapping must be one id plus at least one range",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+impl RecordedIdMapping {
+    /// 検証して作る。
+    ///
+    /// 拒否: uid / gid の行が空・[`MAX_RECORDED_ID_EXTENTS`] 超過 / 個数 0 / u32 を超える範囲 / ホスト ID 0 /
+    /// 先頭がコンテナ内 0 でない / 範囲の重複 / モデルと形の不一致（`Single` は 0→1 件だけ、
+    /// `Subordinate` は先頭が 0→1 件で合計 2 行以上）。
+    pub fn new(
+        model: RecordedIdModel,
+        uid: Vec<RecordedIdExtent>,
+        gid: Vec<RecordedIdExtent>,
+    ) -> Result<Self, LaunchIsolationError> {
+        validate_id_extents(model, &uid)?;
+        validate_id_extents(model, &gid)?;
+        Ok(Self { model, uid, gid })
+    }
+
+    /// モデル。
+    pub fn model(&self) -> RecordedIdModel {
+        self.model
+    }
+
+    /// uid の写像行。
+    pub fn uid(&self) -> &[RecordedIdExtent] {
+        &self.uid
+    }
+
+    /// gid の写像行。
+    pub fn gid(&self) -> &[RecordedIdExtent] {
+        &self.gid
+    }
+}
+
+impl fmt::Debug for RecordedIdMapping {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecordedIdMapping")
+            .field("model", &self.model)
+            .field("uid_extents", &self.uid.len())
+            .field("gid_extents", &self.gid.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// launch 時の分離の記録（コンテナの `/` の同一性 + 適用した Landlock）。
 ///
 /// 1 つの値にして「記録がある」ことを一体で判定できるようにする（片方だけの記録を表現できない）。
@@ -307,6 +458,7 @@ pub struct LaunchIsolationRecord {
     root: RootIdentity,
     landlock: RecordedLandlock,
     audit_coverage: RecordedAuditCoverage,
+    id_mapping: Option<RecordedIdMapping>,
 }
 
 impl LaunchIsolationRecord {
@@ -316,7 +468,20 @@ impl LaunchIsolationRecord {
             root,
             landlock,
             audit_coverage: RecordedAuditCoverage::NotRecorded,
+            id_mapping: None,
         }
+    }
+
+    /// launch が使った ID 写像の記録を添える（CORE-6・#2388）。添えなければ `None`（旧記録と同じ。「single」とは推測しない）。
+    #[must_use]
+    pub fn with_id_mapping(mut self, mapping: RecordedIdMapping) -> Self {
+        self.id_mapping = Some(mapping);
+        self
+    }
+
+    /// 添えられた ID 写像の記録（無ければ `None`）。
+    pub fn id_mapping(&self) -> Option<&RecordedIdMapping> {
+        self.id_mapping.as_ref()
     }
 
     /// 監査の網羅の評価結果を添える（SEC-4・#2027）。添えなければ [`RecordedAuditCoverage::NotRecorded`]。
@@ -355,7 +520,11 @@ impl fmt::Debug for LaunchIsolationRecord {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) use linux::id_extents_of;
+
+#[cfg(target_os = "linux")]
 mod linux {
+    use super::RecordedIdExtent;
     use super::RecordedLandlockAudit;
     use super::{
         LaunchIsolationError, LaunchIsolationRecord, RecordedLandlock, RecordedRule,
@@ -364,6 +533,19 @@ mod linux {
     use crate::landlock::{
         AccessFs, LandlockAuditMode, LandlockRuleset, PathRule, RuleOrigin, RulePath,
     };
+    use crate::rootless::IdMapSet;
+
+    /// 検証済みの写像集合を記録用の行へ写す（CORE-6・#2388。launcher が記録を作るときに使う）。
+    pub(crate) fn id_extents_of(set: &IdMapSet) -> Vec<RecordedIdExtent> {
+        set.entries()
+            .iter()
+            .map(|e| RecordedIdExtent {
+                container_id: e.container_id,
+                host_id: e.host_id,
+                size: e.count,
+            })
+            .collect()
+    }
 
     impl From<LandlockAuditMode> for RecordedLandlockAudit {
         /// 実行時のモードを OS 非依存の記録の語彙へ写す（launcher と supervisor 手順 4 の前倒し判定が共有する。#2027）。
@@ -550,6 +732,99 @@ mod tests {
         );
     }
 
+    fn ext(c: u32, h: u32, n: u32) -> RecordedIdExtent {
+        RecordedIdExtent {
+            container_id: c,
+            host_id: h,
+            size: n,
+        }
+    }
+
+    /// CORE-6・SEC-5・#2388: ID 写像の記録の検証を具体値で照合する。
+    #[test]
+    fn core6_2388_id_mapping_validation() {
+        use RecordedIdModel::{Single, Subordinate};
+        let single = vec![ext(0, 1000, 1)];
+        let sub = vec![ext(0, 1000, 1), ext(1, 100_000, 65_536)];
+        let m = RecordedIdMapping::new(Single, single.clone(), single.clone()).unwrap();
+        assert_eq!(m.model().as_str(), "single");
+        assert_eq!(m.uid(), single.as_slice());
+        let m = RecordedIdMapping::new(Subordinate, sub.clone(), sub.clone()).unwrap();
+        assert_eq!(m.model().as_str(), "subordinate");
+        assert_eq!(m.gid().len(), 2);
+        assert_eq!(RecordedIdModel::parse("subordinate"), Some(Subordinate));
+        assert_eq!(RecordedIdModel::parse("range"), None);
+
+        let msg = |model, u: Vec<RecordedIdExtent>| {
+            RecordedIdMapping::new(model, u, single.clone())
+                .unwrap_err()
+                .message()
+        };
+        assert_eq!(
+            msg(Single, vec![]),
+            "id mapping extent count is out of range"
+        );
+        let many = (0..=MAX_RECORDED_ID_EXTENTS as u32)
+            .map(|i| ext(i, 1000 + i, 1))
+            .collect();
+        assert_eq!(
+            msg(Subordinate, many),
+            "id mapping extent count is out of range"
+        );
+        assert_eq!(
+            msg(Single, vec![ext(0, 1000, 0)]),
+            "id mapping extent size is zero"
+        );
+        assert_eq!(
+            msg(Single, vec![ext(0, u32::MAX, 2)]),
+            "id mapping range overflows u32"
+        );
+        assert_eq!(
+            msg(Single, vec![ext(0, 0, 1)]),
+            "id mapping must not map to host id 0"
+        );
+        assert_eq!(
+            msg(Subordinate, vec![ext(0, 1000, 1), ext(1, 0, 5)]),
+            "id mapping must not map to host id 0"
+        );
+        assert_eq!(
+            msg(Subordinate, vec![ext(0, 1000, 1), ext(1, 1000, 5)]),
+            "id mapping ranges overlap"
+        );
+        assert_eq!(
+            msg(Subordinate, vec![ext(0, 1000, 1), ext(0, 5000, 5)]),
+            "id mapping ranges overlap"
+        );
+        assert_eq!(
+            msg(Single, vec![ext(1, 1000, 1)]),
+            "container id 0 must be mapped first"
+        );
+        assert_eq!(
+            msg(Single, sub.clone()),
+            "single id mapping must be exactly one id"
+        );
+        assert_eq!(
+            msg(Single, vec![ext(0, 1000, 2)]),
+            "single id mapping must be exactly one id"
+        );
+        assert_eq!(
+            msg(Subordinate, single.clone()),
+            "subordinate id mapping must be one id plus at least one range"
+        );
+        // gid 側の不正も拒否する。
+        assert!(RecordedIdMapping::new(Single, single.clone(), vec![ext(0, 0, 1)]).is_err());
+    }
+
+    /// `Debug` は値を出さず件数だけを出す。
+    #[test]
+    fn core6_2388_id_mapping_debug_hides_ids() {
+        let sub = vec![ext(0, 1234, 1), ext(1, 777_000, 65_536)];
+        let m = RecordedIdMapping::new(RecordedIdModel::Subordinate, sub.clone(), sub).unwrap();
+        let s = format!("{m:?}");
+        assert!(s.contains("uid_extents: 2"), "{s}");
+        assert!(!s.contains("1234") && !s.contains("777000"), "{s}");
+    }
+
     /// `Debug` は件数だけを出し、パスや識別子の値を載せない。
     #[test]
     fn sup6_task163_1468_debug_hides_paths_and_identity() {
@@ -571,6 +846,7 @@ mod tests {
 
         #[test]
         fn sup6_task163_1468_constants_match_landlock_module() {
+            assert_eq!(MAX_RECORDED_ID_EXTENTS, crate::rootless::MAX_EXTENTS);
             assert_eq!(MAX_RECORDED_RULES, MAX_LANDLOCK_RULES);
             assert_eq!(ALL_FS_ACCESS_BITS, AccessFs::ALL.bits());
         }

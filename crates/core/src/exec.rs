@@ -205,9 +205,6 @@ pub use launch_status::relay_mount_binds_failure_for_test;
 /// supervisor の `SETUP_VIOLATIONS` との突き合わせ試験専用の再公開（SEC-4・SUP-6・#1579。通常の利用者は呼ばない）。
 #[doc(hidden)]
 pub use process::exec_child_violation_reasons;
-/// 結合試験 `tests/seccomp.rs` 専用の再公開（CORE-5・TASK-38.4・#179。通常の利用者は呼ばない。詳細は定義側）。
-#[doc(hidden)]
-pub use process::spawn_container_seccomp_probe;
 /// 結合試験 `tests/fork_exec_isolation.rs` 専用の再公開（CORE-5・SEC-1・REPAIR-12・#1714。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]

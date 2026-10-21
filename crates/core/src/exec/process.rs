@@ -2492,7 +2492,7 @@ impl StepError {
 /// 子の前段（[`run_pre_pivot`] → ステージ列）を共通化した本体。
 ///
 /// 終端 `terminal` は組み込みステージ（capability 削減・`NO_NEW_PRIVS`・seccomp）の通過後にだけ呼ばれる。
-/// 本番の `run_child` は exec を、結合試験専用の [`spawn_container_seccomp_probe`] は exec の代わりに
+/// 本番の `run_child` は exec を、結合試験専用の `spawn_container_probe` 系は exec の代わりに
 /// プローブを渡す。exec を呼べるのは `run_child` の終端だけで、fail-closed（`require_restriction_evidence`）
 /// は変わらない。
 fn run_child_then<T>(
@@ -2531,66 +2531,6 @@ fn run_child_then<T>(
     stages.with_mounted_targets(ops.into_mounted()).run_then(
         |_stage_report, _capability_report, evidence| terminal(&isolation, &report, evidence),
     )
-}
-
-/// 子のメイン（プローブ版）。失敗は `child_main` と同じ規約で stderr へ 1 行出して終了コードにする。
-fn child_main_probe(rootfs: &Path, stages: StagePipeline) -> i32 {
-    let result = run_child_then(rootfs, None, stages, |_isolation, _report, _evidence| {
-        let record = super::seccomp::probe_denied_syscalls()?;
-        publish_probe_record(&record.render())
-    });
-    match result {
-        Ok(()) => 0,
-        Err(err) => {
-            let _ = writeln!(std::io::stderr(), "fandhe-container: {err}");
-            exit_code_for(&err)
-        }
-    }
-}
-
-/// 記録を pivot 後の `/seccomp-probe.tmp` へ `create_new` で書き、`/seccomp-probe` へハードリンクして
-/// から一時名を消す（`link` は宛先が存在すれば `EEXIST` で失敗するため、既存ファイル・symlink を
-/// 上書き・追従しない。`rename` は宛先を黙って置換するため使わない。親はリンク後の完成品だけを読む）。
-fn publish_probe_record(text: &str) -> Result<(), ExecError> {
-    let fail = |e: std::io::Error| {
-        ExecError::new(
-            ErrorCode::Internal,
-            IsolationStage::Seccomp,
-            format!("failed to publish seccomp probe record: {e}"),
-        )
-    };
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open("/seccomp-probe.tmp")
-        .map_err(fail)?;
-    f.write_all(text.as_bytes()).map_err(fail)?;
-    drop(f);
-    let linked = std::fs::hard_link("/seccomp-probe.tmp", "/seccomp-probe");
-    // 一時名は成否に関わらず片付ける（リンク失敗を優先して報告する）。
-    let removed = std::fs::remove_file("/seccomp-probe.tmp");
-    linked.map_err(fail)?;
-    removed.map_err(fail)
-}
-
-/// 結合試験専用: exec の代わりに禁止 syscall のプローブを実行する子を fork する（CORE-5・TASK-38.4・#179）。
-///
-/// 呼び出し文脈は `tests/seccomp.rs` のシナリオ（`isolate` 済みの親）。`spawn_container_with_stages` と
-/// 同じ前段（pivot 済み・capability 削減・`NO_NEW_PRIVS`・組み込み seccomp）を通した後、終端で
-/// `<rootfs>/seccomp-probe` へ記録を書いて終了コード 0 で終わる。exec は呼ばないため、権限は
-/// `spawn_container` と同じで昇格経路は増えない。通常の利用者は呼ばない。
-///
-/// # 将来仕様（記録のみ）
-///
-/// プローブの成功は証跡ではない。エントリポイント内のプローブへ移して本関数を廃止する（REPAIR-3。#1714 の範囲外）。
-#[doc(hidden)]
-pub fn spawn_container_seccomp_probe(
-    rootfs: &Path,
-    stages: StagePipeline,
-) -> Result<ContainerChild, ExecError> {
-    let pid = sys::fork_single_threaded(|| child_main_probe(rootfs, stages), EXIT_SETUP_FAILED)
-        .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
-    Ok(ContainerChild::new(pid))
 }
 
 /// 結合試験専用: exec の代わりに任意の攻撃プローブを実行する子を fork する（SEC-2・TASK-42.1・#199）。
@@ -3310,7 +3250,7 @@ impl ContainerChild {
     ///
     /// 出力は `emit_diagnostic_line`（AF_UNIX の socket 以外へは書かず、満杯でも待たず、再試行しない）の 1 回だけで、
     /// stderr が停止していても返却を妨げない。出力の成否で起動の可否は変えない（最善努力）。`new` は I/O をしない
-    /// 契約のまま残し、`spawn_container_probe`・`spawn_container_seccomp_probe`・内部の回収（結合試験と内部用）は
+    /// 契約のまま残し、`spawn_container_probe`・内部の回収（結合試験と内部用）は
     /// `new` を使う（診断ログを出す対象にしない）。
     pub(super) fn spawned(pid: u32) -> Self {
         Self::from_pidfd_result_reported(pid, sys::pidfd_open(pid), std::io::stderr().as_fd()).0

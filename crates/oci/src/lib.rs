@@ -52,8 +52,10 @@
 //! 展開物の所有者は、既定では実行ユーザーのままで、`OwnershipPolicy::ChownMapped` と複数行の写像 `IdMap` を渡すと
 //! tar の uid / gid を写像してホストの ID へ `chown` する（Linux のみ。権限の主体と順序は `layer::extract` のモジュール
 //! doc を参照）。`SpecialBitsPolicy::PreserveIfChowned` は rootful（ホスト root）で `chown` 後の所有者が写像と一致する
-//! ファイルだけ特殊ビットを残す（SEC-5・SEC-1・#2225）。
-//! 未実装: ディレクトリ fd 起点の解決（TOCTOU 対策）、rootless で写像済みの user namespace の中から展開する経路、
+//! ファイルだけ特殊ビットを残す（SEC-5・SEC-1・#2225）。`OwnershipPolicy::ChownInUserNamespace` は rootless で、
+//! コンテナと同じ写像の user namespace の中から tar のコンテナ内 ID をそのまま `chown` する（`/proc/self` で開始前に
+//! 検証する。OCI-2・SEC-5・#2382）。
+//! 未実装: ディレクトリ fd 起点の解決（TOCTOU 対策）、rootless の user namespace へ入って展開器を呼ぶ core 側の配線（#2315）、
 //! 0700 の祖先ディレクトリで閉じ込めを判定する方式（複数範囲の写像でコンテナ内の非 root が `/` を辿れるようにするため。
 //! 現状は `root` が 0700 で、コンテナ root だけが辿れる）、綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する
 //! 別表記は衝突として扱わない。IO-5）。

@@ -479,10 +479,15 @@ mod imp {
         let root_dev = fstat(root.as_fd())
             .map(|(d, _, _, _)| d)
             .map_err(|_| remove_failed())?;
-        // rootfs の下に bind mount 等があると、再帰削除がマウント元の中身を消す。何も消す前に拒否する。
-        refuse_if_mounts_below(root.as_fd())?;
+        // rootfs 自身がマウントポイントなら（親と別のマウント）マウント元を消さないよう拒否する。
+        // 下位の bind mount は、再帰の各エントリを開くたびに `mnt_id` を照合して跨がない（検査後に足された
+        // マウントも、経路の snapshot に依存せず fd の実体で拒否する。fail-closed）。
+        let root_mnt = mount_id(root.as_fd()).ok_or_else(refuse)?;
+        if mount_id(parent) != Some(root_mnt) {
+            return Err(refuse());
+        }
         let mut seen = 0usize;
-        remove_children(root.as_fd(), root_dev, 0, &mut seen)?;
+        remove_children(root.as_fd(), root_dev, root_mnt, 0, &mut seen)?;
         match sys::remove_dir_at(parent, name) {
             Ok(()) => Ok(RecordedRootfsRemoval::Removed),
             Err(SysError::Os(n)) if n == sys::ENOENT => Ok(RecordedRootfsRemoval::Removed),
@@ -524,57 +529,12 @@ mod imp {
         Err(refuse())
     }
 
-    /// `/proc/self/mountinfo` の mount point 欄（8 進エスケープ）を元のバイト列へ戻す。
-    #[cfg(test)]
-    pub(super) fn unescape_mountinfo_for_test(field: &str) -> Vec<u8> {
-        unescape_mountinfo(field)
-    }
-
-    fn unescape_mountinfo(field: &str) -> Vec<u8> {
-        let b = field.as_bytes();
-        let mut out = Vec::with_capacity(b.len());
-        let mut i = 0;
-        while i < b.len() {
-            let octal = b.get(i..i + 4).filter(|w| {
-                w.first() == Some(&b'\\')
-                    && w.get(1..)
-                        .is_some_and(|d| d.iter().all(|c| (b'0'..=b'7').contains(c)))
-            });
-            if let Some(w) = octal {
-                let v = u32::from(w[1] - b'0') * 64
-                    + u32::from(w[2] - b'0') * 8
-                    + u32::from(w[3] - b'0');
-                out.push((v & 0xff) as u8);
-                i += 4;
-            } else if let Some(c) = b.get(i) {
-                out.push(*c);
-                i += 1;
-            }
-        }
-        out
-    }
-
-    /// rootfs（固定済みの fd）自身またはその下にマウントポイントがあれば拒否する（SEC-1。bind mount の
-    /// マウント元の中身を再帰削除で消さないため）。mountinfo を読めない場合も fail-closed で拒否する。
-    fn refuse_if_mounts_below(root: BorrowedFd<'_>) -> Result<(), TraitError> {
-        let root_path = std::fs::read_link(format!("/proc/self/fd/{}", root.as_raw_fd()))
-            .map_err(|_| refuse())?;
-        let mountinfo = std::fs::read("/proc/self/mountinfo").map_err(|_| refuse())?;
-        let root_bytes = root_path.as_os_str().as_bytes();
-        for line in String::from_utf8_lossy(&mountinfo).lines() {
-            let Some(field) = line.split(' ').nth(4) else {
-                continue;
-            };
-            let mp = unescape_mountinfo(field);
-            let below = mp == root_bytes
-                || (mp.len() > root_bytes.len()
-                    && mp.starts_with(root_bytes)
-                    && mp.get(root_bytes.len()) == Some(&b'/'));
-            if below {
-                return Err(refuse());
-            }
-        }
-        Ok(())
+    /// fd の属するマウント ID（fdinfo の `mnt_id`）。経路の文字列に依存せず、固定した fd の実体で判定する
+    /// （改名・bind mount の別名・非 UTF-8 の名前の影響を受けない。SEC-1）。読めない場合は `None`。
+    fn mount_id(fd: BorrowedFd<'_>) -> Option<u64> {
+        let text =
+            std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd())).ok()?;
+        crate::oci_runtime::mountinfo_identity::parse_fdinfo_mnt_id(&text)
     }
 
     /// `dir`（固定済みの fd）の中身を、fd 相対・リンク非追従で再帰的に消す（件数・深さの上限つき）。
@@ -584,6 +544,7 @@ mod imp {
     fn remove_children(
         dir: BorrowedFd<'_>,
         root_dev: u64,
+        root_mnt: u64,
         depth: usize,
         seen: &mut usize,
     ) -> Result<(), TraitError> {
@@ -592,8 +553,8 @@ mod imp {
         }
         let proc_path = format!("/proc/self/fd/{}", dir.as_raw_fd());
         let (dev, _, is_dir, mode) = fstat(dir).map_err(|_| remove_failed())?;
-        // 別ファイルシステムのマウントを跨がない（同一 FS の bind mount は事前の mountinfo 検査が担う）。
-        if !is_dir || dev != root_dev {
+        // 別ファイルシステム・別マウント（同一 FS の bind mount を含む）を跨がない。
+        if !is_dir || dev != root_dev || mount_id(dir) != Some(root_mnt) {
             return Err(remove_failed());
         }
         if mode & 0o700 != 0o700 {
@@ -612,11 +573,14 @@ mod imp {
                 Err(SysError::Os(n)) if n == sys::ENOENT => continue,
                 Err(_) => return Err(remove_failed()),
             };
+            if mount_id(child.as_fd()) != Some(root_mnt) {
+                return Err(remove_failed());
+            }
             let is_child_dir = fstat(child.as_fd())
                 .map(|(_, _, d, _)| d)
                 .map_err(|_| remove_failed())?;
             if is_child_dir {
-                remove_children(child.as_fd(), root_dev, depth + 1, seen)?;
+                remove_children(child.as_fd(), root_dev, root_mnt, depth + 1, seen)?;
                 sys::remove_dir_at(dir, &name).map_err(|_| remove_failed())?;
             } else {
                 sys::remove_file_at(dir, &name).map_err(|_| remove_failed())?;
@@ -1086,14 +1050,5 @@ mod tests {
             .expect("must not block");
         assert!(refused);
         let _ = std::fs::remove_dir_all(&b);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn oci7_unescape_mountinfo_decodes_octal() {
-        assert_eq!(
-            imp::unescape_mountinfo_for_test("/a\\040b"),
-            b"/a b".to_vec()
-        );
     }
 }

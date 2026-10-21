@@ -469,6 +469,7 @@ jobs:
       # plugin 起動対象の構築口 from_verified_file を呼ぶのが core の変換と許可した試験コードだけであることの
       # 機械判定（PLUG-11・#1857）。cargo を使わないソースの走査。既存ジョブへのステップ追加（check-run 件数は不変）
       - name: plugin 起動対象の構築箇所の検証（PLUG-11・#1857）
+        if: env.HANG_PROBE != 'true'
         shell: bash
         timeout-minutes: 5
         run: make check-launch-target

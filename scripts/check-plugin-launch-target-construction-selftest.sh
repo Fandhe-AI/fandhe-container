@@ -32,16 +32,53 @@ make_base() {
     "${r}/crates/cli/tests" "${r}/benches/benches"
   cat >"${r}/${DEF}" <<'EOT'
 //! `PluginLaunchTarget::from_verified_file` に触れる doc コメント。
+pub struct PluginLaunchTarget {
+    file: Arc<File>,
+}
+
 impl PluginLaunchTarget {
     /// `from_verified_file` の doc。
-    pub fn from_verified_file(file: File) -> Result<Self, PluginError> {
-        todo!()
+    pub fn from_verified_file(
+        file: File,
+        display_path: PathBuf,
+    ) -> Result<Self, PluginError> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                file: Arc::new(file),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                file: Arc::new(file),
+            })
+        }
     }
+
+    pub fn display_path(&self) -> &Path {
+        &self.display_path
+    }
+
+    pub fn identity(&self) -> PluginFileIdentity {
+        self.identity
+    }
+}
+
+pub(crate) fn linux_fd_exec_path(
+    target: &PluginLaunchTarget,
+) -> Result<PathBuf, PluginError> {
+    todo!()
 }
 
 #[cfg(test)]
 fn current_exe_target() -> PluginLaunchTarget {
     PluginLaunchTarget::from_verified_file(f).unwrap()
+}
+
+#[cfg(test)]
+fn test_literal() -> PluginLaunchTarget {
+    PluginLaunchTarget { file: x }
 }
 
 #[cfg(test)]
@@ -182,6 +219,65 @@ m_real_inner_attr() {
 m_char_quote() {
   printf '%s\n' "fn a() { let _ = '\"'; }" '#[cfg(test)]' 'fn t() {' '    let _ = PluginLaunchTarget::from_verified_file(f);' '}' >"$1/${MODE}"
 }
+def_append() { printf '%s\n' "$2" >>"$1/${DEF}"; }
+m_alias_ctor_literal() {
+  def_append "$1" 'impl PluginLaunchTarget {
+    pub fn from_path(file: File) -> Result<Self, PluginError> {
+        Ok(Self { file: Arc::new(file) })
+    }
+}'
+}
+m_alias_ctor_multiline() {
+  def_append "$1" 'impl PluginLaunchTarget {
+    pub fn from_path(
+        file: File,
+    ) -> Self {
+        make(file)
+    }
+}'
+}
+m_alias_ctor_clone() {
+  def_append "$1" 'impl PluginLaunchTarget {
+    pub fn dup(&self) -> Self { self.clone() }
+}'
+}
+m_literal_outside_fvf() {
+  def_append "$1" 'impl Default for PluginLaunchTarget {
+    fn default() -> Self {
+        PluginLaunchTarget { file: x }
+    }
+}'
+}
+m_literal_count_decreased() {
+  # 片方の cfg 分岐のリテラル（2 件目）を消す
+  awk 'BEGIN{n=0} /Ok\(Self \{/ {n++; if (n==2) {print "            Err(todo())"; skip=2; next}} skip>0 {skip--; next} {print}' "$1/${DEF}" >"$1/${DEF}.new"
+  mv "$1/${DEF}.new" "$1/${DEF}"
+}
+m_literal_in_test_ok() {
+  def_append "$1" '#[cfg(test)]
+mod more {
+    fn t() -> u8 { let _ = PluginLaunchTarget { file: x }; 0 }
+}'
+}
+m_oneline_cfg_test() {
+  printf '#[cfg(test)] fn a() {}\nfn prod() {\n    let _ = PluginLaunchTarget::from_verified_file(f);\n}\n' >"$1/${MODE}"
+}
+m_oneline_attr_after_cfg_test() {
+  printf '#[cfg(test)]\n#[allow(dead_code)] fn a() {}\nfn prod() {\n    let _ = PluginLaunchTarget::from_verified_file(f);\n}\n' >"$1/${MODE}"
+}
+m_cfg_test_trailing_comment_ok() {
+  printf '#[cfg(test)] // note\nfn a() {\n    let _ = PluginLaunchTarget::from_verified_file(f);\n}\n' >"$1/${MODE}"
+}
+m_multiline_attr_ok() {
+  printf '#[cfg(all(\n    unix,\n))]\nfn a() {}\n' >"$1/${MODE}"
+}
+m_def_external_mod() {
+  def_append "$1" 'mod evil;'
+}
+m_symlink_dir() {
+  mkdir -p "$1/crates/real/src"
+  ln -s real "$1/crates/linked"
+}
 m_second_def() {
   mkdir -p "$1/crates/net/src"
   echo 'pub fn from_verified_file() {}' >"$1/crates/net/src/lib.rs"
@@ -210,6 +306,28 @@ run_case multiline_str_attr 1 "NG: ${MODE}:5:" m_multiline_str_attr
 run_case unterminated 1 "unterminated string" m_unterminated
 run_case real_inner_attr 0 "OK:" m_real_inner_attr
 run_case char_quote 0 "OK:" m_char_quote
+run_case alias_ctor_literal 1 "function 'from_path' returns PluginLaunchTarget" m_alias_ctor_literal
+run_case alias_ctor_literal_lit 1 "struct literal outside from_verified_file" m_alias_ctor_literal
+run_case alias_ctor_multiline 1 "function 'from_path' returns PluginLaunchTarget" m_alias_ctor_multiline
+run_case alias_ctor_clone 1 "function 'dup' returns PluginLaunchTarget" m_alias_ctor_clone
+run_case literal_outside_fvf 1 "struct literal outside from_verified_file" m_literal_outside_fvf
+run_case literal_count_decreased 1 "expected 2 PluginLaunchTarget struct literals" m_literal_count_decreased
+run_case literal_in_test_ok 0 "OK:" m_literal_in_test_ok
+run_case oneline_cfg_test 1 "NG: ${MODE}:1: attribute followed by code" m_oneline_cfg_test
+run_case oneline_cfg_test_prod 1 "NG: ${MODE}:3:" m_oneline_cfg_test
+run_case oneline_attr_after_cfg_test 1 "NG: ${MODE}:2: attribute followed by code" m_oneline_attr_after_cfg_test
+run_case cfg_test_trailing_comment_ok 0 "OK:" m_cfg_test_trailing_comment_ok
+run_case multiline_attr_ok 0 "OK:" m_multiline_attr_ok
+run_case def_external_mod 1 "out-of-file module" m_def_external_mod
+
+# ディレクトリの symlink。作れない環境（Git Bash で複製になる等）では note を出して先へ進む。
+symprobe="${work}/symprobe"
+mkdir -p "${symprobe}/d"
+if ln -s d "${symprobe}/l" 2>/dev/null && [ -L "${symprobe}/l" ]; then
+  run_case symlink_dir 1 "symlinked directory is not scanned" m_symlink_dir
+else
+  echo "note: symlink-dir case not applicable on this host"
+fi
 run_case bad_arg 2 "usage:" m_none --bogus
 
 # 読めないファイル。chmod 000 でも読めてしまう環境では実行できない。

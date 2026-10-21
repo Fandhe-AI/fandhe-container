@@ -13,24 +13,27 @@
 //!
 //! ストア単位の排他（TASK-183.2・OCI-7・#473）は [`ImageStore`] が担う。テーブルはそのガード越しにだけ
 //! 変更できる（契約と前提は `store` モジュールの doc）。コンテナ参照（エントリと世代カウンタ）は root 直下の
-//! ファイルへ永続化済み（#2341。`container_ref_persist`）で、manifest の在庫・タグ・リースは
-//! プロセスごとのメモリ上の別物のままである。
+//! ファイルへ永続化済み（#2341。`container_ref_persist`）で、manifest の在庫・タグ・リースも別ファイル
+//! `@image-inventory.json` へ永続化済み（#2380。`inventory_persist`）。どちらも排他取得のたびに読み直す。
 //!
 //! 未実装（後続 issue の担当。実装済みを装わない。REPAIR-3）:
-//! - テーブル（manifest の在庫・タグ・リース）自体のディスクへの永続化。削除の永続化完了確認と再試行
+//! - 在庫・タグ・リースの永続化は #2380 で実装済み（ひとまとまりの操作の入口が排他の中で保存する。ガードから
+//!   下位メソッドを直接呼んだ変更は保存されない）。本番で在庫を埋める経路（pull → `ImageStore` の配線。cli・cri）は
+//!   未実装のため、本番のストアの在庫は空のまま。削除の永続化完了確認と再試行
 //!   （削除ジャーナル `gc_journal`。fsync と取得時のロールフォワード）は実装済み（#851）だが、保証するのは
 //!   ジャーナルと blob ファイルの unlink の範囲だけ。再起動時の照合 API は `reconcile` で実装済み（#854）。本番 probe と起動時の配線は未実装（#2315）
 //! - `image rm` の既定の削除拒否判定は `remove` モジュールで実装済み。`--force` と実削除（untag・`remove_manifest`・非共有 blob の削除。TASK-183.6・#481）も
 //!   `remove` で実装済み（削除の永続化と再試行は #851 で実装済み、CLI 配線は未実装）
-//! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（CLI 経路と永続化は未実装）
+//! - `image tag` の API は `tag`（#479・TASK-183.4）で実装済み（永続化は #2380。CLI 経路は #2316）
 //! - `image prune` 本体は `prune` モジュールで実装済み（#476）。`rm`・`prune` の CLI 配線（#476・#480・#481）。`image ls`/`system df` の集計 API は
 //!   `usage`（#478・TASK-183.3）で実装済み（staging の容量・コンテナ容量の受け口・展開後サイズの二段階 API は #2222。CLI 経路は未実装）
 //! - pull のリース登録・ステージング書き込み（#474・TASK-183.9）と、公開・失敗時のロールバック
 //!   （#475・TASK-183.10）は `pull` で実装済み（cri からの配線は未実装）。クラッシュで残った pull の
 //!   リース・ステージングの回収 GC は `pull_recovery`（`recover_stale_pulls`。#852・TASK-183.11.2）で
 //!   実装済み（起動時の呼び出しの配線は未実装・#2315）
-//! - コンテナ参照以外（manifest・タグ・リース）の件数上限は永続化と合わせて判断する（コンテナ参照は
-//!   `MAX_CONTAINER_REFS` で上限済み）。タグは `MAX_TAG_REFS` で書き込み側が検査済み（#2316）
+//! - 件数の上限: コンテナ参照は `MAX_CONTAINER_REFS`、manifest は `MAX_IMAGE_MANIFESTS`、タグは
+//!   `MAX_TAG_REFS`（#2316）、pull リースの組は `MAX_PULL_LEASES`。いずれも書き込み側で検査し、読み込み側
+//!   （永続化ファイル）でも同じ上限で拒否する（#2380）
 //!
 //! core の `ContainerId` との対応づけ（#853・TASK-183.8.1）: core は oci に依存せず、core 側の
 //! `ContainerImageRefs`（`oci_runtime`）を、oci と core の両方に依存するアダプタが
@@ -46,6 +49,14 @@ mod container_ref_persist;
 pub use container_ref_persist::{
     CONTAINER_REFS_FILE_NAME, MAX_CONTAINER_REFS, MAX_CONTAINER_REFS_FILE_BYTES,
 };
+
+mod inventory_persist;
+pub use inventory_persist::{
+    IMAGE_INVENTORY_FILE_NAME, MAX_IMAGE_INVENTORY_FILE_BYTES, MAX_IMAGE_MANIFESTS, MAX_PULL_LEASES,
+};
+
+#[cfg(test)]
+mod inventory_ops_tests;
 
 mod container_ref;
 pub use container_ref::{ContainerRefRegistration, ContainerRefRelease};
@@ -393,6 +404,13 @@ impl ReferenceTable {
                 format!("manifest {digest} already registered with a different composition"),
             )),
             None => {
+                // 永続化できる件数を超える新規登録は拒否する（保存できない状態を作らない。#2380）。
+                if self.manifests.len() >= MAX_IMAGE_MANIFESTS {
+                    return Err(err(
+                        OciErrorCode::ResourceExhausted,
+                        "too many image manifests",
+                    ));
+                }
                 self.manifests.insert(digest, composition);
                 Ok(())
             }
@@ -519,6 +537,14 @@ impl ReferenceTable {
     /// 削除ジャーナルがディスクに残っている間は `FailedPrecondition`（参照の追加を禁じる。OCI-7）。
     pub fn acquire_lease(&mut self, blob: Digest, pull: PullId) -> Result<LeaseAcquired, OciError> {
         self.ensure_no_pending_deletion()?;
+        // 永続化できる組の総数を超える新規リースは拒否する（既存の組の再取得は通す。#2380）。
+        let exists = self
+            .pull_leases
+            .get(&blob)
+            .is_some_and(|set| set.contains(&pull));
+        if !exists && self.lease_pair_count() >= MAX_PULL_LEASES {
+            return Err(err(OciErrorCode::ResourceExhausted, "too many pull leases"));
+        }
         let newly_added = self.pull_leases.entry(blob).or_default().insert(pull);
         Ok(LeaseAcquired { newly_added })
     }

@@ -27,10 +27,12 @@ mod run;
 
 pub use mount::{
     DistroName, GUEST_MOUNT_BASE, HostDir, LaunchRequest, Launched, MAX_DISTRO_NAME_LEN,
-    MAX_HOST_DIR_LEN, MAX_MOUNT_NAME_LEN, MAX_SHARED_MOUNTS, MAX_UNRELEASED_MOUNTS, MountError,
-    MountName, PreparedLaunch, PreparedMount, SharedMount, SharedTransport, TransportPolicy,
+    MAX_HOST_DIR_LEN, MAX_MOUNT_NAME_LEN, MAX_OWNER_ID_LEN, MAX_SHARED_MOUNTS,
+    MAX_UNRELEASED_MOUNTS, MountError, MountName, OwnerId, PreparedLaunch, PreparedMount,
+    RecoveryReport, SharedMount, SharedTransport, TransportPolicy,
     launch_cancellable_with_recorder, launch_with, launch_with_recorder, prepare_virtiofs_launch,
-    prepare_virtiofs_launch_with_recorder, release_virtiofs_launch,
+    prepare_virtiofs_launch_with_recorder, release_container_mounts,
+    release_container_mounts_with_recorder, release_virtiofs_launch,
     release_virtiofs_launch_with_recorder,
 };
 
@@ -230,8 +232,8 @@ pub mod test_support {
     use std::time::Duration;
 
     use super::{
-        LaunchRequest, Launched, MountError, PreparedLaunch, Wsl2Error, Wsl2Status, WslDistro,
-        WslVersionInfo,
+        DistroName, LaunchRequest, Launched, MountError, OwnerId, PreparedLaunch, RecoveryReport,
+        Wsl2Error, Wsl2Status, WslDistro, WslVersionInfo,
     };
     use crate::wslconfig::VirtiofsState;
 
@@ -274,6 +276,17 @@ pub mod test_support {
         timeout: Duration,
     ) -> Result<(), MountError> {
         super::mount::release_with_program(program, prepared, timeout)
+    }
+
+    /// `program` を `wsl.exe` とみなす [`super::release_container_mounts`]（別プロセスからの回収。結合試験
+    /// `tests/wsl2_mount.rs`。#1412・WIN-2・PLUG-7）。
+    pub fn release_container_mounts_with_program(
+        program: &Path,
+        distro: &DistroName,
+        owner: &OwnerId,
+        timeout: Duration,
+    ) -> Result<RecoveryReport, MountError> {
+        super::mount::recover_with_program(program, distro, owner, timeout)
     }
 
     /// `program` を `wsl.exe` とみなし、`.wslconfig` の virtiofs 状態を `virtiofs` で与える [`super::launch_with`]。

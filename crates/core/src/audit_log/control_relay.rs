@@ -13,7 +13,8 @@
 //!
 //! - 構築（[`ControlAuditRelay::spawn`]）は呼び出しプロセスが単一スレッドのときだけ成功する（`FailedPrecondition`）。
 //!   制御チャネルの listener を bind する前に呼ぶこと（helper は fd 3 以上を閉じるため listener を持たない）
-//! - 運べるのは [`AuditEvent::ControlPeer`] と [`AuditEvent::Seccomp`] の記録だけ（他の層は `InvalidArgument`）。時刻・PID・
+//! - 運べるのは [`AuditEvent::ControlPeer`]・[`AuditEvent::Seccomp`]・[`AuditEvent::ExitSignal`]（#2236。launcher の
+//!   回収点が出す補助の `exit_signal`）の記録だけ（他の層は `InvalidArgument`）。時刻・PID・
 //!   コンテナ ID・理由トークン（seccomp は種別トークンと syscall 番号・arch）を固定の枠で送り、helper が [`AuditRecord`] を
 //!   組み直す（生のバイト列を記録として扱わない。REPAIR-2）。seccomp の記録は supervisor の seccomp 通知ループ
 //!   （`record_seccomp_denial_for` 経由。SEC-4・REPAIR-5・#2025）が書く
@@ -36,8 +37,8 @@ use crate::sys;
 use crate::traits::{ContainerId, ErrorCode, TraitError};
 
 use super::{
-    AuditEvent, AuditPid, AuditRecord, AuditSink, AuditSyscallArch, AuditSyscallNr, AuditTimestamp,
-    ControlPeerRejection, FileAuditSink, RECORD_WAIT_LIMIT,
+    AuditEvent, AuditPid, AuditRecord, AuditSignal, AuditSink, AuditSyscallArch, AuditSyscallNr,
+    AuditTimestamp, ControlPeerRejection, FileAuditSink, RECORD_WAIT_LIMIT,
 };
 
 /// 枠の固定部: 理由 1・秒 8・ナノ秒 4・PID 4・コンテナ ID 長 1。
@@ -55,8 +56,21 @@ const REAP_WAIT: Duration = Duration::from_secs(1);
 const TAG_SECCOMP: u8 = 0x80;
 /// 記録先の確認要求を示す先頭バイト（本体は固定部だけ。何も書かず、helper の sink が保存先を開けるかだけを確かめる）。
 const TAG_PROBE: u8 = 0x81;
+/// 終了シグナル（`AuditEvent::ExitSignal`。#2236）の記録を示す先頭バイト。コンテナ ID の後に signal（u8）と target_pid（u32）が付く。
+const TAG_EXIT_SIGNAL: u8 = 0x82;
+/// exit_signal の枠だけが持つ追加部（signal 1・target_pid 4）。
+const EXIT_SIGNAL_EXTRA_LEN: usize = 1 + 4;
 /// seccomp の枠だけが持つ追加部（番号 4・arch 4）。
 const SECCOMP_EXTRA_LEN: usize = 8;
+
+/// 先頭バイトから、コンテナ ID の後ろに続く追加部の長さを返す（`serve` の読み取り量を 1 か所で決める）。
+const fn extra_len(tag: u8) -> usize {
+    match tag {
+        TAG_SECCOMP => SECCOMP_EXTRA_LEN,
+        TAG_EXIT_SIGNAL => EXIT_SIGNAL_EXTRA_LEN,
+        _ => 0,
+    }
+}
 
 /// 運べる拒否理由（枠の先頭バイトが添字）。
 const REJECTIONS: [ControlPeerRejection; 2] = [
@@ -70,7 +84,7 @@ fn err(code: ErrorCode, message: &'static str) -> TraitError {
 
 /// 記録を枠へ符号化する。`ControlPeer` 以外・長すぎるコンテナ ID は拒否する。
 fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
-    let (tag, extra) = match record.event() {
+    let (tag, extra, exit_signal) = match record.event() {
         AuditEvent::ControlPeer { reason } => {
             let Some(tag) = REJECTIONS
                 .iter()
@@ -82,13 +96,20 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
                     "the audit relay does not know this rejection reason",
                 ));
             };
-            (tag, None)
+            (tag, None, None)
         }
-        AuditEvent::Seccomp { syscall, arch } => (TAG_SECCOMP, Some((syscall.get(), arch.get()))),
+        AuditEvent::Seccomp { syscall, arch } => {
+            (TAG_SECCOMP, Some((syscall.get(), arch.get())), None)
+        }
+        AuditEvent::ExitSignal { signal, target_pid } => (
+            TAG_EXIT_SIGNAL,
+            None,
+            Some((signal.get(), target_pid.get())),
+        ),
         _ => {
             return Err(err(
                 ErrorCode::InvalidArgument,
-                "the audit relay only carries control channel and seccomp records",
+                "the audit relay only carries control channel, seccomp and exit signal records",
             ));
         }
     };
@@ -110,6 +131,10 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
     if let Some((nr, arch)) = extra {
         frame.extend_from_slice(&nr.to_be_bytes());
         frame.extend_from_slice(&arch.to_be_bytes());
+    }
+    if let Some((signal, target_pid)) = exit_signal {
+        frame.push(signal);
+        frame.extend_from_slice(&target_pid.to_be_bytes());
     }
     Ok(frame)
 }
@@ -140,6 +165,15 @@ fn decode(frame: &[u8]) -> Option<AuditRecord> {
                 arch: AuditSyscallArch::from_raw(arch),
             },
         )
+    } else if tag == TAG_EXIT_SIGNAL {
+        if rest.len() != id_len.checked_add(EXIT_SIGNAL_EXTRA_LEN)? {
+            return None;
+        }
+        let (id, extra) = rest.split_at(id_len);
+        let signal = AuditSignal::new(i32::from(*extra.first()?)).ok()?;
+        let target = u32::from_be_bytes(extra.get(1..5)?.try_into().ok()?);
+        let target_pid = AuditPid::new(i32::try_from(target).ok()?).ok()?;
+        (id, AuditEvent::ExitSignal { signal, target_pid })
     } else {
         if rest.len() != id_len {
             return None;
@@ -163,11 +197,7 @@ fn serve(mut stream: UnixStream, sink: &FileAuditSink) -> i32 {
             return 0;
         }
         let id_len = usize::from(head.last().copied().unwrap_or(0));
-        let extra = if head.first() == Some(&TAG_SECCOMP) {
-            SECCOMP_EXTRA_LEN
-        } else {
-            0
-        };
+        let extra = head.first().copied().map_or(0, extra_len);
         let mut frame = head.to_vec();
         frame.resize(FIXED_LEN + id_len + extra, 0);
         if let Some(body) = frame.get_mut(FIXED_LEN..)
@@ -624,5 +654,70 @@ mod tests {
         let mut zero_pid = good;
         zero_pid[13..17].copy_from_slice(&0u32.to_be_bytes());
         assert!(decode(&zero_pid).is_none());
+    }
+
+    fn exit_signal_sample(signal: i32, target: i32, id: Option<&str>) -> AuditRecord {
+        let r = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 9)),
+            AuditPid::new(55).unwrap(),
+            AuditEvent::ExitSignal {
+                signal: AuditSignal::new(signal).unwrap(),
+                target_pid: AuditPid::new(target).unwrap(),
+            },
+        );
+        match id {
+            Some(id) => r.with_container_id(ContainerId::new(id).unwrap()),
+            None => r,
+        }
+    }
+
+    /// SEC-4・ESC-06・#2236: exit_signal の枠は signal・target_pid・PID・時刻・コンテナ ID が往復で一致する。
+    #[test]
+    fn sec4_2236_exit_signal_frame_round_trips() {
+        for (signal, target, id) in [
+            (31, 4321, Some("web-1")),
+            (1, 1, None),
+            (64, i32::MAX, Some("a")),
+        ] {
+            let rec = exit_signal_sample(signal, target, id);
+            let frame = encode(&rec).unwrap();
+            assert_eq!(
+                frame.len(),
+                FIXED_LEN + id.map_or(0, str::len) + EXIT_SIGNAL_EXTRA_LEN
+            );
+            assert_eq!(extra_len(frame[0]), EXIT_SIGNAL_EXTRA_LEN);
+            let back = decode(&frame).unwrap();
+            assert_eq!(back.exit_signal().map(AuditSignal::get), Some(signal as u8));
+            assert_eq!(back.target_pid().map(AuditPid::get), Some(target as u32));
+            assert_eq!(back.pid(), rec.pid());
+            assert_eq!(back.timestamp(), rec.timestamp());
+            assert_eq!(back.container_id(), rec.container_id());
+        }
+    }
+
+    /// REPAIR-2・#2236: exit_signal の壊れた枠（不足・余り・signal 0 / 65・target_pid 0・ID 長の不一致）は記録にしない。
+    #[test]
+    fn repair2_2236_malformed_exit_signal_frames_are_not_decoded() {
+        let good = encode(&exit_signal_sample(31, 4321, Some("ab"))).unwrap();
+        assert!(decode(&good).is_some());
+        assert!(decode(&good[..good.len() - 1]).is_none());
+        let mut longer = good.clone();
+        longer.push(0);
+        assert!(decode(&longer).is_none());
+        let sig_at = FIXED_LEN + 2;
+        for bad in [0u8, 65, 255] {
+            let mut f = good.clone();
+            f[sig_at] = bad;
+            assert!(decode(&f).is_none(), "signal {bad}");
+        }
+        let mut zero_target = good.clone();
+        zero_target[sig_at + 1..sig_at + 5].copy_from_slice(&0u32.to_be_bytes());
+        assert!(decode(&zero_target).is_none());
+        let mut huge_target = good.clone();
+        huge_target[sig_at + 1..sig_at + 5].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode(&huge_target).is_none());
+        let mut wrong_len = good;
+        wrong_len[17] = 3;
+        assert!(decode(&wrong_len).is_none());
     }
 }

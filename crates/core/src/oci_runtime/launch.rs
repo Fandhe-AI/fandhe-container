@@ -813,8 +813,12 @@ impl ContainerChildProcess {
     /// - 記録は `wait` / `terminate` が SIGSYS の終了を初めて見たときにちょうど 1 回、回収の**後**に出す。
     ///   sink の失敗は握りつぶし、終了状態の返却を変えない（`AuditSink` の契約）
     /// - 記録の `target_pid` は回収した側（呼び出しプロセス）の PID namespace の値
-    /// - 制約（後続）: 複数スレッドのプロセスでは `FileAuditSink` の隔離が使えず、カーネル監査経由の代替になる
-    ///   ため、rootless では記録が残らない場合がある。pid 1 以外の子孫の SIGSYS 終了は親から見えない
+    /// - 複数スレッドのプロセスでは `FileAuditSink` の隔離が使えず、rootless では代替経路も失敗するため、本番
+    ///   launcher は `ProductionLauncherBuilder::exit_audit_sink` で指定された記録先（supervisor は単一スレッドの間に
+    ///   作った `ControlAuditRelay`。#2236）を渡す
+    /// - 制約（後続）: pid 1 以外の子孫の SIGSYS 終了は、コンテナの PID namespace の外にいる親から `waitpid` で見えない
+    ///   （孤児は namespace 内の init に再親付けされる）。親が観測できる手段は承認済みの最小権限の範囲に無く、
+    ///   正の記録はカーネルの `AUDIT_SECCOMP` が担う（`docs/design/audit-delivery.md` 9.1）
     #[must_use]
     pub(crate) fn with_exit_audit(
         mut self,
@@ -841,20 +845,16 @@ impl ContainerChildProcess {
         if audit.recorded.swap(true, Ordering::SeqCst) {
             return;
         }
-        let event = match (
-            crate::audit_log::AuditSignal::new(SIGSYS),
-            i32::try_from(self.pid.get())
-                .map_err(|_| ())
-                .and_then(|p| crate::audit_log::AuditPid::new(p).map_err(|_| ())),
-        ) {
-            (Ok(signal), Ok(target_pid)) => {
-                crate::audit_log::AuditEvent::ExitSignal { signal, target_pid }
-            }
-            _ => return,
-        };
         // 配送結果は呼び出し側の終了状態に影響させない（失敗の通知は sink の責務）。
-        let _ =
-            crate::audit_log::mount::deliver(event, Some(&audit.container), audit.sink.as_ref());
+        // 共有の relay のロック待ちを含め、配送全体を絶対期限で制限する（REPAIR-5・SEC-4・ESC-06・#2236）。
+        let deadline = std::time::Instant::now() + crate::audit_log::RECORD_WAIT_LIMIT;
+        let _ = crate::audit_log::record_exit_signal_until(
+            SIGSYS,
+            self.pid.get(),
+            Some(&audit.container),
+            audit.sink.as_ref(),
+            Some(deadline),
+        );
     }
 
     /// `terminate` が成功したときに呼ぶ通知を持たせる（起動台帳への回収の証跡の引き継ぎ。CORE-2）。
@@ -1576,6 +1576,26 @@ mod tests {
         assert_eq!(r.container_id().map(ContainerId::as_str), Some("c1"));
         assert_eq!(r.syscall(), None);
         assert_eq!(r.seccomp_arch(), None);
+    }
+
+    /// SEC-4・REPAIR-5・#2236: 複数スレッドが同時に `wait` を呼び、続けて `terminate` を呼んでも、SIGSYS 終了の記録は 1 件だけ
+    /// （回収点は supervisor の複数スレッドから呼ばれる）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2236_concurrent_reap_points_record_exit_signal_once() {
+        let (process, sink, _) = exit_audit_process("kill -SYS $$; sleep 30", false);
+        let t = Duration::from_secs(10);
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                let p = &process;
+                s.spawn(move || {
+                    let _ = p.wait(t);
+                });
+            }
+        });
+        // SIGSYS が先に確定した後の terminate も数えない（terminate が先に SIGKILL を送る競合を避けるため後段）。
+        let _ = process.terminate(t);
+        assert_eq!(sink.snapshot().len(), 1);
     }
 
     /// SEC-4・#2004: SIGSYS 以外の終了（SIGKILL・通常終了）では記録しない。

@@ -48,7 +48,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::audit_log::{
-        AuditEvent, AuditFallback, AuditFileWriter, AuditPid, AuditRecord, AuditSink,
+        AuditEvent, AuditFallback, AuditFileWriter, AuditPid, AuditRecord, AuditSignal, AuditSink,
         AuditSyscallArch, AuditSyscallNr, AuditTimestamp, AuditWriteError, AuditWriteErrorKind,
         ControlAuditRelay, ControlPeerRejection, FileAuditSink,
     };
@@ -300,6 +300,8 @@ mod linux {
         notify_child_failing_mid_line_is_retried_after_a_newline();
         multi_threaded_process_skips_the_primary();
         control_relay_persists_from_a_multi_threaded_process();
+        control_relay_keeps_exit_signal_records_from_many_threads();
+        control_relay_exit_signal_times_out_then_is_unavailable();
         // `SIGCHLD` の disposition を変えるため最後に実行する。
         assert!(FileAuditSink::set_child_signal_ignored_for_test(true));
         sigchld_ignored_keeps_results_and_records_once();
@@ -529,6 +531,100 @@ mod linux {
         drop(relay);
         wait_single_threaded();
         let _ = std::fs::remove_file(&marker);
+    }
+
+    fn exit_signal_record(target: i32) -> AuditRecord {
+        AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
+            AuditPid::new(4242).unwrap(),
+            AuditEvent::ExitSignal {
+                signal: AuditSignal::new(31).unwrap(),
+                target_pid: AuditPid::new(target).unwrap(),
+            },
+        )
+    }
+
+    /// SEC-4・ESC-06・REPAIR-5・#2236: 複数スレッドから並行に `exit_signal` を記録しても、主経路にちょうど全件が欠落・
+    /// 重複なく残り、スレッドごとの送信順が保たれる（スレッド間の全体順は非決定的なので照合しない）。
+    fn control_relay_keeps_exit_signal_records_from_many_threads() {
+        const THREADS: i32 = 4;
+        const PER_THREAD: i32 = 8;
+        let marker = tmp_marker("relay-exit-signal");
+        let _ = std::fs::remove_file(&marker);
+        let primary: Primary = Arc::new(|path, rec| {
+            let pid = rec.target_pid().map_or(0, AuditPid::get);
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|_| unreachable_err())?;
+            f.write_all(format!("target_pid={pid}\n").as_bytes())
+                .map_err(|_| unreachable_err())
+        });
+        let (sink, _seen) = sink(primary, false, Notify::Discard, marker.clone());
+        let relay = Arc::new(ControlAuditRelay::spawn(sink).unwrap());
+        let workers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let relay = Arc::clone(&relay);
+                std::thread::spawn(move || {
+                    for i in 0..PER_THREAD {
+                        relay
+                            .record(&exit_signal_record((t + 1) * 1000 + i + 1))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        let text = std::fs::read_to_string(&marker).unwrap();
+        let pids: Vec<i32> = text
+            .lines()
+            .map(|l| l.strip_prefix("target_pid=").unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), (THREADS * PER_THREAD) as usize, "{text:?}");
+        for t in 0..THREADS {
+            let mine: Vec<i32> = pids.iter().copied().filter(|p| p / 1000 == t + 1).collect();
+            let expected: Vec<i32> = (0..PER_THREAD).map(|i| (t + 1) * 1000 + i + 1).collect();
+            assert_eq!(mine, expected, "thread {t}");
+        }
+        drop(relay);
+        wait_single_threaded();
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// REPAIR-5・SEC-4・#2236: 主経路が止まった helper への `exit_signal` は、期限 + 許容差以内に `Timeout` で戻り、
+    /// 以後の記録は `Unavailable`（ずれた応答を取り違えない）。スレッドも子も残らない。
+    fn control_relay_exit_signal_times_out_then_is_unavailable() {
+        // helper を SIGKILL すると主経路を実行している孫は孤児になる。止まったままだと `cargo test` の標準出力の
+        // パイプを握り続けるため、親（helper）が消えたら自分で終了する。
+        let primary: Primary = Arc::new(|_, _| {
+            let parent = std::os::unix::process::parent_id();
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
+                if std::os::unix::process::parent_id() != parent {
+                    std::process::exit(0);
+                }
+            }
+        });
+        let (sink, _seen) = sink(primary, false, Notify::Discard, tmp_marker("relay-hang"));
+        let relay = ControlAuditRelay::spawn(sink).unwrap();
+        let budget = Duration::from_millis(300);
+        let start = Instant::now();
+        let e = relay
+            .record_until(&exit_signal_record(77), start + budget)
+            .unwrap_err();
+        let took = start.elapsed();
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        assert!(took >= budget, "{took:?}");
+        assert!(took < budget + Duration::from_millis(500), "{took:?}");
+        assert_eq!(
+            relay.record(&exit_signal_record(78)).unwrap_err().code(),
+            ErrorCode::Unavailable
+        );
+        drop(relay);
+        wait_single_threaded();
     }
 
     fn sink_for_late(marker: &Path) -> FileAuditSink {

@@ -220,7 +220,10 @@ mod linux {
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
-                let _ = child.wait();
+                let reap_end = Instant::now() + WAIT_DEADLINE;
+                while child.try_wait().ok().flatten().is_none() && Instant::now() < reap_end {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
                 panic!("child did not start unpacking\n{}", log_tail(&log));
             }
             std::thread::sleep(Duration::from_millis(10));

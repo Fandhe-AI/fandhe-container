@@ -31,28 +31,6 @@
 //! `Unimplemented` で木が生じず、[`reap_stale_unpacks`] も `Unimplemented` を返す（REPAIR-3）。
 //! 起動時の照合への配線（`StateStore::list` で列挙した bundle への呼び出し）は #2315 で扱う。
 //!
-//! # 展開途中の木の回収（#2379・OCI-7）
-//!
-//! 展開の途中でプロセスが落ちると、非公開の名前 `.fandhe-unpack-<pid>-<seq>` の木が残る（連番は
-//! プロセスごとに 0 から数えるため、PID が再利用されると次の create が `EEXIST` で止まる）。
-//! 持ち主がいるかは PID ではなく、木のディレクトリ自体への OS ロック（`flock`）で判定する。作る側は作った
-//! 直後に排他ロックを取り、`CreatedRootfs` が生きている間保持する（プロセスが落ちれば OS が外す）。
-//! 回収する側は固定した親の fd の下で予約名（`.fandhe-unpack-<10 桁以内の数>-<20 桁以内の数>` に厳密に一致する名前）の
-//! 兄弟を調べ、次の条件をすべて満たすものだけを消す: リンクでないディレクトリ・所有者が実効 uid・mode 0700・
-//! ロックが取れる（`WouldBlock` は生きているので残す）・ロック保持中に名前から開き直した実体が同じ
-//! （dev・ino）。どれかを確かめられなければ残す（OCI-7: 誤るときは余分に残す側だけ）。件数・深さ・走査数に
-//! 上限を置き、ロックは `try_lock` だけで待たない。回収は create の時点（`prepare_rootfs_target`）と、
-//! 起動時の照合用の公開入口 [`reap_stale_unpacks`] の 2 か所で行い、生きている create を壊さない。
-//!
-//! 作る側と回収側の競合: `mkdir` からロックまでの間に回収側が空の新しい木を取ることがある。作る側は
-//! ロックの失敗か開き直しの不一致を `Internal` で返し（後始末はしない。持ち主は回収側）、再試行で成功する。
-//! 既知の残り: 本変更より前に作られたロックの無い木も「ロックが取れる」ため、名前・所有者・mode の条件を
-//! 満たせば回収対象になる（予約名のため許容）。ロックはローカルのファイルシステムが前提で、NFS 等での意味は
-//! 保証しない。公開済みで状態の無い `rootfs`（公開後・状態作成前のクラッシュ）は利用者のデータと
-//! 見分けられず、通常の create と共有する排他も無いため対象外で、手動で回復する。Linux 以外は作成自体が
-//! `Unimplemented` で木が生じず、[`reap_stale_unpacks`] も `Unimplemented` を返す（REPAIR-3）。
-//! 起動時の照合への配線（`StateStore::list` で列挙した bundle への呼び出し）は #2315 で扱う。
-//!
 //! 本番の展開器（manifest からレイヤーの blob・mediaType・diff_id を引いて oci へ渡すアダプタ）と
 //! CLI / plugin の配線は未実装である（REPAIR-3。#2315 の配線で扱う）。
 
@@ -164,7 +142,14 @@ pub trait ImageRootfsUnpacker {
 pub(super) struct CreatedRootfs {
     path: PathBuf,
     backing: imp::Backing,
-    #[cfg_attr(not(test), allow(dead_code))]
+    // 読むのは Linux の試験だけ（本番の読み手は #2315 の配線で追加する。REPAIR-3）。それ以外の構成では未使用になる。
+    #[cfg_attr(
+        not(all(test, target_os = "linux")),
+        expect(
+            dead_code,
+            reason = "reclamation is read only by Linux tests until the #2315 wiring"
+        )
+    )]
     reclamation: StagingReclamation,
 }
 
@@ -297,7 +282,7 @@ impl CreatedRootfs {
     }
 
     /// 作成の前に同じ親の下で回収した、持ち主のいない展開途中の木の結果（#2379・OCI-7）。
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn reclamation(&self) -> &StagingReclamation {
         &self.reclamation
     }

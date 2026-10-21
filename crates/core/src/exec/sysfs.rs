@@ -47,6 +47,11 @@
 //!   `FailedPrecondition`。rbind はホストの `/sys` 配下のマウント（cgroup2・securityfs・bpf 等）を持ち込むため、
 //!   その一つでも rw なら起動しない。`exec::setns` の「コンテナの中から cgroupfs に書けない」前提はこの再帰 ro と
 //!   `CAP_SYS_ADMIN` の削減・seccomp の mount 系の拒否に支えられる
+//! - **rbind の最上位の ro はロックされない可能性がある（未実測の読み。#2305）**: unshare の時点でホストの `/sys` が rw なら、
+//!   複製に後から付けた ro には `MNT_LOCK_READONLY` が立たず、user namespace の root が `mount_setattr` で外せる見込みがある。
+//!   その場合にコンテナ内から外されるのを防ぐのは CapabilityDrop（`CAP_SYS_ADMIN` の削減）と seccomp による
+//!   `mount_setattr` の拒否（`EPERM`）だけになる。実機での測定は `tests/sysfs_mount.rs` の `ro-clear` シナリオ
+//!   （手順は `docs/verification/rootless-sysfs-readonly.md`）で行い、結果が出るまで確定事項として扱わない
 //! - **失敗時**: 後始末の umount はしない。呼び出し側はプロセスを破棄する（`crate::exec` のモジュール doc の契約）
 //! - **同一スレッド**: `MountIsolation::establish` と同じスレッドで呼ぶ
 //!
@@ -105,6 +110,50 @@ pub fn select_sysfs_source(user_ns_inode: u64) -> SysfsSource {
     } else {
         SysfsSource::HostReadOnlyRbind
     }
+}
+
+/// [`probe_clear_sysfs_readonly_for_test`] の前提検査（純関数）: PID 1 で、user namespace の inode が読め、かつ
+/// 供給方式が [`SysfsSource::HostReadOnlyRbind`] になる（初期 user namespace ではない）こと。
+#[cfg(feature = "escape-probe")]
+fn clear_probe_precondition(pid: u32, user_ns_inode: Option<u64>) -> bool {
+    pid == 1
+        && user_ns_inode
+            .is_some_and(|ino| select_sysfs_source(ino) == SysfsSource::HostReadOnlyRbind)
+}
+
+/// 試験専用: コンテナ内の `/sys` の最上位のマウントから、`mount_setattr` で ro を外せるかを試して結果を返す
+/// （SEC-2・SEC-1・#2305 の P2-1 の測定）。
+///
+/// 呼び出し元は結合試験 `tests/sysfs_mount.rs` の `ro-clear` シナリオ（防御なしの測定は `StageKind::CgroupJoin` のフック、
+/// 防御ありの測定は組み込みの制限段の通過後のクロージャ）。通常ビルドには含まれず（`escape-probe` feature 限定）、`#[doc(hidden)]`。
+///
+/// fail-closed の前提検査: PID 1 で、かつ rbind 経路の user namespace（初期 user namespace ではない）でなければ syscall を
+/// 発行せず `FailedPrecondition` を返す。ホスト root の初期 user namespace で `/sys` の ro を外す経路を作らないための検査で、
+/// 防御なしの測定のため `Seccomp: 2` は要求しない。対象は `O_PATH|O_DIRECTORY|O_NOFOLLOW` で開いた `/sys` の fd で、
+/// mount 系の syscall にパス文字列は渡さない。外せた場合の変更は呼び出したコンテナの mount namespace 内の複製マウントに限り、
+/// 子の終了で消える（ホストの `/sys` は変わらない）。
+///
+/// # 将来仕様（記録のみ）
+///
+/// 測定後に廃止するか、恒久的な試験へ置き換える（REPAIR-3）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub fn probe_clear_sysfs_readonly_for_test() -> Result<super::seccomp::ProbeOutcome, ExecError> {
+    let inode = thread_ns_link("user")
+        .ok()
+        .and_then(|l| parse_user_ns_inode(&l));
+    if !clear_probe_precondition(std::process::id(), inode) {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            STAGE,
+            "probe_clear_sysfs_readonly_for_test must run as PID 1 in a non-initial user namespace",
+        ));
+    }
+    let sys_dir = sys::open_dir_path_nofollow(None, c"/sys")
+        .map_err(|e| ExecError::from_sys(e, STAGE, "open /sys for the ro-clear probe"))?;
+    Ok(super::seccomp::ProbeOutcome::from_result(
+        sys::clear_mount_read_only_probe(sys_dir.as_fd()),
+    ))
 }
 
 /// `/proc/thread-self/ns/user` のリンク先（`user:[inode]`）の inode。書式に反すれば `None`。
@@ -332,6 +381,16 @@ mod tests {
     use super::*;
     use crate::oci_runtime::{OciConfig, parse_config_bytes};
     use std::cell::RefCell;
+
+    /// SEC-2・SEC-1（#2305）: ro を外す試験用入口の前提検査。PID 1 かつ初期でない user namespace のときだけ通る。
+    #[cfg(feature = "escape-probe")]
+    #[test]
+    fn sec2_clear_probe_precondition_requires_pid1_in_non_initial_userns() {
+        assert!(clear_probe_precondition(1, Some(USER_NS_INIT_INO + 1)));
+        assert!(!clear_probe_precondition(1, Some(USER_NS_INIT_INO)));
+        assert!(!clear_probe_precondition(2, Some(USER_NS_INIT_INO + 1)));
+        assert!(!clear_probe_precondition(1, None));
+    }
 
     fn spec() -> SysfsMountSpec {
         let v = serde_json::json!({

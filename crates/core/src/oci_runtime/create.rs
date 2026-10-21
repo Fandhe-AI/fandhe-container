@@ -49,8 +49,10 @@
 //! 並行する通常の create が未完成の rootfs で成功することはなく、展開の失敗は非公開の展開先だけを消す。
 //! 公開後の失敗では rootfs を消さずに残す（create 間の排他が未実装のため。REPAIR-3）。Linux 以外は
 //! 展開先を固定できないため、展開開始前（作成の前）に `Unimplemented` で拒否し、何も作らない（fail-closed）。
-//! create の途中でプロセスが落ちて残った部分的な rootfs は自動では回収せず、次の同じ bundle の create は
-//! `AlreadyExists` で止まる（fail-closed。利用者のデータを消さない）。公開した rootfs は状態レコードに記録し
+//! create の途中でプロセスが落ちて残った展開途中の木（非公開の名前）は、持ち主のいない（OS ロックが取れる）
+//! ものだけを次の create の時点と `reap_stale_unpacks` が回収する（#2379・OCI-7。`image_rootfs` のモジュール doc）。
+//! 公開済みで状態の無い rootfs は回収せず、次の同じ bundle の create は `AlreadyExists` で止まる
+//! （fail-closed。利用者のデータを消さない）。公開した rootfs は状態レコードに記録し
 //! （`StateRecord::image_rootfs`）、delete が状態削除の成功後に消す（所有・タイミング・失敗時の扱いは
 //! `docs/design/image-rootfs-lifetime.md`。OCI-7・OCI-5・#2378）。delete は bundle 自体は消さない。
 //! 展開器なしの [`create_with_image`] は従来どおり、bundle の rootfs が展開済みの前提で動く。
@@ -74,10 +76,12 @@ use super::cgroup_requirement::check_cgroups_path;
 use super::config::{OciConfig, OciConfigError, load_config};
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::image_refs::{ContainerImage, ImageRefRegistration};
-use super::image_rootfs::{CreatedRootfs, ImageRootfsUnpacker, prepare_rootfs_target};
+use super::image_rootfs::{
+    CreatedRootfs, ImageRootfsUnpacker, StagingReclamation, prepare_rootfs_target_with,
+};
 use super::launch::BundleLock;
 use super::resources::LinuxResourceLimits;
-use crate::observability::{OpName, OpRecorder};
+use crate::observability::{OpName, OpOutcome, OpRecorder};
 use crate::traits::{
     ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, GetStateRequest,
     ImageRootfsRecord, StateRecord, StateStore, TraitError,
@@ -97,6 +101,7 @@ const IMAGE_REF_BIND_OP_NAME: &str = "image_ref_bind";
 /// レイヤー展開と、失敗時の展開途中 rootfs の削除の操作名（REPAIR-4・#2342）。
 const IMAGE_ROOTFS_UNPACK_OP_NAME: &str = "image_rootfs_unpack";
 const IMAGE_ROOTFS_CLEANUP_OP_NAME: &str = "image_rootfs_cleanup";
+const IMAGE_ROOTFS_REAP_OP_NAME: &str = "image_rootfs_reap";
 
 /// `config.json` を検証し、プロセス未起動の「created」状態を `store` に作る。
 ///
@@ -207,8 +212,18 @@ fn create_with_image_inner(
         }
     }
     // OCI-7: 参照登録の後・状態作成の前。展開器があれば、検証を展開の前後に分けて展開する。
+    // 展開器なしは、検証より前に bundle のロックを取り状態作成まで保持する（検証の後に delete が rootfs を消して
+    // 完了する隙を作らない。通常の `create` と同じ順。OCI-7・SEC-1）。展開器ありは展開後・状態作成の前に取る。
+    let mut early_guard: Option<Option<BundleLock>> = None;
     let image_rootfs = match image.unpacker() {
         None => {
+            match lock_for_create(req.bundle()) {
+                Ok(g) => early_guard = Some(g),
+                Err(e) => {
+                    rollback_image_ref(recorder, image, req);
+                    return Err(e);
+                }
+            }
             if let Err(e) = validate_bundle(req.bundle()) {
                 rollback_image_ref(recorder, image, req);
                 return Err(e);
@@ -233,12 +248,15 @@ fn create_with_image_inner(
         },
     };
     // 状態を作る間も delete の rootfs 後始末と排他する。ロックを取れなければ公開済みの rootfs は残し、参照だけ外す。
-    let guard = match lock_for_create(req.bundle()) {
-        Ok(g) => g,
-        Err(e) => {
-            rollback_image_ref(recorder, image, req);
-            return Err(e);
-        }
+    let guard = match early_guard {
+        Some(g) => g,
+        None => match lock_for_create(req.bundle()) {
+            Ok(g) => g,
+            Err(e) => {
+                rollback_image_ref(recorder, image, req);
+                return Err(e);
+            }
+        },
     };
     let created_state = create_state(store, req, image_rootfs);
     drop(guard);
@@ -304,7 +322,13 @@ fn unpack_rootfs(
     // Linux は非公開の名前で展開し、成功後に最終の名前へ公開する（展開中は `root.path` が存在せず、
     // 並行する別の create は rootfs を使用中として成功できない。展開途中の失敗の後始末は他から参照されない
     // 非公開の rootfs だけを消す）。Linux 以外は作成の前に Unimplemented で拒否する。
-    let mut created = prepare_rootfs_target(req.bundle(), config.root().path())?;
+    // 回収の実処理は計測区間で包み、後続の作成が失敗しても結果と所要時間を記録する（REPAIR-4）。
+    let mut created = prepare_rootfs_target_with(req.bundle(), config.root().path(), &|reap| {
+        let started = std::time::Instant::now();
+        let reclamation = reap();
+        record_staging_reclamation(recorder, &reclamation, started.elapsed());
+        reclamation
+    })?;
     let unpack_name = OpName::new(IMAGE_ROOTFS_UNPACK_OP_NAME)?;
     // 展開器へは固定した rootfs を指す経路を渡す（作成後の bundle 内の差し替えで bundle 外へ書かせない。SEC-1）。
     let unpack_path = created.unpack_path();
@@ -357,6 +381,28 @@ fn same_dir_path(a: &Path, b: &Path) -> bool {
             .collect()
     };
     normal(a) == normal(b)
+}
+
+/// 作成の前に回収した、持ち主のいない展開途中の木（#2379・OCI-7）を `image_rootfs_reap` として、実際の
+/// 回収に要した時間つきで記録する（REPAIR-4）。何も無ければ記録しない。消せなかった・確かめられなかった・
+/// 打ち切った・走査に失敗したものがあれば失敗として記録する（create 自体は失敗させない。残した木は余分に
+/// 持つだけの安全側）。
+fn record_staging_reclamation(
+    recorder: &OpRecorder,
+    reclamation: &StagingReclamation,
+    elapsed: std::time::Duration,
+) {
+    if !reclamation.is_noteworthy() {
+        return;
+    }
+    if let Ok(name) = OpName::new(IMAGE_ROOTFS_REAP_OP_NAME) {
+        let outcome = if reclamation.is_incomplete() {
+            OpOutcome::Failure
+        } else {
+            OpOutcome::Success
+        };
+        let _ = recorder.record(&name, outcome, elapsed);
+    }
 }
 
 /// 作った rootfs を消す。失敗は握りつぶさず `image_rootfs_cleanup` として記録し、元のエラーを優先させる。
@@ -1087,6 +1133,22 @@ mod tests {
         let err = run_with_image(&store, &refs, &OpRecorder::new(), &b).expect_err("no rootfs");
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert_eq!(log_of(&log), vec!["refs.register", "refs.release"]);
+    }
+
+    /// OCI-7・SEC-1（#2378）: 展開器なしの create も bundle の検証より前にロックを取る。delete が保持中なら、
+    /// rootfs が無い bundle でも検証（`NotFound`）へ進まず `FailedPrecondition` で拒否し、参照を外して状態は作らない
+    /// （検証の後にロックを取ると、その隙に delete が rootfs を消して完了し、rootfs の無い状態を作れてしまう）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_create_without_unpacker_locks_before_validation() {
+        let b = Bundle::new("oci7-lock-first");
+        b.write_config(&valid_config());
+        let _held = BundleLock::acquire(&b.dir).expect("hold the bundle lock");
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        let err = run_with_image(&store, &refs, &OpRecorder::new(), &b).expect_err("locked");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(log_of(&log), vec!["refs.register", "refs.release"]);
+        assert_eq!(store.inner.len(), 0);
     }
 
     /// OCI-7: 状態作成が AlreadyExists で失敗したら参照を外す。

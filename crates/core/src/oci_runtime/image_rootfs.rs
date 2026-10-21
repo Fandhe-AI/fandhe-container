@@ -9,6 +9,28 @@
 //! トレイト [`ImageRootfsUnpacker`] を上位 crate が `ImageStore` で満たす。展開先のパスの決定・作成・
 //! 失敗時の後始末は core の責務で、本ファイルの `prepare_rootfs_target` と `CreatedRootfs::remove` が担う。
 //!
+//! # 展開途中の木の回収（#2379・OCI-7）
+//!
+//! 展開の途中でプロセスが落ちると、非公開の名前 `.fandhe-unpack-<pid>-<seq>` の木が残る（連番は
+//! プロセスごとに 0 から数えるため、PID が再利用されると次の create が `EEXIST` で止まる）。
+//! 持ち主がいるかは PID ではなく、木のディレクトリ自体への OS ロック（`flock`）で判定する。作る側は作った
+//! 直後に排他ロックを取り、`CreatedRootfs` が生きている間保持する（プロセスが落ちれば OS が外す）。
+//! 回収する側は固定した親の fd の下で予約名（`^\.fandhe-unpack-[0-9]{1,10}-[0-9]{1,20}$`）の兄弟を調べ、
+//! 次の条件をすべて満たすものだけを消す: リンクでないディレクトリ・所有者が実効 uid・mode 0700・
+//! ロックが取れる（`WouldBlock` は生きているので残す）・ロック保持中に名前から開き直した実体が同じ
+//! （dev・ino）。どれかを確かめられなければ残す（OCI-7: 誤るときは余分に残す側だけ）。件数・深さ・走査数に
+//! 上限を置き、ロックは `try_lock` だけで待たない。回収は create の時点（`prepare_rootfs_target`）と、
+//! 起動時の照合用の公開入口 [`reap_stale_unpacks`] の 2 か所で行い、生きている create を壊さない。
+//!
+//! 作る側と回収側の競合: `mkdir` からロックまでの間に回収側が空の新しい木を取ることがある。作る側は
+//! ロックの失敗か開き直しの不一致を `Internal` で返し（後始末はしない。持ち主は回収側）、再試行で成功する。
+//! 既知の残り: 本変更より前に作られたロックの無い木も「ロックが取れる」ため、名前・所有者・mode の条件を
+//! 満たせば回収対象になる（予約名のため許容）。ロックはローカルのファイルシステムが前提で、NFS 等での意味は
+//! 保証しない。公開済みで状態の無い `rootfs`（公開後・状態作成前のクラッシュ）は利用者のデータと
+//! 見分けられず、通常の create と共有する排他も無いため対象外で、手動で回復する。Linux 以外は作成自体が
+//! `Unimplemented` で木が生じず、[`reap_stale_unpacks`] も `Unimplemented` を返す（REPAIR-3）。
+//! 起動時の照合への配線（`StateStore::list` で列挙した bundle への呼び出し）は #2315 で扱う。
+//!
 //! 本番の展開器（manifest からレイヤーの blob・mediaType・diff_id を引いて oci へ渡すアダプタ）と
 //! CLI / plugin の配線は未実装である（REPAIR-3。#2315 の配線で扱う）。
 
@@ -41,6 +63,48 @@ const CLEANUP_MAX_DEPTH: usize = 256;
 pub struct ImageRootfsUnpacked {
     /// 展開したレイヤーの数。
     pub layers: usize,
+}
+
+/// 持ち主のいない展開途中の木の回収結果（#2379・OCI-7）。各一覧は名前の昇順で決定的。
+///
+/// 名前だけを持ち、パスや OS のエラー文字列は含めない。呼び出し元（create の記録・起動時の照合）が
+/// 構造化ログへ出す。`kept_*` と `failed` は「消さずに残した」もので、余分に残すだけの安全側。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct StagingReclamation {
+    /// 回収（削除）できた木の名前。
+    pub reclaimed: Vec<std::ffi::OsString>,
+    /// ロックが取れず、生きている create が持つと判断して残した木。
+    pub kept_alive: Vec<std::ffi::OsString>,
+    /// 種別・所有者・mode・同一性のいずれかを確かめられず残した木。
+    pub kept_unverified: Vec<std::ffi::OsString>,
+    /// 回収を試みて削除に失敗した木（一部が消えて残っていることがある）。
+    pub failed: Vec<std::ffi::OsString>,
+    /// 走査の上限で打ち切り、残りを調べなかったか。
+    pub truncated: bool,
+    /// 親ディレクトリの列挙そのものに失敗した（`read_dir` の失敗・列挙中のエラー）か。
+    /// 失敗した範囲に木が残っていても見えないため、回収は不完全として扱う（REPAIR-4）。
+    pub scan_failed: bool,
+}
+
+impl StagingReclamation {
+    /// 何かを回収した・残した・失敗した・打ち切ったか（記録に値するか）。
+    pub fn is_noteworthy(&self) -> bool {
+        !(self.reclaimed.is_empty()
+            && self.kept_alive.is_empty()
+            && self.kept_unverified.is_empty()
+            && self.failed.is_empty())
+            || self.truncated
+            || self.scan_failed
+    }
+
+    /// 回収が完全でなかったか（消せなかった・確かめられなかった・打ち切った・走査に失敗した。
+    /// 生きている木は含めない）。
+    pub fn is_incomplete(&self) -> bool {
+        !(self.kept_unverified.is_empty() && self.failed.is_empty())
+            || self.truncated
+            || self.scan_failed
+    }
 }
 
 /// イメージのレイヤーを rootfs へ展開する（OCI-7・#2342）。
@@ -86,6 +150,15 @@ pub(super) struct CreatedRootfs {
     /// bundle 相対の正規化済みの経路（Normal 要素だけ。[`CreatedRootfs::record`] が状態へ記録する）。
     relative: PathBuf,
     backing: imp::Backing,
+    // 読むのは Linux の試験だけ（本番の読み手は #2315 の配線で追加する。REPAIR-3）。それ以外の構成では未使用になる。
+    #[cfg_attr(
+        not(all(test, target_os = "linux")),
+        expect(
+            dead_code,
+            reason = "reclamation is read only by Linux tests until the #2315 wiring"
+        )
+    )]
+    reclamation: StagingReclamation,
 }
 
 /// [`remove_recorded_rootfs`] の結果（将来の拡張に備え非網羅）。
@@ -116,15 +189,11 @@ fn remove_failed() -> TraitError {
     TraitError::new(ErrorCode::Internal, "failed to remove rootfs")
 }
 
-/// `root.path` の経路を検査し、末尾の要素を空のディレクトリとして排他的に作る。
+/// `root.path` を検査し、bundle 配下の Normal 要素だけの列（親の要素 + 末尾の要素）へ分解する。
 ///
-/// `check_rootfs` と同じ規則（`..`・ファイルシステムのルート・bundle 外の絶対指定・中間要素の
-/// symlink / junction を拒否）に加え、末尾が既に存在すれば `AlreadyExists` で拒否して利用者の既存データへ
-/// 展開しない。相対部分が空（rootfs が bundle そのもの）は拒否する。
-pub(super) fn prepare_rootfs_target(
-    bundle: &Path,
-    root_path: &Path,
-) -> Result<CreatedRootfs, TraitError> {
+/// 規則: `..`・予約名・ファイルシステムのルート・bundle 外の絶対指定・bundle そのものを拒否する。
+/// `prepare_rootfs_target` と [`reap_stale_unpacks`] が共有する。
+fn split_target(bundle: &Path, root_path: &Path) -> Result<Vec<std::ffi::OsString>, TraitError> {
     if root_path
         .components()
         .any(|c| matches!(c, Component::ParentDir))
@@ -144,17 +213,49 @@ pub(super) fn prepare_rootfs_target(
     let rel = rootfs
         .strip_prefix(bundle)
         .map_err(|_| invalid("rootfs must be inside the bundle"))?;
-    let parts: Vec<_> = rel
+    let parts: Vec<std::ffi::OsString> = rel
         .components()
         .filter_map(|c| match c {
-            Component::Normal(p) => Some(p),
+            Component::Normal(p) => Some(p.to_os_string()),
             _ => None,
         })
         .collect();
+    if parts.is_empty() {
+        return Err(invalid("rootfs must be a directory below the bundle"));
+    }
+    Ok(parts)
+}
+
+/// `root.path` の経路を検査し、末尾の要素を空のディレクトリとして排他的に作る。
+///
+/// `check_rootfs` と同じ規則（`..`・ファイルシステムのルート・bundle 外の絶対指定・中間要素の
+/// symlink / junction を拒否）に加え、末尾が既に存在すれば `AlreadyExists` で拒否して利用者の既存データへ
+/// 展開しない。相対部分が空（rootfs が bundle そのもの）は拒否する。作成の前に、同じ親の下の持ち主のいない
+/// 展開途中の木を回収する（結果は [`CreatedRootfs::reclamation`]。#2379・OCI-7）。
+#[cfg(test)]
+pub(super) fn prepare_rootfs_target(
+    bundle: &Path,
+    root_path: &Path,
+) -> Result<CreatedRootfs, TraitError> {
+    prepare_rootfs_target_with(bundle, root_path, &|reap| reap())
+}
+
+/// 回収の実処理を包む関数。回収を呼んだ結果をそのまま返す。
+pub(super) type ReapHook<'a> = &'a dyn Fn(&dyn Fn() -> StagingReclamation) -> StagingReclamation;
+
+/// [`prepare_rootfs_target`] の本体。`reap_hook` は回収の実処理（走査と再帰削除）を引数に取って呼ぶ関数で、
+/// 呼び出し元が計測区間で包める（その後の作成が失敗しても、回収の結果と所要時間を記録できる。REPAIR-4）。
+pub(super) fn prepare_rootfs_target_with(
+    bundle: &Path,
+    root_path: &Path,
+    reap_hook: ReapHook<'_>,
+) -> Result<CreatedRootfs, TraitError> {
+    let parts = split_target(bundle, root_path)?;
     let Some((last, parents)) = parts.split_last() else {
         return Err(invalid("rootfs must be a directory below the bundle"));
     };
-    let backing = imp::create_dir(bundle, parents, last)?;
+    let parents: Vec<&std::ffi::OsStr> = parents.iter().map(|p| p.as_os_str()).collect();
+    let (backing, reclamation) = imp::create_dir(bundle, &parents, last, reap_hook)?;
     // 正規化した（Normal 要素だけの）経路。
     let path = parts.iter().fold(bundle.to_path_buf(), |mut p, part| {
         p.push(part);
@@ -165,7 +266,27 @@ pub(super) fn prepare_rootfs_target(
         path,
         relative,
         backing,
+        reclamation,
     })
+}
+
+/// `root.path` の親の下に残った、持ち主のいない展開途中の木（`.fandhe-unpack-*`）を回収する（#2379・OCI-7）。
+///
+/// 起動時の照合（#2315 の配線。`reconcile_container_refs` と並べ、`StateStore::list` で列挙した bundle ごとに
+/// 呼ぶ想定。配線は未実装で、本関数は呼ばれるまで何も回収しない。REPAIR-3）の入口。生きている create
+/// （ロックを保持中の木）は壊さず、いつ呼んでもよい。経路検査は `prepare_rootfs_target` と同じで、
+/// 回収は固定した親の fd の下だけで行う。回収の失敗はエラーにせず結果へ記録する。
+/// Linux 以外は `Unimplemented`。
+pub fn reap_stale_unpacks(
+    bundle: &Path,
+    root_path: &Path,
+) -> Result<StagingReclamation, TraitError> {
+    let parts = split_target(bundle, root_path)?;
+    let Some((_, parents)) = parts.split_last() else {
+        return Err(invalid("rootfs must be a directory below the bundle"));
+    };
+    let parents: Vec<&std::ffi::OsStr> = parents.iter().map(|p| p.as_os_str()).collect();
+    imp::reap_stale(bundle, &parents)
 }
 
 /// 経路のいずれかの要素が非公開の展開先の予約名（[`STAGING_PREFIX`] 始まり）か。
@@ -180,6 +301,12 @@ impl CreatedRootfs {
     /// 作った rootfs のパス（bundle 配下。Normal 要素だけの正規化済みの経路）。
     pub(super) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 作成の前に同じ親の下で回収した、持ち主のいない展開途中の木の結果（#2379・OCI-7）。
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn reclamation(&self) -> &StagingReclamation {
+        &self.reclamation
     }
 
     /// 展開器へ渡す経路（[`ImageRootfsUnpacker::unpack`] の契約）。Linux は保持した fd を指す
@@ -255,7 +382,7 @@ pub(super) fn remove_recorded_rootfs(
 mod imp {
     //! Linux: 親ディレクトリの fd を保持して fd 相対・リンク非追従で作成・後始末する。
 
-    use std::ffi::{CString, OsStr};
+    use std::ffi::{CString, OsStr, OsString};
     use std::fs::File;
     use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
@@ -264,8 +391,8 @@ mod imp {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        CLEANUP_MAX_DEPTH, CLEANUP_MAX_ENTRIES, ImageRootfsRecord, RecordedRootfsRemoval, invalid,
-        refuse, remove_failed,
+        CLEANUP_MAX_DEPTH, CLEANUP_MAX_ENTRIES, ImageRootfsRecord, RecordedRootfsRemoval,
+        STAGING_PREFIX, StagingReclamation, invalid, refuse, remove_failed,
     };
     use crate::sys::{self, SysError};
     use crate::traits::{ErrorCode, TraitError};
@@ -286,6 +413,9 @@ mod imp {
         identity: (u64, u64),
         /// `seal` が書いた所有トークン（小文字 16 進 32 文字）。
         token: Option<String>,
+        /// 展開先のディレクトリ自体への排他の `flock`。生きている間は他の回収側から「持ち主あり」に見え、
+        /// プロセスが落ちれば OS が外す（#2379・OCI-7）。`Backing` と同じ寿命で保持する。
+        _lock: File,
     }
 
     /// 削除時に照合する所有トークンの扱い。
@@ -314,14 +444,40 @@ mod imp {
     }
 
     pub(super) fn seal(b: &mut Backing) -> Result<(), TraitError> {
+        let token = new_token()?;
+        // 展開器は rootfs 自身の mode を変えてよい（契約は禁止していない）。所有者の write・search 権限が無いと
+        // 印を作れず、従来成功した create が失敗する退行になるため、固定した fd の実体（`/proc/self/fd/N` は
+        // 経路を再解決しない）の mode を一時的に補って印を書き、成功・失敗のどちらでも元の mode へ戻す。
+        let proc_dir = format!("/proc/self/fd/{}", b.dir.as_raw_fd());
+        let original = fstat(b.dir.as_fd())
+            .map(|(_, _, _, mode)| mode & 0o7777)
+            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to stat rootfs"))?;
+        let widened = original | 0o300;
+        if widened != original {
+            std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(widened)).map_err(
+                |_| TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token"),
+            )?;
+        }
+        let written = write_marker(&proc_dir, &token);
+        if widened != original {
+            let restored =
+                std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(original));
+            written?;
+            restored.map_err(|_| {
+                TraitError::new(ErrorCode::Internal, "failed to restore rootfs mode")
+            })?;
+        } else {
+            written?;
+        }
+        b.token = Some(token);
+        Ok(())
+    }
+
+    /// 固定した rootfs（`proc_dir`）の直下へ所有トークンの印を新規作成して書く。
+    fn write_marker(proc_dir: &str, token: &str) -> Result<(), TraitError> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let token = new_token()?;
-        let path = format!(
-            "/proc/self/fd/{}/{}",
-            b.dir.as_raw_fd(),
-            super::OWNER_TOKEN_FILE
-        );
+        let path = format!("{proc_dir}/{}", super::OWNER_TOKEN_FILE);
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -343,7 +499,6 @@ mod imp {
             .map_err(|_| {
                 TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token")
             })?;
-        b.token = Some(token);
         Ok(())
     }
 
@@ -464,11 +619,11 @@ mod imp {
             .is_ok_and(|mut it| it.next().is_none())
     }
 
-    pub(super) fn create_dir(
-        bundle: &Path,
-        parents: &[&OsStr],
-        last: &OsStr,
-    ) -> Result<Backing, TraitError> {
+    /// 展開先の走査の上限（これを超える兄弟は調べずに残す。無制限の走査を避ける。REPAIR-5）。
+    const REAP_MAX_SCAN: usize = 4096;
+
+    /// bundle を開き、`parents` を 1 要素ずつリンク非追従で辿って親ディレクトリの fd を返す。
+    fn open_parent(bundle: &Path, parents: &[&OsStr]) -> Result<OwnedFd, TraitError> {
         // bundle そのものは呼び出し側が渡した経路（上位が symlink でもよい）。追従して開き、以降は fd で固定する。
         let mut cur = open_bundle(bundle).map_err(|e| match e {
             SysError::Os(n) if n == sys::ENOENT => {
@@ -483,6 +638,128 @@ mod imp {
         for part in parents {
             cur = open_dir(cur.as_fd(), &cstr(part)?)?;
         }
+        Ok(cur)
+    }
+
+    pub(super) fn reap_stale(
+        bundle: &Path,
+        parents: &[&OsStr],
+    ) -> Result<StagingReclamation, TraitError> {
+        let cur = open_parent(bundle, parents)?;
+        Ok(reap_under(cur.as_fd()))
+    }
+
+    /// 名前が `.fandhe-unpack-<pid>-<seq>`（pid は 1〜10 桁・seq は 1〜20 桁の 10 進数）に厳密に一致するか。
+    fn is_staging_name(name: &[u8]) -> bool {
+        let Some(rest) = name.strip_prefix(STAGING_PREFIX.as_bytes()) else {
+            return false;
+        };
+        let mut it = rest.splitn(2, |b| *b == b'-');
+        let (Some(pid), Some(seq)) = (it.next(), it.next()) else {
+            return false;
+        };
+        let digits = |v: &[u8], max: usize| {
+            !v.is_empty() && v.len() <= max && v.iter().all(|b| b.is_ascii_digit())
+        };
+        digits(pid, 10) && digits(seq, 20)
+    }
+
+    /// 親 `cur`（固定済みの fd）の下の、持ち主のいない展開途中の木を回収する。結果は名前の昇順。
+    fn reap_under(cur: BorrowedFd<'_>) -> StagingReclamation {
+        let mut result = StagingReclamation::default();
+        let Ok(rd) = std::fs::read_dir(format!("/proc/self/fd/{}", cur.as_raw_fd())) else {
+            result.scan_failed = true;
+            return result;
+        };
+        let mut names: Vec<OsString> = Vec::new();
+        for (scanned, ent) in rd.enumerate() {
+            if scanned >= REAP_MAX_SCAN {
+                result.truncated = true;
+                break;
+            }
+            let Ok(ent) = ent else {
+                result.scan_failed = true;
+                continue;
+            };
+            let name = ent.file_name();
+            if is_staging_name(name.as_bytes()) {
+                names.push(name);
+            }
+        }
+        names.sort();
+        for name in names {
+            match reap_one(cur, &name) {
+                Reap::Reclaimed => result.reclaimed.push(name),
+                Reap::Alive => result.kept_alive.push(name),
+                Reap::Unverified => result.kept_unverified.push(name),
+                Reap::Failed => result.failed.push(name),
+                Reap::Gone => {}
+            }
+        }
+        result
+    }
+
+    enum Reap {
+        Reclaimed,
+        Alive,
+        Unverified,
+        Failed,
+        /// 調べている間に消えた（別の回収側が先に消した）。
+        Gone,
+    }
+
+    /// 1 つの候補を調べ、持ち主がいないと確かめられたときだけ消す（確かめられなければ残す）。
+    fn reap_one(cur: BorrowedFd<'_>, name: &OsStr) -> Reap {
+        let Ok(cname) = cstr(name) else {
+            return Reap::Unverified;
+        };
+        let fd = match sys::open_dir_path_nofollow(Some(cur), &cname) {
+            Ok(fd) => fd,
+            Err(SysError::Os(n)) if n == sys::ENOENT => return Reap::Gone,
+            Err(_) => return Reap::Unverified,
+        };
+        let identity = match fstat(fd.as_fd()) {
+            Ok((dev, ino, true, mode))
+                if mode & 0o777 == 0o700 && fd_owner(fd.as_fd()) == Some(sys::effective_uid()) =>
+            {
+                (dev, ino)
+            }
+            _ => return Reap::Unverified,
+        };
+        // O_PATH の fd には flock できないため、`/proc/self/fd/N` から開き直したディレクトリにロックを掛ける。
+        let Ok(lock) = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) else {
+            return Reap::Unverified;
+        };
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Reap::Alive,
+            Err(_) => return Reap::Unverified,
+        }
+        // ロックを保持したまま名前から開き直し、検査した実体と同じことを確かめる（差し替え・別の回収側の
+        // 取り直しを弾く）。ロックはこの関数を出るまで保持する。
+        match sys::open_dir_path_nofollow(Some(cur), &cname) {
+            Ok(again) => match fstat(again.as_fd()) {
+                Ok((dev, ino, true, _)) if (dev, ino) == identity => {}
+                _ => return Reap::Unverified,
+            },
+            Err(SysError::Os(n)) if n == sys::ENOENT => return Reap::Gone,
+            Err(_) => return Reap::Unverified,
+        }
+        match remove_tree_at(cur, &cname, identity, Owner::Unchecked) {
+            Ok(_) => Reap::Reclaimed,
+            Err(_) => Reap::Failed,
+        }
+    }
+
+    pub(super) fn create_dir(
+        bundle: &Path,
+        parents: &[&OsStr],
+        last: &OsStr,
+        reap_hook: super::ReapHook<'_>,
+    ) -> Result<(Backing, StagingReclamation), TraitError> {
+        let cur = open_parent(bundle, parents)?;
+        // 同じ親の下に残った、持ち主のいない展開途中の木を先に回収する（PID の再利用による名前の衝突も解く）。
+        let reclamation = reap_hook(&|| reap_under(cur.as_fd()));
         let final_name = cstr(last)?;
         // 最終の名前が既にあれば展開せずに拒否する（利用者の既存データへ展開しない。公開時の
         // `RENAME_NOREPLACE` が最終的な排他）。
@@ -545,14 +822,36 @@ mod imp {
                 ));
             }
         };
-        Ok(Backing {
-            parent: cur,
-            final_name,
-            current: name,
-            dir,
-            identity,
-            token: None,
-        })
+        // 展開先自体に排他ロックを取る。取れない・取った後に名前の実体が変わっていれば、直前に回収側が
+        // 空の木を取った（持ち主はその回収側）ので、後始末せず失敗する。再試行で成功する（#2379）。
+        let reclaimed_concurrently = || {
+            TraitError::new(
+                ErrorCode::Internal,
+                "rootfs staging was reclaimed concurrently",
+            )
+        };
+        let lock = File::open(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to lock rootfs staging"))?;
+        lock.try_lock().map_err(|_| reclaimed_concurrently())?;
+        match open_dir(cur.as_fd(), &name)
+            .ok()
+            .and_then(|fd| fstat(fd.as_fd()).ok())
+        {
+            Some((dev, ino, true, _)) if (dev, ino) == identity => {}
+            _ => return Err(reclaimed_concurrently()),
+        }
+        Ok((
+            Backing {
+                parent: cur,
+                final_name,
+                current: name,
+                dir,
+                identity,
+                token: None,
+                _lock: lock,
+            },
+            reclamation,
+        ))
     }
 
     pub(super) fn identity(b: &Backing) -> Result<(u64, u64), TraitError> {
@@ -719,7 +1018,7 @@ mod imp {
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
-    use super::{ImageRootfsRecord, RecordedRootfsRemoval, refuse};
+    use super::{ImageRootfsRecord, RecordedRootfsRemoval, StagingReclamation, refuse};
     use crate::traits::{ErrorCode, TraitError};
 
     #[derive(Debug)]
@@ -746,10 +1045,22 @@ mod imp {
         _bundle: &Path,
         _parents: &[&OsStr],
         _last: &OsStr,
-    ) -> Result<Backing, TraitError> {
+        _reap_hook: super::ReapHook<'_>,
+    ) -> Result<(Backing, StagingReclamation), TraitError> {
         Err(TraitError::new(
             ErrorCode::Unimplemented,
             "image rootfs unpacking is not supported on this OS yet",
+        ))
+    }
+
+    /// 展開途中の木が生じないので回収する物も無いが、実装済みを装わず `Unimplemented` を返す（REPAIR-3）。
+    pub(super) fn reap_stale(
+        _bundle: &Path,
+        _parents: &[&OsStr],
+    ) -> Result<StagingReclamation, TraitError> {
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "reclaiming image rootfs staging is not supported on this OS yet",
         ))
     }
 
@@ -1029,6 +1340,31 @@ mod tests {
         c.record().expect("record")
     }
 
+    /// OCI-7（#2378）: 展開器が rootfs 自身を 0555 にしても seal は印を書け、公開後の mode は展開器が
+    /// 残したまま（0555）で、記録から消せる（削除側が mode を補って辿る）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_seal_works_on_read_only_rootfs_and_restores_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = tmp("seal-ro");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
+        std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod 0555");
+        c.seal().expect("seal must not fail on a read-only rootfs");
+        let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o7777;
+        assert_eq!(mode(&c.unpack_path()), 0o555);
+        c.publish().expect("publish");
+        let rec = c.record().expect("record");
+        assert_eq!(mode(&b.join("rootfs")), 0o555);
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("remove"),
+            RecordedRootfsRemoval::Removed
+        );
+        assert!(!b.join("rootfs").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
     /// OCI-7・SEC-1（#2378）: 記録した rootfs を手で消して同名のディレクトリを作り直した（印が無い・別の印）
     /// ときは、(dev, ino) が偶然一致しても消さない。利用者の新しいデータが残る。
     #[cfg(target_os = "linux")]
@@ -1281,6 +1617,232 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("must not block");
         assert!(refused);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// 持ち主のいない展開途中の木を `parent` の下に作る（`name` は予約名。中にファイルとサブディレクトリを置く）。
+    #[cfg(target_os = "linux")]
+    fn plant_staging(parent: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let t = parent.join(name);
+        std::fs::create_dir(&t).expect("plant");
+        std::fs::create_dir(t.join("sub")).expect("sub");
+        std::fs::write(t.join("sub").join("f"), b"x").expect("f");
+        std::fs::set_permissions(&t, std::fs::Permissions::from_mode(0o700)).expect("0700");
+        t
+    }
+
+    /// OCI-7・#2379: create の途中で落ちた（`remove` も `publish` もせず drop した = ロックが外れた）展開途中の
+    /// 木は、次の create の時点で回収される。予約名でない兄弟・公開済みの rootfs は残り、2 回目は何も回収しない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_reap_reclaims_staging_left_by_crashed_create() {
+        let b = tmp("reap-crashed");
+        let mut published = prepare_rootfs_target(&b, Path::new("rootfs")).expect("first");
+        std::fs::write(published.unpack_path().join("keep"), b"x").expect("write");
+        published.publish().expect("publish");
+        // 別の root.path で作って中身を書き、落ちたことにする（drop でロックが外れる）。
+        let crashed = prepare_rootfs_target(&b, Path::new("other")).expect("second");
+        std::fs::write(crashed.unpack_path().join("partial"), b"x").expect("partial");
+        let leftover = std::fs::read_dir(&b)
+            .expect("read")
+            .map(|e| e.expect("ent").file_name())
+            .find(|n| n.to_string_lossy().starts_with(STAGING_PREFIX))
+            .expect("staging exists");
+        drop(crashed);
+        std::fs::create_dir(b.join(".fandhe-unpack-x")).expect("not reserved shape");
+        std::fs::write(b.join("sibling"), b"x").expect("sibling");
+
+        let next = prepare_rootfs_target(&b, Path::new("third")).expect("third");
+        assert_eq!(next.reclamation().reclaimed, vec![leftover.clone()]);
+        assert!(next.reclamation().kept_alive.is_empty());
+        assert!(!b.join(&leftover).exists());
+        assert!(b.join("rootfs/keep").exists());
+        assert!(b.join(".fandhe-unpack-x").is_dir());
+        assert!(b.join("sibling").exists());
+        let again = reap_stale_unpacks(&b, Path::new("third")).expect("public");
+        assert!(again.reclaimed.is_empty());
+        assert_eq!(again.kept_alive.len(), 1, "the live `third` staging");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7・#2379: ロックを保持中の（生きている）create の展開先は回収せず、両方が共存する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_reap_keeps_live_staging() {
+        let b = tmp("reap-live");
+        let first = prepare_rootfs_target(&b, Path::new("a")).expect("first");
+        std::fs::write(first.unpack_path().join("f"), b"x").expect("write");
+        let second = prepare_rootfs_target(&b, Path::new("b")).expect("second");
+        assert_eq!(second.reclamation().kept_alive.len(), 1);
+        assert!(second.reclamation().reclaimed.is_empty());
+        assert_eq!(
+            std::fs::read(first.unpack_path().join("f")).expect("alive"),
+            b"x"
+        );
+        let r = reap_stale_unpacks(&b, Path::new("a")).expect("public");
+        assert_eq!(r.kept_alive.len(), 2);
+        assert!(r.reclaimed.is_empty());
+        first.remove().expect("rm first");
+        second.remove().expect("rm second");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7・#2379: PID が再利用されて同じ名前の持ち主のいない木が残っていても、次の create は
+    /// `AlreadyExists` にならず、その木を回収して成功する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_reap_resolves_pid_reuse_collision() {
+        let b = tmp("reap-pid-reuse");
+        let pid = std::process::id();
+        for seq in 0..16 {
+            plant_staging(&b, &format!("{STAGING_PREFIX}{pid}-{seq}"));
+        }
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("must not collide");
+        assert_eq!(c.reclamation().reclaimed.len(), 16);
+        std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
+        c.publish().expect("publish");
+        assert!(b.join("rootfs/f").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// SEC-1・OCI-7・#2379: 回収は予約名の symlink・通常ファイル・mode が違うディレクトリを辿らず消さず、
+    /// bundle 外の実体にも触れない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_reap_does_not_follow_or_delete_foreign_entries() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = tmp("reap-foreign");
+        let outside = tmp("reap-foreign-out");
+        std::fs::write(outside.join("marker"), b"x").expect("marker");
+        std::os::unix::fs::symlink(&outside, b.join(".fandhe-unpack-1-1")).expect("symlink");
+        std::fs::write(b.join(".fandhe-unpack-2-2"), b"file").expect("file");
+        let wide = plant_staging(&b, ".fandhe-unpack-3-3");
+        std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o755)).expect("0755");
+        std::fs::create_dir(b.join(".fandhe-unpack-4-")).expect("bad shape");
+        std::fs::create_dir(b.join(".fandhe-unpack-99999999999-1")).expect("too long pid");
+
+        let r = reap_stale_unpacks(&b, Path::new("rootfs")).expect("reap");
+        assert!(r.reclaimed.is_empty());
+        assert_eq!(
+            r.kept_unverified,
+            vec![
+                std::ffi::OsString::from(".fandhe-unpack-1-1"),
+                ".fandhe-unpack-2-2".into(),
+                ".fandhe-unpack-3-3".into()
+            ]
+        );
+        assert!(outside.join("marker").exists());
+        assert!(b.join(".fandhe-unpack-2-2").is_file());
+        assert!(wide.join("sub/f").exists());
+        assert!(b.join(".fandhe-unpack-4-").is_dir());
+        assert!(b.join(".fandhe-unpack-99999999999-1").is_dir());
+        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// SEC-1・#2379: 持ち主のいない木の中の symlink は辿らず、リンクだけを消す。読み取り専用の木も消せる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_reap_does_not_follow_symlinks_inside_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = tmp("reap-inner");
+        let outside = tmp("reap-inner-out");
+        std::fs::write(outside.join("marker"), b"x").expect("marker");
+        let t = plant_staging(&b, ".fandhe-unpack-5-5");
+        std::os::unix::fs::symlink(&outside, t.join("dirlink")).expect("symlink");
+        std::fs::set_permissions(t.join("sub"), std::fs::Permissions::from_mode(0o555))
+            .expect("ro");
+        let r = reap_stale_unpacks(&b, Path::new("rootfs")).expect("reap");
+        assert_eq!(
+            r.reclaimed,
+            vec![std::ffi::OsString::from(".fandhe-unpack-5-5")]
+        );
+        assert!(!t.exists());
+        assert!(outside.join("marker").exists());
+        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// OCI-7・#2379: 別のプロセス（ここでは別の open file description）がロックを持つ木は生きていると
+    /// 見なして消さず、ロックが外れたら次の回収で消える。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_lock_held_by_other_is_reported_as_alive_not_deleted() {
+        let b = tmp("reap-lock-other");
+        let t = plant_staging(&b, ".fandhe-unpack-6-6");
+        let holder = std::fs::File::open(&t).expect("open");
+        holder.try_lock().expect("lock");
+        let r = reap_stale_unpacks(&b, Path::new("rootfs")).expect("reap");
+        assert_eq!(
+            r.kept_alive,
+            vec![std::ffi::OsString::from(".fandhe-unpack-6-6")]
+        );
+        assert!(t.join("sub/f").exists());
+        drop(holder);
+        let r = reap_stale_unpacks(&b, Path::new("rootfs")).expect("reap");
+        assert_eq!(r.reclaimed.len(), 1);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// REPAIR-4・#2379: 親が書込・探索可能だが読めない（走査できない）とき、create は成功するが回収は
+    /// 不完全（`scan_failed`）として報告される。木が無い場合（`is_incomplete() == false`）と区別できる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair4_reap_reports_scan_failure_for_unreadable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = tmp("reap-unreadable");
+        std::fs::create_dir(b.join("p")).expect("p");
+        std::fs::set_permissions(b.join("p"), std::fs::Permissions::from_mode(0o300))
+            .expect("chmod");
+        if std::fs::read_dir(b.join("p")).is_ok() {
+            // root 等で権限が効かない環境では前提を作れない。
+            std::fs::set_permissions(b.join("p"), std::fs::Permissions::from_mode(0o700)).ok();
+            let _ = std::fs::remove_dir_all(&b);
+            return;
+        }
+        let r = reap_stale_unpacks(&b, Path::new("p/rootfs")).expect("reap");
+        assert!(r.scan_failed);
+        assert!(r.is_incomplete());
+        assert!(r.is_noteworthy());
+        assert!(r.reclaimed.is_empty() && r.failed.is_empty());
+        let c = prepare_rootfs_target(&b, Path::new("p/rootfs")).expect("create succeeds");
+        assert!(c.reclamation().scan_failed);
+        assert!(c.reclamation().is_incomplete());
+        drop(c);
+        std::fs::set_permissions(b.join("p"), std::fs::Permissions::from_mode(0o700)).ok();
+        let clean = reap_stale_unpacks(&b, Path::new("p/rootfs")).expect("reap");
+        assert!(!clean.scan_failed);
+        assert!(!clean.is_incomplete());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// SEC-1・#2379: 公開入口は `prepare_rootfs_target` と同じ経路検査を通す（`..`・予約名・bundle 自身・symlink の親）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_reap_stale_unpacks_validates_paths() {
+        let b = tmp("reap-paths");
+        let outside = tmp("reap-paths-out");
+        plant_staging(&outside, ".fandhe-unpack-7-7");
+        std::os::unix::fs::symlink(&outside, b.join("link")).expect("symlink");
+        for bad in ["../x", ".fandhe-unpack-1-0", ".", "link/rootfs"] {
+            let e = reap_stale_unpacks(&b, Path::new(bad)).expect_err(bad);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
+        }
+        assert!(outside.join(".fandhe-unpack-7-7/sub/f").exists());
+        let e = reap_stale_unpacks(&b.join("nope"), Path::new("rootfs")).expect_err("no bundle");
+        assert_eq!(e.code(), ErrorCode::NotFound);
+        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// OCI-7・SEC-1: Linux 以外は回収も `Unimplemented`（実装済みを装わない。REPAIR-3）。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn sec1_reap_stale_unpacks_is_unimplemented_outside_linux() {
+        let b = tmp("reap-nonlinux");
+        let e = reap_stale_unpacks(&b, Path::new("rootfs")).expect_err("unimplemented");
+        assert_eq!(e.code(), ErrorCode::Unimplemented);
         let _ = std::fs::remove_dir_all(&b);
     }
 }

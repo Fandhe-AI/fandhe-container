@@ -41,8 +41,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use super::container_ref_persist::CONTAINER_REFS_TMP_PREFIX;
 use super::usage::{blob_dir, blob_path, check_blob_dirs};
-use super::{ReferenceTable, TagKey};
+use super::{MAX_CACHE_SCAN_ENTRIES, ReferenceTable, TagKey};
 use crate::error::{OciError, OciErrorCode};
 use crate::reference::{Digest, RegistryHost, Repository, Tag};
 
@@ -424,13 +425,20 @@ fn publish_journal(root: &Path, bytes: &[u8]) -> Result<(), PublishError> {
 }
 
 /// 書き込み中のクラッシュで残った一時ファイルを回収する（通常ファイルだけ。ストアの排他区間内で、`lock` が取得直後に呼ぶ）。
-pub(super) fn reap_stale_tmp(root: &Path) {
+///
+/// `prefixes` のいずれかで始まる root 直下の通常ファイルだけを消す（symlink・ディレクトリ・固定名の
+/// 本体ファイルは触らない）。対象は GC ジャーナルの一時ファイル（`@gc-pending.json.tmp-*`）と
+/// コンテナ参照テーブルの一時ファイル（`@container-refs.json.tmp-*`。#2379・OCI-7）。どちらも書き手が
+/// 排他区間の中でしか作らないため、排他を取った時点で残っているものは中断した書き込みの残骸で、PID の
+/// 生存確認は要らない。走査は 1 回にまとめ、件数は `MAX_CACHE_SCAN_ENTRIES` で打ち切る。
+pub(super) fn reap_stale_tmp(root: &Path, prefixes: &[&str]) {
     let Ok(rd) = fs::read_dir(root) else {
         return;
     };
-    for ent in rd.flatten() {
+    for ent in rd.flatten().take(MAX_CACHE_SCAN_ENTRIES) {
         let name = ent.file_name();
-        if !name.to_string_lossy().starts_with(TMP_PREFIX) {
+        let name = name.to_string_lossy();
+        if !prefixes.iter().any(|p| name.starts_with(p)) {
             continue;
         }
         let path = ent.path();
@@ -439,6 +447,9 @@ pub(super) fn reap_stale_tmp(root: &Path) {
         }
     }
 }
+
+/// `lock` が取得直後に回収する一時ファイルの接頭辞（GC ジャーナルとコンテナ参照テーブル）。
+pub(super) const STALE_TMP_PREFIXES: &[&str] = &[TMP_PREFIX, CONTAINER_REFS_TMP_PREFIX];
 
 /// ジャーナルを消滅させる。この成功が削除確定のコミット点。
 ///

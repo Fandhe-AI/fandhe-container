@@ -532,7 +532,7 @@ pub const LAYER_MEDIA_TYPES: &[LayerMediaTypeEntry] = &[
 /// pull の事前拒否が受ける `mediaType` か（[`LAYER_MEDIA_TYPES`] の `pull` 列。完全一致）。
 ///
 /// `manifest::ensure_supported_layer_media_types` から blob 取得前に呼ばれる。
-pub fn is_pull_supported_layer_media_type(media_type: &str) -> bool {
+pub(crate) fn is_pull_supported_layer_media_type(media_type: &str) -> bool {
     LAYER_MEDIA_TYPES
         .iter()
         .any(|e| e.pull && e.media_type == media_type)

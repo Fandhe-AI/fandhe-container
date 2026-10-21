@@ -273,7 +273,6 @@ fn lock_file_error() -> OciError {
     )
 }
 
-/// `@lock` を開く（無ければ 0600 で作る）。symlink・通常ファイル以外は拒否する。
 /// root と祖先の信頼性を検査し、正規化したパスを返す（OCI-7・SEC-1・#2381）。`@lock` 作成等の副作用より前に呼ぶ。
 #[cfg(unix)]
 fn verify_root_trust(root: PathBuf, meta: &fs::Metadata) -> Result<PathBuf, OciError> {
@@ -344,6 +343,7 @@ fn verify_ancestor_meta(meta: &fs::Metadata, euid: u32) -> Result<(), OciError> 
     Ok(())
 }
 
+/// `@lock` を開く（無ければ 0600 で作る）。symlink・通常ファイル以外は拒否する。
 fn open_lock_file(root: &Path) -> Result<File, OciError> {
     let path = root.join(IMAGE_STORE_LOCK_FILE_NAME);
     let pre = match fs::symlink_metadata(&path) {

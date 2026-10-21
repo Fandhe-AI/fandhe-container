@@ -23,7 +23,7 @@
 //! 本物の syscall は [`RealKernel`]（`sys` のラッパー）だけが呼ぶ。テストは偽の `SeccompKernel` で
 //! 呼び出し順・エラー写像を再現し、実 syscall は使い捨てスレッドで確認する。
 
-use super::seccomp_listener::{ACK_TIMEOUT, ListenerSender};
+use super::seccomp_listener::ListenerSender;
 use super::{ExecError, IsolationStage, ThreadCountSource};
 use crate::seccomp::SeccompProgram;
 use crate::sys::{self, SysError};
@@ -123,13 +123,20 @@ pub(crate) fn apply_default_seccomp() -> Result<SeccompReport, ExecError> {
 pub(crate) fn apply_default_seccomp_with_listener(
     sender: ListenerSender,
 ) -> Result<SeccompReport, ExecError> {
-    apply_default_seccomp_with_listener_threads(sender, &mut ThreadCountSource::ProcSelf)
+    apply_default_seccomp_with_listener_threads(
+        sender,
+        super::seccomp_listener::ACK_TIMEOUT,
+        &mut ThreadCountSource::ProcSelf,
+    )
 }
 
 /// [`apply_default_seccomp_with_listener`] のスレッド数取得元を差し替える版（exec の再適用用。SUP-6）。
 #[cfg_attr(test, allow(dead_code))]
+///
+/// `ack_timeout` は C の ACK を待つ上限（exec は全体の期限と `ACK_TIMEOUT` の短い方を渡す。REPAIR-5・#2385）。
 pub(crate) fn apply_default_seccomp_with_listener_threads(
     sender: ListenerSender,
+    ack_timeout: std::time::Duration,
     threads: &mut ThreadCountSource,
 ) -> Result<SeccompReport, ExecError> {
     let program = match build_default_program_with(sender.delivery()) {
@@ -147,7 +154,7 @@ pub(crate) fn apply_default_seccomp_with_listener_threads(
             .borrow_mut()
             .take()
         {
-            Some(sender) => sender.hand_over(fd, ACK_TIMEOUT),
+            Some(sender) => sender.hand_over(fd, ack_timeout),
             None => Err(ExecError::new(
                 ErrorCode::Internal,
                 IsolationStage::Seccomp,
@@ -1065,6 +1072,16 @@ pub(super) mod testing {
 
     /// `exec/reapply.rs` が `cfg(test)` で呼ぶ偽物（取得元は読まない）。
     pub(in crate::exec) fn apply_default_seccomp_with(
+        _threads: &mut ThreadCountSource,
+    ) -> Result<SeccompReport, ExecError> {
+        apply_default_seccomp()
+    }
+
+    /// `exec/reapply.rs` が `cfg(test)` で、送り手つきのときに呼ぶ偽物。送り手は使わず閉じるだけ（呼び出しは
+    /// `apply_default_seccomp_with` と同じ記録・失敗注入に従う）。
+    pub(in crate::exec) fn apply_default_seccomp_with_listener_threads(
+        _sender: crate::exec::seccomp_listener::ListenerSender,
+        _ack_timeout: std::time::Duration,
         _threads: &mut ThreadCountSource,
     ) -> Result<SeccompReport, ExecError> {
         apply_default_seccomp()

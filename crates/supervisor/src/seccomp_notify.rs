@@ -34,7 +34,7 @@
 //!
 //! 記録先を作れないときの起動拒否は入口（`start_entry::require_seccomp_audit_sink`。#2027）が行い、本モジュールは
 //! 起動した後に記録に失敗した分の `unrecorded` の集計とログまで。exec 経路（SUP-6）の
-//! listener 受け渡しは #2385。restart の再 launch を本番で成り立たせること自体は #2043（本モジュールの差し替えは
+//! listener 受け渡しは #2385 で実装済み（filter は ERRNO 版のままで通知は出ない。exec の USER_NOTIF 化と応答者は #2385 の後続）。restart の再 launch を本番で成り立たせること自体は #2043（本モジュールの差し替えは
 //! 偽の launcher でだけ試している）。
 
 use std::collections::VecDeque;

@@ -11,7 +11,7 @@
 //! - 呼び出し元は supervisor の USER_NOTIF listener ループ（`fandhe-container-supervisor` の `seccomp_notify`。#2025）。
 //!   SIGSYS ハンドラ経由（`from_sigsys`）は未実装（REPAIR-3）。supervisor の start 経路は `ProductionLauncherBuilder::
 //!   seccomp_errno_delivery(UserNotif)` で ERRNO 側の 40 件を通知にし、ループが PID を変換して本フックで記録してから
-//!   `-EPERM` で応答する。それ以外の launcher（既定の `Errno`）や exec 経路（#2385）は従来どおり `ERRNO(EPERM)` で、
+//!   `-EPERM` で応答する。それ以外の launcher（既定の `Errno`）や exec 経路（listener は #2385 で受け渡し済みだが filter は ERRNO 版のまま。USER_NOTIF 化は後続）は従来どおり `ERRNO(EPERM)` で、
 //!   報告が発生しない。`unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS`（ESC-06）。`KILL_PROCESS` では終了するプロセス自身が記録を書けず、
 //!   プロセス内の SIGSYS ハンドラ経由の `SeccompDenialReport::from_sigsys` も使えない。そのため KILL 側では
 //!   本フックを使わない（正の記録はカーネルの `AUDIT_SECCOMP`、補助は親の回収点が出す

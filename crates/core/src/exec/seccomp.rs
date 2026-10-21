@@ -303,7 +303,7 @@ pub enum ProbeOutcome {
 }
 
 impl ProbeOutcome {
-    fn from_result(r: Result<(), SysError>) -> Self {
+    pub(super) fn from_result(r: Result<(), SysError>) -> Self {
         match r {
             Ok(()) => ProbeOutcome::Ok,
             Err(SysError::Os(n)) => ProbeOutcome::Errno(n),

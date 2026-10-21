@@ -26,9 +26,23 @@
 //!   （mountinfo の `ro` が主な保証。`readonly_paths` と同じ流儀）
 //! - `/sys/fs/cgroup/cgroup.procs` があれば、書き込み `open` は拒否される（`exec::setns` の前提の裏付け）
 //!
+//! # シナリオ（`--ignored` 時は dispatcher が順に再 exec する。#2305）
+//! mount 属性を変える試行は同じ子の観測を壊すため、シナリオごとに別プロセスで動かす（`escape_suite.rs` の `--scenario` に倣う）。
+//! - `default`: 上の流れと期待値（従来の試験）
+//! - `ro-clear`: rootless の `/sys` の rbind の最上位の ro を、user namespace の root が `mount_setattr` で外せるかの測定
+//!   （SEC-2・SEC-1・#2305 の P2-1。root では「該当なし」を出力する: 問いは rbind 経路にしか無く、skip で通しているのではない）。
+//!   - 防御なしの測定: `StageKind::CgroupJoin` のフック（pivot 後・capability 削減前。全 capability あり・seccomp なし）で試し、
+//!     `ro_clear_errno=0|<errno>|unsupported|failed|precondition` を記録する。**値は測定対象そのもので未知のため、
+//!     どの errno でも assert しない**（0 なら外せた、`EPERM` ならロックされている）。測定が行われなかった
+//!     `precondition`・`unsupported`・`failed` は測定不成立として失敗にする（false-green を避ける）。
+//!     外せた場合は書き込みを一切せず、mountinfo の読み直しと書き込み用 `open(2)` の errno だけを観測する
+//!   - 防御ありの測定: 組み込みの制限段（capability 削減・seccomp）通過後のクロージャで同じ試行をし、
+//!     `ro_clear_defended_errno=1`（`EPERM`）を要求する。これは本番の防御（SEC-1・CORE-5）の性質なので assert する
+//!   - 手順と結果の記録先: `docs/verification/rootless-sysfs-readonly.md`・#2305
+//!
 //! # 判定ロジックの自己照合（REPAIR-12）
 //! mountinfo の判定（`sys_tree_violations`）は特権なしの純関数で、合成 fixture による自己照合を `--ignored` 指定の有無に
-//! かかわらず毎回実行する（CI の `cargo test --workspace` で走る）。
+//! かかわらず毎回実行する（CI の `cargo test --workspace` で走る）。`ro-clear` の判定（`ro_clear_verdict`）も同様。
 //!
 //! # 実機前提テストとしての分離
 //! Linux 5.12 以降（`open_tree`・`move_mount`・`mount_setattr`）で、root もしくは非特権 user namespace を許可する
@@ -42,9 +56,16 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 fn main() {
+    // シナリオ再入時は常に走る自己照合を繰り返さない（dispatcher が 1 回走らせている）。
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--scenario") {
+        let id = args.get(i + 1).expect("scenario id after --scenario");
+        linux::scenario(id);
+        return;
+    }
     linux::self_check();
-    if std::env::args().any(|a| a == "--ignored") {
-        linux::run();
+    if args.iter().any(|a| a == "--ignored") {
+        linux::dispatch();
     } else {
         println!(
             "sysfs_mount: ignored (real-machine test; run with `-- --ignored`, see AGENTS.md)"
@@ -56,12 +77,12 @@ fn main() {
 mod linux {
     use std::io::{Read as _, Write as _};
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        ChildExit, DevptsGidSource, IsolationConfig, Namespace, NamespaceSet, StagePipeline,
-        isolate, isolate_rootful_host_root, plan, plan_rootful_host_root,
-        spawn_container_probe_with_sysfs,
+        ChildExit, DevptsGidSource, IsolationConfig, Namespace, NamespaceSet, ProbeOutcome,
+        StageKind, StagePipeline, isolate, isolate_rootful_host_root, plan, plan_rootful_host_root,
+        probe_clear_sysfs_readonly_for_test, spawn_container_probe_with_sysfs,
     };
     use fandhe_container_core::oci_runtime::{SysfsMountSpec, parse_config_bytes};
     use fandhe_container_core::rootless::single_id_mapping;
@@ -352,6 +373,52 @@ mod linux {
             Ok((vec!["/sys has no mount".to_string()], 0))
         );
         assert!(sys_tree_violations("10 1 0:5 / /sys rw\n").is_err());
+        // ro-clear の判定（#2305）。防御ありは EPERM のみ、防御なしは測定対象のため語彙内なら errno を問わない。
+        let base = "sys_stack=2\ntop_opts=\"ro,nosuid\"\nro_clear_defended_errno=1\n";
+        let verdict = |u: &str| ro_clear_verdict(&format!("{base}ro_clear_errno={u}\n"));
+        assert_eq!(
+            verdict("1"),
+            Ok(RoClearVerdict {
+                undefended: "1".to_string(),
+                stack: 2
+            })
+        );
+        assert_eq!(
+            verdict("13").map(|v| v.undefended),
+            Ok("13".to_string()),
+            "any errno is a valid measurement"
+        );
+        assert!(verdict("0").is_err(), "0 needs the follow-up observations");
+        let cleared = format!(
+            "{base}ro_clear_errno=0\ntop_ro_after_clear=false\nchildren_ro_after_clear=true\n"
+        );
+        assert_eq!(
+            ro_clear_verdict(&cleared).map(|v| v.undefended),
+            Ok("0".to_string())
+        );
+        for bad in ["precondition", "unsupported", "failed", "eperm", ""] {
+            assert!(
+                verdict(bad).is_err(),
+                "{bad:?} must not be a valid measurement"
+            );
+        }
+        let defended_open = base.replace("defended_errno=1", "defended_errno=0");
+        assert!(
+            ro_clear_verdict(&format!("{defended_open}ro_clear_errno=1\n")).is_err(),
+            "a defended success must fail"
+        );
+        assert!(ro_clear_verdict("sys_stack=1\nro_clear_errno=1\n").is_err());
+        let two =
+            "11 1 0:6 / /sys rw - sysfs sysfs rw\n12 1 0:7 / /sys ro,nosuid - sysfs sysfs rw\n";
+        assert_eq!(
+            sys_stack_and_top(two),
+            Ok((2, Some(vec!["ro".to_string(), "nosuid".to_string()])))
+        );
+        assert_eq!(host_sys_read_only(two), Some(true));
+        assert_eq!(
+            host_sys_read_only("10 1 0:5 / /proc rw - proc proc rw\n"),
+            None
+        );
         println!("sysfs_mount: mountinfo judgement self-check passed");
     }
 
@@ -454,8 +521,8 @@ mod linux {
         writeln!(writer, "mask_thermal_throttle={thermal}").expect("write");
     }
 
-    pub fn run() {
-        let rootfs = make_rootfs();
+    /// 試験プロセスを分離する（root は rootful、非 root は rootless）。`(root かどうか, 分離前の実効 gid)`。
+    fn isolate_self() -> (bool, u32) {
         let root = is_root();
         // 親（user namespace に入る前）の実効 gid。rootless の devpts の `gid=` 決定に使う。
         let egid: u32 = std::fs::read_to_string("/proc/self/status")
@@ -484,6 +551,13 @@ mod linux {
             plan(&config).and_then(|p| isolate(&p))
         };
         result.unwrap_or_else(|err| panic!("isolate failed: {err}"));
+        (root, egid)
+    }
+
+    /// 従来の試験（シナリオ `default`）。
+    fn run() {
+        let rootfs = make_rootfs();
+        let (root, egid) = isolate_self();
 
         let spec = sysfs_spec();
         let gid_map;
@@ -528,6 +602,247 @@ mod linux {
             lookup(&text, "mask_powercap"),
             lookup(&text, "mask_thermal_throttle"),
         );
+    }
+
+    /// `ro-clear` の防御なし側で、数値の errno 以外に許す語彙（測定不成立のものを含む。判定は `ro_clear_verdict`）。
+    const UNDEFENDED_WORDS: [&str; 4] = ["unsupported", "failed", "precondition", "0"];
+
+    /// 試行の結果を記録用の語彙へ写す（`0`・errno の数値・`unsupported`・`failed`・`precondition`）。
+    fn render_clear_outcome<E>(r: &Result<ProbeOutcome, E>) -> String {
+        match r {
+            Ok(ProbeOutcome::Ok) => "0".to_string(),
+            Ok(ProbeOutcome::Errno(n)) => n.to_string(),
+            Ok(ProbeOutcome::Unsupported) => "unsupported".to_string(),
+            Ok(ProbeOutcome::Failed) => "failed".to_string(),
+            Err(_) => "precondition".to_string(),
+        }
+    }
+
+    /// mountinfo の `/sys` の行数（mountpoint がちょうど `/sys`）と、最上位（最後の行）の per-mount options。
+    fn sys_stack_and_top(mountinfo: &str) -> Result<(usize, Option<Vec<String>>), String> {
+        let mnts = parse_mountinfo(mountinfo)?;
+        let stack = mnts.iter().filter(|m| m.mountpoint == "/sys").count();
+        let top = mnts
+            .iter()
+            .rev()
+            .find(|m| m.mountpoint == "/sys")
+            .map(|m| m.opts.clone());
+        Ok((stack, top))
+    }
+
+    /// `/sys` の最上位が ro か（読めなければ `None`）。ホスト側で ro なら、rbind に後から付けた ro が外せなくても
+    /// 仮説（ロックされない）とは別の理由であり、結果の解釈が変わる。
+    fn host_sys_read_only(mountinfo: &str) -> Option<bool> {
+        let (_, top) = sys_stack_and_top(mountinfo).ok()?;
+        top.map(|o| o.iter().any(|x| x == "ro"))
+    }
+
+    /// `ro-clear` の観測の判定結果（`ro_clear_verdict`）。
+    #[derive(Debug, PartialEq, Eq)]
+    struct RoClearVerdict {
+        /// 防御なしの試行の語彙。
+        undefended: String,
+        /// `/sys` の行数。
+        stack: usize,
+    }
+
+    /// 観測テキストを判定する（特権不要の純関数）。防御あり側は `EPERM`（1）を要求し、防御なし側は測定対象のため
+    /// errno の値を問わない（ただし測定不成立の語彙と、語彙外の値は失敗）。
+    fn ro_clear_verdict(text: &str) -> Result<RoClearVerdict, String> {
+        let get = |k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{k}=")))
+                .ok_or_else(|| format!("missing observation {k}"))
+        };
+        let stack: usize = get("sys_stack")?
+            .parse()
+            .map_err(|_| "sys_stack is not a number".to_string())?;
+        let undefended = get("ro_clear_errno")?.to_string();
+        let numeric = undefended.parse::<i32>().is_ok();
+        if !numeric && !UNDEFENDED_WORDS.contains(&undefended.as_str()) {
+            return Err(format!("unknown ro_clear_errno value {undefended:?}"));
+        }
+        if matches!(
+            undefended.as_str(),
+            "unsupported" | "failed" | "precondition"
+        ) {
+            return Err(format!(
+                "the undefended measurement was not taken (ro_clear_errno={undefended})"
+            ));
+        }
+        let defended = get("ro_clear_defended_errno")?;
+        if defended != "1" {
+            return Err(format!(
+                "the defended attempt must fail with EPERM (1), got {defended:?}"
+            ));
+        }
+        if undefended == "0" {
+            for k in ["top_ro_after_clear", "children_ro_after_clear"] {
+                get(k)?;
+            }
+        }
+        Ok(RoClearVerdict { undefended, stack })
+    }
+
+    /// `ro-clear` の防御なしの測定（`CgroupJoin` のフックから呼ぶ）。書き込みは一切しない。
+    fn observe_ro_clear_undefended(writer: &mut std::io::PipeWriter) {
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        match sys_stack_and_top(&mountinfo) {
+            Ok((stack, top)) => {
+                writeln!(writer, "sys_stack={stack}").expect("write");
+                writeln!(writer, "top_opts={:?}", top.unwrap_or_default().join(","))
+                    .expect("write");
+            }
+            Err(e) => writeln!(writer, "mountinfo_error={e}").expect("write"),
+        }
+        let outcome = probe_clear_sysfs_readonly_for_test();
+        let word = render_clear_outcome(&outcome);
+        writeln!(writer, "ro_clear_errno={word}").expect("write");
+        if word != "0" {
+            return;
+        }
+        // 外せた場合: mountinfo を読み直し、書き込み用 open の errno だけを観測する（書かない）。
+        let after = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let top_ro = host_sys_read_only(&after);
+        writeln!(
+            writer,
+            "top_ro_after_clear={}",
+            top_ro.map_or("unknown".to_string(), |b| b.to_string())
+        )
+        .expect("write");
+        let children = parse_mountinfo(&after)
+            .map(|m| {
+                m.into_iter()
+                    .filter(|x| x.mountpoint.starts_with("/sys/"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let children_ro = children.iter().all(|m| m.opts.iter().any(|o| o == "ro"));
+        writeln!(writer, "children_after_clear={}", children.len()).expect("write");
+        writeln!(writer, "children_ro_after_clear={children_ro}").expect("write");
+        for p in WRITE_TARGETS
+            .iter()
+            .copied()
+            .chain(["/sys/fs/cgroup/cgroup.procs"])
+        {
+            if std::fs::symlink_metadata(p).is_ok() {
+                writeln!(
+                    writer,
+                    "open_w_errno_after_clear:{p}={}",
+                    open_for_write_errno(p)
+                )
+                .expect("write");
+            }
+        }
+    }
+
+    /// シナリオ `ro-clear`（SEC-2・SEC-1・#2305）。
+    fn run_ro_clear() {
+        let rootfs = make_rootfs();
+        let (root, egid) = isolate_self();
+        if root {
+            println!(
+                "sysfs_mount: ro-clear not applicable (fresh sysfs in the initial user namespace) (root={root})"
+            );
+            return;
+        }
+        let spec = sysfs_spec();
+        let gid_map = single_id_mapping(egid).expect("single id mapping");
+        let (mut reader, writer) = std::io::pipe().expect("create pipe");
+        let mut hook_writer = writer.try_clone().expect("clone pipe writer");
+        let stages = StagePipeline::new()
+            .with_hook(StageKind::CgroupJoin, move || {
+                observe_ro_clear_undefended(&mut hook_writer);
+                Ok(())
+            })
+            .expect("register the undefended probe hook");
+        let child = spawn_container_probe_with_sysfs(
+            &rootfs.0,
+            stages,
+            DevptsGidSource::Rootless(&gid_map),
+            &spec,
+            move || {
+                // 組み込みの制限段（capability 削減・seccomp）の通過後。本番と同じ防御の下での同じ試行。
+                let mut w = writer;
+                let word = render_clear_outcome(&probe_clear_sysfs_readonly_for_test());
+                writeln!(w, "ro_clear_defended_errno={word}").expect("write");
+            },
+        )
+        .unwrap_or_else(|e| panic!("spawn: {e}"));
+        let exit = child.wait_timeout(timeout()).unwrap_or_else(|e| {
+            let _ = child.kill_and_reap(Duration::from_secs(5));
+            panic!("wait: {e}")
+        });
+        assert!(
+            matches!(exit, ChildExit::Exited(0)),
+            "child must exit with 0, got {exit:?}"
+        );
+        let mut text = String::new();
+        reader
+            .by_ref()
+            .take(64 * 1024)
+            .read_to_string(&mut text)
+            .expect("read observations");
+        for l in text.lines() {
+            println!("sysfs_mount: ro-clear observation: {l}");
+        }
+        let verdict = ro_clear_verdict(&text).unwrap_or_else(|e| panic!("{e}:\n{text}"));
+        verify_host_untouched(&rootfs.0);
+        println!(
+            "sysfs_mount: ro-clear on /sys top mount (stack={}): undefended={}, defended errno=1 (root={root})",
+            verdict.stack, verdict.undefended
+        );
+    }
+
+    /// 子プロセスを期限付きで待つ。期限超過なら kill して回収し `None`（REPAIR-5）。
+    fn wait_deadline(
+        child: &mut std::process::Child,
+        limit: Duration,
+    ) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + limit;
+        loop {
+            match child.try_wait().expect("try_wait") {
+                Some(status) => return Some(status),
+                None if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    /// `--ignored` 時の入口。ホストの `/sys` の状態を出力し、シナリオを別プロセスで順に実行する。
+    /// 自身は分離しない（入れ子の user namespace で測ってしまうため）。
+    pub fn dispatch() {
+        let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").expect("mountinfo");
+        println!(
+            "sysfs_mount: host /sys read-only={}",
+            host_sys_read_only(&mountinfo).map_or("unknown".to_string(), |b| b.to_string())
+        );
+        let exe = std::env::current_exe().expect("current_exe");
+        // シナリオ内の子待ち（`timeout()`）より長い期限にして、シナリオ側の失敗報告を優先させる。
+        let limit = timeout() + Duration::from_secs(15);
+        for id in ["default", "ro-clear"] {
+            let mut child = std::process::Command::new(&exe)
+                .args(["--scenario", id])
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn scenario");
+            let status = wait_deadline(&mut child, limit)
+                .unwrap_or_else(|| panic!("scenario {id} timed out"));
+            assert!(status.success(), "scenario {id} failed: {status:?}");
+        }
+    }
+
+    /// シナリオ 1 つを実行する（再 exec された子から呼ばれる）。
+    pub fn scenario(id: &str) {
+        match id {
+            "default" => run(),
+            "ro-clear" => run_ro_clear(),
+            other => panic!("unknown scenario {other:?}"),
+        }
     }
 
     /// OCI 既定の sysfs の指定（`start` が検証するのと同じ変換）。

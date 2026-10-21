@@ -296,6 +296,10 @@ pub use seccomp_listener::{UserNotifProbe, kcmp_self_errno_for_test, user_notif_
 pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 pub use subreaper::ChildSubreaper;
+/// 結合試験 `tests/sysfs_mount.rs` の `ro-clear` シナリオ専用の再公開（SEC-2・SEC-1・#2305。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(feature = "escape-probe")]
+#[doc(hidden)]
+pub use sysfs::probe_clear_sysfs_readonly_for_test;
 pub use sysfs::{SysfsReport, SysfsSource, mount_sysfs, select_sysfs_source};
 pub use tmpfs::{TmpfsMountOutcome, TmpfsReport, mount_tmpfs};
 /// 結合試験 `tests/tmpfs_mount.rs` 専用の再公開（SUP-12・TASK-169 追補・#1472・#1669 事後監査 P2。通常の利用者は呼ばない。

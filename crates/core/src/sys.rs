@@ -2462,9 +2462,11 @@ pub(crate) fn open_tree_clone_bind(
 }
 
 /// `mount_setattr(2)` の `struct mount_attr`（include/uapi/linux/mount.h。`MOUNT_ATTR_SIZE_VER0` = 32 バイト）。
-/// 値は [`rootfs_nodev_mount_attr`]・[`read_only_mount_attr`]・[`bind_mount_attr`] だけが作る（任意のビットを渡す経路を持たない。REPAIR-2・SEC-1）。
+/// 値は [`rootfs_nodev_mount_attr`]・[`read_only_mount_attr`]・[`bind_mount_attr`] と、`escape-probe` feature 限定の
+/// `clear_read_only_probe_mount_attr` だけが作る（任意のビットを渡す経路を持たない。REPAIR-2・SEC-1）。
 ///
-/// 構築子はどれも private な `const fn` で、`attr_clr`・`propagation`・`userns_fd` は 0（属性を足すだけ・伝播は変えない）。
+/// 構築子はどれも private な `const fn` で、`propagation`・`userns_fd` は 0（伝播は変えない）。本番の 3 つは `attr_clr` も 0（属性を足すだけ）。
+/// 試験専用の 1 つだけが `attr_clr` = `MOUNT_ATTR_RDONLY`（ro を外す。#2305）。
 /// 構築子を足す・変えるときは、[`mount_setattr_empty_path_raw`] の `// SAFETY:` と、構築子の一覧と値を具体値で
 /// 照合する単体テスト `sec1_sup12_mount_attr_constructors_are_exhaustive` を合わせて更新すること（#1693 の事後監査 P3）。
 #[repr(C)]
@@ -2494,6 +2496,23 @@ const fn read_only_mount_attr() -> MountAttr {
     MountAttr {
         attr_set: consts::MOUNT_ATTR_RDONLY as u64,
         attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    }
+}
+
+/// 試験専用: ro を外す属性（`attr_clr` = `MOUNT_ATTR_RDONLY`）。`escape-probe` feature 限定で、通常ビルドには存在しない。
+///
+/// rootless の `/sys` の rbind（ホストの `/sys` を複製して後から ro を付けたもの）の最上位の ro が、user namespace の
+/// root から外せるかを実機で測る結合試験 `tests/sysfs_mount.rs` の `ro-clear` シナリオ専用（#2305・SEC-2・SEC-1）。
+/// 本番の属性設定が `attr_clr` = 0 である不変条件の唯一の例外で、呼び出しは
+/// `exec::probe_clear_sysfs_readonly_for_test` の前提検査（PID 1・rbind 経路の user namespace）を通った後に限る。
+/// 外すのは ro だけで、`nosuid`・`nodev`・`noexec` と伝播には触れない。
+#[cfg(feature = "escape-probe")]
+const fn clear_read_only_probe_mount_attr() -> MountAttr {
+    MountAttr {
+        attr_set: 0,
+        attr_clr: consts::MOUNT_ATTR_RDONLY as u64,
         propagation: 0,
         userns_fd: 0,
     }
@@ -2602,6 +2621,39 @@ pub(crate) fn bind_mount_call_params(
     )
 }
 
+/// 単体テストの dry-run が記録する、[`clear_mount_read_only_probe`] と同じ値の組（[`rootfs_nodev_call_params`] と同形）。
+#[cfg(all(test, feature = "escape-probe"))]
+pub(crate) fn clear_read_only_probe_call_params() -> (u64, u64, u64, u64, u32, usize) {
+    let a = clear_read_only_probe_mount_attr();
+    (
+        a.attr_set,
+        a.attr_clr,
+        a.propagation,
+        a.userns_fd,
+        mount_setattr_flags(),
+        std::mem::size_of::<MountAttr>(),
+    )
+}
+
+/// 試験専用: `mount_root`（マウントのルートを指す fd）のマウント 1 枚から ro を外す（`mount_setattr(2)`。再帰なし）。
+///
+/// rootless の `/sys` の rbind の最上位の ro が user namespace の root から外せるかの実機測定（#2305・SEC-2・SEC-1）のためだけに
+/// 存在し、`escape-probe` feature 限定。呼び出し元は `exec::probe_clear_sysfs_readonly_for_test` で、前提検査
+/// （PID 1・rbind 経路の user namespace）を通らない限り本関数は呼ばれない。パスは渡さず `AT_EMPTY_PATH` で fd 自身を対象にする。
+/// 新規 `unsafe` は無く、既存の [`mount_setattr_empty_path_raw`] を再利用する。成功すれば ro は外れる（測定対象の事象）。
+///
+/// # 将来仕様（記録のみ）
+///
+/// 測定後に廃止するか、恒久的な試験へ置き換える（REPAIR-3）。
+#[cfg(feature = "escape-probe")]
+pub(crate) fn clear_mount_read_only_probe(mount_root: BorrowedFd<'_>) -> Result<(), SysError> {
+    mount_setattr_empty_path_raw(
+        mount_root.as_raw_fd(),
+        clear_read_only_probe_mount_attr(),
+        mount_setattr_flags(),
+    )
+}
+
 /// `mount`（[`open_tree_clone_bind`] が返した切り離したマウントの fd）に、bind mount の属性を足す
 /// （`mount_setattr(2)`。CORE-1・SEC-1・REPAIR-2・TASK-29 追補・#1912。呼び出し元は適用の段〔#1913〕）。
 ///
@@ -2691,10 +2743,11 @@ fn mount_setattr_empty_path_raw(fd: RawFd, attr: MountAttr, flags: u32) -> Resul
     let nr = consts::SYS_MOUNT_SETATTR.get()?;
     // SAFETY: `fd` は fd 番号の整数で、カーネルが検証する（無効なら `EBADF`）。パスは静的な空文字列（NUL 終端）で、
     // `AT_EMPTY_PATH` により fd 自身が対象になる。`attr` は呼び出しの間生存する 32 バイトの `repr(C)` で、
-    // カーネルは読むだけ（`size` は構造体の大きさ）。`attr` は `attr_clr` = 0 の private な固定 const 構築子
-    // （`rootfs_nodev_mount_attr`・`read_only_mount_attr`・`bind_mount_attr`）の値だけが渡り、`flags` も private な
+    // カーネルは読むだけ（`size` は構造体の大きさ）。`attr` は private な固定 const 構築子
+    // （本番は `attr_clr` = 0 の `rootfs_nodev_mount_attr`・`read_only_mount_attr`・`bind_mount_attr`、`escape-probe` feature 限定で
+    // `attr_clr` = `MOUNT_ATTR_RDONLY` だけの `clear_read_only_probe_mount_attr`）の値だけが渡り、`flags` も private な
     // フラグ関数の値だけ（`AT_RECURSIVE` は `MountTreeScope::Recursive` のときに限る）。副作用は fd が指すマウント
-    // （再帰時は配下全体）への属性の追加に限る（既存の属性は外さず、伝播も変えない）。
+    // （再帰時は配下全体）への属性の追加に限る（本番は既存の属性を外さず、伝播も変えない。試験専用の構築子は ro だけを外す）。
     // 構築子を足すときは本コメントと構築子一覧の試験を更新する。
     let rc = unsafe {
         syscall(
@@ -6208,6 +6261,11 @@ mod tests {
                 (0x1, 0, 0, 0, 0x1000, 32),
                 "SUP-12 #1620: rdonly だけを足す"
             );
+            assert_eq!(
+                clear_read_only_probe_call_params(),
+                (0, 0x1, 0, 0, 0x1000, 32),
+                "SEC-2 #2305: ro だけを外す（再帰なし）"
+            );
             // AT_RECURSIVE（0x8000）は付けない。
             assert_eq!(mount_setattr_flags() & 0x8000, 0);
         }
@@ -6229,6 +6287,10 @@ mod tests {
             ("rootfs_nodev_mount_attr", fields(rootfs_nodev_mount_attr())),
             ("read_only_mount_attr", fields(read_only_mount_attr())),
             ("bind_mount_attr", bind_fields),
+            (
+                "clear_read_only_probe_mount_attr",
+                fields(clear_read_only_probe_mount_attr()),
+            ),
         ];
         assert_eq!(
             listed,
@@ -6236,6 +6298,8 @@ mod tests {
                 ("rootfs_nodev_mount_attr", (0x4, 0, 0, 0)),
                 ("read_only_mount_attr", (0x1, 0, 0, 0)),
                 ("bind_mount_attr", (0x7, 0, 0, 0)),
+                // 試験専用（`escape-probe`。#2305）: 唯一 `attr_clr` を持ち、ro のビット（0x1）だけを外す。
+                ("clear_read_only_probe_mount_attr", (0, 0x1, 0, 0)),
             ],
             "attr_set, attr_clr, propagation, userns_fd"
         );
@@ -6253,17 +6317,18 @@ mod tests {
             vec![
                 "rootfs_nodev_mount_attr",
                 "read_only_mount_attr",
+                "clear_read_only_probe_mount_attr",
                 "bind_mount_attr"
             ]
         );
         let functions_returning_attr = body.lines().filter(|l| l.contains("-> MountAttr")).count();
         assert_eq!(
-            functions_returning_attr, 3,
+            functions_returning_attr, 4,
             "no other MountAttr constructor"
         );
         let literals = body.lines().filter(|l| l.trim() == "MountAttr {").count();
         assert_eq!(
-            literals, 3,
+            literals, 4,
             "MountAttr is built only in the listed constructors"
         );
     }

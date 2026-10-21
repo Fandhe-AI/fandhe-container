@@ -54,12 +54,17 @@ use super::image::{Stage, trait_failure};
 /// （FNV-1a 64 を異なる初期値で 2 本。暗号学的ハッシュではなく、同一利用者の状態ルート同士の区別用）
 /// を作り、キーを `<hex>.<id>` にする。
 pub(super) fn state_scope(root: &StateRoot) -> String {
+    let bytes = root.path().as_os_str().as_encoded_bytes();
+    state_hash(bytes)
+}
+
+/// 32 桁の小文字 hex（FNV-1a 64 を異なる初期値で 2 本）。
+fn state_hash(bytes: &[u8]) -> String {
     fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
         bytes.iter().fold(seed, |h, b| {
             (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3)
         })
     }
-    let bytes = root.path().as_os_str().as_encoded_bytes();
     format!(
         "{:016x}{:016x}",
         fnv1a(0xcbf2_9ce4_8422_2325, bytes),
@@ -80,8 +85,24 @@ impl<'a> StoreImageRefs<'a> {
     }
 
     fn ref_id(&self, id: &ContainerId) -> Result<ContainerRefId, TraitError> {
-        ContainerRefId::new(&format!("{}.{}", self.scope, id.as_str())).map_err(fail)
+        ContainerRefId::new(&ref_key(self.scope, id.as_str())).map_err(fail)
     }
+}
+
+/// 参照キーの上限（`ContainerRefId` と同じ 255 バイト）。
+const REF_KEY_MAX: usize = 255;
+
+/// 状態ルートの `scope` とコンテナ ID から参照キーを作る（create / delete / 停止中スナップショットで共有）。
+///
+/// 通常は `<scope>.<id>`。接頭辞を足すと 255 バイトを超える長い ID（223 バイト以上）は
+/// `<scope>-<id の 32 桁 hex>` に畳む。区切りが `.` と `-` で違うため、通常形と畳んだ形は衝突しない。
+/// 結果は常に `[A-Za-z0-9._-]` かつ 255 バイト以下で、変換は失敗しない。
+pub(super) fn ref_key(scope: &str, id: &str) -> String {
+    let plain = format!("{scope}.{id}");
+    if plain.len() <= REF_KEY_MAX {
+        return plain;
+    }
+    format!("{scope}-{}", state_hash(id.as_bytes()))
 }
 
 fn fail(e: OciError) -> TraitError {
@@ -302,6 +323,31 @@ mod tests {
             ImageRefRelease::NotRegistered
         );
         assert_eq!(a.registration(&cid("c1")).expect("kept"), Some(g));
+    }
+
+    /// OCI-7: 223 バイト以上・255 バイトの長い ID も register / bind / release が通り、別 ID と混ざらない。
+    #[test]
+    fn oci7_long_ids_round_trip() {
+        let tmp = Tmp::new("long");
+        let store = seeded(tmp.path(), &[MANIFEST]);
+        let refs = StoreImageRefs::new(&store, SCOPE);
+        for len in [222usize, 223, 254, 255] {
+            let a = cid(&"a".repeat(len));
+            let b = cid(&format!("{}b", "a".repeat(len - 1)));
+            refs.register(&a, &mdigest(MANIFEST)).expect("register");
+            let g = refs.bind(&a).expect("bind");
+            assert_eq!(refs.registration(&a).expect("reg"), Some(g));
+            assert_eq!(refs.registration(&b).expect("other"), None);
+            assert_eq!(
+                refs.release(&a).expect("release"),
+                ImageRefRelease::Released
+            );
+        }
+        assert!(ref_key(SCOPE, &"a".repeat(255)).len() <= 255);
+        assert_ne!(
+            ref_key(SCOPE, &"a".repeat(255)),
+            ref_key(SCOPE, &"a".repeat(254))
+        );
     }
 
     /// OCI-7: 状態ルートの識別子は決定的で、パスが違えば変わり、キー全体が ID の上限に収まる。

@@ -1637,3 +1637,173 @@ fn cli1_image_tag_fails_closed_off_linux() {
     );
     assert!(!root.exists());
 }
+/// OCI-7・CLI-1・#2315: create / delete の `--image-root` / `--image` の使い方の誤りは、
+/// 3 OS 同一に core 到達前の使用法エラー（終了コード 2）になる。
+#[test]
+fn oci7_image_option_usage_errors() {
+    let tmp = TmpDir::new("oci7-usage");
+    let root_s = tmp.0.to_str().expect("utf8").to_string();
+    let digest = format!("sha256:{}", "a".repeat(64));
+    for args in [
+        // --image-root だけ・--image だけ。
+        vec!["create", "--bundle", "/b", "--image-root", &root_s, "c1"],
+        vec!["create", "--bundle", "/b", "--image", &digest, "c1"],
+        // 相対パスの --image-root。
+        vec![
+            "create",
+            "--bundle",
+            "/b",
+            "--image-root",
+            "rel",
+            "--image",
+            &digest,
+            "c1",
+        ],
+        // 重複指定。
+        vec![
+            "create",
+            "--bundle",
+            "/b",
+            "--image-root",
+            &root_s,
+            "--image-root",
+            &root_s,
+            "--image",
+            &digest,
+            "c1",
+        ],
+        vec!["delete", "--image-root", "rel", "c1"],
+        vec![
+            "delete",
+            "--image-root",
+            &root_s,
+            "--image-root",
+            &root_s,
+            "c1",
+        ],
+        vec!["delete", "--image-root"],
+    ] {
+        let out = run(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), USAGE_JSON, "{args:?}");
+    }
+}
+
+/// OCI-7・ERR-1・ERR-2・#2315: Linux で、不正な在庫・ストアルート・digest での create は core に入る前に
+/// 構造化エラーと非ゼロ終了コードで終わり、状態ルートにコンテナを作らない。delete は失敗しても状態を保持する。
+#[cfg(target_os = "linux")]
+#[test]
+fn oci7_image_failures_keep_state_on_linux() {
+    let tmp = TmpDir::new("oci7-flow");
+    let bundle = tmp.0.join("bundle");
+    std::fs::create_dir(&bundle).expect("bundle");
+    std::fs::create_dir(bundle.join("rootfs")).expect("rootfs");
+    std::fs::write(
+        bundle.join("config.json"),
+        r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
+    )
+    .expect("config");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+    let bundle_s = bundle.to_str().expect("utf8");
+    let missing = tmp.0.join("no-such-image-root");
+    let missing_s = missing.to_str().expect("utf8");
+    let digest = format!("sha256:{}", "a".repeat(64));
+
+    // 不正な digest: INVALID_ARGUMENT（2）。
+    let out = run(&[
+        "--root",
+        root_s,
+        "create",
+        "--bundle",
+        bundle_s,
+        "--image-root",
+        missing_s,
+        "--image",
+        "sha256:xyz",
+        "c1",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(
+        op_and_code(&out),
+        ("create".into(), "INVALID_ARGUMENT".into())
+    );
+    assert!(out.stdout.is_empty());
+
+    // 存在しないストアルート: NOT_FOUND（3）・固定文言でパスを含まない。
+    let out = run(&[
+        "--root",
+        root_s,
+        "create",
+        "--bundle",
+        bundle_s,
+        "--image-root",
+        missing_s,
+        "--image",
+        &digest,
+        "c1",
+    ]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(op_and_code(&out), ("create".into(), "NOT_FOUND".into()));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains(missing_s));
+    assert!(
+        !root.join("c1").exists(),
+        "no container state must be created"
+    );
+
+    // 在庫に無い digest（空のストア）: 構造化エラーで失敗し、状態は作られない。
+    let store = tmp.0.join("images");
+    std::fs::create_dir(&store).expect("images");
+    let store_s = store.to_str().expect("utf8");
+    let out = run(&[
+        "--root",
+        root_s,
+        "create",
+        "--bundle",
+        bundle_s,
+        "--image-root",
+        store_s,
+        "--image",
+        &digest,
+        "c1",
+    ]);
+    assert_ne!(out.status.code(), Some(0));
+    let (op, code) = op_and_code(&out);
+    assert_eq!(op, "create");
+    assert_eq!(code, "NOT_FOUND");
+    assert!(!root.join("c1").join("state.json").exists());
+
+    // delete: 存在しないストアルートでは状態を消さずに NOT_FOUND（3）。
+    assert_failure_free(&run(&[
+        "--root", root_s, "create", "--bundle", bundle_s, "c1",
+    ]));
+    let out = run(&["--root", root_s, "delete", "--image-root", missing_s, "c1"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(op_and_code(&out), ("delete".into(), "NOT_FOUND".into()));
+    assert!(root.join("c1").join("state.json").exists());
+
+    // --force との組み合わせでも、開けないストアでは状態を保持する。
+    let out = run(&[
+        "--root",
+        root_s,
+        "delete",
+        "--force",
+        "--image-root",
+        missing_s,
+        "c1",
+    ]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(root.join("c1").join("state.json").exists());
+
+    // 開ける（空の）ストアでの delete は成功し、状態が消える（登録の無い参照の解除は成功扱い）。
+    assert_failure_free(&run(&[
+        "--root",
+        root_s,
+        "delete",
+        "--image-root",
+        store_s,
+        "c1",
+    ]));
+    assert!(!root.join("c1").join("state.json").exists());
+}

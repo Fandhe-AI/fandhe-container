@@ -11,7 +11,7 @@
 //! も実装済み。`delete`（TASK-30.2・TASK-30.3）は cgroup（依存注入する `ContainerCgroupRemover`。Linux の
 //! 本番実装は `cgroups::DelegatedCgroup`）と `StateStore` のレコード（状態ファイル）を削除する。OCI-7 の
 //! 参照登録・解除は `create_with_image` / `delete_releasing_image_ref`（TASK-183.8.1。依存注入する
-//! `ContainerImageRefs` 経由）が担い、本番のアダプタと CLI / plugin からの配線は未実装である
+//! `ContainerImageRefs` 経由）が担い、本番のアダプタは cli の `StoreImageRefs`（#2315）で CLI から配線済み、plugin 経由の配線は未実装である
 //! （REPAIR-3: 実装済みを装わない）。イメージのレイヤーを rootfs へ展開する依存注入口 `ImageRootfsUnpacker`
 //! （#2342）も同様で、`create_with_image` が展開先の作成・展開・失敗時の後始末を担い、本番の展開器は未実装である。モジュールは
 //! `cfg(target_os)` を付けず 3 OS でビルドされる（CLI-1）。

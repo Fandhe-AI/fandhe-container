@@ -14,7 +14,7 @@
 //! 本ファイルのトレイトを oci 側（または両方に依存する上位 crate）が `ImageStore` で満たす。
 //! `ContainerId` と oci の `ContainerRefId` は同じ規則、[`ImageManifestDigest`] は oci の `Digest::parse` と
 //! 同じ形（`sha256:` ＋ 64 桁の小文字 hex）だけを受けるので、アダプタの変換は失敗しない。
-//! 本番のアダプタと CLI / plugin からの配線は後続の作業で、未実装である（REPAIR-3）。
+//! 本番のアダプタは cli の `image_refs::StoreImageRefs`（暫定の置き場所。#2315）で、CLI の `create --image-root --image` / `delete --image-root` が配線する。plugin 経由の配線は未実装（REPAIR-3）。
 //! 上位のアダプタは [`ContainerImageRefs`] と [`ImageRootfsUnpacker`] の両方を `ImageStore` で満たし、
 //! `ContainerImage::new(..).with_unpacker(..)` で create へ渡す（展開の順序・展開先の作成・後始末は core の担当。#2342・#2315）。
 

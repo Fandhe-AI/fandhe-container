@@ -1,11 +1,11 @@
-//! `fandhe_container_stack::schema` の公開パス経由の結合試験（STACK-1・TASK-149.2・#584・REPAIR-12）。
+//! `fandhe_container_stack::schema` の公開パス経由の結合試験（STACK-1・TASK-149.2・#584・TASK-149.3・#585・REPAIR-12）。
 //!
 //! 6 テーブル（project・services・networks・volumes・secrets・configs）の読み込みと、
 //! 書き出し・再読み込みの往復を具体値で照合する。parse / serialize の公開入口は
-//! TASK-149.3 以降のため、`toml` を直接使う。
+//! 後続のため、`toml` を直接使う。
 
 use fandhe_container_stack::schema::{
-    ComposeToml, Config, Network, Project, Secret, Service, Volume,
+    ComposeToml, Config, DependsOnCondition, Network, Project, Secret, Service, Volume,
 };
 
 const DOC: &str = r#"
@@ -13,6 +13,14 @@ const DOC: &str = r#"
 name = "demo"
 
 [services.web]
+image = "example/web:1"
+ports = ["8080:8080/tcp"]
+
+[services.web.depends_on]
+db = "healthy"
+
+[services.db]
+image = "example/db:1"
 
 [networks.backend]
 driver = "bridge"
@@ -39,8 +47,16 @@ fn stack_1_public_api_parses_six_tables() {
             name: Some("demo".into())
         })
     );
-    assert_eq!(parsed.services.len(), 1);
-    assert_eq!(parsed.services.get("web"), Some(&Service {}));
+    assert_eq!(parsed.services.len(), 2);
+    assert_eq!(
+        parsed.services.get("web"),
+        Some(&Service {
+            image: Some("example/web:1".into()),
+            ports: vec!["8080:8080/tcp".into()],
+            depends_on: [("db".to_string(), DependsOnCondition::Healthy)].into(),
+            ..Service::default()
+        })
+    );
     assert_eq!(
         parsed.networks.get("backend"),
         Some(&Network {
@@ -81,6 +97,10 @@ fn stack_1_public_api_roundtrip_is_stable() {
     assert_eq!(toml::to_string(&back).expect("serialize again"), text);
     assert!(
         text.contains("driver = \"io-share\""),
+        "unexpected output: {text}"
+    );
+    assert!(
+        text.contains("db = \"healthy\""),
         "unexpected output: {text}"
     );
     assert!(

@@ -123,7 +123,7 @@
 //! - 呼び出し側の契約: 展開するプロセスは初期 user namespace にいて `CAP_CHOWN` を持つ（典型はホスト root）。
 //!   ホストの非特権ユーザーは subuid 範囲の ID へ `chown` できず、`EPERM` は `PermissionDenied` で失敗する。
 //!   写像はコンテナを起動するときの user namespace の写像（core の `rootless_mapping`・`/etc/subuid` から作ったもの）と
-//!   同じものを渡す。非 Linux は展開の開始前に `Unimplemented` で拒否する（黙って飛ばさない）。
+//!   同じものを渡す（cli の `image_ownership` が start と同じ解決部品から作る。#2389）。非 Linux は展開の開始前に `Unimplemented` で拒否する（黙って飛ばさない）。
 //! - 検証: 写像に無い ID は `PermissionDenied`、解析できない ID は `InvalidArgument`。パス 1 で
 //!   そのレイヤーの書き込みより前に拒否する（グローバル PAX の取り込みもパス 3 と同じ規則）。
 //! - 順序: 通常ファイルは書き込み後に `fchown` し、所有者を読み戻して一致を確かめてから（不一致は

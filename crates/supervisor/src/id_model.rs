@@ -29,6 +29,7 @@
 //! # doctor との共用
 //! 設定ファイルの既定位置（`SYSTEM_*`）・passwd の読み取り（`read_owner_name`）・subuid / subgid の分類
 //! （`probe_sub_id_file`）は Linux 限定で公開し、`start`（`start_entry` の `resolve_launch_privilege`）と
+//! pull 時の展開の所有者（cli の `image_ownership`。`resolve_rootless_id_source`。#2389）と
 //! CLI の `doctor`（`doctor::id_mapping_check`。#2387）が同じ関数を呼ぶ。診断と `start` の判定を食い違わせない。
 //!
 //! エラー文言は固定の英語で、ユーザー名・パス・errno・ファイルの内容を含めない。
@@ -180,6 +181,49 @@ pub fn probe_sub_id_file(
     }
 }
 
+/// 所有者の解決の結果(`resolve_rootless_id_source`)。start の権限モデルと pull 時の展開の写像の両方の入力になる。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub enum RootlessIdResolution {
+    /// コンテナ 0 → 自 ID の 1 対 1(subuid / subgid の設定が無いホスト)。
+    SingleId,
+    /// 範囲写像。入力元は probe したのと同じ subuid / subgid を読む。
+    SubordinateIds(fandhe_container_core::oci_runtime::SubordinateIdSource),
+}
+
+/// passwd から所有者名を得て、subuid / subgid を分類し、モデルと範囲写像の入力元を決める(NSS を使わない)。
+///
+/// rootless の start(`start_entry` の `resolve_launch_privilege`)と、pull 時の展開の所有者(cli の
+/// `image_ownership`。#2389・SEC-5・CORE-6・OCI-1)が同じこの関数を呼び、所有者の解決を食い違わせない。
+/// rootful(uid 0)の判定は呼び出し側が先に行う。`real` / `effective` は start する利用者の uid。
+/// 名前が規則に違反する行は `SingleId` へ黙って落とさず拒否する。
+#[cfg(target_os = "linux")]
+pub fn resolve_rootless_id_source(
+    real: u32,
+    effective: u32,
+    passwd: &std::path::Path,
+    subuid: &std::path::Path,
+    subgid: &std::path::Path,
+) -> Result<RootlessIdResolution, TraitError> {
+    use fandhe_container_core::oci_runtime::SubordinateIdSource;
+    use fandhe_container_core::rootless::SubIdOwner;
+    let name = read_owner_name(passwd, effective)?;
+    let owner = SubIdOwner::new(effective, name.clone())
+        .map_err(|_| precondition("the owner name is not usable for subordinate ids"))?;
+    let model = select_rootless_id_model(
+        probe_sub_id_file(subuid, &owner),
+        probe_sub_id_file(subgid, &owner),
+        real,
+        effective,
+    )?;
+    match model {
+        RootlessIdModel::SingleId => Ok(RootlessIdResolution::SingleId),
+        RootlessIdModel::SubordinateIds => Ok(RootlessIdResolution::SubordinateIds(
+            SubordinateIdSource::with_id_files(name, subuid, subgid)?,
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::SubIdFileProbe::{Absent, Assigned, NoOwnerRows, Unusable};
@@ -291,6 +335,56 @@ mod tests {
         use super::super::*;
         use fandhe_container_core::rootless::SubIdOwner;
         use std::path::PathBuf;
+
+        /// 解決の入力一式を一時ディレクトリへ置く。
+        fn resolve(
+            tag: &str,
+            subuid: Option<&str>,
+            subgid: Option<&str>,
+        ) -> (Result<RootlessIdResolution, TraitError>, PathBuf) {
+            let d = tmp(tag);
+            std::fs::write(d.join("passwd"), "alice:x:1000:1000::/h:/bin/sh\n").unwrap();
+            for (n, b) in [("subuid", subuid), ("subgid", subgid)] {
+                if let Some(b) = b {
+                    std::fs::write(d.join(n), b).unwrap();
+                }
+            }
+            let r = resolve_rootless_id_source(
+                1000,
+                1000,
+                &d.join("passwd"),
+                &d.join("subuid"),
+                &d.join("subgid"),
+            );
+            (r, d)
+        }
+
+        /// CORE-6・SEC-5(#2389): 設定なし → 1 対 1、両方あり → 範囲写像、片側のみ → 拒否。
+        #[test]
+        fn core6_resolve_rootless_id_source_cases() {
+            let (r, d) = resolve("r-single", None, None);
+            assert!(matches!(r.unwrap(), RootlessIdResolution::SingleId));
+            let _ = std::fs::remove_dir_all(&d);
+            let (r, d) = resolve(
+                "r-sub",
+                Some("alice:100000:65536\n"),
+                Some("alice:200000:65536\n"),
+            );
+            match r.unwrap() {
+                RootlessIdResolution::SubordinateIds(src) => {
+                    let maps = src.resolve_id_maps(1000, 1000).unwrap();
+                    assert_eq!(maps.uid().host_id_of(1), Some(100000));
+                    assert_eq!(maps.gid().host_id_of(1), Some(200000));
+                }
+                RootlessIdResolution::SingleId => panic!("expected a ranged mapping"),
+            }
+            let _ = std::fs::remove_dir_all(&d);
+            let (r, d) = resolve("r-part", Some("alice:100000:65536\n"), None);
+            let _ = std::fs::remove_dir_all(&d);
+            let e = r.unwrap_err();
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), "subordinate id configuration is incomplete");
+        }
 
         fn tmp(tag: &str) -> PathBuf {
             let d = std::env::temp_dir().join(format!(

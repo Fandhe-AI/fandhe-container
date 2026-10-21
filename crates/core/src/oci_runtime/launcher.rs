@@ -395,6 +395,62 @@ impl SubordinateIdSource {
         )
     }
 
+    /// 範囲写像の解決(`resolve_id_maps`)だけに使う入力元を、subuid / subgid のパスだけ指定して作る。
+    ///
+    /// helper のパスとタイムアウトは既定のまま。呼び出し元は supervisor の `id_model`(start と pull の展開が同じ
+    /// 解決を共有する。#2389・SEC-5・CORE-6)と試験。パスの検証は `with_paths` と同じ。
+    pub fn with_id_files(
+        owner_name: Option<String>,
+        subuid: &Path,
+        subgid: &Path,
+    ) -> Result<Self, TraitError> {
+        Self::with_paths(
+            owner_name,
+            subuid,
+            subgid,
+            Path::new("/usr/bin/newuidmap"),
+            Path::new("/usr/bin/newgidmap"),
+            DEFAULT_HELPER_TIMEOUT,
+        )
+    }
+
+    /// 起動する利用者の `uid` / `gid` について、範囲写像(コンテナ 0 → 自 ID、1.. → subordinate 範囲)を組み立てる。
+    ///
+    /// start の本番 launcher(`resolve_privilege`)と、pull 時の展開の所有者(cli の `image_ownership`。
+    /// `ChownMapped` / `ChownInUserNamespace` に渡す写像。#2389)が同じこの関数を呼ぶ。所有者の解決を
+    /// 別々に持たないための唯一の入口で、副作用は無い(helper の検証は含まない)。
+    ///
+    /// 拒否: `uid` / `gid` が 0(`PermissionDenied`。SEC-5)、範囲が 0 件(`FailedPrecondition`。単一 ID へ
+    /// 黙って縮退しない)、ホスト ID 0 を含む範囲(`PermissionDenied`)、読み取り・解析の失敗。
+    /// 文言は固定の英語で、パス・errno・ユーザー名を含めない。
+    pub fn resolve_id_maps(&self, uid: u32, gid: u32) -> Result<SubordinateIdMaps, TraitError> {
+        let fail = |code: ErrorCode| {
+            TraitError::new(
+                code,
+                "failed to resolve the subordinate id mapping for the launcher",
+            )
+        };
+        if uid == 0 || gid == 0 {
+            return Err(TraitError::new(
+                ErrorCode::PermissionDenied,
+                "refusing to map the host root identity",
+            ));
+        }
+        let owner = SubIdOwner::new(uid, self.owner_name.clone()).map_err(|e| fail(e.code))?;
+        let uid_ranges = load_subordinate_ids(&self.subuid, &owner).map_err(|e| fail(e.code))?;
+        let gid_ranges = load_subordinate_ids(&self.subgid, &owner).map_err(|e| fail(e.code))?;
+        if uid_ranges.is_empty() || gid_ranges.is_empty() {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "no subordinate id range is assigned to the launching user",
+            ));
+        }
+        Ok(SubordinateIdMaps {
+            uid: rootless_mapping(uid, &uid_ranges).map_err(|e| fail(e.code))?,
+            gid: rootless_mapping(gid, &gid_ranges).map_err(|e| fail(e.code))?,
+        })
+    }
+
     /// 明示パスで作る(試験・別配置向け)。パスは絶対パスのみ、`helper_timeout` は 1..=60 秒、名前は
     /// `[A-Za-z0-9._-]`・32 文字以内。違反は `InvalidArgument`(副作用なし)。
     pub fn with_paths(
@@ -426,6 +482,27 @@ impl SubordinateIdSource {
             newgidmap: newgidmap.to_path_buf(),
             helper_timeout,
         })
+    }
+}
+
+/// `SubordinateIdSource::resolve_id_maps` の結果(uid 側と gid 側の写像)。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct SubordinateIdMaps {
+    uid: IdMapSet,
+    gid: IdMapSet,
+}
+
+#[cfg(target_os = "linux")]
+impl SubordinateIdMaps {
+    /// uid の写像。
+    pub fn uid(&self) -> &IdMapSet {
+        &self.uid
+    }
+
+    /// gid の写像。
+    pub fn gid(&self) -> &IdMapSet {
+        &self.gid
     }
 }
 
@@ -461,26 +538,8 @@ fn resolve_privilege(
     };
     match (privilege, source) {
         (IsolationPrivilege::RootlessSubordinateIds, Some(source)) => {
-            if euid == 0 || egid == 0 {
-                return Err(TraitError::new(
-                    ErrorCode::PermissionDenied,
-                    "refusing to map the host root identity",
-                ));
-            }
-            let owner_of =
-                |id| SubIdOwner::new(id, source.owner_name.clone()).map_err(|e| fail(e.code));
-            let uid_ranges =
-                load_subordinate_ids(&source.subuid, &owner_of(euid)?).map_err(|e| fail(e.code))?;
-            let gid_ranges =
-                load_subordinate_ids(&source.subgid, &owner_of(euid)?).map_err(|e| fail(e.code))?;
-            if uid_ranges.is_empty() || gid_ranges.is_empty() {
-                return Err(TraitError::new(
-                    ErrorCode::FailedPrecondition,
-                    "no subordinate id range is assigned to the launching user",
-                ));
-            }
-            let uid = rootless_mapping(euid, &uid_ranges).map_err(|e| fail(e.code))?;
-            let gid = rootless_mapping(egid, &gid_ranges).map_err(|e| fail(e.code))?;
+            // 範囲の読み取りと写像の組み立ては pull 時の展開と共有する(#2389)。
+            let SubordinateIdMaps { uid, gid } = source.resolve_id_maps(euid, egid)?;
             let helper =
                 HelperPaths::new(&source.newuidmap, &source.newgidmap).map_err(|e| fail(e.code))?;
             Ok(Some(SubordinateIds {
@@ -2652,6 +2711,45 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// CORE-6・SEC-5(#2389): `resolve_privilege` が返す写像は `resolve_id_maps` の結果と同じ行になる(具体値)。
+    #[test]
+    fn core6_resolve_id_maps_matches_resolve_privilege() {
+        let src = source_in(
+            "idmaps",
+            "tester:100000:65536\n",
+            "tester:200000:65536\n",
+            helper_stand_in(),
+        );
+        let maps = src.resolve_id_maps(1000, 1001).expect("maps");
+        let rows = |s: &IdMapSet| {
+            s.entries()
+                .iter()
+                .map(|m| (m.container_id, m.host_id, m.count))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(maps.uid()), vec![(0, 1000, 1), (1, 100000, 65536)]);
+        assert_eq!(rows(maps.gid()), vec![(0, 1001, 1), (1, 200000, 65536)]);
+        let ids = resolve_privilege(
+            IsolationPrivilege::RootlessSubordinateIds,
+            Some(src),
+            1000,
+            1001,
+        )
+        .expect("resolved")
+        .expect("some");
+        assert_eq!(rows(&ids.uid), rows(maps.uid()));
+        assert_eq!(rows(&ids.gid), rows(maps.gid()));
+        let e = SubordinateIdSource::with_id_files(
+            Some("tester".to_owned()),
+            Path::new("/nonexistent-fandhe-dir/subuid"),
+            Path::new("/nonexistent-fandhe-dir/subgid"),
+        )
+        .expect("source")
+        .resolve_id_maps(0, 1000)
+        .expect_err("root");
+        assert_eq!(e.code(), ErrorCode::PermissionDenied);
     }
 
     /// CORE-6(#2009): 入力元の相対パス・不正な名前・範囲外の timeout は構築前に `InvalidArgument`。

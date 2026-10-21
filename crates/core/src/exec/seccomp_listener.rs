@@ -31,10 +31,22 @@
 //! - 切り詰め（`MSG_TRUNC` / `MSG_CTRUNC`）が無い・本文がちょうど `L` 1 バイト
 //! - `SCM_RIGHTS` の fd がちょうど 1 本
 //! - `SCM_CREDENTIALS` の pid が、C が起動した子（PID 1 または worker）の pid と一致する（pid は C の PID namespace へ
-//!   カーネルが変換する）。uid は照合しない: 子は新しい user namespace の写像下にあり、C から導ける期待値が
-//!   権限モデル（単一 ID 写像・範囲写像）で変わる。socketpair の子の端を持つのは C が起動した子だけなので、pid の
-//!   一致で送信元を特定できる
+//!   カーネルが変換する）。uid は照合しない（下の「信頼の前提」）
 //! - fd が close-on-exec（`MSG_CMSG_CLOEXEC`）で、種別が `anon_inode:seccomp notify`
+//!
+//! # 信頼の前提（pid のみ照合し uid を照合しない根拠。SEC-4・REPAIR-5・#2372）
+//!
+//! - 実際の境界は socketpair の子の端の保持である。子の端を持つのは C が fork した子（launch は PID 1、exec は
+//!   worker）だけで、端は `SOCK_CLOEXEC`、子は送信して ACK を受けた後に閉じ、workload（execve 後）へは渡らない
+//! - 送信は exec 前の、こちらのコードだけが走っている子が 1 回だけ行う。pid 照合はこの前提の下での配線の取り違え
+//!   （別の子・別の socketpair）への照合であり、悪意ある送信者への認証ではない
+//! - uid を照合しない理由: C が受け取る uid は C の user namespace へ写された値で、権限モデル（単一 ID 写像・
+//!   範囲写像）と送信時点で子が uid を切り替え済みかの両方に依存し、固定の期待値を導けない。また、新しい user
+//!   namespace 内で capability を持つ PID 1 は `SCM_CREDENTIALS` の値を明示指定できうるため、uid を足しても
+//!   送信者の偽装に対する強さは増えない
+//! - 受信できる fd は `MAX_RECV_FDS`（制御バッファの容量で実際に制限）までで、受信は `MSG_DONTWAIT`
+//! - PID namespace をまたぐ pid の変換の実機確認は `production_launcher` のシナリオ A で行い、結果は #1621 に記録する
+//!   （人間担当）
 //!
 //! # 漏れの防止（分離）
 //!
@@ -426,25 +438,35 @@ pub(crate) fn receive_listener(
     deadline: Instant,
 ) -> Result<SeccompListener, ExecError> {
     const STAGE: IsolationStage = IsolationStage::Seccomp;
-    match wait_readable(sock, deadline) {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(ExecError::new(
-                ErrorCode::Timeout,
-                STAGE,
-                "the seccomp listener was not delivered in time",
-            ));
+    // 受信は `MSG_DONTWAIT`。poll の見かけ上の起床で `EAGAIN` になれば、同じ `deadline` までで待ち直す
+    // （各周回の `wait_readable` が期限を見るため無期限にならない。REPAIR-5・#2372）。
+    let received = loop {
+        match wait_readable(sock, deadline) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(ExecError::new(
+                    ErrorCode::Timeout,
+                    STAGE,
+                    "the seccomp listener was not delivered in time",
+                ));
+            }
+            Err(e) => {
+                return Err(ExecError::from_sys(
+                    e,
+                    STAGE,
+                    "wait for the seccomp listener",
+                ));
+            }
         }
-        Err(e) => {
-            return Err(ExecError::from_sys(
-                e,
-                STAGE,
-                "wait for the seccomp listener",
-            ));
+        match sys::seccomp_notify::recv_fd_with_creds(sock) {
+            Err(SysError::Os(e)) if e == sys::EAGAIN => {}
+            other => {
+                break other.map_err(|e| {
+                    ExecError::from_sys(e, STAGE, "receive of the seccomp listener")
+                })?;
+            }
         }
-    }
-    let received = sys::seccomp_notify::recv_fd_with_creds(sock)
-        .map_err(|e| ExecError::from_sys(e, STAGE, "receive of the seccomp listener"))?;
+    };
     if let Some(e) = decode_failure(&received, expected_pid) {
         return Err(e);
     }

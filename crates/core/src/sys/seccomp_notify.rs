@@ -7,7 +7,8 @@
 //! `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_NEW_LISTENER)` を呼んで listener fd を得て
 //! （[`seccomp_set_filter_new_listener`]）、起動側（supervisor 側のプロセス C）へ socketpair で渡す
 //! （[`send_fd_with_token`] / [`recv_fd_with_creds`]）ために使う。検証の方針（資格情報・fd の種別・
-//! fail-closed）は呼び出し側の `exec/seccomp_listener.rs` が持ち、本モジュールは syscall の薄い安全 API だけを公開する。
+//! fail-closed）と送信元の照合（pid のみ・信頼の前提・uid を照合しない根拠。#2372）は呼び出し側の
+//! `exec/seccomp_listener.rs`（モジュール doc の「信頼の前提」）が持ち、本モジュールは syscall の薄い安全 API だけを公開する。
 //!
 //! # 一次情報（Linux v6.12 `kernel/seccomp.c`。2026-10-19 に確認）
 //!
@@ -17,6 +18,14 @@
 //! - 祖先の filter が既に listener を持つ場合は `EBUSY`（`has_duplicate_listener`）
 //! - `SO_PASSCRED` が受信側にあると、送信側が `SCM_CREDENTIALS` を付けなくても、カーネルが送信側の
 //!   資格情報（pid は受信側の PID namespace へ変換される）を付ける
+//!
+//! # 受信の fd 数の制限（SEC-4・REPAIR-5・#2372。Linux v6.12 `net/core/scm.c`・`net/unix/af_unix.c`）
+//!
+//! - `SO_PASSCRED` の受信では `SCM_CREDENTIALS` が先、`SCM_RIGHTS` が後に制御バッファへ書かれる。`SCM_RIGHTS` は
+//!   残り容量から入る fd 本数を決め、入らない fd は受信側に割り当てずに解放して `MSG_CTRUNC` を立てる
+//! - `SO_PASSSEC`・`SO_PASSPIDFD` は設定しないため他の cmsg は付かない。制御バッファ（`CONTROL_CAP`）は
+//!   `MAX_RECV_FDS` 本＋資格情報ちょうどの容量にし、超過は実際に `MSG_CTRUNC` になる（試験で固定する）
+//! - 受信は `MSG_DONTWAIT`（`SOCK_SEQPACKET` の待機中メッセージ無しは `EAGAIN`）。poll を省いても無期限に待たない
 //!
 //! `SO_PEERCRED` は socketpair では作成者（呼び出し元自身）を両端で返し検証の意味が無いため使わない。
 
@@ -54,7 +63,8 @@ const MSG_DONTWAIT: i32 = 0x40;
 const MSG_NOSIGNAL: i32 = 0x4000;
 const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
 
-/// 受信で受け取る fd の上限（これを超える分はカーネルが `MSG_CTRUNC` で切り詰める）。
+/// 受信で受け取る fd の上限。これを超える分はカーネルが受信側に割り当てずに閉じ、`MSG_CTRUNC` を立てる
+/// （制御バッファの容量 `CONTROL_CAP` がこの本数ちょうどを保証する。SEC-4・#2372）。
 pub(crate) const MAX_RECV_FDS: usize = 4;
 /// 受信する本文の最大バイト数。
 const MAX_PAYLOAD: usize = 8;
@@ -107,13 +117,20 @@ const fn cmsg_space(data_len: usize) -> usize {
     CMSG_HDR_LEN + cmsg_align(data_len)
 }
 
-/// 制御バッファの容量。`SCM_RIGHTS`（`MAX_RECV_FDS` 本）＋ `SCM_CREDENTIALS` に余裕を足した固定長。
-const CONTROL_CAP: usize = 128;
-const _: () = assert!(cmsg_space(MAX_RECV_FDS * 4) + cmsg_space(UCRED_LEN) <= CONTROL_CAP);
+/// 制御バッファの容量。`SCM_RIGHTS`（`MAX_RECV_FDS` 本）＋ `SCM_CREDENTIALS` ちょうど（余裕を持たせない。
+/// 余裕があると `MAX_RECV_FDS` を超える fd が入ってしまう）。
+const CONTROL_CAP: usize = cmsg_space(MAX_RECV_FDS * 4) + cmsg_space(UCRED_LEN);
+/// 試験用の複数 fd 送信の本数の上限（`MAX_RECV_FDS` 超過を送れれば足りる）。
+const SEND_MAX_FDS: usize = MAX_RECV_FDS + 1;
+const _: () = assert!(cmsg_space(SEND_MAX_FDS * 4) <= CONTROL_CAP);
 
 /// `cmsghdr` の整列を満たす固定長の制御バッファ。
 #[repr(C, align(8))]
 struct ControlBuf([u8; CONTROL_CAP]);
+
+/// 送信用（試験の複数 fd 送信を含む）の制御バッファ。整列は [`ControlBuf`] と同じ。
+#[repr(C, align(8))]
+struct SendControlBuf([u8; cmsg_space(SEND_MAX_FDS * 4)]);
 
 unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int socketpair(int domain, int type, int protocol, int sv[2])`。
@@ -255,27 +272,44 @@ pub(crate) fn send_fd_with_token(
     token: u8,
     fd: BorrowedFd<'_>,
 ) -> Result<(), SysError> {
+    send_fds_with_token(sock, token, &[fd])
+}
+
+/// [`send_fd_with_token`] の本体。`1..=SEND_MAX_FDS` 本を 1 つの `SCM_RIGHTS` で送る（範囲外は `EINVAL`）。
+/// 本番の入口は 1 本送りの [`send_fd_with_token`] だけで、複数本は受信側の上限の試験（#2372）のために持つ。
+fn send_fds_with_token(
+    sock: BorrowedFd<'_>,
+    token: u8,
+    fds: &[BorrowedFd<'_>],
+) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
+    if fds.is_empty() || fds.len() > SEND_MAX_FDS {
+        return Err(SysError::Os(EINVAL));
+    }
+    let data_len = fds.len() * 4;
     let mut payload = [token];
     let mut iov = IoVec {
         base: payload.as_mut_ptr().cast(),
         len: 1,
     };
-    let mut control = ControlBuf([0; CONTROL_CAP]);
-    let space = cmsg_space(4);
-    // 先頭に cmsghdr、直後（`CMSG_DATA`）に fd。`ControlBuf` は 8 バイト整列。
+    // 送信側は資格情報を付けないので `SEND_MAX_FDS` 本分の容量を別に確保する。
+    let mut control = SendControlBuf([0; cmsg_space(SEND_MAX_FDS * 4)]);
+    let space = cmsg_space(data_len);
+    // 先頭に cmsghdr、直後（`CMSG_DATA`）に fd。`SendControlBuf` は 8 バイト整列。
     let hdr = CmsgHdr {
-        len: CMSG_HDR_LEN + 4,
+        len: CMSG_HDR_LEN + data_len,
         level: consts::SOL_SOCKET,
         kind: SCM_RIGHTS,
     };
-    let mut bytes = Vec::with_capacity(CMSG_HDR_LEN + 4);
+    let mut bytes = Vec::with_capacity(CMSG_HDR_LEN + data_len);
     bytes.extend_from_slice(&hdr.len.to_ne_bytes());
     bytes.extend_from_slice(&hdr.level.to_ne_bytes());
     bytes.extend_from_slice(&hdr.kind.to_ne_bytes());
-    bytes.extend_from_slice(&fd.as_raw_fd().to_ne_bytes());
+    for fd in fds {
+        bytes.extend_from_slice(&fd.as_raw_fd().to_ne_bytes());
+    }
     let Some(dst) = control.0.get_mut(..bytes.len()) else {
         return Err(SysError::Os(EINVAL));
     };
@@ -290,8 +324,8 @@ pub(crate) fn send_fd_with_token(
         flags: 0,
     };
     // SAFETY: `msg` が指す `iov`（1 要素・`payload` 1 バイトを指す）と `control`（`space` バイトは確保済みで初期化済み、
-    // 先頭に整列した cmsghdr と fd 1 本）は呼び出しの間生存する。`name` は null・`namelen` は 0。カーネルは
-    // 呼び出し中だけこれらを読み、ポインタを保持しない。`sock`・`fd` は生存中の `BorrowedFd`。
+    // 先頭に整列した cmsghdr と fd `fds.len()` 本。`space` <= バッファ長は本数の検証と const assert で保証）は呼び出しの間生存する。`name` は null・`namelen` は 0。カーネルは
+    // 呼び出し中だけこれらを読み、ポインタを保持しない。`sock`・`fds` は生存中の `BorrowedFd`。
     let n = unsafe { sendmsg(sock.as_raw_fd(), &raw const msg, MSG_NOSIGNAL) };
     if n == 1 {
         Ok(())
@@ -376,7 +410,8 @@ fn parse_control_into(
     Some(())
 }
 
-/// 1 通を受信する（`MSG_CMSG_CLOEXEC`）。呼び出し前に `poll_readable` で読み取り可能を確認する（なければブロックする）。
+/// 1 通を受信する（`MSG_CMSG_CLOEXEC | MSG_DONTWAIT`）。呼び出し前に poll で読み取り可能を確認する前提だが、
+/// 待機中のメッセージが無ければ待たずに `Os(EAGAIN)` を返す（多重防御。REPAIR-5・#2372）。
 /// 受け取った fd はすべて `OwnedFd` で所有するため、呼び出し側が拒否して値を捨てれば確実に閉じる。
 /// 制御データの形式違反は、拾えた fd を閉じてから `EINVAL` を返す。
 pub(crate) fn recv_fd_with_creds(sock: BorrowedFd<'_>) -> Result<ReceivedFd, SysError> {
@@ -398,10 +433,16 @@ pub(crate) fn recv_fd_with_creds(sock: BorrowedFd<'_>) -> Result<ReceivedFd, Sys
         controllen: CONTROL_CAP,
         flags: 0,
     };
-    // SAFETY: `msg` が指す `iov`（`payload` の 8 バイト）と `control`（128 バイト・8 バイト整列）は書き込み可能で
+    // SAFETY: `msg` が指す `iov`（`payload` の 8 バイト）と `control`（`CONTROL_CAP` バイト・8 バイト整列）は書き込み可能で
     // 呼び出しの間生存する。カーネルは確保サイズを超えて書かず、受け取った fd 番号を制御バッファへ書く。
     // `sock` は生存中の `BorrowedFd`。
-    let n = unsafe { recvmsg(sock.as_raw_fd(), &raw mut msg, MSG_CMSG_CLOEXEC) };
+    let n = unsafe {
+        recvmsg(
+            sock.as_raw_fd(),
+            &raw mut msg,
+            MSG_CMSG_CLOEXEC | MSG_DONTWAIT,
+        )
+    };
     let n = usize::try_from(n).map_err(|_| last_error())?;
     let controllen = msg.controllen.min(CONTROL_CAP);
     let truncated = msg.flags & (MSG_CTRUNC | MSG_TRUNC) != 0;
@@ -673,7 +714,7 @@ const SEND_EINTR_ATTEMPTS: u32 = 8;
 ))]
 mod tests {
     use super::*;
-    use std::os::fd::AsFd as _;
+    use std::os::fd::AsFd;
 
     /// 構造体のサイズ・オフセットは LP64 の ABI と一致する（REPAIR-2）。
     #[test]
@@ -689,6 +730,7 @@ mod tests {
         assert_eq!(core::mem::offset_of!(CmsgHdr, kind), 12);
         assert_eq!(cmsg_space(4), 24);
         assert_eq!(cmsg_space(12), 32);
+        assert_eq!(CONTROL_CAP, 64);
     }
 
     /// uapi の値（出典: include/uapi/linux/seccomp.h・asm-generic/socket.h・linux/socket.h・syscall 表）。
@@ -785,6 +827,98 @@ mod tests {
         let got = recv_fd_with_creds(b.as_fd()).unwrap();
         assert!(got.payload.is_empty());
         assert!(got.fds.is_empty());
+    }
+
+    /// 同じ pipe の書き端の複製を `n` 本作る（受信側が漏らさず閉じたかを読み端の EOF で見るため）。
+    fn dup_writers(n: usize) -> (std::io::PipeReader, Vec<OwnedFd>) {
+        let (r, w) = std::io::pipe().unwrap();
+        let w = OwnedFd::from(w);
+        let mut v = vec![w.try_clone().unwrap()];
+        for _ in 1..n {
+            v.push(w.try_clone().unwrap());
+        }
+        drop(w);
+        (r, v)
+    }
+
+    /// 読み端が EOF（書き端がすべて閉じた）まで 5 秒以内に達するか。
+    fn reader_hits_eof(r: &std::io::PipeReader) -> bool {
+        use std::io::Read as _;
+        let mut pfd = PollFd {
+            fd: r.as_raw_fd(),
+            events: consts::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: 試験用。`pfd` は初期化済みの 1 要素で nfds = 1。
+        let rc = unsafe { poll(&raw mut pfd, 1, 5000) };
+        let mut b = [0u8; 1];
+        rc == 1 && (&*r).read(&mut b).unwrap() == 0
+    }
+
+    /// SEC-4・REPAIR-5（#2372）: `MAX_RECV_FDS` 本ちょうどと資格情報は切り詰められずに届く。
+    #[test]
+    fn sec4_2372_control_buffer_holds_exactly_max_fds_and_creds() {
+        let (a, b) = unix_seqpacket_pair().unwrap();
+        set_passcred(b.as_fd()).unwrap();
+        let (_r, ws) = dup_writers(MAX_RECV_FDS);
+        let bs: Vec<BorrowedFd<'_>> = ws.iter().map(AsFd::as_fd).collect();
+        send_fds_with_token(a.as_fd(), b'L', &bs).unwrap();
+        let got = recv_fd_with_creds(b.as_fd()).unwrap();
+        assert!(!got.truncated);
+        assert_eq!(got.fds.len(), MAX_RECV_FDS);
+        assert_eq!(
+            got.creds.unwrap().pid,
+            i32::try_from(std::process::id()).unwrap()
+        );
+    }
+
+    /// SEC-4・REPAIR-5（#2372）: 上限超過の fd は切り詰められ、超過分は受信側に漏れず閉じられる。
+    #[test]
+    fn sec4_2372_excess_fds_are_truncated_and_released() {
+        let (a, b) = unix_seqpacket_pair().unwrap();
+        set_passcred(b.as_fd()).unwrap();
+        let (r, ws) = dup_writers(MAX_RECV_FDS + 1);
+        let bs: Vec<BorrowedFd<'_>> = ws.iter().map(AsFd::as_fd).collect();
+        send_fds_with_token(a.as_fd(), b'L', &bs).unwrap();
+        drop(bs);
+        drop(ws);
+        let got = recv_fd_with_creds(b.as_fd()).unwrap();
+        assert!(got.truncated);
+        assert_eq!(got.fds.len(), MAX_RECV_FDS);
+        assert!(got.creds.is_some());
+        drop(got);
+        assert!(reader_hits_eof(&r), "an excess fd leaked to the receiver");
+    }
+
+    /// SEC-4・REPAIR-5（#2372）: 空の socket でも `recv_fd_with_creds` は待たずに `EAGAIN` を返す。
+    #[test]
+    fn sec4_2372_recv_does_not_block_on_empty_socket() {
+        let (a, b) = unix_seqpacket_pair().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = std::thread::spawn(move || {
+            let r = recv_fd_with_creds(b.as_fd()).map(|_| ());
+            let _ = tx.send(r);
+        });
+        let r = rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(matches!(r, Ok(Err(SysError::Os(e))) if e == super::super::EAGAIN));
+        h.join().unwrap();
+        drop(a);
+    }
+
+    /// 送信本数は `1..=SEND_MAX_FDS`。範囲外は `EINVAL`。
+    #[test]
+    fn sec4_2372_send_rejects_out_of_range_fd_counts() {
+        let (a, _b) = unix_seqpacket_pair().unwrap();
+        assert_eq!(
+            send_fds_with_token(a.as_fd(), b'L', &[]),
+            Err(SysError::Os(EINVAL))
+        );
+        let (_r, ws) = dup_writers(SEND_MAX_FDS + 1);
+        let bs: Vec<BorrowedFd<'_>> = ws.iter().map(AsFd::as_fd).collect();
+        assert_eq!(
+            send_fds_with_token(a.as_fd(), b'L', &bs),
+            Err(SysError::Os(EINVAL))
+        );
     }
 
     /// SEC-4（#2025）: 通知まわりの構造体と ioctl 番号は uapi と一致する（出典: include/uapi/linux/seccomp.h v6.12）。

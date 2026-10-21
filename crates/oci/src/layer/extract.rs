@@ -19,7 +19,11 @@
 //!
 //! # 呼び出し契約
 //!
-//! - 呼び出し側は先に `verify_blob_digest` を通すこと。
+//! - イメージの展開（`extract_image_layers`）は、`VerifiedLayerBlob`（`open_blob_nofollow` で開き、同じハンドルで
+//!   信頼条件と digest を確かめた値。#2309）だけを受ける。パスを開き直さないため、検証と展開の間にパスを別の
+//!   ファイルへ差し替えられても展開物は変わらない。パスを受ける旧入口（`extract_layer_blob(s)*`。gzip 固定で
+//!   diff_id を突合しない）は、呼び出し側が排他的に所有する 0700 のステージングにある、直前に `verify_blob_digest` を
+//!   通した blob に限る。キャッシュの blob を再利用する経路と diff_id の突合には使わない。
 //! - `root` は呼び出し側が排他的に所有する既存の空ディレクトリ（ステージング）で、`root` 自体が
 //!   symlink であってはならない。空でなければ `FailedPrecondition` で拒否する（別表記の衝突の判定が
 //!   「`root` 配下の実在項目はすべてこの展開が作った」ことに依るため）。別プロセスが同時に `root` を
@@ -28,11 +32,13 @@
 //! - 複数レイヤーは `extract_layers` / `extract_layer_blobs` で下位から上位の順に同一 `root` へ重ねる
 //!   （TASK-52.4・#410）。空であることの検査は最初のレイヤーの前だけで、別表記の索引・遅延ディレクトリ mode・
 //!   4 種の上限（`max_input_bytes` を含む）は全レイヤーで共有・累積する。
-//! - 各レイヤーの tar は 2 回走査する（下記「レイヤーごとの 3 パス」）。blob 版は同じ blob を 2 回開き、
-//!   ストリーム版（`extract_tar`・`extract_layers`）は入力に `Seek` を求め、各走査の前に最初の位置へ戻す。
-//!   2 回の走査で内容が変わらないことは digest 検証済みであることに依る（変わっても、パス 3 はマーカー名を
-//!   書き出さない）。展開後 tar の diff_id（sha256）はパス 1 の読み取りで計算し、`extract_image_layers` では
-//!   image config の `rootfs.diff_ids` と突合する（パス 3 では再計算しない。#2017・OCI-1）。
+//! - 各レイヤーの tar は 2 回走査する（下記「レイヤーごとの 3 パス」）。ハンドル版（`VerifiedLayerBlob`）は各走査の前に
+//!   ハンドルの先頭へ戻し、パス版の旧入口は blob をパスから 2 回開き、ストリーム版（`extract_tar`・`extract_layers`）は
+//!   入力に `Seek` を求めて最初の位置へ戻す。展開後 tar の diff_id（sha256）はパス 1 の読み取りで計算し、
+//!   `extract_image_layers` では image config の `rootfs.diff_ids` と突合する（#2017・OCI-1）。パス 3 でも同じ構成で
+//!   同じハッシュを計算し、末尾でパス 1 の値と照合して、違えば `DataLoss` にする（#2309。同じ inode への上書きなど、
+//!   開き直しの間の内容の変化を検出する。全入口に効く）。不一致は末尾でしか分からないため、そのレイヤーの展開物が
+//!   `root` に残る。`Err` を受けたら `root` ごと破棄すること（変わっても、パス 3 はマーカー名を書き出さない）。
 //! - tar の終端後に入力を EOF まで読み捨てる（gzip トレーラの CRC32・ISIZE 検証のため）。読み捨てを含む
 //!   入力全体は `ExtractLimits::max_input_bytes` で上限を課す（超過は `ResourceExhausted`）。
 //!
@@ -170,7 +176,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::{
     DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, GzipLayerReader, LayerMediaType, PlainLayerReader,
-    oci_error_from_layer_io, open_gzip_layer, open_plain_layer,
+    VerifiedLayerBlob, oci_error_from_layer_io, open_gzip_layer,
 };
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
@@ -271,7 +277,7 @@ pub struct ExtractedLayer {
     /// 所有者の適用（`chown`）の判定と件数（#2225・SEC-5）。
     pub ownership: OwnershipOutcome,
     /// 展開後 tar（圧縮を解いた全バイト。終端後の読み捨てを含む）の sha256。image config の
-    /// `rootfs.diff_ids` の要素と同じ値（#2017・OCI-1）。パス 1 の読み取りで計算する。
+    /// `rootfs.diff_ids` の要素と同じ値（#2017・OCI-1）。パス 1 の読み取りで計算し、パス 3 の再計算と一致した値（#2309）。
     pub diff_id: Digest,
 }
 
@@ -734,13 +740,15 @@ impl<R: Read + Seek> LayerSource for Rewind<R> {
     }
 }
 
-/// `BlobLayer` の読み取り口。`mediaType` に応じて gzip 展開か素通しかが決まる。
-enum LayerReader {
-    Gzip(Box<GzipLayerReader<File>>),
-    Plain(PlainLayerReader<File>),
+/// blob 系 `LayerSource` の読み取り口。`mediaType` に応じて gzip 展開か素通しかが決まる。
+///
+/// `R` は読み取り元で、パス版 `BlobLayer` は `File`、ハンドル版 `VerifiedBlobLayer` は `&File`。
+enum LayerReader<R: Read> {
+    Gzip(Box<GzipLayerReader<R>>),
+    Plain(PlainLayerReader<R>),
 }
 
-impl Read for LayerReader {
+impl<R: Read> Read for LayerReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Gzip(r) => r.read(buf),
@@ -749,10 +757,11 @@ impl Read for LayerReader {
     }
 }
 
-/// digest 検証済みのレイヤー blob を、走査のたびに開き直す `LayerSource`。
+/// gzip 固定の旧入口（`extract_layer_blobs*`）が使う、パスから走査のたびに開き直す `LayerSource`。
 ///
-/// `media_type` が `TarGzip` なら gzip 展開、`Tar` なら素通し（どちらも `max_uncompressed_bytes` の上限つき）。
-/// `expected_diff_id` があれば、パス 1 で計算した展開後 tar の sha256 と突合する（#2017・OCI-1）。
+/// 検証と展開の間の差し替え・symlink は検出しない（パス 3 の再ハッシュが内容の変化だけを `DataLoss` にする）。
+/// 呼び出し側が排他的に所有する 0700 のステージングにある、直前に検証した blob に限る（#2309）。
+/// キャッシュの blob を再利用する経路と diff_id の照合には `VerifiedBlobLayer` を使う。
 struct BlobLayer<'p> {
     path: &'p Path,
     media_type: LayerMediaType,
@@ -762,17 +771,19 @@ struct BlobLayer<'p> {
 
 impl LayerSource for BlobLayer<'_> {
     type Reader<'a>
-        = LayerReader
+        = LayerReader<File>
     where
         Self: 'a;
 
-    fn open(&mut self) -> Result<LayerReader, OciError> {
+    fn open(&mut self) -> Result<LayerReader<File>, OciError> {
         match self.media_type {
             LayerMediaType::TarGzip => open_gzip_layer(self.path, self.max_uncompressed_bytes)
                 .map(|r| LayerReader::Gzip(Box::new(r))),
-            LayerMediaType::Tar => {
-                open_plain_layer(self.path, self.max_uncompressed_bytes).map(LayerReader::Plain)
-            }
+            // 旧入口は gzip 固定のため、非圧縮はここへ来ない。来たら推測で開かず拒否する。
+            LayerMediaType::Tar => Err(err(
+                OciErrorCode::Unimplemented,
+                "plain tar layers require a verified blob handle",
+            )),
         }
     }
 
@@ -781,12 +792,53 @@ impl LayerSource for BlobLayer<'_> {
     }
 }
 
-/// `extract_image_layers` に渡す 1 レイヤー分の記述（#2017・OCI-1）。
+/// 検証済みハンドル（`VerifiedLayerBlob`）から読む `LayerSource`（#2309・OCI-1）。パスを一度も開き直さない。
+///
+/// `open` のたびにハンドルの先頭へ seek してから gzip 展開か素通しで包む。同じ `VerifiedLayerBlob` を複数の
+/// レイヤーに渡しても正しく読めるが、読み取り位置はハンドルの中で共有されるため、展開中に同じ値を並行して読まないこと
+/// （`extract_stack` は直列に読む）。
+struct VerifiedBlobLayer<'b> {
+    blob: &'b VerifiedLayerBlob,
+    media_type: LayerMediaType,
+    max_uncompressed_bytes: u64,
+    expected_diff_id: Option<Digest>,
+}
+
+impl LayerSource for VerifiedBlobLayer<'_> {
+    type Reader<'a>
+        = LayerReader<&'a File>
+    where
+        Self: 'a;
+
+    fn open(&mut self) -> Result<LayerReader<&File>, OciError> {
+        let mut handle = self.blob.file();
+        handle
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| err(OciErrorCode::Internal, "failed to rewind the layer blob"))?;
+        Ok(match self.media_type {
+            LayerMediaType::TarGzip => LayerReader::Gzip(Box::new(GzipLayerReader::new(
+                handle,
+                self.max_uncompressed_bytes,
+            ))),
+            LayerMediaType::Tar => {
+                LayerReader::Plain(PlainLayerReader::new(handle, self.max_uncompressed_bytes))
+            }
+        })
+    }
+
+    fn expected_diff_id(&self) -> Option<&Digest> {
+        self.expected_diff_id.as_ref()
+    }
+}
+
+/// `extract_image_layers` に渡す 1 レイヤー分の記述（#2017・#2309・OCI-1）。
+///
+/// blob はパスではなく `VerifiedLayerBlob`（信頼条件と digest を同じハンドルで確かめた値）で受ける。
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ImageLayer<'a> {
-    /// digest 検証済みの blob のパス。
-    pub path: &'a Path,
+    /// 信頼条件と digest を検証済みの blob。
+    pub blob: &'a VerifiedLayerBlob,
     /// manifest の descriptor の `mediaType`。
     pub media_type: &'a str,
     /// image config の `rootfs.diff_ids` の対応する要素。
@@ -794,10 +846,10 @@ pub struct ImageLayer<'a> {
 }
 
 impl<'a> ImageLayer<'a> {
-    /// blob のパス・`mediaType`・期待する diff_id から作る。
-    pub fn new(path: &'a Path, media_type: &'a str, diff_id: &'a Digest) -> Self {
+    /// 検証済み blob・`mediaType`・期待する diff_id から作る。
+    pub fn new(blob: &'a VerifiedLayerBlob, media_type: &'a str, diff_id: &'a Digest) -> Self {
         Self {
-            path,
+            blob,
             media_type,
             diff_id,
         }
@@ -821,6 +873,9 @@ pub fn extract_image_layers(
 }
 
 /// `mediaType` で入口を選び、展開後 tar の sha256 を `rootfs.diff_ids` と突合しながら重ねて展開する（#2017・OCI-1）。
+///
+/// 入力は `VerifiedLayerBlob`（検証済みハンドル）で、パスは開き直さない（#2309）。パス 1 とパス 3 は同じハンドルを読み、
+/// パス 3 でも同じハッシュを計算して末尾で照合する（不一致は `DataLoss`。`root` ごと破棄すること）。
 ///
 /// 手順は、(1) 全レイヤーの `mediaType` を I/O より前に検査する（未対応は `Unimplemented`。rootfs に触れない）、
 /// (2) 各レイヤーのパス 1 で計算した展開後 tar の sha256 を `diff_id` と突合する（不一致は `DataLoss`。そのレイヤーの
@@ -862,8 +917,8 @@ pub fn extract_image_layers_with_policy(
     let sources = layers
         .iter()
         .map(|l| {
-            Ok(BlobLayer {
-                path: l.path,
+            Ok(VerifiedBlobLayer {
+                blob: l.blob,
                 media_type: LayerMediaType::parse(l.media_type)?,
                 max_uncompressed_bytes,
                 expected_diff_id: Some(l.diff_id.clone()),
@@ -880,28 +935,37 @@ pub fn extract_image_layers_with_policy(
     )
 }
 
-/// 件数の照合つきで `ImageLayer` の列を作る補助（#2017・OCI-1）。
+/// 件数と対応の照合つきで `ImageLayer` の列を作る補助（#2017・#2309・OCI-1）。
 ///
-/// manifest の `layers`・digest 検証済みの blob パス・config の `rootfs.diff_ids` の 3 者の件数が揃わなければ、
-/// どの I/O よりも前に `DataLoss` を返す。
+/// manifest の `layers`・検証済みの blob・config の `rootfs.diff_ids` の 3 者の件数が揃わなければ、どの I/O よりも
+/// 前に `DataLoss` を返す。各 descriptor の `digest`・`size` が対応する blob の検証済みの値と違う場合も、
+/// 取り違えた blob を展開しないよう `DataLoss` で拒否する。
 pub fn image_layers_from<'a>(
     descriptors: &'a [crate::manifest::Descriptor],
-    blob_paths: &'a [&'a Path],
+    blobs: &'a [&'a VerifiedLayerBlob],
     rootfs: &'a crate::config::ImageRootFs,
 ) -> Result<Vec<ImageLayer<'a>>, OciError> {
     let ids = rootfs.diff_ids();
-    if descriptors.len() != ids.len() || descriptors.len() != blob_paths.len() {
+    if descriptors.len() != ids.len() || descriptors.len() != blobs.len() {
         return Err(err(
             OciErrorCode::DataLoss,
             "layer count does not match rootfs.diff_ids",
         ));
     }
-    Ok(descriptors
+    descriptors
         .iter()
-        .zip(blob_paths)
+        .zip(blobs)
         .zip(ids)
-        .map(|((d, path), id)| ImageLayer::new(path, d.media_type.as_str(), id))
-        .collect())
+        .map(|((d, blob), id)| {
+            if d.digest != *blob.digest() || d.size != blob.size() {
+                return Err(err(
+                    OciErrorCode::DataLoss,
+                    "layer blob does not match the manifest descriptor",
+                ));
+            }
+            Ok(ImageLayer::new(blob, d.media_type.as_str(), id))
+        })
+        .collect()
 }
 
 /// 読んだバイトを sha256 へ通す読み取りアダプタ（パス 1 で展開後 tar の diff_id を計算する）。
@@ -2686,8 +2750,12 @@ fn extract_one_layer<S: LayerSource>(
     x.apply_markers(&markers)?;
     drop(markers);
     x.layer_nodes.clear();
+    // パス 3 もパス 1 と同じ構成（読み取り → ハッシュ → 上限）で包み、drain までの全バイトをハッシュする。
     let mut src = LimitedReader {
-        inner: src.open()?,
+        inner: HashingReader {
+            inner: src.open()?,
+            hasher: Sha256::new(),
+        },
         read: 0,
         limit: input_budget,
     };
@@ -2749,6 +2817,14 @@ fn extract_one_layer<S: LayerSource>(
     }
     x.layer_nodes.clear();
     drain(&mut src)?;
+    // パス 1 とパス 3 の間にレイヤーの内容が変わった（同じ inode への上書きなど）場合は fail-closed にする。
+    // 差し替え後の内容の展開物が `root` に残るため、呼び出し側は `Err` を受けたら `root` ごと破棄すること。
+    if digest_of(src.inner.hasher)? != diff_id {
+        return Err(err(
+            OciErrorCode::DataLoss,
+            "layer content changed between passes",
+        ));
+    }
     Ok((
         ExtractedLayer {
             entries: x.entries.saturating_sub(entries0),
@@ -6382,5 +6458,186 @@ mod tests {
         );
         assert_eq!(l.files_with_stripped_special_bits, 1);
         assert_eq!(l.ownership.decision, OwnershipDecision::NotRequested);
+    }
+
+    /// パス 1 とパス 3 で別の tar を返す `LayerSource`（開き直しの間の内容の変化を再現する）。
+    struct Flip {
+        opens: usize,
+        first: Vec<u8>,
+        second: Vec<u8>,
+        expected: Option<Digest>,
+    }
+
+    impl LayerSource for Flip {
+        type Reader<'a>
+            = Cursor<Vec<u8>>
+        where
+            Self: 'a;
+
+        fn open(&mut self) -> Result<Cursor<Vec<u8>>, OciError> {
+            self.opens += 1;
+            Ok(Cursor::new(if self.opens == 1 {
+                self.first.clone()
+            } else {
+                self.second.clone()
+            }))
+        }
+
+        fn expected_diff_id(&self) -> Option<&Digest> {
+            self.expected.as_ref()
+        }
+    }
+
+    fn sha_digest(data: &[u8]) -> Digest {
+        let mut h = Sha256::new();
+        h.update(data);
+        digest_of(h).unwrap()
+    }
+
+    #[cfg(unix)]
+    /// 2 回目の `open` の直前に `hook` を呼ぶ試験専用のラッパー（パス 1 とパス 3 の間の差し替えを再現する）。
+    struct HookBeforeReopen<S, F: FnMut()> {
+        inner: S,
+        hook: F,
+        opens: usize,
+    }
+
+    #[cfg(unix)]
+    impl<S: LayerSource, F: FnMut()> LayerSource for HookBeforeReopen<S, F> {
+        type Reader<'a>
+            = S::Reader<'a>
+        where
+            Self: 'a;
+
+        fn open(&mut self) -> Result<S::Reader<'_>, OciError> {
+            self.opens += 1;
+            if self.opens == 2 {
+                (self.hook)();
+            }
+            self.inner.open()
+        }
+
+        fn expected_diff_id(&self) -> Option<&Digest> {
+            self.inner.expected_diff_id()
+        }
+    }
+
+    fn extract_one_source<S: LayerSource>(
+        sb: &Sandbox,
+        src: S,
+    ) -> Result<Vec<ExtractedLayer>, OciError> {
+        extract_stack(
+            &NoopOciOpRecorder,
+            [src],
+            &sb.root,
+            ExtractLimits::new(1000, 1 << 20, 1 << 30, 1 << 20),
+            host_lstat,
+            SpecialSetup::host(SpecialBitsPolicy::Strip),
+        )
+    }
+
+    /// OCI-1・#2309: パス 1 とパス 3 で内容が変わったら（期待 diff_id の有無に依らず）`DataLoss`。3 OS で確かめる。
+    #[test]
+    fn oci1_content_change_between_passes_is_data_loss() {
+        let a = archive(&[file("f", 0o644, b"hellp")]);
+        let b = archive(&[file("f", 0o644, b"hello")]);
+        for expected in [None, Some(sha_digest(&a))] {
+            let sb = Sandbox::new();
+            let e = extract_one_source(
+                &sb,
+                Flip {
+                    opens: 0,
+                    first: a.clone(),
+                    second: b.clone(),
+                    expected,
+                },
+            )
+            .unwrap_err();
+            assert_eq!(e.code(), OciErrorCode::DataLoss);
+            assert_eq!(e.message(), "layer content changed between passes");
+        }
+    }
+
+    /// OCI-1・#2309: 内容が変わらなければパス 3 の再ハッシュは成功し、結果の diff_id はパス 1 の値になる。
+    #[test]
+    fn oci1_unchanged_content_passes_rehash() {
+        let a = archive(&[file("f", 0o644, b"hello")]);
+        let sb = Sandbox::new();
+        let r = extract_one_source(
+            &sb,
+            Flip {
+                opens: 0,
+                first: a.clone(),
+                second: a.clone(),
+                expected: Some(sha_digest(&a)),
+            },
+        )
+        .unwrap();
+        assert_eq!(r[0].diff_id, sha_digest(&a));
+        assert_eq!(fs::read(sb.root.join("f")).unwrap(), b"hello");
+    }
+
+    /// 0600 で書いて `VerifiedLayerBlob` を作る（Unix 限定の試験用）。
+    #[cfg(unix)]
+    fn verified_blob(path: &Path, data: &[u8]) -> VerifiedLayerBlob {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        fs::write(path, data).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        let uid = fs::metadata(path).unwrap().uid();
+        VerifiedLayerBlob::open(path, &sha_digest(data), data.len() as u64, uid).unwrap()
+    }
+
+    /// OCI-1・OCI-2・#2309: パス 1 とパス 3 の間にパスのエントリを別ファイルへ差し替えても、
+    /// ハンドルを開き直さないので検証済みの内容が展開される。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_handle_layer_ignores_path_swap_between_passes() {
+        let sb = Sandbox::new();
+        let a = archive(&[file("a", 0o644, b"A1")]);
+        let b = archive(&[file("a", 0o644, b"B2")]);
+        let path = sb.base.join("l.tar");
+        let blob = verified_blob(&path, &a);
+        let evil = sb.base.join("evil.tar");
+        let src = HookBeforeReopen {
+            inner: VerifiedBlobLayer {
+                blob: &blob,
+                media_type: LayerMediaType::Tar,
+                max_uncompressed_bytes: 1 << 20,
+                expected_diff_id: Some(sha_digest(&a)),
+            },
+            hook: || {
+                fs::write(&evil, &b).unwrap();
+                fs::rename(&evil, &path).unwrap();
+            },
+            opens: 0,
+        };
+        let r = extract_one_source(&sb, src).unwrap();
+        assert_eq!(fs::read(sb.root.join("a")).unwrap(), b"A1");
+        assert_eq!(r[0].diff_id, sha_digest(&a));
+    }
+
+    /// OCI-1・#2309: パス 1 とパス 3 の間に同じ inode が書き換えられた場合は、パス 3 の再ハッシュで
+    /// `DataLoss` になる（同じ UID なら信頼条件を保ったまま書けるため、ハンドル保持だけでは防げない）。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_handle_layer_detects_in_place_rewrite_between_passes() {
+        let sb = Sandbox::new();
+        let a = archive(&[file("a", 0o644, b"A1")]);
+        let b = archive(&[file("a", 0o644, b"B2")]);
+        let path = sb.base.join("l.tar");
+        let blob = verified_blob(&path, &a);
+        let src = HookBeforeReopen {
+            inner: VerifiedBlobLayer {
+                blob: &blob,
+                media_type: LayerMediaType::Tar,
+                max_uncompressed_bytes: 1 << 20,
+                expected_diff_id: Some(sha_digest(&a)),
+            },
+            hook: || fs::write(&path, &b).unwrap(),
+            opens: 0,
+        };
+        let e = extract_one_source(&sb, src).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        assert_eq!(e.message(), "layer content changed between passes");
     }
 }

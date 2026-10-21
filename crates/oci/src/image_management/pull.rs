@@ -68,7 +68,9 @@ use crate::instrument::{OciOpKind, OciOpRecorder, record_oci_op};
 use crate::layer::open_blob_nofollow;
 #[cfg(windows)]
 use crate::layer::verify_blob_file_digest_with;
-use crate::layer::{VerifiedBlob, verify_blob_digest, verify_blob_digest_with};
+use crate::layer::{
+    VerifiedBlob, blob_trust_violation, verify_blob_digest, verify_blob_digest_with,
+};
 use crate::reference::Digest;
 
 /// ストア root 直下のステージング領域名。GC・`image ls` の走査対象外。
@@ -207,32 +209,6 @@ impl FileIdent {
         let m = fs::symlink_metadata(path)?;
         Ok(m.is_file().then(|| Self::of(&m)))
     }
-}
-
-/// 公開してよい blob の信頼条件の違反を返す（OCI-1・SEC。unix のみ。違反なしは `None`）。
-///
-/// 条件は通常ファイル・所有者が `owner`・ハードリンク数 1（ストア外の名前から同じ inode を書き換えられない）・
-/// group / other 書き込み不可。非 unix は所有者・リンク数を標準ライブラリで取得できないため通常ファイルかだけを見る。
-fn blob_trust_violation(m: &fs::Metadata, owner: Option<u32>) -> Option<&'static str> {
-    if !m.is_file() {
-        return Some("blob is not a regular file");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if owner.is_some_and(|o| m.uid() != o) {
-            return Some("blob has an unexpected owner");
-        }
-        if m.nlink() != 1 {
-            return Some("blob has extra hard links");
-        }
-        if m.mode() & 0o022 != 0 {
-            return Some("blob is writable by group or others");
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = owner;
-    None
 }
 
 /// パスが信頼条件を満たす通常ファイル（symlink を辿らない）か。

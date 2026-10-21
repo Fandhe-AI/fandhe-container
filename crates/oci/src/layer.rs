@@ -5,6 +5,7 @@
 //! 参照 digest と完全一致しなければ `DataLoss` で拒否する（fail-closed。ソフトウェアとデータの完全性）。
 //!
 //! 呼び出し契約: layer 展開（TASK-52.x）やキャッシュ公開の前に、呼び出し側が本検証を通すこと。
+//! イメージの展開へ渡す blob は、検証済みを型で表す `VerifiedLayerBlob`（下記）で作る（#2309）。
 //! 検証対象は呼び出し側が管理するステージング領域のファイル（pull では `PullSession` の `<root>/staging/<pull-id>/`。#474）とし、パスはエラー文言に載せない。
 //! 未実装（後続 issue）: `fetch_blob` 内への組み込み、manifest 本文の digest 突合、tar 展開・キャッシュ格納。
 //!
@@ -12,12 +13,16 @@
 //! 内容を検証する場合（`fandhe-container-cri` の `PullImage` のキャッシュ再利用・公開）は、
 //! `open_blob_nofollow` で最終要素の symlink を辿らずに開き、そのハンドルのメタデータを確認したうえで
 //! `verify_blob_file_digest` に同じハンドルを渡す。パスを再解決しないため、確認と読み取りの間に
-//! 別のファイルへ差し替えられない。所有者・権限の判定（信頼条件）は本モジュールでは行わない（呼び出し側の責務）。
+//! 別のファイルへ差し替えられない。個別の関数（`open_blob_nofollow`・`verify_blob_file_digest`）は信頼条件を判定しない。
+//! 信頼条件・digest・サイズを同じハンドルで確かめる入口が `VerifiedLayerBlob::open` で、イメージ展開
+//! （`extract::extract_image_layers`）はこの値だけを受ける（#2309）。パスを受ける `verify_blob_digest(_with)`・
+//! `verify_fetched_blob(_with)`・`open_gzip_layer`・`decompress_layer_to_writer(_with)` は、呼び出し側が排他的に所有する
+//! 0700 のステージングにある blob に限る部品で、キャッシュの再利用と展開には使わない。
 //!
 //! gzip 展開（TASK-52.2・OCI-1・#407）: digest 検証済みの圧縮 blob を `GzipLayerReader` で逐次展開し、
 //! 後続の tar 展開（TASK-52.3）へ tar バイトストリームとして渡す。展開後サイズの上限は必須引数で、
 //! 超過した最初の読み取りで中断する（decompression bomb 対策。メモリ使用量は展開サイズに依存しない）。
-//! 呼び出し契約: 展開の前に `verify_blob_digest` を通すこと。digest は圧縮 blob に対する値であり、
+//! 呼び出し契約: 展開の前に `verify_blob_digest`（ステージングのパス）か `VerifiedLayerBlob::open` を通すこと。digest は圧縮 blob に対する値であり、
 //! 展開後 tar の diff_id（config の `rootfs.diff_ids`）との突合は `extract::extract_image_layers` が行う
 //! （#2017・OCI-1）。gzip トレーラ（CRC32・ISIZE）は EOF まで読み切ったときにだけ検証されるため、
 //! tar 側は EOF まで読むこと。
@@ -281,6 +286,109 @@ pub fn verify_fetched_blob_with(
     verify_blob_digest_with(recorder, &blob.path, &blob.digest, max_bytes)
 }
 
+/// 公開してよい blob の信頼条件の違反を返す（OCI-1・SEC。unix のみ。違反なしは `None`）。
+///
+/// 条件は通常ファイル・所有者が `owner`・ハードリンク数 1（ストア外の名前から同じ inode を書き換えられない）・
+/// group / other 書き込み不可。非 unix は所有者・リンク数を標準ライブラリで取得できないため通常ファイルかだけを見る。
+pub(crate) fn blob_trust_violation(
+    m: &std::fs::Metadata,
+    owner: Option<u32>,
+) -> Option<&'static str> {
+    if !m.is_file() {
+        return Some("blob is not a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if owner.is_some_and(|o| m.uid() != o) {
+            return Some("blob has an unexpected owner");
+        }
+        if m.nlink() != 1 {
+            return Some("blob has extra hard links");
+        }
+        if m.mode() & 0o022 != 0 {
+            return Some("blob is writable by group or others");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = owner;
+    None
+}
+
+/// 信頼条件と digest を同じハンドルで確かめたレイヤー blob（OCI-1・#2309）。イメージ展開の入口
+/// （`extract::extract_image_layers` ほか）はこの値だけを受ける。
+///
+/// 「digest 検証済みの blob」という呼び出し契約を型で表す。構築経路は [`VerifiedLayerBlob::open`] の 1 本だけで、
+/// `File` から直接作る経路は無い。構築では (1) [`open_blob_nofollow`] で symlink を辿らずに開き、(2) 同じハンドルの
+/// fstat で信頼条件（通常ファイル・所有者・ハードリンク数 1・group / other 書き込み不可）を確かめ、(3) 同じハンドルを
+/// [`verify_blob_file_digest`] で検証する。以後の展開はこのハンドルから読み、パスを開き直さないため、
+/// 検証と展開の間にパスのエントリを別のファイルへ差し替えられても展開物は変わらない。
+/// 同じ inode への上書きは展開側がパス 3 で diff_id を再計算して検出する（`DataLoss`）。
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct VerifiedLayerBlob {
+    file: File,
+    digest: Digest,
+    size: u64,
+}
+
+impl VerifiedLayerBlob {
+    /// 計装なしの [`VerifiedLayerBlob::open_with`]（`NoopOciOpRecorder`）。
+    pub fn open(path: &Path, expected: &Digest, size: u64, owner: u32) -> Result<Self, OciError> {
+        Self::open_with(&NoopOciOpRecorder, path, expected, size, owner)
+    }
+
+    /// `path` の blob を開いて信頼条件と digest を確かめる。digest の検証は `OciOpKind::VerifyBlobDigest` として
+    /// `recorder` へ記録する（REPAIR-4）。
+    ///
+    /// `expected` と `size` は manifest の descriptor の `digest` と `size`。読み取り上限は `size` で、超過は
+    /// `ResourceExhausted`、digest の不一致と実サイズが `size` と違う場合は `DataLoss`。`owner` は blob を置いた
+    /// ストア（ステージング）の所有者の uid で、省略できない（fail-closed）。
+    /// エラー: 存在しなければ `NotFound`、通常ファイルでなければ（symlink を含む）`InvalidArgument`、開く間の差し替えと
+    /// 信頼条件の違反は `FailedPrecondition`。
+    /// 非 Unix: ハンドルの同一性と所有者を標準ライブラリで確かめられないため、開かずに `Unimplemented` で拒否する。
+    pub fn open_with(
+        recorder: &dyn OciOpRecorder,
+        path: &Path,
+        expected: &Digest,
+        size: u64,
+        owner: u32,
+    ) -> Result<Self, OciError> {
+        let file = open_blob_nofollow(path)?;
+        let meta = file.metadata().map_err(map_io_error)?;
+        if let Some(v) = blob_trust_violation(&meta, Some(owner)) {
+            return Err(OciError::new(OciErrorCode::FailedPrecondition, v));
+        }
+        let verified = verify_blob_file_digest_with(recorder, &file, expected, size)?;
+        if verified.size != size {
+            return Err(OciError::new(
+                OciErrorCode::DataLoss,
+                "layer blob size does not match the descriptor",
+            ));
+        }
+        Ok(Self {
+            file,
+            digest: verified.digest,
+            size: verified.size,
+        })
+    }
+
+    /// 検証済みの digest（descriptor の `digest` と一致した値）。
+    pub fn digest(&self) -> &Digest {
+        &self.digest
+    }
+
+    /// 検証済みのサイズ（descriptor の `size` と一致した値）。
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// 展開側が読み取りに使うハンドル（モジュール内限定。パスは持たない）。
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
+}
+
 /// Reader を EOF まで読み、小文字 hex の sha256 と読み取りバイト数を返す。
 fn sha256_hex_of_reader<R: Read>(mut r: R, max_bytes: u64) -> Result<(String, u64), OciError> {
     let mut hasher = Sha256::new();
@@ -529,12 +637,6 @@ pub fn open_gzip_layer(
 ) -> Result<GzipLayerReader<File>, OciError> {
     let file = open_regular_blob(path)?;
     Ok(GzipLayerReader::new(file, max_uncompressed_bytes))
-}
-
-/// 非圧縮レイヤー blob を開いて `PlainLayerReader` を返す。通常ファイル以外は `InvalidArgument`。
-pub fn open_plain_layer(path: &Path, max_bytes: u64) -> Result<PlainLayerReader<File>, OciError> {
-    let file = open_regular_blob(path)?;
-    Ok(PlainLayerReader::new(file, max_bytes))
 }
 
 /// 計装なしの `decompress_layer_to_writer_with`（`NoopOciOpRecorder`）。
@@ -1193,5 +1295,117 @@ mod tests {
         );
         let mut b = [0u8; 4];
         assert!(over.read(&mut b).is_err());
+    }
+
+    /// 0600 のファイルを書く（umask に依らず信頼条件を満たす）。
+    #[cfg(unix)]
+    fn write_0600(path: &Path, data: &[u8]) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, data).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn uid_of(path: &Path) -> u32 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).unwrap().uid()
+    }
+
+    /// OCI-1・#2309: 信頼条件を満たす blob は検証済みの値になり、digest とサイズが載る。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_verified_layer_blob_accepts_trusted_blob() {
+        let d = tmp_dir("vlb-ok");
+        let p = d.join("b");
+        write_0600(&p, b"abc");
+        let b = VerifiedLayerBlob::open(&p, &Digest::parse(ABC).unwrap(), 3, uid_of(&p)).unwrap();
+        assert_eq!(b.digest().as_str(), ABC);
+        assert_eq!(b.size(), 3);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-1・#2309: symlink の blob は辿らずに拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_verified_layer_blob_rejects_symlink() {
+        let d = tmp_dir("vlb-link");
+        let real = d.join("real");
+        write_0600(&real, b"abc");
+        let link = d.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let e = VerifiedLayerBlob::open(&link, &Digest::parse(ABC).unwrap(), 3, uid_of(&real))
+            .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+        assert_eq!(e.message(), "blob path is not a regular file");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-1・#2309: 期待と違う所有者の blob は拒否する（実ファイルの uid と違う値を渡して再現する）。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_verified_layer_blob_rejects_foreign_owner() {
+        let d = tmp_dir("vlb-owner");
+        let p = d.join("b");
+        write_0600(&p, b"abc");
+        let e = VerifiedLayerBlob::open(&p, &Digest::parse(ABC).unwrap(), 3, uid_of(&p) ^ 1)
+            .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "blob has an unexpected owner");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-1・#2309: ハードリンクが増えた blob と group 書き込み可の blob は拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_verified_layer_blob_rejects_extra_links_and_group_writable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = tmp_dir("vlb-mode");
+        let p = d.join("b");
+        write_0600(&p, b"abc");
+        let uid = uid_of(&p);
+        let abc = Digest::parse(ABC).unwrap();
+        std::fs::hard_link(&p, d.join("b2")).unwrap();
+        let e = VerifiedLayerBlob::open(&p, &abc, 3, uid).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "blob has extra hard links");
+        let q = d.join("c");
+        write_0600(&q, b"abc");
+        std::fs::set_permissions(&q, std::fs::Permissions::from_mode(0o620)).unwrap();
+        let e = VerifiedLayerBlob::open(&q, &abc, 3, uid).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "blob is writable by group or others");
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-1・#2309: digest の不一致・宣言より短い blob は `DataLoss`、長い blob は `ResourceExhausted`。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_verified_layer_blob_rejects_digest_or_size_mismatch() {
+        let d = tmp_dir("vlb-digest");
+        let p = d.join("b");
+        write_0600(&p, b"abc");
+        let uid = uid_of(&p);
+        let e = VerifiedLayerBlob::open(&p, &Digest::parse(EMPTY).unwrap(), 3, uid).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        assert_eq!(e.message(), MSG);
+        let abc = Digest::parse(ABC).unwrap();
+        let e = VerifiedLayerBlob::open(&p, &abc, 4, uid).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        assert_eq!(e.message(), "layer blob size does not match the descriptor");
+        let e = VerifiedLayerBlob::open(&p, &abc, 2, uid).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::ResourceExhausted);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// OCI-1・#2309: 非 Unix では開かずに `Unimplemented`。
+    #[cfg(not(unix))]
+    #[test]
+    fn oci1_verified_layer_blob_is_unimplemented_off_unix() {
+        let d = tmp_dir("vlb-off-unix");
+        let p = d.join("b");
+        std::fs::write(&p, b"abc").unwrap();
+        let e = VerifiedLayerBlob::open(&p, &Digest::parse(ABC).unwrap(), 3, 0).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::Unimplemented);
+        std::fs::remove_dir_all(&d).unwrap();
     }
 }

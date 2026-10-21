@@ -7,7 +7,7 @@
 //! 呼び出し契約: layer 展開（TASK-52.x）やキャッシュ公開の前に、呼び出し側が本検証を通すこと。
 //! イメージの展開へ渡す blob は、検証済みを型で表す `VerifiedLayerBlob`（下記）で作る（#2309）。
 //! 検証対象は呼び出し側が管理するステージング領域のファイル（pull では `PullSession` の `<root>/staging/<pull-id>/`。#474）とし、パスはエラー文言に載せない。
-//! 未実装（後続 issue）: `fetch_blob` 内への組み込み、manifest 本文の digest 突合、tar 展開・キャッシュ格納。
+//! 未実装（後続 issue）: `fetch_blob` 内への組み込み、manifest 本文の digest 突合。tar 展開は子モジュール `extract` に実装済みで、キャッシュ格納と展開の配線は cri の `image_pull` が担う（#2323）。
 //!
 //! 開いたハンドルでの検証（OCI-1・#446）: 呼び出し側が blob の所有者・権限・ハードリンク数を確認してから
 //! 内容を検証する場合（`fandhe-container-cri` の `PullImage` のキャッシュ再利用・公開）は、

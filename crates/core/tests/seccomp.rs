@@ -1,16 +1,17 @@
 //! 起動したコンテナプロセスの中で禁止 syscall が遮断されることの結合試験（CORE-5・TASK-38.4・#179。
 //! REPAIR-12 の機械照合）。
 //!
-//! `seccomp_enforcement`（#178）は使い捨ての子で適用経路を呼ぶ検証にとどまる。本試験は
-//! `spawn_container_seccomp_probe` が fork した実際のコンテナプロセス（新しい PID namespace の PID 1・
-//! pivot_root 後・capability 削減・`NO_NEW_PRIVS` 設定済み）の中で、ステージ列の**組み込み `Seccomp` 段**が
-//! 載せたフィルタが禁止 syscall を拒否することを照合する。`ERRNO(EPERM)` の syscall は、子が pivot 後の
-//! `/seccomp-probe` へ書いた記録（`SeccompProbeRecord`）の具体値で照合する。`KILL_PROCESS` の
+//! `seccomp_enforcement`（#178）は使い捨ての子で適用経路を呼ぶ検証にとどまる。本試験は、
+//! `with_landlock` を載せたステージ列で試験バイナリ自身を `/entry` として exec した実際のコンテナプロセス
+//! （新しい PID namespace の PID 1・pivot_root 後・capability 削減・`NO_NEW_PRIVS` 設定済み。
+//! `tests/support/real_entry.rs`。#2386・REPAIR-3）の**エントリポイントの中**で、ステージ列の**組み込み
+//! `Seccomp` 段**が載せたフィルタが禁止 syscall を拒否することを照合する。`ERRNO(EPERM)` の syscall は、
+//! エントリポイントが `probe_denied_syscalls_for_test` で観測して pivot 後の `/seccomp-probe` へ書いた記録
+//! （`SeccompProbeRecord`）の具体値で照合する。`KILL_PROCESS` の
 //! `unshare`・`ptrace`・`kexec_load`（ESC-06。`DeniedSyscall::deny_action`）は戻らず記録を書けないため、
-//! 1 件ずつ別の子で発行し、親が終了シグナル SIGSYS（31）を照合する。Landlock を載せない構成では `LaunchReady` が作られず exec は拒否される（fail-closed。
-//! #1714）ため、プローブ用 API は exec の代わりに終端でプローブを実行する。exec 後のプロセスでの拒否
-//! （`mount` の `EPERM`・許可 syscall の対照・`unshare`/`ptrace`/`kexec_load` の SIGSYS）は、`production_launcher` の
-//! シナリオ J・K が照合する（#2012）。
+//! 1 件ずつ別の子で発行し、親が終了シグナル SIGSYS（31）を照合する（こちらは exec の代わりに終端でプローブを
+//! 実行する `spawn_container_probe`。エントリポイント内への移行は別途。REPAIR-3）。`production_launcher` の
+//! シナリオ J・K は本番 launcher 経由の exec 後の拒否を照合する（#2012）。
 //!
 //! # 識別的な検査と網羅確認
 //! - 識別的（capability 不足ではなく seccomp が拒否したことを示せる）: `kcmp(自 pid, 自 pid, KCMP_VM)`
@@ -33,7 +34,8 @@
 //!   子だけのため）。
 //!
 //! # 実機前提テストとしての分離
-//! root もしくは非特権 user namespace を許可するホストが必要（`capabilities` と同じ）。GitHub ホステッド
+//! root もしくは非特権 user namespace を許可するホストと、Landlock ABI 6 以上（Linux 6.12 以上）が必要
+//! （`with_landlock` を載せて exec まで到達させるため。満たさなければ検出の失敗で panic）。GitHub ホステッド
 //! runner で保証できないため `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」）。プローブの
 //! 引数は、フィルタが欠けていてもホストへ副作用が出ないもの（attach を伴わない ptrace・segment 数超過の
 //! kexec_load・コンテナの mount namespace に閉じる mount 系）に固定している。実行された場合は分離の拒否・
@@ -42,6 +44,16 @@
 #[cfg(target_os = "linux")]
 use fandhe_container_core::exec::{ProbeOutcome, SeccompProbeRecord};
 use fandhe_container_core::seccomp::DeniedSyscall;
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
+#[path = "support/real_entry.rs"]
+mod real_entry;
 
 /// 結合試験が errno を照合する禁止 syscall の論理名（`DeniedSyscall::ALL` に含まれる必要がある）。
 const PROBED: [&str; 7] = [
@@ -132,6 +144,11 @@ fn main() {
     )
 ))]
 fn main() {
+    // exec 後のエントリポイント（`/entry --entry seccomp-probe`）は他のどの判定よりも先に分ける。
+    // 後ろに置くとコンテナ内のプロセスが "ignored" を出して 0 で終わり、親が記録の欠落で失敗する。
+    if std::env::args().any(|a| a == "--entry") {
+        linux::entry_main();
+    }
     // シナリオ再入時は常に走る部分を繰り返さない。
     if std::env::args().any(|a| a == "--scenario") {
         linux::run();
@@ -162,11 +179,15 @@ mod linux {
     use fandhe_container_core::exec::{
         ChildExit, IsolationConfig, Namespace, NamespaceSet, ProbeOutcome, SeccompProbeRecord,
         StagePipeline, isolate, isolate_rootful_host_root, plan, plan_rootful_host_root,
-        spawn_container_probe, spawn_container_seccomp_probe,
+        spawn_container_probe,
     };
     use fandhe_container_core::exec::{
-        EscapeSyscallProbe, probe_escape_syscall, probe_kcmp_self_for_test,
+        DevptsGidSource, EscapeSyscallProbe, probe_denied_syscalls_for_test, probe_escape_syscall,
+        probe_kcmp_self_for_test, spawn_container_with_stages_and_devices,
     };
+    use fandhe_container_core::rootless::single_id_mapping;
+
+    use super::real_entry;
 
     /// Linux の `EPERM`（x86_64・aarch64 共通で 1）。
     const EPERM: i32 = 1;
@@ -386,19 +407,80 @@ mod linux {
         );
     }
 
-    /// 分離 → fork したコンテナ内でプローブ → 記録を具体値で照合する。
+    /// 分離の前の実効 gid（`/proc/self/status` の `Gid:` の 2 列目。user namespace に入ると 0 に見えるため、
+    /// rootless の devpts の gid 判定に分離前の値を使う）。
+    fn host_egid() -> u32 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("read status")
+            .lines()
+            .find(|l| l.starts_with("Gid:"))
+            .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
+            .and_then(|v| v.parse().ok())
+            .expect("parse egid")
+    }
+
+    /// exec 後のエントリポイント（コンテナ内の PID 1。標準入出力は `/dev/null`）: 禁止 syscall を観測して
+    /// `/seccomp-probe` へ `create_new` で書く。失敗は何も書かずに非 0 で終わる（親が失敗にする）。
+    pub fn entry_main() -> ! {
+        use std::io::Write as _;
+        let Ok(rec) = probe_denied_syscalls_for_test() else {
+            std::process::exit(3);
+        };
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(Path::new("/").join(RECORD))
+            .and_then(|mut f| {
+                f.write_all(rec.render().as_bytes())?;
+                f.sync_all()
+            });
+        std::process::exit(if written.is_ok() { 0 } else { 4 });
+    }
+
+    /// 分離 → `with_landlock` を載せて `/entry` を exec → エントリポイント内の観測の記録を具体値で照合する。
     fn scenario(rootfs: &Path) {
+        let is_root = is_root();
+        let egid = host_egid();
         isolate_scenario();
 
-        let child = spawn_container_seccomp_probe(rootfs, StagePipeline::new())
-            .unwrap_or_else(|e| panic!("spawn: {e}"));
+        let ld = real_entry::install_entry(rootfs);
+        let entry = real_entry::entrypoint_from(
+            &real_entry::entry_args("seccomp-probe"),
+            &real_entry::entry_env(&ld),
+        );
+        let stages = StagePipeline::new()
+            .with_landlock(real_entry::landlock_ruleset())
+            .unwrap_or_else(|e| panic!("register landlock: {e}"));
+        // root は gid 0 を写せない（`single_id_mapping` は SEC-5 で host_id == 0 を拒否する）ため `Rootful`。
+        let child = if is_root {
+            spawn_container_with_stages_and_devices(
+                rootfs,
+                &entry,
+                stages,
+                DevptsGidSource::Rootful,
+            )
+        } else {
+            let gid_map = single_id_mapping(egid).expect("single id mapping");
+            spawn_container_with_stages_and_devices(
+                rootfs,
+                &entry,
+                stages,
+                DevptsGidSource::Rootless(&gid_map),
+            )
+        }
+        .unwrap_or_else(|e| panic!("spawn: {e}"));
         let exit = child.wait_timeout(timeout()).unwrap_or_else(|e| {
             let _ = child.kill_and_reap(Duration::from_secs(5));
             panic!("wait: {e}")
         });
-        assert_eq!(exit, ChildExit::Exited(0), "probe child must exit with 0");
+        assert_eq!(exit, ChildExit::Exited(0), "entrypoint must exit with 0");
 
-        let text = std::fs::read_to_string(rootfs.join(RECORD))
+        // 記録はコンテナが書いた外部入力として、上限つきで読む。
+        let mut text = String::new();
+        std::fs::File::open(rootfs.join(RECORD))
+            .unwrap_or_else(|e| panic!("open probe record: {e}"))
+            .take(4096)
+            .read_to_string(&mut text)
             .unwrap_or_else(|e| panic!("read probe record: {e}"));
         let rec = SeccompProbeRecord::parse(&text).unwrap_or_else(|e| panic!("parse record: {e}"));
 

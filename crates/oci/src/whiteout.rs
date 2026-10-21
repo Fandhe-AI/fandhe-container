@@ -5,7 +5,8 @@
 //!
 //! - `classify`: tar エントリの最終コンポーネントを whiteout / 不透明マーカー / 通常名へ分類する。
 //!   `extract_one_layer` のパス 1（収集・検証）とパス 3（展開。マーカーは書かずに読み飛ばす）が各エントリに対して呼ぶ。
-//!   `.wh..wh.` 予約名（AUFS メタデータ）は `Reserved` として読み飛ばしの対象にする（#2183）。
+//!   `.wh..wh.` 予約名（AUFS メタデータ）は `Reserved` として読み飛ばしの対象にする（#2183）。種別は読み飛ばす前に
+//!   検査し、`.wh..wh.plnk` 配下への hardlink は差し替えず拒否する（#2312）。判定は `is_reserved`。
 //! - `remove_tree_nofollow`: symlink を追従せずに実体（ファイル・symlink・ディレクトリの木）を再帰削除する。
 //!   パス 2（whiteout の適用）と、パス 3 で下位レイヤー由来のノードを置き換えるとき（image-spec の
 //!   「Changeset over existing files」）に `Extractor` から呼ばれる。
@@ -47,8 +48,16 @@ pub(crate) enum NameClass {
     /// `.wh..wh..opq`（不透明ディレクトリ。中身の削除は `remove_dir_contents_nofollow`・TASK-53.2）。
     Opaque,
     /// `.wh..wh.` で始まり `.wh..wh..opq` ではない名前（AUFS のメタデータ）。
-    /// 呼び出し側 `plan_entry` がエントリ全体を rootfs へ書かずに読み飛ばす（何も消さない）。
+    /// 呼び出し側 `plan_entry` が、種別を検査した上でエントリ全体を rootfs へ書かずに読み飛ばす（何も消さない）。
     Reserved,
+}
+
+/// コンポーネントが AUFS メタデータの予約名（`.wh..wh.` で始まり `.wh..wh..opq` 以外）か判定する。
+///
+/// 判定の定義を 1 か所に置くため `classify` と、`layer::extract` の hardlink 参照先の検査（`.wh..wh.plnk`
+/// 配下への hardlink を差し替えず `Unimplemented` で拒否する。#2312・OCI-2）が共に使う。
+pub(crate) fn is_reserved(name: &[u8]) -> bool {
+    name != OPAQUE_MARKER && name.starts_with(RESERVED_PREFIX)
 }
 
 /// 最終コンポーネント（バイト列）を分類する。
@@ -56,7 +65,10 @@ pub(crate) enum NameClass {
 /// `.wh..wh.` の予約名（`.wh..wh..opq` 以外）は `Reserved` を返す。AUFS ストレージドライバ時代の古い
 /// イメージを展開できるよう、moby / containerd と同様に失敗させず読み飛ばす。image-spec 上 `.wh.` で始まる
 /// 名前は FS に実在できず whiteout 自体も隠す決まりなので、読み飛ばしても仕様に反しない。rootfs へ何も書かない
-/// ため分離の攻撃面は増えない。親の位置の whiteout など fail-closed の除外は `plan_entry` が担う。
+/// ため分離の攻撃面は増えない。ただし読み飛ばす前に、エントリの種別は予約名の外と同じ規則で検査する
+/// （未対応の種別は `plan_entry` が拒否する。#2312）。`.wh..wh.plnk` 配下を指す hardlink は moby のような
+/// 差し替えをせず、`plan_entry` が `Unimplemented` で拒否する（理由は `layer::extract` の「AUFS メタデータの予約名」）。
+/// 親の位置の whiteout など fail-closed の除外は `plan_entry` が担う。
 ///
 /// 不正な whiteout（対象が空・`.`・`..`・`/` や NUL を含む・長すぎる）は
 /// `InvalidArgument` で拒否する（`.wh...` を `..` の whiteout として解釈し親を消す事故を防ぐ）。
@@ -65,7 +77,7 @@ pub(crate) fn classify(name: &[u8]) -> Result<NameClass, OciError> {
     if name == OPAQUE_MARKER {
         return Ok(NameClass::Opaque);
     }
-    if name.starts_with(RESERVED_PREFIX) {
+    if is_reserved(name) {
         return Ok(NameClass::Reserved);
     }
     let Some(target) = name.strip_prefix(WHITEOUT_PREFIX) else {
@@ -183,6 +195,17 @@ fn remove_file_best_effort(path: &Path, meta: &fs::Metadata) -> Result<(), OciEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// OCI-2・#2312: 予約名の判定（`.wh..wh.` 始まりで `.wh..wh..opq` 以外）。
+    #[test]
+    fn is_reserved_matches_aufs_names_only() {
+        for n in [&b".wh..wh.plnk"[..], b".wh..wh.aufs", b".wh..wh."] {
+            assert!(is_reserved(n), "{n:?}");
+        }
+        for n in [&b".wh..wh..opq"[..], b".wh.x", b".WH..WH.plnk", b"plnk"] {
+            assert!(!is_reserved(n), "{n:?}");
+        }
+    }
 
     fn invalid(name: &[u8]) {
         let e = classify(name).expect_err("must be rejected");

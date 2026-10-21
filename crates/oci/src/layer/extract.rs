@@ -12,8 +12,9 @@
 //!   削除・権限変更・リンク作成の前に `AlreadyExists` で拒否する（IO-5。下記「別表記の衝突」）。
 //! - whiteout・不透明ディレクトリを下位レイヤーの実体へ適用し、マーカー自体は展開しない（OCI-2。下記
 //!   「レイヤーごとの 3 パス」）。
-//! - AUFS のメタデータ（`.wh..wh.` で始まり `.wh..wh..opq` 以外の名前。`.wh..wh.plnk` 等）は、深さ・種別を問わず
-//!   エントリごと読み飛ばして rootfs へ何も書かない（#2183・OCI-2。下記「AUFS メタデータの予約名」）。
+//! - AUFS のメタデータ（`.wh..wh.` で始まり `.wh..wh..opq` 以外の名前。`.wh..wh.plnk` 等）は、種別を予約名の外と
+//!   同じ規則で検査してから、深さを問わずエントリごと読み飛ばして rootfs へ何も書かない
+//!   （#2183・#2312・OCI-2。下記「AUFS メタデータの予約名」）。
 //!
 //! tar クレートは解析（エントリ列挙）だけに使い、`unpack` / `unpack_in` は使わない（#408 の承認条件）。
 //!
@@ -77,13 +78,24 @@
 //! 決まりなので、読み飛ばしても仕様に反しない。よって本実装も読み飛ばす（`Plan::Skip`）。
 //!
 //! - 判定はパスを先頭から順に分類し、最初に通常でないと判定されたコンポーネントが決める。予約名が先なら
-//!   配下（中身のある通常ファイル・ディレクトリ・リンク・FIFO を含む）をエントリごと読み飛ばす。親の位置の
+//!   配下（中身のある通常ファイル・ディレクトリ・リンクを含む）をエントリごと読み飛ばす。ただし読み飛ばす前に
+//!   種別を予約名の外と同じ規則で検査し、未対応の種別（FIFO・デバイス等）は予約名の下でも `PermissionDenied` で
+//!   拒否する（パス 1 で落ちるため rootfs は変わらない。#2312）。親の位置の
 //!   `.wh.<x>`・`.wh..wh..opq` が先なら従来どおり `InvalidArgument` で拒否する（fail-closed）。
 //! - 判定は `normalize_entry_path` の後なので、`..`・絶対パス・NUL・長すぎるパスは予約名の下でも拒否する。
 //! - 読み飛ばしたエントリも `max_entries` と入力上限には数え、展開バイト数には数えない。件数は
 //!   `ExtractedLayer::ignored_reserved_entries` に返す（黙って捨てない）。
-//! - moby との差: moby は `.wh..wh.plnk` 配下を指す hardlink の参照先を差し替えるが、本実装は再現しない。
-//!   参照先が展開されないため、その hardlink は `NotFound` で拒否する（fail-closed）。
+//! - moby との差（#2312）: moby/go-archive `diff.go`（commit a9a82af9）はルート直下の `.wh..wh.plnk` で始まる
+//!   通常ファイルを dest 内の一時ディレクトリへ basename で書き出し、後に来る hardlink の参照先が
+//!   `.wh..wh.plnk` で始まると basename だけで引き当てて、hardlink ではなく独立した通常ファイルのコピーを作る
+//!   （引き当てられなければ失敗）。本実装はこの差し替えを再現せず、`.wh..wh.plnk` など予約名を含む参照先への
+//!   hardlink を、パス 1 で `Unimplemented` により拒否する（fail-closed。パス 2 より前なので rootfs は変わらない）。
+//!   理由: (1) 結果がエントリの並びで変わり、並び順に依らない 3 パス設計と相容れない。(2) rootfs 内に作業用の木が
+//!   要り、IO-5 の `NameIndex` が依る「`root` 配下の実在項目はすべてこの展開が作った名前」という不変条件の例外に
+//!   なる（root の外に置くなら別の書き込み場所と上限の計上が要る）。(3) basename だけの引き当てはパス検証の契約より
+//!   弱い。(4) image-spec に定めが無い AUFS 固有の慣例で、実イメージで必要になれば後から足せる（可逆）。
+//!   これは #2312 での安全側の判断であり、オーナー承認済みの仕様ではない。symlink 経由で予約名のディレクトリが
+//!   物理的に作られた後にそれを字面で指す hardlink も、同じく拒否する。
 //!
 //! # 別表記の衝突（IO-5）
 //! 大文字小文字非区別の FS（Windows・macOS の既定）では `f` と `F`、正規化非区別の FS（APFS）では NFC と NFD の
@@ -2555,8 +2567,8 @@ fn check_root_empty(root: &Path) -> Result<(), OciError> {
 /// tar エントリ 1 件を検証し、処理内容を返す（パス 1 とパス 3 で共通。副作用なし）。
 ///
 /// パスの正規化（`normalize_entry_path`）、先頭から順の各コンポーネントの分類（`whiteout::classify`）。
-/// 最初に通常でないと判定されたものが決める: 予約名（AUFS メタデータ）ならエントリ全体を `Plan::Skip`
-/// （読み飛ばし。moby / containerd と同じ。#2183・OCI-2）、親の位置の whiteout 名・不透明マーカーなら拒否。
+/// 最初に通常でないと判定されたものが決める: 予約名（AUFS メタデータ）なら、種別を検査した上でエントリ全体を
+/// `Plan::Skip`（読み飛ばし。moby / containerd と同じ。#2183・#2312・OCI-2）、親の位置の whiteout 名・不透明マーカーなら拒否。
 /// 最終コンポーネントの分類、マーカーの形（中身の無い通常ファイル）の検査、未対応の種別の拒否を行う。
 fn plan_entry<R: Read>(entry: &tar::Entry<'_, R>) -> Result<Plan, OciError> {
     let ty = entry.header().entry_type();
@@ -2574,9 +2586,11 @@ fn plan_entry<R: Read>(entry: &tar::Entry<'_, R>) -> Result<Plan, OciError> {
     while let Some(c) = raw_comps.next() {
         let cls = whiteout::classify(c)?;
         if cls == NameClass::Reserved {
-            // AUFS メタデータ。最初に現れた非通常コンポーネントが予約名なら、深さ・種別・サイズを問わず
+            // AUFS メタデータ。最初に現れた非通常コンポーネントが予約名なら、深さ・サイズを問わず
             // エントリ全体を読み飛ばす（配下の通常ファイルは中身を持つためマーカーの形は検査しない）。
+            // ただし種別は予約名の外と同じ規則で先に検査する（FIFO・デバイス等は fail-closed。#2312）。
             // 正規化（`..`・絶対パス・NUL・長さ）は上で済んでおり、予約名の下でも従来どおり拒否される。
+            check_supported_entry_type(ty)?;
             return Ok(Plan::Skip);
         }
         if raw_comps.peek().is_none() {
@@ -2620,14 +2634,56 @@ fn plan_entry<R: Read>(entry: &tar::Entry<'_, R>) -> Result<Plan, OciError> {
         EntryType::Regular | EntryType::Continuous if is_dir_name => Plan::Dir(comps, mode()?),
         EntryType::Regular | EntryType::Continuous => Plan::File(comps, mode()?),
         EntryType::Symlink => Plan::Symlink(comps),
-        EntryType::Link => Plan::Hardlink(comps),
+        EntryType::Link => {
+            check_hardlink_target_not_aufs(entry)?;
+            Plan::Hardlink(comps)
+        }
         _ => {
+            check_supported_entry_type(ty)?;
+            // 受理する種別は上の腕で網羅済みでここへは来ない（来たら未対応として拒否する）。
             return Err(err(
                 OciErrorCode::PermissionDenied,
                 "unsupported entry type",
             ));
         }
     })
+}
+
+/// 展開できるエントリ種別（ディレクトリ・通常ファイル・Continuous・symlink・hardlink）だけを受理する。
+///
+/// 予約名（AUFS メタデータ）の下と外の両方で `plan_entry` が呼び、受理する種別の定義を 1 か所にそろえる。
+/// 未対応の種別は `PermissionDenied`（#2312・OCI-2）。
+fn check_supported_entry_type(ty: EntryType) -> Result<(), OciError> {
+    match ty {
+        EntryType::Directory
+        | EntryType::Regular
+        | EntryType::Continuous
+        | EntryType::Symlink
+        | EntryType::Link => Ok(()),
+        _ => Err(err(
+            OciErrorCode::PermissionDenied,
+            "unsupported entry type",
+        )),
+    }
+}
+
+/// hardlink の参照先の構造を検査し、AUFS の予約名（`.wh..wh.plnk` 等）を含むなら `Unimplemented` で拒否する。
+///
+/// パス 1 で呼ぶため、パス 2 の whiteout 適用より前に拒否され rootfs は変わらない（#2312・OCI-2）。
+/// moby 互換の差し替えを実装しない理由はモジュール doc「AUFS メタデータの予約名」。構造の検査
+/// （`..`・絶対パス・NUL・長さ）はパス 3 の `make_hardlink` と同じコードで前倒しする。
+fn check_hardlink_target_not_aufs<R: Read>(entry: &tar::Entry<'_, R>) -> Result<(), OciError> {
+    let target = entry
+        .link_name_bytes()
+        .ok_or_else(|| err(OciErrorCode::InvalidArgument, "hardlink target is invalid"))?;
+    normalize_entry_path_for(&target, false)?;
+    if target.split(|b| *b == b'/').any(whiteout::is_reserved) {
+        return Err(err(
+            OciErrorCode::Unimplemented,
+            "hardlink into AUFS metadata is not supported",
+        ));
+    }
+    Ok(())
 }
 
 /// tar 終端後の残りを EOF まで読み捨て、gzip トレーラ（CRC32・ISIZE）を検証させる。
@@ -5819,7 +5875,7 @@ mod tests {
         );
     }
 
-    /// OCI-2・#2183: 読み飛ばしの件数・バイト数の数え方（ネスト・単体・FIFO を含む）。
+    /// OCI-2・#2183: 読み飛ばしの件数・バイト数の数え方（ネスト・単体・symlink を含む）。
     #[test]
     fn oci2_aufs_reserved_skip_counts() {
         let sb = Sandbox::new();
@@ -5829,7 +5885,7 @@ mod tests {
             file("d/.wh..wh.plnk", 0o644, b"abc"),
             file(".wh..wh.orph/x", 0o644, b"zz"),
             wh(".wh..wh."),
-            raw_entry(b".wh..wh.orph/f", EntryType::Fifo, b"", 0o644, 0, b""),
+            symlink(".wh..wh.orph/l", "/etc/passwd"),
         ];
         let r = extract_one_layer(
             &mut ex,
@@ -5845,17 +5901,70 @@ mod tests {
         sb.assert_outside_untouched();
     }
 
-    /// OCI-2・#2183: `.wh..wh.plnk` 配下を指す hardlink は moby の差し替えを再現せず、並びに依らず `NotFound`。
+    /// OCI-2・#2312: 予約名（AUFS メタデータ）を含む参照先への hardlink は差し替えず、並びに依らず `Unimplemented`。
     #[test]
-    fn oci2_hardlink_into_aufs_plnk_is_not_found() {
+    fn oci2_hardlink_into_aufs_metadata_is_unimplemented() {
+        for target in [
+            ".wh..wh.plnk/123",
+            "./.wh..wh.plnk/123",
+            ".wh..wh.plnk/sub/123",
+            "d/.wh..wh.plnk/1",
+            ".wh..wh.aufs",
+        ] {
+            let link = hardlink("g", target);
+            let r = all_orders(&[], &[file(".wh..wh.plnk/123", 0o644, b"x"), link.clone()]);
+            assert_eq!(r.unwrap_err(), OciErrorCode::Unimplemented, "{target}");
+            let r = all_orders(&[], &[link]);
+            assert_eq!(r.unwrap_err(), OciErrorCode::Unimplemented, "{target}");
+        }
+    }
+
+    /// OCI-2・#2312: plnk への hardlink はパス 2（whiteout の適用）より前に拒否され、下位の実体は残る。
+    #[test]
+    fn oci2_hardlink_into_aufs_metadata_rejected_before_whiteout() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(&mut ex, &[file("a", 0o644, b"a")]);
+        let before = snapshot(&sb.root);
+        assert_eq!(
+            lay_err(&mut ex, &[wh(".wh.a"), hardlink("g", ".wh..wh.plnk/1")]),
+            OciErrorCode::Unimplemented
+        );
+        assert_eq!(snapshot(&sb.root), before);
+        sb.assert_outside_untouched();
+    }
+
+    /// OCI-2・#2312: 予約名配下の未対応の種別は、予約名の外と同じ `PermissionDenied` で拒否し rootfs を変えない。
+    #[test]
+    fn oci2_aufs_reserved_rejects_unsupported_types() {
+        let sb = Sandbox::new();
+        let mut ex = ex_for(&sb, host_lstat);
+        lay(&mut ex, &[file("keep", 0o644, b"k")]);
+        let before = snapshot(&sb.root);
+        for (name, ty) in [
+            (&b".wh..wh.plnk/f"[..], EntryType::Fifo),
+            (&b".wh..wh.orph/c"[..], EntryType::Char),
+            (&b"d/.wh..wh.aufs"[..], EntryType::Block),
+        ] {
+            let bad = raw_entry(name, ty, b"", 0o644, 0, b"");
+            assert_eq!(
+                lay_err(&mut ex, &[file("new", 0o644, b"n"), bad]),
+                OciErrorCode::PermissionDenied
+            );
+            assert_eq!(snapshot(&sb.root), before);
+            // 予約名の外に同じ種別を置いた場合と同じコード。
+            let outside = raw_entry(b"x", ty, b"", 0o644, 0, b"");
+            assert_eq!(lay_err(&mut ex, &[outside]), OciErrorCode::PermissionDenied);
+        }
+        sb.assert_outside_untouched();
         let r = all_orders(
-            &[],
+            &[file("a", 0o644, b"a")],
             &[
-                file(".wh..wh.plnk/123", 0o644, b"x"),
-                hardlink("g", ".wh..wh.plnk/123"),
+                wh(".wh.a"),
+                raw_entry(b".wh..wh.plnk/f", EntryType::Fifo, b"", 0o644, 0, b""),
             ],
         );
-        assert_eq!(r.unwrap_err(), OciErrorCode::NotFound);
+        assert_eq!(r.unwrap_err(), OciErrorCode::PermissionDenied);
     }
 
     /// OCI-2・#2183: 予約名の読み飛ばしでも fail-closed の拒否（`..`・親の位置の whiteout / 不透明）は残り、

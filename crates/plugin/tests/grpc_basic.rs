@@ -156,13 +156,16 @@ async fn roundtrip_and_graceful_shutdown() {
 }
 
 /// 誰も listen していないポートへの接続は期限内に Unavailable か Timeout で失敗する（REPAIR-5）。
+///
+/// bind だけして listen しないソケットで番号を予約し、接続試行の後まで保持する。解放したポートを
+/// 並行試験のサーバーが再利用すると接続が成功してしまう間欠失敗を防ぐ（#2348）。
 #[tokio::test]
 async fn connect_refused_is_bounded() {
     tokio::time::timeout(WATCHDOG, async {
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().port()
-        };
+        // listen() を呼ばないこと。std の TcpListener は bind 時に listen まで行い接続が成功するため使わない。
+        let reserved = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = reserved.local_addr().unwrap().port();
         let cfg = GrpcClientConfig::new()
             .with_connect_timeout(Duration::from_secs(2))
             .unwrap();
@@ -177,6 +180,8 @@ async fn connect_refused_is_bounded() {
             ),
             "{e:?}"
         );
+        // 接続試行とアサーションが終わるまで予約を保持する。
+        drop(reserved);
     })
     .await
     .expect("watchdog");

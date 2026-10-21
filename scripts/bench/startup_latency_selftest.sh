@@ -78,6 +78,16 @@ expect_contains() {
   fi
 }
 
+expect_not_contains() {
+  local name="$1" needle="$2"
+  if [[ "$last_output" != *"$needle"* ]]; then
+    pass "$name"
+  else
+    fail "$name (output unexpectedly contains '$needle')"
+    print_indented "$last_output"
+  fi
+}
+
 expect_eq() {
   local name="$1" expected="$2" actual="$3"
   if [ "$expected" = "$actual" ]; then
@@ -808,6 +818,19 @@ elapsed=$((SECONDS - started))
 if [ "$elapsed" -lt 15 ]; then pass "exec-never-bounded (${elapsed}s < 15s)"; else fail "exec-never-bounded (${elapsed}s)"; fi
 expect_contains "exec-never-error" "runtime-exec-not-observed"
 if grep -q '^delete ' "$stub_log"; then pass "exec-never-delete-called"; else fail "exec-never-delete-called"; fi
+# 最後の照会の収集待ちが観測期限をまたぐ場合（#2375・REPAIR-5・REPAIR-12・CORE-10）。state の収集が
+# 0.6 秒遅れるので、2 回目の照会は期限（1 秒）の手前で復帰し、収集待ちだけが期限を越える。判定は state の
+# 復帰時刻と 124 で行うため collector-timeout にならず runtime-exec-not-observed になること。
+reset_log
+started="$SECONDS"
+STUB_MODE=exec-never STARTUP_LATENCY_TEST_COLLECT_DELAY=state.out:0.6 expect_rc "exec-never-flush-straddles-deadline" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1
+elapsed=$((SECONDS - started))
+if [ "$elapsed" -lt 15 ]; then pass "exec-never-flush-straddles-bounded (${elapsed}s < 15s)"; else fail "exec-never-flush-straddles-bounded (${elapsed}s)"; fi
+expect_contains "exec-never-flush-straddles-error" "runtime-exec-not-observed"
+expect_not_contains "exec-never-flush-straddles-no-state-failed" "runtime-state-failed"
+expect_not_contains "exec-never-flush-straddles-no-collector-timeout" "reason=collector-timeout"
+expect_not_contains "exec-never-flush-straddles-no-unverified" "runtime-state-unverified"
+if grep -q '^delete ' "$stub_log"; then pass "exec-never-flush-straddles-delete-called"; else fail "exec-never-flush-straddles-delete-called"; fi
 # running を観測した照会の完了が期限（--timeout 1 秒）を過ぎた場合は成功結果に混ぜず exit 1
 # （Codex P1）。照会は 2 回（0.6 秒 + 0.6 秒）。
 reset_log

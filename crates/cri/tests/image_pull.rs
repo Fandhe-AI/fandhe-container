@@ -1184,7 +1184,8 @@ fn sec_pull_does_not_publish_symlinked_staged_blob() {
 }
 // ---- レイヤー展開の配線（#2323・OCI-1・OCI-2・CRI-3・ERR-3） ----
 
-fn rootfs_path(dir: &TempDir, config_hex: &str) -> PathBuf {
+/// 公開済みエントリ（`rootfs/` と `unpack-record` を持つ。1 回の rename で公開される）。
+fn entry_path(dir: &TempDir, config_hex: &str) -> PathBuf {
     dir.0
         .join("cache")
         .join("rootfs")
@@ -1192,8 +1193,12 @@ fn rootfs_path(dir: &TempDir, config_hex: &str) -> PathBuf {
         .join(config_hex)
 }
 
+fn rootfs_path(dir: &TempDir, config_hex: &str) -> PathBuf {
+    entry_path(dir, config_hex).join("rootfs")
+}
+
 fn rootfs_exists(dir: &TempDir, config_hex: &str) -> bool {
-    fs::symlink_metadata(rootfs_path(dir, config_hex)).is_ok()
+    fs::symlink_metadata(entry_path(dir, config_hex)).is_ok()
 }
 
 fn mode_of(path: &Path) -> u32 {
@@ -1354,6 +1359,95 @@ fn oci1_pull_does_not_reuse_rootfs_unpacked_with_other_settings() {
     first.pull(&req("alpine:3.20")).expect("same settings");
 }
 
+/// OCI-1: 展開物と記録は同じエントリに入り、記録だけ・展開物だけが単独で公開されることはない（旧 `.fingerprint` は作らない）。
+#[test]
+fn oci1_pull_publishes_rootfs_and_record_together() {
+    let dir = TempDir::new("entry");
+    let puller = OciImagePuller::new(
+        Arc::new(FakeClient::new(two_layer_manifest())),
+        config(&dir),
+    );
+    puller.pull(&req("alpine:3.20")).expect("pull");
+    let entry = entry_path(&dir, SHA_CONFIG);
+    let mut names: Vec<String> = fs::read_dir(&entry)
+        .expect("entry")
+        .map(|e| e.expect("e").file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["rootfs", "unpack-record"]);
+    let sha256_dir = entry.parent().expect("parent");
+    assert_eq!(fs::read_dir(sha256_dir).expect("dir").count(), 1);
+    let record = fs::read_to_string(entry.join("unpack-record")).expect("record");
+    assert!(
+        record.contains("ownership=keep\nspecial-bits=strip\n"),
+        "{record}"
+    );
+    assert!(record.contains(&format!("config=sha256:{SHA_CONFIG}\n")));
+    // 記録の無いエントリ（旧版・手作業の残骸）は再利用せず拒否する。
+    fs::remove_file(entry.join("unpack-record")).expect("rm record");
+    let err = puller.pull(&req("alpine:3.20")).expect_err("no record");
+    assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(
+        err.message(),
+        "image rootfs cache entry has no unpack record"
+    );
+}
+
+/// OCI-1: 公開済みでも layer の読み取り方式（mediaType）が違う manifest は、今回の descriptor に従って検証し直す。
+/// 非圧縮 tar の blob を tar+gzip と宣言した manifest は、キャッシュ命中で通らず DataLoss になる。展開物は消さない。
+#[test]
+fn oci1_pull_cached_rootfs_revalidates_other_layer_media_type() {
+    let dir = TempDir::new("cached-media");
+    let first = OciImagePuller::new(
+        Arc::new(FakeClient::new(two_layer_manifest())),
+        config(&dir),
+    );
+    first.pull(&req("alpine:3.20")).expect("first");
+    let marker = rootfs_path(&dir, SHA_CONFIG).join("marker");
+    fs::write(&marker, b"m").expect("marker");
+    let other = manifest_json_media(
+        SHA_CONFIG,
+        &[(SHA_LAYER1, SIZE_LAYER1), (SHA_LAYER2, SIZE_LAYER2)],
+        "application/vnd.oci.image.layer.v1.tar+gzip",
+    );
+    let second = OciImagePuller::new(Arc::new(FakeClient::new(other)), config(&dir));
+    let err = second.pull(&req("alpine:3.20")).expect_err("other media");
+    assert_eq!(err.code(), OciErrorCode::DataLoss);
+    assert_eq!(fs::read(&marker).expect("kept"), b"m");
+    assert!(staging_is_empty(&dir));
+    // 元の descriptor ならそのまま再利用できる。
+    first.pull(&req("alpine:3.20")).expect("same descriptors");
+}
+
+/// REPAIR-4: 展開の計装は注入した記録先へ届く（レイヤーごとに `ExtractLayer` の成功が記録される）。
+#[test]
+fn repair4_pull_reports_extraction_to_the_injected_recorder() {
+    use fandhe_container_oci::instrument::{OciOpKind, OciOpOutcome, OciOpRecorder, OciOpSample};
+    #[derive(Debug, Default)]
+    struct Rec(Mutex<Vec<(OciOpKind, OciOpOutcome)>>);
+    impl OciOpRecorder for Rec {
+        fn record_oci_op(&self, sample: &OciOpSample) {
+            self.0
+                .lock()
+                .expect("lock")
+                .push((sample.kind(), sample.outcome()));
+        }
+    }
+    let dir = TempDir::new("recorder");
+    let rec = Arc::new(Rec::default());
+    let puller = OciImagePuller::new(
+        Arc::new(FakeClient::new(two_layer_manifest())),
+        config(&dir),
+    )
+    .with_recorder(rec.clone());
+    puller.pull(&req("alpine:3.20")).expect("pull");
+    let got = rec.0.lock().expect("lock").clone();
+    assert_eq!(
+        got,
+        vec![(OciOpKind::ExtractLayer, OciOpOutcome::Success); 2]
+    );
+}
+
 /// OCI-1・SEC: 公開先に通常ファイルや symlink があれば、消さずに FailedPrecondition で拒否する。
 #[test]
 fn oci1_pull_rejects_untrusted_rootfs_cache_entry() {
@@ -1361,7 +1455,7 @@ fn oci1_pull_rejects_untrusted_rootfs_cache_entry() {
     let client = Arc::new(FakeClient::new(two_layer_manifest()));
     let puller = OciImagePuller::new(client, config(&dir));
     puller.pull(&req("alpine:3.20")).expect("first");
-    let final_path = rootfs_path(&dir, SHA_CONFIG);
+    let final_path = entry_path(&dir, SHA_CONFIG);
     force_remove(&final_path);
     fs::write(&final_path, b"planted").expect("plant file");
     let err = puller.pull(&req("alpine:3.20")).expect_err("file");

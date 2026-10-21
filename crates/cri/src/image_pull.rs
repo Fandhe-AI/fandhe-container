@@ -15,10 +15,12 @@
 //!    読んで `rootfs.diff_ids` を解析（`read_verified_config`）
 //! 8. 各 layer を `VerifiedLayerBlob`（検証済みハンドル）で開き直し、pull ごとのステージングの `rootfs/` へ
 //!    `extract_image_layers_with_options` で展開しながら diff_id を突合（#2323・OCI-1・OCI-2）
-//! 9. 展開に成功したときだけ `rename` で `<cache_dir>/rootfs/sha256/<config-hex>` へ公開。公開済みで、隣の `<config-hex>.fingerprint`
-//!    （config・layer 列・展開設定の記録）が今回と一致するときだけ 8 を省く。件数の照合は命中時も行い、設定が違えば
-//!    FailedPrecondition で拒否する（既存の展開物は消さない）。所有者写像では root の期待所有者を写像先で照合する
-//!    （冪等。[`OciImagePuller::unpacked_rootfs_dir`]）
+//! 9. 展開に成功したときだけ、ステージングで組んだエントリ（`rootfs/` と展開設定の記録 `unpack-record`）を 1 回の
+//!    `rename` で `<cache_dir>/rootfs/sha256/<config-hex>/` へ公開する（記録の無い rootfs が残らない）。公開済みで、
+//!    記録（config・展開設定）と layer の表現が今回と一致するときだけ 8 を省く。layer の表現（圧縮 blob の digest・
+//!    mediaType）だけ違うときは今回の descriptor で展開を検証し直す（公開はしない）。件数の照合は命中時も行い、
+//!    設定が違えば FailedPrecondition で拒否する（既存の展開物は消さない）。所有者写像では root の期待所有者を
+//!    写像先で照合する（冪等。[`OciImagePuller::unpacked_rootfs_dir`]）
 //!
 //! キャッシュに同じ digest の blob が既にあれば 5 の取得を省くが、再利用するのは「信頼できる」既存 blob だけ
 //! （下記「既存 blob の再利用条件」）。条件を満たさない既存 blob は、ステージングへ取得し直したファイルで置き換える。
@@ -97,13 +99,14 @@ use std::fmt;
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::config::{ImageRootFs, MAX_CONFIG_BYTES, parse_image_config_rootfs};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
-use fandhe_container_oci::instrument::NoopOciOpRecorder;
+use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
 use fandhe_container_oci::layer::extract::{
     ExtractLimits, ExtractOptions, OwnershipPolicy, extract_image_layers_with_options,
     image_layers_from, remove_extracted_tree,
@@ -446,12 +449,26 @@ impl PullConfig {
 pub struct OciImagePuller<C: RegistryPullClient> {
     client: C,
     config: PullConfig,
+    /// 展開（`ExtractLayer`）の計装の記録先。既定は何も記録しない（REPAIR-4）。
+    recorder: Arc<dyn OciOpRecorder>,
 }
 
 impl<C: RegistryPullClient> OciImagePuller<C> {
     /// クライアントと設定から作る。
     pub fn new(client: C, config: PullConfig) -> Self {
-        Self { client, config }
+        Self {
+            client,
+            config,
+            recorder: Arc::new(NoopOciOpRecorder),
+        }
+    }
+
+    /// 展開の計装（レイヤーごとの成否・エラー code・所要時間。REPAIR-4）の記録先を差し替える。
+    /// plugin-cri などの上位が集計・構造化ログの実装を渡す入口。
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Arc<dyn OciOpRecorder>) -> Self {
+        self.recorder = recorder;
+        self
     }
 
     /// 認証状態を取り直す（token 失効・PermissionDenied 時。資格情報は pull 要求のものを再利用する）。
@@ -481,7 +498,10 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         prepare_private_dir(&self.config.cache_dir, &["blobs", "sha256"])
     }
 
-    /// 展開済み rootfs の公開先（`<cache_dir>/rootfs/sha256/<hex>`。キーはイメージ ID = config digest）。
+    /// 展開済み rootfs の公開先（`<cache_dir>/rootfs/sha256/<hex>/rootfs`。キーはイメージ ID = config digest）。
+    ///
+    /// 親の `<hex>/` エントリは `rootfs/`（展開物）と `unpack-record`（展開時の設定の記録）を持ち、1 回の `rename` で
+    /// 一緒に公開される（記録の無い rootfs が残らない）。
     ///
     /// 公開済みなら、検証済み blob から pull が展開し終えた読み取り専用の元になる rootfs である。コンテナの rootfs として
     /// 直接書き換えず、複製・overlay の下位層として使うこと（create 経路は TASK-59.2 の担当）。
@@ -491,6 +511,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
             .join("rootfs")
             .join("sha256")
             .join(digest_hex(image_id))
+            .join(ROOTFS_SUBDIR)
     }
 
     /// 展開済み rootfs があれば省き、無ければステージングで展開して成功時だけ公開する（#2323・OCI-1）。
@@ -505,11 +526,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         started: Instant,
     ) -> Result<(), PullError> {
         let rootfs_dir = prepare_private_dir(&self.config.cache_dir, &["rootfs", "sha256"])?;
-        let final_path = rootfs_dir.path.join(digest_hex(&manifest.config.digest));
-        let meta_path = rootfs_dir.path.join(format!(
-            "{}.fingerprint",
-            digest_hex(&manifest.config.digest)
-        ));
+        let entry_path = rootfs_dir.path.join(digest_hex(&manifest.config.digest));
         // 公開済みでも件数の照合を飛ばさない（余分な layer を足した不整合な manifest を成功させない。OCI-1）。
         if manifest.layers.len() != rootfs_cfg.diff_ids().len() {
             return Err(PullError::new(
@@ -517,11 +534,17 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
                 "image layer count does not match the config",
             ));
         }
-        let fingerprint = self.rootfs_fingerprint(manifest);
+        let record = self.unpack_record(manifest)?;
         let root_owner = self.expected_root_owner(rootfs_dir.owner)?;
-        if inspect_published_rootfs(&final_path, root_owner)? {
-            // 命中は、同じ config・同じ layer 列・同じ展開設定で diff_id を突合して展開した結果に限る。
-            return check_rootfs_fingerprint(&meta_path, &fingerprint, rootfs_dir.owner);
+        // 公開済みの命中は、同じ config・同じ展開設定の記録があるときに限る。layer の表現（圧縮 blob の digest・
+        // mediaType）が違うだけなら、config の diff_ids が同じため展開物は同じ。その場合は今回の descriptor で
+        // 展開を検証するだけで（公開はしない）成功とする（OCI-1）。
+        let mut verify_only = false;
+        if inspect_published_rootfs(&entry_path, rootfs_dir.owner, root_owner)? {
+            match check_unpack_record(&entry_path.join(RECORD_FILE), &record, rootfs_dir.owner)? {
+                RecordMatch::Exact => return Ok(()),
+                RecordMatch::SameImageOtherLayers => verify_only = true,
+            }
         }
         // descriptor の数だけ開く（重複 digest も別ハンドル。`image_layers_from` が件数の一致を要求する）。
         let verified = manifest
@@ -540,11 +563,14 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         let refs: Vec<&VerifiedLayerBlob> = verified.iter().collect();
         let layers = image_layers_from(&manifest.layers, &refs, rootfs_cfg)
             .map_err(|e| PullError::from_extract(&e))?;
-        let root = staging.path().join("rootfs");
+        // ステージングの中でエントリ（`rootfs/` と記録）を組み立て、1 回の rename で公開する。
+        let staged_entry = staging.path().join("entry");
+        create_private_dir(&staged_entry)?;
+        let root = staged_entry.join(ROOTFS_SUBDIR);
         create_private_dir(&root)?;
         self.check_deadline(started)?;
         extract_image_layers_with_options(
-            &NoopOciOpRecorder,
+            self.recorder.as_ref(),
             &layers,
             &root,
             self.config.max_uncompressed_layer_bytes,
@@ -553,38 +579,48 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
         )
         .map_err(|e| PullError::from_extract(&e))?;
         self.check_deadline(started)?;
+        if verify_only {
+            return Ok(());
+        }
+        write_unpack_record(&staged_entry.join(RECORD_FILE), &record)?;
         // 原子的に公開する。並行する pull が先に公開していて信頼できるなら、その展開設定が同じときだけ成功とする。
-        if fs::rename(&root, &final_path).is_err() {
-            if inspect_published_rootfs(&final_path, root_owner).unwrap_or(false) {
-                return check_rootfs_fingerprint(&meta_path, &fingerprint, rootfs_dir.owner);
+        if fs::rename(&staged_entry, &entry_path).is_err() {
+            if inspect_published_rootfs(&entry_path, rootfs_dir.owner, root_owner).unwrap_or(false)
+            {
+                check_unpack_record(&entry_path.join(RECORD_FILE), &record, rootfs_dir.owner)?;
+                return Ok(());
             }
             return Err(PullError::new(
                 OciErrorCode::FailedPrecondition,
                 "failed to publish image rootfs",
             ));
         }
-        if let Err(e) = write_rootfs_fingerprint(staging.path(), &meta_path, &fingerprint) {
-            // 照合用の記録が無い rootfs は再利用できないため、公開を取り消す（残すと以後の pull が拒否される）。
-            let _ = remove_extracted_tree(&final_path);
-            return Err(e);
-        }
         Ok(())
     }
 
-    /// 展開結果を決める入力（config・layer 列・所有者と特殊ビットの設定）を 1 つの文字列にする。
-    /// 公開済み rootfs の再利用可否は、この文字列が展開時の記録と一致するかで決める（#2323・OCI-1・SEC-5）。
-    fn rootfs_fingerprint(&self, manifest: &ImageManifest) -> String {
-        let mut s = format!(
-            "fandhe-rootfs-v1\nconfig={}\n",
+    /// 展開結果を決める入力（config・所有者と特殊ビットの設定）と、今回の layer の表現を記録にする。
+    /// 公開済み rootfs の再利用可否は、この記録が展開時のものと一致するかで決める（#2323・OCI-1・SEC-5）。
+    fn unpack_record(&self, manifest: &ImageManifest) -> Result<UnpackRecord, PullError> {
+        let mut settings = format!(
+            "fandhe-rootfs-v2\nconfig={}\n",
             manifest.config.digest.as_str()
         );
+        settings.push_str(&encode_extract_options(&self.config.extract_options)?);
+        let mut layers = String::new();
         for d in &manifest.layers {
-            s.push_str("layer=");
-            s.push_str(d.digest.as_str());
-            s.push('\n');
+            layers.push_str("layer=");
+            layers.push_str(d.digest.as_str());
+            layers.push(' ');
+            layers.extend(d.media_type.chars().map(|c| {
+                if c.is_control() || c.is_whitespace() {
+                    '_'
+                } else {
+                    c
+                }
+            }));
+            layers.push('\n');
         }
-        s.push_str(&format!("options={:?}\n", self.config.extract_options));
-        s
+        Ok(UnpackRecord { settings, layers })
     }
 
     /// 公開済み rootfs の root が持つべき所有 uid。`ChownMapped` では展開が root を写像先（コンテナ uid 0 の
@@ -1074,18 +1110,84 @@ fn read_verified_config(
     parse_image_config_rootfs(&body).map_err(|e| PullError::from_config(&e))
 }
 
-/// 公開済み rootfs の有無を確かめる。有って信頼できれば `true`、無ければ `false`、有るのに信頼できなければ拒否する
+/// 公開済みエントリ内の展開物のディレクトリ名。
+const ROOTFS_SUBDIR: &str = "rootfs";
+/// 公開済みエントリ内の展開時の設定の記録のファイル名。
+const RECORD_FILE: &str = "unpack-record";
+
+/// 展開時の設定の記録。`settings` は展開結果を決める入力（config・所有者・特殊ビット）、`layers` は今回の layer の
+/// 表現（圧縮 blob の digest と mediaType）。
+struct UnpackRecord {
+    settings: String,
+    layers: String,
+}
+
+/// 記録との照合結果。
+enum RecordMatch {
+    /// 設定も layer の表現も一致する。
+    Exact,
+    /// 設定は一致し、layer の表現だけ違う（同じ config = 同じ diff_ids の再圧縮など）。
+    SameImageOtherLayers,
+}
+
+/// `ExtractOptions` を固定書式で符号化する。`Debug` 出力は書式が安定しないため使わない（記録の互換性を保つ）。
+/// 未知の選択肢（将来追加された variant）は黙って同一視せず `Unimplemented` で拒否する（fail-closed）。
+fn encode_extract_options(options: &ExtractOptions) -> Result<String, PullError> {
+    use fandhe_container_oci::layer::extract::{IdRange, SpecialBitsPolicy};
+    fn range(r: &IdRange) -> String {
+        format!("{}:{}:{}", r.container_id, r.host_id, r.count)
+    }
+    fn map_lines(lines: &[IdRange]) -> String {
+        lines.iter().map(range).collect::<Vec<_>>().join(",")
+    }
+    let unsupported = || {
+        PullError::new(
+            OciErrorCode::Unimplemented,
+            "unsupported layer extraction option",
+        )
+    };
+    let ownership = match &options.ownership {
+        OwnershipPolicy::Keep => "keep".to_owned(),
+        OwnershipPolicy::ChownMapped { uid, gid } => {
+            format!(
+                "chown-mapped uid={} gid={}",
+                map_lines(uid.lines()),
+                map_lines(gid.lines())
+            )
+        }
+        _ => return Err(unsupported()),
+    };
+    let special = match &options.special_bits {
+        SpecialBitsPolicy::Strip => "strip".to_owned(),
+        SpecialBitsPolicy::PreserveIfOwnerMapped { uid, gid } => {
+            format!(
+                "preserve-if-owner-mapped uid={} gid={}",
+                range(uid),
+                range(gid)
+            )
+        }
+        SpecialBitsPolicy::PreserveIfChowned => "preserve-if-chowned".to_owned(),
+        _ => return Err(unsupported()),
+    };
+    Ok(format!("ownership={ownership}\nspecial-bits={special}\n"))
+}
+
+/// 公開済みエントリの有無を確かめる。有って信頼できれば `true`、無ければ `false`、有るのに信頼できなければ拒否する
 /// （消さない。#2323）。信頼条件はキャッシュのディレクトリと同じ（symlink でない・所有者一致・group/other 書き込みなし）。
-fn inspect_published_rootfs(path: &Path, root_owner: u32) -> Result<bool, PullError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => verify_private_dir(path, root_owner)
-            .map(|()| true)
-            .map_err(|_| {
-                PullError::new(
-                    OciErrorCode::FailedPrecondition,
-                    "image rootfs cache entry is not trusted",
-                )
-            }),
+/// エントリ（管理プロセス所有）と中の `rootfs/`（`root_owner` 所有）の両方を見る。
+fn inspect_published_rootfs(entry: &Path, owner: u32, root_owner: u32) -> Result<bool, PullError> {
+    let untrusted = || {
+        PullError::new(
+            OciErrorCode::FailedPrecondition,
+            "image rootfs cache entry is not trusted",
+        )
+    };
+    match fs::symlink_metadata(entry) {
+        Ok(_) => {
+            verify_private_dir(entry, owner).map_err(|_| untrusted())?;
+            verify_private_dir(&entry.join(ROOTFS_SUBDIR), root_owner).map_err(|_| untrusted())?;
+            Ok(true)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(_) => Err(PullError::new(
             OciErrorCode::FailedPrecondition,
@@ -1094,12 +1196,16 @@ fn inspect_published_rootfs(path: &Path, root_owner: u32) -> Result<bool, PullEr
     }
 }
 
-/// 照合用の記録（フィンガープリント）の読み取り上限。
-const MAX_FINGERPRINT_BYTES: u64 = 64 * 1024;
+/// 照合用の記録の読み取り上限。
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
-/// 公開済み rootfs の記録が `expected` と一致すれば成功。記録が無い・信頼できない・食い違う場合は再利用せず拒否する
+/// 公開済みエントリの記録を `expected` と照合する。記録が無い・信頼できない・設定が食い違う場合は再利用せず拒否する
 /// （既存の展開物は消さない。コンテナの下位層として使われている可能性があるため）。
-fn check_rootfs_fingerprint(path: &Path, expected: &str, owner: u32) -> Result<(), PullError> {
+fn check_unpack_record(
+    path: &Path,
+    expected: &UnpackRecord,
+    owner: u32,
+) -> Result<RecordMatch, PullError> {
     use std::io::Read as _;
     let reject = |message: &'static str| PullError::new(OciErrorCode::FailedPrecondition, message);
     let meta = fs::symlink_metadata(path)
@@ -1118,23 +1224,22 @@ fn check_rootfs_fingerprint(path: &Path, expected: &str, owner: u32) -> Result<(
     let _ = owner;
     let mut body = Vec::new();
     fs::File::open(path)
-        .and_then(|f| f.take(MAX_FINGERPRINT_BYTES).read_to_end(&mut body))
+        .and_then(|f| f.take(MAX_RECORD_BYTES).read_to_end(&mut body))
         .map_err(|_| reject("failed to read the image rootfs unpack record"))?;
-    if body == expected.as_bytes() {
-        Ok(())
-    } else {
-        Err(reject(
+    let Some(rest) = body.strip_prefix(expected.settings.as_bytes()) else {
+        return Err(reject(
             "image rootfs cache entry was unpacked with different settings",
-        ))
+        ));
+    };
+    if rest == expected.layers.as_bytes() {
+        Ok(RecordMatch::Exact)
+    } else {
+        Ok(RecordMatch::SameImageOtherLayers)
     }
 }
 
-/// 記録をステージングへ 0600 で書き、`meta_path` へ原子的に置く。
-fn write_rootfs_fingerprint(
-    staging: &Path,
-    meta_path: &Path,
-    fingerprint: &str,
-) -> Result<(), PullError> {
+/// 記録を 0600 で `path`（ステージングのエントリ内）へ書く。公開は親ごとの rename で行うため、単体の rename はしない。
+fn write_unpack_record(path: &Path, record: &UnpackRecord) -> Result<(), PullError> {
     use std::io::Write as _;
     let fail = || {
         PullError::new(
@@ -1142,7 +1247,6 @@ fn write_rootfs_fingerprint(
             "failed to record the image rootfs unpack settings",
         )
     };
-    let tmp = staging.join("rootfs.fingerprint");
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -1150,11 +1254,11 @@ fn write_rootfs_fingerprint(
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(0o600);
     }
-    let mut f = opts.open(&tmp).map_err(|_| fail())?;
-    f.write_all(fingerprint.as_bytes()).map_err(|_| fail())?;
-    f.sync_all().map_err(|_| fail())?;
-    drop(f);
-    fs::rename(&tmp, meta_path).map_err(|_| fail())
+    let mut f = opts.open(path).map_err(|_| fail())?;
+    f.write_all(record.settings.as_bytes())
+        .map_err(|_| fail())?;
+    f.write_all(record.layers.as_bytes()).map_err(|_| fail())?;
+    f.sync_all().map_err(|_| fail())
 }
 
 /// 非再帰で 0700 のディレクトリを作る（既存は拒否。展開の root は空であることが前提）。

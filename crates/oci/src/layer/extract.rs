@@ -946,9 +946,7 @@ pub fn extract_image_layers_with_options(
     // レイヤー 0 のイメージ（manifest の layers と diff_ids がともに空）は正常な入力。展開物は空の rootfs になる。
     // `extract_stack` は空入力を拒否するため、ここで選択肢の組み合わせと root の前提だけ確かめて空の結果を返す。
     if layers.is_empty() {
-        setup.owner_ctx()?;
-        check_root_empty(root)?;
-        return Ok(Vec::new());
+        return extract_zero_layers(root, &setup);
     }
     let sources = layers
         .iter()
@@ -962,6 +960,20 @@ pub fn extract_image_layers_with_options(
         })
         .collect::<Result<Vec<_>, OciError>>()?;
     extract_stack(recorder, sources, root, limits, host_lstat, setup)
+}
+
+/// レイヤー 0 のイメージの展開（選択肢と root の前提を確かめ、`ChownMapped` なら root だけ写像先へ `chown` する）。
+///
+/// `ChownMapped` では空の rootfs でも root 自身を写像先へ `chown` する（`extract_stack` の `chown_root` と同じ）。
+/// 省くと root が 0700 の実行ユーザー所有のまま公開され、期待所有者の照合が常に食い違う（SEC-5・OCI-1）。
+fn extract_zero_layers(root: &Path, setup: &SpecialSetup) -> Result<Vec<ExtractedLayer>, OciError> {
+    let own = setup.owner_ctx()?;
+    check_root_empty(root)?;
+    if let Some(o) = &own {
+        let ids = map_tar_owner((Some(0), Some(0)), &o.uid, &o.gid)?;
+        (o.fns.lchown)(root, ids.0, ids.1).map_err(|e| chown_err(&e))?;
+    }
+    Ok(Vec::new())
 }
 
 /// 展開した木を symlink を追従せずに消す（#2323）。存在しなければ成功。
@@ -6297,6 +6309,22 @@ mod tests {
             h.set_size(0);
             h.set_cksum();
             h.as_bytes().to_vec()
+        }
+
+        /// SEC-5・OCI-1: レイヤー 0 のイメージでも `ChownMapped` なら root を写像先（0 → 100000）へ chown する。
+        #[test]
+        fn sec5_zero_layer_image_chowns_root() {
+            let sb = Sandbox::new();
+            take_calls();
+            let r =
+                extract_zero_layers(&sb.root, &chown_setup(SpecialBitsPolicy::Strip, rec_fns()))
+                    .unwrap();
+            assert!(r.is_empty());
+            let calls = take_calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].kind, 'l');
+            assert_eq!(calls[0].path.as_deref(), Some(sb.root.as_path()));
+            assert_eq!((calls[0].uid, calls[0].gid), (100_000, 100_000));
         }
 
         /// SEC-5: 複数行の写像で、ファイル・symlink・ディレクトリ・暗黙のディレクトリ・root へ期待どおりの ID を chown する。

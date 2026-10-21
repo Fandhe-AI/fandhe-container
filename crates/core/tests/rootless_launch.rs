@@ -248,7 +248,8 @@ mod linux {
     fn helper_mappings(euid: u32, egid: u32) -> (IdMapSet, IdMapSet) {
         let name = std::env::var("USER").ok();
         let uowner = SubIdOwner::new(euid, name.clone()).expect("uid owner");
-        let gowner = SubIdOwner::new(egid, name).expect("gid owner");
+        // shadow は subgid の数値の行も gid ではなく uid で照合する（#2390）。
+        let gowner = SubIdOwner::new(euid, name).expect("gid owner");
         let uranges =
             load_subordinate_ids(Path::new("/etc/subuid"), &uowner).expect("load /etc/subuid");
         let granges =

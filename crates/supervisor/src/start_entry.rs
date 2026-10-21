@@ -1980,8 +1980,8 @@ mod linux {
 
     /// `/proc/self/status` の内容と 3 つの設定ファイルから権限モデルを決める（#2243・CORE-6・SEC-5）。
     ///
-    /// 手順: rootful を拒否（`privilege_for_status`）→ `passwd` から実効 uid の名前を得る（NSS を使わない）→ subuid / subgid を
-    /// 分類 → `select_rootless_id_model`。範囲写像のときは probe したのと同じ subuid / subgid を読む `SubordinateIdSource` を添える（`resolve_rootless_id_source`。pull の展開と共有。#2389）（helper の有無は
+    /// 手順: rootful を拒否（`privilege_for_status`）→ `passwd` から実効 uid の名前を得る（無ければ `getent`）→ subuid / subgid を
+    /// 分類 → `select_rootless_id_model`。名前は passwd、無ければ NSS(`getent`。#2390)。範囲写像のときは probe したのと同じ subuid / subgid を読む `SubordinateIdSource` を添える（`resolve_rootless_id_source`。pull の展開と共有。#2389）（helper の有無は
     /// ここでは見ず、core の launcher 構築が検証する。縮退しない）。構造化ログは出さない（手順 8 より前に常駐スレッドを
     /// 作らない制約のため。選んだモデルは子の `uid_map` のほか、launch が残す `state.json` の `launchIsolation.id_mapping` と `inspect` の `idMapping` で確かめられる。#2388）。
     fn resolve_launch_privilege(

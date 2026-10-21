@@ -1733,6 +1733,18 @@ fn doctor_reports_id_mapping_diagnostics_through_the_real_entry() {
             "passwd",
             "unresolved",
         ),
+        (
+            "notice",
+            "SUBID_OWNER_LOOKUP_UNAVAILABLE",
+            "passwd",
+            "lookup_unavailable",
+        ),
+        (
+            "warning",
+            "SUBID_OWNER_LOOKUP_FAILED",
+            "passwd",
+            "lookup_failed",
+        ),
         ("warning", "SUBUID_UNUSABLE", "subuid", "unusable"),
         ("warning", "SUBGID_UNUSABLE", "subgid", "unusable"),
         (

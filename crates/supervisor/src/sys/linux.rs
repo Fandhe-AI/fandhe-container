@@ -290,6 +290,20 @@ pub(crate) fn cap_ambient_clear_all() -> io::Result<()> {
     check(i64::from(rc)).map(|_| ())
 }
 
+/// 子プロセスの exec 直前に ambient capability をすべて消すよう `cmd` へ登録する（#2390・SEC-5・SUP-14）。
+///
+/// supervisor は特権ランチャー経由で ambient capability を持つことがあり、setuid でない外部コマンド
+/// （NSS 参照の `getent`）はそのまま exec すると ambient を引き継ぐ。`id_model` が `getent` を起動する前に
+/// 呼ぶ。消去に失敗したら子は exec せず `spawn` が `Err` を返す（fail-closed）。
+pub(crate) fn clear_ambient_caps_on_exec(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: クロージャは fork 後・exec 前の子で実行される。呼ぶのは整数引数のみの `prctl` 1 回で、
+    // 確保・ロック・親との共有状態の操作をしない（async-signal-safe）。影響は子の ambient 集合の縮小のみ。
+    unsafe {
+        cmd.pre_exec(cap_ambient_clear_all);
+    }
+}
+
 /// `PR_SET_KEEPCAPS` を設定 / 解除する（`setresuid` をまたいで permitted を保持するための一時設定。
 /// 呼び出したスレッドのみ）。
 pub(crate) fn set_keep_caps(on: bool) -> io::Result<()> {

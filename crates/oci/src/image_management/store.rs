@@ -23,11 +23,13 @@
 //!
 //! # 未実装・前提（実装済みを装わない。REPAIR-3）
 //!
-//! - コンテナ参照（エントリと世代カウンタ）は #2341 で root 直下の `@container-refs.json` へ永続化済み。
-//!   排他区間に入るたびにディスクから読み直し（ファイルが無ければメモリ上の内容を保つ）、読み込みに失敗
-//!   したら `lock` 自体がエラーを返す。削除の永続化（削除ジャーナルと取得時の再試行。`gc_journal`・#851）は
-//!   実装済みだが、manifest の在庫・タグ・pull リースは永続化されず、プロセスごとのメモリ上の別物のままで、
-//!   プロセス間ロックはそれらの内容を同期しない。
+//! - コンテナ参照（エントリと世代カウンタ）は #2341 で root 直下の `@container-refs.json` へ、manifest の
+//!   在庫・タグ・pull リースは #2380 で `@image-inventory.json`（`inventory_persist`）へ永続化済み。
+//!   排他区間に入るたびにどちらもディスクから読み直し（ファイルが無ければメモリ上の内容を保つ）、読み込みに
+//!   失敗したら `lock` 自体がエラーを返す。削除の永続化（削除ジャーナルと取得時の再試行。`gc_journal`・#851）も
+//!   実装済み。保存はひとまとまりの操作の入口が排他の中で行い、ガードから下位メソッドを直接呼んだ変更は
+//!   保存されない（試験と `with_table` の種入れ用の口。ファイルがあれば次の排他取得でディスクの内容になる）。
+//!   本番で在庫を埋める経路（pull → `ImageStore` の配線）は未実装（REPAIR-3）。
 //! - root の所有者・権限・祖先の検査は `open` / `with_table` で行う（#2381・SEC-1。unix のみ）。root は
 //!   現在の実効 uid の所有で group / other に書き込めないこと（`0o022` が立っていない。0700 と 0755 は受理、
 //!   0770・0757・1777 は拒否）、祖先は root か実効 uid の所有で、group / other に書き込めないこと
@@ -50,6 +52,7 @@ use super::container_ref_persist::load_container_refs;
 use super::gc_journal::{
     PendingDeletionRecovery, STALE_TMP_PREFIXES, journal_exists, reap_stale_tmp,
 };
+use super::inventory_persist::load_image_inventory;
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 
@@ -187,6 +190,11 @@ impl ImageStore {
         // 区間に入るたびにディスクのコンテナ参照を正とする（#2341）。壊れた参照表は fail-closed で拒否する。
         if let Some(persisted) = load_container_refs(&self.root)? {
             guard.table.apply_persisted_container_refs(persisted);
+        }
+        // manifest の在庫・タグ・pull リースも同様にディスクを正とする（#2380）。ファイルが無ければメモリ上の
+        // 内容を保つ。復旧と GC の数え直しが別プロセスのリース・タグを見られるよう、復旧より前に読む。
+        if let Some(persisted) = load_image_inventory(&self.root)? {
+            guard.table.apply_persisted_inventory(persisted);
         }
         // 他の操作が割り込む前に、前回の中断した削除を片づける。ジャーナルがあったときだけ記録する。
         reap_stale_tmp(&self.root, STALE_TMP_PREFIXES);

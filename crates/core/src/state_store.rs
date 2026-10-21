@@ -101,8 +101,9 @@ use serde::{Deserialize, Serialize};
 use crate::audit_log::{AuditCoverage, AuditCoveragePolicy, CoverageLayer, KernelAuditLayerStatus};
 use crate::dev_mounts::ImplicitDevMount;
 use crate::launch_isolation::{
-    LaunchIsolationRecord, MAX_RECORDED_RULES, RecordedAuditCoverage, RecordedLandlock,
-    RecordedLandlockAudit, RecordedRule, RecordedTarget, RootIdentity,
+    LaunchIsolationRecord, MAX_RECORDED_ID_EXTENTS, MAX_RECORDED_RULES, RecordedAuditCoverage,
+    RecordedIdExtent, RecordedIdMapping, RecordedIdModel, RecordedLandlock, RecordedLandlockAudit,
+    RecordedRule, RecordedTarget, RootIdentity,
 };
 use crate::oci_runtime::MountDestination;
 use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
@@ -1636,6 +1637,12 @@ fn open_nowait(path: &Path, opts: &mut OpenOptions) -> std::io::Result<File> {
 /// ビット範囲・先頭・重複を検証する。種別と由来の不一致・未知の origin・`mount` の `index` 欠落は破損（`Internal`）。
 /// キーの無い既存ファイルは `None`（記録なし）として読む。ルール数が上限に近い構成は [`MAX_STATE_FILE_BYTES`]
 /// を超えうる。その場合は書き込みが `InvalidArgument` で拒否され launch も失敗する（黙って上限を上げない）。
+/// `launchIsolation.id_mapping`（CORE-6・SEC-5・REPAIR-4・#2388。launch が使った ID 写像）は `None` なら書かない。
+/// `{"model":"single"|"subordinate","uid":[{"container_id":0,"host_id":1000,"size":1},...],"gid":[...]}` で、読み込み側は
+/// 件数を確保の前に [`MAX_RECORDED_ID_EXTENTS`] で検証し、`RecordedIdMapping::new` で組み直す（未知の model・ホスト ID 0・
+/// 重複・モデルと形の不一致は破損〔`Internal`〕）。キーの無い既存ファイルは `None`（記録なし。「single」と推測しない）。
+/// 最悪（uid・gid 各 340 行）は Landlock のルールと合わせて [`MAX_STATE_FILE_BYTES`] を超えうる。その場合も書き込みが
+/// `InvalidArgument` で拒否され launch も失敗する（黙って上限を上げない。現実の構成は 1 ユーザー 1〜2 範囲）。
 /// 3 つとも持たない既存の `state.json`（導入前の版が書いたもの）は PID なし・未設定・0 回として読む
 /// （導入前は supervisor がこれらを書いていないため、破損にしない）。
 #[derive(Debug, Serialize, Deserialize)]
@@ -1679,6 +1686,62 @@ struct LaunchIsolationDto {
     /// launch が評価した監査の網羅（SEC-4・#2027）。無ければ `NotRecorded`（旧記録を「網羅している」と読まない）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     audit_coverage: Option<AuditCoverageDto>,
+    /// launch が使った ID 写像（CORE-6・#2388）。無ければ記録なし。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id_mapping: Option<IdMappingDto>,
+}
+
+/// ID 写像の記録。`model` は `single` / `subordinate`。
+#[derive(Debug, Serialize, Deserialize)]
+struct IdMappingDto {
+    model: String,
+    uid: Vec<IdExtentDto>,
+    gid: Vec<IdExtentDto>,
+}
+
+/// ID 写像の 1 行。
+#[derive(Debug, Serialize, Deserialize)]
+struct IdExtentDto {
+    container_id: u32,
+    host_id: u32,
+    size: u32,
+}
+
+impl IdMappingDto {
+    fn from_record(m: &RecordedIdMapping) -> Self {
+        let conv = |v: &[RecordedIdExtent]| {
+            v.iter()
+                .map(|e| IdExtentDto {
+                    container_id: e.container_id,
+                    host_id: e.host_id,
+                    size: e.size,
+                })
+                .collect()
+        };
+        Self {
+            model: m.model().as_str().to_owned(),
+            uid: conv(m.uid()),
+            gid: conv(m.gid()),
+        }
+    }
+
+    /// untrusted な入力を検証つきのコンストラクタだけで組み直す。件数は確保の前に検証する。
+    fn into_record(self) -> Result<RecordedIdMapping, ()> {
+        if self.uid.len() > MAX_RECORDED_ID_EXTENTS || self.gid.len() > MAX_RECORDED_ID_EXTENTS {
+            return Err(());
+        }
+        let model = RecordedIdModel::parse(&self.model).ok_or(())?;
+        let conv = |v: Vec<IdExtentDto>| {
+            v.into_iter()
+                .map(|e| RecordedIdExtent {
+                    container_id: e.container_id,
+                    host_id: e.host_id,
+                    size: e.size,
+                })
+                .collect::<Vec<_>>()
+        };
+        RecordedIdMapping::new(model, conv(self.uid), conv(self.gid)).map_err(|_| ())
+    }
 }
 
 /// 監査の網羅の記録。`policy` は `best-effort` / `strict`、各層は `{mode, reason?}`。
@@ -1827,6 +1890,7 @@ impl LaunchIsolationDto {
                 audit: LandlockAuditDto::from_record(record.landlock().audit()),
             },
             audit_coverage: AuditCoverageDto::from_record(record.audit_coverage()),
+            id_mapping: record.id_mapping().map(IdMappingDto::from_record),
         }
     }
 
@@ -1853,13 +1917,17 @@ impl LaunchIsolationDto {
             RootIdentity::new(self.root.dev, self.root.ino),
             landlock,
         );
-        Ok(match self.audit_coverage {
+        let record = match self.audit_coverage {
             Some(c) => match c.into_record()? {
                 RecordedAuditCoverage::Evaluated { policy, coverage } => {
                     record.with_audit_coverage(policy, coverage)
                 }
                 _ => record,
             },
+            None => record,
+        };
+        Ok(match self.id_mapping {
+            Some(m) => record.with_id_mapping(m.into_record()?),
             None => record,
         })
     }
@@ -3255,6 +3323,53 @@ mod tests {
         ] {
             let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
             v["audit_coverage"] = bad;
+            let dto: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+            assert!(dto.into_record().is_err());
+        }
+    }
+
+    /// CORE-6・SEC-5・#2388: ID 写像の記録が JSON の具体値で往復し、無い旧記録は記録なし、
+    /// 不正な値（未知の model・ホスト ID 0・重複・形の不一致・件数超過）は破損として拒否される。
+    #[test]
+    fn core6_2388_state_id_mapping_roundtrip_and_rejects_corruption() {
+        let ext = |c, h, n| RecordedIdExtent {
+            container_id: c,
+            host_id: h,
+            size: n,
+        };
+        let sub = vec![ext(0, 1000, 1), ext(1, 100_000, 65_536)];
+        let m = RecordedIdMapping::new(RecordedIdModel::Subordinate, sub.clone(), sub).unwrap();
+        let rec = iso(100).with_id_mapping(m.clone());
+        let v = serde_json::to_value(LaunchIsolationDto::from_record(&rec)).unwrap();
+        assert_eq!(
+            v["id_mapping"],
+            serde_json::json!({
+                "model": "subordinate",
+                "uid": [{"container_id":0,"host_id":1000,"size":1},{"container_id":1,"host_id":100000,"size":65536}],
+                "gid": [{"container_id":0,"host_id":1000,"size":1},{"container_id":1,"host_id":100000,"size":65536}]
+            })
+        );
+        let back: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+        assert_eq!(back.into_record().unwrap().id_mapping(), Some(&m));
+        let legacy = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+        assert!(legacy.get("id_mapping").is_none());
+        let back: LaunchIsolationDto = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.into_record().unwrap().id_mapping(), None);
+        let one = serde_json::json!([{"container_id":0,"host_id":1000,"size":1}]);
+        let many: Vec<_> = (0..=MAX_RECORDED_ID_EXTENTS as u32)
+            .map(|i| serde_json::json!({"container_id":i,"host_id":1000+i,"size":1}))
+            .collect();
+        for bad in [
+            serde_json::json!({"model":"range","uid":one,"gid":one}),
+            serde_json::json!({"model":"single","uid":[{"container_id":0,"host_id":0,"size":1}],"gid":one}),
+            serde_json::json!({"model":"single","uid":one,"gid":[{"container_id":0,"host_id":1000,"size":2}]}),
+            serde_json::json!({"model":"subordinate","uid":one,"gid":one}),
+            serde_json::json!({"model":"subordinate","uid":[{"container_id":0,"host_id":1000,"size":1},{"container_id":1,"host_id":1000,"size":5}],"gid":one}),
+            serde_json::json!({"model":"subordinate","uid":many,"gid":one}),
+            serde_json::json!({"model":"single","uid":[],"gid":one}),
+        ] {
+            let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+            v["id_mapping"] = bad;
             let dto: LaunchIsolationDto = serde_json::from_value(v).unwrap();
             assert!(dto.into_record().is_err());
         }

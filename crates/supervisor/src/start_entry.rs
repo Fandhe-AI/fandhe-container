@@ -1881,12 +1881,11 @@ mod linux {
         LinuxResourceLimits, ProductionLauncher, ProductionLauncherBuilder, SubordinateIdSource,
         load_resource_limits,
     };
-    use fandhe_container_core::rootless::SubIdOwner;
 
     use super::*;
     use crate::id_model::{
-        RootlessIdModel, SYSTEM_PASSWD, SYSTEM_SUBGID, SYSTEM_SUBUID, probe_sub_id_file,
-        read_owner_name, select_rootless_id_model,
+        RootlessIdResolution, SYSTEM_PASSWD, SYSTEM_SUBGID, SYSTEM_SUBUID,
+        resolve_rootless_id_source,
     };
     use crate::privilege::{MAX_STATUS_BYTES, parse_proc_status};
     use crate::start_contract::StartArgs;
@@ -1982,7 +1981,7 @@ mod linux {
     /// `/proc/self/status` の内容と 3 つの設定ファイルから権限モデルを決める（#2243・CORE-6・SEC-5）。
     ///
     /// 手順: rootful を拒否（`privilege_for_status`）→ `passwd` から実効 uid の名前を得る（NSS を使わない）→ subuid / subgid を
-    /// 分類 → `select_rootless_id_model`。範囲写像のときは `SubordinateIdSource::system` を添える（helper の有無は
+    /// 分類 → `select_rootless_id_model`。範囲写像のときは probe したのと同じ subuid / subgid を読む `SubordinateIdSource` を添える（`resolve_rootless_id_source`。pull の展開と共有。#2389）（helper の有無は
     /// ここでは見ず、core の launcher 構築が検証する。縮退しない）。構造化ログは出さない（手順 8 より前に常駐スレッドを
     /// 作らない制約のため。選んだモデルは子の `uid_map` のほか、launch が残す `state.json` の `launchIsolation.id_mapping` と `inspect` の `idMapping` で確かめられる。#2388）。
     fn resolve_launch_privilege(
@@ -1995,28 +1994,14 @@ mod linux {
         let snapshot = parse_proc_status(status_text)
             .map_err(|e| TraitError::new(e.code, "failed to read the process credentials"))?;
         let (real, effective) = (snapshot.uid.real, snapshot.uid.effective);
-        let name = read_owner_name(passwd, effective)?;
-        // 名前が規則（文字種・長さ）に違反する行は、None へ黙って落とさず拒否する（Single への縮退を避ける）。
-        let owner = SubIdOwner::new(effective, name.clone()).map_err(|_| {
-            TraitError::new(
-                ErrorCode::FailedPrecondition,
-                "the owner name is not usable for subordinate ids",
-            )
-        })?;
-        let model = select_rootless_id_model(
-            probe_sub_id_file(subuid, &owner),
-            probe_sub_id_file(subgid, &owner),
-            real,
-            effective,
-        )?;
-        match model {
-            RootlessIdModel::SingleId => Ok(LaunchPrivilege {
+        match resolve_rootless_id_source(real, effective, passwd, subuid, subgid)? {
+            RootlessIdResolution::SingleId => Ok(LaunchPrivilege {
                 privilege: single,
                 subordinate: None,
             }),
-            RootlessIdModel::SubordinateIds => Ok(LaunchPrivilege {
+            RootlessIdResolution::SubordinateIds(source) => Ok(LaunchPrivilege {
                 privilege: IsolationPrivilege::RootlessSubordinateIds,
-                subordinate: Some(SubordinateIdSource::system(name)?),
+                subordinate: Some(source),
             }),
         }
     }

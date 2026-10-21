@@ -92,9 +92,9 @@ pub use launch::{
     RootfsDir, RootfsPinError, START_TIMEOUT_MAX, StartTimeouts, pin_bundle_rootfs,
     pin_bundle_rootfs_audited,
 };
-#[cfg(target_os = "linux")]
-pub use launcher::SubordinateIdSource;
 pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
+#[cfg(target_os = "linux")]
+pub use launcher::{SubordinateIdMaps, SubordinateIdSource};
 pub use mount_destination::{MountDestination, audit_mount_config_error};
 pub use resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
 pub use start::{

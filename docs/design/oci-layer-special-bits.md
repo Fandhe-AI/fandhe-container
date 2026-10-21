@@ -71,7 +71,7 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
 
 | 項目 | 決定 |
 | ---- | ---- |
-| 呼び出し側 | 初期 user namespace で `CAP_CHOWN` を持つプロセス（典型はホスト root）。ホストの非特権ユーザーは subuid 範囲へ `chown` できず、`EPERM` は `PermissionDenied`（fail-closed）。写像はコンテナ起動時の user namespace の写像と同じものを渡す |
+| 呼び出し側 | 初期 user namespace で `CAP_CHOWN` を持つプロセス（典型はホスト root）。ホストの非特権ユーザーは subuid 範囲へ `chown` できず、`EPERM` は `PermissionDenied`（fail-closed）。写像はコンテナ起動時の user namespace の写像と同じものを渡す。入手経路は 1 本だけで、cli の `image_ownership`（start の launcher と同じ supervisor `id_model::resolve_rootless_id_source` → core `SubordinateIdSource::resolve_id_maps` を呼ぶ。#2389。本番の呼び出し元は未配線） |
 | 非 Linux | 開始前に `Unimplemented`（黙って飛ばさない）。特殊ビットは従来どおり `UnsupportedHost`（Strip 相当） |
 | 範囲外・不正な ID | 写像に無い ID は `PermissionDenied`、解析できない ID（PAX の不正値を含む）は `InvalidArgument`。パス 1 で書き込み前に拒否 |
 | ホスト ID 0 | `IdMap::new` が `PermissionDenied` で拒否する（コンテナ root をホスト root に写さない。SEC-5） |
@@ -108,7 +108,7 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
 
 `ChownMapped` は展開プロセスが初期 user namespace で `CAP_CHOWN` を持つ前提（rootful）で、ホストの非特権ユーザーは
 subuid 範囲へ `chown` できない。rootless では展開プロセス自身がコンテナと同じ写像の user namespace の中に入り、
-tar のコンテナ内 ID をそのまま `chown` する（namespace の中では恒等写像）。
+tar のコンテナ内 ID をそのまま `chown` する（namespace の中では恒等写像）。渡す写像は `ChownMapped` と同じく cli の `image_ownership` で作り、start と食い違わせない（#2389）。
 
 - 責務の分け: namespace へ入る処理（fork・`unshare`・`newuidmap`。core の `isolate` / `isolate_rootless_subordinate`）は
   core の責務で、oci は入らない。oci は「呼び出しプロセスがすでに入っている」契約を開始前に検証する。

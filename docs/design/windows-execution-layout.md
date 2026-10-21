@@ -92,6 +92,12 @@ Windows で core・CLI・supervisor を WSL2 ゲストの中で動かし、Windo
 - `PreparedLaunch` を外から組み立てられない制約は保つ。記録からの復元は、platform-windows の内側にある検証つきの関数に限る
 - #1412 との関係: 回収の主体が「新しい plugin プロセスの stop」から「起動役の delete」に変わる。そのため #1412 の範囲と受け入れ条件の書き直しを提案する（実施は承認後にユーザーが判断する）
 - `delete --force` では、ゲスト内の delete が失敗した場合も解除の順序はコンテナが消えた後とし、解除できなければ構造化エラーで報告する
+- 実装の現状（#1412。呼び出し側に依らない中核だけを先行して実装した。回収の主体の承認〔本節の論点 4・#2230〕は待っていない）
+  - 記録 `/run/fandhe/<nonce>` は 3 行（1 行目: マウント ID または `none`、2 行目: マウント先、3 行目: コンテナ ID または印 `.`）。既存の読み手は 1 行目だけを読む
+  - コンテナ ID は `LaunchRequest::with_owner(OwnerId)` で付ける。ID を付けずに準備した記録は ID では引けない
+  - `release_container_mounts(distro, owner, timeout)`（platform-windows）が、ゲスト内の検索（`/`・`/run`・`/run/fandhe` と各記録を root 所有・symlink でない・他者書き込み不可で確かめる）→ 形式とマウント先の検証 → `mountinfo` の最上位との照合 → 既存の umount の経路（ロックの下でマウント ID を再照合）の順で、その ID の記録のマウントだけを外す
+  - 改ざんが 1 件でもあれば、同じ ID の他の記録も含めて何も外さず `FAILED_PRECONDITION` を返す。記録が無ければ `found` が 0 の `Ok`
+  - 呼び出し側（起動役の delete、または plugin の stop）への接続は未実装。論点 4 の承認後に、上の 12 節の 5 番で行う
 
 ## 7. 論点 5: Ctrl+C の中継とゲスト内への導入・更新（推奨案・承認待ち）
 

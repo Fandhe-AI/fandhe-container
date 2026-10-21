@@ -2,7 +2,7 @@
 //!
 //! 偽の `wsl.exe`（`tests/bin/fake_wsl.rs` のマウント系モード）を実際に子プロセスとして起動し、
 //! `wsl2::test_support` 経由で公開 API と同じ処理（検出 → mount → mountinfo によるマウント ID・fstype の確認 →
-//! 起動ステップ → 解除）を 3 OS で確かめる。実行器との接続（argv の受け渡し・呼び出しごとのタイムアウト・
+//! 起動ステップ → 解除）と、別プロセスからのコンテナ ID による回収（#1412）を 3 OS で確かめる。実行器との接続（argv の受け渡し・呼び出しごとのタイムアウト・
 //! 出力の解析）を通すことが目的で、ゲスト内スクリプトの振る舞いは模擬ゲストのユニットテスト
 //! （`src/wsl2/mount.rs`）と実機確認（tests/wsl2_virtiofs.rs の #[ignore] テスト。TASK-67.6・#377）の担当。
 //! feature `wsl2-test-support` が必要（`cargo test -p fandhe-container-platform-windows --all-features`）。
@@ -16,18 +16,19 @@ use std::time::Duration;
 
 use fandhe_container_platform_windows::instrument::WinWarningCode;
 use fandhe_container_platform_windows::wsl2::test_support::{
-    launch_with_program, prepare_virtiofs_launch_with_program, release_virtiofs_launch_with_program,
+    launch_with_program, prepare_virtiofs_launch_with_program,
+    release_container_mounts_with_program, release_virtiofs_launch_with_program,
 };
 use fandhe_container_platform_windows::wsl2::{
-    DistroName, HostDir, LaunchRequest, MountName, PreparedMount, SharedMount, SharedTransport,
-    TransportPolicy, Wsl2Error, Wsl2ErrorCode,
+    DistroName, HostDir, LaunchRequest, MountName, OwnerId, PreparedMount, RecoveryReport,
+    SharedMount, SharedTransport, TransportPolicy, Wsl2Error, Wsl2ErrorCode,
 };
 use fandhe_container_platform_windows::wslconfig::VirtiofsState;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 偽 `wsl.exe` のマウント系モード（テストごとに別の状態ファイルを使うため 1 テスト 1 モード）。
-const MODES: [&str; 8] = [
+const MODES: [&str; 13] = [
     "mount_ok",
     "mount_9p",
     "mount_9p_unset",
@@ -36,6 +37,11 @@ const MODES: [&str; 8] = [
     "mount_launch",
     "mount_unset",
     "mount_slow",
+    "mount_recover",
+    "mount_recover_other",
+    "mount_recover_legacy",
+    "mount_recover_slow",
+    "mount_recover_ro_run",
 ];
 
 /// モードごとの名前で偽 `wsl.exe` を置いたディレクトリ（`tests/wsl2_detect.rs` と同じ用意の仕方。
@@ -62,7 +68,39 @@ fn fresh_fake(mode: &str) -> PathBuf {
     assert!(MODES.contains(&mode), "unknown mode {mode}");
     let exe = fake_dir().join(format!("fake_wsl-{mode}{}", std::env::consts::EXE_SUFFIX));
     let _ = std::fs::remove_file(exe.with_extension("state"));
+    let _ = std::fs::remove_file(exe.with_extension("records"));
     exe
+}
+
+/// 偽 `wsl.exe` のゲスト内の記録（nonce・ID・マウント先・コンテナ ID の 4 列）に残っているマウント先と
+/// コンテナ ID の組。
+fn records(exe: &Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(exe.with_extension("records"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split('\t').skip(2);
+            Some((f.next()?.to_string(), f.next()?.to_string()))
+        })
+        .collect()
+}
+
+/// コンテナ ID `owner` が所有する共有マウント 1 件の要求。
+fn owned_request(owner: &str, host: &str, name: &str) -> LaunchRequest {
+    LaunchRequest::new(
+        DistroName::parse("Ubuntu").unwrap(),
+        vec![SharedMount::new(
+            HostDir::parse(host).unwrap(),
+            MountName::parse(name).unwrap(),
+            false,
+        )],
+    )
+    .unwrap()
+    .with_owner(OwnerId::parse(owner).unwrap())
+}
+
+fn ubuntu() -> DistroName {
+    DistroName::parse("Ubuntu").unwrap()
 }
 
 /// 状態ファイルに残っているマウント先の一覧（`/` を除く）。
@@ -263,4 +301,201 @@ fn launch_shares_one_deadline_between_detect_and_prepare() {
     assert_eq!(n.value, 2);
     release_virtiofs_launch_with_program(&exe, &n.prepared, Duration::from_secs(30)).unwrap();
     assert!(mounted(&exe).is_empty());
+}
+
+/// WIN-2・PLUG-7・REPAIR-12（#1412 の A1）: 準備した側の `PreparedLaunch` を捨てても（解除に失敗したまま終わった
+/// プロセスの模擬）、偽 `wsl.exe` は呼び出しごとに別プロセスなので、ゲスト側の状態（マウント表と記録）だけを
+/// 引き継いだ別の呼び出しがコンテナ ID だけを手がかりにマウントを外し、記録を消す。
+#[test]
+fn recover_by_container_id_from_another_process() {
+    let exe = fresh_fake("mount_recover");
+    let req = LaunchRequest::new(
+        ubuntu(),
+        vec![
+            SharedMount::new(
+                HostDir::parse("C:\\work").unwrap(),
+                MountName::parse("work").unwrap(),
+                false,
+            ),
+            SharedMount::new(
+                HostDir::parse("D:\\data").unwrap(),
+                MountName::parse("data").unwrap(),
+                true,
+            ),
+        ],
+    )
+    .unwrap()
+    .with_owner(OwnerId::parse("web-1").unwrap());
+    let prepared =
+        prepare_virtiofs_launch_with_program(&exe, VirtiofsState::Enabled, &req, TIMEOUT).unwrap();
+    drop(prepared);
+    assert_eq!(mounted(&exe), ["/mnt/fandhe/work", "/mnt/fandhe/data"]);
+    assert_eq!(
+        records(&exe),
+        [
+            ("/mnt/fandhe/work".to_string(), "web-1".to_string()),
+            ("/mnt/fandhe/data".to_string(), "web-1".to_string())
+        ]
+    );
+
+    let report = release_container_mounts_with_program(
+        &exe,
+        &ubuntu(),
+        &OwnerId::parse("web-1").unwrap(),
+        TIMEOUT,
+    )
+    .unwrap();
+    assert_eq!((report.found, report.released), (2, 2));
+    assert!(mounted(&exe).is_empty());
+    assert!(records(&exe).is_empty());
+
+    // 回収済みなら記録は無く、何もしない。
+    let again = release_container_mounts_with_program(
+        &exe,
+        &ubuntu(),
+        &OwnerId::parse("web-1").unwrap(),
+        TIMEOUT,
+    )
+    .unwrap();
+    assert_eq!(again, RecoveryReport::default());
+}
+
+/// WIN-2・PLUG-7（#1412 の A2）: 別のコンテナ ID のマウントと記録には触れない。
+#[test]
+fn recover_leaves_other_containers_alone() {
+    let exe = fresh_fake("mount_recover_other");
+    for (owner, host, name) in [("web", "C:\\work", "work"), ("api", "D:\\data", "data")] {
+        let p = prepare_virtiofs_launch_with_program(
+            &exe,
+            VirtiofsState::Enabled,
+            &owned_request(owner, host, name),
+            TIMEOUT,
+        )
+        .unwrap();
+        drop(p);
+    }
+    let report = release_container_mounts_with_program(
+        &exe,
+        &ubuntu(),
+        &OwnerId::parse("web").unwrap(),
+        TIMEOUT,
+    )
+    .unwrap();
+    assert_eq!((report.found, report.released), (1, 1));
+    assert_eq!(mounted(&exe), ["/mnt/fandhe/data"]);
+    assert_eq!(
+        records(&exe),
+        [("/mnt/fandhe/data".to_string(), "api".to_string())]
+    );
+
+    // 存在しないコンテナ ID は何も外さない。
+    let none = release_container_mounts_with_program(
+        &exe,
+        &ubuntu(),
+        &OwnerId::parse("nobody").unwrap(),
+        TIMEOUT,
+    )
+    .unwrap();
+    assert_eq!(none.found, 0);
+    assert_eq!(mounted(&exe), ["/mnt/fandhe/data"]);
+}
+
+/// 偽 `wsl.exe` のゲスト内の記録に、所有者欄が `marker`（`@legacy` / `@bad`）の行を直接足す。
+fn add_marked_record(exe: &Path, marker: &str) {
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(exe.with_extension("records"))
+        .unwrap();
+    writeln!(f, "00ee\t99\t/mnt/fandhe/old\t{marker}").unwrap();
+}
+
+/// WIN-2・PLUG-7（#1412）: 旧形式 1 行の記録が混在しても、新形式の所有者の回収は成功する。壊れた記録は拒否する。
+#[test]
+fn recover_skips_legacy_record_but_rejects_bad_record() {
+    let exe = fresh_fake("mount_recover_legacy");
+    let p = prepare_virtiofs_launch_with_program(
+        &exe,
+        VirtiofsState::Enabled,
+        &owned_request("web", "C:\\work", "work"),
+        TIMEOUT,
+    )
+    .unwrap();
+    drop(p);
+    add_marked_record(&exe, "@legacy");
+    let web = OwnerId::parse("web").unwrap();
+    let report = release_container_mounts_with_program(&exe, &ubuntu(), &web, TIMEOUT).unwrap();
+    assert_eq!((report.found, report.released), (1, 1));
+    assert!(mounted(&exe).is_empty());
+
+    let p = prepare_virtiofs_launch_with_program(
+        &exe,
+        VirtiofsState::Enabled,
+        &owned_request("web", "C:\\work", "work"),
+        TIMEOUT,
+    )
+    .unwrap();
+    drop(p);
+    add_marked_record(&exe, "@bad");
+    let e = release_container_mounts_with_program(&exe, &ubuntu(), &web, TIMEOUT).unwrap_err();
+    assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+    assert_eq!(mounted(&exe), ["/mnt/fandhe/work"]);
+}
+
+/// REPAIR-5（#1412 の A4）: 回収は検索・mountinfo の読み取り・各 umount で 1 つの合計期限を共有する。偽 `wsl.exe`
+/// （`mount_recover_slow`）は検索と全 mountinfo の応答前に 600 ms ずつ眠るため、合計期限 1 秒では検索（600 ms 以上）の
+/// 後に残る 400 ms 未満で mountinfo を読み切れず `TIMEOUT` で止まり、何も外さない（呼び出しごとに 1 秒を持つ実装では
+/// 止まらない）。期限が十分なら同じ状態から回収できる（期限切れは記録を壊さず、やり直せる）。
+#[test]
+fn recover_shares_one_deadline_across_calls() {
+    let exe = fresh_fake("mount_recover_slow");
+    let p = prepare_virtiofs_launch_with_program(
+        &exe,
+        VirtiofsState::Enabled,
+        &owned_request("web", "C:\\work", "work"),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    drop(p);
+    let owner = OwnerId::parse("web").unwrap();
+    let e = release_container_mounts_with_program(&exe, &ubuntu(), &owner, Duration::from_secs(1))
+        .unwrap_err();
+    assert_eq!(
+        (e.code(), e.message()),
+        (
+            Wsl2ErrorCode::Timeout,
+            "wsl.exe did not finish before the deadline"
+        )
+    );
+    assert_eq!(mounted(&exe), ["/mnt/fandhe/work"]);
+    assert_eq!(records(&exe).len(), 1);
+
+    let report =
+        release_container_mounts_with_program(&exe, &ubuntu(), &owner, Duration::from_secs(30))
+            .unwrap();
+    assert_eq!((report.found, report.released), (1, 1));
+    assert!(mounted(&exe).is_empty());
+    assert!(records(&exe).is_empty());
+}
+
+/// REPAIR-5・#1412: `/run` が読み取り専用で記録を消せない場合、umount が成立しても `Ok` にせず未完了
+/// （`FAILED_PRECONDITION`）で返し、記録を保持する。何度やり直しても記録が残る限り完了を装わない。
+#[test]
+fn recover_reports_incomplete_when_record_cannot_be_removed() {
+    let exe = fresh_fake("mount_recover_ro_run");
+    let req = owned_request("web-ro", "C:\\work", "work");
+    let prepared =
+        prepare_virtiofs_launch_with_program(&exe, VirtiofsState::Enabled, &req, TIMEOUT).unwrap();
+    drop(prepared);
+    let owner = OwnerId::parse("web-ro").unwrap();
+    for _ in 0..2 {
+        let e =
+            release_container_mounts_with_program(&exe, &ubuntu(), &owner, TIMEOUT).unwrap_err();
+        assert_eq!(e.code(), Wsl2ErrorCode::FailedPrecondition);
+        assert_eq!(
+            records(&exe),
+            [("/mnt/fandhe/work".to_string(), "web-ro".to_string())]
+        );
+    }
 }

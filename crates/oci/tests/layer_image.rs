@@ -17,6 +17,10 @@ use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::layer::VerifiedLayerBlob;
 use fandhe_container_oci::layer::extract::{ExtractLimits, extract_image_layers};
 #[cfg(unix)]
+use fandhe_container_oci::layer::extract::{
+    ExtractOptions, SpecialBitsPolicy, extract_image_layers_with_options, remove_extracted_tree,
+};
+#[cfg(unix)]
 use fandhe_container_oci::layer::extract::{ImageLayer, image_layers_from};
 #[cfg(unix)]
 use fandhe_container_oci::manifest::{Descriptor, ParsedManifest, parse_manifest};
@@ -362,4 +366,74 @@ fn oci1_symlink_and_foreign_owner_blobs_are_rejected_before_extract() {
     let e = VerifiedLayerBlob::open(&real, &sha(&t1), t1.len() as u64, uid ^ 1).unwrap_err();
     assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
     assert_eq!(e.message(), "blob has an unexpected owner");
+}
+
+/// OCI-1・#2323: 既定の選択肢（Keep + Strip）の `_with_options` は `extract_image_layers` と同じ結果になる。
+#[cfg(unix)]
+#[test]
+fn oci1_with_options_default_matches_extract_image_layers() {
+    let t = Tmp::new("opts-default");
+    let t1 = tar_of(&[("a", b"A1")]);
+    let d1 = sha(&t1);
+    let b1 = t.blob("l1.tar", &t1);
+    let layers = [ImageLayer::new(&b1, TAR, &d1)];
+    let r = extract_image_layers_with_options(
+        &fandhe_container_oci::instrument::NoopOciOpRecorder,
+        &layers,
+        &t.root(),
+        1 << 20,
+        limits(),
+        &ExtractOptions::new(),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(t.root().join("a")).unwrap(), b"A1");
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].diff_id, d1);
+}
+
+/// OCI-1・SEC-5・#2323: 不正な組み合わせ（PreserveIfChowned + Keep）は root に触れる前に InvalidArgument。
+#[cfg(unix)]
+#[test]
+fn oci1_with_options_rejects_preserve_without_ownership_mapping() {
+    let t = Tmp::new("opts-bad");
+    let t1 = tar_of(&[("a", b"A1")]);
+    let d1 = sha(&t1);
+    let b1 = t.blob("l1.tar", &t1);
+    let layers = [ImageLayer::new(&b1, TAR, &d1)];
+    let opts = ExtractOptions::new().with_special_bits(SpecialBitsPolicy::PreserveIfChowned);
+    for l in [&layers[..], &[][..]] {
+        let e = extract_image_layers_with_options(
+            &fandhe_container_oci::instrument::NoopOciOpRecorder,
+            l,
+            &t.root(),
+            1 << 20,
+            limits(),
+            &opts,
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+        assert!(root_is_empty(&t.root()));
+    }
+}
+
+/// OCI-1・#2323: 0555 のディレクトリと symlink を含む木を消せ、symlink の先は残る。
+#[cfg(unix)]
+#[test]
+fn oci1_remove_extracted_tree_removes_readonly_dirs_and_keeps_symlink_target() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let t = Tmp::new("remove");
+    let outside = t.base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"k").unwrap();
+    let tree = t.base.join("tree");
+    std::fs::create_dir_all(tree.join("etc/sub")).unwrap();
+    std::fs::write(tree.join("etc/sub/f"), b"x").unwrap();
+    std::os::unix::fs::symlink(&outside, tree.join("etc/link")).unwrap();
+    std::fs::set_permissions(tree.join("etc/sub"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    std::fs::set_permissions(tree.join("etc"), std::fs::Permissions::from_mode(0o555)).unwrap();
+    remove_extracted_tree(&tree).unwrap();
+    assert!(!tree.exists());
+    assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"k");
+    // 存在しない木は冪等に成功する。
+    remove_extracted_tree(&tree).unwrap();
 }

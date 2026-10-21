@@ -29,36 +29,106 @@ use fandhe_container_oci::reference::{Digest, Reference, RegistryHost, Repositor
 use fandhe_container_oci::registry::RegistryEndpoint;
 use tonic::{Code, Request};
 
-// sha256 の既知値（`printf hello | sha256sum` など）。
-const SHA_CONFIG: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"; // "hello"
-const SHA_LAYER1: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"; // "abc"
-const SHA_LAYER2: &str = "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7"; // "world"
+// fixture の sha256 は fixture のバイト列を書き出して `sha256sum` で求めた値で、`fixture_digests_match_bodies` が
+// 実体と照合する（fixture を変えたときに気づけるようにする）。レイヤーは非圧縮 tar なので diff_id は blob の digest と同じ。
+/// 2 層（layer1 + layer2）の config。
+const SHA_CONFIG: &str = "2a5f645ff4c74446faf26364efce10b6d719685dacc7bc786f04d4dff63b683d";
+/// 1 層（layer1 のみ）の config。
+const SHA_CONFIG_L1: &str = "e3c1bb45a59fe7d8f51b7e3120b4f5284471b4b94782539aa52481cbb7cc0516";
+/// `etc/`（0555）+ `etc/hello`（"abc"）の tar。
+const SHA_LAYER1: &str = "fab1366a117f241f9419d25c8625e8f64bee0ba97a6964ac756297dbd94e61df";
+/// `world`（"world"）の tar。
+const SHA_LAYER2: &str = "b606f40ff971b51d3b88c65f32533c8836ddae9a02ca24351697a8e9f5a2321e";
+const SIZE_CONFIG: u64 = 225;
+const SIZE_LAYER1: u64 = 2560;
+const SIZE_LAYER2: u64 = 2048;
+/// config + 2 層の圧縮サイズ（非圧縮なので tar と同じ）の合計。
+const SIZE_TOTAL: u64 = SIZE_CONFIG + SIZE_LAYER1 + SIZE_LAYER2;
+
 /// 偽クライアントが返す manifest の digest（試験では内容を持たない任意値）。
 const SHA_INDEX_PICK: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
-fn blob_body(hex: &str) -> &'static [u8] {
+/// ustar の 1 エントリ（ヘッダ 512 バイト + 512 バイト境界へ詰めたデータ）。mtime・uid・gid は 0 に固定する。
+/// `dir` ならディレクトリ（typeflag `5`）。チェックサム欄は空白 8 個とみなして全バイトを足す。
+fn tar_entry(name: &str, mode: u32, data: &[u8], dir: bool) -> Vec<u8> {
+    let mut h = [0u8; 512];
+    let mut put = |off: usize, bytes: &[u8]| h[off..off + bytes.len()].copy_from_slice(bytes);
+    put(0, name.as_bytes());
+    put(100, format!("{mode:07o}\0").as_bytes());
+    put(108, b"0000000\0");
+    put(116, b"0000000\0");
+    put(124, format!("{:011o}\0", data.len()).as_bytes());
+    put(136, b"00000000000\0");
+    put(148, b"        ");
+    put(156, if dir { b"5" } else { b"0" });
+    put(257, b"ustar\0");
+    put(263, b"00");
+    let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    let mut out = h.to_vec();
+    out.extend_from_slice(data);
+    out.resize(512 + data.len().div_ceil(512) * 512, 0);
+    out
+}
+
+/// 非圧縮 tar（エントリ列 + 終端の 1024 バイトのゼロ）。非圧縮レイヤーでは diff_id が blob の digest と一致する。
+fn tar_of(entries: &[Vec<u8>]) -> Vec<u8> {
+    let mut out: Vec<u8> = entries.concat();
+    out.extend_from_slice(&[0u8; 1024]);
+    out
+}
+
+/// 1 層目: `etc/`（0555）と `etc/hello`（"abc"）。
+fn layer1_body() -> Vec<u8> {
+    tar_of(&[
+        tar_entry("etc/", 0o555, b"", true),
+        tar_entry("etc/hello", 0o644, b"abc", false),
+    ])
+}
+
+/// 2 層目: `world`（"world"）。
+fn layer2_body() -> Vec<u8> {
+    tar_of(&[tar_entry("world", 0o644, b"world", false)])
+}
+
+/// image config（`rootfs.diff_ids` は下位から上位の順の sha256。バイト列を固定する）。
+fn config_body(diff_ids: &[&str]) -> Vec<u8> {
+    let ids: Vec<String> = diff_ids.iter().map(|h| format!("\"sha256:{h}\"")).collect();
+    format!(
+        r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":[{}]}}}}"#,
+        ids.join(",")
+    )
+    .into_bytes()
+}
+
+fn blob_body(hex: &str) -> Vec<u8> {
     match hex {
-        SHA_CONFIG => b"hello",
-        SHA_LAYER1 => b"abc",
-        SHA_LAYER2 => b"world",
-        _ => b"",
+        SHA_CONFIG => config_body(&[SHA_LAYER1, SHA_LAYER2]),
+        SHA_CONFIG_L1 => config_body(&[SHA_LAYER1]),
+        SHA_LAYER1 => layer1_body(),
+        SHA_LAYER2 => layer2_body(),
+        _ => Vec::new(),
     }
 }
 
+const MEDIA_TAR: &str = "application/vnd.oci.image.layer.v1.tar";
+
 fn manifest_json(config: &str, layers: &[(&str, u64)]) -> String {
+    manifest_json_media(config, layers, MEDIA_TAR)
+}
+
+fn manifest_json_media(config: &str, layers: &[(&str, u64)], media_type: &str) -> String {
     let layers: Vec<String> = layers
         .iter()
-        .map(|(h, s)| {
-            format!(
-                r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:{h}","size":{s}}}"#
-            )
-        })
+        .map(|(h, s)| format!(r#"{{"mediaType":"{media_type}","digest":"sha256:{h}","size":{s}}}"#))
         .collect();
     format!(
-        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{config}","size":5}},"layers":[{}]}}"#,
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{config}","size":{}}},"layers":[{}]}}"#,
+        blob_body(config).len(),
         layers.join(",")
     )
 }
+
 fn parse_image(json: &str) -> ImageManifest {
     match parse_manifest(
         json.as_bytes(),
@@ -72,7 +142,10 @@ fn parse_image(json: &str) -> ImageManifest {
 }
 
 fn two_layer_manifest() -> String {
-    manifest_json(SHA_CONFIG, &[(SHA_LAYER1, 3), (SHA_LAYER2, 5)])
+    manifest_json(
+        SHA_CONFIG,
+        &[(SHA_LAYER1, SIZE_LAYER1), (SHA_LAYER2, SIZE_LAYER2)],
+    )
 }
 
 /// 偽クライアント。manifest 本文と blob 本文を返し、blob 取得回数を数える。
@@ -131,7 +204,7 @@ impl RegistryPullClient for FakeClient {
     ) -> Result<(), OciError> {
         self.blob_fetches.fetch_add(1, Ordering::SeqCst);
         let hex = descriptor.digest.as_str().trim_start_matches("sha256:");
-        let mut body = blob_body(hex).to_vec();
+        let mut body = blob_body(hex);
         if self.corrupt_digest == Some(hex) {
             body = b"WORLD".to_vec();
         }
@@ -276,7 +349,7 @@ async fn task_61_4_images_pull_inspecti_sequence() {
     assert_eq!(image.id, image_id());
     assert_eq!(image.repo_tags, vec![TAG.to_owned()]);
     assert_eq!(image.repo_digests, vec![repo_digest()]);
-    assert_eq!(image.size, 13);
+    assert_eq!(image.size, SIZE_TOTAL);
     assert_eq!(
         image.spec.as_ref().map(|s| s.image.clone()),
         Some(image_id())

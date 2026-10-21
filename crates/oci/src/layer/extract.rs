@@ -920,11 +920,33 @@ pub fn extract_image_layers_with_policy(
     limits: ExtractLimits,
     policy: SpecialBitsPolicy,
 ) -> Result<Vec<ExtractedLayer>, OciError> {
+    extract_image_layers_with_options(
+        recorder,
+        layers,
+        root,
+        max_uncompressed_bytes,
+        limits,
+        &ExtractOptions::new().with_special_bits(policy),
+    )
+}
+
+/// `extract_image_layers_with` に所有者（`chown`）と特殊ビットの選択肢を足した版（SEC-5・OCI-1・#2225・#2323）。
+///
+/// `options` の契約は `extract_layers_with_options` と同じ。cri の `PullImage` が `PullConfig` の選択肢をそのまま渡す
+/// 入口で、`Err` のときは先行レイヤーの展開物が `root` に残りうるため、呼び出し側が `root` ごと破棄すること。
+pub fn extract_image_layers_with_options(
+    recorder: &dyn OciOpRecorder,
+    layers: &[ImageLayer<'_>],
+    root: &Path,
+    max_uncompressed_bytes: u64,
+    limits: ExtractLimits,
+    options: &ExtractOptions,
+) -> Result<Vec<ExtractedLayer>, OciError> {
+    let setup = SpecialSetup::from_options(options);
     // レイヤー 0 のイメージ（manifest の layers と diff_ids がともに空）は正常な入力。展開物は空の rootfs になる。
-    // `extract_stack` は空入力を拒否するため、ここで root の前提（存在・ディレクトリ・空）だけ確かめて空の結果を返す。
+    // `extract_stack` は空入力を拒否するため、ここで選択肢の組み合わせと root の前提だけ確かめて空の結果を返す。
     if layers.is_empty() {
-        check_root_empty(root)?;
-        return Ok(Vec::new());
+        return extract_zero_layers(root, &setup);
     }
     let sources = layers
         .iter()
@@ -937,14 +959,30 @@ pub fn extract_image_layers_with_policy(
             })
         })
         .collect::<Result<Vec<_>, OciError>>()?;
-    extract_stack(
-        recorder,
-        sources,
-        root,
-        limits,
-        host_lstat,
-        SpecialSetup::host(policy),
-    )
+    extract_stack(recorder, sources, root, limits, host_lstat, setup)
+}
+
+/// レイヤー 0 のイメージの展開（選択肢と root の前提を確かめ、`ChownMapped` なら root だけ写像先へ `chown` する）。
+///
+/// `ChownMapped` では空の rootfs でも root 自身を写像先へ `chown` する（`extract_stack` の `chown_root` と同じ）。
+/// 省くと root が 0700 の実行ユーザー所有のまま公開され、期待所有者の照合が常に食い違う（SEC-5・OCI-1）。
+fn extract_zero_layers(root: &Path, setup: &SpecialSetup) -> Result<Vec<ExtractedLayer>, OciError> {
+    let own = setup.owner_ctx()?;
+    check_root_empty(root)?;
+    if let Some(o) = &own {
+        let ids = map_tar_owner((Some(0), Some(0)), &o.uid, &o.gid)?;
+        (o.fns.lchown)(root, ids.0, ids.1).map_err(|e| chown_err(&e))?;
+    }
+    Ok(Vec::new())
+}
+
+/// 展開した木を symlink を追従せずに消す（#2323）。存在しなければ成功。
+///
+/// 展開は最後に遅延していたディレクトリの mode（0555 等）を適用するため、展開後に中断した root は通常の
+/// `remove_dir_all` では消せないことがある。所有者の rwx が欠けるディレクトリは権限を戻してから消す。
+/// cri の `PullImage` がステージングの後始末に使う。深さは上限があり、超えれば `ResourceExhausted`。
+pub fn remove_extracted_tree(path: &Path) -> Result<(), OciError> {
+    whiteout::remove_tree_nofollow(path)
 }
 
 /// 件数と対応の照合つきで `ImageLayer` の列を作る補助（#2017・#2309・OCI-1）。
@@ -6271,6 +6309,22 @@ mod tests {
             h.set_size(0);
             h.set_cksum();
             h.as_bytes().to_vec()
+        }
+
+        /// SEC-5・OCI-1: レイヤー 0 のイメージでも `ChownMapped` なら root を写像先（0 → 100000）へ chown する。
+        #[test]
+        fn sec5_zero_layer_image_chowns_root() {
+            let sb = Sandbox::new();
+            take_calls();
+            let r =
+                extract_zero_layers(&sb.root, &chown_setup(SpecialBitsPolicy::Strip, rec_fns()))
+                    .unwrap();
+            assert!(r.is_empty());
+            let calls = take_calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].kind, 'l');
+            assert_eq!(calls[0].path.as_deref(), Some(sb.root.as_path()));
+            assert_eq!((calls[0].uid, calls[0].gid), (100_000, 100_000));
         }
 
         /// SEC-5: 複数行の写像で、ファイル・symlink・ディレクトリ・暗黙のディレクトリ・root へ期待どおりの ID を chown する。

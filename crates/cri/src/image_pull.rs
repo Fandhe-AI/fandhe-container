@@ -11,6 +11,16 @@
 //! 5. config と各 layer の blob を一意なステージング領域へ取得し、開いたハンドルで所有者・権限・ハードリンク数を
 //!    確認してから、同じハンドルの内容の sha256 digest を検証（`verify_blob_file_digest`）
 //! 6. 検証済み blob をコンテンツアドレスのパス `<cache_dir>/blobs/sha256/<hex>` へ公開
+//! 7. config blob を symlink を辿らずに開き、同じハンドルで信頼条件と digest を確かめ、同じハンドルから上限つきで
+//!    読んで `rootfs.diff_ids` を解析（`read_verified_config`）
+//! 8. 各 layer を `VerifiedLayerBlob`（検証済みハンドル）で開き直し、pull ごとのステージングの `rootfs/` へ
+//!    `extract_image_layers_with_options` で展開しながら diff_id を突合（#2323・OCI-1・OCI-2）
+//! 9. 展開に成功したときだけ、ステージングで組んだエントリ（`rootfs/` と展開設定の記録 `unpack-record`）を 1 回の
+//!    `rename` で `<cache_dir>/rootfs/sha256/<config-hex>/` へ公開する（記録の無い rootfs が残らない）。公開済みで、
+//!    記録（config・展開設定）と layer の表現が今回と一致するときだけ 8 を省く。layer の表現（圧縮 blob の digest・
+//!    mediaType）だけ違うときは今回の descriptor で展開を検証し直す（公開はしない）。件数の照合は命中時も行い、
+//!    設定が違えば FailedPrecondition で拒否する（既存の展開物は消さない）。所有者写像では root の期待所有者を
+//!    写像先で照合する（冪等。[`OciImagePuller::unpacked_rootfs_dir`]）
 //!
 //! キャッシュに同じ digest の blob が既にあれば 5 の取得を省くが、再利用するのは「信頼できる」既存 blob だけ
 //! （下記「既存 blob の再利用条件」）。条件を満たさない既存 blob は、ステージングへ取得し直したファイルで置き換える。
@@ -20,6 +30,12 @@
 //! - 検証前のファイルをキャッシュへ公開しない。公開先のパスは検証済み `Digest` の 16 進部のみから組み立て、
 //!   レジストリ・リクエスト由来の文字列をパス要素に使わない（パストラバーサル対策）
 //! - ステージング領域は成否に関わらず後始末する（ステージング領域の `Drop` で削除）
+//! - 作りかけの rootfs を公開しない。展開はステージングの中だけで行い、diff_id の不一致・上限超過・未対応の
+//!   mediaType などで失敗したらステージングごと消す（先行レイヤーの展開物も残らない）。展開後に中断した root が
+//!   持つ 0555 等のディレクトリは、oci の `remove_extracted_tree` が権限を戻して消す
+//! - 公開済み rootfs は読み取り専用の元として扱い、コンテナの rootfs として直接書き換えない（複製・overlay の
+//!   下位層に使う。create 経路は TASK-59.2 の担当）。公開先が信頼できない状態（symlink・他人所有など）なら
+//!   消さずに拒否する
 //! - エラー文言は固定の英語で、イメージ名・資格情報・レジストリ応答の文言を含めない（`.claude/rules/security.md`）
 //! - 資格情報は oci の `BasicCredentials` で検証され、`Debug` は伏せられる。zeroize は未対応（oci と同様。依存を足さない）
 //!
@@ -46,12 +62,13 @@
 //! - 本モジュールが保証するのは「この pull が確認した時点で、キャッシュのエントリが上記条件を満たす検証済みの
 //!   ファイルである」ことまで。キャッシュの blob を後から読む処理は、パスを信頼せず同じ手順（symlink を辿らずに
 //!   開く → ハンドルで条件を確認 → 同じハンドルから読む）で開き直すこと。tar 展開の実体は
-//!   `fandhe_container_oci::layer::extract` にある（TASK-52.3・TASK-52.4・TASK-53）が、本モジュールからはまだ
-//!   呼んでいない。oci 側には、この契約を満たす入口として `VerifiedLayerBlob`（symlink を辿らずに開き、同じハンドルで
-//!   信頼条件と digest を確かめた値）と、それだけを受ける `extract_image_layers` がある（#2309）。パスを受け取る旧入口
+//!   `fandhe_container_oci::layer::extract` にあり（TASK-52.3・TASK-52.4・TASK-53）、本モジュールは oci の契約を満たす
+//!   入口 `VerifiedLayerBlob`（symlink を辿らずに開き、同じハンドルで信頼条件と digest を確かめた値）と
+//!   `extract_image_layers_with_options` だけを使う（#2309・#2323）。パスを受け取る旧入口
 //!   （`extract_layer_blob` / `extract_layer_blobs` 系）は内部でパスを開き直し、最終要素の symlink を辿り、所有者・
-//!   権限・ハードリンク数も確かめないため、この契約を満たさない（排他所有のステージングの直後の blob に限る）。
-//!   キャッシュの blob を展開へつなぐ側は `VerifiedLayerBlob` と `extract_image_layers` を使うこと
+//!   権限・ハードリンク数も確かめないため使わない
+//! - 各 layer は `ensure_blob`・`VerifiedLayerBlob::open`・展開のパス 1 とパス 3 で計 4 回読まれる（oci の契約に従った
+//!   結果で、最適化していない）。開いておく fd の数は layer 数と同じで、oci の `MAX_LAYERS` が上限になる
 //! - 同一 UID の別プロセスと root による書き換えは対象外（キャッシュの所有者自身のため防げない）。所有者または
 //!   root が過去に権限を緩めていた間に他ユーザーが開いた書き込み用の記述子も、現在のメタデータからは検出できない
 //! - 既存のキャッシュディレクトリが他ユーザーから辿れる権限（0755 等）で、OS が他人のファイルへのハードリンク作成を
@@ -62,11 +79,15 @@
 //!
 //! # 未実装範囲（REPAIR-3）
 //!
-//! - レイヤーの tar 展開（rootfs 化）と whiteout・不透明ディレクトリの処理は `fandhe-container-oci` の
-//!   `layer::extract` に実装済み（TASK-52.3・TASK-52.4・TASK-53。#409・#410・#414。OCI-1・OCI-2）だが、本モジュール
-//!   の pull 経路からは呼んでいない。この配線を担当する issue は無い（TASK-55・#419 は pull から実行までの受け入れ検証）
-//! - diff_id（config の `rootfs.diff_ids`）の突合は oci 側の `extract_image_layers` が行う（#2017・#2309。OCI-1）。
-//!   本モジュールは展開を呼ばないため、まだ使っていない（展開の配線と同じく担当 issue は無い）
+//! - レイヤーの展開と diff_id の突合は配線済み（#2323）。残りは次のとおり。
+//!   - 所有者・特殊ビットの選択肢は [`PullConfig::extract_options`] の受け口までで、既定は安全側（`Keep` + `Strip`）。
+//!     rootless / rootful ごとの値（`ChownMapped`・`PreserveIfOwnerMapped`。`CAP_CHOWN` と subuid の写像・user namespace
+//!     の範囲が要る）を決めて渡すのは呼び出し元（plugin-cri・create 経路）の担当（SEC-5・SEC-1。
+//!     `docs/design/oci-layer-special-bits.md`）
+//!   - 展開済み rootfs の GC と `image rm` / `image prune` への接続は TASK-183（OCI-7）の担当。それまで削除しても
+//!     `<cache_dir>/rootfs/sha256/<hex>` は残る
+//!   - 異常終了で残ったステージング（展開途中の rootfs を含む）の回収は、blob のステージングと同じく起動時 GC の担当（#2315）
+//!   - 展開中の処理は gRPC のキャンセルで打ち切れず、期限（[`PullConfig::pull_deadline`]）は展開の前後で確認する
 //! - 永続イメージストアと展開後サイズの算出は TASK-183（OCI-7。展開後サイズは #2222）の担当。本モジュールが返す
 //!   `size` は config と全 layer の**圧縮サイズの合計**で、展開後サイズではない
 //! - `AuthConfig.identity_token`（OAuth2）・`registry_token` は未対応で `UNIMPLEMENTED`（oci の OAuth2 POST フロー待ち。OCI-3）
@@ -76,13 +97,24 @@
 
 use std::fmt;
 use std::fs;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
+use fandhe_container_oci::config::{ImageRootFs, MAX_CONFIG_BYTES, parse_image_config_rootfs};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
-use fandhe_container_oci::layer::{open_blob_nofollow, verify_blob_file_digest};
+use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
+use fandhe_container_oci::layer::extract::{
+    ExtractLimits, ExtractOptions, OwnershipPolicy, extract_image_layers_with_options,
+    image_layers_from, remove_extracted_tree,
+};
+use fandhe_container_oci::layer::{
+    DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, VerifiedLayerBlob, open_blob_nofollow,
+    verify_blob_file_digest,
+};
 use fandhe_container_oci::manifest::{Descriptor, ImageManifest, Platform};
 use fandhe_container_oci::reference::{
     DOCKER_HUB_REGISTRY_HOST, Digest, ImageReference, Reference, RegistryHost, Repository,
@@ -129,6 +161,34 @@ impl PullError {
             OciErrorCode::ResourceExhausted => "image exceeds the size limit",
             OciErrorCode::FailedPrecondition => "image cache precondition failed",
             _ => "image pull failed",
+        };
+        Self::new(err.code(), message)
+    }
+
+    /// レイヤー展開の失敗を写す。oci の message にはエントリ名等が入りうるため捨て、分類ごとの固定文言にする
+    /// （`.claude/rules/security.md`。#2323・OCI-1・ERR-3）。
+    pub fn from_extract(err: &OciError) -> Self {
+        let message = match err.code() {
+            OciErrorCode::DataLoss => "image layer failed validation",
+            OciErrorCode::ResourceExhausted => "image layer exceeds the extraction limit",
+            OciErrorCode::Unimplemented => "unsupported image layer format",
+            OciErrorCode::InvalidArgument => "image layer contains an invalid entry",
+            OciErrorCode::PermissionDenied => "image layer entry is not permitted",
+            OciErrorCode::NotFound => "image layer references a missing entry",
+            OciErrorCode::FailedPrecondition => "image rootfs precondition failed",
+            OciErrorCode::AlreadyExists => "image layer has conflicting entries",
+            _ => "image layer extraction failed",
+        };
+        Self::new(err.code(), message)
+    }
+
+    /// image config の読み取り・解析の失敗を写す（固定文言。#2323・OCI-1・ERR-3）。
+    pub fn from_config(err: &OciError) -> Self {
+        let message = match err.code() {
+            OciErrorCode::DataLoss => "image config failed validation",
+            OciErrorCode::ResourceExhausted => "image config exceeds the size limit",
+            OciErrorCode::Unimplemented => "unsupported image config",
+            _ => "image config could not be read",
         };
         Self::new(err.code(), message)
     }
@@ -356,6 +416,14 @@ pub struct PullConfig {
     pub pull_deadline: Duration,
     /// 資格情報を送ってよい token realm の追加ホスト（既定は空。接続先と同一ホスト・oci の組み込み既知対は常に許可）。
     pub trusted_realm_hosts: Vec<RegistryHost>,
+    /// 1 レイヤーあたりの展開後（tar）サイズの上限。
+    pub max_uncompressed_layer_bytes: u64,
+    /// レイヤー展開の上限（エントリ数・展開バイト数・入力バイト数・索引件数。全レイヤーで共有して累積する）。
+    pub extract_limits: ExtractLimits,
+    /// レイヤー展開の所有者・特殊ビットの選択肢。既定は `chown` しない（`Keep`）・特殊ビットは落とす（`Strip`）。
+    /// rootless / rootful ごとの値（`ChownMapped`・`PreserveIfOwnerMapped` 等）は呼び出し元（plugin-cri・create 経路）が
+    /// 決める。条件は `docs/design/oci-layer-special-bits.md`（SEC-5・SEC-1。#2323 では既定のまま）。
+    pub extract_options: ExtractOptions,
 }
 
 impl PullConfig {
@@ -369,6 +437,9 @@ impl PullConfig {
             max_config_bytes: DEFAULT_MAX_CONFIG_BYTES,
             pull_deadline: DEFAULT_PULL_DEADLINE,
             trusted_realm_hosts: Vec::new(),
+            max_uncompressed_layer_bytes: DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES,
+            extract_limits: ExtractLimits::default(),
+            extract_options: ExtractOptions::new(),
         })
     }
 }
@@ -378,12 +449,26 @@ impl PullConfig {
 pub struct OciImagePuller<C: RegistryPullClient> {
     client: C,
     config: PullConfig,
+    /// 展開（`ExtractLayer`）の計装の記録先。既定は何も記録しない（REPAIR-4）。
+    recorder: Arc<dyn OciOpRecorder>,
 }
 
 impl<C: RegistryPullClient> OciImagePuller<C> {
     /// クライアントと設定から作る。
     pub fn new(client: C, config: PullConfig) -> Self {
-        Self { client, config }
+        Self {
+            client,
+            config,
+            recorder: Arc::new(NoopOciOpRecorder),
+        }
+    }
+
+    /// 展開の計装（レイヤーごとの成否・エラー code・所要時間。REPAIR-4）の記録先を差し替える。
+    /// plugin-cri などの上位が集計・構造化ログの実装を渡す入口。
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Arc<dyn OciOpRecorder>) -> Self {
+        self.recorder = recorder;
+        self
     }
 
     /// 認証状態を取り直す（token 失効・PermissionDenied 時。資格情報は pull 要求のものを再利用する）。
@@ -411,6 +496,145 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
     /// `blobs/sha256` を作る（Unix では 0700）。
     fn blobs_dir(&self) -> Result<TrustedDir, PullError> {
         prepare_private_dir(&self.config.cache_dir, &["blobs", "sha256"])
+    }
+
+    /// 展開済み rootfs の公開先（`<cache_dir>/rootfs/sha256/<hex>/rootfs`。キーはイメージ ID = config digest）。
+    ///
+    /// 親の `<hex>/` エントリは `rootfs/`（展開物）と `unpack-record`（展開時の設定の記録）を持ち、1 回の `rename` で
+    /// 一緒に公開される（記録の無い rootfs が残らない）。
+    ///
+    /// 公開済みなら、検証済み blob から pull が展開し終えた読み取り専用の元になる rootfs である。コンテナの rootfs として
+    /// 直接書き換えず、複製・overlay の下位層として使うこと（create 経路は TASK-59.2 の担当）。
+    pub fn unpacked_rootfs_dir(&self, image_id: &Digest) -> PathBuf {
+        self.config
+            .cache_dir
+            .join("rootfs")
+            .join("sha256")
+            .join(digest_hex(image_id))
+            .join(ROOTFS_SUBDIR)
+    }
+
+    /// 展開済み rootfs があれば省き、無ければステージングで展開して成功時だけ公開する（#2323・OCI-1）。
+    ///
+    /// 作りかけの rootfs は公開先に現れない。失敗時の root はステージングごと呼び出し側の `Drop` が消す。
+    fn ensure_rootfs(
+        &self,
+        blobs: &TrustedDir,
+        staging: &StagingDir,
+        manifest: &ImageManifest,
+        rootfs_cfg: &ImageRootFs,
+        started: Instant,
+    ) -> Result<(), PullError> {
+        let rootfs_dir = prepare_private_dir(&self.config.cache_dir, &["rootfs", "sha256"])?;
+        let entry_path = rootfs_dir.path.join(digest_hex(&manifest.config.digest));
+        // 公開済みでも件数の照合を飛ばさない（余分な layer を足した不整合な manifest を成功させない。OCI-1）。
+        if manifest.layers.len() != rootfs_cfg.diff_ids().len() {
+            return Err(PullError::new(
+                OciErrorCode::DataLoss,
+                "image layer count does not match the config",
+            ));
+        }
+        let record = self.unpack_record(manifest)?;
+        let root_owner = self.expected_root_owner(rootfs_dir.owner)?;
+        // 公開済みの命中は、同じ config・同じ展開設定の記録があるときに限る。layer の表現（圧縮 blob の digest・
+        // mediaType）が違うだけなら、config の diff_ids が同じため展開物は同じ。その場合は今回の descriptor で
+        // 展開を検証するだけで（公開はしない）成功とする（OCI-1）。
+        let mut verify_only = false;
+        if inspect_published_rootfs(&entry_path, rootfs_dir.owner, root_owner)? {
+            match check_unpack_record(&entry_path.join(RECORD_FILE), &record, rootfs_dir.owner)? {
+                RecordMatch::Exact => return Ok(()),
+                RecordMatch::SameImageOtherLayers => verify_only = true,
+            }
+        }
+        // descriptor の数だけ開く（重複 digest も別ハンドル。`image_layers_from` が件数の一致を要求する）。
+        let verified = manifest
+            .layers
+            .iter()
+            .map(|d| {
+                VerifiedLayerBlob::open(
+                    &blobs.path.join(digest_hex(&d.digest)),
+                    &d.digest,
+                    d.size,
+                    blobs.owner,
+                )
+                .map_err(|e| PullError::from_extract(&e))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let refs: Vec<&VerifiedLayerBlob> = verified.iter().collect();
+        let layers = image_layers_from(&manifest.layers, &refs, rootfs_cfg)
+            .map_err(|e| PullError::from_extract(&e))?;
+        // ステージングの中でエントリ（`rootfs/` と記録）を組み立て、1 回の rename で公開する。
+        let staged_entry = staging.path().join("entry");
+        create_private_dir(&staged_entry)?;
+        let root = staged_entry.join(ROOTFS_SUBDIR);
+        create_private_dir(&root)?;
+        self.check_deadline(started)?;
+        extract_image_layers_with_options(
+            self.recorder.as_ref(),
+            &layers,
+            &root,
+            self.config.max_uncompressed_layer_bytes,
+            self.config.extract_limits,
+            &self.config.extract_options,
+        )
+        .map_err(|e| PullError::from_extract(&e))?;
+        self.check_deadline(started)?;
+        if verify_only {
+            return Ok(());
+        }
+        write_unpack_record(&staged_entry.join(RECORD_FILE), &record)?;
+        // 原子的に公開する。並行する pull が先に公開していて信頼できるなら、その展開設定が同じときだけ成功とする。
+        if fs::rename(&staged_entry, &entry_path).is_err() {
+            if inspect_published_rootfs(&entry_path, rootfs_dir.owner, root_owner).unwrap_or(false)
+            {
+                check_unpack_record(&entry_path.join(RECORD_FILE), &record, rootfs_dir.owner)?;
+                return Ok(());
+            }
+            return Err(PullError::new(
+                OciErrorCode::FailedPrecondition,
+                "failed to publish image rootfs",
+            ));
+        }
+        Ok(())
+    }
+
+    /// 展開結果を決める入力（config・所有者と特殊ビットの設定）と、今回の layer の表現を記録にする。
+    /// 公開済み rootfs の再利用可否は、この記録が展開時のものと一致するかで決める（#2323・OCI-1・SEC-5）。
+    fn unpack_record(&self, manifest: &ImageManifest) -> Result<UnpackRecord, PullError> {
+        let mut settings = format!(
+            "fandhe-rootfs-v2\nconfig={}\n",
+            manifest.config.digest.as_str()
+        );
+        settings.push_str(&encode_extract_options(&self.config.extract_options)?);
+        let mut layers = String::new();
+        for d in &manifest.layers {
+            layers.push_str("layer=");
+            layers.push_str(d.digest.as_str());
+            layers.push(' ');
+            layers.extend(d.media_type.chars().map(|c| {
+                if c.is_control() || c.is_whitespace() {
+                    '_'
+                } else {
+                    c
+                }
+            }));
+            layers.push('\n');
+        }
+        Ok(UnpackRecord { settings, layers })
+    }
+
+    /// 公開済み rootfs の root が持つべき所有 uid。`ChownMapped` では展開が root を写像先（コンテナ uid 0 の
+    /// ホスト側 ID）へ `chown` するため、それを期待値にする。それ以外は管理プロセスの uid（`owner`）。
+    fn expected_root_owner(&self, owner: u32) -> Result<u32, PullError> {
+        match &self.config.extract_options.ownership {
+            OwnershipPolicy::ChownMapped { uid, .. } => uid.map_to_host(0).ok_or_else(|| {
+                PullError::new(
+                    OciErrorCode::InvalidArgument,
+                    "id mapping does not cover the container root user",
+                )
+            }),
+            _ => Ok(owner),
+        }
     }
 
     /// 信頼できる検証済みの既存 blob があれば取得を省き、そうでなければステージングへ取得 → 検証 → 公開する。
@@ -584,8 +808,18 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
             self.ensure_blob(&ctx, &mut auth, &staging, &blobs, descriptor)?;
             seen.push((&descriptor.digest, descriptor.size));
         }
-        drop(staging);
         // 最後の blob の取得・検証で期限を超えた場合も成功を返さない（REPAIR-5）。
+        self.check_deadline(started)?;
+
+        // config を検証してから解析し、検証済みハンドルでレイヤーを展開する（#2323・OCI-1・OCI-2）。
+        let rootfs_cfg = read_verified_config(
+            &blobs.path.join(digest_hex(&manifest.config.digest)),
+            &manifest.config,
+            blobs.owner,
+            self.config.max_config_bytes,
+        )?;
+        self.ensure_rootfs(&blobs, &staging, manifest, &rootfs_cfg, started)?;
+        drop(staging);
         self.check_deadline(started)?;
 
         let name = display_name(image_ref.registry(), repository);
@@ -823,6 +1057,227 @@ fn inspect_cached_blob(
         Ok(verified) if verified.size == size => Ok(()),
         _ => Err(CachedBlobRejection::ContentMismatch),
     }
+}
+
+/// config blob を信頼条件と digest の確認つきで 1 つのハンドルから読み、rootfs 部だけ解析する（#2323・OCI-1）。
+///
+/// 手順: symlink を辿らず開く → 同じハンドルで所有者・権限・ハードリンク数と digest・サイズを確認 → 同じハンドルを
+/// 先頭から上限つきで読む → `parse_image_config_rootfs`。パスは開き直さない。上限は `max_bytes` と oci の
+/// `MAX_CONFIG_BYTES` の小さい方で、`max_bytes` を大きくしても oci 側の 1 MiB で拒否される（fail-closed）。
+fn read_verified_config(
+    path: &Path,
+    descriptor: &Descriptor,
+    owner: u32,
+    max_bytes: u64,
+) -> Result<ImageRootFs, PullError> {
+    let mut file = open_blob_nofollow(path).map_err(|e| PullError::from_config(&e))?;
+    let untrusted = || {
+        PullError::new(
+            OciErrorCode::FailedPrecondition,
+            "cached image config is not trusted",
+        )
+    };
+    let facts = blob_file_facts(&file).ok_or_else(untrusted)?;
+    check_blob_trust(&facts, owner).map_err(|_| untrusted())?;
+    let verified = verify_blob_file_digest(&file, &descriptor.digest, descriptor.size)
+        .map_err(|e| PullError::from_config(&e))?;
+    if verified.size != descriptor.size {
+        return Err(PullError::new(
+            OciErrorCode::DataLoss,
+            "image config failed validation",
+        ));
+    }
+    let limit = max_bytes.min(MAX_CONFIG_BYTES);
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| PullError::new(OciErrorCode::DataLoss, "image config could not be read"))?;
+    let mut body = Vec::new();
+    (&mut file)
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut body)
+        .map_err(|_| PullError::new(OciErrorCode::DataLoss, "image config could not be read"))?;
+    if body.len() as u64 > limit {
+        return Err(PullError::new(
+            OciErrorCode::ResourceExhausted,
+            "image config exceeds the size limit",
+        ));
+    }
+    if body.len() as u64 != descriptor.size {
+        return Err(PullError::new(
+            OciErrorCode::DataLoss,
+            "image config failed validation",
+        ));
+    }
+    parse_image_config_rootfs(&body).map_err(|e| PullError::from_config(&e))
+}
+
+/// 公開済みエントリ内の展開物のディレクトリ名。
+const ROOTFS_SUBDIR: &str = "rootfs";
+/// 公開済みエントリ内の展開時の設定の記録のファイル名。
+const RECORD_FILE: &str = "unpack-record";
+
+/// 展開時の設定の記録。`settings` は展開結果を決める入力（config・所有者・特殊ビット）、`layers` は今回の layer の
+/// 表現（圧縮 blob の digest と mediaType）。
+struct UnpackRecord {
+    settings: String,
+    layers: String,
+}
+
+/// 記録との照合結果。
+enum RecordMatch {
+    /// 設定も layer の表現も一致する。
+    Exact,
+    /// 設定は一致し、layer の表現だけ違う（同じ config = 同じ diff_ids の再圧縮など）。
+    SameImageOtherLayers,
+}
+
+/// `ExtractOptions` を固定書式で符号化する。`Debug` 出力は書式が安定しないため使わない（記録の互換性を保つ）。
+/// 未知の選択肢（将来追加された variant）は黙って同一視せず `Unimplemented` で拒否する（fail-closed）。
+fn encode_extract_options(options: &ExtractOptions) -> Result<String, PullError> {
+    use fandhe_container_oci::layer::extract::{IdRange, SpecialBitsPolicy};
+    fn range(r: &IdRange) -> String {
+        format!("{}:{}:{}", r.container_id, r.host_id, r.count)
+    }
+    fn map_lines(lines: &[IdRange]) -> String {
+        lines.iter().map(range).collect::<Vec<_>>().join(",")
+    }
+    let unsupported = || {
+        PullError::new(
+            OciErrorCode::Unimplemented,
+            "unsupported layer extraction option",
+        )
+    };
+    let ownership = match &options.ownership {
+        OwnershipPolicy::Keep => "keep".to_owned(),
+        OwnershipPolicy::ChownMapped { uid, gid } => {
+            format!(
+                "chown-mapped uid={} gid={}",
+                map_lines(uid.lines()),
+                map_lines(gid.lines())
+            )
+        }
+        _ => return Err(unsupported()),
+    };
+    let special = match &options.special_bits {
+        SpecialBitsPolicy::Strip => "strip".to_owned(),
+        SpecialBitsPolicy::PreserveIfOwnerMapped { uid, gid } => {
+            format!(
+                "preserve-if-owner-mapped uid={} gid={}",
+                range(uid),
+                range(gid)
+            )
+        }
+        SpecialBitsPolicy::PreserveIfChowned => "preserve-if-chowned".to_owned(),
+        _ => return Err(unsupported()),
+    };
+    Ok(format!("ownership={ownership}\nspecial-bits={special}\n"))
+}
+
+/// 公開済みエントリの有無を確かめる。有って信頼できれば `true`、無ければ `false`、有るのに信頼できなければ拒否する
+/// （消さない。#2323）。信頼条件はキャッシュのディレクトリと同じ（symlink でない・所有者一致・group/other 書き込みなし）。
+/// エントリ（管理プロセス所有）と中の `rootfs/`（`root_owner` 所有）の両方を見る。
+fn inspect_published_rootfs(entry: &Path, owner: u32, root_owner: u32) -> Result<bool, PullError> {
+    let untrusted = || {
+        PullError::new(
+            OciErrorCode::FailedPrecondition,
+            "image rootfs cache entry is not trusted",
+        )
+    };
+    match fs::symlink_metadata(entry) {
+        Ok(_) => {
+            verify_private_dir(entry, owner).map_err(|_| untrusted())?;
+            verify_private_dir(&entry.join(ROOTFS_SUBDIR), root_owner).map_err(|_| untrusted())?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(PullError::new(
+            OciErrorCode::FailedPrecondition,
+            "failed to inspect the image rootfs cache entry",
+        )),
+    }
+}
+
+/// 照合用の記録の読み取り上限。
+const MAX_RECORD_BYTES: u64 = 64 * 1024;
+
+/// 公開済みエントリの記録を `expected` と照合する。記録が無い・信頼できない・設定が食い違う場合は再利用せず拒否する
+/// （既存の展開物は消さない。コンテナの下位層として使われている可能性があるため）。
+fn check_unpack_record(
+    path: &Path,
+    expected: &UnpackRecord,
+    owner: u32,
+) -> Result<RecordMatch, PullError> {
+    use std::io::Read as _;
+    let reject = |message: &'static str| PullError::new(OciErrorCode::FailedPrecondition, message);
+    let meta = fs::symlink_metadata(path)
+        .map_err(|_| reject("image rootfs cache entry has no unpack record"))?;
+    if !meta.file_type().is_file() {
+        return Err(reject("image rootfs unpack record is not trusted"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        if meta.uid() != owner || meta.permissions().mode() & 0o022 != 0 {
+            return Err(reject("image rootfs unpack record is not trusted"));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = owner;
+    let mut body = Vec::new();
+    fs::File::open(path)
+        .and_then(|f| f.take(MAX_RECORD_BYTES).read_to_end(&mut body))
+        .map_err(|_| reject("failed to read the image rootfs unpack record"))?;
+    let Some(rest) = body.strip_prefix(expected.settings.as_bytes()) else {
+        return Err(reject(
+            "image rootfs cache entry was unpacked with different settings",
+        ));
+    };
+    if rest == expected.layers.as_bytes() {
+        Ok(RecordMatch::Exact)
+    } else {
+        Ok(RecordMatch::SameImageOtherLayers)
+    }
+}
+
+/// 記録を 0600 で `path`（ステージングのエントリ内）へ書く。公開は親ごとの rename で行うため、単体の rename はしない。
+fn write_unpack_record(path: &Path, record: &UnpackRecord) -> Result<(), PullError> {
+    use std::io::Write as _;
+    let fail = || {
+        PullError::new(
+            OciErrorCode::FailedPrecondition,
+            "failed to record the image rootfs unpack settings",
+        )
+    };
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).map_err(|_| fail())?;
+    f.write_all(record.settings.as_bytes())
+        .map_err(|_| fail())?;
+    f.write_all(record.layers.as_bytes()).map_err(|_| fail())?;
+    f.sync_all().map_err(|_| fail())
+}
+
+/// 非再帰で 0700 のディレクトリを作る（既存は拒否。展開の root は空であることが前提）。
+fn create_private_dir(path: &Path) -> Result<(), PullError> {
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let builder = fs::DirBuilder::new();
+    builder.create(path).map_err(|_| {
+        PullError::new(
+            OciErrorCode::FailedPrecondition,
+            "failed to create the image rootfs staging directory",
+        )
+    })
 }
 
 /// 公開する blob の権限（所有者のみ読み書き）。oci の `fetch_blob` が作る `.part` と同じ値。
@@ -1124,7 +1579,10 @@ impl StagingDir {
 
 impl Drop for StagingDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        // 展開後に中断した root は 0555 等のディレクトリを含みうる。権限を戻して消せる oci の削除を先に試す。
+        if remove_extracted_tree(&self.path).is_err() {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -1649,6 +2107,96 @@ mod blob_trust_fs_tests {
     }
 }
 
+/// 展開の後始末とエラー写像の単体試験（#2323・OCI-1・ERR-3）。
+#[cfg(test)]
+mod extract_cleanup_tests {
+    use super::*;
+
+    /// OCI-1: 展開後に中断した root（0555 のディレクトリを含む）もステージングの `Drop` で消える。
+    #[cfg(unix)]
+    #[test]
+    fn oci1_staging_drop_removes_readonly_extracted_tree() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let cache = std::env::temp_dir().join(format!(
+            "fandhe-cri-staging-drop-{}-{}",
+            std::process::id(),
+            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&cache).expect("mkdir");
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).expect("chmod");
+        let staging = StagingDir::create(&cache).expect("staging");
+        let staging_path = staging.path().to_path_buf();
+        let deep = staging_path.join("rootfs").join("etc").join("sub");
+        fs::create_dir_all(&deep).expect("mkdir");
+        fs::write(deep.join("f"), b"x").expect("write");
+        fs::set_permissions(&deep, fs::Permissions::from_mode(0o555)).expect("chmod");
+        fs::set_permissions(
+            staging_path.join("rootfs").join("etc"),
+            fs::Permissions::from_mode(0o555),
+        )
+        .expect("chmod");
+        drop(staging);
+        assert!(fs::symlink_metadata(&staging_path).is_err());
+        let _ = fs::remove_dir_all(&cache);
+    }
+
+    /// ERR-3: 展開・config の失敗は分類を引き継ぎ、文言は分類ごとの固定の英語になる。
+    #[test]
+    fn err3_extract_and_config_errors_have_fixed_messages() {
+        let secret = "layer entry etc/shadow at /var/lib/secret";
+        let extract = [
+            (OciErrorCode::DataLoss, "image layer failed validation"),
+            (
+                OciErrorCode::ResourceExhausted,
+                "image layer exceeds the extraction limit",
+            ),
+            (
+                OciErrorCode::Unimplemented,
+                "unsupported image layer format",
+            ),
+            (
+                OciErrorCode::InvalidArgument,
+                "image layer contains an invalid entry",
+            ),
+            (
+                OciErrorCode::PermissionDenied,
+                "image layer entry is not permitted",
+            ),
+            (
+                OciErrorCode::NotFound,
+                "image layer references a missing entry",
+            ),
+            (
+                OciErrorCode::FailedPrecondition,
+                "image rootfs precondition failed",
+            ),
+            (
+                OciErrorCode::AlreadyExists,
+                "image layer has conflicting entries",
+            ),
+            (OciErrorCode::Internal, "image layer extraction failed"),
+        ];
+        for (code, message) in extract {
+            let e = PullError::from_extract(&OciError::new(code, secret));
+            assert_eq!(e.code(), code);
+            assert_eq!(e.message(), message);
+        }
+        let config = [
+            (OciErrorCode::DataLoss, "image config failed validation"),
+            (
+                OciErrorCode::ResourceExhausted,
+                "image config exceeds the size limit",
+            ),
+            (OciErrorCode::Unimplemented, "unsupported image config"),
+            (OciErrorCode::NotFound, "image config could not be read"),
+        ];
+        for (code, message) in config {
+            let e = PullError::from_config(&OciError::new(code, secret));
+            assert_eq!(e.code(), code);
+            assert_eq!(e.message(), message);
+        }
+    }
+}
 #[cfg(all(test, not(unix)))]
 mod non_unix_tests {
     use super::*;

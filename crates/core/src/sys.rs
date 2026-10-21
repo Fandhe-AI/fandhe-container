@@ -5063,20 +5063,36 @@ pub(crate) fn landlock_add_path_beneath(
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `landlock_restrict_self` が受ける flags の既知ビット（`LOG_NEW_EXEC_ON` のみ。SEC-4・#2307）。
+/// 対応外アーキテクチャでは 0 になり、0 以外はすべて拒否される（fail-closed）。
+const LANDLOCK_RESTRICT_SELF_KNOWN_FLAGS: u32 = consts::LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON;
+
+/// flags が既知ビットだけか fd に触れず検査する純粋関数。`landlock_restrict_self` の先頭から呼ばれ、
+/// 未知ビット（意味を変える `TSYNC`・記録を抑えるビット等）を syscall に届かせない（SEC-4・REPAIR-2・#2307）。
+pub(crate) fn check_landlock_restrict_self_flags(flags: u32) -> Result<(), SysError> {
+    if flags & !LANDLOCK_RESTRICT_SELF_KNOWN_FLAGS != 0 {
+        return Err(SysError::Os(EINVAL));
+    }
+    Ok(())
+}
+
 /// ruleset を呼び出したスレッドへ適用する（`landlock_restrict_self(2)`。CORE-5・TASK-39.3・#183）。
 ///
 /// 適用は不可逆で、呼び出したスレッド（と以後 fork・clone する子）にのみ効く。`NO_NEW_PRIVS` と
 /// 単一スレッドの事前確認は呼び出し側（`crate::landlock`）の契約で、本関数は検証しない。
-/// `flags` は ABI に応じた既知のビットだけを呼び出し側（`crate::landlock::RestrictSelfFlags`）が選ぶ契約で、
-/// 未知のビットはカーネルが `EINVAL` で拒否する（SEC-4・#2026）。
+/// `flags` はランタイムが使う既知のビット（`LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON` のみ。SEC-4・#2026）に限り、
+/// それ以外（`LOG_SAME_EXEC_OFF`・`LOG_SUBDOMAINS_OFF`・ABI 8 の `TSYNC` 等）は syscall の前に本関数が
+/// `Os(EINVAL)` で拒否する（#2307・REPAIR-2）。対応外アーキテクチャでも 0 以外は `Unsupported` でなく
+/// `Os(EINVAL)` になる（検査が `SUPPORTED` 判定より先）。
 pub(crate) fn landlock_restrict_self(ruleset: BorrowedFd<'_>, flags: u32) -> Result<(), SysError> {
+    check_landlock_restrict_self_flags(flags)?;
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
     let nr = consts::SYS_LANDLOCK_RESTRICT_SELF.get()?;
     // SAFETY: 引数は生存中の `BorrowedFd` の fd 番号と flags の整数のみでポインタを渡さない。
     // メモリには触れず、影響は呼び出したスレッドの Landlock ドメインの追加（権限を減らす方向）のみ。
-    // flags はドメインの監査ログの設定だけで、許可する権利は広がらない。
+    // flags はドメインの監査ログの設定だけで、許可する権利は広がらない（冒頭の既知ビット検査で担保）。
     let rc = unsafe { syscall(nr, i64::from(ruleset.as_raw_fd()), u64::from(flags)) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
@@ -5389,6 +5405,31 @@ mod tests {
         assert_eq!(core::mem::size_of::<LandlockRulesetAttr>(), 24);
         assert_eq!(core::mem::size_of::<LandlockPathBeneathAttr>(), 12);
         assert_eq!(core::mem::offset_of!(LandlockPathBeneathAttr, parent_fd), 8);
+    }
+
+    /// SEC-4・REPAIR-2・#2307: 既知ビット（0 と `LOG_NEW_EXEC_ON`）以外の flags は fd に触れず
+    /// `Os(EINVAL)` で拒否する。ビット位置は include/uapi/linux/landlock.h の
+    /// `LOG_SAME_EXEC_OFF`=1<<0・`LOG_NEW_EXEC_ON`=1<<1・`LOG_SUBDOMAINS_OFF`=1<<2・`TSYNC`=1<<3。
+    #[test]
+    fn sec4_landlock_restrict_self_rejects_unknown_flags() {
+        assert_eq!(check_landlock_restrict_self_flags(0), Ok(()));
+        for bad in [1_u32, 4, 8, 3, 1 << 31, u32::MAX] {
+            assert_eq!(
+                check_landlock_restrict_self_flags(bad),
+                Err(SysError::Os(EINVAL)),
+                "flags={bad:#x}"
+            );
+        }
+    }
+
+    /// SEC-4・#2307: 対応アーキテクチャでは `LOG_NEW_EXEC_ON` だけが通る。
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec4_landlock_restrict_self_accepts_log_new_exec_on() {
+        assert_eq!(check_landlock_restrict_self_flags(2), Ok(()));
     }
 
     /// CORE-5・TASK-39.3: ruleset 作成とルール追加は fd に触れるだけでプロセスを制限しないため

@@ -22,6 +22,7 @@ use fandhe_container_cri::instrument::{CriOpOutcome, CriOpRecorder, CriOpSample}
 use fandhe_container_cri::runtime::v1::{self, image_service_server::ImageService};
 use fandhe_container_oci::auth::{BasicCredentials, RegistryAuth};
 use fandhe_container_oci::error::{OciError, OciErrorCode};
+use fandhe_container_oci::layer::extract::ExtractLimits;
 use fandhe_container_oci::manifest::{
     Descriptor, ImageManifest, ParsedManifest, Platform, parse_manifest,
 };
@@ -29,36 +30,123 @@ use fandhe_container_oci::reference::{Digest, Reference, RegistryHost, Repositor
 use fandhe_container_oci::registry::RegistryEndpoint;
 use tonic::{Code, Request};
 
-// sha256 の既知値（`printf hello | sha256sum` など）。
-const SHA_CONFIG: &str = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"; // "hello"
-const SHA_LAYER1: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"; // "abc"
-const SHA_LAYER2: &str = "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7"; // "world"
+// fixture の sha256 は fixture のバイト列を書き出して `sha256sum` で求めた値で、`fixture_digests_match_bodies` が
+// 実体と照合する（fixture を変えたときに気づけるようにする）。レイヤーは非圧縮 tar なので diff_id は blob の digest と同じ。
+/// 2 層（layer1 + layer2）の config。
+const SHA_CONFIG: &str = "2a5f645ff4c74446faf26364efce10b6d719685dacc7bc786f04d4dff63b683d";
+/// 1 層（layer1 のみ）の config。
+const SHA_CONFIG_L1: &str = "e3c1bb45a59fe7d8f51b7e3120b4f5284471b4b94782539aa52481cbb7cc0516";
+/// `etc/`（0555）+ `etc/hello`（"abc"）の tar。
+const SHA_LAYER1: &str = "fab1366a117f241f9419d25c8625e8f64bee0ba97a6964ac756297dbd94e61df";
+/// `world`（"world"）の tar。
+const SHA_LAYER2: &str = "b606f40ff971b51d3b88c65f32533c8836ddae9a02ca24351697a8e9f5a2321e";
+const SIZE_CONFIG: u64 = 225;
+const SIZE_LAYER1: u64 = 2560;
+const SIZE_LAYER2: u64 = 2048;
+/// config + 2 層の圧縮サイズ（非圧縮なので tar と同じ）の合計。
+const SIZE_TOTAL: u64 = SIZE_CONFIG + SIZE_LAYER1 + SIZE_LAYER2;
+/// 3 層目 `.wh.world` の tar。
+const SHA_LAYER3: &str = "3012d30d565bfb7f4fdd6045a976359ad5bd1d1126241c1d517634eac4ab14ad";
+/// 3 層（layer1〜3）の config。
+const SHA_CONFIG_L3: &str = "d167b2300d21a713edee1616b9943ec615bcb809f339f63dad134383440a986f";
+/// diff_ids が [layer1, layer1] の config（layer1 を 2 回使う manifest に合う。[layer1, layer2] の manifest には 2 層目が合わない）。
+const SHA_CONFIG_DUP: &str = "6f3d697df322cbd63aedddb069f12d4b1fe248d50a6633153fb1908bd51eebfd";
+/// JSON でない config 本体（"not json"）。
+const SHA_CONFIG_JSON: &str = "7ccfa1fbf3940e6f0c0375d87c0f9235a50514e14cb427bdfaf5077987b26ccf";
+const SIZE_LAYER3: u64 = 1536;
+
 /// index から選ばれた manifest の digest（試験では内容を持たない任意値）。
 const SHA_INDEX_PICK: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
 /// image index 本文の digest（試験では内容を持たない任意値。選択 manifest の `SHA_INDEX_PICK` とは別）。
 const SHA_INDEX_TOP: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
-fn blob_body(hex: &str) -> &'static [u8] {
+/// ustar の 1 エントリ（ヘッダ 512 バイト + 512 バイト境界へ詰めたデータ）。mtime・uid・gid は 0 に固定する。
+/// `dir` ならディレクトリ（typeflag `5`）。チェックサム欄は空白 8 個とみなして全バイトを足す。
+fn tar_entry(name: &str, mode: u32, data: &[u8], dir: bool) -> Vec<u8> {
+    let mut h = [0u8; 512];
+    let mut put = |off: usize, bytes: &[u8]| h[off..off + bytes.len()].copy_from_slice(bytes);
+    put(0, name.as_bytes());
+    put(100, format!("{mode:07o}\0").as_bytes());
+    put(108, b"0000000\0");
+    put(116, b"0000000\0");
+    put(124, format!("{:011o}\0", data.len()).as_bytes());
+    put(136, b"00000000000\0");
+    put(148, b"        ");
+    put(156, if dir { b"5" } else { b"0" });
+    put(257, b"ustar\0");
+    put(263, b"00");
+    let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    let mut out = h.to_vec();
+    out.extend_from_slice(data);
+    out.resize(512 + data.len().div_ceil(512) * 512, 0);
+    out
+}
+
+/// 非圧縮 tar（エントリ列 + 終端の 1024 バイトのゼロ）。非圧縮レイヤーでは diff_id が blob の digest と一致する。
+fn tar_of(entries: &[Vec<u8>]) -> Vec<u8> {
+    let mut out: Vec<u8> = entries.concat();
+    out.extend_from_slice(&[0u8; 1024]);
+    out
+}
+
+/// 1 層目: `etc/`（0555）と `etc/hello`（"abc"）。
+fn layer1_body() -> Vec<u8> {
+    tar_of(&[
+        tar_entry("etc/", 0o555, b"", true),
+        tar_entry("etc/hello", 0o644, b"abc", false),
+    ])
+}
+
+/// 2 層目: `world`（"world"）。
+fn layer2_body() -> Vec<u8> {
+    tar_of(&[tar_entry("world", 0o644, b"world", false)])
+}
+
+/// 3 層目: `world` の whiteout（`.wh.world`）。
+fn layer3_body() -> Vec<u8> {
+    tar_of(&[tar_entry(".wh.world", 0o644, b"", false)])
+}
+
+/// image config（`rootfs.diff_ids` は下位から上位の順の sha256。バイト列を固定する）。
+fn config_body(diff_ids: &[&str]) -> Vec<u8> {
+    let ids: Vec<String> = diff_ids.iter().map(|h| format!("\"sha256:{h}\"")).collect();
+    format!(
+        r#"{{"architecture":"amd64","os":"linux","rootfs":{{"type":"layers","diff_ids":[{}]}}}}"#,
+        ids.join(",")
+    )
+    .into_bytes()
+}
+
+fn blob_body(hex: &str) -> Vec<u8> {
     match hex {
-        SHA_CONFIG => b"hello",
-        SHA_LAYER1 => b"abc",
-        SHA_LAYER2 => b"world",
-        _ => b"",
+        SHA_CONFIG => config_body(&[SHA_LAYER1, SHA_LAYER2]),
+        SHA_CONFIG_L1 => config_body(&[SHA_LAYER1]),
+        SHA_LAYER1 => layer1_body(),
+        SHA_LAYER2 => layer2_body(),
+        SHA_CONFIG_L3 => config_body(&[SHA_LAYER1, SHA_LAYER2, SHA_LAYER3]),
+        SHA_CONFIG_DUP => config_body(&[SHA_LAYER1, SHA_LAYER1]),
+        SHA_CONFIG_JSON => b"not json".to_vec(),
+        SHA_LAYER3 => layer3_body(),
+        _ => Vec::new(),
     }
 }
 
+const MEDIA_TAR: &str = "application/vnd.oci.image.layer.v1.tar";
+
 fn manifest_json(config: &str, layers: &[(&str, u64)]) -> String {
+    manifest_json_media(config, layers, MEDIA_TAR)
+}
+
+fn manifest_json_media(config: &str, layers: &[(&str, u64)], media_type: &str) -> String {
     let layers: Vec<String> = layers
         .iter()
-        .map(|(h, s)| {
-            format!(
-                r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:{h}","size":{s}}}"#
-            )
-        })
+        .map(|(h, s)| format!(r#"{{"mediaType":"{media_type}","digest":"sha256:{h}","size":{s}}}"#))
         .collect();
     format!(
-        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{config}","size":5}},"layers":[{}]}}"#,
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"sha256:{config}","size":{}}},"layers":[{}]}}"#,
+        blob_body(config).len(),
         layers.join(",")
     )
 }
@@ -185,7 +273,7 @@ impl RegistryPullClient for FakeClient {
                 .map_err(|_| OciError::new(OciErrorCode::Internal, "symlink"));
         }
         let hex = descriptor.digest.as_str().trim_start_matches("sha256:");
-        let mut body = blob_body(hex).to_vec();
+        let mut body = blob_body(hex);
         if self.corrupt_digest == Some(hex) {
             body = b"WORLD".to_vec();
         }
@@ -215,9 +303,28 @@ impl TempDir {
     }
 }
 
+/// 展開済み rootfs の 0555 のディレクトリを含む木も消せるよう、権限を戻しながら再帰削除する（試験の後始末）。
+fn force_remove(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.file_type().is_dir() {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o755));
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                force_remove(&entry.path());
+            }
+        }
+        let _ = fs::remove_dir(path);
+    } else {
+        let _ = fs::remove_file(path);
+    }
+}
+
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        force_remove(&self.0);
     }
 }
 
@@ -254,7 +361,10 @@ fn staging_is_empty(dir: &TempDir) -> bool {
 }
 
 fn two_layer_manifest() -> String {
-    manifest_json(SHA_CONFIG, &[(SHA_LAYER1, 3), (SHA_LAYER2, 5)])
+    manifest_json(
+        SHA_CONFIG,
+        &[(SHA_LAYER1, SIZE_LAYER1), (SHA_LAYER2, SIZE_LAYER2)],
+    )
 }
 
 fn req(reference: &str) -> PullRequest {
@@ -307,15 +417,21 @@ fn cri4_pull_tag_publishes_verified_blobs() {
             id: format!("sha256:{SHA_CONFIG}"),
             repo_tags: vec!["docker.io/library/alpine:3.20".to_owned()],
             repo_digests: vec![format!("docker.io/library/alpine@sha256:{SHA_INDEX_PICK}")],
-            size: 13,
+            size: SIZE_TOTAL,
         }
     );
     assert_eq!(
         fs::read(blob_path(&dir, SHA_CONFIG)).expect("cfg"),
-        b"hello"
+        blob_body(SHA_CONFIG)
     );
-    assert_eq!(fs::read(blob_path(&dir, SHA_LAYER1)).expect("l1"), b"abc");
-    assert_eq!(fs::read(blob_path(&dir, SHA_LAYER2)).expect("l2"), b"world");
+    assert_eq!(
+        fs::read(blob_path(&dir, SHA_LAYER1)).expect("l1"),
+        layer1_body()
+    );
+    assert_eq!(
+        fs::read(blob_path(&dir, SHA_LAYER2)).expect("l2"),
+        layer2_body()
+    );
     assert!(staging_is_empty(&dir));
     // 公開した blob は取得側の umask に依らず所有者専用（0600）・リンク数 1 の通常ファイル（OCI-1・SEC）。
     for hex in [SHA_CONFIG, SHA_LAYER1, SHA_LAYER2] {
@@ -378,7 +494,7 @@ fn oci1_digest_pull_with_mismatched_manifest_is_rejected() {
 #[test]
 fn repair5_deadline_is_checked_after_last_blob() {
     let dir = TempDir::new("lastblob");
-    let mut fake = FakeClient::new(manifest_json(SHA_CONFIG, &[(SHA_LAYER1, 3)]));
+    let mut fake = FakeClient::new(manifest_json(SHA_CONFIG_L1, &[(SHA_LAYER1, SIZE_LAYER1)]));
     fake.blob_delay = Duration::from_millis(60);
     let mut cfg = config(&dir);
     cfg.pull_deadline = Duration::from_millis(90);
@@ -406,7 +522,10 @@ fn cri4_canonical_reference_matches_pull_registration() {
 #[test]
 fn cri4_pull_dedup_and_cache_hit_and_repair() {
     let dir = TempDir::new("cache");
-    let dup = manifest_json(SHA_CONFIG, &[(SHA_LAYER1, 3), (SHA_LAYER1, 3)]);
+    let dup = manifest_json(
+        SHA_CONFIG_DUP,
+        &[(SHA_LAYER1, SIZE_LAYER1), (SHA_LAYER1, SIZE_LAYER1)],
+    );
     let client = Arc::new(FakeClient::new(dup));
     let puller = OciImagePuller::new(client.clone(), config(&dir));
     puller.pull(&req("alpine")).expect("first");
@@ -417,7 +536,10 @@ fn cri4_pull_dedup_and_cache_hit_and_repair() {
     fs::write(blob_path(&dir, SHA_LAYER1), b"xyz").expect("corrupt");
     puller.pull(&req("alpine")).expect("third");
     assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 3, "refetch");
-    assert_eq!(fs::read(blob_path(&dir, SHA_LAYER1)).expect("l1"), b"abc");
+    assert_eq!(
+        fs::read(blob_path(&dir, SHA_LAYER1)).expect("l1"),
+        layer1_body()
+    );
 }
 
 /// OCI-1: blob 本文が改ざんされていたら DATA_LOSS で、キャッシュにもストアにも残らない。
@@ -483,7 +605,7 @@ async fn cri4_private_registry_pull_with_credentials() {
         .into_inner();
         let image = status.image.expect("image is visible");
         assert_eq!(image.id, resp.image_ref);
-        assert_eq!(image.size, 13);
+        assert_eq!(image.size, SIZE_TOTAL);
         let list = ImageService::list_images(&svc, Request::new(Default::default()))
             .await
             .expect("list")
@@ -516,7 +638,7 @@ fn cri4_size_limit_is_checked_before_fetching() {
     let dir = TempDir::new("limit");
     let client = Arc::new(FakeClient::new(two_layer_manifest()));
     let mut cfg = config(&dir);
-    cfg.max_image_bytes = 12; // 合計 13
+    cfg.max_image_bytes = SIZE_TOTAL - 1;
     let puller = OciImagePuller::new(client.clone(), cfg);
     let err = puller.pull(&req("alpine")).expect_err("too large");
     assert_eq!(err.code(), OciErrorCode::ResourceExhausted);
@@ -552,8 +674,8 @@ async fn cri4_tag_moves_and_tags_merge() {
 
     let first = OciImagePuller::new(
         Arc::new(FakeClient::new(manifest_json(
-            SHA_CONFIG,
-            &[(SHA_LAYER1, 3)],
+            SHA_CONFIG_L1,
+            &[(SHA_LAYER1, SIZE_LAYER1)],
         ))),
         cfg.clone(),
     );
@@ -582,8 +704,8 @@ async fn cri4_tag_moves_and_tags_merge() {
     // 別イメージ（config が違う）が alpine:1 を奪う。
     let second = OciImagePuller::new(
         Arc::new(FakeClient::new(manifest_json(
-            SHA_LAYER2,
-            &[(SHA_LAYER1, 3)],
+            SHA_CONFIG,
+            &[(SHA_LAYER1, SIZE_LAYER1), (SHA_LAYER2, SIZE_LAYER2)],
         ))),
         cfg,
     );
@@ -599,11 +721,11 @@ async fn cri4_tag_moves_and_tags_merge() {
     assert_eq!(list.len(), 2);
     let old = list
         .iter()
-        .find(|i| i.id == format!("sha256:{SHA_CONFIG}"))
+        .find(|i| i.id == format!("sha256:{SHA_CONFIG_L1}"))
         .expect("old");
     let new = list
         .iter()
-        .find(|i| i.id == format!("sha256:{SHA_LAYER2}"))
+        .find(|i| i.id == format!("sha256:{SHA_CONFIG}"))
         .expect("new");
     assert_eq!(old.repo_tags, vec!["docker.io/library/alpine:2".to_owned()]);
     assert_eq!(new.repo_tags, vec!["docker.io/library/alpine:1".to_owned()]);
@@ -814,8 +936,8 @@ async fn cri4_index_digest_pull_is_resolvable_by_index_digest() {
 fn oci1_descriptor_size_mismatch_is_rejected_regardless_of_cache() {
     let dir = TempDir::new("size-mismatch");
     // 実際の "abc" は 3 バイトだが 4 と宣言する。
-    let bad = manifest_json(SHA_CONFIG, &[(SHA_LAYER1, 4)]);
-    let good = manifest_json(SHA_CONFIG, &[(SHA_LAYER1, 3)]);
+    let bad = manifest_json(SHA_CONFIG, &[(SHA_LAYER1, SIZE_LAYER1 + 1)]);
+    let good = manifest_json(SHA_CONFIG_L1, &[(SHA_LAYER1, SIZE_LAYER1)]);
     let cold = OciImagePuller::new(Arc::new(FakeClient::new(bad.clone())), config(&dir));
     assert_eq!(
         cold.pull(&req("alpine")).expect_err("cold").code(),
@@ -836,7 +958,10 @@ fn oci1_descriptor_size_mismatch_is_rejected_regardless_of_cache() {
 #[test]
 fn oci1_duplicate_descriptors_with_different_sizes_are_rejected() {
     let dir = TempDir::new("dup-size");
-    let bad = manifest_json(SHA_CONFIG, &[(SHA_LAYER1, 3), (SHA_LAYER1, 4)]);
+    let bad = manifest_json(
+        SHA_CONFIG_DUP,
+        &[(SHA_LAYER1, SIZE_LAYER1), (SHA_LAYER1, SIZE_LAYER1 + 1)],
+    );
     let puller = OciImagePuller::new(Arc::new(FakeClient::new(bad)), config(&dir));
     assert_eq!(
         puller.pull(&req("alpine")).expect_err("dup").code(),
@@ -970,7 +1095,7 @@ fn sec_pull_replaces_cached_blob_writable_by_others() {
         old_inode,
         "replaced, not reused"
     );
-    assert_eq!(fs::read(&path).expect("l1"), b"abc");
+    assert_eq!(fs::read(&path).expect("l1"), layer1_body());
     assert!(staging_is_empty(&dir));
 
     puller.pull(&req("alpine:3.20")).expect("third");
@@ -1000,7 +1125,7 @@ fn sec_pull_replaces_hard_linked_cached_blob() {
 
     // 元の inode は alias に残る。そこへ書き込んでもキャッシュの blob は変わらない。
     fs::write(&alias, b"tampered").expect("tamper through the old link");
-    assert_eq!(fs::read(&path).expect("l2"), b"world");
+    assert_eq!(fs::read(&path).expect("l2"), layer2_body());
     puller.pull(&req("alpine:3.20")).expect("third");
     assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 4, "cache hit");
 }
@@ -1018,7 +1143,7 @@ fn sec_pull_replaces_symlinked_cached_blob_without_touching_the_target() {
 
     let path = blob_path(&dir, SHA_LAYER1);
     let outside = dir.0.join("outside-blob");
-    fs::write(&outside, b"abc").expect("write");
+    fs::write(&outside, layer1_body()).expect("write");
     let outside_before = fs::metadata(&outside).expect("stat");
     fs::remove_file(&path).expect("remove");
     std::os::unix::fs::symlink(&outside, &path).expect("symlink");
@@ -1026,14 +1151,14 @@ fn sec_pull_replaces_symlinked_cached_blob_without_touching_the_target() {
     puller.pull(&req("alpine:3.20")).expect("second");
     assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 4);
     assert_eq!(blob_stat(&dir, SHA_LAYER1), (0o600, 1));
-    assert_eq!(fs::read(&path).expect("l1"), b"abc");
+    assert_eq!(fs::read(&path).expect("l1"), layer1_body());
 
     let outside_after = fs::metadata(&outside).expect("stat");
     assert_eq!(outside_after.ino(), outside_before.ino());
     assert_eq!(outside_after.mode(), outside_before.mode());
     assert_eq!(outside_after.nlink(), 1);
     assert_ne!(blob_inode(&dir, SHA_LAYER1), outside_after.ino());
-    assert_eq!(fs::read(&outside).expect("outside"), b"abc");
+    assert_eq!(fs::read(&outside).expect("outside"), layer1_body());
 }
 
 /// SEC・OCI-1: 取得結果が symlink のステージング blob は公開しない（先が正しい内容でも辿らない）。
@@ -1041,7 +1166,7 @@ fn sec_pull_replaces_symlinked_cached_blob_without_touching_the_target() {
 fn sec_pull_does_not_publish_symlinked_staged_blob() {
     let dir = TempDir::new("stagedsymlink");
     let outside = dir.0.join("outside-blob");
-    fs::write(&outside, b"hello").expect("write");
+    fs::write(&outside, blob_body(SHA_CONFIG)).expect("write");
     let mut client = FakeClient::new(two_layer_manifest());
     client.staged_symlink_target = Some(outside.clone());
     let client = Arc::new(client);
@@ -1055,5 +1180,288 @@ fn sec_pull_does_not_publish_symlinked_staged_blob() {
         "nothing is published"
     );
     assert!(staging_is_empty(&dir));
-    assert_eq!(fs::read(&outside).expect("outside"), b"hello");
+    assert_eq!(fs::read(&outside).expect("outside"), blob_body(SHA_CONFIG));
+}
+// ---- レイヤー展開の配線（#2323・OCI-1・OCI-2・CRI-3・ERR-3） ----
+
+fn rootfs_path(dir: &TempDir, config_hex: &str) -> PathBuf {
+    dir.0
+        .join("cache")
+        .join("rootfs")
+        .join("sha256")
+        .join(config_hex)
+}
+
+fn rootfs_exists(dir: &TempDir, config_hex: &str) -> bool {
+    fs::symlink_metadata(rootfs_path(dir, config_hex)).is_ok()
+}
+
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt as _;
+    fs::symlink_metadata(path)
+        .expect("stat")
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+/// 展開の上限を 1 エントリに絞る（layer1 は 2 エントリ: `etc/` と `etc/hello`）。
+fn tight_extract_limits() -> ExtractLimits {
+    ExtractLimits::new(1, 1 << 20, 1 << 30, 1 << 20)
+}
+
+/// REPAIR-12: fixture の sha256 定数と実体（本体のバイト列・サイズ）が一致している。
+#[test]
+fn oci1_fixture_digests_match_bodies() {
+    let dir = TempDir::new("fixture-digest");
+    let cases = [
+        (SHA_CONFIG, 225),
+        (SHA_CONFIG_L1, 151),
+        (SHA_CONFIG_L3, 299),
+        (SHA_CONFIG_DUP, 225),
+        (SHA_CONFIG_JSON, 8),
+        (SHA_LAYER1, SIZE_LAYER1),
+        (SHA_LAYER2, SIZE_LAYER2),
+        (SHA_LAYER3, SIZE_LAYER3),
+    ];
+    for (hex, size) in cases {
+        let path = dir.0.join(format!("fixture-{hex}"));
+        fs::write(&path, blob_body(hex)).expect("write");
+        let digest = Digest::parse(&format!("sha256:{hex}")).expect("digest");
+        let verified =
+            fandhe_container_oci::layer::verify_blob_digest(&path, &digest, size).expect("digest");
+        assert_eq!(verified.size, size, "{hex}");
+    }
+    assert_eq!(SIZE_CONFIG, 225);
+    assert_eq!(SIZE_TOTAL, 4833);
+}
+
+/// OCI-1・CRI-3: 2 層の pull が成功すると、検証済み blob から rootfs が展開されて公開される。
+#[test]
+fn oci1_pull_extracts_layers_into_rootfs() {
+    let dir = TempDir::new("extract");
+    let client = Arc::new(FakeClient::new(two_layer_manifest()));
+    let puller = OciImagePuller::new(client, config(&dir));
+    puller.pull(&req("alpine:3.20")).expect("pull");
+    let root = rootfs_path(&dir, SHA_CONFIG);
+    assert_eq!(fs::read(root.join("etc/hello")).expect("hello"), b"abc");
+    assert_eq!(fs::read(root.join("world")).expect("world"), b"world");
+    assert_eq!(mode_of(&root.join("etc")), 0o555);
+    assert_eq!(mode_of(&root), 0o700);
+    assert_eq!(
+        mode_of(&dir.0.join("cache").join("rootfs").join("sha256")),
+        0o700
+    );
+    assert!(staging_is_empty(&dir));
+    let id = Digest::parse(&format!("sha256:{SHA_CONFIG}")).expect("digest");
+    assert_eq!(puller.unpacked_rootfs_dir(&id), root);
+}
+
+/// OCI-2: 上位レイヤーの whiteout が下位レイヤーの実体を消す（層の順序が下位から上位）。
+#[test]
+fn oci2_pull_applies_whiteout_across_layers() {
+    let dir = TempDir::new("whiteout");
+    let manifest = manifest_json(
+        SHA_CONFIG_L3,
+        &[
+            (SHA_LAYER1, SIZE_LAYER1),
+            (SHA_LAYER2, SIZE_LAYER2),
+            (SHA_LAYER3, SIZE_LAYER3),
+        ],
+    );
+    let puller = OciImagePuller::new(Arc::new(FakeClient::new(manifest)), config(&dir));
+    puller.pull(&req("alpine:3.20")).expect("pull");
+    let root = rootfs_path(&dir, SHA_CONFIG_L3);
+    assert_eq!(fs::read(root.join("etc/hello")).expect("hello"), b"abc");
+    assert!(fs::symlink_metadata(root.join("world")).is_err());
+    assert!(fs::symlink_metadata(root.join(".wh.world")).is_err());
+}
+
+/// OCI-1: 公開済みの rootfs は 2 回目の pull で展開し直さない。
+#[test]
+fn oci1_pull_rootfs_is_idempotent() {
+    let dir = TempDir::new("idem");
+    let client = Arc::new(FakeClient::new(two_layer_manifest()));
+    let puller = OciImagePuller::new(client.clone(), config(&dir));
+    puller.pull(&req("alpine:3.20")).expect("first");
+    let marker = rootfs_path(&dir, SHA_CONFIG).join("marker");
+    fs::write(&marker, b"m").expect("marker");
+    puller.pull(&req("alpine:3.20")).expect("second");
+    assert_eq!(fs::read(&marker).expect("marker"), b"m");
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 3);
+    assert!(staging_is_empty(&dir));
+}
+
+/// OCI-1・SEC: 公開先に通常ファイルや symlink があれば、消さずに FailedPrecondition で拒否する。
+#[test]
+fn oci1_pull_rejects_untrusted_rootfs_cache_entry() {
+    let dir = TempDir::new("untrusted-rootfs");
+    let client = Arc::new(FakeClient::new(two_layer_manifest()));
+    let puller = OciImagePuller::new(client, config(&dir));
+    puller.pull(&req("alpine:3.20")).expect("first");
+    let final_path = rootfs_path(&dir, SHA_CONFIG);
+    force_remove(&final_path);
+    fs::write(&final_path, b"planted").expect("plant file");
+    let err = puller.pull(&req("alpine:3.20")).expect_err("file");
+    assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(err.message(), "image rootfs cache entry is not trusted");
+    assert_eq!(fs::read(&final_path).expect("kept"), b"planted");
+
+    fs::remove_file(&final_path).expect("rm");
+    let target = dir.0.join("elsewhere");
+    fs::create_dir_all(&target).expect("mkdir");
+    std::os::unix::fs::symlink(&target, &final_path).expect("symlink");
+    let err = puller.pull(&req("alpine:3.20")).expect_err("symlink");
+    assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    assert!(
+        fs::symlink_metadata(&final_path)
+            .expect("kept")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_dir(&target).expect("read").count(), 0);
+    assert!(staging_is_empty(&dir));
+}
+
+/// OCI-1: 2 層目の diff_id が合わないと DataLoss で、1 層目の展開物も rootfs として残らない。
+#[test]
+fn oci1_diff_id_mismatch_on_second_layer_leaves_no_rootfs() {
+    let dir = TempDir::new("diffid");
+    let manifest = manifest_json(
+        SHA_CONFIG_DUP,
+        &[(SHA_LAYER1, SIZE_LAYER1), (SHA_LAYER2, SIZE_LAYER2)],
+    );
+    let puller = OciImagePuller::new(Arc::new(FakeClient::new(manifest)), config(&dir));
+    let err = puller.pull(&req("alpine:3.20")).expect_err("mismatch");
+    assert_eq!(err.code(), OciErrorCode::DataLoss);
+    assert_eq!(err.message(), "image layer failed validation");
+    assert!(!rootfs_exists(&dir, SHA_CONFIG_DUP));
+    assert!(staging_is_empty(&dir));
+}
+
+/// OCI-1: config の diff_ids と manifest の layers の件数が違えば、展開の I/O の前に DataLoss。
+#[test]
+fn oci1_layer_count_mismatch_is_data_loss() {
+    let dir = TempDir::new("count");
+    let manifest = manifest_json(
+        SHA_CONFIG_L1,
+        &[(SHA_LAYER1, SIZE_LAYER1), (SHA_LAYER2, SIZE_LAYER2)],
+    );
+    let puller = OciImagePuller::new(Arc::new(FakeClient::new(manifest)), config(&dir));
+    let err = puller.pull(&req("alpine:3.20")).expect_err("count");
+    assert_eq!(err.code(), OciErrorCode::DataLoss);
+    assert_eq!(err.message(), "image layer count does not match the config");
+    assert!(!rootfs_exists(&dir, SHA_CONFIG_L1));
+    assert!(staging_is_empty(&dir));
+}
+
+/// OCI-1: 未対応の layer mediaType（zstd）は Unimplemented で、rootfs もステージングも残らない。
+#[test]
+fn oci1_unsupported_layer_media_type_is_unimplemented() {
+    let dir = TempDir::new("zstd");
+    let manifest = manifest_json_media(
+        SHA_CONFIG,
+        &[(SHA_LAYER1, SIZE_LAYER1), (SHA_LAYER2, SIZE_LAYER2)],
+        "application/vnd.oci.image.layer.v1.tar+zstd",
+    );
+    let puller = OciImagePuller::new(Arc::new(FakeClient::new(manifest)), config(&dir));
+    let err = puller.pull(&req("alpine:3.20")).expect_err("zstd");
+    assert_eq!(err.code(), OciErrorCode::Unimplemented);
+    assert_eq!(err.message(), "unsupported image layer format");
+    assert!(!rootfs_exists(&dir, SHA_CONFIG));
+    assert!(staging_is_empty(&dir));
+}
+
+/// OCI-1: 展開の上限（エントリ数）を超えたら ResourceExhausted で、rootfs もステージングも残らない。
+#[test]
+fn oci1_extract_limit_exceeded_is_resource_exhausted() {
+    let dir = TempDir::new("limit");
+    let mut cfg = config(&dir);
+    cfg.extract_limits = tight_extract_limits();
+    let puller = OciImagePuller::new(Arc::new(FakeClient::new(two_layer_manifest())), cfg);
+    let err = puller.pull(&req("alpine:3.20")).expect_err("limit");
+    assert_eq!(err.code(), OciErrorCode::ResourceExhausted);
+    assert_eq!(err.message(), "image layer exceeds the extraction limit");
+    assert!(!rootfs_exists(&dir, SHA_CONFIG));
+    assert!(staging_is_empty(&dir));
+}
+
+/// OCI-1: digest は合っているが JSON でない config は DataLoss で、rootfs は作られない。
+#[test]
+fn oci1_config_not_json_is_data_loss() {
+    let dir = TempDir::new("cfg-json");
+    let manifest = manifest_json(SHA_CONFIG_JSON, &[(SHA_LAYER1, SIZE_LAYER1)]);
+    let puller = OciImagePuller::new(Arc::new(FakeClient::new(manifest)), config(&dir));
+    let err = puller.pull(&req("alpine:3.20")).expect_err("json");
+    assert_eq!(err.code(), OciErrorCode::DataLoss);
+    assert_eq!(err.message(), "image config failed validation");
+    assert!(!rootfs_exists(&dir, SHA_CONFIG_JSON));
+    assert!(staging_is_empty(&dir));
+}
+
+/// OCI-1: 上限を超える config descriptor は通信前に ResourceExhausted（blob の取得は 0 回）。
+#[test]
+fn oci1_config_over_limit_is_rejected_before_fetch() {
+    let dir = TempDir::new("cfg-limit");
+    let mut cfg = config(&dir);
+    cfg.max_config_bytes = SIZE_CONFIG - 1;
+    let client = Arc::new(FakeClient::new(two_layer_manifest()));
+    let puller = OciImagePuller::new(client.clone(), cfg);
+    let err = puller.pull(&req("alpine:3.20")).expect_err("limit");
+    assert_eq!(err.code(), OciErrorCode::ResourceExhausted);
+    assert_eq!(client.blob_fetches.load(Ordering::SeqCst), 0);
+}
+
+/// ERR-3・CRI-3: 展開・config の失敗が gRPC の status コードと固定文言へ写る（参照文字列を含まない）。
+#[tokio::test]
+async fn err3_pull_image_maps_extraction_failures() {
+    let zstd = manifest_json_media(
+        SHA_CONFIG,
+        &[(SHA_LAYER1, SIZE_LAYER1), (SHA_LAYER2, SIZE_LAYER2)],
+        "application/vnd.oci.image.layer.v1.tar+zstd",
+    );
+    let diff = manifest_json(
+        SHA_CONFIG_DUP,
+        &[(SHA_LAYER1, SIZE_LAYER1), (SHA_LAYER2, SIZE_LAYER2)],
+    );
+    let bad_cfg = manifest_json(SHA_CONFIG_JSON, &[(SHA_LAYER1, SIZE_LAYER1)]);
+    let cases = [
+        (diff, false, Code::DataLoss, "image layer failed validation"),
+        (
+            zstd,
+            false,
+            Code::Unimplemented,
+            "unsupported image layer format",
+        ),
+        (
+            two_layer_manifest(),
+            true,
+            Code::ResourceExhausted,
+            "image layer exceeds the extraction limit",
+        ),
+        (
+            bad_cfg,
+            false,
+            Code::DataLoss,
+            "image config failed validation",
+        ),
+    ];
+    for (i, (manifest, tight, code, message)) in cases.into_iter().enumerate() {
+        let dir = TempDir::new(&format!("err3-extract-{i}"));
+        let mut cfg = config(&dir);
+        if tight {
+            cfg.extract_limits = tight_extract_limits();
+        }
+        let (svc, store) = service_with(Arc::new(FakeClient::new(manifest)), cfg);
+        let err = ImageService::pull_image(
+            &svc,
+            Request::new(pull_req("secret.example.com/team/app:v1")),
+        )
+        .await
+        .expect_err("pull must fail");
+        assert_eq!(err.code(), code, "case {i}");
+        assert_eq!(err.message(), message, "case {i}");
+        assert!(!err.message().contains("secret.example.com"));
+        assert!(store.list().expect("list").is_empty());
+    }
 }

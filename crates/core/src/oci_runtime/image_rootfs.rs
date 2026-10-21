@@ -84,6 +84,8 @@ pub(super) struct CreatedRootfs {
 }
 
 /// [`remove_recorded_rootfs`] の結果（将来の拡張に備え非網羅）。
+// Linux 以外は削除経路が常に `Unimplemented` で拒否するため、各 variant は Linux でしか構築されない。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub(super) enum RecordedRootfsRemoval {

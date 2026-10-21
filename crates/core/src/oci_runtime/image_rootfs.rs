@@ -351,19 +351,26 @@ mod imp {
     /// FIFO で止まらない）。
     fn token_matches(root: BorrowedFd<'_>, expected: &str) -> bool {
         use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
-        let path = format!(
-            "/proc/self/fd/{}/{}",
-            root.as_raw_fd(),
-            super::OWNER_TOKEN_FILE
-        );
-        let Ok(f) = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(sys::O_NOFOLLOW | sys::O_NONBLOCK)
-            .open(&path)
-        else {
+        // 先に `O_PATH|O_NOFOLLOW` で実体を固定し、fstat で通常ファイルと確かめてから、固定済みの fd を
+        // 読み取りで開き直す。種別確認が open より前のため、デバイス・FIFO への差し替えでも open の
+        // 副作用（端末の取得・ブロック）が起きない（SEC-1）。
+        let Ok(name) = CString::new(super::OWNER_TOKEN_FILE) else {
             return false;
         };
+        let Ok(pinned) = sys::open_path_nofollow_at(root, &name) else {
+            return false;
+        };
+        let Ok((_, _, _, mode)) = fstat(pinned.as_fd()) else {
+            return false;
+        };
+        // S_IFMT = 0o170000・S_IFREG = 0o100000。
+        if mode & 0o170_000 != 0o100_000 {
+            return false;
+        }
+        let Ok(fd) = sys::reopen_pinned_read_nonblock(pinned.as_fd()) else {
+            return false;
+        };
+        let f = File::from(fd);
         if !f.metadata().is_ok_and(|m| m.is_file() && m.len() <= 64) {
             return false;
         }
@@ -1223,6 +1230,33 @@ mod tests {
         let e = prepare_rootfs_target(&b, Path::new("rootfs")).expect_err("refuse");
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         assert!(!b.join("rootfs").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// SEC-1・OCI-7: 所有印が FIFO に差し替えられても open せず（ブロックせず）拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_refuses_non_regular_marker() {
+        let b = tmp("marker-fifo");
+        let rec = published_record(&b, "rootfs");
+        let root = b.join("rootfs");
+        let marker = root.join(super::OWNER_TOKEN_FILE);
+        std::fs::remove_file(&marker).expect("rm marker");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&marker)
+            .status()
+            .expect("mkfifo");
+        assert!(st.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let b2 = b.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(remove_recorded_rootfs(&b2, &rec).is_err());
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("must not block");
+        assert!(refused);
+        assert!(root.exists());
         let _ = std::fs::remove_dir_all(&b);
     }
 

@@ -118,7 +118,7 @@ pub(crate) use consts::LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON;
 pub(crate) use consts::{EAGAIN, EPIPE};
 // rootfs 内の所有トークンの印を、リンク非追従・FIFO で止まらずに開く（`oci_runtime::image_rootfs`。#2378）。
 #[cfg(target_os = "linux")]
-pub(crate) use consts::{O_NOFOLLOW, O_NONBLOCK};
+pub(crate) use consts::O_NOFOLLOW;
 
 // # `open(2)` フラグのアーキテクチャ差（Codex P0 指摘〔aarch64 の値が誤り〕への確認記録）
 //
@@ -3928,7 +3928,11 @@ pub(crate) fn reopen_pinned_read_nonblock(pinned: BorrowedFd<'_>) -> Result<Owne
         // 整数の書式化のため NUL は含まず実際には起こらない。起きても「対応外」とは分類しない（REPAIR-2）。
         .map_err(|_| SysError::Os(consts::EINVAL))?;
     // 絶対パスのため dirfd は無視される（`pinned` を渡しても解決に影響しない）。
-    open_follow_at(pinned, &path, consts::O_RDONLY | consts::O_NONBLOCK)
+    open_follow_at(
+        pinned,
+        &path,
+        consts::O_RDONLY | consts::O_NONBLOCK | consts::O_NOCTTY,
+    )
 }
 
 /// procfs の fd エントリ名 `thread-self/fd/<fd>` を、NUL 終端つきで `buf` に組み立てる（アロケーションなし）。

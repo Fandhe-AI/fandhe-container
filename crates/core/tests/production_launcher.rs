@@ -50,6 +50,12 @@
 //!   （`/probe` は削除して絶対パスの経路を断つ）。pivot 後に解決されて PID 1 として起動し、コンテナ内プローブが `READY` を
 //!   出して終了コード 7（`ProcessExit::Exited(7)`）で終わることを照合する。`PATH` のどこにも無い名前は `start` の失敗
 //!   （状態は Created のまま）か終了コード 127 で、成功起動にならず子も残らない
+//! - シナリオ Q（SIGSYS 終了の `exit_signal` 補助記録の配送。#2236・SEC-4・ESC-06・REPAIR-5。issue 本文の「シナリオ I」にあたる）:
+//!   単一スレッドの間に作った `ControlAuditRelay` を launcher の回収点の記録先（`exit_audit_sink`）にだけ渡し、start の後に補助スレッドを
+//!   立てて複数スレッドにした状態で `--seccomp-kill unshare` のコンテナの終了（`Signaled(31)`）を回収する。`<状態ルート>/@audit.log` に
+//!   当コンテナの `layer=exit_signal` の行がちょうど 1 行で、`signal` 31・`target_pid` = コンテナの PID・`syscall`/`arch` は null、
+//!   再度の `wait` / `terminate` の後も 1 行のままであることを照合する。成功行の前に
+//!   `production_launcher: exit_signal recorded once via audit relay (scenario=Q)` を出す
 //! - root で実行された場合: 主経路は非 root（SEC-5）。launch が拒否され、状態が Created に戻り、子が残らないことだけを
 //!   照合する（コンテナ内 root をホスト root へ写す起動は試さない）
 //!
@@ -152,7 +158,9 @@ mod linux {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
+    use fandhe_container_core::audit_log::{
+        AUDIT_LOG_FILE_NAME, AuditRecord, AuditSink, ControlAuditRelay, FileAuditSink,
+    };
     use fandhe_container_core::capabilities::OCI_DEFAULT_CAPABILITIES;
     use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup, DelegatedCgroup};
     use fandhe_container_core::exec::{
@@ -735,6 +743,7 @@ mod linux {
         scenario_m_n_working_dir_refused(&env, tag);
         scenario_o_user_outside_mapping_refused(&env, tag);
         scenario_p_bare_name_entrypoint(&env, tag);
+        scenario_q_exit_signal_via_relay(&env, container, tag);
         if subordinate_requested() {
             scenario_i_user_applied(tag);
         }
@@ -1814,6 +1823,113 @@ mod linux {
                 "no child may remain after terminate"
             );
         }
+    }
+
+    /// シナリオ Q（SEC-4・ESC-06・REPAIR-5・#2236。issue 本文の「シナリオ I」にあたる。I は範囲写像で使用済みのため Q とする）:
+    /// SIGSYS で終了したコンテナの `exit_signal` 補助記録が、複数スレッドのプロセスから回収しても落ちず、本番と同じ配送経路
+    /// （`ControlAuditRelay` → `FileAuditSink` → `<状態ルート>/@audit.log`）にちょうど 1 件残ることを照合する。
+    ///
+    /// 構成: 単一スレッドの間に relay を spawn し、launcher の回収点の記録先（`exit_audit_sink`）にだけ渡す（launch の時点の
+    /// 記録先は `MemSink` のまま）。start の後に補助スレッドを立てて複数スレッドにしてから `wait` する（supervisor の監視スレッドが
+    /// 回収する状況の再現）。relay の helper は test プロセスと同じ cgroup に残るが、cgroup の準備（`prepare`）は済んでいる。
+    /// 照合: `@audit.log` の `layer=exit_signal` かつ当コンテナの行がちょうど 1 行で、`signal` 31・`target_pid` = コンテナの
+    /// 回収した PID・`syscall`/`arch` は null。再度の `wait` / `terminate` の後も 1 行のまま（二重記録なし）。
+    /// 複数スレッドの直接 `FileAuditSink` との対照（主経路は `isolation_unavailable`、代替経路はホスト依存）は、結果が
+    /// ホストの権限で変わるため照合しない。
+    fn scenario_q_exit_signal_via_relay(env: &Env, container: &Arc<ContainerCgroup>, tag: u32) {
+        const SIGSYS: i32 = 31;
+        let log = env._root.dir.join("state").join(AUDIT_LOG_FILE_NAME);
+        wait_single_thread();
+        let relay = Arc::new(
+            ControlAuditRelay::spawn(FileAuditSink::in_state_store(&env.store))
+                .expect("spawn the audit relay while single-threaded"),
+        );
+        let join_container = Arc::clone(container);
+        let launcher = ProductionLauncher::builder()
+            .privilege(IsolationPrivilege::RootlessSingleId)
+            .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+            .exit_audit_sink(Arc::clone(&relay) as Arc<dyn AuditSink>)
+            .cgroup_join_source(move || join_container.join_hook())
+            .build()
+            .expect("build the launcher with a relay for exit audit");
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(launcher);
+
+        let bundle = Bundle::new("q");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--seccomp-kill", "unshare"], json!([]));
+        let id = ContainerId::new(format!("plq{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed (q): {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        // 以後は複数スレッド（補助スレッドは検証の終わりまで生かす）。
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let helper = std::thread::spawn(move || {
+            let _ = stop_rx.recv();
+        });
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let threads: u32 = status_field("/proc/self/status", "Threads:")
+                .and_then(|v| v.trim().parse().ok())
+                .expect("Threads");
+            assert!(
+                threads >= 2,
+                "the reap must run in a multi-threaded process"
+            );
+            let output = started.process().take_output().expect("container output");
+            reader_slot = Some(spawn_reader(output.stdout.expect("container stdout")));
+            let exit = started
+                .process()
+                .wait(timeout())
+                .expect("wait for the probe")
+                .expect("the probe must exit within the timeout");
+            assert_eq!(exit, ProcessExit::Signaled(SIGSYS));
+            assert_eq!(
+                started.process().wait(Duration::ZERO).expect("wait again"),
+                Some(ProcessExit::Signaled(SIGSYS))
+            );
+            // 回収済みの後の terminate でも件数は増えない（この後 `finish_started` がもう 1 回呼ぶ）。
+            started
+                .process()
+                .terminate(timeout())
+                .expect("terminate after reap");
+            let text = std::fs::read_to_string(&log).expect("the audit log must exist");
+            let mine: Vec<&str> = text
+                .lines()
+                .filter(|l| {
+                    l.contains("\"layer\":\"exit_signal\"")
+                        && l.contains(&format!("\"container_id\":\"{}\"", id.as_str()))
+                })
+                .collect();
+            assert_eq!(mine.len(), 1, "exactly one exit_signal line: {text:?}");
+            let line = mine[0];
+            assert!(
+                line.contains(&format!("\"signal\":{SIGSYS},\"target_pid\":{pid},")),
+                "signal/target_pid mismatch: {line}"
+            );
+            assert!(
+                line.contains("\"syscall\":null,\"arch\":null"),
+                "no syscall may be inferred: {line}"
+            );
+            println!("production_launcher: exit_signal recorded once via audit relay (scenario=Q)");
+        }));
+        finish_started(started, verified);
+        drop(stop_tx);
+        helper.join().expect("join helper thread");
+        if let Some((rx, reader)) = reader_slot.take() {
+            reader.join().expect("join reader");
+            drop(rx);
+        }
+        drop(launcher);
+        drop(relay);
+        wait_single_thread();
+        assert!(eventually(|| children_of_self().is_empty()));
     }
 
     /// シナリオ P（OCI-1・TASK-55 追補・#2314）: 名前だけの `process.args[0]` を、コンテナ内の `process.env` の

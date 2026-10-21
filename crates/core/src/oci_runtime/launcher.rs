@@ -199,6 +199,8 @@ pub struct ProductionLauncherBuilder {
     #[cfg(target_os = "linux")]
     audit_sink: Option<Arc<dyn AuditSink>>,
     #[cfg(target_os = "linux")]
+    exit_audit_sink: Option<Arc<dyn AuditSink>>,
+    #[cfg(target_os = "linux")]
     cgroup_join_source: Option<JoinSource>,
     #[cfg(target_os = "linux")]
     subordinate_ids: Option<SubordinateIdSource>,
@@ -251,6 +253,19 @@ impl ProductionLauncherBuilder {
     #[must_use]
     pub fn audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
         self.audit_sink = Some(sink);
+        self
+    }
+
+    /// 回収点(`ContainerChildProcess::wait` / `terminate`)が出す補助の `exit_signal` 監査(SIGSYS 終了。#2004)だけの
+    /// 記録先(任意。SEC-4・ESC-06・#2236)。未指定なら [`Self::audit_sink`] を使う。
+    ///
+    /// 回収点は supervisor の監視スレッドなど複数スレッドのプロセスから呼ばれ、`FileAuditSink` の fork 隔離が使えない
+    /// (rootless では代替経路も失敗する)。supervisor は単一スレッドの間に作った `ControlAuditRelay` をここへ渡す。
+    /// launch の時点の記録(監査網羅の縮退・bind 拒否・pre-pivot の違反)は単一スレッドで出るため `audit_sink` のままで、
+    /// relay は `Mount` 等を運べないので `audit_sink` 全体の差し替えには使わない。
+    #[must_use]
+    pub fn exit_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.exit_audit_sink = Some(sink);
         self
     }
 
@@ -334,6 +349,7 @@ impl ProductionLauncherBuilder {
             inner.applied_resources = self.applied_resources;
             inner.seccomp_delivery = self.seccomp_delivery;
             inner.audit_policy = self.audit_policy;
+            inner.exit_audit_sink = self.exit_audit_sink;
             Ok(ProductionLauncher { inner })
         }
         #[cfg(not(target_os = "linux"))]
@@ -774,6 +790,8 @@ struct Inner {
     /// `RootlessSubordinateIds` のときだけ `Some`(`resolve_privilege` が保証する)。
     subordinate: Option<SubordinateIds>,
     audit_sink: Arc<dyn AuditSink>,
+    /// 回収点の `exit_signal` 監査だけの記録先(`ProductionLauncherBuilder::exit_audit_sink`。#2236)。`None` なら `audit_sink`。
+    exit_audit_sink: Option<Arc<dyn AuditSink>>,
     cgroup_join_source: Option<JoinSource>,
     /// cgroup 連鎖で書いた `linux.resources`(`ProductionLauncherBuilder::applied_resource_limits`)。
     applied_resources: Option<LinuxResourceLimits>,
@@ -804,6 +822,7 @@ impl Inner {
             privilege,
             subordinate,
             audit_sink,
+            exit_audit_sink: None,
             cgroup_join_source,
             applied_resources: None,
             seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
@@ -812,6 +831,11 @@ impl Inner {
             next_generation: std::sync::atomic::AtomicU64::new(0),
             left_process: AtomicBool::new(false),
         }
+    }
+
+    /// 回収点の `exit_signal` 監査の記録先。指定が無ければ launcher の `audit_sink`（#2236）。
+    fn exit_audit_sink(&self) -> Arc<dyn AuditSink> {
+        Arc::clone(self.exit_audit_sink.as_ref().unwrap_or(&self.audit_sink))
     }
 
     fn ledger(&self) -> std::sync::MutexGuard<'_, Ledger> {
@@ -997,7 +1021,7 @@ impl Inner {
             .with_output(stdout, stderr)
             .with_seccomp_listener(listener)
             .with_launch_isolation(isolation_record)
-            .with_exit_audit(Arc::clone(&self.audit_sink), id.clone())
+            .with_exit_audit(self.exit_audit_sink(), id.clone())
             .with_reap_notice(Box::new(move || {
                 let Some(ledger) = ledger.upgrade() else {
                     return;
@@ -3086,6 +3110,21 @@ mod tests {
     fn sec4_rejection_audit_sink_is_the_launcher_sink() {
         let l = launcher(FakeOps::new(&events()), rootless(), None);
         assert!(l.rejection_audit_sink().is_some());
+    }
+
+    /// SEC-4・ESC-06(#2236): `exit_audit_sink` 指定時は回収点の記録先だけが差し替わり、`rejection_audit_sink` は
+    /// launcher の `audit_sink` のまま。未指定なら回収点も `audit_sink`。
+    #[test]
+    fn sec4_2236_exit_audit_sink_overrides_only_the_reap_point() {
+        let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+        let main = Arc::clone(&l.inner.audit_sink);
+        assert!(Arc::ptr_eq(&l.inner.exit_audit_sink(), &main));
+        let relay: Arc<dyn AuditSink> = Arc::new(NullSink);
+        l.inner.exit_audit_sink = Some(Arc::clone(&relay));
+        assert!(Arc::ptr_eq(&l.inner.exit_audit_sink(), &relay));
+        assert!(!Arc::ptr_eq(&l.inner.exit_audit_sink(), &main));
+        let rej = l.rejection_audit_sink().expect("sink");
+        assert!(std::ptr::addr_eq(rej, Arc::as_ptr(&main)));
     }
 
     /// 全 OS 共通の型: `parse_config_bytes` を使う他の試験と同様に config が `LaunchSpec` まで載ること。

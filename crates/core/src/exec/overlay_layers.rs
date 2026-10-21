@@ -1,5 +1,5 @@
 //! mountinfo の overlayfs の super_options から、層（`lowerdir`・`upperdir`・`workdir`）のパスを取り出す純関数
-//! （SEC-1・OCI-4・SEC-5・TASK-29 追補・#2166）。
+//! （SEC-1・OCI-4・SEC-5・TASK-29 追補・#2166・#2317）。
 //!
 //! # 役割と呼び出し文脈
 //!
@@ -8,6 +8,7 @@
 //! 適用の段（`super::bind_mounts` の `check_overlay_layers`）は、付け替えた木の mountinfo のうち fstype が
 //! `overlay` の行から本モジュールで層のパスを取り出し、各層を `/` から `O_NOFOLLOW` で辿って inode の照合にかける。
 //! 本モジュールは文字列の解析だけを担い、ファイルシステムには触れない。
+//! 保護対象の側が overlay 上にある逆方向の照合（`protected_overlay_layers`。#2317）からも同じ解析を使う。
 //!
 //! # 入力の書式（Linux v7.0 の一次情報。#2166）
 //!

@@ -223,10 +223,13 @@ use super::capabilities::{
 use super::landlock::apply_landlock_stage_with;
 #[cfg(test)]
 use super::landlock::testing::apply_landlock_stage_with;
-#[cfg(not(test))]
-use super::seccomp::apply_default_seccomp_with;
 #[cfg(test)]
-use super::seccomp::testing::apply_default_seccomp_with;
+use super::seccomp::testing::{
+    apply_default_seccomp_with, apply_default_seccomp_with_listener_threads,
+};
+#[cfg(not(test))]
+use super::seccomp::{apply_default_seccomp_with, apply_default_seccomp_with_listener_threads};
+use super::seccomp_listener::ExecListenerSender;
 
 /// [`prepare_exec_restrictions`] が `setns` の前に確保した再適用の材料一式。[`reapply_restrictions`] が消費する。
 #[must_use = "prepared restrictions do nothing until passed to reapply_restrictions"]
@@ -251,6 +254,9 @@ pub struct ExecRestrictions {
     /// 封印した複製が元のファイルの実行時ポリシー（複製では維持できない LSM・`AT_EXECVE_CHECK` の要否）を
     /// 迂回しないかの判定材料。`setns` の前（ホスト側の securityfs が見えるうち）に作る（#1531）。
     seal_policy: SealPolicy,
+    /// seccomp の段で listener を exec の親へ渡す送信口（SEC-4・SUP-6・#2385）。本番の再適用（`Complete`）では必須
+    /// （[`Self::with_seccomp_listener`] で付ける。無ければ何も適用せず拒否する）。観測用の経路では任意。
+    seccomp_listener: Option<ExecListenerSender>,
 }
 
 /// 制限を exec の対象（pid1）へ束縛する材料（SUP-6・SEC-1・TASK-163.4）。
@@ -274,6 +280,17 @@ struct TargetBinding {
 }
 
 impl ExecRestrictions {
+    /// seccomp の listener を exec の親へ渡す送信口を付ける（SEC-4・SUP-6・#2385）。
+    ///
+    /// `spawn_exec_worker_with_listener` が worker へ渡す [`ExecListenerSender`] を、`reapply_restrictions` の前に
+    /// 付ける。seccomp の段は `NEW_LISTENER` 付きで filter を載せ、listener を親へ渡して ACK を待つ（届け方は
+    /// ERRNO 版のまま。通知は生じない）。付けずに本番の再適用を呼ぶと、何も適用せず `FailedPrecondition`
+    /// （段 `Validate`）で拒否する（listener の受け渡しを省く経路を本番に残さない。fail-closed）。
+    pub fn with_seccomp_listener(mut self, sender: ExecListenerSender) -> Self {
+        self.seccomp_listener = Some(sender);
+        self
+    }
+
     /// エントリポイントの実行方式の判定結果（`setns` の前に判定済み。封印した複製か現行方式と、その理由。
     /// オーナー判断 2026-10-09「条件付き切り替え」・#1531・REPAIR-4）。supervisor が構造化ログと `ExecOutcome` に
     /// 残すために読む。
@@ -925,6 +942,7 @@ fn prepare_with_launch(
         groups_before_join: None,
         ids: None,
         seal_policy,
+        seccomp_listener: None,
     })
 }
 
@@ -1044,6 +1062,7 @@ fn reapply_inner(
         groups_before_join,
         ids,
         seal_policy,
+        seccomp_listener,
     } = restrictions;
     if owner_pid != std::process::id() {
         return Err(ExecError::new(
@@ -1058,6 +1077,15 @@ fn reapply_inner(
     }
     verify_target_binding(&binding)?;
     let root = open_verified_root(expected_root)?;
+    // 本番は listener の送信口が無い再適用を、何も適用する前に拒否する（受け渡しを省く経路を残さない。SEC-4・#2385）。
+    // 束縛・`/` の照合より後に置き、それらの違反の検出（違反記録つきの拒否）を先取りしない。
+    if mode == ReapplyMode::Complete && seccomp_listener.is_none() {
+        return Err(ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Validate,
+            "exec restrictions have no seccomp listener channel; refusing to reapply",
+        ));
+    }
     // 観測用の空集合では syscall を呼ばず、下で未適用の一覧へ `Rlimits` を載せる。通常は全 16 種が入る。
     let rlimits_skipped = rlimits.is_empty();
     // `RLIMIT_FSIZE` だけは子へ持ち越す（封印した複製の書き込みを妨げない。#1531）。実効値は子が複製の完成後・
@@ -1093,8 +1121,14 @@ fn reapply_inner(
     no_new_privs::apply_no_new_privs()?;
     let landlock = apply_landlock_stage_with(&landlock, &mut threads, root.as_fd())
         .map_err(|e| e.at_stage(IsolationStage::Landlock))?;
-    let seccomp = apply_default_seccomp_with(&mut threads)
-        .map_err(|e| e.at_stage(IsolationStage::Seccomp))?;
+    let seccomp = match seccomp_listener {
+        Some(sender) => {
+            let (sender, ack_timeout) = sender.into_parts();
+            apply_default_seccomp_with_listener_threads(sender, ack_timeout, &mut threads)
+        }
+        None => apply_default_seccomp_with(&mut threads),
+    }
+    .map_err(|e| e.at_stage(IsolationStage::Seccomp))?;
     Ok(ExecRestrictionReport {
         landlock_rules: landlock.rules_added,
         seccomp_instructions: seccomp.instructions,
@@ -1327,7 +1361,14 @@ mod tests {
             groups_before_join: None,
             ids: None,
             seal_policy: SealPolicy::unrestricted(),
+            seccomp_listener: Some(test_listener_sender()),
         }
+    }
+
+    /// 単体テスト用の送り手（親の端は直ちに閉じる。偽の seccomp は送り手を使わない）。
+    fn test_listener_sender() -> ExecListenerSender {
+        let (_receiver, child_end) = crate::exec::seccomp_listener::exec_listener_pair().unwrap();
+        crate::exec::seccomp_listener::exec_sender_from(child_end)
     }
 
     /// 対象の mount namespace を自分自身にした束縛（単体テストは `setns` をしないため照合が通る）。
@@ -1679,6 +1720,69 @@ mod tests {
         assert_eq!(e.stage, IsolationStage::CapabilityDrop);
         assert_eq!(e.code, ErrorCode::PermissionDenied);
         assert_eq!(taken(), vec!["rlimits", "capability_drop"]);
+        let _ = crate::exec::rlimits::testing::take_sets();
+    }
+
+    /// SEC-4・SUP-6（#2385）: 本番の再適用で listener の送信口が無ければ、何も適用せず `FailedPrecondition`
+    /// （段 `Validate`）で拒否する（受け渡しを省く経路を残さない）。
+    #[test]
+    fn sec4_sup6_2385_complete_reapply_without_listener_channel_applies_nothing() {
+        let _ = take();
+        let mut r = restrictions(std::process::id());
+        r.seccomp_listener = None;
+        let e = reapply_restrictions(r).expect_err("no channel");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::Validate);
+        assert_eq!(
+            e.message,
+            "exec restrictions have no seccomp listener channel; refusing to reapply"
+        );
+        assert!(e.violation.is_none());
+        assert_eq!(taken(), Vec::<&str>::new());
+    }
+
+    /// SEC-4・SUP-6（#2385）: 送り手が無くても、束縛の不一致は従来どおりの違反として拒否される
+    /// （送り手の検査が束縛・`/` の照合を先取りしない）。
+    #[test]
+    fn sec4_sup6_2385_binding_violation_is_not_masked_by_missing_listener_channel() {
+        let _ = take();
+        let mut r = restrictions(std::process::id());
+        r.seccomp_listener = None;
+        let (dev, ino) = r.binding.target_mnt_ns;
+        r.binding.target_mnt_ns = (dev, ino.wrapping_add(1));
+        let e = reapply_restrictions(r).expect_err("other target");
+        assert_eq!(e.stage, IsolationStage::SetNs);
+        assert_eq!(
+            e.violation.expect("violation").reason,
+            ViolationReason::ExecJoinedNamespaceMismatch
+        );
+        assert_eq!(taken(), Vec::<&str>::new());
+    }
+
+    /// SEC-4・SUP-6（#2385）: 送り手を付けても段の順は変わらない。seccomp の失敗は段 `Seccomp`・code を保つ。
+    #[test]
+    fn sec4_sup6_2385_listener_channel_keeps_stage_order_and_seccomp_failure_code() {
+        let _ = take();
+        let _report = reapply_restrictions(restrictions(std::process::id())).expect("ok");
+        assert_eq!(
+            taken(),
+            vec![
+                "rlimits",
+                "capability_drop",
+                "no_new_privs",
+                "landlock",
+                "seccomp"
+            ]
+        );
+        let _ = crate::exec::rlimits::testing::take_sets();
+        let _ = take();
+        crate::exec::seccomp::testing::fake_seccomp_err(err(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::Seccomp,
+        ));
+        let e = reapply_restrictions(restrictions(std::process::id())).expect_err("seccomp");
+        assert_eq!(e.code, ErrorCode::FailedPrecondition);
+        assert_eq!(e.stage, IsolationStage::Seccomp);
         let _ = crate::exec::rlimits::testing::take_sets();
     }
 

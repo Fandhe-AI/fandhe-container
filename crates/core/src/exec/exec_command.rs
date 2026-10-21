@@ -96,6 +96,9 @@ use crate::traits::types::ErrorCode;
 
 use super::process::{EXIT_SETUP_FAILED, exec_child_main, exec_status_pipe, read_exec_status};
 use super::reapply::ExecReadyParts;
+use super::seccomp_listener::{
+    ExecListenerReceiver, ExecListenerSender, exec_listener_pair, exec_sender_from,
+};
 use super::{
     ChildExit, ContainerChild, ExecChildCgroup, ExecCommand, ExecError, ExecExit, ExecReady,
     IsolationStage,
@@ -374,6 +377,39 @@ pub fn spawn_exec_worker<F: FnOnce(ExecWorkerProof) -> i32>(
     )
     .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
     Ok(ContainerChild::spawned(pid))
+}
+
+/// [`spawn_exec_worker`] に加えて、worker が seccomp の listener を親へ渡す口を張る（SEC-4・SUP-6・#2385。
+/// `docs/design/audit-delivery.md` の「起動側 C」は exec では worker を fork した親）。
+///
+/// fork の前に socketpair（`SOCK_SEQPACKET`・`SOCK_CLOEXEC`・親の端は `SO_PASSCRED`）を作り、worker へは子の端の送信口
+/// [`ExecListenerSender`] を渡す。worker は継承した親の端を **最初に** 閉じ（閉じられなければ `EXIT_SETUP_FAILED`）、
+/// 親は子の端を fork 直後に閉じる。戻り値の [`ExecListenerReceiver`] で、worker の終了を待つ **前** に
+/// listener を受信・検証すること（worker は ACK を待ってからコマンドを起動するため、先に終了を待つと相互待ちになる）。
+///
+/// 呼び出し元の要件・worker の中の制約は [`spawn_exec_worker`] と同じ。
+pub fn spawn_exec_worker_with_listener<F>(
+    worker: F,
+) -> Result<(ContainerChild, ExecListenerReceiver), ExecError>
+where
+    F: FnOnce(ExecWorkerProof, ExecListenerSender) -> i32,
+{
+    let (receiver, child_end) = exec_listener_pair()?;
+    let parent_end_fd = receiver.raw_fd();
+    let child = spawn_exec_worker(move |proof| {
+        // 継承した親の端の複製を閉じる（worker が自分宛てに送って ACK を偽装できないように。子は `_exit` で終わり
+        // 親の端の `OwnedFd` を drop しないため二重 close にならない）。
+        let closed = match u32::try_from(parent_end_fd) {
+            Ok(n) => sys::close_fd_number(n).is_ok(),
+            Err(_) => false,
+        };
+        if !closed {
+            return EXIT_SETUP_FAILED;
+        }
+        worker(proof, exec_sender_from(child_end))
+    })?;
+    // 親の子の端は上の closure の drop で閉じる（`fork_single_threaded` は親側で closure を drop する）。
+    Ok((child, receiver))
 }
 
 /// worker が保持する「親（`spawn_exec_worker` の呼び出し元）の pidfd」（fork で継承した fd の複製）。

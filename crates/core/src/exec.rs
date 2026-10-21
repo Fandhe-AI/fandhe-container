@@ -180,7 +180,10 @@ pub use diagnostic::{
 };
 /// 封印した複製の上限（結合試験が上限超過を再現するための再公開。TASK-163 追補・#1531）。
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
-pub use exec_command::{ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker};
+pub use exec_command::{
+    ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker,
+    spawn_exec_worker_with_listener,
+};
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
 pub use landlock::launch_isolation_from_bundle;
 #[cfg(test)]
@@ -286,10 +289,13 @@ pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
 #[doc(hidden)]
 pub use seccomp::{probe_denied_syscalls_for_test, probe_kcmp_self_for_test};
 pub use seccomp_listener::{
-    DenyOutcome, ListenerReadiness, NotificationId, SeccompListener, SeccompNotification,
+    DenyOutcome, ExecListenerReceiver, ExecListenerSender, ListenerReadiness, ListenerReceipt,
+    NotificationId, SeccompListener, SeccompNotification,
 };
 #[cfg(feature = "exec-test-support")]
 pub use seccomp_listener::{UserNotifProbe, kcmp_self_errno_for_test, user_notif_probe_for_test};
+#[cfg(feature = "exec-test-support")]
+pub use seccomp_listener::{apply_exec_seccomp_listener_for_test, hand_over_non_listener_for_test};
 pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 pub use subreaper::ChildSubreaper;

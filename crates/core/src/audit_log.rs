@@ -31,7 +31,7 @@
 //!   通知は発生しない既定の launcher では、フックは呼ばれない。supervisor の start 経路は
 //!   `ProductionLauncherBuilder::seccomp_errno_delivery(UserNotif)` で ERRNO 側を USER_NOTIF にし、listener ループ
 //!   〔`fandhe-container-supervisor::seccomp_notify`。#2025〕が `record_seccomp_denial_for` で記録してから `-EPERM` で応答する。
-//!   exec 経路〔SUP-6〕の USER_NOTIF 化は #2385。KILL 側の正の記録はカーネルの
+//!   exec 経路〔SUP-6〕の listener 受け渡しは #2385 で実装済みで、USER_NOTIF 化は後続。KILL 側の正の記録はカーネルの
 //!   `AUDIT_SECCOMP`、親の回収点が出す `exit_signal` 層の補助記録は [`AuditEvent::ExitSignal`]〔#2004〕）・41.4（#195 マウント検証/API。
 //!   `exec::IsolationViolation` からの写像もここで扱う）が、違反検知時に [`AuditRecord`] を組み立てる
 //! - ローカルファイルへの JSON Lines 書き込み（主経路）は `file_writer` で実装済み（TASK-41.5.1・#839）。

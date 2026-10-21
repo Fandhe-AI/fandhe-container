@@ -94,6 +94,8 @@ fn build_create(
         None => None,
         Some(i) => {
             let manifest = ImageManifestDigest::new(&i.manifest)?;
+            // 非 Linux はローカルストアを開かず、バックエンド（plugin）解決の拒否へそのまま渡す（OCI-7・CLI-1）。
+            require_local_backend(global)?;
             let store = open_image_store_for_lifecycle(&i.image_root)?;
             let scope = state_scope(&fandhe_container_core::state_store::StateRoot::resolve(
                 global.root.clone(),
@@ -143,6 +145,18 @@ pub(super) fn production_runtime<R>(
             Err(e)
         }
     }
+}
+
+/// ローカルの画像ストアを開く前の関門。Linux は何もせず、非 Linux は plugin 発見機構の拒否（`open_store` と同じ）を返す。
+/// `--image-root` が無いホストでも NOT_FOUND でなく plugin 解決の拒否に到達させるため（OCI-7・CLI-1）。
+#[cfg(target_os = "linux")]
+pub(super) fn require_local_backend(_global: &GlobalArgs) -> Result<(), TraitError> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(super) fn require_local_backend(global: &GlobalArgs) -> Result<(), TraitError> {
+    Err(super::plugin_backend::unavailable(global))
 }
 
 /// 状態ストアを開く。Linux は core を直接使い、非 Linux は plugin 発見機構経由（TASK-79.4・PLUG-4）で
@@ -1324,7 +1338,19 @@ mod tests {
         }
     }
 
+    /// OCI-7・CLI-1: 非 Linux は存在しない `--image-root` でも NOT_FOUND にならず、plugin 解決の拒否に到達する。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn oci7_build_create_non_linux_skips_local_store() {
+        let root = std::env::temp_dir().join("fc-cli-no-such-image-root-3");
+        let e = build_create(&test_global(), &image_args(root, IMG_DIGEST))
+            .err()
+            .expect("must fail");
+        assert_ne!(e.message(), "image store root not found");
+    }
+
     /// OCI-7: 存在しない `--image-root` は NOT_FOUND と固定文言で、パスを含まない。
+    #[cfg(target_os = "linux")]
     #[test]
     fn oci7_build_create_missing_image_root_is_fixed_not_found() {
         let root = std::env::temp_dir().join("fc-cli-no-such-image-root-2");

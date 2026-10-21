@@ -67,7 +67,7 @@ use fandhe_container_supervisor::control::ControlSignaler;
 
 use super::CliExit;
 use super::args::{DeleteArgs, GlobalArgs, StopArgs};
-use super::create_start::{OP_LOG_ENV, export_ops, production_runtime};
+use super::create_start::{OP_LOG_ENV, export_ops, production_runtime, require_local_backend};
 use super::image::open_image_store_for_lifecycle;
 use super::image_refs::{StoreImageRefs, state_scope};
 use fandhe_container_oci::image_management::ImageStore;
@@ -339,6 +339,8 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
             .image_root
             .as_deref()
             .map(|root| {
+                // 非 Linux はローカルストアを開かず、バックエンド（plugin）解決の拒否へそのまま渡す（OCI-7・CLI-1）。
+                require_local_backend(global)?;
                 let store = open_image_store_for_lifecycle(root)?;
                 // 参照キーに状態ルートを含め、別の状態ルートの同名コンテナの参照を外さない（OCI-7）。
                 let scope = state_scope(&fandhe_container_core::state_store::StateRoot::resolve(

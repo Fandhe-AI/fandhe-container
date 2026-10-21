@@ -75,6 +75,7 @@ use super::config::{OciConfig, OciConfigError, load_config};
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::image_refs::{ContainerImage, ImageRefRegistration};
 use super::image_rootfs::{CreatedRootfs, ImageRootfsUnpacker, prepare_rootfs_target};
+use super::launch::BundleLock;
 use super::resources::LinuxResourceLimits;
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
@@ -120,8 +121,24 @@ pub fn create(
 }
 
 fn create_inner(store: &dyn StateStore, req: &CreateRequest) -> Result<StateRecord, TraitError> {
+    // delete が core の作った rootfs を消している間の create を排他する（検証より前に取る。OCI-7・#2378）。
+    let _guard = lock_for_create(req.bundle())?;
     validate_bundle(req.bundle())?;
     create_state(store, req, None)
+}
+
+/// delete が rootfs の後始末を終えるまで保持する bundle の所有ロックを、create 側が取る（#2378・OCI-7）。
+///
+/// delete は core が作った rootfs の削除が済むまでこのロックを保持する。その間に同じ bundle を採用する create が
+/// 状態を作ると、新しいコンテナの rootfs を旧 delete が消すため、ロック保持中の create は `FailedPrecondition`
+/// で拒否する。ロックを取れない他の理由（bundle の祖先が symlink・Linux 以外）では排他せず進む（start も
+/// 同じ理由で拒否される bundle で、delete 側も同様に排他なしで進む）。
+fn lock_for_create(bundle: &Path) -> Result<Option<BundleLock>, TraitError> {
+    match BundleLock::acquire(bundle) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(e) if e.code() == ErrorCode::FailedPrecondition => Err(e),
+        Err(_) => Ok(None),
+    }
 }
 
 /// 状態を作る。`image_rootfs` は core が作って公開した rootfs の記録（展開器つきの create だけが渡す。
@@ -215,7 +232,17 @@ fn create_with_image_inner(
             }
         },
     };
-    match create_state(store, req, image_rootfs) {
+    // 状態を作る間も delete の rootfs 後始末と排他する。ロックを取れなければ公開済みの rootfs は残し、参照だけ外す。
+    let guard = match lock_for_create(req.bundle()) {
+        Ok(g) => g,
+        Err(e) => {
+            rollback_image_ref(recorder, image, req);
+            return Err(e);
+        }
+    };
+    let created_state = create_state(store, req, image_rootfs);
+    drop(guard);
+    match created_state {
         Ok(record) => {
             // 参照を状態作成まで済んだものとして確定する。delete は確定済みの参照だけを外すので、状態作成前に止まった
             // create の参照を、既存の別の状態の delete が巻き込んで外す競合を防げる。失敗しても状態は
@@ -285,6 +312,11 @@ fn unpack_rootfs(
         unpacker.unpack(image.manifest(), &unpack_path)
     });
     if let Err(e) = unpacked {
+        remove_created_rootfs(recorder, created);
+        return Err(e);
+    }
+    // 公開前に所有トークンの印を書く（delete が作成世代を照合する。OCI-7・#2378）。失敗は公開前なので消す。
+    if let Err(e) = created.seal() {
         remove_created_rootfs(recorder, created);
         return Err(e);
     }

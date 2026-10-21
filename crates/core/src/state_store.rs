@@ -1690,6 +1690,9 @@ struct ImageRootfsDto {
     path: String,
     dev: u64,
     ino: u64,
+    /// 作成世代の所有トークン。キー欠落（旧記録）は `None` で、delete は消さない（fail-closed）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
 }
 
 /// `state.json` の launch 時の分離の記録（`launchIsolation`）。
@@ -1970,6 +1973,7 @@ impl StateDto {
                         .to_owned(),
                     dev: r.identity().0,
                     ino: r.identity().1,
+                    token: r.token().map(str::to_owned),
                 }),
             },
         })
@@ -2056,10 +2060,14 @@ impl StateDto {
         // core が作った rootfs の記録も untrusted。破損は `Internal`（delete が壊れた記録で消さない）。
         let image_rootfs = match self.image_rootfs {
             None => None,
-            Some(dto) => Some(
-                ImageRootfsRecord::new(PathBuf::from(dto.path), dto.dev, dto.ino)
-                    .map_err(|_| corrupted())?,
-            ),
+            Some(dto) => {
+                let rec = ImageRootfsRecord::new(PathBuf::from(dto.path), dto.dev, dto.ino)
+                    .map_err(|_| corrupted())?;
+                Some(match dto.token {
+                    None => rec,
+                    Some(t) => rec.with_token(t).map_err(|_| corrupted())?,
+                })
+            }
         };
         let record = StateRecord::new(
             status,
@@ -3390,6 +3398,26 @@ mod tests {
     }
 
     /// OCI-5・#2378: 記録しないレコードは `imageRootfs` キーを書かず、キーの無い既存 `state.json` は `None` として読める。
+    #[test]
+    fn oci7_image_rootfs_token_persists_and_rejects_malformed() {
+        let tok = "0123456789abcdef0123456789abcdef".to_owned();
+        let r = image_rootfs_rec("p/rootfs", 1, 2)
+            .with_token(tok.clone())
+            .unwrap();
+        assert_eq!(r.token(), Some(tok.as_str()));
+        for bad in [
+            "",
+            "ABCDEF0123456789abcdef0123456789",
+            "0123",
+            "g123456789abcdef0123456789abcdef",
+        ] {
+            let e = image_rootfs_rec("p/rootfs", 1, 2)
+                .with_token(bad.to_owned())
+                .unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
+        }
+    }
+
     #[test]
     fn oci5_absent_image_rootfs_is_omitted_and_legacy_reads_none() {
         let t = TmpDir::new("imgrootnone");

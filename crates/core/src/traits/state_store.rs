@@ -489,6 +489,9 @@ pub struct ImageRootfsRecord {
     relative_path: PathBuf,
     dev: u64,
     ino: u64,
+    /// 作成世代を区別する所有トークン（小文字 16 進 32 文字）。rootfs 内の印のファイルと照合する。
+    /// `None`（旧記録）の rootfs は delete が消さない（fail-closed。inode の再利用による誤削除を防ぐ）。
+    token: Option<String>,
 }
 
 impl ImageRootfsRecord {
@@ -527,7 +530,32 @@ impl ImageRootfsRecord {
             relative_path,
             dev,
             ino,
+            token: None,
         })
+    }
+
+    /// 作成世代を区別する所有トークンを付ける（OCI-7・#2378。小文字 16 進 32 文字だけを受ける）。
+    ///
+    /// (dev, ino) だけでは、rootfs を手で消して同名のディレクトリを作り直したときの inode 再利用を
+    /// 区別できない。delete は rootfs 内の印のファイルの内容とこのトークンを照合し、不一致・欠落なら消さない。
+    pub fn with_token(mut self, token: String) -> Result<Self, TraitError> {
+        let ok = token.len() == 32
+            && token
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !ok {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "image rootfs token must be 32 lowercase hex digits",
+            ));
+        }
+        self.token = Some(token);
+        Ok(self)
+    }
+
+    /// 所有トークン（旧記録は `None`）。
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
     }
 
     /// bundle 相対の経路（Normal 要素だけ）。

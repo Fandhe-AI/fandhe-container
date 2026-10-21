@@ -23,6 +23,11 @@ use crate::traits::{ErrorCode, ImageRootfsRecord, TraitError};
 /// 記録（`ImageRootfsRecord`）の経路検証と同じ定数を使い、単一の真実源にする（#2378）。
 pub(super) const STAGING_PREFIX: &str = crate::traits::state_store::IMAGE_ROOTFS_STAGING_PREFIX;
 
+/// 作った rootfs の直下に置く所有トークンの印のファイル名。delete が記録のトークンと内容を照合し、
+/// 一致したときだけ消す（作成世代の識別。inode の再利用で別のディレクトリを誤認しない。OCI-7・SEC-1・#2378）。
+#[cfg(target_os = "linux")]
+const OWNER_TOKEN_FILE: &str = ".fandhe-container-rootfs-owner";
+
 /// 後始末で権限を補正しながら辿る項目数の上限（無制限の走査を避ける。展開側の既定上限と同程度）。
 #[cfg(target_os = "linux")]
 const CLEANUP_MAX_ENTRIES: usize = 1_000_000;
@@ -211,7 +216,15 @@ impl CreatedRootfs {
     /// 拒否されるため到達しない（`Unimplemented`）。
     pub(super) fn record(&self) -> Result<ImageRootfsRecord, TraitError> {
         let (dev, ino) = imp::identity(&self.backing)?;
-        ImageRootfsRecord::new(self.relative.clone(), dev, ino)
+        let token = imp::token(&self.backing)?;
+        ImageRootfsRecord::new(self.relative.clone(), dev, ino)?.with_token(token)
+    }
+
+    /// 展開後・公開前に、作成世代を区別する所有トークンを rootfs 直下の印のファイルへ書く（OCI-7・#2378）。
+    ///
+    /// 展開済みの木に同名のファイルがあれば（イメージ由来の偽の印を採用しない）`AlreadyExists` で拒否する。
+    pub(super) fn seal(&mut self) -> Result<(), TraitError> {
+        imp::seal(&mut self.backing)
     }
 
     /// rootfs を消す。
@@ -271,6 +284,91 @@ mod imp {
         /// 作った rootfs ディレクトリそのものの fd（展開器へ `/proc/self/fd/N` で渡す）。
         dir: OwnedFd,
         identity: (u64, u64),
+        /// `seal` が書いた所有トークン（小文字 16 進 32 文字）。
+        token: Option<String>,
+    }
+
+    /// 削除時に照合する所有トークンの扱い。
+    #[derive(Clone, Copy)]
+    enum Owner<'a> {
+        /// 自分が作った直後の木の後始末（トークンを照合しない）。
+        Unchecked,
+        /// 記録のトークンと照合する。`None`（記録欠落）は拒否する。
+        Token(Option<&'a str>),
+    }
+
+    pub(super) fn token(b: &Backing) -> Result<String, TraitError> {
+        b.token.clone().ok_or_else(|| {
+            TraitError::new(ErrorCode::Internal, "rootfs owner token is not written")
+        })
+    }
+
+    /// OS の乱数から 128 bit のトークンを作り、小文字 16 進 32 文字にする。
+    fn new_token() -> Result<String, TraitError> {
+        use std::io::Read;
+        let mut buf = [0u8; 16];
+        File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut buf))
+            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to create rootfs token"))?;
+        Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    pub(super) fn seal(b: &mut Backing) -> Result<(), TraitError> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let token = new_token()?;
+        let path = format!(
+            "/proc/self/fd/{}/{}",
+            b.dir.as_raw_fd(),
+            super::OWNER_TOKEN_FILE
+        );
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .custom_flags(sys::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    TraitError::new(
+                        ErrorCode::AlreadyExists,
+                        "rootfs owner marker already exists",
+                    )
+                } else {
+                    TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token")
+                }
+            })?;
+        f.write_all(token.as_bytes())
+            .and_then(|()| f.sync_all())
+            .map_err(|_| {
+                TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token")
+            })?;
+        b.token = Some(token);
+        Ok(())
+    }
+
+    /// 固定した rootfs の fd 直下の印のファイルが `expected` と一致するか（リンク非追従・通常ファイルのみ・
+    /// FIFO で止まらない）。
+    fn token_matches(root: BorrowedFd<'_>, expected: &str) -> bool {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = format!(
+            "/proc/self/fd/{}/{}",
+            root.as_raw_fd(),
+            super::OWNER_TOKEN_FILE
+        );
+        let Ok(f) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(sys::O_NOFOLLOW | sys::O_NONBLOCK)
+            .open(&path)
+        else {
+            return false;
+        };
+        if !f.metadata().is_ok_and(|m| m.is_file() && m.len() <= 64) {
+            return false;
+        }
+        let mut buf = Vec::new();
+        f.take(65).read_to_end(&mut buf).is_ok() && buf == expected.as_bytes()
     }
 
     pub(super) fn unpack_path(_path: &Path, b: &Backing) -> PathBuf {
@@ -446,6 +544,7 @@ mod imp {
             current: name,
             dir,
             identity,
+            token: None,
         })
     }
 
@@ -455,7 +554,7 @@ mod imp {
 
     pub(super) fn remove(_path: &Path, b: Backing) -> Result<(), TraitError> {
         // 既に無ければ消す物が無い（`NotPresent` も成功）。
-        remove_tree_at(b.parent.as_fd(), &b.current, b.identity).map(|_| ())
+        remove_tree_at(b.parent.as_fd(), &b.current, b.identity, Owner::Unchecked).map(|_| ())
     }
 
     /// 固定済みの `parent` の下の `name` を、(dev, ino) が `identity` と一致するときだけ中身ごと消す。
@@ -464,6 +563,7 @@ mod imp {
         parent: BorrowedFd<'_>,
         name: &CString,
         identity: (u64, u64),
+        owner: Owner<'_>,
     ) -> Result<RecordedRootfsRemoval, TraitError> {
         let root = match sys::open_dir_path_nofollow(Some(parent), name) {
             Ok(fd) => fd,
@@ -475,6 +575,13 @@ mod imp {
         match fstat(root.as_fd()) {
             Ok((dev, ino, true, _)) if (dev, ino) == identity => {}
             _ => return Err(refuse()),
+        }
+        // 作成世代の照合（inode の再利用で作り直された別のディレクトリを消さない）。記録欠落・不一致・
+        // 印の欠落はいずれも拒否する（fail-closed）。
+        if let Owner::Token(expected) = owner
+            && !expected.is_some_and(|t| token_matches(root.as_fd(), t))
+        {
+            return Err(refuse());
         }
         let root_dev = fstat(root.as_fd())
             .map(|(d, _, _, _)| d)
@@ -512,7 +619,12 @@ mod imp {
         while let Some(part) = parts.next() {
             let name = cstr(part)?;
             if parts.peek().is_none() {
-                return remove_tree_at(cur.as_fd(), &name, rec.identity());
+                return remove_tree_at(
+                    cur.as_fd(),
+                    &name,
+                    rec.identity(),
+                    Owner::Token(rec.token()),
+                );
             }
             cur = match open_dir(cur.as_fd(), &name) {
                 Ok(fd) => fd,
@@ -639,6 +751,20 @@ mod imp {
     }
 
     /// 作成自体が拒否される（`create_dir` は Unimplemented）ため到達しない。
+    pub(super) fn seal(_b: &mut Backing) -> Result<(), TraitError> {
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "image rootfs requires Linux",
+        ))
+    }
+
+    pub(super) fn token(_b: &Backing) -> Result<String, TraitError> {
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "image rootfs requires Linux",
+        ))
+    }
+
     pub(super) fn identity(_b: &Backing) -> Result<(u64, u64), TraitError> {
         Err(TraitError::new(
             ErrorCode::Unimplemented,
@@ -891,8 +1017,79 @@ mod tests {
     fn published_record(b: &Path, rel: &str) -> ImageRootfsRecord {
         let mut c = prepare_rootfs_target(b, Path::new(rel)).expect("prepare");
         std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
+        c.seal().expect("seal");
         c.publish().expect("publish");
         c.record().expect("record")
+    }
+
+    /// OCI-7・SEC-1（#2378）: 記録した rootfs を手で消して同名のディレクトリを作り直した（印が無い・別の印）
+    /// ときは、(dev, ino) が偶然一致しても消さない。利用者の新しいデータが残る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_refuses_recreated_dir_without_matching_token() {
+        let b = tmp("rec-token");
+        let rec = published_record(&b, "rootfs");
+        let token = rec.token().expect("token").to_owned();
+        assert_eq!(token.len(), 32);
+        let root = b.join("rootfs");
+        // 印を別の値へ差し替えた作り直し（同じ inode の再利用を模す）。
+        std::fs::set_permissions(
+            root.join(super::OWNER_TOKEN_FILE),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("chmod");
+        std::fs::write(root.join(super::OWNER_TOKEN_FILE), "0".repeat(32)).expect("other token");
+        std::fs::write(root.join("user-data"), b"keep").expect("data");
+        let e = remove_recorded_rootfs(&b, &rec).expect_err("mismatch");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            std::fs::read(root.join("user-data")).expect("kept"),
+            b"keep"
+        );
+        // 印が無い（利用者が作り直した空のディレクトリ相当）。
+        std::fs::remove_file(root.join(super::OWNER_TOKEN_FILE)).expect("rm marker");
+        let e = remove_recorded_rootfs(&b, &rec).expect_err("no marker");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(root.join("user-data").exists());
+        // 印が symlink（リンクは辿らない）。
+        std::os::unix::fs::symlink("/etc/hostname", root.join(super::OWNER_TOKEN_FILE))
+            .expect("symlink");
+        assert!(remove_recorded_rootfs(&b, &rec).is_err());
+        assert!(root.join("user-data").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7・SEC-1（#2378）: トークンの無い旧記録は、実体が一致しても消さない（fail-closed）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_refuses_record_without_token() {
+        let b = tmp("rec-notoken");
+        let rec = published_record(&b, "rootfs");
+        let (dev, ino) = rec.identity();
+        let legacy =
+            ImageRootfsRecord::new(rec.relative_path().to_path_buf(), dev, ino).expect("legacy");
+        assert!(legacy.token().is_none());
+        let e = remove_recorded_rootfs(&b, &legacy).expect_err("no token");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(b.join("rootfs").join("f").exists());
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("matching"),
+            RecordedRootfsRemoval::Removed
+        );
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7（#2378）: 展開済みの木に同名の印のファイルがあれば（イメージ由来の偽の印）採用せず拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_seal_refuses_preexisting_marker() {
+        let b = tmp("seal-pre");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        std::fs::write(c.unpack_path().join(super::OWNER_TOKEN_FILE), "x").expect("fake");
+        let e = c.seal().expect_err("exists");
+        assert_eq!(e.code(), ErrorCode::AlreadyExists);
+        c.remove().expect("cleanup");
+        let _ = std::fs::remove_dir_all(&b);
     }
 
     /// OCI-7: 記録から公開済みの rootfs を消せる。bundle と他のファイルは残る。
@@ -1007,6 +1204,7 @@ mod tests {
         std::fs::write(up.join("ro/f"), b"x").expect("f");
         std::fs::set_permissions(up.join("ro"), std::fs::Permissions::from_mode(0o500))
             .expect("chmod");
+        c.seal().expect("seal");
         c.publish().expect("publish");
         let rec = c.record().expect("record");
         assert_eq!(

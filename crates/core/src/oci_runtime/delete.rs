@@ -155,6 +155,7 @@
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::image_refs::ContainerImageRefs;
 use super::image_rootfs::remove_recorded_rootfs;
+use super::launch::BundleLock;
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     CgroupPlacement, CgroupScope, ContainerId, ContainerState, DeleteRequest, DeleteResponse,
@@ -329,6 +330,20 @@ fn delete_inner(
 ) -> Result<DeleteResponse, TraitError> {
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     check_deletable(&record, req.force())?;
+    // core が作った rootfs を持つコンテナは、状態削除から rootfs の後始末の完了まで bundle の所有ロックを保持する。
+    // 状態削除でストアのロックが外れた後に、同じ bundle を採用する create・start が成功して、旧 delete が
+    // 新しいコンテナの rootfs を消すのを防ぐ（create・start も同じロックを取る。OCI-7・#2378）。
+    // 他の delete・start が保持中なら何も変えずに `FailedPrecondition` で再試行を促す。ロックを取れない他の理由
+    // （bundle の祖先が symlink）では排他なしで進む（start も同じ理由で拒否される bundle）。
+    let _rootfs_guard = if record.image_rootfs().is_some() {
+        match BundleLock::acquire(record.bundle()) {
+            Ok(lock) => Some(lock),
+            Err(e) if e.code() == ErrorCode::FailedPrecondition => return Err(e),
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
     // 配置の記録が無いレコードは cgroup を作っていない（`StateRecord::cgroup`）ので触れない。
     if let Some(placement) = record.cgroup() {
         // 検出の失敗は記録の経路へ回さず fail-closed で返す（モジュール doc「委譲スコープの照合」）。

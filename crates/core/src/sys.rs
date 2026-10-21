@@ -116,6 +116,9 @@ pub(crate) use consts::{
 pub(crate) use consts::LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON;
 // 診断ログの待たない送信（`send_nonblocking_unix`）の失敗分類に使う errno（`crate::exec::diagnostic`）。
 pub(crate) use consts::{EAGAIN, EPIPE};
+// rootfs 内の所有トークンの印を、リンク非追従・FIFO で止まらずに開く（`oci_runtime::image_rootfs`。#2378）。
+#[cfg(target_os = "linux")]
+pub(crate) use consts::{O_NOFOLLOW, O_NONBLOCK};
 
 // # `open(2)` フラグのアーキテクチャ差（Codex P0 指摘〔aarch64 の値が誤り〕への確認記録）
 //

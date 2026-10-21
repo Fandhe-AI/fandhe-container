@@ -417,6 +417,45 @@ fn sec1_delete_keeps_replaced_rootfs_and_succeeds() {
     );
 }
 
+/// OCI-7・SEC-1（#2378）: bundle の所有ロックを他が保持している間の delete は、状態も rootfs も変えず
+/// `FailedPrecondition` で再試行を促す。保持が外れれば削除できる（状態削除から rootfs の後始末まで排他するため）。
+#[test]
+fn oci7_delete_is_refused_while_bundle_lock_is_held() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let refs = Refs::default();
+    run(&store, &refs, &Unpacker { fail: false }, &sb).expect("create");
+    let holder = std::fs::File::open(sb.bundle()).expect("open bundle");
+    holder.try_lock().expect("lock");
+    let rec = OpRecorder::new();
+    let e = delete_c1(&store, &rec, &refs).expect_err("locked");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert!(get(&store).is_ok());
+    assert!(sb.rootfs().join("bin").join("true").is_file());
+    assert_eq!(rootfs_remove_counts(&rec), (0, 0));
+    holder.unlock().expect("unlock");
+    delete_c1(&store, &rec, &refs).expect("delete");
+    assert!(!sb.rootfs().exists());
+}
+
+/// OCI-7・SEC-1（#2378）: 通常の create も、bundle の所有ロック（delete が rootfs の後始末の間保持する）が
+/// 取れなければ状態を作らず `FailedPrecondition` で拒否する。
+#[test]
+fn oci7_plain_create_is_refused_while_bundle_lock_is_held() {
+    let sb = Sandbox::new();
+    std::fs::create_dir(sb.rootfs()).expect("rootfs");
+    let store = sb.store();
+    let holder = std::fs::File::open(sb.bundle()).expect("open bundle");
+    holder.try_lock().expect("lock");
+    let e = fandhe_container_core::oci_runtime::create(&store, &OpRecorder::new(), &sb.request())
+        .expect_err("locked");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(get(&store).expect_err("none").code(), ErrorCode::NotFound);
+    holder.unlock().expect("unlock");
+    fandhe_container_core::oci_runtime::create(&store, &OpRecorder::new(), &sb.request())
+        .expect("create after unlock");
+}
+
 /// SEC-1: rootfs が symlink に差し替えられても、symlink の先は消さない。
 #[test]
 fn sec1_delete_does_not_follow_symlinked_rootfs() {

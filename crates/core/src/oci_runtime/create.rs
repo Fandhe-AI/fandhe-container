@@ -50,7 +50,9 @@
 //! 公開後の失敗では rootfs を消さずに残す（create 間の排他が未実装のため。REPAIR-3）。Linux 以外は
 //! 展開先を固定できないため、展開開始前（作成の前）に `Unimplemented` で拒否し、何も作らない（fail-closed）。
 //! create の途中でプロセスが落ちて残った部分的な rootfs は自動では回収せず、次の同じ bundle の create は
-//! `AlreadyExists` で止まる（fail-closed。利用者のデータを消さない）。delete は bundle と rootfs を消さない。
+//! `AlreadyExists` で止まる（fail-closed。利用者のデータを消さない）。公開した rootfs は状態レコードに記録し
+//! （`StateRecord::image_rootfs`）、delete が状態削除の成功後に消す（所有・タイミング・失敗時の扱いは
+//! `docs/design/image-rootfs-lifetime.md`。OCI-7・OCI-5・#2378）。delete は bundle 自体は消さない。
 //! 展開器なしの [`create_with_image`] は従来どおり、bundle の rootfs が展開済みの前提で動く。
 //!
 //! # スコープ外
@@ -76,8 +78,8 @@ use super::image_rootfs::{CreatedRootfs, ImageRootfsUnpacker, prepare_rootfs_tar
 use super::resources::LinuxResourceLimits;
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
-    ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, GetStateRequest, StateRecord,
-    StateStore, TraitError,
+    ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, GetStateRequest,
+    ImageRootfsRecord, StateRecord, StateStore, TraitError,
 };
 
 /// bundle 直下の設定ファイル名（OCI Runtime Spec）。
@@ -119,12 +121,21 @@ pub fn create(
 
 fn create_inner(store: &dyn StateStore, req: &CreateRequest) -> Result<StateRecord, TraitError> {
     validate_bundle(req.bundle())?;
-    create_state(store, req)
+    create_state(store, req, None)
 }
 
-fn create_state(store: &dyn StateStore, req: &CreateRequest) -> Result<StateRecord, TraitError> {
+/// 状態を作る。`image_rootfs` は core が作って公開した rootfs の記録（展開器つきの create だけが渡す。
+/// 利用者が用意した rootfs には付けず、delete は触れない。OCI-7・#2378）。
+fn create_state(
+    store: &dyn StateStore,
+    req: &CreateRequest,
+    image_rootfs: Option<ImageRootfsRecord>,
+) -> Result<StateRecord, TraitError> {
     let status = ContainerStatus::created(req.id().clone(), None);
-    let state_req = CreateStateRequest::new(status, req.bundle().to_path_buf())?;
+    let mut state_req = CreateStateRequest::new(status, req.bundle().to_path_buf())?;
+    if let Some(r) = image_rootfs {
+        state_req = state_req.with_image_rootfs(r);
+    }
     store.create(&state_req)
 }
 
@@ -179,7 +190,7 @@ fn create_with_image_inner(
         }
     }
     // OCI-7: 参照登録の後・状態作成の前。展開器があれば、検証を展開の前後に分けて展開する。
-    let _published_rootfs = match image.unpacker() {
+    let image_rootfs = match image.unpacker() {
         None => {
             if let Err(e) = validate_bundle(req.bundle()) {
                 rollback_image_ref(recorder, image, req);
@@ -188,7 +199,15 @@ fn create_with_image_inner(
             None
         }
         Some(unpacker) => match unpack_rootfs(store, recorder, image, unpacker, req) {
-            Ok(created) => Some(created),
+            // 公開済みの rootfs を状態へ記録する（delete が消す印）。記録を作れない失敗は公開後の失敗と同じ扱い
+            // （rootfs は残し、参照だけ外す）。
+            Ok(created) => match created.record() {
+                Ok(record) => Some(record),
+                Err(e) => {
+                    rollback_image_ref(recorder, image, req);
+                    return Err(e);
+                }
+            },
             Err(e) => {
                 // 公開前の失敗では rootfs は unpack_rootfs が消した後（公開後の失敗はここへ来ない）。残るのは未確定の参照だけ。
                 rollback_image_ref(recorder, image, req);
@@ -196,7 +215,7 @@ fn create_with_image_inner(
             }
         },
     };
-    match create_state(store, req) {
+    match create_state(store, req, image_rootfs) {
         Ok(record) => {
             // 参照を状態作成まで済んだものとして確定する。delete は確定済みの参照だけを外すので、状態作成前に止まった
             // create の参照を、既存の別の状態の delete が巻き込んで外す競合を防げる。失敗しても状態は
@@ -1307,7 +1326,7 @@ mod tests {
     fn oci7_unpack_skipped_when_state_exists() {
         let b = config_bundle("unpack-stateexists");
         let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
-        create_state(&store.inner, &b.request("c1")).expect("pre-existing");
+        create_state(&store.inner, &b.request("c1"), None).expect("pre-existing");
         let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
         let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
         assert_eq!(err.code(), ErrorCode::AlreadyExists);

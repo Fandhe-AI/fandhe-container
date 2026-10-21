@@ -25,7 +25,9 @@
 //!    （実装は削除の直前に、直下に残った exec 用の子 cgroup を上限つきの待機で掃除してよい。#1596）
 //! 5. `StateStore::delete` を get で得た revision つきで呼ぶ（楽観的排他）。revision 不一致
 //!    （`FailedPrecondition`）なら get を 1 回だけやり直し、`NotFound` なら並行する delete が先に削除
-//!    したとみなして `NotFound`、レコードが残っていれば再試行を促す `FailedPrecondition` を返す
+//!    したとみなして `NotFound`、レコードが残っていれば再試行を促す `FailedPrecondition` を返す。
+//!    成功した後、レコードに core が作った rootfs の記録（[`StateRecord::image_rootfs`]）があれば
+//!    その rootfs も消す（下の「core が作った rootfs の削除」）
 //!
 //! 6. [`delete_releasing_image_ref`] だけが、手順 5 が成功した後にイメージ参照（OCI-7）を外す（下の
 //!    「イメージ参照の解除」）
@@ -66,6 +68,23 @@
 //! `NotFound` になるため）、操作名 `image_ref_release` で `recorder` に記録する。読み取りに失敗したときは
 //! 解除しない。残った参照はデータを余分に持つ安全側で、起動時の照合（#854）が回収する。
 //! 参照を登録しない [`delete`] でイメージつきのコンテナを消すと参照が残る（同じく安全側）。
+//!
+//! # core が作った rootfs の削除（OCI-7・OCI-5・OCI-6・#2378）
+//!
+//! 展開器つきの `create_with_image` が core 自身で作って公開した rootfs は、状態レコードの
+//! [`StateRecord::image_rootfs`]（bundle 相対の経路と作成時の (dev, ino)）で所有を記録する。利用者が用意した
+//! rootfs（通常の `create`・展開器なしの `create_with_image`）は記録が無く、delete は触れない。
+//!
+//! - **状態削除の成功後に消す**: start は `BundleLock` と revision の予約より前に rootfs の fd を固定するため、
+//!   「状態削除の前に消す」順では、固定済みの start が使用中の rootfs を消された上で予約に進む窓が残る。
+//!   状態を消した後なら、そのコンテナへの start・restart・update は revision 照合で `NotFound` になる
+//! - **fail-closed**: 記録した bundle から経路を fd 相対・リンク非追従で辿り、末尾の (dev, ino) が記録と
+//!   一致するときだけ消す。symlink・ディレクトリでないもの・差し替えは `FailedPrecondition` で何も消さない。
+//!   既に無ければ成功扱い
+//! - **失敗は delete の結果を変えない**: 状態は既に消えており、エラーを返すと再実行が `NotFound` になる
+//!   （`image_ref_release` と同じ）。操作名 `image_rootfs_remove` で `recorder` に記録し、木は残す。残った木が
+//!   あると同じ bundle の次の `create_with_image` は `AlreadyExists` になるため、手動で消す。孤児の自動回収は
+//!   本件の対象外。設計と制約は `docs/design/image-rootfs-lifetime.md`
 //!
 //! # cgroup を先に消す理由（OCI-6・CORE-3）
 //!
@@ -122,7 +141,8 @@
 //! # 到達範囲（REPAIR-3）
 //!
 //! - 本関数が解放するのは cgroup（[`ContainerCgroupRemover`]）と `StateStore` のレコード（ファイルベース実装では
-//!   状態ファイル）である。OCI-7 の参照解除は [`delete_releasing_image_ref`] が担う（TASK-183.8.1）。
+//!   状態ファイル）、および core が作った rootfs（記録がある場合だけ。#2378）である。bundle 自体と利用者が用意した
+//!   rootfs は消さない。OCI-7 の参照解除は [`delete_releasing_image_ref`] が担う（TASK-183.8.1）。
 //!   本番のアダプタと CLI / plugin からの配線は未実装
 //! - 本番の呼び出し元（CLI / plugin / supervisor）が `DelegatedCgroup::detect` で得たスコープを渡す結線と、
 //!   本番の create がスコープを記録する結線（`oci_runtime::create` は記録しない）は未実装（create / start が
@@ -134,6 +154,7 @@
 
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::image_refs::ContainerImageRefs;
+use super::image_rootfs::remove_recorded_rootfs;
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     CgroupPlacement, CgroupScope, ContainerId, ContainerState, DeleteRequest, DeleteResponse,
@@ -143,6 +164,9 @@ use crate::traits::{
 
 /// [`OpRecorder`] に記録する操作名（REPAIR-4）。
 const DELETE_OP_NAME: &str = "delete";
+
+/// core が作った rootfs の削除の操作名（REPAIR-4。OCI-7・#2378）。
+const IMAGE_ROOTFS_REMOVE_OP_NAME: &str = "image_rootfs_remove";
 
 /// 参照解除の操作名（REPAIR-4）。
 const IMAGE_REF_RELEASE_OP_NAME: &str = "image_ref_release";
@@ -332,7 +356,11 @@ fn delete_inner(
     }
     let delete_req = DeleteStateRequest::new(req.id().clone(), record.revision());
     match store.delete(&delete_req) {
-        Ok(_) => Ok(DeleteResponse::new()),
+        Ok(_) => {
+            // 状態を消した実際の revision のレコード（関数の先頭で読んだもの）に付いた記録だけを使う。
+            remove_core_created_rootfs(recorder, &record);
+            Ok(DeleteResponse::new())
+        }
         Err(e) if e.code() == ErrorCode::FailedPrecondition => {
             // get の後に状態が進んだか、並行する delete が先に削除した。1 回だけ確認する。
             match store.get(&GetStateRequest::new(req.id().clone())) {
@@ -344,6 +372,21 @@ fn delete_inner(
             }
         }
         Err(e) => Err(e),
+    }
+}
+
+/// 状態削除の成功後に、core が `create_with_image` で作った rootfs を消す（OCI-7・OCI-5・#2378）。
+///
+/// 記録（[`StateRecord::image_rootfs`]）が無いレコード（利用者が用意した rootfs）では何もしない。失敗は
+/// delete の結果を変えず（状態は既に消えており、エラーを返すと再実行が `NotFound` になる。`image_ref_release`
+/// と同じ考え方）、操作名 `image_rootfs_remove` で `recorder` に記録して木を残す。残った木は手動で消す
+/// （`docs/design/image-rootfs-lifetime.md`）。
+fn remove_core_created_rootfs(recorder: &OpRecorder, record: &StateRecord) {
+    let Some(rec) = record.image_rootfs() else {
+        return;
+    };
+    if let Ok(name) = OpName::new(IMAGE_ROOTFS_REMOVE_OP_NAME) {
+        let _ = recorder.record_op(&name, || remove_recorded_rootfs(record.bundle(), rec));
     }
 }
 

@@ -15,12 +15,13 @@
 use std::path::{Component, Path, PathBuf};
 
 use super::image_refs::ImageManifestDigest;
-use crate::traits::{ErrorCode, TraitError};
+use crate::traits::{ErrorCode, ImageRootfsRecord, TraitError};
 
 /// 非公開の展開先の名前の接頭辞。`root.path` の要素としてこの接頭辞を持つ名前は、展開中の非公開の木を
 /// 通常の create が rootfs として採用することを防ぐため、`prepare_rootfs_target` と `check_rootfs` が拒否する
 /// （OCI-7: 使用中 rootfs の保持。展開中の木は名前を列挙でき、別 ID の create が指せてしまう）。
-pub(super) const STAGING_PREFIX: &str = ".fandhe-unpack-";
+/// 記録（`ImageRootfsRecord`）の経路検証と同じ定数を使い、単一の真実源にする（#2378）。
+pub(super) const STAGING_PREFIX: &str = crate::traits::state_store::IMAGE_ROOTFS_STAGING_PREFIX;
 
 /// 後始末で権限を補正しながら辿る項目数の上限（無制限の走査を避ける。展開側の既定上限と同程度）。
 #[cfg(target_os = "linux")]
@@ -77,7 +78,19 @@ pub trait ImageRootfsUnpacker {
 #[derive(Debug)]
 pub(super) struct CreatedRootfs {
     path: PathBuf,
+    /// bundle 相対の正規化済みの経路（Normal 要素だけ。[`CreatedRootfs::record`] が状態へ記録する）。
+    relative: PathBuf,
     backing: imp::Backing,
+}
+
+/// [`remove_recorded_rootfs`] の結果（将来の拡張に備え非網羅）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(super) enum RecordedRootfsRemoval {
+    /// 記録の実体を消した。
+    Removed,
+    /// 既に無かった（どの段でも `ENOENT`）。冪等な再実行として成功扱いにする。
+    NotPresent,
 }
 
 fn invalid(message: &str) -> TraitError {
@@ -140,7 +153,12 @@ pub(super) fn prepare_rootfs_target(
         p.push(part);
         p
     });
-    Ok(CreatedRootfs { path, backing })
+    let relative = parts.iter().collect::<PathBuf>();
+    Ok(CreatedRootfs {
+        path,
+        relative,
+        backing,
+    })
 }
 
 /// 経路のいずれかの要素が非公開の展開先の予約名（[`STAGING_PREFIX`] 始まり）か。
@@ -184,6 +202,16 @@ impl CreatedRootfs {
         imp::path_is_unpacked(path, &self.backing)
     }
 
+    /// 公開済みの rootfs を、状態レコードへ残す記録にする（契約 13。OCI-7・#2378）。
+    ///
+    /// 経路は bundle 相対の正規化済みのもの、同一性は作成時に固定した実体の (dev, ino)。delete が
+    /// [`remove_recorded_rootfs`] で「作ったときと同じ実体」だけを消すための印になる。Linux 以外は作成自体が
+    /// 拒否されるため到達しない（`Unimplemented`）。
+    pub(super) fn record(&self) -> Result<ImageRootfsRecord, TraitError> {
+        let (dev, ino) = imp::identity(&self.backing)?;
+        ImageRootfsRecord::new(self.relative.clone(), dev, ino)
+    }
+
     /// rootfs を消す。
     ///
     /// 作成時に固定した親（Linux は fd）の下で、末尾が作ったときと同じディレクトリ（dev・ino）で
@@ -192,6 +220,20 @@ impl CreatedRootfs {
     pub(super) fn remove(self) -> Result<(), TraitError> {
         imp::remove(&self.path, self.backing)
     }
+}
+
+/// 状態レコードに記録された rootfs を消す（delete が状態削除の成功後に呼ぶ。OCI-7・OCI-5・#2378）。
+///
+/// 呼び出し元は `oci_runtime::delete`。`bundle` はレコードの bundle、`rec` は create が記録した経路と実体の
+/// 同一性。bundle は作成時と同じく追従して開き、記録の経路は中間要素をリンク非追従の fd 相対で辿る。
+/// 末尾が記録の (dev, ino) と一致するディレクトリのときだけ中身ごと消す。symlink・ディレクトリでないもの・
+/// 同一性の不一致は `FailedPrecondition` で拒否し何も消さない（fail-closed）。どの段でも `ENOENT` なら
+/// [`RecordedRootfsRemoval::NotPresent`]。Linux 以外は同一性を保証できないため `Unimplemented`。
+pub(super) fn remove_recorded_rootfs(
+    bundle: &Path,
+    rec: &ImageRootfsRecord,
+) -> Result<RecordedRootfsRemoval, TraitError> {
+    imp::remove_recorded(bundle, rec)
 }
 
 #[cfg(target_os = "linux")]
@@ -206,7 +248,10 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{CLEANUP_MAX_DEPTH, CLEANUP_MAX_ENTRIES, invalid, refuse, remove_failed};
+    use super::{
+        CLEANUP_MAX_DEPTH, CLEANUP_MAX_ENTRIES, ImageRootfsRecord, RecordedRootfsRemoval, invalid,
+        refuse, remove_failed,
+    };
     use crate::sys::{self, SysError};
     use crate::traits::{ErrorCode, TraitError};
 
@@ -397,24 +442,76 @@ mod imp {
         })
     }
 
+    pub(super) fn identity(b: &Backing) -> Result<(u64, u64), TraitError> {
+        Ok(b.identity)
+    }
+
     pub(super) fn remove(_path: &Path, b: Backing) -> Result<(), TraitError> {
-        let root = match sys::open_dir_path_nofollow(Some(b.parent.as_fd()), &b.current) {
+        // 既に無ければ消す物が無い（`NotPresent` も成功）。
+        remove_tree_at(b.parent.as_fd(), &b.current, b.identity).map(|_| ())
+    }
+
+    /// 固定済みの `parent` の下の `name` を、(dev, ino) が `identity` と一致するときだけ中身ごと消す。
+    /// 末尾はリンク非追従で開く。`ENOENT` は `NotPresent`、それ以外の開く失敗・種類や同一性の不一致は拒否する。
+    fn remove_tree_at(
+        parent: BorrowedFd<'_>,
+        name: &CString,
+        identity: (u64, u64),
+    ) -> Result<RecordedRootfsRemoval, TraitError> {
+        let root = match sys::open_dir_path_nofollow(Some(parent), name) {
             Ok(fd) => fd,
-            // 既に無ければ消す物が無い。
-            Err(SysError::Os(n)) if n == sys::ENOENT => return Ok(()),
+            Err(SysError::Os(n)) if n == sys::ENOENT => {
+                return Ok(RecordedRootfsRemoval::NotPresent);
+            }
             Err(_) => return Err(refuse()),
         };
         match fstat(root.as_fd()) {
-            Ok((dev, ino, true, _)) if (dev, ino) == b.identity => {}
+            Ok((dev, ino, true, _)) if (dev, ino) == identity => {}
             _ => return Err(refuse()),
         }
         let mut seen = 0usize;
         remove_children(root.as_fd(), 0, &mut seen)?;
-        match sys::remove_dir_at(b.parent.as_fd(), &b.current) {
-            Ok(()) => Ok(()),
-            Err(SysError::Os(n)) if n == sys::ENOENT => Ok(()),
+        match sys::remove_dir_at(parent, name) {
+            Ok(()) => Ok(RecordedRootfsRemoval::Removed),
+            Err(SysError::Os(n)) if n == sys::ENOENT => Ok(RecordedRootfsRemoval::Removed),
             Err(_) => Err(remove_failed()),
         }
+    }
+
+    pub(super) fn remove_recorded(
+        bundle: &Path,
+        rec: &ImageRootfsRecord,
+    ) -> Result<RecordedRootfsRemoval, TraitError> {
+        let file = match File::open(bundle) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(RecordedRootfsRemoval::NotPresent);
+            }
+            Err(_) => return Err(remove_failed()),
+        };
+        if !file.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+            return Err(refuse());
+        }
+        let mut cur = OwnedFd::from(file);
+        let mut parts = rec.relative_path().iter().peekable();
+        while let Some(part) = parts.next() {
+            let name = cstr(part)?;
+            if parts.peek().is_none() {
+                return remove_tree_at(cur.as_fd(), &name, rec.identity());
+            }
+            cur = match open_dir(cur.as_fd(), &name) {
+                Ok(fd) => fd,
+                // 中間の要素が無ければ rootfs も無い。
+                Err(e) if e.code() == ErrorCode::NotFound => {
+                    return Ok(RecordedRootfsRemoval::NotPresent);
+                }
+                // symlink・ディレクトリでないものへの差し替え（リンクは辿らない）。
+                Err(e) if e.code() == ErrorCode::InvalidArgument => return Err(refuse()),
+                Err(e) => return Err(e),
+            };
+        }
+        // 空の経路は `ImageRootfsRecord::new` が拒否済みで到達しない。
+        Err(refuse())
     }
 
     /// `dir`（固定済みの fd）の中身を、fd 相対・リンク非追従で再帰的に消す（件数・深さの上限つき）。
@@ -474,7 +571,7 @@ mod imp {
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
-    use super::refuse;
+    use super::{ImageRootfsRecord, RecordedRootfsRemoval, refuse};
     use crate::traits::{ErrorCode, TraitError};
 
     #[derive(Debug)]
@@ -510,6 +607,25 @@ mod imp {
 
     pub(super) fn remove(_path: &Path, _b: Backing) -> Result<(), TraitError> {
         Err(refuse())
+    }
+
+    /// 作成自体が拒否される（`create_dir` は Unimplemented）ため到達しない。
+    pub(super) fn identity(_b: &Backing) -> Result<(u64, u64), TraitError> {
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "image rootfs unpacking is not supported on this OS yet",
+        ))
+    }
+
+    /// 同一性を fd で固定できないため、経路を再解決して消さない（SEC-1。記録は失敗として残す）。
+    pub(super) fn remove_recorded(
+        _bundle: &Path,
+        _rec: &ImageRootfsRecord,
+    ) -> Result<RecordedRootfsRemoval, TraitError> {
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "image rootfs removal is not supported on this OS yet",
+        ))
     }
 }
 
@@ -738,6 +854,137 @@ mod tests {
         assert!(b.join("rootfs").join("keep").exists());
         c.remove().expect("remove staging");
         assert!(b.join("rootfs").join("keep").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// 公開済みの rootfs を作り、記録を返す（`<b>/<rel>` に `f` を置く）。
+    #[cfg(target_os = "linux")]
+    fn published_record(b: &Path, rel: &str) -> ImageRootfsRecord {
+        let mut c = prepare_rootfs_target(b, Path::new(rel)).expect("prepare");
+        std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
+        c.publish().expect("publish");
+        c.record().expect("record")
+    }
+
+    /// OCI-7: 記録から公開済みの rootfs を消せる。bundle と他のファイルは残る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_remove_recorded_rootfs_deletes_tree() {
+        let b = tmp("rec-del");
+        std::fs::write(b.join("config.json"), b"{}").expect("config");
+        let rec = published_record(&b, "rootfs");
+        assert_eq!(rec.relative_path(), Path::new("rootfs"));
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("remove"),
+            RecordedRootfsRemoval::Removed
+        );
+        assert!(!b.join("rootfs").exists());
+        assert!(b.join("config.json").is_file());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7: 入れ子の `root.path` でも記録の経路で消せる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_remove_recorded_rootfs_nested_path() {
+        let b = tmp("rec-nested");
+        std::fs::create_dir(b.join("p")).expect("parent");
+        let rec = published_record(&b, "p/rootfs");
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("remove"),
+            RecordedRootfsRemoval::Removed
+        );
+        assert!(b.join("p").is_dir());
+        assert!(!b.join("p/rootfs").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7: 既に無ければ `NotPresent`（冪等な再実行）。bundle・中間要素が無い場合も同じ。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_remove_recorded_rootfs_absent_is_not_present() {
+        let b = tmp("rec-absent");
+        std::fs::create_dir(b.join("p")).expect("parent");
+        let rec = published_record(&b, "p/rootfs");
+        std::fs::remove_dir_all(b.join("p/rootfs")).expect("gone");
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("absent"),
+            RecordedRootfsRemoval::NotPresent
+        );
+        std::fs::remove_dir_all(b.join("p")).expect("parent gone");
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("no parent"),
+            RecordedRootfsRemoval::NotPresent
+        );
+        let _ = std::fs::remove_dir_all(&b);
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("no bundle"),
+            RecordedRootfsRemoval::NotPresent
+        );
+    }
+
+    /// SEC-1: 同名の別ディレクトリ・symlink に差し替えられていたら `FailedPrecondition` で何も消さない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_refuses_replaced_dir() {
+        let b = tmp("rec-replaced");
+        let rec = published_record(&b, "rootfs");
+        std::fs::rename(b.join("rootfs"), b.join("moved")).expect("move");
+        std::fs::create_dir(b.join("rootfs")).expect("replacement");
+        std::fs::write(b.join("rootfs/marker"), b"o").expect("marker");
+        let e = remove_recorded_rootfs(&b, &rec).expect_err("replaced");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(b.join("rootfs/marker").is_file());
+
+        std::fs::remove_dir_all(b.join("rootfs")).expect("rm replacement");
+        let outside = tmp("rec-replaced-out");
+        std::fs::write(outside.join("marker"), b"o").expect("marker");
+        std::os::unix::fs::symlink(&outside, b.join("rootfs")).expect("symlink");
+        let e = remove_recorded_rootfs(&b, &rec).expect_err("symlink");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(outside.join("marker").is_file());
+        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// SEC-1: 中間要素が bundle 外への symlink に差し替えられても、外側は消さない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_parent_symlink_untouched() {
+        let b = tmp("rec-parent");
+        std::fs::create_dir(b.join("p")).expect("parent");
+        let rec = published_record(&b, "p/rootfs");
+        let outside = tmp("rec-parent-out");
+        std::fs::create_dir(outside.join("rootfs")).expect("outside rootfs");
+        std::fs::write(outside.join("rootfs/marker"), b"o").expect("marker");
+        std::fs::rename(b.join("p"), b.join("p-moved")).expect("move");
+        std::os::unix::fs::symlink(&outside, b.join("p")).expect("symlink");
+        let e = remove_recorded_rootfs(&b, &rec).expect_err("symlinked parent");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(outside.join("rootfs/marker").is_file());
+        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// OCI-7: 展開時に読み取り専用にされたディレクトリを含む木も消せる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_remove_recorded_rootfs_handles_read_only_dirs() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let b = tmp("rec-ro");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        let up = c.unpack_path();
+        std::fs::create_dir(up.join("ro")).expect("ro");
+        std::fs::write(up.join("ro/f"), b"x").expect("f");
+        std::fs::set_permissions(up.join("ro"), std::fs::Permissions::from_mode(0o500))
+            .expect("chmod");
+        c.publish().expect("publish");
+        let rec = c.record().expect("record");
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("remove"),
+            RecordedRootfsRemoval::Removed
+        );
+        assert!(!b.join("rootfs").exists());
         let _ = std::fs::remove_dir_all(&b);
     }
 

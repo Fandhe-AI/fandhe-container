@@ -109,8 +109,8 @@ use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
 use crate::traits::{
     Annotations, CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, CreateStateRequest,
     DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest, HealthStatus,
-    ListStateRequest, StateList, StateListCursor, StateRecord, StateRevision, StateStore,
-    SupervisionState, TerminationReason, TraitError, UpdateStateRequest,
+    ImageRootfsRecord, ListStateRequest, StateList, StateListCursor, StateRecord, StateRevision,
+    StateStore, SupervisionState, TerminationReason, TraitError, UpdateStateRequest,
 };
 
 /// 各コンテナの状態ファイル名（OCI-5）。
@@ -970,6 +970,10 @@ impl StateStore for FileStateStore {
         if let Some(l) = req.launch_isolation() {
             record = record.with_launch_isolation(l.clone());
         }
+        // core が作った rootfs の記録も同じ形（トレイト契約 13。OCI-7・#2378）。
+        if let Some(r) = req.image_rootfs() {
+            record = record.with_image_rootfs(r.clone());
+        }
         self.write_record(&record)?;
         Ok(record)
     }
@@ -1024,6 +1028,11 @@ impl StateStore for FileStateStore {
         // （トレイト契約 12。#1468）。
         if let Some(l) = req.launch_isolation().or(existing.launch_isolation()) {
             record = record.with_launch_isolation(l.clone());
+        }
+        // core が作った rootfs の記録は update で変えずに引き継ぐ（トレイト契約 13。supervisor の status 更新で
+        // 消すと delete が rootfs を消さなくなる。OCI-7・#2378）。
+        if let Some(r) = existing.image_rootfs() {
+            record = record.with_image_rootfs(r.clone());
         }
         self.write_record(&record)?;
         Ok(record)
@@ -1669,6 +1678,18 @@ struct StateDto {
     rlimits: Option<Vec<RlimitDto>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     launch_isolation: Option<LaunchIsolationDto>,
+    /// core が作った rootfs の記録（OCI-7・OCI-5・#2378）。キー欠落は `None`（利用者が用意した rootfs）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_rootfs: Option<ImageRootfsDto>,
+}
+
+/// `state.json` の core が作った rootfs の記録（`imageRootfs`）。`{"path":"rootfs","dev":N,"ino":N}`。
+/// 読み込み側は [`ImageRootfsRecord::new`] で検証し、絶対パス・`..`・予約名・空は破損（`Internal`）とする。
+#[derive(Debug, Serialize, Deserialize)]
+struct ImageRootfsDto {
+    path: String,
+    dev: u64,
+    ino: u64,
 }
 
 /// `state.json` の launch 時の分離の記録（`launchIsolation`）。
@@ -1937,6 +1958,20 @@ impl StateDto {
             launch_isolation: record
                 .launch_isolation()
                 .map(LaunchIsolationDto::from_record),
+            image_rootfs: match record.image_rootfs() {
+                None => None,
+                Some(r) => Some(ImageRootfsDto {
+                    path: r
+                        .relative_path()
+                        .to_str()
+                        .ok_or_else(|| {
+                            err(ErrorCode::InvalidArgument, "image rootfs path is not UTF-8")
+                        })?
+                        .to_owned(),
+                    dev: r.identity().0,
+                    ino: r.identity().1,
+                }),
+            },
         })
     }
 
@@ -2018,6 +2053,14 @@ impl StateDto {
             None => None,
             Some(dto) => Some(dto.into_record().map_err(|()| corrupted())?),
         };
+        // core が作った rootfs の記録も untrusted。破損は `Internal`（delete が壊れた記録で消さない）。
+        let image_rootfs = match self.image_rootfs {
+            None => None,
+            Some(dto) => Some(
+                ImageRootfsRecord::new(PathBuf::from(dto.path), dto.dev, dto.ino)
+                    .map_err(|_| corrupted())?,
+            ),
+        };
         let record = StateRecord::new(
             status,
             PathBuf::from(self.bundle),
@@ -2036,6 +2079,10 @@ impl StateDto {
         };
         let record = match launch_isolation {
             Some(l) => record.with_launch_isolation(l),
+            None => record,
+        };
+        let record = match image_rootfs {
+            Some(r) => record.with_image_rootfs(r),
             None => record,
         };
         Ok(match cgroup {
@@ -3303,6 +3350,110 @@ mod tests {
         assert_eq!(replaced.launch_isolation(), Some(&iso(200)));
     }
 
+    fn image_rootfs_rec(path: &str, dev: u64, ino: u64) -> ImageRootfsRecord {
+        ImageRootfsRecord::new(PathBuf::from(path), dev, ino).unwrap()
+    }
+
+    /// OCI-7・OCI-5・#2378: core が作った rootfs の記録が `state.json` に書かれ（形を具体値で照合）、update で
+    /// 引き継がれ、再オープン後の get でも同じ値で読める（契約 13）。
+    #[test]
+    fn oci7_oci5_image_rootfs_persists_and_survives_update() {
+        let t = TmpDir::new("imgroot");
+        let store = t.open();
+        let req = CreateStateRequest::new(ContainerStatus::created(cid("web"), None), bundle())
+            .unwrap()
+            .with_image_rootfs(image_rootfs_rec("p/rootfs", 44, 100));
+        let rec = store.create(&req).unwrap();
+        assert_eq!(
+            rec.image_rootfs(),
+            Some(&image_rootfs_rec("p/rootfs", 44, 100))
+        );
+        assert_eq!(
+            read_json(&t, "web")["imageRootfs"],
+            serde_json::json!({"path": "p/rootfs", "dev": 44, "ino": 100})
+        );
+        let updated = store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(cid("web"), NonZeroU32::new(100)),
+                rec.revision(),
+            ))
+            .unwrap();
+        assert_eq!(
+            updated.image_rootfs(),
+            Some(&image_rootfs_rec("p/rootfs", 44, 100))
+        );
+        let got = t.open().get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(
+            got.image_rootfs(),
+            Some(&image_rootfs_rec("p/rootfs", 44, 100))
+        );
+    }
+
+    /// OCI-5・#2378: 記録しないレコードは `imageRootfs` キーを書かず、キーの無い既存 `state.json` は `None` として読める。
+    #[test]
+    fn oci5_absent_image_rootfs_is_omitted_and_legacy_reads_none() {
+        let t = TmpDir::new("imgrootnone");
+        let store = t.open();
+        let rec = create(&store, "plain");
+        assert!(rec.image_rootfs().is_none());
+        assert!(read_json(&t, "plain").get("imageRootfs").is_none());
+        let got = store.get(&GetStateRequest::new(cid("plain"))).unwrap();
+        assert!(got.image_rootfs().is_none());
+    }
+
+    /// OCI-5・SEC-1・#2378: 不正な `imageRootfs`（絶対パス・`..`・予約名・空）は破損（Internal）として読む。
+    #[test]
+    fn oci5_invalid_image_rootfs_is_corrupted() {
+        let t = TmpDir::new("imgrootbad");
+        let store = t.open();
+        let cases = [
+            ("a", "/etc"),
+            ("b", "../outside"),
+            ("c", "p/../../x"),
+            ("d", ".fandhe-unpack-1-0"),
+            ("e", "p/.fandhe-unpack-1-0/x"),
+            ("f", ""),
+            ("g", "."),
+        ];
+        for (id, path) in cases {
+            create(&store, id);
+            let body = serde_json::json!({
+                "ociVersion": "1.2.0", "id": id, "status": "stopped", "bundle": "/b", "revision": 10,
+                "imageRootfs": {"path": path, "dev": 1, "ino": 2},
+            });
+            fs::write(t.path().join(id).join("state.json"), body.to_string()).unwrap();
+            let e = store.get(&GetStateRequest::new(cid(id))).unwrap_err();
+            assert_eq!(e.code().as_str(), "INTERNAL", "{id}");
+        }
+    }
+
+    /// OCI-5・SEC-1・#2378: `ImageRootfsRecord::new` は bundle の外・展開中の木を指せる値を作らせない。
+    #[test]
+    fn oci5_image_rootfs_record_rejects_unsafe_paths() {
+        for bad in [
+            "",
+            "/abs",
+            "..",
+            "a/../b",
+            "./",
+            ".fandhe-unpack-9-9",
+            "a/.fandhe-unpack-x",
+        ] {
+            let e = ImageRootfsRecord::new(PathBuf::from(bad), 1, 2).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad:?}");
+        }
+        let long = "a/".repeat(3000);
+        assert_eq!(
+            ImageRootfsRecord::new(PathBuf::from(long), 1, 2)
+                .unwrap_err()
+                .code(),
+            ErrorCode::InvalidArgument
+        );
+        let ok = ImageRootfsRecord::new(PathBuf::from("a/./b"), 7, 9).unwrap();
+        assert_eq!(ok.relative_path(), Path::new("a/b"));
+        assert_eq!(ok.identity(), (7, 9));
+        assert_eq!(format!("{ok:?}"), "ImageRootfsRecord { .. }");
+    }
     /// 後方互換（#1468）: 記録しないレコードは `launchIsolation` キーを書かず、キーの無い既存 `state.json` は
     /// `None` として読める。
     #[test]

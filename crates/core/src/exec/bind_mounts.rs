@@ -923,12 +923,19 @@ struct ProtectedOverlayLayers {
     /// 決められないため、同一・祖先・子孫のすべてを `BindSourceContainsRootfs` で拒否する（層は実行基盤の内部の backing storage で、
     /// 配下を元にできなくても実害は小さい）。
     contained: Vec<ProtectedLayer>,
+    /// `ctx.protected` と同じ添字で、各保護対象自身の層が属する FS の dev（状態ルート由来のみ。それ以外は空）。
+    /// ハードリンクの検査は、その保護対象自身の層の dev とだけ対にする（他の保護対象の層の FS と混ぜない）。
+    devs_by_root: Vec<Vec<String>>,
 }
 
 impl ProtectedOverlayLayers {
-    /// 状態ルート由来の層が属する FS の dev（ハードリンクの検査で、保護対象の dev と同じ FS とみなす）。
-    fn state_devs(&self) -> impl Iterator<Item = &str> {
-        self.state.iter().map(|l| l.identity.dev.as_str())
+    /// `idx` 番目の保護対象自身の層が属する FS の dev（ハードリンクの検査で、その保護対象の dev と同じ FS とみなす）。
+    fn state_devs_of(&self, idx: usize) -> impl Iterator<Item = &str> {
+        self.devs_by_root
+            .get(idx)
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
     }
 }
 
@@ -1008,6 +1015,11 @@ fn protected_overlay_layers(
             &mut out.state
         };
         dst.extend(layers.iter().cloned());
+        out.devs_by_root.push(if p.is_containment_only() {
+            Vec::new()
+        } else {
+            layers.iter().map(|l| l.identity.dev.clone()).collect()
+        });
     }
     Ok(out)
 }
@@ -1059,9 +1071,9 @@ fn check_source_not_protected(
     // （fail-closed）。保護対象が overlay 上にあるときは状態ファイルの実体が層の FS 上にあるため、層の dev も同じ FS とみなす（#2317）。
     if src.kind() == BindSourceKind::RegularFile
         && src.nlink() > 1
-        && ctx.protected.iter().any(|p| {
+        && ctx.protected.iter().enumerate().any(|(i, p)| {
             !p.is_containment_only()
-                && (p.dev() == identity.dev || layers.state_devs().any(|d| d == identity.dev))
+                && (p.dev() == identity.dev || layers.state_devs_of(i).any(|d| d == identity.dev))
         })
     {
         return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
@@ -1112,8 +1124,8 @@ fn check_place_not_protected(
                 "the pinned bind mount source cannot be located in mountinfo",
             ));
         };
-        if ctx.protected.iter().any(|p| {
-            (devs.contains(p.dev()) || layers.state_devs().any(|d| devs.contains(d)))
+        if ctx.protected.iter().enumerate().any(|(i, p)| {
+            (devs.contains(p.dev()) || layers.state_devs_of(i).any(|d| devs.contains(d)))
                 && p.has_hard_linked_files()
         }) {
             return Err(violation(spec, ViolationReason::BindSourceReachesStateRoot));
@@ -4687,6 +4699,53 @@ mod tests {
         let set = one("/mnt/f", &fx.src("file2"), &[]).with_protected_roots(vec![state_on_9_9()]);
         let (r, log) = run(&fx, &set, &o.knobs());
         r.unwrap_or_else(|e| panic!("file on another fs must pass: {e}; {log:?}"));
+    }
+
+    /// SEC-1・#2317: ハードリンクの検査は、各保護対象自身の層の dev とだけ対にする。別の保護対象にハードリンク済みの
+    /// 状態ファイルがあっても、overlay 上の状態ルートの層の FS 上のディレクトリ元を誤って拒否しない。
+    #[test]
+    fn sec1_2317_hard_link_scan_is_paired_per_root_layer_devs() {
+        let fx = fx();
+        let o = ovl_fx(&fx);
+        // 元の属するマウント（ID 1）を層と同じ dev `0:7` にする。
+        let info = o.info("overlay", &o.opts()).replace(
+            "1 0 0:1 / / rw - tmpfs none rw",
+            "1 0 0:7 / / rw - tmpfs none rw",
+        );
+        let knobs = Knobs {
+            mountinfo: Some(info),
+            ..Knobs::default()
+        };
+        // overlay 上の状態ルート（リンクなし）と、別 FS（dev `0:2`）上のハードリンクを持つ状態ルート。
+        let other =
+            |linked: bool| ProtectedFsRoot::new("0:2".to_owned(), "/other".to_owned(), linked);
+        let set = one("/mnt/d", &fx.src("dir"), &[])
+            .with_protected_roots(vec![state_on_9_9(), other(true)]);
+        let (r, log) = run(&fx, &set, &knobs);
+        r.unwrap_or_else(|e| panic!("unrelated backing fs must pass: {e}; {log:?}"));
+        // 対照: overlay 上の状態ルート自身にリンクがあれば、層の FS 上のディレクトリ元は拒否する。
+        let linked_overlay = ProtectedFsRoot::new("9:9".to_owned(), "/state".to_owned(), true)
+            .with_inode_chain(
+                "/proc".to_owned(),
+                dir_identity_chain("/proc").expect("chain of /proc"),
+            );
+        let fx2 = self::fx();
+        let o2 = ovl_fx(&fx2);
+        let info2 = o2.info("overlay", &o2.opts()).replace(
+            "1 0 0:1 / / rw - tmpfs none rw",
+            "1 0 0:7 / / rw - tmpfs none rw",
+        );
+        let knobs2 = Knobs {
+            mountinfo: Some(info2),
+            ..Knobs::default()
+        };
+        let set = one("/mnt/d", &fx2.src("dir"), &[])
+            .with_protected_roots(vec![linked_overlay, other(false)]);
+        let (r, _log) = run(&fx2, &set, &knobs2);
+        assert_eq!(
+            reason_of(&r.expect_err("own layer fs with links")),
+            Some(ViolationReason::BindSourceReachesStateRoot)
+        );
     }
 
     /// SEC-1・#2317: 層を解決できない・解析できない・入れ子・食い違いは、`FAILED_PRECONDITION`（fail-closed）。

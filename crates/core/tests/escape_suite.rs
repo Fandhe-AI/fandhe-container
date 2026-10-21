@@ -16,6 +16,12 @@
 //!   ESC-03 は `USER_NOTIF` 版の filter の通知を応答者が本番の記録先へ記録した `@audit.log` の行、ESC-01 は
 //!   カーネル監査の `LANDLOCK_ACCESS`（opt-in の段）で照合する（#2028。下の「監査の照合」節）
 //!
+//! # シナリオプロセスのスレッド制約（#2319）
+//! シナリオプロセスは `isolate()` の後にスレッドを作れない（`unshare(CLONE_NEWPID)` をした本人の `CLONE_THREAD` は
+//! `clone(2)` が EINVAL にする）。isolate の前も `CLONE_NEWUSER` と `fork_single_threaded` の単一スレッド要件で
+//! 作れない。そのため記録の回収と ESC-03 の応答は単一スレッドで行う。ケースや補助処理を足すときは、シナリオ側で
+//! `thread::spawn` / `Builder` / `scope` を使わない（dispatcher 側は isolate しないので使ってよい）。
+//!
 //! # 共通関数の流れ（コンテナ起動 → 攻撃 → 判定 → 後始末）
 //! `linux::run_case`（ディスパッチャ）が排他作成した一時 rootfs を用意し、自身を
 //! `--scenario <case-id> <rootfs>` で再起動する（`unshare(CLONE_NEWPID)` の後に PID 1 になれるのは最初の
@@ -37,7 +43,7 @@
 //!   の `@audit.log` を、シナリオ終了後にディスパッチャが上限つきで回収し、件数（ちょうど）・層・コンテナ ID・
 //!   seccomp 層の syscall 番号と arch と攻撃した子の pid を具体値で照合する。
 //!   - ESC-03: `spawn_container_probe_with_seccomp_listener`（`ErrnoDelivery::UserNotif` ＋ `NEW_LISTENER` ＋ `SCM_RIGHTS`
-//!     による listener の受け渡し〔本番と同じ検証〕）で子を起動し、応答者のスレッドが通知ごとに
+//!     による listener の受け渡し〔本番と同じ検証〕）で子を起動し、シナリオ側の応答ループ（単一スレッド）が通知ごとに
 //!     `record_seccomp_denial_for` → `ControlAuditRelay` → `FileAuditSink` で記録して `-EPERM` で応答する。
 //!     応答ループ自体は試験側が core の公開 API だけで組む（supervisor の `SeccompNotifyHub` の試験ではない。
 //!     それは `crates/supervisor/tests/seccomp_notify_audit.rs` が担う）
@@ -541,7 +547,7 @@ fn judge(expect: &Expectation, obs: &Observation) -> CaseVerdict {
     }
 }
 
-/// 子が書く記録の累計バイト上限（pipe 容量 64 KiB より十分小さくし、子の書き込みブロックを避ける）。
+/// 子が書く記録の累計バイト上限（pipe 容量 64 KiB より十分小さくし、親が読む前に子が書き切ってもブロックしない）。
 const RECORD_MAX_BYTES: usize = 16 * 1024;
 
 /// 子から回収した記録の解析結果。
@@ -1975,7 +1981,7 @@ mod linux {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitStatus, Stdio};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -1985,9 +1991,9 @@ mod linux {
     };
     use fandhe_container_core::dev_mounts::ImplicitDevMounts;
     use fandhe_container_core::exec::{
-        ChildExit, EscapeSyscallProbe, IsolationConfig, ListenerReadiness, Namespace, NamespaceSet,
-        ProbeOutcome, SeccompListener, StagePipeline, escape_probe_mount, isolate,
-        isolate_rootful_host_root, plan, plan_rootful_host_root, probe_escape_syscall,
+        ChildExit, ContainerChild, EscapeSyscallProbe, IsolationConfig, ListenerReadiness,
+        Namespace, NamespaceSet, ProbeOutcome, SeccompListener, StagePipeline, escape_probe_mount,
+        isolate, isolate_rootful_host_root, plan, plan_rootful_host_root, probe_escape_syscall,
         spawn_container_probe, spawn_container_probe_with_seccomp_listener,
     };
     use fandhe_container_core::landlock::{
@@ -3287,20 +3293,36 @@ mod linux {
     /// 応答者（ESC-03）: seccomp の listener の通知を受けて、`record_seccomp_denial_for` → 本番の sink で記録し、
     /// `-EPERM` で応答する。試験側の応答ループで、supervisor の `SeccompNotifyHub` そのものではない（core の公開 API
     /// だけで組む）。記録の成否にかかわらず応答は必ず返し、許可（`CONTINUE`）には覆さない。
+    ///
+    /// シナリオプロセスは `isolate()` の `unshare(CLONE_NEWPID)` の後にスレッドを作れない（`clone(2)` の EINVAL）ため、
+    /// 呼び出し元のスレッドで回す。子の終了（回収）を各周回で確かめ、回収済み・listener の閉鎖・期限超過で抜ける。
+    /// 期限を過ぎたら子を kill して回収してから panic する（REPAIR-5）。抜けた後の終了状態は `child` から得る。
     fn respond_loop(
+        child: &ContainerChild,
         listener: &SeccompListener,
         sink: &dyn AuditSink,
         container: &ContainerId,
-        stop: &AtomicBool,
-    ) {
+    ) -> ChildExit {
         const POLL: Duration = Duration::from_millis(100);
-        // どの経路でも有限時間で抜ける（REPAIR-5）。子の待ち上限より少し長くする。
-        let deadline = Instant::now() + timeout() + Duration::from_secs(5);
-        while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
-            match listener.wait(POLL) {
+        let deadline = Instant::now() + timeout();
+        loop {
+            match child.wait_for_exit(Duration::ZERO) {
+                Ok(Some(exit)) => return exit,
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = child.kill_and_reap(Duration::from_secs(5));
+                    panic!("wait: {e}")
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                let _ = child.kill_and_reap(Duration::from_secs(5));
+                panic!("the container process did not exit within {:?}", timeout());
+            }
+            match listener.wait(POLL.min(deadline - now)) {
                 Ok(ListenerReadiness::Readable) => {}
                 Ok(ListenerReadiness::Idle) => continue,
-                // 利用者の消滅（子の終了）か読めない状態。以後の通知は来ない。
+                // 利用者の消滅（子の終了）か読めない状態。以後の通知は来ない。終了状態の回収へ進む。
                 _ => break,
             }
             let notification = match listener.receive() {
@@ -3323,31 +3345,10 @@ mod linux {
             }
             let _ = listener.deny_eperm(id);
         }
-    }
-
-    /// 応答者のスレッドの停止用ハンドル。
-    struct Responder {
-        stop: Arc<AtomicBool>,
-        handle: std::thread::JoinHandle<()>,
-    }
-
-    impl Responder {
-        /// 応答者を起動する。`fork` の後（子を作った後）に呼ぶこと（`fork_single_threaded` は単一スレッドを要求する）。
-        fn start(listener: SeccompListener, relay: Arc<ControlAuditRelay>) -> Self {
-            let stop = Arc::new(AtomicBool::new(false));
-            let flag = Arc::clone(&stop);
-            let container = ContainerId::new(AUDIT_CONTAINER_ID).expect("harness container id");
-            let handle = std::thread::spawn(move || {
-                respond_loop(&listener, relay.as_ref(), &container, &flag);
-            });
-            Responder { stop, handle }
-        }
-
-        /// 停止を指示して join する。ループは 100 ms ごとに停止を見る。
-        fn finish(self) {
-            self.stop.store(true, Ordering::Release);
-            self.handle.join().expect("the responder thread panicked");
-        }
+        child.wait_timeout(timeout()).unwrap_or_else(|e| {
+            let _ = child.kill_and_reap(Duration::from_secs(5));
+            panic!("wait: {e}")
+        })
     }
 
     /// 子（コンテナ）で攻撃を実行するシナリオ（`CaseBody::Probe` / `ProbeWithSeccompListener`）。
@@ -3398,15 +3399,12 @@ mod linux {
             attack(&recorder, &attack_canary);
         };
         let stages = (case.stages)();
-        let (child, responder) = match case.body {
+        let (child, listener) = match case.body {
             CaseBody::ProbeWithSeccompListener => {
                 let (child, listener) =
                     spawn_container_probe_with_seccomp_listener(rootfs, stages, probe)
                         .unwrap_or_else(|e| panic!("spawn with the seccomp listener: {e}"));
-                // 応答者は子を作った後に立てる。子は listener の ACK を受けた後に拒否対象の syscall を発行し、
-                // 通知は応答者が読むまでカーネル内で保留される（ENOSYS にならない）。
-                let relay = relay.expect("a listener case records to the state root");
-                (child, Some(Responder::start(listener, relay)))
+                (child, Some(listener))
             }
             CaseBody::Probe => (
                 spawn_container_probe(rootfs, stages, probe)
@@ -3416,40 +3414,40 @@ mod linux {
             CaseBody::StartRejection => unreachable!("handled by start_rejection"),
         };
         let child_pid = child.pid();
-        // seccomp の記録の期待値: 子自身の PID namespace での pid。応答者が通知を読むまで子の最初の拒否は
-        // 保留されるが、念のため応答者の起動前（ここ）に外側から独立に読む。listener を使わないケースは不要。
+        // seccomp の記録の期待値: 子自身の PID namespace での pid。子の最初の拒否は応答ループが読むまで
+        // 保留されるため、ループの開始前（ここ）に外側から独立に読む。listener を使わないケースは不要。
         let pid_in_ns = (case.body == CaseBody::ProbeWithSeccompListener)
             .then(|| pid_in_own_ns(child_pid))
             .flatten();
-        // パイプ容量を超える記録でも子が write で詰まらないよう、子の待機と並行して別スレッドで読む（REPAIR-5）。
-        // fork は単一スレッド必須（`fork_single_threaded` が Threads: 1 を要求）のため、読み取りスレッドは fork の後に起動する。
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut text = String::new();
-            let res = reader
-                .take(RECORD_MAX_BYTES as u64 + 1)
-                .read_to_string(&mut text)
-                .map(|_| text);
-            let _ = tx.send(res);
-        });
-        let exit = child.wait_timeout(timeout()).unwrap_or_else(|e| {
-            let _ = child.kill_and_reap(Duration::from_secs(5));
-            panic!("wait: {e}")
-        });
-        if let Some(responder) = responder {
-            responder.finish();
-        }
+        // このプロセスは `isolate()` で PID namespace を unshare 済みのため、スレッドを作れない（`clone(2)` の
+        // `CLONE_THREAD` は EINVAL）。応答と回収は単一スレッドで行う。
+        let exit = match listener {
+            Some(listener) => {
+                // 子は listener の ACK を受けた後に拒否対象の syscall を発行し、通知は読まれるまでカーネル内で保留される。
+                let relay = relay.expect("a listener case records to the state root");
+                let container = ContainerId::new(AUDIT_CONTAINER_ID).expect("harness container id");
+                respond_loop(&child, &listener, relay.as_ref(), &container)
+            }
+            None => child.wait_timeout(timeout()).unwrap_or_else(|e| {
+                let _ = child.kill_and_reap(Duration::from_secs(5));
+                panic!("wait: {e}")
+            }),
+        };
         let exit = match exit {
             ChildExit::Exited(c) => ObservedExit::Exited(c),
             ChildExit::Signaled(s) => ObservedExit::Signaled(s),
             other => panic!("unexpected child exit {other:?}"),
         };
 
-        // 上限 + 1 バイトで打ち切り（超過は記録として不正）。子孫が writer を保持し続けても EOF 待ちで
-        // 無期限にブロックしないよう、回収には期限を設けて超過なら失敗にする。
-        let text = rx
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap_or_else(|e| panic!("record read did not finish in time: {e}"))
+        // 子（新しい PID namespace の PID 1）が終了すると、カーネルは namespace 内の全プロセスを終わらせて回収してから
+        // 終了を親へ報告する（`zap_pid_ns_processes`）。親側の writer は fork 時に閉じ済みなので、回収後は EOF に
+        // 直ちに届き、期限なしで読んでもブロックしない（REPAIR-5。全体の上限は dispatcher の `wait_deadline`）。
+        // 子は 16 KiB 以下しか書かず（`RECORD_MAX_BYTES`）既定の pipe 容量より小さいため、読み手がいなくても詰まらない。
+        // 上限 + 1 バイトで打ち切り、超過は記録として不正にする。
+        let mut text = String::new();
+        reader
+            .take(RECORD_MAX_BYTES as u64 + 1)
+            .read_to_string(&mut text)
             .expect("read record");
         // outcome 欠落は `judge` が終了状態と突き合わせて判定する（シグナル終了では行が残らないことがある）。
         let record = parse_record(&text)

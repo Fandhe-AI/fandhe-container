@@ -1188,30 +1188,40 @@ mod tests {
         );
     }
 
-    // ---- exec の受け渡し（SEC-4・SUP-6・#2385）。worker の代役を単一スレッドの fork 子で立てる。----
+    // ---- exec の受け渡し（SEC-4・SUP-6・#2385）。worker の代役を同一プロセス内のスレッドで立てる。----
+    //
+    // libtest は多スレッドで走るため、`fork` を伴う代役は単一スレッド検査（`Threads: 1`）を満たせない。検査を迂回して
+    // fork すると、子が他スレッドの握るロックを継承して停止したり、並行する試験の fd を継承して EOF 検出が遅れたりする。
+    // そのため fork せず、受け渡しの送信側（worker の役）をスレッドで動かす。送信元 pid の照合（SO_PEERCRED）は
+    // 自プロセスの pid と一致する。fork を伴う実プロセスの経路は supervisor の結合試験 `exec_seccomp_listener`
+    // （`harness = false`）が検証する。
 
-    /// 代役の worker を fork し、`(親の受信口, 子のハンドル)` を返す。`body` は子の送信口を受けて終了コードを返す。
+    /// 代役の worker。`pid` は自プロセスのもので、`join` が終了コード（`body` の戻り値）を返す。
+    struct WorkerStandIn {
+        child: ContainerChild,
+        handle: std::thread::JoinHandle<i32>,
+    }
+
+    impl WorkerStandIn {
+        /// スレッドの終了を待って `body` の戻り値を返す（panic は -1）。
+        fn join(self) -> i32 {
+            self.handle.join().unwrap_or(-1)
+        }
+    }
+
+    /// 代役の worker を起動し、`(親の受信口, 代役)` を返す。`body` は子の送信口を受けて終了コードを返す。
     fn fork_worker_stand_in(
-        body: impl FnOnce(ExecListenerSender) -> i32,
-    ) -> (ExecListenerReceiver, ContainerChild) {
+        body: impl FnOnce(ExecListenerSender) -> i32 + Send + 'static,
+    ) -> (ExecListenerReceiver, WorkerStandIn) {
         let (receiver, child_end) = exec_listener_pair().unwrap();
-        let parent_fd = receiver.raw_fd();
-        let pid = sys::fork_single_threaded_with(
-            || true,
-            move || {
-                if u32::try_from(parent_fd)
-                    .ok()
-                    .and_then(|n| sys::close_fd_number(n).ok())
-                    .is_none()
-                {
-                    return 7;
-                }
-                body(exec_sender_from(child_end))
+        let handle = std::thread::spawn(move || body(exec_sender_from(child_end)));
+        (
+            receiver,
+            WorkerStandIn {
+                child: ContainerChild::spawned(std::process::id()),
+                handle,
             },
-            7,
         )
-        .unwrap();
-        (receiver, ContainerChild::spawned(pid))
     }
 
     /// 子の中で実 listener を作る（NNP を立て、ERRNO 版の filter を `NEW_LISTENER` 付きで載せる）。
@@ -1224,7 +1234,7 @@ mod tests {
     /// SEC-4・SUP-6（#2385）: 実 listener を受け取って検証し、worker は ACK を受けて 0 で終わる。
     #[test]
     fn sec4_sup6_2385_exec_receiver_gets_a_verified_listener() {
-        let (receiver, child) = fork_worker_stand_in(|sender| {
+        let (receiver, stand_in) = fork_worker_stand_in(|sender| {
             let Some(listener) = child_listener() else {
                 return 10;
             };
@@ -1236,7 +1246,7 @@ mod tests {
                 Err(_) => 11,
             }
         });
-        match receiver.receive(&child, Instant::now() + Duration::from_secs(20)) {
+        match receiver.receive(&stand_in.child, Instant::now() + Duration::from_secs(20)) {
             ListenerReceipt::Received(l) => {
                 let kind =
                     std::fs::read_link(format!("/proc/self/fd/{}", l.as_fd().as_raw_fd())).unwrap();
@@ -1244,34 +1254,31 @@ mod tests {
             }
             other => panic!("unexpected receipt: {other:?}"),
         }
-        assert_eq!(
-            child.wait_timeout(Duration::from_secs(10)).unwrap(),
-            crate::exec::ChildExit::Exited(0)
-        );
+        assert_eq!(stand_in.join(), 0);
     }
 
     /// SEC-4・SUP-6（#2385）: worker が何も送らずに終わると `SenderClosed`（期限を待たない）。
     #[test]
     fn sec4_sup6_2385_exec_receiver_reports_sender_closed() {
-        let (receiver, child) = fork_worker_stand_in(|sender| {
+        let (receiver, stand_in) = fork_worker_stand_in(|sender| {
             drop(sender);
             0
         });
         let started = Instant::now();
-        let receipt = receiver.receive(&child, Instant::now() + Duration::from_secs(30));
+        let receipt = receiver.receive(&stand_in.child, Instant::now() + Duration::from_secs(30));
         assert!(
             matches!(receipt, ListenerReceipt::SenderClosed),
             "{receipt:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(5));
-        let _ = child.wait_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(stand_in.join(), 0);
     }
 
     /// SEC-4・SUP-6（#2385）: listener でない fd は `Rejected`（段 `Seccomp`）。親が閉じると worker の ACK 待ちは
     /// HUP で期限より前に終わる。
     #[test]
     fn sec4_sup6_2385_exec_receiver_rejects_a_non_listener_fd() {
-        let (receiver, child) = fork_worker_stand_in(|sender| {
+        let (receiver, stand_in) = fork_worker_stand_in(|sender| {
             let (sender, _) = sender.into_parts();
             let (r, _w) = std::io::pipe().unwrap();
             let fd = OwnedFd::from(r);
@@ -1282,7 +1289,7 @@ mod tests {
             }
         });
         let started = Instant::now();
-        match receiver.receive(&child, Instant::now() + Duration::from_secs(20)) {
+        match receiver.receive(&stand_in.child, Instant::now() + Duration::from_secs(20)) {
             ListenerReceipt::Rejected(e) => {
                 assert_eq!(e.stage, IsolationStage::Seccomp);
                 assert_eq!(e.code, ErrorCode::Internal);
@@ -1293,22 +1300,21 @@ mod tests {
             }
             other => panic!("unexpected receipt: {other:?}"),
         }
-        assert_eq!(
-            child.wait_timeout(Duration::from_secs(10)).unwrap(),
-            crate::exec::ChildExit::Exited(0)
-        );
+        assert_eq!(stand_in.join(), 0);
         assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     /// REPAIR-5・SEC-4（#2385）: 何も届かず眠る worker は期限で `TimedOut`（段 `Seccomp`・`Timeout`）。
     #[test]
     fn sec4_sup6_2385_exec_receiver_times_out() {
-        let (receiver, child) = fork_worker_stand_in(|sender| {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (receiver, stand_in) = fork_worker_stand_in(move |sender| {
             let _keep = sender;
-            std::thread::sleep(Duration::from_secs(30));
+            let _ = released.recv_timeout(Duration::from_secs(30));
             0
         });
-        let receipt = receiver.receive(&child, Instant::now() + Duration::from_millis(150));
+        let receipt =
+            receiver.receive(&stand_in.child, Instant::now() + Duration::from_millis(150));
         match receipt {
             ListenerReceipt::TimedOut(e) => {
                 assert_eq!(e.code, ErrorCode::Timeout);
@@ -1316,7 +1322,8 @@ mod tests {
             }
             other => panic!("unexpected receipt: {other:?}"),
         }
-        child.kill_and_reap(Duration::from_secs(5)).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(stand_in.join(), 0);
     }
 
     /// REPAIR-5（#2385）: ACK 待ちの上限は、全体の期限が近ければその残り（`ACK_TIMEOUT` を超えない）。

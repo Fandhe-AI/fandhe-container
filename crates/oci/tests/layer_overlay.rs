@@ -377,6 +377,91 @@ fn oci1_replacement_entry_with_parent_dir_is_rejected() {
     assert_eq!(std::fs::read(t.root().join("d/x")).unwrap(), b"x");
 }
 
+/// `base` の FS が `a` と `b` を同じ名前として解決するか（`a` を作って `b` で引く。後始末する）。
+fn resolves_as_same(base: &Path, a: &str, b: &str) -> bool {
+    std::fs::write(base.join(a), b"p").unwrap();
+    let same = std::fs::symlink_metadata(base.join(b)).is_ok();
+    std::fs::remove_file(base.join(a)).unwrap();
+    same
+}
+
+/// `base` 直下の名前の集合（root の外が変わっていないことの照合用）。
+fn names_at(base: &Path) -> BTreeSet<String> {
+    std::fs::read_dir(base)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect()
+}
+
+/// IO-5・OCI-1・OCI-2: 上位レイヤーが別表記（大文字小文字・NFC / NFD）の名前のファイルで下位の中身のある
+/// ディレクトリを置き換えようとする場合を、公開 API で実 FS に対して確かめる。ホスト FS で分岐する。
+/// 別表記を同じ名前と解決する FS は拒否（`ALREADY_EXISTS`）され下位の木が残り、区別する FS は別名として
+/// 並存する。区別しない FS の挙動はホストに依らない形で `extract.rs` の単体テスト（`folding_lstat`）が照合し、
+/// ここは実 FS での確認（Linux の PR CI は区別する側だけ。macOS / Windows の側は main の 3 OS 実行と
+/// `io5_default_host_fs_folds_spelling_variants` で固定する）。
+#[test]
+fn io5_oci1_upper_alias_file_over_lower_dir_follows_destination_fs() {
+    for (case, lower, upper) in [("case", "d", "D"), ("nfd", "caf\u{e9}", "cafe\u{301}")] {
+        let t = Tmp::new(&format!("alias-{case}"));
+        let ld = format!("{lower}/");
+        let lx = format!("{lower}/x");
+        let ly = format!("{lower}/sub/y");
+        let l1 = layer_gz(&[
+            E::Dir(&ld, 0o755),
+            E::File(&lx, 0o644, b"x"),
+            E::File(&ly, 0o644, b"y"),
+            E::File("keep", 0o644, b"k"),
+        ]);
+        let l2 = layer_gz(&[E::File(upper, 0o644, b"file-upper")]);
+        let b1 = t.blob("l1.tar.gz", &l1);
+        let b2 = t.blob("l2.tar.gz", &l2);
+        let same = resolves_as_same(&t.base, lower, upper);
+        let r = extract_layer_blobs(&[b1.as_path(), b2.as_path()], &t.root(), 1 << 20, limits());
+        let mut expect: BTreeSet<String> = [lower, &format!("{lower}/sub"), &ly, &lx, "keep"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        if same {
+            let e = r.expect_err(case);
+            assert_eq!(e.code(), OciErrorCode::AlreadyExists, "{case}");
+            assert_eq!(e.code().as_str(), "ALREADY_EXISTS", "{case}");
+            assert_eq!(
+                e.message(),
+                "entry name resolves to an existing entry with a different spelling \
+                 (case or Unicode normalization) on the destination filesystem",
+                "{case}"
+            );
+        } else {
+            r.expect(case);
+            expect.insert(upper.to_string());
+            assert_eq!(
+                std::fs::read(t.root().join(upper)).unwrap(),
+                b"file-upper",
+                "{case}"
+            );
+        }
+        assert_eq!(tree(&t.root()), expect, "{case}");
+        assert_eq!(std::fs::read(t.root().join(&lx)).unwrap(), b"x", "{case}");
+        assert_eq!(std::fs::read(t.root().join(&ly)).unwrap(), b"y", "{case}");
+        let outside: BTreeSet<String> = ["l1.tar.gz", "l2.tar.gz", "root"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(names_at(&t.base), outside, "{case}");
+    }
+}
+
+/// IO-5: macOS / Windows の既定の一時領域は別表記を同じ名前と解決する。上の試験が拒否の側を実際に通ることを
+/// 固定する（大文字小文字は両 OS、NFC / NFD は macOS の APFS のみ）。
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn io5_default_host_fs_folds_spelling_variants() {
+    let t = Tmp::new("alias-host");
+    assert!(resolves_as_same(&t.base, "d", "D"));
+    #[cfg(target_os = "macos")]
+    assert!(resolves_as_same(&t.base, "caf\u{e9}", "cafe\u{301}"));
+}
+
 /// OCI-1: 下位の symlink を経由してもルート外へは書けない（上位レイヤーの絶対 symlink 先もルートに閉じる）。
 #[cfg(unix)]
 #[test]

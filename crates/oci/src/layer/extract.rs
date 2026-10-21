@@ -4929,6 +4929,65 @@ mod tests {
         assert_eq!(names_in(&sb.root), vec!["f"]);
     }
 
+    /// 別表記の衝突として拒否されたこと（レイヤー積み上げ版。`code` と `message` の具体値）を確かめる。
+    fn assert_stack_spelling_collision(r: Result<Vec<ExtractedLayer>, OciError>) {
+        let e = r.expect_err("must be rejected as a spelling collision");
+        assert_eq!(e.code(), OciErrorCode::AlreadyExists);
+        assert_eq!(e.code().as_str(), "ALREADY_EXISTS");
+        assert_eq!(
+            e.message(),
+            "entry name resolves to an existing entry with a different spelling \
+             (case or Unicode normalization) on the destination filesystem"
+        );
+    }
+
+    /// IO-5・OCI-1・OCI-2: 区別しない FS（`folding_lstat` の模擬。ホスト FS に依らない）で、上位レイヤーが
+    /// 別表記（大文字小文字・NFC / NFD）の名前のエントリで下位の中身のあるディレクトリを置き換えようとすると、
+    /// Changeset の置換（再帰削除）に入る前に拒否される。下位の木は残り、ルート外は変わらない。
+    #[test]
+    fn io5_stack_alias_entry_replacing_lower_dir_is_rejected() {
+        // (case, 下位ディレクトリ名, 上位エントリ名)
+        let names = [("case", "d", "D"), ("nfc-nfd", "caf\u{e9}", "cafe\u{301}")];
+        for (case, lower, upper) in names {
+            let uppers: Vec<(&str, Vec<u8>)> = vec![
+                ("file", file(upper, 0o644, b"file-upper")),
+                ("hardlink", hardlink(upper, "keep")),
+            ];
+            for (kind, upper_entry) in uppers {
+                let sb = Sandbox::new();
+                let lower_dir = format!("{lower}/");
+                let lower_x = format!("{lower}/x");
+                let lower_y = format!("{lower}/sub/y");
+                let r = run_stack(
+                    &sb,
+                    &[
+                        vec![
+                            dir(&lower_dir, 0o755),
+                            file(&lower_x, 0o644, b"x"),
+                            file(&lower_y, 0o644, b"y"),
+                            file("keep", 0o644, b"k"),
+                        ],
+                        vec![upper_entry],
+                    ],
+                    LIM(),
+                    folding_lstat,
+                );
+                assert_stack_spelling_collision(r);
+                let msg = format!("case={case} kind={kind}");
+                let mut expect = vec![lower.to_string(), "keep".to_string()];
+                expect.sort();
+                assert_eq!(names_in(&sb.root), expect, "{msg}");
+                let ld = sb.root.join(lower);
+                assert!(fs::symlink_metadata(&ld).unwrap().is_dir(), "{msg}");
+                assert_eq!(names_in(&ld), vec!["sub", "x"], "{msg}");
+                assert_eq!(fs::read(ld.join("x")).unwrap(), b"x", "{msg}");
+                assert_eq!(fs::read(ld.join("sub/y")).unwrap(), b"y", "{msg}");
+                assert_eq!(fs::read(sb.root.join("keep")).unwrap(), b"k", "{msg}");
+                sb.assert_outside_untouched();
+            }
+        }
+    }
+
     /// OCI-1: 上位レイヤーの `..` は既存どおり拒否され、ルート外へは何も書かれない。
     #[test]
     fn oci1_stack_upper_layer_traversal_is_rejected() {

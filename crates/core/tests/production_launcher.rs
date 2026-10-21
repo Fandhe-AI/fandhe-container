@@ -2081,7 +2081,9 @@ mod linux {
                     {
                         lines.push(line);
                     }
-                    reader.join().expect("join diagnostic reader");
+                    // 書き込み側が開いたままだと read_line が戻らず join が無期限になり得る（REPAIR-5）。
+                    // 診断用のため join せず切り離す（スレッドは読み取り終了かテストプロセス終了で消える）。
+                    drop(reader);
                 }
                 assert_eq!(
                     exit.expect("wait"),

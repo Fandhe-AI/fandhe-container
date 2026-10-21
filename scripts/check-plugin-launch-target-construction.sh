@@ -11,7 +11,10 @@
 # 合格条件（許可リストはパスで持つ。下の判定規則を参照）:
 #   definition  crates/plugin/src/lifecycle/launch_target.rs
 #               試験領域の外の定義 `fn from_verified_file` が全体でちょうど 1 件。それ以外の一致は試験領域内のみ
-#               （構築口の定義と plugin crate 自身の単体テスト）
+#               （構築口の定義と plugin crate 自身の単体テスト）。あわせて試験領域外で、戻り値に Self /
+#               PluginLaunchTarget を含む fn がちょうど 1 件（from_verified_file）・構造体リテラル（`Self {` /
+#               `PluginLaunchTarget {`）がちょうど 2 件（その本体の cfg(unix) / cfg(not(unix)) の 2 分岐）。
+#               外部ファイルの子モジュール（`mod x;`）・`include!`・`#[path]` は禁止（private フィールドに触れられるため）
 #   production  crates/core/src/plugin.rs
 #               試験領域の外の一致がちょうど 1 件・試験領域内は 0 件（#1320 の決定による唯一の本番の変換）
 #   test-src    crates/plugin/src/ 配下（definition のファイルを除く）
@@ -29,14 +32,18 @@
 # 文字列やコメントの中の属性は無視し、ファイル末で文字列・ブロックコメントが閉じない場合は判定不能として NG にする。項目が 1 行で終わるもの（`;` 終わり・括弧が 1 行で閉じるもの）はその行だけ。
 # それ以外は、次の column 0 の行のうち空行・`//`・`)`・`]` で始まらない最初の行まで。その行が `}` で始まれば
 # 含めて閉じ、別の項目なら手前で閉じる。ファイル先頭の `#![cfg(test)]`・`#![cfg(all(test` はファイル全体。
-# `cfg(any(test, ...))` は試験専用とみなさない。判定の誤りは領域を早く閉じる方向（失敗側）にしか働かない。
+# `cfg(any(test, ...))` は試験専用とみなさない。column 0 の属性が同じ行で閉じ、その後ろにコードが続く行
+# （`#[cfg(test)] fn a() {}` 等）は試験領域を開かず、未分類として失敗にする。この扱いと rustfmt の整形
+# （column 0 の規則）を前提に、判定の誤りは領域を早く閉じる方向（失敗側）にしか働かない。
 #
 # fail-closed（非 0 で終了）: 定義が 1 件でない・definition / production のファイルが無い・件数の不一致・
-# 走査対象が読めない・*.rs が通常ファイルでない・走査件数 0・crates が無い。
+# 走査対象が読めない・*.rs が通常ファイルでない・走査件数 0・crates が無い・構築関数 / 構造体リテラルの件数不一致・
+# 未分類の属性行・symlink のディレクトリ（find が辿らず走査できないため）。
 #
 # 限界（REPAIR-3。実装済みを装わない）: `include!` と `#[path]` で走査範囲の外のファイルを取り込む場合と、
-# build.rs が OUT_DIR に生成するコードは見ない。構造体リテラルでの構築は private フィールドで型が防ぐため、
-# 走査するのは関数名だけ。試験領域の判定は rustfmt の整形（column 0 の規則）が前提。
+# build.rs が OUT_DIR に生成するコードは見ない。定義ファイル内の構築は関数の戻り値とリテラルの件数で判定し、
+# 型エイリアス（`type X = PluginLaunchTarget;`）経由のリテラルと、既存値のフィールド書き換え（`&mut self`）は見ない。
+# 試験領域の判定は rustfmt の整形（column 0 の規則）が前提。
 #
 # 使い方: check-plugin-launch-target-construction.sh [--root <dir>]（既定はこのスクリプトの 1 つ上）。
 # 終了コード: 0 合格 / 1 違反または fail-closed / 2 usage。bash 3.2・BSD / Git Bash でも動く書き方にする。
@@ -46,6 +53,10 @@ export LC_ALL=C
 
 DEF_FILE="crates/plugin/src/lifecycle/launch_target.rs"
 PROD_FILE="crates/core/src/plugin.rs"
+# 定義ファイルの試験領域外の期待件数。構築関数は from_verified_file の 1 件、構造体リテラルはその本体の
+# `#[cfg(unix)]` / `#[cfg(not(unix))]` の 2 分岐の各 1 件。分岐を変えたらレビューつきで本定数を更新する。
+EXPECTED_CONSTRUCTORS=1
+EXPECTED_LITERALS=2
 
 usage() {
   echo "usage: $0 [--root <dir>]" >&2
@@ -94,6 +105,10 @@ while IFS= read -r d; do
   find "${d}" \( -type d \( -name target -o -name .git \) -prune \) -o -name '*.rs' -print0 >>"${list}" || {
     ng "failed to scan ${d#"${root}"/}"
   }
+  # symlink のディレクトリは find が辿らず走査できないため、あれば失敗にする（*.rs の symlink は -f で実体を読む）。
+  while IFS= read -r -d '' l; do
+    if [ -d "${l}" ]; then ng "${l#"${root}"/}: symlinked directory is not scanned"; fi
+  done < <(find "${d}" \( -type d \( -name target -o -name .git \) -prune \) -o -type l -print0)
 done <<EOF
 ${dirs}
 EOF
@@ -154,12 +169,27 @@ function lex(line,    out, n, i, c, c2, j, k, m, prev) {
   return out
 }
 function strip_cr() { sub(/\r$/, "", $0) }
-BEGIN { all_test = 0; state = 0; mode = 0; depth = 0; rawhash = 0; rawpat = ""; spaces = sprintf("%400s", "") }
+# column 0 の属性が同じ行で閉じ、閉じ括弧の後ろに空白以外（コード）が残るなら 1。
+# 試験属性と項目が 1 行に詰まった行を試験領域の判定に混ぜないため（未分類として失敗させる）。
+function attr_trailing(s,    i, n, d, c) {
+  if (s !~ /^#!?\[/) return 0
+  n = length(s); d = 0
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1)
+    if (c == "[") d++
+    else if (c == "]") { d--; if (d == 0) return (substr(s, i + 1) !~ /^[ \t]*$/) }
+  }
+  return 0
+}
+function count_ch(s, ch,    t) { t = s; return gsub(ch, "", t) }
+BEGIN { all_test = 0; is_fvf = 0; fvf = 0; fvf_d = 0; fvf_seen = 0; cur_fn = ""; state = 0; mode = 0; depth = 0; rawhash = 0; rawpat = ""; spaces = sprintf("%400s", "") }
 {
   strip_cr()
   orig = $0
   line = lex(orig)
-  if (line ~ /^#!\[cfg\((test\)|all\(test[,)])/) all_test = 1
+  a_trail = attr_trailing(line)
+  if (a_trail) print NR, "A"
+  if (!a_trail && line ~ /^#!\[cfg\((test\)|all\(test[,)])/) all_test = 1
   # state: 0=通常 1=試験属性の直後（項目待ち） 2=複数行の試験項目の中
   if (state == 2) {
     if (line ~ /^[^ \t]/ && line !~ /^\/\// && line !~ /^\)/ && line !~ /^\]/) {
@@ -167,11 +197,11 @@ BEGIN { all_test = 0; state = 0; mode = 0; depth = 0; rawhash = 0; rawpat = ""; 
       else { state = 0; in_test_line = 0 }
     } else { in_test_line = 1 }
   } else { in_test_line = 0 }
-  if (state == 0 && line ~ /^#\[cfg\((test\)\]|all\(test[,)])/ ) {
+  if (state == 0 && !a_trail && line ~ /^#\[cfg\((test\)\]|all\(test[,)])/ ) {
     state = 1
     in_test_line = 0
   } else if (state == 1) {
-    if (line ~ /^#\[/ || line ~ /^[ \t]*$/ || line ~ /^\/\//) {
+    if ((line ~ /^#\[/ && !a_trail) || line ~ /^[ \t]*$/ || line ~ /^\/\//) {
       in_test_line = 0
     } else {
       in_test_line = 1
@@ -181,11 +211,47 @@ BEGIN { all_test = 0; state = 0; mode = 0; depth = 0; rawhash = 0; rawpat = ""; 
       else state = 2
     }
   }
+  region = (all_test || in_test_line)
+  if (is_def && !region) {
+    # 定義ファイルの試験領域外: 構築関数（戻り値に Self / PluginLaunchTarget を含む fn）・構造体リテラル・
+    # 外部ファイルの子モジュールを数える。private フィールドへ触れられるのはこのファイルの中だけのため、
+    # from_verified_file 以外の構築は件数と名前で失敗させる。
+    if (match(line, /(^|[^A-Za-z0-9_])fn[ \t]+[A-Za-z0-9_]+/)) {
+      t0 = substr(line, RSTART, RLENGTH)
+      sub(/^.*fn[ \t]+/, "", t0)
+      cur_fn = t0
+    }
+    if (line ~ /(^|[^A-Za-z0-9_])fn[ \t]+from_verified_file([^A-Za-z0-9_]|$)/) { fvf = 1; fvf_d = 0; fvf_seen = 0 }
+    in_fvf = 0
+    if (fvf) {
+      in_fvf = 1
+      o = count_ch(line, "\\{"); c = count_ch(line, "\\}")
+      fvf_d += o - c
+      if (o > 0) fvf_seen = 1
+      if (fvf_seen && fvf_d <= 0) fvf = 0
+    }
+    if (index(line, "->") > 0) {
+      rs = line
+      while ((pp = index(rs, "->")) > 0) rs = substr(rs, pp + 2)
+      sub(/[{;].*/, "", rs)
+      sub(/[ \t]where[ \t].*/, "", rs)
+      gsub("\047[A-Za-z_]+", "", rs)
+      gsub(/&[ \t]*(mut[ \t]+)?(Self|PluginLaunchTarget)/, "", rs)
+      if (rs ~ /(^|[^A-Za-z0-9_])(Self|PluginLaunchTarget)([^A-Za-z0-9_]|$)/) print NR, "F", cur_fn
+    }
+    lt = line
+    gsub(/(struct|enum|union|trait|impl|for)[ \t]+PluginLaunchTarget/, "X", lt)
+    gsub(/->[ \t]*(Self|PluginLaunchTarget)/, "->X", lt)
+    while (match(lt, /(^|[^A-Za-z0-9_])(Self|PluginLaunchTarget)[ \t]*\{/)) {
+      print NR, "L", in_fvf
+      lt = substr(lt, RSTART + RLENGTH)
+    }
+    if (line ~ /^[ \t]*(pub(\([^)]*\))?[ \t]+)?mod[ \t]+[A-Za-z0-9_]+[ \t]*;/ || line ~ /include!/ || line ~ /#\[[ \t]*path/) print NR, "M"
+  }
   tmp = orig
   sub(/^[ \t]+/, "", tmp)
   if (tmp ~ /^\/\//) next
   if (orig !~ /(^|[^A-Za-z0-9_])from_verified_file([^A-Za-z0-9_]|$)/) next
-  region = (all_test || in_test_line)
   if (!region && orig ~ /(^|[^A-Za-z0-9_])fn[ \t]+from_verified_file([^A-Za-z0-9_]|$)/) print NR, "D"
   else if (region) print NR, "T"
   else print NR, "P"
@@ -198,6 +264,8 @@ def_count=0
 def_in_def_file=0
 prod_p=0
 prod_t=0
+ctor_count=0
+literal_count=0
 while IFS= read -r -d '' f; do
   rel="${f#"${root}"/}"
   if [ ! -f "${f}" ] || [ ! -r "${f}" ]; then
@@ -205,14 +273,32 @@ while IFS= read -r -d '' f; do
     continue
   fi
   scanned=$((scanned + 1))
-  out="$(awk "${scan_awk}" "${f}")" || {
+  out="$(awk -v is_def="$([ "${rel}" = "${DEF_FILE}" ] && echo 1 || echo 0)" "${scan_awk}" "${f}")" || {
     ng "${rel}: scan failed"
     continue
   }
   [ -n "${out}" ] || continue
-  while read -r ln kind; do
+  while read -r ln kind extra; do
     case "${kind}" in
       U) ng "${rel}: unterminated string or block comment (cannot classify test regions)" ;;
+      A)
+        ng "${rel}:${ln}: attribute followed by code on the same line (cannot classify test regions)"
+        continue
+        ;;
+      F)
+        ctor_count=$((ctor_count + 1))
+        [ "${extra}" = "from_verified_file" ] || ng "${rel}:${ln}: function '${extra}' returns PluginLaunchTarget (only from_verified_file may construct it)"
+        continue
+        ;;
+      L)
+        literal_count=$((literal_count + 1))
+        [ "${extra}" = "1" ] || ng "${rel}:${ln}: PluginLaunchTarget constructed by struct literal outside from_verified_file"
+        continue
+        ;;
+      M)
+        ng "${rel}:${ln}: out-of-file module, include! or #[path] in the definition file is not allowed"
+        continue
+        ;;
       D)
         def_count=$((def_count + 1))
         if [ "${rel}" = "${DEF_FILE}" ]; then def_in_def_file=$((def_in_def_file + 1)); else ng "${rel}:${ln}: from_verified_file defined outside the allowed file"; fi
@@ -248,6 +334,12 @@ done <"${list}"
 if [ "${def_count}" -ne 1 ] || [ "${def_in_def_file}" -ne 1 ]; then
   ng "expected exactly one 'fn from_verified_file' definition in ${DEF_FILE}, found ${def_count}"
 fi
+if [ "${ctor_count}" -ne "${EXPECTED_CONSTRUCTORS}" ]; then
+  ng "${DEF_FILE}: expected ${EXPECTED_CONSTRUCTORS} function returning PluginLaunchTarget outside test regions, found ${ctor_count}"
+fi
+if [ "${literal_count}" -ne "${EXPECTED_LITERALS}" ]; then
+  ng "${DEF_FILE}: expected ${EXPECTED_LITERALS} PluginLaunchTarget struct literals outside test regions, found ${literal_count}"
+fi
 if [ "${prod_p}" -ne 1 ]; then
   ng "${PROD_FILE}: expected exactly one production use of from_verified_file, found ${prod_p}"
 fi
@@ -255,4 +347,4 @@ fi
 if [ "${fail}" -ne 0 ]; then
   exit 1
 fi
-echo "OK: from_verified_file is used only by the core conversion and allowed test code (scanned ${scanned} files)"
+echo "OK: from_verified_file is used only by the core conversion and allowed test code (scanned ${scanned} files, ${ctor_count} constructor, ${literal_count} literals)"

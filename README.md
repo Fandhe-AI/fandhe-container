@@ -68,6 +68,8 @@ make hooks                    # git hooks のみ導入する場合
 make docker-ci                # 開発コンテナ内で make ci を実行（環境非依存の検証）
 ```
 
+`make docker-ci` は Docker の既定 seccomp プロファイルを保ったまま動くため、`kcmp` を対照に使う seccomp 系の結合試験（`exec_restrictions_reapply`・`seccomp_enforcement` など）は `PRECONDITION FAILED (test environment ...)` で失敗することがあります。これはリグレッションではなく試験環境の前提欠如で、skip も除外もしません（方針は #2235）。ホストで該当試験を個別に実行するか CI に任せてください（見分け方と対処は `AGENTS.md` の「`make docker-ci` の注意」）。
+
 `docs/spec`（`fandhe-container-spec`）は private リポジトリのため、アクセス権のない環境では submodule 取得が失敗します（`make setup` は警告のみで続行します）。実装コードのビルド・テストは `docs/spec` 抜きでも成立するよう維持します。
 
 ビルド成果物（`target/`）は数十 GB に膨らみやすいため、ルート `Cargo.toml` の `[profile.dev.package."*"]` で依存クレート（workspace 外）のデバッグ情報を行番号のみにしています（`dev`・`test` に効き、本リポの crate は full debuginfo のままです。panic 位置・バックトレースの行番号は残り、デバッガで依存の変数・型を見られなくなるだけです）。溜まった古い成果物は `cargo install cargo-sweep` のうえ `cargo sweep --time 14`（14 日以上使われていない成果物を削除）や `cargo sweep --installed`（rustup に現存しないツールチェーンでビルドした成果物を削除）で消せます。

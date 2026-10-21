@@ -98,6 +98,9 @@ pub struct StagingReclamation {
     pub failed: Vec<std::ffi::OsString>,
     /// 走査の上限で打ち切り、残りを調べなかったか。
     pub truncated: bool,
+    /// 親ディレクトリの列挙そのものに失敗した（`read_dir` の失敗・列挙中のエラー）か。
+    /// 失敗した範囲に木が残っていても見えないため、回収は不完全として扱う（REPAIR-4）。
+    pub scan_failed: bool,
 }
 
 impl StagingReclamation {
@@ -108,11 +111,15 @@ impl StagingReclamation {
             && self.kept_unverified.is_empty()
             && self.failed.is_empty())
             || self.truncated
+            || self.scan_failed
     }
 
-    /// 回収が完全でなかったか（消せなかった・確かめられなかった・打ち切った。生きている木は含めない）。
+    /// 回収が完全でなかったか（消せなかった・確かめられなかった・打ち切った・走査に失敗した。
+    /// 生きている木は含めない）。
     pub fn is_incomplete(&self) -> bool {
-        !(self.kept_unverified.is_empty() && self.failed.is_empty()) || self.truncated
+        !(self.kept_unverified.is_empty() && self.failed.is_empty())
+            || self.truncated
+            || self.scan_failed
     }
 }
 
@@ -157,6 +164,7 @@ pub trait ImageRootfsUnpacker {
 pub(super) struct CreatedRootfs {
     path: PathBuf,
     backing: imp::Backing,
+    #[cfg_attr(not(test), allow(dead_code))]
     reclamation: StagingReclamation,
 }
 
@@ -219,16 +227,30 @@ fn split_target(bundle: &Path, root_path: &Path) -> Result<Vec<std::ffi::OsStrin
 /// symlink / junction を拒否）に加え、末尾が既に存在すれば `AlreadyExists` で拒否して利用者の既存データへ
 /// 展開しない。相対部分が空（rootfs が bundle そのもの）は拒否する。作成の前に、同じ親の下の持ち主のいない
 /// 展開途中の木を回収する（結果は [`CreatedRootfs::reclamation`]。#2379・OCI-7）。
+#[cfg(test)]
 pub(super) fn prepare_rootfs_target(
     bundle: &Path,
     root_path: &Path,
+) -> Result<CreatedRootfs, TraitError> {
+    prepare_rootfs_target_with(bundle, root_path, &|reap| reap())
+}
+
+/// 回収の実処理を包む関数。回収を呼んだ結果をそのまま返す。
+pub(super) type ReapHook<'a> = &'a dyn Fn(&dyn Fn() -> StagingReclamation) -> StagingReclamation;
+
+/// [`prepare_rootfs_target`] の本体。`reap_hook` は回収の実処理（走査と再帰削除）を引数に取って呼ぶ関数で、
+/// 呼び出し元が計測区間で包める（その後の作成が失敗しても、回収の結果と所要時間を記録できる。REPAIR-4）。
+pub(super) fn prepare_rootfs_target_with(
+    bundle: &Path,
+    root_path: &Path,
+    reap_hook: ReapHook<'_>,
 ) -> Result<CreatedRootfs, TraitError> {
     let parts = split_target(bundle, root_path)?;
     let Some((last, parents)) = parts.split_last() else {
         return Err(invalid("rootfs must be a directory below the bundle"));
     };
     let parents: Vec<&std::ffi::OsStr> = parents.iter().map(|p| p.as_os_str()).collect();
-    let (backing, reclamation) = imp::create_dir(bundle, &parents, last)?;
+    let (backing, reclamation) = imp::create_dir(bundle, &parents, last, reap_hook)?;
     // 正規化した（Normal 要素だけの）経路。
     let path = parts.iter().fold(bundle.to_path_buf(), |mut p, part| {
         p.push(part);
@@ -275,6 +297,7 @@ impl CreatedRootfs {
     }
 
     /// 作成の前に同じ親の下で回収した、持ち主のいない展開途中の木の結果（#2379・OCI-7）。
+    #[cfg(test)]
     pub(super) fn reclamation(&self) -> &StagingReclamation {
         &self.reclamation
     }
@@ -484,6 +507,7 @@ mod imp {
     fn reap_under(cur: BorrowedFd<'_>) -> StagingReclamation {
         let mut result = StagingReclamation::default();
         let Ok(rd) = std::fs::read_dir(format!("/proc/self/fd/{}", cur.as_raw_fd())) else {
+            result.scan_failed = true;
             return result;
         };
         let mut names: Vec<OsString> = Vec::new();
@@ -492,7 +516,10 @@ mod imp {
                 result.truncated = true;
                 break;
             }
-            let Ok(ent) = ent else { continue };
+            let Ok(ent) = ent else {
+                result.scan_failed = true;
+                continue;
+            };
             let name = ent.file_name();
             if is_staging_name(name.as_bytes()) {
                 names.push(name);
@@ -567,10 +594,11 @@ mod imp {
         bundle: &Path,
         parents: &[&OsStr],
         last: &OsStr,
+        reap_hook: super::ReapHook<'_>,
     ) -> Result<(Backing, StagingReclamation), TraitError> {
         let cur = open_parent(bundle, parents)?;
         // 同じ親の下に残った、持ち主のいない展開途中の木を先に回収する（PID の再利用による名前の衝突も解く）。
-        let reclamation = reap_under(cur.as_fd());
+        let reclamation = reap_hook(&|| reap_under(cur.as_fd()));
         let final_name = cstr(last)?;
         // 最終の名前が既にあれば展開せずに拒否する（利用者の既存データへ展開しない。公開時の
         // `RENAME_NOREPLACE` が最終的な排他）。
@@ -779,6 +807,7 @@ mod imp {
         _bundle: &Path,
         _parents: &[&OsStr],
         _last: &OsStr,
+        _reap_hook: super::ReapHook<'_>,
     ) -> Result<(Backing, StagingReclamation), TraitError> {
         Err(TraitError::new(
             ErrorCode::Unimplemented,
@@ -1203,6 +1232,38 @@ mod tests {
         drop(holder);
         let r = reap_stale_unpacks(&b, Path::new("rootfs")).expect("reap");
         assert_eq!(r.reclaimed.len(), 1);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// REPAIR-4・#2379: 親が書込・探索可能だが読めない（走査できない）とき、create は成功するが回収は
+    /// 不完全（`scan_failed`）として報告される。木が無い場合（`is_incomplete() == false`）と区別できる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair4_reap_reports_scan_failure_for_unreadable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = tmp("reap-unreadable");
+        std::fs::create_dir(b.join("p")).expect("p");
+        std::fs::set_permissions(b.join("p"), std::fs::Permissions::from_mode(0o300))
+            .expect("chmod");
+        if std::fs::read_dir(b.join("p")).is_ok() {
+            // root 等で権限が効かない環境では前提を作れない。
+            std::fs::set_permissions(b.join("p"), std::fs::Permissions::from_mode(0o700)).ok();
+            let _ = std::fs::remove_dir_all(&b);
+            return;
+        }
+        let r = reap_stale_unpacks(&b, Path::new("p/rootfs")).expect("reap");
+        assert!(r.scan_failed);
+        assert!(r.is_incomplete());
+        assert!(r.is_noteworthy());
+        assert!(r.reclaimed.is_empty() && r.failed.is_empty());
+        let c = prepare_rootfs_target(&b, Path::new("p/rootfs")).expect("create succeeds");
+        assert!(c.reclamation().scan_failed);
+        assert!(c.reclamation().is_incomplete());
+        drop(c);
+        std::fs::set_permissions(b.join("p"), std::fs::Permissions::from_mode(0o700)).ok();
+        let clean = reap_stale_unpacks(&b, Path::new("p/rootfs")).expect("reap");
+        assert!(!clean.scan_failed);
+        assert!(!clean.is_incomplete());
         let _ = std::fs::remove_dir_all(&b);
     }
 

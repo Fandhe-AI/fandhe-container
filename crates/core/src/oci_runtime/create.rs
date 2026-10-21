@@ -75,10 +75,10 @@ use super::config::{OciConfig, OciConfigError, load_config};
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::image_refs::{ContainerImage, ImageRefRegistration};
 use super::image_rootfs::{
-    CreatedRootfs, ImageRootfsUnpacker, StagingReclamation, prepare_rootfs_target,
+    CreatedRootfs, ImageRootfsUnpacker, StagingReclamation, prepare_rootfs_target_with,
 };
 use super::resources::LinuxResourceLimits;
-use crate::observability::{OpName, OpRecorder};
+use crate::observability::{OpName, OpOutcome, OpRecorder};
 use crate::traits::{
     ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, GetStateRequest, StateRecord,
     StateStore, TraitError,
@@ -263,8 +263,13 @@ fn unpack_rootfs(
     // Linux は非公開の名前で展開し、成功後に最終の名前へ公開する（展開中は `root.path` が存在せず、
     // 並行する別の create は rootfs を使用中として成功できない。展開途中の失敗の後始末は他から参照されない
     // 非公開の rootfs だけを消す）。Linux 以外は作成の前に Unimplemented で拒否する。
-    let mut created = prepare_rootfs_target(req.bundle(), config.root().path())?;
-    record_staging_reclamation(recorder, created.reclamation());
+    // 回収の実処理は計測区間で包み、後続の作成が失敗しても結果と所要時間を記録する（REPAIR-4）。
+    let mut created = prepare_rootfs_target_with(req.bundle(), config.root().path(), &|reap| {
+        let started = std::time::Instant::now();
+        let reclamation = reap();
+        record_staging_reclamation(recorder, &reclamation, started.elapsed());
+        reclamation
+    })?;
     let unpack_name = OpName::new(IMAGE_ROOTFS_UNPACK_OP_NAME)?;
     // 展開器へは固定した rootfs を指す経路を渡す（作成後の bundle 内の差し替えで bundle 外へ書かせない。SEC-1）。
     let unpack_path = created.unpack_path();
@@ -314,24 +319,25 @@ fn same_dir_path(a: &Path, b: &Path) -> bool {
     normal(a) == normal(b)
 }
 
-/// 作成の前に回収した、持ち主のいない展開途中の木（#2379・OCI-7）を `image_rootfs_reap` として記録する
-/// （REPAIR-4）。何も無ければ記録しない。消せなかった・確かめられなかった・打ち切ったものがあれば失敗として
-/// 記録する（create 自体は失敗させない。残した木は余分に持つだけの安全側）。
-fn record_staging_reclamation(recorder: &OpRecorder, reclamation: &StagingReclamation) {
+/// 作成の前に回収した、持ち主のいない展開途中の木（#2379・OCI-7）を `image_rootfs_reap` として、実際の
+/// 回収に要した時間つきで記録する（REPAIR-4）。何も無ければ記録しない。消せなかった・確かめられなかった・
+/// 打ち切った・走査に失敗したものがあれば失敗として記録する（create 自体は失敗させない。残した木は余分に
+/// 持つだけの安全側）。
+fn record_staging_reclamation(
+    recorder: &OpRecorder,
+    reclamation: &StagingReclamation,
+    elapsed: std::time::Duration,
+) {
     if !reclamation.is_noteworthy() {
         return;
     }
     if let Ok(name) = OpName::new(IMAGE_ROOTFS_REAP_OP_NAME) {
-        let _ = recorder.record_op(&name, || {
-            if reclamation.is_incomplete() {
-                Err(TraitError::new(
-                    ErrorCode::Internal,
-                    "some stale rootfs staging trees were kept",
-                ))
-            } else {
-                Ok(())
-            }
-        });
+        let outcome = if reclamation.is_incomplete() {
+            OpOutcome::Failure
+        } else {
+            OpOutcome::Success
+        };
+        let _ = recorder.record(&name, outcome, elapsed);
     }
 }
 

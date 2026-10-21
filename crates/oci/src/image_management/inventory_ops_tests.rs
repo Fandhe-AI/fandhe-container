@@ -72,6 +72,11 @@ impl Root {
         ));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(p.join("blobs").join("sha256")).expect("mkdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
         Root(p)
     }
     fn put(&self, dg: &Digest) {

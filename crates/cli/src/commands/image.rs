@@ -9,7 +9,7 @@
 //!
 //! `image ls --image-root <abs>` / `system df --image-root <abs>` / `image rm [--force] --image-root <abs> <ref>` / `image tag --image-root <abs> <source> <target>`。
 //! イメージストアの root は必須オプション `--image-root`（絶対パス）で受ける。既定位置は未決のため発明しない（下記「未実装」）。
-//! root は作らない（`ImageStore::open` が存在するディレクトリ・非 symlink であることだけを見る）。
+//! root は作らない（`ImageStore::open` が存在するディレクトリ・非 symlink・所有者・書き込み権限・祖先を検査する。#2381）。
 //!
 //! # 出力形式（stdout・タブ区切り・LF 固定）
 //!
@@ -584,6 +584,12 @@ mod tests {
                 N.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir_all(p.join("blobs").join("sha256")).expect("mkdir");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod");
+            }
             Tmp(p)
         }
         fn path(&self) -> &Path {

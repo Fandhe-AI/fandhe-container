@@ -29,6 +29,11 @@ fn oci7_reuse_leases_and_staged_blob_is_invisible() {
     let _ = fs::remove_dir_all(&root.0);
     let blobs = root.0.join("blobs").join("sha256");
     fs::create_dir_all(&blobs).expect("mkdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
     let cached = d(1);
     fs::write(
         blobs.join(cached.as_str().trim_start_matches("sha256:")),

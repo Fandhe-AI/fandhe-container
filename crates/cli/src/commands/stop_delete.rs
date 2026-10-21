@@ -1308,6 +1308,12 @@ mod tests {
             use fandhe_container_oci::reference::Digest;
             let root = base.0.join("images");
             std::fs::create_dir_all(&root).expect("images");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod");
+            }
             let images = ImageStore::open(&root).expect("open");
             if seed {
                 images

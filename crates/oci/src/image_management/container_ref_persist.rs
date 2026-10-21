@@ -30,7 +30,7 @@
 //! 矛盾したファイルは fail-closed で拒否する（空として扱うと参照が消えて GC が誤削除するため）。
 //! 世代の矛盾（`generation >= next_generation`・重複）は再発行の恐れがあるため `DataLoss` とする。
 //! group / other に書き込み権のあるファイル（`PermissionDenied`）・symlink・通常ファイル以外（`Internal`）も拒否する。
-//! root の所有者 / 0700 の検査は未実装（`store` モジュールの前提）。
+//! root の所有者・権限・祖先の検査は `ImageStore::open` が行う（#2381。unix のみ）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -507,6 +507,11 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&p).expect("mkdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
         p
     }
 

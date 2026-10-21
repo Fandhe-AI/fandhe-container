@@ -40,6 +40,11 @@ fn oci7_child_holds_lock() {
 fn oci7_lock_excludes_other_process() {
     let root = std::env::temp_dir().join(format!("fc-oci-store-it-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("mkdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
     let mut child = Command::new(std::env::current_exe().expect("exe"))
         .args(["--exact", CHILD_TEST, "--test-threads=1", "--nocapture"])
         .env(ROOT_ENV, &root)

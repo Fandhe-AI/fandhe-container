@@ -1129,6 +1129,12 @@ mod tests {
             // image / system 用のイメージストア root（空。blobs/sha256 だけ作る）。
             let images = base.0.join("images");
             std::fs::create_dir_all(images.join("blobs").join("sha256")).expect("images");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&images, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod");
+            }
             let ir = images.to_str().expect("utf8").to_owned();
             let mut covered = Vec::new();
             for command in Command::ALL {

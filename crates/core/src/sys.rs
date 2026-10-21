@@ -1682,6 +1682,27 @@ pub(crate) fn open_dir_path_nofollow(
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// 絶対パスまたは相対パス `path` を `O_PATH|O_DIRECTORY|O_CLOEXEC`（最終要素の symlink は辿る）で開く。
+///
+/// `O_DIRECTORY` により FIFO・デバイス等の非ディレクトリは open で `ENOTDIR` になり、読み出し側の
+/// 相手を待ってブロックしない（delete の bundle 差し替え対策。OCI-7・SEC-1）。`O_PATH` のため
+/// 読み書きには使えず、dirfd と `fstat` 専用。
+pub(crate) fn open_dir_path_follow(path: &CStr) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let flags = consts::O_PATH | consts::O_DIRECTORY | consts::O_CLOEXEC;
+    // SAFETY: `path` は借用した NUL 終端文字列で呼び出しの間生存する。dirfd は `AT_FDCWD`。flags に
+    // O_CREAT / O_TMPFILE を含まないため可変長引数（mode）は渡さない。成功時の戻り値は新規 fd で、
+    // 直後に `OwnedFd` が唯一の所有者となる。
+    let fd = unsafe { openat(AT_FDCWD, path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// `target` に procfs を `nosuid,nodev,noexec` でマウントする。
 ///
 /// `crate::exec::mount_proc` は検証済みの O_PATH fd を指す `/proc/thread-self/fd/N` を渡す

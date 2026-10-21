@@ -332,6 +332,14 @@ mod imp {
         })
     }
 
+    /// bundle を開く。最終要素の symlink は辿るが、ディレクトリ以外は open の時点で拒否する
+    /// （FIFO への差し替えで delete がブロックしない。OCI-7・SEC-1）。
+    fn open_bundle(bundle: &Path) -> Result<OwnedFd, SysError> {
+        let c =
+            CString::new(bundle.as_os_str().as_bytes()).map_err(|_| SysError::Os(sys::EINVAL))?;
+        sys::open_dir_path_follow(&c)
+    }
+
     /// fd の指す実体の (dev, ino, ディレクトリか, mode)。fd は複製して `File` として fstat する。
     fn fstat(fd: BorrowedFd<'_>) -> Result<(u64, u64, bool, u32), std::io::Error> {
         let file = File::from(fd.try_clone_to_owned()?);
@@ -357,19 +365,16 @@ mod imp {
         last: &OsStr,
     ) -> Result<Backing, TraitError> {
         // bundle そのものは呼び出し側が渡した経路（上位が symlink でもよい）。追従して開き、以降は fd で固定する。
-        let file = File::open(bundle).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
+        let mut cur = open_bundle(bundle).map_err(|e| match e {
+            SysError::Os(n) if n == sys::ENOENT => {
                 TraitError::new(ErrorCode::NotFound, "bundle directory not found")
             }
-            std::io::ErrorKind::PermissionDenied => {
+            SysError::Os(n) if n == sys::ENOTDIR => invalid("bundle is not a directory"),
+            SysError::Os(n) if n == sys::EACCES || n == sys::EPERM => {
                 TraitError::new(ErrorCode::PermissionDenied, "cannot access bundle")
             }
             _ => TraitError::new(ErrorCode::Internal, "failed to open bundle"),
         })?;
-        if !file.metadata().map(|m| m.is_dir()).unwrap_or(false) {
-            return Err(invalid("bundle is not a directory"));
-        }
-        let mut cur = OwnedFd::from(file);
         for part in parents {
             cur = open_dir(cur.as_fd(), &cstr(part)?)?;
         }
@@ -471,8 +476,13 @@ mod imp {
             Ok((dev, ino, true, _)) if (dev, ino) == identity => {}
             _ => return Err(refuse()),
         }
+        let root_dev = fstat(root.as_fd())
+            .map(|(d, _, _, _)| d)
+            .map_err(|_| remove_failed())?;
+        // rootfs の下に bind mount 等があると、再帰削除がマウント元の中身を消す。何も消す前に拒否する。
+        refuse_if_mounts_below(root.as_fd())?;
         let mut seen = 0usize;
-        remove_children(root.as_fd(), 0, &mut seen)?;
+        remove_children(root.as_fd(), root_dev, 0, &mut seen)?;
         match sys::remove_dir_at(parent, name) {
             Ok(()) => Ok(RecordedRootfsRemoval::Removed),
             Err(SysError::Os(n)) if n == sys::ENOENT => Ok(RecordedRootfsRemoval::Removed),
@@ -484,17 +494,15 @@ mod imp {
         bundle: &Path,
         rec: &ImageRootfsRecord,
     ) -> Result<RecordedRootfsRemoval, TraitError> {
-        let file = match File::open(bundle) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        // FIFO 等への差し替えでも open でブロックしない（`O_DIRECTORY`）。差し替えは拒否として扱う。
+        let mut cur = match open_bundle(bundle) {
+            Ok(fd) => fd,
+            Err(SysError::Os(n)) if n == sys::ENOENT => {
                 return Ok(RecordedRootfsRemoval::NotPresent);
             }
+            Err(SysError::Os(n)) if n == sys::ENOTDIR => return Err(refuse()),
             Err(_) => return Err(remove_failed()),
         };
-        if !file.metadata().map(|m| m.is_dir()).unwrap_or(false) {
-            return Err(refuse());
-        }
-        let mut cur = OwnedFd::from(file);
         let mut parts = rec.relative_path().iter().peekable();
         while let Some(part) = parts.next() {
             let name = cstr(part)?;
@@ -516,12 +524,66 @@ mod imp {
         Err(refuse())
     }
 
+    /// `/proc/self/mountinfo` の mount point 欄（8 進エスケープ）を元のバイト列へ戻す。
+    #[cfg(test)]
+    pub(super) fn unescape_mountinfo_for_test(field: &str) -> Vec<u8> {
+        unescape_mountinfo(field)
+    }
+
+    fn unescape_mountinfo(field: &str) -> Vec<u8> {
+        let b = field.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            let octal = b.get(i..i + 4).filter(|w| {
+                w.first() == Some(&b'\\')
+                    && w.get(1..)
+                        .is_some_and(|d| d.iter().all(|c| (b'0'..=b'7').contains(c)))
+            });
+            if let Some(w) = octal {
+                let v = u32::from(w[1] - b'0') * 64
+                    + u32::from(w[2] - b'0') * 8
+                    + u32::from(w[3] - b'0');
+                out.push((v & 0xff) as u8);
+                i += 4;
+            } else if let Some(c) = b.get(i) {
+                out.push(*c);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// rootfs（固定済みの fd）自身またはその下にマウントポイントがあれば拒否する（SEC-1。bind mount の
+    /// マウント元の中身を再帰削除で消さないため）。mountinfo を読めない場合も fail-closed で拒否する。
+    fn refuse_if_mounts_below(root: BorrowedFd<'_>) -> Result<(), TraitError> {
+        let root_path = std::fs::read_link(format!("/proc/self/fd/{}", root.as_raw_fd()))
+            .map_err(|_| refuse())?;
+        let mountinfo = std::fs::read("/proc/self/mountinfo").map_err(|_| refuse())?;
+        let root_bytes = root_path.as_os_str().as_bytes();
+        for line in String::from_utf8_lossy(&mountinfo).lines() {
+            let Some(field) = line.split(' ').nth(4) else {
+                continue;
+            };
+            let mp = unescape_mountinfo(field);
+            let below = mp == root_bytes
+                || (mp.len() > root_bytes.len()
+                    && mp.starts_with(root_bytes)
+                    && mp.get(root_bytes.len()) == Some(&b'/'));
+            if below {
+                return Err(refuse());
+            }
+        }
+        Ok(())
+    }
+
     /// `dir`（固定済みの fd）の中身を、fd 相対・リンク非追従で再帰的に消す（件数・深さの上限つき）。
     ///
     /// 展開が適用した読み取り専用の mode は、ディレクトリごとに所有者の rwx を足して戻す。
     /// 列挙と chmod は `/proc/self/fd/N` 経由（magic link は fd の実体へ解決され、経路は再解決されない）。
     fn remove_children(
         dir: BorrowedFd<'_>,
+        root_dev: u64,
         depth: usize,
         seen: &mut usize,
     ) -> Result<(), TraitError> {
@@ -529,8 +591,9 @@ mod imp {
             return Err(remove_failed());
         }
         let proc_path = format!("/proc/self/fd/{}", dir.as_raw_fd());
-        let (_, _, is_dir, mode) = fstat(dir).map_err(|_| remove_failed())?;
-        if !is_dir {
+        let (dev, _, is_dir, mode) = fstat(dir).map_err(|_| remove_failed())?;
+        // 別ファイルシステムのマウントを跨がない（同一 FS の bind mount は事前の mountinfo 検査が担う）。
+        if !is_dir || dev != root_dev {
             return Err(remove_failed());
         }
         if mode & 0o700 != 0o700 {
@@ -553,7 +616,7 @@ mod imp {
                 .map(|(_, _, d, _)| d)
                 .map_err(|_| remove_failed())?;
             if is_child_dir {
-                remove_children(child.as_fd(), depth + 1, seen)?;
+                remove_children(child.as_fd(), root_dev, depth + 1, seen)?;
                 sys::remove_dir_at(dir, &name).map_err(|_| remove_failed())?;
             } else {
                 sys::remove_file_at(dir, &name).map_err(|_| remove_failed())?;
@@ -999,5 +1062,38 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         assert!(!b.join("rootfs").exists());
         let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// SEC-1・OCI-7: bundle が FIFO に差し替えられても delete は open でブロックせず拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_fifo_bundle_does_not_block() {
+        let b = tmp("fifo-bundle");
+        let fifo = b.join("fifo");
+        let st = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo");
+        assert!(st.success());
+        let rec = published_record(&b, "rootfs");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let f = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(remove_recorded_rootfs(&f, &rec).is_err());
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("must not block");
+        assert!(refused);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_unescape_mountinfo_decodes_octal() {
+        assert_eq!(
+            imp::unescape_mountinfo_for_test("/a\\040b"),
+            b"/a b".to_vec()
+        );
     }
 }

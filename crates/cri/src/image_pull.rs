@@ -47,10 +47,11 @@
 //!   ファイルである」ことまで。キャッシュの blob を後から読む処理は、パスを信頼せず同じ手順（symlink を辿らずに
 //!   開く → ハンドルで条件を確認 → 同じハンドルから読む）で開き直すこと。tar 展開の実体は
 //!   `fandhe_container_oci::layer::extract` にある（TASK-52.3・TASK-52.4・TASK-53）が、本モジュールからはまだ
-//!   呼んでいない。パスを受け取る入口（`extract_layer_blob` / `extract_layer_blobs` 系）は内部で `open_regular_blob`
-//!   によりパスを開き直す。これは最終要素の symlink を辿り、所有者・権限・ハードリンク数も確かめないため、上記の
-//!   契約を満たさない。キャッシュの blob を展開へつなぐ側は、`open_blob_nofollow` で開いたハンドルを渡せる
-//!   ストリーム版（`extract_layers` 系）を使うか、そうした経路を足すこと
+//!   呼んでいない。oci 側には、この契約を満たす入口として `VerifiedLayerBlob`（symlink を辿らずに開き、同じハンドルで
+//!   信頼条件と digest を確かめた値）と、それだけを受ける `extract_image_layers` がある（#2309）。パスを受け取る旧入口
+//!   （`extract_layer_blob` / `extract_layer_blobs` 系）は内部でパスを開き直し、最終要素の symlink を辿り、所有者・
+//!   権限・ハードリンク数も確かめないため、この契約を満たさない（排他所有のステージングの直後の blob に限る）。
+//!   キャッシュの blob を展開へつなぐ側は `VerifiedLayerBlob` と `extract_image_layers` を使うこと
 //! - 同一 UID の別プロセスと root による書き換えは対象外（キャッシュの所有者自身のため防げない）。所有者または
 //!   root が過去に権限を緩めていた間に他ユーザーが開いた書き込み用の記述子も、現在のメタデータからは検出できない
 //! - 既存のキャッシュディレクトリが他ユーザーから辿れる権限（0755 等）で、OS が他人のファイルへのハードリンク作成を
@@ -64,8 +65,8 @@
 //! - レイヤーの tar 展開（rootfs 化）と whiteout・不透明ディレクトリの処理は `fandhe-container-oci` の
 //!   `layer::extract` に実装済み（TASK-52.3・TASK-52.4・TASK-53。#409・#410・#414。OCI-1・OCI-2）だが、本モジュール
 //!   の pull 経路からは呼んでいない。この配線を担当する issue は無い（TASK-55・#419 は pull から実行までの受け入れ検証）
-//! - diff_id（config の `rootfs.diff_ids`）の突合は未実装で、oci 側の #2017（TASK-52 追補・OCI-1）で追跡中。
-//!   本モジュールは突合しない
+//! - diff_id（config の `rootfs.diff_ids`）の突合は oci 側の `extract_image_layers` が行う（#2017・#2309。OCI-1）。
+//!   本モジュールは展開を呼ばないため、まだ使っていない（展開の配線と同じく担当 issue は無い）
 //! - 永続イメージストアと展開後サイズの算出は TASK-183（OCI-7。展開後サイズは #2222）の担当。本モジュールが返す
 //!   `size` は config と全 layer の**圧縮サイズの合計**で、展開後サイズではない
 //! - `AuthConfig.identity_token`（OAuth2）・`registry_token` は未対応で `UNIMPLEMENTED`（oci の OAuth2 POST フロー待ち。OCI-3）

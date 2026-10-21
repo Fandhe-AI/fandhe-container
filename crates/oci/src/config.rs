@@ -2,7 +2,8 @@
 //!
 //! image config は pull したイメージの「展開後 tar の sha256（diff_id）」をレイヤーごとに宣言する。
 //! 本モジュールは config 本文から `rootfs.diff_ids` だけを検証済みの型で取り出し、
-//! `layer::extract::extract_image_layers` が展開と同じ読み取りで計算した diff_id と突合できるようにする。
+//! `layer::extract::extract_image_layers` が、検証済みハンドル（`layer::VerifiedLayerBlob`）から展開と同じ読み取りで
+//! 計算した diff_id と突合できるようにする。
 //! config は信頼できない入力のため、長さ・件数を先に検証し、不正な形は fail-closed で拒否する。
 //!
 //! 呼び出し契約: config blob 自体の digest 検証（`layer::verify_blob_digest`）は呼び出し側の責務で、

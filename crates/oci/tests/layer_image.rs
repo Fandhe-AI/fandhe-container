@@ -1,22 +1,33 @@
-//! `mediaType` による入口の選択と `rootfs.diff_ids` の突合の公開 API 結合試験（#2017・OCI-1・TASK-52 追補）。
-//! image config の解析 → 件数の照合 → gzip / 非圧縮の展開 → diff_id の突合を、外向き通信なしで具体値で確認する。
+//! `mediaType` による入口の選択と `rootfs.diff_ids` の突合の公開 API 結合試験（#2017・#2309・OCI-1・TASK-52 追補）。
+//! image config の解析 → 件数・対応の照合 → gzip / 非圧縮の展開 → diff_id の突合を、外向き通信なしで具体値で確認する。
+//!
+//! 展開の入口は `VerifiedLayerBlob`（`open_blob_nofollow` で開き、同じハンドルで信頼条件と digest を確かめた値）だけを
+//! 受ける。その構築は非 Unix で `Unimplemented` になる（API 自体が fail-closed）ため、blob を使う試験は
+//! `#[cfg(unix)]` にする。特定 OS の試験を飛ばして CI を通すためではなく、非 Unix 側は
+//! `oci1_verified_layer_blob_is_unimplemented_off_unix` と blob の要らないレイヤー 0 の試験で確かめる。
 
 use std::fmt::Write as _;
+#[cfg(unix)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
 use fandhe_container_oci::config::parse_image_config_rootfs;
 use fandhe_container_oci::error::OciErrorCode;
-use fandhe_container_oci::layer::extract::{
-    ExtractLimits, ImageLayer, extract_image_layers, image_layers_from,
-};
-use fandhe_container_oci::layer::verify_blob_digest;
+use fandhe_container_oci::layer::VerifiedLayerBlob;
+use fandhe_container_oci::layer::extract::{ExtractLimits, extract_image_layers};
+#[cfg(unix)]
+use fandhe_container_oci::layer::extract::{ImageLayer, image_layers_from};
+#[cfg(unix)]
 use fandhe_container_oci::manifest::{Descriptor, ParsedManifest, parse_manifest};
 use fandhe_container_oci::reference::Digest;
 use sha2::{Digest as _, Sha256};
 
+#[cfg(unix)]
 const TAR: &str = "application/vnd.oci.image.layer.v1.tar";
+#[cfg(unix)]
 const TAR_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+#[cfg(unix)]
 const TAR_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
 
 fn sha(data: &[u8]) -> Digest {
@@ -28,6 +39,7 @@ fn sha(data: &[u8]) -> Digest {
 }
 
 /// 通常ファイルだけの tar（非圧縮）。
+#[cfg(unix)]
 fn tar_of(files: &[(&str, &[u8])]) -> Vec<u8> {
     let mut b = tar::Builder::new(Vec::new());
     for (name, data) in files {
@@ -40,6 +52,7 @@ fn tar_of(files: &[(&str, &[u8])]) -> Vec<u8> {
     b.into_inner().unwrap()
 }
 
+#[cfg(unix)]
 fn gzip(data: &[u8]) -> Vec<u8> {
     let mut z = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     z.write_all(data).unwrap();
@@ -62,13 +75,29 @@ impl Tmp {
         self.base.join("root")
     }
 
-    /// blob を書き、圧縮後の digest を検証した上でパスを返す（呼び出し契約）。
-    fn blob(&self, name: &str, bytes: &[u8]) -> PathBuf {
+    /// blob を 0600 で書き、パスを返す（umask に依らず信頼条件を満たす）。
+    #[cfg(unix)]
+    fn write_blob(&self, name: &str, bytes: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
         let p = self.base.join(name);
         std::fs::write(&p, bytes).unwrap();
-        verify_blob_digest(&p, &sha(bytes), 1 << 20).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
         p
     }
+
+    /// blob を書き、自分の uid で信頼条件と圧縮後の digest を同じハンドルで検証した値を返す（呼び出し契約）。
+    #[cfg(unix)]
+    fn blob(&self, name: &str, bytes: &[u8]) -> VerifiedLayerBlob {
+        let p = self.write_blob(name, bytes);
+        VerifiedLayerBlob::open(&p, &sha(bytes), bytes.len() as u64, my_uid(&p)).unwrap()
+    }
+}
+
+/// 試験が作ったファイルの所有者（= 自分の uid）。
+#[cfg(unix)]
+fn my_uid(p: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(p).unwrap().uid()
 }
 
 impl Drop for Tmp {
@@ -86,6 +115,7 @@ fn root_is_empty(root: &Path) -> bool {
 }
 
 /// 指定の layer descriptor を持つ manifest を `parse_manifest` で作り、layers を取り出す。
+#[cfg(unix)]
 fn descriptors(layers: &[(&str, Digest, u64)]) -> Vec<Descriptor> {
     let zero = format!("sha256:{}", "0".repeat(64));
     let list = layers
@@ -102,6 +132,7 @@ fn descriptors(layers: &[(&str, Digest, u64)]) -> Vec<Descriptor> {
     }
 }
 
+#[cfg(unix)]
 fn config_for(ids: &[&Digest]) -> Vec<u8> {
     let list = ids
         .iter()
@@ -112,6 +143,7 @@ fn config_for(ids: &[&Digest]) -> Vec<u8> {
 }
 
 /// OCI-1: gzip と非圧縮を混ぜた 2 レイヤーが、diff_id の一致で重なって展開され、結果に diff_id が載る。
+#[cfg(unix)]
 #[test]
 fn oci1_mixed_gzip_and_plain_layers_extract_with_matching_diff_ids() {
     let t = Tmp::new("mixed");
@@ -134,6 +166,7 @@ fn oci1_mixed_gzip_and_plain_layers_extract_with_matching_diff_ids() {
 }
 
 /// OCI-1: config → 件数の照合 → 展開の一連の経路（Docker の mediaType を含む）。
+#[cfg(unix)]
 #[test]
 fn oci1_config_to_extract_end_to_end() {
     let t = Tmp::new("e2e");
@@ -147,13 +180,14 @@ fn oci1_config_to_extract_end_to_end() {
         sha(&gz),
         gz.len() as u64,
     )]);
-    let paths = [b1.as_path()];
-    let layers = image_layers_from(&desc, &paths, &cfg).unwrap();
+    let blobs = [&b1];
+    let layers = image_layers_from(&desc, &blobs, &cfg).unwrap();
     extract_image_layers(&layers, &t.root(), 1 << 20, limits()).unwrap();
     assert_eq!(std::fs::read(t.root().join("f")).unwrap(), b"hello");
 }
 
 /// OCI-1: 展開後 tar が 1 バイト違えば DataLoss。最初のレイヤーなら root は空のまま。
+#[cfg(unix)]
 #[test]
 fn oci1_diff_id_mismatch_is_data_loss_and_root_untouched() {
     let t = Tmp::new("mismatch");
@@ -170,6 +204,7 @@ fn oci1_diff_id_mismatch_is_data_loss_and_root_untouched() {
 }
 
 /// OCI-1: 件数の不一致（blob・descriptor・diff_ids のどれか）は I/O より前に DataLoss。
+#[cfg(unix)]
 #[test]
 fn oci1_layer_count_mismatch_is_data_loss() {
     let t = Tmp::new("count");
@@ -177,11 +212,11 @@ fn oci1_layer_count_mismatch_is_data_loss() {
     let d1 = sha(&t1);
     let b1 = t.blob("l1.tar", &t1);
     let desc_one = descriptors(&[(TAR, sha(&t1), t1.len() as u64)]);
-    let paths = [b1.as_path()];
+    let blobs = [&b1];
     let cfg_two = parse_image_config_rootfs(&config_for(&[&d1, &d1])).unwrap();
     let cfg_zero = parse_image_config_rootfs(&config_for(&[])).unwrap();
     for cfg in [&cfg_two, &cfg_zero] {
-        let e = image_layers_from(&desc_one, &paths, cfg).unwrap_err();
+        let e = image_layers_from(&desc_one, &blobs, cfg).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::DataLoss);
         assert_eq!(e.message(), "layer count does not match rootfs.diff_ids");
     }
@@ -191,6 +226,7 @@ fn oci1_layer_count_mismatch_is_data_loss() {
 }
 
 /// OCI-1: zstd などの未対応 mediaType は Unimplemented で、root に触れる前に拒否する。
+#[cfg(unix)]
 #[test]
 fn oci1_unsupported_media_type_is_rejected_before_any_io() {
     let t = Tmp::new("zstd");
@@ -208,6 +244,7 @@ fn oci1_unsupported_media_type_is_rejected_before_any_io() {
 }
 
 /// OCI-1: gzip の blob を tar と宣言しても推測で開かず、成功しない。
+#[cfg(unix)]
 #[test]
 fn oci1_gzip_blob_declared_as_plain_tar_fails() {
     let t = Tmp::new("liar");
@@ -219,6 +256,7 @@ fn oci1_gzip_blob_declared_as_plain_tar_fails() {
 }
 
 /// OCI-1: 非圧縮レイヤーにも展開後サイズの上限が課される。
+#[cfg(unix)]
 #[test]
 fn oci1_plain_layer_size_limit_is_enforced() {
     let t = Tmp::new("limit");
@@ -254,4 +292,74 @@ fn oci1_zero_layer_image_rejects_missing_root() {
     let t = Tmp::new("zero-missing");
     let missing = t.root().join("nope");
     assert!(extract_image_layers(&[], &missing, 1 << 20, limits()).is_err());
+}
+
+/// OCI-1: 非 Unix では `VerifiedLayerBlob` を構築できず、開かずに `Unimplemented`（fail-closed）。
+#[cfg(not(unix))]
+#[test]
+fn oci1_verified_layer_blob_is_unimplemented_off_unix() {
+    let t = Tmp::new("off-unix");
+    let p = t.base.join("l1.tar");
+    std::fs::write(&p, b"x").unwrap();
+    let e = VerifiedLayerBlob::open(&p, &sha(b"x"), 1, 0).unwrap_err();
+    assert_eq!(e.code(), OciErrorCode::Unimplemented);
+}
+
+/// OCI-1・#2309: 検証の後に同じパスへ別の内容を被せても、検証済みハンドルの内容が展開される。
+#[cfg(unix)]
+#[test]
+fn oci1_blob_swapped_after_verification_is_not_extracted() {
+    let t = Tmp::new("swap");
+    let t1 = tar_of(&[("a", b"A1")]);
+    let d1 = sha(&t1);
+    let b1 = t.blob("l1.tar", &t1);
+    // 検証後に rename で別の内容（同じ長さ）のファイルを被せる。
+    let evil = t.write_blob("evil.tar", &tar_of(&[("a", b"B2")]));
+    std::fs::rename(&evil, t.base.join("l1.tar")).unwrap();
+    let layers = [ImageLayer::new(&b1, TAR, &d1)];
+    let r = extract_image_layers(&layers, &t.root(), 1 << 20, limits()).unwrap();
+    assert_eq!(std::fs::read(t.root().join("a")).unwrap(), b"A1");
+    assert_eq!(r[0].diff_id, d1);
+}
+
+/// OCI-1・#2309: descriptor の digest か size が blob と違えば、I/O の前に DataLoss で root は空のまま。
+#[cfg(unix)]
+#[test]
+fn oci1_image_layers_from_rejects_descriptor_blob_mismatch() {
+    let t = Tmp::new("desc-mismatch");
+    let t1 = tar_of(&[("f", b"x")]);
+    let t2 = tar_of(&[("f", b"y")]);
+    let d1 = sha(&t1);
+    let b1 = t.blob("l1.tar", &t1);
+    let cfg = parse_image_config_rootfs(&config_for(&[&d1])).unwrap();
+    let blobs = [&b1];
+    let wrong_digest = descriptors(&[(TAR, sha(&t2), t1.len() as u64)]);
+    let wrong_size = descriptors(&[(TAR, sha(&t1), t1.len() as u64 + 1)]);
+    for desc in [&wrong_digest, &wrong_size] {
+        let e = image_layers_from(desc, &blobs, &cfg).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::DataLoss);
+        assert_eq!(
+            e.message(),
+            "layer blob does not match the manifest descriptor"
+        );
+    }
+    assert!(root_is_empty(&t.root()));
+}
+
+/// OCI-1・#2309: symlink の blob と所有者違いの blob は、検証済み値を作る段階で拒否される。
+#[cfg(unix)]
+#[test]
+fn oci1_symlink_and_foreign_owner_blobs_are_rejected_before_extract() {
+    let t = Tmp::new("untrusted");
+    let t1 = tar_of(&[("f", b"x")]);
+    let real = t.write_blob("real.tar", &t1);
+    let link = t.base.join("link.tar");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let uid = my_uid(&real);
+    let e = VerifiedLayerBlob::open(&link, &sha(&t1), t1.len() as u64, uid).unwrap_err();
+    assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+    assert_eq!(e.message(), "blob path is not a regular file");
+    let e = VerifiedLayerBlob::open(&real, &sha(&t1), t1.len() as u64, uid ^ 1).unwrap_err();
+    assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), "blob has an unexpected owner");
 }

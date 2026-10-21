@@ -25,7 +25,9 @@
 //!
 //! 実装済み: レイヤー blob の gzip 展開（TASK-52.2・OCI-1・MS-4・#407。`layer::decompress_layer_to_writer`・
 //! `layer::GzipLayerReader`）。展開後サイズの上限を必須引数とし、超過で中断する（decompression bomb 対策）。
-//! 展開後 tar の diff_id 検証は `layer::extract::extract_image_layers` が行う（#2017。下記）。
+//! 展開後 tar の diff_id 検証は `layer::extract::extract_image_layers` が行う（#2017。下記）。展開の入口は
+//! `layer::VerifiedLayerBlob`（symlink を辿らず開いたハンドルで信頼条件と digest を確かめた値。#2309）だけを受け、
+//! パス 1 とパス 3 で同じハンドルを読み、パス 3 でも diff_id を再計算して照合する。
 //!
 //! 対応するレイヤーの mediaType は `application/vnd.oci.image.layer.v1.tar+gzip`・
 //! `application/vnd.docker.image.rootfs.diff.tar.gzip` の 2 種のみ。それ以外（zstd は #2029 で保留中）は

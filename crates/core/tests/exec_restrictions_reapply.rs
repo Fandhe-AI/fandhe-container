@@ -16,6 +16,9 @@
 //! 「capability 削減・rlimit 適用」の実機確認は supervisor の `tests/exec.rs`（TASK-163.4・#503）で行う。
 //! 本テストは非特権で動かすため、観測関数は capability 削減を省き、rlimit も変えない（空集合）。省いた 2 つは
 //! 未適用に `Rlimits`・`CapabilityDrop` として残る（TASK-163 追補・#1460。本番の入口は rlimit の空集合を拒否する）。
+//! 適用前の対照（`kcmp` の成功・`Seccomp: 0`）が外側の環境（`make docker-ci` の Docker 既定 seccomp 等）で
+//! 満たせない場合は、skip せず失敗のまま、子がマーカー行（`precondition-failed ...`）と専用の終了コードで報告し、
+//! 親が `PRECONDITION FAILED (test environment ...)` の 1 行目で判別できる panic にする（#2235・ESC-06）。
 //! 観測関数は `exec-test-support` feature の下にあり、core の dev-dependency の自己参照で有効になる。
 //!
 //! # 実行モード（ci.md「実機前提テスト」）
@@ -111,6 +114,40 @@ fn main() {
         panic!("could not create a unique probe dir");
     }
 
+    /// 前提欠如を報告する子の専用終了コード（panic の 101 と区別する）。
+    const PRECONDITION_EXIT: i32 = 3;
+    const MARKER: &str = "exec_restrictions_reapply child: precondition-failed ";
+
+    /// 前提欠如をマーカー行で報告して専用の終了コードで終わる（#2235）。
+    fn exit_precondition(kcmp_errno: Option<i32>, seccomp_before: &str) -> ! {
+        let e = kcmp_errno.map_or("none".to_string(), |e| e.to_string());
+        println!("{MARKER}kcmp_before_errno={e} seccomp_before={seccomp_before}");
+        std::process::exit(PRECONDITION_EXIT);
+    }
+
+    /// 終了コードとマーカーが揃ったときだけ前提欠如のマーカー値部分を返す（解析不能は `None`＝汎用の失敗）。
+    fn precondition_fields(code: Option<i32>, stdout: &str) -> Option<(i32, String)> {
+        if code != Some(PRECONDITION_EXIT) {
+            return None;
+        }
+        let rest = stdout.lines().find_map(|l| l.strip_prefix(MARKER))?;
+        let mut errno = None;
+        let mut mode = None;
+        for kv in rest.split_whitespace() {
+            if let Some(v) = kv.strip_prefix("kcmp_before_errno=") {
+                // kcmp が成功していて errno が無い場合（`none`）は 0 とする。
+                errno = if v == "none" {
+                    Some(0)
+                } else {
+                    v.parse::<i32>().ok()
+                };
+            } else if let Some(v) = kv.strip_prefix("seccomp_before=") {
+                mode = Some(v.to_string());
+            }
+        }
+        Some((errno?, mode?))
+    }
+
     fn run_child(dir: &Path) {
         let allowed = dir.join("allowed");
         let denied = dir.join("denied");
@@ -135,13 +172,9 @@ fn main() {
         ];
         let o =
             observe_exec_restriction_reapply(&config, Path::new("/"), &probes).expect("observe");
-        assert_eq!(
-            o.kcmp_before, None,
-            "precondition failed: kcmp(self, self) must succeed before reapply (errno {:?}, Seccomp: {}); \
-             the outer environment already denies kcmp (e.g. Docker's default seccomp profile). \
-             See AGENTS.md exec_restrictions_reapply",
-            o.kcmp_before, o.seccomp_before
-        );
+        if o.kcmp_before.is_some() {
+            exit_precondition(o.kcmp_before, &o.seccomp_before);
+        }
 
         if let Some(e) = &o.prepare_error {
             // Landlock 未対応カーネルでの fail-closed: 準備が Landlock 段で拒否し、何も適用しない。
@@ -198,11 +231,9 @@ fn main() {
             incomplete.message,
             "exec restrictions are incomplete; not applied: rlimits, capability_drop"
         );
-        assert_eq!(
-            o.seccomp_before, "0",
-            "precondition failed: an outer seccomp filter is already present (Seccomp: {}). See AGENTS.md exec_restrictions_reapply",
-            o.seccomp_before
-        );
+        if o.seccomp_before != "0" {
+            exit_precondition(o.kcmp_before, &o.seccomp_before);
+        }
         assert_eq!(o.seccomp_after, "2");
         assert_eq!(o.no_new_privs_after, "1");
         assert_eq!(o.kcmp_after, Some(EPERM), "denied syscall must be EPERM");
@@ -295,6 +326,29 @@ fn main() {
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         if !status.success() {
             let _ = std::fs::remove_dir_all(dir);
+            if let Some((errno, mode)) = precondition_fields(status.code(), &stdout) {
+                let what = if errno == 0 {
+                    "kcmp succeeded but an outer seccomp filter is already present".to_string()
+                } else {
+                    format!(
+                        "kcmp(self, self, KCMP_VM) was denied with errno {errno} before reapply"
+                    )
+                };
+                panic!(
+                    "exec_restrictions_reapply: PRECONDITION FAILED (test environment, not a reapply regression): \
+                     {what} (Seccomp: {mode} before reapply).\n\
+                     hint: {}.\n\
+                     By policy (#2235) the dev container keeps Docker's seccomp and this test stays failing there; \
+                     run it on the host (cargo test -p fandhe-container-core --test exec_restrictions_reapply) \
+                     or rely on CI. See AGENTS.md exec_restrictions_reapply.",
+                    match (errno, mode.as_str()) {
+                        (38, _) => "the kernel does not provide kcmp (CONFIG_KCMP)",
+                        (_, "0") => "kcmp is denied by something other than seccomp (e.g. an LSM)",
+                        _ =>
+                            "an outer seccomp filter is present (e.g. Docker's default seccomp profile under make docker-ci)",
+                    }
+                );
+            }
             panic!(
                 "child ({mode}) failed ({status}): {stdout}\n{}",
                 String::from_utf8_lossy(&out.stderr)

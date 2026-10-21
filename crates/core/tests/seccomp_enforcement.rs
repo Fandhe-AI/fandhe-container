@@ -9,6 +9,12 @@
 //! `harness = false` の単一スレッド `main` で動かす。親は子をタイムアウト付きで待つ（REPAIR-5）。
 //! root・KVM 等は不要で、既定のテスト集合で動く。Landlock 証跡不足での exec 拒否は
 //! `fork_exec_isolation` 側の責務で、本試験は seccomp の遮断そのものを検証する。
+//!
+//! 適用前の対照（`kcmp` の成功）が外側の環境（`make docker-ci` の Docker 既定 seccomp 等）で
+//! 満たせない場合は、skip せず失敗のまま、子が固定書式のマーカー行（`precondition-failed ...`）と
+//! 専用の終了コードで報告し、親が「試験環境の前提欠如でありリグレッションではない」と 1 行目で
+//! 判別できる文言で panic する（#2235・ESC-06。方針は `AGENTS.md` の `seccomp_enforcement`）。
+//! 終了コードとマーカーの両方が揃ったときだけ前提欠如として扱い、それ以外は汎用の失敗にする。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -51,7 +57,112 @@ fn main() {
         ("kexec_load", KilledSyscall::KexecLoad),
     ];
 
+    /// 前提欠如を報告する子の専用終了コード（panic の 101・汎用失敗の 1 と区別する）。
+    const PRECONDITION_EXIT: i32 = 3;
+    const MARKER: &str = "seccomp_enforcement child: precondition-failed ";
+
+    /// 子の結果の分類（REPAIR-12。純関数で自己照合する）。
+    #[derive(Debug, PartialEq)]
+    enum ChildOutcome {
+        Ok,
+        PreconditionFailed {
+            kcmp_errno: i32,
+            seccomp_before: String,
+        },
+        Failed,
+    }
+
+    /// 終了コードと標準出力から子の結果を分類する。解析に失敗したら `Failed`（fail-closed）。
+    fn classify_child(code: Option<i32>, stdout: &str) -> ChildOutcome {
+        if code == Some(0) {
+            return ChildOutcome::Ok;
+        }
+        if code != Some(PRECONDITION_EXIT) {
+            return ChildOutcome::Failed;
+        }
+        let Some(rest) = stdout.lines().find_map(|l| l.strip_prefix(MARKER)) else {
+            return ChildOutcome::Failed;
+        };
+        let mut errno = None;
+        let mut mode = None;
+        for kv in rest.split_whitespace() {
+            if let Some(v) = kv.strip_prefix("kcmp_before_errno=") {
+                errno = v.parse::<i32>().ok();
+            } else if let Some(v) = kv.strip_prefix("seccomp_before=") {
+                mode = Some(v.to_string());
+            }
+        }
+        match (errno, mode) {
+            (Some(kcmp_errno), Some(seccomp_before)) => ChildOutcome::PreconditionFailed {
+                kcmp_errno,
+                seccomp_before,
+            },
+            _ => ChildOutcome::Failed,
+        }
+    }
+
+    /// 前提欠如の panic メッセージ（1 行目で判別でき、値から決まるヒントだけを添える）。
+    fn precondition_message(kcmp_errno: i32, seccomp_before: &str) -> String {
+        let hint = match (kcmp_errno, seccomp_before) {
+            (1, "0") => "kcmp is denied by something other than seccomp (e.g. an LSM)",
+            (1, _) => {
+                "an outer seccomp filter denies kcmp (e.g. Docker's default seccomp profile under make docker-ci)"
+            }
+            (38, _) => "the kernel does not provide kcmp (CONFIG_KCMP)",
+            _ => "the environment denies kcmp",
+        };
+        format!(
+            "seccomp_enforcement: PRECONDITION FAILED (test environment, not a seccomp filter regression): \
+             kcmp(self, self, KCMP_VM) was denied with errno {kcmp_errno} before the runtime's filter was applied \
+             (Seccomp: {seccomp_before} before apply).\n\
+             hint: {hint}.\n\
+             By policy (#2235) the dev container keeps Docker's seccomp and this test stays failing there; \
+             run it on the host (cargo test -p fandhe-container-core --test seccomp_enforcement) or rely on CI. \
+             See AGENTS.md seccomp_enforcement."
+        )
+    }
+
     let args: Vec<String> = std::env::args().collect();
+    let is_child = args.iter().any(|a| a == "--child" || a == "--child-kill");
+    if !is_child {
+        // 分類の自己照合（常に走る。ESC-06・REPAIR-12）。
+        let marker =
+            |e: i32, m: &str| format!("noise\n{MARKER}kcmp_before_errno={e} seccomp_before={m}\n");
+        assert_eq!(
+            classify_child(Some(0), "seccomp_enforcement child: ok\n"),
+            ChildOutcome::Ok
+        );
+        assert_eq!(
+            classify_child(Some(PRECONDITION_EXIT), &marker(1, "2")),
+            ChildOutcome::PreconditionFailed {
+                kcmp_errno: 1,
+                seccomp_before: "2".into()
+            }
+        );
+        assert_eq!(
+            classify_child(Some(PRECONDITION_EXIT), &marker(38, "0")),
+            ChildOutcome::PreconditionFailed {
+                kcmp_errno: 38,
+                seccomp_before: "0".into()
+            }
+        );
+        assert_eq!(
+            classify_child(Some(PRECONDITION_EXIT), "no marker\n"),
+            ChildOutcome::Failed
+        );
+        assert_eq!(
+            classify_child(Some(101), &marker(1, "2")),
+            ChildOutcome::Failed
+        );
+        assert_eq!(
+            classify_child(
+                Some(PRECONDITION_EXIT),
+                &format!("{MARKER}kcmp_before_errno=x seccomp_before=2\n")
+            ),
+            ChildOutcome::Failed
+        );
+        assert_eq!(classify_child(None, &marker(1, "2")), ChildOutcome::Failed);
+    }
     if let Some(i) = args.iter().position(|a| a == "--child-kill") {
         let name = args.get(i + 1).expect("syscall name after --child-kill");
         let (_, which) = KILLED
@@ -65,15 +176,21 @@ fn main() {
     }
 
     if std::env::args().any(|a| a == "--child") {
+        // 適用後は常に 2 になるため、適用前の `Seccomp:` を先に読んでおく（前提欠如の表示用）。
+        let seccomp_before = std::fs::read_to_string("/proc/thread-self/status")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix("Seccomp:").map(|v| v.trim().to_string()))
+            })
+            .unwrap_or_else(|| "unknown".to_string());
         let o = fandhe_container_core::exec::observe_default_seccomp_enforcement()
             .expect("apply default seccomp in child");
-        assert_eq!(
-            o.kcmp_before, None,
-            "precondition failed: kcmp(self, self, KCMP_VM) must succeed before our filter is applied \
-             (errno {:?}); the outer environment already denies kcmp (e.g. Docker's default seccomp \
-             profile in a dev container), so the control is meaningless. See AGENTS.md seccomp_enforcement",
-            o.kcmp_before
-        );
+        if let Some(errno) = o.kcmp_before {
+            // 外側の環境が kcmp を拒否している: 対照が無意味なので親へ判別可能に報告して失敗する。
+            println!("{MARKER}kcmp_before_errno={errno} seccomp_before={seccomp_before}");
+            std::process::exit(PRECONDITION_EXIT);
+        }
         assert!(o.instructions > 0, "filter has instructions");
         assert_eq!(o.seccomp_mode, "2", "SECCOMP_MODE_FILTER");
         assert_eq!(o.kcmp_after, Some(EPERM), "kcmp blocked");
@@ -109,12 +226,18 @@ fn main() {
     };
 
     let (status, out) = run(&["--child"]);
-    assert!(
-        status.success(),
-        "child failed ({status}): {}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    match classify_child(status.code(), &String::from_utf8_lossy(&out.stdout)) {
+        ChildOutcome::Ok => {}
+        ChildOutcome::PreconditionFailed {
+            kcmp_errno,
+            seccomp_before,
+        } => panic!("{}", precondition_message(kcmp_errno, &seccomp_before)),
+        ChildOutcome::Failed => panic!(
+            "child failed ({status}): {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    }
     assert!(String::from_utf8_lossy(&out.stdout).contains("seccomp_enforcement child: ok"));
 
     for (name, _) in KILLED {

@@ -67,7 +67,8 @@ pub(crate) fn is_reserved(name: &[u8]) -> bool {
 /// 名前は FS に実在できず whiteout 自体も隠す決まりなので、読み飛ばしても仕様に反しない。rootfs へ何も書かない
 /// ため分離の攻撃面は増えない。ただし読み飛ばす前に、エントリの種別は予約名の外と同じ規則で検査する
 /// （未対応の種別は `plan_entry` が拒否する。#2312）。`.wh..wh.plnk` 配下を指す hardlink は moby のような
-/// 差し替えをせず、`plan_entry` が `Unimplemented` で拒否する（理由は `layer::extract` の「AUFS メタデータの予約名」）。親の位置の whiteout など fail-closed の除外は `plan_entry` が担う。
+/// 差し替えをせず、`plan_entry` が `Unimplemented` で拒否する（理由は `layer::extract` の「AUFS メタデータの予約名」）。
+/// 親の位置の whiteout など fail-closed の除外は `plan_entry` が担う。
 ///
 /// 不正な whiteout（対象が空・`.`・`..`・`/` や NUL を含む・長すぎる）は
 /// `InvalidArgument` で拒否する（`.wh...` を `..` の whiteout として解釈し親を消す事故を防ぐ）。
@@ -193,6 +194,8 @@ fn remove_file_best_effort(path: &Path, meta: &fs::Metadata) -> Result<(), OciEr
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// OCI-2・#2312: 予約名の判定（`.wh..wh.` 始まりで `.wh..wh..opq` 以外）。
     #[test]
     fn is_reserved_matches_aufs_names_only() {
@@ -203,8 +206,6 @@ mod tests {
             assert!(!is_reserved(n), "{n:?}");
         }
     }
-
-    use super::*;
 
     fn invalid(name: &[u8]) {
         let e = classify(name).expect_err("must be rejected");

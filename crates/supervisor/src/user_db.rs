@@ -11,19 +11,26 @@
 //! - 実行ファイルは固定の絶対パス候補のみ（`PATH` を探索しない）。実体と全祖先ディレクトリが root 所有で
 //!   group / other から書き込めないことを確かめる。満たさなければ「利用不可」（従来どおり数値 uid の行だけで照合）。
 //! - 子は環境変数を持たず（`LD_*` を渡さない）、stdin / stderr は null、ambient capability は exec 直前に消す。
-//! - 期限（既定 5 秒）を超えたら kill して回収する。読み取り用スレッドは作らない（`start_entry` の手順 8 より前に
-//!   常駐スレッドを作らない制約）。出力は 4 KiB まで。
+//! - 期限（既定 5 秒）を超えたら kill して回収する。期限は子の終了待ちだけでなく標準出力の読み取りにも適用する
+//!   （バックグラウンドの孫が標準出力を継承して EOF が来なくても期限で打ち切る。REPAIR-5）。標準出力は
+//!   `UnixStream` 対の読み取り側を読み取りタイムアウトつきで読む（読み取り用スレッドも `unsafe` も使わない。
+//!   `start_entry` の手順 8 より前に常駐スレッドを作らない制約）。出力は 4 KiB まで。
+//! - 終了コード 2（キー無し）は、`/etc/nsswitch.conf` の passwd 系が `files` 等のローカル源だけのときに限り
+//!   「名前なし」とする。LDAP・sssd 等の遠隔源があるときは NSS の障害と区別できないため `Err`（起動拒否）。
 //! - 参照の失敗・不正な出力・期限切れは `Err`（fail-closed）。名前の有無を判定できないまま 1 対 1 写像へ落とさない。
 //!
 //! エラー文言は固定の英語で、ユーザー名・パス・errno・出力内容を含めない。
 
+#[cfg(any(target_os = "linux", test))]
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 
+#[cfg(any(target_os = "linux", test))]
 use crate::id_model::owner_name_from_passwd;
 
 /// `getent` の出力の上限（バイト）。1 エントリは通常 1 KiB 未満。
 pub const MAX_GETENT_OUTPUT_BYTES: usize = 4096;
 
+#[cfg(any(target_os = "linux", test))]
 fn precondition(message: &'static str) -> TraitError {
     TraitError::new(ErrorCode::FailedPrecondition, message)
 }
@@ -32,6 +39,7 @@ fn precondition(message: &'static str) -> TraitError {
 ///
 /// 1 件目の `名前:…:uid:…` の uid 欄が要求した `uid` と一致するときだけ採用する。上限超過・UTF-8 不正・
 /// 欄不足・空の名前・uid の不一致は `FailedPrecondition`。
+#[cfg(any(target_os = "linux", test))]
 pub fn owner_name_from_getent(stdout: &[u8], uid: u32) -> Result<String, TraitError> {
     let bad = || precondition("the user database returned an unusable entry");
     if stdout.len() > MAX_GETENT_OUTPUT_BYTES {
@@ -74,6 +82,7 @@ pub use linux::{DEFAULT_GETENT_TIMEOUT, GETENT_CANDIDATES, UserDbLookup, resolve
 mod linux {
     use std::io::Read as _;
     use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -109,6 +118,45 @@ mod linux {
         extra_trusted_uid: Option<u32>,
         /// この配下より上の祖先は検査しない。本番は `/`。
         ancestor_floor: PathBuf,
+        /// passwd 系の NSS 源を調べる `nsswitch.conf`。`None` は「ローカル源のみ」とみなす（試験用）。
+        nsswitch_conf: Option<PathBuf>,
+    }
+
+    /// 終了コード 2 を「名前なし」と断定してよい（NSS の障害と取り違えない）ローカル源。
+    const LOCAL_NSS_SOURCES: [&str; 6] =
+        ["files", "compat", "db", "altfiles", "systemd", "usrfiles"];
+    /// `nsswitch.conf` の読み取り上限（バイト）。
+    const MAX_NSSWITCH_BYTES: u64 = 64 * 1024;
+
+    /// `nsswitch.conf` の passwd 系（`passwd`・`passwd_compat`）の源がローカルだけか。
+    /// 角括弧の動作指定（`[NOTFOUND=return]` 等）は読み飛ばす。閉じていない角括弧は不正として `false`。
+    fn passwd_sources_all_local(text: &str) -> bool {
+        text.lines().all(|raw| {
+            let line = raw.split('#').next().unwrap_or("");
+            let Some((key, rest)) = line.split_once(':') else {
+                return true;
+            };
+            if !matches!(key.trim(), "passwd" | "passwd_compat") {
+                return true;
+            }
+            let mut in_action = false;
+            let mut plain = String::new();
+            for c in rest.chars() {
+                match c {
+                    '[' => in_action = true,
+                    ']' => {
+                        in_action = false;
+                        plain.push(' ');
+                    }
+                    _ if !in_action => plain.push(c),
+                    _ => {}
+                }
+            }
+            !in_action
+                && plain
+                    .split_whitespace()
+                    .all(|t| LOCAL_NSS_SOURCES.contains(&t))
+        })
     }
 
     impl UserDbLookup {
@@ -120,6 +168,7 @@ mod linux {
                 timeout: DEFAULT_GETENT_TIMEOUT,
                 extra_trusted_uid: None,
                 ancestor_floor: PathBuf::from("/"),
+                nsswitch_conf: Some(PathBuf::from("/etc/nsswitch.conf")),
             }
         }
 
@@ -137,7 +186,37 @@ mod linux {
                 timeout: timeout.clamp(Duration::from_secs(1), MAX_TIMEOUT),
                 extra_trusted_uid,
                 ancestor_floor,
+                nsswitch_conf: None,
             }
+        }
+
+        /// 試験向け。終了コード 2 の判定に使う `nsswitch.conf` を指定する。
+        #[must_use]
+        pub fn with_nsswitch_conf(mut self, path: PathBuf) -> Self {
+            self.nsswitch_conf = Some(path);
+            self
+        }
+
+        /// 終了コード 2 が「名前なし」だと確定できるか。遠隔源があるか読めないときは確定できない（`false`）。
+        /// ファイルが存在しないときは glibc の既定（`files`）とみなす。
+        fn exit2_means_absent(&self) -> bool {
+            let Some(path) = &self.nsswitch_conf else {
+                return true;
+            };
+            let file = match std::fs::File::open(path) {
+                Ok(f) => f,
+                Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+            };
+            let mut buf = Vec::new();
+            if file
+                .take(MAX_NSSWITCH_BYTES.saturating_add(1))
+                .read_to_end(&mut buf)
+                .is_err()
+                || u64::try_from(buf.len()).map_or(true, |n| n > MAX_NSSWITCH_BYTES)
+            {
+                return false;
+            }
+            std::str::from_utf8(&buf).is_ok_and(passwd_sources_all_local)
         }
 
         /// 最初に実体を解決できた候補が信頼できれば、その実体のパスを返す。
@@ -167,55 +246,93 @@ mod linux {
     }
 
     /// `exe passwd <uid>` を期限つきで実行し、(終了コード, 標準出力) を返す。
+    ///
+    /// 期限は終了待ちと出力の読み取りの両方に掛かる。標準出力は `UnixStream` 対の片側を子へ渡し、親側を
+    /// 短い読み取りタイムアウトで読む。孫が標準出力を持ち続けて EOF が来ない場合も期限で `Timeout` にする。
     fn run_getent(
         exe: &Path,
         uid: u32,
         timeout: Duration,
     ) -> Result<(Option<i32>, Vec<u8>), TraitError> {
+        let failed = || precondition("the user database lookup failed");
+        let (mut reader, writer) = UnixStream::pair().map_err(|_| failed())?;
+        reader
+            .set_read_timeout(Some(POLL_INTERVAL))
+            .map_err(|_| failed())?;
         let mut cmd = Command::new(exe);
         cmd.arg("passwd")
             .arg(uid.to_string())
             .env_clear()
             .stdin(Stdio::null())
             .stderr(Stdio::null())
-            .stdout(Stdio::piped());
+            .stdout(Stdio::from(std::os::fd::OwnedFd::from(writer)));
         crate::sys::clear_ambient_caps_on_exec(&mut cmd);
-        let mut child = cmd
-            .spawn()
-            .map_err(|_| precondition("the user database lookup could not start"))?;
+        let spawned = cmd.spawn();
+        // Command が持つ親側の書き込み端を閉じる。残ると子の終了後も EOF が来ない。
+        drop(cmd);
+        let mut child =
+            spawned.map_err(|_| precondition("the user database lookup could not start"))?;
         let deadline = Instant::now() + timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL_INTERVAL),
-                Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(TraitError::new(
-                        ErrorCode::Timeout,
-                        "the user database lookup timed out",
-                    ));
-                }
-                Err(_) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(precondition("the user database lookup failed"));
+        let mut out: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 1024];
+        let mut eof = false;
+        let mut status = None;
+        loop {
+            if !eof {
+                match reader.read(&mut chunk) {
+                    Ok(0) => eof = true,
+                    Ok(n) => {
+                        out.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
+                        if out.len() > MAX_GETENT_OUTPUT_BYTES {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            return Err(precondition(
+                                "the user database returned an unusable entry",
+                            ));
+                        }
+                        continue;
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(failed());
+                    }
                 }
             }
-        };
-        // 終了後に読む。出力がパイプの容量を超えると子が終わらず上の期限で打ち切られる（fail-closed）。
-        let mut out = Vec::new();
-        if let Some(pipe) = child.stdout.take() {
-            let limit = u64::try_from(MAX_GETENT_OUTPUT_BYTES)
-                .unwrap_or(u64::MAX)
-                .saturating_add(1);
-            pipe.take(limit)
-                .read_to_end(&mut out)
-                .map_err(|_| precondition("the user database lookup failed"))?;
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(s) => status = s,
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(failed());
+                    }
+                }
+            }
+            if let (Some(s), true) = (status, eof) {
+                return Ok((s.code(), out));
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(TraitError::new(
+                    ErrorCode::Timeout,
+                    "the user database lookup timed out",
+                ));
+            }
+            if eof {
+                // EOF 後は読み取りが即座に返るため、子の終了待ちの空回りを避ける。
+                std::thread::sleep(POLL_INTERVAL);
+            }
         }
-        Ok((status.code(), out))
     }
-
     /// 実効 uid の所有者名を解決する（単一の入口。`start`・pull の展開・`doctor` が共用）。
     ///
     /// `passwd` に行があればそれを返し、`getent` は起動しない。行が無いときだけ NSS を引く。passwd が壊れている・
@@ -240,8 +357,12 @@ mod linux {
                 name: owner_name_from_getent(&out, uid)?,
                 source: OwnerNameSource::Nss,
             }),
-            // getent(1): 2 はキーが見つからない。
-            Some(2) => Ok(OwnerNameResolution::NotFound),
+            // getent(1): 2 はキーが見つからない。ただし NSS の障害でも 2 が返り得るため、遠隔源がある
+            // （または nsswitch.conf を読めない）ときは「名前なし」と断定せず起動拒否にする。
+            Some(2) if lookup.exit2_means_absent() => Ok(OwnerNameResolution::NotFound),
+            Some(2) => Err(precondition(
+                "the user database could not confirm that the entry is absent",
+            )),
             _ => Err(precondition("the user database lookup failed")),
         }
     }
@@ -341,6 +462,60 @@ mod linux {
                 let e = resolve(&d, &stub(&d, body)).unwrap_err();
                 assert_eq!(e.code(), ErrorCode::FailedPrecondition, "{body}");
             }
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        /// P1: 遠隔源（ldap・sss）があるとき終了 2 は名前なしと断定せず拒否。ローカル源だけなら名前なし。
+        #[test]
+        fn core6_exit2_with_remote_nss_source_is_refused() {
+            let d = tmp("nsw");
+            let conf = d.join("nsswitch.conf");
+            let l = stub(&d, "exit 2");
+            for (text, absent) in [
+                ("passwd: files systemd\n", true),
+                (
+                    "# c\npasswd:   files [NOTFOUND=return] db\nhosts: dns ldap\n",
+                    true,
+                ),
+                ("passwd: files sss\n", false),
+                ("passwd: files ldap # x\n", false),
+                ("passwd: compat\npasswd_compat: ldap\n", false),
+                ("passwd: files [SUCCESS=return\n", false),
+            ] {
+                std::fs::write(&conf, text).unwrap();
+                let l = l.clone().with_nsswitch_conf(conf.clone());
+                let r = resolve(&d, &l);
+                if absent {
+                    assert_eq!(r.unwrap(), OwnerNameResolution::NotFound, "{text}");
+                } else {
+                    assert_eq!(
+                        r.unwrap_err().code(),
+                        ErrorCode::FailedPrecondition,
+                        "{text}"
+                    );
+                }
+            }
+            // 読めない（ディレクトリ）なら拒否、存在しないなら既定の files で名前なし。
+            let l2 = l.clone().with_nsswitch_conf(d.clone());
+            assert!(resolve(&d, &l2).is_err());
+            let l3 = l.with_nsswitch_conf(d.join("absent"));
+            assert_eq!(resolve(&d, &l3).unwrap(), OwnerNameResolution::NotFound);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        /// REPAIR-5・P0: 孫が標準出力を持ち続けても、親の終了後の読み取りは期限で打ち切る。
+        #[test]
+        fn repair5_background_grandchild_holding_stdout_times_out() {
+            let d = tmp("bg");
+            let l = stub(&d, "sleep 30 &\nexit 2");
+            let l = UserDbLookup {
+                timeout: Duration::from_secs(1),
+                ..l
+            };
+            let t = Instant::now();
+            let e = resolve(&d, &l).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::Timeout);
+            assert!(t.elapsed() < Duration::from_secs(4));
             let _ = std::fs::remove_dir_all(&d);
         }
 

@@ -489,19 +489,21 @@ mod tests {
     /// OCI-7・CLI-1: create の `--image-root` と `--image` は両方そろったときだけ受け、順不同・各 1 回。
     #[test]
     fn oci7_parse_create_image_options() {
+        let root = std::env::temp_dir();
+        let r = root.to_str().unwrap();
         let d = format!("sha256:{}", "a".repeat(64));
         let expect = Ok(CreateArgs {
             bundle: PathBuf::from("/b"),
             id: "c1".into(),
             image: Some(CreateImageArgs {
-                image_root: PathBuf::from("/imgs"),
+                image_root: root.clone(),
                 manifest: d.clone(),
             }),
         });
         assert_eq!(
             parse_create(v(&[
                 "--image-root",
-                "/imgs",
+                r,
                 "--image",
                 &d,
                 "--bundle",
@@ -517,7 +519,7 @@ mod tests {
                 "--image",
                 &d,
                 "--image-root",
-                "/imgs",
+                r,
                 "--",
                 "c1"
             ])),
@@ -525,7 +527,7 @@ mod tests {
         );
         for bad in [
             v(&["--bundle", "/b", "--image", &d, "c1"]),
-            v(&["--bundle", "/b", "--image-root", "/imgs", "c1"]),
+            v(&["--bundle", "/b", "--image-root", r, "c1"]),
             v(&["--bundle", "/b", "--image-root", "rel", "--image", &d, "c1"]),
             v(&[
                 "--bundle",
@@ -559,12 +561,14 @@ mod tests {
     /// OCI-7・CLI-1: delete の `--image-root` は任意・絶対パスのみ・1 回まで。
     #[test]
     fn oci7_parse_delete_image_root() {
+        let root = std::env::temp_dir();
+        let r = root.to_str().unwrap();
         assert_eq!(
-            parse_delete(v(&["--image-root", "/imgs", "--force", "c1"])),
+            parse_delete(v(&["--image-root", r, "--force", "c1"])),
             Ok(DeleteArgs {
                 id: "c1".into(),
                 force: true,
-                image_root: Some(PathBuf::from("/imgs")),
+                image_root: Some(root.clone()),
             })
         );
         for bad in [

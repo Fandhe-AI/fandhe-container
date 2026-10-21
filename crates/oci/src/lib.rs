@@ -29,9 +29,11 @@
 //! `layer::VerifiedLayerBlob`（symlink を辿らず開いたハンドルで信頼条件と digest を確かめた値。#2309）だけを受け、
 //! パス 1 とパス 3 で同じハンドルを読み、パス 3 でも diff_id を再計算して照合する。
 //!
-//! 対応するレイヤーの mediaType は `application/vnd.oci.image.layer.v1.tar+gzip`・
-//! `application/vnd.docker.image.rootfs.diff.tar.gzip` の 2 種のみ。それ以外（zstd は #2029 で保留中）は
-//! manifest 解決の時点で blob 取得前に `Unimplemented` で拒否する（`manifest::ensure_supported_layer_media_types`。#2037）。
+//! レイヤーの mediaType の受理集合は `layer::LAYER_MEDIA_TYPES` の 1 つの表から導出する（#2311）。展開は 6 種
+//! （非圧縮 tar・nondistributable・foreign を含む）、pull は `application/vnd.oci.image.layer.v1.tar+gzip`・
+//! `application/vnd.docker.image.rootfs.diff.tar.gzip` の 2 種のみ（暫定の決定・オーナー確認待ち）。それ以外
+//! （zstd は #2029 で保留中）は manifest 解決の時点で blob 取得前に `Unimplemented` で拒否する
+//! （`manifest::ensure_supported_layer_media_types`。#2037）。
 //!
 //! 実装済み: レイヤー tar のルート配下への安全な展開（TASK-52.3・OCI-1・MS-4・#409。`layer::extract`）。
 //! パス検証、ルートに閉じ込めた symlink 解決、hardlink の制限、エントリ数・累積サイズの上限を持つ。

@@ -193,3 +193,7 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 | インストール時の署名検証 | 未採用（PLUG-11 の opt-in の将来拡張。差し込む位置は 10 章） |
 | `CAP_AUDIT_READ`（`AUDIT_SECCOMP` の READLOG 購読） | 最小集合に含めない。付与の可否は判断待ち（`audit-seccomp-reader.md`。#2237） |
 | 再検証条件 | 実機（root 権限・対象カーネル）で #539 を実施するとき |
+
+## 補足: 範囲写像の書き込み先と dumpable（#2374）
+
+subuid / subgid の範囲写像では、`newuidmap` / `newgidmap` が対象の `/proc/<pid>` の所有者を検査するため、対象が non-dumpable だと拒否される。launcher の中間プロセスを一時的に dumpable にする方式（#2243）は、その間に同一 uid のホスト側プロセスが fd と制御フローへ触れられる窓を作る。これをなくすため、書き込み先を使い捨ての holder プロセスへ分け、中間プロセスは終始 non-dumpable のまま `setns` で参加する。設計と残る影響は [rootless-id-map-holder.md](./rootless-id-map-holder.md)（CORE-6・SEC-5・SEC-1）。

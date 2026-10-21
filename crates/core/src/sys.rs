@@ -4607,12 +4607,13 @@ pub(crate) fn set_non_dumpable() -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
-/// 呼び出したプロセスを dumpable に戻す（`PR_SET_DUMPABLE` = 1。CORE-6・SEC-5・#2243）。
+/// 呼び出したプロセスを dumpable にする（`PR_SET_DUMPABLE` = 1。CORE-6・SEC-5・#2243・#2374）。
 ///
 /// non-dumpable のプロセスの `/proc/<pid>` は root 所有になり、`newuidmap` / `newgidmap`（setuid helper）の
-/// 「呼び出し元と対象の所有者が一致する」検査が拒否する。subuid / subgid の範囲写像の書き込み
-/// （`isolate_rootless_subordinate`）の間だけ、non-dumpable で起動された呼び出しプロセス（写像の対象）を
-/// この関数で dumpable にし、書き込みの後に [`set_non_dumpable`] で戻す。
+/// 「呼び出し元と対象の所有者が一致する」検査が拒否する。subuid / subgid の範囲写像の書き込み先は、
+/// `isolate_rootless_subordinate` が fork する使い捨ての holder プロセス(`rootless::run_userns_holder`)であり、
+/// **holder の fork 子だけが**この関数を呼ぶ。呼び出しプロセス(本番 launcher の中間プロセス I を含む)は
+/// 終始 non-dumpable のままにし、dumpable になる窓を作らない。
 pub(crate) fn set_dumpable_user() -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);

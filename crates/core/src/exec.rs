@@ -321,6 +321,24 @@ pub fn path_violation_error_for_test(reason: ViolationReason, subject: &Path) ->
     ExecError::from_violation(reason, Some(subject))
 }
 
+/// 結合試験 `tests/unshare_isolation.rs` 専用の入口: 呼び出しプロセスを non-dumpable にする
+/// (`PR_SET_DUMPABLE` = 0。`isolate_rootless_subordinate` が呼び出しプロセスを dumpable にしないことの確認用。
+/// CORE-6・SEC-5・#2374。通常の利用者は呼ばない)。`exec-test-support` feature を付けたビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn set_non_dumpable_for_test() -> Result<(), ExecError> {
+    sys::set_non_dumpable()
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::UserNamespaceMap, "PR_SET_DUMPABLE"))
+}
+
+/// 結合試験専用の入口: 呼び出しプロセスの `PR_GET_DUMPABLE` が 0(non-dumpable)かどうか。
+/// 読めなければ `None`。`exec-test-support` feature を付けたビルドにだけ存在する(#2374)。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn is_non_dumpable_for_test() -> Option<bool> {
+    sys::is_dumpable().ok().map(|d| !d)
+}
+
 pub use violation::{
     IsolationViolation, VIOLATION_SUBJECT_MAX_CHARS, ViolationKind, ViolationReason,
     ViolationSubject,
@@ -1545,29 +1563,33 @@ fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
 
 /// 範囲写像付き rootless 経路の計画に従い、呼び出しプロセスを namespace 分離する（CORE-6・SEC-5）。
 ///
-/// 処理順: 実行 ID の再検証 → 同期チャネルと mapper の fork（外側の user namespace に残る）→
-/// 呼び出し元が `CLONE_NEWUSER` → mapper へ go → mapper が親 pid の `uid_map` / `gid_map` を書く
-/// （`newuidmap` / `newgidmap` 経由は setuid ヘルパーで root 権限を代替）→ 応答（固定 3 バイト）を
-/// 上限付き・タイムアウト付きで受領 → 自プロセスの写像を読み戻して計画と照合 → user namespace 内で
-/// uid / gid が 0 であることを確認 → 残りの namespace を分離（[`isolate`] と同じく `Mount` を含むときだけ `/` を再帰 private 化・hostname）。
+/// 処理順: 実行 ID の再検証 → 同期チャネルと holder(使い捨ての専用プロセス)の fork → holder が
+/// `CLONE_NEWUSER` して dumpable になり READY を返す → mapper を fork(外側の user namespace に残る)→ mapper へ
+/// go → mapper が **holder の pid** の `uid_map` / `gid_map` を書く（`newuidmap` / `newgidmap` 経由は
+/// setuid ヘルパーで root 権限を代替）→ 応答（固定 3 バイト）を上限付き・タイムアウト付きで受領 →
+/// 呼び出しプロセスが holder の pidfd で `setns(CLONE_NEWUSER)` して参加 → user namespace 内で uid / gid が 0 で、
+/// holder と同じ namespace であることを確認 → holder へ release → holder と mapper を回収 →
+/// 残りの namespace を分離（[`isolate`] と同じく `Mount` を含むときだけ `/` を再帰 private 化・hostname）。
+///
+/// 呼び出しプロセス自身は dumpable に **ならない**(写像の対象を holder に分けたため。同一 uid のホスト側
+/// プロセスが ptrace・`/proc/<pid>/fd` で呼び出しプロセスの fd・制御フローに触れる窓がない。
+/// `docs/design/rootless-id-map-holder.md`・#2374)。呼び出し元が non-dumpable ならその状態を保つ。
 ///
 /// 契約:
-/// - シングルスレッドから呼ぶこと（mapper の fork と `CLONE_NEWUSER` の制約。マルチスレッドは
+/// - シングルスレッドから呼ぶこと（holder・mapper の fork と `setns(CLONE_NEWUSER)` の制約。マルチスレッドは
 ///   副作用なしで `FailedPrecondition`）
-/// - 失敗したプロセスは破棄すること（写像は write-once で戻せない。[`isolate`] と同じ）。mapper は
+/// - 失敗したプロセスは破棄すること（写像は write-once で戻せない。[`isolate`] と同じ）。holder と mapper は
 ///   どの失敗経路でも kill して回収する（ゾンビを残さない）
-/// - mapper は親の死を EOF で検知できない（fork で fd が複製され、子側から安全に閉じられない）ため、
-///   go の待ちは read タイムアウト（`timeout`）と `parent_id()` の再確認で止める（REPAIR-5）
-/// - pidfd は採らない（書き込み先は応答待ちでブロックしている親で、pid は解放されない。
-///   詳細は [`crate::rootless`] の doc）
+/// - holder・mapper は親の死を EOF で検知できない場合があるため、待ちは read タイムアウトで止める
+///   （holder は `PDEATHSIG` でも終わる。REPAIR-5）
 pub fn isolate_rootless_subordinate(
     plan: &SubordinateIsolationPlan,
 ) -> Result<RootlessIsolationReport, ExecError> {
     isolate_rootless_subordinate_with(plan, MapperCaller::Standalone)
 }
 
-/// [`isolate_rootless_subordinate_with`] の呼び出し元の種類(mapper の fork 前の flush と、失敗時の mapper の扱い
-/// を決める。CORE-2・CORE-6・REPAIR-5・#2009)。
+/// [`isolate_rootless_subordinate_with`] の呼び出し元の種類(holder・mapper の fork 前の flush と、失敗時の
+/// mapper の扱いを決める。CORE-2・CORE-6・REPAIR-5・#2009)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MapperCaller {
     /// 公開 API([`isolate_rootless_subordinate`])。fork 前に stdio を flush し、失敗時は mapper を kill・回収する。
@@ -1577,12 +1599,29 @@ enum MapperCaller {
     Launcher,
 }
 
-/// [`isolate_rootless_subordinate`] の本体。`caller` で mapper の fork 前の flush と失敗時の扱いを切り替える。
+/// `caller` に応じた fork(Standalone は stdio を flush、Launcher は flush しない)。
+fn fork_for<F: FnOnce() -> i32>(caller: MapperCaller, f: F) -> Result<u32, ExecError> {
+    match caller {
+        MapperCaller::Standalone => sys::fork_single_threaded(f, EXIT_SETUP_FAILED),
+        MapperCaller::Launcher => sys::fork_single_threaded_no_flush(f, EXIT_SETUP_FAILED),
+    }
+    .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))
+}
+
+/// holder の release 待ちの余裕(holder が I の期限より先に諦めないための上乗せ)。
+const HOLDER_SLACK: Duration = Duration::from_secs(5);
+
+/// [`isolate_rootless_subordinate`] の本体。`caller` で fork 前の flush と失敗時の mapper の扱いを切り替える。
 ///
 /// 本番 launcher の中間プロセス I は、C の stdio バッファを flush せずに複製した子である。I が flush すると
 /// C の未出力分が二重に出て、flush が止まると期限も効かない(REPAIR-5)ため、launcher 経路は flush しない
-/// (`isolate_rootless_subordinate_no_flush`)。mapper は `_exit` で終わり stdout に書かないので、省いても二重出力は
-/// 起きない(CORE-6・#2009)。
+/// (`isolate_rootless_subordinate_no_flush`)。holder・mapper は `_exit` で終わり stdout に書かないので、省いても
+/// 二重出力は起きない(CORE-6・#2009)。
+///
+/// holder は user namespace を作って保持するだけの使い捨てプロセスで、dumpable にするのは holder だけである
+/// (`newuidmap` / `newgidmap` は対象の `/proc/<pid>` の所有者を検査し、non-dumpable な対象を拒否するため。
+/// [`crate::rootless::run_userns_holder`])。holder は I の `comm`(起動識別子)を引き継ぐ。I が報告せずに死んだ場合も、
+/// holder は `PDEATHSIG` で終わり、残っても C の識別子の再探索(`rescan_unreported_init`)が回収する(CORE-2)。
 ///
 /// mapper は fork 直後に `setsid(2)` で自分のセッション(ID = mapper の pid)を作ってから写像に進む。mapper が
 /// 起動する `newuidmap` / `newgidmap`(helper)はセッションを継承するため、mapper が helper を残して終了しても、
@@ -1599,89 +1638,64 @@ fn isolate_rootless_subordinate_with(
             None,
         ));
     }
-    // 公開 API は呼び出し元が明示した non-dumpable の保護を外さない。写像の書き込みには対象が dumpable である
-    // ことが要る(下の `restore_non_dumpable` の理由)ため、non-dumpable のままなら fork の前に拒否する
-    // (fail-closed。CORE-6・SEC-5・SEC-1)。dumpable を一時的に上げてよいのは、保護を自分で作り直せる本番 launcher
-    // の中間プロセス I だけである。
-    if caller == MapperCaller::Standalone && matches!(sys::is_dumpable(), Ok(false)) {
-        return Err(ExecError::new(
-            ErrorCode::FailedPrecondition,
-            IsolationStage::UserNamespaceMap,
-            "the caller is non-dumpable; newuidmap/newgidmap cannot map it (make the process dumpable \
-             before calling, or use the production launcher)",
-        ));
-    }
-    let (mut parent_sock, mapper_sock) = std::os::unix::net::UnixStream::pair()
-        .map_err(|e| ExecError::from_io(&e, IsolationStage::UserNamespaceMap, "socketpair"))?;
+    let io_err = |e: &std::io::Error, what: &str| {
+        ExecError::from_io(e, IsolationStage::UserNamespaceMap, what)
+    };
+    let (mut holder_sock, holder_end) =
+        std::os::unix::net::UnixStream::pair().map_err(|e| io_err(&e, "socketpair"))?;
+    let (mut mapper_sock, mapper_end) =
+        std::os::unix::net::UnixStream::pair().map_err(|e| io_err(&e, "socketpair"))?;
     let parent_pid = std::process::id();
-    let (uid, gid, writer, timeout) = (
-        plan.uid.clone(),
-        plan.gid.clone(),
-        plan.writer.clone(),
-        plan.timeout,
-    );
-    let mapper_main = move || {
-        // helper の帰属を mapper の終了後も保つため、写像の前に自分のセッションを作る(上の doc。CORE-2)。
-        if sys::new_session().is_err() {
-            return EXIT_SETUP_FAILED;
-        }
-        rootless::run_id_map_mapper(parent_pid, mapper_sock, &uid, &gid, &writer, timeout)
-    };
-    let mapper_pid = match caller {
-        MapperCaller::Standalone => sys::fork_single_threaded(mapper_main, EXIT_SETUP_FAILED),
-        MapperCaller::Launcher => {
-            sys::fork_single_threaded_no_flush(mapper_main, EXIT_SETUP_FAILED)
-        }
-    }
-    .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "fork"))?;
-    let mapper = ContainerChild::spawned(mapper_pid);
+    let timeout = plan.timeout;
 
-    // 写像の対象(このプロセス)が non-dumpable だと `/proc/<pid>` が root 所有になり、`newuidmap` / `newgidmap` の
-    // 所有者検査が拒否する(supervisor は入口で non-dumpable にする。CORE-6・SEC-5・#2243)。launcher の中間プロセス
-    // I(写像の対象。supervisor 本体 C ではなく fork した子で、C は non-dumpable のまま)に限り、書き込みの間だけ
-    // dumpable にし、成否によらず握手の後に戻す。窓の間に同一 uid のホスト側プロセスが I を ptrace できる点は
-    // newuidmap / newgidmap の仕様上避けられない(I の fd は起動入口で close_range 済みで、PID 1 の fork より前に戻す)。
-    let restore_non_dumpable =
-        caller == MapperCaller::Launcher && matches!(sys::is_dumpable(), Ok(false));
-    // mapper を fork した後は、どの失敗も下の回収の分岐を通す(`?` で早期 return すると mapper がゾンビで残る。
-    // `ContainerChild` は drop で回収しない。CORE-2)。
-    let make_dumpable = if restore_non_dumpable {
-        sys::set_dumpable_user().map_err(|e| {
-            ExecError::from_sys(e, IsolationStage::UserNamespaceMap, "PR_SET_DUMPABLE")
-        })
-    } else {
-        Ok(())
-    };
-    let handshake = match make_dumpable {
-        Ok(()) => rootless_handshake(&mut parent_sock, plan),
-        Err(e) => Err(e),
-    };
-    drop(parent_sock);
-    let restored = if restore_non_dumpable {
-        sys::set_non_dumpable().map_err(|e| {
-            ExecError::from_sys(e, IsolationStage::UserNamespaceMap, "PR_SET_DUMPABLE")
-        })
-    } else {
-        Ok(())
-    };
-    // 握手の失敗を優先し、握手が成功しても戻せなかったら失敗として扱う(non-dumpable のまま進めない)。
-    let handshake = handshake.and(restored);
+    // holder: 最初の fork(マルチスレッドはここで `FailedPrecondition`)。
+    let release_wait = timeout * 3 + HOLDER_SLACK;
+    let holder_pid = fork_for(caller, move || {
+        rootless::run_userns_holder(parent_pid, holder_end, timeout, release_wait)
+    })?;
+    // holder を fork した後は、どの失敗も下の回収の分岐を通す(`?` で早期 return すると holder・mapper が
+    // ゾンビで残る。`ContainerChild` は drop で回収しない。CORE-2)。
+    let holder = ContainerChild::spawned(holder_pid);
+    let mut mapper: Option<ContainerChild> = None;
+
+    let handshake = rootless_handshake(
+        plan,
+        caller,
+        &holder,
+        &mut holder_sock,
+        &mut mapper_sock,
+        mapper_end,
+        &mut mapper,
+    );
+    drop(mapper_sock);
+    drop(holder_sock);
     match handshake {
         // 応答(Ok)は mapper が helper を回収し終えた後にだけ届くため、ここで mapper を kill しても helper は残らない。
         Ok(()) => {
-            mapper.wait_timeout(MAPPER_REAP_TIMEOUT)?;
+            // 片方の回収が失敗しても、もう片方の回収は試みる(ゾンビを残さない)。
+            let holder_exit = holder.wait_timeout(MAPPER_REAP_TIMEOUT);
+            let mapper_exit = mapper.as_ref().map(|m| m.wait_timeout(MAPPER_REAP_TIMEOUT));
+            holder_exit?;
+            if let Some(r) = mapper_exit {
+                r?;
+            }
         }
         Err(e) => {
-            match caller {
-                // 公開 API: mapper を必ず回収する。回収自体の失敗は元のエラーを優先する。
-                MapperCaller::Standalone => {
-                    let _ = mapper.kill_and_reap(MAPPER_REAP_TIMEOUT);
+            // holder は helper を持たず I の子として必ず回収できるため、どちらの caller でも kill・回収する。
+            let _ = holder.kill_and_reap(MAPPER_REAP_TIMEOUT);
+            if let Some(m) = mapper {
+                match caller {
+                    // 公開 API: mapper を必ず回収する。回収自体の失敗は元のエラーを優先する。
+                    MapperCaller::Standalone => {
+                        let _ = m.kill_and_reap(MAPPER_REAP_TIMEOUT);
+                    }
+                    // launcher の I: mapper を kill しない。helper の実行中に mapper だけを殺すと helper が C へ
+                    // 再親付けされて識別子(`LaunchTag`)を持たないまま残り、C の判定が Clean に進む(CORE-2)。
+                    // mapper は I から継承した識別子を持ち、I の終了で C へ再親付けされるので、`R` を受けた C が
+                    // I の回収後に識別子で再探索し、helper を先に kill してから mapper と helper を回収する
+                    // (`launch_intermediate`)。
+                    MapperCaller::Launcher => drop(m),
                 }
-                // launcher の I: mapper を kill しない。helper の実行中に mapper だけを殺すと helper が C へ再親付け
-                // されて識別子(`LaunchTag`)を持たないまま残り、C の判定が Clean に進む(CORE-2)。mapper は I から
-                // 継承した識別子を持ち、I の終了で C へ再親付けされるので、`R` を受けた C が I の回収後に識別子で
-                // 再探索し、helper を先に kill してから mapper と helper を回収する(`launch_intermediate`)。
-                MapperCaller::Launcher => drop(mapper),
             }
             return Err(e);
         }
@@ -1715,12 +1729,13 @@ fn isolate_rootless_subordinate_with(
     })
 }
 
-/// 本番 launcher の中間プロセスが使う [`isolate_rootless_subordinate`](mapper の fork 前に stdio を flush
-/// しない。REPAIR-5・CORE-6。#2009)。
+/// 本番 launcher の中間プロセスが使う [`isolate_rootless_subordinate`](holder・mapper の fork 前に stdio を
+/// flush しない。REPAIR-5・CORE-6。#2009)。
 ///
 /// 公開版との違い: 失敗時に mapper を kill・回収しない。mapper(と helper)の回収は、`R` の報告を受けた C が
-/// 中間プロセスの回収後に起動識別子の再探索(`rescan_unreported_init`)で行う(CORE-2)。呼び出し元は、識別子を
-/// `comm` に設定した中間プロセスで、失敗を報告して終了すること。
+/// 中間プロセスの回収後に起動識別子の再探索(`rescan_unreported_init`)で行う(CORE-2)。holder は I の子として
+/// どちらの版でも I が回収する。呼び出し元は、識別子を `comm` に設定した中間プロセスで、失敗を報告して終了すること。
+/// 呼び出しプロセスは終始 dumpable にならない(#2374)。
 pub(crate) fn isolate_rootless_subordinate_no_flush(
     plan: &SubordinateIsolationPlan,
 ) -> Result<RootlessIsolationReport, ExecError> {
@@ -1734,24 +1749,101 @@ impl SubordinateIsolationPlan {
     }
 }
 
-/// [`isolate_rootless_subordinate`] の親側（`unshare` → go → 応答 → 自己検証）。
-/// 失敗時の mapper 回収は呼び出し元が行う。
+/// `/proc/<pid>/ns/user`(`None` なら自プロセス)の同一性 (dev, ino)。
+fn user_ns_identity(pid: Option<u32>) -> Result<(u64, u64), ExecError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let path = match pid {
+        Some(p) => format!("/proc/{p}/ns/user"),
+        None => "/proc/self/ns/user".to_string(),
+    };
+    std::fs::metadata(&path)
+        .map(|m| (m.dev(), m.ino()))
+        .map_err(|e| {
+            ExecError::from_io(&e, IsolationStage::UserNamespaceMap, "stat user namespace")
+        })
+}
+
+/// [`isolate_rootless_subordinate`] の親側（holder の READY → mapper の fork → go → 応答 → holder の
+/// user namespace へ `setns` → 自己検証 → holder へ release）。
+///
+/// 失敗時の holder・mapper の回収は呼び出し元が行う。途中で失敗しても回収できるよう、fork 済みの mapper は
+/// `mapper` へ入れてから先へ進む。
 fn rootless_handshake(
-    sock: &mut std::os::unix::net::UnixStream,
     plan: &SubordinateIsolationPlan,
+    caller: MapperCaller,
+    holder: &ContainerChild,
+    holder_sock: &mut std::os::unix::net::UnixStream,
+    mapper_sock: &mut std::os::unix::net::UnixStream,
+    mapper_end: std::os::unix::net::UnixStream,
+    mapper: &mut Option<ContainerChild>,
 ) -> Result<(), ExecError> {
     use std::io::Read as _;
 
-    rootless::unshare_user_namespace().map_err(ExecError::from_rootless)?;
-    sock.set_write_timeout(Some(plan.timeout))
-        .map_err(|e| sync_io_error(&e, "set write timeout"))?;
-    sock.write_all(&[rootless::MAPPER_GO])
-        .map_err(|e| sync_io_error(&e, "send go signal to the id map mapper"))?;
-    // Helper は uid / gid で 2 回実行するため、応答待ちの上限は 2 × timeout + 1s。
-    sock.set_read_timeout(Some(plan.timeout * 2 + Duration::from_secs(1)))
+    let parent_pid = std::process::id();
+    // 1. holder が user namespace を作って dumpable になるのを待つ(固定長・期限つき)。
+    holder_sock
+        .set_read_timeout(Some(plan.timeout))
         .map_err(|e| sync_io_error(&e, "set read timeout"))?;
     let mut buf = [0u8; rootless::MAPPER_REPLY_LEN];
-    sock.read_exact(&mut buf)
+    holder_sock
+        .read_exact(&mut buf)
+        .map_err(|e| sync_io_error(&e, "read the userns holder reply"))?;
+    match MapperReply::decode(&buf).map_err(ExecError::from_rootless)? {
+        MapperReply::Ok => {}
+        MapperReply::Failed { code, stage } => {
+            return Err(ExecError::new(
+                code,
+                IsolationStage::Unshare,
+                format!("userns holder failed at {}", stage.as_str()),
+            ));
+        }
+    }
+
+    // 2. mapper(外側の user namespace に残る)を fork する。
+    let (uid, gid, writer, timeout) = (
+        plan.uid.clone(),
+        plan.gid.clone(),
+        plan.writer.clone(),
+        plan.timeout,
+    );
+    let holder_pid = holder.pid();
+    let mut mapper_end = Some(mapper_end);
+    let mapper_pid = fork_for(caller, move || {
+        let Some(sock) = mapper_end.take() else {
+            return EXIT_SETUP_FAILED;
+        };
+        // helper の帰属を mapper の終了後も保つため、写像の前に自分のセッションを作る(上の doc。CORE-2)。
+        if sys::new_session().is_err() {
+            return EXIT_SETUP_FAILED;
+        }
+        rootless::run_id_map_mapper(holder_pid, parent_pid, sock, &uid, &gid, &writer, timeout)
+    })?;
+    *mapper = Some(ContainerChild::spawned(mapper_pid));
+
+    // 3. 参加先の同一性を、参加する前(元の namespace から)に記録する。
+    let before = user_ns_identity(None)?;
+    let holder_ns = user_ns_identity(Some(holder_pid))?;
+    if holder_ns == before {
+        return Err(ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::UserNamespaceMap,
+            "the userns holder did not create a new user namespace",
+        ));
+    }
+
+    // 4. go → 応答(Helper は uid / gid で 2 回実行するため、応答待ちの上限は 2 × timeout + 1s)。
+    mapper_sock
+        .set_write_timeout(Some(plan.timeout))
+        .map_err(|e| sync_io_error(&e, "set write timeout"))?;
+    mapper_sock
+        .write_all(&[rootless::MAPPER_GO])
+        .map_err(|e| sync_io_error(&e, "send go signal to the id map mapper"))?;
+    mapper_sock
+        .set_read_timeout(Some(plan.timeout * 2 + Duration::from_secs(1)))
+        .map_err(|e| sync_io_error(&e, "set read timeout"))?;
+    let mut buf = [0u8; rootless::MAPPER_REPLY_LEN];
+    mapper_sock
+        .read_exact(&mut buf)
         .map_err(|e| sync_io_error(&e, "read the id map mapper reply"))?;
     match MapperReply::decode(&buf).map_err(ExecError::from_rootless)? {
         MapperReply::Ok => {}
@@ -1763,10 +1855,36 @@ fn rootless_handshake(
             ));
         }
     }
+
+    // 5. holder の user namespace へ参加する。呼び出し元が non-dumpable だった場合は、参加後も保つ
+    //    (資格情報の更新で dumpable が変わる環境があっても、戻す方向にだけ動かす)。
+    let was_non_dumpable = matches!(sys::is_dumpable(), Ok(false));
+    let pidfd = holder.pidfd().ok_or_else(|| {
+        ExecError::new(
+            ErrorCode::FailedPrecondition,
+            IsolationStage::UserNamespaceMap,
+            "pidfd of the userns holder is unavailable (Linux 5.3+ required)",
+        )
+    })?;
+    sys::setns_pidfd(pidfd, &[NsFlag::User])
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::Unshare, "setns(CLONE_NEWUSER)"))?;
+    if was_non_dumpable {
+        sys::set_non_dumpable().map_err(|e| {
+            ExecError::from_sys(e, IsolationStage::UserNamespaceMap, "PR_SET_DUMPABLE")
+        })?;
+    }
     // 写像の照合は mapper 側（親の user namespace の外側）が `apply_id_maps_to` の読み戻しで済ませ、
     // Ok 応答はその検証通過を意味する。分離先の namespace から /proc/self/{uid,gid}_map を読むと
     // lower ID が読み手基準（opener の user namespace）で表示され、外側の ID と直接比較できない
-    // ため、ここでは比較せず、namespace 内で uid / gid が 0 になったことだけを確かめる。
+    // ため、ここでは比較せず、holder と同じ namespace に入ったことと、namespace 内で uid / gid が 0 に
+    // なったことだけを確かめる(fail-closed)。
+    if user_ns_identity(None)? != holder_ns {
+        return Err(ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::UserNamespaceMap,
+            "the joined user namespace is not the userns holder's",
+        ));
+    }
     if sys::effective_uid() != 0 || sys::effective_gid() != 0 {
         return Err(ExecError::new(
             ErrorCode::Internal,
@@ -1774,6 +1892,10 @@ fn rootless_handshake(
             "uid/gid inside the user namespace is not 0 after mapping",
         ));
     }
+
+    // 6. 参加が済んだので holder を解放する(best effort。応答しなくても呼び出し元が回収する)。
+    let _ = holder_sock.set_write_timeout(Some(plan.timeout));
+    let _ = holder_sock.write_all(&[rootless::HOLDER_RELEASE]);
     Ok(())
 }
 
@@ -2262,11 +2384,13 @@ mod tests {
         }
     }
 
-    /// CORE-6・SEC-5・SEC-1(#2243): non-dumpable の呼び出し元に対する公開 API は、dumpable に戻さず(保護を外さず)
-    /// fork の前に `FailedPrecondition` で拒否する。`PR_SET_DUMPABLE` はプロセス単位でテストの他の試験に残るため、
-    /// 自分自身を再実行した使い捨てプロセスの中で確かめる。
+    /// CORE-6・SEC-5・SEC-1(#2374): non-dumpable の呼び出し元に対する公開 API は、拒否もせず dumpable にも
+    /// しない(写像の対象を holder に分けたため。#2243 の「non-dumpable なら fork 前に拒否」は前提が変わって不要)。
+    /// 環境(AppArmor 等)で分離自体が失敗しても、呼び出しの後に non-dumpable のままで、失敗理由が
+    /// 「non-dumpable」でないことを確かめる(成功時の挙動は結合試験 `unshare_isolation` が具体値で照合する)。
+    /// `PR_SET_DUMPABLE` はプロセス単位でテストの他の試験に残るため、自分自身を再実行した使い捨てプロセスの中で確かめる。
     #[test]
-    fn core6_sec5_standalone_rejects_non_dumpable_caller_without_weakening_it() {
+    fn core6_sec5_standalone_keeps_non_dumpable_caller() {
         const MARK: &str = "FANDHE_TEST_NON_DUMPABLE_CHILD";
         if std::env::var_os(MARK).is_some() {
             assert_eq!(sys::set_non_dumpable(), Ok(()));
@@ -2278,10 +2402,10 @@ mod tests {
                 Duration::from_secs(5),
             )
             .unwrap();
-            let err = isolate_rootless_subordinate(&plan).unwrap_err();
-            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{err}");
-            assert!(err.to_string().contains("non-dumpable"), "{err}");
-            // 保護は外れておらず、user namespace にも入っていない(副作用なし)。
+            if let Err(err) = isolate_rootless_subordinate(&plan) {
+                assert!(!err.to_string().contains("non-dumpable"), "{err}");
+            }
+            // 成否によらず、呼び出しプロセスの保護は外れていない。
             assert_eq!(sys::is_dumpable(), Ok(false));
             return;
         }
@@ -2293,7 +2417,7 @@ mod tests {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "exec::tests::core6_sec5_standalone_rejects_non_dumpable_caller_without_weakening_it",
+                "exec::tests::core6_sec5_standalone_keeps_non_dumpable_caller",
                 "--nocapture",
                 "--test-threads=1",
             ])

@@ -77,6 +77,7 @@ rootless の `start` は、`/etc/subuid` と `/etc/subgid` の設定で ID 写�
 - `/etc/passwd` に載らないユーザー（LDAP・sssd 等）は名前が分からず、数値 uid の行だけで照合する。`newuidmap` は NSS で呼び出し元を解決するため、食い違うと helper が拒否して起動に失敗する
 - 範囲があるのに `uidmap` が無い・検証に通らないときも起動に失敗する（1 対 1 へ縮退しない）
 - これらの前提は `fandhe-container doctor` で `start` の前に確かめられる（読み取りのみ。`start` と同じ判定を使う。CORE-6・SEC-5・#2387）。主な `code` は、`SUBORDINATE_IDS_INCOMPLETE`（片方だけ）・`SUBUID_UNUSABLE` / `SUBGID_UNUSABLE`（読めない・書式不正）・`SUBORDINATE_ID_RANGE_INVALID`（範囲を写像にできない）・`ID_MAP_HELPER_NOT_FOUND` / `ID_MAP_HELPER_UNTRUSTED`（`newuidmap` / `newgidmap` が無い・信頼できない）で、いずれも警告（終了コード 3）。`SUBORDINATE_IDS_NOT_CONFIGURED`（1 対 1 写像になる）は通知のみで終了コードは 0 のまま
+- 起動したコンテナにどの写像が効いているかは、`state.json` の `launchIsolation.id_mapping` と、supervisor の `inspect` 出力の `idMapping` で確かめられる（CORE-6・REPAIR-4・#2388）。`model` は `single`（1 対 1）か `subordinate`（範囲写像）で、`uid` / `gid` はコンテナ側先頭・ホスト側先頭・個数の配列である（`inspect` では `containerId`・`hostId`・`size`）。この記録を作る前の `state.json` では `null` になる（1 対 1 とは推測しない）。記録は観測用で、写像の選択には使わない
 
 ## 起動の前提（systemd の user マネージャ）
 

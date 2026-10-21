@@ -2081,9 +2081,14 @@ mod linux {
                     {
                         lines.push(line);
                     }
-                    // 書き込み側が開いたままだと read_line が戻らず join が無期限になり得る（REPAIR-5）。
-                    // 診断用のため join せず切り離す（スレッドは読み取り終了かテストプロセス終了で消える）。
-                    drop(reader);
+                    // 子は terminate 済みで書き込み側は閉じるため、リーダーは EOF で終わる。終了を期限つきで待ち、
+                    // 終わっていれば join してスレッドを残さない（後続の wait_single_thread のため）。書き込み側が
+                    // 開いたままの場合だけ、join が無期限になるのを避けて切り離す（REPAIR-5）。
+                    if eventually(|| reader.is_finished()) {
+                        reader.join().expect("join diagnostic reader");
+                    } else {
+                        drop(reader);
+                    }
                 }
                 assert_eq!(
                     exit.expect("wait"),

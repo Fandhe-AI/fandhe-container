@@ -128,35 +128,87 @@ mod linux {
     /// `nsswitch.conf` の読み取り上限（バイト）。
     const MAX_NSSWITCH_BYTES: u64 = 64 * 1024;
 
+    /// 角括弧の動作指定を除いた源の名前の一覧。閉じていない角括弧は不正として `None`。
+    fn plain_sources(rest: &str) -> Option<Vec<String>> {
+        let mut in_action = false;
+        let mut plain = String::new();
+        for c in rest.chars() {
+            match c {
+                '[' => in_action = true,
+                ']' => {
+                    in_action = false;
+                    plain.push(' ');
+                }
+                _ if !in_action => plain.push(c),
+                _ => {}
+            }
+        }
+        if in_action {
+            return None;
+        }
+        Some(plain.split_whitespace().map(str::to_owned).collect())
+    }
+
     /// `nsswitch.conf` の passwd 系（`passwd`・`passwd_compat`）の源がローカルだけか。
     /// 角括弧の動作指定（`[NOTFOUND=return]` 等）は読み飛ばす。閉じていない角括弧は不正として `false`。
+    /// `passwd` が `compat` を含むとき、glibc は `passwd_compat` の既定を `nis` とするため、
+    /// `passwd_compat` の行が無ければローカルのみとは証明できず `false`（CORE-6・SEC-5）。
     fn passwd_sources_all_local(text: &str) -> bool {
-        text.lines().all(|raw| {
+        let mut passwd: Option<Vec<String>> = None;
+        let mut compat: Option<Vec<String>> = None;
+        for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or("");
             let Some((key, rest)) = line.split_once(':') else {
-                return true;
+                continue;
             };
-            if !matches!(key.trim(), "passwd" | "passwd_compat") {
-                return true;
+            let slot = match key.trim() {
+                "passwd" => &mut passwd,
+                "passwd_compat" => &mut compat,
+                _ => continue,
+            };
+            let Some(srcs) = plain_sources(rest) else {
+                return false;
+            };
+            // 同じ鍵が複数行あれば全部を検査対象にする。
+            slot.get_or_insert_with(Vec::new).extend(srcs);
+        }
+        let all_local = |v: &Vec<String>| v.iter().all(|t| LOCAL_NSS_SOURCES.contains(&t.as_str()));
+        if !passwd.as_ref().is_none_or(all_local) {
+            return false;
+        }
+        let uses_compat = passwd
+            .as_ref()
+            .is_some_and(|v| v.iter().any(|t| t == "compat"));
+        match &compat {
+            Some(v) => all_local(v),
+            None => !uses_compat,
+        }
+    }
+
+    /// 期限後の子の回収の猶予。
+    const REAP_GRACE: Duration = Duration::from_secs(2);
+
+    /// 子を kill し、有限の猶予内で回収する。回収できなければ `Timeout` を返す（無期限の `wait` はしない。
+    /// 割り込み不能な I/O 待ちの子が SIGKILL 後も残り得るため。REPAIR-5）。kill の失敗は握りつぶさず、
+    /// 子が既に終了していた場合を除いて回収の可否で判定する。
+    fn kill_and_reap(child: &mut std::process::Child) -> Result<(), TraitError> {
+        let _ = child.kill();
+        let until = Instant::now() + REAP_GRACE;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {}
+                Err(_) => break,
             }
-            let mut in_action = false;
-            let mut plain = String::new();
-            for c in rest.chars() {
-                match c {
-                    '[' => in_action = true,
-                    ']' => {
-                        in_action = false;
-                        plain.push(' ');
-                    }
-                    _ if !in_action => plain.push(c),
-                    _ => {}
-                }
+            if Instant::now() >= until {
+                break;
             }
-            !in_action
-                && plain
-                    .split_whitespace()
-                    .all(|t| LOCAL_NSS_SOURCES.contains(&t))
-        })
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Err(TraitError::new(
+            ErrorCode::Timeout,
+            "the user database helper could not be reaped",
+        ))
     }
 
     impl UserDbLookup {
@@ -284,8 +336,7 @@ mod linux {
                     Ok(n) => {
                         out.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
                         if out.len() > MAX_GETENT_OUTPUT_BYTES {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            kill_and_reap(&mut child)?;
                             return Err(precondition(
                                 "the user database returned an unusable entry",
                             ));
@@ -300,8 +351,7 @@ mod linux {
                                 | std::io::ErrorKind::Interrupted
                         ) => {}
                     Err(_) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_and_reap(&mut child)?;
                         return Err(failed());
                     }
                 }
@@ -310,8 +360,7 @@ mod linux {
                 match child.try_wait() {
                     Ok(s) => status = s,
                     Err(_) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_and_reap(&mut child)?;
                         return Err(failed());
                     }
                 }
@@ -320,8 +369,7 @@ mod linux {
                 return Ok((s.code(), out));
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_and_reap(&mut child)?;
                 return Err(TraitError::new(
                     ErrorCode::Timeout,
                     "the user database lookup timed out",
@@ -480,6 +528,9 @@ mod linux {
                 ("passwd: files sss\n", false),
                 ("passwd: files ldap # x\n", false),
                 ("passwd: compat\npasswd_compat: ldap\n", false),
+                // passwd_compat の既定は nis のため、compat のみでは証明できない。
+                ("passwd: compat\n", false),
+                ("passwd: compat\npasswd_compat: files\n", true),
                 ("passwd: files [SUCCESS=return\n", false),
             ] {
                 std::fs::write(&conf, text).unwrap();

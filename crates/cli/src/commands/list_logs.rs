@@ -33,6 +33,11 @@
 //! ファイルのバイト列をそのまま出す（`stdout ` / `stderr ` のタグと LF を残す）。コンテナの出力は CLI の stderr へ
 //! 出さない（stderr は失敗時の 1 行 JSON の契約。ERR-1・ERR-2）。
 //!
+//! 書き手は supervisor のバイナリ入口である。起動の手順 6 で `StartDeps::open_log_sink` の本番実装が同じ
+//! ディレクトリ（`<state_root>/@container-logs`）に `RotatingFileSink` を開き、`log_pipeline::CaptureHub` が core の
+//! 本番 launcher の出力パイプ（`take_output`）から行を流す（#1471・#1819・SUP-7）。本 module は書き手と同じ定義
+//! （`container_log_dir`・`container_log_rotation_config`）で読む。
+//!
 //! 端末制御文字はエスケープしない。ログはコンテナ利用者のデータで、docker / kubectl と同じく加工しないためである。
 //! 端末へ直接出すと ESC 系のシーケンスが解釈され得るので、信頼できないコンテナのログは `| cat -v` 等を通して見ること
 //! （エスケープ表示のオプションは未提供）。
@@ -52,6 +57,9 @@
 //!
 //! 未実装・簡易実装（REPAIR-3）:
 //! - logs の `--follow` / `--tail` / ストリーム別出力 / エスケープ表示: 未提供（CLI-1 の拡張）。
+//! - delete でのコンテナログ（`@container-logs/<id>.log*`）の削除: 未配線（#2446）。delete が消すのは supervisor の
+//!   構造化ログ（`@supervisor-logs`）だけで、コンテナログはディスクに残る。
+//! - 再起動をまたぐ出力の捕捉: 再 launch が実機で成り立つのを待つ（#2043）。
 //! - list の JSON 出力・bundle 列: JSON を手組みしない（REPAIR-2）ため serde 系の配線か core の公開ライタが前提
 //!   （TASK-95・TASK-98）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4）。非 Linux では状態ストアを開けず core 側が

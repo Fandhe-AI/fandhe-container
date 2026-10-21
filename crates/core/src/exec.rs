@@ -1819,7 +1819,17 @@ fn rootless_handshake(
         if sys::new_session().is_err() {
             return EXIT_SETUP_FAILED;
         }
-        rootless::run_id_map_mapper(holder_pid, parent_pid, sock, &uid, &gid, &writer, timeout)
+        // 診断は fork 後の子の中で作った unbuffered の stderr へ出す(#2393。バッファ付きは `_exit` で失われる)。
+        rootless::run_id_map_mapper(
+            holder_pid,
+            parent_pid,
+            sock,
+            &uid,
+            &gid,
+            &writer,
+            timeout,
+            &mut std::io::stderr(),
+        )
     })?;
     *mapper = Some(ContainerChild::spawned(mapper_pid));
 

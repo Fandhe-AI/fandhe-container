@@ -21,8 +21,13 @@
 //!
 //! # 未実装（REPAIR-3）
 //! - `newuidmap` と `newgidmap` のどちらが欠けているかの個別の切り分け（core の `HelperPaths` が組で検証するため）。
-//! - NSS（LDAP・sssd 等）と `/etc/passwd` の食い違いの検出（`start` も NSS を使わない。
-//!   `SUBID_OWNER_NAME_UNRESOLVED` の通知で案内するのみ）。
+//! - `/etc/nsswitch.conf` の `subid:` で範囲を NSS（libsubid・sssd・FreeIPA）から配る構成の検出（`start` も
+//!   `/etc/subuid`・`/etc/subgid` のファイルだけを読む。#2390 の対象外）。
+//!
+//! # 所有者名の解決（#2390）
+//! 名前は `start` と同じ `user_db::resolve_owner_name` で得る（passwd を先に読み、行が無いときだけ固定パスの
+//! `getent` を期限つきで実行する）。`getent` が無い・信頼できないときは `SUBID_OWNER_LOOKUP_UNAVAILABLE`（通知）、
+//! NSS の参照が失敗・期限切れのときは `SUBID_OWNER_LOOKUP_FAILED`（Warning。`start` も拒否する）。
 
 use super::user_scope_check::PrivilegeState;
 use super::{DoctorExitStatus, DoctorSeverity};
@@ -33,8 +38,12 @@ use crate::json::json_escape;
 pub enum OwnerState {
     /// 名前を得て、`SubIdOwner` の規則に適合する。
     Resolved,
-    /// passwd が無い・実効 uid の行が無い（数値 uid の行だけで照合する）。
+    /// passwd にも NSS（`getent`）にも実効 uid の行が無い（数値 uid の行だけで照合する）。
     Unresolved,
+    /// passwd に行が無く、信頼できる `getent` も無い（NSS を引けない。数値 uid の行だけで照合する）。
+    LookupUnavailable,
+    /// NSS の参照が失敗・期限切れ・不正な出力（`start` は拒否する）。
+    LookupFailed,
     /// passwd が読めない・壊れている・上限超過。
     PasswdUnusable,
     /// 名前が `SubIdOwner` の規則（文字種・長さ）に違反する。
@@ -245,9 +254,9 @@ pub fn evaluate(f: &IdMappingFindings) -> IdMappingReport {
         OwnerState::InvalidName => diagnostics.push(diag(
             Warning,
             "SUBID_OWNER_NAME_INVALID",
-            "the user name in /etc/passwd cannot be used to match subordinate id lines (only letters, digits, dot, underscore and hyphen up to 32 characters are accepted)",
+            "the user name of this account cannot be used to match subordinate id lines (it must be 1 to 256 bytes with no colon, whitespace or control characters)",
             vec![
-                "Use a user name made of letters, digits, dot, underscore and hyphen (at most 32 characters) for the account that starts containers",
+                "Use a user name of at most 256 bytes without colons, whitespace or control characters for the account that starts containers",
             ],
             "passwd",
             "invalid_name",
@@ -255,12 +264,32 @@ pub fn evaluate(f: &IdMappingFindings) -> IdMappingReport {
         OwnerState::Unresolved => diagnostics.push(diag(
             Notice,
             "SUBID_OWNER_NAME_UNRESOLVED",
-            "no user name was found in /etc/passwd for this uid; only subordinate id lines that use the numeric uid can match (NSS sources such as LDAP are not consulted)",
+            "no user name was found in /etc/passwd or the system user database for this uid; only subordinate id lines that use the numeric uid can match",
             vec![
-                "If the account comes from LDAP or sssd, write the numeric uid in the first field of /etc/subuid and /etc/subgid",
+                "Write the numeric uid, or the account name reported by getent passwd, in the first field of /etc/subuid and /etc/subgid",
             ],
             "passwd",
             "unresolved",
+        )),
+        OwnerState::LookupUnavailable => diagnostics.push(diag(
+            Notice,
+            "SUBID_OWNER_LOOKUP_UNAVAILABLE",
+            "this uid is not in /etc/passwd and no trusted getent was found, so the system user database was not consulted; only subordinate id lines that use the numeric uid can match",
+            vec![
+                "Install getent as a root-owned file that group and other users cannot write, or write the numeric uid in the first field of /etc/subuid and /etc/subgid",
+            ],
+            "passwd",
+            "lookup_unavailable",
+        )),
+        OwnerState::LookupFailed => diagnostics.push(diag(
+            Warning,
+            "SUBID_OWNER_LOOKUP_FAILED",
+            "this uid is not in /etc/passwd and looking it up in the system user database failed or timed out; starting a container fails closed",
+            vec![
+                "Check that the directory service (LDAP, sssd) is reachable and that getent passwd returns this account, then re-run fandhe-container doctor",
+            ],
+            "passwd",
+            "lookup_failed",
         )),
         OwnerState::Resolved | OwnerState::NotChecked => {}
     }
@@ -409,6 +438,8 @@ pub struct IdMappingSources {
     pub subgid: std::path::PathBuf,
     /// helper の位置（`None` なら固定の既定位置）。
     pub helpers: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    /// NSS（`getent`）の参照設定。本番は `UserDbLookup::system()`。
+    pub lookup: fandhe_container_supervisor::user_db::UserDbLookup,
 }
 
 #[cfg(target_os = "linux")]
@@ -421,6 +452,7 @@ impl IdMappingSources {
             subuid: SYSTEM_SUBUID.into(),
             subgid: SYSTEM_SUBGID.into(),
             helpers: None,
+            lookup: fandhe_container_supervisor::user_db::UserDbLookup::system(),
         }
     }
 }
@@ -440,10 +472,10 @@ pub fn collect_with(status_text: Option<&str>, sources: &IdMappingSources) -> Id
     };
     use fandhe_container_core::traits::ErrorCode;
     use fandhe_container_supervisor::id_model::{
-        RootlessIdModel, SubIdFileProbe, probe_sub_id_file, read_owner_name,
-        select_rootless_id_model,
+        RootlessIdModel, SubIdFileProbe, probe_sub_id_file, select_rootless_id_model,
     };
     use fandhe_container_supervisor::privilege::parse_proc_status;
+    use fandhe_container_supervisor::user_db::{OwnerNameResolution, resolve_owner_name};
 
     let Some(Ok(snapshot)) = status_text.map(parse_proc_status) else {
         return IdMappingFindings::unchecked(PrivilegeState::Unreadable);
@@ -454,20 +486,28 @@ pub fn collect_with(status_text: Option<&str>, sources: &IdMappingSources) -> Id
     }
     let mut f = IdMappingFindings::unchecked(PrivilegeState::Rootless);
     let (real, effective) = (uid.real, uid.effective);
-    let Ok(name) = read_owner_name(&sources.passwd, effective) else {
-        f.owner = OwnerState::PasswdUnusable;
-        return f;
+    let resolution = match resolve_owner_name(&sources.passwd, effective, &sources.lookup) {
+        Ok(r) => r,
+        // passwd の不具合と NSS の失敗は、`start` と同じ固定文言で見分ける。
+        Err(e) if e.message() == "the passwd database is unusable" => {
+            f.owner = OwnerState::PasswdUnusable;
+            return f;
+        }
+        Err(_) => {
+            f.owner = OwnerState::LookupFailed;
+            return f;
+        }
     };
-    let resolved = name.is_some();
+    let (name, state) = match resolution {
+        OwnerNameResolution::Resolved { name, .. } => (Some(name), OwnerState::Resolved),
+        OwnerNameResolution::NotFound => (None, OwnerState::Unresolved),
+        OwnerNameResolution::LookupUnavailable => (None, OwnerState::LookupUnavailable),
+    };
     let Ok(owner) = SubIdOwner::new(effective, name) else {
         f.owner = OwnerState::InvalidName;
         return f;
     };
-    f.owner = if resolved {
-        OwnerState::Resolved
-    } else {
-        OwnerState::Unresolved
-    };
+    f.owner = state;
     let (pu, pg) = (
         probe_sub_id_file(&sources.subuid, &owner),
         probe_sub_id_file(&sources.subgid, &owner),
@@ -629,6 +669,27 @@ mod tests {
         assert_eq!(r.exit_status().code(), 3);
     }
 
+    /// 名前を引けない場合・NSS を引けない場合は通知で 0、NSS の失敗は Warning で 3。
+    #[test]
+    fn core6_nss_lookup_states() {
+        let r = evaluate(&IdMappingFindings {
+            owner: OwnerState::LookupUnavailable,
+            ..base()
+        });
+        assert_eq!(codes(&r), ["SUBID_OWNER_LOOKUP_UNAVAILABLE"]);
+        assert_eq!(r.diagnostics[0].severity, DoctorSeverity::Notice);
+        assert_eq!(r.diagnostics[0].state, "lookup_unavailable");
+        assert_eq!(r.exit_status().code(), 0);
+        let r = evaluate(&IdMappingFindings {
+            owner: OwnerState::LookupFailed,
+            ..IdMappingFindings::unchecked(PrivilegeState::Rootless)
+        });
+        assert_eq!(codes(&r), ["SUBID_OWNER_LOOKUP_FAILED"]);
+        assert_eq!(r.diagnostics[0].severity, DoctorSeverity::Warning);
+        assert_eq!(r.diagnostics[0].state, "lookup_failed");
+        assert_eq!(r.exit_status().code(), 3);
+    }
+
     /// 名前を引けない場合は通知で 0。
     #[test]
     fn core6_unresolved_owner_name_is_a_notice() {
@@ -701,7 +762,10 @@ mod tests {
     mod linux {
         use super::*;
         use fandhe_container_supervisor::id_model::{SubIdFileProbe, select_rootless_id_model};
+        use fandhe_container_supervisor::user_db::UserDbLookup;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         use std::path::{Path, PathBuf};
+        use std::time::Duration;
 
         struct Dir(PathBuf);
         impl Dir {
@@ -713,6 +777,7 @@ mod tests {
                 ));
                 let _ = std::fs::remove_dir_all(&d);
                 std::fs::create_dir_all(&d).unwrap();
+                std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
                 Self(d)
             }
             fn write(&self, name: &str, body: &str) -> PathBuf {
@@ -748,6 +813,8 @@ mod tests {
                 subgid: subgid.map_or(missing, |b| d.write("subgid", b)),
                 // 利用者所有ファイル（祖先の一時ディレクトリが g/o 書き込み可なので必ず拒否される）。
                 helpers: Some((d.write("newuidmap", ""), d.write("newgidmap", ""))),
+                // 既定は候補なし（実機の NSS を引かない）。
+                lookup: UserDbLookup::custom(Vec::new(), Duration::from_secs(5), None, d.0.clone()),
             }
         }
 
@@ -817,16 +884,54 @@ mod tests {
             assert_eq!(r.exit_status().code(), 0);
         }
 
-        /// CORE-6: 名前を引けない（passwd に行が無い）場合は数値 uid の行で照合し、通知を出す。
+        /// 試験用の getent を置き、それを使う設定を返す。
+        fn stub_lookup(d: &Dir, body: &str) -> UserDbLookup {
+            let p = d.0.join("getent");
+            let _ = std::fs::remove_file(&p);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let euid = std::fs::metadata("/proc/self").unwrap().uid();
+            UserDbLookup::custom(vec![p], Duration::from_secs(5), Some(euid), d.0.clone())
+        }
+
+        /// CORE-6・SEC-5(#2390): passwd に無い名前を NSS から得て、名前で書かれた行で範囲写像になる。
+        /// NSS の失敗は LOOKUP_FAILED、getent が無ければ LOOKUP_UNAVAILABLE。
+        #[test]
+        fn core6_nss_name_resolves_named_subid_lines() {
+            let d = Dir::new("nss");
+            let mut s = sources(
+                &d,
+                "bob:x:2000:2000::/h:/bin/sh\n",
+                Some("ldapuser:100000:65536\n"),
+                Some("ldapuser:100000:65536\n"),
+            );
+            s.lookup = stub_lookup(&d, "echo 'ldapuser:*:1000:1000::/h:/bin/sh'");
+            let (f, r) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.owner, OwnerState::Resolved);
+            assert_eq!(f.model, ModelState::Subordinate);
+            assert!(!codes(&r).contains(&"SUBID_OWNER_NAME_UNRESOLVED"));
+            s.lookup = stub_lookup(&d, "exit 1");
+            let (f, r) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.owner, OwnerState::LookupFailed);
+            assert_eq!(f.subuid, SubIdState::NotChecked);
+            assert_eq!(codes(&r), ["SUBID_OWNER_LOOKUP_FAILED"]);
+            s.lookup = UserDbLookup::custom(Vec::new(), Duration::from_secs(5), None, d.0.clone());
+            let (f, r) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.owner, OwnerState::LookupUnavailable);
+            assert!(codes(&r).contains(&"SUBID_OWNER_LOOKUP_UNAVAILABLE"));
+        }
+
+        /// CORE-6: 名前を引けない（passwd にも NSS にも行が無い）場合は数値 uid の行で照合し、通知を出す。
         #[test]
         fn core6_numeric_uid_line_matches_without_passwd_name() {
             let d = Dir::new("numeric");
-            let s = sources(
+            let mut s = sources(
                 &d,
                 "bob:x:2000:2000::/h:/bin/sh\n",
                 Some("1000:100000:65536\n"),
                 Some("1000:100000:65536\n"),
             );
+            s.lookup = stub_lookup(&d, "exit 2");
             let (f, r) = run(&d, &status(1000, 1000), &s);
             assert_eq!(f.owner, OwnerState::Unresolved);
             assert_eq!(f.model, ModelState::Subordinate);

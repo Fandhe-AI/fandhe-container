@@ -87,5 +87,6 @@ pub mod stderr_sink;
 pub mod supervisor_log;
 #[cfg(any(windows, target_os = "linux"))]
 mod sys;
+pub mod user_db;
 #[cfg(target_os = "linux")]
 pub mod user_scope;

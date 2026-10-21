@@ -46,9 +46,10 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - ユーザー名 → `/etc/subuid` 行の NSS 解決は**追加しない**（`getpwuid_r` は新規 FFI のため。
-//!   呼び出し側が [`SubIdOwner`] に数値 uid と検証済みユーザー名を渡す方式を維持する。
-//!   ライブラリコードは `$USER` を読まない）
+//! - ユーザー名 → `/etc/subuid` 行の NSS 解決は core では行わない。名前の解決は supervisor の `id_model` が
+//!   `/etc/passwd` を先に読み、無いときだけ `getent` を期限つきで実行して行う（#2390・SEC-5・CORE-6。
+//!   `docs/design/subid-owner-resolution.md`）。core は [`SubIdOwner`] に数値 uid と検証済みユーザー名を
+//!   受け取るだけで、ライブラリコードは `$USER` を読まない
 //! - `oci_runtime` の `linux.uidMappings` / `gidMappings` の受理（start.rs は現状拒否のまま。受けるかは SEC-5 に関わるオーナー判断待ち。#2240・`docs/design/config-id-mappings.md`）
 //!
 //! ファイル所有者の写像（SEC-5。ns 内 0 → ホスト非特権 UID）の照合は `tests/rootless_file_owner.rs`
@@ -82,8 +83,9 @@ const MAX_HELPER_STDERR_BYTES: usize = 4096;
 /// ヘルパー実行タイムアウトの既定（REPAIR-5）。範囲は `1..=60` 秒。
 pub const DEFAULT_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
-/// 所有者名の最大長。
-const MAX_OWNER_NAME_LEN: usize = 32;
+/// 所有者名の最大バイト長（`LOGIN_NAME_MAX`）。sssd / LDAP の長い名前（`user@example.com` 等）を受けるため
+/// shadow 側に制限が無いことに合わせて緩める（#2390）。
+const MAX_OWNER_NAME_LEN: usize = 256;
 
 /// 失敗した段（ERR-1 の機械可読な文脈）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,13 +339,16 @@ pub struct SubIdOwner {
 }
 
 impl SubIdOwner {
-    /// 所有者を作る。名前は `[A-Za-z0-9._-]`・32 文字以内のみ許可する。
+    /// 所有者を作る。名前は空でなく 256 バイト以内で、`:`・空白・ASCII 制御文字を含まないものだけ許可する。
+    ///
+    /// 名前は分割した欄との `==` 比較にしか使わず helper にもシェルにも渡さないため、文字種は注入面にならない
+    /// （`newuidmap` 側にも文字種の制限は無い。#2390）。
     pub fn new(uid: u32, name: Option<String>) -> Result<Self, RootlessError> {
         if let Some(n) = &name {
             let ok = !n.is_empty()
                 && n.len() <= MAX_OWNER_NAME_LEN
-                && n.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+                && n.chars()
+                    .all(|c| c != ':' && !c.is_whitespace() && !c.is_ascii_control());
             if !ok {
                 return Err(RootlessError::invalid(
                     RootlessStage::ParseSubordinateIds,
@@ -1403,6 +1408,27 @@ mod tests {
         assert!(parse_subordinate_ids(lines.as_bytes(), &owner()).is_err());
         assert!(SubIdOwner::new(1, Some("a b".to_string())).is_err());
         assert!(SubIdOwner::new(1, Some("a:b".to_string())).is_err());
+    }
+
+    /// CORE-6・SEC-5（#2390）: sssd / LDAP 形式の長い名前・`@` つきの名前を受け、規則違反は拒否する。
+    #[test]
+    fn core6_owner_name_accepts_directory_service_names() {
+        for ok in ["alice@example.com".to_string(), "a".repeat(256)] {
+            assert!(SubIdOwner::new(1, Some(ok)).is_ok());
+        }
+        for bad in [
+            "a".repeat(257),
+            "a\nb".to_string(),
+            "a\tb".to_string(),
+            "a\0b".to_string(),
+            String::new(),
+        ] {
+            assert!(SubIdOwner::new(1, Some(bad)).is_err());
+        }
+        let owner = SubIdOwner::new(1000, Some("alice@example.com".to_string())).expect("owner");
+        let ranges =
+            parse_subordinate_ids(b"alice@example.com:100000:65536\n", &owner).expect("parse");
+        assert_eq!(ranges.len(), 1);
     }
 
     #[test]

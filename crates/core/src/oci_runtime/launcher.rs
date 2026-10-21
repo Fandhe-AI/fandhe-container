@@ -366,7 +366,8 @@ impl ProductionLauncherBuilder {
 /// CORE-6・SEC-5・#2009)。
 ///
 /// 呼び出し元は supervisor(結線済み。#2243。選ぶ条件と名前の取得は supervisor の start 経路)。パスはすべて絶対パスで、`PATH` は探索しない。所有者の名前は
-/// 呼び出し側が渡す(`rootless` のモジュール doc のとおり、ライブラリは `$USER` を読まず NSS も使わない)。一般的な
+/// 呼び出し側(supervisor の `id_model`)が `/etc/passwd`、無ければ NSS(`getent`)で解決して渡す(#2390。
+/// ライブラリは `$USER` を読まず NSS も使わない)。一般的な
 /// `/etc/subuid` はユーザー名で書かれるため、名前を渡さないと数値の uid の行しか一致しない。
 /// 範囲の読み取りと helper の検証は [`ProductionLauncherBuilder::build`] が行う。
 #[cfg(target_os = "linux")]

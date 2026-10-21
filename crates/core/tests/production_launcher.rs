@@ -22,7 +22,7 @@
 //!   mountinfo 上の `/data` のオプションに `rw`・`nosuid`・`nodev` が含まれることを照合する
 //! - シナリオ E（状態ルートの bind 拒否。#2066・SEC-1）: 状態ルート自身とその symlink 別名を bind の元にした start が
 //!   `InvalidArgument` で拒否され、状態が Created のまま子が残らないことを照合する
-//! - シナリオ F（Landlock の Mount 識別子照合。#2071・CORE-5・SEC-1）: `linux.readonlyPaths` に `/dev` を足し、
+//! - シナリオ F（Landlock の Mount 識別子照合。#2071・CORE-5・SEC-1）: `mounts[]` の bind 先を `linux.readonlyPaths` にも足し、
 //!   記録（`RealPrePivotOps`）より後に `/dev` へ別のマウントが重なる起動が、Landlock 適用時の照合で拒否されて
 //!   失敗し、状態が Created のまま子が残らないことを照合する。記録と一致する側はシナリオ A・D の成功が担う
 //! - シナリオ G（devtmpfs の bind 拒否。#2129・SEC-1）: ホストの `/dev`（fstype `devtmpfs`。`f_type` は tmpfs と同じで見分けられない）を
@@ -1409,21 +1409,30 @@ mod linux {
     ///
     /// - 一致する場合: シナリオ D（`/data` の bind を記録し、Landlock 適用後も bind 先へ書ける）とシナリオ A
     ///   （既定の `/dev` 系の記録）が、記録と実マウントが一致したまま起動に成功することで担う
-    /// - 記録後にマウントが変わる場合（本シナリオ）: `linux.readonlyPaths` に `/dev` を足すと、`apply_readonly_paths` が
-    ///   `RealPrePivotOps` の記録（`create_devices` 直後）より後に `/dev` へ別のマウント（読み取り専用の bind）を重ねる。
-    ///   Landlock の暗黙の `/dev` ルールの対象は記録と別のマウントになるため、適用時の照合が拒否し、起動は失敗する。
+    /// - 記録後にマウントが変わる場合（本シナリオ）: `mounts[]` の bind（`BIND_DEST`）を記録させたうえで `linux.readonlyPaths` に同じ
+    ///   `BIND_DEST` を足すと、`apply_readonly_paths` が記録より後にそこへ別のマウント（読み取り専用の bind）を重ねる。
+    ///   Landlock の Mount 由来のルールの対象は記録と別のマウントになるため、適用時の照合が拒否し、起動は失敗する。
+    ///   暗黙の `/dev` 系（`/dev`・`/dev/pts`・`/dev/shm`）を保護パスにする config は start 入口が `InvalidArgument` で
+    ///   拒否する（SEC-2・#2015）ため、本シナリオは `/dev` 系を使わない
     ///   Landlock 段の拒否は pivot 後の子で起き、状態 pipe（pre-pivot 段のみ）では親へ届かない（`docs/design/audit-delivery.md`
     ///   8 章。#2023〜）ため、親から観測できるのは「起動が失敗し、状態が Created に戻り、子が残らない」ことまで。
     ///   拒否理由そのものは `exec/landlock.rs` の単体試験が `ViolationReason::LandlockMountIdentityMismatch` で照合する。
     fn scenario_f_landlock_mount_identity_swapped(env: &Env, tag: u32) {
+        let src = Bundle::new("f-src");
         let bundle = Bundle::new("f");
         let ld = make_rootfs(&bundle.rootfs(), true);
-        write_config(&bundle, &ld, &[], json!([]));
+        let mounts = json!([{
+            "destination": BIND_DEST,
+            "type": "bind",
+            "source": src.dir.to_str().expect("utf8 source path"),
+            "options": ["bind", "rw"]
+        }]);
+        write_config(&bundle, &ld, &[], mounts);
         let path = bundle.dir.join("config.json");
         let mut config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).expect("read config.json"))
                 .expect("parse config.json");
-        config["linux"]["readonlyPaths"] = json!(["/dev"]);
+        config["linux"]["readonlyPaths"] = json!([BIND_DEST]);
         std::fs::write(
             &path,
             serde_json::to_vec(&config).expect("serialize config"),

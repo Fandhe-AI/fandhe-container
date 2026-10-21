@@ -1292,6 +1292,68 @@ fn oci1_pull_rootfs_is_idempotent() {
     assert!(staging_is_empty(&dir));
 }
 
+/// OCI-1: 公開済みでも layer 件数が config と食い違う manifest は DataLoss で拒否する（キャッシュ命中で飛ばさない）。
+#[test]
+fn oci1_pull_cached_rootfs_still_checks_layer_count() {
+    let dir = TempDir::new("cached-count");
+    let first = OciImagePuller::new(
+        Arc::new(FakeClient::new(two_layer_manifest())),
+        config(&dir),
+    );
+    first.pull(&req("alpine:3.20")).expect("first");
+    let extra = manifest_json(
+        SHA_CONFIG,
+        &[
+            (SHA_LAYER1, SIZE_LAYER1),
+            (SHA_LAYER2, SIZE_LAYER2),
+            (SHA_LAYER1, SIZE_LAYER1),
+        ],
+    );
+    let second = OciImagePuller::new(Arc::new(FakeClient::new(extra)), config(&dir));
+    let err = second.pull(&req("alpine:3.20")).expect_err("extra layer");
+    assert_eq!(err.code(), OciErrorCode::DataLoss);
+    assert_eq!(err.message(), "image layer count does not match the config");
+}
+
+/// OCI-1・SEC-5: 展開設定が違う pull は公開済み rootfs を再利用せず、既存の展開物も消さずに拒否する。
+#[test]
+fn oci1_pull_does_not_reuse_rootfs_unpacked_with_other_settings() {
+    use fandhe_container_oci::layer::extract::{IdRange, SpecialBitsPolicy};
+    let dir = TempDir::new("settings");
+    let first = OciImagePuller::new(
+        Arc::new(FakeClient::new(two_layer_manifest())),
+        config(&dir),
+    );
+    first.pull(&req("alpine:3.20")).expect("first");
+    let marker = rootfs_path(&dir, SHA_CONFIG).join("marker");
+    fs::write(&marker, b"m").expect("marker");
+    let mut other = config(&dir);
+    let range = IdRange {
+        container_id: 0,
+        host_id: 100_000,
+        count: 65_536,
+    };
+    other.extract_options =
+        other
+            .extract_options
+            .with_special_bits(SpecialBitsPolicy::PreserveIfOwnerMapped {
+                uid: range,
+                gid: range,
+            });
+    let second = OciImagePuller::new(Arc::new(FakeClient::new(two_layer_manifest())), other);
+    let err = second
+        .pull(&req("alpine:3.20"))
+        .expect_err("other settings");
+    assert_eq!(err.code(), OciErrorCode::FailedPrecondition);
+    assert_eq!(
+        err.message(),
+        "image rootfs cache entry was unpacked with different settings"
+    );
+    assert_eq!(fs::read(&marker).expect("kept"), b"m");
+    // 同じ設定なら再利用できる。
+    first.pull(&req("alpine:3.20")).expect("same settings");
+}
+
 /// OCI-1・SEC: 公開先に通常ファイルや symlink があれば、消さずに FailedPrecondition で拒否する。
 #[test]
 fn oci1_pull_rejects_untrusted_rootfs_cache_entry() {

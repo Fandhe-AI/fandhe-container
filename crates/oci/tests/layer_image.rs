@@ -15,9 +15,10 @@ use std::path::{Path, PathBuf};
 use fandhe_container_oci::config::parse_image_config_rootfs;
 use fandhe_container_oci::error::OciErrorCode;
 use fandhe_container_oci::layer::VerifiedLayerBlob;
+use fandhe_container_oci::layer::extract::{ExtractLimits, extract_image_layers};
+#[cfg(unix)]
 use fandhe_container_oci::layer::extract::{
-    ExtractLimits, ExtractOptions, SpecialBitsPolicy, extract_image_layers,
-    extract_image_layers_with_options, remove_extracted_tree,
+    ExtractOptions, SpecialBitsPolicy, extract_image_layers_with_options, remove_extracted_tree,
 };
 #[cfg(unix)]
 use fandhe_container_oci::layer::extract::{ImageLayer, image_layers_from};

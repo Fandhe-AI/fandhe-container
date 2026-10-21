@@ -2063,10 +2063,31 @@ mod linux {
                 assert_eq!(state_of(&env.store, &id), ContainerState::Created);
             }
             Ok(started) => {
+                // 失敗の診断（子の stderr の 1 行）を終了状態の不一致の報告へ添えるため、待つ前に読み手を立てる
+                // （CI だけで SIGSEGV が観測された原因の切り分け用。#2376）。
+                let diag = started
+                    .process()
+                    .take_output()
+                    .and_then(|o| o.stderr)
+                    .map(spawn_reader);
                 let exit = started.process().wait(timeout());
                 let (_record, process) = started.into_parts();
                 let _ = process.terminate(timeout());
-                assert_eq!(exit.expect("wait"), Some(ProcessExit::Exited(127)));
+                let mut lines: Vec<String> = Vec::new();
+                if let Some((rx, reader)) = diag {
+                    let deadline = Instant::now() + timeout();
+                    while let Ok(line) =
+                        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    {
+                        lines.push(line);
+                    }
+                    reader.join().expect("join diagnostic reader");
+                }
+                assert_eq!(
+                    exit.expect("wait"),
+                    Some(ProcessExit::Exited(127)),
+                    "child stderr: {lines:?}"
+                );
             }
         }
         assert!(eventually(|| children_of_self().is_empty()));

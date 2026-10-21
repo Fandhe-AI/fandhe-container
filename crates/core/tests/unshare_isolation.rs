@@ -285,11 +285,18 @@ mod linux {
         let out = std::fs::read_to_string(&log).unwrap_or_default();
         let _ = std::fs::remove_file(&log);
         assert_eq!(status.code(), Some(0), "subordinate child failed\n{out}");
-        assert!(samples >= 1, "no /proc/<child> owner sample was taken");
-        assert!(
-            observed.is_empty(),
-            "the caller became dumpable while mapping (owner uids seen: {observed:?}, samples: {samples})"
-        );
+        if !out.lines().any(|l| l == "owner sampling supported") {
+            println!(
+                "unshare_isolation: /proc owner does not reflect non-dumpable on this kernel; \
+                 owner sampling skipped (the child still verified PR_GET_DUMPABLE)"
+            );
+        } else {
+            assert!(samples >= 1, "no /proc/<child> owner sample was taken");
+            assert!(
+                observed.is_empty(),
+                "the caller became dumpable while mapping (owner uids seen: {observed:?}, samples: {samples})"
+            );
+        }
         println!(
             "unshare_isolation: subordinate isolation kept the caller non-dumpable (samples={samples})"
         );
@@ -307,7 +314,14 @@ mod linux {
 
         set_non_dumpable_for_test().expect("set non-dumpable");
         assert_eq!(is_non_dumpable_for_test(), Some(true));
-        assert_eq!(proc_owner_uid(std::process::id()), Some(0));
+        // non-dumpable のとき /proc/<pid> の所有者が root になるのは一部のカーネル・環境の挙動で、
+        // 成り立たない環境では所有者の標本が窓の観測にならない。その場合は親が標本の判定を省き、
+        // 子側の PR_GET_DUMPABLE の照合だけを残す(実装の不具合とは区別して明示する)。
+        if proc_owner_uid(std::process::id()) == Some(0) {
+            println!("owner sampling supported");
+        } else {
+            println!("owner sampling unsupported");
+        }
         let uid = real_uid();
         let gid = std::fs::read_to_string("/proc/self/status")
             .expect("read status")

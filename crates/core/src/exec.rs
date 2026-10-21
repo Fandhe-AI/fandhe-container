@@ -1898,6 +1898,7 @@ fn rootless_handshake(
     let _ = holder_sock.write_all(&[rootless::HOLDER_RELEASE]);
     Ok(())
 }
+
 /// 両経路に共通する副作用部（検証済みの計画からだけ呼ぶ）。
 fn unshare_and_configure(
     namespaces: NamespaceSet,

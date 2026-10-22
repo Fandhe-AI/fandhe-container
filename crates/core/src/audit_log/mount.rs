@@ -17,8 +17,9 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! 本番 sink `FileAuditSink`（#1594）は実装済み。本番 launcher・fork 後の子プロセスへの `AuditSink` の引き回しは
-//! 後続（TASK-29 / TASK-157 系）。現時点で本番経路からは呼ばれない。
+//! 本番 sink `FileAuditSink`（#1594）は実装済み。`oci_runtime::audit_mount_config_error` は CLI の create
+//! （`create_audited`。#2480）から呼ばれる。plugin-cri の create と start の TOCTOU 再検証での destination 拒否、
+//! fork 後の子プロセスへの `AuditSink` の引き回しは後続（TASK-29 / TASK-157 系）。
 
 use std::path::Path;
 

@@ -66,7 +66,9 @@ pub use config::{
     OciConfigErrorKind, OciIdMapping, OciMount, OciNamespace, OciProcess, OciRoot, OciUser,
     OciVersion, UnappliedField, load_config, parse_config_bytes,
 };
-pub use create::{create, create_with_image, load_resource_limits};
+pub use create::{
+    create, create_audited, create_with_image, create_with_image_audited, load_resource_limits,
+};
 pub use delete::{CgroupRemoval, ContainerCgroupRemover, delete, delete_releasing_image_ref};
 pub use error::{
     LifecycleOp, OCI_ERROR_MESSAGE_MAX_BYTES, OCI_EXIT_ALREADY_EXISTS,

@@ -8,6 +8,10 @@
 //! （canonicalize しない）。bundle までの経路の symlink は supervisor 側の start が起動前に検査して拒否する（SEC-1）。
 //! 依存（状態ストア・計測器）は [`Runtime`] で注入できるようにし、単体テストではフェイクを差せる。
 //!
+//! `create` は config の `mounts[].destination` の拒否を、状態ルートの `@audit.log` へ mount 層で記録する
+//! （core の `create_audited` / `create_with_image_audited`。SEC-4・OCI-4・#2480。Linux のみ。非 Linux は
+//! `open_store` が先に失敗するため到達しない）。
+//!
 //! 未実装・簡易実装（REPAIR-3）:
 //! - `--image-root <abs> --image <sha256:digest>` つきの `create` は core の `create_with_image` を呼び、イメージ参照（OCI-7）を
 //!   `image_refs::StoreImageRefs` で登録・確定する（#2315）。レイヤーの展開はしない（本番の展開器は #2377。bundle の rootfs は展開済みの前提）。
@@ -26,9 +30,11 @@
 
 use std::time::Instant;
 
+use fandhe_container_core::audit_log::{AuditSink, FileAuditSink};
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{
-    ContainerImage, ImageManifestDigest, LifecycleOp, OciRuntimeError, create, create_with_image,
+    ContainerImage, ImageManifestDigest, LifecycleOp, OciRuntimeError, create_audited,
+    create_with_image_audited,
 };
 use fandhe_container_core::state_store::FileStateStore;
 use fandhe_container_core::traits::{
@@ -45,6 +51,9 @@ use fandhe_container_oci::image_management::ImageStore;
 pub(super) struct Runtime {
     pub(super) store: Box<dyn StateStore>,
     pub(super) recorder: OpRecorder,
+    /// create の `mounts[].destination` 拒否の記録先（本番は状態ルートの `@audit.log`。SEC-4・OCI-4・#2480）。
+    /// start / stop / delete は使わない。
+    pub(super) audit: Box<dyn AuditSink>,
 }
 
 /// 構築済みの要求で core の `create` を呼ぶ。
@@ -52,7 +61,7 @@ pub(super) fn create_container(
     rt: &Runtime,
     req: &CreateRequest,
 ) -> Result<StateRecord, OciRuntimeError> {
-    create(rt.store.as_ref(), &rt.recorder, req)
+    create_audited(rt.store.as_ref(), &rt.recorder, req, rt.audit.as_ref())
 }
 
 /// イメージつき create の入力（検証済みの manifest digest と、開いたイメージストア）。
@@ -73,11 +82,12 @@ pub(super) fn create_container_with_image(
     req: &CreateRequest,
 ) -> Result<StateRecord, OciRuntimeError> {
     let refs = StoreImageRefs::new(&image.store, &image.scope);
-    create_with_image(
+    create_with_image_audited(
         rt.store.as_ref(),
         &rt.recorder,
         ContainerImage::new(&refs, &image.manifest),
         req,
+        rt.audit.as_ref(),
     )
 }
 
@@ -134,6 +144,8 @@ pub(super) fn production_runtime<R>(
     match prepared {
         Ok((req, store)) => Ok((
             Runtime {
+                // 同じ状態ルートの `@audit.log` へ記録する（open 済みの store から作り、二度は開かない）。
+                audit: Box::new(FileAuditSink::in_state_store(&store)),
                 store: Box::new(store),
                 recorder,
             },
@@ -611,7 +623,9 @@ pub(super) fn run_start(global: &GlobalArgs, args: &StartArgs) -> CliExit {
         Ok(v) => v,
         Err(e) => return CliExit::Runtime(e),
     };
-    let Runtime { store, recorder } = rt;
+    let Runtime {
+        store, recorder, ..
+    } = rt;
     let result = ensure_exists(store, &req).and_then(|()| launch_supervisor(global, &req));
     record_start_outcome(&recorder, started, result.is_ok());
     export_ops(&recorder, std::env::var_os(OP_LOG_ENV).as_deref());
@@ -1410,8 +1424,10 @@ mod tests {
             let root =
                 fandhe_container_core::state_store::StateRoot::from_override(base.0.join("state"))
                     .expect("root");
+            let store = FileStateStore::open(root).expect("open");
             Runtime {
-                store: Box::new(FileStateStore::open(root).expect("open")),
+                audit: Box::new(FileAuditSink::in_state_store(&store)),
+                store: Box::new(store),
                 recorder: OpRecorder::new(),
             }
         }

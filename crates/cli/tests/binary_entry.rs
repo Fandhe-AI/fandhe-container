@@ -580,6 +580,65 @@ fn cli1_create_start_flow_on_linux() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// SEC-4・OCI-4・CLI-1（#2480）: 実バイナリの create が `mounts[].destination`（遡り・rootfs 全体・相対 `..`）を
+/// INVALID_ARGUMENT（2）で拒否し、状態ルートの `@audit.log` に mount 層の記録が 1 件ずつ残る。
+/// 正常な create は `@audit.log` を作らない。
+#[cfg(target_os = "linux")]
+#[test]
+fn sec4_2480_create_rejected_destination_is_audited() {
+    let tmp = TmpDir::new("audit-dest");
+    let dir = isolated_cli_dir("audit-dest");
+    let cli = dir.join("fandhe-container");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8").to_string();
+    let dests = ["/../..", "/", "run/../../.."];
+    for (n, dest) in dests.iter().enumerate() {
+        let bundle = tmp.0.join(format!("bundle{n}"));
+        std::fs::create_dir(&bundle).expect("bundle");
+        std::fs::create_dir(bundle.join("rootfs")).expect("rootfs");
+        let config = format!(
+            r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs"}},"process":{{"user":{{"uid":0,"gid":0}},"args":["/bin/echo","it"],"cwd":"/"}},"mounts":[{{"destination":"{dest}","type":"bind","source":"/tmp"}}]}}"#
+        );
+        std::fs::write(bundle.join("config.json"), config).expect("config");
+        let id = format!("c{n}");
+        let out = run_isolated(
+            &cli,
+            &[
+                "--root",
+                &root_s,
+                "create",
+                "--bundle",
+                bundle.to_str().expect("utf8"),
+                &id,
+            ],
+        );
+        assert_eq!(out.status.code(), Some(2), "dest={dest}");
+        assert_eq!(
+            op_and_code(&out),
+            ("create".into(), "INVALID_ARGUMENT".into()),
+            "dest={dest}"
+        );
+        assert!(out.stdout.is_empty());
+    }
+    let log = std::fs::read_to_string(root.join("@audit.log")).expect("audit log");
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), dests.len(), "{log}");
+    for (n, line) in lines.iter().enumerate() {
+        assert!(line.contains("\"layer\":\"mount\""), "{line}");
+        assert!(line.contains("\"path\":null"), "{line}");
+        assert!(
+            line.contains(&format!("\"container_id\":\"c{n}\"")),
+            "{line}"
+        );
+    }
+
+    // 正常な create は記録を増やさない。
+    let ok_tmp = TmpDir::new("audit-ok");
+    let (ok_root, _) = prepare_c1(&ok_tmp, &cli);
+    assert!(!ok_root.join("@audit.log").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// SUP-1・CLI-1・ERR-2: 同じディレクトリのフェイクの supervisor が OK を報告すれば start は 0 で何も出さず、
 /// ERR（UNIMPLEMENTED）を報告すれば 8 と構造化エラーになる。どちらも CLI は状態を書かず、一覧は created のまま。
 #[cfg(target_os = "linux")]

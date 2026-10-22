@@ -22,7 +22,9 @@
 //! # 監査記録（SEC-4・TASK-41.4・#195）
 //!
 //! 拒否を `Mount` 監査レコードにする [`MountDestination::resolve_in_audited`]・[`audit_mount_config_error`]
-//! を持つ。ファイル永続化（TASK-41.5.1・#839）は実装済みで、本番経路への sink の配線は未実装。
+//! を持つ。ファイル永続化（TASK-41.5.1・#839）は実装済み。[`audit_mount_config_error`] は create の
+//! config 検証（`create_audited` / `create_with_image_audited`。#2480）から呼ばれ、CLI の create が
+//! 状態ルートの `@audit.log` へ配線する。plugin-cri の create と start の再検証は未配線。
 //!
 //! bind mount の宛先は `BindMountSet::from_mounts`（`bind_mounts`。#1911）を経て検証する。bind の適用で
 //! [`MountDestination::resolve_in`] の文字列結合を直接 `mount(2)` に渡してはならない。
@@ -101,7 +103,8 @@ impl MountDestination {
     ///
     /// 成功時は `resolve_in` と同じ値。`mounts[].destination` 起因の拒否時は正規化済みのコンテナ内パス（ホスト側 rootfs の実パスは
     /// 載せない）を `Mount` レコードとして `sink` へ 1 件渡し、エラーはそのまま返す（fail-closed）。
-    /// 本番経路への配線は未実装（TASK-29.2）。
+    /// bind の元の拒否の本番経路は start（`validate_bind_mounts`。#1911）。create のパース時の拒否は
+    /// [`audit_mount_config_error`] が担う（#2480）。
     ///
     /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。ID が無い呼び出し側は `None` を渡す。
     pub fn resolve_in_audited(

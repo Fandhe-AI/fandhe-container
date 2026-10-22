@@ -80,10 +80,12 @@ use super::image_rootfs::{
     CreatedRootfs, ImageRootfsUnpacker, StagingReclamation, prepare_rootfs_target_with,
 };
 use super::launch::BundleLock;
+use super::mount_destination::audit_mount_config_error;
 use super::resources::LinuxResourceLimits;
+use crate::audit_log::AuditSink;
 use crate::observability::{OpName, OpOutcome, OpRecorder};
 use crate::traits::{
-    ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, GetStateRequest,
+    ContainerId, ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, GetStateRequest,
     ImageRootfsRecord, StateRecord, StateStore, TraitError,
 };
 
@@ -119,16 +121,66 @@ pub fn create(
     recorder: &OpRecorder,
     req: &CreateRequest,
 ) -> Result<StateRecord, OciRuntimeError> {
+    create_impl(store, recorder, req, None)
+}
+
+/// [`create`] に、`mounts[].destination` の拒否の監査記録を足したもの（SEC-4・OCI-4・#2480）。
+///
+/// config のパースが `mounts[].destination` を拒否したとき（宛先の遡り・rootfs 全体・相対 `..` 等）、
+/// [`audit_mount_config_error`] で mount 層の拒否として `sink` に 1 件記録する。本番の create（CLI の
+/// `create`）はこちらを呼び、`sink` は状態ルートの `@audit.log` への `FileAuditSink` を渡す。
+///
+/// - 記録の成否で拒否を覆さない。返す `code`・`message`・終了コードは [`create`] とバイト単位で同じ（fail-closed）
+/// - 記録は `path` なし。config の入力値・ホストのパスは載せない
+/// - 記録の `container_id` は要求された ID。拒否は `AlreadyExists` の判定より前に起きるため、
+///   同じ ID の既存コンテナとは対応しない場合がある（start の記録と同じ意味）
+/// - destination 以外の拒否は記録しない
+/// - plugin-cri の `CoreLifecycleRuntime::create` は未配線（tokio のマルチスレッドでは `FileAuditSink` の
+///   fork 隔離が使えないため。追跡 issue 参照）
+pub fn create_audited(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    req: &CreateRequest,
+    sink: &dyn AuditSink,
+) -> Result<StateRecord, OciRuntimeError> {
+    create_impl(
+        store,
+        recorder,
+        req,
+        Some(ConfigAudit { id: req.id(), sink }),
+    )
+}
+
+fn create_impl(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    req: &CreateRequest,
+    audit: Option<ConfigAudit<'_>>,
+) -> Result<StateRecord, OciRuntimeError> {
     // 変換は最上位 1 か所のみ。内部関数は `TraitError` のまま（波及最小）。
     let to_err = |e: TraitError| OciRuntimeError::from_trait_error(LifecycleOp::Create, e);
     let name = OpName::new(CREATE_OP_NAME).map_err(to_err)?;
-    recorder.record_op(&name, || create_inner(store, req).map_err(to_err))
+    recorder.record_op(&name, || create_inner(store, req, audit).map_err(to_err))
 }
 
-fn create_inner(store: &dyn StateStore, req: &CreateRequest) -> Result<StateRecord, TraitError> {
+/// create の config 検証で、`mounts[].destination` の拒否を記録するための配線（#2480・SEC-4・OCI-4）。
+///
+/// `create_audited` / `create_with_image_audited` だけが作る。start の再検証・`load_resource_limits` は
+/// `None` のまま（本 issue の対象外）。
+#[derive(Clone, Copy)]
+struct ConfigAudit<'a> {
+    id: &'a ContainerId,
+    sink: &'a dyn AuditSink,
+}
+
+fn create_inner(
+    store: &dyn StateStore,
+    req: &CreateRequest,
+    audit: Option<ConfigAudit<'_>>,
+) -> Result<StateRecord, TraitError> {
     // delete が core の作った rootfs を消している間の create を排他する（検証より前に取る。OCI-7・#2378）。
     let _guard = lock_for_create(req.bundle())?;
-    validate_bundle(req.bundle())?;
+    validate_bundle_audited(req.bundle(), audit)?;
     create_state(store, req, None)
 }
 
@@ -195,10 +247,38 @@ pub fn create_with_image(
     image: ContainerImage<'_>,
     req: &CreateRequest,
 ) -> Result<StateRecord, OciRuntimeError> {
+    create_with_image_impl(store, recorder, image, req, None)
+}
+
+/// [`create_with_image`] に、[`create_audited`] と同じ `mounts[].destination` 拒否の監査記録を足したもの
+/// （SEC-4・OCI-4・#2480）。展開器の有無にかかわらず、拒否 1 回につき 1 件記録する。
+pub fn create_with_image_audited(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    image: ContainerImage<'_>,
+    req: &CreateRequest,
+    sink: &dyn AuditSink,
+) -> Result<StateRecord, OciRuntimeError> {
+    create_with_image_impl(
+        store,
+        recorder,
+        image,
+        req,
+        Some(ConfigAudit { id: req.id(), sink }),
+    )
+}
+
+fn create_with_image_impl(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    image: ContainerImage<'_>,
+    req: &CreateRequest,
+    audit: Option<ConfigAudit<'_>>,
+) -> Result<StateRecord, OciRuntimeError> {
     let to_err = |e: TraitError| OciRuntimeError::from_trait_error(LifecycleOp::Create, e);
     let name = OpName::new(CREATE_OP_NAME).map_err(to_err)?;
     recorder.record_op(&name, || {
-        create_with_image_inner(store, recorder, image, req).map_err(to_err)
+        create_with_image_inner(store, recorder, image, req, audit).map_err(to_err)
     })
 }
 
@@ -207,6 +287,7 @@ fn create_with_image_inner(
     recorder: &OpRecorder,
     image: ContainerImage<'_>,
     req: &CreateRequest,
+    audit: Option<ConfigAudit<'_>>,
 ) -> Result<StateRecord, TraitError> {
     let register_name = OpName::new(IMAGE_REF_REGISTER_OP_NAME)?;
     let registration = recorder.record_op(&register_name, || {
@@ -234,13 +315,13 @@ fn create_with_image_inner(
                     return Err(e);
                 }
             }
-            if let Err(e) = validate_bundle(req.bundle()) {
+            if let Err(e) = validate_bundle_audited(req.bundle(), audit) {
                 rollback_image_ref(recorder, image, req);
                 return Err(e);
             }
             None
         }
-        Some(unpacker) => match unpack_rootfs(store, recorder, image, unpacker, req) {
+        Some(unpacker) => match unpack_rootfs(store, recorder, image, unpacker, req, audit) {
             // 公開済みの rootfs を状態へ記録する（delete が消す印）。記録を作れない失敗は公開後の失敗と同じ扱い
             // （rootfs は残し、参照だけ外す）。
             Ok(created) => match created.record() {
@@ -320,8 +401,9 @@ fn unpack_rootfs(
     image: ContainerImage<'_>,
     unpacker: &dyn ImageRootfsUnpacker,
     req: &CreateRequest,
+    audit: Option<ConfigAudit<'_>>,
 ) -> Result<CreatedRootfs, TraitError> {
-    let config = validate_config(req.bundle())?;
+    let config = validate_config(req.bundle(), audit)?;
     // 展開の無駄を避ける事前確認。最終判定は `StateStore::create`。
     if store.get(&GetStateRequest::new(req.id().clone())).is_ok() {
         return Err(TraitError::new(
@@ -366,7 +448,7 @@ fn unpack_rootfs(
     // create が検証して自分のものとして成功しうるが、bundle の別表記・別 bundle からの同一 rootfs の参照を
     // 確実に見分ける手段と、通常の create と共有する排他が無いため、「未使用の確認 → 削除」は使用中の
     // rootfs を壊しうる。残る木は #854 の起動時照合・手動で回収する（余分に持つだけの安全側。REPAIR-3）。
-    match validate_bundle(req.bundle()) {
+    match validate_bundle_audited(req.bundle(), audit) {
         // 文字列の一致に加え、解決した実体が展開した実体（保持中の fd の dev・ino）であることを確認する
         // （展開中に bundle の途中の要素を別名へ移して新しい同名の rootfs を用意する差し替えを拒否する）。
         Ok((_, rootfs))
@@ -435,7 +517,16 @@ fn rollback_image_ref(recorder: &OpRecorder, image: ContainerImage<'_>, req: &Cr
 /// 検証を共有するための入口。戻り値は検証済みの設定と、検査済みの rootfs の絶対パス。
 /// 検証内容はモジュール doc の「fail-closed の判断」を参照。
 pub(super) fn validate_bundle(bundle: &Path) -> Result<(OciConfig, PathBuf), TraitError> {
-    let config = validate_config(bundle)?;
+    validate_bundle_audited(bundle, None)
+}
+
+/// [`validate_bundle`] に、`mounts[].destination` 拒否の監査記録（`audit` が `Some` のときだけ）を足したもの。
+/// create の経路だけが `Some` を渡す（#2480）。
+fn validate_bundle_audited(
+    bundle: &Path,
+    audit: Option<ConfigAudit<'_>>,
+) -> Result<(OciConfig, PathBuf), TraitError> {
+    let config = validate_config(bundle, audit)?;
     let rootfs = check_rootfs(bundle, config.root().path())?;
     Ok((config, rootfs))
 }
@@ -443,8 +534,16 @@ pub(super) fn validate_bundle(bundle: &Path) -> Result<(OciConfig, PathBuf), Tra
 /// `validate_bundle` のうち rootfs の実在に依らない部分（config の読み込みと各種検証）。
 ///
 /// イメージつき create は、展開の前にこれだけを済ませる（不正な config で展開しない。#2342）。
-fn validate_config(bundle: &Path) -> Result<OciConfig, TraitError> {
-    let config = load_config(&bundle.join(CONFIG_FILE_NAME)).map_err(config_error)?;
+///
+/// `audit` があれば、`mounts[].destination` の拒否をここで mount 層の監査へ記録する。`OciConfigError` の
+/// field 情報は `TraitError` へ変換すると落ちるため、変換の直前がフックできる唯一の点（#2480・SEC-4・OCI-4）。
+/// 返すエラーの内容は `audit` の有無で変わらない。
+fn validate_config(bundle: &Path, audit: Option<ConfigAudit<'_>>) -> Result<OciConfig, TraitError> {
+    let config = load_config(&bundle.join(CONFIG_FILE_NAME)).map_err(|e| match audit {
+        // 記録の成否（delivery）は拒否に影響させない。失敗の通知は sink 側の責務。
+        Some(a) => config_error(audit_mount_config_error(e, Some(a.id), a.sink).error),
+        None => config_error(e),
+    })?;
     reject_unapplied(&config)?;
     check_cgroups_path(&config)?;
     check_resource_ranges(&config)?;

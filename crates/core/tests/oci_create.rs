@@ -448,3 +448,73 @@ fn err2_create_validation_failures_map_to_exit_codes() {
     assert_eq!(err.exit_code().get(), 8);
     assert_eq!(store.len(), 0);
 }
+/// `create_audited` の結合試験用の収集 sink（SEC-4・OCI-4・#2480）。
+struct CollectSink(Mutex<Vec<fandhe_container_core::audit_log::AuditRecord>>);
+
+impl fandhe_container_core::audit_log::AuditSink for CollectSink {
+    fn record(
+        &self,
+        record: &fandhe_container_core::audit_log::AuditRecord,
+    ) -> Result<(), TraitError> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(record.clone());
+        Ok(())
+    }
+}
+
+fn config_with_destination(dest: &str) -> Value {
+    let mut v = valid_config();
+    v["mounts"] = json!([{"destination": dest, "type": "bind", "source": "/tmp"}]);
+    v
+}
+
+/// SEC-4・OCI-4: 遡り・rootfs 全体・相対 `..` の 3 種が InvalidArgument で拒否され、mount 層 1 件ずつ記録される（#2480）。
+#[test]
+fn sec4_2480_create_audited_records_destination_rejections() {
+    use fandhe_container_core::audit_log::AuditLayer;
+    use fandhe_container_core::oci_runtime::create_audited;
+    for (n, dest) in ["/../..", "/", "run/../../.."].into_iter().enumerate() {
+        let b = Bundle::new(&format!("audit-dest-{n}"));
+        b.write_config(&config_with_destination(dest));
+        std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+        let store = MemStateStore::new();
+        let sink = CollectSink(Mutex::new(Vec::new()));
+        let req = b.request("cx");
+        let err = create_audited(&store, &OpRecorder::new(), &req, &sink)
+            .expect_err("destination must be rejected");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "dest={dest}");
+        assert_eq!(store.len(), 0);
+        let g = sink.0.lock().expect("lock");
+        assert_eq!(g.len(), 1, "dest={dest}");
+        assert_eq!(g[0].layer(), AuditLayer::Mount);
+        assert_eq!(g[0].path(), None);
+        assert_eq!(g[0].container_id().map(|c| c.as_str()), Some("cx"));
+        // 監査なしの create と同じ拒否（code・message）になる。
+        let plain = create(&store, &OpRecorder::new(), &req).expect_err("rejected");
+        assert_eq!(plain.code(), err.code());
+        assert_eq!(plain.message(), err.message());
+    }
+}
+
+/// SEC-4: destination 以外の拒否は記録せず、エラーは従来と同じ。正常な create でも記録しない（#2480）。
+#[test]
+fn sec4_2480_create_audited_ignores_other_outcomes() {
+    use fandhe_container_core::oci_runtime::create_audited;
+    let b = Bundle::new("audit-other");
+    let mut v = valid_config();
+    v.as_object_mut().expect("obj").remove("process");
+    b.write_config(&v);
+    std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
+    let store = MemStateStore::new();
+    let sink = CollectSink(Mutex::new(Vec::new()));
+    let req = b.request("cy");
+    let err = create_audited(&store, &OpRecorder::new(), &req, &sink).expect_err("no process");
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    assert_eq!(sink.0.lock().expect("lock").len(), 0);
+
+    let ok = ready_bundle("audit-ok");
+    create_audited(&store, &OpRecorder::new(), &ok.request("cz"), &sink).expect("ok");
+    assert_eq!(sink.0.lock().expect("lock").len(), 0);
+}

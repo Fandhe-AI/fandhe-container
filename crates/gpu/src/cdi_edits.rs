@@ -22,6 +22,9 @@
 //!   完全に同一なら先勝ちで 1 件に畳み、同一キーで内容が異なれば黙って上書きせず `InvalidArgument`
 //!   で拒否する（fail-closed）。
 //! - `hooks` は完全一致のものだけ畳み、それ以外は順序を保って全て残す。
+//! - `netDevices`（CDI v1.1.0。#2445）は `hostInterfaceName` をキーに同様に畳み、異なる `hostInterfaceName` が同じ
+//!   `name` を持つ場合も `InvalidArgument` で拒否する。畳んだ結果が非空なら適用が未実装のため `Unimplemented`
+//!   で拒否する（REPAIR-3。公開アクセサは適用タスクで追加）。
 //! - `additionalGids` は値の重複を除き初出順。`intelRdt` は 1 つだけ採用し、内容が異なる複数は拒否する。
 //!
 //! 責務境界（将来仕様。REPAIR-3）: `all` の展開やセレクタ（`vendor/class=name`）の分解、`/var/run/cdi` の
@@ -43,7 +46,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cdi_spec::{
     CdiSpec, CdiSpecError, CdiSpecErrorCode, ContainerEdits, DeviceNode, EnvList, Hook, IntelRdt,
-    Mount,
+    Mount, NetDevice, net_devices_unimplemented,
 };
 
 /// 1 回の集計で要求できるデバイス名の最大件数（重複を除く前の件数で数える）。
@@ -73,6 +76,9 @@ pub struct AggregatedEdits {
     hooks: Vec<Hook>,
     additional_gids: Vec<u32>,
     intel_rdt: Option<IntelRdt>,
+    /// 適用が未実装のため公開アクセサは付けない（常に空に見えて実装済みを装うのを避ける。REPAIR-3）。
+    /// 適用タスク（net crate・TASK-127 の範囲）で `net_devices()` を足し、ゲートを外す。
+    net_devices: Vec<NetDevice>,
 }
 
 impl AggregatedEdits {
@@ -133,6 +139,26 @@ fn merge_keyed<'a, T: PartialEq + Clone + 'a>(
         }
     }
     Ok(out)
+}
+
+/// `netDevices` を `hostInterfaceName` キーで畳み（完全一致は先勝ち）、`name` の一意性も検査する。
+/// 上流の `Append` は連結のみだが、本実装は他の編集と同様に衝突を fail-closed で拒否する（GPU-1）。
+fn merge_net_devices(all: &[&ContainerEdits]) -> Result<Vec<NetDevice>, CdiSpecError> {
+    let merged = merge_keyed(
+        all.iter().flat_map(|e| e.net_devices.iter()),
+        |n| n.host_interface_name.as_str(),
+        "conflicting netDevices entries for the same hostInterfaceName",
+    )?;
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    for nd in &merged {
+        if !names.insert(nd.name.as_str()) {
+            return Err(err(
+                CdiSpecErrorCode::InvalidArgument,
+                "conflicting netDevices entries for the same name",
+            ));
+        }
+    }
+    Ok(merged)
 }
 
 fn merge_device_nodes(all: &[&ContainerEdits]) -> Result<Vec<DeviceNode>, CdiSpecError> {
@@ -317,8 +343,22 @@ pub fn aggregate_container_edits_across_specs(
     aggregate_requests(requests)
 }
 
-/// 上限検証済みの要求列を集計する共通実装。計算量は O((R + D) log R + N log N)。
+/// 上限検証済みの要求列を集計し、`netDevices` が残れば `Unimplemented` で拒否する（#2445・REPAIR-3）。
+///
+/// `CdiSpec` は全フィールドが公開で `parse_cdi_spec` を通らずに作れるため、parse 側のゲートとは別に置く。
+/// 衝突する `netDevices` は `InvalidArgument` が先に返る。
 fn aggregate_requests(requests: &[CdiDeviceRequest<'_>]) -> Result<AggregatedEdits, CdiSpecError> {
+    let aggregated = aggregate_requests_ungated(requests)?;
+    if !aggregated.net_devices.is_empty() {
+        return Err(net_devices_unimplemented());
+    }
+    Ok(aggregated)
+}
+
+/// ゲートを掛けない集計の実装。計算量は O((R + D) log R + N log N)。
+fn aggregate_requests_ungated(
+    requests: &[CdiDeviceRequest<'_>],
+) -> Result<AggregatedEdits, CdiSpecError> {
     // (spec のアドレス, 名前) → 要求順の位置（重複は初出の位置へ畳む）。アドレスは比較するだけで参照外しはしない。
     let mut slot_of: BTreeMap<(*const CdiSpec, &str), usize> = BTreeMap::new();
     let mut slot_specs: Vec<&CdiSpec> = Vec::new();
@@ -382,6 +422,7 @@ fn aggregate_requests(requests: &[CdiDeviceRequest<'_>]) -> Result<AggregatedEdi
         hooks: merge_hooks(&all),
         additional_gids: merge_gids(&all),
         intel_rdt: merge_intel_rdt(&all)?,
+        net_devices: merge_net_devices(&all)?,
     })
 }
 #[cfg(test)]
@@ -1045,5 +1086,97 @@ mod tests {
         };
         assert_eq!(arg(0), Some("a0"));
         assert_eq!(arg(4999), Some("a4999"));
+    }
+
+    // ---- netDevices（#2445・GPU-1・REPAIR-3） ----
+
+    fn nd(h: &str, n: &str) -> String {
+        format!("{{hostInterfaceName: {h}, name: {n}}}")
+    }
+
+    fn nd_spec(top: &[String], devs: &[(&str, Vec<String>)]) -> CdiSpec {
+        use crate::cdi_spec::parse_cdi_spec_unchecked;
+        let mut y = String::from("cdiVersion: '1.1.0'\nkind: v/c\ndevices:\n");
+        for (name, list) in devs {
+            y.push_str(&format!(
+                "  - name: {name}\n    containerEdits:\n      netDevices: [{}]\n",
+                list.join(", ")
+            ));
+        }
+        y.push_str(&format!(
+            "containerEdits:\n  netDevices: [{}]\n",
+            top.join(", ")
+        ));
+        parse_cdi_spec_unchecked(&y).expect("fixture parses")
+    }
+
+    fn reqs<'a>(s: &'a CdiSpec, names: &[&'a str]) -> Vec<CdiDeviceRequest<'a>> {
+        names.iter().map(|n| CdiDeviceRequest::new(s, n)).collect()
+    }
+
+    fn hosts(a: &AggregatedEdits) -> Vec<&str> {
+        a.net_devices
+            .iter()
+            .map(|n| n.host_interface_name.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn gpu1_net_devices_aggregate_top_then_device_order() {
+        let s = nd_spec(
+            &[nd("t0", "nt0")],
+            &[("a", vec![nd("a0", "na0")]), ("b", vec![nd("b0", "nb0")])],
+        );
+        let agg = aggregate_requests_ungated(&reqs(&s, &["b", "a"])).unwrap();
+        assert_eq!(hosts(&agg), ["t0", "b0", "a0"]);
+        // 複数 spec では spec 初出の位置にトップレベルが入る。
+        let s2 = nd_spec(&[nd("u0", "nu0")], &[("c", vec![nd("c0", "nc0")])]);
+        let mut r = reqs(&s, &["a"]);
+        r.extend(reqs(&s2, &["c"]));
+        let agg = aggregate_requests_ungated(&r).unwrap();
+        assert_eq!(hosts(&agg), ["t0", "a0", "u0", "c0"]);
+    }
+
+    #[test]
+    fn gpu1_net_devices_identical_fold_first_wins() {
+        let s = nd_spec(&[nd("e1", "n1")], &[("a", vec![nd("e1", "n1")])]);
+        let agg = aggregate_requests_ungated(&reqs(&s, &["a"])).unwrap();
+        assert_eq!(hosts(&agg), ["e1"]);
+    }
+
+    #[test]
+    fn gpu1_net_devices_conflicts_rejected() {
+        let s = nd_spec(&[nd("e1", "n1")], &[("a", vec![nd("e1", "n2")])]);
+        let e = aggregate_requests_ungated(&reqs(&s, &["a"])).unwrap_err();
+        assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument);
+        assert_eq!(
+            e.message(),
+            "conflicting netDevices entries for the same hostInterfaceName"
+        );
+        let s = nd_spec(&[nd("e1", "n1")], &[("a", vec![nd("e2", "n1")])]);
+        let e = aggregate_requests_ungated(&reqs(&s, &["a"])).unwrap_err();
+        assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument);
+        assert_eq!(
+            e.message(),
+            "conflicting netDevices entries for the same name"
+        );
+    }
+
+    #[test]
+    fn repair3_aggregate_rejects_net_devices_unimplemented() {
+        let s = nd_spec(&[], &[("a", vec![nd("e1", "n1")]), ("b", vec![])]);
+        let e = aggregate_container_edits(&s, &["a"]).unwrap_err();
+        assert_eq!(e.code(), CdiSpecErrorCode::Unimplemented);
+        assert_eq!(e.message(), "CDI netDevices edits are not supported yet");
+        let e = aggregate_container_edits_across_specs(&reqs(&s, &["a"])).unwrap_err();
+        assert_eq!(e.code(), CdiSpecErrorCode::Unimplemented);
+        // 要求されないデバイスにだけある netDevices は集計に入らない。
+        assert!(aggregate_container_edits(&s, &["b"]).is_ok());
+        // 衝突は Unimplemented より先に InvalidArgument。
+        let c = nd_spec(&[nd("e1", "n1")], &[("a", vec![nd("e1", "n2")])]);
+        assert_eq!(
+            aggregate_container_edits(&c, &["a"]).unwrap_err().code(),
+            CdiSpecErrorCode::InvalidArgument
+        );
     }
 }

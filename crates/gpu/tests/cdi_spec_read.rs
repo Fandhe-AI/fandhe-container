@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use fandhe_container_gpu::cdi_spec::{
     CDI_SPEC_MAX_INPUT_BYTES, CdiSpecErrorCode, CdiSpecReadRecorder, CdiSpecReadSample,
-    read_cdi_spec_file, read_cdi_spec_file_with_recorder,
+    parse_cdi_spec, read_cdi_spec_file, read_cdi_spec_file_with_recorder,
 };
 
 struct TempDir(PathBuf);
@@ -178,4 +178,61 @@ fn gpu1_oversize_multibyte_boundary_is_resource_exhausted() {
     std::fs::write(&p, data).unwrap();
     let e = read_cdi_spec_file(&p).unwrap_err();
     assert_eq!(e.code(), CdiSpecErrorCode::ResourceExhausted);
+}
+
+const ND: &str = "{hostInterfaceName: eth1, name: net1}";
+
+fn nd_yaml(version: &str, top: &str, dev: &str) -> String {
+    format!(
+        "cdiVersion: \"{version}\"\nkind: v/c\ndevices:\n  - name: a\n    containerEdits:\n      netDevices: {dev}\ncontainerEdits:\n  netDevices: {top}\n"
+    )
+}
+
+/// GPU-1・REPAIR-3: `cdiVersion` と `netDevices` の組み合わせごとの受け付け範囲（#2445）。
+#[test]
+fn gpu1_cdi_version_acceptance_range_for_net_devices() {
+    use CdiSpecErrorCode::{InvalidArgument, Unimplemented};
+    let none = |v: &str| format!("cdiVersion: \"{v}\"\nkind: v/c\n");
+    for v in ["0.3.0", "0.7.0", "1.1.0", "1"] {
+        assert!(parse_cdi_spec(&none(v)).is_ok(), "{v}");
+    }
+    assert!(parse_cdi_spec(&nd_yaml("0.7.0", "[]", "[]")).is_ok());
+    let list = format!("[{ND}]");
+    let cases = [
+        ("0.7.0", InvalidArgument),
+        ("0.8.0", InvalidArgument),
+        ("1.0.0", InvalidArgument),
+        ("1.1.0", Unimplemented),
+        ("v1.1.0", Unimplemented),
+        ("1.2.0", Unimplemented),
+        ("abc", InvalidArgument),
+        ("1.1", InvalidArgument),
+        ("1.1.0-rc1", InvalidArgument),
+        ("", InvalidArgument),
+    ];
+    for (v, want) in cases {
+        for y in [nd_yaml(v, &list, "[]"), nd_yaml(v, "[]", &list)] {
+            let got = parse_cdi_spec(&y).unwrap_err().code();
+            assert_eq!(got, want, "{v:?}");
+        }
+    }
+    let bad = nd_yaml("1.1.0", "[{hostInterfaceName: \"a/b\", name: n}]", "[]");
+    assert_eq!(parse_cdi_spec(&bad).unwrap_err().code(), InvalidArgument);
+}
+
+/// REPAIR-3: ファイル経由でも `Unimplemented` で拒否され、計測に 1 回記録される。
+#[test]
+fn repair3_reads_net_devices_file_as_unimplemented() {
+    let d = TempDir::new("netdev");
+    let p = d.path().join("net.yaml");
+    std::fs::write(&p, nd_yaml("1.1.0", &format!("[{ND}]"), "[]")).unwrap();
+    let rec = Collect::default();
+    let e = read_cdi_spec_file_with_recorder(&p, &rec).unwrap_err();
+    assert_eq!(e.code(), CdiSpecErrorCode::Unimplemented);
+    let samples = rec.0.lock().unwrap();
+    assert_eq!(samples.len(), 1);
+    assert_eq!(
+        samples[0].error_code(),
+        Some(CdiSpecErrorCode::Unimplemented)
+    );
 }

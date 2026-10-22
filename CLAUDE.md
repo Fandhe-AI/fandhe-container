@@ -90,6 +90,7 @@ fandhe-container/
 │   │   ├── healthcheck-argv-timeout.md  # healthcheck の argv[0] の解決方式と timeout の上限の判断記録（#2439・SUP-4・TASK-161 追補。オーナー承認待ち）
 │   │   ├── subid-owner-resolution.md  # rootless の subuid / subgid の所有者名を passwd 優先・無ければ `getent`（NSS）で解決する方針の判断記録（#2390・SEC-5・CORE-6。shadow 4.13 の `newuidmap` の照合に合わせる）
 │   │   ├── dev-default-mounts.md  # OCI 既定の /dev の残り（/dev/pts・/dev/ptmx・/dev/shm・/dev/console）と rootless の /dev 供給方式の設計ドラフト（TASK-29 追補・#1609。方式を確定し実装 issue を #54 配下に起票）
+│   │   ├── volume-provider-implementation.md  # VolumeProvider の core 側実装（named volume の実体化）の担当 TASK と時期の判断記録（#2451・CRI-7・PLUG-1・IO-7。オーナー承認待ち）
 │   │   ├── macos-state-root.md    # macOS の既定の状態ルート（`StateRoot::resolve(None)`）の判断記録（#2431・OCI-5・SEC-4。オーナー承認待ち）
 │   │   ├── windows-execution-layout.md  # Windows の実行構成（WSL2 ゲスト内の core とホストの起動役）の設計ドラフト（#1415・#1539 の決定以外はオーナー承認待ち。TASK-116 追補・#1862・WIN-1）
 │   │   ├── audit-non-linux.md     # 非 Linux の監査の記録経路（Windows の主経路の隔離・代替経路）の設計ドラフト・判断シート（#2430・SEC-4・オーナー承認待ち）

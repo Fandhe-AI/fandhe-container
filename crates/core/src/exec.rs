@@ -1586,7 +1586,7 @@ fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
 ///   グループごと止めた後に限る（helper は holder を pid の数値で受け取るため。#2376）。止めたと言えない場合は
 ///   holder を kill だけして回収せず、ゾンビとして pid を保つ（CORE-6・SEC-5。fail-closed）
 /// - holder・mapper は親の死を EOF で検知できない場合があるため、待ちは read タイムアウトで止める
-///   （holder は `PDEATHSIG` でも終わる。REPAIR-5）
+///   （holder は `PDEATHSIG` を持たず、helper を含む全員の終了〔socket の EOF〕か期限で終わる。#2376・REPAIR-5）
 pub fn isolate_rootless_subordinate(
     plan: &SubordinateIsolationPlan,
 ) -> Result<RootlessIsolationReport, ExecError> {
@@ -1626,7 +1626,8 @@ const HOLDER_SLACK: Duration = Duration::from_secs(5);
 /// holder は user namespace を作って保持するだけの使い捨てプロセスで、dumpable にするのは holder だけである
 /// (`newuidmap` / `newgidmap` は対象の `/proc/<pid>` の所有者を検査し、non-dumpable な対象を拒否するため。
 /// [`crate::rootless::run_userns_holder`])。holder は I の `comm`(起動識別子)を引き継ぐ。I が報告せずに死んだ場合も、
-/// holder は `PDEATHSIG` で終わり、残っても C の識別子の再探索(`rescan_unreported_init`)が回収する(CORE-2)。
+/// holder は helper を含む全員の終了(socket の EOF。`PDEATHSIG` は持たない。#2376)か期限で終わり、残っても C の
+/// 識別子の再探索(`rescan_unreported_init`)が回収する(CORE-2)。
 ///
 /// mapper は fork 直後に `setsid(2)` で自分のセッション(ID = mapper の pid)を作ってから写像に進む。mapper が
 /// 起動する `newuidmap` / `newgidmap`(helper)はセッションを継承するため、mapper が helper を残して終了しても、
@@ -1846,8 +1847,16 @@ fn rootless_handshake(
     );
     let holder_pid = holder.pid();
     let mut mapper_end = Some(mapper_end);
+    // holder の socket の相手側の複製を mapper に持たせ、mapper は各 helper の stdin へ複製を渡す。holder は全員が閉じる
+    // (EOF)まで終了しないため、helper の実行中に holder の pid は解放されない(helper は pid の数値で受け取る。
+    // `rootless::run_userns_holder`・CORE-6・SEC-5・#2376)。親の複製はクロージャと共に親側で閉じる。
+    let mut keepalive = Some(std::os::fd::OwnedFd::from(
+        holder_sock
+            .try_clone()
+            .map_err(|e| sync_io_error(&e, "duplicate the userns holder socket"))?,
+    ));
     let mapper_pid = fork_for(caller, move || {
-        let Some(sock) = mapper_end.take() else {
+        let (Some(sock), Some(keepalive)) = (mapper_end.take(), keepalive.take()) else {
             return EXIT_SETUP_FAILED;
         };
         // helper の帰属を mapper の終了後も保つため、写像の前に自分のセッションを作る(上の doc。CORE-2)。
@@ -1863,6 +1872,7 @@ fn rootless_handshake(
             &gid,
             &writer,
             timeout,
+            Some(keepalive),
             &mut std::io::stderr(),
         )
     })?;

@@ -893,6 +893,9 @@ pub(crate) fn rescan_unreported_init(
     // 受け取るため、識別子つきの子(holder・mapper・PID 1)のどれかを回収する前に、全員の子孫(helper)を止めて
     // ゾンビ化を確かめる。1 つでも保持(列挙不完全・停止未確認)になれば、その子孫の helper が生きている可能性が
     // あるため、どの錨も回収しない(停止したまま残し、`scan_incomplete` により呼び出し側が識別子で再探索する)。
+    // 候補の列挙自体が不完全(`/proc` の列挙・stat・comm の読み取りの失敗)なら、見逃した候補(mapper 等)の helper が
+    // 生きている可能性があるため、見つけた候補も止めるだけで回収しない。
+    let listing_incomplete = out.scan_incomplete;
     let mut halted = Vec::with_capacity(candidates.len());
     let mut retained = false;
     for pid in candidates {
@@ -901,7 +904,7 @@ pub(crate) fn rescan_unreported_init(
             None => retained = true,
         }
     }
-    if retained {
+    if !may_reap_halted(listing_incomplete, retained) {
         out.scan_incomplete = true;
         return out;
     }
@@ -1039,6 +1042,13 @@ fn settled_after_kill(anchor: u32, members: &[NonZeroU32], me: u32, timeout: Dur
     !again.scan_incomplete && relisted.iter().all(|p| members.contains(p))
 }
 
+/// 止めた候補(錨)を回収へ進めてよいか。候補の列挙が不完全か、どれか 1 つでも保持になったら、どの錨も回収しない
+/// (helper が holder を pid の数値で受け取るため、helper を止めたと言えない間に holder の pid を解放しない。
+/// CORE-6・SEC-5・#2376)。
+fn may_reap_halted(listing_incomplete: bool, retained: bool) -> bool {
+    !listing_incomplete && !retained
+}
+
 /// 識別子つきの子を kill・回収せず保持すべきか。停止(またはゾンビ化)を確認できない、または子孫の列挙が不完全な
 /// ときは、未列挙の helper の帰属を失わないよう保持する(CORE-2)。
 fn must_retain_tagged(halted: bool, enumeration_incomplete: bool) -> bool {
@@ -1143,6 +1153,11 @@ fn descendants_in(proc_root: &Path, anchor: u32, me: u32, out: &mut Rescan) -> V
         if matches!(proc_state_of(&stat), Some('X' | 'x')) {
             continue;
         }
+        // 終了処理中(`X` / `x`)のタスクはセッション ID を -1 と表示し解析できない。もう fork もユーザー空間への
+        // 復帰もしないため、無関係なものとして除く(列挙不完全にしない)。
+        if matches!(proc_state_of(&stat), Some('X' | 'x')) {
+            continue;
+        }
         match parent_and_session_of(&stat) {
             Some((parent, _)) if parent == anchor => found.push(pid),
             Some((parent, session)) if session == anchor => {
@@ -1202,8 +1217,15 @@ fn session_has_live_member(session: u32) -> Option<bool> {
             Ok(None) => continue,
             Err(_) => return None,
         };
+        // 終了処理中(`X` / `x`)のタスクはセッション ID を -1 と表示し解析できないため、先に state で除く
+        // (もうユーザー空間へ戻らない)。
+        match proc_state_of(&stat)? {
+            'X' | 'x' => continue,
+            'Z' => continue,
+            _ => {}
+        }
         let (_, member_session) = parent_and_session_of(&stat)?;
-        if member_session == session && proc_state_of(&stat)? != 'Z' {
+        if member_session == session {
             return Some(true);
         }
     }
@@ -2236,6 +2258,15 @@ mod tests {
                 .kill_and_reap(Duration::from_secs(5))
                 .expect("reap a test process");
         }
+    }
+
+    /// CORE-6・SEC-5(#2376): 候補の列挙が不完全か、どれかの候補が保持になったら、どの錨も回収へ進めない。
+    #[test]
+    fn core6_halted_anchors_are_reaped_only_after_a_complete_listing() {
+        assert!(may_reap_halted(false, false));
+        assert!(!may_reap_halted(true, false));
+        assert!(!may_reap_halted(false, true));
+        assert!(!may_reap_halted(true, true));
     }
 
     /// CORE-6・SEC-5(#2376): セッションの全員の終了確認は、生きているメンバーが居る間は期限で `false`、全員が

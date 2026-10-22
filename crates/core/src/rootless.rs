@@ -26,9 +26,11 @@
 //!   （[`ProcHandle`]）で固定する。mapper は先に fd を開き、その**後**に mapper 自身の `parent_id()` と対象(holder)の
 //!   親(fd 経由の stat)がともに I のままであることを確認する（開いた時点で pid は生きた親を指していたと言える）。以後の書き込み・読み戻しは
 //!   fd 経由（`/proc/self/fd/N/...`）で、対象が死んで pid が再利用されても別プロセスへは届かず失敗する。
-//!   `newuidmap` / `newgidmap` には pid 文字列を渡す（shadow 4.13 は `fd:<pidfd>` 形式を受け付けないため。#2376）。
-//!   helper の書き込み先は fd で固定されないため、対象（holder）を回収するのは helper が止まった後に限る:
-//!   成功時は mapper が helper を回収してから応答する。失敗時は I が mapper とそのプロセスグループ（helper を含む）へ
+//!   `newuidmap` / `newgidmap` へは、公開 API（[`apply_id_maps_to`]）は `fd:0`（stdin の `/proc/<pid>` fd。`fd:N`
+//!   未対応の helper では fail-closed）で、mapper は pid 文字列で渡す（shadow 4.13 は `fd:N` を受け付けないため。#2376。
+//!   `HelperTarget`）。pid 文字列では helper の書き込み先が fd で固定されないため、対象（holder）の pid が解放されるのは
+//!   helper が止まった後に限る: holder は `PDEATHSIG` を持たず、helper の stdin に渡した socket の EOF（I・mapper・
+//!   全 helper の終了）か期限まで終了しない（I が死んだ場合）。成功時は mapper が helper を回収してから応答する。失敗時は I が mapper とそのプロセスグループ（helper を含む）へ
 //!   `SIGKILL` を送り、セッションの全員の終了を確かめてから holder を回収し、確かめられなければ holder を回収しない
 //!   （`exec::isolate_rootless_subordinate_with`）。I が死んだ場合は C の識別子の再探索が全候補の helper を止めて
 //!   から holder を回収する（`exec::launch_intermediate::rescan_unreported_init`）。
@@ -757,12 +759,31 @@ fn sanitize_stderr(raw: &[u8]) -> String {
     out
 }
 
+/// `newuidmap` / `newgidmap` へ渡す写像の対象（[`run_helper`] が使う。CORE-6・SEC-5・#2376）。
+///
+/// どちらの形でも、helper が書く先が別プロセスへ移らないことを保証できる経路だけが構築する。
+#[derive(Clone, Copy)]
+enum HelperTarget<'a> {
+    /// `fd:0`（stdin に `/proc/<pid>` の fd を渡す shadow の形式）。書き込み先が fd で固定され、対象の回収に依らず
+    /// pid 再利用に耐える。shadow 4.13 等の `fd:N` 未対応の helper は usage で失敗する（fail-closed）。公開 API
+    /// （[`apply_id_maps_to`]）はこの形だけを使う。
+    ProcFd(&'a ProcHandle),
+    /// pid の数値（`fd:N` 未対応の helper でも動く）。helper の stdin に `keepalive` の複製を渡す。`keepalive` は対象
+    /// （holder）が持つ socket の相手側で、holder はその EOF（= 呼び出し元・mapper・全 helper の終了）まで終了しない
+    /// （[`run_userns_holder`]）。そのため helper の実行中に対象の pid が解放されない。mapper（[`run_id_map_mapper`]）
+    /// だけが構築する。
+    HeldPid {
+        handle: &'a ProcHandle,
+        keepalive: std::os::fd::BorrowedFd<'a>,
+    },
+}
+
 /// 検証済みヘルパーを実行する。exec 直前に所有者・権限・祖先ディレクトリ・dev/ino を再検証し、
 /// [`HelperPaths::new`] 時点から差し替えられていれば拒否する（TOCTOU 対策。祖先が root 専有のため
 /// 非 root は残る窓でも差し替えられない）。
 fn run_helper(
     paths: &HelperPaths,
-    target: &ProcHandle,
+    target: HelperTarget<'_>,
     set: &IdMapSet,
     kind: IdKind,
     timeout: Duration,
@@ -776,19 +797,34 @@ fn run_helper(
             "helper was replaced after validation",
         ));
     }
-    // 対象は pid 文字列で渡す。shadow 4.13（ubuntu-latest）の `newuidmap` は `fd:<pidfd>` 形式を受け付けない
-    // （usage を出して終了する）ため（#2376）。pid 再利用への対策は、対象（holder）を helper が止まるまで回収しない
-    // ことで行う（成功時はここで helper を回収してから応答し、失敗時は I が mapper のグループごと止めてから holder を
-    // 回収する。モジュール doc の「pid 再利用（TOCTOU）対策」。CORE-6・SEC-5）。
+    // 対象の渡し方は `HelperTarget` が決める（モジュール doc の「pid 再利用（TOCTOU）対策」。CORE-6・SEC-5・#2376）。
+    let (target_arg, stdin) = match target {
+        HelperTarget::ProcFd(handle) => {
+            let dir = handle
+                .dir
+                .try_clone()
+                .map_err(|e| io_error(stage, "duplicate target proc directory", &e))?;
+            (
+                "fd:0".to_string(),
+                Stdio::from(std::os::fd::OwnedFd::from(dir)),
+            )
+        }
+        HelperTarget::HeldPid { handle, keepalive } => {
+            let keep = keepalive
+                .try_clone_to_owned()
+                .map_err(|e| io_error(stage, "duplicate the holder keepalive", &e))?;
+            (handle.pid().get().to_string(), Stdio::from(keep))
+        }
+    };
     let mut cmd = Command::new(path);
-    cmd.arg(target.pid().get().to_string());
+    cmd.arg(target_arg);
     for e in set.entries() {
         cmd.arg(e.container_id.to_string())
             .arg(e.host_id.to_string())
             .arg(e.count.to_string());
     }
     cmd.env_clear()
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let mut child = cmd
@@ -945,6 +981,11 @@ pub fn apply_id_maps(
 }
 
 /// 開いた [`ProcHandle`] の指すプロセスへ写像を設定する（pid 再利用に耐える本体。CORE-6・SEC-5）。
+///
+/// `Helper` の書き込みは、helper へ対象を `fd:0`（stdin の `/proc/<pid>` fd）で渡す。書き込み先が fd で固定されるため、
+/// 呼び出し元が対象を回収しても別プロセスへは届かない。shadow 4.13 等の `fd:N` 未対応の `newuidmap` / `newgidmap`
+/// では helper が usage で失敗する（fail-closed。pid の数値へは退避しない。#2376）。pid の数値で渡すのは、対象が
+/// helper の終了まで生き続けることを保証できる内部の経路（holder と mapper。`exec::isolate_rootless_subordinate`）だけ。
 pub fn apply_id_maps_to(
     target: &ProcHandle,
     uid: &IdMapSet,
@@ -954,6 +995,7 @@ pub fn apply_id_maps_to(
 ) -> Result<IdMapReport, RootlessError> {
     apply_id_maps_as(
         target,
+        None,
         uid,
         gid,
         writer,
@@ -963,9 +1005,13 @@ pub fn apply_id_maps_to(
     )
 }
 
-/// euid / egid を注入できる本体（事前検証をテストするため分離）。
+/// euid / egid を注入できる本体（事前検証をテストするため分離）。`keepalive` は mapper だけが渡す
+/// （[`HelperTarget::HeldPid`]）。`None` なら helper へ `fd:0` で渡す。
+// 引数 8 個: 公開 API と mapper が共有する内部の本体で、試験が euid / egid を注入する(#2376 の最小変更)。
+#[allow(clippy::too_many_arguments)]
 fn apply_id_maps_as(
     pid: &ProcHandle,
+    keepalive: Option<std::os::fd::BorrowedFd<'_>>,
     uid: &IdMapSet,
     gid: &IdMapSet,
     writer: &IdMapWriter,
@@ -1002,8 +1048,15 @@ fn apply_id_maps_as(
             WriterKind::Direct
         }
         IdMapWriter::Helper(paths) => {
-            run_helper(paths, pid, uid, IdKind::Uid, timeout)?;
-            run_helper(paths, pid, gid, IdKind::Gid, timeout)?;
+            let target = match keepalive {
+                Some(keepalive) => HelperTarget::HeldPid {
+                    handle: pid,
+                    keepalive,
+                },
+                None => HelperTarget::ProcFd(pid),
+            };
+            run_helper(paths, target, uid, IdKind::Uid, timeout)?;
+            run_helper(paths, target, gid, IdKind::Gid, timeout)?;
             WriterKind::Helper
         }
     };
@@ -1123,9 +1176,15 @@ pub(crate) const HOLDER_RELEASE: u8 = 2;
 /// non-dumpable な対象は root 所有に見えて拒否される。そこで写像の対象を I ではなくこのプロセスにし、
 /// ここだけを dumpable にする。I は写像の後に `setns` でこの user namespace へ参加する(CORE-6・SEC-5・SEC-1)。
 ///
-/// 流れ: fd 3 以上を閉じる(I から継承した報告 pipe・listener 等を持たない)→ `PDEATHSIG` を SIGKILL に
+/// 流れ: fd 3 以上を閉じる(I から継承した報告 pipe・listener 等を持たない)
 /// → 親が `expected_parent`(I)のままか確認 → `unshare(CLONE_NEWUSER)` → dumpable にする → READY(`MapperReply::Ok`)
-/// を返す → [`HOLDER_RELEASE`] を `release_wait` まで待って終了する(REPAIR-5。I が死ねば PDEATHSIG で終わる)。
+/// を返す → [`HOLDER_RELEASE`] を `release_wait` まで待って終了する(REPAIR-5)。
+///
+/// `PDEATHSIG` は設定しない(#2376)。helper(`newuidmap` / `newgidmap`)は holder を pid の数値で受け取るため、I が
+/// helper の実行中に死んでも holder は先に終了して pid を解放してはならない。`sock` の相手側は I・mapper(fork で
+/// 継承)・各 helper(stdin に複製。`HelperTarget::HeldPid`)が持ち、全員が閉じるまで EOF にならない。そのため I が
+/// 死んだ場合も、holder は mapper と全 helper の終了(EOF)か `release_wait` の期限で終わる。`release_wait`
+/// (`3 × timeout + 5s`)は mapper の go 待ち(`timeout`)と helper 2 回(各 `timeout`)の和を上回る。
 /// 失敗は `MapperReply::Failed` で返して終了コード 1。exec せず I の `comm`(起動識別子)を引き継ぐため、I が
 /// 報告せずに死んでも C の再探索が回収できる(CORE-2)。
 pub(crate) fn run_userns_holder(
@@ -1141,7 +1200,6 @@ pub(crate) fn run_userns_holder(
             |m: &str| RootlessError::new(ErrorCode::Internal, RootlessStage::Validate, m);
         sys::close_fds_from_except(3, sock.as_fd())
             .map_err(|_| internal("close inherited fds in the holder"))?;
-        sys::set_parent_death_sigkill().map_err(|_| internal("PR_SET_PDEATHSIG in the holder"))?;
         if std::os::unix::process::parent_id() != expected_parent {
             return Err(RootlessError::new(
                 ErrorCode::FailedPrecondition,
@@ -1192,7 +1250,11 @@ pub(crate) fn run_userns_holder(
 /// 出力捕捉を通らず成功試験の実行中に雑音が出るのを避ける）。書き込みの失敗は無視し応答は必ず返す。
 /// 書き先は呼び出しごとの引数とし、グローバルな差し替えは採らない（fork 時に他スレッドが持つロックで
 /// 子がデッドロックするため。`eprintln!` も書き込み失敗で panic するため使わない）。
-// 引数 8 個: fork 子の単一呼び出し口で、まとめる構造体への整理は #2393 の対象外(最小変更)。
+///
+/// `keepalive`（#2376）: holder が持つ socket の相手側の複製（`exec` の handshake が渡す）。あれば helper へ対象を pid の
+/// 数値で渡し、各 helper の stdin にこの複製を持たせる（[`HelperTarget::HeldPid`]。holder は全員が閉じるまで終了しない）。
+/// `None` なら `fd:0` で渡す。
+// 引数 9 個: fork 子の単一呼び出し口で、まとめる構造体への整理は #2393 の対象外(最小変更)。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_id_map_mapper(
     target: u32,
@@ -1202,12 +1264,15 @@ pub(crate) fn run_id_map_mapper(
     gid: &IdMapSet,
     writer: &IdMapWriter,
     timeout: Duration,
+    keepalive: Option<std::os::fd::OwnedFd>,
     diag: &mut dyn std::io::Write,
 ) -> i32 {
+    use std::os::fd::AsFd as _;
     let outcome = mapper_outcome(
         target,
         expected_parent,
         &mut sock,
+        keepalive.as_ref().map(|k| k.as_fd()),
         uid,
         gid,
         writer,
@@ -1231,10 +1296,13 @@ pub(crate) fn run_id_map_mapper(
     code
 }
 
+// 引数 8 個: `run_id_map_mapper` の本体(#2376 の最小変更)。
+#[allow(clippy::too_many_arguments)]
 fn mapper_outcome(
     target: u32,
     expected_parent: u32,
     sock: &mut std::os::unix::net::UnixStream,
+    keepalive: Option<std::os::fd::BorrowedFd<'_>>,
     uid: &IdMapSet,
     gid: &IdMapSet,
     writer: &IdMapWriter,
@@ -1275,7 +1343,17 @@ fn mapper_outcome(
             "the mapping target is not a child of the expected parent",
         ));
     }
-    apply_id_maps_to(&handle, uid, gid, writer, timeout).map(|_| ())
+    apply_id_maps_as(
+        &handle,
+        keepalive,
+        uid,
+        gid,
+        writer,
+        timeout,
+        sys::effective_uid(),
+        sys::effective_gid(),
+    )
+    .map(|_| ())
 }
 
 #[cfg(test)]
@@ -1512,6 +1590,7 @@ mod tests {
         let pid = &pid;
         let e = apply_id_maps_as(
             pid,
+            None,
             &range,
             &single,
             &IdMapWriter::Direct,
@@ -1526,6 +1605,7 @@ mod tests {
         );
         let e = apply_id_maps_as(
             pid,
+            None,
             &single,
             &single,
             &IdMapWriter::Direct,
@@ -1603,6 +1683,7 @@ mod tests {
             &gid,
             &IdMapWriter::Direct,
             Duration::from_secs(1),
+            None,
             &mut diag,
         );
         assert_eq!(code, 1);
@@ -1640,6 +1721,7 @@ mod tests {
             &gid,
             &IdMapWriter::Direct,
             Duration::from_secs(1),
+            None,
             &mut diag,
         );
         assert_eq!(code, 1);
@@ -1676,6 +1758,7 @@ mod tests {
             &gid,
             &IdMapWriter::Direct,
             Duration::from_secs(1),
+            None,
             &mut diag,
         );
         assert_eq!(code, 1);
@@ -1721,6 +1804,7 @@ mod tests {
             &gid,
             &IdMapWriter::Direct,
             Duration::from_secs(1),
+            None,
             &mut diag,
         );
         assert_eq!(code, 1);
@@ -1766,6 +1850,7 @@ mod tests {
             &gid,
             &IdMapWriter::Direct,
             Duration::from_secs(1),
+            None,
             &mut FailingWriter,
         );
         assert_eq!(code, 1);

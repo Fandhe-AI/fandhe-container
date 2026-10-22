@@ -1686,7 +1686,7 @@ const PERSIST_EXPLICIT_STOP_LIMIT: Duration = Duration::from_secs(10);
 
 /// `Stopped` の記録へ「明示 stop 済み」を書き足す。cgroup の instance が start 時と一致し、`Stopped` で、
 /// 他の監視者が居ない記録だけに書く（同じ ID の再作成・別処理の再起動を取り違えない。SEC-1）。別世代・別の監視者の
-/// 記録なら書かずに `true`（`mark_stopped` と同じ扱い）。`Stopped` でない・読み書きが続けて失敗したら `false`。
+/// 記録、または start 時の instance が無く世代を識別できない場合も書かずに `true`（`mark_stopped` と同じ扱い）。`Stopped` でない・読み書きが続けて失敗したら `false`。
 fn persist_explicit_stop(
     store: &Arc<dyn StateStore>,
     id: &ContainerId,
@@ -1722,7 +1722,13 @@ fn try_persist_explicit_stop(
     let record = store
         .get(&GetStateRequest::new(id.clone()))
         .map_err(|e| e.code())?;
-    let same_instance = record.cgroup().map(|c| c.instance()) == instance;
+    // 世代の識別子（start 時の instance）が無い場合は `None == None` で別世代と取り違えるため、内容の一致に
+    // 頼らず書かずに中止する（fail-closed。SEC-1・契約 14。`write_explicit_stop` と同じ扱い）。
+    let Some(instance) = instance else {
+        log_event("persist_explicit_stop_skipped_no_instance", None);
+        return Ok(());
+    };
+    let same_instance = record.cgroup().map(|c| c.instance()) == Some(instance);
     let foreign = record
         .supervision()
         .supervisor_pid()
@@ -3195,6 +3201,19 @@ mod tests {
         CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ListStateRequest, StateList,
     };
 
+    /// 試験用の cgroup 記録（世代の識別子 instance = 7）。
+    fn test_placement() -> fandhe_container_core::traits::CgroupPlacement {
+        fandhe_container_core::traits::CgroupPlacement::new(
+            fandhe_container_core::traits::CgroupScope::new("/user.slice/x.scope").unwrap(),
+            StateRevision::from_raw(7),
+        )
+    }
+
+    /// 試験用の start 時 instance（[`test_placement`] と同じ世代）。
+    fn test_instance() -> Option<StateRevision> {
+        Some(StateRevision::from_raw(7))
+    }
+
     /// 1 レコードを持つメモリ上のストア（`update` は status・監視・明示 stop を反映して revision を進める）。
     struct OneRecord(Mutex<StateRecord>);
 
@@ -3205,7 +3224,8 @@ mod tests {
                 std::env::temp_dir().join("b"),
                 StateRevision::from_raw(1),
             )
-            .expect("record");
+            .expect("record")
+            .with_cgroup(test_placement());
             Arc::new(Self(Mutex::new(rec)))
         }
     }
@@ -3226,6 +3246,7 @@ mod tests {
                 StateRevision::from_raw(g.revision().value() + 1),
             )
             .expect("record")
+            .with_cgroup(test_placement())
             .with_supervision(req.supervision().unwrap_or_else(|| g.supervision()))
             .with_explicit_stop(explicit);
             *g = next.clone();
@@ -3252,7 +3273,7 @@ mod tests {
         let st = OneRecord::stopped();
         let store: Arc<dyn StateStore> = st.clone();
         assert_eq!(
-            finish_disposed_explicit(&store, &id, None, (true, vec![]), 0, true),
+            finish_disposed_explicit(&store, &id, test_instance(), (true, vec![]), 0, true),
             0
         );
         let rec = st.0.lock().unwrap().clone();
@@ -3277,7 +3298,7 @@ mod tests {
         let st = OneRecord::stopped();
         let store: Arc<dyn StateStore> = st.clone();
         assert_eq!(
-            finish_disposed_explicit(&store, &id, None, (false, vec![]), 0, true),
+            finish_disposed_explicit(&store, &id, test_instance(), (false, vec![]), 0, true),
             internal
         );
         assert_eq!(
@@ -3285,7 +3306,30 @@ mod tests {
             ExplicitStop::NotRecorded
         );
         assert_eq!(
-            finish_disposed_explicit(&store, &id, None, (true, vec![]), 0, false),
+            finish_disposed_explicit(&store, &id, test_instance(), (true, vec![]), 0, false),
+            0
+        );
+        assert_eq!(
+            st.0.lock().unwrap().explicit_stop(),
+            ExplicitStop::NotRecorded
+        );
+    }
+
+    /// SUP-9・SUP-3・SEC-1・契約 14・#2440: start 時の instance も記録の cgroup も無い（`None == None`）ときは
+    /// 同一世代とみなさず、明示 stop を書かない（同じ ID で再作成された新世代の unless-stopped を止めない）。
+    #[test]
+    fn sup9_2440_persist_skips_when_no_generation_identifier() {
+        let id = ContainerId::new("c1").expect("id");
+        let st = OneRecord::stopped();
+        *st.0.lock().unwrap() = StateRecord::new(
+            ContainerStatus::stopped(id.clone(), None),
+            std::env::temp_dir().join("b"),
+            StateRevision::from_raw(1),
+        )
+        .expect("record");
+        let store: Arc<dyn StateStore> = st.clone();
+        assert_eq!(
+            finish_disposed_explicit(&store, &id, None, (true, vec![]), 0, true),
             0
         );
         assert_eq!(
@@ -3304,10 +3348,11 @@ mod tests {
             std::env::temp_dir().join("b"),
             StateRevision::from_raw(1),
         )
-        .expect("record");
+        .expect("record")
+        .with_cgroup(test_placement());
         let store: Arc<dyn StateStore> = st.clone();
         assert_eq!(
-            finish_disposed_explicit(&store, &id, None, (true, vec![]), 0, true),
+            finish_disposed_explicit(&store, &id, test_instance(), (true, vec![]), 0, true),
             exit_code_for(ErrorCode::Internal).get()
         );
     }

@@ -39,7 +39,7 @@ I ─ RELEASE を U へ送り、U と M を回収 → 残りの namespace を un
 - 応答は REPAIR-2 に沿った固定長フレーム（`MapperReply` の 3 バイト、RELEASE は 1 バイト定数）。READY・go・応答・RELEASE の待ちはすべて期限つき（REPAIR-5）。U は RELEASE を `3 × timeout + 5s` まで待ち、I が死ねば PDEATHSIG で終わる。
 - M の TOCTOU（SEC-5）: 対象が「親の pid」から「兄弟の U の pid」に変わる。M は先に `ProcHandle` で `/proc/<U>` の fd を開き、その後で M 自身の親と U の ppid がともに I であることを確かめる。I が生きていて U が I の未回収の子なら pid は再利用されておらず、fd は以後同じプロセスを指す。
 - helper へ渡す対象（#2376）: ubuntu-latest の shadow 4.13 の `newuidmap` / `newgidmap` は `fd:N` 形式を受け付けないため、U の pid を数値で渡す。helper の書き込み先は fd で固定されないので、U の pid が解放（回収）されるのは helper が止まった後に限る（下の後始末）。成功時は M が helper を回収してから応答する。
-- 失敗時の後始末（CORE-2・CORE-6・SEC-5）: I は先に M へ `SIGKILL`（回収しない）、続けて M のプロセスグループ（M が写像の前に `setsid` で作り、helper が継承する）へ `SIGKILL` を送り、その後で U を kill・回収する。`kill(2)` が戻った後の helper はユーザー空間へ戻らず、新たに `/proc/<U>` を開いて書けない。グループ宛てが失敗した場合は U を kill だけして回収しない（ゾンビの間は pid が保たれる。fail-closed）。M は公開 API では kill・回収し、launcher では回収せず、C の識別子の再探索が helper ごと回収する。U は I の `comm`（起動識別子）を引き継ぎ exec しないため、I が報告せずに死んでも C の再探索で見つけられる。再探索は、識別子つきの全候補（U・M・PID 1）の子孫（helper）を止めてゾンビ化を確かめてから錨を回収し、1 つでも保持になればどの錨も回収しない（U を helper より先に回収しない）。
+- 失敗時の後始末（CORE-2・CORE-6・SEC-5）: I は先に M へ `SIGKILL`（回収しない）、続けて M のプロセスグループ（M が写像の前に `setsid` で作り、helper が継承する）へ `SIGKILL` を送り、M のセッションの全員（helper を含む）がゾンビ化するか消えたことを期限つきで確かめてから U を kill・回収する（`SIGKILL` は送達と終了が同時でなく、実行中の syscall は `kill(2)` の後も完了し得るため）。グループ宛てが失敗した場合や終了を確かめられない場合は U を kill だけして回収しない（ゾンビの間は pid が保たれる。fail-closed）。M は公開 API では kill・回収し、launcher では回収せず、C の識別子の再探索が helper ごと回収する。U は I の `comm`（起動識別子）を引き継ぎ exec しないため、I が報告せずに死んでも C の再探索で見つけられる。再探索は、識別子つきの全候補（U・M・PID 1）の子孫（helper）を止めてゾンビ化を確かめてから錨を回収し、1 つでも保持になればどの錨も回収しない（U を helper より先に回収しない）。
 
 ## 4. 残る影響と許容の根拠
 

@@ -29,7 +29,7 @@
 //!   `newuidmap` / `newgidmap` には pid 文字列を渡す（shadow 4.13 は `fd:<pidfd>` 形式を受け付けないため。#2376）。
 //!   helper の書き込み先は fd で固定されないため、対象（holder）を回収するのは helper が止まった後に限る:
 //!   成功時は mapper が helper を回収してから応答する。失敗時は I が mapper とそのプロセスグループ（helper を含む）へ
-//!   `SIGKILL` を送ってから holder を回収し、止めたと言えなければ holder を回収しない
+//!   `SIGKILL` を送り、セッションの全員の終了を確かめてから holder を回収し、確かめられなければ holder を回収しない
 //!   （`exec::isolate_rootless_subordinate_with`）。I が死んだ場合は C の識別子の再探索が全候補の helper を止めて
 //!   から holder を回収する（`exec::launch_intermediate::rescan_unreported_init`）。
 //!   新規 FFI は不要（pidfd は採らない）。単独で [`apply_id_maps`] を呼ぶ場合は pid から fd を開くため、対象を reap する前

@@ -1162,6 +1162,54 @@ fn descendants_in(proc_root: &Path, anchor: u32, me: u32, out: &mut Rescan) -> V
     found
 }
 
+/// セッション `session` に属するプロセスが、期限内に全員終了した(ゾンビか、回収されて `/proc` から消えた)か
+/// (CORE-6・SEC-5・#2376。REPAIR-5)。
+///
+/// rootless の範囲写像の失敗の後始末(`exec::stop_mapper_and_helpers`)が、mapper のグループへ `SIGKILL` を送った後、
+/// holder を回収する前に helper(mapper のセッションを継承する)の終了を確かめるために使う。`SIGKILL` は送達と終了が
+/// 同時でなく、実行中の syscall は `kill(2)` が戻った後も完了し得るため。呼び出し側は `session` が未回収の自分の子の
+/// pid であること(セッション ID が再利用されない)を保証する。`/proc` の列挙・読み取り・解析に失敗したら `false`
+/// (fail-closed)。
+pub(super) fn session_members_exited(session: u32, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout.min(Duration::from_secs(2));
+    loop {
+        match session_has_live_member(session) {
+            Some(false) => return true,
+            Some(true) => {}
+            None => return false,
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// セッション `session` に、ゾンビでないプロセスが居るか(`/proc` を 1 回走査する)。走査できなければ `None`。
+fn session_has_live_member(session: u32) -> Option<bool> {
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let entry = entry.ok()?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let stat = match read_proc_text(&Path::new("/proc").join(pid.to_string()).join("stat")) {
+            Ok(Some(stat)) => stat,
+            // 走査中に消えた(回収された)。
+            Ok(None) => continue,
+            Err(_) => return None,
+        };
+        let (_, member_session) = parent_and_session_of(&stat)?;
+        if member_session == session && proc_state_of(&stat)? != 'Z' {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 /// `/proc` のテキストを読む。対象が消えていれば `Ok(None)`(列挙から読むまでの間に終了した)、それ以外の失敗は
 /// `Err`(呼び出し側が fail-closed で扱う)。
 fn read_proc_text(path: &Path) -> std::io::Result<Option<String>> {
@@ -2183,6 +2231,47 @@ mod tests {
         let _ = sys::kill_pid(helper, sys::Signal::Kill);
         wait_state(helper, 'Z');
         for pid in [mapper, holder, helper, grandchild] {
+            let child = ContainerChild::adopt_reparented(NonZeroU32::new(pid).unwrap(), &subreaper);
+            child
+                .kill_and_reap(Duration::from_secs(5))
+                .expect("reap a test process");
+        }
+    }
+
+    /// CORE-6・SEC-5(#2376): セッションの全員の終了確認は、生きているメンバーが居る間は期限で `false`、全員が
+    /// ゾンビになれば `true` を返す(holder の回収前に helper の終了を確かめる経路の実体)。
+    #[test]
+    fn core6_session_members_exited_waits_for_all_members() {
+        let subreaper = ChildSubreaper::enable().expect("subreaper");
+        let tag = LaunchTag::fresh();
+        let (mut ready_read, ready_write) = std::io::pipe().unwrap();
+        let ready_write = std::fs::File::from(std::os::fd::OwnedFd::from(ready_write));
+        let leader = fork_tagged_session_leader(tag, || {
+            let member = sys::fork_single_threaded_with_no_flush(
+                || true,
+                || {
+                    let mut w = &ready_write;
+                    let _ = w.write_all(&std::process::id().to_le_bytes());
+                    std::thread::sleep(Duration::from_secs(120));
+                    0
+                },
+                EXIT_SETUP_FAILED,
+            );
+            if member.is_err() {
+                return EXIT_SETUP_FAILED;
+            }
+            std::thread::sleep(Duration::from_secs(120));
+            0
+        });
+        drop(ready_write);
+        let mut buf = [0u8; 4];
+        read_within(&mut ready_read, &mut buf, Duration::from_secs(10));
+        let member = u32::from_le_bytes(buf);
+        assert!(!session_members_exited(leader, Duration::from_millis(100)));
+        sys::kill_process_group(leader, sys::Signal::Kill).expect("kill the session group");
+        assert!(session_members_exited(leader, Duration::from_secs(2)));
+        assert_eq!(parent_of(member), Some(std::process::id()));
+        for pid in [leader, member] {
             let child = ContainerChild::adopt_reparented(NonZeroU32::new(pid).unwrap(), &subreaper);
             child
                 .kill_and_reap(Duration::from_secs(5))

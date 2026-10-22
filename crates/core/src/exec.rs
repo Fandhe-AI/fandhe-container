@@ -1749,10 +1749,11 @@ fn isolate_rootless_subordinate_with(
 ///
 /// 1. mapper 自身へ `SIGKILL`(回収しない。未回収の子なので pid と、それを ID に持つプロセスグループは再利用されない)。
 ///    送達後の mapper は新しい helper を fork できない(fork は保留中の致死シグナルで失敗する)
-/// 2. mapper のプロセスグループ(mapper が写像の前に `setsid` で作り、helper が継承する)へ `SIGKILL`。`kill(2)` が
-///    戻った後の helper は以後ユーザー空間へ戻らないため、新たに `/proc/<holder の pid>` を開いて書くことはない。
-///    既に開いていた fd は holder を回収する前に開いたもの(holder を指す)である。`ESRCH`(グループが無い)は、
-///    mapper が `setsid` の前に止まった(helper を作っていない)ことを意味する
+/// 2. mapper のプロセスグループ(mapper が写像の前に `setsid` で作り、helper が継承する)へ `SIGKILL`。`ESRCH`
+///    (グループが無い)は、mapper が `setsid` の前に止まった(helper を作っていない)ことを意味する
+/// 3. mapper のセッションの全員(helper を含む)が終了した(ゾンビか、回収されて消えた)ことを期限つきで確かめる。
+///    `SIGKILL` は送達と終了が同時でなく、実行中の syscall は `kill(2)` が戻った後も完了し得るため、終了を確かめて
+///    から holder を回収する(以後 helper が `/proc/<holder の pid>` を開くことはない)
 ///
 /// helper が止まったと言えるときだけ `true`。`false` なら呼び出し側は holder を回収しない(fail-closed)。
 fn stop_mapper_and_helpers(mapper: &ContainerChild) -> bool {
@@ -1760,7 +1761,7 @@ fn stop_mapper_and_helpers(mapper: &ContainerChild) -> bool {
         return false;
     }
     match sys::kill_process_group(mapper.pid(), sys::Signal::Kill) {
-        Ok(()) => true,
+        Ok(()) => launch_intermediate::session_members_exited(mapper.pid(), MAPPER_REAP_TIMEOUT),
         Err(sys::SysError::Os(e)) if e == sys::ESRCH => true,
         Err(_) => false,
     }

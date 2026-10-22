@@ -111,6 +111,12 @@ pub struct PeerAuthRejection<'a> {
     pub expected_pid: Option<u32>,
     /// 観測した peer pid（pid 系の理由で取得できた場合のみ）。
     pub peer_pid: Option<u32>,
+    /// この受け付けでの連続拒否回数（REPAIR-4）。`grpc::UdsIncoming` の accept のみ `Some`
+    /// （peer 拒否のバックオフの状態。PLUG-12・REPAIR-5）。他の経路は `None`。
+    pub consecutive_rejections: Option<u32>,
+    /// この拒否の後に受け付けへ入れる待ちのミリ秒（0 は待ちなし）。`consecutive_rejections` と同じく
+    /// `grpc::UdsIncoming` のみ `Some`。
+    pub backoff_ms: Option<u64>,
     /// 対象 socket のパス。
     pub socket_path: &'a Path,
 }
@@ -129,6 +135,10 @@ struct EventLine<'a> {
     expected_pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     peer_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    consecutive_rejections: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backoff_ms: Option<u64>,
     socket_path: &'a str,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     socket_path_lossy: bool,
@@ -152,6 +162,8 @@ impl PeerAuthRejection<'_> {
             peer_uid: self.peer_uid,
             expected_pid: self.expected_pid,
             peer_pid: self.peer_pid,
+            consecutive_rejections: self.consecutive_rejections,
+            backoff_ms: self.backoff_ms,
             socket_path: &lossy_path,
             socket_path_lossy: lossy,
         };
@@ -281,8 +293,23 @@ mod tests {
             peer_uid,
             expected_pid: None,
             peer_pid: None,
+            consecutive_rejections: None,
+            backoff_ms: None,
             socket_path: p,
         }
+    }
+
+    /// PLUG-12・REPAIR-4: バックオフの連続回数と待ちを持つ行は完全一致で固定する（キー順を含む）。
+    #[test]
+    fn plug12_sec4_backoff_fields_line_is_exact() {
+        let p = Path::new("/run/user/1000/fandhe-container/a.sock");
+        let mut e = ev(PeerAuthRejectReason::UidMismatch, Some(1000), p);
+        e.consecutive_rejections = Some(4);
+        e.backoff_ms = Some(10);
+        assert_eq!(
+            e.to_json_line(),
+            "{\"event\":\"plugin_peer_auth\",\"op\":\"accept\",\"outcome\":\"error\",\"reason\":\"peer_uid_mismatch\",\"code\":\"PERMISSION_DENIED\",\"expected_uid\":1001,\"peer_uid\":1000,\"consecutive_rejections\":4,\"backoff_ms\":10,\"socket_path\":\"/run/user/1000/fandhe-container/a.sock\"}"
+        );
     }
 
     /// PLUG-12・SEC-4: UID 不一致の行は完全一致で固定する。

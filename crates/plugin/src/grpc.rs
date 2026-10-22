@@ -863,6 +863,10 @@ mod uds {
     /// 止まらない。UID 値は返却エラーにもログにも載せない）。`observer` は受付の中で同期に呼ばれるため
     /// ブロックしない実装であること（`PeerAuthObserver` の契約）。
     ///
+    /// peer 拒否が続くと（別 UID の相手の接続・切断の連打）、連続 4 件目から 10ms 起点で倍々に待ち、
+    /// 上限 500ms で頭打ちにする。peer 照合に合格した接続を受理したら解除する（PLUG-12・REPAIR-5）。
+    /// 連続回数と待ちは監査イベントの `consecutive_rejections`・`backoff_ms` に載る（REPAIR-4）。
+    ///
     /// accept の I/O エラー（fd 枯渇等）は `Err` として流し、tonic が記録して継続する。直後は 10ms の
     /// バックオフを挟み busy loop を避ける（REPAIR-5）。
     ///
@@ -875,10 +879,51 @@ mod uds {
         expected_uid: u32,
         observer: Box<dyn crate::PeerAuthObserver>,
         backoff: Option<Pin<Box<tokio::time::Sleep>>>,
+        /// peer 拒否の連続回数と待ち（PLUG-12・REPAIR-5）。
+        peer_reject: PeerRejectBackoff,
     }
 
     /// accept エラー後のバックオフ。
     const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+    /// 待たずに処理する連続 peer 拒否の件数（単発の拒否で正当な接続を遅らせない）。
+    const PEER_REJECT_BACKOFF_FREE: u32 = 3;
+    /// peer 拒否が `PEER_REJECT_BACKOFF_FREE` 件を超えた最初の待ち。
+    const PEER_REJECT_BACKOFF_BASE: Duration = Duration::from_millis(10);
+    /// peer 拒否のバックオフの上限。拒否の連打の最中に正当な同 UID の client が受ける追加遅延の
+    /// 最悪値でもある（client の接続期限の既定より十分小さい）。
+    const PEER_REJECT_BACKOFF_MAX: Duration = Duration::from_millis(500);
+
+    /// peer 拒否の連続回数と待ちを決める状態機械（PLUG-12・REPAIR-5）。`UdsIncoming::poll_next` が使う。
+    ///
+    /// 別 UID の相手が接続と切断を繰り返しても受け付けが空回りしないよう、連続拒否が
+    /// `PEER_REJECT_BACKOFF_FREE` 件を超えたら `BASE` 起点で倍々に待ち、`MAX` で頭打ちにする。
+    /// 解除は「peer 照合に合格した接続の受理」だけで行う。待ち行列が空（`Pending`）になった時点では
+    /// 解除しない。相手が間を空けて 1 接続ずつ繰り返すと毎回解除されて抑止が効かなくなるため。
+    #[derive(Debug, Default)]
+    pub(super) struct PeerRejectBackoff {
+        streak: u32,
+    }
+
+    impl PeerRejectBackoff {
+        /// 拒否を 1 件数え、(連続回数, この拒否の後の待ち) を返す。演算は飽和で panic しない。
+        pub(super) fn on_rejection(&mut self) -> (u32, Duration) {
+            self.streak = self.streak.saturating_add(1);
+            let over = self.streak.saturating_sub(PEER_REJECT_BACKOFF_FREE);
+            if over == 0 {
+                return (self.streak, Duration::ZERO);
+            }
+            let factor = 1u32.checked_shl(over.saturating_sub(1)).unwrap_or(u32::MAX);
+            let wait = PEER_REJECT_BACKOFF_BASE
+                .checked_mul(factor)
+                .map_or(PEER_REJECT_BACKOFF_MAX, |d| d.min(PEER_REJECT_BACKOFF_MAX));
+            (self.streak, wait)
+        }
+
+        /// 合格した接続を受理したので連続回数を戻す。
+        pub(super) fn on_accepted(&mut self) {
+            self.streak = 0;
+        }
+    }
 
     impl UdsIncoming {
         /// bind 済みの `listener` を incoming にする。fd の dup・tokio 化に失敗したら `Internal`。
@@ -910,7 +955,26 @@ mod uds {
                 expected_uid,
                 observer,
                 backoff: None,
+                peer_reject: PeerRejectBackoff::default(),
             })
+        }
+
+        /// 試験用: 期待 UID を差し替える（`with_expected_uid` と同じ趣旨で、照合を省く経路ではない）。
+        #[cfg(test)]
+        pub(super) fn set_expected_uid_for_test(&mut self, uid: u32) {
+            self.expected_uid = uid;
+        }
+
+        /// 試験用: 現在の連続 peer 拒否回数。
+        #[cfg(test)]
+        pub(super) fn peer_reject_streak(&self) -> u32 {
+            self.peer_reject.streak
+        }
+
+        /// 試験用: peer 拒否または accept エラーの待ちが残っているか。
+        #[cfg(test)]
+        pub(super) fn has_backoff(&self) -> bool {
+            self.backoff.is_some()
         }
 
         /// client が接続に使う socket のパス（`UdsListener::path`）。
@@ -956,6 +1020,7 @@ mod uds {
                         {
                             // 「切断 → 監査通知」の順（`transport` の accept と同じ。SEC-4）。
                             drop(std_stream);
+                            let (streak, wait) = this.peer_reject.on_rejection();
                             this.observer.on_rejection(&crate::PeerAuthRejection {
                                 op: crate::PeerAuthOp::Accept,
                                 reason: rej.reason,
@@ -964,12 +1029,29 @@ mod uds {
                                 peer_uid: rej.peer_uid,
                                 expected_pid: None,
                                 peer_pid: None,
+                                consecutive_rejections: Some(streak),
+                                backoff_ms: Some(
+                                    u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+                                ),
                                 socket_path: this.listener.path(),
                             });
+                            if wait.is_zero() {
+                                continue;
+                            }
+                            // 何も yield せず Pending を返すため、sleep をここで 1 回 poll して
+                            // waker をタイマーへ登録する（しないと受け付けが止まる）。
+                            let mut sleep = Box::pin(tokio::time::sleep(wait));
+                            if sleep.as_mut().poll(cx).is_pending() {
+                                this.backoff = Some(sleep);
+                                return Poll::Pending;
+                            }
                             continue;
                         }
                         match tokio::net::UnixStream::from_std(std_stream) {
-                            Ok(s) => return Poll::Ready(Some(Ok(s))),
+                            Ok(s) => {
+                                this.peer_reject.on_accepted();
+                                return Poll::Ready(Some(Ok(s)));
+                            }
                             Err(_) => continue,
                         }
                     }
@@ -1026,6 +1108,8 @@ mod uds {
                     peer_uid: rej.peer_uid,
                     expected_pid: None,
                     peer_pid: None,
+                    consecutive_rejections: None,
+                    backoff_ms: None,
                     socket_path: self.path.as_path(),
                 });
                 return Err(rej.error);
@@ -1441,6 +1525,17 @@ mod uds_peer_auth_tests {
     use std::sync::atomic::AtomicU32;
 
     type Events = Arc<Mutex<Vec<(PeerAuthOp, PeerAuthRejectReason)>>>;
+    type BackoffEvents = Arc<Mutex<Vec<(Option<u32>, Option<u64>)>>>;
+
+    struct BackoffRecorder(BackoffEvents);
+    impl PeerAuthObserver for BackoffRecorder {
+        fn on_rejection(&mut self, e: &PeerAuthRejection<'_>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((e.consecutive_rejections, e.backoff_ms));
+        }
+    }
 
     struct Recorder(Events);
     impl PeerAuthObserver for Recorder {
@@ -1531,5 +1626,96 @@ mod uds_peer_auth_tests {
             *events.lock().unwrap(),
             vec![(PeerAuthOp::Connect, PeerAuthRejectReason::UidMismatch)]
         );
+    }
+
+    /// PLUG-12・REPAIR-5: 待ちの表を具体値で照合する。
+    #[test]
+    fn plug12_peer_reject_backoff_schedule() {
+        let mut b = super::uds::PeerRejectBackoff::default();
+        let ms = Duration::from_millis;
+        let want = [
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (4, 10),
+            (5, 20),
+            (6, 40),
+            (7, 80),
+            (8, 160),
+            (9, 320),
+            (10, 500),
+            (11, 500),
+            (12, 500),
+        ];
+        for (n, w) in want {
+            assert_eq!(b.on_rejection(), (n, ms(w)));
+        }
+    }
+
+    /// PLUG-12・REPAIR-5: 回数が増えても panic せず上限の待ちになる。
+    #[test]
+    fn plug12_peer_reject_backoff_saturates() {
+        let mut b = super::uds::PeerRejectBackoff::default();
+        for _ in 0..200 {
+            b.on_rejection();
+        }
+        assert_eq!(b.on_rejection(), (201, Duration::from_millis(500)));
+    }
+
+    /// PLUG-12: 受理で連続回数が戻る。
+    #[test]
+    fn plug12_peer_reject_backoff_resets_on_accept() {
+        let mut b = super::uds::PeerRejectBackoff::default();
+        for _ in 0..5 {
+            b.on_rejection();
+        }
+        b.on_accepted();
+        assert_eq!(b.on_rejection(), (1, Duration::ZERO));
+    }
+
+    /// PLUG-12・REPAIR-5・REPAIR-4: 実ソケットで連続拒否に待ちが入り、正当な接続で解除される。
+    #[tokio::test]
+    async fn plug12_server_backs_off_on_consecutive_rejections_and_recovers() {
+        let dir = TempDir::new();
+        let listener = UdsListener::bind(&dir.0.join("s.sock")).unwrap();
+        let events: BackoffEvents = Arc::default();
+        let mut incoming = UdsIncoming::with_expected_uid(
+            listener,
+            Box::new(BackoffRecorder(Arc::clone(&events))),
+            other_uid(),
+        )
+        .unwrap();
+        let path = incoming.path().to_path_buf();
+        let _clients: Vec<StdStream> = (0..5).map(|_| StdStream::connect(&path).unwrap()).collect();
+        let polled = tokio::time::timeout(
+            Duration::from_secs(1),
+            poll_fn(|cx| Pin::new(&mut incoming).poll_next(cx)),
+        )
+        .await;
+        assert!(polled.is_err(), "rejected peers must not be yielded");
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                (Some(1), Some(0)),
+                (Some(2), Some(0)),
+                (Some(3), Some(0)),
+                (Some(4), Some(10)),
+                (Some(5), Some(20)),
+            ]
+        );
+        assert_eq!(incoming.peer_reject_streak(), 5);
+
+        incoming.set_expected_uid_for_test(crate::sys::effective_uid());
+        let _good = StdStream::connect(&path).unwrap();
+        let got = tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_fn(|cx| Pin::new(&mut incoming).poll_next(cx)),
+        )
+        .await
+        .expect("legitimate peer must be accepted after the backoff");
+        assert!(matches!(got, Some(Ok(_))));
+        assert_eq!(incoming.peer_reject_streak(), 0);
+        assert!(!incoming.has_backoff());
+        assert_eq!(events.lock().unwrap().len(), 5);
     }
 }

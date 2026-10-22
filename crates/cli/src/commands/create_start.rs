@@ -17,7 +17,7 @@
 //!   `fandhe-container-supervisor` を起動して結果を受け取る（`supervisor_start` module の doc に契約・期限・
 //!   未実装範囲を書く）。supervisor が core の本番 launcher（#1715・#1819）で起動し、Running の記録は supervisor が行う
 //!   （rootless のみ。実機での通し確認は未実施で #2062）。CLI は状態を書かないので、失敗しても `state.json` は変わらない
-//!   （プロセスのいない Running を CLI は残さない。#1541）。ランチャー経由の特権起動の選択は未対応（#1719・#1722）。
+//!   （プロセスのいない Running を CLI は残さない。#1541）。実体の隣に特権ランチャーがあれば rootful のインストールとしてランチャー経由で起動する（#2442。uid 0 の起動は `UNIMPLEMENTED`）。
 //! - 計測（REPAIR-4）のファイル出力は core の `open_flags` が対応するアーキテクチャの Linux のみ（`op_log_file`。対応外は出力しない）。本バイナリを
 //!   setuid / setgid・file capability つきで導入しない前提で、権限分離（TASK-171・SUP-14）で見直す。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・PLUG-4。`plugin_backend` module）。非 Linux では

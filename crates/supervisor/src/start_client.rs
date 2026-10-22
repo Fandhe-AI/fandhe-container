@@ -21,7 +21,8 @@
 //!   supervisor のログを混ぜず受け手も置かない。supervisor の構造化ログは supervisor 自身が `<root>/@supervisor-logs/<id>.log*`
 //!   へ保存する（サイズ上限・世代ローテーションつき。`fandhe_container_supervisor::supervisor_log`。#2067・REPAIR-4）。
 //!   `delete` が後始末する（`stop_delete`）。
-//! - `process_group(0)` で別のプロセスグループにし、端末の SIGINT / SIGHUP が supervisor に届かないようにする。
+//! - 直接経路は `process_group(0)` で別のプロセスグループにし、端末の SIGINT / SIGHUP が supervisor に届かないようにする
+//!   （ランチャー経路は付けない。後述の #2442）。
 //!
 //! # 委譲スコープでの起動（#2081・CORE-3・CORE-4・SEC-5）
 //! supervisor 側の `DelegatedCgroup::prepare` は、委譲された親 cgroup に自分以外のプロセスがいると拒否する。CLI と同じ
@@ -73,13 +74,17 @@
 //!   `/proc/self/exe` の解決結果（実体のパス）を返すため、`argv[0]` や symlink の置き場所ではなく実体のディレクトリを見る
 //!   （配布手順は CLI を launcher・supervisor と同じディレクトリに置く。#2068・SUP-14）。同一ユーザーで起動するため CLI と supervisor の間に権限の境界は無く、
 //!   実行ファイルの所有者・権限の fd 経由の検証は特権経路のランチャー（#1719）の責務とする。
-//! - rootful の特権起動でランチャー（`fandhe-container-launcher`）を選ぶ規則は未実装（#1719・#1722）。
+//! - 特権ランチャーの選択（#2442・SUP-14）: 非 root で、CLI の実体と同じディレクトリに固定名 `fandhe-container-launcher`
+//!   があれば rootful のインストールとみなし、`systemd-run ... -- <launcher> start --root <root> <id>` で起動する
+//!   （`process_group(0)` は付けない。ランチャーの `setsid` が `EPERM` になるため。stdio に pty は渡さない）。無ければ従来の
+//!   直接経路。在るが通常ファイル・実行可能・所有者 root か euid・g/o 書き込み不可でなければ `FAILED_PRECONDITION` で止め、
+//!   直接経路へ黙って落とさない。uid 0 の起動はランチャーの前提（呼び出し元は非 root）に反し、`RootfulHostRoot` の判断
+//!   （#2241）待ちのため今のまま `UNIMPLEMENTED`。実機での通し確認は未実施（#538・#539）。
 //! - supervisor の fd 2 へ直接書かれるもの（core の診断・panic のメッセージ等）は保存されない（stderr が null のため捨てられる。
 //!   範囲は `supervisor_log` の「未実装・残余」。`legacy_tiocsti` の警告は supervisor のログへ残る。#2008）。
 //! - 親から継承した CLOEXEC の無い fd は CLI では閉じない。supervisor の bin の入口が fd 3 以降を閉じる
 //!   （ランチャー経由と同じ処理。#2070・SEC-1）。exec から入口までの短い窓は残る。
-//! - supervisor は core の本番 launcher（#1715・#1819 で結線済み）で起動する。権限モデルは rootless のみで、
-//!   rootful は spawn の前に `UNIMPLEMENTED`（上記）。restart の再 launch は fail-closed（#2043）。実機での通し確認
+//! - supervisor は core の本番 launcher（#1715・#1819 で結線済み）で起動する。uid 0 は spawn の前に `UNIMPLEMENTED`（上記）。restart の再 launch は fail-closed（#2043）。実機での通し確認
 //!   （委譲 cgroup の準備で拒否されないか）は未実施（#2062。`tests/supervisor_bin_real.rs` は実機前提）。
 //! - 1 行も無いまま EOF のとき、supervisor の異常終了と systemd-run の失敗（D-Bus 接続の失敗等）を区別できない
 //!   （stderr を pipe にすると supervisor の構造化ログが混ざり、CLI の終了後に EPIPE になるため採らない。制御チャネル #2058 の後の課題）。
@@ -101,9 +106,10 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use fandhe_container_core::oci_runtime::{LifecycleOp, OciRuntimeError, StartTimeouts};
+use fandhe_container_core::plugin_trust::check_owner_and_mode;
 use fandhe_container_core::traits::{ContainerId, ErrorCode};
 
-use crate::launcher::SUPERVISOR_FILE_NAME;
+use crate::launcher::{LAUNCHER_FILE_NAME, SUPERVISOR_FILE_NAME};
 use crate::start_contract::{
     MAX_REPORT_LEN, StartReport, USER_SCOPE_WRAPPER_ARGS, cli_receive_deadline,
 };
@@ -218,8 +224,9 @@ fn map_received(received: Received) -> Result<NonZeroU32, OciRuntimeError> {
     }
 }
 
-/// 契約どおりの argv・stdio・環境・cwd・プロセスグループを `cmd` に設定する（シェルも文字列連結も使わない）。
-fn configure(cmd: &mut Command, root: &Path, id: &ContainerId) {
+/// 契約どおりの argv・stdio・環境・cwd を `cmd` に設定する（シェルも文字列連結も使わない）。
+/// プロセスグループは設定しない（直接経路は [`configure`]、ランチャー経路は付けない。#2442）。
+fn configure_common(cmd: &mut Command, root: &Path, id: &ContainerId) {
     cmd.arg("start")
         .arg("--root")
         .arg(root)
@@ -229,8 +236,60 @@ fn configure(cmd: &mut Command, root: &Path, id: &ContainerId) {
         .stderr(Stdio::null())
         .env_clear()
         .env("PATH", SUPERVISOR_PATH_ENV)
-        .current_dir("/")
-        .process_group(0);
+        .current_dir("/");
+}
+
+/// 直接経路（rootless）の設定: [`configure_common`] に `process_group(0)` を足す。
+fn configure(cmd: &mut Command, root: &Path, id: &ContainerId) {
+    configure_common(cmd, root, id);
+    cmd.process_group(0);
+}
+
+/// CLI の実体パスと同じディレクトリの固定名から特権ランチャーの実行ファイルを決める（`PATH` 探索をしない。純関数）。
+fn launcher_path_beside(cli_exe: &Path) -> Result<PathBuf, OciRuntimeError> {
+    match cli_exe.parent() {
+        Some(dir) if dir.is_absolute() => Ok(dir.join(LAUNCHER_FILE_NAME)),
+        _ => Err(start_error(
+            ErrorCode::FailedPrecondition,
+            "cannot resolve the cli executable path",
+        )),
+    }
+}
+
+/// 隣のランチャーの有無と信頼の判定結果（#2442）。
+#[derive(Debug, PartialEq, Eq)]
+enum LauncherPresence {
+    /// 無い（rootless のインストール）。
+    Absent,
+    /// 実体が通常ファイル・実行可能・所有者が root か `euid`・group/other 書き込み不可。
+    Trusted(PathBuf),
+    /// 在るが信頼条件を満たさない、または読めない（fail-closed。直接経路へ落とさない）。
+    Untrusted,
+}
+
+/// `path` のランチャーを分類する。祖先は辿らない（特権側の信頼チェーンはランチャーが自分で検証する。#1719）。
+fn classify_launcher(path: &Path, euid: u32) -> LauncherPresence {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let real = match std::fs::canonicalize(path) {
+        Ok(p) => p,
+        // 解決失敗でもディレクトリエントリ自体が在る（リンク切れ・ループ・権限エラー等）なら不存在とみなさない
+        // （SUP-14: 在るが信頼できないランチャーは fail-closed。直接経路へ黙って落とさない）。
+        Err(_) => {
+            return match std::fs::symlink_metadata(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => LauncherPresence::Absent,
+                _ => LauncherPresence::Untrusted,
+            };
+        }
+    };
+    let Ok(meta) = std::fs::metadata(&real) else {
+        return LauncherPresence::Untrusted;
+    };
+    let mode = meta.permissions().mode();
+    if !meta.is_file() || mode & 0o111 == 0 || check_owner_and_mode(meta.uid(), mode, euid).is_err()
+    {
+        return LauncherPresence::Untrusted;
+    }
+    LauncherPresence::Trusted(real)
 }
 
 /// CLI の実体パスと同じディレクトリの固定名から supervisor の実行ファイルを決める（`PATH` 探索をしない。純関数）。
@@ -348,17 +407,32 @@ pub fn locate_systemd_run(euid: u32) -> Result<PathBuf, OciRuntimeError> {
     resolve_systemd_run(&refs, euid, Path::new("/")).map_err(systemd_run_error)
 }
 
-/// systemd-run で包んだ起動コマンドを組む（シェルも文字列連結も使わない）。内側の設定は [`configure`]。
+/// systemd-run で包んだ起動コマンドを組む（シェルも文字列連結も使わない）。内側の設定は [`configure_common`]。
+///
+/// `launcher` が `Some` のときは supervisor の代わりに特権ランチャーを包む（argv は同じ。ランチャーが検証して転送する）。
+/// この経路では `process_group(0)` を付けない: 付けると子がプロセスグループのリーダーになり、ランチャーの入口の
+/// `setsid` が `EPERM` で拒否される（#537・#2442）。systemd-run は同じプロセスで exec するため、ランチャーは CLI の
+/// グループの非リーダーのまま `setsid` に成功する。stdio は pty を渡さない（null / pipe / null）。
 fn scoped_command(
     systemd_run: &Path,
+    launcher: Option<&Path>,
     supervisor: &Path,
     root: &Path,
     id: &ContainerId,
     xdg: &OsStr,
 ) -> Command {
     let mut cmd = Command::new(systemd_run);
-    cmd.args(USER_SCOPE_WRAPPER_ARGS).arg(supervisor);
-    configure(&mut cmd, root, id);
+    cmd.args(USER_SCOPE_WRAPPER_ARGS);
+    match launcher {
+        Some(launcher) => {
+            cmd.arg(launcher);
+            configure_common(&mut cmd, root, id);
+        }
+        None => {
+            cmd.arg(supervisor);
+            configure(&mut cmd, root, id);
+        }
+    }
     cmd.env("XDG_RUNTIME_DIR", xdg);
     cmd
 }
@@ -372,6 +446,8 @@ fn scoped_command(
 pub struct SupervisorLaunch {
     systemd_run: PathBuf,
     supervisor: PathBuf,
+    /// `Some` なら特権ランチャー経由（rootful のインストール。#2442）。`None` は直接経路（rootless）。
+    launcher: Option<PathBuf>,
     xdg_runtime_dir: std::ffi::OsString,
 }
 
@@ -385,8 +461,29 @@ impl SupervisorLaunch {
         Self {
             systemd_run,
             supervisor,
+            launcher: None,
             xdg_runtime_dir,
         }
+    }
+
+    /// [`Self::new`] のランチャー経由版（試験の注入用。検査はしない。製品コードは呼ばない）。
+    pub fn new_via_launcher(
+        systemd_run: PathBuf,
+        launcher: PathBuf,
+        supervisor: PathBuf,
+        xdg_runtime_dir: std::ffi::OsString,
+    ) -> Self {
+        Self {
+            systemd_run,
+            supervisor,
+            launcher: Some(launcher),
+            xdg_runtime_dir,
+        }
+    }
+
+    /// 特権ランチャー経由の起動か（試験・診断用）。
+    pub fn uses_launcher(&self) -> bool {
+        self.launcher.is_some()
     }
 
     /// 実行ファイルの実体パス `exe` と同じディレクトリの固定名から supervisor を決め、本番の検査で解決する。
@@ -409,10 +506,26 @@ impl SupervisorLaunch {
             ));
         }
         let euid = privilege_gate(read_self_status().as_deref())?;
+        // rootful のインストールは CLI の隣にランチャーがあること（#2442）。在るのに信頼できなければ直接経路へ落とさず止める。
+        let launcher = match classify_launcher(&launcher_path_beside(exe)?, euid) {
+            LauncherPresence::Absent => None,
+            LauncherPresence::Trusted(p) => Some(p),
+            LauncherPresence::Untrusted => {
+                return Err(start_error(
+                    ErrorCode::FailedPrecondition,
+                    "privileged launcher is not a trusted executable (must be a regular file owned by root or the current user, not writable by group or others)",
+                ));
+            }
+        };
         let systemd_run = locate(euid)?;
         let xdg = user_manager_env(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), euid)
             .map_err(user_manager_error)?;
-        Ok(Self::new(systemd_run, program, xdg))
+        Ok(Self {
+            systemd_run,
+            supervisor: program,
+            launcher,
+            xdg_runtime_dir: xdg,
+        })
     }
 }
 
@@ -429,6 +542,7 @@ pub fn start_with(
 ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
     let cmd = scoped_command(
         &launch.systemd_run,
+        launch.launcher.as_deref(),
         &launch.supervisor,
         root,
         id,
@@ -766,12 +880,129 @@ mod tests {
         }
     }
 
+    /// SUP-14: ランチャー経路の argv・環境・cwd（プログラムは systemd-run、supervisor の代わりにランチャーを包む）。
+    #[test]
+    fn sup14_scoped_command_via_launcher_argv_env_cwd() {
+        let id = ContainerId::new("c1").expect("id");
+        let cmd = scoped_command(
+            Path::new("/usr/bin/systemd-run"),
+            Some(Path::new("/opt/x/fandhe-container-launcher")),
+            Path::new("/opt/x/fandhe-container-supervisor"),
+            Path::new("/r"),
+            &id,
+            OsStr::new("/run/user/1000"),
+        );
+        assert_eq!(cmd.get_program(), "/usr/bin/systemd-run");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "--user",
+                "--scope",
+                "--quiet",
+                "-p",
+                "Delegate=yes",
+                "--",
+                "/opt/x/fandhe-container-launcher",
+                "start",
+                "--root",
+                "/r",
+                "c1"
+            ]
+        );
+        let mut envs: Vec<_> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        envs.sort();
+        assert_eq!(
+            envs,
+            [
+                ("PATH".to_string(), Some(SUPERVISOR_PATH_ENV.to_string())),
+                (
+                    "XDG_RUNTIME_DIR".to_string(),
+                    Some("/run/user/1000".to_string())
+                ),
+            ]
+        );
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/")));
+    }
+
+    /// SUP-14: ランチャーのパスは CLI の実体と同じディレクトリの固定名。相対パス・親なしは拒否する。
+    #[test]
+    fn sup14_launcher_path_beside() {
+        assert_eq!(LAUNCHER_FILE_NAME, "fandhe-container-launcher");
+        assert_eq!(
+            launcher_path_beside(Path::new("/opt/x/fandhe-container")).expect("ok"),
+            PathBuf::from("/opt/x/fandhe-container-launcher")
+        );
+        for bad in ["fandhe-container", "/", ""] {
+            assert!(launcher_path_beside(Path::new(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// SUP-14: ランチャーの分類。無い / 信頼できる / 信頼できない（g+w・o+w・実行ビット無し・ディレクトリ・他人所有）。
+    #[test]
+    fn sup14_classify_launcher() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = TmpDir::new("classify");
+        let euid = std::fs::metadata(&dir.0).expect("meta").uid();
+        let path = dir.0.join("fandhe-container-launcher");
+        assert_eq!(classify_launcher(&path, euid), LauncherPresence::Absent);
+
+        std::fs::write(&path, b"#!/bin/sh\n").expect("write");
+        let real = std::fs::canonicalize(&path).expect("canon");
+        for (mode, trusted) in [
+            (0o755, true),
+            (0o4755, true),
+            (0o775, false),
+            (0o757, false),
+            (0o644, false),
+        ] {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+            let want = if trusted {
+                LauncherPresence::Trusted(real.clone())
+            } else {
+                LauncherPresence::Untrusted
+            };
+            assert_eq!(classify_launcher(&path, euid), want, "mode {mode:o}");
+        }
+        // 所有者が root でも euid でもない場合（euid を別の値にして擬似的に表す）。
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        if euid != 0 {
+            assert_eq!(
+                classify_launcher(&path, euid.wrapping_add(1)),
+                LauncherPresence::Untrusted
+            );
+        }
+        // リンク切れの symlink はエントリが在るので Untrusted（Absent にしない）。
+        let dangling = dir.0.join("dangling-launcher");
+        std::os::unix::fs::symlink(dir.0.join("no-such-target"), &dangling).expect("symlink");
+        assert_eq!(
+            classify_launcher(&dangling, euid),
+            LauncherPresence::Untrusted
+        );
+        // ディレクトリは通常ファイルではない。
+        let sub = dir.0.join("d");
+        std::fs::create_dir(&sub).expect("mkdir");
+        assert_eq!(classify_launcher(&sub, euid), LauncherPresence::Untrusted);
+    }
+
     /// CORE-3・SUP-1: systemd-run で包んだ argv・環境・cwd は固定（環境は PATH と XDG_RUNTIME_DIR だけ）。
     #[test]
     fn core3_sup1_scoped_command_argv_env_cwd() {
         let id = ContainerId::new("c1").expect("id");
         let cmd = scoped_command(
             Path::new("/usr/bin/systemd-run"),
+            None,
             Path::new("/opt/x/fandhe-container-supervisor"),
             Path::new("/r"),
             &id,

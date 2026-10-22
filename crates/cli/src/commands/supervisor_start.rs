@@ -6,6 +6,10 @@
 //! 共有するため CLI の private 実装から移した（#2434・REPAIR-1）。契約・期限・待機中のシグナルの扱い・未実装の一覧は
 //! 移設先の module doc を参照する。外部から見える挙動（終了コード・文言・期限）は移設前と変えない。
 //!
+//! 権限モデルの選択（#2442・SUP-14）: 非 root で実体の隣に信頼できる `fandhe-container-launcher` があれば rootful のインストールと
+//! みなしてランチャー経由で起動する（`process_group(0)` なし・pty なし）。無ければ従来の直接経路（rootless）。uid 0 はランチャーの
+//! 前提（呼び出し元は非 root）に反し、`RootfulHostRoot`（#2241）の判断待ちのため `UNIMPLEMENTED` のまま。規則は共有クライアント側にある。
+//!
 //! CLI に残す責務:
 //! - 実行ファイルの基準: CLI 自身の実体パス（`current_exe()`）と同じディレクトリの固定名 `fandhe-container-supervisor`
 //!   （`PATH` 探索・環境変数・引数による上書きは作らない。#2068・SUP-14）。

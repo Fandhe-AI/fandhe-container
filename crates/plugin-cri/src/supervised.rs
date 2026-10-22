@@ -26,7 +26,8 @@
 //! # 未実装・簡易実装（REPAIR-3）
 //! - supervisor の実行ファイルは plugin-cri の実体パス（`current_exe()`）と同じディレクトリの固定名から解決する
 //!   （`PATH` 探索・環境変数・引数による上書きは作らない。`docs/setup/linux.md`）。
-//! - 権限モデルは rootless のみで、rootful は spawn の前に `UNIMPLEMENTED`（CLI と同じ。#1719・#1722）。
+//! - 権限モデルは CLI と同じ共有クライアントの規則: 実体の隣に信頼できるランチャーがあればランチャー経由、無ければ直接経路。
+//!   uid 0 は spawn の前に `UNIMPLEMENTED`（#2442・#2241）。
 //! - `XDG_RUNTIME_DIR` が plugin の環境に必要（将来の plugin proxy が環境を空にすると `FAILED_PRECONDITION`。#1869）。
 //! - 実機での通し（委譲 scope 内での plugin-cri → supervisor → delete）は未実施（#850・#2062）。
 

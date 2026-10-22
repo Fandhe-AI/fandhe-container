@@ -25,7 +25,7 @@
 //! - 分離の単体テストは `setup::tests::cli2_daily_commands_do_not_request_os_setup`（TASK-80.3）。
 //!
 //! 将来仕様（本実装の範囲外）:
-//! - start: ランチャー経由の特権起動の選択（#1719・#1722）。
+//! - start: uid 0 の起動（`RootfulHostRoot`。現状は `UNIMPLEMENTED`。#2241 のオーナー判断待ち）。
 //! - stop の猶予 → SIGKILL（#1545）・stop の意図の伝達（SUP-9）・`kill` コマンド（#1902。`production_signaler` を共用）。
 //! - list の JSON 出力: serde 系の配線か core の公開ライタが前提（`list_logs` module の doc 参照。TASK-95・TASK-98）。
 //! - macOS / Windows は plugin 発見機構経由（TASK-79.4・#641・PLUG-4。`plugin_backend` module）。発見 → 登録 → 信頼性検証までを

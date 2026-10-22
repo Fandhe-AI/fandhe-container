@@ -1582,9 +1582,11 @@ fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
 /// - シングルスレッドから呼ぶこと（holder・mapper の fork と `setns(CLONE_NEWUSER)` の制約。マルチスレッドは
 ///   副作用なしで `FailedPrecondition`）
 /// - 失敗したプロセスは破棄すること（写像は write-once で戻せない。[`isolate`] と同じ）。holder と mapper は
-///   どの失敗経路でも kill して回収する（ゾンビを残さない）
+///   どの失敗経路でも kill して回収する（ゾンビを残さない）。ただし holder の回収は、mapper と helper を
+///   グループごと止めた後に限る（helper は holder を pid の数値で受け取るため。#2376）。止めたと言えない場合は
+///   holder を kill だけして回収せず、ゾンビとして pid を保つ（CORE-6・SEC-5。fail-closed）
 /// - holder・mapper は親の死を EOF で検知できない場合があるため、待ちは read タイムアウトで止める
-///   （holder は `PDEATHSIG` でも終わる。REPAIR-5）
+///   （holder は `PDEATHSIG` を持たず、helper を含む全員の終了〔socket の EOF〕か期限で終わる。#2376・REPAIR-5）
 pub fn isolate_rootless_subordinate(
     plan: &SubordinateIsolationPlan,
 ) -> Result<RootlessIsolationReport, ExecError> {
@@ -1624,7 +1626,8 @@ const HOLDER_SLACK: Duration = Duration::from_secs(5);
 /// holder は user namespace を作って保持するだけの使い捨てプロセスで、dumpable にするのは holder だけである
 /// (`newuidmap` / `newgidmap` は対象の `/proc/<pid>` の所有者を検査し、non-dumpable な対象を拒否するため。
 /// [`crate::rootless::run_userns_holder`])。holder は I の `comm`(起動識別子)を引き継ぐ。I が報告せずに死んだ場合も、
-/// holder は `PDEATHSIG` で終わり、残っても C の識別子の再探索(`rescan_unreported_init`)が回収する(CORE-2)。
+/// holder は helper を含む全員の終了(socket の EOF。`PDEATHSIG` は持たない。#2376)か期限で終わり、残っても C の
+/// 識別子の再探索(`rescan_unreported_init`)が回収する(CORE-2)。
 ///
 /// mapper は fork 直後に `setsid(2)` で自分のセッション(ID = mapper の pid)を作ってから写像に進む。mapper が
 /// 起動する `newuidmap` / `newgidmap`(helper)はセッションを継承するため、mapper が helper を残して終了しても、
@@ -1684,19 +1687,30 @@ fn isolate_rootless_subordinate_with(
             }
         }
         Err(e) => {
-            // holder は helper を持たず I の子として必ず回収できるため、どちらの caller でも kill・回収する。
-            let _ = holder.kill_and_reap(MAPPER_REAP_TIMEOUT);
+            // helper(`newuidmap` / `newgidmap`)は holder を pid の数値で受け取る(shadow 4.13 は `fd:N` を受けない。
+            // #2376)。holder を回収すると pid が解放されて再利用され得るため、helper がもう `/proc/<pid>` を開いて
+            // 書けないことを確かめてから回収する(CORE-6・SEC-5)。mapper が居なければ helper も居ない。
+            let helpers_stopped = mapper.as_ref().is_none_or(stop_mapper_and_helpers);
+            if helpers_stopped {
+                // holder は helper を持たず I の子として必ず回収できる。
+                let _ = holder.kill_and_reap(MAPPER_REAP_TIMEOUT);
+            } else {
+                // helper を止めたと言えない間は holder を回収しない(止めるだけで、ゾンビの間は pid が保たれる)。
+                // 公開 API ではゾンビが呼び出しプロセスの終了まで残り、launcher では I の終了で C へ再親付けされ、
+                // C の識別子の再探索が helper の停止を確かめてから回収する(`rescan_unreported_init`。CORE-2)。
+                let _ = holder.kill_keep_unreaped();
+            }
             if let Some(m) = mapper {
                 match caller {
-                    // 公開 API: mapper を必ず回収する。回収自体の失敗は元のエラーを優先する。
+                    // 公開 API: mapper を回収する(helper を止められなかった場合も、mapper 自身はゾンビで残さない)。
+                    // 回収自体の失敗は元のエラーを優先する。
                     MapperCaller::Standalone => {
                         let _ = m.kill_and_reap(MAPPER_REAP_TIMEOUT);
                     }
-                    // launcher の I: mapper を kill しない。helper の実行中に mapper だけを殺すと helper が C へ
-                    // 再親付けされて識別子(`LaunchTag`)を持たないまま残り、C の判定が Clean に進む(CORE-2)。
-                    // mapper は I から継承した識別子を持ち、I の終了で C へ再親付けされるので、`R` を受けた C が
-                    // I の回収後に識別子で再探索し、helper を先に kill してから mapper と helper を回収する
-                    // (`launch_intermediate`)。
+                    // launcher の I: mapper を回収しない。止めた helper は mapper の死で C へ再親付けされ、識別子
+                    // (`LaunchTag`)を持たない。未回収の mapper(ゾンビ)の pid が helper のセッション ID として帰属の
+                    // 錨になり、`R` を受けた C が I の回収後に識別子で再探索して helper と mapper を回収する
+                    // (`launch_intermediate`。CORE-2)。
                     MapperCaller::Launcher => drop(m),
                 }
             }
@@ -1730,6 +1744,28 @@ fn isolate_rootless_subordinate_with(
             },
         },
     })
+}
+
+/// 失敗の後始末で、mapper と、mapper が起動した helper(`newuidmap` / `newgidmap`)を止める(CORE-6・SEC-5・#2376)。
+///
+/// 1. mapper 自身へ `SIGKILL`(回収しない。未回収の子なので pid と、それを ID に持つプロセスグループは再利用されない)。
+///    送達後の mapper は新しい helper を fork できない(fork は保留中の致死シグナルで失敗する)
+/// 2. mapper のプロセスグループ(mapper が写像の前に `setsid` で作り、helper が継承する)へ `SIGKILL`。`ESRCH`
+///    (グループが無い)は、mapper が `setsid` の前に止まった(helper を作っていない)ことを意味する
+/// 3. mapper のセッションの全員(helper を含む)が終了した(ゾンビか、回収されて消えた)ことを期限つきで確かめる。
+///    `SIGKILL` は送達と終了が同時でなく、実行中の syscall は `kill(2)` が戻った後も完了し得るため、終了を確かめて
+///    から holder を回収する(以後 helper が `/proc/<holder の pid>` を開くことはない)
+///
+/// helper が止まったと言えるときだけ `true`。`false` なら呼び出し側は holder を回収しない(fail-closed)。
+fn stop_mapper_and_helpers(mapper: &ContainerChild) -> bool {
+    if !mapper.kill_keep_unreaped() {
+        return false;
+    }
+    match sys::kill_process_group(mapper.pid(), sys::Signal::Kill) {
+        Ok(()) => launch_intermediate::session_members_exited(mapper.pid(), MAPPER_REAP_TIMEOUT),
+        Err(sys::SysError::Os(e)) if e == sys::ESRCH => true,
+        Err(_) => false,
+    }
 }
 
 /// 本番 launcher の中間プロセスが使う [`isolate_rootless_subordinate`](holder・mapper の fork 前に stdio を
@@ -1811,8 +1847,16 @@ fn rootless_handshake(
     );
     let holder_pid = holder.pid();
     let mut mapper_end = Some(mapper_end);
+    // holder の socket の相手側の複製を mapper に持たせ、mapper は各 helper の stdin へ複製を渡す。holder は全員が閉じる
+    // (EOF)まで終了しないため、helper の実行中に holder の pid は解放されない(helper は pid の数値で受け取る。
+    // `rootless::run_userns_holder`・CORE-6・SEC-5・#2376)。親の複製はクロージャと共に親側で閉じる。
+    let mut keepalive = Some(std::os::fd::OwnedFd::from(
+        holder_sock
+            .try_clone()
+            .map_err(|e| sync_io_error(&e, "duplicate the userns holder socket"))?,
+    ));
     let mapper_pid = fork_for(caller, move || {
-        let Some(sock) = mapper_end.take() else {
+        let (Some(sock), Some(keepalive)) = (mapper_end.take(), keepalive.take()) else {
             return EXIT_SETUP_FAILED;
         };
         // helper の帰属を mapper の終了後も保つため、写像の前に自分のセッションを作る(上の doc。CORE-2)。
@@ -1828,6 +1872,7 @@ fn rootless_handshake(
             &gid,
             &writer,
             timeout,
+            Some(keepalive),
             &mut std::io::stderr(),
         )
     })?;

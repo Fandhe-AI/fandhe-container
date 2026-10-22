@@ -3402,6 +3402,21 @@ impl ContainerChild {
         }
     }
 
+    /// 未回収の子へ `SIGKILL` を送るが、回収しない（ゾンビの間は pid 番号が解放されない。CORE-6・SEC-5・#2376）。
+    ///
+    /// rootless の範囲写像の失敗の後始末（`exec::isolate_rootless_subordinate_with`）が、mapper を止めてもその pid
+    /// (= mapper のプロセスグループ ID)を保ったまま、グループ宛ての `SIGKILL` で helper を止めるために使う。
+    /// [`Self::send_signal`] はゾンビをその場で回収してしまうため使わない。
+    ///
+    /// 戻り値は「送った（または既に送ってあり）、まだ未回収である」とき `true`。回収済み・契約外の回収者に
+    /// 回収された（`Lost`）・送れなかった場合は `false` で、呼び出し側は pid が保たれている前提に立たないこと。
+    pub(super) fn kill_keep_unreaped(&self) -> bool {
+        if self.kill_if_unreaped().is_err() {
+            return false;
+        }
+        matches!(self.lock().state, ReapState::Killed)
+    }
+
     /// 未回収の子へシグナルを 1 つ送る（`oci_runtime::kill` の `ContainerChildProcess::signal` から呼ばれる。
     /// CORE-2・OCI-6・TASK-30.1）。
     ///

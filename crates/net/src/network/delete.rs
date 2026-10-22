@@ -49,6 +49,22 @@
 //! 成功扱いにする（冪等）。bridge の所有確認（`IFLA_IFALIAS`）はテーブルとは独立で、bridge の削除にだけ使う。
 //! bridge はテーブルの削除を確認してから消す（テーブルの削除に失敗したら bridge を残す）。
 //!
+//! # 作成失敗の回収（#2467）
+//!
+//! 作成（`create_network`）が資源を残して失敗したとき（`NetworkCreateError::rollback` の `leftover`）、
+//! `NetworkCreateError::reclaim_claim` の請求書（[`FailedCreateClaim`]）で `reclaim_failed_create`
+//! （Linux のみ）を呼ぶと、取り残した資源を所有の証明つきで回収できる。名前は請求書のネットワーク名から
+//! 再導出し、請求書のトークンがそのネットワークの発行形式でなければ ops を呼ぶ前に `Validate` で拒否する。
+//! nft テーブル → bridge の順に、請求書に載った資源だけを独立に照会する（載っていない資源、たとえば他者の
+//! 同名テーブルとの衝突で作れなかったテーブルは照会もしない）。`delete_network` が bridge の削除を
+//! テーブルの後まで待つのは veth の所有の証明（bridge への所属）を残すためだが、作成失敗には veth が無く、
+//! テーブルの所有は自分の userdata で独立に証明できるため、ここでは待たない。「すでに無い」は成功扱い。
+//! 確認から削除までの窓は `rollback_bridge` の doc と同じ残余リスクで、ここでは繰り返さない。
+//!
+//! 残余リスク（REPAIR-3）: 所有トークンを刻む前に失敗した bridge（`CreateBridge` の結果不明・`ResolveIndex`・
+//! `SetOwnerToken` の失敗）は別名が空のため証明できず、回収は成功しない（手動回収）。他者の同名資源が
+//! 残っている場合も同様。請求書はプロセスのメモリにだけあり、プロセスをまたぐ回収は未実装（担当 Issue 未確定）。
+//!
 //! # veth の所有
 //!
 //! ifindex は削除後に再利用されうるため、ifindex だけでは veth の所有を証明できない。接続時に host 側
@@ -94,7 +110,7 @@ use crate::nftables_batch::{NftBatchOutcome, NftName, TableInfo};
 #[cfg(target_os = "linux")]
 use super::link_ref;
 use super::{
-    AttachedContainer, CreatedNetwork, EndpointId, NetnsDirRecord, NetworkName,
+    AttachedContainer, CreatedNetwork, EndpointId, FailedCreateClaim, NetnsDirRecord, NetworkName,
     NetworkResourceNames, NftApplyFailure, PortRegistry, ResourceState, StaticIpam, UnpinFailure,
     VethNames, host_owner_token, is_indeterminate, token_names_network,
 };
@@ -304,13 +320,16 @@ enum TableProof {
 }
 
 fn prove_table<O: DeleteOps>(ops: &O, network: &CreatedNetwork) -> TableProof {
-    match ops.table_info(&network.table) {
+    prove_table_token(ops, &network.table, &network.bridge_token)
+}
+
+/// `table` の所有を、`token` と `NFTA_TABLE_USERDATA` の一致で証明する（作成失敗の回収でも共用。#2467）。
+fn prove_table_token<O: DeleteOps>(ops: &O, table: &NftName, token: &str) -> TableProof {
+    match ops.table_info(table) {
         Err(e) if e.code() == NetErrorCode::NotFound => TableProof::Absent,
         Err(e) => TableProof::Unproven(e),
         Ok(info) => match (info.handle(), info.userdata()) {
-            (Some(handle), Some(data)) if data == network.bridge_token.as_bytes() => {
-                TableProof::Owned(handle)
-            }
+            (Some(handle), Some(data)) if data == token.as_bytes() => TableProof::Owned(handle),
             _ => TableProof::Unproven(precondition(
                 "nft table ownership token mismatch (table was replaced or has no token)",
             )),
@@ -626,6 +645,91 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
     }
 }
 
+/// 作成失敗で取り残した bridge・nft テーブルを、所有を証明してから回収する本体（OS 非依存。#2467）。
+/// 手順と方針はモジュール doc「作成失敗の回収」。各資源は独立に扱い、最初のエラーだけを保持する（ERR-1）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn reclaim_failed_create_with<O: DeleteOps>(
+    ops: &O,
+    claim: &FailedCreateClaim,
+) -> Result<NetworkDeleteReport, NetworkDeleteError<O::Netns>> {
+    let mut report = NetworkDeleteReport::default();
+    let mut failures = Failures::default();
+    let token = claim.token();
+
+    // 1. 入力検証（カーネル I/O の前）。名前は請求書のネットワーク名から再導出し、トークンがそのネット
+    //    ワークの発行形式でなければ（空・別ネットワーク）何も触れずに拒否する。
+    let names = match NetworkResourceNames::derive(claim.network()) {
+        Ok(n) if token_names_network(token, claim.network()) => n,
+        Ok(_) => {
+            return Err(fail(
+                precondition("reclaim token does not belong to the network"),
+                DeleteStep::Validate,
+                report,
+                Vec::new(),
+            ));
+        }
+        Err(e) => return Err(fail(e, DeleteStep::Validate, report, Vec::new())),
+    };
+
+    // 2. nft テーブル（請求書に載った場合だけ照会する）。
+    if claim.includes_table() {
+        let table = names.table();
+        let res = DeleteResource::NftTable(table.clone());
+        match prove_table_token(ops, table, token) {
+            TableProof::Absent => report.removed.push(res),
+            TableProof::Unproven(e) => {
+                report.leftover.push((res, ResourceState::Unknown));
+                failures.note(e, DeleteStep::DeleteNftTable);
+            }
+            TableProof::Owned(handle) => match ops.delete_table(table, handle) {
+                Ok(()) => report.removed.push(res),
+                Err(f)
+                    if f.outcome == NftBatchOutcome::Aborted
+                        && f.error.code() == NetErrorCode::NotFound =>
+                {
+                    report.removed.push(res);
+                }
+                Err(f) => {
+                    let state = if f.outcome == NftBatchOutcome::Unknown {
+                        ResourceState::Unknown
+                    } else {
+                        ResourceState::Present
+                    };
+                    report.leftover.push((res, state));
+                    failures.note(f.error, DeleteStep::DeleteNftTable);
+                }
+            },
+        }
+    }
+
+    // 3. bridge（請求書に載った場合だけ）。別名がトークンと一致するときだけ、照会で得た ifindex で消す。
+    if claim.includes_bridge() {
+        let bridge = names.bridge();
+        let res = DeleteResource::Bridge(bridge.clone());
+        match ops.owned_bridge_index(bridge, token) {
+            Err(e) if e.code() == NetErrorCode::NotFound => report.removed.push(res),
+            Err(e) => {
+                // 別名の不一致・空（トークン未付与の bridge を含む）・判定不能。触れない。
+                report.leftover.push((res, ResourceState::Unknown));
+                failures.note(e, DeleteStep::DeleteBridge);
+            }
+            Ok(index) => match ops.delete_link(index) {
+                Ok(()) => report.removed.push(res),
+                Err(e) if e.code() == NetErrorCode::NotFound => report.removed.push(res),
+                Err(e) => {
+                    report.leftover.push((res, state_of(e.code())));
+                    failures.note(e, DeleteStep::DeleteBridge);
+                }
+            },
+        }
+    }
+
+    match failures.first {
+        None => Ok(report),
+        Some((error, step)) => Err(fail(error, step, report, Vec::new())),
+    }
+}
+
 /// veth を ifindex 指定で削除する。消えている（または今回消せた）なら `true`。
 fn delete_veth<O: DeleteOps>(
     ops: &O,
@@ -835,6 +939,30 @@ pub fn delete_network(
         containers,
         ipam,
         ports,
+    )
+}
+
+/// 作成失敗で取り残した bridge・nft テーブルを、所有を証明してから回収する（NET-1・NET-4・#2467）。
+///
+/// `claim` は `NetworkCreateError::reclaim_claim` が返した請求書で、外部入力から作れない。bridge は
+/// `IFLA_IFALIAS`、テーブルは `NFTA_TABLE_USERDATA` が作成時のトークンと一致する場合だけ、照会で得た
+/// ifindex・ハンドル指定で削除する。不一致・判定不能は触れずに `Unknown` で報告する（fail-closed）。
+/// 取り残しがあれば `Err` で、`report` に解放済みと取り残しを載せる。`CAP_NET_ADMIN` は呼び出し側の責務。
+/// `timeout` は各カーネル要求の期限（REPAIR-5）。
+#[cfg(target_os = "linux")]
+pub fn reclaim_failed_create(
+    route: &NetlinkRouteSocket,
+    nft: &NetlinkNetfilterSocket,
+    claim: &FailedCreateClaim,
+    timeout: Duration,
+) -> Result<NetworkDeleteReport, NetworkDeleteError<ContainerNetns>> {
+    reclaim_failed_create_with(
+        &LinuxDeleteOps {
+            route,
+            nft,
+            timeout,
+        },
+        claim,
     )
 }
 
@@ -1983,5 +2111,170 @@ mod tests {
             )]
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn claim(bridge: bool, table: bool) -> FailedCreateClaim {
+        FailedCreateClaim::for_test(NetworkName::new("web").unwrap(), TOKEN, bridge, table)
+    }
+
+    /// NET-1・#2467: 両方トークン一致なら、テーブル → bridge の順に照会して ifindex・ハンドル指定で消す。
+    #[test]
+    fn net1_reclaim_removes_owned_table_and_bridge() {
+        let fake = Fake::default();
+        let report = reclaim_failed_create_with(&fake, &claim(true, true)).unwrap();
+        let net = created();
+        assert_eq!(
+            fake.calls(),
+            vec![
+                format!("table_info {}", net.table.as_str()),
+                format!("delete_table {} handle=99", net.table.as_str()),
+                format!("owned_bridge_index {}", net.bridge.as_str()),
+                "delete_link 7".to_owned(),
+            ]
+        );
+        assert_eq!(
+            report.removed,
+            vec![
+                DeleteResource::NftTable(net.table.clone()),
+                DeleteResource::Bridge(net.bridge.clone())
+            ]
+        );
+        assert!(report.leftover.is_empty());
+    }
+
+    /// NET-1・#2467: すでに無い資源は成功扱い（冪等）で、削除は 1 回も呼ばない。
+    #[test]
+    fn net1_reclaim_not_found_is_idempotent() {
+        let fake = Fake {
+            table_absent: true,
+            bridge_lookup_err: Some(NetErrorCode::NotFound),
+            ..Fake::default()
+        };
+        let report = reclaim_failed_create_with(&fake, &claim(true, true)).unwrap();
+        assert_eq!(report.removed.len(), 2);
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_")));
+    }
+
+    /// NET-1・#2467: bridge の別名が不一致なら bridge に触れず Unknown。テーブルは独立に消える。
+    #[test]
+    fn net1_reclaim_refuses_bridge_without_token_but_removes_table() {
+        let fake = Fake {
+            bridge_lookup_err: Some(NetErrorCode::FailedPrecondition),
+            ..Fake::default()
+        };
+        let e = reclaim_failed_create_with(&fake, &claim(true, true)).unwrap_err();
+        let net = created();
+        assert_eq!(e.step, DeleteStep::DeleteBridge);
+        assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Bridge(net.bridge), ResourceState::Unknown)]
+        );
+        assert_eq!(e.report.removed, vec![DeleteResource::NftTable(net.table)]);
+        assert!(!fake.calls().iter().any(|c| c == "delete_link 7"));
+    }
+
+    /// NET-1・#2467: テーブルの userdata 不一致・ハンドル無しは削除せず Unknown。
+    #[test]
+    fn net1_reclaim_refuses_unproven_table() {
+        for fake in [
+            Fake {
+                table_userdata: Some(b"other".to_vec()),
+                ..Fake::default()
+            },
+            Fake {
+                table_no_handle: true,
+                ..Fake::default()
+            },
+        ] {
+            let e = reclaim_failed_create_with(&fake, &claim(false, true)).unwrap_err();
+            assert_eq!(e.step, DeleteStep::DeleteNftTable);
+            assert_eq!(
+                e.report.leftover,
+                vec![(
+                    DeleteResource::NftTable(created().table),
+                    ResourceState::Unknown
+                )]
+            );
+            assert!(!fake.calls().iter().any(|c| c.starts_with("delete_table")));
+        }
+    }
+
+    /// NET-1・#2467: 請求書に載っていない資源は照会もしない。
+    #[test]
+    fn net1_reclaim_skips_resources_not_in_claim() {
+        let fake = Fake::default();
+        reclaim_failed_create_with(&fake, &claim(true, false)).unwrap();
+        assert!(!fake.calls().iter().any(|c| c.contains("table")));
+        let fake = Fake::default();
+        reclaim_failed_create_with(&fake, &claim(false, true)).unwrap();
+        assert!(!fake.calls().iter().any(|c| c.contains("bridge")));
+    }
+
+    /// NET-1・#2467: 削除の失敗の状態。delete_link の Internal は Present、Timeout は Unknown。
+    #[test]
+    fn net1_reclaim_delete_failures_are_classified() {
+        let net = created();
+        for (code, state) in [
+            (NetErrorCode::Internal, ResourceState::Present),
+            (NetErrorCode::Timeout, ResourceState::Unknown),
+        ] {
+            let fake = Fake {
+                bridge_delete_err: Some(code),
+                ..Fake::default()
+            };
+            let e = reclaim_failed_create_with(&fake, &claim(true, false)).unwrap_err();
+            assert_eq!(e.step, DeleteStep::DeleteBridge);
+            assert_eq!(
+                e.report.leftover,
+                vec![(DeleteResource::Bridge(net.bridge.clone()), state)]
+            );
+        }
+        let fake = Fake {
+            table_err: Some((NetErrorCode::Timeout, NftBatchOutcome::Unknown)),
+            ..Fake::default()
+        };
+        let e = reclaim_failed_create_with(&fake, &claim(false, true)).unwrap_err();
+        assert_eq!(
+            e.report.leftover,
+            vec![(
+                DeleteResource::NftTable(net.table.clone()),
+                ResourceState::Unknown
+            )]
+        );
+        let fake = Fake {
+            table_err: Some((NetErrorCode::NotFound, NftBatchOutcome::Aborted)),
+            ..Fake::default()
+        };
+        let report = reclaim_failed_create_with(&fake, &claim(false, true)).unwrap();
+        assert_eq!(report.removed, vec![DeleteResource::NftTable(net.table)]);
+    }
+
+    /// NET-1・ERR-1・#2467: 2 段とも失敗したとき最初のエラーと手順を保持し、もう一方も試す。
+    #[test]
+    fn net1_reclaim_keeps_first_error() {
+        let fake = Fake {
+            table_query_err: Some(NetErrorCode::Timeout),
+            bridge_lookup_err: Some(NetErrorCode::FailedPrecondition),
+            ..Fake::default()
+        };
+        let e = reclaim_failed_create_with(&fake, &claim(true, true)).unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteNftTable);
+        assert_eq!(e.code(), NetErrorCode::Timeout);
+        assert_eq!(e.report.leftover.len(), 2);
+    }
+
+    /// NET-1・#2467: 別ネットワークのトークンや空トークンの請求書は ops を呼ぶ前に拒否する。
+    #[test]
+    fn net1_reclaim_rejects_foreign_or_empty_token_before_io() {
+        for token in ["fandhe-net:other:1:0:0", "", "fandhe-net:web2:1:0:0"] {
+            let fake = Fake::default();
+            let c =
+                FailedCreateClaim::for_test(NetworkName::new("web").unwrap(), token, true, true);
+            let e = reclaim_failed_create_with(&fake, &c).unwrap_err();
+            assert_eq!(e.step, DeleteStep::Validate);
+            assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+            assert!(fake.calls().is_empty());
+        }
     }
 }

@@ -20,7 +20,10 @@
 //!
 //! # 契約との対応（`NetworkPlugin` の doc の契約番号）
 //!
-//! - 契約 6: カーネル資源の巻き戻しは net が行う。取り残しがあれば件数を `message` に載せた `Internal` を返す
+//! - 契約 6: カーネル資源の巻き戻しは net が行う。取り残しがあれば件数を `message` に載せた `Internal` を返し、
+//!   ネットワークを回収待ちとして保持する。`delete_network` は net の `network::reclaim_failed_create`
+//!   （名前の再導出と所有トークンの一致で証明した bridge・nft テーブルだけを消す。#2467）で回収し、成功したときだけ
+//!   記録を外す
 //! - 契約 7・8・12: 本モジュールのレジストリで判定する。`attach` は契約 12 を最初に判定し、続けて
 //!   ネットワーク未作成、netns 未登録（いずれも `NotFound`）、紐付けネットワーク不一致（`FailedPrecondition`）の順
 //! - 契約 9: `delete_network` は net が残りを続行する。失敗時は再試行用のハンドルをレジストリへ戻し、
@@ -35,6 +38,9 @@
 //!   同じ pin パスで `AlreadyExists` になる。そのため Linux バックエンド（`LinuxNetsetup`）の `create_netns` は
 //!   メモリ上の登録だけで成功を装わず `Unimplemented` を返す（実 netns の事前作成は net の API 分割の後続作業）。
 //!   バックエンドの `create_netns` が成功したときだけ契約 7・8 の記録を作る
+//! - 作成失敗の回収（#2467）: 手動回収のまま残るのは、所有トークンを刻む前の失敗で残った bridge（請求書が無い、
+//!   または別名が空で証明できない）、他者の同名資源が残っている場合、plugin プロセスの再起動で請求書（メモリ上）を
+//!   失った場合。いずれも記録を保持して `FailedPrecondition`（または件数入りの `Internal`）を返す
 //! - `publish_port`: net はポート公開を attach 時の `ContainerAttachSpec::with_port_publishes` でしか受けず、
 //!   コンテナ単位の公開・解除が未実装のため `Unimplemented`（NET-4）
 //! - `detach`: net にコンテナ単体の切り離しが無いため、attach 済みは `Unimplemented`
@@ -198,17 +204,24 @@ impl From<TraitError> for AttachFailure {
 /// [`NetsetupBackend::create_network`] の失敗。作成途中の取り残し・結果不明の資源の件数を握りつぶさず運ぶ
 /// （契約 6・特権操作の後始末。レジストリが回収待ちとして保持し、上限に数える）。
 #[derive(Debug)]
-pub struct CreateFailure {
+pub struct CreateFailure<F = ()> {
     /// 失敗の原因（取り残しがあれば件数入りの `Internal`）。
     pub error: TraitError,
     /// 巻き戻しで回収できず残った・結果不明で削除しなかった資源の件数（0 なら何も残らない）。
     pub leftover: usize,
+    /// 取り残しを所有確認つきで回収するための請求書（Linux は net の `FailedCreateClaim`）。
+    /// 所有を証明できない取り残しでは `None`（手動回収。#2467）。
+    pub reclaim: Option<F>,
 }
 
-impl From<TraitError> for CreateFailure {
+impl<F> From<TraitError> for CreateFailure<F> {
     /// 取り残しなしの失敗。
     fn from(error: TraitError) -> Self {
-        Self { error, leftover: 0 }
+        Self {
+            error,
+            leftover: 0,
+            reclaim: None,
+        }
     }
 }
 
@@ -229,20 +242,27 @@ pub trait NetsetupBackend: Send + Sync {
     type Network: Send;
     /// attach 済みコンテナのハンドル。
     type Container: NetsetupContainer + Send;
+    /// 作成失敗の回収に使う請求書（Linux は net の `FailedCreateClaim`。#2467）。回収待ちの記録が保持し、
+    /// [`reclaim_failed_create`](Self::reclaim_failed_create) へそのまま返す。
+    type FailedCreate: Send;
 
     /// ネットワークを作る。失敗時の巻き戻しは実装が行う（契約 6）。
     fn create_network(
         &self,
         name: &NetName,
         gateway: IpPrefix,
-    ) -> Result<Self::Network, CreateFailure>;
+    ) -> Result<Self::Network, CreateFailure<Self::FailedCreate>>;
 
     /// 作成失敗で取り残した（または結果不明の）資源を、所有を確認したうえで回収する。成功は回収の確認済み。
     ///
-    /// 既定は回収せず `FailedPrecondition`（成功を装わない）。net に作成失敗後の所有確認つき回収 API
-    /// （ハンドルなしで bridge・nft テーブルを所有トークンで証明して消す口）が入るまで、Linux バックエンドも
-    /// 既定のまま手動回収を求める（REPAIR-3）。
-    fn reclaim_failed_create(&self, _name: &NetName) -> Result<(), TraitError> {
+    /// `claim` は同じ作成の失敗が返した請求書。既定は回収せず `FailedPrecondition`（成功を装わない）。
+    /// Linux バックエンドは net の `network::reclaim_failed_create` で、所有トークンの一致を確かめた
+    /// bridge・nft テーブルだけを消す。所有を証明できない資源は残り、手動回収になる（REPAIR-3）。
+    fn reclaim_failed_create(
+        &self,
+        _name: &NetName,
+        _claim: &Self::FailedCreate,
+    ) -> Result<(), TraitError> {
         Err(TraitError::new(
             ErrorCode::FailedPrecondition,
             "network creation left resources behind that cannot be reclaimed automatically; \
@@ -287,11 +307,12 @@ struct ContainerEntry<C> {
     attached: Option<C>,
     /// attach の巻き戻しで資源を取り残した印。立っている間は記録を消さず、attach・detach・
     /// ネットワーク削除を fail-closed で拒否する（net に所有確認つきの個別回収 API が入るまでの保持）。
+    /// 作成失敗の回収（#2467）とは別で、attach 側の回収は未実装。
     unreclaimed: bool,
 }
 
 /// 作成済みネットワーク 1 件の記録。
-struct NetworkEntry<N> {
+struct NetworkEntry<N, F> {
     /// 削除を始めたら立てる。完了（記録の除去）まで下ろさず、その間の新規登録・接続を拒否する（契約 9）。
     deleting: bool,
     /// バックエンドでのネットワーク解放が完了した印。取り残しの記録だけが残って再試行されるとき、
@@ -302,18 +323,27 @@ struct NetworkEntry<N> {
     handle: Option<N>,
     /// 作成失敗で取り残した・結果不明の資源の件数。`Some` の間は回収待ちとして上限に数え、
     /// 接続系の操作を拒否し、`delete_network` で回収を再試行する（回収確認まで記録を保持する）。
-    leaked: Option<usize>,
+    leaked: Option<LeakedCreate<F>>,
 }
 
-struct Registry<N, C> {
-    networks: HashMap<String, NetworkEntry<N>>,
+/// 作成失敗で取り残した資源の回収待ちの記録。
+struct LeakedCreate<F> {
+    /// 所有確認つきの回収に使う請求書。`None` は所有を証明できない取り残しで、手動回収。
+    claim: Option<F>,
+}
+
+struct Registry<N, C, F> {
+    networks: HashMap<String, NetworkEntry<N, F>>,
     /// コンテナ ID（文字列）→ 記録。同じコンテナはネットワークを問わず 1 件だけ（契約 7・8）。
     containers: HashMap<String, ContainerEntry<C>>,
 }
 
 /// バックエンド `B` のハンドル型で具体化したレジストリ。
-type BackendRegistry<B> =
-    Registry<<B as NetsetupBackend>::Network, <B as NetsetupBackend>::Container>;
+type BackendRegistry<B> = Registry<
+    <B as NetsetupBackend>::Network,
+    <B as NetsetupBackend>::Container,
+    <B as NetsetupBackend>::FailedCreate,
+>;
 
 /// `NetworkPlugin` を netsetup の操作単位で実装する（CRI-7・PLUG-1）。
 ///
@@ -419,6 +449,15 @@ fn leaked_network() -> TraitError {
     )
 }
 
+/// 所有を証明できない取り残し（トークンを刻む前の失敗等）の回収の拒否。記録は保持する。
+fn manual_reclaim_required() -> TraitError {
+    TraitError::new(
+        ErrorCode::FailedPrecondition,
+        "network creation left resources behind that cannot be reclaimed automatically; \
+         manual reclaim required",
+    )
+}
+
 fn network_deleting() -> TraitError {
     TraitError::new(
         ErrorCode::FailedPrecondition,
@@ -453,7 +492,9 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         }
         let (handle, leaked, result) = match self.backend.create_network(&name, gateway) {
             Ok(h) => (Some(h), None, Ok(())),
-            Err(f) if f.leftover > 0 => (None, Some(f.leftover), Err(f.error)),
+            Err(f) if f.leftover > 0 => {
+                (None, Some(LeakedCreate { claim: f.reclaim }), Err(f.error))
+            }
             Err(f) => return Err(f.error),
         };
         // 取り残し・結果不明は回収を確認できるまで記録を保持し、MAX_NETWORKS に数える。
@@ -625,9 +666,11 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let name = req.name().as_str();
         let network = reg.networks.get_mut(name).ok_or_else(not_found_network)?;
         // 作成失敗で取り残した資源の回収待ち: 回収を確認できたときだけ記録を外す（失敗なら保持して再試行）。
-        if network.leaked.is_some() {
+        if let Some(leaked) = &network.leaked {
+            // 請求書が無い（所有を証明できない）取り残しは、バックエンドを呼ばず手動回収を求める。
+            let claim = leaked.claim.as_ref().ok_or_else(manual_reclaim_required)?;
             let net_name = to_net_name(req.name())?;
-            self.backend.reclaim_failed_create(&net_name)?;
+            self.backend.reclaim_failed_create(&net_name, claim)?;
             reg.networks.remove(name);
             return Ok(DeleteNetworkResponse::new());
         }
@@ -753,8 +796,9 @@ mod linux {
     use fandhe_container_net::netlink_route::NetlinkRouteSocket;
     use fandhe_container_net::netns::ContainerNetns;
     use fandhe_container_net::network::{
-        AttachedContainer, ContainerAttachSpec, CreatedNetwork, NetworkCreateSpec, PortRegistry,
-        StaticIpam, attach_container, create_network, delete_network,
+        AttachedContainer, ContainerAttachSpec, CreatedNetwork, FailedCreateClaim,
+        NetworkCreateSpec, PortRegistry, StaticIpam, attach_container, create_network,
+        delete_network, reclaim_failed_create,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -827,12 +871,13 @@ mod linux {
     impl NetsetupBackend for LinuxNetsetup {
         type Network = LinuxNetwork;
         type Container = AttachedContainer<ContainerNetns>;
+        type FailedCreate = FailedCreateClaim;
 
         fn create_network(
             &self,
             name: &NetName,
             gateway: IpPrefix,
-        ) -> Result<Self::Network, CreateFailure> {
+        ) -> Result<Self::Network, CreateFailure<Self::FailedCreate>> {
             let spec = NetworkCreateSpec::new(name.clone(), gateway)
                 .map_err(|e| net_error_to_trait(&e))?;
             let (route, nft) = self.open_sockets()?;
@@ -842,18 +887,42 @@ mod linux {
                     CreateFailure {
                         error: with_leftover(net_error_to_trait(&e.error), leftover),
                         leftover,
+                        reclaim: e.reclaim_claim(),
                     }
                 })?;
             // 作成は成功済みで、ここで失敗すると bridge と nft テーブル（2 件）をハンドルなしで残す。
             let ipam = StaticIpam::for_network(&created).map_err(|e| CreateFailure {
                 error: with_leftover(net_error_to_trait(&e), 2),
                 leftover: 2,
+                reclaim: Some(FailedCreateClaim::from_created(&created)),
             })?;
             Ok(LinuxNetwork {
                 created,
                 ipam,
                 ports: PortRegistry::new(),
             })
+        }
+
+        fn reclaim_failed_create(
+            &self,
+            name: &NetName,
+            claim: &Self::FailedCreate,
+        ) -> Result<(), TraitError> {
+            // 防御的な照合。請求書は作成時のものをそのまま保持するはずで、食い違いは記録の破損なので触れない。
+            if claim.network() != name {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "reclaim claim does not belong to the network",
+                ));
+            }
+            let (route, nft) = self.open_sockets()?;
+            match reclaim_failed_create(&route, &nft, claim, NETSETUP_REQUEST_TIMEOUT) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(with_leftover(
+                    net_error_to_trait(&e.error),
+                    e.report.leftover.len(),
+                )),
+            }
         }
 
         fn create_netns(

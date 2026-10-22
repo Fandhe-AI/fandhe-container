@@ -526,6 +526,9 @@ impl ImageRootfsRecord {
         if relative_path.as_os_str().len() > MAX_IMAGE_ROOTFS_PATH_BYTES {
             return Err(bad("image rootfs path is too long"));
         }
+        // `components()` は途中の `.` と重複した区切りを読み飛ばすので、検証した Normal 要素だけで組み直して
+        // 保持する（`a/./b` は `a/b` として記録・永続化する）。
+        let relative_path: PathBuf = relative_path.components().collect();
         Ok(Self {
             relative_path,
             dev,

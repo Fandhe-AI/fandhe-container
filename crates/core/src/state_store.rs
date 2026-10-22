@@ -3479,6 +3479,8 @@ mod tests {
         );
         let ok = ImageRootfsRecord::new(PathBuf::from("a/./b"), 7, 9).unwrap();
         assert_eq!(ok.relative_path(), Path::new("a/b"));
+        // `Path` の比較は要素単位のため、保持する表記そのものが正規化されていることも確かめる。
+        assert_eq!(ok.relative_path().as_os_str(), std::ffi::OsStr::new("a/b"));
         assert_eq!(ok.identity(), (7, 9));
         assert_eq!(format!("{ok:?}"), "ImageRootfsRecord { .. }");
     }

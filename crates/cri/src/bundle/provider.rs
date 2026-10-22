@@ -130,26 +130,45 @@ impl SpecBundleProvider {
     }
 
     fn bundle_dir(&self, container_id: &str) -> Result<PathBuf, CriError> {
+        if container_id.len() > 255 {
+            return Err(CriError::invalid_argument("container id is invalid"));
+        }
         let id = ContainerId::new(container_id)
             .map_err(|_| CriError::invalid_argument("container id is invalid"))?;
         Ok(self.root.join(id.as_str()))
     }
 }
 
+/// この process の実効 UID を、root 直下に作った使い捨てファイルの所有者から独立に求める（unix）。
+///
+/// 新規作成したファイルの所有者は作成者の実効 UID になる。検証対象（root）の所有者や `/proc/self` の所有者
+/// （non-dumpable 時は root になる）を代用しない。作成・読み取りに失敗したら拒否する（fail-closed）。
+#[cfg(unix)]
+fn effective_uid(root: &Path) -> Result<u32, CriError> {
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let probe = root.join(format!(".fandhe-uid-probe-{}", std::process::id()));
+    let _ = fs::remove_file(&probe);
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&probe);
+    let uid = file
+        .and_then(|f| f.metadata())
+        .map(|m| m.uid())
+        .map_err(|_| CriError::failed_precondition("effective uid is unavailable"));
+    let _ = fs::remove_file(&probe);
+    uid
+}
+
 /// root 自身と祖先の所有者・書き込み権を検証する（unix）。
 ///
-/// 所有者は root（uid 0）か、この process の uid（Linux のみ `/proc/self` の所有者で判定。他 unix は root 自身の
-/// 所有者との一致で代える）。group / other に書き込み権のある祖先は、sticky bit がある場合だけ許す。
+/// 所有者は root（uid 0）か、この process の実効 UID（[`effective_uid`] で独立に取得。取得できなければ拒否）。
+/// group / other に書き込み権のある祖先は、sticky bit がある場合だけ許す。
 #[cfg(unix)]
 fn check_trusted_chain(root: &Path, root_meta: &fs::Metadata) -> Result<(), CriError> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let me = if cfg!(target_os = "linux") {
-        fs::metadata("/proc/self")
-            .map(|m| m.uid())
-            .unwrap_or(root_meta.uid())
-    } else {
-        root_meta.uid()
-    };
+    let me = effective_uid(root)?;
     if root_meta.uid() != me && root_meta.uid() != 0 {
         return Err(CriError::failed_precondition(
             "bundle root has an untrusted owner",

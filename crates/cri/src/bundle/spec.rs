@@ -653,12 +653,14 @@ fn build_inner(
     let args = build_args(container, image, require_command, &mut budget)?;
     let env = build_env(container, image, &mut budget)?;
 
-    let cwd = if !container.working_dir.is_empty() {
-        container.working_dir.clone()
+    // 複製前に借用のまま長さと形を検証する（巨大な値を拒否する場合でも追加確保しない）。
+    let cwd_ref: &str = if !container.working_dir.is_empty() {
+        &container.working_dir
     } else {
-        image.working_dir.clone().unwrap_or_else(|| "/".to_owned())
+        image.working_dir.as_deref().unwrap_or("/")
     };
-    check_abs_path("working_dir", &cwd)?;
+    check_abs_path("working_dir", cwd_ref)?;
+    let cwd = cwd_ref.to_owned();
     budget.spend(cwd.len().saturating_add(ITEM_OVERHEAD))?;
     if let Some(h) = hostname {
         budget.spend(h.len().saturating_add(ITEM_OVERHEAD))?;

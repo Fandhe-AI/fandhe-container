@@ -30,6 +30,10 @@ fandhe-container-oci = { path = "../oci" }
 # 参照は core の traits のみ。plugin feature は引き込まない（default-features = false）。
 fandhe-container-core = { path = "../core", default-features = false }
 tokio = { workspace = true, features = ["rt"] }
+# bundle の config.json 生成（CRI-1・CRI-2・#2395）。serde / serde_json は #138 で承認済み（用途: OCI config.json）。
+# workspace 既存の =x.y.z 固定版を参照するだけで Cargo.lock に新規パッケージは増えない。
+serde.workspace = true
+serde_json.workspace = true
 tonic.workspace = true
 tonic-prost.workspace = true
 prost.workspace = true

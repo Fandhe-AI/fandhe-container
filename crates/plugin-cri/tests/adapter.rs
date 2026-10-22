@@ -8,9 +8,9 @@ use fandhe_container_core::traits::{
     KillRequest, NetworkName, NetworkPlugin, PublishPortRequest, Signal, StartRequest,
     StateRequest, StopRequest,
 };
-use fandhe_container_cri::adapter::BundleProvider;
+use fandhe_container_cri::adapter::{BundleProvider, BundleRequest};
 use fandhe_container_cri::error::CriErrorCode;
-use fandhe_container_cri::runtime::v1::ContainerConfig;
+use fandhe_container_cri::runtime::v1::{ContainerConfig, PodSandboxConfig};
 use fandhe_container_plugin_cri::adapter::{
     CoreLifecycleRuntime, CriPluginBackends, MSG_BUNDLE_UNAVAILABLE, MSG_LAUNCH_UNAVAILABLE,
     MSG_NETWORK_UNAVAILABLE, UnimplementedBundleProvider, UnimplementedNetwork,
@@ -188,8 +188,9 @@ fn cri7_network_stub_unimplemented() {
 #[test]
 fn cri2_bundle_provider_stub() {
     let p = UnimplementedBundleProvider;
+    let (pod, ctr) = (PodSandboxConfig::default(), ContainerConfig::default());
     let e = p
-        .prepare("c1", "s1", &ContainerConfig::default())
+        .prepare(&BundleRequest::new("c1", "s1", &pod, &ctr))
         .expect_err("prepare");
     assert_eq!(e.code(), CriErrorCode::Unimplemented);
     assert_eq!(e.message(), MSG_BUNDLE_UNAVAILABLE);

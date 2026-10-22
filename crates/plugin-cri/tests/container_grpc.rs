@@ -32,7 +32,7 @@ use fandhe_container_core::traits::{
     ContainerRuntime, ContainerState, ContainerStatus, CreateRequest, DeleteRequest,
     DeleteResponse, ErrorCode, KillRequest, StartRequest, StateRequest, StopRequest, TraitError,
 };
-use fandhe_container_cri::adapter::{BundleProvider, RuntimeAdapter};
+use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::runtime::v1 as cri;
 use fandhe_container_cri::runtime::v1::runtime_service_client::RuntimeServiceClient;
@@ -477,12 +477,8 @@ impl ContainerRuntime for SharedRuntime {
 struct RecordingBundles(Mutex<Vec<String>>);
 
 impl BundleProvider for RecordingBundles {
-    fn prepare(
-        &self,
-        container_id: &str,
-        sandbox_id: &str,
-        config: &cri::ContainerConfig,
-    ) -> Result<PathBuf, CriError> {
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
+        let (container_id, sandbox_id, config) = (req.container_id, req.sandbox_id, req.config);
         let name = config.metadata.as_ref().map_or("", |m| m.name.as_str());
         self.0
             .lock()

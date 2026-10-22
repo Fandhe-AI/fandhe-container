@@ -1,0 +1,811 @@
+//! CRI の `PodSandboxConfig`・`ContainerConfig` から OCI `config.json` への純粋な変換と入力検証
+//! （CRI-1・CRI-2・ERR-3・OCI-4・SEC-1・SEC-5・REPAIR-2。#2395）。
+//!
+//! ファイルシステムにも core にも触れない。呼び出し元は [`super::SpecBundleProvider`]（bundle ディレクトリへ
+//! `config.json` を書く）で、出力は core の `oci_runtime::parse_config_bytes` が読む形式である。
+//!
+//! **fail-closed**: 実行層（core の create・start）が受けない項目、または黙って落とすと要求より分離が弱くなる項目
+//! （privileged・capability の追加・seccomp / AppArmor の無効化・NODE の pid / ipc 等）は、黙って落とさず
+//! `UNIMPLEMENTED` で拒否する。値域外・形式不正は `INVALID_ARGUMENT`。エラー文言は固定文言と CRI の
+//! フィールド名だけにし、値（env の秘密値・パス）を含めない。
+//!
+//! **上限**: 件数・長さは core の `oci_runtime::config` の上限（`CONFIG_MAX_*`）と同じ値を本モジュールで持つ
+//! （cri は core の `traits` だけを参照する境界のため。CRI-7）。一致は試験で core の定数と照合する。
+//!
+//! **未実装・簡易実装（REPAIR-3）**:
+//! - namespace の共有（POD の pid / ipc を pod 内で共有する）は未実装で、`POD` もコンテナごとの新しい
+//!   namespace にする（共有の欠落であり、要求より分離が弱くなる方向ではない）。
+//! - network namespace: `POD` / `CONTAINER` は `{"type":"network"}` を出す。core の start は network namespace を
+//!   まだ受けず `Unimplemented` で拒否する（NetworkPlugin の結線〔NET 系・#459 系〕まで）。`NODE`（host）は
+//!   network namespace を出さない（ホストの netns で動く。利用者が明示した場合だけ）。crictl 疎通確認
+//!   （#442）の pod.json は当面 `namespace_options.network = NODE` を要する。
+//! - user namespace: `userns_options.mode` が `NODE` でも新しい user namespace にする（分離を強める方向。
+//!   uid の写像は core の launcher が権限モデルから導く。SEC-5）。`uids` / `gids` の指定は未実装（#2240）。
+//! - イメージ config（Entrypoint・Cmd・Env・WorkingDir・User）の解析は #2433。ここでは [`ImageDefaults`] で受ける。
+
+use std::collections::HashMap;
+
+use serde::Serialize;
+
+use fandhe_container_core::path_masks::normalize_container_path;
+
+use crate::error::CriError;
+use crate::runtime::v1::{
+    ContainerConfig, Int64Value, LinuxContainerResources, Mount, MountPropagation, NamespaceMode,
+    NamespaceOption, PodSandboxConfig, SecurityProfile, security_profile::ProfileType,
+};
+
+/// `config.json` 全体の上限（core の `CONFIG_MAX_BYTES` と同値）。
+pub const MAX_CONFIG_BYTES: usize = 4 << 20;
+/// `process.args` / `process.env` の件数上限（core の `CONFIG_MAX_ARGS` / `CONFIG_MAX_ENV` と同値）。
+pub const MAX_ARGS: usize = 4096;
+/// `process.env` の件数上限。
+pub const MAX_ENV: usize = 4096;
+/// 文字列 1 要素の長さ上限（core の `CONFIG_MAX_STRING_BYTES` と同値）。
+pub const MAX_STRING_BYTES: usize = 131_071;
+/// パスの長さ上限（core の `CONFIG_MAX_PATH_BYTES` と同値）。
+pub const MAX_PATH_BYTES: usize = 4096;
+/// `mounts` の件数上限（core の `CONFIG_MAX_MOUNTS` と同値）。
+pub const MAX_MOUNTS: usize = 1024;
+/// `maskedPaths` / `readonlyPaths` の件数上限（core の `CONFIG_MAX_MASKED_PATHS` / `CONFIG_MAX_READONLY_PATHS` と同値）。
+pub const MAX_PROTECTED_PATHS: usize = 256;
+/// hostname の長さ上限（core の `CONFIG_MAX_HOSTNAME_BYTES` と同値）。
+pub const MAX_HOSTNAME_BYTES: usize = 64;
+
+/// 生成する `ociVersion`（core は `1.x` 系だけを受ける）。
+/// mount 1 件あたりの JSON 構造の概算オーバーヘッド（キー名・options 等）。
+const MOUNT_OVERHEAD: usize = 128;
+/// 文字列 1 要素あたりの JSON 構造の概算オーバーヘッド（引用符・区切り・エスケープの余裕）。
+const ITEM_OVERHEAD: usize = 8;
+
+const OCI_VERSION: &str = "1.2.0";
+
+/// イメージ config 由来の既定値（Entrypoint・Cmd・Env・WorkingDir・User。#2433 が埋める）。
+///
+/// どの項目も省略でき、`ImageDefaults::default()` なら CRI の設定だけで変換する。外部 crate（#2433 の
+/// `RootfsSource` 実装）が構造体式で組み立てられるよう `#[non_exhaustive]` にしない。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImageDefaults {
+    /// イメージの Entrypoint。
+    pub entrypoint: Vec<String>,
+    /// イメージの Cmd。
+    pub cmd: Vec<String>,
+    /// イメージの Env（`KEY=VALUE`）。
+    pub env: Vec<String>,
+    /// イメージの WorkingDir。
+    pub working_dir: Option<String>,
+    /// イメージの User（uid, gid）。
+    pub user: Option<(u32, u32)>,
+}
+
+/// 検証済みの `config.json` のバイト列（REPAIR-2）。
+///
+/// [`build_runtime_config`] 以外からは作れない。生の JSON 文字列を手で組んで書き出さないための型。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeConfigJson(Vec<u8>);
+
+impl RuntimeConfigJson {
+    /// 直列化済みのバイト列。
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpecOut<'a> {
+    oci_version: &'static str,
+    root: RootOut,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hostname: Option<&'a str>,
+    process: ProcessOut,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    mounts: Vec<MountOut<'a>>,
+    linux: LinuxOut<'a>,
+}
+
+#[derive(Serialize)]
+struct RootOut {
+    path: &'static str,
+}
+
+#[derive(Serialize)]
+struct ProcessOut {
+    args: Vec<String>,
+    env: Vec<String>,
+    cwd: String,
+    user: UserOut,
+}
+
+#[derive(Serialize)]
+struct UserOut {
+    uid: u32,
+    gid: u32,
+}
+
+#[derive(Serialize)]
+struct MountOut<'a> {
+    destination: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    source: &'a str,
+    options: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LinuxOut<'a> {
+    namespaces: Vec<NamespaceOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resources: Option<ResourcesOut>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    masked_paths: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    readonly_paths: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
+struct NamespaceOut {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+#[derive(Serialize)]
+struct ResourcesOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory: Option<MemoryOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu: Option<CpuOut>,
+}
+
+#[derive(Serialize)]
+struct MemoryOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    swap: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct CpuOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    period: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quota: Option<i64>,
+}
+
+fn unsupported(field: &'static str) -> CriError {
+    CriError::unimplemented(format!("{field} is not supported"))
+}
+
+fn invalid(field: &'static str) -> CriError {
+    CriError::invalid_argument(format!("{field} is invalid"))
+}
+
+/// 文字列 1 要素の長さと NUL を検証する。
+fn check_string(field: &'static str, s: &str) -> Result<(), CriError> {
+    if s.len() > MAX_STRING_BYTES || s.contains('\0') {
+        return Err(invalid(field));
+    }
+    Ok(())
+}
+
+/// 絶対パス（`/` 始まり・NUL 無し・`..` 無し・空要素無し・長さ上限以下）を検証する。
+fn check_abs_path(field: &'static str, p: &str) -> Result<(), CriError> {
+    if p.len() > MAX_PATH_BYTES || !p.starts_with('/') || p.contains('\0') {
+        return Err(invalid(field));
+    }
+    if p == "/" {
+        return Ok(());
+    }
+    let rest = p.strip_prefix('/').ok_or_else(|| invalid(field))?;
+    for comp in rest.split('/') {
+        if comp.is_empty() || comp == ".." {
+            return Err(invalid(field));
+        }
+    }
+    Ok(())
+}
+
+/// コンテナ内パスを core の `normalize_container_path` と同じ規則で検証する（OCI-4）。
+///
+/// `\`・`.`・`..`・空要素（`//`・末尾 `/`）を含む値と、正規化で値が変わる値、`/` のみの値は拒否する
+/// （core が create / start で拒否または書き換える形を、config 生成の時点で `INVALID_ARGUMENT` にする）。
+fn check_canonical_path(field: &'static str, p: &str) -> Result<(), CriError> {
+    check_abs_path(field, p)?;
+    match normalize_container_path(p, MAX_PATH_BYTES) {
+        Some(n) if n == p => Ok(()),
+        _ => Err(invalid(field)),
+    }
+}
+
+/// ホスト側のマウント元を core の `validate_source` と同じ規則で検証する（絶対・`\` 無し・`.`・`..`・空要素無し・`/` 不可）。
+fn check_host_source(field: &'static str, p: &str) -> Result<(), CriError> {
+    if p.len() > MAX_PATH_BYTES || p.contains('\0') || p.contains('\\') {
+        return Err(invalid(field));
+    }
+    let rest = p.strip_prefix('/').ok_or_else(|| invalid(field))?;
+    if rest.is_empty() || rest.split('/').any(|e| matches!(e, "" | "." | "..")) {
+        return Err(invalid(field));
+    }
+    Ok(())
+}
+
+/// 要素単位で同一または祖先・子孫の関係か（core の `overlaps` と同じ。`/a/b` と `/a/bc` は無関係）。
+fn overlaps(a: &str, b: &str) -> bool {
+    let within = |child: &str, parent: &str| {
+        child
+            .strip_prefix(parent)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    a == b || within(a, b) || within(b, a)
+}
+
+/// bind mount 間・保護パスとの関係を core の `BindMountSet` と同じ条件で検証する
+/// （予約先 `/proc`・`/sys`・`/dev` 配下、重複・入れ子、保護パスとの重なりを拒否。OCI-4・SEC-1）。
+fn check_mount_set(
+    mounts: &[MountOut<'_>],
+    masked: &[&str],
+    readonly: &[&str],
+) -> Result<(), CriError> {
+    const RESERVED: [&str; 3] = ["/proc", "/sys", "/dev"];
+    for (i, m) in mounts.iter().enumerate() {
+        let d = m.destination;
+        if RESERVED
+            .iter()
+            .any(|r| overlaps(d, r) && d.len() >= r.len())
+        {
+            return Err(invalid("mounts.container_path"));
+        }
+        if mounts
+            .iter()
+            .take(i)
+            .any(|prev| overlaps(prev.destination, d))
+        {
+            return Err(invalid("mounts.container_path"));
+        }
+        if masked.iter().chain(readonly.iter()).any(|p| overlaps(d, p)) {
+            return Err(invalid("mounts.container_path"));
+        }
+    }
+    Ok(())
+}
+
+/// `config.json` の総量予算（複製・直列化の前に checked 演算で消費する。REPAIR-5・DoS 防止）。
+struct Budget {
+    left: usize,
+}
+
+impl Budget {
+    fn new() -> Self {
+        Self {
+            left: MAX_CONFIG_BYTES,
+        }
+    }
+
+    /// `n` バイト分を消費する。予算を超える場合は `INVALID_ARGUMENT`。
+    fn spend(&mut self, n: usize) -> Result<(), CriError> {
+        self.left = self
+            .left
+            .checked_sub(n)
+            .ok_or_else(|| invalid("config size"))?;
+        Ok(())
+    }
+}
+
+/// JSON 出力の上限付き writer（`MAX_CONFIG_BYTES` を超える書き込みを拒否する）。
+struct LimitedWriter {
+    buf: Vec<u8>,
+}
+
+impl std::io::Write for LimitedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf
+            .len()
+            .checked_add(data.len())
+            .filter(|t| *t <= MAX_CONFIG_BYTES)
+            .ok_or_else(|| std::io::Error::other("config too large"))?;
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 保護パス（masked / readonly）の検証。core の `ProtectedPath` と同じく root のみ（`/`）は拒否する。
+fn check_protected_path(field: &'static str, p: &str) -> Result<(), CriError> {
+    check_canonical_path(field, p)
+}
+
+fn nonneg_u32(field: &'static str, v: &Option<Int64Value>) -> Result<Option<u32>, CriError> {
+    match v {
+        None => Ok(None),
+        Some(v) => u32::try_from(v.value).map(Some).map_err(|_| invalid(field)),
+    }
+}
+
+/// `RuntimeDefault` 以外（Unconfined・Localhost）は拒否する。core の既定 seccomp は常に適用される（CORE-5）。
+fn check_profile(field: &'static str, p: &Option<SecurityProfile>) -> Result<(), CriError> {
+    match p {
+        None => Ok(()),
+        Some(p) if p.profile_type == ProfileType::RuntimeDefault as i32 => Ok(()),
+        Some(_) => Err(unsupported(field)),
+    }
+}
+
+/// AppArmor は現状どの指定も受けない（`RuntimeDefault` を含む）。core に AppArmor プロファイルの適用処理が無く、
+/// 受理すると明示された分離要求が黙って失われる（fail-closed。適用の実装は未着手。SEC-1）。
+fn check_apparmor(field: &'static str, p: &Option<SecurityProfile>) -> Result<(), CriError> {
+    match p {
+        None => Ok(()),
+        Some(_) => Err(unsupported(field)),
+    }
+}
+
+fn resolve_mode(field: &'static str, v: i32) -> Result<NamespaceMode, CriError> {
+    NamespaceMode::try_from(v).map_err(|_| invalid(field))
+}
+
+/// コンテナの namespace_options（無ければ sandbox の）を読み、`linux.namespaces` を決める。
+fn namespaces(opts: Option<&NamespaceOption>) -> Result<Vec<NamespaceOut>, CriError> {
+    let default = NamespaceOption::default();
+    let o = opts.unwrap_or(&default);
+    let mut out = Vec::with_capacity(6);
+    // pid・ipc: POD / CONTAINER はコンテナごとの新しい namespace（共有は未実装。REPAIR-3）。
+    // NODE は必須 namespace を外す（SEC-1）ため拒否、TARGET は join 未対応。
+    for (kind, field, v) in [
+        ("pid", "namespace_options.pid", o.pid),
+        ("ipc", "namespace_options.ipc", o.ipc),
+    ] {
+        match resolve_mode(field, v)? {
+            NamespaceMode::Pod | NamespaceMode::Container => out.push(NamespaceOut { kind }),
+            NamespaceMode::Node | NamespaceMode::Target => return Err(unsupported(field)),
+        }
+    }
+    out.push(NamespaceOut { kind: "mount" });
+    out.push(NamespaceOut { kind: "uts" });
+    // user: 常に新しい namespace（SEC-5）。写像の指定は未実装（#2240）。
+    out.push(NamespaceOut { kind: "user" });
+    if let Some(u) = &o.userns_options {
+        match resolve_mode("namespace_options.userns_options.mode", u.mode)? {
+            NamespaceMode::Pod | NamespaceMode::Container | NamespaceMode::Node => {}
+            NamespaceMode::Target => {
+                return Err(unsupported("namespace_options.userns_options.mode"));
+            }
+        }
+        if !u.uids.is_empty() || !u.gids.is_empty() {
+            return Err(unsupported("namespace_options.userns_options mappings"));
+        }
+    }
+    match resolve_mode("namespace_options.network", o.network)? {
+        NamespaceMode::Pod | NamespaceMode::Container => out.push(NamespaceOut { kind: "network" }),
+        NamespaceMode::Node => {}
+        NamespaceMode::Target => return Err(unsupported("namespace_options.network")),
+    }
+    Ok(out)
+}
+
+/// 負の値を拒否して `Some(v)`（0 は未指定として `None`）にする。
+fn positive(field: &'static str, v: i64) -> Result<Option<i64>, CriError> {
+    match v {
+        0 => Ok(None),
+        v if v > 0 => Ok(Some(v)),
+        _ => Err(invalid(field)),
+    }
+}
+
+fn resources(r: &LinuxContainerResources) -> Result<Option<ResourcesOut>, CriError> {
+    if r.cpu_shares != 0 {
+        return Err(unsupported("resources.cpu_shares"));
+    }
+    if r.oom_score_adj != 0 {
+        return Err(unsupported("resources.oom_score_adj"));
+    }
+    if !r.cpuset_cpus.is_empty() || !r.cpuset_mems.is_empty() {
+        return Err(unsupported("resources.cpuset"));
+    }
+    if !r.hugepage_limits.is_empty() {
+        return Err(unsupported("resources.hugepage_limits"));
+    }
+    if !r.unified.is_empty() {
+        return Err(unsupported("resources.unified"));
+    }
+    let limit = positive("resources.memory_limit_in_bytes", r.memory_limit_in_bytes)?;
+    let swap = positive(
+        "resources.memory_swap_limit_in_bytes",
+        r.memory_swap_limit_in_bytes,
+    )?;
+    // core は swap を「メモリ＋スワップ」の合計として扱い、メモリ上限が無い・swap がメモリ上限より小さい指定を拒否する。
+    if let Some(sw) = swap
+        && limit.is_none_or(|l| l > sw)
+    {
+        return Err(invalid("resources.memory_swap_limit_in_bytes"));
+    }
+    let period = positive("resources.cpu_period", r.cpu_period)?
+        .map(|v| u64::try_from(v).map_err(|_| invalid("resources.cpu_period")))
+        .transpose()?;
+    // cpu_quota: 0 は未指定、-1 は無制限、正の値は上限。それ以外の負値は core が受けないため拒否する。
+    let quota = match r.cpu_quota {
+        0 => None,
+        q if q == -1 || q > 0 => Some(q),
+        _ => return Err(invalid("resources.cpu_quota")),
+    };
+    let memory = (limit.is_some() || swap.is_some()).then_some(MemoryOut { limit, swap });
+    let cpu = (period.is_some() || quota.is_some()).then_some(CpuOut { period, quota });
+    Ok((memory.is_some() || cpu.is_some()).then_some(ResourcesOut { memory, cpu }))
+}
+
+fn mount_out<'a>(m: &'a Mount, budget: &mut Budget) -> Result<MountOut<'a>, CriError> {
+    check_canonical_path("mounts.container_path", &m.container_path)?;
+    check_host_source("mounts.host_path", &m.host_path)?;
+    budget.spend(
+        m.container_path
+            .len()
+            .saturating_add(m.host_path.len())
+            .saturating_add(MOUNT_OVERHEAD),
+    )?;
+    if m.propagation != MountPropagation::PropagationPrivate as i32 {
+        return Err(unsupported("mounts.propagation"));
+    }
+    if m.selinux_relabel {
+        return Err(unsupported("mounts.selinux_relabel"));
+    }
+    if m.recursive_read_only {
+        return Err(unsupported("mounts.recursive_read_only"));
+    }
+    if !m.uid_mappings.is_empty() || !m.gid_mappings.is_empty() {
+        return Err(unsupported("mounts.id_mappings"));
+    }
+    if m.image.is_some() || !m.image_sub_path.is_empty() {
+        return Err(unsupported("mounts.image"));
+    }
+    if !m.mount_options.is_empty() {
+        return Err(unsupported("mounts.mount_options"));
+    }
+    Ok(MountOut {
+        destination: &m.container_path,
+        kind: "bind",
+        source: &m.host_path,
+        options: vec![
+            "rbind",
+            "rprivate",
+            "nosuid",
+            "nodev",
+            if m.readonly { "ro" } else { "rw" },
+        ],
+    })
+}
+
+fn paths<'a>(
+    field: &'static str,
+    v: &'a [String],
+    budget: &mut Budget,
+) -> Result<Vec<&'a str>, CriError> {
+    if v.len() > MAX_PROTECTED_PATHS {
+        return Err(invalid(field));
+    }
+    v.iter()
+        .map(|p| {
+            check_protected_path(field, p)?;
+            budget.spend(p.len().saturating_add(ITEM_OVERHEAD))?;
+            Ok(p.as_str())
+        })
+        .collect()
+}
+
+/// `process.args` を Kubernetes の規則（command が Entrypoint を、args が Cmd を置き換える）で決める。
+fn build_args(
+    c: &ContainerConfig,
+    img: &ImageDefaults,
+    require_command: bool,
+    budget: &mut Budget,
+) -> Result<Vec<String>, CriError> {
+    let (head, tail): (&[String], &[String]) = if !c.command.is_empty() {
+        (&c.command, &c.args)
+    } else if !c.args.is_empty() {
+        (&img.entrypoint, &c.args)
+    } else {
+        (&img.entrypoint, &img.cmd)
+    };
+    let total = head
+        .len()
+        .checked_add(tail.len())
+        .ok_or_else(|| invalid("args"))?;
+    if total == 0 && !require_command {
+        return Ok(Vec::new());
+    }
+    if total == 0 {
+        return Err(CriError::invalid_argument("no command to run"));
+    }
+    if total > MAX_ARGS {
+        return Err(invalid("args"));
+    }
+    // 複製の前に、各要素の検証と総量予算の消費を済ませる。
+    for a in head.iter().chain(tail) {
+        check_string("args", a)?;
+        budget.spend(a.len().saturating_add(ITEM_OVERHEAD))?;
+    }
+    Ok(head.iter().chain(tail).cloned().collect())
+}
+
+/// `process.env` を決める。イメージの Env を先に置き、コンテナの `envs` が同じキーを上書きする。
+fn build_env(
+    c: &ContainerConfig,
+    img: &ImageDefaults,
+    budget: &mut Budget,
+) -> Result<Vec<String>, CriError> {
+    if img.env.len() > MAX_ENV || c.envs.len() > MAX_ENV {
+        return Err(invalid("envs"));
+    }
+    // 複製の前に、重複で畳まれる前の総量で予算を消費する（大きい側に倒す）。
+    for e in &img.env {
+        budget.spend(e.len().saturating_add(ITEM_OVERHEAD))?;
+    }
+    for kv in &c.envs {
+        budget.spend(
+            kv.key
+                .len()
+                .saturating_add(kv.value.len())
+                .saturating_add(ITEM_OVERHEAD),
+        )?;
+    }
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut put = |k: String, v: String| match index.get(&k) {
+        Some(&i) => {
+            if let Some(slot) = pairs.get_mut(i) {
+                slot.1 = v;
+            }
+        }
+        None => {
+            index.insert(k.clone(), pairs.len());
+            pairs.push((k, v));
+        }
+    };
+    for e in &img.env {
+        let (k, v) = e.split_once('=').ok_or_else(|| invalid("image env"))?;
+        if k.is_empty() || k.contains('\0') || v.contains('\0') || e.len() > MAX_STRING_BYTES {
+            return Err(invalid("image env"));
+        }
+        put(k.to_owned(), v.to_owned());
+    }
+    for kv in &c.envs {
+        let v = std::str::from_utf8(&kv.value).map_err(|_| invalid("envs"))?;
+        if kv.key.is_empty()
+            || kv.key.contains('=')
+            || kv.key.contains('\0')
+            || v.contains('\0')
+            || kv.key.len().saturating_add(v.len()).saturating_add(1) > MAX_STRING_BYTES
+        {
+            return Err(invalid("envs"));
+        }
+        put(kv.key.clone(), v.to_owned());
+    }
+    if pairs.len() > MAX_ENV {
+        return Err(invalid("envs"));
+    }
+    Ok(pairs.into_iter().map(|(k, v)| format!("{k}={v}")).collect())
+}
+
+fn check_hostname(h: &str) -> Result<Option<&str>, CriError> {
+    if h.is_empty() {
+        return Ok(None);
+    }
+    if h.len() > MAX_HOSTNAME_BYTES || h.chars().any(|c| c.is_control() || c == '/') {
+        return Err(invalid("hostname"));
+    }
+    Ok(Some(h))
+}
+
+/// CRI の設定から `config.json` を作る。
+///
+/// 呼び出し元は [`super::SpecBundleProvider`]。`sandbox` は登録済みのサンドボックス設定、`image` はイメージ
+/// config 由来の既定値。拒否する項目の一覧はモジュール doc と試験（`tests/bundle_spec.rs`）を参照。
+pub fn build_runtime_config(
+    sandbox: &PodSandboxConfig,
+    container: &ContainerConfig,
+    image: &ImageDefaults,
+) -> Result<RuntimeConfigJson, CriError> {
+    build_inner(sandbox, container, image, true)
+}
+
+/// イメージを展開する前に、CRI の設定だけで判定できる拒否・検証を済ませる（不正な要求で bundle を作らない）。
+///
+/// 実コマンドの有無はイメージ次第のため確認しない（それ以外は [`build_runtime_config`] と同じ判定）。
+pub fn validate_config(
+    sandbox: &PodSandboxConfig,
+    container: &ContainerConfig,
+) -> Result<(), CriError> {
+    build_inner(sandbox, container, &ImageDefaults::default(), false).map(|_| ())
+}
+
+fn build_inner(
+    sandbox: &PodSandboxConfig,
+    container: &ContainerConfig,
+    image: &ImageDefaults,
+    require_command: bool,
+) -> Result<RuntimeConfigJson, CriError> {
+    // 実行層が受けない・無視すると要求より弱くなる入力を先に拒否する。
+    if container.tty || container.stdin || container.stdin_once {
+        return Err(unsupported("tty/stdin"));
+    }
+    if !container.devices.is_empty() || !container.cdi_devices.is_empty() {
+        return Err(unsupported("devices"));
+    }
+    if container.stop_signal != 0 {
+        return Err(unsupported("stop_signal"));
+    }
+    if !container.log_path.is_empty() || !sandbox.log_directory.is_empty() {
+        return Err(unsupported("log_path"));
+    }
+    if container.windows.is_some() || sandbox.windows.is_some() {
+        return Err(unsupported("windows"));
+    }
+    if sandbox.dns_config.is_some() {
+        return Err(unsupported("dns_config"));
+    }
+    if !sandbox.port_mappings.is_empty() {
+        return Err(unsupported("port_mappings"));
+    }
+    let hostname = check_hostname(&sandbox.hostname)?;
+    let mut budget = Budget::new();
+
+    let sandbox_linux = sandbox.linux.as_ref();
+    if let Some(l) = sandbox_linux {
+        if !l.cgroup_parent.is_empty() {
+            return Err(unsupported("linux.cgroup_parent"));
+        }
+        if !l.sysctls.is_empty() {
+            return Err(unsupported("linux.sysctls"));
+        }
+        if l.overhead.is_some() || l.resources.is_some() {
+            return Err(unsupported("linux.resources"));
+        }
+        if let Some(sc) = &l.security_context {
+            if sc.privileged {
+                return Err(unsupported("privileged"));
+            }
+            if sc.selinux_options.is_some() {
+                return Err(unsupported("selinux_options"));
+            }
+            if !sc.supplemental_groups.is_empty() {
+                return Err(unsupported("supplemental_groups"));
+            }
+            check_profile("seccomp", &sc.seccomp)?;
+            check_apparmor("apparmor", &sc.apparmor)?;
+            // 非推奨の文字列欄も、指定されたまま黙って落とさない（プロファイルの無効化を見逃さない）。
+            #[allow(deprecated)]
+            if !sc.seccomp_profile_path.is_empty() {
+                return Err(unsupported("seccomp_profile_path"));
+            }
+        }
+    }
+
+    let linux = container.linux.as_ref();
+    let sc = linux.and_then(|l| l.security_context.as_ref());
+    if let Some(sc) = sc {
+        if sc.privileged {
+            return Err(unsupported("privileged"));
+        }
+        if let Some(c) = &sc.capabilities
+            && (!c.add_capabilities.is_empty()
+                || !c.drop_capabilities.is_empty()
+                || !c.add_ambient_capabilities.is_empty())
+        {
+            return Err(unsupported("capabilities"));
+        }
+        if sc.readonly_rootfs {
+            return Err(unsupported("readonly_rootfs"));
+        }
+        if !sc.run_as_username.is_empty() {
+            return Err(unsupported("run_as_username"));
+        }
+        if !sc.supplemental_groups.is_empty() {
+            return Err(unsupported("supplemental_groups"));
+        }
+        if sc.selinux_options.is_some() {
+            return Err(unsupported("selinux_options"));
+        }
+        check_profile("seccomp", &sc.seccomp)?;
+        check_apparmor("apparmor", &sc.apparmor)?;
+        // 非推奨の文字列欄も、指定されたまま黙って落とさない。
+        #[allow(deprecated)]
+        let legacy_profile = !sc.apparmor_profile.is_empty() || !sc.seccomp_profile_path.is_empty();
+        if legacy_profile {
+            return Err(unsupported("security profile path"));
+        }
+    }
+
+    let args = build_args(container, image, require_command, &mut budget)?;
+    let env = build_env(container, image, &mut budget)?;
+
+    // 複製前に借用のまま長さと形を検証する（巨大な値を拒否する場合でも追加確保しない）。
+    let cwd_ref: &str = if !container.working_dir.is_empty() {
+        &container.working_dir
+    } else {
+        image.working_dir.as_deref().unwrap_or("/")
+    };
+    check_abs_path("working_dir", cwd_ref)?;
+    let cwd = cwd_ref.to_owned();
+    budget.spend(cwd.len().saturating_add(ITEM_OVERHEAD))?;
+    if let Some(h) = hostname {
+        budget.spend(h.len().saturating_add(ITEM_OVERHEAD))?;
+    }
+
+    let run_as_user = nonneg_u32("run_as_user", &sc.and_then(|s| s.run_as_user))?;
+    let run_as_group = nonneg_u32("run_as_group", &sc.and_then(|s| s.run_as_group))?;
+    if run_as_group.is_some() && run_as_user.is_none() {
+        return Err(invalid("run_as_group"));
+    }
+    let uid = run_as_user.or(image.user.map(|u| u.0)).unwrap_or(0);
+    let gid = run_as_group
+        .or_else(|| {
+            run_as_user
+                .is_none()
+                .then(|| image.user.map(|u| u.1))
+                .flatten()
+        })
+        .unwrap_or(0);
+
+    if container.mounts.len() > MAX_MOUNTS {
+        return Err(invalid("mounts"));
+    }
+    let mounts = container
+        .mounts
+        .iter()
+        .map(|m| mount_out(m, &mut budget))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // 名前空間: コンテナ側の指定を優先し、無ければ sandbox 側。
+    let ns_opts = sc.and_then(|s| s.namespace_options.as_ref()).or_else(|| {
+        sandbox_linux
+            .and_then(|l| l.security_context.as_ref())
+            .and_then(|s| s.namespace_options.as_ref())
+    });
+    let namespaces = namespaces(ns_opts)?;
+
+    let resources = match linux.and_then(|l| l.resources.as_ref()) {
+        Some(r) => resources(r)?,
+        None => None,
+    };
+    let (masked, readonly) = match sc {
+        Some(s) => (
+            paths("masked_paths", &s.masked_paths, &mut budget)?,
+            paths("readonly_paths", &s.readonly_paths, &mut budget)?,
+        ),
+        None => (Vec::new(), Vec::new()),
+    };
+
+    check_mount_set(&mounts, &masked, &readonly)?;
+
+    let out = SpecOut {
+        oci_version: OCI_VERSION,
+        root: RootOut { path: "rootfs" },
+        hostname,
+        process: ProcessOut {
+            args,
+            env,
+            cwd,
+            user: UserOut { uid, gid },
+        },
+        mounts,
+        linux: LinuxOut {
+            namespaces,
+            resources,
+            masked_paths: masked,
+            readonly_paths: readonly,
+        },
+    };
+    // 上限付き writer へ直列化し、JSON 全体の確保を上限で止める。
+    let mut w = LimitedWriter { buf: Vec::new() };
+    serde_json::to_writer(&mut w, &out).map_err(|e| {
+        if e.is_io() {
+            invalid("config size")
+        } else {
+            CriError::internal("failed to encode config")
+        }
+    })?;
+    Ok(RuntimeConfigJson(w.buf))
+}

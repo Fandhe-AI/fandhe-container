@@ -1192,10 +1192,14 @@ mod tests {
             let _ = fs::remove_dir_all(&p);
             fs::create_dir_all(p.join("blobs").join("sha256")).unwrap();
             #[cfg(unix)]
-            {
+            let p = {
                 use std::os::unix::fs::PermissionsExt;
                 fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
-            }
+                // unix の `ImageStore::open` は root を `canonicalize` した正規パスで保持する（#2381）。
+                // macOS の一時ディレクトリ（`/var` → `/private/var` の symlink 配下）では、非正規パスのままだと
+                // 障害注入の照合キーやストアが返すパスとの比較が食い違うため、ストアと同じ正規パスに揃える（#2537）。
+                fs::canonicalize(&p).expect("canonicalize")
+            };
             Root(p)
         }
         fn blob(&self, dg: &Digest) -> PathBuf {

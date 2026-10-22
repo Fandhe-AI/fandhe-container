@@ -1473,9 +1473,12 @@ fn entrypoint_of(spec: &LaunchSpec) -> Result<Entrypoint, TraitError> {
         TraitError::new(ErrorCode::InvalidArgument, "process.args must not be empty")
     })?;
     // `/` で始まれば絶対パス。`/` を含まない名前は pivot 後に `process.env` の `PATH` で解決する(OCI-1・#2314。
-    // runtime-spec は `args[0]` を `execvp` の file と同じ意味とする)。`/` を含む相対パスは `new` が拒否する。
-    let built = if first.contains('/') {
+    // runtime-spec は `args[0]` を `execvp` の file と同じ意味とする)。`/` を含む相対パスは `PATH` を引かず、
+    // pivot と cwd の適用後に cwd 起点で解決する(OCI-1・OCI-4・#2432。`..` は `cwd_relative` が拒否)。
+    let built = if first.starts_with('/') {
         Entrypoint::new(first, spec.args(), spec.env())
+    } else if first.contains('/') {
+        Entrypoint::cwd_relative(first, spec.args(), spec.env())
     } else {
         Entrypoint::search_path(first, spec.args(), spec.env())
     };
@@ -2023,7 +2026,8 @@ mod tests {
     }
 
     /// OCI-1（#2314）: `entrypoint_of` は名前だけの `args[0]` を `PATH` 探索の対象にし、絶対パスは従来どおり、
-    /// `PATH` が無い名前と `/` を含む相対パスは `InvalidArgument` で拒否する。
+    /// `PATH` が無い名前と `..` を含む相対パスは `InvalidArgument` で拒否し、`/` を含む相対パスは cwd 起点の
+    /// 解決の対象にする(#2432)。
     #[test]
     fn oci1_entrypoint_of_bare_name_search_and_rejections() {
         let ok = |args: &[&str], env: &[&str]| {
@@ -2043,9 +2047,15 @@ mod tests {
         assert_eq!(e.path(), std::path::Path::new("docker-entrypoint.sh"));
         let e = ok(&["/bin/sh"], &[]).expect("absolute path");
         assert_eq!(e.path(), std::path::Path::new("/bin/sh"));
+        let e = ok(&["bin/app", "x"], &[]).expect("relative path with slash");
+        assert_eq!(e.path(), std::path::Path::new("bin/app"));
+        let e = ok(&["./entrypoint.sh"], &[]).expect("dot-relative path");
+        assert_eq!(e.path(), std::path::Path::new("./entrypoint.sh"));
         for (args, env) in [
             (&["docker-entrypoint.sh"][..], &["HOME=/"][..]),
-            (&["bin/app"][..], &["PATH=/bin"][..]),
+            (&["../x"][..], &["PATH=/bin"][..]),
+            (&["a/../x"][..], &[][..]),
+            (&["bin/"][..], &[][..]),
         ] {
             let err = ok(args, env).expect_err("rejected");
             assert_eq!(err.code(), ErrorCode::InvalidArgument, "{args:?}");

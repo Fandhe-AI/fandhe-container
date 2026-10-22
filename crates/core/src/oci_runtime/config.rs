@@ -52,7 +52,8 @@
 //!
 //! `process.args` は 1 件以上であることだけを検証する。`args[0]` の空文字・実行可能性の検証は
 //! `exec::Entrypoint` 側の担当（本モジュールでは行わない）。名前だけの `args[0]` を `process.env` の `PATH` で解決するのも
-//! exec 側（pivot 後の子。OCI-1・#2314）。
+//! exec 側（pivot 後の子。OCI-1・#2314）。`/` を含む相対パスも exec 側が pivot と `process.cwd` の適用後に
+//! cwd 起点で解決する（`..` は拒否。OCI-1・OCI-4・#2432）。
 //!
 //! # 入力上限（DoS 防止）
 //!

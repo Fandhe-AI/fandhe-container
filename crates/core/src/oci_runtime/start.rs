@@ -102,8 +102,9 @@
 //! start 拒否」になる）。fd 相対の open は Linux にしか無いため、Linux 以外では固定段（予約の前）で
 //! `Unimplemented` を返し起動しない（fail-closed。本番 launcher も Linux のみ。CLI-1）。
 //!
-//! `process.args[0]` がコンテナ内の絶対パス（先頭 `/`）でない場合は `InvalidArgument`（PATH 探索は未実装）。
-//! コンテナパスはホスト OS 非依存に文字列で判定する（Windows でも `/bin/echo` を受理する。3 OS 一級対応）。
+//! `process.args[0]` は空でなければ受ける: 絶対パス、名前（pivot 後に `PATH` で探索。#2314）、`/` を含む相対パス（pivot 後に
+//! `process.cwd` 起点で解決。`..` は拒否。#2432）。解決は exec 側の担当。コンテナパスはホスト OS 非依存に文字列で判定する
+//! （Windows でも `/bin/echo` を受理する。3 OS 一級対応）。
 //!
 //! # 到達範囲（REPAIR-3）
 //!
@@ -782,16 +783,14 @@ fn build_spec(
         )
     })?;
 
-    // 絶対パス、または `/` を含まない名前(pivot 後に `process.env` の `PATH` で解決する。OCI-1・#2314。
-    // `PATH` の有無は launcher の fork 前の検証で見る)。`/` を含む相対パスは未対応(REPAIR-3)。
-    let first_is_usable = process
-        .args()
-        .first()
-        .is_some_and(|a| a.starts_with('/') || (!a.is_empty() && !a.contains('/')));
+    // 絶対パス、`/` を含まない名前(pivot 後に `process.env` の `PATH` で解決する。OCI-1・#2314。`PATH` の有無は
+    // launcher の fork 前の検証で見る)、`/` を含む相対パス(pivot と cwd の適用後に cwd 起点で解決する。OCI-1・
+    // OCI-4・#2432。`..` 等の字句検証は launcher の `Entrypoint::cwd_relative`)のいずれでもよい。ここでは空だけ拒否する。
+    let first_is_usable = process.args().first().is_some_and(|a| !a.is_empty());
     if !first_is_usable {
         return Err(TraitError::new(
             ErrorCode::InvalidArgument,
-            "process.args[0] must be an absolute path or a bare command name",
+            "process.args[0] must not be empty",
         ));
     }
     validate_entrypoint_limits(process.args(), process.env())?;
@@ -1968,18 +1967,15 @@ mod tests {
         assert_eq!(launcher.calls(), 0);
     }
 
-    /// SEC-1・OCI-1: args[0] が `/` を含む相対パス（cwd 相対は未対応）なら InvalidArgument。
-    /// 名前だけの args[0] は PATH で解決する対象のため、ここでは拒否しない（#2314）。
+    /// SEC-1・OCI-1・OCI-4（#2432）: args[0] が空なら InvalidArgument。`/` を含む相対パスは start の検証を通る
+    /// (`..` 等の字句検証は launcher の `Entrypoint::cwd_relative`)。
     #[test]
-    fn sec1_start_rejects_relative_entrypoint() {
+    fn sec1_start_rejects_empty_entrypoint() {
         let mut cfg = valid_config();
-        cfg["process"]["args"] = json!(["bin/app", "hi"]);
-        let err = start_rejected_after_rewrite("relarg", &cfg);
+        cfg["process"]["args"] = json!(["", "hi"]);
+        let err = start_rejected_after_rewrite("emptyarg", &cfg);
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
-        assert_eq!(
-            err.message(),
-            "process.args[0] must be an absolute path or a bare command name"
-        );
+        assert_eq!(err.message(), "process.args[0] must not be empty");
     }
 
     /// SEC-1・SEC-5・CORE-5: start が適用できない指定は黙って無視せず Unimplemented で拒否する。

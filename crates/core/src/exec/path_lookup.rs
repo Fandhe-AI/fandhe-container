@@ -1,7 +1,9 @@
-//! 名前だけの `process.args[0]` を `PATH` で解決するための候補列の組み立てと選択（OCI-1・TASK-55 追補・#2314）。
+//! 名前だけの `process.args[0]` の `PATH` 探索と、`/` を含む相対パスの cwd 起点の解決に使う、候補列・要素列の
+//! 組み立てと選択（OCI-1・OCI-4・TASK-55 追補・#2314・#2432）。
 //!
 //! `process::Entrypoint::search_path` が候補列を fork 前に作り（外部入力の検証と上限確認はここ）、
-//! pivot 後の子の `process::open_entrypoint` が [`select_candidate`] で 1 件を選ぶ。
+//! pivot 後の子の `process::open_entrypoint` が [`select_candidate`] で 1 件を選ぶ。`/` を含む相対パスは
+//! `process::Entrypoint::cwd_relative` が [`relative_components`] で要素列にし、子が cwd の fd を起点に辿る。
 //!
 //! # 根拠（一次情報）
 //!
@@ -18,8 +20,11 @@
 //!   探索経路そのものを作らない）
 //! - 実行可否は mode の `0111` で判定する（`eaccess(X_OK)` ではない）。他者にだけ実行ビットがある候補は
 //!   `execveat` が `EACCES`（終了コード 126）になり得る
-//! - `/` を含む相対パス（`./x`・`bin/app`）は対象外で、`Entrypoint::search_path` が `InvalidArgument` で拒否する
-//!   （execvp では cwd 相対だが未対応。REPAIR-3）
+//! - `/` を含む相対パス（`./x`・`bin/app`）は `PATH` を引かず、pivot と `process.cwd` の適用後に cwd 起点で解決する
+//!   （runtime-spec・runc と同じ。#2432）。差は 2 点で、いずれも fail-closed 側: `..` 要素は字句の段階で
+//!   `InvalidArgument` にする（runc は辿る）／中間のディレクトリ要素が symlink なら拒否する（最終要素の symlink は
+//!   辿る）。`.` と空要素（`a//b`）は飛ばし、末尾の `/` は最終要素が無いとして拒否する。`Entrypoint::search_path` は
+//!   これまでどおり `/` を含む名前を拒否する
 //!
 //! # 閉じ込め
 //!
@@ -38,6 +43,9 @@ use super::{ExecError, IsolationStage};
 pub(super) const PATH_SEARCH_MAX_DIRS: usize = 256;
 /// 探索する名前の上限バイト数（`NAME_MAX`）。
 pub(super) const PATH_SEARCH_MAX_NAME_BYTES: usize = 255;
+
+/// cwd 相対パスの要素数の上限（確保前に検証する）。
+pub(super) const RELATIVE_MAX_COMPONENTS: usize = 64;
 
 /// 候補 1 件の判定結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +77,53 @@ pub(super) fn validate_name(name: &OsStr) -> Result<(), ExecError> {
         ));
     }
     Ok(())
+}
+
+/// `/` を含む相対パスを、cwd から辿る要素列にする（OCI-1・OCI-4・#2432）。
+///
+/// 空・NUL・先頭 `/`・`/` を含まない名前・`..` 要素・末尾 `/`・上限超過は `InvalidArgument`（段 `Validate`）。
+/// `.` と空要素は飛ばす。全長・要素数・要素長の上限は確保の前に確かめる。戻り値は 1 件以上の要素
+/// （最後が最終要素）で、各要素は `/`・NUL を含まない。
+pub(super) fn relative_components(path: &OsStr) -> Result<Vec<CString>, ExecError> {
+    let bytes = path.as_bytes();
+    if bytes.is_empty() {
+        return Err(invalid("the entrypoint path must not be empty"));
+    }
+    if bytes.len() + 1 > CONFIG_MAX_PATH_BYTES {
+        return Err(invalid("the entrypoint path is too long"));
+    }
+    if bytes.contains(&0) {
+        return Err(invalid("the entrypoint path must not contain NUL"));
+    }
+    if bytes.first() == Some(&b'/') || !bytes.contains(&b'/') {
+        return Err(invalid(
+            "the entrypoint path to resolve from the cwd must be relative and contain '/'",
+        ));
+    }
+    if bytes.ends_with(b"/") {
+        return Err(invalid("the entrypoint path must not end with '/'"));
+    }
+    let mut out: Vec<CString> = Vec::new();
+    for comp in bytes.split(|b| *b == b'/') {
+        if comp.is_empty() || comp == b"." {
+            continue;
+        }
+        if comp == b".." {
+            return Err(invalid("the entrypoint path must not contain '..'"));
+        }
+        if comp.len() > PATH_SEARCH_MAX_NAME_BYTES {
+            return Err(invalid("a component of the entrypoint path is too long"));
+        }
+        if out.len() >= RELATIVE_MAX_COMPONENTS {
+            return Err(invalid("the entrypoint path has too many components"));
+        }
+        // NUL は上で除外済みのため失敗しない。失敗は不正入力として扱う。
+        out.push(CString::new(comp).map_err(|_| invalid("invalid entrypoint path component"))?);
+    }
+    if out.is_empty() {
+        return Err(invalid("the entrypoint path has no file component"));
+    }
+    Ok(out)
 }
 
 /// `env`（`KEY=VALUE` 形式の列）の最後の `PATH=` から探索候補（`<dir>/<name>`）を作る。
@@ -199,6 +254,53 @@ mod tests {
         // 巨大な ':' 連続は上限超過として拒否する（収集は上限 + 1 件で打ち切り）。
         let huge = format!("PATH=/a{}", ":".repeat(130_000));
         let err = candidates_from_env(OsStr::new("a"), &env(&[huge.as_str()])).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    /// OCI-1・OCI-4（#2432）: `./x`・`a/b` の要素分解。`.` と空要素は飛ばす。
+    #[test]
+    fn oci1_oci4_relative_components_split() {
+        let cases: [(&str, &[&str]); 5] = [
+            ("./x", &["x"]),
+            ("a/b", &["a", "b"]),
+            ("./a/./b", &["a", "b"]),
+            ("a//b", &["a", "b"]),
+            ("bin/docker-entrypoint.sh", &["bin", "docker-entrypoint.sh"]),
+        ];
+        for (input, want) in cases {
+            let got = relative_components(OsStr::new(input)).unwrap();
+            assert_eq!(strs(&got), want, "{input}");
+        }
+    }
+
+    /// OCI-1・OCI-4（#2432）: `../x`・末尾 `/`・絶対パス・名前だけ・NUL・空は `InvalidArgument`（段 `Validate`）。
+    #[test]
+    fn oci1_oci4_relative_components_rejects() {
+        let deep = vec!["a"; RELATIVE_MAX_COMPONENTS + 1].join("/");
+        let long = format!("a/{}", "x".repeat(PATH_SEARCH_MAX_NAME_BYTES + 1));
+        let cases = [
+            "../x", "a/../x", "a/..", "..", "a/b/", "./", "/x", "x", "a\0b/c", "", ".//", &deep,
+            &long,
+        ];
+        for input in cases {
+            let err = relative_components(OsStr::new(input)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "{input:?}");
+            assert_eq!(err.stage, IsolationStage::Validate, "{input:?}");
+        }
+    }
+
+    /// OCI-1・OCI-4（#2432）: 要素数・要素長・全長の上限ちょうどは受理する。
+    #[test]
+    fn oci1_oci4_relative_components_limits_boundary() {
+        let ok = vec!["a"; RELATIVE_MAX_COMPONENTS].join("/");
+        assert_eq!(
+            relative_components(OsStr::new(&ok)).unwrap().len(),
+            RELATIVE_MAX_COMPONENTS
+        );
+        let ok = format!("a/{}", "x".repeat(PATH_SEARCH_MAX_NAME_BYTES));
+        assert_eq!(relative_components(OsStr::new(&ok)).unwrap().len(), 2);
+        let too_long = format!("{}/a", "x".repeat(CONFIG_MAX_PATH_BYTES));
+        let err = relative_components(OsStr::new(&too_long)).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 

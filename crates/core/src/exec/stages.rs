@@ -667,6 +667,11 @@ impl StagePipeline {
             landlock_ev,
             seccomp_ev,
         );
+        // 終端(exec)の前にステージ列を手放す。フック(`CgroupJoin` の `cgroup.procs` の fd 等)が持つ fd は、終端の
+        // `prepare_exec_child` が fd 3 以上をまとめて閉じた後に drop すると二重の close になる(debug ビルドの std は
+        // IO Safety 違反で abort し、seccomp 下では SIGSEGV で終わる。release でも同じ番号を得た別の fd を閉じ得る)。
+        // 全段を適用し終えた後はフックも送り手も使わないため、ここで閉じる(OCI-1・CORE-1・#2376)。
+        drop(self);
         exec(
             &StageReport { statuses },
             capability_report.as_ref(),
@@ -757,6 +762,46 @@ mod tests {
             ]
         );
         assert!(report.iter().all(|(_, s)| s == StageStatus::Applied));
+    }
+
+    /// OCI-1・CORE-1（#2376）: 登録したフック（`CgroupJoin` 等。fd を持ち得る）は終端（exec）の前に drop される。
+    /// 終端が fd 3 以上を閉じた後に drop すると二重の close になるため（本番では exec 段の失敗時に abort していた）。
+    #[test]
+    fn oci1_hooks_are_dropped_before_exec() {
+        struct DropMark(&'static str);
+        impl Drop for DropMark {
+            fn drop(&mut self) {
+                rec(self.0);
+            }
+        }
+        take();
+        take_sets();
+        let mark = DropMark("drop:cgroup_join");
+        let hook = move || {
+            let _ = &mark;
+            rec("cgroup_join");
+            Ok(())
+        };
+        StagePipeline::new()
+            .with_hook(StageKind::CgroupJoin, hook)
+            .unwrap()
+            .run_then(|_, _, _| {
+                rec("exec");
+                Ok(())
+            })
+            .unwrap();
+        let calls = take();
+        assert_eq!(
+            calls,
+            [
+                "cgroup_join",
+                "capability_drop",
+                "no_new_privs",
+                "seccomp",
+                "drop:cgroup_join",
+                "exec"
+            ]
+        );
     }
 
     /// CORE-1・TASK-27.4.3: NO_NEW_PRIVS は capability 削減の後・Landlock の前に実行される

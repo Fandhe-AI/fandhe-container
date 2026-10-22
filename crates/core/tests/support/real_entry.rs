@@ -5,22 +5,22 @@
 //! # 背景
 //! 制限適用の証跡 `LaunchReady` が無い起動は exec の手前で fail-closed に拒否される（#1714）。そのため従来の
 //! rootless 系試験は、exec の代わりに中間プロセスやテストバイナリ自身でコンテナの振る舞いを演じていた。
-//! 本モジュールは `StagePipeline::with_landlock` を載せたステージ列で exec まで到達させ、試験バイナリ自身を
-//! rootfs の `/entry` へコピーして `--entry <mode>` で再入させる（実エントリポイント）。
+//! 本モジュールは試験バイナリ自身を rootfs の `/entry` へコピーして `--entry <mode>` で再入させる
+//! （実エントリポイント）ための部品を持つ。exec まで到達させるステージ列（`with_landlock` 入り）は本番 launcher が組む。
 //!
 //! # 本番 launcher 経由の部品（#2246）
-//! `rootless`・`rootless_file_owner` は本番 `ProductionLauncher` を通すため、launcher の組み立て
+//! `rootless`・`rootless_file_owner`・`rootless_uid_mapping`（#2391）は本番 `ProductionLauncher` を通すため、launcher の組み立て
 //! （`rootless_launcher`）・単一スレッドへの戻りの待ち（`wait_single_thread`）・範囲写像の期待値
 //! （`helper_mappings`）・rootfs 構築（`install_entry`・`write_rootless_config`）をここに集約する。
 //! 本番 launcher 経由でも観測値は `/entry-report` のファイルで受ける（実エントリポイントの標準入出力は
-//! `/dev/null` へ置換されるため）。直接ステージ経路（`spawn_real_entry`）は `rootless_uid_mapping` が使う。
+//! `/dev/null` へ置換されるため）。直接ステージ経路の部品（`entrypoint_from`・`landlock_ruleset`）は `seccomp` だけが使う。
 //!
 //! # 取り込み方
 //! 各テストのクレート直下（`#[cfg(target_os = "linux")]`）で `#[path = "support/real_entry.rs"] mod real_entry;`
 //! として取り込む。`tests/support/` には `main.rs` が無いため cargo の自動検出の対象にならない。
 //!
 //! # 契約
-//! - 実エントリポイントの標準入出力は `/dev/null` へ置換される（`StdioNulling::ALL`。`spawn_real_entry` と本番 launcher の両方）ため、観測値は pivot 後の
+//! - 実エントリポイントの標準入出力は `/dev/null` へ置換される（`StdioNulling::ALL`。本番 launcher と直接ステージ経路の両方）ため、観測値は pivot 後の
 //!   `/` 直下の報告ファイル（`/entry-report`。`key=value` 行。最終行は `done=1`）へ書き、ホスト側は
 //!   `<rootfs>/entry-report` として読む。rename は使わない（Landlock の REFER 権限に依存しないため）
 //! - Landlock の ABI 6 以上（Linux 6.12 以上）を要する。満たさない環境は検出の失敗で panic（失敗）にし、
@@ -36,10 +36,7 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
 use fandhe_container_core::dev_mounts::ImplicitDevMounts;
-use fandhe_container_core::exec::{
-    ContainerChild, DevptsGidSource, Entrypoint, IsolationPrivilege, StagePipeline,
-    spawn_container_with_stages_and_devices,
-};
+use fandhe_container_core::exec::{Entrypoint, IsolationPrivilege};
 use fandhe_container_core::landlock::{
     LandlockRuleset, build_path_rules_with_dev, detect_landlock_abi,
 };
@@ -188,11 +185,11 @@ pub fn install_entry(rootfs: &Path) -> String {
     install_binary_at(rootfs, ENTRY_PATH.trim_start_matches('/'), &["proc", "dev"])
 }
 
-/// rootless 系 2 本（`rootless`・`rootless_file_owner`）が本番 `ProductionLauncher` へ渡す最小の `config.json` を
+/// rootless 系 3 本（`rootless`・`rootless_file_owner`・`rootless_uid_mapping`）が本番 `ProductionLauncher` へ渡す最小の `config.json` を
 /// `bundle/config.json` へ書く（`create_new`）。`root.readonly=false`・`process.user` 0/0・`cwd` `/`・namespaces は
 /// pid / mount / uts / ipc / user。`linux.uidMappings` は書かない（start が拒否する。写像は launcher の責務）。
 /// `args` / `env` は `entry_args` / `entry_env` を渡す。
-#[allow(dead_code)] // 取り込み元によっては使わない（`rootless_uid_mapping`・`production_launcher` は使わない）
+#[allow(dead_code)] // 取り込み元によっては使わない（`production_launcher`・`seccomp` は使わない）
 pub fn write_rootless_config(bundle: &Path, hostname: &str, args: &[String], env: &[String]) {
     let config = serde_json::json!({
         "ociVersion": "1.2.0",
@@ -239,7 +236,7 @@ pub fn entry_env(ld_library_path: &str) -> Vec<String> {
 
 /// argv の先頭をパスとする `Entrypoint` を作る（`rootless` は launcher が受け取った `LaunchSpec` の
 /// `args` / `env`、他の 2 本は `entry_args` / `entry_env` を渡す）。検証（NUL・件数・長さ）は `Entrypoint::new` が行う。
-#[allow(dead_code)] // 直接ステージ経路を使う `rootless_uid_mapping` だけが使う（本番 launcher 経由の試験は使わない）
+#[allow(dead_code)] // 直接ステージ経路を使う `seccomp` だけが使う（本番 launcher 経由の試験は使わない）
 pub fn entrypoint_from(args: &[String], env: &[String]) -> Entrypoint {
     let path = args.first().expect("argv must not be empty");
     Entrypoint::new(path, args, env).expect("entrypoint")
@@ -248,7 +245,7 @@ pub fn entrypoint_from(args: &[String], env: &[String]) -> Entrypoint {
 /// `root.readonly=false`・追加 mounts なしの config から、実カーネルの ABI を検出して Landlock ruleset を作る
 /// （fork 前に親が作る）。専用の `/dev` を pivot 前に載せるため `/dev/shm` を除く暗黙の許可を足す
 /// （`fork_exec_isolation` の `landlock-exec` と同じ。#1657）。
-#[allow(dead_code)] // 直接ステージ経路を使う `rootless_uid_mapping` だけが使う（本番 launcher 経由の試験は使わない）
+#[allow(dead_code)] // 直接ステージ経路を使う `seccomp` だけが使う（本番 launcher 経由の試験は使わない）
 pub fn landlock_ruleset() -> LandlockRuleset {
     let json = r#"{"ociVersion":"1.2.0","root":{"path":"rootfs","readonly":false},"mounts":[]}"#;
     let config = parse_config_bytes(json.as_bytes()).expect("valid config");
@@ -261,22 +258,6 @@ pub fn landlock_ruleset() -> LandlockRuleset {
         ImplicitDevMounts::WithoutShm,
     )
     .unwrap_or_else(|e| panic!("landlock rules: {e}"))
-}
-
-/// `with_landlock` を載せたステージ列で実エントリポイントを PID 1 として起動する。呼び出し元は分離
-/// （`isolate_rootless_subordinate`）済みの単一スレッドプロセスであること。失敗は panic。
-#[allow(dead_code)] // 直接ステージ経路を使う `rootless_uid_mapping` だけが使う（本番 launcher 経由の試験は使わない）
-pub fn spawn_real_entry(rootfs: &Path, entry: &Entrypoint, gid_map: &IdMapSet) -> ContainerChild {
-    let stages = StagePipeline::new()
-        .with_landlock(landlock_ruleset())
-        .unwrap_or_else(|e| panic!("register landlock: {e}"));
-    spawn_container_with_stages_and_devices(
-        rootfs,
-        entry,
-        stages,
-        DevptsGidSource::Rootless(gid_map),
-    )
-    .unwrap_or_else(|e| panic!("spawn the real entrypoint: {e}"))
 }
 
 /// 自プロセスの `/proc/self/status` の `key`（コロン付き）の値（先頭・末尾の空白を除く）。
@@ -395,7 +376,7 @@ impl AuditSink for MemSink {
 /// cgroup には参加させない（config に `linux.resources`・`cgroupsPath` が無いため `cgroup_join_source` 不要）。
 /// root で `RootlessSubordinateIds` を組むと `PermissionDenied` で拒否される（SEC-5。root 実行時の照合用に
 /// `Result` のまま返す）。
-#[allow(dead_code)] // 取り込み元によっては使わない（`rootless_uid_mapping`・`production_launcher` は使わない）
+#[allow(dead_code)] // 取り込み元によっては使わない（`production_launcher`・`seccomp` は使わない）
 pub fn build_rootless_launcher(subordinate: bool) -> Result<ProductionLauncher, TraitError> {
     let builder =
         ProductionLauncher::builder().audit_sink(Arc::new(MemSink(Mutex::new(Vec::new()))));

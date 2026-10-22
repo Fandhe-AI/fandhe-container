@@ -16,8 +16,8 @@
 //! 範囲写像（`RootlessSubordinateIds`）は本番 launcher の `SubordinateIdSource` 経路を通る（#2009）。
 //!
 //! `rootless_uid_mapping`（ESC-09）との違い: 本試験は作成と `chown` の所有者写像を、ホスト上の bundle 配下の
-//! rootfs で照合する。`rootless_uid_mapping` は PID 1・pivot 済み rootfs であることの証跡（`/` の一覧）と RESULT 行を見る
-//! （直接ステージ経路。本番 launcher へは移していない）。
+//! rootfs で照合する。`rootless_uid_mapping` は PID 1・pivot 済み rootfs であることの証跡（`/` の一覧）・`id_mapping` の記録と RESULT 行を見る
+//! （こちらも本番 launcher 経由。#2391）。
 //!
 //! # 流れ
 //! - ディスパッチャ: 一時 bundle（`config.json`・`rootfs/`〔実エントリポイント入り〕・状態ルート）を排他的に作り、

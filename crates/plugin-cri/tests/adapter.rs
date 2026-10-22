@@ -1,4 +1,7 @@
 //! `adapter`（TASK-114.2・#458・PLUG-1・CRI-2・CRI-7）の結合試験。3 OS で動く範囲だけを置く。
+//!
+//! 状態ストアを使う create → state → delete の流れは Linux・macOS で動く（macOS は main の
+//! `platform-ci (macos-latest)` と `workflow_dispatch` で実行される。#2435）。
 
 use std::sync::Arc;
 
@@ -204,15 +207,15 @@ fn cri2_bundle_provider_stub() {
 }
 
 /// 非対応 OS では既定構成の組み立てが `Unimplemented` で fail-closed（CRI-2）。
-#[cfg(target_os = "windows")]
+#[cfg(not(target_os = "linux"))]
 #[test]
-fn cri2_production_unimplemented_on_windows() {
-    let e = CriPluginBackends::production().expect_err("windows");
+fn cri2_production_unimplemented_off_linux() {
+    let e = CriPluginBackends::production().expect_err("non-linux");
     assert_eq!(e.code(), ErrorCode::Unimplemented);
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod store_backed {
     use std::path::PathBuf;
 
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
@@ -268,6 +271,12 @@ mod linux {
         rt.delete(&DeleteRequest::new(cid("c1"))).expect("delete");
         let gone = rt.state(&StateRequest::new(cid("c1"))).expect_err("gone");
         assert_eq!(gone.code(), ErrorCode::NotFound);
+
+        // 二重 delete も NotFound（core の契約）。
+        let twice = rt
+            .delete(&DeleteRequest::new(cid("c1")))
+            .expect_err("second delete");
+        assert_eq!(twice.code(), ErrorCode::NotFound);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

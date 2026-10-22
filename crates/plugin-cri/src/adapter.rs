@@ -328,6 +328,31 @@ pub(crate) fn to_trait_error(e: OciRuntimeError) -> TraitError {
     TraitError::new(e.code(), e.message())
 }
 
+impl CoreLifecycleRuntime {
+    /// force 削除の前に、生きている（Running・pid あり、または pid あり Created）コンテナを停止して終了を確認する。
+    ///
+    /// 猶予 0 で SIGTERM の直後に SIGKILL へ進み、最長 `STOP_KILL_WAIT` で有界（REPAIR-5）。記録が無い・停止済み・
+    /// pid の無い状態は何もせず、core の delete の判定に任せる。
+    #[cfg(target_os = "linux")]
+    fn stop_live_before_force_delete(&self, id: &ContainerId) -> Result<(), TraitError> {
+        use fandhe_container_core::traits::ContainerState;
+        let status = match self.store.get(&GetStateRequest::new(id.clone())) {
+            Ok(r) => r.status().clone(),
+            Err(e) if e.code() == ErrorCode::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let live = matches!(
+            status.state(),
+            ContainerState::Running | ContainerState::Created
+        ) && status.pid().is_some();
+        if live {
+            let stop = StopRequest::new(id.clone(), Duration::ZERO)?;
+            self.supervised.stop(&*self.store, &self.recorder, &stop)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 fn launch_unavailable() -> TraitError {
     TraitError::new(ErrorCode::Unimplemented, MSG_LAUNCH_UNAVAILABLE)
@@ -372,7 +397,14 @@ impl ContainerRuntime for CoreLifecycleRuntime {
 
     fn delete(&self, req: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
         #[cfg(target_os = "linux")]
-        self.supervised.reap();
+        {
+            self.supervised.reap();
+            // force は停止してから削除する（ContainerRuntime::delete の契約。CORE-2・CRI-2）。core の delete は
+            // 生きたコンテナの force を拒否するため、ここで停止と終了確認を済ませる。
+            if req.force() {
+                self.stop_live_before_force_delete(req.id())?;
+            }
+        }
         let response = oci_runtime::delete(&*self.store, &self.recorder, &*self.cgroups, req)
             .map_err(to_trait_error)?;
         self.remove_supervisor_log(req.id());
@@ -631,6 +663,33 @@ mod tests {
             .snapshot_op(&OpName::new("delete").expect("name"))
             .expect("delete recorded");
         assert_eq!((stats.success(), stats.failure()), (0, 1));
+    }
+
+    /// CRI-2・CORE-2: 未起動（pid なし）の Created への stop は FAILED_PRECONDITION にならず、停止済みを返す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_on_created_without_pid_reports_stopped() {
+        let store = Arc::new(OneRecord::new(record(false)));
+        let rt = CoreLifecycleRuntime::new(store);
+        let status = rt
+            .stop(&StopRequest::new(cid("c1"), Duration::ZERO).expect("req"))
+            .expect("created is already stopped");
+        assert_eq!(
+            status.state(),
+            fandhe_container_core::traits::ContainerState::Stopped
+        );
+    }
+
+    /// CRI-2・CORE-2: force 削除は、停止対象の無い pid なし Created をそのまま core の delete へ渡す。
+    #[test]
+    fn force_delete_on_created_without_pid_reaches_store_delete() {
+        let store = Arc::new(OneRecord::new(record(false)));
+        let rt = CoreLifecycleRuntime::new(store.clone());
+        let e = rt
+            .delete(&DeleteRequest::new(cid("c1")).with_force(true))
+            .expect_err("fake store delete fails");
+        assert_eq!(e.message(), "unused");
+        assert_eq!(*store.deletes.lock().expect("lock"), 1);
     }
 
     /// cgroup の配置が無い記録の delete は remover に触れず store.delete まで進む。

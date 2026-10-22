@@ -452,15 +452,14 @@ fn sup9_stop_already_stopped_is_idempotent() {
     assert_eq!(h.sim.calls(), []);
 }
 
-/// Created は送らずに FAILED_PRECONDITION。
+/// 未起動の Created（pid なし）は何も送らず停止済みとして返す（CRI-2。StartContainer 前の StopPodSandbox）。
 #[test]
-fn sup9_stop_created_is_failed_precondition() {
+fn sup9_stop_created_without_pid_is_reported_stopped() {
     let h = harness(Sim::new(ContainerStatus::created(cid("c1"), None)), LONG);
-    let e =
+    let s =
         h.rt.stop(&StopRequest::new(cid("c1"), Duration::from_secs(1)).expect("req"))
-            .expect_err("created");
-    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
-    assert_eq!(e.message(), "container is not running");
+            .expect("created is already stopped");
+    assert_eq!(s.state(), ContainerState::Stopped);
     assert_eq!(h.sim.calls(), []);
 }
 

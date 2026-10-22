@@ -270,7 +270,14 @@ impl SupervisedLifecycle {
             // 冪等: 停止済みには何も送らない。
             ContainerState::Stopped => return Ok(status),
             ContainerState::Running => {}
-            // Creating・Created と、将来追加される状態は送らずに拒否する（fail-closed）。
+            // 未起動（pid なし）の Created は止めるプロセスが無く、既に停止済みと同じである。記録は書き換えず
+            // 停止済みの状態を返す（削除は core が pid なしの Created を許す。CRI-2・CORE-2）。
+            ContainerState::Created if status.pid().is_none() => {
+                return Ok(ContainerStatus::stopped(id.clone(), None));
+            }
+            // pid つきの Created は生きているため Running と同じく停止する。
+            ContainerState::Created => {}
+            // Creating と、将来追加される状態は送らずに拒否する（fail-closed）。
             _ => {
                 return Err(TraitError::new(
                     ErrorCode::FailedPrecondition,

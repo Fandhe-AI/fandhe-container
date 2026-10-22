@@ -41,13 +41,17 @@ signal-test-support = []
 # 差し替えを足す（偽の systemd-run で既定集合の結合試験を動かすため。#2081・CORE-3）。既定のビルドには含めず、
 # リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。依存は増えない。
 start-test-support = []
+# logs-test-support: logs --follow の期限を環境変数 `FANDHE_CONTAINER_TEST_LOGS_FOLLOW_DEADLINE_MS`（10 進ミリ秒）で短くできる
+# ようにする（既定の期限は 24 時間で、終わる結合試験を書けないため。#2447・CLI-1・SUP-7）。既定のビルドには含めず、
+# リリースビルドで有効にするとコンパイルが止まる（src/lib.rs の `compile_error!`）。依存は増えない。
+logs-test-support = []
 
 # 自己参照の dev-dependency（supervisor・core と同じ仕組み。外部クレートの追加ではない）: cli 自身のテストでは
-# `signal-test-support`・`start-test-support` を常に有効にし、試験専用の入口を使う結合試験（signal_forward）が `cargo test --workspace`
+# `signal-test-support`・`start-test-support`・`logs-test-support` を常に有効にし、試験専用の入口を使う結合試験（signal_forward）が `cargo test --workspace`
 # の既定のテスト集合から外れないようにする。通常のビルド（`cargo build`・リリース成果物）は dev-dependency を
 # 解決しないため、feature は無効のまま。
 [dev-dependencies]
-fandhe-container-cli = { path = ".", features = ["signal-test-support", "start-test-support"] }
+fandhe-container-cli = { path = ".", features = ["signal-test-support", "start-test-support", "logs-test-support"] }
 
 # `sys.rs` の自前 FFI 宣言を libc と照合する試験専用の依存（#1838・#1318・MVM-4・REPAIR-12）。製品の依存には入れない
 # （cargo tree -e normal,build に現れない）。`sys.rs` は `cfg(unix)` のため unix に限る。方式は docs/design/ffi-libc-check.md。

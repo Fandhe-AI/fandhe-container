@@ -29,6 +29,13 @@ compile_error!(
     "the `start-test-support` feature lets the systemd-run path be overridden by an environment variable and must not be enabled in release builds"
 );
 
+// `logs-test-support` は logs --follow の期限を環境変数で短くする試験専用の入口を有効にする feature で、製品のバイナリに
+// 含める理由がない。最適化ビルドで有効になっていたらコンパイルを止める（#2447・CLI-1・REPAIR-3。`start-test-support` と同じ方式）。
+#[cfg(all(feature = "logs-test-support", not(debug_assertions)))]
+compile_error!(
+    "the `logs-test-support` feature lets the logs --follow deadline be overridden by an environment variable and must not be enabled in release builds"
+);
+
 pub mod commands;
 pub mod doctor;
 pub mod error;

@@ -3,7 +3,7 @@
 //! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
-//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest>] --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs <id>`。
+//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest>] --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
 //! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `image tag --image-root <dir> <source> <target>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
@@ -73,10 +73,29 @@ pub(super) struct SetupArgs;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DoctorArgs;
 
-/// `logs` の引数。
+/// `logs --tail` に指定できる件数の上限（supervisor の `MAX_TAIL_RECORDS` と同じ値。範囲外は使い方エラー。
+/// 値の確定はオーナー確認待ち。args は OS 非依存の純粋関数群のため、定数は別に持ち、等しいことを試験で照合する）。
+pub(super) const MAX_LOGS_TAIL: u32 = 1_000_000;
+
+/// `logs --stream` の値。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LogStreamArg {
+    Stdout,
+    Stderr,
+}
+
+/// `logs` の引数（CLI-1・SUP-7）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LogsArgs {
     pub(super) id: String,
+    /// `--follow`（追記を期限まで追う）。
+    pub(super) follow: bool,
+    /// `--tail <N>`（絞り込み後の末尾 N レコード。`0..=MAX_LOGS_TAIL`）。
+    pub(super) tail: Option<u32>,
+    /// `--stream <stdout|stderr>`。
+    pub(super) stream: Option<LogStreamArg>,
+    /// `--escape`（本体の制御文字を `cat -v` と同じ表で表示用に変換）。
+    pub(super) escape: bool,
 }
 
 /// `image` サブコマンドの引数（#2221・CLI-1・OCI-7）。
@@ -303,11 +322,74 @@ pub(super) fn parse_doctor(args: Vec<OsString>) -> Result<DoctorArgs, UsageError
     }
 }
 
-/// `logs <id>` を解析する（オプションは受け付けない）。
+/// `logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] [--] <id>` を解析する。
+/// オプションは順不同で各 1 回まで（重複は使い方エラー）。長い形だけを受け、`-f` / `-n` は使い方エラー。
+/// `--tail` の値は 10 進数字だけ（符号・空白・`all` は拒否）で `0..=MAX_LOGS_TAIL`。
 pub(super) fn parse_logs(args: Vec<OsString>) -> Result<LogsArgs, UsageError> {
+    let mut follow = false;
+    let mut tail: Option<u32> = None;
+    let mut stream: Option<LogStreamArg> = None;
+    let mut escape = false;
+    let mut positional: Vec<OsString> = Vec::new();
+    let mut it = args.into_iter();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            positional.extend(it.by_ref());
+            break;
+        } else if a == "--follow" {
+            if follow {
+                return Err(UsageError);
+            }
+            follow = true;
+        } else if a == "--escape" {
+            if escape {
+                return Err(UsageError);
+            }
+            escape = true;
+        } else if a == "--tail" {
+            let value = it.next().ok_or(UsageError)?;
+            if tail.is_some() {
+                return Err(UsageError);
+            }
+            tail = Some(parse_tail_count(&value)?);
+        } else if a == "--stream" {
+            let value = it.next().ok_or(UsageError)?;
+            if stream.is_some() {
+                return Err(UsageError);
+            }
+            stream = Some(if value == "stdout" {
+                LogStreamArg::Stdout
+            } else if value == "stderr" {
+                LogStreamArg::Stderr
+            } else {
+                return Err(UsageError);
+            });
+        } else if is_option_like(&a) {
+            return Err(UsageError);
+        } else {
+            positional.push(a);
+        }
+    }
     Ok(LogsArgs {
-        id: single_positional(args)?,
+        id: single_id(positional)?,
+        follow,
+        tail,
+        stream,
+        escape,
     })
+}
+
+/// `--tail` の値（10 進数字だけ・`0..=MAX_LOGS_TAIL`）。
+fn parse_tail_count(value: &OsString) -> Result<u32, UsageError> {
+    let s = value.to_str().ok_or(UsageError)?;
+    if s.is_empty() || s.len() > 10 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(UsageError);
+    }
+    let n: u32 = s.parse().map_err(|_| UsageError)?;
+    if n > MAX_LOGS_TAIL {
+        return Err(UsageError);
+    }
+    Ok(n)
 }
 
 /// `image <ls|rm|tag> ...` を解析する（サブコマンド無し・未知は使い方エラー）。
@@ -737,17 +819,93 @@ mod tests {
         }
     }
 
-    /// CLI-1: logs は位置引数 1 個のみ。
+    fn logs_plain(id: &str) -> LogsArgs {
+        LogsArgs {
+            id: id.into(),
+            follow: false,
+            tail: None,
+            stream: None,
+            escape: false,
+        }
+    }
+
+    /// CLI-1: logs は位置引数 1 個のみ（オプションなし）。
     #[test]
     fn cli1_parse_logs() {
-        assert_eq!(parse_logs(v(&["c1"])), Ok(LogsArgs { id: "c1".into() }));
-        assert_eq!(
-            parse_logs(v(&["--", "-c"])),
-            Ok(LogsArgs { id: "-c".into() })
-        );
-        for a in [v(&[]), v(&["a", "b"]), v(&["--x", "a"]), v(&["-f"])] {
-            assert_eq!(parse_logs(a), Err(UsageError));
+        assert_eq!(parse_logs(v(&["c1"])), Ok(logs_plain("c1")));
+        assert_eq!(parse_logs(v(&["--", "-c"])), Ok(logs_plain("-c")));
+        for a in [v(&[]), v(&["a", "b"]), v(&["--x", "a"]), v(&["-f", "a"])] {
+            assert_eq!(parse_logs(a.clone()), Err(UsageError), "{a:?}");
         }
+    }
+
+    /// CLI-1・SUP-7: logs のオプション（順不同・各 1 回まで・長い形だけ）。
+    #[test]
+    fn cli1_parse_logs_options() {
+        assert_eq!(
+            parse_logs(v(&[
+                "--follow", "--tail", "5", "--stream", "stderr", "--escape", "c1"
+            ])),
+            Ok(LogsArgs {
+                id: "c1".into(),
+                follow: true,
+                tail: Some(5),
+                stream: Some(LogStreamArg::Stderr),
+                escape: true,
+            })
+        );
+        assert_eq!(
+            parse_logs(v(&["c1", "--escape", "--tail", "0"])),
+            Ok(LogsArgs {
+                tail: Some(0),
+                escape: true,
+                ..logs_plain("c1")
+            })
+        );
+        assert_eq!(
+            parse_logs(v(&["--stream", "stdout", "--", "--follow"])),
+            Ok(LogsArgs {
+                stream: Some(LogStreamArg::Stdout),
+                ..logs_plain("--follow")
+            })
+        );
+        assert_eq!(
+            parse_logs(v(&["--tail", "1000000", "c1"])).map(|a| a.tail),
+            Ok(Some(1_000_000))
+        );
+        for bad in [
+            v(&["--tail"]),
+            v(&["--tail", "c1"]),
+            v(&["--tail", "x", "c1"]),
+            v(&["--tail", "-1", "c1"]),
+            v(&["--tail", "+5", "c1"]),
+            v(&["--tail", " 5", "c1"]),
+            v(&["--tail", "all", "c1"]),
+            v(&["--tail", "", "c1"]),
+            v(&["--tail", "1000001", "c1"]),
+            v(&["--tail", "99999999999", "c1"]),
+            v(&["--tail=5", "c1"]),
+            v(&["--tail", "1", "--tail", "2", "c1"]),
+            v(&["--stream", "bogus", "c1"]),
+            v(&["--stream"]),
+            v(&["--stream", "stdout", "--stream", "stderr", "c1"]),
+            v(&["--follow", "--follow", "c1"]),
+            v(&["--escape", "--escape", "c1"]),
+            v(&["-f", "c1"]),
+            v(&["-n", "1", "c1"]),
+            v(&["--follow"]),
+        ] {
+            assert_eq!(parse_logs(bad.clone()), Err(UsageError), "{bad:?}");
+        }
+    }
+
+    /// CLI-1: `--tail` の上限は supervisor の定数と同じ。
+    #[test]
+    fn cli1_logs_tail_limit_matches_supervisor() {
+        assert_eq!(
+            MAX_LOGS_TAIL,
+            fandhe_container_supervisor::logs::MAX_TAIL_RECORDS
+        );
     }
 
     /// CLI-1: 非 UTF-8 の ID は logs でも使い方エラー。

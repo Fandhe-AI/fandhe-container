@@ -55,10 +55,10 @@
 //! | 読む量の上限を超えた | 5（`FAILED_PRECONDITION`。`container log exceeds the read limit`） |
 //! | stdout への書き込みに失敗した | 1（`INTERNAL`） |
 //!
+//! delete でのコンテナログ（`@container-logs/<id>.log*`）の削除は、core の delete の成功後に `stop_delete` が行う（#2446）。
+//!
 //! 未実装・簡易実装（REPAIR-3）:
 //! - logs の `--follow` / `--tail` / ストリーム別出力 / エスケープ表示: 未提供（CLI-1 の拡張）。
-//! - delete でのコンテナログ（`@container-logs/<id>.log*`）の削除: 未配線（#2446）。delete が消すのは supervisor の
-//!   構造化ログ（`@supervisor-logs`）だけで、コンテナログはディスクに残る。
 //! - 再起動をまたぐ出力の捕捉: 再 launch が実機で成り立つのを待つ（#2043）。
 //! - list の JSON 出力・bundle 列: JSON を手組みしない（REPAIR-2）ため serde 系の配線か core の公開ライタが前提
 //!   （TASK-95・TASK-98）。

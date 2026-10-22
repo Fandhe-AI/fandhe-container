@@ -21,7 +21,7 @@
 //!   一括。sink 生存中は `FailedPrecondition` で何も消さない）。ロック競合・ロックパスが通常ファイルでない
 //!   ときの失敗では消さない（他の sink のものであるため）。sink の生存中に外から消してはならない。
 //!   消すと排他が崩れ得るため、取得後にパスの実体を再照合し（unix は dev / inode）、Windows は削除共有なしで
-//!   開く。コンテナ削除経路からの呼び出し配線は未実装（REPAIR-3）。
+//!   開く。呼び出し元は CLI の `delete`（`logs::remove_container_logs` 経由。#2446）。
 //! - 1 つの sink は supervisor プロセスにつき 1 回作り、再起動・再捕捉では同じものを使い回す。
 //!   [`RotatingFileSink::open`] は既存の `<id>.log` を開かず世代へ退避してから新規作成するため、
 //!   open するたびに 1 世代を消費する（既存の `<id>.log` が空なら退避せず作り直し、世代を消費しない）。
@@ -374,7 +374,7 @@ impl RotatingFileSink {
     }
 
     /// コンテナ削除時に、この ID の現在ログ・全世代・ロックファイルをまとめて消す
-    /// （SUP-7・TASK-164 追補・#1469。コンテナ削除経路の配線は未実装〔REPAIR-3〕。配線側が呼ぶ）。
+    /// （SUP-7・TASK-164 追補・#1469。CLI の `delete` が `logs::remove_container_logs` 経由で呼ぶ・#2446）。
     ///
     /// 同じ ID の sink が生存中なら、ロックを取れず `FailedPrecondition` で拒否し、何も消さない。
     /// `RotationConfig` は受け取らず、設定世代数を超える番号の世代も消す。名前空間に受理できない

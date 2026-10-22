@@ -971,6 +971,134 @@ fn repair4_delete_removes_supervisor_log() {
     assert!(left.is_empty(), "left: {left:?}");
 }
 
+/// bundle を作り、`--root` 配下に c1 / c2 を create する（#2446 の試験用）。root の絶対パスを返す。
+#[cfg(target_os = "linux")]
+fn create_two_containers(tmp: &TmpDir) -> std::path::PathBuf {
+    let bundle = tmp.0.join("bundle");
+    std::fs::create_dir(&bundle).expect("bundle");
+    std::fs::create_dir(bundle.join("rootfs")).expect("rootfs");
+    std::fs::write(
+        bundle.join("config.json"),
+        r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
+    )
+    .expect("config");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+    let bundle_s = bundle.to_str().expect("utf8");
+    for id in ["c1", "c2"] {
+        assert_failure_free(&run(&[
+            "--root", root_s, "create", "--bundle", bundle_s, id,
+        ]));
+    }
+    root
+}
+
+/// コンテナログの書き手（sink）を開いて 1 行書き、flush する。再 open の競合は期限つきで再試行する（REPAIR-5）。
+#[cfg(target_os = "linux")]
+fn open_container_log_sink(
+    root: &std::path::Path,
+    name: &str,
+) -> fandhe_container_supervisor::logs::RotatingFileSink {
+    use fandhe_container_supervisor::logs::{
+        LogSink as _, RotatingFileSink, StreamKind, container_log_dir,
+        container_log_rotation_config,
+    };
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = container_log_dir(root);
+    std::fs::create_dir_all(&dir).expect("logdir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let id = fandhe_container_core::traits::ContainerId::new(name).expect("id");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let sink = loop {
+        match RotatingFileSink::open(&dir, &id, container_log_rotation_config()) {
+            Ok(s) => break s,
+            Err(e)
+                if e.code() == fandhe_container_core::traits::ErrorCode::FailedPrecondition
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("open sink: {e:?}"),
+        }
+    };
+    sink.append(StreamKind::Stdout, format!("hello {name}").as_bytes())
+        .expect("append");
+    sink.flush().expect("flush");
+    sink
+}
+
+#[cfg(target_os = "linux")]
+fn sorted_dir_names(dir: &std::path::Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .expect("dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// SUP-7・CLI-1・#2446: `delete` は対象 ID のコンテナログ（現在ログ・世代・ロック）だけを消し、他のコンテナのログは残す。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup7_delete_removes_container_logs_only_for_target() {
+    let tmp = TmpDir::new("ctrlog");
+    let root = create_two_containers(&tmp);
+    let root_s = root.to_str().expect("utf8");
+    let logs = fandhe_container_supervisor::logs::container_log_dir(&root);
+    // c1 は世代 1 まで作る（2 回目の open で現在ログが世代へ退避される）。
+    drop(open_container_log_sink(&root, "c1"));
+    drop(open_container_log_sink(&root, "c1"));
+    drop(open_container_log_sink(&root, "c2"));
+    assert_eq!(
+        sorted_dir_names(&logs),
+        ["c1.log", "c1.log.1", "c1.log.lock", "c2.log", "c2.log.lock"]
+    );
+
+    // 未 create の ID の delete は失敗し、c1 のログには触れない。
+    assert_eq!(
+        run(&["--root", root_s, "delete", "nope"]).status.code(),
+        Some(3)
+    );
+    assert_eq!(sorted_dir_names(&logs).len(), 5);
+
+    let out = run(&["--root", root_s, "delete", "c1"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    assert!(out.stderr.is_empty(), "stderr: {:?}", out.stderr);
+    assert_eq!(sorted_dir_names(&logs), ["c2.log", "c2.log.lock"]);
+
+    let out = run(&["--root", root_s, "logs", "c2"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"stdout hello c2\n");
+}
+
+/// SUP-7・CLI-1・ERR-1・#2446: sink が生きていてコンテナログを消せないとき、delete は成功のまま
+/// （状態は削除済み）で、構造化された警告 1 行を stderr に出し、ログは残す。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup7_delete_warns_when_container_log_is_locked() {
+    let tmp = TmpDir::new("ctrlock");
+    let root = create_two_containers(&tmp);
+    let root_s = root.to_str().expect("utf8");
+    let logs = fandhe_container_supervisor::logs::container_log_dir(&root);
+    let sink = open_container_log_sink(&root, "c1");
+
+    let out = run(&["--root", root_s, "delete", "c1"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"container log removal failed; leftover logs may remain\"}\n"
+    );
+    assert_eq!(sorted_dir_names(&logs), ["c1.log", "c1.log.lock"]);
+    let listed = run(&["--root", root_s, "list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&listed.stdout),
+        "ID\tSTATUS\tPID\nc2\tcreated\t-\n"
+    );
+    drop(sink);
+}
+
 /// REPAIR-4: 複数の CLI プロセスが同じ `FANDHE_CONTAINER_OP_LOG` へ並行に追記しても JSON 行が混ざらない。
 ///
 /// 相対 bundle の create は core へ到達する前に失敗し（終了コード 2）、失敗 1 件の計測を追記する。

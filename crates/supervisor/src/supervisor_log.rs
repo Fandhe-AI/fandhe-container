@@ -202,23 +202,57 @@ pub fn run_log_removal_bounded(
     job: impl FnOnce() + Send + 'static,
     timeout: std::time::Duration,
 ) -> LogRemoval {
+    // 起動失敗は従来どおり `Finished` 扱い（結果を持ち帰る `run_bounded` では区別できないため、起動失敗を別に判定する）。
+    match run_bounded_inner(job, timeout) {
+        BoundedOutcome::TimedOut => LogRemoval::TimedOut,
+        BoundedOutcome::NoResult | BoundedOutcome::Done(()) => LogRemoval::Finished,
+    }
+}
+
+/// [`run_bounded`] の内部結果。結果が無い理由（起動失敗・job の panic）を期限切れと区別するために持つ。
+enum BoundedOutcome<T> {
+    Done(T),
+    TimedOut,
+    NoResult,
+}
+
+fn run_bounded_inner<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+    timeout: std::time::Duration,
+) -> BoundedOutcome<T> {
     let Some(slot) = InflightSlot::acquire() else {
-        return LogRemoval::TimedOut;
+        return BoundedOutcome::TimedOut;
     };
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("supervisor-log-remove".to_string())
         .spawn(move || {
             let _slot = slot;
-            job();
-            let _ = tx.send(());
+            let _ = tx.send(job());
         });
     if spawned.is_err() {
-        return LogRemoval::Finished;
+        return BoundedOutcome::NoResult;
     }
     match rx.recv_timeout(timeout) {
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => LogRemoval::TimedOut,
-        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => LogRemoval::Finished,
+        Ok(v) => BoundedOutcome::Done(v),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => BoundedOutcome::TimedOut,
+        // job の panic（結果を送らず終了）。従来どおり「終わった」扱いだが、値は無い。
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => BoundedOutcome::NoResult,
+    }
+}
+
+/// `job` を作業スレッドで実行して結果を持ち帰る、期限つき実行（#2446。`run_log_removal_bounded` の汎用版）。
+///
+/// 結果が得られなかったとき（期限切れ・同時実行枠の満杯・スレッド起動失敗・job の panic）は `None` を返す。
+/// 枠（`MAX_INFLIGHT_LOG_REMOVALS`）は supervisor ログの削除と共有する。呼び出し元は `None` を「結果が無い」として扱う
+/// （コンテナログの削除は `logs::remove_container_logs_bounded` が `Timeout` のエラーにする）。
+pub fn run_bounded<T: Send + 'static>(
+    job: impl FnOnce() -> T + Send + 'static,
+    timeout: std::time::Duration,
+) -> Option<T> {
+    match run_bounded_inner(job, timeout) {
+        BoundedOutcome::Done(v) => Some(v),
+        BoundedOutcome::TimedOut | BoundedOutcome::NoResult => None,
     }
 }
 
@@ -475,5 +509,93 @@ mod tests {
         assert!(started.elapsed() >= Duration::from_millis(200));
         assert!(started.elapsed() < Duration::from_secs(1));
         drop(release);
+    }
+
+    fn container_sink(root: &Path, name: &str) -> crate::logs::RotatingFileSink {
+        let dir = crate::logs::container_log_dir(root);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let id = ContainerId::new(name).unwrap();
+        let sink = crate::logs::RotatingFileSink::open(
+            &dir,
+            &id,
+            crate::logs::container_log_rotation_config(),
+        )
+        .unwrap();
+        // 空の現在ログは次の open で世代へ退避されないため、内容を書いて確定させる。
+        crate::logs::LogSink::append(&sink, crate::logs::StreamKind::Stdout, b"x").unwrap();
+        crate::logs::LogSink::flush(&sink).unwrap();
+        sink
+    }
+
+    fn sorted_names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// SUP-7・#2446: 対象 ID の現在ログ・世代・ロックだけが消え、他の ID のログは残る。
+    #[test]
+    fn sup7_remove_container_logs_removes_only_target() {
+        let t = TmpDir::new("rmc");
+        let dir = crate::logs::container_log_dir(&t.0);
+        drop(container_sink(&t.0, "c1"));
+        drop(container_sink(&t.0, "c1"));
+        drop(container_sink(&t.0, "c2"));
+        assert_eq!(
+            sorted_names(&dir),
+            ["c1.log", "c1.log.1", "c1.log.lock", "c2.log", "c2.log.lock"]
+        );
+        let removed = crate::logs::remove_container_logs(&t.0, &id()).unwrap();
+        assert_eq!(removed.log_files(), 2);
+        assert_eq!(sorted_names(&dir), ["c2.log", "c2.log.lock"]);
+    }
+
+    /// SUP-7・#2446: sink 生存中は `FailedPrecondition` で何も消さない。
+    #[test]
+    fn sup7_remove_container_logs_refuses_while_sink_alive() {
+        let t = TmpDir::new("rmalive");
+        let dir = crate::logs::container_log_dir(&t.0);
+        let _sink = container_sink(&t.0, "c1");
+        let e = crate::logs::remove_container_logs(&t.0, &id()).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(sorted_names(&dir), ["c1.log", "c1.log.lock"]);
+    }
+
+    /// SUP-7・#2446: ディレクトリが無ければ 0 件で成功し（冪等）、作らない。
+    #[test]
+    fn sup7_remove_container_logs_missing_dir_is_ok() {
+        let t = TmpDir::new("rmmissing");
+        for _ in 0..2 {
+            let removed = crate::logs::remove_container_logs_bounded(
+                &t.0,
+                &id(),
+                std::time::Duration::from_secs(10),
+            )
+            .unwrap();
+            assert_eq!(removed.log_files(), 0);
+        }
+        assert!(!crate::logs::container_log_dir(&t.0).exists());
+    }
+
+    /// REPAIR-5・#2446: `run_bounded` は結果を返し、止まった job は期限で `None` になる。
+    #[test]
+    fn repair5_run_bounded_returns_result_or_none() {
+        assert_eq!(run_bounded(|| 7_u32, Duration::from_secs(10)), Some(7));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let started = Instant::now();
+        let out = run_bounded(
+            move || {
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                1_u32
+            },
+            Duration::from_millis(100),
+        );
+        assert_eq!(out, None);
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(release_tx);
     }
 }

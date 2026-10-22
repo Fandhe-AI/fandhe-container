@@ -82,6 +82,7 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
 | `start_scope_real`（#2081） | `fandhe-container-cli` | **包まず**直接 `<bin> --ignored`（同居する cgroup から実行しないと感度の確認が逆になる） | `start_scope_real: supervisor ran alone in a delegated user scope; cli did not linger; prepare accepted` |
 | `delete_cgroup_real`（#2061。受け入れ条件 3） | `fandhe-container-cli` | `systemd-run --user --scope -p Delegate=yes <bin> --ignored` | `delete_cgroup_real: cli delete removed the container cgroup and state for matching, recorded and vanished scopes; refused a non-empty cgroup without killing` |
 | `start_recover_real`（任意） | `fandhe-container-cli` | `cargo build -p fandhe-container-supervisor` で CLI の隣に supervisor を置き、`systemd-run --user --scope -p Delegate=yes <bin> --ignored` | `start_recover_real: a second cli start recovered the interrupted reservation from the recorded cgroup; delete then removed it` |
+| `start_stop_delete_real`（任意） | `fandhe-container-cli` | `cargo build -p fandhe-container-supervisor` で CLI の隣に supervisor を置き、`systemd-run --user --scope -p Delegate=yes <bin> --ignored`（CLI の実バイナリだけで create → start → list → logs → stop → delete を通す。#2450） | `start_stop_delete_real: cli start ran the container under the production launcher; stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs` |
 | `supervisor_bin_real`（任意・参考） | `fandhe-container-supervisor` | 直接 `<bin> --ignored`（試験の側で包む） | AGENTS.md の該当行を参照 |
 
 ## 結果記録の雛形
@@ -101,6 +102,7 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
 | `start_scope_real` 最終行の一致 | 一致 / 不一致（出力の末尾） |
 | `delete_cgroup_real` 最終行の一致 | 一致 / 不一致（出力の末尾） |
 | `start_recover_real`（任意） | (記入) |
+| `start_stop_delete_real`（任意） | 一致 / 不一致（出力の末尾。`scope_present_before_delete` の値も記入） |
 | 後始末で残骸が無いこと | (記入) |
 | 判定 | 成功 / prepare で拒否 / その他の失敗 |
 
@@ -117,4 +119,4 @@ CLI と supervisor は同じディレクトリに置く（[linux.md](../setup/li
 
 ## 後続
 
-TASK-157（supervisor の Stopped への遷移）が入ったら、本番の `start` から `delete` までの自動の通し試験を足すかを検討する。現時点では起票しない。
+本番の `start` から `stop`・`delete` までの自動の通し試験 `start_stop_delete_real` を追加した（#2450）。実行と結果の記録は人間担当（#2062・#1621）で、作成時は未実行。

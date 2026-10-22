@@ -38,6 +38,8 @@ struct Script {
     create_leftover: usize,
     /// 次の reclaim_failed_create を成功させるか。
     reclaim_ok: bool,
+    /// create 失敗時に回収用の請求書を出さない（所有を証明できない取り残し）か。
+    no_claim: bool,
     fail_attach: bool,
     /// attach 失敗時に巻き戻しで取り残す資源の件数。
     attach_leftover: usize,
@@ -57,8 +59,13 @@ impl Fake {
 impl NetsetupBackend for Fake {
     type Network = String;
     type Container = FakeContainer;
+    type FailedCreate = String;
 
-    fn create_network(&self, name: &NetName, gateway: IpPrefix) -> Result<String, CreateFailure> {
+    fn create_network(
+        &self,
+        name: &NetName,
+        gateway: IpPrefix,
+    ) -> Result<String, CreateFailure<String>> {
         let mut s = self.0.lock().expect("lock");
         s.calls.push(format!(
             "create_network {} {}/{}",
@@ -70,14 +77,15 @@ impl NetsetupBackend for Fake {
             return Err(CreateFailure {
                 error: TraitError::new(ErrorCode::Internal, "create failed"),
                 leftover: s.create_leftover,
+                reclaim: (!s.no_claim).then(|| format!("claim-{}", name.as_str())),
             });
         }
         Ok(name.as_str().to_owned())
     }
 
-    fn reclaim_failed_create(&self, name: &NetName) -> Result<(), TraitError> {
+    fn reclaim_failed_create(&self, name: &NetName, claim: &String) -> Result<(), TraitError> {
         let mut s = self.0.lock().expect("lock");
-        s.calls.push(format!("reclaim {}", name.as_str()));
+        s.calls.push(format!("reclaim {} {claim}", name.as_str()));
         if s.reclaim_ok {
             Ok(())
         } else {
@@ -393,6 +401,7 @@ fn poisoned_lock_returns_internal() {
     impl NetsetupBackend for Panics {
         type Network = ();
         type Container = FakeContainer;
+        type FailedCreate = ();
         fn create_network(&self, _: &NetName, _: IpPrefix) -> Result<(), CreateFailure> {
             panic!("injected");
         }
@@ -614,8 +623,45 @@ fn contract6_create_leftover_is_tracked_until_reclaimed() {
     fake.0.lock().expect("lock").reclaim_ok = true;
     net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
         .expect("reclaimed");
-    assert!(fake.calls().iter().any(|c| c == "reclaim n0"));
-    pod_network::set_up_pod(&net, &nname("extra"), subnet()).expect("room again");
+    // 作成時に出した請求書がそのまま回収に渡る（失敗した 1 回と成功した 1 回）。
+    let reclaims: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("reclaim "))
+        .collect();
+    assert_eq!(reclaims, ["reclaim n0 claim-n0", "reclaim n0 claim-n0"]);
+    // 回収した名前は再作成できる（空いた 1 枠を使う）。
+    pod_network::set_up_pod(&net, &nname("n0"), subnet()).expect("n0 reusable after reclaim");
+}
+
+/// 請求書が無い（所有を証明できない）取り残しは、バックエンドの回収を呼ばず手動回収を求め、記録を保持する。
+#[test]
+fn contract6_leak_without_claim_requires_manual_reclaim() {
+    let (net, fake) = plugin();
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_create = true;
+        s.create_leftover = 1;
+        s.no_claim = true;
+        s.reclaim_ok = true;
+    }
+    pod_network::set_up_pod(&net, &nname("n0"), subnet()).expect_err("create fails");
+    for _ in 0..2 {
+        let e = net
+            .delete_network(&DeleteNetworkRequest::new(nname("n0")))
+            .expect_err("manual reclaim");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(e.message().contains("manual reclaim required"));
+    }
+    assert!(!fake.calls().iter().any(|c| c.starts_with("reclaim ")));
+    // 記録は保持され、再作成は AlreadyExists のまま。
+    fake.0.lock().expect("lock").fail_create = false;
+    assert_eq!(
+        pod_network::set_up_pod(&net, &nname("n0"), subnet())
+            .expect_err("still tracked")
+            .code(),
+        ErrorCode::AlreadyExists
+    );
 }
 
 /// 取り残しの無い作成失敗は従来どおり何も保持しない。

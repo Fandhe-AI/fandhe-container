@@ -48,8 +48,12 @@
 //!   ままで結果が `kept_setgroups_denied`（所有者は初期 user namespace で `CAP_SETGID` を持たず、参加先は `setgroups` が
 //!   `deny` のため）。capability の値は rootful と同じ `00000000a80425fb` だが、これはコンテナの user namespace に対する
 //!   権限で、host に対する権限ではない（`ns/user` の不一致と `uid_map` で裏づける）。
-//!   範囲は成功経路の 5 回に限り、拒否経路（`/dev/null` の差し替え・インタープリタ経由・別コンテナ・pivot していない対象）は
-//!   rootful の場面だけが照合する。
+//!   成功経路の 5 回のあと、拒否経路 4 つ（インタープリタ経由 `entrypoint_interpreter_is_runtime_binary`・別コンテナ
+//!   `exec_joined_namespace_mismatch`・pivot していない対象 `exec_root_not_container_rootfs`・`/dev/null` の差し替え
+//!   `stdio_null_not_null_device`。#2443）も rootful と同じ具体値で照合する。違いは `/dev/null` の差し替え方だけで、
+//!   rootless の `/dev/null` はホストのノードの bind のため、ホストからの `rename` は `EBUSY`・user namespace 内の
+//!   `mknod` は `EPERM` になる。そこで使い捨てのコンテナの pid1 が pivot の前に差し替える（symlink と、`/dev/zero`
+//!   〔1:5〕の bind）。この場面は `mount` / `umount`（util-linux）も要る。
 //!
 //! # 構成（再入）
 //! `harness = false` の単一スレッド `main` で、自身を次の役で再実行する。
@@ -58,7 +62,7 @@
 //! - rootless のコンテナ役は再入ではなく `unshare(1)` を直接起動する。core の単一 ID 経路（`plan` → `isolate`）を使わないのは、
 //!   `Namespace` に network が無く（rootless の起動経路への netns の追加は #1939）、core の `join_namespaces` が 5 種を必ず
 //!   `setns` するため、user namespace へ参加した後は初期 user namespace が所有する netns へ入れないから（`--net` が要る）
-//! - `--pid1` / `--pid1-rootless`: 新しい PID namespace の PID 1。`establish` → `prepare_rootfs` → `create_default_devices` →
+//! - `--pid1` / `--pid1-rootless`（後者は末尾に任意の差し替え指定 `tamper-symlink` / `tamper-bind-zero`）: 新しい PID namespace の PID 1。`establish` → `prepare_rootfs` → `create_default_devices` →
 //!   `pivot_root` の後、合図ファイルを置いて待機する（launch の exec は証跡未結線で拒否されるため exec しない）。
 //!   rootless は `DevptsGidSource::Rootless`（本番 launcher の単一 ID 経路と同じ。host の gid は argv で受ける）
 //! - `--joiner`: 単一スレッドで `run_command` 等を呼ぶ exec 専用プロセス
@@ -207,11 +211,18 @@ mod linux {
                 Path::new(arg(2).expect("rootfs")),
                 arg(3).expect("ready name"),
                 None,
+                None,
             ),
+            // `--pid1-rootless <rootfs> <ready> <host egid> [tamper-symlink|tamper-bind-zero]`
             Some("--pid1-rootless") => pid1(
                 Path::new(arg(2).expect("rootfs")),
                 arg(3).expect("ready name"),
                 Some(arg(4).expect("host egid").parse().expect("host egid")),
+                arg(5).map(|t| match t {
+                    "tamper-symlink" => Tamper::Symlink,
+                    "tamper-bind-zero" => Tamper::BindZero,
+                    other => panic!("unknown tamper {other}"),
+                }),
             ),
             Some("--joiner") => joiner(&args[2..]),
             // root 不要の補助: 手組みのプローブだけをホスト上で自己検証する（`orchestrate` も最初に行う）。
@@ -439,7 +450,12 @@ mod linux {
     ///
     /// `rootless_host_egid` が `Some` なら rootless（`--pid1-rootless`）で、本番 launcher の単一 ID 経路と同じ
     /// `DevptsGidSource::Rootless(single_id_mapping(host の egid))` を使う（host の `/dev` のノードを bind して供給する）。
-    fn pid1(rootfs: &Path, ready: &str, rootless_host_egid: Option<u32>) {
+    ///
+    /// `tamper` が `Some` なら、`pivot_root` の前に `<rootfs>/dev/null` を差し替える（rootless の `/dev/null` 拒否経路。
+    /// #2443・#1459・SEC-1）。rootless の `/dev` はホストのノードの bind を載せた tmpfs で、コンテナの外（初期 user
+    /// namespace の orchestrator）からは `rename` が `EBUSY`・`umount` が権限不足・user namespace 内の `mknod` が `EPERM` に
+    /// なるため、まだホストの util-linux が見えるこの時点で、pid1 自身（名前空間内の root）が行う。
+    fn pid1(rootfs: &Path, ready: &str, rootless_host_egid: Option<u32>, tamper: Option<Tamper>) {
         assert_eq!(std::process::id(), 1, "must be PID 1 of the new namespace");
         let isolation = MountIsolation::establish().expect("establish mount isolation");
         let prepared = prepare_rootfs(&isolation, rootfs).expect("prepare rootfs");
@@ -457,12 +473,62 @@ mod linux {
             .ensure_default_dev_shm()
             .expect("default /dev/shm spec");
         mount_tmpfs(&isolation, &prepared, Some(&devices), &tmpfs).expect("mount default /dev/shm");
+        if let Some(t) = tamper {
+            tamper_dev_null(rootfs, t);
+        }
         pivot_root(&isolation, prepared).expect("pivot_root");
         fs::write(format!("/{ready}"), b"ready").expect("write ready marker");
         // 親が stdin 経由で pid1 を kill するまで待機する（上限つき。REPAIR-5）。
         let deadline = Instant::now() + Duration::from_secs(600);
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    /// rootless の pid1 が pivot の前に行う `/dev/null` の差し替えの種類（#2443）。
+    #[derive(Clone, Copy)]
+    enum Tamper {
+        /// bind を外し、tmpfs 上のファイルを消して `zero` への symlink にする。
+        Symlink,
+        /// ホストの `/dev/zero`（文字デバイス 1:5）を `/dev/null` へ bind する（rootful の `mknod c 1 5` の代わり）。
+        BindZero,
+    }
+
+    impl Tamper {
+        fn arg(self) -> &'static str {
+            match self {
+                Tamper::Symlink => "tamper-symlink",
+                Tamper::BindZero => "tamper-bind-zero",
+            }
+        }
+    }
+
+    /// 外部コマンド（util-linux）を期限つきで実行し、成功を要求する（REPAIR-5。失敗は panic = 試験の失敗）。
+    fn run_tool(program: &str, args: &[&Path]) {
+        let child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|e| panic!("run {program}: {e}"));
+        assert_eq!(finish_joiner(child).0, Some(0), "{program} must succeed");
+    }
+
+    /// [`pid1`] の差し替え本体。`<rootfs>/dev` は pid1 の mount namespace 内で tmpfs（#1653）。
+    /// 失敗は panic にして試験を失敗させる（差し替えられていないのに拒否を期待する偽の成功を作らない）。
+    fn tamper_dev_null(rootfs: &Path, tamper: Tamper) {
+        let null = rootfs.join("dev/null");
+        match tamper {
+            Tamper::Symlink => {
+                run_tool("umount", &[&null]);
+                fs::remove_file(&null).expect("remove the unmounted /dev/null placeholder");
+                std::os::unix::fs::symlink("zero", &null).expect("symlink /dev/null -> zero");
+            }
+            Tamper::BindZero => {
+                run_tool(
+                    "mount",
+                    &[Path::new("--bind"), Path::new("/dev/zero"), &null],
+                );
+            }
         }
     }
 
@@ -616,6 +682,17 @@ mod linux {
     /// uid_map / gid_map は `0 <euid> 1` / `0 <egid> 1`（setgroups は deny）で、launcher の単一 ID 経路と同じ写像になる。
     /// pid1 の host 側 pid は、`unshare` の子のうち入れ子の PID 1（[`nested_pid1_child`]）として探す。
     fn start_container_as(bundle: &Bundle, tag: &str, instance: u64, rootless: bool) -> Container {
+        start_container_with(bundle, tag, instance, rootless, None)
+    }
+
+    /// [`start_container_as`] の本体。`tamper` は rootless の pid1 にだけ渡る（rootful には無い）。
+    fn start_container_with(
+        bundle: &Bundle,
+        tag: &str,
+        instance: u64,
+        rootless: bool,
+        tamper: Option<Tamper>,
+    ) -> Container {
         let exe = std::env::current_exe().expect("current_exe");
         let ready_name = format!("ready-{tag}");
         let mut a = if rootless {
@@ -638,6 +715,9 @@ mod linux {
             // 名前空間内の egid は 0 になるため、host の egid を pid1 へ渡す（devpts の gid= の決定元）。
             .arg(own_status_ids().1.to_string())
             .stdin(Stdio::null());
+            if let Some(t) = tamper {
+                cmd.arg(t.arg());
+            }
             cmd
         } else {
             let mut cmd = Command::new(exe);
@@ -1346,10 +1426,28 @@ mod linux {
 
     /// pivot していない pid1（`unshare` した `sleep`。`/` はホストの root）への exec が、参加後の `/` の照合で
     /// 拒否され、コマンドが起動しないこと（条件 4(d)）。
-    fn unpivoted_target_is_rejected(bundle: &Bundle) {
+    ///
+    /// `rootless` のときは `start_container_as` と同じ構成（`--user --map-root-user ... --net`）で `sleep` を起動する。
+    /// `--net` が要るのは、user namespace へ参加した後は初期 user namespace が所有する netns へ `setns` できないため。
+    /// 照合の順序は rootful と同じで、最初に落ちるのは参加後の `/` の照合（`exec_root_not_container_rootfs`）。
+    fn unpivoted_target_is_rejected(bundle: &Bundle, rootless: bool) {
         clean_probe_files(bundle);
-        let unshare = Command::new("unshare")
-            .args([
+        let unshare_args: &[&str] = if rootless {
+            &[
+                "--user",
+                "--map-root-user",
+                "--pid",
+                "--fork",
+                "--kill-child",
+                "--mount",
+                "--uts",
+                "--ipc",
+                "--net",
+                "sleep",
+                "60",
+            ]
+        } else {
+            &[
                 "--pid",
                 "--fork",
                 "--kill-child",
@@ -1358,7 +1456,10 @@ mod linux {
                 "--ipc",
                 "sleep",
                 "60",
-            ])
+            ]
+        };
+        let unshare = Command::new("unshare")
+            .args(unshare_args)
             .stdin(Stdio::null())
             .spawn()
             .expect("spawn unshare");
@@ -1512,6 +1613,65 @@ mod linux {
         }
     }
 
+    /// rootless 版の `/dev/null` 差し替え（#2443・#1459・SEC-1・SEC-4）。照合は [`replaced_dev_null_is_rejected`] と同じ
+    /// 具体値（`StdioNullNotNullDevice`・層 `entrypoint`・`data/ok` 無し）。
+    ///
+    /// rootful と手段が違う理由（経路ごと）:
+    /// - ホストからの `rename`: rootless の `/dev/null` はホストのノードの bind（`DeviceSupply::BindFromHost`）で、
+    ///   マウントポイントのため `EBUSY` になる
+    /// - ホストからの `umount`: orchestrator は初期 user namespace にいて、コンテナの mount namespace を外せない
+    /// - `nsenter -m` で入る: pivot 後の rootfs に `umount` / `ln` が無い
+    /// - `mknod c 1 5`: user namespace 内では `EPERM`。別のデバイスノードへの差し替えは `/dev/zero`（1:5）の bind で再現する
+    ///
+    /// そのため種類ごとに使い捨てのコンテナを、pid1 が pivot の前に差し替える形（[`Tamper`]）で起動する。
+    /// 使い捨てなので元へ戻さず、drop で破棄する。
+    fn replaced_dev_null_is_rejected_rootless(bundle: &Bundle) {
+        for (kind, tamper, instance) in [
+            ("symlink", Tamper::Symlink, 4000_u64),
+            ("device", Tamper::BindZero, 4001_u64),
+        ] {
+            clean_probe_files(bundle);
+            let c = start_container_with(
+                bundle,
+                &format!("t{instance}"),
+                instance,
+                true,
+                Some(tamper),
+            );
+            let joiner = spawn_joiner(&[
+                "run".into(),
+                bundle.dir.display().to_string(),
+                own_cgroup_path(),
+                instance.to_string(),
+                c.pid1.to_string(),
+            ]);
+            let (code, out) = finish_joiner(joiner);
+            drop(c);
+            assert_eq!(code, Some(0), "joiner output: {out}; {kind}");
+            assert!(
+                out.starts_with(&format!(
+                    "outcome exit={:?} ",
+                    ExecExit::SetupFailed {
+                        exit: ChildExit::Exited(126),
+                        violation: Some(ViolationReason::StdioNullNotNullDevice),
+                    }
+                )),
+                "the exec child must refuse the replaced /dev/null ({kind}): {out}"
+            );
+            assert!(
+                out.contains(
+                    "audit: delivery=Recorded records=1 layer=entrypoint \
+                     reason=stdio_null_not_null_device path=none"
+                ),
+                "the setup rejection must be audited once ({kind}): {out}"
+            );
+            assert!(
+                !bundle.rootfs().join("data/ok").exists(),
+                "the command must not have started ({kind})"
+            );
+        }
+    }
+
     /// `unshare_pid` の子のうち、入れ子の PID namespace の PID 1（`NSpid` が 2 要素以上で末尾 1）のもの。
     fn nested_pid1_child(unshare_pid: u32) -> Option<u32> {
         let children =
@@ -1588,7 +1748,7 @@ mod linux {
         let b = start_container(&bundle, "b", 2000);
         other_container_is_rejected(&bundle, &a, &b);
         drop(b);
-        unpivoted_target_is_rejected(&bundle);
+        unpivoted_target_is_rejected(&bundle, false);
         println!("exec: {ROUNDS}/{ROUNDS} exec verified");
     }
 
@@ -1657,6 +1817,19 @@ mod linux {
         if prlimit != Some(Some(0)) {
             not_verified("`prlimit` (util-linux) is not available");
         }
+        // `/dev/null` の差し替え（pid1 が pivot の前に行う。#2443）に使う。
+        for tool in ["mount", "umount"] {
+            let ok = Command::new(tool)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .ok()
+                .map(|child| finish_joiner(child).0);
+            if ok != Some(Some(0)) {
+                not_verified(&format!("`{tool}` (util-linux) is not available"));
+            }
+        }
         // 削減後の期待値（OCI 既定集合）が成り立つには、joiner の bounding set がそれを含む必要がある。
         let status = fs::read_to_string("/proc/self/status").expect("own status");
         let bnd = u64::from_str_radix(&status_field(&status, "CapBnd:"), 16).expect("CapBnd");
@@ -1670,7 +1843,8 @@ mod linux {
     ///
     /// 分離の理由: 非 root・非特権 user namespace・Landlock ABI 6+・委譲 cgroup v2・x86_64 を要し、GitHub ホステッド
     /// runner では保証できない。環境が揃わないときは [`rootless_preconditions`] が `exit 2` で「検証していない」ことを
-    /// 知らせる。成功経路の 5 回に限り、拒否経路は rootful の場面が担う。
+    /// 知らせる。成功経路の 5 回のあと、拒否経路 4 つ（インタープリタ経由・別コンテナ・pivot していない対象・
+    /// `/dev/null` の差し替え。#2443）も rootful と同じ違反の理由で照合する。
     fn orchestrate_rootless() {
         rootless_preconditions();
         let bundle = make_bundle();
@@ -1695,6 +1869,13 @@ mod linux {
                 .collect();
             assert_eq!(left, Vec::<String>::new(), "round {round}");
         }
+        // 拒否経路（#2443）。違反の理由・監査の要約は rootful と同じ具体値で照合する。
+        runtime_interpreter_script_is_rejected(&bundle, &a);
+        let b = start_container_as(&bundle, "b", 2000, true);
+        other_container_is_rejected(&bundle, &a, &b);
+        drop(b);
+        unpivoted_target_is_rejected(&bundle, true);
+        replaced_dev_null_is_rejected_rootless(&bundle);
         println!("exec: {ROUNDS}/{ROUNDS} rootless exec verified");
     }
 }

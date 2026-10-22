@@ -219,7 +219,7 @@
 //! - rootless の exec の通しの確認。user namespace への参加（[`enter_namespaces`] が、対象が別の user namespace に
 //!   いるときだけ 5 種に先立って参加する。#1462）と参加後の資格情報は `tests/exec_setns_join.rs` が非特権の
 //!   user namespace で照合する。制限の再適用を含む通し（Landlock ABI 6+）は実機前提の `tests/exec.rs` の
-//!   rootless の場面（`--ignored --rootless`。#1887）が担うが、実機での実行結果の記録は人間担当の issue（案は #1453）で
+//!   rootless の場面（`--ignored --rootless`。#1887）が担うが、実機での実行結果の記録は人間担当の issue（#1621）で
 //!   行う（記録が済むまで rootless での通しは未確認）
 //! - コマンドの標準入出力の受け渡し（CLI の exec・TASK-161 / SUP-4 の healthcheck の出力取得）。現状は launch と
 //!   同じく `/dev/null` へ固定し、cwd・ユーザーの指定も未対応（cwd はコンテナの rootfs の根。`config.json` の

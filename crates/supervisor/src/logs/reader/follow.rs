@@ -28,8 +28,8 @@ use fandhe_container_core::traits::{ContainerId, ErrorCode};
 
 use super::super::rotating::{RotationConfig, current_log_path};
 use super::imp::{
-    Opened, feed_range, internal, is_current_log, last_lf_end, open_consistent, read_error,
-    scan_error,
+    Opened, check_bytes, check_limit, feed_range, internal, is_current_log, last_lf_end,
+    open_consistent, read_error, scan_error,
 };
 use super::record::Scanner;
 use super::{FOLLOW_OUTRAN_MESSAGE, FollowOptions, LogReadFailure, source};
@@ -59,6 +59,7 @@ struct Held {
 }
 
 /// 追従ループ。期限（[`FollowOptions::deadline`]）に達した回で、残りを出し切って成功で戻る。
+/// 戻り値は追従中に新たに読んだファイル数（初回のスナップショット分を含まない）。
 pub(super) fn run(
     dir: &Path,
     id: &ContainerId,
@@ -67,7 +68,7 @@ pub(super) fn run(
     start: Start,
     out: &mut dyn Write,
     driver: &mut Driver<'_>,
-) -> Result<(), LogReadFailure> {
+) -> Result<u32, LogReadFailure> {
     if config.generations() < 2 {
         return Err(source(ErrorCode::Unavailable, FOLLOW_OUTRAN_MESSAGE));
     }
@@ -84,15 +85,16 @@ pub(super) fn run(
             });
         }
     }
+    let mut extra = 0u32;
     loop {
-        let ended = poll_once(dir, id, config, &mut held, &mut scanner, out)?;
+        let ended = poll_once(dir, id, config, &mut held, &mut scanner, out, &mut extra)?;
         out.flush().map_err(|_| LogReadFailure::Output)?;
         if ended {
-            return Ok(());
+            return Ok(extra);
         }
         let elapsed = (driver.elapsed)();
         if elapsed >= follow.deadline() {
-            return Ok(());
+            return Ok(extra);
         }
         let remaining = follow.deadline() - elapsed;
         (driver.sleep)(follow.poll_interval().min(remaining));
@@ -107,9 +109,10 @@ fn poll_once(
     held: &mut Option<Held>,
     scanner: &mut Scanner,
     out: &mut dyn Write,
+    extra: &mut u32,
 ) -> Result<bool, LogReadFailure> {
     if let Some(h) = held.as_mut() {
-        feed_new(h, scanner, out)?;
+        feed_new(h, scanner, out, config)?;
     }
     let rotated = match held.as_ref() {
         None => true,
@@ -129,11 +132,11 @@ fn poll_once(
     if !rotated {
         return Ok(false);
     }
-    if advance(dir, id, config, held, scanner, out)? {
+    if advance(dir, id, config, held, scanner, out, extra)? {
         return Ok(true);
     }
     if let Some(h) = held.as_mut() {
-        feed_new(h, scanner, out)?;
+        feed_new(h, scanner, out, config)?;
     }
     Ok(false)
 }
@@ -146,11 +149,14 @@ fn advance(
     held: &mut Option<Held>,
     scanner: &mut Scanner,
     out: &mut dyn Write,
+    extra: &mut u32,
 ) -> Result<bool, LogReadFailure> {
     if let Some(h) = held.as_mut() {
-        drain_all(h, scanner, out)?;
+        drain_all(h, scanner, out, config)?;
     }
     let opened = open_consistent(dir, id, config, &mut |_| {})?;
+    // 新しいスナップショットの合計も読み出す前に上限で検証する（初回と同じ。REPAIR-5）。
+    check_limit(&opened, config)?;
     let first_new = match held.as_ref() {
         Some(h) => match opened.iter().position(|o| o.dev == h.dev && o.ino == h.ino) {
             Some(i) => i + 1,
@@ -161,6 +167,7 @@ fn advance(
     };
     let n = opened.len();
     for (i, o) in opened.into_iter().enumerate().skip(first_new) {
+        *extra = extra.saturating_add(1);
         let last = i + 1 == n;
         if last && is_current_log(&o.path) {
             *held = Some(Held {
@@ -191,11 +198,13 @@ fn feed_new(
     h: &mut Held,
     scanner: &mut Scanner,
     out: &mut dyn Write,
+    config: RotationConfig,
 ) -> Result<(), LogReadFailure> {
     let len = h.file.metadata().map_err(|_| internal())?.len();
     if len < h.offset {
         return Err(internal());
     }
+    check_bytes(len - h.offset, config)?;
     if len == h.offset {
         return Ok(());
     }
@@ -212,11 +221,13 @@ fn drain_all(
     h: &mut Held,
     scanner: &mut Scanner,
     out: &mut dyn Write,
+    config: RotationConfig,
 ) -> Result<(), LogReadFailure> {
     let len = h.file.metadata().map_err(|_| internal())?.len();
     if len < h.offset {
         return Err(internal());
     }
+    check_bytes(len - h.offset, config)?;
     if len > h.offset {
         feed_range(&h.file, h.offset, len, scanner, Some(&mut *out))?;
     }
@@ -491,8 +502,32 @@ mod tests {
                 append(&d2, "c1.log", b"stdout x\n");
             }
         });
-        o.result.expect("ok");
+        let rep = o.result.expect("ok");
         assert_eq!(o.out, b"stdout x\n");
+        // 追従中に読んだファイルも計上される。
+        assert_eq!(rep.files(), 1);
+    }
+
+    /// REPAIR-5・SUP-7: 追従中に増えた量が上限を超えたら、読み出す前に `FailedPrecondition` で失敗する。
+    #[test]
+    fn repair5_follow_enforces_read_limit_on_growth() {
+        let t = Tmp::new("growlimit");
+        fs::write(t.0.join("c1.log"), b"stdout a\n").expect("seed");
+        let dir = t.0.clone();
+        let o = follow_run(&t.0, follow_opts(), &mut |r| {
+            if r == 0 {
+                let f = fs::OpenOptions::new()
+                    .write(true)
+                    .open(dir.join("c1.log"))
+                    .expect("open");
+                f.set_len(1 << 40).expect("sparse grow");
+            }
+        });
+        match o.result {
+            Err(LogReadFailure::Source(e)) => assert_eq!(e.code(), ErrorCode::FailedPrecondition),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(o.out, b"stdout a\n");
     }
 
     /// CLI-1: 追従でもストリームの絞り込みとエスケープが効く。

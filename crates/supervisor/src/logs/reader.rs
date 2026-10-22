@@ -439,11 +439,20 @@ mod imp {
     }
 
     /// 読む合計の上限（`max_file_bytes × (generations + 1)`）を確かめる。
-    fn check_limit(opened: &[Opened], config: RotationConfig) -> Result<(), LogReadFailure> {
+    pub(super) fn check_limit(
+        opened: &[Opened],
+        config: RotationConfig,
+    ) -> Result<(), LogReadFailure> {
+        let total = opened.iter().fold(0u64, |acc, o| acc.saturating_add(o.len));
+        check_bytes(total, config)
+    }
+
+    /// 1 回の読取対象の合計バイト数が上限以下か確かめる。追従中の各回（新しいスナップショット・保持ファイルの増加量）にも
+    /// 同じ上限を適用する（読み出す前に検証する。REPAIR-5）。
+    pub(super) fn check_bytes(total: u64, config: RotationConfig) -> Result<(), LogReadFailure> {
         let limit = config
             .max_file_bytes()
             .saturating_mul(u64::from(config.generations()).saturating_add(1));
-        let total = opened.iter().fold(0u64, |acc, o| acc.saturating_add(o.len));
         if total > limit {
             return Err(source(
                 ErrorCode::FailedPrecondition,
@@ -621,7 +630,7 @@ mod imp {
         }
         let mut scanner = Scanner::new(options.stream(), options.escape());
         scanner.set_skip(skip);
-        let files = u32::try_from(opened.len()).unwrap_or(u32::MAX);
+        let mut files = u32::try_from(opened.len()).unwrap_or(u32::MAX);
         for (o, (limit, current)) in opened.iter().zip(&plan) {
             feed_range(&o.file, 0, *limit, &mut scanner, Some(&mut counting))?;
             if !*current {
@@ -635,7 +644,8 @@ mod imp {
                 plan,
                 scanner,
             };
-            follow::run(dir, id, config, f, start, &mut counting, driver)?;
+            let extra = follow::run(dir, id, config, f, start, &mut counting, driver)?;
+            files = files.saturating_add(extra);
         }
         Ok(LogReadReport {
             files,

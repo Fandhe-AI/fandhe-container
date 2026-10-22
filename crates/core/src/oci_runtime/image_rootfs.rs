@@ -37,12 +37,18 @@
 use std::path::{Component, Path, PathBuf};
 
 use super::image_refs::ImageManifestDigest;
-use crate::traits::{ErrorCode, TraitError};
+use crate::traits::{ErrorCode, ImageRootfsRecord, TraitError};
 
 /// 非公開の展開先の名前の接頭辞。`root.path` の要素としてこの接頭辞を持つ名前は、展開中の非公開の木を
 /// 通常の create が rootfs として採用することを防ぐため、`prepare_rootfs_target` と `check_rootfs` が拒否する
 /// （OCI-7: 使用中 rootfs の保持。展開中の木は名前を列挙でき、別 ID の create が指せてしまう）。
-pub(super) const STAGING_PREFIX: &str = ".fandhe-unpack-";
+/// 記録（`ImageRootfsRecord`）の経路検証と同じ定数を使い、単一の真実源にする（#2378）。
+pub(super) const STAGING_PREFIX: &str = crate::traits::state_store::IMAGE_ROOTFS_STAGING_PREFIX;
+
+/// 作った rootfs の直下に置く所有トークンの印のファイル名。delete が記録のトークンと内容を照合し、
+/// 一致したときだけ消す（作成世代の識別。inode の再利用で別のディレクトリを誤認しない。OCI-7・SEC-1・#2378）。
+#[cfg(target_os = "linux")]
+const OWNER_TOKEN_FILE: &str = ".fandhe-container-rootfs-owner";
 
 /// 後始末で権限を補正しながら辿る項目数の上限（無制限の走査を避ける。展開側の既定上限と同程度）。
 #[cfg(target_os = "linux")]
@@ -141,6 +147,8 @@ pub trait ImageRootfsUnpacker {
 #[derive(Debug)]
 pub(super) struct CreatedRootfs {
     path: PathBuf,
+    /// bundle 相対の正規化済みの経路（Normal 要素だけ。[`CreatedRootfs::record`] が状態へ記録する）。
+    relative: PathBuf,
     backing: imp::Backing,
     // 読むのは Linux の試験だけ（本番の読み手は #2315 の配線で追加する。REPAIR-3）。それ以外の構成では未使用になる。
     #[cfg_attr(
@@ -151,6 +159,18 @@ pub(super) struct CreatedRootfs {
         )
     )]
     reclamation: StagingReclamation,
+}
+
+/// [`remove_recorded_rootfs`] の結果（将来の拡張に備え非網羅）。
+// Linux 以外は削除経路が常に `Unimplemented` で拒否するため、各 variant は Linux でしか構築されない。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(super) enum RecordedRootfsRemoval {
+    /// 記録の実体を消した。
+    Removed,
+    /// 既に無かった（どの段でも `ENOENT`）。冪等な再実行として成功扱いにする。
+    NotPresent,
 }
 
 fn invalid(message: &str) -> TraitError {
@@ -241,8 +261,10 @@ pub(super) fn prepare_rootfs_target_with(
         p.push(part);
         p
     });
+    let relative = parts.iter().collect::<PathBuf>();
     Ok(CreatedRootfs {
         path,
+        relative,
         backing,
         reclamation,
     })
@@ -314,6 +336,24 @@ impl CreatedRootfs {
         imp::path_is_unpacked(path, &self.backing)
     }
 
+    /// 公開済みの rootfs を、状態レコードへ残す記録にする（契約 13。OCI-7・#2378）。
+    ///
+    /// 経路は bundle 相対の正規化済みのもの、同一性は作成時に固定した実体の (dev, ino)。delete が
+    /// [`remove_recorded_rootfs`] で「作ったときと同じ実体」だけを消すための印になる。Linux 以外は作成自体が
+    /// 拒否されるため到達しない（`Unimplemented`）。
+    pub(super) fn record(&self) -> Result<ImageRootfsRecord, TraitError> {
+        let (dev, ino) = imp::identity(&self.backing)?;
+        let token = imp::token(&self.backing)?;
+        ImageRootfsRecord::new(self.relative.clone(), dev, ino)?.with_token(token)
+    }
+
+    /// 展開後・公開前に、作成世代を区別する所有トークンを rootfs 直下の印のファイルへ書く（OCI-7・#2378）。
+    ///
+    /// 展開済みの木に同名のファイルがあれば（イメージ由来の偽の印を採用しない）`AlreadyExists` で拒否する。
+    pub(super) fn seal(&mut self) -> Result<(), TraitError> {
+        imp::seal(&mut self.backing)
+    }
+
     /// rootfs を消す。
     ///
     /// 作成時に固定した親（Linux は fd）の下で、末尾が作ったときと同じディレクトリ（dev・ino）で
@@ -322,6 +362,20 @@ impl CreatedRootfs {
     pub(super) fn remove(self) -> Result<(), TraitError> {
         imp::remove(&self.path, self.backing)
     }
+}
+
+/// 状態レコードに記録された rootfs を消す（delete が状態削除の成功後に呼ぶ。OCI-7・OCI-5・#2378）。
+///
+/// 呼び出し元は `oci_runtime::delete`。`bundle` はレコードの bundle、`rec` は create が記録した経路と実体の
+/// 同一性。bundle は作成時と同じく追従して開き、記録の経路は中間要素をリンク非追従の fd 相対で辿る。
+/// 末尾が記録の (dev, ino) と一致するディレクトリのときだけ中身ごと消す。symlink・ディレクトリでないもの・
+/// 同一性の不一致は `FailedPrecondition` で拒否し何も消さない（fail-closed）。どの段でも `ENOENT` なら
+/// [`RecordedRootfsRemoval::NotPresent`]。Linux 以外は同一性を保証できないため `Unimplemented`。
+pub(super) fn remove_recorded_rootfs(
+    bundle: &Path,
+    rec: &ImageRootfsRecord,
+) -> Result<RecordedRootfsRemoval, TraitError> {
+    imp::remove_recorded(bundle, rec)
 }
 
 #[cfg(target_os = "linux")]
@@ -337,8 +391,8 @@ mod imp {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        CLEANUP_MAX_DEPTH, CLEANUP_MAX_ENTRIES, STAGING_PREFIX, StagingReclamation, invalid,
-        refuse, remove_failed,
+        CLEANUP_MAX_DEPTH, CLEANUP_MAX_ENTRIES, ImageRootfsRecord, RecordedRootfsRemoval,
+        STAGING_PREFIX, StagingReclamation, invalid, refuse, remove_failed,
     };
     use crate::sys::{self, SysError};
     use crate::traits::{ErrorCode, TraitError};
@@ -357,9 +411,126 @@ mod imp {
         /// 作った rootfs ディレクトリそのものの fd（展開器へ `/proc/self/fd/N` で渡す）。
         dir: OwnedFd,
         identity: (u64, u64),
+        /// `seal` が書いた所有トークン（小文字 16 進 32 文字）。
+        token: Option<String>,
         /// 展開先のディレクトリ自体への排他の `flock`。生きている間は他の回収側から「持ち主あり」に見え、
         /// プロセスが落ちれば OS が外す（#2379・OCI-7）。`Backing` と同じ寿命で保持する。
         _lock: File,
+    }
+
+    /// 削除時に照合する所有トークンの扱い。
+    #[derive(Clone, Copy)]
+    enum Owner<'a> {
+        /// 自分が作った直後の木の後始末（トークンを照合しない）。
+        Unchecked,
+        /// 記録のトークンと照合する。`None`（記録欠落）は拒否する。
+        Token(Option<&'a str>),
+    }
+
+    pub(super) fn token(b: &Backing) -> Result<String, TraitError> {
+        b.token.clone().ok_or_else(|| {
+            TraitError::new(ErrorCode::Internal, "rootfs owner token is not written")
+        })
+    }
+
+    /// OS の乱数から 128 bit のトークンを作り、小文字 16 進 32 文字にする。
+    fn new_token() -> Result<String, TraitError> {
+        use std::io::Read;
+        let mut buf = [0u8; 16];
+        File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut buf))
+            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to create rootfs token"))?;
+        Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+    }
+
+    pub(super) fn seal(b: &mut Backing) -> Result<(), TraitError> {
+        let token = new_token()?;
+        // 展開器は rootfs 自身の mode を変えてよい（契約は禁止していない）。所有者の write・search 権限が無いと
+        // 印を作れず、従来成功した create が失敗する退行になるため、固定した fd の実体（`/proc/self/fd/N` は
+        // 経路を再解決しない）の mode を一時的に補って印を書き、成功・失敗のどちらでも元の mode へ戻す。
+        let proc_dir = format!("/proc/self/fd/{}", b.dir.as_raw_fd());
+        let original = fstat(b.dir.as_fd())
+            .map(|(_, _, _, mode)| mode & 0o7777)
+            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to stat rootfs"))?;
+        let widened = original | 0o300;
+        if widened != original {
+            std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(widened)).map_err(
+                |_| TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token"),
+            )?;
+        }
+        let written = write_marker(&proc_dir, &token);
+        if widened != original {
+            let restored =
+                std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(original));
+            written?;
+            restored.map_err(|_| {
+                TraitError::new(ErrorCode::Internal, "failed to restore rootfs mode")
+            })?;
+        } else {
+            written?;
+        }
+        b.token = Some(token);
+        Ok(())
+    }
+
+    /// 固定した rootfs（`proc_dir`）の直下へ所有トークンの印を新規作成して書く。
+    fn write_marker(proc_dir: &str, token: &str) -> Result<(), TraitError> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = format!("{proc_dir}/{}", super::OWNER_TOKEN_FILE);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .custom_flags(sys::O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    TraitError::new(
+                        ErrorCode::AlreadyExists,
+                        "rootfs owner marker already exists",
+                    )
+                } else {
+                    TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token")
+                }
+            })?;
+        f.write_all(token.as_bytes())
+            .and_then(|()| f.sync_all())
+            .map_err(|_| {
+                TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token")
+            })?;
+        Ok(())
+    }
+
+    /// 固定した rootfs の fd 直下の印のファイルが `expected` と一致するか（リンク非追従・通常ファイルのみ・
+    /// FIFO で止まらない）。
+    fn token_matches(root: BorrowedFd<'_>, expected: &str) -> bool {
+        use std::io::Read;
+        // 先に `O_PATH|O_NOFOLLOW` で実体を固定し、fstat で通常ファイルと確かめてから、固定済みの fd を
+        // 読み取りで開き直す。種別確認が open より前のため、デバイス・FIFO への差し替えでも open の
+        // 副作用（端末の取得・ブロック）が起きない（SEC-1）。
+        let Ok(name) = CString::new(super::OWNER_TOKEN_FILE) else {
+            return false;
+        };
+        let Ok(pinned) = sys::open_path_nofollow_at(root, &name) else {
+            return false;
+        };
+        let Ok((_, _, _, mode)) = fstat(pinned.as_fd()) else {
+            return false;
+        };
+        // S_IFMT = 0o170000・S_IFREG = 0o100000。
+        if mode & 0o170_000 != 0o100_000 {
+            return false;
+        }
+        let Ok(fd) = sys::reopen_pinned_read_nonblock(pinned.as_fd()) else {
+            return false;
+        };
+        let f = File::from(fd);
+        if !f.metadata().is_ok_and(|m| m.is_file() && m.len() <= 64) {
+            return false;
+        }
+        let mut buf = Vec::new();
+        f.take(65).read_to_end(&mut buf).is_ok() && buf == expected.as_bytes()
     }
 
     pub(super) fn unpack_path(_path: &Path, b: &Backing) -> PathBuf {
@@ -421,6 +592,14 @@ mod imp {
         })
     }
 
+    /// bundle を開く。最終要素の symlink は辿るが、ディレクトリ以外は open の時点で拒否する
+    /// （FIFO への差し替えで delete がブロックしない。OCI-7・SEC-1）。
+    fn open_bundle(bundle: &Path) -> Result<OwnedFd, SysError> {
+        let c =
+            CString::new(bundle.as_os_str().as_bytes()).map_err(|_| SysError::Os(sys::EINVAL))?;
+        sys::open_dir_path_follow(&c)
+    }
+
     /// fd の指す実体の (dev, ino, ディレクトリか, mode)。fd は複製して `File` として fstat する。
     fn fstat(fd: BorrowedFd<'_>) -> Result<(u64, u64, bool, u32), std::io::Error> {
         let file = File::from(fd.try_clone_to_owned()?);
@@ -446,19 +625,16 @@ mod imp {
     /// bundle を開き、`parents` を 1 要素ずつリンク非追従で辿って親ディレクトリの fd を返す。
     fn open_parent(bundle: &Path, parents: &[&OsStr]) -> Result<OwnedFd, TraitError> {
         // bundle そのものは呼び出し側が渡した経路（上位が symlink でもよい）。追従して開き、以降は fd で固定する。
-        let file = File::open(bundle).map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => {
+        let mut cur = open_bundle(bundle).map_err(|e| match e {
+            SysError::Os(n) if n == sys::ENOENT => {
                 TraitError::new(ErrorCode::NotFound, "bundle directory not found")
             }
-            std::io::ErrorKind::PermissionDenied => {
+            SysError::Os(n) if n == sys::ENOTDIR => invalid("bundle is not a directory"),
+            SysError::Os(n) if n == sys::EACCES || n == sys::EPERM => {
                 TraitError::new(ErrorCode::PermissionDenied, "cannot access bundle")
             }
             _ => TraitError::new(ErrorCode::Internal, "failed to open bundle"),
         })?;
-        if !file.metadata().map(|m| m.is_dir()).unwrap_or(false) {
-            return Err(invalid("bundle is not a directory"));
-        }
-        let mut cur = OwnedFd::from(file);
         for part in parents {
             cur = open_dir(cur.as_fd(), &cstr(part)?)?;
         }
@@ -569,8 +745,8 @@ mod imp {
             Err(SysError::Os(n)) if n == sys::ENOENT => return Reap::Gone,
             Err(_) => return Reap::Unverified,
         }
-        match remove_tree_at(cur, &cname, identity) {
-            Ok(()) => Reap::Reclaimed,
+        match remove_tree_at(cur, &cname, identity, Owner::Unchecked) {
+            Ok(_) => Reap::Reclaimed,
             Err(_) => Reap::Failed,
         }
     }
@@ -671,41 +847,125 @@ mod imp {
                 current: name,
                 dir,
                 identity,
+                token: None,
                 _lock: lock,
             },
             reclamation,
         ))
     }
 
-    pub(super) fn remove(_path: &Path, b: Backing) -> Result<(), TraitError> {
-        remove_tree_at(b.parent.as_fd(), &b.current, b.identity)
+    pub(super) fn identity(b: &Backing) -> Result<(u64, u64), TraitError> {
+        Ok(b.identity)
     }
 
-    /// `parent` の下の `name` が `identity`（dev・ino）のディレクトリであることを確かめてから、
-    /// その木を fd 相対・リンク非追従で消す（件数・深さの上限つき）。既に無ければ何もしない。
-    /// 実体が違えば `FailedPrecondition` で消さない（差し替えられた先を消さない fail-closed）。
+    pub(super) fn remove(_path: &Path, b: Backing) -> Result<(), TraitError> {
+        // 既に無ければ消す物が無い（`NotPresent` も成功）。
+        remove_tree_at(b.parent.as_fd(), &b.current, b.identity, Owner::Unchecked).map(|_| ())
+    }
+
+    /// 固定済みの `parent` の下の `name` を、(dev, ino) が `identity` と一致するときだけ中身ごと消す。
+    /// 末尾はリンク非追従で開く。`ENOENT` は `NotPresent`、それ以外の開く失敗・種類や同一性の不一致は拒否する。
     fn remove_tree_at(
         parent: BorrowedFd<'_>,
         name: &CString,
         identity: (u64, u64),
-    ) -> Result<(), TraitError> {
+        owner: Owner<'_>,
+    ) -> Result<RecordedRootfsRemoval, TraitError> {
         let root = match sys::open_dir_path_nofollow(Some(parent), name) {
             Ok(fd) => fd,
-            // 既に無ければ消す物が無い。
-            Err(SysError::Os(n)) if n == sys::ENOENT => return Ok(()),
+            Err(SysError::Os(n)) if n == sys::ENOENT => {
+                return Ok(RecordedRootfsRemoval::NotPresent);
+            }
             Err(_) => return Err(refuse()),
         };
-        match fstat(root.as_fd()) {
-            Ok((dev, ino, true, _)) if (dev, ino) == identity => {}
+        let (root_dev, root_mode) = match fstat(root.as_fd()) {
+            Ok((dev, ino, true, mode)) if (dev, ino) == identity => (dev, mode & 0o7777),
             _ => return Err(refuse()),
+        };
+        // rootfs 自身がマウントポイントなら（親と別のマウント）マウント元を消さないよう拒否する。
+        // 下位の bind mount は、再帰の各エントリを開くたびに `mnt_id` を照合して跨がない（検査後に足された
+        // マウントも、経路の snapshot に依存せず fd の実体で拒否する。fail-closed）。
+        let root_mnt = mount_id(root.as_fd()).ok_or_else(refuse)?;
+        if mount_id(parent) != Some(root_mnt) {
+            return Err(refuse());
+        }
+        // 作成世代の照合（inode の再利用で作り直された別のディレクトリを消さない）。記録欠落・不一致・
+        // 印の欠落はいずれも拒否する（fail-closed）。
+        if let Owner::Token(expected) = owner {
+            // 展開器が rootfs 自身の mode から所有者の search 権限を外していると（`seal` は一時的に補って
+            // 印を書く）、印を開けず正しい記録でも拒否してしまう。固定した fd の実体（`/proc/self/fd/N` は
+            // 経路を再解決しない）の mode を一時的に補って照合し、不一致なら元の mode へ戻してから拒否する。
+            // 一致すれば続く `remove_children` が中身ごと消すので戻さない。
+            let proc_root = format!("/proc/self/fd/{}", root.as_raw_fd());
+            let widened = root_mode | 0o100;
+            if widened != root_mode {
+                std::fs::set_permissions(&proc_root, std::fs::Permissions::from_mode(widened))
+                    .map_err(|_| refuse())?;
+            }
+            if !expected.is_some_and(|t| token_matches(root.as_fd(), t)) {
+                if widened != root_mode {
+                    let _ = std::fs::set_permissions(
+                        &proc_root,
+                        std::fs::Permissions::from_mode(root_mode),
+                    );
+                }
+                return Err(refuse());
+            }
         }
         let mut seen = 0usize;
-        remove_children(root.as_fd(), 0, &mut seen)?;
+        remove_children(root.as_fd(), root_dev, root_mnt, 0, &mut seen)?;
         match sys::remove_dir_at(parent, name) {
-            Ok(()) => Ok(()),
-            Err(SysError::Os(n)) if n == sys::ENOENT => Ok(()),
+            Ok(()) => Ok(RecordedRootfsRemoval::Removed),
+            Err(SysError::Os(n)) if n == sys::ENOENT => Ok(RecordedRootfsRemoval::Removed),
             Err(_) => Err(remove_failed()),
         }
+    }
+
+    pub(super) fn remove_recorded(
+        bundle: &Path,
+        rec: &ImageRootfsRecord,
+    ) -> Result<RecordedRootfsRemoval, TraitError> {
+        // FIFO 等への差し替えでも open でブロックしない（`O_DIRECTORY`）。差し替えは拒否として扱う。
+        let mut cur = match open_bundle(bundle) {
+            Ok(fd) => fd,
+            Err(SysError::Os(n)) if n == sys::ENOENT => {
+                return Ok(RecordedRootfsRemoval::NotPresent);
+            }
+            Err(SysError::Os(n)) if n == sys::ENOTDIR => return Err(refuse()),
+            Err(_) => return Err(remove_failed()),
+        };
+        let mut parts = rec.relative_path().iter().peekable();
+        while let Some(part) = parts.next() {
+            let name = cstr(part)?;
+            if parts.peek().is_none() {
+                return remove_tree_at(
+                    cur.as_fd(),
+                    &name,
+                    rec.identity(),
+                    Owner::Token(rec.token()),
+                );
+            }
+            cur = match open_dir(cur.as_fd(), &name) {
+                Ok(fd) => fd,
+                // 中間の要素が無ければ rootfs も無い。
+                Err(e) if e.code() == ErrorCode::NotFound => {
+                    return Ok(RecordedRootfsRemoval::NotPresent);
+                }
+                // symlink・ディレクトリでないものへの差し替え（リンクは辿らない）。
+                Err(e) if e.code() == ErrorCode::InvalidArgument => return Err(refuse()),
+                Err(e) => return Err(e),
+            };
+        }
+        // 空の経路は `ImageRootfsRecord::new` が拒否済みで到達しない。
+        Err(refuse())
+    }
+
+    /// fd の属するマウント ID（fdinfo の `mnt_id`）。経路の文字列に依存せず、固定した fd の実体で判定する
+    /// （改名・bind mount の別名・非 UTF-8 の名前の影響を受けない。SEC-1）。読めない場合は `None`。
+    fn mount_id(fd: BorrowedFd<'_>) -> Option<u64> {
+        let text =
+            std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd())).ok()?;
+        crate::oci_runtime::mountinfo_identity::parse_fdinfo_mnt_id(&text)
     }
 
     /// `dir`（固定済みの fd）の中身を、fd 相対・リンク非追従で再帰的に消す（件数・深さの上限つき）。
@@ -714,6 +974,8 @@ mod imp {
     /// 列挙と chmod は `/proc/self/fd/N` 経由（magic link は fd の実体へ解決され、経路は再解決されない）。
     fn remove_children(
         dir: BorrowedFd<'_>,
+        root_dev: u64,
+        root_mnt: u64,
         depth: usize,
         seen: &mut usize,
     ) -> Result<(), TraitError> {
@@ -721,8 +983,9 @@ mod imp {
             return Err(remove_failed());
         }
         let proc_path = format!("/proc/self/fd/{}", dir.as_raw_fd());
-        let (_, _, is_dir, mode) = fstat(dir).map_err(|_| remove_failed())?;
-        if !is_dir {
+        let (dev, _, is_dir, mode) = fstat(dir).map_err(|_| remove_failed())?;
+        // 別ファイルシステム・別マウント（同一 FS の bind mount を含む）を跨がない。
+        if !is_dir || dev != root_dev || mount_id(dir) != Some(root_mnt) {
             return Err(remove_failed());
         }
         if mode & 0o700 != 0o700 {
@@ -741,11 +1004,14 @@ mod imp {
                 Err(SysError::Os(n)) if n == sys::ENOENT => continue,
                 Err(_) => return Err(remove_failed()),
             };
+            if mount_id(child.as_fd()) != Some(root_mnt) {
+                return Err(remove_failed());
+            }
             let is_child_dir = fstat(child.as_fd())
                 .map(|(_, _, d, _)| d)
                 .map_err(|_| remove_failed())?;
             if is_child_dir {
-                remove_children(child.as_fd(), depth + 1, seen)?;
+                remove_children(child.as_fd(), root_dev, root_mnt, depth + 1, seen)?;
                 sys::remove_dir_at(dir, &name).map_err(|_| remove_failed())?;
             } else {
                 sys::remove_file_at(dir, &name).map_err(|_| remove_failed())?;
@@ -765,7 +1031,7 @@ mod imp {
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
-    use super::{StagingReclamation, refuse};
+    use super::{ImageRootfsRecord, RecordedRootfsRemoval, StagingReclamation, refuse};
     use crate::traits::{ErrorCode, TraitError};
 
     #[derive(Debug)]
@@ -813,6 +1079,39 @@ mod imp {
 
     pub(super) fn remove(_path: &Path, _b: Backing) -> Result<(), TraitError> {
         Err(refuse())
+    }
+
+    /// 作成自体が拒否される（`create_dir` は Unimplemented）ため到達しない。
+    pub(super) fn seal(_b: &mut Backing) -> Result<(), TraitError> {
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "image rootfs requires Linux",
+        ))
+    }
+
+    pub(super) fn token(_b: &Backing) -> Result<String, TraitError> {
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "image rootfs requires Linux",
+        ))
+    }
+
+    pub(super) fn identity(_b: &Backing) -> Result<(u64, u64), TraitError> {
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "image rootfs unpacking is not supported on this OS yet",
+        ))
+    }
+
+    /// 同一性を fd で固定できないため、経路を再解決して消さない（SEC-1。記録は失敗として残す）。
+    pub(super) fn remove_recorded(
+        _bundle: &Path,
+        _rec: &ImageRootfsRecord,
+    ) -> Result<RecordedRootfsRemoval, TraitError> {
+        Err(TraitError::new(
+            ErrorCode::Unimplemented,
+            "image rootfs removal is not supported on this OS yet",
+        ))
     }
 }
 
@@ -1044,6 +1343,290 @@ mod tests {
         let _ = std::fs::remove_dir_all(&b);
     }
 
+    /// 公開済みの rootfs を作り、記録を返す（`<b>/<rel>` に `f` を置く）。
+    #[cfg(target_os = "linux")]
+    fn published_record(b: &Path, rel: &str) -> ImageRootfsRecord {
+        let mut c = prepare_rootfs_target(b, Path::new(rel)).expect("prepare");
+        std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
+        c.seal().expect("seal");
+        c.publish().expect("publish");
+        c.record().expect("record")
+    }
+
+    /// OCI-7（#2378）: 展開器が rootfs 自身を 0555 にしても seal は印を書け、公開後の mode は展開器が
+    /// 残したまま（0555）で、記録から消せる（削除側が mode を補って辿る）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_seal_works_on_read_only_rootfs_and_restores_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = tmp("seal-ro");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
+        std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(0o555))
+            .expect("chmod 0555");
+        c.seal().expect("seal must not fail on a read-only rootfs");
+        let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o7777;
+        assert_eq!(mode(&c.unpack_path()), 0o555);
+        c.publish().expect("publish");
+        let rec = c.record().expect("record");
+        assert_eq!(mode(&b.join("rootfs")), 0o555);
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("remove"),
+            RecordedRootfsRemoval::Removed
+        );
+        assert!(!b.join("rootfs").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7（#2378）: 展開器が rootfs 自身から所有者の search 権限まで外しても（0600・0000）、削除側は
+    /// 照合の前に権限を一時的に補うので、正しい記録なら消せる（印の検索が EACCES で拒否にならない）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_remove_recorded_rootfs_without_owner_search_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        for (i, m) in [0o600u32, 0o000].into_iter().enumerate() {
+            let b = tmp(&format!("rec-nosearch-{i}"));
+            let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+            std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
+            std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(m))
+                .expect("chmod");
+            c.seal().expect("seal");
+            c.publish().expect("publish");
+            let rec = c.record().expect("record");
+            assert_eq!(
+                remove_recorded_rootfs(&b, &rec).expect("remove"),
+                RecordedRootfsRemoval::Removed,
+                "mode {m:o}"
+            );
+            assert!(!b.join("rootfs").exists());
+            let _ = std::fs::remove_dir_all(&b);
+        }
+    }
+
+    /// OCI-7・SEC-1（#2378）: 照合のために補った権限は、照合が不一致（拒否）なら元の mode へ戻す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_restores_mode_on_token_mismatch() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = tmp("rec-nosearch-mismatch");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
+        std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+        c.seal().expect("seal");
+        c.publish().expect("publish");
+        let rec = c.record().expect("record");
+        let (dev, ino) = rec.identity();
+        let wrong = ImageRootfsRecord::new(rec.relative_path().to_path_buf(), dev, ino)
+            .and_then(|r| r.with_token("0".repeat(32)))
+            .expect("wrong token record");
+        let root = b.join("rootfs");
+        let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o7777;
+        let e = remove_recorded_rootfs(&b, &wrong).expect_err("mismatch");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(mode(&root), 0o000);
+        // 正しい記録では消せる。
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("remove"),
+            RecordedRootfsRemoval::Removed
+        );
+        assert!(!root.exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7・SEC-1（#2378）: 記録した rootfs を手で消して同名のディレクトリを作り直した（印が無い・別の印）
+    /// ときは、(dev, ino) が偶然一致しても消さない。利用者の新しいデータが残る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_refuses_recreated_dir_without_matching_token() {
+        let b = tmp("rec-token");
+        let rec = published_record(&b, "rootfs");
+        let token = rec.token().expect("token").to_owned();
+        assert_eq!(token.len(), 32);
+        let root = b.join("rootfs");
+        // 印を別の値へ差し替えた作り直し（同じ inode の再利用を模す）。
+        std::fs::set_permissions(
+            root.join(super::OWNER_TOKEN_FILE),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .expect("chmod");
+        std::fs::write(root.join(super::OWNER_TOKEN_FILE), "0".repeat(32)).expect("other token");
+        std::fs::write(root.join("user-data"), b"keep").expect("data");
+        let e = remove_recorded_rootfs(&b, &rec).expect_err("mismatch");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            std::fs::read(root.join("user-data")).expect("kept"),
+            b"keep"
+        );
+        // 印が無い（利用者が作り直した空のディレクトリ相当）。
+        std::fs::remove_file(root.join(super::OWNER_TOKEN_FILE)).expect("rm marker");
+        let e = remove_recorded_rootfs(&b, &rec).expect_err("no marker");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(root.join("user-data").exists());
+        // 印が symlink（リンクは辿らない）。
+        std::os::unix::fs::symlink("/etc/hostname", root.join(super::OWNER_TOKEN_FILE))
+            .expect("symlink");
+        assert!(remove_recorded_rootfs(&b, &rec).is_err());
+        assert!(root.join("user-data").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7・SEC-1（#2378）: トークンの無い旧記録は、実体が一致しても消さない（fail-closed）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_refuses_record_without_token() {
+        let b = tmp("rec-notoken");
+        let rec = published_record(&b, "rootfs");
+        let (dev, ino) = rec.identity();
+        let legacy =
+            ImageRootfsRecord::new(rec.relative_path().to_path_buf(), dev, ino).expect("legacy");
+        assert!(legacy.token().is_none());
+        let e = remove_recorded_rootfs(&b, &legacy).expect_err("no token");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(b.join("rootfs").join("f").exists());
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("matching"),
+            RecordedRootfsRemoval::Removed
+        );
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7（#2378）: 展開済みの木に同名の印のファイルがあれば（イメージ由来の偽の印）採用せず拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_seal_refuses_preexisting_marker() {
+        let b = tmp("seal-pre");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        std::fs::write(c.unpack_path().join(super::OWNER_TOKEN_FILE), "x").expect("fake");
+        let e = c.seal().expect_err("exists");
+        assert_eq!(e.code(), ErrorCode::AlreadyExists);
+        c.remove().expect("cleanup");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7: 記録から公開済みの rootfs を消せる。bundle と他のファイルは残る。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_remove_recorded_rootfs_deletes_tree() {
+        let b = tmp("rec-del");
+        std::fs::write(b.join("config.json"), b"{}").expect("config");
+        let rec = published_record(&b, "rootfs");
+        assert_eq!(rec.relative_path(), Path::new("rootfs"));
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("remove"),
+            RecordedRootfsRemoval::Removed
+        );
+        assert!(!b.join("rootfs").exists());
+        assert!(b.join("config.json").is_file());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7: 入れ子の `root.path` でも記録の経路で消せる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_remove_recorded_rootfs_nested_path() {
+        let b = tmp("rec-nested");
+        std::fs::create_dir(b.join("p")).expect("parent");
+        let rec = published_record(&b, "p/rootfs");
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("remove"),
+            RecordedRootfsRemoval::Removed
+        );
+        assert!(b.join("p").is_dir());
+        assert!(!b.join("p/rootfs").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7: 既に無ければ `NotPresent`（冪等な再実行）。bundle・中間要素が無い場合も同じ。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_remove_recorded_rootfs_absent_is_not_present() {
+        let b = tmp("rec-absent");
+        std::fs::create_dir(b.join("p")).expect("parent");
+        let rec = published_record(&b, "p/rootfs");
+        std::fs::remove_dir_all(b.join("p/rootfs")).expect("gone");
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("absent"),
+            RecordedRootfsRemoval::NotPresent
+        );
+        std::fs::remove_dir_all(b.join("p")).expect("parent gone");
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("no parent"),
+            RecordedRootfsRemoval::NotPresent
+        );
+        let _ = std::fs::remove_dir_all(&b);
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("no bundle"),
+            RecordedRootfsRemoval::NotPresent
+        );
+    }
+
+    /// SEC-1: 同名の別ディレクトリ・symlink に差し替えられていたら `FailedPrecondition` で何も消さない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_refuses_replaced_dir() {
+        let b = tmp("rec-replaced");
+        let rec = published_record(&b, "rootfs");
+        std::fs::rename(b.join("rootfs"), b.join("moved")).expect("move");
+        std::fs::create_dir(b.join("rootfs")).expect("replacement");
+        std::fs::write(b.join("rootfs/marker"), b"o").expect("marker");
+        let e = remove_recorded_rootfs(&b, &rec).expect_err("replaced");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(b.join("rootfs/marker").is_file());
+
+        std::fs::remove_dir_all(b.join("rootfs")).expect("rm replacement");
+        let outside = tmp("rec-replaced-out");
+        std::fs::write(outside.join("marker"), b"o").expect("marker");
+        std::os::unix::fs::symlink(&outside, b.join("rootfs")).expect("symlink");
+        let e = remove_recorded_rootfs(&b, &rec).expect_err("symlink");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(outside.join("marker").is_file());
+        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// SEC-1: 中間要素が bundle 外への symlink に差し替えられても、外側は消さない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_parent_symlink_untouched() {
+        let b = tmp("rec-parent");
+        std::fs::create_dir(b.join("p")).expect("parent");
+        let rec = published_record(&b, "p/rootfs");
+        let outside = tmp("rec-parent-out");
+        std::fs::create_dir(outside.join("rootfs")).expect("outside rootfs");
+        std::fs::write(outside.join("rootfs/marker"), b"o").expect("marker");
+        std::fs::rename(b.join("p"), b.join("p-moved")).expect("move");
+        std::os::unix::fs::symlink(&outside, b.join("p")).expect("symlink");
+        let e = remove_recorded_rootfs(&b, &rec).expect_err("symlinked parent");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(outside.join("rootfs/marker").is_file());
+        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// OCI-7: 展開時に読み取り専用にされたディレクトリを含む木も消せる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_remove_recorded_rootfs_handles_read_only_dirs() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let b = tmp("rec-ro");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        let up = c.unpack_path();
+        std::fs::create_dir(up.join("ro")).expect("ro");
+        std::fs::write(up.join("ro/f"), b"x").expect("f");
+        std::fs::set_permissions(up.join("ro"), std::fs::Permissions::from_mode(0o500))
+            .expect("chmod");
+        c.seal().expect("seal");
+        c.publish().expect("publish");
+        let rec = c.record().expect("record");
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("remove"),
+            RecordedRootfsRemoval::Removed
+        );
+        assert!(!b.join("rootfs").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
     /// OCI-7・SEC-1: Linux 以外は展開先を固定できないため、作成の前に Unimplemented で拒否する。
     #[cfg(not(target_os = "linux"))]
     #[test]
@@ -1052,6 +1635,79 @@ mod tests {
         let e = prepare_rootfs_target(&b, Path::new("rootfs")).expect_err("refuse");
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         assert!(!b.join("rootfs").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// `mkfifo` の終了待ちの期限（REPAIR-5）。
+    #[cfg(target_os = "linux")]
+    const MKFIFO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// `mkfifo(1)` で FIFO を作る（std・`sys` に FIFO を作る手段が無いため、テストに限り外部コマンドを使う）。
+    /// 終了を期限つきで待ち、超過したら kill して回収してから失敗させる（REPAIR-5。無期限に待たない）。
+    /// 起動失敗・失敗終了・期限超過はすべてテスト失敗にする（skip で成功扱いにしない）。
+    #[cfg(target_os = "linux")]
+    fn make_fifo(path: &Path) {
+        let mut child = std::process::Command::new("mkfifo")
+            .arg(path)
+            .spawn()
+            .expect("mkfifo must be runnable to verify FIFO handling");
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait().expect("failed to poll mkfifo") {
+                Some(status) => {
+                    assert!(status.success(), "mkfifo failed: {status}");
+                    return;
+                }
+                None if start.elapsed() > MKFIFO_DEADLINE => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("mkfifo did not finish within {MKFIFO_DEADLINE:?}");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+    }
+
+    /// SEC-1・OCI-7: 所有印が FIFO に差し替えられても open せず（ブロックせず）拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_refuses_non_regular_marker() {
+        let b = tmp("marker-fifo");
+        let rec = published_record(&b, "rootfs");
+        let root = b.join("rootfs");
+        let marker = root.join(super::OWNER_TOKEN_FILE);
+        std::fs::remove_file(&marker).expect("rm marker");
+        make_fifo(&marker);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let b2 = b.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(remove_recorded_rootfs(&b2, &rec).is_err());
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("must not block");
+        assert!(refused);
+        assert!(root.exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// SEC-1・OCI-7: bundle が FIFO に差し替えられても delete は open でブロックせず拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_fifo_bundle_does_not_block() {
+        let b = tmp("fifo-bundle");
+        let fifo = b.join("fifo");
+        make_fifo(&fifo);
+        let rec = published_record(&b, "rootfs");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let f = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(remove_recorded_rootfs(&f, &rec).is_err());
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("must not block");
+        assert!(refused);
         let _ = std::fs::remove_dir_all(&b);
     }
 

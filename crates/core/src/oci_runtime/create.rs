@@ -52,7 +52,9 @@
 //! create の途中でプロセスが落ちて残った展開途中の木（非公開の名前）は、持ち主のいない（OS ロックが取れる）
 //! ものだけを次の create の時点と `reap_stale_unpacks` が回収する（#2379・OCI-7。`image_rootfs` のモジュール doc）。
 //! 公開済みで状態の無い rootfs は回収せず、次の同じ bundle の create は `AlreadyExists` で止まる
-//! （fail-closed。利用者のデータを消さない）。delete は bundle と rootfs を消さない。
+//! （fail-closed。利用者のデータを消さない）。公開した rootfs は状態レコードに記録し
+//! （`StateRecord::image_rootfs`）、delete が状態削除の成功後に消す（所有・タイミング・失敗時の扱いは
+//! `docs/design/image-rootfs-lifetime.md`。OCI-7・OCI-5・#2378）。delete は bundle 自体は消さない。
 //! 展開器なしの [`create_with_image`] は従来どおり、bundle の rootfs が展開済みの前提で動く。
 //!
 //! # スコープ外
@@ -77,11 +79,12 @@ use super::image_refs::{ContainerImage, ImageRefRegistration};
 use super::image_rootfs::{
     CreatedRootfs, ImageRootfsUnpacker, StagingReclamation, prepare_rootfs_target_with,
 };
+use super::launch::BundleLock;
 use super::resources::LinuxResourceLimits;
 use crate::observability::{OpName, OpOutcome, OpRecorder};
 use crate::traits::{
-    ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, GetStateRequest, StateRecord,
-    StateStore, TraitError,
+    ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, GetStateRequest,
+    ImageRootfsRecord, StateRecord, StateStore, TraitError,
 };
 
 /// bundle 直下の設定ファイル名（OCI Runtime Spec）。
@@ -123,13 +126,48 @@ pub fn create(
 }
 
 fn create_inner(store: &dyn StateStore, req: &CreateRequest) -> Result<StateRecord, TraitError> {
+    // delete が core の作った rootfs を消している間の create を排他する（検証より前に取る。OCI-7・#2378）。
+    let _guard = lock_for_create(req.bundle())?;
     validate_bundle(req.bundle())?;
-    create_state(store, req)
+    create_state(store, req, None)
 }
 
-fn create_state(store: &dyn StateStore, req: &CreateRequest) -> Result<StateRecord, TraitError> {
+/// delete が rootfs の後始末を終えるまで保持する bundle の所有ロックを、create 側が取る（#2378・OCI-7）。
+///
+/// delete は core が作った rootfs の削除が済むまでこのロックを保持する。その間に同じ bundle を採用する create が
+/// 状態を作ると、新しいコンテナの rootfs を旧 delete が消すため、ロック保持中の create は `FailedPrecondition`
+/// で拒否する。
+///
+/// ロックは bundle が指す実体に取る（[`BundleLock::acquire_resolved`]。bundle の祖先が symlink でも、実体の
+/// 絶対パスで同じ bundle を指す delete と排他する）。Linux でそれでもロックを取れないときは、状態を作らずに
+/// 拒否する（fail-closed）。排他なしで進むと、delete が保持中でも create が成功し、旧 delete が新しい
+/// コンテナの rootfs を消しうるため。ただし bundle の検証で拒否される bundle（不在・config 不正等）は、
+/// 従来どおり検証のエラー（コードと文言）を返す。Linux 以外はロックが未実装（`Unimplemented`）のため排他せず
+/// 進む（Linux 以外は core が rootfs を作らず、delete も rootfs を消さない）。
+fn lock_for_create(bundle: &Path) -> Result<Option<BundleLock>, TraitError> {
+    match BundleLock::acquire_resolved(bundle) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(e) if e.code() == ErrorCode::FailedPrecondition => Err(e),
+        Err(_) if !cfg!(target_os = "linux") => Ok(None),
+        Err(e) => {
+            validate_bundle(bundle)?;
+            Err(e)
+        }
+    }
+}
+
+/// 状態を作る。`image_rootfs` は core が作って公開した rootfs の記録（展開器つきの create だけが渡す。
+/// 利用者が用意した rootfs には付けず、delete は触れない。OCI-7・#2378）。
+fn create_state(
+    store: &dyn StateStore,
+    req: &CreateRequest,
+    image_rootfs: Option<ImageRootfsRecord>,
+) -> Result<StateRecord, TraitError> {
     let status = ContainerStatus::created(req.id().clone(), None);
-    let state_req = CreateStateRequest::new(status, req.bundle().to_path_buf())?;
+    let mut state_req = CreateStateRequest::new(status, req.bundle().to_path_buf())?;
+    if let Some(r) = image_rootfs {
+        state_req = state_req.with_image_rootfs(r);
+    }
     store.create(&state_req)
 }
 
@@ -184,8 +222,18 @@ fn create_with_image_inner(
         }
     }
     // OCI-7: 参照登録の後・状態作成の前。展開器があれば、検証を展開の前後に分けて展開する。
-    let _published_rootfs = match image.unpacker() {
+    // 展開器なしは、検証より前に bundle のロックを取り状態作成まで保持する（検証の後に delete が rootfs を消して
+    // 完了する隙を作らない。通常の `create` と同じ順。OCI-7・SEC-1）。展開器ありは展開後・状態作成の前に取る。
+    let mut early_guard: Option<Option<BundleLock>> = None;
+    let image_rootfs = match image.unpacker() {
         None => {
+            match lock_for_create(req.bundle()) {
+                Ok(g) => early_guard = Some(g),
+                Err(e) => {
+                    rollback_image_ref(recorder, image, req);
+                    return Err(e);
+                }
+            }
             if let Err(e) = validate_bundle(req.bundle()) {
                 rollback_image_ref(recorder, image, req);
                 return Err(e);
@@ -193,7 +241,15 @@ fn create_with_image_inner(
             None
         }
         Some(unpacker) => match unpack_rootfs(store, recorder, image, unpacker, req) {
-            Ok(created) => Some(created),
+            // 公開済みの rootfs を状態へ記録する（delete が消す印）。記録を作れない失敗は公開後の失敗と同じ扱い
+            // （rootfs は残し、参照だけ外す）。
+            Ok(created) => match created.record() {
+                Ok(record) => Some(record),
+                Err(e) => {
+                    rollback_image_ref(recorder, image, req);
+                    return Err(e);
+                }
+            },
             Err(e) => {
                 // 公開前の失敗では rootfs は unpack_rootfs が消した後（公開後の失敗はここへ来ない）。残るのは未確定の参照だけ。
                 rollback_image_ref(recorder, image, req);
@@ -201,7 +257,20 @@ fn create_with_image_inner(
             }
         },
     };
-    match create_state(store, req) {
+    // 状態を作る間も delete の rootfs 後始末と排他する。ロックを取れなければ公開済みの rootfs は残し、参照だけ外す。
+    let guard = match early_guard {
+        Some(g) => g,
+        None => match lock_for_create(req.bundle()) {
+            Ok(g) => g,
+            Err(e) => {
+                rollback_image_ref(recorder, image, req);
+                return Err(e);
+            }
+        },
+    };
+    let created_state = create_state(store, req, image_rootfs);
+    drop(guard);
+    match created_state {
         Ok(record) => {
             // 参照を状態作成まで済んだものとして確定する。delete は確定済みの参照だけを外すので、状態作成前に止まった
             // create の参照を、既存の別の状態の delete が巻き込んで外す競合を防げる。失敗しても状態は
@@ -277,6 +346,11 @@ fn unpack_rootfs(
         unpacker.unpack(image.manifest(), &unpack_path)
     });
     if let Err(e) = unpacked {
+        remove_created_rootfs(recorder, created);
+        return Err(e);
+    }
+    // 公開前に所有トークンの印を書く（delete が作成世代を照合する。OCI-7・#2378）。失敗は公開前なので消す。
+    if let Err(e) = created.seal() {
         remove_created_rootfs(recorder, created);
         return Err(e);
     }
@@ -1071,6 +1145,22 @@ mod tests {
         assert_eq!(log_of(&log), vec!["refs.register", "refs.release"]);
     }
 
+    /// OCI-7・SEC-1（#2378）: 展開器なしの create も bundle の検証より前にロックを取る。delete が保持中なら、
+    /// rootfs が無い bundle でも検証（`NotFound`）へ進まず `FailedPrecondition` で拒否し、参照を外して状態は作らない
+    /// （検証の後にロックを取ると、その隙に delete が rootfs を消して完了し、rootfs の無い状態を作れてしまう）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_create_without_unpacker_locks_before_validation() {
+        let b = Bundle::new("oci7-lock-first");
+        b.write_config(&valid_config());
+        let _held = BundleLock::acquire(&b.dir).expect("hold the bundle lock");
+        let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
+        let err = run_with_image(&store, &refs, &OpRecorder::new(), &b).expect_err("locked");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(log_of(&log), vec!["refs.register", "refs.release"]);
+        assert_eq!(store.inner.len(), 0);
+    }
+
     /// OCI-7: 状態作成が AlreadyExists で失敗したら参照を外す。
     #[test]
     fn oci7_create_rolls_back_on_state_already_exists() {
@@ -1340,7 +1430,7 @@ mod tests {
     fn oci7_unpack_skipped_when_state_exists() {
         let b = config_bundle("unpack-stateexists");
         let (store, refs, log) = fixture(None, Ok(ImageRefRegistration::Registered), None);
-        create_state(&store.inner, &b.request("c1")).expect("pre-existing");
+        create_state(&store.inner, &b.request("c1"), None).expect("pre-existing");
         let unpacker = LoggingUnpacker::new(&log, UnpackMode::Ok);
         let err = run_unpacking(&store, &refs, &unpacker, &OpRecorder::new(), &b).expect_err("x");
         assert_eq!(err.code(), ErrorCode::AlreadyExists);

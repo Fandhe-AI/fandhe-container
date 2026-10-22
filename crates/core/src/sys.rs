@@ -116,6 +116,9 @@ pub(crate) use consts::{
 pub(crate) use consts::LANDLOCK_RESTRICT_SELF_LOG_NEW_EXEC_ON;
 // 診断ログの待たない送信（`send_nonblocking_unix`）の失敗分類に使う errno（`crate::exec::diagnostic`）。
 pub(crate) use consts::{EAGAIN, EPIPE};
+// rootfs 内の所有トークンの印を、リンク非追従・FIFO で止まらずに開く（`oci_runtime::image_rootfs`。#2378）。
+#[cfg(target_os = "linux")]
+pub(crate) use consts::O_NOFOLLOW;
 
 // # `open(2)` フラグのアーキテクチャ差（Codex P0 指摘〔aarch64 の値が誤り〕への確認記録）
 //
@@ -1675,6 +1678,27 @@ pub(crate) fn open_dir_path_nofollow(
     // O_CREAT / O_TMPFILE を含まないため可変長引数（mode）は渡さず、カーネルも読まない。
     // 成功時の戻り値は新規 fd で、直後に `OwnedFd` が唯一の所有者となる（二重 close なし）。
     let fd = unsafe { openat(dirfd, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(last_error());
+    }
+    // SAFETY: `fd` は上で成功した openat が返した、他に所有者のいない有効な fd。
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// 絶対パスまたは相対パス `path` を `O_PATH|O_DIRECTORY|O_CLOEXEC`（最終要素の symlink は辿る）で開く。
+///
+/// `O_DIRECTORY` により FIFO・デバイス等の非ディレクトリは open で `ENOTDIR` になり、読み出し側の
+/// 相手を待ってブロックしない（delete の bundle 差し替え対策。OCI-7・SEC-1）。`O_PATH` のため
+/// 読み書きには使えず、dirfd と `fstat` 専用。
+pub(crate) fn open_dir_path_follow(path: &CStr) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let flags = consts::O_PATH | consts::O_DIRECTORY | consts::O_CLOEXEC;
+    // SAFETY: `path` は借用した NUL 終端文字列で呼び出しの間生存する。dirfd は `AT_FDCWD`。flags に
+    // O_CREAT / O_TMPFILE を含まないため可変長引数（mode）は渡さない。成功時の戻り値は新規 fd で、
+    // 直後に `OwnedFd` が唯一の所有者となる。
+    let fd = unsafe { openat(AT_FDCWD, path.as_ptr(), flags) };
     if fd < 0 {
         return Err(last_error());
     }
@@ -3904,7 +3928,11 @@ pub(crate) fn reopen_pinned_read_nonblock(pinned: BorrowedFd<'_>) -> Result<Owne
         // 整数の書式化のため NUL は含まず実際には起こらない。起きても「対応外」とは分類しない（REPAIR-2）。
         .map_err(|_| SysError::Os(consts::EINVAL))?;
     // 絶対パスのため dirfd は無視される（`pinned` を渡しても解決に影響しない）。
-    open_follow_at(pinned, &path, consts::O_RDONLY | consts::O_NONBLOCK)
+    open_follow_at(
+        pinned,
+        &path,
+        consts::O_RDONLY | consts::O_NONBLOCK | consts::O_NOCTTY,
+    )
 }
 
 /// procfs の fd エントリ名 `thread-self/fd/<fd>` を、NUL 終端つきで `buf` に組み立てる（アロケーションなし）。

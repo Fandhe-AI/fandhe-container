@@ -78,6 +78,13 @@
 //!     （しないと restart 後の exec は `/` の照合で拒否される。fail-closed）。`get` / `list` で返す。plugin 実装も
 //!     同じく往復させる。ストアは中身の正しさを判定しない（型が検証済みの値しか作らせない）。記録が無い場合の
 //!     拒否は exec 側の責務
+//! 13. [`StateRecord::image_rootfs`]（core が `create_with_image` で作って公開した rootfs の記録。bundle 相対の
+//!     経路と作成時の実体の (dev, ino)。OCI-7・OCI-5・#2378）は、`create` で
+//!     [`CreateStateRequest::with_image_rootfs`] の指定があればその値、なければ `None` で記録する。`update` は
+//!     常に既存の値を引き継ぐ（作成後は変えない。supervisor の status 更新で消さないため）。`None` は
+//!     「core が作った rootfs ではない」（利用者が用意したもの）ことを表し、`oci_runtime::delete` は rootfs に
+//!     触れない。`Some` のときだけ delete が状態削除の成功後に消す。`get` / `list` で返す。plugin 実装も同じく
+//!     往復させる。値の形式は [`ImageRootfsRecord::new`] が検証する（設計は `docs/design/image-rootfs-lifetime.md`）
 //!
 //! メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 //! `ContainerRuntime`（TASK-4.1）と同じく dyn 互換（object safety）を保つ。
@@ -463,6 +470,114 @@ impl Annotations {
     }
 }
 
+/// 予約された展開先の名前の接頭辞（`oci_runtime::image_rootfs` の非公開の展開先。単一の真実源。#2378）。
+///
+/// 展開中の非公開の木は通常の rootfs として扱わないため、記録の経路にこの接頭辞の要素を許さない。
+pub(crate) const IMAGE_ROOTFS_STAGING_PREFIX: &str = ".fandhe-unpack-";
+
+/// 記録する bundle 相対経路の最大バイト数（Linux の `PATH_MAX` と同程度。無制限の確保を避ける）。
+const MAX_IMAGE_ROOTFS_PATH_BYTES: usize = 4096;
+
+/// core が `create_with_image` で作って公開した rootfs の記録（契約 13。OCI-7・OCI-5・#2378）。
+///
+/// delete が「core が作った rootfs だけを、作ったときと同じ実体であることを確かめて」消すための印で、
+/// 利用者が用意した rootfs には付かない。経路は bundle 相対で Normal 要素だけ（`..`・絶対パス・予約名を
+/// 含められない）ため、記録を改ざんされても bundle の外を指せない。
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ImageRootfsRecord {
+    relative_path: PathBuf,
+    dev: u64,
+    ino: u64,
+    /// 作成世代を区別する所有トークン（小文字 16 進 32 文字）。rootfs 内の印のファイルと照合する。
+    /// `None`（旧記録）の rootfs は delete が消さない（fail-closed。inode の再利用による誤削除を防ぐ）。
+    token: Option<String>,
+}
+
+impl ImageRootfsRecord {
+    /// bundle 相対の経路と、作成時の実体の (dev, ino) から作る。
+    ///
+    /// 経路は 1 要素以上の Normal 要素だけで、NUL・非 UTF-8・予約された展開先の接頭辞の要素・
+    /// 4096 バイト超を含められない。違反は [`ErrorCode::InvalidArgument`]。
+    pub fn new(relative_path: PathBuf, dev: u64, ino: u64) -> Result<Self, TraitError> {
+        let bad = |m: &'static str| TraitError::new(ErrorCode::InvalidArgument, m);
+        if relative_path.is_absolute() {
+            return Err(bad("image rootfs path must be relative"));
+        }
+        let mut count = 0usize;
+        for c in relative_path.components() {
+            let std::path::Component::Normal(part) = c else {
+                return Err(bad("image rootfs path must contain only normal components"));
+            };
+            let Some(text) = part.to_str() else {
+                return Err(bad("image rootfs path must be valid UTF-8"));
+            };
+            if text.contains('\0') {
+                return Err(bad("image rootfs path must not contain NUL"));
+            }
+            if text.starts_with(IMAGE_ROOTFS_STAGING_PREFIX) {
+                return Err(bad("image rootfs path must not use a reserved name"));
+            }
+            count += 1;
+        }
+        if count == 0 {
+            return Err(bad("image rootfs path must not be empty"));
+        }
+        if relative_path.as_os_str().len() > MAX_IMAGE_ROOTFS_PATH_BYTES {
+            return Err(bad("image rootfs path is too long"));
+        }
+        // `components()` は途中の `.` と重複した区切りを読み飛ばすので、検証した Normal 要素だけで組み直して
+        // 保持する（`a/./b` は `a/b` として記録・永続化する）。
+        let relative_path: PathBuf = relative_path.components().collect();
+        Ok(Self {
+            relative_path,
+            dev,
+            ino,
+            token: None,
+        })
+    }
+
+    /// 作成世代を区別する所有トークンを付ける（OCI-7・#2378。小文字 16 進 32 文字だけを受ける）。
+    ///
+    /// (dev, ino) だけでは、rootfs を手で消して同名のディレクトリを作り直したときの inode 再利用を
+    /// 区別できない。delete は rootfs 内の印のファイルの内容とこのトークンを照合し、不一致・欠落なら消さない。
+    pub fn with_token(mut self, token: String) -> Result<Self, TraitError> {
+        let ok = token.len() == 32
+            && token
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !ok {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "image rootfs token must be 32 lowercase hex digits",
+            ));
+        }
+        self.token = Some(token);
+        Ok(self)
+    }
+
+    /// 所有トークン（旧記録は `None`）。
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
+    /// bundle 相対の経路（Normal 要素だけ）。
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    /// 作成時の実体の (dev, ino)。
+    pub fn identity(&self) -> (u64, u64) {
+        (self.dev, self.ino)
+    }
+}
+
+/// 経路と ino をログに出さない（`RootIdentity` と同じ方針）。
+impl std::fmt::Debug for ImageRootfsRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageRootfsRecord").finish_non_exhaustive()
+    }
+}
 /// コンテナ状態のレコード（[`StateStore`] が保持・返却する単位）。
 ///
 /// 真偽値やフラットな文字列ではなく、将来の拡張に備えて構造化された型にする
@@ -488,6 +603,8 @@ pub struct StateRecord {
     rlimits: Option<Rlimits>,
     /// launch 時の分離の記録（契約 12。SUP-6・TASK-163 追補・#1468）。
     launch_isolation: Option<LaunchIsolationRecord>,
+    /// core が作った rootfs の記録（契約 13。OCI-7・OCI-5・#2378）。
+    image_rootfs: Option<ImageRootfsRecord>,
 }
 
 impl StateRecord {
@@ -518,7 +635,20 @@ impl StateRecord {
             annotations: Annotations::default(),
             rlimits: None,
             launch_isolation: None,
+            image_rootfs: None,
         })
+    }
+
+    /// core が作った rootfs の記録を設定する（[`Self::image_rootfs`]）。ストア実装が create・update・読み込みで使う。
+    #[must_use]
+    pub fn with_image_rootfs(mut self, image_rootfs: ImageRootfsRecord) -> Self {
+        self.image_rootfs = Some(image_rootfs);
+        self
+    }
+
+    /// core が作った rootfs の記録を返す（契約 13）。`None` は利用者が用意した rootfs（delete は触れない）。
+    pub fn image_rootfs(&self) -> Option<&ImageRootfsRecord> {
+        self.image_rootfs.as_ref()
     }
 
     /// launch 時の分離の記録を設定する（[`Self::launch_isolation`]）。ストア実装が create・update・読み込みで使う。
@@ -643,6 +773,7 @@ pub struct CreateStateRequest {
     annotations: Option<Annotations>,
     rlimits: Option<Rlimits>,
     launch_isolation: Option<LaunchIsolationRecord>,
+    image_rootfs: Option<ImageRootfsRecord>,
 }
 
 impl CreateStateRequest {
@@ -664,7 +795,20 @@ impl CreateStateRequest {
             annotations: None,
             rlimits: None,
             launch_isolation: None,
+            image_rootfs: None,
         })
+    }
+
+    /// 記録する「core が作った rootfs」を指定する（OCI-7・OCI-5・#2378。契約 13）。未指定なら記録しない。
+    #[must_use]
+    pub fn with_image_rootfs(mut self, image_rootfs: ImageRootfsRecord) -> Self {
+        self.image_rootfs = Some(image_rootfs);
+        self
+    }
+
+    /// 指定された「core が作った rootfs」の記録を返す（未指定なら `None`）。
+    pub fn image_rootfs(&self) -> Option<&ImageRootfsRecord> {
+        self.image_rootfs.as_ref()
     }
 
     /// 記録する launch 時の分離（`/` の同一性と Landlock ルール）を指定する（SUP-6・TASK-163 追補・#1468。
@@ -1122,6 +1266,10 @@ mod tests {
             if let Some(l) = req.launch_isolation() {
                 record = record.with_launch_isolation(l.clone());
             }
+            // 契約 13: core が作った rootfs の記録は指定があればその値、なければ記録しない。
+            if let Some(r) = req.image_rootfs() {
+                record = record.with_image_rootfs(r.clone());
+            }
             records.insert(req.id().clone(), record.clone());
             Ok(record)
         }
@@ -1167,6 +1315,10 @@ mod tests {
             // 契約 12: launch 時の分離の記録は指定があれば置き換え、なければ引き継ぐ。
             if let Some(l) = req.launch_isolation().or(current.launch_isolation()) {
                 updated = updated.with_launch_isolation(l.clone());
+            }
+            // 契約 13: core が作った rootfs の記録は update で変えずに引き継ぐ。
+            if let Some(r) = current.image_rootfs() {
+                updated = updated.with_image_rootfs(r.clone());
             }
             records.insert(req.id().clone(), updated.clone());
             Ok(updated)

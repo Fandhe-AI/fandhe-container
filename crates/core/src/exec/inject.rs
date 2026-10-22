@@ -46,6 +46,7 @@
 //! `mount(2)` 系・`mount_setattr(2)`・`umount2(2)` は `cfg(test)` では dry-run に差し替わる。このとき実 tmpfs が無いため、
 //! ファイルは一時ディレクトリ配下（rootfs の代わり）へ作られる（単体テスト限定の挙動）。実機での挙動は結合試験
 //! `tests/inject_files.rs`（`-- --ignored`）で確認する。
+//! tmpfs マウントの失敗は `tmpfs::tests::MOUNT_FAIL` で注入できる（#2248・#2398。SEC-2・REPAIR-12）。
 
 use std::ffi::{CString, OsStr};
 use std::io::Write as _;
@@ -346,7 +347,7 @@ fn read_only_syscall(tmpfs_root: BorrowedFd<'_>) -> Result<(), SysError> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tmpfs::tests::{Tmp, take_calls, take_umounts};
+    use super::super::tmpfs::tests::{MOUNT_FAIL, Tmp, UMOUNT_FAIL, take_calls, take_umounts};
     use super::*;
     use crate::injected_files::{InjectedContent, InjectedFileMode, InjectedFileSpec};
     use std::os::unix::fs::{MetadataExt as _, symlink};
@@ -391,6 +392,8 @@ mod tests {
         let _ = (take_calls(), take_umounts(), take_read_only_calls());
         FORCE_RW.with(|c| c.set(false));
         READ_ONLY_FAIL.with(|c| c.set(None));
+        MOUNT_FAIL.with(|f| f.set(None));
+        UMOUNT_FAIL.with(|f| f.set(None));
     }
 
     /// SUP-12・TASK-169.4.2・#1620: ディレクトリごとに rw マウント → 書き込み → `mount_setattr` で ro にし、
@@ -695,11 +698,11 @@ mod tests {
         let tmp = Tmp::new("inject-rbfail");
         reset();
         FORCE_RW.with(|c| c.set(true));
-        super::super::tmpfs::tests::UMOUNT_FAIL.with(|f| f.set(Some(SysError::Os(sys::EPERM))));
+        UMOUNT_FAIL.with(|f| f.set(Some(SysError::Os(sys::EPERM))));
         let fd = tmp.fd();
         let err = inject_files_at(fd.as_fd(), &set(&[("/run/s/f", "x", 0o444)]), &not_shared)
             .expect_err("rw");
-        super::super::tmpfs::tests::UMOUNT_FAIL.with(|f| f.set(None));
+        UMOUNT_FAIL.with(|f| f.set(None));
         FORCE_RW.with(|c| c.set(false));
         assert_eq!(err.code, ErrorCode::FailedPrecondition);
         assert_eq!(err.stage, IsolationStage::InjectFiles);
@@ -707,5 +710,124 @@ mod tests {
             err.message,
             "the mount at /run/s is not read-only after mount_setattr; cleanup failed: umount2(/run/s) failed: Operation not permitted (os error 1)"
         );
+    }
+
+    /// SEC-2・REPAIR-12・SUP-12・#2398（#2248 の注入口）: 1 件目の tmpfs マウントが失敗したら、
+    /// `apply_group` の実際の経路で段が InjectFiles・code が permission_denied になり、内容は書かれず、
+    /// 自分で作ったディレクトリは逆順に消える。注入は 1 回だけ効く。
+    #[test]
+    fn sec2_repair12_2398_inject_mount_failure_removes_created_dirs() {
+        let tmp = Tmp::new("inject-mountfail");
+        reset();
+        let fd = tmp.fd();
+        let s = set(&[("/run/s/f", SENTINEL, 0o444)]);
+        MOUNT_FAIL.with(|f| f.set(Some(SysError::Os(sys::EPERM))));
+        let err = inject_files_at(fd.as_fd(), &s, &not_shared).expect_err("mount fails");
+        MOUNT_FAIL.with(|f| f.set(None));
+        assert_eq!(err.stage, IsolationStage::InjectFiles);
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert!(err.violation.is_none());
+        assert_eq!(
+            err.message,
+            "mount(tmpfs on /run/s) failed: Operation not permitted (os error 1)"
+        );
+        assert!(!err.message.contains(SENTINEL));
+        assert!(take_calls().is_empty());
+        assert!(take_read_only_calls().is_empty());
+        assert!(take_umounts().is_empty());
+        assert!(!tmp.0.join("run/s/f").exists());
+        assert!(!tmp.0.join("run").exists());
+        // 注入は 1 回で消えるので、同じ set の再実行は成功する。
+        inject_files_at(fd.as_fd(), &s, &not_shared).expect("second run succeeds");
+        assert_eq!(take_calls().len(), 1);
+    }
+
+    /// SEC-2・REPAIR-12・SUP-12・#2398: 2 件目のマウントが失敗したら、先にマウントした tmpfs を外し、
+    /// 失敗したグループが作ったディレクトリを消す。先のグループのディレクトリが残るかは dry-run 固有
+    /// （実 tmpfs が無く、書いたファイルが残って rmdir が ENOTEMPTY になる）なので確かめない。
+    #[test]
+    fn sec2_repair12_2398_inject_mount_failure_rolls_back_earlier_mounts() {
+        let tmp = Tmp::new("inject-mountfail2");
+        reset();
+        let fd = tmp.fd();
+        let s = set(&[("/scratch/a/f", "x", 0o444), ("/run/b/f", SENTINEL, 0o444)]);
+        let seen = std::cell::Cell::new(0usize);
+        let hook = |_: &OwnedFd| -> Result<bool, ExecError> {
+            seen.set(seen.get() + 1);
+            if seen.get() == 2 {
+                MOUNT_FAIL.with(|f| f.set(Some(SysError::Os(sys::EPERM))));
+            }
+            Ok(false)
+        };
+        let err = inject_files_at(fd.as_fd(), &s, &hook).expect_err("second mount fails");
+        MOUNT_FAIL.with(|f| f.set(None));
+        assert_eq!(err.stage, IsolationStage::InjectFiles);
+        assert_eq!(err.code, ErrorCode::PermissionDenied);
+        assert!(err.violation.is_none());
+        assert_eq!(
+            err.message,
+            "mount(tmpfs on /run/b) failed: Operation not permitted (os error 1)"
+        );
+        assert!(!err.message.contains(SENTINEL));
+        let a = tmp.0.join("scratch/a").to_string_lossy().into_owned();
+        let calls = take_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].0.ends_with("scratch/a"), "{calls:?}");
+        let ro = take_read_only_calls();
+        assert_eq!(ro.len(), 1);
+        assert!(ro[0].0.ends_with("scratch/a"), "{ro:?}");
+        assert_eq!(take_umounts(), vec![a]);
+        assert!(!tmp.0.join("run").exists());
+    }
+
+    /// SEC-2・REPAIR-12・SUP-12・#2398: マウント失敗でも、もとからあった空ディレクトリは消さない。
+    #[test]
+    fn sec2_repair12_2398_inject_mount_failure_keeps_existing_directory() {
+        let tmp = Tmp::new("inject-mountfail3");
+        reset();
+        std::fs::create_dir_all(tmp.0.join("run/secrets")).expect("pre");
+        let fd = tmp.fd();
+        MOUNT_FAIL.with(|f| f.set(Some(SysError::Os(sys::EPERM))));
+        let err = inject_files_at(
+            fd.as_fd(),
+            &set(&[("/run/secrets/a", "x", 0o444)]),
+            &not_shared,
+        )
+        .expect_err("mount fails");
+        MOUNT_FAIL.with(|f| f.set(None));
+        assert_eq!(err.stage, IsolationStage::InjectFiles);
+        assert!(tmp.0.join("run/secrets").is_dir());
+        assert_eq!(
+            std::fs::read_dir(tmp.0.join("run/secrets"))
+                .expect("dir")
+                .count(),
+            0
+        );
+        assert!(take_umounts().is_empty());
+    }
+
+    /// SEC-2・REPAIR-12・SUP-12・#2398: 新マウント API が無いカーネルは実際の経路でも `unimplemented` になり、
+    /// 作成したディレクトリは消える。
+    #[test]
+    fn sup12_sec2_2398_inject_mount_unsupported_is_unimplemented() {
+        let tmp = Tmp::new("inject-mountfail4");
+        reset();
+        let fd = tmp.fd();
+        MOUNT_FAIL.with(|f| f.set(Some(SysError::Unsupported)));
+        let err = inject_files_at(
+            fd.as_fd(),
+            &set(&[("/run/s/f", SENTINEL, 0o444)]),
+            &not_shared,
+        )
+        .expect_err("unsupported");
+        MOUNT_FAIL.with(|f| f.set(None));
+        assert_eq!(err.code, ErrorCode::Unimplemented);
+        assert_eq!(err.stage, IsolationStage::InjectFiles);
+        assert_eq!(
+            err.message,
+            "tmpfs mount requires the new mount API (fsopen, fsconfig, fsmount, move_mount; Linux 5.2 or later)"
+        );
+        assert!(take_calls().is_empty());
+        assert!(!tmp.0.join("run").exists());
     }
 }

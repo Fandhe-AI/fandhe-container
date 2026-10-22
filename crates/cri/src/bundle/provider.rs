@@ -74,12 +74,14 @@ impl SpecBundleProvider {
         #[cfg(not(unix))]
         {
             let _ = (&root, &rootfs);
-            return Err(CriError::unimplemented(
+            Err(CriError::unimplemented(
                 "bundle generation is not supported on this platform",
-            ));
+            ))
         }
         #[cfg(unix)]
-        Self::new_unix(root, rootfs)
+        {
+            Self::new_unix(root, rootfs)
+        }
     }
 
     #[cfg(unix)]

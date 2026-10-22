@@ -1638,6 +1638,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&b);
     }
 
+    /// `mkfifo` の終了待ちの期限（REPAIR-5）。
+    #[cfg(target_os = "linux")]
+    const MKFIFO_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// `mkfifo(1)` で FIFO を作る（std・`sys` に FIFO を作る手段が無いため、テストに限り外部コマンドを使う）。
+    /// 終了を期限つきで待ち、超過したら kill して回収してから失敗させる（REPAIR-5。無期限に待たない）。
+    /// 起動失敗・失敗終了・期限超過はすべてテスト失敗にする（skip で成功扱いにしない）。
+    #[cfg(target_os = "linux")]
+    fn make_fifo(path: &Path) {
+        let mut child = std::process::Command::new("mkfifo")
+            .arg(path)
+            .spawn()
+            .expect("mkfifo must be runnable to verify FIFO handling");
+        let start = std::time::Instant::now();
+        loop {
+            match child.try_wait().expect("failed to poll mkfifo") {
+                Some(status) => {
+                    assert!(status.success(), "mkfifo failed: {status}");
+                    return;
+                }
+                None if start.elapsed() > MKFIFO_DEADLINE => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("mkfifo did not finish within {MKFIFO_DEADLINE:?}");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        }
+    }
+
     /// SEC-1・OCI-7: 所有印が FIFO に差し替えられても open せず（ブロックせず）拒否する。
     #[cfg(target_os = "linux")]
     #[test]
@@ -1647,11 +1677,7 @@ mod tests {
         let root = b.join("rootfs");
         let marker = root.join(super::OWNER_TOKEN_FILE);
         std::fs::remove_file(&marker).expect("rm marker");
-        let st = std::process::Command::new("mkfifo")
-            .arg(&marker)
-            .status()
-            .expect("mkfifo");
-        assert!(st.success());
+        make_fifo(&marker);
         let (tx, rx) = std::sync::mpsc::channel();
         let b2 = b.clone();
         std::thread::spawn(move || {
@@ -1671,11 +1697,7 @@ mod tests {
     fn sec1_remove_recorded_rootfs_fifo_bundle_does_not_block() {
         let b = tmp("fifo-bundle");
         let fifo = b.join("fifo");
-        let st = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .expect("mkfifo");
-        assert!(st.success());
+        make_fifo(&fifo);
         let rec = published_record(&b, "rootfs");
         let (tx, rx) = std::sync::mpsc::channel();
         let f = fifo.clone();

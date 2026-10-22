@@ -149,6 +149,59 @@ pub fn remove(root: &Path, id: &ContainerId) -> Result<RemovedLogs, TraitError> 
     }
 }
 
+/// ログ削除を待つ既定の上限。ローカル FS の小さなファイル数個（世代数 × 3 MiB 以下）の unlink には十分長く、
+/// I/O 停止（NFS ハング等）でも呼び出し元が秒単位で戻れる値にする（REPAIR-5）。
+pub const SUPERVISOR_LOG_REMOVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// ログ削除を期限つきで試した結果（REPAIR-5）。
+#[derive(Debug, PartialEq, Eq)]
+pub enum LogRemoval {
+    /// 期限内に終わった（削除自体の成否は問わない。best effort）。
+    Finished,
+    /// 期限内に終わらなかった。作業スレッドは I/O で止まったまま残る。
+    TimedOut,
+}
+
+/// `job` を作業スレッドで実行し、`timeout` までだけ待つ。呼び出し元スレッドは削除 I/O で止まらない。
+///
+/// 期限切れのとき作業スレッドは join せず残す（止まった I/O を中断する手段は無く、待てば呼び出し元が無期限に戻らなく
+/// なるため）。スレッドを起動できなかった場合は削除を諦めて `Finished` 扱いにする（同期実行へ退避しない。ブロックし得るため）。
+/// CLI の `delete` の警告出力の期限（`emit_warning_bounded`）も同じ仕組みを使う（#2434 で CLI から移設）。
+pub fn run_log_removal_bounded(
+    job: impl FnOnce() + Send + 'static,
+    timeout: std::time::Duration,
+) -> LogRemoval {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("supervisor-log-remove".to_string())
+        .spawn(move || {
+            job();
+            let _ = tx.send(());
+        });
+    if spawned.is_err() {
+        return LogRemoval::Finished;
+    }
+    match rx.recv_timeout(timeout) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => LogRemoval::TimedOut,
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => LogRemoval::Finished,
+    }
+}
+
+/// core の `delete` が成功した後に、`id` の supervisor ログを best effort で期限つきに消す（#2067・#2434・REPAIR-4・REPAIR-5）。
+///
+/// 失敗は握る（delete の結果は変えない）。期限切れなら [`LogRemoval::TimedOut`] を返すので、警告を出すかは呼び出し側が決める
+/// （CLI は stderr に 1 行の JSON、plugin-cri は構造化ログ）。core の `delete` より前には呼ばない（失敗時に稼働中のログを消さないため）。
+pub fn remove_bounded(root: &Path, id: &ContainerId, timeout: std::time::Duration) -> LogRemoval {
+    let root = root.to_path_buf();
+    let id = id.clone();
+    run_log_removal_bounded(
+        move || {
+            let _ = remove(&root, &id);
+        },
+        timeout,
+    )
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::fs;

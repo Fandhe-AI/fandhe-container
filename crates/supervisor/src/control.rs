@@ -53,6 +53,54 @@ pub mod server;
 
 pub use client::ControlSignaler;
 
+/// 状態ルートを公開しないストア用の fail-closed の signaler。常に `Unimplemented` で失敗する（REPAIR-3）。
+///
+/// [`production_signaler`]・[`production_stop_signaler`] が `host_state_root()` の無いストアに対してだけ返す。
+/// 送らないことで `state.json` の pid への縮退を防ぐ（SEC-1・CORE-1）。
+pub struct UnavailableSignaler;
+
+impl fandhe_container_core::oci_runtime::ProcessSignaler for UnavailableSignaler {
+    fn signal(
+        &self,
+        _id: &fandhe_container_core::traits::ContainerId,
+        _pid: std::num::NonZeroU32,
+        _signal: fandhe_container_core::traits::Signal,
+        _deadline: std::time::Instant,
+    ) -> Result<(), fandhe_container_core::traits::TraitError> {
+        Err(fandhe_container_core::traits::TraitError::new(
+            fandhe_container_core::traits::ErrorCode::Unimplemented,
+            "process signaler is not available yet",
+        ))
+    }
+}
+
+/// 本番の signaler（stop の意図を記録させない版。`kill` 用。#2059・#1902。CLI-1・SEC-1・CORE-1）。
+///
+/// CLI の `kill` 系の注入点と plugin-cri の `kill` が呼ぶ。`<host_state_root>/<id>/supervisor.sock` の supervisor へ依頼する
+/// [`ControlSignaler`] を返し、到達できなければ構造化エラーで失敗する。`state.json` の pid へ `kill(2)` する縮退は持たない。
+/// ルートに `host_state_root()` を使うのは、supervisor のログルートと揃い、cfg を呼び出し側に持ち込まないため。
+/// supervisor の bind 側（`args.root`）との違いは親の symlink の解決だけで、`<root>/<id>` は同じディレクトリを指す。
+pub fn production_signaler(
+    store: &dyn fandhe_container_core::traits::StateStore,
+) -> std::sync::Arc<dyn fandhe_container_core::oci_runtime::ProcessSignaler> {
+    match store.host_state_root() {
+        Some(root) => std::sync::Arc::new(ControlSignaler::new(root.to_path_buf())),
+        None => std::sync::Arc::new(UnavailableSignaler),
+    }
+}
+
+/// 本番の `stop` 用 signaler（SUP-9・#2162）。[`production_signaler`] と同じ到達先・縮退なしの規則だが、
+/// `ControlSignaler::for_stop` で StopRequest を送り、supervisor に明示 stop の意図を記録させてから SIGTERM を渡す。
+/// 意図を記録できない supervisor（書き先なし・古い版）には送らず、構造化エラーで失敗する（fail-closed）。
+pub fn production_stop_signaler(
+    store: &dyn fandhe_container_core::traits::StateStore,
+) -> std::sync::Arc<dyn fandhe_container_core::oci_runtime::ProcessSignaler> {
+    match store.host_state_root() {
+        Some(root) => std::sync::Arc::new(ControlSignaler::for_stop(root.to_path_buf())),
+        None => std::sync::Arc::new(UnavailableSignaler),
+    }
+}
+
 /// 構造化ログを stderr に 1 行出す（値は固定語彙だけ。入力値・uid・パス・errno は載せない。REPAIR-4）。
 ///
 /// 待たない出力経路（`stderr_sink`）へ渡すだけで、キューが満杯なら捨てる（REPAIR-5）。

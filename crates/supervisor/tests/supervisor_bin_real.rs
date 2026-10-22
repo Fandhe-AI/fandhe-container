@@ -746,12 +746,7 @@ mod linux {
         let placement = rec.cgroup().expect("the scope stays recorded");
         let scope_dir = PathBuf::from("/sys/fs/cgroup")
             .join(placement.scope().as_str().trim_start_matches('/'));
-        let leftover = std::fs::read_dir(&scope_dir)
-            .map(|d| {
-                d.flatten()
-                    .any(|e| e.file_name().to_string_lossy().contains(&id))
-            })
-            .unwrap_or(false);
+        let leftover = container_cgroup_leftover(&scope_dir, &id);
         assert!(!leftover, "the container cgroup must be removed");
         println!("supervisor_bin_real: scenario=B ok code={}", code.as_str());
     }
@@ -926,15 +921,23 @@ mod linux {
         assert_eq!(again.result, "NOT_FOUND", "second delete");
         let scope_dir = PathBuf::from("/sys/fs/cgroup")
             .join(placement.scope().as_str().trim_start_matches('/'));
-        let leftover = std::fs::read_dir(&scope_dir)
-            .map(|d| {
-                d.flatten()
-                    .any(|e| e.file_name().to_string_lossy().contains(&id))
-            })
-            .unwrap_or(false);
+        let leftover = container_cgroup_leftover(&scope_dir, &id);
         assert!(!leftover, "the container cgroup must be removed");
         println!(
             "supervisor_bin_real: scenario=D ok pid={pid} (stopped delete succeeded; second delete NOT_FOUND)"
         );
+    }
+
+    /// スコープ配下に `id` を含む子 cgroup が残っているかを返す。
+    /// スコープ自体が無い（`NotFound`）場合は「残っていない」と明示して扱い、
+    /// それ以外の読み取り失敗は握りつぶさず panic させる（検証が空振りしないようにする）。
+    fn container_cgroup_leftover(scope_dir: &std::path::Path, id: &str) -> bool {
+        match std::fs::read_dir(scope_dir) {
+            Ok(d) => d
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains(id)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => panic!("cannot inspect scope dir {}: {e}", scope_dir.display()),
+        }
     }
 }

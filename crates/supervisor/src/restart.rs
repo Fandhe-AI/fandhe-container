@@ -1038,6 +1038,14 @@ pub fn supervise_with_restart(
             if reason == NoRestartReason::ExplicitStop && explicit_requested(stop) {
                 return Ok(finish_explicit_stop(state, last, restarts, obs));
             }
+            // 再起動せずに終える最終判定: 受付を閉じ、閉じた時点で受理済みの取消（上の intent 読取の後に届いたもの）は
+            // 必ず記録へ渡す。以後の取消は拒否される（受理して記録しない経路を作らない。SUP-9・契約 14・#2440）。
+            if reason != NoRestartReason::ExplicitStop
+                && stop.close_explicit_stop() == crate::run::ExplicitStopState::Requested
+                && !stop.is_stop_requested()
+            {
+                return Ok(finish_explicit_stop(state, last, restarts, obs));
+            }
             return Ok(SuperviseOutcome::Finished {
                 last,
                 reason,
@@ -2272,6 +2280,30 @@ mod tests {
         assert_eq!(g.restart_count(), 0);
         assert_eq!(g.status().state(), ContainerState::Stopped);
         assert_eq!(g.status().exit_code(), Some(143));
+    }
+
+    /// SUP-9・契約 14・#2440: 再起動なしで終わる最終判定は受付を閉じる。以後の取消は意図を立てられず（`Closed`）、
+    /// 受理して記録しない経路が残らない。
+    #[test]
+    fn sup9_policy_no_finish_closes_explicit_stop_acceptance() {
+        let st = store(0, 42);
+        let q = Arc::new(Queue::new(&[(43, FAIL)]));
+        let obs = Events::default();
+        let stop = StopToken::new();
+        let out = run(&st, "no", FAIL, &q, &stop, &obs);
+        let SuperviseOutcome::Finished { reason, .. } = out else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(reason, NoRestartReason::PolicyNo);
+        assert_eq!(
+            stop.mark_explicit_stop(),
+            crate::run::ExplicitStopRecord::Closed
+        );
+        assert_eq!(
+            stop.explicit_stop_state(),
+            crate::run::ExplicitStopState::NotRequested
+        );
+        assert_eq!(obs.count(MonitorOperation::RecordExplicitStop), 0);
     }
 
     /// SUP-9・SUP-3・#2440: 稼働中の stop 相当（意図を立ててから終了）は、再起動せず「明示 stop 済み」を

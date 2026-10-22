@@ -175,7 +175,10 @@ impl SignalSlot {
             SlotState::Empty => ControlReason::NoHandle,
             SlotState::Active { .. } => ControlReason::ContainerRunning,
             SlotState::Exited { .. } => {
-                token.mark_explicit_stop();
+                // 受付が閉じていたら（restart ループが再起動なしで終わる最終判定を済ませた）成功にしない。
+                if token.mark_explicit_stop() == ExplicitStopRecord::Closed {
+                    return ControlReason::ContainerExited;
+                }
                 #[cfg(target_os = "linux")]
                 super::log_control_event("restart_cancel_recorded", None);
                 ControlReason::Ok

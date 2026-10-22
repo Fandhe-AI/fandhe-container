@@ -43,6 +43,11 @@
 //! bridge 作成要求が
 //! 送信後の応答エラー（`ResourceExhausted` 等）で失敗した場合は作成済みの可能性があるため
 //! `ResourceState::Unknown` で報告する（確定的な拒否のみ空報告）。
+//! 取り残しは `NetworkCreateError::reclaim_claim` の請求書（[`FailedCreateClaim`]）で `reclaim_failed_create`
+//! （Linux のみ。#2467）から回収できる。請求書のトークンで証明できるのは、トークンを刻んだ後の失敗
+//! （`AddAddress` / `SetUp` / `CreateNftTable`）で残った bridge と nft テーブルだけで、刻む前の失敗
+//! （`CreateBridge` の結果不明・`ResolveIndex`・`SetOwnerToken`）で残った bridge は別名が空のため
+//! 回収側が `Unknown` のまま触れない（手動回収）。
 //! 自分が作ったと確定した bridge のみ削除する（address は bridge と一緒に消える）。作成結果が
 //! 不明（`Timeout` / `DataLoss`）なリソースは fail-closed で削除せず、[`RollbackReport::leftover`]
 //! に `ResourceState::Unknown` として報告する。nft バッチは all-or-nothing なので `Aborted` /
@@ -112,6 +117,8 @@ use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 pub use delete::delete_network;
+#[cfg(target_os = "linux")]
+pub use delete::reclaim_failed_create;
 pub use delete::{DeleteResource, DeleteStep, NetworkDeleteError, NetworkDeleteReport};
 pub(crate) use ipam::NetnsDirRecord;
 pub use ipam::StaticIpam;
@@ -412,6 +419,91 @@ pub struct NetworkCreateError {
     pub step: CreateStep,
     /// ロールバックの結果。
     pub rollback: RollbackReport,
+    /// この作成が発行した所有トークンとネットワーク名（名前の導出に失敗した場合は未発行で `None`）。
+    /// 回収用の請求書（[`FailedCreateClaim`]）の元になるためだけに保持し、公開しない（#2467）。
+    /// `Err` の型を大きくしないため Box にする。
+    owner_token: Option<Box<(NetworkName, String)>>,
+}
+
+/// 作成失敗で取り残した資源を回収するための請求書（NET-1・#2467）。
+///
+/// 作成が失敗して `NetworkCreateError::rollback` の `leftover` が残ったとき、その資源が「この作成が
+/// 作ったもの」だと後から証明するための所有トークンを、ネットワーク名と取り残した資源の種類と一緒に持つ。
+/// 外部入力から作れない（フィールド非公開・構築口は `NetworkCreateError::reclaim_claim` と
+/// [`FailedCreateClaim::from_created`] だけ）。トークンを返すアクセサも置かない。回収は
+/// `network::reclaim_failed_create`（Linux のみ）が、名前の再導出とトークンの完全一致を確かめてから行う。
+/// plugin-cri の netsetup が作成失敗の回収待ちの記録に保持し、削除要求で回収に使う。
+/// プロセスをまたぐ永続化は未実装（REPAIR-3）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FailedCreateClaim {
+    network: NetworkName,
+    token: String,
+    bridge: bool,
+    table: bool,
+}
+
+impl FailedCreateClaim {
+    /// 作成には成功したが、後続の処理（IPAM 等）の失敗でネットワークごと戻したい場合の請求書
+    /// （bridge・テーブルの両方を対象にする）。
+    pub fn from_created(created: &CreatedNetwork) -> Self {
+        Self {
+            network: created.name.clone(),
+            token: created.bridge_token.clone(),
+            bridge: true,
+            table: true,
+        }
+    }
+
+    /// 対象のネットワーク名。
+    pub fn network(&self) -> &NetworkName {
+        &self.network
+    }
+
+    /// bridge を回収対象に含むか。
+    pub fn includes_bridge(&self) -> bool {
+        self.bridge
+    }
+
+    /// nft テーブルを回収対象に含むか。
+    pub fn includes_table(&self) -> bool {
+        self.table
+    }
+
+    /// 回収側（`delete.rs`）が所有の証明に使うトークン。
+    pub(crate) fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// テスト用の組み立て（別ネットワークのトークン等の不正な請求書を作る）。
+    #[cfg(test)]
+    pub(crate) fn for_test(network: NetworkName, token: &str, bridge: bool, table: bool) -> Self {
+        Self {
+            network,
+            token: token.to_owned(),
+            bridge,
+            table,
+        }
+    }
+}
+
+impl NetworkCreateError {
+    /// 取り残した資源（`rollback.leftover`）の回収用の請求書。取り残しが無い、またはトークン未発行
+    /// （名前の導出に失敗）なら `None`。請求書に載るのは取り残しとして報告された資源の種類だけで、
+    /// 他者の同名資源との衝突（`AlreadyExists`）で作れなかった資源は含まれない。
+    pub fn reclaim_claim(&self) -> Option<FailedCreateClaim> {
+        let (network, token) = &**self.owner_token.as_ref()?;
+        let has =
+            |f: fn(&NetworkResource) -> bool| self.rollback.leftover.iter().any(|(r, _)| f(r));
+        let bridge = has(|r| matches!(r, NetworkResource::Bridge(_)));
+        let table = has(|r| matches!(r, NetworkResource::NftTable(_)));
+        (bridge || table).then(|| FailedCreateClaim {
+            network: network.clone(),
+            token: token.clone(),
+            bridge,
+            table,
+        })
+    }
 }
 
 impl NetworkCreateError {
@@ -617,20 +709,27 @@ pub(crate) fn create_network_with(
     ops: &impl NetworkOps,
     spec: &NetworkCreateSpec,
 ) -> Result<CreatedNetwork, NetworkCreateError> {
+    // 所有トークンは名前の導出より前に発行し、DeriveNames 以外の全失敗経路で回収用の請求書
+    // （`NetworkCreateError::reclaim_claim`。#2467）へ引き継ぐ。
+    let token = ownership_token(spec.name());
     let fail = |error, step, rollback| NetworkCreateError {
         error,
         step,
         rollback,
+        owner_token: Some(Box::new((spec.name().clone(), token.clone()))),
     };
-    let names = NetworkResourceNames::derive(spec.name())
-        .map_err(|e| fail(e, CreateStep::DeriveNames, RollbackReport::default()))?;
+    let names = NetworkResourceNames::derive(spec.name()).map_err(|error| NetworkCreateError {
+        error,
+        step: CreateStep::DeriveNames,
+        rollback: RollbackReport::default(),
+        owner_token: None,
+    })?;
     let bridge = names.bridge().clone();
     let table = names.table().clone();
 
     // 1. bridge 作成。カーネルは作成時の IFLA_IFALIAS を反映しないため、この要求では所有を刻まない。
     // AlreadyExists は他者のリソースなので削除しない。確定的な拒否以外（送信後の応答エラー等）は
     // 作成済みの可能性があるため Unknown で報告する。
-    let token = ownership_token(spec.name());
     if let Err(e) = ops.create_bridge(&bridge) {
         let mut report = RollbackReport::default();
         if !is_definitely_rejected(e.code()) {
@@ -2124,6 +2223,69 @@ mod tests {
         assert!(!token_names_network("fandhe-net:db:1:0:0", &web));
         assert!(!token_names_network("fandhe-net:web", &web));
         assert!(!token_names_network("other:web:1:0:0", &web));
+    }
+
+    /// NET-1・#2467: 作成失敗の請求書は、失敗手順と取り残しの種類に応じた値になり、
+    /// トークンは bridge に刻んだものと一致する。
+    #[test]
+    fn net1_reclaim_claim_follows_leftover() {
+        // 取り残しなし（rollback 成功）・名前の導出失敗相当でない成功は None。
+        let f = Fake {
+            fail_up: true,
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(e.reclaim_claim(), None);
+
+        // SetUp 失敗＋bridge 削除失敗: bridge のみ。トークンは bridge の別名と一致する。
+        let f = Fake {
+            fail_up: true,
+            fail_delete: true,
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        let claim = e.reclaim_claim().unwrap();
+        assert_eq!(claim.network(), &nname("web"));
+        assert!(claim.includes_bridge() && !claim.includes_table());
+        let alias = f.kernel.borrow().clone().unwrap().1.unwrap();
+        assert_eq!(claim.token(), alias);
+
+        // nft 結果不明: テーブルのみ（bridge は rollback 済み）。
+        let f = Fake {
+            fail_nft: Some((NetErrorCode::Timeout, NftBatchOutcome::Unknown)),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        let claim = e.reclaim_claim().unwrap();
+        assert!(!claim.includes_bridge() && claim.includes_table());
+
+        // nft 結果不明＋bridge 削除失敗: 両方。
+        let f = Fake {
+            fail_nft: Some((NetErrorCode::Timeout, NftBatchOutcome::Unknown)),
+            fail_delete: true,
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        let claim = e.reclaim_claim().unwrap();
+        assert!(claim.includes_bridge() && claim.includes_table());
+
+        // 他者の同名 bridge との衝突は取り残しなしで None。
+        let f = Fake {
+            fail_bridge: Some(NetErrorCode::AlreadyExists),
+            ..Default::default()
+        };
+        let e = create_network_with(&f, &spec("web")).unwrap_err();
+        assert_eq!(e.reclaim_claim(), None);
+    }
+
+    /// NET-1・#2467: `from_created` は bridge・テーブルの両方を、作成結果のトークンで対象にする。
+    #[test]
+    fn net1_claim_from_created_covers_both() {
+        let c = create_network_with(&Fake::default(), &spec("web")).unwrap();
+        let claim = FailedCreateClaim::from_created(&c);
+        assert_eq!(claim.network(), &nname("web"));
+        assert_eq!(claim.token(), c.bridge_token);
+        assert!(claim.includes_bridge() && claim.includes_table());
     }
 
     /// NET-1: bridge 作成の Timeout は fail-closed（削除せず Unknown で報告）。

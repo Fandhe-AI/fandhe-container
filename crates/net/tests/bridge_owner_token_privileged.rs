@@ -17,7 +17,9 @@
 //!   から、(1) `create_network` の成功と、`ip -o link show` の alias が `bridge_token`・ifindex が
 //!   `bridge_index` と一致すること、(2) 別名の無い同名 bridge を先に作ると `AlreadyExists` で `leftover` が空
 //!   かつその bridge が残ること、(3) 別名を書き換えた bridge を `delete_network` が削除せず失敗すること、
-//!   (4) 別名を戻した正規の `delete_network` で bridge が消えることを確認する
+//!   (4) 別名を戻した正規の `delete_network` で bridge が消えること、(5) 作成失敗の回収（`reclaim_failed_create`。
+//!   #2467）が所有トークン一致の bridge・nft テーブルを消すこと、(6) bridge の別名が書き換えられていれば
+//!   bridge に触れず（テーブルは独立に消える）、別名を戻した再回収で収束することを確認する
 //!
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・
 //! `unshare`・`ip`）を満たさない場合は skip せず失敗する。
@@ -49,10 +51,10 @@ mod linux {
 
     use fandhe_container_net::netlink_route::{IpPrefix, NetlinkRouteSocket};
     use fandhe_container_net::network::{
-        NetworkCreateSpec, NetworkName, NetworkResourceNames, PortRegistry, StaticIpam,
-        create_network, delete_network,
+        FailedCreateClaim, NetworkCreateSpec, NetworkName, NetworkResourceNames, PortRegistry,
+        StaticIpam, create_network, delete_network, reclaim_failed_create,
     };
-    use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
+    use fandhe_container_net::nftables_batch::{NetlinkNetfilterSocket, NftFamily, TableGet};
 
     /// 新規 netns にカーネルが自動生成しうるデバイス（モジュールのロード状況で有無が変わる）。
     const ALLOWED_DEVICES: [&str; 11] = [
@@ -275,8 +277,58 @@ mod linux {
         if show(net.bridge.as_str()).is_ok() {
             fail("bridge still exists after delete_network");
         }
+
+        // (5) 作成失敗の回収。所有トークン一致の bridge・テーブルが消える。
+        let table_gone = |table: &fandhe_container_net::nftables_batch::NftName| {
+            matches!(
+                nft.table_info(&TableGet::new(NftFamily::Ipv4, table.clone()), t),
+                Err(e) if e.code() == fandhe_container_net::error::NetErrorCode::NotFound
+            )
+        };
+        let rc = create_network(&route, &nft, &spec("rc", [10, 216, 0, 1]), t)
+            .unwrap_or_else(|e| fail(&format!("create_network rc: {e}")));
+        reclaim_failed_create(&route, &nft, &FailedCreateClaim::from_created(&rc), t)
+            .unwrap_or_else(|e| fail(&format!("reclaim_failed_create: {e}")));
+        if show(rc.bridge.as_str()).is_ok() {
+            fail("bridge still exists after reclaim");
+        }
+        if !table_gone(&rc.table) {
+            fail("nft table still exists after reclaim");
+        }
+
+        // (6) bridge の別名が書き換えられていれば bridge に触れない。テーブルは独立に消える。
+        let rf = create_network(&route, &nft, &spec("rf", [10, 217, 0, 1]), t)
+            .unwrap_or_else(|e| fail(&format!("create_network rf: {e}")));
+        let claim = FailedCreateClaim::from_created(&rf);
+        ip(&["link", "set", rf.bridge.as_str(), "alias", "other-owner"])
+            .unwrap_or_else(|e| fail(&e));
+        match reclaim_failed_create(&route, &nft, &claim, t) {
+            Ok(_) => fail("reclaim must refuse a bridge with a foreign alias"),
+            Err(e) => {
+                let want = vec![(
+                    fandhe_container_net::network::DeleteResource::Bridge(rf.bridge.clone()),
+                    fandhe_container_net::network::ResourceState::Unknown,
+                )];
+                if e.report.leftover != want {
+                    fail(&format!("unexpected reclaim report {:?}", e.report));
+                }
+            }
+        }
+        if show(rf.bridge.as_str()).is_err() {
+            fail("bridge with a foreign alias was removed by reclaim");
+        }
+        if !table_gone(&rf.table) {
+            fail("owned nft table was not removed by reclaim");
+        }
+        ip(&["link", "set", rf.bridge.as_str(), "alias", &rf.bridge_token])
+            .unwrap_or_else(|e| fail(&e));
+        reclaim_failed_create(&route, &nft, &claim, t)
+            .unwrap_or_else(|e| fail(&format!("second reclaim: {e}")));
+        if show(rf.bridge.as_str()).is_ok() {
+            fail("bridge still exists after the second reclaim");
+        }
         println!(
-            "bridge_owner_token_privileged: ok alias=token index=match foreign=kept delete=ok"
+            "bridge_owner_token_privileged: ok alias=token index=match foreign=kept delete=ok reclaim=ok reclaim_foreign=kept"
         );
     }
 }

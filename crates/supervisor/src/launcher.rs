@@ -44,7 +44,10 @@
 //! - 先例: core の `exec/process.rs`（setsid 後の fd の開き直し）と core の `sys.rs` の `O_NOCTTY`
 //! - 現状の担保: 外部指定パスを開く 2 つのヘルパー（`container_options::env::open_nonblocking`・
 //!   `logs::rotating::open_read_nofollow_nonblocking`）が `O_NOCTTY` を付け、単体テストでフラグを照合する。
-//!   それ以外の open は `/proc/self/*`・ディレクトリ・新規作成などで端末になりえない
+//!   対象外の open（`/proc/self/*`・ディレクトリ・新規作成のほか、`/etc` 配下の root 管理ファイル〔nsswitch.conf・
+//!   passwd 等。`user_db`・`id_model`〕と導入経路を検証済みの実行ファイル〔ランチャーの supervisor 検証〕）は、
+//!   利用者が端末へ差し替えられない経路のため `O_NOCTTY` を付けない。これらの経路を利用者指定パスへ広げるときは
+//!   端末になりうる対象に当たるので `O_NOCTTY` を付ける
 //!
 //! # 失敗時の契約（fail-closed）
 //! 昇格できない場合（file capability も setuid も無い・`nosuid`・`no_new_privs`）は構造化エラーで非ゼロ終了し、

@@ -101,9 +101,9 @@ use serde::{Deserialize, Serialize};
 use crate::audit_log::{AuditCoverage, AuditCoveragePolicy, CoverageLayer, KernelAuditLayerStatus};
 use crate::dev_mounts::ImplicitDevMount;
 use crate::launch_isolation::{
-    LaunchIsolationRecord, MAX_RECORDED_ID_EXTENTS, MAX_RECORDED_RULES, RecordedAuditCoverage,
-    RecordedIdExtent, RecordedIdMapping, RecordedIdModel, RecordedLandlock, RecordedLandlockAudit,
-    RecordedRule, RecordedTarget, RootIdentity,
+    AuditCoverageRecordOutcome, LaunchIsolationRecord, MAX_RECORDED_ID_EXTENTS, MAX_RECORDED_RULES,
+    RecordedAuditCoverage, RecordedIdExtent, RecordedIdMapping, RecordedIdModel, RecordedLandlock,
+    RecordedLandlockAudit, RecordedRule, RecordedTarget, RootIdentity,
 };
 use crate::oci_runtime::MountDestination;
 use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
@@ -1798,6 +1798,9 @@ struct AuditCoverageDto {
     policy: String,
     seccomp_kill: CoverageLayerDto,
     landlock: CoverageLayerDto,
+    /// 縮退の監査記録を書けなかった事実（SEC-4・REPAIR-4・#2468）。書くのは `"failed"` のときだけ。無ければ失敗なし。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    record: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1827,6 +1830,7 @@ impl AuditCoverageDto {
                 policy: policy.as_str().to_owned(),
                 seccomp_kill: CoverageLayerDto::from_status(coverage.seccomp_kill()),
                 landlock: CoverageLayerDto::from_status(coverage.landlock()),
+                record: None,
             }),
             _ => None,
         }
@@ -1937,7 +1941,12 @@ impl LaunchIsolationDto {
                 rules,
                 audit: LandlockAuditDto::from_record(record.landlock().audit()),
             },
-            audit_coverage: AuditCoverageDto::from_record(record.audit_coverage()),
+            audit_coverage: AuditCoverageDto::from_record(record.audit_coverage()).map(|mut c| {
+                if record.audit_coverage_record() == AuditCoverageRecordOutcome::Failed {
+                    c.record = Some("failed".to_owned());
+                }
+                c
+            }),
             id_mapping: record.id_mapping().map(IdMappingDto::from_record),
         }
     }
@@ -1966,12 +1975,25 @@ impl LaunchIsolationDto {
             landlock,
         );
         let record = match self.audit_coverage {
-            Some(c) => match c.into_record()? {
-                RecordedAuditCoverage::Evaluated { policy, coverage } => {
-                    record.with_audit_coverage(policy, coverage)
+            Some(c) => {
+                let failed = match c.record.as_deref() {
+                    None => false,
+                    Some("failed") => true,
+                    Some(_) => return Err(()),
+                };
+                match c.into_record()? {
+                    RecordedAuditCoverage::Evaluated { policy, coverage } => {
+                        let r = record.with_audit_coverage(policy, coverage);
+                        if failed {
+                            // 縮退していない評価との矛盾は破損として拒否する。
+                            r.with_audit_coverage_record_failed().map_err(|_| ())?
+                        } else {
+                            r
+                        }
+                    }
+                    _ => record,
                 }
-                _ => record,
-            },
+            }
             None => record,
         };
         Ok(match self.id_mapping {
@@ -3415,6 +3437,48 @@ mod tests {
             let dto: LaunchIsolationDto = serde_json::from_value(v).unwrap();
             assert!(dto.into_record().is_err());
         }
+    }
+
+    /// SEC-4・REPAIR-4・#2468: 縮退の監査記録の失敗が `"record":"failed"` で往復し、失敗なしではキーが無く、
+    /// 未知の語彙・縮退していない評価との矛盾は破損として拒否される。
+    #[test]
+    fn sec4_2468_state_audit_coverage_record_roundtrip() {
+        use crate::audit_log::DegradeReason;
+        let degraded = AuditCoverage::new(
+            KernelAuditLayerStatus::Degraded(DegradeReason::SeccompKillNotLogged),
+            KernelAuditLayerStatus::Requested,
+        );
+        let rec = iso(100)
+            .with_audit_coverage(AuditCoveragePolicy::BestEffort, degraded)
+            .with_audit_coverage_record_failed()
+            .unwrap();
+        let v = serde_json::to_value(LaunchIsolationDto::from_record(&rec)).unwrap();
+        assert_eq!(v["audit_coverage"]["record"], serde_json::json!("failed"));
+        let back: LaunchIsolationDto = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(
+            back.into_record().unwrap().audit_coverage_record(),
+            AuditCoverageRecordOutcome::Failed
+        );
+        // 失敗なしではキーを書かず、キーが無い記録は NotFailed。
+        let ok = iso(100).with_audit_coverage(AuditCoveragePolicy::BestEffort, degraded);
+        let v2 = serde_json::to_value(LaunchIsolationDto::from_record(&ok)).unwrap();
+        assert!(v2["audit_coverage"].get("record").is_none());
+        let back: LaunchIsolationDto = serde_json::from_value(v2).unwrap();
+        assert_eq!(
+            back.into_record().unwrap().audit_coverage_record(),
+            AuditCoverageRecordOutcome::NotFailed
+        );
+        // 未知の語彙は破損。
+        let mut bad = v.clone();
+        bad["audit_coverage"]["record"] = serde_json::json!("bogus");
+        let dto: LaunchIsolationDto = serde_json::from_value(bad).unwrap();
+        assert!(dto.into_record().is_err());
+        // 縮退していない評価に失敗は付けられない(破損)。
+        let mut bad = v;
+        bad["audit_coverage"]["seccomp_kill"] =
+            serde_json::json!({"mode": "kernel_audit_requested"});
+        let dto: LaunchIsolationDto = serde_json::from_value(bad).unwrap();
+        assert!(dto.into_record().is_err());
     }
 
     /// CORE-6・SEC-5・#2388: ID 写像の記録が JSON の具体値で往復し、無い旧記録は記録なし、

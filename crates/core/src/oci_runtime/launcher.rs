@@ -643,10 +643,8 @@ impl ProcessLauncher for ProductionLauncher {
     }
 }
 
-/// 縮退の監査記録を書けなかったときの診断行(固定語彙のみ。SEC-4・#2027)。
 #[cfg(target_os = "linux")]
-const AUDIT_COVERAGE_RECORD_FAILED_LINE: &str =
-    r#"{"component":"core.audit","operation":"audit_coverage_record","outcome":"failed"}"#;
+use crate::audit_log::AUDIT_COVERAGE_RECORD_FAILED_LINE;
 
 /// 起動の実体(fork・Landlock の検出・スレッド数の観測)を差し替えられる継ぎ目(単体テストが順序と拒否を
 /// フォーク無し・ABI 非依存で照合できるようにする)。本番の実装は [`RealOps`]。
@@ -1178,6 +1176,7 @@ impl Inner {
         if let Some(line) = coverage.log_line() {
             self.ops.emit_warning(&line);
         }
+        let mut record_failed = false;
         if let Some(event) = coverage.degraded_event() {
             // 同期配送の待ちも launch の入口の期限へ絞る。尽きたときは記録できなかった扱い(警告のみ)にし、
             // 続く spawn 直前の残り時間の確認で `Timeout` として拒否する(REPAIR-5・SEC-4)。
@@ -1188,10 +1187,21 @@ impl Inner {
                 Some(deadline),
             );
             if !matches!(delivery, crate::audit_log::AuditDelivery::Recorded) {
+                // fd 2 は socket 構成向けに残す。同じ事実を評価値にも載せ、supervisor が
+                // `@supervisor-logs` へ出し直す(SEC-4・REPAIR-4・#2468)。
                 self.ops.emit_warning(AUDIT_COVERAGE_RECORD_FAILED_LINE);
+                record_failed = true;
             }
         }
-        Ok(record.with_audit_coverage(self.audit_policy, coverage))
+        let record = record.with_audit_coverage(self.audit_policy, coverage);
+        if record_failed {
+            // 縮退を評価済みなので Err にはならない。万一でも起動の可否は変えず記録をそのまま返す。
+            return Ok(record
+                .clone()
+                .with_audit_coverage_record_failed()
+                .unwrap_or(record));
+        }
+        Ok(record)
     }
 
     /// launch の前に、同じ ID の確かめられていない起動を再回収する。確かめられなければ fork 前に拒否する
@@ -2316,6 +2326,11 @@ mod tests {
         let events = ev.lock().unwrap();
         assert_eq!(events.iter().filter(|e| e.starts_with("spawn")).count(), 1);
         assert_eq!(*warnings.lock().unwrap(), vec![DEGRADED_LINE.to_owned()]);
+        // 記録に成功した縮退では記録失敗を載せない(#2468)。
+        assert_eq!(
+            record.audit_coverage_record(),
+            crate::launch_isolation::AuditCoverageRecordOutcome::NotFailed
+        );
         let recs = sink.records.lock().unwrap();
         let cov: Vec<_> = recs
             .iter()
@@ -2376,13 +2391,18 @@ mod tests {
         let warnings = Arc::clone(&ops.warnings);
         let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(true));
         let l = audit_launcher(ops, crate::audit_log::AuditCoveragePolicy::BestEffort, sink);
-        l.launch(&spec, Duration::from_secs(1)).expect("launched");
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launched");
         assert_eq!(
             *warnings.lock().unwrap(),
             vec![
                 DEGRADED_LINE.to_owned(),
                 AUDIT_COVERAGE_RECORD_FAILED_LINE.to_owned()
             ]
+        );
+        // SEC-4・REPAIR-4(#2468): 記録できなかった事実が評価値にも載る(supervisor が出し直す元)。
+        assert_eq!(
+            p.launch_isolation().unwrap().audit_coverage_record(),
+            crate::launch_isolation::AuditCoverageRecordOutcome::Failed
         );
     }
 

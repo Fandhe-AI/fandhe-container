@@ -299,6 +299,30 @@ pub enum RecordedAuditCoverage {
     },
 }
 
+/// 縮退の監査記録（層 `audit_coverage`）の書き込み結果の記録（SEC-4・REPAIR-4・#2468。OS 非依存の語彙）。
+///
+/// launcher が記録先へ書けなかった事実を起動結果に載せ、supervisor が `@supervisor-logs` へ固定の 1 行として
+/// 出し直す元になる。`NotFailed` は「失敗を観測していない」だけで、「記録された」ことの保証ではない
+/// （縮退が無い・記録に成功した・旧記録で不明のいずれか）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuditCoverageRecordOutcome {
+    /// 失敗を観測していない。
+    NotFailed,
+    /// 縮退の監査記録を記録先へ書けなかった。
+    Failed,
+}
+
+impl AuditCoverageRecordOutcome {
+    /// 失敗したときだけ、supervisor が保存する固定の診断行（改行なし）を返す。
+    pub fn log_line(self) -> Option<&'static str> {
+        match self {
+            Self::Failed => Some(crate::audit_log::AUDIT_COVERAGE_RECORD_FAILED_LINE),
+            _ => None,
+        }
+    }
+}
+
 /// 記録できる ID 写像の範囲（行）数の上限（uid・gid それぞれ。`rootless::MAX_EXTENTS` と同じ値。Linux では単体テストで
 /// 一致を照合する。CORE-6・#2388）。
 pub const MAX_RECORDED_ID_EXTENTS: usize = 340;
@@ -458,6 +482,7 @@ pub struct LaunchIsolationRecord {
     root: RootIdentity,
     landlock: RecordedLandlock,
     audit_coverage: RecordedAuditCoverage,
+    audit_coverage_record: AuditCoverageRecordOutcome,
     id_mapping: Option<RecordedIdMapping>,
 }
 
@@ -468,6 +493,7 @@ impl LaunchIsolationRecord {
             root,
             landlock,
             audit_coverage: RecordedAuditCoverage::NotRecorded,
+            audit_coverage_record: AuditCoverageRecordOutcome::NotFailed,
             id_mapping: None,
         }
     }
@@ -498,6 +524,27 @@ impl LaunchIsolationRecord {
     /// 監査の網羅の記録。
     pub fn audit_coverage(&self) -> RecordedAuditCoverage {
         self.audit_coverage
+    }
+
+    /// 縮退の監査記録を書けなかった事実を添える（SEC-4・REPAIR-4・#2468）。
+    ///
+    /// 縮退を評価済み（`Evaluated` かつ縮退あり）の記録にだけ付けられる。縮退が無い記録に「記録の失敗」を
+    /// 持たせる矛盾した値は作れない（REPAIR-2）。
+    pub fn with_audit_coverage_record_failed(mut self) -> Result<Self, LaunchIsolationError> {
+        match self.audit_coverage {
+            RecordedAuditCoverage::Evaluated { coverage, .. } if coverage.is_degraded() => {
+                self.audit_coverage_record = AuditCoverageRecordOutcome::Failed;
+                Ok(self)
+            }
+            _ => Err(LaunchIsolationError(
+                "audit coverage record failure requires a degraded evaluated coverage",
+            )),
+        }
+    }
+
+    /// 縮退の監査記録の書き込み結果。
+    pub fn audit_coverage_record(&self) -> AuditCoverageRecordOutcome {
+        self.audit_coverage_record
     }
 
     /// launch 時の pivot 後の `/` の識別子。
@@ -656,6 +703,48 @@ mod tests {
             },
             allowed,
         )
+    }
+
+    /// SEC-4・REPAIR-4・#2468: 記録失敗は縮退を評価済みの記録にだけ付けられる。
+    #[test]
+    fn sec4_2468_record_failed_requires_degraded_coverage() {
+        use crate::audit_log::{DegradeReason, KernelAuditLayerStatus};
+        let base = || {
+            LaunchIsolationRecord::from_parts(
+                RootIdentity::new(1, 2),
+                RecordedLandlock::new(0xFFFF, vec![root_rule(0x7)]).unwrap(),
+            )
+        };
+        assert_eq!(
+            base().audit_coverage_record(),
+            AuditCoverageRecordOutcome::NotFailed
+        );
+        assert!(base().with_audit_coverage_record_failed().is_err());
+        let clear = AuditCoverage::new(
+            KernelAuditLayerStatus::Requested,
+            KernelAuditLayerStatus::Requested,
+        );
+        let r = base().with_audit_coverage(AuditCoveragePolicy::BestEffort, clear);
+        assert!(r.with_audit_coverage_record_failed().is_err());
+        let degraded = AuditCoverage::new(
+            KernelAuditLayerStatus::Degraded(DegradeReason::SeccompKillNotLogged),
+            KernelAuditLayerStatus::Requested,
+        );
+        let r = base()
+            .with_audit_coverage(AuditCoveragePolicy::BestEffort, degraded)
+            .with_audit_coverage_record_failed()
+            .unwrap();
+        assert_eq!(
+            r.audit_coverage_record(),
+            AuditCoverageRecordOutcome::Failed
+        );
+        assert_eq!(
+            r.audit_coverage_record().log_line(),
+            Some(
+                r#"{"component":"core.audit","operation":"audit_coverage_record","outcome":"failed"}"#
+            )
+        );
+        assert_eq!(AuditCoverageRecordOutcome::NotFailed.log_line(), None);
     }
 
     /// SEC-4・#2026: `with_audit` は永続化して読み戻せる値だけを受ける。縮退の ABI は 1〜6 のみで、0 と 7 以上は拒否する

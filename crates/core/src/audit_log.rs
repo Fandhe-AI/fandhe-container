@@ -68,8 +68,9 @@ mod landlock;
 #[cfg(target_os = "linux")]
 pub use control_relay::ControlAuditRelay;
 pub use coverage::{
-    AUDIT_COVERAGE_STRICT_REFUSAL, AuditCoverage, AuditCoveragePolicy, CoverageLayer,
-    DegradeReason, KernelAuditLayerStatus, KernelAuditProbe, assess,
+    AUDIT_COVERAGE_RECORD_FAILED_LINE, AUDIT_COVERAGE_STRICT_REFUSAL, AuditCoverage,
+    AuditCoveragePolicy, CoverageLayer, DegradeReason, KernelAuditLayerStatus, KernelAuditProbe,
+    assess,
 };
 pub use file_sink::{AUDIT_LOG_FILE_NAME, FileAuditSink, RECORD_WAIT_LIMIT};
 pub use file_writer::{

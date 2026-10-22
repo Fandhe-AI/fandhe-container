@@ -8,7 +8,8 @@
 //! 判定は `<XDG_RUNTIME_DIR>/systemd/private`（systemd-run `--user` の直結先）が、symlink を辿らない lstat で
 //! 自 euid 所有のソケットであることの確認に限る（[`user_manager_env`]。`start` とベンチはこれだけを使う）。
 //! 死んだソケット（ファイルは残るが listener がいない）を見分ける実 connect は [`probe_user_manager_socket`] が
-//! 担い、`doctor` だけが呼ぶ（`start` への追加は別判断。#2158）。
+//! 担い、`doctor` だけが呼ぶ（`start` への追加と接続先の `SO_PEERCRED` 照合は未実装で、判断待ち。
+//! #2448・`docs/design/user-manager-connect-precheck.md`・オーナー承認待ち）。
 //! エラー値は固定文言のみで、値（パス・`XDG_RUNTIME_DIR` の内容）を載せない。
 
 use std::ffi::{OsStr, OsString};

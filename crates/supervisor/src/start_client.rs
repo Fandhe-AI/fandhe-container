@@ -88,6 +88,7 @@
 //!   （委譲 cgroup の準備で拒否されないか）は未実施（#2062。`tests/supervisor_bin_real.rs` は実機前提）。
 //! - 1 行も無いまま EOF のとき、supervisor の異常終了と systemd-run の失敗（D-Bus 接続の失敗等）を区別できない
 //!   （stderr を pipe にすると supervisor の構造化ログが混ざり、CLI の終了後に EPIPE になるため採らない。制御チャネル #2058 の後の課題）。
+//!   事前の実 connect で死んだソケットだけ区別する案は未実装で、判断待ち（#2448・`docs/design/user-manager-connect-precheck.md`。`resolve` は今も `user_manager_env` の lstat のみ）。
 //! - 固定候補の外にある `systemd-run` には未対応（`PATH` は探さない。理由は `crate::systemd_run`）。NixOS の store が
 //!   group 書き込み可・sticky の祖先として拒否される可能性があり、実機での確認と扱いはオーナー判断待ち（#2133）。
 //! - CLI の試験専用 feature `start-test-support` のときだけ、環境変数 `FANDHE_CONTAINER_TEST_SYSTEMD_RUN`（絶対パス）で

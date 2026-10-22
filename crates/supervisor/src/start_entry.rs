@@ -316,6 +316,16 @@ fn log_audit_coverage_to(
     Some(sink.emit(format!("{line}\n").into_bytes()))
 }
 
+/// 縮退の監査記録(層 `audit_coverage`)を記録先へ書けなかった launch なら、固定の診断行 1 行を `sink` へ待たずに入れる
+/// (SEC-4・REPAIR-4・REPAIR-5・#2468)。失敗していない・評価の記録が無いときは何もせず `None`。結果は起動の可否に使わない。
+fn log_audit_coverage_record_failed_to(
+    sink: &crate::stderr_sink::StderrSink,
+    record: Option<&fandhe_container_core::launch_isolation::LaunchIsolationRecord>,
+) -> Option<crate::stderr_sink::EmitOutcome> {
+    let line = record?.audit_coverage_record().log_line()?;
+    Some(sink.emit(format!("{line}\n").into_bytes()))
+}
+
 /// start の成功後に、launch が評価した監査の網羅の縮退警告を supervisor のログ(`@supervisor-logs`)へ 1 行残す(#2027)。
 ///
 /// core の launch 中の出力(`emit_diagnostic_line`)は fd 2 が AF_UNIX の socket のときだけ届き、CLI の `start`(stderr が
@@ -324,6 +334,11 @@ fn log_audit_coverage_to(
 /// 再出力しない(初回に記録済み)。
 fn log_audit_coverage(process: &dyn LaunchedProcess) {
     let _ = log_audit_coverage_to(crate::stderr_sink::stderr(), process.launch_isolation());
+    // 縮退の行に続けて、その監査記録を書けなかった事実を出す(core が fd 2 へ出す順と同じ。#2468)。
+    let _ = log_audit_coverage_record_failed_to(
+        crate::stderr_sink::stderr(),
+        process.launch_isolation(),
+    );
 }
 
 /// 回収を確かめられなかったハンドルの保管先（`Drop` は回収しないため、捨てずに保持する。REPAIR-5）。
@@ -3454,6 +3469,82 @@ mod tests {
         assert_eq!(log_audit_coverage_to(&sink, Some(&clear)), None);
         assert_eq!(log_audit_coverage_to(&sink, Some(&base())), None);
         assert_eq!(log_audit_coverage_to(&sink, None), None);
+    }
+
+    /// SEC-4・REPAIR-4(#2468): 縮退の監査記録を書けなかった launch だけが、縮退の行に続けて記録失敗の固定 1 行をログへ入れる。
+    #[test]
+    fn sec4_repair4_2468_record_failure_reaches_the_supervisor_log() {
+        use crate::stderr_sink::{EmitOutcome, StderrSink};
+        use fandhe_container_core::audit_log::{
+            AuditCoverage, AuditCoveragePolicy, DegradeReason, KernelAuditLayerStatus,
+        };
+        use fandhe_container_core::launch_isolation::{
+            LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+        };
+        let base = || {
+            LaunchIsolationRecord::from_parts(
+                RootIdentity::new(44, 1234),
+                RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)])
+                    .unwrap(),
+            )
+        };
+        let degraded = base().with_audit_coverage(
+            AuditCoveragePolicy::BestEffort,
+            AuditCoverage::new(
+                KernelAuditLayerStatus::Degraded(DegradeReason::SeccompKillNotLogged),
+                KernelAuditLayerStatus::Degraded(DegradeReason::LandlockAuditAbiTooOld),
+            ),
+        );
+        let degraded_line = concat!(
+            r#"{"component":"core.audit","operation":"audit_coverage","outcome":"degraded","#,
+            r#""seccomp_kill":"seccomp_kill_not_logged","landlock":"landlock_audit_abi_too_old"}"#,
+            "\n"
+        );
+        let failed_line = concat!(
+            r#"{"component":"core.audit","operation":"audit_coverage_record","outcome":"failed"}"#,
+            "\n"
+        );
+
+        // 記録に失敗した起動: 縮退の行 + 記録失敗の行。
+        let failed = degraded
+            .clone()
+            .with_audit_coverage_record_failed()
+            .unwrap();
+        let buf = SharedBuf::default();
+        let sink = StderrSink::spawn(buf.clone(), 4);
+        assert_eq!(
+            log_audit_coverage_to(&sink, Some(&failed)),
+            Some(EmitOutcome::Queued)
+        );
+        assert_eq!(
+            log_audit_coverage_record_failed_to(&sink, Some(&failed)),
+            Some(EmitOutcome::Queued)
+        );
+        assert_eq!(sink.flush(Duration::from_secs(5)), EmitOutcome::Written);
+        assert_eq!(
+            buf.0.lock().unwrap().as_slice(),
+            format!("{degraded_line}{failed_line}").as_bytes()
+        );
+
+        // 記録に成功した縮退・縮退なし・評価なし・記録なしでは記録失敗の行は入らない。
+        let buf = SharedBuf::default();
+        let sink = StderrSink::spawn(buf.clone(), 4);
+        let clear = base().with_audit_coverage(
+            AuditCoveragePolicy::BestEffort,
+            AuditCoverage::new(
+                KernelAuditLayerStatus::Requested,
+                KernelAuditLayerStatus::Requested,
+            ),
+        );
+        for r in [Some(&degraded), Some(&clear), Some(&base()), None] {
+            assert_eq!(log_audit_coverage_record_failed_to(&sink, r), None);
+        }
+        assert_eq!(
+            log_audit_coverage_to(&sink, Some(&degraded)),
+            Some(EmitOutcome::Queued)
+        );
+        assert_eq!(sink.flush(Duration::from_secs(5)), EmitOutcome::Written);
+        assert_eq!(buf.0.lock().unwrap().as_slice(), degraded_line.as_bytes());
     }
 
     /// CORE-5(#2008): 対象外の状態では何も入れない。

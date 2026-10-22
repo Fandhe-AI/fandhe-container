@@ -38,6 +38,13 @@ use crate::audit_log::AuditReason;
 use crate::launch_isolation::RecordedLandlockAudit;
 use crate::traits::{ErrorCode, TraitError};
 
+/// 縮退の監査記録（層 `audit_coverage`）を記録先へ書けなかったときの診断行（固定語彙のみ。SEC-4・REPAIR-4・#2468）。
+///
+/// launcher が fd 2 へ出し、同じ事実を `LaunchIsolationRecord` に載せて supervisor が `@supervisor-logs` へ出し直す。
+/// 改行は含めない（呼び出し側が付ける）。
+pub const AUDIT_COVERAGE_RECORD_FAILED_LINE: &str =
+    r#"{"component":"core.audit","operation":"audit_coverage_record","outcome":"failed"}"#;
+
 /// 厳格モードで縮退を理由に起動を拒否するときの固定文言（値を含めない）。
 pub const AUDIT_COVERAGE_STRICT_REFUSAL: &str =
     "audit coverage is degraded and the strict audit policy refuses to start";
@@ -542,6 +549,15 @@ mod tests {
         assert_eq!(
             c.log_line().unwrap(),
             r#"{"component":"core.audit","operation":"audit_coverage","outcome":"degraded","seccomp_kill":"requested","landlock":"landlock_audit_abi_too_old"}"#
+        );
+    }
+
+    /// SEC-4・REPAIR-4・#2468: 記録失敗の診断行は固定語彙でバイト列が完全一致する。
+    #[test]
+    fn sec4_2468_record_failed_line_is_exact() {
+        assert_eq!(
+            AUDIT_COVERAGE_RECORD_FAILED_LINE,
+            "{\"component\":\"core.audit\",\"operation\":\"audit_coverage_record\",\"outcome\":\"failed\"}"
         );
     }
 

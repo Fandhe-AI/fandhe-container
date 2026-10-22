@@ -33,6 +33,7 @@
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::process::Child;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -63,6 +64,24 @@ pub const MSG_START_REPORT_MISMATCH: &str =
 pub const MSG_TOO_MANY_SUPERVISORS: &str = "too many supervisor processes are tracked";
 /// 猶予後の SIGKILL でも Stopped にならなかったときの固定文言。
 pub const MSG_STOP_DEADLINE: &str = "container did not stop within the deadline";
+
+/// 受信期限切れ（`Timeout`）のとき、報告を出さないまま残った supervisor を kill する（回収は呼び出し側の一覧の `try_wait`）。
+///
+/// 常駐デーモンでは、報告を待つ補助スレッドが supervisor の stdout を握ったまま残り続けるのを防ぐ。supervisor の内部上限は
+/// 受信期限より短いため、期限を過ぎても報告が無い supervisor は契約違反の状態にある（SUP-1・REPAIR-5）。CLI は
+/// 直後に終了するので kill しない（CLI の契約は `start_client` の「supervisor は kill されない」のまま）。
+fn reclaim_on_timeout(
+    (result, child): (Result<NonZeroU32, OciRuntimeError>, Option<Child>),
+) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
+    let mut child = child;
+    if let (Err(e), Some(c)) = (&result, child.as_mut())
+        && e.code() == ErrorCode::Timeout
+    {
+        // kill の失敗（既に終了済み等）は無視する。残りは reap が回収する。
+        let _ = c.kill();
+    }
+    (result, child)
+}
 
 /// supervisor の起動を行う口（本番は [`ProductionStarter`]。結合試験は偽の systemd-run・supervisor を指す [`FixedLaunchStarter`]）。
 ///
@@ -101,7 +120,7 @@ impl SupervisorStarter for ProductionStarter {
             }
         };
         match SupervisorLaunch::resolve_beside(&exe) {
-            Ok(launch) => start_with(&launch, root, id, production_deadline()),
+            Ok(launch) => reclaim_on_timeout(start_with(&launch, root, id, production_deadline())),
             Err(e) => (Err(e), None),
         }
     }
@@ -129,7 +148,7 @@ impl SupervisorStarter for FixedLaunchStarter {
         root: &Path,
         id: &ContainerId,
     ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
-        start_with(&self.launch, root, id, self.within)
+        reclaim_on_timeout(start_with(&self.launch, root, id, self.within))
     }
 }
 
@@ -160,6 +179,8 @@ pub struct SupervisedLifecycle {
     starter: Arc<dyn SupervisorStarter>,
     signalers: Arc<dyn SignalerSource>,
     children: Mutex<Vec<Child>>,
+    /// 起動の結果待ちで枠だけ予約している件数。`children` のロックを持つ間だけ増減する（並行 start の上限超過を防ぐ）。
+    reserved: AtomicUsize,
 }
 
 impl SupervisedLifecycle {
@@ -174,6 +195,7 @@ impl SupervisedLifecycle {
             starter,
             signalers,
             children: Mutex::new(Vec::new()),
+            reserved: AtomicUsize::new(0),
         }
     }
 
@@ -207,15 +229,25 @@ impl SupervisedLifecycle {
                 "state root is not available for starting a container",
             ));
         };
-        if self.lock_children().len() >= MAX_TRACKED_SUPERVISORS {
-            return Err(TraitError::new(
-                ErrorCode::Unavailable,
-                MSG_TOO_MANY_SUPERVISORS,
-            ));
+        // 追跡数と予約数の合計で上限を検査し、同じロックの下で枠を予約する（検査と追加の間に並行 start が割り込めない）。
+        {
+            let children = self.lock_children();
+            if children.len() + self.reserved.load(Ordering::SeqCst) >= MAX_TRACKED_SUPERVISORS {
+                return Err(TraitError::new(
+                    ErrorCode::Unavailable,
+                    MSG_TOO_MANY_SUPERVISORS,
+                ));
+            }
+            self.reserved.fetch_add(1, Ordering::SeqCst);
         }
         let (result, child) = self.starter.start(root, id);
-        if let Some(child) = child {
-            self.lock_children().push(child);
+        {
+            // 予約を解放し、Child を得たなら同じロックの下で追跡枠へ移す。
+            let mut children = self.lock_children();
+            self.reserved.fetch_sub(1, Ordering::SeqCst);
+            if let Some(child) = child {
+                children.push(child);
+            }
         }
         let pid = result.map_err(|e| TraitError::new(e.code(), e.message()))?;
         let status = read_status(store, id)?;
@@ -304,8 +336,12 @@ fn send_or_observe_exit(
         Ok(_) => Ok(()),
         Err(e) => {
             let e = to_trait_error(e);
-            if e.code() == ErrorCode::FailedPrecondition
-                && read_status(store, req.id()).is_ok_and(|s| s.state() == ContainerState::Stopped)
+            // 直前に終了した場合、core は FAILED_PRECONDITION を返し、本番の制御チャネルは supervisor が
+            // ソケットを閉じた後の接続・読み取りの失敗を UNAVAILABLE で返す。どちらも記録を読み直す（CRI-2）。
+            if matches!(
+                e.code(),
+                ErrorCode::FailedPrecondition | ErrorCode::Unavailable
+            ) && read_status(store, req.id()).is_ok_and(|s| s.state() == ContainerState::Stopped)
             {
                 return Ok(());
             }

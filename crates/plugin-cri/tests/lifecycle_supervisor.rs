@@ -306,6 +306,16 @@ fn repair5_start_times_out_without_report() {
     );
     assert!(t.elapsed() >= Duration::from_millis(300));
     assert!(t.elapsed() < Duration::from_secs(5));
+    // 報告の無い supervisor は kill され、入口の回収で一覧から外れる（補助スレッドを残さない）。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.rt.tracked_supervisors() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "timed-out child was not reclaimed"
+        );
+        let _ = h.rt.kill(&KillRequest::new(cid("c-hang"), Signal::SIGTERM));
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// SUP-1: 1 行も無いまま EOF なら INTERNAL。
@@ -469,6 +479,18 @@ fn sup9_stop_race_exit_before_delivery_is_ok() {
             .expect("stop");
     assert_eq!(status.state(), ContainerState::Stopped);
     assert_eq!(h.sim.state(), ContainerState::Stopped);
+}
+
+/// 制御チャネルが消えた（signaler が UNAVAILABLE を返し、記録は Stopped）場合も成功として扱う（CRI-2）。
+#[test]
+fn cri2_stop_race_channel_gone_unavailable_is_ok() {
+    let sim = running("c1", 4242);
+    *sim.race.lock().expect("lock") = Some(ErrorCode::Unavailable);
+    let h = harness(sim, LONG);
+    let status =
+        h.rt.stop(&StopRequest::new(cid("c1"), Duration::from_secs(1)).expect("req"))
+            .expect("stop");
+    assert_eq!(status.state(), ContainerState::Stopped);
 }
 
 /// kill は意図なしの signaler で 1 回だけ送り、終了は待たない（Running のまま返る）。

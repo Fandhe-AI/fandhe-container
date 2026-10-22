@@ -170,7 +170,8 @@ fn read_report_line(mut out: impl Read) -> Received {
 
 /// 補助スレッドで [`read_report_line`] を行い、`within` を過ぎたら [`Received::TimedOut`] を返す。
 ///
-/// 期限切れのとき補助スレッドは read で止まったまま残る（CLI は直後に終了する。子は kill しないため pipe は閉じない）。
+/// 期限切れのとき補助スレッドは read で止まったまま残る（子を kill しないため pipe は閉じない）。CLI は直後に終了する。
+/// 常駐する呼び出し側（plugin-cri）は期限切れの子を kill して pipe を閉じ、スレッドを終わらせる。
 fn receive_report(out: impl Read + Send + 'static, within: Duration) -> Received {
     let (tx, rx) = mpsc::sync_channel(1);
     let spawned = std::thread::Builder::new()

@@ -63,7 +63,7 @@
 
 use std::fmt;
 use std::fs::OpenOptions;
-use std::io::{ErrorKind, Read as _, Write as _};
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -1178,17 +1178,17 @@ pub(crate) const HOLDER_RELEASE: u8 = 2;
 ///
 /// 流れ: fd 3 以上を閉じる(I から継承した報告 pipe・listener 等を持たない)
 /// → 親が `expected_parent`(I)のままか確認 → `unshare(CLONE_NEWUSER)` → dumpable にする → READY(`MapperReply::Ok`)
-/// を返す → [`HOLDER_RELEASE`] を `release_wait` まで待って終了する。期限までに RELEASE も EOF も来なければ、EOF
-/// まで待ってから終了する(下記。この待ちに呼び出し元は依存しない。REPAIR-5)。
+/// を返す → [`HOLDER_RELEASE`] を `release_wait` まで待って終了する(REPAIR-5)。
 ///
 /// `PDEATHSIG` は設定しない(#2376)。helper(`newuidmap` / `newgidmap`)は holder を pid の数値で受け取るため、I が
 /// helper の実行中に死んでも holder は先に終了して pid を解放してはならない。`sock` の相手側は I・mapper(fork で
 /// 継承)・各 helper(stdin に複製。`HelperTarget::HeldPid`)が持ち、全員が閉じるまで EOF にならない。そのため I が
-/// 死んだ場合も、holder は mapper と全 helper の終了(EOF)まで終わらない。`release_wait`(`3 × timeout + 5s`)は
-/// mapper の go 待ち(`timeout`)と helper 2 回(各 `timeout`)の和を上回り、通常はそれまでに RELEASE か EOF が来る。
-/// 期限を過ぎても相手側が残っている(helper が停止している等)場合は、holder の pid を保つため EOF まで待ち続ける
-/// (helper より先に終了しない)。I・C は helper を止めた後に holder を kill する(`exec::stop_mapper_and_helpers`・
-/// `exec::launch_intermediate::rescan_unreported_init`)。
+/// 死んだ場合も、holder は mapper と全 helper の終了(EOF)か `release_wait` の期限で終わる。`release_wait`
+/// (`3 × timeout + 5s`)は mapper の go 待ち(`timeout`)と helper 2 回(各 `timeout`)の和を上回る。期限で終わるため
+/// (REPAIR-5)、呼び出し元が死んだうえで helper が期限を超えて止められている場合は holder が先に終わり得る(残余。
+/// 再利用先は helper の所有者確認により同じ利用者の、写像が未設定の子 user namespace のプロセスに限られ、書けるのは
+/// その利用者自身の subordinate 範囲だけのため、新しい権限は与えない。#2551)。I・C は helper を止めた後に
+/// holder を kill する(`exec::stop_mapper_and_helpers`・`exec::launch_intermediate::rescan_unreported_init`)。
 /// 失敗は `MapperReply::Failed` で返して終了コード 1。exec せず I の `comm`(起動識別子)を引き継ぐため、I が
 /// 報告せずに死んでも C の再探索が回収できる(CORE-2)。
 pub(crate) fn run_userns_holder(
@@ -1234,30 +1234,9 @@ pub(crate) fn run_userns_holder(
     }
     let _ = sock.set_read_timeout(Some(release_wait));
     let mut b = [0u8; 1];
-    match sock.read(&mut b) {
-        Ok(1) if b[0] == HOLDER_RELEASE => 0,
-        // 期限切れ: RELEASE は来なかったが、相手側を持つ誰か(mapper・helper)がまだ生きている。helper は holder を
-        // pid の数値で受け取るため、EOF(全員の終了)まで終了しない(#2376)。待つのは使い捨ての holder 自身だけで、
-        // 呼び出し元(I・C)はこの待ちに依存しない(REPAIR-5)。I・C は helper を止めた後に holder を kill する。
-        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-            let _ = sock.set_read_timeout(None);
-            wait_until_peers_close(&mut sock);
-            1
-        }
+    match sock.read_exact(&mut b) {
+        Ok(()) if b[0] == HOLDER_RELEASE => 0,
         _ => 1,
-    }
-}
-
-/// `sock` の相手側を持つ全員が閉じる(EOF)か、読み取りが失敗するまで読み捨てる(holder の期限切れ後。#2376)。
-fn wait_until_peers_close(sock: &mut std::os::unix::net::UnixStream) {
-    let mut b = [0u8; 16];
-    loop {
-        match sock.read(&mut b) {
-            Ok(0) => return,
-            Ok(_) => {}
-            Err(e) if e.kind() == ErrorKind::Interrupted => {}
-            Err(_) => return,
-        }
     }
 }
 

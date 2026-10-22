@@ -167,7 +167,7 @@ pub enum ExplicitStopRecord {
     NewlyRecorded,
     /// 既に別の呼び出しが意図を立てていた。
     AlreadyRecorded,
-    /// restart ループが再起動なしで終わる最終判定を済ませ、受付を閉じていた（[`StopToken::close_explicit_stop`]）。
+    /// restart ループが再起動なしで終わる最終判定を済ませ、受付を閉じていた（`StopToken::close_explicit_stop`）。
     /// 意図は立てていない（記録に渡らない）ので、呼び出し側は成功として返してはならない（SUP-9・契約 14・#2440）。
     Closed,
 }
@@ -218,7 +218,7 @@ impl StopToken {
 
     /// 明示 stop の意図を立て、直前の状態を返す。監視は止めない（[`Self::request_stop`] との違い）。
     ///
-    /// 受付が閉じられ（[`Self::close_explicit_stop`]）かつ意図が未設定なら、立てずに `Closed` を返す。
+    /// 受付が閉じられ（`Self::close_explicit_stop`）かつ意図が未設定なら、立てずに `Closed` を返す。
     pub fn mark_explicit_stop(&self) -> ExplicitStopRecord {
         let _gate = self
             .gate

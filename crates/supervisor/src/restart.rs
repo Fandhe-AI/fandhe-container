@@ -1103,10 +1103,12 @@ pub fn supervise_with_restart(
                 observe(Some(error.code()));
                 // 再 launch の待機中に受理済みの明示 stop は、再 launch が失敗しても残す。残存プロセスが無いと
                 // 確認できた（実行スレッド完了・未回収ハンドルなし）ときだけ記録する（REPAIR-5・SUP-9・契約 14）。
-                if explicit_requested(stop)
-                    && !stop.is_stop_requested()
-                    && late.is_clean_after_settle(RELAUNCH_REPLY_GRACE)
-                {
+                // 最終判定として受付を閉じ、閉じた時点で受理済みの取消を確定させる。以後の取消は拒否されるので、
+                // 「確定後に受理して記録しない」経路は残らない（SUP-9・契約 14・#2440）。
+                let accepted = stop.close_explicit_stop()
+                    == crate::run::ExplicitStopState::Requested
+                    && !stop.is_stop_requested();
+                if accepted && late.is_clean_after_settle(RELAUNCH_REPLY_GRACE) {
                     return Ok(finish_explicit_stop(state, last, restarts, obs));
                 }
                 // 回収を確認できなかった場合は記録を動かさず、明示 stop は呼び出し側の回収確認後に残す（未記録のまま
@@ -1116,7 +1118,7 @@ pub fn supervise_with_restart(
                     error,
                     late,
                     restarts,
-                    explicit_stop_pending: explicit_requested(stop) && !stop.is_stop_requested(),
+                    explicit_stop_pending: accepted,
                 });
             }
         };
@@ -2808,6 +2810,28 @@ mod tests {
         assert_eq!(reason, NoRestartReason::PolicyNo);
         assert_eq!(st.rec.lock().unwrap().restart_count(), 0);
         assert_eq!(q.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// SUP-9・契約 14・#2440: 再 launch が失敗して終わる最終判定でも受付を閉じる。確定後の取り消しは `Closed` で断られ、
+    /// 「受理したのに記録されない」経路が残らない。
+    #[test]
+    fn sup9_relaunch_failure_closes_explicit_stop_admission() {
+        let st = store(1, 42);
+        let q = Arc::new(Queue::new(&[]));
+        let stop = StopToken::new();
+        let out = run(&st, "unless-stopped", FAIL, &q, &stop, &Events::default());
+        let SuperviseOutcome::RelaunchFailed {
+            explicit_stop_pending,
+            ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert!(!explicit_stop_pending);
+        assert_eq!(
+            stop.mark_explicit_stop(),
+            crate::run::ExplicitStopRecord::Closed
+        );
     }
 
     /// SUP-3・TASK-159.3: 再 launch 失敗は restart_count を進めず、状態は Stopped のまま。

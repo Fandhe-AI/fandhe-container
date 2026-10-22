@@ -1157,6 +1157,14 @@ pub fn log_file_paths(dir: &Path, id: &ContainerId) -> Result<Vec<PathBuf>, Trai
     Ok(names.into_iter().map(|(_, n)| dir.join(n)).collect())
 }
 
+/// この ID の現在ログ（`<enc>.log`）のパス。`logs --follow` が入れ替わりの検出（現在ログのパスの dev / ino の
+/// 照合）に使う（SUP-7・CLI-1）。`dir` の検査は [`log_file_paths`] と同じ。
+#[cfg(unix)]
+pub(crate) fn current_log_path(dir: &Path, id: &ContainerId) -> Result<PathBuf, TraitError> {
+    let dir = check_dir(dir)?;
+    Ok(dir.join(format!("{}.log", encode_file_stem(id.as_str()))))
+}
+
 /// `dir` が実在するディレクトリで、経路上に（信頼できない）symlink を含まず、（unix では）他者書き込み不可で
 /// あることを確認し、解決済みの絶対パスを返す。以後のファイル操作はこの固定したパスで行う（再解決しない）。
 ///

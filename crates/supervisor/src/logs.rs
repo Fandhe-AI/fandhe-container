@@ -53,7 +53,8 @@
 //!
 //! # 読み出し（#1543・CLI-1・SUP-7）
 //! `logs` コマンドの読み出しは [`reader::read_container_log`] が担う。ディレクトリ契約は [`container_log_dir`]
-//! （`<state_root>/@container-logs`）、世代の並びは [`rotating`] の名前空間に従う。
+//! （`<state_root>/@container-logs`）、世代の並びは [`rotating`] の名前空間に従う。`--tail` / `--stream` / `--escape` /
+//! `--follow` に当たる指定は [`reader::read_container_log_with`] が受ける（CLI-1・SUP-7）。
 //!
 //! # 後始末（#2446・SUP-7・CLI-1）
 //! CLI の `delete` が core の delete の成功後に [`remove_container_logs_bounded`] で現在ログ・全世代・ロックファイルを
@@ -74,7 +75,11 @@
 pub mod reader;
 pub mod rotating;
 
-pub use reader::{LogReadFailure, LogReadReport, read_container_log};
+pub use reader::{
+    FOLLOW_OUTRAN_MESSAGE, FOLLOW_POLL_INTERVAL, FollowOptions, LogReadFailure, LogReadOptions,
+    LogReadReport, MAX_FOLLOW_DURATION, MAX_TAIL_RECORDS, TailCount, read_container_log,
+    read_container_log_with,
+};
 pub use rotating::{RemovedLogs, RotatingFileSink, RotationConfig, log_file_paths};
 
 /// コンテナログのディレクトリ名（状態ルート直下）。`@` 始まりはストアのメタデータ用の名前空間で、コンテナ ID

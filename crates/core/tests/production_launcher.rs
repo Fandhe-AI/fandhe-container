@@ -743,6 +743,7 @@ mod linux {
         scenario_m_n_working_dir_refused(&env, tag);
         scenario_o_user_outside_mapping_refused(&env, tag);
         scenario_p_bare_name_entrypoint(&env, tag);
+        scenario_r_cwd_relative_entrypoint(&env, tag);
         scenario_q_exit_signal_via_relay(&env, container, tag);
         if subordinate_requested() {
             scenario_i_user_applied(tag);
@@ -2062,44 +2063,174 @@ mod linux {
                 );
                 assert_eq!(state_of(&env.store, &id), ContainerState::Created);
             }
-            Ok(started) => {
-                // 失敗の診断（子の stderr の 1 行）を終了状態の不一致の報告へ添えるため、待つ前に読み手を立てる
-                // （CI だけで SIGSEGV が観測された原因の切り分け用。#2376）。
-                let diag = started
-                    .process()
-                    .take_output()
-                    .and_then(|o| o.stderr)
-                    .map(spawn_reader);
-                let exit = started.process().wait(timeout());
-                let (_record, process) = started.into_parts();
-                let _ = process.terminate(timeout());
-                let mut lines: Vec<String> = Vec::new();
-                if let Some((rx, reader)) = diag {
-                    let deadline = Instant::now() + timeout();
-                    while let Ok(line) =
-                        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    {
-                        lines.push(line);
-                    }
-                    // 子は terminate 済みで書き込み側は閉じるため、リーダーは EOF で終わる。終了を期限つきで待ち、
-                    // 終わっていれば join してスレッドを残さない（後続の wait_single_thread のため）。書き込み側が
-                    // 開いたままの場合だけ、join が無期限になるのを避けて切り離す（REPAIR-5）。
-                    if eventually(|| reader.is_finished()) {
-                        reader.join().expect("join diagnostic reader");
-                    } else {
-                        drop(reader);
-                    }
-                }
-                assert_eq!(
-                    exit.expect("wait"),
-                    Some(ProcessExit::Exited(127)),
-                    "child stderr: {lines:?}"
-                );
-            }
+            Ok(started) => assert_started_child_exits_127(started),
         }
         assert!(eventually(|| children_of_self().is_empty()));
         println!(
             "production_launcher: scenario=bare-name resolved via PATH, exit code {EXIT_CODE}; missing name not started"
+        );
+    }
+
+    /// 起動後に子が終了コード 127(`exec` 層の `NotFound` 相当)で終わることを確かめ、子と読み手を残さない。
+    fn assert_started_child_exits_127(
+        started: fandhe_container_core::oci_runtime::StartedContainer,
+    ) {
+        // 失敗の診断（子の stderr の 1 行）を終了状態の不一致の報告へ添えるため、待つ前に読み手を立てる
+        // （CI だけで SIGSEGV が観測された原因の切り分け用。#2376）。
+        let diag = started
+            .process()
+            .take_output()
+            .and_then(|o| o.stderr)
+            .map(spawn_reader);
+        let exit = started.process().wait(timeout());
+        let (_record, process) = started.into_parts();
+        let _ = process.terminate(timeout());
+        let mut lines: Vec<String> = Vec::new();
+        if let Some((rx, reader)) = diag {
+            let deadline = Instant::now() + timeout();
+            while let Ok(line) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                lines.push(line);
+            }
+            // 子は terminate 済みで書き込み側は閉じるため、リーダーは EOF で終わる。終了を期限つきで待ち、
+            // 終わっていれば join してスレッドを残さない（後続の wait_single_thread のため）。書き込み側が
+            // 開いたままの場合だけ、join が無期限になるのを避けて切り離す（REPAIR-5）。
+            if eventually(|| reader.is_finished()) {
+                reader.join().expect("join diagnostic reader");
+            } else {
+                drop(reader);
+            }
+        }
+        assert_eq!(
+            exit.expect("wait"),
+            Some(ProcessExit::Exited(127)),
+            "child stderr: {lines:?}"
+        );
+    }
+
+    /// シナリオ R（OCI-1・OCI-4・#2432）: `/` を含む相対パスの `process.args[0]` を、pivot と `process.cwd` の適用の
+    /// 後に cwd 起点で解決して実行する。R1 は非ルート cwd の `./entrypoint.sh`、R2 は `bin/app` で、いずれも
+    /// 具体値の終了コード 7 と `READY` を照合する。R3（不在）と R4（`bin/app/.` が通常ファイル `bin/app` を指す。
+    /// ENOTDIR 相当で拒否）は成功起動にならず（start の失敗なら Created のまま、起動後なら 127）、子が残らない。
+    fn scenario_r_cwd_relative_entrypoint(env: &Env, tag: u32) {
+        const EXIT_CODE: i32 = 7;
+        let setup = |name: &str, cwd: &str, arg0: &str, probe_at: Option<&str>| {
+            let bundle = Bundle::new(name);
+            let ld = make_rootfs(&bundle.rootfs(), true);
+            let root = bundle.rootfs();
+            mkdir(&root.join("work/bin"));
+            if let Some(rel) = probe_at {
+                std::fs::copy(root.join("probe"), root.join(rel)).expect("copy probe");
+                std::fs::set_permissions(root.join(rel), std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod probe");
+            }
+            // `/probe` の絶対パスで拾われないよう、cwd 相対の解決だけに頼らせる。
+            std::fs::remove_file(root.join("probe")).expect("remove /probe");
+            let config = json!({
+                "ociVersion": "1.2.0",
+                "root": {"path": "rootfs", "readonly": false},
+                "hostname": HOSTNAME,
+                "process": {
+                    "user": {"uid": 0, "gid": 0},
+                    "args": [arg0, "--container-probe", "--exit-code", EXIT_CODE.to_string()],
+                    "env": ["PATH=/nonexistent", "TERM=dumb", format!("LD_LIBRARY_PATH={ld}")],
+                    "cwd": cwd
+                },
+                "mounts": [],
+                "linux": {"namespaces": [
+                    {"type": "pid"}, {"type": "mount"}, {"type": "uts"}, {"type": "ipc"}, {"type": "user"}
+                ]}
+            });
+            std::fs::write(
+                bundle.dir.join("config.json"),
+                serde_json::to_vec(&config).expect("serialize config"),
+            )
+            .expect("write config.json");
+            let id = ContainerId::new(format!("plr{name}{tag}")).expect("id");
+            do_create(env, &bundle, &id);
+            wait_single_thread();
+            (bundle, id)
+        };
+
+        for (name, cwd, arg0, at) in [
+            ("r1", "/work", "./entrypoint.sh", "work/entrypoint.sh"),
+            ("r2", "/work", "bin/app", "work/bin/app"),
+        ] {
+            let (_bundle, id) = setup(name, cwd, arg0, Some(at));
+            let started = start(
+                &env.store,
+                &env.recorder,
+                &env.launcher,
+                &StartRequest::new(id.clone()),
+                &timeouts(),
+            )
+            .unwrap_or_else(|e| panic!("{name}: start failed: {:?} {}", e.code(), e.message()));
+            let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> =
+                None;
+            let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_eq!(started.record().status().state(), ContainerState::Running);
+                let output = started.process().take_output().expect("container output");
+                reader_slot = Some(spawn_reader(output.stdout.expect("container stdout")));
+                let exit = started
+                    .process()
+                    .wait(timeout())
+                    .expect("wait for the probe")
+                    .expect("the probe did not exit within the timeout");
+                assert_eq!(exit, ProcessExit::Exited(EXIT_CODE), "{name}: exit");
+                let rx = &reader_slot.as_ref().expect("reader slot").0;
+                let mut lines = Vec::new();
+                let deadline = Instant::now() + timeout();
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    match rx.recv_timeout(left) {
+                        Ok(line) => lines.push(line),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            panic!("{name}: probe output did not reach EOF; got {lines:?}")
+                        }
+                    }
+                }
+                assert_eq!(value_of(&lines, "PID"), "1", "{name}");
+                assert_eq!(value_of(&lines, "CWD"), "/work", "{name}");
+                assert!(
+                    lines.contains(&PROBE_READY.to_string()),
+                    "{name}: {lines:?}"
+                );
+            }));
+            finish_started(started, verified);
+            let (rx, reader) = reader_slot.take().expect("reader slot");
+            reader.join().expect("join reader");
+            drop(rx);
+            assert!(eventually(|| children_of_self().is_empty()));
+        }
+
+        // R3: 不在、R4: `bin/app/.`（bin/app は通常ファイル）。どちらも成功起動にならず、子が残らない。
+        for (name, arg0, at) in [
+            ("r3", "./nothere", None),
+            ("r4", "bin/app/.", Some("work/bin/app")),
+        ] {
+            let (_bundle, id) = setup(name, "/work", arg0, at);
+            match start(
+                &env.store,
+                &env.recorder,
+                &env.launcher,
+                &StartRequest::new(id.clone()),
+                &timeouts(),
+            ) {
+                Err(e) => {
+                    println!(
+                        "production_launcher: scenario={name} start refused code={:?}",
+                        e.code()
+                    );
+                    assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+                    assert!(!env.launcher.last_launch_may_have_left_process());
+                }
+                Ok(started) => assert_started_child_exits_127(started),
+            }
+            assert!(eventually(|| children_of_self().is_empty()));
+        }
+        println!(
+            "production_launcher: scenario=cwd-relative resolved from cwd, exit code {EXIT_CODE}; missing and bin/app/. not started"
         );
     }
 

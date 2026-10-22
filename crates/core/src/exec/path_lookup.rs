@@ -81,7 +81,7 @@ pub(super) fn validate_name(name: &OsStr) -> Result<(), ExecError> {
 
 /// `/` を含む相対パスを、cwd から辿る要素列にする（OCI-1・OCI-4・#2432）。
 ///
-/// 空・NUL・先頭 `/`・`/` を含まない名前・`..` 要素・末尾 `/`・上限超過は `InvalidArgument`（段 `Validate`）。
+/// 空・NUL・先頭 `/`・`/` を含まない名前・`..` 要素・末尾 `/`・末尾 `.`・上限超過は `InvalidArgument`（段 `Validate`）。
 /// `.` と空要素は飛ばす。全長・要素数・要素長の上限は確保の前に確かめる。戻り値は 1 件以上の要素
 /// （最後が最終要素）で、各要素は `/`・NUL を含まない。
 pub(super) fn relative_components(path: &OsStr) -> Result<Vec<CString>, ExecError> {
@@ -102,6 +102,11 @@ pub(super) fn relative_components(path: &OsStr) -> Result<Vec<CString>, ExecErro
     }
     if bytes.ends_with(b"/") {
         return Err(invalid("the entrypoint path must not end with '/'"));
+    }
+    // 末尾の `.` を黙って落とすと `bin/app/.`（app がディレクトリである要求）が通常ファイル `bin/app` の
+    // 実行に化けるため、execvp 相当の ENOTDIR 契約を守って拒否する。
+    if bytes.rsplit(|b| *b == b'/').next() == Some(b".".as_slice()) {
+        return Err(invalid("the entrypoint path must not end with '.'"));
     }
     let mut out: Vec<CString> = Vec::new();
     for comp in bytes.split(|b| *b == b'/') {
@@ -279,7 +284,21 @@ mod tests {
         let deep = vec!["a"; RELATIVE_MAX_COMPONENTS + 1].join("/");
         let long = format!("a/{}", "x".repeat(PATH_SEARCH_MAX_NAME_BYTES + 1));
         let cases = [
-            "../x", "a/../x", "a/..", "..", "a/b/", "./", "/x", "x", "a\0b/c", "", ".//", &deep,
+            "../x",
+            "a/../x",
+            "a/..",
+            "..",
+            "a/b/",
+            "./",
+            "bin/app/.",
+            "a//.",
+            "./.",
+            "/x",
+            "x",
+            "a\0b/c",
+            "",
+            ".//",
+            &deep,
             &long,
         ];
         for input in cases {

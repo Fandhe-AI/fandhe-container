@@ -25,7 +25,9 @@
 //!   Warning とする。判定できなかった場合は `CGROUP_INCONCLUSIVE`（4）。
 //!
 //! # 未実装（REPAIR-3）
-//! - `start` の事前検査への connect の追加（`start` の挙動の変更になるため別判断）。
+//! - `start` の事前検査への connect の追加（`start` の挙動の変更になるため別判断。#2448・
+//!   `docs/design/user-manager-connect-precheck.md`・オーナー承認待ち）。
+//! - connect 先の `SO_PEERCRED` の照合（同上の判断待ち）。
 //! - `delete` が検出に失敗したときに記録の経路へ回すこと（`commands::stop_delete` の doc 参照）。
 
 #[cfg(target_os = "linux")]

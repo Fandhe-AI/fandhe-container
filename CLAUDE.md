@@ -85,6 +85,7 @@ fandhe-container/
 │   │   ├── crate-naming.md        # crate 短縮名・plugin crate 配置の確定内容（TASK-1・REPAIR-1）
 │   │   ├── rootless-network.md    # rootless ネットワーク外部ヘルパーの判断記録（TASK-147・NET-9。pasta を採用〔#340〕。実装・実証は #341）
 │   │   ├── privilege-separation.md  # 権限分離方式の比較と必要最小権限の設計書（TASK-171.1.1・SUP-14。方式承認済み〔#1454〕）
+│   │   ├── user-manager-connect-precheck.md  # start の事前検査への実 connect と connect 先の SO_PEERCRED 照合を足すかの判断記録（#2448・CORE-3・SUP-14。オーナー承認待ち）
 │   │   ├── rootful-host-root.md   # RootfulHostRoot（ホスト root のまま分離する権限モデル）を許すかの判断記録（#2241・SEC-5・CORE-6。オーナー承認待ち）
 │   │   ├── healthcheck-argv-timeout.md  # healthcheck の argv[0] の解決方式と timeout の上限の判断記録（#2439・SUP-4・TASK-161 追補。オーナー承認待ち）
 │   │   ├── subid-owner-resolution.md  # rootless の subuid / subgid の所有者名を passwd 優先・無ければ `getent`（NSS）で解決する方針の判断記録（#2390・SEC-5・CORE-6。shadow 4.13 の `newuidmap` の照合に合わせる）

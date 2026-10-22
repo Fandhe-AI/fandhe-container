@@ -305,3 +305,29 @@ fn rootfs_release_failure_during_rollback_keeps_the_bundle() {
     assert_eq!(e.code(), CriErrorCode::ResourceExhausted);
     assert!(tmp.0.join("ctr1").is_dir());
 }
+
+#[test]
+fn release_after_a_precheck_failure_keeps_an_existing_bundle_with_the_same_id() {
+    // CRI-1・REPAIR-12: 同 ID の既存 bundle があり事前検証（tty・image 欠落）で失敗しても、巻き戻し release は
+    // 既存の bundle と rootfs を消さない。
+    let (tmp, _rootfs, p) = setup("precheck-existing");
+    let dir = prepare(&p, "ctr1", &container()).unwrap();
+    let mut c = container();
+    c.tty = true;
+    let e = prepare(&p, "ctr1", &c).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+    p.release("ctr1").expect("rollback release is a no-op");
+    assert!(dir.join("config.json").exists());
+    assert!(dir.join("rootfs").is_dir());
+
+    let mut c = container();
+    c.image = None;
+    let e = prepare(&p, "ctr1", &c).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::InvalidArgument);
+    p.release("ctr1").expect("rollback release is a no-op");
+    assert!(tmp.0.join("ctr1/rootfs").is_dir());
+
+    // 通常の release は消す。
+    p.release("ctr1").expect("release");
+    assert!(!dir.exists());
+}

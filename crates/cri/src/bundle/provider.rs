@@ -50,7 +50,7 @@ pub struct SpecBundleProvider {
     /// 構築時に検証した root の (dev, ino)（unix のみ）。
     #[cfg(unix)]
     root_identity: (u64, u64),
-    /// 既存 bundle を理由に `prepare` が拒否した ID（この provider が作っていない実体を `release` が消さないため）。
+    /// `prepare` が bundle を作成できずに失敗した ID（事前検証の失敗・既存 bundle を含む）（この provider が作っていない実体を `release` が消さないため）。
     refused: Mutex<HashSet<String>>,
 }
 
@@ -209,6 +209,9 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), CriError> {
 impl BundleProvider for SpecBundleProvider {
     fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
         let dir = self.bundle_dir(req.container_id)?;
+        // 事前検証の失敗でも、同 ID の既存実体はこの provider が作っていない。直後の release（呼び出し元の
+        // 巻き戻し）で消さないよう、bundle を作成できるまで ID を拒否扱いにしておく。
+        self.lock_refused().insert(req.container_id.to_owned());
         self.verify_root()?;
         // ファイルシステムに触れる前に、設定だけで判定できる拒否を済ませる。
         validate_config(req.sandbox_config, req.config)?;
@@ -219,13 +222,9 @@ impl BundleProvider for SpecBundleProvider {
             .filter(|i| !i.image.is_empty())
             .ok_or_else(|| CriError::invalid_argument("image is required"))?;
 
-        if let Err(e) = create_private_dir(&dir) {
-            if e.code() == crate::error::CriErrorCode::FailedPrecondition {
-                // 既存の実体はこの provider が作っていない。直後の release で消さない。
-                self.lock_refused().insert(req.container_id.to_owned());
-            }
-            return Err(e);
-        }
+        // 作成に成功した時だけ所有する（拒否扱いを外す）。既存・作成失敗は拒否扱いのまま残す。
+        create_private_dir(&dir)?;
+        self.lock_refused().remove(req.container_id);
         let rootfs = dir.join("rootfs");
         let built = (|| {
             let defaults = self.rootfs.prepare(image, &rootfs)?;

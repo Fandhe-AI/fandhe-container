@@ -878,26 +878,39 @@ mod imp {
             }
             Err(_) => return Err(refuse()),
         };
-        match fstat(root.as_fd()) {
-            Ok((dev, ino, true, _)) if (dev, ino) == identity => {}
+        let (root_dev, root_mode) = match fstat(root.as_fd()) {
+            Ok((dev, ino, true, mode)) if (dev, ino) == identity => (dev, mode & 0o7777),
             _ => return Err(refuse()),
-        }
-        // 作成世代の照合（inode の再利用で作り直された別のディレクトリを消さない）。記録欠落・不一致・
-        // 印の欠落はいずれも拒否する（fail-closed）。
-        if let Owner::Token(expected) = owner
-            && !expected.is_some_and(|t| token_matches(root.as_fd(), t))
-        {
-            return Err(refuse());
-        }
-        let root_dev = fstat(root.as_fd())
-            .map(|(d, _, _, _)| d)
-            .map_err(|_| remove_failed())?;
+        };
         // rootfs 自身がマウントポイントなら（親と別のマウント）マウント元を消さないよう拒否する。
         // 下位の bind mount は、再帰の各エントリを開くたびに `mnt_id` を照合して跨がない（検査後に足された
         // マウントも、経路の snapshot に依存せず fd の実体で拒否する。fail-closed）。
         let root_mnt = mount_id(root.as_fd()).ok_or_else(refuse)?;
         if mount_id(parent) != Some(root_mnt) {
             return Err(refuse());
+        }
+        // 作成世代の照合（inode の再利用で作り直された別のディレクトリを消さない）。記録欠落・不一致・
+        // 印の欠落はいずれも拒否する（fail-closed）。
+        if let Owner::Token(expected) = owner {
+            // 展開器が rootfs 自身の mode から所有者の search 権限を外していると（`seal` は一時的に補って
+            // 印を書く）、印を開けず正しい記録でも拒否してしまう。固定した fd の実体（`/proc/self/fd/N` は
+            // 経路を再解決しない）の mode を一時的に補って照合し、不一致なら元の mode へ戻してから拒否する。
+            // 一致すれば続く `remove_children` が中身ごと消すので戻さない。
+            let proc_root = format!("/proc/self/fd/{}", root.as_raw_fd());
+            let widened = root_mode | 0o100;
+            if widened != root_mode {
+                std::fs::set_permissions(&proc_root, std::fs::Permissions::from_mode(widened))
+                    .map_err(|_| refuse())?;
+            }
+            if !expected.is_some_and(|t| token_matches(root.as_fd(), t)) {
+                if widened != root_mode {
+                    let _ = std::fs::set_permissions(
+                        &proc_root,
+                        std::fs::Permissions::from_mode(root_mode),
+                    );
+                }
+                return Err(refuse());
+            }
         }
         let mut seen = 0usize;
         remove_children(root.as_fd(), root_dev, root_mnt, 0, &mut seen)?;
@@ -1362,6 +1375,62 @@ mod tests {
             RecordedRootfsRemoval::Removed
         );
         assert!(!b.join("rootfs").exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7（#2378）: 展開器が rootfs 自身から所有者の search 権限まで外しても（0600・0000）、削除側は
+    /// 照合の前に権限を一時的に補うので、正しい記録なら消せる（印の検索が EACCES で拒否にならない）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_remove_recorded_rootfs_without_owner_search_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        for (i, m) in [0o600u32, 0o000].into_iter().enumerate() {
+            let b = tmp(&format!("rec-nosearch-{i}"));
+            let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+            std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
+            std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(m))
+                .expect("chmod");
+            c.seal().expect("seal");
+            c.publish().expect("publish");
+            let rec = c.record().expect("record");
+            assert_eq!(
+                remove_recorded_rootfs(&b, &rec).expect("remove"),
+                RecordedRootfsRemoval::Removed,
+                "mode {m:o}"
+            );
+            assert!(!b.join("rootfs").exists());
+            let _ = std::fs::remove_dir_all(&b);
+        }
+    }
+
+    /// OCI-7・SEC-1（#2378）: 照合のために補った権限は、照合が不一致（拒否）なら元の mode へ戻す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_remove_recorded_rootfs_restores_mode_on_token_mismatch() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = tmp("rec-nosearch-mismatch");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
+        std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(0o000))
+            .expect("chmod");
+        c.seal().expect("seal");
+        c.publish().expect("publish");
+        let rec = c.record().expect("record");
+        let (dev, ino) = rec.identity();
+        let wrong = ImageRootfsRecord::new(rec.relative_path().to_path_buf(), dev, ino)
+            .and_then(|r| r.with_token("0".repeat(32)))
+            .expect("wrong token record");
+        let root = b.join("rootfs");
+        let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o7777;
+        let e = remove_recorded_rootfs(&b, &wrong).expect_err("mismatch");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(mode(&root), 0o000);
+        // 正しい記録では消せる。
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("remove"),
+            RecordedRootfsRemoval::Removed
+        );
+        assert!(!root.exists());
         let _ = std::fs::remove_dir_all(&b);
     }
 

@@ -4395,16 +4395,52 @@ pub(crate) fn kill_pid(pid: u32, sig: Signal) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
-    let raw = positive_pid(pid)?;
+    send_kill(KillTarget::Process(positive_pid(pid)?), sig)
+}
+
+/// プロセスグループ `pgid` の全員へシグナルを送る（`kill(-pgid, sig)`）。
+///
+/// rootless の範囲写像で、失敗後に mapper と、mapper が起動した `newuidmap` / `newgidmap`(helper。mapper の
+/// `setsid` でできたグループを継承する)をまとめて止めるために使う(`exec::isolate_rootless_subordinate_with`。
+/// CORE-6・SEC-5・#2376)。呼び出し側は、`pgid` が未回収の自分の子(グループのリーダー)の pid であることを保証する
+/// (未回収の間は pid 番号が解放されず、別のグループ ID として再利用されない)。
+///
+/// `pgid` が 0（自グループ宛て）・1（`kill(-1)` は全プロセス宛てになる）・`i32` を超える値は `EINVAL` で拒否する。
+/// グループに誰も居なければ `ESRCH`。
+pub(crate) fn kill_process_group(pgid: u32, sig: Signal) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    match positive_pid(pgid)? {
+        1 => Err(SysError::Os(EINVAL)),
+        raw => send_kill(KillTarget::Group(raw), sig),
+    }
+}
+
+/// [`send_kill`] の宛先。中身は検証済みの値（`Process` は 1 以上、`Group` は 2 以上）。
+enum KillTarget {
+    Process(i32),
+    Group(i32),
+}
+
+/// `kill(2)` の本体（[`kill_pid`]・[`kill_process_group`] が共有する唯一の呼び出し）。
+fn send_kill(target: KillTarget, sig: Signal) -> Result<(), SysError> {
+    // 宛先の番号を `unsafe` の外で組み立てる。0（自グループ）と -1（全プロセス）にはならないことをここで確かめる。
+    let raw = match target {
+        KillTarget::Process(p) if p > 0 => p,
+        // `g` は 2..=i32::MAX なので符号反転は溢れず、-1 にもならない。
+        KillTarget::Group(g) if g > 1 => -g,
+        _ => return Err(SysError::Os(EINVAL)),
+    };
     let number = match sig {
         Signal::Kill => consts::SIGKILL,
         // 1..=64 以外（0 は存在確認、65 以上は未定義）は送らずに拒否する。
         Signal::Number(n) if (1..=64).contains(&n.get()) => i32::from(n.get()),
         Signal::Number(_) => return Err(SysError::Os(EINVAL)),
     };
-    // SAFETY: 引数は整数のみでポインタを取らない。`raw` は正であることを確認済みで、
-    // プロセスグループ・全プロセス宛て（0・負値）にならない。`number` は `SIGKILL` 定数か、
-    // 1..=64 を検証済みの番号だけである。
+    // SAFETY: 引数は整数のみでポインタを取らない。`raw` は正の pid（特定の 1 プロセス）か、2 以上の pgid の
+    // 符号反転（特定の 1 グループ）のどちらかで、自グループ宛て（0）・全プロセス宛て（-1）にならないことを
+    // 直前で確認済み。`number` は `SIGKILL` 定数か、1..=64 を検証済みの番号だけである。
     let rc = unsafe { kill(raw, number) };
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
@@ -7432,6 +7468,110 @@ mod tests {
         };
         // 終了ステータスの下位 7 ビットが終了シグナル。
         assert_eq!(status & 0x7f, 15);
+    }
+
+    /// CORE-6・SEC-5（#2376）: グループ宛ての送信は、自グループ（0）・全プロセス（1 → `kill(-1)`）・`i32` を超える
+    /// pgid と範囲外のシグナル番号を `kill` を呼ばずに `EINVAL` で拒否する。
+    #[test]
+    fn core6_kill_process_group_rejects_self_all_and_overflow() {
+        assert_eq!(
+            kill_process_group(0, Signal::Kill),
+            Err(SysError::Os(EINVAL))
+        );
+        assert_eq!(
+            kill_process_group(1, Signal::Kill),
+            Err(SysError::Os(EINVAL))
+        );
+        assert_eq!(
+            kill_process_group(i32::MAX as u32 + 1, Signal::Kill),
+            Err(SysError::Os(EINVAL))
+        );
+        let n65 = Signal::Number(std::num::NonZeroU8::new(65).unwrap());
+        assert_eq!(
+            kill_process_group(std::process::id(), n65),
+            Err(SysError::Os(EINVAL))
+        );
+        assert_eq!(
+            send_kill(KillTarget::Group(1), Signal::Kill),
+            Err(SysError::Os(EINVAL))
+        );
+        assert_eq!(
+            send_kill(KillTarget::Process(0), Signal::Kill),
+            Err(SysError::Os(EINVAL))
+        );
+    }
+
+    /// CORE-6・SEC-5（#2376）: 自分のグループを作った子（リーダー）とその子（同じグループ）の両方へ、グループ宛ての
+    /// SIGKILL が届く（mapper と helper をまとめて止める経路の実体）。グループに誰も居なければ `ESRCH`。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core6_kill_process_group_reaches_leader_and_member() {
+        use std::io::{Read as _, Write as _};
+        // リーダーは自分のセッション（= グループ）を作り、同じグループの子を 1 つ fork して、その pid を報告する。
+        let (mut ready_read, ready_write) = std::io::pipe().unwrap();
+        let ready_write = std::fs::File::from(OwnedFd::from(ready_write));
+        let leader = fork_single_threaded_with_no_flush(
+            || true,
+            || {
+                if new_session().is_err() {
+                    return 1;
+                }
+                let member = fork_single_threaded_with_no_flush(
+                    || true,
+                    || {
+                        std::thread::sleep(std::time::Duration::from_secs(120));
+                        0
+                    },
+                    1,
+                );
+                let Ok(member) = member else {
+                    return 1;
+                };
+                let mut w = &ready_write;
+                let _ = w.write_all(&member.to_le_bytes());
+                std::thread::sleep(std::time::Duration::from_secs(120));
+                0
+            },
+            1,
+        )
+        .unwrap();
+        drop(ready_write);
+        let mut buf = [0u8; 4];
+        ready_read.read_exact(&mut buf).unwrap();
+        let member = u32::from_le_bytes(buf);
+        kill_process_group(leader, Signal::Kill).unwrap();
+        // メンバー（リーダーの子。リーダーの死で再親付けされ、この試験プロセスの子ではない）は `/proc` の state で
+        // 終了を確かめる（ゾンビ化か、回収されて消える）。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match std::fs::read_to_string(format!("/proc/{member}/stat")) {
+                Ok(stat)
+                    if stat
+                        .rsplit_once(')')
+                        .is_some_and(|(_, r)| r.trim_start().starts_with('Z')) =>
+                {
+                    break;
+                }
+                Err(_) => break,
+                Ok(_) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "member {member} still alive"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        let status = loop {
+            match wait_pid_nohang(leader).unwrap() {
+                Some(s) => break s,
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        assert_eq!(status & 0x7f, 9, "the leader must be killed by SIGKILL");
+        // 同じ試験プロセスの別の試験が subreaper を有効にしていると、メンバーはこのプロセスへ再親付けされる。
+        // その場合だけ回収する（それ以外は `ECHILD` で、init が回収する）。
+        let _ = wait_pid_nohang(member);
     }
 
     /// SUP-12・TASK-169.1: RLIMIT_* の番号を固定値で照合する（asm-generic/resource.h）。

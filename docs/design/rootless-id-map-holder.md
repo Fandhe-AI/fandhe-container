@@ -27,7 +27,7 @@ I ─ fork ─> U : fd 3 以上を閉じる → PDEATHSIG=SIGKILL → 親が I �
               → RELEASE / EOF / 期限まで待つ → _exit
 I ─ READY を期限つきで受ける
 I ─ fork ─> M : go を待つ → /proc/<U> の fd を開く → 「M の親が I」かつ「U の ppid(fd 経由の stat)が I」を確認
-              → U の uid_map / gid_map を書く(newuidmap / newgidmap 経由もこの fd:0) → 応答
+              → U の uid_map / gid_map を書く(newuidmap / newgidmap には U の pid の数値。#2376) → 応答
 I ─ go を送り M の応答を期限つきで受ける(2 × timeout + 1s)
 I ─ U の pidfd で setns(CLONE_NEWUSER) → /proc/self/ns/user が U のものであること・euid/egid == 0 を確認
 I ─ RELEASE を U へ送り、U と M を回収 → 残りの namespace を unshare(従来どおり)
@@ -38,7 +38,8 @@ I ─ RELEASE を U へ送り、U と M を回収 → 残りの namespace を un
 - 呼び出し元が non-dumpable だった場合は、参加の後にも `set_non_dumpable` で戻す方向にだけ動かす（カーネルの資格情報の更新による dumpable の変化に備える）。公開 API（`isolate_rootless_subordinate`）も同じ経路に揃えたため、「non-dumpable の呼び出し元を fork 前に拒否する」前提条件（#2243）は不要になり削除した。
 - 応答は REPAIR-2 に沿った固定長フレーム（`MapperReply` の 3 バイト、RELEASE は 1 バイト定数）。READY・go・応答・RELEASE の待ちはすべて期限つき（REPAIR-5）。U は RELEASE を `3 × timeout + 5s` まで待ち、I が死ねば PDEATHSIG で終わる。
 - M の TOCTOU（SEC-5）: 対象が「親の pid」から「兄弟の U の pid」に変わる。M は先に `ProcHandle` で `/proc/<U>` の fd を開き、その後で M 自身の親と U の ppid がともに I であることを確かめる。I が生きていて U が I の未回収の子なら pid は再利用されておらず、fd は以後同じプロセスを指す。
-- 失敗時の後始末（CORE-2）: U は helper を持たないので、どちらの呼び出し元でも I が kill・回収する。M の扱いは従来どおり（公開 API は kill・回収、launcher は kill せず C の識別子の再探索が helper ごと回収）。U は I の `comm`（起動識別子）を引き継ぎ exec しないため、I が報告せずに死んでも C の再探索で見つけられる。
+- helper へ渡す対象（#2376）: ubuntu-latest の shadow 4.13 の `newuidmap` / `newgidmap` は `fd:N` 形式を受け付けないため、U の pid を数値で渡す。helper の書き込み先は fd で固定されないので、U の pid が解放（回収）されるのは helper が止まった後に限る（下の後始末）。成功時は M が helper を回収してから応答する。
+- 失敗時の後始末（CORE-2・CORE-6・SEC-5）: I は先に M へ `SIGKILL`（回収しない）、続けて M のプロセスグループ（M が写像の前に `setsid` で作り、helper が継承する）へ `SIGKILL` を送り、その後で U を kill・回収する。`kill(2)` が戻った後の helper はユーザー空間へ戻らず、新たに `/proc/<U>` を開いて書けない。グループ宛てが失敗した場合は U を kill だけして回収しない（ゾンビの間は pid が保たれる。fail-closed）。M は公開 API では kill・回収し、launcher では回収せず、C の識別子の再探索が helper ごと回収する。U は I の `comm`（起動識別子）を引き継ぎ exec しないため、I が報告せずに死んでも C の再探索で見つけられる。再探索は、識別子つきの全候補（U・M・PID 1）の子孫（helper）を止めてゾンビ化を確かめてから錨を回収し、1 つでも保持になればどの錨も回収しない（U を helper より先に回収しない）。
 
 ## 4. 残る影響と許容の根拠
 

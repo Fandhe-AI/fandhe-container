@@ -26,8 +26,12 @@
 //!   （[`ProcHandle`]）で固定する。mapper は先に fd を開き、その**後**に mapper 自身の `parent_id()` と対象(holder)の
 //!   親(fd 経由の stat)がともに I のままであることを確認する（開いた時点で pid は生きた親を指していたと言える）。以後の書き込み・読み戻しは
 //!   fd 経由（`/proc/self/fd/N/...`）で、対象が死んで pid が再利用されても別プロセスへは届かず失敗する。
-//!   `newuidmap` / `newgidmap` には pid 文字列を渡す（shadow 4.13 は `fd:<pidfd>` 形式を受け付けないため。
-//!   対象の holder は I の子で I が reap するまで pid が解放されず、mapper は fd を保持し続ける。#2376）。
+//!   `newuidmap` / `newgidmap` には pid 文字列を渡す（shadow 4.13 は `fd:<pidfd>` 形式を受け付けないため。#2376）。
+//!   helper の書き込み先は fd で固定されないため、対象（holder）を回収するのは helper が止まった後に限る:
+//!   成功時は mapper が helper を回収してから応答する。失敗時は I が mapper とそのプロセスグループ（helper を含む）へ
+//!   `SIGKILL` を送ってから holder を回収し、止めたと言えなければ holder を回収しない
+//!   （`exec::isolate_rootless_subordinate_with`）。I が死んだ場合は C の識別子の再探索が全候補の helper を止めて
+//!   から holder を回収する（`exec::launch_intermediate::rescan_unreported_init`）。
 //!   新規 FFI は不要（pidfd は採らない）。単独で [`apply_id_maps`] を呼ぶ場合は pid から fd を開くため、対象を reap する前
 //!   （`Child` を保持した状態）に呼ぶこと
 //! - SEC-5: ホスト ID 0 を含む写像と、コンテナ内 0 を持たない写像は [`IdMapSet::new`] が拒否する
@@ -773,9 +777,9 @@ fn run_helper(
         ));
     }
     // 対象は pid 文字列で渡す。shadow 4.13（ubuntu-latest）の `newuidmap` は `fd:<pidfd>` 形式を受け付けない
-    // （usage を出して終了する）ため。pid 再利用は、呼び出し側が `target`（`/proc/<pid>` の fd）を保持し、
-    // 対象が呼び出し元の子として reap されない間だけ書くことで防ぐ（holder は I の子で、I が reap するまで
-    // pid は解放されない。#2376）。
+    // （usage を出して終了する）ため（#2376）。pid 再利用への対策は、対象（holder）を helper が止まるまで回収しない
+    // ことで行う（成功時はここで helper を回収してから応答し、失敗時は I が mapper のグループごと止めてから holder を
+    // 回収する。モジュール doc の「pid 再利用（TOCTOU）対策」。CORE-6・SEC-5）。
     let mut cmd = Command::new(path);
     cmd.arg(target.pid().get().to_string());
     for e in set.entries() {

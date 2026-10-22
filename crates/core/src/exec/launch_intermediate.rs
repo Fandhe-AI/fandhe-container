@@ -829,6 +829,7 @@ pub(crate) fn rescan_unreported_init(
 ) -> Rescan {
     let mut out = Rescan::default();
     let me = std::process::id();
+    let mut candidates: Vec<NonZeroU32> = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
         note_scan_failure(&mut out, "cannot scan /proc for the init");
         return out;
@@ -886,7 +887,26 @@ pub(crate) fn rescan_unreported_init(
         }
         // 親が C の未回収の子(subreaper が再親付けした)なので、回収まで pid は解放されず、pidfd が開けなくても
         // `kill(2)` が別プロセスへ届くことはない。
-        reap_tagged(pid, subreaper, reap_timeout, me, &mut out);
+        candidates.push(pid);
+    }
+    // 2 段階で回収する(CORE-6・SEC-5・#2376)。範囲写像の helper(`newuidmap` / `newgidmap`)は holder を pid の数値で
+    // 受け取るため、識別子つきの子(holder・mapper・PID 1)のどれかを回収する前に、全員の子孫(helper)を止めて
+    // ゾンビ化を確かめる。1 つでも保持(列挙不完全・停止未確認)になれば、その子孫の helper が生きている可能性が
+    // あるため、どの錨も回収しない(停止したまま残し、`scan_incomplete` により呼び出し側が識別子で再探索する)。
+    let mut halted = Vec::with_capacity(candidates.len());
+    let mut retained = false;
+    for pid in candidates {
+        match halt_tagged(pid, reap_timeout, me, &mut out) {
+            Some(members) => halted.push((pid, members)),
+            None => retained = true,
+        }
+    }
+    if retained {
+        out.scan_incomplete = true;
+        return out;
+    }
+    for (pid, members) in halted {
+        reap_halted(pid, members, subreaper, reap_timeout, &mut out);
     }
     out
 }
@@ -907,18 +927,19 @@ pub(crate) fn rescan_unreported_init(
 ///    それ以外の親を持つ子孫(helper の子等。pid の安定を保証できない)が居れば列挙不完全とする
 /// 3. 停止を確かめられない・列挙不完全なら、`pid` も子孫も kill・回収せずに保持する(走査不完全。呼び出し側が
 ///    識別子を `rescans` に残し、次の再探索が同じ錨から再び辿る。fail-closed)
-/// 4. 子孫を `SIGKILL` → `pid` を kill・回収 → C へ再親付けされた子孫を回収する
-fn reap_tagged(
+/// 4. 子孫を `SIGKILL` し、全員のゾンビ化を確かめる(ここまでが本関数。保持なら `None`)
+/// 5. `pid` を kill・回収 → C へ再親付けされた子孫を回収する([`reap_halted`]。呼び出し側は、全候補の 1〜4 が
+///    済んでから 5 に進む。helper が holder を pid で受け取るため、helper を止める前に holder を回収しない。#2376)
+fn halt_tagged(
     pid: NonZeroU32,
-    subreaper: &ChildSubreaper,
     reap_timeout: Duration,
     me: u32,
     out: &mut Rescan,
-) {
+) -> Option<Vec<NonZeroU32>> {
     let halted = halt_and_confirm(pid.get(), reap_timeout);
     // 子孫の列挙が不完全かを、この候補の分だけ判定する(他の候補で立った不完全フラグと区別する)。
     let earlier_incomplete = std::mem::replace(&mut out.scan_incomplete, false);
-    let mut members = if halted {
+    let members = if halted {
         descendants_of(pid.get(), me, out)
     } else {
         note_scan_failure(
@@ -942,7 +963,7 @@ fn reap_tagged(
                 "kept a tagged process because its descendants could not be fully listed",
             ));
         }
-        return;
+        return None;
     }
     for member in &members {
         // 子孫は停止(またはゾンビ)の錨か C の未回収の子なので、回収されるまで pid は再利用されない。
@@ -959,8 +980,20 @@ fn reap_tagged(
                 "kept a tagged process because its descendants did not settle after SIGKILL",
             ));
         }
-        return;
+        return None;
     }
+    Some(members)
+}
+
+/// [`halt_tagged`] で子孫を止めた識別子つきの子 `pid` を kill・回収し、C へ再親付けされた子孫 `members` を回収する
+/// (CORE-2)。呼び出し側は、同じ再探索の全候補の [`halt_tagged`] が保持なしで済んだ後にだけ呼ぶ(#2376)。
+fn reap_halted(
+    pid: NonZeroU32,
+    mut members: Vec<NonZeroU32>,
+    subreaper: &ChildSubreaper,
+    reap_timeout: Duration,
+    out: &mut Rescan,
+) {
     let child = ContainerChild::adopt_reparented(pid, subreaper);
     if let Err(e) = child.kill_and_reap(reap_timeout) {
         if out.error.is_none() {
@@ -2074,6 +2107,86 @@ mod tests {
             child
                 .kill_and_reap(Duration::from_secs(5))
                 .expect("reap a descendant");
+        }
+    }
+
+    /// CORE-6・SEC-5・CORE-2(#2376): 同じ識別子の候補のうち 1 つでも保持(子孫の列挙不完全)になれば、子孫を持たない
+    /// 候補(holder 相当)も回収しない。helper は holder を pid の数値で受け取るため、helper を止めたと言えない間に
+    /// holder を回収して pid を解放しない。保持した候補は停止したまま残り、`scan_incomplete` で再探索を要求する。
+    #[test]
+    fn core6_rescan_keeps_holder_while_another_candidate_is_retained() {
+        let subreaper = ChildSubreaper::enable().expect("subreaper");
+        let tag = LaunchTag::fresh();
+        let (mut ready_read, ready_write) = std::io::pipe().unwrap();
+        let ready_write = std::fs::File::from(std::os::fd::OwnedFd::from(ready_write));
+        // holder 相当: 識別子を持ち、子孫を持たない。
+        let holder = fork_tagged_session_leader(tag, || {
+            std::thread::sleep(Duration::from_secs(120));
+            0
+        });
+        // mapper 相当: helper の下に pid の安定を保証できない孫が居る(列挙不完全で保持される)。
+        let mapper = fork_tagged_session_leader(tag, || {
+            let helper = sys::fork_single_threaded_with_no_flush(
+                || true,
+                || {
+                    if sys::set_process_comm(b"notatag-helper\0\0").is_err() {
+                        return EXIT_SETUP_FAILED;
+                    }
+                    let grandchild = sys::fork_single_threaded_with_no_flush(
+                        || true,
+                        || {
+                            let _ = sys::set_process_comm(b"notatag-grand\0\0\0");
+                            let mut buf = [0u8; 8];
+                            buf[..4].copy_from_slice(
+                                &std::os::unix::process::parent_id().to_le_bytes(),
+                            );
+                            buf[4..].copy_from_slice(&std::process::id().to_le_bytes());
+                            let mut w = &ready_write;
+                            let _ = w.write_all(&buf);
+                            std::thread::sleep(Duration::from_secs(120));
+                            0
+                        },
+                        EXIT_SETUP_FAILED,
+                    );
+                    if grandchild.is_err() {
+                        return EXIT_SETUP_FAILED;
+                    }
+                    std::thread::sleep(Duration::from_secs(120));
+                    0
+                },
+                EXIT_SETUP_FAILED,
+            );
+            if helper.is_err() {
+                return EXIT_SETUP_FAILED;
+            }
+            std::thread::sleep(Duration::from_secs(120));
+            0
+        });
+        drop(ready_write);
+        let mut buf = [0u8; 8];
+        read_within(&mut ready_read, &mut buf, Duration::from_secs(10));
+        let helper = u32::from_le_bytes(buf[..4].try_into().unwrap());
+        let grandchild = u32::from_le_bytes(buf[4..].try_into().unwrap());
+        let found = rescan_unreported_init(&tag, &subreaper, Duration::from_secs(1));
+        assert!(found.unreaped.is_empty(), "{found:?}");
+        assert!(found.scan_incomplete, "{found:?}");
+        assert_eq!(
+            found.error.as_ref().map(|e| e.message.as_str()),
+            Some("a descendant of a tagged process has an unexpected parent"),
+            "{found:?}"
+        );
+        let me = std::process::id();
+        assert_eq!(parent_of(holder), Some(me), "the holder must not be reaped");
+        assert!(!gone(mapper) && !gone(helper) && !gone(grandchild));
+        // 後始末: 孫 → helper の順に止め、錨(mapper・holder)を回収してから再親付けされた子孫を回収する。
+        let _ = sys::kill_pid(grandchild, sys::Signal::Kill);
+        let _ = sys::kill_pid(helper, sys::Signal::Kill);
+        wait_state(helper, 'Z');
+        for pid in [mapper, holder, helper, grandchild] {
+            let child = ContainerChild::adopt_reparented(NonZeroU32::new(pid).unwrap(), &subreaper);
+            child
+                .kill_and_reap(Duration::from_secs(5))
+                .expect("reap a test process");
         }
     }
 

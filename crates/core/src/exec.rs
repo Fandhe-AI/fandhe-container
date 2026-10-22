@@ -1582,7 +1582,9 @@ fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
 /// - シングルスレッドから呼ぶこと（holder・mapper の fork と `setns(CLONE_NEWUSER)` の制約。マルチスレッドは
 ///   副作用なしで `FailedPrecondition`）
 /// - 失敗したプロセスは破棄すること（写像は write-once で戻せない。[`isolate`] と同じ）。holder と mapper は
-///   どの失敗経路でも kill して回収する（ゾンビを残さない）
+///   どの失敗経路でも kill して回収する（ゾンビを残さない）。ただし holder の回収は、mapper と helper を
+///   グループごと止めた後に限る（helper は holder を pid の数値で受け取るため。#2376）。止めたと言えない場合は
+///   holder を kill だけして回収せず、ゾンビとして pid を保つ（CORE-6・SEC-5。fail-closed）
 /// - holder・mapper は親の死を EOF で検知できない場合があるため、待ちは read タイムアウトで止める
 ///   （holder は `PDEATHSIG` でも終わる。REPAIR-5）
 pub fn isolate_rootless_subordinate(
@@ -1684,19 +1686,30 @@ fn isolate_rootless_subordinate_with(
             }
         }
         Err(e) => {
-            // holder は helper を持たず I の子として必ず回収できるため、どちらの caller でも kill・回収する。
-            let _ = holder.kill_and_reap(MAPPER_REAP_TIMEOUT);
+            // helper(`newuidmap` / `newgidmap`)は holder を pid の数値で受け取る(shadow 4.13 は `fd:N` を受けない。
+            // #2376)。holder を回収すると pid が解放されて再利用され得るため、helper がもう `/proc/<pid>` を開いて
+            // 書けないことを確かめてから回収する(CORE-6・SEC-5)。mapper が居なければ helper も居ない。
+            let helpers_stopped = mapper.as_ref().is_none_or(stop_mapper_and_helpers);
+            if helpers_stopped {
+                // holder は helper を持たず I の子として必ず回収できる。
+                let _ = holder.kill_and_reap(MAPPER_REAP_TIMEOUT);
+            } else {
+                // helper を止めたと言えない間は holder を回収しない(止めるだけで、ゾンビの間は pid が保たれる)。
+                // 公開 API ではゾンビが呼び出しプロセスの終了まで残り、launcher では I の終了で C へ再親付けされ、
+                // C の識別子の再探索が helper の停止を確かめてから回収する(`rescan_unreported_init`。CORE-2)。
+                let _ = holder.kill_keep_unreaped();
+            }
             if let Some(m) = mapper {
                 match caller {
-                    // 公開 API: mapper を必ず回収する。回収自体の失敗は元のエラーを優先する。
+                    // 公開 API: mapper を回収する(helper を止められなかった場合も、mapper 自身はゾンビで残さない)。
+                    // 回収自体の失敗は元のエラーを優先する。
                     MapperCaller::Standalone => {
                         let _ = m.kill_and_reap(MAPPER_REAP_TIMEOUT);
                     }
-                    // launcher の I: mapper を kill しない。helper の実行中に mapper だけを殺すと helper が C へ
-                    // 再親付けされて識別子(`LaunchTag`)を持たないまま残り、C の判定が Clean に進む(CORE-2)。
-                    // mapper は I から継承した識別子を持ち、I の終了で C へ再親付けされるので、`R` を受けた C が
-                    // I の回収後に識別子で再探索し、helper を先に kill してから mapper と helper を回収する
-                    // (`launch_intermediate`)。
+                    // launcher の I: mapper を回収しない。止めた helper は mapper の死で C へ再親付けされ、識別子
+                    // (`LaunchTag`)を持たない。未回収の mapper(ゾンビ)の pid が helper のセッション ID として帰属の
+                    // 錨になり、`R` を受けた C が I の回収後に識別子で再探索して helper と mapper を回収する
+                    // (`launch_intermediate`。CORE-2)。
                     MapperCaller::Launcher => drop(m),
                 }
             }
@@ -1730,6 +1743,27 @@ fn isolate_rootless_subordinate_with(
             },
         },
     })
+}
+
+/// 失敗の後始末で、mapper と、mapper が起動した helper(`newuidmap` / `newgidmap`)を止める(CORE-6・SEC-5・#2376)。
+///
+/// 1. mapper 自身へ `SIGKILL`(回収しない。未回収の子なので pid と、それを ID に持つプロセスグループは再利用されない)。
+///    送達後の mapper は新しい helper を fork できない(fork は保留中の致死シグナルで失敗する)
+/// 2. mapper のプロセスグループ(mapper が写像の前に `setsid` で作り、helper が継承する)へ `SIGKILL`。`kill(2)` が
+///    戻った後の helper は以後ユーザー空間へ戻らないため、新たに `/proc/<holder の pid>` を開いて書くことはない。
+///    既に開いていた fd は holder を回収する前に開いたもの(holder を指す)である。`ESRCH`(グループが無い)は、
+///    mapper が `setsid` の前に止まった(helper を作っていない)ことを意味する
+///
+/// helper が止まったと言えるときだけ `true`。`false` なら呼び出し側は holder を回収しない(fail-closed)。
+fn stop_mapper_and_helpers(mapper: &ContainerChild) -> bool {
+    if !mapper.kill_keep_unreaped() {
+        return false;
+    }
+    match sys::kill_process_group(mapper.pid(), sys::Signal::Kill) {
+        Ok(()) => true,
+        Err(sys::SysError::Os(e)) if e == sys::ESRCH => true,
+        Err(_) => false,
+    }
 }
 
 /// 本番 launcher の中間プロセスが使う [`isolate_rootless_subordinate`](holder・mapper の fork 前に stdio を

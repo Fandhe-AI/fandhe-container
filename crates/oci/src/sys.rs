@@ -25,3 +25,11 @@ pub(crate) fn effective_uid() -> u32 {
     // SAFETY: 引数を取らず、POSIX の規定上エラー条件を持たない。
     unsafe { geteuid() }
 }
+
+// ディレクトリ fd 起点の操作（`openat2` 系。#2437・OCI-1・SEC-5）。Linux の x86_64 / aarch64 限定。
+// 他のアーキテクチャ・OS ではコンパイルせず、呼び出し側（`layer::anchored`）が fail-closed にする。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) mod at;

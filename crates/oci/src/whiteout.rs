@@ -10,6 +10,9 @@
 //! - `remove_tree_nofollow`: symlink を追従せずに実体（ファイル・symlink・ディレクトリの木）を再帰削除する。
 //!   パス 2（whiteout の適用）と、パス 3 で下位レイヤー由来のノードを置き換えるとき（image-spec の
 //!   「Changeset over existing files」）に `Extractor` から呼ばれる。
+//!   Linux の x86_64 / aarch64 の展開では `Extractor` が `layer::anchored` の fd 起点の削除（同じ契約。祖先の
+//!   差し替えで `root` の外を消さない。#2437）を使い、本関数は公開の `remove_extracted_tree` とそれ以外のホストの
+//!   展開から呼ばれる。
 //! - `remove_dir_contents_nofollow`: 不透明ディレクトリ（`.wh..wh..opq`。TASK-53.2・#413）用に、ディレクトリ自体は
 //!   残して直下の全エントリを再帰削除する。パス 2 で `Extractor::apply_markers` から呼ばれる。
 //!
@@ -35,7 +38,7 @@ const RESERVED_PREFIX: &[u8] = b".wh..wh.";
 /// 1 コンポーネントの最大バイト数（`NAME_MAX`）。
 const MAX_NAME_BYTES: usize = 255;
 /// 再帰削除の深さ上限（作成時のコンポーネント数上限 256 に余裕を足した防御値）。
-const MAX_REMOVE_DEPTH: usize = 300;
+pub(crate) const MAX_REMOVE_DEPTH: usize = 300;
 
 /// tar エントリの最終コンポーネントの分類結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +116,14 @@ pub(crate) fn remove_tree_nofollow(path: &Path) -> Result<(), OciError> {
 /// 存在しなければ成功（冪等）。`path` が symlink・非ディレクトリなら `FailedPrecondition`（追従しない）。
 /// 所有者の rwx が欠けるディレクトリ（0555・0000）は権限を戻してから消す。mode の復元は呼び出し側の遅延 mode
 /// （`Extractor::finish_dirs`）が担う。再帰の深さは `MAX_REMOVE_DEPTH`。
+// Linux の x86_64 / aarch64 は fd 起点の実装（`layer::anchored`）が使うため、本体は試験からだけ呼ばれる。
+#[cfg_attr(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    allow(dead_code)
+)]
 pub(crate) fn remove_dir_contents_nofollow(path: &Path) -> Result<(), OciError> {
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,

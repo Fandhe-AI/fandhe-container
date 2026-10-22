@@ -1,6 +1,6 @@
 # レイヤー展開の setuid / setgid / sticky の扱い
 
-OCI-1・OCI-2・SEC-5・SEC-1・REPAIR-3・REPAIR-4（#1810・#2251。前段は TASK-52.3・#409）。実装は `crates/oci/src/layer/extract.rs`。
+OCI-1・OCI-2・SEC-5・SEC-1・REPAIR-3・REPAIR-4（#1810・#2251・#2437。前段は TASK-52.3・#409）。実装は `crates/oci/src/layer/extract.rs`。
 
 ## 背景
 
@@ -29,6 +29,7 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
 | ポリシーが `PreserveIfOwnerMapped` | `StripPolicy` | 既定は fail-closed |
 | ホストが Linux | `UnsupportedHost` | macOS は非 root の通常ファイルへの sticky が `EFTYPE`、setgid の継承規則も異なる。Windows には mode が無い |
 | `root` がディレクトリで `mode & 0o077 == 0` | `RootAccessibleByOthers` | 0700 ならほかのユーザーは `root` より下へ入れず、祖先の権限は判定に要らない |
+| （展開中）`root` の所有者と 0700 が開始時のまま | `RootChangedDuringExtraction` | 展開の途中で変えられても、以後のビットを保持しない（#2437。下記「展開中の再確認」） |
 
 ファイル単位（`write_file` で書いた後、`fchmod` の前に評価。所有者は書いたファイル自身の metadata から得る）
 
@@ -54,8 +55,9 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
 
 ## 呼び出し側の契約
 
-- `root` を排他的に所有し、展開から rootfs として使い終わるまで 0700 を保つ。権限の後からの変更（TOCTOU）は防げない。
-  0700 の確認は展開の開始時の 1 回だけで、展開中・展開後には確かめ直さない。呼び出し側は展開中も展開の後も group / other に開かない（#2251 P2-2）
+- `root` を排他的に所有し、展開から rootfs として使い終わるまで 0700 を保つ。展開中の権限の変更は、特殊ビットを保持する
+  経路について展開中に検出して fail-closed にする（下記「展開中の再確認」・#2437）。展開の後は確かめ直さない。呼び出し側は
+  展開中も展開の後も group / other に開かない（#2251 P2-2）
 - 展開の後に呼び出し側が所有者を変えるときは、fchown → fchmod の順にし、所有者と mode を読み戻して確かめる。Linux は `chown` で
   setuid / setgid を落とすため、mode を先に適用するとビットが失われるか意図しない所有者の setuid が残る。展開内の `chown`
   （`ChownMapped`）は #2225 でこの順序を実装済み（#2251 P2-5）
@@ -102,7 +104,46 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
 - 根拠: `IdMap` はホスト ID 0 を含む写像を拒否するため、残る setuid / setgid はホスト上で非特権の subuid / subgid にしか
   効かない。`root` が 0700 なのでほかのホストユーザーは辿れない。コンテナ内で setuid が効くかは `process.noNewPrivileges` 次第
 - 適用後に mode を読み戻し、残っていなければ落とした件数に入れる（既存の規則と同じ）
-- TOCTOU（ディレクトリ fd 起点の解決が未実装）は既存の制限のまま。呼び出し側が `root` を排他的に所有する契約に依る
+- TOCTOU は Linux の x86_64 / aarch64 ではディレクトリ fd 起点の解決と展開中の再確認で縮める（下記）。呼び出し側が `root` を
+  排他的に所有する契約は引き続き前提
+
+## ディレクトリ fd 起点の解決と展開中の再確認（#2437・OCI-1・OCI-2・SEC-5）
+
+実装は `crates/oci/src/layer/anchored.rs`（`AnchoredRoot`）と `crates/oci/src/sys/at.rs`（`openat2` 等の自前宣言。新しい `unsafe` は
+`sys` の中だけ）。
+
+- 解決は 2 段にする。各コンポーネントの `lstat` による確認（別表記の検出 IO-5・型の衝突・symlink の chroot 意味論）は残し、
+  変更操作（作成・削除・symlink・hardlink・`chown`・mode の適用・whiteout の削除）だけを `root` の fd 起点にする。`root` は
+  展開の開始時に 1 回だけ `O_NOFOLLOW | O_DIRECTORY` で開き、以後パスで開き直さない
+- 親ディレクトリは、解決済みの物理コンポーネント列（symlink も `..` も含まない）を `root` の fd からの相対パスとして
+  `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)` で開き直す。列に symlink が
+  無いはずなので `RESOLVE_NO_SYMLINKS` は差し替えの検出器になる。確認の後に祖先が symlink にされると `ELOOP`、マウントを
+  またぐと `EXDEV`、非ディレクトリにされると `ENOTDIR` で失敗し、`FailedPrecondition`（`an extraction path changed during
+  extraction`）にする。`RESOLVE_IN_ROOT` は二重の保険。`EAGAIN`（解決中の rename・mount の競合）は 8 回まで再試行し、超えたら
+  同じエラー
+- 最終コンポーネントは親 fd に対する `*at(2)` で追従しない形にする: 作成は `O_CREAT | O_EXCL | O_NOFOLLOW`、`mkdirat`、
+  `symlinkat`、`linkat`（flags 0 で参照元の symlink を追従しない。`AT_EMPTY_PATH` は非特権で使えない）、`unlinkat`、
+  `fchownat(AT_SYMLINK_NOFOLLOW)`。hardlink は作成後に通常ファイルであることを確かめ、違えばリンクを消して拒否する
+- 古いカーネル: `openat2` は Linux 5.6 以降。`ENOSYS`・`E2BIG`・`EINVAL`（`open_how` や `RESOLVE_*` を知らない）は展開の開始前に
+  `Unimplemented`（`openat2 is not available on this kernel`）で拒否し、パス起点へ縮退しない。`Strip` ポリシーでも同じ（Landlock
+  前提の 5.13 より古いカーネルは CORE の前提外）。seccomp による `EPERM` は `PermissionDenied`
+- 他の OS・アーキテクチャ: macOS・Windows はパス起点のまま（特殊ビットの保持は Linux 限定で `UnsupportedHost` になるため、
+  SEC-5 の TOCTOU は Linux 固有）。Linux の他アーキテクチャは定数を確かめていないので `Unimplemented`
+- whiteout の削除（`remove_tree` / `remove_contents`）も fd 起点で、`getdents64` で列挙する。所有者の rwx が欠けるディレクトリは
+  権限を戻してから消すが、所有者に `r` が無い（0000）ディレクトリは開けず `PermissionDenied`（展開中のディレクトリは遅延
+  mode のため `finish_dirs` まで 0700 で、この経路には現れない）。公開の `remove_extracted_tree` はパス起点のまま
+
+### 展開中の再確認（SEC-5）
+
+- 特殊ビットを判定する直前と、ビットを付けた直後に、開いた `root` の fd の `fstat` で「ディレクトリで、`mode & 0o077 == 0`、
+  所有 uid が開始時と同じ」を確かめる。費用は特殊ビット付きのファイル数に比例する
+- 変わっていたら判定を一方向にラッチする（`SpecialBitsDecision::RootChangedDuringExtraction`）。そのファイルを含め以後は
+  すべて落とし（付けた直後の検出では `fchmod` で外す）、落とした件数は `stripped_bits` に数える
+- 保持済みのビットが 1 件でもある状態で前提が崩れた場合は、遡って外さず、全レイヤーの展開後（`chown_root` の前）に
+  `FailedPrecondition`（`the extraction root changed while special mode bits were preserved`）で展開全体を拒否する。`Err` を
+  受けた呼び出し側は `root` ごと破棄する（契約）。`chown_root` は `root` の所有者を正当に変えるため、その後は確認しない
+- 残る窓: `fstat` と `fchmod` の間は、事後の確認で縮めるがゼロではない。0700 は `root` の inode の性質なので、`root` のパスを
+  rename で動かされても fd 起点の書き込みと配下の保護は保たれる
 
 ## rootless の user namespace の中での展開（`OwnershipPolicy::ChownInUserNamespace`。#2382・OCI-2・SEC-5）
 
@@ -138,6 +179,9 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   `PreserveIfOwnerMapped` の rootless 経路（`chown` しない 1 行の写像）は従来どおり
 - 0700 の祖先ディレクトリで閉じ込めを判定する方式。`root` が 0700 のため、複数範囲の写像でもコンテナ内の非 root ユーザーは
   `/` を辿れない
+- macOS・Windows・Linux の他アーキテクチャでのディレクトリ fd 起点の解決（unix 全体なら `openat(O_DIRECTORY | O_NOFOLLOW)` の
+  1 コンポーネントずつの走査で統一できる）と、公開の `remove_extracted_tree` の fd 起点化（#2437 の範囲外）
+- oci の `sys` への `libc` との機械照合の導入（`docs/design/ffi-libc-check.md`。`sys/at.rs` の定数は一次情報との突き合わせのみ）
 - 本番の呼び出し元（pull → 展開 → 起動の経路）から `ExtractOptions` を渡す配線
 - `IdMap` と core の `IdMapSet` を下位 crate へ共通化するかどうか（crate 境界の判断）
 
@@ -151,6 +195,14 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
 Issue #2251 で追加: `sec5_setgid_dropped_when_file_owner_uid_is_host_root`・`oci2_global_pax_headers_count_toward_entry_limit`・
 `oci2_global_pax_headers_accumulate_across_layers`・`sec5_readback_setgid_only_drop_does_not_count_setuid_as_stripped`・
 `sec5_special_bit_counts_add_bits`。
+
+fd 起点の解決と再確認（#2437）: `extract.rs` の `anchored_tests`（`oci1_parent_swapped_to_symlink_after_probe_is_rejected`・
+`oci2_whiteout_parent_swapped_to_symlink_does_not_remove_outside`・`oci2_opaque_parent_swapped_to_symlink_does_not_remove_outside`・
+`oci1_hardlink_target_parent_swapped_is_rejected`・`sec5_root_mode_change_before_special_file_strips_remaining`・
+`sec5_root_owner_change_is_detected`・`sec5_root_mode_change_after_preserved_file_fails_closed`・
+`oci1_extract_refuses_when_openat2_unavailable`・`oci1_eagain_is_retried_with_a_cap`）、`anchored.rs` の単体試験と `sys/at.rs` の
+単体試験（dirent の解析・名前の検証・`RESOLVE_NO_SYMLINKS` の `ELOOP`）。既存の拒否試験（`oci1_path_traversal_is_rejected`・
+`oci1_symlink_*`・`oci1_hardlink_*`・`oci2_*_does_not_follow_symlinks`・`io5_*`）は期待値を変えずに通る。
 
 chown（#2225）: `extract.rs` の `chown_tests`（`chown` を記録する差し替え口で呼び出しの値・順序を照合。
 `sec5_chown_maps_tar_owner_through_multi_line_map`・`sec5_chown_order_file_before_mode`・

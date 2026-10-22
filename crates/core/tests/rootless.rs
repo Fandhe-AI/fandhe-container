@@ -58,7 +58,11 @@
 //! # 既知課題・未検証の条件（ホスト設定などで本テストが検証できない、または未実装で検証しないもの）
 //! - PID 1 の寿命の上限までの残り: 試験プロセスが外から SIGKILL された場合、PID 1 は上限（通常シナリオは
 //!   `lifecycle_entry_lifetime`）の間ホストに残りうる。上限より短い間隔で繰り返し殺される場合は無力
-//!   （外側の監視役による掃除は後続候補）
+//!   （外側の監視役 guard は導入しない。判断: 寿命の上限があるため残りは上限までに限られる。再親付けされた孫は
+//!   subreaper と fail-closed の子の照合〔`leftover_children`〕で検出・回収できる。試験プロセスと無関係な別プロセスから
+//!   PID 1 を止めるには、pid 指定の生の kill〔SEC-1 に反する〕か `sys` 外の新たな `unsafe`〔事前承認の範囲外〕が要り、
+//!   guard 自身も CI のタイムアウトやプロセスグループ単位の kill で一緒に殺されうる。実機で人が実行する際の運用上の
+//!   代替は `systemd-run --user --scope` の下で実行してスコープごと止めること。#2436）
 //! - AppArmor の `kernel.apparmor_restrict_unprivileged_userns=1`（Ubuntu 23.10 以降・24.04 の既定）:
 //!   非特権 user namespace での写像書き込みやマウントが拒否され、`PermissionDenied` で失敗する。緩和は
 //!   sysctl を 0 にするか AppArmor プロファイルの付与（いずれも root 権限が必要）。CI が緩和しているのは
@@ -84,6 +88,10 @@
 fn main() {
     println!("rootless: Linux only, not applicable on this OS");
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/leftover_children.rs"]
+mod leftover_children;
 
 #[cfg(target_os = "linux")]
 #[path = "support/real_entry.rs"]
@@ -116,6 +124,7 @@ mod linux {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use super::leftover_children::{assert_no_leftover_children, children_of_self};
     use super::real_entry;
     use fandhe_container_core::exec::{
         Hostname, IsolationConfig, Namespace, NamespaceSet, plan_rootless_subordinate,
@@ -141,17 +150,8 @@ mod linux {
     /// `StartTimeouts::new` の 600 秒上限を超えないよう 295 秒で打ち切る。
     const MAX_TIMEOUT_SECS: u64 = 295;
 
-    /// 実エントリポイント（PID 1）の寿命の上限（秒）を渡す `process.env` のキー（#2250・CORE-1・REPAIR-5）。
-    /// 値は試験自身が `make_bundle` で書く。
-    const ENTRY_LIFETIME_ENV: &str = "FANDHE_CONTAINER_TEST_ENTRY_LIFETIME_SECS";
-
-    /// 寿命の上限として受け付ける最大（秒）。env が無い・範囲外のときもこの値で打ち切り、無期限にはしない（fail-closed）。
-    const ENTRY_LIFETIME_MAX_SECS: u64 = 3600;
-
-    /// PID 1 が寿命の上限で自ら終わったときの終了コード。`EXIT_SETUP_FAILED`(125)・
-    /// `EXIT_EXEC_NOT_EXECUTABLE`(126)・`EXIT_EXEC_NOT_FOUND`(127) と重ならない値で、kill の
-    /// `Signaled(9)` とも区別できる。
-    const EXIT_ENTRY_LIFETIME_EXPIRED: i32 = 75;
+    // 寿命の上限の定数・env の解析・見張りは `real_entry` に共有している（#2436・REPAIR-1）。
+    use real_entry::{ENTRY_LIFETIME_MAX_SECS, EXIT_ENTRY_LIFETIME_EXPIRED};
 
     /// `abandoned` シナリオで使う短い寿命（秒）。
     const ABANDONED_LIFETIME_SECS: u64 = 3;
@@ -238,23 +238,19 @@ mod linux {
     /// ホストの init へ再親付けされる）でも、ホストに残るのは寿命の上限までになる（#2250・CORE-1・REPAIR-5。
     /// `sys` の外に `unsafe` を置かずに済む試験側の最終手段）。
     pub fn entry_init() {
+        let lifetime_secs = real_entry::arm_entry_lifetime();
         let mut lines = real_entry::entry_observations();
+        lines.push(("lifetime_secs", lifetime_secs.to_string()));
         let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname").map_or_else(
             |e| format!("error:{:?}", e.kind()),
             |s| s.trim().to_string(),
         );
         lines.push(("hostname", hostname));
         real_entry::write_report(&lines);
-        let secs = std::env::var(ENTRY_LIFETIME_ENV)
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|s| (1..=ENTRY_LIFETIME_MAX_SECS).contains(s))
-            .unwrap_or(ENTRY_LIFETIME_MAX_SECS);
-        let deadline = Instant::now() + Duration::from_secs(secs);
-        while Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
+        loop {
+            // 寿命の上限は見張りスレッドが担う。spurious wakeup はループで吸収する。
+            std::thread::park();
         }
-        std::process::exit(EXIT_ENTRY_LIFETIME_EXPIRED);
     }
 
     /// start が返した起動ハンドルを保持し、kill をそのハンドルへだけ委ねる signaler（テスト専用）。
@@ -332,7 +328,7 @@ mod linux {
     }
 
     /// `config.json` と `rootfs/`（`proc/`・実エントリポイント `/entry` とローダ・共有ライブラリ）を排他的に作る。
-    /// `lifetime` は PID 1 の寿命の上限で、`process.env` の `ENTRY_LIFETIME_ENV` へ秒で書く（`entry_init`）。
+    /// `lifetime` は PID 1 の寿命の上限で、`process.env` へ秒で書く（`real_entry::lifetime_env`。`entry_init`）。
     /// `RootfsDir::pin` は symlink を含む祖先を拒否するため、temp は canonicalize する。
     fn make_bundle(label: &str, lifetime: Duration) -> Bundle {
         let nanos = std::time::SystemTime::now()
@@ -351,7 +347,7 @@ mod linux {
             .expect("chmod bundle");
         let ld = real_entry::install_entry(&bundle.rootfs());
         let mut env = real_entry::entry_env(&ld);
-        env.push(format!("{ENTRY_LIFETIME_ENV}={}", lifetime.as_secs()));
+        env.push(real_entry::lifetime_env(lifetime));
         real_entry::write_rootless_config(
             &bundle.0,
             HOSTNAME,
@@ -379,19 +375,6 @@ mod linux {
             lifecycle(mode, euid, egid);
         }
         abandoned(euid, egid);
-    }
-
-    /// 呼び出しプロセスの子が `limit` 以内に 0 件になることを照合する（残りがあれば pid を含めて panic）。
-    fn assert_no_children_within(limit: Duration, what: &str) {
-        let deadline = Instant::now() + limit;
-        while !children_of_self().is_empty() {
-            assert!(
-                Instant::now() < deadline,
-                "no child may remain {what}: {:?}",
-                children_of_self()
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     /// 放置された起動ハンドル（#2250・CORE-1・REPAIR-5）: ハンドルの持ち主（試験プロセス）が kill を送らないまま
@@ -438,6 +421,10 @@ mod linux {
             let ready =
                 real_entry::read_report(&bundle.rootfs().join(real_entry::REPORT_FILE), timeout());
             assert_eq!(ready.get("pid").map(String::as_str), Some("1"));
+            assert_eq!(
+                ready.get("lifetime_secs").map(String::as_str),
+                Some(ABANDONED_LIFETIME_SECS.to_string().as_str())
+            );
             // kill を送らずに待つ。寿命 + 余裕の間に PID 1 が自分で終わる。
             let exit = handle.wait(lifetime + timeout() * 2).expect("wait");
             assert_eq!(
@@ -458,7 +445,7 @@ mod linux {
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert_no_children_within(timeout(), "after the abandoned entrypoint exited");
+            assert_no_leftover_children(timeout(), "after the abandoned entrypoint exited");
         }));
         // 検証が途中で panic しても実機に PID 1 を残さない（回収済みなら terminate は何もしない）。
         let terminated = handle.terminate(timeout());
@@ -472,19 +459,6 @@ mod linux {
         println!(
             "rootless: abandoned launch handle: PID 1 exited by its lifetime bound and left nothing behind (exit={EXIT_ENTRY_LIFETIME_EXPIRED}; host uid={euid}, gid={egid}; via ProductionLauncher)"
         );
-    }
-
-    /// 呼び出しプロセスの子（全スレッド分）の pid 一覧。
-    fn children_of_self() -> Vec<String> {
-        let mut out = Vec::new();
-        let tasks = std::fs::read_dir("/proc/self/task").expect("read /proc/self/task");
-        for t in tasks {
-            let t = t.expect("task entry");
-            if let Ok(s) = std::fs::read_to_string(t.path().join("children")) {
-                out.extend(s.split_whitespace().map(str::to_string));
-            }
-        }
-        out
     }
 
     /// root 実行（SEC-5）: コンテナ内 root をホスト root へ写す起動は試さず、拒否だけを照合する。
@@ -534,15 +508,7 @@ mod linux {
             ContainerState::Created
         );
         assert!(!launcher.last_launch_may_have_left_process());
-        let deadline = Instant::now() + timeout();
-        while !children_of_self().is_empty() {
-            assert!(
-                Instant::now() < deadline,
-                "no child may remain after a refused root launch: {:?}",
-                children_of_self()
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        assert_no_leftover_children(timeout(), "after a refused root launch");
         println!("rootless: host root launch rejected (SEC-5, root=true)");
     }
 
@@ -691,7 +657,7 @@ mod linux {
             t.expect("terminate");
         }
         // 終了後に子が残っていない（PID 1 の取り残しがない）ことを fail-closed で確かめる（#2250）。
-        assert_no_children_within(timeout(), "after the lifecycle scenario finished");
+        assert_no_leftover_children(timeout(), "after the lifecycle scenario finished");
 
         println!(
             "rootless: scenario {mode} lifecycle verified with the real entrypoint as PID 1 (create/start/kill/delete-rejected; host uid={euid}; via ProductionLauncher)"
@@ -778,6 +744,11 @@ mod linux {
         assert_eq!(field("uid"), "0");
         assert_eq!(field("gid"), "0");
         assert_eq!(field("hostname"), HOSTNAME);
+        // 見張り（寿命の上限）が期待どおりの値で張られたこと（#2436・REPAIR-12）。
+        assert_eq!(
+            field("lifetime_secs"),
+            lifecycle_entry_lifetime().as_secs().to_string()
+        );
         assert_eq!(field("nonewprivs"), "1");
         assert_eq!(field("seccomp"), "2");
         // 別の user namespace にいることは、初期 namespace の恒等写像ではない上の uid_map の完全一致で

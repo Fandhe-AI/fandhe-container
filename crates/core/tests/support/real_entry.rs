@@ -26,6 +26,10 @@
 //! - Landlock の ABI 6 以上（Linux 6.12 以上）を要する。満たさない環境は検出の失敗で panic（失敗）にし、
 //!   検証せずに成功する分岐は持たない（ci.md「実機前提テスト」）
 //! - 失敗はすべて panic。待ちはすべて期限つき（REPAIR-5）で、外部入力（報告ファイル）の長さ・行数に上限を設ける
+//! - 実エントリポイントには寿命の上限を付ける（#2250・#2436・CORE-1・REPAIR-5）。`arm_entry_lifetime` が見張りスレッドを
+//!   起こし、上限（`process.env` の `ENTRY_LIFETIME_ENV`。無い・範囲外なら `ENTRY_LIFETIME_MAX_SECS`）に達したら
+//!   `EXIT_ENTRY_LIFETIME_EXPIRED` で自ら終わる。PID 1 が終わればカーネルが PID namespace ごと落とすため、ハーネスが
+//!   固まる・外から殺されてもホストに残るのは上限までになる。無期限にはしない（fail-closed）
 
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -433,4 +437,54 @@ pub fn helper_mappings(euid: u32, egid: u32) -> (IdMapSet, IdMapSet) {
         rootless_mapping(euid, &uranges).expect("uid range mapping"),
         rootless_mapping(egid, &granges).expect("gid range mapping"),
     )
+}
+
+/// 実エントリポイントの寿命の上限（秒）を渡す `process.env` のキー（#2250・#2436・CORE-1・REPAIR-5）。
+/// 値は試験自身が bundle の config に書く（`lifetime_env`）。
+#[allow(dead_code)] // production_launcher・seccomp は使わない
+pub const ENTRY_LIFETIME_ENV: &str = "FANDHE_CONTAINER_TEST_ENTRY_LIFETIME_SECS";
+
+/// 寿命の上限として受け付ける最大（秒）。env が無い・範囲外のときもこの値で打ち切り、無期限にはしない。
+#[allow(dead_code)] // production_launcher・seccomp は使わない
+pub const ENTRY_LIFETIME_MAX_SECS: u64 = 3600;
+
+/// 実エントリポイントが寿命の上限で自ら終わったときの終了コード。`EXIT_SETUP_FAILED`(125)・
+/// `EXIT_EXEC_NOT_EXECUTABLE`(126)・`EXIT_EXEC_NOT_FOUND`(127) と重ならず、kill の `Signaled(9)` とも区別できる。
+#[allow(dead_code)] // production_launcher・seccomp は使わない
+pub const EXIT_ENTRY_LIFETIME_EXPIRED: i32 = 75;
+
+/// config の `process.env` に足す寿命の上限の 1 行（`KEY=秒`）。
+#[allow(dead_code)] // production_launcher・seccomp は使わない
+pub fn lifetime_env(lifetime: Duration) -> String {
+    format!("{ENTRY_LIFETIME_ENV}={}", lifetime.as_secs())
+}
+
+/// `process.env` から寿命の上限（秒）を読む。不在・解析不能・`1..=ENTRY_LIFETIME_MAX_SECS` の外は
+/// `ENTRY_LIFETIME_MAX_SECS`（無期限にしない）。
+#[allow(dead_code)] // production_launcher・seccomp は使わない
+pub fn entry_lifetime_from_env() -> u64 {
+    std::env::var(ENTRY_LIFETIME_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|s| (1..=ENTRY_LIFETIME_MAX_SECS).contains(s))
+        .unwrap_or(ENTRY_LIFETIME_MAX_SECS)
+}
+
+/// 実エントリポイント（exec 後のコンテナ PID 1）の先頭で呼ぶ。見張りスレッドが寿命の上限まで眠り、来たら
+/// `EXIT_ENTRY_LIFETIME_EXPIRED` で自ら終わる。処理自体が固まった場合にも効く。見張りを起こせなければ、
+/// 上限なしで進まず報告を書く前に非 0 で終わる（fail-closed。ホスト側は期待した終了・報告が無く失敗になる）。
+/// 戻り値は採用した上限（秒）で、報告の `lifetime_secs` に載せる。
+#[allow(dead_code)] // production_launcher・seccomp は使わない
+pub fn arm_entry_lifetime() -> u64 {
+    let secs = entry_lifetime_from_env();
+    let spawned = std::thread::Builder::new()
+        .name("entry-lifetime".to_string())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            std::process::exit(EXIT_ENTRY_LIFETIME_EXPIRED);
+        });
+    if spawned.is_err() {
+        std::process::exit(EXIT_ENTRY_LIFETIME_EXPIRED);
+    }
+    secs
 }

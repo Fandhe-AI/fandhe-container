@@ -48,10 +48,9 @@ use fandhe_container_core::traits::{
     PublishPortRequest, StartRequest, StateRequest, StateRevision, StateStore, StopRequest,
     TraitError,
 };
-use fandhe_container_cri::adapter::{BundleProvider, RuntimeAdapter};
+use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::instrument::{CriOpOutcome, CriOpRecorder, CriOpSample};
-use fandhe_container_cri::runtime::v1::ContainerConfig;
 use fandhe_container_cri::runtime_service::CriRuntimeService;
 
 /// 起動・シグナル系の未実装文言（固定。入力を含めない）。
@@ -352,12 +351,7 @@ impl NetworkPlugin for UnimplementedNetwork {
 pub struct UnimplementedBundleProvider;
 
 impl BundleProvider for UnimplementedBundleProvider {
-    fn prepare(
-        &self,
-        _container_id: &str,
-        _sandbox_id: &str,
-        _config: &ContainerConfig,
-    ) -> Result<PathBuf, CriError> {
+    fn prepare(&self, _req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
         Err(CriError::unimplemented(MSG_BUNDLE_UNAVAILABLE))
     }
 

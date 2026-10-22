@@ -14,7 +14,7 @@ use fandhe_container_core::traits::{
     ContainerRuntime, ContainerStatus, CreateRequest, DeleteRequest, DeleteResponse, ErrorCode,
     KillRequest, StartRequest, StateRequest, StopRequest, TerminationReason, TraitError,
 };
-use fandhe_container_cri::adapter::{BundleProvider, RuntimeAdapter};
+use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::instrument::{CriOpRecorder, CriOpSample, code_name};
 use fandhe_container_cri::runtime::v1::{
@@ -193,6 +193,8 @@ impl ContainerRuntime for Shared {
 #[derive(Default)]
 struct FakeBundles {
     calls: Mutex<Vec<String>>,
+    /// prepare に渡った sandbox_config の hostname（登録記録の複製が渡ることの検証用。#2395）。
+    sandbox_hostnames: Mutex<Vec<String>>,
     fail: AtomicBool,
     fail_release: AtomicBool,
 }
@@ -206,13 +208,13 @@ fn bundle_root() -> PathBuf {
 }
 
 impl BundleProvider for FakeBundles {
-    fn prepare(
-        &self,
-        container_id: &str,
-        sandbox_id: &str,
-        config: &ContainerConfig,
-    ) -> Result<PathBuf, CriError> {
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError> {
+        let (container_id, sandbox_id, config) = (req.container_id, req.sandbox_id, req.config);
         let name = config.metadata.as_ref().map(|m| m.name.as_str());
+        self.sandbox_hostnames
+            .lock()
+            .unwrap()
+            .push(req.sandbox_config.hostname.clone());
         self.calls.lock().unwrap().push(format!(
             "prepare {container_id} {sandbox_id} {}",
             name.unwrap_or("")
@@ -391,6 +393,49 @@ async fn task_59_2_create_and_start_reach_the_runtime() {
     let st = status(&h.service, &id).await;
     assert_eq!(st.state, S::ContainerRunning as i32);
     assert!(st.started_at > 0);
+}
+
+/// CRI-1・CRI-2（#2395）: bundle 供給元へ渡る sandbox_config は登録記録の値で、
+/// CreateContainer 要求の `sandbox_config` に別の値が入っていても使われない。
+#[tokio::test]
+async fn cri_1_bundle_request_carries_registered_sandbox_config() {
+    let h = harness();
+    let mut cfg = PodSandboxConfig {
+        metadata: Some(PodSandboxMetadata {
+            name: "pod".into(),
+            uid: "uid-9".into(),
+            namespace: "ns".into(),
+            attempt: 0,
+        }),
+        ..Default::default()
+    };
+    cfg.hostname = "registered-host".into();
+    let sb = RuntimeService::run_pod_sandbox(
+        &h.service,
+        Request::new(v1::RunPodSandboxRequest {
+            config: Some(cfg.clone()),
+            runtime_handler: String::new(),
+        }),
+    )
+    .await
+    .expect("run sandbox")
+    .into_inner()
+    .pod_sandbox_id;
+    cfg.hostname = "forged-host".into();
+    RuntimeService::create_container(
+        &h.service,
+        Request::new(v1::CreateContainerRequest {
+            pod_sandbox_id: sb,
+            config: Some(container("c")),
+            sandbox_config: Some(cfg),
+        }),
+    )
+    .await
+    .expect("create");
+    assert_eq!(
+        h.bundles.sandbox_hostnames.lock().unwrap().clone(),
+        vec!["registered-host".to_owned()]
+    );
 }
 
 /// ERR-3: create 失敗は実行層のコードへ写され、記録・重複キー・件数を巻き戻して再作成できる。

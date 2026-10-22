@@ -26,8 +26,8 @@
 //! 除去を `FAILED_PRECONDITION` にする。実行層が失敗したら記録を巻き戻し（Create）・Created へ戻し（Start）、
 //! 「記録上だけ running」のフォールバックはしない（fail-closed）。注入しない場合は従来のスタブ動作のまま。
 //! 未実装（REPAIR-3）: `RunPodSandbox` は実行層に対応操作が無く記録のみ（共有 namespace・net 連携は後続）。
-//! bundle の生成の本体（image 展開・`ContainerConfig` から `config.json`）は未提供で、core の本番
-//! launcher との結線は TASK-114、一連の結合試験は TASK-59.4 で扱う。Start 後に中断・確定失敗した場合は、
+//! bundle の生成のうち config 変換と bundle ディレクトリの寿命は `crate::bundle`（#2395）。image 展開
+//! （`RootfsSource` の本番実装）と plugin-cri への結線は #2433 で、core の本番 launcher との結線は TASK-114、一連の結合試験は TASK-59.4 で扱う。Start 後に中断・確定失敗した場合は、
 //! 実行層が running の可能性があるため記録を unknown にして再 Start を拒否する（fail-closed）。
 //!
 //! **Stop・Remove の接続（CRI-2・TASK-59.3・#439）**: 実行層接続時、実行層の資源を持つコンテナ
@@ -107,7 +107,9 @@ use tonic::{Request, Response, Status};
 
 use crate::error::{CriError, CriErrorCode};
 
-use crate::adapter::{BundleProvider, RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle};
+use crate::adapter::{
+    BundleProvider, BundleRequest, RuntimeAdapter, RuntimeContainerStatus, RuntimeLifecycle,
+};
 use crate::instrument::{CriOpKind, CriOpRecorder, CriOpTimer, NoopCriOpRecorder};
 use crate::runtime::v1::{
     self, ContainerState as CriContainerState, PodSandboxConfig, PodSandboxState,
@@ -285,6 +287,9 @@ struct ReservedContainer {
     pod_sandbox_id: String,
     /// `in_flight` 登録のときだけ `Some`（上限検証済みの複製）。
     provider_config: Option<v1::ContainerConfig>,
+    /// `in_flight` 登録のときだけ `Some`。所属サンドボックスの登録記録の複製（RunPodSandbox で上限検証済み。
+    /// bundle 供給元が hostname・namespace_options を読む。要求の `sandbox_config` は使わない。#2395）。
+    provider_sandbox_config: Option<PodSandboxConfig>,
 }
 
 /// 実行層を呼び出し中の操作の種類（[`InFlightGuard`] が巻き戻しの方法を選ぶ）。
@@ -1139,6 +1144,7 @@ impl CriRuntimeService {
             container_id.ok_or_else(|| CriError::internal("failed to allocate container id"))?;
         let config = config.into_config();
         let provider_config = in_flight.then(|| config.clone());
+        let provider_sandbox_config = in_flight.then(|| sandbox.config.clone());
         let sandbox_id = key.0.clone();
         registry.containers.insert(
             container_id.clone(),
@@ -1162,6 +1168,7 @@ impl CriRuntimeService {
             container_id,
             pod_sandbox_id: sandbox_id,
             provider_config,
+            provider_sandbox_config,
         })
     }
 
@@ -1180,6 +1187,9 @@ impl CriRuntimeService {
         let config = reserved
             .provider_config
             .ok_or_else(|| CriError::internal("container config is unavailable"))?;
+        let sandbox_config = reserved
+            .provider_sandbox_config
+            .ok_or_else(|| CriError::internal("sandbox config is unavailable"))?;
         // bundle の用意・create・確定・巻き戻し・bundle の解放はすべて worker が所有する。RPC の future が
         // 中断・タイムアウトしても、実行層が処理中の間に記録・件数枠・bundle だけが解放されることはない。
         let mut guard = InFlightGuard::new(
@@ -1194,7 +1204,12 @@ impl CriRuntimeService {
         run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
             // worker が実際に走り出してから bundle の解放責務を持つ（起動失敗時は RPC スレッドで release しない）。
             guard.arm_bundles(Arc::clone(&bundles));
-            let bundle = bundles.prepare(&id, &sandbox_id, &config)?;
+            let bundle = bundles.prepare(&BundleRequest::new(
+                &id,
+                &sandbox_id,
+                &sandbox_config,
+                &config,
+            ))?;
             // 以後は実行層に資源が残りうる。確定失敗または削除完了を確認できた場合だけ解放する（fail-closed）。
             guard.mark_dispatched();
             let status = match adapter.create(&id, bundle) {
@@ -2456,12 +2471,7 @@ mod tests {
     }
 
     impl BundleProvider for HangingRelease {
-        fn prepare(
-            &self,
-            _: &str,
-            _: &str,
-            _: &v1::ContainerConfig,
-        ) -> Result<std::path::PathBuf, CriError> {
+        fn prepare(&self, _: &BundleRequest<'_>) -> Result<std::path::PathBuf, CriError> {
             self.prepares
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(std::path::PathBuf::from("/bundles/x"))

@@ -15,8 +15,8 @@
 //! **未実装・簡易実装（REPAIR-3）**: 本モジュールは呼び出し境界だけを提供する。RPC ハンドラへの接続は
 //! create・start が TASK-59.2（#438。`CriRuntimeService::with_runtime` で注入したときだけ有効）、
 //! stop・delete が TASK-59.3（#439。接続済み）、全ライフサイクルの結合試験は TASK-59.4（#440。`tests/adapter_integration.rs`）で実施済みで、
-//! `ContainerRuntime` の実装（plugin 側。TASK-114）と OCI bundle の生成の本体も本モジュールの範囲外である
-//! （bundle の供給は [`BundleProvider`] の注入点だけを定義する）。
+//! `ContainerRuntime` の実装（plugin 側。TASK-114）も本モジュールの範囲外である
+//! （bundle の供給は [`BundleProvider`] の注入点だけを定義し、config 変換と bundle の寿命は `crate::bundle`）。
 
 use std::fmt;
 use std::path::PathBuf;
@@ -31,8 +31,8 @@ use fandhe_container_core::traits::{
 use tonic::Status;
 
 use crate::error::CriError;
-use crate::runtime::v1::ContainerConfig;
 use crate::runtime::v1::ContainerState as CriContainerState;
+use crate::runtime::v1::{ContainerConfig, PodSandboxConfig};
 
 /// 実行層が報告した生の状態（CRI の外向き状態へ写す前の区別。CRI-2・REPAIR-5）。
 ///
@@ -155,22 +155,55 @@ pub fn trait_error_to_status(err: &TraitError) -> Status {
     Status::from(CriError::from(err))
 }
 
+/// [`BundleProvider::prepare`] への入力（CRI-1・CRI-2・#2395）。
+///
+/// `sandbox_config` は要求ではなくサンドボックスの登録記録（RunPodSandbox 時に上限検証済み）の複製で、
+/// hostname・namespace_options の正は登録記録である。`CreateContainerRequest.sandbox_config` は使わない。
+/// 将来の項目追加に備えて `#[non_exhaustive]` とし、外部 crate は [`BundleRequest::new`] で作る。
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct BundleRequest<'a> {
+    /// コンテナ ID（`CreateContainer` が採番した値）。
+    pub container_id: &'a str,
+    /// 所属サンドボックスの ID。
+    pub sandbox_id: &'a str,
+    /// 所属サンドボックスの登録済み設定。
+    pub sandbox_config: &'a PodSandboxConfig,
+    /// 作成するコンテナの設定。
+    pub config: &'a ContainerConfig,
+}
+
+impl<'a> BundleRequest<'a> {
+    /// 各項目から入力を作る。
+    pub fn new(
+        container_id: &'a str,
+        sandbox_id: &'a str,
+        sandbox_config: &'a PodSandboxConfig,
+        config: &'a ContainerConfig,
+    ) -> Self {
+        Self {
+            container_id,
+            sandbox_id,
+            sandbox_config,
+            config,
+        }
+    }
+}
+
 /// CRI の `ContainerConfig` から OCI bundle（rootfs と `config.json`）を用意する注入点（TASK-59.2・#438・CRI-2）。
 ///
 /// `CreateContainer` ハンドラが `ContainerRuntime::create` を呼ぶ直前に呼ぶ。CRI の要求は bundle の
 /// パスを持たないため、image の展開と `ContainerConfig` から `config.json` への変換は本トレイトの実装側の
 /// 責務とする。同期 API で、ハンドラは tokio の blocking pool を使わず専用スレッド（worker）上から呼ぶ。
 ///
-/// **未実装（REPAIR-3）**: 本番の実装（image 展開・config 変換・パスの検証）は未提供で、本リポでは
-/// テスト用の実装だけがある。`config` の内容（envs 等の秘密値を含みうる）をエラー文言へ含めないこと。
+/// 汎用の実装として `crate::bundle::SpecBundleProvider`（config 変換と bundle ディレクトリの寿命。#2395）がある。
+///
+/// **未実装（REPAIR-3）**: image 展開（`crate::bundle::RootfsSource` の本番実装。#2433）は未提供で、
+/// plugin-cri はまだ常に `UNIMPLEMENTED` を返す実装を差している。
+/// `config` の内容（envs 等の秘密値を含みうる）をエラー文言へ含めないこと。
 pub trait BundleProvider: Send + Sync {
     /// コンテナ用の bundle を用意し、その絶対パスを返す。失敗は ERR-3 の gRPC ステータスで返す。
-    fn prepare(
-        &self,
-        container_id: &str,
-        sandbox_id: &str,
-        config: &ContainerConfig,
-    ) -> Result<PathBuf, CriError>;
+    fn prepare(&self, req: &BundleRequest<'_>) -> Result<PathBuf, CriError>;
 
     /// `prepare` で用意した資源を解放する（`create` 失敗時の後始末。stop・delete は TASK-59.3 で接続済み）。
     ///

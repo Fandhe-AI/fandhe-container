@@ -4,6 +4,7 @@
 //! `ContainerRuntime` 呼び出しアダプタ `adapter` は TASK-59.1（CRI-2・CRI-7）で追加済みで、`CreateContainer`・`StartContainer` への接続は TASK-59.2（#438。`CriRuntimeService::with_runtime` で注入したときだけ有効）、
 //! `StopContainer`・`RemoveContainer`・`StopPodSandbox`・`RemovePodSandbox` への接続は TASK-59.3（#439。同じく注入時のみ有効）。
 //! 全ライフサイクルの結合試験は TASK-59.4（#440。`tests/adapter_integration.rs`）。
+//! CRI の設定から OCI bundle（`config.json` と bundle の寿命）を作る層は `bundle`（#2395。image 展開は #2433）。
 //! 統一エラー型 `error`（ERR-3・TASK-97.1）をハンドラへ適用済み（TASK-97.2・#450）。
 //! 他の RPC は `Unimplemented`、状態管理はメモリ上のスタブ（TASK-59 で置換。REPAIR-3）。
 //! RPC の結果と所要時間は `instrument` の記録先へ渡す（REPAIR-4。core の記録器への接続は plugin-cri。TASK-108）。
@@ -14,6 +15,7 @@
 //! 生成し、[`runtime::v1`] で取り込む（TASK-56.4・#427。型の整合は `tests/generated_build_check.rs` で照合）。RPC 本体は TASK-57 以降で順次実装する（未実装分はスタブ。REPAIR-3）。
 
 pub mod adapter;
+pub mod bundle;
 pub mod error;
 pub mod image_pull;
 pub mod image_service;

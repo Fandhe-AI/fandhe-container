@@ -359,7 +359,7 @@ mod tests {
             SetupPlatform::Linux,
         ] {
             for s in required_steps(p) {
-                let t = s.instructions().expect(s.id());
+                let t = s.instructions().unwrap_or_else(|| panic!("{}", s.id()));
                 assert!(!t.is_empty());
                 assert!(t.chars().all(|c| c == ' ' || c.is_ascii_graphic()), "{t}");
                 assert!(t.contains("fandhe-container does not"), "{t}");

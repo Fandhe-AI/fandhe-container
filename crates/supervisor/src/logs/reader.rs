@@ -60,6 +60,8 @@ use super::rotating::RotationConfig;
 
 #[cfg(unix)]
 mod follow;
+// 呼び出し元（imp・follow）が unix 限定のため、非 unix では dead_code になる。
+#[cfg(unix)]
 mod record;
 
 /// 世代の入れ替わりで再試行する回数の上限（無限に回らない。REPAIR-5）。

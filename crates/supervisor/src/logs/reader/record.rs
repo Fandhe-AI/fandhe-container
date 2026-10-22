@@ -65,12 +65,15 @@ fn is_known_prefix(prefix: &[u8]) -> bool {
 /// `cat -v` と同じ 1 バイトの表示（TAB は変えない。LF は呼び出し側が区切りとして扱うため来ない）。
 pub(super) fn escape_byte(b: u8, out: &mut Vec<u8>) {
     let mut low = b;
+    if b == b'\t' {
+        out.push(b);
+        return;
+    }
     if b >= 0x80 {
         out.extend_from_slice(b"M-");
         low = b & 0x7f;
     }
     match low {
-        b'\t' => out.push(low),
         0x00..=0x1f => {
             out.push(b'^');
             out.push(low + 0x40);
@@ -248,7 +251,7 @@ mod tests {
     /// CLI-1: エスケープの表は `cat -v` と同じ。
     #[test]
     fn cli1_escape_table_matches_cat_v() {
-        let cases: [(&[u8], &[u8]); 7] = [
+        let cases: [(&[u8], &[u8]); 8] = [
             (b"\x1b[0m", b"^[[0m"),
             (b"\r", b"^M"),
             (b"\t", b"\t"),
@@ -256,6 +259,7 @@ mod tests {
             (b"\x9b", b"M-^["),
             (b"\xe3", b"M-c"),
             (b"\x00\x80\xff", b"^@M-^@M-^?"),
+            (b"\x89", b"M-^I"),
         ];
         for (input, expect) in cases {
             let mut out = Vec::new();

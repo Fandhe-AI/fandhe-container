@@ -1337,6 +1337,9 @@ mod tests {
 
         fn runtime_with(st: FileStateStore) -> crate::commands::create_start::Runtime {
             crate::commands::create_start::Runtime {
+                audit: Box::new(
+                    fandhe_container_core::audit_log::FileAuditSink::in_state_store(&st),
+                ),
                 store: Box::new(st),
                 recorder: OpRecorder::new(),
             }

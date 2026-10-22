@@ -62,8 +62,9 @@
 //!   opt-in で前提が欠けたら skip せず失敗にする
 //! - 残余（実装済みを装わない。REPAIR-3）: ESC-06（`KILL_PROCESS` の 3 件）の監査は `Deferred`（追跡: #2236・#2237）。
 //!   `USER_NOTIF` では届かず、補助の `exit_signal` は本番 launcher の回収点が出し、正の記録はカーネルの
-//!   `AUDIT_SECCOMP` で fandhe は自前の読み手を持たない。`create` のパース時の destination 拒否は本番で監査されない
-//!   （`audit_mount_config_error` を呼ぶ本番コードが無い）ため `esc-08-config-destination` は攻撃結果だけを照合する
+//!   `AUDIT_SECCOMP` で fandhe は自前の読み手を持たない。`create` のパース時の destination 拒否
+//!   （`esc-08-config-destination`）は本番の `create_audited` が `@audit.log` へ記録する（#2480）。plugin-cri の
+//!   `create` と start の TOCTOU 再検証での destination 拒否は未配線（`docs/design/audit-delivery.md`）
 //!
 //! # 構成
 //! - 常に走る部分（3 OS 共通・既定のテスト集合）: 判定ロジック `judge` と記録パーサの自己テスト
@@ -2001,8 +2002,8 @@ mod linux {
     };
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
-        LaunchSpec, LaunchedProcess, ProcessLauncher, StartTimeouts, create, parse_config_bytes,
-        start,
+        LaunchSpec, LaunchedProcess, ProcessLauncher, StartTimeouts, create, create_audited,
+        parse_config_bytes, start,
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
@@ -2057,6 +2058,8 @@ mod linux {
         ProbeWithSeccompListener,
         /// 分離もコンテナ probe もせず、`create` → `start` の拒否を実行する（ESC-08。SEC-4・#2028）。
         StartRejection,
+        /// 分離もコンテナ probe もせず、本番の `create_audited` の destination 拒否を実行する（ESC-08。SEC-4・OCI-4・#2480）。
+        CreateRejection,
     }
 
     /// ホスト視点の検査関数の型。
@@ -2070,12 +2073,9 @@ mod linux {
         is_root: bool,
     }
 
-    /// ESC-08 のパース時の拒否の期待（攻撃結果のみ。本番では監査されないため監査は要求しない）。
-    const ESC08_CONFIG_EXPECT: Expectation = Expectation {
-        allowed: &[AttackOutcome::Failed],
-        signal: None,
-        audit: AuditExpectation::None,
-    };
+    /// ESC-08 のパース時の拒否の期待。本番の `create_audited` が mount 層 3 件（遡り・`/`・相対 `..`）を
+    /// `@audit.log` へ記録する（SEC-4・OCI-4・#2480）。start の bind の拒否（`ESC08_EXPECT`）と同じ形。
+    const ESC08_CONFIG_EXPECT: Expectation = ESC08_EXPECT;
 
     /// 登録済みケース。対照ケースと ESC-01〜03（#200）・ESC-04〜06（#201）・ESC-07〜08（#202）・ESC-09〜10（#203）。
     const CASES: &[EscapeCase] = &[
@@ -2266,14 +2266,14 @@ mod linux {
             host_check: None,
             launcher: LauncherRequirement::Any,
         },
-        // ESC-08 の `create` のパース時の destination 拒否。本番では監査されない（`audit_mount_config_error` を
-        // 呼ぶ本番コードが無い）ため、攻撃結果の拒否だけを照合し監査は要求しない（追跡: docs/design/audit-delivery.md）。
+        // ESC-08 の `create` のパース時の destination 拒否。本番の `create_audited` が `@audit.log` の mount 層へ
+        // 記録するため、拒否と監査 3 行の両方を照合する（#2480）。
         EscapeCase {
             id: "esc-08-config-destination",
-            body: CaseBody::Probe,
+            body: CaseBody::CreateRejection,
             expectation: ESC08_CONFIG_EXPECT,
             stages: StagePipeline::new,
-            attack: attack_esc08_config_destination,
+            attack: attack_unused,
             precondition: no_precondition,
             host_check: None,
             launcher: LauncherRequirement::Any,
@@ -2599,35 +2599,8 @@ mod linux {
         rec.outcome(outcome);
     }
 
-    /// 何もしない攻撃（`CaseBody::StartRejection` は子で攻撃を実行しないため、フィールドを埋めるためだけに使う）。
+    /// 何もしない攻撃（`CaseBody::StartRejection` / `CreateRejection` は子で攻撃を実行しないため、フィールドを埋めるためだけに使う）。
     fn attack_unused(_rec: &Recorder, _host_canary: &Path) {}
-
-    /// ESC-08 のパース時の拒否（SEC-2・TASK-42.4・#202）: マウント先ホワイトリスト外の要求（rootfs 外への遡り・rootfs
-    /// 全体・相対 `..`。source はホストの機密パスを例示）を API 層（config パース）で検証し、`InvalidArgument` で
-    /// 拒否されることを確かめる。実マウントは行わない（純粋関数のみ）。
-    ///
-    /// 監査は要求しない: `create` のパース時の拒否を `Mount` 監査レコードにする本番コード
-    /// （`audit_mount_config_error` の呼び出し）が無く、このパスは本番では監査されない（SEC-4。REPAIR-3。追跡は
-    /// `docs/design/audit-delivery.md`）。本番で監査される bind の元の拒否は `esc-08-mount-outside-whitelist` が担う。
-    fn attack_esc08_config_destination(rec: &Recorder, _host_canary: &Path) {
-        for dest in ["/../../run/fandhe-container", "/", "run/../../../etc"] {
-            let json = format!(
-                r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs"}},"mounts":[{{"destination":"{dest}","type":"bind","source":"/run/fandhe-container","options":["bind"]}}]}}"#
-            );
-            match parse_config_bytes(json.as_bytes()) {
-                Ok(_) => {
-                    rec.outcome(AttackOutcome::Succeeded);
-                    return;
-                }
-                Err(err) => assert_eq!(
-                    err.code(),
-                    ErrorCode::InvalidArgument,
-                    "mount rejection must be InvalidArgument"
-                ),
-            }
-        }
-        rec.outcome(AttackOutcome::Failed);
-    }
 
     /// 対照: 禁止対象外の操作（`/proc/self/status` の読み出し）が制限下でも動くこと。
     fn attack_control_read_proc(rec: &Recorder, _host_canary: &Path) {
@@ -3265,6 +3238,7 @@ mod linux {
             (case.body == CaseBody::ProbeWithSeccompListener).then(|| spawn_relay(state_root));
         let meta = match case.body {
             CaseBody::StartRejection => start_rejection(rootfs, state_root, started_at),
+            CaseBody::CreateRejection => create_rejection(rootfs, state_root, started_at),
             CaseBody::Probe | CaseBody::ProbeWithSeccompListener => {
                 probe_scenario(case, rootfs, relay, started_at)
             }
@@ -3412,6 +3386,7 @@ mod linux {
                 None,
             ),
             CaseBody::StartRejection => unreachable!("handled by start_rejection"),
+            CaseBody::CreateRejection => unreachable!("handled by create_rejection"),
         };
         let child_pid = child.pid();
         // seccomp の記録の期待値: 子自身の PID namespace での pid。子の最初の拒否は応答ループが読むまで
@@ -3592,6 +3567,68 @@ mod linux {
             state.status().state(),
             ContainerState::Created,
             "a rejected start leaves the container Created"
+        );
+        ScenarioMeta {
+            exit: ObservedExit::Exited(0),
+            outcome: Some(outcome),
+            child_pid: None,
+            pid_in_ns: None,
+            started_at,
+        }
+    }
+
+    /// ESC-08 のパース時の拒否の本体（SEC-2・SEC-4・OCI-4・TASK-42.4・#202・#2480）: 宛先が rootfs 外への遡り・
+    /// rootfs 全体・相対 `..` の config を、CLI と同じ構成（`FileStateStore` ＋ 状態ルートの `FileAuditSink`）の
+    /// `create_audited` へ渡し、いずれも `InvalidArgument` で拒否されて状態が作られないことを確かめる。
+    /// 記録は本番の拒否経路が出す（ここでは作らない）。ディスパッチャが `@audit.log` の mount 層 3 行を照合する。
+    fn create_rejection(bundle: &Path, state_root: &Path, started_at: u64) -> ScenarioMeta {
+        let id = ContainerId::new(AUDIT_CONTAINER_ID).expect("harness container id");
+        // 単一スレッドの呼び出し元なので、書き込みは fork した子で行われる（`start_rejection` と同じ前提）。
+        let sink = FileAuditSink::open_in_state_root(Some(state_root.to_path_buf()))
+            .unwrap_or_else(|e| panic!("open the audit sink in the state root: {e}"));
+        std::fs::create_dir(bundle.join("rootfs")).expect("create bundle/rootfs");
+        let store = FileStateStore::open(
+            StateRoot::from_override(state_root.to_path_buf()).expect("state root"),
+        )
+        .unwrap_or_else(|e| panic!("open the state store: {e}"));
+        let recorder = OpRecorder::new();
+        let config_path = bundle.join("config.json");
+        let mut outcome = AttackOutcome::Failed;
+        for dest in ["/../../run/fandhe-container", "/", "run/../../../etc"] {
+            let config = serde_json::to_vec(&serde_json::json!({
+                "ociVersion": "1.2.0",
+                "root": {"path": "rootfs"},
+                "process": {"user": {"uid": 0, "gid": 0}, "args": ["/bin/echo", "it"], "cwd": "/"},
+                "mounts": [{
+                    "destination": dest,
+                    "type": "bind",
+                    "source": "/run/fandhe-container",
+                    "options": ["bind"]
+                }]
+            }))
+            .expect("serialize config");
+            std::fs::write(&config_path, config).expect("write config");
+            match create_audited(
+                &store,
+                &recorder,
+                &CreateRequest::new(id.clone(), bundle.to_path_buf()).expect("absolute bundle"),
+                &sink,
+            ) {
+                // 拒否されなかった（destination の検証の欠落）。残りは試さず、成功として失敗にする。
+                Ok(_) => {
+                    outcome = AttackOutcome::Succeeded;
+                    break;
+                }
+                Err(err) => assert_eq!(
+                    err.code(),
+                    ErrorCode::InvalidArgument,
+                    "destination {dest:?} must be rejected as InvalidArgument: {err}"
+                ),
+            }
+        }
+        assert!(
+            store.get(&GetStateRequest::new(id)).is_err(),
+            "a rejected create must not leave a state"
         );
         ScenarioMeta {
             exit: ObservedExit::Exited(0),

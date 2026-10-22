@@ -48,7 +48,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 | 本番 sink | `FileAuditSink`（ファイル主経路と NETLINK_AUDIT フォールバック。常時 tee は未実装）。supervisor の exec 経路は `default_audit_sink` で配線済み（#1594） | `crates/core/src/audit_log/file_sink.rs`・`crates/supervisor/src/exec.rs` |
 | コンテナ ID | `AuditRecord::container_id`（#1618）。seccomp は #2025 で付与（`record_seccomp_denial_for`）。Landlock の記録への付与は未実装 | `crates/core/src/audit_log.rs` |
 | 型の制約 | `AuditEvent::Seccomp` は syscall 番号と arch が必須で、「syscall の無い seccomp 違反」を構築できない | `crates/core/src/audit_log.rs` |
-| 試験 | ESC-03（seccomp）・ESC-08（mount の bind の元）は `Required` で、コンテナの外で回収した状態ルートの `@audit.log` を照合する。ESC-01・07（landlock 帰属）・10 は `Required` で、カーネル監査の `LANDLOCK_ACCESS` を opt-in の段（`FANDHE_CONTAINER_TEST_KERNEL_AUDIT=1`）で照合し、opt-in なしは `audit-not-verified`（合格に数えない）。ESC-06 だけ `Deferred`（#2236・#2237）。試験の側が記録を作る経路（`record_landlock_denial`・`audit_mount_config_error` の直接呼び出し・子の pipe の `audit=` 行）は削除した（#2028。9 章の案 7 の結果。9.3） | `crates/core/tests/escape_suite.rs` |
+| 試験 | ESC-03（seccomp）・ESC-08（mount の bind の元・create のパース時の destination 拒否〔#2480〕）は `Required` で、コンテナの外で回収した状態ルートの `@audit.log` を照合する。ESC-01・07（landlock 帰属）・10 は `Required` で、カーネル監査の `LANDLOCK_ACCESS` を opt-in の段（`FANDHE_CONTAINER_TEST_KERNEL_AUDIT=1`）で照合し、opt-in なしは `audit-not-verified`（合格に数えない）。ESC-06 だけ `Deferred`（#2236・#2237）。試験の側が記録を作る経路（`record_landlock_denial`・`audit_mount_config_error` の直接呼び出し〔create_audited 経由に置換。#2480〕・子の pipe の `audit=` 行）は削除した（#2028。9 章の案 7 の結果。9.3） | `crates/core/tests/escape_suite.rs` |
 
 本リポの #1834 から導かれる制約:
 
@@ -139,7 +139,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 | 4 | `KILL_PROCESS` 側の記録（親の終了シグナルとカーネル監査の突き合わせ。レコード型の拡張の要否） | core・supervisor | #2004（実装済み。判断は 9.1） |
 | 5 | Landlock のカーネル監査対応（ABI 7 のログ制御フラグ）と縮退時の状態表示 | core | #2026 |
 | 6 | 縮退時の挙動（起動拒否／警告）の実装 | core・supervisor | #2027（実装済み。7.1。CLI からの `--audit-policy` の受け渡しは後続） |
-| 7 | `escape_suite.rs` の整備 | core | #2028（9.3。ESC-06 と、パース時の destination 拒否・supervisor の relay 経由の mount 拒否は残余） |
+| 7 | `escape_suite.rs` の整備 | core | #2028（9.3。ESC-06 と、supervisor の relay 経由の mount 拒否は残余。パース時の destination 拒否は #2480 で本番の create 経路に配線） |
 
 ### 7.1 実装した挙動（#2027。SEC-4・TASK-41 追補。監査配送 6/6）
 
@@ -188,7 +188,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 **残余（REPAIR-3。実装済みを装わない）**:
 
 - **ESC-06（`KILL_PROCESS` の 3 件）は `Deferred`**: `USER_NOTIF` に載らず、補助の `exit_signal` は本番 launcher の回収点が出して試験の入口（`spawn_container_probe`）では作られず、正の記録はカーネルの `AUDIT_SECCOMP`（読み手が無い。#2237）。`Required` への切り替えは #2237（`AUDIT_SECCOMP` の読み手と `CAP_AUDIT_READ`）の結論の後に行う。#2236 の側は、複数スレッド・rootless での `exit_signal` の配送と exec コマンドの記録を実装した（9.1。実機の照合は `production_launcher` のシナリオ Q〔#1621 で人間が実行〕）。子孫の SIGSYS 終了は親から観測できず未達のまま
-- **`create` のパース時の destination 拒否（遡り・`/`・相対 `..`）は本番で監査されない**: `audit_mount_config_error` を呼ぶ本番コードが無く、`create` の config 検証失敗は記録しない。`esc-08-config-destination` は攻撃結果（`InvalidArgument`）だけを照合し、監査は要求しない
+- **`create` のパース時の destination 拒否（遡り・`/`・相対 `..`）は、CLI の create だけ本番で監査される（#2480）**: `create_audited` / `create_with_image_audited` が `audit_mount_config_error` を通し、`FileAuditSink`（`<状態ルート>/@audit.log`）へ mount 層で 1 件記録する（`esc-08-config-destination` は `Required` で 3 行を照合。結合試験は `tests/create_mount_audit_delivery.rs`・`crates/cli/tests/binary_entry.rs`）。残余: plugin-cri の `CoreLifecycleRuntime::create` は未配線（tokio のマルチスレッドでは `FileAuditSink` の fork 隔離が使えず、rootless では `SinkFailed` になる）。start の TOCTOU 再検証（create 後に書き換えられた destination の拒否）も記録しない
 - **supervisor の `start` 経由の bind の元の拒否の監査は未照合**: supervisor は launcher の launch の時点の監査 sink に `FileAuditSink`（`build_audit_sink`）を渡し、`ControlAuditRelay` は回収点の `exit_signal` 専用の記録先（`exit_audit_sink`）と seccomp ハブ・制御チャネルにだけ渡す（#2236 で訂正。以前の記述は実装とずれていた）。relay は `Mount` の記録を `InvalidArgument` で拒否するため、launch の時点の sink には使わない。この試験は core の `start` と `FileAuditSink` の結線までを照合しており、supervisor の結線は照合していない
 - カーネル監査の段の実機での実行と記録は人間担当の #206。この環境（AppArmor が非特権 user namespace を制限）では、分離を要するケースを含め実機部は実行できていない
 

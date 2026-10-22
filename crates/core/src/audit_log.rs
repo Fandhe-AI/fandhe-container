@@ -10,7 +10,7 @@
 //!
 //! - マウント検証/API レイヤーの記録ヘルパと記録先トレイトは [`mount`]・[`AuditSink`]（TASK-41.4・#195。
 //!   `exec::audit_mount_violation` と `oci_runtime::audit_mount_config_error` がここを使う。
-//!   本番 sink `FileAuditSink`〔#1594〕は実装済み。launcher・CLI・healthcheck 等への配線は未実装）
+//!   本番 sink `FileAuditSink`〔#1594〕は実装済み。CLI の create は destination 拒否を配線済み〔#2480〕。plugin-cri・healthcheck 等への配線は未実装）
 //! - exec の対象の拒否（層 `exec_target`）は `exec::audit_exec_violation` / `exec::record_exec_target_rejection`
 //!   が [`AuditEvent::ExecTarget`] として記録する。supervisor の通しの入口 `run_command` が親プロセス側で
 //!   1 拒否 1 件を記録する（#1465。worker の経路の拒否は `exec::record_exec_worker_rejection` で、種別 `rootfs_pivot`

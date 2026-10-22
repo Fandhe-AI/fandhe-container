@@ -7508,8 +7508,11 @@ mod tests {
     fn core6_kill_process_group_reaches_leader_and_member() {
         use std::io::{Read as _, Write as _};
         // リーダーは自分のセッション（= グループ）を作り、同じグループの子を 1 つ fork して、その pid を報告する。
-        let (mut ready_read, ready_write) = std::io::pipe().unwrap();
-        let ready_write = std::fs::File::from(OwnedFd::from(ready_write));
+        // 報告の読み取りと回収の待ちには期限を付ける（REPAIR-5）。
+        let (mut ready_read, ready_write) = std::os::unix::net::UnixStream::pair().unwrap();
+        ready_read
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
         let leader = fork_single_threaded_with_no_flush(
             || true,
             || {
@@ -7537,7 +7540,11 @@ mod tests {
         .unwrap();
         drop(ready_write);
         let mut buf = [0u8; 4];
-        ready_read.read_exact(&mut buf).unwrap();
+        if let Err(e) = ready_read.read_exact(&mut buf) {
+            let _ = kill_process_group(leader, Signal::Kill);
+            let _ = kill_pid(leader, Signal::Kill);
+            panic!("the leader did not report its member within the deadline: {e}");
+        }
         let member = u32::from_le_bytes(buf);
         kill_process_group(leader, Signal::Kill).unwrap();
         // メンバー（リーダーの子。リーダーの死で再親付けされ、この試験プロセスの子ではない）は `/proc` の state で
@@ -7548,7 +7555,7 @@ mod tests {
                 Ok(stat)
                     if stat
                         .rsplit_once(')')
-                        .is_some_and(|(_, r)| r.trim_start().starts_with('Z')) =>
+                        .is_some_and(|(_, r)| r.trim_start().starts_with(['Z', 'X', 'x'])) =>
                 {
                     break;
                 }
@@ -7562,10 +7569,17 @@ mod tests {
                 }
             }
         }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let status = loop {
             match wait_pid_nohang(leader).unwrap() {
                 Some(s) => break s,
-                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+                None => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "leader {leader} was not reaped"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
             }
         };
         assert_eq!(status & 0x7f, 9, "the leader must be killed by SIGKILL");

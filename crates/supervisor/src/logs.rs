@@ -96,10 +96,23 @@ pub fn remove_container_logs(
     root: &std::path::Path,
     id: &fandhe_container_core::traits::ContainerId,
 ) -> Result<RemovedLogs, fandhe_container_core::traits::TraitError> {
+    remove_container_logs_guarded(root, id, &|| true)
+}
+
+/// [`remove_container_logs`] に、ロック取得後・削除前の確認 `guard` を足したもの（#2446・SUP-7）。
+///
+/// `guard` が `false` なら何も消さずに 0 件で成功する。CLI の `delete` は「同じ ID が再作成されていない」ことを
+/// 返す。確認はロック保持中で、以後に同じ ID の sink は開けない（同じロックが要る）ため、削除待ちの間に再作成・
+/// 起動・終了した別インスタンスのログを消さない。
+pub fn remove_container_logs_guarded(
+    root: &std::path::Path,
+    id: &fandhe_container_core::traits::ContainerId,
+    guard: &dyn Fn() -> bool,
+) -> Result<RemovedLogs, fandhe_container_core::traits::TraitError> {
     use fandhe_container_core::traits::{ErrorCode, TraitError};
     let dir = container_log_dir(root);
     match std::fs::symlink_metadata(&dir) {
-        Ok(_) => RotatingFileSink::remove_all_quiet(&dir, id),
+        Ok(_) => RotatingFileSink::remove_all_quiet_guarded(&dir, id, guard),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RemovedLogs::default()),
         Err(_) => Err(TraitError::new(
             ErrorCode::Internal,
@@ -120,16 +133,32 @@ pub fn remove_container_logs_bounded(
     id: &fandhe_container_core::traits::ContainerId,
     timeout: std::time::Duration,
 ) -> Result<RemovedLogs, fandhe_container_core::traits::TraitError> {
+    remove_container_logs_guarded_bounded(root, id, timeout, || true)
+}
+
+/// [`remove_container_logs_bounded`] に確認 `guard`（[`remove_container_logs_guarded`]）を足したもの（#2446・SUP-7）。
+///
+/// 期限切れ後も作業スレッドが残り得るが、`guard` はロック取得後に作業スレッドで評価されるため、CLI 復帰後に
+/// 削除が走っても再作成された別インスタンスのログは消えない。
+pub fn remove_container_logs_guarded_bounded(
+    root: &std::path::Path,
+    id: &fandhe_container_core::traits::ContainerId,
+    timeout: std::time::Duration,
+    guard: impl Fn() -> bool + Send + 'static,
+) -> Result<RemovedLogs, fandhe_container_core::traits::TraitError> {
     use fandhe_container_core::traits::{ErrorCode, TraitError};
     let root = root.to_path_buf();
     let id = id.clone();
-    crate::supervisor_log::run_bounded(move || remove_container_logs(&root, &id), timeout)
-        .unwrap_or_else(|| {
-            Err(TraitError::new(
-                ErrorCode::Timeout,
-                "container log removal did not finish within the deadline",
-            ))
-        })
+    crate::supervisor_log::run_bounded(
+        move || remove_container_logs_guarded(&root, &id, &guard),
+        timeout,
+    )
+    .unwrap_or_else(|| {
+        Err(TraitError::new(
+            ErrorCode::Timeout,
+            "container log removal did not finish within the deadline",
+        ))
+    })
 }
 
 /// コンテナログのローテーション設定（既定 1MiB × 3 世代）。書き手と読み手が同じ値を使う。

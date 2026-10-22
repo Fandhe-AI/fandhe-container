@@ -565,6 +565,47 @@ mod tests {
         assert_eq!(sorted_names(&dir), ["c1.log", "c1.log.lock"]);
     }
 
+    /// SUP-7・#2446: 確認 `guard` が `false`（同じ ID が再作成済み）なら何も消さず、ロックファイルだけ掃除する。
+    /// `guard` はロック保持中に評価される（評価中は別の sink が同じ ID を開けない）。
+    #[test]
+    fn sup7_remove_container_logs_guard_false_keeps_logs_and_holds_lock() {
+        let t = TmpDir::new("rmguard");
+        let dir = crate::logs::container_log_dir(&t.0);
+        drop(container_sink(&t.0, "c1"));
+        drop(container_sink(&t.0, "c1"));
+        let root = t.0.clone();
+        let removed = crate::logs::remove_container_logs_guarded(&t.0, &id(), &|| {
+            // 評価中に同じ ID の sink を開こうとしてもロックで拒否される。
+            let e = crate::logs::RotatingFileSink::open(
+                &crate::logs::container_log_dir(&root),
+                &id(),
+                crate::logs::container_log_rotation_config(),
+            );
+            assert!(e.is_err());
+            false
+        })
+        .unwrap();
+        assert_eq!(removed.log_files(), 0);
+        assert_eq!(sorted_names(&dir), ["c1.log", "c1.log.1"]);
+    }
+
+    /// SUP-7・#2446: `guard` が `true` なら従来どおり消す。
+    #[test]
+    fn sup7_remove_container_logs_guard_true_removes() {
+        let t = TmpDir::new("rmguardtrue");
+        let dir = crate::logs::container_log_dir(&t.0);
+        drop(container_sink(&t.0, "c1"));
+        let removed = crate::logs::remove_container_logs_guarded_bounded(
+            &t.0,
+            &id(),
+            Duration::from_secs(10),
+            || true,
+        )
+        .unwrap();
+        assert_eq!(removed.log_files(), 1);
+        assert_eq!(sorted_names(&dir), Vec::<String>::new());
+    }
+
     /// SUP-7・#2446: ディレクトリが無ければ 0 件で成功し（冪等）、作らない。
     #[test]
     fn sup7_remove_container_logs_missing_dir_is_ok() {

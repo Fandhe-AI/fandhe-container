@@ -386,7 +386,7 @@ impl RotatingFileSink {
     /// 削除数・所要時間を構造化 1 行（JSON）で stderr へ出す（REPAIR-4。パス・errno は含めない。ERR-1）。
     pub fn remove_all(dir: &Path, id: &ContainerId) -> Result<RemovedLogs, TraitError> {
         let started = Instant::now();
-        let (removed, result) = Self::remove_all_inner(dir, id);
+        let (removed, result) = Self::remove_all_inner(dir, id, &|| true);
         let (outcome, code) = match &result {
             Ok(_) => ("ok", ""),
             Err(e) => ("error", e.code().as_str()),
@@ -409,11 +409,29 @@ impl RotatingFileSink {
         dir: &Path,
         id: &ContainerId,
     ) -> Result<RemovedLogs, TraitError> {
-        Self::remove_all_inner(dir, id).1
+        Self::remove_all_inner(dir, id, &|| true).1
+    }
+
+    /// [`Self::remove_all_quiet`] に、ロック取得後・削除前の確認 `guard` を足したもの（#2446・SUP-7）。
+    ///
+    /// `guard` が `false` を返したら何も消さず（0 件で成功する。ロックファイルだけ掃除する）、削除を見送る。
+    /// 呼び出し側は「同じ ID が再作成されていない」ことをここで確かめる。確認はロック保持中に行うため、
+    /// 確認後に同じ ID の sink が開くことは無く（開くには同じロックが要る）、再作成された別インスタンスの
+    /// ログを消さない。
+    pub(crate) fn remove_all_quiet_guarded(
+        dir: &Path,
+        id: &ContainerId,
+        guard: &dyn Fn() -> bool,
+    ) -> Result<RemovedLogs, TraitError> {
+        Self::remove_all_inner(dir, id, guard).1
     }
 
     /// [`Self::remove_all`] の本体。実際に消せた数と結果を別々に返す（失敗時も削除数を観測に出すため）。
-    fn remove_all_inner(dir: &Path, id: &ContainerId) -> (u32, Result<RemovedLogs, TraitError>) {
+    fn remove_all_inner(
+        dir: &Path,
+        id: &ContainerId,
+        guard: &dyn Fn() -> bool,
+    ) -> (u32, Result<RemovedLogs, TraitError>) {
         let dir = match check_dir(dir) {
             Ok(d) => d,
             Err(e) => return (0, Err(e)),
@@ -429,7 +447,12 @@ impl RotatingFileSink {
             Ok(l) => l,
             Err(e) => return (0, Err(e)),
         };
-        let (removed, log_result) = remove_log_files(&dir, &base);
+        // ロック保持中に確認する（削除待ちの間に同じ ID が再作成されていたら、新しいインスタンスのログを消さない）。
+        let (removed, log_result) = if guard() {
+            remove_log_files(&dir, &base)
+        } else {
+            (0, Ok(()))
+        };
         let lock_removed = remove_lock_file(lock, &lock_path(&dir, &base), &dir);
         // ログ削除側の失敗を優先して返す。
         if let Err(e) = log_result {

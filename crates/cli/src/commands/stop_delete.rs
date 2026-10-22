@@ -364,10 +364,13 @@ fn remove_container_log(store: &dyn StateStore, req: &DeleteRequest) {
     let Some(root) = store.host_state_root() else {
         return;
     };
-    if let Err(e) = fandhe_container_supervisor::logs::remove_container_logs_bounded(
+    let guard_root = root.to_path_buf();
+    let guard_id = req.id().clone();
+    if let Err(e) = fandhe_container_supervisor::logs::remove_container_logs_guarded_bounded(
         root,
         req.id(),
         fandhe_container_supervisor::logs::CONTAINER_LOG_REMOVE_TIMEOUT,
+        move || id_is_still_deleted(&guard_root, &guard_id),
     ) {
         emit_warning_bounded(
             container_log_removal_warning(&e),
@@ -375,6 +378,27 @@ fn remove_container_log(store: &dyn StateStore, req: &DeleteRequest) {
             WARNING_WRITE_TIMEOUT,
         );
     }
+}
+
+/// 状態ストアに `id` が無い（delete 後に再作成されていない）ときだけ `true`（#2446・SUP-7。同じ ID の再作成との排他）。
+///
+/// supervisor のログ削除がロックを取った後（同じ ID の sink が開けない状態）で評価される。再作成済みなら削除を
+/// 見送り、新しいインスタンスのログを消さない。ストアを開けない・NotFound 以外の失敗は fail-closed で `false`。
+fn id_is_still_deleted(
+    root: &std::path::Path,
+    id: &fandhe_container_core::traits::ContainerId,
+) -> bool {
+    use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+    let Ok(root) = StateRoot::from_override(root.to_path_buf()) else {
+        return false;
+    };
+    let Ok(store) = FileStateStore::open(root) else {
+        return false;
+    };
+    matches!(
+        store.get(&GetStateRequest::new(id.clone())),
+        Err(e) if e.code() == fandhe_container_core::traits::ErrorCode::NotFound
+    )
 }
 
 /// 警告の書き出しを待つ上限（`main.rs` の `DEFERRED_REPORT_TIMEOUT` と同じ値）。
@@ -807,6 +831,21 @@ mod tests {
             .expect("req")
             .with_cgroup_scope(CgroupScope::new(FAKE_SCOPE).expect("scope"));
             store.create(&req).expect("create").revision()
+        }
+
+        /// SUP-7・#2446: コンテナログ削除の確認は、同じ ID が再作成されていたら `false`（削除を見送る）、
+        /// 無ければ `true`、記録が壊れていて判定できなければ fail-closed で `false`。
+        #[test]
+        fn sup7_id_is_still_deleted_reflects_recreation() {
+            let base = TmpDir::new("recreated");
+            let store = store(&base);
+            let root = state_root(&base);
+            assert!(id_is_still_deleted(&root, &id("c1")));
+            create_placed(&base, &store, "c1");
+            assert!(!id_is_still_deleted(&root, &id("c1")));
+            assert!(id_is_still_deleted(&root, &id("c2")));
+            std::fs::write(root.join("c1").join("state.json"), "{").expect("corrupt");
+            assert!(!id_is_still_deleted(&root, &id("c1")));
         }
 
         /// 検出の呼び出し回数を数えつつ `fake` を返す remover を作る。

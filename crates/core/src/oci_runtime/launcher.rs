@@ -201,6 +201,8 @@ pub struct ProductionLauncherBuilder {
     #[cfg(target_os = "linux")]
     exit_audit_sink: Option<Arc<dyn AuditSink>>,
     #[cfg(target_os = "linux")]
+    rejection_audit_sink: Option<Arc<dyn AuditSink>>,
+    #[cfg(target_os = "linux")]
     cgroup_join_source: Option<JoinSource>,
     #[cfg(target_os = "linux")]
     subordinate_ids: Option<SubordinateIdSource>,
@@ -261,11 +263,25 @@ impl ProductionLauncherBuilder {
     ///
     /// 回収点は supervisor の監視スレッドなど複数スレッドのプロセスから呼ばれ、`FileAuditSink` の fork 隔離が使えない
     /// (rootless では代替経路も失敗する)。supervisor は単一スレッドの間に作った `ControlAuditRelay` をここへ渡す。
-    /// launch の時点の記録(監査網羅の縮退・bind 拒否・pre-pivot の違反)は単一スレッドで出るため `audit_sink` のままで、
-    /// relay は `Mount` 等を運べないので `audit_sink` 全体の差し替えには使わない。
+    /// launch の時点の記録(監査網羅の縮退・pre-pivot の違反)は単一スレッドで出るため `audit_sink` のままで、
+    /// relay は理由つきの `Mount` 等を運べないので `audit_sink` 全体の差し替えには使わない。
+    /// start の検証(bind・sysfs)の拒否の記録先は [`Self::rejection_audit_sink`]。
     #[must_use]
     pub fn exit_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
         self.exit_audit_sink = Some(sink);
+        self
+    }
+
+    /// start の設定検証(`claim_start` の bind mount の元・sysfs の拒否)が出す mount 層の拒否だけの記録先
+    /// (任意。SEC-4・#2481)。未指定なら [`Self::audit_sink`] を使う。
+    ///
+    /// この検証は start の作業スレッド(入口スレッドが待つ間のため複数スレッド)で走り、`FileAuditSink` の fork 隔離が
+    /// 使えない(rootless では代替経路も失敗して拒否が残らない)。supervisor は単一スレッドの間に作った
+    /// `ControlAuditRelay`(理由なしの `Mount` を運べる)をここへ渡す。launch の時点の記録(監査網羅の縮退・
+    /// pre-pivot の違反)は単一スレッドで出るので `audit_sink` のまま。
+    #[must_use]
+    pub fn rejection_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.rejection_audit_sink = Some(sink);
         self
     }
 
@@ -350,6 +366,7 @@ impl ProductionLauncherBuilder {
             inner.seccomp_delivery = self.seccomp_delivery;
             inner.audit_policy = self.audit_policy;
             inner.exit_audit_sink = self.exit_audit_sink;
+            inner.rejection_audit_sink = self.rejection_audit_sink;
             Ok(ProductionLauncher { inner })
         }
         #[cfg(not(target_os = "linux"))]
@@ -568,11 +585,18 @@ impl ProcessLauncher for ProductionLauncher {
         LaunchMode::SelfBounded
     }
 
-    /// start が設定の検証で拒否したときの記録先として、この launcher の監査 sink を貸す(SEC-4・#1915)。
+    /// start が設定の検証で拒否したときの記録先を貸す(SEC-4・#1915)。`rejection_audit_sink` の指定があればそれ、
+    /// 無ければ launcher の監査 sink(#2481)。
     fn rejection_audit_sink(&self) -> Option<&dyn AuditSink> {
         #[cfg(target_os = "linux")]
         {
-            Some(self.inner.audit_sink.as_ref())
+            Some(
+                self.inner
+                    .rejection_audit_sink
+                    .as_ref()
+                    .unwrap_or(&self.inner.audit_sink)
+                    .as_ref(),
+            )
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -900,6 +924,8 @@ struct Inner {
     audit_sink: Arc<dyn AuditSink>,
     /// 回収点の `exit_signal` 監査だけの記録先(`ProductionLauncherBuilder::exit_audit_sink`。#2236)。`None` なら `audit_sink`。
     exit_audit_sink: Option<Arc<dyn AuditSink>>,
+    /// start の検証(bind・sysfs)の拒否だけの記録先(`ProductionLauncherBuilder::rejection_audit_sink`。#2481)。`None` なら `audit_sink`。
+    rejection_audit_sink: Option<Arc<dyn AuditSink>>,
     cgroup_join_source: Option<JoinSource>,
     /// cgroup 連鎖で書いた `linux.resources`(`ProductionLauncherBuilder::applied_resource_limits`)。
     applied_resources: Option<LinuxResourceLimits>,
@@ -931,6 +957,7 @@ impl Inner {
             subordinate,
             audit_sink,
             exit_audit_sink: None,
+            rejection_audit_sink: None,
             cgroup_join_source,
             applied_resources: None,
             seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
@@ -3451,6 +3478,21 @@ mod tests {
         assert!(!Arc::ptr_eq(&l.inner.exit_audit_sink(), &main));
         let rej = l.rejection_audit_sink().expect("sink");
         assert!(std::ptr::addr_eq(rej, Arc::as_ptr(&main)));
+    }
+
+    /// SEC-4・#2481: `rejection_audit_sink` 指定時は start の検証の拒否の記録先だけが差し替わり、
+    /// 回収点と launch の時点の `audit_sink` は変わらない。
+    #[test]
+    fn sec4_2481_rejection_audit_sink_overrides_only_the_rejection_point() {
+        let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+        let main = Arc::clone(&l.inner.audit_sink);
+        let relay: Arc<dyn AuditSink> = Arc::new(NullSink);
+        l.inner.rejection_audit_sink = Some(Arc::clone(&relay));
+        let rej = l.rejection_audit_sink().expect("sink");
+        assert!(std::ptr::addr_eq(rej, Arc::as_ptr(&relay)));
+        assert!(!std::ptr::addr_eq(rej, Arc::as_ptr(&main)));
+        assert!(Arc::ptr_eq(&l.inner.audit_sink, &main));
+        assert!(Arc::ptr_eq(&l.inner.exit_audit_sink(), &main));
     }
 
     /// 全 OS 共通の型: `parse_config_bytes` を使う他の試験と同様に config が `LaunchSpec` まで載ること。

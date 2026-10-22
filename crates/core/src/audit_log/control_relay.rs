@@ -14,7 +14,10 @@
 //! - 構築（[`ControlAuditRelay::spawn`]）は呼び出しプロセスが単一スレッドのときだけ成功する（`FailedPrecondition`）。
 //!   制御チャネルの listener を bind する前に呼ぶこと（helper は fd 3 以上を閉じるため listener を持たない）
 //! - 運べるのは [`AuditEvent::ControlPeer`]・[`AuditEvent::Seccomp`]・[`AuditEvent::ExitSignal`]（#2236。launcher の
-//!   回収点が出す補助の `exit_signal`）の記録だけ（他の層は `InvalidArgument`）。時刻・PID・
+//!   回収点が出す補助の `exit_signal`）・理由なしの [`AuditEvent::Mount`]（#2481。supervisor の `start` が作業スレッドで
+//!   出す bind・sysfs の拒否。パスは生バイトで運ぶ）の記録だけ（他の層と、理由つきの `Mount` は `InvalidArgument`。
+//!   理由トークンは静的文字列の開いた語彙で、復号側が閉じた表へ戻せないため。理由つきの記録は単一スレッドの launch が
+//!   `FileAuditSink` へ直接出す）。時刻・PID・
 //!   コンテナ ID・理由トークン（seccomp は種別トークンと syscall 番号・arch）を固定の枠で送り、helper が [`AuditRecord`] を
 //!   組み直す（生のバイト列を記録として扱わない。REPAIR-2）。seccomp の記録は supervisor の seccomp 通知ループ
 //!   （`record_seccomp_denial_for` 経由。SEC-4・REPAIR-5・#2025）が書く
@@ -27,9 +30,12 @@
 //!
 //! helper が死んだ後の再起動はしない（以後 `Unavailable`。呼び出し側が構造化ログへ縮退する）。
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -37,8 +43,9 @@ use crate::sys;
 use crate::traits::{ContainerId, ErrorCode, TraitError};
 
 use super::{
-    AuditEvent, AuditPid, AuditRecord, AuditSignal, AuditSink, AuditSyscallArch, AuditSyscallNr,
-    AuditTimestamp, ControlPeerRejection, FileAuditSink, RECORD_WAIT_LIMIT,
+    AUDIT_PATH_MAX_BYTES, AuditEvent, AuditPath, AuditPid, AuditRecord, AuditSignal, AuditSink,
+    AuditSyscallArch, AuditSyscallNr, AuditTimestamp, ControlPeerRejection, FileAuditSink,
+    RECORD_WAIT_LIMIT,
 };
 
 /// 枠の固定部: 理由 1・秒 8・ナノ秒 4・PID 4・コンテナ ID 長 1。
@@ -62,12 +69,18 @@ const TAG_EXIT_SIGNAL: u8 = 0x82;
 const EXIT_SIGNAL_EXTRA_LEN: usize = 1 + 4;
 /// seccomp の枠だけが持つ追加部（番号 4・arch 4）。
 const SECCOMP_EXTRA_LEN: usize = 8;
+/// mount（理由なし。#2481）の記録を示す先頭バイト。コンテナ ID の後に追加部（path_present 1・path_len 2・original_len 8）、
+/// さらに可変長のパス本体 `path_len` バイトが付く。
+const TAG_MOUNT: u8 = 0x83;
+/// mount の枠の固定の追加部の長さ（path_present 1・path_len 2・original_len 8）。パス本体はこの後ろに続く。
+const MOUNT_EXTRA_LEN: usize = 1 + 2 + 8;
 
 /// 先頭バイトから、コンテナ ID の後ろに続く追加部の長さを返す（`serve` の読み取り量を 1 か所で決める）。
 const fn extra_len(tag: u8) -> usize {
     match tag {
         TAG_SECCOMP => SECCOMP_EXTRA_LEN,
         TAG_EXIT_SIGNAL => EXIT_SIGNAL_EXTRA_LEN,
+        TAG_MOUNT => MOUNT_EXTRA_LEN,
         _ => 0,
     }
 }
@@ -85,6 +98,15 @@ fn err(code: ErrorCode, message: &'static str) -> TraitError {
 /// 記録を枠へ符号化する。`ControlPeer` 以外・長すぎるコンテナ ID は拒否する。
 fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
     let (tag, extra, exit_signal) = match record.event() {
+        AuditEvent::Mount { path, reason: None } => {
+            return encode_mount(record, path.as_ref());
+        }
+        AuditEvent::Mount { .. } => {
+            return Err(err(
+                ErrorCode::InvalidArgument,
+                "the audit relay does not carry mount records with a reason",
+            ));
+        }
         AuditEvent::ControlPeer { reason } => {
             let Some(tag) = REJECTIONS
                 .iter()
@@ -109,7 +131,7 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
         _ => {
             return Err(err(
                 ErrorCode::InvalidArgument,
-                "the audit relay only carries control channel, seccomp and exit signal records",
+                "the audit relay only carries control channel, seccomp, exit signal and mount records",
             ));
         }
     };
@@ -139,6 +161,74 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
     Ok(frame)
 }
 
+/// 共通の固定部（先頭バイト・時刻・PID・コンテナ ID）を `frame` へ積む。ID が長すぎれば拒否する。
+fn push_head(frame: &mut Vec<u8>, tag: u8, record: &AuditRecord) -> Result<(), TraitError> {
+    let id = record.container_id().map_or("", ContainerId::as_str);
+    let Ok(id_len) = u8::try_from(id.len()) else {
+        return Err(err(
+            ErrorCode::InvalidArgument,
+            "the container id is too long for the audit relay",
+        ));
+    };
+    let at = record.timestamp().as_unix_duration();
+    frame.push(tag);
+    frame.extend_from_slice(&at.as_secs().to_be_bytes());
+    frame.extend_from_slice(&at.subsec_nanos().to_be_bytes());
+    frame.extend_from_slice(&record.pid().get().to_be_bytes());
+    frame.push(id_len);
+    frame.extend_from_slice(id.as_bytes());
+    Ok(())
+}
+
+/// 理由なしの `Mount` を枠へ符号化する（#2481）。パスは生バイトのまま運び、保持長は
+/// [`AUDIT_PATH_MAX_BYTES`] 以下（`AuditPath` の不変条件）なので `u16` に収まる。
+fn encode_mount(record: &AuditRecord, path: Option<&AuditPath>) -> Result<Vec<u8>, TraitError> {
+    let (bytes, original_len) = match path {
+        Some(p) => (p.as_path().as_os_str().as_bytes(), p.original_len()),
+        None => (&[][..], 0),
+    };
+    let too_long = || err(ErrorCode::InvalidArgument, "the audit path is too long");
+    if bytes.len() > AUDIT_PATH_MAX_BYTES {
+        return Err(too_long());
+    }
+    let path_len = u16::try_from(bytes.len()).map_err(|_| too_long())?;
+    let original = u64::try_from(original_len).map_err(|_| too_long())?;
+    let mut frame = Vec::with_capacity(FIXED_LEN + MOUNT_EXTRA_LEN + bytes.len());
+    push_head(&mut frame, TAG_MOUNT, record)?;
+    frame.push(u8::from(path.is_some()));
+    frame.extend_from_slice(&path_len.to_be_bytes());
+    frame.extend_from_slice(&original.to_be_bytes());
+    frame.extend_from_slice(bytes);
+    Ok(frame)
+}
+
+/// `rest`（ID の後ろ）から mount の記録の ID と事象を組み直す。`AuditPath` の不変条件
+/// （保持長 ≤ 上限・切り詰めの有無と `original_len` の整合）を満たさない枠は `None`。
+fn decode_mount(rest: &[u8], id_len: usize) -> Option<(&[u8], AuditEvent)> {
+    let (id, after) = rest.split_at_checked(id_len)?;
+    let present = *after.first()?;
+    let path_len = usize::from(u16::from_be_bytes(after.get(1..3)?.try_into().ok()?));
+    let original_len =
+        usize::try_from(u64::from_be_bytes(after.get(3..11)?.try_into().ok()?)).ok()?;
+    let body = after.get(MOUNT_EXTRA_LEN..)?;
+    if body.len() != path_len || path_len > AUDIT_PATH_MAX_BYTES {
+        return None;
+    }
+    let path = match present {
+        0 if path_len == 0 && original_len == 0 => None,
+        1 if original_len >= path_len
+            && (original_len > AUDIT_PATH_MAX_BYTES || original_len == path_len) =>
+        {
+            Some(AuditPath {
+                path: PathBuf::from(OsStr::from_bytes(body)),
+                original_len,
+            })
+        }
+        _ => return None,
+    };
+    Some((id, AuditEvent::Mount { path, reason: None }))
+}
+
 /// 枠から記録を組み直す。壊れた枠は `None`（記録を捏造しない）。
 fn decode(frame: &[u8]) -> Option<AuditRecord> {
     let tag = *frame.first()?;
@@ -150,7 +240,9 @@ fn decode(frame: &[u8]) -> Option<AuditRecord> {
     if nanos >= 1_000_000_000 {
         return None;
     }
-    let (id, event) = if tag == TAG_SECCOMP {
+    let (id, event) = if tag == TAG_MOUNT {
+        decode_mount(rest, id_len)?
+    } else if tag == TAG_SECCOMP {
         // 長さは厳密に一致させる（余りも不足も壊れた枠）。
         if rest.len() != id_len.checked_add(SECCOMP_EXTRA_LEN)? {
             return None;
@@ -204,6 +296,28 @@ fn serve(mut stream: UnixStream, sink: &FileAuditSink) -> i32 {
             && stream.read_exact(body).is_err()
         {
             return 1;
+        }
+        if head.first() == Some(&TAG_MOUNT) {
+            // 可変長のパス本体。長さは確保の前に上限で検証する（壊れた枠はストリームを読み進められないので
+            // helper を終え、親は応答待ちの期限で Unavailable になる。fail-closed。DoS 対策）。
+            let at = FIXED_LEN + id_len + 1;
+            let len_bytes = frame
+                .get(at..at + 2)
+                .and_then(|b| <[u8; 2]>::try_from(b).ok());
+            let Some(len_bytes) = len_bytes else {
+                return 1;
+            };
+            let path_len = usize::from(u16::from_be_bytes(len_bytes));
+            if path_len > AUDIT_PATH_MAX_BYTES {
+                return 1;
+            }
+            let start = frame.len();
+            frame.resize(start + path_len, 0);
+            if let Some(body) = frame.get_mut(start..)
+                && stream.read_exact(body).is_err()
+            {
+                return 1;
+            }
         }
         let ok = if head.first() == Some(&TAG_PROBE) {
             id_len == 0 && sink.probe_primary().is_ok()
@@ -569,15 +683,113 @@ mod tests {
         }
     }
 
-    /// SEC-4: 運ぶのは制御チャネルと seccomp だけ。それ以外の層（Mount）は拒否する。
+    /// SEC-4: まだ運ばない層（Landlock・PluginTrust・AuditCoverageDegraded）は拒否する。
     #[test]
     fn sec4_other_layers_are_rejected() {
+        for event in [
+            AuditEvent::Landlock {
+                path: AuditPath::new("/x"),
+                syscall: None,
+            },
+            AuditEvent::AuditCoverageDegraded {
+                seccomp_kill: None,
+                landlock: None,
+            },
+        ] {
+            let rec = AuditRecord::new(
+                AuditTimestamp::from_unix_duration(Duration::new(1, 0)),
+                AuditPid::new(1).unwrap(),
+                event,
+            );
+            assert_eq!(encode(&rec).unwrap_err().code(), ErrorCode::InvalidArgument);
+        }
+    }
+
+    fn mount_sample(path: Option<AuditPath>, id: Option<&str>) -> AuditRecord {
+        let r = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 3)),
+            AuditPid::new(99).unwrap(),
+            AuditEvent::Mount { path, reason: None },
+        );
+        match id {
+            Some(id) => r.with_container_id(ContainerId::new(id).unwrap()),
+            None => r,
+        }
+    }
+
+    /// SEC-4・#2481: mount（理由なし）の枠はパスのバイト列・切り詰め・元の長さ・ID が往復で一致する。
+    #[test]
+    fn sec4_2481_mount_frame_round_trips() {
+        let non_utf8 = AuditPath::new(OsStr::from_bytes(&[b'/', 0xff, 0xfe, b'\n', b'a']));
+        let long = AuditPath::new(&"a".repeat(AUDIT_PATH_MAX_BYTES + 10));
+        let exact = AuditPath::new(&"b".repeat(AUDIT_PATH_MAX_BYTES));
+        for path in [
+            None,
+            Some(AuditPath::new("/etc/shadow")),
+            Some(AuditPath::new("")),
+            Some(non_utf8),
+            Some(long),
+            Some(exact),
+        ] {
+            for id in [None, Some("web-1")] {
+                let rec = mount_sample(path.clone(), id);
+                let frame = encode(&rec).unwrap();
+                assert_eq!(extra_len(frame[0]), MOUNT_EXTRA_LEN);
+                let back = decode(&frame).unwrap();
+                assert_eq!(back.event(), rec.event());
+                assert_eq!(back.pid(), rec.pid());
+                assert_eq!(back.timestamp(), rec.timestamp());
+                assert_eq!(back.container_id(), rec.container_id());
+            }
+        }
+        let long = AuditPath::new(&"a".repeat(AUDIT_PATH_MAX_BYTES + 10));
+        let back = decode(&encode(&mount_sample(Some(long), None)).unwrap()).unwrap();
+        let AuditEvent::Mount { path: Some(p), .. } = back.event() else {
+            panic!("mount with a path");
+        };
+        assert!(p.is_truncated());
+        assert_eq!(p.original_len(), AUDIT_PATH_MAX_BYTES + 10);
+    }
+
+    /// REPAIR-2・#2481: mount の壊れた枠（本体の不足・余り・長さ上限超過・存在フラグ不正・元の長さの矛盾）は記録にしない。
+    #[test]
+    fn repair2_2481_malformed_mount_frames_are_not_decoded() {
+        let good = encode(&mount_sample(Some(AuditPath::new("/abc")), Some("ab"))).unwrap();
+        assert!(decode(&good).is_some());
+        assert!(decode(&good[..good.len() - 1]).is_none());
+        let mut longer = good.clone();
+        longer.push(0);
+        assert!(decode(&longer).is_none());
+        let at = FIXED_LEN + 2;
+        let mut huge = good.clone();
+        huge[at + 1..at + 3].copy_from_slice(&5000u16.to_be_bytes());
+        assert!(decode(&huge).is_none());
+        let mut bad_present = good.clone();
+        bad_present[at] = 2;
+        assert!(decode(&bad_present).is_none());
+        let mut shorter_original = good.clone();
+        shorter_original[at + 3..at + 11].copy_from_slice(&3u64.to_be_bytes());
+        assert!(decode(&shorter_original).is_none());
+        let mut bigger_original = good.clone();
+        bigger_original[at + 3..at + 11].copy_from_slice(&9u64.to_be_bytes());
+        assert!(decode(&bigger_original).is_none());
+        let none = encode(&mount_sample(None, None)).unwrap();
+        assert!(decode(&none).is_some());
+        let mut none_with_len = none;
+        none_with_len[FIXED_LEN + 1..FIXED_LEN + 3].copy_from_slice(&1u16.to_be_bytes());
+        none_with_len.push(b'x');
+        assert!(decode(&none_with_len).is_none());
+    }
+
+    /// SEC-4・#2481: 理由つきの mount は運ばない（静的トークンを復号側で戻せない）。
+    #[test]
+    fn sec4_2481_mount_with_reason_is_rejected() {
         let rec = AuditRecord::new(
             AuditTimestamp::from_unix_duration(Duration::new(1, 0)),
             AuditPid::new(1).unwrap(),
             AuditEvent::Mount {
                 path: None,
-                reason: None,
+                reason: Some(super::super::AuditReason::new("x")),
             },
         );
         assert_eq!(encode(&rec).unwrap_err().code(), ErrorCode::InvalidArgument);

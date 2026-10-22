@@ -42,6 +42,13 @@ use std::fmt;
 use fandhe_container_core::capabilities::{Capability, CapabilitySet};
 use fandhe_container_core::traits::{ErrorCode, TraitError};
 
+#[cfg(target_os = "linux")]
+use crate::sys::EPERM;
+/// 非 Linux では `crate::sys` が無いが、fake kernel の単体テストは 3 OS で走るため同じ値を試験用に置く
+/// （値は Linux の `EPERM`）。
+#[cfg(all(test, not(target_os = "linux")))]
+const EPERM: i32 = 1;
+
 /// `/proc/<pid>/status` として受け入れる最大バイト数（無制限確保の防止）。
 pub const MAX_STATUS_BYTES: usize = 64 * 1024;
 /// `/proc/<pid>/status` として受け入れる最大行数。
@@ -790,7 +797,7 @@ trait PrivilegeKernel {
 /// message は固定の英語文と errno 番号だけで、環境の情報を含めない。
 #[cfg(any(target_os = "linux", test))]
 fn syscall_failed(what: &str, e: &std::io::Error) -> PrivilegeError {
-    let code = if e.raw_os_error() == Some(1) {
+    let code = if e.raw_os_error() == Some(EPERM) {
         ErrorCode::PermissionDenied
     } else {
         ErrorCode::Internal
@@ -1176,13 +1183,16 @@ trait SessionKernel {
 /// `setsid` が `EPERM`（呼び出し元がプロセスグループのリーダー）のときは、読み戻しで `session == pid == pgrp` かつ
 /// 制御端末なしなら「既に切り離されている」として成功にする（systemd のサービスや `setsid(1)` 経由）。それ以外は拒否する。
 /// fork で回避しない（ランチャーの「exec で置き換わる・待機しない」契約を保つため）。
+///
+/// fork しないため exec 後の supervisor は生涯セッションリーダーになる。その帰結（端末の `open` に `O_NOCTTY`
+/// が必須）は `crate::launcher` の module doc を参照（#2426）。
 #[cfg(any(target_os = "linux", test))]
 fn detach_session_with<K: SessionKernel>(k: &mut K) -> Result<SessionSnapshot, PrivilegeError> {
     let stdio = k.stdio_terminals();
     check_stdio(stdio)?;
     match k.setsid() {
         Ok(()) => {}
-        Err(e) if e.raw_os_error() == Some(1) => {}
+        Err(e) if e.raw_os_error() == Some(EPERM) => {}
         Err(e) => return Err(syscall_failed("setsid", &e)),
     }
     let text = k
@@ -2173,14 +2183,14 @@ mod session_tests {
     #[test]
     fn sup14_task171_2_detach_eperm_is_ok_only_when_already_detached() {
         // EPERM かつ既に自分のセッションのリーダーで制御端末なし: 成功。
-        let mut k = fake(Some(1), stat(9, 9, 9, 0));
+        let mut k = fake(Some(EPERM), stat(9, 9, 9, 0));
         assert_eq!(detach_session_with(&mut k).unwrap(), snap(9, 9, 9, 0));
         // EPERM かつ別セッション: 拒否。
-        let mut k = fake(Some(1), stat(9, 9, 3, 0));
+        let mut k = fake(Some(EPERM), stat(9, 9, 3, 0));
         let e = detach_session_with(&mut k).unwrap_err();
         assert_eq!(e.reason, PrivilegeErrorReason::NotSessionLeader);
         // EPERM かつ制御端末あり: 拒否。
-        let mut k = fake(Some(1), stat(9, 9, 9, 34816));
+        let mut k = fake(Some(EPERM), stat(9, 9, 9, 34816));
         let e = detach_session_with(&mut k).unwrap_err();
         assert_eq!(e.reason, PrivilegeErrorReason::ControllingTerminalAttached);
     }

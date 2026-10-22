@@ -84,7 +84,7 @@ rootful 時に、本リポのコードが行う特権操作と、それに要す
 
 ## 5. 権限の保持期間と縮退手順
 
-1. ランチャーが `setsid` し、制御端末・標準入出力が pty でないことを確認する（(B)。#537。実装済み）。順序は、標準入出力が端末でないことの判定（端末なら `setsid` の前に拒否）→ `setsid` → `/proc/self/stat` の読み戻しで `session == pid`・`pgrp == pid`・`tty_nr == 0` を確認、とする。`setsid` が `EPERM`（プロセスグループのリーダーとして起動された）のときは、読み戻しで上の 3 条件を満たす場合に限り「既に切り離されている」として成功扱いにし、それ以外は拒否する。fork で回避しない（ランチャーは exec で置き換わり待機しない契約のため）。**起動側の契約**: ランチャーを `process_group(0)` で起動しない（`setsid` が新しいセッションとプロセスグループを作るので代わりになる）。標準入出力に pty を渡さない。CLI の `supervisor_start.rs` は supervisor を `process_group(0)` で起動するが、ランチャーを選ぶ規則はまだ無く（rootful は spawn 前に `UNIMPLEMENTED`）、その規則を入れる際にこの契約を守る
+1. ランチャーが `setsid` し、制御端末・標準入出力が pty でないことを確認する（(B)。#537。実装済み）。順序は、標準入出力が端末でないことの判定（端末なら `setsid` の前に拒否）→ `setsid` → `/proc/self/stat` の読み戻しで `session == pid`・`pgrp == pid`・`tty_nr == 0` を確認、とする。`setsid` が `EPERM`（プロセスグループのリーダーとして起動された）のときは、読み戻しで上の 3 条件を満たす場合に限り「既に切り離されている」として成功扱いにし、それ以外は拒否する。fork で回避しない（ランチャーは exec で置き換わり待機しない契約のため）。**起動側の契約**: ランチャーを `process_group(0)` で起動しない（`setsid` が新しいセッションとプロセスグループを作るので代わりになる）。標準入出力に pty を渡さない。CLI の `supervisor_start.rs` は supervisor を `process_group(0)` で起動するが、ランチャーを選ぶ規則はまだ無く（rootful は spawn 前に `UNIMPLEMENTED`）、その規則を入れる際にこの契約を守る。**supervisor 側の契約**: exec 後の supervisor はセッションリーダーのままなので、端末になりうる対象の `open` には常に `O_NOCTTY` を付ける（理由: 制御端末の再取得により `TIOCSTI` の入力注入や hangup 時の SIGHUP の波及という、ここで断った経路が再発するため。#2426）。実装上の対応は `crates/supervisor/src/launcher.rs` の module doc
 2. 環境変数をサニタイズ（`LD_*`・`PATH` 等を信用しない）し、引数・cwd・継承 fd を検証する
 3. 必要最小集合以外を bounding set から落とす（`CAP_SETPCAP` が要る）
 4. 必要最小集合だけを inheritable・ambient に載せ、supervisor を exec する（(c)）。(a) の場合は uid を非特権へ戻す前に `PR_SET_KEEPCAPS` を 1 にして、setuid 遷移で permitted が失われないようにする。`setresuid` で非特権 UID へ戻した直後は effective が落ちるため、`capset` で permitted・effective・inheritable を必要最小集合に再設定し、ambient へ載せたうえで `PR_SET_KEEPCAPS` を 0 に戻す。`capget`・`/proc/self/status` の `CapPrm`・`CapEff`・`CapAmb` が期待集合と一致することを exec 前に検証し、不一致なら 6 章に従い fail-closed とする
@@ -183,7 +183,7 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 | ---- | ---- |
 | `prctl(2)`・`execve(2)`・`setsid(2)`・`mount(8)` の `nosuid`・sudoers `use_pty` の原文照合 | 未確認 |
 | `CAP_SYS_CHROOT`・UTS namespace・cgroup 書き込み権限の要否 | 未確認（4 章の「想定」） |
-| セッションリーダーが `O_NOCTTY` を付けずに tty を `open` すると制御端末を再取得しうる | 未確認（supervisor は状態ルート配下のファイルとソケットしか開かない前提。実機での確認は #539） |
+| セッションリーダーが `O_NOCTTY` を付けずに tty を `open` すると制御端末を再取得しうる | 契約として明記（#2426。`launcher.rs` の module doc と 5 章 1 項。env ファイル・ログ等の外部指定パスを開くヘルパーは `O_NOCTTY` を付ける）。カーネル挙動の原文照合と実機での確認は #539 |
 | `sudo`（`use_pty`）経由で起動すると標準入出力が pty になりランチャーが拒否する | 設計どおり（「sudo へ戻らない」の帰結。回避手段は設けない） |
 | file capabilities 付きバイナリの AppArmor 等の LSM 下の挙動 | 未確認 |
 | macOS・Windows（VM 内）で本方式が不要であること | 要確認（MAC・WIN 系ビヘイビア） |

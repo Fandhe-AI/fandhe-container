@@ -11,7 +11,9 @@
 //!
 //! 終了コードの規則: 条件なし（どの構成でも要る）のステップが残れば `UNIMPLEMENTED`（8）、条件つき（[`SetupCondition`]）のステップだけなら 0。
 //!
-//! macOS / Windows は要求ステップの提示までで、OS 設定の検出・適用は行わない（実装済みを装わない。REPAIR-3）。
+//! macOS / Windows も Linux と同じ形式の `instructions`（手順の固定文言。表示のみ）つきでステップを提示し、
+//! OS 設定の検出・適用は行わない（TASK-125 の範囲。実装済みを装わない。REPAIR-3・#2452・CLI-1）。
+//! Windows の文言は `docs/setup/windows.md` と食い違わない（単体テスト `win5_instructions_match_windows_setup_doc` で照合）。
 //! - cli は platform-* へ依存できない（CLI-1・PLUG-4・`make check-cli-backend-deps`）ため、検出・適用は将来 plugin 境界経由になる。
 //! - WSL2 有効化・Developer Mode は管理者権限を要し、macOS の entitlement はビルド / 署名時の属性で実行時には付与できない。
 //!   CLI からの昇格・シェル / 外部コマンド起動・設定ファイル / レジストリの変更は行わない。
@@ -29,6 +31,22 @@ use crate::json::json_escape_into;
 /// 特権ランチャーのインストール手順の固定文言（sudo は案内しない。root で直接実行する。#1454）。
 /// 引数は `scripts/install-privileged-launcher.sh` の使い方（#2137 の sha256 3 引数を含む）に合わせる。
 const LAUNCHER_INSTALL_INSTRUCTIONS: &str = "rootful only; rootless (default) needs no install. As root, run scripts/install-privileged-launcher.sh --launcher <file> --launcher-sha256 <hex> --supervisor <file> --supervisor-sha256 <hex> --cli <file> --cli-sha256 <hex> [--dest-dir <absolute path>] (default dest-dir /usr/local/libexec/fandhe-container). fandhe-container does not run it. See docs/setup/linux.md";
+
+/// Windows: WSL2 有効化の手順の固定文言（`docs/setup/windows.md`「WSL2 の有効化」と同じコマンド。WIN-1・WIN-5・#2452）。
+const WSL2_ENABLE_INSTRUCTIONS: &str = "Requires administrator. In an elevated PowerShell, run wsl --install and reboot (or enable the Virtual Machine Platform and Windows Subsystem for Linux features, reboot, and run wsl --set-default-version 2). Then install a WSL2 distribution and confirm that wsl -l -v shows VERSION 2 and that wsl --version succeeds. fandhe-container does not run these. See docs/setup/windows.md";
+
+/// Windows: Developer Mode の手順の固定文言（`docs/setup/windows.md`「Developer Mode の有効化」。WIN-4・WIN-5・#2452）。
+const DEVELOPER_MODE_INSTRUCTIONS: &str = "Requires administrator. Turn on Developer Mode in Settings > System > For developers (Windows 11) or Settings > Update & Security > For developers (Windows 10); it is needed to create symbolic links and widens the local attack surface. fandhe-container does not change it. See docs/setup/windows.md";
+
+/// Windows: `.wslconfig` の virtiofs の手順の固定文言（`docs/setup/windows.md`「`.wslconfig` で virtiofs を有効化」。WIN-2・WIN-5・#2452）。
+const WSLCONFIG_VIRTIOFS_INSTRUCTIONS: &str = "No administrator needed. In %UserProfile%\\.wslconfig, add virtiofs=true under [wsl2] (put comments on their own lines), then run wsl --shutdown so the setting takes effect. fandhe-container does not edit .wslconfig. See docs/setup/windows.md";
+
+/// macOS: entitlement と署名の手順の固定文言（`fandhe-container-plugin-macos` の前提。MAC-1・#2452）。
+/// macOS のセットアップ文書は未整備のため、文書へのリンクは付けない。
+const VIRTUALIZATION_ENTITLEMENT_INSTRUCTIONS: &str = "The macOS backend plugin fandhe-container-plugin-macos must be code-signed with the com.apple.security.virtualization entitlement (ad-hoc signing is accepted), e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.virtualization> <path to fandhe-container-plugin-macos>. fandhe-container does not sign binaries.";
+
+/// macOS: 最低版数の手順の固定文言（13 以上は `MacosMinVersion` の暫定要件。spec 未定義。MAC-1・#2452）。
+const MACOS_MIN_VERSION_INSTRUCTIONS: &str = "Requires macOS 13 or later (provisional minimum for Virtualization.framework). Check with sw_vers -productVersion. fandhe-container does not check or upgrade macOS.";
 
 /// `setup` が要求する OS 固有ステップ（閉じた列挙。外部入力からは構築しない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,14 +107,15 @@ impl SetupStep {
         }
     }
 
-    /// 手順の固定文言（出力の `instructions` フィールド。英語・外部入力を含まない）。無いステップは `None`。
+    /// 手順の固定文言（出力の `instructions` フィールド。英語・外部入力を含まない。表示のみで CLI は実行しない）。
+    /// 現状は全ステップが `Some`。手順の無いステップを足せるよう `Option` を保つ。
     pub fn instructions(self) -> Option<&'static str> {
         match self {
-            SetupStep::Wsl2Enable
-            | SetupStep::DeveloperMode
-            | SetupStep::WslconfigVirtiofs
-            | SetupStep::VirtualizationEntitlement
-            | SetupStep::MacosMinVersion => None,
+            SetupStep::Wsl2Enable => Some(WSL2_ENABLE_INSTRUCTIONS),
+            SetupStep::DeveloperMode => Some(DEVELOPER_MODE_INSTRUCTIONS),
+            SetupStep::WslconfigVirtiofs => Some(WSLCONFIG_VIRTIOFS_INSTRUCTIONS),
+            SetupStep::VirtualizationEntitlement => Some(VIRTUALIZATION_ENTITLEMENT_INSTRUCTIONS),
+            SetupStep::MacosMinVersion => Some(MACOS_MIN_VERSION_INSTRUCTIONS),
             SetupStep::PrivilegedLauncherInstall => Some(LAUNCHER_INSTALL_INSTRUCTIONS),
         }
     }
@@ -289,7 +308,7 @@ mod tests {
         }
         assert_eq!(
             step_line(SetupStep::Wsl2Enable),
-            "{\"step\":\"wsl2-enable\",\"requires_admin\":true,\"status\":\"manual\"}\n"
+            test_line("wsl2-enable", true, WSL2_ENABLE_INSTRUCTIONS)
         );
         assert_eq!(step_line(SetupStep::PrivilegedLauncherInstall), LINUX_LINE);
     }
@@ -299,14 +318,84 @@ mod tests {
     fn cli2_run_output_per_platform() {
         assert_eq!(out_of(SetupPlatform::Linux), (0, LINUX_LINE.to_owned()));
         assert_eq!(out_of(SetupPlatform::Other), (8, String::new()));
-        let mac = concat!(
-            "{\"step\":\"virtualization-entitlement\",\"requires_admin\":false,\"status\":\"manual\"}\n",
-            "{\"step\":\"macos-min-version\",\"requires_admin\":false,\"status\":\"manual\"}\n"
-        );
-        assert_eq!(out_of(SetupPlatform::Macos), (8, mac.to_owned()));
-        let (code, text) = out_of(SetupPlatform::Windows);
-        assert_eq!(code, 8);
-        assert_eq!(text.lines().count(), 3);
+        let mac = [
+            test_line(
+                "virtualization-entitlement",
+                false,
+                VIRTUALIZATION_ENTITLEMENT_INSTRUCTIONS,
+            ),
+            test_line("macos-min-version", false, MACOS_MIN_VERSION_INSTRUCTIONS),
+        ]
+        .concat();
+        assert_eq!(out_of(SetupPlatform::Macos), (8, mac));
+        let win = [
+            test_line("wsl2-enable", true, WSL2_ENABLE_INSTRUCTIONS),
+            test_line("developer-mode", true, DEVELOPER_MODE_INSTRUCTIONS),
+            test_line("wslconfig-virtiofs", false, WSLCONFIG_VIRTIOFS_INSTRUCTIONS),
+        ]
+        .concat();
+        assert_eq!(out_of(SetupPlatform::Windows), (8, win));
+        // 文言の具体値（定数からの組み立てとの循環照合を避ける）。JSON では `\` が `\\` になる。
+        assert!(step_line(SetupStep::WslconfigVirtiofs).contains(
+            r"No administrator needed. In %UserProfile%\\.wslconfig, add virtiofs=true under [wsl2]"
+        ));
+        assert!(step_line(SetupStep::MacosMinVersion).contains("Requires macOS 13 or later"));
+    }
+
+    /// 期待する出力行を組み立てる（文言中の `\` だけを JSON 用に 2 重化する）。
+    fn test_line(id: &str, admin: bool, text: &str) -> String {
+        format!(
+            "{{\"step\":\"{id}\",\"requires_admin\":{admin},\"status\":\"manual\",\"instructions\":\"{}\"}}\n",
+            text.replace('\\', "\\\\")
+        )
+    }
+
+    /// CLI-1・CLI-2・#2452: 全 OS 区分の全ステップが、非空・ASCII 印字可能・単一行の手順文言を持つ。
+    #[test]
+    fn cli1_cli2_every_step_has_instructions() {
+        for p in [
+            SetupPlatform::Windows,
+            SetupPlatform::Macos,
+            SetupPlatform::Linux,
+        ] {
+            for s in required_steps(p) {
+                let t = s.instructions().unwrap_or_else(|| panic!("{}", s.id()));
+                assert!(!t.is_empty());
+                assert!(t.chars().all(|c| c == ' ' || c.is_ascii_graphic()), "{t}");
+                assert!(t.contains("fandhe-container does not"), "{t}");
+            }
+        }
+    }
+
+    /// WIN-5・REPAIR-12・#2452: Windows の文言のコマンド・設定値が `docs/setup/windows.md` にも載っている。
+    #[test]
+    fn win5_instructions_match_windows_setup_doc() {
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/setup/windows.md"),
+        )
+        .expect("windows.md");
+        let all = [
+            WSL2_ENABLE_INSTRUCTIONS,
+            DEVELOPER_MODE_INSTRUCTIONS,
+            WSLCONFIG_VIRTIOFS_INSTRUCTIONS,
+        ]
+        .join(" ");
+        for needle in [
+            "wsl --install",
+            "wsl --set-default-version 2",
+            "wsl -l -v",
+            "wsl --version",
+            "virtiofs=true",
+            "[wsl2]",
+            "wsl --shutdown",
+            ".wslconfig",
+        ] {
+            assert!(all.contains(needle), "instructions: {needle}");
+            assert!(doc.contains(needle), "doc: {needle}");
+        }
+        for id in ["wsl2-enable", "developer-mode", "wslconfig-virtiofs"] {
+            assert!(doc.contains(&format!("`{id}`")), "doc id: {id}");
+        }
     }
 
     /// stdout 書き込み失敗は panic せず INTERNAL（1）で失敗する。
@@ -538,7 +627,9 @@ mod tests {
                 "developer-mode",
                 "wslconfig-virtiofs",
                 "wsl",
-                "virtiofs"
+                "developer mode",
+                "virtiofs",
+                "setup"
             ]
         );
         assert!(setup_markers_in(&win).contains(&"wsl2-enable".to_owned()));

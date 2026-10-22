@@ -22,6 +22,19 @@ Windows 利用者が fandhe-container を使う前に整えておく前提条件
 | Developer Mode の有効化 | 必要 |
 | `.wslconfig` の編集 | 不要 |
 
+## `fandhe-container setup` の表示
+
+Windows で `fandhe-container setup` を実行すると、次の 3 ステップを 1 行 1 JSON で表示する（CLI-1・CLI-2。#2452）。各行の `instructions` は本書の該当節と同じ手順の固定文言（英語）で、CLI は表示するだけで実行しない。
+
+| ステップ ID | 本書の節 | 管理者権限 |
+| ----------- | -------- | ---------- |
+| `wsl2-enable` | WSL2 の有効化 | 必要 |
+| `developer-mode` | Developer Mode の有効化 | 必要 |
+| `wslconfig-virtiofs` | `.wslconfig` で virtiofs を有効化 | 不要 |
+
+- `setup` は WSL2・Developer Mode・`.wslconfig` を検出も変更もしない。ステップが残るため終了コードは 8（`UNIMPLEMENTED`）になる
+- ステップの検出・適用は `setup` の範囲外で、plugin 経由の将来仕様（TASK-125。#1869 の設計）である（REPAIR-3）
+
 ## WSL2 の有効化
 
 対象: WIN-1・WIN-5

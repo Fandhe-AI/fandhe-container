@@ -2856,7 +2856,13 @@ impl Extractor<'_> {
     /// ビットを遡って外す代わりに結果全体を `FailedPrecondition` で拒否する（fail-closed。呼び出し側が `root` ごと
     /// 破棄する契約。#2437・SEC-5）。
     fn verify_root_after_special_bits(&self) -> Result<(), OciError> {
-        if self.preserved_special > 0
+        // 要求の一部だけが残った（例: 06755 のうち setuid だけ）場合も保持済みとして数える。`preserved_special`
+        // は全ビットが残ったファイルだけが増えるため、判定には使わない。
+        let kept_any = self.preserved_special > 0
+            || self.preserved_bits.setuid > 0
+            || self.preserved_bits.setgid > 0
+            || self.preserved_bits.sticky > 0;
+        if kept_any
             && (self.special.decision == SpecialBitsDecision::RootChangedDuringExtraction
                 || !self.root_still_private())
         {
@@ -7773,6 +7779,43 @@ mod tests {
                 e.message(),
                 "the extraction root changed while special mode bits were preserved"
             );
+        }
+
+        /// SEC-5・#2437: 要求 06755 のうち setuid だけが残った（setgid は読み戻しで落ちた）場合も保持済みとして数え、
+        /// 終了時に `root` が変わっていれば `FailedPrecondition` で拒否する（部分保持の取りこぼしを防ぐ。#2565）。
+        #[test]
+        fn sec5_partial_preserve_then_root_change_fails_closed() {
+            fn without_setgid(f: &fs::File) -> u32 {
+                special_bits_of(f) & !S_ISGID
+            }
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o700);
+            let root = sb.root.clone();
+            fn lstat_then_open(p: &Path) -> std::io::Result<fs::Metadata> {
+                let m = fs::symlink_metadata(p);
+                if p.file_name().is_some_and(|n| n == "plain") {
+                    let root = p.parent().unwrap();
+                    fs::set_permissions(root, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                m
+            }
+            let tars = archive(&[
+                file_owned("both", 0o6755, 0, 0, b"a"),
+                file("plain", 0o644, b"b"),
+            ]);
+            let mut setup = setup_1000();
+            setup.mode_readback = without_setgid;
+            let r = extract_stack(
+                &NoopOciOpRecorder,
+                [Rewind::new(Cursor::new(tars.as_slice()))],
+                &root,
+                LIM(),
+                lstat_then_open,
+                setup,
+            );
+            disarm();
+            let e = r.expect_err("fail closed");
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
         }
 
         fn enosys(

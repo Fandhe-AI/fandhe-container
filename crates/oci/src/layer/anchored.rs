@@ -51,7 +51,7 @@ pub(super) fn path_changed() -> OciError {
 ))]
 mod imp {
     use std::io::Seek as _;
-    use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+    use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
     use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -295,8 +295,19 @@ mod imp {
             comps: &[OsString],
             mode: u32,
         ) -> io::Result<()> {
-            let d = File::from(self.open_rel(comps, DIR_FLAGS_RW)?);
-            d.set_permissions(fs::Permissions::from_mode(mode & 0o7777))
+            let perms = fs::Permissions::from_mode(mode & 0o7777);
+            match self.open_rel(comps, DIR_FLAGS_RW) {
+                Ok(fd) => File::from(fd).set_permissions(perms),
+                // umask で所有者の読み取り権限が落ちた新規ディレクトリ（0400・0777 等）は読み取りで開けない。
+                // 読み取り権限を要らない `O_PATH` の fd を握り、`/proc/self/fd/<n>` 経由で mode を適用する
+                // （fd 起点のまま。パスの再解決をしない。#2565 P1）。
+                Err(e) if e.raw_os_error() == Some(at::EACCES) => {
+                    let fd = self.open_rel(comps, DIR_FLAGS)?;
+                    let p = format!("/proc/self/fd/{}", fd.as_raw_fd());
+                    fs::set_permissions(p, perms)
+                }
+                Err(e) => Err(e),
+            }
         }
 
         /// `parent/name` を symlink を追従せず木ごと消す。存在しなければ成功（冪等）。
@@ -730,6 +741,29 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(e.code(), OciErrorCode::NotFound);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// OCI-1・#2565 P1: umask（0400・0777）で所有者の読み取り権限が落ちた新規ディレクトリ（mkdirat の結果は
+    /// `0777 & !umask` で、0377 と 0000 になる）でも、fd 起点のまま mode を復元できる。
+    #[test]
+    fn oci1_set_dir_mode_restores_dirs_made_unreadable_by_umask() {
+        use std::os::fd::AsFd as _;
+        let base = tmp("umask");
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let a = AnchoredRoot::open(&root, AnchorHooks::host()).unwrap();
+        let rf = File::open(&root).unwrap();
+        for (name, made) in [("u0400", 0o377), ("u0777", 0o000)] {
+            crate::sys::at::mkdirat_name(rf.as_fd(), OsStr::new(name), made).unwrap();
+            let comps = os(&[name]);
+            a.set_dir_mode(&comps, 0o700).unwrap();
+            assert_eq!(
+                fs::metadata(root.join(name)).unwrap().permissions().mode() & 0o7777,
+                0o700,
+                "{name}"
+            );
+        }
         fs::remove_dir_all(&base).unwrap();
     }
 }

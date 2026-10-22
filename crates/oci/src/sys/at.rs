@@ -54,6 +54,7 @@ pub(crate) const RESOLVE_IN_ROOT: u64 = 0x10;
 
 /// errno（`include/uapi/asm-generic/errno-base.h` と `errno.h`。x86_64 / aarch64 で共通）。
 pub(crate) const EPERM: i32 = 1;
+pub(crate) const EACCES: i32 = 13;
 pub(crate) const E2BIG: i32 = 7;
 pub(crate) const EAGAIN: i32 = 11;
 pub(crate) const EXDEV: i32 = 18;

@@ -34,7 +34,7 @@
 //!
 //! - **タグ・digest 参照の解決**: plugin-cri は `ImageService` をサーブしておらず、プロセス内でタグを解決できない。
 //!   [`ImageRootfsSource::with_image_store`] で `ImageStore` を注入したときだけタグを解決し、無ければ
-//!   `sha256:<64 桁小文字 hex>` の image ID だけを受ける（それ以外は `UNIMPLEMENTED`）
+//!   `sha256:<64 桁小文字 hex>` の image ID だけを受ける（それ以外は `UNIMPLEMENTED`。注入済みで未知の参照は `NOT_FOUND`）
 //! - **イメージの User**: 数値の `uid:gid` だけを解決する。名前と uid のみは rootfs 内の `/etc/passwd`・`/etc/group` を
 //!   読む必要があり、リンク経由でホストの内容を読む経路ができるため未実装で、[`ImageDefaults::user_unresolved`] で
 //!   `build_runtime_config` に拒否させる（root へ黙ってフォールバックしない）
@@ -196,6 +196,10 @@ impl ImageRootfsSource {
         if spec.image.starts_with("sha256:") || is_bare_hex {
             // image ID の形をしているものは、形が不正なら INVALID_ARGUMENT（素の hex も受けない）。
             return Digest::parse(&spec.image).map_err(|_| bad());
+        }
+        if self.store.is_some() {
+            // 解決は実行済みで参照が未知なだけなので、機能欠如ではなく NOT_FOUND を返す。
+            return Err(CriError::not_found("image reference is not found"));
         }
         Err(CriError::unimplemented(
             "image reference resolution is not available; use the image id",

@@ -544,6 +544,17 @@ fn cri2_image_store_resolves_tags() {
     assert_eq!(fs::read(dir.join("rootfs/world")).unwrap(), b"world");
 }
 
+/// 解決器を注入済みで参照が未知のときは UNIMPLEMENTED ではなく NOT_FOUND（CRI-2）。
+#[test]
+fn cri2_image_store_miss_is_not_found() {
+    let env = pulled_env("store-miss", CONFIG_SECTION);
+    let store = Arc::new(InMemoryImageStore::new());
+    let p = env.provider_with(ImageRootfsSource::new(env.extract_config()).with_image_store(store));
+    let e = prepare(&p, "ctr1", &container("docker.io/library/unknown:1")).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::NotFound);
+    assert_eq!(bundle_count(&env), 0);
+}
+
 /// キャッシュの信頼境界: 信頼できない公開済みエントリ・記録の欠落・設定の食い違いは拒否され、キャッシュは消えず、
 /// bundle も残らない。
 #[test]

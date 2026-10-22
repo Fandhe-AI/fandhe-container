@@ -136,12 +136,16 @@ impl SupervisedState {
     ///
     /// 保持レコードが `Stopped` でなければ `FailedPrecondition`。revision 不一致のときだけ `refresh` して再試行する
     /// （上限 [`MAX_WRITE_ATTEMPTS`]）が、再読込したレコードの status・`restart_count` が変わったり監視権が付いたり
-    /// していれば（同じ ID の再作成・別処理の再起動）書かずに `FailedPrecondition` で中止する。
+    /// していれば、また bundle・cgroup の記録が変わっていれば（同じ ID の再作成・別処理の再起動）書かずに `FailedPrecondition` で中止する。
     /// 呼び出し元は [`crate::restart::supervise_with_restart`] の監視スレッドだけ（`SupervisedState` を持つのは
     /// 監視スレッドだけのため、書き手は他に増えない）。
     pub fn write_explicit_stop(&mut self) -> Result<&StateRecord, TraitError> {
         let expected_status = self.last.status().clone();
         let expected_count = self.last.restart_count();
+        // 世代の識別子。revision が食い違って再読込した後は、同じ ID の削除・再作成で status・終了コード・
+        // `restart_count` が偶然一致しても取り違えないよう、作成時に決まる bundle と cgroup の記録も照合する。
+        let expected_bundle = self.last.bundle().to_path_buf();
+        let expected_cgroup = self.last.cgroup().cloned();
         let mut last_err = TraitError::new(
             ErrorCode::FailedPrecondition,
             "explicit stop write attempts exhausted",
@@ -154,6 +158,8 @@ impl SupervisedState {
             if rec.status().state() != ContainerState::Stopped
                 || rec.status() != &expected_status
                 || rec.restart_count() != expected_count
+                || rec.bundle() != expected_bundle.as_path()
+                || rec.cgroup() != expected_cgroup.as_ref()
                 || rec.supervisor_pid().is_some()
             {
                 return Err(TraitError::new(
@@ -283,6 +289,47 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::FailedPrecondition);
         b.refresh().unwrap();
         assert_eq!(b.write_supervision(sup(2, 2)).unwrap().restart_count(), 2);
+    }
+
+    /// SUP-9・#2440: revision 競合後の再読込で bundle が違う（同じ ID の再作成）記録なら、status・終了コード・
+    /// `restart_count` が同じでも明示 stop を書かず `FailedPrecondition` で中止する。
+    #[test]
+    fn sup9_explicit_stop_aborts_on_recreated_generation() {
+        let stopped = |bundle: &str, rev: u64| {
+            StateRecord::new(
+                ContainerStatus::stopped(cid("c1"), Some(1)),
+                std::env::temp_dir().join(bundle),
+                StateRevision::from_raw(rev),
+            )
+            .unwrap()
+        };
+        let store = Arc::new(FakeStore(Mutex::new(Some(stopped("old", 1)))));
+        let mut s = SupervisedState::attach(store.clone(), cid("c1")).unwrap();
+        // 削除・再作成された新世代（revision は進み、内容は同じ Stopped）。
+        *store.0.lock().unwrap() = Some(stopped("new", 5));
+        let e = s.write_explicit_stop().unwrap_err();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            store.0.lock().unwrap().as_ref().unwrap().revision().value(),
+            5
+        );
+    }
+
+    /// SUP-9・#2440: 同じ世代で revision だけ進んだ（health 更新など）記録なら再読込して書ける。
+    #[test]
+    fn sup9_explicit_stop_retries_on_same_generation() {
+        let rec = |rev: u64| {
+            StateRecord::new(
+                ContainerStatus::stopped(cid("c1"), Some(1)),
+                std::env::temp_dir().join("b"),
+                StateRevision::from_raw(rev),
+            )
+            .unwrap()
+        };
+        let store = Arc::new(FakeStore(Mutex::new(Some(rec(1)))));
+        let mut s = SupervisedState::attach(store.clone(), cid("c1")).unwrap();
+        *store.0.lock().unwrap() = Some(rec(2));
+        assert_eq!(s.write_explicit_stop().unwrap().revision().value(), 3);
     }
 
     /// TASK-157.3: 別コンテナの status は InvalidArgument、レコードなしは NotFound。

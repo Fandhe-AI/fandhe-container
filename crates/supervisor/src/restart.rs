@@ -452,6 +452,13 @@ impl LateOrphans {
         self.lock().active_workers == 0
     }
 
+    /// 実行スレッドがすべて終了済みで、terminate に失敗したハンドルも積まれていないとき `true`
+    /// （残存プロセスが無いと確認できた状態。取り出さずに見るだけ。#2440・SUP-9）。
+    fn is_clean(&self) -> bool {
+        let g = self.lock();
+        g.active_workers == 0 && g.orphans.is_empty()
+    }
+
     /// 実行スレッドの終了を `timeout` まで待つ。終了していれば `true`（以後の [`LateOrphans::take`] が最終結果）。
     /// `false` は relaunch が戻らず未完了で、呼び出し側は受け皿を保持して後で再確認する（REPAIR-5）。
     pub fn wait_settled(&self, timeout: Duration) -> bool {
@@ -1073,6 +1080,11 @@ pub fn supervise_with_restart(
             Ok(p) => p,
             Err(error) => {
                 observe(Some(error.code()));
+                // 再 launch の待機中に受理済みの明示 stop は、再 launch が失敗しても残す。残存プロセスが無いと
+                // 確認できた（実行スレッド完了・未回収ハンドルなし）ときだけ記録する（REPAIR-5・SUP-9・契約 14）。
+                if explicit_requested(stop) && !stop.is_stop_requested() && late.is_clean() {
+                    return Ok(finish_explicit_stop(state, last, restarts, obs));
+                }
                 return Ok(SuperviseOutcome::RelaunchFailed {
                     exit,
                     error,
@@ -2390,6 +2402,48 @@ mod tests {
         let g = st.rec.lock().unwrap();
         assert_eq!(g.status().state(), ContainerState::Stopped);
         assert_eq!(g.restart_count(), 0);
+        assert_eq!(g.explicit_stop(), ExplicitStop::Recorded);
+    }
+
+    /// 明示 stop の意図を立ててから `Err` を返す再 launch（残存プロセスなし）。
+    struct MarksExplicitThenFails {
+        stop: StopToken,
+    }
+
+    impl Relauncher for MarksExplicitThenFails {
+        fn relaunch(&self, _: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            self.stop.mark_explicit_stop();
+            Err(TraitError::new(
+                ErrorCode::Internal,
+                "injected relaunch failure",
+            ))
+        }
+    }
+
+    /// SUP-9・SUP-3・#2440: 再 launch 中に取り消しが受理された後で再 launch が失敗しても、残存プロセスが無ければ
+    /// 明示 stop を残す（`unless-stopped` の再開で再起動されない）。
+    #[test]
+    fn sup9_explicit_stop_persisted_when_relaunch_fails() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        let q: Arc<dyn Relauncher> = Arc::new(MarksExplicitThenFails { stop: stop.clone() });
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &q,
+            &MonitorConfig::default(),
+            &cfg("unless-stopped"),
+            &stop,
+            &Events::default(),
+        )
+        .unwrap();
+        let SuperviseOutcome::Finished { reason, .. } = out else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(reason, NoRestartReason::ExplicitStop);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.status().state(), ContainerState::Stopped);
         assert_eq!(g.explicit_stop(), ExplicitStop::Recorded);
     }
 

@@ -1949,6 +1949,31 @@ mod tests {
         args: &[&str],
         env: &[&str],
     ) -> LaunchSpec {
+        spec_with_process_user(name, linux_extra, mounts, args, env, (0, 0))
+    }
+
+    /// `process.user` が `user`(uid, gid)の `LaunchSpec`。権限モデルの拒否と user 写像の照合の順序を
+    /// 確かめるため(#2397・SEC-5)。
+    fn spec_with_user(name: &str, user: (u32, u32)) -> LaunchSpec {
+        spec_with_process_user(
+            name,
+            serde_json::json!({}),
+            serde_json::json!([]),
+            &["/bin/echo", "hi"],
+            &["PATH=/bin"],
+            user,
+        )
+    }
+
+    /// 最も内側の組み立て。config の `process.user` と `LaunchSpec` の user を同じ値にそろえる。
+    fn spec_with_process_user(
+        name: &str,
+        linux_extra: serde_json::Value,
+        mounts: serde_json::Value,
+        args: &[&str],
+        env: &[&str],
+        user: (u32, u32),
+    ) -> LaunchSpec {
         use super::super::cgroup_requirement::CgroupRequirement;
         use super::super::launch::RootfsDir;
         use crate::traits::ContainerId;
@@ -1968,7 +1993,7 @@ mod tests {
             "ociVersion": "1.2.0",
             "root": {"path": "rootfs"},
             "hostname": "box",
-            "process": {"user": {"uid": 0, "gid": 0}, "args": ["/bin/echo", "hi"],
+            "process": {"user": {"uid": user.0, "gid": user.1}, "args": ["/bin/echo", "hi"],
                         "env": ["PATH=/bin"], "cwd": "/"},
             "mounts": mounts,
             "linux": linux
@@ -1991,7 +2016,7 @@ mod tests {
             ContainerId::new(name).unwrap(),
             binds,
             super::super::working_dir::ContainerWorkingDir::root(),
-            (0, 0),
+            user,
         );
         let _ = std::fs::remove_dir_all(&dir);
         spec
@@ -2574,6 +2599,48 @@ mod tests {
         assert_eq!(
             err.message(),
             "the rootful privilege model is not supported by the launcher"
+        );
+        assert!(ev.lock().unwrap().is_empty());
+    }
+
+    /// SEC-5・CORE-6(#2397): `RootfulHostRoot` の拒否(`Unimplemented`)は `process.user` の照合より先に返る。
+    /// `RootfulHostRoot` は uid/gid が (0, 0) なら照合を通るため、写像の外の (1000, 1000) で順序を区別する。
+    /// 対照として `RootlessSingleId` は同じ spec を user 照合で拒否する(選んだ uid が実際に照合で落ちる証拠)。
+    #[test]
+    fn sec5_core6_rootful_refusal_precedes_user_mapping_check() {
+        let spec = spec_with_user("priv-user", (1000, 1000));
+
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), IsolationPrivilege::RootfulHostRoot, None);
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::Unimplemented);
+        assert_eq!(
+            err.message(),
+            "the rootful privilege model is not supported by the launcher"
+        );
+        assert_ne!(
+            err.message(),
+            "process.user is not mapped in the user namespace (SEC-5)"
+        );
+        assert!(ev.lock().unwrap().is_empty());
+
+        let ev = events();
+        let l = launcher(
+            FakeOps::new(&ev),
+            IsolationPrivilege::RootlessSingleId,
+            None,
+        );
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "process.user is not mapped in the user namespace (SEC-5)"
         );
         assert!(ev.lock().unwrap().is_empty());
     }

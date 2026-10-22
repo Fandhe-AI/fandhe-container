@@ -1067,9 +1067,15 @@ fn parent_and_session_of(stat: &str) -> Option<(u32, u32)> {
 /// でもない子孫は、pid の安定(未回収であること)を保証できず kill できないため、列挙不完全として残す。列挙・読み取り・
 /// 解析の失敗も `note_scan_failure` で残す(fail-closed)。
 fn descendants_of(anchor: u32, me: u32, out: &mut Rescan) -> Vec<NonZeroU32> {
+    descendants_in(Path::new("/proc"), anchor, me, out)
+}
+
+/// `descendants_of` の本体。`/proc` の場所を差し替えられる(試験が stat の fixture を渡して探索処理そのものを検証する。
+/// REPAIR-12・#2394)。
+fn descendants_in(proc_root: &Path, anchor: u32, me: u32, out: &mut Rescan) -> Vec<NonZeroU32> {
     const WHAT: &str = "cannot scan /proc for the descendants of a tagged process";
     let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
         note_scan_failure(out, WHAT);
         return found;
     };
@@ -1089,7 +1095,7 @@ fn descendants_of(anchor: u32, me: u32, out: &mut Rescan) -> Vec<NonZeroU32> {
         if pid.get() == anchor {
             continue;
         }
-        let path = Path::new("/proc").join(pid.get().to_string()).join("stat");
+        let path = proc_root.join(pid.get().to_string()).join("stat");
         let stat = match read_proc_text(&path) {
             Ok(Some(stat)) => stat,
             Ok(None) => continue,
@@ -2105,6 +2111,55 @@ mod tests {
             "831151 (fdh-l00000002) X 0 -1 -1 0 -1 4227148 63 0 0 0 0 0 0 0 20 0 0 0 221010080\n";
         assert_eq!(proc_state_of(dying), Some('X'));
         assert_eq!(parent_and_session_of(dying), None);
+    }
+
+    /// 疑似 `/proc`(一時ディレクトリ)に `<pid>/stat` を置く。
+    fn fake_proc(label: &str, stats: &[(u32, &str)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("core2-2394-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (pid, stat) in stats {
+            let dir = root.join(pid.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("stat"), stat).unwrap();
+        }
+        root
+    }
+
+    /// CORE-2・REPAIR-12(#2394): 探索処理そのものに fixture を渡す。終了処理中(`X` / `x`)の task は除外され
+    /// `scan_incomplete` が立たず、通常の子は列挙される。
+    #[test]
+    fn core2_descendants_skip_dying_tasks_without_marking_incomplete() {
+        let dying_x = "300 (a) X 0 -1 -1 0 -1 4227148\n";
+        let dying_lx = "301 (b) x 0 -1 -1 0 -1 4227148\n";
+        let child = "302 (c) S 100 100 100 0 -1 0\n";
+        let root = fake_proc(
+            "skip",
+            &[
+                (300, dying_x),
+                (301, dying_lx),
+                (302, child),
+                (100, "100 (anchor) S 1 100 100 0 -1 0\n"),
+            ],
+        );
+        let mut out = Rescan::default();
+        let found = descendants_in(&root, 100, 1, &mut out);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, vec![pid(302)]);
+        assert!(!out.scan_incomplete, "{out:?}");
+        assert!(out.error.is_none(), "{out:?}");
+    }
+
+    /// 対照: state が生きていて解析できない stat(壊れた stat)は従来どおり `scan_incomplete` になる。
+    #[test]
+    fn core2_descendants_unparsable_live_stat_marks_incomplete() {
+        let broken = "303 (d) S 0 -1 -1 0 -1 4227148\n";
+        let root = fake_proc("broken", &[(303, broken)]);
+        let mut out = Rescan::default();
+        let found = descendants_in(&root, 100, 1, &mut out);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(found.is_empty(), "{found:?}");
+        assert!(out.scan_incomplete, "{out:?}");
+        assert!(out.error.is_some(), "{out:?}");
     }
 
     fn gone(pid: u32) -> bool {

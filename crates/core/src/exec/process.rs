@@ -74,7 +74,8 @@
 //!   待機が `Err` で戻ってもハンドルは残り、再試行で kill・回収できる
 //! - **exec は絶対パスのみ（launch は名前の `PATH` 探索も可）**: 稼働中コンテナへの exec は [`Entrypoint::new`] の絶対パスのみ。launch は
 //!   名前だけの `args[0]` を [`Entrypoint::search_path`] で pivot 後に `process.env` の `PATH` から解決する（OCI-1・#2314。
-//!   契約は `path_lookup.rs`）。`/` を含む相対パス・（cwd は launch の `setup.working_dir` で pivot 直後に適用。OCI-1）・OCI `process` からの組み立て・`preserve_fds`・
+//!   契約は `path_lookup.rs`）。`/` を含む相対パスは [`Entrypoint::cwd_relative`] で pivot と cwd の適用後に cwd 起点で解決する（OCI-1・OCI-4・#2432。
+//!   `..` は拒否）。（cwd は launch の `setup.working_dir` で pivot 直後に適用。OCI-1）・OCI `process` からの組み立て・`preserve_fds`・
 //!   `LISTEN_FDS` の受け渡しは TASK-29/30 の範囲
 //! - **環境変数と補助グループ**（SUP-6・SEC-1・SEC-5・TASK-163 追補・#1457）: `execveat` へは [`Entrypoint`] が持つ
 //!   env だけを envp として明示的に渡し、呼び出しプロセスの環境は引き継がない（既定値の補完もしない）。launch は
@@ -155,12 +156,24 @@ pub const EXIT_EXEC_NOT_FOUND: i32 = 127;
 /// バイト数を検証済みの `CString` 群として保持する（壊れた値を表現できない型。REPAIR-2）。
 #[derive(Clone, PartialEq, Eq)]
 pub struct Entrypoint {
-    /// 絶対パス。[`Entrypoint::search_path`] で作ったときは探索する名前（`/` を含まない）。
+    /// 絶対パス。[`Entrypoint::search_path`] で作ったときは探索する名前（`/` を含まない）、
+    /// [`Entrypoint::cwd_relative`] で作ったときは渡された相対パス（表示用）。
     path: CString,
     argv: Vec<CString>,
     env: Vec<CString>,
-    /// 名前を `PATH` で探すときの候補列（`<dir>/<name>`。fork 前に検証済み）。`None` は絶対パス。
-    search: Option<Vec<CString>>,
+    /// `path` の解決方式（fork 前に検証済み）。
+    resolution: Resolution,
+}
+
+/// [`Entrypoint`] の実行ファイルの解決方式（壊れた組み合わせを作れないよう 1 つの型にする。REPAIR-2）。
+#[derive(Clone, PartialEq, Eq)]
+enum Resolution {
+    /// 絶対パス。pivot 後の `/` 起点で開く。
+    Absolute,
+    /// 名前を `PATH` で探すときの候補列（`<dir>/<name>`）。
+    SearchPath(Vec<CString>),
+    /// `/` を含む相対パスの要素列（`..`・空・`.` を除いた 1 件以上。`process.cwd` 起点で辿る。#2432）。
+    CwdRelative(Vec<CString>),
 }
 
 // env の値は秘密情報を含み得るため、`Debug` には KEY だけを出す（これを包む `ExecCommand` の `Debug` も同じ出力に
@@ -239,7 +252,7 @@ impl Entrypoint {
     /// 名前だけの `process.args[0]` を `process.env` の `PATH` で探すエントリポイントを作る（OCI-1・#2314）。
     ///
     /// 探索は子が `pivot_root` した後に rootfs の中でだけ行う（契約と runc との差は `path_lookup.rs`）。
-    /// `name` は空でなく `/`・NUL を含まない（`/` を含む相対パスは `InvalidArgument`。未対応。REPAIR-3）。
+    /// `name` は空でなく `/`・NUL を含まない（`/` を含む相対パスは [`Entrypoint::cwd_relative`] を使う）。
     /// `env` に使える `PATH` が無ければ `InvalidArgument`（既定値は補わない）。`argv` は変えない（`argv[0]` は
     /// 呼び出し元が渡した名前のまま）。その他の検証と違反の分類は [`Entrypoint::new`] と同じ。
     pub fn search_path<N, A, E>(name: N, args: A, env: E) -> Result<Self, ExecError>
@@ -255,11 +268,35 @@ impl Entrypoint {
         let mut total = 0usize;
         let path = to_cstring(name, &mut total, "entrypoint name")?;
         let mut entry = Self::assemble(path, total, args, env)?;
-        entry.search = Some(path_lookup::candidates_from_env(name, &entry.env)?);
+        entry.resolution =
+            Resolution::SearchPath(path_lookup::candidates_from_env(name, &entry.env)?);
         Ok(entry)
     }
 
-    /// `new` と `search_path` が共有する argv・env の検証と組み立て。
+    /// `/` を含む相対パスの `process.args[0]`（`./entrypoint.sh`・`bin/app`）を `process.cwd` 起点で解決する
+    /// エントリポイントを作る（OCI-1・OCI-4・#2432）。
+    ///
+    /// 解決は子が `pivot_root` と cwd の適用を済ませた後に、cwd の fd を起点に 1 要素ずつ行う（`PATH` は引かない）。
+    /// `..` 要素・末尾 `/`・絶対パス・`/` を含まない名前は `InvalidArgument`（契約と runc との差は
+    /// `path_lookup.rs`）。`argv` は変えない。その他の検証と違反の分類は [`Entrypoint::new`] と同じ。
+    pub fn cwd_relative<P, A, E>(path: P, args: A, env: E) -> Result<Self, ExecError>
+    where
+        P: AsRef<OsStr>,
+        A: IntoIterator,
+        A::Item: AsRef<OsStr>,
+        E: IntoIterator,
+        E::Item: AsRef<OsStr>,
+    {
+        let path = path.as_ref();
+        let components = path_lookup::relative_components(path)?;
+        let mut total = 0usize;
+        let cpath = to_cstring(path, &mut total, "entrypoint path")?;
+        let mut entry = Self::assemble(cpath, total, args, env)?;
+        entry.resolution = Resolution::CwdRelative(components);
+        Ok(entry)
+    }
+
+    /// `new`・`search_path`・`cwd_relative` が共有する argv・env の検証と組み立て。
     fn assemble<A, E>(path: CString, mut total: usize, args: A, env: E) -> Result<Self, ExecError>
     where
         A: IntoIterator,
@@ -286,11 +323,12 @@ impl Entrypoint {
             path,
             argv,
             env: dedup_env_last_wins(env),
-            search: None,
+            resolution: Resolution::Absolute,
         })
     }
 
-    /// コンテナ内の絶対パス。[`Entrypoint::search_path`] で作ったときは探索する名前（解決後のパスではない。
+    /// コンテナ内の絶対パス。[`Entrypoint::search_path`] で作ったときは探索する名前、
+    /// [`Entrypoint::cwd_relative`] で作ったときは渡された相対パス（いずれも解決後のパスではない。
     /// 解決後は `open_entrypoint` が返す）。
     pub fn path(&self) -> &Path {
         Path::new(OsStr::from_bytes(self.path.to_bytes()))
@@ -1014,8 +1052,8 @@ fn open_entrypoint(
     // 絶対パスなので解決は呼び出しプロセスの root（= 照合済みの `root`）から始まる。
     // 固定用の fd も 3 以上へ置く（呼び出し元の fd 0〜2 が閉じていると `openat` はその番号を返し、直後の
     // 「継承した標準入出力と同一の実体か」の照合が、固定した fd 自身と一致して通常のファイルを誤って拒否する）。
-    let (pinned, resolved) = match &entry.search {
-        None => {
+    let (pinned, resolved) = match &entry.resolution {
+        Resolution::Absolute => {
             let fd = sys::open_path_follow_at(root, &entry.path)
                 .map_err(|e| open_error_for(entry.path(), e))
                 .and_then(keep_above_stdio)?;
@@ -1023,7 +1061,17 @@ fn open_entrypoint(
         }
         // 名前の探索（OCI-1・#2314）。pivot 後の `/` の下で、候補を `O_PATH` で固定して判定する（ドライバの
         // `open` を呼ばず制御端末も取得しない。#1456）。不在・権限・`ELOOP` 等は次の候補へ進む。
-        Some(candidates) => {
+        Resolution::CwdRelative(components) => {
+            // `process.cwd` 起点の解決（OCI-1・OCI-4・#2432）。cwd の fd は一時的で、固定した実行ファイルの fd を
+            // 得たら閉じる（標準入出力の置換をまたがない）。
+            let cwd = sys::open_dir_path_nofollow(None, c".")
+                .map_err(|e| ExecError::from_sys(e, STAGE, "openat(.)"))?;
+            let fd = open_cwd_relative(cwd.as_fd(), components, entry.path())?;
+            #[cfg(test)]
+            tests::record(format!("lookup(entrypoint)={}", entry.path().display()));
+            (fd, entry.path().to_path_buf())
+        }
+        Resolution::SearchPath(candidates) => {
             let mut chosen: Option<OwnedFd> = None;
             let idx = path_lookup::select_candidate(candidates, |cand| {
                 let fd = sys::open_path_follow_at(root, cand)
@@ -1105,6 +1153,53 @@ fn open_entrypoint(
         ));
     }
     Ok((file, meta, resolved))
+}
+
+/// `cwd` を起点に `components` を 1 要素ずつ辿り、最終要素を `O_PATH` で固定して返す（OCI-1・OCI-4・#2432）。
+///
+/// 中間要素は symlink を辿らないディレクトリとして開く（symlink・非ディレクトリは `InvalidArgument`、不在は
+/// `NotFound`）。最終要素は絶対パスの `args[0]` と同じく symlink を辿って開く（以降の通常ファイル・標準入出力との
+/// 同一性・開き直しの照合は呼び出し元の共通経路）。`..` は `Entrypoint::cwd_relative` の字句検証で除いてある。
+/// 返す fd は 3 以上（[`keep_above_stdio`]）。`shown` はエラー文言の表示用で、解決には使わない。
+fn open_cwd_relative(
+    cwd: BorrowedFd<'_>,
+    components: &[CString],
+    shown: &Path,
+) -> Result<OwnedFd, ExecError> {
+    const STAGE: IsolationStage = IsolationStage::Exec;
+    let (last, dirs) = components.split_last().ok_or_else(|| {
+        ExecError::new(
+            ErrorCode::InvalidArgument,
+            STAGE,
+            "the entrypoint path has no file component",
+        )
+    })?;
+    let map_err = |e: SysError, what: &str| {
+        let code = match e {
+            SysError::Os(n) if n == sys::ENOTDIR || n == sys::ELOOP => ErrorCode::InvalidArgument,
+            other => exec_errno_to_code(other),
+        };
+        ExecError::new(
+            code,
+            STAGE,
+            format!(
+                "open of the {what} of the entrypoint {:?} failed: {}",
+                shown,
+                describe(e)
+            ),
+        )
+    };
+    let mut held: Option<OwnedFd> = None;
+    for dir in dirs {
+        let parent = held.as_ref().map_or(cwd, |fd| fd.as_fd());
+        let next =
+            sys::open_dir_path_nofollow(Some(parent), dir).map_err(|e| map_err(e, "directory"))?;
+        held = Some(next);
+    }
+    let parent = held.as_ref().map_or(cwd, |fd| fd.as_fd());
+    sys::open_path_follow_at(parent, last)
+        .map_err(|e| map_err(e, "file"))
+        .and_then(keep_above_stdio)
 }
 
 /// fd が 0〜2 なら 3 以上へ複製して元を閉じる（3 以上ならそのまま返す）。
@@ -4661,7 +4756,10 @@ mod tests {
             .collect();
         assert_eq!(got, vec!["K=v".to_string(), new.clone()]);
         assert_eq!(
-            entry.search.as_ref().unwrap()[0].to_string_lossy(),
+            match &entry.resolution {
+                Resolution::SearchPath(c) => c[0].to_string_lossy(),
+                _ => panic!("expected SearchPath"),
+            },
             format!("{}/new/x", dir.0.display())
         );
     }
@@ -4695,7 +4793,85 @@ mod tests {
         assert_eq!(v.reason, ViolationReason::EntrypointIsRuntimeBinary);
     }
 
-    /// OCI-1（#2314）: `/` を含む相対パスは従来どおり `InvalidArgument`（`search_path` も同じ）。
+    /// OCI-1・OCI-4（#2432）: cwd の fd 起点で `bin/app`・`./x` を解決し、通常ファイルの inode に固定する。
+    #[test]
+    fn oci1_oci4_open_cwd_relative_resolves_from_cwd_fd() {
+        let dir = TempDir::create("oci1-cwdrel");
+        std::fs::create_dir_all(dir.0.join("bin")).unwrap();
+        std::fs::write(dir.0.join("bin/app"), b"x").unwrap();
+        std::fs::write(dir.0.join("x"), b"y").unwrap();
+        let cwd = dir_fd(&dir.0);
+        for (input, file) in [
+            ("bin/app", "bin/app"),
+            ("./x", "x"),
+            ("./bin/./app", "bin/app"),
+        ] {
+            let entry = Entrypoint::cwd_relative(input, ["a"], [] as [&str; 0]).unwrap();
+            let Resolution::CwdRelative(comps) = &entry.resolution else {
+                panic!("expected CwdRelative");
+            };
+            let fd = open_cwd_relative(cwd.as_fd(), comps, entry.path()).unwrap();
+            let got = std::fs::File::from(fd).metadata().unwrap();
+            let want = std::fs::metadata(dir.0.join(file)).unwrap();
+            assert_eq!((got.dev(), got.ino()), (want.dev(), want.ino()), "{input}");
+        }
+    }
+
+    /// OCI-1・OCI-4（#2432）: 不在は `NotFound`（127）、中間要素の symlink・非ディレクトリは `InvalidArgument`。
+    #[test]
+    fn oci1_oci4_open_cwd_relative_failures() {
+        let dir = TempDir::create("oci1-cwdrel-err");
+        std::fs::create_dir_all(dir.0.join("real")).unwrap();
+        std::fs::write(dir.0.join("real/app"), b"x").unwrap();
+        std::os::unix::fs::symlink("real", dir.0.join("link")).unwrap();
+        std::fs::write(dir.0.join("file"), b"x").unwrap();
+        let cwd = dir_fd(&dir.0);
+        let run = |input: &str| {
+            let entry = Entrypoint::cwd_relative(input, ["a"], [] as [&str; 0]).unwrap();
+            let Resolution::CwdRelative(comps) = &entry.resolution else {
+                panic!("expected CwdRelative");
+            };
+            open_cwd_relative(cwd.as_fd(), comps, entry.path()).unwrap_err()
+        };
+        let err = run("./nope");
+        assert_eq!(
+            (err.code, err.stage),
+            (ErrorCode::NotFound, IsolationStage::Exec)
+        );
+        assert_eq!(exit_code_for(&err), EXIT_EXEC_NOT_FOUND);
+        assert_eq!(run("nodir/app").code, ErrorCode::NotFound);
+        assert_eq!(run("link/app").code, ErrorCode::InvalidArgument);
+        assert_eq!(run("file/app").code, ErrorCode::InvalidArgument);
+    }
+
+    /// OCI-1・OCI-4・SEC-1（#2432）: 最終要素の解決結果も既存の検査を通る（cwd を `/proc/self` にすると `./exe` は
+    /// ランタイム自身で違反として拒否する）。`..` は `cwd_relative` が字句で拒否する。
+    #[test]
+    fn oci1_oci4_cwd_relative_runtime_binary_and_dotdot_rejected() {
+        let cwd = dir_fd(Path::new("/proc/self"));
+        let entry = Entrypoint::cwd_relative("./exe", ["exe"], [] as [&str; 0]).unwrap();
+        let Resolution::CwdRelative(comps) = &entry.resolution else {
+            panic!("expected CwdRelative");
+        };
+        let pinned = open_cwd_relative(cwd.as_fd(), comps, entry.path()).unwrap();
+        let meta = std::fs::File::from(pinned).metadata().unwrap();
+        assert_eq!(
+            (meta.dev(), meta.ino()),
+            runtime_identity(real_procfs().as_fd()).unwrap()
+        );
+        for bad in ["../x", "a/../x", "a/b/"] {
+            let err = Entrypoint::cwd_relative(bad, ["x"], [] as [&str; 0]).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidArgument, "{bad}");
+            assert_eq!(err.stage, IsolationStage::Validate, "{bad}");
+        }
+        // 名前だけ・絶対パスはこの経路の対象外。
+        for bad in ["x", "/x"] {
+            assert!(Entrypoint::cwd_relative(bad, ["x"], [] as [&str; 0]).is_err());
+        }
+    }
+
+    /// OCI-1（#2314）: `new` と `search_path` は `/` を含む相対パスを従来どおり `InvalidArgument` で拒否する
+    /// （相対パスは `cwd_relative` を使う。#2432）。
     #[test]
     fn oci1_entrypoint_relative_with_slash_still_rejected() {
         let err = Entrypoint::new("bin/app", ["x"], [] as [&str; 0]).unwrap_err();

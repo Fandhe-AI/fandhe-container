@@ -1,7 +1,7 @@
 //! 起動引数の解析（TASK-114.1・#457・TASK-114.3.1・#849・PLUG-1）。
 //!
 //! 呼び出し元は `main.rs` のみ。argv は外部入力として扱い、件数と合計バイト数を
-//! `ONE_SHOT_ARGS_MAX_*`（plugin 境界機構と同じ上限）で検証してから解釈する。
+//! `PLUGIN_ARGS_MAX_*`（plugin 境界機構と同じ上限）で検証してから解釈する。
 //! 診断は固定文言のみで、引数の値は含めない。
 //! 受ける形は `--help`（単独）・`--socket <PATH>`・`--socket=<PATH>`。socket パスは絶対パスで `..` を含まないこと
 //! だけをここで検証し、配置ディレクトリの所有者・0700・symlink・`sun_path` 長は bind 側（`UdsListener::bind`）に任せる。
@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::path::{Component, PathBuf};
 
 use fandhe_container_plugin::{
-    ONE_SHOT_ARGS_MAX_BYTES, ONE_SHOT_ARGS_MAX_COUNT, PluginError, PluginErrorCode,
+    PLUGIN_ARGS_MAX_BYTES, PLUGIN_ARGS_MAX_COUNT, PluginError, PluginErrorCode,
 };
 
 /// 未知の引数・`--help` の誤用に対する固定文言。
@@ -96,7 +96,7 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocatio
     for a in args {
         count = count.saturating_add(1);
         bytes = bytes.saturating_add(a.len());
-        if count > ONE_SHOT_ARGS_MAX_COUNT || bytes > ONE_SHOT_ARGS_MAX_BYTES {
+        if count > PLUGIN_ARGS_MAX_COUNT || bytes > PLUGIN_ARGS_MAX_BYTES {
             return Err(invalid(MSG_ARGS_TOO_LARGE));
         }
         all.push(a);
@@ -203,7 +203,7 @@ mod tests {
 
     #[test]
     fn too_many_args_are_rejected() {
-        let v = vec![OsString::from("a"); ONE_SHOT_ARGS_MAX_COUNT + 1];
+        let v = vec![OsString::from("a"); PLUGIN_ARGS_MAX_COUNT + 1];
         assert_eq!(
             msg(parse_args(v)),
             (
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn too_long_arg_is_rejected() {
-        let v = vec![OsString::from("a".repeat(ONE_SHOT_ARGS_MAX_BYTES + 1))];
+        let v = vec![OsString::from("a".repeat(PLUGIN_ARGS_MAX_BYTES + 1))];
         assert_eq!(
             msg(parse_args(v)),
             (

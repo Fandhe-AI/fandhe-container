@@ -17,8 +17,8 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
 use fandhe_container_plugin::{
-    ONE_SHOT_ARGS_MAX_BYTES, ONE_SHOT_ARGS_MAX_COUNT, PLUGIN_SOCKET_ENV, PluginError,
-    PluginErrorCode, RuntimeDir,
+    PLUGIN_ARGS_MAX_BYTES, PLUGIN_ARGS_MAX_COUNT, PLUGIN_SOCKET_ENV, PluginError, PluginErrorCode,
+    RuntimeDir,
 };
 
 /// socket パスを明示する起動フラグ。
@@ -105,7 +105,7 @@ pub fn usage() -> &'static str {
 
 /// 起動引数（`argv[0]` を除く）を解析する。
 ///
-/// 件数・合計バイト数を `ONE_SHOT_ARGS_MAX_*` で上限検証し、未知フラグ・位置引数・
+/// 件数・合計バイト数を `PLUGIN_ARGS_MAX_*` で上限検証し、未知フラグ・位置引数・
 /// `--socket` の重複・値の欠落・空値は `InvalidArgument`。
 pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocation, PluginError> {
     let mut count = 0usize;
@@ -116,7 +116,7 @@ pub fn parse_args<I: IntoIterator<Item = OsString>>(args: I) -> Result<Invocatio
     for arg in args {
         count += 1;
         total = total.saturating_add(arg.len());
-        if count > ONE_SHOT_ARGS_MAX_COUNT || total > ONE_SHOT_ARGS_MAX_BYTES {
+        if count > PLUGIN_ARGS_MAX_COUNT || total > PLUGIN_ARGS_MAX_BYTES {
             return Err(invalid("too many or too long arguments"));
         }
         if pending_value {
@@ -232,7 +232,7 @@ pub fn resolve_socket_path(
         });
     }
     if let Some(v) = env_socket {
-        if v.len() > ONE_SHOT_ARGS_MAX_BYTES {
+        if v.len() > PLUGIN_ARGS_MAX_BYTES {
             return Err(invalid("socket path from environment is too long"));
         }
         if v.is_empty() {
@@ -392,9 +392,9 @@ mod tests {
 
     #[test]
     fn argument_limits_enforced() {
-        let many = vec![OsString::from("--help"); ONE_SHOT_ARGS_MAX_COUNT + 1];
+        let many = vec![OsString::from("--help"); PLUGIN_ARGS_MAX_COUNT + 1];
         assert_eq!(code(parse_args(many)), PluginErrorCode::InvalidArgument);
-        let long = vec![OsString::from("a".repeat(ONE_SHOT_ARGS_MAX_BYTES + 1))];
+        let long = vec![OsString::from("a".repeat(PLUGIN_ARGS_MAX_BYTES + 1))];
         assert_eq!(code(parse_args(long)), PluginErrorCode::InvalidArgument);
     }
 

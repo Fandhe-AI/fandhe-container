@@ -1743,15 +1743,39 @@ fn cli2_sup14_setup_on_linux_lists_launcher_install_step() {
     assert_eq!(String::from_utf8(out.stderr).expect("utf8"), "");
 }
 
-/// CLI-2・REPAIR-3: macOS / Windows の setup は要求ステップを stdout へ出し、自動適用未実装のため 8 で失敗する。
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+/// CLI-1・CLI-2・REPAIR-3（#2452）: macOS の setup は 2 ステップを手順の文言つきで stdout へ出し、自動適用未実装のため 8 で失敗する。
+#[cfg(target_os = "macos")]
 #[test]
-fn cli2_setup_on_non_linux_lists_steps_and_fails() {
+fn cli1_cli2_setup_on_macos_prints_steps_with_instructions() {
     let out = run(&["setup"]);
     assert_eq!(out.status.code(), Some(8));
-    let stdout = String::from_utf8(out.stdout).expect("utf8");
-    assert!(stdout.lines().count() >= 2, "{stdout:?}");
-    assert!(stdout.lines().all(|l| l.starts_with("{\"step\":\"")));
+    assert_eq!(
+        String::from_utf8(out.stdout).expect("utf8"),
+        concat!(
+            "{\"step\":\"virtualization-entitlement\",\"requires_admin\":false,\"status\":\"manual\",\"instructions\":\"The macOS backend plugin fandhe-container-plugin-macos must be code-signed with the com.apple.security.virtualization entitlement (ad-hoc signing is accepted), e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.virtualization> <path to fandhe-container-plugin-macos>. fandhe-container does not sign binaries.\"}\n",
+            "{\"step\":\"macos-min-version\",\"requires_admin\":false,\"status\":\"manual\",\"instructions\":\"Requires macOS 13 or later (provisional minimum for Virtualization.framework). Check with sw_vers -productVersion. fandhe-container does not check or upgrade macOS.\"}\n"
+        )
+    );
+    assert_eq!(
+        String::from_utf8(out.stderr).expect("utf8"),
+        "{\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"
+    );
+}
+
+/// CLI-1・CLI-2・REPAIR-3（#2452）: Windows の setup は 3 ステップを手順の文言つきで stdout へ出し、自動適用未実装のため 8 で失敗する。
+#[cfg(target_os = "windows")]
+#[test]
+fn cli1_cli2_setup_on_windows_prints_steps_with_instructions() {
+    let out = run(&["setup"]);
+    assert_eq!(out.status.code(), Some(8));
+    assert_eq!(
+        String::from_utf8(out.stdout).expect("utf8"),
+        concat!(
+            "{\"step\":\"wsl2-enable\",\"requires_admin\":true,\"status\":\"manual\",\"instructions\":\"Requires administrator. In an elevated PowerShell, run wsl --install and reboot (or enable the Virtual Machine Platform and Windows Subsystem for Linux features, reboot, and run wsl --set-default-version 2). Then install a WSL2 distribution and confirm that wsl -l -v shows VERSION 2 and that wsl --version succeeds. fandhe-container does not run these. See docs/setup/windows.md\"}\n",
+            "{\"step\":\"developer-mode\",\"requires_admin\":true,\"status\":\"manual\",\"instructions\":\"Requires administrator. Turn on Developer Mode in Settings > System > For developers (Windows 11) or Settings > Update & Security > For developers (Windows 10); it is needed to create symbolic links and widens the local attack surface. fandhe-container does not change it. See docs/setup/windows.md\"}\n",
+            "{\"step\":\"wslconfig-virtiofs\",\"requires_admin\":false,\"status\":\"manual\",\"instructions\":\"No administrator needed. In %UserProfile%\\\\.wslconfig, add virtiofs=true under [wsl2] (put comments on their own lines), then run wsl --shutdown so the setting takes effect. fandhe-container does not edit .wslconfig. See docs/setup/windows.md\"}\n"
+        )
+    );
     assert_eq!(
         String::from_utf8(out.stderr).expect("utf8"),
         "{\"code\":\"UNIMPLEMENTED\",\"message\":\"not implemented on this platform\"}\n"

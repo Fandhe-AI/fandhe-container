@@ -142,6 +142,7 @@ flowchart LR
     supervisor -->|確定| core
     plugin_cri["plugin-cri"] -->|確定| cri
     plugin_cri -->|確定| net
+    plugin_cri -->|確定| supervisor
     cri -->|確定| oci
     plugin_macos["plugin-macos"] -->|確定| platform_macos["platform-macos"]
     plugin_windows["plugin-windows"] -->|確定| platform_windows["platform-windows"]
@@ -178,7 +179,7 @@ flowchart LR
 | `plugin`（境界基盤） | crate-naming.md 表 #10（core 側・plugin 側双方が依存する境界基盤） | 確定（依存の向きは双方向的な基盤利用であり、上記フローチャートでは個別の辺として描かない） |
 | `core` → `io` | `VolumeProvider`（core 実装）がデータパスで I/O 共有層を使う想定（D-14。G2/G3 で確定） | 想定 |
 | `cli` → `core` | 統一 CLI が実行層を呼ぶ。Linux は core を直接、macOS は core の plugin 発見・登録機構（PLUG-4）経由で（Windows は、ゲスト内の CLI が core を直接呼ぶ Linux の経路を使い、ホストの CLI は隣の起動役の補助を起動するだけにする案。承認待ち。[windows-execution-layout.md](design/windows-execution-layout.md)）、platform-* / microvm 系へは直接依存しない（`make check-cli-backend-deps` で normal / build / dev 辺・全ターゲットを機械判定。TASK-79.2〜79.4） | 確定（Windows 部分は設計ドラフト・承認待ち） |
-| `cli` → `supervisor` | `start` が supervisor の bin を起動し、結果の 1 行を契約の型（`start_contract::StartReport`）で復号する。`logs` が `logs::read_container_log` でコンテナログ（`<state_root>/@container-logs`）を読む（#1543・CLI-1・SUP-7）。pull 時の展開の所有者は start と同じ `id_model::resolve_rootless_id_source` で解決する（cli の `image_ownership`。#2389・SEC-5・CORE-6）。実行ファイルの固定名（`launcher::SUPERVISOR_FILE_NAME`）もここから得る（TASK-79 追補・#1718・REPAIR-2。workspace 内 path 依存で実装済み。外部クレートの追加ではない。supervisor は core にのみ依存し循環しない） | 確定 |
+| `cli` → `supervisor` | `start` が supervisor の bin を起動し、結果の 1 行を契約の型（`start_contract::StartReport`）で復号する。`logs` が `logs::read_container_log` でコンテナログ（`<state_root>/@container-logs`）を読む（#1543・CLI-1・SUP-7）。pull 時の展開の所有者は start と同じ `id_model::resolve_rootless_id_source` で解決する（cli の `image_ownership`。#2389・SEC-5・CORE-6）。実行ファイルの固定名（`launcher::SUPERVISOR_FILE_NAME`）もここから得る。`start` の起動・受信の実装は `supervisor::start_client`、`stop` / `delete` の signaler・cgroup remover は `supervisor::control` / `supervisor::cgroup_remover` にあり、plugin-cri と共有する（#2434。CLI は薄い呼び出し層）（TASK-79 追補・#1718・REPAIR-2。workspace 内 path 依存で実装済み。外部クレートの追加ではない。supervisor は core にのみ依存し循環しない） | 確定 |
 | `cli` → `oci` | `image ls`・`system df`・`image rm [--force]`・`image tag` が oci の管理 API（`image_management`）を呼ぶ（#2221・#2316・CLI-1・OCI-7・TASK-183。workspace 内 path 依存で実装済み。外部クレートの追加ではない。oci は cli に依存せず循環しない）。あわせて `create --image-root --image` / `delete --image-root` が OCI-7 のコンテナ参照の登録・解除に `ImageStore` を使う（#2315。アダプタは cli 内）。コンテナ参照（#2341・#2352）と manifest の在庫・タグ・リース（#2380）は永続化済みだが、本番で在庫を埋める経路（pull → `ImageStore` の配線）が未実装のため、現状の観測値は `image ls` がヘッダのみ・`image rm` / `image tag` / `create --image` が `NOT_FOUND` | 確定 |
 | `platform-macos` → `io` | virtiofs 共有の I/O 共有プロトコルクライアント（`PipelineClient`）を使う（MAC-1・TASK-65.2。workspace 内 path 依存で実装済み。外部クレートの追加ではない）。向きはバックエンド → core 側で、規則 2 の逆向きのため抵触しない | 確定 |
 | `cli` → `net` | `doctor` が br_netfilter・ホストの `ip filter FORWARD` policy の判定材料を net の読み取り照会（GETCHAIN）で取得する（NET-10・TASK-148.1。workspace 内 path 依存で実装済み。組み合わせ判定・警告・DOCKER-USER 案内・終了コードの評価層は TASK-148.2 で実装済み。CLI 配線は TASK-79） | 確定 |
@@ -190,6 +191,7 @@ flowchart LR
 | `core` → `plugin`（境界基盤） | core の `plugin` feature（既定で有効）で optional 依存。`--no-default-features` で除外できる（PLUG-3・TASK-111.1・#262）。plugin 候補の探索は core 側の `crates/core/src/plugin_discovery.rs` に実装済み。登録の成果物も core 側に置く想定（TASK-109） | 確定（optional 辺。探索は実装済み・登録は未実装） |
 | `stack` → `core` | `up` コマンドが core の CLI／ライブラリ API を呼ぶ想定（PLUG-1 境界表の stack 行・TASK-155） | 想定 |
 | `supervisor` → `net` | rootless ネットワーク転送の pasta の起動・監視・回収をコンテナごとの supervisor が行う（NET-9・CORE-1・#1940。`net` は core 側のライブラリに確定〔2026-10-12 オーナー決定、[#4 のコメント](https://github.com/Fandhe-AI/fandhe-container/issues/4#issuecomment-6129145225)〕。辺は `Cargo.toml` にまだ無く、依存の向き・feature の切り方は #1870 の設計で決める） | 想定 |
+| `plugin-cri` → `supervisor` | `CoreLifecycleRuntime` の `start`・`kill`・`stop` と `delete` の cgroup remover を CLI と同じ本番経路へ結線する（`supervisor::start_client`〔supervisor の bin の委譲 scope 起動と結果の受信〕・`control::production_signaler` / `production_stop_signaler`〔制御チャネル経由。stop の意図は SUP-9〕・`cgroup_remover`・`supervisor_log::remove_bounded`。CLI の private 実装を複製せず移設して共有した。#2434・CRI-2・PLUG-1・SUP-1・SUP-9・REPAIR-1。workspace 内 path 依存で外部クレートの追加なし。辺は一方向で、supervisor は core にのみ依存するため循環しない。supervisor が core を既定 feature〔`plugin`〕で引くため、`-p fandhe-container-plugin-cri` のビルドでは feature 統合で core の `plugin` feature が有効になる。PLUG-4 の core 不変性の判定は core 単体のビルドで行うため影響しない） | 確定 |
 | `plugin-cri` → `net` | `NetworkPlugin` の実装（`netsetup`）が TASK-139 の統合 API（`create_network`・`attach_container`・`delete_network`）を呼ぶ（CRI-7・PLUG-1・NET-1〜NET-3・TASK-114.4・#460・MS-4。workspace 内 path 依存で外部クレートの追加なし。`net` は依存を持たない core 側ライブラリで、辺は一方向）。DNS ヘルパーの起動・停止（NET-5・NET-7）は未実装 | 確定 |
 | `gpu` の GPU-1〜4 以外を含む辺 | GPU-5・7・8 は境界表に明示判定なし、GPU-9 は「検討中」（`api-gpu.md`） | 未確定 |
 | macOS Venus（GPU-6）関連の辺 | 成果物は `plugin-macos` 側に置く定義のみが確定しており、依存の詳細な方向は未確定 | 未確定 |

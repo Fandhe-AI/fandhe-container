@@ -98,6 +98,15 @@ fandhe-container doctor
 
 `delete` は cgroup の配置を記録したコンテナを消すとき、実行中の cgroup が委譲されている必要がある。通常のログインセッション（SSH・TTY ログイン）の cgroup は委譲されていないため、そのまま実行すると失敗する（事前に doctor の `CGROUP_NOT_DELEGATED` で確かめられる）。委譲されたスコープの中で実行する。
 
+## CRI plugin（`fandhe-container-plugin-cri`）を使う場合
+
+CRI plugin の `start`・`kill`・`stop`・`delete` は CLI と同じ経路で supervisor を使う（#2434・CRI-2）。
+
+- `fandhe-container-supervisor` を plugin の実体（`fandhe-container-plugin-cri`）と同じディレクトリにも置く。CLI の `start` と同じ規則で、`PATH` 探索・環境変数・引数による上書きは無い。見つからなければ `FAILED_PRECONDITION`
+- plugin のプロセスの環境に `XDG_RUNTIME_DIR` が必要（user マネージャへの到達に使う）。上の「起動の前提」を同じく満たすこと
+- cgroup の配置を記録したコンテナの `delete` は、plugin プロセス自身の cgroup が委譲されている必要がある（CLI の `delete` と同じ検出で、検出に失敗すると記録を残したまま失敗する）。plugin を委譲されたスコープの中（例: `systemd-run --user --scope -p Delegate=yes -- fandhe-container-plugin-cri ...`）で動かす
+- rootful の `start` は CLI と同じく未対応（`UNIMPLEMENTED`）。実機での通しは未確認（#850・#2062）
+
 ```bash
 systemd-run --user --scope -p Delegate=yes -- fandhe-container delete <id>
 ```

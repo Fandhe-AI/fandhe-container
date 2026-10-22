@@ -64,7 +64,7 @@ use fandhe_container_core::traits::{
     TraitError,
 };
 // 試験が `use super::*` 経由で使う型（本番の経路では使わない）。
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use fandhe_container_core::oci_runtime::CgroupRemoval;
 #[cfg(test)]
 use fandhe_container_core::traits::{CgroupPlacement, CgroupScope, ErrorCode, StateRevision};
@@ -83,9 +83,11 @@ use fandhe_container_supervisor::cgroup_remover::UnavailableCgroupRemover;
 use fandhe_container_supervisor::cgroup_remover::production_cgroup_remover;
 #[cfg(all(test, target_os = "linux"))]
 use fandhe_container_supervisor::cgroup_remover::{DetectedCgroupRemover, detect_error};
-use fandhe_container_supervisor::control::production_stop_signaler;
 #[cfg(test)]
-use fandhe_container_supervisor::control::{UnavailableSignaler, production_signaler};
+use fandhe_container_supervisor::control::UnavailableSignaler;
+#[cfg(all(test, target_os = "linux"))]
+use fandhe_container_supervisor::control::production_signaler;
+use fandhe_container_supervisor::control::production_stop_signaler;
 use fandhe_container_supervisor::supervisor_log::{
     LogRemoval, SUPERVISOR_LOG_REMOVE_TIMEOUT, run_log_removal_bounded,
 };
@@ -368,6 +370,7 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         #[cfg(not(target_os = "linux"))]
         {
+            use fandhe_container_supervisor::control::ControlSignaler;
             let e = ControlSignaler::new(std::path::PathBuf::from("root"))
                 .signal(&id, pid, Signal::SIGTERM, Instant::now())
                 .expect_err("control signal");

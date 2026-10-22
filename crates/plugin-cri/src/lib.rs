@@ -5,7 +5,7 @@
 //! core との接続の向きは `docs/design/plugin-backend-wiring.md` 4.9（#1869。承認待ち）に従い、plugin-cri が gRPC サーバー、
 //! core 側（kubelet / crictl 相当）が `fandhe-container-plugin` の `connect_uds_channel` で接続するクライアントである。
 //! 未実装（REPAIR-3）: 既定の socket パスの解決と lifecycle からの起動（#459・#1869）、`ImageService` の UDS サーブ、
-//! SIGTERM の正常停止、start / kill / stop と cgroup remover の本番結線（#2434）。本番の `BundleProvider`（#2433）は結線済みだが、
+//! SIGTERM の正常停止。start / kill / stop と cgroup remover は supervisor 経由で本番結線済み（`supervised`。Linux のみ。#2434）。本番の `BundleProvider`（#2433）は結線済みだが、
 //! `ImageService` をサーブしていないためタグは解決できず、`CreateContainer` は image ID（`sha256:<hex>`）で受ける
 //! （タグ解決とイメージ取り込みの結線は別途。crictl の通し〔#442〕は `container.json` がタグのため、それまで通らない）。
 //! Container 系 4 RPC の UDS＋gRPC 境界越しの到達と、注入したフェイクでの一連の成功は `tests/container_grpc.rs` で照合済み（#850）。
@@ -18,4 +18,6 @@ pub mod pod_network;
 #[cfg(unix)]
 pub mod server;
 pub mod startup;
+#[cfg(target_os = "linux")]
+pub mod supervised;
 pub mod telemetry;

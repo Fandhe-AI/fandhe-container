@@ -33,6 +33,22 @@
 //!   ランチャーを選ぶ規則を入れる際の前提とする（現状 CLI はランチャーを起動しない）
 //! - 標準入出力に端末（pty）を渡さない（pipe・`/dev/null`・ファイルを渡す）
 //!
+//! # supervisor 側の不変条件: 端末の `open` に `O_NOCTTY`（SUP-14・TASK-171.2・#537・#2426）
+//! - exec 後の supervisor（とその中で動くコード）が、端末になりうる対象を `open` するときは常に `O_NOCTTY` を付ける。
+//!   端末になりうる対象とは、端末デバイスそのもの・利用者が指定するパス・open 前の確認と open の間に差し替えられうる
+//!   パスをいう
+//! - 理由: ランチャーは fork せずに `setsid` してから supervisor を exec するため、supervisor は生涯セッションリーダーで
+//!   制御端末を持たない。Linux ではこの状態で `O_NOCTTY` なしに端末を開くとそれが制御端末になり、`TIOCSTI` による
+//!   入力注入や hangup 時の SIGHUP の波及という、#537 で断った経路が再発する
+//! - 対象になりうる将来の箇所: tty 対応（attach 等）・healthcheck の exec（#495）・ログや env ファイル等の外部指定パスの open
+//! - 先例: core の `exec/process.rs`（setsid 後の fd の開き直し）と core の `sys.rs` の `O_NOCTTY`
+//! - 現状の担保: 外部指定パスを開く 2 つのヘルパー（`container_options::env::open_nonblocking`・
+//!   `logs::rotating::open_read_nofollow_nonblocking`）が `O_NOCTTY` を付け、単体テストでフラグを照合する。
+//!   対象外の open（`/proc/self/*`・ディレクトリ・新規作成のほか、`/etc` 配下の root 管理ファイル〔nsswitch.conf・
+//!   passwd 等。`user_db`・`id_model`〕と導入経路を検証済みの実行ファイル〔ランチャーの supervisor 検証〕）は、
+//!   利用者が端末へ差し替えられない経路のため `O_NOCTTY` を付けない。これらの経路を利用者指定パスへ広げるときは
+//!   端末になりうる対象に当たるので `O_NOCTTY` を付ける
+//!
 //! # 失敗時の契約（fail-closed）
 //! 昇格できない場合（file capability も setuid も無い・`nosuid`・`no_new_privs`）は構造化エラーで非ゼロ終了し、
 //! `sudo` へ黙って戻らない。`elevate` が `Err` を返した後は exec も特権操作もしない。結果は stdout（結果チャネル）に

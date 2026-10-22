@@ -74,6 +74,11 @@ mod arch {
     pub(super) const SO_PEERCRED: Option<i32> = None;
 }
 
+/// `EPERM`（include/uapi/asm-generic/errno-base.h の 1。x86_64・aarch64 で共通）。`privilege` が `setsid(2)` の
+/// 「プロセスグループのリーダー」と capability 系 syscall の権限不足を見分けるのに使う（SUP-14・#2426）。
+/// この crate は `libc` との機械照合が未導入のため、値は下の単体テストで具体値を照合する。
+pub(crate) const EPERM: i32 = 1;
+
 /// include/uapi/linux/prctl.h の値。
 const PR_SET_DUMPABLE: i32 = 4;
 const PR_GET_KEEPCAPS: i32 = 7;
@@ -664,6 +669,16 @@ pub(crate) fn set_dumpable(on: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SUP-14・#2426: `EPERM` の値と、`io::Error` 上で `PermissionDenied` になることを固定する。
+    #[test]
+    fn sup14_eperm_constant_is_one_and_permission_denied() {
+        assert_eq!(EPERM, 1);
+        assert_eq!(
+            io::Error::from_raw_os_error(EPERM).kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
 
     /// SUP-14・TASK-171.1.3: prctl の番号と capability ABI の値を固定する（include/uapi の値との照合）。
     #[test]

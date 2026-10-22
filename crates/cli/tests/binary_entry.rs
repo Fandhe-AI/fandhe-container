@@ -265,6 +265,13 @@ fn cli1_list_logs_usage_errors() {
         &["logs"],
         &["logs", "a", "b"],
         &["logs", "--x", "a"],
+        &["logs", "-f", "a"],
+        &["logs", "-n", "1", "a"],
+        &["logs", "--tail"],
+        &["logs", "--tail", "x", "a"],
+        &["logs", "--tail", "1000001", "a"],
+        &["logs", "--stream", "bogus", "a"],
+        &["logs", "--follow", "--follow", "a"],
     ] {
         assert_failure(&run(a), 2, USAGE_JSON);
     }
@@ -1331,6 +1338,263 @@ fn cli1_list_logs_flow_on_linux() {
     );
 }
 
+/// コンテナログの書き手に 1 レコード足して flush する（logs のオプション試験用）。
+#[cfg(target_os = "linux")]
+fn append_record(
+    sink: &fandhe_container_supervisor::logs::RotatingFileSink,
+    stream: fandhe_container_supervisor::logs::StreamKind,
+    line: &[u8],
+) {
+    use fandhe_container_supervisor::logs::LogSink as _;
+    sink.append(stream, line).expect("append");
+    sink.flush().expect("flush");
+}
+
+/// CLI-1・SUP-7・#2447: `--tail` / `--stream` / `--escape` の出力を具体値で照合する（終了コード 0・stderr は空）。
+/// 追従は存在しないコンテナで NOT_FOUND（3）になり、待たずに終わる。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_logs_tail_stream_escape_outputs() {
+    use fandhe_container_supervisor::logs::StreamKind;
+    let tmp = TmpDir::new("logsopts");
+    let root = create_two_containers(&tmp);
+    let root_s = root.to_str().expect("utf8");
+    let sink = open_container_log_sink(&root, "c1");
+    append_record(&sink, StreamKind::Stderr, b"b\x1b[1m");
+    append_record(&sink, StreamKind::Stdout, b"c");
+
+    let cases: [(&[&str], &[u8]); 6] = [
+        (
+            &["logs", "c1"],
+            b"stdout hello c1\nstderr b\x1b[1m\nstdout c\n",
+        ),
+        (
+            &["logs", "--tail", "2", "c1"],
+            b"stderr b\x1b[1m\nstdout c\n",
+        ),
+        (&["logs", "--tail", "0", "c1"], b""),
+        (&["logs", "--stream", "stderr", "c1"], b"stderr b\x1b[1m\n"),
+        (
+            &["logs", "--escape", "--stream", "stderr", "c1"],
+            b"stderr b^[[1m\n",
+        ),
+        (
+            &["logs", "--tail", "1", "--stream", "stdout", "c1"],
+            b"stdout c\n",
+        ),
+    ];
+    for (args, expect) in cases {
+        let mut full = vec!["--root", root_s];
+        full.extend_from_slice(args);
+        let out = run(&full);
+        assert_eq!(out.status.code(), Some(0), "{args:?}");
+        assert_eq!(out.stdout, expect, "{args:?}");
+        assert!(out.stderr.is_empty(), "{args:?}");
+    }
+    drop(sink);
+
+    let out = run(&["--root", root_s, "logs", "--follow", "nonexist"]);
+    assert_failure(
+        &out,
+        3,
+        "{\"code\":\"NOT_FOUND\",\"message\":\"container not found\"}\n",
+    );
+}
+
+/// `logs --follow` の子プロセス。Drop で kill して回収する（試験の失敗で孤児を残さない。REPAIR-5）。
+#[cfg(target_os = "linux")]
+struct FollowChild {
+    child: std::process::Child,
+    rx: mpsc::Receiver<Vec<u8>>,
+    got: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+impl FollowChild {
+    /// `logs --follow c1` を起動する。`deadline_ms` は試験専用の期限の上書き。
+    fn spawn(root: &std::path::Path, deadline_ms: u64) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_fandhe-container"))
+            .args([
+                "--root",
+                root.to_str().expect("utf8"),
+                "logs",
+                "--follow",
+                "c1",
+            ])
+            .env_remove("FANDHE_CONTAINER_PLUGIN_PATH_SEARCH")
+            .env(
+                "FANDHE_CONTAINER_TEST_LOGS_FOLLOW_DEADLINE_MS",
+                deadline_ms.to_string(),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn logs --follow");
+        let mut pipe = child.stdout.take().expect("stdout piped");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; 64 * 1024];
+            while let Ok(n) = pipe.read(&mut buf) {
+                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            child,
+            rx,
+            got: Vec::new(),
+        }
+    }
+
+    /// 出力が `len` バイトに届くまで待つ（期限つき。超えたら panic。REPAIR-5）。
+    fn wait_len(&mut self, len: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while self.got.len() < len {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "timed out: got {} of {len} bytes",
+                self.got.len()
+            );
+            if let Ok(chunk) = self.rx.recv_timeout(left) {
+                self.got.extend_from_slice(&chunk);
+            }
+        }
+    }
+
+    /// 追加の出力が来ないことを `quiet` の間確かめる（重複の検出）。
+    fn assert_quiet(&mut self, quiet: Duration) {
+        let until = Instant::now() + quiet;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            if let Ok(chunk) = self.rx.recv_timeout(left) {
+                self.got.extend_from_slice(&chunk);
+                panic!("unexpected extra output: {} bytes", chunk.len());
+            }
+        }
+    }
+
+    /// 終了を期限つきで待つ。
+    fn wait_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(s) = self.child.try_wait().expect("try_wait") {
+                return s;
+            }
+            assert!(Instant::now() < deadline, "logs --follow did not exit");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn stderr_text(&mut self) -> String {
+        let mut s = String::new();
+        if let Some(mut e) = self.child.stderr.take() {
+            let _ = e.read_to_string(&mut s);
+        }
+        s
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FollowChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// REPAIR-5・#2447: `--follow` は期限で終わり（0）、期限までに出した分は stdout に届く。
+#[cfg(target_os = "linux")]
+#[test]
+fn repair5_logs_follow_ends_at_deadline() {
+    let tmp = TmpDir::new("followdl");
+    let root = create_two_containers(&tmp);
+    let sink = open_container_log_sink(&root, "c1");
+    let mut f = FollowChild::spawn(&root, 600);
+    let status = f.wait_exit(Duration::from_secs(20));
+    assert_eq!(status.code(), Some(0));
+    while let Ok(chunk) = f.rx.recv_timeout(Duration::from_secs(5)) {
+        f.got.extend_from_slice(&chunk);
+    }
+    assert_eq!(f.got, b"stdout hello c1\n");
+    assert_eq!(f.stderr_text(), "");
+    drop(sink);
+}
+
+/// SUP-7・#2447: `--follow` は追記を出し、ローテーション（世代の退避）をまたいでも欠落・重複なく連結した出力になる。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup7_logs_follow_spans_rotation() {
+    use fandhe_container_supervisor::logs::StreamKind;
+    let tmp = TmpDir::new("followrot");
+    let root = create_two_containers(&tmp);
+    let sink = open_container_log_sink(&root, "c1");
+    let mut f = FollowChild::spawn(&root, 120_000);
+    let mut expect: Vec<u8> = b"stdout hello c1\n".to_vec();
+    f.wait_len(expect.len(), Duration::from_secs(30));
+    assert_eq!(f.got, expect);
+
+    append_record(&sink, StreamKind::Stdout, b"first");
+    expect.extend_from_slice(b"stdout first\n");
+    f.wait_len(expect.len(), Duration::from_secs(30));
+    assert_eq!(f.got, expect);
+
+    // 1 MiB の上限を超えるまで 60000 バイトの行を足す（現在ログが世代へ退避される）。
+    for i in 0..20u32 {
+        let mut line = format!("{i:03}-").into_bytes();
+        line.resize(60_000, b'x');
+        append_record(&sink, StreamKind::Stdout, &line);
+        expect.extend_from_slice(b"stdout ");
+        expect.extend_from_slice(&line);
+        expect.push(b'\n');
+        // 追従側が世代 2 本ぶん以上遅れて世代を取りこぼさないよう、数行ごとに到達を待つ。
+        if i % 4 == 3 {
+            f.wait_len(expect.len(), Duration::from_secs(30));
+        }
+    }
+    assert!(
+        fandhe_container_supervisor::logs::container_log_dir(&root)
+            .join("c1.log.1")
+            .exists(),
+        "rotation must have happened"
+    );
+    append_record(&sink, StreamKind::Stdout, b"last");
+    expect.extend_from_slice(b"stdout last\n");
+    f.wait_len(expect.len(), Duration::from_secs(30));
+    f.assert_quiet(Duration::from_millis(800));
+    assert!(f.got == expect, "output differs from the written records");
+    drop(sink);
+}
+
+/// REPAIR-5・#2447: `--follow` は SIGINT で終わる（シグナル終了・stderr は空で、それまでの行は stdout に届いている）。
+#[cfg(target_os = "linux")]
+#[test]
+fn repair5_logs_follow_terminates_on_sigint() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let tmp = TmpDir::new("followint");
+    let root = create_two_containers(&tmp);
+    let sink = open_container_log_sink(&root, "c1");
+    let mut f = FollowChild::spawn(&root, 120_000);
+    f.wait_len(b"stdout hello c1\n".len(), Duration::from_secs(30));
+    let kill = Command::new("kill")
+        .args(["-INT", &f.child.id().to_string()])
+        .status()
+        .expect("kill");
+    assert!(kill.success());
+    let status = f.wait_exit(Duration::from_secs(10));
+    assert_eq!(status.signal(), Some(2));
+    while let Ok(chunk) = f.rx.recv_timeout(Duration::from_secs(5)) {
+        f.got.extend_from_slice(&chunk);
+    }
+    assert_eq!(f.got, b"stdout hello c1\n");
+    assert_eq!(f.stderr_text(), "");
+    drop(sink);
+}
 /// SEC-1・PLUG-4・C1: Linux 以外では list / logs も plugin 候補なしの fail-closed で FAILED_PRECONDITION（5）。
 /// 文言は「未導入」の識別子（信頼性検証の拒否とは別。TASK-79.4 追補）。
 /// logs の ID 不正は plugin 解決より先に 2 で弾く。

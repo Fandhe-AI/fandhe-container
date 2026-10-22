@@ -9,8 +9,8 @@
 //! `stop` の本番 `ProcessSignaler` は supervisor の制御チャネル経由（`stop_delete::production_signaler`。#2059・SEC-1）で、
 //! supervisor に届かなければ構造化エラー（UNAVAILABLE 等）で失敗する。非 Linux は `UNIMPLEMENTED`（8）で fail-closed（REPAIR-3）。
 //! `list` は core の状態ストアを読んで stdout へタブ区切りで一覧を出し、`logs` は存在確認の後に supervisor の
-//! `logs::read_container_log` でコンテナログ（`<state_root>/@container-logs`）を古い順に stdout へ出す
-//! （TASK-79.3・#640・#1543。`list_logs` module）。
+//! `logs::read_container_log_with` でコンテナログ（`<state_root>/@container-logs`）を古い順に stdout へ出す
+//! （`--follow` / `--tail` / `--stream` / `--escape` つき。TASK-79.3・#640・#1543・#2447。`list_logs` module）。
 //! `image ls` / `system df` / `image rm [--force]` / `image tag` は oci の管理 API（`image_management`）を呼ぶ（#2221・CLI-1・OCI-7。`image` module）。
 //! イメージストアの root は必須オプション `--image-root`。参照テーブルの永続化が oci 側で未実装のため、現状は `image ls` が
 //! 常にヘッダのみ・`image rm` が常に `NOT_FOUND` になる。既定 root・非 Linux の実行経路・`image prune` は未配線
@@ -43,7 +43,9 @@ use std::io::Write;
 use fandhe_container_core::oci_runtime::{
     OCI_EXIT_INVALID_ARGUMENT, OCI_EXIT_UNIMPLEMENTED, OciRuntimeError,
 };
-use fandhe_container_core::traits::ErrorCode;
+use fandhe_container_core::traits::{ErrorCode, TraitError};
+
+use fandhe_container_supervisor::logs::FOLLOW_OUTRAN_MESSAGE;
 
 use crate::doctor::DoctorExitStatus;
 use crate::error::CliError;
@@ -231,11 +233,16 @@ impl CliExit {
         CliExit::Error(CliError::new(code, STATE_STORE_CORRUPTED_MESSAGE))
     }
 
-    /// `logs` のコンテナログ読み出しの失敗（#1543・CLI-1・SUP-7）。`code` は supervisor の読み出しが返したもの
-    /// （`Internal` / `Unavailable` / `FailedPrecondition`）で、終了コードはそれに従う。文言は固定表のみ。
-    /// ログ側の `NotFound` は「コンテナ不在」と誤報しないよう、呼び出し側で `Internal` へ寄せてから渡す。
-    pub(crate) fn container_log_failed(code: ErrorCode) -> Self {
+    /// `logs` のコンテナログ読み出しの失敗（#1543・CLI-1・SUP-7）。コードは supervisor の読み出しが返したもの
+    /// （`Internal` / `Unavailable` / `FailedPrecondition`）で、終了コードはそれに従う。文言は固定表のみ
+    /// （`e` のメッセージは出さない。`Unavailable` のうち追従が追いつかない場合だけ、supervisor の固定文言との完全一致で
+    /// 専用の文言へ写す）。ログ側の `NotFound` は「コンテナ不在」と誤報しないよう `Internal` へ寄せる。
+    pub(crate) fn container_log_failed(e: &TraitError) -> Self {
+        let code = e.code();
         let message = match code {
+            ErrorCode::Unavailable if e.message() == FOLLOW_OUTRAN_MESSAGE => {
+                CONTAINER_LOG_OUTRAN_MESSAGE
+            }
             ErrorCode::Unavailable => CONTAINER_LOG_ROTATING_MESSAGE,
             ErrorCode::FailedPrecondition => CONTAINER_LOG_LIMIT_MESSAGE,
             _ => CONTAINER_LOG_UNREADABLE_MESSAGE,
@@ -291,6 +298,7 @@ const UNIMPLEMENTED_MESSAGE: &str = "command is not implemented yet";
 const CONTAINER_LOG_UNREADABLE_MESSAGE: &str = "container log could not be read";
 const CONTAINER_LOG_ROTATING_MESSAGE: &str = "container log is rotating; retry";
 const CONTAINER_LOG_LIMIT_MESSAGE: &str = "container log exceeds the read limit";
+const CONTAINER_LOG_OUTRAN_MESSAGE: &str = "container log rotated faster than it could be followed";
 
 /// [`CliExit::failed`] の固定文言表。引用符・バックスラッシュ・制御文字を含まない定数のみ（テストで固定）。
 /// `ErrorCode` は `#[non_exhaustive]` のため、未知のコードは汎用文言に落とす。

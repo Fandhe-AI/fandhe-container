@@ -38,9 +38,25 @@
 //! 本番 launcher の出力パイプ（`take_output`）から行を流す（#1471・#1819・SUP-7）。本 module は書き手と同じ定義
 //! （`container_log_dir`・`container_log_rotation_config`）で読む。
 //!
-//! 端末制御文字はエスケープしない。ログはコンテナ利用者のデータで、docker / kubectl と同じく加工しないためである。
-//! 端末へ直接出すと ESC 系のシーケンスが解釈され得るので、信頼できないコンテナのログは `| cat -v` 等を通して見ること
-//! （エスケープ表示のオプションは未提供）。
+//! # logs のオプション（CLI-1・SUP-7・#2447）
+//!
+//! 構文は `logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] [--] <id>`（順不同・各 1 回まで。長い形だけ。
+//! 3 OS で同じ構文を受理する）。オプションなしは従来どおりバイトのまま出す。どれかを指定するとレコード単位になり、
+//! レコードの検証（タグが `stdout ` / `stderr ` であること・1 行が上限以下であること）をする。
+//!
+//! - `--tail <N>`: 絞り込みの後の末尾 N レコード（`0..=1,000,000`。範囲外は使い方エラー）。メモリは N に依らず固定。
+//! - `--stream <stdout|stderr>`: そのタグのレコードだけを、タグを残して stdout へ出す。コンテナの stderr を CLI の stderr へ
+//!   流さないのは、CLI の stderr が失敗時の 1 行 JSON の契約（ERR-1・ERR-2）だからである。
+//! - `--escape`: レコード本体の制御文字を `cat -v` と同じ表（ESC → `^[`、CR → `^M`、`0x7F` → `^?`、`0x80` 以上は `M-` を前置、
+//!   TAB はそのまま）で表示用に変換する。タグと区切りの LF は変えない。信頼できないコンテナのログを端末へ出すときに使う。
+//!   指定しない出力は、docker / kubectl と同じくデータを加工しない。端末へ直接出すと ESC 系のシーケンスが解釈され得る。
+//! - `--follow`: 出し終えた後も現在ログの追記を追う（完全な行だけ。ローテーションをまたいでも欠落・重複なし）。
+//!   終わりは (1) 組み込みの期限（24 時間。値はオーナー確認待ち。超えたら残りを出し切って 0）、(2) SIGINT・SIGTERM・SIGHUP
+//!   （`signals` が転送した後に既定動作で終了する。stderr に JSON は出ず、それまでに出した行は stdout に届いている。
+//!   起動時に `SIG_IGN` を継承したシグナルは上書きしない）、(3) stdout の失敗（`| head` 等。1 / `INTERNAL`）、(4) 追いつけない
+//!   ローテーション（9 / `UNAVAILABLE`）、(5) ログの削除（出し切って 0）。コンテナの停止では終わらない。
+//!   試験専用 feature `logs-test-support` のときだけ、環境変数 `FANDHE_CONTAINER_TEST_LOGS_FOLLOW_DEADLINE_MS`（10 進ミリ秒。
+//!   上限で丸め、不正なら無視）で期限を短くできる。
 //!
 //! | 条件 | 結果 |
 //! | ---- | ---- |
@@ -50,15 +66,18 @@
 //! | 対象の状態レコードが無い | 3（`NOT_FOUND`。`container not found`） |
 //! | ログが無い（ディレクトリが無い・ファイルが 0 件・0 バイト） | 0（stdout は空） |
 //! | ログがある | 0（stdout はレコード列） |
-//! | ログを読めない（名前空間に受理できない名前・symlink・権限・I/O エラー） | 1（`INTERNAL`。`container log could not be read`） |
+//! | ログを読めない（名前空間に受理できない名前・symlink・権限・I/O エラー・レコードの破損） | 1（`INTERNAL`。`container log could not be read`） |
 //! | 世代の入れ替わりが収まらない | 9（`UNAVAILABLE`。`container log is rotating; retry`） |
+//! | 追従がローテーションに追いつけない | 9（`UNAVAILABLE`。`container log rotated faster than it could be followed`） |
+//! | 追従の期限 | 0 |
 //! | 読む量の上限を超えた | 5（`FAILED_PRECONDITION`。`container log exceeds the read limit`） |
 //! | stdout への書き込みに失敗した | 1（`INTERNAL`） |
 //!
 //! delete でのコンテナログ（`@container-logs/<id>.log*`）の削除は、core の delete の成功後に `stop_delete` が行う（#2446）。
 //!
 //! 未実装・簡易実装（REPAIR-3）:
-//! - logs の `--follow` / `--tail` / ストリーム別出力 / エスケープ表示: 未提供（CLI-1 の拡張）。
+//! - logs: コンテナの停止で `--follow` を終える挙動（supervisor の最終 flush と停止記録の順序が前提）・利用者向けの期限フラグ・
+//!   writer の定期 flush による追従の遅延の短縮は未提供。非 Linux の読み出しは plugin 経由（TASK-114・TASK-125）。
 //! - 再起動をまたぐ出力の捕捉: 再 launch が実機で成り立つのを待つ（#2043）。
 //! - list の JSON 出力・bundle 列: JSON を手組みしない（REPAIR-2）ため serde 系の配線か core の公開ライタが前提
 //!   （TASK-95・TASK-98）。
@@ -76,11 +95,12 @@ use fandhe_container_core::traits::{
 };
 
 use fandhe_container_supervisor::logs::{
-    LogReadFailure, container_log_dir, container_log_rotation_config, read_container_log,
+    FollowOptions, LogReadFailure, LogReadOptions, MAX_FOLLOW_DURATION, StreamKind, TailCount,
+    container_log_dir, container_log_rotation_config, read_container_log_with,
 };
 
 use super::CliExit;
-use super::args::{GlobalArgs, ListArgs, LogsArgs};
+use super::args::{GlobalArgs, ListArgs, LogStreamArg, LogsArgs};
 use super::create_start::{OP_LOG_ENV, export_ops, open_store, production_runtime};
 
 /// list の固定ヘッダ行（LF 終端）。
@@ -224,8 +244,42 @@ pub(super) fn run_list(global: &GlobalArgs, _args: &ListArgs, stdout: &mut dyn W
 fn log_read_failure(f: &LogReadFailure) -> CliExit {
     match f {
         LogReadFailure::Output => CliExit::failed(ErrorCode::Internal),
-        LogReadFailure::Source(e) => CliExit::container_log_failed(e.code()),
+        LogReadFailure::Source(e) => CliExit::container_log_failed(e),
     }
+}
+
+/// 試験専用: `--follow` の期限を上書きする環境変数（feature `logs-test-support` のときだけ読む。10 進ミリ秒）。
+#[cfg(feature = "logs-test-support")]
+const TEST_FOLLOW_DEADLINE_ENV: &str = "FANDHE_CONTAINER_TEST_LOGS_FOLLOW_DEADLINE_MS";
+
+/// `--follow` の期限。既定は上限（24 時間）。試験用 feature のときだけ環境変数で短くできる（不正な値は無視する）。
+fn follow_deadline() -> std::time::Duration {
+    #[cfg(feature = "logs-test-support")]
+    if let Some(ms) = std::env::var(TEST_FOLLOW_DEADLINE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return std::time::Duration::from_millis(ms).min(MAX_FOLLOW_DURATION);
+    }
+    MAX_FOLLOW_DURATION
+}
+
+/// 引数から supervisor の読み出しオプションを組む。範囲外は構築の段階で `InvalidArgument`（args が先に弾くため防御）。
+fn read_options(args: &LogsArgs) -> Result<LogReadOptions, TraitError> {
+    let mut opts = LogReadOptions::default().with_escape(args.escape);
+    if let Some(n) = args.tail {
+        opts = opts.with_tail(TailCount::new(n)?);
+    }
+    if let Some(s) = args.stream {
+        opts = opts.with_stream(match s {
+            LogStreamArg::Stdout => StreamKind::Stdout,
+            LogStreamArg::Stderr => StreamKind::Stderr,
+        });
+    }
+    if args.follow {
+        opts = opts.with_follow(FollowOptions::new(follow_deadline())?);
+    }
+    Ok(opts)
 }
 
 /// 本番入口の `logs`。対象の存在を確かめ、supervisor の読み出し入口でコンテナログを古い順に stdout へ出す
@@ -244,13 +298,22 @@ pub(super) fn run_logs(global: &GlobalArgs, args: &LogsArgs, stdout: &mut dyn Wr
         Ok(()) => match rt.store.host_state_root() {
             // `FileStateStore` では起きない防御。ログの置き場が決められなければ読めない（fail-closed）。
             None => CliExit::unimplemented(),
-            Some(root) => {
-                let dir = container_log_dir(root);
-                match read_container_log(&dir, &id, container_log_rotation_config(), stdout) {
-                    Ok(_) => CliExit::Success,
-                    Err(f) => log_read_failure(&f),
+            Some(root) => match read_options(args) {
+                Err(e) => CliExit::failed(e.code()),
+                Ok(opts) => {
+                    let dir = container_log_dir(root);
+                    match read_container_log_with(
+                        &dir,
+                        &id,
+                        container_log_rotation_config(),
+                        &opts,
+                        stdout,
+                    ) {
+                        Ok(_) => CliExit::Success,
+                        Err(f) => log_read_failure(&f),
+                    }
                 }
-            }
+            },
         },
     };
     record_op(

@@ -104,7 +104,7 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | `stop` | `stop <id>` | 終了コード・`code`・stdout 空・不在 ID は `NOT_FOUND`（3） |
 | `delete` | `delete [--force] <id>` | 終了コード・`code`・stdout 空・直後の `list` から ID が消える |
 | `list` | `list` | 終了コード・stdout の形式（ヘッダ `ID<TAB>STATUS<TAB>PID`、ID 昇順、0 件はヘッダのみで 0）・状態ルート不在は `NOT_FOUND`（3） |
-| `logs` | `logs <id>` | 終了コード・`code`・不在 ID は `NOT_FOUND`（3） |
+| `logs` | `logs [--follow] [--tail <N>] [--stream <stdout\|stderr>] [--escape] <id>` | 終了コード・`code`・不在 ID は `NOT_FOUND`（3）。オプションの構文は D 層（#2447・SUP-7） |
 
 ### ケース別チェックリスト
 
@@ -172,6 +172,34 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | C24 | `image ls --image-root <通常ファイル>` | 5 / `FAILED_PRECONDITION` | | 前提未達 | 前提未達 | | |
 | C25 | `image tag --image-root <dir> busybox:latest busybox:v2` | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 在庫を埋める経路が未実装のため常にこの値 |
 | C26 | `create --image-root <dir> --image sha256:<64 hex> --bundle <bundle> <id>`（OCI-7・#2315） | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 在庫を埋める経路（pull → `ImageStore` の配線）が入るまで常にこの値。状態は作られない。`--image` だけ・`--image-root` だけは 2 / `INVALID_ARGUMENT` |
+
+## D 層: logs のオプション（`--follow`・`--tail`・`--stream`・`--escape`。#2447・CLI-1・SUP-7）
+
+`scripts/cli-parity-check.sh` は本層を自動収集しない（`--follow` は期限まで終わらないため。A 層への取り込みは後続）。手動で実行し、結果欄だけを記入する。3 OS で同じなのは構文（D 層の構文ケース）で、読み出しの挙動は Linux だけが実装済み・確認済みである（非 Linux は plugin 経由で、TASK-114・TASK-125 待ち。`logs` の入口は plugin 解決の失敗で fail-closed）。出力の意味は `list_logs` module の doc を正とする（オプションなしはバイトのまま。`--escape` は `cat -v` と同じ表で本体だけ変換）。
+
+### D 層の構文ケース（3 OS で 2 / `INVALID_ARGUMENT` を期待）
+
+| ID | 構文 | 期待 | Linux | macOS | Windows | 一致 | 備考 |
+| -- | ---- | ---- | ----- | ----- | ------- | ---- | ---- |
+| D01 | `logs --tail`（値欠落） | 2 / `INVALID_ARGUMENT` | | | | | |
+| D02 | `logs --tail x c1` | 2 / `INVALID_ARGUMENT` | | | | | 10 進数字以外（`-1`・`+5`・`all` を含む） |
+| D03 | `logs --tail 1000001 c1` | 2 / `INVALID_ARGUMENT` | | | | | 上限は 1,000,000（オーナー確認待ち） |
+| D04 | `logs --stream bogus c1` | 2 / `INVALID_ARGUMENT` | | | | | 値は `stdout` / `stderr` のみ |
+| D05 | `logs --follow --follow c1`（重複） | 2 / `INVALID_ARGUMENT` | | | | | `--tail`・`--stream`・`--escape` の重複も同じ |
+| D06 | `logs -f c1` / `logs -n 1 c1`（短縮形） | 2 / `INVALID_ARGUMENT` | | | | | 長い形だけを受ける |
+
+### D 層の挙動ケース（Linux の参考期待値のみ。macOS / Windows は「前提未達」が既定）
+
+前提: c1 を create 済みで、コンテナログ（`<state_root>/@container-logs/c1.log`）が `stdout a` / `stderr b<ESC>[1m` / `stdout c` の 3 レコード（タグと LF つき）。
+
+| ID | コマンドと前提 | Linux の参考期待値 | Linux | macOS | Windows | 一致 | 備考 |
+| -- | -------------- | ------------------ | ----- | ----- | ------- | ---- | ---- |
+| D20 | `logs --tail 2 c1` | 0 / 末尾 2 レコード（`stderr b<ESC>[1m` と `stdout c`） | | 前提未達 | 前提未達 | | |
+| D21 | `logs --tail 0 c1` | 0 / 空 | | 前提未達 | 前提未達 | | |
+| D22 | `logs --stream stderr c1` | 0 / `stderr b<ESC>[1m` のみ（タグを残す） | | 前提未達 | 前提未達 | | コンテナの stderr は CLI の stderr へ流さない |
+| D23 | `logs --escape --stream stderr c1` | 0 / `stderr b^[[1m` | | 前提未達 | 前提未達 | | |
+| D24 | `logs --follow nonexist` | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 待たずに終わる |
+| D25 | `logs --follow c1` の実行中に追記し、Ctrl-C（SIGINT） | シグナル終了・stderr 空・それまでの行は stdout に届く | | 前提未達 | 前提未達 | | 期限は組み込みの 24 時間。ローテーションをまたいでも欠落・重複なし（結合試験で確認） |
 
 ## 差異のフィードバック先
 

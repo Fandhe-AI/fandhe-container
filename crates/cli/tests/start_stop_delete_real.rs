@@ -472,17 +472,17 @@ mod linux {
         )?;
         if scope_dir.is_dir() {
             let prefix = format!("fc-{id_s}@");
-            let leftovers: Vec<String> = fs::read_dir(&scope_dir)
-                .map_err(|e| format!("read scope dir: {e}"))?
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|n| n.starts_with(&prefix))
-                .collect();
+            let leftovers = list_prefixed(&scope_dir, &prefix)?;
             expect(
                 leftovers.is_empty(),
                 &format!("container cgroups remain under the scope: {leftovers:?}"),
             )?;
-            let procs = fs::read_to_string(scope_dir.join("cgroup.procs")).unwrap_or_default();
+            // 不存在（NotFound）だけを空として扱い、権限エラー等の観測失敗は伝播する
+            let procs = match fs::read_to_string(scope_dir.join("cgroup.procs")) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(format!("read scope cgroup.procs: {e}")),
+            };
             expect(
                 procs.trim().is_empty(),
                 &format!("scope cgroup.procs is not empty: {procs:?}"),
@@ -490,14 +490,7 @@ mod linux {
         }
         let log_prefix = format!("{id_s}.log");
         for dir in ["@supervisor-logs", "@container-logs"] {
-            let names: Vec<String> = match fs::read_dir(root.join(dir)) {
-                Ok(rd) => rd
-                    .flatten()
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| n.starts_with(&log_prefix))
-                    .collect(),
-                Err(_) => Vec::new(),
-            };
+            let names = list_prefixed(&root.join(dir), &log_prefix)?;
             expect(
                 names.is_empty(),
                 &format!("{dir} entries remain: {names:?}"),
@@ -525,6 +518,25 @@ mod linux {
         }
         cleanup.armed = false;
         Ok(scope_present)
+    }
+
+    /// `dir` 直下で `prefix` 始まりの名前を返す。ディレクトリ不存在（NotFound）だけを空とし、
+    /// それ以外の読み取り失敗（PermissionDenied 等）とエントリ単位の失敗はエラーにする。
+    fn list_prefixed(dir: &Path, prefix: &str) -> Result<Vec<String>, String> {
+        let rd = match fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(format!("read dir {}: {e}", dir.display())),
+        };
+        let mut names = Vec::new();
+        for entry in rd {
+            let entry = entry.map_err(|e| format!("read dir entry {}: {e}", dir.display()))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(prefix) {
+                names.push(name);
+            }
+        }
+        Ok(names)
     }
 
     fn set_mode(path: &Path, mode: u32) -> Result<(), String> {

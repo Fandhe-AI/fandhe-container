@@ -212,7 +212,8 @@ impl UdsListener {
     /// 入れること。本メソッドは拒否 1 件で即返るため、無対策のループは busy loop になる（#2252 P2-4）。
     /// observer への通知も呼び出しごとに出て件数の上限が無いため、observer にはあふれを集約する
     /// 有界な実装（`JsonLinesPeerAuthObserver` 等）を使う。既存の例として、`grpc::UdsIncoming` は accept
-    /// エラーの後に短いバックオフを挟む（peer 拒否の後のバックオフは未実装）。
+    /// エラーの後に短いバックオフを挟み、peer 拒否が続けば連続回数に応じた指数バックオフ（4 件目から 10ms 起点・
+    /// 上限 500ms・合格した接続の受理で解除。#2438）を入れる。
     /// 返す接続は peer credential が自 UID であることを確認済み。不一致は接続を切断して
     /// `PermissionDenied` を返す（呼び出し側の受付ループは継続してよい）。本メソッドは拒否 1 件で必ず返り、
     /// 自ら待ち受けを続けない（続けるのは起動経路の `accept_peer_pid` のみ）。peer 認証による拒否かどうかは
@@ -1021,6 +1022,8 @@ mod imp {
                                 peer_uid: rej.peer_uid,
                                 expected_pid: None,
                                 peer_pid: None,
+                                consecutive_rejections: None,
+                                backoff_ms: None,
                                 socket_path: &self.path,
                             });
                             if expected_pid.is_none()
@@ -1049,6 +1052,8 @@ mod imp {
                                         peer_uid: Some(self.euid),
                                         expected_pid: Some(pid),
                                         peer_pid: None,
+                                        consecutive_rejections: None,
+                                        backoff_ms: None,
                                         socket_path: &self.path,
                                     });
                                     return Err(e);
@@ -1066,6 +1071,8 @@ mod imp {
                                     peer_uid: Some(self.euid),
                                     expected_pid: Some(pid),
                                     peer_pid: Some(peer_pid),
+                                    consecutive_rejections: None,
+                                    backoff_ms: None,
                                     socket_path: &self.path,
                                 });
                                 count_continued_rejection(&mut continued)?;
@@ -1194,6 +1201,8 @@ mod imp {
                     peer_uid: rej.peer_uid,
                     expected_pid: None,
                     peer_pid: None,
+                    consecutive_rejections: None,
+                    backoff_ms: None,
                     socket_path: path,
                 });
                 return Err(rej.error);
@@ -2617,6 +2626,8 @@ mod tests {
                     peer_uid: Some(2),
                     expected_pid: None,
                     peer_pid: None,
+                    consecutive_rejections: None,
+                    backoff_ms: None,
                     socket_path: p,
                 });
             }
@@ -2647,6 +2658,8 @@ mod tests {
             peer_uid: None,
             expected_pid: None,
             peer_pid: None,
+            consecutive_rejections: None,
+            backoff_ms: None,
             socket_path: Path::new("/x.sock"),
         };
         assert_eq!(

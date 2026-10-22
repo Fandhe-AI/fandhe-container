@@ -579,6 +579,10 @@ pub enum SuperviseOutcome {
         late: LateOrphans,
         /// 実施した再起動の回数。
         restarts: u32,
+        /// 再 launch 中に受理した明示 stop が、まだ state.json へ残せていない（呼び出し側の回収確認後に残す）。
+        /// `true` のとき、呼び出し側は回収を確認できてから世代を照合して `explicit_stop` を書く（書けなければ非 0。
+        /// #2440・SUP-9・契約 14）。
+        explicit_stop_pending: bool,
     },
     /// 再 launch に失敗した（`restart_count` は進めていない。状態は `Stopped`）。
     RelaunchFailed {
@@ -590,6 +594,8 @@ pub enum SuperviseOutcome {
         late: LateOrphans,
         /// 実施した再起動の回数。
         restarts: u32,
+        /// 再 launch の待機中に受理した明示 stop が、残存プロセスの回収未確認のため未記録（`Stopped` 同名フィールド参照）。
+        explicit_stop_pending: bool,
     },
     /// 再 launch には成功したが `Running` の記録に失敗したため、新プロセスを terminate した。
     /// 停止要求で取り消した再起動の記録の書き戻し（`Stopped` へ戻す・監視権を返す）に失敗した場合もこれを返す
@@ -660,24 +666,28 @@ impl fmt::Debug for SuperviseOutcome {
                 process,
                 late,
                 restarts,
+                explicit_stop_pending,
             } => f
                 .debug_struct("Stopped")
                 .field("last", last)
                 .field("has_process", &process.is_some())
                 .field("late", late)
                 .field("restarts", restarts)
+                .field("explicit_stop_pending", explicit_stop_pending)
                 .finish(),
             Self::RelaunchFailed {
                 exit,
                 error,
                 late,
                 restarts,
+                explicit_stop_pending,
             } => f
                 .debug_struct("RelaunchFailed")
                 .field("exit", exit)
                 .field("error", error)
                 .field("late", late)
                 .field("restarts", restarts)
+                .field("explicit_stop_pending", explicit_stop_pending)
                 .finish(),
             Self::RestartUnrecorded {
                 error,
@@ -997,6 +1007,7 @@ pub fn supervise_with_restart(
                     process: Some(process),
                     late: cleanup_late,
                     restarts,
+                    explicit_stop_pending: false,
                 });
             }
             _ => {
@@ -1042,6 +1053,7 @@ pub fn supervise_with_restart(
                         process: None,
                         late: cleanup_late,
                         restarts,
+                        explicit_stop_pending: false,
                     });
                 }
                 // バックオフ中の stop: 保留中の再起動を取り消して明示 stop を残す（#2440・SUP-9）。
@@ -1057,6 +1069,7 @@ pub fn supervise_with_restart(
                 process: None,
                 late: cleanup_late,
                 restarts,
+                explicit_stop_pending: false,
             });
         }
         if explicit_requested(stop) {
@@ -1088,11 +1101,14 @@ pub fn supervise_with_restart(
                 {
                     return Ok(finish_explicit_stop(state, last, restarts, obs));
                 }
+                // 回収を確認できなかった場合は記録を動かさず、明示 stop は呼び出し側の回収確認後に残す（未記録のまま
+                // 返すと unless-stopped が再起動対象にしてしまう。#2440・SUP-9・契約 14）。
                 return Ok(SuperviseOutcome::RelaunchFailed {
                     exit,
                     error,
                     late,
                     restarts,
+                    explicit_stop_pending: explicit_requested(stop) && !stop.is_stop_requested(),
                 });
             }
         };
@@ -1110,6 +1126,7 @@ pub fn supervise_with_restart(
                 process: None,
                 late: cleanup_late,
                 restarts,
+                explicit_stop_pending: false,
             });
         }
         // 再 launch 中に再起動の取り消し（明示 stop）が届いていたら、同じく Running を記録せず新プロセスを回収し、
@@ -1123,11 +1140,13 @@ pub fn supervise_with_restart(
             );
             return Ok(match terminated {
                 Ok(()) => finish_explicit_stop(state, last, restarts, obs),
+                // 回収未確認: 呼び出し側が回収を確認できてから明示 stop を残す（#2440・SUP-9・契約 14）。
                 Err(_) => SuperviseOutcome::Stopped {
                     last,
                     process: None,
                     late: cleanup_late,
                     restarts,
+                    explicit_stop_pending: !stop.is_stop_requested(),
                 },
             });
         }
@@ -1212,6 +1231,8 @@ pub fn supervise_with_restart(
                                     process: None,
                                     late: cleanup_late,
                                     restarts: restarts.saturating_add(1),
+                                    explicit_stop_pending: explicit_requested(stop)
+                                        && !stop.is_stop_requested(),
                                 }
                             }
                             Err(error) => {
@@ -1243,6 +1264,7 @@ pub fn supervise_with_restart(
                             process: None,
                             late: cleanup_late,
                             restarts,
+                            explicit_stop_pending: false,
                         },
                         Err(error) => {
                             observe(Some(error.code()));
@@ -2406,6 +2428,93 @@ mod tests {
         assert_eq!(g.status().state(), ContainerState::Stopped);
         assert_eq!(g.restart_count(), 0);
         assert_eq!(g.explicit_stop(), ExplicitStop::Recorded);
+    }
+
+    /// 再 launch の中で明示 stop の意図を立て、terminate が必ず失敗する新プロセスを返す再 launch。
+    struct MarksExplicitThenStuck {
+        stop: StopToken,
+    }
+
+    impl Relauncher for MarksExplicitThenStuck {
+        fn relaunch(&self, _: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            self.stop.mark_explicit_stop();
+            Ok(Box::new(StuckProc(43)))
+        }
+    }
+
+    /// SUP-9・SUP-3・契約 14・#2440: 再 launch 中の取り消し受理後に最初の terminate が失敗した場合は、記録を動かさず
+    /// ハンドルを `late` で返し、明示 stop の記録は呼び出し側の回収確認後に回す（`explicit_stop_pending`）。
+    #[test]
+    fn sup9_explicit_stop_during_relaunch_terminate_failure_is_pending() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        let q: Arc<dyn Relauncher> = Arc::new(MarksExplicitThenStuck { stop: stop.clone() });
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &q,
+            &MonitorConfig::default(),
+            &cfg("unless-stopped"),
+            &stop,
+            &Events::default(),
+        )
+        .unwrap();
+        let SuperviseOutcome::Stopped {
+            late,
+            restarts,
+            explicit_stop_pending,
+            ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert!(explicit_stop_pending);
+        assert_eq!(restarts, 0);
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert_eq!(late.take().len(), 1);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.status().state(), ContainerState::Stopped);
+        assert_eq!(g.explicit_stop(), ExplicitStop::NotRecorded);
+    }
+
+    /// SUP-9・SUP-3・契約 14・#2440: `Running` の記録直後に取り消しが届き terminate が失敗した場合も、記録は
+    /// `Running(新 pid)` のまま監視権だけ返し、明示 stop の記録は後始末側へ回す（`explicit_stop_pending`）。
+    /// 停止要求（hard stop）が同時にあれば明示 stop は残さない。
+    #[test]
+    fn sup9_explicit_stop_after_running_record_terminate_failure_is_pending() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        *st.explicit_on_restart_write.lock().unwrap() = Some(stop.clone());
+        let out = run_once(&st, Box::new(StuckProc(43)), &stop);
+        let SuperviseOutcome::Stopped {
+            restarts,
+            explicit_stop_pending,
+            ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert!(explicit_stop_pending);
+        assert_eq!(restarts, 1);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.status().state(), ContainerState::Running);
+        assert_eq!(g.explicit_stop(), ExplicitStop::NotRecorded);
+        drop(g);
+
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        *st.explicit_on_restart_write.lock().unwrap() = Some(stop.clone());
+        *st.stop_on_restart_write.lock().unwrap() = Some((stop.clone(), false));
+        let out = run_once(&st, Box::new(StuckProc(43)), &stop);
+        let SuperviseOutcome::Stopped {
+            explicit_stop_pending,
+            ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert!(!explicit_stop_pending);
     }
 
     /// 明示 stop の意図を立ててから `Err` を返す再 launch（残存プロセスなし）。

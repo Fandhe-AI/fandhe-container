@@ -85,8 +85,9 @@ use fandhe_container_core::oci_runtime::{
     recover_interrupted_start, take_unreaped_processes,
 };
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, ContainerStatus, ErrorCode, GetStateRequest, StartRequest,
-    StateRecord, StateRevision, StateStore, SupervisionState, TraitError, UpdateStateRequest,
+    ContainerId, ContainerState, ContainerStatus, ErrorCode, ExplicitStop, GetStateRequest,
+    StartRequest, StateRecord, StateRevision, StateStore, SupervisionState, TraitError,
+    UpdateStateRequest,
 };
 
 use crate::deadline_store::{DeadlineStore, LateWrites};
@@ -1657,6 +1658,88 @@ fn finish_disposed(
     }
 }
 
+/// [`finish_disposed`] に加え、`explicit_stop_pending`（再 launch 中に受理した明示 stop が未記録）なら、回収と
+/// `Stopped` の記録を確かめられた後に世代を照合して「明示 stop 済み」を残す（#2440・SUP-9・SUP-3・契約 14）。
+/// 回収を確かめられなかった場合は記録を動かさず、残せなかった場合は `Internal`（fail-closed。残さないと
+/// `unless-stopped` が停止済みのコンテナを再起動対象にしてしまう）。
+fn finish_disposed_explicit(
+    store: &Arc<dyn StateStore>,
+    id: &ContainerId,
+    instance: Option<StateRevision>,
+    disposed: (bool, Vec<NonZeroU32>),
+    code: u8,
+    explicit_stop_pending: bool,
+) -> u8 {
+    let internal = exit_code_for(ErrorCode::Internal).get();
+    let (ok, reaped) = disposed;
+    if !(ok && mark_stopped(store, id, instance, &reaped)) {
+        return internal;
+    }
+    if explicit_stop_pending && !persist_explicit_stop(store, id, instance) {
+        return internal;
+    }
+    code
+}
+
+/// [`persist_explicit_stop`] の待ちの上限（REPAIR-5）。
+const PERSIST_EXPLICIT_STOP_LIMIT: Duration = Duration::from_secs(10);
+
+/// `Stopped` の記録へ「明示 stop 済み」を書き足す。cgroup の instance が start 時と一致し、`Stopped` で、
+/// 他の監視者が居ない記録だけに書く（同じ ID の再作成・別処理の再起動を取り違えない。SEC-1）。別世代・別の監視者の
+/// 記録なら書かずに `true`（`mark_stopped` と同じ扱い）。`Stopped` でない・読み書きが続けて失敗したら `false`。
+fn persist_explicit_stop(
+    store: &Arc<dyn StateStore>,
+    id: &ContainerId,
+    instance: Option<StateRevision>,
+) -> bool {
+    let (store, id) = (Arc::clone(store), id.clone());
+    run_bounded(
+        "supervisor-persist-explicit-stop",
+        PERSIST_EXPLICIT_STOP_LIMIT,
+        move || {
+            for attempt in 1..=MARK_STOPPED_ATTEMPTS {
+                match try_persist_explicit_stop(store.as_ref(), &id, instance) {
+                    Ok(()) => return true,
+                    Err(code) => {
+                        log_event("persist_explicit_stop_failed", Some(code));
+                        if attempt < MARK_STOPPED_ATTEMPTS {
+                            std::thread::sleep(MARK_STOPPED_RETRY_INTERVAL);
+                        }
+                    }
+                }
+            }
+            false
+        },
+    )
+}
+
+/// [`persist_explicit_stop`] の 1 回の試行。
+fn try_persist_explicit_stop(
+    store: &dyn StateStore,
+    id: &ContainerId,
+    instance: Option<StateRevision>,
+) -> Result<(), ErrorCode> {
+    let record = store
+        .get(&GetStateRequest::new(id.clone()))
+        .map_err(|e| e.code())?;
+    let same_instance = record.cgroup().map(|c| c.instance()) == instance;
+    let foreign = record
+        .supervision()
+        .supervisor_pid()
+        .is_some_and(|p| p.get() != std::process::id());
+    if !same_instance || foreign {
+        log_event("persist_explicit_stop_skipped", None);
+        return Ok(());
+    }
+    if record.status().state() != ContainerState::Stopped {
+        return Err(ErrorCode::FailedPrecondition);
+    }
+    let req = UpdateStateRequest::new(record.status().clone(), record.revision())
+        .with_supervision(record.supervision())
+        .with_explicit_stop(ExplicitStop::Recorded);
+    store.update(&req).map(drop).map_err(|e| e.code())
+}
+
 /// 手順 10: 監視と restart。返り値は supervisor プロセスの終了コード（0 = 記録して正常に終わった）。
 ///
 /// 監視の結果が返したハンドルの所有者は本入口なので、終了の前に terminate して回収を確かめる。
@@ -1799,19 +1882,30 @@ fn supervise_running(
             exit_code_for(e.code()).get()
         }
         Ok(SuperviseOutcome::Finished { .. }) => 0,
-        Ok(SuperviseOutcome::Stopped { process, late, .. }) => {
+        Ok(SuperviseOutcome::Stopped {
+            process,
+            late,
+            explicit_stop_pending,
+            ..
+        }) => {
             let disposed = dispose(process, Some(&late), timeouts);
-            finish_disposed(&store, &id, instance, disposed, 0)
+            finish_disposed_explicit(&store, &id, instance, disposed, 0, explicit_stop_pending)
         }
-        Ok(SuperviseOutcome::RelaunchFailed { error, late, .. }) => {
+        Ok(SuperviseOutcome::RelaunchFailed {
+            error,
+            late,
+            explicit_stop_pending,
+            ..
+        }) => {
             log_event("restart_failed", Some(error.code()));
             let disposed = dispose(None, Some(&late), timeouts);
-            finish_disposed(
+            finish_disposed_explicit(
                 &store,
                 &id,
                 instance,
                 disposed,
                 exit_code_for(error.code()).get(),
+                explicit_stop_pending,
             )
         }
         Ok(SuperviseOutcome::RestartUnrecorded {
@@ -3097,6 +3191,126 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_core::traits::{
+        CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ListStateRequest, StateList,
+    };
+
+    /// 1 レコードを持つメモリ上のストア（`update` は status・監視・明示 stop を反映して revision を進める）。
+    struct OneRecord(Mutex<StateRecord>);
+
+    impl OneRecord {
+        fn stopped() -> Arc<Self> {
+            let rec = StateRecord::new(
+                ContainerStatus::stopped(ContainerId::new("c1").expect("id"), None),
+                std::env::temp_dir().join("b"),
+                StateRevision::from_raw(1),
+            )
+            .expect("record");
+            Arc::new(Self(Mutex::new(rec)))
+        }
+    }
+
+    impl StateStore for OneRecord {
+        fn create(&self, _: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+            Err(TraitError::new(ErrorCode::Internal, "unused"))
+        }
+        fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+            let mut g = self.0.lock().unwrap();
+            if g.revision() != req.expected_revision() {
+                return Err(TraitError::new(ErrorCode::FailedPrecondition, "stale"));
+            }
+            let explicit = req.explicit_stop().unwrap_or(g.explicit_stop());
+            let next = StateRecord::new(
+                req.status().clone(),
+                g.bundle().to_path_buf(),
+                StateRevision::from_raw(g.revision().value() + 1),
+            )
+            .expect("record")
+            .with_supervision(req.supervision().unwrap_or_else(|| g.supervision()))
+            .with_explicit_stop(explicit);
+            *g = next.clone();
+            Ok(next)
+        }
+        fn get(&self, _: &GetStateRequest) -> Result<StateRecord, TraitError> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+        fn list(&self, _: &ListStateRequest) -> Result<StateList, TraitError> {
+            Err(TraitError::new(ErrorCode::Internal, "unused"))
+        }
+        fn delete(&self, _: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+            Err(TraitError::new(ErrorCode::Internal, "unused"))
+        }
+    }
+
+    /// SUP-9・SUP-3・契約 14・#2440: 再 launch 中に受理した明示 stop が未記録のまま回収だけ後始末で完了した経路
+    /// （最初の terminate 失敗後の再試行成功、待ち切れず後始末で回収完了）では、回収確認後に明示 stop を残し、
+    /// `unless-stopped` の再開が再起動対象にしない。
+    #[test]
+    fn sup9_2440_pending_explicit_stop_is_persisted_after_disposal() {
+        use crate::restart::{NoRestartReason, RestartDecision, evaluate_resume};
+        let id = ContainerId::new("c1").expect("id");
+        let st = OneRecord::stopped();
+        let store: Arc<dyn StateStore> = st.clone();
+        assert_eq!(
+            finish_disposed_explicit(&store, &id, None, (true, vec![]), 0, true),
+            0
+        );
+        let rec = st.0.lock().unwrap().clone();
+        assert_eq!(rec.explicit_stop(), ExplicitStop::Recorded);
+        assert_eq!(rec.status().state(), ContainerState::Stopped);
+        assert_eq!(
+            evaluate_resume(
+                crate::restart::RestartPolicy::UnlessStopped,
+                rec.explicit_stop()
+            ),
+            RestartDecision::DoNotRestart {
+                reason: NoRestartReason::ExplicitStop
+            }
+        );
+    }
+
+    /// SUP-9・#2440: 回収を確かめられなければ明示 stop を残さず非 0（INTERNAL）。pending でなければ記録を動かさない。
+    #[test]
+    fn sup9_2440_explicit_stop_not_persisted_when_disposal_unconfirmed_or_not_pending() {
+        let id = ContainerId::new("c1").expect("id");
+        let internal = exit_code_for(ErrorCode::Internal).get();
+        let st = OneRecord::stopped();
+        let store: Arc<dyn StateStore> = st.clone();
+        assert_eq!(
+            finish_disposed_explicit(&store, &id, None, (false, vec![]), 0, true),
+            internal
+        );
+        assert_eq!(
+            st.0.lock().unwrap().explicit_stop(),
+            ExplicitStop::NotRecorded
+        );
+        assert_eq!(
+            finish_disposed_explicit(&store, &id, None, (true, vec![]), 0, false),
+            0
+        );
+        assert_eq!(
+            st.0.lock().unwrap().explicit_stop(),
+            ExplicitStop::NotRecorded
+        );
+    }
+
+    /// SUP-9・#2440: 記録が `Stopped` でない（残せない）なら fail-closed で非 0。
+    #[test]
+    fn sup9_2440_persist_fails_closed_when_record_not_stopped() {
+        let id = ContainerId::new("c1").expect("id");
+        let st = OneRecord::stopped();
+        *st.0.lock().unwrap() = StateRecord::new(
+            ContainerStatus::running(id.clone(), NonZeroU32::new(43)),
+            std::env::temp_dir().join("b"),
+            StateRevision::from_raw(1),
+        )
+        .expect("record");
+        let store: Arc<dyn StateStore> = st.clone();
+        assert_eq!(
+            finish_disposed_explicit(&store, &id, None, (true, vec![]), 0, true),
+            exit_code_for(ErrorCode::Internal).get()
+        );
+    }
 
     /// 書かれたバイト列を共有する書き手(#2008 の試験用)。
     #[derive(Clone, Default)]

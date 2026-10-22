@@ -34,6 +34,7 @@
 //! tar 展開（TASK-52.3・OCI-1・#409）は子モジュール `extract` が担う（呼び出し契約と未実装項目はそちらを参照）。
 //! 複数レイヤーの重ね合わせ展開（TASK-52.4・#410）も同モジュールの `extract_layers` / `extract_layer_blobs`。
 
+mod anchored;
 pub mod extract;
 pub mod idmap;
 

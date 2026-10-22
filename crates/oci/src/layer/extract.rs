@@ -28,7 +28,8 @@
 //! - `root` は呼び出し側が排他的に所有する既存の空ディレクトリ（ステージング）で、`root` 自体が
 //!   symlink であってはならない。空でなければ `FailedPrecondition` で拒否する（別表記の衝突の判定が
 //!   「`root` 配下の実在項目はすべてこの展開が作った」ことに依るため）。別プロセスが同時に `root` を
-//!   書き換える競合（TOCTOU）は防げない。
+//!   書き換える競合（TOCTOU）は、Linux の x86_64 / aarch64 では変更操作を `root` のディレクトリ fd 起点に閉じて
+//!   防ぐ（下記「ディレクトリ fd 起点の解決」）。それ以外のホストでは防げない。
 //! - 失敗時は部分的な展開物が残るため、呼び出し側が `root` ごと破棄すること。
 //! - 複数レイヤーは `extract_layers` / `extract_layer_blobs` で下位から上位の順に同一 `root` へ重ねる
 //!   （TASK-52.4・#410）。空であることの検査は最初のレイヤーの前だけで、別表記の索引・遅延ディレクトリ mode・
@@ -97,6 +98,17 @@
 //!   これは #2312 での安全側の判断であり、オーナー承認済みの仕様ではない。symlink 経由で予約名のディレクトリが
 //!   物理的に作られた後にそれを字面で指す hardlink も、同じく拒否する。
 //!
+//! # ディレクトリ fd 起点の解決（SEC-5・OCI-1・OCI-2・#2437）
+//! 各コンポーネントの `lstat` による確認（`resolve_dir`・別表記の検出・型の衝突の判定）は従来どおりパスで行うが、
+//! 変更操作（ディレクトリ・ファイル・symlink・hardlink の作成、削除、`chown`、mode の適用、whiteout の削除）は
+//! `layer::anchored` の `AnchoredRoot` を通し、展開の開始時に 1 回だけ開いた `root` の fd を起点に行う。親ディレクトリは
+//! 解決済みの物理コンポーネント列から `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS |
+//! RESOLVE_NO_XDEV)` で開き直すため、確認の後に祖先が symlink・非ディレクトリ・別マウントへ差し替えられると
+//! `FailedPrecondition`（`an extraction path changed during extraction`）で拒否し、`root` の外へ書き込まない。
+//! `openat2` が使えないカーネル（5.6 未満）・seccomp は、パス起点へ縮退せず展開の開始前に `Unimplemented` で
+//! 拒否する（`Strip` でも同じ）。macOS・Windows・Linux の他アーキテクチャは従来のパス起点のまま
+//! （Linux の他アーキテクチャは定数を確かめていないため `Unimplemented`）。
+//!
 //! # 別表記の衝突（IO-5）
 //! 大文字小文字非区別の FS（Windows・macOS の既定）では `f` と `F`、正規化非区別の FS（APFS）では NFC と NFD の
 //! 綴りが同じ実体を指す。綴りの比較（`PathBuf` の一致）だけで同一性を判断すると、`f` の後の hardlink
@@ -149,6 +161,14 @@
 //!   `PreserveIfOwnerMapped`（`chown` しない 1 行の写像）は従来どおり。
 //! - 0700 の祖先ディレクトリで閉じ込めを判定する方式。`root` が 0700 のため、複数範囲の写像でもコンテナ内の
 //!   非 root ユーザーは `/` を辿れない。
+//! - macOS・Windows・Linux の他アーキテクチャでのディレクトリ fd 起点の解決（現状はパス起点で、確認から使用までの
+//!   TOCTOU を防げない。unix 全体なら `openat(O_DIRECTORY | O_NOFOLLOW)` の 1 コンポーネントずつの走査で統一できる）。
+//!   特殊ビットの保持は Linux 限定のため、SEC-5 の TOCTOU は Linux 固有である。
+//! - 公開の `remove_extracted_tree`（呼び出し側が `root` ごと破棄する道具）の fd 起点化。パス起点のままで、権限を
+//!   戻しながら消す。
+//! - 綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する別表記は衝突として扱わない。IO-5）。HFS+ のように
+//!   保存時に名前を書き換える FS は前提外。
+//! - Windows ホストでの symlink エントリ（`Unimplemented` で拒否する）。
 //!
 //! # 通常ファイルの setuid / setgid / sticky（SEC-5・SEC-1・#1810）
 //! 既定（`SpecialBitsPolicy::Strip`）は下位 9 ビット（`FILE_MODE_MASK`）だけを適用し、落とした件数を
@@ -162,6 +182,10 @@
 //! - setgid: 書いたファイルの所有 uid と gid がともに 0 でなく、tar の gid を写像した host gid と一致すること
 //!   （rootful〔所有 uid 0〕は setuid / setgid を常に落とす。#2251 P2-1）。
 //! - sticky: 上記のポリシー全体の条件を満たすこと。
+//! - 判定の直前と、ビットを付けた直後に、開いた `root` の fd の `fstat` で「`root` が開始時と同じ所有者の 0700」を
+//!   確かめ直す。変わっていたら、そのファイルを含め以後のビットはすべて落とし（`SpecialBitsDecision::
+//!   RootChangedDuringExtraction`）、保持済みのビットが 1 件でもあれば全レイヤーの展開後に `FailedPrecondition` で
+//!   展開全体を拒否する（遡って外さず fail-closed。`Err` を受けた呼び出し側が `root` ごと破棄する）。
 //! - 適用後に mode を読み戻し、ビットが残っていなければ適用したことにしない。ビットごとの件数は
 //!   `SpecialBitsOutcome::preserved_bits` / `stripped_bits` に返す（一部のビットだけが落ちても残ったビットを
 //!   「落とした」と数えない。#2251 P2-6）。
@@ -176,14 +200,10 @@
 //!   にしか効かず、`root` が 0700 なのでほかのホストユーザーは辿れない。
 //!
 //! ディレクトリの mode（sticky・setgid を含む）はポリシーに関係なくそのまま適用する。
-//! - ディレクトリ fd 起点（`openat2` の `RESOLVE_IN_ROOT` 等）の解決。libc 系の依存承認後の後続課題。
-//! - 綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する別表記は衝突として扱わない。IO-5）。HFS+ のように
-//!   保存時に名前を書き換える FS は前提外。
-//! - Windows ホストでの symlink エントリ（`Unimplemented` で拒否する）。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -192,6 +212,7 @@ use tar::{Archive, EntryType};
 pub use super::idmap::{IdMap, IdRange};
 use sha2::{Digest as _, Sha256};
 
+use super::anchored::{AnchorHooks, AnchoredRoot, map_at_err, path_changed};
 use super::{
     DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, GzipLayerReader, LayerMediaType, PlainLayerReader,
     VerifiedLayerBlob, oci_error_from_layer_io, open_gzip_layer,
@@ -441,6 +462,9 @@ pub enum SpecialBitsDecision {
     RootAccessibleByOthers,
     /// ファイルごとの条件で判定した。
     Evaluated,
+    /// 展開中に `root` の所有者または 0700 が変わったことを検出し、以後のファイルはすべて落とした（#2437）。
+    /// 検出前に保持済みのビットがあれば、展開は `FailedPrecondition` で終わる（結果は返らない）。
+    RootChangedDuringExtraction,
 }
 
 /// 特殊ビットの扱いの結果。
@@ -994,10 +1018,11 @@ pub fn extract_image_layers_with_options(
 /// 省くと root が 0700 の実行ユーザー所有のまま公開され、期待所有者の照合が常に食い違う（SEC-5・OCI-1）。
 fn extract_zero_layers(root: &Path, setup: &SpecialSetup) -> Result<Vec<ExtractedLayer>, OciError> {
     let own = setup.owner_ctx()?;
-    check_root_empty(root)?;
+    let anchor = AnchoredRoot::open(root, setup.anchor)?;
+    check_root_empty(&anchor)?;
     if let Some(o) = &own {
         let ids = o.resolve((Some(0), Some(0)))?;
-        (o.fns.lchown)(root, ids.0, ids.1).map_err(|e| chown_err(&e))?;
+        (o.fns.lchown)(&anchor, &[], ids.0, ids.1).map_err(|e| chown_err(&e))?;
     }
     Ok(Vec::new())
 }
@@ -1197,14 +1222,14 @@ enum Marker {
 
 /// パス 2 で削除を実行する前に、下位ツリーで解決し終えた削除対象。
 enum Removal {
-    /// `parent`（ID）直下の `name`（物理パスは `path`）を木ごと消す。
+    /// `parent`（ID。物理コンポーネント列は `parent_comps`）直下の `name` を木ごと消す。
     Tree {
-        path: PathBuf,
+        parent_comps: Vec<OsString>,
         parent: u64,
         name: OsString,
     },
-    /// ディレクトリ `path`（ID は `id`）の中身を消す。
-    Contents { path: PathBuf, id: u64 },
+    /// ディレクトリ（`root` からの物理コンポーネント列は `comps`、ID は `id`）の中身を消す。
+    Contents { comps: Vec<OsString>, id: u64 },
 }
 
 /// tar エントリ 1 件の検証済みの処理内容（パス 1 とパス 3 で共通の `plan_entry` が作る）。
@@ -1229,12 +1254,14 @@ struct ResolvedDir {
     id: u64,
 }
 
-/// 遅延するディレクトリ（物理パス, mode, `chown` 先のホストの (uid, gid)）。
-type DeferredDir = (PathBuf, u32, Option<(u32, u32)>);
+/// 遅延するディレクトリ（`root` からの物理コンポーネント列, mode, `chown` 先のホストの (uid, gid)）。
+type DeferredDir = (Vec<OsString>, u32, Option<(u32, u32)>);
 
 /// 親ディレクトリの解決・種別ごとの処理を束ねる状態。
 struct Extractor<'a> {
     root: &'a Path,
+    /// `root` を開いたディレクトリ fd。変更操作はすべてここを起点に行う（`AnchoredRoot`）。
+    anchor: AnchoredRoot,
     limits: ExtractLimits,
     entries: u64,
     bytes: u64,
@@ -1662,16 +1689,16 @@ fn apply_file_mode(_f: &fs::File, _mode: u32) -> Result<(), OciError> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn apply_dir_mode(path: &Path, mode: u32) -> Result<(), OciError> {
-    fs::set_permissions(path, mode_perms(mode)).map_err(|e| map_fs_err(&e))
+/// `comps`（`root` からの物理コンポーネント列）のディレクトリの mode を `root` の fd 起点で適用する。
+fn apply_dir_mode(anchor: &AnchoredRoot, comps: &[OsString], mode: u32) -> Result<(), OciError> {
+    anchor.set_dir_mode(comps, mode).map_err(|e| map_at_err(&e))
 }
 
-#[cfg(not(unix))]
-// 非 unix ホストと unix ホストで関数シグネチャ（Result）をそろえ、呼び出し側を cfg 分岐させないため。
-#[allow(clippy::unnecessary_wraps)]
-fn apply_dir_mode(_path: &Path, _mode: u32) -> Result<(), OciError> {
-    Ok(())
+/// 親のコンポーネント列と最終コンポーネントを連結する。
+fn full_comps(parent: &[OsString], name: &OsStr) -> Vec<OsString> {
+    let mut v = parent.to_vec();
+    v.push(name.to_os_string());
+    v
 }
 
 /// 通常ファイルへ適用する mode のマスク（下位 9 ビット）。
@@ -1709,7 +1736,7 @@ fn host_owner(_m: &fs::Metadata) -> (u32, u32) {
 #[derive(Clone, Copy)]
 struct ChownFns {
     fchown: fn(&File, u32, u32) -> std::io::Result<()>,
-    lchown: fn(&Path, u32, u32) -> std::io::Result<()>,
+    lchown: fn(&AnchoredRoot, &[OsString], u32, u32) -> std::io::Result<()>,
     readback: fn(&File) -> std::io::Result<(u32, u32)>,
 }
 
@@ -1719,7 +1746,7 @@ impl ChownFns {
         use std::os::unix::fs::MetadataExt as _;
         Self {
             fchown: |f, u, g| std::os::unix::fs::fchown(f, Some(u), Some(g)),
-            lchown: |p, u, g| std::os::unix::fs::lchown(p, Some(u), Some(g)),
+            lchown: |a, c, u, g| a.lchown(c, u, g),
             readback: |f| f.metadata().map(|m| (m.uid(), m.gid())),
         }
     }
@@ -1734,7 +1761,7 @@ impl ChownFns {
         }
         Self {
             fchown: |_, _, _| unsupported(),
-            lchown: |_, _, _| unsupported(),
+            lchown: |_, _, _, _| unsupported(),
             readback: |_| unsupported(),
         }
     }
@@ -1923,6 +1950,8 @@ struct SpecialSetup {
     chown: ChownFns,
     /// `ChownInUserNamespace` の開始前検証が読む `/proc/self` の見え方（試験だけが差し替える）。
     ns_probe: fn() -> Result<UserNsView, OciError>,
+    /// `root` の fd 起点の操作の差し替え口（試験だけが差し替える。`AnchoredRoot` を参照）。
+    anchor: AnchorHooks,
 }
 
 impl SpecialSetup {
@@ -1934,6 +1963,7 @@ impl SpecialSetup {
             ownership: OwnershipPolicy::Keep,
             chown: ChownFns::host(),
             ns_probe: host_user_ns_view,
+            anchor: AnchorHooks::host(),
         }
     }
 
@@ -2010,7 +2040,7 @@ impl SpecialCtx {
 }
 
 /// ポリシー全体の条件（ポリシー・ホスト OS・`root` の権限）を評価する。`check_root_empty` の後に 1 回だけ呼ぶ。
-fn eval_special_ctx(setup: &SpecialSetup, root: &Path) -> Result<SpecialCtx, OciError> {
+fn eval_special_ctx(setup: &SpecialSetup, anchor: &AnchoredRoot) -> Result<SpecialCtx, OciError> {
     let mut ctx = SpecialCtx::strip();
     ctx.owner_of = setup.owner_of;
     let (mapped, chowned) = match setup.policy {
@@ -2024,7 +2054,7 @@ fn eval_special_ctx(setup: &SpecialSetup, root: &Path) -> Result<SpecialCtx, Oci
         use std::os::unix::fs::PermissionsExt as _;
         // 0700 なら祖先の権限に依らず、ほかのユーザーは root より下へ入れない。
         ctx.decision = SpecialBitsDecision::RootAccessibleByOthers;
-        let m = fs::symlink_metadata(root).map_err(|e| map_fs_err(&e))?;
+        let m = anchor.root_meta().map_err(|e| map_fs_err(&e))?;
         if m.is_dir() && m.permissions().mode() & 0o077 == 0 {
             ctx.decision = SpecialBitsDecision::Evaluated;
             ctx.ranges = mapped;
@@ -2038,7 +2068,7 @@ fn eval_special_ctx(setup: &SpecialSetup, root: &Path) -> Result<SpecialCtx, Oci
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (mapped, chowned, root);
+        let _ = (mapped, chowned, anchor);
     }
     Ok(ctx)
 }
@@ -2216,19 +2246,6 @@ fn needs_deferral(mode: u32) -> bool {
     mode & 0o700 != 0o700
 }
 
-#[cfg(unix)]
-fn create_symlink(target: &Path, link: &Path) -> Result<(), OciError> {
-    std::os::unix::fs::symlink(target, link).map_err(|e| map_fs_err(&e))
-}
-
-#[cfg(not(unix))]
-fn create_symlink(_target: &Path, _link: &Path) -> Result<(), OciError> {
-    Err(err(
-        OciErrorCode::Unimplemented,
-        "symlink entries are not supported on this host",
-    ))
-}
-
 impl Extractor<'_> {
     /// `dir`（ID は `dir_id`）直下の `name`（物理パスは `path`）を `lstat` する。無ければ `None`、
     /// あればメタデータと `NameIndex` の ID を返す。
@@ -2260,12 +2277,17 @@ impl Extractor<'_> {
         }
     }
 
-    /// `parent`（ID）直下の `name`（物理パスは `path`）を木ごと消し、配下の登録・遅延 mode を外す。
+    /// `parent`（ID。物理コンポーネント列は `parent_comps`）直下の `name` を木ごと消し、配下の登録・遅延 mode を外す。
     ///
     /// whiteout の適用（パス 2）と、下位レイヤー由来のノードの置換（パス 3。Changeset over existing files）が使う。
-    /// 削除は symlink を追従しない。存在しなければ何もしない。
-    fn remove_tree(&mut self, parent: u64, name: &OsStr, path: &Path) -> Result<(), OciError> {
-        whiteout::remove_tree_nofollow(path)?;
+    /// 削除は `root` の fd 起点で、symlink を追従しない。存在しなければ何もしない。
+    fn remove_tree(
+        &mut self,
+        parent: u64,
+        parent_comps: &[OsString],
+        name: &OsStr,
+    ) -> Result<(), OciError> {
+        self.anchor.remove_tree(parent_comps, name)?;
         let ids = self.names.forget_tree(parent, name);
         self.drop_ids(ids);
         Ok(())
@@ -2310,7 +2332,10 @@ impl Extractor<'_> {
                             "too many symbolic links while resolving an entry path",
                         ));
                     }
-                    let target = fs::read_link(&cand).map_err(|e| map_fs_err(&e))?;
+                    let target = self
+                        .anchor
+                        .read_link(&resolved, &c)
+                        .map_err(|e| map_at_err(&e))?;
                     let mut pending = Vec::new();
                     for comp in target.components() {
                         match comp {
@@ -2331,8 +2356,10 @@ impl Extractor<'_> {
                 Some((_, id)) if create && !self.layer_nodes.contains(&id) => {
                     // 下位レイヤー由来の非ディレクトリの位置に暗黙の親ディレクトリを作る（`d` の後の上位の `d/y`）。
                     // 非ディレクトリなので配下の登録は無く、ID はそのまま使う。
-                    fs::remove_file(&cand).map_err(|e| map_fs_err(&e))?;
-                    self.create_implicit_dir(&cand, id)?;
+                    self.anchor
+                        .unlink(&resolved, &c)
+                        .map_err(|e| map_at_err(&e))?;
+                    self.create_implicit_dir(&resolved, &c, id)?;
                     self.layer_nodes.insert(id);
                     resolved.push(c);
                     ids.push(id);
@@ -2348,7 +2375,7 @@ impl Extractor<'_> {
                         return Err(err(OciErrorCode::NotFound, "extraction path not found"));
                     }
                     let id = self.names.insert(parent_id, &c)?;
-                    self.create_implicit_dir(&cand, id)?;
+                    self.create_implicit_dir(&resolved, &c, id)?;
                     self.layer_nodes.insert(id);
                     resolved.push(c);
                     ids.push(id);
@@ -2366,13 +2393,21 @@ impl Extractor<'_> {
     ///
     /// `ChownMapped` のときは tar に所有者が無いため、コンテナ内 0:0 を写したホストの ID を全レイヤーの後に
     /// `chown` する（イメージの慣行の root:root。写像は必ずコンテナ内 0 を含む）。`id` はこのノードの `NameIndex` の ID。
-    fn create_implicit_dir(&mut self, path: &Path, id: u64) -> Result<(), OciError> {
-        fs::create_dir(path).map_err(|e| map_fs_err(&e))?;
-        apply_dir_mode(path, IMPLICIT_DIR_MODE)?;
+    fn create_implicit_dir(
+        &mut self,
+        parent: &[OsString],
+        name: &OsStr,
+        id: u64,
+    ) -> Result<(), OciError> {
+        self.anchor
+            .mkdir(parent, name)
+            .map_err(|e| map_at_err(&e))?;
+        let full = full_comps(parent, name);
+        apply_dir_mode(&self.anchor, &full, IMPLICIT_DIR_MODE)?;
         if let Some(o) = &self.own {
             let owner = o.resolve((Some(0), Some(0)))?;
             self.deferred_dirs
-                .insert(id, (path.to_path_buf(), IMPLICIT_DIR_MODE, Some(owner)));
+                .insert(id, (full, IMPLICIT_DIR_MODE, Some(owner)));
         }
         Ok(())
     }
@@ -2385,6 +2420,7 @@ impl Extractor<'_> {
     fn clear_for_non_dir(
         &mut self,
         dir_id: u64,
+        parent_comps: &[OsString],
         name: &OsStr,
         path: &Path,
     ) -> Result<(), OciError> {
@@ -2396,9 +2432,12 @@ impl Extractor<'_> {
                         "a directory already exists at the entry path",
                     ));
                 }
-                self.remove_tree(dir_id, name, path)
+                self.remove_tree(dir_id, parent_comps, name)
             }
-            Some(_) => fs::remove_file(path).map_err(|e| map_fs_err(&e)),
+            Some(_) => self
+                .anchor
+                .unlink(parent_comps, name)
+                .map_err(|e| map_at_err(&e)),
             None => Ok(()),
         }
     }
@@ -2420,28 +2459,35 @@ impl Extractor<'_> {
             // 既存もエントリもディレクトリなら属性だけを置き換える（Changeset over existing files）。
             Some((m, id)) if m.is_dir() => id,
             Some((_, id)) => {
-                fs::remove_file(&path).map_err(|e| map_fs_err(&e))?;
-                fs::create_dir(&path).map_err(|e| map_fs_err(&e))?;
+                self.anchor
+                    .unlink(&dir.comps, &name)
+                    .map_err(|e| map_at_err(&e))?;
+                self.anchor
+                    .mkdir(&dir.comps, &name)
+                    .map_err(|e| map_at_err(&e))?;
                 id
             }
             None => {
                 let id = self.names.insert(dir.id, &name)?;
-                fs::create_dir(&path).map_err(|e| map_fs_err(&e))?;
+                self.anchor
+                    .mkdir(&dir.comps, &name)
+                    .map_err(|e| map_at_err(&e))?;
                 id
             }
         };
         self.layer_nodes.insert(id);
         // 同じディレクトリの再定義は後勝ち。先の遅延 mode を残すと finish_dirs が後の mode を上書きする。
         self.deferred_dirs.remove(&id);
+        let full = full_comps(&dir.comps, &name);
         if needs_deferral(mode) {
             // umask 等で所有者の rwx が欠けても子を作れるよう、finish_dirs まで一時的に 0700 にする。
-            apply_dir_mode(&path, 0o700)?;
-            self.deferred_dirs.insert(id, (path, mode, owner));
+            apply_dir_mode(&self.anchor, &full, 0o700)?;
+            self.deferred_dirs.insert(id, (full, mode, owner));
             Ok(())
         } else {
-            apply_dir_mode(&path, mode)?;
+            apply_dir_mode(&self.anchor, &full, mode)?;
             if owner.is_some() {
-                self.deferred_dirs.insert(id, (path, mode, owner));
+                self.deferred_dirs.insert(id, (full, mode, owner));
             }
             Ok(())
         }
@@ -2472,15 +2518,14 @@ impl Extractor<'_> {
             })?;
         let dir = self.resolve_dir(&parent, true)?;
         let path = join_resolved(self.root, &dir.comps, &name);
-        self.clear_for_non_dir(dir.id, &name, &path)?;
+        self.clear_for_non_dir(dir.id, &dir.comps, &name, &path)?;
         let id = self.names.insert(dir.id, &name)?;
         self.layer_nodes.insert(id);
-        // create_new は O_CREAT|O_EXCL で、最終コンポーネントの symlink を追従しない。
-        let mut f = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|e| map_fs_err(&e))?;
+        // O_CREAT|O_EXCL|O_NOFOLLOW で、最終コンポーネントの symlink を追従しない。親は `root` の fd 起点で開き直す。
+        let mut f = self
+            .anchor
+            .create_file(&dir.comps, &name)
+            .map_err(|e| map_at_err(&e))?;
         let mut buf = vec![0u8; COPY_BUF_LEN];
         let mut written = 0u64;
         while written < size {
@@ -2523,6 +2568,13 @@ impl Extractor<'_> {
             (None, _) => None,
         };
         let requested = mode & SPECIAL_BITS;
+        // 判定の直前に `root` の所有者と 0700 を fd で確かめ直す。変わっていたら以後は一方向に落とす（SEC-5・#2437）。
+        if requested != 0
+            && self.special.decision == SpecialBitsDecision::Evaluated
+            && !self.root_still_private()
+        {
+            self.special.decision = SpecialBitsDecision::RootChangedDuringExtraction;
+        }
         let keep = if requested != 0 && self.special.decision == SpecialBitsDecision::Evaluated {
             if self.special.chowned_mode {
                 match (&self.own, chowned_owner) {
@@ -2550,6 +2602,11 @@ impl Extractor<'_> {
             0
         };
         apply_file_mode(&f, mode & (FILE_MODE_MASK | keep))?;
+        if keep != 0 && !self.root_still_private() {
+            // 特殊ビットを付けた直後にも確かめる。変わっていたら付けたビットを外し、以後も落とす。
+            self.special.decision = SpecialBitsDecision::RootChangedDuringExtraction;
+            apply_file_mode(&f, mode & FILE_MODE_MASK)?;
+        }
         if requested != 0 {
             // カーネルが黙って落とした場合（所属しない gid への setgid 等）は適用したことにしない。
             // 一部のビットだけが落ちた場合、残ったビットは preserved_bits、落ちたビットだけを stripped_bits に
@@ -2600,13 +2657,25 @@ impl Extractor<'_> {
             }
         }
         let path = join_resolved(self.root, &dir.comps, &name);
-        self.clear_for_non_dir(dir.id, &name, &path)?;
+        self.clear_for_non_dir(dir.id, &dir.comps, &name, &path)?;
         let id = self.names.insert(dir.id, &name)?;
         self.layer_nodes.insert(id);
-        create_symlink(Path::new(&bytes_to_os(target)?), &path)?;
+        self.anchor
+            .symlink(&dir.comps, &name, &bytes_to_os(target)?)
+            .map_err(|e| {
+                if e.kind() == ErrorKind::Unsupported {
+                    err(
+                        OciErrorCode::Unimplemented,
+                        "symlink entries are not supported on this host",
+                    )
+                } else {
+                    map_at_err(&e)
+                }
+            })?;
         if let (Some(o), Some(ids)) = (&self.own, owner) {
             // symlink 自体の所有者を変える（リンク先を追従しない）。mode は扱わない。
-            (o.fns.lchown)(&path, ids.0, ids.1).map_err(|e| chown_err(&e))?;
+            (o.fns.lchown)(&self.anchor, &full_comps(&dir.comps, &name), ids.0, ids.1)
+                .map_err(|e| chown_err(&e))?;
             self.chowned = self.chowned.saturating_add(1);
         }
         Ok(())
@@ -2644,10 +2713,22 @@ impl Extractor<'_> {
         if tpath == path {
             return Ok(());
         }
-        self.clear_for_non_dir(dir.id, &name, &path)?;
+        self.clear_for_non_dir(dir.id, &dir.comps, &name, &path)?;
         let id = self.names.insert(dir.id, &name)?;
         self.layer_nodes.insert(id);
-        fs::hard_link(&tpath, &path).map_err(|e| map_fs_err(&e))
+        self.anchor
+            .hardlink(&tdir.comps, &tname, &dir.comps, &name)
+            .map_err(|e| map_at_err(&e))?;
+        // 参照先の確認からリンク作成までの間に、参照先が通常ファイル以外（symlink 等）へ差し替えられていないか
+        // 確かめる。違えば作ったリンクを消して拒否する（SEC-5・#2437）。
+        match self.anchor.is_regular_file(&dir.comps, &name) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                let _ = self.anchor.unlink(&dir.comps, &name);
+                Err(path_changed())
+            }
+            Err(e) => Err(map_at_err(&e)),
+        }
     }
 
     /// マーカーの親 `parent` を下位ツリーで解決する。親が無い・非ディレクトリなら `None`（下位に消す実体が無い）。
@@ -2690,7 +2771,7 @@ impl Extractor<'_> {
                     let path = join_resolved(self.root, &dir.comps, target);
                     if self.probe(dir.id, target, &path)?.is_some() {
                         plan.push(Removal::Tree {
-                            path,
+                            parent_comps: dir.comps,
                             parent: dir.id,
                             name: target.clone(),
                         });
@@ -2700,17 +2781,22 @@ impl Extractor<'_> {
                     let Some(dir) = self.resolve_marker_parent(parent)? else {
                         continue;
                     };
-                    let mut path = self.root.to_path_buf();
-                    path.extend(&dir.comps);
-                    plan.push(Removal::Contents { path, id: dir.id });
+                    plan.push(Removal::Contents {
+                        comps: dir.comps,
+                        id: dir.id,
+                    });
                 }
             }
         }
         for r in plan {
             match r {
-                Removal::Tree { path, parent, name } => self.remove_tree(parent, &name, &path)?,
-                Removal::Contents { path, id } => {
-                    whiteout::remove_dir_contents_nofollow(&path)?;
+                Removal::Tree {
+                    parent_comps,
+                    parent,
+                    name,
+                } => self.remove_tree(parent, &parent_comps, &name)?,
+                Removal::Contents { comps, id } => {
+                    self.anchor.remove_contents(&comps)?;
                     let ids = self.names.forget_children(id);
                     self.drop_ids(ids);
                 }
@@ -2725,29 +2811,65 @@ impl Extractor<'_> {
             .into_values()
             .collect();
         // 深い順。同じ深さはパス順で決定的にする。
-        dirs.sort_by(|(a, _, _), (b, _, _)| {
-            b.components()
-                .count()
-                .cmp(&a.components().count())
-                .then_with(|| a.cmp(b))
-        });
-        for (path, mode, owner) in dirs {
-            match fs::symlink_metadata(&path) {
-                Ok(m) if m.is_dir() => {
-                    // `chown` の後に mode を適用する（ディレクトリは `chown` で setgid を落とさないが、順序を固定する）。
-                    if let (Some(o), Some(ids)) = (&self.own, owner) {
-                        (o.fns.lchown)(&path, ids.0, ids.1).map_err(|e| chown_err(&e))?;
-                        self.chowned = self.chowned.saturating_add(1);
-                    }
-                    apply_dir_mode(&path, mode)?;
-                }
-                _ => {
-                    return Err(err(
-                        OciErrorCode::FailedPrecondition,
-                        "an extracted directory was replaced during extraction",
-                    ));
-                }
+        dirs.sort_by(|(a, _, _), (b, _, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        for (comps, mode, owner) in dirs {
+            // `root` の fd 起点で実ディレクトリであることを確かめる（symlink・差し替えは拒否）。
+            if self.anchor.check_dir(&comps).is_err() {
+                return Err(err(
+                    OciErrorCode::FailedPrecondition,
+                    "an extracted directory was replaced during extraction",
+                ));
             }
+            // `chown` の後に mode を適用する（ディレクトリは `chown` で setgid を落とさないが、順序を固定する）。
+            if let (Some(o), Some(ids)) = (&self.own, owner) {
+                (o.fns.lchown)(&self.anchor, &comps, ids.0, ids.1).map_err(|e| chown_err(&e))?;
+                self.chowned = self.chowned.saturating_add(1);
+            }
+            apply_dir_mode(&self.anchor, &comps, mode)?;
+        }
+        Ok(())
+    }
+
+    /// `root` が今も「展開の開始時と同じ所有者で、group / other に権限のない（0700）ディレクトリ」か。
+    ///
+    /// 特殊ビットを保持してよい前提（`SpecialBitsDecision::Evaluated`）が展開中も成り立つかを、開いた fd の `fstat`
+    /// で確かめ直す（パスを開き直さない）。確認できなければ偽（fail-closed）。特殊ビットの保持は Linux 限定のため、
+    /// 他の OS では常に偽。fstat と `fchmod` の間の窓は残る（`docs/design/oci-layer-special-bits.md`）。
+    #[cfg(target_os = "linux")]
+    fn root_still_private(&self) -> bool {
+        use std::os::unix::fs::PermissionsExt as _;
+        self.anchor.root_meta().is_ok_and(|m| {
+            m.is_dir()
+                && m.permissions().mode() & 0o077 == 0
+                && (self.special.owner_of)(&m).0 == self.special.root_uid
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn root_still_private(&self) -> bool {
+        false
+    }
+
+    /// 全レイヤーの展開後に、保持した特殊ビットの前提（`root` の所有者と 0700）が最後まで保たれたかを確かめる。
+    ///
+    /// 保持済みのビットが 1 件以上あるのに、展開中に前提が崩れた（検出済み、または今も崩れている）なら、既に付けた
+    /// ビットを遡って外す代わりに結果全体を `FailedPrecondition` で拒否する（fail-closed。呼び出し側が `root` ごと
+    /// 破棄する契約。#2437・SEC-5）。
+    fn verify_root_after_special_bits(&self) -> Result<(), OciError> {
+        // 要求の一部だけが残った（例: 06755 のうち setuid だけ）場合も保持済みとして数える。`preserved_special`
+        // は全ビットが残ったファイルだけが増えるため、判定には使わない。
+        let kept_any = self.preserved_special > 0
+            || self.preserved_bits.setuid > 0
+            || self.preserved_bits.setgid > 0
+            || self.preserved_bits.sticky > 0;
+        if kept_any
+            && (self.special.decision == SpecialBitsDecision::RootChangedDuringExtraction
+                || !self.root_still_private())
+        {
+            return Err(err(
+                OciErrorCode::FailedPrecondition,
+                "the extraction root changed while special mode bits were preserved",
+            ));
         }
         Ok(())
     }
@@ -2774,33 +2896,24 @@ impl Extractor<'_> {
             return Ok(());
         };
         let ids = o.resolve((Some(0), Some(0)))?;
-        (o.fns.lchown)(self.root, ids.0, ids.1).map_err(|e| chown_err(&e))?;
+        (o.fns.lchown)(&self.anchor, &[], ids.0, ids.1).map_err(|e| chown_err(&e))?;
         self.chowned = self.chowned.saturating_add(1);
         Ok(())
     }
 }
 
-/// `root` が既存の空ディレクトリであることを確かめる（最初のレイヤーの前に 1 回だけ呼ぶ）。
-fn check_root_empty(root: &Path) -> Result<(), OciError> {
-    match fs::symlink_metadata(root) {
-        Ok(m) if m.is_dir() => {}
-        Ok(_) => {
-            return Err(err(
-                OciErrorCode::InvalidArgument,
-                "extraction root is not a directory",
-            ));
-        }
-        Err(e) => return Err(map_fs_err(&e)),
-    }
+/// `root` が空であることを確かめる（最初のレイヤーの前に 1 回だけ呼ぶ）。`root` がディレクトリであること
+/// （symlink でないこと）は `AnchoredRoot::open` が確かめ済みで、列挙は開いた fd 経由で行う。
+fn check_root_empty(anchor: &AnchoredRoot) -> Result<(), OciError> {
     // 別表記の衝突の判定（`Extractor::probe`）は「`root` 配下の実在項目はすべてこの展開が作った」ことに依る。
     // 呼び出し契約（空のステージング）を前提にせず、ここで確かめる（IO-5）。
-    match fs::read_dir(root).map_err(|e| map_fs_err(&e))?.next() {
-        None => Ok(()),
-        Some(Ok(_)) => Err(err(
+    match anchor.root_is_empty() {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(err(
             OciErrorCode::FailedPrecondition,
             "extraction root is not empty",
         )),
-        Some(Err(e)) => Err(map_fs_err(&e)),
+        Err(e) => Err(map_fs_err(&e)),
     }
 }
 
@@ -3177,7 +3290,8 @@ fn extract_stack<S: LayerSource>(
             if x.is_none() {
                 // 選択肢の不正な組み合わせ・非 Linux の `chown` は、`root` に触れる前に拒否する。
                 let own = setup.owner_ctx()?;
-                check_root_empty(root)?;
+                let anchor = AnchoredRoot::open(root, setup.anchor)?;
+                check_root_empty(&anchor)?;
                 x = Some(Extractor {
                     root,
                     limits,
@@ -3190,7 +3304,8 @@ fn extract_stack<S: LayerSource>(
                     preserved_bits: SpecialBitCounts::default(),
                     stripped_bits: SpecialBitCounts::default(),
                     mode_readback: setup.mode_readback,
-                    special: eval_special_ctx(&setup, root)?,
+                    special: eval_special_ctx(&setup, &anchor)?,
+                    anchor,
                     deferred_dirs: HashMap::new(),
                     own,
                     chowned: 0,
@@ -3210,6 +3325,8 @@ fn extract_stack<S: LayerSource>(
             if is_last {
                 let chowned0 = ex.chowned;
                 ex.finish_dirs()?;
+                // `chown_root` は `root` の所有者を正当に変えるため、その前に確かめる。
+                ex.verify_root_after_special_bits()?;
                 ex.chown_root()?;
                 // ディレクトリと `root` の `chown` は最後のレイヤーの結果に数える。
                 layer.ownership.chowned_entries = layer
@@ -5481,6 +5598,7 @@ mod tests {
         let limits = LIM();
         Extractor {
             root: &sb.root,
+            anchor: AnchoredRoot::open(&sb.root, AnchorHooks::host()).unwrap(),
             limits,
             entries: 0,
             bytes: 0,
@@ -6411,7 +6529,14 @@ mod tests {
             Ok(())
         }
 
-        fn rec_lchown(p: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+        fn rec_lchown(
+            a: &AnchoredRoot,
+            comps: &[OsString],
+            uid: u32,
+            gid: u32,
+        ) -> std::io::Result<()> {
+            let p = a.debug_path(comps);
+            let p = p.as_path();
             let mode = fs::symlink_metadata(p)?.permissions().mode() & 0o7777;
             CALLS.with_borrow_mut(|c| {
                 c.push(ChownCall {
@@ -7359,5 +7484,400 @@ mod tests {
         let e = extract_one_source(&sb, src).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::DataLoss);
         assert_eq!(e.message(), "layer content changed between passes");
+    }
+    // ---- ディレクトリ fd 起点の解決と root の再確認（#2437・OCI-1・OCI-2・SEC-5） ----
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    mod anchored_tests {
+        use super::*;
+        use std::cell::{Cell, RefCell};
+        use std::os::fd::{BorrowedFd, OwnedFd};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        /// `Lstat` 経由で「確認の後、使用の前」の差し替えを起こす注入口（試験スレッド専用）。
+        struct Trap {
+            /// 差し替える対象のディレクトリ（`root` 配下の絶対パス）。
+            victim: PathBuf,
+            /// 差し替え後に `victim` が指す先（`root` の外のディレクトリ）。
+            outside: PathBuf,
+            /// `victim` が実在すると確認できた何回目で差し替えるか（1 始まり）。
+            fire_on: u32,
+            seen: u32,
+        }
+
+        thread_local! {
+            static TRAP: RefCell<Option<Trap>> = const { RefCell::new(None) };
+            /// 最初の `lstat` で 1 回だけ実行する副作用（`root` の mode / 所有者の変更を模す）。
+            static ON_FIRST: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+            static ROOT_UID: Cell<u32> = const { Cell::new(1000) };
+        }
+
+        fn trap_lstat(p: &Path) -> std::io::Result<fs::Metadata> {
+            if let Some(f) = ON_FIRST.with_borrow_mut(Option::take) {
+                f();
+            }
+            // 先に確認の結果を取り、その後で差し替える（確認の後・使用の前に祖先が差し替わる状況）。
+            let m = fs::symlink_metadata(p);
+            TRAP.with_borrow_mut(|t| {
+                if let Some(trap) = t.as_mut()
+                    && p == trap.victim
+                    && m.as_ref().is_ok_and(fs::Metadata::is_dir)
+                {
+                    trap.seen += 1;
+                    if trap.seen == trap.fire_on {
+                        let moved = trap.victim.with_extension("moved");
+                        fs::rename(&trap.victim, &moved).unwrap();
+                        std::os::unix::fs::symlink(&trap.outside, &trap.victim).unwrap();
+                    }
+                }
+            });
+            m
+        }
+
+        fn run_trap(
+            sb: &Sandbox,
+            layers: &[Vec<Vec<u8>>],
+            setup: SpecialSetup,
+        ) -> Result<Vec<ExtractedLayer>, OciError> {
+            let tars: Vec<Vec<u8>> = layers.iter().map(|l| archive(l)).collect();
+            extract_stack(
+                &NoopOciOpRecorder,
+                tars.iter().map(|t| Rewind::new(Cursor::new(t.as_slice()))),
+                &sb.root,
+                LIM(),
+                trap_lstat,
+                setup,
+            )
+        }
+
+        fn arm(sb: &Sandbox, victim: &str, fire_on: u32) -> PathBuf {
+            let outside = sb.base.join("outside");
+            fs::create_dir_all(outside.join("b")).unwrap();
+            fs::write(outside.join("x"), b"keep").unwrap();
+            TRAP.with_borrow_mut(|t| {
+                *t = Some(Trap {
+                    victim: sb.root.join(victim),
+                    outside: outside.clone(),
+                    fire_on,
+                    seen: 0,
+                });
+            });
+            outside
+        }
+
+        fn disarm() {
+            TRAP.with_borrow_mut(|t| *t = None);
+            ON_FIRST.with_borrow_mut(|f| *f = None);
+        }
+
+        fn outside_listing(outside: &Path) -> Vec<String> {
+            let mut v: Vec<String> = fs::read_dir(outside)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            v.sort();
+            v
+        }
+
+        /// SEC-5・OCI-1: 親ディレクトリが確認の後で `root` の外を指す symlink に差し替えられても、
+        /// 書き込みは `FailedPrecondition` で拒否され、外側のディレクトリは変わらない。
+        #[test]
+        fn oci1_parent_swapped_to_symlink_after_probe_is_rejected() {
+            let sb = Sandbox::new();
+            let outside = arm(&sb, "a", 2);
+            let r = run_trap(
+                &sb,
+                &[vec![
+                    dir("a/", 0o755),
+                    dir("a/b/", 0o755),
+                    file("a/b/f", 0o644, b"data"),
+                ]],
+                SpecialSetup::host(SpecialBitsPolicy::Strip),
+            );
+            disarm();
+            let e = r.expect_err("swap must be rejected");
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), "an extraction path changed during extraction");
+            assert_eq!(outside_listing(&outside), vec!["b", "x"]);
+            assert_eq!(outside_listing(&outside.join("b")), Vec::<String>::new());
+            assert_eq!(fs::read(outside.join("x")).unwrap(), b"keep");
+        }
+
+        /// OCI-2・SEC-5: whiteout の適用中に親が外向きの symlink に差し替えられても、`root` の外のファイルは消えない。
+        #[test]
+        fn oci2_whiteout_parent_swapped_to_symlink_does_not_remove_outside() {
+            let sb = Sandbox::new();
+            let outside = arm(&sb, "d", 2);
+            let r = run_trap(
+                &sb,
+                &[
+                    vec![dir("d/", 0o755), file("d/x", 0o644, b"low")],
+                    vec![wh("d/.wh.x")],
+                ],
+                SpecialSetup::host(SpecialBitsPolicy::Strip),
+            );
+            disarm();
+            let e = r.expect_err("swap must be rejected");
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+            assert_eq!(fs::read(outside.join("x")).unwrap(), b"keep");
+            assert_eq!(outside_listing(&outside), vec!["b", "x"]);
+        }
+
+        /// SEC-5: 不透明ディレクトリの適用中の差し替えでも、外側の中身は消えない。
+        #[test]
+        fn oci2_opaque_parent_swapped_to_symlink_does_not_remove_outside() {
+            let sb = Sandbox::new();
+            let outside = arm(&sb, "d", 2);
+            let r = run_trap(
+                &sb,
+                &[
+                    vec![dir("d/", 0o755), file("d/y", 0o644, b"low")],
+                    vec![wh("d/.wh..wh..opq")],
+                ],
+                SpecialSetup::host(SpecialBitsPolicy::Strip),
+            );
+            disarm();
+            let e = r.expect_err("swap must be rejected");
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+            assert_eq!(outside_listing(&outside), vec!["b", "x"]);
+        }
+
+        /// SEC-5: hardlink の参照先の祖先が確認の後で差し替えられても、リンクは作られず拒否される。
+        #[test]
+        fn oci1_hardlink_target_parent_swapped_is_rejected() {
+            let sb = Sandbox::new();
+            let outside = arm(&sb, "a", 2);
+            // 差し替え後の `a/t` も通常ファイルに見える（確認は通り、使用の段で拒否される）ようにしておく。
+            fs::write(outside.join("t"), b"out").unwrap();
+            let r = run_trap(
+                &sb,
+                &[vec![
+                    dir("a/", 0o755),
+                    file("a/t", 0o644, b"t"),
+                    hardlink("l", "a/t"),
+                ]],
+                SpecialSetup::host(SpecialBitsPolicy::Strip),
+            );
+            disarm();
+            let e = r.expect_err("swap must be rejected");
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+            assert!(fs::symlink_metadata(sb.root.join("l")).is_err());
+            assert_eq!(outside_listing(&outside), vec!["b", "t", "x"]);
+            assert_eq!(fs::read(outside.join("t")).unwrap(), b"out");
+        }
+
+        fn setup_1000() -> SpecialSetup {
+            fn owner(m: &fs::Metadata) -> (u32, u32) {
+                if m.is_dir() {
+                    (ROOT_UID.get(), 1000)
+                } else {
+                    (1000, 1000)
+                }
+            }
+            SpecialSetup {
+                owner_of: owner,
+                ..SpecialSetup::host(policy_1000())
+            }
+        }
+
+        /// SEC-5・#2437: 展開の途中で `root` が 0755 に変わると、以後の特殊ビットはすべて落ちる。
+        /// 結果は `RootChangedDuringExtraction` で、落とした件数がビットごとに具体値で合う。
+        #[test]
+        fn sec5_root_mode_change_before_special_file_strips_remaining() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o700);
+            let root = sb.root.clone();
+            ON_FIRST.with_borrow_mut(|f| {
+                *f = Some(Box::new(move || {
+                    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+                }));
+            });
+            let r = run_trap(
+                &sb,
+                &[vec![
+                    file_owned("suid", 0o4755, 0, 0, b"a"),
+                    file_owned("sgid", 0o2755, 0, 0, b"b"),
+                ]],
+                setup_1000(),
+            );
+            disarm();
+            let l = single(r.unwrap()).unwrap();
+            assert_eq!(
+                l.special_bits.decision,
+                SpecialBitsDecision::RootChangedDuringExtraction
+            );
+            assert_eq!(l.special_bits.preserved_files, 0);
+            assert_eq!(l.files_with_stripped_special_bits, 2);
+            assert_eq!(
+                (
+                    l.special_bits.stripped_bits.setuid,
+                    l.special_bits.stripped_bits.setgid,
+                    l.special_bits.stripped_bits.sticky
+                ),
+                (1, 1, 0)
+            );
+            assert_eq!(mode_of(&sb.root.join("suid")), 0o755);
+            assert_eq!(mode_of(&sb.root.join("sgid")), 0o755);
+        }
+
+        /// SEC-5・#2437: `root` の所有者が変わった場合も同様に落とす（所有者の変化は fstat の uid の変化で注入する）。
+        #[test]
+        fn sec5_root_owner_change_is_detected() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o700);
+            ON_FIRST.with_borrow_mut(|f| *f = Some(Box::new(|| ROOT_UID.set(2000))));
+            ROOT_UID.set(1000);
+            let r = run_trap(
+                &sb,
+                &[vec![file_owned("suid", 0o4755, 0, 0, b"a")]],
+                setup_1000(),
+            );
+            disarm();
+            ROOT_UID.set(1000);
+            let l = single(r.unwrap()).unwrap();
+            assert_eq!(
+                l.special_bits.decision,
+                SpecialBitsDecision::RootChangedDuringExtraction
+            );
+            assert_eq!(l.special_bits.stripped_bits.setuid, 1);
+            assert_eq!(mode_of(&sb.root.join("suid")), 0o755);
+        }
+
+        /// SEC-5・#2437: 保持済みのビットがある状態で `root` が変わったら、終了時に `FailedPrecondition` で拒否する。
+        #[test]
+        fn sec5_root_mode_change_after_preserved_file_fails_closed() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o700);
+            let root = sb.root.clone();
+            // 1 件目（特殊ビット付き）を書いた後、2 件目（plain）の確認で `root` を 0755 にする。
+            fn lstat_then_open(p: &Path) -> std::io::Result<fs::Metadata> {
+                let m = fs::symlink_metadata(p);
+                if p.file_name().is_some_and(|n| n == "plain") {
+                    let root = p.parent().unwrap();
+                    fs::set_permissions(root, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                m
+            }
+            let tars = archive(&[
+                file_owned("suid", 0o4755, 0, 0, b"a"),
+                file("plain", 0o644, b"b"),
+            ]);
+            let r = extract_stack(
+                &NoopOciOpRecorder,
+                [Rewind::new(Cursor::new(tars.as_slice()))],
+                &root,
+                LIM(),
+                lstat_then_open,
+                setup_1000(),
+            );
+            disarm();
+            let e = r.expect_err("fail closed");
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+            assert_eq!(
+                e.message(),
+                "the extraction root changed while special mode bits were preserved"
+            );
+        }
+
+        /// SEC-5・#2437: 要求 06755 のうち setuid だけが残った（setgid は読み戻しで落ちた）場合も保持済みとして数え、
+        /// 終了時に `root` が変わっていれば `FailedPrecondition` で拒否する（部分保持の取りこぼしを防ぐ。#2565）。
+        #[test]
+        fn sec5_partial_preserve_then_root_change_fails_closed() {
+            fn without_setgid(f: &fs::File) -> u32 {
+                special_bits_of(f) & !S_ISGID
+            }
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o700);
+            let root = sb.root.clone();
+            fn lstat_then_open(p: &Path) -> std::io::Result<fs::Metadata> {
+                let m = fs::symlink_metadata(p);
+                if p.file_name().is_some_and(|n| n == "plain") {
+                    let root = p.parent().unwrap();
+                    fs::set_permissions(root, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+                m
+            }
+            let tars = archive(&[
+                file_owned("both", 0o6755, 0, 0, b"a"),
+                file("plain", 0o644, b"b"),
+            ]);
+            let mut setup = setup_1000();
+            setup.mode_readback = without_setgid;
+            let r = extract_stack(
+                &NoopOciOpRecorder,
+                [Rewind::new(Cursor::new(tars.as_slice()))],
+                &root,
+                LIM(),
+                lstat_then_open,
+                setup,
+            );
+            disarm();
+            let e = r.expect_err("fail closed");
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        }
+
+        fn enosys(
+            _d: Option<BorrowedFd<'_>>,
+            _p: &std::ffi::CStr,
+            _f: u64,
+            _m: u64,
+            _r: u64,
+        ) -> std::io::Result<OwnedFd> {
+            Err(std::io::Error::from_raw_os_error(crate::sys::at::ENOSYS))
+        }
+
+        /// OCI-1・#2437: `openat2` が使えないカーネルでは、パス起点へ縮退せず `root` に触れる前に `Unimplemented`。
+        #[test]
+        fn oci1_extract_refuses_when_openat2_unavailable() {
+            let sb = Sandbox::new();
+            let setup = SpecialSetup {
+                anchor: AnchorHooks { openat2: enosys },
+                ..SpecialSetup::host(SpecialBitsPolicy::Strip)
+            };
+            let r = run_trap(&sb, &[vec![file("f", 0o644, b"x")]], setup);
+            let e = r.expect_err("must refuse");
+            assert_eq!(e.code(), OciErrorCode::Unimplemented);
+            assert_eq!(e.message(), "openat2 is not available on this kernel");
+            assert_eq!(fs::read_dir(&sb.root).unwrap().count(), 0);
+        }
+
+        thread_local! {
+            static EAGAIN_LEFT: Cell<u32> = const { Cell::new(0) };
+        }
+
+        fn flaky(
+            d: Option<BorrowedFd<'_>>,
+            p: &std::ffi::CStr,
+            f: u64,
+            m: u64,
+            r: u64,
+        ) -> std::io::Result<OwnedFd> {
+            if d.is_some() && f & crate::sys::at::O_PATH != 0 && EAGAIN_LEFT.get() > 0 {
+                EAGAIN_LEFT.set(EAGAIN_LEFT.get() - 1);
+                return Err(std::io::Error::from_raw_os_error(crate::sys::at::EAGAIN));
+            }
+            crate::sys::at::openat2(d, p, f, m, r)
+        }
+
+        /// OCI-1・#2437: `EAGAIN` は上限つきで再試行する（1 回なら成功、無限なら `FailedPrecondition`）。
+        #[test]
+        fn oci1_eagain_is_retried_with_a_cap() {
+            let setup = || SpecialSetup {
+                anchor: AnchorHooks { openat2: flaky },
+                ..SpecialSetup::host(SpecialBitsPolicy::Strip)
+            };
+            let sb = Sandbox::new();
+            EAGAIN_LEFT.set(1);
+            run_trap(&sb, &[vec![file("d/f", 0o644, b"x")]], setup()).unwrap();
+            assert_eq!(fs::read(sb.root.join("d/f")).unwrap(), b"x");
+            let sb2 = Sandbox::new();
+            EAGAIN_LEFT.set(u32::MAX);
+            let e = run_trap(&sb2, &[vec![file("d/f", 0o644, b"x")]], setup()).unwrap_err();
+            EAGAIN_LEFT.set(0);
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), "an extraction path changed during extraction");
+        }
     }
 }

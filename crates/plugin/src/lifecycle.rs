@@ -41,7 +41,7 @@
 //! - 子の環境変数は `env_clear()` 後に [`PLUGIN_SOCKET_ENV`] を設定する（資格情報を継承させない）。
 //!   追加は [`PluginLaunchSpec::with_env`] で呼び出し側が名前と値を明示した組だけで、親の環境を暗黙に
 //!   継承する指定は無い。`FANDHE_CONTAINER_PLUGIN_`・`LD_`・`DYLD_` 始まりの名前・規則外の名前・重複・
-//!   NUL を含む値・上限超過（[`ONE_SHOT_ENV_MAX_COUNT`] 等）は `InvalidArgument` で拒否し、spawn しない
+//!   NUL を含む値・上限超過（[`PLUGIN_ENV_MAX_COUNT`] 等）は `InvalidArgument` で拒否し、spawn しない
 //!   （#1858・#1319・PLUG-7）。
 //!   stdin / stdout は null。stderr は親へ継承させず、専用の UNIX ソケット対で受けて
 //!   [`OneShotStderr`] として返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は
@@ -94,8 +94,8 @@ mod mode;
 mod resident;
 
 pub use env::{
-    ONE_SHOT_ENV_MAX_BYTES, ONE_SHOT_ENV_MAX_COUNT, ONE_SHOT_ENV_NAME_MAX_BYTES,
-    ONE_SHOT_ENV_VALUE_MAX_BYTES,
+    PLUGIN_ENV_MAX_BYTES, PLUGIN_ENV_MAX_COUNT, PLUGIN_ENV_NAME_MAX_BYTES,
+    PLUGIN_ENV_VALUE_MAX_BYTES,
 };
 #[cfg(unix)]
 pub use launch_target::PluginFileIdentity;
@@ -142,10 +142,10 @@ pub const ONE_SHOT_TIMEOUT_MAX: Duration = Duration::from_secs(10);
 pub const ONE_SHOT_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 起動引数の件数上限。
-pub const ONE_SHOT_ARGS_MAX_COUNT: usize = 64;
+pub const PLUGIN_ARGS_MAX_COUNT: usize = 64;
 
 /// 起動引数の合計バイト数上限。
-pub const ONE_SHOT_ARGS_MAX_BYTES: usize = 4096;
+pub const PLUGIN_ARGS_MAX_BYTES: usize = 4096;
 
 /// 子の終了待ちポーリング間隔の上限。
 const POLL_MAX: Duration = Duration::from_millis(5);
@@ -228,7 +228,7 @@ impl PluginLaunchSpec {
         socket_dir: PathBuf,
     ) -> Result<Self, PluginError> {
         let total: usize = args.iter().map(|a| a.len()).sum();
-        if args.len() > ONE_SHOT_ARGS_MAX_COUNT || total > ONE_SHOT_ARGS_MAX_BYTES {
+        if args.len() > PLUGIN_ARGS_MAX_COUNT || total > PLUGIN_ARGS_MAX_BYTES {
             return Err(PluginError::new(
                 PluginErrorCode::InvalidArgument,
                 "plugin arguments exceed the allowed count or size",
@@ -246,7 +246,7 @@ impl PluginLaunchSpec {
     /// `Vec` で既定へ戻る）。都度起動・常駐・[`PluginSession`] のすべての経路で同じ組が渡る。
     ///
     /// 違反は `InvalidArgument`（固定の英語文言。名前も値も載せない）で、spawn しない。規則は
-    /// `lifecycle` の契約と [`ONE_SHOT_ENV_MAX_COUNT`] 等の上限を参照。親の環境は読まない。
+    /// `lifecycle` の契約と [`PLUGIN_ENV_MAX_COUNT`] 等の上限を参照。親の環境は読まない。
     /// どの plugin に何を渡すかは呼び出し側（core）が決める（#1869）。PLUG-7・#1858。
     pub fn with_env(mut self, vars: Vec<(String, OsString)>) -> Result<Self, PluginError> {
         self.env = env::validate(vars)?;
@@ -2998,15 +2998,15 @@ mod tests {
 
     #[test]
     fn plug7_plugin_rejects_too_many_or_too_long_args() {
-        let many = vec![OsString::from("a"); ONE_SHOT_ARGS_MAX_COUNT + 1];
+        let many = vec![OsString::from("a"); PLUGIN_ARGS_MAX_COUNT + 1];
         let e = PluginLaunchSpec::new(launch_target::current_exe_target(), many, "/tmp".into())
             .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
-        let long = vec![OsString::from("a".repeat(ONE_SHOT_ARGS_MAX_BYTES + 1))];
+        let long = vec![OsString::from("a".repeat(PLUGIN_ARGS_MAX_BYTES + 1))];
         let e = PluginLaunchSpec::new(launch_target::current_exe_target(), long, "/tmp".into())
             .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::InvalidArgument);
-        let ok = vec![OsString::from("a"); ONE_SHOT_ARGS_MAX_COUNT];
+        let ok = vec![OsString::from("a"); PLUGIN_ARGS_MAX_COUNT];
         assert!(
             PluginLaunchSpec::new(launch_target::current_exe_target(), ok, "/tmp".into()).is_ok()
         );

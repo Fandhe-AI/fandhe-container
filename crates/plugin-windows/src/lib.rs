@@ -34,7 +34,7 @@ use std::path::{Component, Path, PathBuf};
 
 pub use fandhe_container_plugin::PLUGIN_SOCKET_ENV;
 use fandhe_container_plugin::{
-    ONE_SHOT_ARGS_MAX_BYTES, ONE_SHOT_ARGS_MAX_COUNT, PluginError, PluginErrorCode, RuntimeDir,
+    PLUGIN_ARGS_MAX_BYTES, PLUGIN_ARGS_MAX_COUNT, PluginError, PluginErrorCode, RuntimeDir,
 };
 
 /// socket パスを指定する起動引数名（暫定構文）。
@@ -144,7 +144,7 @@ where
         } else {
             return Err(invalid("unknown argument"));
         };
-        if count > ONE_SHOT_ARGS_MAX_COUNT || bytes > ONE_SHOT_ARGS_MAX_BYTES {
+        if count > PLUGIN_ARGS_MAX_COUNT || bytes > PLUGIN_ARGS_MAX_BYTES {
             return Err(invalid("too many or too large arguments"));
         }
         if from_arg.replace(value).is_some() {
@@ -160,7 +160,7 @@ where
     }
     if let Some(v) = env_socket.filter(|v| !v.is_empty()) {
         // 環境変数も untrusted。引数と同じ上限で格納前に拒否する（無制限の長さを保持させない）。
-        if v.len() > ONE_SHOT_ARGS_MAX_BYTES {
+        if v.len() > PLUGIN_ARGS_MAX_BYTES {
             return Err(invalid("socket environment value too large"));
         }
         return Ok(StartupConfig {
@@ -322,12 +322,10 @@ mod tests {
             vec![os("--socket")],
             vec![os("--bogus")],
             vec![os("--socket"), os(ABS), os("--socket"), os(ABS)],
-            (0..=ONE_SHOT_ARGS_MAX_COUNT)
-                .map(|_| os("--bogus"))
-                .collect(),
+            (0..=PLUGIN_ARGS_MAX_COUNT).map(|_| os("--bogus")).collect(),
             vec![
                 os("--socket"),
-                os(&format!("/{}", "a".repeat(ONE_SHOT_ARGS_MAX_BYTES))),
+                os(&format!("/{}", "a".repeat(PLUGIN_ARGS_MAX_BYTES))),
             ],
         ];
         for args in cases {
@@ -341,7 +339,7 @@ mod tests {
             PluginErrorCode::InvalidArgument
         );
         // 環境変数値にも長さ上限を適用する（上限ちょうどは受理、超過は拒否）。
-        let big = format!("/{}", "a".repeat(ONE_SHOT_ARGS_MAX_BYTES));
+        let big = format!("/{}", "a".repeat(PLUGIN_ARGS_MAX_BYTES));
         assert_eq!(
             code(resolve_startup([], Some(os(&big)), no_default)),
             PluginErrorCode::InvalidArgument

@@ -580,7 +580,7 @@ make deny   # cargo deny --locked check advisories bans licenses sources
 | plugin 境界 | 動的ライブラリの実行時ロードを行っていないか（拡張は別プロセス＋UDS に限る。PLUG-2）。`ContainerRuntime`・`NetworkPlugin` の実装が plugin 側、`VolumeProvider` が core 側になっているか（PLUG-1）。`StateStore` はトレイト定義とファイルベースの既定実装が core 側にあり、別実装を plugin として差し替えられる構造になっているか（TASK-31・OCI-5・PLUG-1）。他ユーザー書き込み可能な場所の plugin・許可済みハッシュ / 署名に一致しない plugin の登録を拒否しているか。`PATH` 探索が opt-in のみになっているか（PLUG-11） | P0 |
 | UDS 境界 | UDS を所有者・権限・symlink を検証してから bind しているか。別 UID からの接続を peer credential 検証で切断しているか（PLUG-12） | P0 |
 | plugin 入力の検証 | plugin からの入力を untrusted として検証しているか | P0 |
-| plugin 子プロセスの環境変数 | 既定は `FANDHE_CONTAINER_PLUGIN_SOCKET` のみ（`env_clear()` 後に設定）で、追加は `PluginLaunchSpec::with_env` で名前と値を明示した組だけか（親の環境を暗黙に継承する指定は無い。#1858・PLUG-7）。`FANDHE_CONTAINER_PLUGIN_`・`LD_`・`DYLD_` 始まり・規則外の名前・重複・NUL を含む値・上限超過（`ONE_SHOT_ENV_*`）が `InvalidArgument` で拒否されているか。`env_clear()` を外す・`envs(std::env::vars_os())` のように親の環境を丸ごと渡す・エラーや `Debug` へ値を出す差分になっていないか | P0 |
+| plugin 子プロセスの環境変数 | 既定は `FANDHE_CONTAINER_PLUGIN_SOCKET` のみ（`env_clear()` 後に設定）で、追加は `PluginLaunchSpec::with_env` で名前と値を明示した組だけか（親の環境を暗黙に継承する指定は無い。#1858・PLUG-7）。`FANDHE_CONTAINER_PLUGIN_`・`LD_`・`DYLD_` 始まり・規則外の名前・重複・NUL を含む値・上限超過（`PLUGIN_ENV_*`）が `InvalidArgument` で拒否されているか。`env_clear()` を外す・`envs(std::env::vars_os())` のように親の環境を丸ごと渡す・エラーや `Debug` へ値を出す差分になっていないか | P0 |
 | 外部入力の検証 | イメージ・CDI spec・TOML / compose・CRI / MCP リクエスト・plugin 入出力・カーネル応答の経路で `unwrap`・`expect`・添字アクセス（`[]`）を使わず、`get()`・`try_into()`・checked 演算で処理しているか | P0 |
 | リソース上限 | 長さ・件数を上限検証してからアロケーションに使っているか（無制限確保による DoS を防ぐ） | P0 |
 | タイムアウト | ACK・plugin RPC・子プロセスなど相手の応答を待つ処理に、有限時間で打ち切るタイムアウトが設けられているか（REPAIR-5） | P0 |

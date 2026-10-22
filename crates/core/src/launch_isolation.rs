@@ -518,6 +518,8 @@ impl LaunchIsolationRecord {
         coverage: AuditCoverage,
     ) -> Self {
         self.audit_coverage = RecordedAuditCoverage::Evaluated { policy, coverage };
+        // 評価を置き換えたら記録失敗の事実は引き継がない（縮退なしの評価に Failed が残る矛盾を作らない。REPAIR-2）。
+        self.audit_coverage_record = AuditCoverageRecordOutcome::NotFailed;
         self
     }
 
@@ -737,6 +739,14 @@ mod tests {
         assert_eq!(
             r.audit_coverage_record(),
             AuditCoverageRecordOutcome::Failed
+        );
+        // Failed の後に縮退なしの評価で上書きすると NotFailed に戻る（矛盾した値を残さない）。
+        let overwritten = r
+            .clone()
+            .with_audit_coverage(AuditCoveragePolicy::BestEffort, clear);
+        assert_eq!(
+            overwritten.audit_coverage_record(),
+            AuditCoverageRecordOutcome::NotFailed
         );
         assert_eq!(
             r.audit_coverage_record().log_line(),

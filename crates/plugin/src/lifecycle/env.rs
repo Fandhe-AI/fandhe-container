@@ -20,13 +20,13 @@ use std::ffi::OsString;
 use std::fmt;
 
 /// 追加する環境変数の件数上限。
-pub const ONE_SHOT_ENV_MAX_COUNT: usize = 32;
+pub const PLUGIN_ENV_MAX_COUNT: usize = 32;
 /// 名前 1 件のバイト数上限。
-pub const ONE_SHOT_ENV_NAME_MAX_BYTES: usize = 128;
+pub const PLUGIN_ENV_NAME_MAX_BYTES: usize = 128;
 /// 値 1 件のバイト数上限（`OsStr::as_encoded_bytes` の長さ）。
-pub const ONE_SHOT_ENV_VALUE_MAX_BYTES: usize = 4096;
+pub const PLUGIN_ENV_VALUE_MAX_BYTES: usize = 4096;
 /// 全件の `名前の長さ + 値の長さ` の合計上限（区切りの `=` は数えない）。
-pub const ONE_SHOT_ENV_MAX_BYTES: usize = 16384;
+pub const PLUGIN_ENV_MAX_BYTES: usize = 16384;
 
 /// 拒否する名前の接頭辞（ASCII の大文字小文字を区別しない）。
 const RESERVED_PREFIXES: [&str; 3] = ["FANDHE_CONTAINER_PLUGIN_", "LD_", "DYLD_"];
@@ -54,7 +54,7 @@ fn invalid(msg: &'static str) -> PluginError {
 }
 
 fn name_is_valid(name: &str) -> bool {
-    if name.is_empty() || name.len() > ONE_SHOT_ENV_NAME_MAX_BYTES {
+    if name.is_empty() || name.len() > PLUGIN_ENV_NAME_MAX_BYTES {
         return false;
     }
     let mut bytes = name.bytes();
@@ -74,7 +74,7 @@ fn name_is_reserved(name: &str) -> bool {
 /// 名前と値の組を検証して `PluginEnvVars` にする。違反は `InvalidArgument`（固定文言）。
 pub(super) fn validate(vars: Vec<(String, OsString)>) -> Result<PluginEnvVars, PluginError> {
     const SIZE_MSG: &str = "plugin environment variables exceed the allowed count or size";
-    if vars.len() > ONE_SHOT_ENV_MAX_COUNT {
+    if vars.len() > PLUGIN_ENV_MAX_COUNT {
         return Err(invalid(SIZE_MSG));
     }
     let mut total: usize = 0;
@@ -84,7 +84,7 @@ pub(super) fn validate(vars: Vec<(String, OsString)>) -> Result<PluginEnvVars, P
             .and_then(|t| t.checked_add(value.len()))
             .ok_or_else(|| invalid(SIZE_MSG))?;
     }
-    if total > ONE_SHOT_ENV_MAX_BYTES {
+    if total > PLUGIN_ENV_MAX_BYTES {
         return Err(invalid(SIZE_MSG));
     }
     for (name, value) in &vars {
@@ -95,7 +95,7 @@ pub(super) fn validate(vars: Vec<(String, OsString)>) -> Result<PluginEnvVars, P
             return Err(invalid("plugin environment variable name is reserved"));
         }
         let bytes = value.as_encoded_bytes();
-        if bytes.len() > ONE_SHOT_ENV_VALUE_MAX_BYTES {
+        if bytes.len() > PLUGIN_ENV_VALUE_MAX_BYTES {
             return Err(invalid(
                 "plugin environment variable value exceeds the allowed size",
             ));

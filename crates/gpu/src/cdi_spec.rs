@@ -4,6 +4,16 @@
 //! デシリアライズするだけの層で、`fandhe-container-gpu` の他モジュール（TASK-126.2 の集計、
 //! TASK-126.3 の usr-merge パス正規化、TASK-127 以降の edits 適用）から入力として使われる。
 //!
+//! フィールド集合は CDI v0.7.0 のもの（GPU-1）に、v1.1.0 で追加された `containerEdits.netDevices` を加えたもの。
+//! v1.1.0 の `intelRdt` の変更（`schemata`・`enableMonitoring` の追加、`enableCMT`・`enableMBM` の削除）は
+//! 未対応で、未知フィールドとして拒否する（#2445。出典は cncf-tags/container-device-interface v1.1.1
+//! `cb98bcf66dc68530012483bd56e33e14d815e167` の `SPEC.md` の版の表と `specs-go/version.go`）。
+//!
+//! netDevices（#2445・GPU-1・REPAIR-3）: ホストのネットワークインターフェースをコンテナの netns へ移す編集で、
+//! 適用は net crate の責務でありまだ無い。そのため型付きで解析・検証した上で、1 件でもあれば
+//! [`parse_cdi_spec`] が `Unimplemented` で spec 全体を拒否する（要求されないデバイスにだけあっても拒否する）。
+//! `cdiVersion` の形式検査は行わない原則の唯一の例外として、`netDevices` が非空のときだけ 1.1.0 以上を要求する。
+//!
 //! 責務境界（将来仕様。REPAIR-3）:
 //! - 本モジュールは構文・型・未知フィールド・重複キー・資源上限の検査までを行う。
 //!   `cdiVersion` / `kind` / `name` の形式検査、パスの絶対性、`hookName` の許可値などの意味検証は行わない
@@ -17,7 +27,7 @@
 //! `Budget` を明示して深さ・ノード数・エイリアス展開を締める。エラーの `message` と `Debug` 出力には
 //! YAML の内容（とくに `env` の値。トークン等を含みうる）を載せない。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::io::Read;
@@ -56,6 +66,8 @@ pub enum CdiSpecErrorCode {
     NotFound,
     /// 上記以外（読み取り失敗など）。
     Internal,
+    /// 仕様上は有効だが本実装がまだ適用できない編集（現状は `netDevices`。#2445・REPAIR-3）。
+    Unimplemented,
 }
 
 impl CdiSpecErrorCode {
@@ -66,6 +78,7 @@ impl CdiSpecErrorCode {
             Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
             Self::NotFound => "NOT_FOUND",
             Self::Internal => "INTERNAL",
+            Self::Unimplemented => "UNIMPLEMENTED",
         }
     }
 }
@@ -226,6 +239,22 @@ pub struct ContainerEdits {
     /// 追加 GID。
     #[serde(default)]
     pub additional_gids: Vec<u32>,
+    /// ネットワークデバイス（CDI v1.1.0 で追加。適用は未実装で、非空なら [`parse_cdi_spec`] と集計が
+    /// `Unimplemented` で拒否する。#2445・GPU-1・REPAIR-3）。
+    #[serde(default)]
+    pub net_devices: Vec<NetDevice>,
+}
+
+/// ホストのインターフェースをコンテナの netns へ移す CDI v1.1.0 の編集 1 件。
+///
+/// 適用（netns への移動）は net crate の責務で未実装（#2445・REPAIR-3）。本層は名前を検証して保持するだけ。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetDevice {
+    /// ホスト側のインターフェース名。
+    pub host_interface_name: String,
+    /// コンテナ内でのインターフェース名。
+    pub name: String,
 }
 
 /// デバイスノード定義。
@@ -359,7 +388,123 @@ fn classify(err: &serde_saphyr::Error) -> CdiSpecError {
 ///
 /// 入力長が [`CDI_SPEC_MAX_INPUT_BYTES`] を超えれば `ResourceExhausted`。`Budget` を明示し、
 /// 重複キー・マージキーは拒否する。パニックしない。
+///
+/// `netDevices`（トップレベル・デバイスのいずれか）が 1 件以上あるときは、次の順で検査する（#2445・GPU-1）。
+/// 1. `cdiVersion` が 1.1.0 以上でなければ `InvalidArgument`
+/// 2. 各 `containerEdits` の名前（15 バイト以下・`.` `..` `/` `:` 空白 NUL 不可。`fandhe-container-net` の
+///    `IfName::new` と同じ規則）と、1 つの edits 内の `hostInterfaceName`・`name` の重複を検査し `InvalidArgument`
+/// 3. 検査を通っても適用が未実装のため `Unimplemented`（spec 単位。REPAIR-3）
+///
+/// 1・2 は逆シリアライズ後の検査のため、エラーの行・列は `None`。`netDevices: []` は無いものと同じ扱い。
+/// 適用（net crate）が実装されたら 3 を外し、公開 API から netDevices を返す（将来仕様）。
 pub fn parse_cdi_spec(input: &str) -> Result<CdiSpec, CdiSpecError> {
+    let spec = parse_cdi_spec_unchecked(input)?;
+    reject_unapplied_edits(&spec)?;
+    Ok(spec)
+}
+
+/// 構造・名前・版の検査までを行い、適用可否のゲートは掛けない解析（集計の内部試験用）。
+pub(crate) fn parse_cdi_spec_unchecked(input: &str) -> Result<CdiSpec, CdiSpecError> {
+    let spec = parse_structure(input)?;
+    validate_net_devices(&spec)?;
+    Ok(spec)
+}
+
+/// 適用が未実装の編集（現状は `netDevices`）を含む spec を `Unimplemented` で拒否するゲート。
+pub(crate) fn reject_unapplied_edits(spec: &CdiSpec) -> Result<(), CdiSpecError> {
+    let any = !spec.container_edits.net_devices.is_empty()
+        || spec
+            .devices
+            .iter()
+            .any(|d| !d.container_edits.net_devices.is_empty());
+    if any {
+        return Err(net_devices_unimplemented());
+    }
+    Ok(())
+}
+
+/// `netDevices` が未適用であることを示す固定文言のエラー（parse と集計の両ゲートで共有する）。
+pub(crate) fn net_devices_unimplemented() -> CdiSpecError {
+    CdiSpecError::new(
+        CdiSpecErrorCode::Unimplemented,
+        "CDI netDevices edits are not supported yet",
+    )
+}
+
+/// `cdiVersion` を (major, minor, patch) へ解く。先頭の `v` は 1 つだけ許し、3 要素の ASCII 数字（各 9 桁以下）のみ。
+fn parse_cdi_version(raw: &str) -> Option<(u32, u32, u32)> {
+    let body = raw.strip_prefix('v').unwrap_or(raw);
+    let mut parts = body.split('.');
+    let mut next = || -> Option<u32> {
+        let p = parts.next()?;
+        if p.is_empty() || p.len() > 9 || !p.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        p.parse().ok()
+    };
+    let v = (next()?, next()?, next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(v)
+}
+
+/// インターフェース名の検証。`fandhe-container-net` の `IfName::new`（カーネルの `dev_valid_name` 相当）と
+/// 同じ規則で、変えるときは両方を揃える。net crate への依存は crate 境界を変えるため足さない。
+/// ホストの altname（最大 127 バイト）は受けない（fail-closed。net crate での適用実装時に見直す）。
+fn is_valid_interface_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 15
+        && name != "."
+        && name != ".."
+        && !name
+            .chars()
+            .any(|c| c == '/' || c == ':' || c == '\0' || c.is_whitespace())
+}
+
+fn validate_net_devices(spec: &CdiSpec) -> Result<(), CdiSpecError> {
+    let all = std::iter::once(&spec.container_edits)
+        .chain(spec.devices.iter().map(|d| &d.container_edits));
+    let mut has_any = false;
+    for edits in all.clone() {
+        if !edits.net_devices.is_empty() {
+            has_any = true;
+        }
+    }
+    if !has_any {
+        return Ok(());
+    }
+    let version_ok = parse_cdi_version(&spec.cdi_version).is_some_and(|v| v >= (1, 1, 0));
+    if !version_ok {
+        return Err(CdiSpecError::new(
+            CdiSpecErrorCode::InvalidArgument,
+            "CDI netDevices requires cdiVersion 1.1.0 or later",
+        ));
+    }
+    for edits in all {
+        let mut hosts: BTreeSet<&str> = BTreeSet::new();
+        let mut names: BTreeSet<&str> = BTreeSet::new();
+        for nd in &edits.net_devices {
+            if !is_valid_interface_name(&nd.host_interface_name)
+                || !is_valid_interface_name(&nd.name)
+            {
+                return Err(CdiSpecError::new(
+                    CdiSpecErrorCode::InvalidArgument,
+                    "CDI netDevices entry has an invalid interface name",
+                ));
+            }
+            if !hosts.insert(nd.host_interface_name.as_str()) || !names.insert(nd.name.as_str()) {
+                return Err(CdiSpecError::new(
+                    CdiSpecErrorCode::InvalidArgument,
+                    "CDI netDevices has a duplicate hostInterfaceName or name",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_structure(input: &str) -> Result<CdiSpec, CdiSpecError> {
     if input.len() > CDI_SPEC_MAX_INPUT_BYTES {
         return Err(CdiSpecError::new(
             CdiSpecErrorCode::ResourceExhausted,
@@ -861,5 +1006,154 @@ containerEdits:
         assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- netDevices（#2445・GPU-1・REPAIR-3） ----
+
+    fn nd_spec(version: &str, top: &str, dev: &str) -> String {
+        format!(
+            "cdiVersion: \"{version}\"\nkind: v/c\ndevices:\n  - name: a\n    containerEdits:\n      netDevices: {dev}\ncontainerEdits:\n  netDevices: {top}\n"
+        )
+    }
+
+    fn pair(h: &str, n: &str) -> String {
+        format!("{{hostInterfaceName: \"{h}\", name: \"{n}\"}}")
+    }
+
+    #[test]
+    fn gpu1_parses_net_devices_structure() {
+        let y = nd_spec(
+            "1.1.0",
+            &format!("[{}]", pair("eth1", "net1")),
+            &format!("[{}]", pair("eth2", "net2")),
+        );
+        let spec = parse_cdi_spec_unchecked(&y).unwrap();
+        assert_eq!(spec.container_edits.net_devices.len(), 1);
+        assert_eq!(
+            spec.container_edits.net_devices[0].host_interface_name,
+            "eth1"
+        );
+        assert_eq!(spec.container_edits.net_devices[0].name, "net1");
+        let d = &spec.devices[0].container_edits.net_devices[0];
+        assert_eq!(
+            (d.host_interface_name.as_str(), d.name.as_str()),
+            ("eth2", "net2")
+        );
+        let json = r#"{"cdiVersion":"1.1.0","kind":"v/c","containerEdits":{"netDevices":[{"hostInterfaceName":"eth1","name":"net1"}]}}"#;
+        assert_eq!(
+            parse_cdi_spec_unchecked(json)
+                .unwrap()
+                .container_edits
+                .net_devices[0]
+                .name,
+            "net1"
+        );
+    }
+
+    #[test]
+    fn gpu1_net_device_schema_errors() {
+        for dev in [
+            "[{hostInterfaceName: eth1, name: n, bogus: 1}]",
+            "[{hostInterfaceName: eth1}]",
+            "[{name: n}]",
+            "[{hostInterfaceName: 1, name: [x]}]",
+        ] {
+            let e = parse_cdi_spec_unchecked(&nd_spec("1.1.0", dev, "[]")).unwrap_err();
+            assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument, "{dev}");
+        }
+    }
+
+    #[test]
+    fn gpu1_net_device_name_validation() {
+        let long16 = "a".repeat(16);
+        let ok15 = "a".repeat(15);
+        // YAML のダブルクォート内のエスケープ（\t・\0・全角空白）を含む。
+        let bad = [
+            "",
+            long16.as_str(),
+            ".",
+            "..",
+            "a/b",
+            "a:b",
+            "a b",
+            "a\\tb",
+            "a\\0b",
+            "a\\u3000b",
+        ];
+        for b in bad {
+            for (h, n) in [(b, "net1"), ("eth1", b)] {
+                let y = nd_spec("1.1.0", &format!("[{}]", pair(h, n)), "[]");
+                let e = parse_cdi_spec_unchecked(&y).unwrap_err();
+                assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument, "{b:?}");
+                assert_eq!(
+                    e.message(),
+                    "CDI netDevices entry has an invalid interface name"
+                );
+            }
+        }
+        for good in [ok15.as_str(), "eth0", "net1"] {
+            let y = nd_spec("1.1.0", &format!("[{}]", pair(good, good)), "[]");
+            assert!(parse_cdi_spec_unchecked(&y).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn gpu1_net_devices_duplicate_within_edits() {
+        let dup_host = format!("[{}, {}]", pair("eth1", "a"), pair("eth1", "b"));
+        let dup_exact = format!("[{}, {}]", pair("eth1", "a"), pair("eth1", "a"));
+        let dup_name = format!("[{}, {}]", pair("eth1", "a"), pair("eth2", "a"));
+        for top in [dup_host, dup_exact, dup_name] {
+            let e = parse_cdi_spec_unchecked(&nd_spec("1.1.0", &top, "[]")).unwrap_err();
+            assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument);
+            assert_eq!(
+                e.message(),
+                "CDI netDevices has a duplicate hostInterfaceName or name"
+            );
+        }
+        // 別の edits にまたがる重複はこの段では拒否しない（集計側の規則）。
+        let y = nd_spec(
+            "1.1.0",
+            &format!("[{}]", pair("eth1", "a")),
+            &format!("[{}]", pair("eth1", "b")),
+        );
+        assert!(parse_cdi_spec_unchecked(&y).is_ok());
+    }
+
+    #[test]
+    fn repair3_parse_rejects_net_devices_unimplemented() {
+        let y = nd_spec("1.1.0", &format!("[{}]", pair("eth1", "n")), "[]");
+        let e = parse_cdi_spec(&y).unwrap_err();
+        assert_eq!(e.code(), CdiSpecErrorCode::Unimplemented);
+        assert_eq!(e.code().as_str(), "UNIMPLEMENTED");
+        assert_eq!(e.message(), "CDI netDevices edits are not supported yet");
+        // 要求されないデバイスにだけあっても spec 単位で拒否する。
+        let y = nd_spec("1.1.0", "[]", &format!("[{}]", pair("eth1", "n")));
+        assert_eq!(
+            parse_cdi_spec(&y).unwrap_err().code(),
+            CdiSpecErrorCode::Unimplemented
+        );
+    }
+
+    #[test]
+    fn gpu1_empty_net_devices_is_absent() {
+        assert!(parse_cdi_spec(&nd_spec("0.5.0", "[]", "[]")).is_ok());
+    }
+
+    #[test]
+    fn gpu1_cdi_version_parsing() {
+        assert_eq!(parse_cdi_version("1.1.0"), Some((1, 1, 0)));
+        assert_eq!(parse_cdi_version("v1.2.3"), Some((1, 2, 3)));
+        for bad in [
+            "",
+            "abc",
+            "1.1",
+            "1.1.0-rc1",
+            "vv1.1.0",
+            "1.1.0.0",
+            "1..0",
+            "1.1.9999999999",
+        ] {
+            assert_eq!(parse_cdi_version(bad), None, "{bad}");
+        }
     }
 }

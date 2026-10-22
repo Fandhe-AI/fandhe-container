@@ -74,5 +74,5 @@ cargo bench -p fandhe-container-benches --bench small_files -- \
 
 - 平置きでは `create_file` が作成のたびに祖先ディレクトリの実在エントリを読み直すため、N 件で約 N²/2 の走査になり、計測値に含まれる。ツリー配置では 1 回あたり高々約 452 件
 - K ファイルごとの FLUSH は IO-2 の保証外で、Linux のみ
-- 2 構成は置き場所の違いを呼び出し側が与えるラベルで、`VolumeProvider` の実装は対象外
+- 2 構成は置き場所の違いを呼び出し側が与えるラベルで、`VolumeProvider` の実装は対象外（担当と時期は [volume-provider-implementation.md](volume-provider-implementation.md) で判断待ち・#2451）
 - 期限は協調的で、`create_file` の内部で止まった syscall には割り込めない

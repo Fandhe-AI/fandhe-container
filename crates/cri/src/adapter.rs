@@ -198,8 +198,8 @@ impl<'a> BundleRequest<'a> {
 ///
 /// 汎用の実装として `crate::bundle::SpecBundleProvider`（config 変換と bundle ディレクトリの寿命。#2395）がある。
 ///
-/// **未実装（REPAIR-3）**: image 展開（`crate::bundle::RootfsSource` の本番実装。#2433）は未提供で、
-/// plugin-cri はまだ常に `UNIMPLEMENTED` を返す実装を差している。
+/// 本番の rootfs 供給は `crate::bundle::ImageRootfsSource`（pull 済みイメージの再展開と既定値の読み取り。#2433）で、
+/// plugin-cri が `SpecBundleProvider` と組んで差す。タグの解決は未実装（REPAIR-3。image ID のみ受ける）。
 /// `config` の内容（envs 等の秘密値を含みうる）をエラー文言へ含めないこと。
 pub trait BundleProvider: Send + Sync {
     /// コンテナ用の bundle を用意し、その絶対パスを返す。失敗は ERR-3 の gRPC ステータスで返す。

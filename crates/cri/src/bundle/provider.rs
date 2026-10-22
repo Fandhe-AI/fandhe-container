@@ -31,9 +31,8 @@ use crate::adapter::{BundleProvider, BundleRequest};
 use crate::error::CriError;
 use crate::runtime::v1::ImageSpec;
 
-/// `rootfs/` の用意と解放の注入点（本番の実装はイメージ展開。#2433）。
+/// `rootfs/` の用意と解放の注入点（本番の実装は [`super::ImageRootfsSource`]。#2433）。
 ///
-/// **未実装（REPAIR-3）**: 本番実装は本 crate に無い（oci のレイヤー展開とイメージ config の読み取りは #2433）。
 /// 実装は rootfs の内容と digest を検証する責務を持つ。
 pub trait RootfsSource: Send + Sync {
     /// 存在しないパス `rootfs` を作成して `image` の内容で満たし、イメージ config 由来の既定値を返す。

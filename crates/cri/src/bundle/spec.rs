@@ -21,7 +21,10 @@
 //!   （#442）の pod.json は当面 `namespace_options.network = NODE` を要する。
 //! - user namespace: `userns_options.mode` が `NODE` でも新しい user namespace にする（分離を強める方向。
 //!   uid の写像は core の launcher が権限モデルから導く。SEC-5）。`uids` / `gids` の指定は未実装（#2240）。
-//! - イメージ config（Entrypoint・Cmd・Env・WorkingDir・User）の解析は #2433。ここでは [`ImageDefaults`] で受ける。
+//! - イメージ config（Entrypoint・Cmd・Env・WorkingDir・User）の解析は [`super::ImageRootfsSource`]（#2433）が行い、
+//!   ここでは [`ImageDefaults`] で受ける。イメージの User が名前・uid のみ（`/etc/passwd` の解決が要る形）のときは
+//!   [`ImageDefaults::user_unresolved`] で受け、CRI の `run_as_user` が無ければ `UNIMPLEMENTED` で拒否する
+//!   （root へ黙ってフォールバックしない。rootfs 内の passwd を読むとリンク経由でホストの内容を読む経路ができるため未実装）。
 
 use std::collections::HashMap;
 
@@ -74,8 +77,11 @@ pub struct ImageDefaults {
     pub env: Vec<String>,
     /// イメージの WorkingDir。
     pub working_dir: Option<String>,
-    /// イメージの User（uid, gid）。
+    /// イメージの User（uid, gid）。数値の `uid:gid` だけが入る。
     pub user: Option<(u32, u32)>,
+    /// イメージの User が名前または uid のみで、数値の `uid:gid` に解決していない（解決は未実装。#2433）。
+    /// 真で CRI の `run_as_user` が無いときは `UNIMPLEMENTED` で拒否する。
+    pub user_unresolved: bool,
 }
 
 /// 検証済みの `config.json` のバイト列（REPAIR-2）。
@@ -735,6 +741,9 @@ fn build_inner(
     }
 
     let run_as_user = nonneg_u32("run_as_user", &sc.and_then(|s| s.run_as_user))?;
+    if run_as_user.is_none() && image.user_unresolved {
+        return Err(unsupported("image user"));
+    }
     let run_as_group = nonneg_u32("run_as_group", &sc.and_then(|s| s.run_as_group))?;
     if run_as_group.is_some() && run_as_user.is_none() {
         return Err(invalid("run_as_group"));

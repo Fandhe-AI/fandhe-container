@@ -1,0 +1,490 @@
+//! 本番の [`RootfsSource`]: pull 済みイメージを bundle の `rootfs/` へ展開し、イメージ config の既定値を返す
+//! （CRI-2・OCI-1・OCI-4・OCI-7・SEC-1・SEC-5・REPAIR-2・REPAIR-5。#2433）。
+//!
+//! 呼び出し元: [`super::SpecBundleProvider`] の `prepare`（`CreateContainer` の worker スレッド上）が `prepare` を、
+//! Create の巻き戻しと `RemoveContainer` が `release` を呼ぶ。返した [`ImageDefaults`] は
+//! [`super::build_runtime_config`] が `config.json` へ合成する。キャッシュを作る側は [`crate::image_pull`]
+//! （`PullImage`）で、本モジュールはそのキャッシュを**読むだけ**で書き換えない。
+//!
+//! # rootfs の用意（A5・OCI-7・SEC-1）
+//!
+//! `PullImage` が公開した展開済み rootfs（`<cache>/rootfs/sha256/<hex>/rootfs`）はコンテナの rootfs として直接使わない
+//! （コンテナの書き込みがキャッシュと次回以降の create に届くため）。ここでは公開済みエントリを「pull が検証を完了した」
+//! 印と展開記録（`unpack-record`）の置き場としてだけ読み、**キャッシュの検証済み layer blob から bundle の `rootfs/` へ
+//! 再展開**する（コンテナごとの私有の木ができる。複製の一形態）。pull と同じ入口（`VerifiedLayerBlob::open` →
+//! `extract_image_layers_with_options`）を通すため、所有者の写像・特殊ビット・展開上限・diff_id 照合は pull と同一になる。
+//!
+//! 代償: create ごとに展開のコスト（時間・ディスク）がかかる。overlay の下位層にする最適化は `mount(2)` の `unsafe` を
+//! 要し、本 crate には `sys` モジュールが無いため未実装（REPAIR-3）。
+//!
+//! # 検証の順序（信頼境界）
+//!
+//! 1. 要求（`ImageSpec`）の長さ・NUL・`runtime_handler` を、キャッシュに触れる前に検証する。参照はパス要素に使わず、
+//!    `Digest::parse` で検証した 16 進部だけを使う
+//! 2. キャッシュの `blobs/sha256`・`rootfs/sha256` を所有者・権限・symlink の検証つきで開き、公開済みエントリが
+//!    信頼できなければ**消さずに**拒否する
+//! 3. 展開記録を symlink を辿らず非ブロッキングで開き、同じハンドルの fstat で信頼条件を確かめ、`settings` 部が
+//!    今回の展開設定と完全一致することを要求する（食い違えば `FAILED_PRECONDITION`。黙って別設定で展開しない）
+//! 4. config blob は上限つきで 1 回だけ読み、**読んだバイト列そのもの**の sha256 を image ID と照合してから
+//!    `rootfs.diff_ids` と `config` 節を同じ本文から解析する
+//! 5. layer は記録の `layer=` 行から得る。件数は config の `diff_ids` と一致を要求し、各 blob は fstat のサイズで
+//!    `VerifiedLayerBlob::open`（digest・サイズ照合）してから展開する
+//!
+//! # 未実装・簡易実装（REPAIR-3）
+//!
+//! - **タグ・digest 参照の解決**: plugin-cri は `ImageService` をサーブしておらず、プロセス内でタグを解決できない。
+//!   [`ImageRootfsSource::with_image_store`] で `ImageStore` を注入したときだけタグを解決し、無ければ
+//!   `sha256:<64 桁小文字 hex>` の image ID だけを受ける（それ以外は `UNIMPLEMENTED`）
+//! - **イメージの User**: 数値の `uid:gid` だけを解決する。名前と uid のみは rootfs 内の `/etc/passwd`・`/etc/group` を
+//!   読む必要があり、リンク経由でホストの内容を読む経路ができるため未実装で、[`ImageDefaults::user_unresolved`] で
+//!   `build_runtime_config` に拒否させる（root へ黙ってフォールバックしない）
+//! - **展開設定**: 所有者・特殊ビットの本番の値（`ChownMapped` 等）の決定は #2534 の担当。既定は pull と同じ
+//!   `Keep` + `Strip`。pull と create の設定は [`ImageExtractConfig`] で 1 か所にまとめる
+//! - 展開中の処理は打ち切れない。期限は展開の前後で確認する（REPAIR-5。pull と同じ制約）
+//! - 展開済み rootfs・blob の GC は TASK-183（OCI-7）の担当
+
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use fandhe_container_oci::config::{
+    ImageProcessConfig, MAX_CONFIG_BYTES, parse_verified_image_config,
+};
+use fandhe_container_oci::error::OciErrorCode;
+use fandhe_container_oci::instrument::{NoopOciOpRecorder, OciOpRecorder};
+use fandhe_container_oci::layer::extract::{
+    ExtractLimits, ExtractOptions, ImageLayer, extract_image_layers_with_options,
+    remove_extracted_tree,
+};
+use fandhe_container_oci::layer::{VerifiedLayerBlob, open_blob_nofollow};
+use fandhe_container_oci::manifest::MAX_LAYERS;
+use fandhe_container_oci::reference::Digest;
+
+use super::provider::RootfsSource;
+use super::spec::ImageDefaults;
+use crate::error::CriError;
+use crate::image_pull::{
+    DEFAULT_MAX_IMAGE_BYTES, MAX_RECORD_BYTES, PullConfig, PullError, RECORD_FILE, blob_file_facts,
+    check_blob_trust, create_private_dir, digest_hex, expected_root_owner_for,
+    inspect_published_rootfs, prepare_private_dir, record_settings,
+};
+use crate::image_service::{ImageStore, MAX_IMAGE_FIELD_BYTES};
+use crate::runtime::v1::ImageSpec;
+
+/// 1 回の rootfs 用意の既定の期限（展開の前後で確認する。REPAIR-5）。
+pub const DEFAULT_ROOTFS_DEADLINE: Duration = Duration::from_secs(10 * 60);
+/// `ImageSpec.annotations` の件数上限（本実装は使わないが、確保前に上限を検証する）。
+const MAX_ANNOTATIONS: usize = 64;
+/// イメージの User の数値 1 項目の最大桁数（`u32` の 10 桁）。
+const MAX_ID_DIGITS: usize = 10;
+
+/// 展開に使う設定の束。`PullConfig` の対応する項目と同じ値を渡せる（pull と create で展開設定が食い違うと、
+/// 記録の照合で `FAILED_PRECONDITION` になるため、1 か所から配る。#2534 が両方を配線する）。
+#[derive(Debug, Clone)]
+pub struct ImageExtractConfig {
+    /// キャッシュのルート（`PullConfig::cache_dir` と同じ。`blobs/sha256` と `rootfs/sha256` を持つ）。
+    pub cache_dir: PathBuf,
+    /// レイヤー展開の所有者・特殊ビットの選択肢（pull 時の記録と一致すること）。
+    pub extract_options: ExtractOptions,
+    /// レイヤー展開の上限。
+    pub extract_limits: ExtractLimits,
+    /// 1 レイヤーあたりの展開後（tar）サイズの上限。
+    pub max_uncompressed_layer_bytes: u64,
+    /// layer blob の圧縮サイズ合計の上限。
+    pub max_image_bytes: u64,
+    /// 1 回の用意の期限。
+    pub deadline: Duration,
+}
+
+impl ImageExtractConfig {
+    /// pull と同じ既定値で作る（`Keep` + `Strip`。写せないアーキテクチャは `Unimplemented`）。
+    pub fn new(cache_dir: impl Into<PathBuf>) -> Result<Self, CriError> {
+        Ok(Self::from_pull_config(&PullConfig::new(cache_dir)?))
+    }
+
+    /// `PullConfig` の展開に関する項目をそのまま写す（pull と create の設定を一致させる）。
+    pub fn from_pull_config(pull: &PullConfig) -> Self {
+        Self {
+            cache_dir: pull.cache_dir.clone(),
+            extract_options: pull.extract_options.clone(),
+            extract_limits: pull.extract_limits,
+            max_uncompressed_layer_bytes: pull.max_uncompressed_layer_bytes,
+            max_image_bytes: pull.max_image_bytes.min(DEFAULT_MAX_IMAGE_BYTES),
+            deadline: DEFAULT_ROOTFS_DEADLINE,
+        }
+    }
+}
+
+/// 展開記録の `layer=` 行 1 件。
+struct RecordedLayer {
+    digest: Digest,
+    media_type: String,
+}
+
+/// pull 済みイメージを bundle の `rootfs/` へ再展開する本番の [`RootfsSource`]。
+pub struct ImageRootfsSource {
+    config: ImageExtractConfig,
+    store: Option<Arc<dyn ImageStore>>,
+    recorder: Arc<dyn OciOpRecorder>,
+}
+
+impl std::fmt::Debug for ImageRootfsSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageRootfsSource")
+            .field("cache_dir", &self.config.cache_dir)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ImageRootfsSource {
+    /// 展開設定から作る。タグの解決器は無く、image ID（`sha256:<hex>`）だけを受ける。
+    pub fn new(config: ImageExtractConfig) -> Self {
+        Self {
+            config,
+            store: None,
+            recorder: Arc::new(NoopOciOpRecorder),
+        }
+    }
+
+    /// タグ・digest 参照を image ID へ解決する `ImageStore` を注入する（`ImageService` と同じストアを共有したとき用）。
+    #[must_use]
+    pub fn with_image_store(mut self, store: Arc<dyn ImageStore>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// 展開の計装（REPAIR-4）の記録先を差し替える。
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Arc<dyn OciOpRecorder>) -> Self {
+        self.recorder = recorder;
+        self
+    }
+
+    /// `ImageSpec` を検証し、image ID（config digest）へ解決する。キャッシュには触れない。
+    fn resolve_image_id(&self, spec: &ImageSpec) -> Result<Digest, CriError> {
+        let bad = || CriError::invalid_argument("image reference is invalid");
+        let too_long = |s: &str| s.len() > MAX_IMAGE_FIELD_BYTES;
+        if spec.image.is_empty()
+            || too_long(&spec.image)
+            || spec.image.contains('\0')
+            || too_long(&spec.user_specified_image)
+            || too_long(&spec.image_ref)
+            || spec.annotations.len() > MAX_ANNOTATIONS
+            || spec
+                .annotations
+                .iter()
+                .any(|(k, v)| too_long(k) || too_long(v))
+        {
+            return Err(bad());
+        }
+        if !spec.runtime_handler.is_empty() {
+            return Err(CriError::unimplemented(
+                "image runtime_handler is not supported",
+            ));
+        }
+        if let Some(store) = &self.store {
+            let found = store
+                .get(&spec.image)
+                .map_err(|_| CriError::internal("image store is unavailable"))?;
+            if let Some(id) = found.and_then(|r| Digest::parse(r.id()).ok()) {
+                return Ok(id);
+            }
+        }
+        let is_bare_hex =
+            spec.image.len() == 64 && spec.image.bytes().all(|b| b.is_ascii_hexdigit());
+        if spec.image.starts_with("sha256:") || is_bare_hex {
+            // image ID の形をしているものは、形が不正なら INVALID_ARGUMENT（素の hex も受けない）。
+            return Digest::parse(&spec.image).map_err(|_| bad());
+        }
+        Err(CriError::unimplemented(
+            "image reference resolution is not available; use the image id",
+        ))
+    }
+
+    fn check_deadline(&self, started: Instant) -> Result<(), CriError> {
+        if started.elapsed() >= self.config.deadline {
+            return Err(CriError::timeout(
+                "image rootfs preparation exceeded its deadline",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn untrusted(message: &'static str) -> CriError {
+    CriError::failed_precondition(message)
+}
+
+/// 展開記録を信頼条件つきで読み、`settings` 部の完全一致を確かめて `layer=` 行を返す。
+fn read_layers(
+    path: &Path,
+    expected_settings: &str,
+    owner: u32,
+) -> Result<Vec<RecordedLayer>, CriError> {
+    let mut file = open_blob_nofollow(path)
+        .map_err(|_| untrusted("image rootfs cache entry has no unpack record"))?;
+    let facts = blob_file_facts(&file)
+        .ok_or_else(|| untrusted("image rootfs unpack record is not trusted"))?;
+    check_blob_trust(&facts, owner)
+        .map_err(|_| untrusted("image rootfs unpack record is not trusted"))?;
+    let mut body = Vec::new();
+    (&mut file)
+        .take(MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| {
+            CriError::new(
+                crate::error::CriErrorCode::DataLoss,
+                "image rootfs unpack record could not be read",
+            )
+        })?;
+    if body.len() as u64 > MAX_RECORD_BYTES {
+        return Err(CriError::resource_exhausted(
+            "image rootfs unpack record exceeds the size limit",
+        ));
+    }
+    let Some(rest) = body.strip_prefix(expected_settings.as_bytes()) else {
+        return Err(untrusted(
+            "image rootfs cache entry was unpacked with different settings",
+        ));
+    };
+    let data_loss = || {
+        CriError::new(
+            crate::error::CriErrorCode::DataLoss,
+            "image rootfs unpack record is malformed",
+        )
+    };
+    let text = std::str::from_utf8(rest).map_err(|_| data_loss())?;
+    let mut layers = Vec::new();
+    for line in text.lines() {
+        if layers.len() >= MAX_LAYERS {
+            return Err(CriError::resource_exhausted(
+                "image rootfs unpack record has too many layers",
+            ));
+        }
+        let entry = line.strip_prefix("layer=").ok_or_else(data_loss)?;
+        let (digest, media_type) = entry.split_once(' ').ok_or_else(data_loss)?;
+        let digest = Digest::parse(digest).map_err(|_| data_loss())?;
+        layers.push(RecordedLayer {
+            digest,
+            media_type: media_type.to_owned(),
+        });
+    }
+    Ok(layers)
+}
+
+/// config blob を信頼条件つきで上限まで 1 回だけ読み、読んだ本文の digest を image ID と照合してから解析する。
+fn read_config(
+    blobs: &Path,
+    owner: u32,
+    id: &Digest,
+) -> Result<(Vec<Digest>, ImageProcessConfig), CriError> {
+    let mut file = open_blob_nofollow(&blobs.join(digest_hex(id)))
+        .map_err(|e| CriError::from(PullError::from_config(&e)))?;
+    let facts =
+        blob_file_facts(&file).ok_or_else(|| untrusted("cached image config is not trusted"))?;
+    check_blob_trust(&facts, owner).map_err(|_| untrusted("cached image config is not trusted"))?;
+    let mut body = Vec::new();
+    (&mut file)
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| {
+            CriError::new(
+                crate::error::CriErrorCode::DataLoss,
+                "image config could not be read",
+            )
+        })?;
+    if body.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(CriError::resource_exhausted(
+            "image config exceeds the size limit",
+        ));
+    }
+    let (rootfs, process) = parse_verified_image_config(&body, id)
+        .map_err(|e| CriError::from(PullError::from_config(&e)))?;
+    Ok((rootfs.diff_ids().to_vec(), process))
+}
+
+/// イメージ config の実行既定値を [`ImageDefaults`] へ写す。
+///
+/// User は数値の `uid:gid` だけ解決し、名前・uid のみは未解決として印を付ける（root へ落とさない）。
+fn defaults_from(process: &ImageProcessConfig) -> Result<ImageDefaults, CriError> {
+    let working_dir = match process.working_dir() {
+        "" => None,
+        "/" => Some("/".to_owned()),
+        w => Some(w.strip_suffix('/').unwrap_or(w).to_owned()),
+    };
+    let (user, user_unresolved) = parse_user(process.user())?;
+    Ok(ImageDefaults {
+        entrypoint: process.entrypoint().to_vec(),
+        cmd: process.cmd().to_vec(),
+        env: process.env().to_vec(),
+        working_dir,
+        user,
+        user_unresolved,
+    })
+}
+
+fn parse_user(user: &str) -> Result<(Option<(u32, u32)>, bool), CriError> {
+    if user.is_empty() {
+        return Ok((None, false));
+    }
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let id = |s: &str| -> Result<u32, CriError> {
+        if s.len() > MAX_ID_DIGITS {
+            return Err(CriError::invalid_argument("image user is invalid"));
+        }
+        s.parse::<u32>()
+            .map_err(|_| CriError::invalid_argument("image user is invalid"))
+    };
+    match user.split_once(':') {
+        Some((u, g)) if numeric(u) && numeric(g) => Ok((Some((id(u)?, id(g)?)), false)),
+        // 名前・uid のみ・名前つきの組は、passwd / group の解決が要るため未解決（拒否される）。
+        _ => Ok((None, true)),
+    }
+}
+
+impl RootfsSource for ImageRootfsSource {
+    fn prepare(&self, image: &ImageSpec, rootfs: &Path) -> Result<ImageDefaults, CriError> {
+        let started = Instant::now();
+        let id = self.resolve_image_id(image)?;
+        let opts = &self.config.extract_options;
+        let blobs = prepare_private_dir(&self.config.cache_dir, &["blobs", "sha256"])?;
+        let entries = prepare_private_dir(&self.config.cache_dir, &["rootfs", "sha256"])?;
+        let root_owner = expected_root_owner_for(opts, entries.owner)?;
+        let entry = entries.path.join(digest_hex(&id));
+        // 公開済みエントリは「pull が検証を完了した」印としてだけ見る。展開済み rootfs は開かず、書かない。
+        if !inspect_published_rootfs(&entry, entries.owner, root_owner)? {
+            return Err(CriError::not_found(
+                "image is not present in the local cache",
+            ));
+        }
+        let settings = record_settings(&id, opts)?;
+        let layers = read_layers(&entry.join(RECORD_FILE), &settings, entries.owner)?;
+        let (diff_ids, process) = read_config(&blobs.path, blobs.owner, &id)?;
+        let defaults = defaults_from(&process)?;
+        if layers.len() != diff_ids.len() {
+            return Err(CriError::new(
+                crate::error::CriErrorCode::DataLoss,
+                "image layer count does not match the config",
+            ));
+        }
+        // 各 blob を fstat のサイズで検証つきに開く。サイズは上限内であること（digest 照合は open が行う）。
+        let mut total: u64 = 0;
+        let mut verified = Vec::with_capacity(layers.len());
+        for l in &layers {
+            let path = blobs.path.join(digest_hex(&l.digest));
+            let size = open_blob_nofollow(&path)
+                .and_then(|f| {
+                    f.metadata().map(|m| m.len()).map_err(|_| {
+                        fandhe_container_oci::error::OciError::new(
+                            OciErrorCode::DataLoss,
+                            "layer blob could not be inspected",
+                        )
+                    })
+                })
+                .map_err(|e| CriError::from(PullError::from_extract(&e)))?;
+            total = total.saturating_add(size);
+            if size > self.config.max_image_bytes || total > self.config.max_image_bytes {
+                return Err(CriError::resource_exhausted(
+                    "image layers exceed the size limit",
+                ));
+            }
+            verified.push(
+                VerifiedLayerBlob::open(&path, &l.digest, size, blobs.owner)
+                    .map_err(|e| CriError::from(PullError::from_extract(&e)))?,
+            );
+        }
+        let image_layers: Vec<ImageLayer<'_>> = verified
+            .iter()
+            .zip(&layers)
+            .zip(&diff_ids)
+            .map(|((b, l), d)| ImageLayer::new(b, &l.media_type, d))
+            .collect();
+        self.check_deadline(started)?;
+        // 呼び出し元（SpecBundleProvider）が渡す不在のパスを 0700 で作る。作れなければ他人の実体の可能性があり消さない。
+        create_private_dir(rootfs).map_err(CriError::from)?;
+        let extracted = extract_image_layers_with_options(
+            self.recorder.as_ref(),
+            &image_layers,
+            rootfs,
+            self.config.max_uncompressed_layer_bytes,
+            self.config.extract_limits,
+            opts,
+        )
+        .map_err(|e| CriError::from(PullError::from_extract(&e)))
+        .and_then(|_| self.check_deadline(started));
+        if let Err(e) = extracted {
+            // 先行レイヤーの展開物が残るため、自分が作った rootfs だけを消す（0555 等も権限を戻して消す）。
+            let _ = remove_extracted_tree(rootfs);
+            return Err(e);
+        }
+        Ok(defaults)
+    }
+
+    fn release(&self, rootfs: &Path) -> Result<(), CriError> {
+        match std::fs::symlink_metadata(rootfs) {
+            Ok(m) if m.file_type().is_dir() => remove_extracted_tree(rootfs)
+                .map_err(|_| CriError::internal("failed to remove rootfs")),
+            // symlink・通常ファイル等は辿らず消さない（リンク先の削除を防ぐ。fail-closed）。
+            Ok(_) => Err(CriError::internal("rootfs path is not a directory")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(CriError::internal("failed to inspect rootfs")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn process(user: &str, wd: &str) -> ImageProcessConfig {
+        let body = format!(r#"{{"config":{{"User":"{user}","WorkingDir":"{wd}"}}}}"#);
+        fandhe_container_oci::config::parse_image_config_process(body.as_bytes()).unwrap()
+    }
+
+    /// CRI-2: User の変換表。数値の `uid:gid` だけ解決し、名前・uid のみは未解決の印を付ける。
+    #[test]
+    fn cri2_image_user_conversion_table() {
+        let get = |u: &str| defaults_from(&process(u, "")).map(|d| (d.user, d.user_unresolved));
+        assert_eq!(get("").unwrap(), (None, false));
+        assert_eq!(get("1000:2000").unwrap(), (Some((1000, 2000)), false));
+        assert_eq!(get("0:0").unwrap(), (Some((0, 0)), false));
+        assert_eq!(get("0").unwrap(), (None, true));
+        assert_eq!(get("1000").unwrap(), (None, true));
+        assert_eq!(get("app").unwrap(), (None, true));
+        assert_eq!(get("app:staff").unwrap(), (None, true));
+        assert_eq!(get("1000:staff").unwrap(), (None, true));
+        assert_eq!(
+            get("4294967296:0").unwrap_err().code(),
+            crate::error::CriErrorCode::InvalidArgument
+        );
+        assert_eq!(get("4294967295:1").unwrap(), (Some((u32::MAX, 1)), false));
+    }
+
+    /// CRI-2: WorkingDir は末尾の `/` を 1 つ除く。ルートと空は別扱い。
+    #[test]
+    fn cri2_image_working_dir_normalization() {
+        let get = |w: &str| defaults_from(&process("", w)).unwrap().working_dir;
+        assert_eq!(get(""), None);
+        assert_eq!(get("/"), Some("/".to_owned()));
+        assert_eq!(get("/srv/"), Some("/srv".to_owned()));
+        assert_eq!(get("/srv"), Some("/srv".to_owned()));
+        assert_eq!(get("rel"), Some("rel".to_owned()));
+    }
+
+    /// 上限定数は bundle 変換（spec.rs）と oci の config 解析で同値（依存の向きのため 2 か所で持つ）。
+    #[test]
+    fn cri2_process_limits_match_bundle_limits() {
+        use fandhe_container_oci::config as c;
+        assert_eq!(c::MAX_PROCESS_ITEMS, super::super::spec::MAX_ARGS);
+        assert_eq!(c::MAX_PROCESS_ITEMS, super::super::spec::MAX_ENV);
+        assert_eq!(
+            c::MAX_PROCESS_STRING_BYTES,
+            super::super::spec::MAX_STRING_BYTES
+        );
+        assert_eq!(
+            c::MAX_PROCESS_PATH_BYTES,
+            super::super::spec::MAX_PATH_BYTES
+        );
+    }
+}

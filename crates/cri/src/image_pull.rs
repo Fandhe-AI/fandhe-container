@@ -33,8 +33,9 @@
 //! - 作りかけの rootfs を公開しない。展開はステージングの中だけで行い、diff_id の不一致・上限超過・未対応の
 //!   mediaType などで失敗したらステージングごと消す（先行レイヤーの展開物も残らない）。展開後に中断した root が
 //!   持つ 0555 等のディレクトリは、oci の `remove_extracted_tree` が権限を戻して消す
-//! - 公開済み rootfs は読み取り専用の元として扱い、コンテナの rootfs として直接書き換えない（複製・overlay の
-//!   下位層に使う。create 経路は TASK-59.2 の担当）。公開先が信頼できない状態（symlink・他人所有など）なら
+//! - 公開済み rootfs は読み取り専用の元として扱い、コンテナの rootfs として直接書き換えない。create 経路
+//!   （`crate::bundle::ImageRootfsSource`。#2433）は、この rootfs に触れず、検証済み blob から bundle の `rootfs/` へ
+//!   再展開する（複製の一形態。overlay の下位層は未実装）。公開先が信頼できない状態（symlink・他人所有など）なら
 //!   消さずに拒否する
 //! - エラー文言は固定の英語で、イメージ名・資格情報・レジストリ応答の文言を含めない（`.claude/rules/security.md`）
 //! - 資格情報は oci の `BasicCredentials` で検証され、`Debug` は伏せられる。zeroize は未対応（oci と同様。依存を足さない）
@@ -601,11 +602,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
     /// 展開結果を決める入力（config・所有者と特殊ビットの設定）と、今回の layer の表現を記録にする。
     /// 公開済み rootfs の再利用可否は、この記録が展開時のものと一致するかで決める（#2323・OCI-1・SEC-5）。
     fn unpack_record(&self, manifest: &ImageManifest) -> Result<UnpackRecord, PullError> {
-        let mut settings = format!(
-            "fandhe-rootfs-v2\nconfig={}\n",
-            manifest.config.digest.as_str()
-        );
-        settings.push_str(&encode_extract_options(&self.config.extract_options)?);
+        let settings = record_settings(&manifest.config.digest, &self.config.extract_options)?;
         let mut layers = String::new();
         for d in &manifest.layers {
             layers.push_str("layer=");
@@ -626,15 +623,7 @@ impl<C: RegistryPullClient> OciImagePuller<C> {
     /// 公開済み rootfs の root が持つべき所有 uid。`ChownMapped` では展開が root を写像先（コンテナ uid 0 の
     /// ホスト側 ID）へ `chown` するため、それを期待値にする。それ以外は管理プロセスの uid（`owner`）。
     fn expected_root_owner(&self, owner: u32) -> Result<u32, PullError> {
-        match &self.config.extract_options.ownership {
-            OwnershipPolicy::ChownMapped { uid, .. } => uid.map_to_host(0).ok_or_else(|| {
-                PullError::new(
-                    OciErrorCode::InvalidArgument,
-                    "id mapping does not cover the container root user",
-                )
-            }),
-            _ => Ok(owner),
-        }
+        expected_root_owner_for(&self.config.extract_options, owner)
     }
 
     /// 信頼できる検証済みの既存 blob があれば取得を省き、そうでなければステージングへ取得 → 検証 → 公開する。
@@ -864,7 +853,7 @@ impl<C: RegistryPullClient> ImagePuller for OciImagePuller<C> {
 }
 
 /// `sha256:` を除いた 16 進部（`Digest` の検証済み不変条件により小文字 hex 64 桁のみ。パス要素に安全）。
-fn digest_hex(digest: &Digest) -> &str {
+pub(crate) fn digest_hex(digest: &Digest) -> &str {
     digest.as_str().strip_prefix("sha256:").unwrap_or("")
 }
 
@@ -903,7 +892,10 @@ pub fn canonical_reference(input: &str) -> Option<String> {
 /// blob 公開（rename）で未検証の内容が混入する経路を塞ぐ。ディレクトリの検証は配下の既存 inode の書き換えを
 /// 防がないため、blob ファイル自体の所有者・権限・ハードリンク数は [`check_blob_trust`] で別に確認する。
 /// 0700 の指定は新規作成時にしか効かないので、既存ディレクトリは必ずここで検証する。
-fn prepare_private_dir(cache_dir: &Path, components: &[&str]) -> Result<TrustedDir, PullError> {
+pub(crate) fn prepare_private_dir(
+    cache_dir: &Path,
+    components: &[&str],
+) -> Result<TrustedDir, PullError> {
     let prep_err = || {
         PullError::new(
             OciErrorCode::FailedPrecondition,
@@ -949,16 +941,16 @@ fn prepare_private_dir(cache_dir: &Path, components: &[&str]) -> Result<TrustedD
 /// `owner` は呼び出しプロセスの実効 UID 相当（`owner_probe`）で、配下の blob ファイルの所有者確認
 /// （[`check_blob_trust`]）にも同じ値を使う（基準を取り直さない）。
 #[derive(Debug)]
-struct TrustedDir {
-    path: PathBuf,
-    owner: u32,
+pub(crate) struct TrustedDir {
+    pub(crate) path: PathBuf,
+    pub(crate) owner: u32,
 }
 
 /// blob ファイルの信頼条件の判定材料。開いたハンドルの fstat から得た値で、パスからは読まない
 /// （[`blob_file_facts`]）。判定（[`check_blob_trust`]）を OS 呼び出しから分け、他ユーザー所有のように
 /// root なしでは作れない状態も具体値で試験できるようにする（REPAIR-12）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct BlobFileFacts {
+pub(crate) struct BlobFileFacts {
     /// 通常ファイルか（ディレクトリ・FIFO・デバイス等でない）。
     is_regular_file: bool,
     /// 所有者の UID。
@@ -971,7 +963,7 @@ struct BlobFileFacts {
 
 /// blob ファイルが信頼条件を満たさない理由（[`check_blob_trust`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlobTrustViolation {
+pub(crate) enum BlobTrustViolation {
     /// 通常ファイルでない。
     NotRegularFile,
     /// 所有者が呼び出しプロセスと異なる（所有者は後から権限を変えて書き換えられる）。
@@ -988,7 +980,10 @@ enum BlobTrustViolation {
 /// 違反が複数あれば、この順で最初の 1 つを返す（順序は契約。[`open_staged_blob`] は
 /// `WritableByOthers` を「それ以外の条件は満たしている」と読む）。同種の確認は net の hosts ファイル追記・
 /// plugin の UDS 検証にもある（crate をまたぐ共有はしていない）。
-fn check_blob_trust(facts: &BlobFileFacts, owner: u32) -> Result<(), BlobTrustViolation> {
+pub(crate) fn check_blob_trust(
+    facts: &BlobFileFacts,
+    owner: u32,
+) -> Result<(), BlobTrustViolation> {
     if !facts.is_regular_file {
         return Err(BlobTrustViolation::NotRegularFile);
     }
@@ -1006,7 +1001,7 @@ fn check_blob_trust(facts: &BlobFileFacts, owner: u32) -> Result<(), BlobTrustVi
 
 /// 開いたハンドルから判定材料を読む（fstat。パスは引かない）。読めなければ `None`。
 #[cfg(unix)]
-fn blob_file_facts(file: &fs::File) -> Option<BlobFileFacts> {
+pub(crate) fn blob_file_facts(file: &fs::File) -> Option<BlobFileFacts> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = file.metadata().ok()?;
     Some(BlobFileFacts {
@@ -1021,7 +1016,7 @@ fn blob_file_facts(file: &fs::File) -> Option<BlobFileFacts> {
 /// （呼び出し側は再利用も公開もしない。fail-closed）。キャッシュ準備（`owner_probe`）が先に
 /// `Unimplemented` で拒否するため、現状は到達しない。
 #[cfg(not(unix))]
-fn blob_file_facts(_file: &fs::File) -> Option<BlobFileFacts> {
+pub(crate) fn blob_file_facts(_file: &fs::File) -> Option<BlobFileFacts> {
     None
 }
 
@@ -1111,9 +1106,9 @@ fn read_verified_config(
 }
 
 /// 公開済みエントリ内の展開物のディレクトリ名。
-const ROOTFS_SUBDIR: &str = "rootfs";
+pub(crate) const ROOTFS_SUBDIR: &str = "rootfs";
 /// 公開済みエントリ内の展開時の設定の記録のファイル名。
-const RECORD_FILE: &str = "unpack-record";
+pub(crate) const RECORD_FILE: &str = "unpack-record";
 
 /// 展開時の設定の記録。`settings` は展開結果を決める入力（config・所有者・特殊ビット）、`layers` は今回の layer の
 /// 表現（圧縮 blob の digest と mediaType）。
@@ -1132,7 +1127,7 @@ enum RecordMatch {
 
 /// `ExtractOptions` を固定書式で符号化する。`Debug` 出力は書式が安定しないため使わない（記録の互換性を保つ）。
 /// 未知の選択肢（将来追加された variant）は黙って同一視せず `Unimplemented` で拒否する（fail-closed）。
-fn encode_extract_options(options: &ExtractOptions) -> Result<String, PullError> {
+pub(crate) fn encode_extract_options(options: &ExtractOptions) -> Result<String, PullError> {
     use fandhe_container_oci::layer::extract::{IdRange, SpecialBitsPolicy};
     fn range(r: &IdRange) -> String {
         format!("{}:{}:{}", r.container_id, r.host_id, r.count)
@@ -1172,10 +1167,41 @@ fn encode_extract_options(options: &ExtractOptions) -> Result<String, PullError>
     Ok(format!("ownership={ownership}\nspecial-bits={special}\n"))
 }
 
+/// 展開記録の `settings` 部（先頭〜special-bits 行）を組み立てる。pull（書き込み）と create（照合。#2433）が
+/// 同じ書式を使い、展開設定の食い違いを検出する。
+pub(crate) fn record_settings(
+    config: &Digest,
+    options: &ExtractOptions,
+) -> Result<String, PullError> {
+    let mut settings = format!("fandhe-rootfs-v2\nconfig={}\n", config.as_str());
+    settings.push_str(&encode_extract_options(options)?);
+    Ok(settings)
+}
+
+/// 公開済み rootfs の root が持つべき所有 uid（`ChownMapped` では写像先、それ以外は `owner`）。
+pub(crate) fn expected_root_owner_for(
+    options: &ExtractOptions,
+    owner: u32,
+) -> Result<u32, PullError> {
+    match &options.ownership {
+        OwnershipPolicy::ChownMapped { uid, .. } => uid.map_to_host(0).ok_or_else(|| {
+            PullError::new(
+                OciErrorCode::InvalidArgument,
+                "id mapping does not cover the container root user",
+            )
+        }),
+        _ => Ok(owner),
+    }
+}
+
 /// 公開済みエントリの有無を確かめる。有って信頼できれば `true`、無ければ `false`、有るのに信頼できなければ拒否する
 /// （消さない。#2323）。信頼条件はキャッシュのディレクトリと同じ（symlink でない・所有者一致・group/other 書き込みなし）。
 /// エントリ（管理プロセス所有）と中の `rootfs/`（`root_owner` 所有）の両方を見る。
-fn inspect_published_rootfs(entry: &Path, owner: u32, root_owner: u32) -> Result<bool, PullError> {
+pub(crate) fn inspect_published_rootfs(
+    entry: &Path,
+    owner: u32,
+    root_owner: u32,
+) -> Result<bool, PullError> {
     let untrusted = || {
         PullError::new(
             OciErrorCode::FailedPrecondition,
@@ -1197,7 +1223,7 @@ fn inspect_published_rootfs(entry: &Path, owner: u32, root_owner: u32) -> Result
 }
 
 /// 照合用の記録の読み取り上限。
-const MAX_RECORD_BYTES: u64 = 64 * 1024;
+pub(crate) const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
 /// 公開済みエントリの記録を `expected` と照合する。記録が無い・信頼できない・設定が食い違う場合は再利用せず拒否する
 /// （既存の展開物は消さない。コンテナの下位層として使われている可能性があるため）。
@@ -1262,7 +1288,7 @@ fn write_unpack_record(path: &Path, record: &UnpackRecord) -> Result<(), PullErr
 }
 
 /// 非再帰で 0700 のディレクトリを作る（既存は拒否。展開の root は空であることが前提）。
-fn create_private_dir(path: &Path) -> Result<(), PullError> {
+pub(crate) fn create_private_dir(path: &Path) -> Result<(), PullError> {
     #[cfg(unix)]
     let builder = {
         use std::os::unix::fs::DirBuilderExt as _;

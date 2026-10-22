@@ -39,7 +39,7 @@ fn fail_err(e: &PluginError) -> ExitCode {
 #[cfg(unix)]
 fn serve(socket: &std::path::Path) -> ExitCode {
     use fandhe_container_plugin::grpc::GrpcServerConfig;
-    use fandhe_container_plugin_cri::adapter::{CriPluginBackends, UnimplementedBundleProvider};
+    use fandhe_container_plugin_cri::adapter::CriPluginBackends;
     use fandhe_container_plugin_cri::{server, telemetry};
 
     let backends = match CriPluginBackends::production() {
@@ -54,7 +54,18 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         }
     };
     let recorder = std::sync::Arc::clone(backends.op_recorder());
-    let svc = backends.runtime_service(std::sync::Arc::new(UnimplementedBundleProvider));
+    // bundle の供給は fail-closed。置き場を用意できなければ（fixed 文言のみ出して）起動しない。
+    let bundles = match backends.production_bundle_provider() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!(
+                "error: {}: failed to prepare the bundle store",
+                e.code().as_str()
+            );
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    let svc = backends.runtime_service(bundles);
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()

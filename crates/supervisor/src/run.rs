@@ -45,7 +45,10 @@
 //!
 //! 未実装（将来仕様と対応ビヘイビア ID）:
 //! - 本番 `ProcessLauncher` による再 launch の実機での成立（結線は済み〔[`crate::restart::LauncherRelauncher`]〕だが、単一スレッドの要求を満たせず拒否される。#2043・SUP-3）。
-//! - 停止シグナルの猶予時間（#517）と、再 launch 時の `unless-stopped` と `always` の差（「明示 stop 済み」の state.json への持続化を要する。SUP-9・SUP-3）。明示 stop の意図は制御チャネルが [`StopToken::mark_explicit_stop`] で立てる（#2162）。
+//! - 停止シグナルの猶予時間（#517）。
+//! - 再 launch・re-adopt 時の `unless-stopped` と `always` の差: 「明示 stop 済み」は state.json に記録済み（#2440。トレイト契約 14）で、
+//!   判定の入口は `crate::restart::evaluate_resume`。それを呼ぶ re-adopt 本体は未実装（#514・SUP-8）。明示 stop の意図は
+//!   制御チャネルが [`StopToken::mark_explicit_stop`] で立てる（#2162）。
 //! - 指数バックオフ等の高度な間隔制御（現状は固定のバックオフ。SUP-3）。
 //! - [`MonitorOutcome::ExitedUnrecorded`] の回復（SUP-3）。
 //!
@@ -307,6 +310,8 @@ pub enum MonitorOperation {
     CaptureStart,
     /// 終了検知後の出力捕捉の終端待ち（#241）。
     CaptureDrain,
+    /// 明示 stop の state.json への記録（`Stopped` の記録へ「明示 stop 済み」を足す。#2440・SUP-9・SUP-3）。
+    RecordExplicitStop,
 }
 
 impl MonitorOperation {
@@ -323,6 +328,7 @@ impl MonitorOperation {
             Self::Restart => "restart",
             Self::CaptureStart => "capture_start",
             Self::CaptureDrain => "capture_drain",
+            Self::RecordExplicitStop => "record_explicit_stop",
         }
     }
 }

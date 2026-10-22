@@ -12,11 +12,11 @@
 //!
 //! | モジュール | 役割 |
 //! | ---------- | ---- |
-//! | `protocol` | 固定長 frame（Hello・SignalRequest・StopRequest・Response）と理由コード。全 OS |
+//! | `protocol` | 固定長 frame（Hello・SignalRequest・StopRequest・CancelRestartRequest・Response）と理由コード。全 OS |
 //! | `target` | 起動ハンドルの包み（`ControlledProcess`）と共有状態（`SignalSlot`）。全 OS |
 //! | `listener` | 置き場所の検証・bind・削除（Linux） |
 //! | `server` | accept ループ・接続元の検証・期限（Linux） |
-//! | `client` | CLI が使う入口 `ControlSignaler`（core の `ProcessSignaler` を実装。非 Linux は `Unimplemented`） |
+//! | `client` | CLI が使う入口 `ControlSignaler`（core の `ProcessSignaler` を実装）と `ControlRestartCanceller`（非 Linux は `Unimplemented`） |
 //!
 //! # 寿命
 //!
@@ -28,10 +28,13 @@
 //!
 //! - CLI の `kill` への結線（`stop` は `stop_delete::production_stop_signaler` で結線済み。#2059・#2162。`kill` は #1902 が
 //!   `ControlSignaler::new`〔stop の意図を立てない kind 2〕を使う。`kill` が意図を立てるかは #1902 の判断）
-//! - 明示 stop の意図は StopRequest（kind 4）が `StopToken::mark_explicit_stop` で立て、restart の判定が読む（SUP-9・#2162）。
-//!   supervisor の寿命の中では `always`・`unless-stopped` を含む全ポリシーで、stop 後は再起動しない。「明示 stop 済み」を
-//!   state.json に残して再 launch 時に `unless-stopped` と `always` を分けること、バックオフ中の stop で保留中の再起動を
-//!   取り消すことは未実装（core の `SupervisionState` の変更を要する）
+//! - 明示 stop の意図は StopRequest（kind 4。稼働中）か CancelRestartRequest（kind 5。バックオフ・再 launch 中。#2440）が
+//!   `StopToken::mark_explicit_stop` で立て、restart の判定が読む（SUP-9・#2162）。supervisor の寿命の中では `always`・
+//!   `unless-stopped` を含む全ポリシーで、stop 後は再起動しない。明示 stop は `restart` ループが state.json の `Stopped` の記録へ
+//!   「明示 stop 済み」（トレイト契約 14）として残す。記録に失敗したら再起動せず非 0 で終わる（fail-closed）。取り消しの `Ok` は
+//!   「この supervisor は再起動しない」の意味で、記録の成否は応答に含まれない（失敗は supervisor のログと終了コードで見える）。
+//!   終了から記録までの間に supervisor が死んだ場合も記録は残らず、その後の re-adopt では `unless-stopped` が起こし得る。
+//!   re-adopt 本体（`restart::evaluate_resume` を呼ぶ側）は未実装（#514・SUP-8）
 //! - restart の再 launch を単一スレッドで行う再構成（#2043）では、制御チャネルのスレッドも止める対象になる
 //!   （停止の口は `ControlServer::shutdown` に用意済み）
 //! - 異常終了で残った `supervisor.sock` は、core の `StateStore::delete`（`FileStateStore`）が `<id>/` を開いた fd を
@@ -51,7 +54,7 @@ pub mod observe;
 #[cfg(target_os = "linux")]
 pub mod server;
 
-pub use client::ControlSignaler;
+pub use client::{CancelOutcome, ControlRestartCanceller, ControlSignaler};
 
 /// 状態ルートを公開しないストア用の fail-closed の signaler。常に `Unimplemented` で失敗する（REPAIR-3）。
 ///
@@ -98,6 +101,45 @@ pub fn production_stop_signaler(
     match store.host_state_root() {
         Some(root) => std::sync::Arc::new(ControlSignaler::for_stop(root.to_path_buf())),
         None => std::sync::Arc::new(UnavailableSignaler),
+    }
+}
+
+/// バックオフ中・再 launch 中の stop で、supervisor の保留中の再起動を取り消す注入点（SUP-9・SUP-3・#2440）。
+///
+/// CLI の `stop`（`Stopped` の記録に対する分岐）が呼ぶ。本番は [`ControlRestartCanceller`]、CLI の試験は差し替える。
+pub trait PendingRestartCanceller: Send + Sync {
+    /// `deadline` までに取り消しを依頼し、結果を返す。シグナルは送らない。
+    fn cancel(
+        &self,
+        id: &fandhe_container_core::traits::ContainerId,
+        deadline: std::time::Instant,
+    ) -> Result<CancelOutcome, fandhe_container_core::traits::TraitError>;
+}
+
+/// 状態ルートを公開しないストア用の fail-closed の canceller。常に `Unimplemented` で失敗する（REPAIR-3）。
+pub struct UnavailableRestartCanceller;
+
+impl PendingRestartCanceller for UnavailableRestartCanceller {
+    fn cancel(
+        &self,
+        _id: &fandhe_container_core::traits::ContainerId,
+        _deadline: std::time::Instant,
+    ) -> Result<CancelOutcome, fandhe_container_core::traits::TraitError> {
+        Err(fandhe_container_core::traits::TraitError::new(
+            fandhe_container_core::traits::ErrorCode::Unimplemented,
+            "restart canceller is not available yet",
+        ))
+    }
+}
+
+/// 本番の canceller（`stop` が `Stopped` の記録に当たったとき用。SUP-9・SUP-3・#2440）。
+/// [`production_stop_signaler`] と同じ到達先の規則で、`host_state_root()` の無いストアには fail-closed の実装を返す。
+pub fn production_restart_canceller(
+    store: &dyn fandhe_container_core::traits::StateStore,
+) -> std::sync::Arc<dyn PendingRestartCanceller> {
+    match store.host_state_root() {
+        Some(root) => std::sync::Arc::new(ControlRestartCanceller::new(root.to_path_buf())),
+        None => std::sync::Arc::new(UnavailableRestartCanceller),
     }
 }
 

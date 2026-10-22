@@ -27,9 +27,11 @@ use std::sync::Arc;
 use fandhe_container_core::launch_isolation::LaunchIsolationRecord;
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
 use fandhe_container_core::traits::{
-    ContainerId, ContainerStatus, ErrorCode, GetStateRequest, StateRecord, StateStore,
-    SupervisionState, TraitError, UpdateStateRequest,
+    ContainerId, ContainerState, ContainerStatus, ErrorCode, ExplicitStop, GetStateRequest,
+    StateRecord, StateStore, SupervisionState, TraitError, UpdateStateRequest,
 };
+
+use crate::run::MAX_WRITE_ATTEMPTS;
 
 /// core の既定ストア（`FileStateStore`）を開く。
 ///
@@ -127,6 +129,51 @@ impl SupervisedState {
         }
         self.last = self.store.update(&req)?;
         Ok(&self.last)
+    }
+
+    /// 保持レコード（`monitor` が書いた `Stopped` の終了記録）へ「明示 stop 済み」を書き足す（トレイト契約 14。
+    /// SUP-9・SUP-3・SUP-8・#2440）。status と監視 3 項目は変えない。
+    ///
+    /// 保持レコードが `Stopped` でなければ `FailedPrecondition`。revision 不一致のときだけ `refresh` して再試行する
+    /// （上限 [`MAX_WRITE_ATTEMPTS`]）が、再読込したレコードの status・`restart_count` が変わったり監視権が付いたり
+    /// していれば（同じ ID の再作成・別処理の再起動）書かずに `FailedPrecondition` で中止する。
+    /// 呼び出し元は [`crate::restart::supervise_with_restart`] の監視スレッドだけ（`SupervisedState` を持つのは
+    /// 監視スレッドだけのため、書き手は他に増えない）。
+    pub fn write_explicit_stop(&mut self) -> Result<&StateRecord, TraitError> {
+        let expected_status = self.last.status().clone();
+        let expected_count = self.last.restart_count();
+        let mut last_err = TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "explicit stop write attempts exhausted",
+        );
+        for attempt in 0..MAX_WRITE_ATTEMPTS {
+            if attempt > 0 {
+                self.refresh()?;
+            }
+            let rec = &self.last;
+            if rec.status().state() != ContainerState::Stopped
+                || rec.status() != &expected_status
+                || rec.restart_count() != expected_count
+                || rec.supervisor_pid().is_some()
+            {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "container state changed while recording explicit stop",
+                ));
+            }
+            let req = UpdateStateRequest::new(rec.status().clone(), rec.revision())
+                .with_supervision(rec.supervision())
+                .with_explicit_stop(ExplicitStop::Recorded);
+            match self.store.update(&req) {
+                Ok(updated) => {
+                    self.last = updated;
+                    return Ok(&self.last);
+                }
+                Err(e) if e.code() == ErrorCode::FailedPrecondition => last_err = e,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err)
     }
 
     /// status は保持レコードのまま、監視 3 項目だけを書く。

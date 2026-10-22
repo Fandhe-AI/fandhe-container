@@ -8,7 +8,8 @@
 //!
 //! - accept の直後に `SO_PEERCRED` で接続元の uid を取り、実効 uid と違えば何も書かずに切断する
 //!   （多層防御。ソケットは 0600・0700 の `<id>/` の中にあり、別 uid は通常 connect 自体ができない）。
-//! - 要求（SignalRequest・StopRequest）は 21 バイト固定で、ヘッダの payload_len が上限（64）を超えれば payload を読まずに拒否する。
+//! - 要求（SignalRequest・StopRequest は 21 バイト、CancelRestartRequest〔#2440〕は 16 バイトの固定長）で、kind ごとの payload 長と
+//!   一致しない・ヘッダの payload_len が上限（64）を超える場合は payload を読まずに拒否する。
 //! - 読み取りは絶対期限（[`ServeConfig::read_deadline`]）、返信待ちは送信期限 + 猶予、書き込みは
 //!   [`ServeConfig::write_timeout`] で打ち切る（REPAIR-5）。
 //! - 拒否は固定語彙の構造化ログ（理由名のみ。入力値・uid・パス・errno は出さない）。応答は理由コードだけ。
@@ -32,8 +33,9 @@ use fandhe_container_core::audit_log::ControlPeerRejection;
 use super::log_control_event;
 use super::observe::ControlObserver;
 use super::protocol::{
-    ControlReason, FrameHeader, HEADER_LEN, ResponseFrame, SIGNAL_REQUEST_PAYLOAD_LEN,
-    SignalRequestFrame, encode_hello,
+    CANCEL_RESTART_PAYLOAD_LEN, CancelRestartRequestFrame, ControlReason, FrameHeader, HEADER_LEN,
+    RequestHeader, ResponseFrame, SIGNAL_REQUEST_PAYLOAD_LEN, SignalDeadline, SignalRequestFrame,
+    encode_hello,
 };
 use super::target::{SignalSlot, wait_reply};
 
@@ -159,8 +161,11 @@ fn handle_request(
     if read_exact_until(&mut stream, &mut header, read_deadline).is_err() {
         return respond(&mut stream, ControlReason::Malformed);
     }
-    let kind = match FrameHeader::decode(&header).and_then(FrameHeader::expect_request) {
-        Ok(kind) => kind,
+    let kind = match FrameHeader::decode(&header).and_then(FrameHeader::expect_any_request) {
+        Ok(RequestHeader::Signal(kind)) => kind,
+        Ok(RequestHeader::CancelRestart) => {
+            return handle_cancel_restart(stream, slot, read_deadline);
+        }
         Err(reason) => return respond(&mut stream, reason),
     };
     let mut payload = [0u8; SIGNAL_REQUEST_PAYLOAD_LEN];
@@ -172,23 +177,50 @@ fn handle_request(
         Err(reason) => return respond(&mut stream, reason),
     };
 
-    // 送信期限はクライアントが載せた絶対期限（CLOCK_MONOTONIC）。受信までの遅れの分だけ残りが縮むので、
-    // サーバ側の遅延でクライアントの期限より後ろへずれない（REPAIR-5）。`Instant` を先に取ってから単調時計を
-    // 読む順序にして、2 回の読み取りの間にスレッドが止まっても期限が延びず早まる側にずれるようにする。
-    let base = Instant::now();
-    let Ok(now_ns) = crate::sys::monotonic_now_ns() else {
-        return respond(&mut stream, ControlReason::Internal);
-    };
-    let remaining = match request.deadline.remaining_from(now_ns) {
-        Ok(r) => r,
+    let deadline = match absolute_deadline(request.deadline) {
+        Ok(d) => d,
         Err(reason) => return respond(&mut stream, reason),
     };
-    let deadline = base + remaining;
     let reason = match slot.submit(request.kind, request.pid, request.signal, deadline) {
         Ok(rx) => wait_reply(&rx, deadline, config.reply_grace),
         Err(reason) => reason,
     };
     respond(&mut stream, reason)
+}
+
+/// CancelRestartRequest（kind 5）の payload を読んで、保留中の再起動の取り消しを `slot` に依頼する（#2440・SUP-9）。
+/// 受け箱を経由せず、スロットの状態をその場で判定する（資源は固定。シグナルは送らない）。
+fn handle_cancel_restart(
+    mut stream: UnixStream,
+    slot: &SignalSlot,
+    read_deadline: Instant,
+) -> ControlReason {
+    let mut payload = [0u8; CANCEL_RESTART_PAYLOAD_LEN];
+    if read_exact_until(&mut stream, &mut payload, read_deadline).is_err() {
+        return respond(&mut stream, ControlReason::Malformed);
+    }
+    let request = match CancelRestartRequestFrame::decode_payload(&payload) {
+        Ok(r) => r,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    let deadline = match absolute_deadline(request.deadline) {
+        Ok(d) => d,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    let reason = slot.cancel_pending_restart(deadline);
+    respond(&mut stream, reason)
+}
+
+/// 要求が載せた絶対期限（`CLOCK_MONOTONIC`）を、サーバ側の `Instant` に写す。
+///
+/// 受信までの遅れの分だけ残りが縮むので、サーバ側の遅延でクライアントの期限より後ろへずれない（REPAIR-5）。
+/// `Instant` を先に取ってから単調時計を読む順序にして、2 回の読み取りの間にスレッドが止まっても期限が延びず
+/// 早まる側にずれるようにする。
+fn absolute_deadline(deadline: SignalDeadline) -> Result<Instant, ControlReason> {
+    let base = Instant::now();
+    let now_ns = crate::sys::monotonic_now_ns().map_err(|_| ControlReason::Internal)?;
+    let remaining = deadline.remaining_from(now_ns)?;
+    Ok(base + remaining)
 }
 
 /// accept ループのスレッドとその停止の口。`Drop` で停止を要求して期限つきで join する。

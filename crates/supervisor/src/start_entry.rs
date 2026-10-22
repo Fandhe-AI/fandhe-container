@@ -1833,6 +1833,11 @@ fn supervise_running(
                 exit_code_for(error.code()).get(),
             )
         }
+        Ok(SuperviseOutcome::ExplicitStopUnrecorded { error, .. }) => {
+            // 再起動はしていない。明示 stop を state.json に残せなかったことを非 0 で知らせる（fail-closed。#2440・SUP-9）。
+            log_event("explicit_stop_unrecorded", Some(error.code()));
+            exit_code_for(error.code()).get()
+        }
         Ok(SuperviseOutcome::MonitorFailed { process, .. }) => {
             log_event("monitor_failed", None);
             let disposed = dispose(process, None, timeouts);

@@ -21,6 +21,17 @@
 //! [`ControlledProcess`] の `wait` は内側の `wait` の前に受け箱を処理するので、SIGTERM による終了が観測されるのは必ず
 //! 意図が立った後になる。`RequestKind::Signal`（将来の `kill`。#1902）は意図に触れない。
 //!
+//! # バックオフ中・再 launch 中の stop（SUP-9・SUP-3・#2440）
+//!
+//! 終了を検知した後のバックオフ中は記録が `Stopped`（pid なし）で、StopRequest の pid が使えない。そこで CancelRestartRequest
+//! （[`SignalSlot::cancel_pending_restart`]）を別に設ける。スロットが `Exited`（終了済みで再起動が保留中）のときだけ
+//! 明示 stop の意図を立てて `Ok` を返し、restart ループがバックオフ・再 launch の最中にそれを見て再起動を取りやめる。
+//! `Active`（新しいプロセスが既に動いている）は `ContainerRunning` で拒否し（同じ uid の別プロセスが稼働中コンテナの restart を
+//! 黙って外せないようにする）、クライアントは通常の StopRequest をやり直す。上の「終了済みの Stop では意図を立てない」と
+//! 両立するのは、StopRequest が pid を指定して「そのプロセスを止める」要求なのに対し、取り消しは利用者がはっきり
+//! 「保留中の再起動の取り消し」を求める要求で、`Exited` のときだけ意図を立てるため。意図の設定とスロットの状態遷移（再 launch の
+//! 登録）は同じロックの下で起きるので、取り消しは必ず「登録前（意図が立ち再起動が止まる）」か「登録後（`ContainerRunning`）」のどちらかになる。
+//!
 //! 応答の遅れは最大で監視ループの poll 間隔（`start_entry::POLL_INTERVAL`、100ms）。`run.rs`・`restart.rs` の
 //! 公開関数のシグネチャは変えない（REPAIR-1）。全 OS でコンパイル・テストする（std のみ）。
 
@@ -143,6 +154,32 @@ impl SignalSlot {
         };
         if matches {
             inner.state = SlotState::Empty;
+        }
+    }
+
+    /// 保留中の再起動を取り消す（明示 stop の意図を立てる。CancelRestartRequest。SUP-9・SUP-3・#2440）。
+    ///
+    /// 受け箱は経由せず、スロットのロックの下で判定する（シグナルは送らない）。結果は次のとおり。
+    /// - `Exited`: 意図を立てて `Ok`（restart ループがバックオフ・再 launch の最中に見て再起動を取りやめ、state.json に残す）。
+    /// - `Active`: `ContainerRunning`（意図に触れない）。
+    /// - `Empty`: `NoHandle`。意図の書き先が無い: `StopIntentUnavailable`。期限切れ: `Timeout`（意図を立てない）。
+    pub fn cancel_pending_restart(&self, deadline: Instant) -> ControlReason {
+        if Instant::now() >= deadline {
+            return ControlReason::Timeout;
+        }
+        let inner = self.lock();
+        let Some(token) = inner.stop_intent.as_ref() else {
+            return ControlReason::StopIntentUnavailable;
+        };
+        match &inner.state {
+            SlotState::Empty => ControlReason::NoHandle,
+            SlotState::Active { .. } => ControlReason::ContainerRunning,
+            SlotState::Exited { .. } => {
+                token.mark_explicit_stop();
+                #[cfg(target_os = "linux")]
+                super::log_control_event("restart_cancel_recorded", None);
+                ControlReason::Ok
+            }
         }
     }
 
@@ -810,6 +847,50 @@ mod tests {
             );
             assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
         }
+    }
+
+    /// SUP-9・SUP-3・#2440: 取り消しは `Exited`（終了済みで再起動が保留中）でだけ意図を立てて `Ok`。
+    #[test]
+    fn sup9_cancel_pending_restart_marks_intent_only_when_exited() {
+        let (slot, cp, token, seen) = probe_setup(false, ErrorCode::Internal);
+        // Active: 稼働中の restart を外させない。意図は立たず、シグナルも送られない。
+        assert_eq!(
+            slot.cancel_pending_restart(far()),
+            ControlReason::ContainerRunning
+        );
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
+        assert!(seen.lock().unwrap().is_empty());
+        // Exited: 意図が立つ。stop_requested（監視の打ち切り）は立たない。冪等。
+        slot.mark_exited(cp.generation);
+        assert_eq!(slot.cancel_pending_restart(far()), ControlReason::Ok);
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::Requested);
+        assert!(!token.is_stop_requested());
+        assert_eq!(slot.cancel_pending_restart(far()), ControlReason::Ok);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// SUP-9・#2440: 取り消しの拒否（ハンドルなし・書き先なし・期限切れ）は意図を立てない。
+    #[test]
+    fn sup9_cancel_pending_restart_rejections_do_not_mark_intent() {
+        let token = StopToken::new();
+        let slot = SignalSlot::with_stop_intent(token.clone());
+        assert_eq!(slot.cancel_pending_restart(far()), ControlReason::NoHandle);
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
+
+        let (slot, cp, token, _) = probe_setup(false, ErrorCode::Internal);
+        slot.mark_exited(cp.generation);
+        assert_eq!(
+            slot.cancel_pending_restart(Instant::now()),
+            ControlReason::Timeout
+        );
+        assert_eq!(token.explicit_stop_state(), ExplicitStopState::NotRequested);
+
+        // 書き先の無いスロット（意図を記録できない supervisor）は fail-closed。
+        let slot = SignalSlot::new();
+        assert_eq!(
+            slot.cancel_pending_restart(far()),
+            ControlReason::StopIntentUnavailable
+        );
     }
 
     /// SUP-9・REPAIR-5: 終了観測後の drain で、期限切れの Stop は Timeout で断り意図を立てない。

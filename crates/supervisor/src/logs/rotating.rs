@@ -833,15 +833,22 @@ const O_NOFOLLOW: i32 = 0x100;
 ))]
 const O_NOFOLLOW: i32 = 0;
 
-/// 読み取り専用・非ブロッキング・symlink 非追従（`O_NOFOLLOW`）でログを開く（unix。SUP-7・IO-5）。
+/// ログ読み取り open の `custom_flags`（非ブロッキング・symlink 非追従・`O_NOCTTY`。SUP-14・#2426）。
+#[cfg(unix)]
+const LOG_READ_FLAGS: i32 = crate::container_options::env::O_NONBLOCK
+    | O_NOFOLLOW
+    | crate::container_options::env::O_NOCTTY;
+
+/// 読み取り専用・非ブロッキング・symlink 非追従（`O_NOFOLLOW`）・`O_NOCTTY` でログを開く（unix。SUP-7・IO-5）。
 ///
-/// lstat 後に末尾要素が symlink へ差し替えられても、リンク先を開かずに失敗する。
+/// lstat 後に末尾要素が symlink へ差し替えられても、リンク先を開かずに失敗する。supervisor はセッションリーダー
+/// なので、端末へ差し替えられても制御端末を取らないよう `O_NOCTTY` を付ける（`crate::launcher` の module doc）。
 #[cfg(unix)]
 pub(crate) fn open_read_nofollow_nonblocking(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
         .read(true)
-        .custom_flags(crate::container_options::env::O_NONBLOCK | O_NOFOLLOW)
+        .custom_flags(LOG_READ_FLAGS)
         .open(path)
 }
 

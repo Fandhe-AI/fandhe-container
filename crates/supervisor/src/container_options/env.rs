@@ -99,14 +99,38 @@ pub(crate) const O_NONBLOCK: i32 = 0x4;
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) const O_NONBLOCK: i32 = 0;
 
-/// 読み取り専用・非ブロッキング（unix）で env ファイルを開く。
+/// `open(2)` に渡す `O_NOCTTY`（unix のみ。SUP-14・#2426）。
+///
+/// 特権ランチャーは fork せずに `setsid` するため supervisor は生涯セッションリーダーで、`O_NOCTTY` なしで
+/// 端末を開くとそれが制御端末になる（`crate::launcher` の module doc「supervisor 側の不変条件」）。open 前の
+/// 種別確認と open の間にパスが端末へ差し替えられても制御端末を取らないよう、外部指定パスの open に必ず付ける。
+/// 値は arch ごとに違うため、core の `sys.rs` と同じく照合済みの x86_64・aarch64（asm-generic の 0o400）に限り、
+/// それ以外は 0 にする（その場合この保護は無い）。macOS など BSD 系は `open` で暗黙に制御端末を取得せず
+/// `TIOCSCTTY` が要るため不要。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+pub(crate) const O_NOCTTY: i32 = 0o400;
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) const O_NOCTTY: i32 = 0;
+
+/// env ファイルを開くときの `custom_flags`（非ブロッキングと `O_NOCTTY`）。
+#[cfg(unix)]
+pub(crate) const ENV_OPEN_FLAGS: i32 = O_NONBLOCK | O_NOCTTY;
+
+/// 読み取り専用・非ブロッキング・`O_NOCTTY`（unix）で env ファイルを開く。
 pub(crate) fn open_nonblocking(path: &Path) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(O_NONBLOCK);
+        opts.custom_flags(ENV_OPEN_FLAGS);
     }
     opts.open(path)
 }
@@ -383,6 +407,20 @@ fn invalid(msg: &'static str) -> TraitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SUP-14・#2426: `O_NOCTTY` の値（x86_64・aarch64 の Linux は asm-generic の 0o400）と、
+    /// env ファイルの open フラグに含まれることを固定する。
+    #[test]
+    #[cfg(unix)]
+    fn sup14_env_open_flags_include_o_noctty() {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        assert_eq!(O_NOCTTY, 0o400);
+        assert_eq!(ENV_OPEN_FLAGS & O_NOCTTY, O_NOCTTY);
+        assert_eq!(ENV_OPEN_FLAGS & O_NONBLOCK, O_NONBLOCK);
+    }
 
     fn var(s: &str) -> EnvVar {
         EnvVar::parse(s).unwrap()

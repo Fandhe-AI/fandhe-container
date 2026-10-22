@@ -1554,3 +1554,14 @@ fn replaced_during_open_is_distinguishable_from_kind_violation() {
     )));
     assert!(!is_replaced_during_open(&internal("log file open failed")));
 }
+
+/// SUP-14・#2426: ログ読み取り open のフラグに `O_NOCTTY`・`O_NONBLOCK`・`O_NOFOLLOW` がすべて含まれる。
+#[cfg(unix)]
+#[test]
+fn sup14_log_read_flags_include_o_noctty() {
+    let noctty = crate::container_options::env::O_NOCTTY;
+    let nonblock = crate::container_options::env::O_NONBLOCK;
+    assert_eq!(LOG_READ_FLAGS & noctty, noctty);
+    assert_eq!(LOG_READ_FLAGS & nonblock, nonblock);
+    assert_eq!(LOG_READ_FLAGS & O_NOFOLLOW, O_NOFOLLOW);
+}

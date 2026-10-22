@@ -195,10 +195,11 @@ fn sec4_repair4_2468_record_failure_reaches_state_and_supervisor_log() {
         r#"{"component":"core.audit","operation":"audit_coverage_record","outcome":"failed"}"#,
         "\n"
     );
-    // 末尾には start の計測行（start_metrics）が続くため、先頭の 2 行を完全一致で照合する。
+    // 前後にはホストの sysctl 次第で legacy_tiocsti の警告行や start の計測行（start_metrics）が付くため、
+    // 先頭一致ではなく、2 行が連続した部分列として含まれることを照合する（ホストの sysctl に依存しない）。
     let logged = String::from_utf8_lossy(buf.0.lock().unwrap().as_slice()).into_owned();
     assert!(
-        logged.starts_with(expected),
+        logged.contains(expected),
         "unexpected supervisor log: {logged}"
     );
     drop(running);

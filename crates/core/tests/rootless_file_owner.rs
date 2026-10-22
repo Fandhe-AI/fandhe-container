@@ -49,6 +49,10 @@ fn main() {
 }
 
 #[cfg(target_os = "linux")]
+#[path = "support/leftover_children.rs"]
+mod leftover_children;
+
+#[cfg(target_os = "linux")]
 #[path = "support/real_entry.rs"]
 mod real_entry;
 
@@ -70,8 +74,9 @@ mod linux {
     use std::io::Write as _;
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
+    use super::leftover_children::assert_no_leftover_children;
     use super::real_entry;
 
     use fandhe_container_core::exec::{
@@ -111,6 +116,17 @@ mod linux {
         let limit = scenario_deadline().min(START_TIMEOUT_MAX);
         StartTimeouts::new(limit, timeout(), timeout()).expect("start timeouts")
     }
+
+    /// 実エントリポイントの寿命の上限（#2436・CORE-1・REPAIR-5）。ディスパッチャの `wait(scenario_deadline())` と
+    /// 後始末より必ず長く取り、遅いホストでも正常系が `EXIT_ENTRY_LIFETIME_EXPIRED` に化けないようにする。
+    /// 処理自体（`read_dir`・`create_new`・`chown`・`sync_all` 等）が固まったときだけ効く。
+    fn entry_lifetime() -> Duration {
+        let secs = (scenario_deadline() + timeout() * 2).as_secs() + 60;
+        Duration::from_secs(secs.min(real_entry::ENTRY_LIFETIME_MAX_SECS))
+    }
+
+    /// `hang` モードの寿命（秒）。寿命の上限が実際に発火することの照合に使う短い値。
+    const HUNG_LIFETIME_SECS: u64 = 3;
 
     fn own_ids() -> (u32, u32) {
         let id = |key: &str| -> u32 {
@@ -237,9 +253,94 @@ mod linux {
                 "rootless_file_owner: helper case not requested (set FANDHE_CONTAINER_TEST_ID_HELPER=1)"
             );
         }
+        // 寿命の上限が発火することの照合は、通常ケースより前に行う。失敗は panic で、成功行は出ない。
+        hung_entrypoint_bounded(euid, egid);
         for name in names {
             run_case(name, euid, egid);
         }
+    }
+
+    /// 寿命の上限の発火（#2436・CORE-1・REPAIR-5）: 処理が固まって終わらない実エントリポイント（`hang` モード）が、
+    /// 短い寿命の上限で自ら `Exited(EXIT_ENTRY_LIFETIME_EXPIRED)` になり、`/proc/<pid>` が消え、子が残らないことを照合する。
+    /// 寿命より早い終了・大きく遅れた終了はどちらも失敗にする。
+    fn hung_entrypoint_bounded(euid: u32, egid: u32) {
+        let lifetime = Duration::from_secs(HUNG_LIFETIME_SECS);
+        let dir = make_workdir("hang");
+        let rootfs = dir.0.join("rootfs");
+        let ld = real_entry::install_entry(&rootfs);
+        let mut env = real_entry::entry_env(&ld);
+        env.push(real_entry::lifetime_env(lifetime));
+        real_entry::write_rootless_config(&dir.0, HOSTNAME, &real_entry::entry_args("hang"), &env);
+        let store = FileStateStore::open(
+            StateRoot::from_override(dir.0.join("state")).expect("state root"),
+        )
+        .expect("open state store");
+        let recorder = OpRecorder::new();
+        let id = ContainerId::new(format!("rfohang{}", std::process::id())).expect("id");
+        create(
+            &store,
+            &recorder,
+            &CreateRequest::new(id.clone(), dir.0.clone()).expect("absolute bundle"),
+        )
+        .expect("create");
+        let launcher = real_entry::rootless_launcher(false);
+        real_entry::wait_single_thread();
+        // 寿命のタイマーは実エントリポイントの開始から数えるため、基準点は start() の前で採る。
+        let began = Instant::now();
+        let started = start(
+            &store,
+            &recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &start_timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let (_record, process) = started.into_parts();
+        let pid = process.pid().get();
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let ready = real_entry::read_report(&rootfs.join(real_entry::REPORT_FILE), timeout());
+            assert_eq!(ready.get("pid").map(String::as_str), Some("1"));
+            assert_eq!(
+                ready.get("lifetime_secs").map(String::as_str),
+                Some(HUNG_LIFETIME_SECS.to_string().as_str())
+            );
+            // kill を送らずに待つ。寿命 + 余裕の間に PID 1 が自分で終わる。
+            let exit = process.wait(lifetime + timeout() * 2).expect("wait");
+            assert_eq!(
+                exit,
+                Some(ProcessExit::Exited(real_entry::EXIT_ENTRY_LIFETIME_EXPIRED)),
+                "a hung entrypoint must exit by its lifetime bound"
+            );
+            let elapsed = began.elapsed();
+            assert!(
+                elapsed + Duration::from_secs(1) >= lifetime,
+                "the entrypoint exited before its lifetime bound: {elapsed:?} < {lifetime:?}"
+            );
+            let gone = Instant::now() + timeout();
+            while Path::new(&format!("/proc/{pid}")).exists() {
+                assert!(
+                    Instant::now() < gone,
+                    "/proc/{pid} must disappear after the entrypoint is reaped"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_no_leftover_children(timeout(), "after the hung entrypoint exited");
+        }));
+        // 検証が途中で panic しても実機に PID 1 を残さない（回収済みなら terminate は何もしない）。
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "rootless_file_owner: terminate after failed hang check also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        println!(
+            "rootless_file_owner: hung entrypoint exited by its lifetime bound (exit={}; host uid={euid}, gid={egid})",
+            real_entry::EXIT_ENTRY_LIFETIME_EXPIRED
+        );
     }
 
     /// 1 ケース分: bundle を作り、本番 launcher で `create` → `start` し、起動ハンドルの `Exited(0)` を待って
@@ -249,12 +350,9 @@ mod linux {
         let dir = make_workdir(name);
         let rootfs = dir.0.join("rootfs");
         let ld = real_entry::install_entry(&rootfs);
-        real_entry::write_rootless_config(
-            &dir.0,
-            HOSTNAME,
-            &real_entry::entry_args(name),
-            &real_entry::entry_env(&ld),
-        );
+        let mut env = real_entry::entry_env(&ld);
+        env.push(real_entry::lifetime_env(entry_lifetime()));
+        real_entry::write_rootless_config(&dir.0, HOSTNAME, &real_entry::entry_args(name), &env);
         let store = FileStateStore::open(
             StateRoot::from_override(dir.0.join("state")).expect("state root"),
         )
@@ -279,6 +377,7 @@ mod linux {
         )
         .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
 
+        let mut lines: Vec<String> = Vec::new();
         let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             assert_eq!(
                 started.record().status().state(),
@@ -303,7 +402,7 @@ mod linux {
                 Some(ProcessExit::Exited(0)),
                 "scenario {name}: the real entrypoint must create the files and exit 0 within the limit"
             );
-            verify_owners(name, euid, egid, &rootfs);
+            lines = verify_owners(name, euid, egid, &rootfs);
         }));
         let (_record, process) = started.into_parts();
         let terminated = process.terminate(timeout());
@@ -317,10 +416,16 @@ mod linux {
             std::panic::resume_unwind(p);
         }
         terminated.expect("terminate");
+        // 終了後に子が残っていない（PID 1・holder・mapper の取り残しがない）ことを fail-closed で確かめる（#2436）。
+        assert_no_leftover_children(timeout(), &format!("after scenario {name} finished"));
+        // 成功行は子の照合まで通ってから出す（CI の完全一致 grep の文言は変えない）。
+        for line in lines {
+            println!("{line}");
+        }
     }
 
     /// ホスト視点（分離されていないこのプロセス）での所有者照合（SEC-5）。
-    fn verify_owners(name: &str, euid: u32, egid: u32, rootfs: &Path) {
+    fn verify_owners(name: &str, euid: u32, egid: u32, rootfs: &Path) -> Vec<String> {
         let want = expected(name, euid, egid);
         let report = real_entry::read_report(&rootfs.join(real_entry::REPORT_FILE), timeout());
         let field = |k: &str| report.get(k).map(String::as_str).unwrap_or("missing");
@@ -328,6 +433,11 @@ mod linux {
             field("pid"),
             "1",
             "scenario {name}: real entrypoint is PID 1"
+        );
+        assert_eq!(
+            field("lifetime_secs"),
+            entry_lifetime().as_secs().to_string(),
+            "scenario {name}: entry lifetime bound"
         );
         assert_eq!(field("uid"), "0", "scenario {name}: container uid");
         assert_eq!(field("gid"), "0", "scenario {name}: container gid");
@@ -361,12 +471,13 @@ mod linux {
             assert_ne!(m.uid(), 0);
             assert_ne!(m.gid(), 0);
         }
-        println!(
+        vec![format!(
             "rootless_file_owner: scenario {name} verified (host uid={}, gid={})",
             meta.uid(),
             meta.gid()
-        );
+        )]
     }
+
     /// 実エントリポイント（exec 後のコンテナ PID 1）。コンテナ内 root としてファイルを作り、観測値を報告する。
     /// 失敗は値（`error:<kind>`）として記録し、終了コードは全操作が成功したときだけ 0 にする。
     pub fn entry() {
@@ -377,8 +488,16 @@ mod linux {
             .and_then(|i| args.get(i + 1))
             .expect("mode after --entry")
             .clone();
+        let lifetime_secs = real_entry::arm_entry_lifetime();
         let mut lines = real_entry::entry_observations();
+        lines.push(("lifetime_secs", lifetime_secs.to_string()));
         let mut ok = true;
+        if name == "hang" {
+            real_entry::write_report(&lines);
+            loop {
+                std::thread::park();
+            }
+        }
         let mut create = |file: &str, key: &'static str, chown: bool| -> (&'static str, String) {
             let path = Path::new("/").join(file);
             let made = std::fs::OpenOptions::new()

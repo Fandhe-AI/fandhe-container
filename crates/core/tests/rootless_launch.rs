@@ -29,11 +29,24 @@
 //! `platform-ci` への組み込みは別 PR（ci.yml は infra-builder 担当）。実行された場合は拒否を含む
 //! あらゆる失敗を失敗として扱い、検証せずに成功する分岐は持たない。helper ケースは env の opt-in 時のみ
 //! 実行し、opt-in 時に前提（uidmap・subuid/subgid 行）が無ければ失敗とする。
+//!
+//! # 寿命の上限と残った子の照合（#2436・CORE-1・REPAIR-5）
+//! 本試験には exec される実エントリポイントが無い（`/entry` は `#!/bin/true` で、`LaunchReady` が無いため実行されない）。
+//! そのため `rootless` 系と違い、env で渡す寿命の上限（`real_entry::arm_entry_lifetime`）は持たない。また scenario
+//! プロセスは `isolate_rootless_subordinate`・`spawn_container` の前提として単一スレッドでなければならず、見張り
+//! スレッドも置けない。代わりに、固まりうる待ちはすべて期限つきで、期限を過ぎたら kill する（helper の
+//! `DEFAULT_HELPER_TIMEOUT`・`ContainerChild::wait_timeout`・ディスパッチャの `wait_deadline`）。さらにディスパッチャは
+//! child subreaper になり、各 scenario の後に `leftover_children::assert_no_leftover_children` で、再親付けされた
+//! holder・mapper・コンテナ PID 1 を含む子が残っていないことを fail-closed で照合する（残りは kill・回収して失敗にする）。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("rootless_launch: Linux only, not applicable on this OS");
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/leftover_children.rs"]
+mod leftover_children;
 
 #[cfg(target_os = "linux")]
 fn main() {
@@ -49,14 +62,16 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io::Read as _;
+
+    use crate::leftover_children;
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitStatus, Stdio};
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::exec::{
-        ChildExit, Entrypoint, Hostname, IsolationConfig, IsolationPrivilege, Namespace,
-        NamespaceSet, plan_rootless_subordinate, spawn_container,
+        ChildExit, ChildSubreaper, Entrypoint, Hostname, IsolationConfig, IsolationPrivilege,
+        Namespace, NamespaceSet, plan_rootless_subordinate, spawn_container,
     };
     use fandhe_container_core::rootless::{
         DEFAULT_HELPER_TIMEOUT, HelperPaths, IdMapSet, IdMapWriter, SubIdOwner, WriterKind,
@@ -212,6 +227,9 @@ mod linux {
                 "rootless_launch: helper case not requested (set FANDHE_CONTAINER_TEST_ID_HELPER=1)"
             );
         }
+        // scenario が holder・mapper・コンテナ PID 1 を残して終わった（kill された）場合に、init ではなく
+        // このプロセスへ再親付けさせ、後続の子の照合で見えるようにする（#2436）。
+        let _subreaper = ChildSubreaper::enable().expect("enable child subreaper");
         let exe = std::env::current_exe().expect("current_exe");
         for name in names {
             let rootfs = make_rootfs(name);
@@ -222,8 +240,14 @@ mod linux {
                 .stderr(Stdio::piped())
                 .spawn()
                 .expect("spawn scenario");
-            let status = wait_deadline(&mut child, scenario_deadline())
-                .unwrap_or_else(|| panic!("scenario {name} did not exit within the limit"));
+            let Some(status) = wait_deadline(&mut child, scenario_deadline()) else {
+                // 期限超過で kill・回収済み。残った子も回収してから失敗にする。
+                leftover_children::assert_no_leftover_children(
+                    timeout(),
+                    &format!("after scenario {name} was killed at its deadline"),
+                );
+                panic!("scenario {name} did not exit within the limit");
+            };
             let mut stderr = String::new();
             child
                 .stderr
@@ -235,6 +259,10 @@ mod linux {
                 status.code(),
                 Some(0),
                 "scenario {name} must exit with 0; stderr:\n{stderr}"
+            );
+            leftover_children::assert_no_leftover_children(
+                timeout(),
+                &format!("after scenario {name} finished"),
             );
             // Exec 段への到達（SEC-1・CORE-5: `LaunchReady` が作られず exec だけが拒否される）。
             assert!(

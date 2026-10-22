@@ -272,8 +272,14 @@ fn classify_launcher(path: &Path, euid: u32) -> LauncherPresence {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let real = match std::fs::canonicalize(path) {
         Ok(p) => p,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LauncherPresence::Absent,
-        Err(_) => return LauncherPresence::Untrusted,
+        // 解決失敗でもディレクトリエントリ自体が在る（リンク切れ・ループ・権限エラー等）なら不存在とみなさない
+        // （SUP-14: 在るが信頼できないランチャーは fail-closed。直接経路へ黙って落とさない）。
+        Err(_) => {
+            return match std::fs::symlink_metadata(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => LauncherPresence::Absent,
+                _ => LauncherPresence::Untrusted,
+            };
+        }
     };
     let Ok(meta) = std::fs::metadata(&real) else {
         return LauncherPresence::Untrusted;
@@ -977,6 +983,13 @@ mod tests {
                 LauncherPresence::Untrusted
             );
         }
+        // リンク切れの symlink はエントリが在るので Untrusted（Absent にしない）。
+        let dangling = dir.0.join("dangling-launcher");
+        std::os::unix::fs::symlink(dir.0.join("no-such-target"), &dangling).expect("symlink");
+        assert_eq!(
+            classify_launcher(&dangling, euid),
+            LauncherPresence::Untrusted
+        );
         // ディレクトリは通常ファイルではない。
         let sub = dir.0.join("d");
         std::fs::create_dir(&sub).expect("mkdir");

@@ -14,7 +14,7 @@
 //! - 「非 root で一連のライフサイクルが成功する」は、create → start → kill を実行し、各段の状態・revision・
 //!   観測記録（REPAIR-4）と、起動したプロセスのホスト視点の写像（`/proc/<pid>/uid_map`・`gid_map`・
 //!   `status`）で照合する。検証できるのは **create / start / kill と、kill 直後の delete の拒否まで**で、
-//!   Running → Stopped の遷移と停止後の delete の成功は未検証（下記「既知課題」）
+//!   Running → Stopped の遷移と停止後の delete の成功は `crates/supervisor/tests/supervisor_bin_real.rs` のシナリオ D が照合する（下記「既知課題」）
 //! - コンテナ PID 1 は実エントリポイント（#2012）。試験バイナリ自身を rootfs の `/entry` へコピーし、
 //!   本番 launcher の `StagePipeline`（`with_landlock` 入り）で exec まで通して `--entry init` で再入させる
 //!   （`tests/support/real_entry.rs`）。ホストの `/proc/<pid>` の pid は、この exec 後の PID 1（`NSpid` の末尾が 1、
@@ -71,13 +71,14 @@
 //!   マスクされた `/proc` で proc マウントも拒否されるため検証できない
 //! - rootless の cgroup v2 委譲（systemd ユーザー slice の Delegate）: rootless 経路での cgroup 参加は
 //!   未検証（TASK-32・CORE-3・CORE-4）
-//! - SIGKILL 以外のシグナル（SIGTERM 等）の配送: 本番のハンドルの `signal` で送れるが、本試験は SIGKILL の
-//!   kill の流れだけを範囲とする。常駐側の `ProcessSignaler` は supervisor（TASK-157）が提供する
+//! - SIGKILL 以外のシグナル（SIGTERM 等）の配送: 本試験は SIGKILL の kill の流れだけを範囲とする。常駐側の
+//!   `ProcessSignaler`（制御チャネル）経由の SIGTERM の配送は `crates/supervisor/tests/supervisor_bin_real.rs` の
+//!   シナリオ D が本番 launcher 経由で照合する（SUP-4・#2392）
 //! - Running → Stopped の遷移と停止後の delete の成功: Stopped への遷移は起動ハンドルの所有者である
-//!   supervisor（TASK-157）の責務。`kill` が状態を更新しない契約と、その結果 kill 直後の delete
+//!   supervisor（TASK-157）の責務。本試験は `kill` が状態を更新しない契約と、その結果 kill 直後の delete
 //!   （TASK-30.2・#152）が `FailedPrecondition` で拒否され状態が残ることだけを照合し、状態の書き換えに
-//!   よる代用はしない（停止後の delete の成功は `oci_lifecycle.rs`・`oci_delete.rs` が状態を直接作って
-//!   照合する）。supervisor の実装後に本テストへ追加する
+//!   よる代用はしない。遷移の記録と停止後の delete の成功（本番の remover）は `supervisor_bin_real` の
+//!   シナリオ D が照合する（#2392）
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

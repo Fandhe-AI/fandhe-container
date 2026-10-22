@@ -317,6 +317,10 @@ mod consts {
     // arch/x86/include/uapi/asm/signal.h の `SIGCHLD`（結合試験の `set_child_signal_ignored_for_test` だけが使う）。
     #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const SIGCHLD: i32 = 17;
+    // include/uapi/asm-generic/signal.h の `SIGTERM`（x86_64 は上書きしない。結合試験の
+    // `exit_on_sigterm_for_test` だけが使う）。
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const SIGTERM: i32 = 15;
     // include/uapi/asm-generic/fcntl.h（x86_64 は上書きしない）。
     pub const O_DIRECTORY: i32 = 0o200_000;
     pub const O_NOFOLLOW: i32 = 0o400_000;
@@ -657,6 +661,10 @@ mod consts {
     // include/uapi/asm-generic/signal.h の `SIGCHLD`（結合試験の `set_child_signal_ignored_for_test` だけが使う）。
     #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const SIGCHLD: i32 = 17;
+    // include/uapi/asm-generic/signal.h の `SIGTERM`（arm64 は上書きしない。結合試験の
+    // `exit_on_sigterm_for_test` だけが使う）。
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const SIGTERM: i32 = 15;
     // arch/arm64/include/uapi/asm/fcntl.h（asm-generic と異なる。x86_64 の値を流用しない。
     // 流用すると O_DIRECT / O_LARGEFILE に化ける）。
     pub const O_DIRECTORY: i32 = 0o40_000;
@@ -984,6 +992,8 @@ mod consts {
     pub const SIGPIPE: i32 = 0;
     #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
     pub const SIGCHLD: i32 = 0;
+    #[cfg_attr(not(feature = "exec-test-support"), allow(dead_code))]
+    pub const SIGTERM: i32 = 0;
     pub const O_DIRECTORY: i32 = 0;
     pub const O_NOFOLLOW: i32 = 0;
     pub const O_CLOEXEC: i32 = 0;
@@ -4367,6 +4377,50 @@ pub(crate) fn set_child_signal_ignored_for_test(ignored: bool) -> Result<(), Sys
     // SAFETY: 引数は整数（`SIG_IGN` = 1 / `SIG_DFL` = 0）のみでポインタを取らない。ハンドラ関数を
     // 登録しないため、シグナルハンドラの再入・非同期安全性の問題は生じない。対象は `SIGCHLD` の定数だけ。
     let prev = unsafe { signal(consts::SIGCHLD, handler) };
+    if prev == SIG_ERR {
+        Err(last_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// [`exit_on_sigterm_for_test`] のハンドラが `_exit` へ渡す終了コード。
+///
+/// 通常終了（試験プローブの 7）・`Signaled(15)` の写像（143）・SIGKILL（137）・起動失敗の 125〜127 の
+/// どれとも重ならない値にし、状態の `Stopped` の終了コードだけで「ハンドラ経由で終わった」と判別できるようにする。
+#[cfg(feature = "exec-test-support")]
+pub(crate) const SIGTERM_HANDLER_EXIT_CODE: i32 = 43;
+
+/// [`exit_on_sigterm_for_test`] が登録するシグナルハンドラ。`_exit` だけを呼ぶ（非同期シグナル安全）。
+#[cfg(feature = "exec-test-support")]
+extern "C" fn sigterm_exit_handler(_sig: i32) {
+    // SAFETY: `_exit` は非同期シグナル安全で、ヒープ・ロック・Rust のランタイムに触れない。
+    // 引数は定数 `SIGTERM_HANDLER_EXIT_CODE` だけで、戻らない。
+    unsafe { _exit(SIGTERM_HANDLER_EXIT_CODE) }
+}
+
+/// 結合試験専用: 自プロセスの `SIGTERM` に「`_exit(SIGTERM_HANDLER_EXIT_CODE)` だけを呼ぶ」ハンドラを登録する。
+///
+/// 新しい PID namespace の PID 1 は、ハンドラを持たない（`SIG_DFL` の）シグナルをカーネルが配送しない
+/// （SIGKILL / SIGSTOP を除く）。コンテナ内のプローブにこれを呼ばせて、制御チャネルから届いた SIGTERM を
+/// 実際に受けて停止する経路を `supervisor_bin_real` が照合できるようにする（SUP-4・CORE-2・REPAIR-3）。
+///
+/// 単一スレッドのプローブからだけ呼ぶ。プロセス全体の disposition を変えるため、他の試験と同じプロセスで使わない。
+/// `libc` との機械照合は core にまだ導入されていない（`signal` の宣言は既存で、新しい宣言は増やしていない）。
+#[cfg(feature = "exec-test-support")]
+pub(crate) fn exit_on_sigterm_for_test() -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    // SAFETY: 登録するのは上の `sigterm_exit_handler`（`_exit` のみを呼ぶ extern "C" 関数）で、関数ポインタを
+    // ポインタ幅の整数として渡す。対象は `SIGTERM` の定数だけ。ハンドラはメモリにもロックにも触れないため、
+    // 再入・割り込み位置に依らず安全。
+    let prev = unsafe {
+        signal(
+            consts::SIGTERM,
+            sigterm_exit_handler as extern "C" fn(i32) as usize,
+        )
+    };
     if prev == SIG_ERR {
         Err(last_error())
     } else {

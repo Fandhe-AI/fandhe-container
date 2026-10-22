@@ -296,6 +296,20 @@ pub use seccomp_listener::{
 pub use seccomp_listener::{UserNotifProbe, kcmp_self_errno_for_test, user_notif_probe_for_test};
 #[cfg(feature = "exec-test-support")]
 pub use seccomp_listener::{apply_exec_seccomp_listener_for_test, hand_over_non_listener_for_test};
+/// 試験用プローブが `SIGTERM` で終わるときの終了コード（[`exit_on_sigterm_for_test`] のハンドラが使う）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub const SIGTERM_HANDLER_EXIT_CODE_FOR_TEST: i32 = sys::SIGTERM_HANDLER_EXIT_CODE;
+
+/// 自プロセスの `SIGTERM` を「`_exit(43)` だけ」のハンドラで受けるようにする(試験専用)。
+///
+/// コンテナ内の PID 1 は `SIG_DFL` のシグナルを受けないため、`supervisor_bin_real` のプローブが、制御チャネルから
+/// 届く SIGTERM を実際に受けて停止する経路の照合に使う(SUP-4・CORE-2・REPAIR-3)。単一スレッドのプローブからだけ呼ぶ。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn exit_on_sigterm_for_test() -> Result<(), String> {
+    sys::exit_on_sigterm_for_test().map_err(|e| format!("{e:?}"))
+}
 pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 pub use subreaper::ChildSubreaper;

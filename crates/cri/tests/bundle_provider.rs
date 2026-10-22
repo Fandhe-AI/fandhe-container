@@ -270,3 +270,38 @@ fn new_rejects_unsafe_roots() {
         assert_eq!(e.code(), CriErrorCode::FailedPrecondition, "{bad:o}");
     }
 }
+#[test]
+fn release_after_a_refused_existing_bundle_keeps_the_existing_data() {
+    // CRI-1・REPAIR-12: 既存 bundle を理由に拒否された ID の巻き戻し release は、既存の実体を消さない。
+    let (tmp, _rootfs, p) = setup("refused");
+    let dir = prepare(&p, "ctr1", &container()).unwrap();
+    let e = prepare(&p, "ctr1", &container()).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+    p.release("ctr1").expect("rollback release is a no-op");
+    assert!(dir.join("config.json").exists());
+    assert!(tmp.0.join("ctr1").is_dir());
+    // 通常の release は消す。
+    p.release("ctr1").expect("release");
+    assert!(!dir.exists());
+}
+
+#[test]
+fn rootfs_release_failure_during_rollback_keeps_the_bundle() {
+    // 解放失敗時は資源を保持し、後続の release が回収する（rootfs 解放 → bundle 削除の順）。
+    struct StickyRootfs(Arc<FakeRootfs>);
+    impl RootfsSource for StickyRootfs {
+        fn prepare(&self, i: &ImageSpec, r: &Path) -> Result<ImageDefaults, CriError> {
+            self.0.prepare(i, r)
+        }
+        fn release(&self, _r: &Path) -> Result<(), CriError> {
+            Err(CriError::internal("rootfs release"))
+        }
+    }
+    let tmp = TempDir::new("rollback-keep");
+    let inner = Arc::new(FakeRootfs::default());
+    *inner.fail_prepare.lock().unwrap() = true;
+    let p = SpecBundleProvider::new(tmp.0.clone(), Arc::new(StickyRootfs(inner))).unwrap();
+    let e = prepare(&p, "ctr1", &container()).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::ResourceExhausted);
+    assert!(tmp.0.join("ctr1").is_dir());
+}

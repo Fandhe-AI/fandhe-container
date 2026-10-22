@@ -51,6 +51,11 @@ pub const MAX_PROTECTED_PATHS: usize = 256;
 pub const MAX_HOSTNAME_BYTES: usize = 64;
 
 /// 生成する `ociVersion`（core は `1.x` 系だけを受ける）。
+/// mount 1 件あたりの JSON 構造の概算オーバーヘッド（キー名・options 等）。
+const MOUNT_OVERHEAD: usize = 128;
+/// 文字列 1 要素あたりの JSON 構造の概算オーバーヘッド（引用符・区切り・エスケープの余裕）。
+const ITEM_OVERHEAD: usize = 8;
+
 const OCI_VERSION: &str = "1.2.0";
 
 /// イメージ config 由来の既定値（Entrypoint・Cmd・Env・WorkingDir・User。#2433 が埋める）。
@@ -191,10 +196,63 @@ fn check_abs_path(field: &'static str, p: &str) -> Result<(), CriError> {
     if p == "/" {
         return Ok(());
     }
-    for comp in p[1..].split('/') {
+    let rest = p.strip_prefix('/').ok_or_else(|| invalid(field))?;
+    for comp in rest.split('/') {
         if comp.is_empty() || comp == ".." {
             return Err(invalid(field));
         }
+    }
+    Ok(())
+}
+
+/// `config.json` の総量予算（複製・直列化の前に checked 演算で消費する。REPAIR-5・DoS 防止）。
+struct Budget {
+    left: usize,
+}
+
+impl Budget {
+    fn new() -> Self {
+        Self {
+            left: MAX_CONFIG_BYTES,
+        }
+    }
+
+    /// `n` バイト分を消費する。予算を超える場合は `INVALID_ARGUMENT`。
+    fn spend(&mut self, n: usize) -> Result<(), CriError> {
+        self.left = self
+            .left
+            .checked_sub(n)
+            .ok_or_else(|| invalid("config size"))?;
+        Ok(())
+    }
+}
+
+/// JSON 出力の上限付き writer（`MAX_CONFIG_BYTES` を超える書き込みを拒否する）。
+struct LimitedWriter {
+    buf: Vec<u8>,
+}
+
+impl std::io::Write for LimitedWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf
+            .len()
+            .checked_add(data.len())
+            .filter(|t| *t <= MAX_CONFIG_BYTES)
+            .ok_or_else(|| std::io::Error::other("config too large"))?;
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// 保護パス（masked / readonly）の検証。core の `ProtectedPath` と同じく root のみ（`/`）は拒否する。
+fn check_protected_path(field: &'static str, p: &str) -> Result<(), CriError> {
+    check_abs_path(field, p)?;
+    if p == "/" {
+        return Err(invalid(field));
     }
     Ok(())
 }
@@ -288,22 +346,38 @@ fn resources(r: &LinuxContainerResources) -> Result<Option<ResourcesOut>, CriErr
         "resources.memory_swap_limit_in_bytes",
         r.memory_swap_limit_in_bytes,
     )?;
+    // core は swap を「メモリ＋スワップ」の合計として扱い、メモリ上限が無い・swap がメモリ上限より小さい指定を拒否する。
+    if let Some(sw) = swap
+        && limit.is_none_or(|l| l > sw)
+    {
+        return Err(invalid("resources.memory_swap_limit_in_bytes"));
+    }
     let period = positive("resources.cpu_period", r.cpu_period)?
         .map(|v| u64::try_from(v).map_err(|_| invalid("resources.cpu_period")))
         .transpose()?;
-    // cpu_quota は負（-1: 無制限）を CRI が許すため、0 のみ未指定とみなして値はそのまま渡す。
-    let quota = (r.cpu_quota != 0).then_some(r.cpu_quota);
+    // cpu_quota: 0 は未指定、-1 は無制限、正の値は上限。それ以外の負値は core が受けないため拒否する。
+    let quota = match r.cpu_quota {
+        0 => None,
+        q if q == -1 || q > 0 => Some(q),
+        _ => return Err(invalid("resources.cpu_quota")),
+    };
     let memory = (limit.is_some() || swap.is_some()).then_some(MemoryOut { limit, swap });
     let cpu = (period.is_some() || quota.is_some()).then_some(CpuOut { period, quota });
     Ok((memory.is_some() || cpu.is_some()).then_some(ResourcesOut { memory, cpu }))
 }
 
-fn mount_out(m: &Mount) -> Result<MountOut<'_>, CriError> {
+fn mount_out<'a>(m: &'a Mount, budget: &mut Budget) -> Result<MountOut<'a>, CriError> {
     check_abs_path("mounts.container_path", &m.container_path)?;
     check_abs_path("mounts.host_path", &m.host_path)?;
     if m.container_path == "/" || m.host_path == "/" {
         return Err(invalid("mounts path"));
     }
+    budget.spend(
+        m.container_path
+            .len()
+            .saturating_add(m.host_path.len())
+            .saturating_add(MOUNT_OVERHEAD),
+    )?;
     if m.propagation != MountPropagation::PropagationPrivate as i32 {
         return Err(unsupported("mounts.propagation"));
     }
@@ -336,12 +410,20 @@ fn mount_out(m: &Mount) -> Result<MountOut<'_>, CriError> {
     })
 }
 
-fn paths<'a>(field: &'static str, v: &'a [String]) -> Result<Vec<&'a str>, CriError> {
+fn paths<'a>(
+    field: &'static str,
+    v: &'a [String],
+    budget: &mut Budget,
+) -> Result<Vec<&'a str>, CriError> {
     if v.len() > MAX_PROTECTED_PATHS {
         return Err(invalid(field));
     }
     v.iter()
-        .map(|p| check_abs_path(field, p).map(|()| p.as_str()))
+        .map(|p| {
+            check_protected_path(field, p)?;
+            budget.spend(p.len().saturating_add(ITEM_OVERHEAD))?;
+            Ok(p.as_str())
+        })
         .collect()
 }
 
@@ -350,6 +432,7 @@ fn build_args(
     c: &ContainerConfig,
     img: &ImageDefaults,
     require_command: bool,
+    budget: &mut Budget,
 ) -> Result<Vec<String>, CriError> {
     let (head, tail): (&[String], &[String]) = if !c.command.is_empty() {
         (&c.command, &c.args)
@@ -371,18 +454,34 @@ fn build_args(
     if total > MAX_ARGS {
         return Err(invalid("args"));
     }
-    let mut out = Vec::with_capacity(total);
+    // 複製の前に、各要素の検証と総量予算の消費を済ませる。
     for a in head.iter().chain(tail) {
         check_string("args", a)?;
-        out.push(a.clone());
+        budget.spend(a.len().saturating_add(ITEM_OVERHEAD))?;
     }
-    Ok(out)
+    Ok(head.iter().chain(tail).cloned().collect())
 }
 
 /// `process.env` を決める。イメージの Env を先に置き、コンテナの `envs` が同じキーを上書きする。
-fn build_env(c: &ContainerConfig, img: &ImageDefaults) -> Result<Vec<String>, CriError> {
+fn build_env(
+    c: &ContainerConfig,
+    img: &ImageDefaults,
+    budget: &mut Budget,
+) -> Result<Vec<String>, CriError> {
     if img.env.len() > MAX_ENV || c.envs.len() > MAX_ENV {
         return Err(invalid("envs"));
+    }
+    // 複製の前に、重複で畳まれる前の総量で予算を消費する（大きい側に倒す）。
+    for e in &img.env {
+        budget.spend(e.len().saturating_add(ITEM_OVERHEAD))?;
+    }
+    for kv in &c.envs {
+        budget.spend(
+            kv.key
+                .len()
+                .saturating_add(kv.value.len())
+                .saturating_add(ITEM_OVERHEAD),
+        )?;
     }
     let mut index: HashMap<String, usize> = HashMap::new();
     let mut pairs: Vec<(String, String)> = Vec::new();
@@ -483,6 +582,7 @@ fn build_inner(
         return Err(unsupported("port_mappings"));
     }
     let hostname = check_hostname(&sandbox.hostname)?;
+    let mut budget = Budget::new();
 
     let sandbox_linux = sandbox.linux.as_ref();
     if let Some(l) = sandbox_linux {
@@ -501,6 +601,9 @@ fn build_inner(
             }
             if sc.selinux_options.is_some() {
                 return Err(unsupported("selinux_options"));
+            }
+            if !sc.supplemental_groups.is_empty() {
+                return Err(unsupported("supplemental_groups"));
             }
             check_profile("seccomp", &sc.seccomp)?;
             check_profile("apparmor", &sc.apparmor)?;
@@ -547,8 +650,8 @@ fn build_inner(
         }
     }
 
-    let args = build_args(container, image, require_command)?;
-    let env = build_env(container, image)?;
+    let args = build_args(container, image, require_command, &mut budget)?;
+    let env = build_env(container, image, &mut budget)?;
 
     let cwd = if !container.working_dir.is_empty() {
         container.working_dir.clone()
@@ -556,6 +659,10 @@ fn build_inner(
         image.working_dir.clone().unwrap_or_else(|| "/".to_owned())
     };
     check_abs_path("working_dir", &cwd)?;
+    budget.spend(cwd.len().saturating_add(ITEM_OVERHEAD))?;
+    if let Some(h) = hostname {
+        budget.spend(h.len().saturating_add(ITEM_OVERHEAD))?;
+    }
 
     let run_as_user = nonneg_u32("run_as_user", &sc.and_then(|s| s.run_as_user))?;
     let run_as_group = nonneg_u32("run_as_group", &sc.and_then(|s| s.run_as_group))?;
@@ -578,7 +685,7 @@ fn build_inner(
     let mounts = container
         .mounts
         .iter()
-        .map(mount_out)
+        .map(|m| mount_out(m, &mut budget))
         .collect::<Result<Vec<_>, _>>()?;
 
     // 名前空間: コンテナ側の指定を優先し、無ければ sandbox 側。
@@ -595,8 +702,8 @@ fn build_inner(
     };
     let (masked, readonly) = match sc {
         Some(s) => (
-            paths("masked_paths", &s.masked_paths)?,
-            paths("readonly_paths", &s.readonly_paths)?,
+            paths("masked_paths", &s.masked_paths, &mut budget)?,
+            paths("readonly_paths", &s.readonly_paths, &mut budget)?,
         ),
         None => (Vec::new(), Vec::new()),
     };
@@ -619,10 +726,14 @@ fn build_inner(
             readonly_paths: readonly,
         },
     };
-    let bytes =
-        serde_json::to_vec(&out).map_err(|_| CriError::internal("failed to encode config"))?;
-    if bytes.len() > MAX_CONFIG_BYTES {
-        return Err(invalid("config size"));
-    }
-    Ok(RuntimeConfigJson(bytes))
+    // 上限付き writer へ直列化し、JSON 全体の確保を上限で止める。
+    let mut w = LimitedWriter { buf: Vec::new() };
+    serde_json::to_writer(&mut w, &out).map_err(|e| {
+        if e.is_io() {
+            invalid("config size")
+        } else {
+            CriError::internal("failed to encode config")
+        }
+    })?;
+    Ok(RuntimeConfigJson(w.buf))
 }

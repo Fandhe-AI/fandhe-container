@@ -760,3 +760,59 @@ fn validate_config_does_not_require_a_command() {
         CriErrorCode::Unimplemented
     );
 }
+#[test]
+fn issue_2554_review_rejections() {
+    // sandbox の supplemental_groups・cpu_quota の不正な負値・swap の不整合・保護パスの `/`（CRI-1・SEC-1）。
+    let mut p = pod();
+    p.linux = Some(LinuxPodSandboxConfig {
+        security_context: Some(LinuxSandboxSecurityContext {
+            supplemental_groups: vec![1000],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    assert_eq!(
+        validate_config(&p, &ctr()).unwrap_err().code(),
+        CriErrorCode::Unimplemented
+    );
+    let res = |f: fn(&mut LinuxContainerResources)| {
+        let mut r = LinuxContainerResources::default();
+        f(&mut r);
+        let mut c = ctr();
+        c.linux = Some(LinuxContainerConfig {
+            resources: Some(r),
+            ..Default::default()
+        });
+        validate_config(&pod(), &c)
+    };
+    assert_eq!(
+        res(|r| r.cpu_quota = -5).unwrap_err().code(),
+        CriErrorCode::InvalidArgument
+    );
+    assert!(res(|r| r.cpu_quota = -1).is_ok());
+    assert_eq!(
+        res(|r| r.memory_swap_limit_in_bytes = 100)
+            .unwrap_err()
+            .code(),
+        CriErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        res(|r| {
+            r.memory_limit_in_bytes = 200;
+            r.memory_swap_limit_in_bytes = 100;
+        })
+        .unwrap_err()
+        .code(),
+        CriErrorCode::InvalidArgument
+    );
+    let c = with_sc(|s| s.masked_paths = vec!["/".into()]);
+    assert_eq!(
+        validate_config(&pod(), &c).unwrap_err().code(),
+        CriErrorCode::InvalidArgument
+    );
+    let c = with_sc(|s| s.readonly_paths = vec!["/".into()]);
+    assert_eq!(
+        validate_config(&pod(), &c).unwrap_err().code(),
+        CriErrorCode::InvalidArgument
+    );
+}

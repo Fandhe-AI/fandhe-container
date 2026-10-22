@@ -170,9 +170,10 @@ fn read_report_line(mut out: impl Read) -> Received {
 
 /// 補助スレッドで [`read_report_line`] を行い、`within` を過ぎたら [`Received::TimedOut`] を返す。
 ///
-/// 期限切れのとき補助スレッドは read で止まったまま残る（子を kill しないため pipe は閉じない）。CLI は直後に終了する。
-/// 常駐する呼び出し側（plugin-cri）は、受信期限切れ（報告なし）の子だけを kill して pipe を閉じ、スレッドを終わらせる。
-/// 報告を受信できた場合は読み取りスレッドは既に終わっているため、kill は不要。
+/// 期限切れのとき補助スレッドは read で止まったまま残る。受信期限切れだけを理由に子を kill しない（supervisor は
+/// 起動権の予約・子プロセス・cgroup を回収中かもしれず、kill すると後始末が失われる。CORE-2）。supervisor は内部上限で
+/// 自ら終了して pipe が閉じ、スレッドも終わる。常駐する呼び出し側（plugin-cri）は `Child` を追跡数の上限つきで保持するため、
+/// 残るスレッドの数もその上限で抑えられる。
 fn receive_report(out: impl Read + Send + 'static, within: Duration) -> Received {
     let (tx, rx) = mpsc::sync_channel(1);
     let spawned = std::thread::Builder::new()
@@ -248,6 +249,7 @@ fn supervisor_path_beside(cli_exe: &Path) -> Result<PathBuf, OciRuntimeError> {
 /// 戻りの `Child` はテストが回収するためのもの。本番の呼び出し側は `wait` せずに drop する（supervisor は
 /// CLI より長く生きる。drop は kill しない）。1 行も来ないまま EOF の枝だけ、既に終了した子を 1 回 `try_wait` で回収する
 /// （ECHILD 等の失敗は無視する）。
+#[cfg(test)]
 fn launch_and_receive(
     cmd: Command,
     receive_within: Duration,
@@ -425,20 +427,6 @@ pub fn start_with(
     id: &ContainerId,
     within: Duration,
 ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
-    let (result, child, _) = start_with_receipt(launch, root, id, within);
-    (result, child)
-}
-
-/// [`start_with`] に「受信期限が切れたか」を加えたもの（常駐する呼び出し側用。plugin-cri）。
-///
-/// 3 つ目が `true` は報告が来ないまま期限を過ぎた場合だけ。supervisor が報告した `TIMEOUT`（後始末の途中）では `false`
-/// なので、呼び出し側はこの値で kill の要否を決める（報告後の supervisor を kill して後始末を失わない。CORE-2・REPAIR-5）。
-pub fn start_with_receipt(
-    launch: &SupervisorLaunch,
-    root: &Path,
-    id: &ContainerId,
-    within: Duration,
-) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>, bool) {
     let cmd = scoped_command(
         &launch.systemd_run,
         &launch.supervisor,
@@ -446,7 +434,8 @@ pub fn start_with_receipt(
         id,
         &launch.xdg_runtime_dir,
     );
-    launch_and_receive_ex(cmd, within)
+    let (result, child, _) = launch_and_receive_ex(cmd, within);
+    (result, child)
 }
 
 #[cfg(test)]

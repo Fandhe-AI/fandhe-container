@@ -47,7 +47,7 @@ use fandhe_container_core::traits::{
 };
 use fandhe_container_supervisor::control::{production_signaler, production_stop_signaler};
 use fandhe_container_supervisor::start_client::{
-    SupervisorLaunch, production_deadline, start_with_receipt,
+    SupervisorLaunch, production_deadline, start_with,
 };
 
 /// 追跡する supervisor の子プロセスの上限。超えたら（回収しても空きが無ければ）新しい起動を拒否する（無制限の蓄積を防ぐ）。
@@ -64,24 +64,6 @@ pub const MSG_START_REPORT_MISMATCH: &str =
 pub const MSG_TOO_MANY_SUPERVISORS: &str = "too many supervisor processes are tracked";
 /// 猶予後の SIGKILL でも Stopped にならなかったときの固定文言。
 pub const MSG_STOP_DEADLINE: &str = "container did not stop within the deadline";
-
-/// 受信期限切れ（報告が来ないまま期限を過ぎた場合だけ）に、報告を出さないまま残った supervisor を kill する（回収は呼び出し側の一覧の `try_wait`）。
-///
-/// 常駐デーモンでは、報告を待つ補助スレッドが supervisor の stdout を握ったまま残り続けるのを防ぐ。supervisor の内部上限は
-/// 受信期限より短いため、期限を過ぎても報告が無い supervisor は契約違反の状態にある（SUP-1・REPAIR-5）。
-/// supervisor が `TIMEOUT` を報告した場合は `expired` が `false` で、kill しない: supervisor は報告の後に予約の回復・
-/// 未回収プロセスの terminate・cgroup 削除を行うため、途中で kill すると後始末が失われる（CORE-2）。その場合は読み取り
-/// スレッドも報告の受信で終了済みなので、kill しなくても残らない。CLI は直後に終了するので kill しない。
-fn reclaim_on_timeout(
-    (result, child, expired): (Result<NonZeroU32, OciRuntimeError>, Option<Child>, bool),
-) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
-    let mut child = child;
-    if expired && let Some(c) = child.as_mut() {
-        // kill の失敗（既に終了済み等）は無視する。残りは reap が回収する。
-        let _ = c.kill();
-    }
-    (result, child)
-}
 
 /// supervisor の起動を行う口（本番は [`ProductionStarter`]。結合試験は偽の systemd-run・supervisor を指す [`FixedLaunchStarter`]）。
 ///
@@ -120,9 +102,7 @@ impl SupervisorStarter for ProductionStarter {
             }
         };
         match SupervisorLaunch::resolve_beside(&exe) {
-            Ok(launch) => {
-                reclaim_on_timeout(start_with_receipt(&launch, root, id, production_deadline()))
-            }
+            Ok(launch) => start_with(&launch, root, id, production_deadline()),
             Err(e) => (Err(e), None),
         }
     }
@@ -150,7 +130,7 @@ impl SupervisorStarter for FixedLaunchStarter {
         root: &Path,
         id: &ContainerId,
     ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
-        reclaim_on_timeout(start_with_receipt(&self.launch, root, id, self.within))
+        start_with(&self.launch, root, id, self.within)
     }
 }
 

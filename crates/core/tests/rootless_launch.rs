@@ -248,22 +248,34 @@ mod linux {
                 );
                 panic!("scenario {name} did not exit within the limit");
             };
-            let mut stderr = String::new();
-            child
-                .stderr
-                .take()
-                .expect("piped stderr")
-                .read_to_string(&mut stderr)
-                .expect("read scenario stderr");
+            // 終了コードの照合や stderr の収集より前に、残存した子（holder・mapper・PID 1）を必ず回収する。
+            // 残った子が stderr を継承していると EOF が来ないため、回収が先（#2436・REPAIR-5）。
+            let leftover = leftover_children::reap_leftover_children(timeout());
+            let mut pipe = child.stderr.take().expect("piped stderr");
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+                let r = pipe.read_to_string(&mut buf);
+                let _ = tx.send((r, buf));
+            });
+            // stderr の収集にも期限を設ける。期限切れなら読み取りスレッドは放置して失敗にする。
+            let stderr = match rx.recv_timeout(timeout()) {
+                Ok((r, buf)) => {
+                    r.expect("read scenario stderr");
+                    buf
+                }
+                Err(_) => panic!("scenario {name} stderr did not reach EOF within the limit"),
+            };
             assert_eq!(
                 status.code(),
                 Some(0),
                 "scenario {name} must exit with 0; stderr:\n{stderr}"
             );
-            leftover_children::assert_no_leftover_children(
-                timeout(),
-                &format!("after scenario {name} finished"),
-            );
+            if let Some((left, failed)) = leftover {
+                panic!(
+                    "no child may remain after scenario {name} finished: {left:?} (cleanup failures: {failed:?})"
+                );
+            }
             // Exec 段への到達（SEC-1・CORE-5: `LaunchReady` が作られず exec だけが拒否される）。
             assert!(
                 stderr.contains("PERMISSION_DENIED"),

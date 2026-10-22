@@ -45,31 +45,64 @@ pub fn children_of_self() -> Vec<u32> {
     out
 }
 
-/// 呼び出しプロセスの子が `limit` 以内に 0 件になることを照合する。残りがあれば kill・回収した上で、
-/// pid を含めて panic する。`what` は失敗メッセージの文脈（例: "after the lifecycle scenario finished"）。
-pub fn assert_no_leftover_children(limit: Duration, what: &str) {
+/// 強制回収ループ全体の上限。kill で再親付けされた子（mapper の helper 等）を拾い直す回数を期限で縛る（REPAIR-5）。
+const REAP_ALL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// 呼び出しプロセスの子が `limit` 以内に自然に 0 件になるのを待ち、残っていれば kill・回収する。
+/// 戻り値は「期限後も残っていた子の pid」と「回収の失敗」。何も残らなければ `None`。panic しない（呼び出し側が
+/// 終了コードや stderr の照合より前に必ず回収を済ませるために使う。#2436）。
+///
+/// 回収は子の一覧を再取得して収束するまで繰り返す。mapper を kill すると実行中の newuidmap/newgidmap が
+/// subreaper である自プロセスへ再親付けされ、最初の一覧には無い子が現れるため。全体は [`REAP_ALL_TIMEOUT`] で縛る。
+pub fn reap_leftover_children(limit: Duration) -> Option<(Vec<u32>, Vec<String>)> {
     let deadline = Instant::now() + limit;
     loop {
         if children_of_self().is_empty() {
-            return;
+            return None;
         }
         if Instant::now() >= deadline {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let left = children_of_self();
+    let mut left = children_of_self();
     // 冪等。再親付けされた孫を pid 指定で回収できるようにする（呼び出し側が未設定でも安全側に倒す）。
     let proof = ChildSubreaper::enable().expect("enable child subreaper for cleanup");
     let mut failed = Vec::new();
-    for pid in &left {
-        let Some(pid) = NonZeroU32::new(*pid) else {
-            continue;
-        };
-        let child = ContainerChild::adopt_reparented(pid, &proof);
-        if let Err(e) = child.kill_and_reap(REAP_TIMEOUT) {
-            failed.push(format!("{pid}: {e:?}"));
+    let reap_deadline = Instant::now() + REAP_ALL_TIMEOUT;
+    let mut round = left.clone();
+    while !round.is_empty() {
+        for pid in &round {
+            let Some(pid) = NonZeroU32::new(*pid) else {
+                continue;
+            };
+            let child = ContainerChild::adopt_reparented(pid, &proof);
+            if let Err(e) = child.kill_and_reap(REAP_TIMEOUT) {
+                failed.push(format!("{pid}: {e:?}"));
+            }
+        }
+        if Instant::now() >= reap_deadline {
+            failed.push(format!(
+                "reap did not converge within {REAP_ALL_TIMEOUT:?}: {:?}",
+                children_of_self()
+            ));
+            break;
+        }
+        // 回収後に子の一覧を取り直し、新しく再親付けされた子も回収する。
+        round = children_of_self();
+        for pid in &round {
+            if !left.contains(pid) {
+                left.push(*pid);
+            }
         }
     }
-    panic!("no child may remain {what}: {left:?} (cleanup failures: {failed:?})");
+    Some((left, failed))
+}
+
+/// 呼び出しプロセスの子が `limit` 以内に 0 件になることを照合する。残りがあれば kill・回収した上で、
+/// pid を含めて panic する。`what` は失敗メッセージの文脈（例: "after the lifecycle scenario finished"）。
+pub fn assert_no_leftover_children(limit: Duration, what: &str) {
+    if let Some((left, failed)) = reap_leftover_children(limit) {
+        panic!("no child may remain {what}: {left:?} (cleanup failures: {failed:?})");
+    }
 }

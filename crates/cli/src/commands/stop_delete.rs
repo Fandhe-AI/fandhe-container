@@ -34,8 +34,13 @@
 //!   `kill` に揃える）。猶予待ち → SIGKILL・Stopped への遷移確認は TASK-157 の範囲。
 //! - stop の SIGTERM は意図つき（StopRequest）で送る。supervisor は意図を記録してから送るので、stop による終了は
 //!   `always`・`on-failure`・`unless-stopped` でも再起動されない（SUP-9・SUP-3・#2162）。意図を記録できない supervisor
-//!   （書き先なし・古い版）にはシグナルを送らず、構造化エラーで失敗する（fail-closed）。「明示 stop 済み」の state.json
-//!   への持続化と再 launch 時の `unless-stopped` / `always` の差は未実装。
+//!   （書き先なし・古い版）にはシグナルを送らず、構造化エラーで失敗する（fail-closed）。「明示 stop 済み」は supervisor が
+//!   state.json の `Stopped` の記録へ残す（#2440・トレイト契約 14）。
+//! - 記録が `Stopped` のとき（終了を検知した後のバックオフ・再 launch 中かもしれない）は、[`stop_or_cancel_restart`] が
+//!   core の `kill`（`Stopped` を `FailedPrecondition` で拒否する）の前に、supervisor の制御チャネルへ保留中の再起動の取り消しを
+//!   依頼する（#2440・SUP-9・SUP-3）。取り消せたら成功。届く supervisor が無ければ従来どおり core の `kill` に任せて
+//!   `container is not running` で失敗する。取り消しの時点で新しいプロセスが動いていたら、期限内に記録を読み直して通常の stop を
+//!   やり直す。
 //! - stop の猶予後の SIGKILL と Stopped への遷移確認（#1545。同じ stop 用 signaler を使う。意図は一度立てば残るので 2 回目は
 //!   無害）、`kill` コマンド（#1902。[`production_signaler`] を使い、意図は立てない）は未実装。
 //! - `delete` が最初に照合する委譲スコープは CLI 自身の cgroup から検出したもの。start 時に supervisor が記録した
@@ -54,20 +59,20 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fandhe_container_core::observability::OpRecorder;
+use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{
     ContainerCgroupRemover, KillTimeout, LifecycleOp, OciRuntimeError, ProcessSignaler, delete,
     delete_releasing_image_ref, kill,
 };
 use fandhe_container_core::traits::{
-    ContainerId, ContainerStatus, DeleteRequest, DeleteResponse, KillRequest, Signal, StateStore,
-    TraitError,
+    ContainerId, ContainerState, ContainerStatus, DeleteRequest, DeleteResponse, ErrorCode,
+    GetStateRequest, KillRequest, Signal, StateStore, TraitError,
 };
 // 試験が `use super::*` 経由で使う型（本番の経路では使わない）。
 #[cfg(all(test, target_os = "linux"))]
 use fandhe_container_core::oci_runtime::CgroupRemoval;
 #[cfg(test)]
-use fandhe_container_core::traits::{CgroupPlacement, CgroupScope, ErrorCode, StateRevision};
+use fandhe_container_core::traits::{CgroupPlacement, CgroupScope, StateRevision};
 
 use super::CliExit;
 use super::args::{DeleteArgs, GlobalArgs, StopArgs};
@@ -87,7 +92,9 @@ use fandhe_container_supervisor::cgroup_remover::{DetectedCgroupRemover, detect_
 use fandhe_container_supervisor::control::UnavailableSignaler;
 #[cfg(all(test, target_os = "linux"))]
 use fandhe_container_supervisor::control::production_signaler;
-use fandhe_container_supervisor::control::production_stop_signaler;
+use fandhe_container_supervisor::control::{
+    CancelOutcome, PendingRestartCanceller, production_restart_canceller, production_stop_signaler,
+};
 use fandhe_container_supervisor::supervisor_log::{
     LogRemoval, SUPERVISOR_LOG_REMOVE_TIMEOUT, run_log_removal_bounded,
 };
@@ -113,6 +120,92 @@ pub(super) fn stop_container(
     timeout: &KillTimeout,
 ) -> Result<ContainerStatus, OciRuntimeError> {
     kill(store, recorder, signaler, req, timeout)
+}
+
+/// `stop` の本体。記録が `Stopped` なら保留中の再起動の取り消しを試し、それ以外は core の `kill`（SIGTERM）へ進む
+/// （SUP-9・SUP-3・#2440。モジュール doc 参照）。op は従来どおり `kill` で記録する（取り消しの経路も含む）。
+pub(super) fn stop_or_cancel_restart(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    signaler: &Arc<dyn ProcessSignaler>,
+    canceller: &dyn PendingRestartCanceller,
+    req: &KillRequest,
+    timeout: &KillTimeout,
+) -> Result<(), OciRuntimeError> {
+    let stopped = store
+        .get(&GetStateRequest::new(req.id().clone()))
+        .is_ok_and(|rec| rec.status().state() == ContainerState::Stopped);
+    if !stopped {
+        return stop_container(store, recorder, signaler, req, timeout).map(drop);
+    }
+    let started = Instant::now();
+    let deadline = started + timeout.get();
+    match cancel_until(store, canceller, req.id(), deadline) {
+        // 取り消せた、または取り消しの試行自体が失敗した: ここで終わる。op `kill` として記録する。
+        Ok(CancelFlow::Cancelled) => {
+            record_kill(recorder, true, started);
+            Ok(())
+        }
+        Err(e) => {
+            record_kill(recorder, false, started);
+            Err(OciRuntimeError::from_trait_error(LifecycleOp::Kill, e))
+        }
+        // 届く supervisor が無い、または新しいプロセスが動いている: 通常の stop（従来の挙動と失敗）へ。
+        Ok(CancelFlow::Fallback) => {
+            stop_container(store, recorder, signaler, req, timeout).map(drop)
+        }
+    }
+}
+
+/// 取り消しの試行の結果。
+enum CancelFlow {
+    /// 保留中の再起動を取り消した。
+    Cancelled,
+    /// 取り消せない（届く supervisor が無い・記録が `Stopped` でなくなった）。通常の `kill` へ進む。
+    Fallback,
+}
+
+/// op `kill` の結果を記録する（記録できなくても stop の結果は変えない）。
+fn record_kill(recorder: &OpRecorder, success: bool, started: Instant) {
+    if let Ok(name) = OpName::new("kill") {
+        let outcome = if success {
+            OpOutcome::Success
+        } else {
+            OpOutcome::Failure
+        };
+        let _ = recorder.record(&name, outcome, started.elapsed());
+    }
+}
+
+/// 記録が `Stopped` の間、`deadline` まで取り消しを依頼する。
+///
+/// 取り消しの時点で新しいプロセスが動いていた（`ContainerRunning`）ときは、記録を読み直して様子を見る:
+/// `Running` なら通常の stop に任せ（`Fallback`）、また `Stopped` ならもう一度取り消す。期限に達したら `Timeout`。
+fn cancel_until(
+    store: &dyn StateStore,
+    canceller: &dyn PendingRestartCanceller,
+    id: &ContainerId,
+    deadline: Instant,
+) -> Result<CancelFlow, TraitError> {
+    loop {
+        match canceller.cancel(id, deadline)? {
+            CancelOutcome::Cancelled => return Ok(CancelFlow::Cancelled),
+            CancelOutcome::ContainerRunning => {
+                let rec = store.get(&GetStateRequest::new(id.clone()))?;
+                if rec.status().state() != ContainerState::Stopped {
+                    return Ok(CancelFlow::Fallback);
+                }
+                if Instant::now() >= deadline {
+                    return Err(TraitError::new(
+                        ErrorCode::Timeout,
+                        "the restart cancellation did not complete within the timeout",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => return Ok(CancelFlow::Fallback),
+        }
+    }
 }
 
 /// 構築済みの要求で core の `delete` を呼ぶ。
@@ -152,10 +245,12 @@ pub(super) fn run_stop(global: &GlobalArgs, args: &StopArgs) -> CliExit {
         Err(e) => return CliExit::Runtime(e),
     };
     let signaler = production_stop_signaler(rt.store.as_ref());
-    let result = stop_container(
+    let canceller = production_restart_canceller(rt.store.as_ref());
+    let result = stop_or_cancel_restart(
         rt.store.as_ref(),
         &rt.recorder,
         &signaler,
+        canceller.as_ref(),
         &req,
         &KillTimeout::default(),
     );

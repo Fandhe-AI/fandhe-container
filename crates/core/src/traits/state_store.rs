@@ -85,6 +85,13 @@
 //!     「core が作った rootfs ではない」（利用者が用意したもの）ことを表し、`oci_runtime::delete` は rootfs に
 //!     触れない。`Some` のときだけ delete が状態削除の成功後に消す。`get` / `list` で返す。plugin 実装も同じく
 //!     往復させる。値の形式は [`ImageRootfsRecord::new`] が検証する（設計は `docs/design/image-rootfs-lifetime.md`）
+//! 14. [`StateRecord::explicit_stop`]（利用者の明示 stop を supervisor が記録したもの。SUP-9・SUP-3・SUP-8・#2440）は
+//!     **`Stopped` のレコードでだけ有効**とする。`create` では常に [`ExplicitStop::NotRecorded`]。`update` は、新しい
+//!     status が `Stopped` でなければ常に落とし（次の `Running` へ持ち越して、次のクラッシュで `unless-stopped` の
+//!     再起動を誤って抑止しないため）、`Stopped` で [`UpdateStateRequest::with_explicit_stop`] の指定が無ければ既存の値を
+//!     引き継ぐ（health 更新などで消さない）。`Stopped` 以外の status への指定付き `update` は `InvalidArgument` で
+//!     拒否する（壊れた値を表現させない）。re-adopt・再 launch の判定（`unless-stopped` は記録済みなら起こさない）が
+//!     読む。`get` / `list` で返す。plugin 実装も同じく往復させる
 //!
 //! メソッドは同期（`&self`、`async fn` を使わない）にし、ジェネリクスも持たない。
 //! `ContainerRuntime`（TASK-4.1）と同じく dyn 互換（object safety）を保つ。
@@ -605,6 +612,23 @@ pub struct StateRecord {
     launch_isolation: Option<LaunchIsolationRecord>,
     /// core が作った rootfs の記録（契約 13。OCI-7・OCI-5・#2378）。
     image_rootfs: Option<ImageRootfsRecord>,
+    /// 明示 stop の記録（契約 14。SUP-9・SUP-3・SUP-8・#2440）。`Stopped` のときだけ有効。
+    explicit_stop: ExplicitStop,
+}
+
+/// 利用者の明示 stop を記録したか（契約 14。SUP-9・SUP-3・SUP-8・#2440）。
+///
+/// supervisor の監視スレッドが、明示 stop による終了（稼働中の stop・バックオフ中の stop による再起動の取り消し）を
+/// `Stopped` のレコードへ残す。クラッシュなどの明示 stop でない終了では `NotRecorded` のまま。
+/// 真偽値にしないのは、将来の種別追加の余地を残すため（`#[non_exhaustive]`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ExplicitStop {
+    /// 記録が無い（既定。既存の状態ファイルもこれとして読む）。
+    #[default]
+    NotRecorded,
+    /// 明示 stop として記録済み。
+    Recorded,
 }
 
 impl StateRecord {
@@ -636,7 +660,21 @@ impl StateRecord {
             rlimits: None,
             launch_isolation: None,
             image_rootfs: None,
+            explicit_stop: ExplicitStop::NotRecorded,
         })
+    }
+
+    /// 明示 stop の記録を設定する（[`Self::explicit_stop`]）。ストア実装が update・読み込みで使う。
+    #[must_use]
+    pub fn with_explicit_stop(mut self, explicit_stop: ExplicitStop) -> Self {
+        self.explicit_stop = explicit_stop;
+        self
+    }
+
+    /// 明示 stop の記録を返す（契約 14）。re-adopt・再 launch が `unless-stopped` を起こすかの判定に使う
+    /// （supervisor の `evaluate_resume`。呼び出し側の re-adopt は #514 で実装予定）。
+    pub fn explicit_stop(&self) -> ExplicitStop {
+        self.explicit_stop
     }
 
     /// core が作った rootfs の記録を設定する（[`Self::image_rootfs`]）。ストア実装が create・update・読み込みで使う。
@@ -903,6 +941,7 @@ pub struct UpdateStateRequest {
     cgroup_scope: Option<CgroupScope>,
     rlimits: Option<Rlimits>,
     launch_isolation: Option<LaunchIsolationRecord>,
+    explicit_stop: Option<ExplicitStop>,
 }
 
 impl UpdateStateRequest {
@@ -915,7 +954,22 @@ impl UpdateStateRequest {
             cgroup_scope: None,
             rlimits: None,
             launch_isolation: None,
+            explicit_stop: None,
         }
+    }
+
+    /// 更新後の明示 stop の記録を指定する（契約 14。SUP-9・SUP-3・#2440）。`Stopped` への update でだけ指定できる
+    /// （それ以外の status との組は `InvalidArgument`）。未指定の update は `Stopped` なら既存の値を引き継ぎ、
+    /// `Stopped` 以外なら落とす。
+    #[must_use]
+    pub fn with_explicit_stop(mut self, explicit_stop: ExplicitStop) -> Self {
+        self.explicit_stop = Some(explicit_stop);
+        self
+    }
+
+    /// 指定された明示 stop の記録を返す（未指定なら `None`）。
+    pub fn explicit_stop(&self) -> Option<ExplicitStop> {
+        self.explicit_stop
     }
 
     /// 更新後の launch 時の分離の記録を指定する（契約 12。SUP-6・TASK-163 追補・#1468）。restart の再 launch は

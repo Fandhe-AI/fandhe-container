@@ -108,10 +108,11 @@ use crate::launch_isolation::{
 use crate::oci_runtime::MountDestination;
 use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
 use crate::traits::{
-    Annotations, CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, CreateStateRequest,
-    DeleteStateRequest, DeleteStateResponse, ErrorCode, GetStateRequest, HealthStatus,
-    ImageRootfsRecord, ListStateRequest, StateList, StateListCursor, StateRecord, StateRevision,
-    StateStore, SupervisionState, TerminationReason, TraitError, UpdateStateRequest,
+    Annotations, CgroupPlacement, CgroupScope, ContainerId, ContainerState, ContainerStatus,
+    CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ErrorCode, ExplicitStop,
+    GetStateRequest, HealthStatus, ImageRootfsRecord, ListStateRequest, StateList, StateListCursor,
+    StateRecord, StateRevision, StateStore, SupervisionState, TerminationReason, TraitError,
+    UpdateStateRequest,
 };
 
 /// 各コンテナの状態ファイル名（OCI-5）。
@@ -1035,6 +1036,21 @@ impl StateStore for FileStateStore {
         if let Some(r) = existing.image_rootfs() {
             record = record.with_image_rootfs(r.clone());
         }
+        // 明示 stop の記録は `Stopped` のレコードでだけ有効（トレイト契約 14。SUP-9・SUP-3・#2440）。
+        // `Stopped` では指定があれば置き換え、なければ引き継ぐ。それ以外の status へは持ち越さず（次のクラッシュで
+        // `unless-stopped` の再起動を誤って抑止しないため）、指定付きは拒否する。拒否は書き込みの前に行う。
+        let is_stopped = req.status().state() == ContainerState::Stopped;
+        match (is_stopped, req.explicit_stop()) {
+            (true, Some(e)) => record = record.with_explicit_stop(e),
+            (true, None) => record = record.with_explicit_stop(existing.explicit_stop()),
+            (false, None) => {}
+            (false, Some(_)) => {
+                return Err(err(
+                    ErrorCode::InvalidArgument,
+                    "explicit stop requires a stopped status",
+                ));
+            }
+        }
         self.write_record(&record)?;
         Ok(record)
     }
@@ -1688,6 +1704,14 @@ struct StateDto {
     /// core が作った rootfs の記録（OCI-7・OCI-5・#2378）。キー欠落は `None`（利用者が用意した rootfs）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     image_rootfs: Option<ImageRootfsDto>,
+    /// 明示 stop の記録（SUP-9・SUP-3・#2440。契約 14）。`stopped` のときだけ `true` を許し、キー欠落は `false`
+    /// （導入前の版が書いた state.json は未記録として読む）。
+    #[serde(default, skip_serializing_if = "is_false")]
+    explicit_stop: bool,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// `state.json` の core が作った rootfs の記録（`imageRootfs`）。`{"path":"rootfs","dev":N,"ino":N}`。
@@ -2044,6 +2068,7 @@ impl StateDto {
                     token: r.token().map(str::to_owned),
                 }),
             },
+            explicit_stop: record.explicit_stop() == ExplicitStop::Recorded,
         })
     }
 
@@ -2083,6 +2108,10 @@ impl StateDto {
         };
         // 終了理由は stopped のときだけ持てる（それ以外での出現は破損）。
         if termination.is_some() && status.termination_reason().is_none() {
+            return Err(corrupted());
+        }
+        // 明示 stop の記録も stopped のときだけ持てる（それ以外での出現は破損。契約 14）。
+        if self.explicit_stop && status.state() != ContainerState::Stopped {
             return Err(corrupted());
         }
         let cgroup = match (self.cgroup_scope.as_deref(), self.cgroup_instance) {
@@ -2160,6 +2189,11 @@ impl StateDto {
         let record = match image_rootfs {
             Some(r) => record.with_image_rootfs(r),
             None => record,
+        };
+        let record = if self.explicit_stop {
+            record.with_explicit_stop(ExplicitStop::Recorded)
+        } else {
+            record
         };
         Ok(match cgroup {
             Some(c) => record.with_cgroup(c),
@@ -3568,6 +3602,112 @@ mod tests {
             let e = store.get(&GetStateRequest::new(cid(id))).unwrap_err();
             assert_eq!(e.code().as_str(), "INTERNAL", "{id}");
         }
+    }
+
+    fn stopped_status(rec: &StateRecord) -> ContainerStatus {
+        ContainerStatus::stopped(rec.id().clone(), Some(1))
+    }
+
+    /// SUP-9・SUP-3・OCI-5・#2440: `explicitStop` を持たない既存の state.json は未記録として読め、未記録は書かない。
+    #[test]
+    fn sup9_explicit_stop_absent_key_reads_not_recorded_and_is_omitted() {
+        let t = TmpDir::new("exstopnone");
+        let store = t.open();
+        let rec = create(&store, "web");
+        assert_eq!(rec.explicit_stop(), ExplicitStop::NotRecorded);
+        assert!(read_json(&t, "web").get("explicitStop").is_none());
+        let stopped = store
+            .update(&UpdateStateRequest::new(
+                stopped_status(&rec),
+                rec.revision(),
+            ))
+            .unwrap();
+        assert_eq!(stopped.explicit_stop(), ExplicitStop::NotRecorded);
+        assert!(read_json(&t, "web").get("explicitStop").is_none());
+    }
+
+    /// SUP-9・SUP-3・#2440: `Stopped` への指定付き update で記録され、再読み込みでも `Recorded`、
+    /// 指定なしの `Stopped` への update（health 更新など）では引き継がれる（契約 14）。
+    #[test]
+    fn sup9_explicit_stop_persists_round_trip_and_carries_over_on_stopped() {
+        let t = TmpDir::new("exstopset");
+        let store = t.open();
+        let rec = create(&store, "web");
+        let stopped = store
+            .update(
+                &UpdateStateRequest::new(stopped_status(&rec), rec.revision())
+                    .with_explicit_stop(ExplicitStop::Recorded),
+            )
+            .unwrap();
+        assert_eq!(stopped.explicit_stop(), ExplicitStop::Recorded);
+        assert_eq!(read_json(&t, "web")["explicitStop"], true);
+        let got = store.get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(got.explicit_stop(), ExplicitStop::Recorded);
+        let health = store
+            .update(
+                &UpdateStateRequest::new(stopped_status(&got), got.revision()).with_supervision(
+                    SupervisionState::new(None, Some(HealthStatus::Unhealthy), 3),
+                ),
+            )
+            .unwrap();
+        assert_eq!(health.explicit_stop(), ExplicitStop::Recorded);
+    }
+
+    /// SUP-9・SUP-3・#2440: `Running` への update では記録を落とす（次のクラッシュで `unless-stopped` を抑止しない）。
+    #[test]
+    fn sup9_explicit_stop_is_dropped_when_leaving_stopped() {
+        let t = TmpDir::new("exstopdrop");
+        let store = t.open();
+        let rec = create(&store, "web");
+        let stopped = store
+            .update(
+                &UpdateStateRequest::new(stopped_status(&rec), rec.revision())
+                    .with_explicit_stop(ExplicitStop::Recorded),
+            )
+            .unwrap();
+        let running = update_to_running(&store, &stopped);
+        assert_eq!(running.explicit_stop(), ExplicitStop::NotRecorded);
+        assert!(read_json(&t, "web").get("explicitStop").is_none());
+    }
+
+    /// SUP-9・SUP-3・#2440: `Stopped` 以外の status への指定付き update は `InvalidArgument` で、書き込まない。
+    #[test]
+    fn sup9_explicit_stop_on_non_stopped_update_is_rejected() {
+        let t = TmpDir::new("exstopbad");
+        let store = t.open();
+        let rec = create(&store, "web");
+        let status = ContainerStatus::running(rec.id().clone(), NonZeroU32::new(4242));
+        let e = store
+            .update(
+                &UpdateStateRequest::new(status, rec.revision())
+                    .with_explicit_stop(ExplicitStop::Recorded),
+            )
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::InvalidArgument);
+        let got = store.get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(got.revision(), rec.revision());
+    }
+
+    /// SUP-9・SUP-3・OCI-5・#2440: `explicitStop: true` と `running` の組は破損（Internal）として読む。
+    #[test]
+    fn sup9_explicit_stop_with_running_status_is_corrupted() {
+        let t = TmpDir::new("exstopcorrupt");
+        let store = t.open();
+        create(&store, "web");
+        let body = serde_json::json!({
+            "ociVersion": "1.2.0", "id": "web", "status": "running", "bundle": "/b", "revision": 10,
+            "explicitStop": true,
+        });
+        fs::write(t.path().join("web").join("state.json"), body.to_string()).unwrap();
+        let e = store.get(&GetStateRequest::new(cid("web"))).unwrap_err();
+        assert_eq!(e.code().as_str(), "INTERNAL");
+        let ok = serde_json::json!({
+            "ociVersion": "1.2.0", "id": "web", "status": "stopped", "bundle": "/b", "revision": 10,
+            "explicitStop": true,
+        });
+        fs::write(t.path().join("web").join("state.json"), ok.to_string()).unwrap();
+        let got = store.get(&GetStateRequest::new(cid("web"))).unwrap();
+        assert_eq!(got.explicit_stop(), ExplicitStop::Recorded);
     }
 
     /// OCI-5・SEC-1・#2378: `ImageRootfsRecord::new` は bundle の外・展開中の木を指せる値を作らせない。

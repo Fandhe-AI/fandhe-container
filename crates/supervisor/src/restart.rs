@@ -20,10 +20,13 @@
 //!   単一スレッドの要求を満たせないため、`FailedPrecondition` で拒否されて [`SuperviseOutcome::RelaunchFailed`] になる
 //!   （fail-closed。新しい子は作られない）。実機で成立させる再構成は #2043（SUP-3・CORE-1）で、レイテンシ実測・合否判定
 //!   （#490・#491。TASK-160）はその後になる。
-//! - 明示的な stop の意図は制御チャネルの StopRequest が [`StopToken::mark_explicit_stop`] で立て（#2162・SUP-9）、本モジュールは
-//!   [`StopToken`] を [`StopIntent`] へ写すだけ。supervisor の寿命の中では、`always`・`unless-stopped` を含む全ポリシーで
-//!   明示 stop の後は再起動しない。「明示 stop 済み」を state.json に残して再 launch 時に `unless-stopped` と `always` を
-//!   分ける挙動は未実装（core の `SupervisionState` の変更を要する。SUP-3・SUP-9）。
+//! - 明示的な stop の意図は制御チャネルの StopRequest（稼働中）か CancelRestartRequest（バックオフ・再 launch 中）が
+//!   [`StopToken::mark_explicit_stop`] で立て（#2162・#2440・SUP-9）、本モジュールは [`StopToken`] を [`StopIntent`] へ写す。
+//!   supervisor の寿命の中では、`always`・`unless-stopped` を含む全ポリシーで明示 stop の後は再起動しない。
+//!   明示 stop による終了は state.json の `Stopped` の記録へ「明示 stop 済み」（`StateRecord::explicit_stop`。トレイト契約 14）として
+//!   残し、再 launch・re-adopt 時の `unless-stopped`（起こさない）と `always`（起こす）の分岐は [`evaluate_resume`] が担う。
+//!   [`evaluate_resume`] を呼ぶ re-adopt 本体は未実装（#514・SUP-8）。記録に失敗したら再起動せず
+//!   [`SuperviseOutcome::ExplicitStopUnrecorded`] で戻る（fail-closed。その後の re-adopt では `unless-stopped` が起こし得る）。
 //! - [`crate::run::MonitorOutcome::ExitedUnrecorded`]（終了は回収済みだが記録失敗）の回復は未実装で、
 //!   再 launch せずに [`SuperviseOutcome::MonitorFailed`] で返す（状態が不確かなまま再起動しない。fail-closed）。
 //! - 指数バックオフ等の高度な間隔制御は未実装（固定の [`RestartConfig::backoff`] のみ）。
@@ -47,7 +50,8 @@ use fandhe_container_core::oci_runtime::{
     LaunchSpec, LaunchedProcess, ProcessExit, ProcessLauncher,
 };
 use fandhe_container_core::traits::{
-    ContainerId, ContainerStatus, ErrorCode, Signal, StateRecord, SupervisionState, TraitError,
+    ContainerId, ContainerStatus, ErrorCode, ExplicitStop, Signal, StateRecord, SupervisionState,
+    TraitError,
 };
 
 use crate::log_pipeline::CaptureHub;
@@ -201,6 +205,8 @@ pub enum NoRestartReason {
     ExplicitStop,
     /// 終了を分類できず異常と判断しない（`on-failure`）。
     UnclassifiedExit,
+    /// 再 launch・re-adopt 時に `on-failure` は起こさない（[`evaluate_resume`]。直前の終了を持たないため）。
+    NotResumedOnFailure,
 }
 
 impl NoRestartReason {
@@ -212,6 +218,7 @@ impl NoRestartReason {
             NoRestartReason::RetriesExhausted => "retries_exhausted",
             NoRestartReason::ExplicitStop => "explicit_stop",
             NoRestartReason::UnclassifiedExit => "unclassified_exit",
+            NoRestartReason::NotResumedOnFailure => "not_resumed_on_failure",
         }
     }
 }
@@ -220,7 +227,7 @@ impl NoRestartReason {
 ///
 /// 評価順: 明示的 stop（全ポリシーで再起動しない。Docker 互換）→ `no` → `always` / `unless-stopped`
 /// （常に再起動）→ `on-failure`。このため終了検知時点では `always` と `unless-stopped` は同じ結果になり、
-/// 差は再 launch 時の挙動（未実装。SUP-3・SUP-9）にある。
+/// 差は再 launch・re-adopt 時の挙動（[`evaluate_resume`]。SUP-3・SUP-9）にある。
 ///
 /// `restart_count` は「これまでに行った再起動の回数」として受ける。呼び出し元は [`supervise_with_restart`]
 /// （#489・TASK-159.3）で、state.json の `restart_count`（再 launch 成功ごとに 1 進む）をそのまま渡す。
@@ -244,6 +251,30 @@ pub fn evaluate_restart(
                 Some(n) if restart_count >= n.get() => no(NoRestartReason::RetriesExhausted),
                 _ => RestartDecision::Restart,
             },
+        },
+    }
+}
+
+/// 再 launch・re-adopt（supervisor が落ちた後に state.json から戻すとき）の起こす・起こさないを判定する純粋関数
+/// （SUP-3・SUP-8・SUP-9・#2440）。
+///
+/// Docker のデーモン再起動時の挙動に合わせた解釈: `always` は明示 stop 済みでも起こす／`unless-stopped` は
+/// 明示 stop 済み（`StateRecord::explicit_stop` が `Recorded`）なら起こさない／`on-failure` は直前の終了を
+/// 持たないため起こさない（[`NoRestartReason::NotResumedOnFailure`]）／`no` は起こさない。
+/// 明示 stop の記録が欠けている（`NotRecorded`）ときは `unless-stopped` を起こす側に倒れる点に注意
+/// （記録は [`supervise_with_restart`] が書く。書けなかった場合は [`SuperviseOutcome::ExplicitStopUnrecorded`]）。
+///
+/// 呼び出し側（re-adopt・再 launch の入口。#514・TASK-165.5）は未実装で、`StateRecord::explicit_stop()` を渡して呼ぶ予定。
+/// spec には再 launch 時の `unless-stopped` の定義が無く、上記は Docker 互換の解釈である（REPAIR-3）。
+pub fn evaluate_resume(policy: RestartPolicy, explicit: ExplicitStop) -> RestartDecision {
+    let no = |reason| RestartDecision::DoNotRestart { reason };
+    match policy {
+        RestartPolicy::No => no(NoRestartReason::PolicyNo),
+        RestartPolicy::OnFailure { .. } => no(NoRestartReason::NotResumedOnFailure),
+        RestartPolicy::Always => RestartDecision::Restart,
+        RestartPolicy::UnlessStopped => match explicit {
+            ExplicitStop::Recorded => no(NoRestartReason::ExplicitStop),
+            _ => RestartDecision::Restart,
         },
     }
 }
@@ -421,6 +452,13 @@ impl LateOrphans {
         self.lock().active_workers == 0
     }
 
+    /// 実行スレッドの終了を `grace` まで待ってから 「実行スレッドが全て終了済みで、terminate に失敗したハンドルも無い（残存プロセスが無いと確認できた）」かを判定する。結果の通知（`Slot::Done`）は
+    /// スレッド終了のガードより先に公開されるため、通知直後は終了が競合で未反映になり得る。その競合で
+    /// 受理済みの明示 stop の記録可否が変わらないよう、有限時間だけ待つ（REPAIR-5・SUP-9・契約 14）。
+    fn is_clean_after_settle(&self, grace: Duration) -> bool {
+        self.wait_settled(grace) && self.lock().orphans.is_empty()
+    }
+
     /// 実行スレッドの終了を `timeout` まで待つ。終了していれば `true`（以後の [`LateOrphans::take`] が最終結果）。
     /// `false` は relaunch が戻らず未完了で、呼び出し側は受け皿を保持して後で再確認する（REPAIR-5）。
     pub fn wait_settled(&self, timeout: Duration) -> bool {
@@ -541,6 +579,10 @@ pub enum SuperviseOutcome {
         late: LateOrphans,
         /// 実施した再起動の回数。
         restarts: u32,
+        /// 再 launch 中に受理した明示 stop が、まだ state.json へ残せていない（呼び出し側の回収確認後に残す）。
+        /// `true` のとき、呼び出し側は回収を確認できてから世代を照合して `explicit_stop` を書く（書けなければ非 0。
+        /// #2440・SUP-9・契約 14）。
+        explicit_stop_pending: bool,
     },
     /// 再 launch に失敗した（`restart_count` は進めていない。状態は `Stopped`）。
     RelaunchFailed {
@@ -552,6 +594,8 @@ pub enum SuperviseOutcome {
         late: LateOrphans,
         /// 実施した再起動の回数。
         restarts: u32,
+        /// 再 launch の待機中に受理した明示 stop が、残存プロセスの回収未確認のため未記録（`Stopped` 同名フィールド参照）。
+        explicit_stop_pending: bool,
     },
     /// 再 launch には成功したが `Running` の記録に失敗したため、新プロセスを terminate した。
     /// 停止要求で取り消した再起動の記録の書き戻し（`Stopped` へ戻す・監視権を返す）に失敗した場合もこれを返す
@@ -577,6 +621,18 @@ pub enum SuperviseOutcome {
         /// 終了を確認できていない（生存の可能性がある）起動ハンドル。回収責任は呼び出し側（REPAIR-5）。
         /// 終了が回収済みの `ExitedUnrecorded` では `None`。
         process: Option<Box<dyn LaunchedProcess>>,
+        /// 実施した再起動の回数。
+        restarts: u32,
+    },
+    /// 明示 stop で再起動を取りやめたが、「明示 stop 済み」を state.json に記録できなかった（fail-closed。#2440・SUP-9）。
+    ///
+    /// 再起動はしない（メモリ上の意図で判定は確定している）。プロセスは回収済みで、記録は `Stopped`（明示 stop なし）のまま。
+    /// この状態で supervisor が落ちて re-adopt されると `unless-stopped` は起こし得る（[`evaluate_resume`]）。
+    ExplicitStopUnrecorded {
+        /// 最後の `monitor` の結果（`Exited`）。
+        last: MonitorOutcome,
+        /// 記録の失敗理由。
+        error: TraitError,
         /// 実施した再起動の回数。
         restarts: u32,
     },
@@ -610,24 +666,28 @@ impl fmt::Debug for SuperviseOutcome {
                 process,
                 late,
                 restarts,
+                explicit_stop_pending,
             } => f
                 .debug_struct("Stopped")
                 .field("last", last)
                 .field("has_process", &process.is_some())
                 .field("late", late)
                 .field("restarts", restarts)
+                .field("explicit_stop_pending", explicit_stop_pending)
                 .finish(),
             Self::RelaunchFailed {
                 exit,
                 error,
                 late,
                 restarts,
+                explicit_stop_pending,
             } => f
                 .debug_struct("RelaunchFailed")
                 .field("exit", exit)
                 .field("error", error)
                 .field("late", late)
                 .field("restarts", restarts)
+                .field("explicit_stop_pending", explicit_stop_pending)
                 .finish(),
             Self::RestartUnrecorded {
                 error,
@@ -653,6 +713,16 @@ impl fmt::Debug for SuperviseOutcome {
                 .field("has_process", &process.is_some())
                 .field("restarts", restarts)
                 .finish(),
+            Self::ExplicitStopUnrecorded {
+                last,
+                error,
+                restarts,
+            } => f
+                .debug_struct("ExplicitStopUnrecorded")
+                .field("last", last)
+                .field("error", error)
+                .field("restarts", restarts)
+                .finish(),
             Self::MonitorError {
                 error, restarts, ..
             } => f
@@ -664,18 +734,69 @@ impl fmt::Debug for SuperviseOutcome {
     }
 }
 
-/// バックオフ待ち。`stop` を [`BACKOFF_SLICE`] ごとに確認し、停止要求なら `false`（待ちを打ち切る）を返す。
-fn sleep_unless_stopped(backoff: Duration, stop: &StopToken) -> bool {
+/// バックオフ待ちの終わり方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackoffEnd {
+    /// 待ちきった（再 launch へ進む）。
+    Elapsed,
+    /// 停止要求（`request_stop`）で打ち切った。
+    HardStop,
+    /// 明示 stop の意図（バックオフ中の stop による再起動の取り消し。#2440）で打ち切った。
+    ExplicitStop,
+}
+
+/// バックオフ待ち。`stop` を [`BACKOFF_SLICE`] ごとに確認し、停止要求・明示 stop の意図で打ち切る（種類を返す）。
+/// 両方立っていれば停止要求を優先する。
+fn sleep_unless_stopped(backoff: Duration, stop: &StopToken) -> BackoffEnd {
     let end = Instant::now() + backoff;
     loop {
         if stop.is_stop_requested() {
-            return false;
+            return BackoffEnd::HardStop;
+        }
+        if explicit_requested(stop) {
+            return BackoffEnd::ExplicitStop;
         }
         let now = Instant::now();
         if now >= end {
-            return true;
+            return BackoffEnd::Elapsed;
         }
         std::thread::sleep(BACKOFF_SLICE.min(end - now));
+    }
+}
+
+/// 明示 stop の意図が立っているか。
+fn explicit_requested(stop: &StopToken) -> bool {
+    stop.explicit_stop_state() == crate::run::ExplicitStopState::Requested
+}
+
+/// 明示 stop による終了を state.json へ記録して結果を返す（#2440・SUP-9・SUP-3）。
+///
+/// 成功は [`SuperviseOutcome::Finished`]（`ExplicitStop`）。記録に失敗しても再起動はせず、観測イベント
+/// （`record_explicit_stop`）を失敗つきで通知して [`SuperviseOutcome::ExplicitStopUnrecorded`] を返す（fail-closed）。
+fn finish_explicit_stop(
+    state: &mut SupervisedState,
+    last: MonitorOutcome,
+    restarts: u32,
+    obs: &dyn MonitorObserver,
+) -> SuperviseOutcome {
+    let started = Instant::now();
+    let written = state.write_explicit_stop().map(drop);
+    obs.observe(&MonitorEvent {
+        operation: MonitorOperation::RecordExplicitStop,
+        error_code: written.as_ref().err().map(TraitError::code),
+        elapsed: started.elapsed(),
+    });
+    match written {
+        Ok(()) => SuperviseOutcome::Finished {
+            last,
+            reason: NoRestartReason::ExplicitStop,
+            restarts,
+        },
+        Err(error) => SuperviseOutcome::ExplicitStopUnrecorded {
+            last,
+            error,
+            restarts,
+        },
     }
 }
 
@@ -886,6 +1007,7 @@ pub fn supervise_with_restart(
                     process: Some(process),
                     late: cleanup_late,
                     restarts,
+                    explicit_stop_pending: false,
                 });
             }
             _ => {
@@ -912,20 +1034,41 @@ pub fn supervise_with_restart(
             restart_count,
             intent,
         ) {
+            // 明示 stop（稼働中の stop）による終了は、再 launch 時の判定のために state.json へ残す（#2440）。
+            if reason == NoRestartReason::ExplicitStop && explicit_requested(stop) {
+                return Ok(finish_explicit_stop(state, last, restarts, obs));
+            }
+            // 再起動せずに終える最終判定: 受付を閉じ、閉じた時点で受理済みの取消（上の intent 読取の後に届いたもの）は
+            // 必ず記録へ渡す。以後の取消は拒否される（受理して記録しない経路を作らない。SUP-9・契約 14・#2440）。
+            if reason != NoRestartReason::ExplicitStop
+                && stop.close_explicit_stop() == crate::run::ExplicitStopState::Requested
+                && !stop.is_stop_requested()
+            {
+                return Ok(finish_explicit_stop(state, last, restarts, obs));
+            }
             return Ok(SuperviseOutcome::Finished {
                 last,
                 reason,
                 restarts,
             });
         }
-        if !restart_config.backoff.is_zero() && !sleep_unless_stopped(restart_config.backoff, stop)
-        {
-            return Ok(SuperviseOutcome::Stopped {
-                last,
-                process: None,
-                late: cleanup_late,
-                restarts,
-            });
+        if !restart_config.backoff.is_zero() {
+            match sleep_unless_stopped(restart_config.backoff, stop) {
+                BackoffEnd::Elapsed => {}
+                BackoffEnd::HardStop => {
+                    return Ok(SuperviseOutcome::Stopped {
+                        last,
+                        process: None,
+                        late: cleanup_late,
+                        restarts,
+                        explicit_stop_pending: false,
+                    });
+                }
+                // バックオフ中の stop: 保留中の再起動を取り消して明示 stop を残す（#2440・SUP-9）。
+                BackoffEnd::ExplicitStop => {
+                    return Ok(finish_explicit_stop(state, last, restarts, obs));
+                }
+            }
         }
         // バックオフ 0 でも relaunch の直前に停止要求を確認する（停止後に再起動しない。SUP-3）。
         if stop.is_stop_requested() {
@@ -934,7 +1077,11 @@ pub fn supervise_with_restart(
                 process: None,
                 late: cleanup_late,
                 restarts,
+                explicit_stop_pending: false,
             });
+        }
+        if explicit_requested(stop) {
+            return Ok(finish_explicit_stop(state, last, restarts, obs));
         }
         let observe = |error_code: Option<ErrorCode>| {
             obs.observe(&MonitorEvent {
@@ -954,11 +1101,24 @@ pub fn supervise_with_restart(
             Ok(p) => p,
             Err(error) => {
                 observe(Some(error.code()));
+                // 再 launch の待機中に受理済みの明示 stop は、再 launch が失敗しても残す。残存プロセスが無いと
+                // 確認できた（実行スレッド完了・未回収ハンドルなし）ときだけ記録する（REPAIR-5・SUP-9・契約 14）。
+                // 最終判定として受付を閉じ、閉じた時点で受理済みの取消を確定させる。以後の取消は拒否されるので、
+                // 「確定後に受理して記録しない」経路は残らない（SUP-9・契約 14・#2440）。
+                let accepted = stop.close_explicit_stop()
+                    == crate::run::ExplicitStopState::Requested
+                    && !stop.is_stop_requested();
+                if accepted && late.is_clean_after_settle(RELAUNCH_REPLY_GRACE) {
+                    return Ok(finish_explicit_stop(state, last, restarts, obs));
+                }
+                // 回収を確認できなかった場合は記録を動かさず、明示 stop は呼び出し側の回収確認後に残す（未記録のまま
+                // 返すと unless-stopped が再起動対象にしてしまう。#2440・SUP-9・契約 14）。
                 return Ok(SuperviseOutcome::RelaunchFailed {
                     exit,
                     error,
                     late,
                     restarts,
+                    explicit_stop_pending: accepted,
                 });
             }
         };
@@ -976,6 +1136,28 @@ pub fn supervise_with_restart(
                 process: None,
                 late: cleanup_late,
                 restarts,
+                explicit_stop_pending: false,
+            });
+        }
+        // 再 launch 中に再起動の取り消し（明示 stop）が届いていたら、同じく Running を記録せず新プロセスを回収し、
+        // 回収を確認できてから明示 stop を残す。回収を確認できなければ記録は動かさず、ハンドルを呼び出し側へ返す（REPAIR-5）。
+        if explicit_requested(stop) {
+            let terminated = terminate_bounded(
+                new_process,
+                restart_config.terminate_timeout,
+                &cleanup_late,
+                spawn_os_thread,
+            );
+            return Ok(match terminated {
+                Ok(()) => finish_explicit_stop(state, last, restarts, obs),
+                // 回収未確認: 呼び出し側が回収を確認できてから明示 stop を残す（#2440・SUP-9・契約 14）。
+                Err(_) => SuperviseOutcome::Stopped {
+                    last,
+                    process: None,
+                    late: cleanup_late,
+                    restarts,
+                    explicit_stop_pending: !stop.is_stop_requested(),
+                },
             });
         }
         let new_pid = new_process.pid();
@@ -1014,7 +1196,7 @@ pub fn supervise_with_restart(
                 let self_pid = NonZeroU32::new(std::process::id());
                 // 監視権の取得は、いま書いた `Running` の記録そのもの（同じ revision）への 1 回の書き込みで行う。
                 let claimed = match self_pid {
-                    Some(self_pid) if stop.is_stop_requested() => {
+                    Some(self_pid) if stop.is_stop_requested() || explicit_requested(stop) => {
                         let supervision = SupervisionState::new(
                             Some(self_pid),
                             state.record().health(),
@@ -1059,6 +1241,8 @@ pub fn supervise_with_restart(
                                     process: None,
                                     late: cleanup_late,
                                     restarts: restarts.saturating_add(1),
+                                    explicit_stop_pending: explicit_requested(stop)
+                                        && !stop.is_stop_requested(),
                                 }
                             }
                             Err(error) => {
@@ -1080,12 +1264,17 @@ pub fn supervise_with_restart(
                             SupervisionState::new(None, rec.health(), restart_count),
                         ))
                     });
+                    // 取り消しが明示 stop だけなら（停止要求なし）、元の終了記録へ戻した上で明示 stop を残す（#2440）。
+                    if reverted.is_ok() && !stop.is_stop_requested() && explicit_requested(stop) {
+                        return Ok(finish_explicit_stop(state, last, restarts, obs));
+                    }
                     return Ok(match reverted {
                         Ok(_) => SuperviseOutcome::Stopped {
                             last,
                             process: None,
                             late: cleanup_late,
                             restarts,
+                            explicit_stop_pending: false,
                         },
                         Err(error) => {
                             observe(Some(error.code()));
@@ -1696,6 +1885,10 @@ mod tests {
         /// `restart_count` を進める書き込み（再起動の `Running` 記録）の成功直前に停止要求を立てる。
         /// `true` なら、その書き込みの直後に別の supervisor（pid 999）が監視権を取った状態にする。
         stop_on_restart_write: Mutex<Option<(StopToken, bool)>>,
+        /// 同じ時機（`Running` 記録の成功直前）に、明示 stop の意図を立てる（#2440）。
+        explicit_on_restart_write: Mutex<Option<StopToken>>,
+        /// 明示 stop の記録（`with_explicit_stop` 付きの update）をこのエラーで失敗させる（#2440）。
+        fail_explicit_write: Mutex<Option<ErrorCode>>,
     }
 
     impl StateStore for Store {
@@ -1706,13 +1899,20 @@ mod tests {
             let mut g = self.rec.lock().unwrap();
             let mut c = self.conflicts.lock().unwrap();
             let bump = |g: &StateRecord, sup: SupervisionState, st: ContainerStatus| {
+                // 契約 14: Stopped では指定があれば置き換え・なければ引き継ぎ、それ以外では落とす。
+                let explicit = if st.state() == ContainerState::Stopped {
+                    req.explicit_stop().unwrap_or(g.explicit_stop())
+                } else {
+                    ExplicitStop::NotRecorded
+                };
                 let next = StateRecord::new(
                     st,
                     g.bundle().to_path_buf(),
                     StateRevision::from_raw(g.revision().value() + 1),
                 )
                 .unwrap()
-                .with_supervision(sup);
+                .with_supervision(sup)
+                .with_explicit_stop(explicit);
                 // 契約 12: 指定があれば置き換え、なければ既存の値を引き継ぐ。
                 match req.launch_isolation().or(g.launch_isolation()) {
                     Some(l) => next.with_launch_isolation(l.clone()),
@@ -1731,17 +1931,26 @@ mod tests {
                 *g = bump(&g, s, g.status().clone());
                 return Err(TraitError::new(ErrorCode::FailedPrecondition, "stale"));
             }
+            if req.explicit_stop().is_some()
+                && let Some(code) = *self.fail_explicit_write.lock().unwrap()
+            {
+                return Err(TraitError::new(code, "injected explicit stop failure"));
+            }
             if g.revision() != req.expected_revision() {
                 return Err(TraitError::new(ErrorCode::FailedPrecondition, "stale"));
             }
             let s = req.supervision().unwrap_or_else(|| g.supervision());
-            let hook = if s.restart_count() > g.restart_count() {
+            let advances = s.restart_count() > g.restart_count();
+            let hook = if advances {
                 self.stop_on_restart_write.lock().unwrap().clone()
             } else {
                 None
             };
             let next = bump(&g, s, req.status().clone());
             *g = next.clone();
+            if advances && let Some(stop) = self.explicit_on_restart_write.lock().unwrap().clone() {
+                stop.mark_explicit_stop();
+            }
             if let Some((stop, foreign_claim)) = hook {
                 stop.request_stop();
                 if foreign_claim {
@@ -1779,6 +1988,8 @@ mod tests {
             rec: Mutex::new(rec),
             conflicts: Mutex::new(0),
             stop_on_restart_write: Mutex::new(None),
+            explicit_on_restart_write: Mutex::new(None),
+            fail_explicit_write: Mutex::new(None),
         })
     }
 
@@ -2073,6 +2284,467 @@ mod tests {
         assert_eq!(g.status().exit_code(), Some(143));
     }
 
+    /// SUP-9・契約 14・#2440: 再起動なしで終わる最終判定は受付を閉じる。以後の取消は意図を立てられず（`Closed`）、
+    /// 受理して記録しない経路が残らない。
+    #[test]
+    fn sup9_policy_no_finish_closes_explicit_stop_acceptance() {
+        let st = store(0, 42);
+        let q = Arc::new(Queue::new(&[(43, FAIL)]));
+        let obs = Events::default();
+        let stop = StopToken::new();
+        let out = run(&st, "no", FAIL, &q, &stop, &obs);
+        let SuperviseOutcome::Finished { reason, .. } = out else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(reason, NoRestartReason::PolicyNo);
+        assert_eq!(
+            stop.mark_explicit_stop(),
+            crate::run::ExplicitStopRecord::Closed
+        );
+        assert_eq!(
+            stop.explicit_stop_state(),
+            crate::run::ExplicitStopState::NotRequested
+        );
+        assert_eq!(obs.count(MonitorOperation::RecordExplicitStop), 0);
+    }
+
+    /// SUP-9・SUP-3・#2440: 稼働中の stop 相当（意図を立ててから終了）は、再起動せず「明示 stop 済み」を
+    /// state.json の `Stopped` の記録へ残す。
+    #[test]
+    fn sup9_running_stop_persists_explicit_stop() {
+        let st = store(0, 42);
+        let q = Arc::new(Queue::new(&[(43, FAIL)]));
+        let obs = Events::default();
+        let stop = StopToken::new();
+        stop.mark_explicit_stop();
+        let out = run(&st, "always", ProcessExit::Signaled(15), &q, &stop, &obs);
+        let SuperviseOutcome::Finished { reason, .. } = out else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(reason, NoRestartReason::ExplicitStop);
+        assert_eq!(obs.count(MonitorOperation::RecordExplicitStop), 1);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.status().state(), ContainerState::Stopped);
+        assert_eq!(g.status().exit_code(), Some(143));
+        assert_eq!(g.explicit_stop(), ExplicitStop::Recorded);
+        assert_eq!(g.restart_count(), 0);
+    }
+
+    /// SUP-9・#2440: 明示 stop でない終了（クラッシュ・ポリシー `no`）では「明示 stop 済み」を残さない。
+    #[test]
+    fn sup9_non_explicit_exit_does_not_persist_explicit_stop() {
+        for (policy, exit) in [("no", FAIL), ("on-failure", ProcessExit::Exited(0))] {
+            let st = store(0, 42);
+            let q = Arc::new(Queue::new(&[]));
+            let obs = Events::default();
+            let out = run(&st, policy, exit, &q, &StopToken::new(), &obs);
+            assert!(matches!(out, SuperviseOutcome::Finished { .. }), "{policy}");
+            assert_eq!(obs.count(MonitorOperation::RecordExplicitStop), 0);
+            assert_eq!(
+                st.rec.lock().unwrap().explicit_stop(),
+                ExplicitStop::NotRecorded,
+                "{policy}"
+            );
+        }
+    }
+
+    /// SUP-9・SUP-3・#2440: バックオフ中の stop（取り消し）は、`always`・`on-failure`・`unless-stopped` のどのポリシーでも
+    /// 保留中の再起動を取り消し、以後 restart しない。relaunch は 0 回・`restart_count` は不変で、記録は `Stopped` に
+    /// 「明示 stop 済み」が付く。
+    fn backoff_cancel_case(policy: &str) {
+        let st = store(0, 42);
+        let q = Arc::new(Queue::new(&[(43, FAIL)]));
+        let stop = StopToken::new();
+        let config = RestartConfig::new(policy.parse().unwrap())
+            .with_backoff(Duration::from_secs(30))
+            .unwrap();
+        let t = stop.clone();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            t.mark_explicit_stop();
+        });
+        let obs = Events::default();
+        let started = Instant::now();
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &rl(&q),
+            &MonitorConfig::default(),
+            &config,
+            &stop,
+            &obs,
+        )
+        .unwrap();
+        h.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "{policy}");
+        let SuperviseOutcome::Finished {
+            reason, restarts, ..
+        } = out
+        else {
+            panic!("{policy}: unexpected outcome: {out:?}")
+        };
+        assert_eq!(reason, NoRestartReason::ExplicitStop, "{policy}");
+        assert_eq!(restarts, 0, "{policy}");
+        assert_eq!(q.calls.load(Ordering::SeqCst), 0, "{policy}");
+        assert_eq!(obs.count(MonitorOperation::Restart), 0, "{policy}");
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.status().state(), ContainerState::Stopped, "{policy}");
+        assert_eq!(g.status().exit_code(), Some(1), "{policy}");
+        assert_eq!(g.restart_count(), 0, "{policy}");
+        assert_eq!(g.explicit_stop(), ExplicitStop::Recorded, "{policy}");
+    }
+
+    #[test]
+    fn sup9_sup3_backoff_explicit_stop_cancels_pending_restart_always() {
+        backoff_cancel_case("always");
+    }
+
+    #[test]
+    fn sup9_sup3_backoff_explicit_stop_cancels_pending_restart_on_failure() {
+        backoff_cancel_case("on-failure");
+    }
+
+    #[test]
+    fn sup9_sup3_backoff_explicit_stop_cancels_pending_restart_unless_stopped() {
+        backoff_cancel_case("unless-stopped");
+    }
+
+    /// 再 launch の中で明示 stop の意図を立ててから新プロセスを返す再 launch。
+    struct MarksExplicitDuringRelaunch {
+        stop: StopToken,
+        terminated: Arc<AtomicU32>,
+    }
+
+    impl Relauncher for MarksExplicitDuringRelaunch {
+        fn relaunch(&self, _: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            self.stop.mark_explicit_stop();
+            Ok(Box::new(Fp {
+                pid: 43,
+                exit: FAIL,
+                terminated: self.terminated.clone(),
+            }))
+        }
+    }
+
+    /// SUP-9・SUP-3・#2440: 再 launch 中に取り消しが届いたら、`Running` を記録せず新プロセスを terminate し、
+    /// 回収後に「明示 stop 済み」を残す。`restart_count` は不変。
+    #[test]
+    fn sup9_explicit_stop_during_relaunch_terminates_new_process() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        let terminated = Arc::new(AtomicU32::new(0));
+        let q: Arc<dyn Relauncher> = Arc::new(MarksExplicitDuringRelaunch {
+            stop: stop.clone(),
+            terminated: terminated.clone(),
+        });
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &q,
+            &MonitorConfig::default(),
+            &cfg("unless-stopped"),
+            &stop,
+            &Events::default(),
+        )
+        .unwrap();
+        let SuperviseOutcome::Finished {
+            reason, restarts, ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(reason, NoRestartReason::ExplicitStop);
+        assert_eq!(restarts, 0);
+        assert_eq!(terminated.load(Ordering::SeqCst), 1);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.status().state(), ContainerState::Stopped);
+        assert_eq!(g.restart_count(), 0);
+        assert_eq!(g.explicit_stop(), ExplicitStop::Recorded);
+    }
+
+    /// 再 launch の中で明示 stop の意図を立て、terminate が必ず失敗する新プロセスを返す再 launch。
+    struct MarksExplicitThenStuck {
+        stop: StopToken,
+    }
+
+    impl Relauncher for MarksExplicitThenStuck {
+        fn relaunch(&self, _: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            self.stop.mark_explicit_stop();
+            Ok(Box::new(StuckProc(43)))
+        }
+    }
+
+    /// SUP-9・SUP-3・契約 14・#2440: 再 launch 中の取り消し受理後に最初の terminate が失敗した場合は、記録を動かさず
+    /// ハンドルを `late` で返し、明示 stop の記録は呼び出し側の回収確認後に回す（`explicit_stop_pending`）。
+    #[test]
+    fn sup9_explicit_stop_during_relaunch_terminate_failure_is_pending() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        let q: Arc<dyn Relauncher> = Arc::new(MarksExplicitThenStuck { stop: stop.clone() });
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &q,
+            &MonitorConfig::default(),
+            &cfg("unless-stopped"),
+            &stop,
+            &Events::default(),
+        )
+        .unwrap();
+        let SuperviseOutcome::Stopped {
+            late,
+            restarts,
+            explicit_stop_pending,
+            ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert!(explicit_stop_pending);
+        assert_eq!(restarts, 0);
+        assert!(late.wait_settled(Duration::from_secs(5)));
+        assert_eq!(late.take().len(), 1);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.status().state(), ContainerState::Stopped);
+        assert_eq!(g.explicit_stop(), ExplicitStop::NotRecorded);
+    }
+
+    /// SUP-9・SUP-3・契約 14・#2440: `Running` の記録直後に取り消しが届き terminate が失敗した場合も、記録は
+    /// `Running(新 pid)` のまま監視権だけ返し、明示 stop の記録は後始末側へ回す（`explicit_stop_pending`）。
+    /// 停止要求（hard stop）が同時にあれば明示 stop は残さない。
+    #[test]
+    fn sup9_explicit_stop_after_running_record_terminate_failure_is_pending() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        *st.explicit_on_restart_write.lock().unwrap() = Some(stop.clone());
+        let out = run_once(&st, Box::new(StuckProc(43)), &stop);
+        let SuperviseOutcome::Stopped {
+            restarts,
+            explicit_stop_pending,
+            ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert!(explicit_stop_pending);
+        assert_eq!(restarts, 1);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.status().state(), ContainerState::Running);
+        assert_eq!(g.explicit_stop(), ExplicitStop::NotRecorded);
+        drop(g);
+
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        *st.explicit_on_restart_write.lock().unwrap() = Some(stop.clone());
+        *st.stop_on_restart_write.lock().unwrap() = Some((stop.clone(), false));
+        let out = run_once(&st, Box::new(StuckProc(43)), &stop);
+        let SuperviseOutcome::Stopped {
+            explicit_stop_pending,
+            ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert!(!explicit_stop_pending);
+    }
+
+    /// 明示 stop の意図を立ててから `Err` を返す再 launch（残存プロセスなし）。
+    struct MarksExplicitThenFails {
+        stop: StopToken,
+    }
+
+    impl Relauncher for MarksExplicitThenFails {
+        fn relaunch(&self, _: Duration) -> Result<Box<dyn LaunchedProcess>, TraitError> {
+            self.stop.mark_explicit_stop();
+            Err(TraitError::new(
+                ErrorCode::Internal,
+                "injected relaunch failure",
+            ))
+        }
+    }
+
+    /// SUP-9・契約 14・#2440: 結果通知と実行スレッド終了の競合で記録可否が変わらない（反復して競合窓を踏ませる）。
+    #[test]
+    fn sup9_explicit_stop_persist_is_not_racy_with_worker_completion() {
+        for _ in 0..200 {
+            sup9_explicit_stop_persisted_when_relaunch_fails();
+        }
+    }
+
+    /// SUP-9・SUP-3・#2440: 再 launch 中に取り消しが受理された後で再 launch が失敗しても、残存プロセスが無ければ
+    /// 明示 stop を残す（`unless-stopped` の再開で再起動されない）。
+    #[test]
+    fn sup9_explicit_stop_persisted_when_relaunch_fails() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        let q: Arc<dyn Relauncher> = Arc::new(MarksExplicitThenFails { stop: stop.clone() });
+        let mut s = attach(&st);
+        let out = supervise_with_restart(
+            &mut s,
+            first(FAIL),
+            &q,
+            &MonitorConfig::default(),
+            &cfg("unless-stopped"),
+            &stop,
+            &Events::default(),
+        )
+        .unwrap();
+        let SuperviseOutcome::Finished { reason, .. } = out else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(reason, NoRestartReason::ExplicitStop);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.status().state(), ContainerState::Stopped);
+        assert_eq!(g.explicit_stop(), ExplicitStop::Recorded);
+    }
+
+    /// SUP-9・SUP-3・#2440: `Running` の記録の直後に取り消しが届いていた場合は、監視権を取って新プロセスを terminate し、
+    /// 元の終了記録へ戻した上で「明示 stop 済み」を残す（再起動は数えない）。
+    #[test]
+    fn sup9_explicit_stop_after_running_record_reverts_and_persists() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        *st.explicit_on_restart_write.lock().unwrap() = Some(stop.clone());
+        let q = Arc::new(Queue::new(&[(43, FAIL), (44, FAIL)]));
+        let obs = Events::default();
+        let out = run(&st, "always", FAIL, &q, &stop, &obs);
+        let SuperviseOutcome::Finished {
+            reason, restarts, ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert_eq!(reason, NoRestartReason::ExplicitStop);
+        assert_eq!(restarts, 0);
+        assert_eq!(q.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(q.terminated.load(Ordering::SeqCst), 1);
+        assert_eq!(obs.count(MonitorOperation::Restart), 0);
+        let g = st.rec.lock().unwrap();
+        assert_eq!(g.status().state(), ContainerState::Stopped);
+        assert_eq!(g.status().exit_code(), Some(1));
+        assert_eq!(g.restart_count(), 0);
+        assert_eq!(g.supervision().supervisor_pid(), None);
+        assert_eq!(g.explicit_stop(), ExplicitStop::Recorded);
+    }
+
+    /// SUP-9・#2440: 記録に失敗しても再起動はしない（fail-closed）。`ExplicitStopUnrecorded` で戻り、relaunch は 0 回、
+    /// 記録は `Stopped` のまま「明示 stop 済み」は付かない。ストアの内部エラーと、競合が続く場合の両方。
+    #[test]
+    fn sup9_explicit_stop_persist_failure_is_fail_closed() {
+        for code in [ErrorCode::Internal, ErrorCode::FailedPrecondition] {
+            let st = store(0, 42);
+            *st.fail_explicit_write.lock().unwrap() = Some(code);
+            let q = Arc::new(Queue::new(&[(43, FAIL)]));
+            let obs = Events::default();
+            let stop = StopToken::new();
+            stop.mark_explicit_stop();
+            let out = run(&st, "always", FAIL, &q, &stop, &obs);
+            let SuperviseOutcome::ExplicitStopUnrecorded {
+                error, restarts, ..
+            } = out
+            else {
+                panic!("{code:?}: unexpected outcome: {out:?}")
+            };
+            assert_eq!(error.code(), code);
+            assert_eq!(restarts, 0);
+            assert_eq!(q.calls.load(Ordering::SeqCst), 0, "{code:?}");
+            assert_eq!(
+                obs.0.lock().unwrap().last().copied(),
+                Some((MonitorOperation::RecordExplicitStop, Some(code)))
+            );
+            let g = st.rec.lock().unwrap();
+            assert_eq!(g.status().state(), ContainerState::Stopped);
+            assert_eq!(g.explicit_stop(), ExplicitStop::NotRecorded);
+        }
+    }
+
+    /// SUP-3・SUP-8・SUP-9・#2440: 再 launch・re-adopt の判定。`unless-stopped` は明示 stop 済みなら起こさず、
+    /// `always` は起こす（Docker 互換）。`on-failure`・`no` は起こさない。
+    #[test]
+    fn sup3_sup8_evaluate_resume_table() {
+        let restart = RestartDecision::Restart;
+        let no = |r| RestartDecision::DoNotRestart { reason: r };
+        let on_failure = RestartPolicy::OnFailure { max_retries: None };
+        let cases = [
+            (
+                RestartPolicy::No,
+                ExplicitStop::NotRecorded,
+                no(NoRestartReason::PolicyNo),
+            ),
+            (
+                RestartPolicy::No,
+                ExplicitStop::Recorded,
+                no(NoRestartReason::PolicyNo),
+            ),
+            (
+                on_failure,
+                ExplicitStop::NotRecorded,
+                no(NoRestartReason::NotResumedOnFailure),
+            ),
+            (
+                on_failure,
+                ExplicitStop::Recorded,
+                no(NoRestartReason::NotResumedOnFailure),
+            ),
+            (RestartPolicy::Always, ExplicitStop::NotRecorded, restart),
+            (RestartPolicy::Always, ExplicitStop::Recorded, restart),
+            (
+                RestartPolicy::UnlessStopped,
+                ExplicitStop::NotRecorded,
+                restart,
+            ),
+            (
+                RestartPolicy::UnlessStopped,
+                ExplicitStop::Recorded,
+                no(NoRestartReason::ExplicitStop),
+            ),
+        ];
+        for (policy, explicit, want) in cases {
+            assert_eq!(
+                evaluate_resume(policy, explicit),
+                want,
+                "{policy:?} {explicit:?}"
+            );
+        }
+        assert_eq!(
+            NoRestartReason::NotResumedOnFailure.as_str(),
+            "not_resumed_on_failure"
+        );
+    }
+
+    /// SUP-3・SUP-8・SUP-9・#2440: 明示 stop で終わった記録（再読込したレコード）を `evaluate_resume` に渡すと、
+    /// `unless-stopped` は起こさず `always` は起こす。明示 stop でないクラッシュの記録は両方起こす。
+    #[test]
+    fn sup3_sup8_resume_decision_follows_the_persisted_record() {
+        let st = store(0, 42);
+        let stop = StopToken::new();
+        stop.mark_explicit_stop();
+        let q = Arc::new(Queue::new(&[]));
+        let _ = run(&st, "unless-stopped", FAIL, &q, &stop, &Events::default());
+        let rec = st.rec.lock().unwrap().clone();
+        assert_eq!(
+            evaluate_resume(RestartPolicy::UnlessStopped, rec.explicit_stop()),
+            RestartDecision::DoNotRestart {
+                reason: NoRestartReason::ExplicitStop
+            }
+        );
+        assert_eq!(
+            evaluate_resume(RestartPolicy::Always, rec.explicit_stop()),
+            RestartDecision::Restart
+        );
+
+        let st = store(0, 42);
+        let _ = run(&st, "no", FAIL, &q, &StopToken::new(), &Events::default());
+        let rec = st.rec.lock().unwrap().clone();
+        assert_eq!(
+            evaluate_resume(RestartPolicy::UnlessStopped, rec.explicit_stop()),
+            RestartDecision::Restart
+        );
+    }
+
     /// SUP-3・TASK-159.3: `on-failure:2` は異常終了 3 回で再起動 2 回、restart_count == 2、RetriesExhausted。
     #[test]
     fn sup3_task159_3_on_failure_limit_stops_at_n() {
@@ -2138,6 +2810,28 @@ mod tests {
         assert_eq!(reason, NoRestartReason::PolicyNo);
         assert_eq!(st.rec.lock().unwrap().restart_count(), 0);
         assert_eq!(q.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// SUP-9・契約 14・#2440: 再 launch が失敗して終わる最終判定でも受付を閉じる。確定後の取り消しは `Closed` で断られ、
+    /// 「受理したのに記録されない」経路が残らない。
+    #[test]
+    fn sup9_relaunch_failure_closes_explicit_stop_admission() {
+        let st = store(1, 42);
+        let q = Arc::new(Queue::new(&[]));
+        let stop = StopToken::new();
+        let out = run(&st, "unless-stopped", FAIL, &q, &stop, &Events::default());
+        let SuperviseOutcome::RelaunchFailed {
+            explicit_stop_pending,
+            ..
+        } = out
+        else {
+            panic!("unexpected outcome: {out:?}")
+        };
+        assert!(!explicit_stop_pending);
+        assert_eq!(
+            stop.mark_explicit_stop(),
+            crate::run::ExplicitStopRecord::Closed
+        );
     }
 
     /// SUP-3・TASK-159.3: 再 launch 失敗は restart_count を進めず、状態は Stopped のまま。

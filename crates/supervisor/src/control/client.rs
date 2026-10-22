@@ -1,4 +1,4 @@
-//! 制御チャネルのクライアント入口（SUP-1・SUP-9・SEC-1・REPAIR-5・#2058・#2162）。
+//! 制御チャネルのクライアント入口（SUP-1・SUP-9・SEC-1・REPAIR-5・#2058・#2162・#2440）。
 //!
 //! CLI の `stop`（と `kill`）が、起動ハンドルを持つ supervisor へシグナル送信を依頼するための公開 API。core の
 //! `ProcessSignaler`（`oci_runtime::kill` の送信境界）を実装する。CLI の `stop_delete::production_signaler` が
@@ -6,6 +6,9 @@
 //! `for_stop` は StopRequest（kind 4）を送り、supervisor に明示 stop の意図を記録させる（SUP-9）。意図を記録できない
 //! supervisor（書き先なし・古い版）は、シグナルを送らずに構造化エラーを返す（fail-closed）。
 //! `state.json` の pid へ生の `kill(2)` は送らない（pid 再利用で無関係なプロセスを止めない。SEC-1・CORE-1）。
+//!
+//! バックオフ中・再 launch 中（記録は `Stopped` で pid が無い）の stop は [`ControlRestartCanceller`] が
+//! CancelRestartRequest（kind 5）を送り、保留中の再起動を取り消す（SUP-9・SUP-3・#2440）。シグナルは送らない。
 //!
 //! # 手順（Linux）
 //!
@@ -31,7 +34,51 @@ use std::time::Instant;
 use fandhe_container_core::oci_runtime::ProcessSignaler;
 use fandhe_container_core::traits::{ContainerId, Signal, TraitError};
 
+use super::PendingRestartCanceller;
 use super::protocol::RequestKind;
+
+/// [`PendingRestartCanceller::cancel`] の結果（SUP-9・SUP-3・#2440）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CancelOutcome {
+    /// 保留中の再起動を取り消した（supervisor はもう再起動しない）。
+    Cancelled,
+    /// 取り消す時点で新しいプロセスが動いていた（通常の stop をやり直す対象）。
+    ContainerRunning,
+    /// 届く supervisor が無い（ソケットが無い・接続先が無い・取り消しを知らない古い版・ハンドル未保持）。
+    NoSupervisor,
+}
+
+/// supervisor の制御チャネルへ「保留中の再起動の取り消し」を依頼する [`PendingRestartCanceller`]。
+#[derive(Debug, Clone)]
+pub struct ControlRestartCanceller {
+    state_root: PathBuf,
+}
+
+impl ControlRestartCanceller {
+    /// 状態ルートから作る。
+    pub fn new(state_root: PathBuf) -> Self {
+        Self { state_root }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PendingRestartCanceller for ControlRestartCanceller {
+    fn cancel(&self, id: &ContainerId, deadline: Instant) -> Result<CancelOutcome, TraitError> {
+        linux::cancel_restart(&self.state_root, id, deadline)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl PendingRestartCanceller for ControlRestartCanceller {
+    fn cancel(&self, id: &ContainerId, deadline: Instant) -> Result<CancelOutcome, TraitError> {
+        let _ = (&self.state_root, id, deadline);
+        Err(TraitError::new(
+            fandhe_container_core::traits::ErrorCode::Unimplemented,
+            "the supervisor control channel requires Linux",
+        ))
+    }
+}
 
 /// supervisor の制御チャネルへシグナル送信を依頼する `ProcessSignaler`。
 #[derive(Debug, Clone)]
@@ -100,14 +147,26 @@ mod linux {
 
     use fandhe_container_core::traits::{ContainerId, ErrorCode, Signal, TraitError};
 
+    use super::CancelOutcome;
     use crate::control::listener::{
         CONTROL_SOCKET_NAME, effective_uid, open_state_dir, path_via_fd,
     };
     use crate::control::protocol::{
-        ControlReason, FrameHeader, HEADER_LEN, MAX_SIGNAL_BUDGET, RESPONSE_PAYLOAD_LEN,
-        RequestKind, ResponseFrame, SignalDeadline, SignalRequestFrame,
+        CancelRestartRequestFrame, ControlReason, FrameHeader, HEADER_LEN, MAX_SIGNAL_BUDGET,
+        RESPONSE_PAYLOAD_LEN, RequestKind, ResponseFrame, SignalDeadline, SignalRequestFrame,
     };
     use crate::control::server::{peer_allowed, read_exact_until};
+
+    /// 1 回の交換で送る要求。
+    #[derive(Clone, Copy)]
+    enum Request {
+        Signal {
+            kind: RequestKind,
+            pid: NonZeroU32,
+            signal: Signal,
+        },
+        CancelRestart,
+    }
 
     /// connect の再試行の間隔と、`ENOENT`・`ECONNREFUSED` を再試行する窓。
     const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(20);
@@ -148,7 +207,45 @@ mod linux {
             // 期限が迫っているときは接続せず、送らない（期限後にシグナルが届かない。REPAIR-5）。
             return Err(timeout());
         }
-        exchange(state_root, kind, id, pid, signal, deadline)
+        let reason = exchange(
+            state_root,
+            Request::Signal { kind, pid, signal },
+            id,
+            deadline,
+        )?;
+        match reason.to_error() {
+            None => Ok(()),
+            Some(e) => Err(e),
+        }
+    }
+
+    /// 保留中の再起動の取り消しを依頼する（SUP-9・SUP-3・#2440）。
+    ///
+    /// 接続できない（`Unavailable`）・取り消しを知らない古い supervisor（`Malformed` 等で拒否）・ハンドル未保持は
+    /// `NoSupervisor`（呼び出し側が従来の stop の扱いへ倒す）。それ以外の拒否は固定文言の構造化エラー。
+    pub(super) fn cancel_restart(
+        state_root: &Path,
+        id: &ContainerId,
+        deadline: Instant,
+    ) -> Result<CancelOutcome, TraitError> {
+        let usable = deadline.saturating_duration_since(Instant::now());
+        if usable <= DEADLINE_MARGIN {
+            return Err(timeout());
+        }
+        let reason = match exchange(state_root, Request::CancelRestart, id, deadline) {
+            Ok(reason) => reason,
+            Err(e) if e.code() == ErrorCode::Unavailable => return Ok(CancelOutcome::NoSupervisor),
+            Err(e) => return Err(e),
+        };
+        match reason {
+            ControlReason::Ok => Ok(CancelOutcome::Cancelled),
+            ControlReason::ContainerRunning => Ok(CancelOutcome::ContainerRunning),
+            ControlReason::NoHandle
+            | ControlReason::Malformed
+            | ControlReason::TooLarge
+            | ControlReason::UnsupportedVersion => Ok(CancelOutcome::NoSupervisor),
+            other => Err(other.to_error().unwrap_or_else(unavailable)),
+        }
     }
 
     fn connect_until(path: &Path, deadline: Instant) -> Result<UnixStream, TraitError> {
@@ -189,14 +286,13 @@ mod linux {
         }
     }
 
+    /// 1 要求を送って理由コードを受ける。接続・転送の失敗は `Err`（`Unavailable` は「届かない」を表す）。
     fn exchange(
         state_root: &Path,
-        kind: RequestKind,
+        request: Request,
         id: &ContainerId,
-        pid: NonZeroU32,
-        signal: Signal,
         deadline: Instant,
-    ) -> Result<(), TraitError> {
+    ) -> Result<ControlReason, TraitError> {
         let euid = effective_uid()?;
         let dir = open_state_dir(state_root, id, euid)?;
         let path = path_via_fd(&dir, CONTROL_SOCKET_NAME);
@@ -240,15 +336,24 @@ mod linux {
             .and_then(|n| now_ns.checked_add(n))
             .ok_or_else(unavailable)?;
         let deadline_frame = SignalDeadline::from_nanos(abs_ns).map_err(|_| unavailable())?;
-        let frame = SignalRequestFrame {
-            kind,
-            pid,
-            signal,
-            deadline: deadline_frame,
+        let sent = match request {
+            Request::Signal { kind, pid, signal } => stream.write_all(
+                &SignalRequestFrame {
+                    kind,
+                    pid,
+                    signal,
+                    deadline: deadline_frame,
+                }
+                .encode(),
+            ),
+            Request::CancelRestart => stream.write_all(
+                &CancelRestartRequestFrame {
+                    deadline: deadline_frame,
+                }
+                .encode(),
+            ),
         };
-        stream
-            .write_all(&frame.encode())
-            .map_err(|e| io_error(&e))?;
+        sent.map_err(|e| io_error(&e))?;
 
         read_exact_until(&mut stream, &mut head, deadline).map_err(|e| io_error(&e))?;
         FrameHeader::decode(&head)
@@ -256,9 +361,6 @@ mod linux {
             .map_err(|r| r.to_error().unwrap_or_else(unavailable))?;
         let mut payload = [0u8; RESPONSE_PAYLOAD_LEN];
         read_exact_until(&mut stream, &mut payload, deadline).map_err(|e| io_error(&e))?;
-        match ResponseFrame::decode_payload(&payload).reason.to_error() {
-            None => Ok(()),
-            Some(e) => Err(e),
-        }
+        Ok(ResponseFrame::decode_payload(&payload).reason)
     }
 }

@@ -1,4 +1,4 @@
-//! `stop` の本番 signaler（supervisor の制御チャネル経由）の結合試験（CLI-1・SEC-1・ERR-2・SUP-1・SUP-9・#2059・#2162）。
+//! `stop` の本番 signaler（supervisor の制御チャネル経由）の結合試験（CLI-1・SEC-1・ERR-2・SUP-1・SUP-9・SUP-3・#2059・#2162・#2440）。
 //!
 //! 本番入口 `commands::run_to` から、フェイクの supervisor（`ControlServer` と模擬の起動ハンドル）の UDS までを
 //! 実際に通し、終了コードと stderr の JSON を具体値で照合する。root・実コンテナは不要で既定のテスト集合で動く。
@@ -24,7 +24,10 @@ use fandhe_container_core::oci_runtime::{
     start,
 };
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
-use fandhe_container_core::traits::{ContainerId, Signal, StartRequest, TraitError};
+use fandhe_container_core::traits::{
+    ContainerId, ContainerStatus, GetStateRequest, Signal, StartRequest, StateStore, TraitError,
+    UpdateStateRequest,
+};
 use fandhe_container_supervisor::control::listener::{ControlListener, effective_uid};
 use fandhe_container_supervisor::control::observe::ControlObserver;
 use fandhe_container_supervisor::control::server::{ControlServer, ServeConfig};
@@ -50,6 +53,21 @@ impl LaunchedProcess for Fake {
     }
     fn signal(&self, signal: Signal, _d: Instant) -> Result<(), TraitError> {
         self.signals.lock().unwrap().push(signal.as_u8());
+        Ok(())
+    }
+}
+
+/// 最初の `wait` で終了を返す模擬の起動ハンドル（スロットを `Exited` にする。バックオフ中の supervisor に相当）。
+struct ExitedFake(u32);
+
+impl LaunchedProcess for ExitedFake {
+    fn pid(&self) -> NonZeroU32 {
+        NonZeroU32::new(self.0).unwrap()
+    }
+    fn wait(&self, _timeout: Duration) -> Result<Option<ProcessExit>, TraitError> {
+        Ok(Some(ProcessExit::Exited(1)))
+    }
+    fn terminate(&self, _t: Duration) -> Result<(), TraitError> {
         Ok(())
     }
 }
@@ -169,6 +187,40 @@ impl FakeSupervisor {
         }
     }
 
+    /// 起動ハンドルが既に終了している supervisor（バックオフ中・再 launch 中。スロットは `Exited`）。
+    fn start_exited(root: &Path, id: &ContainerId, pid: u32) -> Self {
+        let listener = ControlListener::bind(root, id).unwrap();
+        let intent = StopToken::new();
+        let slot = SignalSlot::with_stop_intent(intent.clone());
+        let stop = Arc::new(AtomicBool::new(false));
+        let p = ControlledProcess::new(Box::new(ExitedFake(pid)), slot.clone());
+        let monitor = Some({
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let _ = p.wait(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        });
+        let server = ControlServer::spawn(
+            listener.try_clone_listener().unwrap(),
+            slot,
+            effective_uid().unwrap(),
+            ServeConfig::default(),
+            Arc::new(ControlObserver::new(None, None)),
+        )
+        .unwrap();
+        Self {
+            signals: Arc::new(Mutex::new(Vec::new())),
+            intent,
+            stop,
+            monitor,
+            server: Some(server),
+            listener: Some(listener),
+        }
+    }
+
     fn recorded(&self) -> Vec<u8> {
         self.signals.lock().unwrap().clone()
     }
@@ -235,6 +287,22 @@ fn running_container(tag: &str, pid: u32) -> Env {
         _tmp: tmp,
         _started: started,
     }
+}
+
+fn open_store(env: &Env) -> FileStateStore {
+    FileStateStore::open(StateRoot::from_override(env.root.clone()).unwrap()).unwrap()
+}
+
+/// 記録を `Stopped`（終了コード 1）にする（終了を検知した後のバックオフ中の記録に相当）。
+fn mark_stopped(env: &Env) {
+    let store = open_store(env);
+    let rec = store.get(&GetStateRequest::new(env.id.clone())).unwrap();
+    store
+        .update(&UpdateStateRequest::new(
+            ContainerStatus::stopped(env.id.clone(), Some(1)),
+            rec.revision(),
+        ))
+        .unwrap();
 }
 
 fn stop(env: &Env) -> (u8, String, String) {
@@ -344,5 +412,66 @@ fn sup1_err2_stop_without_handle_is_failed_precondition() {
             "FAILED_PRECONDITION",
             "the supervisor holds no launched process"
         )
+    );
+}
+/// SUP-9・SUP-3・CLI-1・#2440: 記録が `Stopped`（バックオフ中）で supervisor のスロットが `Exited` なら、`stop` は
+/// 保留中の再起動の取り消しを依頼して成功する（0・出力なし）。supervisor には明示 stop の意図が立ち、シグナルは送られない。
+#[test]
+fn sup9_sup3_stop_in_backoff_cancels_pending_restart() {
+    let env = running_container("stopbackoff", 4242);
+    mark_stopped(&env);
+    let sup = FakeSupervisor::start_exited(&env.root, &env.id, 4242);
+    let (code, out, err) = stop(&env);
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(
+        sup.intent.explicit_stop_state(),
+        ExplicitStopState::Requested
+    );
+    assert!(!sup.intent.is_stop_requested());
+    assert!(sup.recorded().is_empty());
+}
+
+/// SUP-9・ERR-2・#2440: 記録が `Stopped` で届く supervisor が無ければ、従来どおり core の `kill` が
+/// FAILED_PRECONDITION（5）`container is not running` で失敗する（取り消しの導入で挙動を変えない）。
+#[test]
+fn sup9_err2_stop_of_stopped_container_without_supervisor_keeps_not_running_error() {
+    let env = running_container("stopstopped", 4242);
+    mark_stopped(&env);
+    let (code, out, err) = stop(&env);
+    assert_eq!(code, 5);
+    assert_eq!(out, "");
+    assert_eq!(
+        err,
+        err_line("FAILED_PRECONDITION", "container is not running")
+    );
+}
+
+/// SUP-9・SUP-3・#2440: 取り消しの時点で新しいプロセスが動いていた（スロットが `Active`）場合は、記録を読み直し、
+/// `Running` になったら通常の stop（StopRequest）をやり直す。シグナル 15 が 1 回だけ届き、成功する。
+#[test]
+fn sup9_sup3_stop_retries_as_plain_stop_when_the_container_is_running_again() {
+    let env = running_container("stoprerun", 4242);
+    mark_stopped(&env);
+    let sup = FakeSupervisor::start(&env.root, &env.id, 4242, true);
+    let root = env.root.clone();
+    let id = env.id.clone();
+    let flip = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        let store = FileStateStore::open(StateRoot::from_override(root).unwrap()).unwrap();
+        let rec = store.get(&GetStateRequest::new(id.clone())).unwrap();
+        store
+            .update(&UpdateStateRequest::new(
+                ContainerStatus::running(id, NonZeroU32::new(4242)),
+                rec.revision(),
+            ))
+            .unwrap();
+    });
+    let (code, out, err) = stop(&env);
+    flip.join().unwrap();
+    assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
+    assert_eq!(sup.recorded(), vec![15]);
+    assert_eq!(
+        sup.intent.explicit_stop_state(),
+        ExplicitStopState::Requested
     );
 }

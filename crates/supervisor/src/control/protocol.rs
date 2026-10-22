@@ -1,6 +1,6 @@
-//! 制御チャネルのワイヤー形式（固定長・big-endian。REPAIR-2・SUP-1・SUP-9・SEC-1・#2058・#2162）。
+//! 制御チャネルのワイヤー形式（固定長・big-endian。REPAIR-2・SUP-1・SUP-9・SEC-1・#2058・#2162・#2440）。
 //!
-//! CLI（クライアント。[`super::client`]）と supervisor（サーバ。`control::server`）が UDS 上で交わす 3 種類の
+//! CLI（クライアント。[`super::client`]）と supervisor（サーバ。`control::server`）が UDS 上で交わす 5 種類の
 //! frame を、壊れた値を表現できない型で組み立てる。生の `Vec<u8>` を手で組まず、encode は固定長の配列を返し、
 //! decode は `get`・`from_be_bytes`・配列パターンだけで読む（添字アクセスをしない。外部入力の経路）。
 //!
@@ -14,9 +14,15 @@
 //! | SignalRequest | クライアント → サーバ | 2 | pid `u32`・signal `u8`・deadline_ns `u64` | 21 |
 //! | Response | サーバ → クライアント | 3 | reason `u8` | 9 |
 //! | StopRequest | クライアント → サーバ | 4 | SignalRequest と同じ（pid・signal・deadline_ns） | 21 |
+//! | CancelRestartRequest | クライアント → サーバ | 5 | deadline_ns `u64` | 16 |
 //!
 //! StopRequest は「シグナルを送る」に加えて「これは利用者の明示的な stop である」という意図を supervisor に記録させる
 //! （SUP-9・#2162）。supervisor は意図を記録してからシグナルを送り、その後の終了を restart ポリシーの対象から外す。
+//!
+//! CancelRestartRequest は、終了を検知した後のバックオフ中・再 launch 中（記録は `Stopped` で pid が無く、
+//! SignalRequest・StopRequest の pid が使えない）に、保留中の再起動を取り消して「明示 stop」の意図を記録させる
+//! （SUP-9・SUP-3・#2440）。シグナルは送らない。稼働中のプロセスがあるときは `ContainerRunning` で拒否し、
+//! 同じ uid の別プロセスが稼働中コンテナの restart を黙って外せないようにする。
 //!
 //! 1 接続 1 要求。Hello はサーバが接続元の uid を検証した後に送る。クライアントは Hello を受けてから
 //! 「自分の期限 − 余裕」を `CLOCK_MONOTONIC` のナノ秒（同一ホストの別プロセスと比較できる絶対時刻）で要求に載せ、
@@ -30,7 +36,8 @@
 //! 版（`VERSION`）は 1 のまま上げず、kind 4 を足して互換を保つ。新しい CLI と古い supervisor の組では、古い側が kind 4 を
 //! `Malformed` として拒否し、クライアントは `InvalidArgument` を返す（シグナルは送られない。fail-closed）。古い CLI と
 //! 新しい supervisor の組では kind 2 が従来どおり処理され、stop の意図は立たない。CLI と supervisor は同じ配布物から
-//! 一緒に入る前提で、版の不一致は上のとおり安全側に倒れる。
+//! 一緒に入る前提で、版の不一致は上のとおり安全側に倒れる。kind 5（#2440）も同じ方針で、古い supervisor は
+//! `Malformed` として拒否し、クライアントは `NoSupervisor` 相当（従来の stop）に倒す。
 
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -49,6 +56,10 @@ pub const MAX_PAYLOAD: u16 = 64;
 pub const SIGNAL_REQUEST_PAYLOAD_LEN: usize = 13;
 /// SignalRequest の全長。
 pub const SIGNAL_REQUEST_LEN: usize = HEADER_LEN + SIGNAL_REQUEST_PAYLOAD_LEN;
+/// CancelRestartRequest の payload 長（deadline_ns のみ）。
+pub const CANCEL_RESTART_PAYLOAD_LEN: usize = 8;
+/// CancelRestartRequest の全長。
+pub const CANCEL_RESTART_REQUEST_LEN: usize = HEADER_LEN + CANCEL_RESTART_PAYLOAD_LEN;
 /// Response の payload 長。
 pub const RESPONSE_PAYLOAD_LEN: usize = 1;
 /// Response の全長。
@@ -60,6 +71,7 @@ const KIND_HELLO: u8 = 1;
 const KIND_SIGNAL_REQUEST: u8 = 2;
 const KIND_RESPONSE: u8 = 3;
 const KIND_STOP_REQUEST: u8 = 4;
+const KIND_CANCEL_RESTART_REQUEST: u8 = 5;
 
 /// 要求の種類。payload は共通で、supervisor が stop の意図を記録するかどうかだけが違う（SUP-9）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +121,8 @@ pub enum ControlReason {
     Internal = 10,
     /// stop の意図を記録できない（書き先が無い supervisor）。シグナルは送らない（fail-closed。SUP-9）。
     StopIntentUnavailable = 11,
+    /// 再起動の取り消しの時点で、コンテナのプロセスが動いている（取り消す再起動が無い。#2440）。
+    ContainerRunning = 12,
 }
 
 impl ControlReason {
@@ -127,6 +141,7 @@ impl ControlReason {
             9 => Self::SignalFailed,
             10 => Self::Internal,
             11 => Self::StopIntentUnavailable,
+            12 => Self::ContainerRunning,
             _ => return None,
         })
     }
@@ -146,6 +161,7 @@ impl ControlReason {
             Self::SignalFailed => "signal_failed",
             Self::Internal => "internal",
             Self::StopIntentUnavailable => "stop_intent_unavailable",
+            Self::ContainerRunning => "container_running",
         }
     }
 
@@ -185,6 +201,10 @@ impl ControlReason {
             Self::StopIntentUnavailable => (
                 ErrorCode::FailedPrecondition,
                 "the supervisor cannot record the stop intent",
+            ),
+            Self::ContainerRunning => (
+                ErrorCode::FailedPrecondition,
+                "the container process is running",
             ),
             Self::SignalFailed | Self::Internal => (
                 ErrorCode::Internal,
@@ -281,6 +301,16 @@ impl FrameHeader {
         Ok(kind)
     }
 
+    /// 要求のヘッダ（SignalRequest・StopRequest・CancelRestartRequest）として正しいか確かめ、種類を返す
+    /// （サーバが payload を読む前に呼ぶ。kind ごとに payload 長を照合する）。それ以外は `Malformed`。
+    pub fn expect_any_request(self) -> Result<RequestHeader, ControlReason> {
+        if self.kind == KIND_CANCEL_RESTART_REQUEST {
+            self.expect(KIND_CANCEL_RESTART_REQUEST, CANCEL_RESTART_PAYLOAD_LEN)?;
+            return Ok(RequestHeader::CancelRestart);
+        }
+        self.expect_request().map(RequestHeader::Signal)
+    }
+
     /// Hello のヘッダとして正しいか確かめる。
     pub fn expect_hello(self) -> Result<(), ControlReason> {
         self.expect(KIND_HELLO, 0)
@@ -290,6 +320,16 @@ impl FrameHeader {
     pub fn expect_response(self) -> Result<(), ControlReason> {
         self.expect(KIND_RESPONSE, RESPONSE_PAYLOAD_LEN)
     }
+}
+
+/// 検証済みの要求ヘッダの種類（[`FrameHeader::expect_any_request`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RequestHeader {
+    /// SignalRequest・StopRequest（payload 13 バイト）。
+    Signal(RequestKind),
+    /// CancelRestartRequest（payload 8 バイト。#2440）。
+    CancelRestart,
 }
 
 /// Hello frame（payload なし）を encode する。
@@ -360,6 +400,35 @@ impl SignalRequestFrame {
             signal,
             deadline,
         })
+    }
+}
+
+/// CancelRestartRequest frame（kind 5。SUP-9・SUP-3・#2440）。期限の値域は型が保証する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CancelRestartRequestFrame {
+    /// 取り消しを完了する期限（`CLOCK_MONOTONIC` の絶対時刻）。
+    pub deadline: SignalDeadline,
+}
+
+impl CancelRestartRequestFrame {
+    /// 16 バイトに encode する。
+    pub fn encode(&self) -> [u8; CANCEL_RESTART_REQUEST_LEN] {
+        let [h0, h1, h2, h3, h4, h5, h6, h7] = FrameHeader::encode(
+            KIND_CANCEL_RESTART_REQUEST,
+            CANCEL_RESTART_PAYLOAD_LEN as u16,
+        );
+        let [b0, b1, b2, b3, b4, b5, b6, b7] = self.deadline.as_nanos().to_be_bytes();
+        [
+            h0, h1, h2, h3, h4, h5, h6, h7, b0, b1, b2, b3, b4, b5, b6, b7,
+        ]
+    }
+
+    /// 検証済みヘッダ（[`RequestHeader::CancelRestart`]）の後ろの payload 8 バイトを読む。deadline 0 は `Malformed`。
+    pub fn decode_payload(
+        payload: &[u8; CANCEL_RESTART_PAYLOAD_LEN],
+    ) -> Result<Self, ControlReason> {
+        let deadline = SignalDeadline::from_nanos(u64::from_be_bytes(*payload))?;
+        Ok(Self { deadline })
     }
 }
 
@@ -451,7 +520,7 @@ mod tests {
         );
     }
 
-    /// SUP-9: 要求として受けるのは kind 2・4 だけ。1・3・5 以上は `Malformed`。
+    /// SUP-9: 要求として受けるのは kind 2・4 だけ。1・3・5 以上は `Malformed`（kind 5 は `expect_any_request` だけが受ける）。
     #[test]
     fn sup9_expect_request_rejects_other_kinds() {
         for kind in [0u8, 1, 3, 5, 255] {
@@ -467,6 +536,77 @@ mod tests {
             FrameHeader::decode(&head).unwrap().expect_request(),
             Err(ControlReason::Malformed)
         );
+    }
+
+    /// SUP-9・SUP-3・REPAIR-2・#2440: CancelRestartRequest は kind 5・payload 8 バイトで、具体バイトで往復する。
+    #[test]
+    fn sup9_sup3_cancel_restart_request_roundtrip_concrete_bytes() {
+        let frame = CancelRestartRequestFrame {
+            deadline: SignalDeadline::from_nanos(1_500_000_000).unwrap(),
+        };
+        let bytes = frame.encode();
+        assert_eq!(
+            bytes,
+            [
+                b'F', b'C', b'S', b'C', 1, 5, 0, 8, // ヘッダ
+                0, 0, 0, 0, 0x59, 0x68, 0x2f, 0x00, // deadline 1_500_000_000ns
+            ]
+        );
+        let (head, payload) = bytes.split_first_chunk::<HEADER_LEN>().unwrap();
+        let header = FrameHeader::decode(head).unwrap();
+        assert_eq!(
+            header.expect_any_request(),
+            Ok(RequestHeader::CancelRestart)
+        );
+        let payload: [u8; CANCEL_RESTART_PAYLOAD_LEN] = payload.try_into().unwrap();
+        assert_eq!(
+            CancelRestartRequestFrame::decode_payload(&payload).unwrap(),
+            frame
+        );
+        assert_eq!(
+            CancelRestartRequestFrame::decode_payload(&[0; CANCEL_RESTART_PAYLOAD_LEN]),
+            Err(ControlReason::Malformed)
+        );
+    }
+
+    /// SUP-9・#2440: kind ごとに payload 長を照合する（kind 5 は 8 だけ。kind 2・4 は従来どおり 13 だけ）。
+    #[test]
+    fn sup9_expect_any_request_checks_payload_len_per_kind() {
+        let h = |kind: u8, len: u8| {
+            FrameHeader::decode(&[b'F', b'C', b'S', b'C', 1, kind, 0, len]).unwrap()
+        };
+        assert_eq!(
+            h(2, 13).expect_any_request(),
+            Ok(RequestHeader::Signal(RequestKind::Signal))
+        );
+        assert_eq!(
+            h(4, 13).expect_any_request(),
+            Ok(RequestHeader::Signal(RequestKind::Stop))
+        );
+        assert_eq!(
+            h(5, 8).expect_any_request(),
+            Ok(RequestHeader::CancelRestart)
+        );
+        for (kind, len) in [(5u8, 13u8), (5, 0), (5, 9), (2, 8), (4, 8), (1, 0), (3, 1)] {
+            assert_eq!(
+                h(kind, len).expect_any_request(),
+                Err(ControlReason::Malformed),
+                "kind {kind} len {len}"
+            );
+        }
+    }
+
+    /// SUP-9・#2440: `ContainerRunning` の値・語彙・固定文言。
+    #[test]
+    fn sup9_container_running_reason() {
+        assert_eq!(
+            ControlReason::from_u8(12),
+            Some(ControlReason::ContainerRunning)
+        );
+        assert_eq!(ControlReason::ContainerRunning.name(), "container_running");
+        let e = ControlReason::ContainerRunning.to_error().unwrap();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(e.message(), "the container process is running");
     }
 
     /// SUP-9: 新しい理由コードの値・語彙・固定文言。

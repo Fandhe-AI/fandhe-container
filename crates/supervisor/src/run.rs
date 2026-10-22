@@ -45,7 +45,10 @@
 //!
 //! 未実装（将来仕様と対応ビヘイビア ID）:
 //! - 本番 `ProcessLauncher` による再 launch の実機での成立（結線は済み〔[`crate::restart::LauncherRelauncher`]〕だが、単一スレッドの要求を満たせず拒否される。#2043・SUP-3）。
-//! - 停止シグナルの猶予時間（#517）と、再 launch 時の `unless-stopped` と `always` の差（「明示 stop 済み」の state.json への持続化を要する。SUP-9・SUP-3）。明示 stop の意図は制御チャネルが [`StopToken::mark_explicit_stop`] で立てる（#2162）。
+//! - 停止シグナルの猶予時間（#517）。
+//! - 再 launch・re-adopt 時の `unless-stopped` と `always` の差: 「明示 stop 済み」は state.json に記録済み（#2440。トレイト契約 14）で、
+//!   判定の入口は `crate::restart::evaluate_resume`。それを呼ぶ re-adopt 本体は未実装（#514・SUP-8）。明示 stop の意図は
+//!   制御チャネルが [`StopToken::mark_explicit_stop`] で立てる（#2162）。
 //! - 指数バックオフ等の高度な間隔制御（現状は固定のバックオフ。SUP-3）。
 //! - [`MonitorOutcome::ExitedUnrecorded`] の回復（SUP-3）。
 //!
@@ -164,6 +167,9 @@ pub enum ExplicitStopRecord {
     NewlyRecorded,
     /// 既に別の呼び出しが意図を立てていた。
     AlreadyRecorded,
+    /// restart ループが再起動なしで終わる最終判定を済ませ、受付を閉じていた（`StopToken::close_explicit_stop`）。
+    /// 意図は立てていない（記録に渡らない）ので、呼び出し側は成功として返してはならない（SUP-9・契約 14・#2440）。
+    Closed,
 }
 
 /// 明示 stop の意図の状態（[`StopToken::explicit_stop_state`]。SUP-9・#2162）。
@@ -188,6 +194,10 @@ pub enum ExplicitStopState {
 pub struct StopToken {
     stop: Arc<AtomicBool>,
     explicit: Arc<AtomicBool>,
+    /// 明示 stop の受付を閉じたか（[`Self::close_explicit_stop`]）。`gate` の下でだけ読み書きする。
+    closed: Arc<AtomicBool>,
+    /// 意図の設定と受付の閉鎖・最終確認を直列化する（取消の受理と終了判定の競合を防ぐ。SUP-9・#2440）。
+    gate: Arc<std::sync::Mutex<()>>,
 }
 
 impl StopToken {
@@ -207,12 +217,34 @@ impl StopToken {
     }
 
     /// 明示 stop の意図を立て、直前の状態を返す。監視は止めない（[`Self::request_stop`] との違い）。
+    ///
+    /// 受付が閉じられ（`Self::close_explicit_stop`）かつ意図が未設定なら、立てずに `Closed` を返す。
     pub fn mark_explicit_stop(&self) -> ExplicitStopRecord {
+        let _gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.closed.load(Ordering::SeqCst) && !self.explicit.load(Ordering::SeqCst) {
+            return ExplicitStopRecord::Closed;
+        }
         if self.explicit.swap(true, Ordering::SeqCst) {
             ExplicitStopRecord::AlreadyRecorded
         } else {
             ExplicitStopRecord::NewlyRecorded
         }
+    }
+
+    /// 明示 stop の受付を閉じ、閉じた時点の意図の状態を返す（SUP-9・契約 14・#2440）。
+    ///
+    /// restart ループが「再起動せずに終える」と決める直前に 1 回呼ぶ。意図の設定と同じロックの下で行うので、
+    /// 受理済みの要求は必ずこの戻り値に現れ（記録へ渡せる）、以後の要求は `Closed` で断られる。
+    pub(crate) fn close_explicit_stop(&self) -> ExplicitStopState {
+        let _gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.closed.store(true, Ordering::SeqCst);
+        self.explicit_stop_state()
     }
 
     /// 明示 stop の意図の状態を返す。
@@ -307,6 +339,8 @@ pub enum MonitorOperation {
     CaptureStart,
     /// 終了検知後の出力捕捉の終端待ち（#241）。
     CaptureDrain,
+    /// 明示 stop の state.json への記録（`Stopped` の記録へ「明示 stop 済み」を足す。#2440・SUP-9・SUP-3）。
+    RecordExplicitStop,
 }
 
 impl MonitorOperation {
@@ -323,6 +357,7 @@ impl MonitorOperation {
             Self::Restart => "restart",
             Self::CaptureStart => "capture_start",
             Self::CaptureDrain => "capture_drain",
+            Self::RecordExplicitStop => "record_explicit_stop",
         }
     }
 }
@@ -778,6 +813,20 @@ mod tests {
     use super::*;
 
     /// SUP-9・#2162: 明示 stop の意図は停止要求と独立で、複製と共有され、直前の値を返す。
+    /// SUP-9・#2440: 受付を閉じた時点で受理済みの意図は戻り値に現れ、以後は `Closed` で断る。
+    #[test]
+    fn sup9_close_explicit_stop_reports_accepted_and_rejects_later() {
+        let t = StopToken::new();
+        let c = t.clone();
+        assert_eq!(t.close_explicit_stop(), ExplicitStopState::NotRequested);
+        assert_eq!(c.mark_explicit_stop(), ExplicitStopRecord::Closed);
+        assert_eq!(c.explicit_stop_state(), ExplicitStopState::NotRequested);
+        let t2 = StopToken::new();
+        t2.mark_explicit_stop();
+        assert_eq!(t2.close_explicit_stop(), ExplicitStopState::Requested);
+        assert_eq!(t2.mark_explicit_stop(), ExplicitStopRecord::AlreadyRecorded);
+    }
+
     #[test]
     fn sup9_explicit_stop_flag_is_independent_and_shared() {
         let t = StopToken::new();

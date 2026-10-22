@@ -305,6 +305,17 @@ fn mount_rejections() {
         ("/", "/d"),
         ("/h", "/"),
         ("", "/d"),
+        // core の BindMountSet / normalize_container_path が拒否する形（OCI-4）。
+        ("/h", "/data//x"),
+        ("/h", "/a/./b"),
+        ("/h", "/a/"),
+        ("/h", "/a\\b"),
+        ("/a/./h", "/d"),
+        ("/h//x", "/d"),
+        ("/h\\x", "/d"),
+        ("/h", "/dev/shm"),
+        ("/h", "/proc/x"),
+        ("/h", "/sys"),
     ];
     for (h, d) in bad_paths {
         let mut c = ctr();
@@ -688,12 +699,12 @@ fn rejection_table_is_unimplemented() {
             "{name}"
         );
     }
-    // RuntimeDefault は受ける。
-    let c = with_sc(|sc| {
-        sc.seccomp = profile(ProfileType::RuntimeDefault);
-        sc.apparmor = profile(ProfileType::RuntimeDefault);
-    });
+    // seccomp の RuntimeDefault は受ける（core の既定 seccomp が常に適用される）。
+    let c = with_sc(|sc| sc.seccomp = profile(ProfileType::RuntimeDefault));
     build_runtime_config(&pod(), &c, &ImageDefaults::default()).expect("runtime default");
+    // AppArmor は適用処理が無いため RuntimeDefault も拒否する（SEC-1・fail-closed）。
+    let c = with_sc(|sc| sc.apparmor = profile(ProfileType::RuntimeDefault));
+    assert_eq!(code(&pod(), &c), CriErrorCode::Unimplemented);
 }
 
 #[test]
@@ -815,4 +826,41 @@ fn issue_2554_review_rejections() {
         validate_config(&pod(), &c).unwrap_err().code(),
         CriErrorCode::InvalidArgument
     );
+}
+
+#[test]
+fn nested_duplicate_and_protected_overlapping_mounts_are_rejected() {
+    // 入れ子・重複するマウント先（OCI-4）。
+    for dests in [["/a", "/a/b"], ["/a/b", "/a"], ["/a", "/a"]] {
+        let mut c = ctr();
+        c.mounts = vec![mount("/h1", dests[0], false), mount("/h2", dests[1], false)];
+        assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument, "{dests:?}");
+    }
+    // 兄弟（接頭辞だけ共通）は受ける。
+    let mut c = ctr();
+    c.mounts = vec![mount("/h1", "/a/b", false), mount("/h2", "/a/bc", false)];
+    build_runtime_config(&pod(), &c, &ImageDefaults::default()).expect("siblings");
+    // 保護パスと重なるマウント先。
+    let mut c = ctr();
+    c.mounts = vec![mount("/h", "/secret/x", false)];
+    c.linux = Some(LinuxContainerConfig {
+        security_context: Some(LinuxContainerSecurityContext {
+            masked_paths: vec!["/secret".into()],
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
+    // 保護パスの非正規形（core の ProtectedPath が拒否する）。
+    for bad in ["/.", "/a//b", "/a\\b", "/a/"] {
+        let mut c = ctr();
+        c.linux = Some(LinuxContainerConfig {
+            security_context: Some(LinuxContainerSecurityContext {
+                masked_paths: vec![bad.into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument, "{bad:?}");
+    }
 }

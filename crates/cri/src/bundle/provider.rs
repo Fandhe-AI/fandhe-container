@@ -68,6 +68,22 @@ impl SpecBundleProvider {
     /// `root` は絶対パスで、symlink でない既存のディレクトリであること（unix では group / other に
     /// 書き込み権が無いこと）。反すれば `INVALID_ARGUMENT` / `FAILED_PRECONDITION`。
     pub fn new(root: PathBuf, rootfs: Arc<dyn RootfsSource>) -> Result<Self, CriError> {
+        // 非 unix（Windows）は root の所有者・祖先・実体固定の検証と、bundle / config.json の専用 ACL・再解析ポイントの
+        // 検証が未実装（REPAIR-3。実装は Windows 実行構成の確定後。WIN-1）。保護なしで bundle を作らないよう、
+        // 副作用の前に拒否する（fail-closed。SEC-1）。
+        #[cfg(not(unix))]
+        {
+            let _ = (&root, &rootfs);
+            return Err(CriError::unimplemented(
+                "bundle generation is not supported on this platform",
+            ));
+        }
+        #[cfg(unix)]
+        Self::new_unix(root, rootfs)
+    }
+
+    #[cfg(unix)]
+    fn new_unix(root: PathBuf, rootfs: Arc<dyn RootfsSource>) -> Result<Self, CriError> {
         if !root.is_absolute() {
             return Err(CriError::invalid_argument("bundle root must be absolute"));
         }

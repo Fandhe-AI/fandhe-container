@@ -27,6 +27,8 @@ use std::collections::HashMap;
 
 use serde::Serialize;
 
+use fandhe_container_core::path_masks::normalize_container_path;
+
 use crate::error::CriError;
 use crate::runtime::v1::{
     ContainerConfig, Int64Value, LinuxContainerResources, Mount, MountPropagation, NamespaceMode,
@@ -205,6 +207,70 @@ fn check_abs_path(field: &'static str, p: &str) -> Result<(), CriError> {
     Ok(())
 }
 
+/// コンテナ内パスを core の `normalize_container_path` と同じ規則で検証する（OCI-4）。
+///
+/// `\`・`.`・`..`・空要素（`//`・末尾 `/`）を含む値と、正規化で値が変わる値、`/` のみの値は拒否する
+/// （core が create / start で拒否または書き換える形を、config 生成の時点で `INVALID_ARGUMENT` にする）。
+fn check_canonical_path(field: &'static str, p: &str) -> Result<(), CriError> {
+    check_abs_path(field, p)?;
+    match normalize_container_path(p, MAX_PATH_BYTES) {
+        Some(n) if n == p => Ok(()),
+        _ => Err(invalid(field)),
+    }
+}
+
+/// ホスト側のマウント元を core の `validate_source` と同じ規則で検証する（絶対・`\` 無し・`.`・`..`・空要素無し・`/` 不可）。
+fn check_host_source(field: &'static str, p: &str) -> Result<(), CriError> {
+    if p.len() > MAX_PATH_BYTES || p.contains('\0') || p.contains('\\') {
+        return Err(invalid(field));
+    }
+    let rest = p.strip_prefix('/').ok_or_else(|| invalid(field))?;
+    if rest.is_empty() || rest.split('/').any(|e| matches!(e, "" | "." | "..")) {
+        return Err(invalid(field));
+    }
+    Ok(())
+}
+
+/// 要素単位で同一または祖先・子孫の関係か（core の `overlaps` と同じ。`/a/b` と `/a/bc` は無関係）。
+fn overlaps(a: &str, b: &str) -> bool {
+    let within = |child: &str, parent: &str| {
+        child
+            .strip_prefix(parent)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    a == b || within(a, b) || within(b, a)
+}
+
+/// bind mount 間・保護パスとの関係を core の `BindMountSet` と同じ条件で検証する
+/// （予約先 `/proc`・`/sys`・`/dev` 配下、重複・入れ子、保護パスとの重なりを拒否。OCI-4・SEC-1）。
+fn check_mount_set(
+    mounts: &[MountOut<'_>],
+    masked: &[&str],
+    readonly: &[&str],
+) -> Result<(), CriError> {
+    const RESERVED: [&str; 3] = ["/proc", "/sys", "/dev"];
+    for (i, m) in mounts.iter().enumerate() {
+        let d = m.destination;
+        if RESERVED
+            .iter()
+            .any(|r| overlaps(d, r) && d.len() >= r.len())
+        {
+            return Err(invalid("mounts.container_path"));
+        }
+        if mounts
+            .iter()
+            .take(i)
+            .any(|prev| overlaps(prev.destination, d))
+        {
+            return Err(invalid("mounts.container_path"));
+        }
+        if masked.iter().chain(readonly.iter()).any(|p| overlaps(d, p)) {
+            return Err(invalid("mounts.container_path"));
+        }
+    }
+    Ok(())
+}
+
 /// `config.json` の総量予算（複製・直列化の前に checked 演算で消費する。REPAIR-5・DoS 防止）。
 struct Budget {
     left: usize,
@@ -250,11 +316,7 @@ impl std::io::Write for LimitedWriter {
 
 /// 保護パス（masked / readonly）の検証。core の `ProtectedPath` と同じく root のみ（`/`）は拒否する。
 fn check_protected_path(field: &'static str, p: &str) -> Result<(), CriError> {
-    check_abs_path(field, p)?;
-    if p == "/" {
-        return Err(invalid(field));
-    }
-    Ok(())
+    check_canonical_path(field, p)
 }
 
 fn nonneg_u32(field: &'static str, v: &Option<Int64Value>) -> Result<Option<u32>, CriError> {
@@ -269,6 +331,15 @@ fn check_profile(field: &'static str, p: &Option<SecurityProfile>) -> Result<(),
     match p {
         None => Ok(()),
         Some(p) if p.profile_type == ProfileType::RuntimeDefault as i32 => Ok(()),
+        Some(_) => Err(unsupported(field)),
+    }
+}
+
+/// AppArmor は現状どの指定も受けない（`RuntimeDefault` を含む）。core に AppArmor プロファイルの適用処理が無く、
+/// 受理すると明示された分離要求が黙って失われる（fail-closed。適用の実装は未着手。SEC-1）。
+fn check_apparmor(field: &'static str, p: &Option<SecurityProfile>) -> Result<(), CriError> {
+    match p {
+        None => Ok(()),
         Some(_) => Err(unsupported(field)),
     }
 }
@@ -367,11 +438,8 @@ fn resources(r: &LinuxContainerResources) -> Result<Option<ResourcesOut>, CriErr
 }
 
 fn mount_out<'a>(m: &'a Mount, budget: &mut Budget) -> Result<MountOut<'a>, CriError> {
-    check_abs_path("mounts.container_path", &m.container_path)?;
-    check_abs_path("mounts.host_path", &m.host_path)?;
-    if m.container_path == "/" || m.host_path == "/" {
-        return Err(invalid("mounts path"));
-    }
+    check_canonical_path("mounts.container_path", &m.container_path)?;
+    check_host_source("mounts.host_path", &m.host_path)?;
     budget.spend(
         m.container_path
             .len()
@@ -606,7 +674,7 @@ fn build_inner(
                 return Err(unsupported("supplemental_groups"));
             }
             check_profile("seccomp", &sc.seccomp)?;
-            check_profile("apparmor", &sc.apparmor)?;
+            check_apparmor("apparmor", &sc.apparmor)?;
             // 非推奨の文字列欄も、指定されたまま黙って落とさない（プロファイルの無効化を見逃さない）。
             #[allow(deprecated)]
             if !sc.seccomp_profile_path.is_empty() {
@@ -641,7 +709,7 @@ fn build_inner(
             return Err(unsupported("selinux_options"));
         }
         check_profile("seccomp", &sc.seccomp)?;
-        check_profile("apparmor", &sc.apparmor)?;
+        check_apparmor("apparmor", &sc.apparmor)?;
         // 非推奨の文字列欄も、指定されたまま黙って落とさない。
         #[allow(deprecated)]
         let legacy_profile = !sc.apparmor_profile.is_empty() || !sc.seccomp_profile_path.is_empty();
@@ -709,6 +777,8 @@ fn build_inner(
         ),
         None => (Vec::new(), Vec::new()),
     };
+
+    check_mount_set(&mounts, &masked, &readonly)?;
 
     let out = SpecOut {
         oci_version: OCI_VERSION,

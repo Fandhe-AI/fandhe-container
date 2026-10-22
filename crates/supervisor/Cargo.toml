@@ -176,7 +176,7 @@ path = "tests/inherited_fds.rs"
 harness = false
 
 # supervisor の bin から core の本番 launcher を経て monitor まで通す実機シナリオ（起動 → 報告 → 監視 → Stopped の記録、
-# 起動失敗で何も残らないこと、restart の fail-closed。SUP-1・SUP-3・CORE-1・CORE-2・TASK-157 追補・#1819）。同じ実行ファイルが
+# 起動失敗で何も残らないこと、restart の fail-closed、SIGTERM の配送 → Stopped → 停止後の delete。SUP-1・SUP-3・SUP-4・CORE-1・CORE-2・TASK-157 追補・#1819・#2392）。同じ実行ファイルが
 # コンテナ内のプローブも兼ねるため独自 main（harness = false）で動かす。非特権ユーザー・Linux 6.12 以上・委譲された
 # cgroup v2（systemd-run --user）を要する実機前提テストで、`-- --ignored` 指定時のみ実行する（AGENTS.md）。実行は人間担当。
 [[test]]

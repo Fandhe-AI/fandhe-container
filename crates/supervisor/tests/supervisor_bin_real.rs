@@ -1,10 +1,16 @@
 //! supervisor の bin から core の本番 launcher を経て `monitor` まで通す実機シナリオ
 //! （TASK-157 追補・#1819・SUP-1・SUP-3・SUP-7・CORE-1・CORE-2・CORE-3・CORE-5・SEC-1・REPAIR-3・REPAIR-12）。
 //!
-//! `harness = false` の単一 `main` で、同じ実行ファイルが 2 つの役を持つ。
+//! `harness = false` の単一 `main` で、同じ実行ファイルが 3 つの役を持つ。
 //! - 親（既定）: `-- --ignored` のときだけ実機シナリオを動かす（それ以外は案内を出して成功。既定のテスト集合に
 //!   実機前提を混ぜないため）。
 //! - コンテナ内のプローブ（`--container-probe`）: 禁止 syscall（`kcmp`）を 1 回呼んで `KCMP_ERRNO=<errno>` と `READY` を出し、約 2 秒待って終了コード 7 で終わる。
+//!   `--term-probe` を足すと SIGTERM のハンドラ（`_exit(43)` のみ）を登録して `READY_TERM` を出し、SIGTERM を待つ（シナリオ D。
+//!   寿命の上限 60 秒を過ぎたら終了コード 8）。PID 1 は `SIG_DFL` のシグナルをカーネルが配送しないため、ハンドラ無しでは SIGTERM が
+//!   黙って捨てられ、寿命切れの終了を「SIGTERM で止まった」と取り違える（REPAIR-3）。
+//! - delete の補助役（`--delete-helper --root <root> <id>`）: `systemd-run --user --scope` の委譲 cgroup の中で本番の
+//!   `DelegatedCgroup::detect()` を remover にして core の `delete` を呼び、`DELETE_RESULT <OK|コード>` を 1 行出す
+//!   （端末のセッション scope は root 所有で検出に失敗するため、試験プロセス自身では delete できない）。
 //!
 //! # 照合項目
 //! - シナリオ A の起動直後、PID 1 の `uid_map`・`gid_map` が選択規則（subuid / subgid の自分の行が両方あれば範囲写像、
@@ -21,10 +27,16 @@
 //! - シナリオ C（restart の fail-closed。SUP-3・#2043）: `--restart always` でプローブが終了した後、再 launch は
 //!   単一スレッドの要求を満たせず本番 launcher が拒否する。新しい子は作られず、状態は Stopped で、bin の終了コードは
 //!   FAILED_PRECONDITION の写像になる。再 launch が実機で成立する再構成（#2043）が入ったら、この項目を置き換える
+//! - シナリオ D（SIGTERM の配送 → Stopped → 停止後の delete。SUP-4・SUP-1・CORE-2・OCI-6・#2392）: Running の間の delete は
+//!   FAILED_PRECONDITION で拒否され記録が残る。プローブの SIGTERM ハンドラ登録を待ってから、CLI `stop` と同じ
+//!   `ControlSignaler::for_stop` 経由で core の `kill`（SIGTERM）を送る。monitor が Stopped を記録し、終了コードは
+//!   ハンドラの 43（寿命切れの 8・`Signaled(15)` の 143・SIGKILL の 137 ではない）。bin は終了コード 0 で終わり、
+//!   プロセスが残らない。その後の delete は補助役（本番の remover）で成功し、状態が消え、2 回目は NOT_FOUND になる
 //!
 //! # 必要環境
 //! - Linux 6.12 以上（Landlock ABI 6 以上。満たさないと launcher が起動を拒否する。CORE-5）
 //! - 非特権ユーザーでの実行（root では rootful として拒否される。SEC-5）
+//! - `systemd-run --user`（supervisor と、シナリオ D の delete の補助役の両方が使う）
 //! - 非特権 user namespace を許可するホスト（`kernel.apparmor_restrict_unprivileged_userns=0` 等の緩和が要る場合がある）
 //! - `systemd-run --user`（bin を非特権ユーザーに委譲された cgroup v2 の新しいスコープで起動するため。試験プロセスと同じ
 //!   cgroup に他プロセスがいると `DelegatedCgroup::prepare` が失敗する）。包み込みの引数は本番（CLI の `start`）と同じ
@@ -44,7 +56,8 @@
 //! ```
 //!
 //! 成功時の最終行: `supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped(7), logs
-//! captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043`。
+//! captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043; SIGTERM
+//! via the control channel recorded Stopped(43) and the stopped container was deleted`。
 //! 実行と結果の記録は人間担当（#499・#485・#491・#219 のうち該当するもの、または PR）。Linux 限定。
 
 #[cfg(not(target_os = "linux"))]
@@ -72,8 +85,15 @@ fn main() {
 ))]
 fn main() {
     // 子（コンテナ内）は同じバイナリを `--container-probe` で再実行したもの。
-    if std::env::args().any(|a| a == "--container-probe") {
-        linux::probe();
+    let has = |flag: &str| std::env::args().any(|a| a == flag);
+    if has("--container-probe") {
+        if has("--term-probe") {
+            linux::term_probe();
+        } else {
+            linux::probe();
+        }
+    } else if has("--delete-helper") {
+        linux::delete_helper();
     } else if std::env::args().any(|a| a == "--ignored") {
         linux::run();
     } else {
@@ -99,12 +119,16 @@ mod linux {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    use fandhe_container_core::cgroups::DelegatedCgroup;
     use fandhe_container_core::observability::OpRecorder;
-    use fandhe_container_core::oci_runtime::{create, exit_code_for};
-    use fandhe_container_core::traits::{
-        ContainerId, ContainerState, CreateRequest, ErrorCode, GetStateRequest, StateRecord,
-        StateStore,
+    use fandhe_container_core::oci_runtime::{
+        KillTimeout, ProcessSignaler, create, delete, exit_code_for, kill,
     };
+    use fandhe_container_core::traits::{
+        ContainerId, ContainerState, CreateRequest, DeleteRequest, ErrorCode, GetStateRequest,
+        KillRequest, Signal, StateRecord, StateStore,
+    };
+    use fandhe_container_supervisor::control::ControlSignaler;
     use fandhe_container_supervisor::start_contract::StartReport;
     use fandhe_container_supervisor::state::open_default_store;
 
@@ -118,6 +142,79 @@ mod linux {
     const EXIT_TIMEOUT: Duration = Duration::from_secs(90);
     /// 報告 1 行の長さの上限（契約の最大長に十分な余裕。無制限確保を避ける）。
     const LINE_MAX: u64 = 1024;
+    /// SIGTERM 用プローブの寿命の上限（`EXIT_TIMEOUT` より短く、無期限に待たない。REPAIR-5）と、その終了コード。
+    const TERM_PROBE_LIFETIME: Duration = Duration::from_secs(60);
+    const TERM_PROBE_TIMEOUT_EXIT: i32 = 8;
+    /// SIGTERM のハンドラが `_exit` へ渡す終了コード（core の試験用の口と同じ値。`Stopped` の終了コードと照合する）。
+    const TERM_HANDLER_EXIT: i32 = fandhe_container_core::exec::SIGTERM_HANDLER_EXIT_CODE_FOR_TEST;
+    /// `/proc/<pid>/status` の `SigCgt`（捕捉中シグナルのマスク）で SIGTERM（15）に当たるビット（1 << 14）。
+    const SIGTERM_CAUGHT_BIT: u64 = 1 << 14;
+    /// ハンドラ登録の待ちの上限（REPAIR-5）。
+    const HANDLER_WAIT: Duration = Duration::from_secs(30);
+
+    /// コンテナ内で動く SIGTERM 用プローブ（シナリオ D）。SIGTERM のハンドラ（`_exit(43)` のみ）を登録してから
+    /// `READY_TERM` を出し、SIGTERM を待つ。`kcmp` は呼ばない（シナリオ A の監査レコード件数を崩さないため）。
+    pub fn term_probe() {
+        let mut out = std::io::stdout();
+        if let Err(e) = fandhe_container_core::exec::exit_on_sigterm_for_test() {
+            let _ = writeln!(out, "TERM_HANDLER_FAILED {e}");
+            let _ = out.flush();
+            std::process::exit(9);
+        }
+        let _ = writeln!(out, "READY_TERM");
+        let _ = out.flush();
+        let deadline = Instant::now() + TERM_PROBE_LIFETIME;
+        while Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::process::exit(TERM_PROBE_TIMEOUT_EXIT);
+    }
+
+    /// delete の補助役。委譲 cgroup（`systemd-run --user --scope`）の中で、本番の remover（`DelegatedCgroup::detect()`）を
+    /// 使って core の `delete` を呼び、結果を `DELETE_RESULT <OK|コード>` の 1 行で出す。失敗は非 0 で終わる。
+    pub fn delete_helper() {
+        let args: Vec<String> = std::env::args().collect();
+        let value_after = |flag: &str| {
+            args.iter()
+                .position(|a| a == flag)
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+        };
+        let (Some(root), Some(id)) = (value_after("--root"), args.last().cloned()) else {
+            println!("DELETE_RESULT BAD_ARGS");
+            std::process::exit(2);
+        };
+        let Ok(id) = ContainerId::new(id) else {
+            println!("DELETE_RESULT BAD_ID");
+            std::process::exit(2);
+        };
+        let store = match open_default_store(Some(PathBuf::from(root))) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("DELETE_RESULT STORE_{}", e.code().as_str());
+                std::process::exit(2);
+            }
+        };
+        let delegated = match DelegatedCgroup::detect() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("DELETE_RESULT DETECT_{}", e.code.as_str());
+                std::process::exit(2);
+            }
+        };
+        match delete(
+            store.as_ref(),
+            &OpRecorder::new(),
+            &delegated,
+            &DeleteRequest::new(id),
+        ) {
+            Ok(_) => println!("DELETE_RESULT OK"),
+            Err(e) => {
+                println!("DELETE_RESULT {}", e.code().as_str());
+                std::process::exit(i32::from(e.exit_code().get()));
+            }
+        }
+    }
 
     /// コンテナ内で動くプローブ。`READY` を出して一定時間待ち、`PROBE_EXIT` で終わる。
     pub fn probe() {
@@ -252,8 +349,21 @@ mod linux {
         store: Arc<dyn StateStore>,
     }
 
+    /// コンテナ内で動かすプローブの種類。
+    #[derive(Clone, Copy)]
+    enum Probe {
+        /// 約 2 秒後に終了コード 7 で自ら終わる（シナリオ A〜C）。
+        Exit7,
+        /// SIGTERM を待ち、ハンドラ経由で終了コード 43 で終わる（シナリオ D）。
+        Term,
+    }
+
     impl Env {
-        fn new(tag: &str, with_proc: bool) -> Self {
+        fn new(tag: &str, with_proc: bool, probe: Probe) -> Self {
+            let probe_args = match probe {
+                Probe::Exit7 => r#""/probe","--container-probe""#,
+                Probe::Term => r#""/probe","--container-probe","--term-probe""#,
+            };
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.subsec_nanos())
@@ -272,7 +382,7 @@ mod linux {
             let ld = make_rootfs(&bundle.join("rootfs"), with_proc);
             let config = format!(
                 r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs","readonly":false}},"hostname":"fandhe-supbin",
-"process":{{"user":{{"uid":0,"gid":0}},"args":["/probe","--container-probe"],
+"process":{{"user":{{"uid":0,"gid":0}},"args":[{probe_args}],
 "env":["PATH=/","TERM=dumb","LD_LIBRARY_PATH={ld}"],"cwd":"/"}},
 "linux":{{"namespaces":[{{"type":"pid"}},{{"type":"mount"}},{{"type":"uts"}},{{"type":"ipc"}},{{"type":"user"}}]}}}}"#
             );
@@ -429,8 +539,9 @@ mod linux {
         scenario_a_start_monitor_record();
         scenario_b_failed_start_leaves_nothing();
         scenario_c_restart_fails_closed();
+        scenario_d_sigterm_stop_delete();
         println!(
-            "supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped({PROBE_EXIT}), logs captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043"
+            "supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped({PROBE_EXIT}), logs captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043; SIGTERM via the control channel recorded Stopped({TERM_HANDLER_EXIT}) and the stopped container was deleted"
         );
     }
 
@@ -523,7 +634,7 @@ mod linux {
 
     /// シナリオ A: 起動 → 報告 → 監視 → Stopped の記録。
     fn scenario_a_start_monitor_record() {
-        let env = Env::new("a", true);
+        let env = Env::new("a", true, Probe::Exit7);
         let id = format!("sba{}", std::process::id());
         env.create(&id);
         let mut sup = spawn_supervisor(&env, &id, None);
@@ -613,7 +724,7 @@ mod linux {
 
     /// シナリオ B: pre-pivot 段の失敗で、子を残さず、Created のまま、作った cgroup を消す。
     fn scenario_b_failed_start_leaves_nothing() {
-        let env = Env::new("b", false);
+        let env = Env::new("b", false, Probe::Exit7);
         let id = format!("sbb{}", std::process::id());
         env.create(&id);
         let mut sup = spawn_supervisor(&env, &id, None);
@@ -647,7 +758,7 @@ mod linux {
 
     /// シナリオ C: restart の再 launch は fail-closed（#2043 まで）。
     fn scenario_c_restart_fails_closed() {
-        let env = Env::new("c", true);
+        let env = Env::new("c", true, Probe::Exit7);
         let id = format!("sbc{}", std::process::id());
         env.create(&id);
         let mut sup = spawn_supervisor(&env, &id, Some("always"));
@@ -666,5 +777,164 @@ mod linux {
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
         assert!(no_probe_remains(), "no probe process may remain");
         println!("supervisor_bin_real: scenario=C ok first_pid={pid}");
+    }
+
+    /// delete の補助役の結果。
+    struct DeleteOutcome {
+        exit_code: i32,
+        /// `DELETE_RESULT` 行の値（`OK` かエラーコード）。
+        result: String,
+    }
+
+    /// 同じ実行ファイルを `--delete-helper` で、supervisor と同じ委譲 scope の包みの中で動かす。出力の読み取りは行長の
+    /// 上限つき、終了待ちは期限つきで、超過したら kill して回収し失敗にする（REPAIR-5）。
+    fn run_delete_helper(env: &Env, id: &str) -> DeleteOutcome {
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = Command::new("systemd-run")
+            .args(fandhe_container_supervisor::start_contract::USER_SCOPE_WRAPPER_ARGS)
+            .arg(exe)
+            .arg("--delete-helper")
+            .arg("--root")
+            .arg(env.root())
+            .arg(id)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn the delete helper (is `systemd-run --user` available?)");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = Vec::new();
+            let mut reader = std::io::BufReader::new(stdout);
+            let _ = (&mut reader).take(LINE_MAX).read_until(b'\n', &mut line);
+            let _ = tx.send(line);
+        });
+        let deadline = Instant::now() + EXIT_TIMEOUT;
+        let exit_code = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status.code().expect("exit code (not a signal)");
+            }
+            if Instant::now() >= deadline {
+                let killed = child.kill();
+                let _ = child.wait();
+                panic!("the delete helper did not exit within the deadline (kill: {killed:?})");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let line = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the delete helper must print its result line");
+        let text = String::from_utf8_lossy(&line);
+        let result = text
+            .trim()
+            .strip_prefix("DELETE_RESULT ")
+            .unwrap_or_else(|| panic!("unexpected delete helper output: {text:?}"))
+            .to_string();
+        DeleteOutcome { exit_code, result }
+    }
+
+    /// ホストの `/proc/<pid>/status` の `SigCgt` に SIGTERM のビットが立つまで期限つきで待つ（ハンドラ登録前に送ると
+    /// PID 1 では黙って捨てられる）。起動の OK 報告は制御ソケットの bind より前に出るが、`ControlSignaler` が
+    /// `ENOENT`・`ECONNREFUSED` を短時間再試行するうえ、この待ちが先に入るので送信は bind 後になる。
+    fn wait_sigterm_handler(pid: u32) {
+        let deadline = Instant::now() + HANDLER_WAIT;
+        while Instant::now() < deadline {
+            let caught = status_field(&format!("/proc/{pid}/status"), "SigCgt:")
+                .and_then(|v| u64::from_str_radix(&v, 16).ok())
+                .unwrap_or(0);
+            if caught & SIGTERM_CAUGHT_BIT != 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("the probe did not install its SIGTERM handler within the deadline");
+    }
+
+    /// シナリオ D: 制御チャネルの SIGTERM の配送 → monitor が Stopped を記録 → 停止後の delete の成功（SUP-4・#2392）。
+    fn scenario_d_sigterm_stop_delete() {
+        let env = Env::new("d", true, Probe::Term);
+        let id = format!("sbd{}", std::process::id());
+        env.create(&id);
+        let mut sup = spawn_supervisor(&env, &id, None);
+        let pid = match sup.report() {
+            StartReport::Started { pid } => pid,
+            other => panic!("expected OK, got {other:?}"),
+        };
+        let running = env.record(&id);
+        assert_eq!(running.status().state(), ContainerState::Running);
+        assert_eq!(running.status().pid(), Some(pid));
+        let placement = running
+            .cgroup()
+            .expect("the cgroup scope is recorded")
+            .clone();
+
+        // 停止前の delete は状態の判定で拒否され（cgroup に触れる前）、記録は Running のまま残る（OCI-6）。
+        let early = run_delete_helper(&env, &id);
+        assert_eq!(
+            early.result, "FAILED_PRECONDITION",
+            "delete of a running container"
+        );
+        assert_eq!(
+            early.exit_code,
+            i32::from(exit_code_for(ErrorCode::FailedPrecondition).get())
+        );
+        assert_eq!(env.record(&id).status().state(), ContainerState::Running);
+
+        // CLI `stop` と同じ経路: for_stop の signaler で core の kill（SIGTERM）を制御チャネルへ送る。
+        wait_sigterm_handler(pid.get());
+        let signaler: Arc<dyn ProcessSignaler> = Arc::new(ControlSignaler::for_stop(env.root()));
+        let killed = kill(
+            env.store.as_ref(),
+            &OpRecorder::new(),
+            &signaler,
+            &KillRequest::new(cid(&id), Signal::SIGTERM),
+            &KillTimeout::default(),
+        )
+        .unwrap_or_else(|e| panic!("kill(SIGTERM) via the control channel failed: {e:?}"));
+        // kill は状態を更新しない契約。照合した時点の状態は Running で pid が一致する。
+        assert_eq!(killed.state(), ContainerState::Running);
+        assert_eq!(killed.pid(), Some(pid));
+
+        assert_eq!(sup.exit_code(), 0, "monitor must finish cleanly");
+        let stopped = env.record(&id);
+        assert_eq!(stopped.status().state(), ContainerState::Stopped);
+        assert_eq!(
+            stopped.status().exit_code(),
+            Some(TERM_HANDLER_EXIT),
+            "must stop through the SIGTERM handler (not lifetime expiry 8, Signaled(15) 143 or SIGKILL 137)"
+        );
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "the container process must be reaped"
+        );
+        assert!(no_probe_remains(), "no probe process may remain");
+        println!(
+            "supervisor_bin_real: SIGTERM delivered via the control channel, monitor recorded Stopped({TERM_HANDLER_EXIT})"
+        );
+
+        // 停止後の delete: 本番の remover（委譲 scope の中の `DelegatedCgroup`）で成功し、状態が消え、2 回目は NOT_FOUND。
+        let deleted = run_delete_helper(&env, &id);
+        assert_eq!(deleted.result, "OK", "delete of the stopped container");
+        assert_eq!(deleted.exit_code, 0);
+        let gone = env.store.get(&GetStateRequest::new(cid(&id)));
+        assert!(
+            matches!(gone, Err(ref e) if e.code() == ErrorCode::NotFound),
+            "the state record must be gone: {gone:?}"
+        );
+        let again = run_delete_helper(&env, &id);
+        assert_eq!(again.result, "NOT_FOUND", "second delete");
+        let scope_dir = PathBuf::from("/sys/fs/cgroup")
+            .join(placement.scope().as_str().trim_start_matches('/'));
+        let leftover = std::fs::read_dir(&scope_dir)
+            .map(|d| {
+                d.flatten()
+                    .any(|e| e.file_name().to_string_lossy().contains(&id))
+            })
+            .unwrap_or(false);
+        assert!(!leftover, "the container cgroup must be removed");
+        println!(
+            "supervisor_bin_real: scenario=D ok pid={pid} (stopped delete succeeded; second delete NOT_FOUND)"
+        );
     }
 }

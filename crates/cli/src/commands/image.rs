@@ -9,7 +9,7 @@
 //!
 //! `image ls --image-root <abs>` / `system df --image-root <abs>` / `image rm [--force] --image-root <abs> <ref>` / `image tag --image-root <abs> <source> <target>`。
 //! イメージストアの root は必須オプション `--image-root`（絶対パス）で受ける。既定位置は未決のため発明しない（下記「未実装」）。
-//! root は作らない（`ImageStore::open` が存在するディレクトリ・非 symlink であることだけを見る）。
+//! root は作らない（`ImageStore::open` が存在するディレクトリ・非 symlink・所有者・書き込み権限・祖先を検査する。#2381）。
 //!
 //! # 出力形式（stdout・タブ区切り・LF 固定）
 //!
@@ -43,10 +43,11 @@
 //!
 //! # 未実装・前提（実装済みを装わない。REPAIR-3）
 //!
-//! - コンテナ参照（`@container-refs.json`）は永続化済み（#2341・#2352）だが、manifest の在庫・タグ・リースの永続化は oci 側で未実装（#2380）。
-//!   CLI は在庫が空の参照テーブルでしかストアを開けないため、
+//! - コンテナ参照（`@container-refs.json`）は永続化済み（#2341・#2352）で、manifest の在庫・タグ・リース（`@image-inventory.json`）も
+//!   oci 側で永続化済み（#2380。`ImageStore::lock` が排他取得のたびに読み直すので、CLI 側の配線は要らない）。ただし本番で在庫を埋める
+//!   経路（pull → `ImageStore` の配線）が未実装のため、本番のストアの在庫は空で、
 //!   現状は `image ls` が常にヘッダのみ、`system df` の images 側が 0 件（キャッシュ側は実ファイルを全件「未登録」として数える）、
-//!   `image rm` と `image tag` が常に `NOT_FOUND` になる（`image tag` は成功してもプロセス終了で消える）。永続化（#2380）が入ったら `ImageStore::with_table` へ読み込み結果を渡す配線を足す（create / delete の `--image-root`〔`image_refs`・#2315〕も同じ在庫を使う）。
+//!   `image rm` と `image tag` が常に `NOT_FOUND` になる（在庫が入れば `image tag` のタグはプロセスをまたいで残る）。create / delete の `--image-root`〔`image_refs`・#2315〕も同じ在庫を使う。
 //! - `--image-root` 省略時の既定位置（Linux の root / rootless、macOS / Windows の置き場。MAC-4・WIN-1）は未決。
 //! - macOS / Windows ではイメージキャッシュの置き場（ゲスト VM 内かホストか）が未決のため、ローカルの oci を呼ばず
 //!   他コマンドと同じ plugin 解決の失敗（`list_logs::store_open_failure`）で fail-closed に失敗する。
@@ -583,6 +584,12 @@ mod tests {
                 N.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir_all(p.join("blobs").join("sha256")).expect("mkdir");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod");
+            }
             Tmp(p)
         }
         fn path(&self) -> &Path {

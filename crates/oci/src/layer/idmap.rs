@@ -1,7 +1,9 @@
 //! レイヤー展開が tar の uid / gid をホストの ID へ写す写像（SEC-5・OCI-1・#2225）。
 //!
 //! `IdRange` は 1 行の写像、`IdMap` は検証済みの複数行の写像である。`extract` の
-//! `OwnershipPolicy::ChownMapped`（展開物の `chown`）と `SpecialBitsPolicy` が使う。
+//! `OwnershipPolicy::ChownMapped`（展開物の `chown`）・`OwnershipPolicy::ChownInUserNamespace`（rootless の
+//! user namespace の中での `chown`。#2382）と `SpecialBitsPolicy` が使う。後者は `parse_proc_id_map` で読んだ
+//! `/proc/self/{uid,gid}_map` と `IdMap::same_lines_as` で照合する。
 //!
 //! 定義は core の `IdMapping`（`container_id host_id count`）と `IdMapSet::new`（#2009・本番 launcher の範囲写像）
 //! にそろえる。oci は core に依存しない（core は dev-dependency だけ）ため型は共有せず写している。
@@ -54,11 +56,45 @@ impl IdRange {
 /// コンテナ側 / ホスト側の範囲重複・コンテナ内 0 が写されていない構成（いずれも `InvalidArgument`）、
 /// ホスト ID 0 を含む写像（SEC-5。`PermissionDenied`）。
 /// 各範囲の `host_id` の見え方は `IdRange` と同じ（`chown` の引数として展開プロセスの user namespace で解釈される。
-/// `ChownMapped` の呼び出し側は初期 user namespace にいる契約。`OwnershipPolicy` を参照）。
+/// `ChownMapped` の呼び出し側は初期 user namespace にいる契約。`ChownInUserNamespace` では写像の 2 列目〔親の ID〕を渡す。`OwnershipPolicy` を参照）。
 /// ホスト側の範囲が `u32::MAX` を含む写像も拒否する（chown の「変更なし」指定と衝突するため。core の `IdMapSet::new` より厳しい）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdMap {
     lines: Vec<IdRange>,
+}
+
+/// `/proc/<pid>/{uid,gid}_map` の内容を解析する（1 行は空白区切りの u32 が 3 つ。core の
+/// `rootless::parse_id_map` と同じ規則。`tests/idmap_core_parity.rs` が照合する）。
+///
+/// カーネルの行数上限 `MAX_ID_MAP_LINES` を超える入力は確保の前に拒否する。解析できなければ
+/// `FailedPrecondition`（不正な前提環境。パスや内容はメッセージに載せない）。値の検証（重複・ID 0 等）は
+/// しない。`IdMap::same_lines_as` の入力にするだけで、`IdMap` は作らない。
+pub fn parse_proc_id_map(bytes: &[u8]) -> Result<Vec<IdRange>, OciError> {
+    let bad = || {
+        OciError::new(
+            OciErrorCode::FailedPrecondition,
+            "malformed /proc id map line",
+        )
+    };
+    let text = std::str::from_utf8(bytes).map_err(|_| bad())?;
+    let mut out = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut it = line.split_whitespace().map(|f| f.parse::<u32>().ok());
+        let (Some(Some(c)), Some(Some(h)), Some(Some(n)), None) =
+            (it.next(), it.next(), it.next(), it.next())
+        else {
+            return Err(bad());
+        };
+        if out.len() >= MAX_ID_MAP_LINES {
+            return Err(bad());
+        }
+        out.push(IdRange {
+            container_id: c,
+            host_id: h,
+            count: n,
+        });
+    }
+    Ok(out)
 }
 
 /// 半開区間 `[start, end)` の列に重なりがあるか。
@@ -120,6 +156,20 @@ impl IdMap {
     #[must_use]
     pub fn lines(&self) -> &[IdRange] {
         &self.lines
+    }
+
+    /// `ranges`（`parse_proc_id_map` の結果）が、この写像と行の集合として完全に一致するか。順序は問わない。
+    ///
+    /// `ChownInUserNamespace` が、展開プロセスの user namespace の実際の写像と渡された写像の一致を
+    /// 確かめるのに使う（SEC-5）。
+    #[must_use]
+    pub fn same_lines_as(&self, ranges: &[IdRange]) -> bool {
+        let key = |r: &IdRange| (r.container_id, r.host_id, r.count);
+        let mut a: Vec<_> = self.lines.iter().map(key).collect();
+        let mut b: Vec<_> = ranges.iter().map(key).collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        a == b
     }
 
     /// コンテナ内の `id` が写るホストの ID。どの行にも無い・オーバーフローは `None`。
@@ -199,5 +249,50 @@ mod tests {
             .map(|i| r(i, 1000 + i, 1))
             .collect();
         assert!(IdMap::new(ok).is_ok());
+    }
+
+    /// OCI-2・SEC-5: `/proc/self/uid_map` の解析（カーネルの桁そろえ・複数行・上限）。
+    #[test]
+    fn sec5_parse_proc_id_map() {
+        let v = parse_proc_id_map(
+            b"         0       1000          1\n         1     100000      65536\n",
+        )
+        .unwrap();
+        assert_eq!(v, vec![r(0, 1000, 1), r(1, 100_000, 65_536)]);
+        assert_eq!(parse_proc_id_map(b"").unwrap(), vec![]);
+        assert_eq!(parse_proc_id_map(b"0 1000 1").unwrap(), vec![r(0, 1000, 1)]);
+        for bad in [
+            &b"0 1000\n"[..],
+            b"0 1000 1 9\n",
+            b"a b c\n",
+            b"0 1000 4294967296\n",
+            b"-1 0 1\n",
+            b"\xff\n",
+        ] {
+            assert_eq!(
+                parse_proc_id_map(bad).unwrap_err().code(),
+                OciErrorCode::FailedPrecondition
+            );
+        }
+        let lines =
+            |n: usize| -> String { (0..n).map(|i| format!("{i} {} 1\n", 1000 + i)).collect() };
+        assert_eq!(
+            parse_proc_id_map(lines(MAX_ID_MAP_LINES).as_bytes())
+                .unwrap()
+                .len(),
+            MAX_ID_MAP_LINES
+        );
+        assert!(parse_proc_id_map(lines(MAX_ID_MAP_LINES + 1).as_bytes()).is_err());
+    }
+
+    /// OCI-2・SEC-5: 行の集合としての一致（順序は問わず、欠落・追加・値の違いは不一致）。
+    #[test]
+    fn sec5_same_lines_as() {
+        let m = IdMap::new(vec![r(0, 1000, 1), r(1, 100_000, 10)]).unwrap();
+        assert!(m.same_lines_as(&[r(1, 100_000, 10), r(0, 1000, 1)]));
+        assert!(!m.same_lines_as(&[r(0, 1000, 1)]));
+        assert!(!m.same_lines_as(&[r(0, 1000, 1), r(1, 100_000, 10), r(20, 5000, 1)]));
+        assert!(!m.same_lines_as(&[r(0, 1000, 1), r(1, 100_000, 11)]));
+        assert!(!m.same_lines_as(&[]));
     }
 }

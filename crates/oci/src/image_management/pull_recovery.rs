@@ -40,7 +40,12 @@
 //! あっても、空のディレクトリは `begin_pull` の排他区間の外では「作成途中」にならない（作成はストア排他の内側）ため、
 //! 排他下で見た空ディレクトリは不在として回収する。
 //!
-//! 既知の残り（「余分に残す」側）: `@pull.lock` を持たない（#852 より前に作られた）空でないステージングは
+//! リースは `@image-inventory.json` に永続化され（#2380）、排他取得のたびに読み直されるため、別プロセスの
+//! pull が残したリースも不在の確認後に解放して保存する。解放の保存に失敗したら、その pull のステージングは
+//! 消さずに `failed` へ積む（保存の順序の不変条件: 永続化済みのリースがあれば `staging/<id>` がある）。
+//!
+//! 既知の残り（「余分に残す」側）: `staging/<id>` が無いのに永続化されたリース（上の順序を守る限り通常は
+//! 生じない）は、ステージングを手がかりにする本 GC では解放されない。`@pull.lock` を持たない（#852 より前に作られた）空でないステージングは
 //! 回収されない。
 //!
 //! 未実装（REPAIR-3）: 起動時の呼び出しの配線と結果のログ出力は、cri・core と oci の両方に依存するアダプタの
@@ -286,8 +291,16 @@ impl ImageStore {
                 PullLiveness::Live => result.kept_live.push(id),
                 PullLiveness::Undetermined => result.kept_undetermined.push(id),
                 PullLiveness::Absent(file) => {
-                    // 同一プロセスで drop されたセッションのリース。別プロセスのリースはこのテーブルに無い。
+                    // 不在を確認できた pull のリース（排他取得時に永続化から読み直したもの。別プロセスの
+                    // リースを含む。#2380）。解放を保存してからステージングを消す（保存の順序の不変条件）。
+                    let before = guard.inventory_portion();
                     let n = guard.release_all_leases(&id).len();
+                    if let Err(e) = guard.persist_inventory(before) {
+                        // 保存できなければリースは残り（戻される）、ステージングも消さない（余分に残す側）。
+                        drop(file);
+                        result.failed.push((id, e.code()));
+                        continue;
+                    }
                     if n > 0 {
                         result.released_leases.push((id.clone(), n));
                     }
@@ -322,6 +335,11 @@ mod tests {
             let p = std::env::temp_dir().join(format!("fc-oci-recov-{tag}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&p);
             fs::create_dir_all(p.join("blobs").join("sha256")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
+            }
             Root(p)
         }
         fn staging(&self) -> PathBuf {

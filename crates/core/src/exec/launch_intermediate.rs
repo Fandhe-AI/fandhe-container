@@ -1067,9 +1067,15 @@ fn parent_and_session_of(stat: &str) -> Option<(u32, u32)> {
 /// でもない子孫は、pid の安定(未回収であること)を保証できず kill できないため、列挙不完全として残す。列挙・読み取り・
 /// 解析の失敗も `note_scan_failure` で残す(fail-closed)。
 fn descendants_of(anchor: u32, me: u32, out: &mut Rescan) -> Vec<NonZeroU32> {
+    descendants_in(Path::new("/proc"), anchor, me, out)
+}
+
+/// `descendants_of` の本体。`/proc` の場所を差し替えられる(試験が stat の fixture を渡して探索処理そのものを検証する。
+/// REPAIR-12・#2394)。
+fn descendants_in(proc_root: &Path, anchor: u32, me: u32, out: &mut Rescan) -> Vec<NonZeroU32> {
     const WHAT: &str = "cannot scan /proc for the descendants of a tagged process";
     let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
+    let Ok(entries) = std::fs::read_dir(proc_root) else {
         note_scan_failure(out, WHAT);
         return found;
     };
@@ -1089,7 +1095,7 @@ fn descendants_of(anchor: u32, me: u32, out: &mut Rescan) -> Vec<NonZeroU32> {
         if pid.get() == anchor {
             continue;
         }
-        let path = Path::new("/proc").join(pid.get().to_string()).join("stat");
+        let path = proc_root.join(pid.get().to_string()).join("stat");
         let stat = match read_proc_text(&path) {
             Ok(Some(stat)) => stat,
             Ok(None) => continue,
@@ -1098,6 +1104,12 @@ fn descendants_of(anchor: u32, me: u32, out: &mut Rescan) -> Vec<NonZeroU32> {
                 continue;
             }
         };
+        // 終了処理中(state `X`/`x`)の task は ppid 0・pgrp/session -1 を返し、数値として解析できない。終了済みで
+        // kill も回収も要らないため、消えたものと同じく列挙から外す(#2394。これを解析失敗として残すと、他の
+        // プロセスの終了と重なっただけで列挙不完全になる)。
+        if matches!(proc_state_of(&stat), Some('X' | 'x')) {
+            continue;
+        }
         match parent_and_session_of(&stat) {
             Some((parent, _)) if parent == anchor => found.push(pid),
             Some((parent, session)) if session == anchor => {
@@ -1199,6 +1211,19 @@ mod tests {
     use crate::exec::launch_status::{PrePivotFailure, PrePivotStep, report_failure, report_ready};
     use crate::exec::process::ChildExit;
     use crate::traits::{ContainerId, TraitError};
+
+    /// fork する試験を 1 本ずつ実行するための試験プロセス内の直列化ロック(#2394・CORE-6・REPAIR-12)。
+    ///
+    /// 試験は同じプロセスの複数スレッドで並列に走り、fork 子は fork 時点でプロセスが持つ全 fd の複製を引き継ぐ
+    /// (CLOEXEC は exec でしか効かない)。別の試験の fork 子(120 秒眠る代役・mapper 等)が、いま EOF を待っている
+    /// 試験の pipe の書き込み端(開始ゲート・報告 pipe)を複製して握り続けると、書き手を全部閉じても EOF が届かず、
+    /// 期限切れや無期限の待ちになる(間欠失敗の原因。1/300 程度)。fd の寿命ごと排他にするため、fork を行う試験は
+    /// 冒頭でこのロックを取り、終了まで保持する。本番の起動経路は単一スレッドで fd の寿命が重ならないため対象外。
+    fn serialize_forks() -> std::sync::MutexGuard<'static, ()> {
+        static FORK_SERIAL: Mutex<()> = Mutex::new(());
+        // 別の試験が panic してもロックは有効にしておく(失敗が連鎖して原因を隠さない)。
+        FORK_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     // ---- ワイヤー(REPAIR-2) ----
 
@@ -1792,6 +1817,7 @@ mod tests {
     /// 受けて 0 で終了する。
     #[test]
     fn sec4_2024_launch_receives_a_verified_listener_and_acks() {
+        let _serial = serialize_forks();
         let (result, _, _) = run_handoff(Handoff::Good, Duration::from_secs(20));
         let launched = result.expect("launch must succeed");
         let listener = launched.listener.expect("listener");
@@ -1811,6 +1837,7 @@ mod tests {
     /// SEC-4・REPAIR-5・#2024: PID 1 が送らずに終了すると、C は期限(20 秒)を待たず EOF で起動を失敗させる。
     #[test]
     fn sec4_2024_launch_fails_fast_when_the_listener_never_arrives() {
+        let _serial = serialize_forks();
         let (result, elapsed, _) = run_handoff(Handoff::NoSend, Duration::from_secs(20));
         let failure = result.expect_err("must fail");
         assert_eq!(failure.rejection.error.code, ErrorCode::Internal);
@@ -1823,6 +1850,7 @@ mod tests {
     /// 段 `Seccomp` の `FailedPrecondition` として C に復元され、PID 1 は回収される。
     #[test]
     fn sec4_2024_launch_restores_failed_precondition_from_pre_listener_failure() {
+        let _serial = serialize_forks();
         let (result, elapsed, pid1) = run_handoff(Handoff::ReportBusy, Duration::from_secs(20));
         let failure = result.expect_err("must fail");
         assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
@@ -1839,6 +1867,7 @@ mod tests {
     /// SEC-4・#2024: listener ではない fd を送ると拒否され、PID 1 は回収される(ACK は返らない)。
     #[test]
     fn sec4_2024_launch_rejects_a_non_listener_fd_and_reaps_pid1() {
+        let _serial = serialize_forks();
         let (result, _, pid1) = run_handoff(Handoff::WrongFd, Duration::from_secs(20));
         let failure = result.expect_err("must fail");
         assert_eq!(
@@ -1852,6 +1881,7 @@ mod tests {
     /// SEC-4・#2024: PID 1 以外の送信元(pid の不一致)からの fd は拒否される。
     #[test]
     fn sec4_2024_launch_rejects_a_sender_other_than_pid1() {
+        let _serial = serialize_forks();
         let (result, _, pid1) = run_handoff(Handoff::WrongSender, Duration::from_secs(20));
         let failure = result.expect_err("must fail");
         assert_eq!(
@@ -1921,6 +1951,7 @@ mod tests {
     /// 回収してから mapper を回収する(識別子の消失で Clean に進まない)。
     #[test]
     fn core2_exited_mapper_still_anchors_its_orphaned_helper() {
+        let _serial = serialize_forks();
         let subreaper = ChildSubreaper::enable().expect("subreaper");
         let tag = LaunchTag::fresh();
         let (mut ready_read, ready_write) = std::io::pipe().unwrap();
@@ -1972,6 +2003,7 @@ mod tests {
     /// 見つける(識別子の不在で解除されない)。
     #[test]
     fn core2_tagged_process_with_unlisted_descendant_is_kept_across_rescans() {
+        let _serial = serialize_forks();
         let subreaper = ChildSubreaper::enable().expect("subreaper");
         let tag = LaunchTag::fresh();
         let (mut ready_read, ready_write) = std::io::pipe().unwrap();
@@ -2071,6 +2103,65 @@ mod tests {
         assert_eq!(proc_state_of("garbage"), None);
     }
 
+    /// CORE-2・REPAIR-12(#2394): 終了処理中(state `X`)の task の stat は ppid 0・pgrp / session -1 で、
+    /// 親とセッションとしては解析できない。`descendants_of` は state を先に見て、これを列挙不完全にしない。
+    #[test]
+    fn core2_dying_task_stat_has_dead_state_and_unparsable_session() {
+        let dying =
+            "831151 (fdh-l00000002) X 0 -1 -1 0 -1 4227148 63 0 0 0 0 0 0 0 20 0 0 0 221010080\n";
+        assert_eq!(proc_state_of(dying), Some('X'));
+        assert_eq!(parent_and_session_of(dying), None);
+    }
+
+    /// 疑似 `/proc`(一時ディレクトリ)に `<pid>/stat` を置く。
+    fn fake_proc(label: &str, stats: &[(u32, &str)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("core2-2394-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (pid, stat) in stats {
+            let dir = root.join(pid.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("stat"), stat).unwrap();
+        }
+        root
+    }
+
+    /// CORE-2・REPAIR-12(#2394): 探索処理そのものに fixture を渡す。終了処理中(`X` / `x`)の task は除外され
+    /// `scan_incomplete` が立たず、通常の子は列挙される。
+    #[test]
+    fn core2_descendants_skip_dying_tasks_without_marking_incomplete() {
+        let dying_x = "300 (a) X 0 -1 -1 0 -1 4227148\n";
+        let dying_lx = "301 (b) x 0 -1 -1 0 -1 4227148\n";
+        let child = "302 (c) S 100 100 100 0 -1 0\n";
+        let root = fake_proc(
+            "skip",
+            &[
+                (300, dying_x),
+                (301, dying_lx),
+                (302, child),
+                (100, "100 (anchor) S 1 100 100 0 -1 0\n"),
+            ],
+        );
+        let mut out = Rescan::default();
+        let found = descendants_in(&root, 100, 1, &mut out);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, vec![pid(302)]);
+        assert!(!out.scan_incomplete, "{out:?}");
+        assert!(out.error.is_none(), "{out:?}");
+    }
+
+    /// 対照: state が生きていて解析できない stat(壊れた stat)は従来どおり `scan_incomplete` になる。
+    #[test]
+    fn core2_descendants_unparsable_live_stat_marks_incomplete() {
+        let broken = "303 (d) S 0 -1 -1 0 -1 4227148\n";
+        let root = fake_proc("broken", &[(303, broken)]);
+        let mut out = Rescan::default();
+        let found = descendants_in(&root, 100, 1, &mut out);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(found.is_empty(), "{found:?}");
+        assert!(out.scan_incomplete, "{out:?}");
+        assert!(out.error.is_some(), "{out:?}");
+    }
+
     fn gone(pid: u32) -> bool {
         !Path::new(&format!("/proc/{pid}")).exists()
     }
@@ -2079,6 +2170,7 @@ mod tests {
     /// 中間プロセスは回収済みで、監査は 0 件。
     #[test]
     fn core1_via_intermediate_success_returns_adopted_pid1() {
+        let _serial = serialize_forks();
         let (result, sink, pid1) = run(Behavior::Ready, Duration::from_secs(10));
         let child = result.unwrap();
         assert_eq!(Some(child.pid()), pid1);
@@ -2129,6 +2221,7 @@ mod tests {
     /// process-global のロックで並列テストを巻き込まないよう、`--test-threads=1` の子プロセスへ隔離して確かめる。
     #[test]
     fn repair12_2249_stand_in_fork_ignores_stdio_locks_held_by_other_threads() {
+        let _serial = serialize_forks();
         if std::env::var_os("REPAIR12_2249_CHILD").is_some() {
             return;
         }
@@ -2165,6 +2258,7 @@ mod tests {
     /// SEC-4(#1816): pivot 前段の違反は C が 1 件記録し、起動失敗を返して PID 1 を回収する。
     #[test]
     fn sec4_via_intermediate_failure_audits_and_reaps_pid1() {
+        let _serial = serialize_forks();
         let (result, sink, pid1) = run(Behavior::FailWithViolation, Duration::from_secs(10));
         let failure = result.expect_err("launch must fail");
         assert_eq!(failure.rejection.error.code, ErrorCode::FailedPrecondition);
@@ -2187,6 +2281,7 @@ mod tests {
     /// REPAIR-5(#1816): PID 1 が状態を報告しないと `Timeout` で失敗し、記録は 0 件、PID 1 を回収する。
     #[test]
     fn repair5_via_intermediate_silent_pid1_times_out_and_is_reaped() {
+        let _serial = serialize_forks();
         let started = Instant::now();
         let (result, sink, pid1) = run(Behavior::PidOneSilent, Duration::from_millis(500));
         let failure = result.expect_err("launch must fail");
@@ -2201,6 +2296,7 @@ mod tests {
     /// REPAIR-5(#1816): 中間プロセスが報告しないと `Timeout` で失敗し、中間プロセスを SIGKILL して回収する。
     #[test]
     fn repair5_via_intermediate_silent_intermediate_times_out_and_is_killed() {
+        let _serial = serialize_forks();
         let started = Instant::now();
         let (result, sink, intermediate) =
             run(Behavior::IntermediateSilent, Duration::from_millis(300));
@@ -2223,6 +2319,7 @@ mod tests {
     /// PID 1 を特定して回収する(残さない)。報告されない PID 1 の pid は fork_stand_in がテストへ渡す。
     #[test]
     fn core2_via_intermediate_unreported_init_is_recovered_by_tag() {
+        let _serial = serialize_forks();
         let (result, _sink, pid1) = run(Behavior::PidOneBeforeReport, Duration::from_millis(500));
         let failure = result.expect_err("launch must fail");
         assert_eq!(failure.rejection.error.code, ErrorCode::Timeout);
@@ -2240,6 +2337,7 @@ mod tests {
     /// 再実行も要らない(`rescans` は空)。I は回収済みで `/proc` に残らない。
     #[test]
     fn core2_via_intermediate_spawn_failure_report_leaves_nothing() {
+        let _serial = serialize_forks();
         let (result, sink, _) = run(Behavior::SpawnFails, Duration::from_secs(10));
         let failure = result.expect_err("launch must fail");
         assert_eq!(failure.rejection.error.code, ErrorCode::Unavailable);
@@ -2255,6 +2353,7 @@ mod tests {
     /// `reap_error`・`rescans` が空)で、両者とも `/proc` に残らない。
     #[test]
     fn core2_via_intermediate_isolate_failure_reaps_left_mapper_and_helper() {
+        let _serial = serialize_forks();
         let (result, sink, pids) = run_pids(
             Behavior::IsolateFailsLeavingMapper,
             Duration::from_secs(10),
@@ -2278,6 +2377,7 @@ mod tests {
     /// 再探索の実体)。見つけた子は回収済みで `/proc` に残らず、結果は「残っていない」(`is_clean`)。
     #[test]
     fn core2_rescan_finds_tagged_child_and_reaps_it() {
+        let _serial = serialize_forks();
         let subreaper = ChildSubreaper::enable().expect("subreaper");
         let tag = LaunchTag::fresh();
         let (mut ready_read, ready_write) = std::io::pipe().unwrap();
@@ -2311,6 +2411,7 @@ mod tests {
     /// 子も kill・回収し、`/proc` に残さない。
     #[test]
     fn core2_rescan_also_reaps_untagged_children_of_tagged_process() {
+        let _serial = serialize_forks();
         let subreaper = ChildSubreaper::enable().expect("subreaper");
         let tag = LaunchTag::fresh();
         let (mut ready_read, ready_write) = std::io::pipe().unwrap();
@@ -2359,6 +2460,7 @@ mod tests {
     /// 失敗(gate_w の drop)で開始ゲートが EOF となり、期限(10 秒)を待たずに終了する。
     #[test]
     fn core2_start_gate_sees_eof_when_launcher_aborts_before_release() {
+        let _serial = serialize_forks();
         let _subreaper = ChildSubreaper::enable().expect("subreaper");
         let (mut mark_read, mark_write) = std::io::pipe().unwrap();
         let mark_write = std::fs::File::from(std::os::fd::OwnedFd::from(mark_write));
@@ -2460,6 +2562,7 @@ mod tests {
     /// SEC-5(#1816): isolate の失敗報告は元の `ErrorCode` と固定文言で返り、監査は 0 件。
     #[test]
     fn sec5_via_intermediate_isolate_failure_is_propagated() {
+        let _serial = serialize_forks();
         let (result, sink, _) = run(Behavior::IsolateFails, Duration::from_secs(10));
         let failure = result.expect_err("launch must fail");
         assert_eq!(failure.rejection.error.code, ErrorCode::PermissionDenied);
@@ -2475,6 +2578,7 @@ mod tests {
     /// REPAIR-2(#1816): 不正な報告(pid 0)は起動失敗(`Internal`)として扱う。
     #[test]
     fn repair2_via_intermediate_malformed_report_fails_closed() {
+        let _serial = serialize_forks();
         let (result, _sink, _) = run(Behavior::MalformedReport, Duration::from_secs(10));
         let failure = result.expect_err("launch must fail");
         assert_eq!(failure.rejection.error.code, ErrorCode::Internal);
@@ -2508,6 +2612,7 @@ mod tests {
     /// 有効のとき、固定 1 行がちょうど 1 回、改行付きで届き、起動は成功する。
     #[test]
     fn core5_sec1_2008_enabled_emits_exact_line_once() {
+        let _serial = serialize_forks();
         assert_eq!(
             crate::legacy_tiocsti::warning_line(LegacyTiocsti::Enabled),
             Some(LEGACY_LINE)
@@ -2534,6 +2639,7 @@ mod tests {
     /// 対象外の状態では何も出力されない。
     #[test]
     fn core5_sec1_2008_non_applicable_states_emit_nothing() {
+        let _serial = serialize_forks();
         for state in [
             LegacyTiocsti::Absent,
             LegacyTiocsti::Disabled,
@@ -2557,6 +2663,7 @@ mod tests {
     /// fork の後なら、起動が失敗しても警告は 1 行出る。
     #[test]
     fn core5_sec1_2008_emitted_even_when_launch_fails() {
+        let _serial = serialize_forks();
         let (tx, mut rx) = UnixStream::pair().unwrap();
         let (result, _sink, _) = run_with(
             Behavior::IsolateFails,
@@ -2574,6 +2681,7 @@ mod tests {
     /// 出力先が満杯でも起動は待たされず成功する(REPAIR-5)。
     #[test]
     fn repair5_2008_full_output_does_not_block_launch() {
+        let _serial = serialize_forks();
         let (mut tx, rx) = UnixStream::pair().unwrap();
         tx.set_nonblocking(true).unwrap();
         let chunk = [b'x'; 4096];
@@ -2604,6 +2712,7 @@ mod tests {
     /// 読み手が閉じていても起動は失敗せず、SIGPIPE で落ちない(`MSG_NOSIGNAL`)。
     #[test]
     fn repair5_2008_closed_peer_does_not_fail_launch() {
+        let _serial = serialize_forks();
         let (tx, rx) = UnixStream::pair().unwrap();
         drop(rx);
         let (result, _sink, _) = run_with(
@@ -2622,6 +2731,7 @@ mod tests {
     /// CORE-1(#1816): 複数スレッドの呼び出しは中間プロセスを作らず `FailedPrecondition`。
     #[test]
     fn core1_via_intermediate_refuses_multithreaded_caller() {
+        let _serial = serialize_forks();
         let subreaper = ChildSubreaper::enable().expect("subreaper");
         let sink = VecSink(Mutex::new(Vec::new()));
         let audit = LaunchAudit {
@@ -2671,6 +2781,7 @@ mod tests {
     /// 止まらず、指定した timeout の範囲で失敗を返す。
     #[test]
     fn repair5_1816_launch_does_not_block_on_full_stdout_pipe() {
+        let _serial = serialize_forks();
         if std::env::var_os("REPAIR5_1816_MARKER").is_some() {
             return;
         }

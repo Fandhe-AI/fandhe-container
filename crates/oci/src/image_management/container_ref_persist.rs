@@ -11,13 +11,16 @@
 //!
 //! # 永続化しないもの（実装済みを装わない。REPAIR-3）
 //!
-//! manifest の在庫と構成・タグ・pull リースは永続化しない（#851）。このため読み直した直後のエントリは、
-//! メモリ上のテーブルに無い manifest を指しうる。読み込みでは在庫を確かめない。参照数の集計・未確定の
+//! manifest の在庫と構成・タグ・pull リースは、別ファイル `@image-inventory.json` に永続化する（#2380。
+//! `inventory_persist`）。各操作が書き換えるのはどちらか一方のファイルだけで、
+//! 両方を同じ排他区間で読み直す。在庫ファイルが無い（本番で在庫を埋める経路は未実装）場合などは、
+//! 読み直した直後のエントリがテーブルに無い manifest を指しうる。読み込みでは在庫を確かめない。参照数の集計・未確定の
 //! 一覧・照合・`remove_manifest` の参照確認は manifest の在庫が無くても正しく動く。一方 blob の参照は
 //! manifest の構成から数えるため、在庫に無い manifest への参照は構成が分からず、その manifest だけが
 //! 使う blob を守れない。このため `has_unresolved_container_refs` が真の間は `image rm` / `image prune` が
-//! blob ファイルを一切削除しない（残す側へ倒す。manifest の外し自体は従来どおり）。残ったままの一時ファイル（クラッシュ時の `*.tmp-*`）の回収は未実装
-//! （読み込みは固定名のファイルしか見ないので害はない）。
+//! blob ファイルを一切削除しない（残す側へ倒す。manifest の外し自体は従来どおり）。残ったままの一時ファイル（クラッシュ時の `*.tmp-*`）は、`ImageStore::lock` の
+//! 取得直後（排他区間の中。書き手は排他の中でしか作らないので残っているものは中断の残骸）に通常ファイルだけを回収する（#2379・OCI-7。
+//! 照合 `reconcile_container_refs` も最初に lock を取るので同じ経路で回収される）。読み込みは固定名のファイルしか見ない。
 //!
 //! # 形式と安全性
 //!
@@ -27,7 +30,7 @@
 //! 矛盾したファイルは fail-closed で拒否する（空として扱うと参照が消えて GC が誤削除するため）。
 //! 世代の矛盾（`generation >= next_generation`・重複）は再発行の恐れがあるため `DataLoss` とする。
 //! group / other に書き込み権のあるファイル（`PermissionDenied`）・symlink・通常ファイル以外（`Internal`）も拒否する。
-//! root の所有者 / 0700 の検査は未実装（`store` モジュールの前提）。
+//! root の所有者・権限・祖先の検査は `ImageStore::open` が行う（#2381。unix のみ）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -47,6 +50,10 @@ use crate::reference::Digest;
 
 /// ストア root 直下のコンテナ参照ファイル名。`@` で始め、`blobs/`・`staging/` の走査にかからない。
 pub const CONTAINER_REFS_FILE_NAME: &str = "@container-refs.json";
+
+/// 保存の一時ファイル名の接頭辞（`<固定名>.tmp-<pid>-<nonce>`）。書き込み中のクラッシュで残ったものは
+/// `ImageStore::lock` の取得直後に `gc_journal::reap_stale_tmp` が回収する（#2379・OCI-7）。
+pub(super) const CONTAINER_REFS_TMP_PREFIX: &str = "@container-refs.json.tmp-";
 
 /// 永続化できるコンテナ参照の件数の上限（読み込みでも書き込みでも守る）。
 pub const MAX_CONTAINER_REFS: usize = 16_384;
@@ -381,7 +388,7 @@ fn next_tmp_nonce() -> u64 {
 
 fn tmp_path(root: &Path, nonce: u64) -> PathBuf {
     root.join(format!(
-        "{CONTAINER_REFS_FILE_NAME}.tmp-{}-{nonce}",
+        "{CONTAINER_REFS_TMP_PREFIX}{}-{nonce}",
         std::process::id()
     ))
 }
@@ -500,6 +507,11 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&p).expect("mkdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
         p
     }
 
@@ -771,6 +783,53 @@ mod tests {
         .expect("tmp");
         let b = open(&r);
         assert_eq!(containers_of(&b, 0xa0), vec![cid("c1")]);
+        let _ = fs::remove_dir_all(r);
+    }
+
+    /// OCI-7・#2379: クラッシュで残った参照表の一時ファイルは lock 取得時に回収される。symlink・ディレクトリ・
+    /// 固定名の本体・無関係なファイルは残り、登録済みの参照は変わらない。
+    #[test]
+    fn oci7_stale_container_refs_tmp_is_reaped_on_lock() {
+        let r = root("reap-tmp");
+        {
+            let a = open(&r);
+            a.register_container_ref(&cid("c1"), &d(0xa0)).expect("reg");
+        }
+        let stale = r.join(format!("{CONTAINER_REFS_TMP_PREFIX}1-1"));
+        fs::write(&stale, r#"{"version":1,"next_gener"#).expect("tmp");
+        let dir = r.join(format!("{CONTAINER_REFS_TMP_PREFIX}2-2"));
+        fs::create_dir(&dir).expect("dir");
+        let unrelated = r.join("unrelated.tmp-1");
+        fs::write(&unrelated, b"keep").expect("unrelated");
+        #[cfg(unix)]
+        let link = {
+            let link = r.join(format!("{CONTAINER_REFS_TMP_PREFIX}3-3"));
+            std::os::unix::fs::symlink(&unrelated, &link).expect("symlink");
+            link
+        };
+        let b = open(&r);
+        assert!(fs::symlink_metadata(&stale).is_err());
+        assert!(dir.is_dir());
+        assert!(unrelated.exists());
+        #[cfg(unix)]
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert!(r.join(CONTAINER_REFS_FILE_NAME).is_file());
+        assert_eq!(containers_of(&b, 0xa0), vec![cid("c1")]);
+        let _ = fs::remove_dir_all(r);
+    }
+
+    /// OCI-7・#2379: 照合（`reconcile_container_refs`）の経路でも、残った一時ファイルが回収される。
+    #[test]
+    fn oci7_reconcile_reaps_stale_container_refs_tmp() {
+        use crate::image_management::ContainerStatePresence;
+        let r = root("reap-reconcile");
+        let a = open(&r);
+        a.register_container_ref(&cid("c1"), &d(0xa0)).expect("reg");
+        let stale = r.join(format!("{CONTAINER_REFS_TMP_PREFIX}9-9"));
+        fs::write(&stale, b"partial").expect("tmp");
+        a.reconcile_container_refs(|_| ContainerStatePresence::Present)
+            .expect("reconcile");
+        assert!(fs::symlink_metadata(&stale).is_err());
         let _ = fs::remove_dir_all(r);
     }
 

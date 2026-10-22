@@ -19,12 +19,20 @@
 //!   helper が無いことを理由に `SingleId` へ縮退しない（設定が範囲写像の意図を示しているため）。
 //! - real uid と effective uid が食い違う場合の範囲写像は拒否する（`newuidmap` は real uid で所有者を確かめる）。
 //!
-//! # 所有者名（NSS を使わない）
+//! # 所有者名（passwd 優先・無ければ NSS）
 //! `/etc/subuid` の第 1 欄は多くがユーザー名のため、`/etc/passwd` を上限つきで直接読み、uid 欄が実効 uid と一致する
 //! 最初の行の第 1 欄を名前にする（[`owner_name_from_passwd`]）。環境変数 `USER` は信頼しない（CLI が起動時に消す。
 //! 利用者が書き換えられる入力でもある）。argv で渡す案・数値 uid だけで照合する案は採らない。
-//! 既知の制約: `/etc/passwd` に載らないユーザー（LDAP / sssd 等）は名前なしとなり、数値 uid の行だけで照合される。
-//! `newuidmap` は NSS で呼び出し元を解決するため、NSS と `/etc/passwd` が食い違うと helper が拒否する（fail-closed）。
+//! `/etc/passwd` に行が無い（LDAP / sssd 等）ときだけ、`user_db::resolve_owner_name` が固定パスの `getent` を
+//! 期限つきで実行して NSS の名前を得る（`newuidmap` が NSS で呼び出し元を解決するのに合わせる。#2390）。
+//! NSS の参照失敗・期限切れ・不正な出力は fail-closed（黙って 1 対 1 へ落とさない）。信頼できる `getent` が無いときは
+//! 名前なしで数値 uid の行だけで照合する（`doctor` が通知する）。`subid:` の NSS で範囲を配る構成は未対応。
+//!
+//! # doctor との共用
+//! 設定ファイルの既定位置（`SYSTEM_*`）・passwd の読み取り（`read_owner_name`）・subuid / subgid の分類
+//! （`probe_sub_id_file`）は Linux 限定で公開し、`start`（`start_entry` の `resolve_launch_privilege`）と
+//! pull 時の展開の所有者（cli の `image_ownership`。`resolve_rootless_id_source`。#2389）と
+//! CLI の `doctor`（`doctor::id_mapping_check`。#2387）が同じ関数を呼ぶ。診断と `start` の判定を食い違わせない。
 //!
 //! エラー文言は固定の英語で、ユーザー名・パス・errno・ファイルの内容を含めない。
 
@@ -56,6 +64,16 @@ pub enum RootlessIdModel {
     /// コンテナ 0 → 実効 uid / gid、1.. → subordinate 範囲（`newuidmap` / `newgidmap`）。
     SubordinateIds,
 }
+
+/// `/etc/passwd` の既定位置（NSS は使わない）。
+#[cfg(target_os = "linux")]
+pub const SYSTEM_PASSWD: &str = "/etc/passwd";
+/// `/etc/subuid` の既定位置。
+#[cfg(target_os = "linux")]
+pub const SYSTEM_SUBUID: &str = "/etc/subuid";
+/// `/etc/subgid` の既定位置。
+#[cfg(target_os = "linux")]
+pub const SYSTEM_SUBGID: &str = "/etc/subgid";
 
 fn precondition(message: &'static str) -> TraitError {
     TraitError::new(ErrorCode::FailedPrecondition, message)
@@ -121,6 +139,115 @@ pub fn owner_name_from_passwd(bytes: &[u8], uid: u32) -> Result<Option<String>, 
         };
     }
     Ok(None)
+}
+
+/// 上限つきでファイルを読む（超過は `None`）。
+#[cfg(target_os = "linux")]
+fn read_bounded(path: &std::path::Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)?
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    Ok((u64::try_from(buf.len()).unwrap_or(u64::MAX) <= limit).then_some(buf))
+}
+
+/// `passwd` を上限つきで読み、`effective` の名前を返す（`start` と `doctor` が共用。#2387）。
+///
+/// ファイルが無ければ `None`（名前なしで数値 uid の行だけ照合する）。上限超過・その他の I/O 失敗・書式不正は
+/// 固定文言の `FailedPrecondition`。
+#[cfg(target_os = "linux")]
+pub fn read_owner_name(
+    passwd: &std::path::Path,
+    effective: u32,
+) -> Result<Option<String>, TraitError> {
+    match read_bounded(passwd, MAX_PASSWD_BYTES) {
+        Ok(Some(bytes)) => owner_name_from_passwd(&bytes, effective),
+        Ok(None) => Err(precondition("the passwd database is unusable")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(precondition("the passwd database is unusable")),
+    }
+}
+
+/// subuid / subgid の 1 ファイルを分類する（`ErrorCode::NotFound` はファイル無し。それ以外の失敗は `Unusable`）。
+#[cfg(target_os = "linux")]
+pub fn probe_sub_id_file(
+    path: &std::path::Path,
+    owner: &fandhe_container_core::rootless::SubIdOwner,
+) -> SubIdFileProbe {
+    match fandhe_container_core::rootless::load_subordinate_ids(path, owner) {
+        Ok(ranges) if ranges.is_empty() => SubIdFileProbe::NoOwnerRows,
+        Ok(_) => SubIdFileProbe::Assigned,
+        Err(e) if e.code == ErrorCode::NotFound => SubIdFileProbe::Absent,
+        Err(_) => SubIdFileProbe::Unusable,
+    }
+}
+
+/// 所有者の解決の結果(`resolve_rootless_id_source`)。start の権限モデルと pull 時の展開の写像の両方の入力になる。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub enum RootlessIdResolution {
+    /// コンテナ 0 → 自 ID の 1 対 1(subuid / subgid の設定が無いホスト)。
+    SingleId,
+    /// 範囲写像。入力元は probe したのと同じ subuid / subgid を読む。
+    SubordinateIds(fandhe_container_core::oci_runtime::SubordinateIdSource),
+}
+
+/// 所有者名を passwd、無ければ NSS(`getent`)から得て、subuid / subgid を分類し、モデルと範囲写像の入力元を決める。
+///
+/// rootless の start(`start_entry` の `resolve_launch_privilege`)と、pull 時の展開の所有者(cli の
+/// `image_ownership`。#2389・SEC-5・CORE-6・OCI-1)が同じこの関数を呼び、所有者の解決を食い違わせない。
+/// rootful(uid 0)の判定は呼び出し側が先に行う。`real` / `effective` は start する利用者の uid。
+/// 名前が規則に違反する行は `SingleId` へ黙って落とさず拒否する。
+#[cfg(target_os = "linux")]
+pub fn resolve_rootless_id_source(
+    real: u32,
+    effective: u32,
+    passwd: &std::path::Path,
+    subuid: &std::path::Path,
+    subgid: &std::path::Path,
+) -> Result<RootlessIdResolution, TraitError> {
+    resolve_rootless_id_source_with(
+        real,
+        effective,
+        passwd,
+        subuid,
+        subgid,
+        &crate::user_db::UserDbLookup::system(),
+    )
+}
+
+/// [`resolve_rootless_id_source`] の NSS 参照の設定を差し替えられる版(試験・別配置向け。本番は上の関数)。
+#[cfg(target_os = "linux")]
+pub fn resolve_rootless_id_source_with(
+    real: u32,
+    effective: u32,
+    passwd: &std::path::Path,
+    subuid: &std::path::Path,
+    subgid: &std::path::Path,
+    lookup: &crate::user_db::UserDbLookup,
+) -> Result<RootlessIdResolution, TraitError> {
+    use crate::user_db::{OwnerNameResolution, resolve_owner_name};
+    use fandhe_container_core::oci_runtime::SubordinateIdSource;
+    use fandhe_container_core::rootless::SubIdOwner;
+    let name = match resolve_owner_name(passwd, effective, lookup)? {
+        OwnerNameResolution::Resolved { name, .. } => Some(name),
+        OwnerNameResolution::NotFound | OwnerNameResolution::LookupUnavailable => None,
+    };
+    let owner = SubIdOwner::new(effective, name.clone())
+        .map_err(|_| precondition("the owner name is not usable for subordinate ids"))?;
+    let model = select_rootless_id_model(
+        probe_sub_id_file(subuid, &owner),
+        probe_sub_id_file(subgid, &owner),
+        real,
+        effective,
+    )?;
+    match model {
+        RootlessIdModel::SingleId => Ok(RootlessIdResolution::SingleId),
+        RootlessIdModel::SubordinateIds => Ok(RootlessIdResolution::SubordinateIds(
+            SubordinateIdSource::with_id_files(name, subuid, subgid)?,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -226,5 +353,166 @@ mod tests {
         assert_eq!(run(&big), expect);
         let many = "x:x:1:1\n".repeat(MAX_PASSWD_LINES + 1);
         assert_eq!(run(many.as_bytes()), expect);
+    }
+
+    /// Linux 限定: `read_owner_name`・`probe_sub_id_file` の分類（`doctor` と共用する経路。#2387・CORE-6）。
+    #[cfg(target_os = "linux")]
+    mod linux_shared {
+        use super::super::*;
+        use fandhe_container_core::rootless::SubIdOwner;
+        use std::path::PathBuf;
+
+        /// 解決の入力一式を一時ディレクトリへ置く。
+        fn resolve(
+            tag: &str,
+            subuid: Option<&str>,
+            subgid: Option<&str>,
+        ) -> (Result<RootlessIdResolution, TraitError>, PathBuf) {
+            let d = tmp(tag);
+            std::fs::write(d.join("passwd"), "alice:x:1000:1000::/h:/bin/sh\n").unwrap();
+            for (n, b) in [("subuid", subuid), ("subgid", subgid)] {
+                if let Some(b) = b {
+                    std::fs::write(d.join(n), b).unwrap();
+                }
+            }
+            let r = resolve_rootless_id_source(
+                1000,
+                1000,
+                &d.join("passwd"),
+                &d.join("subuid"),
+                &d.join("subgid"),
+            );
+            (r, d)
+        }
+
+        /// CORE-6・SEC-5(#2389): 設定なし → 1 対 1、両方あり → 範囲写像、片側のみ → 拒否。
+        #[test]
+        fn core6_resolve_rootless_id_source_cases() {
+            let (r, d) = resolve("r-single", None, None);
+            assert!(matches!(r.unwrap(), RootlessIdResolution::SingleId));
+            let _ = std::fs::remove_dir_all(&d);
+            let (r, d) = resolve(
+                "r-sub",
+                Some("alice:100000:65536\n"),
+                Some("alice:200000:65536\n"),
+            );
+            match r.unwrap() {
+                RootlessIdResolution::SubordinateIds(src) => {
+                    let maps = src.resolve_id_maps(1000, 1000).unwrap();
+                    assert_eq!(maps.uid().host_id_of(1), Some(100000));
+                    assert_eq!(maps.gid().host_id_of(1), Some(200000));
+                }
+                RootlessIdResolution::SingleId => panic!("expected a ranged mapping"),
+            }
+            let _ = std::fs::remove_dir_all(&d);
+            let (r, d) = resolve("r-part", Some("alice:100000:65536\n"), None);
+            let _ = std::fs::remove_dir_all(&d);
+            let e = r.unwrap_err();
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            assert_eq!(e.message(), "subordinate id configuration is incomplete");
+        }
+
+        /// CORE-6・SEC-5(#2390): passwd に行が無く NSS(stub の getent)が名前を返すと、名前で書かれた subuid / subgid の
+        /// 行で範囲写像になる。NSS の失敗は縮退せず拒否する。
+        #[test]
+        fn core6_resolve_uses_nss_name_when_passwd_misses() {
+            use crate::user_db::UserDbLookup;
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            use std::time::Duration;
+            let d = tmp("r-nss");
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(d.join("passwd"), "other:x:2000:2000::/h:/bin/sh\n").unwrap();
+            std::fs::write(d.join("subuid"), "ldapuser:100000:65536\n").unwrap();
+            std::fs::write(d.join("subgid"), "ldapuser:200000:65536\n").unwrap();
+            let euid = std::fs::metadata("/proc/self").unwrap().uid();
+            let lookup_for = |body: &str| {
+                let p = d.join("getent");
+                let _ = std::fs::remove_file(&p);
+                std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+                UserDbLookup::custom(vec![p], Duration::from_secs(5), Some(euid), d.clone())
+            };
+            let run = |l: &UserDbLookup| {
+                resolve_rootless_id_source_with(
+                    1000,
+                    1000,
+                    &d.join("passwd"),
+                    &d.join("subuid"),
+                    &d.join("subgid"),
+                    l,
+                )
+            };
+            match run(&lookup_for("echo 'ldapuser:*:1000:1000::/h:/bin/sh'")).unwrap() {
+                RootlessIdResolution::SubordinateIds(src) => {
+                    let maps = src.resolve_id_maps(1000, 1000).unwrap();
+                    assert_eq!(maps.uid().host_id_of(1), Some(100000));
+                    assert_eq!(maps.gid().host_id_of(1), Some(200000));
+                }
+                RootlessIdResolution::SingleId => panic!("expected a ranged mapping"),
+            }
+            // 名前なし(終了 2)は従来どおり数値 uid の行だけで照合され、名前の行は一致せず 1 対 1。
+            assert!(matches!(
+                run(&lookup_for("exit 2")).unwrap(),
+                RootlessIdResolution::SingleId
+            ));
+            // NSS の失敗は縮退せず拒否。
+            let e = run(&lookup_for("exit 1")).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        fn tmp(tag: &str) -> PathBuf {
+            let d = std::env::temp_dir().join(format!(
+                "fc-idmodel-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        }
+
+        #[test]
+        fn core6_read_owner_name_cases() {
+            let d = tmp("pw");
+            assert_eq!(read_owner_name(&d.join("none"), 1000).unwrap(), None);
+            let pw = d.join("passwd");
+            std::fs::write(&pw, "alice:x:1000:1000::/h:/bin/sh\n").unwrap();
+            assert_eq!(
+                read_owner_name(&pw, 1000).unwrap(),
+                Some("alice".to_owned())
+            );
+            let big = d.join("big");
+            std::fs::write(
+                &big,
+                vec![b'a'; usize::try_from(MAX_PASSWD_BYTES).unwrap() + 1],
+            )
+            .unwrap();
+            let e = read_owner_name(&big, 1000).unwrap_err();
+            assert_eq!(e.message(), "the passwd database is unusable");
+            // ディレクトリは読めない（NotFound 以外の I/O 失敗）。
+            let e = read_owner_name(&d, 1000).unwrap_err();
+            assert_eq!(e.message(), "the passwd database is unusable");
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        #[test]
+        fn core6_probe_sub_id_file_cases() {
+            let d = tmp("sub");
+            let owner = SubIdOwner::new(1000, Some("alice".to_owned())).unwrap();
+            assert_eq!(
+                probe_sub_id_file(&d.join("none"), &owner),
+                SubIdFileProbe::Absent
+            );
+            let f = d.join("subuid");
+            std::fs::write(&f, "bob:100000:65536\n").unwrap();
+            assert_eq!(probe_sub_id_file(&f, &owner), SubIdFileProbe::NoOwnerRows);
+            std::fs::write(&f, "alice:100000:65536\n").unwrap();
+            assert_eq!(probe_sub_id_file(&f, &owner), SubIdFileProbe::Assigned);
+            std::fs::write(&f, "alice:bad\n").unwrap();
+            assert_eq!(probe_sub_id_file(&f, &owner), SubIdFileProbe::Unusable);
+            assert_eq!(probe_sub_id_file(&d, &owner), SubIdFileProbe::Unusable);
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 }

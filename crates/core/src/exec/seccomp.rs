@@ -23,7 +23,7 @@
 //! 本物の syscall は [`RealKernel`]（`sys` のラッパー）だけが呼ぶ。テストは偽の `SeccompKernel` で
 //! 呼び出し順・エラー写像を再現し、実 syscall は使い捨てスレッドで確認する。
 
-use super::seccomp_listener::{ACK_TIMEOUT, ListenerSender};
+use super::seccomp_listener::ListenerSender;
 use super::{ExecError, IsolationStage, ThreadCountSource};
 use crate::seccomp::SeccompProgram;
 use crate::sys::{self, SysError};
@@ -123,13 +123,20 @@ pub(crate) fn apply_default_seccomp() -> Result<SeccompReport, ExecError> {
 pub(crate) fn apply_default_seccomp_with_listener(
     sender: ListenerSender,
 ) -> Result<SeccompReport, ExecError> {
-    apply_default_seccomp_with_listener_threads(sender, &mut ThreadCountSource::ProcSelf)
+    apply_default_seccomp_with_listener_threads(
+        sender,
+        super::seccomp_listener::ACK_TIMEOUT,
+        &mut ThreadCountSource::ProcSelf,
+    )
 }
 
 /// [`apply_default_seccomp_with_listener`] のスレッド数取得元を差し替える版（exec の再適用用。SUP-6）。
 #[cfg_attr(test, allow(dead_code))]
+///
+/// `ack_timeout` は C の ACK を待つ上限（exec は全体の期限と `ACK_TIMEOUT` の短い方を渡す。REPAIR-5・#2385）。
 pub(crate) fn apply_default_seccomp_with_listener_threads(
     sender: ListenerSender,
+    ack_timeout: std::time::Duration,
     threads: &mut ThreadCountSource,
 ) -> Result<SeccompReport, ExecError> {
     let program = match build_default_program_with(sender.delivery()) {
@@ -147,7 +154,7 @@ pub(crate) fn apply_default_seccomp_with_listener_threads(
             .borrow_mut()
             .take()
         {
-            Some(sender) => sender.hand_over(fd, ACK_TIMEOUT),
+            Some(sender) => sender.hand_over(fd, ack_timeout),
             None => Err(ExecError::new(
                 ErrorCode::Internal,
                 IsolationStage::Seccomp,
@@ -337,7 +344,7 @@ impl ProbeOutcome {
 
 /// コンテナ内（組み込み `Seccomp` 段の通過後）で観測した禁止 syscall の遮断記録（CORE-5・TASK-38.4・#179）。
 ///
-/// [`spawn_container_seccomp_probe`](super::spawn_container_seccomp_probe) の子が `probe_denied_syscalls`
+/// exec 後のエントリポイント（`tests/seccomp.rs` の `/entry`）が `probe_denied_syscalls_for_test`
 /// で作り、pivot 後の `/seccomp-probe` へ `key=value` 行で書く。親（結合試験 `tests/seccomp.rs`）が
 /// [`SeccompProbeRecord::parse`] で読む。識別的な検査は `kcmp`・`seccomp_mode`、網羅確認は
 /// `mount`・`pivot_root`・`umount2`（capability 不足でも `EPERM` になり得る）。強制終了対象の
@@ -420,41 +427,6 @@ impl SeccompProbeRecord {
             umount2: ProbeOutcome::parse(get("umount2")?)?,
         })
     }
-}
-
-/// 組み込み `Seccomp` 段の通過後に禁止 syscall を呼んで遮断を記録する（CORE-5・TASK-38.4・#179）。
-///
-/// `process.rs::spawn_container_seccomp_probe` の子（コンテナの PID 1・pivot 済み）が、ステージ列の
-/// 終端として exec の代わりに呼ぶ。引数はいずれも副作用が出ないものに固定している（`sys` の各プローブの
-/// `// SAFETY:` 参照）。`seccomp_mode` を読めない場合は `Err`（fail-closed）。
-///
-/// # 将来仕様（記録のみ）
-///
-/// exec が許可されたら（証跡配線後。後続作業）、エントリポイント側のプローブ実行へ置き換える（REPAIR-3）。
-/// exec 後の PID 1 からは test 限定の [`probe_denied_syscalls_for_test`] 経由で呼べる（#2234）。
-pub(crate) fn probe_denied_syscalls() -> Result<SeccompProbeRecord, ExecError> {
-    let fail =
-        |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Seccomp, m.to_string());
-    let read_status = || std::fs::read_to_string("/proc/thread-self/status");
-    let status = read_status().map_err(|_| fail("failed to read thread status"))?;
-    let seccomp_mode = status
-        .lines()
-        .find_map(|l| l.strip_prefix("Seccomp:"))
-        .map(|v| v.trim().to_string())
-        .ok_or_else(|| fail("Seccomp field missing"))?;
-    // 対照: 禁止対象外の読み出しが成功すること。失敗は errno を伴わないので `Failed`。
-    let control = match read_status() {
-        Ok(_) => ProbeOutcome::Ok,
-        Err(_) => ProbeOutcome::Failed,
-    };
-    Ok(SeccompProbeRecord {
-        kcmp: ProbeOutcome::from_result(sys::kcmp_self_probe()),
-        seccomp_mode,
-        control,
-        mount: ProbeOutcome::from_result(sys::mount_root_private_recursive()),
-        pivot_root: ProbeOutcome::from_result(sys::pivot_root_dot()),
-        umount2: ProbeOutcome::from_result(sys::umount_cwd_detach()),
-    })
 }
 
 /// ESC-06 の攻撃クロージャが発行する禁止 syscall の種別（SEC-2・TASK-42.3・#201）。
@@ -563,16 +535,16 @@ pub fn probe_kcmp_self_for_test() -> ProbeOutcome {
     ProbeOutcome::from_result(sys::kcmp_self_probe())
 }
 
-/// exec 後のコンテナ PID 1 から [`probe_denied_syscalls`] を呼ぶ test 限定の入口（CORE-5・ESC-06・SEC-1・#2234）。
+/// exec 後のコンテナ PID 1（エントリポイント）から禁止 syscall を呼んで遮断を記録する test 限定の入口
+/// （CORE-5・ESC-06・SEC-1・REPAIR-3・#2234・#2386）。
 ///
-/// `tests/production_launcher.rs` のシナリオ J のプローブ（exec 後の PID 1）が呼び、`kcmp` の `EPERM` を識別的に
-/// 照合する。`probe_denied_syscalls` は `mount`・`pivot_root`・`umount2` も発行するため、[`escape_probe_mount`]
-/// と同じ前提検査で fail-closed にする。PID 1 かつ `Seccomp: 2` でなければ syscall を発行せず
-/// `FailedPrecondition` を返す（ホストの `/` の propagation を変えない）。新規 `unsafe`・新規 `sys` 宣言は無い。
-///
-/// # 将来仕様（記録のみ）
-///
-/// エントリポイント内のプローブへ置き換えて本関数を廃止する（REPAIR-3）。
+/// `tests/seccomp.rs` の `/entry`・`tests/production_launcher.rs` のシナリオ J のプローブ（exec 後の PID 1）が呼び、
+/// `kcmp` の `EPERM`・`Seccomp: 2`・対照の読み出し・`mount`・`pivot_root`・`umount2` の結果を
+/// [`SeccompProbeRecord`] にして返す。引数はいずれも副作用が出ないものに固定している（`sys` の各プローブの
+/// `// SAFETY:` 参照）。試験側は `unsafe` を書けないため、この安全な入口が exec 後のエントリポイントの
+/// プローブ本体になる。`mount`・`pivot_root`・`umount2` を発行するため、[`escape_probe_mount`] と同じ前提検査で
+/// fail-closed にする。PID 1 かつ `Seccomp: 2` でなければ syscall を発行せず `FailedPrecondition` を返す
+/// （ホストの `/` の propagation を変えない）。`Seccomp` 欄を読めない場合も `Err`。新規 `unsafe`・新規 `sys` 宣言は無い。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub fn probe_denied_syscalls_for_test() -> Result<SeccompProbeRecord, ExecError> {
@@ -584,7 +556,28 @@ pub fn probe_denied_syscalls_for_test() -> Result<SeccompProbeRecord, ExecError>
                 .to_string(),
         ));
     }
-    probe_denied_syscalls()
+    let fail =
+        |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Seccomp, m.to_string());
+    let read_status = || std::fs::read_to_string("/proc/thread-self/status");
+    let status = read_status().map_err(|_| fail("failed to read thread status"))?;
+    let seccomp_mode = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Seccomp:"))
+        .map(|v| v.trim().to_string())
+        .ok_or_else(|| fail("Seccomp field missing"))?;
+    // 対照: 禁止対象外の読み出しが成功すること。失敗は errno を伴わないので `Failed`。
+    let control = match read_status() {
+        Ok(_) => ProbeOutcome::Ok,
+        Err(_) => ProbeOutcome::Failed,
+    };
+    Ok(SeccompProbeRecord {
+        kcmp: ProbeOutcome::from_result(sys::kcmp_self_probe()),
+        seccomp_mode,
+        control,
+        mount: ProbeOutcome::from_result(sys::mount_root_private_recursive()),
+        pivot_root: ProbeOutcome::from_result(sys::pivot_root_dot()),
+        umount2: ProbeOutcome::from_result(sys::umount_cwd_detach()),
+    })
 }
 
 /// 単一スレッド条件を適用の前後で検査して [`apply_filter`] を呼ぶ。事前検査は副作用の前に行う。
@@ -1065,6 +1058,16 @@ pub(super) mod testing {
 
     /// `exec/reapply.rs` が `cfg(test)` で呼ぶ偽物（取得元は読まない）。
     pub(in crate::exec) fn apply_default_seccomp_with(
+        _threads: &mut ThreadCountSource,
+    ) -> Result<SeccompReport, ExecError> {
+        apply_default_seccomp()
+    }
+
+    /// `exec/reapply.rs` が `cfg(test)` で、送り手つきのときに呼ぶ偽物。送り手は使わず閉じるだけ（呼び出しは
+    /// `apply_default_seccomp_with` と同じ記録・失敗注入に従う）。
+    pub(in crate::exec) fn apply_default_seccomp_with_listener_threads(
+        _sender: crate::exec::seccomp_listener::ListenerSender,
+        _ack_timeout: std::time::Duration,
         _threads: &mut ThreadCountSource,
     ) -> Result<SeccompReport, ExecError> {
         apply_default_seccomp()

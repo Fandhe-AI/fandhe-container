@@ -180,7 +180,10 @@ pub use diagnostic::{
 };
 /// 封印した複製の上限（結合試験が上限超過を再現するための再公開。TASK-163 追補・#1531）。
 pub use entrypoint_mode::{EntrypointExecMode, IntegrityLsm, PathBoundLsm, SealedCopyUnavailable};
-pub use exec_command::{ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker};
+pub use exec_command::{
+    ExecChild, ExecWorkerProof, spawn_exec_command, spawn_exec_worker,
+    spawn_exec_worker_with_listener,
+};
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
 pub use landlock::launch_isolation_from_bundle;
 #[cfg(test)]
@@ -205,9 +208,6 @@ pub use launch_status::relay_mount_binds_failure_for_test;
 /// supervisor の `SETUP_VIOLATIONS` との突き合わせ試験専用の再公開（SEC-4・SUP-6・#1579。通常の利用者は呼ばない）。
 #[doc(hidden)]
 pub use process::exec_child_violation_reasons;
-/// 結合試験 `tests/seccomp.rs` 専用の再公開（CORE-5・TASK-38.4・#179。通常の利用者は呼ばない。詳細は定義側）。
-#[doc(hidden)]
-pub use process::spawn_container_seccomp_probe;
 /// 結合試験 `tests/fork_exec_isolation.rs` 専用の再公開（CORE-5・SEC-1・REPAIR-12・#1714。通常の利用者は呼ばない。詳細は定義側）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
@@ -289,10 +289,13 @@ pub use seccomp::{ProbeOutcome, SeccompProbeRecord};
 #[doc(hidden)]
 pub use seccomp::{probe_denied_syscalls_for_test, probe_kcmp_self_for_test};
 pub use seccomp_listener::{
-    DenyOutcome, ListenerReadiness, NotificationId, SeccompListener, SeccompNotification,
+    DenyOutcome, ExecListenerReceiver, ExecListenerSender, ListenerReadiness, ListenerReceipt,
+    NotificationId, SeccompListener, SeccompNotification,
 };
 #[cfg(feature = "exec-test-support")]
 pub use seccomp_listener::{UserNotifProbe, kcmp_self_errno_for_test, user_notif_probe_for_test};
+#[cfg(feature = "exec-test-support")]
+pub use seccomp_listener::{apply_exec_seccomp_listener_for_test, hand_over_non_listener_for_test};
 pub use setns::{JoinNamespace, NamespaceJoinReport, Pid1Target, join_namespaces};
 pub use stages::{StageHook, StageKind, StagePipeline, StageReport, StageStatus};
 pub use subreaper::ChildSubreaper;
@@ -1816,7 +1819,17 @@ fn rootless_handshake(
         if sys::new_session().is_err() {
             return EXIT_SETUP_FAILED;
         }
-        rootless::run_id_map_mapper(holder_pid, parent_pid, sock, &uid, &gid, &writer, timeout)
+        // 診断は fork 後の子の中で作った unbuffered の stderr へ出す(#2393。バッファ付きは `_exit` で失われる)。
+        rootless::run_id_map_mapper(
+            holder_pid,
+            parent_pid,
+            sock,
+            &uid,
+            &gid,
+            &writer,
+            timeout,
+            &mut std::io::stderr(),
+        )
     })?;
     *mapper = Some(ContainerChild::spawned(mapper_pid));
 

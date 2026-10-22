@@ -14,6 +14,11 @@
 //! - 値を持たない項目はキーを省略せず `null` を出す（`state.json` は `None` を書かない点との差。項目の
 //!   存在を機械照合できるようにするため）。
 //! - 出力は 1 個の JSON オブジェクト + 末尾 LF 1 個（1 行。改行は LF 固定）。キー順は固定。
+//! - `idMapping`（CORE-6・SEC-5・REPAIR-4・#2388）は launch が実際に使った ID 写像。記録が無ければ（旧 `state.json`・
+//!   `launchIsolation` なし）`null` で、「1 対 1」とは推測しない。あるときは
+//!   `{"model":"single"|"subordinate","uid":[{"containerId":N,"hostId":N,"size":N},...],"gid":[...]}`。
+//!   値は数値と固定語彙だけ（エスケープ不要）。行数は uid・gid とも最大 340 で出力は有界。`hostId` は記録値で、
+//!   権限判断・シグナル送信先に使わない（観測専用）。
 //! - `supervisorPid`・`pid` は記録値でありシグナル送信先・権限判断に使わない（SUP-5・SUP-8）。
 //! - Linux 以外では core が `Unimplemented` を返し、そのまま伝播する（CLI-1）。
 //! - 出力は有界: ID 255 バイト・bundle / cgroupScope 各 4096 バイト以下（core が検証）、
@@ -165,8 +170,41 @@ impl InspectReport {
         let _ = write!(s, ",\"restartCount\":{}", self.restart_count());
         s.push_str(",\"auditCoverage\":");
         self.push_audit_coverage(&mut s);
+        s.push_str(",\"idMapping\":");
+        self.push_id_mapping(&mut s);
         s.push('}');
         s
+    }
+
+    /// 選ばれた ID 写像のモデルと範囲（CORE-6・SEC-5・REPAIR-4・#2388）。記録が無ければ `null`。値はすべて数値と
+    /// core の固定語彙（エスケープ不要）。
+    fn push_id_mapping(&self, s: &mut String) {
+        use fandhe_container_core::launch_isolation::RecordedIdExtent;
+        let Some(m) = self.record.launch_isolation().and_then(|l| l.id_mapping()) else {
+            s.push_str("null");
+            return;
+        };
+        let extents = |s: &mut String, v: &[RecordedIdExtent]| {
+            s.push('[');
+            for (i, e) in v.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                let _ = write!(
+                    s,
+                    "{{\"containerId\":{},\"hostId\":{},\"size\":{}}}",
+                    e.container_id, e.host_id, e.size
+                );
+            }
+            s.push(']');
+        };
+        s.push_str("{\"model\":");
+        push_str_value(s, m.model().as_str());
+        s.push_str(",\"uid\":");
+        extents(s, m.uid());
+        s.push_str(",\"gid\":");
+        extents(s, m.gid());
+        s.push('}');
     }
 
     /// 監査の網羅（SEC-4・#2027）。launch が評価した方針とカーネル監査頼みの 2 層の状態。記録が無ければ `null`。
@@ -306,7 +344,7 @@ mod tests {
         .unwrap()
         .with_supervision(SupervisionState::new(nz(7), Some(HealthStatus::Healthy), 2));
         let expected = format!(
-            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2,\"auditCoverage\":null}}",
+            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2,\"auditCoverage\":null,\"idMapping\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -325,7 +363,7 @@ mod tests {
         )
         .unwrap();
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null}}",
+            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -348,7 +386,7 @@ mod tests {
             StateRevision::from_raw(2),
         ));
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null}}",
+            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(

@@ -137,3 +137,48 @@ fn sec5_idmap_oci_rejects_host_u32_max_unlike_core() {
         );
     }
 }
+
+/// `/proc/self/{uid,gid}_map` の解析（`parse_proc_id_map`）が core の `parse_id_map` と同じ入力で同じ受理 / 拒否・
+/// 同じ行を返す（OCI-2・SEC-5・#2382・REPAIR-12）。
+#[test]
+fn oci2_parse_proc_id_map_matches_core() {
+    use fandhe_container_core::rootless::parse_id_map;
+    use fandhe_container_oci::layer::idmap::parse_proc_id_map;
+
+    let many = |n: u32| -> String { (0..n).map(|i| format!("{i} {} 1\n", 1000 + i)).collect() };
+    let inputs: Vec<Vec<u8>> = vec![
+        b"".to_vec(),
+        b"         0       1000          1\n".to_vec(),
+        b"0 1000 1\n1 100000 65536\n".to_vec(),
+        b"0 1000 1".to_vec(),
+        b"\n  \n0 1 1\n".to_vec(),
+        b"0 1000\n".to_vec(),
+        b"0 1000 1 9\n".to_vec(),
+        b"a b c\n".to_vec(),
+        b"0 1000 4294967296\n".to_vec(),
+        b"-1 0 1\n".to_vec(),
+        b"\xff\xfe\n".to_vec(),
+        many(340).into_bytes(),
+        many(341).into_bytes(),
+    ];
+    let (mut ok, mut ng) = (0, 0);
+    for (i, input) in inputs.iter().enumerate() {
+        match (parse_id_map(input), parse_proc_id_map(input)) {
+            (Ok(c), Ok(o)) => {
+                ok += 1;
+                let c: Vec<(u32, u32, u32)> = c
+                    .iter()
+                    .map(|m| (m.container_id, m.host_id, m.count))
+                    .collect();
+                let o: Vec<(u32, u32, u32)> = o
+                    .iter()
+                    .map(|m| (m.container_id, m.host_id, m.count))
+                    .collect();
+                assert_eq!(c, o, "case {i}");
+            }
+            (Err(_), Err(_)) => ng += 1,
+            (c, o) => panic!("case {i}: core={c:?} oci={o:?}"),
+        }
+    }
+    assert_eq!((ok, ng), (6, 7));
+}

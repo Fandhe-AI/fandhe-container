@@ -70,7 +70,7 @@ pub mod exec;
 pub mod health;
 pub mod healthcheck;
 #[cfg(any(target_os = "linux", test))]
-mod id_model;
+pub mod id_model;
 pub mod inspect;
 pub mod launcher;
 pub mod log_pipeline;
@@ -87,5 +87,6 @@ pub mod stderr_sink;
 pub mod supervisor_log;
 #[cfg(any(windows, target_os = "linux"))]
 mod sys;
+pub mod user_db;
 #[cfg(target_os = "linux")]
 pub mod user_scope;

@@ -40,6 +40,10 @@
 //!   `spawn_exec_worker` の worker の中でしか得られない証跡 `ExecWorkerProof` を要求する（常駐側から呼べない。#1532）。順序の全体:
 //!   `identify_pid1` → `prepare_cgroup_join` → 子 cgroup の作成 → `prepare_restrictions` → `enter_namespaces` → `join_cgroup` →
 //!   `reapply_restrictions` → `require_exec_ready` → `spawn_exec_command`
+//!   （seccomp の listener の受け渡し・SEC-4・SUP-6・#2385: `reapply_restrictions` の最後の seccomp の段で、worker が
+//!   `NEW_LISTENER` 付きの filter を載せて listener を親へ渡し ACK を待つ。親は worker の終了を待つ **前** に受信・検証して
+//!   ACK を返す〔`ExecOutcome::seccomp_listener` が証跡〕。失敗・不着・ACK 無しの成功は fail-closed で exec を拒否する。
+//!   filter は ERRNO 版のままで通知は出ない。exec での USER_NOTIF 化と応答者は #2385 の後続で、**未実装**）
 //! - 再適用は、参加後の自プロセスの `/` が **launch 時に記録したコンテナの `/`**（[`identify_pid1`] に渡した記録の
 //!   `launch_isolation` の `st_dev`・`st_ino`。ホスト側の bundle ディレクトリではなく launch の pivot 後の `/`）
 //!   であることを照合してから適用する。不一致（pivot していない対象・`/` へ別のマウントが重ねられた対象・restart で
@@ -270,14 +274,14 @@ use fandhe_container_core::exec::{
     ChildExit, ContainerEnv, DiagnosticDelivery, ENTRYPOINT_MAX_ARGS, ENTRYPOINT_MAX_ENV,
     ENTRYPOINT_MAX_STRING_BYTES, ENTRYPOINT_MAX_TOTAL_BYTES, EntrypointExecMode, ExecCgroupJoin,
     ExecCgroupJoinReport, ExecCgroupName, ExecCgroupSweep, ExecChildCgroup, ExecCommand, ExecError,
-    ExecExit, ExecReady, ExecRestrictionReport, ExecRestrictions, ExecWorkerProof,
-    NamespaceJoinReport, Pid1Target, SealedCopyUnavailable, SupplementaryGroups, ViolationReason,
-    emit_diagnostic_line_to, join_cgroup as core_join_cgroup, join_namespaces,
-    prepare_cgroup_join as core_prepare_cgroup_join,
+    ExecExit, ExecListenerSender, ExecReady, ExecRestrictionReport, ExecRestrictions,
+    ExecWorkerProof, ListenerReceipt, NamespaceJoinReport, Pid1Target, SealedCopyUnavailable,
+    SupplementaryGroups, ViolationReason, emit_diagnostic_line_to, join_cgroup as core_join_cgroup,
+    join_namespaces, prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions, record_entrypoint_rejection,
     record_exec_worker_rejection, remove_exec_child_cgroup, spawn_exec_command, spawn_exec_worker,
-    sweep_stale_exec_child_cgroups,
+    spawn_exec_worker_with_listener, sweep_stale_exec_child_cgroups,
 };
 use fandhe_container_core::launch_isolation::LaunchIsolationRecord;
 use fandhe_container_core::oci_runtime::{
@@ -682,6 +686,22 @@ pub struct ExecOutcome {
     /// exec 開始時に行った、残った `exec-*` 子 cgroup の掃除の結果（#1596・SUP-6）。呼び出しプロセスが worker の
     /// 結果を受けた後で載せる値で、worker の結果行には含まれない。掃除を行わなかった場合は既定値（未実施）。
     pub stale_exec_cgroups: ExecCgroupSweep,
+    /// worker が seccomp の listener を親へ渡し、親が検証して ACK を返したか（SEC-4・SUP-6・#2385。監査配送の受け渡しの
+    /// 証跡）。本番の通しの入口（[`run_command_with_pidfd`]）の成功結果は常に `Verified`（受け渡しに失敗すれば exec は
+    /// 拒否され、成功結果に至らない）。worker の結果行には含まれず、親が載せる。
+    pub seccomp_listener: ExecListenerHandover,
+}
+
+/// [`ExecOutcome::seccomp_listener`] の値（将来拡張できる構造。REPAIR-3）。
+///
+/// `Copy` の証跡で、listener そのもの（`SeccompListener` は `Clone` を持たない）は載せない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExecListenerHandover {
+    /// 受け渡しの対象外の経路（試験専用の入口・worker の結果行の復号直後の既定値）。
+    NotApplicable,
+    /// 検証済みの listener を受け取り、ACK を返した（filter の届け方は ERRNO 版のまま。応答者は後続。#2385）。
+    Verified,
 }
 
 /// [`run_command_with_pidfd`] 系の成功側の戻り値: コマンドの結果と、`execve` 前の拒否の監査記録の結果（SEC-4・SUP-6・#1595）。
@@ -762,9 +782,9 @@ pub fn run_command(
         deadline,
         || create_child_cgroup(record, &name),
         || cleanup_child_cgroup(record, &name),
-        |proof, child| {
+        |proof, child, sender| {
             let target = identify_pid1(record)?;
-            run_with_target(proof, &target, request, deadline, child)
+            run_with_target(proof, &target, request, deadline, child, sender)
         },
     );
     audit_worker_result(
@@ -894,9 +914,9 @@ pub fn run_command_with_pidfd(
         deadline,
         || create_child_cgroup(record, &name),
         || cleanup_child_cgroup(record, &name),
-        |proof, child| {
+        |proof, child, sender| {
             let target = identify_pid1_with_pidfd(record, pidfd)?;
-            run_with_target(proof, &target, request, deadline, child)
+            run_with_target(proof, &target, request, deadline, child, sender)
         },
     );
     audit_worker_result(
@@ -939,9 +959,9 @@ pub fn run_command_in(
             .map(|_| ())
             .map_err(from_exec_error)
         },
-        |proof, child| {
+        |proof, child, sender| {
             let target = identify_pid1_in(record, expected_cgroup_path)?;
-            run_with_target(proof, &target, request, deadline, child)
+            run_with_target(proof, &target, request, deadline, child, sender)
         },
     );
     audit_worker_result(
@@ -1052,16 +1072,29 @@ const WORKER_RESULT_MAX: u64 = 4096;
 /// 読まなくても worker の `write_all` が詰まらないようにする。`WORKER_RESULT_MAX` 以下であること。
 const WORKER_LINE_MAX: usize = 2048;
 
+/// worker へ seccomp の listener の受け渡し口を張るか（SEC-4・SUP-6・#2385）。真偽値にせず、意味を型で示す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListenerPolicy {
+    /// 本番: worker は listener を親へ渡して ACK を受けるまでコマンドを起動できない。受け渡しに失敗すれば exec を拒否する。
+    Required,
+    /// 受け渡しの対象外（試験専用の入口。worker の機構だけを任意の処理で確かめる）。
+    None,
+}
+
 /// `work` を worker プロセスで実行し、`deadline + grace` までに終わらなければ worker を `SIGKILL` して回収し
 /// `Timeout` を返す（REPAIR-5・SUP-6・TASK-163.4）。契約はモジュール doc「全体の上限時間」。
 ///
 /// 呼び出しプロセスは単一スレッドであること（満たさなければ core が fork せず拒否する）。`work` は fork した
-/// 子で実行され、結果は pipe の 1 行（[`encode_worker_result`]）で返る。
+/// 子で実行され、結果は pipe の 1 行（[`encode_worker_result`]）で返る。`listener` が `Required` のとき、`work` は
+/// listener の送信口を受け取り、親は worker の終了を待つ **前** に listener を期限つきで受信・検証して ACK を返す
+/// （`work` が ACK を待つため、先に終了を待つと相互待ちになる）。受け渡しの結果ごとの扱いは
+/// [`reject_unacknowledged_exit`]・[`listener_failure`]。
 fn run_in_worker_with(
     deadline: Deadline,
     grace: Duration,
     cleanup: impl FnOnce() -> Result<(), TraitError>,
-    work: impl FnOnce(&ExecWorkerProof) -> Result<ExecOutcome, TraitError>,
+    listener: ListenerPolicy,
+    work: impl FnOnce(&ExecWorkerProof, Option<ExecListenerSender>) -> Result<ExecOutcome, TraitError>,
 ) -> Result<ExecOutcome, WorkerFailure> {
     // fork 前に期限を確かめる（切れていれば worker を作らない。fork 後の早期 return で worker を残さないため）。
     deadline.remaining("starting the exec worker")?;
@@ -1071,19 +1104,70 @@ fn run_in_worker_with(
             format!("exec stage Spawn: pipe failed: {}", e.kind()),
         )
     })?;
-    let child = spawn_exec_worker(|proof| {
-        let line = encode_worker_result(&work(&proof));
+    let body = |proof: ExecWorkerProof, sender: Option<ExecListenerSender>| {
+        let line = encode_worker_result(&work(&proof, sender));
         // 書けなければ親は「結果なし」として失敗扱いにする（fail-closed）。
         let _ = (&writer).write_all(&line);
         0
-    })
-    .map_err(from_exec_error)?;
+    };
+    let (child, receiver) = match listener {
+        ListenerPolicy::Required => {
+            let (child, receiver) =
+                spawn_exec_worker_with_listener(|proof, sender| body(proof, Some(sender)))
+                    .map_err(from_exec_error)?;
+            (child, Some(receiver))
+        }
+        ListenerPolicy::None => (
+            spawn_exec_worker(|proof| body(proof, None)).map_err(from_exec_error)?,
+            None,
+        ),
+    };
     // 親は書き込み側を閉じる（worker の終了後に読み取りが EOF で終わるようにする）。
     drop(writer);
     // worker を fork した後は、結果の取得がどう終わっても（正常・期限切れ・異常終了・結果行の不正）worker の
     // 停止・回収の後に exec 用の子 cgroup の後始末を必ず行う（cgroup は呼び出しプロセスが fork 前に作って
     // 所有しており、削除は制限の掛かっていないここでしかできない。作成できなかった場合は呼ばれない。#1466）。
-    let result = collect_worker_result(&child, &mut reader, deadline, grace);
+    let result = match receiver {
+        None => collect_worker_result(&child, &mut reader, deadline, grace),
+        Some(receiver) => match receiver.receive(&child, deadline.at) {
+            // 受け取った listener は worker の回収が済むまで保持する（先に閉じると、後続で通知を載せたとき
+            // worker の拒否された syscall が `ENOSYS` になる）。
+            ListenerReceipt::Received(listener) => {
+                let collected = collect_worker_result(&child, &mut reader, deadline, grace);
+                drop(listener);
+                collected.map(|mut outcome| {
+                    outcome.seccomp_listener = ExecListenerHandover::Verified;
+                    outcome
+                })
+            }
+            ListenerReceipt::SenderClosed => reject_unacknowledged_exit(collect_worker_result(
+                &child,
+                &mut reader,
+                deadline,
+                grace,
+            )),
+            ListenerReceipt::Rejected(e) | ListenerReceipt::TimedOut(e) => {
+                // worker は ACK を待っている（または止まっている）。待たずに止めて回収し、受け渡しの失敗を優先する。
+                let reaped = child
+                    .kill_and_reap(LISTENER_REAP_TIMEOUT)
+                    .map_err(from_exec_error);
+                Err(listener_failure(from_exec_error(e), reaped))
+            }
+            // `ListenerReceipt` は将来拡張される。未知の結果は受け渡しを確認できないものとして拒否する（fail-closed）。
+            _ => {
+                let reaped = child
+                    .kill_and_reap(LISTENER_REAP_TIMEOUT)
+                    .map_err(from_exec_error);
+                Err(listener_failure(
+                    TraitError::new(
+                        ErrorCode::Internal,
+                        "exec stage Seccomp: the seccomp listener handover ended in an unknown state",
+                    ),
+                    reaped,
+                ))
+            }
+        },
+    };
     let cleaned = cleanup();
     match (result, cleaned) {
         (Ok(outcome), Ok(())) => Ok(outcome),
@@ -1100,6 +1184,47 @@ fn run_in_worker_with(
             ),
             violation: err.violation,
         }),
+    }
+}
+
+/// listener の受け渡しの失敗で worker を止めて回収するときの回収待ちの上限（REPAIR-5）。
+const LISTENER_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// worker が何も渡さずに終わった（`SenderClosed`）ときの結果の合成（SEC-4・SUP-6・#2385）。
+///
+/// - worker が失敗を返した（seccomp の段より前の拒否・違反）: その失敗をそのまま返す（違反の理由と監査の 1 件を保つ）
+/// - worker が成功を返した: ACK を受けずに exec へ進んだことになるため、`Internal`（段 `Seccomp`）で拒否する（fail-closed）
+fn reject_unacknowledged_exit(
+    collected: Result<ExecOutcome, WorkerFailure>,
+) -> Result<ExecOutcome, WorkerFailure> {
+    match collected {
+        Err(failure) => Err(failure),
+        Ok(_) => Err(TraitError::new(
+            ErrorCode::Internal,
+            "exec stage Seccomp: the exec worker finished without handing over the seccomp listener",
+        )
+        .into()),
+    }
+}
+
+/// 受け渡しの拒否・期限切れ（`Rejected`・`TimedOut`）の結果の合成。`reaped` は worker を止めて回収した結果で、
+/// 失敗していれば既存の "cleanup also failed" の形でメッセージへ添える（黙って捨てない）。違反の理由は持たない
+/// （監査の対象になる拒否は worker の経路のもの）。
+fn listener_failure(error: TraitError, reaped: Result<ChildExit, TraitError>) -> WorkerFailure {
+    let error = match reaped {
+        Ok(_) => error,
+        Err(reap_err) => TraitError::new(
+            error.code(),
+            format!(
+                "{}; cleanup also failed: {}",
+                error.message(),
+                reap_err.message()
+            ),
+        ),
+    };
+    WorkerFailure {
+        error,
+        violation: None,
     }
 }
 
@@ -1161,7 +1286,11 @@ fn run_owning_child_cgroup(
     deadline: Deadline,
     create: impl FnOnce() -> Result<Option<ExecChildCgroup>, TraitError>,
     remove: impl Fn() -> Result<(), TraitError>,
-    work: impl FnOnce(&ExecWorkerProof, Option<&ExecChildCgroup>) -> Result<ExecOutcome, TraitError>,
+    work: impl FnOnce(
+        &ExecWorkerProof,
+        Option<&ExecChildCgroup>,
+        ExecListenerSender,
+    ) -> Result<ExecOutcome, TraitError>,
 ) -> Result<ExecOutcome, WorkerFailure> {
     let child = create()?;
     let owned = child.is_some();
@@ -1173,7 +1302,15 @@ fn run_owning_child_cgroup(
             cleanup_ran.set(true);
             if owned { remove() } else { Ok(()) }
         },
-        |proof| work(proof, child.as_ref()),
+        ListenerPolicy::Required,
+        |proof, sender| match sender {
+            Some(sender) => work(proof, child.as_ref(), sender),
+            // `Required` では必ず `Some`。無ければ fail-closed（listener 無しで進まない）。
+            None => Err(TraitError::new(
+                ErrorCode::Internal,
+                "exec stage Seccomp: the seccomp listener channel was not provided",
+            )),
+        },
     );
     let mut result = result;
     if owned && !cleanup_ran.get() {
@@ -1262,7 +1399,72 @@ pub fn run_in_worker_for_test(
     cleanup: impl FnOnce() -> Result<(), TraitError>,
     work: impl FnOnce() -> Result<ExecOutcome, TraitError>,
 ) -> Result<ExecOutcome, TraitError> {
-    run_in_worker_with(Deadline::after(timeout), grace, cleanup, |_| work()).map_err(|f| f.error)
+    run_in_worker_with(
+        Deadline::after(timeout),
+        grace,
+        cleanup,
+        ListenerPolicy::None,
+        |_, _| work(),
+    )
+    .map_err(|f| f.error)
+}
+
+/// 結合試験専用の入口: 本番と同じ worker・listener の受け渡し（`ListenerPolicy::Required`）で `work` を実行する
+/// （SEC-4・SUP-6・#2385。`tests/exec_seccomp_listener.rs`）。
+///
+/// `work` は listener の送信口を受け取る。`Ok(())` を返したとき、worker の結果は固定の見本（コマンドが起動して 0 で終了した
+/// 結果）になる。親は本番と同じく worker の終了を待つ前に受信し、結果を合成する。`exec-test-support` feature を付けた
+/// ビルドにだけ存在する。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn run_in_worker_with_listener_for_test(
+    timeout: Duration,
+    grace: Duration,
+    cleanup: impl FnOnce() -> Result<(), TraitError>,
+    work: impl FnOnce(ExecListenerSender) -> Result<(), TraitError>,
+) -> Result<ExecOutcome, TraitError> {
+    run_in_worker_with(
+        Deadline::after(timeout),
+        grace,
+        cleanup,
+        ListenerPolicy::Required,
+        |_, sender| {
+            let sender = sender.ok_or_else(|| {
+                TraitError::new(ErrorCode::Internal, "the listener channel was not provided")
+            })?;
+            work(sender)?;
+            decode_worker_result(
+                b"ok command - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
+            )
+            .map_err(|f| f.error)
+        },
+    )
+    .map_err(|f| f.error)
+}
+
+/// 結合試験専用: worker の中で本番と同じ listener 付きの seccomp 適用を行い、受け渡しの後に socket fd が残っていないこと
+/// （listener の受け渡しに使った socket が worker に漏れていない）まで確かめる（SEC-4・SUP-6・#2385）。
+/// worker に seccomp の filter が不可逆に載るため、[`run_in_worker_with_listener_for_test`] の `work` 専用。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn apply_seccomp_listener_for_test(sender: ExecListenerSender) -> Result<(), TraitError> {
+    let open_sockets = fandhe_container_core::exec::apply_exec_seccomp_listener_for_test(sender)
+        .map_err(from_exec_error)?;
+    if open_sockets == 0 {
+        Ok(())
+    } else {
+        Err(TraitError::new(
+            ErrorCode::Internal,
+            format!("exec stage Seccomp: {open_sockets} socket fd(s) remained open in the worker"),
+        ))
+    }
+}
+
+/// 結合試験専用: listener ではない fd を親へ送る（親の拒否を確かめる）。常に `Err`（親が拒否して閉じた）が期待どおり。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn hand_over_non_listener_for_test(sender: ExecListenerSender) -> Result<(), TraitError> {
+    fandhe_container_core::exec::hand_over_non_listener_for_test(sender).map_err(from_exec_error)
 }
 
 /// 結合試験専用の入口: `work` を本番と同じ worker（fork・結果行の pipe・期限）で実行し、親側の記録点
@@ -1284,7 +1486,8 @@ pub fn run_in_worker_audited_for_test(
         Deadline::after(timeout),
         WORKER_GRACE,
         || Ok(()),
-        |_| work().map_err(from_exec_error),
+        ListenerPolicy::None,
+        |_, _| work().map_err(from_exec_error),
     );
     audit_worker_result(result, container, audit)
 }
@@ -1303,7 +1506,8 @@ pub fn run_in_worker_trait_audited_for_test(
         Deadline::after(timeout),
         WORKER_GRACE,
         || Ok(()),
-        |_| work(),
+        ListenerPolicy::None,
+        |_, _| work(),
     );
     audit_worker_result(result, container, audit)
 }
@@ -1527,6 +1731,7 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         supplementary_groups,
         entrypoint_mode,
         stale_exec_cgroups: ExecCgroupSweep::default(),
+        seccomp_listener: ExecListenerHandover::NotApplicable,
     })
 }
 
@@ -1537,6 +1742,7 @@ fn run_with_target(
     request: &ExecRequest,
     deadline: Deadline,
     child_cgroup: Option<&ExecChildCgroup>,
+    listener: ExecListenerSender,
 ) -> Result<ExecOutcome, TraitError> {
     // コマンドだけを入れる子 cgroup は、呼び出しプロセスが fork 前に作って所有する（worker は fd を継承して使う。
     // 同名の既存を後始末で止めないため。#1466）。配置の記録が無ければ `identify_pid1` が先に拒否しここへ来ない。
@@ -1547,7 +1753,15 @@ fn run_with_target(
         )
     })?;
     let cgroup = prepare_cgroup_join(target)?;
-    let result = run_in_child_cgroup(proof, target, request, deadline, cgroup, child_cgroup);
+    let result = run_in_child_cgroup(
+        proof,
+        target,
+        request,
+        deadline,
+        cgroup,
+        child_cgroup,
+        listener,
+    );
     // 成否によらず、コマンドの子孫を子 cgroup ごと止める（exec の終了後に子孫を残さない。削除は呼び出しプロセスが行う）。
     // 失敗しても呼び出しプロセスの後始末が改めて `cgroup.kill` する。
     let _ = child_cgroup.kill_all();
@@ -1562,6 +1776,7 @@ fn run_in_child_cgroup(
     deadline: Deadline,
     cgroup: ExecCgroupJoin,
     child_cgroup: &ExecChildCgroup,
+    listener: ExecListenerSender,
 ) -> Result<ExecOutcome, TraitError> {
     // `config.json` は 1 回だけ読み、制限の準備とコマンドの環境の両方に使う（同じ定義から導く）。
     let (config, rootfs) = load_exec_bundle(&target.bundle)?;
@@ -1575,7 +1790,9 @@ fn run_in_child_cgroup(
         &target.rlimits,
         &target.launch_isolation,
     )
-    .map_err(from_exec_error)?;
+    .map_err(from_exec_error)?
+    // listener の送り手を付ける。ACK 待ちは全体の期限までに縛る（REPAIR-5）。親は worker の終了を待つ前に受信する。
+    .with_seccomp_listener(listener.with_ack_deadline(deadline.at));
     // 方式の切り替えを黙って行わない（オーナー判断 2026-10-09・#1531・REPAIR-4）。判定の直後に 1 回だけ出す。
     let entrypoint_mode = restrictions.entrypoint_mode();
     // 送信は待たない best-effort で結果は捨てる（#1698）。縮退の事実の確かな観測口は `ExecOutcome::entrypoint_mode`。
@@ -1629,6 +1846,7 @@ fn run_in_child_cgroup(
         supplementary_groups,
         entrypoint_mode,
         stale_exec_cgroups: ExecCgroupSweep::default(),
+        seccomp_listener: ExecListenerHandover::NotApplicable,
     })
 }
 
@@ -2407,6 +2625,7 @@ mod tests {
             supplementary_groups: SupplementaryGroups::Cleared { cleared: 4 },
             entrypoint_mode: EntrypointExecMode::SealedCopy,
             stale_exec_cgroups: ExecCgroupSweep::default(),
+            seccomp_listener: ExecListenerHandover::NotApplicable,
         };
         let line = encode_worker_result(&Ok(outcome));
         assert_eq!(
@@ -2448,6 +2667,7 @@ mod tests {
             let outcome = ExecOutcome {
                 entrypoint_mode: EntrypointExecMode::PinnedInode { reason },
                 stale_exec_cgroups: ExecCgroupSweep::default(),
+                seccomp_listener: ExecListenerHandover::NotApplicable,
                 ..outcome
             };
             let line = encode_worker_result(&Ok(outcome));
@@ -2649,7 +2869,8 @@ mod tests {
             Deadline::after(Duration::ZERO),
             Duration::from_secs(1),
             || panic!("cleanup must not run when no worker was forked"),
-            |_| panic!("work must not run when the deadline has expired"),
+            ListenerPolicy::Required,
+            |_, _| panic!("work must not run when the deadline has expired"),
         )
         .unwrap_err()
         .error;
@@ -2668,10 +2889,67 @@ mod tests {
             Deadline::after(Duration::from_secs(5)),
             || Err(TraitError::new(ErrorCode::AlreadyExists, "exists")),
             || panic!("cleanup must not run for a cgroup we did not create"),
-            |_, _| panic!("worker must not run"),
+            |_, _, _| panic!("worker must not run"),
         )
         .unwrap_err();
         assert_eq!(err.error.code(), ErrorCode::AlreadyExists);
+    }
+
+    fn sample_outcome() -> ExecOutcome {
+        decode_worker_result(b"ok command - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n")
+            .expect("decode")
+    }
+
+    /// SEC-4・SUP-6（#2385）: worker の結果行の復号直後は受け渡しの証跡を持たない（親が受信の結果として載せる）。
+    #[test]
+    fn sec4_sup6_2385_decoded_outcome_has_no_handover_evidence() {
+        assert_eq!(
+            sample_outcome().seccomp_listener,
+            ExecListenerHandover::NotApplicable
+        );
+    }
+
+    /// SEC-4・SUP-6（#2385）: 何も渡さずに worker が終わったとき、worker の失敗（違反つき）はそのまま返り、
+    /// 成功は ACK 無しで進んだものとして `Internal` で拒否される。
+    #[test]
+    fn sec4_sup6_2385_sender_closed_keeps_worker_failure_and_rejects_success() {
+        let reason = ViolationReason::ExecTargetNotNestedPid1;
+        let failure = WorkerFailure {
+            error: TraitError::new(ErrorCode::FailedPrecondition, "exec stage Validate: boom"),
+            violation: Some(reason),
+        };
+        let got = reject_unacknowledged_exit(Err(failure)).unwrap_err();
+        assert_eq!(got.error.code(), ErrorCode::FailedPrecondition);
+        assert_eq!(got.error.message(), "exec stage Validate: boom");
+        assert_eq!(got.violation, Some(reason));
+
+        let got = reject_unacknowledged_exit(Ok(sample_outcome())).unwrap_err();
+        assert_eq!(got.error.code(), ErrorCode::Internal);
+        assert_eq!(
+            got.error.message(),
+            "exec stage Seccomp: the exec worker finished without handing over the seccomp listener"
+        );
+        assert!(got.violation.is_none());
+    }
+
+    /// SEC-4・SUP-6（#2385）: 受け渡しの拒否・期限切れは受け渡し側の code・段を保ち、回収の失敗は添えるだけで隠さない。
+    #[test]
+    fn sec4_sup6_2385_listener_failure_keeps_code_and_appends_reap_failure() {
+        let base = || TraitError::new(ErrorCode::Timeout, "exec stage Seccomp: not delivered");
+        let got = listener_failure(base(), Ok(ChildExit::Signaled(9)));
+        assert_eq!(got.error.code(), ErrorCode::Timeout);
+        assert_eq!(got.error.message(), "exec stage Seccomp: not delivered");
+        assert!(got.violation.is_none());
+
+        let got = listener_failure(
+            base(),
+            Err(TraitError::new(ErrorCode::Internal, "reap failed")),
+        );
+        assert_eq!(got.error.code(), ErrorCode::Timeout);
+        assert_eq!(
+            got.error.message(),
+            "exec stage Seccomp: not delivered; cleanup also failed: reap failed"
+        );
     }
 
     #[test]
@@ -2874,6 +3152,7 @@ mod tests {
             supplementary_groups: SupplementaryGroups::Cleared { cleared: 0 },
             entrypoint_mode: EntrypointExecMode::SealedCopy,
             stale_exec_cgroups: ExecCgroupSweep::default(),
+            seccomp_listener: ExecListenerHandover::NotApplicable,
         }
     }
 

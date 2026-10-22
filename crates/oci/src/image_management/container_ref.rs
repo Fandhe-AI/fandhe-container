@@ -35,7 +35,7 @@
 //! ディスクの内容に揃い、誤りは「余分に残す」側（未確定の参照が残る・外れているのに解除がエラー）に限り、
 //! 世代は再発行しない。永続化されるのはこれらの入口を通った変更だけで、ガードから
 //! `ReferenceTable::register_container` 等を直接呼んだ変更は保存されない（ファイルがあれば次の排他取得で
-//! 上書きされる。試験と `with_table` の種入れ用の口）。manifest・タグ・リースは永続化しない（#851）。
+//! 上書きされる。試験と `with_table` の種入れ用の口）。manifest・タグ・リースは別ファイル `@image-inventory.json` に永続化する（#2380。`inventory_persist`）。
 //!
 //! 排他の取得は `AcquireImageStoreLock` として記録済みなので、ここでは別の操作種別を増やさない。
 
@@ -224,6 +224,11 @@ mod tests {
             std::env::temp_dir().join(format!("fandhe-oci-cref-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
         let store = ImageStore::open(&dir)
             .expect("open")
             .with_timeout(Duration::from_millis(200));

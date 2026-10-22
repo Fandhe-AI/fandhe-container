@@ -11,8 +11,8 @@
 //! 未実装・簡易実装（REPAIR-3）:
 //! - `--image-root <abs> --image <sha256:digest>` つきの `create` は core の `create_with_image` を呼び、イメージ参照（OCI-7）を
 //!   `image_refs::StoreImageRefs` で登録・確定する（#2315）。レイヤーの展開はしない（本番の展開器は #2377。bundle の rootfs は展開済みの前提）。
-//!   manifest の在庫は永続化されていない（#2380）ため、新しい CLI プロセスのストアでは `register` が常に `NOT_FOUND` になり、本番では
-//!   イメージつき create は在庫の永続化まで成功しない。タグ参照の解決もしない（digest のみ）。
+//!   manifest の在庫は永続化済み（#2380）だが、本番で在庫を埋める経路（pull → `ImageStore` の配線）が未実装のため、`register` は
+//!   常に `NOT_FOUND` になり、本番ではイメージつき create はその配線まで成功しない。タグ参照の解決もしない（digest のみ）。
 //! - 本番入口の `start` は、状態ストアで ID の存在を確かめた後、CLI の実体と同じディレクトリの
 //!   `fandhe-container-supervisor` を起動して結果を受け取る（`supervisor_start` module の doc に契約・期限・
 //!   未実装範囲を書く）。supervisor が core の本番 launcher（#1715・#1819）で起動し、Running の記録は supervisor が行う

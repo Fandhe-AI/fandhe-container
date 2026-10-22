@@ -52,8 +52,10 @@
 //! 展開物の所有者は、既定では実行ユーザーのままで、`OwnershipPolicy::ChownMapped` と複数行の写像 `IdMap` を渡すと
 //! tar の uid / gid を写像してホストの ID へ `chown` する（Linux のみ。権限の主体と順序は `layer::extract` のモジュール
 //! doc を参照）。`SpecialBitsPolicy::PreserveIfChowned` は rootful（ホスト root）で `chown` 後の所有者が写像と一致する
-//! ファイルだけ特殊ビットを残す（SEC-5・SEC-1・#2225）。
-//! 未実装: ディレクトリ fd 起点の解決（TOCTOU 対策）、rootless で写像済みの user namespace の中から展開する経路、
+//! ファイルだけ特殊ビットを残す（SEC-5・SEC-1・#2225）。`OwnershipPolicy::ChownInUserNamespace` は rootless で、
+//! コンテナと同じ写像の user namespace の中から tar のコンテナ内 ID をそのまま `chown` する（`/proc/self` で開始前に
+//! 検証する。OCI-2・SEC-5・#2382）。
+//! 未実装: ディレクトリ fd 起点の解決（TOCTOU 対策）、rootless の user namespace へ入って展開器を呼ぶ core 側の配線（#2315）、
 //! 0700 の祖先ディレクトリで閉じ込めを判定する方式（複数範囲の写像でコンテナ内の非 root が `/` を辿れるようにするため。
 //! 現状は `root` が 0700 で、コンテナ root だけが辿れる）、綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する
 //! 別表記は衝突として扱わない。IO-5）。
@@ -63,6 +65,7 @@
 //! 実装済み: ローカルイメージ管理の参照テーブルのデータ構造と登録・解除・カウント API（TASK-183.1・OCI-7・MS-4・#472。
 //! `image_management`）と、ストア単位の排他区間（TASK-183.2・OCI-7・#473。`image_management::ImageStore`）。`image ls`/`system df` の集計 API（TASK-183.3・#478）と `image rm`（既定・`--force`・実削除。TASK-183.5/183.6・#480/#481）と `image tag` の API（TASK-183.4・#479）も実装済み。`image prune` の本体（無参照イメージ・レイヤーの回収。TASK-183.7・#476。`image_management::ReferenceTable::execute_image_prune`）も実装済み。 pull のリース登録とステージング書き込み（TASK-183.9・#474。`image_management::PullSession`）も実装済み。pull の公開と失敗時のロールバック（TASK-183.10・#475。`PullSession::publish` / `abort`）も実装済み（cri からの配線は未実装）。クラッシュで残った pull のリース・ステージングの回収 GC（TASK-183.11.2・#852。`ImageStore::recover_stale_pulls`）も実装済み（起動時の配線は未実装）。
 //! 永続化・GC・`image rm`/`tag`/`prune` の CLI 経路は未実装。
+//! `sys` は unix の `geteuid(2)` の薄いラッパーのみ（イメージストア root の所有者検査用。OCI-7・SEC-1・#2381）。
 //! PLUG-1 区分は core（crate-naming.md）。
 
 pub mod auth;
@@ -74,5 +77,7 @@ pub mod layer;
 pub mod manifest;
 pub mod reference;
 pub mod registry;
+#[cfg(unix)]
+mod sys;
 mod tls;
 mod whiteout;

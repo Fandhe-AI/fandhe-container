@@ -19,8 +19,11 @@
 //! `blobs` / `blobs/sha256` が symlink・非ディレクトリなら何も変えず `FailedPrecondition`。
 //! blob は `symlink_metadata` で調べ、通常ファイルだけを消す（symlink は辿らず触らない）。
 //!
-//! 未実装（実装済みを装わない。REPAIR-3）: manifest の在庫・タグ・リースのテーブル自体の永続化
-//! （削除の永続化が保証するのはジャーナルと blob ファイルの unlink の範囲だけ）、pull のステージングとリースの組み込み（#474・#475）、CLI 配線、どの構成にも入っていない
+//! 永続化（#2380）: manifest の除去は、blob を消す前に `@image-inventory.json` へ保存する
+//! （`inventory_persist`）。保存に失敗したらテーブルを戻し、書いたジャーナルを片づけて、blob を 1 つも
+//! 消さずにエラーを返す。
+//!
+//! 未実装（実装済みを装わない。REPAIR-3）: CLI 配線、どの構成にも入っていない
 //! 未登録 blob の回収（pull の書き込み途中のファイルかもしれないため消さない）。
 
 use std::collections::BTreeSet;
@@ -147,14 +150,24 @@ impl ReferenceTable {
                 },
             )?;
         }
+        let before = self.inventory_portion();
         for digest in &plan.manifests {
             // 区間内で数え直した直後なので失敗しない想定。panic は Mutex を毒化させるため Result で返す。
             if self.remove_manifest_unchecked(digest).is_err() {
+                self.restore_inventory_portion(before);
                 if journaled {
                     let _ = remove_journal(root);
                 }
                 return Err(err(OciErrorCode::Internal, "failed to remove manifest"));
             }
+        }
+        // manifest の除去は、blob を消す前に保存する。失敗したら戻し、ジャーナルを片づけて blob を消さずに
+        // 失敗する（#2380・OCI-7）。
+        if let Err(e) = self.persist_inventory(before) {
+            if journaled {
+                let _ = remove_journal(root);
+            }
+            return Err(e);
         }
         let mut out = ImagePruneOutcome {
             removed_manifests: plan.manifests,

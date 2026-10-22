@@ -284,7 +284,7 @@ impl ProductionLauncherBuilder {
     /// 受け取っても応答者がいなくてよい)。`UserNotif` は **launch で得た listener に応答する者がいる呼び出し元だけ**が
     /// 指定する(supervisor の start 経路が `LaunchedProcess::take_seccomp_listener` で受け取って応答する)。
     /// 応答者がいないまま指定すると、拒否対象の syscall が listener を閉じるまで止まる(閉じれば `ENOSYS`)。
-    /// 既存の exec 経路(`exec/reapply.rs`)と送り手の無い経路は常に ERRNO のまま(SUP-6 は #2385)。
+    /// 既存の exec 経路(`exec/reapply.rs`)と送り手の無い経路は常に ERRNO のまま(SUP-6 は #2385 で listener の受け渡しのみ実装済み。USER_NOTIF 化は後続)。
     #[must_use]
     pub fn seccomp_errno_delivery(mut self, delivery: crate::seccomp::ErrnoDelivery) -> Self {
         self.seccomp_delivery = delivery;
@@ -366,7 +366,8 @@ impl ProductionLauncherBuilder {
 /// CORE-6・SEC-5・#2009)。
 ///
 /// 呼び出し元は supervisor(結線済み。#2243。選ぶ条件と名前の取得は supervisor の start 経路)。パスはすべて絶対パスで、`PATH` は探索しない。所有者の名前は
-/// 呼び出し側が渡す(`rootless` のモジュール doc のとおり、ライブラリは `$USER` を読まず NSS も使わない)。一般的な
+/// 呼び出し側(supervisor の `id_model`)が `/etc/passwd`、無ければ NSS(`getent`)で解決して渡す(#2390。
+/// ライブラリは `$USER` を読まず NSS も使わない)。一般的な
 /// `/etc/subuid` はユーザー名で書かれるため、名前を渡さないと数値の uid の行しか一致しない。
 /// 範囲の読み取りと helper の検証は [`ProductionLauncherBuilder::build`] が行う。
 #[cfg(target_os = "linux")]
@@ -393,6 +394,62 @@ impl SubordinateIdSource {
             Path::new("/usr/bin/newgidmap"),
             DEFAULT_HELPER_TIMEOUT,
         )
+    }
+
+    /// 範囲写像の解決(`resolve_id_maps`)だけに使う入力元を、subuid / subgid のパスだけ指定して作る。
+    ///
+    /// helper のパスとタイムアウトは既定のまま。呼び出し元は supervisor の `id_model`(start と pull の展開が同じ
+    /// 解決を共有する。#2389・SEC-5・CORE-6)と試験。パスの検証は `with_paths` と同じ。
+    pub fn with_id_files(
+        owner_name: Option<String>,
+        subuid: &Path,
+        subgid: &Path,
+    ) -> Result<Self, TraitError> {
+        Self::with_paths(
+            owner_name,
+            subuid,
+            subgid,
+            Path::new("/usr/bin/newuidmap"),
+            Path::new("/usr/bin/newgidmap"),
+            DEFAULT_HELPER_TIMEOUT,
+        )
+    }
+
+    /// 起動する利用者の `uid` / `gid` について、範囲写像(コンテナ 0 → 自 ID、1.. → subordinate 範囲)を組み立てる。
+    ///
+    /// start の本番 launcher(`resolve_privilege`)と、pull 時の展開の所有者(cli の `image_ownership`。
+    /// `ChownMapped` / `ChownInUserNamespace` に渡す写像。#2389)が同じこの関数を呼ぶ。所有者の解決を
+    /// 別々に持たないための唯一の入口で、副作用は無い(helper の検証は含まない)。
+    ///
+    /// 拒否: `uid` / `gid` が 0(`PermissionDenied`。SEC-5)、範囲が 0 件(`FailedPrecondition`。単一 ID へ
+    /// 黙って縮退しない)、ホスト ID 0 を含む範囲(`PermissionDenied`)、読み取り・解析の失敗。
+    /// 文言は固定の英語で、パス・errno・ユーザー名を含めない。
+    pub fn resolve_id_maps(&self, uid: u32, gid: u32) -> Result<SubordinateIdMaps, TraitError> {
+        let fail = |code: ErrorCode| {
+            TraitError::new(
+                code,
+                "failed to resolve the subordinate id mapping for the launcher",
+            )
+        };
+        if uid == 0 || gid == 0 {
+            return Err(TraitError::new(
+                ErrorCode::PermissionDenied,
+                "refusing to map the host root identity",
+            ));
+        }
+        let owner = SubIdOwner::new(uid, self.owner_name.clone()).map_err(|e| fail(e.code))?;
+        let uid_ranges = load_subordinate_ids(&self.subuid, &owner).map_err(|e| fail(e.code))?;
+        let gid_ranges = load_subordinate_ids(&self.subgid, &owner).map_err(|e| fail(e.code))?;
+        if uid_ranges.is_empty() || gid_ranges.is_empty() {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "no subordinate id range is assigned to the launching user",
+            ));
+        }
+        Ok(SubordinateIdMaps {
+            uid: rootless_mapping(uid, &uid_ranges).map_err(|e| fail(e.code))?,
+            gid: rootless_mapping(gid, &gid_ranges).map_err(|e| fail(e.code))?,
+        })
     }
 
     /// 明示パスで作る(試験・別配置向け)。パスは絶対パスのみ、`helper_timeout` は 1..=60 秒、名前は
@@ -429,6 +486,27 @@ impl SubordinateIdSource {
     }
 }
 
+/// `SubordinateIdSource::resolve_id_maps` の結果(uid 側と gid 側の写像)。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct SubordinateIdMaps {
+    uid: IdMapSet,
+    gid: IdMapSet,
+}
+
+#[cfg(target_os = "linux")]
+impl SubordinateIdMaps {
+    /// uid の写像。
+    pub fn uid(&self) -> &IdMapSet {
+        &self.uid
+    }
+
+    /// gid の写像。
+    pub fn gid(&self) -> &IdMapSet {
+        &self.gid
+    }
+}
+
 /// 構築時に解決・検証済みの範囲写像(`Inner` が保持し、起動のたびに `plan_rootless_subordinate` へ渡す)。
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]
@@ -461,26 +539,8 @@ fn resolve_privilege(
     };
     match (privilege, source) {
         (IsolationPrivilege::RootlessSubordinateIds, Some(source)) => {
-            if euid == 0 || egid == 0 {
-                return Err(TraitError::new(
-                    ErrorCode::PermissionDenied,
-                    "refusing to map the host root identity",
-                ));
-            }
-            let owner_of =
-                |id| SubIdOwner::new(id, source.owner_name.clone()).map_err(|e| fail(e.code));
-            let uid_ranges =
-                load_subordinate_ids(&source.subuid, &owner_of(euid)?).map_err(|e| fail(e.code))?;
-            let gid_ranges =
-                load_subordinate_ids(&source.subgid, &owner_of(euid)?).map_err(|e| fail(e.code))?;
-            if uid_ranges.is_empty() || gid_ranges.is_empty() {
-                return Err(TraitError::new(
-                    ErrorCode::FailedPrecondition,
-                    "no subordinate id range is assigned to the launching user",
-                ));
-            }
-            let uid = rootless_mapping(euid, &uid_ranges).map_err(|e| fail(e.code))?;
-            let gid = rootless_mapping(egid, &gid_ranges).map_err(|e| fail(e.code))?;
+            // 範囲の読み取りと写像の組み立ては pull 時の展開と共有する(#2389)。
+            let SubordinateIdMaps { uid, gid } = source.resolve_id_maps(euid, egid)?;
             let helper =
                 HelperPaths::new(&source.newuidmap, &source.newgidmap).map_err(|e| fail(e.code))?;
             Ok(Some(SubordinateIds {
@@ -602,6 +662,8 @@ trait LaunchOps: Send + Sync {
     /// pin 済みの rootfs の `(st_dev, st_ino)`（launch 時の分離の記録の `/`。fstat できなければ `None`。
     /// SUP-6・#2007）。
     fn root_identity(&self, rootfs: &super::launch::RootfsDir) -> Option<RootIdentity>;
+    /// 起動ユーザーの実効 `(uid, gid)`(単一 ID 写像のホスト側 ID。分離の記録の `idMapping` の元。CORE-6・#2388)。
+    fn effective_ids(&self) -> (u32, u32);
     /// カーネル監査まわりの観測値(procfs。読めない項目は `None`。SEC-4・#2027)。
     fn kernel_audit_probe(&self) -> crate::audit_log::KernelAuditProbe;
     /// 縮退の警告 1 行(構造化ログ。固定語彙のみ)を出す。launch の単一スレッド要求のため `log_event` 系は使えない。
@@ -782,6 +844,54 @@ fn check_user_mapped(
     }
 }
 
+/// launch が使う ID 写像の記録を作る(純関数。副作用なし。CORE-6・SEC-5・REPAIR-4・#2388)。
+///
+/// `RootlessSubordinateIds` は構築時に解決済みの uid / gid 写像、`RootlessSingleId` は起動ユーザーの実効 ID を
+/// コンテナ内 0 の 1 件へ写す写像(spawn の計画と同じ内容)。ホスト ID 0 の単一 ID は spawn の計画と同じ code・
+/// 文言で拒否する(fail-closed)。範囲写像で `subordinate` が無い・`RootfulHostRoot` は `check_privilege` が先に拒否する
+/// ため、ここへ来たら内部不整合として拒否する。
+#[cfg(target_os = "linux")]
+fn recorded_id_mapping(
+    privilege: IsolationPrivilege,
+    subordinate: Option<&SubordinateIds>,
+    euid: u32,
+    egid: u32,
+) -> Result<crate::launch_isolation::RecordedIdMapping, TraitError> {
+    use crate::launch_isolation::{
+        RecordedIdExtent, RecordedIdMapping, RecordedIdModel, id_extents_of,
+    };
+    let refuse = |_| {
+        TraitError::new(
+            ErrorCode::PermissionDenied,
+            "refusing to map the host root identity",
+        )
+    };
+    let (model, uid, gid) = match (privilege, subordinate) {
+        (IsolationPrivilege::RootlessSingleId, _) => {
+            let one = |host_id| {
+                vec![RecordedIdExtent {
+                    container_id: 0,
+                    host_id,
+                    size: 1,
+                }]
+            };
+            (RecordedIdModel::Single, one(euid), one(egid))
+        }
+        (IsolationPrivilege::RootlessSubordinateIds, Some(ids)) => (
+            RecordedIdModel::Subordinate,
+            id_extents_of(&ids.uid),
+            id_extents_of(&ids.gid),
+        ),
+        _ => {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "the id mapping cannot be recorded for the privilege model",
+            ));
+        }
+    };
+    RecordedIdMapping::new(model, uid, gid).map_err(refuse)
+}
+
 /// Linux の launcher 本体(拒否の判定・順序・写像・起動台帳)。
 #[cfg(target_os = "linux")]
 struct Inner {
@@ -929,6 +1039,15 @@ impl Inner {
         .map_err(|e| to_trait_error(&e))?;
         // 監査の網羅(カーネル監査頼みの層)を評価し、厳格モードの縮退は子を作る前に拒否する(SEC-4・#2027)。
         let isolation_record = self.assess_audit_coverage(id, isolation_record, deadline)?;
+        // 実際に使う ID 写像のモデルと範囲を記録へ添える(inspect の `idMapping`。観測専用。作れなければ fork 前に拒否。
+        // CORE-6・SEC-5・REPAIR-4・#2388)。
+        let (euid, egid) = self.ops.effective_ids();
+        let isolation_record = isolation_record.with_id_mapping(recorded_id_mapping(
+            self.privilege,
+            self.subordinate.as_ref(),
+            euid,
+            egid,
+        )?);
         let (uid, gid) = spec.user();
         let mut stages = StagePipeline::new()
             .with_seccomp_delivery(self.seccomp_delivery)
@@ -1424,6 +1543,10 @@ impl LaunchOps for RealOps {
         RootIdentity::of_dir_fd(rootfs.as_fd())
     }
 
+    fn effective_ids(&self) -> (u32, u32) {
+        (crate::sys::effective_uid(), crate::sys::effective_gid())
+    }
+
     fn kernel_audit_probe(&self) -> crate::audit_log::KernelAuditProbe {
         crate::audit_log::KernelAuditProbe::read_host()
     }
@@ -1577,6 +1700,10 @@ mod tests {
     /// spawn に渡った (bind の宛先列, 既定 tmpfs の宛先列)。
     type SeenSpawn = (Option<Vec<String>>, Vec<String>);
 
+    /// 偽の実体が返す実効 uid / gid(試験を実行ユーザーに依存させない)。
+    const FAKE_EUID: u32 = 1000;
+    const FAKE_EGID: u32 = 1001;
+
     /// 呼び出しの記録と注入ができる偽の実体。
     struct FakeOps {
         events: Arc<Mutex<Vec<String>>>,
@@ -1645,6 +1772,10 @@ mod tests {
             push(&self.events, "landlock");
             let detected = crate::landlock::evaluate_abi(self.abi.unwrap_or(6));
             crate::exec::ruleset_from_detection(detected, config)
+        }
+
+        fn effective_ids(&self) -> (u32, u32) {
+            (FAKE_EUID, FAKE_EGID)
         }
 
         fn kernel_audit_probe(&self) -> crate::audit_log::KernelAuditProbe {
@@ -2022,7 +2153,10 @@ mod tests {
             expected.landlock().audit(),
         );
         let expected = expected
-            .with_audit_coverage(crate::audit_log::AuditCoveragePolicy::BestEffort, coverage);
+            .with_audit_coverage(crate::audit_log::AuditCoveragePolicy::BestEffort, coverage)
+            .with_id_mapping(
+                recorded_id_mapping(rootless(), None, FAKE_EUID, FAKE_EGID).expect("id mapping"),
+            );
         assert!(
             record == expected,
             "record must come from the applied ruleset"
@@ -2580,6 +2714,45 @@ mod tests {
         );
     }
 
+    /// CORE-6・SEC-5(#2389): `resolve_privilege` が返す写像は `resolve_id_maps` の結果と同じ行になる(具体値)。
+    #[test]
+    fn core6_resolve_id_maps_matches_resolve_privilege() {
+        let src = source_in(
+            "idmaps",
+            "tester:100000:65536\n",
+            "tester:200000:65536\n",
+            helper_stand_in(),
+        );
+        let maps = src.resolve_id_maps(1000, 1001).expect("maps");
+        let rows = |s: &IdMapSet| {
+            s.entries()
+                .iter()
+                .map(|m| (m.container_id, m.host_id, m.count))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(rows(maps.uid()), vec![(0, 1000, 1), (1, 100000, 65536)]);
+        assert_eq!(rows(maps.gid()), vec![(0, 1001, 1), (1, 200000, 65536)]);
+        let ids = resolve_privilege(
+            IsolationPrivilege::RootlessSubordinateIds,
+            Some(src),
+            1000,
+            1001,
+        )
+        .expect("resolved")
+        .expect("some");
+        assert_eq!(rows(&ids.uid), rows(maps.uid()));
+        assert_eq!(rows(&ids.gid), rows(maps.gid()));
+        let e = SubordinateIdSource::with_id_files(
+            Some("tester".to_owned()),
+            Path::new("/nonexistent-fandhe-dir/subuid"),
+            Path::new("/nonexistent-fandhe-dir/subgid"),
+        )
+        .expect("source")
+        .resolve_id_maps(0, 1000)
+        .expect_err("root");
+        assert_eq!(e.code(), ErrorCode::PermissionDenied);
+    }
+
     /// CORE-6(#2009): 入力元の相対パス・不正な名前・範囲外の timeout は構築前に `InvalidArgument`。
     #[test]
     fn core6_subordinate_source_validates_inputs() {
@@ -2623,6 +2796,20 @@ mod tests {
             None,
         );
         let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        // CORE-6・REPAIR-4(#2388): 分離の記録へ、範囲写像のモデルと範囲が具体値で残る。
+        let mapping = p
+            .launch_isolation()
+            .and_then(|r| r.id_mapping())
+            .expect("id mapping record")
+            .clone();
+        assert_eq!(mapping.model().as_str(), "subordinate");
+        let ext = |c, h, n| crate::launch_isolation::RecordedIdExtent {
+            container_id: c,
+            host_id: h,
+            size: n,
+        };
+        assert_eq!(mapping.uid(), [ext(0, 1000, 1), ext(1, 100_000, 65_536)]);
+        assert_eq!(mapping.gid(), [ext(0, 1001, 1), ext(1, 200_000, 65_536)]);
         p.terminate(Duration::from_secs(5)).expect("terminate");
         let log = ev.lock().unwrap().clone();
         assert_eq!(log.len(), 6, "{log:?}");
@@ -2633,6 +2820,48 @@ mod tests {
         );
         assert!(log[4].starts_with("spawn StagePipeline"), "{}", log[4]);
         assert_eq!(log[5], "evidence ready");
+    }
+
+    /// CORE-6・REPAIR-4(#2388): 単一 ID の launch は、実効 ID をコンテナ内 0 の 1 件へ写す記録を残す。
+    #[test]
+    fn core6_single_id_launch_records_one_to_one_mapping() {
+        let spec = spec_for("single-record", serde_json::json!({}));
+        let ev = events();
+        let l = launcher(FakeOps::new(&ev), rootless(), None);
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let mapping = p
+            .launch_isolation()
+            .and_then(|r| r.id_mapping())
+            .expect("id mapping record")
+            .clone();
+        let ext = |h| crate::launch_isolation::RecordedIdExtent {
+            container_id: 0,
+            host_id: h,
+            size: 1,
+        };
+        assert_eq!(mapping.model().as_str(), "single");
+        assert_eq!(mapping.uid(), [ext(FAKE_EUID)]);
+        assert_eq!(mapping.gid(), [ext(FAKE_EGID)]);
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SEC-5・CORE-6(#2388): ホスト root の単一 ID は記録を作れず、spawn の計画と同じ code・文言で拒否する。
+    #[test]
+    fn sec5_core6_single_id_record_refuses_host_root() {
+        for (u, g) in [(0, 1000), (1000, 0)] {
+            let e = recorded_id_mapping(IsolationPrivilege::RootlessSingleId, None, u, g)
+                .expect_err("host root");
+            assert_eq!(e.code(), ErrorCode::PermissionDenied);
+            assert_eq!(e.message(), "refusing to map the host root identity");
+        }
+        // 範囲写像なのに写像が無い・rootful は記録を作らない(fail-closed)。
+        for p in [
+            IsolationPrivilege::RootlessSubordinateIds,
+            IsolationPrivilege::RootfulHostRoot,
+        ] {
+            let e = recorded_id_mapping(p, None, 1000, 1000).expect_err("no record");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        }
     }
 
     /// REPAIR-5: launcher は `SelfBounded` を宣言する。

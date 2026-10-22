@@ -89,6 +89,11 @@ fn new_root(name: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!("fc-oci-mgmt-it-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("blobs").join("sha256")).expect("mkdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
     root
 }
 

@@ -16,8 +16,10 @@
 //! （`ReferenceTable::register_tag`）で行い、新規キーだけを拒否する（`ResourceExhausted`）。
 //! 既存タグの付け替えと再付与は上限に達していても通す（#2316）。
 //!
-//! 未実装（実装済みを装わない。REPAIR-3）: 永続化（#853・#854・#851）のため、タグ登録は
-//! プロセス内メモリ上だけで効く。CLI 配線は `fandhe-container-cli` の `image tag`（#2316）。
+//! 永続化（#2380）: タグの付与・付け替えは、排他区間の root が設定されたテーブル（`ImageStore::lock` の
+//! ガード）では `@image-inventory.json` へ保存してから結果を返す。変わらない結果（`Unchanged`）とエラーでは
+//! 書かない。保存に失敗したらテーブルを戻してエラーを返す（`inventory_persist`）。
+//! CLI 配線は `fandhe-container-cli` の `image tag`（#2316）。
 
 use super::{ImageStore, ReferenceTable, TagKey};
 use crate::error::{OciError, OciErrorCode};
@@ -27,8 +29,8 @@ use crate::reference::Digest;
 /// テーブル全体のタグ件数の上限（#2316・OCI-7）。
 ///
 /// コンテナ参照の上限 `MAX_CONTAINER_REFS`（#2352）と同じ値に揃えた。`TagKey` 1 件は検証済みの
-/// host・repository・tag の文字列で 1 KiB 未満のため、最大でも十数 MiB に収まる。永続化（#851）の
-/// 読み込み側も同じ定数で検査する前提。
+/// host・repository・tag の文字列で 1 KiB 未満のため、最大でも十数 MiB に収まる。永続化（#2380）の
+/// 読み込み側も同じ定数で検査する。
 pub const MAX_TAG_REFS: usize = 16_384;
 
 /// `image tag` のソース（検証済みの newtype だけで表す）。`ImageRmTarget` と同じ形の別の型。
@@ -114,7 +116,10 @@ impl ReferenceTable {
             }
         };
         // register_tag 内でも在庫を確認する（タグが在庫外を指す状態への防御の二重確認）。
+        let before = self.inventory_portion();
         let previous = self.register_tag(target.clone(), &manifest)?;
+        // 排他区間の root があれば、変わったときだけ保存する。失敗したら戻してエラー（#2380）。
+        self.persist_inventory(before)?;
         let change = match previous {
             None => ImageTagChange::Added,
             Some(prev) if prev == manifest => ImageTagChange::Unchanged,
@@ -200,6 +205,11 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&p).expect("mkdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
         p
     }
 

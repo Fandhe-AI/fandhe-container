@@ -6,6 +6,7 @@
 //! `fandhe-container-cri` の `CriRuntimeService` を得る。`main.rs` の `Serve`（`--socket`）が `server::serve` で UDS＋gRPC にサーブする（#849）。
 //!
 //! 依存の向きは plugin-cri → cri・core の一方向で、core・cri から plugin-cri への辺は無い（CRI-7）。
+//! この向きは `crates/cri/tests/dependency_direction.rs` が `cargo metadata` で機械照合する（#2435）。
 //! [`CriPluginBackends`] は trait object だけを持ち、具象型を型として露出しない。
 //!
 //! # 実装の置き場（CRI-7・PLUG-1）

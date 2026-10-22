@@ -136,13 +136,23 @@ fn create_inner(store: &dyn StateStore, req: &CreateRequest) -> Result<StateReco
 ///
 /// delete は core が作った rootfs の削除が済むまでこのロックを保持する。その間に同じ bundle を採用する create が
 /// 状態を作ると、新しいコンテナの rootfs を旧 delete が消すため、ロック保持中の create は `FailedPrecondition`
-/// で拒否する。ロックを取れない他の理由（bundle の祖先が symlink・Linux 以外）では排他せず進む（start も
-/// 同じ理由で拒否される bundle で、delete 側も同様に排他なしで進む）。
+/// で拒否する。
+///
+/// ロックは bundle が指す実体に取る（[`BundleLock::acquire_resolved`]。bundle の祖先が symlink でも、実体の
+/// 絶対パスで同じ bundle を指す delete と排他する）。Linux でそれでもロックを取れないときは、状態を作らずに
+/// 拒否する（fail-closed）。排他なしで進むと、delete が保持中でも create が成功し、旧 delete が新しい
+/// コンテナの rootfs を消しうるため。ただし bundle の検証で拒否される bundle（不在・config 不正等）は、
+/// 従来どおり検証のエラー（コードと文言）を返す。Linux 以外はロックが未実装（`Unimplemented`）のため排他せず
+/// 進む（Linux 以外は core が rootfs を作らず、delete も rootfs を消さない）。
 fn lock_for_create(bundle: &Path) -> Result<Option<BundleLock>, TraitError> {
-    match BundleLock::acquire(bundle) {
+    match BundleLock::acquire_resolved(bundle) {
         Ok(lock) => Ok(Some(lock)),
         Err(e) if e.code() == ErrorCode::FailedPrecondition => Err(e),
-        Err(_) => Ok(None),
+        Err(_) if !cfg!(target_os = "linux") => Ok(None),
+        Err(e) => {
+            validate_bundle(bundle)?;
+            Err(e)
+        }
     }
 }
 

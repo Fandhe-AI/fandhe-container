@@ -418,6 +418,32 @@ impl BundleLock {
         }
     }
 
+    /// `bundle` が指す実体（symlink を解決した先）の所有ロックを待たずに取得する（create・delete 用。OCI-7・#2378）。
+    ///
+    /// まず [`Self::acquire`] で取り、bundle 自体や祖先が symlink で拒否されたときだけ、`canonicalize` で
+    /// 解決した実体の経路で取り直す。ロックは inode に掛かるため、別の表記（symlink 経由・実体の絶対パス）で
+    /// 同じ bundle を指す create・delete・start とも排他できる。start は symlink 経由の bundle を拒否する
+    /// （[`Self::acquire`]）ので、このフォールバックを使わない。解決の失敗は元のエラーを返す。
+    /// 解決と取得の間に経路を差し替えられる者は信頼境界の外（型 doc「前提（信頼境界）」）。
+    #[cfg(target_os = "linux")]
+    pub(super) fn acquire_resolved(bundle: &Path) -> Result<Self, TraitError> {
+        match Self::acquire(bundle) {
+            Err(e) if e.code() == ErrorCode::InvalidArgument && bundle.is_absolute() => {
+                match std::fs::canonicalize(bundle) {
+                    Ok(real) if real != bundle => Self::acquire(&real),
+                    _ => Err(e),
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Linux 以外では所有ロックを取れないため拒否する（fail-closed）。
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn acquire_resolved(bundle: &Path) -> Result<Self, TraitError> {
+        Self::acquire(bundle)
+    }
+
     /// Linux 以外では所有ロックを取れないため拒否する（fail-closed）。
     #[cfg(not(target_os = "linux"))]
     pub(super) fn acquire(_bundle: &Path) -> Result<Self, TraitError> {

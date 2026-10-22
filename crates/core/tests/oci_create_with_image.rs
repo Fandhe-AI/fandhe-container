@@ -456,6 +456,55 @@ fn oci7_plain_create_is_refused_while_bundle_lock_is_held() {
         .expect("create after unlock");
 }
 
+/// OCI-7・SEC-1（#2378）: 記録の bundle の経路に symlink があっても、delete は bundle の実体にロックを取る。
+/// 実体を他が保持している間は状態も rootfs も変えず `FailedPrecondition`。保持が外れれば実体の rootfs を消す
+/// （表記の違う bundle 経由で排他が外れ、状態削除の後に同じ実体を採用した create の rootfs を消す窓を作らない）。
+#[test]
+fn sec1_delete_through_symlinked_bundle_locks_the_real_bundle() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let refs = Refs::default();
+    run(&store, &refs, &Unpacker { fail: false }, &sb).expect("create");
+    // 記録の bundle の経路を、同じ実体への symlink にする。
+    let real = sb.dir.join("real");
+    std::fs::rename(sb.bundle(), &real).expect("move bundle");
+    std::os::unix::fs::symlink(&real, sb.bundle()).expect("symlink bundle");
+    let holder = std::fs::File::open(&real).expect("open real bundle");
+    holder.try_lock().expect("lock");
+    let rec = OpRecorder::new();
+    let e = delete_c1(&store, &rec, &refs).expect_err("locked");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert!(get(&store).is_ok());
+    assert!(real.join("rootfs").join("bin").join("true").is_file());
+    assert_eq!(rootfs_remove_counts(&rec), (0, 0));
+    holder.unlock().expect("unlock");
+    delete_c1(&store, &rec, &refs).expect("delete");
+    assert_eq!(get(&store).expect_err("gone").code(), ErrorCode::NotFound);
+    assert!(!real.join("rootfs").exists());
+    assert_eq!(rootfs_remove_counts(&rec), (1, 0));
+}
+
+/// OCI-7・SEC-1（#2378）: 通常の create も bundle の実体にロックを取る。symlink 経由の表記で同じ bundle を指す
+/// create は、実体のロックの保持中は状態を作らず `FailedPrecondition` で拒否し、外れれば成功する。
+#[test]
+fn sec1_plain_create_through_symlinked_bundle_locks_the_real_bundle() {
+    let sb = Sandbox::new();
+    std::fs::create_dir(sb.rootfs()).expect("rootfs");
+    let store = sb.store();
+    let link = sb.dir.join("link");
+    std::os::unix::fs::symlink(sb.bundle(), &link).expect("symlink bundle");
+    let req = CreateRequest::new(ContainerId::new("c1").expect("id"), link).expect("request");
+    let holder = std::fs::File::open(sb.bundle()).expect("open bundle");
+    holder.try_lock().expect("lock");
+    let e = fandhe_container_core::oci_runtime::create(&store, &OpRecorder::new(), &req)
+        .expect_err("locked");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(get(&store).expect_err("none").code(), ErrorCode::NotFound);
+    holder.unlock().expect("unlock");
+    fandhe_container_core::oci_runtime::create(&store, &OpRecorder::new(), &req)
+        .expect("create after unlock");
+}
+
 /// SEC-1: rootfs が symlink に差し替えられても、symlink の先は消さない。
 #[test]
 fn sec1_delete_does_not_follow_symlinked_rootfs() {

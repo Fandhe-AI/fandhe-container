@@ -85,6 +85,10 @@
 //!   （`image_ref_release` と同じ）。操作名 `image_rootfs_remove` で `recorder` に記録し、木は残す。残った木が
 //!   あると同じ bundle の次の `create_with_image` は `AlreadyExists` になるため、手動で消す。孤児の自動回収は
 //!   本件の対象外。設計と制約は `docs/design/image-rootfs-lifetime.md`
+//! - **bundle の所有ロックを保持して消す**: 状態削除の前から rootfs の後始末の完了まで `BundleLock` を保持し、
+//!   create・start と排他する（ロックは bundle が指す実体に取り、symlink 経由の表記でも同じ実体なら排他する）。
+//!   他の保持者がいれば何も変えず `FailedPrecondition`。それでもロックを取れない理由（Linux 以外等）では、
+//!   状態は消すが rootfs は消さず、失敗として記録する
 //!
 //! # cgroup を先に消す理由（OCI-6・CORE-3）
 //!
@@ -154,7 +158,7 @@
 
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::image_refs::ContainerImageRefs;
-use super::image_rootfs::remove_recorded_rootfs;
+use super::image_rootfs::{RecordedRootfsRemoval, remove_recorded_rootfs};
 use super::launch::BundleLock;
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
@@ -333,13 +337,14 @@ fn delete_inner(
     // core が作った rootfs を持つコンテナは、状態削除から rootfs の後始末の完了まで bundle の所有ロックを保持する。
     // 状態削除でストアのロックが外れた後に、同じ bundle を採用する create・start が成功して、旧 delete が
     // 新しいコンテナの rootfs を消すのを防ぐ（create・start も同じロックを取る。OCI-7・#2378）。
-    // 他の delete・start が保持中なら何も変えずに `FailedPrecondition` で再試行を促す。ロックを取れない他の理由
-    // （bundle の祖先が symlink）では排他なしで進む（start も同じ理由で拒否される bundle）。
-    let _rootfs_guard = if record.image_rootfs().is_some() {
-        match BundleLock::acquire(record.bundle()) {
-            Ok(lock) => Some(lock),
+    // ロックは bundle が指す実体に取る（祖先が symlink でも、実体の絶対パスで同じ bundle を指す create と排他する）。
+    // 他の delete・start が保持中なら何も変えずに `FailedPrecondition` で再試行を促す。それでもロックを取れない
+    // 他の理由（Linux 以外等）では、状態は消すが rootfs は消さずに残す（排他なしで消すと、状態削除の後に
+    // 同じ実体を採用した create の rootfs を消しうるため。fail-closed）。
+    let rootfs_lock = if record.image_rootfs().is_some() {
+        match BundleLock::acquire_resolved(record.bundle()) {
             Err(e) if e.code() == ErrorCode::FailedPrecondition => return Err(e),
-            Err(_) => None,
+            other => Some(other),
         }
     } else {
         None
@@ -373,7 +378,7 @@ fn delete_inner(
     match store.delete(&delete_req) {
         Ok(_) => {
             // 状態を消した実際の revision のレコード（関数の先頭で読んだもの）に付いた記録だけを使う。
-            remove_core_created_rootfs(recorder, &record);
+            remove_core_created_rootfs(recorder, &record, rootfs_lock.as_ref());
             Ok(DeleteResponse::new())
         }
         Err(e) if e.code() == ErrorCode::FailedPrecondition => {
@@ -396,13 +401,35 @@ fn delete_inner(
 /// delete の結果を変えず（状態は既に消えており、エラーを返すと再実行が `NotFound` になる。`image_ref_release`
 /// と同じ考え方）、操作名 `image_rootfs_remove` で `recorder` に記録して木を残す。残った木は手動で消す
 /// （`docs/design/image-rootfs-lifetime.md`）。
-fn remove_core_created_rootfs(recorder: &OpRecorder, record: &StateRecord) {
+///
+/// `lock` は [`delete_inner`] が状態削除の前に取った bundle の所有ロックの結果。ロックを保持しているときだけ
+/// 消す。取れなかった場合（Linux 以外・bundle を開けない等）は消さずに木を残し、同じ操作名で失敗として
+/// 記録する。排他なしで消すと、状態削除の後に同じ ID・同じ実体の rootfs を採用した create のコンテナの
+/// rootfs を消しうるため（OCI-7 の使用中 rootfs の保持。fail-closed）。bundle 自体が無い（`NotFound`）なら
+/// 消す物も無いので `NotPresent` として記録する。
+fn remove_core_created_rootfs(
+    recorder: &OpRecorder,
+    record: &StateRecord,
+    lock: Option<&Result<BundleLock, TraitError>>,
+) {
     let Some(rec) = record.image_rootfs() else {
         return;
     };
-    if let Ok(name) = OpName::new(IMAGE_ROOTFS_REMOVE_OP_NAME) {
-        let _ = recorder.record_op(&name, || remove_recorded_rootfs(record.bundle(), rec));
-    }
+    let Ok(name) = OpName::new(IMAGE_ROOTFS_REMOVE_OP_NAME) else {
+        return;
+    };
+    let _ = recorder.record_op(&name, || match lock {
+        Some(Ok(_held)) => remove_recorded_rootfs(record.bundle(), rec),
+        Some(Err(e)) if e.code() == ErrorCode::NotFound => Ok(RecordedRootfsRemoval::NotPresent),
+        Some(Err(e)) => Err(TraitError::new(
+            e.code(),
+            "bundle lock is unavailable; image rootfs was kept",
+        )),
+        None => Err(TraitError::new(
+            ErrorCode::Internal,
+            "bundle lock was not taken; image rootfs was kept",
+        )),
+    });
 }
 
 /// 状態の判定表（モジュール doc）。`ContainerState` の追加をコンパイルエラーで検出するため網羅で書く。

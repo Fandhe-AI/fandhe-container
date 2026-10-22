@@ -812,8 +812,19 @@ mod linux {
             }
             if Instant::now() >= deadline {
                 let killed = child.kill();
-                let _ = child.wait();
-                panic!("the delete helper did not exit within the deadline (kill: {killed:?})");
+                // 回収も有限期限まで try_wait で確かめる（kill の失敗・終了しない子で無期限に止まらない。REPAIR-5）。
+                let reap_until = Instant::now() + Duration::from_secs(10);
+                let mut reaped = false;
+                while Instant::now() < reap_until {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        reaped = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                panic!(
+                    "the delete helper did not exit within the deadline (kill: {killed:?}, reaped: {reaped})"
+                );
             }
             std::thread::sleep(Duration::from_millis(20));
         };

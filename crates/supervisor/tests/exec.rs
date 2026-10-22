@@ -156,8 +156,8 @@ mod linux {
     };
     use fandhe_container_supervisor::container_options::env::EnvVar;
     use fandhe_container_supervisor::exec::{
-        AuditedOutcome, ExecRequest, enter_namespaces, identify_pid1, join_cgroup,
-        prepare_cgroup_join, prepare_restrictions, reapply_restrictions, run_command,
+        AuditedOutcome, ExecListenerHandover, ExecRequest, enter_namespaces, identify_pid1,
+        join_cgroup, prepare_cgroup_join, prepare_restrictions, reapply_restrictions, run_command,
         run_command_in,
     };
 
@@ -753,7 +753,7 @@ mod linux {
                 outcome: o, audit, ..
             }) => {
                 println!(
-                    "outcome exit={:?} rlimits={} rlimits_deferred={} caps_dropped={} landlock_rules={} seccomp_instructions={} groups={} entrypoint_mode={} reason={}",
+                    "outcome exit={:?} rlimits={} rlimits_deferred={} caps_dropped={} landlock_rules={} seccomp_instructions={} groups={} entrypoint_mode={} reason={} seccomp_listener={}",
                     o.exit,
                     o.rlimits_applied,
                     o.rlimits_deferred,
@@ -765,6 +765,11 @@ mod linux {
                     o.entrypoint_mode
                         .fallback_reason()
                         .map_or("-", |r| r.as_str()),
+                    // listener の受け渡しの証跡（SEC-4・SUP-6・#2385）。本番の通しの入口は必ず `verified`。
+                    match o.seccomp_listener {
+                        ExecListenerHandover::Verified => "verified",
+                        _ => "other",
+                    },
                 );
                 // `execve` 前の拒否（`SetupFailed` の違反）だけ、層 `entrypoint` の記録の要約を 2 行目に出す（#1595）。
                 // コマンドが起動した成功経路は 1 行のまま（既存の厳密一致の照合を保つ）。
@@ -1296,7 +1301,7 @@ mod linux {
         assert_eq!(
             out.trim_end(),
             format!(
-                "outcome exit={:?} rlimits=15 rlimits_deferred=1 caps_dropped={} landlock_rules=5 seccomp_instructions={} groups={} entrypoint_mode={mode} reason={outcome_reason}",
+                "outcome exit={:?} rlimits=15 rlimits_deferred=1 caps_dropped={} landlock_rules=5 seccomp_instructions={} groups={} entrypoint_mode={mode} reason={outcome_reason} seccomp_listener=verified",
                 ExecExit::Command(ChildExit::Signaled(15)),
                 parse_after(&out, "caps_dropped="),
                 parse_after(&out, "seccomp_instructions="),

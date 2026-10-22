@@ -116,6 +116,9 @@ unsafe extern "C" {
     // `libc` との機械照合はこの crate では未導入（dev-dependencies に `libc` が無い。coding-rust.md「照合が未導入の
     // crate には、その crate の実装 issue が済んでから効く」）。#537 で追加。
     fn setsid() -> i32;
+    // SAFETY（宣言そのものの妥当性）: `int kill(pid_t pid, int sig)`（`pid_t` は Linux で i32）。整数引数のみ。
+    // `libc` との機械照合はこの crate では未導入（上の `setsid` と同じ理由）。
+    fn kill(pid: i32, sig: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `int getsockopt(int sockfd, int level, int optname, void *optval,
     // socklen_t *optlen)`（`socklen_t` は Linux で u32）。制御チャネルの `SO_PEERCRED` 取得だけに使う（#2058）。
     fn getsockopt(
@@ -288,6 +291,36 @@ pub(crate) fn cap_ambient_clear_all() -> io::Result<()> {
     // 影響は呼び出したスレッドの ambient 集合の縮小のみ。
     let rc = unsafe { prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0u64, 0u64, 0u64) };
     check(i64::from(rc)).map(|_| ())
+}
+
+/// `pgid` のプロセスグループ全体へ SIGKILL を送る（`kill(-pgid, SIGKILL)`。#2390・REPAIR-5）。
+///
+/// 呼び出し元は `process_group(0)` で起動した子の pid（= pgid）だけを渡す。`pgid` が 2 未満・`i32` 範囲外なら
+/// `EINVAL` を返し、全プロセス（-1）や自グループ・init への送信を作らない。
+pub(crate) fn kill_process_group(pgid: u32) -> io::Result<()> {
+    const SIGKILL: i32 = 9;
+    let pgid = i32::try_from(pgid)
+        .ok()
+        .filter(|p| *p >= 2)
+        .ok_or_else(|| io::Error::from_raw_os_error(22))?;
+    // SAFETY: 引数は整数のみでポインタを渡さない。負の pid はプロセスグループ宛てで、pgid >= 2 を検証済みのため
+    // 全プロセス（-1）や自プロセスへ送らない。影響は対象グループの終了のみ（メモリ安全性に影響しない）。
+    let rc = unsafe { kill(-pgid, SIGKILL) };
+    check(i64::from(rc)).map(|_| ())
+}
+
+/// 子プロセスの exec 直前に ambient capability をすべて消すよう `cmd` へ登録する（#2390・SEC-5・SUP-14）。
+///
+/// supervisor は特権ランチャー経由で ambient capability を持つことがあり、setuid でない外部コマンド
+/// （NSS 参照の `getent`）はそのまま exec すると ambient を引き継ぐ。`id_model` が `getent` を起動する前に
+/// 呼ぶ。消去に失敗したら子は exec せず `spawn` が `Err` を返す（fail-closed）。
+pub(crate) fn clear_ambient_caps_on_exec(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: クロージャは fork 後・exec 前の子で実行される。呼ぶのは整数引数のみの `prctl` 1 回で、
+    // 確保・ロック・親との共有状態の操作をしない（async-signal-safe）。影響は子の ambient 集合の縮小のみ。
+    unsafe {
+        cmd.pre_exec(cap_ambient_clear_all);
+    }
 }
 
 /// `PR_SET_KEEPCAPS` を設定 / 解除する（`setresuid` をまたいで permitted を保持するための一時設定。

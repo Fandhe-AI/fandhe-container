@@ -32,6 +32,8 @@ compile_error!(
 pub mod commands;
 pub mod doctor;
 pub mod error;
+#[cfg(target_os = "linux")]
+pub mod image_ownership;
 mod json;
 pub mod setup;
 #[cfg(unix)]

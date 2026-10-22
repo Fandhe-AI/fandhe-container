@@ -43,3 +43,10 @@ fandhe-container-core = { path = "../core", default-features = false }
 name = "pull_e2e"
 path = "tests/pull_e2e.rs"
 harness = false
+
+# rootless の user namespace の中でのレイヤー展開の実機前提試験（#2382・OCI-2・SEC-5）。`unshare` で子を
+# user namespace へ入れる単一スレッドの独自 main。`-- --ignored` 指定時のみ実行する（AGENTS.md）。
+[[test]]
+name = "userns_extract"
+path = "tests/userns_extract.rs"
+harness = false

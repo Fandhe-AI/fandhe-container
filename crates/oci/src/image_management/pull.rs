@@ -50,7 +50,10 @@
 //! - 回収 GC の起動時の呼び出しの配線（#2315 のアダプタ側）。回収 GC 本体は
 //!   `ImageStore::recover_stale_pulls`（#852）で実装済みで、drop またはクラッシュでステージングの
 //!   `@pull.lock` のロックが外れたものを回収する。
-//! - テーブルの永続化は未実装（削除の永続化は #851 で実装済み。ほかは #853・#854）（`system df` のステージング容量の集計は `usage` で実装済み。#2222）。
+//! - リースの取得・解放と公開は、在庫・タグ・リースを `@image-inventory.json` へ排他の中で保存する
+//!   （#2380・`inventory_persist`）。保存の順序は「リース解放の保存 → ステージング削除」で、保存に失敗
+//!   したらテーブルを戻してステージングを消さずに返す。公開の保存に失敗しても公開済みの blob は消さない。
+//!   `system df` のステージング容量の集計は `usage` で実装済み（#2222）。
 //! - cri の `image_pull` からの配線。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -493,7 +496,10 @@ impl PullSession<'_> {
             .join(hex_of(digest)?);
         {
             let mut guard = self.store.lock()?;
+            let before = guard.inventory_portion();
             guard.acquire_lease(digest.clone(), self.id.clone())?;
+            // 別プロセスの GC が数え直せるよう、使う前にリースを永続化する。失敗したら戻してエラー（#2380）。
+            guard.persist_inventory(before)?;
         }
         let miss = match fs::symlink_metadata(&path) {
             _ if !dirs_exist => Some(BlobReuse::Absent),
@@ -547,7 +553,9 @@ impl PullSession<'_> {
 
     fn release_own(&self, digest: &Digest) -> Result<(), OciError> {
         let mut guard = self.store.lock()?;
-        guard.release_lease(digest, &self.id)
+        let before = guard.inventory_portion();
+        guard.release_lease(digest, &self.id)?;
+        guard.persist_inventory(before)
     }
 
     /// 新規取得 blob の書き込み先 `<root>/staging/<pull-id>/<hex>` を返す。
@@ -768,9 +776,17 @@ impl PullSession<'_> {
                 return Err(e);
             }
         };
+        let before = guard.inventory_portion();
         let released = guard.release_all_leases(&self.id).len();
         self.leased.clear();
         self.verified.clear();
+        // リース解放を永続化してからステージングを消す（永続化済みのリースがあれば staging/<id> がある、
+        // という順序を保つ。#2380）。保存に失敗したらテーブルを戻し、ステージングは消さずに返す
+        // （残骸とリースは回収 GC が拾う。余分に残す側）。
+        if let Err(e) = guard.persist_inventory(before) {
+            self.pull_lock.take();
+            return Err(e);
+        }
         self.pull_lock.take();
         let staging = self.remove_staging();
         drop(guard);
@@ -889,6 +905,8 @@ impl PullSession<'_> {
                 "manifest is already registered with a different composition",
             ));
         }
+        // 在庫・タグ・リースの変更（manifest 登録・タグ付与・リース解放）を 1 回の保存にまとめるための複製。
+        let before = guard.inventory_portion();
         // タグ件数の上限は blob の移動より前に検査する（ループ途中の失敗で半端なタグを残さない。#2316）。
         guard.ensure_tag_capacity(req.tags.iter())?;
         // 移動。この呼び出しで作った宛先だけを記録し、失敗時はそれだけを消す。
@@ -995,13 +1013,27 @@ impl PullSession<'_> {
         let changes = match result {
             Ok(c) => c,
             Err(e) => {
+                // 途中まで登録した manifest・タグは戻す（blob を消した後に在庫へ残さない。保存はまだ）。
+                guard.restore_inventory_portion(before);
                 for p in &created {
                     let _ = fs::remove_file(p);
                 }
                 return Err(e);
             }
         };
+        // 在庫を保存する前に、公開した blob 本体とそれを置いたディレクトリ（新設した祖先を含む）を永続化する。
+        // 電源断後に manifest・タグだけが残り blob が欠損する状態を作らない（OCI-7。保存の失敗と同じく、
+        // テーブルは戻し、公開済みの blob は消さない）。
+        if let Err(e) = sync_published_blobs(&root, &to_move) {
+            guard.restore_inventory_portion(before);
+            return Err(e);
+        }
         let released_leases = guard.release_all_leases(&self.id).len();
+        // 公開のまとまり（manifest・タグ・リース解放）を 1 回の原子的な保存にする。失敗したらテーブルを戻して
+        // エラーを返す。公開済みの blob は消さない（rename まで成功して親ディレクトリの fsync だけ失敗した
+        // 場合、ディスクには新しい manifest があり、blob を消すと欠損を指すため。余分に残す側。#2380）。
+        // 呼び出し元 `publish` が続けて `abort_inner` を行い、リースとステージングを片づける。
+        guard.persist_inventory(before)?;
         self.leased.clear();
         self.verified.clear();
         self.pull_lock.take();
@@ -1075,6 +1107,36 @@ impl PullSession<'_> {
     }
 }
 
+/// 公開した blob の本体と、`blobs/sha256`・`blobs`・ストアルートのディレクトリを fsync する（OCI-7）。
+/// `blobs` 配下は `ensure_blob_dirs` が新設しうるため、祖先のエントリも永続化する。
+/// ディレクトリの fsync は unix のみ（Windows は std で開けない）。
+fn sync_published_blobs(root: &Path, digests: &[Digest]) -> Result<(), OciError> {
+    if digests.is_empty() {
+        return Ok(());
+    }
+    let fail = || err(OciErrorCode::Internal, "failed to sync published blobs");
+    for b in digests {
+        let path = blob_path(root, b)?;
+        // unix は読み取り専用で開いても fsync できる（blob は 0o444 のことがある）。Windows は書き込み権が要る。
+        #[cfg(unix)]
+        let file = fs::File::open(&path);
+        #[cfg(not(unix))]
+        let file = fs::OpenOptions::new().write(true).open(&path);
+        file.and_then(|f| f.sync_all()).map_err(|_| fail())?;
+    }
+    #[cfg(unix)]
+    for dir in [
+        root.join("blobs").join("sha256"),
+        root.join("blobs"),
+        root.to_path_buf(),
+    ] {
+        fs::File::open(&dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|_| fail())?;
+    }
+    Ok(())
+}
+
 /// Windows の公開用の私的な一時名（宛先と同じディレクトリ。同一ボリュームで rename できる）。
 ///
 /// 同一プロセス内の並行する公開（別セッション・同じ digest）と衝突しないよう、`nonce`（公開ごとに
@@ -1129,6 +1191,11 @@ mod tests {
             let p = std::env::temp_dir().join(format!("fc-oci-pull-{tag}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&p);
             fs::create_dir_all(p.join("blobs").join("sha256")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
+            }
             Root(p)
         }
         fn blob(&self, dg: &Digest) -> PathBuf {

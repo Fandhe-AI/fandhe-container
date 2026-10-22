@@ -123,7 +123,7 @@
 //! - 呼び出し側の契約: 展開するプロセスは初期 user namespace にいて `CAP_CHOWN` を持つ（典型はホスト root）。
 //!   ホストの非特権ユーザーは subuid 範囲の ID へ `chown` できず、`EPERM` は `PermissionDenied` で失敗する。
 //!   写像はコンテナを起動するときの user namespace の写像（core の `rootless_mapping`・`/etc/subuid` から作ったもの）と
-//!   同じものを渡す。非 Linux は展開の開始前に `Unimplemented` で拒否する（黙って飛ばさない）。
+//!   同じものを渡す（cli の `image_ownership` が start と同じ解決部品から作る。#2389）。非 Linux は展開の開始前に `Unimplemented` で拒否する（黙って飛ばさない）。
 //! - 検証: 写像に無い ID は `PermissionDenied`、解析できない ID は `InvalidArgument`。パス 1 で
 //!   そのレイヤーの書き込みより前に拒否する（グローバル PAX の取り込みもパス 3 と同じ規則）。
 //! - 順序: 通常ファイルは書き込み後に `fchown` し、所有者を読み戻して一致を確かめてから（不一致は
@@ -131,6 +131,11 @@
 //!   妨げないよう全レイヤーの後に深い順で `lchown` し、その直後に mode を適用する。symlink は `lchown`（追従しない）。
 //!   tar に所有者が無い暗黙のディレクトリはコンテナ内 0:0 を写した ID にする。`root` 自身も最後にコンテナ内 0:0 を
 //!   写した ID へ `chown` する（mode は 0700 のまま）。
+//! - rootless（`OwnershipPolicy::ChownInUserNamespace`。#2382）: 展開プロセスがコンテナと同じ写像の user namespace の
+//!   中にいて、tar のコンテナ内 ID をそのまま `chown` する（`ChownMapped` と順序・検証は同じで、宛先だけが恒等）。
+//!   `/proc/self/{uid,gid}_map` と effective / fs の ID を開始前に照合する（条件・根拠・制約は
+//!   `docs/design/oci-layer-special-bits.md`）。展開した木はホストから見ると subuid の所有になり、ホスト側からは
+//!   消せないことがある（後始末は namespace の中で行う。core 側の配線は未実装）。
 //! - hardlink は `chown` しない。inode を共有するため、参照先の所有者と特殊ビットを書き換えないためで、所有者は
 //!   参照先のエントリのものになる。
 //! - PAX の `uname` / `gname` は使わない（読まない）。数値の uid / gid だけを正とする。名前はイメージの
@@ -139,7 +144,8 @@
 //!
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!
-//! - rootless で写像済みの user namespace の中から展開する経路（ns 内の ID の見え方と特殊ビットの条件の再設計が要る）。
+//! - rootless の user namespace へ入って `ImageRootfsUnpacker::unpack` を呼ぶ core 側の配線と、subuid 所有の
+//!   rootfs の削除経路（#2315・#482。本モジュールの `ChownInUserNamespace` は展開器の側だけ）。
 //!   `PreserveIfOwnerMapped`（`chown` しない 1 行の写像）は従来どおり。
 //! - 0700 の祖先ディレクトリで閉じ込めを判定する方式。`root` が 0700 のため、複数範囲の写像でもコンテナ内の
 //!   非 root ユーザーは `/` を辿れない。
@@ -344,6 +350,26 @@ pub enum OwnershipPolicy {
         /// gid の写像。
         gid: IdMap,
     },
+    /// rootless: 展開プロセスがコンテナと同じ写像の user namespace の中にいる前提で、tar のコンテナ内 ID を
+    /// そのまま `chown` する（namespace の中では恒等写像。#2382・OCI-2・SEC-5）。
+    ///
+    /// `uid` / `gid` はコンテナの user namespace の写像（`container_id parent_id count`。core の
+    /// `rootless_mapping` / `IdMapSet` と同じもの）で、ホスト ID 0 は `IdMap::new` が拒否する。tar の ID が写像に
+    /// 含まれるかの判定にだけ使い、写像に無い ID は `PermissionDenied`、解析できない ID は `InvalidArgument` で
+    /// そのレイヤーの書き込みより前に拒否する。
+    ///
+    /// 開始前（`root` に触れる前）に `/proc/self` で次を確かめ、満たさなければ `FailedPrecondition` で拒否する
+    /// （fail-closed）: 初期 user namespace でない・`/proc/self/{uid,gid}_map` が渡された写像と集合として一致する・
+    /// effective / fs の uid と gid が 0（namespace の中の ID）。呼び出し側の契約: 単一スレッドで、
+    /// 初期 user namespace の直下に作った namespace に入っている（入れ子では「親の ID が 0 でない」が
+    /// 「ホスト ID が 0 でない」を意味しない）。namespace へ入る処理は core の責務で、oci は入らない。
+    /// 非 Linux は開始前に `Unimplemented`。
+    ChownInUserNamespace {
+        /// uid の写像（コンテナの user namespace の写像）。
+        uid: IdMap,
+        /// gid の写像。
+        gid: IdMap,
+    },
 }
 
 /// 展開の選択肢（所有者・特殊ビット）。将来の項目追加に備え `non_exhaustive`。
@@ -387,7 +413,7 @@ impl ExtractOptions {
 pub enum OwnershipDecision {
     /// `OwnershipPolicy::Keep` のため `chown` しなかった。
     NotRequested,
-    /// `OwnershipPolicy::ChownMapped` に従って `chown` した。
+    /// `OwnershipPolicy::ChownMapped` / `ChownInUserNamespace` に従って `chown` した。
     Applied,
 }
 
@@ -970,7 +996,7 @@ fn extract_zero_layers(root: &Path, setup: &SpecialSetup) -> Result<Vec<Extracte
     let own = setup.owner_ctx()?;
     check_root_empty(root)?;
     if let Some(o) = &own {
-        let ids = map_tar_owner((Some(0), Some(0)), &o.uid, &o.gid)?;
+        let ids = o.resolve((Some(0), Some(0)))?;
         (o.fns.lchown)(root, ids.0, ids.1).map_err(|e| chown_err(&e))?;
     }
     Ok(Vec::new())
@@ -1717,7 +1743,11 @@ impl ChownFns {
 /// `chown` の失敗を構造化エラーにする。権限不足（`EPERM`）は `PermissionDenied`（fail-closed）。
 /// パスや ID の生の値はメッセージに載せない。
 fn chown_err(e: &std::io::Error) -> OciError {
-    let code = if e.kind() == ErrorKind::PermissionDenied {
+    // namespace の中で写像に無い ID へ `chown` すると `EINVAL`（`InvalidInput`）になる。権限の失敗として扱う。
+    let code = if matches!(
+        e.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::InvalidInput
+    ) {
         OciErrorCode::PermissionDenied
     } else {
         OciErrorCode::Internal
@@ -1752,6 +1782,134 @@ struct OwnerCtx {
     uid: IdMap,
     gid: IdMap,
     fns: ChownFns,
+    /// `ChownInUserNamespace`（宛先は tar の ID そのまま）か。
+    in_userns: bool,
+}
+
+impl OwnerCtx {
+    /// tar の ID を検証し、`chown` の宛先の ID を返す。`ChownMapped` は写像先のホスト ID、
+    /// `ChownInUserNamespace` は tar の ID そのまま（検証だけに写像を使う）。
+    fn resolve(&self, ids: (Option<u32>, Option<u32>)) -> Result<(u32, u32), OciError> {
+        let mapped = map_tar_owner(ids, &self.uid, &self.gid)?;
+        if self.in_userns {
+            // 検証済みのため両方 `Some`。
+            if let (Some(u), Some(g)) = ids {
+                return Ok((u, g));
+            }
+        }
+        Ok(mapped)
+    }
+}
+
+/// 展開プロセスの user namespace の見え方（`/proc/self`）。`ChownInUserNamespace` の開始前の検証に使う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserNsView {
+    uid_map: Vec<IdRange>,
+    gid_map: Vec<IdRange>,
+    /// effective / fs の uid・gid（namespace の中の ID）。
+    euid: u32,
+    fsuid: u32,
+    egid: u32,
+    fsgid: u32,
+}
+
+/// `/proc/self` 由来の読み取りの上限（バイト）。カーネルの写像は最大 340 行で十分小さい。
+#[cfg(target_os = "linux")]
+const MAX_PROC_SELF_BYTES: u64 = 16 * 1024;
+
+#[cfg(target_os = "linux")]
+fn read_proc_self(name: &str) -> Result<Vec<u8>, OciError> {
+    let bad = |_: std::io::Error| {
+        err(
+            OciErrorCode::FailedPrecondition,
+            "cannot read /proc/self to verify the user namespace",
+        )
+    };
+    let f = File::open(Path::new("/proc/self").join(name)).map_err(bad)?;
+    let mut buf = Vec::new();
+    f.take(MAX_PROC_SELF_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(bad)?;
+    if buf.len() as u64 > MAX_PROC_SELF_BYTES {
+        return Err(err(
+            OciErrorCode::FailedPrecondition,
+            "/proc/self file is too large",
+        ));
+    }
+    Ok(buf)
+}
+
+/// `/proc/self/status` の `Uid:` / `Gid:` 行から (effective, fs) を取る。
+#[cfg(target_os = "linux")]
+fn parse_status_ids(status: &str, key: &str) -> Option<(u32, u32)> {
+    let line = status.lines().find_map(|l| l.strip_prefix(key))?;
+    let mut it = line.split_whitespace().map(|f| f.parse::<u32>().ok());
+    let (_real, eff, _saved, fs, rest) = (
+        it.next()??,
+        it.next()??,
+        it.next()??,
+        it.next()??,
+        it.next(),
+    );
+    rest.is_none().then_some((eff, fs))
+}
+
+/// 既定の `UserNsView` の取得（`/proc/self` を上限つきで読む）。非 Linux は呼ばれない。
+fn host_user_ns_view() -> Result<UserNsView, OciError> {
+    #[cfg(target_os = "linux")]
+    {
+        let bad = || {
+            err(
+                OciErrorCode::FailedPrecondition,
+                "malformed /proc/self/status id line",
+            )
+        };
+        let uid_map = super::idmap::parse_proc_id_map(&read_proc_self("uid_map")?)?;
+        let gid_map = super::idmap::parse_proc_id_map(&read_proc_self("gid_map")?)?;
+        let status = String::from_utf8(read_proc_self("status")?).map_err(|_| bad())?;
+        let (euid, fsuid) = parse_status_ids(&status, "Uid:").ok_or_else(bad)?;
+        let (egid, fsgid) = parse_status_ids(&status, "Gid:").ok_or_else(bad)?;
+        Ok(UserNsView {
+            uid_map,
+            gid_map,
+            euid,
+            fsuid,
+            egid,
+            fsgid,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(err(
+            OciErrorCode::Unimplemented,
+            "user namespace inspection is only supported on linux",
+        ))
+    }
+}
+
+/// 初期 user namespace の恒等写像（`0 0 4294967295` の 1 行）か。
+fn is_initial_userns_map(m: &[IdRange]) -> bool {
+    matches!(m, [r] if r.container_id == 0 && r.host_id == 0 && r.count == u32::MAX)
+}
+
+/// `ChownInUserNamespace` の開始前の検証（純関数。#2382・SEC-5）。
+///
+/// 初期 user namespace・渡された写像との不一致・namespace の中で euid / fsuid / egid / fsgid が 0 でない、の
+/// いずれかなら `FailedPrecondition`。`user_namespaces(7)` のとおり、読む側と対象が同じ namespace にいるとき
+/// 写像の 2 列目は親の namespace の ID になるため、ホストから見た `IdMap` と直接比べられる。
+/// 写像はカーネルが 1 回しか書かせないため、検証から使用までの間に書き換えられない。
+fn check_user_namespace(view: &UserNsView, uid: &IdMap, gid: &IdMap) -> Result<(), OciError> {
+    let fail = |msg: &'static str| Err(err(OciErrorCode::FailedPrecondition, msg));
+    if is_initial_userns_map(&view.uid_map) || is_initial_userns_map(&view.gid_map) {
+        return fail("the extracting process is not inside a user namespace");
+    }
+    if !uid.same_lines_as(&view.uid_map) || !gid.same_lines_as(&view.gid_map) {
+        return fail("the user namespace id mapping differs from the requested mapping");
+    }
+    if view.euid != 0 || view.fsuid != 0 || view.egid != 0 || view.fsgid != 0 {
+        return fail("the extracting process is not root inside the user namespace");
+    }
+    Ok(())
 }
 
 /// 特殊ビット・所有者の扱いの入力。`extract_stack` の入口で受け取る。
@@ -1763,6 +1921,8 @@ struct SpecialSetup {
     mode_readback: fn(&fs::File) -> u32,
     ownership: OwnershipPolicy,
     chown: ChownFns,
+    /// `ChownInUserNamespace` の開始前検証が読む `/proc/self` の見え方（試験だけが差し替える）。
+    ns_probe: fn() -> Result<UserNsView, OciError>,
 }
 
 impl SpecialSetup {
@@ -1773,6 +1933,7 @@ impl SpecialSetup {
             mode_readback: special_bits_of,
             ownership: OwnershipPolicy::Keep,
             chown: ChownFns::host(),
+            ns_probe: host_user_ns_view,
         }
     }
 
@@ -1783,7 +1944,7 @@ impl SpecialSetup {
         }
     }
 
-    /// 選択肢の組み合わせとホストを検査し、`ChownMapped` なら実行時の文脈を作る。`root` に触れる前に呼ぶ。
+    /// 選択肢の組み合わせとホストを検査し、`ChownMapped` / `ChownInUserNamespace` なら実行時の文脈を作る。`root` に触れる前に呼ぶ。
     fn owner_ctx(&self) -> Result<Option<OwnerCtx>, OciError> {
         match (&self.ownership, self.policy) {
             (OwnershipPolicy::Keep, SpecialBitsPolicy::PreserveIfChowned) => Err(err(
@@ -1799,7 +1960,23 @@ impl SpecialSetup {
                 uid: uid.clone(),
                 gid: gid.clone(),
                 fns: self.chown,
+                in_userns: false,
             })),
+            (OwnershipPolicy::ChownInUserNamespace { .. }, _) if !cfg!(target_os = "linux") => {
+                Err(err(
+                    OciErrorCode::Unimplemented,
+                    "applying layer ownership is only supported on linux",
+                ))
+            }
+            (OwnershipPolicy::ChownInUserNamespace { uid, gid }, _) => {
+                check_user_namespace(&(self.ns_probe)()?, uid, gid)?;
+                Ok(Some(OwnerCtx {
+                    uid: uid.clone(),
+                    gid: gid.clone(),
+                    fns: self.chown,
+                    in_userns: true,
+                }))
+            }
         }
     }
 }
@@ -1815,6 +1992,8 @@ struct SpecialCtx {
     owner_of: OwnerOf,
     /// `PreserveIfChowned`（`chown` 後の所有者で判定する経路）か。
     chowned_mode: bool,
+    /// `ChownInUserNamespace`（所有者の条件が `special_bits_to_keep_chowned` で変わる）か。
+    in_userns: bool,
 }
 
 impl SpecialCtx {
@@ -1825,6 +2004,7 @@ impl SpecialCtx {
             root_uid: 0,
             owner_of: host_owner,
             chowned_mode: false,
+            in_userns: false,
         }
     }
 }
@@ -1849,6 +2029,10 @@ fn eval_special_ctx(setup: &SpecialSetup, root: &Path) -> Result<SpecialCtx, Oci
             ctx.decision = SpecialBitsDecision::Evaluated;
             ctx.ranges = mapped;
             ctx.chowned_mode = chowned;
+            ctx.in_userns = matches!(
+                setup.ownership,
+                OwnershipPolicy::ChownInUserNamespace { .. }
+            );
             ctx.root_uid = (setup.owner_of)(&m).0;
         }
     }
@@ -1908,6 +2092,24 @@ fn special_bits_to_keep_chowned(
         return 0;
     }
     let mut keep = requested & S_ISVTX;
+    if ctx.in_userns {
+        // namespace の中では所有者は tar の ID と一致し（恒等）、その ID が写像に含まれるときだけ残す。
+        // コンテナ root（ns 内 uid 0）の所有も残してよい: ホストでは起動ユーザー / subuid にしか効かず、
+        // `root` が 0700 のため他のホストユーザーは辿れない（#2382・SEC-5）。
+        if requested & S_ISUID != 0
+            && tar_ids.0 == Some(owner.0)
+            && maps.0.map_to_host(owner.0).is_some()
+        {
+            keep |= S_ISUID;
+        }
+        if requested & S_ISGID != 0
+            && tar_ids.1 == Some(owner.1)
+            && maps.1.map_to_host(owner.1).is_some()
+        {
+            keep |= S_ISGID;
+        }
+        return keep;
+    }
     if requested & S_ISUID != 0
         && owner.0 != 0
         && tar_ids.0.and_then(|u| maps.0.map_to_host(u)) == Some(owner.0)
@@ -2168,7 +2370,7 @@ impl Extractor<'_> {
         fs::create_dir(path).map_err(|e| map_fs_err(&e))?;
         apply_dir_mode(path, IMPLICIT_DIR_MODE)?;
         if let Some(o) = &self.own {
-            let owner = map_tar_owner((Some(0), Some(0)), &o.uid, &o.gid)?;
+            let owner = o.resolve((Some(0), Some(0)))?;
             self.deferred_dirs
                 .insert(id, (path.to_path_buf(), IMPLICIT_DIR_MODE, Some(owner)));
         }
@@ -2560,7 +2762,7 @@ impl Extractor<'_> {
         let Some(o) = &self.own else {
             return Ok(None);
         };
-        map_tar_owner(tar_owner(entry, global), &o.uid, &o.gid).map(Some)
+        o.resolve(tar_owner(entry, global)).map(Some)
     }
 
     /// `ChownMapped` のとき `root` 自身をコンテナ内 0:0 を写した ID へ `chown` する（mode は 0700 のまま変えない）。
@@ -2571,7 +2773,7 @@ impl Extractor<'_> {
         let Some(o) = &self.own else {
             return Ok(());
         };
-        let ids = map_tar_owner((Some(0), Some(0)), &o.uid, &o.gid)?;
+        let ids = o.resolve((Some(0), Some(0)))?;
         (o.fns.lchown)(self.root, ids.0, ids.1).map_err(|e| chown_err(&e))?;
         self.chowned = self.chowned.saturating_add(1);
         Ok(())
@@ -2789,7 +2991,7 @@ fn collect_markers<R: Read>(
             if let Some(o) = &x.own
                 && matches!(plan, Plan::Dir(..) | Plan::File(..) | Plan::Symlink(_))
             {
-                map_tar_owner(tar_owner(&mut entry, &global_owner), &o.uid, &o.gid)?;
+                o.resolve(tar_owner(&mut entry, &global_owner))?;
             }
             match plan {
                 Plan::Marker(m) => markers.push(m),
@@ -4698,6 +4900,7 @@ mod tests {
             root_uid: 1000,
             owner_of: owner_1000,
             chowned_mode: false,
+            in_userns: false,
         };
         let all = S_ISUID | S_ISGID | S_ISVTX;
         let k = |req, ids, owner| special_bits_to_keep(req, ids, owner, &ctx);
@@ -6586,6 +6789,7 @@ mod tests {
                 root_uid: 0,
                 owner_of: host_owner,
                 chowned_mode: true,
+                in_userns: false,
             };
             let all = S_ISUID | S_ISGID | S_ISVTX;
             let k = |req, ids, owner| special_bits_to_keep_chowned(req, ids, owner, (&m, &m), &ctx);
@@ -6614,6 +6818,300 @@ mod tests {
                 ),
                 0
             );
+        }
+
+        // ---- rootless の user namespace の中での展開（ChownInUserNamespace。#2382・OCI-2・SEC-5） ----
+
+        fn view_of(m: &IdMap) -> UserNsView {
+            UserNsView {
+                uid_map: m.lines().to_vec(),
+                gid_map: m.lines().to_vec(),
+                euid: 0,
+                fsuid: 0,
+                egid: 0,
+                fsgid: 0,
+            }
+        }
+
+        fn probe_ok() -> Result<UserNsView, OciError> {
+            Ok(view_of(&subuid_map()))
+        }
+
+        fn probe_initial_ns() -> Result<UserNsView, OciError> {
+            let init = vec![IdRange {
+                container_id: 0,
+                host_id: 0,
+                count: u32::MAX,
+            }];
+            Ok(UserNsView {
+                uid_map: init.clone(),
+                gid_map: init,
+                ..view_of(&subuid_map())
+            })
+        }
+
+        fn probe_gid_mismatch() -> Result<UserNsView, OciError> {
+            Ok(UserNsView {
+                gid_map: vec![IdRange {
+                    container_id: 0,
+                    host_id: 100_000,
+                    count: 1,
+                }],
+                ..view_of(&subuid_map())
+            })
+        }
+
+        fn probe_fsuid_nonzero() -> Result<UserNsView, OciError> {
+            Ok(UserNsView {
+                fsuid: 1,
+                ..view_of(&subuid_map())
+            })
+        }
+
+        fn probe_unreadable() -> Result<UserNsView, OciError> {
+            Err(err(OciErrorCode::FailedPrecondition, "cannot read"))
+        }
+
+        fn ns_setup(
+            policy: SpecialBitsPolicy,
+            fns: ChownFns,
+            probe: fn() -> Result<UserNsView, OciError>,
+        ) -> SpecialSetup {
+            SpecialSetup {
+                ownership: OwnershipPolicy::ChownInUserNamespace {
+                    uid: subuid_map(),
+                    gid: subuid_map(),
+                },
+                chown: fns,
+                ns_probe: probe,
+                ..SpecialSetup::host(policy)
+            }
+        }
+
+        /// OCI-2・SEC-5: namespace の中では宛先が tar の ID そのまま（ChownMapped なら 101000 になる ID）で、
+        /// 暗黙のディレクトリと root は 0:0。順序・件数は ChownMapped と同じ。
+        #[test]
+        fn oci2_userns_chown_destination_is_tar_id() {
+            let sb = Sandbox::new();
+            let entries = [
+                owned_entry("d/", EntryType::Directory, "", 0o755, 33, 34),
+                file_owned("d/f", 0o644, 1000, 1001, b"x"),
+                owned_entry("l", EntryType::Symlink, "d/f", 0o777, 5, 6),
+                file_owned("x/y", 0o644, 0, 0, b"y"),
+            ];
+            let r = run_setup(
+                &sb,
+                &entries,
+                ns_setup(SpecialBitsPolicy::Strip, rec_fns(), probe_ok),
+            )
+            .unwrap();
+            let summary: Vec<(char, Option<PathBuf>, u32, u32)> = take_calls()
+                .iter()
+                .map(|c| (c.kind, c.path.clone(), c.uid, c.gid))
+                .collect();
+            assert_eq!(
+                summary,
+                vec![
+                    ('f', None, 1000, 1001),
+                    ('l', Some(sb.root.join("l")), 5, 6),
+                    ('f', None, 0, 0),
+                    ('l', Some(sb.root.join("d")), 33, 34),
+                    ('l', Some(sb.root.join("x")), 0, 0),
+                    ('l', Some(sb.root.clone()), 0, 0),
+                ]
+            );
+            assert_eq!(r.ownership.decision, OwnershipDecision::Applied);
+            assert_eq!(r.ownership.chowned_entries, 6);
+        }
+
+        /// OCI-2・SEC-5: 開始前の検証に落ちたら FailedPrecondition で、root に触れず chown も 0 回。
+        #[test]
+        fn oci2_userns_precondition_failures_touch_nothing() {
+            let probes: [fn() -> Result<UserNsView, OciError>; 5] = [
+                probe_initial_ns,
+                probe_gid_mismatch,
+                probe_fsuid_nonzero,
+                probe_unreadable,
+                || {
+                    Ok(UserNsView {
+                        euid: 1000,
+                        ..view_of(&subuid_map())
+                    })
+                },
+            ];
+            for probe in probes {
+                let sb = Sandbox::new();
+                let e = run_setup(
+                    &sb,
+                    &[file_owned("f", 0o644, 0, 0, b"x")],
+                    ns_setup(SpecialBitsPolicy::Strip, rec_fns(), probe),
+                )
+                .unwrap_err();
+                assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+                assert_eq!(fs::read_dir(&sb.root).unwrap().count(), 0);
+                assert!(take_calls().is_empty());
+            }
+        }
+
+        /// OCI-2・SEC-5: 純関数の検証。順序違いの写像は一致とみなし、uid 側の不一致も拒否する。
+        #[test]
+        fn oci2_check_user_namespace_cases() {
+            let m = subuid_map();
+            assert!(check_user_namespace(&view_of(&m), &m, &m).is_ok());
+            let mut rev = view_of(&m);
+            rev.uid_map.reverse();
+            assert!(check_user_namespace(&rev, &m, &m).is_ok());
+            let mut bad = view_of(&m);
+            bad.uid_map.pop();
+            let e = check_user_namespace(&bad, &m, &m).unwrap_err();
+            assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+            assert_eq!(
+                e.message(),
+                "the user namespace id mapping differs from the requested mapping"
+            );
+            let mut g = view_of(&m);
+            g.egid = 5;
+            assert_eq!(
+                check_user_namespace(&g, &m, &m).unwrap_err().message(),
+                "the extracting process is not root inside the user namespace"
+            );
+        }
+
+        /// OCI-2・SEC-5: 写像に無い ID はそのレイヤーを書く前に PermissionDenied。
+        #[test]
+        fn oci2_userns_owner_outside_map_is_rejected_before_writes() {
+            let sb = Sandbox::new();
+            let e = run_setup(
+                &sb,
+                &[
+                    file_owned("a", 0o644, 0, 0, b"x"),
+                    file_owned("b", 0o644, 70_000, 0, b"y"),
+                ],
+                ns_setup(SpecialBitsPolicy::Strip, rec_fns(), probe_ok),
+            )
+            .unwrap_err();
+            assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+            assert!(!sb.root.join("a").exists());
+            assert!(take_calls().is_empty());
+        }
+
+        fn einval_fchown(_f: &File, _u: u32, _g: u32) -> std::io::Result<()> {
+            Err(std::io::Error::from(ErrorKind::InvalidInput))
+        }
+
+        /// OCI-2・SEC-5: namespace の中の EINVAL（写像に無い ID への chown）は PermissionDenied。
+        #[test]
+        fn oci2_userns_einval_is_permission_denied() {
+            let sb = Sandbox::new();
+            let fns = ChownFns {
+                fchown: einval_fchown,
+                ..rec_fns()
+            };
+            let e = run_setup(
+                &sb,
+                &[file_owned("f", 0o644, 0, 0, b"x")],
+                ns_setup(SpecialBitsPolicy::Strip, fns, probe_ok),
+            )
+            .unwrap_err();
+            assert_eq!(e.code(), OciErrorCode::PermissionDenied);
+        }
+
+        /// OCI-2・SEC-5: レイヤー 0 のイメージでも開始前に検証し、root を 0:0 へ chown する。
+        #[test]
+        fn oci2_userns_zero_layer_image() {
+            let sb = Sandbox::new();
+            take_calls();
+            let setup = ns_setup(SpecialBitsPolicy::Strip, rec_fns(), probe_ok);
+            assert!(extract_zero_layers(&sb.root, &setup).unwrap().is_empty());
+            let calls = take_calls();
+            assert_eq!(calls.len(), 1);
+            assert_eq!((calls[0].uid, calls[0].gid), (0, 0));
+            let bad = ns_setup(SpecialBitsPolicy::Strip, rec_fns(), probe_initial_ns);
+            assert_eq!(
+                extract_zero_layers(&sb.root, &bad).unwrap_err().code(),
+                OciErrorCode::FailedPrecondition
+            );
+            assert!(take_calls().is_empty());
+        }
+
+        /// SEC-5・SEC-1: namespace の中では ns 内 uid 0 が所有する setuid も残す（ホストでは subuid にしか効かない）。
+        /// 写像に無い ID・root が開いているときは落とす。
+        #[test]
+        fn sec5_userns_preserve_if_chowned_end_to_end() {
+            let sb = Sandbox::new();
+            chmod_root(&sb, 0o700);
+            let r = run_setup(
+                &sb,
+                &[
+                    file_owned("suid", 0o4755, 0, 0, b"a"),
+                    file_owned("sgid", 0o2755, 33, 33, b"b"),
+                    file_owned("sticky", 0o1644, 1000, 1000, b"c"),
+                ],
+                ns_setup(SpecialBitsPolicy::PreserveIfChowned, rec_fns(), probe_ok),
+            )
+            .unwrap();
+            take_calls();
+            assert_eq!(r.special_bits.decision, SpecialBitsDecision::Evaluated);
+            assert_eq!(r.special_bits.preserved_files, 3);
+            assert_eq!(mode_of(&sb.root.join("suid")), 0o4755);
+            assert_eq!(mode_of(&sb.root.join("sgid")), 0o2755);
+            assert_eq!(mode_of(&sb.root.join("sticky")), 0o1644);
+
+            let sb2 = Sandbox::new();
+            chmod_root(&sb2, 0o755);
+            let r2 = run_setup(
+                &sb2,
+                &[file_owned("suid", 0o4755, 0, 0, b"a")],
+                ns_setup(SpecialBitsPolicy::PreserveIfChowned, rec_fns(), probe_ok),
+            )
+            .unwrap();
+            take_calls();
+            assert_eq!(
+                r2.special_bits.decision,
+                SpecialBitsDecision::RootAccessibleByOthers
+            );
+            assert_eq!(mode_of(&sb2.root.join("suid")), 0o755);
+        }
+
+        /// SEC-5: ns 内の `special_bits_to_keep_chowned` の条件（所有者 0 でも残す・tar の ID と所有者の不一致は落とす）。
+        #[test]
+        fn sec5_special_bits_to_keep_in_userns_matrix() {
+            let m = subuid_map();
+            let ctx = SpecialCtx {
+                decision: SpecialBitsDecision::Evaluated,
+                ranges: None,
+                root_uid: 0,
+                owner_of: host_owner,
+                chowned_mode: true,
+                in_userns: true,
+            };
+            let all = S_ISUID | S_ISGID | S_ISVTX;
+            let k = |req, ids, owner| special_bits_to_keep_chowned(req, ids, owner, (&m, &m), &ctx);
+            assert_eq!(k(all, (Some(0), Some(0)), (0, 0)), all);
+            assert_eq!(k(all, (Some(1000), Some(1000)), (1000, 1000)), all);
+            // 所有者が tar の ID と一致しない。
+            assert_eq!(
+                k(all, (Some(1000), Some(1000)), (1001, 1000)),
+                S_ISGID | S_ISVTX
+            );
+            // 写像に無い ID（一致していても落とす）。
+            assert_eq!(
+                k(all, (Some(70_000), Some(0)), (70_000, 0)),
+                S_ISGID | S_ISVTX
+            );
+            assert_eq!(k(all, (None, None), (0, 0)), S_ISVTX);
+        }
+
+        /// OCI-2: `/proc/self/status` の Uid / Gid 行の解析（effective と fs を取り、桁の過不足は拒否）。
+        #[test]
+        fn oci2_parse_status_ids() {
+            let st = "Name:\tx\nUid:\t1000\t0\t1000\t0\nGid:\t1000\t0\t1000\t7\n";
+            assert_eq!(parse_status_ids(st, "Uid:"), Some((0, 0)));
+            assert_eq!(parse_status_ids(st, "Gid:"), Some((0, 7)));
+            assert_eq!(parse_status_ids("Uid:\t1\t2\t3\n", "Uid:"), None);
+            assert_eq!(parse_status_ids("Uid:\t1\t2\t3\t4\t5\n", "Uid:"), None);
+            assert_eq!(parse_status_ids("Uid:\ta\t2\t3\t4\n", "Uid:"), None);
+            assert_eq!(parse_status_ids("Name:\tx\n", "Uid:"), None);
         }
     }
 

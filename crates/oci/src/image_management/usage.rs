@@ -457,6 +457,11 @@ mod tests {
             let p = std::env::temp_dir().join(format!("fc-oci-usage-{tag}-{}", std::process::id()));
             let _ = fs::remove_dir_all(&p);
             fs::create_dir_all(blob_dir(&p)).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
+            }
             Root(p)
         }
         fn put(&self, dg: &Digest, len: usize) {

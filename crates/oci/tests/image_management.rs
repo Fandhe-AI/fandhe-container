@@ -122,6 +122,11 @@ fn oci7_image_rm_force_through_store_guard() {
     let _ = fs::remove_dir_all(&root);
     let blobs = root.join("blobs").join("sha256");
     fs::create_dir_all(&blobs).expect("mkdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
     let put = |dg: &Digest| {
         let hex = dg.as_str().trim_start_matches("sha256:");
         fs::write(blobs.join(hex), dg.as_str()).expect("write blob");
@@ -205,6 +210,11 @@ fn oci7_image_rm_force_through_store_guard() {
 fn oci7_image_store_tag_flow_through_public_api() {
     let root = std::env::temp_dir().join(format!("fc-oci-it-tag-{}", std::process::id()));
     std::fs::create_dir_all(&root).expect("mkdir");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
     let mut t = ReferenceTable::new();
     for (m, c, l) in [(0xa0, 0xc1, 0x10), (0xb0, 0xc2, 0x11)] {
         t.register_manifest(

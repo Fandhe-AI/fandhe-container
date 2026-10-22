@@ -23,15 +23,22 @@
 //!
 //! # 未実装・前提（実装済みを装わない。REPAIR-3）
 //!
-//! - コンテナ参照（エントリと世代カウンタ）は #2341 で root 直下の `@container-refs.json` へ永続化済み。
-//!   排他区間に入るたびにディスクから読み直し（ファイルが無ければメモリ上の内容を保つ）、読み込みに失敗
-//!   したら `lock` 自体がエラーを返す。削除の永続化（削除ジャーナルと取得時の再試行。`gc_journal`・#851）は
-//!   実装済みだが、manifest の在庫・タグ・pull リースは永続化されず、プロセスごとのメモリ上の別物のままで、
-//!   プロセス間ロックはそれらの内容を同期しない。
-//! - root の解決・作成・所有者 / 権限（0700）検査・祖先検査は永続化側の担当。`open` は存在する
-//!   ディレクトリ（symlink でない）であることしか見ない。oci には `sys` モジュールが無く
-//!   `O_NOFOLLOW` / `O_NONBLOCK` を使えないため、`@lock` の検査から open までの差し替えは
-//!   「root は所有者専用」の前提で防ぐ（open 後に通常ファイルであることを再確認する）。
+//! - コンテナ参照（エントリと世代カウンタ）は #2341 で root 直下の `@container-refs.json` へ、manifest の
+//!   在庫・タグ・pull リースは #2380 で `@image-inventory.json`（`inventory_persist`）へ永続化済み。
+//!   排他区間に入るたびにどちらもディスクから読み直し（ファイルが無ければメモリ上の内容を保つ）、読み込みに
+//!   失敗したら `lock` 自体がエラーを返す。削除の永続化（削除ジャーナルと取得時の再試行。`gc_journal`・#851）も
+//!   実装済み。保存はひとまとまりの操作の入口が排他の中で行い、ガードから下位メソッドを直接呼んだ変更は
+//!   保存されない（試験と `with_table` の種入れ用の口。ファイルがあれば次の排他取得でディスクの内容になる）。
+//!   本番で在庫を埋める経路（pull → `ImageStore` の配線）は未実装（REPAIR-3）。
+//! - root の所有者・権限・祖先の検査は `open` / `with_table` で行う（#2381・SEC-1。unix のみ）。root は
+//!   現在の実効 uid の所有で group / other に書き込めないこと（`0o022` が立っていない。0700 と 0755 は受理、
+//!   0770・0757・1777 は拒否）、祖先は root か実効 uid の所有で、group / other に書き込めないこと
+//!   （sticky bit 付きは許す）を、副作用（`@lock` の作成）より前に確かめ、違反は `PermissionDenied`。
+//!   root は `canonicalize` した正規パスを保持する。厳密な 0700 までは要求しない（既定 umask の 0755 の
+//!   root を壊さないため。オーナー確認待ち）。残る制約: Windows は検査しない（ACL は #2428 の方式判断後）、
+//!   macOS の拡張 ACL は見ない、検査から使用までの差し替え（TOCTOU）は openat 系が無く閉じきれない
+//!   （`@lock` の検査から open までの差し替えは「root は所有者専用」の前提で防ぐ）。`sys` は
+//!   `geteuid` だけで `O_NOFOLLOW` / `O_NONBLOCK` は持たない。
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::ops::{Deref, DerefMut};
@@ -45,6 +52,7 @@ use super::container_ref_persist::load_container_refs;
 use super::gc_journal::{
     PendingDeletionRecovery, STALE_TMP_PREFIXES, journal_exists, reap_stale_tmp,
 };
+use super::inventory_persist::load_image_inventory;
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 
@@ -70,6 +78,9 @@ pub struct ImageStore {
 
 impl ImageStore {
     /// 空の参照テーブルでストアを開く。root は存在するディレクトリ（symlink 不可）でなければならない。
+    ///
+    /// unix では root が実効 uid の所有で group / other に書き込めず、祖先も root か実効 uid の所有で
+    /// 他者に書き込めない（sticky 付きを除く）ことを要求し、違反は `PermissionDenied`（OCI-7・SEC-1・#2381）。
     pub fn open(root: &Path) -> Result<Self, OciError> {
         Self::with_table(root, ReferenceTable::new())
     }
@@ -98,6 +109,8 @@ impl ImageStore {
                 "image store root is not a directory",
             ));
         }
+        #[cfg(unix)]
+        let root = verify_root_trust(root, &meta)?;
         Ok(Self {
             root,
             table: Mutex::new(table),
@@ -177,6 +190,11 @@ impl ImageStore {
         // 区間に入るたびにディスクのコンテナ参照を正とする（#2341）。壊れた参照表は fail-closed で拒否する。
         if let Some(persisted) = load_container_refs(&self.root)? {
             guard.table.apply_persisted_container_refs(persisted);
+        }
+        // manifest の在庫・タグ・pull リースも同様にディスクを正とする（#2380）。ファイルが無ければメモリ上の
+        // 内容を保つ。復旧と GC の数え直しが別プロセスのリース・タグを見られるよう、復旧より前に読む。
+        if let Some(persisted) = load_image_inventory(&self.root)? {
+            guard.table.apply_persisted_inventory(persisted);
         }
         // 他の操作が割り込む前に、前回の中断した削除を片づける。ジャーナルがあったときだけ記録する。
         reap_stale_tmp(&self.root, STALE_TMP_PREFIXES);
@@ -261,6 +279,76 @@ fn lock_file_error() -> OciError {
         OciErrorCode::Internal,
         "image store lock file is not a regular file",
     )
+}
+
+/// root と祖先の信頼性を検査し、正規化したパスを返す（OCI-7・SEC-1・#2381）。`@lock` 作成等の副作用より前に呼ぶ。
+#[cfg(unix)]
+fn verify_root_trust(root: PathBuf, meta: &fs::Metadata) -> Result<PathBuf, OciError> {
+    let euid = crate::sys::effective_uid();
+    verify_root_meta(meta, euid)?;
+    let canonical = fs::canonicalize(&root)
+        .map_err(|_| OciError::new(OciErrorCode::Internal, "image store root is not accessible"))?;
+    // 検査した実体と正規化後の実体が同じことを確かめる（検査と正規化の間の差し替えを fail-closed に）。
+    let after = fs::symlink_metadata(&canonical)
+        .map_err(|_| OciError::new(OciErrorCode::Internal, "image store root is not accessible"))?;
+    {
+        use std::os::unix::fs::MetadataExt;
+        if after.dev() != meta.dev() || after.ino() != meta.ino() {
+            return Err(OciError::new(
+                OciErrorCode::Internal,
+                "image store root changed while opening",
+            ));
+        }
+    }
+    for ancestor in canonical.ancestors().skip(1) {
+        let m = fs::metadata(ancestor).map_err(|_| {
+            OciError::new(
+                OciErrorCode::Internal,
+                "ancestor of the image store root is not accessible",
+            )
+        })?;
+        verify_ancestor_meta(&m, euid)?;
+    }
+    Ok(canonical)
+}
+
+/// root 自身の所有者・権限の判定（sticky の免除なし。1777 の root は攻撃そのもの）。
+#[cfg(unix)]
+fn verify_root_meta(meta: &fs::Metadata, euid: u32) -> Result<(), OciError> {
+    use std::os::unix::fs::MetadataExt;
+    if meta.mode() & 0o022 != 0 {
+        return Err(OciError::new(
+            OciErrorCode::PermissionDenied,
+            "image store root must not be writable by group or others",
+        ));
+    }
+    if meta.uid() != euid {
+        return Err(OciError::new(
+            OciErrorCode::PermissionDenied,
+            "image store root must be owned by the current user",
+        ));
+    }
+    Ok(())
+}
+
+/// 祖先ディレクトリの判定（root か実効 uid の所有。sticky 付きの group / other 書き込み可は許す。`/tmp` 等）。
+#[cfg(unix)]
+fn verify_ancestor_meta(meta: &fs::Metadata, euid: u32) -> Result<(), OciError> {
+    use std::os::unix::fs::MetadataExt;
+    let mode = meta.mode();
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(OciError::new(
+            OciErrorCode::PermissionDenied,
+            "ancestor of the image store root must not be writable by group or others",
+        ));
+    }
+    if meta.uid() != 0 && meta.uid() != euid {
+        return Err(OciError::new(
+            OciErrorCode::PermissionDenied,
+            "ancestor of the image store root must be owned by root or the current user",
+        ));
+    }
+    Ok(())
 }
 
 /// `@lock` を開く（無ければ 0600 で作る）。symlink・通常ファイル以外は拒否する。
@@ -352,6 +440,11 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&p).expect("mkdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
         p
     }
 
@@ -530,6 +623,106 @@ mod tests {
         assert_eq!(items[1].error_code(), Some(OciErrorCode::Timeout));
         assert!(items[1].latency() >= SHORT);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    fn chmod(p: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(p, fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    /// OCI-7・SEC-1・#2381: 0700 と 0755 の root は受理する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_open_accepts_0700_and_0755_roots() {
+        let root = temp_root("m_ok");
+        for mode in [0o700, 0o755] {
+            chmod(&root, mode);
+            ImageStore::open(&root).unwrap_or_else(|e| panic!("mode {mode:o}: {e:?}"));
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// OCI-7・SEC-1・#2381: group / other に書き込める root は拒否し、`@lock` も作らない。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_open_rejects_group_or_other_writable_root() {
+        let root = temp_root("m_bad");
+        for mode in [0o770, 0o757, 0o1777] {
+            chmod(&root, mode);
+            let e = ImageStore::open(&root).expect_err("writable root");
+            assert_eq!(e.code(), OciErrorCode::PermissionDenied, "mode {mode:o}");
+            assert!(!root.join(IMAGE_STORE_LOCK_FILE_NAME).exists());
+        }
+        chmod(&root, 0o700);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// OCI-7・SEC-1・#2381: 他者が書き込める祖先（sticky なし）は拒否し、sticky 付きは受理する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_open_checks_ancestor_permissions() {
+        let base = temp_root("anc");
+        let root = base.join("store");
+        fs::create_dir(&root).expect("mkdir");
+        chmod(&root, 0o700);
+        chmod(&base, 0o777);
+        assert_eq!(
+            ImageStore::open(&root).expect_err("ancestor").code(),
+            OciErrorCode::PermissionDenied
+        );
+        chmod(&base, 0o1777);
+        ImageStore::open(&root).expect("sticky ancestor is accepted");
+        chmod(&base, 0o700);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// OCI-7・SEC-1・#2381: 所有者の判定（chown は root 権限が要るため純関数で照合する）。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_owner_checks_use_effective_uid() {
+        use std::os::unix::fs::MetadataExt;
+        let root = temp_root("owner");
+        let meta = fs::metadata(&root).expect("meta");
+        let uid = meta.uid();
+        assert!(verify_root_meta(&meta, uid).is_ok());
+        assert_eq!(
+            verify_root_meta(&meta, uid.wrapping_add(1))
+                .expect_err("other owner")
+                .code(),
+            OciErrorCode::PermissionDenied
+        );
+        // 祖先は root か実効 uid の所有を受理する。自分の所有は uid 一致で受理、不一致（かつ非 root）は拒否。
+        assert!(verify_ancestor_meta(&meta, uid).is_ok());
+        if uid != 0 {
+            assert_eq!(
+                verify_ancestor_meta(&meta, uid.wrapping_add(1))
+                    .expect_err("foreign ancestor")
+                    .code(),
+                OciErrorCode::PermissionDenied
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// OCI-7・SEC-1・#2381: 祖先側の symlink を経由しても、root は正規化したパスで保持する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_open_stores_canonical_root() {
+        let base = temp_root("canon");
+        let real = base.join("real");
+        fs::create_dir(&real).expect("mkdir");
+        chmod(&real, 0o700);
+        let store_dir = real.join("store");
+        fs::create_dir(&store_dir).expect("mkdir");
+        chmod(&store_dir, 0o700);
+        std::os::unix::fs::symlink(&real, base.join("link")).expect("symlink");
+        let store = ImageStore::open(&base.join("link").join("store")).expect("open");
+        assert_eq!(
+            store.root(),
+            fs::canonicalize(&store_dir).expect("canon").as_path()
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// OCI-7: 末尾区切り付きの symlink root も拒否する。

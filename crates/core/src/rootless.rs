@@ -46,9 +46,10 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - ユーザー名 → `/etc/subuid` 行の NSS 解決は**追加しない**（`getpwuid_r` は新規 FFI のため。
-//!   呼び出し側が [`SubIdOwner`] に数値 uid と検証済みユーザー名を渡す方式を維持する。
-//!   ライブラリコードは `$USER` を読まない）
+//! - ユーザー名 → `/etc/subuid` 行の NSS 解決は core では行わない。名前の解決は supervisor の `id_model` が
+//!   `/etc/passwd` を先に読み、無いときだけ `getent` を期限つきで実行して行う（#2390・SEC-5・CORE-6。
+//!   `docs/design/subid-owner-resolution.md`）。core は [`SubIdOwner`] に数値 uid と検証済みユーザー名を
+//!   受け取るだけで、ライブラリコードは `$USER` を読まない
 //! - `oci_runtime` の `linux.uidMappings` / `gidMappings` の受理（start.rs は現状拒否のまま。受けるかは SEC-5 に関わるオーナー判断待ち。#2240・`docs/design/config-id-mappings.md`）
 //!
 //! ファイル所有者の写像（SEC-5。ns 内 0 → ホスト非特権 UID）の照合は `tests/rootless_file_owner.rs`
@@ -82,8 +83,9 @@ const MAX_HELPER_STDERR_BYTES: usize = 4096;
 /// ヘルパー実行タイムアウトの既定（REPAIR-5）。範囲は `1..=60` 秒。
 pub const DEFAULT_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HELPER_TIMEOUT: Duration = Duration::from_secs(60);
-/// 所有者名の最大長。
-const MAX_OWNER_NAME_LEN: usize = 32;
+/// 所有者名の最大バイト長（`LOGIN_NAME_MAX`）。sssd / LDAP の長い名前（`user@example.com` 等）を受けるため
+/// shadow 側に制限が無いことに合わせて緩める（#2390）。
+const MAX_OWNER_NAME_LEN: usize = 256;
 
 /// 失敗した段（ERR-1 の機械可読な文脈）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -337,13 +339,16 @@ pub struct SubIdOwner {
 }
 
 impl SubIdOwner {
-    /// 所有者を作る。名前は `[A-Za-z0-9._-]`・32 文字以内のみ許可する。
+    /// 所有者を作る。名前は空でなく 256 バイト以内で、`:`・空白・ASCII 制御文字を含まないものだけ許可する。
+    ///
+    /// 名前は分割した欄との `==` 比較にしか使わず helper にもシェルにも渡さないため、文字種は注入面にならない
+    /// （`newuidmap` 側にも文字種の制限は無い。#2390）。
     pub fn new(uid: u32, name: Option<String>) -> Result<Self, RootlessError> {
         if let Some(n) = &name {
             let ok = !n.is_empty()
                 && n.len() <= MAX_OWNER_NAME_LEN
-                && n.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+                && n.chars()
+                    .all(|c| c != ':' && !c.is_whitespace() && !c.is_ascii_control());
             if !ok {
                 return Err(RootlessError::invalid(
                     RootlessStage::ParseSubordinateIds,
@@ -1176,7 +1181,16 @@ pub(crate) fn run_userns_holder(
 /// `/proc/<pid>` fd を開いたうえで、mapper 自身の親と対象の親がともに `expected_parent`(中間プロセス)
 /// のままであることを確認する（reparent 後に無関係な pid へ書かない。pid 再利用・TOCTOU 対策）→ [`apply_id_maps_to`] を fd に対して実行 → 応答フレームを返す。
 /// 親が死んでも mapper 側の fd は閉じられず EOF を当てにできないため、待ちは read タイムアウトで
-/// 止める（REPAIR-5）。詳細は stderr へ出す（自由形式の文字列は応答に載せない）。
+/// 止める（REPAIR-5）。詳細は呼び出し側が渡す `diag` へ 1 行で出す（自由形式の文字列は応答に載せない）。
+///
+/// `diag`（CORE-6・REPAIR-12・#2393）: 本番（`exec.rs` の mapper の fork 子）は fork 後の子の中で作った
+/// unbuffered の `std::io::stderr()` を渡す。子は `_exit` で終わるため、`BufWriter` 等のバッファ付きは
+/// 渡さない（flush されず出力が失われる）。試験は `Vec<u8>` を渡して内容を具体値で照合する（libtest の
+/// 出力捕捉を通らず成功試験の実行中に雑音が出るのを避ける）。書き込みの失敗は無視し応答は必ず返す。
+/// 書き先は呼び出しごとの引数とし、グローバルな差し替えは採らない（fork 時に他スレッドが持つロックで
+/// 子がデッドロックするため。`eprintln!` も書き込み失敗で panic するため使わない）。
+// 引数 8 個: fork 子の単一呼び出し口で、まとめる構造体への整理は #2393 の対象外(最小変更)。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_id_map_mapper(
     target: u32,
     expected_parent: u32,
@@ -1185,6 +1199,7 @@ pub(crate) fn run_id_map_mapper(
     gid: &IdMapSet,
     writer: &IdMapWriter,
     timeout: Duration,
+    diag: &mut dyn std::io::Write,
 ) -> i32 {
     let outcome = mapper_outcome(
         target,
@@ -1198,7 +1213,7 @@ pub(crate) fn run_id_map_mapper(
     let (reply, code) = match outcome {
         Ok(()) => (MapperReply::Ok, 0),
         Err(e) => {
-            let _ = writeln!(std::io::stderr(), "fandhe-container: id map mapper: {e}");
+            let _ = writeln!(diag, "fandhe-container: id map mapper: {e}");
             (
                 MapperReply::Failed {
                     code: e.code,
@@ -1405,6 +1420,27 @@ mod tests {
         assert!(SubIdOwner::new(1, Some("a:b".to_string())).is_err());
     }
 
+    /// CORE-6・SEC-5（#2390）: sssd / LDAP 形式の長い名前・`@` つきの名前を受け、規則違反は拒否する。
+    #[test]
+    fn core6_owner_name_accepts_directory_service_names() {
+        for ok in ["alice@example.com".to_string(), "a".repeat(256)] {
+            assert!(SubIdOwner::new(1, Some(ok)).is_ok());
+        }
+        for bad in [
+            "a".repeat(257),
+            "a\nb".to_string(),
+            "a\tb".to_string(),
+            "a\0b".to_string(),
+            String::new(),
+        ] {
+            assert!(SubIdOwner::new(1, Some(bad)).is_err());
+        }
+        let owner = SubIdOwner::new(1000, Some("alice@example.com".to_string())).expect("owner");
+        let ranges =
+            parse_subordinate_ids(b"alice@example.com:100000:65536\n", &owner).expect("parse");
+        assert_eq!(ranges.len(), 1);
+    }
+
     #[test]
     fn core6_parse_id_map_handles_kernel_padding() {
         let got =
@@ -1555,6 +1591,7 @@ mod tests {
     fn core6_mapper_times_out_without_go_signal() {
         let (parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
         let (uid, gid) = mapper_fixture();
+        let mut diag: Vec<u8> = Vec::new();
         let code = run_id_map_mapper(
             std::process::id(),
             std::os::unix::process::parent_id(),
@@ -1563,6 +1600,7 @@ mod tests {
             &gid,
             &IdMapWriter::Direct,
             Duration::from_secs(1),
+            &mut diag,
         );
         assert_eq!(code, 1);
         let mut buf = [0u8; MAPPER_REPLY_LEN];
@@ -1575,6 +1613,9 @@ mod tests {
                 stage: RootlessStage::Validate
             }
         );
+        let text = String::from_utf8(diag).expect("utf8");
+        assert_eq!(text.matches('\n').count(), 1);
+        assert!(text.starts_with("fandhe-container: id map mapper: TIMEOUT (validate): did not receive the go signal from the parent: "), "{text}");
     }
 
     /// CORE-6・SEC-5（TASK-40.2）: 親 pid が期待と違えば（reparent 後の pid 再利用を想定）
@@ -1587,6 +1628,7 @@ mod tests {
         // 実在するが親ではない pid（自プロセス）を使う。存在しない pid だと `/proc/<pid>` の open が
         // 先に `NotFound` で失敗し、親不一致の検証まで到達しない。
         let wrong = std::process::id();
+        let mut diag: Vec<u8> = Vec::new();
         let code = run_id_map_mapper(
             wrong,
             wrong,
@@ -1595,6 +1637,7 @@ mod tests {
             &gid,
             &IdMapWriter::Direct,
             Duration::from_secs(1),
+            &mut diag,
         );
         assert_eq!(code, 1);
         let mut buf = [0u8; MAPPER_REPLY_LEN];
@@ -1605,6 +1648,12 @@ mod tests {
                 code: ErrorCode::FailedPrecondition,
                 stage: RootlessStage::Validate
             }
+        );
+        let text = String::from_utf8(diag).expect("utf8");
+        assert_eq!(text.matches('\n').count(), 1);
+        assert_eq!(
+            text,
+            "fandhe-container: id map mapper: FAILED_PRECONDITION (validate): the parent process changed before the mapping was written\n"
         );
     }
 
@@ -1615,6 +1664,7 @@ mod tests {
         let (mut parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
         parent_end.write_all(&[MAPPER_GO]).expect("go");
         let (uid, gid) = mapper_fixture();
+        let mut diag: Vec<u8> = Vec::new();
         let code = run_id_map_mapper(
             1,
             std::os::unix::process::parent_id(),
@@ -1623,6 +1673,7 @@ mod tests {
             &gid,
             &IdMapWriter::Direct,
             Duration::from_secs(1),
+            &mut diag,
         );
         assert_eq!(code, 1);
         let mut buf = [0u8; MAPPER_REPLY_LEN];
@@ -1633,6 +1684,12 @@ mod tests {
                 code: ErrorCode::FailedPrecondition,
                 stage: RootlessStage::Validate
             }
+        );
+        let text = String::from_utf8(diag).expect("utf8");
+        assert_eq!(text.matches('\n').count(), 1);
+        assert_eq!(
+            text,
+            "fandhe-container: id map mapper: FAILED_PRECONDITION (validate): the mapping target is not a child of the expected parent\n"
         );
     }
 
@@ -1652,6 +1709,7 @@ mod tests {
         let (mut parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
         parent_end.write_all(&[9]).expect("byte");
         let (uid, gid) = mapper_fixture();
+        let mut diag: Vec<u8> = Vec::new();
         let code = run_id_map_mapper(
             std::process::id(),
             std::os::unix::process::parent_id(),
@@ -1660,6 +1718,52 @@ mod tests {
             &gid,
             &IdMapWriter::Direct,
             Duration::from_secs(1),
+            &mut diag,
+        );
+        assert_eq!(code, 1);
+        let mut buf = [0u8; MAPPER_REPLY_LEN];
+        parent_end.read_exact(&mut buf).expect("reply");
+        assert_eq!(
+            MapperReply::decode(&buf).expect("decode"),
+            MapperReply::Failed {
+                code: ErrorCode::InvalidArgument,
+                stage: RootlessStage::Validate
+            }
+        );
+        let text = String::from_utf8(diag).expect("utf8");
+        assert_eq!(text.matches('\n').count(), 1);
+        assert_eq!(
+            text,
+            "fandhe-container: id map mapper: INVALID_ARGUMENT (validate): unexpected go signal byte\n"
+        );
+    }
+
+    /// 常に失敗する書き先。
+    struct FailingWriter;
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("sink closed"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("sink closed"))
+        }
+    }
+
+    /// CORE-6・REPAIR-12・REPAIR-5（#2393）: 診断の書き先が失敗しても応答フレームと終了コードは変わらない。
+    #[test]
+    fn core6_mapper_reply_survives_diag_write_failure() {
+        let (mut parent_end, mapper_end) = std::os::unix::net::UnixStream::pair().expect("pair");
+        parent_end.write_all(&[9]).expect("byte");
+        let (uid, gid) = mapper_fixture();
+        let code = run_id_map_mapper(
+            std::process::id(),
+            std::os::unix::process::parent_id(),
+            mapper_end,
+            &uid,
+            &gid,
+            &IdMapWriter::Direct,
+            Duration::from_secs(1),
+            &mut FailingWriter,
         );
         assert_eq!(code, 1);
         let mut buf = [0u8; MAPPER_REPLY_LEN];

@@ -38,6 +38,11 @@ impl Tmp {
         let p = std::env::temp_dir().join(format!("fc-oci-sdf-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).expect("mkdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
         // 状態ルートの祖先は group / others に書き込めてはいけない（umask に依らず 0700 にする）。
         fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
         Tmp(p)
@@ -83,6 +88,11 @@ fn oci7_system_df_composes_containers_staging_and_expanded() {
     let root = t.0.join("images");
     let blobs = root.join("blobs").join("sha256");
     fs::create_dir_all(&blobs).expect("blobs");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
     let layer = gz(&[9u8; 20_000]);
     fs::write(blobs.join("10".repeat(32)), &layer).expect("layer");
     fs::write(blobs.join("c1".repeat(32)), vec![0u8; 50]).expect("config blob");

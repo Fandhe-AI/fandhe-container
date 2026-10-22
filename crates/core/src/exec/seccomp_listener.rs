@@ -11,7 +11,9 @@
 //! 通知を読んで応答するループ（PID 変換・`record_seccomp_denial_for`・`EPERM` 応答）は supervisor の
 //! `seccomp_notify`（#2025）が担い、本モジュールは取得・受け渡しと、通知の読み書きの安全 API（[`SeccompListener::wait`]・
 //! `receive`・`is_pending`・`deny_eperm`）を担う。**filter の既定は ERRNO 版**（`USER_NOTIF` を返さない）で、listener を
-//! 保持するだけならコンテナの挙動は変わらない。`ProductionLauncherBuilder::seccomp_errno_delivery(UserNotif)` で opt-in した
+//! 保持するだけならコンテナの挙動は変わらない。exec の経路（SUP-6・#2385）では worker が同じ手順で渡し、起動側 C は worker を fork した
+//! exec 専用の親（[`ExecListenerReceiver`]）になる。exec の親は worker の終了を待つ前に受信し（相互待ちを避ける）、exec での
+//! USER_NOTIF 化と応答者は後続。`ProductionLauncherBuilder::seccomp_errno_delivery(UserNotif)` で opt-in した
 //! launcher（supervisor の start 経路だけ）では ERRNO 側の 40 件が通知になり、応答者がいる前提になる
 //! （`audit-delivery.md` 9 章の案 3）。通知の引数・命令ポインタは公開せず、応答は `-EPERM` の 1 種類だけ（TOCTOU の余地を
 //! 型で無くす）。
@@ -63,7 +65,7 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use super::{ExecError, IsolationStage};
+use super::{ContainerChild, ExecError, IsolationStage};
 use crate::sys::{self, SysError};
 use crate::traits::types::ErrorCode;
 
@@ -353,7 +355,7 @@ fn validate(
         truncated,
     } = received;
     if payload.is_empty() && fds.is_empty() {
-        return Err("the sender closed before delivering the seccomp listener");
+        return Err(SENDER_CLOSED_MESSAGE);
     }
     if truncated {
         return Err("the listener message was truncated");
@@ -437,41 +439,77 @@ pub(crate) fn receive_listener(
     expected_pid: u32,
     deadline: Instant,
 ) -> Result<SeccompListener, ExecError> {
+    receive_listener_classified(sock, expected_pid, deadline).map_err(|failure| match failure {
+        ReceiveFailure::SenderClosed => ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Seccomp,
+            SENDER_CLOSED_MESSAGE,
+        ),
+        ReceiveFailure::Failed(e) => e,
+    })
+}
+
+/// 何も届かないまま送り手が閉じたときの文言（launch 側の `Internal` と exec 側の判別で同じ値を使う）。
+const SENDER_CLOSED_MESSAGE: &str = "the sender closed before delivering the seccomp listener";
+
+/// [`receive_listener_classified`] の失敗。EOF（送り手が seccomp より前で失敗して終わった通常の経路）と、
+/// それ以外の拒否・期限切れを区別する（exec の親は前者では worker の結果を採る。SUP-6・#2385）。
+enum ReceiveFailure {
+    /// 本文も fd も無いまま EOF になった。
+    SenderClosed,
+    /// 検証の不一致・切り詰め・期限切れ・syscall 失敗・`E` 通知の復元（段 `Seccomp`）。
+    Failed(ExecError),
+}
+
+/// [`receive_listener`] の本体。EOF を [`ReceiveFailure::SenderClosed`] として区別して返す。
+fn receive_listener_classified(
+    sock: BorrowedFd<'_>,
+    expected_pid: u32,
+    deadline: Instant,
+) -> Result<SeccompListener, ReceiveFailure> {
     const STAGE: IsolationStage = IsolationStage::Seccomp;
+    let failed = |e: ExecError| ReceiveFailure::Failed(e);
     // 受信は `MSG_DONTWAIT`。poll の見かけ上の起床で `EAGAIN` になれば、同じ `deadline` までで待ち直す
     // （各周回の `wait_readable` が期限を見るため無期限にならない。REPAIR-5・#2372）。
     let received = loop {
         match wait_readable(sock, deadline) {
             Ok(true) => {}
             Ok(false) => {
-                return Err(ExecError::new(
+                return Err(failed(ExecError::new(
                     ErrorCode::Timeout,
                     STAGE,
                     "the seccomp listener was not delivered in time",
-                ));
+                )));
             }
             Err(e) => {
-                return Err(ExecError::from_sys(
+                return Err(failed(ExecError::from_sys(
                     e,
                     STAGE,
                     "wait for the seccomp listener",
-                ));
+                )));
             }
         }
         match sys::seccomp_notify::recv_fd_with_creds(sock) {
             Err(SysError::Os(e)) if e == sys::EAGAIN => {}
             other => {
                 break other.map_err(|e| {
-                    ExecError::from_sys(e, STAGE, "receive of the seccomp listener")
+                    failed(ExecError::from_sys(
+                        e,
+                        STAGE,
+                        "receive of the seccomp listener",
+                    ))
                 })?;
             }
         }
     };
     if let Some(e) = decode_failure(&received, expected_pid) {
-        return Err(e);
+        return Err(failed(e));
+    }
+    if received.payload.is_empty() && received.fds.is_empty() {
+        return Err(ReceiveFailure::SenderClosed);
     }
     let fd = validate(received, expected_pid)
-        .map_err(|why| ExecError::new(ErrorCode::Internal, STAGE, why))?;
+        .map_err(|why| failed(ExecError::new(ErrorCode::Internal, STAGE, why)))?;
     // 設定の失敗で ACK を返さない(子が exec へ進んだまま listener だけ捨てられるのを防ぐ。fail-closed)。
     ack_after_nonblocking(
         || {
@@ -483,7 +521,8 @@ pub(crate) fn receive_listener(
                 .map(|_| ())
                 .map_err(|e| ExecError::from_sys(e, STAGE, "send of the listener ACK"))
         },
-    )?;
+    )
+    .map_err(failed)?;
     Ok(SeccompListener(fd, AtomicBool::new(false)))
 }
 
@@ -509,6 +548,149 @@ pub(crate) fn listener_socketpair() -> Result<(OwnedFd, OwnedFd), ExecError> {
         super::process::keep_above_stdio(parent_end)?,
         super::process::keep_above_stdio(child_end)?,
     ))
+}
+
+/// exec の worker（`spawn_exec_worker_with_listener` の子）側の送信口（SEC-4・SUP-6・#2385）。
+///
+/// `ExecRestrictions::with_seccomp_listener` へ渡すと、`reapply_restrictions` の最後（seccomp の段）が
+/// `NEW_LISTENER` 付きで filter を載せ、得た listener を exec の親（[`ExecListenerReceiver`]）へ渡して ACK を待つ。
+/// 構築できるのは core だけ（`spawn_exec_worker_with_listener` が worker へ渡す）で、`Clone` を持たない。
+/// filter の届け方は ERRNO 版のまま（通知は生じない。応答者は後続。`docs/design/audit-delivery.md`）。
+#[derive(Debug)]
+pub struct ExecListenerSender {
+    inner: ListenerSender,
+    ack_deadline: Option<Instant>,
+}
+
+impl ExecListenerSender {
+    fn new(child_end: OwnedFd) -> Self {
+        Self {
+            inner: ListenerSender::new(child_end),
+            ack_deadline: None,
+        }
+    }
+
+    /// ACK 待ちの絶対期限を設定する（実際の待ちは `ACK_TIMEOUT` と残り時間の短い方。REPAIR-5）。
+    #[must_use]
+    pub fn with_ack_deadline(mut self, at: Instant) -> Self {
+        self.ack_deadline = Some(at);
+        self
+    }
+
+    /// 送り手と、ACK を待つ上限。
+    pub(crate) fn into_parts(self) -> (ListenerSender, Duration) {
+        let timeout = match self.ack_deadline {
+            Some(at) => at
+                .saturating_duration_since(Instant::now())
+                .min(ACK_TIMEOUT),
+            None => ACK_TIMEOUT,
+        };
+        (self.inner, timeout)
+    }
+}
+
+/// exec の親プロセス側の受信口（SEC-4・SUP-6・#2385）。worker の fork の前に作った socketpair の親の端を所有する。
+#[derive(Debug)]
+pub struct ExecListenerReceiver(OwnedFd);
+
+/// [`ExecListenerReceiver::receive`] の結果。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ListenerReceipt {
+    /// 検証済みの listener を受け取り、ACK を返した。呼び出し側は worker の回収が済むまで保持する。
+    Received(SeccompListener),
+    /// 何も届かないまま worker 側が閉じた。worker が seccomp の段より前で失敗して終わった通常の経路で、
+    /// 呼び出し側は worker の結果（失敗の理由）を採る。worker が成功を返したなら ACK 無しで進んだことになるため拒否する。
+    SenderClosed,
+    /// 検証の不一致・切り詰め・送信元の不一致・worker からの失敗通知（`EBUSY` 等）。段 `Seccomp`。
+    Rejected(ExecError),
+    /// 期限までに届かなかった。段 `Seccomp`・`Timeout`。
+    TimedOut(ExecError),
+}
+
+impl ExecListenerReceiver {
+    /// listener を期限つきで受信・検証して ACK を返す。`self` を消費するため、成否によらず親の端は閉じ、
+    /// worker の ACK 待ちには HUP が届く。`worker` は `spawn_exec_worker_with_listener` が返した子で、送信元の pid の照合に使う。
+    ///
+    /// worker の終了を待つ **前** に呼ぶこと（worker は ACK を待つため、先に終了を待つと相互待ちになる）。
+    pub fn receive(self, worker: &ContainerChild, deadline: Instant) -> ListenerReceipt {
+        match receive_listener_classified(self.0.as_fd(), worker.pid(), deadline) {
+            Ok(listener) => ListenerReceipt::Received(listener),
+            Err(ReceiveFailure::SenderClosed) => ListenerReceipt::SenderClosed,
+            Err(ReceiveFailure::Failed(e)) if e.code == ErrorCode::Timeout => {
+                ListenerReceipt::TimedOut(e)
+            }
+            Err(ReceiveFailure::Failed(e)) => ListenerReceipt::Rejected(e),
+        }
+    }
+}
+
+/// 新しい socketpair を作り、`(親の端, 子の端の送信口)` を返す（`exec_command` の worker 用）。
+pub(crate) fn exec_listener_pair() -> Result<(ExecListenerReceiver, OwnedFd), ExecError> {
+    let (parent_end, child_end) = listener_socketpair()?;
+    Ok((ExecListenerReceiver(parent_end), child_end))
+}
+
+impl ExecListenerReceiver {
+    /// 親の端の fd 番号（worker が継承した複製を閉じるために使う）。
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+/// 子の端から送信口を作る（`exec_command` の worker 内で呼ぶ）。
+pub(crate) fn exec_sender_from(child_end: OwnedFd) -> ExecListenerSender {
+    ExecListenerSender::new(child_end)
+}
+
+/// 試験専用: worker の中で本番と同じ seccomp の listener 付き適用（NNP → `NEW_LISTENER` 付き filter → 送信 → ACK 待ち）を行い、
+/// 受け渡しの後に開いている socket fd の数を返す（SEC-4・SUP-6・#2385。supervisor の結合試験 `exec_seccomp_listener`）。
+///
+/// 数は 0 でなければならない（子の端は送信で消費され、継承した親の端は worker の開始時に閉じ済みのため。残っていれば
+/// listener の受け渡しに使った socket が worker に漏れている）。**呼び出しプロセスに seccomp の filter が不可逆に載る**
+/// ため、使い捨ての worker 専用。`exec-test-support` feature の下のみ。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn apply_exec_seccomp_listener_for_test(
+    sender: ExecListenerSender,
+) -> Result<usize, ExecError> {
+    super::no_new_privs::apply_no_new_privs()?;
+    let (sender, timeout) = sender.into_parts();
+    super::seccomp::apply_default_seccomp_with_listener_threads(
+        sender,
+        timeout,
+        &mut super::ThreadCountSource::ProcSelf,
+    )?;
+    let dir = std::fs::read_dir("/proc/self/fd").map_err(|_| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Seccomp,
+            "failed to list the open fds",
+        )
+    })?;
+    // `read_dir` 自身の fd も数えるが、それは socket ではない。
+    Ok(dir
+        .flatten()
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .filter(|t| t.to_str().is_some_and(|s| s.starts_with("socket:[")))
+        .count())
+}
+
+/// 試験専用: listener ではない fd（pipe の読み端）を、本番の `hand_over` と同じ経路で親へ送る（親の検証が拒否することと、
+/// 拒否で worker の ACK 待ちが期限より前に終わることの確認用。SEC-4・SUP-6・#2385）。常に `Err` を返せば期待どおり
+/// （親が拒否して閉じた）で、`Ok` は親が ACK を返した（検証の欠陥）。`exec-test-support` feature の下のみ。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn hand_over_non_listener_for_test(sender: ExecListenerSender) -> Result<(), ExecError> {
+    let (sender, timeout) = sender.into_parts();
+    let (reader, _writer) = std::io::pipe().map_err(|_| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Seccomp,
+            "failed to create a pipe",
+        )
+    })?;
+    sender.hand_over(OwnedFd::from(reader), timeout)
 }
 
 /// [`UserNotifProbe::call_kcmp`] が応答を待つ上限。
@@ -1004,5 +1186,161 @@ mod tests {
             crate::exec::StagePipeline::new().seccomp_delivery(),
             crate::seccomp::ErrnoDelivery::Errno
         );
+    }
+
+    // ---- exec の受け渡し（SEC-4・SUP-6・#2385）。worker の代役を同一プロセス内のスレッドで立てる。----
+    //
+    // libtest は多スレッドで走るため、`fork` を伴う代役は単一スレッド検査（`Threads: 1`）を満たせない。検査を迂回して
+    // fork すると、子が他スレッドの握るロックを継承して停止したり、並行する試験の fd を継承して EOF 検出が遅れたりする。
+    // そのため fork せず、受け渡しの送信側（worker の役）をスレッドで動かす。送信元 pid の照合（SO_PEERCRED）は
+    // 自プロセスの pid と一致する。fork を伴う実プロセスの経路は supervisor の結合試験 `exec_seccomp_listener`
+    // （`harness = false`）が検証する。
+
+    /// 代役の worker。`pid` は自プロセスのもので、`join` が終了コード（`body` の戻り値）を返す。
+    struct WorkerStandIn {
+        child: ContainerChild,
+        handle: std::thread::JoinHandle<i32>,
+    }
+
+    impl WorkerStandIn {
+        /// スレッドの終了を待って `body` の戻り値を返す（panic は -1）。
+        fn join(self) -> i32 {
+            self.handle.join().unwrap_or(-1)
+        }
+    }
+
+    /// 代役の worker を起動し、`(親の受信口, 代役)` を返す。`body` は子の送信口を受けて終了コードを返す。
+    fn fork_worker_stand_in(
+        body: impl FnOnce(ExecListenerSender) -> i32 + Send + 'static,
+    ) -> (ExecListenerReceiver, WorkerStandIn) {
+        let (receiver, child_end) = exec_listener_pair().unwrap();
+        let handle = std::thread::spawn(move || body(exec_sender_from(child_end)));
+        (
+            receiver,
+            WorkerStandIn {
+                child: ContainerChild::spawned(std::process::id()),
+                handle,
+            },
+        )
+    }
+
+    /// 子の中で実 listener を作る（NNP を立て、ERRNO 版の filter を `NEW_LISTENER` 付きで載せる）。
+    fn child_listener() -> Option<OwnedFd> {
+        sys::set_no_new_privs().ok()?;
+        let p = crate::seccomp::build_filter_for_target_arch().ok()?;
+        sys::seccomp_notify::seccomp_set_filter_new_listener(&p).ok()
+    }
+
+    /// SEC-4・SUP-6（#2385）: 実 listener を受け取って検証し、worker は ACK を受けて 0 で終わる。
+    #[test]
+    fn sec4_sup6_2385_exec_receiver_gets_a_verified_listener() {
+        let (receiver, stand_in) = fork_worker_stand_in(|sender| {
+            let Some(listener) = child_listener() else {
+                return 10;
+            };
+            let (sender, timeout) = sender
+                .with_ack_deadline(Instant::now() + Duration::from_secs(20))
+                .into_parts();
+            match sender.hand_over(listener, timeout) {
+                Ok(()) => 0,
+                Err(_) => 11,
+            }
+        });
+        match receiver.receive(&stand_in.child, Instant::now() + Duration::from_secs(20)) {
+            ListenerReceipt::Received(l) => {
+                let kind =
+                    std::fs::read_link(format!("/proc/self/fd/{}", l.as_fd().as_raw_fd())).unwrap();
+                assert_eq!(kind.to_str(), Some("anon_inode:seccomp notify"));
+            }
+            other => panic!("unexpected receipt: {other:?}"),
+        }
+        assert_eq!(stand_in.join(), 0);
+    }
+
+    /// SEC-4・SUP-6（#2385）: worker が何も送らずに終わると `SenderClosed`（期限を待たない）。
+    #[test]
+    fn sec4_sup6_2385_exec_receiver_reports_sender_closed() {
+        let (receiver, stand_in) = fork_worker_stand_in(|sender| {
+            drop(sender);
+            0
+        });
+        let started = Instant::now();
+        let receipt = receiver.receive(&stand_in.child, Instant::now() + Duration::from_secs(30));
+        assert!(
+            matches!(receipt, ListenerReceipt::SenderClosed),
+            "{receipt:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(stand_in.join(), 0);
+    }
+
+    /// SEC-4・SUP-6（#2385）: listener でない fd は `Rejected`（段 `Seccomp`）。親が閉じると worker の ACK 待ちは
+    /// HUP で期限より前に終わる。
+    #[test]
+    fn sec4_sup6_2385_exec_receiver_rejects_a_non_listener_fd() {
+        let (receiver, stand_in) = fork_worker_stand_in(|sender| {
+            let (sender, _) = sender.into_parts();
+            let (r, _w) = std::io::pipe().unwrap();
+            let fd = OwnedFd::from(r);
+            // 本物の `hand_over` と同じ経路で送り、ACK 待ちが HUP で終わること（60 秒を待たない）を確かめる。
+            match sender.hand_over(fd, Duration::from_secs(20)) {
+                Err(_) => 0,
+                Ok(()) => 12,
+            }
+        });
+        let started = Instant::now();
+        match receiver.receive(&stand_in.child, Instant::now() + Duration::from_secs(20)) {
+            ListenerReceipt::Rejected(e) => {
+                assert_eq!(e.stage, IsolationStage::Seccomp);
+                assert_eq!(e.code, ErrorCode::Internal);
+                assert_eq!(
+                    e.message,
+                    "the received fd is not a seccomp notification fd"
+                );
+            }
+            other => panic!("unexpected receipt: {other:?}"),
+        }
+        assert_eq!(stand_in.join(), 0);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// REPAIR-5・SEC-4（#2385）: 何も届かず眠る worker は期限で `TimedOut`（段 `Seccomp`・`Timeout`）。
+    #[test]
+    fn sec4_sup6_2385_exec_receiver_times_out() {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (receiver, stand_in) = fork_worker_stand_in(move |sender| {
+            let _keep = sender;
+            let _ = released.recv_timeout(Duration::from_secs(30));
+            0
+        });
+        let receipt =
+            receiver.receive(&stand_in.child, Instant::now() + Duration::from_millis(150));
+        match receipt {
+            ListenerReceipt::TimedOut(e) => {
+                assert_eq!(e.code, ErrorCode::Timeout);
+                assert_eq!(e.stage, IsolationStage::Seccomp);
+            }
+            other => panic!("unexpected receipt: {other:?}"),
+        }
+        release.send(()).unwrap();
+        assert_eq!(stand_in.join(), 0);
+    }
+
+    /// REPAIR-5（#2385）: ACK 待ちの上限は、全体の期限が近ければその残り（`ACK_TIMEOUT` を超えない）。
+    #[test]
+    fn sec4_sup6_2385_ack_wait_is_capped_by_the_deadline() {
+        let (_r, c) = exec_listener_pair().unwrap();
+        let (_, t) = exec_sender_from(c).into_parts();
+        assert_eq!(t, ACK_TIMEOUT);
+        let (_r, c) = exec_listener_pair().unwrap();
+        let (_, t) = exec_sender_from(c)
+            .with_ack_deadline(Instant::now() + Duration::from_secs(2))
+            .into_parts();
+        assert!(t <= Duration::from_secs(2), "{t:?}");
+        let (_r, c) = exec_listener_pair().unwrap();
+        let (_, t) = exec_sender_from(c)
+            .with_ack_deadline(Instant::now() + Duration::from_secs(3600))
+            .into_parts();
+        assert_eq!(t, ACK_TIMEOUT);
     }
 }

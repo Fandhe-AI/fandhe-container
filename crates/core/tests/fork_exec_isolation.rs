@@ -44,7 +44,7 @@
 //!   （setup 失敗）、stderr に失敗した段（`at Landlock`。#173 以降 capability 削減は組み込みのためフック失敗の対象外）
 //!
 //! - シナリオ `landlock-apply-ro` / `landlock-apply-rw` / `landlock-fail`（#184・TASK-39.4・CORE-5。
-//!   `with_landlock` + `spawn_container_seccomp_probe`）: 実カーネルの Landlock を fork した子で適用する。
+//!   `with_landlock` + `spawn_container_probe`）: 実カーネルの Landlock を fork した子で適用する。
 //!   ro は適用成功後に終端の書き込みが拒否され（`Exited(125)`・`Permission denied`）、rw は書き込みが
 //!   許可され（`Exited(0)`）、存在しない mount 先は適用失敗で起動拒否（`Exited(125)`・
 //!   `landlock_open_path_failed`）になる。いずれも Landlock の前段（cgroup 参加）は制限前に実行済み。
@@ -125,7 +125,7 @@ mod linux {
     use fandhe_container_core::exec::{
         ChildExit, EXIT_EXEC_NOT_FOUND, Entrypoint, ExecError, Hostname, IsolationConfig,
         Namespace, NamespaceSet, StageKind, StagePipeline, isolate, isolate_rootful_host_root,
-        plan, plan_rootful_host_root, spawn_container, spawn_container_seccomp_probe,
+        plan, plan_rootful_host_root, spawn_container, spawn_container_probe,
         spawn_container_with_stages,
     };
     use fandhe_container_core::landlock::{
@@ -490,8 +490,8 @@ mod linux {
                 // CORE-5・TASK-39.4・#184: 実カーネルの Landlock を、fork した子の本番経路
                 // （`spawn_container_*` → pivot → 組み込みの capability 削減・NO_NEW_PRIVS → Landlock → seccomp）で適用する。
                 // exec は `LaunchReady` 不在で拒否されるため、終端は exec の代わりに pivot 後の `/` へ
-                // 記録ファイルを書くプローブ（`spawn_container_seccomp_probe`）を使い、書き込みの成否で
-                // Landlock の適用有無を観測する。
+                // 記録ファイルを書くプローブ（`spawn_container_probe` のクロージャ）を使い、書き込みの成否で
+                // Landlock の適用有無を観測する。書けなければ panic で `Exited(125)`（stderr に errno の表示）になる。
                 let (readonly, mounts) = match name {
                     "landlock-apply-ro" => (true, "[]"),
                     "landlock-apply-rw" => (false, "[]"),
@@ -511,7 +511,16 @@ mod linux {
                     // 適用成功後の書き込み拒否（ro）と適用失敗（fail）はどちらも起動拒否（非 0）。
                     _ => ChildExit::Exited(125),
                 };
-                spawn_container_seccomp_probe(rootfs, stages)
+                spawn_container_probe(rootfs, stages, || {
+                    use std::io::Write as _;
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open("/landlock-probe")
+                        .unwrap_or_else(|e| panic!("write /landlock-probe: {e}"));
+                    f.write_all(b"landlock-probe\n")
+                        .unwrap_or_else(|e| panic!("write /landlock-probe: {e}"));
+                })
             }
             "landlock-exec" => {
                 // CORE-5・SEC-1・REPAIR-12・#1714: `with_landlock` を載せた構成は、全段（cgroup 参加 → 組み込みの
@@ -590,7 +599,7 @@ mod linux {
                     "the pre-landlock stage must run before restriction"
                 );
                 // プローブ記録（終端の書き込み）は、Landlock が許可した場合のみ存在する。
-                let published = rootfs.join("seccomp-probe").exists();
+                let published = rootfs.join("landlock-probe").exists();
                 assert_eq!(
                     published,
                     name == "landlock-apply-rw",

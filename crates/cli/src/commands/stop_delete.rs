@@ -1308,6 +1308,12 @@ mod tests {
             use fandhe_container_oci::reference::Digest;
             let root = base.0.join("images");
             std::fs::create_dir_all(&root).expect("images");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod");
+            }
             let images = ImageStore::open(&root).expect("open");
             if seed {
                 images
@@ -1435,7 +1441,7 @@ mod tests {
         }
 
         /// OCI-7・#2315: 在庫に無い manifest の create は NOT_FOUND で、状態も参照も残らない
-        /// （本番の現行値。manifest の在庫の永続化は #2380）。
+        /// （本番の現行値。在庫の永続化は #2380 で済みだが、本番で在庫を埋める経路が未実装）。
         #[test]
         fn oci7_create_with_empty_inventory_is_not_found() {
             let base = TmpDir::new("img-empty");

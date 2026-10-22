@@ -11,8 +11,10 @@
 //!
 //! # 永続化しないもの（実装済みを装わない。REPAIR-3）
 //!
-//! manifest の在庫と構成・タグ・pull リースは永続化しない（#851）。このため読み直した直後のエントリは、
-//! メモリ上のテーブルに無い manifest を指しうる。読み込みでは在庫を確かめない。参照数の集計・未確定の
+//! manifest の在庫と構成・タグ・pull リースは、別ファイル `@image-inventory.json` に永続化する（#2380。
+//! `inventory_persist`）。各操作が書き換えるのはどちらか一方のファイルだけで、
+//! 両方を同じ排他区間で読み直す。在庫ファイルが無い（本番で在庫を埋める経路は未実装）場合などは、
+//! 読み直した直後のエントリがテーブルに無い manifest を指しうる。読み込みでは在庫を確かめない。参照数の集計・未確定の
 //! 一覧・照合・`remove_manifest` の参照確認は manifest の在庫が無くても正しく動く。一方 blob の参照は
 //! manifest の構成から数えるため、在庫に無い manifest への参照は構成が分からず、その manifest だけが
 //! 使う blob を守れない。このため `has_unresolved_container_refs` が真の間は `image rm` / `image prune` が
@@ -28,7 +30,7 @@
 //! 矛盾したファイルは fail-closed で拒否する（空として扱うと参照が消えて GC が誤削除するため）。
 //! 世代の矛盾（`generation >= next_generation`・重複）は再発行の恐れがあるため `DataLoss` とする。
 //! group / other に書き込み権のあるファイル（`PermissionDenied`）・symlink・通常ファイル以外（`Internal`）も拒否する。
-//! root の所有者 / 0700 の検査は未実装（`store` モジュールの前提）。
+//! root の所有者・権限・祖先の検査は `ImageStore::open` が行う（#2381。unix のみ）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -505,6 +507,11 @@ mod tests {
             SEQ.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&p).expect("mkdir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
+        }
         p
     }
 

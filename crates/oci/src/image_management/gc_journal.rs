@@ -19,8 +19,8 @@
 //! 残った孤児ファイルは運用者がストアの `blobs/sha256` から手動で確認・削除する。
 //!
 //! 信頼境界: ジャーナルの読み込みは種別・group/other の書き込み権限・サイズ・件数・未知フィールドを
-//! 検査するが、所有者（uid）は検査しない。ストア root 自体の所有者・権限の検査は `store.rs` の
-//! 永続化側の担当で、root が信頼できることを前提とする。
+//! 検査するが、所有者（uid）は検査しない。ストア root 自体の所有者・権限・祖先の検査は
+//! `ImageStore::open` が行う（#2381。unix のみ）ため、ここでは root が信頼できることを前提とする。
 //! 書き込み中のクラッシュで残る一時ファイル `@gc-pending.json.tmp-*` は、lock 取得時に回収する。
 //!
 //! 呼び出し元: `remove`（`execute_image_rm`）・`prune`（`execute_image_prune`）・`store`（lock 時の再試行）。
@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use super::container_ref_persist::CONTAINER_REFS_TMP_PREFIX;
+use super::inventory_persist::IMAGE_INVENTORY_TMP_PREFIX;
 use super::usage::{blob_dir, blob_path, check_blob_dirs};
 use super::{MAX_CACHE_SCAN_ENTRIES, ReferenceTable, TagKey};
 use crate::error::{OciError, OciErrorCode};
@@ -301,9 +302,10 @@ fn from_raw(raw: RawJournal) -> Result<GcJournal, OciError> {
 ///
 /// したがって、クラッシュで復活し得るのは最後に fsync で確定した状態以下の削除意図だけで、消滅の直前に
 /// 確定する状態は墓標（意図なし）である。消滅していない状態は(1)で参照の追加を拒否するので、ジャーナル
-/// 作成後に追加された参照が、復活したジャーナルで消されることはない。別プロセスの復旧は
-/// manifest・タグ・リースの表が空（それらは永続化されずプロセス内のみ。既存の設計上の制約で、永続化は
-/// TASK-183 の親 issue #471 の未実装範囲）でも、再公開された blob を消さない。
+/// 作成後に追加された参照が、復活したジャーナルで消されることはない。別プロセスの復旧も、manifest・
+/// タグ・リースは `@image-inventory.json`（`inventory_persist`・#2380）、コンテナ参照は
+/// `@container-refs.json` に永続化されて排他取得ごとに読み直されるため、別プロセスのリースや再公開された
+/// blob の参照を数え直しに含め、それらの blob を消さない。
 pub(super) fn journal_exists(root: &Path) -> bool {
     match fs::symlink_metadata(journal_path(root)) {
         Ok(_) => true,
@@ -428,7 +430,8 @@ fn publish_journal(root: &Path, bytes: &[u8]) -> Result<(), PublishError> {
 ///
 /// `prefixes` のいずれかで始まる root 直下の通常ファイルだけを消す（symlink・ディレクトリ・固定名の
 /// 本体ファイルは触らない）。対象は GC ジャーナルの一時ファイル（`@gc-pending.json.tmp-*`）と
-/// コンテナ参照テーブルの一時ファイル（`@container-refs.json.tmp-*`。#2379・OCI-7）。どちらも書き手が
+/// コンテナ参照テーブルの一時ファイル（`@container-refs.json.tmp-*`。#2379・OCI-7）と在庫ファイルの
+/// 一時ファイル（`@image-inventory.json.tmp-*`。#2380）。いずれも書き手が
 /// 排他区間の中でしか作らないため、排他を取った時点で残っているものは中断した書き込みの残骸で、PID の
 /// 生存確認は要らない。走査は 1 回にまとめ、件数は `MAX_CACHE_SCAN_ENTRIES` で打ち切る。
 pub(super) fn reap_stale_tmp(root: &Path, prefixes: &[&str]) {
@@ -448,8 +451,12 @@ pub(super) fn reap_stale_tmp(root: &Path, prefixes: &[&str]) {
     }
 }
 
-/// `lock` が取得直後に回収する一時ファイルの接頭辞（GC ジャーナルとコンテナ参照テーブル）。
-pub(super) const STALE_TMP_PREFIXES: &[&str] = &[TMP_PREFIX, CONTAINER_REFS_TMP_PREFIX];
+/// `lock` が取得直後に回収する一時ファイルの接頭辞（GC ジャーナル・コンテナ参照テーブル・在庫ファイル）。
+pub(super) const STALE_TMP_PREFIXES: &[&str] = &[
+    TMP_PREFIX,
+    CONTAINER_REFS_TMP_PREFIX,
+    IMAGE_INVENTORY_TMP_PREFIX,
+];
 
 /// ジャーナルを消滅させる。この成功が削除確定のコミット点。
 ///
@@ -747,6 +754,8 @@ impl ReferenceTable {
         let Some(journal) = read_journal(root)? else {
             return Ok(None);
         };
+        // untag・manifest 除去を保存するための複製。保存に失敗したら戻し、ジャーナルを残して失敗させる。
+        let before = self.inventory_portion();
         let mut out = PendingDeletionRecovery::default();
         for (key, manifest) in &journal.untag {
             if self.tag_refs.get(key) == Some(manifest) {
@@ -765,6 +774,9 @@ impl ReferenceTable {
                 out.removed_manifests.push(m.clone());
             }
         }
+        // untag・manifest 除去を blob の削除より前に永続化する。保存できなければ blob を消さず、ジャーナルを
+        // 残したまま失敗とする（次の lock が同じ復旧をやり直す。fail-closed。#2380・OCI-7）。
+        self.persist_inventory(before)?;
         // 数え直し: 構成に含む manifest かリースがある blob は残す。
         // 構成が分からないコンテナ参照が残る間は blob を消さない（#2341・OCI-7）。
         let unresolved = self.has_unresolved_container_refs();
@@ -845,6 +857,11 @@ mod tests {
             let p = std::env::temp_dir().join(format!("fc-oci-gcj-{}-{n}", std::process::id()));
             let _ = fs::remove_dir_all(&p);
             fs::create_dir_all(p.join("blobs").join("sha256")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("chmod");
+            }
             Root(p)
         }
         fn put(&self, dg: &Digest) {
@@ -1385,12 +1402,15 @@ mod tests {
         // 復旧は A を外し終えている。再登録（pull 相当）が通り、以後は外されない。
         let mut g = store.lock().unwrap();
         assert_eq!(g.manifests().count(), 1);
+        // 公開（pull 相当）は変更を永続化する。ガード直接の変更は次の取得でディスクの内容に置き換わる（#2380）。
+        let before = g.inventory_portion();
         g.register_manifest(
             d(0xa0),
             ManifestComposition::new(d(0xc1), vec![d(0x10), d(0x11)]).unwrap(),
         )
         .unwrap();
         g.register_tag(tk("v1"), &d(0xa0)).unwrap();
+        g.persist_inventory(before).unwrap();
         assert_eq!(g.tags().count(), 1);
         drop(g);
         let g = store.lock().unwrap();

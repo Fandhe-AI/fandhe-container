@@ -27,9 +27,12 @@
 //! manifest 本文はディスクに保存していない（config と layer の blob だけ）ため、manifest の削除は
 //! 在庫（テーブル）から外すことを指す。
 //!
-//! 未実装（実装済みを装わない。REPAIR-3）: manifest の在庫・タグ・リースのテーブル自体の永続化
-//! （削除の永続化が保証するのはジャーナルと blob ファイルの unlink の範囲だけ）、
-//! CLI の `image rm [--force]` 配線と `StateStore` からのスナップショット作成（#853 以降）。
+//! 永続化（#2380）: untag と manifest 除去は、blob を消す前に `@image-inventory.json` へ保存する
+//! （`inventory_persist`）。保存に失敗したらテーブルを戻し、書いたジャーナルを片づけて、blob を 1 つも
+//! 消さずにエラーを返す。
+//!
+//! 未実装（実装済みを装わない。REPAIR-3）: CLI の `image rm [--force]` 配線と `StateStore` からの
+//! スナップショット作成（#853 以降）。
 //!
 //! Docker の `rmi <tag>` はタグが複数あるイメージなら untag して成功するが、既定経路は OCI-7 に従い
 //! コンテナ参照があれば拒否する。pull リースは blob を守るもので manifest は守らないため、判定には
@@ -400,8 +403,11 @@ impl ReferenceTable {
                 },
             )?;
         }
+        // untag と manifest 除去は、blob を消す前に 1 回だけ保存する（#2380）。
+        let before = self.inventory_portion();
         for key in &action.untag {
             if self.unregister_tag_unchecked(key).is_err() {
+                self.restore_inventory_portion(before);
                 if journaled {
                     let _ = remove_journal(root);
                 }
@@ -419,17 +425,27 @@ impl ReferenceTable {
             durability: DeletionDurability::NotApplicable,
         };
         if !delete {
+            // untag のみ。保存に失敗したらテーブルを戻してエラー（blob には触れていない）。
+            self.persist_inventory(before)?;
             return Ok(outcome);
         }
         let composition = match self.remove_manifest_unchecked(&action.manifest) {
             Ok(c) => c,
             Err(e) => {
+                self.restore_inventory_portion(before);
                 if journaled {
                     let _ = remove_journal(root);
                 }
                 return Err(e);
             }
         };
+        // 保存に失敗したら戻し、ジャーナルを片づけて blob を 1 つも消さずに失敗する（#2380・OCI-7）。
+        if let Err(e) = self.persist_inventory(before) {
+            if journaled {
+                let _ = remove_journal(root);
+            }
+            return Err(e);
+        }
         outcome.kind = ImageRmKind::Deleted;
         let mut to_sweep = Vec::new();
         // blobs() は BTreeSet のため昇順で決定的。

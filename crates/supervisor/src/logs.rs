@@ -55,11 +55,14 @@
 //! `logs` コマンドの読み出しは [`reader::read_container_log`] が担う。ディレクトリ契約は [`container_log_dir`]
 //! （`<state_root>/@container-logs`）、世代の並びは [`rotating`] の名前空間に従う。
 //!
+//! # 後始末（#2446・SUP-7・CLI-1）
+//! CLI の `delete` が core の delete の成功後に [`remove_container_logs_bounded`] で現在ログ・全世代・ロックファイルを
+//! 消す（stderr へは何も書かない。失敗は delete を失敗にせず、CLI が構造化された警告 1 行にする）。
+//!
 //! # 未実装（将来仕様。REPAIR-3）
 //! 本モジュールは捕捉経路とファイル sink までで、次は未実装である。
 //! - flush ごとの fsync・同期ポリシーの設定化・タイマーによる定期 flush（read ごとの flush で代替している）: SUP-7。
 //! - stdout / stderr 混在での大規模な欠落 0・重複 0 の検証（stdout 単独の 100 万行検証は `tests/log_rotation.rs` に実装済み）: SUP-7・TASK-164.4（#508）。
-//! - コンテナ削除経路からの [`RotatingFileSink::remove_all`]（ログ・ロックファイルの一括削除）の呼び出し配線: SUP-7・TASK-164 追補（#1469）。
 //! - 本番 launcher からの呼び出し配線: 子の stdout / stderr をパイプへ接続する機構（core の `exec::ChildStdio`）と、
 //!   読み取り側を受け取って起動・再起動をまたいで捕捉する配線（[`crate::log_pipeline::CaptureHub`]）は実装済みで
 //!   （TASK-164 追補・#1471）、core の本番 `ProcessLauncher` が `LaunchedProcess::take_output` で返す読み取り側を、
@@ -82,6 +85,80 @@ pub const CONTAINER_LOG_DIR_NAME: &str = "@container-logs";
 /// 共有する唯一の定義で、二重管理しない（REPAIR-1）。旧配置 `<root>/logs` からの移行はしない（未リリース）。
 pub fn container_log_dir(root: &std::path::Path) -> std::path::PathBuf {
     root.join(CONTAINER_LOG_DIR_NAME)
+}
+
+/// `id` のコンテナログ（現在ログ・全世代・ロックファイル）を消す（stderr へは何も書かない。CLI の `delete` 用。#2446・SUP-7・ERR-2）。
+///
+/// `@container-logs` が無ければ 0 件で成功する（create しただけで start していないコンテナ。冪等）。同じ ID の sink が
+/// 生存中なら `FailedPrecondition` で何も消さない。名前空間に受理できない別名・不正な世代があれば `InvalidArgument` で
+/// 何も消さない。他の ID のログには触れない。
+pub fn remove_container_logs(
+    root: &std::path::Path,
+    id: &fandhe_container_core::traits::ContainerId,
+) -> Result<RemovedLogs, fandhe_container_core::traits::TraitError> {
+    remove_container_logs_guarded(root, id, &|| true)
+}
+
+/// [`remove_container_logs`] に、ロック取得後・削除前の確認 `guard` を足したもの（#2446・SUP-7）。
+///
+/// `guard` が `false` なら何も消さずに 0 件で成功する。CLI の `delete` は「同じ ID が再作成されていない」ことを
+/// 返す。確認はロック保持中で、以後に同じ ID の sink は開けない（同じロックが要る）ため、削除待ちの間に再作成・
+/// 起動・終了した別インスタンスのログを消さない。
+pub fn remove_container_logs_guarded(
+    root: &std::path::Path,
+    id: &fandhe_container_core::traits::ContainerId,
+    guard: &dyn Fn() -> bool,
+) -> Result<RemovedLogs, fandhe_container_core::traits::TraitError> {
+    use fandhe_container_core::traits::{ErrorCode, TraitError};
+    let dir = container_log_dir(root);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_) => RotatingFileSink::remove_all_quiet_guarded(&dir, id, guard),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RemovedLogs::default()),
+        Err(_) => Err(TraitError::new(
+            ErrorCode::Internal,
+            "container log directory inspection failed",
+        )),
+    }
+}
+
+/// コンテナログ削除を待つ既定の上限（`supervisor_log::SUPERVISOR_LOG_REMOVE_TIMEOUT` と同じ根拠。REPAIR-5）。
+pub const CONTAINER_LOG_REMOVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// [`remove_container_logs`] を作業スレッドで `timeout` までだけ待って実行する（REPAIR-5）。
+///
+/// 期限切れ・同時実行枠の満杯・スレッド起動失敗のときは `Timeout` のエラーを返す（作業スレッドは残り得る）。
+/// 同時実行枠は supervisor ログの削除と共有する。core の `delete` より前には呼ばない。
+pub fn remove_container_logs_bounded(
+    root: &std::path::Path,
+    id: &fandhe_container_core::traits::ContainerId,
+    timeout: std::time::Duration,
+) -> Result<RemovedLogs, fandhe_container_core::traits::TraitError> {
+    remove_container_logs_guarded_bounded(root, id, timeout, || true)
+}
+
+/// [`remove_container_logs_bounded`] に確認 `guard`（[`remove_container_logs_guarded`]）を足したもの（#2446・SUP-7）。
+///
+/// 期限切れ後も作業スレッドが残り得るが、`guard` はロック取得後に作業スレッドで評価されるため、CLI 復帰後に
+/// 削除が走っても再作成された別インスタンスのログは消えない。
+pub fn remove_container_logs_guarded_bounded(
+    root: &std::path::Path,
+    id: &fandhe_container_core::traits::ContainerId,
+    timeout: std::time::Duration,
+    guard: impl Fn() -> bool + Send + 'static,
+) -> Result<RemovedLogs, fandhe_container_core::traits::TraitError> {
+    use fandhe_container_core::traits::{ErrorCode, TraitError};
+    let root = root.to_path_buf();
+    let id = id.clone();
+    crate::supervisor_log::run_bounded(
+        move || remove_container_logs_guarded(&root, &id, &guard),
+        timeout,
+    )
+    .unwrap_or_else(|| {
+        Err(TraitError::new(
+            ErrorCode::Timeout,
+            "container log removal did not finish within the deadline",
+        ))
+    })
 }
 
 /// コンテナログのローテーション設定（既定 1MiB × 3 世代）。書き手と読み手が同じ値を使う。

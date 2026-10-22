@@ -23,6 +23,12 @@
 //! `delete` は core の delete が成功した後に、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）を best effort で
 //! 消す（`remove_supervisor_log`。失敗は握り、成功時の stderr は空のまま。#2067・REPAIR-4・ERR-2）。
 //!
+//! 続けてコンテナログ（`<root>/@container-logs/<id>.log*`・ロックファイル）も消す（`remove_container_log`。#2446・SUP-7・CLI-1）。
+//! 消せなかった（supervisor 生存中でロックが取れない・期限切れ等）ときも delete は成功のまま（状態は削除済みで、再試行は
+//! `NOT_FOUND` になり回復できないため。残りは 1 ID あたり世代数 × 上限に収まり、次の start で世代として回る）、
+//! `code` / `message` の 1 行 JSON の警告を stderr に出す。消せたとき（0 件を含む）の stderr は空（ERR-2）。
+//! 削除は supervisor ログ → コンテナログの直列で、各 5 秒が上限（最悪 10 秒）。
+//!
 //! 状態ルートが無ければ `production_runtime` の状態ストアを開く段階で親の下に 0700 で作る（親は作らない）。
 //! list / logs と同じ判断で、読み取り専用 open は足さない（理由は `list_logs` の module doc。#1607 E2）。
 //!
@@ -304,6 +310,7 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
     match result {
         Ok(_) => {
             remove_supervisor_log(rt.store.as_ref(), &req);
+            remove_container_log(rt.store.as_ref(), &req);
             CliExit::Success
         }
         Err(e) => CliExit::Runtime(e),
@@ -333,11 +340,65 @@ fn remove_supervisor_log(store: &dyn StateStore, req: &DeleteRequest) {
     );
     if outcome == LogRemoval::TimedOut {
         emit_warning_bounded(
-            log_removal_timeout_warning(),
+            log_removal_timeout_warning().to_string(),
             write_warning_to_stderr,
             WARNING_WRITE_TIMEOUT,
         );
     }
+}
+
+/// コンテナログ削除の失敗の警告（stderr に 1 行の JSON。ERR-1）。パス・errno・内容は含めない。
+/// 期限切れ（`TIMEOUT`）も同じ文言で、`code` で見分ける。
+fn container_log_removal_warning(e: &TraitError) -> String {
+    format!(
+        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"container log removal failed; leftover logs may remain\"}}",
+        e.code().as_str()
+    )
+}
+
+/// core の `delete` が成功した後に、コンテナログ（`<root>/@container-logs/<id>.log*`）を消す（#2446・SUP-7・CLI-1）。
+///
+/// 失敗しても delete の結果は変えず、警告を 1 行だけ stderr に出す（理由はモジュール doc）。core の delete より前には
+/// 呼ばない（delete が失敗したとき稼働中のコンテナのログを消さないため）。
+fn remove_container_log(store: &dyn StateStore, req: &DeleteRequest) {
+    let Some(root) = store.host_state_root() else {
+        return;
+    };
+    let guard_root = root.to_path_buf();
+    let guard_id = req.id().clone();
+    if let Err(e) = fandhe_container_supervisor::logs::remove_container_logs_guarded_bounded(
+        root,
+        req.id(),
+        fandhe_container_supervisor::logs::CONTAINER_LOG_REMOVE_TIMEOUT,
+        move || id_is_still_deleted(&guard_root, &guard_id),
+    ) {
+        emit_warning_bounded(
+            container_log_removal_warning(&e),
+            write_warning_to_stderr,
+            WARNING_WRITE_TIMEOUT,
+        );
+    }
+}
+
+/// 状態ストアに `id` が無い（delete 後に再作成されていない）ときだけ `true`（#2446・SUP-7。同じ ID の再作成との排他）。
+///
+/// supervisor のログ削除がロックを取った後（同じ ID の sink が開けない状態）で評価される。再作成済みなら削除を
+/// 見送り、新しいインスタンスのログを消さない。ストアを開けない・NotFound 以外の失敗は fail-closed で `false`。
+fn id_is_still_deleted(
+    root: &std::path::Path,
+    id: &fandhe_container_core::traits::ContainerId,
+) -> bool {
+    use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+    let Ok(root) = StateRoot::from_override(root.to_path_buf()) else {
+        return false;
+    };
+    let Ok(store) = FileStateStore::open(root) else {
+        return false;
+    };
+    matches!(
+        store.get(&GetStateRequest::new(id.clone())),
+        Err(e) if e.code() == fandhe_container_core::traits::ErrorCode::NotFound
+    )
 }
 
 /// 警告の書き出しを待つ上限（`main.rs` の `DEFERRED_REPORT_TIMEOUT` と同じ値）。
@@ -357,11 +418,11 @@ fn write_warning_to_stderr(line: &str) {
 /// 期限切れ・書き込み側の panic・スレッド起動失敗のいずれでも何も伝播せず戻り、delete の結果は変えない
 /// （`main.rs` の `report_deferred` と同じ流儀。止まった書き込みのスレッドは置き去りにする）。
 fn emit_warning_bounded(
-    line: &'static str,
+    line: String,
     write: impl FnOnce(&str) + Send + 'static,
     timeout: Duration,
 ) {
-    let _ = run_log_removal_bounded(move || write(line), timeout);
+    let _ = run_log_removal_bounded(move || write(&line), timeout);
 }
 
 #[cfg(test)]
@@ -374,7 +435,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let started = Instant::now();
         emit_warning_bounded(
-            "w",
+            "w".to_string(),
             move |_| {
                 let _ = release_rx.recv_timeout(Duration::from_secs(30));
             },
@@ -384,7 +445,7 @@ mod tests {
         drop(release_tx);
 
         emit_warning_bounded(
-            "w",
+            "w".to_string(),
             |_| panic!("injected write failure"),
             Duration::from_secs(10),
         );
@@ -416,6 +477,21 @@ mod tests {
         assert!(!w.contains('\n'));
         assert!(w.contains("\"code\":\"TIMEOUT\""));
         assert!(w.contains("\"message\":\"supervisor log removal did not finish"));
+    }
+
+    /// ERR-1・#2446: コンテナログ削除失敗の警告は改行なしの 1 行 JSON で、code ごとに完全一致し、パスを含まない。
+    #[test]
+    fn err1_container_log_removal_warning_is_single_line_json() {
+        let w = container_log_removal_warning(&TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "/secret/path",
+        ));
+        assert_eq!(
+            w,
+            "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"container log removal failed; leftover logs may remain\"}"
+        );
+        let w = container_log_removal_warning(&TraitError::new(ErrorCode::Timeout, "x"));
+        assert!(w.contains("\"code\":\"TIMEOUT\"") && !w.contains('\n') && !w.contains('/'));
     }
 
     fn stop_args(id: &str) -> StopArgs {
@@ -755,6 +831,21 @@ mod tests {
             .expect("req")
             .with_cgroup_scope(CgroupScope::new(FAKE_SCOPE).expect("scope"));
             store.create(&req).expect("create").revision()
+        }
+
+        /// SUP-7・#2446: コンテナログ削除の確認は、同じ ID が再作成されていたら `false`（削除を見送る）、
+        /// 無ければ `true`、記録が壊れていて判定できなければ fail-closed で `false`。
+        #[test]
+        fn sup7_id_is_still_deleted_reflects_recreation() {
+            let base = TmpDir::new("recreated");
+            let store = store(&base);
+            let root = state_root(&base);
+            assert!(id_is_still_deleted(&root, &id("c1")));
+            create_placed(&base, &store, "c1");
+            assert!(!id_is_still_deleted(&root, &id("c1")));
+            assert!(id_is_still_deleted(&root, &id("c2")));
+            std::fs::write(root.join("c1").join("state.json"), "{").expect("corrupt");
+            assert!(!id_is_still_deleted(&root, &id("c1")));
         }
 
         /// 検出の呼び出し回数を数えつつ `fake` を返す remover を作る。

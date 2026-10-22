@@ -675,6 +675,145 @@ fn sup14_start_via_path_symlink_uses_supervisor_beside_real_exe() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// 起動された偽の実行ファイル（ランチャーまたは supervisor）が自分の pgrp・stdio を `<dir>/<tag>.obs` へ記録して OK を報告する本体。
+/// 記録は具体値（`pgrp_is_self`・`pgrp_eq_parent`・fd 0〜2 の行き先・tty かどうか）で照合する（SUP-14・#2442）。
+#[cfg(target_os = "linux")]
+fn observing_body(tag: &str) -> String {
+    format!(
+        r#"d=$(dirname "$0")
+pg=$(sed 's/.*) //' /proc/$$/stat | cut -d' ' -f3)
+ppg=$(sed 's/.*) //' /proc/$PPID/stat | cut -d' ' -f3)
+s0=$(readlink /proc/$$/fd/0); s1=$(readlink /proc/$$/fd/1); s2=$(readlink /proc/$$/fd/2)
+case "$s1" in pipe:*) s1=pipe;; esac
+t0=0; t1=0; t2=0
+[ -t 0 ] && t0=1; [ -t 1 ] && t1=1; [ -t 2 ] && t2=1
+pis=0; [ "$pg" = "$$" ] && pis=1
+peq=0; [ "$pg" = "$ppg" ] && peq=1
+printf 'pgrp_is_self=%s pgrp_eq_parent=%s stdin=%s stdout=%s stderr=%s tty=%s%s%s\n' "$pis" "$peq" "$s0" "$s1" "$s2" "$t0" "$t1" "$t2" > "$d/{tag}.obs"
+printf 'FCSUP1 OK 4242\n'; exec sleep 1"#
+    )
+}
+
+/// SUP-14・CLI-1・CORE-6・SEC-1: 実体の隣に（信頼できる）ランチャーがあれば rootful のインストールとみなし、
+/// systemd-run の後ろにランチャーを包んで起動する（#2442）。ランチャーは `process_group(0)` なし（CLI のグループに残り
+/// リーダーでない）で、stdio は null / pipe / null（pty ではない）。隣のおとりの supervisor は使われない。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup14_start_selects_launcher_beside_real_exe() {
+    let tmp = TmpDir::new("sup14l");
+    let dir = isolated_cli_dir("sup14l");
+    let cli = dir.join("fandhe-container");
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+    install_fake_supervisor(&dir, &observing_body("supervisor"));
+    install_fake_exe(
+        &dir,
+        "fandhe-container-launcher",
+        &observing_body("launcher"),
+    );
+    let scope = FakeScope::new(&dir, &tmp);
+
+    let out = scope.run(&cli, &["--root", &root_s, "start", "c1"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    assert!(out.stdout.is_empty());
+    assert!(
+        out.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let argv = std::fs::read_to_string(dir.join("wrapper.argv")).expect("wrapper.argv");
+    let lines: Vec<&str> = argv.lines().collect();
+    assert_eq!(
+        lines.get(6).copied(),
+        dir.join("fandhe-container-launcher").to_str(),
+        "{argv}"
+    );
+    assert_eq!(lines.get(7).copied(), Some("start"));
+    let obs = std::fs::read_to_string(dir.join("launcher.obs")).expect("launcher.obs");
+    assert_eq!(
+        obs,
+        "pgrp_is_self=0 pgrp_eq_parent=1 stdin=/dev/null stdout=pipe stderr=/dev/null tty=000\n"
+    );
+    assert!(!dir.join("supervisor.obs").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// SUP-14・CLI-1: 隣にランチャーが無い（rootless のインストール）なら従来の直接経路のまま。supervisor は
+/// `process_group(0)` でグループのリーダーになる（端末の SIGINT / SIGHUP が届かない性質の維持）。#2442
+#[cfg(target_os = "linux")]
+#[test]
+fn sup14_start_without_launcher_keeps_direct_route() {
+    let tmp = TmpDir::new("sup14d");
+    let dir = isolated_cli_dir("sup14d");
+    let cli = dir.join("fandhe-container");
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+    install_fake_supervisor(&dir, &observing_body("supervisor"));
+    let scope = FakeScope::new(&dir, &tmp);
+
+    let out = scope.run(&cli, &["--root", &root_s, "start", "c1"], &[]);
+    assert_eq!(out.status.code(), Some(0), "{:?}", out.stderr);
+    let argv = std::fs::read_to_string(dir.join("wrapper.argv")).expect("wrapper.argv");
+    assert_eq!(
+        argv.lines().nth(6),
+        dir.join("fandhe-container-supervisor").to_str(),
+        "{argv}"
+    );
+    let obs = std::fs::read_to_string(dir.join("supervisor.obs")).expect("supervisor.obs");
+    assert_eq!(
+        obs,
+        "pgrp_is_self=1 pgrp_eq_parent=0 stdin=/dev/null stdout=pipe stderr=/dev/null tty=000\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// SUP-14・SEC-1・ERR-2: 隣のランチャーが信頼条件を満たさない（group 書き込み可）なら、直接経路へ落とさず
+/// FAILED_PRECONDITION（5）で spawn の前に止まる。systemd-run もおとりの supervisor も呼ばれず、状態は Created のまま。#2442
+#[cfg(target_os = "linux")]
+#[test]
+fn sup14_start_rejects_untrusted_launcher_without_fallback() {
+    let tmp = TmpDir::new("sup14u");
+    let dir = isolated_cli_dir("sup14u");
+    let cli = dir.join("fandhe-container");
+    let (_root, root_s) = prepare_c1(&tmp, &cli);
+    install_fake_supervisor(&dir, &observing_body("supervisor"));
+    install_fake_exe(
+        &dir,
+        "fandhe-container-launcher",
+        &observing_body("launcher"),
+    );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            dir.join("fandhe-container-launcher"),
+            std::fs::Permissions::from_mode(0o775),
+        )
+        .expect("chmod");
+    }
+    let scope = FakeScope::new(&dir, &tmp);
+
+    let out = scope.run(&cli, &["--root", &root_s, "start", "c1"], &[]);
+    assert_eq!(out.status.code(), Some(5));
+    assert_eq!(
+        op_and_code(&out),
+        ("start".into(), "FAILED_PRECONDITION".into())
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("privileged launcher is not a trusted executable"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!dir.join("wrapper.argv").exists());
+    assert!(!dir.join("supervisor.obs").exists());
+    assert!(!dir.join("launcher.obs").exists());
+    let out = run_isolated(&cli, &["--root", &root_s, "list"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ID\tSTATUS\tPID\nc1\tcreated\t-\n"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// SUP-14・ERR-2: 実体のディレクトリに supervisor が無ければ、symlink の隣に supervisor があっても使わず
 /// FAILED_PRECONDITION（5）で止まる（symlink の置き場所を見ていないことの判別。#2068）。
 #[cfg(target_os = "linux")]

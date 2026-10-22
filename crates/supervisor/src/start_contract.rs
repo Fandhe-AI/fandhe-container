@@ -26,7 +26,8 @@
 //!   `<root>/@supervisor-logs/` へ保存する（[`crate::supervisor_log`]。#2067）ので、呼び出し側の stderr へ行くのは fd 2 へ
 //!   直接書かれるもの（core の診断・panic 等。同モジュールの「未実装・残余」）だけで、null でもログは失われない。
 //! - supervisor は CLI より長く生きる（CORE-1・D-19）。端末の SIGINT / SIGHUP を受けないよう、CLI は
-//!   `CommandExt::process_group(0)` で別のプロセスグループにして spawn する。
+//!   `CommandExt::process_group(0)` で別のプロセスグループにして spawn する。ただし特権ランチャー経由の起動（#2442）では
+//!   付けない: ランチャーの入口の `setsid` はプロセスグループのリーダーだと `EPERM` になり拒否される（#537）。stdio に pty も渡さない。
 //!
 //! # 結果の報告（1 行・固定書式）
 //! ASCII、`\n` で終わる 1 行、最大 [`MAX_REPORT_LEN`] バイト。

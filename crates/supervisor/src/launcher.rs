@@ -30,7 +30,7 @@
 //! # 起動側（呼び出し元）への契約（#537）
 //! - ランチャーを `process_group(0)` で起動しない。ランチャーがプロセスグループのリーダーだと `setsid` が `EPERM` に
 //!   なり拒否される（ランチャーの `setsid` が新しいセッションとプロセスグループを作るので代わりになる）。CLI が
-//!   ランチャーを選ぶ規則を入れる際の前提とする（現状 CLI はランチャーを起動しない）
+//!   ランチャーを選ぶ規則を入れる際の前提とする（CLI の選択の規則は `start_client`。#2442）
 //! - 標準入出力に端末（pty）を渡さない（pipe・`/dev/null`・ファイルを渡す）
 //!
 //! # supervisor 側の不変条件: 端末の `open` に `O_NOCTTY`（SUP-14・TASK-171.2・#537・#2426）
@@ -79,6 +79,9 @@ use crate::privilege::{PrivilegeError, PrivilegeMethod, UidSet};
 
 /// 同じディレクトリに置く supervisor の固定のファイル名。
 pub const SUPERVISOR_FILE_NAME: &str = "fandhe-container-supervisor";
+/// 特権ランチャーの固定のファイル名（`[[bin]]` 名・`scripts/install-privileged-launcher.sh` の `LAUNCHER_NAME` と一致。
+/// CLI の `start` が実体の隣にこれを見つけたら rootful のインストールとみなす。#2442）。
+pub const LAUNCHER_FILE_NAME: &str = "fandhe-container-launcher";
 /// supervisor へ渡す `argv[0]`（固定）。
 pub const SUPERVISOR_ARGV0: &str = SUPERVISOR_FILE_NAME;
 /// supervisor へ渡す環境の `PATH`（固定。呼び出し元の `PATH` は渡さない）。

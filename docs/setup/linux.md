@@ -6,7 +6,7 @@ fandhe-container の実行ファイル（CLI・supervisor・特権ランチャ�
 - タスク: TASK-171 追補（#1721）・#2068。`start` の解決規則は TASK-79 追補（#1718）、`fandhe-container setup` はステップ `privileged-launcher-install` として rootful の手順を表示する（実行はしない。#1722）
 - 設計: [privilege-separation.md](../design/privilege-separation.md) の「インストールスクリプト」
 
-> 未検証の注記（REPAIR-3）: rootful の手順は `scripts/install-privileged-launcher.sh` の自己テスト（スタブのみ・root 不要）で確かめたもので、root での実機実行と検証は未実施である（#538・#539）。rootless の手順は CLI の結合試験（symlink 経由の `start`）に基づくが、実機での手順全体の通し確認は未実施である。rootless の範囲写像（subuid / subgid）の実機確認も未実施である（#1621）。rootless の `start` は supervisor が core の本番 launcher で起動するが（#1819）、委譲 cgroup の準備を含む実機での確認は未実施である（#2062）。rootful の `start` は CLI からランチャーを選ぶ規則が未実装のため `UNIMPLEMENTED`（終了コード 8）で終わる（#1719・#1722）。
+> 未検証の注記（REPAIR-3）: rootful の手順は `scripts/install-privileged-launcher.sh` の自己テスト（スタブのみ・root 不要）で確かめたもので、root での実機実行と検証は未実施である（#538・#539）。rootless の手順は CLI の結合試験（symlink 経由の `start`）に基づくが、実機での手順全体の通し確認は未実施である。rootless の範囲写像（subuid / subgid）の実機確認も未実施である（#1621）。rootless の `start` は supervisor が core の本番 launcher で起動するが（#1819）、委譲 cgroup の準備を含む実機での確認は未実施である（#2062）。rootful の `start` は CLI の実体の隣にある `fandhe-container-launcher` を選んで起動するが（#2442）、ランチャー経由の本物の systemd-run・file capability・`setsid` を通す実機での確認は未実施である（#538・#539）。root（uid 0）での `start` は `UNIMPLEMENTED`（終了コード 8）で終わる（#2241 の判断待ち）。
 
 ## 配置の規則
 
@@ -105,7 +105,7 @@ CRI plugin の `start`・`kill`・`stop`・`delete` は CLI と同じ経路で s
 - `fandhe-container-supervisor` を plugin の実体（`fandhe-container-plugin-cri`）と同じディレクトリにも置く。CLI の `start` と同じ規則で、`PATH` 探索・環境変数・引数による上書きは無い。見つからなければ `FAILED_PRECONDITION`
 - plugin のプロセスの環境に `XDG_RUNTIME_DIR` が必要（user マネージャへの到達に使う）。上の「起動の前提」を同じく満たすこと
 - cgroup の配置を記録したコンテナの `delete` は、plugin プロセス自身の cgroup が委譲されている必要がある（CLI の `delete` と同じ検出で、検出に失敗すると記録を残したまま失敗する）。plugin を委譲されたスコープの中（例: `systemd-run --user --scope -p Delegate=yes -- fandhe-container-plugin-cri ...`）で動かす
-- rootful の `start` は CLI と同じく未対応（`UNIMPLEMENTED`）。実機での通しは未確認（#850・#2062）
+- `start` の権限モデルは CLI と同じ規則（plugin の実体の隣に信頼できるランチャーがあればランチャー経由。uid 0 は `UNIMPLEMENTED`。#2442）。インストールスクリプトは plugin を置かない。実機での通しは未確認（#850・#2062）
 
 ```bash
 systemd-run --user --scope -p Delegate=yes -- fandhe-container delete <id>

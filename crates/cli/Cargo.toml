@@ -52,6 +52,11 @@ logs-test-support = []
 # 解決しないため、feature は無効のまま。
 [dev-dependencies]
 fandhe-container-cli = { path = ".", features = ["signal-test-support", "start-test-support", "logs-test-support"] }
+# 実機前提の通し試験（tests/start_stop_delete_real.rs。#2450）のコンテナ内プローブが、core の
+# `exec::exit_on_sigterm_for_test`（SIGTERM で `_exit(43)` するハンドラの登録）を使うための workspace 内 path 依存の
+# feature の受け渡し（外部クレートの追加ではない）。通常のビルドは dev-dependency を解決しないため feature は無効のまま
+# で、リリースビルドで有効にすると core の `compile_error!` が止める。
+fandhe-container-supervisor = { path = "../supervisor", features = ["exec-test-support"] }
 
 # `sys.rs` の自前 FFI 宣言を libc と照合する試験専用の依存（#1838・#1318・MVM-4・REPAIR-12）。製品の依存には入れない
 # （cargo tree -e normal,build に現れない）。`sys.rs` は `cfg(unix)` のため unix に限る。方式は docs/design/ffi-libc-check.md。
@@ -75,4 +80,9 @@ harness = false
 # 実機前提の結合試験（#2011）。`harness = false` の単一 main で、`-- --ignored` のときだけ実機シナリオを動かす。
 [[test]]
 name = "start_recover_real"
+harness = false
+
+# 実機前提の通し試験（#2450）。`harness = false` の単一 main で、`-- --ignored` のときだけ実機シナリオを動かす。
+[[test]]
+name = "start_stop_delete_real"
 harness = false

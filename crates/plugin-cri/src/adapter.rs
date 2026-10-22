@@ -21,10 +21,16 @@
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //!
-//! - `start`・`kill`・`stop` は `Unimplemented`。本番 launcher は単一スレッドのプロセスを要求し
-//!   （CORE-1）、`ProcessSignaler` の本番実装は supervisor 側にあるため、tokio 上の CRI プロセスから
-//!   直接呼べない。結線は supervisor 起動の経路（#2434）
-//! - `delete` は cgroup の配置を持つ記録では fail-closed（`UnavailableCgroupRemover`）で、記録を残す
+//! - `start`・`kill`・`stop` は Linux で supervisor 経由の本番経路へ結線済み（`crate::supervised`。#2434）。契約・期限・
+//!   子プロセスの回収・前提（supervisor を plugin の実体と同じディレクトリに置く・`XDG_RUNTIME_DIR` が環境にある・rootful は
+//!   `UNIMPLEMENTED`）は同 module の doc に従う。実機での通し（委譲 scope 内）は未実施（#850・#2062）。非 Linux では
+//!   従来どおり `Unimplemented`（`MSG_LAUNCH_UNAVAILABLE`）
+//! - `delete` の cgroup 削除は本番の `DetectedCgroupRemover`（`fandhe_container_supervisor::cgroup_remover`。CLI と共有）で、
+//!   plugin プロセス自身の cgroup から委譲スコープを遅延検出する。plugin を委譲されたスコープの外（ログインセッション等）で
+//!   動かすと検出に失敗し、cgroup の配置を記録したコンテナの `delete` は記録を残したまま失敗する（fail-closed。CLI と同じ
+//!   方針で、検出の失敗を記録の経路へ回すかはオーナー判断待ち。#2133・#2060）。非 Linux は常に `Unimplemented`。
+//!   core の `delete` が成功した後に限り、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）を期限つきで
+//!   best effort で消す（失敗は戻り値に影響させず、期限切れは記録器の `supervisor_log_remove` の失敗として計上する）
 //! - bundle 供給: 本番は `CriPluginBackends::production_bundle_provider`（unix のみ）（pull 済みイメージの再展開と
 //!   ContainerConfig → config.json 変換。#2433）。`ImageService` をサーブしていないためタグは解決できず、
 //!   image ID（`sha256:<hex>`）だけを受ける（イメージ取り込みの結線と合わせて別途。REPAIR-3）。
@@ -34,28 +40,33 @@
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use crate::netsetup::{LinuxNetsetup, NetsetupNetwork};
+#[cfg(target_os = "linux")]
+use crate::supervised::SupervisedLifecycle;
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
-use fandhe_container_core::oci_runtime::{
-    self, CgroupRemoval, ContainerCgroupRemover, OciRuntimeError,
-};
+use fandhe_container_core::oci_runtime::{self, ContainerCgroupRemover, OciRuntimeError};
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
 use fandhe_container_core::traits::{
-    AttachRequest, AttachResponse, CgroupPlacement, CgroupScope, ContainerId, ContainerRuntime,
-    ContainerStatus, CreateNetnsRequest, CreateNetworkRequest, CreateRequest, DeleteNetworkRequest,
+    AttachRequest, AttachResponse, ContainerId, ContainerRuntime, ContainerStatus,
+    CreateNetnsRequest, CreateNetworkRequest, CreateRequest, DeleteNetworkRequest,
     DeleteNetworkResponse, DeleteRequest, DeleteResponse, DetachRequest, DetachResponse, ErrorCode,
     GetStateRequest, KillRequest, NetnsStatus, NetworkPlugin, NetworkStatus, PortMapping,
-    PublishPortRequest, StartRequest, StateRequest, StateRevision, StateStore, StopRequest,
-    TraitError,
+    PublishPortRequest, StartRequest, StateRequest, StateStore, StopRequest, TraitError,
 };
 use fandhe_container_cri::adapter::{BundleProvider, BundleRequest, RuntimeAdapter};
 use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::instrument::{CriOpOutcome, CriOpRecorder, CriOpSample};
 use fandhe_container_cri::runtime_service::CriRuntimeService;
+use fandhe_container_supervisor::cgroup_remover::production_cgroup_remover;
+use fandhe_container_supervisor::supervisor_log::{
+    LogRemoval, SUPERVISOR_LOG_REMOVE_TIMEOUT, remove_bounded,
+};
 
-/// 起動・シグナル系の未実装文言（固定。入力を含めない）。
+/// 起動・シグナル系の未実装文言（固定。入力を含めない。非 Linux でだけ返す。Linux は supervisor 経由で結線済み）。
+#[cfg(not(target_os = "linux"))]
 pub const MSG_LAUNCH_UNAVAILABLE: &str =
     "container start/kill/stop is not available in the CRI plugin yet";
 /// ネットワーク系の未実装文言。
@@ -63,9 +74,6 @@ pub const MSG_NETWORK_UNAVAILABLE: &str = "network plugin is not available in th
 /// bundle 供給の未実装文言。
 pub const MSG_BUNDLE_UNAVAILABLE: &str =
     "bundle provisioning is not available in the CRI plugin yet";
-/// cgroup 削除の未実装文言。
-const MSG_CGROUP_UNAVAILABLE: &str =
-    "container cgroup removal is not available in the CRI plugin yet";
 
 /// plugin プロセスが core のトレイト境界へ差す実装の組（trait object だけを持つ。CRI-7）。
 #[derive(Clone)]
@@ -180,19 +188,33 @@ impl CriPluginBackends {
     /// 実行層を接続した `CriRuntimeService` を作る。サーブは `server::serve` が担う（#849）。
     ///
     /// CRI 側の計測は共有記録器（[`Self::op_recorder`]）へ `cri.*` の操作名で記録する。
+    ///
+    /// 実行層の呼び出しの待ち上限は [`PLUGIN_RUNTIME_TIMEOUT`] にする（CRI の既定 10 秒では supervisor の起動の受信期限
+    /// 〔約 58.9 秒〕より先に結果不明へ倒れるため。#2434・REPAIR-5）。
     pub fn runtime_service(&self, bundles: Arc<dyn BundleProvider>) -> CriRuntimeService {
         CriRuntimeService::with_recorder(Arc::new(CoreCriRecorder(Arc::clone(&self.recorder))))
+            .with_runtime_timeout(PLUGIN_RUNTIME_TIMEOUT)
             .with_runtime(RuntimeAdapter::new(Arc::clone(&self.runtime)), bundles)
     }
 }
 
+/// CRI サービスが実行層の呼び出しを待つ上限（REPAIR-5・#2434）。
+///
+/// supervisor の起動結果の受信期限（`start_contract::cli_receive_deadline`）に 2 秒の余裕を足した値。CRI の既定
+/// （10 秒）のままだと、起動が成功しても結果不明（exited）に倒れる。`stop` の待ちは CRI 側がこれに SIGTERM の猶予を足す。
+pub const PLUGIN_RUNTIME_TIMEOUT: Duration = Duration::from_millis(60_900);
+
 /// core の `oci_runtime` のライブラリ関数へ委ねる plugin 側の `ContainerRuntime`（CRI-2）。
 ///
-/// supervisor のプロセスが無くても core の呼び出しだけで完結する `create`・`state`・`delete` だけを
-/// 実装する。`start`・`kill`・`stop` は `Unimplemented`（モジュール doc の REPAIR-3）。
+/// `create`・`state`・`delete` は core の呼び出しで完結する。`start`・`kill`・`stop` は Linux で supervisor 経由
+/// （`crate::supervised`）、非 Linux では `Unimplemented`（モジュール doc の REPAIR-3）。
 pub struct CoreLifecycleRuntime {
     store: Arc<dyn StateStore>,
     recorder: Arc<OpRecorder>,
+    /// `delete` が cgroup の配置を記録したコンテナを消すための remover（本番は遅延検出。注入で差し替えられる）。
+    cgroups: Arc<dyn ContainerCgroupRemover>,
+    #[cfg(target_os = "linux")]
+    supervised: SupervisedLifecycle,
 }
 
 /// cri の計測結果を core の `OpRecorder` へ流す橋渡し（操作名は `CriOpKind::as_str`）。
@@ -246,12 +268,58 @@ impl CoreLifecycleRuntime {
 
     /// 状態ストアと共有の記録器を受けて作る（`create`・`delete` の観測値を呼び出し元と共有する。REPAIR-4）。
     pub fn with_recorder(store: Arc<dyn StateStore>, recorder: Arc<OpRecorder>) -> Self {
-        Self { store, recorder }
+        Self {
+            store,
+            recorder,
+            cgroups: Arc::new(production_cgroup_remover()),
+            #[cfg(target_os = "linux")]
+            supervised: SupervisedLifecycle::production(),
+        }
+    }
+
+    /// cgroup remover を差し替える（結合試験と別実装。本番の既定は supervisor crate の遅延検出つき remover）。
+    #[must_use]
+    pub fn with_cgroup_remover(mut self, cgroups: Arc<dyn ContainerCgroupRemover>) -> Self {
+        self.cgroups = cgroups;
+        self
+    }
+
+    /// supervisor の起動・signaler の組を差し替える（結合試験と別実装。Linux のみ）。
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn with_supervision(mut self, supervised: SupervisedLifecycle) -> Self {
+        self.supervised = supervised;
+        self
+    }
+
+    /// 起動した supervisor の子プロセスの追跡数（回収の観測用。Linux のみ）。
+    #[cfg(target_os = "linux")]
+    pub fn tracked_supervisors(&self) -> usize {
+        self.supervised.tracked_children()
     }
 
     /// 記録器。`snapshot` 等で `create`・`delete` の件数とレイテンシを取り出せる。
     pub fn recorder(&self) -> &Arc<OpRecorder> {
         &self.recorder
+    }
+
+    /// core の `delete` が成功した後に、supervisor の構造化ログを期限つきで best effort に消す（#2067・#2434・REPAIR-4・REPAIR-5）。
+    ///
+    /// 失敗・期限切れでも `delete` の結果は変えない（状態の削除は完了済み）。期限切れは記録器の操作名
+    /// `supervisor_log_remove` の失敗として計上し、観測できるようにする。
+    fn remove_supervisor_log(&self, id: &ContainerId) {
+        let Some(root) = self.store.host_state_root() else {
+            return;
+        };
+        let started = Instant::now();
+        let outcome = remove_bounded(root, id, SUPERVISOR_LOG_REMOVE_TIMEOUT);
+        if let Ok(name) = OpName::new("supervisor_log_remove") {
+            let result = match outcome {
+                LogRemoval::Finished => OpOutcome::Success,
+                LogRemoval::TimedOut => OpOutcome::Failure,
+            };
+            let _ = self.recorder.record(&name, result, started.elapsed());
+        }
     }
 }
 
@@ -260,6 +328,32 @@ pub(crate) fn to_trait_error(e: OciRuntimeError) -> TraitError {
     TraitError::new(e.code(), e.message())
 }
 
+impl CoreLifecycleRuntime {
+    /// force 削除の前に、生きている（Running・pid あり、または pid あり Created）コンテナを停止して終了を確認する。
+    ///
+    /// 猶予 0 で SIGTERM の直後に SIGKILL へ進み、最長 `STOP_KILL_WAIT` で有界（REPAIR-5）。記録が無い・停止済み・
+    /// pid の無い状態は何もせず、core の delete の判定に任せる。
+    #[cfg(target_os = "linux")]
+    fn stop_live_before_force_delete(&self, id: &ContainerId) -> Result<(), TraitError> {
+        use fandhe_container_core::traits::ContainerState;
+        let status = match self.store.get(&GetStateRequest::new(id.clone())) {
+            Ok(r) => r.status().clone(),
+            Err(e) if e.code() == ErrorCode::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let live = matches!(
+            status.state(),
+            ContainerState::Running | ContainerState::Created
+        ) && status.pid().is_some();
+        if live {
+            let stop = StopRequest::new(id.clone(), Duration::ZERO)?;
+            self.supervised.stop(&*self.store, &self.recorder, &stop)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
 fn launch_unavailable() -> TraitError {
     TraitError::new(ErrorCode::Unimplemented, MSG_LAUNCH_UNAVAILABLE)
 }
@@ -271,61 +365,56 @@ impl ContainerRuntime for CoreLifecycleRuntime {
             .map_err(to_trait_error)
     }
 
+    #[cfg(target_os = "linux")]
+    fn start(&self, req: &StartRequest) -> Result<ContainerStatus, TraitError> {
+        self.supervised.start(&*self.store, req.id())
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn start(&self, _req: &StartRequest) -> Result<ContainerStatus, TraitError> {
         Err(launch_unavailable())
     }
 
+    #[cfg(target_os = "linux")]
+    fn kill(&self, req: &KillRequest) -> Result<ContainerStatus, TraitError> {
+        self.supervised.kill(&*self.store, &self.recorder, req)
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn kill(&self, _req: &KillRequest) -> Result<ContainerStatus, TraitError> {
         Err(launch_unavailable())
     }
 
+    #[cfg(target_os = "linux")]
+    fn stop(&self, req: &StopRequest) -> Result<ContainerStatus, TraitError> {
+        self.supervised.stop(&*self.store, &self.recorder, req)
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn stop(&self, _req: &StopRequest) -> Result<ContainerStatus, TraitError> {
         Err(launch_unavailable())
     }
 
     fn delete(&self, req: &DeleteRequest) -> Result<DeleteResponse, TraitError> {
-        oci_runtime::delete(&*self.store, &self.recorder, &UnavailableCgroupRemover, req)
-            .map_err(to_trait_error)
+        #[cfg(target_os = "linux")]
+        {
+            self.supervised.reap();
+            // force は停止してから削除する（ContainerRuntime::delete の契約。CORE-2・CRI-2）。core の delete は
+            // 生きたコンテナの force を拒否するため、ここで停止と終了確認を済ませる。
+            if req.force() {
+                self.stop_live_before_force_delete(req.id())?;
+            }
+        }
+        let response = oci_runtime::delete(&*self.store, &self.recorder, &*self.cgroups, req)
+            .map_err(to_trait_error)?;
+        self.remove_supervisor_log(req.id());
+        Ok(response)
     }
 
     fn state(&self, req: &StateRequest) -> Result<ContainerStatus, TraitError> {
         self.store
             .get(&GetStateRequest::new(req.id().clone()))
             .map(|r| r.status().clone())
-    }
-}
-
-/// cgroup を消せない remover（fail-closed）。cgroup の配置を持つ記録の `delete` は失敗し、記録を残す。
-///
-/// cgroup の配置が無い記録（プロセスを起動していない `Created`）では core の `delete` は remover に
-/// 触れないため、そのまま削除できる（REPAIR-3。本番の remover の接続は supervisor 起動の経路と同時）。
-#[derive(Debug, Clone, Copy)]
-struct UnavailableCgroupRemover;
-
-fn cgroup_unavailable() -> TraitError {
-    TraitError::new(ErrorCode::Unimplemented, MSG_CGROUP_UNAVAILABLE)
-}
-
-impl ContainerCgroupRemover for UnavailableCgroupRemover {
-    fn scope(&self) -> Result<CgroupScope, TraitError> {
-        Err(cgroup_unavailable())
-    }
-
-    fn remove(
-        &self,
-        _id: &ContainerId,
-        _instance: StateRevision,
-    ) -> Result<CgroupRemoval, TraitError> {
-        Err(cgroup_unavailable())
-    }
-
-    fn remove_recorded(
-        &self,
-        _id: &ContainerId,
-        _placement: &CgroupPlacement,
-        _recorder: &OpRecorder,
-    ) -> Result<CgroupRemoval, TraitError> {
-        Err(cgroup_unavailable())
     }
 }
 
@@ -438,10 +527,10 @@ mod tests {
 
     use std::sync::Mutex;
 
-    use fandhe_container_core::oci_runtime::LifecycleOp;
+    use fandhe_container_core::oci_runtime::{CgroupRemoval, LifecycleOp};
     use fandhe_container_core::traits::{
-        CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ListStateRequest, StateList,
-        StateRecord, UpdateStateRequest,
+        CgroupPlacement, CgroupScope, CreateStateRequest, DeleteStateRequest, DeleteStateResponse,
+        ListStateRequest, StateList, StateRecord, StateRevision, UpdateStateRequest,
     };
     use fandhe_container_cri::instrument::{CriOpKind, CriOpTimer};
 
@@ -525,12 +614,45 @@ mod tests {
         }
     }
 
-    /// cgroup の配置を持つ記録の delete は fail-closed で、状態記録を消さず失敗を記録する（CRI-2・REPAIR-3・REPAIR-4）。
+    const MSG_CGROUP_UNAVAILABLE: &str =
+        "container cgroup removal is not available in the CRI plugin yet";
+
+    /// 常に失敗する remover（本番の遅延検出は実環境の cgroup に依存するため、注入して fail-closed の経路を固定する）。
+    struct UnavailableRemover;
+
+    fn cgroup_unavailable() -> TraitError {
+        TraitError::new(ErrorCode::Unimplemented, MSG_CGROUP_UNAVAILABLE)
+    }
+
+    impl ContainerCgroupRemover for UnavailableRemover {
+        fn scope(&self) -> Result<CgroupScope, TraitError> {
+            Err(cgroup_unavailable())
+        }
+        fn remove(
+            &self,
+            _id: &ContainerId,
+            _instance: StateRevision,
+        ) -> Result<CgroupRemoval, TraitError> {
+            Err(cgroup_unavailable())
+        }
+        fn remove_recorded(
+            &self,
+            _id: &ContainerId,
+            _placement: &CgroupPlacement,
+            _recorder: &OpRecorder,
+        ) -> Result<CgroupRemoval, TraitError> {
+            Err(cgroup_unavailable())
+        }
+    }
+
+    /// cgroup の配置を持つ記録の delete は、remover の失敗で fail-closed になり、状態記録を消さず失敗を記録する
+    /// （CRI-2・REPAIR-4。remover は注入。本番の遅延検出の失敗は `tests/lifecycle_supervisor.rs`）。
     #[test]
     fn delete_with_cgroup_placement_fails_closed_and_keeps_record() {
         let store = Arc::new(OneRecord::new(record(true)));
         let recorder = Arc::new(OpRecorder::new());
-        let rt = CoreLifecycleRuntime::with_recorder(store.clone(), Arc::clone(&recorder));
+        let rt = CoreLifecycleRuntime::with_recorder(store.clone(), Arc::clone(&recorder))
+            .with_cgroup_remover(Arc::new(UnavailableRemover));
         let e = rt
             .delete(&DeleteRequest::new(cid("c1")))
             .expect_err("cgroup unavailable");
@@ -541,6 +663,33 @@ mod tests {
             .snapshot_op(&OpName::new("delete").expect("name"))
             .expect("delete recorded");
         assert_eq!((stats.success(), stats.failure()), (0, 1));
+    }
+
+    /// CRI-2・CORE-2: 未起動（pid なし）の Created への stop は FAILED_PRECONDITION にならず、停止済みを返す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stop_on_created_without_pid_reports_stopped() {
+        let store = Arc::new(OneRecord::new(record(false)));
+        let rt = CoreLifecycleRuntime::new(store);
+        let status = rt
+            .stop(&StopRequest::new(cid("c1"), Duration::ZERO).expect("req"))
+            .expect("created is already stopped");
+        assert_eq!(
+            status.state(),
+            fandhe_container_core::traits::ContainerState::Stopped
+        );
+    }
+
+    /// CRI-2・CORE-2: force 削除は、停止対象の無い pid なし Created をそのまま core の delete へ渡す。
+    #[test]
+    fn force_delete_on_created_without_pid_reaches_store_delete() {
+        let store = Arc::new(OneRecord::new(record(false)));
+        let rt = CoreLifecycleRuntime::new(store.clone());
+        let e = rt
+            .delete(&DeleteRequest::new(cid("c1")).with_force(true))
+            .expect_err("fake store delete fails");
+        assert_eq!(e.message(), "unused");
+        assert_eq!(*store.deletes.lock().expect("lock"), 1);
     }
 
     /// cgroup の配置が無い記録の delete は remover に触れず store.delete まで進む。

@@ -22,8 +22,14 @@ fandhe-container-plugin = { workspace = true, features = ["grpc"] }
 tokio = { workspace = true, features = ["rt", "net", "time"] }
 tonic = { workspace = true }
 fandhe-container-cri = { path = "../cri" }
-# core は plugin feature を有効にしない（feature 統合で core の成果物が変わらないよう cri と揃える。PLUG-4）。
+# core 自身は plugin feature を要求しない（PLUG-4）。ただし下の supervisor が core を既定 feature（`plugin`）で引くため、
+# `-p fandhe-container-plugin-cri` でビルドすると feature 統合で core の `plugin` feature が有効になる（#2434）。
+# PLUG-4 の core 不変性の判定は core 単体のビルドで行うため影響しない。
 fandhe-container-core = { path = "../core", default-features = false }
+# #2434（CRI-2・PLUG-1・SUP-1・SUP-9）: start・kill・stop と cgroup remover を CLI と同じ本番経路へ結線するため supervisor へ path 依存を
+# 足した（workspace 内 path 依存で外部クレートの追加ではない。辺は plugin-cri → supervisor の一方向で、supervisor は core
+# にのみ依存するため循環しない。CLI の private 実装を複製せず supervisor の公開 API を共有する。REPAIR-1）。
+fandhe-container-supervisor = { path = "../supervisor" }
 # TASK-114.4（#460・MS-4）: NetworkPlugin の実装が TASK-139 の統合 API（create_network・attach_container・delete_network）を呼ぶ。
 # workspace 内 path 依存で外部クレートの追加ではない。net は依存を持たない core 側ライブラリで、辺は plugin-cri → net の一方向（PLUG-1・CRI-7）。
 fandhe-container-net = { path = "../net" }

@@ -56,14 +56,18 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::observability::OpRecorder;
 use fandhe_container_core::oci_runtime::{
-    CgroupRemoval, ContainerCgroupRemover, KillTimeout, LifecycleOp, OciRuntimeError,
-    ProcessSignaler, delete, delete_releasing_image_ref, kill,
+    ContainerCgroupRemover, KillTimeout, LifecycleOp, OciRuntimeError, ProcessSignaler, delete,
+    delete_releasing_image_ref, kill,
 };
 use fandhe_container_core::traits::{
-    CgroupPlacement, CgroupScope, ContainerId, ContainerStatus, DeleteRequest, DeleteResponse,
-    ErrorCode, KillRequest, Signal, StateRevision, StateStore, TraitError,
+    ContainerId, ContainerStatus, DeleteRequest, DeleteResponse, KillRequest, Signal, StateStore,
+    TraitError,
 };
-use fandhe_container_supervisor::control::ControlSignaler;
+// 試験が `use super::*` 経由で使う型（本番の経路では使わない）。
+#[cfg(all(test, target_os = "linux"))]
+use fandhe_container_core::oci_runtime::CgroupRemoval;
+#[cfg(test)]
+use fandhe_container_core::traits::{CgroupPlacement, CgroupScope, ErrorCode, StateRevision};
 
 use super::CliExit;
 use super::args::{DeleteArgs, GlobalArgs, StopArgs};
@@ -72,188 +76,21 @@ use super::image::open_image_store_for_lifecycle;
 use super::image_refs::{StoreImageRefs, state_scope};
 use fandhe_container_oci::image_management::ImageStore;
 
-/// 状態ルートを公開しないストア用の fail-closed の signaler。常に `Unimplemented` で失敗する（REPAIR-3）。
-///
-/// [`production_signaler`] が `host_state_root()` の無いストアに対してだけ返す。送らないことで
-/// `state.json` の pid への縮退を防ぐ（SEC-1・CORE-1）。
-struct UnavailableSignaler;
-
-/// 本番の signaler（stop の意図を記録させない版。`kill` 用の注入点。#2059・#1902。CLI-1・SEC-1・CORE-1）。
-///
-/// 将来の `kill`（#1902）から呼ばれる。stop の意図は立てない（kind 2）。現状の呼び出しは試験だけ。`<host_state_root>/<id>/supervisor.sock` の supervisor へ
-/// 依頼する `ControlSignaler` を返し、到達できなければ構造化エラーで失敗する。`state.json` の pid へ
-/// `kill(2)` する縮退は持たない。ルートに `host_state_root()` を使うのは、supervisor のログルートや
-/// `remove_supervisor_log` と揃い、cfg を CLI に持ち込まないため。supervisor の bind 側（`args.root`）との違いは
-/// 親の symlink の解決だけで、`<root>/<id>` は同じディレクトリを指す。
-#[allow(dead_code)]
-pub(super) fn production_signaler(store: &dyn StateStore) -> Arc<dyn ProcessSignaler> {
-    match store.host_state_root() {
-        Some(root) => Arc::new(ControlSignaler::new(root.to_path_buf())),
-        None => Arc::new(UnavailableSignaler),
-    }
-}
-
-/// 本番の `stop` 用 signaler（SUP-9・#2162）。[`production_signaler`] と同じ到達先・縮退なしの規則だが、
-/// `ControlSignaler::for_stop` で StopRequest を送り、supervisor に明示 stop の意図を記録させてから SIGTERM を渡す。
-/// 意図を記録できない supervisor（書き先なし・古い版）には送らず、構造化エラーで失敗する（fail-closed）。
-pub(super) fn production_stop_signaler(store: &dyn StateStore) -> Arc<dyn ProcessSignaler> {
-    match store.host_state_root() {
-        Some(root) => Arc::new(ControlSignaler::for_stop(root.to_path_buf())),
-        None => Arc::new(UnavailableSignaler),
-    }
-}
-
-impl ProcessSignaler for UnavailableSignaler {
-    fn signal(
-        &self,
-        _id: &ContainerId,
-        _pid: std::num::NonZeroU32,
-        _signal: Signal,
-        _deadline: Instant,
-    ) -> Result<(), TraitError> {
-        Err(TraitError::new(
-            ErrorCode::Unimplemented,
-            "process signaler is not available yet",
-        ))
-    }
-}
-
-/// 委譲スコープを初回の利用時に 1 回だけ検出し、結果をキャッシュする cgroup remover（Linux。OCI-6・CORE-3）。
-///
-/// `run_delete` が core の `delete` へ渡す。core は cgroup 配置の記録が無いレコードでは remover に触れないため、
-/// 検出（`DelegatedCgroup::detect`）は配置のあるレコードの delete だけで走る。`scope()` と
-/// `remove_with_recorder()` が同じ検出結果を共有するので、2 回の検出の間に所属が変わって食い違うことは無い。
-/// 検出の失敗もキャッシュして同じエラーで返し、状態記録を残す（fail-closed）。
-#[cfg(target_os = "linux")]
-struct DetectedCgroupRemover<R, F> {
-    detect: F,
-    detected: std::sync::OnceLock<Result<R, TraitError>>,
-}
-
-#[cfg(target_os = "linux")]
-impl<R, F> DetectedCgroupRemover<R, F>
-where
-    R: ContainerCgroupRemover,
-    F: Fn() -> Result<R, TraitError> + Send + Sync,
-{
-    fn new(detect: F) -> Self {
-        Self {
-            detect,
-            detected: std::sync::OnceLock::new(),
-        }
-    }
-
-    fn get(&self) -> Result<&R, TraitError> {
-        self.detected
-            .get_or_init(|| (self.detect)())
-            .as_ref()
-            .map_err(Clone::clone)
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl<R, F> ContainerCgroupRemover for DetectedCgroupRemover<R, F>
-where
-    R: ContainerCgroupRemover,
-    F: Fn() -> Result<R, TraitError> + Send + Sync,
-{
-    fn scope(&self) -> Result<CgroupScope, TraitError> {
-        self.get()?.scope()
-    }
-
-    fn remove(
-        &self,
-        id: &ContainerId,
-        instance: StateRevision,
-    ) -> Result<CgroupRemoval, TraitError> {
-        self.get()?.remove(id, instance)
-    }
-
-    /// 既定実装に任せると残留 `exec-*` の掃除の観測値が記録されないため、内側へ明示的に転送する（REPAIR-4）。
-    fn remove_with_recorder(
-        &self,
-        id: &ContainerId,
-        instance: StateRevision,
-        recorder: &OpRecorder,
-    ) -> Result<CgroupRemoval, TraitError> {
-        self.get()?.remove_with_recorder(id, instance, recorder)
-    }
-
-    /// 記録のスコープが検出したスコープと食い違うときの経路を内側へ転送する（#2096・#2060 案 B）。
-    /// 検出の失敗はキャッシュしたエラーのまま返し、記録の経路へ回さない（fail-closed。#2133 で再検討し維持。
-    /// 理由と回避策はモジュール doc の「未実装・簡易実装」）。
-    fn remove_recorded(
-        &self,
-        id: &ContainerId,
-        placement: &CgroupPlacement,
-        recorder: &OpRecorder,
-    ) -> Result<CgroupRemoval, TraitError> {
-        self.get()?.remove_recorded(id, placement, recorder)
-    }
-}
-
-/// 検出失敗のエラーを `code` だけ保って固定文言にする（パス・errno を出さない。ERR-2）。
-#[cfg(target_os = "linux")]
-fn detect_error(code: ErrorCode) -> TraitError {
-    TraitError::new(code, "failed to detect the delegated cgroup")
-}
-
-/// 自プロセスの委譲 cgroup を検出する（所有者・`cgroup.type` の検証は core の `detect` が行う）。
-#[cfg(target_os = "linux")]
-fn detect_delegated_cgroup() -> Result<fandhe_container_core::cgroups::DelegatedCgroup, TraitError>
-{
-    fandhe_container_core::cgroups::DelegatedCgroup::detect().map_err(|e| detect_error(e.code))
-}
-
-/// 本番の cgroup remover。cfg の分岐をここに閉じ込める。
-#[cfg(target_os = "linux")]
-fn production_cgroup_remover() -> impl ContainerCgroupRemover {
-    DetectedCgroupRemover::new(detect_delegated_cgroup)
-}
-
-/// 非 Linux では委譲 cgroup が無い（`production_runtime` が先に fail-closed になり通常は到達しない）。
-#[cfg(not(target_os = "linux"))]
-fn production_cgroup_remover() -> impl ContainerCgroupRemover {
-    UnavailableCgroupRemover
-}
-
-/// 非 Linux の cgroup remover。委譲 cgroup が無いため常に `Unimplemented` で失敗する（REPAIR-3）。
-///
-/// `remove` も `NotPresent` を返さない（cgroup を残したまま記録だけ消す経路を作らない）。
-#[cfg(not(target_os = "linux"))]
-struct UnavailableCgroupRemover;
-
-#[cfg(not(target_os = "linux"))]
-impl ContainerCgroupRemover for UnavailableCgroupRemover {
-    fn scope(&self) -> Result<CgroupScope, TraitError> {
-        Err(unavailable_cgroup())
-    }
-
-    fn remove(
-        &self,
-        _id: &ContainerId,
-        _instance: StateRevision,
-    ) -> Result<CgroupRemoval, TraitError> {
-        Err(unavailable_cgroup())
-    }
-
-    fn remove_recorded(
-        &self,
-        _id: &ContainerId,
-        _placement: &CgroupPlacement,
-        _recorder: &OpRecorder,
-    ) -> Result<CgroupRemoval, TraitError> {
-        Err(unavailable_cgroup())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn unavailable_cgroup() -> TraitError {
-    TraitError::new(
-        ErrorCode::Unimplemented,
-        "container cgroup removal is not available yet",
-    )
-}
+// 本番の signaler・cgroup remover は supervisor crate にある（plugin-cri の `kill`・`stop`・`delete` と共有するため
+// CLI の private 実装から移した。#2434・REPAIR-1）。`production_signaler` は `kill` コマンド（#1902）が入るまで試験だけが使う。
+#[cfg(all(test, not(target_os = "linux")))]
+use fandhe_container_supervisor::cgroup_remover::UnavailableCgroupRemover;
+use fandhe_container_supervisor::cgroup_remover::production_cgroup_remover;
+#[cfg(all(test, target_os = "linux"))]
+use fandhe_container_supervisor::cgroup_remover::{DetectedCgroupRemover, detect_error};
+#[cfg(test)]
+use fandhe_container_supervisor::control::UnavailableSignaler;
+#[cfg(all(test, target_os = "linux"))]
+use fandhe_container_supervisor::control::production_signaler;
+use fandhe_container_supervisor::control::production_stop_signaler;
+use fandhe_container_supervisor::supervisor_log::{
+    LogRemoval, SUPERVISOR_LOG_REMOVE_TIMEOUT, run_log_removal_bounded,
+};
 
 /// ID を core の型で検証し、`SIGTERM` の kill 要求を作る。
 fn build_stop_request(args: &StopArgs) -> Result<KillRequest, TraitError> {
@@ -378,41 +215,6 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
     }
 }
 
-/// ログ削除を待つ上限。ローカル FS の小さなファイル数個（世代数 × 3 MiB 以下）の unlink には十分長く、
-/// I/O 停止（NFS ハング等）でも CLI が秒単位で戻れる値にする（REPAIR-5）。
-const SUPERVISOR_LOG_REMOVE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// ログ削除を期限つきで試した結果（REPAIR-5）。
-#[derive(Debug, PartialEq, Eq)]
-enum LogRemoval {
-    /// 期限内に終わった（削除自体の成否は問わない。best effort）。
-    Finished,
-    /// 期限内に終わらなかった。作業スレッドは I/O で止まったまま残る。
-    TimedOut,
-}
-
-/// `job` を作業スレッドで実行し、`timeout` までだけ待つ。呼び出し元スレッドは削除 I/O で止まらない。
-///
-/// 期限切れのとき作業スレッドは join せず残す（CLI は直後にプロセスごと終了する。止まった I/O を中断する
-/// 手段は無く、待てば CLI が無期限に戻らなくなるため。`main.rs` の `report_deferred` と同じ流儀）。
-/// スレッドを起動できなかった場合は削除を諦めて `Finished` 扱いにする（同期実行へ退避しない。ブロックし得るため）。
-fn run_log_removal_bounded(job: impl FnOnce() + Send + 'static, timeout: Duration) -> LogRemoval {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("supervisor-log-remove".to_string())
-        .spawn(move || {
-            job();
-            let _ = tx.send(());
-        });
-    if spawned.is_err() {
-        return LogRemoval::Finished;
-    }
-    match rx.recv_timeout(timeout) {
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => LogRemoval::TimedOut,
-        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => LogRemoval::Finished,
-    }
-}
-
 /// 期限切れの警告（stderr に 1 行の JSON。`code` / `message` は ERR-1 の形）。
 fn log_removal_timeout_warning() -> &'static str {
     "{\"level\":\"warn\",\"code\":\"TIMEOUT\",\"message\":\"supervisor log removal did not finish within the deadline; leftover logs may remain\"}"
@@ -429,12 +231,9 @@ fn remove_supervisor_log(store: &dyn StateStore, req: &DeleteRequest) {
     let Some(root) = store.host_state_root() else {
         return;
     };
-    let root = root.to_path_buf();
-    let id = req.id().clone();
-    let outcome = run_log_removal_bounded(
-        move || {
-            let _ = fandhe_container_supervisor::supervisor_log::remove(&root, &id);
-        },
+    let outcome = fandhe_container_supervisor::supervisor_log::remove_bounded(
+        root,
+        req.id(),
         SUPERVISOR_LOG_REMOVE_TIMEOUT,
     );
     if outcome == LogRemoval::TimedOut {
@@ -571,6 +370,7 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         #[cfg(not(target_os = "linux"))]
         {
+            use fandhe_container_supervisor::control::ControlSignaler;
             let e = ControlSignaler::new(std::path::PathBuf::from("root"))
                 .signal(&id, pid, Signal::SIGTERM, Instant::now())
                 .expect_err("control signal");

@@ -149,6 +149,94 @@ pub fn remove(root: &Path, id: &ContainerId) -> Result<RemovedLogs, TraitError> 
     }
 }
 
+/// ログ削除を待つ既定の上限。ローカル FS の小さなファイル数個（世代数 × 3 MiB 以下）の unlink には十分長く、
+/// I/O 停止（NFS ハング等）でも呼び出し元が秒単位で戻れる値にする（REPAIR-5）。
+pub const SUPERVISOR_LOG_REMOVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// ログ削除を期限つきで試した結果（REPAIR-5）。
+#[derive(Debug, PartialEq, Eq)]
+pub enum LogRemoval {
+    /// 期限内に終わった（削除自体の成否は問わない。best effort）。
+    Finished,
+    /// 期限内に終わらなかった。作業スレッドは I/O で止まったまま残る。
+    TimedOut,
+}
+
+/// 同時に走らせる削除作業スレッドの上限。枠は期限切れではなく作業の実終了まで保持する（REPAIR-5）。
+const MAX_INFLIGHT_LOG_REMOVALS: usize = 8;
+
+/// 実行中の削除作業の数（常駐する plugin-cri の `delete` で I/O 停止時にスレッドが無制限に増えるのを防ぐ）。
+static INFLIGHT_LOG_REMOVALS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 作業スレッドが終わる（panic を含む）ときに枠を返す。
+struct InflightSlot;
+
+impl InflightSlot {
+    /// 枠が空いていれば確保する。満杯なら `None`。
+    fn acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        INFLIGHT_LOG_REMOVALS
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < MAX_INFLIGHT_LOG_REMOVALS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for InflightSlot {
+    fn drop(&mut self) {
+        INFLIGHT_LOG_REMOVALS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// `job` を作業スレッドで実行し、`timeout` までだけ待つ。呼び出し元スレッドは削除 I/O で止まらない。
+///
+/// 期限切れのとき作業スレッドは join せず残す（止まった I/O を中断する手段は無く、待てば呼び出し元が無期限に戻らなく
+/// なるため）。残るスレッドは `MAX_INFLIGHT_LOG_REMOVALS` 個までで、枠は作業の実終了まで保持する。枠が埋まっている
+/// ときは best effort として削除を諦め、スレッドを起動せず `TimedOut` を返す（REPAIR-5）。
+/// スレッドを起動できなかった場合は削除を諦めて `Finished` 扱いにする（同期実行へ退避しない。ブロックし得るため）。
+/// CLI の `delete` の警告出力の期限（`emit_warning_bounded`）も同じ仕組みを使う（#2434 で CLI から移設）。
+pub fn run_log_removal_bounded(
+    job: impl FnOnce() + Send + 'static,
+    timeout: std::time::Duration,
+) -> LogRemoval {
+    let Some(slot) = InflightSlot::acquire() else {
+        return LogRemoval::TimedOut;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("supervisor-log-remove".to_string())
+        .spawn(move || {
+            let _slot = slot;
+            job();
+            let _ = tx.send(());
+        });
+    if spawned.is_err() {
+        return LogRemoval::Finished;
+    }
+    match rx.recv_timeout(timeout) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => LogRemoval::TimedOut,
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => LogRemoval::Finished,
+    }
+}
+
+/// core の `delete` が成功した後に、`id` の supervisor ログを best effort で期限つきに消す（#2067・#2434・REPAIR-4・REPAIR-5）。
+///
+/// 失敗は握る（delete の結果は変えない）。期限切れなら [`LogRemoval::TimedOut`] を返すので、警告を出すかは呼び出し側が決める
+/// （CLI は stderr に 1 行の JSON、plugin-cri は構造化ログ）。core の `delete` より前には呼ばない（失敗時に稼働中のログを消さないため）。
+pub fn remove_bounded(root: &Path, id: &ContainerId, timeout: std::time::Duration) -> LogRemoval {
+    let root = root.to_path_buf();
+    let id = id.clone();
+    run_log_removal_bounded(
+        move || {
+            let _ = remove(&root, &id);
+        },
+        timeout,
+    )
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use std::fs;
@@ -299,6 +387,26 @@ mod tests {
     }
 
     /// REPAIR-4: remove は全ファイルを消し冪等。生存中は FailedPrecondition で何も消さない。
+    /// REPAIR-5: 枠が埋まっているとスレッドを起動せず TimedOut を返し、実終了で枠が戻る。
+    #[test]
+    fn repair5_inflight_cap_gives_up_and_releases_on_finish() {
+        let slots: Vec<_> = std::iter::from_fn(InflightSlot::acquire).collect();
+        assert!(!slots.is_empty());
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = Arc::clone(&ran);
+        let out = run_log_removal_bounded(
+            move || r.store(true, Ordering::SeqCst),
+            Duration::from_millis(50),
+        );
+        assert_eq!(out, LogRemoval::TimedOut);
+        assert!(!ran.load(Ordering::SeqCst));
+        drop(slots);
+        assert_eq!(
+            run_log_removal_bounded(|| {}, Duration::from_secs(5)),
+            LogRemoval::Finished
+        );
+    }
+
     #[test]
     fn repair4_remove_deletes_all_and_is_idempotent() {
         let t = TmpDir::new("rm");

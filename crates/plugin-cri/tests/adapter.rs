@@ -2,18 +2,22 @@
 
 use std::sync::Arc;
 
+#[cfg(not(target_os = "linux"))]
+use fandhe_container_core::traits::Signal;
 use fandhe_container_core::traits::{
     AttachRequest, ContainerId, ContainerRuntime, ContainerStatus, CreateNetnsRequest,
     CreateNetworkRequest, DeleteNetworkRequest, DeleteRequest, DetachRequest, ErrorCode, IpCidr,
-    KillRequest, NetworkName, NetworkPlugin, PublishPortRequest, Signal, StartRequest,
-    StateRequest, StopRequest,
+    KillRequest, NetworkName, NetworkPlugin, PublishPortRequest, StartRequest, StateRequest,
+    StopRequest,
 };
 use fandhe_container_cri::adapter::{BundleProvider, BundleRequest};
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::runtime::v1::{ContainerConfig, PodSandboxConfig};
+#[cfg(not(target_os = "linux"))]
+use fandhe_container_plugin_cri::adapter::MSG_LAUNCH_UNAVAILABLE;
 use fandhe_container_plugin_cri::adapter::{
-    CoreLifecycleRuntime, CriPluginBackends, MSG_BUNDLE_UNAVAILABLE, MSG_LAUNCH_UNAVAILABLE,
-    MSG_NETWORK_UNAVAILABLE, UnimplementedBundleProvider, UnimplementedNetwork,
+    CoreLifecycleRuntime, CriPluginBackends, MSG_BUNDLE_UNAVAILABLE, MSG_NETWORK_UNAVAILABLE,
+    UnimplementedBundleProvider, UnimplementedNetwork,
 };
 
 fn cid(s: &str) -> ContainerId {
@@ -134,7 +138,9 @@ fn no_state() -> fandhe_container_core::traits::TraitError {
     fandhe_container_core::traits::TraitError::new(ErrorCode::Unimplemented, "unused")
 }
 
-/// start・kill・stop は固定文言の `Unimplemented`（REPAIR-3）。
+/// start・kill・stop は固定文言の `Unimplemented`（REPAIR-3）。Linux は supervisor 経由で結線済みのため
+/// 非 Linux だけで照合する（Linux 側は `tests/lifecycle_supervisor.rs`。#2434）。
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn cri2_start_kill_stop_unimplemented() {
     let rt = CoreLifecycleRuntime::new(Arc::new(NoState));

@@ -216,6 +216,25 @@ impl ImageRootfsSource {
     }
 }
 
+/// 展開成功後に rootfs 自体へ検索権限（0755）を付ける（CRI-2・SEC-1）。
+///
+/// 展開中は 0700 のまま保ち（`create_private_dir`）、tar のルートエントリは展開処理が無視するため、放置すると
+/// コンテナの `/` が 0700 になり、`User` が非 root（`1000:2000` や `run_as_user`）のプロセスが `/` 配下を
+/// 検索できず EACCES になる。外側の bundle ディレクトリは 0700 のまま変えない（ホスト側の他ユーザーを締め出す）。
+fn open_rootfs_for_search(rootfs: &Path) -> Result<(), CriError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(rootfs, std::fs::Permissions::from_mode(0o755))
+            .map_err(|_| CriError::internal("failed to set rootfs permissions"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = rootfs;
+        Ok(())
+    }
+}
+
 fn untrusted(message: &'static str) -> CriError {
     CriError::failed_precondition(message)
 }
@@ -416,7 +435,8 @@ impl RootfsSource for ImageRootfsSource {
             opts,
         )
         .map_err(|e| CriError::from(PullError::from_extract(&e)))
-        .and_then(|_| self.check_deadline(started));
+        .and_then(|_| self.check_deadline(started))
+        .and_then(|()| open_rootfs_for_search(rootfs));
         if let Err(e) = extracted {
             // 先行レイヤーの展開物が残るため、自分が作った rootfs だけを消す（0555 等も権限を戻して消す）。
             let _ = remove_extracted_tree(rootfs);

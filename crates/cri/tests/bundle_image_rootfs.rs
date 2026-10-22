@@ -420,6 +420,19 @@ fn cri2_prepare_builds_bundle_from_the_cached_image() {
     );
 }
 
+/// CRI-2・SEC-1: rootfs 自体は非 root が検索できる 0755、外側の bundle ディレクトリは 0700 のまま。
+#[test]
+fn cri2_rootfs_root_is_searchable_by_non_root_users() {
+    let env = pulled_env("rootmode", CONFIG_SECTION);
+    let p = env.provider();
+    let dir = prepare(&p, "ctr-mode", &container(&env.image_id)).expect("prepare");
+    assert_eq!(
+        fs::metadata(dir.join("rootfs")).unwrap().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(fs::metadata(&dir).unwrap().mode() & 0o777, 0o700);
+}
+
 /// CRI-2: CRI の command・args・envs・working_dir がイメージ既定値を置き換える。
 #[test]
 fn cri2_container_config_overrides_image_defaults() {

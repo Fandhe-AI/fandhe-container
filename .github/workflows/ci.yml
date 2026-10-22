@@ -1341,15 +1341,16 @@ jobs:
   # 実行はネイティブ arm64 ランナーでのテスト実行が将来の課題（ci.md「3 OS CI」参照）。
   #
   # クロスリンカ・SDK（macOS SDK・MSVC）無しで成立するのは、現在 Cargo.toml に入っている外部依存が
-  # 純 Rust のクレートのみ（serde / serde_json / sha2 と推移依存。ターゲットにより libc・cpufeatures・
-  # objc2 系・windows-sys / windows-link も入る）で、build.rs・cc 等のネイティブビルドを伴わない
-  # ため（2026-10-10 に 3 ターゲットとも cargo check / clippy が通ることをローカルで確認）。
-  # 2026-10-10 に承認済みでまだ Cargo.toml に入っていない依存（docs/design/from-scratch-policy.md の
-  # 許容依存リストの #399・#406・#408・#425・#540・#582・#678。ureq・rustls・tonic・tokio・
-  # serde-saphyr・toml 等）も、判断資料の依存ツリー（-e normal,build）では cc・cmake・bindgen・
-  # links を持たない純 Rust の範囲にあるが、build.rs を持つもの（cfg の判定と、tonic-prost-build・
-  # protox による .proto のコード生成）は入り、3 ターゲットでの実ビルドは未実施。これらを追加する
-  # PR では `cargo tree -e normal,build --target <ターゲット>`（3 ターゲットそれぞれ）でこの前提を
+  # 純 Rust のクレートのみで、cargo tree -e normal,build --target all に cc・cmake・bindgen が現れ
+  # ないため（ring・cc は rustls-webpki の optional 依存として Cargo.lock に項目が残るがビルドされ
+  # ない。ターゲットにより libc・objc2 系・windows-sys も入る）。ワークスペース内の build.rs は
+  # crates/cri の .proto コード生成（tonic-prost-build・protox）のみで、依存側は cfg の判定だけ。
+  # 依存ごとの導入状況は docs/design/from-scratch-policy.md を正とする。2026-10-10 承認分のうち
+  # 直接依存として未導入なのは hyper（#678・crates/cri。実装は #679）と、crates/cri からの
+  # flate2・hyper-util の参照（#678）、crates/compose-convert からの serde-saphyr の参照（#540）。
+  # いずれも -e normal,build の依存ツリーでは cc・cmake・bindgen・links を持たない純 Rust の範囲
+  # にあるが、3 ターゲットでの実ビルド（リンク）は未実施。これらを追加する PR では
+  # `cargo tree -e normal,build --target <ターゲット>`（3 ターゲットそれぞれ）でこの前提を
   # 確かめ、cc 等ネイティブビルドを伴う依存を承認・追加した場合は、cross toolchain か各 OS の
   # ネイティブランナーへ切り替えること（ci.md「3 OS CI」参照）。
   # --locked・cache を使わないのは platform-ci と条件をそろえるため。ビルド・テストのゲートでは

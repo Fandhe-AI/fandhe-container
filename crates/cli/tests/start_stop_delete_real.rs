@@ -181,14 +181,41 @@ mod linux {
     impl Drop for Cleanup {
         fn drop(&mut self) {
             if self.armed {
-                for sub in ["stop", "delete"] {
-                    if let Err(e) = run_cli(
+                if let Err(e) = run_cli(
+                    &self.cli,
+                    &["--root", &self.root, "stop", &self.id],
+                    CLI_TIMEOUT,
+                ) {
+                    eprintln!("start_stop_delete_real: cleanup stop failed: {e}");
+                }
+                // stop は送達で戻り Stopped を待たないため、delete は成功（終了コード 0）まで期限内で再試行する。
+                // 回収できなければ状態ルートを残して診断先を示す（回収に必要な記録を失わない）。
+                let mut last = String::from("not attempted");
+                let ok = wait_until(
+                    STATE_TIMEOUT,
+                    "cleanup delete to succeed",
+                    || match run_cli(
                         &self.cli,
-                        &["--root", &self.root, sub, &self.id],
+                        &["--root", &self.root, "delete", &self.id],
                         CLI_TIMEOUT,
                     ) {
-                        eprintln!("start_stop_delete_real: cleanup {sub} failed: {e}");
-                    }
+                        Ok(o) if o.code == Some(0) => true,
+                        Ok(o) => {
+                            last = format!("exit {:?} stderr={:?}", o.code, o.stderr);
+                            false
+                        }
+                        Err(e) => {
+                            last = e;
+                            false
+                        }
+                    },
+                );
+                if let Err(e) = ok {
+                    eprintln!(
+                        "start_stop_delete_real: cleanup delete failed ({e}; last: {last}); leaving {} for diagnosis",
+                        self.work.display()
+                    );
+                    return;
                 }
             }
             if let Err(e) = fs::remove_dir_all(&self.work) {
@@ -347,12 +374,29 @@ mod linux {
         })?;
 
         // 5. logs
-        let out = run_cli(&cli, &["--root", &root_s, "logs", &id_s], CLI_TIMEOUT)?;
-        expect_ok_code(&out, "logs")?;
-        expect(
-            out.stdout.lines().any(|l| l == "stdout READY_TERM"),
-            &format!("logs lacks `stdout READY_TERM`: {:?}", out.stdout),
-        )?;
+        // ハンドラ登録後でも supervisor の非同期ログ捕捉・flush は未完のことがあるため、期限内で再取得する（REPAIR-5）。
+        let mut last_logs = String::new();
+        let logs_ok =
+            wait_until(
+                STATE_TIMEOUT,
+                "logs to contain `stdout READY_TERM`",
+                || match run_cli(&cli, &["--root", &root_s, "logs", &id_s], CLI_TIMEOUT) {
+                    Ok(o) if o.code == Some(0) => {
+                        let found = o.stdout.lines().any(|l| l == "stdout READY_TERM");
+                        last_logs = o.stdout;
+                        found
+                    }
+                    Ok(o) => {
+                        last_logs = format!("exit {:?} stderr={:?}", o.code, o.stderr);
+                        false
+                    }
+                    Err(e) => {
+                        last_logs = e;
+                        false
+                    }
+                },
+            );
+        logs_ok.map_err(|e| format!("{e}; last logs: {last_logs:?}"))?;
         let container_log = root.join("@container-logs").join(format!("{id_s}.log"));
         let supervisor_log = root.join("@supervisor-logs").join(format!("{id_s}.log"));
         expect(
@@ -388,14 +432,24 @@ mod linux {
         wait_until(REAP_TIMEOUT, "the container process to vanish", || {
             !Path::new(&format!("/proc/{pid}")).exists()
         })?;
+        // 今回の起動に属するプローブだけを見る（cgroup 一致。並行する別試験のプローブを巻き込まない）。
+        let want_cgroup = format!("0::{expected_line}");
         wait_until(REAP_TIMEOUT, "probe processes to vanish", || {
-            count_processes(|c| c.windows(17).any(|w| w == b"--container-probe")) == 0
+            count_processes(|dir| {
+                fs::read_to_string(dir.join("cgroup"))
+                    .is_ok_and(|t| t.lines().any(|l| l == want_cgroup))
+                    && fs::read(dir.join("cmdline"))
+                        .is_ok_and(|c| c.windows(17).any(|w| w == b"--container-probe"))
+            }) == 0
         })?;
         let sup_needle = supervisor.to_string_lossy().into_owned().into_bytes();
         let root_needle = root_s.clone().into_bytes();
         wait_until(REAP_TIMEOUT, "the supervisor to exit", || {
-            count_processes(|c| {
-                c.starts_with(&sup_needle) && c.windows(root_needle.len()).any(|w| w == root_needle)
+            count_processes(|dir| {
+                fs::read(dir.join("cmdline")).is_ok_and(|c| {
+                    c.starts_with(&sup_needle)
+                        && c.windows(root_needle.len()).any(|w| w == root_needle)
+                })
             }) == 0
         })?;
         expect(
@@ -503,8 +557,8 @@ mod linux {
             .map_err(|e| format!("get: {e:?}"))
     }
 
-    /// `/proc` の全プロセスのうち、cmdline が条件に合うものの数。
-    fn count_processes(pred: impl Fn(&[u8]) -> bool) -> usize {
+    /// `/proc` の全プロセスのうち、`/proc/<pid>` のディレクトリが条件に合うものの数。
+    fn count_processes(pred: impl Fn(&Path) -> bool) -> usize {
         let Ok(dir) = fs::read_dir("/proc") else {
             return 0;
         };
@@ -513,7 +567,7 @@ mod linux {
                 e.file_name()
                     .to_str()
                     .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
-                    && fs::read(e.path().join("cmdline")).is_ok_and(|c| pred(&c))
+                    && pred(&e.path())
             })
             .count()
     }

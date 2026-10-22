@@ -452,11 +452,11 @@ impl LateOrphans {
         self.lock().active_workers == 0
     }
 
-    /// 実行スレッドがすべて終了済みで、terminate に失敗したハンドルも積まれていないとき `true`
-    /// （残存プロセスが無いと確認できた状態。取り出さずに見るだけ。#2440・SUP-9）。
-    fn is_clean(&self) -> bool {
-        let g = self.lock();
-        g.active_workers == 0 && g.orphans.is_empty()
+    /// 実行スレッドの終了を `grace` まで待ってから 「実行スレッドが全て終了済みで、terminate に失敗したハンドルも無い（残存プロセスが無いと確認できた）」かを判定する。結果の通知（`Slot::Done`）は
+    /// スレッド終了のガードより先に公開されるため、通知直後は終了が競合で未反映になり得る。その競合で
+    /// 受理済みの明示 stop の記録可否が変わらないよう、有限時間だけ待つ（REPAIR-5・SUP-9・契約 14）。
+    fn is_clean_after_settle(&self, grace: Duration) -> bool {
+        self.wait_settled(grace) && self.lock().orphans.is_empty()
     }
 
     /// 実行スレッドの終了を `timeout` まで待つ。終了していれば `true`（以後の [`LateOrphans::take`] が最終結果）。
@@ -1082,7 +1082,10 @@ pub fn supervise_with_restart(
                 observe(Some(error.code()));
                 // 再 launch の待機中に受理済みの明示 stop は、再 launch が失敗しても残す。残存プロセスが無いと
                 // 確認できた（実行スレッド完了・未回収ハンドルなし）ときだけ記録する（REPAIR-5・SUP-9・契約 14）。
-                if explicit_requested(stop) && !stop.is_stop_requested() && late.is_clean() {
+                if explicit_requested(stop)
+                    && !stop.is_stop_requested()
+                    && late.is_clean_after_settle(RELAUNCH_REPLY_GRACE)
+                {
                     return Ok(finish_explicit_stop(state, last, restarts, obs));
                 }
                 return Ok(SuperviseOutcome::RelaunchFailed {
@@ -2417,6 +2420,14 @@ mod tests {
                 ErrorCode::Internal,
                 "injected relaunch failure",
             ))
+        }
+    }
+
+    /// SUP-9・契約 14・#2440: 結果通知と実行スレッド終了の競合で記録可否が変わらない（反復して競合窓を踏ませる）。
+    #[test]
+    fn sup9_explicit_stop_persist_is_not_racy_with_worker_completion() {
+        for _ in 0..200 {
+            sup9_explicit_stop_persisted_when_relaunch_fails();
         }
     }
 

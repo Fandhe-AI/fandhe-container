@@ -171,7 +171,8 @@ fn read_report_line(mut out: impl Read) -> Received {
 /// 補助スレッドで [`read_report_line`] を行い、`within` を過ぎたら [`Received::TimedOut`] を返す。
 ///
 /// 期限切れのとき補助スレッドは read で止まったまま残る（子を kill しないため pipe は閉じない）。CLI は直後に終了する。
-/// 常駐する呼び出し側（plugin-cri）は期限切れの子を kill して pipe を閉じ、スレッドを終わらせる。
+/// 常駐する呼び出し側（plugin-cri）は、受信期限切れ（報告なし）の子だけを kill して pipe を閉じ、スレッドを終わらせる。
+/// 報告を受信できた場合は読み取りスレッドは既に終わっているため、kill は不要。
 fn receive_report(out: impl Read + Send + 'static, within: Duration) -> Received {
     let (tx, rx) = mpsc::sync_channel(1);
     let spawned = std::thread::Builder::new()
@@ -248,9 +249,21 @@ fn supervisor_path_beside(cli_exe: &Path) -> Result<PathBuf, OciRuntimeError> {
 /// CLI より長く生きる。drop は kill しない）。1 行も来ないまま EOF の枝だけ、既に終了した子を 1 回 `try_wait` で回収する
 /// （ECHILD 等の失敗は無視する）。
 fn launch_and_receive(
-    mut cmd: Command,
+    cmd: Command,
     receive_within: Duration,
 ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
+    let (result, child, _) = launch_and_receive_ex(cmd, receive_within);
+    (result, child)
+}
+
+/// [`launch_and_receive`] に「受信期限が切れたか」を加えたもの。
+///
+/// 3 つ目の値が `true` のときだけ、supervisor が報告を出さないまま期限を過ぎた（読み取りスレッドが pipe で止まったまま残る）。
+/// supervisor が `TIMEOUT` を報告した場合（報告を受信できた）は `false` で、supervisor は後始末の途中にいる（SUP-1・REPAIR-5）。
+fn launch_and_receive_ex(
+    mut cmd: Command,
+    receive_within: Duration,
+) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>, bool) {
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -265,7 +278,7 @@ fn launch_and_receive(
                     &format!("failed to spawn the supervisor: {}", e.kind()),
                 )
             };
-            return (Err(err), None);
+            return (Err(err), None, false);
         }
     };
     let Some(stdout) = child.stdout.take() else {
@@ -275,13 +288,15 @@ fn launch_and_receive(
                 "failed to read the supervisor start result",
             )),
             Some(child),
+            false,
         );
     };
     let received = receive_report(stdout, receive_within);
     if received == Received::Eof {
         let _ = child.try_wait();
     }
-    (map_received(received), Some(child))
+    let expired = received == Received::TimedOut;
+    (map_received(received), Some(child), expired)
 }
 
 /// CLI の受信期限（既定 58.9 秒。supervisor の内部上限 56.9 秒（手順 8 の見込み 39.45 秒〔監査配送 11.45 秒を含む〕+ cgroup 準備 6 秒 + 記録経路の確認 11.45 秒。`result_deadline` 参照） + 受信の猶予 2 秒。REPAIR-5）。
@@ -410,6 +425,20 @@ pub fn start_with(
     id: &ContainerId,
     within: Duration,
 ) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>) {
+    let (result, child, _) = start_with_receipt(launch, root, id, within);
+    (result, child)
+}
+
+/// [`start_with`] に「受信期限が切れたか」を加えたもの（常駐する呼び出し側用。plugin-cri）。
+///
+/// 3 つ目が `true` は報告が来ないまま期限を過ぎた場合だけ。supervisor が報告した `TIMEOUT`（後始末の途中）では `false`
+/// なので、呼び出し側はこの値で kill の要否を決める（報告後の supervisor を kill して後始末を失わない。CORE-2・REPAIR-5）。
+pub fn start_with_receipt(
+    launch: &SupervisorLaunch,
+    root: &Path,
+    id: &ContainerId,
+    within: Duration,
+) -> (Result<NonZeroU32, OciRuntimeError>, Option<Child>, bool) {
     let cmd = scoped_command(
         &launch.systemd_run,
         &launch.supervisor,
@@ -417,7 +446,7 @@ pub fn start_with(
         id,
         &launch.xdg_runtime_dir,
     );
-    launch_and_receive(cmd, within)
+    launch_and_receive_ex(cmd, within)
 }
 
 #[cfg(test)]
@@ -558,6 +587,29 @@ mod tests {
             "production process launcher is not available yet"
         );
         fx.assert_state_untouched();
+    }
+
+    /// CORE-2・REPAIR-5: 報告された TIMEOUT は受信期限切れではない（呼び出し側が kill しない判断に使う）。
+    #[test]
+    fn core2_reported_timeout_is_not_receive_expiry() {
+        let fx = Fixture::new("reported-timeout");
+        let script = "printf 'FCSUP1 ERR TIMEOUT 7 launch timed out\\n'; exec sleep 5";
+        let (result, child, expired) =
+            launch_and_receive_ex(fx.fake(script), Duration::from_secs(10));
+        reap(child);
+        assert_eq!(result.expect_err("timeout").code(), ErrorCode::Timeout);
+        assert!(!expired);
+    }
+
+    /// CORE-2・REPAIR-5: 報告が来ないまま期限を過ぎたときだけ expired が true。
+    #[test]
+    fn core2_receive_expiry_is_flagged() {
+        let fx = Fixture::new("expiry-flag");
+        let (result, child, expired) =
+            launch_and_receive_ex(fx.fake("exec sleep 5"), Duration::from_millis(300));
+        reap(child);
+        assert_eq!(result.expect_err("timeout").code(), ErrorCode::Timeout);
+        assert!(expired);
     }
 
     /// REPAIR-5: 期限内に報告が無ければ TIMEOUT（結果不明）。supervisor は kill されず、状態は不変。

@@ -57,6 +57,7 @@ case "$4" in
   c-eof) exit 0;;
   c-bad) printf 'garbage\n'; exec sleep 3;;
   c-hang) exec sleep 3;;
+  c-reported-timeout) printf 'FCSUP1 ERR TIMEOUT 7 launch timed out\n'; sleep 1; touch "$3/cleanup-done"; exit 0;;
   c-quick) printf 'FCSUP1 OK 4242\n'; exit 0;;
   *) printf 'FCSUP1 ERR INTERNAL 1 unexpected id\n'; exit 0;;
 esac
@@ -316,6 +317,28 @@ fn repair5_start_times_out_without_report() {
         let _ = h.rt.kill(&KillRequest::new(cid("c-hang"), Signal::SIGTERM));
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// CORE-2・REPAIR-5: supervisor が報告した TIMEOUT では、後始末の途中の supervisor を kill しない（後始末が完了する）。
+#[test]
+fn core2_reported_timeout_does_not_kill_cleaning_supervisor() {
+    let marker = scripts().dir.join("cleanup-done");
+    let _ = std::fs::remove_file(&marker);
+    let h = harness(running("c-reported-timeout", 1), LONG);
+    let e =
+        h.rt.start(&StartRequest::new(cid("c-reported-timeout")))
+            .expect_err("reported timeout");
+    assert_eq!(e.code(), ErrorCode::Timeout);
+    // kill されていれば後始末の印が作られない。
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "supervisor was killed during cleanup"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = std::fs::remove_file(&marker);
 }
 
 /// SUP-1: 1 行も無いまま EOF なら INTERNAL。

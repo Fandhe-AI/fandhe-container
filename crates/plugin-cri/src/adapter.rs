@@ -25,8 +25,10 @@
 //!   （CORE-1）、`ProcessSignaler` の本番実装は supervisor 側にあるため、tokio 上の CRI プロセスから
 //!   直接呼べない。結線は supervisor 起動の経路（#2434）
 //! - `delete` は cgroup の配置を持つ記録では fail-closed（`UnavailableCgroupRemover`）で、記録を残す
-//! - [`UnimplementedBundleProvider`]: 本番の bundle 供給（image 展開と ContainerConfig → config.json 変換）は
-//!   未実装（#2433）
+//! - bundle 供給: 本番は `CriPluginBackends::production_bundle_provider`（unix のみ）（pull 済みイメージの再展開と
+//!   ContainerConfig → config.json 変換。#2433）。`ImageService` をサーブしていないためタグは解決できず、
+//!   image ID（`sha256:<hex>`）だけを受ける（イメージ取り込みの結線と合わせて別途。REPAIR-3）。
+//!   [`UnimplementedBundleProvider`] は試験と非 unix 用に残す
 //! - 状態ルートは既定（`StateRoot::resolve(None)`）に固定し、外部入力から受けない
 
 use std::fmt;
@@ -73,6 +75,8 @@ pub struct CriPluginBackends {
     network: Arc<dyn NetworkPlugin>,
     /// 実行層（`oci_runtime`）と CRI サービスが共有する記録器（REPAIR-4）。
     recorder: Arc<OpRecorder>,
+    /// `production()` が解決した状態ルート（bundle とイメージキャッシュの置き場の親。注入で組んだときは `None`）。
+    state_root: Option<PathBuf>,
 }
 
 impl fmt::Debug for CriPluginBackends {
@@ -104,6 +108,7 @@ impl CriPluginBackends {
             state,
             network,
             recorder,
+            state_root: None,
         }
     }
 
@@ -114,6 +119,7 @@ impl CriPluginBackends {
     /// `Unimplemented` をそのまま返す（fail-closed）。
     pub fn production() -> Result<Self, TraitError> {
         let root = StateRoot::resolve(None)?;
+        let state_root = root.path().to_path_buf();
         let recorder = Arc::new(OpRecorder::new());
         // netns の pin の置き場は状態ルート配下の固定の場所（要求の入力からは受けない。TASK-114.4）。
         // 先頭が `.` のため、英数字始まりの `ContainerId` の状態ディレクトリと衝突しない。
@@ -132,7 +138,22 @@ impl CriPluginBackends {
             Arc::clone(&state),
             Arc::clone(&recorder),
         ));
-        Ok(Self::with_recorder(runtime, state, network, recorder))
+        let mut backends = Self::with_recorder(runtime, state, network, recorder);
+        backends.state_root = Some(state_root);
+        Ok(backends)
+    }
+
+    /// 本番の bundle 供給を作る（状態ルート配下の固定位置。要求の入力から受けない。#2433）。
+    ///
+    /// `production()` で組んだときだけ使え、注入で組んだときは `FAILED_PRECONDITION`。詳細は `bundle_provider_in`。
+    #[cfg(unix)]
+    pub fn production_bundle_provider(&self) -> Result<Arc<dyn BundleProvider>, CriError> {
+        match &self.state_root {
+            Some(root) => bundle_provider_in(root),
+            None => Err(CriError::failed_precondition(
+                "state root is not configured",
+            )),
+        }
     }
 
     /// `ContainerRuntime` の実装。
@@ -343,6 +364,57 @@ impl NetworkPlugin for UnimplementedNetwork {
     ) -> Result<DeleteNetworkResponse, TraitError> {
         Err(network_unavailable())
     }
+}
+
+/// bundle の置き場（状態ルート直下。先頭が `.` のため `ContainerId` の状態ディレクトリと衝突しない）。
+#[cfg(unix)]
+const BUNDLES_DIR: &str = ".cri/bundles";
+/// pull 済みイメージのキャッシュの置き場（`ImageService` の pull が使うキャッシュと同じ位置を想定する）。
+#[cfg(unix)]
+const IMAGES_DIR: &str = ".cri/images";
+
+/// 状態ルート `state_root` 配下に bundle の置き場とイメージキャッシュを用意し、本番の [`BundleProvider`] を作る
+/// （CRI-2・OCI-4・SEC-1。#2433）。
+///
+/// 置き場は `<state_root>/.cri/{bundles,images}` の固定位置で、各ディレクトリは 0700 で作る。既存のものは symlink でなく、
+/// 状態ルートと同じ所有者で、group / other の権限が無いことを確かめ、反すれば消さずに拒否する（fail-closed）。
+/// 失敗の文言は固定で、パスや OS の文字列を含めない。
+#[cfg(unix)]
+pub fn bundle_provider_in(
+    state_root: &std::path::Path,
+) -> Result<Arc<dyn BundleProvider>, CriError> {
+    use fandhe_container_cri::bundle::{ImageExtractConfig, ImageRootfsSource, SpecBundleProvider};
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
+
+    let fail = || CriError::failed_precondition("failed to prepare the bundle store");
+    let owner = std::fs::symlink_metadata(state_root)
+        .map_err(|_| fail())?
+        .uid();
+    let mut dirs = Vec::new();
+    for rel in [BUNDLES_DIR, IMAGES_DIR] {
+        let mut cur = state_root.to_path_buf();
+        for part in rel.split('/') {
+            cur.push(part);
+            match std::fs::DirBuilder::new().mode(0o700).create(&cur) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(fail()),
+            }
+            let m = std::fs::symlink_metadata(&cur).map_err(|_| fail())?;
+            if !m.file_type().is_dir() || m.uid() != owner || m.permissions().mode() & 0o077 != 0 {
+                return Err(fail());
+            }
+        }
+        dirs.push(cur);
+    }
+    let [bundles, images] = <[PathBuf; 2]>::try_from(dirs).map_err(|_| fail())?;
+    // SpecBundleProvider は root の正規化済みパスを要求する（途中の symlink を拒否する）。
+    let bundles = std::fs::canonicalize(bundles).map_err(|_| fail())?;
+    let source = ImageRootfsSource::new(ImageExtractConfig::new(images)?);
+    Ok(Arc::new(SpecBundleProvider::new(
+        bundles,
+        Arc::new(source),
+    )?))
 }
 
 /// bundle を供給できない `BundleProvider`（REPAIR-3）。`prepare` は `UNIMPLEMENTED`、`release` は

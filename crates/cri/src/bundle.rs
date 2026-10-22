@@ -5,14 +5,18 @@
 //! - [`provider`]: bundle ディレクトリの作成・`config.json` の書き込み・解放を担う [`SpecBundleProvider`]
 //!   （[`crate::adapter::BundleProvider`] の汎用実装）と、`rootfs/` の用意の注入点 [`RootfsSource`]。
 //!
-//! **未実装・簡易実装（REPAIR-3）**: 本番の [`RootfsSource`]（イメージのレイヤー展開とイメージ config の
-//! Entrypoint・Cmd・Env・WorkingDir・User の読み取り）と、plugin-cri の `main.rs` への結線は #2433 の範囲で、
-//! 本モジュールは変換と上限検証、bundle の寿命までを提供する。start・kill・stop の本番結線は #2434。
-//! crictl の `runp`→`create`→`start` の実機確認（#442）が最後まで通るには #2433・#2434 も要る。
-//! #2433 の config 変換と上限検証は [`build_runtime_config`] を使う。
+//! - [`image_rootfs`]: 本番の [`RootfsSource`] [`ImageRootfsSource`]（pull 済みイメージを bundle の `rootfs/` へ再展開し、
+//!   イメージ config の Entrypoint・Cmd・Env・WorkingDir・User を [`ImageDefaults`] で返す。#2433）。
+//!
+//! **未実装・簡易実装（REPAIR-3）**: タグ・digest 参照の解決（plugin-cri は `ImageService` をサーブしていない）、
+//! イメージの User の名前解決、overlay による rootfs の用意は未実装で、詳細は [`image_rootfs`] の doc。
+//! start・kill・stop の本番結線は #2434。crictl の `runp`→`create`→`start` の実機確認（#442）が最後まで通るには
+//! タグ解決（`container.json` がタグのため）と #2434 も要る。
 
+pub mod image_rootfs;
 pub mod provider;
 pub mod spec;
 
+pub use image_rootfs::{ImageExtractConfig, ImageRootfsSource};
 pub use provider::{RootfsSource, SpecBundleProvider};
 pub use spec::{ImageDefaults, RuntimeConfigJson, build_runtime_config, validate_config};

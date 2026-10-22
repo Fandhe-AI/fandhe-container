@@ -14,7 +14,7 @@
 //! # 未実装（REPAIR-3）
 //!
 //! - `ImageService` は載せない（`RuntimeService` のみ。PodSandbox 系は #849、Container 系 4 RPC は同じサービスで境界を越えて届き
-//!   `tests/container_grpc.rs` で照合する〔#850〕。本番バックエンドでの一連は #2433・#2434 待ち）
+//!   `tests/container_grpc.rs` で照合する〔#850〕。本番の bundle 供給は #2433 で結線済み、start・kill・stop の本番結線は #2434 待ち）
 //! - peer 認証の拒否は `telemetry` が 1 秒ごとに別 task で回収して stderr へ JSON Lines で書く（SEC-4）。
 //!   `crates/core` の永続的な監査ログへの配線は #1869 の積み残し
 //! - SIGTERM による正常停止は未実装（`main.rs` は `pending()` を渡す）。残った socket は次回起動の

@@ -26,8 +26,8 @@
 //! 除去を `FAILED_PRECONDITION` にする。実行層が失敗したら記録を巻き戻し（Create）・Created へ戻し（Start）、
 //! 「記録上だけ running」のフォールバックはしない（fail-closed）。注入しない場合は従来のスタブ動作のまま。
 //! 未実装（REPAIR-3）: `RunPodSandbox` は実行層に対応操作が無く記録のみ（共有 namespace・net 連携は後続）。
-//! bundle の生成のうち config 変換と bundle ディレクトリの寿命は `crate::bundle`（#2395）。image 展開
-//! （`RootfsSource` の本番実装）と plugin-cri への結線は #2433 で、core の本番 launcher との結線は TASK-114、一連の結合試験は TASK-59.4 で扱う。Start 後に中断・確定失敗した場合は、
+//! bundle の生成（config 変換・bundle ディレクトリの寿命・image 展開の `ImageRootfsSource`）は `crate::bundle`（#2395・#2433）で、
+//! plugin-cri への結線は #2433 で済み、core の本番 launcher との結線は TASK-114、一連の結合試験は TASK-59.4 で扱う。Start 後に中断・確定失敗した場合は、
 //! 実行層が running の可能性があるため記録を unknown にして再 Start を拒否する（fail-closed）。
 //!
 //! **Stop・Remove の接続（CRI-2・TASK-59.3・#439）**: 実行層接続時、実行層の資源を持つコンテナ

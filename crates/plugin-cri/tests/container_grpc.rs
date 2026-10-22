@@ -9,7 +9,7 @@
 //!
 //! 本番バックエンドでの一連は未達（REPAIR-3）: 本番の `BundleProvider` は #2433、supervisor 経由の
 //! start / stop と cgroup remover の結線は #2434 で入る。それまで段 A の CreateContainer は
-//! `UNIMPLEMENTED`（`MSG_BUNDLE_UNAVAILABLE`）で終わるため、成功経路へ切り替える際は段 A の期待値を意識的に書き換える。
+//! `UNIMPLEMENTED`（イメージ参照の未解決）で終わるため、成功経路へ切り替える際は段 A の期待値を意識的に書き換える。
 //! ハーネス（TempDir・ChildGuard・接続待ち）は `pod_sandbox_grpc.rs` と同じもの（試験 crate 間でモジュールを共有できないため複製）。
 //! 段 B のフェイクは `crates/cri/tests/adapter_integration.rs` の `LifecycleRuntime` を最小化して写したもの。
 //!
@@ -41,7 +41,6 @@ use fandhe_container_plugin::grpc::{
     GrpcClientConfig, GrpcServerConfig, call_with_deadline, connect_uds_channel,
 };
 use fandhe_container_plugin::{JsonLinesPeerAuthObserver, PluginError, PluginErrorCode};
-use fandhe_container_plugin_cri::adapter::MSG_BUNDLE_UNAVAILABLE;
 use fandhe_container_plugin_cri::server;
 use tonic::transport::Channel;
 
@@ -326,12 +325,16 @@ async fn container_rpcs_reach_the_plugin_binary() {
 
         let sb = run_sandbox(&mut c, "pod-a").await;
 
-        // 本番の `BundleProvider` は未実装（#2433）。#2433 で成功経路へ切り替えるときに書き換える。
+        // 本番の `BundleProvider`（#2433）はイメージ参照の解決まで進む。`ImageStore` 未注入のため
+        // image ID 以外の参照は UNIMPLEMENTED で、半端な記録は残さない。
         let err = create_container(&mut c, &sb, "c")
             .await
-            .expect_err("bundle provisioning is unimplemented");
+            .expect_err("image reference resolution is unavailable");
         assert_eq!(err.code(), PluginErrorCode::Unimplemented);
-        assert_eq!(err.message(), MSG_BUNDLE_UNAVAILABLE);
+        assert_eq!(
+            err.message(),
+            "image reference resolution is not available; use the image id"
+        );
         assert_eq!(list_containers_len(&mut c).await, 0);
 
         // 未知の 64 桁 hex の ID。

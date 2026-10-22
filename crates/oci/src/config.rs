@@ -7,11 +7,16 @@
 //! config は信頼できない入力のため、長さ・件数を先に検証し、不正な形は fail-closed で拒否する。
 //!
 //! 呼び出し契約: config blob 自体の digest 検証（`layer::verify_blob_digest`）は呼び出し側の責務で、
-//! 本モジュールは本文の JSON だけを見る。`rootfs` 以外のフィールド（`config`・`history` 等）は読まない。
+//! `parse_image_config_rootfs` / `parse_image_config_process` は本文の JSON だけを見る。
+//! 読むのは `rootfs`（`diff_ids`）と `config` 節の Entrypoint・Cmd・Env・WorkingDir・User だけで、
+//! `history` 等は読まない。`config` 節は create 経路が bundle の `config.json` の既定値に使う（#2433・CRI-2）。
+//! 読んだバイト列そのものを照合してから両方を解析する入口が [`parse_verified_image_config`]
+//! （検証と解析の内容がずれない）。
 
 use serde::Deserialize;
 
 use crate::error::{OciError, OciErrorCode};
+use crate::layer::verify_bytes_digest;
 use crate::manifest::MAX_LAYERS;
 use crate::reference::Digest;
 
@@ -97,9 +102,253 @@ pub fn parse_image_config_rootfs(body: &[u8]) -> Result<ImageRootFs, OciError> {
     Ok(ImageRootFs { diff_ids })
 }
 
+/// `config` 節の引数・環境変数の件数上限（cri の bundle 変換の `MAX_ARGS` / `MAX_ENV` と同値。依存の向きを守るため
+/// oci 側で定義し、一致は cri の試験で照合する）。
+pub const MAX_PROCESS_ITEMS: usize = 4096;
+/// `config` 節の文字列 1 要素の長さ上限（cri の `MAX_STRING_BYTES` と同値）。
+pub const MAX_PROCESS_STRING_BYTES: usize = 131_071;
+/// `config` 節の WorkingDir の長さ上限（cri の `MAX_PATH_BYTES` と同値）。
+pub const MAX_PROCESS_PATH_BYTES: usize = 4096;
+/// `config` 節の User の長さ上限。
+pub const MAX_PROCESS_USER_BYTES: usize = 256;
+
+/// image config の `config` 節（実行の既定値。#2433・CRI-2）。
+///
+/// 欠落・`null` は空として扱う。値の意味（Entrypoint と Cmd の合成・User の名前解決）は解釈せず、
+/// 件数・長さ・NUL の検証だけを済ませた文字列を返す。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ImageProcessConfig {
+    entrypoint: Vec<String>,
+    cmd: Vec<String>,
+    env: Vec<String>,
+    working_dir: String,
+    user: String,
+}
+
+impl ImageProcessConfig {
+    /// Entrypoint。
+    pub fn entrypoint(&self) -> &[String] {
+        &self.entrypoint
+    }
+    /// Cmd。
+    pub fn cmd(&self) -> &[String] {
+        &self.cmd
+    }
+    /// Env（`KEY=VALUE`。形式の検証は呼び出し側）。
+    pub fn env(&self) -> &[String] {
+        &self.env
+    }
+    /// WorkingDir（空は未指定）。
+    pub fn working_dir(&self) -> &str {
+        &self.working_dir
+    }
+    /// User（空は未指定。`uid`・`uid:gid`・名前のいずれか。解釈は呼び出し側）。
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+}
+
+#[derive(Deserialize)]
+struct RawProcessDoc {
+    config: Option<RawProcess>,
+}
+
+#[derive(Deserialize)]
+struct RawProcess {
+    #[serde(rename = "Entrypoint")]
+    entrypoint: Option<Vec<String>>,
+    #[serde(rename = "Cmd")]
+    cmd: Option<Vec<String>>,
+    #[serde(rename = "Env")]
+    env: Option<Vec<String>>,
+    #[serde(rename = "WorkingDir")]
+    working_dir: Option<String>,
+    #[serde(rename = "User")]
+    user: Option<String>,
+}
+
+fn check_items(items: &[String], max_items: usize) -> Result<(), OciError> {
+    if items.len() > max_items {
+        return Err(OciError::new(
+            OciErrorCode::ResourceExhausted,
+            "image config has too many entries",
+        ));
+    }
+    for s in items {
+        check_string(s, MAX_PROCESS_STRING_BYTES)?;
+    }
+    Ok(())
+}
+
+fn check_string(s: &str, max_bytes: usize) -> Result<(), OciError> {
+    if s.len() > max_bytes {
+        return Err(OciError::new(
+            OciErrorCode::ResourceExhausted,
+            "image config value is too long",
+        ));
+    }
+    if s.contains('\0') {
+        return Err(OciError::new(
+            OciErrorCode::InvalidArgument,
+            "image config value contains NUL",
+        ));
+    }
+    Ok(())
+}
+
+/// config 本文から `config` 節（Entrypoint・Cmd・Env・WorkingDir・User）を検証して取り出す（#2433・CRI-2）。
+///
+/// エラー: 本文が [`MAX_CONFIG_BYTES`] 超・件数や長さの超過は `ResourceExhausted`、JSON として不正・型が違う・
+/// NUL を含むは `InvalidArgument`（黙って捨てない。fail-closed）。
+pub fn parse_image_config_process(body: &[u8]) -> Result<ImageProcessConfig, OciError> {
+    if body.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(OciError::new(
+            OciErrorCode::ResourceExhausted,
+            "image config body is too large",
+        ));
+    }
+    let doc: RawProcessDoc = serde_json::from_slice(body).map_err(|_| {
+        OciError::new(
+            OciErrorCode::InvalidArgument,
+            "image config has an invalid config section",
+        )
+    })?;
+    let Some(raw) = doc.config else {
+        return Ok(ImageProcessConfig::default());
+    };
+    let entrypoint = raw.entrypoint.unwrap_or_default();
+    let cmd = raw.cmd.unwrap_or_default();
+    let env = raw.env.unwrap_or_default();
+    let working_dir = raw.working_dir.unwrap_or_default();
+    let user = raw.user.unwrap_or_default();
+    check_items(&entrypoint, MAX_PROCESS_ITEMS)?;
+    check_items(&cmd, MAX_PROCESS_ITEMS)?;
+    check_items(&env, MAX_PROCESS_ITEMS)?;
+    check_string(&working_dir, MAX_PROCESS_PATH_BYTES)?;
+    check_string(&user, MAX_PROCESS_USER_BYTES)?;
+    Ok(ImageProcessConfig {
+        entrypoint,
+        cmd,
+        env,
+        working_dir,
+        user,
+    })
+}
+
+/// 読んだバイト列そのものの sha256 を `expected`（image ID = config digest）と照合してから、`rootfs` と `config` 節を
+/// 同じ本文から解析する（#2433・OCI-1。検証と解析の対象がずれない）。
+///
+/// 本文長の上限を先に確かめ、不一致は `DataLoss`。他のエラーは各 parse 関数と同じ。
+pub fn parse_verified_image_config(
+    body: &[u8],
+    expected: &Digest,
+) -> Result<(ImageRootFs, ImageProcessConfig), OciError> {
+    if body.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(OciError::new(
+            OciErrorCode::ResourceExhausted,
+            "image config body is too large",
+        ));
+    }
+    verify_bytes_digest(body, expected)?;
+    Ok((
+        parse_image_config_rootfs(body)?,
+        parse_image_config_process(body)?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn process(body: &str) -> Result<ImageProcessConfig, OciError> {
+        parse_image_config_process(body.as_bytes())
+    }
+
+    /// CRI-2: config 節の 5 項目が具体値で取れる。欠落・null は空。
+    #[test]
+    fn cri2_process_section_is_parsed() {
+        let p = process(
+            r#"{"config":{"Entrypoint":["/bin/app"],"Cmd":["-v","x"],"Env":["A=1","B=2"],"WorkingDir":"/srv","User":"1000:2000"}}"#,
+        )
+        .unwrap();
+        assert_eq!(p.entrypoint(), ["/bin/app"]);
+        assert_eq!(p.cmd(), ["-v", "x"]);
+        assert_eq!(p.env(), ["A=1", "B=2"]);
+        assert_eq!(p.working_dir(), "/srv");
+        assert_eq!(p.user(), "1000:2000");
+        assert_eq!(process("{}").unwrap(), ImageProcessConfig::default());
+        let n =
+            process(r#"{"config":{"Entrypoint":null,"Cmd":null,"Env":null,"User":null}}"#).unwrap();
+        assert_eq!(n, ImageProcessConfig::default());
+    }
+
+    /// CRI-2: 型違い・NUL は InvalidArgument、件数と長さの超過は ResourceExhausted。
+    #[test]
+    fn cri2_process_section_rejects_bad_shapes() {
+        let code = |b: &str| process(b).unwrap_err().code();
+        assert_eq!(code("not json"), OciErrorCode::InvalidArgument);
+        assert_eq!(
+            code(r#"{"config":{"Entrypoint":"sh"}}"#),
+            OciErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            code(r#"{"config":{"Cmd":[1]}}"#),
+            OciErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            code(r#"{"config":{"WorkingDir":"/a\u0000b"}}"#),
+            OciErrorCode::InvalidArgument
+        );
+        let many = vec![r#""x""#; MAX_PROCESS_ITEMS + 1].join(",");
+        assert_eq!(
+            code(&format!(r#"{{"config":{{"Cmd":[{many}]}}}}"#)),
+            OciErrorCode::ResourceExhausted
+        );
+        let ok = vec![r#""x""#; MAX_PROCESS_ITEMS].join(",");
+        assert!(process(&format!(r#"{{"config":{{"Cmd":[{ok}]}}}}"#)).is_ok());
+        let long = "a".repeat(MAX_PROCESS_PATH_BYTES + 1);
+        assert_eq!(
+            code(&format!(r#"{{"config":{{"WorkingDir":"{long}"}}}}"#)),
+            OciErrorCode::ResourceExhausted
+        );
+        let big = vec![b' '; MAX_CONFIG_BYTES as usize + 1];
+        assert_eq!(
+            parse_image_config_process(&big).unwrap_err().code(),
+            OciErrorCode::ResourceExhausted
+        );
+    }
+
+    /// OCI-1: 読んだ本文そのものの digest が一致するときだけ、rootfs と config 節が同じ本文から取れる。
+    #[test]
+    fn oci1_verified_config_requires_matching_digest() {
+        use sha2::{Digest as _, Sha256};
+        let body = format!(
+            r#"{{"config":{{"Cmd":["sh"]}},"rootfs":{{"type":"layers","diff_ids":["sha256:{H1}"]}}}}"#
+        );
+        let hex: String = Sha256::digest(body.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let good = Digest::parse(&format!("sha256:{hex}")).unwrap();
+        let (rootfs, process) = parse_verified_image_config(body.as_bytes(), &good).unwrap();
+        assert_eq!(rootfs.diff_ids().len(), 1);
+        assert_eq!(process.cmd(), ["sh"]);
+        let bad = Digest::parse(&format!("sha256:{H2}")).unwrap();
+        assert_eq!(
+            parse_verified_image_config(body.as_bytes(), &bad)
+                .unwrap_err()
+                .code(),
+            OciErrorCode::DataLoss
+        );
+        let tampered = body.replace("sh", "ls");
+        assert_eq!(
+            parse_verified_image_config(tampered.as_bytes(), &good)
+                .unwrap_err()
+                .code(),
+            OciErrorCode::DataLoss
+        );
+    }
 
     const H1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const H2: &str = "2222222222222222222222222222222222222222222222222222222222222222";

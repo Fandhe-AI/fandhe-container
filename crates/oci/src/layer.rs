@@ -286,6 +286,22 @@ fn digest_of_open_blob(
     })
 }
 
+/// メモリ上のバイト列の sha256 を `expected` と比較する（OCI-1・#2433）。
+///
+/// config のように「読んだバイト列そのものを解析する」入力で、照合と解析の対象がずれないようにするための入口
+/// （別経路で digest を確かめてから再度読み直すと、その間の差し替えが解析結果に混ざる）。
+/// 不一致は `DataLoss`。呼び出し側が長さの上限を先に確かめてから渡すこと。
+pub fn verify_bytes_digest(bytes: &[u8], expected: &Digest) -> Result<(), OciError> {
+    let (hex, _) = sha256_hex_of_reader(bytes, u64::MAX)?;
+    if format!("sha256:{hex}") != expected.as_str() {
+        return Err(OciError::new(
+            OciErrorCode::DataLoss,
+            "blob digest does not match the descriptor",
+        ));
+    }
+    Ok(())
+}
+
 /// `fetch_blob` の戻り値を、要求した digest に対して検証する薄いラッパー。
 pub fn verify_fetched_blob(blob: &FetchedBlob, max_bytes: u64) -> Result<VerifiedBlob, OciError> {
     verify_blob_digest(&blob.path, &blob.digest, max_bytes)

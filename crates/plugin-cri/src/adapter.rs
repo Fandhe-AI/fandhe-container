@@ -59,7 +59,7 @@ use std::time::{Duration, Instant};
 use crate::netsetup::{LinuxNetsetup, NetsetupNetwork};
 #[cfg(target_os = "linux")]
 use crate::supervised::SupervisedLifecycle;
-use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
+use fandhe_container_core::audit_log::{AuditRecord, AuditSink, RECORD_WAIT_LIMIT};
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{self, ContainerCgroupRemover, OciRuntimeError};
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
@@ -284,9 +284,16 @@ fn log_create_audit_failure(code: ErrorCode) {
     let _ = crate::telemetry::stderr_sink().submit(create_audit_failure_line(code));
 }
 
+/// create の destination 拒否 1 件の記録に許す合計時間（ロック取得と配送の合計。REPAIR-5・SEC-4・#2594）。
+///
+/// relay は peer 認証の転送スレッドと共有するため、ロック待ち 1 回分と配送 1 回分で `RECORD_WAIT_LIMIT` の 2 倍。
+/// `PLUGIN_RUNTIME_TIMEOUT` に収まる。
+const CREATE_AUDIT_BUDGET: Duration = RECORD_WAIT_LIMIT.saturating_mul(2);
+
 impl AuditSink for ObservedCreateAudit {
+    /// 期限なしの `record` は relay のロックを無期限に待つため、入口で絶対期限を決めて `record_until` へ渡す。
     fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
-        Self::observe(self.inner.record(record), log_create_audit_failure)
+        self.record_until(record, Instant::now() + CREATE_AUDIT_BUDGET)
     }
 
     fn record_until(&self, record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
@@ -893,6 +900,45 @@ mod tests {
         );
         assert!(!line.contains("secret"), "{line}");
         assert!(line.ends_with('\n'));
+    }
+
+    /// REPAIR-5・SEC-4・#2594: `record` は期限なしの内側の `record` を呼ばず、`CREATE_AUDIT_BUDGET` 以内の
+    /// 絶対期限つきで `record_until` を呼ぶ（ロック待ちを含む合計の制限）。期限切れの `Timeout` はそのまま返る。
+    #[test]
+    fn repair5_2594_create_audit_record_uses_a_bounded_deadline() {
+        use std::sync::Mutex;
+        struct Probe(Mutex<Vec<Instant>>);
+        impl AuditSink for Probe {
+            fn record(&self, _: &AuditRecord) -> Result<(), TraitError> {
+                panic!("unbounded record must not be used");
+            }
+            fn record_until(&self, _: &AuditRecord, d: Instant) -> Result<(), TraitError> {
+                self.0.lock().expect("lock").push(d);
+                Err(TraitError::new(ErrorCode::Timeout, "deadline"))
+            }
+        }
+        let probe = Arc::new(Probe(Mutex::new(Vec::new())));
+        let observed = ObservedCreateAudit {
+            inner: Arc::clone(&probe) as Arc<dyn AuditSink>,
+        };
+        let rec = fandhe_container_core::audit_log::AuditRecord::new(
+            fandhe_container_core::audit_log::AuditTimestamp::from_unix_duration(Duration::new(
+                1_700_000_000,
+                0,
+            )),
+            fandhe_container_core::audit_log::AuditPid::new(4242).expect("pid"),
+            fandhe_container_core::audit_log::AuditEvent::Mount {
+                path: None,
+                reason: None,
+            },
+        );
+        let before = Instant::now();
+        let e = observed.record(&rec).expect_err("timeout passes through");
+        assert_eq!(e.code(), ErrorCode::Timeout);
+        let seen = probe.0.lock().expect("lock");
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0] > before && seen[0] <= Instant::now() + CREATE_AUDIT_BUDGET);
+        assert_eq!(CREATE_AUDIT_BUDGET, RECORD_WAIT_LIMIT * 2);
     }
 
     /// SEC-4・#2594: 常に失敗する sink でも `create` の拒否の `code`・`message` は変わらない（fail-closed）。

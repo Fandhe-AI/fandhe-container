@@ -100,7 +100,7 @@ prost = "=0.14.4"
 # gRPC 面（PLUG-2・TASK-108.1）の非同期ランタイム。承認: Issue #425 のオーナー判断（2026-10-10）、追加は #453。
 # cri / plugin の gRPC 面に限り使い、core には入れない（PLUG-1・CORE-1・PLUG-4）。features はメンバー側で
 # 承認範囲（rt / net / time / macros）から必要なものだけ列挙する。
-tokio = { version = "=1.53.2", default-features = false }
+tokio = { version = "=1.53.3", default-features = false }
 # gRPC 面の UDS 接続（connector の `TokioIo`。PLUG-2・TASK-108.2）。承認: Issue #425 のオーナー判断（2026-10-10。依存要点に
 # 「UDS の接続（#454）に hyper-util」と明記）、追加は #454。tonic の推移依存として Cargo.lock に既存（新規パッケージなし）。
 # crates/plugin の feature `grpc` のみで使い、core には入れない（PLUG-1・CORE-1・PLUG-4）。features はメンバー側で列挙する。

@@ -2694,11 +2694,33 @@ mod tests {
         assert_eq!(got, Vec::<u8>::new());
     }
 
+    /// 本番の pidfd のグループ送信(`PIDFD_SIGNAL_PROCESS_GROUP`)が使えるカーネルか(Linux 6.9 以降)を、
+    /// 使い捨てのセッションリーダーへの無害な SIGCONT で調べる。
+    fn pidfd_group_signal_supported() -> bool {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        let fd = sys::pidfd_open(child.id()).expect("pidfd_open");
+        let sigcont = std::num::NonZeroU8::new(18).expect("nonzero");
+        let r = sys::pidfd_send_signal_group(
+            std::os::fd::AsFd::as_fd(&fd),
+            sys::Signal::Number(sigcont),
+        );
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        match r {
+            Ok(()) => true,
+            Err(SysError::Os(e)) if e == sys::EINVAL => false,
+            Err(e) => panic!("unexpected pidfd group signal result: {e:?}"),
+        }
+    }
+
     /// SEC-5・CORE-6・REPAIR-5(#2551): 本番の kill で、SIGSTOP で止められた mapper のセッションも SIGKILL で終わり、
-    /// EOF に届く。
+    /// EOF に届く。グループ送信が未対応のカーネル(6.9 未満)では、数値 PGID へ退避せず kill しない契約を照合する。
+    /// どちらの分岐でも、子は最後に停止・回収する。
     #[test]
     fn sec5_holder_expiry_real_kill_ends_stopped_session() {
         use std::os::unix::process::ExitStatusExt as _;
+        let supported = pidfd_group_signal_supported();
         let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
         let mut child = spawn_session_leader(&a);
         send_pid(&mut a, child.id());
@@ -2711,8 +2733,17 @@ mod tests {
             &mut |fd, _| sys::pidfd_send_signal_group(fd, sys::Signal::Kill),
             &mut Vec::new(),
         );
-        assert_eq!(r, HolderExit::ExpiredKilled { drained: true });
-        assert_eq!(child.wait().expect("wait").signal(), Some(9));
+        let still_alive = child.try_wait().expect("try_wait").is_none();
+        // 先に回収してから照合する(照合の失敗で停止した子を残さない)。
+        let _ = sys::kill_pid(child.id(), sys::Signal::Kill);
+        let status = child.wait().expect("wait");
+        if supported {
+            assert_eq!(r, HolderExit::ExpiredKilled { drained: true });
+            assert_eq!(status.signal(), Some(9));
+        } else {
+            assert_eq!(r, HolderExit::ExpiredNoKill);
+            assert!(still_alive);
+        }
     }
 
     /// REPAIR-5(#2551): kill の後に EOF が来なくても `drain_wait` で戻る。
@@ -2781,6 +2812,10 @@ mod tests {
             },
             &mut Vec::new(),
         );
+        let alive = child.try_wait().expect("try_wait").is_none();
+        // 先に回収してから照合する(照合の失敗で子を残さない)。
+        child.kill().expect("kill");
+        child.wait().expect("wait");
         // 6.9 未満のカーネルでは EINVAL(未対応)で、どちらも送らない。
         assert!(
             matches!(errors.as_slice(), [Err(SysError::Os(e))] if *e == sys::ESRCH || *e == sys::EINVAL),
@@ -2790,12 +2825,7 @@ mod tests {
             r,
             HolderExit::ExpiredKilled { .. } | HolderExit::ExpiredNoKill
         ));
-        assert!(
-            child.try_wait().expect("try_wait").is_none(),
-            "must stay alive"
-        );
-        child.kill().expect("kill");
-        child.wait().expect("wait");
+        assert!(alive, "must stay alive");
     }
 
     /// SEC-5・CORE-6(#2551): mapper が回収済みでも、期限切れの送信は pidfd 経由の 1 回だけで、錨の pidfd を渡す。

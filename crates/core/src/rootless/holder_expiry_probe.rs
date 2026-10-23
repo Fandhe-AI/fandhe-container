@@ -98,6 +98,10 @@ fn caller_process(
         .spawn()
         .map_err(|e| fail(&format!("spawn mapper: {e}")))?;
     let mapper_pid = mapper.id();
+    // mapper の pid は spawn 直後に報告する(helper の応答を待つ間に止まっても、親が mapper のグループごと回収できる)。
+    report
+        .write_all(&mapper_pid.to_be_bytes())
+        .map_err(|e| fail(&e.to_string()))?;
     let mut line = String::new();
     BufReader::new(
         mapper
@@ -112,7 +116,7 @@ fn caller_process(
         .parse()
         .map_err(|_| fail("helper pid not a number"))?;
     report
-        .write_all(&[mapper_pid.to_be_bytes(), helper_pid.to_be_bytes()].concat())
+        .write_all(&helper_pid.to_be_bytes())
         .map_err(|e| fail(&e.to_string()))?;
     let handle = ProcHandle::open(TargetPid::new(mapper_pid).map_err(|e| fail(&e.to_string()))?)
         .map_err(|e| fail(&e.to_string()))?;
@@ -189,9 +193,14 @@ impl LiveChildren {
     }
 
     /// 未回収の子だけに SIGKILL を送り、回収する(回収済みの pid へは送らない)。
+    ///
+    /// 各 pid のプロセスグループにも送る。未報告の孫(mapper の helper 等)を巻き込むためで、`p` は自分の未回収の子
+    /// (caller を回収した後は孤児の再親付けで自分の子)であり、番号が解放されないので別のグループには当たらない
+    /// (グループが無ければ `ESRCH`)。
     fn kill_and_reap(&self) {
         let pids = std::mem::take(&mut *self.0.borrow_mut());
         for p in pids {
+            let _ = sys::kill_process_group(p, sys::Signal::Kill);
             let _ = sys::kill_pid(p, sys::Signal::Kill);
             let _ = wait_until(p, Duration::from_secs(2));
         }
@@ -234,12 +243,17 @@ pub fn observe_holder_expiry(
     let pid_at = |b: &[u8; 12], i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
     let holder_pid = pid_at(&pids, 0);
     live.add(holder_pid);
-    if let Err(e) = report_rd.read_exact(&mut pids[4..]) {
+    if let Err(e) = report_rd.read_exact(&mut pids[4..8]) {
         cleanup();
         return Err(fail(&format!("caller did not report the mapper: {e}")));
     }
-    let (mapper_pid, helper_pid) = (pid_at(&pids, 4), pid_at(&pids, 8));
+    let mapper_pid = pid_at(&pids, 4);
     live.add(mapper_pid);
+    if let Err(e) = report_rd.read_exact(&mut pids[8..]) {
+        cleanup();
+        return Err(fail(&format!("caller did not report the helper: {e}")));
+    }
+    let helper_pid = pid_at(&pids, 8);
     live.add(helper_pid);
     let mut ready = [0u8; 1];
     if let Err(e) = report_rd.read_exact(&mut ready) {

@@ -31,7 +31,14 @@
 //!   動かすと検出に失敗し、cgroup の配置を記録したコンテナの `delete` は記録を残したまま失敗する（fail-closed。CLI と同じ
 //!   方針で、検出の失敗を記録の経路へ回すかはオーナー判断待ち。#2133・#2060）。非 Linux は常に `Unimplemented`。
 //!   core の `delete` が成功した後に限り、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）を期限つきで
-//!   best effort で消す（失敗は戻り値に影響させず、期限切れは記録器の `supervisor_log_remove` の失敗として計上する）
+//!   best effort で消す（失敗は戻り値に影響させず、期限切れは記録器の `supervisor_log_remove` の失敗として計上する）。
+//!   続けてコンテナログ（`<root>/@container-logs/<id>.log*`・ロック。#2593・SUP-7・CRI-2・CLI-1）も CLI の `delete` と同じ
+//!   `remove_container_logs_guarded_bounded` で消す（期限 5 秒・同じ ID の sink が生きていれば `FailedPrecondition` で何も消さない・
+//!   stderr へは書かない）。消せなくても `delete` は `Ok` のままにする: CRI 層は `Err` で記録を残して再試行するが、再試行は
+//!   core の `NOT_FOUND` で止まりログ削除まで届かないため、CLI と同じく成功として扱い、失敗は記録器の `container_log_remove`
+//!   の失敗として計上する（構造化エラーは [`CoreLifecycleRuntime::remove_container_log`] の `TraitError`）。最悪の上乗せは
+//!   supervisor ログと合わせて 10 秒。記録器にエラーコード別の内訳は無い（REPAIR-3）。既知の制約として、running への force
+//!   `RemoveContainer` は supervisor の終了が sink を閉じきる前だとロックが取れず、ログが残る（1 ID あたり世代数 × 上限に収まる）
 //! - bundle 供給: 本番は `CriPluginBackends::production_bundle_provider`（unix のみ）（pull 済みイメージの再展開と
 //!   ContainerConfig → config.json 変換。#2433）。`ImageService` をサーブしていないためタグは解決できず、
 //!   image ID（`sha256:<hex>`）だけを受ける（イメージ取り込みの結線と合わせて別途。REPAIR-3）。
@@ -68,6 +75,9 @@ use fandhe_container_cri::error::CriError;
 use fandhe_container_cri::instrument::{CriOpOutcome, CriOpRecorder, CriOpSample};
 use fandhe_container_cri::runtime_service::CriRuntimeService;
 use fandhe_container_supervisor::cgroup_remover::production_cgroup_remover;
+use fandhe_container_supervisor::logs::{
+    CONTAINER_LOG_REMOVE_TIMEOUT, RemovedLogs, remove_container_logs_guarded_bounded,
+};
 use fandhe_container_supervisor::supervisor_log::{
     LogRemoval, SUPERVISOR_LOG_REMOVE_TIMEOUT, remove_bounded,
 };
@@ -403,6 +413,46 @@ impl CoreLifecycleRuntime {
             let _ = self.recorder.record(&name, result, started.elapsed());
         }
     }
+
+    /// コンテナログ（現在ログ・全世代・ロック）を消す。core の `delete` が成功した後にだけ呼ぶ（失敗した delete で
+    /// 稼働中のコンテナのログを消さないため。#2593・SUP-7・CRI-2・CLI-1）。
+    ///
+    /// CLI の `delete` と同じ supervisor の関数・契約で、期限は 5 秒（同時実行枠は supervisor ログの削除と共有）、
+    /// stderr へは何も書かない。ロック取得後に状態ストアで ID が `NotFound` のままであることを確かめ、
+    /// 読み取りに失敗したら fail-closed で削除を見送る（同じ ID で再作成されたインスタンスのログを消さない）。
+    /// 状態ルートが無い（ホスト上のパスを持たない）ストアでは何もせず `Ok`。
+    ///
+    /// # Errors
+    /// supervisor の `TraitError` をそのまま返す。`FailedPrecondition`（同じ ID の sink が生きている）・
+    /// `Timeout`（期限切れか枠の満杯）・`InvalidArgument`（名前空間の不正）・`Internal`（ディレクトリ検査の失敗）。
+    pub fn remove_container_log(&self, id: &ContainerId) -> Result<RemovedLogs, TraitError> {
+        let Some(root) = self.store.host_state_root() else {
+            return Ok(RemovedLogs::default());
+        };
+        let store = Arc::clone(&self.store);
+        let guard_id = id.clone();
+        remove_container_logs_guarded_bounded(root, id, CONTAINER_LOG_REMOVE_TIMEOUT, move || {
+            matches!(
+                store.get(&GetStateRequest::new(guard_id.clone())),
+                Err(e) if e.code() == ErrorCode::NotFound
+            )
+        })
+    }
+
+    /// [`Self::remove_container_log`] の結果を記録器の `container_log_remove` に計上する（戻り値には影響させない）。
+    fn record_container_log_removal(&self, id: &ContainerId) {
+        if self.store.host_state_root().is_none() {
+            return;
+        }
+        let started = Instant::now();
+        let result = match self.remove_container_log(id) {
+            Ok(_) => OpOutcome::Success,
+            Err(_) => OpOutcome::Failure,
+        };
+        if let Ok(name) = OpName::new("container_log_remove") {
+            let _ = self.recorder.record(&name, result, started.elapsed());
+        }
+    }
 }
 
 /// core の失敗を `ErrorCode` を保ったまま `TraitError` へ戻す（REPAIR-5 の `Timeout` 等を潰さない）。
@@ -494,6 +544,7 @@ impl ContainerRuntime for CoreLifecycleRuntime {
         let response = oci_runtime::delete(&*self.store, &self.recorder, &*self.cgroups, req)
             .map_err(to_trait_error)?;
         self.remove_supervisor_log(req.id());
+        self.record_container_log_removal(req.id());
         Ok(response)
     }
 

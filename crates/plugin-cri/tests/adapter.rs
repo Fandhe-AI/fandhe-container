@@ -280,4 +280,162 @@ mod store_backed {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // ---- コンテナログの後始末（#2593・SUP-7・CRI-2・CLI-1）----
+    // CLI の試験（crates/cli/tests/binary_entry.rs）の補助関数は別 crate から使えないため複製している。
+
+    /// sink を開いて 1 行書き、flush する。再 open の競合は期限つきで再試行する（REPAIR-5）。
+    #[cfg(target_os = "linux")]
+    fn open_container_log_sink(
+        root: &std::path::Path,
+        name: &str,
+    ) -> fandhe_container_supervisor::logs::RotatingFileSink {
+        use fandhe_container_supervisor::logs::{
+            LogSink as _, RotatingFileSink, StreamKind, container_log_dir,
+            container_log_rotation_config,
+        };
+        use std::os::unix::fs::PermissionsExt as _;
+        use std::time::{Duration, Instant};
+        let dir = container_log_dir(root);
+        std::fs::create_dir_all(&dir).expect("logdir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let id = cid(name);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let sink = loop {
+            match RotatingFileSink::open(&dir, &id, container_log_rotation_config()) {
+                Ok(s) => break s,
+                Err(e)
+                    if e.code() == ErrorCode::FailedPrecondition && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("open sink: {e:?}"),
+            }
+        };
+        sink.append(StreamKind::Stdout, format!("hello {name}").as_bytes())
+            .expect("append");
+        sink.flush().expect("flush");
+        sink
+    }
+
+    #[cfg(target_os = "linux")]
+    fn sorted_dir_names(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .expect("dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[cfg(target_os = "linux")]
+    fn log_runtime(
+        dir: &std::path::Path,
+    ) -> (
+        CoreLifecycleRuntime,
+        Arc<fandhe_container_core::observability::OpRecorder>,
+        PathBuf,
+    ) {
+        use fandhe_container_core::observability::OpRecorder;
+        let root = StateRoot::resolve(Some(dir.join("state"))).expect("root");
+        let store: Arc<dyn fandhe_container_core::traits::StateStore> =
+            Arc::new(FileStateStore::open(root).expect("open"));
+        let state_root = store.host_state_root().expect("host root").to_path_buf();
+        let recorder = Arc::new(OpRecorder::new());
+        (
+            CoreLifecycleRuntime::with_recorder(store, Arc::clone(&recorder)),
+            recorder,
+            state_root,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn log_remove_counts(
+        recorder: &fandhe_container_core::observability::OpRecorder,
+    ) -> Option<(u64, u64)> {
+        use fandhe_container_core::observability::OpName;
+        recorder
+            .snapshot_op(&OpName::new("container_log_remove").expect("name"))
+            .map(|s| (s.success(), s.failure()))
+    }
+
+    /// SUP-7・CRI-2・#2593: `delete` は対象 ID のコンテナログ（現在ログ・世代・ロック）だけを消し、他は残す。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup7_cri2_delete_removes_container_logs_only_for_target() {
+        let dir = tmp_dir("ctrlog-target");
+        let bundle = make_bundle(&dir);
+        let (rt, recorder, root) = log_runtime(&dir);
+        for n in ["c1", "c2"] {
+            rt.create(&CreateRequest::new(cid(n), bundle.clone()).expect("req"))
+                .expect("create");
+        }
+        let logs = fandhe_container_supervisor::logs::container_log_dir(&root);
+        drop(open_container_log_sink(&root, "c1"));
+        drop(open_container_log_sink(&root, "c1"));
+        drop(open_container_log_sink(&root, "c2"));
+        assert_eq!(
+            sorted_dir_names(&logs),
+            ["c1.log", "c1.log.1", "c1.log.lock", "c2.log", "c2.log.lock"]
+        );
+
+        // 未 create の ID の delete は NotFound で、ログには触れない。
+        let err = rt
+            .delete(&DeleteRequest::new(cid("nope")))
+            .expect_err("nope");
+        assert_eq!(err.code(), ErrorCode::NotFound);
+        assert_eq!(sorted_dir_names(&logs).len(), 5);
+
+        rt.delete(&DeleteRequest::new(cid("c1"))).expect("delete");
+        assert_eq!(sorted_dir_names(&logs), ["c2.log", "c2.log.lock"]);
+        assert_eq!(log_remove_counts(&recorder), Some((1, 0)));
+        let st = rt.state(&StateRequest::new(cid("c2"))).expect("c2 state");
+        assert_eq!(st.state(), ContainerState::Created);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SUP-7・CRI-2・#2593: sink が生きている間は `delete` は `Ok` のままログを残し、失敗を構造化エラーで観測できる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup7_cri2_delete_keeps_logs_and_records_failure_when_sink_locked() {
+        let dir = tmp_dir("ctrlog-locked");
+        let bundle = make_bundle(&dir);
+        let (rt, recorder, root) = log_runtime(&dir);
+        rt.create(&CreateRequest::new(cid("c1"), bundle).expect("req"))
+            .expect("create");
+        let logs = fandhe_container_supervisor::logs::container_log_dir(&root);
+        let sink = open_container_log_sink(&root, "c1");
+
+        rt.delete(&DeleteRequest::new(cid("c1"))).expect("delete");
+        assert_eq!(sorted_dir_names(&logs), ["c1.log", "c1.log.lock"]);
+        assert_eq!(log_remove_counts(&recorder), Some((0, 1)));
+        let gone = rt.state(&StateRequest::new(cid("c1"))).expect_err("gone");
+        assert_eq!(gone.code(), ErrorCode::NotFound);
+
+        let err = rt.remove_container_log(&cid("c1")).expect_err("locked");
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+
+        drop(sink);
+        rt.remove_container_log(&cid("c1")).expect("removed");
+        assert!(sorted_dir_names(&logs).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SUP-7・CRI-2・#2593: 同じ ID が再作成されていたら（ガードが偽）ログを消さない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup7_cri2_remove_container_log_skips_recreated_id() {
+        let dir = tmp_dir("ctrlog-recreated");
+        let bundle = make_bundle(&dir);
+        let (rt, _recorder, root) = log_runtime(&dir);
+        rt.create(&CreateRequest::new(cid("c1"), bundle.clone()).expect("req"))
+            .expect("create");
+        let logs = fandhe_container_supervisor::logs::container_log_dir(&root);
+        drop(open_container_log_sink(&root, "c1"));
+
+        // 状態が残っている（再作成された扱い）間は成功しても現在ログは残る（ロックだけは片付く）。
+        rt.remove_container_log(&cid("c1")).expect("skipped");
+        assert_eq!(sorted_dir_names(&logs), ["c1.log"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

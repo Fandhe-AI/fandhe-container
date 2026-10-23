@@ -160,6 +160,9 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | C13 | `image tag --image-root <dir> a b c`（余剰） | 2 / `INVALID_ARGUMENT` | | | | | |
 | C14 | `image tag --force --image-root <dir> a b`（未対応オプション） | 2 / `INVALID_ARGUMENT` | | | | | |
 | C15 | `image tag --image-root <dir> busybox sha256:<64 hex>`（digest の target） | 2 / `INVALID_ARGUMENT` | | | | | Linux のみ到達（非 Linux は解決の失敗が先） |
+| C16 | `image rm --image-root <dir> sha256:<大文字 hex 64>`（digest に見える不正な参照） | 2 / `INVALID_ARGUMENT` | | | | | Linux のみ到達（非 Linux は解決の失敗が先） |
+| C17 | `image rm --image-root <dir> sha512:<hex 128>` | 2 / `INVALID_ARGUMENT` | | | | | Linux のみ到達（非 Linux は解決の失敗が先） |
+| C18 | `image tag --image-root <dir> busybox sha256:<大文字 hex 64>` | 2 / `INVALID_ARGUMENT` | | | | | Linux のみ到達（非 Linux は解決の失敗が先） |
 
 ### C 層の挙動ケース（Linux の参考期待値のみ。macOS / Windows は「前提未達」が既定）
 

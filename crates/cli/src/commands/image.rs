@@ -3,7 +3,15 @@
 //! `commands::run_to` が argv を解析した後に [`run_image`] / [`run_system`] を呼ぶ。実処理は
 //! `fandhe-container-oci` の `image_management`（`ImageStore`・`ReferenceTable::list_images`・`disk_usage`・
 //! `plan_image_rm_with`・`execute_image_rm`・`ImageStore::tag_image`）へ委ね、CLI は引数の解析・出力の整形・エラーの写像だけを担う。
-//! イメージの参照解釈は oci の `ImageReference::parse`（docker.io の正規化・`library/` と `latest` の補完を含む）を唯一の判定とする。
+//! イメージの参照解釈は、digest に見える入力（`sha256:` / `sha384:` / `sha512:` で始まり `/` も `@` も含まない）を
+//! `image_refs::is_bare_digest_form` で先に判別し（`create --image` と共有。OCI-7・#2600）、それ以外を oci の
+//! `ImageReference::parse`（docker.io の正規化・`library/` と `latest` の補完を含む）に委ねる。digest に見えて
+//! `sha256:<小文字 hex 64 桁>` でない入力（大文字 hex・`sha512:`・長さ違い）はタグと誤読せず `INVALID_ARGUMENT`
+//! （`MSG_BAD_DIGEST`）で拒否する。repository 名が `sha256` のイメージは `docker.io/library/sha256:<tag>` と書く。
+//!
+//! `name@digest` は `create --image` と違い受ける（digest 優先。#2221・#2316 以来の契約）。rm / tag は manifest digest 自体を
+//! 対象にする管理操作で、name は構文検証だけ通して捨て、digest 部は `Digest::parse` で厳格に検証するため取り違えは起きない。
+//! name と manifest の対応を検証できない制約は create と同じで、在庫が repository を持つ（pull の配線後）時点で揃えるかを再判断する。
 //!
 //! # 構文
 //!
@@ -75,7 +83,7 @@ use fandhe_container_oci::reference::{Digest, ImageReference, Reference};
 use super::CliExit;
 use super::args::{GlobalArgs, ImageArgs, SystemArgs};
 use super::create_start::{OP_LOG_ENV, export_ops, open_store};
-use super::image_refs::{ref_key, state_scope};
+use super::image_refs::{is_bare_digest_form, ref_key, state_scope};
 use super::list_logs::{MAX_LIST_PAGES, record_op, store_open_failure};
 use super::ref_reconcile::reconcile_for_image_rm;
 use crate::error::CliError;
@@ -99,6 +107,8 @@ const MSG_SCAN_LIMIT: &str = "image store scan limit exceeded";
 const MSG_TAG_LIMIT: &str = "image tag limit exceeded";
 const MSG_REF_LIMIT: &str = "container reference limit exceeded";
 pub(super) const MSG_TAG_NOT_FOUND: &str = "image tag not found";
+/// digest に見えるが `sha256:<小文字 hex 64 桁>` でない入力の固定文言（core の `ImageManifestDigest::new` と同一。試験で照合）。
+const MSG_BAD_DIGEST: &str = "manifest digest must be sha256:<64 lowercase hex>";
 const MSG_TAG_TARGET: &str = "target must be a tag reference";
 
 /// 失敗が出た段階。同じ `OciErrorCode` でも段階で意味が違う（`NotFound` はストア root の不在か対象イメージの不在か）。
@@ -271,13 +281,15 @@ enum ParsedRef {
     Digest(Digest),
 }
 
-/// 純 digest（`sha256:<hex>`）を先に試し、それ以外は oci の参照解析に委ねる。
-/// `name@digest` は digest 優先（oci の正規化規則）。
-fn parse_ref(input: &str) -> Result<ParsedRef, OciError> {
-    if let Ok(d) = Digest::parse(input) {
-        return Ok(ParsedRef::Digest(d));
+/// digest に見える入力は `Digest::parse` だけで決め（失敗は `MSG_BAD_DIGEST`。タグへ流さない）、それ以外は oci の参照解析に委ねる。
+/// `name@digest` は digest 優先（oci の正規化規則。module doc）。
+fn parse_ref(input: &str, stage: Stage) -> Result<ParsedRef, CliExit> {
+    if is_bare_digest_form(input) {
+        return Digest::parse(input).map(ParsedRef::Digest).map_err(|_| {
+            CliExit::Error(CliError::new(ErrorCode::InvalidArgument, MSG_BAD_DIGEST))
+        });
     }
-    let r = ImageReference::parse(input)?;
+    let r = ImageReference::parse(input).map_err(|e| oci_failure(&e, stage))?;
     Ok(match r.reference() {
         Reference::Tag(t) => ParsedRef::Tag(TagKey::new(
             r.registry().clone(),
@@ -289,30 +301,30 @@ fn parse_ref(input: &str) -> Result<ParsedRef, OciError> {
 }
 
 /// `<ref>` を `image rm` の対象へ変換する。
-fn parse_target(input: &str) -> Result<ImageRmTarget, OciError> {
-    Ok(match parse_ref(input)? {
+fn parse_target(input: &str) -> Result<ImageRmTarget, CliExit> {
+    Ok(match parse_ref(input, Stage::Remove)? {
         ParsedRef::Tag(k) => ImageRmTarget::Tag(k),
         ParsedRef::Digest(d) => ImageRmTarget::Manifest(d),
     })
 }
 
 /// `image tag` の付け元（既存タグまたは manifest digest）へ変換する。
-fn parse_tag_source(input: &str) -> Result<ImageTagSource, OciError> {
-    Ok(match parse_ref(input)? {
+fn parse_tag_source(input: &str) -> Result<ImageTagSource, CliExit> {
+    Ok(match parse_ref(input, Stage::Tag)? {
         ParsedRef::Tag(k) => ImageTagSource::Tag(k),
         ParsedRef::Digest(d) => ImageTagSource::Manifest(d),
     })
 }
 
-/// `image tag` の付けるタグへ変換する。digest 指定（`name@digest` を含む）は `INVALID_ARGUMENT`。
+/// `image tag` の付けるタグへ変換する。正しい digest 指定（`name@digest` を含む）は `MSG_TAG_TARGET`、
+/// digest に見える不正な入力は `MSG_BAD_DIGEST`（いずれも `INVALID_ARGUMENT`）。
 fn parse_tag_target(input: &str) -> Result<TagKey, CliExit> {
-    match parse_ref(input) {
-        Ok(ParsedRef::Tag(k)) => Ok(k),
-        Ok(ParsedRef::Digest(_)) => Err(CliExit::Error(CliError::new(
+    match parse_ref(input, Stage::Tag)? {
+        ParsedRef::Tag(k) => Ok(k),
+        ParsedRef::Digest(_) => Err(CliExit::Error(CliError::new(
             ErrorCode::InvalidArgument,
             MSG_TAG_TARGET,
         ))),
-        Err(e) => Err(oci_failure(&e, Stage::Tag)),
     }
 }
 
@@ -560,7 +572,7 @@ pub(super) fn run_image(global: &GlobalArgs, args: &ImageArgs, stdout: &mut dyn 
         ImageArgs::Rm(a) => with_ops("image_rm", || {
             let target = match parse_target(&a.reference) {
                 Ok(t) => t,
-                Err(e) => return oci_failure(&e, Stage::Remove),
+                Err(e) => return e,
             };
             match open_image_store(&a.image_root) {
                 Ok(store) => run_image_rm_reclaiming(
@@ -577,7 +589,7 @@ pub(super) fn run_image(global: &GlobalArgs, args: &ImageArgs, stdout: &mut dyn 
         ImageArgs::Tag(a) => with_ops("image_tag", || {
             let source = match parse_tag_source(&a.source) {
                 Ok(s) => s,
-                Err(e) => return oci_failure(&e, Stage::Tag),
+                Err(e) => return e,
             };
             let target = match parse_tag_target(&a.target) {
                 Ok(t) => t,
@@ -1029,7 +1041,9 @@ mod tests {
         assert_eq!(e.code(), Some("NOT_FOUND"));
         assert!(stderr_of(&e).contains(MSG_IMAGE_NOT_FOUND));
         let bad = parse_target("bad ref!").expect_err("invalid");
-        assert_eq!(bad.code(), OciErrorCode::InvalidArgument);
+        assert_eq!(bad.exit_code(), 2);
+        assert_eq!(bad.code(), Some("INVALID_ARGUMENT"));
+        assert!(stderr_of(&bad).contains("invalid argument"));
     }
 
     /// CLI-1・OCI-7: root の不在は 3、通常ファイルは 5、blobs が symlink なら ls は 5。
@@ -1198,6 +1212,72 @@ mod tests {
         assert!(err.contains(MSG_IMAGE_NOT_FOUND), "{err}");
         assert!(!err.contains("nope"), "{err}");
         assert_eq!(store.lock().expect("lock").tags().count(), 1);
+    }
+
+    /// OCI-7・CLI-1（#2600）: digest に見える不正な入力はタグと誤読せず、rm / tag の 3 入口とも 2 / INVALID_ARGUMENT。
+    #[test]
+    fn cli1_oci7_parse_ref_digest_like_inputs() {
+        let bad_digest = [
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{}F", "a".repeat(63)),
+            format!("sha512:{}", "a".repeat(128)),
+            format!("sha384:{}", "a".repeat(96)),
+            format!("sha256:{}", "a".repeat(63)),
+        ];
+        for t in &bad_digest {
+            for e in [
+                parse_target(t).expect_err("rm"),
+                parse_tag_source(t).expect_err("src"),
+                parse_tag_target(t).expect_err("dst"),
+            ] {
+                assert_eq!(e.exit_code(), 2, "{t}");
+                assert_eq!(e.code(), Some("INVALID_ARGUMENT"), "{t}");
+                let err = stderr_of(&e);
+                assert!(err.contains(MSG_BAD_DIGEST), "{err}");
+                assert!(!err.contains(t.as_str()), "{err}");
+            }
+        }
+        let a = "a".repeat(64);
+        assert_eq!(
+            parse_target(&format!("sha256:{a}")).expect("digest"),
+            ImageRmTarget::Manifest(dg('a'))
+        );
+        assert_eq!(
+            parse_tag_source(&format!("sha256:{a}")).expect("digest"),
+            ImageTagSource::Manifest(dg('a'))
+        );
+        let e = parse_tag_target(&format!("sha256:{a}")).expect_err("digest target");
+        assert!(stderr_of(&e).contains(MSG_TAG_TARGET));
+        let e = parse_tag_target(&format!("busybox@sha256:{a}")).expect_err("name@digest");
+        assert!(stderr_of(&e).contains(MSG_TAG_TARGET));
+        // name@大文字 hex は従来どおり固定の汎用文言。
+        let e = parse_target(&format!("busybox@sha256:{}", "A".repeat(64))).expect_err("bad");
+        assert_eq!(e.exit_code(), 2);
+        assert!(stderr_of(&e).contains("invalid argument"));
+        // タグ参照は変わらない（repository 名が sha256 のイメージは / を含めて書く）。
+        assert_eq!(
+            parse_target("busybox:v2").expect("tag"),
+            ImageRmTarget::Tag(key("library/busybox", "v2"))
+        );
+        assert_eq!(
+            parse_target("docker.io/library/sha256:v1").expect("tag"),
+            ImageRmTarget::Tag(key("library/sha256", "v1"))
+        );
+        assert_eq!(
+            parse_tag_target("busybox:v2").expect("tag"),
+            key("library/busybox", "v2")
+        );
+    }
+
+    /// OCI-7: 固定文言は core の `ImageManifestDigest::new` と同一。
+    #[test]
+    fn oci7_bad_digest_message_matches_core() {
+        let e = fandhe_container_core::oci_runtime::ImageManifestDigest::new(&format!(
+            "sha256:{}",
+            "A".repeat(64)
+        ))
+        .expect_err("bad");
+        assert_eq!(e.message(), MSG_BAD_DIGEST);
     }
 
     /// CLI-1・OCI-7: digest を target にすると 2 / INVALID_ARGUMENT（name@digest も同じ）。

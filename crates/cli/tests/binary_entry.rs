@@ -2270,6 +2270,46 @@ fn cli1_image_tag_digest_target_is_invalid_argument_on_linux() {
     );
 }
 
+/// CLI-1・OCI-7（#2600）: Linux の `image rm` / `image tag` は、digest に見えて正しい digest でない入力
+/// （大文字 hex の sha256・sha512）をタグと誤読せず 2 / INVALID_ARGUMENT（固定文言）で拒否する。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_oci7_image_rm_and_tag_reject_malformed_digest_on_linux() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TmpDir::new("malformed-digest");
+    let root = tmp.0.join("images");
+    std::fs::create_dir(&root).expect("mkdir image root");
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let root = root.to_str().expect("utf8").to_string();
+    let upper = format!("sha256:{}", "A".repeat(64));
+    let sha512 = format!("sha512:{}", "a".repeat(128));
+    let expected = image_err(
+        "INVALID_ARGUMENT",
+        "manifest digest must be sha256:<64 lowercase hex>",
+    );
+    let cases: [Vec<&str>; 4] = [
+        vec!["image", "rm", "--image-root", &root, &upper],
+        vec!["image", "rm", "--image-root", &root, &sha512],
+        vec![
+            "image",
+            "tag",
+            "--image-root",
+            &root,
+            "busybox:latest",
+            &upper,
+        ],
+        vec!["image", "tag", "--image-root", &root, &sha512, "busybox:v2"],
+    ];
+    for args in &cases {
+        let out = run(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), expected, "{args:?}");
+    }
+    let out = run(&["image", "rm", "--image-root", &root, "busybox:latest"]);
+    assert_eq!(out.status.code(), Some(3));
+}
+
 /// CLI-1・OCI-7・SEC-1（#2316）: Linux 以外の `image tag` は plugin 候補なしの fail-closed で
 /// FAILED_PRECONDITION（終了コード 5）。ストアのルートは作らない。
 #[cfg(not(target_os = "linux"))]

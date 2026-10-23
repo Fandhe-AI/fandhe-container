@@ -2735,7 +2735,8 @@ mod tests {
         );
         let still_alive = child.try_wait().expect("try_wait").is_none();
         // 先に回収してから照合する(照合の失敗で停止した子を残さない)。
-        let _ = sys::kill_pid(child.id(), sys::Signal::Kill);
+        // `Child::kill` は回収済みなら何も送らない(再利用された pid へ送らない)。
+        let _ = child.kill();
         let status = child.wait().expect("wait");
         if supported {
             assert_eq!(r, HolderExit::ExpiredKilled { drained: true });

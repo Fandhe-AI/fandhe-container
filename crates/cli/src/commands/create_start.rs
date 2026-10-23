@@ -13,10 +13,11 @@
 //! `open_store` が先に失敗するため到達しない）。
 //!
 //! 未実装・簡易実装（REPAIR-3）:
-//! - `--image-root <abs> --image <sha256:digest>` つきの `create` は core の `create_with_image` を呼び、イメージ参照（OCI-7）を
+//! - `--image-root <abs> --image <sha256:digest|name[:tag]>` つきの `create` は core の `create_with_image` を呼び、イメージ参照（OCI-7）を
 //!   `image_refs::StoreImageRefs` で登録・確定する（#2315）。レイヤーの展開はしない（本番の展開器は #2377。bundle の rootfs は展開済みの前提）。
 //!   manifest の在庫は永続化済み（#2380）だが、本番で在庫を埋める経路（pull → `ImageStore` の配線）が未実装のため、`register` は
-//!   常に `NOT_FOUND` になり、本番ではイメージつき create はその配線まで成功しない。タグ参照の解決もしない（digest のみ）。
+//!   常に `NOT_FOUND` になり、本番ではイメージつき create はその配線まで成功しない。
+//!   `--image` の判別規則（digest かタグ参照か）と解決・付け替えの扱いは `image_refs` module の doc（#2496）。
 //!   core 呼び出しの前に同じ参照キーの残骸（状態の無い参照）を回収し（契機 A）、呼び出し全体を create ゲートの共有で包む
 //!   （`ref_reconcile`・`docs/design/container-ref-reconcile.md`。#2495）。
 //! - 本番入口の `start` は、状態ストアで ID の存在を確かめた後、CLI の実体と同じディレクトリの
@@ -46,7 +47,7 @@ use fandhe_container_core::traits::{
 use super::CliExit;
 use super::args::{CreateArgs, GlobalArgs, StartArgs};
 use super::image::{Stage, open_image_store_for_lifecycle, trait_failure};
-use super::image_refs::{StoreImageRefs, state_scope};
+use super::image_refs::{StoreImageRefs, classify_create_image, resolve_create_image, state_scope};
 use super::ref_reconcile::reclaim_stale_ref_recorded;
 use fandhe_container_oci::image_management::{ContainerCreatePass, ImageStore};
 
@@ -134,10 +135,12 @@ fn build_create(
     let image = match &args.image {
         None => None,
         Some(i) => {
-            let manifest = ImageManifestDigest::new(&i.manifest)?;
+            // 構文の判別はストアを開く前に行う（不正な入力は存在しない root でも INVALID_ARGUMENT。OCI-7・CLI-1）。
+            let classified = classify_create_image(&i.reference)?;
             // 非 Linux はローカルストアを開かず、バックエンド（plugin）解決の拒否へそのまま渡す（OCI-7・CLI-1）。
             require_local_backend(global)?;
             let store = open_image_store_for_lifecycle(&i.image_root)?;
+            let manifest = resolve_create_image(&store, classified)?;
             let scope = state_scope(&fandhe_container_core::state_store::StateRoot::resolve(
                 global.root.clone(),
             )?);
@@ -1362,7 +1365,7 @@ mod tests {
             id: "c1".into(),
             image: Some(crate::commands::args::CreateImageArgs {
                 image_root: root,
-                manifest: manifest.into(),
+                reference: manifest.into(),
             }),
         }
     }
@@ -1381,6 +1384,18 @@ mod tests {
                 .expect("must fail");
             assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
         }
+    }
+
+    /// OCI-7・CLI-1: 非 Linux ではタグ参照でもローカルストアを開かず、plugin 解決の拒否に到達する（#2496）。
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn oci7_build_create_non_linux_tag_ref_reaches_plugin_refusal() {
+        let root = std::env::temp_dir().join("fc-cli-no-such-image-root-4");
+        let e = build_create(&test_global(), &image_args(root, "alpine:3.19"))
+            .err()
+            .expect("must fail");
+        assert_ne!(e.message(), "image store root not found");
+        assert_ne!(e.message(), "image tag not found");
     }
 
     /// OCI-7・CLI-1: 非 Linux は存在しない `--image-root` でも NOT_FOUND にならず、plugin 解決の拒否に到達する。
@@ -1483,6 +1498,122 @@ mod tests {
             assert_eq!(e.code(), ErrorCode::AlreadyExists);
             assert_eq!(e.exit_code().get(), 4);
             assert_eq!(e.op(), LifecycleOp::Create);
+        }
+
+        const IMG_DIGEST_2: &str =
+            "sha256:b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
+
+        fn seed_images(base: &TmpDir, tags: &[(&str, &str)]) -> PathBuf {
+            use fandhe_container_oci::image_management::{ImageTagSource, ManifestComposition};
+            use fandhe_container_oci::reference::{Digest, ImageReference, Reference};
+            let root = base.0.join("images");
+            std::fs::create_dir_all(&root).expect("mkdir");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod");
+            }
+            let store = ImageStore::open(&root).expect("store");
+            let cfg = Digest::parse(&format!("sha256:{}", "c".repeat(64))).expect("cfg");
+            for m in [IMG_DIGEST, IMG_DIGEST_2] {
+                store
+                    .lock()
+                    .expect("lock")
+                    .register_manifest(
+                        Digest::parse(m).expect("d"),
+                        ManifestComposition::new(cfg.clone(), vec![]).expect("comp"),
+                    )
+                    .expect("reg");
+            }
+            for (name, m) in tags {
+                let r = ImageReference::parse(name).expect("ref");
+                let Reference::Tag(t) = r.reference() else {
+                    panic!("tag expected")
+                };
+                store
+                    .tag_image(
+                        &ImageTagSource::Manifest(Digest::parse(m).expect("d")),
+                        fandhe_container_oci::image_management::TagKey::new(
+                            r.registry().clone(),
+                            r.repository().clone(),
+                            t.clone(),
+                        ),
+                    )
+                    .expect("tag");
+            }
+            root
+        }
+
+        /// OCI-7・CLI-1: 存在しないタグは NOT_FOUND と固定文言で、入力もパスも含まない（#2496）。
+        #[test]
+        fn oci7_build_create_unknown_tag_is_not_found() {
+            let base = TmpDir::new("tag-nf");
+            let root = seed_images(&base, &[("registry.example/lib/app:v1", IMG_DIGEST)]);
+            let e = build_create(
+                &test_global(),
+                &image_args(root.clone(), "registry.example/lib/app:v2"),
+            )
+            .err()
+            .expect("must fail");
+            assert_eq!(e.code(), ErrorCode::NotFound);
+            assert_eq!(e.message(), "image tag not found");
+            assert!(!e.message().contains(root.to_string_lossy().as_ref()));
+        }
+
+        /// OCI-7・CLI-1: タグを解決したあとに付け替えられても、create は解決した digest で参照を登録する（#2496）。
+        #[test]
+        fn oci7_create_with_tag_registers_resolved_digest_despite_retag() {
+            use fandhe_container_oci::image_management::{ImageTagSource, TagKey};
+            use fandhe_container_oci::reference::Digest;
+            let base = TmpDir::new("tag-retag");
+            let bundle = make_bundle(&base);
+            let tag = "registry.example/lib/app:v1";
+            let root = seed_images(&base, &[(tag, IMG_DIGEST)]);
+            let mut global = test_global();
+            global.root = Some(base.0.join("state"));
+            let (_req, image) =
+                build_create(&global, &image_args(root.clone(), tag)).expect("build");
+            let image = image.expect("image");
+            assert_eq!(image.manifest.as_str(), IMG_DIGEST);
+            // 解決のあとに別のストアのインスタンスで付け替える。
+            let other = ImageStore::open(&root).expect("other");
+            let key: TagKey =
+                match crate::commands::image_refs::classify_create_image(tag).expect("c") {
+                    crate::commands::image_refs::CreateImageRef::Tag(k) => k,
+                    _ => panic!("tag expected"),
+                };
+            let out = other
+                .tag_image(
+                    &ImageTagSource::Manifest(Digest::parse(IMG_DIGEST_2).expect("d")),
+                    key,
+                )
+                .expect("retag");
+            assert!(matches!(
+                out.change,
+                fandhe_container_oci::image_management::ImageTagChange::Moved { .. }
+            ));
+            let rt = runtime(&base);
+            let req = build_create_request(&CreateArgs {
+                bundle,
+                id: "c1".into(),
+                image: None,
+            })
+            .expect("req");
+            create_container_with_image_reclaiming(&rt, &image, &req).expect("create");
+            let guard = image.store.lock().expect("lock");
+            let m1 = guard.manifest_references(&Digest::parse(IMG_DIGEST).expect("d"));
+            let m2 = guard.manifest_references(&Digest::parse(IMG_DIGEST_2).expect("d"));
+            assert_eq!(m1.containers.len(), 1);
+            assert!(m1.containers[0].as_str().ends_with(".c1"));
+            assert!(m2.containers.is_empty());
+            let moved: Vec<String> = guard
+                .tags()
+                .map(|(k, d)| format!("{k}={}", d.as_str()))
+                .collect();
+            assert_eq!(
+                moved,
+                vec![format!("registry.example/lib/app:v1={IMG_DIGEST_2}")]
+            );
         }
 
         fn gate_test_image(base: &TmpDir) -> CreateImage {

@@ -98,6 +98,7 @@ const MSG_BLOB_DIR: &str = "image store blob directory is invalid";
 const MSG_SCAN_LIMIT: &str = "image store scan limit exceeded";
 const MSG_TAG_LIMIT: &str = "image tag limit exceeded";
 const MSG_REF_LIMIT: &str = "container reference limit exceeded";
+pub(super) const MSG_TAG_NOT_FOUND: &str = "image tag not found";
 const MSG_TAG_TARGET: &str = "target must be a tag reference";
 
 /// 失敗が出た段階。同じ `OciErrorCode` でも段階で意味が違う（`NotFound` はストア root の不在か対象イメージの不在か）。
@@ -115,6 +116,8 @@ pub(super) enum Stage {
     Tag,
     /// create / delete のコンテナ参照の登録・解除（`image_refs::StoreImageRefs`。#2315・OCI-7）。
     Refs,
+    /// create の `--image` のタグ参照の解決（`image_refs::resolve_create_image`。#2496・OCI-7・CLI-1）。
+    Resolve,
 }
 
 /// oci の分類を core の `ErrorCode` へ写す。`OciErrorCode` は `#[non_exhaustive]` ではないが、将来の追加に備え未知は `Internal`。
@@ -143,6 +146,8 @@ pub(super) fn failure_message(code: OciErrorCode, stage: Stage) -> &'static str 
         (Stage::Tag, OciErrorCode::Timeout) => MSG_LOCKED,
         (Stage::Tag, OciErrorCode::ResourceExhausted) => MSG_TAG_LIMIT,
         // 参照の登録先は `register_container_ref` の NotFound（manifest が在庫に無い）が主。
+        (Stage::Resolve, OciErrorCode::NotFound) => MSG_TAG_NOT_FOUND,
+        (Stage::Resolve, OciErrorCode::Timeout) => MSG_LOCKED,
         (Stage::Refs, OciErrorCode::NotFound) => MSG_IMAGE_NOT_FOUND,
         (Stage::Refs, OciErrorCode::Timeout) => MSG_LOCKED,
         (Stage::Refs, OciErrorCode::ResourceExhausted) => MSG_REF_LIMIT,

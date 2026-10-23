@@ -43,7 +43,10 @@
 //!   （seccomp の listener の受け渡し・SEC-4・SUP-6・#2385: `reapply_restrictions` の最後の seccomp の段で、worker が
 //!   `NEW_LISTENER` 付きの filter を載せて listener を親へ渡し ACK を待つ。親は worker の終了を待つ **前** に受信・検証して
 //!   ACK を返す〔`ExecOutcome::seccomp_listener` が証跡〕。失敗・不着・ACK 無しの成功は fail-closed で exec を拒否する。
-//!   filter は ERRNO 版のままで通知は出ない。exec での USER_NOTIF 化と応答者は #2385 の後続で、**未実装**）
+//!   filter は `USER_NOTIF` 版で載り、応答者は **この親**（#2544。[`ExecResponder`]。受け取った後、worker の終了までの間に
+//!   単一スレッドで通知ごとに期限つきで記録して `-EPERM` で応答する。応答者を続けられなくなったら listener を閉じて
+//!   カーネルに `ENOSYS` で解かせる〔許可に倒れない〕。判断は `docs/design/audit-delivery.md` 9.4。集計は
+//!   `ExecOutcome::seccomp_audit`））
 //! - 再適用は、参加後の自プロセスの `/` が **launch 時に記録したコンテナの `/`**（[`identify_pid1`] に渡した記録の
 //!   `launch_isolation` の `st_dev`・`st_ino`。ホスト側の bundle ディレクトリではなく launch の pivot 後の `/`）
 //!   であることを照合してから適用する。不一致（pivot していない対象・`/` へ別のマウントが重ねられた対象・restart で
@@ -293,6 +296,9 @@ use fandhe_container_core::traits::{
 };
 
 use crate::container_options::env::EnvVar;
+use crate::seccomp_notify::{
+    CounterSnapshot, ExecResponder, ListenerSource, NotifyConfig, ServeEnd, report_lines,
+};
 
 /// 検証済みの exec 対象（コンテナ ID と、pidfd で固定した pid1、特定に使った記録の bundle）。
 #[derive(Debug)]
@@ -690,6 +696,50 @@ pub struct ExecOutcome {
     /// 証跡）。本番の通しの入口（[`run_command_with_pidfd`]）の成功結果は常に `Verified`（受け渡しに失敗すれば exec は
     /// 拒否され、成功結果に至らない）。worker の結果行には含まれず、親が載せる。
     pub seccomp_listener: ExecListenerHandover,
+    /// 親の応答者が seccomp の通知に応答した結果（SEC-4・SUP-6・#2544。受け渡しの証跡 `seccomp_listener` とは別）。
+    /// worker の結果行には含まれず、親が載せる。応答者のいない経路は [`ExecSeccompAudit::NOT_APPLICABLE`]。
+    pub seccomp_audit: ExecSeccompAudit,
+}
+
+/// [`ExecSeccompAudit::responder`] の値（将来拡張できる構造。REPAIR-3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExecResponderState {
+    /// 応答者のいない経路（試験専用の入口・worker の結果行の復号直後の既定値）。
+    NotApplicable,
+    /// 応答者が worker の終了（または利用者の消滅）まで務めた。
+    Served,
+    /// 応答者を続けられなくなった（待機・受信・応答の送信の失敗、または応答者が不在）。listener を閉じ、以後の拒否された
+    /// syscall はカーネルが `ENOSYS` で返した（許可には倒れない）。集計は構造化ログ（`seccomp_audit_*`）にも出る。
+    Lost,
+}
+
+/// 親の応答者の結果（SEC-4・SUP-6・#2544）。`Copy` の証跡で、記録できた拒否の件数などを具体値で持つ。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ExecSeccompAudit {
+    /// 応答者の状態。
+    pub responder: ExecResponderState,
+    /// 集計（`recorded` が記録先へ届いた拒否の件数。1 拒否 1 件）。
+    pub counts: CounterSnapshot,
+}
+
+impl ExecSeccompAudit {
+    /// 応答者のいない経路の値。
+    pub const NOT_APPLICABLE: Self = Self {
+        responder: ExecResponderState::NotApplicable,
+        counts: CounterSnapshot {
+            recorded: 0,
+            suppressed: 0,
+            late: 0,
+            unrecorded: 0,
+            target_gone: 0,
+            pid_unresolved: 0,
+            respond_failed: 0,
+            wait_failed: 0,
+            receive_failed: 0,
+        },
+    };
 }
 
 /// [`ExecOutcome::seccomp_listener`] の値（将来拡張できる構造。REPAIR-3）。
@@ -700,7 +750,7 @@ pub struct ExecOutcome {
 pub enum ExecListenerHandover {
     /// 受け渡しの対象外の経路（試験専用の入口・worker の結果行の復号直後の既定値）。
     NotApplicable,
-    /// 検証済みの listener を受け取り、ACK を返した（filter の届け方は ERRNO 版のまま。応答者は後続。#2385）。
+    /// 検証済みの listener を受け取り、ACK を返した（応答者は親。結果は [`ExecOutcome::seccomp_audit`]。#2385・#2544）。
     Verified,
 }
 
@@ -780,6 +830,7 @@ pub fn run_command(
     let name = ExecCgroupName::unique();
     let result = run_owning_child_cgroup(
         deadline,
+        exec_responder(record, audit),
         || create_child_cgroup(record, &name),
         || cleanup_child_cgroup(record, &name),
         |proof, child, sender| {
@@ -897,8 +948,9 @@ fn audit_worker_result(
 ///
 /// `audit` は分離違反による拒否の記録先（SEC-4・#1465。契約はモジュール doc「監査記録」。本番用は [`default_audit_sink`]）。拒否は `Err` の
 /// [`AuditedRejection`] で返り、`error` は記録の成否に関わらず元の拒否、`delivery` が記録の結果。移行: 呼び出しへ
-/// sink を渡し、`Err` は `.error` / `.delivery` を見る。`audit` の実装はブロックし得る I/O にタイムアウトを持つこと
+/// sink を渡し、`Err` は `.error` / `.delivery` を見る。`audit` の実装はブロックし得る I/O にタイムアウトを持ち、`record_until` を期限どおりに実装すること(seccomp の通知への応答が記録で期限を越えて遅れないため。#2544)
 /// （REPAIR-5。`AuditSink` の契約）。記録は worker を回収した後に行うため、sink が詰まっても worker・コマンドは残らない。
+/// コマンドが seccomp で拒否された syscall も、実行中に同じ `audit` へ 1 拒否 1 件で記録して `EPERM` を返す（#2544。結果は `ExecOutcome::seccomp_audit`）。
 pub fn run_command_with_pidfd(
     record: &StateRecord,
     pidfd: BorrowedFd<'_>,
@@ -912,6 +964,7 @@ pub fn run_command_with_pidfd(
     let name = ExecCgroupName::unique();
     let result = run_owning_child_cgroup(
         deadline,
+        exec_responder(record, audit),
         || create_child_cgroup(record, &name),
         || cleanup_child_cgroup(record, &name),
         |proof, child, sender| {
@@ -945,6 +998,7 @@ pub fn run_command_in(
     let name = ExecCgroupName::unique();
     let result = run_owning_child_cgroup(
         deadline,
+        exec_responder(record, audit),
         || {
             ExecChildCgroup::create_in_path_for_test(expected_cgroup_path, &name)
                 .map(Some)
@@ -1073,19 +1127,37 @@ const WORKER_RESULT_MAX: u64 = 4096;
 const WORKER_LINE_MAX: usize = 2048;
 
 /// worker へ seccomp の listener の受け渡し口を張るか（SEC-4・SUP-6・#2385）。真偽値にせず、意味を型で示す。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ListenerPolicy {
+enum ListenerPolicy<'a> {
     /// 本番: worker は listener を親へ渡して ACK を受けるまでコマンドを起動できない。受け渡しに失敗すれば exec を拒否する。
-    Required,
+    /// filter は `USER_NOTIF` で載り、親が応答者になる（応答者の構成を値で持つため、応答者のいない `USER_NOTIF` は
+    /// 本番の経路で構築できない。#2544）。
+    Respond(ExecResponder<'a>),
+    /// 試験専用: `USER_NOTIF` で載せて ACK を返した直後に listener を閉じる（応答者の不在の fail-closed の照合用。
+    /// 拒否された syscall は `ENOSYS` になり、許可にも停止にも倒れない）。本番の値からは作れない。
+    #[cfg(feature = "exec-test-support")]
+    AckThenDrop,
     /// 受け渡しの対象外（試験専用の入口。worker の機構だけを任意の処理で確かめる）。
     None,
+}
+
+impl ListenerPolicy<'_> {
+    /// worker が載せる seccomp filter の届け方（親が fork の前に決める）。
+    fn delivery(&self) -> fandhe_container_core::seccomp::ErrnoDelivery {
+        use fandhe_container_core::seccomp::ErrnoDelivery;
+        match self {
+            Self::Respond(_) => ErrnoDelivery::UserNotif,
+            #[cfg(feature = "exec-test-support")]
+            Self::AckThenDrop => ErrnoDelivery::UserNotif,
+            Self::None => ErrnoDelivery::Errno,
+        }
+    }
 }
 
 /// `work` を worker プロセスで実行し、`deadline + grace` までに終わらなければ worker を `SIGKILL` して回収し
 /// `Timeout` を返す（REPAIR-5・SUP-6・TASK-163.4）。契約はモジュール doc「全体の上限時間」。
 ///
 /// 呼び出しプロセスは単一スレッドであること（満たさなければ core が fork せず拒否する）。`work` は fork した
-/// 子で実行され、結果は pipe の 1 行（[`encode_worker_result`]）で返る。`listener` が `Required` のとき、`work` は
+/// 子で実行され、結果は pipe の 1 行（[`encode_worker_result`]）で返る。`listener` が `Respond`（応答者つき）のとき、`work` は
 /// listener の送信口を受け取り、親は worker の終了を待つ **前** に listener を期限つきで受信・検証して ACK を返す
 /// （`work` が ACK を待つため、先に終了を待つと相互待ちになる）。受け渡しの結果ごとの扱いは
 /// [`reject_unacknowledged_exit`]・[`listener_failure`]。
@@ -1093,7 +1165,7 @@ fn run_in_worker_with(
     deadline: Deadline,
     grace: Duration,
     cleanup: impl FnOnce() -> Result<(), TraitError>,
-    listener: ListenerPolicy,
+    listener: ListenerPolicy<'_>,
     work: impl FnOnce(&ExecWorkerProof, Option<ExecListenerSender>) -> Result<ExecOutcome, TraitError>,
 ) -> Result<ExecOutcome, WorkerFailure> {
     // fork 前に期限を確かめる（切れていれば worker を作らない。fork 後の早期 return で worker を残さないため）。
@@ -1110,17 +1182,19 @@ fn run_in_worker_with(
         let _ = (&writer).write_all(&line);
         0
     };
-    let (child, receiver) = match listener {
-        ListenerPolicy::Required => {
-            let (child, receiver) =
-                spawn_exec_worker_with_listener(|proof, sender| body(proof, Some(sender)))
-                    .map_err(from_exec_error)?;
-            (child, Some(receiver))
-        }
+    let (child, receiver) = match &listener {
         ListenerPolicy::None => (
             spawn_exec_worker(|proof| body(proof, None)).map_err(from_exec_error)?,
             None,
         ),
+        _ => {
+            let (child, receiver) =
+                spawn_exec_worker_with_listener(listener.delivery(), |proof, sender| {
+                    body(proof, Some(sender))
+                })
+                .map_err(from_exec_error)?;
+            (child, Some(receiver))
+        }
     };
     // 親は書き込み側を閉じる（worker の終了後に読み取りが EOF で終わるようにする）。
     drop(writer);
@@ -1130,15 +1204,10 @@ fn run_in_worker_with(
     let result = match receiver {
         None => collect_worker_result(&child, &mut reader, deadline, grace),
         Some(receiver) => match receiver.receive(&child, deadline.at) {
-            // 受け取った listener は worker の回収が済むまで保持する（先に閉じると、後続で通知を載せたとき
+            // 受け取った listener は worker の回収が済むまで保持し、その間は応答者が通知に応答する（先に閉じると、
             // worker の拒否された syscall が `ENOSYS` になる）。
-            ListenerReceipt::Received(listener) => {
-                let collected = collect_worker_result(&child, &mut reader, deadline, grace);
-                drop(listener);
-                collected.map(|mut outcome| {
-                    outcome.seccomp_listener = ExecListenerHandover::Verified;
-                    outcome
-                })
+            ListenerReceipt::Received(received) => {
+                respond_and_collect(&listener, received, &child, &mut reader, deadline, grace)
             }
             ListenerReceipt::SenderClosed => reject_unacknowledged_exit(collect_worker_result(
                 &child,
@@ -1228,6 +1297,72 @@ fn listener_failure(error: TraitError, reaped: Result<ChildExit, TraitError>) ->
     }
 }
 
+/// 本番の応答者を作る（記録先は exec の `audit`、コンテナ ID は記録の ID、設定は既定。SEC-4・SUP-6・#2544）。
+fn exec_responder<'a>(record: &'a StateRecord, audit: &'a dyn AuditSink) -> ExecResponder<'a> {
+    ExecResponder::new(audit, Some(record.status().id()), NotifyConfig::default())
+}
+
+/// worker が終了した（または終了を観測できなかった）か。回収はするが kill はしない（回収した終了状態は後の
+/// `collect_worker_result` が記録済みの値として受け取る）。観測の失敗は「停止」として扱い、回収側に失敗を委ねる。
+fn worker_finished(child: &fandhe_container_core::exec::ContainerChild) -> bool {
+    !matches!(child.wait_for_exit(Duration::ZERO), Ok(None))
+}
+
+/// 受け取った listener で応答者を回し、worker の結果を回収する（SEC-4・SUP-6・REPAIR-5・#2544）。
+///
+/// 応答者は worker の終了・利用者の消滅・`deadline`（exec の全体期限）のいずれかまで通知に応答する。応答者を続けられなく
+/// なった（`Lost`）か期限に達したときは、listener を **回収の前に** 閉じる（待機中の拒否された syscall を、カーネルが
+/// `ENOSYS` で解く。許可には倒れない）。それ以外は回収が済むまで保持する（先に閉じると、worker の拒否された syscall が
+/// `ENOSYS` になる）。`Lost` でも exec は止めず（start 経路の「起動後の喪失で停止しない」と揃える）、状態は
+/// `ExecOutcome::seccomp_audit` と構造化ログに出る。
+fn respond_and_collect(
+    policy: &ListenerPolicy<'_>,
+    received: fandhe_container_core::exec::SeccompListener,
+    child: &fandhe_container_core::exec::ContainerChild,
+    reader: &mut std::io::PipeReader,
+    deadline: Deadline,
+    grace: Duration,
+) -> Result<ExecOutcome, WorkerFailure> {
+    let mut audit = ExecSeccompAudit::NOT_APPLICABLE;
+    let mut held = None;
+    match policy {
+        ListenerPolicy::Respond(responder) => {
+            let source = ListenerSource(received);
+            let report = responder.serve(&source, deadline.at, &mut || worker_finished(child));
+            // 集計の構造化ログ（固定語彙と数値のみ）。待たない出口で出す（共有の出力口は専用スレッドを作り、
+            // 以後の監査記録〔`FileAuditSink` の主経路は `Threads: 1` を要する〕を壊すため使えない）。
+            for line in report_lines(report.counts) {
+                let _ = emit_diagnostic_line_to(std::io::stderr().as_fd(), &line);
+            }
+            let lost = report.end == ServeEnd::Lost;
+            audit = ExecSeccompAudit {
+                responder: if lost {
+                    ExecResponderState::Lost
+                } else {
+                    ExecResponderState::Served
+                },
+                counts: report.counts,
+            };
+            if matches!(report.end, ServeEnd::Stopped | ServeEnd::Closed) {
+                held = Some(source);
+            }
+        }
+        #[cfg(feature = "exec-test-support")]
+        ListenerPolicy::AckThenDrop => {
+            drop(received);
+            audit.responder = ExecResponderState::Lost;
+        }
+        ListenerPolicy::None => drop(received),
+    }
+    let collected = collect_worker_result(child, reader, deadline, grace);
+    drop(held);
+    collected.map(|mut outcome| {
+        outcome.seccomp_listener = ExecListenerHandover::Verified;
+        outcome.seccomp_audit = audit;
+        outcome
+    })
+}
+
 /// worker の終了を待って（期限切れなら `SIGKILL` して回収し）、worker が pipe へ書いた結果 1 行を復号する。
 fn collect_worker_result(
     child: &fandhe_container_core::exec::ContainerChild,
@@ -1284,6 +1419,7 @@ fn collect_worker_result(
 /// `Ok(None)` を返すのは cgroup 配置の記録が無い場合で、`work` が対象特定で拒否する（作成物なし）。
 fn run_owning_child_cgroup(
     deadline: Deadline,
+    responder: ExecResponder<'_>,
     create: impl FnOnce() -> Result<Option<ExecChildCgroup>, TraitError>,
     remove: impl Fn() -> Result<(), TraitError>,
     work: impl FnOnce(
@@ -1302,10 +1438,10 @@ fn run_owning_child_cgroup(
             cleanup_ran.set(true);
             if owned { remove() } else { Ok(()) }
         },
-        ListenerPolicy::Required,
+        ListenerPolicy::Respond(responder),
         |proof, sender| match sender {
             Some(sender) => work(proof, child.as_ref(), sender),
-            // `Required` では必ず `Some`。無ければ fail-closed（listener 無しで進まない）。
+            // `Respond` では必ず `Some`。無ければ fail-closed（listener 無しで進まない）。
             None => Err(TraitError::new(
                 ErrorCode::Internal,
                 "exec stage Seccomp: the seccomp listener channel was not provided",
@@ -1409,8 +1545,22 @@ pub fn run_in_worker_for_test(
     .map_err(|f| f.error)
 }
 
-/// 結合試験専用の入口: 本番と同じ worker・listener の受け渡し（`ListenerPolicy::Required`）で `work` を実行する
-/// （SEC-4・SUP-6・#2385。`tests/exec_seccomp_listener.rs`）。
+/// 結合試験専用: 記録を捨てる記録先（受け渡しの試験が記録内容を見ない入口で使う）。
+#[cfg(feature = "exec-test-support")]
+struct DiscardSink;
+
+#[cfg(feature = "exec-test-support")]
+impl AuditSink for DiscardSink {
+    fn record(
+        &self,
+        _record: &fandhe_container_core::audit_log::AuditRecord,
+    ) -> Result<(), TraitError> {
+        Ok(())
+    }
+}
+
+/// 結合試験専用の入口: 本番と同じ worker・listener の受け渡しと応答者（`ListenerPolicy::Respond`。記録は捨てる）で
+/// `work` を実行する（SEC-4・SUP-6・#2385。`tests/exec_seccomp_listener.rs`）。
 ///
 /// `work` は listener の送信口を受け取る。`Ok(())` を返したとき、worker の結果は固定の見本（コマンドが起動して 0 で終了した
 /// 結果）になる。親は本番と同じく worker の終了を待つ前に受信し、結果を合成する。`exec-test-support` feature を付けた
@@ -1427,7 +1577,11 @@ pub fn run_in_worker_with_listener_for_test(
         Deadline::after(timeout),
         grace,
         cleanup,
-        ListenerPolicy::Required,
+        ListenerPolicy::Respond(ExecResponder::new(
+            &DiscardSink,
+            None,
+            NotifyConfig::default(),
+        )),
         |_, sender| {
             let sender = sender.ok_or_else(|| {
                 TraitError::new(ErrorCode::Internal, "the listener channel was not provided")
@@ -1435,6 +1589,60 @@ pub fn run_in_worker_with_listener_for_test(
             work(sender)?;
             decode_worker_result(
                 b"ok command - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321\n",
+            )
+            .map_err(|f| f.error)
+        },
+    )
+    .map_err(|f| f.error)
+}
+
+/// [`run_in_worker_with_user_notif_for_test`] の応答モード（SEC-4・SUP-6・#2544）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserNotifTestMode {
+    /// 本番と同じ応答者が通知に応答する。
+    Respond,
+    /// ACK の直後に listener を閉じる（応答者の不在。拒否された syscall は `ENOSYS` になる）。
+    AckThenDrop,
+}
+
+/// 結合試験専用の入口: [`run_in_worker_with_listener_for_test`] に、記録先・コンテナ ID・応答者の設定・応答モードを渡せる版
+/// （SEC-4・SUP-6・REPAIR-5・#2544。`tests/exec_seccomp_listener.rs`）。`work` は `USER_NOTIF` 版の filter を載せて
+/// 拒否される syscall を発行する。観測した値は `work` が試験側の pipe へ書いて返す（worker は別プロセス）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+// 理由: 試験専用の入口で、各入力が独立しているため束ねる型を作らない。
+pub fn run_in_worker_with_user_notif_for_test(
+    timeout: Duration,
+    grace: Duration,
+    cleanup: impl FnOnce() -> Result<(), TraitError>,
+    sink: &dyn AuditSink,
+    container_id: Option<&ContainerId>,
+    config: NotifyConfig,
+    mode: UserNotifTestMode,
+    work: impl FnOnce(ExecListenerSender) -> Result<(), TraitError>,
+) -> Result<ExecOutcome, TraitError> {
+    let policy = match mode {
+        UserNotifTestMode::Respond => {
+            ListenerPolicy::Respond(ExecResponder::new(sink, container_id, config))
+        }
+        UserNotifTestMode::AckThenDrop => ListenerPolicy::AckThenDrop,
+    };
+    run_in_worker_with(
+        Deadline::after(timeout),
+        grace,
+        cleanup,
+        policy,
+        |_, sender| {
+            let sender = sender.ok_or_else(|| {
+                TraitError::new(ErrorCode::Internal, "the listener channel was not provided")
+            })?;
+            work(sender)?;
+            decode_worker_result(
+                b"ok command - exited 0 15 1 23 3 120 cleared 4 sealed_copy - 4321
+",
             )
             .map_err(|f| f.error)
         },
@@ -1732,6 +1940,7 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
         entrypoint_mode,
         stale_exec_cgroups: ExecCgroupSweep::default(),
         seccomp_listener: ExecListenerHandover::NotApplicable,
+        seccomp_audit: ExecSeccompAudit::NOT_APPLICABLE,
     })
 }
 
@@ -1847,6 +2056,7 @@ fn run_in_child_cgroup(
         entrypoint_mode,
         stale_exec_cgroups: ExecCgroupSweep::default(),
         seccomp_listener: ExecListenerHandover::NotApplicable,
+        seccomp_audit: ExecSeccompAudit::NOT_APPLICABLE,
     })
 }
 
@@ -2626,6 +2836,7 @@ mod tests {
             entrypoint_mode: EntrypointExecMode::SealedCopy,
             stale_exec_cgroups: ExecCgroupSweep::default(),
             seccomp_listener: ExecListenerHandover::NotApplicable,
+            seccomp_audit: ExecSeccompAudit::NOT_APPLICABLE,
         };
         let line = encode_worker_result(&Ok(outcome));
         assert_eq!(
@@ -2668,6 +2879,7 @@ mod tests {
                 entrypoint_mode: EntrypointExecMode::PinnedInode { reason },
                 stale_exec_cgroups: ExecCgroupSweep::default(),
                 seccomp_listener: ExecListenerHandover::NotApplicable,
+                seccomp_audit: ExecSeccompAudit::NOT_APPLICABLE,
                 ..outcome
             };
             let line = encode_worker_result(&Ok(outcome));
@@ -2869,7 +3081,7 @@ mod tests {
             Deadline::after(Duration::ZERO),
             Duration::from_secs(1),
             || panic!("cleanup must not run when no worker was forked"),
-            ListenerPolicy::Required,
+            ListenerPolicy::None,
             |_, _| panic!("work must not run when the deadline has expired"),
         )
         .unwrap_err()
@@ -2887,12 +3099,22 @@ mod tests {
         // 作成に失敗（同名の既存との衝突）したら、後始末（既存 cgroup の kill / 削除）を呼ばず fork もしない。
         let err = run_owning_child_cgroup(
             Deadline::after(Duration::from_secs(5)),
+            ExecResponder::new(&NoRecordSink, None, NotifyConfig::default()),
             || Err(TraitError::new(ErrorCode::AlreadyExists, "exists")),
             || panic!("cleanup must not run for a cgroup we did not create"),
             |_, _, _| panic!("worker must not run"),
         )
         .unwrap_err();
         assert_eq!(err.error.code(), ErrorCode::AlreadyExists);
+    }
+
+    /// 記録を捨てる記録先（応答者を作る試験の入力）。
+    struct NoRecordSink;
+
+    impl AuditSink for NoRecordSink {
+        fn record(&self, _record: &AuditRecord) -> Result<(), TraitError> {
+            Ok(())
+        }
     }
 
     fn sample_outcome() -> ExecOutcome {
@@ -3153,6 +3375,7 @@ mod tests {
             entrypoint_mode: EntrypointExecMode::SealedCopy,
             stale_exec_cgroups: ExecCgroupSweep::default(),
             seccomp_listener: ExecListenerHandover::NotApplicable,
+            seccomp_audit: ExecSeccompAudit::NOT_APPLICABLE,
         }
     }
 

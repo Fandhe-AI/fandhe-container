@@ -67,6 +67,8 @@ crates/cli の対象外: `REAP_LIMIT`（`Duration`。FFI ではない）、`mask
 
 ## 適用状況
 
-crates/cli（#1838）は適用済み。残りの crate は #1840〜#1849。`sys` に新しい宣言を足す PR は同じ PR で照合も足す（`.claude/rules/coding-rust.md`）。関連: `.claude/rules/ci.md`「クロス型検査」。
+crates/cli（#1838）と crates/oci（#2590。#1837 の範囲に入れる。2026-10-23 のオーナー判断）は適用済み。残りの crate は #1840〜#1849。`sys` に新しい宣言を足す PR は同じ PR で照合も足す（`.claude/rules/coding-rust.md`）。関連: `.claude/rules/ci.md`「クロス型検査」。
+
+crates/oci の対象外（理由は照合モジュールのコメント）: FFI でない安全なラッパー群、`openat2` に渡す大きさ（`OpenHow` のサイズ照合に含まれる）、`struct linux_dirent64`（カーネルの構造体で `libc` に無い。ヘッダ部のオフセットが一致する `libc::dirent64` で `for_each_dirent` の `NAME_OFFSET` と `d_reclen` の位置を代わりに照合）。oci の `O_*` は `open_how.flags` に合わせて `u64` のため、`libc` の `c_int` を負でないことを確かめて広げて比べる。
 
 なお rustdoc は dev-dependencies を解決しないため、`#[cfg(test)]` の外のドキュメントコメントから `libc::…` へ intra-doc リンクを張らない（バッククォートのみ。#1300）。

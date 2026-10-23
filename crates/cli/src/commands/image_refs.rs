@@ -40,6 +40,8 @@
 //! 1. `/` も `@` も含まず、最初の `:` より前が digest のアルゴリズム名（`sha256`・`sha384`・`sha512`）の入力は digest の指定。
 //!    `sha256:<小文字 hex 64 桁>` だけを受け、それ以外は `INVALID_ARGUMENT`（oci の `ImageReference::parse` が
 //!    `sha256:AAAA…` を repository `sha256` のタグと誤読するため、先にここで拒否する）。
+//!    この規則 1 は `image rm` / `image tag`（`image::parse_ref`）と [`is_bare_digest_form`] で共有する。`name@digest` の扱いだけは
+//!    意図して異なり、rm / tag は既存契約（#2221・#2316）の digest 優先で受ける（理由は `image` module doc）。
 //! 2. それ以外は oci の `ImageReference::parse`（Docker 互換の正規化。ホスト省略は `registry-1.docker.io`、単一成分は `library/`、
 //!    タグ省略は `latest`）でタグ参照にする。repository 名が `sha256` のイメージは `docker.io/library/sha256:tag` と書けばよい。
 //! 3. 解析に失敗する入力と `name@digest`・`name:tag@digest` は `INVALID_ARGUMENT`（素の digest で指定する。将来広げる余地はある）。
@@ -82,14 +84,20 @@ pub(super) enum CreateImageRef {
 
 const MSG_BAD_IMAGE: &str = "image must be a sha256 manifest digest or a tag reference";
 
+/// digest に見える入力（`/` も `@` も含まず、最初の `:` より前が digest のアルゴリズム名）か。
+/// `create --image` と `image rm` / `image tag` が共有する判別規則 1 の述語（ストアにも環境にも触れない）。
+pub(super) fn is_bare_digest_form(input: &str) -> bool {
+    !input.contains(['/', '@'])
+        && input
+            .split_once(':')
+            .is_some_and(|(algo, _)| matches!(algo, "sha256" | "sha384" | "sha512"))
+}
+
 /// `--image` の値を digest かタグ参照かに判別する（規則は module doc。ストアにも環境にも触れない純関数）。
 /// 外部入力なので `unwrap`・添字は使わず、エラー文言は固定（入力を含めない）。
 pub(super) fn classify_create_image(input: &str) -> Result<CreateImageRef, TraitError> {
     let bad = || TraitError::new(ErrorCode::InvalidArgument, MSG_BAD_IMAGE);
-    if !input.contains(['/', '@'])
-        && let Some((algo, _)) = input.split_once(':')
-        && matches!(algo, "sha256" | "sha384" | "sha512")
-    {
+    if is_bare_digest_form(input) {
         return ImageManifestDigest::new(input).map(CreateImageRef::Manifest);
     }
     let r = ImageReference::parse(input).map_err(|_| bad())?;
@@ -259,6 +267,24 @@ impl ContainerImageRefs for StoreImageRefs<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// OCI-7・CLI-1（#2600）: digest 風入力の述語（create と rm / tag が共有）。
+    #[test]
+    fn oci7_is_bare_digest_form() {
+        for t in ["sha256:x", "sha512:x", "sha384:x", "sha256:", "sha256:AAAA"] {
+            assert!(is_bare_digest_form(t), "{t}");
+        }
+        for t in [
+            "sha1:x",
+            "sha256",
+            "a/sha256:x",
+            "x@sha256:y",
+            "docker.io/library/sha256:v1",
+            "busybox:v2",
+        ] {
+            assert!(!is_bare_digest_form(t), "{t}");
+        }
+    }
+
     use super::*;
     use fandhe_container_core::traits::ErrorCode;
     use fandhe_container_oci::image_management::ManifestComposition;

@@ -761,6 +761,60 @@ mod linux {
             std::fs::metadata("/proc/self").unwrap().uid()
         }
 
+        /// stub の起動確認（REPAIR-5）。ETXTBSY の再試行と子の終了待ちを同じ期限で縛り、期限切れなら
+        /// kill して有限時間内に回収したうえで `TimedOut` を返す。
+        fn probe_exec(p: &Path, limit: Duration) -> std::io::Result<()> {
+            let deadline = Instant::now() + limit;
+            loop {
+                let spawned = std::process::Command::new(p)
+                    .arg("--fc-probe")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                let mut child = match spawned {
+                    Err(e) if e.raw_os_error() == Some(26) && Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                    Ok(c) => c,
+                };
+                loop {
+                    if child.try_wait()?.is_some() {
+                        return Ok(());
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        // kill 後の回収も期限付きで行う（SIGKILL なので通常は即時）。
+                        let reap_until = Instant::now() + Duration::from_secs(5);
+                        while child.try_wait()?.is_none() && Instant::now() < reap_until {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "probe did not exit before deadline",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+
+        /// REPAIR-5: 終了しないプローブは期限で kill され、`TimedOut` が返る。
+        #[test]
+        fn repair5_probe_exec_kills_hanging_child() {
+            let d = tmp("probehang");
+            let p = d.join("hang");
+            std::fs::write(&p, "#!/bin/sh\nexec sleep 30\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let t = Instant::now();
+            let e = probe_exec(&p, Duration::from_millis(300)).unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::TimedOut);
+            assert!(t.elapsed() < Duration::from_secs(8));
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
         fn stub(dir: &Path, body: &str) -> UserDbLookup {
             let p = dir.join("getent");
             let _ = std::fs::remove_file(&p);
@@ -773,24 +827,7 @@ mod linux {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
             // 並列テストの別スレッドの fork が書き込み fd を exec 前に抱えている間は、exec が ETXTBSY
             // （Text file busy）になり、本体の spawn 失敗が LookupFailed に化ける。exec できるまで待つ。
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                match std::process::Command::new(&p)
-                    .arg("--fc-probe")
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                {
-                    Err(e) if e.raw_os_error() == Some(26) && Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    r => {
-                        r.expect("stub getent must be executable");
-                        break;
-                    }
-                }
-            }
+            probe_exec(&p, Duration::from_secs(10)).expect("stub getent must be executable");
             UserDbLookup::custom(
                 vec![p],
                 Duration::from_secs(5),

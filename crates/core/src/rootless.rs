@@ -1577,24 +1577,24 @@ fn holder_await_release_inner(
         }
     }
 }
-/// 書き込み先が今すぐ書けないときは出力を捨てる診断用ライター(#2551・CORE-6・SEC-5・REPAIR-5)。
+/// 待たずに送れる出力先にだけ書き、それ以外は出力を捨てる診断用ライター(#2551・CORE-6・SEC-5・REPAIR-5)。
 ///
-/// 本番の `stderr` は呼び出し元が与えた pipe・socket の可能性があり、読み手が止まって満杯だと `write` が無期限に
-/// ブロックする。holder・mapper の失敗経路(期限切れの kill・回収を含む)を診断で止めないため、書く前に
-/// `poll(POLLOUT, 0)` で空きを確かめ、無ければ書かずに成功を装って捨てる(診断は最善努力で、応答・終了コードに影響しない)。
-/// 1 回の書き込みは 512 バイトに切る(pipe は空きが `PIPE_BUF` 以上のときだけ `POLLOUT` になる)。
+/// 本番の `stderr` は呼び出し元が与えた pipe・socket・ファイルの可能性があり、読み手が止まって満杯だと `write` が
+/// 無期限にブロックする。`poll(POLLOUT, 0)` は後続の `write` が待たないことを保証しない(別プロセスが直後に空きを
+/// 埋め得る。通常ファイルは停止した FUSE / NFS でも書込み可能と返る)ため、poll 後のブロッキング `write` は使わない。
+/// `sys::send_nonblocking_unix`(`MSG_DONTWAIT`)で送れる AF_UNIX socket にだけ書き、それ以外の出力先・`EAGAIN`・
+/// その他の失敗は成功を装って捨てる(診断は最善努力で、応答・終了コード・holder の寿命上限に影響しない)。
 pub(crate) struct NonBlockingDiag<W: std::io::Write + std::os::fd::AsFd>(pub(crate) W);
 
 impl<W: std::io::Write + std::os::fd::AsFd> std::io::Write for NonBlockingDiag<W> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = buf.len().min(512);
-        if n == 0 || !sys::poll_writable_now(self.0.as_fd()) {
-            return Ok(buf.len());
+        if n == 0 {
+            return Ok(0);
         }
-        match self.0.write(&buf[..n]) {
-            Ok(w) => Ok(w),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(buf.len()),
-            Err(e) => Err(e),
+        match sys::send_nonblocking_unix(self.0.as_fd(), &buf[..n]) {
+            Ok(w) if w > 0 => Ok(w),
+            _ => Ok(buf.len()),
         }
     }
 
@@ -2663,17 +2663,15 @@ mod tests {
         child.wait().expect("wait");
     }
 
-    /// REPAIR-5・SEC-5(#2551): 読み手が止まって満杯の pipe を stderr に見立てても、`NonBlockingDiag` は
+    /// REPAIR-5・SEC-5(#2551): 読み手が止まって満杯の AF_UNIX socket を stderr に見立てても、`NonBlockingDiag` は
     /// 待たずに戻り、ブロックする素の `write` と違って holder の期限切れの経路を止めない。
     #[test]
-    fn sec5_nonblocking_diag_does_not_stall_on_full_pipe() {
+    fn sec5_nonblocking_diag_does_not_stall_on_full_socket() {
         use std::io::Write as _;
-        let (_r, mut w) = std::io::pipe().expect("pipe");
-        // 満杯にする(`POLLOUT` が立たなくなるまで書く)。
+        let (w, _r) = std::os::unix::net::UnixStream::pair().expect("pair");
+        // 満杯にする(`EAGAIN` になるまで待たずに送る)。
         let chunk = [b'x'; 512];
-        while sys::poll_writable_now(std::os::fd::AsFd::as_fd(&w)) {
-            w.write_all(&chunk).expect("fill");
-        }
+        while sys::send_nonblocking_unix(std::os::fd::AsFd::as_fd(&w), &chunk).is_ok() {}
         let mut diag = NonBlockingDiag(w);
         let t = Instant::now();
         writeln!(diag, "fandhe-container: userns holder: release wait ended").expect("dropped");
@@ -2696,6 +2694,20 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(3));
         child.kill().expect("kill");
         child.wait().expect("wait");
+    }
+
+    /// REPAIR-5(#2551): pipe など待たない送信を保証できない出力先には書かず、`EAGAIN` でもエラーにせず捨てる。
+    #[test]
+    fn repair5_nonblocking_diag_discards_for_non_socket() {
+        use std::io::Read as _;
+        use std::io::Write as _;
+        let (mut r, w) = std::io::pipe().expect("pipe");
+        let mut diag = NonBlockingDiag(w);
+        writeln!(diag, "dropped").expect("discarded without error");
+        drop(diag);
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).expect("eof");
+        assert_eq!(got, Vec::<u8>::new());
     }
 
     /// SEC-5・CORE-6・REPAIR-5(#2551): 本番の kill で、SIGSTOP で止められた mapper のセッションも SIGKILL で終わり、

@@ -76,6 +76,10 @@ fn caller_process(
         70,
     )
     .map_err(|e| fail(&format!("fork holder: {e:?}")))?;
+    // 後始末のため、起動した子の pid を判明した順に親へ報告する(失敗しても親が未回収の子を漏れなく回収できる)。
+    report
+        .write_all(&holder_pid.to_be_bytes())
+        .map_err(|e| fail(&e.to_string()))?;
     let mut ctl = ctl;
     ctl.set_read_timeout(Some(timeout))
         .map_err(|e| fail(&e.to_string()))?;
@@ -107,6 +111,9 @@ fn caller_process(
         .trim()
         .parse()
         .map_err(|_| fail("helper pid not a number"))?;
+    report
+        .write_all(&[mapper_pid.to_be_bytes(), helper_pid.to_be_bytes()].concat())
+        .map_err(|e| fail(&e.to_string()))?;
     let handle = ProcHandle::open(TargetPid::new(mapper_pid).map_err(|e| fail(&e.to_string()))?)
         .map_err(|e| fail(&e.to_string()))?;
     let t = Instant::now();
@@ -125,11 +132,8 @@ fn caller_process(
     if MapperReply::decode(&buf) != Ok(MapperReply::Ok) {
         return Err(fail("holder did not anchor the mapper"));
     }
-    let mut out = [0u8; 12];
-    out[..4].copy_from_slice(&holder_pid.to_be_bytes());
-    out[4..8].copy_from_slice(&mapper_pid.to_be_bytes());
-    out[8..].copy_from_slice(&helper_pid.to_be_bytes());
-    report.write_all(&out).map_err(|e| fail(&e.to_string()))?;
+    // 準備完了の合図(1 バイト)。
+    report.write_all(&[1]).map_err(|e| fail(&e.to_string()))?;
     // 呼び出し元の SIGKILL を待つ(上限つき)。
     std::thread::sleep(Duration::from_secs(60));
     Ok(())
@@ -163,6 +167,11 @@ struct LiveChildren(std::cell::RefCell<Vec<u32>>);
 impl LiveChildren {
     fn new(pids: &[u32]) -> Self {
         Self(std::cell::RefCell::new(pids.to_vec()))
+    }
+
+    /// 起動した未回収の子 `pid` を集合へ加える。
+    fn add(&self, pid: u32) {
+        self.0.borrow_mut().push(pid);
     }
 
     /// 回収した `pid` を集合から外す。
@@ -212,16 +221,31 @@ pub fn observe_holder_expiry(
     report_rd
         .set_read_timeout(Some(Duration::from_secs(15)))
         .map_err(|e| fail(&e.to_string()))?;
-    let mut out = [0u8; 12];
-    if let Err(e) = report_rd.read_exact(&mut out) {
-        let _ = sys::kill_pid(caller, sys::Signal::Kill);
-        return Err(fail(&format!("caller did not report: {e}")));
-    }
-    let pid_at = |i: usize| u32::from_be_bytes([out[i], out[i + 1], out[i + 2], out[i + 3]]);
-    let (holder_pid, mapper_pid, helper_pid) = (pid_at(0), pid_at(4), pid_at(8));
-    // holder・mapper・helper は孤児になった後に subreaper の自分の子として再親付けされた未回収の子である。
-    let live = LiveChildren::new(&[caller, holder_pid, mapper_pid, helper_pid]);
+    // 子の pid は判明した順に届く。未回収の自分の子の集合は caller の fork 直後から持ち、どの段階で失敗しても
+    // 期限つきで停止・回収する(caller を先に消して回収し、孤児になった holder・mapper・helper を subreaper の
+    // 自分の子として回収する)。
+    let live = LiveChildren::new(&[caller]);
     let cleanup = || live.kill_and_reap();
+    let mut pids = [0u8; 12];
+    if let Err(e) = report_rd.read_exact(&mut pids[..4]) {
+        cleanup();
+        return Err(fail(&format!("caller did not report the holder: {e}")));
+    }
+    let pid_at = |b: &[u8; 12], i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    let holder_pid = pid_at(&pids, 0);
+    live.add(holder_pid);
+    if let Err(e) = report_rd.read_exact(&mut pids[4..]) {
+        cleanup();
+        return Err(fail(&format!("caller did not report the mapper: {e}")));
+    }
+    let (mapper_pid, helper_pid) = (pid_at(&pids, 4), pid_at(&pids, 8));
+    live.add(mapper_pid);
+    live.add(helper_pid);
+    let mut ready = [0u8; 1];
+    if let Err(e) = report_rd.read_exact(&mut ready) {
+        cleanup();
+        return Err(fail(&format!("caller did not report ready: {e}")));
+    }
     // helper と mapper を止め、呼び出し元を消す。以降、holder が止めない限り helper は socket を握り続ける。
     let stop = std::num::NonZeroU8::new(19).ok_or_else(|| fail("signal"))?;
     for p in [helper_pid, mapper_pid] {

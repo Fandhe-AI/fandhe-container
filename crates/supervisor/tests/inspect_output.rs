@@ -521,7 +521,7 @@ fn sec4_2601_audit_coverage_record_failed_is_reported() {
     let V::Obj(f) = &m["auditCoverage"] else {
         panic!("auditCoverage must be an object");
     };
-    assert_eq!(f.first(), Some(&("policy".to_string(), s("best_effort"))));
+    assert_eq!(f.first(), Some(&("policy".to_string(), s("best-effort"))));
     assert_eq!(f.last(), Some(&("record".to_string(), s("failed"))));
 }
 

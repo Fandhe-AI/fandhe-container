@@ -1279,6 +1279,8 @@ impl DeleteStateResponse {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+    use std::collections::{BinaryHeap, HashMap};
+    use std::sync::{Arc, Mutex};
 
     /// inspect の語彙は固定（SUP-9・#2601）。
     #[test]
@@ -1286,9 +1288,6 @@ mod tests {
         assert_eq!(ExplicitStop::NotRecorded.as_str(), "not_recorded");
         assert_eq!(ExplicitStop::Recorded.as_str(), "recorded");
     }
-
-    use std::collections::{BinaryHeap, HashMap};
-    use std::sync::{Arc, Mutex};
 
     /// [`StubStateStore::list`] の有界選択で使う比較用ラッパー。`StateRecord` 自体は
     /// 状態・revision も含むため `Ord` を持たず、id のみで全順序を与える。

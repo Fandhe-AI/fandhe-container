@@ -764,8 +764,33 @@ mod linux {
         fn stub(dir: &Path, body: &str) -> UserDbLookup {
             let p = dir.join("getent");
             let _ = std::fs::remove_file(&p);
-            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            // 先頭の 1 行は起動確認用（`--fc-probe` なら何もせず終了）。
+            std::fs::write(
+                &p,
+                format!("#!/bin/sh\n[ \"$1\" = --fc-probe ] && exit 0\n{body}\n"),
+            )
+            .unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // 並列テストの別スレッドの fork が書き込み fd を exec 前に抱えている間は、exec が ETXTBSY
+            // （Text file busy）になり、本体の spawn 失敗が LookupFailed に化ける。exec できるまで待つ。
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match std::process::Command::new(&p)
+                    .arg("--fc-probe")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                {
+                    Err(e) if e.raw_os_error() == Some(26) && Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    r => {
+                        r.expect("stub getent must be executable");
+                        break;
+                    }
+                }
+            }
             UserDbLookup::custom(
                 vec![p],
                 Duration::from_secs(5),

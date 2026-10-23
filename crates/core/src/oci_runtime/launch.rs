@@ -1551,7 +1551,25 @@ mod tests {
         );
     }
 
-    /// SEC-4・ESC-06・#2004: テスト用の記録先。`fail` なら常に `Err`。
+    /// SEC-4・ESC-06・#2004: テスト用の記録先。`fail` なら常に `Err`。`pid` は spawn 済みの子。
+    #[cfg(target_os = "linux")]
+    fn audit_wrap(
+        pid: u32,
+        fail: bool,
+    ) -> (
+        ContainerChildProcess,
+        Arc<crate::audit_log::mount::tests::VecSink>,
+        u32,
+    ) {
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(fail));
+        let process =
+            ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
+                .expect("wrap")
+                .with_exit_audit(sink.clone(), ContainerId::new("c1").expect("id"));
+        (process, sink, pid)
+    }
+
+    /// `sh -c <script>` の子を起動して `audit_wrap` で包む（SIGSYS を使わない試験用）。
     #[cfg(target_os = "linux")]
     fn exit_audit_process(
         script: &str,
@@ -1568,25 +1586,93 @@ mod tests {
             .spawn()
             .expect("spawn")
             .id();
-        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(fail));
-        let process =
-            ContainerChildProcess::new(crate::exec::ContainerChild::from_pid_for_test(pid))
-                .expect("wrap")
-                .with_exit_audit(sink.clone(), ContainerId::new("c1").expect("id"));
-        (process, sink, pid)
+        audit_wrap(pid, fail)
+    }
+
+    /// 子側の目印。立っているとき、試験は本体を実行せず `become_sigsys_child` へ入る（#2538）。
+    #[cfg(target_os = "linux")]
+    const SIGSYS_CHILD_MARK: &str = "FANDHE_TEST_SIGSYS_CHILD";
+
+    /// SIGSYS で死ぬ子の本体（自テストバイナリの再実行先）。non-dumpable にしてから自分へ SIGSYS を送る。
+    ///
+    /// SIGSYS の既定動作は core dump で、`core_pattern` が apport 等のパイプだと RLIMIT_CORE=0 でも
+    /// カーネルが helper の終了まで子を回収可能にしない。helper は直列に処理されるため、並列の試験が
+    /// 重なると `wait(10s)` が `None` で期限切れになった（#2538）。non-dumpable なら core を作らず、
+    /// 即座に `Signaled(31)` になる。`sh` では `execve` が dumpable を戻すので自バイナリで行う。
+    /// 終了コード: 71 = non-dumpable にできない・72 = SIGSYS を送れない・73 = SIGSYS の後も生きていた。
+    /// 親は `Signaled(31)` を期待するので、いずれも親の照合で検出される。
+    #[cfg(target_os = "linux")]
+    fn become_sigsys_child() -> ! {
+        if crate::sys::set_non_dumpable().is_err() {
+            std::process::exit(71);
+        }
+        let sig = std::num::NonZeroU8::new(31).map(crate::sys::Signal::Number);
+        let Some(sig) = sig else {
+            std::process::exit(72)
+        };
+        if crate::sys::kill_pid(std::process::id(), sig).is_err() {
+            std::process::exit(72);
+        }
+        std::thread::sleep(Duration::from_secs(30));
+        std::process::exit(73);
+    }
+
+    /// 自テストバイナリを `test_name`（`--exact` の完全名）で再実行し、SIGSYS で死ぬ子として包む（#2538）。
+    /// 名前を誤ると子は 0 件実行で `Exited(0)` になり、`Signaled(31)` の照合が落ちる（fail-closed）。
+    #[cfg(target_os = "linux")]
+    fn sigsys_exit_audit_process(
+        test_name: &str,
+        fail: bool,
+    ) -> (
+        ContainerChildProcess,
+        Arc<crate::audit_log::mount::tests::VecSink>,
+        u32,
+    ) {
+        #[allow(clippy::zombie_processes)]
+        let pid = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", test_name, "--test-threads=1", "--quiet"])
+            .env(SIGSYS_CHILD_MARK, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn")
+            .id();
+        audit_wrap(pid, fail)
+    }
+
+    /// 期限切れ時の診断用に `/proc/<pid>/status` の `State`・`CoreDumping` 行を返す（REPAIR-4）。
+    #[cfg(target_os = "linux")]
+    fn proc_status_excerpt(pid: u32) -> String {
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .map(|s| {
+                s.lines()
+                    .filter(|l| l.starts_with("State:") || l.starts_with("CoreDumping:"))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+            .unwrap_or_else(|_| "<unavailable>".to_string())
     }
 
     /// SEC-4・ESC-06・#2004: SIGSYS 終了を回収すると `exit_signal` が 1 件出る。seccomp を経ない
-    /// （`kill -SYS`）ので syscall・arch は持たない（終了シグナルから syscall を推測しない）。
+    /// （自己 SIGSYS）ので syscall・arch は持たない（終了シグナルから syscall を推測しない）。
     /// `wait` の再呼び出しや `terminate` でも件数は 1 のまま。
     #[cfg(target_os = "linux")]
     #[test]
     fn sec4_2004_sigsys_exit_records_exit_signal_once_without_syscall() {
-        let (process, sink, pid) = exit_audit_process("kill -SYS $$; sleep 30", false);
+        if std::env::var_os(SIGSYS_CHILD_MARK).is_some() {
+            become_sigsys_child();
+        }
+        let (process, sink, pid) = sigsys_exit_audit_process(
+            "oci_runtime::launch::tests::sec4_2004_sigsys_exit_records_exit_signal_once_without_syscall",
+            false,
+        );
         let t = Duration::from_secs(10);
         assert_eq!(
             process.wait(t).expect("wait"),
-            Some(ProcessExit::Signaled(31))
+            Some(ProcessExit::Signaled(31)),
+            "{}",
+            proc_status_excerpt(pid)
         );
         assert_eq!(
             process.wait(Duration::ZERO).expect("wait again"),
@@ -1609,7 +1695,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec4_2236_concurrent_reap_points_record_exit_signal_once() {
-        let (process, sink, _) = exit_audit_process("kill -SYS $$; sleep 30", false);
+        if std::env::var_os(SIGSYS_CHILD_MARK).is_some() {
+            become_sigsys_child();
+        }
+        let (process, sink, _) = sigsys_exit_audit_process(
+            "oci_runtime::launch::tests::sec4_2236_concurrent_reap_points_record_exit_signal_once",
+            false,
+        );
         let t = Duration::from_secs(10);
         std::thread::scope(|s| {
             for _ in 0..4 {
@@ -1645,10 +1737,18 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sec4_2004_sink_failure_does_not_change_exit() {
-        let (process, _sink, _) = exit_audit_process("kill -SYS $$; sleep 30", true);
+        if std::env::var_os(SIGSYS_CHILD_MARK).is_some() {
+            become_sigsys_child();
+        }
+        let (process, _sink, pid) = sigsys_exit_audit_process(
+            "oci_runtime::launch::tests::sec4_2004_sink_failure_does_not_change_exit",
+            true,
+        );
         assert_eq!(
             process.wait(Duration::from_secs(10)).expect("wait"),
-            Some(ProcessExit::Signaled(31))
+            Some(ProcessExit::Signaled(31)),
+            "{}",
+            proc_status_excerpt(pid)
         );
     }
 }

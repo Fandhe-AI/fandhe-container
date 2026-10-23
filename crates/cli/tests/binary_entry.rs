@@ -1811,8 +1811,8 @@ fn cli1_cli2_setup_on_macos_prints_steps_with_instructions() {
     assert_eq!(
         String::from_utf8(out.stdout).expect("utf8"),
         concat!(
-            "{\"step\":\"virtualization-entitlement\",\"requires_admin\":false,\"status\":\"manual\",\"instructions\":\"The macOS backend plugin fandhe-container-plugin-macos must be code-signed with the com.apple.security.virtualization entitlement (ad-hoc signing is accepted), e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.virtualization> <path to fandhe-container-plugin-macos>. fandhe-container does not sign binaries.\"}\n",
-            "{\"step\":\"macos-min-version\",\"requires_admin\":false,\"status\":\"manual\",\"instructions\":\"Requires macOS 13 or later (provisional minimum for Virtualization.framework). Check with sw_vers -productVersion. fandhe-container does not check or upgrade macOS.\"}\n"
+            "{\"step\":\"virtualization-entitlement\",\"requires_admin\":false,\"status\":\"manual\",\"instructions\":\"The macOS backend plugin fandhe-container-plugin-macos must be code-signed with the com.apple.security.virtualization entitlement (ad-hoc signing is accepted), e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.virtualization> <path to fandhe-container-plugin-macos>. fandhe-container does not sign binaries. See docs/setup/macos.md\"}\n",
+            "{\"step\":\"macos-min-version\",\"requires_admin\":false,\"status\":\"manual\",\"instructions\":\"Requires macOS 13 or later (provisional minimum for Virtualization.framework). Check with sw_vers -productVersion. fandhe-container does not check or upgrade macOS. See docs/setup/macos.md\"}\n"
         )
     );
     assert_eq!(
@@ -2767,4 +2767,89 @@ fn oci7_create_with_tag_ref_resolves_persisted_tag_on_linux() {
         .manifest_references(&Digest::parse(&manifest).expect("d"));
     assert_eq!(refs.containers.len(), 1);
     assert!(refs.containers[0].as_str().ends_with(".c1"));
+}
+/// 隣に置いた偽ランチャーで `doctor` を実行し、`check":"launcher"` の行と終了コードを返す。
+/// 一意のディレクトリ名（タグ）が出力に載らないことも照合する（REPAIR-4）。root では検査を省くため `None`。
+#[cfg(target_os = "linux")]
+fn doctor_launcher_line(tag: &str, launcher_mode: Option<&str>) -> Option<(Option<String>, i32)> {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return None;
+    }
+    let dir = isolated_cli_dir(tag);
+    if let Some(mode) = launcher_mode {
+        install_fake_exe(&dir, "fandhe-container-launcher", "exit 0");
+        let mode = u32::from_str_radix(mode, 8).expect("octal");
+        std::fs::set_permissions(
+            dir.join("fandhe-container-launcher"),
+            std::fs::Permissions::from_mode(mode),
+        )
+        .expect("chmod");
+    }
+    let out = run_isolated(&dir.join("fandhe-container"), &["doctor"]);
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let unique = dir.file_name().and_then(|n| n.to_str()).expect("name");
+    assert!(!stdout.contains(unique), "{stdout}");
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("\"check\":\"launcher\""))
+        .map(str::to_owned);
+    Some((line, out.status.code().expect("code")))
+}
+
+/// SUP-14・CORE-6・CLI-1（#2599）: 隣にランチャーが無い rootless のインストールは通知の 1 行。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup14_doctor_reports_absent_launcher() {
+    let Some((line, _)) = doctor_launcher_line("doctor-launcher-absent", None) else {
+        return;
+    };
+    assert_eq!(
+        line.expect("launcher line"),
+        "{\"severity\":\"notice\",\"code\":\"PRIVILEGED_LAUNCHER_ABSENT\",\"message\":\"no privileged launcher is installed beside the cli executable; start uses the rootless direct path\",\"remediation\":[\"For a rootful install, run scripts/install-privileged-launcher.sh as root so fandhe-container-launcher is placed beside the cli\"],\"check\":\"launcher\",\"state\":\"absent\"}"
+    );
+}
+
+/// SUP-14・CORE-6・CLI-1（#2599）: group 書き込み可のランチャーは信頼せず warning・終了コード 3。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup14_doctor_reports_untrusted_launcher() {
+    let Some((line, code)) = doctor_launcher_line("doctor-launcher-untrusted", Some("775")) else {
+        return;
+    };
+    let line = line.expect("launcher line");
+    assert!(
+        line.starts_with(
+            "{\"severity\":\"warning\",\"code\":\"PRIVILEGED_LAUNCHER_UNTRUSTED\",\"message\":\"the privileged launcher beside the cli executable is not trusted;"
+        ),
+        "{line}"
+    );
+    assert!(
+        line.ends_with("\"check\":\"launcher\",\"state\":\"file_mode\"}"),
+        "{line}"
+    );
+    assert_eq!(code, 3);
+}
+
+/// SUP-14・CORE-6・CLI-1（#2599）: 信頼できるが file capability も setuid root も無いランチャーは warning・終了コード 3
+/// （非 root では file capability を付けられないため、昇格手段なしの経路を実ファイルで照合する）。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup14_doctor_reports_launcher_without_elevation() {
+    let Some((line, code)) = doctor_launcher_line("doctor-launcher-noelev", Some("755")) else {
+        return;
+    };
+    let line = line.expect("launcher line");
+    assert!(
+        line.starts_with(
+            "{\"severity\":\"warning\",\"code\":\"LAUNCHER_ELEVATION_UNAVAILABLE\",\"message\":\"the privileged launcher has neither file capabilities nor the setuid root bit; start cannot elevate\","
+        ),
+        "{line}"
+    );
+    assert!(
+        line.ends_with("\"check\":\"launcher\",\"state\":\"no_file_capabilities\"}"),
+        "{line}"
+    );
+    assert_eq!(code, 3);
 }

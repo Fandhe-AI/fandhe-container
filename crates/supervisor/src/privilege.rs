@@ -93,6 +93,22 @@ pub fn runtime_required_capabilities() -> CapabilitySet {
         .fold(CapabilitySet::empty(), |s, c| s.with(*c))
 }
 
+/// 方式 (c)［`PrivilegeMethod::LauncherAmbient`］のランチャーに file capability として付ける集合
+/// （[`RUNTIME_REQUIRED_CAPABILITIES`] に、補助グループを持つ利用者向けの `CAP_SETGID` を足したもの。[`elevate`] の契約）。
+///
+/// `scripts/install-privileged-launcher.sh` の `LAUNCHER_CAPS` と同期する（`launcher_probe` の単体試験が機械照合する）。
+/// `doctor` の特権ランチャー診断（#2599・SUP-14）が「付いているべき集合」として使う。
+pub fn launcher_file_capabilities() -> CapabilitySet {
+    runtime_required_capabilities().with(Capability::Setgid)
+}
+
+/// [`launcher_file_capabilities`] のビット列（bit n が capability 番号 n。`security.capability` の permitted と同じ並び）。
+pub fn launcher_file_capability_mask() -> u64 {
+    launcher_file_capabilities()
+        .iter()
+        .fold(0u64, |m, c| m | (1u64 << c.index()))
+}
+
 /// 検証失敗の理由分類（機械可読）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1740,6 +1756,14 @@ mod tests {
     /// 最小集合 + `CAP_SETGID`（bit 6）。方式 (c) で補助グループを持つ利用者の file capability。
     const MIN_SETGID: &str = "0000000028201162";
     const NONE: &str = "0000000000000000";
+
+    /// SUP-14・#2599: ランチャーの file capability の期待集合は最小集合 + `CAP_SETGID` ちょうど。
+    #[test]
+    fn sup14_launcher_file_capability_mask_is_exact() {
+        assert_eq!(launcher_file_capability_mask(), 0x0000_0000_2820_1162);
+        assert_eq!(launcher_file_capabilities().len(), 8);
+        assert!(launcher_file_capabilities().contains(Capability::Setgid));
+    }
     /// 方式 (a): real は非 root、effective / saved / fs が 0（setuid root を非 root が起動した状態）。
     const SETUID_UID: &str = "1000\t0\t0\t0";
 

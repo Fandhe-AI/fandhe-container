@@ -34,8 +34,9 @@
 //! `register_tag` の不変条件違反として `DataLoss` とする。group / other に書き込み権のあるファイル
 //! （`PermissionDenied`）・symlink・通常ファイル以外（`Internal`）も拒否する。
 //!
-//! root の所有者 / 0700 の検査は未実装（`store` モジュールの前提。#2381）。root は所有者専用の
-//! ディレクトリである前提で、ここでは通常ファイル・symlink・権限・dev/ino だけを見る。
+//! root の所有者・権限・祖先の検査は `ImageStore::open` が行い、`lock` と create ゲートの取得ごとに
+//! 再検査する（#2381・#2547。unix のみ）。root は所有者専用のディレクトリである前提で、ここでは
+//! 通常ファイル・symlink・権限・dev/ino だけを見る。
 //!
 //! # 既知の残り（実装済みを装わない。REPAIR-3）
 //!

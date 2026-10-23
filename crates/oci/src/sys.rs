@@ -7,7 +7,17 @@
 //! `image_management::store` の `ImageStore::open` / `with_table` が、イメージストア root と祖先ディレクトリの
 //! 所有者を現在プロセスの実効 uid と照合するために使う（OCI-7・SEC-1・#2381）。依存追加は禁止
 //! （dependency-policy）のため、他 crate の `sys` と同じ流儀で `extern "C"` 宣言を自前で持つ。
-//! `libc` との機械照合は oci では未導入（`docs/design/ffi-libc-check.md`）。
+//!
+//! # libc 照合をしない理由（#2547）
+//! #1318 の決定（libc は dev-dependencies のみ）の対象 crate は列挙された 9 crate で oci を含まず、#1837 の
+//! 子 issue にも oci は無い。oci へ dev 依存を足すには依存追加としてのユーザー承認が要る
+//! （dependency-policy）ため、承認を得るまで照合しない。代わりに `geteuid` は POSIX の型幅（`uid_t` = `u32`）に
+//! 合わせ、`at.rs` はカーネル uapi と libc 0.2.189 を手で突き合わせた（`at.rs` 冒頭）。承認後は
+//! `docs/design/ffi-libc-check.md` の方式で `geteuid` の型と `at.rs` の番号・フラグ・`OpenHow` のレイアウトを照合する。
+//!
+//! # macOS の拡張 ACL を宣言しない理由（#2547）
+//! macOS では本番経路が `ImageStore::open` に届かず（cli は `non_linux_failure` で先に fail-closed）、
+//! ACL の FFI と `unsafe` を足す根拠が無い。判断は `docs/design/image-store-root-trust.md`。
 //!
 //! # 契約
 //! - `unsafe fn` はこのモジュールの外へ公開しない（公開するのは安全な関数のみ）

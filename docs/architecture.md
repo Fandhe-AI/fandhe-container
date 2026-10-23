@@ -264,6 +264,7 @@ MVP における Windows 対応の主経路は WSL2 経由（WIN-1）である�
 ## 設計ドラフト（採否未決）
 
 - `VolumeProvider` の core 側実装の担当 TASK と時期（CRI-7・PLUG-1・IO-7）: [volume-provider-implementation.md](design/volume-provider-implementation.md)（#2451。オーナー承認待ち。決まるまで core に実装は無い）
+- イメージストア root の検査の基準（OCI-7・SEC-1）: [image-store-root-trust.md](design/image-store-root-trust.md)（#2547。権限ビットと所有者の基準はオーナー承認待ち。決まるまで現行を保つ）
 - macOS の既定の状態ルート（OCI-5・SEC-4）: [macos-state-root.md](design/macos-state-root.md)（#2431。オーナー承認待ち。決まるまで `resolve(None)` は `Unimplemented`）
 - Windows の実行構成（ゲスト内の core とホストの起動役。WIN-1・TASK-116 追補）: [windows-execution-layout.md](design/windows-execution-layout.md)（#1862。#1415・#1539 の決定部分以外はオーナー承認待ち）
 - Windows の `FileStateStore` の所有者 SID・保護 DACL の実装方式（OCI-5・SEC-4）: [windows-state-store-acl.md](design/windows-state-store-acl.md)（#2428。オーナー承認待ち）

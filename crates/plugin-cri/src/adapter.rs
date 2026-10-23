@@ -162,13 +162,15 @@ impl CriPluginBackends {
         // netns の pin の置き場は状態ルート配下の固定の場所（要求の入力からは受けない。TASK-114.4）。
         // 先頭が `.` のため、英数字始まりの `ContainerId` の状態ディレクトリと衝突しない。
         #[cfg(target_os = "linux")]
-        let network: Arc<dyn NetworkPlugin> = Arc::new(NetsetupNetwork::with_recorder(
+        let network: Arc<dyn NetworkPlugin> = Arc::new(NetsetupNetwork::with_reclaim_store(
             LinuxNetsetup::with_recorder(
                 root.path().join(".netns"),
                 Arc::new(CoreNetRecorder(Arc::clone(&recorder))),
             ),
-            Arc::clone(&recorder),
-        ));
+            // 作成失敗の回収待ちの記録は状態ルート配下の固定の場所に残し、再起動後に読み込む（NET-1・#2604）。
+            crate::netsetup::ReclaimStore::open(root.path())?,
+            Some(Arc::clone(&recorder)),
+        )?);
         #[cfg(not(target_os = "linux"))]
         let network: Arc<dyn NetworkPlugin> = Arc::new(UnimplementedNetwork);
         let state: Arc<dyn StateStore> = Arc::new(FileStateStore::open(root)?);

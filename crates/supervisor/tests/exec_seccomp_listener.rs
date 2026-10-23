@@ -7,7 +7,9 @@
 //! なることを具体値で照合する。root・実コンテナは不要で、既定のテスト集合で実行する。
 //!
 //! 前提: 呼び出しプロセスの外側の filter が listener を既に持たないこと（持つ環境では `EBUSY` になる）。満たさない
-//! 環境は skip せず失敗させる（`AGENTS.md`「実機前提でない試験」の注意）。
+//! 環境は skip せず失敗させる（`AGENTS.md`「実機前提でない試験」の注意）。受け渡しの後に worker に socket が残らないことの
+//! 照合は、fork の前に採った socket の基準集合との差で見る（起動元から継承した socket は数えない。実行環境で結果が変わる
+//! 前提を除く。#2603）。`inherited_socket_does_not_count_as_a_leak` が stdin を socket にした再実行で回帰を守る。
 //!
 //! #2544 の応答者の試験: filter は `USER_NOTIF` で載り、親が通知に同期で応答する。worker が拒否される syscall（`kcmp`）を
 //! 発行し、(1) 実際の記録先（`FileAuditSink` の `@audit.log`）に 1 拒否 1 行が届き `EPERM` が返ること、(2) 複数回でも 1 拒否 1 件、
@@ -39,7 +41,8 @@ mod linux {
     use fandhe_container_supervisor::exec::{
         ExecListenerHandover, ExecResponderState, UserNotifTestMode,
         apply_seccomp_listener_for_test, default_audit_sink, hand_over_non_listener_for_test,
-        run_in_worker_with_listener_for_test, run_in_worker_with_user_notif_for_test,
+        open_socket_ids_for_test, run_in_worker_with_listener_for_test,
+        run_in_worker_with_user_notif_for_test,
     };
     use fandhe_container_supervisor::seccomp_notify::NotifyConfig;
 
@@ -49,7 +52,16 @@ mod linux {
     #[cfg(target_arch = "aarch64")]
     const KCMP_NR: u32 = 272;
 
+    /// 子モードを選ぶ引数（`inherited_socket_does_not_count_as_a_leak` が自分自身を再実行するときに付ける）。
+    const CHILD_FLAG: &str = "--inherited-socket-child";
+
     pub fn run() {
+        if std::env::args().any(|a| a == CHILD_FLAG) {
+            // 子モード: stdin が継承した socket の状態で、受け渡しの試験だけを通す。
+            real_listener_is_handed_over_and_verified();
+            println!("exec_seccomp_listener: child ok");
+            return;
+        }
         real_listener_is_handed_over_and_verified();
         non_listener_fd_is_rejected_and_worker_reaped();
         worker_failure_before_seccomp_is_returned_as_is();
@@ -59,7 +71,13 @@ mod linux {
         each_denial_is_one_record();
         stuck_sink_is_answered_at_the_response_deadline();
         missing_responder_fails_closed();
+        inherited_socket_does_not_count_as_a_leak();
         println!("exec_seccomp_listener: all scenarios passed");
+    }
+
+    /// fork の前に採る、今開いている socket の基準集合（`apply_seccomp_listener_for_test` が差だけを漏れとして数える。#2603）。
+    fn baseline_sockets() -> Vec<String> {
+        open_socket_ids_for_test().expect("list the open sockets")
     }
 
     /// 後始末（子 cgroup の削除に相当）の呼び出し回数を数える。
@@ -73,18 +91,21 @@ mod linux {
     /// worker が実 listener を作って渡すと、親は検証して ACK を返し、結果は `Verified`。
     fn real_listener_is_handed_over_and_verified() {
         let cleanups = Cell::new(0);
+        let baseline = baseline_sockets();
         let outcome = run_in_worker_with_listener_for_test(
             Duration::from_secs(20),
             Duration::from_secs(10),
             counted(&cleanups),
-            apply_seccomp_listener_for_test,
+            |sender| apply_seccomp_listener_for_test(sender, &baseline),
         )
         .unwrap_or_else(|e| {
-            panic!(
-                "handover failed: {:?} {} (the caller's outer seccomp filter must not own a listener)",
-                e.code(),
-                e.message()
-            )
+            // EBUSY（外側の filter が listener を持つ）のときだけ原因の手がかりを付ける（#2603）。
+            let hint = if e.code() == ErrorCode::FailedPrecondition {
+                " (the caller's outer seccomp filter must not own a listener)"
+            } else {
+                ""
+            };
+            panic!("handover failed: {:?} {}{hint}", e.code(), e.message())
         });
         assert_eq!(outcome.seccomp_listener, ExecListenerHandover::Verified);
         assert_eq!(cleanups.get(), 1);
@@ -184,13 +205,62 @@ mod linux {
         assert_eq!(cleanups.get(), 1);
     }
 
+    /// 起動元から継承した socket（stdin が socket）があっても、受け渡しの漏れとして数えない（#2603）。
+    /// 自分自身を子として再実行し、stdin に socketpair の片端を渡して受け渡しの試験を通す。子の待ちには上限を設ける（REPAIR-5）。
+    fn inherited_socket_does_not_count_as_a_leak() {
+        use std::io::Read as _;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::{Command, Stdio};
+
+        let (kept, given) = UnixStream::pair().expect("socketpair");
+        let exe = std::env::current_exe().expect("current exe");
+        let mut child = Command::new(exe)
+            .arg(CHILD_FLAG)
+            .stdin(Stdio::from(OwnedFd::from(given)))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn the child");
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("poll the child") {
+                break status;
+            }
+            if started.elapsed() > Duration::from_secs(60) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the child did not finish within 60s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut out = String::new();
+        let mut err = String::new();
+        if let Some(mut o) = child.stdout.take() {
+            let _ = o.read_to_string(&mut out);
+        }
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut err);
+        }
+        drop(kept);
+        assert!(
+            status.success(),
+            "status={status:?} stdout={out} stderr={err}"
+        );
+        assert!(
+            out.contains("exec_seccomp_listener: child ok"),
+            "stdout={out} stderr={err}"
+        );
+    }
+
     /// worker が `kcmp` を `times` 回発行した結果を親へ返す口。1 行 `pid errno_1,errno_2,... elapsed_ms_max`。
     fn probe_in_worker(
         sender: fandhe_container_core::exec::ExecListenerSender,
         writer: &std::io::PipeWriter,
         times: usize,
+        baseline: &[String],
     ) -> Result<(), TraitError> {
-        apply_seccomp_listener_for_test(sender)?;
+        apply_seccomp_listener_for_test(sender, baseline)?;
         let mut errnos = Vec::new();
         let mut max_ms = 0u128;
         for _ in 0..times {
@@ -275,6 +345,7 @@ mod linux {
             let sink = default_audit_sink(Some(dir.clone())).expect("production audit sink");
             let id = ContainerId::new("web-1").unwrap();
             let (reader, writer) = std::io::pipe().unwrap();
+            let baseline = baseline_sockets();
             let outcome = run_in_worker_with_user_notif_for_test(
                 Duration::from_secs(30),
                 Duration::from_secs(10),
@@ -283,7 +354,7 @@ mod linux {
                 Some(&id),
                 NotifyConfig::default(),
                 UserNotifTestMode::Respond,
-                |sender| probe_in_worker(sender, &writer, 1),
+                |sender| probe_in_worker(sender, &writer, 1, &baseline),
             )
             .unwrap_or_else(|e| panic!("{:?} {}", e.code(), e.message()));
             let (worker_pid, errnos, _) = read_probe(reader);
@@ -310,6 +381,7 @@ mod linux {
         let sink = CountingSink::default();
         let id = ContainerId::new("web-1").unwrap();
         let (reader, writer) = std::io::pipe().unwrap();
+        let baseline = baseline_sockets();
         let outcome = run_in_worker_with_user_notif_for_test(
             Duration::from_secs(30),
             Duration::from_secs(10),
@@ -318,7 +390,7 @@ mod linux {
             Some(&id),
             NotifyConfig::default(),
             UserNotifTestMode::Respond,
-            |sender| probe_in_worker(sender, &writer, 3),
+            |sender| probe_in_worker(sender, &writer, 3, &baseline),
         )
         .unwrap_or_else(|e| panic!("{:?} {}", e.code(), e.message()));
         let (worker_pid, errnos, _) = read_probe(reader);
@@ -340,6 +412,7 @@ mod linux {
             .with_response_deadline(Duration::from_millis(100))
             .unwrap();
         let (reader, writer) = std::io::pipe().unwrap();
+        let baseline = baseline_sockets();
         let outcome = run_in_worker_with_user_notif_for_test(
             Duration::from_secs(30),
             Duration::from_secs(10),
@@ -348,7 +421,7 @@ mod linux {
             None,
             config,
             UserNotifTestMode::Respond,
-            |sender| probe_in_worker(sender, &writer, 1),
+            |sender| probe_in_worker(sender, &writer, 1, &baseline),
         )
         .unwrap_or_else(|e| panic!("{:?} {}", e.code(), e.message()));
         let (_, errnos, ms) = read_probe(reader);
@@ -364,6 +437,7 @@ mod linux {
     fn missing_responder_fails_closed() {
         let sink = CountingSink::default();
         let (reader, writer) = std::io::pipe().unwrap();
+        let baseline = baseline_sockets();
         let started = Instant::now();
         let outcome = run_in_worker_with_user_notif_for_test(
             Duration::from_secs(30),
@@ -373,7 +447,7 @@ mod linux {
             None,
             NotifyConfig::default(),
             UserNotifTestMode::AckThenDrop,
-            |sender| probe_in_worker(sender, &writer, 1),
+            |sender| probe_in_worker(sender, &writer, 1, &baseline),
         )
         .unwrap_or_else(|e| panic!("{:?} {}", e.code(), e.message()));
         let (_, errnos, _) = read_probe(reader);

@@ -1650,22 +1650,36 @@ pub fn run_in_worker_with_user_notif_for_test(
     .map_err(|f| f.error)
 }
 
-/// 結合試験専用: worker の中で本番と同じ listener 付きの seccomp 適用を行い、受け渡しの後に socket fd が残っていないこと
-/// （listener の受け渡しに使った socket が worker に漏れていない）まで確かめる（SEC-4・SUP-6・#2385）。
+/// 結合試験専用: worker の中で本番と同じ listener 付きの seccomp 適用を行い、受け渡しの後に受け渡しのために作った socket fd が
+/// 残っていないこと（`baseline` に無い socket が 0 件）まで確かめる（SEC-4・SUP-6・#2385・#2603）。
+/// `baseline` は [`open_socket_ids_for_test`] で fork の前に採った集合で、起動元から継承した socket を数えないための基準。
 /// worker に seccomp の filter が不可逆に載るため、[`run_in_worker_with_listener_for_test`] の `work` 専用。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
-pub fn apply_seccomp_listener_for_test(sender: ExecListenerSender) -> Result<(), TraitError> {
-    let open_sockets = fandhe_container_core::exec::apply_exec_seccomp_listener_for_test(sender)
-        .map_err(from_exec_error)?;
+pub fn apply_seccomp_listener_for_test(
+    sender: ExecListenerSender,
+    baseline: &[String],
+) -> Result<(), TraitError> {
+    let open_sockets =
+        fandhe_container_core::exec::apply_exec_seccomp_listener_for_test(sender, baseline)
+            .map_err(from_exec_error)?;
     if open_sockets == 0 {
         Ok(())
     } else {
         Err(TraitError::new(
             ErrorCode::Internal,
-            format!("exec stage Seccomp: {open_sockets} socket fd(s) remained open in the worker"),
+            format!(
+                "exec stage Seccomp: {open_sockets} socket fd(s) created for the handover remained open in the worker"
+            ),
         ))
     }
+}
+
+/// 結合試験専用: 今開いている socket fd の識別子の集合を返す（[`apply_seccomp_listener_for_test`] の基準。#2603）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn open_socket_ids_for_test() -> Result<Vec<String>, TraitError> {
+    fandhe_container_core::exec::open_socket_ids_for_test().map_err(from_exec_error)
 }
 
 /// 結合試験専用: listener ではない fd を親へ送る（親の拒否を確かめる）。常に `Err`（親が拒否して閉じた）が期待どおり。

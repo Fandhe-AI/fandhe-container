@@ -654,16 +654,47 @@ pub(crate) fn exec_sender_from(
     ExecListenerSender::new(child_end, delivery)
 }
 
-/// 試験専用: worker の中で本番と同じ seccomp の listener 付き適用（NNP → `NEW_LISTENER` 付き filter → 送信 → ACK 待ち）を行い、
-/// 受け渡しの後に開いている socket fd の数を返す（SEC-4・SUP-6・#2385。supervisor の結合試験 `exec_seccomp_listener`）。
+/// 試験専用: 呼び出しプロセスが今開いている socket fd の識別子（`/proc/self/fd` の `socket:[inode]`）を返す（SEC-4・SUP-6・#2385・#2603）。
 ///
-/// 数は 0 でなければならない（子の端は送信で消費され、継承した親の端は worker の開始時に閉じ済みのため。残っていれば
-/// listener の受け渡しに使った socket が worker に漏れている）。**呼び出しプロセスに seccomp の filter が不可逆に載る**
-/// ため、使い捨ての worker 専用。`exec-test-support` feature の下のみ。
+/// 試験の親が worker の fork（受け渡し用 socketpair の作成）より前に採り、[`apply_exec_seccomp_listener_for_test`] の
+/// 基準にする。起動元から継承した socket（stdio が socket の実行器など）は受け渡しと無関係なので、基準に含めて数えない。
+/// `exec-test-support` feature の下のみ。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn open_socket_ids_for_test() -> Result<Vec<String>, ExecError> {
+    let dir = std::fs::read_dir("/proc/self/fd").map_err(|_| {
+        ExecError::new(
+            ErrorCode::Internal,
+            IsolationStage::Seccomp,
+            "failed to list the open fds",
+        )
+    })?;
+    // `read_dir` 自身の fd も走査するが、それは socket ではない。
+    let mut ids: Vec<String> = dir
+        .flatten()
+        .filter_map(|e| std::fs::read_link(e.path()).ok())
+        .filter_map(|t| t.to_str().map(str::to_owned))
+        .filter(|s| s.starts_with("socket:["))
+        .collect();
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}
+
+/// 試験専用: worker の中で本番と同じ seccomp の listener 付き適用（NNP → `NEW_LISTENER` 付き filter → 送信 → ACK 待ち）を行い、
+/// 受け渡しの後に開いている socket fd のうち `baseline` に無いものの数を返す（SEC-4・SUP-6・#2385・#2603。
+/// supervisor の結合試験 `exec_seccomp_listener`）。
+///
+/// `baseline` は試験の親が fork の前に [`open_socket_ids_for_test`] で採った集合。数は 0 でなければならない（子の端は送信で
+/// 消費され、継承した親の端は worker の開始時に閉じ済みのため。残っていれば listener の受け渡しに使った socket が worker に
+/// 漏れている）。親は基準の socket を開いたままなので inode は再利用されず、基準との差は受け渡しのために作った socket だけに
+/// なる。起動元から継承した socket を数えると実行環境で結果が変わる（#2603）。**呼び出しプロセスに seccomp の filter が不可逆に
+/// 載る**ため、使い捨ての worker 専用。`exec-test-support` feature の下のみ。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
 pub fn apply_exec_seccomp_listener_for_test(
     sender: ExecListenerSender,
+    baseline: &[String],
 ) -> Result<usize, ExecError> {
     super::no_new_privs::apply_no_new_privs()?;
     let (sender, timeout) = sender.into_parts();
@@ -672,18 +703,9 @@ pub fn apply_exec_seccomp_listener_for_test(
         timeout,
         &mut super::ThreadCountSource::ProcSelf,
     )?;
-    let dir = std::fs::read_dir("/proc/self/fd").map_err(|_| {
-        ExecError::new(
-            ErrorCode::Internal,
-            IsolationStage::Seccomp,
-            "failed to list the open fds",
-        )
-    })?;
-    // `read_dir` 自身の fd も数えるが、それは socket ではない。
-    Ok(dir
-        .flatten()
-        .filter_map(|e| std::fs::read_link(e.path()).ok())
-        .filter(|t| t.to_str().is_some_and(|s| s.starts_with("socket:[")))
+    Ok(open_socket_ids_for_test()?
+        .iter()
+        .filter(|id| !baseline.contains(id))
         .count())
 }
 

@@ -268,8 +268,9 @@ pub use rlimits::launch_rlimits_from_self;
 pub use rootfs::{PivotReport, PreparedRootfs, pivot_root, prepare_rootfs};
 pub use sealed_copy::MAX_SEALED_COPY_BYTES;
 pub use seccomp::SeccompReport;
-/// 結合試験 `tests/escape_suite.rs` の ESC-03 専用の再公開（SEC-2・TASK-42.2・#200。通常の利用者は呼ばない。詳細は定義側）。
-#[cfg(feature = "escape-probe")]
+/// 結合試験 `tests/escape_suite.rs` の ESC-03 と supervisor の `supervisor_bin_real` のシナリオ E 専用の再公開
+/// （SEC-2・SEC-4・TASK-42.2・#200・#2482。通常の利用者は呼ばない。詳細は定義側）。
+#[cfg(any(feature = "escape-probe", feature = "exec-test-support"))]
 #[doc(hidden)]
 pub use seccomp::escape_probe_mount;
 /// 結合試験 `tests/escape_suite.rs` 専用の再公開（SEC-2・TASK-42.3・#201。通常の利用者は呼ばない。詳細は定義側）。

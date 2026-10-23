@@ -2704,7 +2704,7 @@ where
 /// 戻り値の listener は呼び出し側（試験）が持つ応答者の入力で、応答は `-EPERM` だけにする（許可へ覆さない）。
 /// 受け渡せなければ子を期限つきで kill して回収し `Err` を返す（listener 無しで走らせない。fail-closed）。
 /// 制限適用証跡の例外・契約・将来仕様は [`spawn_container_probe`] と同じ（REPAIR-3）。
-/// 呼び出し元は `escape_suite` の ESC-03 だけで、応答ハブ（supervisor の `SeccompNotifyHub`）そのものの試験ではない。
+/// 呼び出し元は `escape_suite` の ESC-03 だけで、応答ハブ（supervisor の `SeccompNotifyHub`）そのものの試験ではない（hub の通しは `supervisor_bin_real` のシナリオ E が担う。#2482）。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub fn spawn_container_probe_with_seccomp_listener<F>(

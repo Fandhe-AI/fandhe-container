@@ -481,12 +481,14 @@ pub fn probe_escape_syscall(which: EscapeSyscallProbe) -> ProbeOutcome {
 /// - `/proc/self/status` の `Seccomp` が 2（filter 適用済み）。組み込み filter は `mount` を `ERRNO(EPERM)` で
 ///   拒否するため、filter 適用前の（ホスト側の）プロセスでは syscall を発行しない
 ///
-/// この feature はテスト専用で、通常ビルドには含まれない（dev-dependency の自己参照でのみ有効化）。
+/// 呼び出し元は escape_suite の ESC-03 と、supervisor の `supervisor_bin_real` のシナリオ E（本番の
+/// `SeccompNotifyHub` をコンテナ経由で通す照合。SEC-4・#2482）。`escape-probe` または `exec-test-support` の
+/// feature はテスト専用で、通常ビルドには含まれない（dev-dependency の自己参照でのみ有効化）。
 ///
 /// # 将来仕様（記録のみ）
 ///
 /// exec が許可されたら（証跡配線後。後続作業）、エントリポイント内のプローブへ置き換えて本関数を廃止する（REPAIR-3）。
-#[cfg(feature = "escape-probe")]
+#[cfg(any(feature = "escape-probe", feature = "exec-test-support"))]
 #[doc(hidden)]
 pub fn escape_probe_mount() -> Result<ProbeOutcome, ExecError> {
     if std::process::id() != 1 || !probe_context_is_isolated() {
@@ -502,7 +504,7 @@ pub fn escape_probe_mount() -> Result<ProbeOutcome, ExecError> {
 }
 
 /// [`escape_probe_mount`] の前提検査: seccomp filter 適用済みか（読めなければ false）。
-#[cfg(feature = "escape-probe")]
+#[cfg(any(feature = "escape-probe", feature = "exec-test-support"))]
 fn probe_context_is_isolated() -> bool {
     use std::io::Read;
     // /proc/self/status は小さい（数 KiB）。上限を設けて読む。

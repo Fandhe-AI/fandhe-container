@@ -46,7 +46,8 @@
 //!     による listener の受け渡し〔本番と同じ検証〕）で子を起動し、シナリオ側の応答ループ（単一スレッド）が通知ごとに
 //!     `record_seccomp_denial_for` → `ControlAuditRelay` → `FileAuditSink` で記録して `-EPERM` で応答する。
 //!     応答ループ自体は試験側が core の公開 API だけで組む（supervisor の `SeccompNotifyHub` の試験ではない。
-//!     それは `crates/supervisor/tests/seccomp_notify_audit.rs` が担う）
+//!     それは `crates/supervisor/tests/seccomp_notify_audit.rs` が担い、ESC-03 と同じ攻撃を本番の supervisor bin が
+//!     起動した実コンテナで通す照合は `crates/supervisor/tests/supervisor_bin_real.rs` のシナリオ E〔実機前提・#2482〕が担う）
 //!   - ESC-08（bind の元）: `create` → `start` に、マウント元が rootfs・bundle・状態ルートの bind を渡し、
 //!     本番の `start` の拒否経路（`validate_bind_mounts` → `audit_bind_mount_error` →
 //!     `ProcessLauncher::rejection_audit_sink` → `FileAuditSink`）が出した mount 層の記録を要求ごとに 1 行（計 3 行）
@@ -3267,7 +3268,7 @@ mod linux {
 
     /// 応答者（ESC-03）: seccomp の listener の通知を受けて、`record_seccomp_denial_for` → 本番の sink で記録し、
     /// `-EPERM` で応答する。試験側の応答ループで、supervisor の `SeccompNotifyHub` そのものではない（core の公開 API
-    /// だけで組む）。記録の成否にかかわらず応答は必ず返し、許可（`CONTINUE`）には覆さない。
+    /// だけで組む。hub をコンテナ経由で通す照合は `supervisor_bin_real` のシナリオ E が担う。#2482）。記録の成否にかかわらず応答は必ず返し、許可（`CONTINUE`）には覆さない。
     ///
     /// シナリオプロセスは `isolate()` の `unshare(CLONE_NEWPID)` の後にスレッドを作れない（`clone(2)` の EINVAL）ため、
     /// 呼び出し元のスレッドで回す。子の終了（回収）を各周回で確かめ、回収済み・listener の閉鎖・期限超過で抜ける。

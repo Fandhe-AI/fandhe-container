@@ -75,6 +75,8 @@ pub mod healthcheck;
 pub mod id_model;
 pub mod inspect;
 pub mod launcher;
+#[cfg(any(target_os = "linux", test))]
+pub mod launcher_probe;
 pub mod log_pipeline;
 pub mod logs;
 pub mod privilege;

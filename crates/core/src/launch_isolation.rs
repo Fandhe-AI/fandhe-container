@@ -321,6 +321,15 @@ impl AuditCoverageRecordOutcome {
             _ => None,
         }
     }
+
+    /// `inspect` の `auditCoverage.record` の固定語彙（SEC-4・REPAIR-4・#2601）。失敗したときだけ `Some("failed")`。
+    /// `None` は「失敗を観測していない」で、「記録された」ことの保証ではない。
+    pub fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::Failed => Some("failed"),
+            Self::NotFailed => None,
+        }
+    }
 }
 
 /// 記録できる ID 写像の範囲（行）数の上限（uid・gid それぞれ。`rootless::MAX_EXTENTS` と同じ値。Linux では単体テストで
@@ -688,6 +697,13 @@ mod linux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// inspect の `auditCoverage.record` の語彙は固定（SEC-4・#2601）。
+    #[test]
+    fn sec4_2601_audit_coverage_record_vocabulary() {
+        assert_eq!(AuditCoverageRecordOutcome::Failed.as_str(), Some("failed"));
+        assert_eq!(AuditCoverageRecordOutcome::NotFailed.as_str(), None);
+    }
 
     fn dest(s: &str) -> MountDestination {
         MountDestination::parse(s).expect("destination")

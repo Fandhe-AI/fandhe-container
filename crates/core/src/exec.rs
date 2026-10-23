@@ -1603,6 +1603,11 @@ fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
 /// `docs/design/rootless-id-map-holder.md`・#2374)。呼び出し元が non-dumpable ならその状態を保つ。
 ///
 /// 契約:
+/// - **機密をメモリに置いたまま呼ばないこと(#2546・CORE-6・SEC-5)**: holder は exec しない fork で、呼び出し時点の
+///   メモリの COW 複製を持つ。`unshare` から release までの holder は dumpable なので、同じ uid のホスト側
+///   プロセスが ptrace・`/proc/<holder>/mem` で読める。pidfd 経由の `setns` が対象の dumpable を要する
+///   (`ptrace_may_access`。Linux v6.12 で確認)ため、window は release まで縮められない。棚卸しと残課題
+///   (注入ファイルの secret 内容)は `docs/design/rootless-id-map-holder.md` §4
 /// - シングルスレッドから呼ぶこと（holder・mapper の fork と `setns(CLONE_NEWUSER)` の制約。マルチスレッドは
 ///   副作用なしで `FailedPrecondition`）
 /// - 失敗したプロセスは破棄すること（写像は write-once で戻せない。[`isolate`] と同じ）。holder と mapper は
@@ -1862,6 +1867,10 @@ fn user_ns_identity(pid: Option<u32>) -> Result<(u64, u64), ExecError> {
 ///
 /// 失敗時の holder・mapper の回収は呼び出し元が行う。途中で失敗しても回収できるよう、fork 済みの mapper は
 /// `mapper` へ入れてから先へ進む。
+///
+/// `fs.suid_dumpable=1` のホストでも、`setns(CLONE_NEWUSER)` の `commit_creds` は呼び出しプロセスの dumpable を
+/// 書き換えない(id が変わらず、参加先は呼び出し元の uid が所有する子 user namespace のため `cred_cap_issubset`
+/// が真。Linux v6.12 `kernel/cred.c` で確認。#2546)。参加後の `set_non_dumpable` は多層防御として残す。
 fn rootless_handshake(
     plan: &SubordinateIsolationPlan,
     caller: MapperCaller,

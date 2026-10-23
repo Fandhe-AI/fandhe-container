@@ -113,7 +113,10 @@ pub(super) fn create_container_with_image_reclaiming(
         &image.scope,
         req.id(),
     );
+    let gate_started = Instant::now();
     let pass = image.store.enter_container_create().map_err(|e| {
+        // ゲート取得の失敗は core に到達せず core 側の計測に載らないため、ここで create の失敗として記録する（REPAIR-4）。
+        record_pre_core_failure(&rt.recorder, "create", gate_started);
         OciRuntimeError::from_trait_error(LifecycleOp::Create, trait_failure(&e, Stage::Refs))
     })?;
     create_container_with_image(rt, image, req, &pass)
@@ -1480,6 +1483,78 @@ mod tests {
             assert_eq!(e.code(), ErrorCode::AlreadyExists);
             assert_eq!(e.exit_code().get(), 4);
             assert_eq!(e.op(), LifecycleOp::Create);
+        }
+
+        fn gate_test_image(base: &TmpDir) -> CreateImage {
+            let root = base.0.join("images");
+            std::fs::create_dir_all(&root).expect("mkdir");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod");
+            }
+            CreateImage {
+                store: ImageStore::open(&root).expect("store"),
+                manifest: ImageManifestDigest::new(IMG_DIGEST).expect("digest"),
+                scope: "scope".into(),
+            }
+        }
+
+        /// REPAIR-4・OCI-7: create ゲートの共有取得が Timeout になっても create の失敗が 1 件記録される。
+        #[test]
+        fn repair4_create_gate_timeout_is_recorded_as_create_failure() {
+            let base = TmpDir::new("gate-timeout");
+            let bundle = make_bundle(&base);
+            let rt = runtime(&base);
+            let image = gate_test_image(&base);
+            let holder = ImageStore::open(&base.0.join("images")).expect("holder");
+            let _q = holder
+                .quiesce_container_creates()
+                .expect("q")
+                .expect("some");
+            let req = build_create_request(&CreateArgs {
+                bundle,
+                id: "c1".into(),
+                image: None,
+            })
+            .expect("req");
+            let e = create_container_with_image_reclaiming(&rt, &image, &req).expect_err("timeout");
+            assert_eq!(e.op(), LifecycleOp::Create);
+            let snap = rt
+                .recorder
+                .snapshot_op(&OpName::new("create").expect("name"))
+                .expect("snap");
+            assert_eq!(snap.failure(), 1);
+            assert_eq!(snap.success(), 0);
+        }
+
+        /// REPAIR-4・OCI-7: ゲートファイルを開けない場合（ディレクトリで置換）も create の失敗が 1 件記録される。
+        #[test]
+        fn repair4_create_gate_open_failure_is_recorded_as_create_failure() {
+            let base = TmpDir::new("gate-open");
+            let bundle = make_bundle(&base);
+            let rt = runtime(&base);
+            let image = gate_test_image(&base);
+            std::fs::create_dir(
+                base.0.join("images").join(
+                    fandhe_container_oci::image_management::IMAGE_STORE_CREATE_GATE_FILE_NAME,
+                ),
+            )
+            .expect("gate dir");
+            let req = build_create_request(&CreateArgs {
+                bundle,
+                id: "c1".into(),
+                image: None,
+            })
+            .expect("req");
+            let e = create_container_with_image_reclaiming(&rt, &image, &req).expect_err("open");
+            assert_eq!(e.op(), LifecycleOp::Create);
+            let snap = rt
+                .recorder
+                .snapshot_op(&OpName::new("create").expect("name"))
+                .expect("snap");
+            assert_eq!(snap.failure(), 1);
+            assert_eq!(snap.success(), 0);
         }
 
         /// ERR-2: 未 create の ID の start は NOT_FOUND（3）で、supervisor を起動する前に返る。

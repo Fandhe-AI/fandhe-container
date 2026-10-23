@@ -10,6 +10,9 @@
 #
 # ケースの層（docs/verification/cli-cross-platform-parity.md のチェックリストと ID を一致させる）:
 #   A 層: 構文・使い方エラー。OS 非依存の引数解析だけで決まる。3 OS で今すぐ比較できる。
+#   D 層: logs のオプション（--tail・--stream・--follow）。ここで自動収集するのは、速く決定的に終わる
+#         使い方エラーと不在 ID だけ（#2605）。書き手のレコードが要る・--follow が期限まで終わらない
+#         ケースは手動のまま（docs/verification/cli-cross-platform-parity.md の D 層）。
 #   B 層: 挙動（Linux は core 直接、macOS / Windows は plugin 発見機構経由）。非 Linux の plugin 起動と
 #         RPC は未配線（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕。REPAIR-3）のため、現時点で非 Linux の B 層は Linux と一致しない。
 #         不一致は「前提未達」の事実であり、合格に見せてはならない。
@@ -112,6 +115,13 @@ CASES=(
   'B13|B|n|--root @R@ delete nonexist'
   'B14|B|n|--root @R@ logs nonexist'
   'B15|B|l|--root @M@ list'
+  'D01|D|n|--root @R@ logs --tail'
+  'D02|D|n|--root @R@ logs --tail x c1'
+  'D03|D|n|--root @R@ logs --tail 1000001 c1'
+  'D04|D|n|--root @R@ logs --stream bogus c1'
+  'D05|D|n|--root @R@ logs --follow --follow c1'
+  'D06|D|n|--root @R@ logs -f c1'
+  'D24|D|n|--root @R@ logs --follow nonexist'
 )
 
 # --------------------------------------------------
@@ -482,11 +492,11 @@ load_capture() {
   local prefix="$1" file="$2" n=0 line id layer ex code so os_line
   local ids=()
   # 結果を入れる変数を先に消す。同名の変数が環境から渡っていると（例: base_B05）、ファイルに無い
-  # ケースを「読み込んだ」と誤認し、欠落を MATCH にしてしまう。ID の書式（[AB][0-9]{2}）が取り得る
-  # 200 個すべてを対象にする（想定外 ID の重複判定も環境の値に影響されないようにする）。
+  # ケースを「読み込んだ」と誤認し、欠落を MATCH にしてしまう。ID の書式（[ABD][0-9]{2}）が取り得る
+  # 300 個すべてを対象にする（想定外 ID の重複判定も環境の値に影響されないようにする）。
   local u_layer u_n
   unset "${prefix}_os" "${prefix}_ids"
-  for u_layer in A B; do
+  for u_layer in A B D; do
     u_n=0
     while [ "$u_n" -lt 100 ]; do
       if [ "$u_n" -lt 10 ]; then
@@ -503,7 +513,7 @@ load_capture() {
   [ "$size" -le $((MAX_LINES * MAX_LINE_LEN)) ] || { err invalid-input "capture file is too large"; exit 2; }
   # bash の read は NUL を黙って落とすため、行単位の検証の前に元のバイト列で NUL を拒否する。
   [ "$(($(LC_ALL=C tr -d '\000' <"$file" | wc -c)))" -eq "$size" ] || { err invalid-input "capture file contains NUL"; exit 2; }
-  local id_re='^[AB][0-9]{2}$' ex_re='^[0-9]{1,3}$' code_re='^([A-Z_]{1,40}|-|<unparsed>|<timeout>)$'
+  local id_re='^[ABD][0-9]{2}$' ex_re='^[0-9]{1,3}$' code_re='^([A-Z_]{1,40}|-|<unparsed>|<timeout>)$'
   local so_unexp_re='^<unexpected>:(nul|big|[0-9]{1,10})$'
   local so_list_re='^list:H(;[A-Za-z0-9_-]{1,64},[a-z]{1,16},(<pid>|-))*$'
   local k entry_id so_ok
@@ -585,7 +595,7 @@ do_compare() {
   fi
 
   local all_ids id bv cv bvar cvar layer entry
-  local a_match=0 a_mis=0 a_miss=0 b_match=0 b_mis=0 b_miss=0
+  local a_match=0 a_mis=0 a_miss=0 b_match=0 b_mis=0 b_miss=0 d_match=0 d_mis=0 d_miss=0
   # 比較対象は CASES から作る期待 ID 集合（固定ケース表）を基準とし、双方に無いケースも MISSING にする。
   # 入力にだけある想定外 ID は末尾に足す（こちらも片側欠落として MISSING になる）。
   all_ids=""
@@ -628,11 +638,15 @@ do_compare() {
       B:MATCH) b_match=$((b_match + 1)) ;;
       B:MISMATCH) b_mis=$((b_mis + 1)) ;;
       B:MISSING) b_miss=$((b_miss + 1)) ;;
+      D:MATCH) d_match=$((d_match + 1)) ;;
+      D:MISMATCH) d_mis=$((d_mis + 1)) ;;
+      D:MISSING) d_miss=$((d_miss + 1)) ;;
     esac
   done
   printf 'layer A (syntax): match=%s mismatch=%s missing=%s\n' "$a_match" "$a_mis" "$a_miss"
   printf 'layer B (behavior): match=%s mismatch=%s missing=%s\n' "$b_match" "$b_mis" "$b_miss"
-  if [ $((a_mis + a_miss + b_mis + b_miss)) -eq 0 ]; then
+  printf 'layer D (logs options): match=%s mismatch=%s missing=%s\n' "$d_match" "$d_mis" "$d_miss"
+  if [ $((a_mis + a_miss + b_mis + b_miss + d_mis + d_miss)) -eq 0 ]; then
     exit 0
   fi
   exit 1

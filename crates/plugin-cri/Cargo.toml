@@ -36,6 +36,15 @@ fandhe-container-net = { path = "../net" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "net", "time"] }
+# #2484: 結合試験 `peer_auth_audit_delivery` が `UdsIncoming` の期待 UID だけを差し替える口（feature `test-support`。
+# 既定で無効・workspace 内 path 依存の feature 追加のみで外部依存の追加ではない）を使う。本番の依存では有効にしない。
+fandhe-container-plugin = { workspace = true, features = ["grpc", "test-support"] }
+
+[[test]]
+name = "peer_auth_audit_delivery"
+path = "tests/peer_auth_audit_delivery.rs"
+# `ControlAuditRelay::spawn` は単一スレッドの呼び出し元を要求するため、単一スレッドの `main` で動かす。
+harness = false
 
 [[bin]]
 name = "fandhe-container-plugin-cri"

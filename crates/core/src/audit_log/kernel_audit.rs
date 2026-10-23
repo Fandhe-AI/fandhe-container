@@ -249,7 +249,7 @@ fn encode_payload(record: &AuditRecord) -> Result<String, AuditWriteError> {
         | AuditEvent::AuditCoverageDegraded { .. } => None,
         AuditEvent::Landlock { path, .. } => Some(path),
         AuditEvent::Mount { path, .. } => path.as_ref(),
-        AuditEvent::PluginTrust { path, .. } => Some(path),
+        AuditEvent::PluginTrust { path, .. } | AuditEvent::PluginPeer { path, .. } => Some(path),
     };
     let fields = PathFields::new(path);
     // 末尾: plugin 信頼検証・exec 対象・entrypoint・理由つき mount のみ理由、続けてコンテナ ID（全層）。

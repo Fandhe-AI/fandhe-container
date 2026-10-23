@@ -83,6 +83,16 @@ struct Server {
     seen: Vec<String>,
 }
 
+/// サーバーが監査を書く `@audit.log` の場所（`StateRoot::resolve(None)` と同じ規則。root は `/run/fandhe-container`、
+/// それ以外は `$XDG_RUNTIME_DIR/fandhe-container`。#2484）。
+fn audit_log_path(xdg: &Path, euid: u32) -> PathBuf {
+    if euid == 0 {
+        PathBuf::from("/run/fandhe-container/@audit.log")
+    } else {
+        xdg.join("fandhe-container").join("@audit.log")
+    }
+}
+
 impl Server {
     fn spawn(sock: &Path, xdg: &Path) -> Self {
         let mut child = Command::new(BIN)
@@ -309,6 +319,16 @@ async fn task114_5_legit_core_client_lifecycle_over_plug12_uds() {
             .filter(|l| l.contains("\"event\":\"plugin_peer_auth\""))
             .collect();
         assert!(denied.is_empty(), "unexpected peer auth lines: {denied:?}");
+        // 永続化側（@audit.log）にも、この socket への plugin_peer の記録は無い（#2484）。
+        // 本番バイナリが監査の記録経路（relay）を起動前に作れた上で、一連が成功していることも兼ねて確かめる。
+        let log =
+            std::fs::read_to_string(audit_log_path(&xdg.0, dir.owner_uid())).unwrap_or_default();
+        let sock_s = sock.to_str().expect("utf-8 socket path");
+        assert!(
+            !log.lines()
+                .any(|l| l.contains("\"layer\":\"plugin_peer\"") && l.contains(sock_s)),
+            "unexpected plugin_peer audit records: {log}"
+        );
         assert!(server.exited().is_none(), "server must still be running");
     })
     .await
@@ -414,6 +434,27 @@ async fn task114_5_plug12_rejects_other_uid_connection_to_cri_plugin() {
             !line.contains(&format!("\"peer_uid\":{uid},"))
                 && !line.contains(&format!("\"peer_uid\":{uid}}}")),
             "peer_uid must differ from the expected uid: {line}"
+        );
+
+        // 永続的な監査ログ（@audit.log）にも同じ拒否が 1 件届く（SEC-4・PLUG-12・#2484）。
+        let log_path = audit_log_path(&xdg.0, uid);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let persisted = loop {
+            let found: Vec<String> = std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .lines()
+                .filter(|l| l.contains("\"layer\":\"plugin_peer\"") && l.contains(&sock_s))
+                .map(str::to_owned)
+                .collect();
+            if !found.is_empty() || std::time::Instant::now() >= deadline {
+                break found;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(persisted.len(), 1, "persisted audit lines: {persisted:?}");
+        assert!(
+            persisted[0].contains("\"reason\":\"plugin_peer_uid_mismatch\""),
+            "{persisted:?}"
         );
 
         // 拒否の後も、同じサーバーへ新しい同一 UID の接続で一連が成功する。

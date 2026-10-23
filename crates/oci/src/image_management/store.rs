@@ -34,11 +34,14 @@
 //!   現在の実効 uid の所有で group / other に書き込めないこと（`0o022` が立っていない。0700 と 0755 は受理、
 //!   0770・0757・1777 は拒否）、祖先は root か実効 uid の所有で、group / other に書き込めないこと
 //!   （sticky bit 付きは許す）を、副作用（`@lock` の作成）より前に確かめ、違反は `PermissionDenied`。
-//!   root は `canonicalize` した正規パスを保持する。厳密な 0700 までは要求しない（既定 umask の 0755 の
-//!   root を壊さないため。オーナー確認待ち）。残る制約: Windows は検査しない（ACL は #2428 の方式判断後）、
-//!   macOS の拡張 ACL は見ない、検査から使用までの差し替え（TOCTOU）は openat 系が無く閉じきれない
-//!   （`@lock` の検査から open までの差し替えは「root は所有者専用」の前提で防ぐ）。`sys` は
-//!   `geteuid` だけで `O_NOFOLLOW` / `O_NONBLOCK` は持たない。
+//!   root は `canonicalize` した正規パスと open 時の dev / ino を保持し、`lock` と create ゲートの
+//!   取得ごとに同じ検査を `@lock` / ゲートファイルの作成より前に再実行する（`reverify_root`・#2547）。
+//!   権限の基準（厳密な 0700 か現行の `0o022` か）と root の所有者の基準はオーナー判断待ちで、現行を保つ
+//!   （選択肢と影響は `docs/design/image-store-root-trust.md`・#2547）。残る制約: Windows は検査しない
+//!   （ACL は #2428 の方式判断後）、macOS の拡張 ACL は見ない（根拠は同 doc）、再検査から使用までの
+//!   差し替え（TOCTOU）は `openat` 起点の操作に移さない限り閉じきれず「root と祖先は所有者専用」の前提で
+//!   防ぐ（移さない根拠は同 doc）。`sys` は `geteuid` と Linux 限定の `at` で、`O_NOFOLLOW` /
+//!   `O_NONBLOCK` は持たない。
 
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::ops::{Deref, DerefMut};
@@ -71,6 +74,9 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 #[derive(Debug)]
 pub struct ImageStore {
     root: PathBuf,
+    /// open 時に検査した root の (dev, ino)。`reverify_root` が差し替えの検出に使う（#2547）。
+    #[cfg(unix)]
+    root_id: (u64, u64),
     table: Mutex<ReferenceTable>,
     timeout: Duration,
     recorder: Arc<dyn OciOpRecorder>,
@@ -110,9 +116,11 @@ impl ImageStore {
             ));
         }
         #[cfg(unix)]
-        let root = verify_root_trust(root, &meta)?;
+        let (root, root_id) = verify_root_trust(root, &meta)?;
         Ok(Self {
             root,
+            #[cfg(unix)]
+            root_id,
             table: Mutex::new(table),
             timeout: IMAGE_STORE_LOCK_TIMEOUT,
             recorder: Arc::new(NoopOciOpRecorder),
@@ -184,6 +192,8 @@ impl ImageStore {
             )
         })?;
         let table = self.lock_table_until(deadline)?;
+        // open 後の chmod / 差し替えを `@lock` の作成より前に fail-closed で拒否する（#2547・SEC-1）。
+        self.reverify_root()?;
         let file = open_lock_file(&self.root)?;
         lock_file_until(&file, deadline)?;
         let mut guard = ImageStoreGuard {
@@ -279,6 +289,42 @@ pub(super) fn wait_or_timeout(deadline: Instant) -> Result<(), OciError> {
     Ok(())
 }
 
+impl ImageStore {
+    /// root と祖先の信頼性を再検査する（`lock` / create ゲートの取得ごと。副作用より前に呼ぶ。#2547・SEC-1）。
+    ///
+    /// open 時の dev / ino と食い違えば差し替えとして `Internal`。非 unix は検査しない（Windows は #2428）。
+    pub(super) fn reverify_root(&self) -> Result<(), OciError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = fs::symlink_metadata(&self.root).map_err(|e| {
+                let code = if e.kind() == std::io::ErrorKind::NotFound {
+                    OciErrorCode::NotFound
+                } else {
+                    OciErrorCode::Internal
+                };
+                OciError::new(code, "image store root is not accessible")
+            })?;
+            if !meta.is_dir() {
+                return Err(OciError::new(
+                    OciErrorCode::FailedPrecondition,
+                    "image store root is not a directory",
+                ));
+            }
+            if (meta.dev(), meta.ino()) != self.root_id {
+                return Err(OciError::new(
+                    OciErrorCode::Internal,
+                    "image store root changed after open",
+                ));
+            }
+            let euid = crate::sys::effective_uid();
+            verify_root_meta(&meta, euid)?;
+            verify_ancestors(&self.root, euid)?;
+        }
+        Ok(())
+    }
+}
+
 fn lock_file_error() -> OciError {
     OciError::new(
         OciErrorCode::Internal,
@@ -288,7 +334,10 @@ fn lock_file_error() -> OciError {
 
 /// root と祖先の信頼性を検査し、正規化したパスを返す（OCI-7・SEC-1・#2381）。`@lock` 作成等の副作用より前に呼ぶ。
 #[cfg(unix)]
-fn verify_root_trust(root: PathBuf, meta: &fs::Metadata) -> Result<PathBuf, OciError> {
+fn verify_root_trust(
+    root: PathBuf,
+    meta: &fs::Metadata,
+) -> Result<(PathBuf, (u64, u64)), OciError> {
     let euid = crate::sys::effective_uid();
     verify_root_meta(meta, euid)?;
     let canonical = fs::canonicalize(&root)
@@ -296,15 +345,20 @@ fn verify_root_trust(root: PathBuf, meta: &fs::Metadata) -> Result<PathBuf, OciE
     // 検査した実体と正規化後の実体が同じことを確かめる（検査と正規化の間の差し替えを fail-closed に）。
     let after = fs::symlink_metadata(&canonical)
         .map_err(|_| OciError::new(OciErrorCode::Internal, "image store root is not accessible"))?;
-    {
-        use std::os::unix::fs::MetadataExt;
-        if after.dev() != meta.dev() || after.ino() != meta.ino() {
-            return Err(OciError::new(
-                OciErrorCode::Internal,
-                "image store root changed while opening",
-            ));
-        }
+    use std::os::unix::fs::MetadataExt;
+    if after.dev() != meta.dev() || after.ino() != meta.ino() {
+        return Err(OciError::new(
+            OciErrorCode::Internal,
+            "image store root changed while opening",
+        ));
     }
+    verify_ancestors(&canonical, euid)?;
+    Ok((canonical, (after.dev(), after.ino())))
+}
+
+/// 祖先ディレクトリをすべて `verify_ancestor_meta` で検査する（open と再検査で共用）。
+#[cfg(unix)]
+fn verify_ancestors(canonical: &Path, euid: u32) -> Result<(), OciError> {
     for ancestor in canonical.ancestors().skip(1) {
         let m = fs::metadata(ancestor).map_err(|_| {
             OciError::new(
@@ -314,7 +368,7 @@ fn verify_root_trust(root: PathBuf, meta: &fs::Metadata) -> Result<PathBuf, OciE
         })?;
         verify_ancestor_meta(&m, euid)?;
     }
-    Ok(canonical)
+    Ok(())
 }
 
 /// root 自身の所有者・権限の判定（sticky の免除なし。1777 の root は攻撃そのもの）。
@@ -687,6 +741,81 @@ mod tests {
         ImageStore::open(&root).expect("sticky ancestor is accepted");
         chmod(&base, 0o700);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// OCI-7・SEC-1・#2547: open 後に root へ group / other の書き込みを付けると、`lock` は `@lock` を作らず拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_sec1_lock_rechecks_root_mode() {
+        let root = temp_root("recheck-mode");
+        let store = ImageStore::open(&root).expect("open");
+        chmod(&root, 0o757);
+        let Err(err) = store.lock() else {
+            panic!("must be rejected")
+        };
+        assert_eq!(err.code(), OciErrorCode::PermissionDenied);
+        assert!(!root.join(IMAGE_STORE_LOCK_FILE_NAME).exists());
+        let err = store.recover_pending_deletion().expect_err("recover");
+        assert_eq!(err.code(), OciErrorCode::PermissionDenied);
+        chmod(&root, 0o700);
+        store.lock().expect("accepted again");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// OCI-7・SEC-1・#2547: open 後に root が別ディレクトリへ差し替わると `lock` は `Internal` で拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_sec1_lock_rejects_swapped_root() {
+        let root = temp_root("recheck-swap");
+        let store = ImageStore::open(&root).expect("open");
+        let moved = root.with_extension("moved");
+        fs::rename(&root, &moved).expect("rename");
+        fs::create_dir(&root).expect("mkdir");
+        chmod(&root, 0o700);
+        let Err(err) = store.lock() else {
+            panic!("must be rejected")
+        };
+        assert_eq!(err.code(), OciErrorCode::Internal);
+        assert_eq!(err.message(), "image store root changed after open");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&moved);
+    }
+
+    /// OCI-7・SEC-1・#2547: open 後に祖先が他者書き込み可（sticky なし）になると `lock` は拒否する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_sec1_lock_rechecks_ancestor_mode() {
+        let base = temp_root("recheck-anc");
+        let root = base.join("store");
+        fs::create_dir(&root).expect("mkdir");
+        chmod(&root, 0o700);
+        let store = ImageStore::open(&root).expect("open");
+        chmod(&base, 0o777);
+        let Err(err) = store.lock() else {
+            panic!("must be rejected")
+        };
+        assert_eq!(err.code(), OciErrorCode::PermissionDenied);
+        chmod(&base, 0o700);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// OCI-7・SEC-1・#2547: create ゲートの入口も root を再検査する。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_sec1_create_gate_rechecks_root_mode() {
+        let root = temp_root("recheck-gate");
+        let store = ImageStore::open(&root).expect("open");
+        chmod(&root, 0o757);
+        let Err(err) = store.enter_container_create() else {
+            panic!("must be rejected")
+        };
+        assert_eq!(err.code(), OciErrorCode::PermissionDenied);
+        let Err(err) = store.quiesce_container_creates() else {
+            panic!("must be rejected")
+        };
+        assert_eq!(err.code(), OciErrorCode::PermissionDenied);
+        chmod(&root, 0o700);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// OCI-7・SEC-1・#2381: 所有者の判定（chown は root 権限が要るため純関数で照合する）。

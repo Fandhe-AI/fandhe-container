@@ -1603,6 +1603,11 @@ fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
 /// `docs/design/rootless-id-map-holder.md`・#2374)。呼び出し元が non-dumpable ならその状態を保つ。
 ///
 /// 契約:
+/// - **機密をメモリに置いたまま呼ばないこと(#2546・CORE-6・SEC-5)**: holder は exec しない fork で、呼び出し時点の
+///   メモリの COW 複製を持つ。`unshare` から release までの holder は dumpable なので、同じ uid のホスト側
+///   プロセスが ptrace・`/proc/<holder>/mem` で読める。pidfd 経由の `setns` が対象の dumpable を要する
+///   (`ptrace_may_access`。Linux v6.12 で確認)ため、window は release まで縮められない。棚卸しと残課題
+///   (注入ファイルの secret 内容)は `docs/design/rootless-id-map-holder.md` §4
 /// - シングルスレッドから呼ぶこと（holder・mapper の fork と `setns(CLONE_NEWUSER)` の制約。マルチスレッドは
 ///   副作用なしで `FailedPrecondition`）
 /// - 失敗したプロセスは破棄すること（写像は write-once で戻せない。[`isolate`] と同じ）。holder と mapper は
@@ -1681,7 +1686,14 @@ fn isolate_rootless_subordinate_with(
     // holder: 最初の fork(マルチスレッドはここで `FailedPrecondition`)。
     let release_wait = timeout * 3 + HOLDER_SLACK;
     let holder_pid = fork_for(caller, move || {
-        rootless::run_userns_holder(parent_pid, holder_end, timeout, release_wait)
+        // 診断は fork 後の子の中で作った unbuffered の stderr へ出す(#2393・#2546。バッファ付きは `_exit` で失われる)。
+        rootless::run_userns_holder(
+            parent_pid,
+            holder_end,
+            timeout,
+            release_wait,
+            &mut std::io::stderr(),
+        )
     })?;
     // holder を fork した後は、どの失敗も下の回収の分岐を通す(`?` で早期 return すると holder・mapper が
     // ゾンビで残る。`ContainerChild` は drop で回収しない。CORE-2)。
@@ -1701,15 +1713,7 @@ fn isolate_rootless_subordinate_with(
     drop(holder_sock);
     match handshake {
         // 応答(Ok)は mapper が helper を回収し終えた後にだけ届くため、ここで mapper を kill しても helper は残らない。
-        Ok(()) => {
-            // 片方の回収が失敗しても、もう片方の回収は試みる(ゾンビを残さない)。
-            let holder_exit = holder.wait_timeout(MAPPER_REAP_TIMEOUT);
-            let mapper_exit = mapper.as_ref().map(|m| m.wait_timeout(MAPPER_REAP_TIMEOUT));
-            holder_exit?;
-            if let Some(r) = mapper_exit {
-                r?;
-            }
-        }
+        Ok(()) => reap_after_handshake(&holder, mapper.as_ref(), |c, t| c.wait_timeout(t))?,
         Err(e) => {
             // helper(`newuidmap` / `newgidmap`)は holder を pid の数値で受け取る(shadow 4.13 は `fd:N` を受けない。
             // #2376)。holder を回収すると pid が解放されて再利用され得るため、helper がもう `/proc/<pid>` を開いて
@@ -1768,6 +1772,38 @@ fn isolate_rootless_subordinate_with(
             },
         },
     })
+}
+
+/// 握手が成功した後の holder・mapper の回収(CORE-6・SEC-5・REPAIR-5。#2546)。
+///
+/// [`isolate_rootless_subordinate_with`] の成功経路から呼ばれる。`wait` は本番では `ContainerChild::wait_timeout`
+/// で、試験が失敗を注入する継ぎ目でもある。`wait_timeout` は期限切れなら自分で SIGKILL して回収するが、waitpid
+/// の失敗・kill の失敗・SIGKILL 後も回収できなかった場合は子が残り得るため、待ちが Err になった子には
+/// `kill_and_reap`(冪等。回収済みなら記録を返すだけ)で回収を試み直す。
+///
+/// 成功の応答は mapper が helper を回収し終えた後にだけ届くため、成功経路で mapper を kill・回収しても helper は
+/// 残らず、launcher 経路でも安全である。「mapper を回収せず C の再探索に任せる」契約は失敗経路だけのもの。
+/// 片方の待ちが失敗しても、もう片方の回収は試みる。戻り値のエラーは holder を優先する。
+fn reap_after_handshake(
+    holder: &ContainerChild,
+    mapper: Option<&ContainerChild>,
+    wait: impl Fn(&ContainerChild, Duration) -> Result<ChildExit, ExecError>,
+) -> Result<(), ExecError> {
+    let settle = |child: &ContainerChild| {
+        let r = wait(child, MAPPER_REAP_TIMEOUT);
+        if r.is_err() {
+            // 回収の再試行(best-effort)。元のエラーを優先するため結果は捨てる。
+            let _ = child.kill_and_reap(MAPPER_REAP_TIMEOUT);
+        }
+        r
+    };
+    let holder_exit = settle(holder);
+    let mapper_exit = mapper.map(settle);
+    holder_exit?;
+    if let Some(r) = mapper_exit {
+        r?;
+    }
+    Ok(())
 }
 
 /// 失敗の後始末で、mapper と、mapper が起動した helper(`newuidmap` / `newgidmap`)を止める(CORE-6・SEC-5・#2376)。
@@ -1831,6 +1867,10 @@ fn user_ns_identity(pid: Option<u32>) -> Result<(u64, u64), ExecError> {
 ///
 /// 失敗時の holder・mapper の回収は呼び出し元が行う。途中で失敗しても回収できるよう、fork 済みの mapper は
 /// `mapper` へ入れてから先へ進む。
+///
+/// `fs.suid_dumpable=1` のホストでも、`setns(CLONE_NEWUSER)` の `commit_creds` は呼び出しプロセスの dumpable を
+/// 書き換えない(id が変わらず、参加先は呼び出し元の uid が所有する子 user namespace のため `cred_cap_issubset`
+/// が真。Linux v6.12 `kernel/cred.c` で確認。#2546)。参加後の `set_non_dumpable` は多層防御として残す。
 fn rootless_handshake(
     plan: &SubordinateIsolationPlan,
     caller: MapperCaller,
@@ -1889,13 +1929,15 @@ fn rootless_handshake(
         }
         // 診断は fork 後の子の中で作った unbuffered の stderr へ出す(#2393。バッファ付きは `_exit` で失われる)。
         rootless::run_id_map_mapper(
-            holder_pid,
-            parent_pid,
+            &rootless::MapperRequest {
+                target: holder_pid,
+                expected_parent: parent_pid,
+                uid: &uid,
+                gid: &gid,
+                writer: &writer,
+                timeout,
+            },
             sock,
-            &uid,
-            &gid,
-            &writer,
-            timeout,
             Some(keepalive),
             &mut std::io::stderr(),
         )
@@ -2464,6 +2506,69 @@ mod tests {
             namespaces,
             hostname: hostname.map(|h| Hostname::new(h).unwrap()),
         }
+    }
+
+    fn timeout_err() -> ExecError {
+        ExecError::new(
+            ErrorCode::Timeout,
+            IsolationStage::UserNamespaceMap,
+            "injected wait failure",
+        )
+    }
+
+    /// CORE-6・REPAIR-5(#2546): 成功経路の待ちが失敗しても、子を kill して回収する(ゾンビを残さない)。
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn core6_repair5_reap_after_handshake_kills_when_wait_fails() {
+        let holder_proc = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mapper_proc = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let holder = ContainerChild::spawned(holder_proc.id());
+        let mapper = ContainerChild::spawned(mapper_proc.id());
+        // holder の待ちだけ失敗させる。mapper は本物の待ちが無いので kill の有無で照合する。
+        let holder_pid = holder.pid();
+        let err = reap_after_handshake(&holder, Some(&mapper), |c, _| {
+            if c.pid() == holder_pid {
+                Err(timeout_err())
+            } else {
+                Err(ExecError::new(
+                    ErrorCode::Internal,
+                    IsolationStage::UserNamespaceMap,
+                    "injected mapper failure",
+                ))
+            }
+        })
+        .unwrap_err();
+        // holder のエラーを優先する。
+        assert_eq!(err.code, ErrorCode::Timeout);
+        // どちらも SIGKILL(9)で回収済み(冪等な再呼び出しが記録を返す)。
+        assert_eq!(
+            holder.kill_and_reap(Duration::from_secs(1)).unwrap(),
+            ChildExit::Signaled(9)
+        );
+        assert_eq!(
+            mapper.kill_and_reap(Duration::from_secs(1)).unwrap(),
+            ChildExit::Signaled(9)
+        );
+        assert!(!std::path::Path::new(&format!("/proc/{}", holder_pid)).exists());
+    }
+
+    /// CORE-6・REPAIR-5(#2546): 待ちが成功する子は kill されない(終了コードがそのまま残る)。
+    #[test]
+    fn core6_repair5_reap_after_handshake_leaves_clean_exit() {
+        let mut p = std::process::Command::new("true").spawn().unwrap();
+        let holder = ContainerChild::spawned(p.id());
+        reap_after_handshake(&holder, None, |c, t| c.wait_timeout(t)).unwrap();
+        assert_eq!(
+            holder.kill_and_reap(Duration::from_secs(1)).unwrap(),
+            ChildExit::Exited(0)
+        );
+        let _ = p.try_wait();
     }
 
     /// CORE-6・SEC-5・SEC-1(#2374): non-dumpable の呼び出し元に対する公開 API は、拒否もせず dumpable にも

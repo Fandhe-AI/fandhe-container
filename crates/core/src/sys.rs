@@ -4732,6 +4732,10 @@ pub(crate) fn set_non_dumpable() -> Result<(), SysError> {
 /// `isolate_rootless_subordinate` が fork する使い捨ての holder プロセス(`rootless::run_userns_holder`)であり、
 /// **holder の fork 子だけが**この関数を呼ぶ。呼び出しプロセス(本番 launcher の中間プロセス I を含む)は
 /// 終始 non-dumpable のままにし、dumpable になる窓を作らない。
+///
+/// holder は呼び出しプロセスのメモリの COW 複製を持つため、dumpable な間(release まで。pidfd 経由の `setns` が
+/// 対象の dumpable を要するため縮められない)は同じ uid のホスト側プロセスが読める。呼び出し元の契約は
+/// `exec::isolate_rootless_subordinate` の doc と `docs/design/rootless-id-map-holder.md` §4(#2546)。
 pub(crate) fn set_dumpable_user() -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);

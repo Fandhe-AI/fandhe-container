@@ -4,7 +4,9 @@
 
 ## 自動で回収されるもの
 
-所有トークンを刻んだ後の失敗（アドレス設定・up・nft テーブル作成）で残った bridge・テーブルは、請求書が `<状態ルート>/.cri/net/pending-reclaim/<名前>.claim` に残り、plugin を再起動しても、`delete_network`（RemovePodSandbox の再試行）で自動回収される。成功すると記録ファイルも自動で消える。手で消す必要はない。
+所有トークンを刻んだ後の失敗（アドレス設定・up・nft テーブル作成）で残った bridge・テーブルは、請求書が `<状態ルート>/.cri/net/pending-reclaim/<名前>.claim` に残り、plugin を再起動しても、`NetworkPlugin::delete_network` を呼ぶと自動回収される。成功すると記録ファイルも自動で消える。手で消す必要はない。
+
+> 現状の制約（REPAIR-3・CRI-2・NET-1）: `NetworkPlugin` はまだ CRI の RPC（RemovePodSandbox 等）から呼ばれていない（`adapter.rs` の `network()`・`pod_network.rs`）。現時点で回収できる経路は `NetworkPlugin::delete_network` を直接呼ぶ場合だけである。CRI の RemovePodSandbox の再試行による自動回収は、後続の結線後に有効になる将来仕様で、それまでは下の手順で手動回収する。
 
 ## 自動回収されないもの
 
@@ -17,7 +19,7 @@
 
 ## 観測の方法
 
-- `delete_network` の応答: `FailedPrecondition` の `manual reclaim required`、または `Internal` の `N resource(s) left behind`
+- `delete_network` の応答（直接呼び出し時）: `FailedPrecondition` の `manual reclaim required`、または `Internal` の `N resource(s) left behind`
 - 記録ファイル: `ls <状態ルート>/.cri/net/pending-reclaim/`（残っていれば回収待ち）
 - 記録器の失敗件数: `net.delete_network`（回収の失敗）と `net.reclaim_store_load`（起動時に読めなかった記録）
 - plugin の stderr の `unusable pending-reclaim record(s)`（件数のみ。ファイル名は出ない）

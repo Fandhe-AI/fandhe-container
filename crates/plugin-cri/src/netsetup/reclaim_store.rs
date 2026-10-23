@@ -108,7 +108,10 @@ impl ReclaimStore {
             }
             report.claims.push(StoredClaim {
                 name: stem.to_owned(),
-                record: read_record(&entry.path()),
+                record: match read_record(&entry.path()) {
+                    ReadOutcome::Record(r) => Some(r),
+                    _ => None,
+                },
             });
         }
         report.claims.sort_by(|a, b| a.name.cmp(&b.name));
@@ -157,8 +160,13 @@ impl ReclaimStore {
         let file = self.file_for(name)?;
         let _lock = self.lock()?;
         match read_record(&file) {
-            Some(current) if current == expected => {}
-            _ => return Ok(()),
+            ReadOutcome::Record(current) if current == expected => {}
+            // 既に無い、または別の請求書に置き換わっている。消さずに成功する。
+            ReadOutcome::Missing | ReadOutcome::Record(_) => return Ok(()),
+            // 読めない・通常ファイルでない・壊れている記録は、回収済みかを判断できないので失敗して保持する。
+            ReadOutcome::Unreadable => {
+                return Err(internal("failed to read the reclaim record"));
+            }
         }
         match fs::remove_file(&file) {
             Ok(()) => {}
@@ -210,22 +218,42 @@ impl ReclaimStore {
     }
 }
 
-/// 記録を読む。通常ファイルでない・上限超過・UTF-8 でない・読めないときは `None`。
-fn read_record(path: &Path) -> Option<String> {
-    let m = fs::symlink_metadata(path).ok()?;
+/// [`read_record`] の結果。不存在・読み取り失敗・壊れた内容を区別する。
+#[derive(Debug, PartialEq, Eq)]
+enum ReadOutcome {
+    /// 記録が無い。
+    Missing,
+    /// 読めた記録。
+    Record(String),
+    /// 存在するが読めない（権限・I/O エラー）・通常ファイルでない・上限超過・UTF-8 でない。
+    Unreadable,
+}
+
+/// 記録を読む。不存在（`NotFound`）とそれ以外の失敗を区別する。
+fn read_record(path: &Path) -> ReadOutcome {
+    let m = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReadOutcome::Missing,
+        Err(_) => return ReadOutcome::Unreadable,
+    };
     if !m.file_type().is_file() || m.len() > CLAIM_RECORD_MAX_LEN as u64 {
-        return None;
+        return ReadOutcome::Unreadable;
     }
     let mut buf = Vec::new();
-    File::open(path)
-        .ok()?
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ReadOutcome::Missing,
+        Err(_) => return ReadOutcome::Unreadable,
+    };
+    if file
         .take(CLAIM_RECORD_MAX_LEN as u64 + 1)
         .read_to_end(&mut buf)
-        .ok()?;
-    if buf.len() > CLAIM_RECORD_MAX_LEN {
-        return None;
+        .is_err()
+        || buf.len() > CLAIM_RECORD_MAX_LEN
+    {
+        return ReadOutcome::Unreadable;
     }
-    String::from_utf8(buf).ok()
+    String::from_utf8(buf).map_or(ReadOutcome::Unreadable, ReadOutcome::Record)
 }
 
 #[cfg(unix)]
@@ -376,6 +404,24 @@ mod tests {
             s.save("../x", "r").expect_err("name").code(),
             ErrorCode::InvalidArgument
         );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// 読み取り失敗（記録のパスがディレクトリ）では消さずに失敗し、不存在は成功する（NET-1・#2604）。
+    #[test]
+    fn net1_store_remove_fails_when_record_unreadable() {
+        let root = temp_root("unreadable");
+        let s = ReclaimStore::open(&root).expect("open");
+        let dir = root.join(RECLAIM_DIR);
+        fs::create_dir(dir.join("web.claim")).expect("dir as record");
+        assert_eq!(
+            s.remove_if_matches("web", "rec\n")
+                .expect_err("unreadable")
+                .message(),
+            "failed to read the reclaim record"
+        );
+        assert!(dir.join("web.claim").exists());
+        s.remove_if_matches("absent", "rec\n").expect("missing ok");
         fs::remove_dir_all(&root).expect("cleanup");
     }
 

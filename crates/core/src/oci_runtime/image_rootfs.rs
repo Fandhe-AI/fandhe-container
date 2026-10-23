@@ -1077,8 +1077,18 @@ mod imp {
             Err(_) => return Reap::Unverified(UnverifiedReason::Open),
         };
         // O_PATH の fd には flock できないため、`/proc/self/fd/N` から開き直したディレクトリにロックを掛ける。
-        let Ok(lock) = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) else {
-            return Reap::Unverified(UnverifiedReason::LockError);
+        let lock = match File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) {
+            Ok(lock) => lock,
+            // 展開途中で落ちた subuid 所有の木は mode 0700 のことがあり、ホストの実効 uid では開けない
+            // （EACCES）。権限が `SubordinateIds` なら、ロック取得・同一性の再確認・削除を userns の子の中で
+            // 続けて行う（子は固定済みの親 fd を継承し、ロックは子の終了まで保持される。#2540・SEC-5）。
+            Err(e)
+                if e.raw_os_error() == Some(sys::EACCES)
+                    && matches!(privilege, ImageRootfsPrivilege::SubordinateIds(_)) =>
+            {
+                return reap_in_userns(privilege, cur, &cname, identity);
+            }
+            Err(_) => return Reap::Unverified(UnverifiedReason::LockError),
         };
         match lock.try_lock() {
             Ok(()) => {}
@@ -1097,6 +1107,26 @@ mod imp {
         }
         match remove_tree_priv(privilege, cur, &cname, identity, Owner::Unchecked) {
             Ok(_) => Reap::Reclaimed,
+            Err(_) => Reap::Failed,
+        }
+    }
+
+    /// ホストの実効 uid ではロックを取れない subuid 所有の木を、userns の子の中で回収する。
+    fn reap_in_userns(
+        privilege: &ImageRootfsPrivilege,
+        cur: BorrowedFd<'_>,
+        cname: &CString,
+        identity: (u64, u64),
+    ) -> Reap {
+        let ImageRootfsPrivilege::SubordinateIds(source) = privilege else {
+            return Reap::Unverified(UnverifiedReason::LockError);
+        };
+        match userns_run(source, cur, cname, identity, Owner::Unchecked, true) {
+            Ok(UsernsOutcome::Removed) => Reap::Reclaimed,
+            Ok(UsernsOutcome::NotPresent) => Reap::Gone,
+            Ok(UsernsOutcome::Alive) => Reap::Alive,
+            Ok(UsernsOutcome::LockError) => Reap::Unverified(UnverifiedReason::LockError),
+            Ok(UsernsOutcome::Identity) => Reap::Unverified(UnverifiedReason::Identity),
             Err(_) => Reap::Failed,
         }
     }
@@ -1401,6 +1431,18 @@ mod imp {
     const CHILD_REFUSED: i32 = 11;
     const CHILD_FAILED: i32 = 12;
     const CHILD_SETUP_FAILED: i32 = 13;
+    const CHILD_ALIVE: i32 = 14;
+    const CHILD_LOCK_ERROR: i32 = 15;
+    const CHILD_IDENTITY: i32 = 16;
+
+    /// userns の子の結果（`lock_in_child` のときだけ `Alive` / `LockError` / `Identity` が出る）。
+    enum UsernsOutcome {
+        Removed,
+        NotPresent,
+        Alive,
+        LockError,
+        Identity,
+    }
 
     /// subuid 所有の木を、子プロセスの user namespace の中で消す（SEC-5・CORE-6・#2540）。
     ///
@@ -1419,6 +1461,23 @@ mod imp {
         identity: (u64, u64),
         owner: Owner<'_>,
     ) -> Result<RecordedRootfsRemoval, TraitError> {
+        match userns_run(source, parent, name, identity, owner, false)? {
+            UsernsOutcome::Removed => Ok(RecordedRootfsRemoval::Removed),
+            UsernsOutcome::NotPresent => Ok(RecordedRootfsRemoval::NotPresent),
+            _ => Err(remove_failed()),
+        }
+    }
+
+    /// [`remove_tree_in_userns`] の本体。`lock_in_child` なら、子が userns に入った後で木に `flock` を取り、
+    /// 名前から開き直した実体の同一性を再確認してから削除する（ホストの uid では開けない 0700 の木用）。
+    fn userns_run(
+        source: &SubordinateIdSource,
+        parent: BorrowedFd<'_>,
+        name: &CString,
+        identity: (u64, u64),
+        owner: Owner<'_>,
+        lock_in_child: bool,
+    ) -> Result<UsernsOutcome, TraitError> {
         let unavailable = |code: ErrorCode| {
             TraitError::new(
                 code,
@@ -1445,6 +1504,30 @@ mod imp {
                 if isolate_rootless_subordinate(&plan).is_err() {
                     return CHILD_SETUP_FAILED;
                 }
+                // ロックは子の終了（`_exit`）まで保持する。
+                let _lock;
+                if lock_in_child {
+                    let Ok(fd) = sys::open_dir_path_nofollow(Some(parent), name) else {
+                        return CHILD_LOCK_ERROR;
+                    };
+                    let Ok(lock) = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) else {
+                        return CHILD_LOCK_ERROR;
+                    };
+                    match lock.try_lock() {
+                        Ok(()) => {}
+                        Err(std::fs::TryLockError::WouldBlock) => return CHILD_ALIVE,
+                        Err(_) => return CHILD_LOCK_ERROR,
+                    }
+                    _lock = lock;
+                    match sys::open_dir_path_nofollow(Some(parent), name) {
+                        Ok(again) => match fstat(again.as_fd()) {
+                            Ok((dev, ino, true, _)) if (dev, ino) == identity => {}
+                            _ => return CHILD_IDENTITY,
+                        },
+                        Err(SysError::Os(n)) if n == sys::ENOENT => return CHILD_NOT_PRESENT,
+                        Err(_) => return CHILD_IDENTITY,
+                    }
+                }
                 match remove_tree_at(parent, name, identity, owner) {
                     Ok(RecordedRootfsRemoval::Removed) => CHILD_REMOVED,
                     Ok(RecordedRootfsRemoval::NotPresent) => CHILD_NOT_PRESENT,
@@ -1461,8 +1544,13 @@ mod imp {
         // 写像の書き込み（holder の待ちを含む最大 3 × 期限 + 5 秒）と削除の予算を合わせた期限。
         let budget = helper_timeout * 3 + std::time::Duration::from_secs(5) + USERNS_REMOVE_BUDGET;
         match wait_forked_child(pid, budget) {
-            Ok(ChildExit::Exited(CHILD_REMOVED)) => Ok(RecordedRootfsRemoval::Removed),
-            Ok(ChildExit::Exited(CHILD_NOT_PRESENT)) => Ok(RecordedRootfsRemoval::NotPresent),
+            Ok(ChildExit::Exited(CHILD_REMOVED)) => Ok(UsernsOutcome::Removed),
+            Ok(ChildExit::Exited(CHILD_NOT_PRESENT)) => Ok(UsernsOutcome::NotPresent),
+            Ok(ChildExit::Exited(CHILD_ALIVE)) if lock_in_child => Ok(UsernsOutcome::Alive),
+            Ok(ChildExit::Exited(CHILD_LOCK_ERROR)) if lock_in_child => {
+                Ok(UsernsOutcome::LockError)
+            }
+            Ok(ChildExit::Exited(CHILD_IDENTITY)) if lock_in_child => Ok(UsernsOutcome::Identity),
             Ok(ChildExit::Exited(CHILD_REFUSED)) => Err(refuse()),
             Err(e) if e.code == ErrorCode::Timeout => Err(TraitError::new(
                 ErrorCode::Timeout,

@@ -13,6 +13,8 @@
 //! - `c`: 公開済みで状態の無い subuid 所有の木（`a` の残り）を、次の `create_with_image` が userns の中で
 //!   孤児として回収する（`image_rootfs_orphan_reap` 成功 1 件）
 //! - `d`: 展開途中の subuid 所有の木は、権限なしの回収が失敗として残し、権限ありの回収が消す
+//! - `d2`: 最上位自身が subuid 所有・mode 0700 の展開途中の木（ホストの uid ではロック用に開けない）を、
+//!   権限なしは `LockError` で残し、権限ありは userns の中でロック・同一性確認・削除まで行って回収する
 //! - `e`: 展開に失敗した create の後始末（`image_rootfs_cleanup`）が、権限ありなら subuid 所有の木を消す
 //!
 //! # 実機前提テストとしての分離
@@ -31,7 +33,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--populate") {
         let dir = args.get(i + 1).expect("directory after --populate");
-        linux::populate(dir);
+        linux::populate(dir, args.iter().any(|a| a == "--chown-root"));
     } else if args.iter().any(|a| a == "--ignored") {
         linux::run();
     } else {
@@ -87,7 +89,9 @@ mod linux {
     }
 
     /// 展開器の役の子: userns の中で subuid 所有の木を作る（`chown(1, 1)`・mode 0555）。
-    pub fn populate(dir: &str) {
+    /// `chown_root` なら、木の最上位 `dir` 自身も subuid 所有・mode 0700 にする（展開途中でクラッシュした
+    /// 木の再現。ホストの実効 uid ではロック用に開き直せない）。
+    pub fn populate(dir: &str, chown_root: bool) {
         // userns に入る前にディレクトリを開く（入った後は親の `/proc/<pid>/fd` に頼らない）。
         let root = std::fs::File::open(dir).expect("open target dir");
         let (euid, egid) = (euid(), std::fs::metadata("/proc/self").expect("stat").gid());
@@ -116,11 +120,20 @@ mod linux {
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).expect("chmod sub");
         std::os::unix::fs::chown(sub.join("f"), Some(1), Some(1)).expect("chown f");
         std::os::unix::fs::chown(&sub, Some(1), Some(1)).expect("chown sub");
+        if chown_root {
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod root");
+            std::os::unix::fs::chown(&base, Some(1), Some(1)).expect("chown root");
+        }
     }
 
     /// 本試験バイナリを `--populate` で再実行して、`dir`（親のプロセスが保持する fd を指す経路でも可）に
     /// subuid 所有の木を作らせる。子の待ちは期限つきで、超えたら kill して失敗にする（REPAIR-5）。
     fn populate_via_child(dir: &Path) {
+        populate_child(dir, false);
+    }
+
+    fn populate_child(dir: &Path, chown_root: bool) {
         // `/proc/self/fd/N` は子から見ると別のプロセスの fd なので、親の pid の経路へ読み替える。
         let text = dir.to_string_lossy();
         let path = match text.strip_prefix("/proc/self/") {
@@ -128,10 +141,12 @@ mod linux {
             None => text.into_owned(),
         };
         let exe = std::env::current_exe().expect("current exe");
-        let mut child = Command::new(exe)
-            .args(["--populate", &path])
-            .spawn()
-            .expect("spawn populate child");
+        let mut cmd = Command::new(exe);
+        cmd.args(["--populate", &path]);
+        if chown_root {
+            cmd.arg("--chown-root");
+        }
+        let mut child = cmd.spawn().expect("spawn populate child");
         let deadline = Instant::now() + CHILD_DEADLINE;
         loop {
             match child.try_wait().expect("try_wait") {
@@ -392,6 +407,28 @@ mod linux {
         assert_eq!(r.reclaimed.len(), 1, "{r:?}");
         assert!(!staging.exists());
         println!("rootless_image_rootfs_remove: scenario d verified");
+        drop(sb);
+
+        // d2: 最上位自身が subuid 所有・mode 0700 の展開途中の木（ホストの uid ではロック用に開けない）。
+        // 権限なしは LockError で残し、権限ありは userns の中でロック・同一性確認・削除まで行う。
+        let sb = Sandbox::new("d2");
+        let staging = sb.bundle().join(".fandhe-unpack-2-1");
+        std::fs::create_dir(&staging).expect("staging");
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        populate_child(&staging, true);
+        let rec = OpRecorder::new();
+        let r =
+            reap_stale_unpacks_with(&sb.bundle(), Path::new("rootfs"), &ReapOptions::new(), &rec)
+                .expect("reap (host)");
+        assert!(r.reclaimed.is_empty(), "{r:?}");
+        assert_eq!(r.kept_unverified.len(), 1, "{r:?}");
+        assert!(staging.exists());
+        let options = ReapOptions::new().with_privilege(sub.clone());
+        let r = reap_stale_unpacks_with(&sb.bundle(), Path::new("rootfs"), &options, &rec)
+            .expect("reap (subordinate)");
+        assert_eq!(r.reclaimed.len(), 1, "{r:?}");
+        assert!(!staging.exists());
+        println!("rootless_image_rootfs_remove: scenario d2 verified");
         drop(sb);
 
         // e: 展開に失敗した create の後始末。

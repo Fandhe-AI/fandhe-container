@@ -104,6 +104,7 @@ fandhe-container/
 │   │   ├── oci-mounts-implicit-entries.md  # mounts[] の bind・sysfs 以外（暗黙に供給済みの /proc・/dev 系・tmpfs 等）を受けるかの判断記録（#2347・TASK-29 追補・OCI-4・SEC-1。オーナー承認待ち）
 │   │   ├── container-ref-reconcile.md  # コンテナ参照の照合とクラッシュ復旧 GC の起動点（create ゲートの共有 / 排他・契機 A / B・probe の写し方。`Present` かつ未確定の扱いはオーナー確認待ち。#2495・OCI-7・CLI-1・CORE-1）
 │   │   ├── image-rootfs-lifetime.md  # イメージ由来 rootfs（core が create_with_image で作ったもの）の所有・delete での削除・失敗時の扱い（#2378・OCI-7・OCI-5）
+│   │   ├── cri-config-acceptance.md  # CRI の未受理項目の受け入れ順序と担当、イメージ User の名前解決の方式（fd 起点の passwd / group 読み取り。#2606・CRI-2・CRI-7・SEC-1・SEC-5）
 │   │   └── plugin-hash-allowlist.md  # plugin の許可済みハッシュ一覧の置き場所・読み込み経路・一覧ファイル自体の検証の設計案（TASK-122 追補・#1868・PLUG-11。オーナー承認待ち）
 │   ├── setup/                     # 利用者向けセットアップ手順
 │   │   ├── linux.md               # Linux の配置手順（CLI・supervisor・launcher を同じディレクトリに置く。rootful はインストールスクリプト、rootless は利用者所有のディレクトリ。`PATH` 上の symlink。#2068・SUP-14・CORE-6）

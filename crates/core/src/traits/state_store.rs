@@ -664,6 +664,19 @@ pub enum ExplicitStop {
     Recorded,
 }
 
+impl ExplicitStop {
+    /// supervisor の `inspect` 出力（`explicitStop`）の固定語彙（SUP-9・REPAIR-4・#2601）。
+    ///
+    /// `"not_recorded"` は「明示 stop ではない」とは限らない。#2568 より前の `state.json`（キー無し）・
+    /// クラッシュ等の明示 stop でない終了・`stopped` 以外の状態を区別しない。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRecorded => "not_recorded",
+            Self::Recorded => "recorded",
+        }
+    }
+}
+
 impl StateRecord {
     /// コンテナ状態・OCI bundle の絶対パス・revision からレコードを作る。
     ///
@@ -1266,6 +1279,14 @@ impl DeleteStateResponse {
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+
+    /// inspect の語彙は固定（SUP-9・#2601）。
+    #[test]
+    fn sup9_2601_explicit_stop_vocabulary() {
+        assert_eq!(ExplicitStop::NotRecorded.as_str(), "not_recorded");
+        assert_eq!(ExplicitStop::Recorded.as_str(), "recorded");
+    }
+
     use std::collections::{BinaryHeap, HashMap};
     use std::sync::{Arc, Mutex};
 

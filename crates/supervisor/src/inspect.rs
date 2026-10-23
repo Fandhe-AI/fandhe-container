@@ -19,6 +19,12 @@
 //!   `{"model":"single"|"subordinate","uid":[{"containerId":N,"hostId":N,"size":N},...],"gid":[...]}`。
 //!   値は数値と固定語彙だけ（エスケープ不要）。行数は uid・gid とも最大 340 で出力は有界。`hostId` は記録値で、
 //!   権限判断・シグナル送信先に使わない（観測専用）。
+//! - `explicitStop`（SUP-9・REPAIR-4・#2601）は明示 stop の記録で、`"recorded"` / `"not_recorded"` の固定語彙。
+//!   `"not_recorded"` は「明示 stop ではない」を意味しない。#2568 より前の `state.json`（キー無し）・クラッシュ等の
+//!   明示 stop でない終了・`stopped` 以外の状態を区別しない。`"recorded"` は `status` が `stopped` のときだけ現れる。
+//! - `auditCoverage.record`（SEC-4・REPAIR-4・#2601）は縮退の監査記録を記録先へ書けなかったときだけ `"failed"`、
+//!   それ以外は `null`。`null` は「記録された」保証ではない（縮退なし・記録成功・#2468 より前の旧記録を区別しない）。
+//!   `auditCoverage` 自体が `null` のときは出ない。
 //! - `supervisorPid`・`pid` は記録値でありシグナル送信先・権限判断に使わない（SUP-5・SUP-8）。
 //! - Linux 以外では core が `Unimplemented` を返し、そのまま伝播する（CLI-1）。
 //! - 出力は有界: ID 255 バイト・bundle / cgroupScope 各 4096 バイト以下（core が検証）、
@@ -30,8 +36,8 @@ use std::num::NonZeroU32;
 use std::path::Path;
 
 use fandhe_container_core::traits::{
-    CgroupPlacement, ContainerId, ContainerState, ErrorCode, GetStateRequest, HealthStatus,
-    StateRecord, StateRevision, StateStore, TraitError,
+    CgroupPlacement, ContainerId, ContainerState, ErrorCode, ExplicitStop, GetStateRequest,
+    HealthStatus, StateRecord, StateRevision, StateStore, TraitError,
 };
 
 /// bundle・cgroupScope の最大バイト数（出力有界化の上限。core の `state.json` 検証値と揃える）。
@@ -129,6 +135,11 @@ impl InspectReport {
         self.record.restart_count()
     }
 
+    /// 明示 stop の記録（SUP-9・#2601）。
+    pub fn explicit_stop(&self) -> ExplicitStop {
+        self.record.explicit_stop()
+    }
+
     /// 1 個の JSON オブジェクト（末尾改行なし）へ整形する。
     pub fn to_json(&self) -> String {
         let mut s = String::with_capacity(256);
@@ -172,6 +183,8 @@ impl InspectReport {
         self.push_audit_coverage(&mut s);
         s.push_str(",\"idMapping\":");
         self.push_id_mapping(&mut s);
+        s.push_str(",\"explicitStop\":");
+        push_str_value(&mut s, self.explicit_stop().as_str());
         s.push('}');
         s
     }
@@ -234,6 +247,15 @@ impl InspectReport {
         layer(s, coverage.seccomp_kill());
         s.push_str(",\"landlock\":");
         layer(s, coverage.landlock());
+        s.push_str(",\"record\":");
+        match self
+            .record
+            .launch_isolation()
+            .map(|l| l.audit_coverage_record().as_str())
+        {
+            Some(Some(r)) => push_str_value(s, r),
+            _ => s.push_str("null"),
+        }
         s.push('}');
     }
 
@@ -344,7 +366,7 @@ mod tests {
         .unwrap()
         .with_supervision(SupervisionState::new(nz(7), Some(HealthStatus::Healthy), 2));
         let expected = format!(
-            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2,\"auditCoverage\":null,\"idMapping\":null}}",
+            "{{\"id\":\"web-1\",\"status\":\"running\",\"pid\":42,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":5,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":7,\"health\":\"healthy\",\"restartCount\":2,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\"}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -363,7 +385,7 @@ mod tests {
         )
         .unwrap();
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null}}",
+            "{{\"id\":\"c\",\"status\":\"created\",\"pid\":null,\"exitCode\":null,\"bundle\":\"{}\",\"revision\":1,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\"}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(
@@ -386,7 +408,28 @@ mod tests {
             StateRevision::from_raw(2),
         ));
         let expected = format!(
-            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null}}",
+            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":-9,\"bundle\":\"{}\",\"revision\":3,\"cgroupScope\":\"/a/b\",\"cgroupInstance\":2,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"not_recorded\"}}",
+            json_escape(&b.to_string_lossy())
+        );
+        assert_eq!(
+            InspectReport::from_record(&rec).unwrap().to_json(),
+            expected
+        );
+    }
+
+    /// 明示 stop の記録は `explicitStop` に `"recorded"` で出る（SUP-9・#2601）。
+    #[test]
+    fn sup9_2601_explicit_stop_recorded_json_is_exact() {
+        let b = bundle();
+        let rec = StateRecord::new(
+            ContainerStatus::stopped(cid("c"), Some(0)),
+            b.clone(),
+            StateRevision::from_raw(4),
+        )
+        .unwrap()
+        .with_explicit_stop(fandhe_container_core::traits::ExplicitStop::Recorded);
+        let expected = format!(
+            "{{\"id\":\"c\",\"status\":\"stopped\",\"pid\":null,\"exitCode\":0,\"bundle\":\"{}\",\"revision\":4,\"cgroupScope\":null,\"cgroupInstance\":null,\"supervisorPid\":null,\"health\":null,\"restartCount\":0,\"auditCoverage\":null,\"idMapping\":null,\"explicitStop\":\"recorded\"}}",
             json_escape(&b.to_string_lossy())
         );
         assert_eq!(

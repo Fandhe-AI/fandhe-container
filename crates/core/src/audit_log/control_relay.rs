@@ -13,7 +13,8 @@
 //!
 //! - 構築（[`ControlAuditRelay::spawn`]）は呼び出しプロセスが単一スレッドのときだけ成功する（`FailedPrecondition`）。
 //!   制御チャネルの listener を bind する前に呼ぶこと（helper は fd 3 以上を閉じるため listener を持たない）
-//! - 運べるのは [`AuditEvent::ControlPeer`]・[`AuditEvent::Seccomp`]・[`AuditEvent::ExitSignal`]（#2236。launcher の
+//! - 運べるのは [`AuditEvent::PluginPeer`]（#2484。plugin-cri の peer 認証の拒否。socket のパスは mount と同じ枠で運ぶ）・
+//!   [`AuditEvent::ControlPeer`]・[`AuditEvent::Seccomp`]・[`AuditEvent::ExitSignal`]（#2236。launcher の
 //!   回収点が出す補助の `exit_signal`）・理由なしの [`AuditEvent::Mount`]（#2481。supervisor の `start` が作業スレッドで
 //!   出す bind・sysfs の拒否。パスは生バイトで運ぶ）の記録だけ（他の層と、理由つきの `Mount` は `InvalidArgument`。
 //!   理由トークンは静的文字列の開いた語彙で、復号側が閉じた表へ戻せないため。理由つきの記録は単一スレッドの launch が
@@ -45,7 +46,7 @@ use crate::traits::{ContainerId, ErrorCode, TraitError};
 use super::{
     AUDIT_PATH_MAX_BYTES, AuditEvent, AuditPath, AuditPid, AuditRecord, AuditSignal, AuditSink,
     AuditSyscallArch, AuditSyscallNr, AuditTimestamp, ControlPeerRejection, FileAuditSink,
-    RECORD_WAIT_LIMIT,
+    PluginPeerRejection, RECORD_WAIT_LIMIT,
 };
 
 /// 枠の固定部: 理由 1・秒 8・ナノ秒 4・PID 4・コンテナ ID 長 1。
@@ -75,12 +76,28 @@ const TAG_MOUNT: u8 = 0x83;
 /// mount の枠の固定の追加部の長さ（path_present 1・path_len 2・original_len 8）。パス本体はこの後ろに続く。
 const MOUNT_EXTRA_LEN: usize = 1 + 2 + 8;
 
+/// plugin の peer 認証の拒否（`AuditEvent::PluginPeer`。#2484）の記録を示す先頭バイト。コンテナ ID（常に空）の後に
+/// 理由の添字（`PLUGIN_PEER_REJECTIONS` の位置 1）と mount と同じ追加部（`MountHeader`）、可変長のパス本体が付く。
+const TAG_PLUGIN_PEER: u8 = 0x84;
+/// plugin_peer の枠の固定の追加部の長さ（理由の添字 1 ＋ `MOUNT_EXTRA_LEN`）。
+const PLUGIN_PEER_EXTRA_LEN: usize = 1 + MOUNT_EXTRA_LEN;
+
+/// plugin_peer で運べる拒否理由（枠の添字）。`Unknown` も運ぶ（落とさず記録する）。
+const PLUGIN_PEER_REJECTIONS: [PluginPeerRejection; 5] = [
+    PluginPeerRejection::PeerUidMismatch,
+    PluginPeerRejection::PeerUidUnavailable,
+    PluginPeerRejection::PeerPidMismatch,
+    PluginPeerRejection::PeerPidUnavailable,
+    PluginPeerRejection::Unknown,
+];
+
 /// 先頭バイトから、コンテナ ID の後ろに続く追加部の長さを返す（`serve` の読み取り量を 1 か所で決める）。
 const fn extra_len(tag: u8) -> usize {
     match tag {
         TAG_SECCOMP => SECCOMP_EXTRA_LEN,
         TAG_EXIT_SIGNAL => EXIT_SIGNAL_EXTRA_LEN,
         TAG_MOUNT => MOUNT_EXTRA_LEN,
+        TAG_PLUGIN_PEER => PLUGIN_PEER_EXTRA_LEN,
         _ => 0,
     }
 }
@@ -107,6 +124,9 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
                 "the audit relay does not carry mount records with a reason",
             ));
         }
+        AuditEvent::PluginPeer { path, reason } => {
+            return encode_plugin_peer(record, path, reason.as_str());
+        }
         AuditEvent::ControlPeer { reason } => {
             let Some(tag) = REJECTIONS
                 .iter()
@@ -131,7 +151,7 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
         _ => {
             return Err(err(
                 ErrorCode::InvalidArgument,
-                "the audit relay only carries control channel, seccomp, exit signal and mount records",
+                "the audit relay only carries control channel, plugin peer, seccomp, exit signal and mount records",
             ));
         }
     };
@@ -278,6 +298,46 @@ fn encode_mount(record: &AuditRecord, path: Option<&AuditPath>) -> Result<Vec<u8
     Ok(frame)
 }
 
+/// `PluginPeer`（#2484）を枠へ符号化する。理由は閉じた表の添字で運び、表に無いトークンは拒否する。
+fn encode_plugin_peer(
+    record: &AuditRecord,
+    path: &AuditPath,
+    reason: &str,
+) -> Result<Vec<u8>, TraitError> {
+    let Some(index) = PLUGIN_PEER_REJECTIONS
+        .iter()
+        .position(|r| r.as_str() == reason)
+        .and_then(|i| u8::try_from(i).ok())
+    else {
+        return Err(err(
+            ErrorCode::InvalidArgument,
+            "the audit relay does not know this rejection reason",
+        ));
+    };
+    let (header, bytes) = MountHeader::for_path(Some(path))?;
+    let mut frame = Vec::with_capacity(FIXED_LEN + PLUGIN_PEER_EXTRA_LEN + bytes.len());
+    push_head(&mut frame, TAG_PLUGIN_PEER, record)?;
+    frame.push(index);
+    frame.extend_from_slice(&header.to_bytes());
+    frame.extend_from_slice(bytes);
+    Ok(frame)
+}
+
+/// `rest`（ID の後ろ）から plugin_peer の記録の ID と事象を組み直す。壊れた枠・パスなしは `None`。
+fn decode_plugin_peer(rest: &[u8], id_len: usize) -> Option<(&[u8], AuditEvent)> {
+    let (id, after) = rest.split_at_checked(id_len)?;
+    let rejection = PLUGIN_PEER_REJECTIONS.get(usize::from(*after.first()?))?;
+    let header = MountHeader::parse(after.get(1..PLUGIN_PEER_EXTRA_LEN)?)?;
+    let path = header.into_path(after.get(PLUGIN_PEER_EXTRA_LEN..)?)??;
+    Some((
+        id,
+        AuditEvent::PluginPeer {
+            path,
+            reason: super::AuditReason::new(rejection.as_str()),
+        },
+    ))
+}
+
 /// `rest`（ID の後ろ）から mount の記録の ID と事象を組み直す。壊れた枠は `None`。
 fn decode_mount(rest: &[u8], id_len: usize) -> Option<(&[u8], AuditEvent)> {
     let (id, after) = rest.split_at_checked(id_len)?;
@@ -299,6 +359,8 @@ fn decode(frame: &[u8]) -> Option<AuditRecord> {
     }
     let (id, event) = if tag == TAG_MOUNT {
         decode_mount(rest, id_len)?
+    } else if tag == TAG_PLUGIN_PEER {
+        decode_plugin_peer(rest, id_len)?
     } else if tag == TAG_SECCOMP {
         // 長さは厳密に一致させる（余りも不足も壊れた枠）。
         if rest.len() != id_len.checked_add(SECCOMP_EXTRA_LEN)? {
@@ -354,10 +416,19 @@ fn serve(mut stream: UnixStream, sink: &FileAuditSink) -> i32 {
         {
             return 1;
         }
-        if head.first() == Some(&TAG_MOUNT) {
+        let header_offset = match head.first() {
+            Some(&TAG_MOUNT) => Some(0),
+            // plugin_peer は追加部の先頭に理由の添字 1 バイトがあり、MountHeader はその後ろ。
+            Some(&TAG_PLUGIN_PEER) => Some(1),
+            _ => None,
+        };
+        if let Some(offset) = header_offset {
             // 可変長のパス本体。長さは型で検証してから確保する（壊れた枠はストリームを読み進められないので
             // helper を終え、親は応答待ちの期限で Unavailable になる。fail-closed。DoS 対策）。
-            let Some(header) = frame.get(FIXED_LEN + id_len..).and_then(MountHeader::parse) else {
+            let Some(header) = frame
+                .get(FIXED_LEN + id_len + offset..)
+                .and_then(MountHeader::parse)
+            else {
                 return 1;
             };
             let start = frame.len();
@@ -1002,5 +1073,62 @@ mod tests {
         let mut wrong_len = good;
         wrong_len[17] = 3;
         assert!(decode(&wrong_len).is_none());
+    }
+
+    fn plugin_peer_sample(rejection: PluginPeerRejection, path: &str) -> AuditRecord {
+        AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
+            AuditPid::new(4242).unwrap(),
+            rejection.audit_event(std::path::Path::new(path)),
+        )
+    }
+
+    /// SEC-4・PLUG-12・#2484: plugin_peer の枠は理由 5 種・パス（切り詰めと元の長さを含む）が往復で一致する。
+    #[test]
+    fn sec4_2484_plugin_peer_frame_round_trips() {
+        let long = format!("/{}", "a".repeat(AUDIT_PATH_MAX_BYTES + 10));
+        for rejection in PLUGIN_PEER_REJECTIONS {
+            for path in ["/run/p/cri.sock", long.as_str()] {
+                let rec = plugin_peer_sample(rejection, path);
+                let frame = encode(&rec).unwrap();
+                assert_eq!(frame[0], TAG_PLUGIN_PEER);
+                assert_eq!(extra_len(frame[0]), PLUGIN_PEER_EXTRA_LEN);
+                let back = decode(&frame).unwrap();
+                assert_eq!(back.event(), rec.event());
+                assert_eq!(back.pid(), rec.pid());
+                assert_eq!(back.timestamp(), rec.timestamp());
+                assert_eq!(back.container_id(), None);
+                assert_eq!(back.reason().unwrap().as_str(), rejection.as_str());
+            }
+        }
+        let back =
+            decode(&encode(&plugin_peer_sample(PluginPeerRejection::Unknown, &long)).unwrap())
+                .unwrap();
+        let AuditEvent::PluginPeer { path, .. } = back.event() else {
+            panic!("plugin_peer");
+        };
+        assert!(path.is_truncated());
+        assert_eq!(path.original_len(), AUDIT_PATH_MAX_BYTES + 11);
+    }
+
+    /// REPAIR-2・#2484: plugin_peer の壊れた枠（未知の理由添字・パスなし・本体の不足と余り）は記録にしない。
+    #[test]
+    fn repair2_2484_malformed_plugin_peer_frames_are_not_decoded() {
+        let good = encode(&plugin_peer_sample(
+            PluginPeerRejection::PeerUidMismatch,
+            "/s.sock",
+        ))
+        .unwrap();
+        assert!(decode(&good).is_some());
+        assert!(decode(&good[..good.len() - 1]).is_none());
+        let mut longer = good.clone();
+        longer.push(0);
+        assert!(decode(&longer).is_none());
+        let mut bad_reason = good.clone();
+        bad_reason[FIXED_LEN] = 5;
+        assert!(decode(&bad_reason).is_none());
+        let mut absent = good;
+        absent[FIXED_LEN + 1] = 0;
+        assert!(decode(&absent).is_none());
     }
 }

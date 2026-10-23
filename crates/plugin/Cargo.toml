@@ -35,6 +35,9 @@ publish = false
 [features]
 default = []
 grpc = ["dep:tonic", "dep:tokio", "dep:hyper-util"]
+# 結合試験用: `UdsIncoming` の期待 UID だけを差し替える口を公開する（#2484・PLUG-12。照合を省く経路ではない）。
+# 本番の依存（core・plugin-cri・cli）では有効にしない。
+test-support = ["grpc"]
 
 [dependencies]
 serde = { workspace = true }

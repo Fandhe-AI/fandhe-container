@@ -114,6 +114,7 @@ kill・delete・state は plugin-macos では未実装（`UNIMPLEMENTED`）。pr
 ### 4.7 監査と計装
 
 - peer 認証の拒否: core に `PeerAuthObserver` の実装（例: `AuditPeerAuthObserver`）を置き、拒否 1 件につき `AuditSink`（本番は `FileAuditSink`）へ 1 件記録する。フックはブロックする I/O をしない契約なので、拒否はメモリの有界バッファにため、呼び出しが戻った後に sink へ書く（`JsonLinesPeerAuthObserver` → `drain_lines` → sink の形）。socket のパスは監査の記録にだけ載せ、CLI の出力には出さない
+- CRI の gRPC 経路の peer 拒否（#2484 で配線済み。本書の承認状態とは独立）: plugin-cri が受付側なので、plugin 境界をまたがず plugin-cri のプロセス内で core の `ControlAuditRelay` → `FileAuditSink`（同じ `@audit.log`）へ書く。層は `plugin_peer`（理由は `plugin_peer_uid_mismatch` 等の閉じた語彙。パスは socket、uid・pid の値は載せない）。フックは有界キューへ `try_send` するだけで I/O をせず、専用 thread が sink へ書く（文字列の `drain_lines` ではなく型つきの `AuditRecord` を渡す点が上の形との差）。あふれ・書き込み失敗は固定語彙の行で stderr に残す。記録経路を作れなければ（Linux）起動しない。非 Linux は #2430 の判断待ちで stderr のみ。長さ接頭辞フレームの経路（core が接続する側）は上のとおり W5
 - 信頼性検証の拒否: 入口は `verify_candidate`（記録なし）ではなく `verify_candidate_audited` を使い、同じ sink へ書く
 - 起動 API の observer（`call_observed` の `PluginCallRecord` / `OneShotRecord` / `ResidentCallRecord`）: #1322 のとおり、proxy を配線する場所（4.1 の core のモジュール）で `OpRecorder` へ渡す。CLI は今の `production_runtime` が持つ `OpRecorder` を入口へ渡す
 - `Drop` 時に延期された後始末の記録: CLI の `main.rs` が終了時に `take_pending_child_cleanup_failures` を呼ぶので追加配線は要らない。段階 2 の保持役を作るときはそのホストでも取り出しを配線する
@@ -132,7 +133,7 @@ kill・delete・state は plugin-macos では未実装（`UNIMPLEMENTED`）。pr
 - Windows: #1415 の決定と #1862（PR #2197）の推奨により、ホストでは plugin を発見も起動もしない。ゲスト内の core は Linux の経路を使う。plugin-windows の doc の「core 側 proxy が spawn する（TASK-114）」は #2197 の言い方（ホストの起動役の補助）に合わせて書き換え、「proxy が spawn する」とは書かない
 - plugin-mcp: MCP クライアントが起動する前面のサーバーで core が起動するものではないため、この入口には乗せない。結線とフレーミングは別 issue で追う
 - plugin-microvm: 将来この入口（`BackendKind` に値を足す）に乗せる候補。本書の範囲外
-- TASK-114（CRI の gRPC 経路）との分担: 共有するのは入口のうち「発見 → 検証 → 起動対象」の部分だけ（関数として切り出す）。gRPC の接続と `ContainerRuntime` の proxy は別（plugin-cri は gRPC サーバーで、本書の長さ接頭辞フレームの proxy は使わない）
+- TASK-114（CRI の gRPC 経路）との分担: 共有するのは入口のうち「発見 → 検証 → 起動対象」の部分だけ（関数として切り出す）。gRPC の接続と `ContainerRuntime` の proxy は別（plugin-cri は gRPC サーバーで、本書の長さ接頭辞フレームの proxy は使わない）。その peer 拒否の監査は、受付側の plugin-cri が自プロセス内で core の監査ログへ書く形で #2484 に配線済み（4.7）
 
 ### 4.10 CLI の失敗の分類
 

@@ -1516,17 +1516,14 @@ jobs:
 
       # start_stop_delete_real（`crates/cli/tests/`。CLI-1・SUP-1・SUP-4・CORE-3・CORE-4・OCI-6・#2596）: CLI は同じディレクトリの
       # supervisor の bin を使うため先にビルドして置く。試験バイナリ自体を委譲スコープの中で動かす（自分の cgroup = 検出する委譲 cgroup）。
-      # `fandhe-container-launcher` が同じディレクトリにあると rootful のインストールとみなされるため、無いことを確かめる。
+      # `fandhe-container-launcher` が同じディレクトリにあると rootful のインストールとみなされるが、
+      # 試験本体が専用の work/bin へ CLI と supervisor だけを置き、launcher が無いことを確かめる。
       - name: start_stop_delete_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
         run: |
           set -euo pipefail
           cargo build -p fandhe-container-supervisor
-          if [ -e target/debug/fandhe-container-launcher ]; then
-            echo "::error::target/debug/fandhe-container-launcher must not exist (rootful install)" >&2
-            exit 1
-          fi
           json="${RUNNER_TEMP}/ssd-build.json"
           cargo test -p fandhe-container-cli --test start_stop_delete_real --no-run --message-format=json > "${json}"
           sel='select(.profile.test == true and .target.name == "start_stop_delete_real") | .executable'

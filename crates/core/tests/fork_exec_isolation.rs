@@ -72,6 +72,12 @@
 //! から分離している（ci.md「実機前提テスト」）。実行された場合は分離の拒否を含めあらゆる失敗を
 //! 失敗として扱い、検証せずに成功終了する分岐は持たない。プローブは x86_64 / aarch64 の機械語のみ
 //! 用意しており、それ以外のアーキテクチャは `sys` が `Unsupported` を返すため not applicable を出力する。
+//!
+//! # `landlock-apply-*` を fork 子で観測する理由（#2630・CORE-5・REPAIR-3）
+//! - Landlock のドメインは execve をまたいで変わらないため、適用後の fork 子で観測した拒否は exec 後と同じ規則による
+//! - `landlock-fail` は終端より前（Landlock の適用）で失敗するので、fork 子でも exec でも結果は同じ
+//! - exec に到達することと Landlock の下での exec は `landlock-exec` / `landlock-missing` がすでに照合している
+//! - 本試験は `platform-ci` の `--ignored` 対象でなく、移行後の観測を CI で確かめる手段が無い
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

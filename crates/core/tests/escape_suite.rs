@@ -135,6 +135,16 @@
 //! ケースの攻撃操作は、制限が欠けていてもホストへ副作用が出ない引数・対象に限る（`seccomp.rs` と同方針）。
 //! 攻撃クロージャ・ハーネスは `unsafe` を書かない。raw syscall が要る攻撃は core 側の `#[doc(hidden)]`
 //! プローブ（syscall 本体は `sys` モジュール）を経由する。
+//!
+//! # fork 子で観測する理由（ESC-03・ESC-06。#2630・CORE-5・REPAIR-3）
+//! `spawn_container_probe` と `_with_seccomp_listener` を使い続け、ESC-03・ESC-06 を含めてエントリポイント内へは移さない。
+//! - seccomp フィルタ・`NO_NEW_PRIVS`・Landlock のドメイン・マウントの状態は execve をまたいで変わらないため、
+//!   組み込み `Seccomp` 段の後の fork 子の観測は exec 後と同じフィルタによる
+//! - ESC-03: USER_NOTIF の listener の受け渡しと応答ループ・`@audit.log` の照合を ESC-01〜10 の 1 つのハーネスで扱っており、
+//!   exec 後の対応物は `supervisor_bin_real` のシナリオ E（本番の `SeccompNotifyHub` 経由）と `production_launcher` のシナリオ J
+//! - ESC-06: exec 後の対応物は `seccomp.rs` の `kill-<名前>` と `production_launcher` のシナリオ K
+//! - 移す条件（後続）: 本 suite の `platform-ci` への組み込み（ESC-06 の監査の解消〔#2236・#2237〕と Landlock ABI 6 以上の
+//!   runner の確保の後）と同時に、移行後の観測を CI で確かめる
 
 #[cfg(target_os = "linux")]
 #[path = "support/temp_rootfs.rs"]

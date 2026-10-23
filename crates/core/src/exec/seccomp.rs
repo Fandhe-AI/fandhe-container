@@ -471,7 +471,7 @@ pub enum EscapeSyscallProbe {
 ///
 /// 組み込み Seccomp 段の通過後に呼ばれる。呼び出し元は、exec 後のエントリポイント（`tests/seccomp.rs` の
 /// `/entry --entry kill-<名前>`・`production_launcher` のシナリオ K）と、`spawn_container_probe` の fork 子
-/// （`escape_suite` の ESC-06）。ESC-06 を fork 子のまま残してよい根拠: seccomp フィルタ・`NO_NEW_PRIVS`・Landlock のドメイン・マウントの状態は execve をまたいで変わらないため、
+/// （`escape_suite` の ESC-06）。ESC-06 を fork 子のまま残すと #2630 で決めた。残してよい根拠: seccomp フィルタ・`NO_NEW_PRIVS`・Landlock のドメイン・マウントの状態は execve をまたいで変わらないため、
 /// 組み込み `Seccomp` 段を通った後の fork 子で観測した `EPERM` や SIGSYS は、exec 後の PID 1 で観測したものと
 /// 同じフィルタによる。capability は execve で再計算されうるため例外で、exec 後の値は `production_launcher` の
 /// シナリオ J が照合する。
@@ -522,7 +522,8 @@ pub fn probe_escape_syscall(which: EscapeSyscallProbe) -> ProbeOutcome {
 /// いる。ここをエントリポイント内へ移さない根拠: seccomp フィルタ・`NO_NEW_PRIVS`・Landlock のドメイン・マウントの状態は execve をまたいで変わらないため、
 /// 組み込み `Seccomp` 段を通った後の fork 子で観測した `EPERM` や SIGSYS は、exec 後の PID 1 で観測したものと
 /// 同じフィルタによる。capability は execve で再計算されうるため例外で、exec 後の値は `production_launcher` の
-/// シナリオ J が照合する。ESC-03 の移行は未着手。
+/// シナリオ J が照合する。ESC-03 は移さないと決めた（#2630）。exec 後の対応物は上記のシナリオ E・J で、
+/// `escape_suite` の ESC-03 は listener の受け渡しと応答ループ・監査の照合を 1 つのハーネスで扱うため。
 #[cfg(any(feature = "escape-probe", feature = "exec-test-support"))]
 #[doc(hidden)]
 pub fn escape_probe_mount() -> Result<ProbeOutcome, ExecError> {

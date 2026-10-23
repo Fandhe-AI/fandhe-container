@@ -23,6 +23,17 @@
 //! # 実機前提テストとしての分離
 //! Linux 5.12 以降で root もしくは非特権 user namespace を許可するホストが必要。`-- --ignored` 指定時のみ実行する
 //! （ci.md「実機前提テスト」。AGENTS.md）。rootful 経路（root）の実行は root 権限コマンドのため明示指示のもとで行う。
+//!
+//! # fork 子で観測する理由（#2630・CORE-5・REPAIR-3）
+//! `spawn_container_probe` 系を使い続け、exec 後のエントリポイント内の観測へは移さない。
+//! - 識別性: 観測するのは mountinfo の最上位のマウント・fstype・`ro` などのフラグ・覆ったファイルの内容・書き込み用
+//!   `open` の errno で、いずれもマウントの状態で決まる。マウントの状態は execve をまたいで変わらないため、fork 子で
+//!   観測しても exec 後の PID 1 と同じ結果になる。exec 経路は Landlock が必須で `EACCES` の発生源が増えるため、
+//!   Landlock を載せない fork 子のほうが拒否の理由を識別しやすい
+//! - 移せない事情: exec 経路の試験用入口（`spawn_container_with_stages_and_devices`）は `devices` しか渡せず、
+//!   `config_paths` / `sysfs` を受け取らない。本試験は `platform-ci` の `--ignored` 対象でもなく、移行後の観測を CI で
+//!   確かめる手段が無い
+//! - 移す条件（後続）: `config_paths` / `sysfs` を受け取る exec 経路の入口と `platform-ci` への登録を同じ変更で入れる
 
 #[cfg(target_os = "linux")]
 #[path = "support/temp_rootfs.rs"]

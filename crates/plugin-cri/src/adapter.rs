@@ -159,21 +159,23 @@ impl CriPluginBackends {
         let root = StateRoot::resolve(None)?;
         let state_root = root.path().to_path_buf();
         let recorder = Arc::new(OpRecorder::new());
+        // 状態ルートの作成・検証・初期化（`FileStateStore::open`）を先に済ませる。`ReclaimStore::open` はルートが
+        // 既にあることを前提にし、先に `.cri` を作ると新規ストアの判定を壊すため（NET-1・#2604）。
+        let state: Arc<dyn StateStore> = Arc::new(FileStateStore::open(root)?);
         // netns の pin の置き場は状態ルート配下の固定の場所（要求の入力からは受けない。TASK-114.4）。
         // 先頭が `.` のため、英数字始まりの `ContainerId` の状態ディレクトリと衝突しない。
         #[cfg(target_os = "linux")]
         let network: Arc<dyn NetworkPlugin> = Arc::new(NetsetupNetwork::with_reclaim_store(
             LinuxNetsetup::with_recorder(
-                root.path().join(".netns"),
+                state_root.join(".netns"),
                 Arc::new(CoreNetRecorder(Arc::clone(&recorder))),
             ),
             // 作成失敗の回収待ちの記録は状態ルート配下の固定の場所に残し、再起動後に読み込む（NET-1・#2604）。
-            crate::netsetup::ReclaimStore::open(root.path())?,
+            crate::netsetup::ReclaimStore::open(&state_root)?,
             Some(Arc::clone(&recorder)),
         )?);
         #[cfg(not(target_os = "linux"))]
         let network: Arc<dyn NetworkPlugin> = Arc::new(UnimplementedNetwork);
-        let state: Arc<dyn StateStore> = Arc::new(FileStateStore::open(root)?);
         let mut runtime =
             CoreLifecycleRuntime::with_recorder(Arc::clone(&state), Arc::clone(&recorder));
         if let Some(sink) = create_audit {

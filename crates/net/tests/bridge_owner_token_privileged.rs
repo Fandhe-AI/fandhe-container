@@ -334,17 +334,35 @@ mod linux {
         // （plugin の再起動後の回収の核。記録を読むのは復号だけで、所有はカーネル側のトークンで判定する。#2604）。
         let rr = create_network(&route, &nft, &spec("rr", [10, 218, 0, 1]), t)
             .unwrap_or_else(|e| fail(&format!("create_network rr: {e}")));
-        let record_path = std::env::temp_dir().join(format!(
-            "fandhe-bridge-owner-token-{}.claim",
-            std::process::id()
+        // 共有一時ディレクトリの予測できるパスへ書かない: 0700 の専用ディレクトリを新規に作り、その中に
+        // `create_new` で排他的に作る（既存ファイルの切り詰め・symlink 追従を許さない）。
+        let record_dir = std::env::temp_dir().join(format!(
+            "fandhe-bridge-owner-token-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
         ));
-        fs::write(
-            &record_path,
-            FailedCreateClaim::from_created(&rr).to_record(),
-        )
-        .unwrap_or_else(|e| fail(&e.to_string()));
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&record_dir)
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+        let record_path = record_dir.join("rr.claim");
+        {
+            use std::io::Write as _;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&record_path)
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            f.write_all(FailedCreateClaim::from_created(&rr).to_record().as_bytes())
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
         let record = fs::read_to_string(&record_path).unwrap_or_else(|e| fail(&e.to_string()));
-        let _ = fs::remove_file(&record_path);
+        let _ = fs::remove_dir_all(&record_dir);
         let restored =
             FailedCreateClaim::from_record(&record).unwrap_or_else(|e| fail(&e.to_string()));
         reclaim_failed_create(&route, &nft, &restored, t)

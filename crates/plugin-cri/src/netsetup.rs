@@ -776,8 +776,9 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             self.backend.reclaim_failed_create(&net_name, claim)?;
             // 回収を確認した後、記録ファイルを先に消す。消せなければメモリの記録も残し、同じ呼び出しの再試行で
             // 再回収（冪等）と記録の削除をやり直せる（メモリだけ消えてファイルが残る食い違いを作らない）。
-            if let Some(store) = &self.store {
-                store.remove(name)?;
+            // 条件付きで消す: 別プロセスが先に回収して同名を再作成した新しい請求書は消さない（NET-1・#2604）。
+            if let (Some(store), Some(record)) = (&self.store, self.backend.encode_claim(claim)) {
+                store.remove_if_matches(name, &record)?;
             }
             reg.networks.remove(name);
             return Ok(DeleteNetworkResponse::new());

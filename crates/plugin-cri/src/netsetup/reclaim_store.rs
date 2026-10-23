@@ -2,7 +2,7 @@
 //! （NET-1・NET-6・REPAIR-3・REPAIR-4。#2604。設計は `docs/design/network-reclaim-persistence.md`）。
 //!
 //! 呼び出し元: [`super::NetsetupNetwork`] が、作成失敗で取り残しを登録する時点で [`ReclaimStore::save`]、
-//! 回収を確認して記録を外した直後に [`ReclaimStore::remove`]、起動時に [`ReclaimStore::load`] を呼ぶ。
+//! 回収を確認して記録を外した直後に [`ReclaimStore::remove_if_matches`]、起動時に [`ReclaimStore::load`] を呼ぶ。
 //! 記録の中身（net の `FailedCreateClaim` の符号化）は本モジュールにとって不透明な文字列で、符号化と復号は
 //! [`super::NetsetupBackend`] が担う。置き場は `<状態ルート>/.cri/net/pending-reclaim/<ネットワーク名>.claim`
 //! の固定の場所で、要求の入力からは受けない。
@@ -149,10 +149,17 @@ impl ReclaimStore {
         sync_dir(&self.dir)
     }
 
-    /// 記録を消す。無ければ成功（冪等）。
-    pub fn remove(&self, name: &str) -> Result<(), TraitError> {
+    /// 記録の中身が `expected` と一致するときだけ消す。無ければ成功（冪等）。
+    ///
+    /// 同じ古い請求書を読んだ別プロセスが先に回収・削除し、同名の再作成で新しい請求書を保存した後に、遅れた側が
+    /// 新しい請求書まで消さないための条件付き削除（排他の下で照合する。NET-1・#2604）。中身が違えば消さずに成功する。
+    pub fn remove_if_matches(&self, name: &str, expected: &str) -> Result<(), TraitError> {
         let file = self.file_for(name)?;
         let _lock = self.lock()?;
+        match read_record(&file) {
+            Some(current) if current == expected => {}
+            _ => return Ok(()),
+        }
         match fs::remove_file(&file) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -331,8 +338,11 @@ mod tests {
                 },
             ]
         );
-        s.remove("web").expect("remove");
-        s.remove("web").expect("idempotent");
+        s.remove_if_matches("web", "stale\n")
+            .expect("mismatch keeps");
+        assert_eq!(s.load().expect("load").claims.len(), 2);
+        s.remove_if_matches("web", "rec-2\n").expect("remove");
+        s.remove_if_matches("web", "rec-2\n").expect("idempotent");
         assert_eq!(s.load().expect("load").claims.len(), 1);
         fs::remove_dir_all(&root).expect("cleanup");
     }

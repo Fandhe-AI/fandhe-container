@@ -836,20 +836,13 @@ fn net1_no_record_when_backend_does_not_encode() {
 #[cfg(unix)]
 #[test]
 fn net1_persist_failure_is_reported_and_memory_record_kept() {
-    use std::os::unix::fs::PermissionsExt as _;
     let root = temp_state_root("rofail");
     let fake = Fake::default();
     let net = persistent(&root, &fake);
     let dir = root.join(RECLAIM_DIR);
-    // 起動時の読み込みで排他用の .lock は作成済み。ディレクトリを読み取り専用にして一時ファイルの作成を失敗させる。
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("ro");
-    let probe = std::fs::write(dir.join("probe"), "x");
-    if probe.is_ok() {
-        // root 等で読み取り専用が効かない環境では前提を満たせないため、この試験は意味を持たない。
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("rw");
-        std::fs::remove_dir_all(&root).expect("cleanup");
-        return;
-    }
+    // 権限に依存せず（root でも効く）、置き場のディレクトリを通常ファイルに差し替えて保存を必ず失敗させる。
+    std::fs::remove_dir_all(&dir).expect("rm dir");
+    std::fs::write(&dir, "not a directory").expect("replace by file");
     {
         let mut s = fake.0.lock().expect("lock");
         s.fail_create = true;
@@ -859,9 +852,10 @@ fn net1_persist_failure_is_reported_and_memory_record_kept() {
     assert_eq!(e.code(), ErrorCode::Internal);
     assert!(e.message().contains("could not be persisted"));
     fake.0.lock().expect("lock").reclaim_ok = true;
-    // 記録ファイルは無いので、回収の確認後の削除は冪等に成功する。
+    // 置き場を作り直す。記録ファイルは無いので、回収の確認後の削除は冪等に成功する。
+    std::fs::remove_file(&dir).expect("rm file");
+    ReclaimStore::open(&root).expect("reopen");
     net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
         .expect("reclaimed from memory");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("rw");
     std::fs::remove_dir_all(&root).expect("cleanup");
 }

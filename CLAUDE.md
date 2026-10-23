@@ -102,6 +102,7 @@ fandhe-container/
 │   │   ├── config-id-mappings.md  # config の linux.uidMappings / gidMappings を受けるかの判断記録（#2240・SEC-5・CORE-6。オーナー承認待ち）
 │   │   ├── windows-state-store-acl.md  # Windows の FileStateStore の所有者 SID 照合・保護 DACL の実装方式（windows-sys / 自前宣言 / 恒久拒否）の判断記録（#2428・OCI-5・SEC-4。オーナー承認待ち）
 │   │   ├── oci-mounts-implicit-entries.md  # mounts[] の bind・sysfs 以外（暗黙に供給済みの /proc・/dev 系・tmpfs 等）を受けるかの判断記録（#2347・TASK-29 追補・OCI-4・SEC-1。オーナー承認待ち）
+│   │   ├── network-reclaim-persistence.md  # 作成失敗の回収待ちの記録（請求書）を plugin の再起動をまたいで残す設計（置き場所・形式・排他・書く/消す時点・起動時の読み込み。IPAM 等は #1870 の後続。#2604・NET-1・NET-6・REPAIR-3・REPAIR-4）
 │   │   ├── container-ref-reconcile.md  # コンテナ参照の照合とクラッシュ復旧 GC の起動点（create ゲートの共有 / 排他・契機 A / B・probe の写し方。`Present` かつ未確定の扱いはオーナー確認待ち。#2495・OCI-7・CLI-1・CORE-1）
 │   │   ├── image-rootfs-lifetime.md  # イメージ由来 rootfs（core が create_with_image で作ったもの）の所有・delete での削除・失敗時の扱い（#2378・OCI-7・OCI-5）
 │   │   └── plugin-hash-allowlist.md  # plugin の許可済みハッシュ一覧の置き場所・読み込み経路・一覧ファイル自体の検証の設計案（TASK-122 追補・#1868・PLUG-11。オーナー承認待ち）
@@ -109,6 +110,7 @@ fandhe-container/
 │   │   ├── linux.md               # Linux の配置手順（CLI・supervisor・launcher を同じディレクトリに置く。rootful はインストールスクリプト、rootless は利用者所有のディレクトリ。`PATH` 上の symlink。#2068・SUP-14・CORE-6）
 │   │   ├── windows.md             # Windows セットアップ前提条件（WSL2・Developer Mode・`.wslconfig` の virtiofs。TASK-69・WIN-5。NTFS セマンティクス差異への対応〔TASK-68・WIN-4〕を統合）
 │   │   ├── macos.md               # macOS セットアップ前提条件（対応版・Virtualization.framework の entitlement とコード署名・ゲストカーネル / initrd の用意。実装済み / 未実装・#1906 等の判断待ちを区別。#2602・MAC-1・CLI-2）
+│   │   ├── network-reclaim-recovery.md  # 作成失敗で残った資源の観測と、印を刻む前に失敗した別名なし bridge の手動回収の手順（#2604・NET-1・REPAIR-4）
 │   │   └── plugin-socket-recovery.md  # plugin socket の `ALREADY_EXISTS` の見分け方と記録の無い socket の手動削除の手順（#1859・PLUG-12）
 │   ├── verification/              # 実機確認の記録雛形（crictl-smoke.md: crictl runp→create→start の疎通確認の手順書と結果雛形。TASK-60・CRI-1。結果記入は #442。cli-cross-platform-parity.md: CLI 基本 6 コマンドの 3 OS 同一構文・挙動チェックリスト。TASK-125.1・CLI-1。結果記入は #661。supervisor-measurement-runbook.md: 監視プロセス系の実機計測〔#499・#485・#491・#219〕の実行手順。#1820。rootless-start-cgroup.md: 本番の rootless start と委譲 cgroup の prepare の実機確認・delete の通し試験の手順と結果雛形。#2062・CORE-3・CORE-6・SEC-1・CLI-1。rootless-sysfs-readonly.md: rootless の /sys の読み取り専用 rbind の実機確認と、user namespace の root から ro を外せるかの測定の手順と結果雛形。#2305・SEC-2・SEC-1。landlock-audit-exec.md: Landlock ABI 7 以上の実カーネルで LOG_NEW_EXEC_ON 付き restrict_self が受理され拒否が監査ログに残ることの確認手順と結果雛形。#2306・SEC-4・CORE-5。plugin-peer-uid-after-close-macos.md: macOS で connect 直後に close された接続の peer UID 取得（`getpeereid`）の観測手順と結果雛形。PLUG-12・SEC-4・#2252 P2-2。結果記入は #2405。plugin-cri-peer-auth-reject.md: plugin-cri の別 UID connector 拒否の実機確認の手順書と結果雛形。PLUG-12・TASK-114.5。結果記入は #2485）
 │   └── spec/                      # fandhe-container-spec submodule（private・要アクセス権）

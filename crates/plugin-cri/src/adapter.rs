@@ -36,6 +36,11 @@
 //!   ContainerConfig → config.json 変換。#2433）。`ImageService` をサーブしていないためタグは解決できず、
 //!   image ID（`sha256:<hex>`）だけを受ける（イメージ取り込みの結線と合わせて別途。REPAIR-3）。
 //!   [`UnimplementedBundleProvider`] は試験と非 unix 用に残す
+//! - `create` の `mounts[].destination` の拒否（宛先の遡り・rootfs 全体・相対 `..`）の監査記録（SEC-4・OCI-4・CRI-7・#2594）は、
+//!   記録先を注入したときだけ行う（[`CriPluginBackends::production_with_audit_sink`]。Linux の本番はこちら）。プロセスが常に複数
+//!   スレッド（`spawn_blocking` 等）のため `FileAuditSink` を直接渡せず、`main.rs` が単一スレッドの間に作った
+//!   `ControlAuditRelay` を渡す。`production()` と非 Linux（永続化経路が未実装。#2430 の判断待ち）では記録しない。
+//!   `start` の再検証は supervisor（`fandhe_container_supervisor::start_client` が起動する bin）側で記録する
 //! - 状態ルートは既定（`StateRoot::resolve(None)`）に固定し、外部入力から受けない
 
 use std::fmt;
@@ -47,6 +52,7 @@ use std::time::{Duration, Instant};
 use crate::netsetup::{LinuxNetsetup, NetsetupNetwork};
 #[cfg(target_os = "linux")]
 use crate::supervised::SupervisedLifecycle;
+use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{self, ContainerCgroupRemover, OciRuntimeError};
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
@@ -127,6 +133,19 @@ impl CriPluginBackends {
     /// 状態ルートは既定の解決（`StateRoot::resolve(None)`）に固定する。解決できない OS では
     /// `Unimplemented` をそのまま返す（fail-closed）。
     pub fn production() -> Result<Self, TraitError> {
+        Self::production_inner(None)
+    }
+
+    /// [`Self::production`] に、`create` の `mounts[].destination` 拒否の監査の記録先を足したもの（SEC-4・OCI-4・CRI-7・#2594）。
+    ///
+    /// Linux の本番（`main.rs`）はこちらを呼び、`sink` に単一スレッドの間に作った `ControlAuditRelay` を渡す。
+    /// `production()` の `create` はこの拒否を記録しない。記録に失敗しても拒否の `code`・`message` は変えず、失敗は固定語彙の
+    /// 1 行を stderr へ出す（relay の待ちは有界。`PLUGIN_RUNTIME_TIMEOUT` の内側）。
+    pub fn production_with_audit_sink(sink: Arc<dyn AuditSink>) -> Result<Self, TraitError> {
+        Self::production_inner(Some(sink))
+    }
+
+    fn production_inner(create_audit: Option<Arc<dyn AuditSink>>) -> Result<Self, TraitError> {
         let root = StateRoot::resolve(None)?;
         let state_root = root.path().to_path_buf();
         let recorder = Arc::new(OpRecorder::new());
@@ -143,10 +162,12 @@ impl CriPluginBackends {
         #[cfg(not(target_os = "linux"))]
         let network: Arc<dyn NetworkPlugin> = Arc::new(UnimplementedNetwork);
         let state: Arc<dyn StateStore> = Arc::new(FileStateStore::open(root)?);
-        let runtime = Arc::new(CoreLifecycleRuntime::with_recorder(
-            Arc::clone(&state),
-            Arc::clone(&recorder),
-        ));
+        let mut runtime =
+            CoreLifecycleRuntime::with_recorder(Arc::clone(&state), Arc::clone(&recorder));
+        if let Some(sink) = create_audit {
+            runtime = runtime.with_create_audit_sink(sink);
+        }
+        let runtime = Arc::new(runtime);
         let mut backends = Self::with_recorder(runtime, state, network, recorder);
         backends.state_root = Some(state_root);
         Ok(backends)
@@ -214,8 +235,56 @@ pub struct CoreLifecycleRuntime {
     recorder: Arc<OpRecorder>,
     /// `delete` が cgroup の配置を記録したコンテナを消すための remover（本番は遅延検出。注入で差し替えられる）。
     cgroups: Arc<dyn ContainerCgroupRemover>,
+    /// `create` の `mounts[].destination` 拒否の記録先（`with_create_audit_sink`。#2594）。無ければ記録しない。
+    create_audit: Option<Arc<dyn AuditSink>>,
     #[cfg(target_os = "linux")]
     supervised: SupervisedLifecycle,
+}
+
+/// `create` の拒否の記録先を包み、記録の失敗を固定語彙の 1 行で stderr へ残す（結果は内側のまま返す。#2594）。
+///
+/// 記録の失敗で拒否は覆さない（fail-closed）が、失敗が見えなくなるのも避ける。supervisor の `ObservedRejectionSink` と同じ趣旨。
+/// 通知行はエラーコードのトークンだけで、メッセージ・入力値を含めない。
+struct ObservedCreateAudit {
+    inner: Arc<dyn AuditSink>,
+}
+
+impl ObservedCreateAudit {
+    /// 失敗なら `log` へコードを渡してから、同じ結果を返す（`log` は試験で差し替える）。
+    fn observe(
+        result: Result<(), TraitError>,
+        log: impl FnOnce(ErrorCode),
+    ) -> Result<(), TraitError> {
+        if let Err(e) = &result {
+            log(e.code());
+        }
+        result
+    }
+}
+
+/// 失敗の通知行（固定語彙とコードのトークンのみ）を作る。
+fn create_audit_failure_line(code: ErrorCode) -> String {
+    format!(
+        "{{\"component\":\"plugin-cri\",\"event\":\"create_audit_record_failed\",\"outcome\":\"error\",\"code\":\"{}\"}}\n",
+        code.as_str()
+    )
+}
+
+fn log_create_audit_failure(code: ErrorCode) {
+    let _ = crate::telemetry::stderr_sink().submit(create_audit_failure_line(code));
+}
+
+impl AuditSink for ObservedCreateAudit {
+    fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+        Self::observe(self.inner.record(record), log_create_audit_failure)
+    }
+
+    fn record_until(&self, record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
+        Self::observe(
+            self.inner.record_until(record, deadline),
+            log_create_audit_failure,
+        )
+    }
 }
 
 /// cri の計測結果を core の `OpRecorder` へ流す橋渡し（操作名は `CriOpKind::as_str`）。
@@ -273,6 +342,7 @@ impl CoreLifecycleRuntime {
             store,
             recorder,
             cgroups: Arc::new(production_cgroup_remover()),
+            create_audit: None,
             #[cfg(target_os = "linux")]
             supervised: SupervisedLifecycle::production(),
         }
@@ -282,6 +352,17 @@ impl CoreLifecycleRuntime {
     #[must_use]
     pub fn with_cgroup_remover(mut self, cgroups: Arc<dyn ContainerCgroupRemover>) -> Self {
         self.cgroups = cgroups;
+        self
+    }
+
+    /// `create` の `mounts[].destination` 拒否（SEC-4・OCI-4・#2594）の記録先を設定する。
+    ///
+    /// プロセスが複数スレッドのため `FileAuditSink` は直接渡せない。単一スレッドの間に作った `ControlAuditRelay` を渡す
+    /// （呼び出し元は `main.rs`。[`CriPluginBackends::production_with_audit_sink`] 経由）。記録の待ちは有界で、relay を
+    /// peer 認証の転送スレッドと共有するため最悪で `RECORD_WAIT_LIMIT` の約 2 倍待つが `PLUGIN_RUNTIME_TIMEOUT` に収まる。
+    #[must_use]
+    pub fn with_create_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
+        self.create_audit = Some(Arc::new(ObservedCreateAudit { inner: sink }));
         self
     }
 
@@ -361,9 +442,13 @@ fn launch_unavailable() -> TraitError {
 
 impl ContainerRuntime for CoreLifecycleRuntime {
     fn create(&self, req: &CreateRequest) -> Result<ContainerStatus, TraitError> {
-        oci_runtime::create(&*self.store, &self.recorder, req)
-            .map(|r| r.status().clone())
-            .map_err(to_trait_error)
+        let created = match &self.create_audit {
+            Some(sink) => {
+                oci_runtime::create_audited(&*self.store, &self.recorder, req, sink.as_ref())
+            }
+            None => oci_runtime::create(&*self.store, &self.recorder, req),
+        };
+        created.map(|r| r.status().clone()).map_err(to_trait_error)
     }
 
     #[cfg(target_os = "linux")]
@@ -729,5 +814,81 @@ mod tests {
             .snapshot_op(&OpName::new("cri.create_container").expect("name"))
             .expect("recorded");
         assert_eq!((stats.success(), stats.failure()), (1, 1));
+    }
+
+    /// SEC-4・REPAIR-4（#2594）: 記録の失敗は固定語彙の 1 行にだけ出し、結果（`code`）は内側のまま返す。成功では何も出さない。
+    #[test]
+    fn sec4_2594_observed_create_audit_logs_only_failures() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let log = |c: ErrorCode| seen.borrow_mut().push(c);
+        assert!(ObservedCreateAudit::observe(Ok(()), log).is_ok());
+        assert!(seen.borrow().is_empty());
+        let e = ObservedCreateAudit::observe(
+            Err(TraitError::new(ErrorCode::Unavailable, "secret detail")),
+            log,
+        )
+        .expect_err("passes the failure through");
+        assert_eq!(e.code(), ErrorCode::Unavailable);
+        assert_eq!(seen.borrow().as_slice(), [ErrorCode::Unavailable]);
+        let line = create_audit_failure_line(ErrorCode::Unavailable);
+        assert!(
+            line.contains(r#""event":"create_audit_record_failed""#),
+            "{line}"
+        );
+        assert!(line.contains(r#""outcome":"error""#), "{line}");
+        assert!(
+            line.contains(&format!(r#""code":"{}""#, ErrorCode::Unavailable.as_str())),
+            "{line}"
+        );
+        assert!(!line.contains("secret"), "{line}");
+        assert!(line.ends_with('\n'));
+    }
+
+    /// SEC-4・#2594: 常に失敗する sink でも `create` の拒否の `code`・`message` は変わらない（fail-closed）。
+    #[test]
+    fn sec4_2594_create_rejection_is_unchanged_when_the_audit_sink_fails() {
+        struct Failing;
+        impl AuditSink for Failing {
+            fn record(&self, _: &AuditRecord) -> Result<(), TraitError> {
+                Err(TraitError::new(ErrorCode::Internal, "sink down"))
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("fc-cri-2594-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("rootfs")).expect("rootfs");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/true"],"cwd":"/"},"mounts":[{"destination":"/../..","type":"bind","source":"/srv/x","options":["bind","rw"]}]}"#,
+        )
+        .expect("config");
+        let req =
+            CreateRequest::new(ContainerId::new("c1").expect("id"), dir.clone()).expect("req");
+        let store: Arc<dyn StateStore> = Arc::new(OneRecord::new(record(false)));
+        let plain = CoreLifecycleRuntime::new(Arc::clone(&store))
+            .create(&req)
+            .expect_err("rejected");
+        let audited = CoreLifecycleRuntime::new(store)
+            .with_create_audit_sink(Arc::new(Failing))
+            .create(&req)
+            .expect_err("rejected");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(audited.code(), ErrorCode::InvalidArgument);
+        assert_eq!(audited.code(), plain.code());
+        assert_eq!(audited.message(), plain.message());
+    }
+
+    /// SEC-4・#2594: Linux の本番の入口は、単一スレッドの間に作った relay を create の記録先として渡す。
+    /// 実プロセスの結線は単一スレッド条件のためソースで固定する。
+    #[test]
+    fn sec4_2594_main_wires_the_relay_to_create() {
+        let src = include_str!("main.rs");
+        let wire = src
+            .find("CriPluginBackends::production_with_audit_sink(")
+            .expect("main passes the relay to the backends");
+        assert!(src[wire..].contains("std::sync::Arc::clone(&audit_sink)"));
+        let forwarder = src
+            .find("telemetry::PeerAuditForwarder::spawn(")
+            .expect("the forwarder keeps the original sink");
+        assert!(wire < forwarder);
     }
 }

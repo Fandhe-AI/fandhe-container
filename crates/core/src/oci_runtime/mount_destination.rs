@@ -24,7 +24,7 @@
 //! 拒否を `Mount` 監査レコードにする [`MountDestination::resolve_in_audited`]・[`audit_mount_config_error`]
 //! を持つ。ファイル永続化（TASK-41.5.1・#839）は実装済み。[`audit_mount_config_error`] は create の
 //! config 検証（`create_audited` / `create_with_image_audited`。#2480）から呼ばれ、CLI の create が
-//! 状態ルートの `@audit.log` へ配線する。plugin-cri の create と start の再検証は未配線。
+//! 状態ルートの `@audit.log` へ配線する。plugin-cri の create（`ControlAuditRelay` 経由）と start の再検証（手順 5 の supervisor・手順 8 の launcher の記録先）も配線済み（#2594）。
 //!
 //! bind mount の宛先は `BindMountSet::from_mounts`（`bind_mounts`。#1911）を経て検証する。bind の適用で
 //! [`MountDestination::resolve_in`] の文字列結合を直接 `mount(2)` に渡してはならない。

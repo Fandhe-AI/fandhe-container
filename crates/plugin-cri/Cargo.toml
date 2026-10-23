@@ -46,6 +46,13 @@ path = "tests/peer_auth_audit_delivery.rs"
 # `ControlAuditRelay::spawn` は単一スレッドの呼び出し元を要求するため、単一スレッドの `main` で動かす。
 harness = false
 
+# #2594: create の `mounts[].destination` 拒否が、中継 sink（ControlAuditRelay）を通って @audit.log へ届くことの結合試験
+# （SEC-4・OCI-4・CRI-7）。relay の fork は単一スレッドの呼び出し元を要求するため、単一スレッドの `main` で動かす。
+[[test]]
+name = "create_destination_audit_relay"
+path = "tests/create_destination_audit_relay.rs"
+harness = false
+
 [[bin]]
 name = "fandhe-container-plugin-cri"
 path = "src/main.rs"

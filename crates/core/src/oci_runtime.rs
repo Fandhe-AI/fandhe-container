@@ -68,6 +68,7 @@ pub use config::{
 };
 pub use create::{
     create, create_audited, create_with_image, create_with_image_audited, load_resource_limits,
+    load_resource_limits_audited,
 };
 pub use delete::{
     CgroupRemoval, ContainerCgroupRemover, DeleteOptions, delete, delete_releasing_image_ref,

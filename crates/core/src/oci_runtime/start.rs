@@ -125,7 +125,7 @@ use std::time::{Duration, Instant};
 use super::bind_mounts::{BindMountError, BindMountSet, ProtectedFsRoot, audit_bind_mount_error};
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
-use super::create::validate_bundle;
+use super::create::{ConfigAudit, validate_bundle_audited};
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::launch::{
     BundleLock, LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher, RootfsDir, StartTimeouts,
@@ -775,7 +775,12 @@ fn build_spec(
     launcher: &dyn ProcessLauncher,
     state_root: Option<&Path>,
 ) -> Result<LaunchSpec, TraitError> {
-    let (config, rootfs) = validate_bundle(bundle)?;
+    // destination の拒否は launcher の拒否の記録先へ残す（TOCTOU の再検証。#2594・SEC-4・OCI-4）。手順 5 の
+    // `load_resource_limits_audited` で既に拒否された場合はここへ来ないため、1 回の start で高々 1 件。
+    let audit = launcher
+        .rejection_audit_sink()
+        .map(|sink| ConfigAudit { id, sink });
+    let (config, rootfs) = validate_bundle_audited(bundle, audit)?;
     let process = config.process().ok_or_else(|| {
         TraitError::new(
             ErrorCode::InvalidArgument,
@@ -2557,6 +2562,45 @@ mod tests {
         let err2 = start_rejected_after_rewrite("rej-bind-nosink", &cfg);
         assert_eq!(err2.code(), err.code());
         assert_eq!(err2.message(), err.message());
+    }
+
+    /// SEC-4・OCI-4（#2594）: create 後に書き換えられた `mounts[].destination`（遡り・`/`・相対 `..`）の拒否は、
+    /// launcher の拒否の記録先へ mount 層・`path` なしで 1 件記録される。sink が無くても code・message は同じ。
+    #[test]
+    fn sec4_start_records_destination_rejection_to_launcher_audit_sink() {
+        for (i, dest) in ["/../..", "/", "run/../../.."].into_iter().enumerate() {
+            let cfg = with_mounts(json!([bind_json(dest, "/srv/x", &["bind", "rw"])]));
+            let name = format!("rej-dest-audit-{i}");
+            let (b, store) = created(&name);
+            b.write_config(&cfg);
+            let launcher = RecordingLauncher::new(false);
+            let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+            assert!(launcher.audit.set(Arc::clone(&sink)).is_ok());
+            let err = run(&store, &launcher, &name).expect_err("must fail");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{dest}");
+            assert_eq!(launcher.calls(), 0);
+            let recs = sink.snapshot();
+            assert_eq!(recs.len(), 1, "{dest}");
+            assert_eq!(
+                recs[0].container_id().map(|c| c.as_str()),
+                Some(name.as_str())
+            );
+            assert!(
+                matches!(
+                    recs[0].event(),
+                    crate::audit_log::AuditEvent::Mount {
+                        path: None,
+                        reason: None,
+                        ..
+                    }
+                ),
+                "{:?}",
+                recs[0]
+            );
+            let err2 = start_rejected_after_rewrite(&format!("rej-dest-nosink-{i}"), &cfg);
+            assert_eq!(err2.code(), err.code());
+            assert_eq!(err2.message(), err.message());
+        }
     }
 
     /// REPAIR-5: 状態更新に失敗したら起動済みプロセスをちょうど 1 回 terminate し、元のエラーを返す。

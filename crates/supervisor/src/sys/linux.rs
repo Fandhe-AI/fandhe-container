@@ -133,6 +133,16 @@ unsafe extern "C" {
         optval: *mut std::ffi::c_void,
         optlen: *mut u32,
     ) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `ssize_t lgetxattr(const char *path, const char *name, void *value,
+    // size_t size)`（glibc / musl。LP64 で `ssize_t` は isize、`size_t` は usize）。symlink を辿らない。
+    // doctor の特権ランチャー診断（#2599）の `security.capability` 読み取りだけに使う。`libc` との機械照合は
+    // この crate では未導入（上の `setsid` と同じ理由）。
+    fn lgetxattr(
+        path: *const std::ffi::c_char,
+        name: *const std::ffi::c_char,
+        value: *mut std::ffi::c_void,
+        size: usize,
+    ) -> isize;
 }
 
 /// `struct ucred`（`SO_PEERCRED` の結果。include/uapi/asm-generic/socket.h・`<sys/socket.h>`）。
@@ -446,6 +456,43 @@ pub(crate) fn open_dir_nofollow_flags() -> io::Result<i32> {
     }
 }
 
+/// `ENODATA`（include/uapi/asm-generic/errno.h の 61。x86_64・aarch64 で共通）。xattr が付いていない。
+pub(crate) const ENODATA: i32 = 61;
+/// `EOPNOTSUPP`（同 95。Linux の `ENOTSUP` と同値）。ファイルシステムが xattr に非対応。
+pub(crate) const EOPNOTSUPP: i32 = 95;
+/// `ERANGE`（include/uapi/asm-generic/errno-base.h の 34）。値が渡したバッファより大きい。
+pub(crate) const ERANGE: i32 = 34;
+
+/// `security.capability`（file capability。カーネルの `XATTR_NAME_CAPS`）の名前。NUL 終端。
+const XATTR_NAME_CAPS: &[u8] = b"security.capability\0";
+/// `security.capability` を読むバッファの大きさ（`VFS_CAP_REVISION_3` の 24 バイトちょうど。これを超える値は `ERANGE`）。
+pub(crate) const FILE_CAPS_BUF_LEN: usize = 24;
+
+/// `path` の `security.capability` を symlink を辿らず読む（`lgetxattr(2)`。読み取り専用）。
+///
+/// 値が無ければ `ENODATA`、非対応のファイルシステムなら `EOPNOTSUPP`、24 バイトを超えれば `ERANGE` を `io::Error`
+/// の errno で返す。`security.*` はファイルの読み取り権限を要さない。`path` に NUL を含むと `InvalidInput`。
+pub(crate) fn read_security_capability(path: &Path) -> io::Result<Vec<u8>> {
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut buf = [0u8; FILE_CAPS_BUF_LEN];
+    // SAFETY: `c_path`・`XATTR_NAME_CAPS` は NUL 終端でこの呼び出しの間有効。`buf` はこの関数のスタック上の
+    // 24 バイトで、`size` に同じ長さを渡すためカーネルは最大 24 バイトしか書かない。影響は読み取りのみ。
+    let rc = unsafe {
+        lgetxattr(
+            c_path.as_ptr(),
+            XATTR_NAME_CAPS.as_ptr().cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    let len = usize::try_from(rc).map_err(|_| io::Error::last_os_error())?;
+    // 戻り値が渡した大きさを超えることはないが、外部（カーネル）応答として検証する。
+    buf.get(..len)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| io::Error::from_raw_os_error(ERANGE))
+}
+
 /// 接続済みの UNIX ドメインソケットの相手の資格情報を取る（`getsockopt(SOL_SOCKET, SO_PEERCRED)`）。
 ///
 /// 制御チャネルの accept 直後（サーバ）と connect 直後（クライアント）に、相手の uid を照合するために呼ぶ
@@ -669,6 +716,27 @@ pub(crate) fn set_dumpable(on: bool) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SUP-14・#2599: errno の値（x86_64・aarch64 共通）と、実ファイルの `security.capability` 読み取り。
+    #[test]
+    fn sup14_xattr_errno_constants_and_read() {
+        assert_eq!((ENODATA, EOPNOTSUPP, ERANGE), (61, 95, 34));
+        assert_eq!(FILE_CAPS_BUF_LEN, 24);
+        let dir = std::env::temp_dir().join(format!("fc-xattr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let f = dir.join("plain");
+        std::fs::write(&f, b"x").expect("write");
+        let err = read_security_capability(&f).expect_err("no file capability");
+        assert!(
+            matches!(err.raw_os_error(), Some(ENODATA | EOPNOTSUPP)),
+            "{err:?}"
+        );
+        let bad = read_security_capability(Path::new("/nonexistent/fc-xattr")).expect_err("absent");
+        assert_eq!(bad.kind(), io::ErrorKind::NotFound);
+        let nul = read_security_capability(Path::new("a\0b")).expect_err("nul");
+        assert_eq!(nul.kind(), io::ErrorKind::InvalidInput);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 
     /// SUP-14・#2426: `EPERM` の値と、`io::Error` 上で `PermissionDenied` になることを固定する。
     #[test]

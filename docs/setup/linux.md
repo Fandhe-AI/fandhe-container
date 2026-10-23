@@ -38,6 +38,8 @@ scripts/install-privileged-launcher.sh \
 - 3 ファイルは同じロックのもとで一組として置換し、途中で止まったら旧ファイルへ戻す。launcher にだけ file capability を付け、読み戻して照合する
 - 成功すると stdout に `installed: method=file-capability dest-dir=<path>` の 1 行を出す
 
+配置後は非 root で `fandhe-container doctor` を実行し、`"check":"launcher"` の行でランチャーの信頼条件と file capability（または setuid root）が揃っていることを確かめる（#2599。hash / 署名は照合しない）。
+
 `PATH` 上から呼べるようにするには、root が symlink を手作業で作る。スクリプトは作らない。
 
 ```bash

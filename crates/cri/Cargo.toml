@@ -23,7 +23,7 @@ protox.workspace = true
 # 生成コード（runtime.v1）が参照する gRPC・protobuf の実行時依存（CRI-3・TASK-56.4。承認: #425）。
 # PullImage（TASK-61.3・#446・CRI-4）: oci の pull 経路（同期 HTTP）を呼ぶため workspace 内の fandhe-container-oci
 # （path 依存。外部クレートの追加ではない）と、ブロッキング処理を async ハンドラから切り離す tokio（承認: #425 の
-# オーナー判断 2026-10-10 の cri / plugin の gRPC 面。features は rt のみ。workspace 既存の =1.53.2 で新規パッケージなし）。
+# オーナー判断 2026-10-10 の cri / plugin の gRPC 面。features は rt のみ。workspace 既存の tokio で新規パッケージなし）。
 [dependencies]
 fandhe-container-oci = { path = "../oci" }
 # ContainerRuntime トレイト境界の呼び出しアダプタ（TASK-59.1・#437・CRI-2・CRI-7）。workspace 内 path 依存で外部クレートの追加ではない。

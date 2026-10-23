@@ -67,6 +67,8 @@ impl UntrustedKind {
 pub enum Elevation {
     /// setuid root（xattr 非対応環境の代替）。
     SetuidRoot,
+    /// setuid root だが併存する file capability が期待集合を満たさず、昇格できない。
+    SetuidRootRestricted,
     /// file capability が期待集合ちょうど。
     FileCapabilities,
     /// 期待集合を含み超過のビットがある。
@@ -234,6 +236,10 @@ fn evaluate_elevation(e: Elevation) -> UserScopeReport {
             Vec::new(),
             "setuid_root",
         )),
+        Elevation::SetuidRootRestricted => unavailable(
+            "setuid_root_restricted",
+            "the privileged launcher is setuid root but also carries file capabilities that do not cover the required set; the file capabilities take precedence and start cannot elevate",
+        ),
         Elevation::Excess => report(diag(
             Notice,
             "LAUNCHER_FILE_CAPABILITIES_EXCESS",
@@ -319,6 +325,9 @@ pub fn collect() -> LauncherFindings {
             let xattr = read_launcher_file_caps(&t.path);
             LauncherState::Trusted(match assess_elevation(t.owner_uid, t.mode, &xattr) {
                 ElevationAssessment::SetuidRoot => Elevation::SetuidRoot,
+                ElevationAssessment::SetuidRootRestrictedByFileCaps => {
+                    Elevation::SetuidRootRestricted
+                }
                 ElevationAssessment::FileCapabilitiesOk => Elevation::FileCapabilities,
                 ElevationAssessment::FileCapabilitiesExcess => Elevation::Excess,
                 ElevationAssessment::FileCapabilitiesInsufficient => Elevation::Insufficient,
@@ -412,6 +421,13 @@ mod tests {
                 "PRIVILEGED_LAUNCHER_READY",
                 "setuid_root",
                 S::Ok,
+            ),
+            (
+                Elevation::SetuidRootRestricted,
+                "warning",
+                "LAUNCHER_ELEVATION_UNAVAILABLE",
+                "setuid_root_restricted",
+                S::Warning,
             ),
             (
                 Elevation::Excess,

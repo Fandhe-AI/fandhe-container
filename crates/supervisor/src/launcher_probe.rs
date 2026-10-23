@@ -117,6 +117,11 @@ pub enum XattrRead {
 pub enum ElevationAssessment {
     /// setuid root（xattr 非対応環境の代替方式。`PrivilegeMethod::SetuidRoot`）。
     SetuidRoot,
+    /// setuid root だが、併存する file capability が期待集合を満たさない（不足・effective 無し・名前空間付き・壊れ）。
+    ///
+    /// file capability が在ると setuid root の全権付与は効かず取得 capability がファイル側の集合に制限される
+    /// （capabilities(7)）。このとき `privilege::plan_reduction` が UID 縮退条件で `start` を拒否するため、昇格できない。
+    SetuidRootRestrictedByFileCaps,
     /// file capability が期待集合ちょうどで effective 付き。
     FileCapabilitiesOk,
     /// 期待集合を含み effective 付きだが、超過のビットがある（`elevate` が縮退するため `start` は通る）。
@@ -141,8 +146,22 @@ pub enum ElevationAssessment {
 /// 0 のとき `SetuidRoot` を選ぶ（`launcher::select_method`）ため、xattr の有無に関わらず成立する。
 pub fn assess_elevation(owner_uid: u32, mode: u32, xattr: &XattrRead) -> ElevationAssessment {
     if mode & S_ISUID != 0 && owner_uid == 0 {
-        return ElevationAssessment::SetuidRoot;
+        // 併存する file capability があるとそちらが優先されるため、期待集合を満たすかを評価する（fail-closed）。
+        return match xattr {
+            XattrRead::NoData | XattrRead::Unsupported => ElevationAssessment::SetuidRoot,
+            XattrRead::Error => ElevationAssessment::Inconclusive,
+            _ => match assess_file_caps(xattr) {
+                ElevationAssessment::FileCapabilitiesOk
+                | ElevationAssessment::FileCapabilitiesExcess => ElevationAssessment::SetuidRoot,
+                _ => ElevationAssessment::SetuidRootRestrictedByFileCaps,
+            },
+        };
     }
+    assess_file_caps(xattr)
+}
+
+/// file capability だけの判定（setuid root の分岐を含まない）。
+fn assess_file_caps(xattr: &XattrRead) -> ElevationAssessment {
     let bytes = match xattr {
         XattrRead::Present(b) => b,
         XattrRead::NoData | XattrRead::Unsupported => return ElevationAssessment::NoElevation,
@@ -316,6 +335,30 @@ mod tests {
         assert_eq!(
             assess_elevation(0, 0o104_755, &XattrRead::NoData),
             A::SetuidRoot
+        );
+        // setuid root でも不足の file capability が併存すれば昇格できない（start が UID 縮退で拒否される）。
+        for bad in [
+            v2(1, MASK & !(1 << 6), 0),
+            v2(0, MASK, 0),
+            v3(1, MASK, 5),
+            vec![1, 2, 3],
+        ] {
+            assert_eq!(
+                assess_elevation(0, 0o104_755, &present(bad)),
+                A::SetuidRootRestrictedByFileCaps
+            );
+        }
+        assert_eq!(
+            assess_elevation(0, 0o104_755, &XattrRead::TooLarge),
+            A::SetuidRootRestrictedByFileCaps
+        );
+        assert_eq!(
+            assess_elevation(0, 0o104_755, &present(v2(1, MASK, 0))),
+            A::SetuidRoot
+        );
+        assert_eq!(
+            assess_elevation(0, 0o104_755, &XattrRead::Error),
+            A::Inconclusive
         );
         assert_eq!(
             assess_elevation(1000, 0o104_755, &XattrRead::NoData),

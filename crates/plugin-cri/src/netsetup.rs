@@ -774,11 +774,12 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             let claim = leaked.claim.as_ref().ok_or_else(manual_reclaim_required)?;
             let net_name = to_net_name(req.name())?;
             self.backend.reclaim_failed_create(&net_name, claim)?;
-            reg.networks.remove(name);
-            // 回収を確認した後に記録を外す。消せなければ記録は残り、次の起動で読み込まれて再回収される（冪等）。
+            // 回収を確認した後、記録ファイルを先に消す。消せなければメモリの記録も残し、同じ呼び出しの再試行で
+            // 再回収（冪等）と記録の削除をやり直せる（メモリだけ消えてファイルが残る食い違いを作らない）。
             if let Some(store) = &self.store {
                 store.remove(name)?;
             }
+            reg.networks.remove(name);
             return Ok(DeleteNetworkResponse::new());
         }
         let handle = network.handle.as_mut().ok_or_else(not_found_network)?;

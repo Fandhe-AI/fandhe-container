@@ -30,7 +30,9 @@ impl TempDir {
         ));
         fs::create_dir_all(&p).expect("mkdir");
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod");
-        Self(p)
+        // bundle の置き場は symlink を含む root を拒否する（SEC-1）。macOS の一時ディレクトリは
+        // `/var` → `/private/var` の symlink 配下にあるため、正規パスに揃えてから渡す（#2537 と同じ扱い）。
+        Self(fs::canonicalize(&p).expect("canonicalize"))
     }
 }
 

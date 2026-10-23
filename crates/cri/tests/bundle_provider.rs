@@ -32,7 +32,9 @@ impl TempDir {
         fs::create_dir_all(&p).expect("mkdir");
         // umask 002 の環境でも root 検証（group 書き込み不可）を通すため 0755 に固定する。
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod");
-        Self(p)
+        // `SpecBundleProvider` は symlink を含む bundle root を拒否する（SEC-1）。macOS の一時ディレクトリは
+        // `/var` → `/private/var` の symlink 配下にあるため、正規パスに揃えてから渡す（#2537 と同じ扱い）。
+        Self(fs::canonicalize(&p).expect("canonicalize"))
     }
 }
 

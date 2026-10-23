@@ -107,7 +107,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use fandhe_container_core::oci_runtime::{LifecycleOp, OciRuntimeError, StartTimeouts};
-use fandhe_container_core::plugin_trust::check_owner_and_mode;
+use fandhe_container_core::plugin_trust::{PluginTrustErrorKind, check_owner_and_mode};
 use fandhe_container_core::traits::{ContainerId, ErrorCode};
 
 use crate::launcher::{LAUNCHER_FILE_NAME, SUPERVISOR_FILE_NAME};
@@ -258,14 +258,58 @@ fn launcher_path_beside(cli_exe: &Path) -> Result<PathBuf, OciRuntimeError> {
 }
 
 /// 隣のランチャーの有無と信頼の判定結果（#2442）。
+///
+/// `start`（[`SupervisorLaunch::resolve_beside_with`]）と `doctor` の特権ランチャー診断（#2599・SUP-14）が
+/// 同じ判定を共有するため公開する（規則を 2 か所に書かない）。
 #[derive(Debug, PartialEq, Eq)]
-enum LauncherPresence {
+pub enum LauncherPresence {
     /// 無い（rootless のインストール）。
     Absent,
     /// 実体が通常ファイル・実行可能・所有者が root か `euid`・group/other 書き込み不可。
-    Trusted(PathBuf),
+    Trusted(TrustedLauncher),
     /// 在るが信頼条件を満たさない、または読めない（fail-closed。直接経路へ落とさない）。
-    Untrusted,
+    Untrusted(LauncherUntrustedReason),
+}
+
+/// 信頼できると判定したランチャー（symlink 解決後の実体）の情報。
+///
+/// `start` は `path` だけを使う。`owner_uid`・`mode` は doctor が setuid root の代替を判定するために使う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedLauncher {
+    /// symlink を解決した実体のパス。
+    pub path: PathBuf,
+    /// 実体の所有者 uid。
+    pub owner_uid: u32,
+    /// 実体の `st_mode`（種別ビットを含む）。
+    pub mode: u32,
+}
+
+/// ランチャーが信頼できない理由（機械可読。doctor の `state` に写す。パス・uid は載せない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LauncherUntrustedReason {
+    /// 通常ファイルではない（ディレクトリ等）。
+    NotRegularFile,
+    /// 実行ビットが無い。
+    NoExecuteBit,
+    /// 所有者が root でも `euid` でもない。
+    FileOwner,
+    /// group または other が書き込める。
+    FileMode,
+    /// 解決できない（リンク切れ・ループ・権限エラー等。エントリ自体は在る）。
+    Unresolvable,
+    /// 解決後の属性を読めない。
+    Unreadable,
+}
+
+/// CLI の実体パス `cli_exe` の隣のランチャーを分類する（`start` と `doctor` の共通入口。`PATH` 探索なし）。
+///
+/// `cli_exe` が絶対パスの親を持たない場合は `FAILED_PRECONDITION`。
+pub fn classify_launcher_beside(
+    cli_exe: &Path,
+    euid: u32,
+) -> Result<LauncherPresence, OciRuntimeError> {
+    Ok(classify_launcher(&launcher_path_beside(cli_exe)?, euid))
 }
 
 /// `path` のランチャーを分類する。祖先は辿らない（特権側の信頼チェーンはランチャーが自分で検証する。#1719）。
@@ -278,19 +322,31 @@ fn classify_launcher(path: &Path, euid: u32) -> LauncherPresence {
         Err(_) => {
             return match std::fs::symlink_metadata(path) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => LauncherPresence::Absent,
-                _ => LauncherPresence::Untrusted,
+                _ => LauncherPresence::Untrusted(LauncherUntrustedReason::Unresolvable),
             };
         }
     };
     let Ok(meta) = std::fs::metadata(&real) else {
-        return LauncherPresence::Untrusted;
+        return LauncherPresence::Untrusted(LauncherUntrustedReason::Unreadable);
     };
     let mode = meta.permissions().mode();
-    if !meta.is_file() || mode & 0o111 == 0 || check_owner_and_mode(meta.uid(), mode, euid).is_err()
-    {
-        return LauncherPresence::Untrusted;
+    if !meta.is_file() {
+        return LauncherPresence::Untrusted(LauncherUntrustedReason::NotRegularFile);
     }
-    LauncherPresence::Trusted(real)
+    if mode & 0o111 == 0 {
+        return LauncherPresence::Untrusted(LauncherUntrustedReason::NoExecuteBit);
+    }
+    if let Err(e) = check_owner_and_mode(meta.uid(), mode, euid) {
+        return LauncherPresence::Untrusted(match e {
+            PluginTrustErrorKind::UntrustedOwner => LauncherUntrustedReason::FileOwner,
+            _ => LauncherUntrustedReason::FileMode,
+        });
+    }
+    LauncherPresence::Trusted(TrustedLauncher {
+        path: real,
+        owner_uid: meta.uid(),
+        mode,
+    })
 }
 
 /// CLI の実体パスと同じディレクトリの固定名から supervisor の実行ファイルを決める（`PATH` 探索をしない。純関数）。
@@ -508,10 +564,10 @@ impl SupervisorLaunch {
         }
         let euid = privilege_gate(read_self_status().as_deref())?;
         // rootful のインストールは CLI の隣にランチャーがあること（#2442）。在るのに信頼できなければ直接経路へ落とさず止める。
-        let launcher = match classify_launcher(&launcher_path_beside(exe)?, euid) {
+        let launcher = match classify_launcher_beside(exe, euid)? {
             LauncherPresence::Absent => None,
-            LauncherPresence::Trusted(p) => Some(p),
-            LauncherPresence::Untrusted => {
+            LauncherPresence::Trusted(t) => Some(t.path),
+            LauncherPresence::Untrusted(_) => {
                 return Err(start_error(
                     ErrorCode::FailedPrecondition,
                     "privileged launcher is not a trusted executable (must be a regular file owned by root or the current user, not writable by group or others)",
@@ -961,18 +1017,21 @@ mod tests {
 
         std::fs::write(&path, b"#!/bin/sh\n").expect("write");
         let real = std::fs::canonicalize(&path).expect("canon");
-        for (mode, trusted) in [
-            (0o755, true),
-            (0o4755, true),
-            (0o775, false),
-            (0o757, false),
-            (0o644, false),
+        for (mode, want) in [
+            (0o755, None),
+            (0o4755, None),
+            (0o775, Some(LauncherUntrustedReason::FileMode)),
+            (0o757, Some(LauncherUntrustedReason::FileMode)),
+            (0o644, Some(LauncherUntrustedReason::NoExecuteBit)),
         ] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
-            let want = if trusted {
-                LauncherPresence::Trusted(real.clone())
-            } else {
-                LauncherPresence::Untrusted
+            let want = match want {
+                None => LauncherPresence::Trusted(TrustedLauncher {
+                    path: real.clone(),
+                    owner_uid: euid,
+                    mode: 0o100000 | mode,
+                }),
+                Some(r) => LauncherPresence::Untrusted(r),
             };
             assert_eq!(classify_launcher(&path, euid), want, "mode {mode:o}");
         }
@@ -981,7 +1040,7 @@ mod tests {
         if euid != 0 {
             assert_eq!(
                 classify_launcher(&path, euid.wrapping_add(1)),
-                LauncherPresence::Untrusted
+                LauncherPresence::Untrusted(LauncherUntrustedReason::FileOwner)
             );
         }
         // リンク切れの symlink はエントリが在るので Untrusted（Absent にしない）。
@@ -989,12 +1048,15 @@ mod tests {
         std::os::unix::fs::symlink(dir.0.join("no-such-target"), &dangling).expect("symlink");
         assert_eq!(
             classify_launcher(&dangling, euid),
-            LauncherPresence::Untrusted
+            LauncherPresence::Untrusted(LauncherUntrustedReason::Unresolvable)
         );
         // ディレクトリは通常ファイルではない。
         let sub = dir.0.join("d");
         std::fs::create_dir(&sub).expect("mkdir");
-        assert_eq!(classify_launcher(&sub, euid), LauncherPresence::Untrusted);
+        assert_eq!(
+            classify_launcher(&sub, euid),
+            LauncherPresence::Untrusted(LauncherUntrustedReason::NotRegularFile)
+        );
     }
 
     /// CORE-3・SUP-1: systemd-run で包んだ argv・環境・cwd は固定（環境は PATH と XDG_RUNTIME_DIR だけ）。

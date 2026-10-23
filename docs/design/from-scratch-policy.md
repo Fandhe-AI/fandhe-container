@@ -4,7 +4,7 @@
 
 - 決定日: 2026-09-26（ユーザー決定）
 - 関連 issue: #25（MS-0・TASK-73〜75 の前提）
-- 更新: 2026-10-10（オーナー判断。#399・#406・#408・#425・#540・#582・#597・#670・#678 の承認・不採用を反映。2026-10-12 の判断（#340）で rootless の外部ヘルパー pasta の例外を記録。2026-10-12 の判断（#1048・#1525・#1318）で MoltenVK 動的ロードの自前ラッパー・`libloading`／`ash`／`vulkanalia` の不採用・`libc` の用途限定を反映。2026-10-15 の判断で `nix` を許容依存リストから外して不採用へ移した）
+- 更新: 2026-10-10（オーナー判断。#399・#406・#408・#425・#540・#582・#597・#670・#678 の承認・不採用を反映。2026-10-12 の判断（#340）で rootless の外部ヘルパー pasta の例外を記録。2026-10-12 の判断（#1048・#1525・#1318）で MoltenVK 動的ロードの自前ラッパー・`libloading`／`ash`／`vulkanalia` の不採用・`libc` の用途限定を反映。2026-10-15 の判断で `nix` を許容依存リストから外して不採用へ移した。2026-10-23 の判断で tokio を =1.53.3 へ更新）
 
 ## 方針
 
@@ -62,7 +62,7 @@ youki・Cloud Hypervisor・Firecracker・rust-vmm（およびその organization
 | `tonic` | =0.14.6 | gRPC サーバー / クライアント（CRI-3・PLUG-2。cri / plugin の gRPC 面のみ。default-features 無効・`codegen`/`transport`/`router`） | #425 |
 | `tonic-prost` | =0.14.6 | tonic の prost 連携（cri / plugin の gRPC 面のみ） | #425 |
 | `prost` | =0.14.4 | protobuf メッセージ（cri / plugin の gRPC 面と、crates/cri で自作する ttrpc の Task API メッセージ〔CRI-5〕のみ） | #425・#670 |
-| `tokio` | =1.53.2 | 非同期ランタイム（LTS。cri / plugin の gRPC 面と、#678 の crates/cri のストリーミングサーバーのみで core には入れない。features は資料の案で `rt`/`net`/`time`/`macros`） | #425・#678 |
+| `tokio` | =1.53.3 | 非同期ランタイム（LTS。cri / plugin の gRPC 面と、#678 の crates/cri のストリーミングサーバーのみで core には入れない。features は資料の案で `rt`/`net`/`time`/`macros`） | #425・#678（2026-10-23 に =1.53.2 から更新。RUSTSEC-2026-0386 への対応でオーナー承認） |
 | `tokio-stream` | =0.1.19 | UDS 上の tonic の接続（#454。cri / plugin の gRPC 面のみ。`net`） | #425 |
 | `tower-service` | =0.3.3 | UDS 上の tonic の接続（#454。cri / plugin の gRPC 面のみ） | #425 |
 | `hyper` | =1.12.0 | CRI ストリーミングサーバーの HTTP/1.1 Upgrade（CRI-6。crates/cri の直接依存。`server`/`http1`。SPDY/3.1 は自作） | #678 |

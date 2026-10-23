@@ -6,7 +6,7 @@
 //! （[`bpf_prog_load_cgroup_device`]）し、コンテナの cgroup に付け（[`bpf_prog_attach_cgroup_device`]）、
 //! 付いたことを問い合わせる（[`bpf_prog_query_cgroup_device`]）低レベル層。`ContainerCgroup` への入口・
 //! 事後検証・rootless 判定・`CgroupError` への写像は `cgroups::device_policy`
-//! （`ContainerCgroup::apply_default_device_policy`。#1680）から結線済み。起動経路への結線は #1314、GPU の
+//! （`ContainerCgroup::apply_default_device_policy`。#1680）から結線済み。起動経路は start の連鎖（`cgroups::start_chain`。`ProductionStartDeps::prepare_cgroup`。#1716・#1717）から結線済み。GPU の
 //! `deviceNodes` 追加（TASK-129・#562）は本ラッパーの再利用側で、未結線（REPAIR-3）。
 //! `libbpf` 系の依存は使わず `syscall(2)` から直接呼ぶ（フルスクラッチ。dependency-policy）。
 //! コンテナ側の seccomp は `bpf` を拒否する（`DeniedSyscall::Bpf`）ため、cgroup を作る runtime 側の

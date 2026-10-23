@@ -28,7 +28,7 @@
 //! さらに `crate::exec` の結合試験用プローブ（CORE-5・TASK-38.4・#179）が、副作用の無い引数に固定した
 //! `ptrace(2)`・`kexec_load(2)`（`syscall(2)` 経由）を呼ぶ。
 //! さらにデバイス cgroup 用の `sys::bpf`（TASK-32 追補・#1679）が `bpf(2)`（`syscall(2)` 経由。
-//! `BPF_PROG_LOAD`・`BPF_PROG_ATTACH`・`BPF_PROG_QUERY`）を呼ぶ（呼び出し側の配線は #1680・#1314）。
+//! `BPF_PROG_LOAD`・`BPF_PROG_ATTACH`・`BPF_PROG_QUERY`）を呼ぶ（呼び出し側は `cgroups::device_policy`〔#1680〕、起動経路は start の連鎖〔#1716・#1717〕）。
 //! さらに封印した複製からの実行（TASK-163 追補・#1530・#1531）が、`memfd_create(2)`（`syscall(2)` 経由）と
 //! `fcntl(2)` の `F_ADD_SEALS` / `F_GET_SEALS`、複製の前に元のファイルを実行してよいかをカーネルに判定させる
 //! `execveat(2)` の `AT_EXECVE_CHECK`（`syscall(2)` 経由。Linux 6.14 以降）と、元のファイルのマウントの `noexec` を

@@ -2,7 +2,7 @@
 //!
 //! 役割: command / interval / timeout / start_period / retries を表す未検証入力 [`RawHealthcheck`] を
 //! 検証し、壊れた値を表現できない [`HealthcheckDefinition`] へ変換する。入力は stack の `healthcheck`
-//! （STACK-1）等が組み立て、出力は後続の周期実行エンジン（#495・TASK-161.2）と `health` 反映
+//! （STACK-1）等が組み立て、出力は周期実行エンジン（#495・TASK-161.2。実装済み）と `health` 反映
 //! （#496・TASK-161.3）が読む。
 //!
 //! # 実装範囲の線引き（REPAIR-3）
@@ -10,7 +10,7 @@
 //!   周期実行エンジン [`run_periodic`]（TASK-161.2・#495。意味論と未実装の範囲は `periodic` サブモジュールの doc）・
 //!   retries / start_period の集約 [`HealthAggregator`] と `health` の反映（TASK-161.3・#496。遷移の規則は
 //!   `aggregate` サブモジュールの doc）。
-//! - **未実装**: exec を呼ぶ判定の実装と `monitor` ループへの組み込み（#495 の残り・#492）、TOML / compose からのデシリアライズ（`crates/stack`・`crates/compose-convert`。
+//! - **未実装**: exec を呼ぶ判定の実装と `monitor` ループへの組み込み（#2441。親は #492）、TOML / compose からのデシリアライズ（`crates/stack`・`crates/compose-convert`。
 //!   STACK-1・STACK-3）。実行時の分離（seccomp / Landlock 再適用の fail-closed）は TASK-163（SUP-6）の責務。
 //! - 既知の食い違い: 定義の timeout 上限（[`MAX_TIMEOUT`] 1 時間）は `probe_and_record` の上限（60 秒）より大きく、
 //!   [`HealthcheckSchedule::from_definition`] が 60 秒超を拒否する。解消は別 issue。

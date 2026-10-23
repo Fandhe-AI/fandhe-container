@@ -151,7 +151,7 @@ const NOTIFY_THREAD_EXIT_WAIT: Duration = Duration::from_millis(50);
 ///
 /// 内訳は、主経路（`PRIMARY_WRITE_TIMEOUT` の 8 秒＋kill 後の回収待ち 1 秒）＋代替経路の ACK
 /// （[`KERNEL_AUDIT_ACK_TIMEOUT`]）＋失敗通知（子の `NOTIFY_WAIT` の 200 ms＋kill 後の回収待ち 1 秒＋出し直し
-/// スレッドの `NOTIFY_WAIT`＋スレッド数が戻るのを待つ 50 ms）で、合計 11.45 秒。定期 exec（healthcheck。TASK-161・#492／#495）へ配線する
+/// スレッドの `NOTIFY_WAIT`＋スレッド数が戻るのを待つ 50 ms）で、合計 11.45 秒。定期 exec（healthcheck。TASK-161・#492／#2441）へ配線する
 /// ときは、`run_command` の `timeout` とは別にこの値が積み上がる。
 pub const RECORD_WAIT_LIMIT: Duration = PRIMARY_WRITE_TIMEOUT
     .saturating_add(KILL_REAP_WAIT)

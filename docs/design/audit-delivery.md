@@ -122,9 +122,9 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 | launch 経路のマウントの拒否 | mount 層 | pivot 前段の失敗の記録は #1815（closed）で対応。読み取り専用化・覆い（固定集合・config 由来）の適用失敗も、理由 `readonly_path_apply_failed`・`masked_path_apply_failed` で同じ経路に載せた（SEC-2・SEC-4。#2013）。マウント操作の失敗は環境起因（古いカーネル・LSM）と rootfs の内容起因を親が区別できず、記録漏れの方が過剰な記録より悪いため記録する（理由トークンは対象の検査の拒否と分ける）。記録に段のフィールドは無く、段は返る `ExecError.stage` に載る（フィールドの追加は #653） | - |
 | `mounts[]` の bind mount | mount 層 | 未配線（検証済みの型への変換が先） | #1911（open）ほか |
 | `mounts[].destination` の拒否（create・start の再検証） | `audit_mount_config_error`（mount 層・`path` なし） | CLI の create は `FileAuditSink` を直接使う（#2480）。plugin-cri の create は単一スレッドの間に作った `ControlAuditRelay`（#2484 の relay を共有）を使う。start の手順 5（`prepare_cgroup` の `load_resource_limits_audited`）と手順 8（`build_spec`）は supervisor の `rejection_audit`（relay）を使う（#2594）。非 Linux は記録先が無く記録しない | #2430（非 Linux） |
-| seccomp・Landlock | `record_seccomp_denial`・`landlock_denial_record` | ERRNO 側と Landlock は配送経路が無い（本書の対象）。`KILL_PROCESS` 側は #2004 で補助の `exit_signal` レコードを本番 launcher の回収点に配線済み（正の記録はカーネルの `AUDIT_SECCOMP`） | #1835（本書）→ 実装は #2023〜#2028・#2004（9 章） |
+| seccomp・Landlock | `record_seccomp_denial`・`landlock_denial_record` | ERRNO 側は start の supervisor（#2025）と exec の親（#2544）で USER_NOTIF 版＋listener ループにより配送する（9 章）。既定の launcher と送り手の無い経路は ERRNO のままで通知は生じない。Landlock は配送経路が無い（本書の対象）。`KILL_PROCESS` 側は #2004 で補助の `exit_signal` レコードを本番 launcher の回収点に配線済み（正の記録はカーネルの `AUDIT_SECCOMP`） | #1835（本書）→ 実装は #2023〜#2028・#2004（9 章） |
 | plugin 信頼検証（`AuditLayer::PluginTrust`） | `verify_candidate_audited` | CLI の plugin バックエンド（macOS・Windows の本番経路）に配線済み（#2013）。記録先は `FileAuditSink::open_in_state_root`。作れないときは `SinkFailed`（黙って捨てない。拒否は覆らない）。非 Linux では `FileStateStore` が未実装で記録先を作れず `SinkFailed`。レジストリ・spawn への配線は TASK-114 | TASK-114 |
-| CLI・healthcheck | - | CLI は plugin 信頼検証の記録先を配線済み（#2013）。healthcheck は未配線 | #495（healthcheck。open） |
+| CLI・healthcheck | - | CLI は plugin 信頼検証の記録先を配線済み（#2013）。healthcheck は未配線、CLI の exec コマンドは未実装 | healthcheck は #2441（open。親 #492）、CLI の exec は #2626（open） |
 | コンテナ ID の付与 | `AuditRecord::container_id` | mount・exec_target・entrypoint は付与済み。plugin_trust は付与しない（検証はコンテナを特定する前にバックエンドを解決するために走り、特定のコンテナに属さないため。#2013）。seccomp は #2025 で付与済み、landlock は未配線 | #1618（closed。型のみ）。seccomp は #2025（実装済み） |
 
 監査ログ・可観測性・エラー出力の統一は #653（TASK-98.2。open）が担う。本書は配送経路に限り、レコード形式の統一とは分ける。着手時に `git grep` と issue 検索で最新の状態を確かめる。
@@ -213,7 +213,7 @@ exec で起動したコマンドの ERRNO 側 40 件の拒否を記録先へ届�
 
 | 案 | 内容 | 判断 |
 | -- | ---- | ---- |
-| A | supervisor の `SeccompNotifyHub` へ exec の listener を 2 段目の `SCM_RIGHTS` で転送する | **後続**。ハブは供給元を 1 本しか持たず（`attach_with` が先頭で `quiesce()` して直前の監視を畳む）、複数 listener の同時監視への再設計が要る。supervisor から exec 専用プロセスへの経路が本番に無い（`run_command_with_pidfd` の本番の呼び出し元〔CLI・healthcheck。#492・#495・#1314〕が未配線）。転送先の UDS の所有者・peer credential 検証の設計も要る |
+| A | supervisor の `SeccompNotifyHub` へ exec の listener を 2 段目の `SCM_RIGHTS` で転送する | **後続**。ハブは供給元を 1 本しか持たず（`attach_with` が先頭で `quiesce()` して直前の監視を畳む）、複数 listener の同時監視への再設計が要る。supervisor から exec 専用プロセスへの経路が本番に無い（`run_command_with_pidfd` の本番の呼び出し元〔healthcheck #2441・CLI の exec #2626〕が未配線）。転送先の UDS の所有者・peer credential 検証の設計も要る |
 | B | exec の親に per-exec の `SeccompNotifyHub` を持たせ、記録先に単一スレッドのうちに fork した `ControlAuditRelay` を渡す | 不採用。`ControlAuditRelay::spawn` は具体型 `FileAuditSink` を取り `&dyn AuditSink` と噛み合わない。exec ごとに helper を fork する。ハブのスレッド 2 本を `audit_worker_result`（`Threads: 1` 必須）より前に必ず畳む生存期間管理が要り、畳めなければ rootless で記録に失敗する |
 | **C（採用）** | exec の親が単一スレッドで、worker の終了待ちと listener の待ちを交互に回して同期に応答する | exec の親は fork と `FileAuditSink` の主経路の 2 か所で `Threads: 1` を要するため、スレッドを作らずに済む。期限つきの記録 API（`AuditSink::record_until`）が既にあり、`FileAuditSink` は主経路・代替経路・失敗通知の全段を絶対期限で切る。exec の既存の監査（`exec_target`・`entrypoint`・`exit_signal`）も「worker の結果を受けた親」が同じ `audit` に記録しており、listener の寿命（exec の寿命）とも一致する |
 
@@ -225,7 +225,7 @@ exec で起動したコマンドの ERRNO 側 40 件の拒否を記録先へ届�
 - 通知は直列に処理するため、通知が詰まると 1 件ごとに最大で応答期限だけ後続の通知が待つ。洪水はトークンバケットで記録を間引き、間引いた分は待たずに応答する
 - 期限の保証は `audit` が `record_until` を期限どおりに実装することに依存する（trait の既定実装は期限切れでなければ `record` に委ねる）。`run_command_with_pidfd` の `audit` の契約に反映した
 - コマンドが終了した後も残る子孫（exec の子 cgroup は worker の回収後に削除される）が拒否された syscall を発行しても、listener が閉じた後は `ENOSYS` になる（`EPERM` ではない。許可には倒れない）
-- 本番の呼び出し元（CLI・healthcheck）の配線は従来どおり範囲外（#492・#495・#1314）。root を要する `crates/supervisor/tests/exec.rs` の実行は人間担当（#1621）
+- 本番の呼び出し元（CLI・healthcheck）の配線は従来どおり範囲外（healthcheck #2441・CLI の exec #2626）。root を要する `crates/supervisor/tests/exec.rs` の実行は人間担当（#1621）
 - pid の変換は start と同じ（通知の pid は親の PID namespace の TID、`/proc/<tid>/status` の `NSpid` 末尾がコンテナ内の pid。worker は `pid_for_children` だけをコンテナの PID namespace へ移す）。ワークロードが自分で追加した filter による拒否は記録対象外（9.2 と同じ契約）。`KILL_PROCESS` の 3 件は従来どおり（9.1・9.3）
 
 ## 10. セキュリティ上の論点

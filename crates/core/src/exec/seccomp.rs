@@ -116,8 +116,10 @@ pub(crate) fn apply_default_seccomp() -> Result<SeccompReport, ExecError> {
 /// 既定 deny フィルタを `NEW_LISTENER` 付きで適用し、得た listener fd を `sender` で C へ渡して ACK を待つ
 /// （SEC-4・TASK-41 追補・#2024。`stages.rs` の組み込み `Seccomp` 段が、送り手が付いているときに呼ぶ）。
 ///
-/// 適用・事後検査が済んだ後に、送信 → 手元の listener を閉じる → ACK 待ちの順で行う。**filter は ERRNO 版のまま**
-/// （`USER_NOTIF` を返さないため通知は生じず、挙動は [`apply_default_seccomp`] と同じ。応答側は #2025）。
+/// 適用・事後検査が済んだ後に、送信 → 手元の listener を閉じる → ACK 待ちの順で行う。**filter の届け方は送り手の
+/// `ListenerSender::delivery()` で決まる**。既定は ERRNO 版で、通知は生じず挙動は [`apply_default_seccomp`] と同じ。
+/// `UserNotif` になるのは listener に応答する者がいる構成だけ（start は supervisor の `seccomp_notify`〔#2025〕、
+/// exec の本番経路は exec の親〔#2544〕）。
 /// 失敗（`EBUSY`・送信・ACK の不着）は段 `Seccomp` で、exec に進ませない。
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn apply_default_seccomp_with_listener(
@@ -1007,7 +1009,7 @@ mod tests {
 
     /// SEC-4（#2023）: listener 無し（`NEW_LISTENER` を付けない通常の適用）で USER_NOTIF 版を載せると、
     /// ERRNO 側の禁止 syscall はカーネルが `ENOSYS` で拒否し、実行されない（拒否は維持される）。
-    /// `EPERM` ではないため、listener の配線（#2024・#2025）前は本番に載せない。
+    /// `EPERM` ではないため、本番は listener に応答する者がいる構成（start の supervisor・exec の親）でだけ USER_NOTIF 版を載せる。
     ///
     /// 適用前の対照として kcmp が通ることを要求する。外側の seccomp（開発コンテナの既定プロファイル等）が
     /// kcmp を拒否する環境では、skip せず前提不成立として失敗させる。

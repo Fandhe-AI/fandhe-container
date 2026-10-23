@@ -96,7 +96,7 @@ bind したマウントへの `nosuid`・`noexec` は付与しない（#1659 の
 
 ## 5. 実装 issue（2h 粒度。#54 配下）
 
-launcher への配線（`spawn_container` がこれらを呼ぶこと）は #1314 の範囲で、含めない。
+本番 launcher への配線は #1816 で済んだ（`PrePivotSetup.devices`）。最小入口 `spawn_container` はこれらを呼ばない。`--ipc=host` 等の結線は #2625。
 
 | 順 | issue | 旧分割案 | 内容 | 依存 | ID |
 | -- | ----- | -------- | ---- | ---- | -- |

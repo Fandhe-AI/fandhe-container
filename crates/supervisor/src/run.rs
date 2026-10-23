@@ -16,7 +16,7 @@
 //!   stdout / stderr 捕捉の土台は [`crate::logs`] と [`monitor_with_capture`]（#241・TASK-157.7）。永続化・ローテーションは `RotatingFileSink`（SUP-7・TASK-164.2）で
 //!   提供済み。本番の出力パイプは core の launcher が `take_output` で返す読み取り側を `crate::log_pipeline::CaptureHub` が
 //!   捕捉する（#1471・#1819）。`monitor_with_capture` は出力ストリームを注入で受ける土台のまま。
-//!   `health` を書くフックは [`crate::health`] で提供済み（#240・SUP-4）。周期実行は [`crate::healthcheck::run_periodic`] で提供済み（#495）、retries・start_period の集約と `health` 反映も提供済み（#496）。healthcheck コマンドの実行（exec probe）と monitor への組み込みは未実装（TASK-161）で、
+//!   `health` を書くフックは [`crate::health`] で提供済み（#240・SUP-4）。周期実行は [`crate::healthcheck::run_periodic`] で提供済み（#495）、retries・start_period の集約と `health` 反映も提供済み（#496）。healthcheck コマンドの実行（exec probe。#2441）と monitor への組み込みは未実装（TASK-161）で、
 //!   ループ内の統合点は手順 3 の生存確認の周回（本 issue ではループ本体へ組み込まない）。
 //!   終了検知後の分岐（再起動するか Stopped に落とすか）は、[`monitor`] の手順 4 が拡張点になる。
 //!

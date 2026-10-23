@@ -2295,9 +2295,9 @@ mod linux {
         let config = parse_config_bytes(json).expect("valid config");
         let support = detect_landlock_abi()
             .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for ESC-01: {e}"));
-        // rootfs に dev が無い最小フロー（`spawn_container` は `create_default_devices` を呼ばない。#1314 未配線）
+        // rootfs に dev が無い最小入口（`spawn_container` は `create_default_devices` を呼ばない。本番の launch 経路は /dev を作り `All` を使う）
         // では暗黙の `/dev` 系のルールを足せない（存在しないパスは適用時に拒否される）ため含めない。ルールは
-        // 従来と同じで弱体化ではない。#1314 で配線したら `ImplicitDevMounts::All` に戻す（#1657）。
+        // 従来と同じで弱体化ではない（#1657）。
         let ruleset = build_path_rules_with_dev(
             &support,
             config.root(),
@@ -2461,9 +2461,9 @@ mod linux {
         let config = parse_config_bytes(json).unwrap_or_else(|e| panic!("valid config: {e}"));
         let support = detect_landlock_abi()
             .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for this case: {e}"));
-        // rootfs に dev が無い最小フロー（`spawn_container` は `create_default_devices` を呼ばない。#1314 未配線）
+        // rootfs に dev が無い最小入口（`spawn_container` は `create_default_devices` を呼ばない。本番の launch 経路は /dev を作り `All` を使う）
         // では暗黙の `/dev` 系のルールを足せない（存在しないパスは適用時に拒否される）ため含めない。ルールは
-        // 従来と同じで弱体化ではない。#1314 で配線したら `ImplicitDevMounts::All` に戻す（#1657）。
+        // 従来と同じで弱体化ではない（#1657）。
         let ruleset = build_path_rules_with_dev(
             &support,
             config.root(),
@@ -2492,9 +2492,9 @@ mod linux {
         let config = parse_config_bytes(ESC10_CONFIG).expect("valid config");
         let support = detect_landlock_abi()
             .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for ESC-10: {e}"));
-        // rootfs に dev が無い最小フロー（`spawn_container` は `create_default_devices` を呼ばない。#1314 未配線）
+        // rootfs に dev が無い最小入口（`spawn_container` は `create_default_devices` を呼ばない。本番の launch 経路は /dev を作り `All` を使う）
         // では暗黙の `/dev` 系のルールを足せない（存在しないパスは適用時に拒否される）ため含めない。ルールは
-        // 従来と同じで弱体化ではない。#1314 で配線したら `ImplicitDevMounts::All` に戻す（#1657）。
+        // 従来と同じで弱体化ではない（#1657）。
         let ruleset = build_path_rules_with_dev(
             &support,
             config.root(),

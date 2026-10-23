@@ -203,7 +203,7 @@
 //! - **縮退経路**: [`identify_pid1`]（段単位の API）と試験専用の通しの入口 `run_command`（`exec-test-support` feature の下だけ。
 //!   既定ビルドには無く、呼ぶとコンパイルが通らない。#1617）は記録 pid から開き、cgroup の所属で同一性を照合する。
 //!   本番の通しの入口は [`run_command_with_pidfd`] だけなので、supervisor 不在（孤児化・再起動後で起動時の pidfd を失った）
-//!   場合の exec は現状拒否される（fail-closed）。この場合の再設計は、孤児コンテナの re-adopt・終了ポリシー（#514）と healthcheck の exec 経路（#2441）の実装時に行う。この縮退経路は、「コンテナの中から
+//!   場合の exec は現状拒否される（fail-closed）。この場合の再設計を担当する issue は未起票（REPAIR-3）。#514（TASK-165.5）は re-adopt・終了ポリシーだけを扱い、監視を引き継いだ supervisor が起動ハンドル（pidfd）を取り直すという前提を与えるにとどまる。healthcheck（#2441）・CLI の exec（#2626）は supervisor が居る経路の本番の呼び出し元。この縮退経路は、「コンテナの中から
 //!   cgroupfs に書けない」前提（core の `exec/setns.rs` のモジュール doc）が成り立つ間だけ使う。cgroupfs の
 //!   マウント・cgroup namespace・`/sys/fs/cgroup` の bind mount を導入する変更は、この縮退経路を拒否へ切り替える
 //!   こと
@@ -919,7 +919,7 @@ fn audit_worker_result(
 /// 対象の特定は [`identify_pid1_with_pidfd`]（起動時から保持する pidfd で pid1 を固定。SEC-1・CORE-1・TASK-163 追補・#1461）。
 /// pidfd を必須の引数にしているため、pidfd が得られない（未対応カーネル・seccomp・起動ハンドルなし）ときは呼べず、
 /// exec は拒否される（fail-closed）。縮退経路の入口 `run_command` は `exec-test-support` feature の試験専用で、
-/// 既定ビルドには存在せず、呼ぶとコンパイルが通らない。supervisor 不在時（孤児化・再起動後）の exec の再設計（#514）と
+/// 既定ビルドには存在せず、呼ぶとコンパイルが通らない。supervisor 不在時（孤児化・再起動後）の exec の再設計（担当 issue は未起票。#514 は re-adopt・終了ポリシーのみ）と
 /// 本番の呼び出し元（healthcheck #2441・CLI の exec #2626）の配線は未実装（モジュール doc）。
 ///
 /// コマンドの環境は、記録の bundle の `config.json` の `process.env` へ `request` の明示の指定を重ねたもので、

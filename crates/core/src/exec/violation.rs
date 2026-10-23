@@ -60,7 +60,7 @@
 //! launch 経路の `pivot_root` の前にある。稼働中コンテナへの exec の子（`prepare_exec_child` /
 //! `exec_checked_entrypoint`・インタプリタ検証・封印コピー）では生じず、supervisor の worker の結果行にも
 //! 載らない。そのため exec 側の記録（`Entrypoint` / `ExecTarget`）の対象外で、launch 側では
-//! `exec::audit_mount_violation`（`Mount` イベント）で記録する（本番配線は #1314）。
+//! `exec::audit_mount_violation`（`Mount` イベント）で記録する（本番 launcher から結線済み。子の失敗理由は状態 pipe で親へ運ばれ、親が `exec::record_launch_mount_rejection` で記録する。#1815・#1816）。
 
 use std::path::Path;
 

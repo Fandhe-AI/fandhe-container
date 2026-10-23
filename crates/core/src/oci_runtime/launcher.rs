@@ -300,7 +300,7 @@ impl ProductionLauncherBuilder {
     /// 受け取っても応答者がいなくてよい)。`UserNotif` は **launch で得た listener に応答する者がいる呼び出し元だけ**が
     /// 指定する(supervisor の start 経路が `LaunchedProcess::take_seccomp_listener` で受け取って応答する)。
     /// 応答者がいないまま指定すると、拒否対象の syscall が listener を閉じるまで止まる(閉じれば `ENOSYS`)。
-    /// 既存の exec 経路(`exec/reapply.rs`)と送り手の無い経路は常に ERRNO のまま(SUP-6 は #2385 で listener の受け渡しのみ実装済み。USER_NOTIF 化は後続)。
+    /// 既存の exec 経路(`exec/reapply.rs`)と送り手の無い経路は常に ERRNO のまま(exec の本番経路は #2544 で `UserNotif` を指定し、応答するのは exec の親)。
     #[must_use]
     pub fn seccomp_errno_delivery(mut self, delivery: crate::seccomp::ErrnoDelivery) -> Self {
         self.seccomp_delivery = delivery;

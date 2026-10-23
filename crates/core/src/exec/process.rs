@@ -55,9 +55,9 @@
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
 //!   間にパスが差し替わる TOCTOU を防ぐ。読み取り権限のない実行専用バイナリは開けず拒否される。
 //!   fd は 3 以上に置く。稼働中コンテナへの exec の子は、照合した本体を封印した memfd へ複製し
-//!   （`sealed_copy.rs`。TASK-163 追補・#1531）、解析・照合・実行を複製に対して行う（launch は複製しない。#1314 の後）。
+//!   （`sealed_copy.rs`。TASK-163 追補・#1531）、解析・照合・実行を複製に対して行う（launch は複製しない。常駐するワークロードのメモリ増を避ける設計判断。CORE-7〜9。launch への適用の追跡 issue は未起票）。
 //!   上限超過・封印の検証失敗は違反で拒否する。シェバン付きスクリプトは、インタープリタが開き直す新 root の
-//!   `/dev/fd/N` が同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` は `create_default_devices`〔#834・#1297〕が用意する。`spawn_container` の最小構成はまだ呼ばない）
+//!   `/dev/fd/N` が同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` は `create_default_devices`〔#834・#1297〕が用意する。本番の launch 経路は呼ぶ。最小入口 `spawn_container` は呼ばない）
 //! - **fork の健全性は `sys::fork_single_threaded` が強制する**: 呼び出し元が `Threads: 1`
 //!   でなければ fork せず `FailedPrecondition` で返す。子はクロージャの結果で必ず `_exit(2)` し、
 //!   呼び出し元のスタックへ戻らない
@@ -476,7 +476,7 @@ pub fn exec_entrypoint(
 ///    検査から実行までの間のパス差し替え〔TOCTOU〕を防ぐ。稼働中コンテナへの exec の子〔`EntrypointSource::Switchable`〕
 ///    は、封印した複製を使える環境なら照合した本体を封印した memfd に複製し〔`sealed_copy.rs`。#1531〕、以降の解析・照合・
 ///    実行を複製に対して行う〔使えない環境は現行方式で、理由を記録する。オーナー判断 2026-10-09〕。
-///    launch は複製しない〔#1314 の後〕。ランタイム自身の封印複製は後続の課題）。シェバンの連鎖・
+///    launch は複製しない〔常駐メモリの設計判断。追跡 issue は未起票〕。ランタイム自身の封印複製も追跡 issue は未起票）。シェバンの連鎖・
 ///    `PT_INTERP` の解決先がランタイムのバイナリなら同じく拒否する（#1458。`interpreter.rs`）
 /// 3. 開いたエントリポイントが fd 0〜2 と同一 inode なら拒否する（`/proc/self/fd/{0,1,2}` 経由の参照対策。
 ///    fd 0〜2 の実体を確認できなければ拒否。エントリポイントの fd は 3 以上に置く）。
@@ -675,7 +675,7 @@ impl ExecutableFd {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EntrypointSource {
     /// 照合した fd（元の inode）をそのまま `execveat` する。launch 経路（常駐するワークロードのメモリ増を避ける。
-    /// 封印した複製の適用は #1314 の後）。
+    /// 封印した複製の適用は未着手で、追跡 issue は未起票）。
     Pinned,
     /// 稼働中コンテナへの exec。値（`prepare_exec_restrictions` が `setns` の前に作る判定。#1531）の方式に従い、
     /// 封印した memfd に複製して `execveat` するか、照合した元の fd をそのまま `execveat` する（現行方式。#1478）。
@@ -3066,7 +3066,8 @@ pub fn spawn_container_with_stages_reporting_for_test(
 /// （CORE-5・SEC-1・REPAIR-12・#1714）。
 ///
 /// `LaunchReady` がそろった後の `redirect_stdio_to_null` が検証済みの `/dev/null`（文字デバイス 1:3）を開けることを、
-/// 実 exec（`execveat`）の成功で照合するための入口。`/dev` の本番配線（#1314）までの暫定で、
+/// 実 exec（`execveat`）の成功で照合するための入口。本番の `/dev` は launcher 経路で結線済み（#1816）で、
+/// これは最小入口 `spawn_container` に `/dev` を足すための試験専用の入口。
 /// 制限適用の証跡の要求（`require_restriction_evidence`）は `spawn_container_with_stages` と同じく行う。
 /// 通常の利用者は呼ばない。
 #[doc(hidden)]

@@ -27,7 +27,7 @@
 //! （#1912〜#1914）、`start` と本番 launcher へも結線済み（#1915。検証済みの集合は `LaunchSpec::bind_mounts` で渡る）。
 //! bind 以外の種類の `mounts[]` は未対応で `start` が拒否する（REPAIR-3）。
 //! 例外は start の rootfs 固定（`RootfsDir::pin`。`exec::open_dir_beneath` を使う。検証後の差し替えの違反は
-//! `RootfsPinError` で運び、exec の経路が監査ログの層 `mount` へ記録する。start の経路は記録しない〔#1314〕。#1702）と
+//! `RootfsPinError` で運び、exec の経路が監査ログの層 `mount` へ記録する。start の経路は記録しない〔未実装。#2623〕。#1702）と
 //! `ContainerChildProcess` で、`launch.rs` 内に `cfg(target_os = "linux")` で局所化している。Linux 以外の
 //! start は rootfs を固定できないため、起動前に `Unimplemented` で拒否する（fail-closed）。
 
@@ -68,6 +68,7 @@ pub use config::{
 };
 pub use create::{
     create, create_audited, create_with_image, create_with_image_audited, load_resource_limits,
+    load_resource_limits_audited,
 };
 pub use delete::{
     CgroupRemoval, ContainerCgroupRemover, DeleteOptions, delete, delete_releasing_image_ref,

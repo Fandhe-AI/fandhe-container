@@ -296,7 +296,9 @@ pub use seccomp_listener::{
 #[cfg(feature = "exec-test-support")]
 pub use seccomp_listener::{UserNotifProbe, kcmp_self_errno_for_test, user_notif_probe_for_test};
 #[cfg(feature = "exec-test-support")]
-pub use seccomp_listener::{apply_exec_seccomp_listener_for_test, hand_over_non_listener_for_test};
+pub use seccomp_listener::{
+    apply_exec_seccomp_listener_for_test, hand_over_non_listener_for_test, open_socket_ids_for_test,
+};
 /// 試験用プローブが `SIGTERM` で終わるときの終了コード（[`exit_on_sigterm_for_test`] のハンドラが使う）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]

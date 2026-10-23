@@ -883,7 +883,13 @@ jobs:
             echo "::error::unshare_isolation did not report full isolation (possibly not executed)" >&2
             exit 1
           fi
+          sub_line='^unshare_isolation: subordinate isolation kept the caller non-dumpable \(samples=[0-9]+\)$'
+          if ! grep -Eq "${sub_line}" "${log}"; then
+            echo "::error::unshare_isolation did not report the non-dumpable subordinate check" >&2
+            exit 1
+          fi
           echo "unshare_isolation: full isolation verified (root=false)" >> "$GITHUB_STEP_SUMMARY"
+          echo "unshare_isolation: subordinate isolation kept the caller non-dumpable" >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::unshare_isolation verified"
 
       # exec_setns_join（`crates/supervisor/tests/exec_setns_join.rs`。SUP-6・TASK-163.1・#500）:

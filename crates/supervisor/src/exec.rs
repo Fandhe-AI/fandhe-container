@@ -203,7 +203,7 @@
 //! - **縮退経路**: [`identify_pid1`]（段単位の API）と試験専用の通しの入口 `run_command`（`exec-test-support` feature の下だけ。
 //!   既定ビルドには無く、呼ぶとコンパイルが通らない。#1617）は記録 pid から開き、cgroup の所属で同一性を照合する。
 //!   本番の通しの入口は [`run_command_with_pidfd`] だけなので、supervisor 不在（孤児化・再起動後で起動時の pidfd を失った）
-//!   場合の exec は現状拒否される（fail-closed）。この場合の再設計は #1314・#492・#495 の配線時に行う。この縮退経路は、「コンテナの中から
+//!   場合の exec は現状拒否される（fail-closed）。この場合の再設計は、孤児コンテナの re-adopt・終了ポリシー（#514）と healthcheck の exec 経路（#2441）の実装時に行う。この縮退経路は、「コンテナの中から
 //!   cgroupfs に書けない」前提（core の `exec/setns.rs` のモジュール doc）が成り立つ間だけ使う。cgroupfs の
 //!   マウント・cgroup namespace・`/sys/fs/cgroup` の bind mount を導入する変更は、この縮退経路を拒否へ切り替える
 //!   こと
@@ -236,13 +236,13 @@
 //!   コマンド内の `kill(SIGSYS)` と区別できないため seccomp 由来とは断定しない。**未実装（REPAIR-3）**: コマンドの
 //!   子孫の SIGSYS 終了は worker の子ではないため worker も親も観測できず、記録しない
 //!   （`docs/design/audit-delivery.md` 9.1）
-//! - 違反記録（SEC-4）の監査ログへの保存のうち、CLI の exec コマンド・TASK-161 の healthcheck（#492・#495）から
-//!   [`run_command_with_pidfd`] へ [`default_audit_sink`] の sink を渡す配線（本番 launcher の構成〔#1314〕に従う）。本番の
+//! - 違反記録（SEC-4）の監査ログへの保存のうち、CLI の exec コマンド・TASK-161 の healthcheck（#492）から
+//!   [`run_command_with_pidfd`] へ [`default_audit_sink`] の sink を渡す配線（未実装。healthcheck は #2441、CLI の exec は #2626）。supervisor の start 入口（`start_entry`）からは配線済み（#1717・#2481）。本番の
 //!   `AuditSink` の実体（`FileAuditSink`）と生成の入口 [`default_audit_sink`] は実装済み（#1594）。層 `exec_target` と
 //!   [`run_command_with_pidfd`] での 1 拒否 1 件の記録は実装済み（#1465）。`ExecOutcome::exit` が運ぶ `execve` 前の違反
 //!   （`SetupFailed`。種別 `entrypoint`）の層 `entrypoint` での記録も実装済み（#1595）。未実装なのは
-//!   launch 経路（`spawn_container` の子・launcher）で同じ理由が生じたときの記録の配線（#1314。core の
-//!   `exec::audit_entrypoint_violation`）。worker の経路の違反（種別 `exec_target` の 10 理由と種別 `rootfs_pivot` の
+//!   launch 経路（`spawn_container` の子・本番 launcher）で同じ理由が生じたときの記録の配線（担当 #2624。core の
+//!   `exec::audit_entrypoint_violation`。entrypoint 系の理由は pre-pivot の状態 pipe の許可リストに無く、子の側で落とされる）。worker の経路の違反（種別 `exec_target` の 10 理由と種別 `rootfs_pivot` の
 //!   `rootfs_is_host_root`、bundle の rootfs の固定の種別 `mount_target` の `path_symlink_or_not_directory`・`path_missing`）と
 //!   exec の子の違反（種別 `entrypoint` の 8 理由）は、いずれもこの入口で記録する（「監査記録」）。
 //!   この入口の記録の対象外: 種別 `mount_target` の `target_moved` は launch の `pivot_root` 前だけで生じ、種別
@@ -251,8 +251,8 @@
 //!   bundle の rootfs の固定（`load_exec_bundle` → core の `pin_bundle_rootfs_audited`）は、検証後の差し替えによる
 //!   `path_symlink_or_not_directory`・`path_missing` を `RootfsPinError` で運び、`from_pin_error` が末尾の目印つきの
 //!   `TraitError`（`code`・文言は従来どおり）にして、他の worker の違反と同じ経路で層 `mount` に記録する（#1702）。
-//!   bundle 自体や祖先の差し替え・I/O エラーは違反を運ばず記録しない。start の経路（core の `RootfsDir::pin`）は
-//!   `AuditSink` の配線が無く記録しない（#1314）。bundle は supervisor と同じ信頼境界にあるため、差し替えは境界の侵害の兆候。
+//!   bundle 自体や祖先の差し替え・I/O エラーは違反を運ばず記録しない。start の経路（core の `RootfsDir::pin`）は、
+//!   拒否の記録先はあるが違反の理由をまだ流しておらず記録しない（未実装。#2623）。bundle は supervisor と同じ信頼境界にあるため、差し替えは境界の侵害の兆候。
 //!   再起動を越えて残る置き場所・ローテーション・常時の二重記録も未実装（`FileAuditSink` の doc）
 //! - launcher による記録の書き込み（`launch_rlimits_from_self` の結果を `StagePipeline::with_rlimits` と
 //!   `CreateStateRequest::with_rlimits` の両方へ渡す結線）。本番の `start` は `process.rlimits` を `Unimplemented` で
@@ -515,8 +515,8 @@ pub fn prepare_restrictions(
 /// `root_override` が `None` なら core の既定ルート解決に従い（`state::open_default_store` と同じ規則）、状態ストアを
 /// 開いてから `<状態ルート>/@audit.log` を主経路とする `FileAuditSink` を返す。返す sink はファイルを開いたまま
 /// 持たないので、fork 前に作っても worker へ fd は継承されない。[`run_command_with_pidfd`] / `run_command_in` の
-/// `audit` へ渡す。Linux 以外では core が `Unimplemented` を返す（fail-closed）。CLI・healthcheck からの配線は
-/// 本番 launcher の構成（#1314）に従う。
+/// `audit` へ渡す。Linux 以外では core が `Unimplemented` を返す（fail-closed）。supervisor の start 入口（`start_entry`）から
+/// 配線済み（#1717・#2481）。healthcheck（#2441）と CLI の exec（#2626）からは未配線。
 pub fn default_audit_sink(
     root_override: Option<std::path::PathBuf>,
 ) -> Result<FileAuditSink, TraitError> {
@@ -919,8 +919,8 @@ fn audit_worker_result(
 /// 対象の特定は [`identify_pid1_with_pidfd`]（起動時から保持する pidfd で pid1 を固定。SEC-1・CORE-1・TASK-163 追補・#1461）。
 /// pidfd を必須の引数にしているため、pidfd が得られない（未対応カーネル・seccomp・起動ハンドルなし）ときは呼べず、
 /// exec は拒否される（fail-closed）。縮退経路の入口 `run_command` は `exec-test-support` feature の試験専用で、
-/// 既定ビルドには存在せず、呼ぶとコンパイルが通らない。supervisor 不在時（孤児化・再起動後）の exec の再設計と
-/// 本番の呼び出し元（#492・#495・#1314）の配線は未実装（モジュール doc）。
+/// 既定ビルドには存在せず、呼ぶとコンパイルが通らない。supervisor 不在時（孤児化・再起動後）の exec の再設計（#514）と
+/// 本番の呼び出し元（healthcheck #2441・CLI の exec #2626）の配線は未実装（モジュール doc）。
 ///
 /// コマンドの環境は、記録の bundle の `config.json` の `process.env` へ `request` の明示の指定を重ねたもので、
 /// 呼び出しプロセスの環境は使わない（TASK-163 追補・#1457。契約はモジュール doc）。

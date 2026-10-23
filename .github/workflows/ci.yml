@@ -1261,6 +1261,31 @@ jobs:
           done
           echo "::notice::rootless_file_owner verified"
 
+      - name: rootless_holder_expiry のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test rootless_holder_expiry --no-run
+
+      # holder の期限切れ後始末（別 user namespace からの SIGKILL・錨の照合・helper の終了と EOF の関係。CORE-6・SEC-5・
+      # REPAIR-5・#2551）。範囲写像の前提は要らない（unshare の user namespace と setsid コマンドのみ。新しい check-run は増えない）。
+      - name: rootless_holder_expiry の実行（実機前提テスト・--ignored。CORE-6・SEC-5・#2551）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/rootless_holder_expiry.log"
+          cargo test -p fandhe-container-core --test rootless_holder_expiry -- --ignored 2>&1 | tee "${log}"
+          line='rootless_holder_expiry: holder outlived the stopped helper until expiry, then killed its session ('
+          if ! grep -Fq "${line}" "${log}"; then
+            echo "::error::rootless_holder_expiry did not report: ${line} (possibly not executed)" >&2
+            exit 1
+          fi
+          if grep -Fq 'rootless_holder_expiry: ignored' "${log}"; then
+            echo "::error::rootless_holder_expiry reported an unexpected line: ignored" >&2
+            exit 1
+          fi
+          echo "::notice::rootless_holder_expiry verified"
+
       - name: rootless_image_rootfs_remove のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10

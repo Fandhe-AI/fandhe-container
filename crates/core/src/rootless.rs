@@ -1004,6 +1004,13 @@ fn helper_failure(
     )
 }
 
+/// holder の期限切れ後始末を本番の namespace 構成で観測する試験専用の入口(`tests/rootless_holder_expiry.rs`。#2551)。
+#[cfg(feature = "exec-test-support")]
+mod holder_expiry_probe;
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use holder_expiry_probe::{HolderExpiryObservation, observe_holder_expiry};
+
 /// 結合試験 `tests/sanitize_integration.rs` 専用の入口: ヘルパー失敗のエラー生成経路を、終了状態と
 /// stderr の生バイトから直接呼ぶ（TASK-96.1・ERR-2・REPAIR-12。通常の利用者は呼ばない）。
 ///

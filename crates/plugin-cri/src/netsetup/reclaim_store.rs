@@ -120,22 +120,30 @@ impl ReclaimStore {
 
     /// 記録を不可分に書く（同名があれば置き換える）。
     pub fn save(&self, name: &str, record: &str) -> Result<(), TraitError> {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        self.save_with_seq(name, record, &|| SEQ.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// `save` の本体。一時ファイル名の連番の供給元を差し込めるようにして、衝突時の再試行を試験で再現する。
+    fn save_with_seq(
+        &self,
+        name: &str,
+        record: &str,
+        next_seq: &dyn Fn() -> u64,
+    ) -> Result<(), TraitError> {
         let file = self.file_for(name)?;
         if record.len() > CLAIM_RECORD_MAX_LEN {
             return Err(internal("reclaim record is too long"));
         }
         let _lock = self.lock()?;
-        static SEQ: AtomicU64 = AtomicU64::new(0);
         // 異常終了で残った同名の一時ファイル（PID の再利用で連番が 0 から始まり衝突しうる）が保存を妨げないよう、
         // `AlreadyExists` のときは連番を進めて有限回だけ別名で再試行する（NET-1・REPAIR-3・#2604）。
         const TMP_ATTEMPTS: usize = 16;
         let mut opened = None;
         for _ in 0..TMP_ATTEMPTS {
-            let tmp = self.dir.join(format!(
-                "{TMP_PREFIX}{}-{}",
-                std::process::id(),
-                SEQ.fetch_add(1, Ordering::Relaxed)
-            ));
+            let tmp = self
+                .dir
+                .join(format!("{TMP_PREFIX}{}-{}", std::process::id(), next_seq()));
             let mut opts = OpenOptions::new();
             opts.write(true).create_new(true);
             set_private_mode(&mut opts);
@@ -322,12 +330,31 @@ fn dir_is_private(path: &Path, _owner: u32) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
 }
 
+/// macOS で `File::sync_all`（`F_FULLFSYNC`）がディレクトリ fd に対して返しうる errno（EINVAL=22・ENOTSUP=45）。
+/// plugin-cri は `sys` モジュールを持たず `fsync(2)` を呼べないため、この 2 つに限り既に完了した
+/// rename / unlink を失敗扱いにせず受け入れる（それ以外の errno は fail-closed。IO-5・CLI-1）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const DIR_SYNC_UNSUPPORTED_ERRNOS: [i32; 2] = [22, 45];
+
+/// `result` が失敗でも、`tolerated` に含まれる errno のときだけ成功として扱う。
+#[cfg_attr(not(unix), allow(dead_code))]
+fn tolerate_errnos(result: std::io::Result<()>, tolerated: &[i32]) -> std::io::Result<()> {
+    match result {
+        Err(e) if e.raw_os_error().is_some_and(|n| tolerated.contains(&n)) => Ok(()),
+        other => other,
+    }
+}
+
 /// ディレクトリの内容（rename・unlink）を永続化する。unix 以外では何もしない。
 fn sync_dir(dir: &Path) -> Result<(), TraitError> {
     #[cfg(unix)]
     {
+        #[cfg(target_os = "macos")]
+        let tolerated: &[i32] = &DIR_SYNC_UNSUPPORTED_ERRNOS;
+        #[cfg(not(target_os = "macos"))]
+        let tolerated: &[i32] = &[];
         File::open(dir)
-            .and_then(|d| d.sync_all())
+            .and_then(|d| tolerate_errnos(d.sync_all(), tolerated))
             .map_err(|_| internal("failed to sync the reclaim store directory"))
     }
     #[cfg(not(unix))]
@@ -358,22 +385,47 @@ mod tests {
         p
     }
 
-    /// NET-1・REPAIR-3・#2604: 異常終了で残った同名の一時ファイルがあっても、別名で再試行して保存できる。
+    /// NET-1・REPAIR-3・#2604・REPAIR-12: RECLAIM_DIR 配下に残った同名の一時ファイルと実際に衝突しても、
+    /// 連番を進めて別名で保存できる。連番の供給元を差し込み、衝突した回数（供給回数）まで確認する。
     #[test]
     fn net1_store_save_survives_stale_tmp_collision() {
+        use std::cell::Cell;
         let root = temp_root("stale");
         let s = ReclaimStore::open(&root).expect("open");
-        for n in 0..8 {
+        for n in 100..108 {
             fs::write(
-                root.join(format!("{TMP_PREFIX}{}-{n}", std::process::id())),
+                root.join(RECLAIM_DIR)
+                    .join(format!("{TMP_PREFIX}{}-{n}", std::process::id())),
                 "stale",
             )
             .expect("stale");
         }
-        s.save("web", "rec-1\n").expect("save despite stale tmp");
+        let calls = Cell::new(0u64);
+        s.save_with_seq("web", "rec-1\n", &|| {
+            let n = 100 + calls.get();
+            calls.set(calls.get() + 1);
+            n
+        })
+        .expect("save despite stale tmp");
+        // 100..=107 の 8 件と衝突し、9 回目（108）で成功する。
+        assert_eq!(calls.get(), 9);
         let r = s.load().expect("load");
         assert_eq!(r.claims.len(), 1);
         assert_eq!(r.claims[0].record.as_deref(), Some("rec-1\n"));
+    }
+
+    /// IO-5・CLI-1: ディレクトリ同期の許容は指定 errno に限り、それ以外は失敗のまま返す。
+    #[test]
+    fn net1_store_tolerate_errnos_only_listed() {
+        let e = |n| Err(std::io::Error::from_raw_os_error(n));
+        assert!(tolerate_errnos(e(22), &[22, 45]).is_ok());
+        assert!(tolerate_errnos(e(45), &[22, 45]).is_ok());
+        assert_eq!(
+            tolerate_errnos(e(5), &[22, 45]).unwrap_err().raw_os_error(),
+            Some(5)
+        );
+        assert!(tolerate_errnos(e(22), &[]).is_err());
+        assert!(tolerate_errnos(Ok(()), &[]).is_ok());
     }
 
     /// NET-1・#2604: 保存した記録が読み戻せ、削除で消え、削除は冪等。

@@ -3550,19 +3550,6 @@ mod tests {
         }
     }
 
-    /// 解放されるまで最初の書き込みで止まる書き手(#2008 の試験用)。
-    struct BlockedWriter(std::sync::mpsc::Receiver<()>);
-
-    impl Write for BlockedWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            let _ = self.0.recv();
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     const LEGACY_LINE: &str = r#"{"level":"warn","event":"legacy_tiocsti_enabled","sysctl":"dev.tty.legacy_tiocsti","value":1}"#;
 
     /// CORE-5・SEC-1・REPAIR-4(#2008): 有効のとき固定 1 行が改行付きでログへ入る。
@@ -3732,19 +3719,34 @@ mod tests {
         }
     }
 
-    /// REPAIR-5(#2008): 書き手が止まりキューが満杯でも待たずに `QueueFull` で戻る。
+    /// REPAIR-5(#2008)・REPAIR-12(#2538): 書き手が止まりキューが満杯でも待たずに `QueueFull` で戻る。
+    ///
+    /// 専用スレッドが 1 行目を取り出す時刻は呼び出し側の emit と順序が決まっていない。取り出しが遅れると
+    /// 後半の emit の途中で空きができ、最後が `Queued` になる（macOS CI で観測）。書き手に入ったことを
+    /// 待ってから連続 emit し、空きの位置を固定する(#1970 と同じ対策)。
     #[test]
     fn sup_repair5_2008_full_queue_does_not_block() {
+        use crate::stderr_sink::test_support::stuck;
         use crate::stderr_sink::{EmitOutcome, StderrSink};
         use fandhe_container_core::legacy_tiocsti::LegacyTiocsti;
-        let (release, rx) = std::sync::mpsc::channel();
-        let sink = StderrSink::spawn(BlockedWriter(rx), 1);
+        let (release, arrived, writer) = stuck();
+        let sink = StderrSink::spawn(writer, 1);
+        assert_eq!(
+            log_legacy_tiocsti_to(&sink, LegacyTiocsti::Enabled),
+            Some(EmitOutcome::Queued)
+        );
+        arrived
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the drain thread must reach the stuck writer");
+        // キューは空・容量 1。ここから先は専用スレッドが戻らないので結果が決まる。
         let started = Instant::now();
         let outcomes: Vec<_> = (0..8)
             .map(|_| log_legacy_tiocsti_to(&sink, LegacyTiocsti::Enabled))
             .collect();
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(outcomes.last(), Some(&Some(EmitOutcome::QueueFull)));
+        let mut expected = vec![Some(EmitOutcome::Queued)];
+        expected.extend(std::iter::repeat_n(Some(EmitOutcome::QueueFull), 7));
+        assert_eq!(outcomes, expected);
         drop(release);
     }
 

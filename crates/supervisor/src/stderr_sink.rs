@@ -206,17 +206,16 @@ pub fn flush_stderr(deadline: Duration) -> EmitOutcome {
         .map_or(EmitOutcome::NothingQueued, |sink| sink.flush(deadline))
 }
 
+/// 試験用の書き手の共有部品（stderr_sink と、これを使う他モジュールの試験で使う）。
+/// 「専用スレッドが書き手に入った」ことを待ってから判定する競合対策（#1970・#2538）を一箇所に置く。
 #[cfg(test)]
-mod tests {
-    use std::sync::mpsc::{Sender, channel};
-    use std::sync::{Arc, Mutex};
-    use std::time::Instant;
-
-    use super::*;
+pub(crate) mod test_support {
+    use std::io::Write;
+    use std::sync::mpsc::{Receiver, Sender, channel};
 
     /// 解放の合図まで書き込みが戻らない書き手（読み手の止まった満杯の pipe の代わり）。
     /// 書き込みに入った時点で `arrived` へ通知し、専用スレッドが止まったことをテストが確認できる（#1970）。
-    struct StuckWriter {
+    pub(crate) struct StuckWriter {
         release: Receiver<()>,
         arrived: Sender<()>,
     }
@@ -232,7 +231,7 @@ mod tests {
         }
     }
 
-    fn stuck() -> (Sender<()>, Receiver<()>, StuckWriter) {
+    pub(crate) fn stuck() -> (Sender<()>, Receiver<()>, StuckWriter) {
         let (release, rx) = channel();
         let (arrived_tx, arrived) = channel();
         (
@@ -244,6 +243,15 @@ mod tests {
             },
         )
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use super::test_support::stuck;
+    use super::*;
 
     /// 書いた内容を共有のバッファへ溜める書き手。
     #[derive(Clone, Default)]

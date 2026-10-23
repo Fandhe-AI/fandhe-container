@@ -4561,6 +4561,25 @@ pub(crate) fn pidfd_open(pid: u32) -> Result<OwnedFd, SysError> {
 /// 指すプロセスが既に回収済み（終了して消えた）なら `ESRCH` を返し、再利用された別プロセスには
 /// 届かない。番号は [`kill_pid`] と同じく 1..=64 だけを受ける。
 pub(crate) fn pidfd_send_signal(pidfd: BorrowedFd<'_>, sig: Signal) -> Result<(), SysError> {
+    pidfd_send_signal_flags(pidfd, sig, 0)
+}
+
+/// `pidfd_send_signal(2)` の `flags` に渡す `PIDFD_SIGNAL_PROCESS_GROUP`(`include/uapi/linux/pidfd.h` の `1 << 2`。
+/// Linux 6.9 以降。全アーキテクチャ共通の値)。`libc` に対応物が無い(カーネル ABI のフラグを直接使う)ため照合しない。
+const PIDFD_SIGNAL_PROCESS_GROUP: i64 = 1 << 2;
+
+/// [`pidfd_open`] で得た pidfd の指すプロセスの**プロセスグループ全員**へシグナルを送る
+/// (`pidfd_send_signal(fd, sig, NULL, PIDFD_SIGNAL_PROCESS_GROUP)`。Linux 6.9 以降。CORE-6・SEC-5・#2551)。
+///
+/// 宛先は pid の数値ではなく、pidfd が参照する `struct pid` に属するグループである。そのため回収後に番号が別の
+/// プロセスへ再利用されても、元のグループ以外には届かない。グループに誰も居なければ `ESRCH`。未対応カーネル
+/// (6.9 未満)は `EINVAL` を返すので、呼び出し側は数値 PGID の経路へ退避するか送らないかを決める。
+pub(crate) fn pidfd_send_signal_group(pidfd: BorrowedFd<'_>, sig: Signal) -> Result<(), SysError> {
+    pidfd_send_signal_flags(pidfd, sig, PIDFD_SIGNAL_PROCESS_GROUP)
+}
+
+/// `pidfd_send_signal(2)` の本体([`pidfd_send_signal`]・[`pidfd_send_signal_group`] が共有する唯一の呼び出し)。
+fn pidfd_send_signal_flags(pidfd: BorrowedFd<'_>, sig: Signal, flags: i64) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
@@ -4571,14 +4590,15 @@ pub(crate) fn pidfd_send_signal(pidfd: BorrowedFd<'_>, sig: Signal) -> Result<()
     };
     let nr = consts::SYS_PIDFD_SEND_SIGNAL.get()?;
     // SAFETY: `pidfd` は呼び出しの間有効な fd（`BorrowedFd`）。`info` は NULL（カーネルが siginfo を
-    // 既定値で作る）で、ポインタ引数は書き込み・読み出しされない。`number` は検証済みの値、flags は 0。
+    // 既定値で作る）で、ポインタ引数は書き込み・読み出しされない。`number` は検証済みの値、`flags` は
+    // 呼び出し元(この関数は非公開)が渡す 0 か `PIDFD_SIGNAL_PROCESS_GROUP` のどちらかである。
     let rc = unsafe {
         syscall(
             nr,
             i64::from(pidfd.as_raw_fd()),
             i64::from(number),
             0_i64,
-            0_i64,
+            flags,
         )
     };
     if rc == -1 { Err(last_error()) } else { Ok(()) }

@@ -156,6 +156,39 @@ fn wait_until(pid: u32, limit: Duration) -> Option<i32> {
     None
 }
 
+/// まだ回収していない自分の子の pid の集合(#2551)。回収済みの pid は番号が再利用され得るため、cleanup が
+/// シグナルを送る対象から外す(無関係な同一 UID のプロセスを終了させない)。
+struct LiveChildren(std::cell::RefCell<Vec<u32>>);
+
+impl LiveChildren {
+    fn new(pids: &[u32]) -> Self {
+        Self(std::cell::RefCell::new(pids.to_vec()))
+    }
+
+    /// 回収した `pid` を集合から外す。
+    fn reaped(&self, pid: u32) {
+        self.0.borrow_mut().retain(|p| *p != pid);
+    }
+
+    /// `pid` の終了を `limit` まで待ち、回収できたら集合から外して wait status を返す。
+    fn wait(&self, pid: u32, limit: Duration) -> Option<i32> {
+        let status = wait_until(pid, limit);
+        if status.is_some() {
+            self.reaped(pid);
+        }
+        status
+    }
+
+    /// 未回収の子だけに SIGKILL を送り、回収する(回収済みの pid へは送らない)。
+    fn kill_and_reap(&self) {
+        let pids = std::mem::take(&mut *self.0.borrow_mut());
+        for p in pids {
+            let _ = sys::kill_pid(p, sys::Signal::Kill);
+            let _ = wait_until(p, Duration::from_secs(2));
+        }
+    }
+}
+
 /// 期限切れの再現を実行して観測する。呼び出しプロセスを child subreaper にする(孤児になった holder・mapper・
 /// helper を `waitpid` で回収するため)。`release_wait` は 3 秒以上を推奨する(準備の時間が食い込むと期限前の確認が崩れる)。
 pub fn observe_holder_expiry(
@@ -186,11 +219,9 @@ pub fn observe_holder_expiry(
     }
     let pid_at = |i: usize| u32::from_be_bytes([out[i], out[i + 1], out[i + 2], out[i + 3]]);
     let (holder_pid, mapper_pid, helper_pid) = (pid_at(0), pid_at(4), pid_at(8));
-    let cleanup = || {
-        for p in [caller, holder_pid, mapper_pid, helper_pid] {
-            let _ = sys::kill_pid(p, sys::Signal::Kill);
-        }
-    };
+    // holder・mapper・helper は孤児になった後に subreaper の自分の子として再親付けされた未回収の子である。
+    let live = LiveChildren::new(&[caller, holder_pid, mapper_pid, helper_pid]);
+    let cleanup = || live.kill_and_reap();
     // helper と mapper を止め、呼び出し元を消す。以降、holder が止めない限り helper は socket を握り続ける。
     let stop = std::num::NonZeroU8::new(19).ok_or_else(|| fail("signal"))?;
     for p in [helper_pid, mapper_pid] {
@@ -204,25 +235,33 @@ pub fn observe_holder_expiry(
         cleanup();
         return Err(fail(&format!("kill caller: {e:?}")));
     }
-    if wait_until(caller, Duration::from_secs(5)).is_none() {
+    if live.wait(caller, Duration::from_secs(5)).is_none() {
         cleanup();
         return Err(fail("caller was not reaped"));
     }
     // 期限(release_wait)が来る前に、holder は生きていて helper は止まったままのはず。
     std::thread::sleep(Duration::from_millis(500));
     let midpoint = t0.elapsed();
-    let holder_alive_at_midpoint = matches!(sys::wait_pid_nohang(holder_pid), Ok(None));
+    let holder_alive_at_midpoint = match sys::wait_pid_nohang(holder_pid) {
+        Ok(None) => true,
+        // 回収できてしまった場合は集合から外し、cleanup が回収済みの pid へ送らないようにする。
+        Ok(Some(_)) => {
+            live.reaped(holder_pid);
+            false
+        }
+        Err(_) => false,
+    };
     let helper_state_at_midpoint = proc_state(helper_pid);
     // holder の終了を待つ(期限 + 待ち切り + 余裕)。
     let limit = release_wait + drain_wait + Duration::from_secs(10);
-    let Some(holder_status) = wait_until(holder_pid, limit) else {
+    let Some(holder_status) = live.wait(holder_pid, limit) else {
         cleanup();
         return Err(fail("holder did not exit within the bounded wait"));
     };
     let holder_exit_after_caller_exit = t0.elapsed();
     // holder が終わった時点で、止められていた mapper と helper は既に SIGKILL で終わっているはず。
-    let mapper_status = wait_until(mapper_pid, Duration::from_millis(500));
-    let helper_status = wait_until(helper_pid, Duration::from_millis(500));
+    let mapper_status = live.wait(mapper_pid, Duration::from_millis(500));
+    let helper_status = live.wait(helper_pid, Duration::from_millis(500));
     cleanup();
     Ok(HolderExpiryObservation {
         holder_pid,

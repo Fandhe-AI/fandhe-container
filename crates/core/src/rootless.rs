@@ -1425,17 +1425,34 @@ pub(crate) struct HolderWait<'a> {
     pub(crate) release_wait: Duration,
     /// 期限切れで kill した後、EOF を待つ上限。
     pub(crate) drain_wait: Duration,
+    /// 錨にした mapper の pidfd でそのグループ全員へ SIGKILL を送る関数(`None` なら使わない。#2551)。
+    /// pid の数値ではなく `struct pid` へ送るため、mapper が回収された後も元のグループ以外には届かない。
+    /// 本番は `sys::pidfd_send_signal_group`(Linux 6.9 以降)。未対応カーネルの `EINVAL` では数値 PGID の経路へ退避する。
+    pub(crate) pidfd_kill: Option<&'a PidfdKill<'a>>,
+}
+
+/// pidfd でグループへ SIGKILL を送る関数の型([`HolderWait::pidfd_kill`])。
+pub(crate) type PidfdKill<'a> = dyn Fn(std::os::fd::BorrowedFd<'_>) -> Result<(), SysError> + 'a;
+
+/// holder の錨(mapper の `/proc/<pid>` の fd・pid・pidfd)。
+struct Anchor {
+    handle: ProcHandle,
+    pid: u32,
+    /// pid の数値に依らずグループへ送るための pidfd。開けなければ `None`(数値 PGID の経路だけになる)。
+    pidfd: Option<std::os::fd::OwnedFd>,
 }
 
 /// 錨(mapper の `/proc/<pid>` の fd と pid)を作る。作れない・親が一致しない場合は `None`(診断を 1 行出す)。
 ///
 /// 開けないのは mapper が既に回収された場合で、mapper は helper を回収してから終わるか go を受けずに終わる
-/// ため helper は残らない。fd を確保した**後**に親を確かめ、別プロセスの `/proc/<pid>` を錨にしない。
+/// ため helper は残らない。`/proc/<pid>` の fd と pidfd を確保した**後**に親を確かめる(読めれば、どちらの fd も
+/// 回収前の同じプロセスを指す)ため、別プロセスを錨にしない。pidfd は mapper の `struct pid` を保持し、回収後に
+/// 番号が再利用されても元のグループにだけ送れる(#2551)。pidfd を開けない環境では `None` のまま数値 PGID へ退避する。
 fn open_anchor(
     pid: MapperPid,
     w: &HolderWait<'_>,
     diag: &mut dyn std::io::Write,
-) -> Option<(ProcHandle, u32)> {
+) -> Option<Anchor> {
     let pid = pid.get();
     let anchor = (|| {
         if pid == w.self_pid || pid == w.expected_parent {
@@ -1444,8 +1461,9 @@ fn open_anchor(
         let handle = TargetPid::new(pid)
             .and_then(ProcHandle::open)
             .map_err(|_| "cannot open the mapper proc directory")?;
+        let pidfd = sys::pidfd_open(pid).ok();
         match handle.parent_pid() {
-            Ok(ppid) if ppid == (w.current_parent)() => Ok((handle, pid)),
+            Ok(ppid) if ppid == (w.current_parent)() => Ok(Anchor { handle, pid, pidfd }),
             _ => Err("mapper is not a sibling of the holder"),
         }
     })();
@@ -1466,7 +1484,9 @@ fn open_anchor(
 /// I が死んでいても、mapper が回収済みなら生きている helper がセッションを継承して番号を保つ。kill の直前に
 /// fd 経由でセッション ID が mapper の pid であることを確かめ、読めなくなっていれば EOF を確かめ直す。
 /// 残る窓: 期限の直前に最後の helper が終わり、その pid が `setsid` した無関係なプロセスへ再利用される極小の窓。
-/// mapper が回収済み(`Gone`)の場合は送らない(fail-closed)。回収後は元のグループの同一性を保つ手段が無く、番号が
+/// 送信は錨と同時に開いた mapper の pidfd で行い(`HolderWait::pidfd_kill`。`PIDFD_SIGNAL_PROCESS_GROUP`、Linux 6.9 以降)、
+/// 宛先を pid の数値ではなく `struct pid` のグループにするため、回収後の番号の再利用に影響されない(`Gone` でも送れる)。
+/// 未対応(`EINVAL`)・pidfd を開けない場合は数値 PGID へ退避し、その経路で mapper が回収済み(`Gone`)なら送らない(fail-closed)。回収後は元のグループの同一性を保つ手段が無く、番号が
 /// 無関係なプロセスへ再利用されて `setsid`・fork・親の終了まで進むと、現在の所属情報だけでは元のグループと区別できない
 /// ため(`/proc` の走査による判定は走査前に成立する誤判定を除けない)。
 pub(crate) fn holder_await_release(
@@ -1491,7 +1511,7 @@ fn holder_await_release_inner(
     diag: &mut dyn std::io::Write,
 ) -> HolderExit {
     let deadline = Instant::now() + w.release_wait;
-    let mut anchor: Option<(ProcHandle, u32)> = None;
+    let mut anchor: Option<Anchor> = None;
     let mut seen_pid = false;
     let mut buf = [0u8; HOLDER_CONTROL_LEN];
     loop {
@@ -1529,38 +1549,62 @@ fn holder_await_release_inner(
         }
     }
     let _ = writeln!(diag, "fandhe-container: userns holder: release wait ended");
-    let Some((handle, mapper_pid)) = anchor else {
+    let Some(Anchor {
+        handle,
+        pid: mapper_pid,
+        pidfd,
+    }) = anchor
+    else {
         return HolderExit::ExpiredNoKill;
     };
-    match handle.session_probe() {
-        SessionProbe::Session(sid) if sid == mapper_pid => {}
-        SessionProbe::Gone => {
-            // mapper は回収済み。生きている helper が無ければ EOF になっているはずなので、送る直前に確かめ直す。
-            let mut b = [0u8; HOLDER_CONTROL_LEN];
-            match read_frame_until(sock, &mut b, Instant::now() + Duration::from_millis(1)) {
-                FrameRead::Eof => return HolderExit::PeersClosed,
-                FrameRead::Full if HolderControl::decode(&b) == Ok(HolderControl::Release) => {
-                    return HolderExit::Released;
-                }
-                _ => {}
+    // pidfd 経由のグループ送信(番号の再利用に影響されない)。済めば数値 PGID へは送らない。mapper が回収済みでも、
+    // pidfd は元のグループにしか届かない(誰も居なければ ESRCH)ので、`Gone` でも安全に送れる。
+    let mut sent = false;
+    if let (Some(fd), Some(send)) = (pidfd.as_ref(), w.pidfd_kill) {
+        match send(std::os::fd::AsFd::as_fd(fd)) {
+            Ok(()) => sent = true,
+            Err(SysError::Os(e)) if e == sys::ESRCH => sent = true,
+            // 未対応カーネル(6.9 未満の EINVAL)・seccomp 等での拒否: 下の数値 PGID の経路へ退避する。
+            Err(SysError::Os(e)) if e == sys::EINVAL || e == sys::ENOSYS => {}
+            Err(SysError::Unsupported) => {}
+            Err(_) => {
+                let _ = writeln!(diag, "fandhe-container: userns holder: kill failed");
+                return HolderExit::ExpiredNoKill;
             }
-            // EOF が無いことは、元のグループの生存を証明しない(I も socket を持つ。SIGCHLD=SIG_IGN の継承で mapper が
-            // 自動回収された場合など)。回収後は番号の連続した保持を証明できないため、数値 PGID へは送らない。
-            let _ = writeln!(
-                diag,
-                "fandhe-container: userns holder: mapper gone and its group is not verified, not killing"
-            );
-            return HolderExit::ExpiredNoKill;
         }
-        // mapper が `setsid` の前(helper を作っていない)か、読めない: kill しない(fail-closed)。
-        _ => return HolderExit::ExpiredNoKill,
     }
-    match kill(mapper_pid) {
-        Ok(()) => {}
-        Err(SysError::Os(e)) if e == sys::ESRCH => {}
-        Err(_) => {
-            let _ = writeln!(diag, "fandhe-container: userns holder: kill failed");
-            return HolderExit::ExpiredNoKill;
+    if !sent {
+        match handle.session_probe() {
+            SessionProbe::Session(sid) if sid == mapper_pid => {}
+            SessionProbe::Gone => {
+                // mapper は回収済み。生きている helper が無ければ EOF になっているはずなので、確かめ直す。
+                let mut b = [0u8; HOLDER_CONTROL_LEN];
+                match read_frame_until(sock, &mut b, Instant::now() + Duration::from_millis(1)) {
+                    FrameRead::Eof => return HolderExit::PeersClosed,
+                    FrameRead::Full if HolderControl::decode(&b) == Ok(HolderControl::Release) => {
+                        return HolderExit::Released;
+                    }
+                    _ => {}
+                }
+                // EOF が無いことは、元のグループの生存を証明しない(I も socket を持つ。SIGCHLD=SIG_IGN の継承で
+                // mapper が自動回収された場合など)。pidfd で送れない以上、回収後は番号の連続した保持を証明できない
+                // ため、数値 PGID へは送らない。
+                let _ = writeln!(
+                    diag,
+                    "fandhe-container: userns holder: mapper gone and its group is not verified, not killing"
+                );
+                return HolderExit::ExpiredNoKill;
+            }
+            // mapper が `setsid` の前(helper を作っていない)か、読めない: kill しない(fail-closed)。
+            _ => return HolderExit::ExpiredNoKill,
+        }
+        match kill(mapper_pid) {
+            Ok(()) => {}
+            Err(SysError::Os(e)) if e == sys::ESRCH => {}
+            Err(_) => {
+                let _ = writeln!(diag, "fandhe-container: userns holder: kill failed");
+                return HolderExit::ExpiredNoKill;
+            }
         }
     }
     let _ = writeln!(
@@ -1668,6 +1712,7 @@ pub(crate) fn run_userns_holder(
         current_parent: &std::os::unix::process::parent_id,
         release_wait,
         drain_wait,
+        pidfd_kill: Some(&|fd| sys::pidfd_send_signal_group(fd, sys::Signal::Kill)),
     };
     holder_await_release(
         &mut sock,
@@ -2471,13 +2516,14 @@ mod tests {
         );
     }
 
-    fn holder_test_wait(release_ms: u64, drain_ms: u64) -> HolderWait<'static> {
+    fn holder_test_wait<'a>(release_ms: u64, drain_ms: u64) -> HolderWait<'a> {
         HolderWait {
             self_pid: std::process::id(),
             expected_parent: 1,
             current_parent: &std::process::id,
             release_wait: Duration::from_millis(release_ms),
             drain_wait: Duration::from_millis(drain_ms),
+            pidfd_kill: None,
         }
     }
 
@@ -2803,6 +2849,93 @@ mod tests {
         assert!(kills.is_empty());
         let text = String::from_utf8(diag).expect("utf8");
         assert!(text.contains("not verified"), "{text}");
+    }
+
+    /// SEC-5・CORE-6(#2551): mapper が回収済み(`Gone`)でも、pidfd 経由のグループ送信は元のグループにしか届かないため
+    /// 送る(数値 PGID の `kill` は呼ばない)。pidfd 経由が使えない場合の `Gone` は上の試験のとおり送らない。
+    #[test]
+    fn sec5_holder_gone_sends_via_pidfd_group_only() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        let pid = child.id();
+        send_pid(&mut a, pid);
+        let reaper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            child.kill().expect("kill");
+            child.wait().expect("wait");
+        });
+        let sent = std::cell::Cell::new(0_u32);
+        let send = |_fd: std::os::fd::BorrowedFd<'_>| {
+            sent.set(sent.get() + 1);
+            Ok(())
+        };
+        let mut w = holder_test_wait(500, 100);
+        w.pidfd_kill = Some(&send);
+        let mut kills = Vec::new();
+        let r = holder_await_release(
+            &mut b,
+            &w,
+            &mut |p| {
+                kills.push(p);
+                Ok(())
+            },
+            &mut Vec::new(),
+        );
+        reaper.join().expect("join");
+        drop(a);
+        assert_eq!(sent.get(), 1);
+        assert!(kills.is_empty(), "{kills:?}");
+        assert_eq!(r, HolderExit::ExpiredKilled { drained: false });
+    }
+
+    /// SEC-5(#2551): pidfd 経由が未対応(`EINVAL`)なら、生きている mapper に限って数値 PGID の経路へ退避する。
+    #[test]
+    fn sec5_holder_pidfd_einval_falls_back_to_numeric_group() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        send_pid(&mut a, child.id());
+        let send = |_fd: std::os::fd::BorrowedFd<'_>| Err(SysError::Os(sys::EINVAL));
+        let mut w = holder_test_wait(200, 100);
+        w.pidfd_kill = Some(&send);
+        let mut kills = Vec::new();
+        let r = holder_await_release(
+            &mut b,
+            &w,
+            &mut |p| {
+                kills.push(p);
+                Ok(())
+            },
+            &mut Vec::new(),
+        );
+        assert_eq!(kills, vec![child.id()]);
+        assert_eq!(r, HolderExit::ExpiredKilled { drained: false });
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+    }
+
+    /// SEC-5・CORE-6(#2551): 本番の pidfd 経由のグループ送信(未対応カーネルでは数値 PGID へ退避)で、SIGSTOP された
+    /// mapper のセッションも SIGKILL で終わり EOF に届く。
+    #[test]
+    fn sec5_holder_expiry_real_pidfd_group_kill_ends_stopped_session() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        send_pid(&mut a, child.id());
+        let sigstop = std::num::NonZeroU8::new(19).expect("nonzero");
+        sys::kill_pid(child.id(), sys::Signal::Number(sigstop)).expect("stop");
+        drop(a);
+        let send =
+            |fd: std::os::fd::BorrowedFd<'_>| sys::pidfd_send_signal_group(fd, sys::Signal::Kill);
+        let mut w = holder_test_wait(200, 5000);
+        w.pidfd_kill = Some(&send);
+        let r = holder_await_release(
+            &mut b,
+            &w,
+            &mut |pgid| sys::kill_process_group(pgid, sys::Signal::Kill),
+            &mut Vec::new(),
+        );
+        assert_eq!(r, HolderExit::ExpiredKilled { drained: true });
+        assert_eq!(child.wait().expect("wait").signal(), Some(9));
     }
 
     /// SEC-5(#2551): 錨を確保できたら `MapperReply::Ok`、できなければ `Failed` を I へ返す。

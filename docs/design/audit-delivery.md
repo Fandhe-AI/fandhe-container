@@ -192,11 +192,11 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 
 | ケース | 層 | 本番の配送経路 | 照合する証拠 | 段 |
 | ------ | -- | -------------- | ------------ | -- |
-| ESC-03 | seccomp（ERRNO 側） | `UserNotif` 版の filter ＋ `NEW_LISTENER` → `SCM_RIGHTS` の受け渡し（本番と同じ検証）→ 応答者が `record_seccomp_denial_for` → `ControlAuditRelay` → `FileAuditSink` → `@audit.log` | seccomp 層の行がちょうど 1 行（`mount` の syscall 番号・arch・攻撃した子の pid・コンテナ ID） | 既定の `--ignored` の段（root 不要） |
+| ESC-03 | seccomp（ERRNO 側） | `UserNotif` 版の filter ＋ `NEW_LISTENER` → `SCM_RIGHTS` の受け渡し（本番と同じ検証）→ 応答者が `record_seccomp_denial_for` → `ControlAuditRelay` → `FileAuditSink` → `@audit.log` | seccomp 層の行がちょうど 1 行（`mount` の syscall 番号・arch・攻撃した子の pid・コンテナ ID） | 既定の `--ignored` の段（root 不要）。応答者は試験側の応答ループで、本番の `SeccompNotifyHub` をコンテナ経由で通す同じ攻撃の照合は `supervisor_bin_real` のシナリオ E（実機前提・人間が実行。作成時は未実行。#2482） |
 | ESC-08（bind の元） | mount | `create` → `start` → `validate_bind_mounts` → `audit_bind_mount_error` → `ProcessLauncher::rejection_audit_sink` → `FileAuditSink` → `@audit.log` | mount 層の行が要求ごとに 1 行（元が rootfs・bundle・状態ルートの計 3 行・コンテナ ID）。`start` は `InvalidArgument` で拒否され launcher に到達せず、状態は Created のまま | 既定の `--ignored` の段 |
 | ESC-01・07（landlock 帰属）・10 | landlock | カーネル監査 `AUDIT_LANDLOCK_ACCESS`（ABI 7。core は `LOG_SAME_EXEC_OFF` を渡さない） | `/var/log/audit/audit.log` のケース開始後の追記で、`blockers=` の要素（`fs.write_file` / `fs.read_file` / `fs.make_reg`）が完全一致し、同じイベント連番の `SYSCALL` の `pid` が攻撃した子のホスト pid で、時刻が開始以降 | opt-in の段（root か audit ログの読み取り権限・auditd・ABI 7） |
 
-試験の側が書く部分は 2 つだけである。(1) ESC-03 の応答ループ（core の公開 API だけで組む。supervisor の `SeccompNotifyHub` の試験ではなく、それは `crates/supervisor/tests/seccomp_notify_audit.rs`）。(2) ESC-08 の launcher（`rejection_audit_sink` を返すだけの最小実装。本番の `ProductionLauncher` は構築にホストの前提〔cgroup 等〕を要するため使わず、sink の転送は `launcher.rs` の単体試験が担う）。子の記録（pipe）の `audit=` 行は拒否する。
+試験の側が書く部分は 2 つだけである。(1) ESC-03 の応答ループ（core の公開 API だけで組む。supervisor の `SeccompNotifyHub` の試験ではなく、それは `crates/supervisor/tests/seccomp_notify_audit.rs`。また hub をコンテナ経由で通す照合は `crates/supervisor/tests/supervisor_bin_real.rs` のシナリオ E〔#2482〕）。(2) ESC-08 の launcher（`rejection_audit_sink` を返すだけの最小実装。本番の `ProductionLauncher` は構築にホストの前提〔cgroup 等〕を要するため使わず、sink の転送は `launcher.rs` の単体試験が担う）。子の記録（pipe）の `audit=` 行は拒否する。
 
 **残余（REPAIR-3。実装済みを装わない）**:
 

@@ -32,6 +32,10 @@
 //!   `ControlSignaler::for_stop` 経由で core の `kill`（SIGTERM）を送る。monitor が Stopped を記録し、終了コードは
 //!   ハンドラの 43（寿命切れの 8・`Signaled(15)` の 143・SIGKILL の 137 ではない）。bin は終了コード 0 で終わり、
 //!   プロセスが残らない。その後の delete は補助役（本番の remover）で成功し、状態が消え、2 回目は NOT_FOUND になる
+//! - シナリオ E（ESC-03 を supervisor の `SeccompNotifyHub` 経由で照合。SEC-4・SEC-2・CORE-5・#2482）: コンテナ内のプローブ
+//!   （`--mount-probe`）が core の `escape_probe_mount` で `mount(2)` を 1 回試行する。専用の状態ルートで `kcmp` は呼ばない。
+//!   拒否が `EPERM`（ログ sink の `MOUNT_ERRNO=1`。listener が閉じていれば `ENOSYS`）で返り、`@audit.log` の seccomp 層の行が
+//!   ちょうど 1 行（mount の syscall 番号・arch・pid=1・コンテナ ID）届くことを、コンテナの外で回収した記録で具体値照合する
 //!
 //! # 必要環境
 //! - Linux 6.12 以上（Landlock ABI 6 以上。満たさないと launcher が起動を拒否する。CORE-5）
@@ -57,7 +61,8 @@
 //!
 //! 成功時の最終行: `supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped(7), logs
 //! captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043; SIGTERM
-//! via the control channel recorded Stopped(43) and the stopped container was deleted`。
+//! via the control channel recorded Stopped(43) and the stopped container was deleted; ESC-03 mount denied via the
+//! SeccompNotifyHub and recorded once`。
 //! 実行と結果の記録は人間担当（#499・#485・#491・#219 のうち該当するもの、または PR）。Linux 限定。
 
 #[cfg(not(target_os = "linux"))]
@@ -89,6 +94,8 @@ fn main() {
     if has("--container-probe") {
         if has("--term-probe") {
             linux::term_probe();
+        } else if has("--mount-probe") {
+            linux::mount_probe();
         } else {
             linux::probe();
         }
@@ -170,6 +177,35 @@ mod linux {
         std::process::exit(TERM_PROBE_TIMEOUT_EXIT);
     }
 
+    /// コンテナ内で動く mount プローブ（シナリオ E。ESC-03 と同じ攻撃。SEC-2・SEC-4・#2482）。core の
+    /// `escape_probe_mount`（PID 1 かつ `Seccomp: 2` のときだけ `mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL)` を
+    /// 1 回発行。新しいマウントは作らない）の結果を `MOUNT_ERRNO=<errno>` で出す。`kcmp` は呼ばない（シナリオ A の
+    /// 件数の契約を崩さないため）。前提の不成立は終了コード 9 にして親の Stopped(7) の照合で落とす。
+    pub fn mount_probe() {
+        use fandhe_container_core::exec::{ProbeOutcome, escape_probe_mount};
+        let mut out = std::io::stdout();
+        let mut exit = PROBE_EXIT;
+        match escape_probe_mount() {
+            Ok(ProbeOutcome::Errno(n)) => {
+                let _ = writeln!(out, "MOUNT_ERRNO={n}");
+            }
+            Ok(ProbeOutcome::Ok) => {
+                let _ = writeln!(out, "MOUNT_ERRNO=0");
+            }
+            Ok(other) => {
+                let _ = writeln!(out, "MOUNT_PROBE_FAILED {other:?}");
+            }
+            Err(e) => {
+                let _ = writeln!(out, "MOUNT_PRECONDITION_FAILED {}", e.code.as_str());
+                exit = 9;
+            }
+        }
+        let _ = writeln!(out, "READY");
+        let _ = out.flush();
+        std::thread::sleep(PROBE_LIFETIME);
+        std::process::exit(exit);
+    }
+
     /// delete の補助役。委譲 cgroup（`systemd-run --user --scope`）の中で、本番の remover（`DelegatedCgroup::detect()`）を
     /// 使って core の `delete` を呼び、結果を `DELETE_RESULT <OK|コード>` の 1 行で出す。失敗は非 0 で終わる。
     pub fn delete_helper() {
@@ -215,6 +251,17 @@ mod linux {
             }
         }
     }
+
+    /// 拒否される syscall 番号（アーキテクチャごとに別。流用しない）。kcmp は x86_64 = 312 / aarch64 = 272、
+    /// mount は x86_64 = 165 / aarch64 = 40。aarch64 の値は CI の型検査でだけ確認され、実行はされない。
+    #[cfg(target_arch = "x86_64")]
+    const KCMP_NR: u32 = 312;
+    #[cfg(target_arch = "aarch64")]
+    const KCMP_NR: u32 = 272;
+    #[cfg(target_arch = "x86_64")]
+    const MOUNT_NR: u32 = 165;
+    #[cfg(target_arch = "aarch64")]
+    const MOUNT_NR: u32 = 40;
 
     /// コンテナ内で動くプローブ。`READY` を出して一定時間待ち、`PROBE_EXIT` で終わる。
     pub fn probe() {
@@ -356,6 +403,8 @@ mod linux {
         Exit7,
         /// SIGTERM を待ち、ハンドラ経由で終了コード 43 で終わる（シナリオ D）。
         Term,
+        /// `mount(2)` を 1 回試行して終了コード 7 で終わる（シナリオ E。ESC-03）。
+        Mount,
     }
 
     impl Env {
@@ -363,6 +412,7 @@ mod linux {
             let probe_args = match probe {
                 Probe::Exit7 => r#""/probe","--container-probe""#,
                 Probe::Term => r#""/probe","--container-probe","--term-probe""#,
+                Probe::Mount => r#""/probe","--container-probe","--mount-probe""#,
             };
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -540,8 +590,9 @@ mod linux {
         scenario_b_failed_start_leaves_nothing();
         scenario_c_restart_fails_closed();
         scenario_d_sigterm_stop_delete();
+        scenario_e_esc03_mount_via_hub();
         println!(
-            "supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped({PROBE_EXIT}), logs captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043; SIGTERM via the control channel recorded Stopped({TERM_HANDLER_EXIT}) and the stopped container was deleted"
+            "supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped({PROBE_EXIT}), logs captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043; SIGTERM via the control channel recorded Stopped({TERM_HANDLER_EXIT}) and the stopped container was deleted; ESC-03 mount denied via the SeccompNotifyHub and recorded once"
         );
     }
 
@@ -673,14 +724,15 @@ mod linux {
                     .is_ok_and(|t| t.lines().any(|l| l.contains("READY")))
             });
         assert!(captured, "READY must be captured in the log sink");
-        verify_seccomp_audit(&env, &id);
+        verify_seccomp_audit(&env, &id, "KCMP_ERRNO=1", KCMP_NR, "kcmp");
         println!("supervisor_bin_real: scenario=A ok pid={pid} nspid={nspid:?}");
     }
 
     /// seccomp の拒否の end-to-end(SEC-4・REPAIR-5・#2025): プローブが呼んだ `kcmp` が EPERM(1) で返り(ログ sink の
     /// `KCMP_ERRNO=1`)、`<状態ルート>/@audit.log` に seccomp 層の行がちょうど 1 行(コンテナ ID つき・pid はコンテナ内の 1)
     /// 届くことを具体値で照合する。
-    fn verify_seccomp_audit(env: &Env, id: &str) {
+    /// `errno_marker` はプローブが出す EPERM の印、`nr` は拒否された syscall 番号、`label` は成功行に出す syscall 名。
+    fn verify_seccomp_audit(env: &Env, id: &str, errno_marker: &str, nr: u32, label: &str) {
         let logs = fandhe_container_supervisor::logs::container_log_dir(&env.root());
         let denied = std::fs::read_dir(&logs)
             .expect("log directory")
@@ -688,11 +740,11 @@ mod linux {
             .filter(|e| e.file_name().to_string_lossy().starts_with(id))
             .any(|e| {
                 std::fs::read_to_string(e.path())
-                    .is_ok_and(|t| t.lines().any(|l| l.contains("KCMP_ERRNO=1")))
+                    .is_ok_and(|t| t.lines().any(|l| l.contains(errno_marker)))
             });
         assert!(
             denied,
-            "the denied kcmp must return EPERM (KCMP_ERRNO=1 in the log sink)"
+            "the denied {label} must return EPERM ({errno_marker} in the log sink)"
         );
         let audit = std::fs::read_to_string(env.root().join("@audit.log")).unwrap_or_default();
         let lines: Vec<&str> = audit
@@ -706,9 +758,9 @@ mod linux {
         );
         let line = lines.first().copied().unwrap_or_default();
         #[cfg(target_arch = "x86_64")]
-        let (nr, arch) = (312u32, 0xC000_003Eu32);
+        let arch = 0xC000_003Eu32;
         #[cfg(target_arch = "aarch64")]
-        let (nr, arch) = (272u32, 0xC000_00B7u32);
+        let arch = 0xC000_00B7u32;
         for needle in [
             format!("\"syscall\":{nr}"),
             format!("\"arch\":{arch}"),
@@ -717,9 +769,15 @@ mod linux {
         ] {
             assert!(line.contains(&needle), "{needle} missing: {line}");
         }
-        println!(
-            "supervisor_bin_real: seccomp denial returned EPERM and left exactly 1 record in @audit.log"
-        );
+        if label == "kcmp" {
+            println!(
+                "supervisor_bin_real: seccomp denial returned EPERM and left exactly 1 record in @audit.log"
+            );
+        } else {
+            println!(
+                "supervisor_bin_real: ESC-03 {label} denied with EPERM via the supervisor SeccompNotifyHub and left exactly 1 record in @audit.log"
+            );
+        }
     }
 
     /// シナリオ B: pre-pivot 段の失敗で、子を残さず、Created のまま、作った cgroup を消す。
@@ -937,6 +995,38 @@ mod linux {
         println!(
             "supervisor_bin_real: scenario=D ok pid={pid} (stopped delete succeeded; second delete NOT_FOUND)"
         );
+    }
+
+    /// シナリオ E: ESC-03 の `mount(2)` 拒否を、本番 supervisor bin の `SeccompNotifyHub` 経由で記録させて照合する
+    /// （SEC-4・SEC-2・CORE-5・#2482）。証拠はコンテナの外（この親）が状態ルートの `@audit.log` から回収した記録だけで、
+    /// プローブの出力 `MOUNT_ERRNO=1` は攻撃結果の観測にとどめる。
+    fn scenario_e_esc03_mount_via_hub() {
+        let env = Env::new("e", true, Probe::Mount);
+        let id = format!("sbe{}", std::process::id());
+        env.create(&id);
+        let mut sup = spawn_supervisor(&env, &id, None);
+        let pid = match sup.report() {
+            StartReport::Started { pid } => pid,
+            other => panic!("expected OK, got {other:?}"),
+        };
+        let running = env.record(&id);
+        assert_eq!(running.status().state(), ContainerState::Running);
+        assert_eq!(running.status().pid(), Some(pid));
+        assert_eq!(sup.exit_code(), 0, "monitor must finish cleanly");
+        let stopped = env.record(&id);
+        assert_eq!(stopped.status().state(), ContainerState::Stopped);
+        assert_eq!(
+            stopped.status().exit_code(),
+            Some(PROBE_EXIT),
+            "the mount probe must pass its precondition (PID 1, Seccomp: 2) and exit 7"
+        );
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "the container process must be reaped"
+        );
+        assert!(no_probe_remains(), "no probe process may remain");
+        verify_seccomp_audit(&env, &id, "MOUNT_ERRNO=1", MOUNT_NR, "mount");
+        println!("supervisor_bin_real: scenario=E ok pid={pid}");
     }
 
     /// スコープ配下に `id` を含む子 cgroup が残っているかを返す。

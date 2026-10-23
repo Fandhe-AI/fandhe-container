@@ -1701,15 +1701,7 @@ fn isolate_rootless_subordinate_with(
     drop(holder_sock);
     match handshake {
         // 応答(Ok)は mapper が helper を回収し終えた後にだけ届くため、ここで mapper を kill しても helper は残らない。
-        Ok(()) => {
-            // 片方の回収が失敗しても、もう片方の回収は試みる(ゾンビを残さない)。
-            let holder_exit = holder.wait_timeout(MAPPER_REAP_TIMEOUT);
-            let mapper_exit = mapper.as_ref().map(|m| m.wait_timeout(MAPPER_REAP_TIMEOUT));
-            holder_exit?;
-            if let Some(r) = mapper_exit {
-                r?;
-            }
-        }
+        Ok(()) => reap_after_handshake(&holder, mapper.as_ref(), |c, t| c.wait_timeout(t))?,
         Err(e) => {
             // helper(`newuidmap` / `newgidmap`)は holder を pid の数値で受け取る(shadow 4.13 は `fd:N` を受けない。
             // #2376)。holder を回収すると pid が解放されて再利用され得るため、helper がもう `/proc/<pid>` を開いて
@@ -1768,6 +1760,38 @@ fn isolate_rootless_subordinate_with(
             },
         },
     })
+}
+
+/// 握手が成功した後の holder・mapper の回収(CORE-6・SEC-5・REPAIR-5。#2546)。
+///
+/// [`isolate_rootless_subordinate_with`] の成功経路から呼ばれる。`wait` は本番では `ContainerChild::wait_timeout`
+/// で、試験が失敗を注入する継ぎ目でもある。`wait_timeout` は期限切れなら自分で SIGKILL して回収するが、waitpid
+/// の失敗・kill の失敗・SIGKILL 後も回収できなかった場合は子が残り得るため、待ちが Err になった子には
+/// `kill_and_reap`(冪等。回収済みなら記録を返すだけ)で回収を試み直す。
+///
+/// 成功の応答は mapper が helper を回収し終えた後にだけ届くため、成功経路で mapper を kill・回収しても helper は
+/// 残らず、launcher 経路でも安全である。「mapper を回収せず C の再探索に任せる」契約は失敗経路だけのもの。
+/// 片方の待ちが失敗しても、もう片方の回収は試みる。戻り値のエラーは holder を優先する。
+fn reap_after_handshake(
+    holder: &ContainerChild,
+    mapper: Option<&ContainerChild>,
+    wait: impl Fn(&ContainerChild, Duration) -> Result<ChildExit, ExecError>,
+) -> Result<(), ExecError> {
+    let settle = |child: &ContainerChild| {
+        let r = wait(child, MAPPER_REAP_TIMEOUT);
+        if r.is_err() {
+            // 回収の再試行(best-effort)。元のエラーを優先するため結果は捨てる。
+            let _ = child.kill_and_reap(MAPPER_REAP_TIMEOUT);
+        }
+        r
+    };
+    let holder_exit = settle(holder);
+    let mapper_exit = mapper.map(settle);
+    holder_exit?;
+    if let Some(r) = mapper_exit {
+        r?;
+    }
+    Ok(())
 }
 
 /// 失敗の後始末で、mapper と、mapper が起動した helper(`newuidmap` / `newgidmap`)を止める(CORE-6・SEC-5・#2376)。
@@ -2464,6 +2488,69 @@ mod tests {
             namespaces,
             hostname: hostname.map(|h| Hostname::new(h).unwrap()),
         }
+    }
+
+    fn timeout_err() -> ExecError {
+        ExecError::new(
+            ErrorCode::Timeout,
+            IsolationStage::UserNamespaceMap,
+            "injected wait failure",
+        )
+    }
+
+    /// CORE-6・REPAIR-5(#2546): 成功経路の待ちが失敗しても、子を kill して回収する(ゾンビを残さない)。
+    #[test]
+    #[allow(clippy::zombie_processes)]
+    fn core6_repair5_reap_after_handshake_kills_when_wait_fails() {
+        let holder_proc = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mapper_proc = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let holder = ContainerChild::spawned(holder_proc.id());
+        let mapper = ContainerChild::spawned(mapper_proc.id());
+        // holder の待ちだけ失敗させる。mapper は本物の待ちが無いので kill の有無で照合する。
+        let holder_pid = holder.pid();
+        let err = reap_after_handshake(&holder, Some(&mapper), |c, _| {
+            if c.pid() == holder_pid {
+                Err(timeout_err())
+            } else {
+                Err(ExecError::new(
+                    ErrorCode::Internal,
+                    IsolationStage::UserNamespaceMap,
+                    "injected mapper failure",
+                ))
+            }
+        })
+        .unwrap_err();
+        // holder のエラーを優先する。
+        assert_eq!(err.code, ErrorCode::Timeout);
+        // どちらも SIGKILL(9)で回収済み(冪等な再呼び出しが記録を返す)。
+        assert_eq!(
+            holder.kill_and_reap(Duration::from_secs(1)).unwrap(),
+            ChildExit::Signaled(9)
+        );
+        assert_eq!(
+            mapper.kill_and_reap(Duration::from_secs(1)).unwrap(),
+            ChildExit::Signaled(9)
+        );
+        assert!(!std::path::Path::new(&format!("/proc/{}", holder_pid)).exists());
+    }
+
+    /// CORE-6・REPAIR-5(#2546): 待ちが成功する子は kill されない(終了コードがそのまま残る)。
+    #[test]
+    fn core6_repair5_reap_after_handshake_leaves_clean_exit() {
+        let mut p = std::process::Command::new("true").spawn().unwrap();
+        let holder = ContainerChild::spawned(p.id());
+        reap_after_handshake(&holder, None, |c, t| c.wait_timeout(t)).unwrap();
+        assert_eq!(
+            holder.kill_and_reap(Duration::from_secs(1)).unwrap(),
+            ChildExit::Exited(0)
+        );
+        let _ = p.try_wait();
     }
 
     /// CORE-6・SEC-5・SEC-1(#2374): non-dumpable の呼び出し元に対する公開 API は、拒否もせず dumpable にも

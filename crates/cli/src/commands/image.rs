@@ -1057,6 +1057,30 @@ mod tests {
         }
     }
 
+    /// CLI-1・OCI-7・SEC-1（#2547）: root が group / other に書き込めれば PERMISSION_DENIED（6）、0700 と 0755 は受理。
+    #[cfg(unix)]
+    #[test]
+    fn cli1_oci7_sec1_store_root_mode_checks() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = Tmp::new();
+        let chmod = |m: u32| {
+            std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(m)).expect("chmod")
+        };
+        chmod(0o757);
+        let e = open_image_store(tmp.path()).expect_err("0757");
+        assert_eq!(e.exit_code(), 6);
+        let err = stderr_of(&e);
+        assert!(err.contains("PERMISSION_DENIED"), "{err}");
+        assert!(err.contains("permission denied"), "{err}");
+        for mode in [0o700, 0o755] {
+            chmod(mode);
+            let store = open_image_store(tmp.path()).expect("accepted");
+            let (e, out) = out_of(|o| run_image_ls_with(&store, o));
+            assert_eq!(e.exit_code(), 0, "mode {mode:o}");
+            assert_eq!(out, "REPOSITORY\tTAG\tDIGEST\tSIZE\tMISSING\n");
+        }
+    }
+
     /// OCI-7: 純 digest・名前@digest・タグ参照の変換。
     #[test]
     fn cli1_oci7_parse_target_forms() {

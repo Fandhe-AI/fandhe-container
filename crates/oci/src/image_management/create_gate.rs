@@ -61,6 +61,8 @@ impl ImageStore {
     /// イメージつき create の開始を宣言し、共有ロックを期限まで待って取る。期限切れは `Timeout`。
     pub fn enter_container_create(&self) -> Result<ContainerCreatePass<'_>, OciError> {
         let deadline = self.gate_deadline()?;
+        // ゲートファイルの作成より前に root の信頼性を再検査する（#2547・SEC-1）。
+        self.reverify_root()?;
         let file = open_named_lock_file(self.root(), IMAGE_STORE_CREATE_GATE_FILE_NAME)?;
         loop {
             match file.try_lock_shared() {
@@ -86,6 +88,8 @@ impl ImageStore {
     /// 進行中のイメージつき create が無いことを排他ロックで確かめる。期限内に取れなければ `Ok(None)`。
     pub fn quiesce_container_creates(&self) -> Result<Option<CreateQuiescence<'_>>, OciError> {
         let deadline = self.gate_deadline()?;
+        // ゲートファイルの作成より前に root の信頼性を再検査する（#2547・SEC-1）。
+        self.reverify_root()?;
         let file = open_named_lock_file(self.root(), IMAGE_STORE_CREATE_GATE_FILE_NAME)?;
         loop {
             match file.try_lock() {

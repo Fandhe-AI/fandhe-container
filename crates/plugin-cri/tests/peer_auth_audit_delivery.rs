@@ -134,11 +134,10 @@ mod linux {
 
         let notices_out = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         let notices = LineSink::spawn(Box::new(SharedBuf(Arc::clone(&notices_out))), 8);
-        let forwarder = Arc::new(PeerAuditForwarder::spawn(
-            sink,
-            PEER_AUDIT_QUEUE_CAPACITY,
-            notices.clone(),
-        ));
+        let forwarder = Arc::new(
+            PeerAuditForwarder::spawn(sink, PEER_AUDIT_QUEUE_CAPACITY, notices.clone())
+                .expect("forwarder thread"),
+        );
         let (observer, stderr_buf) = SharedPeerAuthObserver::new();
         let observer = observer.with_audit(Arc::clone(&forwarder));
         let euid = effective_uid();

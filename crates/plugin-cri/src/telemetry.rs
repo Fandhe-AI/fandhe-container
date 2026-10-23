@@ -74,48 +74,71 @@ pub struct PeerAuditForwarder {
 }
 
 impl PeerAuditForwarder {
-    /// `sink` へ書く thread を起こす。thread を作れない場合は全記録を欠落として数える口になる。
-    pub fn spawn(sink: Arc<dyn AuditSink>, capacity: usize, notices: LineSink) -> Self {
+    /// `sink` へ書く thread を起こす。thread を作れなければ `Err` を返す（呼び出し側は受付を始めない。
+    /// 記録経路なしで受け付けると以後の拒否が全て欠落するため。SEC-4・PLUG-12）。
+    pub fn spawn(
+        sink: Arc<dyn AuditSink>,
+        capacity: usize,
+        notices: LineSink,
+    ) -> std::io::Result<Self> {
+        Self::spawn_with(
+            |job| {
+                std::thread::Builder::new()
+                    .name("cri-peer-audit".into())
+                    .spawn(job)
+                    .map(drop)
+            },
+            sink,
+            capacity,
+            notices,
+        )
+    }
+
+    /// [`Self::spawn`] の本体。thread の生成器を差し替えられる（起動失敗の試験用）。
+    fn spawn_with(
+        start: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+        sink: Arc<dyn AuditSink>,
+        capacity: usize,
+        notices: LineSink,
+    ) -> std::io::Result<Self> {
         let (tx, rx) = std::sync::mpsc::sync_channel::<AuditRecord>(capacity);
         let dropped = Arc::new(AtomicU64::new(0));
         let pending = Arc::new(AtomicUsize::new(0));
         let (d, p) = (Arc::clone(&dropped), Arc::clone(&pending));
         // join しない（sink が詰まってもシャットダウンを止めない）。tx が全て落ちると rx が閉じて終わる。
-        let _ = std::thread::Builder::new()
-            .name("cri-peer-audit".into())
-            .spawn(move || {
-                loop {
-                    let received = rx.recv_timeout(FORWARDER_IDLE_TICK);
-                    let n = d.load(Ordering::Relaxed);
-                    if n > 0 {
-                        let line = format!(
-                            "{{\"event\":\"plugin_peer_audit_dropped\",\"outcome\":\"error\",\"count\":{n}}}"
-                        );
-                        // 通知を積めたときだけ引く（積めなければ保持して次回に回す。SEC-4）。
-                        if notices.submit(line) {
-                            d.fetch_sub(n, Ordering::Relaxed);
-                        }
-                    }
-                    match received {
-                        Ok(record) => {
-                            if sink.record(&record).is_err() {
-                                let token = record.reason().map_or("unknown", |r| r.as_str());
-                                notices.submit(format!(
-                                    "{{\"event\":\"plugin_peer_audit_unavailable\",\"outcome\":\"error\",\"reason\":\"{token}\"}}"
-                                ));
-                            }
-                            p.fetch_sub(1, Ordering::Relaxed);
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        start(Box::new(move || {
+            loop {
+                let received = rx.recv_timeout(FORWARDER_IDLE_TICK);
+                let n = d.load(Ordering::Relaxed);
+                if n > 0 {
+                    let line = format!(
+                        "{{\"event\":\"plugin_peer_audit_dropped\",\"outcome\":\"error\",\"count\":{n}}}"
+                    );
+                    // 通知を積めたときだけ引く（積めなければ保持して次回に回す。SEC-4）。
+                    if notices.submit(line) {
+                        d.fetch_sub(n, Ordering::Relaxed);
                     }
                 }
-            });
-        Self {
+                match received {
+                    Ok(record) => {
+                        if sink.record(&record).is_err() {
+                            let token = record.reason().map_or("unknown", |r| r.as_str());
+                            notices.submit(format!(
+                                    "{{\"event\":\"plugin_peer_audit_unavailable\",\"outcome\":\"error\",\"reason\":\"{token}\"}}"
+                                ));
+                        }
+                        p.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+        }))?;
+        Ok(Self {
             tx,
             dropped,
             pending,
-        }
+        })
     }
 
     /// 拒否 1 件を型つきの記録にしてキューへ積む。ブロックしない。組み立てられない・積めない場合は欠落として数える。
@@ -482,7 +505,8 @@ mod tests {
     fn sec4_2484_max_burst_is_not_dropped() {
         let sink = VecSink::new(false);
         let notices = LineSink::spawn(Box::new(std::io::sink()), 4);
-        let fwd = PeerAuditForwarder::spawn(sink.clone(), PEER_AUDIT_QUEUE_CAPACITY, notices);
+        let fwd =
+            PeerAuditForwarder::spawn(sink.clone(), PEER_AUDIT_QUEUE_CAPACITY, notices).unwrap();
         let burst = UDS_ACCEPT_PEER_REJECTION_LIMIT as usize + 1;
         assert_eq!(burst, 17);
         for _ in 0..burst {
@@ -511,7 +535,7 @@ mod tests {
         *lock(&sink.gate) = Some(rx);
         let out = Arc::new(Mutex::new(Vec::new()));
         let notices = LineSink::spawn(Box::new(Collect(out.clone())), 8);
-        let fwd = PeerAuditForwarder::spawn(sink.clone(), 2, notices.clone());
+        let fwd = PeerAuditForwarder::spawn(sink.clone(), 2, notices.clone()).unwrap();
         let started = std::time::Instant::now();
         for _ in 0..20 {
             fwd.submit_rejection(
@@ -540,13 +564,30 @@ mod tests {
         );
     }
 
+    /// SEC-4・PLUG-12・#2484: thread を作れないときは `Err` を返し、黙って欠落口を返さない。
+    #[test]
+    fn sec4_2484_spawn_failure_is_returned() {
+        let sink = VecSink::new(false);
+        let notices = LineSink::spawn(Box::new(std::io::sink()), 4);
+        let r = PeerAuditForwarder::spawn_with(
+            |_job| Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            sink,
+            8,
+            notices,
+        );
+        assert_eq!(
+            r.err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::WouldBlock)
+        );
+    }
+
     /// SEC-4・#2484: sink が失敗したら黙らず固定語彙の通知行を出す。
     #[test]
     fn sec4_2484_sink_failure_is_reported() {
         let sink = VecSink::new(true);
         let out = Arc::new(Mutex::new(Vec::new()));
         let notices = LineSink::spawn(Box::new(Collect(out.clone())), 8);
-        let fwd = PeerAuditForwarder::spawn(sink, 8, notices.clone());
+        let fwd = PeerAuditForwarder::spawn(sink, 8, notices.clone()).unwrap();
         fwd.submit_rejection(
             PluginPeerRejection::PeerPidMismatch,
             std::path::Path::new("/s.sock"),

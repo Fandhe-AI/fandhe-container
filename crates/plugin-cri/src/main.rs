@@ -86,21 +86,28 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         Ok(rt) => rt,
         Err(_) => return fail(PluginErrorCode::Internal, "failed to start the runtime"),
     };
+    // 配送 thread を作れなければ listener の bind 前に起動を中止する（SEC-4・PLUG-12・#2484）。
+    #[cfg(target_os = "linux")]
+    let audit = match telemetry::PeerAuditForwarder::spawn(
+        audit_sink,
+        telemetry::PEER_AUDIT_QUEUE_CAPACITY,
+        telemetry::stderr_sink().clone(),
+    ) {
+        Ok(f) => Some(std::sync::Arc::new(f)),
+        Err(_) => {
+            eprintln!("error: audit_delivery_unavailable: failed to start the audit thread");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
+    // 非 Linux は永続化経路が未実装（#2430 の判断待ち。REPAIR-3）。拒否は stderr にだけ残る。
+    #[cfg(not(target_os = "linux"))]
+    let audit = None;
     let result = rt.block_on(async {
         // 操作の件数・レイテンシを定期的に構造化ログとして stderr へ出す（REPAIR-4）。
         let stats = tokio::spawn(telemetry::op_stats_export_loop(
             recorder,
             telemetry::OP_STATS_EXPORT_INTERVAL,
         ));
-        #[cfg(target_os = "linux")]
-        let audit = Some(std::sync::Arc::new(telemetry::PeerAuditForwarder::spawn(
-            audit_sink,
-            telemetry::PEER_AUDIT_QUEUE_CAPACITY,
-            telemetry::stderr_sink().clone(),
-        )));
-        // 非 Linux は永続化経路が未実装（#2430 の判断待ち。REPAIR-3）。拒否は stderr にだけ残る。
-        #[cfg(not(target_os = "linux"))]
-        let audit = None;
         let r = server::serve_with_audit(
             socket,
             svc,

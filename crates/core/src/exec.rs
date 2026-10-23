@@ -1681,7 +1681,14 @@ fn isolate_rootless_subordinate_with(
     // holder: 最初の fork(マルチスレッドはここで `FailedPrecondition`)。
     let release_wait = timeout * 3 + HOLDER_SLACK;
     let holder_pid = fork_for(caller, move || {
-        rootless::run_userns_holder(parent_pid, holder_end, timeout, release_wait)
+        // 診断は fork 後の子の中で作った unbuffered の stderr へ出す(#2393・#2546。バッファ付きは `_exit` で失われる)。
+        rootless::run_userns_holder(
+            parent_pid,
+            holder_end,
+            timeout,
+            release_wait,
+            &mut std::io::stderr(),
+        )
     })?;
     // holder を fork した後は、どの失敗も下の回収の分岐を通す(`?` で早期 return すると holder・mapper が
     // ゾンビで残る。`ContainerChild` は drop で回収しない。CORE-2)。
@@ -1913,13 +1920,15 @@ fn rootless_handshake(
         }
         // 診断は fork 後の子の中で作った unbuffered の stderr へ出す(#2393。バッファ付きは `_exit` で失われる)。
         rootless::run_id_map_mapper(
-            holder_pid,
-            parent_pid,
+            &rootless::MapperRequest {
+                target: holder_pid,
+                expected_parent: parent_pid,
+                uid: &uid,
+                gid: &gid,
+                writer: &writer,
+                timeout,
+            },
             sock,
-            &uid,
-            &gid,
-            &writer,
-            timeout,
             Some(keepalive),
             &mut std::io::stderr(),
         )

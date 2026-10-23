@@ -1189,6 +1189,8 @@ pub(crate) const HOLDER_RELEASE: u8 = 2;
 /// 再利用先は helper の所有者確認により同じ利用者の、写像が未設定の子 user namespace のプロセスに限られ、書けるのは
 /// その利用者自身の subordinate 範囲だけのため、新しい権限は与えない。#2551)。I・C は helper を止めた後に
 /// holder を kill する(`exec::stop_mapper_and_helpers`・`exec::launch_intermediate::rescan_unreported_init`)。
+/// `diag`(#2546): 失敗の 1 行の書き先。本番は fork 後の子の中で作った unbuffered の `std::io::stderr()` を渡し、試験は
+/// `Vec<u8>` で照合する(`run_id_map_mapper` の `diag` と同じ契約)。
 /// 失敗は `MapperReply::Failed` で返して終了コード 1。exec せず I の `comm`(起動識別子)を引き継ぐため、I が
 /// 報告せずに死んでも C の再探索が回収できる(CORE-2)。
 pub(crate) fn run_userns_holder(
@@ -1196,6 +1198,7 @@ pub(crate) fn run_userns_holder(
     mut sock: std::os::unix::net::UnixStream,
     timeout: Duration,
     release_wait: Duration,
+    diag: &mut dyn std::io::Write,
 ) -> i32 {
     use std::os::fd::AsFd as _;
 
@@ -1215,22 +1218,8 @@ pub(crate) fn run_userns_holder(
         // 写像の書き込み先として、このプロセスだけを dumpable にする(I は終始 non-dumpable)。
         sys::set_dumpable_user().map_err(|_| internal("PR_SET_DUMPABLE in the holder"))
     })();
-    let _ = sock.set_write_timeout(Some(timeout));
-    match outcome {
-        Ok(()) => {
-            if sock.write_all(&MapperReply::Ok.encode()).is_err() {
-                return 1;
-            }
-        }
-        Err(e) => {
-            let _ = writeln!(std::io::stderr(), "fandhe-container: userns holder: {e}");
-            let reply = MapperReply::Failed {
-                code: e.code,
-                stage: e.stage,
-            };
-            let _ = sock.write_all(&reply.encode());
-            return 1;
-        }
+    if !report_holder_outcome(outcome, &mut sock, timeout, diag) {
+        return 1;
     }
     let _ = sock.set_read_timeout(Some(release_wait));
     let mut b = [0u8; 1];
@@ -1238,6 +1227,52 @@ pub(crate) fn run_userns_holder(
         Ok(()) if b[0] == HOLDER_RELEASE => 0,
         _ => 1,
     }
+}
+
+/// holder の準備結果を固定 3 バイトの応答で返し、失敗なら `diag` へ 1 行出す([`run_userns_holder`]の一部。#2546)。
+///
+/// 応答を相手へ書けたときだけ `true`(続けて [`HOLDER_RELEASE`] を待つ)。失敗の応答を書いた場合は `false`。
+/// `diag` の書き込みの失敗は無視し、応答は必ず試みる(`run_id_map_mapper` の `diag` と同じ契約)。
+fn report_holder_outcome(
+    outcome: Result<(), RootlessError>,
+    sock: &mut std::os::unix::net::UnixStream,
+    timeout: Duration,
+    diag: &mut dyn std::io::Write,
+) -> bool {
+    let _ = sock.set_write_timeout(Some(timeout));
+    match outcome {
+        Ok(()) => sock.write_all(&MapperReply::Ok.encode()).is_ok(),
+        Err(e) => {
+            let _ = writeln!(diag, "fandhe-container: userns holder: {e}");
+            let reply = MapperReply::Failed {
+                code: e.code,
+                stage: e.stage,
+            };
+            let _ = sock.write_all(&reply.encode());
+            false
+        }
+    }
+}
+
+/// mapper([`run_id_map_mapper`])へ渡す値の束(CORE-6・REPAIR-12。#2546)。
+///
+/// 以前は 9 引数で `clippy::too_many_arguments` を許可していた。fork 子の単一呼び出し口であるため、値だけを
+/// 借用の束にまとめる(所有権を持つ資源の `sock`・`keepalive` と書き出し先の `diag` は別引数に残す)。
+/// 束はスタック上の参照だけで割り当てもロックも行わないため、fork 後の単一スレッドの前提を崩さない。
+#[derive(Clone, Copy)]
+pub(crate) struct MapperRequest<'a> {
+    /// 写像の対象(専用の holder プロセス)の pid。
+    pub(crate) target: u32,
+    /// mapper 自身と対象の親であるべき pid(中間プロセス I)。
+    pub(crate) expected_parent: u32,
+    /// uid の写像。
+    pub(crate) uid: &'a IdMapSet,
+    /// gid の写像。
+    pub(crate) gid: &'a IdMapSet,
+    /// 書き込み方式。
+    pub(crate) writer: &'a IdMapWriter,
+    /// go 待ち・書き込みの期限(REPAIR-5)。
+    pub(crate) timeout: Duration,
 }
 
 /// mapper の処理本体（fork 子が呼ぶ。成功なら終了コード 0、失敗なら 1）。
@@ -1258,30 +1293,14 @@ pub(crate) fn run_userns_holder(
 /// `keepalive`（#2376）: holder が持つ socket の相手側の複製（`exec` の handshake が渡す）。あれば helper へ対象を pid の
 /// 数値で渡し、各 helper の stdin にこの複製を持たせる（[`HelperTarget::HeldPid`]。holder は全員が閉じるまで終了しない）。
 /// `None` なら `fd:0` で渡す。
-// 引数 9 個: fork 子の単一呼び出し口で、まとめる構造体への整理は #2393 の対象外(最小変更)。
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_id_map_mapper(
-    target: u32,
-    expected_parent: u32,
+    req: &MapperRequest<'_>,
     mut sock: std::os::unix::net::UnixStream,
-    uid: &IdMapSet,
-    gid: &IdMapSet,
-    writer: &IdMapWriter,
-    timeout: Duration,
     keepalive: Option<std::os::fd::OwnedFd>,
     diag: &mut dyn std::io::Write,
 ) -> i32 {
     use std::os::fd::AsFd as _;
-    let outcome = mapper_outcome(
-        target,
-        expected_parent,
-        &mut sock,
-        keepalive.as_ref().map(|k| k.as_fd()),
-        uid,
-        gid,
-        writer,
-        timeout,
-    );
+    let outcome = mapper_outcome(req, &mut sock, keepalive.as_ref().map(|k| k.as_fd()));
     let (reply, code) = match outcome {
         Ok(()) => (MapperReply::Ok, 0),
         Err(e) => {
@@ -1295,23 +1314,24 @@ pub(crate) fn run_id_map_mapper(
             )
         }
     };
-    let _ = sock.set_write_timeout(Some(timeout));
+    let _ = sock.set_write_timeout(Some(req.timeout));
     let _ = sock.write_all(&reply.encode());
     code
 }
 
-// 引数 8 個: `run_id_map_mapper` の本体(#2376 の最小変更)。
-#[allow(clippy::too_many_arguments)]
 fn mapper_outcome(
-    target: u32,
-    expected_parent: u32,
+    req: &MapperRequest<'_>,
     sock: &mut std::os::unix::net::UnixStream,
     keepalive: Option<std::os::fd::BorrowedFd<'_>>,
-    uid: &IdMapSet,
-    gid: &IdMapSet,
-    writer: &IdMapWriter,
-    timeout: Duration,
 ) -> Result<(), RootlessError> {
+    let MapperRequest {
+        target,
+        expected_parent,
+        uid,
+        gid,
+        writer,
+        timeout,
+    } = *req;
     sock.set_read_timeout(Some(timeout))
         .map_err(|e| io_error(RootlessStage::Validate, "set mapper read timeout", &e))?;
     let mut go = [0u8; 1];
@@ -1672,6 +1692,52 @@ mod tests {
         (s.clone(), s)
     }
 
+    /// CORE-6・REPAIR-12(#2546): holder の失敗は固定 3 バイトの応答になり、診断は引数の書き先へ出る。
+    #[test]
+    fn core6_holder_failure_reports_frame_and_diag() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut diag: Vec<u8> = Vec::new();
+        let err = RootlessError::new(
+            ErrorCode::Internal,
+            RootlessStage::Validate,
+            "injected holder failure",
+        );
+        let ok = report_holder_outcome(Err(err), &mut a, Duration::from_secs(1), &mut diag);
+        assert!(!ok);
+        let mut buf = [0u8; MAPPER_REPLY_LEN];
+        b.read_exact(&mut buf).expect("reply");
+        assert_eq!(
+            MapperReply::decode(&buf).expect("decode"),
+            MapperReply::Failed {
+                code: ErrorCode::Internal,
+                stage: RootlessStage::Validate,
+            }
+        );
+        let text = String::from_utf8(diag).expect("utf8");
+        assert!(
+            text.starts_with("fandhe-container: userns holder: "),
+            "{text}"
+        );
+        assert_eq!(text.lines().count(), 1);
+    }
+
+    /// CORE-6・REPAIR-12(#2546): holder の成功は `MapperReply::Ok` の枠になり、診断は何も出ない。
+    #[test]
+    fn core6_holder_success_reports_ok_frame_without_diag() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut diag: Vec<u8> = Vec::new();
+        assert!(report_holder_outcome(
+            Ok(()),
+            &mut a,
+            Duration::from_secs(1),
+            &mut diag
+        ));
+        let mut buf = [0u8; MAPPER_REPLY_LEN];
+        b.read_exact(&mut buf).expect("reply");
+        assert_eq!(MapperReply::decode(&buf).expect("decode"), MapperReply::Ok);
+        assert!(diag.is_empty());
+    }
+
     /// CORE-6（TASK-40.2）: go 信号が来ないまま timeout になると mapper は書き込まずに
     /// `Timeout` を返して終了コード 1 になる（親の死・停止でハングしない。REPAIR-5）。
     #[test]
@@ -1680,13 +1746,15 @@ mod tests {
         let (uid, gid) = mapper_fixture();
         let mut diag: Vec<u8> = Vec::new();
         let code = run_id_map_mapper(
-            std::process::id(),
-            std::os::unix::process::parent_id(),
+            &MapperRequest {
+                target: std::process::id(),
+                expected_parent: std::os::unix::process::parent_id(),
+                uid: &uid,
+                gid: &gid,
+                writer: &IdMapWriter::Direct,
+                timeout: Duration::from_secs(1),
+            },
             mapper_end,
-            &uid,
-            &gid,
-            &IdMapWriter::Direct,
-            Duration::from_secs(1),
             None,
             &mut diag,
         );
@@ -1718,13 +1786,15 @@ mod tests {
         let wrong = std::process::id();
         let mut diag: Vec<u8> = Vec::new();
         let code = run_id_map_mapper(
-            wrong,
-            wrong,
+            &MapperRequest {
+                target: wrong,
+                expected_parent: wrong,
+                uid: &uid,
+                gid: &gid,
+                writer: &IdMapWriter::Direct,
+                timeout: Duration::from_secs(1),
+            },
             mapper_end,
-            &uid,
-            &gid,
-            &IdMapWriter::Direct,
-            Duration::from_secs(1),
             None,
             &mut diag,
         );
@@ -1755,13 +1825,15 @@ mod tests {
         let (uid, gid) = mapper_fixture();
         let mut diag: Vec<u8> = Vec::new();
         let code = run_id_map_mapper(
-            1,
-            std::os::unix::process::parent_id(),
+            &MapperRequest {
+                target: 1,
+                expected_parent: std::os::unix::process::parent_id(),
+                uid: &uid,
+                gid: &gid,
+                writer: &IdMapWriter::Direct,
+                timeout: Duration::from_secs(1),
+            },
             mapper_end,
-            &uid,
-            &gid,
-            &IdMapWriter::Direct,
-            Duration::from_secs(1),
             None,
             &mut diag,
         );
@@ -1801,13 +1873,15 @@ mod tests {
         let (uid, gid) = mapper_fixture();
         let mut diag: Vec<u8> = Vec::new();
         let code = run_id_map_mapper(
-            std::process::id(),
-            std::os::unix::process::parent_id(),
+            &MapperRequest {
+                target: std::process::id(),
+                expected_parent: std::os::unix::process::parent_id(),
+                uid: &uid,
+                gid: &gid,
+                writer: &IdMapWriter::Direct,
+                timeout: Duration::from_secs(1),
+            },
             mapper_end,
-            &uid,
-            &gid,
-            &IdMapWriter::Direct,
-            Duration::from_secs(1),
             None,
             &mut diag,
         );
@@ -1847,13 +1921,15 @@ mod tests {
         parent_end.write_all(&[9]).expect("byte");
         let (uid, gid) = mapper_fixture();
         let code = run_id_map_mapper(
-            std::process::id(),
-            std::os::unix::process::parent_id(),
+            &MapperRequest {
+                target: std::process::id(),
+                expected_parent: std::os::unix::process::parent_id(),
+                uid: &uid,
+                gid: &gid,
+                writer: &IdMapWriter::Direct,
+                timeout: Duration::from_secs(1),
+            },
             mapper_end,
-            &uid,
-            &gid,
-            &IdMapWriter::Direct,
-            Duration::from_secs(1),
             None,
             &mut FailingWriter,
         );

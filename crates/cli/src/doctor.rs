@@ -21,6 +21,13 @@
 //! rootless の `start` が `/etc/subuid`・`/etc/subgid` の設定で写像を選ぶ前提（自分の行・`newuidmap` / `newgidmap`）を、
 //! `start` と同じ部品で 1 つずつ検査する（`id_mapping_check`。CORE-6・SEC-5）。終了ステータスは 3 つの結果の合成。
 //!
+//! # 特権ランチャー経路の前提の診断（#2599）
+//!
+//! rootful のインストールで `start` が選ぶ特権ランチャー（CLI の実体の隣の固定名）の信頼条件と、昇格手段
+//! （file capability、xattr 非対応なら setuid root）を、`start` と同じ判定関数で読み取り専用に診断する
+//! （`launcher_check`。SUP-14・CORE-6）。hash / 署名の照合は扱わない（`privilege-separation.md` 12 章の未確認事項）。
+//! 終了ステータスは 4 つの結果の合成。
+//!
 //! # 確認方法
 //!
 //! - `br_netfilter`: `/proc/sys/net/bridge/bridge-nf-call-iptables` の存在で判定する。このディレクトリは
@@ -54,6 +61,7 @@ use fandhe_container_net::nftables_batch::{ChainInfo, ChainPolicy, NfInetHook};
 use crate::json::json_escape;
 
 pub mod id_mapping_check;
+pub mod launcher_check;
 pub mod user_scope_check;
 
 /// sysctl・`/proc` の読み取り上限（バイト）。想定値は 1 文字なので小さく抑える。
@@ -742,9 +750,10 @@ pub fn combine_exit_status(a: DoctorExitStatus, b: DoctorExitStatus) -> DoctorEx
 }
 
 /// 本番入口: NET-10 の診断・CORE-3 の前提の診断・rootless ID 写像の前提の診断（CORE-6・#2387）を実行し、
+/// 特権ランチャー経路の前提の診断（SUP-14・#2599）を実行し、
 /// JSON Lines を `stdout` へ書いて終了ステータスを返す。
 ///
-/// 読み取り専用で、設定を変更しない。出力順は NET-10 の行、CORE-3 の行、ID 写像の行の順。`stdout` への書き込みに失敗したら `Fatal`。
+/// 読み取り専用で、設定を変更しない。出力順は NET-10 の行、CORE-3 の行、ID 写像の行、ランチャーの行の順。`stdout` への書き込みに失敗したら `Fatal`。
 /// `commands::run_to` の `doctor` から呼ばれる。
 pub fn run(mut stdout: &mut dyn std::io::Write) -> DoctorExitStatus {
     #[cfg(target_os = "linux")]
@@ -757,15 +766,20 @@ pub fn run(mut stdout: &mut dyn std::io::Write) -> DoctorExitStatus {
     let net = evaluate(&findings);
     let scope = user_scope_check::evaluate(&user_scope_check::collect());
     let idmap = id_mapping_check::evaluate(&id_mapping_check::collect());
+    let launcher = launcher_check::evaluate(&launcher_check::collect());
     if net.write_json_lines(&mut stdout).is_err()
         || scope.write_json_lines(&mut stdout).is_err()
         || idmap.write_json_lines(&mut stdout).is_err()
+        || launcher.write_json_lines(&mut stdout).is_err()
     {
         return DoctorExitStatus::Fatal;
     }
     combine_exit_status(
-        combine_exit_status(net.exit_status(), scope.exit_status()),
-        idmap.exit_status(),
+        combine_exit_status(
+            combine_exit_status(net.exit_status(), scope.exit_status()),
+            idmap.exit_status(),
+        ),
+        launcher.exit_status(),
     )
 }
 

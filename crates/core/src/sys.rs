@@ -571,6 +571,8 @@ mod consts {
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
     pub const NETLINK_AUDIT: i32 = 9;
     pub const POLLIN: i16 = 1;
+    /// `POLLOUT`(poll.h。全アーキテクチャ共通)。
+    pub const POLLOUT: i16 = 4;
     /// `MSG_DONTWAIT`（送信側を非ブロッキングにする。x86_64・aarch64 とも 0x40）。
     pub const MSG_DONTWAIT: i32 = 0x40;
     // include/uapi/asm-generic/socket.h・linux/socket.h・errno-base.h の値（診断ログの待たない送信。AF_UNIX の判定と
@@ -915,6 +917,8 @@ mod consts {
     pub const SOCK_CLOEXEC: i32 = 0o2_000_000;
     pub const NETLINK_AUDIT: i32 = 9;
     pub const POLLIN: i16 = 1;
+    /// `POLLOUT`(poll.h。全アーキテクチャ共通)。
+    pub const POLLOUT: i16 = 4;
     /// `MSG_DONTWAIT`（送信側を非ブロッキングにする。x86_64・aarch64 とも 0x40）。
     pub const MSG_DONTWAIT: i32 = 0x40;
     // include/uapi/asm-generic/socket.h・linux/socket.h・errno-base.h の値（診断ログの待たない送信。AF_UNIX の判定と
@@ -1162,6 +1166,7 @@ mod consts {
     pub const SOCK_CLOEXEC: i32 = 0;
     pub const NETLINK_AUDIT: i32 = 0;
     pub const POLLIN: i16 = 0;
+    pub const POLLOUT: i16 = 0;
     pub const MSG_DONTWAIT: i32 = 0;
     pub const SOL_SOCKET: i32 = 0;
     pub const SO_DOMAIN: i32 = 0;
@@ -1557,6 +1562,26 @@ pub(crate) fn poll_readable(fd: BorrowedFd<'_>, timeout_ms: i32) -> Result<bool,
         return Err(last_error());
     }
     Ok(r > 0)
+}
+
+/// `fd` が今すぐ書き込み可能か(`poll(2)` を timeout 0 で 1 回)を返す。待たない。
+///
+/// 診断出力が満杯の pipe・socket で無期限にブロックしないための確認用(#2551・REPAIR-5)。pipe は空きが
+/// `PIPE_BUF` 以上のときだけ `POLLOUT` になるため、確認の直後の短い書き込みはブロックしない。
+/// `EINTR`・エラー・`POLLERR` 等は「書けない」として `false`(fail-closed。呼び出し側は出力を捨てる)。
+pub(crate) fn poll_writable_now(fd: BorrowedFd<'_>) -> bool {
+    if !consts::SUPPORTED {
+        return false;
+    }
+    let mut pfd = PollFd {
+        fd: fd.as_raw_fd(),
+        events: consts::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: `pfd` はスタック上の初期化済み 1 要素で、`nfds` = 1 と一致する。timeout 0 なので待たず、
+    // カーネルは呼び出しの間だけ `revents` を書く。
+    let r = unsafe { poll(&raw mut pfd, 1, 0) };
+    r > 0 && (pfd.revents & consts::POLLOUT) != 0
 }
 
 /// 稼働中プロセスの pidfd 経由で、指定 namespace 群へ 1 回の `setns(2)` で参加する（Linux 5.8 以降。

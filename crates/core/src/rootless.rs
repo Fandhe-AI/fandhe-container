@@ -1471,6 +1471,21 @@ pub(crate) fn holder_await_release(
     kill: &mut dyn FnMut(u32) -> Result<(), SysError>,
     diag: &mut dyn std::io::Write,
 ) -> HolderExit {
+    // 診断は kill・EOF 待ちが終わるまで書き出さず、メモリに溜める(#2551・REPAIR-5)。書き先が止まっていても
+    // (満杯の pipe の stderr 等)SIGKILL と待ちの期限が診断に先行し、止まらない。溜める行は有限個の短い固定文のみ。
+    let mut pending: Vec<u8> = Vec::new();
+    let exit = holder_await_release_inner(sock, w, kill, &mut pending);
+    let _ = diag.write_all(&pending);
+    exit
+}
+
+/// [`holder_await_release`] の本体。`diag` はメモリ上の溜め先(書き込みで止まらない)を渡す。
+fn holder_await_release_inner(
+    sock: &mut std::os::unix::net::UnixStream,
+    w: &HolderWait<'_>,
+    kill: &mut dyn FnMut(u32) -> Result<(), SysError>,
+    diag: &mut dyn std::io::Write,
+) -> HolderExit {
     let deadline = Instant::now() + w.release_wait;
     let mut anchor: Option<(ProcHandle, u32)> = None;
     let mut seen_pid = false;
@@ -1562,6 +1577,32 @@ pub(crate) fn holder_await_release(
         }
     }
 }
+/// 書き込み先が今すぐ書けないときは出力を捨てる診断用ライター(#2551・CORE-6・SEC-5・REPAIR-5)。
+///
+/// 本番の `stderr` は呼び出し元が与えた pipe・socket の可能性があり、読み手が止まって満杯だと `write` が無期限に
+/// ブロックする。holder・mapper の失敗経路(期限切れの kill・回収を含む)を診断で止めないため、書く前に
+/// `poll(POLLOUT, 0)` で空きを確かめ、無ければ書かずに成功を装って捨てる(診断は最善努力で、応答・終了コードに影響しない)。
+/// 1 回の書き込みは 512 バイトに切る(pipe は空きが `PIPE_BUF` 以上のときだけ `POLLOUT` になる)。
+pub(crate) struct NonBlockingDiag<W: std::io::Write + std::os::fd::AsFd>(pub(crate) W);
+
+impl<W: std::io::Write + std::os::fd::AsFd> std::io::Write for NonBlockingDiag<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = buf.len().min(512);
+        if n == 0 || !sys::poll_writable_now(self.0.as_fd()) {
+            return Ok(buf.len());
+        }
+        match self.0.write(&buf[..n]) {
+            Ok(w) => Ok(w),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => Ok(buf.len()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// mapper が回収済みのとき、数値の PGID `pid` が元の mapper のグループのままかを `/proc` の走査で判定する(#2551)。
 ///
 /// 真になる条件は、`/proc/<pid>` が存在せず(その番号のプロセスは居ない)、かつセッション ID・PGID がともに `pid` の
@@ -2575,6 +2616,84 @@ mod tests {
         assert_eq!(kills, vec![child.id()]);
         // 注入した kill は何も止めないので、子の複製が残り EOF には届かない。
         assert_eq!(r, HolderExit::ExpiredKilled { drained: false });
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+    }
+
+    /// 書き込みの時点で kill が済んでいたかを記録するライター。
+    struct OrderProbe<'a> {
+        killed: &'a std::cell::Cell<bool>,
+        wrote_after_kill: Option<bool>,
+    }
+
+    impl std::io::Write for OrderProbe<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.wrote_after_kill
+                .get_or_insert_with(|| self.killed.get());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// SEC-5・REPAIR-5(#2551): 診断の書き込みは SIGKILL の送信より後になる(書き先が止まっても kill に届く)。
+    #[test]
+    fn sec5_holder_diag_is_written_after_kill() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        send_pid(&mut a, child.id());
+        let killed = std::cell::Cell::new(false);
+        let mut probe = OrderProbe {
+            killed: &killed,
+            wrote_after_kill: None,
+        };
+        let r = holder_await_release(
+            &mut b,
+            &holder_test_wait(200, 100),
+            &mut |_| {
+                killed.set(true);
+                Ok(())
+            },
+            &mut probe,
+        );
+        assert_eq!(r, HolderExit::ExpiredKilled { drained: false });
+        assert_eq!(probe.wrote_after_kill, Some(true));
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+    }
+
+    /// REPAIR-5・SEC-5(#2551): 読み手が止まって満杯の pipe を stderr に見立てても、`NonBlockingDiag` は
+    /// 待たずに戻り、ブロックする素の `write` と違って holder の期限切れの経路を止めない。
+    #[test]
+    fn sec5_nonblocking_diag_does_not_stall_on_full_pipe() {
+        use std::io::Write as _;
+        let (_r, mut w) = std::io::pipe().expect("pipe");
+        // 満杯にする(`POLLOUT` が立たなくなるまで書く)。
+        let chunk = [b'x'; 512];
+        while sys::poll_writable_now(std::os::fd::AsFd::as_fd(&w)) {
+            w.write_all(&chunk).expect("fill");
+        }
+        let mut diag = NonBlockingDiag(w);
+        let t = Instant::now();
+        writeln!(diag, "fandhe-container: userns holder: release wait ended").expect("dropped");
+        // 満杯の pipe に対しても kill 経路ごと期限内に戻る。
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        send_pid(&mut a, child.id());
+        let mut kills = Vec::new();
+        let r = holder_await_release(
+            &mut b,
+            &holder_test_wait(200, 100),
+            &mut |p| {
+                kills.push(p);
+                Ok(())
+            },
+            &mut diag,
+        );
+        assert_eq!(kills, vec![child.id()]);
+        assert_eq!(r, HolderExit::ExpiredKilled { drained: false });
+        assert!(t.elapsed() < Duration::from_secs(3));
         child.kill().expect("kill");
         child.wait().expect("wait");
     }

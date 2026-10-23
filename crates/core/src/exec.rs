@@ -1695,7 +1695,7 @@ fn isolate_rootless_subordinate_with(
             timeout,
             release_wait,
             MAPPER_REAP_TIMEOUT,
-            &mut std::io::stderr(),
+            &mut rootless::NonBlockingDiag(std::io::stderr()),
         )
     })?;
     // holder を fork した後は、どの失敗も下の回収の分岐を通す(`?` で早期 return すると holder・mapper が
@@ -1942,7 +1942,7 @@ fn rootless_handshake(
             },
             sock,
             Some(keepalive),
-            &mut std::io::stderr(),
+            &mut rootless::NonBlockingDiag(std::io::stderr()),
         )
     })?;
     *mapper = Some(ContainerChild::spawned(mapper_pid));

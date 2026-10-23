@@ -114,6 +114,8 @@ cat >>"$stub" <<'STUB'
 #   ok: create -> created、start 後の state は stopped（`true` 相当で即終了）
 #   create-fail / create-fail-gone: create が何も作らず失敗（delete・state は不存在エラー）
 #   create-fail-delete-fail: create が途中まで作って失敗し、delete も常に失敗（state は created）
+#   create-fail-slow-state: create 未作成で失敗し、以後の state が 1.0 秒かかってから NOT_FOUND を返す
+#     （後始末の state 呼び出しが期限の大半を使う状態を作る。#2548）
 #   create-timeout: create が何も作らずハングする（--timeout で打ち切られる）
 #   foreign-perm: 同じ ID の他者のコンテナが既にあり、state は常に権限エラー、create は
 #                 ID 重複で失敗する（delete / kill が届くと FOREIGN-TOUCHED を記録する）
@@ -223,7 +225,7 @@ case "$cmd" in
     [ -n "${STUB_CREATE_FIFO:-}" ] && [ ! -e "$STUB_CREATE_FIFO" ] && mkfifo "$STUB_CREATE_FIFO"
     [ "$1" = --bundle ] && printf '%s' "$2" >"$m.bundle"
     case "$mode" in
-      create-fail | create-fail-gone | create-fail-state-error | create-fail-notfound-text | create-fail-mixed-codes | create-fail-plain | create-fail-nf-*)
+      create-fail | create-fail-gone | create-fail-state-error | create-fail-notfound-text | create-fail-mixed-codes | create-fail-plain | create-fail-slow-state | create-fail-nf-*)
         echo "stub: create failed" >&2; exit 1 ;;
       create-fail-delete-fail) touch "$m.created"; echo "stub: create failed" >&2; exit 1 ;;
     esac
@@ -246,6 +248,7 @@ case "$cmd" in
   state)
     if [ "$mode" = id-in-use ]; then state_json created; exit 0; fi
     if [ -e "$m.attempted" ] && [ ! -e "$m.created" ]; then
+      [ "$mode" = create-fail-slow-state ] && sleep 1.0
       [ "$mode" = create-fail-state-error ] && { echo '{"code":"PERMISSION_DENIED","message":"open state.json: permission denied"}' >&2; exit 1; }
       case "$mode" in
         create-fail-nf-plus-text) printf '{"code":"NOT_FOUND","message":"x"}\nstub: permission denied\n' >&2; exit 1 ;;
@@ -558,6 +561,22 @@ STUB_MODE=create-fail-gone expect_rc "create-fail-gone" 1 --runtime "$stub" --bu
 expect_contains "create-fail-gone-create-error" "runtime-create-failed"
 if [[ "$last_output" == *"containers left behind"* ]]; then fail "create-fail-gone-no-false-leftover"; else pass "create-fail-gone-no-false-leftover"; fi
 expect_eq "create-fail-gone-state-probed" "2" "$(grep -c '^state ' "$stub_log")"
+# created=0 の後始末の照会は、収集待ちを後始末の期限で切り詰めない（#2548・REPAIR-5・REPAIR-12・CORE-10）。
+# --timeout 2 で state が 1.0 秒かかると、期限の残りは約 1.0 秒以下になる。収集の遅延 1.4 秒は残りより
+# 長く、上限（2 秒）より短い。切り詰めると collector-timeout で残存扱い（exit 4）になるが、切り詰めなければ
+# 不存在を確定して exit 1 になる。delete / kill は送らない。
+reset_log
+started="$SECONDS"
+STUB_MODE=create-fail-slow-state STARTUP_LATENCY_TEST_COLLECT_DELAY=state.out:1.4 \
+  expect_rc "create-fail-flush-straddles-deadline" 1 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 2
+elapsed=$((SECONDS - started))
+if [ "$elapsed" -lt 15 ]; then pass "create-fail-flush-straddles-bounded (${elapsed}s < 15s)"; else fail "create-fail-flush-straddles-bounded (${elapsed}s)"; fi
+expect_contains "create-fail-flush-straddles-create-error" "runtime-create-failed"
+expect_not_contains "create-fail-flush-straddles-no-leftover" "containers left behind"
+expect_not_contains "create-fail-flush-straddles-no-collector-timeout" "reason=collector-timeout"
+expect_not_contains "create-fail-flush-straddles-no-manual" "inspect it manually"
+if grep -qE '^(delete|kill) ' "$stub_log"; then fail "create-fail-flush-straddles-untouched"; else pass "create-fail-flush-straddles-untouched"; fi
+expect_eq "create-fail-flush-straddles-sequence" "state create state" "$(cut -d' ' -f1 "$stub_log" | tr '\n' ' ' | sed 's/ $//')"
 # state が不存在以外の構造化エラー（権限エラー等）を返した場合は残存の可能性ありとして exit 4。
 reset_log
 STUB_MODE=create-fail-state-error expect_rc "create-fail-state-error" 4 --runtime "$stub" --bundle "$work/bundle" --iterations 1 --warmup 0 --timeout 1

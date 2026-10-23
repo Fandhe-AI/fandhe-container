@@ -661,8 +661,9 @@ show_log() {
 
 # state を 1 回呼び、state_rc・state_status・state_reason・state_raw_rc を設定する。state_status は
 # stdout が単一の OCI state JSON で id が一致するときだけその status、それ以外は空文字。
-# 収集の完了待ちの上限は --timeout 秒。ただし第 2 引数に full-flush を渡さない呼び出し（後始末）では
-# 期限（rt_deadline_us）までの残りで切り詰める（REPAIR-5）。観測ループは full-flush を渡し、最後の
+# 収集の完了待ちの上限は --timeout 秒。ただし第 2 引数に full-flush を渡さない呼び出しでは
+# 期限（rt_deadline_us）までの残りで切り詰める（REPAIR-5）。観測ループと、後始末の created=0
+# の照会（#2548）は full-flush を渡し、最後の
 # 照会の収集待ちが観測期限をまたいでも collector-timeout にしない（期限の判定は待ちの前に取る
 # state の復帰時刻と 124 で行う。負荷時の間欠失敗 #2375・#1687）。待ちの最悪時間は 1 回分
 # （--timeout 秒）で有界。観測点は待ちの前に取るので、待ちは計測値に乗らない。
@@ -750,6 +751,8 @@ create_not_made() {
 #              未作成（create_not_made）を確定できれば成功、できなければ残存の可能性ありとして
 #              記録し、手動での確認を促す（所有を証明できないコンテナへ破壊的操作を送らない。
 #              特権操作の後始末）。
+# 例外: created=0 の照会の収集待ちは期限で切り詰めないため、その経路の最悪時間は
+# state 呼び出し（≦ --timeout）＋収集待ち（≦ --timeout）の 2 × --timeout になる（有界。#2548・REPAIR-5）。
 finish_container() {
   local status=0
   rt_deadline_us=$(($(mono_us) + timeout_secs * 1000000))
@@ -763,7 +766,9 @@ finish_container_within_deadline() {
   local id="$1" created="$2"
   local log="$tmpdir/cleanup-$id.log"
   if [ "$created" = "0" ]; then
-    query_state "$id"
+    # 収集待ちは後始末の期限で切り詰めない（上限は --timeout 秒のまま。#2548・REPAIR-12）。
+    # state が期限の大半を使っても、収集が上限内に終わるなら collector-timeout にしない。
+    query_state "$id" full-flush
     if create_not_made; then
       return 0
     fi

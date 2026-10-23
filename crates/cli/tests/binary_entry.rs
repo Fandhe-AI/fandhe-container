@@ -2573,3 +2573,100 @@ fn oci7_image_failures_keep_state_on_linux() {
     ]));
     assert!(!root.join("c1").join("state.json").exists());
 }
+
+/// OCI-7・CLI-1・#2496: Linux で、永続化済みの在庫のタグ参照（name:tag）を CLI バイナリへ渡した create は、
+/// タグの指す digest で参照を登録して成功する。存在しないタグは NOT_FOUND（3）で、状態を作らない。
+#[cfg(target_os = "linux")]
+#[test]
+fn oci7_create_with_tag_ref_resolves_persisted_tag_on_linux() {
+    use fandhe_container_oci::image_management::{
+        ImageStore, ImageTagSource, ManifestComposition, TagKey,
+    };
+    use fandhe_container_oci::reference::{Digest, ImageReference, Reference};
+
+    let tmp = TmpDir::new("oci7-tag-ref");
+    let bundle = tmp.0.join("bundle");
+    std::fs::create_dir(&bundle).expect("bundle");
+    std::fs::create_dir(bundle.join("rootfs")).expect("rootfs");
+    std::fs::write(
+        bundle.join("config.json"),
+        r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
+    )
+    .expect("config");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+    let bundle_s = bundle.to_str().expect("utf8");
+
+    // 在庫: manifest 1 件とタグ 1 件を永続化する。
+    let store_dir = tmp.0.join("images");
+    std::fs::create_dir(&store_dir).expect("images");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&store_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+    }
+    let store_s = store_dir.to_str().expect("utf8");
+    let manifest = format!("sha256:{}", "a1".repeat(32));
+    let cfg = Digest::parse(&format!("sha256:{}", "c".repeat(64))).expect("cfg");
+    let tag = "registry.example/lib/app:v1";
+    {
+        let store = ImageStore::open(&store_dir).expect("store");
+        store
+            .lock()
+            .expect("lock")
+            .register_manifest(
+                Digest::parse(&manifest).expect("d"),
+                ManifestComposition::new(cfg, vec![]).expect("comp"),
+            )
+            .expect("register");
+        let r = ImageReference::parse(tag).expect("ref");
+        let Reference::Tag(t) = r.reference() else {
+            panic!("tag expected")
+        };
+        store
+            .tag_image(
+                &ImageTagSource::Manifest(Digest::parse(&manifest).expect("d")),
+                TagKey::new(r.registry().clone(), r.repository().clone(), t.clone()),
+            )
+            .expect("tag");
+    }
+
+    // 存在しないタグ: NOT_FOUND（3）・状態は作られない。
+    let out = run(&[
+        "--root",
+        root_s,
+        "create",
+        "--bundle",
+        bundle_s,
+        "--image-root",
+        store_s,
+        "--image",
+        "registry.example/lib/app:v2",
+        "c1",
+    ]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(op_and_code(&out), ("create".into(), "NOT_FOUND".into()));
+    assert!(!root.join("c1").join("state.json").exists());
+
+    // 永続化済みのタグ: 成功し、参照先 manifest にコンテナの参照が 1 件登録される。
+    assert_failure_free(&run(&[
+        "--root",
+        root_s,
+        "create",
+        "--bundle",
+        bundle_s,
+        "--image-root",
+        store_s,
+        "--image",
+        tag,
+        "c1",
+    ]));
+    assert!(root.join("c1").join("state.json").exists());
+    let store = ImageStore::open(&store_dir).expect("reopen");
+    let refs = store
+        .lock()
+        .expect("lock")
+        .manifest_references(&Digest::parse(&manifest).expect("d"));
+    assert_eq!(refs.containers.len(), 1);
+    assert!(refs.containers[0].as_str().ends_with(".c1"));
+}

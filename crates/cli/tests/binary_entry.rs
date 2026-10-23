@@ -1811,8 +1811,8 @@ fn cli1_cli2_setup_on_macos_prints_steps_with_instructions() {
     assert_eq!(
         String::from_utf8(out.stdout).expect("utf8"),
         concat!(
-            "{\"step\":\"virtualization-entitlement\",\"requires_admin\":false,\"status\":\"manual\",\"instructions\":\"The macOS backend plugin fandhe-container-plugin-macos must be code-signed with the com.apple.security.virtualization entitlement (ad-hoc signing is accepted), e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.virtualization> <path to fandhe-container-plugin-macos>. fandhe-container does not sign binaries.\"}\n",
-            "{\"step\":\"macos-min-version\",\"requires_admin\":false,\"status\":\"manual\",\"instructions\":\"Requires macOS 13 or later (provisional minimum for Virtualization.framework). Check with sw_vers -productVersion. fandhe-container does not check or upgrade macOS.\"}\n"
+            "{\"step\":\"virtualization-entitlement\",\"requires_admin\":false,\"status\":\"manual\",\"instructions\":\"The macOS backend plugin fandhe-container-plugin-macos must be code-signed with the com.apple.security.virtualization entitlement (ad-hoc signing is accepted), e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.virtualization> <path to fandhe-container-plugin-macos>. fandhe-container does not sign binaries. See docs/setup/macos.md\"}\n",
+            "{\"step\":\"macos-min-version\",\"requires_admin\":false,\"status\":\"manual\",\"instructions\":\"Requires macOS 13 or later (provisional minimum for Virtualization.framework). Check with sw_vers -productVersion. fandhe-container does not check or upgrade macOS. See docs/setup/macos.md\"}\n"
         )
     );
     assert_eq!(

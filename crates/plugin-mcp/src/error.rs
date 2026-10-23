@@ -152,6 +152,7 @@ impl ToolError {
             ErrorCode::PermissionDenied => "Permission denied",
             ErrorCode::Timeout => "Operation timed out",
             ErrorCode::Unavailable => "Backend unavailable",
+            ErrorCode::ResourceExhausted => "Resource exhausted",
             _ => "Internal error",
         }
     }
@@ -284,6 +285,11 @@ mod tests {
             (ErrorCode::Timeout, "TIMEOUT", "Operation timed out"),
             (ErrorCode::Unimplemented, "UNIMPLEMENTED", "Not implemented"),
             (ErrorCode::Unavailable, "UNAVAILABLE", "Backend unavailable"),
+            (
+                ErrorCode::ResourceExhausted,
+                "RESOURCE_EXHAUSTED",
+                "Resource exhausted",
+            ),
             (ErrorCode::Internal, "INTERNAL", "Internal error"),
             (
                 ErrorCode::InvalidArgument,

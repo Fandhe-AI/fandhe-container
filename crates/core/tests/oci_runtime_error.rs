@@ -366,6 +366,27 @@ fn err2_kill_signaler_failure_code_is_preserved() {
     assert!(line.contains("signaler down"));
 }
 
+/// ERR-2・CRI-2・PLUG-1: signaler の失敗 code（ResourceExhausted）は kill / RESOURCE_EXHAUSTED / 10 として透過する。
+#[test]
+fn err2_kill_signaler_resource_exhausted_is_preserved() {
+    let store = MemStateStore::default();
+    store.put(ContainerStatus::running(cid("r"), Some(pid())));
+    let sig: Arc<dyn ProcessSignaler> = FakeSignaler::new(Some(TraitError::new(
+        ErrorCode::ResourceExhausted,
+        "signaler full",
+    )));
+    let err = do_kill(&store, &OpRecorder::new(), &sig, "r").expect_err("exhausted");
+    let line = assert_structured(
+        &err,
+        LifecycleOp::Kill,
+        "kill",
+        ErrorCode::ResourceExhausted,
+        "RESOURCE_EXHAUSTED",
+        10,
+    );
+    assert!(line.contains("signaler full"));
+}
+
 /// ERR-2・TASK-96.3: 未 create ID の delete は delete / NOT_FOUND / 3。
 #[test]
 fn err2_delete_unknown_id() {

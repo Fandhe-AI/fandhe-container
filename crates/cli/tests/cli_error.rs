@@ -42,6 +42,7 @@ fn err1_exit_code_table() {
         (ErrorCode::Timeout, 7),
         (ErrorCode::Unimplemented, 8),
         (ErrorCode::Unavailable, 9),
+        (ErrorCode::ResourceExhausted, 10),
         (ErrorCode::Internal, 1),
     ];
     for (code, want) in table {

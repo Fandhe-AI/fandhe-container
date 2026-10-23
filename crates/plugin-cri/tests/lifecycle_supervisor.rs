@@ -27,8 +27,8 @@ use fandhe_container_core::traits::{
 };
 use fandhe_container_plugin_cri::adapter::{CoreLifecycleRuntime, PLUGIN_RUNTIME_TIMEOUT};
 use fandhe_container_plugin_cri::supervised::{
-    FixedLaunchStarter, MSG_START_REPORT_MISMATCH, MSG_STOP_DEADLINE, SignalerSource,
-    SupervisedLifecycle,
+    FixedLaunchStarter, MSG_START_REPORT_MISMATCH, MSG_STOP_DEADLINE, MSG_TOO_MANY_SUPERVISORS,
+    SignalerSource, SupervisedLifecycle,
 };
 use fandhe_container_supervisor::cgroup_remover::{DetectedCgroupRemover, detect_error};
 use fandhe_container_supervisor::start_client::SupervisorLaunch;
@@ -405,6 +405,45 @@ fn cri2_reaps_exited_supervisors() {
         let _ =
             h.rt.kill(&KillRequest::new(cid("c-quick"), Signal::SIGTERM));
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// CRI-2・ERR-3・PLUG-1・REPAIR-4: 追跡枠（上限 1）が埋まっている間の start は `RESOURCE_EXHAUSTED` と固定文言で断り、
+/// 新しい supervisor を起動しない。先の子が終了して回収されれば枠が戻り、次の start は成功する（#2609）。
+#[test]
+fn cri2_start_rejects_when_tracking_limit_reached_resource_exhausted() {
+    let sim = running("c-ok", 4242);
+    let rt = CoreLifecycleRuntime::new(Arc::new(SimStore(Arc::clone(&sim)))).with_supervision(
+        SupervisedLifecycle::with_tracking_limit(
+            starter(LONG),
+            Arc::new(SimSignalers(Arc::clone(&sim))),
+            1,
+        ),
+    );
+    rt.start(&StartRequest::new(cid("c-ok"))).expect("first");
+    assert_eq!(rt.tracked_supervisors(), 1);
+    let e = rt
+        .start(&StartRequest::new(cid("c-ok")))
+        .expect_err("limit reached");
+    assert_eq!(e.code(), ErrorCode::ResourceExhausted);
+    assert_eq!(e.code().as_str(), "RESOURCE_EXHAUSTED");
+    assert_eq!(e.message(), MSG_TOO_MANY_SUPERVISORS);
+    // 断った start は子を増やさない。
+    assert_eq!(rt.tracked_supervisors(), 1);
+    // 偽 supervisor（3 秒で終了）が回収されれば枠が戻る。
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        match rt.start(&StartRequest::new(cid("c-ok"))) {
+            Ok(status) => {
+                assert_eq!(status.state(), ContainerState::Running);
+                break;
+            }
+            Err(e) => {
+                assert_eq!(e.code(), ErrorCode::ResourceExhausted);
+                assert!(Instant::now() < deadline, "slot was not released");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
     }
 }
 

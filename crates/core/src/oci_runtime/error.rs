@@ -30,6 +30,7 @@
 //! | `Timeout` | `TIMEOUT` | 7 |
 //! | `Unimplemented` | `UNIMPLEMENTED` | 8 |
 //! | `Unavailable` | `UNAVAILABLE` | 9 |
+//! | `ResourceExhausted` | `RESOURCE_EXHAUSTED` | 10 |
 //!
 //! 1 は runc 互換の汎用失敗、2 以降は分類ごとに一意とし、標準エラー出力を解析せずに分類できるようにする。
 //! 125〜127 はコンテナ子プロセス用（`exec/process.rs` の `EXIT_SETUP_FAILED`・`EXIT_EXEC_NOT_EXECUTABLE`・
@@ -74,6 +75,8 @@ pub const OCI_EXIT_TIMEOUT: NonZeroU8 = nz(7);
 pub const OCI_EXIT_UNIMPLEMENTED: NonZeroU8 = nz(8);
 /// [`ErrorCode::Unavailable`] の終了コード（9）。
 pub const OCI_EXIT_UNAVAILABLE: NonZeroU8 = nz(9);
+/// [`ErrorCode::ResourceExhausted`] の終了コード（10）。
+pub const OCI_EXIT_RESOURCE_EXHAUSTED: NonZeroU8 = nz(10);
 
 /// [`ErrorCode`] を終了コードへ写像する（対応表はモジュール doc を参照。ERR-2）。
 ///
@@ -90,6 +93,7 @@ pub const fn exit_code_for(code: ErrorCode) -> NonZeroU8 {
         ErrorCode::Timeout => OCI_EXIT_TIMEOUT,
         ErrorCode::Unimplemented => OCI_EXIT_UNIMPLEMENTED,
         ErrorCode::Unavailable => OCI_EXIT_UNAVAILABLE,
+        ErrorCode::ResourceExhausted => OCI_EXIT_RESOURCE_EXHAUSTED,
     }
 }
 
@@ -219,7 +223,7 @@ impl Error for OciRuntimeError {}
 mod tests {
     use super::*;
 
-    const ALL: [(ErrorCode, u8); 9] = [
+    const ALL: [(ErrorCode, u8); 10] = [
         (ErrorCode::Internal, 1),
         (ErrorCode::InvalidArgument, 2),
         (ErrorCode::NotFound, 3),
@@ -229,6 +233,7 @@ mod tests {
         (ErrorCode::Timeout, 7),
         (ErrorCode::Unimplemented, 8),
         (ErrorCode::Unavailable, 9),
+        (ErrorCode::ResourceExhausted, 10),
     ];
 
     /// ERR-2: 各 ErrorCode が対応表どおりの終了コードになる。
@@ -248,7 +253,7 @@ mod tests {
             assert!((1..=124).contains(&n));
             assert!(seen.insert(n));
         }
-        assert_eq!(seen.len(), 9);
+        assert_eq!(seen.len(), 10);
     }
 
     /// ERR-2: 操作名は OpRecorder の操作名と一致する。

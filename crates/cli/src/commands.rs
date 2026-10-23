@@ -313,6 +313,7 @@ fn failure_message(code: ErrorCode) -> &'static str {
         ErrorCode::PermissionDenied => "permission denied",
         ErrorCode::Timeout => "operation timed out",
         ErrorCode::Unavailable => "unavailable",
+        ErrorCode::ResourceExhausted => "resource exhausted",
         _ => "operation failed",
     }
 }
@@ -596,6 +597,7 @@ mod tests {
             (ErrorCode::PermissionDenied, 6),
             (ErrorCode::Timeout, 7),
             (ErrorCode::Unavailable, 9),
+            (ErrorCode::ResourceExhausted, 10),
         ];
         for (code, exit) in codes {
             let m = failure_message(code);

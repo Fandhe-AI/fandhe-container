@@ -21,7 +21,7 @@
 //! CLI は `start` の直後に終了するが、plugin-cri は常駐するため、起動した supervisor（実体は systemd-run の子）が
 //! plugin の子のまま残り、終了後にゾンビになる。spawn した `Child` を上限つき（[`MAX_TRACKED_SUPERVISORS`]）の一覧に
 //! 保持し、`start`・`kill`・`stop`・`delete` の入口で `try_wait` により終了済みのものだけを回収する。`kill` も `wait`
-//! もしない（supervisor は plugin より長く生きる前提。CORE-1・SUP-5）。上限に達して空きが無いときは起動せず失敗する。
+//! もしない（supervisor は plugin より長く生きる前提。CORE-1・SUP-5）。上限に達して空きが無いときは起動せず `RESOURCE_EXHAUSTED`（CRI では gRPC `RESOURCE_EXHAUSTED`。CRI-2・#2609）で失敗する。
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //! - supervisor の実行ファイルは plugin-cri の実体パス（`current_exe()`）と同じディレクトリの固定名から解決する
@@ -164,6 +164,8 @@ pub struct SupervisedLifecycle {
     children: Mutex<Vec<Child>>,
     /// 起動の結果待ちで枠だけ予約している件数。`children` のロックを持つ間だけ増減する（並行 start の上限超過を防ぐ）。
     reserved: AtomicUsize,
+    /// 追跡する子の上限。本番は [`MAX_TRACKED_SUPERVISORS`]（[`Self::with_tracking_limit`] だけが変える）。
+    limit: usize,
 }
 
 impl SupervisedLifecycle {
@@ -174,11 +176,24 @@ impl SupervisedLifecycle {
 
     /// 起動口と signaler を注入して作る（結合試験と別実装への差し替え）。
     pub fn new(starter: Arc<dyn SupervisorStarter>, signalers: Arc<dyn SignalerSource>) -> Self {
+        Self::with_tracking_limit(starter, signalers, MAX_TRACKED_SUPERVISORS)
+    }
+
+    /// 追跡する子の上限を指定して作る（結合試験と別実装への差し替え用。本番は [`Self::new`] の `MAX_TRACKED_SUPERVISORS`）。
+    ///
+    /// 上限超過の経路（`RESOURCE_EXHAUSTED`・CRI-2）を実プロセス 1024 個なしで試験するための口。0 は全拒否の設定に
+    /// なるため `limit` が 0 のときは 1 に切り上げる。環境変数・引数による上書きは作らない。
+    pub fn with_tracking_limit(
+        starter: Arc<dyn SupervisorStarter>,
+        signalers: Arc<dyn SignalerSource>,
+        limit: usize,
+    ) -> Self {
         Self {
             starter,
             signalers,
             children: Mutex::new(Vec::new()),
             reserved: AtomicUsize::new(0),
+            limit: limit.max(1),
         }
     }
 
@@ -215,9 +230,9 @@ impl SupervisedLifecycle {
         // 追跡数と予約数の合計で上限を検査し、同じロックの下で枠を予約する（検査と追加の間に並行 start が割り込めない）。
         {
             let children = self.lock_children();
-            if children.len() + self.reserved.load(Ordering::SeqCst) >= MAX_TRACKED_SUPERVISORS {
+            if children.len() + self.reserved.load(Ordering::SeqCst) >= self.limit {
                 return Err(TraitError::new(
-                    ErrorCode::Unavailable,
+                    ErrorCode::ResourceExhausted,
                     MSG_TOO_MANY_SUPERVISORS,
                 ));
             }

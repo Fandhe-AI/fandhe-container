@@ -362,7 +362,7 @@ const DELETE_STDERR_MAX: u64 = 4096;
 /// 取り出し、既知のコード（`ErrorCode::as_str`）なら固定文字列で返す。読めない・未知なら `UNPARSED`。
 /// message・パス・errno は返さない（出力へ載せない。外部入力は信頼しない）。
 fn delete_error_code(bytes: &[u8]) -> &'static str {
-    const KNOWN: [ErrorCode; 9] = [
+    const KNOWN: [ErrorCode; 10] = [
         ErrorCode::InvalidArgument,
         ErrorCode::NotFound,
         ErrorCode::AlreadyExists,
@@ -372,6 +372,7 @@ fn delete_error_code(bytes: &[u8]) -> &'static str {
         ErrorCode::PermissionDenied,
         ErrorCode::Timeout,
         ErrorCode::Unavailable,
+        ErrorCode::ResourceExhausted,
     ];
     const KEY: &str = "\"code\":\"";
     let text = String::from_utf8_lossy(bytes);

@@ -199,7 +199,7 @@ fn s(v: &str) -> V {
     V::Str(v.to_string())
 }
 /// 契約上の出力キー順（`src/inspect.rs` の `to_json` と同じ。SUP-11）。
-const ORDERED_KEYS: [&str; 13] = [
+const ORDERED_KEYS: [&str; 14] = [
     "id",
     "status",
     "pid",
@@ -213,6 +213,7 @@ const ORDERED_KEYS: [&str; 13] = [
     "restartCount",
     "auditCoverage",
     "idMapping",
+    "explicitStop",
 ];
 
 /// 固定レコードを返すメモリ上のフェイク（`get` のみ。3 OS で `inspect` の経路を通すため）。
@@ -321,8 +322,32 @@ fn assert_schema(m: &BTreeMap<String, V>) {
         other => panic!("health: expected string or null, got {other:?}"),
     }
     match m.get("auditCoverage") {
-        Some(V::Null | V::Obj(_)) => {}
+        Some(V::Null) => {}
+        Some(V::Obj(fields)) => {
+            let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(keys, ["policy", "seccompKill", "landlock", "record"]);
+            match fields.last().map(|(_, v)| v) {
+                Some(V::Null) => {}
+                Some(V::Str(r)) => {
+                    assert_eq!(r, "failed");
+                    let degraded = fields.iter().any(|(_, v)| {
+                        matches!(v, V::Obj(l) if l.iter().any(|(k, v)| k == "mode" && *v == s("degraded")))
+                    });
+                    assert!(degraded, "record=failed requires a degraded layer");
+                }
+                other => panic!("auditCoverage.record: {other:?}"),
+            }
+        }
         other => panic!("auditCoverage: expected object or null, got {other:?}"),
+    }
+    match m.get("explicitStop") {
+        Some(V::Str(e)) => {
+            assert!(e == "recorded" || e == "not_recorded", "explicitStop {e}");
+            if e == "recorded" {
+                assert_eq!(m.get("status"), Some(&s("stopped")));
+            }
+        }
+        other => panic!("explicitStop: expected string, got {other:?}"),
     }
     match m.get("idMapping") {
         Some(V::Null) => {}
@@ -437,8 +462,67 @@ fn sec4_2027_audit_coverage_is_reported() {
                     ("reason", s("landlock_audit_abi_too_old"))
                 ])
             ),
+            ("record", V::Null),
         ])
     );
+}
+
+/// SUP-9・#2601: 明示 stop の記録は `stopped` のときだけ `"recorded"`、それ以外・既定は `"not_recorded"`。
+#[test]
+fn sup9_2601_explicit_stop_is_reported() {
+    use fandhe_container_core::traits::ExplicitStop;
+    let rec = record(ContainerStatus::stopped(cid("c"), Some(0)), 2)
+        .with_explicit_stop(ExplicitStop::Recorded);
+    let m = render_map(&FakeStore(rec), "c");
+    assert_schema(&m);
+    assert_eq!(m["explicitStop"], s("recorded"));
+    for st in [
+        ContainerStatus::stopped(cid("c"), Some(1)),
+        ContainerStatus::running(cid("c"), nz(5)),
+        ContainerStatus::created(cid("c"), None),
+    ] {
+        let m = render_map(&FakeStore(record(st, 1)), "c");
+        assert_schema(&m);
+        assert_eq!(m["explicitStop"], s("not_recorded"));
+    }
+}
+
+/// SEC-4・REPAIR-4・#2601: 縮退の監査記録の書き込み失敗は `auditCoverage.record = "failed"` で出す。
+#[test]
+fn sec4_2601_audit_coverage_record_failed_is_reported() {
+    use fandhe_container_core::audit_log::{
+        AuditCoverage, AuditCoveragePolicy, DegradeReason, KernelAuditLayerStatus,
+    };
+    use fandhe_container_core::launch_isolation::{
+        LaunchIsolationRecord, RecordedLandlock, RecordedRule, RecordedTarget, RootIdentity,
+    };
+    let iso = LaunchIsolationRecord::from_parts(
+        RootIdentity::new(44, 1234),
+        RecordedLandlock::new(0xFFFF, vec![RecordedRule::new(RecordedTarget::Root, 0x7)]).unwrap(),
+    );
+    let coverage = AuditCoverage::new(
+        KernelAuditLayerStatus::Requested,
+        KernelAuditLayerStatus::Degraded(DegradeReason::LandlockAuditAbiTooOld),
+    );
+    let iso = iso.with_audit_coverage(AuditCoveragePolicy::BestEffort, coverage);
+    let base = record(ContainerStatus::created(cid("c"), None), 1);
+    let ok = render_map(
+        &FakeStore(base.clone().with_launch_isolation(iso.clone())),
+        "c",
+    );
+    assert_schema(&ok);
+    let V::Obj(f) = &ok["auditCoverage"] else {
+        panic!("auditCoverage must be an object");
+    };
+    assert_eq!(f.last(), Some(&("record".to_string(), V::Null)));
+    let failed = iso.with_audit_coverage_record_failed().unwrap();
+    let m = render_map(&FakeStore(base.with_launch_isolation(failed)), "c");
+    assert_schema(&m);
+    let V::Obj(f) = &m["auditCoverage"] else {
+        panic!("auditCoverage must be an object");
+    };
+    assert_eq!(f.first(), Some(&("policy".to_string(), s("best-effort"))));
+    assert_eq!(f.last(), Some(&("record".to_string(), s("failed"))));
 }
 
 /// CORE-6・SEC-5・REPAIR-4・#2388: 選ばれた ID 写像は、記録があればモデルと uid・gid の範囲（containerId・hostId・
@@ -743,12 +827,13 @@ mod linux {
         }
     }
     /// キー集合（アルファベット順。`BTreeMap` のキー列との照合用）。
-    const KEYS: [&str; 13] = [
+    const KEYS: [&str; 14] = [
         "auditCoverage",
         "bundle",
         "cgroupInstance",
         "cgroupScope",
         "exitCode",
+        "explicitStop",
         "health",
         "id",
         "idMapping",

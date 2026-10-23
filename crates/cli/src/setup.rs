@@ -14,6 +14,7 @@
 //! macOS / Windows も Linux と同じ形式の `instructions`（手順の固定文言。表示のみ）つきでステップを提示し、
 //! OS 設定の検出・適用は行わない（TASK-125 の範囲。実装済みを装わない。REPAIR-3・#2452・CLI-1）。
 //! Windows の文言は `docs/setup/windows.md` と食い違わない（単体テスト `win5_instructions_match_windows_setup_doc` で照合）。
+//! macOS の文言は `docs/setup/macos.md` と食い違わない（単体テスト `mac1_cli2_instructions_match_macos_setup_doc` で照合。#2602）。
 //! - cli は platform-* へ依存できない（CLI-1・PLUG-4・`make check-cli-backend-deps`）ため、検出・適用は将来 plugin 境界経由になる。
 //! - WSL2 有効化・Developer Mode は管理者権限を要し、macOS の entitlement はビルド / 署名時の属性で実行時には付与できない。
 //!   CLI からの昇格・シェル / 外部コマンド起動・設定ファイル / レジストリの変更は行わない。
@@ -42,11 +43,11 @@ const DEVELOPER_MODE_INSTRUCTIONS: &str = "Requires administrator. Turn on Devel
 const WSLCONFIG_VIRTIOFS_INSTRUCTIONS: &str = "No administrator needed. In %UserProfile%\\.wslconfig, add virtiofs=true under [wsl2] (put comments on their own lines), then run wsl --shutdown so the setting takes effect. fandhe-container does not edit .wslconfig. See docs/setup/windows.md";
 
 /// macOS: entitlement と署名の手順の固定文言（`fandhe-container-plugin-macos` の前提。MAC-1・#2452）。
-/// macOS のセットアップ文書は未整備のため、文書へのリンクは付けない。
-const VIRTUALIZATION_ENTITLEMENT_INSTRUCTIONS: &str = "The macOS backend plugin fandhe-container-plugin-macos must be code-signed with the com.apple.security.virtualization entitlement (ad-hoc signing is accepted), e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.virtualization> <path to fandhe-container-plugin-macos>. fandhe-container does not sign binaries.";
+/// `docs/setup/macos.md`「entitlement とコード署名」と同じ手順（#2602）。
+const VIRTUALIZATION_ENTITLEMENT_INSTRUCTIONS: &str = "The macOS backend plugin fandhe-container-plugin-macos must be code-signed with the com.apple.security.virtualization entitlement (ad-hoc signing is accepted), e.g. codesign --sign - --force --entitlements <plist granting com.apple.security.virtualization> <path to fandhe-container-plugin-macos>. fandhe-container does not sign binaries. See docs/setup/macos.md";
 
-/// macOS: 最低版数の手順の固定文言（13 以上は `MacosMinVersion` の暫定要件。spec 未定義。MAC-1・#2452）。
-const MACOS_MIN_VERSION_INSTRUCTIONS: &str = "Requires macOS 13 or later (provisional minimum for Virtualization.framework). Check with sw_vers -productVersion. fandhe-container does not check or upgrade macOS.";
+/// macOS: 最低版数の手順の固定文言（13 以上は `MacosMinVersion` の暫定要件。spec 未定義。`docs/setup/macos.md`「macOS の版」と同じ。MAC-1・#2452・#2602）。
+const MACOS_MIN_VERSION_INSTRUCTIONS: &str = "Requires macOS 13 or later (provisional minimum for Virtualization.framework). Check with sw_vers -productVersion. fandhe-container does not check or upgrade macOS. See docs/setup/macos.md";
 
 /// `setup` が要求する OS 固有ステップ（閉じた列挙。外部入力からは構築しない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +396,39 @@ mod tests {
         }
         for id in ["wsl2-enable", "developer-mode", "wslconfig-virtiofs"] {
             assert!(doc.contains(&format!("`{id}`")), "doc id: {id}");
+        }
+    }
+
+    /// MAC-1・CLI-2・REPAIR-12・#2602: macOS の文言のコマンド・値が `docs/setup/macos.md` にも載り、両文言が文書へのリンクで終わる。
+    #[test]
+    fn mac1_cli2_instructions_match_macos_setup_doc() {
+        let doc = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/setup/macos.md"),
+        )
+        .expect("macos.md");
+        let all = [
+            VIRTUALIZATION_ENTITLEMENT_INSTRUCTIONS,
+            MACOS_MIN_VERSION_INSTRUCTIONS,
+        ]
+        .join(" ");
+        for needle in [
+            "com.apple.security.virtualization",
+            "codesign --sign - --force --entitlements",
+            "fandhe-container-plugin-macos",
+            "sw_vers -productVersion",
+            "macOS 13",
+        ] {
+            assert!(all.contains(needle), "instructions: {needle}");
+            assert!(doc.contains(needle), "doc: {needle}");
+        }
+        for id in ["virtualization-entitlement", "macos-min-version"] {
+            assert!(doc.contains(&format!("`{id}`")), "doc id: {id}");
+        }
+        for t in [
+            VIRTUALIZATION_ENTITLEMENT_INSTRUCTIONS,
+            MACOS_MIN_VERSION_INSTRUCTIONS,
+        ] {
+            assert!(t.ends_with(" See docs/setup/macos.md"), "{t}");
         }
     }
 

@@ -5,6 +5,7 @@
 //! 受けた UDS 上で `CriRuntimeService` をサーブすること（`server::serve`。unix のみ）。
 //! 実装の組み立ては `adapter::CriPluginBackends::production`（失敗したら fail-closed で起動しない）。
 //! 既定の socket パスは未定義のため、引数なしの起動は `UNIMPLEMENTED` で失敗させる（REPAIR-3）。
+//! Linux では peer 認証の拒否を core の監査ログ（`@audit.log`）へ永続化する（#2484）。記録経路を作れなければ起動しない。
 //! SIGTERM の正常停止は未実装（SIGKILL で止まる。`server` の未実装の注記を参照）。
 //!
 //! 終了コード: 0 = `--help`、2 = `InvalidArgument`（plugin-macos / plugin-mcp と同じ値）、1 = それ以外の失敗
@@ -42,6 +43,17 @@ fn serve(socket: &std::path::Path) -> ExitCode {
     use fandhe_container_plugin_cri::adapter::CriPluginBackends;
     use fandhe_container_plugin_cri::{server, telemetry};
 
+    // 監査の記録経路（Linux）は、スレッド・listener・ランタイムを作る前に用意する（SEC-4・PLUG-12・#2484）。
+    // `ControlAuditRelay::spawn` は単一スレッドのときだけ成功し、helper は fd 3 以上を閉じるため。
+    // 作れなければ「記録されないまま受け付ける」状態を避けて起動しない（fail-closed。supervisor の #2027 と同じ）。
+    #[cfg(target_os = "linux")]
+    let audit_sink = match open_audit_relay() {
+        Ok(sink) => sink,
+        Err(code) => {
+            eprintln!("error: {code}: failed to open the audit log");
+            return ExitCode::from(EXIT_FAILURE);
+        }
+    };
     let backends = match CriPluginBackends::production() {
         Ok(b) => b,
         Err(e) => {
@@ -74,16 +86,36 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         Ok(rt) => rt,
         Err(_) => return fail(PluginErrorCode::Internal, "failed to start the runtime"),
     };
+    // 配送 thread を作れなければ listener の bind 前に起動を中止する（SEC-4・PLUG-12・#2484）。
+    #[cfg(target_os = "linux")]
+    let audit = match telemetry::PeerAuditForwarder::spawn(
+        audit_sink,
+        telemetry::PEER_AUDIT_QUEUE_CAPACITY,
+        telemetry::stderr_sink().clone(),
+    ) {
+        Ok(f) => Some(std::sync::Arc::new(f)),
+        Err(_) => {
+            // code は PluginErrorCode のトークンに揃える（`error: <CODE>: <message>` の契約）。
+            return fail(
+                PluginErrorCode::Unavailable,
+                "audit delivery unavailable: failed to start the audit thread",
+            );
+        }
+    };
+    // 非 Linux は永続化経路が未実装（#2430 の判断待ち。REPAIR-3）。拒否は stderr にだけ残る。
+    #[cfg(not(target_os = "linux"))]
+    let audit = None;
     let result = rt.block_on(async {
         // 操作の件数・レイテンシを定期的に構造化ログとして stderr へ出す（REPAIR-4）。
         let stats = tokio::spawn(telemetry::op_stats_export_loop(
             recorder,
             telemetry::OP_STATS_EXPORT_INTERVAL,
         ));
-        let r = server::serve(
+        let r = server::serve_with_audit(
             socket,
             svc,
             &GrpcServerConfig::new(),
+            audit,
             std::future::pending(),
         )
         .await;
@@ -95,6 +127,18 @@ fn serve(socket: &std::path::Path) -> ExitCode {
         Ok(()) => fail(PluginErrorCode::Internal, "server stopped unexpectedly"),
         Err(e) => fail_err(&e),
     }
+}
+
+/// 監査専用の helper を fork して記録先を確かめる。失敗したら固定文言のエラーコードトークンを返す。
+#[cfg(target_os = "linux")]
+fn open_audit_relay()
+-> Result<std::sync::Arc<dyn fandhe_container_core::audit_log::AuditSink>, &'static str> {
+    use fandhe_container_core::audit_log::{ControlAuditRelay, FileAuditSink};
+    let relay = FileAuditSink::open_in_state_root(None)
+        .and_then(ControlAuditRelay::spawn)
+        .and_then(|relay| relay.probe().map(|()| relay))
+        .map_err(|e| e.code().as_str())?;
+    Ok(std::sync::Arc::new(relay))
 }
 
 #[cfg(not(unix))]

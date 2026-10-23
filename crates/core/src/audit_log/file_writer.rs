@@ -364,7 +364,9 @@ pub fn encode_json_line(record: &AuditRecord) -> Result<Vec<u8>, AuditWriteError
         AuditEvent::Seccomp { syscall, .. } => (Some(syscall.get()), None),
         AuditEvent::Landlock { path, syscall, .. } => (syscall.map(|s| s.get()), Some(path)),
         AuditEvent::Mount { path, .. } => (None, path.as_ref()),
-        AuditEvent::PluginTrust { path, .. } => (None, Some(path)),
+        AuditEvent::PluginTrust { path, .. } | AuditEvent::PluginPeer { path, .. } => {
+            (None, Some(path))
+        }
         AuditEvent::ExecTarget { .. }
         | AuditEvent::Entrypoint { .. }
         | AuditEvent::ControlPeer { .. }
@@ -1263,6 +1265,20 @@ mod tests {
             let s = text(&rec(3, e));
             assert!(s.ends_with(",\"container_id\":null}\n"), "{s}");
         }
+    }
+
+    /// SEC-4・PLUG-12・#2484: plugin_peer の 1 行は層・path・理由トークンを持ち、コンテナ ID は null。
+    #[test]
+    fn sec4_2484_encode_plugin_peer_is_exact() {
+        let r = rec(
+            9,
+            crate::audit_log::PluginPeerRejection::PeerUidMismatch
+                .audit_event(std::path::Path::new("/run/p/cri.sock")),
+        );
+        assert_eq!(
+            text(&r),
+            "{\"event\":\"audit\",\"layer\":\"plugin_peer\",\"ts_sec\":1700000000,\"ts_nsec\":5,\"pid\":9,\"syscall\":null,\"arch\":null,\"path\":\"/run/p/cri.sock\",\"path_truncated\":false,\"path_original_len\":15,\"reason\":\"plugin_peer_uid_mismatch\",\"container_id\":null}\n"
+        );
     }
 
     /// SEC-4・#1701: 理由つきの mount の 1 行（パスなし／パスあり）の具体値。`reason` は `container_id` の直前。

@@ -10,7 +10,7 @@
 //!
 //! - マウント検証/API レイヤーの記録ヘルパと記録先トレイトは [`mount`]・[`AuditSink`]（TASK-41.4・#195。
 //!   `exec::audit_mount_violation` と `oci_runtime::audit_mount_config_error` がここを使う。
-//!   本番 sink `FileAuditSink`〔#1594〕は実装済み。CLI の create は destination 拒否を配線済み〔#2480〕。plugin-cri・healthcheck 等への配線は未実装）
+//!   本番 sink `FileAuditSink`〔#1594〕は実装済み。CLI の create は destination 拒否を配線済み〔#2480〕。plugin-cri の peer 認証の拒否は層 `plugin_peer` として配線済み〔#2484〕。healthcheck 等への配線は未実装）
 //! - exec の対象の拒否（層 `exec_target`）は `exec::audit_exec_violation` / `exec::record_exec_target_rejection`
 //!   が [`AuditEvent::ExecTarget`] として記録する。supervisor の通しの入口 `run_command` が親プロセス側で
 //!   1 拒否 1 件を記録する（#1465。worker の経路の拒否は `exec::record_exec_worker_rejection` で、種別 `rootfs_pivot`
@@ -401,6 +401,9 @@ pub enum AuditLayer {
     Mount,
     /// plugin 信頼検証（所有者・モード・ハッシュ。PLUG-11・SEC-4・TASK-122.5）。
     PluginTrust,
+    /// plugin の gRPC サーバー（plugin-cri）が受付時の peer credential 照合で接続を拒否した記録
+    /// （別 uid・資格情報を確かめられない接続。SEC-4・PLUG-12・#2484）。
+    PluginPeer,
     /// 稼働中コンテナへの exec の対象の拒否（SEC-4・SUP-6・TASK-163 追補・#1465）。
     ExecTarget,
     /// エントリポイント検証の拒否（launch と exec の子で共有。SEC-4・SUP-6・TASK-163 追補・#1595）。
@@ -423,6 +426,7 @@ impl AuditLayer {
             AuditLayer::Landlock => "landlock",
             AuditLayer::Mount => "mount",
             AuditLayer::PluginTrust => "plugin_trust",
+            AuditLayer::PluginPeer => "plugin_peer",
             AuditLayer::ExecTarget => "exec_target",
             AuditLayer::Entrypoint => "entrypoint",
             AuditLayer::ControlChannel => "control_channel",
@@ -478,6 +482,17 @@ pub enum AuditEvent {
         /// 拒否された plugin ファイルまたは探索先ディレクトリのパス。
         path: AuditPath,
         /// 拒否理由トークン（静的トークン。[`AuditReason`] 参照）。
+        reason: AuditReason,
+    },
+    /// plugin-cri の gRPC サーバーが接続元を拒否した記録（SEC-4・PLUG-12・#2484）。
+    ///
+    /// socket のパス（`plugin-backend-wiring.md` 4.7）と閉じた語彙の理由トークンを持ち、接続元の
+    /// uid・pid の値とコンテナ ID は持たない（拒否は特定のコンテナに属さない。REPAIR-2）。
+    /// 構築は [`PluginPeerRejection::audit_event`] で行う。
+    PluginPeer {
+        /// 受付に使った socket のパス。
+        path: AuditPath,
+        /// 拒否理由トークン（[`PluginPeerRejection::as_str`]）。
         reason: AuditReason,
     },
     /// 稼働中コンテナへの exec の対象の拒否（SEC-4・SUP-6・TASK-163 追補・#1465）。
@@ -560,6 +575,46 @@ impl ControlPeerRejection {
     }
 }
 
+/// plugin の gRPC サーバーが接続元を拒否した理由（SEC-4・PLUG-12・#2484）。固定語彙で、入力値を載せない。
+///
+/// plugin crate の `PeerAuthRejectReason` に対応する。core は plugin crate に依存しないため、
+/// 写像は plugin-cri 側で行い、将来 plugin 側に足される値は `Unknown` に落とす。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PluginPeerRejection {
+    /// 接続元の uid が期待値と違う。
+    PeerUidMismatch,
+    /// 接続元の uid を取得できなかった。
+    PeerUidUnavailable,
+    /// 接続元の pid が期待値と違う。
+    PeerPidMismatch,
+    /// 接続元の pid を取得できなかった。
+    PeerPidUnavailable,
+    /// 上記以外（呼び出し側が知らない理由。落とさず記録するための受け皿）。
+    Unknown,
+}
+
+impl PluginPeerRejection {
+    /// 監査レコードに入る静的トークン。
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerUidMismatch => "plugin_peer_uid_mismatch",
+            Self::PeerUidUnavailable => "plugin_peer_uid_unavailable",
+            Self::PeerPidMismatch => "plugin_peer_pid_mismatch",
+            Self::PeerPidUnavailable => "plugin_peer_pid_unavailable",
+            Self::Unknown => "plugin_peer_unknown",
+        }
+    }
+
+    /// 受け付けた socket のパスから監査イベントを返す。
+    pub fn audit_event(self, path: &Path) -> AuditEvent {
+        AuditEvent::PluginPeer {
+            path: AuditPath::new(path),
+            reason: AuditReason::new(self.as_str()),
+        }
+    }
+}
+
 impl AuditEvent {
     /// 対応するレイヤーを返す。
     pub fn layer(&self) -> AuditLayer {
@@ -568,6 +623,7 @@ impl AuditEvent {
             AuditEvent::Landlock { .. } => AuditLayer::Landlock,
             AuditEvent::Mount { .. } => AuditLayer::Mount,
             AuditEvent::PluginTrust { .. } => AuditLayer::PluginTrust,
+            AuditEvent::PluginPeer { .. } => AuditLayer::PluginPeer,
             AuditEvent::ExecTarget { .. } => AuditLayer::ExecTarget,
             AuditEvent::Entrypoint { .. } => AuditLayer::Entrypoint,
             AuditEvent::ControlPeer { .. } => AuditLayer::ControlChannel,
@@ -660,6 +716,7 @@ impl AuditRecord {
             AuditEvent::Landlock { syscall, .. } => *syscall,
             AuditEvent::Mount { .. }
             | AuditEvent::PluginTrust { .. }
+            | AuditEvent::PluginPeer { .. }
             | AuditEvent::ExecTarget { .. }
             | AuditEvent::Entrypoint { .. }
             | AuditEvent::ControlPeer { .. }
@@ -703,7 +760,9 @@ impl AuditRecord {
             | AuditEvent::AuditCoverageDegraded { .. } => None,
             AuditEvent::Landlock { path, .. } => Some(path.as_path()),
             AuditEvent::Mount { path, .. } => path.as_ref().map(AuditPath::as_path),
-            AuditEvent::PluginTrust { path, .. } => Some(path.as_path()),
+            AuditEvent::PluginTrust { path, .. } | AuditEvent::PluginPeer { path, .. } => {
+                Some(path.as_path())
+            }
         }
     }
 
@@ -724,6 +783,7 @@ impl AuditRecord {
         match &self.event {
             AuditEvent::Mount { reason, .. } => *reason,
             AuditEvent::PluginTrust { reason, .. }
+            | AuditEvent::PluginPeer { reason, .. }
             | AuditEvent::ExecTarget { reason }
             | AuditEvent::Entrypoint { reason }
             | AuditEvent::ControlPeer { reason } => Some(*reason),
@@ -895,6 +955,44 @@ mod tests {
                 .layer(),
             AuditLayer::ControlChannel
         );
+    }
+
+    /// SEC-4・PLUG-12・#2484: plugin_peer の理由トークン 5 種・層トークン・パスと理由のアクセサ。
+    #[test]
+    fn sec4_2484_plugin_peer_tokens_and_accessors() {
+        assert_eq!(AuditLayer::PluginPeer.as_str(), "plugin_peer");
+        let tokens = [
+            (
+                PluginPeerRejection::PeerUidMismatch,
+                "plugin_peer_uid_mismatch",
+            ),
+            (
+                PluginPeerRejection::PeerUidUnavailable,
+                "plugin_peer_uid_unavailable",
+            ),
+            (
+                PluginPeerRejection::PeerPidMismatch,
+                "plugin_peer_pid_mismatch",
+            ),
+            (
+                PluginPeerRejection::PeerPidUnavailable,
+                "plugin_peer_pid_unavailable",
+            ),
+            (PluginPeerRejection::Unknown, "plugin_peer_unknown"),
+        ];
+        for (rejection, token) in tokens {
+            assert_eq!(rejection.as_str(), token);
+            let rec = AuditRecord::new(
+                AuditTimestamp::from_unix_duration(Duration::new(1, 0)),
+                AuditPid::new(1).unwrap(),
+                rejection.audit_event(Path::new("/s.sock")),
+            );
+            assert_eq!(rec.layer(), AuditLayer::PluginPeer);
+            assert_eq!(rec.path(), Some(Path::new("/s.sock")));
+            assert_eq!(rec.reason().map(AuditReason::as_str), Some(token));
+            assert_eq!(rec.syscall(), None);
+            assert_eq!(rec.container_id(), None);
+        }
     }
 
     /// SEC-4・SUP-6・TASK-163 追補・#1595: entrypoint レコードは理由だけを持ち、パス・syscall は持たない。

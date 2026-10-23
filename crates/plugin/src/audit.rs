@@ -34,6 +34,9 @@
 //! 本 crate が担うのは「拒否 1 件につきイベント 1 件を呼び出し側のフックへ渡す」ところまでで、これを
 //! TASK-124.5 の「拒否 1 件ごとに監査イベントを 1 件記録」の定義とする。永続的な SEC-4 監査ログ
 //! （`crates/core` の監査ログ）への書き込みは core 側 proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち。配線は 4.7 と W5 に含まれ、W5 の実装 issue は #2232 の承認後に起票。受け入れ条件の引き継ぎは #2232 のコメント〔#2252 P2-3〕〕・TASK-114）の責務で、本 crate では未実装。
+//! CRI の gRPC 経路（plugin-cri が受付側）は #2484 で配線済み: plugin-cri が自プロセス内の core の
+//! `ControlAuditRelay` → `FileAuditSink` へ拒否 1 件ごとに 1 件を書く（層 `plugin_peer`）。この配線は
+//! 本 crate の外にあり、長さ接頭辞フレームの経路（core が plugin を起動して接続する側）は W5 のまま。
 //! [`JsonLinesPeerAuthObserver`] は I/O をしない一時的なメモリバッファである。フックを渡した呼び出し側が
 //! [`JsonLinesPeerAuthObserver::drain_lines`] で回収して自分の出力先へ書かないまま終了すれば、イベントは
 //! 失われる（回収と永続化は呼び出し側の契約）。

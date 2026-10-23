@@ -959,6 +959,21 @@ mod uds {
             })
         }
 
+        /// crate 外の結合試験用: 期待 UID を指定して作る（#2484・PLUG-12）。
+        ///
+        /// 自プロセスからの接続を別 UID 相当として拒否させ、実際の `SO_PEERCRED` 照合と observer 通知の
+        /// 全経路を通すための口。`with_expected_uid` に委ねるだけで、照合を省く経路ではない。
+        /// feature `test-support`（既定で無効。本番の依存では有効にしない）の下にだけ存在する。
+        #[cfg(feature = "test-support")]
+        #[doc(hidden)]
+        pub fn with_expected_uid_for_test(
+            listener: crate::UdsListener,
+            observer: Box<dyn crate::PeerAuthObserver>,
+            expected_uid: u32,
+        ) -> Result<Self, PluginError> {
+            Self::with_expected_uid(listener, observer, expected_uid)
+        }
+
         /// 試験用: 期待 UID を差し替える（`with_expected_uid` と同じ趣旨で、照合を省く経路ではない）。
         #[cfg(test)]
         pub(super) fn set_expected_uid_for_test(&mut self, uid: u32) {

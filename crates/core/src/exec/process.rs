@@ -2654,8 +2654,12 @@ fn run_child_then<T>(
 ///
 /// # 将来仕様（記録のみ）
 ///
-/// プローブの成功は証跡ではない。エントリポイント内の攻撃プローブへ移して本関数は
-/// 廃止する（REPAIR-3）。
+/// プローブの成功は証跡ではない。`tests/seccomp.rs` はエントリポイント内の観測へ移したため本関数を使わない
+/// （#2386・#2543）。残る呼び出し元は `escape_suite`・`readonly_paths`・`masked_paths`・`config_paths`・
+/// `config_paths_implicit_dev`・`sysfs_mount`・`fork_exec_isolation` で、これらのエントリポイント内への移行と
+/// 本関数の廃止は未着手（REPAIR-3）。fork 子で観測しても識別性が落ちない根拠: seccomp フィルタ・
+/// `NO_NEW_PRIVS`・Landlock のドメイン・マウントの状態は execve をまたいで変わらない。capability は例外で、
+/// exec 後の値は `production_launcher` のシナリオ J が照合する。
 ///
 /// 任意クロージャを分離後の子で実行できるため、cargo feature `escape-probe`（結合試験用に dev-dependency の
 /// 自己参照で有効化。通常ビルドには含まれない）でのみ公開する。

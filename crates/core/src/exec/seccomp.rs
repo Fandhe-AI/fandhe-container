@@ -348,7 +348,7 @@ impl ProbeOutcome {
 /// で作り、pivot 後の `/seccomp-probe` へ `key=value` 行で書く。親（結合試験 `tests/seccomp.rs`）が
 /// [`SeccompProbeRecord::parse`] で読む。識別的な検査は `kcmp`・`seccomp_mode`、網羅確認は
 /// `mount`・`pivot_root`・`umount2`（capability 不足でも `EPERM` になり得る）。強制終了対象の
-/// `unshare`・`ptrace`・`kexec_load` は戻らないため記録せず、別の子で終了シグナルを確認する。
+/// `unshare`・`ptrace`・`kexec_load` は戻らないため記録せず、別のコンテナのエントリポイントで終了シグナルを確認する。
 #[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -446,8 +446,13 @@ pub enum EscapeSyscallProbe {
 
 /// 結合試験 `tests/escape_suite.rs` の ESC-06 から呼ぶ、禁止 syscall の安全な入口（SEC-2・TASK-42.3・#201）。
 ///
-/// `spawn_container_probe` の子（組み込み Seccomp 段の通過後）で呼ばれる。`unsafe` を `sys` の外へ出さない
-/// ための薄い入口で、引数は副作用のない値に固定している（根拠は各 `sys` プローブの `// SAFETY:`）。
+/// 組み込み Seccomp 段の通過後に呼ばれる。呼び出し元は、exec 後のエントリポイント（`tests/seccomp.rs` の
+/// `/entry --entry kill-<名前>`・`production_launcher` のシナリオ K）と、`spawn_container_probe` の fork 子
+/// （`escape_suite` の ESC-06）。ESC-06 を fork 子のまま残してよい根拠: seccomp フィルタ・`NO_NEW_PRIVS`・Landlock のドメイン・マウントの状態は execve をまたいで変わらないため、
+/// 組み込み `Seccomp` 段を通った後の fork 子で観測した `EPERM` や SIGSYS は、exec 後の PID 1 で観測したものと
+/// 同じフィルタによる。capability は execve で再計算されうるため例外で、exec 後の値は `production_launcher` の
+/// シナリオ J が照合する。
+/// `unsafe` を `sys` の外へ出さないための薄い入口で、引数は副作用のない値に固定している（根拠は各 `sys` プローブの `// SAFETY:`）。
 ///
 /// # 将来仕様（REPAIR-3）
 ///
@@ -485,9 +490,15 @@ pub fn probe_escape_syscall(which: EscapeSyscallProbe) -> ProbeOutcome {
 /// `SeccompNotifyHub` をコンテナ経由で通す照合。SEC-4・#2482）。`escape-probe` または `exec-test-support` の
 /// feature はテスト専用で、通常ビルドには含まれない（dev-dependency の自己参照でのみ有効化）。
 ///
-/// # 将来仕様（記録のみ）
+/// # 残す理由（#2543・REPAIR-3）
 ///
-/// exec が許可されたら（証跡配線後。後続作業）、エントリポイント内のプローブへ置き換えて本関数を廃止する（REPAIR-3）。
+/// 本関数は `unsafe` を書けない試験のための安全な入口で、exec 後のエントリポイント（`production_launcher` の
+/// シナリオ J・`supervisor_bin_real` のシナリオ E）がすでに呼んでいるため、廃止しない。fork 子から呼ぶのは
+/// ESC-03 だけで、`spawn_container_probe_with_seccomp_listener`（USER_NOTIF の listener の受け渡し）に結びついて
+/// いる。ここをエントリポイント内へ移さない根拠: seccomp フィルタ・`NO_NEW_PRIVS`・Landlock のドメイン・マウントの状態は execve をまたいで変わらないため、
+/// 組み込み `Seccomp` 段を通った後の fork 子で観測した `EPERM` や SIGSYS は、exec 後の PID 1 で観測したものと
+/// 同じフィルタによる。capability は execve で再計算されうるため例外で、exec 後の値は `production_launcher` の
+/// シナリオ J が照合する。ESC-03 の移行は未着手。
 #[cfg(any(feature = "escape-probe", feature = "exec-test-support"))]
 #[doc(hidden)]
 pub fn escape_probe_mount() -> Result<ProbeOutcome, ExecError> {
@@ -528,9 +539,10 @@ fn probe_context_is_isolated() -> bool {
 /// になり、コンテナ内の `EPERM` を組み込みフィルタの成果と見なせないため、試験側が前提欠如として失敗させる。
 /// `kcmp` は比較のみで副作用が無いため、PID・seccomp の前提検査は付けない。
 ///
-/// # 将来仕様（記録のみ）
+/// # 残す理由（#2543・REPAIR-3）
 ///
-/// エントリポイント内のプローブへ置き換えて本関数を廃止する（REPAIR-3）。
+/// 組み込み段を載せる**前**の親での対照であり、フィルタの無い状態での観測が役割のため、エントリポイント内へは
+/// 移せない。コンテナ内の `kcmp` は [`probe_denied_syscalls_for_test`] が担う。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub fn probe_kcmp_self_for_test() -> ProbeOutcome {

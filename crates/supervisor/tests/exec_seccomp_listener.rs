@@ -9,6 +9,11 @@
 //! 前提: 呼び出しプロセスの外側の filter が listener を既に持たないこと（持つ環境では `EBUSY` になる）。満たさない
 //! 環境は skip せず失敗させる（`AGENTS.md`「実機前提でない試験」の注意）。
 //!
+//! #2544 の応答者の試験: filter は `USER_NOTIF` で載り、親が通知に同期で応答する。worker が拒否される syscall（`kcmp`）を
+//! 発行し、(1) 実際の記録先（`FileAuditSink` の `@audit.log`）に 1 拒否 1 行が届き `EPERM` が返ること、(2) 複数回でも 1 拒否 1 件、
+//! (3) 詰まった記録先でも応答期限で `EPERM` が返ること（REPAIR-5）、(4) 応答者がいないとき `ENOSYS` で閉じ許可に倒れないこと
+//! を具体値で照合する。
+//!
 //! fork は単一スレッドの呼び出し元を要求するため、libtest ではなく `harness = false` の単一スレッド `main` で動かす。
 
 #[cfg(not(target_os = "linux"))]
@@ -24,13 +29,25 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use std::cell::Cell;
+    use std::io::BufRead as _;
+    use std::io::Write as _;
+    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use fandhe_container_core::traits::{ErrorCode, TraitError};
+    use fandhe_container_core::audit_log::{AuditRecord, AuditSink};
+    use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
     use fandhe_container_supervisor::exec::{
-        ExecListenerHandover, apply_seccomp_listener_for_test, hand_over_non_listener_for_test,
-        run_in_worker_with_listener_for_test,
+        ExecListenerHandover, ExecResponderState, UserNotifTestMode,
+        apply_seccomp_listener_for_test, default_audit_sink, hand_over_non_listener_for_test,
+        run_in_worker_with_listener_for_test, run_in_worker_with_user_notif_for_test,
     };
+    use fandhe_container_supervisor::seccomp_notify::NotifyConfig;
+
+    /// `kcmp` の syscall 番号（拒否される ERRNO 側の syscall。アーキ別）。
+    #[cfg(target_arch = "x86_64")]
+    const KCMP_NR: u32 = 312;
+    #[cfg(target_arch = "aarch64")]
+    const KCMP_NR: u32 = 272;
 
     pub fn run() {
         real_listener_is_handed_over_and_verified();
@@ -38,6 +55,10 @@ mod linux {
         worker_failure_before_seccomp_is_returned_as_is();
         worker_success_without_handover_is_rejected();
         silent_worker_times_out_and_is_reaped();
+        denial_reaches_the_audit_file_once_and_is_denied();
+        each_denial_is_one_record();
+        stuck_sink_is_answered_at_the_response_deadline();
+        missing_responder_fails_closed();
         println!("exec_seccomp_listener: all scenarios passed");
     }
 
@@ -161,5 +182,204 @@ mod linux {
         );
         assert!(started.elapsed() < Duration::from_secs(8));
         assert_eq!(cleanups.get(), 1);
+    }
+
+    /// worker が `kcmp` を `times` 回発行した結果を親へ返す口。1 行 `pid errno_1,errno_2,... elapsed_ms_max`。
+    fn probe_in_worker(
+        sender: fandhe_container_core::exec::ExecListenerSender,
+        writer: &std::io::PipeWriter,
+        times: usize,
+    ) -> Result<(), TraitError> {
+        apply_seccomp_listener_for_test(sender)?;
+        let mut errnos = Vec::new();
+        let mut max_ms = 0u128;
+        for _ in 0..times {
+            let started = Instant::now();
+            let errno = fandhe_container_core::exec::kcmp_self_errno_for_test().unwrap_or(0);
+            max_ms = max_ms.max(started.elapsed().as_millis());
+            errnos.push(errno.to_string());
+        }
+        let line = format!("{} {} {}\n", std::process::id(), errnos.join(","), max_ms);
+        let mut w = writer;
+        w.write_all(line.as_bytes())
+            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to report the probe result"))
+    }
+
+    /// 親が受けた `probe_in_worker` の報告: `(worker の pid, errno の列, 最大の所要 ms)`。
+    fn read_probe(reader: std::io::PipeReader) -> (u32, Vec<i32>, u128) {
+        let mut line = String::new();
+        std::io::BufReader::new(reader)
+            .read_line(&mut line)
+            .expect("read the probe line");
+        let mut it = line.split_whitespace();
+        let pid = it.next().expect("pid").parse().expect("pid number");
+        let errnos = it
+            .next()
+            .expect("errnos")
+            .split(',')
+            .map(|e| e.parse().expect("errno number"))
+            .collect();
+        let ms = it.next().expect("ms").parse().expect("ms number");
+        (pid, errnos, ms)
+    }
+
+    /// 0700 の使い捨てディレクトリ（状態ルート。`FileAuditSink` の親ディレクトリ検査を満たす）。
+    fn private_dir() -> std::path::PathBuf {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let base = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
+        let dir = base.join(format!(
+            "fandhe-exec-notif-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .expect("create private dir");
+        dir
+    }
+
+    /// 記録を数える記録先。
+    #[derive(Default)]
+    struct CountingSink {
+        records: Mutex<Vec<AuditRecord>>,
+    }
+
+    impl AuditSink for CountingSink {
+        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+            self.records.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+    }
+
+    /// `record_until` が期限まで眠って `Timeout` を返す記録先（詰まった記録先）。
+    struct StuckSink;
+
+    impl AuditSink for StuckSink {
+        fn record(&self, _record: &AuditRecord) -> Result<(), TraitError> {
+            Err(TraitError::new(ErrorCode::Internal, "unexpected record"))
+        }
+        fn record_until(&self, _record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            Err(TraitError::new(ErrorCode::Timeout, "stuck"))
+        }
+    }
+
+    /// 実際の記録先（`FileAuditSink` → `@audit.log`）に、exec で拒否された syscall が 1 拒否 1 行で届き、コマンド側は
+    /// `EPERM` を受ける。集計は `recorded` が 1 で、応答者は `Served`（SEC-4・SUP-6・#2544）。
+    fn denial_reaches_the_audit_file_once_and_is_denied() {
+        let dir = private_dir();
+        let result = std::panic::catch_unwind(|| {
+            let sink = default_audit_sink(Some(dir.clone())).expect("production audit sink");
+            let id = ContainerId::new("web-1").unwrap();
+            let (reader, writer) = std::io::pipe().unwrap();
+            let outcome = run_in_worker_with_user_notif_for_test(
+                Duration::from_secs(30),
+                Duration::from_secs(10),
+                || Ok(()),
+                &sink,
+                Some(&id),
+                NotifyConfig::default(),
+                UserNotifTestMode::Respond,
+                |sender| probe_in_worker(sender, &writer, 1),
+            )
+            .unwrap_or_else(|e| panic!("{:?} {}", e.code(), e.message()));
+            let (worker_pid, errnos, _) = read_probe(reader);
+            assert_eq!(errnos, vec![1], "EPERM");
+            assert_eq!(outcome.seccomp_audit.responder, ExecResponderState::Served);
+            assert_eq!(outcome.seccomp_audit.counts.recorded, 1);
+            assert_eq!(outcome.seccomp_audit.counts.unrecorded, 0);
+            let text = std::fs::read_to_string(dir.join("@audit.log")).expect("read audit file");
+            assert_eq!(text.lines().count(), 1, "{text}");
+            let line = text.lines().next().expect("one line");
+            assert!(line.contains("\"layer\":\"seccomp\""), "{line}");
+            assert!(line.contains(&format!("\"pid\":{worker_pid},")), "{line}");
+            assert!(line.contains(&format!("\"syscall\":{KCMP_NR},")), "{line}");
+            assert!(line.ends_with("\"container_id\":\"web-1\"}"), "{line}");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// 同じ syscall を 3 回拒否されると、記録はちょうど 3 件（1 拒否 1 件）で、3 回とも `EPERM`。
+    fn each_denial_is_one_record() {
+        let sink = CountingSink::default();
+        let id = ContainerId::new("web-1").unwrap();
+        let (reader, writer) = std::io::pipe().unwrap();
+        let outcome = run_in_worker_with_user_notif_for_test(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            || Ok(()),
+            &sink,
+            Some(&id),
+            NotifyConfig::default(),
+            UserNotifTestMode::Respond,
+            |sender| probe_in_worker(sender, &writer, 3),
+        )
+        .unwrap_or_else(|e| panic!("{:?} {}", e.code(), e.message()));
+        let (worker_pid, errnos, _) = read_probe(reader);
+        assert_eq!(errnos, vec![1, 1, 1]);
+        assert_eq!(outcome.seccomp_audit.counts.recorded, 3);
+        let recs = sink.records.lock().unwrap();
+        assert_eq!(recs.len(), 3);
+        for r in recs.iter() {
+            assert_eq!(r.pid().get(), worker_pid);
+            assert_eq!(r.syscall().map(|s| s.get()), Some(KCMP_NR));
+            assert_eq!(r.container_id().map(ContainerId::as_str), Some("web-1"));
+        }
+    }
+
+    /// 詰まった記録先でも、応答期限（100ms）で `EPERM` が返り、コマンドは期限どおりに進む（REPAIR-5）。
+    /// 記録は打ち切られて `unrecorded` が 1。
+    fn stuck_sink_is_answered_at_the_response_deadline() {
+        let config = NotifyConfig::default()
+            .with_response_deadline(Duration::from_millis(100))
+            .unwrap();
+        let (reader, writer) = std::io::pipe().unwrap();
+        let outcome = run_in_worker_with_user_notif_for_test(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            || Ok(()),
+            &StuckSink,
+            None,
+            config,
+            UserNotifTestMode::Respond,
+            |sender| probe_in_worker(sender, &writer, 1),
+        )
+        .unwrap_or_else(|e| panic!("{:?} {}", e.code(), e.message()));
+        let (_, errnos, ms) = read_probe(reader);
+        assert_eq!(errnos, vec![1], "EPERM");
+        assert!(ms < 2000, "the denial took {ms} ms");
+        assert_eq!(outcome.seccomp_audit.responder, ExecResponderState::Served);
+        assert_eq!(outcome.seccomp_audit.counts.unrecorded, 1);
+        assert_eq!(outcome.seccomp_audit.counts.recorded, 0);
+    }
+
+    /// 応答者がいない（ACK の直後に listener を閉じる）とき、拒否された syscall は `ENOSYS`（38）で戻る。許可（成功）にも
+    /// 停止にも倒れない（fail-closed）。応答者の状態は `Lost` で表に出る。
+    fn missing_responder_fails_closed() {
+        let sink = CountingSink::default();
+        let (reader, writer) = std::io::pipe().unwrap();
+        let started = Instant::now();
+        let outcome = run_in_worker_with_user_notif_for_test(
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            || Ok(()),
+            &sink,
+            None,
+            NotifyConfig::default(),
+            UserNotifTestMode::AckThenDrop,
+            |sender| probe_in_worker(sender, &writer, 1),
+        )
+        .unwrap_or_else(|e| panic!("{:?} {}", e.code(), e.message()));
+        let (_, errnos, _) = read_probe(reader);
+        assert_eq!(errnos, vec![38], "ENOSYS");
+        assert_eq!(outcome.seccomp_audit.responder, ExecResponderState::Lost);
+        assert!(sink.records.lock().unwrap().is_empty());
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 }

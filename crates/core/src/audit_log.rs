@@ -99,6 +99,7 @@ pub use mount::{
 };
 pub use seccomp_hook::{
     SeccompDenialReport, SeccompReportSource, record_seccomp_denial, record_seccomp_denial_for,
+    record_seccomp_denial_for_until,
 };
 pub use sink::AuditSink;
 

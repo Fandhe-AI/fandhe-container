@@ -180,52 +180,109 @@ fn push_head(frame: &mut Vec<u8>, tag: u8, record: &AuditRecord) -> Result<(), T
     Ok(())
 }
 
-/// 理由なしの `Mount` を枠へ符号化する（#2481）。パスは生バイトのまま運び、保持長は
-/// [`AUDIT_PATH_MAX_BYTES`] 以下（`AuditPath` の不変条件）なので `u16` に収まる。
-fn encode_mount(record: &AuditRecord, path: Option<&AuditPath>) -> Result<Vec<u8>, TraitError> {
-    let (bytes, original_len) = match path {
-        Some(p) => (p.as_path().as_os_str().as_bytes(), p.original_len()),
-        None => (&[][..], 0),
-    };
-    let too_long = || err(ErrorCode::InvalidArgument, "the audit path is too long");
-    if bytes.len() > AUDIT_PATH_MAX_BYTES {
-        return Err(too_long());
+/// mount（理由なし。#2481）の枠の固定長の追加部（present 1・path_len 2・original_len 8）。
+/// 符号化・復号・`serve` の本体読み取り量の決定をこの型へ集約し、生のバイト列を手で組まない（REPAIR-2）。
+/// 値は [`MountHeader::parse`] / [`MountHeader::for_path`] を通ったものだけが持つ（保持長 ≤ 上限、
+/// 存在フラグと長さ・元の長さの整合を満たす）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MountHeader {
+    present: bool,
+    path_len: u16,
+    original_len: u64,
+}
+
+impl MountHeader {
+    /// パス（無ければ `None`）から追加部とパス本体のバイト列を作る。保持長は [`AUDIT_PATH_MAX_BYTES`] 以下
+    /// （`AuditPath` の不変条件）なので `u16` に収まる。
+    fn for_path(path: Option<&AuditPath>) -> Result<(Self, &[u8]), TraitError> {
+        let (bytes, original_len) = match path {
+            Some(p) => (p.as_path().as_os_str().as_bytes(), p.original_len()),
+            None => (&[][..], 0),
+        };
+        let too_long = || err(ErrorCode::InvalidArgument, "the audit path is too long");
+        if bytes.len() > AUDIT_PATH_MAX_BYTES {
+            return Err(too_long());
+        }
+        let header = Self {
+            present: path.is_some(),
+            path_len: u16::try_from(bytes.len()).map_err(|_| too_long())?,
+            original_len: u64::try_from(original_len).map_err(|_| too_long())?,
+        };
+        Ok((header, bytes))
     }
-    let path_len = u16::try_from(bytes.len()).map_err(|_| too_long())?;
-    let original = u64::try_from(original_len).map_err(|_| too_long())?;
+
+    /// 追加部を固定長のバイト列へ符号化する。
+    fn to_bytes(self) -> [u8; MOUNT_EXTRA_LEN] {
+        let mut out = [0u8; MOUNT_EXTRA_LEN];
+        out[0] = u8::from(self.present);
+        out[1..3].copy_from_slice(&self.path_len.to_be_bytes());
+        out[3..].copy_from_slice(&self.original_len.to_be_bytes());
+        out
+    }
+
+    /// 追加部を復号する。長さが `MOUNT_EXTRA_LEN` でない・存在フラグ不正・上限超過・
+    /// 切り詰めの有無と `original_len` の矛盾は `None`。
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; MOUNT_EXTRA_LEN] = bytes.try_into().ok()?;
+        let present = match bytes[0] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let path_len = u16::from_be_bytes([bytes[1], bytes[2]]);
+        let original_len = u64::from_be_bytes(bytes[3..].try_into().ok()?);
+        let kept = usize::from(path_len);
+        if kept > AUDIT_PATH_MAX_BYTES {
+            return None;
+        }
+        let original = usize::try_from(original_len).ok()?;
+        let consistent = if present {
+            original >= kept && (original > AUDIT_PATH_MAX_BYTES || original == kept)
+        } else {
+            kept == 0 && original == 0
+        };
+        consistent.then_some(Self {
+            present,
+            path_len,
+            original_len,
+        })
+    }
+
+    /// 追加部の後ろに続くパス本体の長さ（`serve` の読み取り量。検証済みで上限以下）。
+    fn body_len(self) -> usize {
+        usize::from(self.path_len)
+    }
+
+    /// パス本体から `AuditPath` を組み直す。本体の長さが `body_len` と一致しなければ `None`。
+    fn into_path(self, body: &[u8]) -> Option<Option<AuditPath>> {
+        if body.len() != self.body_len() {
+            return None;
+        }
+        if !self.present {
+            return Some(None);
+        }
+        Some(Some(AuditPath {
+            path: PathBuf::from(OsStr::from_bytes(body)),
+            original_len: usize::try_from(self.original_len).ok()?,
+        }))
+    }
+}
+
+/// 理由なしの `Mount` を枠へ符号化する（#2481）。パスは生バイトのまま運ぶ。
+fn encode_mount(record: &AuditRecord, path: Option<&AuditPath>) -> Result<Vec<u8>, TraitError> {
+    let (header, bytes) = MountHeader::for_path(path)?;
     let mut frame = Vec::with_capacity(FIXED_LEN + MOUNT_EXTRA_LEN + bytes.len());
     push_head(&mut frame, TAG_MOUNT, record)?;
-    frame.push(u8::from(path.is_some()));
-    frame.extend_from_slice(&path_len.to_be_bytes());
-    frame.extend_from_slice(&original.to_be_bytes());
+    frame.extend_from_slice(&header.to_bytes());
     frame.extend_from_slice(bytes);
     Ok(frame)
 }
 
-/// `rest`（ID の後ろ）から mount の記録の ID と事象を組み直す。`AuditPath` の不変条件
-/// （保持長 ≤ 上限・切り詰めの有無と `original_len` の整合）を満たさない枠は `None`。
+/// `rest`（ID の後ろ）から mount の記録の ID と事象を組み直す。壊れた枠は `None`。
 fn decode_mount(rest: &[u8], id_len: usize) -> Option<(&[u8], AuditEvent)> {
     let (id, after) = rest.split_at_checked(id_len)?;
-    let present = *after.first()?;
-    let path_len = usize::from(u16::from_be_bytes(after.get(1..3)?.try_into().ok()?));
-    let original_len =
-        usize::try_from(u64::from_be_bytes(after.get(3..11)?.try_into().ok()?)).ok()?;
-    let body = after.get(MOUNT_EXTRA_LEN..)?;
-    if body.len() != path_len || path_len > AUDIT_PATH_MAX_BYTES {
-        return None;
-    }
-    let path = match present {
-        0 if path_len == 0 && original_len == 0 => None,
-        1 if original_len >= path_len
-            && (original_len > AUDIT_PATH_MAX_BYTES || original_len == path_len) =>
-        {
-            Some(AuditPath {
-                path: PathBuf::from(OsStr::from_bytes(body)),
-                original_len,
-            })
-        }
-        _ => return None,
-    };
+    let header = MountHeader::parse(after.get(..MOUNT_EXTRA_LEN)?)?;
+    let path = header.into_path(after.get(MOUNT_EXTRA_LEN..)?)?;
     Some((id, AuditEvent::Mount { path, reason: None }))
 }
 
@@ -298,21 +355,13 @@ fn serve(mut stream: UnixStream, sink: &FileAuditSink) -> i32 {
             return 1;
         }
         if head.first() == Some(&TAG_MOUNT) {
-            // 可変長のパス本体。長さは確保の前に上限で検証する（壊れた枠はストリームを読み進められないので
+            // 可変長のパス本体。長さは型で検証してから確保する（壊れた枠はストリームを読み進められないので
             // helper を終え、親は応答待ちの期限で Unavailable になる。fail-closed。DoS 対策）。
-            let at = FIXED_LEN + id_len + 1;
-            let len_bytes = frame
-                .get(at..at + 2)
-                .and_then(|b| <[u8; 2]>::try_from(b).ok());
-            let Some(len_bytes) = len_bytes else {
+            let Some(header) = frame.get(FIXED_LEN + id_len..).and_then(MountHeader::parse) else {
                 return 1;
             };
-            let path_len = usize::from(u16::from_be_bytes(len_bytes));
-            if path_len > AUDIT_PATH_MAX_BYTES {
-                return 1;
-            }
             let start = frame.len();
-            frame.resize(start + path_len, 0);
+            frame.resize(start + header.body_len(), 0);
             if let Some(body) = frame.get_mut(start..)
                 && stream.read_exact(body).is_err()
             {
@@ -715,6 +764,28 @@ mod tests {
             Some(id) => r.with_container_id(ContainerId::new(id).unwrap()),
             None => r,
         }
+    }
+
+    /// REPAIR-2・#2481: `MountHeader` は固定長で往復し、長さ違い・存在フラグ不正・上限超過・矛盾は拒否する。
+    #[test]
+    fn repair2_2481_mount_header_is_fixed_length_and_validated() {
+        let abc = AuditPath::new("/abc");
+        let (h, body) = MountHeader::for_path(Some(&abc)).unwrap();
+        assert_eq!(body, b"/abc");
+        let bytes = h.to_bytes();
+        assert_eq!(bytes.len(), MOUNT_EXTRA_LEN);
+        assert_eq!(MountHeader::parse(&bytes), Some(h));
+        assert_eq!(h.body_len(), 4);
+        assert!(MountHeader::parse(&bytes[..MOUNT_EXTRA_LEN - 1]).is_none());
+        let mut bad = bytes;
+        bad[0] = 2;
+        assert!(MountHeader::parse(&bad).is_none());
+        let mut over = bytes;
+        over[1..3].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(MountHeader::parse(&over).is_none());
+        assert!(h.into_path(b"/ab").is_none());
+        let (none, _) = MountHeader::for_path(None).unwrap();
+        assert_eq!(none.into_path(b""), Some(None));
     }
 
     /// SEC-4・#2481: mount（理由なし）の枠はパスのバイト列・切り詰め・元の長さ・ID が往復で一致する。

@@ -37,6 +37,9 @@
 mod anchored;
 pub mod extract;
 pub mod idmap;
+mod rootfs_read;
+
+pub use rootfs_read::read_rootfs_file;
 
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};

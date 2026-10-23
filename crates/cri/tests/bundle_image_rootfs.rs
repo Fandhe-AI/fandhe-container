@@ -123,6 +123,30 @@ fn tar_entry(name: &str, mode: u32, data: &[u8], dir: bool) -> Vec<u8> {
     out
 }
 
+/// symlink エントリ（typeflag `2`）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn tar_symlink(name: &str, target: &str) -> Vec<u8> {
+    let mut e = tar_entry(name, 0o777, b"", false);
+    e[156] = b'2';
+    e[157..157 + target.len()].copy_from_slice(target.as_bytes());
+    let sum: u32 = e[..512]
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            if (148..156).contains(&i) {
+                32
+            } else {
+                u32::from(*b)
+            }
+        })
+        .sum();
+    e[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    e
+}
+
 fn tar_of(entries: &[Vec<u8>]) -> Vec<u8> {
     let mut out: Vec<u8> = entries.concat();
     out.extend_from_slice(&[0u8; 1024]);
@@ -279,8 +303,12 @@ impl Env {
 
 /// `config_section` を `config` 節に持つ 2 層イメージを pull してキャッシュを作る。
 fn pulled_env(tag: &str, config_section: &str) -> Env {
+    pulled_env_with_layers(tag, config_section, layer1(), layer2())
+}
+
+/// 下位層・上位層の tar を指定して pull する（名前つき User の解決用に passwd 等を持つ層を渡す）。
+fn pulled_env_with_layers(tag: &str, config_section: &str, l1: Vec<u8>, l2: Vec<u8>) -> Env {
     let tmp = TempDir::new(tag);
-    let (l1, l2) = (layer1(), layer2());
     let (h1, h2) = (sha256_hex(&l1), sha256_hex(&l2));
     let config = format!(
         r#"{{"architecture":"amd64","os":"linux",{config_section}"rootfs":{{"type":"layers","diff_ids":["sha256:{h1}","sha256:{h2}"]}}}}"#
@@ -761,4 +789,81 @@ fn cri2_image_without_config_section_needs_a_command() {
     let mut c = container(&env.image_id);
     c.command = vec!["/bin/app".into()];
     prepare(&p, "c2", &c).expect("command given");
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn run_as_user_container(image: &str, uid: i64) -> ContainerConfig {
+    let mut c = container(image);
+    c.linux = Some(LinuxContainerConfig {
+        security_context: Some(LinuxContainerSecurityContext {
+            run_as_user: Some(Int64Value { value: uid }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    c
+}
+
+/// CRI-2・SEC-5: 名前つき User（`app:staff`）が rootfs の passwd / group で `1000:50` に解決される。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn cri2_named_image_user_is_resolved_from_rootfs_passwd_and_group() {
+    let l1 = tar_of(&[
+        tar_entry("etc/", 0o755, b"", true),
+        tar_entry(
+            "etc/passwd",
+            0o644,
+            b"root:x:0:0:r:/root:/bin/sh\napp:x:1000:1001::/h:/bin/sh\n",
+            false,
+        ),
+        tar_entry("etc/group", 0o644, b"staff:x:50:app\n", false),
+        tar_entry("bin/", 0o755, b"", true),
+        tar_entry("bin/app", 0o755, b"app", false),
+    ]);
+    let env = pulled_env_with_layers(
+        "named-user",
+        r#""config":{"Entrypoint":["/bin/app"],"User":"app:staff"},"#,
+        l1,
+        layer2(),
+    );
+    let p = env.provider();
+    let dir = prepare(&p, "c1", &container(&env.image_id)).expect("resolved");
+    let parsed = oci_runtime::load_config(&dir.join("config.json")).unwrap();
+    let u = parsed.process().unwrap().user();
+    assert_eq!((u.uid(), u.gid()), (1000, 50));
+}
+
+/// SEC-1・SEC-5: `etc` がホスト側を指す symlink のイメージは passwd を読まず未解決になる。
+/// run_as_user が無ければ UNIMPLEMENTED、あれば `(33, 0)` で成功する。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn sec1_symlinked_etc_in_image_is_not_read() {
+    let l1 = tar_of(&[
+        tar_symlink("etc", "/etc"),
+        tar_entry("bin/", 0o755, b"", true),
+        tar_entry("bin/app", 0o755, b"app", false),
+    ]);
+    let env = pulled_env_with_layers(
+        "symlink-etc",
+        r#""config":{"Entrypoint":["/bin/app"],"User":"root"},"#,
+        l1,
+        layer2(),
+    );
+    let p = env.provider();
+    let e = prepare(&p, "c1", &container(&env.image_id)).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+    assert_eq!(bundle_count(&env), 0);
+    let dir = prepare(&p, "c2", &run_as_user_container(&env.image_id, 33)).expect("run_as_user");
+    let parsed = oci_runtime::load_config(&dir.join("config.json")).unwrap();
+    let u = parsed.process().unwrap().user();
+    assert_eq!((u.uid(), u.gid()), (33, 0));
 }

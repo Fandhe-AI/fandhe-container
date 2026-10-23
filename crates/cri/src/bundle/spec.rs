@@ -16,15 +16,19 @@
 //! - namespace の共有（POD の pid / ipc を pod 内で共有する）は未実装で、`POD` もコンテナごとの新しい
 //!   namespace にする（共有の欠落であり、要求より分離が弱くなる方向ではない）。
 //! - network namespace: `POD` / `CONTAINER` は `{"type":"network"}` を出す。core の start は network namespace を
-//!   まだ受けず `Unimplemented` で拒否する（NetworkPlugin の結線〔NET 系・#459 系〕まで）。`NODE`（host）は
+//!   まだ受けず `Unimplemented` で拒否する（NetworkPlugin の結線〔NET 系。`docs/design/cri-config-acceptance.md` の順 13〕まで）。`NODE`（host）は
 //!   network namespace を出さない（ホストの netns で動く。利用者が明示した場合だけ）。crictl 疎通確認
 //!   （#442）の pod.json は当面 `namespace_options.network = NODE` を要する。
 //! - user namespace: `userns_options.mode` が `NODE` でも新しい user namespace にする（分離を強める方向。
 //!   uid の写像は core の launcher が権限モデルから導く。SEC-5）。`uids` / `gids` の指定は未実装（#2240）。
 //! - イメージ config（Entrypoint・Cmd・Env・WorkingDir・User）の解析は [`super::ImageRootfsSource`]（#2433）が行い、
-//!   ここでは [`ImageDefaults`] で受ける。イメージの User が名前・uid のみ（`/etc/passwd` の解決が要る形）のときは
-//!   [`ImageDefaults::user_unresolved`] で受け、CRI の `run_as_user` が無ければ `UNIMPLEMENTED` で拒否する
-//!   （root へ黙ってフォールバックしない。rootfs 内の passwd を読むとリンク経由でホストの内容を読む経路ができるため未実装）。
+//!   ここでは [`ImageDefaults`] で受ける。イメージの User が名前・uid のみ（`/etc/passwd` の解決が要る形）のときは、
+//!   `ImageRootfsSource` が展開後の rootfs の passwd / group を fd 起点で読んで解決する（#2606）。解決できなかった
+//!   ときは [`ImageDefaults::user_unresolved`] で受け、CRI の `run_as_user` が無ければ `UNIMPLEMENTED` で拒否する
+//!   （root へ黙ってフォールバックしない）。
+//! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（log_path・dns_config・port_mappings・cgroup_parent・sysctls・
+//!   devices・stop_signal・capabilities・supplemental_groups・run_as_username・propagation 等）の受け入れ順序と担当は
+//!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 
 use std::collections::HashMap;
 
@@ -77,9 +81,9 @@ pub struct ImageDefaults {
     pub env: Vec<String>,
     /// イメージの WorkingDir。
     pub working_dir: Option<String>,
-    /// イメージの User（uid, gid）。数値の `uid:gid` だけが入る。
+    /// イメージの User（uid, gid）。数値の `uid:gid`、または `ImageRootfsSource` が rootfs の passwd / group で解決した値。
     pub user: Option<(u32, u32)>,
-    /// イメージの User が名前または uid のみで、数値の `uid:gid` に解決していない（解決は未実装。#2433）。
+    /// イメージの User が名前または uid のみで、解決できていない（passwd / group に無い・読めない等。#2433・#2606）。
     /// 真で CRI の `run_as_user` が無いときは `UNIMPLEMENTED` で拒否する。
     pub user_unresolved: bool,
 }

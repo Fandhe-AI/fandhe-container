@@ -36,6 +36,8 @@ pub(crate) const O_EXCL: u64 = 0o200;
 /// `O_CLOEXEC` と `O_PATH` は asm-generic の値で、arm64 も上書きしない。
 pub(crate) const O_CLOEXEC: u64 = 0o2_000_000;
 pub(crate) const O_PATH: u64 = 0o10_000_000;
+/// `O_NONBLOCK` も asm-generic の値（FIFO の読み取り open をブロックさせない。#2606）。
+pub(crate) const O_NONBLOCK: u64 = 0o4000;
 /// `O_DIRECTORY` / `O_NOFOLLOW` は x86_64 と arm64 で値が違う（`arch/arm64/include/uapi/asm/fcntl.h`）。
 #[cfg(target_arch = "x86_64")]
 pub(crate) const O_DIRECTORY: u64 = 0o200_000;
@@ -348,6 +350,7 @@ mod libc_abi {
         assert!(O_EXCL == widen(libc::O_EXCL));
         assert!(O_CLOEXEC == widen(libc::O_CLOEXEC));
         assert!(O_PATH == widen(libc::O_PATH));
+        assert!(O_NONBLOCK == widen(libc::O_NONBLOCK));
         assert!(O_DIRECTORY == widen(libc::O_DIRECTORY));
         assert!(O_NOFOLLOW == widen(libc::O_NOFOLLOW));
 

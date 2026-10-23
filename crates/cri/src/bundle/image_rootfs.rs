@@ -35,9 +35,12 @@
 //! - **タグ・digest 参照の解決**: plugin-cri は `ImageService` をサーブしておらず、プロセス内でタグを解決できない。
 //!   [`ImageRootfsSource::with_image_store`] で `ImageStore` を注入したときだけタグを解決し、無ければ
 //!   `sha256:<64 桁小文字 hex>` の image ID だけを受ける（それ以外は `UNIMPLEMENTED`。注入済みで未知の参照は `NOT_FOUND`）
-//! - **イメージの User**: 数値の `uid:gid` だけを解決する。名前と uid のみは rootfs 内の `/etc/passwd`・`/etc/group` を
-//!   読む必要があり、リンク経由でホストの内容を読む経路ができるため未実装で、[`ImageDefaults::user_unresolved`] で
-//!   `build_runtime_config` に拒否させる（root へ黙ってフォールバックしない）
+//! - **イメージの User**: 数値の `uid:gid` は rootfs を読まずに解決する。名前・uid のみ・名前つきの組は、展開後の
+//!   rootfs の `/etc/passwd`・`/etc/group` を [`fandhe_container_oci::layer::read_rootfs_file`]（fd 起点・symlink を
+//!   辿らない・1 MiB 上限）で読んで解決する（#2606・SEC-1・SEC-5。解決表は `docs/design/cri-config-acceptance.md`）。
+//!   読めない・見つからない場合は [`ImageDefaults::user_unresolved`] のまま返し、`build_runtime_config` に拒否させる
+//!   （root へ黙ってフォールバックしない）。`/etc/group` の所属から補助グループは作らない（core が
+//!   `additionalGids` を未受理のため。権限は弱い側に倒れる）
 //! - **展開設定**: 所有者・特殊ビットの本番の値（`ChownMapped` 等）の決定は #2534 の担当。既定は pull と同じ
 //!   `Keep` + `Strip`。pull と create の設定は [`ImageExtractConfig`] で 1 か所にまとめる
 //! - 展開中の処理は打ち切れない。期限は展開の前後で確認する（REPAIR-5。pull と同じ制約）
@@ -57,7 +60,7 @@ use fandhe_container_oci::layer::extract::{
     ExtractLimits, ExtractOptions, ImageLayer, extract_image_layers_with_options,
     remove_extracted_tree,
 };
-use fandhe_container_oci::layer::{VerifiedLayerBlob, open_blob_nofollow};
+use fandhe_container_oci::layer::{VerifiedLayerBlob, open_blob_nofollow, read_rootfs_file};
 use fandhe_container_oci::manifest::MAX_LAYERS;
 use fandhe_container_oci::reference::Digest;
 
@@ -78,6 +81,12 @@ pub const DEFAULT_ROOTFS_DEADLINE: Duration = Duration::from_secs(10 * 60);
 const MAX_ANNOTATIONS: usize = 64;
 /// イメージの User の数値 1 項目の最大桁数（`u32` の 10 桁）。
 const MAX_ID_DIGITS: usize = 10;
+/// `/etc/passwd`・`/etc/group` 1 ファイルの読み取り上限（REPAIR-5・SEC-1）。
+const MAX_ETC_FILE_BYTES: u64 = 1 << 20;
+/// 上記ファイルの行数の上限（超過は未解決。切り捨てない）。
+const MAX_ETC_LINES: usize = 65_536;
+/// 名前 1 件の最大バイト数。
+const MAX_NAME_BYTES: usize = 256;
 
 /// 展開に使う設定の束。`PullConfig` の対応する項目と同じ値を渡せる（pull と create で展開設定が食い違うと、
 /// 記録の照合で `FAILED_PRECONDITION` になるため、1 か所から配る。#2534 が両方を配線する）。
@@ -366,6 +375,127 @@ fn parse_user(user: &str) -> Result<(Option<(u32, u32)>, bool), CriError> {
     }
 }
 
+/// User の 1 項目（uid / gid のどちらでも使う）。名前は passwd / group で引く。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdPart {
+    Id(u32),
+    Name(String),
+}
+
+/// 解決が要る User の指定（`user[:group]`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UserLookup {
+    user: IdPart,
+    group: Option<IdPart>,
+}
+
+fn parse_id_part(s: &str) -> Option<IdPart> {
+    if s.is_empty() {
+        return None;
+    }
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        if s.len() > MAX_ID_DIGITS {
+            return None;
+        }
+        return s.parse::<u32>().ok().map(IdPart::Id);
+    }
+    if s.len() > MAX_NAME_BYTES || s.bytes().any(|b| matches!(b, 0 | b':' | b'\n' | b'/')) {
+        return None;
+    }
+    Some(IdPart::Name(s.to_owned()))
+}
+
+/// 形式が不正なら `None`（未解決のまま拒否される）。
+fn parse_user_lookup(user: &str) -> Option<UserLookup> {
+    match user.split_once(':') {
+        None => Some(UserLookup {
+            user: parse_id_part(user)?,
+            group: None,
+        }),
+        Some((u, g)) => Some(UserLookup {
+            user: parse_id_part(u)?,
+            group: Some(parse_id_part(g)?),
+        }),
+    }
+}
+
+/// passwd / group の行を走査する。空行・コメント・NIS（`+` `-`）行・UTF-8 でない行は読み飛ばす。
+fn etc_fields(body: &[u8]) -> impl Iterator<Item = Vec<&str>> {
+    body.split(|b| *b == b'\n')
+        .filter_map(|l| std::str::from_utf8(l).ok())
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| !l.is_empty() && !l.starts_with(['#', '+', '-']))
+        .map(|l| l.split(':').collect::<Vec<_>>())
+}
+
+/// passwd から `(uid, gid)` を引く（`by_name` か uid）。形式が崩れた行は読み飛ばし、最初の一致を採る。
+fn passwd_entry(body: &[u8], key: &IdPart) -> Option<(u32, u32)> {
+    etc_fields(body).find_map(|f| {
+        let (name, uid, gid) = (
+            f.first()?,
+            f.get(2)?.parse::<u32>().ok()?,
+            f.get(3)?.parse::<u32>().ok()?,
+        );
+        match key {
+            IdPart::Name(n) if n == name => Some((uid, gid)),
+            IdPart::Id(u) if *u == uid => Some((uid, gid)),
+            _ => None,
+        }
+    })
+}
+
+/// group から gid を名前で引く。
+fn group_gid(body: &[u8], name: &str) -> Option<u32> {
+    etc_fields(body).find_map(|f| {
+        if *f.first()? == name {
+            f.get(2)?.parse::<u32>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+/// rootfs の `etc/<file>` を fd 起点で読む。`Ok(None)` は不在、`Err` は読めない（呼び出し側が未解決にする）。
+fn read_etc(rootfs: &Path, file: &str) -> Result<Option<Vec<u8>>, ()> {
+    let body = read_rootfs_file(rootfs, &["etc", file], MAX_ETC_FILE_BYTES).map_err(|_| ())?;
+    // 行数上限を超える本文は切り捨てず未解決にする（後続行の取りこぼしで gid が 0 に落ちるのを防ぐ）。
+    if let Some(b) = &body
+        && b.split(|c| *c == b'\n').count() > MAX_ETC_LINES
+    {
+        return Err(());
+    }
+    Ok(body)
+}
+
+/// 名前・uid のみの User を `(uid, gid)` へ解決する。解決できなければ `None`（未解決）。
+///
+/// uid のみで passwd に行が無い（または passwd が無い）ときは gid 0（runc / containerd と同じ。uid は root にしない）。
+/// passwd / group が読めない（symlink・FIFO・上限超過等）ときは gid 0 へ落とさず未解決にする。
+fn resolve_user(rootfs: &Path, lookup: &UserLookup) -> Option<(u32, u32)> {
+    let passwd = match &lookup.user {
+        IdPart::Id(_) if matches!(lookup.group, Some(IdPart::Id(_))) => None,
+        _ => Some(read_etc(rootfs, "passwd").ok()?),
+    };
+    let found = passwd
+        .as_ref()
+        .and_then(|b| b.as_deref())
+        .and_then(|b| passwd_entry(b, &lookup.user));
+    let uid = match (&lookup.user, found) {
+        (_, Some((uid, _))) => uid,
+        (IdPart::Id(u), None) => *u,
+        (IdPart::Name(_), None) => return None,
+    };
+    let gid = match &lookup.group {
+        Some(IdPart::Id(g)) => *g,
+        Some(IdPart::Name(n)) => {
+            let body = read_etc(rootfs, "group").ok()??;
+            group_gid(&body, n)?
+        }
+        None => found.map_or(0, |(_, g)| g),
+    };
+    Some((uid, gid))
+}
+
 impl RootfsSource for ImageRootfsSource {
     fn prepare(&self, image: &ImageSpec, rootfs: &Path) -> Result<ImageDefaults, CriError> {
         let started = Instant::now();
@@ -384,7 +514,7 @@ impl RootfsSource for ImageRootfsSource {
         let settings = record_settings(&id, opts)?;
         let layers = read_layers(&entry.join(RECORD_FILE), &settings, entries.owner)?;
         let (diff_ids, process) = read_config(&blobs.path, blobs.owner, &id)?;
-        let defaults = defaults_from(&process)?;
+        let mut defaults = defaults_from(&process)?;
         if layers.len() != diff_ids.len() {
             return Err(CriError::new(
                 crate::error::CriErrorCode::DataLoss,
@@ -436,7 +566,18 @@ impl RootfsSource for ImageRootfsSource {
         )
         .map_err(|e| CriError::from(PullError::from_extract(&e)))
         .and_then(|_| self.check_deadline(started))
-        .and_then(|()| open_rootfs_for_search(rootfs));
+        .and_then(|()| open_rootfs_for_search(rootfs))
+        .and_then(|()| {
+            // 名前・uid のみの User は、展開後の私有 rootfs の passwd / group で解決する（失敗は未解決のまま返す）。
+            if defaults.user_unresolved
+                && let Some(lookup) = parse_user_lookup(process.user())
+                && let Some(ids) = resolve_user(rootfs, &lookup)
+            {
+                defaults.user = Some(ids);
+                defaults.user_unresolved = false;
+            }
+            self.check_deadline(started)
+        });
         if let Err(e) = extracted {
             // 先行レイヤーの展開物が残るため、自分が作った rootfs だけを消す（0555 等も権限を戻して消す）。
             let _ = remove_extracted_tree(rootfs);
@@ -509,6 +650,114 @@ mod tests {
         assert_eq!(
             c::MAX_PROCESS_PATH_BYTES,
             super::super::spec::MAX_PATH_BYTES
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    fn lookup_rootfs(passwd: Option<&str>, group: Option<&str>) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let r = std::env::temp_dir().join(format!(
+            "fc-cri-user-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&r);
+        std::fs::create_dir_all(r.join("etc")).unwrap();
+        if let Some(p) = passwd {
+            std::fs::write(r.join("etc/passwd"), p).unwrap();
+        }
+        if let Some(g) = group {
+            std::fs::write(r.join("etc/group"), g).unwrap();
+        }
+        r
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    const PASSWD: &str = "# c\nroot:x:0:0:r:/root:/bin/sh\n+@nis\nbad:x:zz:1\nshort:x\napp:x:1000:1001::/h:/bin/sh\napp:x:2000:2001::/h:/bin/sh\n";
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    const GROUP: &str = "root:x:0:\nstaff:x:50:app\nbad:x:q:\n";
+
+    /// CRI-2・SEC-5: 名前・uid のみ・名前つきの組の解決表（具体値）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn cri2_image_user_name_resolution_table() {
+        let r = lookup_rootfs(Some(PASSWD), Some(GROUP));
+        let get = |u: &str| resolve_user(&r, &parse_user_lookup(u).unwrap());
+        assert_eq!(get("app"), Some((1000, 1001)));
+        assert_eq!(get("app:staff"), Some((1000, 50)));
+        assert_eq!(get("app:60"), Some((1000, 60)));
+        assert_eq!(get("1000:staff"), Some((1000, 50)));
+        assert_eq!(get("1000"), Some((1000, 1001)));
+        assert_eq!(get("0"), Some((0, 0)));
+        assert_eq!(get("4242"), Some((4242, 0)));
+        assert_eq!(get("nobody"), None);
+        assert_eq!(get("app:nogroup"), None);
+        assert_eq!(get("bad"), None);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// REPAIR-5・SEC-5: 行数上限を超える passwd は切り捨てず未解決（後続行の gid を落として 0 にしない）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn repair5_passwd_over_line_limit_is_unresolved() {
+        let body = format!(
+            "{}app:x:1000:1001::/h:/bin/sh\n",
+            "\n".repeat(MAX_ETC_LINES)
+        );
+        let r = lookup_rootfs(Some(&body), None);
+        assert_eq!(resolve_user(&r, &parse_user_lookup("1000").unwrap()), None);
+        assert_eq!(resolve_user(&r, &parse_user_lookup("app").unwrap()), None);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// SEC-1: passwd が無いと uid のみは gid 0、名前は未解決。passwd が symlink なら uid のみも未解決。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn sec1_missing_or_symlinked_passwd() {
+        let r = lookup_rootfs(None, None);
+        assert_eq!(
+            resolve_user(&r, &parse_user_lookup("1000").unwrap()),
+            Some((1000, 0))
+        );
+        assert_eq!(resolve_user(&r, &parse_user_lookup("app").unwrap()), None);
+        std::os::unix::fs::symlink("/etc/passwd", r.join("etc/passwd")).unwrap();
+        assert_eq!(resolve_user(&r, &parse_user_lookup("1000").unwrap()), None);
+        assert_eq!(resolve_user(&r, &parse_user_lookup("root").unwrap()), None);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// 形式の検証: 名前の禁止文字・長さ・`:` 過多は解決対象にしない。
+    #[test]
+    fn cri2_user_lookup_parse_rejects_malformed() {
+        assert!(parse_user_lookup("a:b:c").is_none());
+        assert!(parse_user_lookup(&"a".repeat(MAX_NAME_BYTES + 1)).is_none());
+        assert!(parse_user_lookup("a/b").is_none());
+        assert!(parse_user_lookup(":1").is_none());
+        assert_eq!(
+            parse_user_lookup("app:staff"),
+            Some(UserLookup {
+                user: IdPart::Name("app".into()),
+                group: Some(IdPart::Name("staff".into()))
+            })
         );
     }
 }

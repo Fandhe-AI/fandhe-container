@@ -24,10 +24,13 @@ I = 呼び出しプロセス（終始 non-dumpable）、U = holder、M = mapper�
 ```text
 I ─ fork ─> U : fd 3 以上を閉じる → 親が I か確認（PDEATHSIG は設定しない。#2376）
               → unshare(CLONE_NEWUSER) → dumpable にする(U だけ) → READY(固定 3 バイト)
-              → RELEASE / EOF（I・M・全 helper が socket の相手側を閉じる）/ 期限まで待つ → _exit
+              → 制御フレーム(5 バイト)を待つ: MapperPid を 1 回受けて M の /proc/<M> を錨にする
+              → RELEASE / EOF（I・M・全 helper が socket の相手側を閉じる）/ 期限まで待つ
+              → 期限切れなら、終わる前に M のセッションへ SIGKILL し、EOF を drain_wait まで待つ(#2551) → _exit
 I ─ READY を期限つきで受ける
 I ─ fork ─> M : go を待つ → /proc/<U> の fd を開く → 「M の親が I」かつ「U の ppid(fd 経由の stat)が I」を確認
               → U の uid_map / gid_map を書く(newuidmap / newgidmap には U の pid の数値。#2376) → 応答
+I ─ M の pid を MapperPid フレームで U へ送る(go の前。書けなければ握手を失敗にする。#2551)
 I ─ go を送り M の応答を期限つきで受ける(2 × timeout + 1s)
 I ─ U の pidfd で setns(CLONE_NEWUSER) → /proc/self/ns/user が U のものであること・euid/egid == 0 を確認
 I ─ RELEASE を U へ送り、U と M を回収 → 残りの namespace を unshare(従来どおり)
@@ -36,7 +39,10 @@ I ─ RELEASE を U へ送り、U と M を回収 → 残りの namespace を un
 - 新しい `unsafe` は無い。既存の sys ラッパー（`fork_single_threaded*`・`close_fds_from_except`・`set_dumpable_user`・`setns_pidfd`・`is_dumpable`・`set_non_dumpable`）だけを使う。`set_dumpable_user` を呼ぶのは U の fork 子だけで、I の経路には dumpable を上げる呼び出しが無い。
 - I が user namespace に `setns` できる根拠: I は親の user namespace にいて euid が U の namespace の所有者と一致するため、参加先の全 capability を持つ。単一スレッドで、`fs` も共有していない（`userns_install` の条件）。参加先の同一性は、参加前に `/proc/<U>/ns/user` の (dev, ino) を控え、参加後の `/proc/self/ns/user` と一致することで確かめる（fail-closed）。
 - 呼び出し元が non-dumpable だった場合は、参加の後にも `set_non_dumpable` で戻す方向にだけ動かす（カーネルの資格情報の更新による dumpable の変化に備える）。公開 API（`isolate_rootless_subordinate`）も同じ経路に揃えたため、「non-dumpable の呼び出し元を fork 前に拒否する」前提条件（#2243）は不要になり削除した。
-- 応答は REPAIR-2 に沿った固定長フレーム（`MapperReply` の 3 バイト、RELEASE は 1 バイト定数）。READY・go・応答・RELEASE の待ちはすべて期限つき（REPAIR-5）。U は RELEASE を `3 × timeout + 5s` まで待つ。I が死んだ場合は、socket の相手側を持つ M と全 helper（stdin に複製を持つ）が終了して EOF になるか、期限で終わる（PDEATHSIG は持たない。helper の実行中に U の pid を解放しないため。#2376）。期限で終わるため（REPAIR-5）、I が死んだうえで helper が期限を超えて止められている場合は U が先に終わり得る（残余。helper は対象の所有者が呼び出し元であることを確かめ、`uid_map` は未設定の子 user namespace にしか書けず、範囲は呼び出し元の subuid で検証されるため、再利用先は同じ利用者の写像待ちのプロセスに限られ、新しい権限は与えない。#2551）。
+- フレームは REPAIR-2 に沿った固定長。M の応答は `MapperReply` の 3 バイト、I から U への制御は `HolderControl` の 5 バイト `[tag, pid の u32 big-endian]`（`MapperPid` = 2..=i32::MAX、`Release` の payload は 0）で、完全一致のみ受ける。issue（#2551）の案は 4 バイトの pid フレームだったが、1 バイトの RELEASE と同じ socket に別形式を混ぜると壊れた値を表現できるため、tag 付きの 1 種類の固定長に揃えた。書き込むのは I だけ（M・helper は複製を持つが書かない）で、順序は「MapperPid（M の fork 直後・go の前）→ 応答待ち → Release」。READY・go・応答・Release の待ちはすべて期限つき（REPAIR-5）。U は Release を `3 × timeout + 5s` まで待つ。I が死んだ場合は、socket の相手側を持つ M と全 helper（stdin に複製を持つ）が終了して EOF になるか、期限で終わる（PDEATHSIG は持たない。helper の実行中に U の pid を解放しないため。#2376）。
+- **期限切れの後始末（#2551・CORE-6・SEC-5・REPAIR-5）**: 待ちを有限にした結果、I が死んだうえで helper が期限を超えて止められていると、U が先に終わって pid が解放され、再開した helper が再利用された pid へ書く残余があった。これを閉じるため、U は期限が来たとき**自分が終わる前に** M のセッション（`kill(-M, SIGKILL)`。M が `setsid` で作り helper が継承する）を止め、EOF を `drain_wait`（5s）まで待ってから終わる（生存は最長 `release_wait + drain_wait`）。SIGKILL は止められたプロセスも終わらせるので、利用者が SIGSTOP で作れる残余は閉じる。kill の宛先は MapperPid を受けた時点で `/proc/<M>` の fd を開いて固定し（開いた**後**にM の ppid が U の現在の親と一致することを確かめる。I が死んでも U と M は同じ親へ再親付けされる）、kill の直前に fd 経由でセッション ID が M の pid であることを確かめる。ID が違えば（M が `setsid` の前＝helper を作っていない）、錨が無ければ、読めなければ kill しない（fail-closed）。M が回収済み（fd 経由の読みが `ESRCH`）なら、送る直前に EOF を確かめ直し、EOF でなければ（生きている helper がセッションを継承している）kill する。根拠: 期限が来ても EOF でないのは相手側の誰かが生きているときだけで、I が生きていれば I は U を kill してから M を回収するため M の pid は保たれる。
+- 対応案 1（helper が `fd:N` に対応していれば `fd:0` を使う）は採らない。対応可否の確実な判定が無く、usage エラーで数値 pid へ退避すると失敗の原因を区別できず fail-closed が崩れるため。公開 API の `apply_id_maps_to` は `fd:0` のまま。
+- 残る窓（#2551）: (a) 期限の直前に最後の helper が終わり、その pid が `setsid` した無関係なプロセスへ再利用されるまでの極小の TOCTOU（kill の直前の EOF の確かめ直しと、セッション ID の照合で縮める）。(b) SIGKILL の後も `drain_wait` を超えて終わらない helper（カーネル内の割り込み不能な待ち等）。この場合 U は終了し、残余は残る。どちらも利用者が SIGSTOP 等で作れる範囲は閉じている。届く先は同じ利用者のプロセスに限られ（`kill(2)` は実 uid / saved uid の照合）、新しい権限は与えない。
 - M の TOCTOU（SEC-5）: 対象が「親の pid」から「兄弟の U の pid」に変わる。M は先に `ProcHandle` で `/proc/<U>` の fd を開き、その後で M 自身の親と U の ppid がともに I であることを確かめる。I が生きていて U が I の未回収の子なら pid は再利用されておらず、fd は以後同じプロセスを指す。
 - helper へ渡す対象（#2376）: ubuntu-latest の shadow 4.13 の `newuidmap` / `newgidmap` は `fd:N` 形式を受け付けないため、M は U の pid を数値で渡し、各 helper の stdin に U の socket の相手側の複製を持たせる。helper の書き込み先は fd で固定されないので、U の pid が解放（回収）されるのは helper が止まった後に限る（U は全員の EOF まで終了せず、I・C が U を kill するのは下の後始末で helper を止めた後）。成功時は M が helper を回収してから応答する。公開 API の `apply_id_maps_to` は対象の生存を保証できないため `fd:0` のまま（`fd:N` 未対応の helper では失敗する。fail-closed）。
 - 失敗時の後始末（CORE-2・CORE-6・SEC-5）: I は先に M へ `SIGKILL`（回収しない）、続けて M のプロセスグループ（M が写像の前に `setsid` で作り、helper が継承する）へ `SIGKILL` を送り、M のセッションの全員（helper を含む）がゾンビ化するか消えたことを期限つきで確かめてから U を kill・回収する（`SIGKILL` は送達と終了が同時でなく、実行中の syscall は `kill(2)` の後も完了し得るため）。グループ宛てが失敗した場合や終了を確かめられない場合は U を kill だけして回収しない（ゾンビの間は pid が保たれる。fail-closed）。M は公開 API では kill・回収し、launcher では回収せず、C の識別子の再探索が helper ごと回収する。U は I の `comm`（起動識別子）を引き継ぎ exec しないため、I が報告せずに死んでも C の再探索で見つけられる。再探索は、識別子つきの全候補（U・M・PID 1）の子孫（helper）を止めてゾンビ化を確かめてから錨を回収し、1 つでも保持になればどの錨も回収しない（U を helper より先に回収しない）。
@@ -66,6 +72,7 @@ I ─ RELEASE を U へ送り、U と M を回収 → 残りの namespace を un
 ## 5. 試験
 
 - 単体（`exec.rs`）: 握手が成功した後の待ちが失敗しても子を kill して回収すること(`reap_after_handshake`。#2546)。
+- 単体（`rootless.rs`。#2551）: `HolderControl` の往復と壊れた値の拒否、`holder_await_release` の Release / EOF / 期限切れ（錨なしは kill しない・setsid 前は kill しない・自身と親の pid は錨にしない・kill は 1 回・SIGSTOP で止めた `setsid` 済みの子を本番の kill で終わらせて EOF に届く・`drain_wait` で戻る）。
 - 単体（`rootless.rs`）: holder の失敗が固定 3 バイトの応答と `diag` の 1 行になること(`report_holder_outcome`。#2546)。mapper が「対象の親が期待した I でない」ことを `FailedPrecondition` で拒否すること、fd 経由の ppid が `parent_id()` と一致すること。
 - 結合（`crates/core/tests/unshare_isolation.rs`・実機前提）: 自身を `--subordinate-non-dumpable` で再起動した子が non-dumpable のまま分離し、user namespace 内の uid 0・`uid_map` / `gid_map` の読み戻し・namespace の変化・子プロセス 0 件・呼び出し後も non-dumpable を具体値で照合する。親（I の祖先）は実行中の `/proc/<子>` の所有者 uid を標本し、標本が 1 件以上で全件が 0（non-dumpable は root 所有に見える）であることを照合する。CI では `platform-ci` の ubuntu が `--ignored` で実行し、成功行 2 本(`full isolation verified (root=false)` と `subordinate isolation kept the caller non-dumpable`)をログで照合する(#2546)。
 

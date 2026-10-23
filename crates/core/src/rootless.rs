@@ -578,26 +578,44 @@ impl ProcHandle {
     /// (CORE-6・SEC-5・#2374)。読み取りは 4096 バイトで打ち切り、comm が `)` を含んでも最後の `)` より後ろ
     /// だけを解析する。形式が崩れていれば `Internal` で拒否する(fail-closed)。
     pub(crate) fn parent_pid(&self) -> Result<u32, RootlessError> {
+        self.stat_field(1)
+    }
+
+    /// fd の指すプロセスのセッション ID(`/proc/<pid>/stat` の session)を、kill の判断に必要な 3 つに分けて返す。
+    ///
+    /// holder が期限切れのとき、錨にした mapper が `setsid` 済み(ID = mapper の pid)であることを kill の直前に
+    /// 確かめるために使う(CORE-6・SEC-5・#2551)。
+    ///
+    /// 対象が既に回収されていれば fd 経由の読み取りは `ESRCH` / `ENOENT` で失敗する(`Gone`)。それ以外の失敗・
+    /// 解析の失敗は `Unreadable` で、呼び出し側は kill しない(fail-closed)。
+    pub(crate) fn session_probe(&self) -> SessionProbe {
+        match self.read_stat() {
+            Ok(buf) => match parse_stat_field(&buf, 3) {
+                Ok(sid) => SessionProbe::Session(sid),
+                Err(_) => SessionProbe::Unreadable,
+            },
+            Err(e) if matches!(e.raw_os_error(), Some(sys::ESRCH | sys::ENOENT)) => {
+                SessionProbe::Gone
+            }
+            Err(_) => SessionProbe::Unreadable,
+        }
+    }
+
+    /// `/proc/<pid>/stat` を 4096 バイトまで読む(fd 経由。pid の再利用に影響されない)。
+    fn read_stat(&self) -> std::io::Result<Vec<u8>> {
         use std::io::Read as _;
         let mut buf = Vec::with_capacity(512);
         std::fs::File::open(self.proc_file("stat"))
-            .and_then(|f| f.take(4096).read_to_end(&mut buf))
+            .and_then(|f| f.take(4096).read_to_end(&mut buf))?;
+        Ok(buf)
+    }
+
+    /// stat の `) <state> <ppid> <pgrp> <session> ...` の `n` 番目(0 起点)を数値で返す。
+    fn stat_field(&self, n: usize) -> Result<u32, RootlessError> {
+        let buf = self
+            .read_stat()
             .map_err(|e| io_error(RootlessStage::Validate, "read target stat", &e))?;
-        let bad = || {
-            RootlessError::new(
-                ErrorCode::Internal,
-                RootlessStage::Validate,
-                "malformed target stat",
-            )
-        };
-        let close = buf.iter().rposition(|b| *b == b')').ok_or_else(bad)?;
-        let rest = buf.get(close + 1..).ok_or_else(bad)?;
-        let rest = std::str::from_utf8(rest).map_err(|_| bad())?;
-        // `) <state> <ppid> ...`
-        rest.split_whitespace()
-            .nth(1)
-            .and_then(|f| f.parse::<u32>().ok())
-            .ok_or_else(bad)
+        parse_stat_field(&buf, n)
     }
 
     /// fd 配下のファイルのパス（`/proc/self/fd/N/<name>`。fd の指すプロセスへ解決される）。
@@ -605,6 +623,36 @@ impl ProcHandle {
         use std::os::fd::AsRawFd as _;
         PathBuf::from(format!("/proc/self/fd/{}/{name}", self.dir.as_raw_fd()))
     }
+}
+
+/// [`ProcHandle::session_probe`] の結果(#2551)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionProbe {
+    /// 対象のセッション ID。
+    Session(u32),
+    /// 対象は既に回収されている(`ESRCH` / `ENOENT`)。
+    Gone,
+    /// 読めない・形式が崩れている。
+    Unreadable,
+}
+
+/// stat の本文から、最後の `)`(comm の終端。comm が `)` を含んでも壊れない)より後ろの `n` 番目の欄を読む。
+/// 形式が崩れていれば `Internal` で拒否する(fail-closed)。
+fn parse_stat_field(buf: &[u8], n: usize) -> Result<u32, RootlessError> {
+    let bad = || {
+        RootlessError::new(
+            ErrorCode::Internal,
+            RootlessStage::Validate,
+            "malformed target stat",
+        )
+    };
+    let close = buf.iter().rposition(|b| *b == b')').ok_or_else(bad)?;
+    let rest = buf.get(close + 1..).ok_or_else(bad)?;
+    let rest = std::str::from_utf8(rest).map_err(|_| bad())?;
+    rest.split_whitespace()
+        .nth(n)
+        .and_then(|f| f.parse::<u32>().ok())
+        .ok_or_else(bad)
 }
 
 /// ヘルパーの同一性（`st_dev` / `st_ino`）。検証時点と実行直前の再検証で比較し、差し替えを検出する。
@@ -1220,9 +1268,266 @@ impl MapperReply {
     }
 }
 
-/// holder へ「参加が済んだ。終了してよい」と知らせる 1 バイト（[`run_userns_holder`] が待つ）。
-pub(crate) const HOLDER_RELEASE: u8 = 2;
+/// holder の制御フレーム長(`[tag, pid の u32 big-endian 4 バイト]` の固定 5 バイト)。
+pub(crate) const HOLDER_CONTROL_LEN: usize = 5;
+const CTL_TAG_MAPPER_PID: u8 = 1;
+const CTL_TAG_RELEASE: u8 = 2;
 
+/// holder が期限切れのときに止める mapper のセッションの錨にする pid(`2..=i32::MAX`。#2551)。
+///
+/// 0(自グループ)・1(`kill(-1)` は全プロセス宛て)・`i32` を超える値(負の pid になる)を型で表現できなくする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MapperPid(u32);
+
+impl MapperPid {
+    /// pid を検証して作る。範囲外は `Internal`。
+    pub(crate) fn new(pid: u32) -> Result<Self, RootlessError> {
+        if (2..=i32::MAX as u32).contains(&pid) {
+            Ok(Self(pid))
+        } else {
+            Err(RootlessError::new(
+                ErrorCode::Internal,
+                RootlessStage::Helper,
+                "mapper pid out of range in holder control frame",
+            ))
+        }
+    }
+
+    /// pid の値。
+    pub(crate) fn get(&self) -> u32 {
+        self.0
+    }
+}
+
+/// 中間プロセス I が holder へ送る制御フレーム(REPAIR-2。CORE-6・SEC-5・#2551)。
+///
+/// 固定 5 バイト `[tag, pid]` で、書くのは I だけ(mapper・helper は socket の複製を持つが書かない)。順序は
+/// `MapperPid`(mapper の fork 直後・go の前)→ 応答待ち → `Release`(参加が済んだ後)。復号は完全一致のみ受け付け、
+/// 長さ不一致・未知の tag・`Release` の payload が 0 でない値・範囲外の pid は `Internal` で拒否する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HolderControl {
+    /// mapper の pid。holder は期限切れのとき、このプロセスのセッション(mapper と helper)を止める。
+    MapperPid(MapperPid),
+    /// 参加が済んだ。終了してよい。
+    Release,
+}
+
+impl HolderControl {
+    /// 固定長フレームへ符号化する。
+    pub(crate) fn encode(&self) -> [u8; HOLDER_CONTROL_LEN] {
+        let (tag, pid) = match self {
+            Self::MapperPid(p) => (CTL_TAG_MAPPER_PID, p.get()),
+            Self::Release => (CTL_TAG_RELEASE, 0),
+        };
+        let [a, b, c, d] = pid.to_be_bytes();
+        [tag, a, b, c, d]
+    }
+
+    /// 完全一致のみ受け付ける復号。
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, RootlessError> {
+        let bad = |m: &str| RootlessError::new(ErrorCode::Internal, RootlessStage::Helper, m);
+        let [tag, a, b, c, d] = <[u8; HOLDER_CONTROL_LEN]>::try_from(bytes)
+            .map_err(|_| bad("malformed holder control frame length"))?;
+        let pid = u32::from_be_bytes([a, b, c, d]);
+        match tag {
+            CTL_TAG_MAPPER_PID => Ok(Self::MapperPid(MapperPid::new(pid)?)),
+            CTL_TAG_RELEASE if pid == 0 => Ok(Self::Release),
+            CTL_TAG_RELEASE => Err(bad("non-zero payload in holder release frame")),
+            _ => Err(bad("unknown tag in holder control frame")),
+        }
+    }
+}
+
+/// [`holder_await_release`] の結末(終了コードへ写す。`Released` だけが 0)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HolderExit {
+    /// `Release` を受けた。
+    Released,
+    /// 相手側が全員閉じた(EOF)。helper も居ない。
+    PeersClosed,
+    /// 期限切れ。mapper のセッションへ SIGKILL を送り、続けて EOF を待った(`drained` は EOF まで届いたか)。
+    ExpiredKilled { drained: bool },
+    /// 期限切れ(または壊れたフレーム)だが、錨が無い・同一性を確かめられないため kill しなかった。
+    ExpiredNoKill,
+    /// socket の読み取りが失敗した。
+    ReadFailed,
+}
+
+impl HolderExit {
+    fn code(self) -> i32 {
+        i32::from(self != Self::Released)
+    }
+}
+
+/// 読み取り 1 フレームの結果。
+enum FrameRead {
+    Full,
+    Eof,
+    TimedOut,
+    Failed,
+}
+
+/// `buf` が満たされるか EOF・`deadline` になるまで読む。1 回ごとに残り時間を read timeout に設定する(REPAIR-5)。
+fn read_frame_until(
+    sock: &mut std::os::unix::net::UnixStream,
+    buf: &mut [u8; HOLDER_CONTROL_LEN],
+    deadline: Instant,
+) -> FrameRead {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return FrameRead::TimedOut;
+        }
+        if sock.set_read_timeout(Some(remaining)).is_err() {
+            return FrameRead::Failed;
+        }
+        let Some(dst) = buf.get_mut(filled..) else {
+            return FrameRead::Failed;
+        };
+        match sock.read(dst) {
+            Ok(0) => return FrameRead::Eof,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return FrameRead::TimedOut;
+            }
+            Err(_) => return FrameRead::Failed,
+        }
+    }
+    FrameRead::Full
+}
+
+/// [`holder_await_release`] の入力(値の束)。
+pub(crate) struct HolderWait<'a> {
+    /// holder 自身の pid(錨にできない値)。
+    pub(crate) self_pid: u32,
+    /// holder を fork した中間プロセス I の pid(錨にできない値)。
+    pub(crate) expected_parent: u32,
+    /// holder の現在の親 pid。I が死ぬと subreaper か init に変わり、mapper も同じ親に再親付けされる。
+    pub(crate) current_parent: &'a dyn Fn() -> u32,
+    /// `Release` を待つ上限。
+    pub(crate) release_wait: Duration,
+    /// 期限切れで kill した後、EOF を待つ上限。
+    pub(crate) drain_wait: Duration,
+}
+
+/// 錨(mapper の `/proc/<pid>` の fd と pid)を作る。作れない・親が一致しない場合は `None`(診断を 1 行出す)。
+///
+/// 開けないのは mapper が既に回収された場合で、mapper は helper を回収してから終わるか go を受けずに終わる
+/// ため helper は残らない。fd を確保した**後**に親を確かめ、別プロセスの `/proc/<pid>` を錨にしない。
+fn open_anchor(
+    pid: MapperPid,
+    w: &HolderWait<'_>,
+    diag: &mut dyn std::io::Write,
+) -> Option<(ProcHandle, u32)> {
+    let pid = pid.get();
+    let anchor = (|| {
+        if pid == w.self_pid || pid == w.expected_parent {
+            return Err("mapper pid is the holder or its parent");
+        }
+        let handle = TargetPid::new(pid)
+            .and_then(ProcHandle::open)
+            .map_err(|_| "cannot open the mapper proc directory")?;
+        match handle.parent_pid() {
+            Ok(ppid) if ppid == (w.current_parent)() => Ok((handle, pid)),
+            _ => Err("mapper is not a sibling of the holder"),
+        }
+    })();
+    match anchor {
+        Ok(a) => Some(a),
+        Err(m) => {
+            let _ = writeln!(diag, "fandhe-container: userns holder: no anchor: {m}");
+            None
+        }
+    }
+}
+
+/// holder の READY 後の待ち(#2551)。`Release`・EOF で終わる。期限が来たら mapper のセッション(helper を含む)へ
+/// SIGKILL を送ってから EOF を待ち、どの待ちも有限にする(REPAIR-5)。`kill` は試験が差し替える継ぎ目。
+///
+/// kill の安全性: 期限が来ても EOF でないのは、相手側(I・mapper・helper)の誰かが生きているときだけである。
+/// I が生きていれば、mapper を回収するのは holder を kill した後に限るため、mapper の pid(セッション ID)は保たれる。
+/// I が死んでいても、mapper が回収済みなら生きている helper がセッションを継承して番号を保つ。kill の直前に
+/// fd 経由でセッション ID が mapper の pid であることを確かめ、読めなくなっていれば EOF を確かめ直す。
+/// 残る窓: 期限の直前に最後の helper が終わり、その pid が `setsid` した無関係なプロセスへ再利用される極小の窓。
+pub(crate) fn holder_await_release(
+    sock: &mut std::os::unix::net::UnixStream,
+    w: &HolderWait<'_>,
+    kill: &mut dyn FnMut(u32) -> Result<(), SysError>,
+    diag: &mut dyn std::io::Write,
+) -> HolderExit {
+    let deadline = Instant::now() + w.release_wait;
+    let mut anchor: Option<(ProcHandle, u32)> = None;
+    let mut seen_pid = false;
+    let mut buf = [0u8; HOLDER_CONTROL_LEN];
+    loop {
+        match read_frame_until(sock, &mut buf, deadline) {
+            FrameRead::Eof => return HolderExit::PeersClosed,
+            FrameRead::Failed => return HolderExit::ReadFailed,
+            FrameRead::TimedOut => break,
+            FrameRead::Full => match HolderControl::decode(&buf) {
+                Ok(HolderControl::Release) => return HolderExit::Released,
+                Ok(HolderControl::MapperPid(p)) if !seen_pid => {
+                    seen_pid = true;
+                    anchor = open_anchor(p, w, diag);
+                }
+                _ => {
+                    let _ = writeln!(diag, "fandhe-container: userns holder: bad control frame");
+                    break;
+                }
+            },
+        }
+    }
+    let _ = writeln!(diag, "fandhe-container: userns holder: release wait ended");
+    let Some((handle, mapper_pid)) = anchor else {
+        return HolderExit::ExpiredNoKill;
+    };
+    match handle.session_probe() {
+        SessionProbe::Session(sid) if sid == mapper_pid => {}
+        SessionProbe::Gone => {
+            // mapper は回収済み。生きている helper が無ければ EOF になっているはずなので、送る直前に確かめ直す。
+            let mut b = [0u8; HOLDER_CONTROL_LEN];
+            match read_frame_until(sock, &mut b, Instant::now() + Duration::from_millis(1)) {
+                FrameRead::Eof => return HolderExit::PeersClosed,
+                FrameRead::Full if HolderControl::decode(&b) == Ok(HolderControl::Release) => {
+                    return HolderExit::Released;
+                }
+                _ => {}
+            }
+        }
+        // mapper が `setsid` の前(helper を作っていない)か、読めない: kill しない(fail-closed)。
+        _ => return HolderExit::ExpiredNoKill,
+    }
+    match kill(mapper_pid) {
+        Ok(()) => {}
+        Err(SysError::Os(e)) if e == sys::ESRCH => {}
+        Err(_) => {
+            let _ = writeln!(diag, "fandhe-container: userns holder: kill failed");
+            return HolderExit::ExpiredNoKill;
+        }
+    }
+    let _ = writeln!(
+        diag,
+        "fandhe-container: userns holder: killed the id map mapper session"
+    );
+    // SIGKILL は止められたプロセスも終わらせ、終了で複製した fd が閉じて EOF になる。届いたバイトは捨てる。
+    let drain_deadline = Instant::now() + w.drain_wait;
+    loop {
+        match read_frame_until(sock, &mut buf, drain_deadline) {
+            FrameRead::Full => {}
+            FrameRead::Eof => return HolderExit::ExpiredKilled { drained: true },
+            FrameRead::TimedOut | FrameRead::Failed => {
+                return HolderExit::ExpiredKilled { drained: false };
+            }
+        }
+    }
+}
 /// user namespace を作って保持するだけの使い捨てプロセス(holder)の処理本体(fork 子が呼ぶ。#2374)。
 ///
 /// 中間プロセス I(`exec::isolate_rootless_subordinate`)は non-dumpable のまま保つ必要があるが、
@@ -1232,17 +1537,21 @@ pub(crate) const HOLDER_RELEASE: u8 = 2;
 ///
 /// 流れ: fd 3 以上を閉じる(I から継承した報告 pipe・listener 等を持たない)
 /// → 親が `expected_parent`(I)のままか確認 → `unshare(CLONE_NEWUSER)` → dumpable にする → READY(`MapperReply::Ok`)
-/// を返す → [`HOLDER_RELEASE`] を `release_wait` まで待って終了する(REPAIR-5)。
+/// を返す → [`HolderControl::Release`] を `release_wait` まで待って終了する(REPAIR-5。待ちは [`holder_await_release`])。
 ///
 /// `PDEATHSIG` は設定しない(#2376)。helper(`newuidmap` / `newgidmap`)は holder を pid の数値で受け取るため、I が
 /// helper の実行中に死んでも holder は先に終了して pid を解放してはならない。`sock` の相手側は I・mapper(fork で
 /// 継承)・各 helper(stdin に複製。`HelperTarget::HeldPid`)が持ち、全員が閉じるまで EOF にならない。そのため I が
 /// 死んだ場合も、holder は mapper と全 helper の終了(EOF)か `release_wait` の期限で終わる。`release_wait`
-/// (`3 × timeout + 5s`)は mapper の go 待ち(`timeout`)と helper 2 回(各 `timeout`)の和を上回る。期限で終わるため
-/// (REPAIR-5)、呼び出し元が死んだうえで helper が期限を超えて止められている場合は holder が先に終わり得る(残余。
-/// 再利用先は helper の所有者確認により同じ利用者の、写像が未設定の子 user namespace のプロセスに限られ、書けるのは
-/// その利用者自身の subordinate 範囲だけのため、新しい権限は与えない。#2551)。I・C は helper を止めた後に
-/// holder を kill する(`exec::stop_mapper_and_helpers`・`exec::launch_intermediate::rescan_unreported_init`)。
+/// (`3 × timeout + 5s`)は mapper の go 待ち(`timeout`)と helper 2 回(各 `timeout`)の和を上回る。待ちは有限に
+/// する(REPAIR-5)ため、I が死んだうえで helper が期限を超えて止められていると、期限で holder が先に終わって pid が
+/// 再利用され得た(#2551)。これを閉じるため、I は mapper の fork 直後(go の前)に [`HolderControl::MapperPid`] を
+/// 送り、holder は期限が来たとき**自分が終わる前に** mapper のセッション(helper を含む)へ SIGKILL を送って EOF を
+/// 待つ([`holder_await_release`]。待ちはどちらも有限で、生存は最長 `release_wait + drain_wait`)。同一性が確かめられ
+/// ない場合は kill しない(fail-closed)。残る窓(期限直前の最後の helper の終了と pid の再利用が重なる極小の窓、
+/// SIGKILL でも `drain_wait` を超えて終わらない helper)は `docs/design/rootless-id-map-holder.md` に記す。
+/// I・C は helper を止めた後に holder を kill する(`exec::stop_mapper_and_helpers`・
+/// `exec::launch_intermediate::rescan_unreported_init`)。
 /// `diag`(#2546): 失敗の 1 行の書き先。本番は fork 後の子の中で作った unbuffered の `std::io::stderr()` を渡し、試験は
 /// `Vec<u8>` で照合する(`run_id_map_mapper` の `diag` と同じ契約)。
 /// 失敗は `MapperReply::Failed` で返して終了コード 1。exec せず I の `comm`(起動識別子)を引き継ぐため、I が
@@ -1252,6 +1561,7 @@ pub(crate) fn run_userns_holder(
     mut sock: std::os::unix::net::UnixStream,
     timeout: Duration,
     release_wait: Duration,
+    drain_wait: Duration,
     diag: &mut dyn std::io::Write,
 ) -> i32 {
     use std::os::fd::AsFd as _;
@@ -1275,17 +1585,25 @@ pub(crate) fn run_userns_holder(
     if !report_holder_outcome(outcome, &mut sock, timeout, diag) {
         return 1;
     }
-    let _ = sock.set_read_timeout(Some(release_wait));
-    let mut b = [0u8; 1];
-    match sock.read_exact(&mut b) {
-        Ok(()) if b[0] == HOLDER_RELEASE => 0,
-        _ => 1,
-    }
+    let w = HolderWait {
+        self_pid: std::process::id(),
+        expected_parent,
+        current_parent: &std::os::unix::process::parent_id,
+        release_wait,
+        drain_wait,
+    };
+    holder_await_release(
+        &mut sock,
+        &w,
+        &mut |pgid| sys::kill_process_group(pgid, sys::Signal::Kill),
+        diag,
+    )
+    .code()
 }
 
 /// holder の準備結果を固定 3 バイトの応答で返し、失敗なら `diag` へ 1 行出す([`run_userns_holder`]の一部。#2546)。
 ///
-/// 応答を相手へ書けたときだけ `true`(続けて [`HOLDER_RELEASE`] を待つ)。失敗の応答を書いた場合は `false`。
+/// 応答を相手へ書けたときだけ `true`(続けて [`HolderControl::Release`] を待つ)。失敗の応答を書いた場合は `false`。
 /// `diag` の書き込みの失敗は無視し、応答は必ず試みる(`run_id_map_mapper` の `diag` と同じ契約)。
 fn report_holder_outcome(
     outcome: Result<(), RootlessError>,
@@ -2023,5 +2341,268 @@ mod tests {
                 stage: RootlessStage::Validate
             }
         );
+    }
+
+    /// SEC-5・CORE-6・REPAIR-2(#2551): holder 制御フレームの往復と、壊れた値の拒否。
+    #[test]
+    fn sec5_holder_control_roundtrip_and_rejects_malformed() {
+        let p = MapperPid::new(12345).expect("pid");
+        assert_eq!(HolderControl::MapperPid(p).encode(), [1, 0, 0, 0x30, 0x39]);
+        assert_eq!(HolderControl::Release.encode(), [2, 0, 0, 0, 0]);
+        assert_eq!(
+            HolderControl::decode(&[1, 0, 0, 0x30, 0x39]).expect("decode"),
+            HolderControl::MapperPid(p)
+        );
+        assert_eq!(
+            HolderControl::decode(&[2, 0, 0, 0, 0]).expect("decode"),
+            HolderControl::Release
+        );
+        let over = (i32::MAX as u32 + 1).to_be_bytes();
+        let cases: [&[u8]; 9] = [
+            &[1, 0, 0, 0, 0],
+            &[1, 0, 0, 0, 1],
+            &[1, over[0], over[1], over[2], over[3]],
+            &[3, 0, 0, 0, 0],
+            &[0, 0, 0, 0, 0],
+            &[2, 0, 0, 0, 1],
+            &[2, 0, 0, 0],
+            &[2, 0, 0, 0, 0, 0],
+            &[],
+        ];
+        for bytes in cases {
+            let e = HolderControl::decode(bytes).expect_err("malformed");
+            assert_eq!(e.code, ErrorCode::Internal, "{bytes:?}");
+        }
+    }
+
+    /// CORE-6・SEC-5(#2551): `session_probe` は自プロセスの `/proc/self/stat` のセッション ID と一致する。
+    #[test]
+    fn core6_proc_handle_session_probe_matches_proc_stat() {
+        let h = ProcHandle::open(TargetPid::new(std::process::id()).expect("pid")).expect("open");
+        let stat = std::fs::read_to_string("/proc/self/stat").expect("stat");
+        let after = &stat[stat.rfind(')').expect("close") + 1..];
+        let sid: u32 = after
+            .split_whitespace()
+            .nth(3)
+            .expect("field")
+            .parse()
+            .expect("num");
+        assert_eq!(h.session_probe(), SessionProbe::Session(sid));
+        assert_eq!(
+            h.parent_pid().expect("ppid"),
+            std::os::unix::process::parent_id()
+        );
+    }
+
+    fn holder_test_wait(release_ms: u64, drain_ms: u64) -> HolderWait<'static> {
+        HolderWait {
+            self_pid: std::process::id(),
+            expected_parent: 1,
+            current_parent: &std::process::id,
+            release_wait: Duration::from_millis(release_ms),
+            drain_wait: Duration::from_millis(drain_ms),
+        }
+    }
+
+    /// `setsid` 済みの `sleep`(セッション ID = 自分の pid)を、`stdin` に `keep` の複製を持たせて起動する。
+    fn spawn_session_leader(keep: &std::os::unix::net::UnixStream) -> std::process::Child {
+        let dup = keep.try_clone().expect("clone");
+        let child = Command::new("setsid")
+            .args(["sleep", "30"])
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(dup)))
+            .spawn()
+            .expect("spawn setsid");
+        let h = ProcHandle::open(TargetPid::new(child.id()).expect("pid")).expect("open");
+        let t = Instant::now();
+        while h.session_probe() != SessionProbe::Session(child.id()) {
+            assert!(t.elapsed() < Duration::from_secs(5), "setsid not done");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        child
+    }
+
+    fn send_pid(sock: &mut std::os::unix::net::UnixStream, pid: u32) {
+        let p = MapperPid::new(pid).expect("pid");
+        sock.write_all(&HolderControl::MapperPid(p).encode())
+            .expect("send");
+    }
+
+    /// SEC-5(#2551): pid の後に Release を受ければ 0 で終わり、kill しない。
+    #[test]
+    fn sec5_holder_release_after_mapper_pid_exits_zero_without_kill() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        send_pid(&mut a, child.id());
+        a.write_all(&HolderControl::Release.encode()).expect("send");
+        let mut kills = Vec::new();
+        let r = holder_await_release(
+            &mut b,
+            &holder_test_wait(5000, 100),
+            &mut |p| {
+                kills.push(p);
+                Ok(())
+            },
+            &mut Vec::new(),
+        );
+        assert_eq!(r, HolderExit::Released);
+        assert_eq!(r.code(), 0);
+        assert!(kills.is_empty());
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+    }
+
+    /// SEC-5(#2551): pid より前に相手側が全員閉じれば EOF で終わり、kill しない。
+    #[test]
+    fn sec5_holder_eof_before_mapper_pid_does_not_kill() {
+        let (a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        drop(a);
+        let mut kills = Vec::new();
+        let r = holder_await_release(
+            &mut b,
+            &holder_test_wait(5000, 100),
+            &mut |p| {
+                kills.push(p);
+                Ok(())
+            },
+            &mut Vec::new(),
+        );
+        assert_eq!(r, HolderExit::PeersClosed);
+        assert_eq!(r.code(), 1);
+        assert!(kills.is_empty());
+    }
+
+    /// SEC-5・REPAIR-5(#2551): pid が来ないまま期限が来ても kill せず、期限で終わる。
+    #[test]
+    fn sec5_holder_expiry_without_mapper_pid_does_not_kill() {
+        let (_a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut kills = Vec::new();
+        let t = Instant::now();
+        let r = holder_await_release(
+            &mut b,
+            &holder_test_wait(200, 100),
+            &mut |p| {
+                kills.push(p);
+                Ok(())
+            },
+            &mut Vec::new(),
+        );
+        assert_eq!(r, HolderExit::ExpiredNoKill);
+        assert!(kills.is_empty());
+        assert!(t.elapsed() >= Duration::from_millis(200));
+        assert!(t.elapsed() < Duration::from_secs(3));
+    }
+
+    /// SEC-5・CORE-6(#2551): 期限切れで mapper のセッションへ kill をちょうど 1 回送り、EOF まで待つ。
+    #[test]
+    fn sec5_holder_expiry_kills_mapper_session_then_drains() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        send_pid(&mut a, child.id());
+        let mut kills = Vec::new();
+        let r = holder_await_release(
+            &mut b,
+            &holder_test_wait(200, 300),
+            &mut |p| {
+                kills.push(p);
+                Ok(())
+            },
+            &mut Vec::new(),
+        );
+        assert_eq!(kills, vec![child.id()]);
+        // 注入した kill は何も止めないので、子の複製が残り EOF には届かない。
+        assert_eq!(r, HolderExit::ExpiredKilled { drained: false });
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+    }
+
+    /// SEC-5・CORE-6・REPAIR-5(#2551): 本番の kill で、SIGSTOP で止められた mapper のセッションも SIGKILL で終わり、
+    /// EOF に届く。
+    #[test]
+    fn sec5_holder_expiry_real_kill_ends_stopped_session() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        send_pid(&mut a, child.id());
+        let sigstop = std::num::NonZeroU8::new(19).expect("nonzero");
+        sys::kill_pid(child.id(), sys::Signal::Number(sigstop)).expect("stop");
+        drop(a);
+        let r = holder_await_release(
+            &mut b,
+            &holder_test_wait(200, 5000),
+            &mut |pgid| sys::kill_process_group(pgid, sys::Signal::Kill),
+            &mut Vec::new(),
+        );
+        assert_eq!(r, HolderExit::ExpiredKilled { drained: true });
+        assert_eq!(child.wait().expect("wait").signal(), Some(9));
+    }
+
+    /// REPAIR-5(#2551): kill の後に EOF が来なくても `drain_wait` で戻る。
+    #[test]
+    fn sec5_holder_drain_wait_is_bounded() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        send_pid(&mut a, child.id());
+        let t = Instant::now();
+        let r = holder_await_release(
+            &mut b,
+            &holder_test_wait(200, 300),
+            &mut |_| Ok(()),
+            &mut Vec::new(),
+        );
+        assert_eq!(r, HolderExit::ExpiredKilled { drained: false });
+        assert!(t.elapsed() >= Duration::from_millis(500));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+    }
+
+    /// SEC-5(#2551): holder 自身・親の pid は錨にせず、期限切れでも kill しない。
+    #[test]
+    fn sec5_holder_rejects_mapper_pid_equal_to_self_or_parent() {
+        let own = std::process::id();
+        for (pid, parent) in [(own, 1), (own + 1, own + 1)] {
+            let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+            send_pid(&mut a, pid);
+            let mut w = holder_test_wait(200, 100);
+            w.expected_parent = parent;
+            let mut kills = Vec::new();
+            let mut diag = Vec::new();
+            let r = holder_await_release(
+                &mut b,
+                &w,
+                &mut |p| {
+                    kills.push(p);
+                    Ok(())
+                },
+                &mut diag,
+            );
+            assert_eq!(r, HolderExit::ExpiredNoKill, "{pid}");
+            assert!(kills.is_empty());
+            let text = String::from_utf8(diag).expect("utf8");
+            assert!(text.contains("no anchor"), "{text}");
+        }
+    }
+
+    /// SEC-5(#2551): mapper が `setsid` の前(セッション ID が自分の pid でない)なら kill しない。
+    #[test]
+    fn sec5_holder_skips_kill_when_mapper_has_not_set_session() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = Command::new("sleep").arg("30").spawn().expect("spawn");
+        send_pid(&mut a, child.id());
+        let mut kills = Vec::new();
+        // 子は holder(この試験)の子なので、錨の親照合を通る。
+        let r = holder_await_release(
+            &mut b,
+            &holder_test_wait(200, 100),
+            &mut |p| {
+                kills.push(p);
+                Ok(())
+            },
+            &mut Vec::new(),
+        );
+        assert_eq!(r, HolderExit::ExpiredNoKill);
+        assert!(kills.is_empty());
+        child.kill().expect("kill");
+        child.wait().expect("wait");
     }
 }

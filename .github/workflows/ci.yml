@@ -1140,7 +1140,7 @@ jobs:
           done
           echo "::notice::userns_extract verified"
 
-      # production_launcher・rootless_file_owner・seccomp（`crates/core/tests/`。CORE-1・CORE-5・CORE-6・SEC-1・
+      # production_launcher・rootless_file_owner・rootless_image_rootfs_remove・seccomp（`crates/core/tests/`。CORE-1・CORE-5・CORE-6・SEC-1・
       # SEC-4・SEC-5・#2376）: `--ignored` の実機前提テスト（harness = false）を非 root で実行する。
       # 範囲写像（`FANDHE_CONTAINER_TEST_ID_HELPER=1`。uidmap・subuid）と委譲 cgroup の前提は、`linux-env-probe.yml` の
       # `id-mapping-probe`（run 39295761418・2026-10-19・#2244）で ubuntu-latest が既定で満たすと実測済み。
@@ -1254,6 +1254,35 @@ jobs:
             fi
           done
           echo "::notice::rootless_file_owner verified"
+
+      - name: rootless_image_rootfs_remove のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test rootless_image_rootfs_remove --no-run
+
+      # subuid 所有の rootfs の木の回収・削除（OCI-7・SEC-5・CORE-6・#2540）。範囲写像の前提は上の前提確認ステップと同じ
+      # （sudo なし。新しい check-run・permissions は追加しない）。
+      - name: rootless_image_rootfs_remove の実行（実機前提テスト・--ignored。OCI-7・SEC-5・#2540）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/rootless_image_rootfs_remove.log"
+          USER="$(id -un)" \
+            cargo test -p fandhe-container-core --test rootless_image_rootfs_remove -- --ignored 2>&1 | tee "${log}"
+          for scenario in a b c d e; do
+            line="rootless_image_rootfs_remove: scenario ${scenario} verified"
+            if ! grep -Fxq "${line}" "${log}"; then
+              echo "::error::rootless_image_rootfs_remove did not report: ${line} (possibly not executed)" >&2
+              exit 1
+            fi
+            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if grep -Fq 'rootless_image_rootfs_remove: ignored' "${log}"; then
+            echo "::error::rootless_image_rootfs_remove reported an unexpected line: ignored" >&2
+            exit 1
+          fi
+          echo "::notice::rootless_image_rootfs_remove verified"
 
       - name: seccomp のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'

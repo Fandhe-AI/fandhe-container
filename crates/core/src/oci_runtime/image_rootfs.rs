@@ -26,10 +26,26 @@
 //! ロックの失敗か開き直しの不一致を `Internal` で返し（後始末はしない。持ち主は回収側）、再試行で成功する。
 //! 既知の残り: 本変更より前に作られたロックの無い木も「ロックが取れる」ため、名前・所有者・mode の条件を
 //! 満たせば回収対象になる（予約名のため許容）。ロックはローカルのファイルシステムが前提で、NFS 等での意味は
-//! 保証しない。公開済みで状態の無い `rootfs`（公開後・状態作成前のクラッシュ）は利用者のデータと
-//! 見分けられず、通常の create と共有する排他も無いため対象外で、手動で回復する。Linux 以外は作成自体が
-//! `Unimplemented` で木が生じず、[`reap_stale_unpacks`] も `Unimplemented` を返す（REPAIR-3）。
-//! 起動時の照合への配線（`StateStore::list` で列挙した bundle への呼び出し）は #2315 で扱う。
+//! 保証しない。mode は証拠にしない（userns の展開器はイメージの `./` の項目で展開先の root の mode を変えうる。
+//! 所有者は実効 uid、権限が `SubordinateIds` なら subuid の範囲も受ける）。確かめられず残した木の理由は
+//! [`UnverifiedReason`] で観測でき、[`reap_stale_unpacks_with`] は残した木・消せなかった木を 1 件ずつ失敗として
+//! 記録する（#2540・REPAIR-4）。Linux 以外は作成自体が `Unimplemented` で木が生じず、[`reap_stale_unpacks`] も
+//! `Unimplemented` を返す（REPAIR-3）。起動時の照合への配線（`StateStore::list` で列挙した bundle への呼び出し）は
+//! #2315 で扱う。
+//!
+//! # 公開済みで状態の無い rootfs の回収（#2540・OCI-7）
+//!
+//! 公開（`renameat2`）の後・状態作成の前にクラッシュした木、delete が状態を消した後の rootfs 削除に失敗した木、
+//! 状態を失った木は、次の同じ bundle の create を `AlreadyExists` で塞ぎ続ける。`create_with_image` は展開先を
+//! 作る前に [`reap_published_orphan`] を呼び、孤児と確かめられたときだけ消す（条件は同関数の doc）。印は v2
+//! （トークン + 作成時の (dev, ino)）で、同一性が一致しない複製（`cp -a`）や v1 の印は残す。生きている create は
+//! `CreatedRootfs` が状態作成まで木の `flock` を保持することで見分ける。
+//!
+//! # subuid 所有の木の削除（#2540・SEC-5・CORE-6）
+//!
+//! rootless で userns の中の展開器が作った木はホストの実効 uid では消せない。[`ImageRootfsPrivilege::SubordinateIds`]
+//! のときは、子プロセスの user namespace の中で（固定済みの親の fd を継承して）消す。delete・create 失敗の後始末・
+//! 展開途中の回収・孤児の回収が共有する。印は最後に消すので、途中で失敗しても次の回収が木を見分けられる。
 //!
 //! 本番の展開器（manifest からレイヤーの blob・mediaType・diff_id を引いて oci へ渡すアダプタ）と
 //! CLI / plugin の配線は未実装である（REPAIR-3。#2315 の配線で扱う）。
@@ -37,7 +53,10 @@
 use std::path::{Component, Path, PathBuf};
 
 use super::image_refs::ImageManifestDigest;
-use crate::traits::{ErrorCode, ImageRootfsRecord, TraitError};
+#[cfg(target_os = "linux")]
+use super::launcher::SubordinateIdSource;
+use crate::observability::{OpName, OpOutcome, OpRecorder};
+use crate::traits::{ErrorCode, ImageRootfsOwnership, ImageRootfsRecord, StateStore, TraitError};
 
 /// 非公開の展開先の名前の接頭辞。`root.path` の要素としてこの接頭辞を持つ名前は、展開中の非公開の木を
 /// 通常の create が rootfs として採用することを防ぐため、`prepare_rootfs_target` と `check_rootfs` が拒否する
@@ -50,12 +69,92 @@ pub(super) const STAGING_PREFIX: &str = crate::traits::state_store::IMAGE_ROOTFS
 #[cfg(target_os = "linux")]
 const OWNER_TOKEN_FILE: &str = ".fandhe-container-rootfs-owner";
 
+/// 印のファイルの最大バイト数（v2 は 32 + 1 + 20 + 1 + 20 + 1 = 75 バイト。余裕を見て 128）。
+#[cfg(target_os = "linux")]
+const MARKER_MAX_BYTES: u64 = 128;
+
+/// userns の中での削除に与える、削除そのものの予算（写像の書き込みの期限とは別。REPAIR-5）。
+#[cfg(target_os = "linux")]
+const USERNS_REMOVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// 公開済みの孤児の回収で、状態を調べるページ数・1 ページの件数の上限（無制限の走査を避ける。REPAIR-5）。
+#[cfg(target_os = "linux")]
+const ORPHAN_SCAN_MAX_PAGES: usize = 200;
+#[cfg(target_os = "linux")]
+const ORPHAN_SCAN_PAGE_SIZE: u32 = 500;
+
+/// 公開済みの孤児の回収の操作名（REPAIR-4・#2540）。
+const IMAGE_ROOTFS_ORPHAN_REAP_OP_NAME: &str = "image_rootfs_orphan_reap";
+/// 展開途中の木の回収の結果の内訳を 1 件ずつ失敗として記録する操作名（REPAIR-4・#2540）。
+/// `OpRecorder::snapshot` の失敗数が、残した木の件数として読める。
+const REAP_KEPT_UNVERIFIED_OP_NAME: &str = "image_rootfs_reap_kept_unverified";
+const REAP_FAILED_OP_NAME: &str = "image_rootfs_reap_failed";
+const REAP_TRUNCATED_OP_NAME: &str = "image_rootfs_reap_truncated";
+const REAP_SCAN_FAILED_OP_NAME: &str = "image_rootfs_reap_scan_failed";
+const IMAGE_ROOTFS_REAP_OP_NAME: &str = "image_rootfs_reap";
+
 /// 後始末で権限を補正しながら辿る項目数の上限（無制限の走査を避ける。展開側の既定上限と同程度）。
 #[cfg(target_os = "linux")]
 const CLEANUP_MAX_ENTRIES: usize = 1_000_000;
 /// 後始末で辿るディレクトリの深さの上限。
 #[cfg(target_os = "linux")]
 const CLEANUP_MAX_DEPTH: usize = 256;
+
+/// core が作った rootfs の木を消すときの権限（SEC-5・CORE-6・OCI-7・#2540）。
+///
+/// rootless で userns の中の展開器が作った木（`OwnershipPolicy::ChownInUserNamespace`）は、subuid 所有の
+/// inode を含み、ホストの実効 uid では `chmod`・`read_dir`・`unlink` が `EPERM` / `EACCES` になる。
+/// `SubordinateIds` のときは、削除を子プロセスの user namespace（コンテナ 0 → 自 euid、1.. → subordinate 範囲。
+/// start と pull の展開が共有する `SubordinateIdSource` の写像）の中で行う。
+///
+/// 呼び出し元: create は [`crate::oci_runtime::ContainerImage::with_rootfs_privilege`]（記録の
+/// `imageRootfs.ownership` にも反映）、delete は [`crate::oci_runtime::DeleteOptions`]、展開途中の回収は
+/// [`ReapOptions`] で渡す。既定は `HostEffectiveIds`（従来の挙動）。CLI / CRI / supervisor からの配線は
+/// #2315・#2243 の範囲で未実装（REPAIR-3）。Linux 以外は `HostEffectiveIds` だけ（作成自体が `Unimplemented`）。
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub enum ImageRootfsPrivilege {
+    /// ホストの実効 ID で消す（既定）。
+    #[default]
+    HostEffectiveIds,
+    /// subuid / subgid の範囲を含む user namespace の中で消す。
+    #[cfg(target_os = "linux")]
+    SubordinateIds(SubordinateIdSource),
+}
+
+impl ImageRootfsPrivilege {
+    /// create が記録に残す、木の所有者の種別。
+    pub(super) fn ownership(&self) -> ImageRootfsOwnership {
+        match self {
+            Self::HostEffectiveIds => ImageRootfsOwnership::HostIds,
+            #[cfg(target_os = "linux")]
+            Self::SubordinateIds(_) => ImageRootfsOwnership::SubordinateIds,
+        }
+    }
+}
+
+/// 既定の権限（ホストの実効 ID）。記録がホスト所有なら、呼び出し元の権限に依らずこれで消す。
+pub(super) static HOST_PRIVILEGE: ImageRootfsPrivilege = ImageRootfsPrivilege::HostEffectiveIds;
+
+/// [`reap_stale_unpacks_with`] の設定（将来の拡張に備え非網羅）。
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct ReapOptions {
+    privilege: ImageRootfsPrivilege,
+}
+
+impl ReapOptions {
+    /// 既定の設定（ホストの実効 ID）。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 木を消す権限を指定する（subuid 所有の展開途中の木を回収する場合は `SubordinateIds`）。
+    pub fn with_privilege(mut self, privilege: ImageRootfsPrivilege) -> Self {
+        self.privilege = privilege;
+        self
+    }
+}
 
 /// [`ImageRootfsUnpacker::unpack`] の結果（将来の拡張に備え非網羅）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -76,8 +175,10 @@ pub struct StagingReclamation {
     pub reclaimed: Vec<std::ffi::OsString>,
     /// ロックが取れず、生きている create が持つと判断して残した木。
     pub kept_alive: Vec<std::ffi::OsString>,
-    /// 種別・所有者・mode・同一性のいずれかを確かめられず残した木。
+    /// 種別・所有者・同一性・ロックのいずれかを確かめられず残した木。
     pub kept_unverified: Vec<std::ffi::OsString>,
+    /// `kept_unverified` と同じ並び（名前の昇順）で、確かめられなかった理由（REPAIR-4・#2540）。
+    pub kept_unverified_reasons: Vec<UnverifiedReason>,
     /// 回収を試みて削除に失敗した木（一部が消えて残っていることがある）。
     pub failed: Vec<std::ffi::OsString>,
     /// 走査の上限で打ち切り、残りを調べなかったか。
@@ -85,6 +186,24 @@ pub struct StagingReclamation {
     /// 親ディレクトリの列挙そのものに失敗した（`read_dir` の失敗・列挙中のエラー）か。
     /// 失敗した範囲に木が残っていても見えないため、回収は不完全として扱う（REPAIR-4）。
     pub scan_failed: bool,
+}
+
+/// 展開途中の木を「持ち主がいない」と確かめられず残した理由（REPAIR-4・#2540）。
+///
+/// 残した木は余分に持つだけの安全側だが、恒久に残り続けると見えないため、理由を観測できるようにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnverifiedReason {
+    /// リンクなどディレクトリでない実体だった。
+    NotDirectory,
+    /// 所有者が実効 uid（権限が許せば subuid の範囲）ではなかった。
+    Owner,
+    /// ロックを取った後に開き直した実体が、検査した実体と一致しなかった。
+    Identity,
+    /// ロックの取得で `WouldBlock` 以外の失敗をした。
+    LockError,
+    /// 開く・検査する段階で失敗した。
+    Open,
 }
 
 impl StagingReclamation {
@@ -237,7 +356,7 @@ pub(super) fn prepare_rootfs_target(
     bundle: &Path,
     root_path: &Path,
 ) -> Result<CreatedRootfs, TraitError> {
-    prepare_rootfs_target_with(bundle, root_path, &|reap| reap())
+    prepare_rootfs_target_with(bundle, root_path, &HOST_PRIVILEGE, &|reap| reap())
 }
 
 /// 回収の実処理を包む関数。回収を呼んだ結果をそのまま返す。
@@ -248,6 +367,7 @@ pub(super) type ReapHook<'a> = &'a dyn Fn(&dyn Fn() -> StagingReclamation) -> St
 pub(super) fn prepare_rootfs_target_with(
     bundle: &Path,
     root_path: &Path,
+    privilege: &ImageRootfsPrivilege,
     reap_hook: ReapHook<'_>,
 ) -> Result<CreatedRootfs, TraitError> {
     let parts = split_target(bundle, root_path)?;
@@ -255,7 +375,7 @@ pub(super) fn prepare_rootfs_target_with(
         return Err(invalid("rootfs must be a directory below the bundle"));
     };
     let parents: Vec<&std::ffi::OsStr> = parents.iter().map(|p| p.as_os_str()).collect();
-    let (backing, reclamation) = imp::create_dir(bundle, &parents, last, reap_hook)?;
+    let (backing, reclamation) = imp::create_dir(bundle, &parents, last, privilege, reap_hook)?;
     // 正規化した（Normal 要素だけの）経路。
     let path = parts.iter().fold(bundle.to_path_buf(), |mut p, part| {
         p.push(part);
@@ -286,7 +406,128 @@ pub fn reap_stale_unpacks(
         return Err(invalid("rootfs must be a directory below the bundle"));
     };
     let parents: Vec<&std::ffi::OsStr> = parents.iter().map(|p| p.as_os_str()).collect();
-    imp::reap_stale(bundle, &parents)
+    imp::reap_stale(bundle, &parents, &HOST_PRIVILEGE)
+}
+
+/// [`reap_stale_unpacks`] に、結果の記録（REPAIR-4）を足したもの。起動時の照合用の入口（#2540）。
+///
+/// 回収の結果を `recorder` へ、従来の `image_rootfs_reap`（成功 / 失敗）に加え、残した木・消せなかった木・
+/// 打ち切り・走査の失敗を **1 件ずつ** 失敗として記録する（`image_rootfs_reap_kept_unverified` 等）。
+/// `options` の権限が `SubordinateIds` なら、subuid 所有の木も userns の中で回収する（SEC-5）。
+/// `OpRecorder::snapshot` の失敗数が件数として読めるので、恒久に `Unverified` のまま残る木を見落とさない。
+pub fn reap_stale_unpacks_with(
+    bundle: &Path,
+    root_path: &Path,
+    options: &ReapOptions,
+    recorder: &OpRecorder,
+) -> Result<StagingReclamation, TraitError> {
+    let started = std::time::Instant::now();
+    let parts = split_target(bundle, root_path)?;
+    let Some((_, parents)) = parts.split_last() else {
+        return Err(invalid("rootfs must be a directory below the bundle"));
+    };
+    let parents: Vec<&std::ffi::OsStr> = parents.iter().map(|p| p.as_os_str()).collect();
+    let reclamation = imp::reap_stale(bundle, &parents, &options.privilege)?;
+    record_staging_reclamation(recorder, &reclamation, started.elapsed());
+    Ok(reclamation)
+}
+
+/// 展開途中の木の回収結果を記録する（`create_with_image` と [`reap_stale_unpacks_with`] が共有。REPAIR-4）。
+///
+/// 何も無ければ記録しない。消せなかった・確かめられなかった・打ち切った・走査に失敗したものがあれば
+/// `image_rootfs_reap` を失敗として記録し（create 自体は失敗させない）、内訳を 1 件ずつ別の操作名で
+/// 失敗として記録する。
+pub(super) fn record_staging_reclamation(
+    recorder: &OpRecorder,
+    reclamation: &StagingReclamation,
+    elapsed: std::time::Duration,
+) {
+    if !reclamation.is_noteworthy() {
+        return;
+    }
+    let outcome = if reclamation.is_incomplete() {
+        OpOutcome::Failure
+    } else {
+        OpOutcome::Success
+    };
+    let record = |name: &str, outcome: OpOutcome, elapsed: std::time::Duration| {
+        if let Ok(name) = OpName::new(name) {
+            let _ = recorder.record(&name, outcome, elapsed);
+        }
+    };
+    record(IMAGE_ROOTFS_REAP_OP_NAME, outcome, elapsed);
+    let none = std::time::Duration::ZERO;
+    for _ in &reclamation.kept_unverified {
+        record(REAP_KEPT_UNVERIFIED_OP_NAME, OpOutcome::Failure, none);
+    }
+    for _ in &reclamation.failed {
+        record(REAP_FAILED_OP_NAME, OpOutcome::Failure, none);
+    }
+    if reclamation.truncated {
+        record(REAP_TRUNCATED_OP_NAME, OpOutcome::Failure, none);
+    }
+    if reclamation.scan_failed {
+        record(REAP_SCAN_FAILED_OP_NAME, OpOutcome::Failure, none);
+    }
+}
+
+/// 公開済みで状態の無い rootfs（孤児）の回収結果（REPAIR-4・#2540）。
+// Linux 以外は孤児が生じず `NotPresent` しか構築されない。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(super) enum OrphanReap {
+    /// 最終の名前に何も無かった（回収する物が無い）。
+    NotPresent,
+    /// 孤児と確かめて消した。
+    Reclaimed,
+    /// ツリーのロックを他が持つ（生きている create）ため残した。
+    Alive,
+    /// bundle の所有ロックを他が持つ（delete・状態作成の最中）ため残した。
+    Held,
+    /// 印・所有者・同一性・状態の照合のいずれかを確かめられず残した。
+    Unverified,
+    /// 回収を試みて削除に失敗した（一部が消えて残っていることがある）。
+    Failed,
+}
+
+/// `root.path` の最終の名前に公開済みの rootfs があり、状態を持たない孤児と確かめられれば消す（#2540・OCI-7）。
+///
+/// 呼び出し元は `create_with_image` の展開先の作成の前。公開後・状態作成前のクラッシュ、delete が状態を
+/// 消した後の rootfs 削除の失敗、状態の喪失で残った木が、同じ bundle の次の create を `AlreadyExists` で
+/// 塞ぎ続けないようにする。消すのは次のすべてを満たすときだけで、どれかを確かめられなければ残す（OCI-7:
+/// 誤るときは余分に残す側だけ）。
+///
+/// 1. bundle の所有ロックを取れる（delete・通常の create の状態作成と排他。保持中は `Held`）
+/// 2. 最終の名前がリンクでないディレクトリで、親と同じマウント
+/// 3. 木のディレクトリの `flock` が取れる（`WouldBlock` は生きている create。`Alive`）
+/// 4. 印のファイルが v2 形式で、所有者が実効 uid・mode 0400・nlink 1・通常ファイル、かつ印の (dev, ino) が
+///    木の実体と一致する（`cp -a` での複製や利用者のデータを消さない）
+/// 5. `store` の全レコードに、印のトークンを持つものも、同じ bundle を指すものも無い（一覧の失敗・打ち切りは
+///    確かめられないので残す）
+///
+/// 別の状態ルート（`--root` 違い）のコンテナが同じ bundle の rootfs を使う構成は支援しない（5. で見えない。
+/// `docs/design/image-rootfs-lifetime.md`）。Linux 以外は常に `NotPresent`（作成が `Unimplemented`）。
+pub(super) fn reap_published_orphan(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    bundle: &Path,
+    root_path: &Path,
+    privilege: &ImageRootfsPrivilege,
+) -> OrphanReap {
+    let started = std::time::Instant::now();
+    let outcome = imp::reap_published_orphan(store, bundle, root_path, privilege);
+    let result = match outcome {
+        OrphanReap::NotPresent | OrphanReap::Alive => None,
+        OrphanReap::Reclaimed => Some(OpOutcome::Success),
+        OrphanReap::Held | OrphanReap::Unverified | OrphanReap::Failed => Some(OpOutcome::Failure),
+    };
+    if let Some(result) = result
+        && let Ok(name) = OpName::new(IMAGE_ROOTFS_ORPHAN_REAP_OP_NAME)
+    {
+        let _ = recorder.record(&name, result, started.elapsed());
+    }
+    outcome
 }
 
 /// 経路のいずれかの要素が非公開の展開先の予約名（[`STAGING_PREFIX`] 始まり）か。
@@ -359,8 +600,14 @@ impl CreatedRootfs {
     /// 作成時に固定した親（Linux は fd）の下で、末尾が作ったときと同じディレクトリ（dev・ino）で
     /// なければ削除しない（`FailedPrecondition`。差し替えられた先 = bundle 外の実体を消さない fail-closed）。
     /// Linux 以外は同一性を保証できないため常に `FailedPrecondition` で拒否する。
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn remove(self) -> Result<(), TraitError> {
-        imp::remove(&self.path, self.backing)
+        self.remove_with(&HOST_PRIVILEGE)
+    }
+
+    /// [`Self::remove`] に、木を消す権限を指定したもの（subuid 所有の木は userns の中で消す。SEC-5・#2540）。
+    pub(super) fn remove_with(self, privilege: &ImageRootfsPrivilege) -> Result<(), TraitError> {
+        imp::remove(&self.path, self.backing, privilege)
     }
 }
 
@@ -371,11 +618,25 @@ impl CreatedRootfs {
 /// 末尾が記録の (dev, ino) と一致するディレクトリのときだけ中身ごと消す。symlink・ディレクトリでないもの・
 /// 同一性の不一致は `FailedPrecondition` で拒否し何も消さない（fail-closed）。どの段でも `ENOENT` なら
 /// [`RecordedRootfsRemoval::NotPresent`]。Linux 以外は同一性を保証できないため `Unimplemented`。
+#[cfg(all(test, target_os = "linux"))]
 pub(super) fn remove_recorded_rootfs(
     bundle: &Path,
     rec: &ImageRootfsRecord,
 ) -> Result<RecordedRootfsRemoval, TraitError> {
-    imp::remove_recorded(bundle, rec)
+    remove_recorded_rootfs_with(bundle, rec, &HOST_PRIVILEGE)
+}
+
+/// [`remove_recorded_rootfs`] に、木を消す権限を指定したもの（SEC-5・#2540）。
+///
+/// 記録の `ownership` が `SubordinateIds`（subuid 所有の inode を含む）なのに `privilege` が
+/// `HostEffectiveIds` のときは、ホストの ID では消せないので木に触れず `FailedPrecondition` で拒否する
+/// （部分削除で印だけ消える順序依存を避ける）。ホスト所有の記録は、権限に依らず従来どおりホストの ID で消す。
+pub(super) fn remove_recorded_rootfs_with(
+    bundle: &Path,
+    rec: &ImageRootfsRecord,
+    privilege: &ImageRootfsPrivilege,
+) -> Result<RecordedRootfsRemoval, TraitError> {
+    imp::remove_recorded(bundle, rec, privilege)
 }
 
 #[cfg(target_os = "linux")]
@@ -391,11 +652,22 @@ mod imp {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        CLEANUP_MAX_DEPTH, CLEANUP_MAX_ENTRIES, ImageRootfsRecord, RecordedRootfsRemoval,
-        STAGING_PREFIX, StagingReclamation, invalid, refuse, remove_failed,
+        CLEANUP_MAX_DEPTH, CLEANUP_MAX_ENTRIES, ImageRootfsRecord, MARKER_MAX_BYTES,
+        ORPHAN_SCAN_MAX_PAGES, ORPHAN_SCAN_PAGE_SIZE, OrphanReap, RecordedRootfsRemoval,
+        STAGING_PREFIX, StagingReclamation, UnverifiedReason, invalid, refuse, remove_failed,
     };
+    use super::{HOST_PRIVILEGE, ImageRootfsPrivilege, USERNS_REMOVE_BUDGET};
+    use crate::exec::{
+        ChildExit, IsolationConfig, Namespace, NamespaceSet, isolate_rootless_subordinate,
+        plan_rootless_subordinate, wait_forked_child,
+    };
+    use crate::oci_runtime::launch::BundleLock;
+    use crate::oci_runtime::launcher::SubordinateIdSource;
+    use crate::rootless::IdMapSet;
     use crate::sys::{self, SysError};
-    use crate::traits::{ErrorCode, TraitError};
+    use crate::traits::{
+        ErrorCode, ImageRootfsOwnership, ListStateRequest, StateStore, TraitError,
+    };
 
     /// 非公開の展開先の名前の連番（同一プロセス内の衝突を避ける。別プロセスとは pid で分ける）。
     static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -458,7 +730,10 @@ mod imp {
                 |_| TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token"),
             )?;
         }
-        let written = write_marker(&proc_dir, &token);
+        // v2: 1 行目 = トークン、2 行目 = 木の作成時の `<dev>:<ino>`。複製（`cp -a`）は inode が新しくなり
+        // 2 行目が一致しないので、孤児の回収が利用者の複製を消さない（#2540）。
+        let content = format!("{token}\n{}:{}\n", b.identity.0, b.identity.1);
+        let written = write_marker(&proc_dir, &content);
         if widened != original {
             let restored =
                 std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(original));
@@ -474,7 +749,7 @@ mod imp {
     }
 
     /// 固定した rootfs（`proc_dir`）の直下へ所有トークンの印を新規作成して書く。
-    fn write_marker(proc_dir: &str, token: &str) -> Result<(), TraitError> {
+    fn write_marker(proc_dir: &str, content: &str) -> Result<(), TraitError> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let path = format!("{proc_dir}/{}", super::OWNER_TOKEN_FILE);
@@ -494,7 +769,7 @@ mod imp {
                     TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token")
                 }
             })?;
-        f.write_all(token.as_bytes())
+        f.write_all(content.as_bytes())
             .and_then(|()| f.sync_all())
             .map_err(|_| {
                 TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token")
@@ -502,35 +777,88 @@ mod imp {
         Ok(())
     }
 
-    /// 固定した rootfs の fd 直下の印のファイルが `expected` と一致するか（リンク非追従・通常ファイルのみ・
-    /// FIFO で止まらない）。
-    fn token_matches(root: BorrowedFd<'_>, expected: &str) -> bool {
+    /// 印のファイルの内容（#2378 の v1 = トークンのみ、#2540 の v2 = トークン + 作成時の (dev, ino)）。
+    struct Marker {
+        token: String,
+        /// v2 だけが持つ、木の作成時の実体の (dev, ino)。v1 は `None`。
+        identity: Option<(u64, u64)>,
+    }
+
+    /// 印の内容を厳密に解析する（16 進と 10 進だけ。長さは呼び出し側が [`MARKER_MAX_BYTES`] で制限済み）。
+    fn parse_marker(buf: &[u8]) -> Option<Marker> {
+        let text = std::str::from_utf8(buf).ok()?;
+        let mut lines = text.split('\n');
+        let token = lines.next()?;
+        if token.len() != 32
+            || !token
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return None;
+        }
+        let Some(second) = lines.next() else {
+            return Some(Marker {
+                token: token.to_owned(),
+                identity: None,
+            });
+        };
+        let (dev, ino) = second.split_once(':')?;
+        let num = |v: &str| {
+            (!v.is_empty() && v.len() <= 20 && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<u64>().ok())
+                .flatten()
+        };
+        // 2 行目の後は空（末尾の改行）だけで、それ以外は拒否する。
+        if lines.next() != Some("") || lines.next().is_some() {
+            return None;
+        }
+        Some(Marker {
+            token: token.to_owned(),
+            identity: Some((num(dev)?, num(ino)?)),
+        })
+    }
+
+    /// 固定した rootfs の fd 直下の印のファイルを読む（リンク非追従・通常ファイルのみ・FIFO で止まらない）。
+    ///
+    /// `strict` のときは、孤児の回収の証拠として所有者が実効 uid・mode 0400・nlink 1 も要求する
+    /// （利用者が置いた別のファイルを印と見なさない。#2540）。
+    fn read_marker(root: BorrowedFd<'_>, strict: bool) -> Option<Marker> {
         use std::io::Read;
         // 先に `O_PATH|O_NOFOLLOW` で実体を固定し、fstat で通常ファイルと確かめてから、固定済みの fd を
         // 読み取りで開き直す。種別確認が open より前のため、デバイス・FIFO への差し替えでも open の
         // 副作用（端末の取得・ブロック）が起きない（SEC-1）。
-        let Ok(name) = CString::new(super::OWNER_TOKEN_FILE) else {
-            return false;
-        };
-        let Ok(pinned) = sys::open_path_nofollow_at(root, &name) else {
-            return false;
-        };
-        let Ok((_, _, _, mode)) = fstat(pinned.as_fd()) else {
-            return false;
-        };
+        let name = CString::new(super::OWNER_TOKEN_FILE).ok()?;
+        let pinned = sys::open_path_nofollow_at(root, &name).ok()?;
+        let meta = File::from(pinned.as_fd().try_clone_to_owned().ok()?)
+            .metadata()
+            .ok()?;
         // S_IFMT = 0o170000・S_IFREG = 0o100000。
-        if mode & 0o170_000 != 0o100_000 {
-            return false;
+        if meta.mode() & 0o170_000 != 0o100_000 {
+            return None;
         }
-        let Ok(fd) = sys::reopen_pinned_read_nonblock(pinned.as_fd()) else {
-            return false;
-        };
+        if strict
+            && (meta.uid() != sys::effective_uid()
+                || meta.nlink() != 1
+                || meta.mode() & 0o7777 != 0o400)
+        {
+            return None;
+        }
+        let fd = sys::reopen_pinned_read_nonblock(pinned.as_fd()).ok()?;
         let f = File::from(fd);
-        if !f.metadata().is_ok_and(|m| m.is_file() && m.len() <= 64) {
-            return false;
+        if !f
+            .metadata()
+            .is_ok_and(|m| m.is_file() && m.len() <= MARKER_MAX_BYTES)
+        {
+            return None;
         }
         let mut buf = Vec::new();
-        f.take(65).read_to_end(&mut buf).is_ok() && buf == expected.as_bytes()
+        f.take(MARKER_MAX_BYTES + 1).read_to_end(&mut buf).ok()?;
+        parse_marker(&buf)
+    }
+
+    /// 固定した rootfs の fd 直下の印のファイルのトークンが `expected` と一致するか（v1・v2 のどちらも受ける）。
+    fn token_matches(root: BorrowedFd<'_>, expected: &str) -> bool {
+        read_marker(root, false).is_some_and(|m| m.token == expected)
     }
 
     pub(super) fn unpack_path(_path: &Path, b: &Backing) -> PathBuf {
@@ -644,9 +972,10 @@ mod imp {
     pub(super) fn reap_stale(
         bundle: &Path,
         parents: &[&OsStr],
+        privilege: &ImageRootfsPrivilege,
     ) -> Result<StagingReclamation, TraitError> {
         let cur = open_parent(bundle, parents)?;
-        Ok(reap_under(cur.as_fd()))
+        Ok(reap_under(cur.as_fd(), privilege))
     }
 
     /// 名前が `.fandhe-unpack-<pid>-<seq>`（pid は 1〜10 桁・seq は 1〜20 桁の 10 進数）に厳密に一致するか。
@@ -665,7 +994,8 @@ mod imp {
     }
 
     /// 親 `cur`（固定済みの fd）の下の、持ち主のいない展開途中の木を回収する。結果は名前の昇順。
-    fn reap_under(cur: BorrowedFd<'_>) -> StagingReclamation {
+    fn reap_under(cur: BorrowedFd<'_>, privilege: &ImageRootfsPrivilege) -> StagingReclamation {
+        let policy = OwnerPolicy::new(privilege);
         let mut result = StagingReclamation::default();
         let Ok(rd) = std::fs::read_dir(format!("/proc/self/fd/{}", cur.as_raw_fd())) else {
             result.scan_failed = true;
@@ -688,10 +1018,13 @@ mod imp {
         }
         names.sort();
         for name in names {
-            match reap_one(cur, &name) {
+            match reap_one(cur, &name, &policy, privilege) {
                 Reap::Reclaimed => result.reclaimed.push(name),
                 Reap::Alive => result.kept_alive.push(name),
-                Reap::Unverified => result.kept_unverified.push(name),
+                Reap::Unverified(reason) => {
+                    result.kept_unverified.push(name);
+                    result.kept_unverified_reasons.push(reason);
+                }
                 Reap::Failed => result.failed.push(name),
                 Reap::Gone => {}
             }
@@ -702,52 +1035,252 @@ mod imp {
     enum Reap {
         Reclaimed,
         Alive,
-        Unverified,
+        Unverified(UnverifiedReason),
         Failed,
         /// 調べている間に消えた（別の回収側が先に消した）。
         Gone,
     }
 
     /// 1 つの候補を調べ、持ち主がいないと確かめられたときだけ消す（確かめられなければ残す）。
-    fn reap_one(cur: BorrowedFd<'_>, name: &OsStr) -> Reap {
+    ///
+    /// 証拠は予約名の正規表現・実効 uid 所有・`flock` が取れること・ロック中の同一性の再確認である。
+    /// mode は証拠にしない: userns の中の展開器はイメージの `./` の項目で展開先の root の mode を変えうる
+    /// （例: 0755）ため、0700 を要求するとクラッシュした展開の木が恒久に `Unverified` になる。消すのは
+    /// マウントを跨がずリンクも辿らない再帰削除なので、他人が足したハードリンクを消しても相手のデータは
+    /// 消えない（#2540）。
+    fn reap_one(
+        cur: BorrowedFd<'_>,
+        name: &OsStr,
+        policy: &OwnerPolicy,
+        privilege: &ImageRootfsPrivilege,
+    ) -> Reap {
         let Ok(cname) = cstr(name) else {
-            return Reap::Unverified;
+            return Reap::Unverified(UnverifiedReason::Open);
         };
         let fd = match sys::open_dir_path_nofollow(Some(cur), &cname) {
             Ok(fd) => fd,
             Err(SysError::Os(n)) if n == sys::ENOENT => return Reap::Gone,
-            Err(_) => return Reap::Unverified,
+            // 予約名の位置にリンクやディレクトリでない実体があると、`O_DIRECTORY | O_NOFOLLOW` が ENOTDIR / ELOOP。
+            Err(SysError::Os(n)) if n == sys::ENOTDIR || n == sys::ELOOP => {
+                return Reap::Unverified(UnverifiedReason::NotDirectory);
+            }
+            Err(_) => return Reap::Unverified(UnverifiedReason::Open),
         };
         let identity = match fstat(fd.as_fd()) {
-            Ok((dev, ino, true, mode))
-                if mode & 0o777 == 0o700 && fd_owner(fd.as_fd()) == Some(sys::effective_uid()) =>
-            {
+            Ok((dev, ino, true, _)) => {
+                if !fd_owner(fd.as_fd()).is_some_and(|uid| policy.allows(uid)) {
+                    return Reap::Unverified(UnverifiedReason::Owner);
+                }
                 (dev, ino)
             }
-            _ => return Reap::Unverified,
+            Ok(_) => return Reap::Unverified(UnverifiedReason::NotDirectory),
+            Err(_) => return Reap::Unverified(UnverifiedReason::Open),
         };
         // O_PATH の fd には flock できないため、`/proc/self/fd/N` から開き直したディレクトリにロックを掛ける。
-        let Ok(lock) = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) else {
-            return Reap::Unverified;
+        let lock = match File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) {
+            Ok(lock) => lock,
+            // 展開途中で落ちた subuid 所有の木は mode 0700 のことがあり、ホストの実効 uid では開けない
+            // （EACCES）。権限が `SubordinateIds` なら、ロック取得・同一性の再確認・削除を userns の子の中で
+            // 続けて行う（子は固定済みの親 fd を継承し、ロックは子の終了まで保持される。#2540・SEC-5）。
+            Err(e)
+                if e.raw_os_error() == Some(sys::EACCES)
+                    && matches!(privilege, ImageRootfsPrivilege::SubordinateIds(_)) =>
+            {
+                return reap_in_userns(privilege, cur, &cname, identity);
+            }
+            Err(_) => return Reap::Unverified(UnverifiedReason::LockError),
         };
         match lock.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => return Reap::Alive,
-            Err(_) => return Reap::Unverified,
+            Err(_) => return Reap::Unverified(UnverifiedReason::LockError),
         }
         // ロックを保持したまま名前から開き直し、検査した実体と同じことを確かめる（差し替え・別の回収側の
         // 取り直しを弾く）。ロックはこの関数を出るまで保持する。
         match sys::open_dir_path_nofollow(Some(cur), &cname) {
             Ok(again) => match fstat(again.as_fd()) {
                 Ok((dev, ino, true, _)) if (dev, ino) == identity => {}
-                _ => return Reap::Unverified,
+                _ => return Reap::Unverified(UnverifiedReason::Identity),
             },
             Err(SysError::Os(n)) if n == sys::ENOENT => return Reap::Gone,
-            Err(_) => return Reap::Unverified,
+            Err(_) => return Reap::Unverified(UnverifiedReason::Identity),
         }
-        match remove_tree_at(cur, &cname, identity, Owner::Unchecked) {
+        match remove_tree_priv(privilege, cur, &cname, identity, Owner::Unchecked) {
             Ok(_) => Reap::Reclaimed,
             Err(_) => Reap::Failed,
+        }
+    }
+
+    /// ホストの実効 uid ではロックを取れない subuid 所有の木を、userns の子の中で回収する。
+    fn reap_in_userns(
+        privilege: &ImageRootfsPrivilege,
+        cur: BorrowedFd<'_>,
+        cname: &CString,
+        identity: (u64, u64),
+    ) -> Reap {
+        let ImageRootfsPrivilege::SubordinateIds(source) = privilege else {
+            return Reap::Unverified(UnverifiedReason::LockError);
+        };
+        match userns_run(source, cur, cname, identity, Owner::Unchecked, true) {
+            Ok(UsernsOutcome::Removed) => Reap::Reclaimed,
+            Ok(UsernsOutcome::NotPresent) => Reap::Gone,
+            Ok(UsernsOutcome::Alive) => Reap::Alive,
+            Ok(UsernsOutcome::LockError) => Reap::Unverified(UnverifiedReason::LockError),
+            Ok(UsernsOutcome::Identity) => Reap::Unverified(UnverifiedReason::Identity),
+            Err(_) => Reap::Failed,
+        }
+    }
+
+    /// 公開済みの最終の名前の検査結果。
+    enum Probe {
+        Gone,
+        Alive,
+        Unverified,
+        Orphan(Orphan),
+    }
+
+    /// 孤児と確かめた木（ロックを保持している間は他の回収側・create から「持ち主あり」に見える）。
+    struct Orphan {
+        identity: (u64, u64),
+        token: String,
+        _lock: File,
+    }
+
+    /// 親 `cur`（固定済みの fd）の下の最終の名前 `cname` が、孤児の条件（[`super::reap_published_orphan`] の
+    /// 2〜4）を満たすかを調べる。
+    fn inspect_published(cur: BorrowedFd<'_>, cname: &CString) -> Probe {
+        let fd = match sys::open_dir_path_nofollow(Some(cur), cname) {
+            Ok(fd) => fd,
+            Err(SysError::Os(n)) if n == sys::ENOENT => return Probe::Gone,
+            Err(_) => return Probe::Unverified,
+        };
+        let identity = match fstat(fd.as_fd()) {
+            Ok((dev, ino, true, _)) => (dev, ino),
+            _ => return Probe::Unverified,
+        };
+        // 親と別のマウント（マウントポイント・bind mount）の木は消さない。
+        let Some(mnt) = mount_id(fd.as_fd()) else {
+            return Probe::Unverified;
+        };
+        if mount_id(cur) != Some(mnt) {
+            return Probe::Unverified;
+        }
+        let Ok(lock) = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) else {
+            return Probe::Unverified;
+        };
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => return Probe::Alive,
+            Err(_) => return Probe::Unverified,
+        }
+        match sys::open_dir_path_nofollow(Some(cur), cname) {
+            Ok(again) => match fstat(again.as_fd()) {
+                Ok((dev, ino, true, _)) if (dev, ino) == identity => {}
+                _ => return Probe::Unverified,
+            },
+            Err(SysError::Os(n)) if n == sys::ENOENT => return Probe::Gone,
+            Err(_) => return Probe::Unverified,
+        }
+        // 印は v2（同一性つき）で、木の実体と一致するものだけを証拠にする。v1 や複製された印は残す。
+        let Some(marker) = read_marker(fd.as_fd(), true) else {
+            return Probe::Unverified;
+        };
+        if marker.identity != Some(identity) {
+            return Probe::Unverified;
+        }
+        Probe::Orphan(Orphan {
+            identity,
+            token: marker.token,
+            _lock: lock,
+        })
+    }
+
+    /// `store` の全レコードを調べ、印のトークンを持つもの・同じ bundle を指すものがあるか。
+    /// 一覧の失敗・ページ数の上限超過・bundle の同一性を確かめられない場合は `None`（不明。呼び出し側は残す）。
+    fn store_references(store: &dyn StateStore, bundle: &Path, token: &str) -> Option<bool> {
+        let bundle_meta = std::fs::metadata(bundle).ok()?;
+        let page_size = std::num::NonZeroU32::new(ORPHAN_SCAN_PAGE_SIZE)?;
+        let mut cursor = None;
+        for _ in 0..ORPHAN_SCAN_MAX_PAGES {
+            let mut req = ListStateRequest::new(page_size).ok()?;
+            if let Some(c) = cursor.take() {
+                req = req.with_cursor(c);
+            }
+            let page = store.list(&req).ok()?;
+            for rec in page.records() {
+                if rec.image_rootfs().and_then(ImageRootfsRecord::token) == Some(token) {
+                    return Some(true);
+                }
+                if rec.bundle() == bundle {
+                    return Some(true);
+                }
+                match std::fs::metadata(rec.bundle()) {
+                    Ok(m) if (m.dev(), m.ino()) == (bundle_meta.dev(), bundle_meta.ino()) => {
+                        return Some(true);
+                    }
+                    Ok(_) => {}
+                    // 相手の bundle が無ければ別物。それ以外の失敗は判定不能として残す。
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(_) => return None,
+                }
+            }
+            match page.next_cursor() {
+                None => return Some(false),
+                Some(c) => cursor = Some(c.clone()),
+            }
+        }
+        None
+    }
+
+    pub(super) fn reap_published_orphan(
+        store: &dyn StateStore,
+        bundle: &Path,
+        root_path: &Path,
+        privilege: &ImageRootfsPrivilege,
+    ) -> OrphanReap {
+        // 経路の検査エラーは後続の `prepare_rootfs_target_with` が従来どおり報告する。ここでは回収しない。
+        let Ok(parts) = super::split_target(bundle, root_path) else {
+            return OrphanReap::NotPresent;
+        };
+        let Some((last, parents)) = parts.split_last() else {
+            return OrphanReap::NotPresent;
+        };
+        let parents: Vec<&OsStr> = parents.iter().map(|p| p.as_os_str()).collect();
+        let Ok(cur) = open_parent(bundle, &parents) else {
+            return OrphanReap::NotPresent;
+        };
+        let Ok(cname) = cstr(last) else {
+            return OrphanReap::NotPresent;
+        };
+        match sys::open_path_nofollow_at(cur.as_fd(), &cname) {
+            Err(SysError::Os(n)) if n == sys::ENOENT => return OrphanReap::NotPresent,
+            Err(_) => return OrphanReap::Unverified,
+            Ok(_) => {}
+        }
+        // delete の後始末・通常の create の状態作成と排他する（回収の判定と削除の間だけ保持する）。
+        let _bundle_lock = match BundleLock::acquire_resolved(bundle) {
+            Ok(lock) => lock,
+            Err(e) if e.code() == ErrorCode::FailedPrecondition => return OrphanReap::Held,
+            Err(_) => return OrphanReap::Unverified,
+        };
+        let orphan = match inspect_published(cur.as_fd(), &cname) {
+            Probe::Gone => return OrphanReap::NotPresent,
+            Probe::Alive => return OrphanReap::Alive,
+            Probe::Unverified => return OrphanReap::Unverified,
+            Probe::Orphan(o) => o,
+        };
+        if store_references(store, bundle, &orphan.token) != Some(false) {
+            return OrphanReap::Unverified;
+        }
+        match remove_tree_priv(
+            privilege,
+            cur.as_fd(),
+            &cname,
+            orphan.identity,
+            Owner::Token(Some(&orphan.token)),
+        ) {
+            Ok(_) => OrphanReap::Reclaimed,
+            Err(_) => OrphanReap::Failed,
         }
     }
 
@@ -755,11 +1288,12 @@ mod imp {
         bundle: &Path,
         parents: &[&OsStr],
         last: &OsStr,
+        privilege: &ImageRootfsPrivilege,
         reap_hook: super::ReapHook<'_>,
     ) -> Result<(Backing, StagingReclamation), TraitError> {
         let cur = open_parent(bundle, parents)?;
         // 同じ親の下に残った、持ち主のいない展開途中の木を先に回収する（PID の再利用による名前の衝突も解く）。
-        let reclamation = reap_hook(&|| reap_under(cur.as_fd()));
+        let reclamation = reap_hook(&|| reap_under(cur.as_fd(), privilege));
         let final_name = cstr(last)?;
         // 最終の名前が既にあれば展開せずに拒否する（利用者の既存データへ展開しない。公開時の
         // `RENAME_NOREPLACE` が最終的な排他）。
@@ -858,9 +1392,203 @@ mod imp {
         Ok(b.identity)
     }
 
-    pub(super) fn remove(_path: &Path, b: Backing) -> Result<(), TraitError> {
+    pub(super) fn remove(
+        _path: &Path,
+        b: Backing,
+        privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
         // 既に無ければ消す物が無い（`NotPresent` も成功）。
-        remove_tree_at(b.parent.as_fd(), &b.current, b.identity, Owner::Unchecked).map(|_| ())
+        remove_tree_priv(
+            privilege,
+            b.parent.as_fd(),
+            &b.current,
+            b.identity,
+            Owner::Unchecked,
+        )
+        .map(|_| ())
+    }
+
+    /// `privilege` に従って木を消す。`HostEffectiveIds` はホストの ID で、`SubordinateIds` は子プロセスの
+    /// user namespace の中で（subuid 所有の inode を消すため）消す。
+    fn remove_tree_priv(
+        privilege: &ImageRootfsPrivilege,
+        parent: BorrowedFd<'_>,
+        name: &CString,
+        identity: (u64, u64),
+        owner: Owner<'_>,
+    ) -> Result<RecordedRootfsRemoval, TraitError> {
+        match privilege {
+            ImageRootfsPrivilege::SubordinateIds(source) => {
+                remove_tree_in_userns(source, parent, name, identity, owner)
+            }
+            _ => remove_tree_at(parent, name, identity, owner),
+        }
+    }
+
+    // userns の子の終了コード（固定語彙。パス・errno を親へ運ばない）。`EXIT_SETUP_FAILED`（125）と区別する。
+    const CHILD_REMOVED: i32 = 0;
+    const CHILD_NOT_PRESENT: i32 = 10;
+    const CHILD_REFUSED: i32 = 11;
+    const CHILD_FAILED: i32 = 12;
+    const CHILD_SETUP_FAILED: i32 = 13;
+    const CHILD_ALIVE: i32 = 14;
+    const CHILD_LOCK_ERROR: i32 = 15;
+    const CHILD_IDENTITY: i32 = 16;
+
+    /// userns の子の結果（`lock_in_child` のときだけ `Alive` / `LockError` / `Identity` が出る）。
+    enum UsernsOutcome {
+        Removed,
+        NotPresent,
+        Alive,
+        LockError,
+        Identity,
+    }
+
+    /// subuid 所有の木を、子プロセスの user namespace の中で消す（SEC-5・CORE-6・#2540）。
+    ///
+    /// 子は呼び出し元が固定済みの親の fd・(dev, ino)・所有者照合をそのまま継承し（経路を再解決しないので
+    /// TOCTOU の保証はホスト側と同じ）、`isolate_rootless_subordinate`（User namespace のみ。Mount は分けず
+    /// `mnt_id` の照合を保つ。holder / mapper 方式で呼び出し側は dumpable にならない。#2374）で
+    /// コンテナ 0 → 自 euid の ns に入ってから `remove_tree_at` を呼び、固定の終了コードで結果を返して
+    /// `_exit` する。親は期限つきで待ち、超えたら kill して回収する（REPAIR-5）。
+    ///
+    /// 呼び出しプロセスがマルチスレッドなら fork の検査が拒否し、`FailedPrecondition` で木を残す
+    /// （CRI / tokio 経路の子プロセス方式の配線は #2315 の範囲）。
+    fn remove_tree_in_userns(
+        source: &SubordinateIdSource,
+        parent: BorrowedFd<'_>,
+        name: &CString,
+        identity: (u64, u64),
+        owner: Owner<'_>,
+    ) -> Result<RecordedRootfsRemoval, TraitError> {
+        match userns_run(source, parent, name, identity, owner, false)? {
+            UsernsOutcome::Removed => Ok(RecordedRootfsRemoval::Removed),
+            UsernsOutcome::NotPresent => Ok(RecordedRootfsRemoval::NotPresent),
+            _ => Err(remove_failed()),
+        }
+    }
+
+    /// [`remove_tree_in_userns`] の本体。`lock_in_child` なら、子が userns に入った後で木に `flock` を取り、
+    /// 名前から開き直した実体の同一性を再確認してから削除する（ホストの uid では開けない 0700 の木用）。
+    fn userns_run(
+        source: &SubordinateIdSource,
+        parent: BorrowedFd<'_>,
+        name: &CString,
+        identity: (u64, u64),
+        owner: Owner<'_>,
+        lock_in_child: bool,
+    ) -> Result<UsernsOutcome, TraitError> {
+        let unavailable = |code: ErrorCode| {
+            TraitError::new(
+                code,
+                "cannot remove a subordinate-owned rootfs in a user namespace",
+            )
+        };
+        let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
+        let inputs = source.removal_inputs(euid, egid)?;
+        let config = IsolationConfig {
+            namespaces: NamespaceSet::empty().with(Namespace::User),
+            hostname: None,
+        };
+        let helper_timeout = inputs.timeout;
+        let plan = plan_rootless_subordinate(
+            &config,
+            inputs.uid,
+            inputs.gid,
+            inputs.writer,
+            helper_timeout,
+        )
+        .map_err(|e| unavailable(e.code))?;
+        let pid = sys::fork_single_threaded(
+            || {
+                if isolate_rootless_subordinate(&plan).is_err() {
+                    return CHILD_SETUP_FAILED;
+                }
+                // ロックは子の終了（`_exit`）まで保持する。
+                let _lock;
+                if lock_in_child {
+                    let Ok(fd) = sys::open_dir_path_nofollow(Some(parent), name) else {
+                        return CHILD_LOCK_ERROR;
+                    };
+                    let Ok(lock) = File::open(format!("/proc/self/fd/{}", fd.as_raw_fd())) else {
+                        return CHILD_LOCK_ERROR;
+                    };
+                    match lock.try_lock() {
+                        Ok(()) => {}
+                        Err(std::fs::TryLockError::WouldBlock) => return CHILD_ALIVE,
+                        Err(_) => return CHILD_LOCK_ERROR,
+                    }
+                    _lock = lock;
+                    match sys::open_dir_path_nofollow(Some(parent), name) {
+                        Ok(again) => match fstat(again.as_fd()) {
+                            Ok((dev, ino, true, _)) if (dev, ino) == identity => {}
+                            _ => return CHILD_IDENTITY,
+                        },
+                        Err(SysError::Os(n)) if n == sys::ENOENT => return CHILD_NOT_PRESENT,
+                        Err(_) => return CHILD_IDENTITY,
+                    }
+                }
+                match remove_tree_at(parent, name, identity, owner) {
+                    Ok(RecordedRootfsRemoval::Removed) => CHILD_REMOVED,
+                    Ok(RecordedRootfsRemoval::NotPresent) => CHILD_NOT_PRESENT,
+                    Err(e) if e.code() == ErrorCode::FailedPrecondition => CHILD_REFUSED,
+                    Err(_) => CHILD_FAILED,
+                }
+            },
+            CHILD_SETUP_FAILED,
+        )
+        .map_err(|e| match e {
+            SysError::MultiThreaded => unavailable(ErrorCode::FailedPrecondition),
+            _ => unavailable(ErrorCode::Internal),
+        })?;
+        // 写像の書き込み（holder の待ちを含む最大 3 × 期限 + 5 秒）と削除の予算を合わせた期限。
+        let budget = helper_timeout * 3 + std::time::Duration::from_secs(5) + USERNS_REMOVE_BUDGET;
+        match wait_forked_child(pid, budget) {
+            Ok(ChildExit::Exited(CHILD_REMOVED)) => Ok(UsernsOutcome::Removed),
+            Ok(ChildExit::Exited(CHILD_NOT_PRESENT)) => Ok(UsernsOutcome::NotPresent),
+            Ok(ChildExit::Exited(CHILD_ALIVE)) if lock_in_child => Ok(UsernsOutcome::Alive),
+            Ok(ChildExit::Exited(CHILD_LOCK_ERROR)) if lock_in_child => {
+                Ok(UsernsOutcome::LockError)
+            }
+            Ok(ChildExit::Exited(CHILD_IDENTITY)) if lock_in_child => Ok(UsernsOutcome::Identity),
+            Ok(ChildExit::Exited(CHILD_REFUSED)) => Err(refuse()),
+            Err(e) if e.code == ErrorCode::Timeout => Err(TraitError::new(
+                ErrorCode::Timeout,
+                "removing a subordinate-owned rootfs timed out",
+            )),
+            _ => Err(remove_failed()),
+        }
+    }
+
+    /// 展開途中の木の所有者として受ける uid（実効 uid。権限が `SubordinateIds` なら subuid の範囲も）。
+    struct OwnerPolicy {
+        euid: u32,
+        subordinate: Option<IdMapSet>,
+    }
+
+    impl OwnerPolicy {
+        fn new(privilege: &ImageRootfsPrivilege) -> Self {
+            let euid = sys::effective_uid();
+            let subordinate = match privilege {
+                ImageRootfsPrivilege::SubordinateIds(source) => source
+                    .resolve_id_maps(euid, sys::effective_gid())
+                    .ok()
+                    .map(|m| m.uid().clone()),
+                _ => None,
+            };
+            Self { euid, subordinate }
+        }
+
+        fn allows(&self, uid: u32) -> bool {
+            uid == self.euid
+                || self.subordinate.as_ref().is_some_and(|m| {
+                    m.entries().iter().any(|e| {
+                        let start = u64::from(e.host_id);
+                        let end = start + u64::from(e.count);
+                        (start..end).contains(&u64::from(uid))
+                    })
+                })
+        }
     }
 
     /// 固定済みの `parent` の下の `name` を、(dev, ino) が `identity` と一致するときだけ中身ごと消す。
@@ -924,7 +1652,22 @@ mod imp {
     pub(super) fn remove_recorded(
         bundle: &Path,
         rec: &ImageRootfsRecord,
+        privilege: &ImageRootfsPrivilege,
     ) -> Result<RecordedRootfsRemoval, TraitError> {
+        // 記録が subuid 所有を示すのに権限が無ければ、ホストの ID では消せないので木に触れず拒否する。
+        // ホスト所有の記録は、権限に依らずホストの ID で消す（不要な userns を作らない）。
+        let effective = match (rec.ownership(), privilege) {
+            (ImageRootfsOwnership::SubordinateIds, ImageRootfsPrivilege::SubordinateIds(_)) => {
+                privilege
+            }
+            (ImageRootfsOwnership::SubordinateIds, _) => {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "rootfs is owned by subordinate ids; a subordinate id privilege is required",
+                ));
+            }
+            _ => &HOST_PRIVILEGE,
+        };
         // FIFO 等への差し替えでも open でブロックしない（`O_DIRECTORY`）。差し替えは拒否として扱う。
         let mut cur = match open_bundle(bundle) {
             Ok(fd) => fd,
@@ -938,7 +1681,8 @@ mod imp {
         while let Some(part) = parts.next() {
             let name = cstr(part)?;
             if parts.peek().is_none() {
-                return remove_tree_at(
+                return remove_tree_priv(
+                    effective,
                     cur.as_fd(),
                     &name,
                     rec.identity(),
@@ -992,30 +1736,60 @@ mod imp {
             std::fs::set_permissions(&proc_path, std::fs::Permissions::from_mode(mode | 0o700))
                 .map_err(|_| remove_failed())?;
         }
+        // 最上位の印のファイルは最後に消す。途中で失敗・期限切れになっても印が残り、次の孤児の回収が
+        // 木を見分けられる（#2540）。
+        let mut marker_deferred = false;
         for entry in std::fs::read_dir(&proc_path).map_err(|_| remove_failed())? {
             let entry = entry.map_err(|_| remove_failed())?;
             *seen += 1;
             if *seen > CLEANUP_MAX_ENTRIES {
                 return Err(remove_failed());
             }
-            let name = cstr(&entry.file_name())?;
-            let child = match sys::open_path_nofollow_at(dir, &name) {
-                Ok(fd) => fd,
-                Err(SysError::Os(n)) if n == sys::ENOENT => continue,
-                Err(_) => return Err(remove_failed()),
-            };
-            if mount_id(child.as_fd()) != Some(root_mnt) {
-                return Err(remove_failed());
+            if depth == 0 && entry.file_name() == OsStr::new(super::OWNER_TOKEN_FILE) {
+                marker_deferred = true;
+                continue;
             }
-            let is_child_dir = fstat(child.as_fd())
-                .map(|(_, _, d, _)| d)
-                .map_err(|_| remove_failed())?;
-            if is_child_dir {
-                remove_children(child.as_fd(), root_dev, root_mnt, depth + 1, seen)?;
-                sys::remove_dir_at(dir, &name).map_err(|_| remove_failed())?;
-            } else {
-                sys::remove_file_at(dir, &name).map_err(|_| remove_failed())?;
-            }
+            remove_entry(dir, &entry.file_name(), root_dev, root_mnt, depth, seen)?;
+        }
+        if marker_deferred {
+            remove_entry(
+                dir,
+                OsStr::new(super::OWNER_TOKEN_FILE),
+                root_dev,
+                root_mnt,
+                depth,
+                seen,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// `dir` の直下の 1 項目をリンク非追従で開いて消す（ディレクトリは再帰）。マウントを跨がない。
+    fn remove_entry(
+        dir: BorrowedFd<'_>,
+        file_name: &OsStr,
+        root_dev: u64,
+        root_mnt: u64,
+        depth: usize,
+        seen: &mut usize,
+    ) -> Result<(), TraitError> {
+        let name = cstr(file_name)?;
+        let child = match sys::open_path_nofollow_at(dir, &name) {
+            Ok(fd) => fd,
+            Err(SysError::Os(n)) if n == sys::ENOENT => return Ok(()),
+            Err(_) => return Err(remove_failed()),
+        };
+        if mount_id(child.as_fd()) != Some(root_mnt) {
+            return Err(remove_failed());
+        }
+        let is_child_dir = fstat(child.as_fd())
+            .map(|(_, _, d, _)| d)
+            .map_err(|_| remove_failed())?;
+        if is_child_dir {
+            remove_children(child.as_fd(), root_dev, root_mnt, depth + 1, seen)?;
+            sys::remove_dir_at(dir, &name).map_err(|_| remove_failed())?;
+        } else {
+            sys::remove_file_at(dir, &name).map_err(|_| remove_failed())?;
         }
         Ok(())
     }
@@ -1031,8 +1805,11 @@ mod imp {
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
-    use super::{ImageRootfsRecord, RecordedRootfsRemoval, StagingReclamation, refuse};
-    use crate::traits::{ErrorCode, TraitError};
+    use super::{
+        ImageRootfsPrivilege, ImageRootfsRecord, OrphanReap, RecordedRootfsRemoval,
+        StagingReclamation, refuse,
+    };
+    use crate::traits::{ErrorCode, StateStore, TraitError};
 
     #[derive(Debug)]
     pub(super) struct Backing;
@@ -1058,6 +1835,7 @@ mod imp {
         _bundle: &Path,
         _parents: &[&OsStr],
         _last: &OsStr,
+        _privilege: &ImageRootfsPrivilege,
         _reap_hook: super::ReapHook<'_>,
     ) -> Result<(Backing, StagingReclamation), TraitError> {
         Err(TraitError::new(
@@ -1070,6 +1848,7 @@ mod imp {
     pub(super) fn reap_stale(
         _bundle: &Path,
         _parents: &[&OsStr],
+        _privilege: &ImageRootfsPrivilege,
     ) -> Result<StagingReclamation, TraitError> {
         Err(TraitError::new(
             ErrorCode::Unimplemented,
@@ -1077,7 +1856,21 @@ mod imp {
         ))
     }
 
-    pub(super) fn remove(_path: &Path, _b: Backing) -> Result<(), TraitError> {
+    /// 作成自体が拒否されるので公開済みの木は生じない（REPAIR-3）。
+    pub(super) fn reap_published_orphan(
+        _store: &dyn StateStore,
+        _bundle: &Path,
+        _root_path: &Path,
+        _privilege: &ImageRootfsPrivilege,
+    ) -> OrphanReap {
+        OrphanReap::NotPresent
+    }
+
+    pub(super) fn remove(
+        _path: &Path,
+        _b: Backing,
+        _privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
         Err(refuse())
     }
 
@@ -1107,6 +1900,7 @@ mod imp {
     pub(super) fn remove_recorded(
         _bundle: &Path,
         _rec: &ImageRootfsRecord,
+        _privilege: &ImageRootfsPrivilege,
     ) -> Result<RecordedRootfsRemoval, TraitError> {
         Err(TraitError::new(
             ErrorCode::Unimplemented,
@@ -1814,18 +2608,28 @@ mod tests {
         std::fs::create_dir(b.join(".fandhe-unpack-99999999999-1")).expect("too long pid");
 
         let r = reap_stale_unpacks(&b, Path::new("rootfs")).expect("reap");
-        assert!(r.reclaimed.is_empty());
+        // mode 0755 の木は回収する（mode は証拠にしない。userns の展開器が root の mode を変えうる。#2540）。
+        assert_eq!(
+            r.reclaimed,
+            vec![std::ffi::OsString::from(".fandhe-unpack-3-3")]
+        );
         assert_eq!(
             r.kept_unverified,
             vec![
                 std::ffi::OsString::from(".fandhe-unpack-1-1"),
                 ".fandhe-unpack-2-2".into(),
-                ".fandhe-unpack-3-3".into()
+            ]
+        );
+        assert_eq!(
+            r.kept_unverified_reasons,
+            vec![
+                UnverifiedReason::NotDirectory,
+                UnverifiedReason::NotDirectory
             ]
         );
         assert!(outside.join("marker").exists());
         assert!(b.join(".fandhe-unpack-2-2").is_file());
-        assert!(wide.join("sub/f").exists());
+        assert!(!wide.exists());
         assert!(b.join(".fandhe-unpack-4-").is_dir());
         assert!(b.join(".fandhe-unpack-99999999999-1").is_dir());
         let _ = std::fs::remove_dir_all(&b);
@@ -1935,5 +2739,99 @@ mod tests {
         let e = reap_stale_unpacks(&b, Path::new("rootfs")).expect_err("unimplemented");
         assert_eq!(e.code(), ErrorCode::Unimplemented);
         let _ = std::fs::remove_dir_all(&b);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rewrite_marker(root: &Path, content: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+        let marker = root.join(super::OWNER_TOKEN_FILE);
+        std::fs::remove_file(&marker).expect("rm marker");
+        std::fs::write(&marker, content).expect("write marker");
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o400)).expect("mode");
+    }
+
+    /// OCI-7・#2540: 印は v2（トークン + 作成時の `<dev>:<ino>`）で書かれ、delete は v1（トークンだけ）の旧記録の
+    /// 印も受ける。形式が不正な印は拒否する（何も消さない）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_marker_v2_is_written_and_v1_is_still_accepted_by_delete() {
+        let b = tmp("marker-v2");
+        let rec = published_record(&b, "rootfs");
+        let root = b.join("rootfs");
+        let token = rec.token().expect("token").to_owned();
+        let text = std::fs::read_to_string(root.join(super::OWNER_TOKEN_FILE)).expect("marker");
+        let (dev, ino) = rec.identity();
+        assert_eq!(text, format!("{token}\n{dev}:{ino}\n"));
+
+        for bad in [
+            format!("{token}\nx:y\n"),
+            format!("{token}\n{dev}:{ino}"),
+            format!("{token}\n{dev}:{ino}\nextra\n"),
+            format!("{token}\n{dev}\n"),
+            format!("{token}\n{dev}:{}\n", "9".repeat(21)),
+            format!("{}\n{dev}:{ino}\n", token.to_uppercase()),
+        ] {
+            rewrite_marker(&root, bad.as_bytes());
+            let e = remove_recorded_rootfs(&b, &rec).expect_err("malformed marker");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition, "{bad}");
+            assert!(root.join("f").exists());
+        }
+        rewrite_marker(&root, token.as_bytes());
+        assert_eq!(
+            remove_recorded_rootfs(&b, &rec).expect("v1 accepted"),
+            RecordedRootfsRemoval::Removed
+        );
+        assert!(!root.exists());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7・#2540: 削除の途中で失敗しても印は最後に消すので残り、次の孤児の回収が木を見分けられる。
+    /// 深さの上限（256）を超える入れ子で失敗させる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_remove_keeps_marker_until_the_rest_is_removed() {
+        let b = tmp("marker-last");
+        let rec = published_record(&b, "rootfs");
+        let root = b.join("rootfs");
+        let deep: PathBuf = std::iter::repeat_n("d", 300).collect();
+        std::fs::create_dir_all(root.join(&deep)).expect("deep");
+        let e = remove_recorded_rootfs(&b, &rec).expect_err("too deep");
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert!(root.join(super::OWNER_TOKEN_FILE).is_file());
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// REPAIR-4・#2540: `reap_stale_unpacks_with` は確かめられず残した木を 1 件ずつ失敗として記録し、
+    /// 理由を `kept_unverified_reasons` に出す。何も無ければ記録しない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn repair4_reap_with_records_each_kept_unverified_tree() {
+        let b = tmp("reap-with");
+        let rec = OpRecorder::new();
+        let r = reap_stale_unpacks_with(&b, Path::new("rootfs"), &ReapOptions::new(), &rec)
+            .expect("empty");
+        assert!(!r.is_noteworthy());
+        assert!(rec.snapshot().is_empty());
+
+        let outside = tmp("reap-with-out");
+        std::os::unix::fs::symlink(&outside, b.join(".fandhe-unpack-1-1")).expect("symlink");
+        std::fs::write(b.join(".fandhe-unpack-2-2"), b"file").expect("file");
+        plant_staging(&b, ".fandhe-unpack-3-3");
+        let r = reap_stale_unpacks_with(&b, Path::new("rootfs"), &ReapOptions::new(), &rec)
+            .expect("reap");
+        assert_eq!(
+            r.reclaimed,
+            vec![std::ffi::OsString::from(".fandhe-unpack-3-3")]
+        );
+        assert_eq!(r.kept_unverified.len(), 2);
+        let count = |name: &str| {
+            rec.snapshot_op(&OpName::new(name).expect("name"))
+                .map_or((0, 0), |s| (s.success(), s.failure()))
+        };
+        assert_eq!(count("image_rootfs_reap"), (0, 1));
+        assert_eq!(count("image_rootfs_reap_kept_unverified"), (0, 2));
+        assert_eq!(count("image_rootfs_reap_failed"), (0, 0));
+        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

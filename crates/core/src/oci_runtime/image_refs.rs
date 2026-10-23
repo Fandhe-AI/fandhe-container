@@ -18,7 +18,7 @@
 //! 上位のアダプタは [`ContainerImageRefs`] と [`ImageRootfsUnpacker`] の両方を `ImageStore` で満たし、
 //! `ContainerImage::new(..).with_unpacker(..)` で create へ渡す（展開の順序・展開先の作成・後始末は core の担当。#2342・#2315）。
 
-use super::image_rootfs::ImageRootfsUnpacker;
+use super::image_rootfs::{HOST_PRIVILEGE, ImageRootfsPrivilege, ImageRootfsUnpacker};
 use crate::traits::{ContainerId, ErrorCode, TraitError};
 
 /// manifest digest の文字列の長さ（`sha256:` ＋ 64 桁）。
@@ -149,6 +149,8 @@ pub struct ContainerImage<'a> {
     refs: &'a dyn ContainerImageRefs,
     manifest: &'a ImageManifestDigest,
     unpacker: Option<&'a dyn ImageRootfsUnpacker>,
+    /// core が作る rootfs の木を消す権限（既定はホストの実効 ID。#2540）。
+    rootfs_privilege: &'a ImageRootfsPrivilege,
 }
 
 impl<'a> ContainerImage<'a> {
@@ -158,7 +160,18 @@ impl<'a> ContainerImage<'a> {
             refs,
             manifest,
             unpacker: None,
+            rootfs_privilege: &HOST_PRIVILEGE,
         }
+    }
+
+    /// 展開器が作る木の所有者（subuid 所有か）に合わせた、木を消す権限を指定する（SEC-5・#2540）。
+    ///
+    /// `SubordinateIds` を渡すと、create の失敗時の後始末と公開済みの孤児の回収が userns の中で木を消し、
+    /// 状態レコードの `imageRootfs.ownership` に `subordinate` を記録する（delete は
+    /// [`crate::oci_runtime::DeleteOptions`] で同じ権限を渡す）。展開器を足さない場合は使われない。
+    pub fn with_rootfs_privilege(mut self, privilege: &'a ImageRootfsPrivilege) -> Self {
+        self.rootfs_privilege = privilege;
+        self
     }
 
     /// レイヤーを rootfs へ展開する展開器を足す（#2342）。指定しない場合、bundle の rootfs は
@@ -166,6 +179,10 @@ impl<'a> ContainerImage<'a> {
     pub fn with_unpacker(mut self, unpacker: &'a dyn ImageRootfsUnpacker) -> Self {
         self.unpacker = Some(unpacker);
         self
+    }
+
+    pub(super) fn rootfs_privilege(&self) -> &'a ImageRootfsPrivilege {
+        self.rootfs_privilege
     }
 
     pub(super) fn unpacker(&self) -> Option<&'a dyn ImageRootfsUnpacker> {

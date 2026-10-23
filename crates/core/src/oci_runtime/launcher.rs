@@ -524,6 +524,43 @@ impl SubordinateIdMaps {
     }
 }
 
+/// subuid 所有の rootfs の木を userns の中で消すための入力(`SubordinateIdSource::removal_inputs`。#2540)。
+#[cfg(target_os = "linux")]
+pub(super) struct RemovalInputs {
+    /// uid の範囲写像(コンテナ 0 → 自 euid、1.. → subordinate 範囲)。
+    pub(super) uid: IdMapSet,
+    /// gid の範囲写像。
+    pub(super) gid: IdMapSet,
+    /// 写像の書き込み経路(`newuidmap` / `newgidmap`)。
+    pub(super) writer: IdMapWriter,
+    /// helper の応答の期限。
+    pub(super) timeout: Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl SubordinateIdSource {
+    /// image rootfs の削除(userns の中で subuid 所有の木を消す。`oci_runtime::image_rootfs`。SEC-5・#2540)に
+    /// 使う写像・書き込み経路・期限を解決する。副作用は無い。start の本番 launcher と同じ解決
+    /// ([`Self::resolve_id_maps`]・`HelperPaths::new`)を共有し、所有者の解決を別々に持たない。
+    ///
+    /// 拒否の分類と文言は [`Self::resolve_id_maps`] と同じ(パス・errno・ユーザー名を含めない)。
+    pub(super) fn removal_inputs(&self, euid: u32, egid: u32) -> Result<RemovalInputs, TraitError> {
+        let maps = self.resolve_id_maps(euid, egid)?;
+        let helper = HelperPaths::new(&self.newuidmap, &self.newgidmap).map_err(|e| {
+            TraitError::new(
+                e.code,
+                "failed to resolve the subordinate id mapping for the launcher",
+            )
+        })?;
+        Ok(RemovalInputs {
+            uid: maps.uid,
+            gid: maps.gid,
+            writer: IdMapWriter::Helper(helper),
+            timeout: self.helper_timeout,
+        })
+    }
+}
+
 /// 構築時に解決・検証済みの範囲写像(`Inner` が保持し、起動のたびに `plan_rootless_subordinate` へ渡す)。
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone)]

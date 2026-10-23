@@ -42,7 +42,7 @@ spec では、OCI-6 の delete が消すのは状態ファイルと cgroup、OCI
 
 ## 失敗後の手動回復
 
-公開済みで状態の無い木は、上の決定 A の条件を満たせば次の `create_with_image` が自動で回収する。回収されずに `AlreadyExists` で止まり続けるとき（`image_rootfs_orphan_reap` の失敗、印が v1・複製・欠落、別の状態ルートの使用、再起動で `st_dev` が変わった等）は、利用者が `<bundle>/<root.path>` の中身を確認し、不要なら手で削除する。`image_rootfs_remove` の失敗が subordinate の木だったときは、権限（`SubordinateIds`）つきで delete し直すか、`podman unshare` 相当の userns の中で削除する。
+公開済みで状態の無い木は、上の決定 A の条件を満たせば次の `create_with_image` が自動で回収する。回収されずに `AlreadyExists` で止まり続けるとき（`image_rootfs_orphan_reap` の失敗、印が v1・複製・欠落、別の状態ルートの使用、再起動で `st_dev` が変わった等）は、利用者が `<bundle>/<root.path>` の中身を確認し、不要なら手で削除する。`image_rootfs_remove` の失敗が subordinate の木だったときは、delete が状態の削除まで済ませており delete し直しは冒頭の状態取得で `NotFound` になるため使えない。権限（`SubordinateIds`）つきの次の create（`ContainerImage::with_rootfs_privilege`）による公開済みの孤児の回収に任せるか、`podman unshare` 相当の userns の中で手で削除する。
 
 ## 対象外（後続の候補）
 

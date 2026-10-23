@@ -31,7 +31,27 @@
 //! - レイヤーの展開（本番の展開器）は #2377。展開器なしの `ContainerImage` を使うため、bundle の rootfs は展開済みの前提
 //! - manifest の在庫の永続化は #2380 で oci 側に実装済み（`ImageStore::lock` が読み直す）。ただし本番で在庫を埋める経路
 //!   （pull → `ImageStore` の配線）が未実装のため、本番のストアの在庫は空で、`register` は常に `NOT_FOUND`
-//! - タグ参照（`name:tag`）の解決はしない。`--image` は manifest digest だけを受ける
+//! - `name@digest` 形式は受けない（在庫は manifest と repository を対応づけず、name を検証できないため fail-closed。#2496）
+//!
+//! # `create --image` の判別規則と解決（#2496・OCI-7・CLI-1）
+//!
+//! [`classify_create_image`]（ストアに触れない純関数）が次の順に判定する。
+//!
+//! 1. `/` も `@` も含まず、最初の `:` より前が digest のアルゴリズム名（`sha256`・`sha384`・`sha512`）の入力は digest の指定。
+//!    `sha256:<小文字 hex 64 桁>` だけを受け、それ以外は `INVALID_ARGUMENT`（oci の `ImageReference::parse` が
+//!    `sha256:AAAA…` を repository `sha256` のタグと誤読するため、先にここで拒否する）。
+//! 2. それ以外は oci の `ImageReference::parse`（Docker 互換の正規化。ホスト省略は `registry-1.docker.io`、単一成分は `library/`、
+//!    タグ省略は `latest`）でタグ参照にする。repository 名が `sha256` のイメージは `docker.io/library/sha256:tag` と書けばよい。
+//! 3. 解析に失敗する入力と `name@digest`・`name:tag@digest` は `INVALID_ARGUMENT`（素の digest で指定する。将来広げる余地はある）。
+//!
+//! タグは [`resolve_create_image`] が永続化済みの在庫から digest へ解決する（存在しなければ `NOT_FOUND`）。
+//!
+//! # 解決と登録のあいだの付け替え
+//!
+//! 解決はその時点のスナップショットで、create は解決した digest で参照を登録する。コンテナが保持するのはタグでなく manifest なので、
+//! 解決後にタグが別の manifest へ付け替えられても、この create の登録先は変わらない（旧 manifest は参照で保護される）。
+//! 解決後・登録前に旧 manifest が在庫から消えた場合は `register` が `NOT_FOUND`（`image not found`）で失敗し、状態も参照も残らない。
+//! 解決から登録までを 1 つの排他区間にはしない（`register` は digest を受ける契約で、排他は呼び出しごとに取る。REPAIR-5）。
 
 use fandhe_container_core::oci_runtime::{
     ContainerImageRefs, ImageManifestDigest, ImageRefGeneration, ImageRefRegistration,
@@ -46,7 +66,68 @@ use fandhe_container_oci::image_management::{
 };
 use fandhe_container_oci::reference::Digest;
 
-use super::image::{Stage, trait_failure};
+use super::image::{MSG_TAG_NOT_FOUND, Stage, trait_failure};
+use fandhe_container_core::traits::ErrorCode;
+use fandhe_container_oci::image_management::TagKey;
+use fandhe_container_oci::reference::{ImageReference, Reference};
+
+/// `create --image` の判別結果（#2496）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CreateImageRef {
+    /// manifest digest の指定。
+    Manifest(ImageManifestDigest),
+    /// タグ参照（正規化済み）。
+    Tag(TagKey),
+}
+
+const MSG_BAD_IMAGE: &str = "image must be a sha256 manifest digest or a tag reference";
+
+/// `--image` の値を digest かタグ参照かに判別する（規則は module doc。ストアにも環境にも触れない純関数）。
+/// 外部入力なので `unwrap`・添字は使わず、エラー文言は固定（入力を含めない）。
+pub(super) fn classify_create_image(input: &str) -> Result<CreateImageRef, TraitError> {
+    let bad = || TraitError::new(ErrorCode::InvalidArgument, MSG_BAD_IMAGE);
+    if !input.contains(['/', '@'])
+        && let Some((algo, _)) = input.split_once(':')
+        && matches!(algo, "sha256" | "sha384" | "sha512")
+    {
+        return ImageManifestDigest::new(input).map(CreateImageRef::Manifest);
+    }
+    let r = ImageReference::parse(input).map_err(|_| bad())?;
+    match r.reference() {
+        Reference::Tag(t) => Ok(CreateImageRef::Tag(TagKey::new(
+            r.registry().clone(),
+            r.repository().clone(),
+            t.clone(),
+        ))),
+        _ => Err(bad()),
+    }
+}
+
+/// 判別結果を manifest digest にする。タグは排他を 1 回だけ取って永続化済みの対応表から引き、ガードを手放してから返す
+/// （create ゲートや状態ストアの操作をまたいで保持しない。走査はタグ件数の上限で抑えられる。REPAIR-5）。
+/// 付け替え競合の扱いは module doc。
+pub(super) fn resolve_create_image(
+    store: &ImageStore,
+    r: CreateImageRef,
+) -> Result<ImageManifestDigest, TraitError> {
+    let key = match r {
+        CreateImageRef::Manifest(d) => return Ok(d),
+        CreateImageRef::Tag(k) => k,
+    };
+    let found: Option<String> = {
+        let guard = store
+            .lock()
+            .map_err(|e| trait_failure(&e, Stage::Resolve))?;
+        guard
+            .tags()
+            .find(|(k, _)| **k == key)
+            .map(|(_, d)| d.as_str().to_string())
+    };
+    match found {
+        Some(d) => ImageManifestDigest::new(&d),
+        None => Err(TraitError::new(ErrorCode::NotFound, MSG_TAG_NOT_FOUND)),
+    }
+}
 
 /// 状態ルートの識別子（参照キーの接頭辞）を作る。
 ///
@@ -385,5 +466,111 @@ mod tests {
         let err = refs.bind(&id).expect_err("no registration");
         assert!(!err.message().contains("secret-container-id"));
         assert!(!err.message().contains(&root));
+    }
+
+    const TAG_MSG: &str = "image must be a sha256 manifest digest or a tag reference";
+
+    fn tag_key(host: &str, repo: &str, tag: &str) -> TagKey {
+        TagKey::new(
+            fandhe_container_oci::reference::RegistryHost::parse(host).expect("host"),
+            fandhe_container_oci::reference::Repository::parse(repo).expect("repo"),
+            fandhe_container_oci::reference::Tag::parse(tag).expect("tag"),
+        )
+    }
+
+    /// OCI-7・CLI-1: digest とタグ参照の判別規則（#2496）。
+    #[test]
+    fn oci7_classify_create_image() {
+        assert_eq!(
+            classify_create_image(MANIFEST).expect("digest"),
+            CreateImageRef::Manifest(mdigest(MANIFEST))
+        );
+        for (input, host, repo, tag) in [
+            (
+                "alpine:3.19",
+                "registry-1.docker.io",
+                "library/alpine",
+                "3.19",
+            ),
+            ("alpine", "registry-1.docker.io", "library/alpine", "latest"),
+            (
+                "registry.example:5000/lib/app:v1",
+                "registry.example:5000",
+                "lib/app",
+                "v1",
+            ),
+            (
+                "docker.io/library/sha256:v1",
+                "registry-1.docker.io",
+                "library/sha256",
+                "v1",
+            ),
+        ] {
+            assert_eq!(
+                classify_create_image(input).expect(input),
+                CreateImageRef::Tag(tag_key(host, repo, tag)),
+                "{input}"
+            );
+        }
+        let upper = format!("sha256:{}", "A".repeat(64));
+        let short = &MANIFEST[..MANIFEST.len() - 1];
+        let sha512 = format!("sha512:{}", "a".repeat(128));
+        let sha384 = format!("sha384:{}", "a".repeat(96));
+        let at = format!("alpine@{MANIFEST}");
+        let tag_at = format!("app:tag@{MANIFEST}");
+        for bad in [
+            upper.as_str(),
+            short,
+            sha512.as_str(),
+            sha384.as_str(),
+            "",
+            at.as_str(),
+            tag_at.as_str(),
+            "has space:x",
+            "UPPER/x:y",
+        ] {
+            let e = classify_create_image(bad).expect_err(bad);
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{bad}");
+            assert!(
+                e.message() == TAG_MSG
+                    || e.message() == "manifest digest must be sha256:<64 lowercase hex>",
+                "{bad}: {}",
+                e.message()
+            );
+            if !bad.is_empty() {
+                assert!(!e.message().contains(bad), "{bad}");
+            }
+        }
+    }
+
+    /// OCI-7・CLI-1: 永続化済みのタグを、別に開いたストアから digest へ解決できる。無いタグは NOT_FOUND（#2496）。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_resolve_tag_from_persisted_inventory() {
+        let tmp = Tmp::new("resolve");
+        let a = seeded(tmp.path(), &[MANIFEST, OTHER]);
+        use fandhe_container_oci::image_management::ImageTagSource;
+        a.tag_image(
+            &ImageTagSource::Manifest(Digest::parse(MANIFEST).expect("d")),
+            tag_key("registry.example", "lib/app", "v1"),
+        )
+        .expect("tag");
+        let b = ImageStore::open(tmp.path()).expect("open b");
+        let got = resolve_create_image(
+            &b,
+            classify_create_image("registry.example/lib/app:v1").expect("c"),
+        )
+        .expect("resolve");
+        assert_eq!(got.as_str(), MANIFEST);
+        let e = resolve_create_image(
+            &b,
+            classify_create_image("registry.example/lib/app:v2").expect("c"),
+        )
+        .expect_err("nf");
+        assert_eq!(e.code(), ErrorCode::NotFound);
+        assert_eq!(e.message(), "image tag not found");
+        // digest 指定は在庫を引かずそのまま返す。
+        let d = resolve_create_image(&b, CreateImageRef::Manifest(mdigest(OTHER))).expect("d");
+        assert_eq!(d.as_str(), OTHER);
     }
 }

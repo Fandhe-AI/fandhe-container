@@ -3,7 +3,7 @@
 //! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
-//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest>] --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
+//! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
 //! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `image tag --image-root <dir> <source> <target>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
@@ -30,13 +30,13 @@ pub(super) struct CreateArgs {
     pub(super) image: Option<CreateImageArgs>,
 }
 
-/// `create` のイメージ指定。意味検証（digest の形式・ストア root の存在）は呼び出し元が core / oci の型に委ねる。
+/// `create` のイメージ指定。意味検証（digest・タグ参照の形式、ストア root の存在）は呼び出し元が core / oci の型に委ねる。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CreateImageArgs {
     /// イメージストアの root（絶対パス）。
     pub(super) image_root: PathBuf,
-    /// 使う manifest digest（未検証の文字列）。
-    pub(super) manifest: String,
+    /// 使うイメージの指定（未検証の文字列。manifest digest かタグ参照。判別は `image_refs::classify_create_image`）。
+    pub(super) reference: String,
 }
 
 /// `start` の引数。
@@ -183,12 +183,12 @@ pub(super) fn parse_global(args: Vec<OsString>) -> Result<(GlobalArgs, Vec<OsStr
     Ok((global, it.collect()))
 }
 
-/// `create [--image-root <abs> --image <digest>] --bundle <dir> <id>` を解析する
+/// `create [--image-root <abs> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` を解析する
 /// （`--bundle` は必須・順不同・`--` 以降は位置引数。`--image-root` と `--image` は両方そろったときだけ受け、各 1 回まで）。
 pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError> {
     let mut bundle: Option<PathBuf> = None;
     let mut image_root: Option<PathBuf> = None;
-    let mut manifest: Option<String> = None;
+    let mut reference: Option<String> = None;
     let mut positional: Vec<OsString> = Vec::new();
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
@@ -209,10 +209,10 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
             image_root = Some(PathBuf::from(value));
         } else if a == "--image" {
             let value = it.next().ok_or(UsageError)?;
-            if manifest.is_some() {
+            if reference.is_some() {
                 return Err(UsageError);
             }
-            manifest = Some(value.into_string().map_err(|_| UsageError)?);
+            reference = Some(value.into_string().map_err(|_| UsageError)?);
         } else if is_option_like(&a) {
             return Err(UsageError);
         } else {
@@ -220,16 +220,16 @@ pub(super) fn parse_create(args: Vec<OsString>) -> Result<CreateArgs, UsageError
         }
     }
     let id = single_id(positional)?;
-    let image = match (image_root, manifest) {
+    let image = match (image_root, reference) {
         (None, None) => None,
-        (Some(image_root), Some(manifest)) => {
+        (Some(image_root), Some(reference)) => {
             // 相対パスは作業ディレクトリ依存で 3 OS の挙動がぶれるため拒否する（`parse_image_options` と同じ）。
             if !image_root.is_absolute() {
                 return Err(UsageError);
             }
             Some(CreateImageArgs {
                 image_root,
-                manifest,
+                reference,
             })
         }
         _ => return Err(UsageError),
@@ -579,7 +579,7 @@ mod tests {
             id: "c1".into(),
             image: Some(CreateImageArgs {
                 image_root: root.clone(),
-                manifest: d.clone(),
+                reference: d.clone(),
             }),
         });
         assert_eq!(

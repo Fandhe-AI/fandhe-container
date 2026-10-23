@@ -37,7 +37,7 @@
 //! （`probe_sub_id_file`）は Linux 限定で公開し、`start`（`start_entry` の `resolve_launch_privilege`）と
 //! pull 時の展開の所有者（cli の `image_ownership`。`resolve_rootless_id_source`。#2389）と
 //! CLI の `doctor`（`doctor::id_mapping_check`。#2387）が同じ関数を呼ぶ。診断と `start` の判定を食い違わせない。
-//! 判定の本体は型つきの拒否理由を返す [`diagnose_rootless_id_source_with`] で、`resolve_rootless_id_source*` は
+//! 判定の本体は型つきの拒否理由を返す `diagnose_rootless_id_source_with` で、`resolve_rootless_id_source*` は
 //! その結果を `TraitError` と範囲写像の入力元へ写す薄い包みである（`doctor` は文字列比較をせず `RefusalReason` で分岐する。#2545）。
 //!
 //! エラー文言は固定の英語で、ユーザー名・パス・errno・ファイルの内容を含めない。
@@ -73,7 +73,7 @@ pub enum RootlessIdModel {
     SubordinateIds,
 }
 
-/// 所有者名の出所の種別（[`diagnose_rootless_id_source_with`] の結果。名前そのものは持たない）。
+/// 所有者名の出所の種別（`diagnose_rootless_id_source_with` の結果。名前そのものは持たない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerNameKind {
     /// passwd または NSS で名前を得た。

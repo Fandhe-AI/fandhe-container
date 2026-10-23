@@ -51,8 +51,9 @@
 //!     本番の `start` の拒否経路（`validate_bind_mounts` → `audit_bind_mount_error` →
 //!     `ProcessLauncher::rejection_audit_sink` → `FileAuditSink`）が出した mount 層の記録を要求ごとに 1 行（計 3 行）
 //!     照合する。launcher は `rejection_audit_sink` を返すだけの最小実装（本番の `ProductionLauncher` は構築に
-//!     ホストの前提を要する）。`ControlAuditRelay` は `Mount` の記録を運ばないため使えない（残余。
-//!     `docs/design/audit-delivery.md`）
+//!     ホストの前提を要する）。この試験は単一スレッドで `start` を呼ぶため `FileAuditSink` を使う。本番の
+//!     supervisor の `start`（複数スレッド）が relay 経由で届くことは supervisor の結合試験
+//!     `start_bind_audit_relay` が照合する（#2481。`docs/design/audit-delivery.md`）
 //! - `AuditSource::KernelAudit`（opt-in の段。環境変数 `FANDHE_CONTAINER_TEST_KERNEL_AUDIT=1`）: Landlock の拒否の
 //!   本番の記録はカーネル監査の `AUDIT_LANDLOCK_ACCESS` だけ（core は `LOG_SAME_EXEC_OFF` を渡さない）。ESC-01・ESC-07
 //!   （Landlock 帰属）・ESC-10 は、ホストの `/var/log/audit/audit.log` のケース開始後の追記から、`blockers=` の
@@ -1596,7 +1597,7 @@ const ESC07_LANDLOCK_EXPECT: Expectation = Expectation {
 /// ESC-08: マウント元が状態ルート・rootfs・bundle の bind の `start` は `InvalidArgument` で拒否され（`Failed`）、
 /// 要求ごとに mount 層の監査記録がちょうど 1 行（計 3 行）、状態ルートの `@audit.log` に届く（#2028）。
 /// 記録を作るのは本番の `start` の拒否経路（`validate_bind_mounts` → `audit_bind_mount_error` →
-/// `ProcessLauncher::rejection_audit_sink` → `ControlAuditRelay` → `FileAuditSink`）で、試験は記録を作らない。
+/// `ProcessLauncher::rejection_audit_sink` → `FileAuditSink`）で、試験は記録を作らない。
 #[cfg_attr(
     not(all(
         target_os = "linux",
@@ -3454,9 +3455,10 @@ mod linux {
     /// 構築時の sink をそのまま返すことは `launcher.rs` の単体試験（`sec4_rejection_audit_sink_is_the_launcher_sink`）
     /// が担い、ここでは `start` の拒否経路から本番の sink 経由で `@audit.log` に届くまでを照合する（#2028）。
     ///
-    /// `ControlAuditRelay` は使わない: relay は制御チャネルと seccomp の記録しか運ばず、`Mount` の記録を
-    /// `InvalidArgument` で拒否する（supervisor の `start` は launcher の sink に relay を渡しているため、本番の
-    /// supervisor 経由では bind の元の拒否の監査が落ちる。残余として追跡する。docs/design/audit-delivery.md）。
+    /// `ControlAuditRelay` は使わない: この試験は単一スレッドで `start` を呼ぶため `FileAuditSink` が主経路で書ける。
+    /// 本番の supervisor の `start` は検証が複数スレッドの作業スレッドで走るので、`rejection_audit_sink` に relay
+    /// （理由なしの `Mount` を運べる。#2481）を渡す。その経路の照合は supervisor の結合試験
+    /// `start_bind_audit_relay` が担う（docs/design/audit-delivery.md）。
     struct RejectionOnlyLauncher {
         sink: FileAuditSink,
         launches: AtomicUsize,

@@ -193,6 +193,14 @@ name = "control_audit_delivery"
 path = "tests/control_audit_delivery.rs"
 harness = false
 
+# start の bind mount の元の拒否が、中継 sink（ControlAuditRelay）を通って監査の記録先（@audit.log）へ届くことの結合試験
+# （SEC-4・OCI-4・SUP-1・#2481）。監査 helper の fork は単一スレッドの呼び出し元を要求するため、単一スレッドの
+# 独自 main（harness = false）で動かす。root 不要で既定のテスト集合で実行する（依存は不変）。
+[[test]]
+name = "start_bind_audit_relay"
+path = "tests/start_bind_audit_relay.rs"
+harness = false
+
 # seccomp の通知を受けて記録し EPERM で応答する経路の実カーネル end-to-end 試験（SEC-4・REPAIR-5・#2025）。
 # 監査 helper の fork は単一スレッドの呼び出し元を要求するため、単一スレッドの独自 main（harness = false）で動かす。
 # root 不要で既定のテスト集合で実行する（`exec-test-support` の probe を使う。依存は不変）。

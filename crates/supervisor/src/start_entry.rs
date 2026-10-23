@@ -1990,7 +1990,7 @@ mod linux {
     use std::process::ExitCode;
 
     use fandhe_container_core::audit_log::{
-        AuditCoveragePolicy, AuditSink, KernelAuditProbe, assess,
+        AuditCoveragePolicy, AuditRecord, AuditSink, KernelAuditProbe, assess,
     };
     use fandhe_container_core::cgroups::{
         CgroupLimitPlan, ContainerCgroup, DelegatedCgroup, ResourceLimitPlan,
@@ -2032,6 +2032,43 @@ mod linux {
     /// supervisor ログの準備（手順 2b）を待つ上限（全体期限から報告の予約分を引いた残りでさらに絞る）。
     const LOG_PREPARE_DEADLINE: Duration = Duration::from_secs(5);
 
+    /// start の検証の拒否の記録先を包み、記録できなかったことを固定語彙の構造化ログへ残す（SEC-4・REPAIR-4・#2481）。
+    ///
+    /// 呼び出し元は core の `claim_start`（bind・sysfs の拒否。結果は `let _ =` で捨てられる）。運べない種類や helper の
+    /// 失敗は内側が `Err` で返すので、ここで 1 行出してから同じ `Err` を返す（拒否の結果は変えない）。`log_event` は
+    /// `stderr_sink` の常駐スレッドを作るが、拒否の記録は必ず start の失敗の直前で起き launch に進まないため、
+    /// 「手順 8 の前の成功経路では `log_event` を呼ばない」規則に触れない。
+    struct ObservedRejectionSink {
+        inner: Arc<dyn AuditSink>,
+    }
+
+    impl ObservedRejectionSink {
+        /// 失敗なら `log` へ固定のイベント名とコードを渡してから、同じ結果を返す（`log` は試験で差し替える）。
+        fn observe(
+            result: Result<(), TraitError>,
+            log: impl FnOnce(&'static str, Option<ErrorCode>),
+        ) -> Result<(), TraitError> {
+            if let Err(e) = &result {
+                log("rejection_audit_record_failed", Some(e.code()));
+            }
+            result
+        }
+    }
+
+    impl AuditSink for ObservedRejectionSink {
+        fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+            Self::observe(self.inner.record(record), log_event)
+        }
+
+        fn record_until(
+            &self,
+            record: &AuditRecord,
+            deadline: std::time::Instant,
+        ) -> Result<(), TraitError> {
+            Self::observe(self.inner.record_until(record, deadline), log_event)
+        }
+    }
+
     /// 本番の [`StartDeps`]。core の本番 `ProcessLauncher`（`oci_runtime::ProductionLauncher`）へ結線する
     /// （#1819・SUP-1・CORE-1・CORE-2・CORE-3・CORE-5・SEC-1・SEC-4・SEC-5）。
     ///
@@ -2051,6 +2088,10 @@ mod linux {
         /// （`with_exit_audit_sink`。入口が単一スレッドの間に作った `ControlAuditRelay`。SEC-4・ESC-06・#2236）。
         /// 無ければ `audit`（`FileAuditSink`）を使う。
         exit_audit: Option<Arc<dyn AuditSink>>,
+        /// start の検証（`claim_start` の bind・sysfs の拒否）が出す mount 層の拒否だけの記録先
+        /// （`with_rejection_audit_sink`。`ObservedRejectionSink` で包んだ `ControlAuditRelay`。SEC-4・#2481）。
+        /// 無ければ `audit`（`FileAuditSink`）を使う。
+        rejection_audit: Option<Arc<dyn AuditSink>>,
         /// 退避で一緒に移す同伴プロセスの PID（監査 helper。`DelegatedCgroup::with_companions`）。
         companions: Vec<u32>,
         /// seccomp の通知に応答するハブ（`with_seccomp_hub`。持つときだけ start の launcher が USER_NOTIF 版になる。#2025）。
@@ -2164,6 +2205,7 @@ mod linux {
                 cgroup: None,
                 audit: None,
                 exit_audit: None,
+                rejection_audit: None,
                 companions: Vec::new(),
                 seccomp: None,
                 audit_policy: AuditCoveragePolicy::default(),
@@ -2182,10 +2224,24 @@ mod linux {
         ///
         /// 回収点は監視スレッドなど複数スレッドから呼ばれ、`FileAuditSink` の fork 隔離が使えない（rootless では代替経路も
         /// 失敗する）。入口が単一スレッドの間に作った `ControlAuditRelay` を渡す。launch の時点の記録（監査網羅の縮退・
-        /// bind 拒否）は単一スレッドなので `build_audit_sink` の `FileAuditSink` のままにする（relay は運べない層がある）。
+        /// pre-pivot の違反）は単一スレッドなので `build_audit_sink` の `FileAuditSink` のままにする（relay は理由つきの
+        /// `Mount` 等の運べない層がある）。start の検証（bind・sysfs）の拒否は作業スレッドで出るため
+        /// [`Self::with_rejection_audit_sink`] で別に渡す。
         #[must_use]
         pub fn with_exit_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
             self.exit_audit = Some(sink);
+            self
+        }
+
+        /// start の検証（`claim_start` の bind mount の元・sysfs）の拒否の記録先を設定する（SEC-4・#2481）。
+        ///
+        /// この検証は作業スレッド `supervisor-start` で走り、入口スレッドが待つ間のため複数スレッドになる。
+        /// `FileAuditSink` は主経路を試せず、rootless では代替経路（`CAP_AUDIT_WRITE` 要）も失敗して拒否が残らない。
+        /// 入口が単一スレッドの間に作った `ControlAuditRelay`（理由なしの `Mount` を運べる）を渡す。記録の失敗は
+        /// 固定語彙の構造化ログへ残す（`ObservedRejectionSink`）。回復用の launcher（launch も検証もしない）には渡さない。
+        #[must_use]
+        pub fn with_rejection_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
+            self.rejection_audit = Some(Arc::new(ObservedRejectionSink { inner: sink }));
             self
         }
 
@@ -2378,6 +2434,10 @@ mod linux {
             let builder = self.launcher_builder(true)?.audit_sink(Arc::clone(audit));
             let builder = match &self.exit_audit {
                 Some(sink) => builder.exit_audit_sink(Arc::clone(sink)),
+                None => builder,
+            };
+            let builder = match &self.rejection_audit {
+                Some(sink) => builder.rejection_audit_sink(Arc::clone(sink)),
                 None => builder,
             };
             let launcher = builder
@@ -2698,8 +2758,10 @@ mod linux {
             .with_audit_policy(args.audit_policy);
         let deps = Box::new(match &audit {
             // relay は launcher の回収点（複数スレッド）の `exit_signal` 監査の記録先にも渡す（#2236）。
+            // start の検証（bind・sysfs）の拒否も作業スレッド（複数スレッド）で出るため relay へ渡す（#2481）。
             Some(audit) => deps
                 .with_exit_audit_sink(Arc::clone(audit))
+                .with_rejection_audit_sink(Arc::clone(audit))
                 .with_seccomp_hub(Arc::new(SeccompNotifyHub::new(
                     Arc::clone(audit),
                     args.id.clone(),
@@ -3087,6 +3149,108 @@ mod linux {
                 .map(|p| p + recover)
                 .expect("recovery call follows the builder");
             assert!(!production[recover..recover_end].contains("exit_audit_sink("));
+        }
+
+        /// SEC-4・#2481: 本番の入口は relay を start の検証の拒否の記録先（`rejection_audit_sink`）へ渡し、回復用の
+        /// launcher には渡さない。実プロセスの結線は単一スレッド条件のためソースで固定する。
+        #[test]
+        fn sec4_2481_relay_is_wired_to_the_rejection_point() {
+            let src = include_str!("start_entry.rs");
+            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+            let entry = production
+                .find("fn run_main_inner<")
+                .expect("run_main_inner in the entry");
+            let wire = production[entry..]
+                .find(".with_rejection_audit_sink(Arc::clone(audit))")
+                .map(|p| p + entry)
+                .expect("relay is passed as the rejection audit sink");
+            let run = production[entry..]
+                .find("run_start_until(\n")
+                .map(|p| p + entry)
+                .expect("run_start_until call in the entry");
+            assert!(wire < run, "relay must be wired before run_start_until");
+            let build = production
+                .find("fn build_launcher(")
+                .expect("build_launcher");
+            assert!(production[build..].contains("builder.rejection_audit_sink(Arc::clone(sink))"));
+            let recover = production
+                .find("self.launcher_builder(false)?")
+                .expect("recover_interrupted builds the recovery launcher");
+            let recover_end = production[recover..]
+                .find("recover_interrupted_start(store")
+                .map(|p| p + recover)
+                .expect("recovery call follows the builder");
+            assert!(!production[recover..recover_end].contains("rejection_audit_sink("));
+        }
+
+        /// 失敗する内側の sink（記録のたびに固定のエラーを返す）。
+        struct FailingSink(ErrorCode);
+
+        impl AuditSink for FailingSink {
+            fn record(&self, _: &AuditRecord) -> Result<(), TraitError> {
+                Err(TraitError::new(self.0, "fake"))
+            }
+        }
+
+        fn mount_record() -> AuditRecord {
+            use fandhe_container_core::audit_log::{AuditEvent, AuditPid, AuditTimestamp};
+            AuditRecord::new(
+                AuditTimestamp::from_unix_duration(Duration::new(1, 0)),
+                AuditPid::new(1).unwrap(),
+                AuditEvent::Mount {
+                    path: None,
+                    reason: None,
+                },
+            )
+        }
+
+        /// SEC-4・REPAIR-4・#2481: 失敗のときだけ、固定のイベント名と内側のエラーコードで 1 回ログを出す。
+        #[test]
+        fn sec4_2481_observe_logs_only_failures_with_fixed_vocabulary() {
+            let seen = std::cell::RefCell::new(Vec::new());
+            let log = |event: &'static str, code: Option<ErrorCode>| {
+                seen.borrow_mut().push((event, code));
+            };
+            assert!(ObservedRejectionSink::observe(Ok(()), log).is_ok());
+            assert!(seen.borrow().is_empty());
+            let e = ObservedRejectionSink::observe(
+                Err(TraitError::new(ErrorCode::InvalidArgument, "x")),
+                log,
+            )
+            .unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument);
+            assert_eq!(
+                seen.borrow().as_slice(),
+                [(
+                    "rejection_audit_record_failed",
+                    Some(ErrorCode::InvalidArgument)
+                )]
+            );
+        }
+
+        /// SEC-4・#2481: 包みは内側の成否をそのまま返す（失敗のログは `log_event` が担い、結果は覆さない）。
+        #[test]
+        fn sec4_2481_observed_rejection_sink_passes_results_through() {
+            let ok = ObservedRejectionSink {
+                inner: Arc::new(OkSink),
+            };
+            assert!(ok.record(&mount_record()).is_ok());
+            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            assert!(ok.record_until(&mount_record(), deadline).is_ok());
+            let failing = ObservedRejectionSink {
+                inner: Arc::new(FailingSink(ErrorCode::InvalidArgument)),
+            };
+            assert_eq!(
+                failing.record(&mount_record()).unwrap_err().code(),
+                ErrorCode::InvalidArgument
+            );
+            assert_eq!(
+                failing
+                    .record_until(&mount_record(), deadline)
+                    .unwrap_err()
+                    .code(),
+                ErrorCode::InvalidArgument
+            );
         }
 
         /// 資格情報だけを変えた `/proc/self/status` の fixture（必須項目は縮退後の非特権プロセス相当）。

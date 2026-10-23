@@ -48,9 +48,9 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::audit_log::{
-        AuditEvent, AuditFallback, AuditFileWriter, AuditPid, AuditRecord, AuditSignal, AuditSink,
-        AuditSyscallArch, AuditSyscallNr, AuditTimestamp, AuditWriteError, AuditWriteErrorKind,
-        ControlAuditRelay, ControlPeerRejection, FileAuditSink,
+        AuditEvent, AuditFallback, AuditFileWriter, AuditPath, AuditPid, AuditRecord, AuditSignal,
+        AuditSink, AuditSyscallArch, AuditSyscallNr, AuditTimestamp, AuditWriteError,
+        AuditWriteErrorKind, ControlAuditRelay, ControlPeerRejection, FileAuditSink,
     };
     use fandhe_container_core::traits::ErrorCode;
 
@@ -511,13 +511,13 @@ mod linux {
         assert!(threads() >= 2);
         let late = ControlAuditRelay::spawn(sink_for_late(&marker));
         assert_eq!(late.unwrap_err().code(), ErrorCode::FailedPrecondition);
-        // 制御チャネルと seccomp（#2025）以外の層は運ばない。
+        // 制御チャネル・seccomp（#2025）・終了シグナル・理由なしの mount（#2481）以外の層は運ばない。
         let mount = AuditRecord::new(
             AuditTimestamp::from_unix_duration(Duration::new(1_700_000_000, 5)),
             AuditPid::new(4242).unwrap(),
-            AuditEvent::Mount {
-                path: None,
-                reason: None,
+            AuditEvent::Landlock {
+                path: AuditPath::new("/x"),
+                syscall: None,
             },
         );
         assert_eq!(

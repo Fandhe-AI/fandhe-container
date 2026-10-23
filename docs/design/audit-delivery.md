@@ -139,7 +139,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 | 4 | `KILL_PROCESS` 側の記録（親の終了シグナルとカーネル監査の突き合わせ。レコード型の拡張の要否） | core・supervisor | #2004（実装済み。判断は 9.1） |
 | 5 | Landlock のカーネル監査対応（ABI 7 のログ制御フラグ）と縮退時の状態表示 | core | #2026 |
 | 6 | 縮退時の挙動（起動拒否／警告）の実装 | core・supervisor | #2027（実装済み。7.1。CLI からの `--audit-policy` の受け渡しは後続） |
-| 7 | `escape_suite.rs` の整備 | core | #2028（9.3。ESC-06 と、supervisor の relay 経由の mount 拒否は残余。パース時の destination 拒否は #2480 で本番の create 経路に配線） |
+| 7 | `escape_suite.rs` の整備 | core | #2028（9.3。ESC-06 は残余。supervisor の relay 経由の mount 拒否は #2481 で結合試験を追加。パース時の destination 拒否は #2480 で本番の create 経路に配線） |
 
 ### 7.1 実装した挙動（#2027。SEC-4・TASK-41 追補。監査配送 6/6）
 
@@ -163,7 +163,20 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 - **`SECCOMP_FILTER_FLAG_LOG` は不要**: `seccomp(2)` の Audit logging 節のとおり、`KILL_PROCESS` は `actions_logged` に載っていれば記録される。現行の適用経路（`prctl(PR_SET_SECCOMP)`）はフラグを渡せず、フィルタは変えない。**カーネルソース（`kernel/seccomp.c` の `seccomp_log` 等）での記録が出なくなる条件・pid の名前空間・rootless での記録有無の一次資料確認は未実施**（man ページ以外は未確認。#2027 の縮退判定は、確認できた観測だけを使い、できないものは 7.1 の残余とした）
 - **補助の `exit_signal` レコード**: 本番 launcher の回収点（`ContainerChildProcess` の `wait` / `terminate`）が SIGSYS の終了をちょうど 1 回、層 `exit_signal`（`AuditEvent::ExitSignal`。シグナルと回収側の PID namespace の対象 pid だけを持つ）で記録する。コンテナ内の `kill(SIGSYS)` と区別できないため seccomp 由来とは断定せず、syscall・arch は型として持たない（親の側で syscall を推測した記録は作れない）
 - **縮退**: カーネル監査を使えない環境では補助レコードだけが残る（syscall は残らない）。検出と表示は #2027（7.1）
-- **複数スレッド・rootless での配送（#2236 で実装）**: supervisor は監視の時点で複数スレッドのため `FileAuditSink` の隔離（fork）が使えず、rootless では代替のカーネル監査送信（`CAP_AUDIT_WRITE` が要る）も失敗する。そこで `ControlAuditRelay` が `ExitSignal` の固定長の枠（タグ 0x82。signal 1 バイトと target_pid 4 バイト。復号は長さの厳密一致と値の範囲検査で、壊れた枠は記録にしない）も運ぶようにし、supervisor の入口が単一スレッドの間に作った relay を `ProductionLauncherBuilder::exit_audit_sink` で launcher の**回収点だけ**の記録先に渡す。launch の時点の記録（監査網羅の縮退・bind の拒否・pre-pivot の違反）は単一スレッドで出るため従来どおり `FileAuditSink` のままにする（relay は `Mount` 等を運べず、sink 全体を差し替えると退行するため）。回収点は `AtomicBool` で 1 回だけ記録し、relay の待ちは `RECORD_WAIT_LIMIT` までで、応答が無ければ helper を SIGKILL して以後は `Unavailable`（REPAIR-5。終了状態の返却は変えない）
+- **複数スレッド・rootless での配送（#2236 で実装）**: supervisor は監視の時点で複数スレッドのため `FileAuditSink` の隔離（fork）が使えず、rootless では代替のカーネル監査送信（`CAP_AUDIT_WRITE` が要る）も失敗する。そこで `ControlAuditRelay` が `ExitSignal` の固定長の枠（タグ 0x82。signal 1 バイトと target_pid 4 バイト。復号は長さの厳密一致と値の範囲検査で、壊れた枠は記録にしない）も運ぶようにし、supervisor の入口が単一スレッドの間に作った relay を `ProductionLauncherBuilder::exit_audit_sink` で launcher の**回収点だけ**の記録先に渡す。launch の時点の記録（監査網羅の縮退・pre-pivot の違反）は単一スレッドで出るため従来どおり `FileAuditSink` のままにする（relay は理由つきの `Mount` 等を運べず、sink 全体を差し替えると退行するため）。start の検証（bind・sysfs の拒否）の記録先は #2481 で別に扱う（次の項目）。回収点は `AtomicBool` で 1 回だけ記録し、relay の待ちは `RECORD_WAIT_LIMIT` までで、応答が無ければ helper を SIGKILL して以後は `Unavailable`（REPAIR-5。終了状態の返却は変えない）
+- **start の bind・sysfs の拒否の配送（#2481 で実装）**: `claim_start` の検証は作業スレッド `supervisor-start` で走り、入口スレッドが待つ間はプロセスが複数スレッドになる。このため launcher の `audit_sink`（`FileAuditSink`）は主経路を試せず、rootless では代替経路も失敗して mount 層の拒否が `@audit.log` に残らなかった（`claim_start` は記録の結果を捨てる）。そこで `ControlAuditRelay` が理由なしの `Mount` の固定の枠（タグ 0x83。path_present 1・path_len 2・original_len 8 の後にパス本体を生バイトで運ぶ。復号は長さの厳密一致・保持長 4096 以下・`AuditPath` の切り詰めの整合を検査し、矛盾する枠は記録にしない。helper は本体を確保する前に長さを上限と照合する）を運ぶようにし、supervisor の入口が `ProductionLauncherBuilder::rejection_audit_sink` で start の検証の拒否だけの記録先に relay を渡す。relay が記録できなかったときは、記録先を包む `ObservedRejectionSink` が固定語彙の構造化ログ（`rejection_audit_record_failed`・エラーコード）を 1 行出し、拒否の結果は変えない。結合試験は `crates/supervisor/tests/start_bind_audit_relay.rs`
+- **`AuditEvent` の種類ごとの relay の扱い（#2481）**: relay で運ぶのは下表の「運ぶ」だけで、運ばない種類は `InvalidArgument` で失敗が見える（黙って捨てない）。運ばない種類は、記録するのが単一スレッドの段か別プロセスのため、`FileAuditSink` で足りる。`audit_sink` を丸ごと relay へ差し替えない（差し替えると理由つきの `Mount` や縮退の記録が `InvalidArgument` で落ちて退行する）
+
+  | 種類 | relay | 記録する段・スレッドの状況 | 使う sink |
+  | ---- | ----- | -------------------------- | --------- |
+  | `ControlPeer` | 運ぶ | 制御チャネルのサーバスレッド（複数スレッド） | relay |
+  | `Seccomp` | 運ぶ | seccomp ハブのスレッド（複数スレッド） | relay |
+  | `ExitSignal` | 運ぶ | launcher の回収点（監視スレッド。複数スレッド） | relay（`exit_audit_sink`） |
+  | `Mount`（理由なし） | 運ぶ | start の bind・sysfs の拒否（作業スレッド。複数スレッド） | relay（`rejection_audit_sink`） |
+  | `Mount`（理由つき） | 運ばない（理由の静的トークンは開いた語彙で、復号側で閉じた表へ戻せない） | launch・create・exec の拒否（単一スレッド） | `FileAuditSink` |
+  | `Landlock`・`PluginTrust`・`ExecTarget`・`Entrypoint` | 運ばない | 単一スレッドの段（launch の pre-pivot・exec の親・plugin 検証） | `FileAuditSink` またはカーネル監査 |
+  | `AuditCoverageDegraded` | 運ばない | launcher の launch（入口スレッド。単一スレッド）。`start_entry_audit_record_failed.rs` が照合済み。restart の再 launch は複数スレッドでは本番 launcher が拒否する（#2043） | `FileAuditSink`（`audit_sink`） |
+
 - **supervisor の exec コマンド（#2236 で実装）**: exec worker が回収したコマンドの終了状態を pipe の 1 行で返す際に、コマンドの PID も載せる（`ExecOutcome::command_pid`。worker は `pid_for_children` だけをコンテナの PID namespace へ移すため、worker・親と同じ PID namespace の値）。親（単一スレッドの exec 専用プロセス）が、コマンドが SIGSYS で終了した（`Signaled(31)`）ときだけ層 `exit_signal` を 1 件記録し、結果は `AuditedOutcome::exit_audit` で返す（違反の記録の `audit` とは別の欄）
 - **残余（未実装。REPAIR-3）: PID 1 以外の子孫と、exec コマンドの子孫の SIGSYS 終了は親から観測できない**。コンテナ内の子孫は同じ PID namespace の中の親が回収し、孤児は namespace 内の init（PID 1）に再親付けされる（`find_new_reaper` は同じ namespace の中で探すため、外にいる supervisor の child subreaper には届かない）。承認済みの最小権限集合（`privilege-separation.md`）の範囲に親が得る手段が無い（proc connector は `CAP_NET_ADMIN`、`PIDFD_INFO_EXIT` は Linux 6.15 以上かつ短命なプロセスの取りこぼしがあり「確実に」を満たせない、コンテナ内の init shim は PID 1 の契約を変える設計変更）。この範囲の正の記録はカーネルの `AUDIT_SECCOMP` が担う（読み手は #2237）。追跡 issue の起票と、spec 側（ESC-06・SEC-4 の受け入れ範囲）の見直しの要否はオーナー判断
 - **読み手と `CAP_AUDIT_READ` の判断材料**: 記録されない条件・rootless・選択肢 A/B は `audit-seccomp-reader.md`（#2237・オーナー承認待ち）。上の「カーネルソースでの確認は未実施」は同書 2 章で確認済み（v6.12）
@@ -189,7 +202,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 
 - **ESC-06（`KILL_PROCESS` の 3 件）は `Deferred`**: `USER_NOTIF` に載らず、補助の `exit_signal` は本番 launcher の回収点が出して試験の入口（`spawn_container_probe`）では作られず、正の記録はカーネルの `AUDIT_SECCOMP`（読み手が無い。#2237）。`Required` への切り替えは #2237（`AUDIT_SECCOMP` の読み手と `CAP_AUDIT_READ`）の結論の後に行う。#2236 の側は、複数スレッド・rootless での `exit_signal` の配送と exec コマンドの記録を実装した（9.1。実機の照合は `production_launcher` のシナリオ Q〔#1621 で人間が実行〕）。子孫の SIGSYS 終了は親から観測できず未達のまま
 - **`create` のパース時の destination 拒否（遡り・`/`・相対 `..`）は、CLI の create だけ本番で監査される（#2480）**: `create_audited` / `create_with_image_audited` が `audit_mount_config_error` を通し、`FileAuditSink`（`<状態ルート>/@audit.log`）へ mount 層で 1 件記録する（`esc-08-config-destination` は `Required` で 3 行を照合。結合試験は `tests/create_mount_audit_delivery.rs`・`crates/cli/tests/binary_entry.rs`）。残余: plugin-cri の `CoreLifecycleRuntime::create` は未配線（tokio のマルチスレッドでは `FileAuditSink` の fork 隔離が使えず、rootless では `SinkFailed` になる）。start の TOCTOU 再検証（create 後に書き換えられた destination の拒否）も記録しない
-- **supervisor の `start` 経由の bind の元の拒否の監査は未照合**: supervisor は launcher の launch の時点の監査 sink に `FileAuditSink`（`build_audit_sink`）を渡し、`ControlAuditRelay` は回収点の `exit_signal` 専用の記録先（`exit_audit_sink`）と seccomp ハブ・制御チャネルにだけ渡す（#2236 で訂正。以前の記述は実装とずれていた）。relay は `Mount` の記録を `InvalidArgument` で拒否するため、launch の時点の sink には使わない。この試験は core の `start` と `FileAuditSink` の結線までを照合しており、supervisor の結線は照合していない
+- **supervisor の `start` 経由の bind の元の拒否の監査は、結合試験までを照合済み（#2481）**: supervisor は launcher の launch の時点の監査 sink に `FileAuditSink`（`build_audit_sink`）を渡し、start の検証の拒否の記録先（`rejection_audit_sink`）・回収点の `exit_signal` 専用の記録先（`exit_audit_sink`）・seccomp ハブ・制御チャネルには `ControlAuditRelay` を渡す。`crates/supervisor/tests/start_bind_audit_relay.rs` が、公開の `run_start`（作業スレッドで `claim_start`）から relay 経由で `@audit.log` に mount 層 3 行が届くことを照合する（relay を使わず `FileAuditSink` のままだと 0 行になることも確認済み）。残余: 本番の `ProductionStartDeps::build_launcher` の結線は core の単体試験とソース構造の試験で固定しており、本番 bin から実コンテナまでの通し（委譲 cgroup 等の実機前提。人間担当の #1621 の範囲）での照合は未実施
 - カーネル監査の段の実機での実行と記録は人間担当の #206。この環境（AppArmor が非特権 user namespace を制限）では、分離を要するケースを含め実機部は実行できていない
 
 ## 10. セキュリティ上の論点

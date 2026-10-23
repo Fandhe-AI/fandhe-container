@@ -128,10 +128,17 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
   `Unimplemented`（`openat2 is not available on this kernel`）で拒否し、パス起点へ縮退しない。`Strip` ポリシーでも同じ（Landlock
   前提の 5.13 より古いカーネルは CORE の前提外）。seccomp による `EPERM` は `PermissionDenied`
 - 他の OS・アーキテクチャ: macOS・Windows はパス起点のまま（特殊ビットの保持は Linux 限定で `UnsupportedHost` になるため、
-  SEC-5 の TOCTOU は Linux 固有）。Linux の他アーキテクチャは定数を確かめていないので `Unimplemented`
-- whiteout の削除（`remove_tree` / `remove_contents`）も fd 起点で、`getdents64` で列挙する。所有者の rwx が欠けるディレクトリは
-  権限を戻してから消すが、所有者に `r` が無い（0000）ディレクトリは開けず `PermissionDenied`（展開中のディレクトリは遅延
-  mode のため `finish_dirs` まで 0700 で、この経路には現れない）。公開の `remove_extracted_tree` はパス起点のまま
+  SEC-5 の TOCTOU は Linux 固有）。Linux の他アーキテクチャは定数を確かめていないので展開は `Unimplemented`
+  （`remove_extracted_tree` はパス起点のまま。理由と残余は下記「未実装」。#2598）
+- whiteout の削除（`remove_tree` / `remove_contents`）も fd 起点で、`getdents64` で列挙する。子は 1 コンポーネントずつ
+  `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV` で開く。所有者の rwx が欠けるディレクトリは権限を戻して消す。
+  所有者に `r` が無い（0000）ディレクトリは、同じ `dirfd` と名前から `O_PATH` で開き、`/proc/self/fd/<n>` 経由で権限を戻し
+  （`fchmodat` は最終コンポーネントの symlink を追従するため使わない）、その fd の `.` を開き直す（名前を解決し直さない）。
+  `/proc` が必要で、無ければ失敗する。所有者でなければ `PermissionDenied`（#2598）
+- 公開の `remove_extracted_tree` も同じ削除（`remove_path_tree`）で fd 起点にした（#2598）。`path` の親だけは信頼済みの
+  接頭辞としてパスで 1 回開き、`path` から下の差し替えは `FailedPrecondition`、`file_name` を持たない `/`・`..` 終わりは
+  `InvalidArgument`。木の中に残ったマウントは `RESOLVE_NO_XDEV` で `FailedPrecondition` になり、中身を消さない
+  （非特権では作れないため試験では確かめていない）
 
 ### 展開中の再確認（SEC-5）
 
@@ -179,8 +186,12 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   `PreserveIfOwnerMapped` の rootless 経路（`chown` しない 1 行の写像）は従来どおり
 - 0700 の祖先ディレクトリで閉じ込めを判定する方式。`root` が 0700 のため、複数範囲の写像でもコンテナ内の非 root ユーザーは
   `/` を辿れない
-- macOS・Windows・Linux の他アーキテクチャでのディレクトリ fd 起点の解決（unix 全体なら `openat(O_DIRECTORY | O_NOFOLLOW)` の
-  1 コンポーネントずつの走査で統一できる）と、公開の `remove_extracted_tree` の fd 起点化（#2437 の範囲外）
+- macOS・Windows・Linux の他アーキテクチャでの、展開と公開の `remove_extracted_tree` のディレクトリ fd 起点の解決（#2598 で
+  広げないと決めた）。パス起点のままで、確認から使用までの TOCTOU と、木の中に残ったマウントの中身の削除を防げない。理由:
+  特殊ビットの保持は Linux 限定で SEC-5 の TOCTOU は Linux 固有／macOS・Windows の本番経路は cli の `non_linux_failure` が先に
+  fail-closed にしホストでの展開に届かない／Linux の他アーキテクチャは展開が `Unimplemented` で展開物が無く、削除も空の木を
+  消すだけ／macOS の `openat` 系・Windows のハンドル起点操作は新しい FFI 宣言・libc 照合（Windows はオーナー判断）が要る。
+  ゲストが共有ディレクトリへ書き込みうる設計（`macos-shared-vm.md`）になれば優先度が上がる
 - oci の `sys` への `libc` との機械照合の導入（`docs/design/ffi-libc-check.md`。`sys/at.rs` の定数は一次情報との突き合わせのみ）
 - 本番の呼び出し元（pull → 展開 → 起動の経路）から `ExtractOptions` を渡す配線
 - `IdMap` と core の `IdMapSet` を下位 crate へ共通化するかどうか（crate 境界の判断）

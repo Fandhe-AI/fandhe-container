@@ -11,8 +11,8 @@
 //!   パス 2（whiteout の適用）と、パス 3 で下位レイヤー由来のノードを置き換えるとき（image-spec の
 //!   「Changeset over existing files」）に `Extractor` から呼ばれる。
 //!   Linux の x86_64 / aarch64 の展開では `Extractor` が `layer::anchored` の fd 起点の削除（同じ契約。祖先の
-//!   差し替えで `root` の外を消さない。#2437）を使い、本関数は公開の `remove_extracted_tree` とそれ以外のホストの
-//!   展開から呼ばれる。
+//!   差し替えで `root` の外を消さない。#2437）を使う。公開の `remove_extracted_tree` も同じ（#2598）。本関数は
+//!   それ以外のホスト（macOS・Windows・Linux の他アーキテクチャ）のパス起点の削除から呼ばれる。
 //! - `remove_dir_contents_nofollow`: 不透明ディレクトリ（`.wh..wh..opq`。TASK-53.2・#413）用に、ディレクトリ自体は
 //!   残して直下の全エントリを再帰削除する。パス 2 で `Extractor::apply_markers` から呼ばれる。
 //!
@@ -107,6 +107,14 @@ pub(crate) fn classify(name: &[u8]) -> Result<NameClass, OciError> {
 ///
 /// symlink はリンク自体だけを消し、リンク先は触らない。所有者の rwx が欠けるディレクトリ（0555・0000 等）は
 /// 先に権限を戻してから中身を消す。深さは `MAX_REMOVE_DEPTH` で打ち切る（`ResourceExhausted`）。
+// Linux の x86_64 / aarch64 は fd 起点の実装（`layer::anchored`）が使うため、本体は試験からだけ呼ばれる。
+#[cfg_attr(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    allow(dead_code)
+)]
 pub(crate) fn remove_tree_nofollow(path: &Path) -> Result<(), OciError> {
     remove_at(path, 0)
 }

@@ -19,10 +19,23 @@
 //! - 古いカーネル（`openat2` は Linux 5.6 以降）や seccomp で `openat2` が使えない場合は、パス起点へ縮退せず
 //!   `Unimplemented` で展開の開始前に拒否する（fail-closed）。`Strip` ポリシーでも同じ。
 //!
+//! - 木ごとの削除は子を 1 コンポーネントずつ `RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV` で
+//!   開いて下降する。所有者に `r` が無い（0000 等）ディレクトリは `O_PATH` の fd と `/proc/self/fd` 経由で権限を
+//!   戻して開き直す（`/proc` が必要。#2598）。公開の `remove_extracted_tree` も `remove_path_tree` でこの経路を使う
+//!   （`path` の親だけは信頼済みの接頭辞としてパスで開く）。マウントをまたぐ木は `FailedPrecondition` で拒否する
+//!   （非特権では作れないため試験で確かめていない）。
+//!
 //! # 他の OS・アーキテクチャ
 //! macOS・Windows・Linux の他アーキテクチャは従来どおりパス起点の `std::fs` で動く（特殊ビットの保持は
 //! Linux 限定で `UnsupportedHost` に落ちるため、SEC-5 の TOCTOU は Linux 固有）。Linux の x86_64 / aarch64 以外は
 //! 定数と syscall 番号を確かめていないため、`open` が `Unimplemented` で拒否する。
+//!
+//! 展開と `remove_extracted_tree` を fd 起点にしない理由（#2598）: macOS・Windows の本番経路は cli の
+//! `non_linux_failure` が先に fail-closed にし、ホストでの展開に届かない（実行はゲストの Linux 側）。macOS の
+//! `openat` 系・Windows のハンドル起点操作には新しい FFI 宣言と libc 照合・オーナー判断が要る。Linux の他
+//! アーキテクチャでは展開が `Unimplemented` のため展開物が存在せず、`remove_extracted_tree` は空の木を消すだけ
+//! なのでパス起点のままにする。残余はパス起点の TOCTOU（確認から使用までの間の祖先の差し替え）と、木の中に
+//! 残ったマウントの中身まで消しうること（REPAIR-3。`docs/design/oci-layer-special-bits.md` の「未実装」）。
 //!
 //! # 呼び出し文脈
 //! `extract_stack` / `extract_zero_layers` が `AnchoredRoot::open` で作り、`Extractor` が保持する。syscall は
@@ -312,9 +325,9 @@ mod imp {
 
         /// `parent/name` を symlink を追従せず木ごと消す。存在しなければ成功（冪等）。
         ///
-        /// 所有者に `r` がないディレクトリ（0000 等）は fd で開けず `PermissionDenied` で拒否する（fail-closed）。
-        /// 展開中のディレクトリは遅延 mode のため `finish_dirs` まで 0700 で、この経路には現れない。権限を
-        /// 戻しながら消す公開の `remove_extracted_tree` はパス起点のまま（`whiteout`）。
+        /// 所有者に `r` がないディレクトリ（0000 等）は、`O_PATH` の fd と `/proc/self/fd` 経由で権限を戻して
+        /// 開き直してから消す（`open_dir_for_removal`。パスを解決し直さない。#2598）。公開の
+        /// `remove_extracted_tree` も同じ部品（`remove_path_tree`）を使う。
         pub(in crate::layer) fn remove_tree(
             &self,
             parent: &[OsString],
@@ -326,13 +339,20 @@ mod imp {
                 Err(e) => return Err(map_at_err(&e)),
             };
             let mut buf = vec![0u8; DIRENT_BUF_LEN];
-            remove_at(dir.as_fd(), name, 0, &mut buf)
+            remove_at(self.hooks.openat2, dir.as_fd(), name, 0, &mut buf)
         }
 
         /// `comps` のディレクトリ自体は残し、直下を symlink を追従せず木ごと消す（不透明ディレクトリ）。
         pub(in crate::layer) fn remove_contents(&self, comps: &[OsString]) -> Result<(), OciError> {
-            let dir = match self.open_rel(comps, DIR_FLAGS_RW) {
-                Ok(d) => File::from(d),
+            let opened = match self.open_rel(comps, DIR_FLAGS_RW) {
+                // 0000 の不透明ディレクトリ: `O_PATH` で握って権限を戻し、同じ inode を開き直す（#2598）。
+                Err(e) if e.raw_os_error() == Some(at::EACCES) => {
+                    self.open_rel(comps, DIR_FLAGS).and_then(reopen_readable)
+                }
+                r => r.map(File::from),
+            };
+            let dir = match opened {
+                Ok(d) => d,
                 Err(e) if e.raw_os_error() == Some(ENOENT) => return Ok(()),
                 Err(e) if matches!(e.raw_os_error(), Some(at::ELOOP | at::ENOTDIR)) => {
                     return Err(err(
@@ -344,8 +364,85 @@ mod imp {
             };
             make_removable(&dir)?;
             let mut buf = vec![0u8; DIRENT_BUF_LEN];
-            remove_contents_of(&dir, 1, &mut buf)
+            remove_contents_of(self.hooks.openat2, &dir, 1, &mut buf)
         }
+    }
+
+    /// 削除のために下降する子の `openat2` 解決フラグ（symlink・マジックリンク・マウント越えを拒否する）。
+    const RESOLVE_DESCEND: u64 =
+        at::RESOLVE_NO_SYMLINKS | at::RESOLVE_NO_MAGICLINKS | at::RESOLVE_NO_XDEV;
+
+    /// `O_PATH` の fd が指すディレクトリの所有者権限を戻し、同じ inode を読み取りで開き直す（#2598）。
+    ///
+    /// 所有者に `r` が無い（0000 等）ディレクトリは `O_RDONLY` で開けない。`set_dir_mode` と同じく
+    /// `/proc/self/fd/<n>` 経由で mode を適用し（fd 起点のまま。`fchmodat` は最終コンポーネントの symlink を
+    /// 追従するため使わない）、その fd を起点に `.` を開き直す（名前の再解決は起きない）。`/proc` が無い環境では
+    /// 失敗する。`ENOENT` を `NotFound` として「既に無い」と取り違えて黙って残さないよう `ENOSYS` に写す。
+    fn reopen_readable(opath: OwnedFd) -> io::Result<File> {
+        let meta = File::from(opath.try_clone()?).metadata()?;
+        let mode = meta.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            let p = format!("/proc/self/fd/{}", opath.as_raw_fd());
+            fs::set_permissions(p, fs::Permissions::from_mode((mode | 0o700) & 0o7777)).map_err(
+                |e| {
+                    if e.raw_os_error() == Some(ENOENT) {
+                        io::Error::from_raw_os_error(at::ENOSYS)
+                    } else {
+                        e
+                    }
+                },
+            )?;
+        }
+        let dot = at::relative_cstring::<&str>(&[])?;
+        at::openat2(Some(opath.as_fd()), &dot, DIR_FLAGS_RW, 0, RESOLVE_DESCEND).map(File::from)
+    }
+
+    /// `dirfd` 直下のディレクトリ `name` を削除のために開く。所有者に `r` が無ければ権限を戻して開き直す。
+    fn open_dir_for_removal(
+        openat2: Openat2Fn,
+        dirfd: BorrowedFd<'_>,
+        name: &std::ffi::CStr,
+    ) -> io::Result<File> {
+        match openat2(Some(dirfd), name, DIR_FLAGS_RW, 0, RESOLVE_DESCEND) {
+            Ok(fd) => Ok(File::from(fd)),
+            Err(e) if e.raw_os_error() == Some(at::EACCES) => {
+                openat2(Some(dirfd), name, DIR_FLAGS, 0, RESOLVE_DESCEND).and_then(reopen_readable)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// 公開の `remove_extracted_tree` の本体。`path` の最終コンポーネントを、親ディレクトリ fd 起点で木ごと消す。
+    ///
+    /// 親は信頼済みの接頭辞（呼び出し側が所有するステージング等）としてパスで 1 回だけ開き、`path` から下は
+    /// 1 コンポーネントずつ `RESOLVE_DESCEND` で開く。差し替え（symlink・マウント越え）は `FailedPrecondition`
+    /// で拒否し `path` の外を消さない（OCI-1・SEC-5・#2598）。`file_name` を持たない `path`（`/`・`..` 終わり）は
+    /// `InvalidArgument`。親が無ければ成功（冪等）。
+    pub(in crate::layer) fn remove_path_tree(path: &Path) -> Result<(), OciError> {
+        let bad = || err(OciErrorCode::InvalidArgument, "path to remove is invalid");
+        let name = path.file_name().ok_or_else(bad)?;
+        at::component_cstring(name).map_err(|_| bad())?;
+        let parent = path.parent().unwrap_or_else(|| Path::new(""));
+        let parent_c = if parent.as_os_str().is_empty() {
+            std::ffi::CString::new(".")
+        } else {
+            std::ffi::CString::new(parent.as_os_str().as_bytes())
+        }
+        .map_err(|_| bad())?;
+        let dir = match at::openat2(
+            None,
+            &parent_c,
+            at::O_PATH | at::O_DIRECTORY | at::O_CLOEXEC,
+            0,
+            0,
+        ) {
+            Ok(d) => d,
+            Err(e) if e.raw_os_error() == Some(ENOENT) => return Ok(()),
+            Err(e) if e.raw_os_error() == Some(at::ENOTDIR) => return Err(bad()),
+            Err(e) => return Err(map_fs_err(&e)),
+        };
+        let mut buf = vec![0u8; DIRENT_BUF_LEN];
+        remove_at(at::openat2, dir.as_fd(), name, 0, &mut buf)
     }
 
     /// 所有者の rwx が欠けるディレクトリは権限を戻す（中身を消せるように）。
@@ -364,6 +461,7 @@ mod imp {
 
     /// `dirfd` 直下の `name` を symlink を追従せず木ごと消す（存在しなければ成功）。
     fn remove_at(
+        openat2: Openat2Fn,
         dirfd: BorrowedFd<'_>,
         name: &OsStr,
         depth: usize,
@@ -386,14 +484,8 @@ mod imp {
             ));
         }
         let n = at::component_cstring(name).map_err(|e| map_fs_err(&e))?;
-        let child = match crate::sys::at::openat2(
-            Some(dirfd),
-            &n,
-            DIR_FLAGS_RW,
-            0,
-            at::RESOLVE_NO_SYMLINKS | at::RESOLVE_NO_MAGICLINKS | at::RESOLVE_NO_XDEV,
-        ) {
-            Ok(fd) => File::from(fd),
+        let child = match open_dir_for_removal(openat2, dirfd, &n) {
+            Ok(fd) => fd,
             Err(e) if e.raw_os_error() == Some(ENOENT) => return Ok(()),
             Err(e) if matches!(e.raw_os_error(), Some(at::ELOOP | at::ENOTDIR)) => {
                 // 本物のディレクトリではない: 元の `EPERM` は権限の失敗、それ以外は差し替え。
@@ -406,7 +498,7 @@ mod imp {
             Err(e) => return Err(map_at_err(&e)),
         };
         make_removable(&child)?;
-        remove_contents_of(&child, depth + 1, buf)?;
+        remove_contents_of(openat2, &child, depth + 1, buf)?;
         match at::unlinkat_name(dirfd, name, true) {
             Ok(()) => Ok(()),
             Err(e) if e.raw_os_error() == Some(ENOENT) => Ok(()),
@@ -415,7 +507,12 @@ mod imp {
     }
 
     /// `dir` 直下の全エントリを木ごと消す。列挙中の削除で取りこぼしがないよう、空の走査になるまで繰り返す。
-    fn remove_contents_of(dir: &File, depth: usize, buf: &mut [u8]) -> Result<(), OciError> {
+    fn remove_contents_of(
+        openat2: Openat2Fn,
+        dir: &File,
+        depth: usize,
+        buf: &mut [u8],
+    ) -> Result<(), OciError> {
         for _ in 0..MAX_DRAIN_PASSES {
             (&*dir).rewind().map_err(|e| map_fs_err(&e))?;
             let mut any = false;
@@ -431,7 +528,7 @@ mod imp {
                 .map_err(|_| err(OciErrorCode::Internal, "failed to list a directory"))?;
                 for nm in names {
                     any = true;
-                    remove_at(dir.as_fd(), &nm, depth, buf)?;
+                    remove_at(openat2, dir.as_fd(), &nm, depth, buf)?;
                 }
             }
             if !any {
@@ -654,9 +751,14 @@ mod imp {
             whiteout::remove_dir_contents_nofollow(&self.debug_path(comps))
         }
     }
+
+    /// 公開の `remove_extracted_tree` の本体（パス起点。fd 起点は Linux の x86_64 / aarch64 のみ。#2598）。
+    pub(in crate::layer) fn remove_path_tree(path: &Path) -> Result<(), OciError> {
+        whiteout::remove_tree_nofollow(path)
+    }
 }
 
-pub(super) use imp::{AnchorHooks, AnchoredRoot, map_at_err};
+pub(super) use imp::{AnchorHooks, AnchoredRoot, map_at_err, remove_path_tree};
 #[cfg(all(
     test,
     target_os = "linux",
@@ -664,6 +766,7 @@ pub(super) use imp::{AnchorHooks, AnchoredRoot, map_at_err};
 ))]
 mod tests {
     use super::*;
+    use std::os::fd::{BorrowedFd, OwnedFd};
     use std::os::unix::fs::PermissionsExt as _;
 
     fn tmp(tag: &str) -> PathBuf {
@@ -721,6 +824,109 @@ mod tests {
             assert_eq!(e.code(), OciErrorCode::FailedPrecondition, "{bad}");
         }
         assert!(base.is_dir());
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// OCI-2・SEC-5・#2598: 所有者に `r` が無い（0000）ディレクトリと 0555 の下の 0000 も、fd 起点の削除
+    /// （`remove_tree` と `remove_path_tree`）が権限を戻して消す。`root` の外は残る。
+    #[test]
+    fn oci2_remove_tree_removes_unreadable_0000_dirs() {
+        for via_path in [false, true] {
+            let base = tmp(if via_path { "z0path" } else { "z0root" });
+            let root = base.join("root");
+            let outside = base.join("outside");
+            fs::create_dir_all(root.join("t/a")).unwrap();
+            fs::create_dir_all(root.join("t/ro/z")).unwrap();
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(outside.join("keep"), b"k").unwrap();
+            fs::write(root.join("t/ro/z/f"), b"f").unwrap();
+            for (p, m) in [("t/ro/z", 0o000), ("t/ro", 0o555), ("t/a", 0o000)] {
+                fs::set_permissions(root.join(p), fs::Permissions::from_mode(m)).unwrap();
+            }
+            if via_path {
+                remove_path_tree(&root.join("t")).unwrap();
+            } else {
+                let a = AnchoredRoot::open(&root, AnchorHooks::host()).unwrap();
+                a.remove_tree(&[], OsStr::new("t")).unwrap();
+            }
+            assert!(fs::symlink_metadata(root.join("t")).is_err());
+            assert_eq!(fs::read(outside.join("keep")).unwrap(), b"k");
+            fs::remove_dir_all(&base).unwrap();
+        }
+    }
+
+    /// OCI-2・#2598: 0000 の不透明ディレクトリの中身を消せ、自身は残って空になる。
+    #[test]
+    fn oci2_remove_contents_handles_0000_opaque_dir() {
+        let base = tmp("opq0");
+        let root = base.join("root");
+        fs::create_dir_all(root.join("d/sub")).unwrap();
+        fs::write(root.join("d/a"), b"a").unwrap();
+        fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o000)).unwrap();
+        let a = AnchoredRoot::open(&root, AnchorHooks::host()).unwrap();
+        a.remove_contents(&os(&["d"])).unwrap();
+        fs::set_permissions(root.join("d"), fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(fs::read_dir(root.join("d")).unwrap().count(), 0);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// OCI-1・#2598: `file_name` を持たない `path` は `InvalidArgument`、親が無ければ冪等に成功する。
+    #[test]
+    fn oci1_remove_path_tree_rejects_nameless_paths_and_is_idempotent() {
+        for bad in ["/", "..", "a/..", "."] {
+            let e = remove_path_tree(Path::new(bad)).unwrap_err();
+            assert_eq!(e.code(), OciErrorCode::InvalidArgument, "{bad}");
+        }
+        let base = tmp("rpt");
+        remove_path_tree(&base.join("no/such/x")).unwrap();
+        remove_path_tree(&base.join("none")).unwrap();
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// OCI-1・SEC-5・#2598: `path` 自身が symlink ならリンクだけを消し、先は残る。
+    #[test]
+    fn sec5_remove_path_tree_unlinks_symlink_only() {
+        let base = tmp("rptl");
+        fs::create_dir_all(base.join("outside")).unwrap();
+        fs::write(base.join("outside/keep"), b"k").unwrap();
+        std::os::unix::fs::symlink(base.join("outside"), base.join("lnk")).unwrap();
+        remove_path_tree(&base.join("lnk")).unwrap();
+        assert!(fs::symlink_metadata(base.join("lnk")).is_err());
+        assert_eq!(fs::read(base.join("outside/keep")).unwrap(), b"k");
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// SEC-5・#2598: 下降の直前に子ディレクトリが `root` の外を指す symlink へ差し替えられたら
+    /// `FailedPrecondition` で拒否し、外のファイルを消さない。
+    #[test]
+    fn sec5_remove_tree_rejects_swap_to_symlink_before_descend() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static SWAPPED: AtomicBool = AtomicBool::new(false);
+        static BASE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+        fn swapping(
+            dir: Option<BorrowedFd<'_>>,
+            path: &std::ffi::CStr,
+            flags: u64,
+            mode: u64,
+            resolve: u64,
+        ) -> io::Result<OwnedFd> {
+            // 子 `d` を開く最初の呼び出しの直前に、`d` を外への symlink へ差し替える。
+            if path.to_bytes() == b"d" && !SWAPPED.swap(true, Ordering::SeqCst) {
+                let base = BASE.lock().unwrap().clone().unwrap();
+                fs::remove_dir_all(base.join("root/t/d")).unwrap();
+                std::os::unix::fs::symlink(base.join("outside"), base.join("root/t/d")).unwrap();
+            }
+            crate::sys::at::openat2(dir, path, flags, mode, resolve)
+        }
+        let base = tmp("swap");
+        fs::create_dir_all(base.join("root/t/d")).unwrap();
+        fs::create_dir_all(base.join("outside")).unwrap();
+        fs::write(base.join("outside/keep"), b"k").unwrap();
+        *BASE.lock().unwrap() = Some(base.clone());
+        let a = AnchoredRoot::open(&base.join("root"), AnchorHooks { openat2: swapping }).unwrap();
+        let e = a.remove_tree(&[], OsStr::new("t")).unwrap_err();
+        assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
+        assert_eq!(fs::read(base.join("outside/keep")).unwrap(), b"k");
         fs::remove_dir_all(&base).unwrap();
     }
 

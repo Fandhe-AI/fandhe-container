@@ -73,3 +73,18 @@ cargo test -p fandhe-container-core --test landlock_enforcement -- --nocapture
 | シナリオ B（`audit.mode`） | |
 | シナリオ C（`abi=`・`restrict_self_flags=`・成否） | |
 | 判定 | |
+
+## GitHub ホステッド runner（ubuntu-latest）での計測（#2483）
+
+`.github/workflows/linux-env-probe.yml` の `escape-suite-probe` ジョブが、auditd の導入・`landlock_audit_exec --ignored`（シナリオ A 相当）・`escape_suite` の opt-in のカーネル監査の段を実行して Step Summary に記録する。ABI 7 は #2022 で計測済み。本計測は #2306 の実機確認（人間担当）の代わりではない。結果は人間が下表へ転記し、`platform-ci` へ組み込むかを判断する（`auid` / `ses` は伏せる）。
+
+| 項目 | 記録 |
+| ---- | ---- |
+| 日付・run | |
+| kernel 版・ABI | |
+| `CONFIG_AUDIT` / `CONFIG_AUDITSYSCALL` | |
+| auditd の導入・起動・`auditctl -s` の `enabled` | |
+| `landlock_audit_exec`（root） | |
+| `escape_suite` opt-in の段（root） | |
+| `escape_suite` opt-in の段（非 root・ACL） | |
+| `LANDLOCK_ACCESS` の件数 | |

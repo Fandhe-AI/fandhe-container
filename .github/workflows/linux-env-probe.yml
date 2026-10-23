@@ -495,11 +495,16 @@ jobs:
   # escape-suite-probe（ubuntu-latest で ESC スイートの実機ケースを実行できるかの計測。
   # #2022・TASK-43 追補・SEC-2。計測のみで必須チェックではない。ケースの失敗では
   # ジョブを落とさず、結果を表にして記録する）
+  # #2483: 加えて opt-in のカーネル監査の段（FANDHE_CONTAINER_TEST_KERNEL_AUDIT=1。
+  # ESC-01・07・10 の LANDLOCK_ACCESS）と landlock_audit_exec を回せるかを計測する
+  # （SEC-4・REPAIR-7）。計測のみで platform-ci へは組み込まない（組み込みは人間の判断）。
+  # sudo の用途は AppArmor 緩和・auditd の導入・audit ログの ACL 付与・root での
+  # テストバイナリ実行に限る（エフェメラルな runner のみ。全ユーザーへの許可はしない）
   # --------------------------------------------------
   # yamllint disable rule:line-length
   escape-suite-probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
     permissions:
       contents: read
     defaults:
@@ -539,6 +544,9 @@ jobs:
             echo "- max_user_namespaces: $(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo n/a)"
             echo "- sudo: $(sudo -n true 2>/dev/null && echo ok || echo no)"
             echo "- Landlock ABI: ${abi}"
+            echo "- kernel config (AUDIT/AUDITSYSCALL/SECURITY_LANDLOCK): $(grep -E '^CONFIG_(AUDIT|AUDITSYSCALL|SECURITY_LANDLOCK)=' "/boot/config-$(uname -r)" 2>/dev/null | tr '\n' ' ')"
+            echo "- cmdline audit=/lsm= tokens: $(grep -oE '(^| )(audit|lsm)=[^ ]*' /proc/cmdline 2>/dev/null | tr '\n' ' ')"
+            echo "- auditd (before): command=$(command -v auditd || echo none) active=$(systemctl is-active auditd 2>&1 | head -n1) log=$(ls /var/log/audit/audit.log 2>/dev/null || echo none)"
           } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Relax AppArmor unprivileged userns restriction
         timeout-minutes: 2
@@ -551,6 +559,21 @@ jobs:
             [ "${value}" = "0" ] || { echo "::error::value is ${value}" >&2; exit 1; }
             echo "apparmor_restrict_unprivileged_userns(after)=${value}" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Install and start auditd (kernel audit measurement)
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          set +e
+          {
+            echo "### auditd install (#2483)"
+            sudo apt-get update -qq > /dev/null 2>&1
+            sudo apt-get install -y -qq --no-install-recommends auditd acl > /dev/null 2>&1
+            echo "- apt-get install auditd acl (exit): $?"
+            sudo systemctl start auditd 2>&1 | head -n3
+            echo "- systemctl is-active auditd: $(systemctl is-active auditd 2>&1 | head -n1)"
+            echo "- auditctl -s: $(sudo auditctl -s 2>&1 | grep -E '^(enabled|failure|backlog_limit|lost) ' | tr '\n' ';')"
+            echo "- audit.log: $(sudo ls -l /var/log/audit/audit.log 2>&1 | awk '{print $1, $3, $4}')"
+          } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Build escape_suite (unprivileged user)
         timeout-minutes: 20
         run: |
@@ -574,16 +597,57 @@ jobs:
           set +e
           sudo -n env FANDHE_CONTAINER_TEST_TIMEOUT_SECS=30 "${ESC_BIN}" --ignored 2>&1 | tee "${RUNNER_TEMP}/esc-root.log"
           echo "exit=${PIPESTATUS[0]}" > "${RUNNER_TEMP}/esc-root.exit"
+      - name: Run escape_suite --ignored with kernel audit (root via sudo)
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set +e
+          sudo -n env FANDHE_CONTAINER_TEST_KERNEL_AUDIT=1 FANDHE_CONTAINER_TEST_TIMEOUT_SECS=30 "${ESC_BIN}" --ignored 2>&1 | tee "${RUNNER_TEMP}/esc-root-kaudit.log"
+          echo "exit=${PIPESTATUS[0]}" > "${RUNNER_TEMP}/esc-root-kaudit.exit"
+      - name: Run escape_suite --ignored with kernel audit (non-root, audit log read via ACL)
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set +e
+          # ジョブ実行ユーザーだけに audit ログの読み取りを付与する（全ユーザーへは許可しない）
+          me="$(id -un)"
+          sudo setfacl -m "u:${me}:x" /var/log/audit
+          sudo setfacl -m "u:${me}:r" /var/log/audit/audit.log
+          echo "setfacl (exit)=$?" | tee -a "$GITHUB_STEP_SUMMARY"
+          FANDHE_CONTAINER_TEST_KERNEL_AUDIT=1 FANDHE_CONTAINER_TEST_TIMEOUT_SECS=30 "${ESC_BIN}" --ignored 2>&1 | tee "${RUNNER_TEMP}/esc-nonroot-kaudit.log"
+          echo "exit=${PIPESTATUS[0]}" > "${RUNNER_TEMP}/esc-nonroot-kaudit.exit"
+      - name: Build landlock_audit_exec (unprivileged user)
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/lae-build.json"
+          cargo test -p fandhe-container-core --test landlock_audit_exec --no-run --message-format=json > "${out}"
+          bins="$(jq -r 'select(.profile.test == true and .target.name == "landlock_audit_exec") | .executable' "${out}" | grep -v '^null$' | sort -u)"
+          [ -n "${bins}" ] && [ "$(printf '%s\n' "${bins}" | wc -l)" = "1" ] || { echo "::error::expected exactly one landlock_audit_exec binary" >&2; exit 1; }
+          echo "LAE_BIN=${bins}" >> "$GITHUB_ENV"
+      - name: Run landlock_audit_exec --ignored (root via sudo)
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          set +e
+          sudo -n env FANDHE_CONTAINER_TEST_TIMEOUT_SECS=30 "${LAE_BIN}" --ignored 2>&1 | tee "${RUNNER_TEMP}/lae-root.log"
+          echo "exit=${PIPESTATUS[0]}" > "${RUNNER_TEMP}/lae-root.exit"
       - name: Summarize escape_suite verdicts
         if: always()
         timeout-minutes: 3
         run: |
           set +e
           {
-            for mode in nonroot root; do
+            for mode in nonroot root nonroot-kaudit root-kaudit; do
               echo "### escape_suite verdicts (${mode}) $(cat "${RUNNER_TEMP}/esc-${mode}.exit" 2>/dev/null || echo exit=missing)"
-              grep -E '^escape_suite: .*(verdict=|harness verified)' "${RUNNER_TEMP}/esc-${mode}.log" 2>/dev/null | cut -c1-300
+              grep -E '^escape_suite: .*(verdict=|harness verified|audit not verified|kernel_audit=)' "${RUNNER_TEMP}/esc-${mode}.log" 2>/dev/null | cut -c1-300
             done
+            echo "### landlock_audit_exec (root) $(cat "${RUNNER_TEMP}/lae-root.exit" 2>/dev/null || echo exit=missing)"
+            grep -E '^landlock_audit_exec:' "${RUNNER_TEMP}/lae-root.log" 2>/dev/null | cut -c1-300
+            echo "### audit.log LANDLOCK_ACCESS (count and redacted head)"
+            sudo grep -c 'type=LANDLOCK_ACCESS' /var/log/audit/audit.log 2>&1
+            sudo grep 'type=LANDLOCK_ACCESS' /var/log/audit/audit.log 2>/dev/null | head -n 3 | sed -E 's/(auid|ses)=[^ ]*/\1=<redacted>/g' | cut -c1-300
           } 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
           grep -qE '^escape_suite:' "${RUNNER_TEMP}/esc-nonroot.log" "${RUNNER_TEMP}/esc-root.log" 2>/dev/null || { echo "::error::no escape_suite output" >&2; exit 1; }
 

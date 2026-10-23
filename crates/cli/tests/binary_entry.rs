@@ -2164,6 +2164,39 @@ fn image_err(code: &str, message: &str) -> String {
     format!("{{\"code\":\"{code}\",\"message\":\"{message}\"}}\n")
 }
 
+/// CLI-1・OCI-7・SEC-1（#2547）: Linux の `image ls` は、`--image-root` が group / other に書き込めれば
+/// PERMISSION_DENIED（終了コード 6・固定文言）、0700 と 0755 は受理する。判定はビットで行うため root で
+/// 走らせても 0757 は拒否される。0755 の受理は祖先（一時ディレクトリ）が 0700 の `TmpDir` 配下であることに依る。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_oci7_image_ls_root_mode_on_linux() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TmpDir::new("ls-mode");
+    let root = tmp.0.join("images");
+    std::fs::create_dir_all(root.join("blobs").join("sha256")).expect("mkdir image root");
+    let ls = |root: &std::path::Path| {
+        run(&["image", "ls", "--image-root", root.to_str().expect("utf8")])
+    };
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o757)).expect("chmod");
+    let out = ls(&root);
+    assert_eq!(out.status.code(), Some(6));
+    assert!(out.stdout.is_empty(), "stdout must be empty");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        image_err("PERMISSION_DENIED", "permission denied")
+    );
+    for mode in [0o700, 0o755] {
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        let out = ls(&root);
+        assert_eq!(out.status.code(), Some(0), "mode {mode:o}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "REPOSITORY\tTAG\tDIGEST\tSIZE\tMISSING\n"
+        );
+        assert!(out.stderr.is_empty(), "stderr must be empty");
+    }
+}
+
 /// CLI-1・OCI-7（#2316）: `image tag` の実入口で、引数不足は INVALID_ARGUMENT（終了コード 2）。
 /// 引数の解析は OS 分岐より先なので 3 OS 共通。stdout は空。
 #[test]

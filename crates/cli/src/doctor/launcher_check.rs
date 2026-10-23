@@ -238,7 +238,7 @@ fn evaluate_elevation(e: Elevation) -> UserScopeReport {
         )),
         Elevation::SetuidRootRestricted => unavailable(
             "setuid_root_restricted",
-            "the privileged launcher is setuid root but also carries file capabilities that do not cover the required set; the file capabilities take precedence and start cannot elevate",
+            "the privileged launcher is setuid root but also carries file capabilities that do not cover the required set or lack CAP_SETUID; the file capabilities take precedence and start cannot elevate",
         ),
         Elevation::Excess => report(diag(
             Notice,

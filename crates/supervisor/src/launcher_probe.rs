@@ -22,6 +22,7 @@
 //! `{permitted, inheritable}`（LE u32）の組が 2 組（v2 は計 20 バイト）、v3 はさらに `rootid`（LE u32。計 24 バイト）。
 
 use crate::privilege::launcher_file_capability_mask;
+use fandhe_container_core::capabilities::Capability;
 
 /// `magic_etc` のリビジョン部のマスク。
 const VFS_CAP_REVISION_MASK: u32 = 0xFF00_0000;
@@ -117,7 +118,8 @@ pub enum XattrRead {
 pub enum ElevationAssessment {
     /// setuid root（xattr 非対応環境の代替方式。`PrivilegeMethod::SetuidRoot`）。
     SetuidRoot,
-    /// setuid root だが、併存する file capability が期待集合を満たさない（不足・effective 無し・名前空間付き・壊れ）。
+    /// setuid root だが、併存する file capability が期待集合を満たさない（不足・effective 無し・名前空間付き・壊れ）、
+    /// または UID 縮退に必要な CAP_SETUID を含まない（期待集合ちょうどを含む）。
     ///
     /// file capability が在ると setuid root の全権付与は効かず取得 capability がファイル側の集合に制限される
     /// （capabilities(7)）。このとき `privilege::plan_reduction` が UID 縮退条件で `start` を拒否するため、昇格できない。
@@ -151,13 +153,29 @@ pub fn assess_elevation(owner_uid: u32, mode: u32, xattr: &XattrRead) -> Elevati
             XattrRead::NoData | XattrRead::Unsupported => ElevationAssessment::SetuidRoot,
             XattrRead::Error => ElevationAssessment::Inconclusive,
             _ => match assess_file_caps(xattr) {
+                // 期待集合には CAP_SETUID が無い（UID 縮退は setuid root の全権に依る）ため、file capability が併存すると
+                // permitted に CAP_SETUID を含む場合（超過）に限り UID 縮退できる。ちょうど期待集合では不足になる。
                 ElevationAssessment::FileCapabilitiesOk
-                | ElevationAssessment::FileCapabilitiesExcess => ElevationAssessment::SetuidRoot,
+                | ElevationAssessment::FileCapabilitiesExcess
+                    if has_setuid_permitted(xattr) =>
+                {
+                    ElevationAssessment::SetuidRoot
+                }
                 _ => ElevationAssessment::SetuidRootRestrictedByFileCaps,
             },
         };
     }
     assess_file_caps(xattr)
+}
+
+/// 併存する file capability の permitted に CAP_SETUID が含まれるか（復号できなければ false）。
+fn has_setuid_permitted(xattr: &XattrRead) -> bool {
+    match xattr {
+        XattrRead::Present(b) => decode_vfs_cap(b)
+            .map(|c| c.permitted & (1u64 << u32::from(Capability::Setuid.index())) != 0)
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// file capability だけの判定（setuid root の分岐を含まない）。
@@ -352,8 +370,14 @@ mod tests {
             assess_elevation(0, 0o104_755, &XattrRead::TooLarge),
             A::SetuidRootRestrictedByFileCaps
         );
+        // 期待集合ちょうどの file capability は CAP_SETUID を含まず UID 縮退できない（codex / Bugbot 指摘）。
         assert_eq!(
             assess_elevation(0, 0o104_755, &present(v2(1, MASK, 0))),
+            A::SetuidRootRestrictedByFileCaps
+        );
+        // CAP_SETUID（bit 7）を足した超過集合なら成立する。
+        assert_eq!(
+            assess_elevation(0, 0o104_755, &present(v2(1, MASK | (1 << 7), 0))),
             A::SetuidRoot
         );
         assert_eq!(

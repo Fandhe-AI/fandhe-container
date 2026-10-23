@@ -2393,15 +2393,40 @@ fn doctor_reports_id_mapping_diagnostics_through_the_real_entry() {
         ),
         (
             "warning",
+            "SUBID_OWNER_UNDETERMINED",
+            "passwd",
+            "owner_undetermined",
+        ),
+        (
+            "warning",
+            "SUBID_NAME_SERVICE_UNSUPPORTED",
+            "nsswitch",
+            "subid_name_service",
+        ),
+        ("warning", "NSSWITCH_UNUSABLE", "nsswitch", "unusable"),
+        (
+            "warning",
             "ID_MAP_HELPER_NOT_FOUND",
             "id_map_helpers",
-            "not_found",
+            "newuidmap_not_found",
+        ),
+        (
+            "warning",
+            "ID_MAP_HELPER_NOT_FOUND",
+            "id_map_helpers",
+            "newgidmap_not_found",
         ),
         (
             "warning",
             "ID_MAP_HELPER_UNTRUSTED",
             "id_map_helpers",
-            "untrusted",
+            "newuidmap_untrusted",
+        ),
+        (
+            "warning",
+            "ID_MAP_HELPER_UNTRUSTED",
+            "id_map_helpers",
+            "newgidmap_untrusted",
         ),
     ];
     let out = run(&["doctor"]);

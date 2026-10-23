@@ -16,10 +16,22 @@
 //!   `UnixStream` 対の読み取り側を読み取りタイムアウトつきで読む（読み取り用スレッドも `unsafe` も使わない。
 //!   `start_entry` の手順 8 より前に常駐スレッドを作らない制約）。出力は 4 KiB まで。全体期限は読み取りのたびに
 //!   確認し、少量ずつ出力され続けても超えて待たない。子は専用プロセスグループで起動し、期限切れ・出力超過時は
-//!   グループごと kill して孫まで後始末する（`sys::kill_process_group`）。
+//!   グループごと kill して孫まで後始末する（`sys::kill_process_group`）。グループ kill は**未回収の子**
+//!   （ゾンビは pid / pgid を保持する）にだけ送る。`try_wait` は標準出力の EOF を得てから呼び、回収済みの子の
+//!   pgid へは送らない（空になったグループの pgid が別プロセスへ再利用される窓をなくす。#2545・REPAIR-5）。
+//! - 呼び出し元が root（real / effective / saved / fs uid のどれかが 0）のときは `getent` を起動しない
+//!   （実 uid / 実効 uid が 0 の exec は ambient を消してもファイルの capability が全ビットとみなされる。
+//!   passwd に行があれば成功する。`RefusedAsRoot`。uid を落として引く方式は #2241 で rootful が承認された
+//!   ときに再検討する。#2545・SEC-5）。
+//! - argv[0] は選んだ候補のパスにする（実体は `canonicalize` 後のパスで exec する）。busybox 等の multi-call
+//!   バイナリがアプレットを argv[0] の basename で解決するため（#2545）。
+//! - `/etc/nsswitch.conf` の `subid:` が `files` 以外（libsubid・sssd・FreeIPA 等）の構成は、ファイルを読む方式では
+//!   範囲を得られないため `SubidSourceProbe::NameService` として検出し、`id_model` が起動を拒否する（#2545）。
 //! - 終了コード 2（キー無し）は、`/etc/nsswitch.conf` の passwd 系が `files` 等のローカル源だけのときに限り
 //!   「名前なし」とする。LDAP・sssd 等の遠隔源があるときは NSS の障害と区別できないため `Err`（起動拒否）。
 //! - 参照の失敗・不正な出力・期限切れは `Err`（fail-closed）。名前の有無を判定できないまま 1 対 1 写像へ落とさない。
+//!   信頼できる `getent` が無い（`LookupUnavailable`）ときは、名前の行が自分のものか判定できないため、
+//!   subuid / subgid に名前の行がある構成を `id_model` が拒否する（数値 uid の行だけなら従来どおり。#2545）。
 //!
 //! エラー文言は固定の英語で、ユーザー名・パス・errno・出力内容を含めない。
 
@@ -52,6 +64,76 @@ pub fn owner_name_from_getent(stdout: &[u8], uid: u32) -> Result<String, TraitEr
         .ok_or_else(bad)
 }
 
+/// 所有者名の解決の失敗の種別（`doctor` が文字列比較なしで `start` と同じ分類をするための型。#2545）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OwnerLookupFailure {
+    /// `/etc/passwd` が読めない・壊れている・上限超過。
+    PasswdUnusable,
+    /// `getent` の起動・実行・終了コードの失敗。
+    LookupFailed,
+    /// 期限切れ（または回収できなかった）。
+    LookupTimedOut,
+    /// 終了コード 2 だが遠隔源があり「名前なし」と断定できない。
+    AbsenceUnconfirmed,
+    /// 出力が不正（欄不足・uid 不一致・上限超過等）。
+    UnusableEntry,
+    /// 呼び出し元が root のため NSS を引かなかった。
+    RefusedAsRoot,
+}
+
+/// [`OwnerLookupFailure`] と、従来どおりの固定文言・コードの組。`TraitError` へ変換できる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerLookupError {
+    kind: OwnerLookupFailure,
+    message: &'static str,
+    code: fandhe_container_core::traits::ErrorCode,
+}
+
+impl OwnerLookupError {
+    #[cfg(any(target_os = "linux", test))]
+    fn new(
+        kind: OwnerLookupFailure,
+        code: fandhe_container_core::traits::ErrorCode,
+        message: &'static str,
+    ) -> Self {
+        Self {
+            kind,
+            message,
+            code,
+        }
+    }
+
+    /// 失敗の種別。
+    #[must_use]
+    pub fn kind(&self) -> OwnerLookupFailure {
+        self.kind
+    }
+
+    /// 固定の英語文言。
+    #[must_use]
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+}
+
+impl From<OwnerLookupError> for fandhe_container_core::traits::TraitError {
+    fn from(e: OwnerLookupError) -> Self {
+        fandhe_container_core::traits::TraitError::new(e.code, e.message)
+    }
+}
+
+/// `/etc/nsswitch.conf` の `subid:` の判定（範囲を NSS から配る構成の検出。#2545・CORE-6）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubidSourceProbe {
+    /// `subid:` が無い・`files` だけ（`/etc/subuid`・`/etc/subgid` を読む既存の方式で足りる）。
+    Files,
+    /// `files` 以外の源がある（libsubid・sssd・FreeIPA 等。ファイルを読む方式では範囲を得られない）。
+    NameService,
+    /// 読めない・上限超過・書式不正・値が空（判定できないため拒否する）。
+    Unusable,
+}
+
 /// 名前の出所。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerNameSource {
@@ -78,7 +160,10 @@ pub enum OwnerNameResolution {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{DEFAULT_GETENT_TIMEOUT, GETENT_CANDIDATES, UserDbLookup, resolve_owner_name};
+pub use linux::{
+    CallerUids, DEFAULT_GETENT_TIMEOUT, GETENT_CANDIDATES, GetentInvocation, UserDbLookup,
+    getent_invocation, resolve_owner_name, resolve_owner_name_typed, subid_sources_from_text,
+};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -93,8 +178,8 @@ mod linux {
     use fandhe_container_core::traits::{ErrorCode, TraitError};
 
     use super::{
-        MAX_GETENT_OUTPUT_BYTES, OwnerNameResolution, OwnerNameSource, owner_name_from_getent,
-        precondition,
+        MAX_GETENT_OUTPUT_BYTES, OwnerLookupError, OwnerLookupFailure, OwnerNameResolution,
+        OwnerNameSource, SubidSourceProbe, owner_name_from_getent,
     };
     use crate::id_model::read_owner_name;
 
@@ -122,6 +207,43 @@ mod linux {
         ancestor_floor: PathBuf,
         /// passwd 系の NSS 源を調べる `nsswitch.conf`。`None` は「ローカル源のみ」とみなす（試験用）。
         nsswitch_conf: Option<PathBuf>,
+        /// 呼び出し元の uid の取得元（root からは `getent` を起動しない。#2545）。
+        caller_uids: CallerUids,
+    }
+
+    /// 呼び出し元の uid（real / effective / saved / fs）の取得元。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CallerUids {
+        /// `/proc/self/status`（本番）。読めない・解析できなければ root とみなす（fail-closed）。
+        FromProc,
+        /// 固定値（試験用。`[real, effective, saved, fs]`）。
+        Fixed([u32; 4]),
+    }
+
+    impl CallerUids {
+        fn is_root(self) -> bool {
+            match self {
+                Self::Fixed(u) => u.contains(&0),
+                Self::FromProc => {
+                    use std::io::Read as _;
+                    let mut buf = Vec::new();
+                    let read = std::fs::File::open("/proc/self/status").and_then(|f| {
+                        f.take(crate::privilege::MAX_STATUS_BYTES as u64 + 1)
+                            .read_to_end(&mut buf)
+                    });
+                    let parsed = read
+                        .ok()
+                        .and_then(|_| String::from_utf8(buf).ok())
+                        .and_then(|t| crate::privilege::parse_proc_status(&t).ok());
+                    match parsed {
+                        Some(s) => {
+                            [s.uid.real, s.uid.effective, s.uid.saved, s.uid.fs].contains(&0)
+                        }
+                        None => true,
+                    }
+                }
+            }
+        }
     }
 
     /// 終了コード 2 を「名前なし」と断定してよい（NSS の障害と取り違えない）ローカル源。
@@ -187,6 +309,43 @@ mod linux {
         }
     }
 
+    /// `nsswitch.conf` の読み取り結果。
+    enum NsswitchRead {
+        Skipped,
+        Missing,
+        Unusable,
+        Text(String),
+    }
+
+    /// `nsswitch.conf` の本文から `subid:` の判定をする（純関数）。
+    ///
+    /// 行が無い・値が `files` だけなら `Files`。角括弧の動作指定は読み飛ばす。値が空・閉じていない角括弧は
+    /// `Unusable`（判定できないため拒否）。`files` 以外の源が 1 つでもあれば `NameService`。
+    /// shadow の `lib/nss.c` の原文での値の解釈の確認は未実施のため、`files` 以外はすべて拒否の安全側に倒している。
+    #[must_use]
+    pub fn subid_sources_from_text(text: &str) -> SubidSourceProbe {
+        let mut found: Option<Vec<String>> = None;
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("");
+            let Some((key, rest)) = line.split_once(':') else {
+                continue;
+            };
+            if key.trim() != "subid" {
+                continue;
+            }
+            let Some(srcs) = plain_sources(rest) else {
+                return SubidSourceProbe::Unusable;
+            };
+            found.get_or_insert_with(Vec::new).extend(srcs);
+        }
+        match found {
+            None => SubidSourceProbe::Files,
+            Some(v) if v.is_empty() => SubidSourceProbe::Unusable,
+            Some(v) if v.iter().all(|t| t == "files") => SubidSourceProbe::Files,
+            Some(_) => SubidSourceProbe::NameService,
+        }
+    }
+
     /// 期限後の子の回収の猶予。
     const REAP_GRACE: Duration = Duration::from_secs(2);
 
@@ -194,8 +353,14 @@ mod linux {
     /// 返す（無期限の `wait` はしない。割り込み不能な I/O 待ちの子が SIGKILL 後も残り得るため。REPAIR-5）。
     /// 孫が標準出力を持ったまま親が先に終了・回収済みでも、グループに孫が残る間は pgid は再利用されないため
     /// グループ宛ての kill は安全に届く。グループ kill の失敗（既に空）は無視し、回収の可否で判定する。
-    fn kill_and_reap(child: &mut std::process::Child) -> Result<(), TraitError> {
-        let _ = crate::sys::kill_process_group(child.id());
+    ///
+    /// **未回収の子にだけ呼ぶ**（`try_wait` が `Some` を返した後は呼ばない。回収済みの pid / pgid へ送ると、
+    /// 空になったグループの番号が別プロセスへ再利用されていた場合に誤送信する。#2545）。
+    fn kill_and_reap(
+        child: &mut std::process::Child,
+        kill_group: &dyn Fn(u32),
+    ) -> Result<(), OwnerLookupError> {
+        kill_group(child.id());
         let _ = child.kill();
         let until = Instant::now() + REAP_GRACE;
         loop {
@@ -209,10 +374,37 @@ mod linux {
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        Err(TraitError::new(
+        Err(OwnerLookupError::new(
+            OwnerLookupFailure::LookupTimedOut,
             ErrorCode::Timeout,
             "the user database helper could not be reaped",
         ))
+    }
+
+    /// 本番のグループ kill（失敗は無視。既に空のグループは回収の可否で判定する）。
+    fn real_kill_group(pid: u32) {
+        let _ = crate::sys::kill_process_group(pid);
+    }
+
+    /// `getent` の起動内容（試験で argv[0] を観測するため `Command` から切り出す。#2545）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct GetentInvocation {
+        /// exec する実体（`canonicalize` 後・信頼検査済み）。
+        pub program: PathBuf,
+        /// argv[0]（選んだ候補のパス。multi-call バイナリのアプレット解決のため）。
+        pub arg0: PathBuf,
+        /// 引数（`passwd` と 10 進の uid）。
+        pub args: Vec<String>,
+    }
+
+    /// 候補と実体から起動内容を作る。
+    #[must_use]
+    pub fn getent_invocation(candidate: &Path, real: &Path, uid: u32) -> GetentInvocation {
+        GetentInvocation {
+            program: real.to_path_buf(),
+            arg0: candidate.to_path_buf(),
+            args: vec!["passwd".to_owned(), uid.to_string()],
+        }
     }
 
     impl UserDbLookup {
@@ -225,6 +417,7 @@ mod linux {
                 extra_trusted_uid: None,
                 ancestor_floor: PathBuf::from("/"),
                 nsswitch_conf: Some(PathBuf::from("/etc/nsswitch.conf")),
+                caller_uids: CallerUids::FromProc,
             }
         }
 
@@ -243,7 +436,16 @@ mod linux {
                 extra_trusted_uid,
                 ancestor_floor,
                 nsswitch_conf: None,
+                // 試験・別配置向けは非 root 固定（root で試験を走らせても決定的にする）。
+                caller_uids: CallerUids::Fixed([1000; 4]),
             }
+        }
+
+        /// 試験向け。呼び出し元の uid を固定する。
+        #[must_use]
+        pub fn with_caller_uids(mut self, uids: CallerUids) -> Self {
+            self.caller_uids = uids;
+            self
         }
 
         /// 試験向け。終了コード 2 の判定に使う `nsswitch.conf` を指定する。
@@ -256,12 +458,23 @@ mod linux {
         /// 終了コード 2 が「名前なし」だと確定できるか。遠隔源があるか読めないときは確定できない（`false`）。
         /// ファイルが存在しないときは glibc の既定（`files`）とみなす。
         fn exit2_means_absent(&self) -> bool {
+            match self.read_nsswitch() {
+                NsswitchRead::Skipped | NsswitchRead::Missing => true,
+                NsswitchRead::Unusable => false,
+                NsswitchRead::Text(t) => passwd_sources_all_local(&t),
+            }
+        }
+
+        /// `nsswitch.conf` を上限つきで読む。`None` の設定は `Skipped`、存在しなければ `Missing`
+        /// （glibc の既定は `files`）、読めない・上限超過・UTF-8 不正は `Unusable`。
+        fn read_nsswitch(&self) -> NsswitchRead {
             let Some(path) = &self.nsswitch_conf else {
-                return true;
+                return NsswitchRead::Skipped;
             };
             let file = match std::fs::File::open(path) {
                 Ok(f) => f,
-                Err(e) => return e.kind() == std::io::ErrorKind::NotFound,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return NsswitchRead::Missing,
+                Err(_) => return NsswitchRead::Unusable,
             };
             let mut buf = Vec::new();
             if file
@@ -270,18 +483,32 @@ mod linux {
                 .is_err()
                 || u64::try_from(buf.len()).map_or(true, |n| n > MAX_NSSWITCH_BYTES)
             {
-                return false;
+                return NsswitchRead::Unusable;
             }
-            std::str::from_utf8(&buf).is_ok_and(passwd_sources_all_local)
+            match String::from_utf8(buf) {
+                Ok(t) => NsswitchRead::Text(t),
+                Err(_) => NsswitchRead::Unusable,
+            }
         }
 
-        /// 最初に実体を解決できた候補が信頼できれば、その実体のパスを返す。
-        fn trusted_executable(&self) -> Option<PathBuf> {
+        /// `subid:` の源が `files` だけか（範囲を NSS から配る構成の検出。#2545・CORE-6）。
+        /// 設定が無い（`custom()`）・ファイルが無いときは `Files`。
+        #[must_use]
+        pub fn subid_source(&self) -> SubidSourceProbe {
+            match self.read_nsswitch() {
+                NsswitchRead::Skipped | NsswitchRead::Missing => SubidSourceProbe::Files,
+                NsswitchRead::Unusable => SubidSourceProbe::Unusable,
+                NsswitchRead::Text(t) => subid_sources_from_text(&t),
+            }
+        }
+
+        /// 最初に実体を解決できた候補が信頼できれば、(候補, 実体) のパスを返す。
+        fn trusted_executable(&self) -> Option<(PathBuf, PathBuf)> {
             let runner = self.extra_trusted_uid.unwrap_or(0);
-            let real = self
+            let (candidate, real) = self
                 .candidates
                 .iter()
-                .find_map(|c| std::fs::canonicalize(c).ok())?;
+                .find_map(|c| std::fs::canonicalize(c).ok().map(|r| (c.clone(), r)))?;
             let meta = std::fs::metadata(&real).ok()?;
             if !meta.is_file() || meta.mode() & 0o111 == 0 {
                 return None;
@@ -297,27 +524,36 @@ mod linux {
                 }
                 check_owner_and_mode(m.uid(), m.mode(), runner).ok()?;
             }
-            Some(real)
+            Some((candidate, real))
         }
     }
 
-    /// `exe passwd <uid>` を期限つきで実行し、(終了コード, 標準出力) を返す。
+    /// `getent passwd <uid>` を期限つきで実行し、(終了コード, 標準出力) を返す。
     ///
     /// 期限は終了待ちと出力の読み取りの両方に掛かる。標準出力は `UnixStream` 対の片側を子へ渡し、親側を
     /// 短い読み取りタイムアウトで読む。孫が標準出力を持ち続けて EOF が来ない場合も期限で `Timeout` にする。
+    ///
+    /// 回収（`try_wait`）は EOF を得てからにする。EOF 前に回収すると、期限切れで送るグループ kill が回収済みの
+    /// pgid 宛てになるため（ゾンビは pid / pgid を保持するので、未回収の間は誤送信が起きない。#2545・REPAIR-5）。
     fn run_getent(
-        exe: &Path,
-        uid: u32,
+        invocation: &GetentInvocation,
         timeout: Duration,
-    ) -> Result<(Option<i32>, Vec<u8>), TraitError> {
-        let failed = || precondition("the user database lookup failed");
+        kill_group: &dyn Fn(u32),
+    ) -> Result<(Option<i32>, Vec<u8>), OwnerLookupError> {
+        let failed = || {
+            OwnerLookupError::new(
+                OwnerLookupFailure::LookupFailed,
+                ErrorCode::FailedPrecondition,
+                "the user database lookup failed",
+            )
+        };
         let (mut reader, writer) = UnixStream::pair().map_err(|_| failed())?;
         reader
             .set_read_timeout(Some(POLL_INTERVAL))
             .map_err(|_| failed())?;
-        let mut cmd = Command::new(exe);
-        cmd.arg("passwd")
-            .arg(uid.to_string())
+        let mut cmd = Command::new(&invocation.program);
+        std::os::unix::process::CommandExt::arg0(&mut cmd, &invocation.arg0);
+        cmd.args(&invocation.args)
             .env_clear()
             .stdin(Stdio::null())
             .stderr(Stdio::null())
@@ -328,108 +564,173 @@ mod linux {
         let spawned = cmd.spawn();
         // Command が持つ親側の書き込み端を閉じる。残ると子の終了後も EOF が来ない。
         drop(cmd);
-        let mut child =
-            spawned.map_err(|_| precondition("the user database lookup could not start"))?;
+        let mut child = spawned.map_err(|_| {
+            OwnerLookupError::new(
+                OwnerLookupFailure::LookupFailed,
+                ErrorCode::FailedPrecondition,
+                "the user database lookup could not start",
+            )
+        })?;
         let deadline = Instant::now() + timeout;
+        let timed_out = || {
+            OwnerLookupError::new(
+                OwnerLookupFailure::LookupTimedOut,
+                ErrorCode::Timeout,
+                "the user database lookup timed out",
+            )
+        };
         let mut out: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 1024];
-        let mut eof = false;
-        let mut status = None;
-        let timed_out = |child: &mut std::process::Child| -> TraitError {
-            match kill_and_reap(child) {
-                Err(e) => e,
-                Ok(()) => TraitError::new(ErrorCode::Timeout, "the user database lookup timed out"),
-            }
-        };
+        // 1) EOF まで読む。この間 `try_wait` は呼ばない（子は未回収のまま）。
         loop {
             // 出力が少量ずつ届き続けても全体期限を超えて待たない（ループ先頭で毎回確認する）。
             let now = Instant::now();
             if now >= deadline {
-                return Err(timed_out(&mut child));
+                return Err(kill_and_reap(&mut child, kill_group)
+                    .err()
+                    .unwrap_or_else(timed_out));
             }
-            if !eof {
-                let slice = POLL_INTERVAL
-                    .min(deadline - now)
-                    .max(Duration::from_millis(1));
-                reader.set_read_timeout(Some(slice)).map_err(|_| failed())?;
-                match reader.read(&mut chunk) {
-                    Ok(0) => eof = true,
-                    Ok(n) => {
-                        out.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
-                        if out.len() > MAX_GETENT_OUTPUT_BYTES {
-                            kill_and_reap(&mut child)?;
-                            return Err(precondition(
-                                "the user database returned an unusable entry",
-                            ));
-                        }
-                        continue;
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock
-                                | std::io::ErrorKind::TimedOut
-                                | std::io::ErrorKind::Interrupted
-                        ) => {}
-                    Err(_) => {
-                        kill_and_reap(&mut child)?;
-                        return Err(failed());
+            let slice = POLL_INTERVAL
+                .min(deadline - now)
+                .max(Duration::from_millis(1));
+            reader.set_read_timeout(Some(slice)).map_err(|_| {
+                let _ = kill_and_reap(&mut child, kill_group);
+                failed()
+            })?;
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    out.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
+                    if out.len() > MAX_GETENT_OUTPUT_BYTES {
+                        kill_and_reap(&mut child, kill_group)?;
+                        return Err(OwnerLookupError::new(
+                            OwnerLookupFailure::UnusableEntry,
+                            ErrorCode::FailedPrecondition,
+                            "the user database returned an unusable entry",
+                        ));
                     }
                 }
-            }
-            if status.is_none() {
-                match child.try_wait() {
-                    Ok(s) => status = s,
-                    Err(_) => {
-                        kill_and_reap(&mut child)?;
-                        return Err(failed());
-                    }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => {
+                    kill_and_reap(&mut child, kill_group)?;
+                    return Err(failed());
                 }
-            }
-            if let (Some(s), true) = (status, eof) {
-                // 成功を返す直前にも期限を確認する（期限後に揃った結果は採らない）。
-                if Instant::now() >= deadline {
-                    return Err(timed_out(&mut child));
-                }
-                return Ok((s.code(), out));
-            }
-            if eof {
-                // EOF 後は読み取りが即座に返るため、子の終了待ちの空回りを避ける。
-                std::thread::sleep(POLL_INTERVAL);
             }
         }
+        // 2) EOF の後に回収する。回収できた時点で子は回収済みのため、以後はグループ kill を送らない。
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    // 成功を返す直前にも期限を確認する（期限後に揃った結果は採らない。回収済みなので kill はしない）。
+                    if Instant::now() >= deadline {
+                        return Err(timed_out());
+                    }
+                    return Ok((status.code(), out));
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    kill_and_reap(&mut child, kill_group)?;
+                    return Err(failed());
+                }
+            }
+            if Instant::now() >= deadline {
+                // 未回収のまま期限切れ（EOF 後も子が生きている）。
+                return Err(kill_and_reap(&mut child, kill_group)
+                    .err()
+                    .unwrap_or_else(timed_out));
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
     }
+
     /// 実効 uid の所有者名を解決する（単一の入口。`start`・pull の展開・`doctor` が共用）。
     ///
-    /// `passwd` に行があればそれを返し、`getent` は起動しない。行が無いときだけ NSS を引く。passwd が壊れている・
-    /// 上限超過は `FailedPrecondition`。NSS の参照失敗・不正な出力は `FailedPrecondition`、期限切れは `Timeout`。
+    /// [`resolve_owner_name_typed`] の `TraitError` 版（呼び出し元・固定文言は従来どおり）。
     pub fn resolve_owner_name(
         passwd: &Path,
         uid: u32,
         lookup: &UserDbLookup,
     ) -> Result<OwnerNameResolution, TraitError> {
-        if let Some(name) = read_owner_name(passwd, uid)? {
+        resolve_owner_name_typed(passwd, uid, lookup).map_err(Into::into)
+    }
+
+    /// 型つきの失敗を返す版（`id_model::diagnose_rootless_id_source_with` と `doctor` が種別で分岐する。#2545）。
+    ///
+    /// `passwd` に行があればそれを返し、`getent` は起動しない。行が無いときだけ NSS を引く。passwd が壊れている・
+    /// 上限超過は `PasswdUnusable`。NSS の参照失敗は `LookupFailed`・不正な出力は `UnusableEntry`、期限切れは
+    /// `LookupTimedOut`。呼び出し元が root のときは `getent` を起動せず `RefusedAsRoot`。
+    pub fn resolve_owner_name_typed(
+        passwd: &Path,
+        uid: u32,
+        lookup: &UserDbLookup,
+    ) -> Result<OwnerNameResolution, OwnerLookupError> {
+        resolve_owner_name_with_kill(passwd, uid, lookup, &real_kill_group)
+    }
+
+    fn resolve_owner_name_with_kill(
+        passwd: &Path,
+        uid: u32,
+        lookup: &UserDbLookup,
+        kill_group: &dyn Fn(u32),
+    ) -> Result<OwnerNameResolution, OwnerLookupError> {
+        let name = read_owner_name(passwd, uid).map_err(|e| {
+            OwnerLookupError::new(
+                OwnerLookupFailure::PasswdUnusable,
+                e.code(),
+                "the passwd database is unusable",
+            )
+        })?;
+        if let Some(name) = name {
             return Ok(OwnerNameResolution::Resolved {
                 name,
                 source: OwnerNameSource::Passwd,
             });
         }
-        let Some(exe) = lookup.trusted_executable() else {
+        let Some((candidate, real)) = lookup.trusted_executable() else {
             return Ok(OwnerNameResolution::LookupUnavailable);
         };
-        let (code, out) = run_getent(&exe, uid, lookup.timeout)?;
+        if lookup.caller_uids.is_root() {
+            return Err(OwnerLookupError::new(
+                OwnerLookupFailure::RefusedAsRoot,
+                ErrorCode::FailedPrecondition,
+                "the user database lookup is refused for a root caller",
+            ));
+        }
+        let invocation = getent_invocation(&candidate, &real, uid);
+        let (code, out) = run_getent(&invocation, lookup.timeout, kill_group)?;
         match code {
-            Some(0) => Ok(OwnerNameResolution::Resolved {
-                name: owner_name_from_getent(&out, uid)?,
-                source: OwnerNameSource::Nss,
-            }),
+            Some(0) => {
+                let name = owner_name_from_getent(&out, uid).map_err(|e| {
+                    OwnerLookupError::new(
+                        OwnerLookupFailure::UnusableEntry,
+                        e.code(),
+                        "the user database returned an unusable entry",
+                    )
+                })?;
+                Ok(OwnerNameResolution::Resolved {
+                    name,
+                    source: OwnerNameSource::Nss,
+                })
+            }
             // getent(1): 2 はキーが見つからない。ただし NSS の障害でも 2 が返り得るため、遠隔源がある
             // （または nsswitch.conf を読めない）ときは「名前なし」と断定せず起動拒否にする。
             Some(2) if lookup.exit2_means_absent() => Ok(OwnerNameResolution::NotFound),
-            Some(2) => Err(precondition(
+            Some(2) => Err(OwnerLookupError::new(
+                OwnerLookupFailure::AbsenceUnconfirmed,
+                ErrorCode::FailedPrecondition,
                 "the user database could not confirm that the entry is absent",
             )),
-            _ => Err(precondition("the user database lookup failed")),
+            _ => Err(OwnerLookupError::new(
+                OwnerLookupFailure::LookupFailed,
+                ErrorCode::FailedPrecondition,
+                "the user database lookup failed",
+            )),
         }
     }
 
@@ -684,6 +985,199 @@ mod linux {
                     OwnerNameResolution::LookupUnavailable
                 );
             }
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        fn resolve_typed(
+            d: &Path,
+            lookup: &UserDbLookup,
+        ) -> Result<OwnerNameResolution, OwnerLookupError> {
+            resolve_owner_name_typed(&d.join("passwd"), 4242, lookup)
+        }
+
+        /// REPAIR-5・#2545: グループ kill は未回収（ゾンビ）の子にだけ送る。kill が呼ばれた時点の
+        /// `/proc/<pid>/stat` の状態が `Z`（未回収）であること、孫が消えること、`Timeout` であることを照合する。
+        #[test]
+        fn repair5_group_kill_only_before_reap() {
+            let d = tmp("killorder");
+            let pidfile = d.join("gpid");
+            let l = stub(
+                &d,
+                &format!("sleep 30 &\necho $! > {}\nexit 2", pidfile.display()),
+            );
+            let l = UserDbLookup {
+                timeout: Duration::from_secs(1),
+                ..l
+            };
+            let states = std::cell::RefCell::new(Vec::new());
+            let kill = |pid: u32| {
+                let st = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                // `pid (comm) S ...` の comm の後ろの状態文字。
+                let state = st.rsplit_once(") ").and_then(|(_, r)| r.chars().next());
+                states.borrow_mut().push(state);
+                real_kill_group(pid);
+            };
+            let e = resolve_owner_name_with_kill(&d.join("passwd"), 4242, &l, &kill).unwrap_err();
+            assert_eq!(e.kind(), OwnerLookupFailure::LookupTimedOut);
+            assert_eq!(e.message(), "the user database lookup timed out");
+            assert_eq!(*states.borrow(), vec![Some('Z')]);
+            let pid = std::fs::read_to_string(&pidfile).unwrap();
+            let proc = format!("/proc/{}", pid.trim());
+            let mut gone = false;
+            for _ in 0..100 {
+                let st = std::fs::read_to_string(format!("{proc}/stat")).unwrap_or_default();
+                if st.is_empty() || st.contains(") Z ") {
+                    gone = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert!(gone);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        /// REPAIR-5・#2545: 正常終了（回収済み）の経路ではグループ kill を 1 回も送らない。
+        #[test]
+        fn repair5_reaped_child_is_never_group_killed() {
+            let d = tmp("noreapkill");
+            let l = stub(&d, "echo 'ldapuser:*:4242:4242::/h:/bin/sh'");
+            let calls = std::cell::Cell::new(0u32);
+            let kill = |_pid: u32| calls.set(calls.get() + 1);
+            let r = resolve_owner_name_with_kill(&d.join("passwd"), 4242, &l, &kill).unwrap();
+            assert!(matches!(r, OwnerNameResolution::Resolved { .. }));
+            assert_eq!(calls.get(), 0);
+            let l = stub(&d, "exit 2");
+            let r = resolve_owner_name_with_kill(&d.join("passwd"), 4242, &l, &kill).unwrap();
+            assert_eq!(r, OwnerNameResolution::NotFound);
+            assert_eq!(calls.get(), 0);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        /// SEC-5・#2545: root の呼び出し元では getent を起動しない。passwd に行があれば成功する。
+        #[test]
+        fn sec5_root_caller_does_not_spawn_getent() {
+            let d = tmp("rootcaller");
+            let mark = d.join("called");
+            let l = stub(&d, &format!("touch {}; exit 2", mark.display()));
+            for uids in [
+                [0, 1000, 1000, 1000],
+                [1000, 0, 1000, 1000],
+                [1000, 1000, 1000, 0],
+            ] {
+                let l = l.clone().with_caller_uids(CallerUids::Fixed(uids));
+                let e = resolve_typed(&d, &l).unwrap_err();
+                assert_eq!(e.kind(), OwnerLookupFailure::RefusedAsRoot);
+                assert_eq!(TraitError::from(e).code(), ErrorCode::FailedPrecondition);
+            }
+            assert!(!mark.exists());
+            std::fs::write(d.join("passwd"), "alice:x:4242:4242::/h:/bin/sh\n").unwrap();
+            let l = l.with_caller_uids(CallerUids::Fixed([0; 4]));
+            assert_eq!(
+                resolve_typed(&d, &l).unwrap(),
+                OwnerNameResolution::Resolved {
+                    name: "alice".into(),
+                    source: OwnerNameSource::Passwd
+                }
+            );
+            assert!(!mark.exists());
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        /// #2545: argv[0] は選んだ候補、exec する実体は canonicalize 後。シェバンの stub では元の argv[0] を
+        /// 観測できないため、起動内容の組み立て関数で照合する（候補が symlink で実体と名前が違う場合を含む）。
+        #[test]
+        fn sec5_getent_argv0_is_candidate() {
+            let d = tmp("arg0");
+            let real = d.join("busybox");
+            std::fs::write(&real, "#!/bin/sh\nexit 2\n").unwrap();
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cand = d.join("getent");
+            std::os::unix::fs::symlink(&real, &cand).unwrap();
+            let l = UserDbLookup::custom(
+                vec![cand.clone()],
+                Duration::from_secs(5),
+                Some(euid()),
+                d.clone(),
+            );
+            let (c, r) = l.trusted_executable().unwrap();
+            assert_eq!(c, cand);
+            assert_eq!(r, std::fs::canonicalize(&real).unwrap());
+            let inv = getent_invocation(&c, &r, 4242);
+            assert_eq!(inv.program, std::fs::canonicalize(&real).unwrap());
+            assert_eq!(inv.arg0, cand);
+            assert_eq!(inv.args, vec!["passwd".to_owned(), "4242".to_owned()]);
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        /// CORE-6・#2545: `subid:` の判定（純関数）。
+        #[test]
+        fn core6_subid_source_parsing() {
+            for (text, want) in [
+                ("", SubidSourceProbe::Files),
+                ("passwd: files sss\n", SubidSourceProbe::Files),
+                ("subid: files\n", SubidSourceProbe::Files),
+                ("subid: files # c\n", SubidSourceProbe::Files),
+                ("subid: sss\n", SubidSourceProbe::NameService),
+                ("subid: files sss\n", SubidSourceProbe::NameService),
+                (
+                    "subid: files [SUCCESS=return] sss\n",
+                    SubidSourceProbe::NameService,
+                ),
+                ("subid: files [x\n", SubidSourceProbe::Unusable),
+                ("subid:\n", SubidSourceProbe::Unusable),
+            ] {
+                assert_eq!(subid_sources_from_text(text), want, "{text}");
+            }
+            let d = tmp("subidfile");
+            let conf = d.join("nsswitch.conf");
+            let l = stub(&d, "exit 2");
+            assert_eq!(l.subid_source(), SubidSourceProbe::Files);
+            std::fs::write(&conf, "subid: sss\n").unwrap();
+            let l = l.with_nsswitch_conf(conf);
+            assert_eq!(l.subid_source(), SubidSourceProbe::NameService);
+            assert_eq!(
+                l.clone()
+                    .with_nsswitch_conf(d.join("absent"))
+                    .subid_source(),
+                SubidSourceProbe::Files
+            );
+            assert_eq!(
+                l.with_nsswitch_conf(d.clone()).subid_source(),
+                SubidSourceProbe::Unusable
+            );
+            let _ = std::fs::remove_dir_all(&d);
+        }
+
+        /// CORE-6・REPAIR-4・#2545: 失敗の種別が型で分かれ、`TraitError` へ写した文言は従来と同一。
+        #[test]
+        fn core6_typed_errors() {
+            let d = tmp("typed");
+            std::fs::write(d.join("passwd"), ":x:4242:1::/h:/s\n").unwrap();
+            let e = resolve_typed(&d, &stub(&d, "exit 2")).unwrap_err();
+            assert_eq!(e.kind(), OwnerLookupFailure::PasswdUnusable);
+            assert_eq!(e.message(), "the passwd database is unusable");
+            let _ = std::fs::remove_file(d.join("passwd"));
+            for (body, kind, msg) in [
+                (
+                    "exit 1",
+                    OwnerLookupFailure::LookupFailed,
+                    "the user database lookup failed",
+                ),
+                (
+                    "echo 'x:*:1:1::/h:/s'",
+                    OwnerLookupFailure::UnusableEntry,
+                    "the user database returned an unusable entry",
+                ),
+            ] {
+                let e = resolve_typed(&d, &stub(&d, body)).unwrap_err();
+                assert_eq!(e.kind(), kind, "{body}");
+                assert_eq!(TraitError::from(e).message(), msg);
+            }
+            let conf = d.join("nsswitch.conf");
+            std::fs::write(&conf, "passwd: files sss\n").unwrap();
+            let l = stub(&d, "exit 2").with_nsswitch_conf(conf);
+            let e = resolve_typed(&d, &l).unwrap_err();
+            assert_eq!(e.kind(), OwnerLookupFailure::AbsenceUnconfirmed);
             let _ = std::fs::remove_dir_all(&d);
         }
 

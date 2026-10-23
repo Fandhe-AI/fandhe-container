@@ -8,8 +8,10 @@
 //! # `start` との一致
 //! 判定の部品は supervisor の `id_model`（passwd の読み取り・subuid / subgid の分類・モデルの選択）と core の
 //! `rootless`（所有者名の規則・範囲の写像・helper の検証）を `start` と共用し、CLI 側に規則を書き直さない。
-//! 判定の順序も `start`（`resolve_launch_privilege`）に揃える: rootful の除外 → passwd → 所有者名 → subuid / subgid の
-//! 分類 → モデルの選択 → 範囲の検証 → helper の検証。passwd と所有者名が Warning のときは後段を検査しない
+//! 判定の順序も `start`（`resolve_launch_privilege`）に揃える: rootful の除外 → passwd → 所有者名 → `subid:` →
+//! subuid / subgid の分類 → モデルの選択 → 範囲の検証 → helper の検証。所有者名からモデルの選択までは、`start` と
+//! 同じ共有関数 `id_model::diagnose_rootless_id_source_with` が返す型つきの拒否理由（`RefusalReason`）で分岐し、
+//! エラー文言の文字列比較はしない（#2545）。passwd と所有者名が Warning のときは後段を検査しない
 //! （`start` もそこで止まり、後段の結果は意味を持たないため）。
 //!
 //! # 構成と出力
@@ -19,10 +21,17 @@
 //! - 終了ステータス: Warning（`start` が通らない前提の不成立）が 1 件でもあれば 3、そうでなく判定不能なら 4、
 //!   それ以外は 0。1 対 1 写像になる設定（`SUBORDINATE_IDS_NOT_CONFIGURED`）と rootful で省いた通知は 0 に寄与する。
 //!
+//! # helper の個別診断・`subid:`・名前の行（#2545）
+//! - `newuidmap` と `newgidmap` は core の `verify_helper_path`（`HelperPaths::new` と同じ規則）で 1 本ずつ検証し、
+//!   欠けた側ごとに 1 件出す（state は `newuidmap_not_found` 等）。
+//! - `/etc/nsswitch.conf` の `subid:` が `files` 以外（範囲を NSS から配る構成）は `SUBID_NAME_SERVICE_UNSUPPORTED`、
+//!   読めない・書式不正は `NSSWITCH_UNUSABLE`（どちらも Warning。`start` も拒否する）。
+//! - 名前を引けず（`getent` が無い）、subuid / subgid に名前の行しか無い構成は `SUBID_OWNER_UNDETERMINED`（Warning。
+//!   `start` も拒否する）。数値 uid の行だけなら従来どおり `SUBID_OWNER_LOOKUP_UNAVAILABLE`（通知）。
+//!
 //! # 未実装（REPAIR-3）
-//! - `newuidmap` と `newgidmap` のどちらが欠けているかの個別の切り分け（core の `HelperPaths` が組で検証するため）。
-//! - `/etc/nsswitch.conf` の `subid:` で範囲を NSS（libsubid・sssd・FreeIPA）から配る構成の検出（`start` も
-//!   `/etc/subuid`・`/etc/subgid` のファイルだけを読む。#2390 の対象外）。
+//! - 状態ストアの inspect の `idMapping`（`RecordedIdModel`）と、現在のホスト設定で選ばれるモデルの突き合わせ
+//!   （状態ストアを読む設計が要る。追跡予定）。
 //!
 //! # 所有者名の解決（#2390）
 //! 名前は `start` と同じ `user_db::resolve_owner_name` で得る（passwd を先に読み、行が無いときだけ固定パスの
@@ -48,6 +57,21 @@ pub enum OwnerState {
     PasswdUnusable,
     /// 名前が `SubIdOwner` の規則（文字種・長さ）に違反する。
     InvalidName,
+    /// 名前を引けず、subuid / subgid の名前の行が自分のものか判定できない（`start` は拒否する。#2545）。
+    Undetermined,
+    /// 検査しなかった。
+    NotChecked,
+}
+
+/// `/etc/nsswitch.conf` の `subid:` の状態（#2545）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NsswitchState {
+    /// `subid:` が無い・`files` だけ。
+    Files,
+    /// `files` 以外の源（範囲を NSS から配る構成。`start` は拒否する）。
+    NameService,
+    /// 読めない・書式不正（`start` は拒否する）。
+    Unusable,
     /// 検査しなかった。
     NotChecked,
 }
@@ -121,8 +145,12 @@ pub struct IdMappingFindings {
     pub model: ModelState,
     /// 範囲の検証。
     pub range: RangeState,
-    /// helper の検証。
-    pub helpers: HelperState,
+    /// `nsswitch.conf` の `subid:`。
+    pub subid_source: NsswitchState,
+    /// `newuidmap` の検証。
+    pub newuidmap: HelperState,
+    /// `newgidmap` の検証。
+    pub newgidmap: HelperState,
 }
 
 impl IdMappingFindings {
@@ -135,7 +163,9 @@ impl IdMappingFindings {
             subgid: SubIdState::NotChecked,
             model: ModelState::NotChecked,
             range: RangeState::NotChecked,
-            helpers: HelperState::NotChecked,
+            subid_source: NsswitchState::NotChecked,
+            newuidmap: HelperState::NotChecked,
+            newgidmap: HelperState::NotChecked,
         }
     }
 }
@@ -164,7 +194,7 @@ pub struct IdMappingDiagnostic {
     pub message: &'static str,
     /// 対処の案内。
     pub remediation: Vec<&'static str>,
-    /// どの検査か（`privilege` / `passwd` / `subuid` / `subgid` / `id_model` / `id_map_helpers`）。
+    /// どの検査か（`privilege` / `passwd` / `nsswitch` / `subuid` / `subgid` / `id_model` / `id_map_helpers`）。
     pub check: &'static str,
     /// 状態のトークン。
     pub state: &'static str,
@@ -281,6 +311,16 @@ pub fn evaluate(f: &IdMappingFindings) -> IdMappingReport {
             "passwd",
             "lookup_unavailable",
         )),
+        OwnerState::Undetermined => diagnostics.push(diag(
+            Warning,
+            "SUBID_OWNER_UNDETERMINED",
+            "this uid is not in /etc/passwd, no trusted getent was found, and /etc/subuid or /etc/subgid has lines that use a user name; whether they belong to this account cannot be determined, so starting a container fails closed",
+            vec![
+                "Install getent as a root-owned file that group and other users cannot write, or write the numeric uid in the first field of the lines for this account in /etc/subuid and /etc/subgid",
+            ],
+            "passwd",
+            "owner_undetermined",
+        )),
         OwnerState::LookupFailed => diagnostics.push(diag(
             Warning,
             "SUBID_OWNER_LOOKUP_FAILED",
@@ -292,6 +332,27 @@ pub fn evaluate(f: &IdMappingFindings) -> IdMappingReport {
             "lookup_failed",
         )),
         OwnerState::Resolved | OwnerState::NotChecked => {}
+    }
+    match f.subid_source {
+        NsswitchState::NameService => diagnostics.push(diag(
+            Warning,
+            "SUBID_NAME_SERVICE_UNSUPPORTED",
+            "/etc/nsswitch.conf configures a source other than files for subid; subordinate id ranges are read only from /etc/subuid and /etc/subgid, so starting a container fails closed",
+            vec![
+                "Provide the ranges for this account in /etc/subuid and /etc/subgid, or set subid to files in /etc/nsswitch.conf",
+            ],
+            "nsswitch",
+            "subid_name_service",
+        )),
+        NsswitchState::Unusable => diagnostics.push(diag(
+            Warning,
+            "NSSWITCH_UNUSABLE",
+            "/etc/nsswitch.conf could not be read or its subid entry is malformed, so the source of the subordinate id ranges cannot be determined; starting a container fails closed",
+            vec!["Check that /etc/nsswitch.conf is a readable, well-formed file of reasonable size"],
+            "nsswitch",
+            "unusable",
+        )),
+        NsswitchState::Files | NsswitchState::NotChecked => {}
     }
     for (state, code, check) in [
         (f.subuid, "SUBUID_UNUSABLE", "subuid"),
@@ -360,28 +421,47 @@ pub fn evaluate(f: &IdMappingFindings) -> IdMappingReport {
             "range_invalid",
         ));
     }
-    match f.helpers {
-        HelperState::NotFound => diagnostics.push(diag(
-            Warning,
-            "ID_MAP_HELPER_NOT_FOUND",
-            "newuidmap or newgidmap was not found at /usr/bin; a subordinate id mapping requires both",
-            vec![
-                "Install the uidmap package (shadow-utils on some distributions) so that /usr/bin/newuidmap and /usr/bin/newgidmap exist",
-            ],
-            "id_map_helpers",
-            "not_found",
-        )),
-        HelperState::Untrusted => diagnostics.push(diag(
-            Warning,
-            "ID_MAP_HELPER_UNTRUSTED",
-            "newuidmap or newgidmap failed the trust check (each must be a regular file owned by root and not writable by group or others, with the same condition on every parent directory)",
-            vec![
-                "Reinstall the uidmap package and make sure /usr/bin/newuidmap, /usr/bin/newgidmap and their parent directories are owned by root and not writable by group or others",
-            ],
-            "id_map_helpers",
-            "untrusted",
-        )),
-        HelperState::Trusted | HelperState::NotChecked => {}
+    for (state, name) in [(f.newuidmap, "newuidmap"), (f.newgidmap, "newgidmap")] {
+        let (not_found, untrusted) = if name == "newuidmap" {
+            ("newuidmap_not_found", "newuidmap_untrusted")
+        } else {
+            ("newgidmap_not_found", "newgidmap_untrusted")
+        };
+        match state {
+            HelperState::NotFound => diagnostics.push(diag(
+                Warning,
+                "ID_MAP_HELPER_NOT_FOUND",
+                if name == "newuidmap" {
+                    "newuidmap was not found at /usr/bin; a subordinate id mapping requires it"
+                } else {
+                    "newgidmap was not found at /usr/bin; a subordinate id mapping requires it"
+                },
+                vec![if name == "newuidmap" {
+                    "Install the uidmap package (shadow-utils on some distributions) so that /usr/bin/newuidmap exists"
+                } else {
+                    "Install the uidmap package (shadow-utils on some distributions) so that /usr/bin/newgidmap exists"
+                }],
+                "id_map_helpers",
+                not_found,
+            )),
+            HelperState::Untrusted => diagnostics.push(diag(
+                Warning,
+                "ID_MAP_HELPER_UNTRUSTED",
+                if name == "newuidmap" {
+                    "newuidmap failed the trust check (it must be a regular file owned by root and not writable by group or others, with the same condition on every parent directory)"
+                } else {
+                    "newgidmap failed the trust check (it must be a regular file owned by root and not writable by group or others, with the same condition on every parent directory)"
+                },
+                vec![if name == "newuidmap" {
+                    "Reinstall the uidmap package and make sure /usr/bin/newuidmap and its parent directories are owned by root and not writable by group or others"
+                } else {
+                    "Reinstall the uidmap package and make sure /usr/bin/newgidmap and its parent directories are owned by root and not writable by group or others"
+                }],
+                "id_map_helpers",
+                untrusted,
+            )),
+            HelperState::Trusted | HelperState::NotChecked => {}
+        }
     }
     let outcome = if diagnostics.iter().any(|d| d.severity == Warning) {
         IdMappingOutcome::Warning
@@ -465,17 +545,22 @@ pub fn collect() -> IdMappingFindings {
 }
 
 /// `/proc/self/status` の本文と入力元から事実を集める（`start` の `resolve_launch_privilege` と同じ順序・同じ部品）。
+///
+/// 所有者名からモデルの選択までは `id_model::diagnose_rootless_id_source_with`（`start` と共有）の型つきの結果で
+/// 写す。範囲の検証と helper の検証だけを本関数が行う（`start` では core の launcher が担う段）。
 #[cfg(target_os = "linux")]
 pub fn collect_with(status_text: Option<&str>, sources: &IdMappingSources) -> IdMappingFindings {
     use fandhe_container_core::rootless::{
-        HelperPaths, SubIdOwner, SubordinateRange, load_subordinate_ids, rootless_mapping,
+        SYSTEM_NEWGIDMAP, SYSTEM_NEWUIDMAP, SubIdOwner, SubordinateRange, load_subordinate_ids,
+        rootless_mapping, verify_helper_path,
     };
     use fandhe_container_core::traits::ErrorCode;
     use fandhe_container_supervisor::id_model::{
-        RootlessIdModel, SubIdFileProbe, probe_sub_id_file, select_rootless_id_model,
+        OwnerNameKind, RefusalReason, RootlessIdModel, SubIdFileProbe,
+        diagnose_rootless_id_source_with,
     };
     use fandhe_container_supervisor::privilege::parse_proc_status;
-    use fandhe_container_supervisor::user_db::{OwnerNameResolution, resolve_owner_name};
+    use fandhe_container_supervisor::user_db::OwnerLookupFailure;
 
     let Some(Ok(snapshot)) = status_text.map(parse_proc_status) else {
         return IdMappingFindings::unchecked(PrivilegeState::Unreadable);
@@ -486,54 +571,83 @@ pub fn collect_with(status_text: Option<&str>, sources: &IdMappingSources) -> Id
     }
     let mut f = IdMappingFindings::unchecked(PrivilegeState::Rootless);
     let (real, effective) = (uid.real, uid.effective);
-    let resolution = match resolve_owner_name(&sources.passwd, effective, &sources.lookup) {
-        Ok(r) => r,
-        // passwd の不具合と NSS の失敗は、`start` と同じ固定文言で見分ける。
-        Err(e) if e.message() == "the passwd database is unusable" => {
-            f.owner = OwnerState::PasswdUnusable;
-            return f;
-        }
-        Err(_) => {
-            f.owner = OwnerState::LookupFailed;
-            return f;
-        }
+    let to_owner = |k: OwnerNameKind| match k {
+        OwnerNameKind::Resolved => OwnerState::Resolved,
+        OwnerNameKind::NotFound => OwnerState::Unresolved,
+        OwnerNameKind::LookupUnavailable => OwnerState::LookupUnavailable,
     };
-    let (name, state) = match resolution {
-        OwnerNameResolution::Resolved { name, .. } => (Some(name), OwnerState::Resolved),
-        OwnerNameResolution::NotFound => (None, OwnerState::Unresolved),
-        OwnerNameResolution::LookupUnavailable => (None, OwnerState::LookupUnavailable),
-    };
-    let Ok(owner) = SubIdOwner::new(effective, name) else {
-        f.owner = OwnerState::InvalidName;
-        return f;
-    };
-    f.owner = state;
-    let (pu, pg) = (
-        probe_sub_id_file(&sources.subuid, &owner),
-        probe_sub_id_file(&sources.subgid, &owner),
-    );
     let to_state = |p: SubIdFileProbe| match p {
         SubIdFileProbe::Assigned => SubIdState::Assigned,
         SubIdFileProbe::Absent | SubIdFileProbe::NoOwnerRows => SubIdState::Unassigned,
         SubIdFileProbe::Unusable => SubIdState::Unusable,
     };
-    f.subuid = to_state(pu);
-    f.subgid = to_state(pg);
-    if pu == SubIdFileProbe::Unusable || pg == SubIdFileProbe::Unusable {
-        return f;
-    }
-    f.model = match select_rootless_id_model(pu, pg, real, effective) {
-        Ok(RootlessIdModel::SingleId) => ModelState::Single,
-        Ok(RootlessIdModel::SubordinateIds) => ModelState::Subordinate,
-        Err(_) => match (pu, pg) {
-            (SubIdFileProbe::Assigned, SubIdFileProbe::Assigned) => ModelState::UidMismatch,
-            (SubIdFileProbe::Assigned, _) => ModelState::IncompleteSubuidOnly,
-            _ => ModelState::IncompleteSubgidOnly,
-        },
+    let diagnosis = match diagnose_rootless_id_source_with(
+        real,
+        effective,
+        &sources.passwd,
+        &sources.subuid,
+        &sources.subgid,
+        &sources.lookup,
+    ) {
+        Ok(d) => d,
+        Err(r) => {
+            if let Some(k) = r.owner {
+                f.owner = to_owner(k);
+            }
+            if let Some((pu, pg)) = r.probes {
+                f.subuid = to_state(pu);
+                f.subgid = to_state(pg);
+            }
+            match r.reason {
+                RefusalReason::Owner(OwnerLookupFailure::PasswdUnusable) => {
+                    f.owner = OwnerState::PasswdUnusable;
+                }
+                // RefusedAsRoot は rootful を先に除外するため通常は起きない。他の種別は NSS の失敗として扱う。
+                RefusalReason::Owner(_) => f.owner = OwnerState::LookupFailed,
+                RefusalReason::OwnerNameInvalid => f.owner = OwnerState::InvalidName,
+                RefusalReason::OwnerUndetermined => f.owner = OwnerState::Undetermined,
+                RefusalReason::SubidFromNameService => {
+                    f.subid_source = NsswitchState::NameService;
+                }
+                RefusalReason::NsswitchUnusable => f.subid_source = NsswitchState::Unusable,
+                RefusalReason::SubIdUnreadable => {
+                    f.subid_source = NsswitchState::Files;
+                }
+                RefusalReason::IncompleteSubuidOnly => {
+                    f.subid_source = NsswitchState::Files;
+                    f.model = ModelState::IncompleteSubuidOnly;
+                }
+                RefusalReason::IncompleteSubgidOnly => {
+                    f.subid_source = NsswitchState::Files;
+                    f.model = ModelState::IncompleteSubgidOnly;
+                }
+                RefusalReason::UidMismatch => {
+                    f.subid_source = NsswitchState::Files;
+                    f.model = ModelState::UidMismatch;
+                }
+                // `non_exhaustive` の将来の理由と Source は、前提の不成立として所有者名の失敗に寄せない。
+                _ => {}
+            }
+            return f;
+        }
+    };
+    f.owner = to_owner(diagnosis.owner);
+    // `subid:` が files 以外なら診断が拒否しているため、ここへ来たときは files（または記述なし）。
+    f.subid_source = NsswitchState::Files;
+    f.subuid = to_state(diagnosis.subuid);
+    f.subgid = to_state(diagnosis.subgid);
+    f.model = match diagnosis.model {
+        RootlessIdModel::SingleId => ModelState::Single,
+        RootlessIdModel::SubordinateIds => ModelState::Subordinate,
     };
     if f.model != ModelState::Subordinate {
         return f;
     }
+    // 名前は診断が使った値をそのまま使う(`SubIdOwner` の規則は診断の段で検証済み)。
+    let Ok(owner) = SubIdOwner::new(effective, diagnosis.name) else {
+        f.owner = OwnerState::InvalidName;
+        return f;
+    };
     // 範囲が写像にできるか（`start` の core の `resolve_privilege` と同じ `rootless_mapping`）。
     let mappable = |path: &std::path::Path, host_id: u32| {
         load_subordinate_ids(path, &owner)
@@ -547,15 +661,21 @@ pub fn collect_with(status_text: Option<&str>, sources: &IdMappingSources) -> Id
     } else {
         RangeState::Invalid
     };
-    let helpers = match &sources.helpers {
-        Some((u, g)) => HelperPaths::new(u, g),
-        None => HelperPaths::system_default(),
+    // helper は 1 本ずつ core の検証(`HelperPaths::new` と同じ規則)にかける。
+    let (uid_path, gid_path) = match &sources.helpers {
+        Some((u, g)) => (u.clone(), g.clone()),
+        None => (
+            std::path::PathBuf::from(SYSTEM_NEWUIDMAP),
+            std::path::PathBuf::from(SYSTEM_NEWGIDMAP),
+        ),
     };
-    f.helpers = match helpers {
-        Ok(_) => HelperState::Trusted,
+    let helper_state = |path: &std::path::Path| match verify_helper_path(path) {
+        Ok(()) => HelperState::Trusted,
         Err(e) if e.code == ErrorCode::NotFound => HelperState::NotFound,
         Err(_) => HelperState::Untrusted,
     };
+    f.newuidmap = helper_state(&uid_path);
+    f.newgidmap = helper_state(&gid_path);
     f
 }
 
@@ -577,7 +697,9 @@ mod tests {
             subgid: SubIdState::Assigned,
             model: ModelState::Subordinate,
             range: RangeState::Valid,
-            helpers: HelperState::Trusted,
+            subid_source: NsswitchState::Files,
+            newuidmap: HelperState::Trusted,
+            newgidmap: HelperState::Trusted,
         }
     }
 
@@ -601,7 +723,8 @@ mod tests {
             subgid: SubIdState::Unassigned,
             model: ModelState::Single,
             range: RangeState::NotChecked,
-            helpers: HelperState::NotChecked,
+            newuidmap: HelperState::NotChecked,
+            newgidmap: HelperState::NotChecked,
             ..base()
         };
         let r = evaluate(&f);
@@ -622,7 +745,8 @@ mod tests {
             let r = evaluate(&IdMappingFindings {
                 model: m,
                 range: RangeState::NotChecked,
-                helpers: HelperState::NotChecked,
+                newuidmap: HelperState::NotChecked,
+                newgidmap: HelperState::NotChecked,
                 ..base()
             });
             assert_eq!(codes(&r), ["SUBORDINATE_IDS_INCOMPLETE"]);
@@ -702,18 +826,48 @@ mod tests {
         assert_eq!(r.exit_status().code(), 0);
     }
 
-    /// CORE-6: helper の欠け・信頼不成立は Warning で、他の Warning と同時に出る。
+    /// CORE-6・#2545: helper の欠け・信頼不成立は欠けた側ごとに 1 件。uid のみ・gid のみ・両方・片方信頼不可の 4 通り。
     #[test]
-    fn core6_helper_failures_warn_alongside_other_warnings() {
+    fn core6_helper_failures_are_diagnosed_per_helper() {
+        let run = |u, g| {
+            let r = evaluate(&IdMappingFindings {
+                newuidmap: u,
+                newgidmap: g,
+                ..base()
+            });
+            (
+                r.diagnostics
+                    .iter()
+                    .map(|d| (d.code, d.state))
+                    .collect::<Vec<_>>(),
+                r.exit_status().code(),
+            )
+        };
+        use HelperState::{NotFound, Trusted, Untrusted};
+        assert_eq!(
+            run(NotFound, Trusted),
+            (vec![("ID_MAP_HELPER_NOT_FOUND", "newuidmap_not_found")], 3)
+        );
+        assert_eq!(
+            run(Trusted, NotFound),
+            (vec![("ID_MAP_HELPER_NOT_FOUND", "newgidmap_not_found")], 3)
+        );
+        assert_eq!(
+            run(NotFound, NotFound),
+            (
+                vec![
+                    ("ID_MAP_HELPER_NOT_FOUND", "newuidmap_not_found"),
+                    ("ID_MAP_HELPER_NOT_FOUND", "newgidmap_not_found")
+                ],
+                3
+            )
+        );
+        assert_eq!(
+            run(Trusted, Untrusted),
+            (vec![("ID_MAP_HELPER_UNTRUSTED", "newgidmap_untrusted")], 3)
+        );
         let r = evaluate(&IdMappingFindings {
-            helpers: HelperState::NotFound,
-            ..base()
-        });
-        assert_eq!(codes(&r), ["ID_MAP_HELPER_NOT_FOUND"]);
-        assert_eq!(r.diagnostics[0].check, "id_map_helpers");
-        assert_eq!(r.exit_status().code(), 3);
-        let r = evaluate(&IdMappingFindings {
-            helpers: HelperState::Untrusted,
+            newuidmap: Untrusted,
             range: RangeState::Invalid,
             ..base()
         });
@@ -721,6 +875,41 @@ mod tests {
             codes(&r),
             ["SUBORDINATE_ID_RANGE_INVALID", "ID_MAP_HELPER_UNTRUSTED"]
         );
+        assert!(r.diagnostics[1].message.starts_with("newuidmap "));
+        assert_eq!(r.diagnostics[1].check, "id_map_helpers");
+    }
+
+    /// SEC-5・CORE-6・#2545: 名前を引けず名前の行しか無い・`subid:` が files 以外・nsswitch が不正は Warning(3)。
+    #[test]
+    fn sec5_owner_undetermined_and_subid_name_service_warn() {
+        let r = evaluate(&IdMappingFindings {
+            owner: OwnerState::Undetermined,
+            subid_source: NsswitchState::Files,
+            ..IdMappingFindings::unchecked(PrivilegeState::Rootless)
+        });
+        assert_eq!(codes(&r), ["SUBID_OWNER_UNDETERMINED"]);
+        assert_eq!(r.diagnostics[0].severity, DoctorSeverity::Warning);
+        assert_eq!(r.diagnostics[0].check, "passwd");
+        assert_eq!(r.diagnostics[0].state, "owner_undetermined");
+        assert_eq!(r.exit_status().code(), 3);
+        for (st, code, state) in [
+            (
+                NsswitchState::NameService,
+                "SUBID_NAME_SERVICE_UNSUPPORTED",
+                "subid_name_service",
+            ),
+            (NsswitchState::Unusable, "NSSWITCH_UNUSABLE", "unusable"),
+        ] {
+            let r = evaluate(&IdMappingFindings {
+                subid_source: st,
+                ..IdMappingFindings::unchecked(PrivilegeState::Rootless)
+            });
+            assert_eq!(codes(&r), [code]);
+            assert_eq!(r.diagnostics[0].severity, DoctorSeverity::Warning);
+            assert_eq!(r.diagnostics[0].check, "nsswitch");
+            assert_eq!(r.diagnostics[0].state, state);
+            assert_eq!(r.exit_status().code(), 3);
+        }
     }
 
     /// root・判定不能・対象外 OS の扱い（0 / 4 / 0）。
@@ -741,7 +930,7 @@ mod tests {
     #[test]
     fn core6_json_lines_shape() {
         let r = evaluate(&IdMappingFindings {
-            helpers: HelperState::NotFound,
+            newuidmap: HelperState::NotFound,
             ..base()
         });
         let mut buf = Vec::new();
@@ -753,7 +942,7 @@ mod tests {
         ));
         assert!(
             text.trim_end()
-                .ends_with("\"check\":\"id_map_helpers\",\"state\":\"not_found\"}")
+                .ends_with("\"check\":\"id_map_helpers\",\"state\":\"newuidmap_not_found\"}")
         );
         assert!(text.contains("\"remediation\":[\""));
     }
@@ -879,7 +1068,8 @@ mod tests {
             let d = Dir::new("single");
             let s = sources(&d, PASSWD, None, None);
             let (f, r) = run(&d, &status(1000, 1000), &s);
-            assert_eq!(f.helpers, HelperState::NotChecked);
+            assert_eq!(f.newuidmap, HelperState::NotChecked);
+            assert_eq!(f.newgidmap, HelperState::NotChecked);
             assert_eq!(codes(&r), ["SUBORDINATE_IDS_NOT_CONFIGURED"]);
             assert_eq!(r.exit_status().code(), 0);
         }
@@ -917,8 +1107,9 @@ mod tests {
             assert_eq!(codes(&r), ["SUBID_OWNER_LOOKUP_FAILED"]);
             s.lookup = UserDbLookup::custom(Vec::new(), Duration::from_secs(5), None, d.0.clone());
             let (f, r) = run(&d, &status(1000, 1000), &s);
-            assert_eq!(f.owner, OwnerState::LookupUnavailable);
-            assert!(codes(&r).contains(&"SUBID_OWNER_LOOKUP_UNAVAILABLE"));
+            // 名前の行しか無いため、自分の行か判定できず拒否(#2545)。
+            assert_eq!(f.owner, OwnerState::Undetermined);
+            assert_eq!(codes(&r), ["SUBID_OWNER_UNDETERMINED"]);
         }
 
         /// CORE-6: 名前を引けない（passwd にも NSS にも行が無い）場合は数値 uid の行で照合し、通知を出す。
@@ -938,19 +1129,105 @@ mod tests {
             assert!(codes(&r).contains(&"SUBID_OWNER_NAME_UNRESOLVED"));
         }
 
-        /// CORE-6: 範囲写像で helper が無い → NOT_FOUND、利用者所有 → UNTRUSTED。
+        /// CORE-6・#2545: 範囲写像で helper が無い → NOT_FOUND、利用者所有 → UNTRUSTED。1 本ずつ診断する。
         #[test]
         fn core6_helper_not_found_and_untrusted() {
             let d = Dir::new("helpers");
             let mut s = sources(&d, PASSWD, Some(GOOD), Some(GOOD));
             let (f, r) = run(&d, &status(1000, 1000), &s);
-            assert_eq!(f.helpers, HelperState::Untrusted);
-            assert_eq!(codes(&r), ["ID_MAP_HELPER_UNTRUSTED"]);
+            assert_eq!(f.newuidmap, HelperState::Untrusted);
+            assert_eq!(f.newgidmap, HelperState::Untrusted);
+            assert_eq!(
+                codes(&r),
+                ["ID_MAP_HELPER_UNTRUSTED", "ID_MAP_HELPER_UNTRUSTED"]
+            );
             assert_eq!(r.exit_status().code(), 3);
+            // newuidmap だけ実在しない構成では、newuidmap の欠けが 1 件だけ出る(newgidmap は信頼不可のまま別件)。
+            s.helpers = Some((d.0.join("nouid"), d.write("newgidmap", "")));
+            let (f, r) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.newuidmap, HelperState::NotFound);
+            assert_eq!(f.newgidmap, HelperState::Untrusted);
+            let states: Vec<_> = r.diagnostics.iter().map(|x| x.state).collect();
+            assert_eq!(states, ["newuidmap_not_found", "newgidmap_untrusted"]);
             s.helpers = Some((d.0.join("nouid"), d.0.join("nogid")));
             let (f, r) = run(&d, &status(1000, 1000), &s);
-            assert_eq!(f.helpers, HelperState::NotFound);
-            assert_eq!(codes(&r), ["ID_MAP_HELPER_NOT_FOUND"]);
+            assert_eq!(f.newuidmap, HelperState::NotFound);
+            assert_eq!(f.newgidmap, HelperState::NotFound);
+            assert_eq!(
+                codes(&r),
+                ["ID_MAP_HELPER_NOT_FOUND", "ID_MAP_HELPER_NOT_FOUND"]
+            );
+        }
+
+        /// SEC-5・CORE-6・#2545: 名前を引けず名前の行しか無い構成は、doctor が Warning にし start も同じ理由で拒否する。
+        /// 数値行だけなら従来どおり通知(0)。
+        #[test]
+        fn sec5_owner_undetermined_and_start_agrees() {
+            use fandhe_container_supervisor::id_model::resolve_rootless_id_source_with;
+            let d = Dir::new("undetermined");
+            let s = sources(
+                &d,
+                "bob:x:2000:2000::/h:/bin/sh\n",
+                Some("ldapuser:100000:65536\n"),
+                Some("ldapuser:100000:65536\n"),
+            );
+            let (f, r) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.owner, OwnerState::Undetermined);
+            assert_eq!(codes(&r), ["SUBID_OWNER_UNDETERMINED"]);
+            assert_eq!(r.exit_status().code(), 3);
+            let e = resolve_rootless_id_source_with(
+                1000, 1000, &s.passwd, &s.subuid, &s.subgid, &s.lookup,
+            )
+            .unwrap_err();
+            assert_eq!(
+                e.message(),
+                "the owner of named subordinate id lines cannot be determined"
+            );
+            // 数値行だけなら範囲写像(名前なしで照合)で、通知のみ。
+            let s = sources(
+                &d,
+                "bob:x:2000:2000::/h:/bin/sh\n",
+                Some("1000:100000:65536\n"),
+                Some("1000:100000:65536\n"),
+            );
+            let (f, r) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.owner, OwnerState::LookupUnavailable);
+            assert_eq!(f.model, ModelState::Subordinate);
+            assert!(codes(&r).contains(&"SUBID_OWNER_LOOKUP_UNAVAILABLE"));
+        }
+
+        /// CORE-6・#2545: `subid:` が files 以外 → SUBID_NAME_SERVICE_UNSUPPORTED、読めない → NSSWITCH_UNUSABLE。
+        /// start(共有関数)も同じ理由で拒否する。
+        #[test]
+        fn core6_subid_name_service_and_start_agrees() {
+            use fandhe_container_supervisor::id_model::resolve_rootless_id_source_with;
+            let d = Dir::new("subid");
+            let mut s = sources(&d, PASSWD, Some(GOOD), Some(GOOD));
+            let conf = d.write("nsswitch.conf", "subid: sss\n");
+            s.lookup = s.lookup.clone().with_nsswitch_conf(conf.clone());
+            let (f, r) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.subid_source, NsswitchState::NameService);
+            assert_eq!(f.model, ModelState::NotChecked);
+            assert_eq!(codes(&r), ["SUBID_NAME_SERVICE_UNSUPPORTED"]);
+            assert_eq!(r.exit_status().code(), 3);
+            let e = resolve_rootless_id_source_with(
+                1000, 1000, &s.passwd, &s.subuid, &s.subgid, &s.lookup,
+            )
+            .unwrap_err();
+            assert_eq!(
+                e.message(),
+                "subordinate ids from a name service are not supported"
+            );
+            s.lookup = s.lookup.clone().with_nsswitch_conf(d.0.clone());
+            let (f, r) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.subid_source, NsswitchState::Unusable);
+            assert_eq!(codes(&r), ["NSSWITCH_UNUSABLE"]);
+            // files なら従来どおり。
+            let conf = d.write("nsswitch.conf", "subid: files\n");
+            s.lookup = s.lookup.clone().with_nsswitch_conf(conf);
+            let (f, _) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.subid_source, NsswitchState::Files);
+            assert_eq!(f.model, ModelState::Subordinate);
         }
 
         /// SEC-5: ホスト ID 0 を含む範囲は RANGE_INVALID。

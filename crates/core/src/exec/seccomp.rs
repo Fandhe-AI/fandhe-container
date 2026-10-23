@@ -310,6 +310,12 @@ pub enum ProbeOutcome {
 }
 
 impl ProbeOutcome {
+    /// 試験用プローブの入口が `SysError` の結果を `ProbeOutcome` へ写す関数（CORE-5・REPAIR-7・#2550）。
+    ///
+    /// 呼び出し元（`probe_escape_syscall`・`escape_probe_mount`・`probe_kcmp_self_for_test`・
+    /// `probe_denied_syscalls_for_test`・`sysfs.rs` の試験用プローブ）の feature の和集合に cfg を揃える。
+    /// `allow(dead_code)` にしないのは、test 用 feature 無効の `-p` 単独 clippy を通すため。
+    #[cfg(any(feature = "escape-probe", feature = "exec-test-support"))]
     pub(super) fn from_result(r: Result<(), SysError>) -> Self {
         match r {
             Ok(()) => ProbeOutcome::Ok,

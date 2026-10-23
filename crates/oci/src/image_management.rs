@@ -61,6 +61,9 @@ mod inventory_ops_tests;
 mod container_ref;
 pub use container_ref::{ContainerRefRegistration, ContainerRefRelease};
 
+mod create_gate;
+pub use create_gate::{ContainerCreatePass, CreateQuiescence, IMAGE_STORE_CREATE_GATE_FILE_NAME};
+
 mod reconcile;
 pub use reconcile::{ContainerRefReconciliation, ContainerStatePresence};
 

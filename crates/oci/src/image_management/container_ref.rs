@@ -20,7 +20,9 @@
 //! 状態作成の曖昧な失敗（`Internal`・`Timeout`）で未確定のまま残った参照は、ID 指定の delete では外れず、
 //! 同じ ID の再作成を `AlreadyExists` で塞ぐ。これを外す部品が [`ImageStore::release_unbound_container_ref_if`]
 //! （未確定かつ世代一致のときだけ外す）。呼び出し元は「その ID の create が進行中でない」ことを保証できる
-//! 場合だけに限る。起動点は #854（再起動時の照合）が持ち、順序は「進行中の create が無いことの保証 →
+//! 場合だけに限る。保証は create ゲート（`create_gate.rs`。#2495）の排他で与え、本番では
+//! `release_unbound_container_ref_quiesced` / `reconcile_container_refs_quiesced` を使う。起動点は cli の
+//! 契機 A・B（`docs/design/container-ref-reconcile.md`）で、順序は「進行中の create が無いことの保証 →
 //! `StateStore` で状態が無いことを確認 → `unbound_containers` で読んだ世代つきで回収」とする。
 //! `register` 時に未確定を置き換えない理由は、並行する同じ ID の create の未確定参照と区別できるのが
 //! 世代だけで、競合側のロールバック（ID 指定の `release`）が勝った側の参照を外しうるため。

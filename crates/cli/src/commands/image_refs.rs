@@ -17,13 +17,14 @@
 //! 各呼び出しは `ImageStore` の期限つきの排他（`IMAGE_STORE_LOCK_TIMEOUT`）を内側で取り、返る前に解放する。
 //! `StateStore` の操作や start の所有ロックをまたいで保持しない（REPAIR-5）。
 //!
-//! # #854 との分担
+//! # 回収の契機と create ゲート（#854・#2495）
 //!
-//! 状態作成まで進まず未確定のまま残った参照の回収は、oci の `reconcile_container_refs`（状態ストアの結果を
-//! 照合用の probe で写す）と `release_unbound_container_ref_if` が担う。前提は「進行中の create が無いこと」で、
-//! 常駐デーモンを持たない CLI にはその時点が無い。起動点と probe の配線は後続の issue の担当で、本アダプタは
-//! トレイトの 5 メソッドだけを満たす（回収はトレイトに含めない）。delete で `--image-root` を省くと確定済みの
-//! 参照が残り、回収は照合を待つ（安全側の誤り方で、データは消えない）。
+//! 状態作成まで進まず未確定のまま残った参照、`--image-root` を省いた delete が残した確定済み参照の回収は、
+//! `ref_reconcile` module が担う（契機 A: イメージつき create の core 呼び出し前に同じキー 1 件、契機 B: `image rm` が
+//! 使用中で拒否したとき）。未確定参照の回収の前提「進行中の create が無いこと」は、oci の create ゲート
+//! （`ImageStore::quiesce_container_creates`）で保証する。イメージつき create は `create_with_image` の呼び出し全体を
+//! ゲートの共有（`ImageStore::enter_container_create`）で包む。本アダプタをゲートなしで `create_with_image` に渡す新しい
+//! 呼び出し元（plugin 経由の配線等）を作るときは、同じ規約を守る。参照キーの形式（`ref_key`・`state_scope`）は変えない。
 //!
 //! # 未実装（実装済みを装わない。REPAIR-3）
 //!

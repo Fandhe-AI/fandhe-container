@@ -9,8 +9,11 @@
 //!
 //! oci は core に依存できないため、`StateStore` を直接受けず、oci の内側で閉じた probe
 //! （[`ContainerStatePresence`] を返す呼び出し）を受ける。probe の本番実装（`StateStore::get` の結果の
-//! 写し方）と起動時の呼び出しの配線は oci と core の両方に依存するアダプタの担当で、#2315 で扱う
-//! （REPAIR-3: 本ファイルは照合の規則だけを実装済みで、配線は未実装）。
+//! 写し方）と呼び出しの配線は oci と core の両方に依存する cli の担当（`crates/cli` の `ref_reconcile`。#2495）。
+//! 常駐デーモンの無い CLI（CORE-1）に「起動時に 1 回」は無いため、契機は (A) イメージつき create の
+//! core 呼び出し前（同じ参照キー 1 件）と (B) `image rm` が使用中で拒否したとき。進行中の create が無い
+//! ことは `create_gate.rs` のゲート排他（[`ImageStore::quiesce_container_creates`]）で保証し、本番では
+//! `reconcile_container_refs_quiesced` を使う。設計は `docs/design/container-ref-reconcile.md`。
 //!
 //! 写し方の規約: `Ok` は [`ContainerStatePresence::Present`]、`NotFound` は
 //! [`ContainerStatePresence::Absent`]、それ以外のエラー（`Timeout`・`Internal`・`PermissionDenied`・
@@ -32,11 +35,12 @@
 //! - 確定済み参照が `Absent`: 状態の削除後に解除だけが落ちた残骸なので外す。
 //! - 未確定参照が `Absent`: 状態作成の前後で止まった create の残骸なので、`release_unbound_container_ref_if`
 //!   と同じ条件（未確定かつ世代一致）で外す。確定済みへ変わっていたら（`bind` が済んだ）外さない。
-//!   進行中の create が無いことは、本関数を「ライフサイクル操作を受け付ける前に 1 回」呼ぶ前提で保証する。
+//!   進行中の create が無いことは、ゲート排他（`create_gate.rs`）を取れた呼び出し元が保証する。
 //! - `Present` は確定・未確定とも残す（未確定のまま状態がある場合は `bind` 前のクラッシュで、
-//!   余分に残す側に誤るだけで GC は参照数に数える。確定への昇格は #2315 の配線側の担当）。
+//!   余分に残す側に誤るだけで GC は参照数に数える。確定へは昇格しない〔オーナー確認待ち。#2495〕。
+//!   状態の削除後は「未確定かつ `Absent`」になり回収される）。
 //!
-//! 前提: 再起動時、ライフサイクル操作（create / delete）を受け付ける前に 1 回呼ぶ。
+//! 前提: 未確定参照を外す呼び出しはゲート排他の下（`*_quiesced` 入口）に限る。
 //! 結果のログ出力も配線側の担当で、ここでは操作種別を増やさない。
 //!
 //! 外した結果は最後に 1 回まとめてディスクへ保存する（#2341。`container_ref` の永続化の節）。保存に失敗したら

@@ -34,8 +34,9 @@
 //!
 //! 未実装・簡易実装（REPAIR-3）:
 //! - `delete --image-root <abs>` は core の `delete_releasing_image_ref` で OCI-7 のイメージ参照を外す（#2315）。ストアは core に入る前に
-//!   開き、開けなければ状態を消さずに失敗する。`--image-root` を省いた delete では確定済みの参照が残り、回収は起動時の照合
-//!   （`image_refs` module doc の #854 との分担。起動点は未配線）を待つ（安全側。データは消えない）。
+//!   開き、開けなければ状態を消さずに失敗する。`--image-root` を省いた delete では確定済みの参照が残り、回収は次の契機で行う
+//!   （同じ ID の `create --image-root` の core 呼び出し前、または `image rm` が使用中で拒否したとき。`ref_reconcile` の module doc・#2495。
+//!   安全側でデータは消えない）。
 //! - stop の失敗 JSON の `op` は `kill` になる（core に `LifecycleOp::Stop` が無いため。core 到達前の失敗も
 //!   `kill` に揃える）。猶予待ち → SIGKILL・Stopped への遷移確認は TASK-157 の範囲。
 //! - stop の SIGTERM は意図つき（StopRequest）で送る。supervisor は意図を記録してから送るので、stop による終了は
@@ -1351,7 +1352,9 @@ mod tests {
             images: fandhe_container_oci::image_management::ImageStore,
             name: &str,
         ) -> Result<crate::commands::create_start::CreateImage, OciRuntimeError> {
-            use crate::commands::create_start::{CreateImage, create_container_with_image};
+            use crate::commands::create_start::{
+                CreateImage, create_container_with_image_reclaiming as create_container_with_image,
+            };
             let image = CreateImage {
                 store: images,
                 manifest: ref_digest(),
@@ -1427,6 +1430,137 @@ mod tests {
                 container_refs(&image.store),
                 vec![format!("{}.c1", scope_of(&base))]
             );
+        }
+
+        fn ref_generation(
+            images: &fandhe_container_oci::image_management::ImageStore,
+            base: &TmpDir,
+            name: &str,
+        ) -> Option<u64> {
+            use fandhe_container_oci::image_management::ContainerRefId;
+            let key =
+                ContainerRefId::new(&crate::commands::image_refs::ref_key(&scope_of(base), name))
+                    .expect("key");
+            let unbound = {
+                let guard = images.lock().expect("lock");
+                guard
+                    .unbound_containers()
+                    .find(|(k, _, _)| **k == key)
+                    .map(|(_, g, _)| g.as_raw())
+            };
+            unbound.or_else(|| {
+                images
+                    .container_ref_registration(&key)
+                    .expect("registration")
+                    .map(|g| g.as_raw())
+            })
+        }
+
+        fn register_unbound(
+            images: &fandhe_container_oci::image_management::ImageStore,
+            base: &TmpDir,
+            name: &str,
+        ) {
+            use fandhe_container_oci::image_management::ContainerRefId;
+            use fandhe_container_oci::reference::Digest;
+            let key =
+                ContainerRefId::new(&crate::commands::image_refs::ref_key(&scope_of(base), name))
+                    .expect("key");
+            images
+                .register_container_ref(&key, &Digest::parse(REF_MANIFEST).expect("digest"))
+                .expect("register");
+        }
+
+        fn recreate(
+            rt: &crate::commands::create_start::Runtime,
+            image: &crate::commands::create_start::CreateImage,
+            base: &TmpDir,
+            name: &str,
+        ) -> Result<fandhe_container_core::traits::StateRecord, OciRuntimeError> {
+            let req = CreateRequest::new(id(name), make_bundle(base)).expect("req");
+            crate::commands::create_start::create_container_with_image_reclaiming(rt, image, &req)
+        }
+
+        fn image_of(
+            base: &TmpDir,
+            images: fandhe_container_oci::image_management::ImageStore,
+        ) -> crate::commands::create_start::CreateImage {
+            crate::commands::create_start::CreateImage {
+                store: images,
+                manifest: ref_digest(),
+                scope: scope_of(base),
+            }
+        }
+
+        /// OCI-7・#2495: `--image-root` なしの delete が残した確定済み参照は、同じ ID の再 create の前に回収され、
+        /// 再 create が成功する（世代は旧 +1）。
+        #[test]
+        fn oci7_create_reclaims_ref_left_by_delete_without_image_root() {
+            let base = TmpDir::new("img-reclaim-bound");
+            let rt = runtime_with(store(&base));
+            let image = create_image(&base, &rt, images_store(&base, true), "c1").expect("create");
+            let old = ref_generation(&image.store, &base, "c1").expect("bound");
+            delete_with(&store(&base), &OpRecorder::new(), "c1", false).expect("delete");
+            assert_eq!(ref_generation(&image.store, &base, "c1"), Some(old));
+            recreate(&rt, &image, &base, "c1").expect("recreate");
+            assert_eq!(ref_generation(&image.store, &base, "c1"), Some(old + 1));
+            assert_eq!(
+                container_refs(&image.store),
+                vec![format!("{}.c1", scope_of(&base))]
+            );
+        }
+
+        /// OCI-7・#2495: register 後のクラッシュ（状態なし・未確定参照）の後でも、同じ ID の再 create が成功する。
+        #[test]
+        fn oci7_recreate_after_crash_after_register() {
+            let base = TmpDir::new("img-crash-register");
+            let rt = runtime_with(store(&base));
+            let images = images_store(&base, true);
+            register_unbound(&images, &base, "c1");
+            let old = ref_generation(&images, &base, "c1").expect("unbound");
+            let image = image_of(&base, images);
+            recreate(&rt, &image, &base, "c1").expect("recreate");
+            assert_eq!(ref_generation(&image.store, &base, "c1"), Some(old + 1));
+        }
+
+        /// OCI-7・#2495: bind 失敗後（状態あり・参照は未確定）は ALREADY_EXISTS で塞がれるが、状態の削除後は回収されて
+        /// 再 create が成功する（恒久的に塞がない）。状態が残る間は参照も触れない。
+        #[test]
+        fn oci7_present_unbound_does_not_block_forever() {
+            let base = TmpDir::new("img-bind-fail");
+            let rt = runtime_with(store(&base));
+            let images = images_store(&base, true);
+            register_unbound(&images, &base, "c1");
+            let old = ref_generation(&images, &base, "c1").expect("unbound");
+            do_create(&base, &store(&base), &OpRecorder::new(), "c1");
+            let image = image_of(&base, images);
+            let e = recreate(&rt, &image, &base, "c1").expect_err("present");
+            assert_eq!(e.code(), ErrorCode::AlreadyExists);
+            assert_eq!(ref_generation(&image.store, &base, "c1"), Some(old));
+            delete_with(&store(&base), &OpRecorder::new(), "c1", false).expect("delete");
+            recreate(&rt, &image, &base, "c1").expect("recreate");
+            assert_eq!(ref_generation(&image.store, &base, "c1"), Some(old + 1));
+        }
+
+        /// OCI-7・#2495: 別プロセス相当（別インスタンス）が create ゲートの共有を保持している間は未確定参照を回収せず、
+        /// 終わった後の再試行は成功する。
+        #[test]
+        fn oci7_unbound_ref_kept_while_create_in_progress() {
+            use fandhe_container_oci::image_management::ImageStore;
+            let base = TmpDir::new("img-in-progress");
+            let rt = runtime_with(store(&base));
+            let images = images_store(&base, true).with_timeout(Duration::from_millis(100));
+            register_unbound(&images, &base, "c1");
+            let old = ref_generation(&images, &base, "c1").expect("unbound");
+            let holder = ImageStore::open(&base.0.join("images")).expect("holder");
+            let pass = holder.enter_container_create().expect("pass");
+            let image = image_of(&base, images);
+            let e = recreate(&rt, &image, &base, "c1").expect_err("in progress");
+            assert_eq!(e.code(), ErrorCode::AlreadyExists);
+            assert_eq!(ref_generation(&image.store, &base, "c1"), Some(old));
+            drop(pass);
+            recreate(&rt, &image, &base, "c1").expect("recreate");
+            assert_eq!(ref_generation(&image.store, &base, "c1"), Some(old + 1));
         }
 
         /// OCI-7・#2315: 在庫に無い manifest の create は NOT_FOUND で、状態も参照も残らない

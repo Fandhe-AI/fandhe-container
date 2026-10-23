@@ -1652,6 +1652,8 @@ const HOLDER_SLACK: Duration = Duration::from_secs(5);
 /// (`isolate_rootless_subordinate_no_flush`)。holder・mapper は `_exit` で終わり stdout に書かないので、省いても
 /// 二重出力は起きない(CORE-6・#2009)。
 ///
+/// I は mapper の fork 直後(go の前)に holder へ mapper の pid を送る。holder は期限切れのとき、自分が終わる前に
+/// mapper のセッション(helper を含む)を止めて pid の再利用の残余を閉じる(#2551。`rootless::holder_await_release`)。
 /// holder は user namespace を作って保持するだけの使い捨てプロセスで、dumpable にするのは holder だけである
 /// (`newuidmap` / `newgidmap` は対象の `/proc/<pid>` の所有者を検査し、non-dumpable な対象を拒否するため。
 /// [`crate::rootless::run_userns_holder`])。holder は I の `comm`(起動識別子)を引き継ぐ。I が報告せずに死んだ場合も、
@@ -1692,7 +1694,8 @@ fn isolate_rootless_subordinate_with(
             holder_end,
             timeout,
             release_wait,
-            &mut std::io::stderr(),
+            MAPPER_REAP_TIMEOUT,
+            &mut rootless::NonBlockingDiag(std::io::stderr()),
         )
     })?;
     // holder を fork した後は、どの失敗も下の回収の分岐を通す(`?` で早期 return すると holder・mapper が
@@ -1939,10 +1942,44 @@ fn rootless_handshake(
             },
             sock,
             Some(keepalive),
-            &mut std::io::stderr(),
+            &mut rootless::NonBlockingDiag(std::io::stderr()),
         )
     })?;
     *mapper = Some(ContainerChild::spawned(mapper_pid));
+
+    // holder へ mapper の pid を渡す(go の前。#2551)。holder は期限切れのとき、自分が終わる前に mapper の
+    // セッション(helper を含む)を止めて pid の再利用を防ぐ。helper はまだ存在しないので、書けなければ失敗にする。
+    holder_sock
+        .set_write_timeout(Some(plan.timeout))
+        .map_err(|e| sync_io_error(&e, "set write timeout"))?;
+    let mapper_pid_frame = rootless::MapperPid::new(mapper_pid)
+        .map(|p| rootless::HolderControl::MapperPid(p).encode())
+        .map_err(ExecError::from_rootless)?;
+    holder_sock
+        .write_all(&mapper_pid_frame)
+        .map_err(|e| sync_io_error(&e, "send the mapper pid to the userns holder"))?;
+    // holder が錨を確保した応答を期限つきで待つ。write_all の成功はフレームが socket に入っただけで、holder が
+    // 錨を開けた保証にならない。受けるまで go を送らない(helper を起動させない。#2551・CORE-6・SEC-5)。
+    holder_sock
+        .set_read_timeout(Some(plan.timeout))
+        .map_err(|e| sync_io_error(&e, "set read timeout"))?;
+    let mut anchor_buf = [0u8; rootless::MAPPER_REPLY_LEN];
+    holder_sock
+        .read_exact(&mut anchor_buf)
+        .map_err(|e| sync_io_error(&e, "read the userns holder anchor reply"))?;
+    match MapperReply::decode(&anchor_buf).map_err(ExecError::from_rootless)? {
+        MapperReply::Ok => {}
+        MapperReply::Failed { code, stage } => {
+            return Err(ExecError::new(
+                code,
+                IsolationStage::UserNamespaceMap,
+                format!(
+                    "userns holder could not anchor the mapper at {}",
+                    stage.as_str()
+                ),
+            ));
+        }
+    }
 
     // 3. 参加先の同一性を、参加する前(元の namespace から)に記録する。
     let before = user_ns_identity(None)?;
@@ -2019,7 +2056,7 @@ fn rootless_handshake(
 
     // 6. 参加が済んだので holder を解放する(best effort。応答しなくても呼び出し元が回収する)。
     let _ = holder_sock.set_write_timeout(Some(plan.timeout));
-    let _ = holder_sock.write_all(&[rootless::HOLDER_RELEASE]);
+    let _ = holder_sock.write_all(&rootless::HolderControl::Release.encode());
     Ok(())
 }
 

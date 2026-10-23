@@ -437,3 +437,25 @@ fn oci1_remove_extracted_tree_removes_readonly_dirs_and_keeps_symlink_target() {
     // 存在しない木は冪等に成功する。
     remove_extracted_tree(&tree).unwrap();
 }
+
+/// OCI-1・SEC-5・#2598: 所有者に `r` が無い（0000）ディレクトリと、0555 の下の 0000 を含む木も消せ、外は残る。
+#[cfg(unix)]
+#[test]
+fn oci1_remove_extracted_tree_removes_0000_dirs_and_keeps_outside() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let t = Tmp::new("remove0000");
+    let outside = t.base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"k").unwrap();
+    let tree = t.base.join("tree");
+    std::fs::create_dir_all(tree.join("a/z")).unwrap();
+    std::fs::create_dir_all(tree.join("ro/z")).unwrap();
+    std::fs::write(tree.join("ro/z/f"), b"x").unwrap();
+    std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
+    for (p, m) in [("ro/z", 0o000), ("ro", 0o555), ("a/z", 0o000), ("a", 0o000)] {
+        std::fs::set_permissions(tree.join(p), std::fs::Permissions::from_mode(m)).unwrap();
+    }
+    remove_extracted_tree(&tree).unwrap();
+    assert!(std::fs::symlink_metadata(&tree).is_err());
+    assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"k");
+}

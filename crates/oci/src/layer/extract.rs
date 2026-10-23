@@ -161,11 +161,11 @@
 //!   `PreserveIfOwnerMapped`（`chown` しない 1 行の写像）は従来どおり。
 //! - 0700 の祖先ディレクトリで閉じ込めを判定する方式。`root` が 0700 のため、複数範囲の写像でもコンテナ内の
 //!   非 root ユーザーは `/` を辿れない。
-//! - macOS・Windows・Linux の他アーキテクチャでのディレクトリ fd 起点の解決（現状はパス起点で、確認から使用までの
-//!   TOCTOU を防げない。unix 全体なら `openat(O_DIRECTORY | O_NOFOLLOW)` の 1 コンポーネントずつの走査で統一できる）。
-//!   特殊ビットの保持は Linux 限定のため、SEC-5 の TOCTOU は Linux 固有である。
-//! - 公開の `remove_extracted_tree`（呼び出し側が `root` ごと破棄する道具）の fd 起点化。パス起点のままで、権限を
-//!   戻しながら消す。
+//! - macOS・Windows・Linux の他アーキテクチャでの、展開と公開の `remove_extracted_tree` のディレクトリ fd 起点の
+//!   解決（現状はパス起点で、確認から使用までの TOCTOU と、木の中に残ったマウントの中身の削除を防げない。#2598 で
+//!   広げないと決めた。特殊ビットの保持は Linux 限定のため SEC-5 の TOCTOU は Linux 固有で、macOS・Windows の本番経路は
+//!   cli が先に fail-closed にし、Linux の他アーキテクチャは展開が `Unimplemented`。広げるには macOS の `openat` 系・
+//!   Windows のハンドル起点操作の新しい FFI 宣言と libc 照合、Windows はオーナー判断が要る）。
 //! - 綴りの畳み込みによる名前衝突の検出（展開先 FS が区別する別表記は衝突として扱わない。IO-5）。HFS+ のように
 //!   保存時に名前を書き換える FS は前提外。
 //! - Windows ホストでの symlink エントリ（`Unimplemented` で拒否する）。
@@ -212,7 +212,7 @@ use tar::{Archive, EntryType};
 pub use super::idmap::{IdMap, IdRange};
 use sha2::{Digest as _, Sha256};
 
-use super::anchored::{AnchorHooks, AnchoredRoot, map_at_err, path_changed};
+use super::anchored::{AnchorHooks, AnchoredRoot, map_at_err, path_changed, remove_path_tree};
 use super::{
     DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, GzipLayerReader, LayerMediaType, PlainLayerReader,
     VerifiedLayerBlob, oci_error_from_layer_io, open_gzip_layer,
@@ -1030,10 +1030,16 @@ fn extract_zero_layers(root: &Path, setup: &SpecialSetup) -> Result<Vec<Extracte
 /// 展開した木を symlink を追従せずに消す（#2323）。存在しなければ成功。
 ///
 /// 展開は最後に遅延していたディレクトリの mode（0555 等）を適用するため、展開後に中断した root は通常の
-/// `remove_dir_all` では消せないことがある。所有者の rwx が欠けるディレクトリは権限を戻してから消す。
-/// cri の `PullImage` がステージングの後始末に使う。深さは上限があり、超えれば `ResourceExhausted`。
+/// `remove_dir_all` では消せないことがある。所有者の rwx が欠けるディレクトリ（0000 を含む）は権限を戻してから消す。
+/// cri の `PullImage` のステージングの後始末と、コンテナの rootfs の解放が使う。深さは上限があり、超えれば
+/// `ResourceExhausted`。
+///
+/// Linux の x86_64 / aarch64 では `path` の親を開いた fd 起点で下降し、差し替えられた symlink・マウントポイントを
+/// `FailedPrecondition` で拒否する（`path` の外を消さない。`/proc` が必要。OCI-1・SEC-5・#2598）。
+/// `file_name` を持たない `path`（`/`・`..` 終わり）は `InvalidArgument`。他のホストはパス起点のままで、確認から
+/// 使用までの TOCTOU を防げない（モジュール冒頭「未実装」）。
 pub fn remove_extracted_tree(path: &Path) -> Result<(), OciError> {
-    whiteout::remove_tree_nofollow(path)
+    remove_path_tree(path)
 }
 
 /// 件数と対応の照合つきで `ImageLayer` の列を作る補助（#2017・#2309・OCI-1）。

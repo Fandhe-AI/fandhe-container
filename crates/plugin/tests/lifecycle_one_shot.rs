@@ -42,8 +42,8 @@ fn plug7_one_shot_requires_unix_transport() {
 #[cfg(unix)]
 mod unix {
     use fandhe_container_plugin::{
-        Frame, ONE_SHOT_STDERR_MAX_BYTES, OneShotRecord, OneShotTermination, OneShotTimeout,
-        PLUGIN_SOCKET_ENV, PluginError, PluginErrorCode, PluginLaunchSpec, RpcTimeout, UdsStream,
+        Frame, OneShotRecord, OneShotTimeout, PLUGIN_SOCKET_ENV, PLUGIN_STDERR_MAX_BYTES,
+        PluginError, PluginErrorCode, PluginLaunchSpec, PluginTermination, RpcTimeout, UdsStream,
         call_once, call_once_observed,
     };
     use std::ffi::OsString;
@@ -429,7 +429,7 @@ mod unix {
         let out = res.unwrap();
         assert_eq!(
             out.termination(),
-            OneShotTermination::Exited { code: Some(0) }
+            PluginTermination::Exited { code: Some(0) }
         );
         assert_process_gone_within(grandchild_pid(&dir), Duration::from_secs(5));
     }
@@ -461,7 +461,7 @@ mod unix {
         let out = res.unwrap();
         assert_eq!(
             out.termination(),
-            OneShotTermination::Exited { code: Some(0) }
+            PluginTermination::Exited { code: Some(0) }
         );
         let pid = pid_of(out.response().payload());
         assert_ne!(pid, std::process::id());
@@ -500,7 +500,7 @@ mod unix {
     fn plug7_one_shot_kills_plugin_that_lingers_after_response() {
         let (res, _, _dir) = run("linger", 5000);
         let out = res.unwrap();
-        assert_eq!(out.termination(), OneShotTermination::Killed);
+        assert_eq!(out.termination(), PluginTermination::Killed);
         assert_process_gone(pid_of(out.response().payload()));
     }
 
@@ -544,9 +544,9 @@ mod unix {
         let out = res.unwrap();
         assert_eq!(
             out.termination(),
-            OneShotTermination::Exited { code: Some(0) }
+            PluginTermination::Exited { code: Some(0) }
         );
-        assert_eq!(ONE_SHOT_STDERR_MAX_BYTES, 65_536);
+        assert_eq!(PLUGIN_STDERR_MAX_BYTES, 65_536);
         assert_eq!(out.stderr().bytes().len(), 65_536);
         assert_eq!(
             out.stderr().bytes().iter().filter(|b| **b == b'x').count(),
@@ -582,7 +582,7 @@ mod unix {
         let out = res.unwrap();
         assert_eq!(
             out.termination(),
-            OneShotTermination::Exited { code: Some(0) }
+            PluginTermination::Exited { code: Some(0) }
         );
         assert_process_gone(pid_of(out.response().payload()));
         let expected = (
@@ -635,7 +635,7 @@ mod unix {
         let out = res.unwrap();
         assert_eq!(
             out.termination(),
-            OneShotTermination::Exited { code: Some(0) }
+            PluginTermination::Exited { code: Some(0) }
         );
         assert_eq!(out.stderr().bytes(), b"");
         assert!(!out.stderr().is_complete());
@@ -811,7 +811,7 @@ mod unix {
         .unwrap();
         assert_eq!(
             out.termination(),
-            OneShotTermination::Exited { code: Some(0) }
+            PluginTermination::Exited { code: Some(0) }
         );
         let pid = pid_of(out.response().payload());
         assert_ne!(pid, std::process::id());

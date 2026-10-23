@@ -49,8 +49,8 @@ fn plug7_mode_selection_requires_unix_transport() {
 #[cfg(unix)]
 mod unix {
     use fandhe_container_plugin::{
-        Frame, OneShotTermination, PLUGIN_SOCKET_ENV, PluginErrorCode, PluginLaunchSpec,
-        PluginMode, PluginModeKind, PluginSession, PluginSessionShutdown, RpcTimeout, UdsStream,
+        Frame, PLUGIN_SOCKET_ENV, PluginErrorCode, PluginLaunchSpec, PluginMode, PluginModeKind,
+        PluginSession, PluginSessionShutdown, PluginTermination, RpcTimeout, UdsStream,
     };
     use std::ffi::OsString;
     use std::os::unix::fs::DirBuilderExt;
@@ -198,7 +198,7 @@ mod unix {
             // 都度起動の終了状況と stderr は統一 API でも保持される。
             assert_eq!(
                 out.termination(),
-                Some(OneShotTermination::Exited { code: Some(0) })
+                Some(PluginTermination::Exited { code: Some(0) })
             );
             assert!(out.stderr().is_some());
             let (a2, seq) = parse(&out.into_response());
@@ -211,7 +211,7 @@ mod unix {
                     assert_eq!(sum.calls(), 2);
                     assert_eq!(
                         sum.last_termination(),
-                        Some(OneShotTermination::Exited { code: Some(0) })
+                        Some(PluginTermination::Exited { code: Some(0) })
                     );
                     assert!(sum.last_stderr().is_some());
                 }
@@ -261,7 +261,7 @@ mod unix {
             match s.shutdown().unwrap() {
                 PluginSessionShutdown::Resident(done) => assert_eq!(
                     done.termination(),
-                    OneShotTermination::Exited { code: Some(0) }
+                    PluginTermination::Exited { code: Some(0) }
                 ),
                 other => panic!("unexpected shutdown: {other:?}"),
             }

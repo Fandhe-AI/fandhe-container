@@ -477,7 +477,7 @@ mod supported {
     mod resident {
         use super::{EXPECTED_SOURCE, rss_guard};
         use fandhe_container_plugin::{
-            Frame, OneShotTermination, PLUGIN_SOCKET_ENV, PluginLaunchSpec, ResidentPlugin,
+            Frame, PLUGIN_SOCKET_ENV, PluginLaunchSpec, PluginTermination, ResidentPlugin,
             ResidentStartTimeout, ResidentState, RpcTimeout, UdsStream, rss,
         };
         use std::ffi::OsString;
@@ -583,7 +583,7 @@ mod supported {
             let done = session.shutdown().unwrap();
             assert_eq!(
                 done.termination(),
-                OneShotTermination::Exited { code: Some(0) }
+                PluginTermination::Exited { code: Some(0) }
             );
             #[cfg(target_os = "linux")]
             assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());

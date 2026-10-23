@@ -190,7 +190,7 @@ pub const ONE_SHOT_SWEEP_MAX_ENTRIES: usize = 256;
 /// 次回の初期化が続きの位置から走査する（手前のエントリは読み直さない）。
 pub const ONE_SHOT_SWEEP_MAX_SCAN: usize = 65_536;
 
-/// 都度起動の残骸の掃除結果（#1310・PLUG-7）。呼び出し側（#1869 の設計・TASK-114）が構造化ログへ出す材料。
+/// 都度起動の残骸の掃除結果（#1310・PLUG-7）。掃除するのは都度起動の `oneshot-*` だけ（`resident-*` は対象外）のため `OneShot` の名前を保つ（#2608）。呼び出し側（#1869 の設計・TASK-114）が構造化ログへ出す材料。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct OneShotSweep {

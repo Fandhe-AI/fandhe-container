@@ -72,7 +72,7 @@ use fandhe_container_platform_windows::wsl2::{
     PreparedLaunch, SharedMount, SharedTransport, TransportPolicy,
 };
 use fandhe_container_plugin::{
-    ONE_SHOT_EXIT_TIMEOUT, PluginError, PluginErrorCode, UDS_RPC_TIMEOUT_DEFAULT, UdsStream,
+    PLUGIN_EXIT_TIMEOUT, PluginError, PluginErrorCode, UDS_RPC_TIMEOUT_DEFAULT, UdsStream,
 };
 
 use crate::frame_loop::RequestHandler;
@@ -102,10 +102,10 @@ pub const EXIT_MARGIN: Duration = Duration::from_secs(1);
 /// [`WindowsRuntimeAdapter::release_all`] 全体の合計期限（複数コンテナ・複数マウントで共有）。
 /// 超過分は解除せず `entries` に残し、[`ReleaseAllReport::remaining`] で報告する。
 ///
-/// 呼び出し元（core 側）が plugin の自発終了を待つ猶予 `ONE_SHOT_EXIT_TIMEOUT`（超過で強制終了）から
+/// 呼び出し元（core 側）が plugin の自発終了を待つ猶予 `PLUGIN_EXIT_TIMEOUT`（超過で強制終了）から
 /// [`EXIT_MARGIN`] を引いた値。終了時の解除はこの 1 回だけで、[`Drop`] は再試行しない（終了処理全体を
 /// 猶予内に収める。REPAIR-5・WIN-2）。
-pub const RELEASE_ALL_BUDGET: Duration = ONE_SHOT_EXIT_TIMEOUT.saturating_sub(EXIT_MARGIN);
+pub const RELEASE_ALL_BUDGET: Duration = PLUGIN_EXIT_TIMEOUT.saturating_sub(EXIT_MARGIN);
 
 /// 残り期限がこの値未満のときは新たな解除を始めない（platform-windows の最小期限より十分大きく取る）。
 const MIN_STEP_BUDGET: Duration = Duration::from_millis(50);
@@ -1347,7 +1347,7 @@ mod tests {
     /// REPAIR-5: 終了時の解除の合計期限は、呼び出し元の終了猶予 5 秒から余裕 1 秒を引いた 4 秒。
     #[test]
     fn task116_3_repair5_release_all_budget_fits_in_exit_grace() {
-        assert_eq!(ONE_SHOT_EXIT_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(PLUGIN_EXIT_TIMEOUT, Duration::from_secs(5));
         assert_eq!(EXIT_MARGIN, Duration::from_secs(1));
         assert_eq!(RELEASE_ALL_BUDGET, Duration::from_secs(4));
     }

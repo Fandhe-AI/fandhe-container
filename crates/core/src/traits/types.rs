@@ -112,6 +112,14 @@ pub enum ErrorCode {
     /// 表す分類が必要なため設ける。spec（error-format.md）への反映要否は別途ユーザーへ
     /// 報告する（本 crate では拡張済みの分類として扱う）。
     Unavailable,
+    /// 資源の上限（追跡枠・件数・走査量など）に達して新しい処理を受けられない。
+    ///
+    /// 既存の資源が解放されるまで再試行しても解けない点で、接続し直せば回復し得る
+    /// [`Self::Unavailable`] と区別する（CRI では gRPC `RESOURCE_EXHAUSTED`）。
+    /// `PluginErrorCode`・`OciErrorCode`・`NetErrorCode`・`CriErrorCode` の同名コードと対応する
+    /// （PLUG-1・CRI-2・REPAIR-4）。ERR-1/3/5 の既定表にはない追加コードで、spec への反映要否は
+    /// 別途ユーザーへ報告する。
+    ResourceExhausted,
 }
 
 impl ErrorCode {
@@ -127,6 +135,7 @@ impl ErrorCode {
             Self::PermissionDenied => "PERMISSION_DENIED",
             Self::Timeout => "TIMEOUT",
             Self::Unavailable => "UNAVAILABLE",
+            Self::ResourceExhausted => "RESOURCE_EXHAUSTED",
         }
     }
 }
@@ -259,6 +268,7 @@ mod tests {
         assert_eq!(ErrorCode::PermissionDenied.as_str(), "PERMISSION_DENIED");
         assert_eq!(ErrorCode::Timeout.as_str(), "TIMEOUT");
         assert_eq!(ErrorCode::Unavailable.as_str(), "UNAVAILABLE");
+        assert_eq!(ErrorCode::ResourceExhausted.as_str(), "RESOURCE_EXHAUSTED");
     }
 
     /// CRI-7: TraitError の Display が "<CODE>: <message>" 形式になる。

@@ -101,8 +101,8 @@ pub const MSG_STATIC_ADDRESS_UNAVAILABLE: &str =
 
 /// net のエラーをトレイトのエラーへ写す（同名のコードはそのまま。net のメッセージは入力値を含まない）。
 ///
-/// `DataLoss`・`ResourceExhausted` は `ErrorCode` に対応が無いため `Internal` にし、元のコードを
-/// `message` の先頭へ残す。
+/// `ResourceExhausted` は `ErrorCode::ResourceExhausted` へ写す（#2609）。`DataLoss` は `ErrorCode` に
+/// 対応が無いため `Internal` にし、元のコードを `message` の先頭へ残す。
 pub fn net_error_to_trait(e: &NetError) -> TraitError {
     let code = match e.code() {
         NetErrorCode::InvalidArgument => ErrorCode::InvalidArgument,
@@ -112,7 +112,8 @@ pub fn net_error_to_trait(e: &NetError) -> TraitError {
         NetErrorCode::NotFound => ErrorCode::NotFound,
         NetErrorCode::AlreadyExists => ErrorCode::AlreadyExists,
         NetErrorCode::FailedPrecondition => ErrorCode::FailedPrecondition,
-        NetErrorCode::DataLoss | NetErrorCode::ResourceExhausted => {
+        NetErrorCode::ResourceExhausted => ErrorCode::ResourceExhausted,
+        NetErrorCode::DataLoss => {
             return TraitError::new(
                 ErrorCode::Internal,
                 format!("{}: {}", e.code().as_str(), e.message()),
@@ -1173,19 +1174,19 @@ mod tests {
         }
     }
 
-    /// ERR-1: 同名コードはそのまま写し、DataLoss・ResourceExhausted は Internal で元のコードを残す。
+    /// ERR-1: 同名コードはそのまま写し、ResourceExhausted も同名で写し（#2609）、DataLoss は Internal で元のコードを残す。
     #[test]
     fn err1_net_error_mapping() {
         let t = net_error_to_trait(&NetError::new(NetErrorCode::NotFound, "gone"));
         assert_eq!((t.code(), t.message()), (ErrorCode::NotFound, "gone"));
         let t = net_error_to_trait(&NetError::new(NetErrorCode::ResourceExhausted, "full"));
-        assert_eq!(t.code(), ErrorCode::Internal);
         assert_eq!(
-            t.message(),
-            format!("{}: full", NetErrorCode::ResourceExhausted.as_str())
+            (t.code(), t.message()),
+            (ErrorCode::ResourceExhausted, "full")
         );
         let t = net_error_to_trait(&NetError::new(NetErrorCode::DataLoss, "bad"));
         assert_eq!(t.code(), ErrorCode::Internal);
+        assert_eq!(t.message(), "DATA_LOSS: bad");
     }
 
     /// 取り残しが 1 件でもあれば分類を問わず Internal になり、件数が載る。

@@ -72,6 +72,9 @@ pub const FIRST_INHERITED_FD: u32 = 3;
 pub const USER_SCOPE_WRAPPER_ARGS: [&str; 6] =
     ["--user", "--scope", "--quiet", "-p", "Delegate=yes", "--"];
 /// 報告の先頭トークン（契約の版。互換性のない変更では数字を上げる）。
+///
+/// `ErrorCode` への語彙の追加（`RESOURCE_EXHAUSTED`・#2609）では上げない。未知の文字列は `parse_error_code` が
+/// `None` にして fail-closed で失敗し、CLI と supervisor は同じ版を一組で配置する前提のため。
 pub const REPORT_MAGIC: &str = "FCSUP1";
 /// 報告 1 行（終端の `\n` を含む）の最大バイト数。
 pub const MAX_REPORT_LEN: usize = 640;
@@ -146,6 +149,7 @@ pub fn parse_error_code(s: &str) -> Option<ErrorCode> {
         "PERMISSION_DENIED" => ErrorCode::PermissionDenied,
         "TIMEOUT" => ErrorCode::Timeout,
         "UNAVAILABLE" => ErrorCode::Unavailable,
+        "RESOURCE_EXHAUSTED" => ErrorCode::ResourceExhausted,
         _ => return None,
     })
 }
@@ -407,7 +411,7 @@ mod tests {
     #[cfg(not(windows))]
     const ROOT2: &str = "/s";
 
-    const ALL_CODES: [ErrorCode; 9] = [
+    const ALL_CODES: [ErrorCode; 10] = [
         ErrorCode::InvalidArgument,
         ErrorCode::NotFound,
         ErrorCode::AlreadyExists,
@@ -417,6 +421,7 @@ mod tests {
         ErrorCode::PermissionDenied,
         ErrorCode::Timeout,
         ErrorCode::Unavailable,
+        ErrorCode::ResourceExhausted,
     ];
 
     fn os(v: &[&str]) -> Vec<OsString> {

@@ -33,12 +33,12 @@
 //! - `image tag`（#2316）: `tagged\t<tag>\t<manifest>`（新規）・`retagged\t<tag>\t<付け替え前>\t<付け替え後>`（付け替え）・
 //!   `unchanged\t<tag>\t<manifest>`（同じ付け先への再付与）を 1 行で出す。いずれも終了コード 0。`source` は既存タグまたは
 //!   manifest digest、`target` はタグ参照のみ（digest は `INVALID_ARGUMENT`）。タグ件数が oci の `MAX_TAG_REFS` を超える
-//!   新規タグは oci が `ResourceExhausted` で拒否し、core の `ErrorCode` に対応が無いため `INTERNAL`（1）と固定文言
-//!   （`MSG_TAG_LIMIT`）で返す（`RESOURCE_EXHAUSTED` の追加は ERR 系 spec の変更にあたり本 issue では行わない）。
+//!   新規タグは oci が `ResourceExhausted` で拒否し、`RESOURCE_EXHAUSTED`（10）と固定文言
+//!   （`MSG_TAG_LIMIT`）で返す（#2609 で core に `ErrorCode::ResourceExhausted` を追加済み）。
 //!
 //! # エラー写像（ERR-1・ERR-2）
 //!
-//! oci の `OciErrorCode` を core の `ErrorCode` へ同名で写す（`DataLoss`・`ResourceExhausted`・`Internal` は `INTERNAL`）。
+//! oci の `OciErrorCode` を core の `ErrorCode` へ同名で写す（`DataLoss`・`Internal` は `INTERNAL`、`ResourceExhausted` は `RESOURCE_EXHAUSTED`）。
 //! `message` は本 module の固定文言表のみで、oci の `OciError::message`（コンテナ ID を含みうる）は出力へ流さない。
 //!
 //! # `image rm` の排他手順
@@ -141,6 +141,7 @@ pub(super) fn map_code(code: OciErrorCode) -> ErrorCode {
         OciErrorCode::Timeout => ErrorCode::Timeout,
         OciErrorCode::Unimplemented => ErrorCode::Unimplemented,
         OciErrorCode::Unavailable => ErrorCode::Unavailable,
+        OciErrorCode::ResourceExhausted => ErrorCode::ResourceExhausted,
         _ => ErrorCode::Internal,
     }
 }
@@ -1298,9 +1299,9 @@ mod tests {
         );
     }
 
-    /// CLI-1・OCI-7: タグ件数が上限なら新規タグは 1 / INTERNAL と固定文言、付け替えは成功する。
+    /// CLI-1・OCI-7: タグ件数が上限なら新規タグは 10 / RESOURCE_EXHAUSTED と固定文言、付け替えは成功する。
     #[test]
-    fn cli1_oci7_image_tag_limit_is_internal_with_fixed_message() {
+    fn cli1_oci7_image_tag_limit_is_resource_exhausted_with_fixed_message() {
         use fandhe_container_oci::image_management::MAX_TAG_REFS;
         let tmp = Tmp::new();
         let mut t = ReferenceTable::new();
@@ -1312,8 +1313,8 @@ mod tests {
         }
         let store = ImageStore::with_table(tmp.path(), t).expect("open");
         let (e, out) = run_tag(&store, "busybox:t0", "busybox:brand-new");
-        assert_eq!(e.exit_code(), 1);
-        assert_eq!(e.code(), Some("INTERNAL"));
+        assert_eq!(e.exit_code(), 10);
+        assert_eq!(e.code(), Some("RESOURCE_EXHAUSTED"));
         assert!(stderr_of(&e).contains(MSG_TAG_LIMIT));
         assert_eq!(out, "");
         let (e, out) = run_tag(&store, &format!("sha256:{}", "2".repeat(64)), "busybox:t1");
@@ -1401,7 +1402,7 @@ mod tests {
         assert_eq!(map_code(OciErrorCode::DataLoss), ErrorCode::Internal);
         assert_eq!(
             map_code(OciErrorCode::ResourceExhausted),
-            ErrorCode::Internal
+            ErrorCode::ResourceExhausted
         );
         assert_eq!(map_code(OciErrorCode::NotFound), ErrorCode::NotFound);
     }

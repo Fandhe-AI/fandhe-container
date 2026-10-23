@@ -135,7 +135,7 @@ impl PrePivotStep {
 
 /// `ErrorCode` の全 variant（`as_str` の逆引き用。`ErrorCode` に `from_str` が無いため）。
 /// 足し忘れは `error_code_ordinal` を使う単体テストが検出する。
-pub(super) const ALL_ERROR_CODES: [ErrorCode; 9] = [
+pub(super) const ALL_ERROR_CODES: [ErrorCode; 10] = [
     ErrorCode::InvalidArgument,
     ErrorCode::NotFound,
     ErrorCode::AlreadyExists,
@@ -145,6 +145,7 @@ pub(super) const ALL_ERROR_CODES: [ErrorCode; 9] = [
     ErrorCode::PermissionDenied,
     ErrorCode::Timeout,
     ErrorCode::Unavailable,
+    ErrorCode::ResourceExhausted,
 ];
 
 /// 段つきの許可リスト照合（子の符号化と親の復号で共有する唯一の規則。#2072）。
@@ -524,6 +525,7 @@ fn error_code_ordinal(code: ErrorCode) -> usize {
         ErrorCode::PermissionDenied => 6,
         ErrorCode::Timeout => 7,
         ErrorCode::Unavailable => 8,
+        ErrorCode::ResourceExhausted => 9,
     }
 }
 
@@ -603,7 +605,7 @@ mod tests {
         for (i, c) in ALL_ERROR_CODES.into_iter().enumerate() {
             assert_eq!(error_code_ordinal(c), i);
         }
-        assert_eq!(ALL_ERROR_CODES.len(), 9);
+        assert_eq!(ALL_ERROR_CODES.len(), 10);
         for (i, s) in PrePivotStep::ALL.into_iter().enumerate() {
             assert_eq!(step_ordinal(s), i);
         }

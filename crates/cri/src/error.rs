@@ -184,6 +184,7 @@ impl From<&TraitError> for CriError {
             ErrorCode::PermissionDenied => CriErrorCode::PermissionDenied,
             ErrorCode::Timeout => CriErrorCode::Timeout,
             ErrorCode::Unavailable => CriErrorCode::Unavailable,
+            ErrorCode::ResourceExhausted => CriErrorCode::ResourceExhausted,
             _ => CriErrorCode::Internal,
         };
         Self::new(code, err.message())
@@ -345,6 +346,7 @@ mod tests {
             (ErrorCode::PermissionDenied, Code::PermissionDenied),
             (ErrorCode::Timeout, Code::DeadlineExceeded),
             (ErrorCode::Unavailable, Code::Unavailable),
+            (ErrorCode::ResourceExhausted, Code::ResourceExhausted),
             (ErrorCode::Internal, Code::Internal),
         ];
         for (ec, expected) in cases {

@@ -34,7 +34,7 @@ use fandhe_container_oci::error::{OciError, OciErrorCode};
 use tonic::{Code, Request, Status};
 
 /// ERR-3 の区分表（`ErrorCode` と期待する gRPC コード。`Timeout` だけ名前が異なる）。
-const TRAIT_CODES: [(ErrorCode, Code); 9] = [
+const TRAIT_CODES: [(ErrorCode, Code); 10] = [
     (ErrorCode::InvalidArgument, Code::InvalidArgument),
     (ErrorCode::NotFound, Code::NotFound),
     (ErrorCode::AlreadyExists, Code::AlreadyExists),
@@ -44,6 +44,7 @@ const TRAIT_CODES: [(ErrorCode, Code); 9] = [
     (ErrorCode::PermissionDenied, Code::PermissionDenied),
     (ErrorCode::Timeout, Code::DeadlineExceeded),
     (ErrorCode::Unavailable, Code::Unavailable),
+    (ErrorCode::ResourceExhausted, Code::ResourceExhausted),
 ];
 
 /// 操作ごとに失敗コードを注入できるフェイクの実行層。

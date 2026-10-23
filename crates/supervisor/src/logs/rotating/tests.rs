@@ -1565,3 +1565,48 @@ fn sup14_log_read_flags_include_o_noctty() {
     assert_eq!(LOG_READ_FLAGS & nonblock, nonblock);
     assert_eq!(LOG_READ_FLAGS & O_NOFOLLOW, O_NOFOLLOW);
 }
+
+/// CLI-1・SUP-7: 書き手の稼働検査。sink の生存中は true、drop 後は false、ロックファイルが無ければ false
+/// （検査でロックファイルは作らない）。
+#[cfg(unix)]
+#[test]
+fn cli1_sink_is_active_follows_sink_lifetime_and_creates_nothing() {
+    let t = TmpDir::new("active");
+    assert!(!sink_is_active(&t.0, &id()).unwrap());
+    assert!(!t.0.join("c1.log.lock").exists());
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    assert!(sink_is_active(&t.0, &id()).unwrap());
+    drop(s);
+    assert!(!sink_is_active(&t.0, &id()).unwrap());
+}
+
+/// ロックファイルが symlink なら辿らず拒否する（fail-closed）。
+#[cfg(unix)]
+#[test]
+fn cli1_sink_is_active_rejects_symlinked_lock() {
+    let t = TmpDir::new("activesym");
+    fs::write(t.0.join("target"), b"").unwrap();
+    std::os::unix::fs::symlink(t.0.join("target"), t.0.join("c1.log.lock")).unwrap();
+    let e = sink_is_active(&t.0, &id()).unwrap_err();
+    assert_ne!(e.code(), ErrorCode::NotFound);
+}
+
+/// 検査が共有ロックを短時間持っている間の open は、有界の再試行で成功する。本物の sink が使用中なら拒否のまま。
+#[cfg(unix)]
+#[test]
+fn cli1_open_tolerates_brief_shared_lock_but_rejects_live_sink() {
+    let t = TmpDir::new("retry");
+    let s = RotatingFileSink::open(&t.0, &id(), small()).unwrap();
+    let e = RotatingFileSink::open(&t.0, &id(), small()).err().unwrap();
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    drop(s);
+    let probe = fs::File::open(t.0.join("c1.log.lock")).unwrap();
+    probe.lock_shared().unwrap();
+    let h = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(15));
+        probe.unlock().unwrap();
+    });
+    let s2 = RotatingFileSink::open(&t.0, &id(), small());
+    h.join().unwrap();
+    assert!(s2.is_ok());
+}

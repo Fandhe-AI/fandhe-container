@@ -54,7 +54,16 @@
 //!   終わりは (1) 組み込みの期限（24 時間。値はオーナー確認待ち。超えたら残りを出し切って 0）、(2) SIGINT・SIGTERM・SIGHUP
 //!   （`signals` が転送した後に既定動作で終了する。stderr に JSON は出ず、それまでに出した行は stdout に届いている。
 //!   起動時に `SIG_IGN` を継承したシグナルは上書きしない）、(3) stdout の失敗（`| head` 等。1 / `INTERNAL`）、(4) 追いつけない
-//!   ローテーション（9 / `UNAVAILABLE`）、(5) ログの削除（出し切って 0）。コンテナの停止では終わらない。
+//!   ローテーション（9 / `UNAVAILABLE`）、(5) ログの削除（出し切って 0）、(6) コンテナの停止（書き手の sink がいなくなり、
+//!   かつ状態の記録が `Running` でないとき、残りを出し切って 0。Docker 互換）。`Stopped` の記録は supervisor の最終 flush より
+//!   先に書かれるため、状態だけでは末尾を取りこぼす。書き手の終了（`<id>.log.lock` の解放）も条件にするので取りこぼさない。
+//!   restart ポリシーの再 launch の間は sink が保持されるので終わらない。状態の読み取りに失敗したら続ける（期限が上限）。
+//!   supervisor がクラッシュして記録が `Running` のまま残る場合は期限まで続く。`create` 済みで未 `start`（sink が無い）の
+//!   コンテナへの `--follow` は、書き手がいないため直ちに終わる。
+//!   追従の遅延は、LF で終わる行について最大で 1 ポーリング間隔（200 ms）と読み出しの時間である（捕捉リーダーが read のたびに
+//!   flush するため、書き手側の滞留は無い）。LF の来ていない行は、LF・EOF・64 KiB の上限のどれかまで出ない。
+//!   世代数 1 の設定の追従は拒否する（9 / `UNAVAILABLE`）。理由は supervisor の `logs::reader` のモジュール doc を参照。
+//!   本番の設定は固定の 3 世代で、利用者が世代数を設定する手段は無いため、本番の CLI からは到達しない。
 //!   試験専用 feature `logs-test-support` のときだけ、環境変数 `FANDHE_CONTAINER_TEST_LOGS_FOLLOW_DEADLINE_MS`（10 進ミリ秒。
 //!   上限で丸め、不正なら無視）で期限を短くできる。
 //!
@@ -76,8 +85,9 @@
 //! delete でのコンテナログ（`@container-logs/<id>.log*`）の削除は、core の delete の成功後に `stop_delete` が行う（#2446）。
 //!
 //! 未実装・簡易実装（REPAIR-3）:
-//! - logs: コンテナの停止で `--follow` を終える挙動（supervisor の最終 flush と停止記録の順序が前提）・利用者向けの期限フラグ・
-//!   writer の定期 flush による追従の遅延の短縮は未提供。非 Linux の読み出しは plugin 経由（TASK-114・TASK-125）。
+//! - logs: 利用者向けの期限フラグ（`--until` 等）の要否と構文、`--follow` の期限（24 時間）・`--tail` の件数（1,000,000）の
+//!   上限の値はオーナー確認待ち（#2605）。追従の遅延の短縮（inotify / kqueue）は行わない。非 Linux の読み出しは plugin 経由
+//!   （TASK-114・TASK-125）。
 //! - 再起動をまたぐ出力の捕捉: 再 launch が実機で成り立つのを待つ（#2043）。
 //! - list の JSON 出力・bundle 列: JSON を手組みしない（REPAIR-2）ため serde 系の配線か core の公開ライタが前提
 //!   （TASK-95・TASK-98）。
@@ -90,13 +100,14 @@ use std::time::Instant;
 
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::traits::{
-    ContainerId, ErrorCode, GetStateRequest, ListStateRequest, MAX_PAGE_SIZE, StateRecord,
-    StateStore, TraitError,
+    ContainerId, ContainerState, ErrorCode, GetStateRequest, ListStateRequest, MAX_PAGE_SIZE,
+    StateRecord, StateStore, TraitError,
 };
 
 use fandhe_container_supervisor::logs::{
-    FollowOptions, LogReadFailure, LogReadOptions, MAX_FOLLOW_DURATION, StreamKind, TailCount,
-    container_log_dir, container_log_rotation_config, read_container_log_with,
+    ContainerActivity, FollowOptions, LogReadFailure, LogReadOptions, MAX_FOLLOW_DURATION,
+    StreamKind, TailCount, container_log_dir, container_log_rotation_config,
+    read_container_log_with,
 };
 
 use super::CliExit;
@@ -282,6 +293,19 @@ fn read_options(args: &LogsArgs) -> Result<LogReadOptions, TraitError> {
     Ok(opts)
 }
 
+/// `--follow` の継続判定用に、状態ストアの記録から稼働状態を読む（書き手の sink がいないときだけ supervisor が呼ぶ）。
+///
+/// 記録が `Running` なら `Running`、それ以外（`Created`・`Stopped`・記録の不在）は `NotRunning`、読み取りの失敗は
+/// `Unknown`（追従を続ける。早く終えると取りこぼし、失敗にすると長い追従が一時的な競合で中断するため。#2605・REPAIR-5）。
+fn container_activity(store: &dyn StateStore, id: &ContainerId) -> ContainerActivity {
+    match store.get(&GetStateRequest::new(id.clone())) {
+        Ok(rec) if rec.status().state() == ContainerState::Running => ContainerActivity::Running,
+        Ok(_) => ContainerActivity::NotRunning,
+        Err(e) if e.code() == ErrorCode::NotFound => ContainerActivity::NotRunning,
+        Err(_) => ContainerActivity::Unknown,
+    }
+}
+
 /// 本番入口の `logs`。対象の存在を確かめ、supervisor の読み出し入口でコンテナログを古い順に stdout へ出す
 /// （CLI-1・SUP-7・#1543）。ログが無ければ何も出さず成功する。
 pub(super) fn run_logs(global: &GlobalArgs, args: &LogsArgs, stdout: &mut dyn Write) -> CliExit {
@@ -302,12 +326,15 @@ pub(super) fn run_logs(global: &GlobalArgs, args: &LogsArgs, stdout: &mut dyn Wr
                 Err(e) => CliExit::failed(e.code()),
                 Ok(opts) => {
                     let dir = container_log_dir(root);
+                    let store = rt.store.as_ref();
+                    let mut activity = || container_activity(store, &id);
                     match read_container_log_with(
                         &dir,
                         &id,
                         container_log_rotation_config(),
                         &opts,
                         stdout,
+                        &mut activity,
                     ) {
                         Ok(_) => CliExit::Success,
                         Err(f) => log_read_failure(&f),

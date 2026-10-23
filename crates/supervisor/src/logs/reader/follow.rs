@@ -16,7 +16,11 @@
 //!
 //! 保持する fd は保持中の 1 本と、スナップショットの一時的な `generations + 1` 本以下で、見たことのある inode の集合は
 //! 持たない。fd を保持している間はその inode が解放されないため、ino の再利用で別のファイルと誤って一致することはない。
-//! 世代数 1 では、ローテーションの隙間（現在ログの削除から新規作成まで）とログの削除を区別できないため、追従を拒否する。
+//! 世代数 1 では、ローテーションの隙間（現在ログの削除から新規作成まで）とログの削除を区別できず、ポーリングの間の複数回の
+//! ローテーションも検出できない（照合する一つ前の世代が無い）ため、追従を拒否する（#2605。案内は [`super`] のモジュール doc）。
+//!
+//! # コンテナの停止での終了
+//! 終了条件と理由は [`run`] と [`super`] のモジュール doc を参照（書き手のロックの解放と状態が `Running` でないこと、の両方）。
 
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -26,13 +30,13 @@ use std::time::Duration;
 
 use fandhe_container_core::traits::{ContainerId, ErrorCode};
 
-use super::super::rotating::{RotationConfig, current_log_path};
+use super::super::rotating::{RotationConfig, current_log_path, sink_is_active};
 use super::imp::{
     Opened, check_bytes, check_limit, feed_range, internal, is_current_log, last_lf_end,
     open_consistent, read_error, scan_error,
 };
 use super::record::Scanner;
-use super::{FOLLOW_OUTRAN_MESSAGE, FollowOptions, LogReadFailure, source};
+use super::{ContainerActivity, FOLLOW_OUTRAN_MESSAGE, FollowOptions, LogReadFailure, source};
 
 /// 時計とスリープの差し込み口。製品は `Instant` と `thread::sleep`、試験は進める時計と書き手の模擬を渡す。
 pub(super) struct Driver<'a> {
@@ -40,6 +44,8 @@ pub(super) struct Driver<'a> {
     pub(super) elapsed: &'a mut dyn FnMut() -> Duration,
     /// ポーリング間の待ち。
     pub(super) sleep: &'a mut dyn FnMut(Duration),
+    /// コンテナの稼働状態の probe（書き手がいなくなったときだけ呼ぶ。終了条件は [`run`] の doc を参照）。
+    pub(super) activity: &'a mut dyn FnMut() -> ContainerActivity,
 }
 
 /// 初回のスナップショットを出し終えた状態の引き継ぎ。
@@ -58,7 +64,13 @@ struct Held {
     offset: u64,
 }
 
-/// 追従ループ。期限（[`FollowOptions::deadline`]）に達した回で、残りを出し切って成功で戻る。
+/// 追従ループ。次のいずれかで、残りを出し切って成功で戻る。
+/// - 期限（[`FollowOptions::deadline`]）に達した回。
+/// - コンテナの停止: 書き手（sink）がいない（[`sink_is_active`] が `false`）**かつ** `driver.activity` が `Running` でも
+///   `Unknown` でもない（`NotRunning`）とき。最終の `poll_once` でローテーションの追従を済ませ、保持中のファイルを
+///   切れた末尾まで出し切る。ロックの検査は毎回、状態の probe はロックが解放されたときだけ呼ぶ。
+///   ロックの検査の失敗（種別違反など）は読み取りの失敗として返す（fail-closed）。
+///
 /// 戻り値は追従中に新たに読んだファイル数（初回のスナップショット分を含まない）。
 pub(super) fn run(
     dir: &Path,
@@ -90,6 +102,17 @@ pub(super) fn run(
         let ended = poll_once(dir, id, config, &mut held, &mut scanner, out, &mut extra)?;
         out.flush().map_err(|_| LogReadFailure::Output)?;
         if ended {
+            return Ok(extra);
+        }
+        if !sink_is_active(dir, id).map_err(read_error)?
+            && (driver.activity)() == ContainerActivity::NotRunning
+        {
+            // 書き手は最終 flush を済ませて close 済み。ローテーションの残りと切れた末尾を出し切る。
+            let ended = poll_once(dir, id, config, &mut held, &mut scanner, out, &mut extra)?;
+            if !ended && let Some(h) = held.as_mut() {
+                drain_all(h, &mut scanner, out, config)?;
+            }
+            out.flush().map_err(|_| LogReadFailure::Output)?;
             return Ok(extra);
         }
         let elapsed = (driver.elapsed)();
@@ -297,6 +320,15 @@ mod tests {
 
     /// 時計を進めながら追従を回す。`script(round)` は各ポーリング間のスリープで呼ばれる（書き手の模擬）。
     fn follow_run(dir: &Path, opts: LogReadOptions, script: &mut dyn FnMut(u32)) -> Outcome {
+        follow_run_probe(dir, opts, script, &mut || ContainerActivity::Running)
+    }
+
+    fn follow_run_probe(
+        dir: &Path,
+        opts: LogReadOptions,
+        script: &mut dyn FnMut(u32),
+        activity: &mut dyn FnMut() -> ContainerActivity,
+    ) -> Outcome {
         let now = Rc::new(Cell::new(Duration::ZERO));
         let n2 = Rc::clone(&now);
         let sleeps = Rc::new(Cell::new(0u32));
@@ -311,6 +343,7 @@ mod tests {
         let mut driver = Driver {
             elapsed: &mut elapsed,
             sleep: &mut sleep,
+            activity,
         };
         let mut out = Vec::new();
         let result = read_with(
@@ -558,9 +591,11 @@ mod tests {
         let now = Cell::new(Duration::ZERO);
         let mut elapsed = || now.get();
         let mut sleep = |_: Duration| {};
+        let mut activity = || ContainerActivity::Running;
         let mut driver = Driver {
             elapsed: &mut elapsed,
             sleep: &mut sleep,
+            activity: &mut activity,
         };
         let mut out = Vec::new();
         let r = read_with(
@@ -576,5 +611,98 @@ mod tests {
             r,
             Err(LogReadFailure::Source(ref e)) if e.code() == ErrorCode::Unavailable
         ));
+    }
+
+    use crate::logs::{LogSink, RotatingFileSink};
+
+    fn cid() -> ContainerId {
+        ContainerId::new("c1").expect("id")
+    }
+
+    /// CLI-1: sink が生きている間は、状態が NotRunning でも終わらず期限まで続き、probe も呼ばれない。
+    #[test]
+    fn cli1_follow_continues_while_sink_alive() {
+        let t = Tmp::new("alive");
+        let sink = RotatingFileSink::open(&t.0, &cid(), RotationConfig::default()).expect("sink");
+        sink.append(StreamKind::Stdout, b"a").expect("append");
+        let calls = Cell::new(0u32);
+        let o = follow_run_probe(&t.0, follow_opts(), &mut |_| {}, &mut || {
+            calls.set(calls.get() + 1);
+            ContainerActivity::NotRunning
+        });
+        o.result.expect("ok");
+        assert_eq!(calls.get(), 0);
+        assert_eq!(o.sleeps, 5);
+        drop(sink);
+    }
+
+    /// CLI-1: sink の drop 後に NotRunning なら、未 flush だった行も出して期限より前に成功で終わる。
+    #[test]
+    fn cli1_follow_ends_after_sink_drop_and_not_running_with_final_flush() {
+        let t = Tmp::new("stop");
+        let sink = RotatingFileSink::open(&t.0, &cid(), RotationConfig::default()).expect("sink");
+        sink.append(StreamKind::Stdout, b"a").expect("append");
+        sink.flush().expect("flush");
+        let mut sink = Some(sink);
+        let o = follow_run_probe(
+            &t.0,
+            follow_opts(),
+            &mut |r| {
+                if r == 0 {
+                    sink.as_ref()
+                        .expect("sink")
+                        .append(StreamKind::Stdout, b"b")
+                        .expect("append");
+                }
+                if r == 1 {
+                    drop(sink.take());
+                }
+            },
+            &mut || ContainerActivity::NotRunning,
+        );
+        o.result.expect("ok");
+        assert_eq!(o.out, b"stdout a\nstdout b\n");
+        assert!(o.sleeps < 5, "sleeps={}", o.sleeps);
+    }
+
+    /// CLI-1: sink がいなくても Running / Unknown の間は続く（restart の間・状態ストアの一時的な失敗）。
+    #[test]
+    fn cli1_follow_continues_when_running_or_unknown() {
+        for act in [ContainerActivity::Running, ContainerActivity::Unknown] {
+            let t = Tmp::new("cont");
+            fs::write(t.0.join("c1.log"), b"stdout a\n").expect("seed");
+            let o = follow_run_probe(&t.0, follow_opts(), &mut |_| {}, &mut || act);
+            o.result.expect("ok");
+            assert_eq!(o.sleeps, 5, "{act:?}");
+        }
+    }
+
+    /// CLI-1: 停止の直前にローテーションがあっても、欠落・重複なく出し切る。
+    #[test]
+    fn cli1_follow_stop_after_rotation_no_loss_no_dup() {
+        let t = Tmp::new("stoprot");
+        fs::write(t.0.join("c1.log"), b"stdout a\n").expect("seed");
+        let dir = t.0.clone();
+        let stopped = Cell::new(false);
+        let o = follow_run_probe(
+            &t.0,
+            follow_opts(),
+            &mut |r| {
+                if r == 0 {
+                    append(&dir, "c1.log", b"stdout b\n");
+                    rotate(&dir, Some(b"stdout c\n"));
+                    stopped.set(true);
+                }
+            },
+            &mut || {
+                if stopped.get() {
+                    ContainerActivity::NotRunning
+                } else {
+                    ContainerActivity::Running
+                }
+            },
+        );
+        o.result.expect("ok");
+        assert_eq!(o.out, b"stdout a\nstdout b\nstdout c\n");
     }
 }

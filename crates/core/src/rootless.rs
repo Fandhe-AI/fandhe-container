@@ -1456,6 +1456,10 @@ fn open_anchor(
 /// I が死んでいても、mapper が回収済みなら生きている helper がセッションを継承して番号を保つ。kill の直前に
 /// fd 経由でセッション ID が mapper の pid であることを確かめ、読めなくなっていれば EOF を確かめ直す。
 /// 残る窓: 期限の直前に最後の helper が終わり、その pid が `setsid` した無関係なプロセスへ再利用される極小の窓。
+/// もう 1 つの窓: mapper が回収済み(`Gone`)で I が生存したまま Release を送らず固まる場合、I は mapper の pid
+/// を保つ側ではなく、helper も居ないのに EOF にならない。このとき mapper の pid が同一ユーザーの別のグループ ID として
+/// 再利用されていると無関係なグループへ SIGKILL を送り得る。I は成功経路で mapper を回収した直後に Release を送るため
+/// 確率は極小で、届く先は同じ利用者に限る。`Gone` の kill を止めると I 死亡時の #2551 の経路が開くため残す。
 pub(crate) fn holder_await_release(
     sock: &mut std::os::unix::net::UnixStream,
     w: &HolderWait<'_>,

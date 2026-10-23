@@ -47,7 +47,9 @@
 //! （Linux のみ。#2467）から回収できる。請求書のトークンで証明できるのは、トークンを刻んだ後の失敗
 //! （`AddAddress` / `SetUp` / `CreateNftTable`）で残った bridge と nft テーブルだけで、刻む前の失敗
 //! （`CreateBridge` の結果不明・`ResolveIndex`・`SetOwnerToken`）で残った bridge は別名が空のため
-//! 回収側が `Unknown` のまま触れない（手動回収）。
+//! 回収側が `Unknown` のまま触れない（手動回収。観測の方法と手順は `docs/setup/network-reclaim-recovery.md`）。
+//! 請求書は [`FailedCreateClaim::to_record`] / [`FailedCreateClaim::from_record`] の固定テキスト記録で
+//! プロセスをまたいで残せる（置き場所・排他は呼び出し側。`docs/design/network-reclaim-persistence.md`・#2604）。
 //! 自分が作ったと確定した bridge のみ削除する（address は bridge と一緒に消える）。作成結果が
 //! 不明（`Timeout` / `DataLoss`）なリソースは fail-closed で削除せず、[`RollbackReport::leftover`]
 //! に `ResourceState::Unknown` として報告する。nft バッチは all-or-nothing なので `Aborted` /
@@ -102,7 +104,7 @@
 //!   `ip_forward` が別途必要（本 crate は host のグローバル設定を変更しない）。担当 Issue 未確定
 //! - peer の `eth0` へのリネーム（`LinkSet` に `IFLA_IFNAME` 変更が無い）、コンテナ単位のポート公開解除
 //!   （ルールハンドルの取得経路が無い）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
-//! - IPAM 状態の永続化とプロセスをまたぐ残置 pin の清掃、コンテナ単体の切り離し。担当 Issue 未確定
+//! - IPAM 状態の永続化とプロセスをまたぐ残置 pin の清掃、コンテナ単体の切り離し。担当 Issue 未確定（作成失敗の請求書の永続化は #2604 で済み）
 //! - IPv6 と `NftFamily::Inet`（IPv4 のみ。静的 IPAM が IPv4 のみのため）
 
 pub mod delete;
@@ -429,11 +431,16 @@ pub struct NetworkCreateError {
 ///
 /// 作成が失敗して `NetworkCreateError::rollback` の `leftover` が残ったとき、その資源が「この作成が
 /// 作ったもの」だと後から証明するための所有トークンを、ネットワーク名と取り残した資源の種類と一緒に持つ。
-/// 外部入力から作れない（フィールド非公開・構築口は `NetworkCreateError::reclaim_claim` と
-/// [`FailedCreateClaim::from_created`] だけ）。トークンを返すアクセサも置かない。回収は
+/// フィールドは非公開で、構築口は `NetworkCreateError::reclaim_claim`・[`FailedCreateClaim::from_created`]・
+/// plugin 自身が書いた永続化記録の復号 [`FailedCreateClaim::from_record`] だけ。トークンを返すアクセサも置かない。回収は
 /// `network::reclaim_failed_create`（Linux のみ）が、名前の再導出とトークンの完全一致を確かめてから行う。
 /// plugin-cri の netsetup が作成失敗の回収待ちの記録に保持し、削除要求で回収に使う。
-/// プロセスをまたぐ永続化は未実装（REPAIR-3）。
+///
+/// プロセスをまたぐ永続化は [`FailedCreateClaim::to_record`] / [`FailedCreateClaim::from_record`] の固定テキスト記録で行う
+/// （置き場所・排他は呼び出し側 plugin-cri の責務。`docs/design/network-reclaim-persistence.md`・#2604）。
+/// 記録は信頼しない入力として厳密に検証するが、所有の最終的な判定はカーネル側の別名・userdata と
+/// トークンの完全一致で行う。トークン内の pid は発行したプロセスのもので、再起動後の照合は
+/// 名前と接頭辞だけで成り立つため直さない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct FailedCreateClaim {
@@ -453,6 +460,58 @@ impl FailedCreateClaim {
             bridge: true,
             table: true,
         }
+    }
+
+    /// 永続化記録（固定のテキスト。LF・ASCII。NET-1・#2604）へ符号化する。
+    pub fn to_record(&self) -> String {
+        format!(
+            "{RECORD_VERSION_LINE}\nnetwork={}\ntoken={}\nbridge={}\ntable={}\n",
+            self.network.as_str(),
+            self.token,
+            u8::from(self.bridge),
+            u8::from(self.table),
+        )
+    }
+
+    /// [`FailedCreateClaim::to_record`] の記録を復号する。版・キーの順序・名前・トークン形式・フラグを
+    /// 厳密に検証し、違反は `InvalidArgument`（入力値はメッセージに載せない）。
+    pub fn from_record(record: &str) -> Result<Self, NetError> {
+        if record.len() > CLAIM_RECORD_MAX_LEN {
+            return Err(invalid("claim record too long"));
+        }
+        let mut lines = record.strip_suffix('\n').unwrap_or("").split('\n');
+        if !record.ends_with('\n') || lines.next() != Some(RECORD_VERSION_LINE) {
+            return Err(invalid("claim record version mismatch"));
+        }
+        let mut field = |key: &str| -> Result<&str, NetError> {
+            lines
+                .next()
+                .and_then(|l| l.strip_prefix(key))
+                .and_then(|l| l.strip_prefix('='))
+                .ok_or_else(|| invalid("claim record malformed"))
+        };
+        let network = NetworkName::new(field("network")?)?;
+        let token = field("token")?;
+        let bridge = parse_flag(field("bridge")?)?;
+        let table = parse_flag(field("table")?)?;
+        if lines.next().is_some() {
+            return Err(invalid("claim record malformed"));
+        }
+        if token.len() > CLAIM_TOKEN_MAX_LEN
+            || !token.bytes().all(|b| b.is_ascii_graphic())
+            || !token_names_network(token, &network)
+        {
+            return Err(invalid("claim record token invalid"));
+        }
+        if !(bridge || table) {
+            return Err(invalid("claim record names no resource"));
+        }
+        Ok(Self {
+            network,
+            token: token.to_owned(),
+            bridge,
+            table,
+        })
     }
 
     /// 対象のネットワーク名。
@@ -484,6 +543,21 @@ impl FailedCreateClaim {
             bridge,
             table,
         }
+    }
+}
+
+/// 請求書の記録の先頭行（版）。
+const RECORD_VERSION_LINE: &str = "fandhe-net-claim v1";
+/// 請求書の記録全体の長さの上限（バイト）。
+pub const CLAIM_RECORD_MAX_LEN: usize = 1024;
+/// 記録内のトークンの長さの上限（バイト）。
+const CLAIM_TOKEN_MAX_LEN: usize = 256;
+
+fn parse_flag(v: &str) -> Result<bool, NetError> {
+    match v {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(invalid("claim record flag invalid")),
     }
 }
 
@@ -2286,6 +2360,50 @@ mod tests {
         assert_eq!(claim.network(), &nname("web"));
         assert_eq!(claim.token(), c.bridge_token);
         assert!(claim.includes_bridge() && claim.includes_table());
+    }
+
+    /// NET-1・#2604: 請求書は記録へ往復で一致する。
+    #[test]
+    fn net1_claim_record_roundtrip() {
+        let c = create_network_with(&Fake::default(), &spec("web")).unwrap();
+        let claim = FailedCreateClaim::from_created(&c);
+        let rec = claim.to_record();
+        assert!(rec.starts_with("fandhe-net-claim v1\nnetwork=web\ntoken=fandhe-net:web:"));
+        assert!(rec.ends_with("\nbridge=1\ntable=1\n"));
+        assert_eq!(FailedCreateClaim::from_record(&rec), Ok(claim));
+        let one = FailedCreateClaim::for_test(nname("web"), "fandhe-net:web:1:2:3", false, true);
+        assert_eq!(FailedCreateClaim::from_record(&one.to_record()), Ok(one));
+    }
+
+    /// NET-1・#2604: 壊れた・不正な記録はすべて InvalidArgument で拒否する。
+    #[test]
+    fn net1_claim_record_rejects_malformed() {
+        let ok =
+            "fandhe-net-claim v1\nnetwork=web\ntoken=fandhe-net:web:1:2:3\nbridge=1\ntable=0\n";
+        assert!(FailedCreateClaim::from_record(ok).is_ok());
+        let long_tok = format!("fandhe-net:web:{}", "a".repeat(300));
+        let long_rec = format!("{}x", ok.replace("fandhe-net:web:1:2:3", &long_tok));
+        let bad = [
+            ok.replace("v1", "v2"),
+            ok.replace("network=web", "network=We b"),
+            ok.replace("token=fandhe-net:web:", "token=fandhe-net:other:"),
+            ok.replace("token=fandhe-net:web:", "token=web:"),
+            ok.replace("1:2:3", "1:2\u{1}3"),
+            ok.replace("bridge=1", "bridge=2"),
+            ok.replace("bridge=1", "bridge=0"),
+            format!("{ok}table=1\n"),
+            ok.replace("bridge=1\ntable=0", "table=0\nbridge=1"),
+            ok.replace("bridge=1\n", "bridge=1\nextra=1\n"),
+            ok.replace('\n', "\r\n"),
+            ok.trim_end().to_owned(),
+            long_rec,
+            ok.replace(&"fandhe-net:web:1:2:3".to_string(), &long_tok),
+            String::new(),
+        ];
+        for r in bad {
+            let e = FailedCreateClaim::from_record(&r).unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::InvalidArgument, "{r:?}");
+        }
     }
 
     /// NET-1: bridge 作成の Timeout は fail-closed（削除せず Unknown で報告）。

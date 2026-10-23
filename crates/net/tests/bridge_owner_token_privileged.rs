@@ -19,7 +19,9 @@
 //!   かつその bridge が残ること、(3) 別名を書き換えた bridge を `delete_network` が削除せず失敗すること、
 //!   (4) 別名を戻した正規の `delete_network` で bridge が消えること、(5) 作成失敗の回収（`reclaim_failed_create`。
 //!   #2467）が所有トークン一致の bridge・nft テーブルを消すこと、(6) bridge の別名が書き換えられていれば
-//!   bridge に触れず（テーブルは独立に消える）、別名を戻した再回収で収束することを確認する
+//!   bridge に触れず（テーブルは独立に消える）、別名を戻した再回収で収束すること、(7) 請求書を永続化記録（ファイル）
+//!   へ書いて読み戻した請求書で回収できること（#2604）、(8) 印を刻む前に失敗した bridge（別名なし）は回収が触れず、
+//!   手で消した後の再回収で収束すること（#2604）を確認する
 //!
 //! 待ちはすべて `FANDHE_CONTAINER_TEST_TIMEOUT_SECS`（既定 10 秒）で期限を切る（REPAIR-5）。前提（root・
 //! `unshare`・`ip`）を満たさない場合は skip せず失敗する。
@@ -327,8 +329,69 @@ mod linux {
         if show(rf.bridge.as_str()).is_ok() {
             fail("bridge still exists after the second reclaim");
         }
+
+        // (7) 請求書を永続化記録（ファイル）へ書いて読み戻しても、実カーネルの bridge・テーブルを回収できる
+        // （plugin の再起動後の回収の核。記録を読むのは復号だけで、所有はカーネル側のトークンで判定する。#2604）。
+        let rr = create_network(&route, &nft, &spec("rr", [10, 218, 0, 1]), t)
+            .unwrap_or_else(|e| fail(&format!("create_network rr: {e}")));
+        // 共有一時ディレクトリの予測できるパスへ書かない: 0700 の専用ディレクトリを新規に作り、その中に
+        // `create_new` で排他的に作る（既存ファイルの切り詰め・symlink 追従を許さない）。
+        let record_dir = std::env::temp_dir().join(format!(
+            "fandhe-bridge-owner-token-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&record_dir)
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+        let record_path = record_dir.join("rr.claim");
+        {
+            use std::io::Write as _;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&record_path)
+                .unwrap_or_else(|e| fail(&e.to_string()));
+            f.write_all(FailedCreateClaim::from_created(&rr).to_record().as_bytes())
+                .unwrap_or_else(|e| fail(&e.to_string()));
+        }
+        let record = fs::read_to_string(&record_path).unwrap_or_else(|e| fail(&e.to_string()));
+        let _ = fs::remove_dir_all(&record_dir);
+        let restored =
+            FailedCreateClaim::from_record(&record).unwrap_or_else(|e| fail(&e.to_string()));
+        reclaim_failed_create(&route, &nft, &restored, t)
+            .unwrap_or_else(|e| fail(&format!("reclaim from record: {e}")));
+        if show(rr.bridge.as_str()).is_ok() || !table_gone(&rr.table) {
+            fail("resources remain after reclaim from a persisted record");
+        }
+
+        // (8) 印（別名）を刻む前に失敗して残った bridge は自動回収されず Unknown のまま残る。手で消した後の
+        // 再回収は収束する（`docs/setup/network-reclaim-recovery.md` の手順。REPAIR-4）。
+        let un = NetworkName::new("un").unwrap_or_else(|e| fail(&e.to_string()));
+        let un_names = NetworkResourceNames::derive(&un).unwrap_or_else(|e| fail(&e.to_string()));
+        ip(&["link", "add", un_names.bridge().as_str(), "type", "bridge"])
+            .unwrap_or_else(|e| fail(&e));
+        let un_claim = FailedCreateClaim::from_record(
+            "fandhe-net-claim v1\nnetwork=un\ntoken=fandhe-net:un:1:2:3\nbridge=1\ntable=0\n",
+        )
+        .unwrap_or_else(|e| fail(&e.to_string()));
+        if reclaim_failed_create(&route, &nft, &un_claim, t).is_ok() {
+            fail("reclaim must not remove a bridge without an ownership alias");
+        }
+        if show(un_names.bridge().as_str()).is_err() {
+            fail("unstamped bridge was removed by reclaim");
+        }
+        ip(&["link", "delete", un_names.bridge().as_str()]).unwrap_or_else(|e| fail(&e));
+        reclaim_failed_create(&route, &nft, &un_claim, t)
+            .unwrap_or_else(|e| fail(&format!("reclaim after manual removal: {e}")));
         println!(
-            "bridge_owner_token_privileged: ok alias=token index=match foreign=kept delete=ok reclaim=ok reclaim_foreign=kept"
+            "bridge_owner_token_privileged: ok alias=token index=match foreign=kept delete=ok reclaim=ok reclaim_foreign=kept reclaim_restart=ok reclaim_manual=converged"
         );
     }
 }

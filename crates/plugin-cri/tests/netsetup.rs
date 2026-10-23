@@ -17,7 +17,7 @@ use fandhe_container_net::netlink_route::IpPrefix;
 use fandhe_container_net::network::{EndpointId, NetworkName as NetName};
 use fandhe_container_plugin_cri::netsetup::{
     AttachFailure, AttachOutcome, CreateFailure, DeleteFailure, MAX_NETWORKS, NetsetupBackend,
-    NetsetupContainer, NetsetupNetwork,
+    NetsetupContainer, NetsetupNetwork, RECLAIM_DIR, ReclaimStore,
 };
 use fandhe_container_plugin_cri::pod_network;
 
@@ -36,6 +36,8 @@ struct Script {
     fail_create: bool,
     /// create 失敗時に取り残す資源の件数。
     create_leftover: usize,
+    /// encode_claim を永続化しない（None）にするか。
+    no_encode: bool,
     /// 次の reclaim_failed_create を成功させるか。
     reclaim_ok: bool,
     /// create 失敗時に回収用の請求書を出さない（所有を証明できない取り残し）か。
@@ -81,6 +83,19 @@ impl NetsetupBackend for Fake {
             });
         }
         Ok(name.as_str().to_owned())
+    }
+
+    fn encode_claim(&self, claim: &String) -> Option<String> {
+        let s = self.0.lock().expect("lock");
+        (!s.no_encode).then(|| format!("rec:{claim}"))
+    }
+
+    fn decode_claim(&self, name: &NetName, record: &str) -> Result<String, TraitError> {
+        let claim = record
+            .strip_prefix("rec:")
+            .filter(|c| *c == format!("claim-{}", name.as_str()))
+            .ok_or_else(|| TraitError::new(ErrorCode::InvalidArgument, "bad record"))?;
+        Ok(claim.to_owned())
     }
 
     fn reclaim_failed_create(&self, name: &NetName, claim: &String) -> Result<(), TraitError> {
@@ -676,4 +691,171 @@ fn contract6_create_failure_without_leftover_is_not_tracked() {
             .code(),
         ErrorCode::NotFound
     );
+}
+
+/// 一意な一時の状態ルート（0700）を作る。
+fn temp_state_root(tag: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!(
+        "fandhe-netsetup-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    std::fs::create_dir_all(&p).expect("root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("mode");
+    }
+    p
+}
+
+fn persistent(root: &std::path::Path, fake: &Fake) -> NetsetupNetwork<Fake> {
+    let store = ReclaimStore::open(root).expect("store");
+    NetsetupNetwork::with_reclaim_store(fake.clone(), store, None).expect("plugin")
+}
+
+fn leak_n0(net: &NetsetupNetwork<Fake>, fake: &Fake) {
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_create = true;
+        s.create_leftover = 1;
+    }
+    pod_network::set_up_pod(net, &nname("n0"), subnet()).expect_err("create fails");
+    fake.0.lock().expect("lock").fail_create = false;
+}
+
+/// NET-1・NET-6・#2604: 作成失敗の請求書は plugin の再起動をまたいで残り、再起動後の delete_network で
+/// 元と同じ請求書が回収に渡り、回収後に記録ファイルが消えて同名を再作成できる。
+#[test]
+fn net1_failed_create_claim_survives_plugin_restart() {
+    let root = temp_state_root("restart");
+    let fake = Fake::default();
+    let net = persistent(&root, &fake);
+    leak_n0(&net, &fake);
+    let file = root.join(RECLAIM_DIR).join("n0.claim");
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("record"),
+        "rec:claim-n0"
+    );
+    drop(net);
+
+    // 再起動: 同じ置き場から作り直す。
+    let fake2 = Fake::default();
+    let net = persistent(&root, &fake2);
+    assert_eq!(
+        pod_network::set_up_pod(&net, &nname("n0"), subnet())
+            .expect_err("tracked")
+            .code(),
+        ErrorCode::AlreadyExists
+    );
+    assert_eq!(
+        net.create_netns(&CreateNetnsRequest::new(nname("n0"), cid("c1")))
+            .expect_err("leaked")
+            .code(),
+        ErrorCode::FailedPrecondition
+    );
+    // 回収に失敗する間は記録が残る。
+    assert_eq!(
+        net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
+            .expect_err("reclaim fails")
+            .message(),
+        "reclaim failed"
+    );
+    assert!(file.exists());
+    fake2.0.lock().expect("lock").reclaim_ok = true;
+    net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
+        .expect("reclaimed");
+    assert!(!file.exists());
+    let reclaims: Vec<String> = fake2
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("reclaim "))
+        .collect();
+    assert_eq!(reclaims, ["reclaim n0 claim-n0", "reclaim n0 claim-n0"]);
+    pod_network::set_up_pod(&net, &nname("n0"), subnet()).expect("reusable");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// 壊れた記録（復号できない）はファイルを残し、請求書なしの手動回収として登録し、記録器の失敗件数に数える。
+#[test]
+fn net1_corrupt_reclaim_record_requires_manual_reclaim() {
+    let root = temp_state_root("corrupt");
+    let store = ReclaimStore::open(&root).expect("store");
+    let file = root.join(RECLAIM_DIR).join("n0.claim");
+    std::fs::write(&file, "garbage").expect("write");
+    let fake = Fake::default();
+    fake.0.lock().expect("lock").reclaim_ok = true;
+    let recorder = Arc::new(fandhe_container_core::observability::OpRecorder::new());
+    let net = NetsetupNetwork::with_reclaim_store(fake.clone(), store, Some(Arc::clone(&recorder)))
+        .expect("plugin");
+    let e = net
+        .delete_network(&DeleteNetworkRequest::new(nname("n0")))
+        .expect_err("manual");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert!(e.message().contains("manual reclaim required"));
+    assert!(file.exists());
+    assert!(!fake.calls().iter().any(|c| c.starts_with("reclaim ")));
+    let op = fandhe_container_core::observability::OpName::new("net.reclaim_store_load")
+        .expect("op name");
+    assert_eq!(recorder.snapshot_op(&op).expect("stats").failure(), 1);
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// 別ネットワークの記録をファイル名だけ付け替えても、復号が名前の食い違いを拒否して手動回収になる。
+#[test]
+fn net1_reclaim_record_for_other_network_is_rejected() {
+    let root = temp_state_root("other");
+    let store = ReclaimStore::open(&root).expect("store");
+    std::fs::write(root.join(RECLAIM_DIR).join("n1.claim"), "rec:claim-n0").expect("write");
+    let fake = Fake::default();
+    fake.0.lock().expect("lock").reclaim_ok = true;
+    let net = NetsetupNetwork::with_reclaim_store(fake.clone(), store, None).expect("plugin");
+    let e = net
+        .delete_network(&DeleteNetworkRequest::new(nname("n1")))
+        .expect_err("manual");
+    assert!(e.message().contains("manual reclaim required"));
+    assert!(fake.calls().is_empty());
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// 符号化しないバックエンド（請求書を記録にできない）では何も書かない。
+#[test]
+fn net1_no_record_when_backend_does_not_encode() {
+    let root = temp_state_root("noenc");
+    let fake = Fake::default();
+    fake.0.lock().expect("lock").no_encode = true;
+    let net = persistent(&root, &fake);
+    leak_n0(&net, &fake);
+    assert!(!root.join(RECLAIM_DIR).join("n0.claim").exists());
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// 記録を書けないときは成功を装わず Internal を返し、メモリの記録は保持して同じプロセスでは回収できる（unix）。
+#[cfg(unix)]
+#[test]
+fn net1_persist_failure_is_reported_and_memory_record_kept() {
+    let root = temp_state_root("rofail");
+    let fake = Fake::default();
+    let net = persistent(&root, &fake);
+    let dir = root.join(RECLAIM_DIR);
+    // 権限に依存せず（root でも効く）、置き場のディレクトリを通常ファイルに差し替えて保存を必ず失敗させる。
+    std::fs::remove_dir_all(&dir).expect("rm dir");
+    std::fs::write(&dir, "not a directory").expect("replace by file");
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_create = true;
+        s.create_leftover = 1;
+    }
+    let e = pod_network::set_up_pod(&net, &nname("n0"), subnet()).expect_err("fails");
+    assert_eq!(e.code(), ErrorCode::Internal);
+    assert!(e.message().contains("could not be persisted"));
+    fake.0.lock().expect("lock").reclaim_ok = true;
+    // 置き場を作り直す。記録ファイルは無いので、回収の確認後の削除は冪等に成功する。
+    std::fs::remove_file(&dir).expect("rm file");
+    ReclaimStore::open(&root).expect("reopen");
+    net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
+        .expect("reclaimed from memory");
+    std::fs::remove_dir_all(&root).expect("cleanup");
 }

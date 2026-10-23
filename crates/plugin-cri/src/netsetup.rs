@@ -39,14 +39,18 @@
 //!   メモリ上の登録だけで成功を装わず `Unimplemented` を返す（実 netns の事前作成は net の API 分割の後続作業）。
 //!   バックエンドの `create_netns` が成功したときだけ契約 7・8 の記録を作る
 //! - 作成失敗の回収（#2467）: 手動回収のまま残るのは、所有トークンを刻む前の失敗で残った bridge（請求書が無い、
-//!   または別名が空で証明できない）、他者の同名資源が残っている場合、plugin プロセスの再起動で請求書（メモリ上）を
-//!   失った場合。いずれも記録を保持して `FailedPrecondition`（または件数入りの `Internal`）を返す
+//!   または別名が空で証明できない）、他者の同名資源が残っている場合、置き場に記録できなかった・壊れた記録の場合。
+//!   いずれも記録を保持して `FailedPrecondition`（または件数入りの `Internal`）を返す。請求書は
+//!   [`ReclaimStore`]（`<状態ルート>/.cri/net/pending-reclaim/<名前>.claim`）に永続化し、plugin の再起動後に
+//!   読み込んで `delete_network` で回収する（#2604。`docs/design/network-reclaim-persistence.md`、手動の手順は
+//!   `docs/setup/network-reclaim-recovery.md`）。置き場を差さない構成（`new`・`with_recorder`）はメモリだけ
 //! - `publish_port`: net はポート公開を attach 時の `ContainerAttachSpec::with_port_publishes` でしか受けず、
 //!   コンテナ単位の公開・解除が未実装のため `Unimplemented`（NET-4）
 //! - `detach`: net にコンテナ単体の切り離しが無いため、attach 済みは `Unimplemented`
 //! - 静的アドレス（`AttachRequest::address`）: net の `attach_container` は内部で動的割り当てを行い、事前予約と
 //!   併用できないため `Unimplemented`（契約 10。カーネル操作の前に判定する）
-//! - 状態（ネットワーク・IPAM・pin）はプロセスのメモリにだけあり、plugin プロセスの再起動で失われる
+//! - 状態（作成に成功したネットワーク・IPAM・pin・削除中の印）はプロセスのメモリにだけあり、plugin プロセスの
+//!   再起動で失われる（永続化するのは作成失敗の回収待ちの記録だけ。残りは #1870 の設計の後続）
 //! - DNS ヘルパーの起動・停止（NET-5・NET-7）は行わない
 //! - ネットワーク名は net の規則（小文字のみ、`_`・`.` を許す）に合わせて検査するため、トレイトの規則では有効な
 //!   大文字入りの名前は `InvalidArgument` になる。サブネットは IPv4 の `/1`〜`/30` のみ
@@ -57,6 +61,10 @@
 //! 本 crate は権限を上げない。権限が無ければ `PermissionDenied` をそのまま返す（fail-closed）。netns の pin の置き場は
 //! 状態ルート配下の固定の場所（`<状態ルート>/.netns`）で、要求の入力からは受けない。置き場は private な mount に
 //! しておく前提で、`shared` は net が拒否する。
+
+mod reclaim_store;
+
+pub use reclaim_store::{LoadReport, RECLAIM_DIR, ReclaimStore, StoredClaim};
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
@@ -270,6 +278,26 @@ pub trait NetsetupBackend: Send + Sync {
         ))
     }
 
+    /// 請求書を永続化記録へ符号化する（plugin の再起動をまたいで回収するため。NET-1・#2604）。
+    /// 既定は `None`（永続化しない。再起動で請求書を失い、手動回収になる）。
+    fn encode_claim(&self, _claim: &Self::FailedCreate) -> Option<String> {
+        None
+    }
+
+    /// [`encode_claim`](Self::encode_claim) の記録を請求書へ復号する。記録は信頼しない入力として検証し、
+    /// 不正なら `InvalidArgument`。ネットワーク名が記録と食い違う場合も拒否する。既定は復号しない
+    /// （`FailedPrecondition`）。
+    fn decode_claim(
+        &self,
+        _name: &NetName,
+        _record: &str,
+    ) -> Result<Self::FailedCreate, TraitError> {
+        Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "reclaim records are not supported by this backend",
+        ))
+    }
+
     /// コンテナ専用の netns を（lo の up を含めて）作る。既定は何もしない成功（試験用 fake 向け）。
     ///
     /// net の `attach_container` は netns の作成と pin から veth の設定までを 1 回で行い、先に netns を作ると
@@ -318,7 +346,8 @@ struct NetworkEntry<N, F> {
     /// バックエンドでのネットワーク解放が完了した印。取り残しの記録だけが残って再試行されるとき、
     /// 解放済みのネットワークへ二重に解放を要求しないために使う。
     backend_deleted: bool,
-    gateway: IpPrefix,
+    /// 作成に成功したネットワークの gateway。回収待ちの記録（再起動後に読み込んだものを含む）では持たない。
+    gateway: Option<IpPrefix>,
     /// 作成に成功したときのハンドル。作成失敗で取り残した回収待ちの記録（`leaked` が `Some`）では無い。
     handle: Option<N>,
     /// 作成失敗で取り残した・結果不明の資源の件数。`Some` の間は回収待ちとして上限に数え、
@@ -354,6 +383,8 @@ pub struct NetsetupNetwork<B: NetsetupBackend> {
     state: Mutex<BackendRegistry<B>>,
     /// 公開操作（入力拒否を含む）の成功・失敗件数とレイテンシの記録先（REPAIR-4）。
     recorder: Option<Arc<OpRecorder>>,
+    /// 回収待ちの記録の置き場。`None` ではメモリだけで保持し、再起動で失う。
+    store: Option<ReclaimStore>,
 }
 
 impl<B: NetsetupBackend> std::fmt::Debug for NetsetupNetwork<B> {
@@ -373,6 +404,58 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         Self::build(backend, Some(recorder))
     }
 
+    /// 回収待ちの記録の置き場を差して作る。置き場の記録を読み込み、作成失敗の回収待ちとして登録する
+    /// （plugin の再起動後に `delete_network` で回収できる。NET-1・REPAIR-3・#2604）。
+    ///
+    /// 復号できない記録（壊れた・名前が食い違う）はファイルを残したまま、請求書なしの回収待ち（手動回収）として
+    /// 登録し、同じ名前の再作成を防ぐ。件数は記録器の `net.reclaim_store_load` の失敗件数と固定語彙の
+    /// stderr 1 行で出す（ファイル名・トークンは出さない。REPAIR-4）。読み込み自体の失敗は fail-closed で返す。
+    pub fn with_reclaim_store(
+        backend: B,
+        store: ReclaimStore,
+        recorder: Option<Arc<OpRecorder>>,
+    ) -> Result<Self, TraitError> {
+        let report = store.load()?;
+        let mut networks = HashMap::new();
+        let mut broken = report.unrecognized;
+        for stored in report.claims {
+            let claim = NetName::new(&stored.name)
+                .ok()
+                .zip(stored.record.as_deref())
+                .and_then(|(n, rec)| backend.decode_claim(&n, rec).ok());
+            if claim.is_none() {
+                broken = broken.saturating_add(1);
+            }
+            networks.insert(
+                stored.name,
+                NetworkEntry {
+                    deleting: false,
+                    backend_deleted: false,
+                    gateway: None,
+                    handle: None,
+                    leaked: Some(LeakedCreate { claim }),
+                },
+            );
+        }
+        if let (Some(r), Ok(op)) = (&recorder, OpName::new("net.reclaim_store_load")) {
+            for _ in 0..broken {
+                r.start(op.clone()).failure();
+            }
+        }
+        if broken > 0 {
+            eprintln!("fandhe-container-plugin-cri: {broken} unusable pending-reclaim record(s)");
+        }
+        Ok(Self {
+            backend,
+            state: Mutex::new(Registry {
+                networks,
+                containers: HashMap::new(),
+            }),
+            recorder,
+            store: Some(store),
+        })
+    }
+
     fn build(backend: B, recorder: Option<Arc<OpRecorder>>) -> Self {
         Self {
             backend,
@@ -381,6 +464,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 containers: HashMap::new(),
             }),
             recorder,
+            store: None,
         }
     }
 
@@ -490,20 +574,39 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 "network limit reached",
             ));
         }
-        let (handle, leaked, result) = match self.backend.create_network(&name, gateway) {
+        let (handle, leaked, mut result) = match self.backend.create_network(&name, gateway) {
             Ok(h) => (Some(h), None, Ok(())),
             Err(f) if f.leftover > 0 => {
                 (None, Some(LeakedCreate { claim: f.reclaim }), Err(f.error))
             }
             Err(f) => return Err(f.error),
         };
+        // 回収待ちは再起動をまたいで残す。書けなくてもメモリの記録は保持し、成功を装わず失敗を足す（NET-1・#2604）。
+        if let (Some(store), Some(claim)) = (
+            &self.store,
+            leaked
+                .as_ref()
+                .and_then(|l: &LeakedCreate<_>| l.claim.as_ref()),
+        ) && let Some(record) = self.backend.encode_claim(claim)
+            && store.save(req.name().as_str(), &record).is_err()
+            && let Err(e) = &result
+        {
+            result = Err(TraitError::new(
+                ErrorCode::Internal,
+                format!(
+                    "{} ({}); the reclaim record could not be persisted",
+                    e.message(),
+                    e.code().as_str()
+                ),
+            ));
+        }
         // 取り残し・結果不明は回収を確認できるまで記録を保持し、MAX_NETWORKS に数える。
         reg.networks.insert(
             req.name().as_str().to_owned(),
             NetworkEntry {
                 deleting: false,
                 backend_deleted: false,
-                gateway,
+                gateway: handle.as_ref().map(|_| gateway),
                 handle,
                 leaked,
             },
@@ -626,7 +729,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             req.network().clone(),
             req.container().clone(),
             address,
-            Some(network.gateway.addr()),
+            network.gateway.map(|g| g.addr()),
         ))
     }
 
@@ -671,6 +774,12 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             let claim = leaked.claim.as_ref().ok_or_else(manual_reclaim_required)?;
             let net_name = to_net_name(req.name())?;
             self.backend.reclaim_failed_create(&net_name, claim)?;
+            // 回収を確認した後、記録ファイルを先に消す。消せなければメモリの記録も残し、同じ呼び出しの再試行で
+            // 再回収（冪等）と記録の削除をやり直せる（メモリだけ消えてファイルが残る食い違いを作らない）。
+            // 条件付きで消す: 別プロセスが先に回収して同名を再作成した新しい請求書は消さない（NET-1・#2604）。
+            if let (Some(store), Some(record)) = (&self.store, self.backend.encode_claim(claim)) {
+                store.remove_if_matches(name, &record)?;
+            }
             reg.networks.remove(name);
             return Ok(DeleteNetworkResponse::new());
         }
@@ -901,6 +1010,26 @@ mod linux {
                 ipam,
                 ports: PortRegistry::new(),
             })
+        }
+
+        fn encode_claim(&self, claim: &Self::FailedCreate) -> Option<String> {
+            Some(claim.to_record())
+        }
+
+        fn decode_claim(
+            &self,
+            name: &NetName,
+            record: &str,
+        ) -> Result<Self::FailedCreate, TraitError> {
+            let claim =
+                FailedCreateClaim::from_record(record).map_err(|e| net_error_to_trait(&e))?;
+            if claim.network() != name {
+                return Err(TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    "reclaim record does not belong to the network",
+                ));
+            }
+            Ok(claim)
         }
 
         fn reclaim_failed_create(

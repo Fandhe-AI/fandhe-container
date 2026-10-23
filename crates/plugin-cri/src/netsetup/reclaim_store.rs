@@ -126,17 +126,31 @@ impl ReclaimStore {
         }
         let _lock = self.lock()?;
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let tmp = self.dir.join(format!(
-            "{TMP_PREFIX}{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut opts = OpenOptions::new();
-        opts.write(true).create_new(true);
-        set_private_mode(&mut opts);
-        let mut f = opts
-            .open(&tmp)
-            .map_err(|_| internal("failed to persist the reclaim record"))?;
+        // 異常終了で残った同名の一時ファイル（PID の再利用で連番が 0 から始まり衝突しうる）が保存を妨げないよう、
+        // `AlreadyExists` のときは連番を進めて有限回だけ別名で再試行する（NET-1・REPAIR-3・#2604）。
+        const TMP_ATTEMPTS: usize = 16;
+        let mut opened = None;
+        for _ in 0..TMP_ATTEMPTS {
+            let tmp = self.dir.join(format!(
+                "{TMP_PREFIX}{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            set_private_mode(&mut opts);
+            match opts.open(&tmp) {
+                Ok(f) => {
+                    opened = Some((tmp, f));
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return Err(internal("failed to persist the reclaim record")),
+            }
+        }
+        let Some((tmp, mut f)) = opened else {
+            return Err(internal("failed to persist the reclaim record"));
+        };
         let written = f
             .write_all(record.as_bytes())
             .and_then(|()| f.sync_all())
@@ -342,6 +356,24 @@ mod tests {
             fs::set_permissions(&p, fs::Permissions::from_mode(0o700)).expect("mode");
         }
         p
+    }
+
+    /// NET-1・REPAIR-3・#2604: 異常終了で残った同名の一時ファイルがあっても、別名で再試行して保存できる。
+    #[test]
+    fn net1_store_save_survives_stale_tmp_collision() {
+        let root = temp_root("stale");
+        let s = ReclaimStore::open(&root).expect("open");
+        for n in 0..8 {
+            fs::write(
+                root.join(format!("{TMP_PREFIX}{}-{n}", std::process::id())),
+                "stale",
+            )
+            .expect("stale");
+        }
+        s.save("web", "rec-1\n").expect("save despite stale tmp");
+        let r = s.load().expect("load");
+        assert_eq!(r.claims.len(), 1);
+        assert_eq!(r.claims[0].record.as_deref(), Some("rec-1\n"));
     }
 
     /// NET-1・#2604: 保存した記録が読み戻せ、削除で消え、削除は冪等。

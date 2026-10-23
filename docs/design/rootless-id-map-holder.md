@@ -43,18 +43,35 @@ I ─ RELEASE を U へ送り、U と M を回収 → 残りの namespace を un
 
 ## 4. 残る影響と許容の根拠
 
-- U は I のメモリの COW 複製を持つ。dumpable な間は、祖先（Yama=1）または同じ uid の任意のプロセス（Yama=0）が U のメモリを読みうる。これは従来 I について生じていた露出と同じ範囲に収まり、fd と制御フローの露出は無くなる（U は fd 3 以上を閉じ、U 側の socket しか持たない）。
+- U は I のメモリの COW 複製を持つ（exec しない fork のため）。`unshare` から RELEASE までの U は dumpable なので、祖先（Yama=1）または同じ uid の任意のプロセス（Yama=0）が U を ptrace したり `/proc/<U>/mem` を読んだりできる。fd と制御フローの露出は無くなる（U は fd 3 以上を閉じ、U 側の socket しか持たない）が、メモリの露出は残る。
+- **呼び出し元の契約（#2546・CORE-6・SEC-5）**: `isolate_rootless_subordinate` を呼ぶプロセス（本番は supervisor C の fork 子の I。公開 API の利用者を含む）は、同じ uid のホスト側プロセスに読まれて困る機密をメモリに置いたまま呼んではならない。U が継承するのは、呼び出し時点の呼び出しプロセスのメモリ全体である。
+- **メモリの棚卸し（#2546。grep による確認で、網羅の保証ではない）**: 分離計画・写像・Landlock の規則・起動識別子・config 由来の `process.args` / `env` は同じ利用者が bundle の `config.json` から元々読める範囲にある。レジストリの資格情報を保持する経路は core / supervisor の `src` に見当たらなかった。**一方、注入ファイル（`InjectedFileSet`。secret の内容を `InjectedContent` として持つ。`container_options/secrets.rs`）が起動計画の一部として I のメモリにある可能性が高く、これは機密に当たりうる**。注入は分離後の PID 1 の準備で使うため fork 前にゼロ化できない。解消には、注入ファイルの内容を分離の後に取得する・または写像を exec 型の専用プロセスへ切り出す、といった設計変更が要り、本 issue の範囲を超える（別 issue で追跡する）。それまでは上記の契約と、dumpable な窓が写像の間から RELEASE までに限られること、および同じ uid の攻撃者は secret の元ファイルを初めから読める利用者であることを許容の根拠とする。
+- **特権ランチャー経由の capability**: C が ambient / permitted で持つ capability は、U の `unshare(CLONE_NEWUSER)` の後は新しい user namespace を基準にした権限になり、親の namespace に対する権限としては残らない（`set_cred_user_ns`。下の原文確認）。unshare の前の U は I から non-dumpable を受け継いでいる。
 - U を乗っ取っても、namespace の所有者（同じ uid）が初めから持つ権限を超えるものは得られない。範囲写像は同じ利用者が `newuidmap` で得られるものと同じで、写像は write-once かつ M が読み戻しを計画と照合するため、先回りの書き込みは失敗になる。I は non-dumpable で `mm->user_ns` は初期の namespace のため、U の namespace の中からは ptrace できない。
-- U は、pidfd 経由の `setns` が対象の dumpable を要するかを確認できていないため、I の参加が済む（RELEASE）まで dumpable のままにする。写像の直後に non-dumpable へ戻す最適化は、一次情報で確かめた後の任意の改善とする。
+- **写像の直後に U を non-dumpable へ戻す案は成立しない（原文で確認済み。#2546）**: I の `setns_pidfd` は `validate_nsset` → `ptrace_may_access(tsk, PTRACE_MODE_READ_REALCREDS)` を通り、対象が dumpable でないと `mm->user_ns`（U は exec せず `mm->user_ns` は初期の namespace）に対する `CAP_SYS_PTRACE` を要求する。rootless の I はこれを持たず `EPERM` になる。`/proc/<U>/ns/user` を開く経路も同じ ptrace 検査（FSCREDS）を通る。そのため U は RELEASE まで dumpable のままにする（窓は最小化済み）。
+- **`fs.suid_dumpable=1` の前提（#2546）**: I の `setns` は `commit_creds` を通るが、dumpable を `suid_dumpable` へ書き換える条件（euid / egid / fsuid / fsgid の変化、または `!cred_cap_issubset(old, new)`）に当たらない。ids は変わらず、参加先は I の uid が所有する子 user namespace（親が I の現在の namespace）で、`cred_cap_issubset` は「別 namespace では `set_ns == subset_ns->parent` かつ `owner == set->euid` なら true」の枝で true になる。よって I は `suid_dumpable` の値によらず non-dumpable のまま。参加後の `set_non_dumpable` は多層防御として残す。
+
+## 4.1 カーネル原文での確認（Linux v6.12。#2546）
+
+出典はいずれも Linux v6.12 のソース（git.kernel.org の stable ツリーの tag）。本文の長い引用はせず、結論だけを書く。
+
+| 対象 | 確認した結論 |
+| ---- | ------------ |
+| `kernel/user_namespace.c` `userns_install` | 同じ namespace・複数スレッド・`fs` 共有を拒否し、参加先で `CAP_SYS_ADMIN` を要する（子 namespace の所有者は持つ）。`set_cred_user_ns` で資格情報の user namespace を替える（kuid は変わらない） |
+| `kernel/cred.c` `commit_creds` / `cred_cap_issubset` | dumpable の書き換えは id の変化か `!cred_cap_issubset` のときだけ。親が旧 namespace で所有者が旧 euid の子 namespace への参加は subset と判定され、書き換わらない |
+| `kernel/nsproxy.c` `setns` / `validate_nsset` | pidfd 経由は対象に `ptrace_may_access(PTRACE_MODE_READ_REALCREDS)` を要求する |
+| `kernel/ptrace.c` `__ptrace_may_access` | uid が一致しても、対象の `get_dumpable(mm) != SUID_DUMP_USER` なら `mm->user_ns` への `CAP_SYS_PTRACE` を要する |
+| `fs/proc/base.c` `task_dump_owner` | non-dumpable な対象の `/proc/<pid>` は `mm->user_ns` の root 所有に見える（`newuidmap` の所有者検査が通らない理由） |
 
 ## 5. 試験
 
-- 単体（`rootless.rs`）: mapper が「対象の親が期待した I でない」ことを `FailedPrecondition` で拒否すること、fd 経由の ppid が `parent_id()` と一致すること。
-- 結合（`crates/core/tests/unshare_isolation.rs`・実機前提）: 自身を `--subordinate-non-dumpable` で再起動した子が non-dumpable のまま分離し、user namespace 内の uid 0・`uid_map` / `gid_map` の読み戻し・namespace の変化・子プロセス 0 件・呼び出し後も non-dumpable を具体値で照合する。親（I の祖先）は実行中の `/proc/<子>` の所有者 uid を標本し、標本が 1 件以上で全件が 0（non-dumpable は root 所有に見える）であることを照合する。CI では `platform-ci` の ubuntu が既存どおり `--ignored` で実行する。
+- 単体（`exec.rs`）: 握手が成功した後の待ちが失敗しても子を kill して回収すること(`reap_after_handshake`。#2546)。
+- 単体（`rootless.rs`）: holder の失敗が固定 3 バイトの応答と `diag` の 1 行になること(`report_holder_outcome`。#2546)。mapper が「対象の親が期待した I でない」ことを `FailedPrecondition` で拒否すること、fd 経由の ppid が `parent_id()` と一致すること。
+- 結合（`crates/core/tests/unshare_isolation.rs`・実機前提）: 自身を `--subordinate-non-dumpable` で再起動した子が non-dumpable のまま分離し、user namespace 内の uid 0・`uid_map` / `gid_map` の読み戻し・namespace の変化・子プロセス 0 件・呼び出し後も non-dumpable を具体値で照合する。親（I の祖先）は実行中の `/proc/<子>` の所有者 uid を標本し、標本が 1 件以上で全件が 0（non-dumpable は root 所有に見える）であることを照合する。CI では `platform-ci` の ubuntu が `--ignored` で実行し、成功行 2 本(`full isolation verified (root=false)` と `subordinate isolation kept the caller non-dumpable`)をログで照合する(#2546)。
 
 ## 6. 実機で確かめる事項（人間担当）
 
 - AppArmor の `restrict_unprivileged_userns` の下で、`setns` で参加した I の挙動。
 - `FANDHE_CONTAINER_TEST_ID_HELPER=1` の `rootless_launch` の helper シナリオと `production_launcher` のシナリオ I（`newuidmap` 経由の範囲写像が holder に対して成功し、PID 1 の `uid_map` が従来と一致すること）。
 
-出典: Linux `user_namespaces(7)`・`setns(2)`・`proc(5)`（`/proc/<pid>` の所有者と dumpable）、shadow の `newuidmap(1)`。カーネル実装（`userns_install`・`task_dump_owner`）の原文での再確認は実機確認と合わせて行う。
+出典: Linux `user_namespaces(7)`・`setns(2)`・`proc(5)`（`/proc/<pid>` の所有者と dumpable）、shadow の `newuidmap(1)`。カーネル実装は v6.12 の原文で確認済み（§4.1）。

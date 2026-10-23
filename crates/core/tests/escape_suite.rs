@@ -140,6 +140,10 @@
 #[path = "support/temp_rootfs.rs"]
 mod temp_rootfs;
 
+#[cfg(target_os = "linux")]
+#[path = "support/proc_status.rs"]
+mod proc_status;
+
 use std::fmt;
 
 /// errno / シグナル番号（asm-generic の値で x86_64・aarch64 とも共通）。
@@ -3292,8 +3296,12 @@ mod linux {
             }
             let now = Instant::now();
             if now >= deadline {
+                let diag = crate::proc_status::excerpt(child.pid());
                 let _ = child.kill_and_reap(Duration::from_secs(5));
-                panic!("the container process did not exit within {:?}", timeout());
+                panic!(
+                    "the container process did not exit within {:?}; {diag}",
+                    timeout()
+                );
             }
             match listener.wait(POLL.min(deadline - now)) {
                 Ok(ListenerReadiness::Readable) => {}
@@ -3406,8 +3414,9 @@ mod linux {
                 respond_loop(&child, &listener, relay.as_ref(), &container)
             }
             None => child.wait_timeout(timeout()).unwrap_or_else(|e| {
+                let diag = crate::proc_status::excerpt(child.pid());
                 let _ = child.kill_and_reap(Duration::from_secs(5));
-                panic!("wait: {e}")
+                panic!("wait: {e}; {diag}")
             }),
         };
         let exit = match exit {

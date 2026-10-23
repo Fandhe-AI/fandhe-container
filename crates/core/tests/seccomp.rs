@@ -55,6 +55,10 @@ use fandhe_container_core::seccomp::DeniedSyscall;
 #[path = "support/real_entry.rs"]
 mod real_entry;
 
+#[cfg(target_os = "linux")]
+#[path = "support/proc_status.rs"]
+mod proc_status;
+
 /// 結合試験が errno を照合する禁止 syscall の論理名（`DeniedSyscall::ALL` に含まれる必要がある）。
 const PROBED: [&str; 7] = [
     "kcmp",
@@ -393,8 +397,9 @@ mod linux {
     fn scenario_kill(rootfs: &Path, name: &str) {
         let child = spawn_entry(rootfs, &format!("kill-{name}"));
         let exit = child.wait_timeout(timeout()).unwrap_or_else(|e| {
+            let diag = crate::proc_status::excerpt(child.pid());
             let _ = child.kill_and_reap(Duration::from_secs(5));
-            panic!("wait: {e}")
+            panic!("wait: {e}; {diag}")
         });
         if exit == ChildExit::Exited(0) {
             // 発行が戻った（フィルタ欠落）。エントリポイントが残した印を、外部入力として上限つきで添える。
@@ -503,7 +508,8 @@ mod linux {
                 else {
                     std::process::exit(5);
                 };
-                // コアダンプによる遅延は `probe_escape_syscall` が RLIMIT_CORE を 0 にして避ける。
+                // コアダンプによる遅延は `probe_escape_syscall` が non-dumpable にして避ける（パイプ形式の core_pattern は
+                // RLIMIT_CORE=0 では避けられない。#2629）。
                 let outcome = probe_escape_syscall(*which);
                 write_new(KILL_RETURNED, &format!("{outcome:?}\n"));
                 std::process::exit(0);

@@ -19,6 +19,10 @@
 //!   `actions_logged` の `kill_process`）を満たさなければ失敗にする（検証せず成功する分岐は持たない）。
 //!   `harness = false` の単一スレッド `main` で動かす（seccomp の適用が不可逆のため）
 
+#[cfg(target_os = "linux")]
+#[path = "support/proc_status.rs"]
+mod proc_status;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("seccomp_kill_audit: Linux only, not applicable on this OS");
@@ -260,8 +264,9 @@ fn main() {
                 }
             }
             if Instant::now() >= deadline {
+                let diag = crate::proc_status::excerpt(pid);
                 let reaped = reap_bounded(&mut child);
-                panic!("child {name} timed out (reaped={reaped})");
+                panic!("child {name} timed out (reaped={reaped}; {diag})");
             }
             std::thread::sleep(Duration::from_millis(20));
         };

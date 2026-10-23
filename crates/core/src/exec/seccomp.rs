@@ -257,6 +257,22 @@ pub fn observe_default_seccomp_enforcement() -> Result<SeccompEnforcementObserva
     })
 }
 
+/// SIGSYS で死ぬ試験専用の入口が、違反 syscall の直前に core dump を作らない状態へする（SEC-4・CORE-5・REPAIR-12・#2629）。
+///
+/// `observe_default_seccomp_kill` と `probe_escape_syscall` から呼ぶ。`PR_SET_DUMPABLE` を 0 にするのが主で、
+/// `core_pattern` がパイプ形式（apport 等）のとき、`RLIMIT_CORE` を 0 にしても helper が起動され、
+/// 終わるまで親が子を回収できない（並列の試験の `wait` が期限切れになる。#2538）。`execve` は dumpable を
+/// 1 に戻すため、exec 後の最後のプロセスの中で呼ぶこと。non-dumpable の後は `/proc/<pid>` の所有者が
+/// 変わるので、親による ID 写像の書き込み等が済んだ後に限る。`RLIMIT_CORE` は file 形式のホストで
+/// core ファイルを残さないための補助。
+fn suppress_core_dump_before_sigsys() -> Result<(), sys::SysError> {
+    sys::set_non_dumpable()?;
+    if sys::is_dumpable()? {
+        return Err(sys::SysError::Unsupported);
+    }
+    sys::set_rlimit_self(crate::rlimits::RlimitKind::Core, 0, 0)
+}
+
 /// 強制終了（`SECCOMP_RET_KILL_PROCESS`）対象の禁止 syscall（ESC-06・CORE-5・SEC-2。`DeniedSyscall::deny_action`）。
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,14 +290,15 @@ pub enum KilledSyscall {
 /// 正常な挙動では syscall が SIGSYS で子プロセスを終了させるため、本関数は戻らない。戻った場合は
 /// 強制終了になっていない（フィルタの欠落）ので `Err` を返す。`tests/seccomp_enforcement.rs` の
 /// 使い捨ての子（`--child-kill`）から呼び、親が終了シグナル（SIGSYS = 31）を照合する。
-/// SIGSYS の既定動作はコアダンプのため、発行前に `RLIMIT_CORE` を 0 にする（CI のダンプ処理による遅延の回避）。
+/// SIGSYS の既定動作はコアダンプのため、発行前に non-dumpable にする（`suppress_core_dump_before_sigsys`。
+/// パイプ形式の `core_pattern` の helper 待ちによる間欠失敗の回避。#2538・#2629）。
 #[doc(hidden)]
 pub fn observe_default_seccomp_kill(which: KilledSyscall) -> Result<(), ExecError> {
     let fail =
         |m: &str| ExecError::new(ErrorCode::Internal, IsolationStage::Seccomp, m.to_string());
     sys::set_no_new_privs().map_err(|_| fail("failed to set no_new_privs"))?;
-    sys::set_rlimit_self(crate::rlimits::RlimitKind::Core, 0, 0)
-        .map_err(|_| fail("failed to set RLIMIT_CORE"))?;
+    suppress_core_dump_before_sigsys()
+        .map_err(|_| fail("failed to suppress core dump (PR_SET_DUMPABLE / RLIMIT_CORE)"))?;
     apply_default_seccomp()?;
     let r = match which {
         KilledSyscall::Unshare => sys::unshare_namespaces(&[]),
@@ -469,8 +486,9 @@ pub enum EscapeSyscallProbe {
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub fn probe_escape_syscall(which: EscapeSyscallProbe) -> ProbeOutcome {
-    // SIGSYS の既定動作はコアダンプのため、発行前に抑止する（失敗しても観測は続ける。ベストエフォート）。
-    let _ = sys::set_rlimit_self(crate::rlimits::RlimitKind::Core, 0, 0);
+    // SIGSYS の既定動作はコアダンプのため、発行前に non-dumpable にして抑止する（失敗しても観測は続ける。
+    // ベストエフォート。`prctl` は組み込みフィルタの必須許可。#2629）。
+    let _ = suppress_core_dump_before_sigsys();
     let result = match which {
         EscapeSyscallProbe::Unshare => sys::unshare_namespaces(&[]),
         EscapeSyscallProbe::Ptrace => sys::ptrace_cont_probe(std::process::id()),

@@ -16,6 +16,10 @@
 //! 判別できる文言で panic する（#2235・ESC-06。方針は `AGENTS.md` の `seccomp_enforcement`）。
 //! 終了コードとマーカーの両方が揃ったときだけ前提欠如として扱い、それ以外は汎用の失敗にする。
 
+#[cfg(target_os = "linux")]
+#[path = "support/proc_status.rs"]
+mod proc_status;
+
 #[cfg(not(target_os = "linux"))]
 fn main() {
     println!("seccomp_enforcement: Linux only, not applicable on this OS");
@@ -201,6 +205,14 @@ fn main() {
         return;
     }
 
+    // 診断ヘルパーの自己テスト（#2629・REPAIR-12）: 自プロセスの抜粋が State と CoreDumping の両行を持つ。
+    let own = crate::proc_status::excerpt(std::process::id());
+    assert!(own.contains("State:"), "State line missing: {own}");
+    assert!(
+        own.contains("CoreDumping:\t0"),
+        "CoreDumping line missing: {own}"
+    );
+
     let exe = std::env::current_exe().expect("current_exe");
     let run = |extra: &[&str]| {
         let mut child = Command::new(&exe)
@@ -209,15 +221,17 @@ fn main() {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn child");
+        let child_pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(30);
         let status = loop {
             if let Some(s) = child.try_wait().expect("try_wait") {
                 break s;
             }
             if Instant::now() >= deadline {
+                let diag = crate::proc_status::excerpt(child_pid);
                 let _ = child.kill();
                 let _ = child.wait();
-                panic!("seccomp_enforcement child timed out");
+                panic!("seccomp_enforcement child timed out ({diag})");
             }
             std::thread::sleep(Duration::from_millis(20));
         };

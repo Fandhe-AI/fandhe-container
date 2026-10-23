@@ -142,6 +142,10 @@ fn main() {
 #[path = "support/real_entry.rs"]
 mod real_entry;
 
+#[cfg(target_os = "linux")]
+#[path = "support/proc_status.rs"]
+mod proc_status;
+
 #[cfg(all(
     target_os = "linux",
     all(
@@ -1782,6 +1786,7 @@ mod linux {
             let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> =
                 None;
             let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let probe_pid = started.process().pid();
                 let output = started.process().take_output().expect("container output");
                 let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
                 reader_slot = Some((rx, reader));
@@ -1789,7 +1794,12 @@ mod linux {
                     .process()
                     .wait(timeout())
                     .expect("wait for the probe")
-                    .unwrap_or_else(|| panic!("{name}: the probe did not exit within the timeout"));
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{name}: the probe did not exit within the timeout; {}",
+                            crate::proc_status::excerpt(probe_pid.get())
+                        )
+                    });
                 assert_eq!(
                     exit,
                     ProcessExit::Signaled(SIGSYS),
@@ -1893,7 +1903,12 @@ mod linux {
                 .process()
                 .wait(timeout())
                 .expect("wait for the probe")
-                .expect("the probe must exit within the timeout");
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the probe must exit within the timeout; {}",
+                        crate::proc_status::excerpt(pid.get())
+                    )
+                });
             assert_eq!(exit, ProcessExit::Signaled(SIGSYS));
             assert_eq!(
                 started.process().wait(Duration::ZERO).expect("wait again"),

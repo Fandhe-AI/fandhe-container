@@ -193,7 +193,7 @@ fn nd_yaml(version: &str, top: &str, dev: &str) -> String {
 fn gpu1_cdi_version_acceptance_range_for_net_devices() {
     use CdiSpecErrorCode::{InvalidArgument, Unimplemented};
     let none = |v: &str| format!("cdiVersion: \"{v}\"\nkind: v/c\n");
-    for v in ["0.3.0", "0.7.0", "1.1.0", "1"] {
+    for v in ["0.3.0", "0.7.0", "1.1.0"] {
         assert!(parse_cdi_spec(&none(v)).is_ok(), "{v}");
     }
     assert!(parse_cdi_spec(&nd_yaml("0.7.0", "[]", "[]")).is_ok());
@@ -204,7 +204,8 @@ fn gpu1_cdi_version_acceptance_range_for_net_devices() {
         ("1.0.0", InvalidArgument),
         ("1.1.0", Unimplemented),
         ("v1.1.0", Unimplemented),
-        ("1.2.0", Unimplemented),
+        // 上流 version.go L99-108 と同じく未知の版は無効（#2597）。
+        ("1.2.0", InvalidArgument),
         ("abc", InvalidArgument),
         ("1.1", InvalidArgument),
         ("1.1.0-rc1", InvalidArgument),

@@ -4,19 +4,34 @@
 //! デシリアライズするだけの層で、`fandhe-container-gpu` の他モジュール（TASK-126.2 の集計、
 //! TASK-126.3 の usr-merge パス正規化、TASK-127 以降の edits 適用）から入力として使われる。
 //!
-//! フィールド集合は CDI v0.7.0 のもの（GPU-1）に、v1.1.0 で追加された `containerEdits.netDevices` を加えたもの。
-//! v1.1.0 の `intelRdt` の変更（`schemata`・`enableMonitoring` の追加、`enableCMT`・`enableMBM` の削除）は
-//! 未対応で、未知フィールドとして拒否する（#2445。出典は cncf-tags/container-device-interface v1.1.1
-//! `cb98bcf66dc68530012483bd56e33e14d815e167` の `SPEC.md` の版の表と `specs-go/version.go`）。
+//! フィールド集合は CDI v1.1.x のもの（GPU-1）。v1.1.0 で `containerEdits.netDevices` と `intelRdt` の
+//! `schemata`・`enableMonitoring` が追加され、`enableCMT`・`enableMBM` が削除された。
+//!
+//! `cdiVersion` の検証（#2597・GPU-1・REPAIR-3）: 出典は cncf-tags/container-device-interface v1.1.1
+//! `cb98bcf66dc68530012483bd56e33e14d815e167` の `specs-go/version.go`（L25-62 の既知の版、L64-81 `ValidateVersion`、
+//! L92-95 `newVersion`、L110-118 `requiredVersion`、L131-256 各要件）・`specs-go/config.go` L67-73・`pkg/cdi/spec.go` の
+//! `ParseSpec`（`KnownFields(true)`）・`SPEC.md` L20-42, L193。上流と判定を揃え、上流より厳しくも緩くもしない。
+//! - 受ける版は 0.3.0・0.4.0・0.5.0・0.6.0・0.7.0・0.8.0・1.0.0・1.1.0 の 8 個だけ。先頭の `v` は 1 つだけ許し、
+//!   外した後の文字列が完全一致するときだけ受ける（`01.1.0`・`1.1`・`1.1.0-rc1`・空文字は不一致）。0.1.0・0.2.0 は
+//!   上流でも最小の版の既定（0.3.0）未満で必ず失敗するため拒否する。未知の版（1.1.1・1.2.0・2.0.0 など新しい版を含む）は
+//!   `InvalidArgument`（fail-closed。`Unimplemented` は「有効だが未適用」の意味なので使わない）。
+//! - フィールドごとの最小の版（新しい版から順に見て最初に当てはまったもの。宣言された版がそれより古ければ `InvalidArgument`）:
+//!   1.1.0 = `intelRdt.schemata`（空の列も含む）・`intelRdt.enableMonitoring: true`・`netDevices` 非空 /
+//!   0.7.0 = `intelRdt`・`additionalGids` 非空 / 0.6.0 = `annotations` 非空・`kind` の class に `.` /
+//!   0.5.0 = デバイス名の先頭が数字・`deviceNodes[].hostPath` が空でない / 0.4.0 = `mounts[].type` が空でない /
+//!   0.3.0 = 上記のどれにも当てはまらない場合。空文字・false は「無い」と同じ扱い（Go のゼロ値と同じ）。
+//! - `intelRdt`: v1.1.0 の `schemata`・`enableMonitoring` を受ける。`enableCMT`・`enableMBM` は上流 v1.1.x の
+//!   `IntelRdt` に無く、`ParseSpec` が宣言された版に関係なく未知フィールドとして拒否するため、本実装も
+//!   `InvalidArgument`（`CDI spec has an unknown field`。行・列つき）で拒否する。v0.7.0 の旧い綴りを書いた spec は
+//!   版に関係なく拒否される（REPAIR-3。版で分ける規則は上流に無いので採らない）。値（schemata の文字列）の意味は検証しない。
 //!
 //! netDevices（#2445・GPU-1・REPAIR-3）: ホストのネットワークインターフェースをコンテナの netns へ移す編集で、
 //! 適用は net crate の責務でありまだ無い。そのため型付きで解析・検証した上で、1 件でもあれば
 //! [`parse_cdi_spec`] が `Unimplemented` で spec 全体を拒否する（要求されないデバイスにだけあっても拒否する）。
-//! `cdiVersion` の形式検査は行わない原則の唯一の例外として、`netDevices` が非空のときだけ 1.1.0 以上を要求する。
 //!
 //! 責務境界（将来仕様。REPAIR-3）:
 //! - 本モジュールは構文・型・未知フィールド・重複キー・資源上限の検査までを行う。
-//!   `cdiVersion` / `kind` / `name` の形式検査、パスの絶対性、`hookName` の許可値などの意味検証は行わない
+//!   `kind` / `name` の形式検査（最小の版の判定に要る分解だけは行う）、パスの絶対性、`hookName` の許可値などの意味検証は行わない
 //!   （TASK-126.2 以降・TASK-127 の責務）。値は保持するだけで、パスやコマンドの組み立てはしない。
 //! - `/var/run/cdi` の所有者・権限の検証、ディレクトリ走査、名前から spec への解決は後続タスクで扱う。解決済みの
 //!   (spec, 名前) の列の集計は `cdi_edits::aggregate_container_edits_across_specs`（TASK-126.2・GPU-1）が担う。
@@ -185,11 +200,11 @@ impl fmt::Debug for EnvList {
     }
 }
 
-/// CDI spec のトップレベル（CDI v0.7.0 のフィールド集合。GPU-1）。
+/// CDI spec のトップレベル（CDI v1.1.x のフィールド集合。GPU-1）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CdiSpec {
-    /// `cdiVersion`（値の検証は TASK-126.2 以降）。
+    /// `cdiVersion`（[`parse_cdi_spec`] が既知の版と、使っているフィールドに対する最小の版を検証する。モジュール doc 参照）。
     pub cdi_version: String,
     /// `kind`（`vendor/class`。形式検査は TASK-126.2 以降）。
     pub kind: String,
@@ -324,7 +339,11 @@ pub struct Mount {
     pub r#type: Option<String>,
 }
 
-/// Intel RDT 設定。
+/// Intel RDT 設定（CDI v1.1.x のフィールド集合。GPU-1・REPAIR-3）。
+///
+/// v0.7.0 の `enableCMT`・`enableMBM` は v1.1.0 で削除された。上流 v1.1.x の `ParseSpec` は宣言された版に関係なく
+/// 未知フィールドとして拒否するため、本実装も同じく `InvalidArgument`（unknown field）で拒否する
+/// （版で分ける規則は上流に無いので採らない。出典は module doc）。
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct IntelRdt {
@@ -337,12 +356,12 @@ pub struct IntelRdt {
     /// メモリ帯域スキーマ。
     #[serde(default)]
     pub mem_bw_schema: Option<String>,
-    /// CMT の有効化。
-    #[serde(default, rename = "enableCMT")]
-    pub enable_cmt: Option<bool>,
-    /// MBM の有効化。
-    #[serde(default, rename = "enableMBM")]
-    pub enable_mbm: Option<bool>,
+    /// スキーマ文字列の列（CDI v1.1.0 で追加。空の列でも 1.1.0 を要求する）。
+    #[serde(default)]
+    pub schemata: Option<Vec<String>>,
+    /// モニタリングの有効化（CDI v1.1.0 で追加。`true` のとき 1.1.0 を要求する）。
+    #[serde(default)]
+    pub enable_monitoring: Option<bool>,
 }
 
 /// `serde-saphyr` のエラーを、入力内容を含まない固定文言の [`CdiSpecError`] へ写す。
@@ -389,13 +408,15 @@ fn classify(err: &serde_saphyr::Error) -> CdiSpecError {
 /// 入力長が [`CDI_SPEC_MAX_INPUT_BYTES`] を超えれば `ResourceExhausted`。`Budget` を明示し、
 /// 重複キー・マージキーは拒否する。パニックしない。
 ///
-/// `netDevices`（トップレベル・デバイスのいずれか）が 1 件以上あるときは、次の順で検査する（#2445・GPU-1）。
-/// 1. `cdiVersion` が 1.1.0 以上でなければ `InvalidArgument`
+/// 構文の検査に続けて、次の順で検査する（#2445・#2597・GPU-1）。
+/// 1. `cdiVersion` が既知の版でない、または使っているフィールドの最小の版（`netDevices` なら 1.1.0）より古ければ
+///    `InvalidArgument`（モジュール doc 参照）
 /// 2. 各 `containerEdits` の名前（15 バイト以下・`.` `..` `/` `:` 空白 NUL 不可。`fandhe-container-net` の
 ///    `IfName::new` と同じ規則）と、1 つの edits 内の `hostInterfaceName`・`name` の重複を検査し `InvalidArgument`
 /// 3. 検査を通っても適用が未実装のため `Unimplemented`（spec 単位。REPAIR-3）
 ///
-/// 1・2 は逆シリアライズ後の検査のため、エラーの行・列は `None`。`netDevices: []` は無いものと同じ扱い。
+/// 2・3 は `netDevices` が 1 件以上あるときだけ行う。1・2 は逆シリアライズ後の検査のため、エラーの行・列は `None`。
+/// `netDevices: []` は無いものと同じ扱い。
 /// 適用（net crate）が実装されたら 3 を外し、公開 API から netDevices を返す（将来仕様）。
 pub fn parse_cdi_spec(input: &str) -> Result<CdiSpec, CdiSpecError> {
     let spec = parse_cdi_spec_unchecked(input)?;
@@ -406,6 +427,7 @@ pub fn parse_cdi_spec(input: &str) -> Result<CdiSpec, CdiSpecError> {
 /// 構造・名前・版の検査までを行い、適用可否のゲートは掛けない解析（集計の内部試験用）。
 pub(crate) fn parse_cdi_spec_unchecked(input: &str) -> Result<CdiSpec, CdiSpecError> {
     let spec = parse_structure(input)?;
+    validate_cdi_version(&spec)?;
     validate_net_devices(&spec)?;
     Ok(spec)
 }
@@ -431,22 +453,147 @@ pub(crate) fn net_devices_unimplemented() -> CdiSpecError {
     )
 }
 
-/// `cdiVersion` を (major, minor, patch) へ解く。先頭の `v` は 1 つだけ許し、3 要素の ASCII 数字（各 9 桁以下）のみ。
-fn parse_cdi_version(raw: &str) -> Option<(u32, u32, u32)> {
-    let body = raw.strip_prefix('v').unwrap_or(raw);
-    let mut parts = body.split('.');
-    let mut next = || -> Option<u32> {
-        let p = parts.next()?;
-        if p.is_empty() || p.len() > 9 || !p.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        p.parse().ok()
-    };
-    let v = (next()?, next()?, next()?);
-    if parts.next().is_some() {
-        return None;
+/// 受ける `cdiVersion` の最新（上流の `CurrentVersion`。GPU-1）。
+pub const CDI_SPEC_LATEST_SUPPORTED_VERSION: &str = "1.1.0";
+
+/// 受ける `cdiVersion`（GPU-1・REPAIR-3）。既知の版だけを表し、壊れた版・未知の版は作れない。
+///
+/// 上流 `specs-go/version.go` の既知の版のうち、最小の版の既定（0.3.0）未満の 0.1.0・0.2.0 を除いた 8 個。
+/// `Ord` は版の新旧の順で、フィールドごとの最小の版との比較に使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CdiSpecVersion {
+    V0_3_0,
+    V0_4_0,
+    V0_5_0,
+    V0_6_0,
+    V0_7_0,
+    V0_8_0,
+    V1_0_0,
+    V1_1_0,
+}
+
+impl CdiSpecVersion {
+    /// 先頭の `v` を 1 つだけ外し、既知の版の文字列との完全一致でのみ作る（上流 `newVersion` と同じ。数値解釈はしない）。
+    pub(crate) fn from_raw(raw: &str) -> Option<Self> {
+        let body = raw.strip_prefix('v').unwrap_or(raw);
+        Some(match body {
+            "0.3.0" => Self::V0_3_0,
+            "0.4.0" => Self::V0_4_0,
+            "0.5.0" => Self::V0_5_0,
+            "0.6.0" => Self::V0_6_0,
+            "0.7.0" => Self::V0_7_0,
+            "0.8.0" => Self::V0_8_0,
+            "1.0.0" => Self::V1_0_0,
+            "1.1.0" => Self::V1_1_0,
+            _ => return None,
+        })
     }
-    Some(v)
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::V0_3_0 => "0.3.0",
+            Self::V0_4_0 => "0.4.0",
+            Self::V0_5_0 => "0.5.0",
+            Self::V0_6_0 => "0.6.0",
+            Self::V0_7_0 => "0.7.0",
+            Self::V0_8_0 => "0.8.0",
+            Self::V1_0_0 => "1.0.0",
+            Self::V1_1_0 => "1.1.0",
+        }
+    }
+}
+
+/// 全 `containerEdits`（トップレベル、続けて各デバイス）。
+fn all_edits(spec: &CdiSpec) -> impl Iterator<Item = &ContainerEdits> + Clone {
+    std::iter::once(&spec.container_edits).chain(spec.devices.iter().map(|d| &d.container_edits))
+}
+
+/// 使っているフィールドから求めた最小の版と、その理由（固定の語彙）。新しい版から順に見て最初に当てはまったもの
+/// （上流 `requiredVersion`。`specs-go/version.go` L110-118、各要件は L131-256）。どれにも当てはまらなければ 0.3.0。
+/// 空文字・false は「無い」と同じ扱い（Go のゼロ値と同じ）。
+fn required_version(spec: &CdiSpec) -> (CdiSpecVersion, &'static str) {
+    let edits = || all_edits(spec);
+    // 1.1.0（L131-156）。
+    if edits().any(|e| e.intel_rdt.as_ref().is_some_and(|r| r.schemata.is_some())) {
+        return (CdiSpecVersion::V1_1_0, "intelRdt schemata");
+    }
+    if edits().any(|e| {
+        e.intel_rdt
+            .as_ref()
+            .is_some_and(|r| r.enable_monitoring == Some(true))
+    }) {
+        return (CdiSpecVersion::V1_1_0, "intelRdt enableMonitoring");
+    }
+    if edits().any(|e| !e.net_devices.is_empty()) {
+        return (CdiSpecVersion::V1_1_0, "netDevices");
+    }
+    // 1.0.0・0.8.0 は spec への変更が無い。
+    // 0.7.0。
+    if edits().any(|e| e.intel_rdt.is_some()) {
+        return (CdiSpecVersion::V0_7_0, "intelRdt");
+    }
+    if edits().any(|e| !e.additional_gids.is_empty()) {
+        return (CdiSpecVersion::V0_7_0, "additionalGids");
+    }
+    // 0.6.0。
+    if !spec.annotations.is_empty() || spec.devices.iter().any(|d| !d.annotations.is_empty()) {
+        return (CdiSpecVersion::V0_6_0, "annotations");
+    }
+    if spec
+        .kind
+        .split_once('/')
+        .is_some_and(|(_, class)| class.contains('.'))
+    {
+        return (CdiSpecVersion::V0_6_0, "kind class containing '.'");
+    }
+    // 0.5.0。
+    if spec
+        .devices
+        .iter()
+        .any(|d| d.name.as_bytes().first().is_some_and(u8::is_ascii_digit))
+    {
+        return (CdiSpecVersion::V0_5_0, "device name starting with a digit");
+    }
+    if edits().any(|e| {
+        e.device_nodes
+            .iter()
+            .any(|n| n.host_path.as_deref().is_some_and(|h| !h.is_empty()))
+    }) {
+        return (CdiSpecVersion::V0_5_0, "deviceNodes hostPath");
+    }
+    // 0.4.0。
+    if edits().any(|e| {
+        e.mounts
+            .iter()
+            .any(|m| m.r#type.as_deref().is_some_and(|t| !t.is_empty()))
+    }) {
+        return (CdiSpecVersion::V0_4_0, "mounts type");
+    }
+    (CdiSpecVersion::V0_3_0, "default")
+}
+
+/// `cdiVersion` を検証する（GPU-1・REPAIR-3）。未知の版・0.3.0 未満・使っているフィールドに対して古すぎる版は
+/// `InvalidArgument`（fail-closed）。メッセージは固定文言で、入力の値を載せない。
+///
+/// `parse_cdi_spec` が呼ぶほか、parse を通らずに作られた [`CdiSpec`] に備えて `cdi_edits` の集計も呼ぶ。
+pub(crate) fn validate_cdi_version(spec: &CdiSpec) -> Result<(), CdiSpecError> {
+    let Some(declared) = CdiSpecVersion::from_raw(&spec.cdi_version) else {
+        return Err(CdiSpecError::new(
+            CdiSpecErrorCode::InvalidArgument,
+            "CDI spec has an unsupported cdiVersion (supported: 0.3.0 to 1.1.0; earliest supported 0.3.0)",
+        ));
+    };
+    let (required, feature) = required_version(spec);
+    if declared < required {
+        return Err(CdiSpecError::new(
+            CdiSpecErrorCode::InvalidArgument,
+            &format!(
+                "CDI {feature} requires cdiVersion {} or later",
+                required.as_str()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// インターフェース名の検証。`fandhe-container-net` の `IfName::new`（カーネルの `dev_valid_name` 相当）と
@@ -463,25 +610,7 @@ fn is_valid_interface_name(name: &str) -> bool {
 }
 
 fn validate_net_devices(spec: &CdiSpec) -> Result<(), CdiSpecError> {
-    let all = std::iter::once(&spec.container_edits)
-        .chain(spec.devices.iter().map(|d| &d.container_edits));
-    let mut has_any = false;
-    for edits in all.clone() {
-        if !edits.net_devices.is_empty() {
-            has_any = true;
-        }
-    }
-    if !has_any {
-        return Ok(());
-    }
-    let version_ok = parse_cdi_version(&spec.cdi_version).is_some_and(|v| v >= (1, 1, 0));
-    if !version_ok {
-        return Err(CdiSpecError::new(
-            CdiSpecErrorCode::InvalidArgument,
-            "CDI netDevices requires cdiVersion 1.1.0 or later",
-        ));
-    }
-    for edits in all {
+    for edits in all_edits(spec) {
         let mut hosts: BTreeSet<&str> = BTreeSet::new();
         let mut names: BTreeSet<&str> = BTreeSet::new();
         for nd in &edits.net_devices {
@@ -868,10 +997,10 @@ containerEdits:
     #[test]
     fn gpu1_rejects_unknown_fields() {
         let cases = [
-            "cdiVersion: '1'\nkind: a/b\nbogus: 1\n",
-            "cdiVersion: '1'\nkind: a/b\ndevices:\n  - name: x\n    bogus: 1\n    containerEdits: {}\n",
-            "cdiVersion: '1'\nkind: a/b\ncontainerEdits:\n  bogus: 1\n",
-            "cdiVersion: '1'\nkind: a/b\ncontainerEdits:\n  mounts:\n    - hostPath: /a\n      containerPath: /b\n      bogus: 1\n",
+            "cdiVersion: '0.7.0'\nkind: a/b\nbogus: 1\n",
+            "cdiVersion: '0.7.0'\nkind: a/b\ndevices:\n  - name: x\n    bogus: 1\n    containerEdits: {}\n",
+            "cdiVersion: '0.7.0'\nkind: a/b\ncontainerEdits:\n  bogus: 1\n",
+            "cdiVersion: '0.7.0'\nkind: a/b\ncontainerEdits:\n  mounts:\n    - hostPath: /a\n      containerPath: /b\n      bogus: 1\n",
         ];
         for c in cases {
             assert_eq!(code_of(c), CdiSpecErrorCode::InvalidArgument, "{c}");
@@ -885,12 +1014,12 @@ containerEdits:
             "",
             "kind: [unclosed\n",
             "cdiVersion: \"abc\nkind: x\n",
-            "cdiVersion: '1'\n",
-            "cdiVersion: '1'\nkind: a/b\ndevices:\n  - containerEdits: {}\n",
-            "cdiVersion: '1'\nkind: a/b\ndevices:\n  - name: x\n",
-            "cdiVersion: '1'\nkind: a/b\ncontainerEdits:\n  deviceNodes:\n    - path: /d\n      major: x\n",
-            "cdiVersion: '1'\nkind: a/b\nkind: c/d\n",
-            "cdiVersion: '1'\nkind: a/b\nannotations:\n  <<: {}\n",
+            "cdiVersion: '0.7.0'\n",
+            "cdiVersion: '0.7.0'\nkind: a/b\ndevices:\n  - containerEdits: {}\n",
+            "cdiVersion: '0.7.0'\nkind: a/b\ndevices:\n  - name: x\n",
+            "cdiVersion: '0.7.0'\nkind: a/b\ncontainerEdits:\n  deviceNodes:\n    - path: /d\n      major: x\n",
+            "cdiVersion: '0.7.0'\nkind: a/b\nkind: c/d\n",
+            "cdiVersion: '0.7.0'\nkind: a/b\nannotations:\n  <<: {}\n",
         ];
         for c in cases {
             let e = parse_cdi_spec(c).unwrap_err();
@@ -902,14 +1031,14 @@ containerEdits:
     #[test]
     fn gpu1_resource_limits() {
         let big = format!(
-            "cdiVersion: '1'\nkind: a/b\n# {}\n",
+            "cdiVersion: '0.7.0'\nkind: a/b\n# {}\n",
             "x".repeat(CDI_SPEC_MAX_INPUT_BYTES)
         );
         assert_eq!(code_of(&big), CdiSpecErrorCode::ResourceExhausted);
 
         // 構文的に完結し、スキーマにも適合する入力でノード数上限（CDI_SPEC_MAX_NODES）を超える。
         // 深さは未知フィールド・型不一致が先に検出されるため、別経路（ノード数・エイリアス）で上限を確認する。
-        let mut many = String::from("cdiVersion: '1'\nkind: a/b\ndevices:\n");
+        let mut many = String::from("cdiVersion: '0.7.0'\nkind: a/b\ndevices:\n");
         for _ in 0..30_000 {
             many.push_str("- {name: a, containerEdits: {}}\n");
         }
@@ -917,27 +1046,37 @@ containerEdits:
         assert_eq!(code_of(&many), CdiSpecErrorCode::ResourceExhausted);
 
         // 構文的に完結し、スキーマにも適合する入力でエイリアス数上限（CDI_SPEC_MAX_ALIASES）を超える。
-        let mut aliases = String::from("cdiVersion: '1'\nkind: a/b\nannotations:\n  k0: &a v\n");
+        let mut aliases =
+            String::from("cdiVersion: '0.7.0'\nkind: a/b\nannotations:\n  k0: &a v\n");
         for i in 1..=(CDI_SPEC_MAX_ALIASES + 8) {
             aliases.push_str(&format!("  k{i}: *a\n"));
         }
         assert_eq!(code_of(&aliases), CdiSpecErrorCode::ResourceExhausted);
     }
 
-    /// GPU-1: IntelRdt は CDI の綴り enableCMT / enableMBM を読む。
+    /// GPU-1・REPAIR-3: IntelRdt は v1.1.x の綴り schemata / enableMonitoring を読み、旧い enableCMT / enableMBM は
+    /// 宣言された版に関係なく未知フィールドとして拒否する（上流 v1.1.x と同じ）。
     #[test]
     fn gpu1_intel_rdt_field_names() {
-        let y = "cdiVersion: '1'\nkind: a/b\ncontainerEdits:\n  intelRdt:\n    closID: c1\n    enableCMT: true\n    enableMBM: false\n";
+        let y = "cdiVersion: '1.1.0'\nkind: a/b\ncontainerEdits:\n  intelRdt:\n    closID: c1\n    schemata: [\"L3:0=f\"]\n    enableMonitoring: true\n";
         let r = parse_cdi_spec(y)
             .unwrap()
             .container_edits
             .intel_rdt
             .unwrap();
         assert_eq!(r.clos_id.as_deref(), Some("c1"));
-        assert_eq!(r.enable_cmt, Some(true));
-        assert_eq!(r.enable_mbm, Some(false));
-        let bad = "cdiVersion: '1'\nkind: a/b\ncontainerEdits:\n  intelRdt:\n    enableCmt: true\n";
-        assert_eq!(code_of(bad), CdiSpecErrorCode::InvalidArgument);
+        assert_eq!(r.schemata, Some(vec!["L3:0=f".to_string()]));
+        assert_eq!(r.enable_monitoring, Some(true));
+        for v in ["0.7.0", "1.1.0"] {
+            for key in ["enableCMT", "enableMBM", "enableCmt", "enablemonitoring"] {
+                let bad = format!(
+                    "cdiVersion: '{v}'\nkind: a/b\ncontainerEdits:\n  intelRdt:\n    {key}: true\n"
+                );
+                let e = parse_cdi_spec(&bad).unwrap_err();
+                assert_eq!(e.code(), CdiSpecErrorCode::InvalidArgument, "{v} {key}");
+                assert_eq!(e.message(), "CDI spec has an unknown field", "{v} {key}");
+            }
+        }
     }
 
     /// GPU-1: env の値はエラー message と Debug に出ない。
@@ -947,7 +1086,7 @@ containerEdits:
         assert!(!format!("{s:?}").contains(SECRET));
 
         let bad = format!(
-            "cdiVersion: '1'\nkind: a/b\ncontainerEdits:\n  env: [\"T={SECRET}\"]\n  bogus: 1\n"
+            "cdiVersion: '0.7.0'\nkind: a/b\ncontainerEdits:\n  env: [\"T={SECRET}\"]\n  bogus: 1\n"
         );
         let e = parse_cdi_spec(&bad).unwrap_err();
         assert!(!e.message().contains(SECRET));
@@ -1141,19 +1280,26 @@ containerEdits:
 
     #[test]
     fn gpu1_cdi_version_parsing() {
-        assert_eq!(parse_cdi_version("1.1.0"), Some((1, 1, 0)));
-        assert_eq!(parse_cdi_version("v1.2.3"), Some((1, 2, 3)));
+        use CdiSpecVersion as V;
+        assert_eq!(V::from_raw("1.1.0"), Some(V::V1_1_0));
+        assert_eq!(V::from_raw("v0.3.0"), Some(V::V0_3_0));
         for bad in [
             "",
             "abc",
+            "1",
             "1.1",
             "1.1.0-rc1",
+            "1.1.0+x",
             "vv1.1.0",
             "1.1.0.0",
-            "1..0",
-            "1.1.9999999999",
+            "01.1.0",
+            "0.1.0",
+            "0.2.0",
+            "1.1.1",
+            "1.2.0",
+            "2.0.0",
         ] {
-            assert_eq!(parse_cdi_version(bad), None, "{bad}");
+            assert_eq!(V::from_raw(bad), None, "{bad}");
         }
     }
 }

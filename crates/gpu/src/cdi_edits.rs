@@ -32,6 +32,10 @@
 //! （TASK-126.3）、パスの組み立て・hooks の実行（TASK-127）は行わない。値は文字列のまま保持する。
 //! エラーの `message` は固定文言で、`env` の値などの内容を含めない。
 //!
+//! `cdiVersion`（GPU-1・REPAIR-3）: 参照された spec ごとに、集計の前（存在確認・曖昧名の判定より先）に
+//! [`crate::cdi_spec`] の版の検査を行い、未知の版や使っているフィールドに足りない版は `InvalidArgument`。
+//! parse を通らずに作られた `CdiSpec` への備えで、parse 側と同じ検査を共有する。
+//!
 //! 資源上限（`AGENTS.md`「リソース上限」・`coding-rust.md`）: 要求デバイス名は spec とは別経路の外部入力
 //! （CLI 引数・CRI のデバイス指定など）で、[`crate::cdi_spec::parse_cdi_spec`] の入力上限が及ばない。
 //! そのため件数（[`CDI_EDITS_MAX_REQUESTED_DEVICES`]）と各名前の長さ（[`CDI_EDITS_MAX_DEVICE_NAME_BYTES`]）を、
@@ -46,7 +50,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cdi_spec::{
     CdiSpec, CdiSpecError, CdiSpecErrorCode, ContainerEdits, DeviceNode, EnvList, Hook, IntelRdt,
-    Mount, NetDevice, net_devices_unimplemented,
+    Mount, NetDevice, net_devices_unimplemented, validate_cdi_version,
 };
 
 /// 1 回の集計で要求できるデバイス名の最大件数（重複を除く前の件数で数える）。
@@ -348,6 +352,14 @@ pub fn aggregate_container_edits_across_specs(
 /// `CdiSpec` は全フィールドが公開で `parse_cdi_spec` を通らずに作れるため、parse 側のゲートとは別に置く。
 /// 衝突する `netDevices` は `InvalidArgument` が先に返る。
 fn aggregate_requests(requests: &[CdiDeviceRequest<'_>]) -> Result<AggregatedEdits, CdiSpecError> {
+    // parse を通らずに作られた spec に備え、参照される spec ごとに 1 回 cdiVersion を検査する（GPU-1・REPAIR-3）。
+    // 存在確認・曖昧名の判定より先に行う。
+    let mut checked: BTreeSet<*const CdiSpec> = BTreeSet::new();
+    for req in requests {
+        if checked.insert(std::ptr::from_ref(req.spec)) {
+            validate_cdi_version(req.spec)?;
+        }
+    }
     let aggregated = aggregate_requests_ungated(requests)?;
     if !aggregated.net_devices.is_empty() {
         return Err(net_devices_unimplemented());
@@ -482,7 +494,7 @@ mod tests {
 
     fn two_part(dev: &str, top: &str) -> CdiSpec {
         spec(&format!(
-            "cdiVersion: '0.5.0'\nkind: v/c\ndevices:\n  - name: a\n    containerEdits:\n      {dev}\ncontainerEdits:\n  {top}\n"
+            "cdiVersion: '0.7.0'\nkind: v/c\ndevices:\n  - name: a\n    containerEdits:\n      {dev}\ncontainerEdits:\n  {top}\n"
         ))
     }
 

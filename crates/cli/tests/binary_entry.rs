@@ -1630,6 +1630,36 @@ fn sup7_logs_follow_spans_rotation() {
     drop(sink);
 }
 
+/// CLI-1・SUP-7・#2605: `--follow` は、書き手（sink）が生きている間は状態が `Running` でなくても終わらず、
+/// sink の終了（最終 flush とロックの解放）後に、未 flush だった行も含めて出し切って 0 で終わる（期限より前）。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup7_logs_follow_ends_when_container_stopped() {
+    use fandhe_container_supervisor::logs::{LogSink as _, StreamKind};
+    let tmp = TmpDir::new("followstop");
+    let root = create_two_containers(&tmp);
+    let sink = open_container_log_sink(&root, "c1");
+    let started = Instant::now();
+    let mut f = FollowChild::spawn(&root, 20_000);
+    let mut expect: Vec<u8> = b"stdout hello c1\n".to_vec();
+    f.wait_len(expect.len(), Duration::from_secs(30));
+    // 記録は Created（Running ではない）だが、書き手が生きているので終わらない。
+    f.assert_quiet(Duration::from_millis(1000));
+    assert!(f.child.try_wait().expect("try_wait").is_none());
+    // flush しない追記。sink の drop（最終 flush）の後に出し切られる。
+    sink.append(StreamKind::Stdout, b"tail").expect("append");
+    expect.extend_from_slice(b"stdout tail\n");
+    drop(sink);
+    let status = f.wait_exit(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0));
+    while let Ok(chunk) = f.rx.recv_timeout(Duration::from_secs(5)) {
+        f.got.extend_from_slice(&chunk);
+    }
+    assert_eq!(f.got, expect);
+    assert_eq!(f.stderr_text(), "");
+    assert!(started.elapsed() < Duration::from_secs(19));
+}
+
 /// REPAIR-5・#2447: `--follow` は SIGINT で終わる（シグナル終了・stderr は空で、それまでの行は stdout に届いている）。
 #[cfg(target_os = "linux")]
 #[test]

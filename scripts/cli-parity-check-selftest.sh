@@ -129,7 +129,23 @@ case "$cmd" in
       esac
     done
     [ -n "$bundle" ] && [ "$n" -eq 1 ] && valid_id "$id" || bad ;;
-  start | stop | logs)
+  logs)
+    # 製品 CLI の logs の引数規則（--tail は 0..1000000 の整数・--stream は stdout|stderr・--follow と --escape（短縮形は無い） は 1 回まで）。
+    follow=0; escape=0; tail_seen=0; stream_seen=0; n=0; id=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --tail) [ $# -ge 2 ] && [ "$tail_seen" = 0 ] || bad; tail_seen=1
+          [[ "$2" =~ ^[0-9]{1,7}$ ]] && [ "$((10#$2))" -le 1000000 ] || bad; shift 2 ;;
+        --stream) [ $# -ge 2 ] && [ "$stream_seen" = 0 ] || bad; stream_seen=1
+          case "$2" in stdout | stderr) ;; *) bad ;; esac; shift 2 ;;
+        --follow) [ "$follow" = 0 ] || bad; follow=1; shift ;;
+        --escape) [ "$escape" = 0 ] || bad; escape=1; shift ;;
+        -*) bad ;;
+        *) id="$1"; n=$((n + 1)); shift ;;
+      esac
+    done
+    [ "$n" -eq 1 ] && valid_id "$id" || bad ;;
+  start | stop)
     [ $# -eq 1 ] && valid_id "$1" && [ "${1#-}" = "$1" ] || bad; id="$1" ;;
   delete)
     force=0; n=0
@@ -325,9 +341,9 @@ done
 # --- capture: 具体値 ---
 count=0
 while IFS= read -r l; do
-  case "$l" in [AB][0-9][0-9]"$tab"*) count=$((count + 1)) ;; esac
+  case "$l" in [ABD][0-9][0-9]"$tab"*) count=$((count + 1)) ;; esac
 done <"$work/ok.txt"
-expect_eq "capture records 33 cases" 33 "$count"
+expect_eq "capture records 40 cases" 40 "$count"
 expect_line "A02 usage error" ok "A02${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "B01 empty list" ok "B01${tab}B${tab}0${tab}-${tab}list:H"
 expect_line "B03 list after create" ok "B03${tab}B${tab}0${tab}-${tab}list:H;c1,created,-"
@@ -346,9 +362,14 @@ while IFS= read -r l; do
   loc_n=$((loc_n + 1))
   [ "$l" = "C" ] || loc_bad=$((loc_bad + 1))
 done <"$work/locale.txt"
-expect_eq "lcall stub invocations" 33 "$loc_n"
+expect_eq "lcall stub invocations" 40 "$loc_n"
 expect_eq "lcall stub got LC_ALL other than C" 0 "$loc_bad"
 expect_line "B15 missing state root" ok "B15${tab}B${tab}3${tab}NOT_FOUND${tab}-"
+expect_line "D01 tail without value" ok "D01${tab}D${tab}2${tab}INVALID_ARGUMENT${tab}-"
+expect_line "D03 tail over the limit" ok "D03${tab}D${tab}2${tab}INVALID_ARGUMENT${tab}-"
+expect_line "D05 duplicate follow" ok "D05${tab}D${tab}2${tab}INVALID_ARGUMENT${tab}-"
+expect_line "D06 short form is rejected" ok "D06${tab}D${tab}2${tab}INVALID_ARGUMENT${tab}-"
+expect_line "D24 follow on a missing container" ok "D24${tab}D${tab}3${tab}NOT_FOUND${tab}-"
 {
   IFS= read -r meta1
   IFS= read -r meta2
@@ -422,6 +443,7 @@ compare ok ok
 expect_rc "compare identical is rc 0" 0 $?
 cmp_has "layer A summary" 'layer A (syntax): match=18 mismatch=0 missing=0'
 cmp_has "layer B summary" 'layer B (behavior): match=15 mismatch=0 missing=0'
+cmp_has "layer D summary" 'layer D (logs options): match=7 mismatch=0 missing=0'
 compare ok lcall
 expect_rc "compare ok vs lcall is rc 0" 0 $?
 cmp_has "lcall layer A summary" 'layer A (syntax): match=18 mismatch=0 missing=0'

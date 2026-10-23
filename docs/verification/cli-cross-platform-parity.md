@@ -178,7 +178,7 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 
 ## D 層: logs のオプション（`--follow`・`--tail`・`--stream`・`--escape`。#2447・CLI-1・SUP-7）
 
-`scripts/cli-parity-check.sh` は本層を自動収集しない（`--follow` は期限まで終わらないため。A 層への取り込みは後続）。手動で実行し、結果欄だけを記入する。3 OS で同じなのは構文（D 層の構文ケース）で、読み出しの挙動は Linux だけが実装済み・確認済みである（非 Linux は plugin 経由で、TASK-114・TASK-125 待ち。`logs` の入口は plugin 解決の失敗で fail-closed）。出力の意味は `list_logs` module の doc を正とする（オプションなしはバイトのまま。`--escape` は `cat -v` と同じ表で本体だけ変換）。
+`scripts/cli-parity-check.sh` は本層のうち、速く決定的に終わる D01〜D05・D06（`-f` のみ）・D24 の 7 件を自動収集する（#2605。層の文字 `D`。`compare` の集計に `layer D (logs options)` が出る）。手動で実行し結果欄を記入するのは D06 の `-n 1` と D20〜D23・D25・D26 である。手動に残す理由は、書き手が作ったログのレコードが前提になること、`--follow` が期限（24 時間）やシグナルまで終わらないこと、試験専用 feature の期限の上書きが本番バイナリでは使えないことによる。これらの挙動は `crates/cli/tests/binary_entry.rs` の結合試験で機械照合している。3 OS で同じなのは構文（D 層の構文ケース）で、読み出しの挙動は Linux だけが実装済み・確認済みである（非 Linux は plugin 経由で、TASK-114・TASK-125 待ち。`logs` の入口は plugin 解決の失敗で fail-closed）。出力の意味は `list_logs` module の doc を正とする（オプションなしはバイトのまま。`--escape` は `cat -v` と同じ表で本体だけ変換）。
 
 ### D 層の構文ケース（3 OS で 2 / `INVALID_ARGUMENT` を期待）
 
@@ -186,7 +186,7 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | -- | ---- | ---- | ----- | ----- | ------- | ---- | ---- |
 | D01 | `logs --tail`（値欠落） | 2 / `INVALID_ARGUMENT` | | | | | |
 | D02 | `logs --tail x c1` | 2 / `INVALID_ARGUMENT` | | | | | 10 進数字以外（`-1`・`+5`・`all` を含む） |
-| D03 | `logs --tail 1000001 c1` | 2 / `INVALID_ARGUMENT` | | | | | 上限は 1,000,000（オーナー確認待ち） |
+| D03 | `logs --tail 1000001 c1` | 2 / `INVALID_ARGUMENT` | | | | | 上限は 1,000,000（値はオーナー確認待ち。#2605） |
 | D04 | `logs --stream bogus c1` | 2 / `INVALID_ARGUMENT` | | | | | 値は `stdout` / `stderr` のみ |
 | D05 | `logs --follow --follow c1`（重複） | 2 / `INVALID_ARGUMENT` | | | | | `--tail`・`--stream`・`--escape` の重複も同じ |
 | D06 | `logs -f c1` / `logs -n 1 c1`（短縮形） | 2 / `INVALID_ARGUMENT` | | | | | 長い形だけを受ける |
@@ -202,7 +202,10 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | D22 | `logs --stream stderr c1` | 0 / `stderr b<ESC>[1m` のみ（タグを残す） | | 前提未達 | 前提未達 | | コンテナの stderr は CLI の stderr へ流さない |
 | D23 | `logs --escape --stream stderr c1` | 0 / `stderr b^[[1m` | | 前提未達 | 前提未達 | | |
 | D24 | `logs --follow nonexist` | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 待たずに終わる |
-| D25 | `logs --follow c1` の実行中に追記し、Ctrl-C（SIGINT） | シグナル終了・stderr 空・それまでの行は stdout に届く | | 前提未達 | 前提未達 | | 期限は組み込みの 24 時間。ローテーションをまたいでも欠落・重複なし（結合試験で確認） |
+| D25 | `logs --follow c1` の実行中に追記し、Ctrl-C（SIGINT） | シグナル終了・stderr 空・それまでの行は stdout に届く | | 前提未達 | 前提未達 | | 期限は組み込みの 24 時間（値はオーナー確認待ち。#2605）。ローテーションをまたいでも欠落・重複なし（結合試験で確認） |
+| D26 | `start` 済みの c1 に対し `logs --follow c1` を実行中に `stop c1` | 残りを出し切って 0 で終わる（stderr 空） | | 前提未達 | 前提未達 | | 書き手の終了（ログのロックの解放）と状態が `Running` でないことの両方で終える。restart ポリシーの再起動の間は終わらない。結合試験 `sup7_logs_follow_ends_when_container_stopped` が書き手の終了を模擬して機械照合。実機の確認は人間（#2605） |
+
+追従の遅延は、LF で終わる行について最大で 1 ポーリング間隔（200 ms）と読み出しの時間で、短縮はしない（`list_logs` module の doc）。世代数 1 の設定の追従は 9 / `UNAVAILABLE` で拒否する（本番は固定の 3 世代で到達しない）。
 
 ## 差異のフィードバック先
 

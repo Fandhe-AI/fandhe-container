@@ -653,6 +653,9 @@ fn retry_transient<T>(
     }
 }
 
+/// [`acquire_lock`] の `WouldBlock` に対する再試行方針（読み手の共有ロックの検査との競合の吸収用。10ms × 4 回）。
+const LOCK_RETRY: RenameRetry = RenameRetry::DEFAULT;
+
 /// ロックファイル名の接尾辞（`<base>.lock`。世代番号は数字のみのため世代ファイルと衝突しない）。
 const LOCK_SUFFIX: &str = ".lock";
 
@@ -689,7 +692,19 @@ fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
             }
         })?,
     };
-    match file.try_lock() {
+    // 読み手の稼働検査（[`sink_is_active`]）が一瞬だけ共有ロックを持つことがあるため、`WouldBlock` は
+    // 有界で再試行して吸収する（合計 40ms 程度。REPAIR-5）。本物の sink が使用中なら、尽きたあと従来どおり拒否する。
+    let mut sleeps_left = LOCK_RETRY.max_sleeps;
+    let locked = loop {
+        match file.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) if sleeps_left > 0 => {
+                sleeps_left -= 1;
+                std::thread::sleep(LOCK_RETRY.interval);
+            }
+            r => break r,
+        }
+    };
+    match locked {
         Ok(()) => {
             // ロックを取れた実体が、いまのパスの実体と同じであることを確かめる（unix）。別の掃除が
             // 取得の前後でロックファイルを消し、別の sink が作り直していた場合、孤立した inode の
@@ -701,6 +716,37 @@ fn acquire_lock(dir: &Path, base: &str) -> Result<File, TraitError> {
             ErrorCode::FailedPrecondition,
             "log is in use by another sink",
         )),
+        Err(std::fs::TryLockError::Error(_)) => Err(internal("log lock failed")),
+    }
+}
+
+/// `id` のログに書き手（[`RotatingFileSink`]）がいるかを、ロックファイルの共有ロックの試行で調べる
+/// （`logs --follow` の終了判定から呼ばれる。CLI-1・SUP-7）。
+///
+/// sink は終了時に残りを flush して close し、その後でロックが解放される。そのため「ロックが取れた（誰も
+/// 保持していない）」なら、以後ログに追記は来ない。ロックファイルは作らず、書き込みも削除もしない。無ければ
+/// 書き手なし（`false`）。種別違反（symlink・FIFO 等）は [`open_existing_regular_read`] のエラーのまま返す
+/// （fail-closed）。共有ロックは検査の間だけ持ち、直ちに解放する（sink の open 側は [`LOCK_RETRY`] で吸収する）。
+/// 戻り値のエラーはパス・errno を含まない固定文言（ERR-1）。
+#[cfg(unix)]
+pub(crate) fn sink_is_active(dir: &Path, id: &ContainerId) -> Result<bool, TraitError> {
+    // ログディレクトリがまだ無い（書き手の起動前・delete 後）なら書き手なし。
+    if matches!(fs::symlink_metadata(dir), Err(e) if e.kind() == ErrorKind::NotFound) {
+        return Ok(false);
+    }
+    let dir = check_dir(dir)?;
+    let base = format!("{}.log", encode_file_stem(id.as_str()));
+    let file = match open_existing_regular_read(&lock_path(&dir, &base), false) {
+        Ok(f) => f,
+        Err(e) if e.code() == ErrorCode::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    match file.try_lock_shared() {
+        Ok(()) => {
+            let _ = file.unlock();
+            Ok(false)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
         Err(std::fs::TryLockError::Error(_)) => Err(internal("log lock failed")),
     }
 }

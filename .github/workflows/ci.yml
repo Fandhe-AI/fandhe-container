@@ -62,6 +62,21 @@ on:
           - step-timeout
           - script-deadline
         default: none
+      repeat-package:
+        description: >-
+          repeat-test と組で指定する Cargo パッケージ名（例: fandhe-container-supervisor）。間欠失敗の修正後に
+          1 つの lib 試験を repeat-count 回繰り返して失敗 0 を示す（REPAIR-12・#2538）。空なら実行しない。
+          PR・push では存在しない
+        type: string
+        default: ''
+      repeat-test:
+        description: 繰り返す lib 試験の完全名（例 start_entry::tests::sup_repair5_2008_full_queue_does_not_block）
+        type: string
+        default: ''
+      repeat-count:
+        description: 繰り返し回数（1〜1000）
+        type: string
+        default: '300'
   pull_request:
   push:
     branches: [main]
@@ -457,6 +472,17 @@ jobs:
         shell: bash
         timeout-minutes: 10
         run: make doc
+      # 指定した lib 試験の繰り返し（workflow_dispatch の repeat-* 入力があるときだけ。REPAIR-12・#2538）。
+      # 入力は env 経由で渡し、run 内で式を展開しない（スクリプトインジェクション対策）。既存ジョブのステップ
+      - name: 指定した試験の繰り返し（workflow_dispatch のみ）
+        if: github.event_name == 'workflow_dispatch' && inputs.repeat-test != ''
+        shell: bash
+        timeout-minutes: 30
+        env:
+          PACKAGE: ${{ inputs.repeat-package }}
+          TEST: ${{ inputs.repeat-test }}
+          COUNT: ${{ inputs.repeat-count }}
+        run: make repeat-test
       # core の plugin 無効構成（--no-default-features）の検証（PLUG-3・TASK-111.1・#262）。
       # 新ジョブは必須チェック名が増えるため既存ジョブへのステップとして追加する。
       - name: core plugin 無効構成の検証
@@ -816,6 +842,13 @@ jobs:
         if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make check-launch-target-selftest
+
+      # 試験の繰り返し実行スクリプトの自己テスト（REPAIR-12・#2538）。スタブの cargo だけを使う。
+      # 既存ジョブのステップ（check-run 件数は不変）
+      - name: 試験の繰り返し実行スクリプトの自己テスト（#2538・REPAIR-12。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make repeat-test-selftest
 
       - name: AppArmor の非特権 user namespace 制限を緩和（unshare_isolation 用・Linux のみ。CORE-1・SEC-5）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'

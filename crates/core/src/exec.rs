@@ -1566,6 +1566,15 @@ pub fn plan_rootless_subordinate(
     )
 }
 
+/// 呼び出し元が `sys::fork_single_threaded` で fork した子 `pid` を、期限つきで待って回収する(REPAIR-5)。
+///
+/// `oci_runtime::image_rootfs` が subuid 所有の木を userns の中で消す子の回収に使う(SEC-5・#2540)。
+/// 期限を超えたら未回収に限り `SIGKILL` して回収し `Timeout`。`ContainerChild` の構築は `exec` の外へ
+/// 公開しない(任意の pid からハンドルを作れる入口を増やさない)ため、この関数が窓口になる。
+pub(crate) fn wait_forked_child(pid: u32, timeout: Duration) -> Result<ChildExit, ExecError> {
+    ContainerChild::spawned(pid).wait_timeout(timeout)
+}
+
 /// 同期チャネルの入出力エラーを写す（タイムアウトは `Timeout`、その他は `Internal`）。
 fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
     let code = match e.kind() {

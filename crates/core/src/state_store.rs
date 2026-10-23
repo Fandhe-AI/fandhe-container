@@ -110,9 +110,9 @@ use crate::rlimits::{Rlimit, RlimitKind, Rlimits};
 use crate::traits::{
     Annotations, CgroupPlacement, CgroupScope, ContainerId, ContainerState, ContainerStatus,
     CreateStateRequest, DeleteStateRequest, DeleteStateResponse, ErrorCode, ExplicitStop,
-    GetStateRequest, HealthStatus, ImageRootfsRecord, ListStateRequest, StateList, StateListCursor,
-    StateRecord, StateRevision, StateStore, SupervisionState, TerminationReason, TraitError,
-    UpdateStateRequest,
+    GetStateRequest, HealthStatus, ImageRootfsOwnership, ImageRootfsRecord, ListStateRequest,
+    StateList, StateListCursor, StateRecord, StateRevision, StateStore, SupervisionState,
+    TerminationReason, TraitError, UpdateStateRequest,
 };
 
 /// 各コンテナの状態ファイル名（OCI-5）。
@@ -1724,6 +1724,9 @@ struct ImageRootfsDto {
     /// 作成世代の所有トークン。キー欠落（旧記録）は `None` で、delete は消さない（fail-closed）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
+    /// 木の所有者の種別。`"subordinate"` のみ（キー欠落はホストの ID）。不明な値は破損（SEC-5・#2540）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ownership: Option<String>,
 }
 
 /// `state.json` の launch 時の分離の記録（`launchIsolation`）。
@@ -2088,6 +2091,12 @@ impl StateDto {
                     dev: r.identity().0,
                     ino: r.identity().1,
                     token: r.token().map(str::to_owned),
+                    ownership: match r.ownership() {
+                        ImageRootfsOwnership::SubordinateIds => {
+                            Some(ImageRootfsOwnership::SUBORDINATE_TEXT.to_owned())
+                        }
+                        _ => None,
+                    },
                 }),
             },
             explicit_stop: record.explicit_stop() == ExplicitStop::Recorded,
@@ -2182,9 +2191,16 @@ impl StateDto {
             Some(dto) => {
                 let rec = ImageRootfsRecord::new(PathBuf::from(dto.path), dto.dev, dto.ino)
                     .map_err(|_| corrupted())?;
-                Some(match dto.token {
+                let rec = match dto.token {
                     None => rec,
                     Some(t) => rec.with_token(t).map_err(|_| corrupted())?,
+                };
+                Some(match dto.ownership.as_deref() {
+                    None => rec,
+                    Some(ImageRootfsOwnership::SUBORDINATE_TEXT) => {
+                        rec.with_subordinate_ownership()
+                    }
+                    Some(_) => return Err(corrupted()),
                 })
             }
         };
@@ -3666,6 +3682,49 @@ mod tests {
             let e = store.get(&GetStateRequest::new(cid(id))).unwrap_err();
             assert_eq!(e.code().as_str(), "INTERNAL", "{id}");
         }
+    }
+
+    /// OCI-5・SEC-5・#2540: `imageRootfs.ownership` は `subordinate` だけを書き・読み、キー欠落はホストの ID、
+    /// 不明な値は破損として拒否する。
+    #[test]
+    fn sec5_image_rootfs_ownership_round_trips_and_rejects_unknown() {
+        let t = TmpDir::new("imgrootown");
+        let store = t.open();
+        let req = CreateStateRequest::new(
+            ContainerStatus::created(cid("own"), None),
+            PathBuf::from("/b"),
+        )
+        .unwrap()
+        .with_image_rootfs(image_rootfs_rec("p/rootfs", 1, 2).with_subordinate_ownership());
+        store.create(&req).unwrap();
+        let got = store.get(&GetStateRequest::new(cid("own"))).unwrap();
+        assert_eq!(
+            got.image_rootfs().map(|r| r.ownership()),
+            Some(ImageRootfsOwnership::SubordinateIds)
+        );
+        let text = fs::read_to_string(t.path().join("own").join("state.json")).unwrap();
+        assert!(text.contains("\"ownership\":\"subordinate\""), "{text}");
+
+        create(&store, "host");
+        let body = serde_json::json!({
+            "ociVersion": "1.2.0", "id": "host", "status": "stopped", "bundle": "/b", "revision": 10,
+            "imageRootfs": {"path": "p/rootfs", "dev": 1, "ino": 2},
+        });
+        fs::write(t.path().join("host").join("state.json"), body.to_string()).unwrap();
+        let got = store.get(&GetStateRequest::new(cid("host"))).unwrap();
+        assert_eq!(
+            got.image_rootfs().map(|r| r.ownership()),
+            Some(ImageRootfsOwnership::HostIds)
+        );
+
+        create(&store, "bad");
+        let body = serde_json::json!({
+            "ociVersion": "1.2.0", "id": "bad", "status": "stopped", "bundle": "/b", "revision": 10,
+            "imageRootfs": {"path": "p/rootfs", "dev": 1, "ino": 2, "ownership": "root"},
+        });
+        fs::write(t.path().join("bad").join("state.json"), body.to_string()).unwrap();
+        let e = store.get(&GetStateRequest::new(cid("bad"))).unwrap_err();
+        assert_eq!(e.code().as_str(), "INTERNAL");
     }
 
     fn stopped_status(rec: &StateRecord) -> ContainerStatus {

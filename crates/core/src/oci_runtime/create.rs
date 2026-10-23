@@ -51,8 +51,10 @@
 //! 展開先を固定できないため、展開開始前（作成の前）に `Unimplemented` で拒否し、何も作らない（fail-closed）。
 //! create の途中でプロセスが落ちて残った展開途中の木（非公開の名前）は、持ち主のいない（OS ロックが取れる）
 //! ものだけを次の create の時点と `reap_stale_unpacks` が回収する（#2379・OCI-7。`image_rootfs` のモジュール doc）。
-//! 公開済みで状態の無い rootfs は回収せず、次の同じ bundle の create は `AlreadyExists` で止まる
-//! （fail-closed。利用者のデータを消さない）。公開した rootfs は状態レコードに記録し
+//! 公開済みで状態の無い rootfs（公開後・状態作成前のクラッシュ、delete の後始末の失敗、状態の喪失）は、
+//! 展開先を作る前に孤児と確かめられたときだけ回収する（印 v2・`flock`・状態の全件照合。確かめられなければ
+//! `AlreadyExists` で止まる fail-closed。利用者のデータを消さない。#2540・`image_rootfs` のモジュール doc）。
+//! 公開した rootfs を状態作成まで保持するのは、生きている create を孤児と区別するため。公開した rootfs は状態レコードに記録し
 //! （`StateRecord::image_rootfs`）、delete が状態削除の成功後に消す（所有・タイミング・失敗時の扱いは
 //! `docs/design/image-rootfs-lifetime.md`。OCI-7・OCI-5・#2378）。delete は bundle 自体は消さない。
 //! 展開器なしの [`create_with_image`] は従来どおり、bundle の rootfs が展開済みの前提で動く。
@@ -77,16 +79,17 @@ use super::config::{OciConfig, OciConfigError, load_config};
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::image_refs::{ContainerImage, ImageRefRegistration};
 use super::image_rootfs::{
-    CreatedRootfs, ImageRootfsUnpacker, StagingReclamation, prepare_rootfs_target_with,
+    CreatedRootfs, ImageRootfsPrivilege, ImageRootfsUnpacker, prepare_rootfs_target_with,
+    reap_published_orphan, record_staging_reclamation,
 };
 use super::launch::BundleLock;
 use super::mount_destination::audit_mount_config_error;
 use super::resources::LinuxResourceLimits;
 use crate::audit_log::AuditSink;
-use crate::observability::{OpName, OpOutcome, OpRecorder};
+use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
     ContainerId, ContainerStatus, CreateRequest, CreateStateRequest, ErrorCode, GetStateRequest,
-    ImageRootfsRecord, StateRecord, StateStore, TraitError,
+    ImageRootfsOwnership, ImageRootfsRecord, StateRecord, StateStore, TraitError,
 };
 
 /// bundle 直下の設定ファイル名（OCI Runtime Spec）。
@@ -103,7 +106,6 @@ const IMAGE_REF_BIND_OP_NAME: &str = "image_ref_bind";
 /// レイヤー展開と、失敗時の展開途中 rootfs の削除の操作名（REPAIR-4・#2342）。
 const IMAGE_ROOTFS_UNPACK_OP_NAME: &str = "image_rootfs_unpack";
 const IMAGE_ROOTFS_CLEANUP_OP_NAME: &str = "image_rootfs_cleanup";
-const IMAGE_ROOTFS_REAP_OP_NAME: &str = "image_rootfs_reap";
 
 /// `config.json` を検証し、プロセス未起動の「created」状態を `store` に作る。
 ///
@@ -306,6 +308,10 @@ fn create_with_image_inner(
     // 展開器なしは、検証より前に bundle のロックを取り状態作成まで保持する（検証の後に delete が rootfs を消して
     // 完了する隙を作らない。通常の `create` と同じ順。OCI-7・SEC-1）。展開器ありは展開後・状態作成の前に取る。
     let mut early_guard: Option<Option<BundleLock>> = None;
+    // 公開済みの rootfs は、状態を作り終えるまで保持する。木の `flock` を状態作成まで残し、公開後・状態作成前の
+    // 生きている create を、孤児の回収（`reap_published_orphan`）が「持ち主あり」と見分けられるようにする
+    // （`flock` は inode に掛かり、公開の改名の後も残る。#2540・OCI-7）。
+    let mut held_rootfs: Option<CreatedRootfs> = None;
     let image_rootfs = match image.unpacker() {
         None => {
             match lock_for_create(req.bundle()) {
@@ -325,7 +331,14 @@ fn create_with_image_inner(
             // 公開済みの rootfs を状態へ記録する（delete が消す印）。記録を作れない失敗は公開後の失敗と同じ扱い
             // （rootfs は残し、参照だけ外す）。
             Ok(created) => match created.record() {
-                Ok(record) => Some(record),
+                Ok(record) => {
+                    held_rootfs = Some(created);
+                    // subuid 所有の木は、delete が userns の中で消すよう記録に残す（SEC-5・#2540）。
+                    Some(match image.rootfs_privilege().ownership() {
+                        ImageRootfsOwnership::SubordinateIds => record.with_subordinate_ownership(),
+                        _ => record,
+                    })
+                }
                 Err(e) => {
                     rollback_image_ref(recorder, image, req);
                     return Err(e);
@@ -351,6 +364,7 @@ fn create_with_image_inner(
     };
     let created_state = create_state(store, req, image_rootfs);
     drop(guard);
+    drop(held_rootfs);
     match created_state {
         Ok(record) => {
             // 参照を状態作成まで済んだものとして確定する。delete は確定済みの参照だけを外すので、状態作成前に止まった
@@ -411,16 +425,28 @@ fn unpack_rootfs(
             "container state already exists",
         ));
     }
+    // 公開済みで状態の無い rootfs（公開後・状態作成前のクラッシュ、delete の後始末の失敗、状態の喪失）が
+    // あれば、孤児と確かめられたときだけ先に回収する。確かめられなければ残し、下の作成が `AlreadyExists`
+    // で拒否する（利用者のデータへ展開しない。#2540・OCI-7）。
+    let privilege = image.rootfs_privilege();
+    let _ = reap_published_orphan(
+        store,
+        recorder,
+        req.bundle(),
+        config.root().path(),
+        privilege,
+    );
     // Linux は非公開の名前で展開し、成功後に最終の名前へ公開する（展開中は `root.path` が存在せず、
     // 並行する別の create は rootfs を使用中として成功できない。展開途中の失敗の後始末は他から参照されない
     // 非公開の rootfs だけを消す）。Linux 以外は作成の前に Unimplemented で拒否する。
     // 回収の実処理は計測区間で包み、後続の作成が失敗しても結果と所要時間を記録する（REPAIR-4）。
-    let mut created = prepare_rootfs_target_with(req.bundle(), config.root().path(), &|reap| {
-        let started = std::time::Instant::now();
-        let reclamation = reap();
-        record_staging_reclamation(recorder, &reclamation, started.elapsed());
-        reclamation
-    })?;
+    let mut created =
+        prepare_rootfs_target_with(req.bundle(), config.root().path(), privilege, &|reap| {
+            let started = std::time::Instant::now();
+            let reclamation = reap();
+            record_staging_reclamation(recorder, &reclamation, started.elapsed());
+            reclamation
+        })?;
     let unpack_name = OpName::new(IMAGE_ROOTFS_UNPACK_OP_NAME)?;
     // 展開器へは固定した rootfs を指す経路を渡す（作成後の bundle 内の差し替えで bundle 外へ書かせない。SEC-1）。
     let unpack_path = created.unpack_path();
@@ -428,19 +454,19 @@ fn unpack_rootfs(
         unpacker.unpack(image.manifest(), &unpack_path)
     });
     if let Err(e) = unpacked {
-        remove_created_rootfs(recorder, created);
+        remove_created_rootfs(recorder, created, privilege);
         return Err(e);
     }
     // 公開前に所有トークンの印を書く（delete が作成世代を照合する。OCI-7・#2378）。失敗は公開前なので消す。
     if let Err(e) = created.seal() {
-        remove_created_rootfs(recorder, created);
+        remove_created_rootfs(recorder, created, privilege);
         return Err(e);
     }
     if let Err(e) = created.publish() {
         // 改名前の失敗だけ非公開の木を消す。改名後の検証失敗は公開済みで、並行する create が使いうるため
         // 残す（OCI-7 の使用中 rootfs の保持。#854 の起動時照合・手動で回収する）。
         if !created.is_published() {
-            remove_created_rootfs(recorder, created);
+            remove_created_rootfs(recorder, created, privilege);
         }
         return Err(e);
     }
@@ -475,32 +501,14 @@ fn same_dir_path(a: &Path, b: &Path) -> bool {
     normal(a) == normal(b)
 }
 
-/// 作成の前に回収した、持ち主のいない展開途中の木（#2379・OCI-7）を `image_rootfs_reap` として、実際の
-/// 回収に要した時間つきで記録する（REPAIR-4）。何も無ければ記録しない。消せなかった・確かめられなかった・
-/// 打ち切った・走査に失敗したものがあれば失敗として記録する（create 自体は失敗させない。残した木は余分に
-/// 持つだけの安全側）。
-fn record_staging_reclamation(
-    recorder: &OpRecorder,
-    reclamation: &StagingReclamation,
-    elapsed: std::time::Duration,
-) {
-    if !reclamation.is_noteworthy() {
-        return;
-    }
-    if let Ok(name) = OpName::new(IMAGE_ROOTFS_REAP_OP_NAME) {
-        let outcome = if reclamation.is_incomplete() {
-            OpOutcome::Failure
-        } else {
-            OpOutcome::Success
-        };
-        let _ = recorder.record(&name, outcome, elapsed);
-    }
-}
-
 /// 作った rootfs を消す。失敗は握りつぶさず `image_rootfs_cleanup` として記録し、元のエラーを優先させる。
-fn remove_created_rootfs(recorder: &OpRecorder, created: CreatedRootfs) {
+fn remove_created_rootfs(
+    recorder: &OpRecorder,
+    created: CreatedRootfs,
+    privilege: &ImageRootfsPrivilege,
+) {
     if let Ok(name) = OpName::new(IMAGE_ROOTFS_CLEANUP_OP_NAME) {
-        let _ = recorder.record_op(&name, || created.remove());
+        let _ = recorder.record_op(&name, || created.remove_with(privilege));
     }
 }
 

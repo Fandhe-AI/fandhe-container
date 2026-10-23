@@ -82,6 +82,9 @@ CLI の表面・3 OS の parity スクリプトへの波及を避けるため。
 
 入力が bundle と `root.path` で、参照テーブルは bundle を持たないため、参照の回収と同じ契機では呼べない。同じ bundle への次の create
 （`prepare_rootfs_target_with`）では既に呼ばれている。状態ルート全体の掃引は状態レコード・bundle の列挙が要るため本 issue の範囲外とする。
+公開済みで状態の無い rootfs（孤児）も同じ bundle への次の create が回収する（#2540）。孤児は状態レコードを持たないので
+`StateStore::list` でも参照テーブルでも bundle を列挙できず、状態ルート全体の掃引は行わない。契機の決定は
+[image-rootfs-lifetime.md](image-rootfs-lifetime.md) の決定 E を参照。
 
 ## 制約・未実装（実装済みを装わない。REPAIR-3）
 

@@ -265,6 +265,14 @@ name = "rootless_file_owner"
 path = "tests/rootless_file_owner.rs"
 harness = false
 
+# rootless の userns 展開が作る subuid 所有の rootfs の木の回収・削除の結合試験（OCI-7・SEC-5・CORE-6・#2540）。
+# 上と同じ理由で harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+# uidmap（setuid の newuidmap / newgidmap）と自分の subuid / subgid の行が要る。
+[[test]]
+name = "rootless_image_rootfs_remove"
+path = "tests/rootless_image_rootfs_remove.rs"
+harness = false
+
 # rootless での OCI Runtime ライフサイクル（create → start → kill）の結合試験と既知課題の記録
 # （CORE-6・SEC-5・TASK-40.4）。CLONE_NEWUSER のため単一スレッドの main が要り harness = false。
 # `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。Landlock ABI 6 以上（Linux 6.12 以上）が要る（#2012）。

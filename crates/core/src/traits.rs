@@ -38,9 +38,9 @@ pub use network_plugin::{
 pub use state_store::{
     ANNOTATION_MAX_KEY_BYTES, ANNOTATIONS_MAX_ENTRIES, ANNOTATIONS_MAX_TOTAL_BYTES, Annotations,
     CgroupPlacement, CgroupScope, CreateStateRequest, DeleteStateRequest, DeleteStateResponse,
-    ExplicitStop, GetStateRequest, HealthStatus, ImageRootfsRecord, ListStateRequest,
-    MAX_CGROUP_SCOPE_BYTES, MAX_CURSOR_LEN, MAX_PAGE_SIZE, StateList, StateListCursor, StateRecord,
-    StateRevision, StateStore, SupervisionState, UpdateStateRequest,
+    ExplicitStop, GetStateRequest, HealthStatus, ImageRootfsOwnership, ImageRootfsRecord,
+    ListStateRequest, MAX_CGROUP_SCOPE_BYTES, MAX_CURSOR_LEN, MAX_PAGE_SIZE, StateList,
+    StateListCursor, StateRecord, StateRevision, StateStore, SupervisionState, UpdateStateRequest,
 };
 pub use types::{ContainerId, ErrorCode, TRAIT_ERROR_MESSAGE_MAX_BYTES, TraitError};
 pub use volume_provider::{

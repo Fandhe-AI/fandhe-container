@@ -69,7 +69,10 @@ pub use config::{
 pub use create::{
     create, create_audited, create_with_image, create_with_image_audited, load_resource_limits,
 };
-pub use delete::{CgroupRemoval, ContainerCgroupRemover, delete, delete_releasing_image_ref};
+pub use delete::{
+    CgroupRemoval, ContainerCgroupRemover, DeleteOptions, delete, delete_releasing_image_ref,
+    delete_releasing_image_ref_with_options, delete_with_options,
+};
 pub use error::{
     LifecycleOp, OCI_ERROR_MESSAGE_MAX_BYTES, OCI_EXIT_ALREADY_EXISTS,
     OCI_EXIT_FAILED_PRECONDITION, OCI_EXIT_INTERNAL, OCI_EXIT_INVALID_ARGUMENT, OCI_EXIT_NOT_FOUND,
@@ -81,7 +84,8 @@ pub use image_refs::{
     ImageRefRegistration, ImageRefRelease,
 };
 pub use image_rootfs::{
-    ImageRootfsUnpacked, ImageRootfsUnpacker, StagingReclamation, reap_stale_unpacks,
+    ImageRootfsPrivilege, ImageRootfsUnpacked, ImageRootfsUnpacker, ReapOptions,
+    StagingReclamation, UnverifiedReason, reap_stale_unpacks, reap_stale_unpacks_with,
 };
 pub use kill::{KillTimeout, ProcessSignaler, kill};
 #[cfg(target_os = "linux")]

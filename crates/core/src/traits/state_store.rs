@@ -499,6 +499,27 @@ pub struct ImageRootfsRecord {
     /// 作成世代を区別する所有トークン（小文字 16 進 32 文字）。rootfs 内の印のファイルと照合する。
     /// `None`（旧記録）の rootfs は delete が消さない（fail-closed。inode の再利用による誤削除を防ぐ）。
     token: Option<String>,
+    /// 木の所有者の種別（既定はホストの実効 ID。subuid 所有なら delete が userns の中で消す。SEC-5・#2540）。
+    ownership: ImageRootfsOwnership,
+}
+
+/// core が作った rootfs の木の所有者の種別（OCI-7・SEC-5・#2540）。
+///
+/// rootless で userns の中の展開器が作った木は、ホストの実効 uid では `chmod`・`unlink` が `EPERM` になる
+/// subuid 所有の inode を含む。delete がどの権限経路で消すかを、記録から決めるための印。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ImageRootfsOwnership {
+    /// ホストの実効 ID 所有（既定。キー欠落の旧記録もこれ）。
+    #[default]
+    HostIds,
+    /// subuid / subgid の範囲の ID が混ざる（userns の中で消す必要がある）。
+    SubordinateIds,
+}
+
+impl ImageRootfsOwnership {
+    /// `state.json` の `imageRootfs.ownership` の値（`HostIds` は書かない）。
+    pub const SUBORDINATE_TEXT: &'static str = "subordinate";
 }
 
 impl ImageRootfsRecord {
@@ -541,7 +562,19 @@ impl ImageRootfsRecord {
             dev,
             ino,
             token: None,
+            ownership: ImageRootfsOwnership::HostIds,
         })
+    }
+
+    /// 木の所有者を subuid / subgid の範囲の ID を含むものとして記録する（SEC-5・#2540）。
+    pub fn with_subordinate_ownership(mut self) -> Self {
+        self.ownership = ImageRootfsOwnership::SubordinateIds;
+        self
+    }
+
+    /// 木の所有者の種別（旧記録は `HostIds`）。
+    pub fn ownership(&self) -> ImageRootfsOwnership {
+        self.ownership
     }
 
     /// 作成世代を区別する所有トークンを付ける（OCI-7・#2378。小文字 16 進 32 文字だけを受ける）。

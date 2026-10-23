@@ -158,7 +158,9 @@
 
 use super::error::{LifecycleOp, OciRuntimeError};
 use super::image_refs::ContainerImageRefs;
-use super::image_rootfs::{RecordedRootfsRemoval, remove_recorded_rootfs};
+use super::image_rootfs::{
+    ImageRootfsPrivilege, RecordedRootfsRemoval, remove_recorded_rootfs_with,
+};
 use super::launch::BundleLock;
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
@@ -259,6 +261,32 @@ pub trait ContainerCgroupRemover: Send + Sync {
     }
 }
 
+/// [`delete_with_options`] の設定（将来の拡張に備え非網羅。#2540）。
+///
+/// 既定は従来の挙動（core が作った rootfs の木をホストの実効 ID で消す）。
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct DeleteOptions {
+    rootfs_privilege: ImageRootfsPrivilege,
+}
+
+impl DeleteOptions {
+    /// 既定の設定。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// core が作った rootfs の木を消す権限を指定する（SEC-5・#2540）。
+    ///
+    /// 状態レコードの `imageRootfs.ownership` が `subordinate`（rootless の userns 展開で subuid 所有の
+    /// inode を含む）のコンテナは、`SubordinateIds` でないと消せない。権限が無いとき、delete は状態を消した
+    /// うえで木を残し、`image_rootfs_remove` の失敗として記録する。
+    pub fn with_rootfs_privilege(mut self, privilege: ImageRootfsPrivilege) -> Self {
+        self.rootfs_privilege = privilege;
+        self
+    }
+}
+
 /// 停止済みまたは未起動のコンテナの cgroup と状態記録を削除する。
 ///
 /// 状態の確認後、`cgroups` で cgroup を削除してから状態記録を削除する（順序の根拠はモジュール doc）。
@@ -282,11 +310,22 @@ pub fn delete(
     cgroups: &dyn ContainerCgroupRemover,
     req: &DeleteRequest,
 ) -> Result<DeleteResponse, OciRuntimeError> {
+    delete_with_options(store, recorder, cgroups, req, &DeleteOptions::default())
+}
+
+/// [`delete`] に、core が作った rootfs の削除の権限（[`DeleteOptions`]）を指定したもの（#2540・SEC-5）。
+pub fn delete_with_options(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    cgroups: &dyn ContainerCgroupRemover,
+    req: &DeleteRequest,
+    options: &DeleteOptions,
+) -> Result<DeleteResponse, OciRuntimeError> {
     // 変換は最上位 1 か所のみ。内部関数は `TraitError` のまま（波及最小）。
     let to_err = |e: TraitError| OciRuntimeError::from_trait_error(LifecycleOp::Delete, e);
     let name = OpName::new(DELETE_OP_NAME).map_err(to_err)?;
     recorder.record_op(&name, || {
-        delete_inner(store, recorder, cgroups, req).map_err(to_err)
+        delete_inner(store, recorder, cgroups, req, options).map_err(to_err)
     })
 }
 
@@ -301,7 +340,26 @@ pub fn delete_releasing_image_ref(
     refs: &dyn ContainerImageRefs,
     req: &DeleteRequest,
 ) -> Result<DeleteResponse, OciRuntimeError> {
-    let response = delete(store, recorder, cgroups, req)?;
+    delete_releasing_image_ref_with_options(
+        store,
+        recorder,
+        cgroups,
+        refs,
+        req,
+        &DeleteOptions::default(),
+    )
+}
+
+/// [`delete_releasing_image_ref`] に、[`DeleteOptions`] を指定したもの（#2540・SEC-5）。
+pub fn delete_releasing_image_ref_with_options(
+    store: &dyn StateStore,
+    recorder: &OpRecorder,
+    cgroups: &dyn ContainerCgroupRemover,
+    refs: &dyn ContainerImageRefs,
+    req: &DeleteRequest,
+    options: &DeleteOptions,
+) -> Result<DeleteResponse, OciRuntimeError> {
+    let response = delete_with_options(store, recorder, cgroups, req, options)?;
     // 状態の削除後に、先に登録世代を読み、そのあとで状態が無いことを確かめる（この順序が要点）。
     // 確定済みの登録は、外されるまで同じ ID の他の create が登録できないので、状態が無い時点で読んだ
     // 確定済みの世代は、削除したコンテナ（または既に消えた別のコンテナ）のものである。読んだ後に状態が
@@ -331,6 +389,7 @@ fn delete_inner(
     recorder: &OpRecorder,
     cgroups: &dyn ContainerCgroupRemover,
     req: &DeleteRequest,
+    options: &DeleteOptions,
 ) -> Result<DeleteResponse, TraitError> {
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     check_deletable(&record, req.force())?;
@@ -378,7 +437,12 @@ fn delete_inner(
     match store.delete(&delete_req) {
         Ok(_) => {
             // 状態を消した実際の revision のレコード（関数の先頭で読んだもの）に付いた記録だけを使う。
-            remove_core_created_rootfs(recorder, &record, rootfs_lock.as_ref());
+            remove_core_created_rootfs(
+                recorder,
+                &record,
+                rootfs_lock.as_ref(),
+                &options.rootfs_privilege,
+            );
             Ok(DeleteResponse::new())
         }
         Err(e) if e.code() == ErrorCode::FailedPrecondition => {
@@ -411,6 +475,7 @@ fn remove_core_created_rootfs(
     recorder: &OpRecorder,
     record: &StateRecord,
     lock: Option<&Result<BundleLock, TraitError>>,
+    privilege: &ImageRootfsPrivilege,
 ) {
     let Some(rec) = record.image_rootfs() else {
         return;
@@ -419,7 +484,7 @@ fn remove_core_created_rootfs(
         return;
     };
     let _ = recorder.record_op(&name, || match lock {
-        Some(Ok(_held)) => remove_recorded_rootfs(record.bundle(), rec),
+        Some(Ok(_held)) => remove_recorded_rootfs_with(record.bundle(), rec, privilege),
         Some(Err(e)) if e.code() == ErrorCode::NotFound => Ok(RecordedRootfsRemoval::NotPresent),
         Some(Err(e)) => Err(TraitError::new(
             e.code(),

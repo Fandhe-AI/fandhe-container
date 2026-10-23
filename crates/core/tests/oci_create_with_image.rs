@@ -543,3 +543,193 @@ fn oci7_delete_failure_before_state_removal_keeps_rootfs() {
     assert!(sb.rootfs().join("bin").join("true").is_file());
     assert_eq!(rootfs_remove_counts(&rec), (0, 0));
 }
+// ---- 公開済みで状態の無い rootfs（孤児）の回収（#2540・OCI-7）----
+
+/// 記録つきで `create_with_image` を呼ぶ（要求は呼び出し側が組む）。
+fn run_recorded(
+    store: &dyn StateStore,
+    refs: &Refs,
+    rec: &OpRecorder,
+    req: &CreateRequest,
+) -> Result<StateRecord, fandhe_container_core::oci_runtime::OciRuntimeError> {
+    let manifest = ImageManifestDigest::new(MANIFEST).expect("digest");
+    create_with_image(
+        store,
+        rec,
+        ContainerImage::new(refs, &manifest).with_unpacker(&Unpacker { fail: false }),
+        req,
+    )
+}
+
+/// `image_rootfs_orphan_reap` の (成功件数, 失敗件数)。
+fn orphan_reap_counts(rec: &OpRecorder) -> (u64, u64) {
+    let name = OpName::new("image_rootfs_orphan_reap").expect("name");
+    rec.snapshot_op(&name)
+        .map_or((0, 0), |s| (s.success(), s.failure()))
+}
+
+/// 状態の喪失を模す（状態ディレクトリごと消す。rootfs は残る）。
+fn lose_state(sb: &Sandbox) {
+    std::fs::remove_dir_all(sb.dir.join("state").join("c1")).expect("lose state");
+}
+
+const MARKER_NAME: &str = ".fandhe-container-rootfs-owner";
+
+fn write_marker(path: &Path, content: &[u8]) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _ = std::fs::remove_file(path);
+    std::fs::write(path, content).expect("write marker");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o400)).expect("mode");
+}
+
+/// OCI-7・#2540: 公開後に状態を失った rootfs（印は v2）は、同じ bundle の次の create が孤児として回収し、
+/// `AlreadyExists` で塞がれない。古い木の中身は残らず、操作 `image_rootfs_orphan_reap` が成功 1 件。
+#[test]
+fn oci7_orphan_published_rootfs_is_reclaimed_by_next_create() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let refs = Refs::default();
+    run(&store, &refs, &Unpacker { fail: false }, &sb).expect("create");
+    std::fs::write(sb.rootfs().join("stale"), b"old").expect("stale");
+    lose_state(&sb);
+    let rec = OpRecorder::new();
+    let again = run_recorded(&store, &refs, &rec, &sb.request()).expect("recreate");
+    assert_eq!(again.status().state(), ContainerState::Created);
+    assert!(sb.rootfs().join("bin").join("true").is_file());
+    assert!(!sb.rootfs().join("stale").exists());
+    assert_eq!(orphan_reap_counts(&rec), (1, 0));
+}
+
+/// OCI-7・#2540: 状態を持つコンテナ（同じ bundle・同じ印）の rootfs は孤児ではないので消さない。
+/// 別 ID の create は `AlreadyExists` で拒否され、既存の木は残る。
+#[test]
+fn oci7_orphan_reap_keeps_rootfs_used_by_existing_state() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let refs = Refs::default();
+    run(&store, &refs, &Unpacker { fail: false }, &sb).expect("create c1");
+    std::fs::write(sb.rootfs().join("keep"), b"x").expect("keep");
+    let rec = OpRecorder::new();
+    let req = CreateRequest::new(ContainerId::new("c2").expect("id"), sb.bundle()).expect("req");
+    let err = run_recorded(&store, &refs, &rec, &req).expect_err("blocked");
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+    assert!(sb.rootfs().join("keep").is_file());
+    assert_eq!(orphan_reap_counts(&rec), (0, 1));
+}
+
+/// OCI-7・#2540: 印の無い rootfs（利用者のデータ）は消さない。
+#[test]
+fn oci7_orphan_reap_keeps_user_data_without_marker() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let refs = Refs::default();
+    std::fs::create_dir(sb.rootfs()).expect("rootfs");
+    std::fs::write(sb.rootfs().join("mine"), b"x").expect("mine");
+    let rec = OpRecorder::new();
+    let err = run_recorded(&store, &refs, &rec, &sb.request()).expect_err("blocked");
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+    assert!(sb.rootfs().join("mine").is_file());
+    assert_eq!(orphan_reap_counts(&rec), (0, 1));
+}
+
+/// OCI-7・#2540: 旧形式（v1。トークンだけ）の印は同一性を確かめられないので消さない。
+#[test]
+fn oci7_orphan_reap_keeps_rootfs_with_v1_marker() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let refs = Refs::default();
+    run(&store, &refs, &Unpacker { fail: false }, &sb).expect("create");
+    let marker = sb.rootfs().join(MARKER_NAME);
+    let text = std::fs::read_to_string(&marker).expect("marker");
+    let token = text.lines().next().expect("token").to_owned();
+    write_marker(&marker, token.as_bytes());
+    lose_state(&sb);
+    let rec = OpRecorder::new();
+    let err = run_recorded(&store, &refs, &rec, &sb.request()).expect_err("blocked");
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+    assert!(sb.rootfs().join("bin").join("true").is_file());
+    assert_eq!(orphan_reap_counts(&rec), (0, 1));
+}
+
+/// OCI-7・#2540: `cp -a` 等で別の bundle へ複製された木（印の同一性が新しい inode と一致しない）は消さない。
+#[test]
+fn oci7_orphan_reap_keeps_copied_tree() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let refs = Refs::default();
+    run(&store, &refs, &Unpacker { fail: false }, &sb).expect("create");
+    let marker = std::fs::read(sb.rootfs().join(MARKER_NAME)).expect("marker");
+    let sb2 = Sandbox::new();
+    std::fs::create_dir(sb2.rootfs()).expect("copy root");
+    write_marker(&sb2.rootfs().join(MARKER_NAME), &marker);
+    std::fs::write(sb2.rootfs().join("mine"), b"x").expect("mine");
+    let rec = OpRecorder::new();
+    let err = run_recorded(&sb2.store(), &refs, &rec, &sb2.request()).expect_err("blocked");
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+    assert!(sb2.rootfs().join("mine").is_file());
+    assert_eq!(orphan_reap_counts(&rec), (0, 1));
+}
+
+/// OCI-7・#2540: 木の `flock` を他が持つ（生きている create）なら消さない。bundle の所有ロックを他が持つ
+/// （delete の後始末の最中）ときも消さない。どちらも `AlreadyExists` で、ロックを外せば回収される。
+#[test]
+fn oci7_orphan_reap_keeps_rootfs_while_locks_are_held() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let refs = Refs::default();
+    run(&store, &refs, &Unpacker { fail: false }, &sb).expect("create");
+    lose_state(&sb);
+
+    let tree_lock = std::fs::File::open(sb.rootfs()).expect("open rootfs");
+    tree_lock.try_lock().expect("lock rootfs");
+    let rec = OpRecorder::new();
+    let err = run_recorded(&store, &refs, &rec, &sb.request()).expect_err("alive");
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+    assert!(sb.rootfs().join("bin").join("true").is_file());
+    drop(tree_lock);
+
+    let bundle_lock = std::fs::File::open(sb.bundle()).expect("open bundle");
+    bundle_lock.try_lock().expect("lock bundle");
+    let rec = OpRecorder::new();
+    let err = run_recorded(&store, &refs, &rec, &sb.request()).expect_err("held");
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+    assert_eq!(orphan_reap_counts(&rec), (0, 1));
+    drop(bundle_lock);
+
+    let rec = OpRecorder::new();
+    run_recorded(&store, &refs, &rec, &sb.request()).expect("reclaimed");
+    assert_eq!(orphan_reap_counts(&rec), (1, 0));
+}
+
+/// OCI-7・REPAIR-4・#2540: 状態の一覧に失敗すると全件を確かめられないので消さない。
+#[test]
+fn oci7_orphan_reap_keeps_rootfs_when_state_list_fails() {
+    struct ListFails<'a>(&'a FileStateStore);
+    impl StateStore for ListFails<'_> {
+        fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+            self.0.create(req)
+        }
+        fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+            self.0.update(req)
+        }
+        fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+            self.0.get(req)
+        }
+        fn list(&self, _req: &ListStateRequest) -> Result<StateList, TraitError> {
+            Err(TraitError::new(ErrorCode::Internal, "list failed"))
+        }
+        fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+            self.0.delete(req)
+        }
+    }
+    let sb = Sandbox::new();
+    let inner = sb.store();
+    let refs = Refs::default();
+    run(&inner, &refs, &Unpacker { fail: false }, &sb).expect("create");
+    lose_state(&sb);
+    let rec = OpRecorder::new();
+    let err = run_recorded(&ListFails(&inner), &refs, &rec, &sb.request()).expect_err("keep");
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+    assert!(sb.rootfs().join("bin").join("true").is_file());
+    assert_eq!(orphan_reap_counts(&rec), (0, 1));
+}

@@ -18,7 +18,7 @@ doc は本配線を「TASK-114」と書いているが、TASK-114 の open issue
 - `crates/cli/src/commands/plugin_backend.rs` の `backend_failure` は、発見 → `PluginRegistry::from_candidates` → `verify_candidate` → `PluginVerificationMethod::default().verify`（空の一覧で全件拒否）→ `NotInvokable` の順に進む。PATH 由来の候補もレジストリへ渡している
 - `plugin_discovery`・`plugin_trust` は `plugin` feature で区切られていない（`crates/core/src/lib.rs`。区切られているのは `plugin` の再エクスポートだけ）。cli は core を既定 feature（`plugin` 有効）で使う
 - 起動 API（`crates/plugin/src/lifecycle.rs` の `call_once`・`ResidentPlugin`・`PluginSession`）に本番の呼び出し元は無い
-- 起動 API の期限の定数: `ONE_SHOT_TIMEOUT_DEFAULT` / `_MAX` 10 秒・`ONE_SHOT_EXIT_TIMEOUT` 5 秒・`ONE_SHOT_REAP_TIMEOUT` 2 秒・`RESIDENT_START_TIMEOUT_DEFAULT` / `_MAX` 10 秒・`UDS_RPC_TIMEOUT_DEFAULT` / `_MAX` 10 秒（`RpcTimeout` は 10 秒を超える値を作れない）
+- 起動 API の期限の定数: `ONE_SHOT_TIMEOUT_DEFAULT` / `_MAX` 10 秒・`PLUGIN_EXIT_TIMEOUT` 5 秒・`PLUGIN_REAP_TIMEOUT` 2 秒・`RESIDENT_START_TIMEOUT_DEFAULT` / `_MAX` 10 秒・`UDS_RPC_TIMEOUT_DEFAULT` / `_MAX` 10 秒（`RpcTimeout` は 10 秒を超える値を作れない）
 - plugin-macos の期限: `LAUNCH_TOTAL_TIMEOUT` 7 秒・`LAUNCH_START_TIMEOUT` 3 秒・`LAUNCH_STOP_TIMEOUT` 2 秒・`CREATE_VALIDATION_TIMEOUT` 3 秒・`SHUTDOWN_BUDGET` 4 秒・`FRAME_DEADLINE` = `UDS_RPC_TIMEOUT_DEFAULT`
 - plugin-macos の暫定ワイヤー契約は `Vec<String>`（先頭要素が操作名）。create（id・kernel・initrd・cmdline・console_log・共有の組）・start・stop・ping だけを処理し、kill・delete・state は `UNIMPLEMENTED`。VM の登録は plugin プロセスのメモリ上にあり、終了時に `stop_all` で停止する。platform-macos の `Vm` は `Drop` で停止を要求する
 - `ControlMessage<T>` のエンベロープは未知のフィールドと配列形を拒否する。「項目を足すときは `PROTOCOL_VERSION` を上げる」と doc にあり、現在は `PROTOCOL_VERSION = 1`
@@ -98,7 +98,7 @@ kill・delete・state は plugin-macos では未実装（`UNIMPLEMENTED`）。pr
 | 都度起動（spawn → 応答） | `OneShotTimeout`（既定 = 上限 10 秒） | lifecycle |
 | 常駐の起動（spawn → accept） | `ResidentStartTimeout`（既定 = 上限 10 秒） | resident |
 | 1 往復 | `RpcTimeout`（上限 10 秒） | transport |
-| 応答後の終了待ち / 回収 | `ONE_SHOT_EXIT_TIMEOUT` 5 秒 / `ONE_SHOT_REAP_TIMEOUT` 2 秒 | lifecycle |
+| 応答後の終了待ち / 回収 | `PLUGIN_EXIT_TIMEOUT` 5 秒 / `PLUGIN_REAP_TIMEOUT` 2 秒 | lifecycle |
 | plugin 側の start | `LAUNCH_TOTAL_TIMEOUT` 7 秒（< 1 往復の 10 秒） | plugin-macos |
 | plugin 側の終了 | `SHUTDOWN_BUDGET` 4 秒（< 終了待ち 5 秒） | plugin-macos |
 

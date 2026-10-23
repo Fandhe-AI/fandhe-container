@@ -40,7 +40,7 @@
 //! - 外部管理の常駐 plugin への attach。
 
 use super::{
-    OneShotStderr, OneShotTermination, OneShotTimeout, PluginLaunchSpec, ResidentPlugin,
+    OneShotTimeout, PluginLaunchSpec, PluginStderr, PluginTermination, ResidentPlugin,
     ResidentShutdown, ResidentShutdownError, ResidentStartTimeout, call_once_observed,
 };
 use crate::error::PluginError;
@@ -115,12 +115,12 @@ impl PluginModeKind {
     }
 }
 
-/// 都度起動セッションが保持する直近の呼び出し結果（`shutdown` で返す。子は呼び出しごとに回収済み）。
+/// 都度起動セッションが保持する直近の呼び出し結果（都度起動専用のため名前を保つ。#2608）（`shutdown` で返す。子は呼び出しごとに回収済み）。
 #[derive(Default)]
 struct OneShotStats {
     calls: u64,
-    last_termination: Option<OneShotTermination>,
-    last_stderr: Option<OneShotStderr>,
+    last_termination: Option<PluginTermination>,
+    last_stderr: Option<PluginStderr>,
 }
 
 /// [`PluginSession::call`] の結果（モードを問わない統一形）。
@@ -131,8 +131,8 @@ struct OneShotStats {
 #[non_exhaustive]
 pub struct PluginCallOutcome {
     response: Frame,
-    termination: Option<OneShotTermination>,
-    stderr: Option<OneShotStderr>,
+    termination: Option<PluginTermination>,
+    stderr: Option<PluginStderr>,
 }
 
 impl PluginCallOutcome {
@@ -147,12 +147,12 @@ impl PluginCallOutcome {
     }
 
     /// 子の終了状況。都度起動のみ `Some`。
-    pub fn termination(&self) -> Option<OneShotTermination> {
+    pub fn termination(&self) -> Option<PluginTermination> {
         self.termination
     }
 
     /// plugin が stderr へ書いた内容（untrusted・上限つき）。都度起動のみ `Some`。
-    pub fn stderr(&self) -> Option<&OneShotStderr> {
+    pub fn stderr(&self) -> Option<&PluginStderr> {
         self.stderr.as_ref()
     }
 }
@@ -173,7 +173,7 @@ pub struct PluginCallRecord {
     /// 開始から戻るまでの所要時間。
     pub elapsed: Duration,
     /// plugin の stderr（untrusted・上限つき）。都度起動のみ `Some`（成功・失敗のどちらでも）。
-    pub stderr: Option<OneShotStderr>,
+    pub stderr: Option<PluginStderr>,
 }
 
 impl PluginCallRecord {
@@ -372,14 +372,14 @@ impl PluginSession {
     }
 }
 
-/// 都度起動セッションの [`PluginSession::shutdown`] 結果。保持しているプロセスはなく（各呼び出しで
+/// 都度起動セッションの [`PluginSession::shutdown`] 結果（都度起動専用のため名前を保つ。常駐の対応物は `ResidentShutdown`。#2608）。保持しているプロセスはなく（各呼び出しで
 /// 回収済み）、直近の呼び出しの情報だけを返す。
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct OneShotSummary {
     calls: u64,
-    last_termination: Option<OneShotTermination>,
-    last_stderr: Option<OneShotStderr>,
+    last_termination: Option<PluginTermination>,
+    last_stderr: Option<PluginStderr>,
 }
 
 impl OneShotSummary {
@@ -389,12 +389,12 @@ impl OneShotSummary {
     }
 
     /// 直近の呼び出しが成功していればその子の終了状況。未呼び出し・直近が失敗なら `None`。
-    pub fn last_termination(&self) -> Option<OneShotTermination> {
+    pub fn last_termination(&self) -> Option<PluginTermination> {
         self.last_termination
     }
 
     /// 直近の呼び出しで plugin が stderr へ書いた内容（untrusted・上限つき）。未呼び出しなら `None`。
-    pub fn last_stderr(&self) -> Option<&OneShotStderr> {
+    pub fn last_stderr(&self) -> Option<&PluginStderr> {
         self.last_stderr.as_ref()
     }
 }

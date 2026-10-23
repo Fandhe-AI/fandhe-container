@@ -65,17 +65,17 @@ pub use frame::{
 #[cfg(unix)]
 pub use lifecycle::PluginFileIdentity;
 pub use lifecycle::{
-    ChildCleanupFailure, DROP_REPORT_CAPACITY, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_REAP_TIMEOUT,
-    ONE_SHOT_STDERR_DRAIN_TIMEOUT, ONE_SHOT_STDERR_MAX_BYTES, ONE_SHOT_STDERR_STOP_TIMEOUT,
-    ONE_SHOT_TIMEOUT_DEFAULT, ONE_SHOT_TIMEOUT_MAX, OneShotOutcome, OneShotRecord, OneShotStderr,
-    OneShotSummary, OneShotTermination, OneShotTimeout, PLUGIN_ARGS_MAX_BYTES,
+    ChildCleanupFailure, DROP_REPORT_CAPACITY, ONE_SHOT_TIMEOUT_DEFAULT, ONE_SHOT_TIMEOUT_MAX,
+    OneShotOutcome, OneShotRecord, OneShotSummary, OneShotTimeout, PLUGIN_ARGS_MAX_BYTES,
     PLUGIN_ARGS_MAX_COUNT, PLUGIN_ENV_MAX_BYTES, PLUGIN_ENV_MAX_COUNT, PLUGIN_ENV_NAME_MAX_BYTES,
-    PLUGIN_ENV_VALUE_MAX_BYTES, PLUGIN_SOCKET_ENV, PendingChildCleanup, PluginCallOutcome,
-    PluginCallRecord, PluginLaunchSpec, PluginLaunchTarget, PluginMode, PluginModeKind,
-    PluginSession, PluginSessionShutdown, RESIDENT_EXIT_DETECT_TIMEOUT,
-    RESIDENT_START_TIMEOUT_DEFAULT, RESIDENT_START_TIMEOUT_MAX, ResidentCallRecord, ResidentPlugin,
-    ResidentShutdown, ResidentShutdownError, ResidentStartTimeout, ResidentState, call_once,
-    call_once_observed, take_pending_child_cleanup_failures, write_stderr_nonblocking,
+    PLUGIN_ENV_VALUE_MAX_BYTES, PLUGIN_EXIT_TIMEOUT, PLUGIN_REAP_TIMEOUT, PLUGIN_SOCKET_ENV,
+    PLUGIN_STDERR_DRAIN_TIMEOUT, PLUGIN_STDERR_MAX_BYTES, PLUGIN_STDERR_STOP_TIMEOUT,
+    PendingChildCleanup, PluginCallOutcome, PluginCallRecord, PluginLaunchSpec, PluginLaunchTarget,
+    PluginMode, PluginModeKind, PluginSession, PluginSessionShutdown, PluginStderr,
+    PluginTermination, RESIDENT_EXIT_DETECT_TIMEOUT, RESIDENT_START_TIMEOUT_DEFAULT,
+    RESIDENT_START_TIMEOUT_MAX, ResidentCallRecord, ResidentPlugin, ResidentShutdown,
+    ResidentShutdownError, ResidentStartTimeout, ResidentState, call_once, call_once_observed,
+    take_pending_child_cleanup_failures, write_stderr_nonblocking,
 };
 pub use message::{ControlMessage, MessageId, decode_message, encode_message};
 pub use rss::{RssSample, RssSource};

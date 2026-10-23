@@ -3,7 +3,7 @@
 //! plugin プロセスを 1 回だけ起動し、確立した接続を保持したまま複数の要求を順次処理する。
 //! 呼び出し元は core 側の plugin proxy（#1869 の設計〔docs/design/plugin-backend-wiring.md。承認待ち・実装 issue は未起票〕・TASK-114 ほか。依存方向は `core -> plugin` のため、本モジュールは
 //! core の登録表を参照せず、検証済みの起動対象（fd）を持つ起動仕様 [`PluginLaunchSpec`] を受け取る。
-//! 起動仕様の型は都度起動モードと共用。モード選択 API は TASK-110.3 の `mode`。型名の中立化は未実施）。
+//! 起動仕様の型は都度起動モードと共用。モード選択 API は TASK-110.3 の `mode`。共用する終了待ち等の定数・型は中立な名前〔`PLUGIN_EXIT_TIMEOUT`・`PluginStderr`・`PluginTermination` など。#2608〕）。
 //!
 //! # 契約
 //!
@@ -12,7 +12,7 @@
 //!   割り込める入口を作らない（PLUG-12 の方針）。応答者は spawn した子の pid に限定する。
 //! - 順次性: [`ResidentPlugin::call`] は `&mut self` を取り、同時に 1 往復しか走らない（借用規則で保証）。
 //! - 期限（REPAIR-5）: 起動は [`ResidentStartTimeout`]、1 往復は呼び出しごとの [`RpcTimeout`]（送信と受信の
-//!   合計）、終了待ち・回収待ち・stderr 収集待ちは都度起動モードの定数を共用する。
+//!   合計）、終了待ち・回収待ち・stderr 収集待ちは両モード共用の定数（`PLUGIN_EXIT_TIMEOUT`・`PLUGIN_REAP_TIMEOUT`・`PLUGIN_STDERR_*`）を使う。
 //! - 異常終了の検知: 往復前の終了確認と、往復失敗後の短い猶予（[`RESIDENT_EXIT_DETECT_TIMEOUT`]）つき終了
 //!   確認で、子の終了を `Unavailable` の構造化エラーへ読み替える。メッセージには自プロセスが取得した終了
 //!   コードの数値のみを含め、plugin 由来の文字列は含めない。終了コード 0 の自発終了も、常駐すべき
@@ -51,15 +51,15 @@
 //!   要求 ID と応答 ID の対応づけ（#1869 の設計）。
 
 use super::{
-    ChildGuard, ONE_SHOT_EXIT_TIMEOUT, ONE_SHOT_STDERR_DRAIN_TIMEOUT, OneShotStderr,
-    OneShotTermination, PluginLaunchSpec, Reap, StderrCapture, classify_reaped,
-    group_kill_failed_error, launch_spawn_error, plugin_command, rpc_timeout, spawn_registered,
-    stderr_channel, unreaped_error, with_group_kill_failure,
+    ChildGuard, PLUGIN_EXIT_TIMEOUT, PLUGIN_STDERR_DRAIN_TIMEOUT, PluginLaunchSpec, PluginStderr,
+    PluginTermination, Reap, StderrCapture, classify_reaped, group_kill_failed_error,
+    launch_spawn_error, plugin_command, rpc_timeout, spawn_registered, stderr_channel,
+    unreaped_error, with_group_kill_failure,
 };
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
 use crate::signal_forward::{PLUGIN_REGISTRY, Registry};
-use crate::transport::{RpcTimeout, UdsListener, UdsStream};
+use crate::transport::{RpcTimeout, UDS_RPC_TIMEOUT_MAX, UdsListener, UdsStream};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -68,6 +68,8 @@ pub const RESIDENT_START_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
 
 /// [`ResidentStartTimeout`] の上限（10 秒。残り時間を常に `RpcTimeout` へ変換できる値にする）。
 pub const RESIDENT_START_TIMEOUT_MAX: Duration = Duration::from_secs(10);
+
+const _: () = assert!(RESIDENT_START_TIMEOUT_MAX.as_nanos() <= UDS_RPC_TIMEOUT_MAX.as_nanos());
 
 /// 往復の失敗後に、子の終了を確認するために待つ猶予（I/O エラーと終了の観測順の競合を吸収する）。
 pub const RESIDENT_EXIT_DETECT_TIMEOUT: Duration = Duration::from_millis(200);
@@ -135,18 +137,18 @@ pub enum ResidentState {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct ResidentShutdown {
-    termination: OneShotTermination,
-    stderr: OneShotStderr,
+    termination: PluginTermination,
+    stderr: PluginStderr,
 }
 
 impl ResidentShutdown {
     /// 子プロセスの終了状況。
-    pub fn termination(&self) -> OneShotTermination {
+    pub fn termination(&self) -> PluginTermination {
         self.termination
     }
 
     /// セッション全期間に plugin が stderr へ書いた内容（untrusted・上限つき）。
-    pub fn stderr(&self) -> &OneShotStderr {
+    pub fn stderr(&self) -> &PluginStderr {
         &self.stderr
     }
 }
@@ -158,7 +160,7 @@ impl ResidentShutdown {
 #[non_exhaustive]
 pub struct ResidentShutdownError {
     error: PluginError,
-    stderr: OneShotStderr,
+    stderr: PluginStderr,
 }
 
 impl ResidentShutdownError {
@@ -168,7 +170,7 @@ impl ResidentShutdownError {
     }
 
     /// セッション全期間に plugin が stderr へ書いた内容（untrusted・上限つき）。
-    pub fn stderr(&self) -> &OneShotStderr {
+    pub fn stderr(&self) -> &PluginStderr {
         &self.stderr
     }
 
@@ -511,7 +513,7 @@ impl ResidentPlugin {
         }
         match self.guard.kill_and_reap() {
             Reap::Reaped(status) => match classify_reaped(status) {
-                OneShotTermination::Exited { code } => {
+                PluginTermination::Exited { code } => {
                     self.state = ResidentState::Exited { code };
                     if code == Some(0) {
                         original
@@ -547,32 +549,32 @@ impl ResidentPlugin {
         }
     }
 
-    /// セッションを終了させる。接続を閉じて EOF を見せ、[`ONE_SHOT_EXIT_TIMEOUT`] まで自発終了を待ち、
+    /// セッションを終了させる。接続を閉じて EOF を見せ、[`PLUGIN_EXIT_TIMEOUT`] まで自発終了を待ち、
     /// 超過で強制終了・回収する。既に終了済みのセッションでは、その終了状況をそのまま使う。
     ///
     /// 自発終了が非ゼロ・取得不能なら `Unavailable`、回収を確認できなければ `Internal`（pid つき）、子は
     /// 回収できたがプロセスグループを停止できなければ `Internal`（pid なし。未回収とは別のメッセージ）を
     /// [`ResidentShutdownError`] で返す。いずれの経路でも、エラーを返す前に stderr の収集結果を
-    /// 期限つき（[`ONE_SHOT_STDERR_DRAIN_TIMEOUT`]）で受け取って読み取りスレッドの停止を確認し、
+    /// 期限つき（[`PLUGIN_STDERR_DRAIN_TIMEOUT`]）で受け取って読み取りスレッドの停止を確認し、
     /// 診断情報（クラッシュ時の plugin の stderr 等）を [`ResidentShutdownError::stderr`] で渡す。
     pub fn shutdown(mut self) -> Result<ResidentShutdown, ResidentShutdownError> {
         self.stream = None;
         let termination = match self.state {
-            ResidentState::Running => self.guard.wait_or_kill(ONE_SHOT_EXIT_TIMEOUT),
-            ResidentState::Exited { code } => OneShotTermination::Exited { code },
-            ResidentState::Killed => OneShotTermination::Killed,
-            ResidentState::Unreaped => OneShotTermination::Unreaped,
-            ResidentState::GroupKillFailed => OneShotTermination::GroupKillFailed,
+            ResidentState::Running => self.guard.wait_or_kill(PLUGIN_EXIT_TIMEOUT),
+            ResidentState::Exited { code } => PluginTermination::Exited { code },
+            ResidentState::Killed => PluginTermination::Killed,
+            ResidentState::Unreaped => PluginTermination::Unreaped,
+            ResidentState::GroupKillFailed => PluginTermination::GroupKillFailed,
         };
         // 失敗の判定を先に済ませ（報告済みの印は `unreaped_error` が付ける）、stderr は必ず回収する。
-        let failure = if termination == OneShotTermination::Unreaped {
+        let failure = if termination == PluginTermination::Unreaped {
             self.state = ResidentState::Unreaped;
             Some(unreaped_error(&mut self.guard, "shutdown"))
-        } else if termination == OneShotTermination::GroupKillFailed {
+        } else if termination == PluginTermination::GroupKillFailed {
             // 直接の子は回収済みのため未回収としては報告しない（pid も報告済みの印も付けない）。
             self.state = ResidentState::GroupKillFailed;
             Some(group_kill_failed_error("shutdown"))
-        } else if let OneShotTermination::Exited { code } = termination
+        } else if let PluginTermination::Exited { code } = termination
             && code != Some(0)
         {
             // 最終応答後の異常終了（非ゼロ・取得不能）を成功として返さない（PLUG-7）。
@@ -582,8 +584,8 @@ impl ResidentPlugin {
             None
         };
         let stderr = match self.capture.take() {
-            Some(capture) => capture.finish(ONE_SHOT_STDERR_DRAIN_TIMEOUT),
-            None => OneShotStderr::empty(),
+            Some(capture) => capture.finish(PLUGIN_STDERR_DRAIN_TIMEOUT),
+            None => PluginStderr::empty(),
         };
         match failure {
             Some(error) => Err(ResidentShutdownError { error, stderr }),
@@ -720,7 +722,7 @@ mod tests {
             "plugin process group could not be killed after shutdown; \
              the direct child was reaped but descendant processes may remain"
         );
-        assert_eq!(failure.stderr(), &OneShotStderr::empty());
+        assert_eq!(failure.stderr(), &PluginStderr::empty());
     }
 
     /// PLUG-7・REPAIR-5: 未回収（`Unreaped`）状態のセッションの shutdown は、従来どおり未回収として報告する

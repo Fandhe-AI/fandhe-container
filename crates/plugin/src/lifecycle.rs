@@ -11,9 +11,9 @@
 //! - 接続方向は「core 側が [`UdsListener`] を bind し、plugin が接続する」（`transport` 冒頭の契約）。
 //!   socket の絶対パスは環境変数 [`PLUGIN_SOCKET_ENV`] で子へ渡す（暫定契約。spec 未規定）。
 //! - spawn から応答受信までは [`OneShotTimeout`] の合計期限で打ち切る（REPAIR-5）。応答後の自発終了
-//!   待ちは別枠の [`ONE_SHOT_EXIT_TIMEOUT`]。猶予内に終了しなければ強制終了する。
+//!   待ちは別枠の [`PLUGIN_EXIT_TIMEOUT`]。猶予内に終了しなければ強制終了する。
 //! - 子プロセスの回収: [`call_once`] が `Ok` を返した時点で、直接起動した子は wait または kill で
-//!   回収済み。`Err` の場合も、返す前に必ず kill と [`ONE_SHOT_REAP_TIMEOUT`] までの回収を試みる。
+//!   回収済み。`Err` の場合も、返す前に必ず kill と [`PLUGIN_REAP_TIMEOUT`] までの回収を試みる。
 //!   回収を確認できなかった場合に限り、`Internal`（メッセージに `could not be reaped` と子の pid を
 //!   含む）を元のエラーに代えて返す。報告した pid の子は、この呼び出しではそれ以降回収しない
 //!   （報告後に回収すると、解放済みの pid を未回収として伝えることになるため）。子は終了済みでも
@@ -44,7 +44,7 @@
 //!   NUL を含む値・上限超過（[`PLUGIN_ENV_MAX_COUNT`] 等）は `InvalidArgument` で拒否し、spawn しない
 //!   （#1858・#1319・PLUG-7）。
 //!   stdin / stdout は null。stderr は親へ継承させず、専用の UNIX ソケット対で受けて
-//!   [`OneShotStderr`] として返す（untrusted。保持は [`ONE_SHOT_STDERR_MAX_BYTES`] まで。超過分は
+//!   [`PluginStderr`] として返す（untrusted。保持は [`PLUGIN_STDERR_MAX_BYTES`] まで。超過分は
 //!   読み捨てて件数だけ数える）。親の stderr・構造化ログへ内容を転記しない（量の上限なしの出力・
 //!   ログ行の偽装を防ぐ）。子から見た stderr は端末でも pipe でもなくソケットで、書き込みは pipe と
 //!   同様に扱える（`/dev/stderr` の開き直しは Linux では失敗する）。
@@ -57,7 +57,7 @@
 //!   解除される。macOS には同等の機構がなく親の強制終了で残留し得る（kqueue `NOTE_EXIT` は将来課題）。
 //!   Windows は対象外。
 //! - stderr の読み取りスレッドは呼び出しごとに 1 本で、[`call_once`] が戻るまでに停止させる
-//!   （呼び出しを繰り返してもスレッドが増え続けない）。子の回収後 [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`]
+//!   （呼び出しを繰り返してもスレッドが増え続けない）。子の回収後 [`PLUGIN_STDERR_DRAIN_TIMEOUT`]
 //!   以内に終端へ達しなければ、ソケットを shutdown して読み取りを打ち切る。
 //!
 //! # 未実装（REPAIR-3）
@@ -78,8 +78,8 @@
 //!   グループ宛ての kill・転送は旧グループに残った孫にだけ届き、本体は `Child::kill` のフォールバックで
 //!   止めて回収する。本体が抜けた後に起動した孫は届かない）、(c) Windows
 //!   （プロセスグループ単位の kill が無く、相当する Job Object は別タスク）では孫が残る。孫が stderr の
-//!   書き込み端を保持し続けた場合、収集は [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`] で打ち切り、
-//!   [`OneShotStderr::is_complete`] が false になる。打ち切り後は読み取り側を閉じるため、孫の以後の
+//!   書き込み端を保持し続けた場合、収集は [`PLUGIN_STDERR_DRAIN_TIMEOUT`] で打ち切り、
+//!   [`PluginStderr::is_complete`] が false になる。打ち切り後は読み取り側を閉じるため、孫の以後の
 //!   書き込みは `EPIPE` になる。子は親と別のプロセスグループになるため、端末由来のシグナル（Ctrl-C 等）は
 //!   カーネルからは届かない。親が受けた SIGINT・SIGTERM・SIGHUP は CLI バイナリのハンドラが
 //!   `signal_forward` 経由でグループ宛て（`kill(-pid)`）に転送し、孫まで届く（#1513）。親が SIGKILL・
@@ -115,7 +115,10 @@ pub use resident::{
 use crate::error::{PluginError, PluginErrorCode};
 use crate::frame::Frame;
 use crate::signal_forward::{PLUGIN_REGISTRY, Registry, SlotToken};
-use crate::transport::{RpcTimeout, UdsListener};
+use crate::transport::{RpcTimeout, UDS_RPC_TIMEOUT_MAX, UdsListener};
+
+// `ONE_SHOT_TIMEOUT_MAX` の doc が約束する「残り時間を常に `RpcTimeout` へ変換できる」をコンパイル時に固定する。
+const _: () = assert!(ONE_SHOT_TIMEOUT_MAX.as_nanos() <= UDS_RPC_TIMEOUT_MAX.as_nanos());
 pub use drop_report::{
     ChildCleanupFailure, DROP_REPORT_CAPACITY, PendingChildCleanup,
     take_pending_child_cleanup_failures, write_stderr_nonblocking,
@@ -133,13 +136,16 @@ use std::time::{Duration, Instant};
 pub const PLUGIN_SOCKET_ENV: &str = "FANDHE_CONTAINER_PLUGIN_SOCKET";
 
 /// [`OneShotTimeout`] の既定値（10 秒）。
+///
+/// `OneShot*` の期限型は都度起動の「spawn から応答受信まで」の合計期限を表す専用の名前で、改名しない
+/// （常駐の対応物は `ResidentStartTimeout` と呼び出しごとの `RpcTimeout`。#2608・PLUG-11・REPAIR-1）。
 pub const ONE_SHOT_TIMEOUT_DEFAULT: Duration = Duration::from_secs(10);
 
 /// [`OneShotTimeout`] の上限（10 秒。残り時間を常に `RpcTimeout` へ変換できる値にする）。
 pub const ONE_SHOT_TIMEOUT_MAX: Duration = Duration::from_secs(10);
 
-/// 応答受信後に子の自発終了を待つ猶予（合計期限とは別枠）。
-pub const ONE_SHOT_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+/// 応答受信後（都度起動）・`shutdown`（常駐）で子の自発終了を待つ猶予（合計期限とは別枠。両モードで共用する。#2608）。
+pub const PLUGIN_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 起動引数の件数上限。
 pub const PLUGIN_ARGS_MAX_COUNT: usize = 64;
@@ -150,27 +156,27 @@ pub const PLUGIN_ARGS_MAX_BYTES: usize = 4096;
 /// 子の終了待ちポーリング間隔の上限。
 const POLL_MAX: Duration = Duration::from_millis(5);
 
-/// 強制終了後の回収（`try_wait` ポーリング）を待つ上限（REPAIR-5。無期限の `wait` を避ける）。
-pub const ONE_SHOT_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+/// 強制終了後の回収（`try_wait` ポーリング）を待つ上限（REPAIR-5。無期限の `wait` を避ける。都度起動と常駐で共用する。#2608）。
+pub const PLUGIN_REAP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// plugin の stderr として保持するバイト数の上限（64 KiB。超過分は読み捨てる。無制限確保の防止）。
-pub const ONE_SHOT_STDERR_MAX_BYTES: usize = 64 * 1024;
+/// plugin の stderr として保持するバイト数の上限（64 KiB。超過分は読み捨てる。無制限確保の防止。都度起動と常駐で共用する。#2608）。
+pub const PLUGIN_STDERR_MAX_BYTES: usize = 64 * 1024;
 
-/// 子の回収後に stderr の読み取り完了（終端）を待つ上限（REPAIR-5。合計期限とは別枠）。
+/// 子の回収後に stderr の読み取り完了（終端）を待つ上限（REPAIR-5。合計期限とは別枠。都度起動と常駐で共用する。#2608）。
 /// 子が終了していれば書き込み端は閉じており即座に完了する。孫プロセスが書き込み端を保持している
 /// 場合のみこの期限まで待ち、読み取りを打ち切ってスレッドを停止させる。
-pub const ONE_SHOT_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+pub const PLUGIN_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// 打ち切りを指示した後、読み取りスレッドの停止を確認するまで待つ上限（REPAIR-5）。
+/// 打ち切りを指示した後、読み取りスレッドの停止を確認するまで待つ上限（REPAIR-5。都度起動と常駐で共用する。#2608）。
 /// shutdown で読み取りは即座に戻るため通常は待たない。スケジューリング遅延への余裕として設ける。
-pub const ONE_SHOT_STDERR_STOP_TIMEOUT: Duration = Duration::from_secs(1);
+pub const PLUGIN_STDERR_STOP_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// stderr の読み取り 1 回の待ち上限。読み取りスレッドはこの間隔で停止指示を確認する
 /// （shutdown による起床が効かない場合でも、この間隔で停止できる）。
 #[cfg(unix)]
 const STDERR_READ_POLL: Duration = Duration::from_millis(100);
 
-/// spawn から応答受信までの合計期限（REPAIR-5）。0 と [`ONE_SHOT_TIMEOUT_MAX`] 超は構築できない。
+/// spawn から応答受信までの合計期限（REPAIR-5。都度起動専用のため名前を保つ。常駐の対応物は `ResidentStartTimeout`。#2608）。0 と [`ONE_SHOT_TIMEOUT_MAX`] 超は構築できない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OneShotTimeout(Duration);
 
@@ -265,16 +271,16 @@ impl PluginLaunchSpec {
     }
 }
 
-/// 応答受信後の子プロセスの終了状況。
+/// 応答受信後（都度起動）・`shutdown`（常駐）の子プロセスの終了状況（両モードで共用する。#2608）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum OneShotTermination {
+pub enum PluginTermination {
     /// 自発終了した（強制終了を試みる直前・直後に自発終了していた場合を含む）。`code` はシグナル
     /// 終了などで取得できない場合 `None`。他所で回収され終了状態が不明な場合（`code: None`）を含む。
     Exited { code: Option<i32> },
     /// 猶予内に終了せず強制終了し、回収まで確認した（回収した終了状態が強制終了によるもの）。
     Killed,
-    /// 強制終了を試みたが、[`ONE_SHOT_REAP_TIMEOUT`] 内に直接の子の回収を確認できなかった（直接の子への
+    /// 強制終了を試みたが、[`PLUGIN_REAP_TIMEOUT`] 内に直接の子の回収を確認できなかった（直接の子への
     /// kill 失敗を含む）。呼び出し側は孤児の可能性として扱う（REPAIR-5・PLUG-7）。
     Unreaped,
     /// 直接の子は回収済み（pid は解放済み）だが、子のプロセスグループ宛ての kill が失敗し、孫プロセスの
@@ -297,14 +303,14 @@ pub enum OneShotTermination {
 /// 場合は、plugin 由来であることを明示し、エスケープしたうえで扱うこと（構造化ログの行を偽装
 /// され得るため、そのまま自プロセスの stderr・ログへ流さない）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OneShotStderr {
+pub struct PluginStderr {
     bytes: Vec<u8>,
     total_bytes: u64,
     complete: bool,
     reader_stopped: bool,
 }
 
-impl OneShotStderr {
+impl PluginStderr {
     /// 何も収集していない完了済みの結果（子を spawn しなかった経路用。読み取りスレッドなし）。
     fn empty() -> Self {
         Self {
@@ -315,7 +321,7 @@ impl OneShotStderr {
         }
     }
 
-    /// 保持している先頭部分（最大 [`ONE_SHOT_STDERR_MAX_BYTES`] バイト）。
+    /// 保持している先頭部分（最大 [`PLUGIN_STDERR_MAX_BYTES`] バイト）。
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -330,14 +336,14 @@ impl OneShotStderr {
         u64::try_from(self.bytes.len()).map_or(true, |kept| self.total_bytes > kept)
     }
 
-    /// 終端（全書き込み端の close）まで読み切ったか。false は [`ONE_SHOT_STDERR_DRAIN_TIMEOUT`] で
+    /// 終端（全書き込み端の close）まで読み切ったか。false は [`PLUGIN_STDERR_DRAIN_TIMEOUT`] で
     /// 打ち切ったことを表す（孫プロセスが書き込み端を保持している等）。
     pub fn is_complete(&self) -> bool {
         self.complete
     }
 
     /// 読み取りスレッドの停止を確認できたか（終端到達、または打ち切り指示への応答）。
-    /// false はスレッドが [`ONE_SHOT_STDERR_STOP_TIMEOUT`] 内に停止を返さなかったことを表し、
+    /// false はスレッドが [`PLUGIN_STDERR_STOP_TIMEOUT`] 内に停止を返さなかったことを表し、
     /// 呼び出し側は資源の残留として扱う（REPAIR-4 の観測記録にも出す）。
     pub fn reader_stopped(&self) -> bool {
         self.reader_stopped
@@ -352,7 +358,7 @@ impl OneShotStderr {
 /// スレッドを停止させる（スレッドを残さない）。`join` は行わず、停止の確認も期限つきで行う。
 /// 常駐モード（`resident`。TASK-110.2）はセッション全期間で 1 本の収集器を保持する。
 struct StderrCapture {
-    state: Arc<Mutex<OneShotStderr>>,
+    state: Arc<Mutex<PluginStderr>>,
     done: mpsc::Receiver<()>,
     stop_requested: Arc<AtomicBool>,
     /// ブロック中の読み取りを起こす操作（ソケットの shutdown）。1 回だけ実行する。
@@ -370,7 +376,7 @@ impl StderrCapture {
         source: R,
         wake: Box<dyn FnOnce() + Send>,
     ) -> io::Result<Self> {
-        let state = Arc::new(Mutex::new(OneShotStderr {
+        let state = Arc::new(Mutex::new(PluginStderr {
             bytes: Vec::new(),
             total_bytes: 0,
             complete: false,
@@ -423,16 +429,16 @@ impl StderrCapture {
     }
 
     /// 読み取り完了を `limit` まで待ち、その時点までの収集結果を返す。期限内に終端へ達しなければ
-    /// 読み取りを打ち切り、スレッドの停止を [`ONE_SHOT_STDERR_STOP_TIMEOUT`] まで確認して
+    /// 読み取りを打ち切り、スレッドの停止を [`PLUGIN_STDERR_STOP_TIMEOUT`] まで確認して
     /// `is_complete() == false` の途中結果を返す。
-    fn finish(mut self, limit: Duration) -> OneShotStderr {
+    fn finish(mut self, limit: Duration) -> PluginStderr {
         // 送信側の消滅（Disconnected）はスレッドが終了したことを意味するため、停止済みとして扱う。
         let timed_out =
             |r: Result<(), mpsc::RecvTimeoutError>| r == Err(mpsc::RecvTimeoutError::Timeout);
         let mut stopped = !timed_out(self.done.recv_timeout(limit));
         if !stopped {
             self.request_stop();
-            stopped = !timed_out(self.done.recv_timeout(ONE_SHOT_STDERR_STOP_TIMEOUT));
+            stopped = !timed_out(self.done.recv_timeout(PLUGIN_STDERR_STOP_TIMEOUT));
         }
         let mut result = lock_stderr(&self.state).clone();
         result.reader_stopped = stopped;
@@ -448,14 +454,14 @@ impl Drop for StderrCapture {
 }
 
 /// 読み取りスレッドが panic しても収集結果を取り出せるよう、poison を無視して lock する。
-fn lock_stderr(state: &Mutex<OneShotStderr>) -> MutexGuard<'_, OneShotStderr> {
+fn lock_stderr(state: &Mutex<PluginStderr>) -> MutexGuard<'_, PluginStderr> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `source` を終端・エラー・停止指示のいずれかまで読み、先頭 [`ONE_SHOT_STDERR_MAX_BYTES`] バイト
+/// `source` を終端・エラー・停止指示のいずれかまで読み、先頭 [`PLUGIN_STDERR_MAX_BYTES`] バイト
 /// だけ保持する。上限到達後も読み捨てを続ける（読むのを止めると子が書き込みで詰まり、応答・終了が
 /// 遅れるため）。停止指示は読み取りのたびに確認するので、書き込みが続いていても停止できる。
-fn drain_stderr<R: Read>(mut source: R, state: &Mutex<OneShotStderr>, stop: &AtomicBool) {
+fn drain_stderr<R: Read>(mut source: R, state: &Mutex<PluginStderr>, stop: &AtomicBool) {
     let mut chunk = [0u8; 4096];
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -471,7 +477,7 @@ fn drain_stderr<R: Read>(mut source: R, state: &Mutex<OneShotStderr>, stop: &Ato
             }
             Ok(n) => {
                 let mut s = lock_stderr(state);
-                let room = ONE_SHOT_STDERR_MAX_BYTES.saturating_sub(s.bytes.len());
+                let room = PLUGIN_STDERR_MAX_BYTES.saturating_sub(s.bytes.len());
                 if let Some(kept) = chunk.get(..n.min(room)) {
                     s.bytes.extend_from_slice(kept);
                 }
@@ -519,13 +525,13 @@ fn stderr_channel() -> io::Result<(Stdio, StderrReader)> {
     Ok((Stdio::null(), io::empty()))
 }
 
-/// [`call_once`] の成功結果。
+/// [`call_once`] の成功結果（都度起動専用のため名前を保つ。常駐の対応物は `ResidentShutdown`。#2608）。
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct OneShotOutcome {
     response: Frame,
-    termination: OneShotTermination,
-    stderr: OneShotStderr,
+    termination: PluginTermination,
+    stderr: PluginStderr,
 }
 
 impl OneShotOutcome {
@@ -540,12 +546,12 @@ impl OneShotOutcome {
     }
 
     /// 子プロセスの終了状況。
-    pub fn termination(&self) -> OneShotTermination {
+    pub fn termination(&self) -> PluginTermination {
         self.termination
     }
 
     /// plugin が stderr へ書いた内容（untrusted・上限つき）。
-    pub fn stderr(&self) -> &OneShotStderr {
+    pub fn stderr(&self) -> &PluginStderr {
         &self.stderr
     }
 }
@@ -707,7 +713,7 @@ impl ChildGuard {
         self.lost = true;
     }
 
-    /// kill して回収を `ONE_SHOT_REAP_TIMEOUT` まで待つ。
+    /// kill して回収を `PLUGIN_REAP_TIMEOUT` まで待つ。
     ///
     /// kill の失敗は無視せず、回収確認ができなければ `Unreaped` を返す（呼び出し側が報告する）。
     /// 直接の子を回収できてもグループ宛ての送信が許容外のエラーで失敗した場合は `GroupKillFailed` を
@@ -843,7 +849,7 @@ impl ChildGuard {
                     return Reap::Lost;
                 }
             }
-            if start.elapsed() >= ONE_SHOT_REAP_TIMEOUT {
+            if start.elapsed() >= PLUGIN_REAP_TIMEOUT {
                 return Reap::Unreaped;
             }
             std::thread::sleep(interval);
@@ -853,7 +859,7 @@ impl ChildGuard {
 
     /// 終了を `limit` まで待つ。終了していれば状態を返し、猶予超過なら強制終了する。
     /// 強制終了後に回収した終了状態は [`classify_reaped`] で分類する（`Killed` と決め打ちしない）。
-    fn wait_or_kill(&mut self, limit: Duration) -> OneShotTermination {
+    fn wait_or_kill(&mut self, limit: Duration) -> PluginTermination {
         let start = Instant::now();
         let mut interval = Duration::from_millis(1);
         loop {
@@ -862,9 +868,9 @@ impl ChildGuard {
                     self.release_reaped();
                     // 自発終了の観測後のグループ送信が失敗した（#1604）。孫の停止を保証できないため成功扱いにしない。
                     if self.group_kill_failed_after_exit {
-                        return OneShotTermination::GroupKillFailed;
+                        return PluginTermination::GroupKillFailed;
                     }
-                    return OneShotTermination::Exited {
+                    return PluginTermination::Exited {
                         code: status.code(),
                     };
                 }
@@ -885,16 +891,16 @@ impl ChildGuard {
 ///
 /// グループ停止の失敗（直接の子は回収済み）は未回収の子と区別して保つ。`Unreaped` へ畳むと、呼び出し側が
 /// 回収済みの子を「回収できなかった」と誤って報告するため（#1311）。
-fn termination_after_kill(reap: Reap) -> OneShotTermination {
+fn termination_after_kill(reap: Reap) -> PluginTermination {
     match reap {
         Reap::Reaped(status) => classify_reaped(status),
         // 孫の停止を保証できないため成功扱いにしないが、直接の子は回収済みなので未回収にもしない。
-        Reap::GroupKillFailed => OneShotTermination::GroupKillFailed,
+        Reap::GroupKillFailed => PluginTermination::GroupKillFailed,
         // 他所で回収された。孤児ではないが終了状態は失われたため、終了コード不明の終了として返す
         // （呼び出し側で成功扱いにならない。`call_once` は `Unavailable`、常駐の終了は `exited_error`。#1513）。
-        Reap::Lost => OneShotTermination::Exited { code: None },
+        Reap::Lost => PluginTermination::Exited { code: None },
         // 既に回収済みのガードに対して呼ばれることはないが、終了状態が不明なため成功扱いしない。
-        Reap::AlreadyReaped | Reap::Unreaped => OneShotTermination::Unreaped,
+        Reap::AlreadyReaped | Reap::Unreaped => PluginTermination::Unreaped,
     }
 }
 
@@ -1072,14 +1078,14 @@ impl Reap {
 /// 持つ状態と `SIGKILL` 以外のシグナルによる終了は `Exited` として返し、成功 / 失敗の判定を
 /// `call_once` 側の終了コード検査へ委ねる。`SIGKILL` による終了のみ `Killed` とする
 /// （外部からの `SIGKILL` とこちらの kill は区別できないが、どちらも kill を試みた後の強制終了である）。
-fn classify_reaped(status: ExitStatus) -> OneShotTermination {
+fn classify_reaped(status: ExitStatus) -> PluginTermination {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
         if status.signal() == Some(crate::sys::SIGKILL) {
-            return OneShotTermination::Killed;
+            return PluginTermination::Killed;
         }
-        OneShotTermination::Exited {
+        PluginTermination::Exited {
             code: status.code(),
         }
     }
@@ -1089,8 +1095,8 @@ fn classify_reaped(status: ExitStatus) -> OneShotTermination {
     #[cfg(not(unix))]
     {
         match status.code() {
-            Some(0) => OneShotTermination::Exited { code: Some(0) },
-            _ => OneShotTermination::Killed,
+            Some(0) => PluginTermination::Exited { code: Some(0) },
+            _ => PluginTermination::Killed,
         }
     }
 }
@@ -1111,8 +1117,10 @@ fn timeout_error() -> PluginError {
     PluginError::new(PluginErrorCode::Timeout, "one-shot plugin call timed out")
 }
 
+/// 残り時間を 1 往復の期限へ変換する。都度起動と常駐の往復から呼ばれるため、上限は `RpcTimeout` 自身の
+/// 上限 [`UDS_RPC_TIMEOUT_MAX`] で切る（#2608）。
 fn rpc_timeout(remaining: Duration) -> Result<RpcTimeout, PluginError> {
-    RpcTimeout::new(remaining.min(ONE_SHOT_TIMEOUT_MAX))
+    RpcTimeout::new(remaining.min(UDS_RPC_TIMEOUT_MAX))
 }
 
 fn spawn_error(e: &io::Error) -> PluginError {
@@ -1134,14 +1142,14 @@ fn spawn_error(e: &io::Error) -> PluginError {
 ///
 /// 流れ: 一意名で listener を bind -> 子を spawn -> 接続を受け付け -> `request` 送信 -> 応答受信 ->
 /// 接続を閉じて子の終了を待つ。spawn から応答受信までが `timeout` の合計期限。接続前に子が
-/// 終了した場合は期限を待たず `Unavailable`。応答は得たが子が [`ONE_SHOT_EXIT_TIMEOUT`] 内に
-/// 終了しなかった場合は強制終了し、`Ok` と [`OneShotTermination::Killed`] を返す。応答後に非ゼロ・
+/// 終了した場合は期限を待たず `Unavailable`。応答は得たが子が [`PLUGIN_EXIT_TIMEOUT`] 内に
+/// 終了しなかった場合は強制終了し、`Ok` と [`PluginTermination::Killed`] を返す。応答後に非ゼロ・
 /// シグナルで終了した場合は `Unavailable`、回収を確認できない場合は `Internal` を返す（このときだけ
 /// 子が残っている可能性がある。メッセージに子の pid を含み、その子は以後回収しない。モジュール冒頭の
 /// 契約を参照）。
 ///
 /// stderr の読み取りスレッドは戻るまでに停止させる。停止を確認できなかった場合は
-/// [`OneShotStderr::reader_stopped`] が false になる。
+/// [`PluginStderr::reader_stopped`] が false になる。
 /// 非 unix では listener の bind が `Unimplemented` を返し、子は spawn されない。
 ///
 /// plugin の stderr は親へ継承させず [`OneShotOutcome::stderr`] で返す。本関数が親の stderr へ出す
@@ -1172,7 +1180,8 @@ pub fn call_once(
 ///
 /// 呼び出し側（core の plugin proxy 等）が `observer` で受け取り、成功 / 失敗件数とレイテンシ分布へ
 /// 集計する。`fandhe-container-core` の `OpRecorder` は依存方向（`core -> plugin`）のため本 crate から
-/// 参照できないので、記録の受け渡しは本型で行う。
+/// 参照できないので、記録の受け渡しは本型で行う。都度起動専用のため名前を保つ（常駐の対応物は
+/// `ResidentCallRecord`。#2608）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OneShotRecord {
@@ -1186,7 +1195,7 @@ pub struct OneShotRecord {
     pub elapsed: Duration,
     /// plugin が stderr へ書いた内容（untrusted・上限つき）。成功・失敗のどちらでも渡す。
     /// [`Self::to_json_line`] には内容を含めず、件数と打ち切りの有無だけを出す。
-    pub stderr: OneShotStderr,
+    pub stderr: PluginStderr,
 }
 
 impl OneShotRecord {
@@ -1316,13 +1325,13 @@ fn call_once_inner(
     audit: &mut dyn crate::audit::PeerAuthObserver,
     registry: &'static Registry,
 ) -> (
-    Result<(Frame, OneShotTermination), PluginError>,
-    OneShotStderr,
+    Result<(Frame, PluginTermination), PluginError>,
+    PluginStderr,
 ) {
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
     let Some(deadline) = Instant::now().checked_add(timeout.as_duration()) else {
-        return (Err(timeout_error()), OneShotStderr::empty());
+        return (Err(timeout_error()), PluginStderr::empty());
     };
 
     // 異常終了で残るこの名前の socket とロックファイルは、runtime directory の初期化時に掃除される
@@ -1334,7 +1343,7 @@ fn call_once_inner(
     );
     let listener = match UdsListener::bind(&plugin.socket_dir.join(name)) {
         Ok(l) => l,
-        Err(e) => return (Err(e), OneShotStderr::empty()),
+        Err(e) => return (Err(e), PluginStderr::empty()),
     };
 
     // stderr は親へ継承させない（plugin が親の stderr へ任意の量・内容を書けてしまうため）。
@@ -1346,7 +1355,7 @@ fn call_once_inner(
                     PluginErrorCode::Internal,
                     "failed to prepare capturing plugin stderr",
                 )),
-                OneShotStderr::empty(),
+                PluginStderr::empty(),
             );
         }
     };
@@ -1354,13 +1363,13 @@ fn call_once_inner(
     let spawned = {
         let mut cmd = match plugin_command(plugin, listener.path(), child_stderr) {
             Ok(c) => c,
-            Err(e) => return (Err(e), OneShotStderr::empty()),
+            Err(e) => return (Err(e), PluginStderr::empty()),
         };
         spawn_registered(&mut cmd, registry).map_err(launch_spawn_error)
     };
     let mut guard = match spawned {
         Ok(g) => g,
-        Err(e) => return (Err(e), OneShotStderr::empty()),
+        Err(e) => return (Err(e), PluginStderr::empty()),
     };
 
     // 接続待ちより前に読み取りを始める（子が接続前に大量に書いても詰まらせない）。
@@ -1376,13 +1385,13 @@ fn call_once_inner(
                     "failed to start capturing plugin stderr",
                 ),
             );
-            return (Err(error), OneShotStderr::empty());
+            return (Err(error), PluginStderr::empty());
         }
     };
     let result = exchange_and_reap(&mut guard, listener, request, deadline, audit);
     // 子の回収後に収集結果を受け取る。子が終了していれば書き込み端は閉じており即座に完了する。
     // 戻る時点で読み取りスレッドは停止している（停止を確認できなければ結果に記録する）。
-    let stderr = capture.finish(ONE_SHOT_STDERR_DRAIN_TIMEOUT);
+    let stderr = capture.finish(PLUGIN_STDERR_DRAIN_TIMEOUT);
     (result, stderr)
 }
 
@@ -1496,7 +1505,7 @@ fn exchange_and_reap(
     request: &Frame,
     deadline: Instant,
     audit: &mut dyn crate::audit::PeerAuthObserver,
-) -> Result<(Frame, OneShotTermination), PluginError> {
+) -> Result<(Frame, PluginTermination), PluginError> {
     // 受付・往復はブロック内で完結させ、抜けた時点で接続を閉じて子に EOF を見せる
     // （続けて listener を drop して socket を unlink してから終了を待つ）。
     let exchange = (|| -> Result<Frame, PluginError> {
@@ -1528,7 +1537,7 @@ fn exchange_and_reap(
         Ok(r) => r,
         Err(e) => return Err(reap_after_failure(guard, e)),
     };
-    let termination = guard.wait_or_kill(ONE_SHOT_EXIT_TIMEOUT);
+    let termination = guard.wait_or_kill(PLUGIN_EXIT_TIMEOUT);
     check_termination_after_response(guard, termination).map(|()| (response, termination))
 }
 
@@ -1539,13 +1548,13 @@ fn exchange_and_reap(
 /// `guard` に報告済みの印も付けない（#1311）。
 fn check_termination_after_response(
     guard: &mut ChildGuard,
-    termination: OneShotTermination,
+    termination: PluginTermination,
 ) -> Result<(), PluginError> {
     match termination {
-        OneShotTermination::Unreaped => Err(unreaped_error(guard, "the response")),
-        OneShotTermination::GroupKillFailed => Err(group_kill_failed_error("the response")),
-        OneShotTermination::Exited { code: Some(0) } | OneShotTermination::Killed => Ok(()),
-        OneShotTermination::Exited { .. } => Err(PluginError::new(
+        PluginTermination::Unreaped => Err(unreaped_error(guard, "the response")),
+        PluginTermination::GroupKillFailed => Err(group_kill_failed_error("the response")),
+        PluginTermination::Exited { code: Some(0) } | PluginTermination::Killed => Ok(()),
+        PluginTermination::Exited { .. } => Err(PluginError::new(
             PluginErrorCode::Unavailable,
             "plugin process exited abnormally after the response",
         )),
@@ -2233,7 +2242,7 @@ mod tests {
         assert!(!records[0].success);
         assert!(records[0].error_code.is_some());
         // 子を spawn していない経路では stderr の収集結果は空で完了済み。
-        assert_eq!(records[0].stderr, OneShotStderr::empty());
+        assert_eq!(records[0].stderr, PluginStderr::empty());
     }
 
     #[test]
@@ -2243,7 +2252,7 @@ mod tests {
             success: false,
             error_code: Some("TIMEOUT"),
             elapsed: Duration::from_micros(1500),
-            stderr: OneShotStderr {
+            stderr: PluginStderr {
                 bytes: b"\"}\n{\"op\":\"forged\"}".to_vec(),
                 total_bytes: 70000,
                 complete: false,
@@ -2268,20 +2277,20 @@ mod tests {
         // wait status の生値: 終了コードは上位 8 bit、シグナル番号は下位 7 bit。
         assert_eq!(
             classify_reaped(ExitStatus::from_raw(0)),
-            OneShotTermination::Exited { code: Some(0) }
+            PluginTermination::Exited { code: Some(0) }
         );
         assert_eq!(
             classify_reaped(ExitStatus::from_raw(3 << 8)),
-            OneShotTermination::Exited { code: Some(3) }
+            PluginTermination::Exited { code: Some(3) }
         );
         assert_eq!(
             classify_reaped(ExitStatus::from_raw(9)),
-            OneShotTermination::Killed
+            PluginTermination::Killed
         );
         // SIGKILL 以外のシグナル（SIGSEGV = 11）は強制終了扱いにせず、異常終了として返す。
         assert_eq!(
             classify_reaped(ExitStatus::from_raw(11)),
-            OneShotTermination::Exited { code: None }
+            PluginTermination::Exited { code: None }
         );
     }
 
@@ -2483,7 +2492,7 @@ mod tests {
         assert_eq!(status.code(), Some(3));
         assert_eq!(
             classify_reaped(status),
-            OneShotTermination::Exited { code: Some(3) }
+            PluginTermination::Exited { code: Some(3) }
         );
         assert_eq!(guard.kill_and_reap(), Reap::AlreadyReaped);
     }
@@ -2699,15 +2708,15 @@ mod tests {
     fn plug7_termination_after_kill_keeps_group_kill_failure_distinct() {
         assert_eq!(
             termination_after_kill(Reap::GroupKillFailed),
-            OneShotTermination::GroupKillFailed
+            PluginTermination::GroupKillFailed
         );
         assert_eq!(
             termination_after_kill(Reap::Unreaped),
-            OneShotTermination::Unreaped
+            PluginTermination::Unreaped
         );
         assert_eq!(
             termination_after_kill(Reap::AlreadyReaped),
-            OneShotTermination::Unreaped
+            PluginTermination::Unreaped
         );
     }
 
@@ -2755,11 +2764,11 @@ mod tests {
         // グループ停止失敗の時点で直接の子は回収済み（`child` は `None`）。その状態を再現する。
         assert_eq!(
             guard.wait_or_kill(Duration::from_secs(5)),
-            OneShotTermination::Exited { code: Some(0) }
+            PluginTermination::Exited { code: Some(0) }
         );
         assert_eq!(guard.pid(), None);
 
-        let e = check_termination_after_response(&mut guard, OneShotTermination::GroupKillFailed)
+        let e = check_termination_after_response(&mut guard, PluginTermination::GroupKillFailed)
             .unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Internal);
         assert_eq!(
@@ -2771,14 +2780,14 @@ mod tests {
 
         // 未回収の子は従来どおり別のメッセージで報告する（両者を取り違えない）。
         let e =
-            check_termination_after_response(&mut guard, OneShotTermination::Unreaped).unwrap_err();
+            check_termination_after_response(&mut guard, PluginTermination::Unreaped).unwrap_err();
         assert_eq!(e.code(), PluginErrorCode::Internal);
         assert_eq!(
             e.message(),
             "plugin process could not be reaped after the response"
         );
         assert_eq!(
-            check_termination_after_response(&mut guard, OneShotTermination::Killed),
+            check_termination_after_response(&mut guard, PluginTermination::Killed),
             Ok(())
         );
     }
@@ -2792,7 +2801,7 @@ mod tests {
         reset_group_kill_sends();
         assert_eq!(
             guard.wait_or_kill(Duration::from_secs(5)),
-            OneShotTermination::Exited { code: Some(0) }
+            PluginTermination::Exited { code: Some(0) }
         );
         assert_grandchild_gone(gc);
         assert_eq!(group_kill_sends(), 1);
@@ -2820,12 +2829,12 @@ mod tests {
         let mut lingering = ChildGuard::new(spawn("exec sleep 60"));
         assert_eq!(
             lingering.wait_or_kill(Duration::from_millis(50)),
-            OneShotTermination::Killed
+            PluginTermination::Killed
         );
         let mut failing = ChildGuard::new(spawn("exit 7"));
         assert_eq!(
             failing.wait_or_kill(Duration::from_secs(5)),
-            OneShotTermination::Exited { code: Some(7) }
+            PluginTermination::Exited { code: Some(7) }
         );
     }
 
@@ -2858,10 +2867,10 @@ mod tests {
         );
     }
 
-    /// 上限を超える stderr は先頭 `ONE_SHOT_STDERR_MAX_BYTES` だけ保持し、総量を数える（REPAIR-5）。
+    /// 上限を超える stderr は先頭 `PLUGIN_STDERR_MAX_BYTES` だけ保持し、総量を数える（REPAIR-5）。
     #[test]
     fn plug7_stderr_capture_keeps_only_the_cap() {
-        let mut data = vec![b'a'; ONE_SHOT_STDERR_MAX_BYTES];
+        let mut data = vec![b'a'; PLUGIN_STDERR_MAX_BYTES];
         data.extend_from_slice(&[b'b'; 34_464]);
         let capture = StderrCapture::start(io::Cursor::new(data), Box::new(|| {})).unwrap();
         let got = capture.finish(Duration::from_secs(5));
@@ -3140,7 +3149,7 @@ mod tests {
         assert!(Reap::Lost.is_reaped());
         assert_eq!(
             g.wait_or_kill(Duration::from_millis(10)),
-            OneShotTermination::Exited { code: None }
+            PluginTermination::Exited { code: None }
         );
         // スロットは解放済みで、表の容量を消費し続けない。
         let _a = reg.reserve().unwrap();
@@ -3241,7 +3250,7 @@ mod tests {
         guard.group_kill_failed_after_exit = true;
         assert_eq!(
             guard.wait_or_kill(Duration::from_secs(5)),
-            OneShotTermination::GroupKillFailed
+            PluginTermination::GroupKillFailed
         );
         assert_eq!(guard.kill_and_reap(), Reap::GroupKillFailed);
     }
@@ -3266,7 +3275,7 @@ mod tests {
         reported.group_kill_failed_after_exit = true;
         assert_eq!(
             reported.wait_or_kill(Duration::from_secs(5)),
-            OneShotTermination::GroupKillFailed
+            PluginTermination::GroupKillFailed
         );
         assert!(reported.child.is_none());
         let mut lines: Vec<String> = Vec::new();

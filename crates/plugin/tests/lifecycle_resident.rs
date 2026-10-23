@@ -40,7 +40,7 @@ fn plug7_resident_requires_unix_transport() {
 #[cfg(unix)]
 mod unix {
     use fandhe_container_plugin::{
-        Frame, OneShotTermination, PLUGIN_SOCKET_ENV, PluginErrorCode, PluginLaunchSpec,
+        Frame, PLUGIN_SOCKET_ENV, PluginErrorCode, PluginLaunchSpec, PluginTermination,
         ResidentCallRecord, ResidentPlugin, ResidentStartTimeout, ResidentState, RpcTimeout,
         UdsStream,
     };
@@ -463,7 +463,7 @@ mod unix {
         let done = session.shutdown().unwrap();
         assert_eq!(
             done.termination(),
-            OneShotTermination::Exited { code: Some(0) }
+            PluginTermination::Exited { code: Some(0) }
         );
         assert_process_gone(child_pid);
         no_socket_left(&dir);
@@ -575,7 +575,7 @@ mod unix {
         let done = session.shutdown().unwrap();
         assert_eq!(
             done.termination(),
-            OneShotTermination::Exited { code: Some(0) }
+            PluginTermination::Exited { code: Some(0) }
         );
         assert_grandchild_gone(&dir);
     }
@@ -668,7 +668,7 @@ mod unix {
         let child_pid = session.pid().unwrap();
         session.call(&ping(), rpc(5000)).unwrap();
         let done = with_watchdog("shutdown", move || session.shutdown());
-        assert_eq!(done.unwrap().termination(), OneShotTermination::Killed);
+        assert_eq!(done.unwrap().termination(), PluginTermination::Killed);
         assert_process_gone(child_pid);
     }
 
@@ -831,7 +831,7 @@ mod unix {
         let done = session.shutdown().unwrap();
         assert_eq!(
             done.termination(),
-            OneShotTermination::Exited { code: Some(0) }
+            PluginTermination::Exited { code: Some(0) }
         );
         // 対照: 差し替え後のパスから新しく起動対象を作るとスクリプトとして拒否される。
         let err = fx.try_target_from_path().unwrap_err();

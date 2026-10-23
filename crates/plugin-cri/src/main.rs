@@ -95,8 +95,11 @@ fn serve(socket: &std::path::Path) -> ExitCode {
     ) {
         Ok(f) => Some(std::sync::Arc::new(f)),
         Err(_) => {
-            eprintln!("error: audit_delivery_unavailable: failed to start the audit thread");
-            return ExitCode::from(EXIT_FAILURE);
+            // code は PluginErrorCode のトークンに揃える（`error: <CODE>: <message>` の契約）。
+            return fail(
+                PluginErrorCode::Unavailable,
+                "audit delivery unavailable: failed to start the audit thread",
+            );
         }
     };
     // 非 Linux は永続化経路が未実装（#2430 の判断待ち。REPAIR-3）。拒否は stderr にだけ残る。

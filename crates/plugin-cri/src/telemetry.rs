@@ -430,6 +430,8 @@ mod tests {
     struct VecSink {
         records: Mutex<Vec<AuditRecord>>,
         gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        /// `record` が gate に入った（ワーカーが sink で止まった）ことを試験へ知らせる。
+        entered: std::sync::atomic::AtomicBool,
         fail: bool,
     }
 
@@ -438,6 +440,7 @@ mod tests {
             Arc::new(Self {
                 records: Mutex::new(Vec::new()),
                 gate: Mutex::new(None),
+                entered: std::sync::atomic::AtomicBool::new(false),
                 fail,
             })
         }
@@ -448,7 +451,9 @@ mod tests {
             &self,
             record: &AuditRecord,
         ) -> Result<(), fandhe_container_core::traits::TraitError> {
-            if let Some(rx) = lock(&self.gate).take() {
+            let gate = lock(&self.gate).take();
+            if let Some(rx) = gate {
+                self.entered.store(true, Ordering::SeqCst);
                 let _ = rx.recv();
             }
             if self.fail {
@@ -536,16 +541,31 @@ mod tests {
         let out = Arc::new(Mutex::new(Vec::new()));
         let notices = LineSink::spawn(Box::new(Collect(out.clone())), 8);
         let fwd = PeerAuditForwarder::spawn(sink.clone(), 2, notices.clone()).unwrap();
-        let started = std::time::Instant::now();
-        for _ in 0..20 {
+        let reject = || {
             fwd.submit_rejection(
                 PluginPeerRejection::PeerUidMismatch,
                 std::path::Path::new("/s.sock"),
+            )
+        };
+        // ワーカーが sink の gate で止まるまで待つ。ワーカーは記録を取り出す前に欠落件数を通知して引くため、
+        // 止まる前に溢れさせると件数が引かれて下限が不定になる（間欠失敗の原因）。
+        reject();
+        let wait = std::time::Instant::now() + Duration::from_secs(5);
+        while !sink.entered.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < wait,
+                "worker never entered sink"
             );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..20 {
+            reject();
         }
         assert!(started.elapsed() < Duration::from_secs(2));
+        // ワーカーは止まっているので引かれない。キュー容量 2 が埋まり、残り 18 件がちょうど欠落になる。
         let dropped = fwd.dropped();
-        assert!(dropped >= 15, "dropped={dropped}");
+        assert_eq!(dropped, 18);
         drop(gate);
         fwd.wait_idle(Duration::from_secs(5));
         // 次の記録（または 1 秒の周期）で欠落が通知される。

@@ -56,8 +56,8 @@
 //! （`<state_root>/@container-logs`）、世代の並びは [`rotating`] の名前空間に従う。`--tail` / `--stream` / `--escape` /
 //! `--follow` に当たる指定は [`reader::read_container_log_with`] が受ける（CLI-1・SUP-7）。
 //!
-//! # 後始末（#2446・SUP-7・CLI-1）
-//! CLI の `delete` が core の delete の成功後に [`remove_container_logs_bounded`] で現在ログ・全世代・ロックファイルを
+//! # 後始末（#2446・#2593・SUP-7・CLI-1・CRI-2）
+//! CLI の `delete` と plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）が core の delete の成功後に [`remove_container_logs_bounded`] で現在ログ・全世代・ロックファイルを
 //! 消す（stderr へは何も書かない。失敗は delete を失敗にせず、CLI が構造化された警告 1 行にする）。
 //!
 //! # 未実装（将来仕様。REPAIR-3）
@@ -92,7 +92,7 @@ pub fn container_log_dir(root: &std::path::Path) -> std::path::PathBuf {
     root.join(CONTAINER_LOG_DIR_NAME)
 }
 
-/// `id` のコンテナログ（現在ログ・全世代・ロックファイル）を消す（stderr へは何も書かない。CLI の `delete` 用。#2446・SUP-7・ERR-2）。
+/// `id` のコンテナログ（現在ログ・全世代・ロックファイル）を消す（stderr へは何も書かない。CLI の `delete` と plugin-cri の `RemoveContainer` 用。#2446・#2593・SUP-7・ERR-2）。
 ///
 /// `@container-logs` が無ければ 0 件で成功する（create しただけで start していないコンテナ。冪等）。同じ ID の sink が
 /// 生存中なら `FailedPrecondition` で何も消さない。名前空間に受理できない別名・不正な世代があれば `InvalidArgument` で

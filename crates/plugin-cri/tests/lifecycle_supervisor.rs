@@ -570,6 +570,11 @@ fn cri2_delete_with_cgroup_uses_injected_remover() {
         .snapshot_op(&OpName::new("supervisor_log_remove").expect("name"))
         .expect("log removal recorded");
     assert_eq!((stats.success(), stats.failure()), (1, 0));
+    // コンテナログ（#2593）は `@container-logs` が無くても 0 件で成功として計上される。
+    let stats = recorder
+        .snapshot_op(&OpName::new("container_log_remove").expect("name"))
+        .expect("container log removal recorded");
+    assert_eq!((stats.success(), stats.failure()), (1, 0));
 }
 
 /// fail-closed: 委譲 cgroup の検出に失敗したら cgroup も状態記録も残したまま、コードを保った固定文言で失敗する。

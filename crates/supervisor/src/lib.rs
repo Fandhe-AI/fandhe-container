@@ -43,7 +43,7 @@
 //! | #1719 | TASK-171 追補 | 特権ランチャー bin `fandhe-container-launcher`（[`launcher`]。入口検証 → `elevate` → 検証済み fd の `execveat`。hash / 署名照合・ambient の子での解除〔healthcheck exec。#495〕・実機検証〔#538・#539〕は未実装。REPAIR-3） |
 //! | #1543 | TASK-79 追補 | `logs` でコンテナログの内容を読み出す（[`logs::reader`]。ディレクトリは `<root>/@container-logs`。CLI-1・SUP-7） |
 //! | #2067 | TASK-79 追補 | supervisor の構造化ログ（stderr）の保存先（[`supervisor_log`]。`<root>/@supervisor-logs/<id>.log*`。REPAIR-4） |
-//! | #2446 | TASK-164 追補 | CLI の `delete` でコンテナログ（`<root>/@container-logs/<id>.log*`）を消す入口（[`logs::remove_container_logs`]・期限つきは [`logs::remove_container_logs_bounded`]。SUP-7・CLI-1） |
+//! | #2446 | TASK-164 追補 | CLI の `delete` と plugin-cri の `RemoveContainer`（#2593・CRI-2）でコンテナログ（`<root>/@container-logs/<id>.log*`）を消す入口（[`logs::remove_container_logs`]・期限つきは [`logs::remove_container_logs_bounded`]。SUP-7・CLI-1） |
 //! | #2133 | CORE-3・CORE-4 | systemd user マネージャへの到達検査（`user_scope`。Linux のみ。CLI の start・doctor とベンチが共有） |
 //! | #2243 | TASK-157 追補 | rootless の ID 写像モデルの選択（`RootlessSingleId` か範囲写像 `RootlessSubordinateIds` か。条件と所有者名の取得は `id_model`、結線は `ProductionStartDeps`）。CORE-6・SEC-5。実機での確認は #1621 |
 //! | #2058 | TASK-157 追補 | CLI からのシグナル送信を受ける制御チャネル（[`control`]。コンテナごとの UDS。サーバ・クライアント入口〔`ControlSignaler`〕は実装済み。CLI の `stop` への結線は済み〔#2059〕、`kill` への結線〔#1902〕・stop の意図の伝達〔SUP-9〕は未実装。REPAIR-3） |

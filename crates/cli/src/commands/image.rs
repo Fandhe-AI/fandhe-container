@@ -37,6 +37,8 @@
 //!
 //! oci の契約（ガードを保持したまま `StateStore` の操作を取らない・状態のスナップショットはガード取得前に読む）を守る。
 //! 1. ガードを取り `--force` なしで判定する。参照が無い・`UntagOnly`/`Delete` ならそのまま実行して終わる。
+//!    使用中の拒否なら、**ガードを手放して**拒否に載った参照を照合・回収し（`ref_reconcile`。create ゲートの排他の下。#2495）、
+//!    もう一度同じ判定をする（照合できなければ何も外さず拒否のまま）。
 //! 2. 使用中で `--force` なしなら拒否する。`--force` ありなら**ガードを手放して**状態ストアを読み、
 //!    停止中のコンテナの集合を作る（読めなければそのエラーで終了。fail-closed）。
 //! 3. 再びガードを取り、スナップショット付きで判定し直す。スナップショット後に起動したコンテナは実行中扱いで拒否される。
@@ -52,7 +54,7 @@
 //! - macOS / Windows ではイメージキャッシュの置き場（ゲスト VM 内かホストか）が未決のため、ローカルの oci を呼ばず
 //!   他コマンドと同じ plugin 解決の失敗（`list_logs::store_open_failure`）で fail-closed に失敗する。
 //! - `system df` の containers・staging・展開後サイズは oci が未計測のため出さない（#2222）。
-//! - `image prune` の CLI 配線、oci の `OciOpRecorder` と CLI 計測の橋渡しは範囲外。
+//! - `image prune` の CLI 配線（配線時は `image rm` と同じく `ref_reconcile::reconcile_in_use` を呼ぶ）、oci の `OciOpRecorder` と CLI 計測の橋渡しは範囲外。
 
 use std::io::Write;
 use std::num::NonZeroU32;
@@ -75,6 +77,7 @@ use super::args::{GlobalArgs, ImageArgs, SystemArgs};
 use super::create_start::{OP_LOG_ENV, export_ops, open_store};
 use super::image_refs::{ref_key, state_scope};
 use super::list_logs::{MAX_LIST_PAGES, record_op, store_open_failure};
+use super::ref_reconcile::reconcile_for_image_rm;
 use crate::error::CliError;
 use fandhe_container_core::state_store::StateRoot;
 
@@ -370,12 +373,28 @@ fn run_system_df_with(store: &ImageStore, out: &mut dyn Write) -> CliExit {
     }
 }
 
-/// `image rm` の実処理。`snapshot` は `--force` で使用中のときだけ、**ガードを手放した状態で**呼ばれる。
+/// `image rm` の実処理（参照の照合なし）。`run_image_rm_reclaiming` の `reclaim` を何もしない形にしたもの（試験用）。
+#[cfg(test)]
 fn run_image_rm_with(
     store: &ImageStore,
     target: &ImageRmTarget,
     force: bool,
     snapshot: &dyn Fn() -> Result<StoppedContainers, CliExit>,
+    out: &mut dyn Write,
+) -> CliExit {
+    run_image_rm_reclaiming(store, target, force, snapshot, &|_| {}, out)
+}
+
+/// `image rm` の実処理。`snapshot` は `--force` で使用中のときだけ、**ガードを手放した状態で**呼ばれる。
+///
+/// 1 回目の判定が使用中で拒否したら、**ガードを手放した状態で** `reclaim`（拒否に載った参照の照合と回収。契機 B・#2495）を
+/// 呼び、判定をやり直す。照合に失敗・保留しても従来どおりの拒否に進む（残す側に誤る）。
+fn run_image_rm_reclaiming(
+    store: &ImageStore,
+    target: &ImageRmTarget,
+    force: bool,
+    snapshot: &dyn Fn() -> Result<StoppedContainers, CliExit>,
+    reclaim: &dyn Fn(&[ContainerRefId]),
     out: &mut dyn Write,
 ) -> CliExit {
     let opts = if force {
@@ -385,15 +404,34 @@ fn run_image_rm_with(
     };
     let none = StoppedContainers::new();
     // 1 回目: スナップショット無し（全コンテナ実行中扱い）で判定する。
-    let first = {
+    // `Err(containers)` は使用中の拒否（拒否に載った参照の全件）。
+    let attempt = || -> Result<Result<_, Vec<ContainerRefId>>, CliExit> {
         let mut guard = match store.lock() {
             Ok(g) => g,
-            Err(e) => return oci_failure(&e, Stage::Lock),
+            Err(e) => return Err(oci_failure(&e, Stage::Lock)),
         };
         match guard.plan_image_rm_with(target, &opts, &none) {
-            Err(e) => return oci_failure(&e, Stage::Remove),
-            Ok(ImageRmPlan::Refuse(_)) => None,
-            Ok(_) => Some(guard.execute_image_rm(store.root(), target, &opts, &none)),
+            Err(e) => Err(oci_failure(&e, Stage::Remove)),
+            Ok(ImageRmPlan::Refuse(u)) => Ok(Err(u.containers)),
+            Ok(_) => Ok(Ok(guard.execute_image_rm(
+                store.root(),
+                target,
+                &opts,
+                &none,
+            ))),
+        }
+    };
+    let first = match attempt() {
+        Err(e) => return e,
+        Ok(Ok(r)) => Some(r),
+        Ok(Err(containers)) => {
+            // ガードは手放し済み。照合は状態ストアとゲートを使うため、ガードの外で呼ぶ（ロック順序）。
+            reclaim(&containers);
+            match attempt() {
+                Err(e) => return e,
+                Ok(Ok(r)) => Some(r),
+                Ok(Err(_)) => None,
+            }
         }
     };
     let result = match first {
@@ -520,11 +558,12 @@ pub(super) fn run_image(global: &GlobalArgs, args: &ImageArgs, stdout: &mut dyn 
                 Err(e) => return oci_failure(&e, Stage::Remove),
             };
             match open_image_store(&a.image_root) {
-                Ok(store) => run_image_rm_with(
+                Ok(store) => run_image_rm_reclaiming(
                     &store,
                     &target,
                     a.force,
                     &|| stopped_snapshot(global),
+                    &|candidates| reconcile_for_image_rm(global, &store, candidates),
                     stdout,
                 ),
                 Err(e) => e,
@@ -849,6 +888,64 @@ mod tests {
         );
         assert_eq!(called.get(), 1);
         assert!(tmp.has_blob('a') && tmp.has_blob('b'));
+    }
+
+    /// OCI-7・#2495: 状態の無い参照だけが残った manifest の `image rm` は、拒否の前に照合・回収されて成功する。
+    /// 他の状態ルートの参照は回収されず、従来どおり拒否される。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_image_rm_reclaims_stale_ref_then_deletes() {
+        use super::super::ref_reconcile::reconcile_in_use;
+        use fandhe_container_core::state_store::FileStateStore;
+        let scope = "0123456789abcdef0123456789abcdef";
+        let other = "fedcba9876543210fedcba9876543210";
+        let state_tmp = Tmp::new();
+        let state = FileStateStore::open(
+            StateRoot::from_override(state_tmp.path().join("state")).expect("root"),
+        )
+        .expect("state");
+        let reclaim = |store: &ImageStore, c: &[ContainerRefId]| {
+            reconcile_in_use(store, &state, scope, c);
+        };
+
+        let tmp = Tmp::new();
+        tmp.put_blob('a', 1);
+        tmp.put_blob('b', 1);
+        let key = super::ref_key(scope, "c1");
+        let store = rm_store(&tmp, &[key.as_str()]);
+        let (e, out) = out_of(|o| {
+            run_image_rm_reclaiming(
+                &store,
+                &target("busybox"),
+                false,
+                &no_snapshot,
+                &|c| reclaim(&store, c),
+                o,
+            )
+        });
+        assert_eq!(e.exit_code(), 0);
+        assert!(out.contains("deleted\tsha256:"), "{out}");
+        assert!(!tmp.has_blob('a') && !tmp.has_blob('b'));
+
+        let tmp2 = Tmp::new();
+        tmp2.put_blob('a', 1);
+        tmp2.put_blob('b', 1);
+        let foreign = super::ref_key(other, "c1");
+        let store2 = rm_store(&tmp2, &[foreign.as_str()]);
+        let (e, out) = out_of(|o| {
+            run_image_rm_reclaiming(
+                &store2,
+                &target("busybox"),
+                false,
+                &no_snapshot,
+                &|c| reclaim(&store2, c),
+                o,
+            )
+        });
+        assert_eq!(e.exit_code(), 5);
+        assert_eq!(e.code(), Some("FAILED_PRECONDITION"));
+        assert_eq!(out, "");
+        assert!(tmp2.has_blob('a') && tmp2.has_blob('b'));
     }
 
     /// OCI-7: アダプタが scope つきで登録した参照（長い ID を含む）は、同じ参照キーの停止中スナップショットで

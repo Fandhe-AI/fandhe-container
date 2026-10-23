@@ -141,6 +141,11 @@ impl ImageStore {
         &self.root
     }
 
+    /// 排他区間の取得を待つ上限（`with_timeout` の値）。create ゲートが同じ期限を使う。
+    pub(super) fn lock_timeout(&self) -> Duration {
+        self.timeout
+    }
+
     /// 排他区間を取得する。スレッド間・プロセス間で他の保持者がいれば期限まで待ち、超過は `Timeout`。
     ///
     /// 取得ごとに成否・エラー code・所要時間を記録先へ渡す（REPAIR-4）。期限が `Instant` で表現できない
@@ -263,7 +268,7 @@ impl DerefMut for ImageStoreGuard<'_> {
 }
 
 /// 期限内なら再試行間隔だけ待つ。超過は `Timeout`。
-fn wait_or_timeout(deadline: Instant) -> Result<(), OciError> {
+pub(super) fn wait_or_timeout(deadline: Instant) -> Result<(), OciError> {
     if Instant::now() >= deadline {
         return Err(OciError::new(
             OciErrorCode::Timeout,
@@ -353,7 +358,14 @@ fn verify_ancestor_meta(meta: &fs::Metadata, euid: u32) -> Result<(), OciError> 
 
 /// `@lock` を開く（無ければ 0600 で作る）。symlink・通常ファイル以外は拒否する。
 fn open_lock_file(root: &Path) -> Result<File, OciError> {
-    let path = root.join(IMAGE_STORE_LOCK_FILE_NAME);
+    open_named_lock_file(root, IMAGE_STORE_LOCK_FILE_NAME)
+}
+
+/// root 直下の固定名ロックファイルを開く（無ければ 0600 で作る）。symlink・通常ファイル以外は拒否する。
+///
+/// `name` は定数だけを渡す（外部入力からパスを組まない）。`@lock` と create ゲート（`create_gate.rs`）が共用する。
+pub(super) fn open_named_lock_file(root: &Path, name: &str) -> Result<File, OciError> {
+    let path = root.join(name);
     let pre = match fs::symlink_metadata(&path) {
         Ok(m) if m.is_file() => Some(m),
         Ok(_) => return Err(lock_file_error()),

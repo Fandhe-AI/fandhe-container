@@ -17,6 +17,8 @@
 //!   `image_refs::StoreImageRefs` で登録・確定する（#2315）。レイヤーの展開はしない（本番の展開器は #2377。bundle の rootfs は展開済みの前提）。
 //!   manifest の在庫は永続化済み（#2380）だが、本番で在庫を埋める経路（pull → `ImageStore` の配線）が未実装のため、`register` は
 //!   常に `NOT_FOUND` になり、本番ではイメージつき create はその配線まで成功しない。タグ参照の解決もしない（digest のみ）。
+//!   core 呼び出しの前に同じ参照キーの残骸（状態の無い参照）を回収し（契機 A）、呼び出し全体を create ゲートの共有で包む
+//!   （`ref_reconcile`・`docs/design/container-ref-reconcile.md`。#2495）。
 //! - 本番入口の `start` は、状態ストアで ID の存在を確かめた後、CLI の実体と同じディレクトリの
 //!   `fandhe-container-supervisor` を起動して結果を受け取る（`supervisor_start` module の doc に契約・期限・
 //!   未実装範囲を書く）。supervisor が core の本番 launcher（#1715・#1819）で起動し、Running の記録は supervisor が行う
@@ -43,9 +45,10 @@ use fandhe_container_core::traits::{
 
 use super::CliExit;
 use super::args::{CreateArgs, GlobalArgs, StartArgs};
-use super::image::open_image_store_for_lifecycle;
+use super::image::{Stage, open_image_store_for_lifecycle, trait_failure};
 use super::image_refs::{StoreImageRefs, state_scope};
-use fandhe_container_oci::image_management::ImageStore;
+use super::ref_reconcile::reclaim_stale_ref_recorded;
+use fandhe_container_oci::image_management::{ContainerCreatePass, ImageStore};
 
 /// core の操作へ注入する依存の束（`start` は core を呼ばないため、状態ストアの存在確認と計測にだけ使う）。
 pub(super) struct Runtime {
@@ -75,11 +78,13 @@ pub(super) struct CreateImage {
 /// 構築済みの要求で core の `create_with_image` を呼ぶ（OCI-7・#2315）。
 ///
 /// 参照の登録・確定・失敗時の巻き戻しは core が行う。展開器は付けない（本番の展開器は #2377 で、
-/// bundle の rootfs は展開済みの前提）。
+/// bundle の rootfs は展開済みの前提）。`_pass`（create ゲートの共有）を要求し、未確定参照の回収側が
+/// 進行中の create を見分けられない呼び出しを型で防ぐ（#2495）。
 pub(super) fn create_container_with_image(
     rt: &Runtime,
     image: &CreateImage,
     req: &CreateRequest,
+    _pass: &ContainerCreatePass<'_>,
 ) -> Result<StateRecord, OciRuntimeError> {
     let refs = StoreImageRefs::new(&image.store, &image.scope);
     create_with_image_audited(
@@ -89,6 +94,32 @@ pub(super) fn create_container_with_image(
         req,
         rt.audit.as_ref(),
     )
+}
+
+/// イメージつき create の本番の流れ（契機 A。`ref_reconcile` の doc・#2495）。
+///
+/// 1. 同じ参照キーの残骸（状態の無い参照）を回収する（失敗・保留でも続行。判定は core の `register` に任せる）
+/// 2. create ゲートの共有を取る（取れなければ状態を作る前に失敗。fail-closed）
+/// 3. 共有を保持したまま core の `create_with_image` を呼ぶ
+pub(super) fn create_container_with_image_reclaiming(
+    rt: &Runtime,
+    image: &CreateImage,
+    req: &CreateRequest,
+) -> Result<StateRecord, OciRuntimeError> {
+    reclaim_stale_ref_recorded(
+        &image.store,
+        rt.store.as_ref(),
+        &rt.recorder,
+        &image.scope,
+        req.id(),
+    );
+    let gate_started = Instant::now();
+    let pass = image.store.enter_container_create().map_err(|e| {
+        // ゲート取得の失敗は core に到達せず core 側の計測に載らないため、ここで create の失敗として記録する（REPAIR-4）。
+        record_pre_core_failure(&rt.recorder, "create", gate_started);
+        OciRuntimeError::from_trait_error(LifecycleOp::Create, trait_failure(&e, Stage::Refs))
+    })?;
+    create_container_with_image(rt, image, req, &pass)
 }
 
 /// create の要求と、`--image-root` / `--image` があればその検証済みの入力を作る。
@@ -594,7 +625,7 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))
     .and_then(|(rt, (req, image))| {
         let r = match &image {
-            Some(image) => create_container_with_image(&rt, image, &req),
+            Some(image) => create_container_with_image_reclaiming(&rt, image, &req),
             None => create_container(&rt, &req),
         };
         export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
@@ -1452,6 +1483,78 @@ mod tests {
             assert_eq!(e.code(), ErrorCode::AlreadyExists);
             assert_eq!(e.exit_code().get(), 4);
             assert_eq!(e.op(), LifecycleOp::Create);
+        }
+
+        fn gate_test_image(base: &TmpDir) -> CreateImage {
+            let root = base.0.join("images");
+            std::fs::create_dir_all(&root).expect("mkdir");
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                    .expect("chmod");
+            }
+            CreateImage {
+                store: ImageStore::open(&root).expect("store"),
+                manifest: ImageManifestDigest::new(IMG_DIGEST).expect("digest"),
+                scope: "scope".into(),
+            }
+        }
+
+        /// REPAIR-4・OCI-7: create ゲートの共有取得が Timeout になっても create の失敗が 1 件記録される。
+        #[test]
+        fn repair4_create_gate_timeout_is_recorded_as_create_failure() {
+            let base = TmpDir::new("gate-timeout");
+            let bundle = make_bundle(&base);
+            let rt = runtime(&base);
+            let image = gate_test_image(&base);
+            let holder = ImageStore::open(&base.0.join("images")).expect("holder");
+            let _q = holder
+                .quiesce_container_creates()
+                .expect("q")
+                .expect("some");
+            let req = build_create_request(&CreateArgs {
+                bundle,
+                id: "c1".into(),
+                image: None,
+            })
+            .expect("req");
+            let e = create_container_with_image_reclaiming(&rt, &image, &req).expect_err("timeout");
+            assert_eq!(e.op(), LifecycleOp::Create);
+            let snap = rt
+                .recorder
+                .snapshot_op(&OpName::new("create").expect("name"))
+                .expect("snap");
+            assert_eq!(snap.failure(), 1);
+            assert_eq!(snap.success(), 0);
+        }
+
+        /// REPAIR-4・OCI-7: ゲートファイルを開けない場合（ディレクトリで置換）も create の失敗が 1 件記録される。
+        #[test]
+        fn repair4_create_gate_open_failure_is_recorded_as_create_failure() {
+            let base = TmpDir::new("gate-open");
+            let bundle = make_bundle(&base);
+            let rt = runtime(&base);
+            let image = gate_test_image(&base);
+            std::fs::create_dir(
+                base.0.join("images").join(
+                    fandhe_container_oci::image_management::IMAGE_STORE_CREATE_GATE_FILE_NAME,
+                ),
+            )
+            .expect("gate dir");
+            let req = build_create_request(&CreateArgs {
+                bundle,
+                id: "c1".into(),
+                image: None,
+            })
+            .expect("req");
+            let e = create_container_with_image_reclaiming(&rt, &image, &req).expect_err("open");
+            assert_eq!(e.op(), LifecycleOp::Create);
+            let snap = rt
+                .recorder
+                .snapshot_op(&OpName::new("create").expect("name"))
+                .expect("snap");
+            assert_eq!(snap.failure(), 1);
+            assert_eq!(snap.success(), 0);
         }
 
         /// ERR-2: 未 create の ID の start は NOT_FOUND（3）で、supervisor を起動する前に返る。

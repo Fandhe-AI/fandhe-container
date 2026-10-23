@@ -65,6 +65,28 @@ fn oci7_gate_child_holds_create() {
     }
 }
 
+/// 子の回収に許す上限（REPAIR-5: 期限なしの待ちを置かない）。
+const REAP_DEADLINE: Duration = Duration::from_secs(10);
+
+/// 子を kill し、`try_wait` のポーリングで有限の期限内に回収する。失敗・期限超過は Err。
+fn kill_and_reap(child: &mut std::process::Child) -> Result<(), String> {
+    child
+        .kill()
+        .map_err(|e| format!("kill child failed: {e}"))?;
+    let deadline = Instant::now() + REAP_DEADLINE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(e) => return Err(format!("try_wait child failed: {e}")),
+        }
+        if Instant::now() >= deadline {
+            return Err("child was not reaped within the deadline after kill".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// OCI-7: 別プロセスの create 中は回収せず、そのプロセスが kill された後は同じ参照を回収できる。
 #[test]
 fn oci7_gate_excludes_reconcile_until_creator_is_killed() {
@@ -101,11 +123,14 @@ fn oci7_gate_excludes_reconcile_until_creator_is_killed() {
     });
 
     // 子を強制終了する（kill はシグナル配送のみ。wait はカーネルがプロセスを回収するまで）。
-    let _ = child.kill();
-    let _ = child.wait();
+    let reaped = kill_and_reap(&mut child);
     if let Err(p) = result {
         let _ = std::fs::remove_dir_all(&root);
         std::panic::resume_unwind(p);
+    }
+    if let Err(e) = reaped {
+        let _ = std::fs::remove_dir_all(&root);
+        panic!("{e}");
     }
 
     let store = ImageStore::open(&root)

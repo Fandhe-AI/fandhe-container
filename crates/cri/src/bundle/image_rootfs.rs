@@ -83,7 +83,7 @@ const MAX_ANNOTATIONS: usize = 64;
 const MAX_ID_DIGITS: usize = 10;
 /// `/etc/passwd`・`/etc/group` 1 ファイルの読み取り上限（REPAIR-5・SEC-1）。
 const MAX_ETC_FILE_BYTES: u64 = 1 << 20;
-/// 上記ファイルの走査行数の上限。
+/// 上記ファイルの行数の上限（超過は未解決。切り捨てない）。
 const MAX_ETC_LINES: usize = 65_536;
 /// 名前 1 件の最大バイト数。
 const MAX_NAME_BYTES: usize = 256;
@@ -422,7 +422,6 @@ fn parse_user_lookup(user: &str) -> Option<UserLookup> {
 /// passwd / group の行を走査する。空行・コメント・NIS（`+` `-`）行・UTF-8 でない行は読み飛ばす。
 fn etc_fields(body: &[u8]) -> impl Iterator<Item = Vec<&str>> {
     body.split(|b| *b == b'\n')
-        .take(MAX_ETC_LINES)
         .filter_map(|l| std::str::from_utf8(l).ok())
         .map(|l| l.trim_end_matches('\r'))
         .filter(|l| !l.is_empty() && !l.starts_with(['#', '+', '-']))
@@ -458,7 +457,14 @@ fn group_gid(body: &[u8], name: &str) -> Option<u32> {
 
 /// rootfs の `etc/<file>` を fd 起点で読む。`Ok(None)` は不在、`Err` は読めない（呼び出し側が未解決にする）。
 fn read_etc(rootfs: &Path, file: &str) -> Result<Option<Vec<u8>>, ()> {
-    read_rootfs_file(rootfs, &["etc", file], MAX_ETC_FILE_BYTES).map_err(|_| ())
+    let body = read_rootfs_file(rootfs, &["etc", file], MAX_ETC_FILE_BYTES).map_err(|_| ())?;
+    // 行数上限を超える本文は切り捨てず未解決にする（後続行の取りこぼしで gid が 0 に落ちるのを防ぐ）。
+    if let Some(b) = &body
+        && b.split(|c| *c == b'\n').count() > MAX_ETC_LINES
+    {
+        return Err(());
+    }
+    Ok(body)
 }
 
 /// 名前・uid のみの User を `(uid, gid)` へ解決する。解決できなければ `None`（未解決）。
@@ -670,7 +676,15 @@ mod tests {
         r
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     const PASSWD: &str = "# c\nroot:x:0:0:r:/root:/bin/sh\n+@nis\nbad:x:zz:1\nshort:x\napp:x:1000:1001::/h:/bin/sh\napp:x:2000:2001::/h:/bin/sh\n";
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
     const GROUP: &str = "root:x:0:\nstaff:x:50:app\nbad:x:q:\n";
 
     /// CRI-2・SEC-5: 名前・uid のみ・名前つきの組の解決表（具体値）。
@@ -692,6 +706,23 @@ mod tests {
         assert_eq!(get("nobody"), None);
         assert_eq!(get("app:nogroup"), None);
         assert_eq!(get("bad"), None);
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// REPAIR-5・SEC-5: 行数上限を超える passwd は切り捨てず未解決（後続行の gid を落として 0 にしない）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn repair5_passwd_over_line_limit_is_unresolved() {
+        let body = format!(
+            "{}app:x:1000:1001::/h:/bin/sh\n",
+            "\n".repeat(MAX_ETC_LINES)
+        );
+        let r = lookup_rootfs(Some(&body), None);
+        assert_eq!(resolve_user(&r, &parse_user_lookup("1000").unwrap()), None);
+        assert_eq!(resolve_user(&r, &parse_user_lookup("app").unwrap()), None);
         let _ = std::fs::remove_dir_all(&r);
     }
 

@@ -124,6 +124,10 @@ fn tar_entry(name: &str, mode: u32, data: &[u8], dir: bool) -> Vec<u8> {
 }
 
 /// symlink エントリ（typeflag `2`）。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn tar_symlink(name: &str, target: &str) -> Vec<u8> {
     let mut e = tar_entry(name, 0o777, b"", false);
     e[156] = b'2';

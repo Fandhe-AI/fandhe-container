@@ -258,11 +258,23 @@ mod tests {
     fn repair5_fifo_and_directory_are_rejected_without_blocking() {
         let r = tmp("fifo");
         std::fs::create_dir(r.join("etc")).unwrap();
-        let ok = std::process::Command::new("mkfifo")
+        // REPAIR-5: 外部コマンドの待機にも期限を設け、超過時は kill して回収する。
+        let mut child = std::process::Command::new("mkfifo")
             .arg(r.join("etc/passwd"))
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+            .spawn()
+            .expect("mkfifo must be available for this test");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let ok = loop {
+            match child.try_wait().expect("try_wait") {
+                Some(s) => break s.success(),
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
         assert!(ok, "mkfifo must be available for this test");
         let e = read_rootfs_file(&r, &["etc", "passwd"], 1024).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);

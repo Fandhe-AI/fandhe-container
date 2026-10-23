@@ -5,7 +5,7 @@
 //! 受けた UDS 上で `CriRuntimeService` をサーブすること（`server::serve`。unix のみ）。
 //! 実装の組み立ては `adapter::CriPluginBackends::production`（失敗したら fail-closed で起動しない）。
 //! 既定の socket パスは未定義のため、引数なしの起動は `UNIMPLEMENTED` で失敗させる（REPAIR-3）。
-//! Linux では peer 認証の拒否を core の監査ログ（`@audit.log`）へ永続化する（#2484）。記録経路を作れなければ起動しない。
+//! Linux では peer 認証の拒否と、create の `mounts[].destination` の拒否（#2594）を core の監査ログ（`@audit.log`）へ永続化する（#2484）。記録経路を作れなければ起動しない。
 //! SIGTERM の正常停止は未実装（SIGKILL で止まる。`server` の未実装の注記を参照）。
 //!
 //! 終了コード: 0 = `--help`、2 = `InvalidArgument`（plugin-macos / plugin-mcp と同じ値）、1 = それ以外の失敗
@@ -54,7 +54,14 @@ fn serve(socket: &std::path::Path) -> ExitCode {
             return ExitCode::from(EXIT_FAILURE);
         }
     };
-    let backends = match CriPluginBackends::production() {
+    // create の `mounts[].destination` 拒否も同じ relay で永続化する（SEC-4・OCI-4・#2594）。プロセスは常に複数スレッドで
+    // `FileAuditSink` を直接使えないため、`PeerAuditForwarder` と共有する。非 Linux は記録先が無く記録しない。
+    #[cfg(target_os = "linux")]
+    let backends =
+        CriPluginBackends::production_with_audit_sink(std::sync::Arc::clone(&audit_sink));
+    #[cfg(not(target_os = "linux"))]
+    let backends = CriPluginBackends::production();
+    let backends = match backends {
         Ok(b) => b,
         Err(e) => {
             // 状態ルートが解決できない等は fail-closed。メッセージは固定文言のコードだけ写す。

@@ -1999,7 +1999,7 @@ mod linux {
     use fandhe_container_core::landlock::detect_landlock_abi;
     use fandhe_container_core::oci_runtime::{
         LinuxResourceLimits, ProductionLauncher, ProductionLauncherBuilder, SubordinateIdSource,
-        load_resource_limits,
+        load_resource_limits, load_resource_limits_audited,
     };
 
     use super::*;
@@ -2342,7 +2342,13 @@ mod linux {
             // 手順 5 の時点の config から `linux.resources` を読み、cgroup v2 の型の計画にする（#2019）。
             // 範囲外の値は create でも拒否済みだが、書き換えに備えここでも同じ変換で検証する。mkdir の前に
             // 失敗させるので後始末は要らない。
-            let resources = load_resource_limits(observed.bundle())?;
+            // destination の拒否（create 後の書き換え = TOCTOU）は、本番で最初に拒否される点なので監査へ記録する
+            // （#2594・SEC-4・OCI-4）。
+            let resources = resource_limits_for_start(
+                observed.bundle(),
+                observed.status().id(),
+                self.rejection_audit.as_ref(),
+            )?;
             let mut plan = CgroupLimitPlan::for_privilege(privilege);
             if let Some(limits) = &resources {
                 let resource_plan = ResourceLimitPlan::try_from(limits).map_err(|e| {
@@ -2804,6 +2810,23 @@ mod linux {
         ExitCode::from(code)
     }
 
+    /// 手順 5 で `config.json` を読み直し、`linux.resources` を取り出す（#2019）。`rejection_audit` があれば
+    /// `mounts[].destination` の拒否を mount 層の監査へ記録する（#2594・SEC-4・OCI-4）。
+    ///
+    /// 本番では `check_launcher_available`（手順 4）が relay の無い構成を先に拒否するため `None` には到達しないが、
+    /// `None` のときも従来どおり同じ検証をする。返すエラーは記録の有無・成否で変わらない（fail-closed）。
+    /// 手順 8 の `build_spec` も同じ記録先を使うが、手順 5 で拒否されれば手順 8 には進まないので 1 回の start で高々 1 件。
+    fn resource_limits_for_start(
+        bundle: &std::path::Path,
+        id: &fandhe_container_core::traits::ContainerId,
+        rejection_audit: Option<&Arc<dyn AuditSink>>,
+    ) -> Result<Option<LinuxResourceLimits>, TraitError> {
+        match rejection_audit {
+            Some(sink) => load_resource_limits_audited(bundle, id, sink.as_ref()),
+            None => load_resource_limits(bundle),
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -2920,6 +2943,68 @@ mod linux {
             ) -> Result<(), TraitError> {
                 Ok(())
             }
+        }
+
+        /// 記録を溜める試験用 sink。
+        struct CollectSink(Mutex<Vec<AuditRecord>>);
+        impl AuditSink for CollectSink {
+            fn record(&self, r: &AuditRecord) -> Result<(), TraitError> {
+                self.0.lock().unwrap().push(r.clone());
+                Ok(())
+            }
+        }
+
+        /// SEC-4・OCI-4（#2594）: 手順 5 の読み直しで destination（遡り・`/`・相対 `..`）が拒否されたら、
+        /// mount 層・`path` なし・コンテナ ID つきで 1 件記録する。sink が無くても code・message は同じ。
+        #[test]
+        fn sec4_2594_step5_destination_rejection_is_audited() {
+            use fandhe_container_core::audit_log::AuditEvent;
+            use fandhe_container_core::traits::ContainerId;
+            for (i, dest) in ["/../..", "/", "run/../../.."].into_iter().enumerate() {
+                let dir = std::env::temp_dir().join(format!("fc-2594-{}-{i}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(dir.join("rootfs")).unwrap();
+                let cfg = format!(
+                    r#"{{"ociVersion":"1.2.0","root":{{"path":"rootfs"}},"process":{{"user":{{"uid":0,"gid":0}},"args":["/bin/true"],"cwd":"/"}},"mounts":[{{"destination":"{dest}","type":"bind","source":"/srv/x","options":["bind","rw"]}}]}}"#
+                );
+                std::fs::write(dir.join("config.json"), cfg).unwrap();
+                let id = ContainerId::new("c2594").unwrap();
+                let sink = Arc::new(CollectSink(Mutex::new(Vec::new())));
+                let dynsink: Arc<dyn AuditSink> = sink.clone();
+                let err = resource_limits_for_start(&dir, &id, Some(&dynsink)).unwrap_err();
+                let plain = resource_limits_for_start(&dir, &id, None).unwrap_err();
+                let _ = std::fs::remove_dir_all(&dir);
+                assert_eq!(err.code(), ErrorCode::InvalidArgument, "{dest}");
+                assert_eq!(err.code(), plain.code());
+                assert_eq!(err.message(), plain.message());
+                let recs = sink.0.lock().unwrap();
+                assert_eq!(recs.len(), 1, "{dest}");
+                assert_eq!(recs[0].container_id(), Some(&id));
+                assert!(matches!(
+                    recs[0].event(),
+                    AuditEvent::Mount {
+                        path: None,
+                        reason: None
+                    }
+                ));
+            }
+        }
+
+        /// SEC-4・#2594: 本番の `prepare_cgroup` は手順 5 の読み直しを `rejection_audit` つきで呼ぶ。実際の
+        /// `prepare_cgroup` は委譲 cgroup が要り CI で回せないため、結線はソースで固定する。
+        #[test]
+        fn sec4_2594_prepare_cgroup_passes_rejection_audit_to_the_reload() {
+            let src = include_str!("start_entry.rs");
+            let production = src.split("#[cfg(test)]").next().unwrap_or(src);
+            let prepare = production
+                .find("fn prepare_cgroup(")
+                .expect("prepare_cgroup");
+            let call = production[prepare..]
+                .find("resource_limits_for_start(")
+                .map(|p| p + prepare)
+                .expect("prepare_cgroup reloads the limits through the audited helper");
+            assert!(production[call..].contains("self.rejection_audit.as_ref()"));
+            assert!(!production[prepare..].contains("load_resource_limits(observed"));
         }
 
         /// SEC-4・#2027: 確実な層の記録先を作れなければ `FailedPrecondition` の固定文言で起動を拒否し、作れていれば

@@ -137,8 +137,9 @@ pub fn create(
 /// - 記録の `container_id` は要求された ID。拒否は `AlreadyExists` の判定より前に起きるため、
 ///   同じ ID の既存コンテナとは対応しない場合がある（start の記録と同じ意味）
 /// - destination 以外の拒否は記録しない
-/// - plugin-cri の `CoreLifecycleRuntime::create` は未配線（tokio のマルチスレッドでは `FileAuditSink` の
-///   fork 隔離が使えないため。追跡 issue 参照）
+/// - plugin-cri の `CoreLifecycleRuntime::create` も本関数を呼ぶ（#2594）。ただしマルチスレッドでは
+///   `FileAuditSink` の fork 隔離が使えないため、plugin-cri は単一スレッドの間に作った `ControlAuditRelay`
+///   を `sink` として渡す
 pub fn create_audited(
     store: &dyn StateStore,
     recorder: &OpRecorder,
@@ -167,12 +168,12 @@ fn create_impl(
 
 /// create の config 検証で、`mounts[].destination` の拒否を記録するための配線（#2480・SEC-4・OCI-4）。
 ///
-/// `create_audited` / `create_with_image_audited` だけが作る。start の再検証・`load_resource_limits` は
-/// `None` のまま（本 issue の対象外）。
+/// `create_audited` / `create_with_image_audited` に加え、start の再検証（`load_resource_limits_audited` と
+/// start の `build_spec`。TOCTOU で書き換えられた destination の拒否。#2594）が作る。
 #[derive(Clone, Copy)]
-struct ConfigAudit<'a> {
-    id: &'a ContainerId,
-    sink: &'a dyn AuditSink,
+pub(super) struct ConfigAudit<'a> {
+    pub(super) id: &'a ContainerId,
+    pub(super) sink: &'a dyn AuditSink,
 }
 
 fn create_inner(
@@ -529,8 +530,8 @@ pub(super) fn validate_bundle(bundle: &Path) -> Result<(OciConfig, PathBuf), Tra
 }
 
 /// [`validate_bundle`] に、`mounts[].destination` 拒否の監査記録（`audit` が `Some` のときだけ）を足したもの。
-/// create の経路だけが `Some` を渡す（#2480）。
-fn validate_bundle_audited(
+/// create の経路（#2480）と start の再検証の経路（#2594）が `Some` を渡す。
+pub(super) fn validate_bundle_audited(
     bundle: &Path,
     audit: Option<ConfigAudit<'_>>,
 ) -> Result<(OciConfig, PathBuf), TraitError> {
@@ -593,6 +594,20 @@ fn check_resource_ranges(_config: &OciConfig) -> Result<(), TraitError> {
 /// （手順 5 と手順 8 の間の書き換え対策）。
 pub fn load_resource_limits(bundle: &Path) -> Result<Option<LinuxResourceLimits>, TraitError> {
     let (config, _rootfs) = validate_bundle(bundle)?;
+    Ok(config.linux_resources().cloned())
+}
+
+/// [`load_resource_limits`] に、`mounts[].destination` 拒否の監査記録（SEC-4・OCI-4・#2594）を足したもの。
+///
+/// supervisor の start 手順 5（`prepare_cgroup`）が、create 後に書き換えられた destination（TOCTOU）を
+/// 最初に拒否する点で呼ぶ。拒否は mount 層・`path` なしで `sink` に 1 件記録する。返すエラーは
+/// [`load_resource_limits`] とバイト単位で同じ（記録の成否で拒否を覆さない。fail-closed）。
+pub fn load_resource_limits_audited(
+    bundle: &Path,
+    id: &ContainerId,
+    sink: &dyn AuditSink,
+) -> Result<Option<LinuxResourceLimits>, TraitError> {
+    let (config, _rootfs) = validate_bundle_audited(bundle, Some(ConfigAudit { id, sink }))?;
     Ok(config.linux_resources().cloned())
 }
 
@@ -833,6 +848,51 @@ mod tests {
         b.write_config(&valid_config());
         std::fs::create_dir(b.dir.join("rootfs")).expect("rootfs");
         b
+    }
+
+    /// SEC-4・OCI-4（#2594）: `load_resource_limits_audited` は destination 拒否を mount 層・`path` なしで
+    /// 1 件記録し、返すエラーは `load_resource_limits` と同じ。destination 以外の拒否は記録しない。
+    #[test]
+    fn sec4_load_resource_limits_audited_records_destination_rejection() {
+        use crate::audit_log::{AuditEvent, mount::tests::VecSink};
+        for (i, dest) in ["/../..", "/", "run/../../.."].into_iter().enumerate() {
+            let b = ready_bundle(&format!("lrl-dest-{i}"));
+            let mut cfg = valid_config();
+            cfg["mounts"] = json!([{
+                "destination": dest, "type": "bind", "source": "/srv/x", "options": ["bind", "rw"]
+            }]);
+            b.write_config(&cfg);
+            let id = ContainerId::new("c1").expect("id");
+            let sink = VecSink::new(false);
+            let err = load_resource_limits_audited(&b.dir, &id, &sink).expect_err("must fail");
+            let plain = load_resource_limits(&b.dir).expect_err("must fail");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{dest}");
+            assert_eq!(err.code(), plain.code());
+            assert_eq!(err.message(), plain.message());
+            let recs = sink.snapshot();
+            assert_eq!(recs.len(), 1, "{dest}");
+            assert_eq!(recs[0].container_id(), Some(&id));
+            assert!(matches!(
+                recs[0].event(),
+                AuditEvent::Mount {
+                    path: None,
+                    reason: None
+                }
+            ));
+            // 記録に失敗しても拒否は同じ（fail-closed）。
+            let bad = VecSink::new(true);
+            let err2 = load_resource_limits_audited(&b.dir, &id, &bad).expect_err("must fail");
+            assert_eq!(err2.message(), plain.message());
+        }
+        // destination 以外の拒否（process 欠落）は記録しない。
+        let b = ready_bundle("lrl-noproc");
+        let mut cfg = valid_config();
+        cfg.as_object_mut().expect("object").remove("process");
+        b.write_config(&cfg);
+        let sink = VecSink::new(false);
+        let id = ContainerId::new("c1").expect("id");
+        assert!(load_resource_limits_audited(&b.dir, &id, &sink).is_err());
+        assert!(sink.snapshot().is_empty());
     }
 
     /// OCI-4: 正しい bundle で created・pid なしの状態が作られ、ストアからも同じ値が取れる。

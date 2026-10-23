@@ -9,8 +9,8 @@
 //! エントリポイントが `probe_denied_syscalls_for_test` で観測して pivot 後の `/seccomp-probe` へ書いた記録
 //! （`SeccompProbeRecord`）の具体値で照合する。`KILL_PROCESS` の
 //! `unshare`・`ptrace`・`kexec_load`（ESC-06。`DeniedSyscall::deny_action`）は戻らず記録を書けないため、
-//! 1 件ずつ別の子で発行し、親が終了シグナル SIGSYS（31）を照合する（こちらは exec の代わりに終端でプローブを
-//! 実行する `spawn_container_probe`。エントリポイント内への移行は別途。REPAIR-3）。`production_launcher` の
+//! 1 件ずつ別のコンテナで、エントリポイント（`/entry --entry kill-<名前>`）の中から発行し、親が終了シグナル
+//! SIGSYS（31）を照合する（#2543・REPAIR-3）。`production_launcher` の
 //! シナリオ J・K は本番 launcher 経由の exec 後の拒否を照合する（#2012）。
 //!
 //! # 識別的な検査と網羅確認
@@ -21,8 +21,8 @@
 //!   kcmp が通らない環境〔kcmp 非対応のカーネル・LSM〕と外側の拒否を検出する。満たさなければ skip せず前提欠如として失敗。#2234）
 //! - 網羅確認: `mount`・`pivot_root`・`umount2` が `EPERM`。capability 不足でも
 //!   `EPERM` になり得るため、識別的な根拠とは扱わない
-//! - 強制終了: `unshare`・`ptrace`・`kexec_load` は別の子で SIGSYS 終了（`ChildExit::Signaled(31)`）。
-//!   プローブが戻って終了コード 0 で終われば（フィルタ欠落）失敗
+//! - 強制終了: `unshare`・`ptrace`・`kexec_load` は別のコンテナのエントリポイントで SIGSYS 終了
+//!   （`ChildExit::Signaled(31)`）。プローブが戻って終了コード 0 で終われば（フィルタ欠落）失敗
 //!
 //! x32 番号の `SECCOMP_RET_KILL_PROCESS` は本試験では扱わない（BPF の単体テストが照合する）。
 //!
@@ -179,7 +179,6 @@ mod linux {
     use fandhe_container_core::exec::{
         ChildExit, IsolationConfig, Namespace, NamespaceSet, ProbeOutcome, SeccompProbeRecord,
         StagePipeline, isolate, isolate_rootful_host_root, plan, plan_rootful_host_root,
-        spawn_container_probe,
     };
     use fandhe_container_core::exec::{
         DevptsGidSource, EscapeSyscallProbe, probe_denied_syscalls_for_test, probe_escape_syscall,
@@ -193,7 +192,7 @@ mod linux {
     const EPERM: i32 = 1;
     /// Linux の `SIGSYS`（x86_64・aarch64 共通で 31）。
     const SIGSYS: i32 = 31;
-    /// 強制終了（`KILL_PROCESS`）の対象と、そのシナリオ名（ESC-06）。
+    /// 強制終了（`KILL_PROCESS`）の対象と、そのシナリオ名（ESC-06）。エントリポイントのモードは `kill-<名前>`。
     const KILLED: [(&str, EscapeSyscallProbe); 3] = [
         ("unshare", EscapeSyscallProbe::Unshare),
         ("ptrace", EscapeSyscallProbe::Ptrace),
@@ -201,6 +200,8 @@ mod linux {
     ];
     /// 子が pivot 後の `/` に書く記録（親からは `<rootfs>/seccomp-probe`）。
     const RECORD: &str = "seccomp-probe";
+    /// kill 系のエントリポイントで発行が戻ってきた（フィルタ欠落）ときに書く印（親からは `<rootfs>/seccomp-kill-returned`）。
+    const KILL_RETURNED: &str = "seccomp-kill-returned";
 
     fn timeout() -> Duration {
         let secs = std::env::var("FANDHE_CONTAINER_TEST_TIMEOUT_SECS")
@@ -222,11 +223,11 @@ mod linux {
                 match name.as_str() {
                     "seccomp" => scenario(Path::new(rootfs)),
                     other => {
-                        let (_, which) = KILLED
+                        let (n, _) = KILLED
                             .iter()
                             .find(|(n, _)| other.strip_prefix("kill-") == Some(n))
                             .unwrap_or_else(|| panic!("unknown scenario {other}"));
-                        scenario_kill(Path::new(rootfs), *which);
+                        scenario_kill(Path::new(rootfs), n);
                     }
                 }
             }
@@ -387,72 +388,47 @@ mod linux {
         result.unwrap_or_else(|err| panic!("isolate failed: {err}"));
     }
 
-    /// 強制終了対象の syscall を子で 1 件発行し、SIGSYS で終了したことを照合する（ESC-06・CORE-5・SEC-2）。
-    fn scenario_kill(rootfs: &Path, which: EscapeSyscallProbe) {
-        isolate_scenario();
-        let child = spawn_container_probe(rootfs, StagePipeline::new(), move || {
-            // コアダンプ（SIGSYS の既定動作）による遅延を避けるため、`probe_escape_syscall` 側で
-            // RLIMIT_CORE を 0 にしてから発行する。戻ってきたら何もせず終了コード 0 になり、親が失敗にする。
-            let _ = probe_escape_syscall(which);
-        })
-        .unwrap_or_else(|e| panic!("spawn: {e}"));
+    /// 強制終了対象の syscall をエントリポイント内で 1 件発行させ、SIGSYS で終了したことを照合する
+    /// （ESC-06・CORE-5・SEC-2・#2543）。
+    fn scenario_kill(rootfs: &Path, name: &str) {
+        let child = spawn_entry(rootfs, &format!("kill-{name}"));
         let exit = child.wait_timeout(timeout()).unwrap_or_else(|e| {
             let _ = child.kill_and_reap(Duration::from_secs(5));
             panic!("wait: {e}")
         });
+        if exit == ChildExit::Exited(0) {
+            // 発行が戻った（フィルタ欠落）。エントリポイントが残した印を、外部入力として上限つきで添える。
+            let mut mark = String::new();
+            if let Ok(f) = std::fs::File::open(rootfs.join(KILL_RETURNED)) {
+                let _ = f.take(4096).read_to_string(&mut mark);
+            }
+            panic!(
+                "kill-{name} returned instead of being killed (filter missing); entrypoint reported: {mark:?}"
+            );
+        }
         assert_eq!(
             exit,
             ChildExit::Signaled(SIGSYS),
-            "{which:?} must kill the process with SIGSYS (KILL_PROCESS)"
+            "kill-{name} must kill the process with SIGSYS (KILL_PROCESS)"
         );
     }
 
-    /// 分離の前の実効 gid（`/proc/self/status` の `Gid:` の 2 列目。user namespace に入ると 0 に見えるため、
-    /// rootless の devpts の gid 判定に分離前の値を使う）。
-    fn host_egid() -> u32 {
-        std::fs::read_to_string("/proc/self/status")
-            .expect("read status")
-            .lines()
-            .find(|l| l.starts_with("Gid:"))
-            .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
-            .and_then(|v| v.parse().ok())
-            .expect("parse egid")
-    }
-
-    /// exec 後のエントリポイント（コンテナ内の PID 1。標準入出力は `/dev/null`）: 禁止 syscall を観測して
-    /// `/seccomp-probe` へ `create_new` で書く。失敗は何も書かずに非 0 で終わる（親が失敗にする）。
-    pub fn entry_main() -> ! {
-        use std::io::Write as _;
-        let Ok(rec) = probe_denied_syscalls_for_test() else {
-            std::process::exit(3);
-        };
-        let written = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(Path::new("/").join(RECORD))
-            .and_then(|mut f| {
-                f.write_all(rec.render().as_bytes())?;
-                f.sync_all()
-            });
-        std::process::exit(if written.is_ok() { 0 } else { 4 });
-    }
-
-    /// 分離 → `with_landlock` を載せて `/entry` を exec → エントリポイント内の観測の記録を具体値で照合する。
-    fn scenario(rootfs: &Path) {
+    /// 分離 → `with_landlock` を載せて `/entry --entry <mode>` を exec したコンテナを起動する
+    /// （`scenario` と `scenario_kill` の共通部分）。
+    fn spawn_entry(rootfs: &Path, mode: &str) -> fandhe_container_core::exec::ContainerChild {
         let is_root = is_root();
+        // 分離（user namespace）の前に読む。入ると gid が 0 に見えるため。
         let egid = host_egid();
         isolate_scenario();
 
         let ld = real_entry::install_entry(rootfs);
-        let entry = real_entry::entrypoint_from(
-            &real_entry::entry_args("seccomp-probe"),
-            &real_entry::entry_env(&ld),
-        );
+        let entry =
+            real_entry::entrypoint_from(&real_entry::entry_args(mode), &real_entry::entry_env(&ld));
         let stages = StagePipeline::new()
             .with_landlock(real_entry::landlock_ruleset())
             .unwrap_or_else(|e| panic!("register landlock: {e}"));
         // root は gid 0 を写せない（`single_id_mapping` は SEC-5 で host_id == 0 を拒否する）ため `Rootful`。
-        let child = if is_root {
+        if is_root {
             spawn_container_with_stages_and_devices(
                 rootfs,
                 &entry,
@@ -468,7 +444,77 @@ mod linux {
                 DevptsGidSource::Rootless(&gid_map),
             )
         }
-        .unwrap_or_else(|e| panic!("spawn: {e}"));
+        .unwrap_or_else(|e| panic!("spawn: {e}"))
+    }
+
+    /// 分離の前の実効 gid（`/proc/self/status` の `Gid:` の 2 列目。user namespace に入ると 0 に見えるため、
+    /// rootless の devpts の gid 判定に分離前の値を使う）。
+    fn host_egid() -> u32 {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("read status")
+            .lines()
+            .find(|l| l.starts_with("Gid:"))
+            .and_then(|l| l.split_whitespace().nth(2).map(str::to_string))
+            .and_then(|v| v.parse().ok())
+            .expect("parse egid")
+    }
+
+    /// 印を `create_new` で書く（失敗しても呼び出し側は非 0 で終わるだけ）。
+    fn write_new(name: &str, body: &str) -> bool {
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(Path::new("/").join(name))
+            .and_then(|mut f| {
+                f.write_all(body.as_bytes())?;
+                f.sync_all()
+            })
+            .is_ok()
+    }
+
+    /// exec 後のエントリポイント（コンテナ内の PID 1。標準入出力は `/dev/null`）。モードは `--entry` の次の引数。
+    /// - `seccomp-probe`: 禁止 syscall を観測して `/seccomp-probe` へ書く。失敗は何も書かずに非 0 で終わる。
+    /// - `kill-<名前>`: `KILL_PROCESS` の syscall を発行する。戻れば（フィルタ欠落）印を書いて 0 で終わり、
+    ///   親が失敗にする。
+    /// - 未知・欠落: ファイルシステムに触れず非 0 で終わる。
+    pub fn entry_main() -> ! {
+        let args: Vec<String> = std::env::args().collect();
+        let mode = args
+            .iter()
+            .position(|a| a == "--entry")
+            .and_then(|i| args.get(i + 1))
+            .map(String::as_str);
+        match mode {
+            Some("seccomp-probe") => {
+                let Ok(rec) = probe_denied_syscalls_for_test() else {
+                    std::process::exit(3);
+                };
+                std::process::exit(if write_new(RECORD, &rec.render()) {
+                    0
+                } else {
+                    4
+                });
+            }
+            Some(m) => {
+                let Some((_, which)) = KILLED
+                    .iter()
+                    .find(|(n, _)| m.strip_prefix("kill-") == Some(n))
+                else {
+                    std::process::exit(5);
+                };
+                // コアダンプによる遅延は `probe_escape_syscall` が RLIMIT_CORE を 0 にして避ける。
+                let outcome = probe_escape_syscall(*which);
+                write_new(KILL_RETURNED, &format!("{outcome:?}\n"));
+                std::process::exit(0);
+            }
+            None => std::process::exit(5),
+        }
+    }
+
+    /// 分離 → `with_landlock` を載せて `/entry` を exec → エントリポイント内の観測の記録を具体値で照合する。
+    fn scenario(rootfs: &Path) {
+        let child = spawn_entry(rootfs, "seccomp-probe");
         let exit = child.wait_timeout(timeout()).unwrap_or_else(|e| {
             let _ = child.kill_and_reap(Duration::from_secs(5));
             panic!("wait: {e}")

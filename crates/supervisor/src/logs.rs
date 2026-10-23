@@ -62,7 +62,7 @@
 //!
 //! # 未実装（将来仕様。REPAIR-3）
 //! 本モジュールは捕捉経路とファイル sink までで、次は未実装である。
-//! - flush ごとの fsync・同期ポリシーの設定化・タイマーによる定期 flush（read ごとの flush で代替している）: SUP-7。
+//! - flush ごとの fsync・同期ポリシーの設定化・タイマーによる定期 flush（read ごとの flush で代替している。`logs --follow` の遅延の上限は `reader` のモジュール doc に記載し、短縮はしない）: SUP-7。
 //! - stdout / stderr 混在での大規模な欠落 0・重複 0 の検証（stdout 単独の 100 万行検証は `tests/log_rotation.rs` に実装済み）: SUP-7・TASK-164.4（#508）。
 //! - 本番 launcher からの呼び出し配線: 子の stdout / stderr をパイプへ接続する機構（core の `exec::ChildStdio`）と、
 //!   読み取り側を受け取って起動・再起動をまたいで捕捉する配線（[`crate::log_pipeline::CaptureHub`]）は実装済みで
@@ -76,9 +76,9 @@ pub mod reader;
 pub mod rotating;
 
 pub use reader::{
-    FOLLOW_OUTRAN_MESSAGE, FOLLOW_POLL_INTERVAL, FollowOptions, LogReadFailure, LogReadOptions,
-    LogReadReport, MAX_FOLLOW_DURATION, MAX_TAIL_RECORDS, TailCount, read_container_log,
-    read_container_log_with,
+    ContainerActivity, FOLLOW_OUTRAN_MESSAGE, FOLLOW_POLL_INTERVAL, FollowOptions, LogReadFailure,
+    LogReadOptions, LogReadReport, MAX_FOLLOW_DURATION, MAX_TAIL_RECORDS, TailCount,
+    read_container_log, read_container_log_with,
 };
 pub use rotating::{RemovedLogs, RotatingFileSink, RotationConfig, log_file_paths};
 

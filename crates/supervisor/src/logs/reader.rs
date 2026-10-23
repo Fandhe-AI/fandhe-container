@@ -39,15 +39,33 @@
 //!   完全な行（LF まで）だけを出す。現在ログの dev / ino が変わったら（ローテーション）、保持中の fd を EOF まで出し切り、
 //!   一覧からそれより新しい世代を古い順に全部出し、新しい現在ログを先頭から追う（欠落・重複なし）。fd を保持している間は
 //!   inode が解放されないので、ino の再利用で誤って一致することはない。保持中のファイルが一覧から消えるほど速く
-//!   ローテーションされたら、黙って飛ばさず `Unavailable`（[`FOLLOW_OUTRAN_MESSAGE`]）で失敗する（世代数 1 の設定では
-//!   ローテーションごとに保持中のファイルが消えるため、追従はローテーションで失敗する）。`delete` でログが消えたら出し切って
-//!   成功で終わる。終わりは [`FollowOptions`] の期限（上限 [`MAX_FOLLOW_DURATION`]。超えたら残りを出し切って成功。REPAIR-5）か、
-//!   呼び出し側プロセスへのシグナル（CLI の `signals` が転送後に既定動作で終了する）。
+//!   ローテーションされたら、黙って飛ばさず `Unavailable`（[`FOLLOW_OUTRAN_MESSAGE`]）で失敗する。`delete` でログが消えたら
+//!   出し切って成功で終わる。終わりは次のいずれか。
+//!   - コンテナの停止: 書き手（sink）がいない（`<id>.log.lock` を誰も保持していない）**かつ** 呼び出し側の probe
+//!     （[`ContainerActivity`]）が `Running` でないとき、残りを出し切って成功で終わる（Docker 互換）。状態の `Stopped` の記録は
+//!     supervisor の最終 flush より先に書かれるため、状態だけでは末尾を取りこぼす。sink の drop（最終 flush）の後でロックが
+//!     解放されるので、ロック解放を終了条件に含める。restart ポリシーの再 launch の間も sink は保持されるので追従は続く。
+//!     probe が `Unknown`（状態ストアの一時的な読み取り失敗）なら続ける（早く終えると取りこぼし、失敗にすると長い追従が
+//!     一時的な競合で中断するため。期限が上限を担う。REPAIR-5）。supervisor がクラッシュして記録が stale な `Running` のまま
+//!     残る場合は期限まで続く（復旧はクラッシュ復旧の GC の担当）。ロックの検査はポーリングのたびに行い、状態の probe は
+//!     ロックが解放されたときだけ呼ぶ（状態ストアの `@lock` との競合を減らす。#2229）。
+//!   - [`FollowOptions`] の期限（上限 [`MAX_FOLLOW_DURATION`]。超えたら残りを出し切って成功。REPAIR-5）。
+//!   - 呼び出し側プロセスへのシグナル（CLI の `signals` が転送後に既定動作で終了する）。
+//!
+//! # 追従の遅延の上限と世代数 1（CLI-1・SUP-7・#2605）
+//! LF で終わる行が `--follow` に現れるまでの遅延は、捕捉リーダーが読んで flush した時点から最大で 1 ポーリング間隔
+//! （[`FOLLOW_POLL_INTERVAL`] = 200 ms）と読み出しの時間である。捕捉リーダーは read のたびに sink を flush するため、
+//! 書き手側にタイマーによる滞留は無い。LF の来ていない行は、LF・EOF・`MAX_LINE_BYTES`（64 KiB）の上限のどれかまで出ない。
+//! inotify / kqueue による短縮は、`unsafe`・`sys` の宣言を増やさず 3 OS で同じ挙動にするため行わない。
+//! 世代数 1 の設定では、追従を `Unavailable` で拒否する。照合する一つ前の世代が無く、ポーリングの間の複数回のローテーションで
+//! 読めない現在ログが生じても検出できず（黙って欠落させるのは不可）、ローテーションの隙間とログの削除も区別できないため。
+//! 本番の設定は固定の 3 世代（`container_log_rotation_config`）で利用者が世代数を設定する手段は無く、世代数 1 には到達しない。
+//! 設定化するときは `--follow` に 2 世代以上を要求し、使い方エラーとして先に拒否すること。
 //!
 //! # 未実装（REPAIR-3）
 //! 非 unix では dev / ino 相当で再確認できないため `Unimplemented` で fail-closed にする（非 Linux の CLI は
-//! plugin 経由で、この入口まで来ない。TASK-114・TASK-125）。コンテナの停止で `--follow` を終える挙動（supervisor の
-//! 最終 flush と状態の停止記録の順序が前提）と、writer の定期 flush による追従の遅延の短縮は未提供。
+//! plugin 経由で、この入口まで来ない。TASK-114・TASK-125）。`--follow` の期限の上限・`--tail` の件数の上限の値と、利用者向けの
+//! `--until` の要否はオーナー確認待ち（#2605）。
 
 use std::io::Write;
 use std::path::Path;
@@ -72,6 +90,19 @@ pub const MAX_TAIL_RECORDS: u32 = 1_000_000;
 
 /// `--follow` の期限の上限（これを超える指定は `InvalidArgument`。値はオーナー確認待ち。REPAIR-5）。
 pub const MAX_FOLLOW_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// `--follow` の継続判定で呼び出し側が答えるコンテナの稼働状態（状態ストアの記録の読み取り結果。CLI-1・SUP-7）。
+///
+/// 真偽値にしないのは、読み取り失敗（`Unknown`）を「止まった」と取り違えて末尾を取りこぼさないため。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerActivity {
+    /// 記録が `Running`。追従を続ける。
+    Running,
+    /// 記録が `Running` でない（`Stopped`・`Created`・記録の不在を含む）。書き手もいなければ追従を終える。
+    NotRunning,
+    /// 記録を読めなかった。追従を続ける（期限が上限）。
+    Unknown,
+}
 
 /// `--follow` のポーリング間隔の既定。
 pub const FOLLOW_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -272,7 +303,8 @@ pub fn read_container_log(
 }
 
 /// [`read_container_log`] のオプション指定版（`logs --follow` / `--tail` / `--stream` / `--escape`。CLI-1・SUP-7）。
-/// `options` が既定なら [`read_container_log`] と同じ。`--follow` は期限まで（または呼び出し側プロセスの終了まで）戻らない。
+/// `options` が既定なら [`read_container_log`] と同じ。`--follow` は期限・コンテナの停止（書き手の終了を確かめた後。
+/// `activity` が `Running` を返す間は続く）・呼び出し側プロセスの終了のいずれかまで戻らない。`activity` は追従中だけ呼ばれる。
 #[cfg(unix)]
 pub fn read_container_log_with(
     dir: &Path,
@@ -280,6 +312,7 @@ pub fn read_container_log_with(
     config: RotationConfig,
     options: &LogReadOptions,
     out: &mut dyn Write,
+    activity: &mut dyn FnMut() -> ContainerActivity,
 ) -> Result<LogReadReport, LogReadFailure> {
     let start = std::time::Instant::now();
     let mut elapsed = move || start.elapsed();
@@ -287,6 +320,7 @@ pub fn read_container_log_with(
     let mut driver = follow::Driver {
         elapsed: &mut elapsed,
         sleep: &mut sleep,
+        activity,
     };
     imp::read_with(dir, id, config, options, out, &mut |_| {}, &mut driver)
 }
@@ -299,8 +333,9 @@ pub fn read_container_log_with(
     config: RotationConfig,
     options: &LogReadOptions,
     out: &mut dyn Write,
+    activity: &mut dyn FnMut() -> ContainerActivity,
 ) -> Result<LogReadReport, LogReadFailure> {
-    let _ = (dir, id, config, options, out);
+    let _ = (dir, id, config, options, out, activity);
     Err(source(
         ErrorCode::Unimplemented,
         "reading container logs is not supported on this platform",
@@ -871,9 +906,11 @@ mod tests {
     ) -> (Result<LogReadReport, LogReadFailure>, Vec<u8>) {
         let mut elapsed = || Duration::ZERO;
         let mut sleep = |_: Duration| {};
+        let mut activity = || ContainerActivity::Running;
         let mut driver = follow::Driver {
             elapsed: &mut elapsed,
             sleep: &mut sleep,
+            activity: &mut activity,
         };
         let mut out = Vec::new();
         let r = imp::read_with(
@@ -996,9 +1033,11 @@ mod tests {
         t.put("c1.log", b"stdout a\n");
         let mut elapsed = || Duration::ZERO;
         let mut sleep = |_: Duration| {};
+        let mut activity = || ContainerActivity::Running;
         let mut driver = follow::Driver {
             elapsed: &mut elapsed,
             sleep: &mut sleep,
+            activity: &mut activity,
         };
         let r = imp::read_with(
             &t.0,

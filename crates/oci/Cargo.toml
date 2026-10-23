@@ -36,6 +36,12 @@ tar.workspace = true
 [dev-dependencies]
 fandhe-container-core = { path = "../core", default-features = false }
 
+# `sys.rs` / `sys/at.rs` の自前 FFI 宣言を libc と照合する試験専用の依存（#2590・#1318・#1837・REPAIR-12）。
+# 承認: #2590 のオーナーコメント（2026-10-23。版は workspace の =0.2.189 のまま・用途は照合の試験に限る）。
+# 製品の依存には入れない（cargo tree -e normal,build に現れない）。方式は docs/design/ffi-libc-check.md。
+[target.'cfg(unix)'.dev-dependencies]
+libc.workspace = true
+
 # pull・digest 検証・展開・rootfs 実行の自動検証ハーネス（OCI-1・TASK-55.1・#420）。実行段で fork するため
 # 単一スレッドの独自 main（harness = false）。`-- --ignored` 指定時のみ実機前提の部分（外向き HTTPS・委譲 cgroup v2・
 # 非特権 user namespace）を実行し、未指定時はオフライン自己検証だけを行う（AGENTS.md）。

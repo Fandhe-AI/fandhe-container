@@ -8,12 +8,10 @@
 //! 所有者を現在プロセスの実効 uid と照合するために使う（OCI-7・SEC-1・#2381）。依存追加は禁止
 //! （dependency-policy）のため、他 crate の `sys` と同じ流儀で `extern "C"` 宣言を自前で持つ。
 //!
-//! # libc 照合をしない理由（#2547）
-//! #1318 の決定（libc は dev-dependencies のみ）の対象 crate は列挙された 9 crate で oci を含まず、#1837 の
-//! 子 issue にも oci は無い。oci へ dev 依存を足すには依存追加としてのユーザー承認が要る
-//! （dependency-policy）ため、承認を得るまで照合しない。代わりに `geteuid` は POSIX の型幅（`uid_t` = `u32`）に
-//! 合わせ、`at.rs` はカーネル uapi と libc 0.2.189 を手で突き合わせた（`at.rs` 冒頭）。承認後は
-//! `docs/design/ffi-libc-check.md` の方式で `geteuid` の型と `at.rs` の番号・フラグ・`OpenHow` のレイアウトを照合する。
+//! # libc との照合（#2590）
+//! `geteuid` の型は子 `libc_abi`、`at.rs` の番号・フラグ・`OpenHow` のレイアウト・関数の型は `at::libc_abi` で、
+//! `libc`（dev-dependencies のみ。#1318・#1837）と `const` 評価で照合する（方式は `docs/design/ffi-libc-check.md`。
+//! 承認は #2590 のオーナーコメント 2026-10-23）。
 //!
 //! # macOS の拡張 ACL を宣言しない理由（#2547）
 //! macOS では本番経路が `ImageStore::open` に届かず（cli は `non_linux_failure` で先に fail-closed）、
@@ -43,3 +41,11 @@ pub(crate) fn effective_uid() -> u32 {
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub(crate) mod at;
+
+/// `geteuid` の型を `libc` と照合する（#2590・OCI-7・REPAIR-12）。関数は呼ばない。
+/// 対象外: `effective_uid` は FFI ではなく安全なラッパー。
+#[cfg(test)]
+mod libc_abi {
+    const _: unsafe extern "C" fn() -> libc::uid_t = super::geteuid;
+    const _: unsafe extern "C" fn() -> libc::uid_t = libc::geteuid;
+}

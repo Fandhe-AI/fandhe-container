@@ -3,8 +3,8 @@
 //! # 呼び出し文脈
 //! `layer::anchored` の `AnchoredRoot` だけが使う。レイヤー展開（OCI-1・OCI-2）の変更操作を `root` の fd 起点に
 //! 閉じ込め、確認（`lstat`）から使用までの間に祖先が symlink へ差し替えられても `root` の外へ書き込めない
-//! ようにする（SEC-5・#2437）。依存追加は禁止のため `extern "C"` 宣言を自前で持つ。`libc` との機械照合は oci では
-//! 未導入のため対象外（`docs/design/ffi-libc-check.md`）。定数と構造体は次の一次情報で確認した値である:
+//! ようにする（SEC-5・#2437）。依存追加は禁止のため `extern "C"` 宣言を自前で持つ。`libc` との機械照合は
+//! 子 `libc_abi` で行う（#2590。`docs/design/ffi-libc-check.md`）。定数と構造体は次の一次情報で確認した値である:
 //! `include/uapi/linux/openat2.h`（`struct open_how` は `flags` / `mode` / `resolve` の `u64` 3 つで 24 バイト。
 //! Linux 5.6 で追加）、`include/uapi/asm-generic/unistd.h`（`__NR_openat2` = 437 は全アーキテクチャ共通。
 //! aarch64 の `getdents64` = 61）、`arch/x86/include/uapi/asm/unistd_64.h`（`getdents64` = 217）、
@@ -313,6 +313,145 @@ pub(crate) fn for_each_dirent(buf: &[u8], mut f: impl FnMut(&[u8])) -> io::Resul
         pos = pos.checked_add(reclen).ok_or_else(bad)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod libc_abi {
+    //! 自前の宣言を `libc` 0.2.189 と `const` 評価で照合する（#2590・OCI-1・SEC-5・REPAIR-12）。関数は呼ばない。
+    //! 親モジュールと同じ cfg（Linux の x86_64 / aarch64）の下にあり、ターゲットごとの `libc` の値と比べる。
+    //!
+    //! 対象外（理由つき）:
+    //! - `component_cstring`・`relative_cstring`・`raw`・`check`・`invalid` と安全なラッパー群: FFI ではない
+    //! - `openat2` に渡す大きさ: `size_of::<OpenHow>()` の照合（24 バイト）に含まれる
+    //! - `struct linux_dirent64`: カーネルの構造体で `libc` に無い。ヘッダ部のオフセットが一致する
+    //!   `libc::dirent64`（glibc の構造体）で `for_each_dirent` の `NAME_OFFSET`・`16..18` を代わりに照合する
+    //!   （試験 `oci1_dirent_parser_concrete_values` が具体値を見る）
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    /// `libc` の `c_int` の `O_*` を `u64` へ広げる。負値は拒否する（切り詰めを隠さない）。
+    const fn widen(v: libc::c_int) -> u64 {
+        assert!(v >= 0);
+        v as u64
+    }
+
+    const _: () = {
+        assert!(AT_FDCWD == libc::AT_FDCWD);
+        assert!(AT_SYMLINK_NOFOLLOW == libc::AT_SYMLINK_NOFOLLOW);
+        assert!(AT_REMOVEDIR == libc::AT_REMOVEDIR);
+
+        // 自前の `O_*` は `open_how.flags`（`u64`）に入れるため `u64`。`O_DIRECTORY` / `O_NOFOLLOW` は
+        // アーキテクチャで値が違い、`libc` 側もターゲットの値になる。
+        assert!(O_RDONLY == widen(libc::O_RDONLY));
+        assert!(O_WRONLY == widen(libc::O_WRONLY));
+        assert!(O_CREAT == widen(libc::O_CREAT));
+        assert!(O_EXCL == widen(libc::O_EXCL));
+        assert!(O_CLOEXEC == widen(libc::O_CLOEXEC));
+        assert!(O_PATH == widen(libc::O_PATH));
+        assert!(O_DIRECTORY == widen(libc::O_DIRECTORY));
+        assert!(O_NOFOLLOW == widen(libc::O_NOFOLLOW));
+
+        assert!(RESOLVE_NO_XDEV == libc::RESOLVE_NO_XDEV);
+        assert!(RESOLVE_NO_MAGICLINKS == libc::RESOLVE_NO_MAGICLINKS);
+        assert!(RESOLVE_NO_SYMLINKS == libc::RESOLVE_NO_SYMLINKS);
+        assert!(RESOLVE_IN_ROOT == libc::RESOLVE_IN_ROOT);
+
+        assert!(EPERM == libc::EPERM);
+        assert!(EACCES == libc::EACCES);
+        assert!(E2BIG == libc::E2BIG);
+        assert!(EAGAIN == libc::EAGAIN);
+        assert!(EXDEV == libc::EXDEV);
+        assert!(ENOTDIR == libc::ENOTDIR);
+        assert!(EISDIR == libc::EISDIR);
+        assert!(EINVAL == libc::EINVAL);
+        assert!(ENOSYS == libc::ENOSYS);
+        assert!(ELOOP == libc::ELOOP);
+        assert!(EINTR == libc::EINTR);
+
+        assert!(SYS_OPENAT2 == libc::SYS_openat2);
+        assert!(SYS_GETDENTS64 == libc::SYS_getdents64);
+
+        // `struct open_how`: サイズ・アラインメント・各フィールドのオフセット。
+        assert!(size_of::<u64>() == size_of::<libc::__u64>());
+        assert!(size_of::<OpenHow>() == size_of::<libc::open_how>());
+        assert!(align_of::<OpenHow>() == align_of::<libc::open_how>());
+        assert!(offset_of!(OpenHow, flags) == offset_of!(libc::open_how, flags));
+        assert!(offset_of!(OpenHow, mode) == offset_of!(libc::open_how, mode));
+        assert!(offset_of!(OpenHow, resolve) == offset_of!(libc::open_how, resolve));
+
+        // `linux_dirent64` のヘッダ部（`for_each_dirent` の 16..18 と NAME_OFFSET = 19）。
+        assert!(offset_of!(libc::dirent64, d_reclen) == 16);
+        assert!(offset_of!(libc::dirent64, d_name) == 19);
+        assert!(size_of::<libc::c_ushort>() == 2);
+    };
+
+    // `syscall` は自前も `libc` も可変長。
+    const _: unsafe extern "C" fn(libc::c_long, ...) -> libc::c_long = syscall;
+    const _: unsafe extern "C" fn(libc::c_long, ...) -> libc::c_long = libc::syscall;
+
+    const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::mode_t) -> libc::c_int =
+        mkdirat;
+    const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::mode_t) -> libc::c_int =
+        libc::mkdirat;
+
+    const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int =
+        unlinkat;
+    const _: unsafe extern "C" fn(libc::c_int, *const libc::c_char, libc::c_int) -> libc::c_int =
+        libc::unlinkat;
+
+    const _: unsafe extern "C" fn(
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+    ) -> libc::c_int = symlinkat;
+    const _: unsafe extern "C" fn(
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+    ) -> libc::c_int = libc::symlinkat;
+
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+    ) -> libc::c_int = linkat;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+    ) -> libc::c_int = libc::linkat;
+
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        *mut libc::c_char,
+        libc::size_t,
+    ) -> libc::ssize_t = readlinkat;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        *mut libc::c_char,
+        libc::size_t,
+    ) -> libc::ssize_t = libc::readlinkat;
+
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::uid_t,
+        libc::gid_t,
+        libc::c_int,
+    ) -> libc::c_int = fchownat;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::uid_t,
+        libc::gid_t,
+        libc::c_int,
+    ) -> libc::c_int = libc::fchownat;
 }
 
 #[cfg(test)]

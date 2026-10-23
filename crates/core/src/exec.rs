@@ -1958,6 +1958,28 @@ fn rootless_handshake(
     holder_sock
         .write_all(&mapper_pid_frame)
         .map_err(|e| sync_io_error(&e, "send the mapper pid to the userns holder"))?;
+    // holder が錨を確保した応答を期限つきで待つ。write_all の成功はフレームが socket に入っただけで、holder が
+    // 錨を開けた保証にならない。受けるまで go を送らない(helper を起動させない。#2551・CORE-6・SEC-5)。
+    holder_sock
+        .set_read_timeout(Some(plan.timeout))
+        .map_err(|e| sync_io_error(&e, "set read timeout"))?;
+    let mut anchor_buf = [0u8; rootless::MAPPER_REPLY_LEN];
+    holder_sock
+        .read_exact(&mut anchor_buf)
+        .map_err(|e| sync_io_error(&e, "read the userns holder anchor reply"))?;
+    match MapperReply::decode(&anchor_buf).map_err(ExecError::from_rootless)? {
+        MapperReply::Ok => {}
+        MapperReply::Failed { code, stage } => {
+            return Err(ExecError::new(
+                code,
+                IsolationStage::UserNamespaceMap,
+                format!(
+                    "userns holder could not anchor the mapper at {}",
+                    stage.as_str()
+                ),
+            ));
+        }
+    }
 
     // 3. 参加先の同一性を、参加する前(元の namespace から)に記録する。
     let before = user_ns_identity(None)?;

@@ -1362,6 +1362,8 @@ impl HolderExit {
 /// 読み取り 1 フレームの結果。
 enum FrameRead {
     Full,
+    /// EOF、または相手が未読のデータを残したまま閉じた(`ECONNRESET`)。どちらも相手側が全員閉じたことを表す
+    /// (holder が書いた錨の応答が未読のまま相手が終わると後者になる。#2551)。
     Eof,
     TimedOut,
     Failed,
@@ -1397,6 +1399,7 @@ fn read_frame_until(
             {
                 return FrameRead::TimedOut;
             }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => return FrameRead::Eof,
             Err(_) => return FrameRead::Failed,
         }
     }
@@ -1415,6 +1418,9 @@ pub(crate) struct HolderWait<'a> {
     pub(crate) release_wait: Duration,
     /// 期限切れで kill した後、EOF を待つ上限。
     pub(crate) drain_wait: Duration,
+    /// mapper が回収済み(`Gone`)のとき、数値の PGID が元のグループのままか([`original_group_survives`])。
+    /// 試験が差し替える継ぎ目。`false` なら数値 PGID へ kill を送らない。
+    pub(crate) group_survives: &'a dyn Fn(u32) -> bool,
 }
 
 /// 錨(mapper の `/proc/<pid>` の fd と pid)を作る。作れない・親が一致しない場合は `None`(診断を 1 行出す)。
@@ -1456,10 +1462,9 @@ fn open_anchor(
 /// I が死んでいても、mapper が回収済みなら生きている helper がセッションを継承して番号を保つ。kill の直前に
 /// fd 経由でセッション ID が mapper の pid であることを確かめ、読めなくなっていれば EOF を確かめ直す。
 /// 残る窓: 期限の直前に最後の helper が終わり、その pid が `setsid` した無関係なプロセスへ再利用される極小の窓。
-/// もう 1 つの窓: mapper が回収済み(`Gone`)で I が生存したまま Release を送らず固まる場合、I は mapper の pid
-/// を保つ側ではなく、helper も居ないのに EOF にならない。このとき mapper の pid が同一ユーザーの別のグループ ID として
-/// 再利用されていると無関係なグループへ SIGKILL を送り得る。I は成功経路で mapper を回収した直後に Release を送るため
-/// 確率は極小で、届く先は同じ利用者に限る。`Gone` の kill を止めると I 死亡時の #2551 の経路が開くため残す。
+/// mapper が回収済み(`Gone`)の場合は、[`original_group_survives`] で「mapper の pid 番号を持つプロセスが居らず、その番号を
+/// PGID・SID とするプロセスが居る」ことを確かめたときだけ送る(カーネルは PGID・SID として使われている番号を再割り当て
+/// しないため、この条件なら元のグループである)。確かめられなければ送らない(fail-closed)。
 pub(crate) fn holder_await_release(
     sock: &mut std::os::unix::net::UnixStream,
     w: &HolderWait<'_>,
@@ -1480,6 +1485,22 @@ pub(crate) fn holder_await_release(
                 Ok(HolderControl::MapperPid(p)) if !seen_pid => {
                     seen_pid = true;
                     anchor = open_anchor(p, w, diag);
+                    // 錨を確保できたか(できなかったか)を I へ返す。I はこの応答を受けてから go を送る(write_all の成功
+                    // は holder が錨を開けた保証にならないため。#2551・CORE-6・SEC-5)。書けなくても待ちは続け、
+                    // I は応答の期限切れで失敗にする。
+                    let reply = if anchor.is_some() {
+                        MapperReply::Ok
+                    } else {
+                        MapperReply::Failed {
+                            code: ErrorCode::FailedPrecondition,
+                            stage: RootlessStage::Validate,
+                        }
+                    };
+                    let left = deadline
+                        .saturating_duration_since(Instant::now())
+                        .max(Duration::from_millis(1));
+                    let _ = sock.set_write_timeout(Some(left));
+                    let _ = sock.write_all(&reply.encode());
                 }
                 _ => {
                     let _ = writeln!(diag, "fandhe-container: userns holder: bad control frame");
@@ -1503,6 +1524,15 @@ pub(crate) fn holder_await_release(
                     return HolderExit::Released;
                 }
                 _ => {}
+            }
+            // EOF が無いことは、元のグループの生存を証明しない(I も socket を持つ。SIGCHLD=SIG_IGN の継承で mapper が
+            // 自動回収された場合など)。元のグループが生きていると確かめられなければ数値 PGID へ送らない。
+            if !(w.group_survives)(mapper_pid) {
+                let _ = writeln!(
+                    diag,
+                    "fandhe-container: userns holder: mapper gone and its group is not verified, not killing"
+                );
+                return HolderExit::ExpiredNoKill;
             }
         }
         // mapper が `setsid` の前(helper を作っていない)か、読めない: kill しない(fail-closed)。
@@ -1532,6 +1562,34 @@ pub(crate) fn holder_await_release(
         }
     }
 }
+/// mapper が回収済みのとき、数値の PGID `pid` が元の mapper のグループのままかを `/proc` の走査で判定する(#2551)。
+///
+/// 真になる条件は、`/proc/<pid>` が存在せず(その番号のプロセスは居ない)、かつセッション ID・PGID がともに `pid` の
+/// プロセスが 1 つ以上居ること。カーネルは PGID・SID として使われている番号を新しいプロセスへ割り当てないため、
+/// この条件ならグループの生存者(helper)が元の番号を保っている。読めない・走査できない場合は `false`(fail-closed)。
+/// 走査は holder(単一スレッド)の期限切れの経路でだけ 1 回行う。
+pub(crate) fn original_group_survives(pid: u32) -> bool {
+    if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        return false;
+    }
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(other) = name.to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(buf) = std::fs::read(format!("/proc/{other}/stat")) else {
+            continue;
+        };
+        if parse_stat_field(&buf, 2) == Ok(pid) && parse_stat_field(&buf, 3) == Ok(pid) {
+            return true;
+        }
+    }
+    false
+}
+
 /// user namespace を作って保持するだけの使い捨てプロセス(holder)の処理本体(fork 子が呼ぶ。#2374)。
 ///
 /// 中間プロセス I(`exec::isolate_rootless_subordinate`)は non-dumpable のまま保つ必要があるが、
@@ -1595,6 +1653,7 @@ pub(crate) fn run_userns_holder(
         current_parent: &std::os::unix::process::parent_id,
         release_wait,
         drain_wait,
+        group_survives: &original_group_survives,
     };
     holder_await_release(
         &mut sock,
@@ -2405,6 +2464,7 @@ mod tests {
             current_parent: &std::process::id,
             release_wait: Duration::from_millis(release_ms),
             drain_wait: Duration::from_millis(drain_ms),
+            group_survives: &|_| false,
         }
     }
 
@@ -2608,5 +2668,127 @@ mod tests {
         assert!(kills.is_empty());
         child.kill().expect("kill");
         child.wait().expect("wait");
+    }
+
+    /// SEC-5(#2551): mapper が回収済み(`Gone`)で元のグループの生存を確かめられなければ、数値 PGID へ送らない。
+    /// (SIGCHLD=SIG_IGN の継承で mapper が自動回収され、I が Release 前に止まった場合の形。)
+    #[test]
+    fn sec5_holder_gone_unverified_group_does_not_kill() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        let pid = child.id();
+        send_pid(&mut a, pid);
+        let reaper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            child.kill().expect("kill");
+            child.wait().expect("wait");
+        });
+        let mut kills = Vec::new();
+        let mut diag = Vec::new();
+        let r = holder_await_release(
+            &mut b,
+            &holder_test_wait(500, 100),
+            &mut |p| {
+                kills.push(p);
+                Ok(())
+            },
+            &mut diag,
+        );
+        reaper.join().expect("join");
+        drop(a);
+        assert_eq!(r, HolderExit::ExpiredNoKill);
+        assert!(kills.is_empty());
+        let text = String::from_utf8(diag).expect("utf8");
+        assert!(text.contains("not verified"), "{text}");
+    }
+
+    /// SEC-5(#2551): `Gone` でも元のグループの生存が確かめられれば kill を 1 回送る。
+    #[test]
+    fn sec5_holder_gone_verified_group_kills_once() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        let pid = child.id();
+        send_pid(&mut a, pid);
+        let reaper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            child.kill().expect("kill");
+            child.wait().expect("wait");
+        });
+        let mut w = holder_test_wait(500, 100);
+        w.group_survives = &|_| true;
+        let mut kills = Vec::new();
+        let r = holder_await_release(
+            &mut b,
+            &w,
+            &mut |p| {
+                kills.push(p);
+                Ok(())
+            },
+            &mut Vec::new(),
+        );
+        reaper.join().expect("join");
+        drop(a);
+        assert_eq!(kills, vec![pid]);
+        assert!(matches!(r, HolderExit::ExpiredKilled { .. }), "{r:?}");
+    }
+
+    /// SEC-5(#2551): 錨を確保できたら `MapperReply::Ok`、できなければ `Failed` を I へ返す。
+    #[test]
+    fn sec5_holder_acks_anchor_result() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        send_pid(&mut a, child.id());
+        a.write_all(&HolderControl::Release.encode()).expect("send");
+        let _ = holder_await_release(
+            &mut b,
+            &holder_test_wait(2000, 100),
+            &mut |_| Ok(()),
+            &mut Vec::new(),
+        );
+        let mut buf = [0u8; MAPPER_REPLY_LEN];
+        a.read_exact(&mut buf).expect("ack");
+        assert_eq!(MapperReply::decode(&buf).expect("decode"), MapperReply::Ok);
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let own = std::process::id();
+        send_pid(&mut a, own + 1);
+        let mut w = holder_test_wait(200, 100);
+        w.expected_parent = own + 1;
+        let _ = holder_await_release(&mut b, &w, &mut |_| Ok(()), &mut Vec::new());
+        a.read_exact(&mut buf).expect("ack");
+        assert_eq!(
+            MapperReply::decode(&buf).expect("decode"),
+            MapperReply::Failed {
+                code: ErrorCode::FailedPrecondition,
+                stage: RootlessStage::Validate
+            }
+        );
+    }
+
+    /// SEC-5(#2551): `original_group_survives` は、リーダーが回収済みで生存者が居るグループだけ真にする。
+    #[test]
+    fn sec5_original_group_survives_only_when_leader_gone_and_member_alive() {
+        let mut leader = Command::new("setsid")
+            .args(["sh", "-c", "sleep 30 & exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let pid = leader.id();
+        leader.wait().expect("wait");
+        let t = Instant::now();
+        while !original_group_survives(pid) {
+            assert!(t.elapsed() < Duration::from_secs(5), "group not observed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        sys::kill_process_group(pid, sys::Signal::Kill).expect("kill group");
+        // 生きているリーダー(/proc/<pid> が存在する)は偽。
+        let (keep, _peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut live = spawn_session_leader(&keep);
+        assert!(!original_group_survives(live.id()));
+        live.kill().expect("kill");
+        live.wait().expect("wait");
     }
 }

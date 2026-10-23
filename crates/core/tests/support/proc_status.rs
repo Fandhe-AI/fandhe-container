@@ -16,6 +16,8 @@ use std::io::Read as _;
 const MAX_STATUS_BYTES: u64 = 64 * 1024;
 
 /// `State:` と `CoreDumping:` の行を ` | ` で連結して返す。読めなければ `<unavailable>`。
+// 理由: このモジュールを `#[path]` で取り込むテストバイナリの一部（期限切れ分岐で呼ばない側）では
+// 関数が未使用になり dead_code 警告が出るため抑止する（バイナリごとに使用有無が異なる）。
 #[allow(dead_code)]
 pub fn excerpt(pid: u32) -> String {
     let mut text = String::new();

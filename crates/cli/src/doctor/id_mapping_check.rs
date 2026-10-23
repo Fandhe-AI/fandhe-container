@@ -339,7 +339,7 @@ pub fn evaluate(f: &IdMappingFindings) -> IdMappingReport {
             "SUBID_NAME_SERVICE_UNSUPPORTED",
             "/etc/nsswitch.conf configures a source other than files for subid; subordinate id ranges are read only from /etc/subuid and /etc/subgid, so starting a container fails closed",
             vec![
-                "Provide the ranges for this account in /etc/subuid and /etc/subgid, or set subid to files in /etc/nsswitch.conf",
+                "Set subid to files in /etc/nsswitch.conf (required), and provide the ranges for this account in /etc/subuid and /etc/subgid",
             ],
             "nsswitch",
             "subid_name_service",

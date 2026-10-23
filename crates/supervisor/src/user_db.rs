@@ -23,8 +23,8 @@
 //!   （実 uid / 実効 uid が 0 の exec は ambient を消してもファイルの capability が全ビットとみなされる。
 //!   passwd に行があれば成功する。`RefusedAsRoot`。uid を落として引く方式は #2241 で rootful が承認された
 //!   ときに再検討する。#2545・SEC-5）。
-//! - argv[0] は選んだ候補のパスにする（実体は `canonicalize` 後のパスで exec する）。busybox 等の multi-call
-//!   バイナリがアプレットを argv[0] の basename で解決するため（#2545）。
+//! - `argv[0]` は選んだ候補のパスにする（実体は `canonicalize` 後のパスで exec する）。busybox 等の multi-call
+//!   バイナリがアプレットを `argv[0]` の basename で解決するため（#2545）。
 //! - `/etc/nsswitch.conf` の `subid:` が `files` 以外（libsubid・sssd・FreeIPA 等）の構成は、ファイルを読む方式では
 //!   範囲を得られないため `SubidSourceProbe::NameService` として検出し、`id_model` が起動を拒否する（#2545）。
 //! - 終了コード 2（キー無し）は、`/etc/nsswitch.conf` の passwd 系が `files` 等のローカル源だけのときに限り
@@ -91,7 +91,7 @@ pub struct OwnerLookupError {
 }
 
 impl OwnerLookupError {
-    #[cfg(any(target_os = "linux", test))]
+    #[cfg(target_os = "linux")]
     fn new(
         kind: OwnerLookupFailure,
         code: fandhe_container_core::traits::ErrorCode,
@@ -386,12 +386,12 @@ mod linux {
         let _ = crate::sys::kill_process_group(pid);
     }
 
-    /// `getent` の起動内容（試験で argv[0] を観測するため `Command` から切り出す。#2545）。
+    /// `getent` の起動内容（試験で `argv[0]` を観測するため `Command` から切り出す。#2545）。
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct GetentInvocation {
         /// exec する実体（`canonicalize` 後・信頼検査済み）。
         pub program: PathBuf,
-        /// argv[0]（選んだ候補のパス。multi-call バイナリのアプレット解決のため）。
+        /// `argv[0]`（選んだ候補のパス。multi-call バイナリのアプレット解決のため）。
         pub arg0: PathBuf,
         /// 引数（`passwd` と 10 進の uid）。
         pub args: Vec<String>,
@@ -1083,7 +1083,7 @@ mod linux {
             let _ = std::fs::remove_dir_all(&d);
         }
 
-        /// #2545: argv[0] は選んだ候補、exec する実体は canonicalize 後。シェバンの stub では元の argv[0] を
+        /// #2545: `argv[0]` は選んだ候補、exec する実体は canonicalize 後。シェバンの stub では元の `argv[0]` を
         /// 観測できないため、起動内容の組み立て関数で照合する（候補が symlink で実体と名前が違う場合を含む）。
         #[test]
         fn sec5_getent_argv0_is_candidate() {

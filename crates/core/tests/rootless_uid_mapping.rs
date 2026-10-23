@@ -44,7 +44,7 @@
 //! （Linux 6.12 以上）も必要（満たさないと失敗する）。`-- --ignored` 指定時のみ実行し、未指定時は
 //! 「ignored」を出力して成功終了する。実行された場合は拒否を含むあらゆる失敗を失敗として扱い、
 //! 検証せずに成功する分岐は持たない。helper ケースは env の opt-in 時のみ実行し、opt-in 時に前提
-//! （uidmap・subuid/subgid 行）が無ければ失敗とする。CI の `platform-ci` への組み込みは未実施（別 PR）。
+//! （uidmap・subuid/subgid 行）が無ければ失敗とする。CI の `platform-ci`（ubuntu）では #2596 で helper ケースを有効にして実行し、成功行を照合する（root 分岐は CI で回さず #1621）。
 //! 実行: `cargo test -p fandhe-container-core --test rootless_uid_mapping -- --ignored`
 
 #[cfg(not(target_os = "linux"))]

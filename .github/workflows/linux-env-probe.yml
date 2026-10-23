@@ -736,6 +736,10 @@ jobs:
           r3="$(sudo -n timeout 30 systemd-run --uid="$(id -u)" --gid="$(id -g)" -p Delegate=yes --wait --pipe --collect sh -c "${probe_cmd}" 2>&1 | tr '\n' ' ')"
           record "path3 transient service with User= and Delegate=yes" "${r3:0:600}"
 
+          # rootless 系・supervisor・CLI の実機前提試験（#2596）の追加前提。値ではなく有無と数値だけを記録する
+          record "Landlock ABI (syscall 444)" "$(python3 -c 'import ctypes; l=ctypes.CDLL(None, use_errno=True); print(l.syscall(444, None, 0, 1))' 2>&1 | head -n1)"
+          record "systemd user manager private socket" "$([ -S "${XDG_RUNTIME_DIR}/systemd/private" ] && echo present || echo absent)"
+
           {
             echo "### id-mapping-probe results (production_launcher scenario I prerequisites)"
             echo ""

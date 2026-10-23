@@ -1147,7 +1147,9 @@ jobs:
           echo "::notice::userns_extract verified"
 
       # production_launcher・rootless_file_owner・rootless_image_rootfs_remove・seccomp（`crates/core/tests/`。CORE-1・CORE-5・CORE-6・SEC-1・
-      # SEC-4・SEC-5・#2376）: `--ignored` の実機前提テスト（harness = false）を非 root で実行する。
+      # SEC-4・SEC-5・#2376）と、rootless_launch・rootless・rootless_uid_mapping（core）・supervisor_bin_real（supervisor）・
+      # start_stop_delete_real（cli）（CORE-6・SUP-4・REPAIR-7・#2596。前提は同じ。Landlock ABI 6 以上と user manager の
+      # private ソケットは前提確認ステップで fail-closed にする）: `--ignored` の実機前提テスト（harness = false）を非 root で実行する。
       # 範囲写像（`FANDHE_CONTAINER_TEST_ID_HELPER=1`。uidmap・subuid）と委譲 cgroup の前提は、`linux-env-probe.yml` の
       # `id-mapping-probe`（run 39295761418・2026-10-19・#2244）で ubuntu-latest が既定で満たすと実測済み。
       # 準備ステップは sudo を使わず確認だけを行い、欠けていれば fail-closed にする（sudo の用途は増やさない）。
@@ -1168,10 +1170,18 @@ jobs:
           [ -n "${XDG_RUNTIME_DIR:-}" ] || fail "XDG_RUNTIME_DIR"
           state="$(systemctl --user is-system-running || true)"
           [ "${state}" = running ] || fail "systemctl --user is-system-running = ${state}"
+          # supervisor_bin_real・start_stop_delete_real（#2596）の前提: user manager の private ソケット（パスの値は出さない）
+          [ -S "${XDG_RUNTIME_DIR}/systemd/private" ] || fail "systemd user manager private socket"
+          # rootless・rootless_uid_mapping（#2596）の前提: Landlock ABI 6 以上（linux-env-probe.yml と同じ測り方）
+          abi_py='import ctypes; l=ctypes.CDLL(None, use_errno=True); print(l.syscall(444, None, 0, 1))'
+          abi="$(python3 -c "${abi_py}" || echo -1)"
+          [ "${abi}" -ge 6 ] 2>/dev/null || fail "Landlock ABI >= 6 (got ${abi})"
           {
             echo "subuid: $(grep "^${user}:" /etc/subuid)"
             echo "subgid: $(grep "^${user}:" /etc/subgid)"
             echo "systemctl --user: ${state}"
+            echo "systemd user manager private socket: present"
+            echo "Landlock ABI: ${abi}"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: production_launcher のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
@@ -1343,6 +1353,214 @@ jobs:
             fi
           done
           echo "::notice::seccomp verified"
+
+      # rootless_launch・rootless・rootless_uid_mapping（`crates/core/tests/`。CORE-6・SEC-1・SEC-5・REPAIR-7・#2596）:
+      # 非特権 user namespace で動く `--ignored` の試験（harness = false）。cargo 経由で直接実行する（委譲スコープは要らない）。helper ケース
+      # （`FANDHE_CONTAINER_TEST_ID_HELPER=1`。uidmap・subuid）を有効にする。root 分岐（root=true）は CI では回さない（#1621）。
+      - name: rootless_launch・rootless・rootless_uid_mapping のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          cargo test -p fandhe-container-core \
+            --test rootless_launch --test rootless --test rootless_uid_mapping --no-run
+
+      - name: rootless_launch の実行（実機前提テスト・--ignored。CORE-6・SEC-1・SEC-5・#2596）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/rootless_launch.log"
+          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
+            cargo test -p fandhe-container-core --test rootless_launch -- --ignored 2>&1 | tee "${log}"
+          for line in \
+            'rootless_launch: scenario direct verified (reached the exec stage)' \
+            'rootless_launch: scenario helper verified (reached the exec stage)'; do
+            if ! grep -Fxq "${line}" "${log}"; then
+              echo "::error::rootless_launch did not report: ${line} (possibly not executed)" >&2
+              exit 1
+            fi
+            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
+          done
+          for bad in 'helper case not requested' 'root=true' 'rootless_launch: ignored'; do
+            if grep -Fq "${bad}" "${log}"; then
+              echo "::error::rootless_launch reported an unexpected line: ${bad}" >&2
+              exit 1
+            fi
+          done
+          echo "::notice::rootless_launch verified"
+
+      - name: rootless の実行（実機前提テスト・--ignored。CORE-6・SEC-1・SEC-5・#2596）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/rootless.log"
+          euid="$(id -u)"
+          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
+            cargo test -p fandhe-container-core --test rootless -- --ignored 2>&1 | tee "${log}"
+          for mode in direct helper; do
+            line="rootless: scenario ${mode} lifecycle verified with the real entrypoint as PID 1"
+            line+=" (create/start/kill/delete-rejected; host uid=${euid}; via ProductionLauncher)"
+            if ! grep -Fxq "${line}" "${log}"; then
+              echo "::error::rootless did not report: ${line} (possibly not executed)" >&2
+              exit 1
+            fi
+            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
+          done
+          part='rootless: abandoned launch handle: PID 1 exited by its lifetime bound and left nothing behind ('
+          if ! grep -Fq "${part}" "${log}"; then
+            echo "::error::rootless did not report: ${part} (possibly not executed)" >&2
+            exit 1
+          fi
+          for bad in 'helper case not requested' 'root=true' 'rootless: ignored'; do
+            if grep -Fq "${bad}" "${log}"; then
+              echo "::error::rootless reported an unexpected line: ${bad}" >&2
+              exit 1
+            fi
+          done
+          echo "::notice::rootless verified"
+
+      - name: rootless_uid_mapping の実行（実機前提テスト・--ignored。CORE-6・SEC-5・ESC-09・#2596）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/rootless_uid_mapping.log"
+          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" \
+            cargo test -p fandhe-container-core --test rootless_uid_mapping -- --ignored 2>&1 | tee "${log}"
+          for mode in direct helper; do
+            for part in \
+              "rootless_uid_mapping: scenario ${mode} verified (host uid=" \
+              "rootless_uid_mapping: RESULT scenario=${mode} behavior=SEC-5,CORE-6,ESC-09 "; do
+              if ! grep -Fq "${part}" "${log}"; then
+                echo "::error::rootless_uid_mapping did not report: ${part} (possibly not executed)" >&2
+                exit 1
+              fi
+            done
+            if ! grep -F "RESULT scenario=${mode} " "${log}" | grep -Fq ' verdict=pass'; then
+              echo "::error::rootless_uid_mapping scenario ${mode} did not report verdict=pass" >&2
+              exit 1
+            fi
+          done
+          part='rootless_uid_mapping: hung entrypoint exited by its lifetime bound ('
+          if ! grep -Fq "${part}" "${log}"; then
+            echo "::error::rootless_uid_mapping did not report: ${part} (possibly not executed)" >&2
+            exit 1
+          fi
+          for bad in 'helper case not requested' 'root=true' 'rootless_uid_mapping: ignored' 'verdict=fail'; do
+            if grep -Fq "${bad}" "${log}"; then
+              echo "::error::rootless_uid_mapping reported an unexpected line: ${bad}" >&2
+              exit 1
+            fi
+          done
+          grep -F 'rootless_uid_mapping: RESULT' "${log}" >> "$GITHUB_STEP_SUMMARY" || true
+          echo "::notice::rootless_uid_mapping verified"
+
+      # supervisor_bin_real（`crates/supervisor/tests/`。SUP-1・SUP-4・CORE-2・CORE-6・OCI-6・ESC-03・#2596）:
+      # 試験自身が supervisor の bin と delete の補助役を `systemd-run --user --scope` で包むため、試験バイナリは外側を包まず直接実行する。
+      - name: supervisor_bin_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          json="${RUNNER_TEMP}/sbr-build.json"
+          cargo test -p fandhe-container-supervisor --test supervisor_bin_real \
+            --no-run --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "supervisor_bin_real") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::supervisor_bin_real test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "SBR_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: supervisor_bin_real の実行（実機前提テスト・--ignored。SUP-1・SUP-4・CORE-6・ESC-03・#2596）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/supervisor_bin_real.log"
+          FANDHE_CONTAINER_TEST_ID_HELPER=1 USER="$(id -un)" "${SBR_BIN}" --ignored 2>&1 | tee "${log}"
+          final='supervisor_bin_real: start reported OK, NSpid ends with 1, monitor recorded Stopped(7), logs captured,'
+          final+=' seccomp denial recorded once; failed start left no process; restart fails closed until #2043;'
+          final+=' SIGTERM via the control channel recorded Stopped(43) and the stopped container was deleted;'
+          final+=' ESC-03 mount denied via the SeccompNotifyHub and recorded once'
+          if ! grep -Fxq "${final}" "${log}"; then
+            echo "::error::supervisor_bin_real did not report the final line (possibly not executed)" >&2
+            exit 1
+          fi
+          for part in \
+            'supervisor_bin_real: id mapping verified (model=subordinate' \
+            'supervisor_bin_real: scenario=A ok ' \
+            'supervisor_bin_real: scenario=B ok ' \
+            'supervisor_bin_real: scenario=C ok ' \
+            'supervisor_bin_real: scenario=D ok ' \
+            'supervisor_bin_real: scenario=E ok ' \
+            'supervisor_bin_real: seccomp denial returned EPERM and left exactly 1 record in @audit.log'; do
+            if ! grep -Fq "${part}" "${log}"; then
+              echo "::error::supervisor_bin_real did not report: ${part} (possibly not executed)" >&2
+              exit 1
+            fi
+          done
+          for bad in 'supervisor_bin_real: ignored' 'precondition failed' 'model=single'; do
+            if grep -Fq "${bad}" "${log}"; then
+              echo "::error::supervisor_bin_real reported an unexpected line: ${bad}" >&2
+              exit 1
+            fi
+          done
+          {
+            echo "${final}"
+            grep -F 'supervisor_bin_real: id mapping verified' "${log}" || true
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::supervisor_bin_real verified"
+
+      # start_stop_delete_real（`crates/cli/tests/`。CLI-1・SUP-1・SUP-4・CORE-3・CORE-4・OCI-6・#2596）: CLI は同じディレクトリの
+      # supervisor の bin を使うため先にビルドして置く。試験バイナリ自体を委譲スコープの中で動かす（自分の cgroup = 検出する委譲 cgroup）。
+      # `fandhe-container-launcher` が同じディレクトリにあると rootful のインストールとみなされるが、
+      # 試験本体が専用の work/bin へ CLI と supervisor だけを置き、launcher が無いことを確かめる。
+      - name: start_stop_delete_real のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          cargo build -p fandhe-container-supervisor
+          json="${RUNNER_TEMP}/ssd-build.json"
+          cargo test -p fandhe-container-cli --test start_stop_delete_real --no-run --message-format=json > "${json}"
+          sel='select(.profile.test == true and .target.name == "start_stop_delete_real") | .executable'
+          bins="$(jq -r "${sel}" "${json}" | grep -v '^null$' | sort -u)"
+          if [ -z "${bins}" ] || [ "$(printf '%s\n' "${bins}" | wc -l)" -ne 1 ]; then
+            echo "::error::start_stop_delete_real test binary not uniquely identified" >&2
+            exit 1
+          fi
+          echo "SSD_BIN=${bins}" >> "$GITHUB_ENV"
+
+      - name: start_stop_delete_real の実行（実機前提テスト・--ignored・委譲スコープ。CLI-1・SUP-4・#2596）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/start_stop_delete_real.log"
+          USER="$(id -un)" \
+            systemd-run --user --scope --quiet -p Delegate=yes -- "${SSD_BIN}" --ignored 2>&1 | tee "${log}"
+          final='start_stop_delete_real: cli start ran the container under the production launcher;'
+          final+=' stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs'
+          if ! grep -Fxq "${final}" "${log}"; then
+            echo "::error::start_stop_delete_real did not report the final line (possibly not executed)" >&2
+            exit 1
+          fi
+          part='start_stop_delete_real: scenario ok scope_present_before_delete='
+          if ! grep -Fq "${part}" "${log}"; then
+            echo "::error::start_stop_delete_real did not report: ${part} (possibly not executed)" >&2
+            exit 1
+          fi
+          for bad in 'start_stop_delete_real: skipped' 'start_stop_delete_real: FAILED'; do
+            if grep -Fq "${bad}" "${log}"; then
+              echo "::error::start_stop_delete_real reported an unexpected line: ${bad}" >&2
+              exit 1
+            fi
+          done
+          echo "${final}" >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::start_stop_delete_real verified"
 
   # --------------------------------------------------
   # bench-regression（ベンチ回帰「比較の仕組み」導入: TASK-86.3・REPAIR-7 第 4 段階・REPAIR-8）

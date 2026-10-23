@@ -51,8 +51,8 @@
 //! 通すため。満たさないと失敗する）が必要。cgroup の委譲は要らない（config に `linux.resources`・`cgroupsPath` を
 //! 置かないため launcher は cgroup へ参加しない）。`-- --ignored` 指定時のみ実行し、未指定時は「ignored」を
 //! 出力して成功終了する（ci.md「実機前提テスト」。CI 通過のための弱体化ではない）。CI の
-//! `platform-ci` への組み込みは別 PR（ci.yml は infra-builder 担当・AppArmor 緩和の
-//! `sudo sysctl` は root 権限コマンド）。実行された場合は拒否を含むあらゆる失敗を失敗として扱い、検証せずに
+//! `platform-ci`（ubuntu）では #2596 で helper ケースを有効にして実行し、成功行を照合する（AppArmor 緩和の
+//! `sudo sysctl` は CI が既に行う。root 分岐は CI で回さず #1621）。実行された場合は拒否を含むあらゆる失敗を失敗として扱い、検証せずに
 //! 成功する分岐は持たない。
 //!
 //! # 既知課題・未検証の条件（ホスト設定などで本テストが検証できない、または未実装で検証しないもの）

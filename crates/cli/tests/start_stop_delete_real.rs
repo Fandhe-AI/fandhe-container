@@ -34,7 +34,7 @@
 //! ```
 //!
 //! 成功時の最終行: `start_stop_delete_real: cli start ran the container under the production launcher; stop recorded Stopped(43); delete left no cgroup, state dir, control socket or logs`。
-//! 実行と結果の記録は人間担当（#2062・#1621）。本試験は作成時に未実行で、Agent はホストに transient scope と cgroup を作るため実行しない。
+//! 使い捨ての CI runner（`platform-ci` の ubuntu）では #2596 で実行し、成功行を照合する。手元の実機での実行と結果の記録は人間担当（#2062・#1621）で、Agent はホストに transient scope と cgroup を作るため手元では実行しない。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

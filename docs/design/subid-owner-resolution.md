@@ -25,6 +25,12 @@ PR #2367（#2243）の `start` は所有者名を `/etc/passwd` だけから得�
 6. **fail-closed**: passwd に行が無く NSS の参照が失敗・期限切れ・不正な出力のときは `start` を拒否する。名前の行の有無を判定できないまま 1 対 1 へ落とさない。信頼できる `getent` が無いときだけ、従来どおり数値 uid の行だけで照合する（`doctor` が通知）
 7. **期限は出力の読み取りにも掛ける**（REPAIR-5）: バックグラウンドの孫が標準出力を継承して EOF が来なくても、全体で 5 秒を超えたら kill して `Timeout`。標準出力は `UnixStream` 対の読み取り側を読み取りタイムアウトつきで読む（スレッドも `unsafe` も増やさない）
 8. **終了コード 2 は源がローカルのときだけ「名前なし」**: `getent` は NSS の障害でも 2 を返し得て区別できない。`/etc/nsswitch.conf` の `passwd`・`passwd_compat` が `files`・`compat`・`db`・`altfiles`・`systemd`・`usrfiles` だけのときに限り名前なしとし、それ以外（`ldap`・`sss` 等の遠隔源、読めない・上限超過・不正な角括弧）は参照失敗として `start` を拒否する。`passwd` が `compat` を含むのに `passwd_compat` の行が無いときは、glibc の既定（`nis`）があるためローカルのみとは証明できず拒否する。ファイルが無いときは glibc の既定（`files`）とみなす
+9. **名前を引けないまま名前の行で 1 対 1 へ落とさない**（#2545）: 信頼できる `getent` が無く（`LookupUnavailable`）、選ばれるモデルが 1 対 1 で、subuid / subgid のどちらかに名前の行（第 1 欄が `u32` でない行）があれば、自分の行か判定できないため `start` は `FailedPrecondition` で拒否し、`doctor` は `SUBID_OWNER_UNDETERMINED`（警告）にする。名前の行が無い（ファイル無し・数値行だけ・空）なら従来どおり 1 対 1 ＋通知。`NotFound`（遠隔源の無い NSS が不在を確定）は名前の行が自分のものでないと証明済みのため 1 対 1 のまま
+10. **グループ kill は未回収の子にだけ送る**（#2545・REPAIR-5）: `try_wait` を標準出力の EOF の後まで呼ばず、期限切れ・出力超過・読み取り失敗の kill は未回収の子（ゾンビは pid / pgid を保持する）に対してだけ送る。回収後に pid が一周して別プロセスのグループリーダーになる窓をなくす。回収後に期限を超えた場合は kill せず `Timeout` を返す
+11. **root の呼び出し元では NSS を引かない**（#2545・SEC-5）: 実 uid / 実効 uid が 0 の exec は、ambient を消しても実行ファイルの capability が全ビットとみなされる。real / effective / saved / fs uid のどれかが 0（`/proc/self/status` を読めなければ root とみなす）なら `getent` を起動せず、`FailedPrecondition`（`RefusedAsRoot`）にする。passwd に行があれば従来どおり成功する。現状は start・doctor が rootful を拒否しており、pull 時の展開（`image_ownership`）を本番へ配線したときに root から呼ばれうるための先回りの契約。uid を落として引く方式は #2241（rootful の承認）で再検討する
+12. **argv[0] は選んだ候補のパス**（#2545）: 実体は `canonicalize` 後のパスで exec するが、busybox 等の multi-call バイナリがアプレットを argv[0] の basename で解決するため、`CommandExt::arg0` に候補のパスを渡す
+13. **`subid:` が `files` 以外なら拒否**（#2545・CORE-6）: `/etc/nsswitch.conf` の `subid:` の値が `files` 以外を含む（libsubid・sssd・FreeIPA）と、ファイルを読む方式では範囲を得られないため `start` は拒否し、`doctor` は `SUBID_NAME_SERVICE_UNSUPPORTED`（警告）にする。`subid:` が無い・`files` だけ・ファイルが無いときは従来どおり。ファイルが読めない・上限超過・UTF-8 不正・角括弧の不正・値が空のときも拒否する（`NSSWITCH_UNUSABLE`）。shadow の `lib/nss.c` の原文での値の解釈の確認は未実施で、`files` 以外はすべて拒否する安全側の規則にした
+14. **判定を型にして共有する**（#2545）: 所有者名の解決の失敗は `OwnerLookupFailure`、`start` / `doctor` 共通の拒否は `RefusalReason`（`id_model::diagnose_rootless_id_source_with`）で返し、`doctor` はエラー文言の文字列比較をしない。固定の英語文言は変えない
 
 ## `getent` の子プロセスにした理由と却下した案
 
@@ -46,7 +52,9 @@ PR #2367（#2243）の `start` は所有者名を `/etc/passwd` だけから得�
 
 ## 対象外（既知の差）
 
-- `subid:` の NSS で範囲を配る構成。ファイルを読む方式では範囲を得られない。検出（`doctor` での通知など）は別途検討
+- `subid:` の NSS で範囲を配る構成の**利用**（検出と拒否は決定 13。libsubid 経由で範囲を得る実装は無い）
+- `doctor` と状態ストアの `idMapping`（`RecordedIdModel`）の突き合わせ（状態ストアを読む設計が要る。追跡予定）
+- root の呼び出し元で uid を落として NSS を引く方式（決定 11。#2241 で rootful が承認されたときに再検討）
 - 同じ uid の別名の行（`newuidmap` の 2 段目の別名照合）は範囲として使わない（部分集合のため helper の拒否は起きない）
 - ambient capability つきの本番構成で `getent` に capability が渡らないことの実機での実証、LDAP / sssd の実環境での範囲写像の確認（いずれも実機・人間担当）
 
@@ -57,3 +65,7 @@ PR #2367（#2243）の `start` は所有者名を `/etc/passwd` だけから得�
 | `SUBID_OWNER_NAME_UNRESOLVED` | notice | passwd にも NSS にも行が無い（数値 uid の行だけで照合） |
 | `SUBID_OWNER_LOOKUP_UNAVAILABLE` | notice | passwd に行が無く、信頼できる `getent` も無い |
 | `SUBID_OWNER_LOOKUP_FAILED` | warning | NSS の参照が失敗・期限切れ（`start` は拒否する。終了コード 3） |
+| `SUBID_OWNER_UNDETERMINED` | warning | 名前を引けず、名前の行が自分のものか判定できない（決定 9。state `owner_undetermined`） |
+| `SUBID_NAME_SERVICE_UNSUPPORTED` | warning | `subid:` が `files` 以外（決定 13。check `nsswitch`・state `subid_name_service`） |
+| `NSSWITCH_UNUSABLE` | warning | `nsswitch.conf` が読めない・書式不正（決定 13。check `nsswitch`・state `unusable`） |
+| `ID_MAP_HELPER_NOT_FOUND` / `ID_MAP_HELPER_UNTRUSTED` | warning | `newuidmap` / `newgidmap` のどちらかが無い・信頼できない。欠けた側ごとに 1 件、state は `newuidmap_not_found`・`newgidmap_untrusted` 等（#2545） |

@@ -444,6 +444,52 @@ pub fn load_subordinate_ids(
     parse_subordinate_ids(&buf, owner)
 }
 
+/// subuid / subgid の本文に「名前の行」があるか（第 1 欄が空でなく `u32` として解釈できない行。
+/// 空行・`#` コメントは読み飛ばす。読み方・上限は [`parse_subordinate_ids`] と同じ。CORE-6・SEC-5・#2545）。
+///
+/// supervisor の `id_model` が、所有者名を引けない（`getent` が無い）ホストで、名前の行が自分のものかを
+/// 判定できないまま 1 対 1 写像へ落ちるのを拒否するために使う。行の中身（欄数・範囲）は検証しない。
+pub fn subordinate_ids_have_named_rows(bytes: &[u8]) -> Result<bool, RootlessError> {
+    let stage = RootlessStage::ParseSubordinateIds;
+    if bytes.len() as u64 > MAX_SUBID_FILE_BYTES {
+        return Err(RootlessError::invalid(
+            stage,
+            "subordinate id file too large",
+        ));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| RootlessError::invalid(stage, "subordinate id file is not valid UTF-8"))?;
+    for (i, line) in text.lines().enumerate() {
+        if i >= MAX_SUBID_LINES {
+            return Err(RootlessError::invalid(
+                stage,
+                "subordinate id file has too many lines",
+            ));
+        }
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let first = line.split(':').next().unwrap_or("");
+        if !first.is_empty() && first.parse::<u32>().is_err() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `path` を上限付きで読み、[`subordinate_ids_have_named_rows`] へ渡す（ファイル無しは `NotFound`）。
+pub fn load_has_named_rows(path: &Path) -> Result<bool, RootlessError> {
+    let stage = RootlessStage::ParseSubordinateIds;
+    let file =
+        std::fs::File::open(path).map_err(|e| io_error(stage, "open subordinate id file", &e))?;
+    let mut buf = Vec::new();
+    file.take(MAX_SUBID_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| io_error(stage, "read subordinate id file", &e))?;
+    subordinate_ids_have_named_rows(&buf)
+}
+
 /// 「コンテナ 0 → `host_id`（1 個）、コンテナ 1.. → subordinate 範囲を順に連結」の写像を作る
 /// （CORE-6・SEC-5）。`host_id == 0` は拒否。
 pub fn rootless_mapping(
@@ -582,6 +628,17 @@ pub struct HelperPaths {
     gid_identity: FileIdentity,
 }
 
+/// `newuidmap` の既定位置。
+pub const SYSTEM_NEWUIDMAP: &str = "/usr/bin/newuidmap";
+/// `newgidmap` の既定位置。
+pub const SYSTEM_NEWGIDMAP: &str = "/usr/bin/newgidmap";
+
+/// helper 1 本を [`HelperPaths::new`] と同じ規則で検証する（`doctor` が `newuidmap` / `newgidmap` を個別に診断する
+/// ために公開する。規則は二重に持たない。失敗の `code` が `NotFound` なら存在しない。#2545・CORE-6）。
+pub fn verify_helper_path(path: &Path) -> Result<(), RootlessError> {
+    check_helper(path).map(|_| ())
+}
+
 fn check_helper(path: &Path) -> Result<FileIdentity, RootlessError> {
     let stage = RootlessStage::ResolveHelper;
     if !path.is_absolute() {
@@ -639,10 +696,7 @@ impl HelperPaths {
 
     /// 固定の既定位置（`/usr/bin/newuidmap`・`/usr/bin/newgidmap`）を検証して作る。
     pub fn system_default() -> Result<Self, RootlessError> {
-        Self::new(
-            Path::new("/usr/bin/newuidmap"),
-            Path::new("/usr/bin/newgidmap"),
-        )
+        Self::new(Path::new(SYSTEM_NEWUIDMAP), Path::new(SYSTEM_NEWGIDMAP))
     }
 
     fn path_for(&self, kind: IdKind) -> &Path {
@@ -1383,6 +1437,32 @@ fn mapper_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-5・CORE-6（#2545）: 名前の行の検出（数値行・コメント・空行は名前の行ではない）。
+    #[test]
+    fn sec5_named_rows_detection() {
+        assert_eq!(subordinate_ids_have_named_rows(b"alice:1:2\n"), Ok(true));
+        assert_eq!(
+            subordinate_ids_have_named_rows(b"1000:1:2\n# c\n\n  \n"),
+            Ok(false)
+        );
+        assert_eq!(subordinate_ids_have_named_rows(b""), Ok(false));
+        assert_eq!(
+            subordinate_ids_have_named_rows(b"1000:1:2\nbob:3:4\n"),
+            Ok(true)
+        );
+        assert!(subordinate_ids_have_named_rows(&[0xff, 0xfe]).is_err());
+        let big = vec![b'#'; (MAX_SUBID_FILE_BYTES + 1) as usize];
+        assert!(subordinate_ids_have_named_rows(&big).is_err());
+    }
+
+    /// CORE-6（#2545）: `verify_helper_path` は `HelperPaths::new` と同じ拒否（相対パス・不在は `NotFound`）。
+    #[test]
+    fn core6_verify_helper_path_matches_helper_paths() {
+        assert!(verify_helper_path(Path::new("newuidmap")).is_err());
+        let e = verify_helper_path(Path::new("/nonexistent-dir-2545/newuidmap")).unwrap_err();
+        assert_eq!(e.code, ErrorCode::NotFound);
+    }
 
     /// TASK-40・ERR-2: stderr から Cf・Zl・Zp・Cc を除去する。
     #[test]

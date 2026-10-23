@@ -387,8 +387,13 @@ pub fn spawn_exec_worker<F: FnOnce(ExecWorkerProof) -> i32>(
 /// 親は子の端を fork 直後に閉じる。戻り値の [`ExecListenerReceiver`] で、worker の終了を待つ **前** に
 /// listener を受信・検証すること（worker は ACK を待ってからコマンドを起動するため、先に終了を待つと相互待ちになる）。
 ///
+/// `delivery` は worker が載せる seccomp filter の届け方で、親が fork の前に決める。`UserNotif` を選ぶ呼び出し元は、
+/// 受信した listener の応答者になる責任を負う（応答者がいないと通知が止まり、コマンドが期限まで止まる。
+/// 応答者を持つ本番の経路は supervisor の `exec`。`docs/design/audit-delivery.md` 9.4・#2544）。
+///
 /// 呼び出し元の要件・worker の中の制約は [`spawn_exec_worker`] と同じ。
 pub fn spawn_exec_worker_with_listener<F>(
+    delivery: crate::seccomp::ErrnoDelivery,
     worker: F,
 ) -> Result<(ContainerChild, ExecListenerReceiver), ExecError>
 where
@@ -406,7 +411,7 @@ where
         if !closed {
             return EXIT_SETUP_FAILED;
         }
-        worker(proof, exec_sender_from(child_end))
+        worker(proof, exec_sender_from(child_end, delivery))
     })?;
     // 親の子の端は上の closure の drop で閉じる（`fork_single_threaded` は親側で closure を drop する）。
     Ok((child, receiver))

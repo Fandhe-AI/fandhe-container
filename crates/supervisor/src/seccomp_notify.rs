@@ -34,7 +34,9 @@
 //!
 //! 記録先を作れないときの起動拒否は入口（`start_entry::require_seccomp_audit_sink`。#2027）が行い、本モジュールは
 //! 起動した後に記録に失敗した分の `unrecorded` の集計とログまで。exec 経路（SUP-6）の
-//! listener 受け渡しは #2385 で実装済み（filter は ERRNO 版のままで通知は出ない。exec の USER_NOTIF 化と応答者は #2385 の後続）。restart の再 launch を本番で成り立たせること自体は #2043（本モジュールの差し替えは
+//! listener 受け渡しは #2385、応答者は #2544 で実装済み（下の [`ExecResponder`]。exec の親が単一スレッドで同期に応答する。
+//! 方式の判断と残余は `audit-delivery.md` 9.4）。ハブ（本モジュールの [`SeccompNotifyHub`]）への exec の listener の
+//! 2 段目の受け渡しは未実装（供給元の複数化と exec の本番配線〔#492・#495・#1314〕の後）。restart の再 launch を本番で成り立たせること自体は #2043（本モジュールの差し替えは
 //! 偽の launcher でだけ試している）。
 
 use std::collections::VecDeque;
@@ -47,6 +49,7 @@ use std::time::{Duration, Instant};
 
 use fandhe_container_core::audit_log::{
     AuditSink, AuditTimestamp, SeccompDenialReport, record_seccomp_denial_for,
+    record_seccomp_denial_for_until,
 };
 use fandhe_container_core::traits::{ContainerId, ErrorCode, TraitError};
 
@@ -268,10 +271,23 @@ fn report_events(now: CounterSnapshot, prev: CounterSnapshot) -> Vec<(&'static s
     .collect()
 }
 
+/// 構造化ログ 1 行（改行なし）。語彙 `event` は固定で、`count` は数値のみ。
+fn report_line(event: &str, count: u64) -> String {
+    format!("{{\"component\":\"supervisor\",\"event\":\"{event}\",\"count\":{count}}}")
+}
+
+/// 集計の構造化ログの行（改行なし。固定語彙と数値のみ）。単一スレッドを保つ exec の親は、共有の出力口（専用スレッドを
+/// 作る）を使えないため、この行を待たない出口（core の `emit_diagnostic_line_to`）で出す（#2544）。
+pub fn report_lines(counts: CounterSnapshot) -> Vec<String> {
+    report_events(counts, CounterSnapshot::default())
+        .into_iter()
+        .map(|(event, count)| report_line(event, count))
+        .collect()
+}
+
 fn emit_report(events: &[(&'static str, u64)]) {
     for (event, count) in events {
-        let line =
-            format!("{{\"component\":\"supervisor\",\"event\":\"{event}\",\"count\":{count}}}\n");
+        let line = format!("{}\n", report_line(event, *count));
         // 満杯・書き込み失敗でも処理は止めない（ログの欠落は許す。REPAIR-5）。
         let _ = crate::stderr_sink::stderr().emit(line.into_bytes());
     }
@@ -809,6 +825,211 @@ fn stop_and_join(live: Live, timeout: Duration) -> CounterSnapshot {
     }
     last
 }
+/// 同期の応答者が通知を待つ 1 回の長さ（停止判定と期限を見る間隔）。
+const SERVE_STEP: Duration = Duration::from_millis(20);
+
+/// [`ExecResponder::serve`] の終わり方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ServeEnd {
+    /// 呼び出し側の停止判定が真になった（exec では worker が終了した）。
+    Stopped,
+    /// 利用者がいなくなった（filter を持つプロセスが全て終了した）。
+    Closed,
+    /// 全体の期限に達した。
+    DeadlineReached,
+    /// 応答者を続けられなくなった（待機・受信・応答の送信の失敗）。呼び出し側は listener を閉じること。
+    /// カーネルが待機中の syscall を `ENOSYS` で解く（許可に倒れない。SEC-4・REPAIR-5）。
+    Lost,
+}
+
+/// [`ExecResponder::serve`] の結果（将来拡張できる構造。REPAIR-3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ServeReport {
+    /// 終わり方。
+    pub end: ServeEnd,
+    /// 集計（固定語彙の構造化ログと同じ値）。
+    pub counts: CounterSnapshot,
+}
+
+/// exec の親が seccomp の通知に同期で応答する主体（SEC-4・SUP-6・REPAIR-5・#2544。判断は `audit-delivery.md` 9.4）。
+///
+/// 呼び出し元は `exec::run_in_worker_with`（exec の親）で、worker から受け取った listener を worker の回収まで保持する間に
+/// [`Self::serve`] を回す。exec の親は fork と `FileAuditSink` の主経路のため単一スレッドでなければならず、
+/// [`SeccompNotifyHub`] のスレッドを持てない。そのため通知ごとに「pid 変換 → cookie 検証 → トークンバケット →
+/// 期限つき記録 → `-EPERM` 応答」を呼び出しスレッドで直列に行う。応答は `-EPERM` の 1 種類だけで、記録の可否に関わらず
+/// 必ず応答する。記録は `min(応答期限, 全体期限)` で打ち切る（打ち切った分は `unrecorded`。ハブの `late` 相当の後追いはしない）。
+/// `audit` は `record_until` を期限どおりに実装すること（既定実装は期限切れでなければ `record` に委ねる）。
+pub struct ExecResponder<'a> {
+    sink: &'a dyn AuditSink,
+    container_id: Option<&'a ContainerId>,
+    config: NotifyConfig,
+}
+
+impl std::fmt::Debug for ExecResponder<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecResponder").finish_non_exhaustive()
+    }
+}
+
+impl<'a> ExecResponder<'a> {
+    /// 記録先と、記録に付けるコンテナ ID で作る。スレッドは作らない。
+    pub fn new(
+        sink: &'a dyn AuditSink,
+        container_id: Option<&'a ContainerId>,
+        config: NotifyConfig,
+    ) -> Self {
+        Self {
+            sink,
+            container_id,
+            config,
+        }
+    }
+
+    /// 本番の pid 変換（`/proc/<tid>/status` の `NSpid`）で [`Self::serve_with`] を回す。
+    pub fn serve<S: NotifySource>(
+        &self,
+        source: &S,
+        deadline: Instant,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> ServeReport {
+        self.serve_with(source, &resolve_pid_from_proc, deadline, stop)
+    }
+
+    /// `deadline`（全体の絶対期限）か `stop` が真になるまで、または供給元が閉じる・応答者を続けられなくなるまで、
+    /// 通知を 1 件ずつ処理する。反復ごとに先に `stop` と期限を確かめるため、通知が連続していても戻れる（REPAIR-5）。
+    /// スレッドを作らない（呼び出しプロセスの単一スレッドを保つ）。集計のログは出さず、[`report_lines`] で呼び出し側が出す。
+    pub fn serve_with<S: NotifySource>(
+        &self,
+        source: &S,
+        resolve: &dyn Fn(u32) -> Option<u32>,
+        deadline: Instant,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> ServeReport {
+        let counters = Counters::default();
+        let mut bucket = Bucket::new(self.config.rate_per_sec, self.config.burst, Instant::now());
+        let end = loop {
+            if stop() {
+                break ServeEnd::Stopped;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break ServeEnd::DeadlineReached;
+            }
+            if counters.respond_broken.load(Ordering::Acquire) {
+                break ServeEnd::Lost;
+            }
+            match source.wait(SERVE_STEP.min(deadline.saturating_duration_since(now))) {
+                Ok(Ready::Readable) => {}
+                Ok(Ready::Idle) => continue,
+                Ok(Ready::Closed) => break ServeEnd::Closed,
+                Err(SourceError) => {
+                    counters.wait_failed.fetch_add(1, Ordering::Relaxed);
+                    break ServeEnd::Lost;
+                }
+            }
+            match source.receive() {
+                Ok(Some((id, notified))) => {
+                    self.serve_one(
+                        source,
+                        resolve,
+                        &counters,
+                        &mut bucket,
+                        id,
+                        notified,
+                        deadline,
+                    );
+                }
+                Ok(None) => {
+                    counters.target_gone.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(SourceError) => {
+                    counters.receive_failed.fetch_add(1, Ordering::Relaxed);
+                    break ServeEnd::Lost;
+                }
+            }
+        };
+        // 最後の応答が送れず `respond_broken` を立てた場合を `Lost` に数える。
+        let end = if counters.respond_broken.load(Ordering::Acquire) {
+            ServeEnd::Lost
+        } else {
+            end
+        };
+        // ログは出さない（専用スレッドを作る共有の出力口は、単一スレッドを要する exec の親では使えない）。
+        // 呼び出し側が [`report_lines`] を待たない出口へ出す。
+        ServeReport {
+            end,
+            counts: counters.snapshot(),
+        }
+    }
+
+    /// 受け取った 1 件の処理。必ず応答する（cookie が無効のときを除く）。
+    // 理由: 毎回使う独立した入力のため、束ねる型を作らず引数のまま渡す（`handle_one` と同じ）。
+    #[allow(clippy::too_many_arguments)]
+    fn serve_one<S: NotifySource>(
+        &self,
+        source: &S,
+        resolve: &dyn Fn(u32) -> Option<u32>,
+        counters: &Counters,
+        bucket: &mut Bucket,
+        id: S::Id,
+        notified: Notified,
+        deadline: Instant,
+    ) {
+        // /proc を読んだ後に cookie を検証する（pid の再利用で別プロセスを記録しない）。
+        let resolved = resolve(notified.pid_in_listener_ns);
+        match source.is_pending(id) {
+            Ok(true) => {
+                let report = resolved.and_then(|pid| {
+                    SeccompDenialReport::from_user_notif(pid, notified.nr, notified.arch).ok()
+                });
+                match report {
+                    None => {
+                        counters.pid_unresolved.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some(report) => self.record(counters, bucket, &report, deadline),
+                }
+            }
+            // 応答待ちでない通知には応答できない（対象は既に消えた）。記録もしない。
+            Ok(false) => {
+                counters.target_gone.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            // 検証できなかったときは記録しない（取り違えの恐れ）。ただし対象は止まっているので応答は試みる。
+            Err(SourceError) => {
+                counters.unrecorded.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        respond(source, counters, id);
+    }
+
+    /// レート内なら、応答期限と全体期限の早い方までに記録する。超過は待たずに数える。
+    fn record(
+        &self,
+        counters: &Counters,
+        bucket: &mut Bucket,
+        report: &SeccompDenialReport,
+        deadline: Instant,
+    ) {
+        let now = Instant::now();
+        if !bucket.take(now) {
+            counters.suppressed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let Ok(at) = AuditTimestamp::now() else {
+            counters.unrecorded.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let until = now
+            .checked_add(self.config.response_deadline)
+            .map_or(deadline, |t| t.min(deadline));
+        match record_seccomp_denial_for_until(report, at, self.container_id, self.sink, until) {
+            Ok(()) => counters.recorded.fetch_add(1, Ordering::Relaxed),
+            Err(_) => counters.unrecorded.fetch_add(1, Ordering::Relaxed),
+        };
+    }
+}
 
 #[cfg(target_os = "linux")]
 mod real {
@@ -868,6 +1089,9 @@ mod real {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+pub use real::ListenerSource;
 
 #[cfg(target_os = "linux")]
 impl SeccompNotifyHub {
@@ -1331,5 +1555,230 @@ mod tests {
             vec![("seccomp_audit_suppressed", 3), ("seccomp_audit_late", 1)]
         );
         assert!(report_events(now, now).is_empty());
+    }
+
+    // ---- ExecResponder（exec の親の同期の応答者。#2544） ----
+
+    /// `record_until` が期限まで眠って `Timeout` を返す記録先（詰まった記録先の再現）。
+    struct StuckUntilDeadline;
+
+    impl AuditSink for StuckUntilDeadline {
+        fn record(&self, _record: &AuditRecord) -> Result<(), TraitError> {
+            Err(TraitError::new(ErrorCode::Internal, "must not be called"))
+        }
+        fn record_until(&self, _record: &AuditRecord, deadline: Instant) -> Result<(), TraitError> {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            Err(TraitError::new(ErrorCode::Timeout, "stuck"))
+        }
+    }
+
+    fn far() -> Instant {
+        Instant::now() + Duration::from_secs(30)
+    }
+
+    fn serve(
+        sink: &dyn AuditSink,
+        config: NotifyConfig,
+        fake: &Fake,
+        stop: &mut dyn FnMut() -> bool,
+    ) -> ServeReport {
+        let id = ContainerId::new("web-1").unwrap();
+        ExecResponder::new(sink, Some(&id), config).serve_with(fake, &Some, far(), stop)
+    }
+
+    /// SEC-4・SUP-6・#2544: 通知 1 件は、変換後の pid・番号・arch・コンテナ ID の記録がちょうど 1 件で、応答もちょうど 1 回。
+    #[test]
+    fn sec4_2544_one_notification_is_recorded_once_and_answered_once() {
+        let sink = Sink::default();
+        let (fake, answered) = Fake::new(vec![Some((7, n(4242)))]);
+        let report = serve(&sink, NotifyConfig::default(), &fake, &mut || false);
+        assert_eq!(report.end, ServeEnd::Closed);
+        assert_eq!(answered.lock().unwrap().as_slice(), &[7]);
+        let recs = sink.records.lock().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].pid().get(), 4242);
+        assert_eq!(recs[0].syscall().map(|s| s.get()), Some(312));
+        assert_eq!(recs[0].seccomp_arch().map(|a| a.get()), Some(0xC000_003E));
+        assert_eq!(
+            recs[0].container_id().map(ContainerId::as_str),
+            Some("web-1")
+        );
+        assert_eq!(
+            report.counts,
+            CounterSnapshot {
+                recorded: 1,
+                ..CounterSnapshot::default()
+            }
+        );
+    }
+
+    /// 複数の拒否は 1 拒否 1 件で、応答は通知の順。
+    #[test]
+    fn sec4_2544_each_denial_is_one_record() {
+        let sink = Sink::default();
+        let (fake, answered) =
+            Fake::new(vec![Some((1, n(10))), Some((2, n(11))), Some((3, n(12)))]);
+        let report = serve(&sink, NotifyConfig::default(), &fake, &mut || false);
+        assert_eq!(answered.lock().unwrap().as_slice(), &[1, 2, 3]);
+        let pids: Vec<u32> = sink
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.pid().get())
+            .collect();
+        assert_eq!(pids, vec![10, 11, 12]);
+        assert_eq!(report.counts.recorded, 3);
+    }
+
+    /// REPAIR-5・#2544: 期限まで眠る記録先でも、応答は応答期限＋余裕以内に返り、`unrecorded` は 1。
+    #[test]
+    fn repair5_2544_stuck_sink_is_answered_at_the_response_deadline() {
+        let (fake, answered) = Fake::new(vec![Some((9, n(55)))]);
+        let config = NotifyConfig::default()
+            .with_response_deadline(Duration::from_millis(100))
+            .unwrap();
+        let started = Instant::now();
+        let report = serve(&StuckUntilDeadline, config, &fake, &mut || false);
+        let took = started.elapsed();
+        assert_eq!(answered.lock().unwrap().as_slice(), &[9]);
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert_eq!(
+            report.counts,
+            CounterSnapshot {
+                unrecorded: 1,
+                ..CounterSnapshot::default()
+            }
+        );
+    }
+
+    /// cookie が無効なら記録も応答もしない（`target_gone` は 1）。
+    #[test]
+    fn sec4_2544_invalid_cookie_records_and_answers_nothing() {
+        let sink = Sink::default();
+        let (mut fake, answered) = Fake::new(vec![Some((1, n(10)))]);
+        fake.pending = false;
+        let report = serve(&sink, NotifyConfig::default(), &fake, &mut || false);
+        assert!(sink.records.lock().unwrap().is_empty());
+        assert!(answered.lock().unwrap().is_empty());
+        assert_eq!(report.counts.target_gone, 1);
+    }
+
+    /// pid を変換できなければ記録せずに応答する（`pid_unresolved` は 1）。
+    #[test]
+    fn sec4_2544_unresolved_pid_is_answered_without_a_record() {
+        let sink = Sink::default();
+        let (fake, answered) = Fake::new(vec![Some((3, n(10)))]);
+        let id = ContainerId::new("web-1").unwrap();
+        let report = ExecResponder::new(&sink, Some(&id), NotifyConfig::default()).serve_with(
+            &fake,
+            &|_| None,
+            far(),
+            &mut || false,
+        );
+        assert_eq!(answered.lock().unwrap().as_slice(), &[3]);
+        assert!(sink.records.lock().unwrap().is_empty());
+        assert_eq!(report.counts.pid_unresolved, 1);
+    }
+
+    /// レート超過は記録を間引くが、応答は全件に返す。
+    #[test]
+    fn repair5_2544_rate_limit_suppresses_records_but_not_responses() {
+        let sink = Sink::default();
+        let items = (0..5).map(|i| Some((i, n(100 + i as u32)))).collect();
+        let (fake, answered) = Fake::new(items);
+        let config = NotifyConfig::default().with_limits(8, 1, 2).unwrap();
+        let report = serve(&sink, config, &fake, &mut || false);
+        assert_eq!(answered.lock().unwrap().len(), 5);
+        assert_eq!(report.counts.recorded, 2);
+        assert_eq!(report.counts.suppressed, 3);
+    }
+
+    /// 待機・受信の失敗、応答の送信の失敗は応答者の喪失（`Lost`）になり、集計は具体値。
+    #[test]
+    fn sec4_2544_source_failures_end_as_lost() {
+        let sink = Sink::default();
+        let (mut fake, _) = Fake::new(vec![Some((1, n(10)))]);
+        fake.fail_at = 1;
+        let report = serve(&sink, NotifyConfig::default(), &fake, &mut || false);
+        assert_eq!(report.end, ServeEnd::Lost);
+        assert_eq!(report.counts.wait_failed, 1);
+
+        let (mut fake, _) = Fake::new(vec![Some((1, n(10)))]);
+        fake.fail_at = 2;
+        let report = serve(&sink, NotifyConfig::default(), &fake, &mut || false);
+        assert_eq!(report.end, ServeEnd::Lost);
+        assert_eq!(report.counts.receive_failed, 1);
+
+        let (fake, _) = Fake::new(vec![Some((1, n(10)))]);
+        fake.send_failures.store(u32::MAX, Ordering::SeqCst);
+        let report = serve(&sink, NotifyConfig::default(), &fake, &mut || false);
+        assert_eq!(report.end, ServeEnd::Lost);
+        assert_eq!(report.counts.respond_failed, 1);
+    }
+
+    /// 通知が途切れない台本でも、停止判定が真になれば処理を打ち切って戻る（`Stopped`）。
+    #[test]
+    fn repair5_2544_stop_ends_a_busy_loop() {
+        let sink = Sink::default();
+        let items = (0..1000).map(|i| Some((i, n(10)))).collect();
+        let (fake, answered) = Fake::new(items);
+        let mut calls = 0;
+        let report = serve(&sink, NotifyConfig::default(), &fake, &mut || {
+            calls += 1;
+            calls > 3
+        });
+        assert_eq!(report.end, ServeEnd::Stopped);
+        assert_eq!(answered.lock().unwrap().len(), 3);
+    }
+
+    /// 全体の期限に達したら戻る（`DeadlineReached`）。
+    #[test]
+    fn repair5_2544_deadline_ends_an_idle_loop() {
+        struct Idle;
+        impl NotifySource for Idle {
+            type Id = u64;
+            fn wait(&self, t: Duration) -> Result<Ready, SourceError> {
+                std::thread::sleep(t);
+                Ok(Ready::Idle)
+            }
+            fn receive(&self) -> Result<Option<(u64, Notified)>, SourceError> {
+                Ok(None)
+            }
+            fn is_pending(&self, _id: u64) -> Result<bool, SourceError> {
+                Ok(true)
+            }
+            fn deny_eperm(&self, _id: u64) -> Result<Responded, SourceError> {
+                Ok(Responded::Sent)
+            }
+        }
+        let sink = Sink::default();
+        let started = Instant::now();
+        let report = ExecResponder::new(&sink, None, NotifyConfig::default()).serve_with(
+            &Idle,
+            &Some,
+            Instant::now() + Duration::from_millis(100),
+            &mut || false,
+        );
+        assert_eq!(report.end, ServeEnd::DeadlineReached);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// #2544: 待たない出口へ渡す行は改行なしの固定語彙の JSON で、増分のある項目だけ。
+    #[test]
+    fn sec4_2544_report_lines_are_fixed_vocabulary_without_newlines() {
+        let counts = CounterSnapshot {
+            recorded: 4,
+            unrecorded: 2,
+            ..CounterSnapshot::default()
+        };
+        assert_eq!(
+            report_lines(counts),
+            vec![
+                "{\"component\":\"supervisor\",\"event\":\"seccomp_audit_unrecorded\",\"count\":2}"
+                    .to_string()
+            ]
+        );
+        assert!(report_lines(CounterSnapshot::default()).is_empty());
     }
 }

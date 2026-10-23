@@ -284,7 +284,7 @@ impl ExecRestrictions {
     ///
     /// `spawn_exec_worker_with_listener` が worker へ渡す [`ExecListenerSender`] を、`reapply_restrictions` の前に
     /// 付ける。seccomp の段は `NEW_LISTENER` 付きで filter を載せ、listener を親へ渡して ACK を待つ（届け方は
-    /// ERRNO 版のまま。通知は生じない）。付けずに本番の再適用を呼ぶと、何も適用せず `FailedPrecondition`
+    /// 送信口が持つ値に従う。`USER_NOTIF` なら応答者は exec の親。#2544）。付けずに本番の再適用を呼ぶと、何も適用せず `FailedPrecondition`
     /// （段 `Validate`）で拒否する（listener の受け渡しを省く経路を本番に残さない。fail-closed）。
     pub fn with_seccomp_listener(mut self, sender: ExecListenerSender) -> Self {
         self.seccomp_listener = Some(sender);
@@ -1368,7 +1368,10 @@ mod tests {
     /// 単体テスト用の送り手（親の端は直ちに閉じる。偽の seccomp は送り手を使わない）。
     fn test_listener_sender() -> ExecListenerSender {
         let (_receiver, child_end) = crate::exec::seccomp_listener::exec_listener_pair().unwrap();
-        crate::exec::seccomp_listener::exec_sender_from(child_end)
+        crate::exec::seccomp_listener::exec_sender_from(
+            child_end,
+            crate::seccomp::ErrnoDelivery::Errno,
+        )
     }
 
     /// 対象の mount namespace を自分自身にした束縛（単体テストは `setns` をしないため照合が通る）。

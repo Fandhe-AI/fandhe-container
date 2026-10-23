@@ -11,8 +11,8 @@
 //! - 呼び出し元は supervisor の USER_NOTIF listener ループ（`fandhe-container-supervisor` の `seccomp_notify`。#2025）。
 //!   SIGSYS ハンドラ経由（`from_sigsys`）は未実装（REPAIR-3）。supervisor の start 経路は `ProductionLauncherBuilder::
 //!   seccomp_errno_delivery(UserNotif)` で ERRNO 側の 40 件を通知にし、ループが PID を変換して本フックで記録してから
-//!   `-EPERM` で応答する。それ以外の launcher（既定の `Errno`）や exec 経路（listener は #2385 で受け渡し済みだが filter は ERRNO 版のまま。USER_NOTIF 化は後続）は従来どおり `ERRNO(EPERM)` で、
-//!   報告が発生しない。`unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS`（ESC-06）。`KILL_PROCESS` では終了するプロセス自身が記録を書けず、
+//!   `-EPERM` で応答する。それ以外の launcher（既定の `Errno`）は従来どおり `ERRNO(EPERM)` で報告が発生しない。exec 経路（#2385）は filter を `USER_NOTIF` で載せ、応答者は exec の親（supervisor の `exec`。
+//!   期限つきの本フック `record_seccomp_denial_for_until` で記録。#2544）。`unshare`・`ptrace`・`kexec_load` は `KILL_PROCESS`（ESC-06）。`KILL_PROCESS` では終了するプロセス自身が記録を書けず、
 //!   プロセス内の SIGSYS ハンドラ経由の `SeccompDenialReport::from_sigsys` も使えない。そのため KILL 側では
 //!   本フックを使わない（正の記録はカーネルの `AUDIT_SECCOMP`、補助は親の回収点が出す
 //!   `AuditEvent::ExitSignal`。#2004）
@@ -155,6 +155,33 @@ pub fn record_seccomp_denial_for<S: AuditSink + ?Sized>(
     })
 }
 
+/// [`record_seccomp_denial_for`] の期限つき版（SEC-4・SUP-6・REPAIR-5・#2544）。`sink.record_until` を 1 回だけ呼ぶ。
+/// 呼び出し元は exec の親の同期の応答者（supervisor の `seccomp_notify`）で、通知の応答期限を `deadline` に渡し、
+/// 記録先が詰まっても応答が期限を越えて遅れないようにする。期限を守るかは `sink` の `record_until` の実装次第。
+pub fn record_seccomp_denial_for_until<S: AuditSink + ?Sized>(
+    report: &SeccompDenialReport,
+    timestamp: AuditTimestamp,
+    container_id: Option<&ContainerId>,
+    sink: &S,
+    deadline: std::time::Instant,
+) -> Result<(), TraitError> {
+    let record = AuditRecord::new(
+        timestamp,
+        report.pid,
+        AuditEvent::Seccomp {
+            syscall: report.syscall,
+            arch: report.arch,
+        },
+    );
+    sink.record_until(
+        &match container_id {
+            Some(id) => record.with_container_id(id.clone()),
+            None => record,
+        },
+        deadline,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -168,9 +195,20 @@ mod tests {
     struct VecSink {
         records: Mutex<Vec<AuditRecord>>,
         fail: bool,
+        until_calls: Mutex<Vec<std::time::Instant>>,
     }
 
     impl AuditSink for VecSink {
+        fn record_until(
+            &self,
+            record: &AuditRecord,
+            deadline: std::time::Instant,
+        ) -> Result<(), TraitError> {
+            self.until_calls.lock().unwrap().push(deadline);
+            self.records.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+
         fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
             self.records.lock().unwrap().push(record.clone());
             if self.fail {
@@ -335,6 +373,25 @@ mod tests {
             Some("web-1")
         );
         assert_eq!(recs[0].pid().get(), 4242);
+        assert_eq!(recs[0].syscall().map(AuditSyscallNr::get), Some(312));
+    }
+
+    /// SEC-4・SUP-6・#2544: 期限つき版は `record_until` をちょうど 1 回呼び、期限・ID・番号・arch・PID をそのまま渡す。
+    #[test]
+    fn sec4_2544_record_for_until_calls_record_until_once() {
+        let sink = VecSink::default();
+        let report = SeccompDenialReport::from_user_notif(77, 312, 0xC000_003E).unwrap();
+        let id = ContainerId::new("web-2").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        record_seccomp_denial_for_until(&report, ts(), Some(&id), &sink, deadline).unwrap();
+        assert_eq!(*sink.until_calls.lock().unwrap(), vec![deadline]);
+        let recs = sink.records.lock().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].container_id().map(ContainerId::as_str),
+            Some("web-2")
+        );
+        assert_eq!(recs[0].pid().get(), 77);
         assert_eq!(recs[0].syscall().map(AuditSyscallNr::get), Some(312));
     }
 }

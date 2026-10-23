@@ -12,8 +12,8 @@
 //! `seccomp_notify`（#2025）が担い、本モジュールは取得・受け渡しと、通知の読み書きの安全 API（[`SeccompListener::wait`]・
 //! `receive`・`is_pending`・`deny_eperm`）を担う。**filter の既定は ERRNO 版**（`USER_NOTIF` を返さない）で、listener を
 //! 保持するだけならコンテナの挙動は変わらない。exec の経路（SUP-6・#2385）では worker が同じ手順で渡し、起動側 C は worker を fork した
-//! exec 専用の親（[`ExecListenerReceiver`]）になる。exec の親は worker の終了を待つ前に受信し（相互待ちを避ける）、exec での
-//! USER_NOTIF 化と応答者は後続。`ProductionLauncherBuilder::seccomp_errno_delivery(UserNotif)` で opt-in した
+//! exec 専用の親（[`ExecListenerReceiver`]）になる。exec の親は worker の終了を待つ前に受信し（相互待ちを避ける）、届け方は親が fork 前に決める
+//! （exec の本番経路は `USER_NOTIF`、応答者は supervisor の `exec::run_in_worker_with`。9.4・#2544）。`ProductionLauncherBuilder::seccomp_errno_delivery(UserNotif)` で opt-in した
 //! launcher（supervisor の start 経路だけ）では ERRNO 側の 40 件が通知になり、応答者がいる前提になる
 //! （`audit-delivery.md` 9 章の案 3）。通知の引数・命令ポインタは公開せず、応答は `-EPERM` の 1 種類だけ（TOCTOU の余地を
 //! 型で無くす）。
@@ -555,7 +555,9 @@ pub(crate) fn listener_socketpair() -> Result<(OwnedFd, OwnedFd), ExecError> {
 /// `ExecRestrictions::with_seccomp_listener` へ渡すと、`reapply_restrictions` の最後（seccomp の段）が
 /// `NEW_LISTENER` 付きで filter を載せ、得た listener を exec の親（[`ExecListenerReceiver`]）へ渡して ACK を待つ。
 /// 構築できるのは core だけ（`spawn_exec_worker_with_listener` が worker へ渡す）で、`Clone` を持たない。
-/// filter の届け方は ERRNO 版のまま（通知は生じない。応答者は後続。`docs/design/audit-delivery.md`）。
+/// filter の届け方（`ERRNO` か `USER_NOTIF` か）は exec の親が fork の **前** に決めて持たせる（`delivery`）。
+/// `USER_NOTIF` なら拒否ごとに通知が生じ、応答者は exec の親（supervisor の `exec::run_in_worker_with`。
+/// `docs/design/audit-delivery.md` 9.4・#2544）。`Errno` のままなら通知は生じない。
 #[derive(Debug)]
 pub struct ExecListenerSender {
     inner: ListenerSender,
@@ -563,11 +565,17 @@ pub struct ExecListenerSender {
 }
 
 impl ExecListenerSender {
-    fn new(child_end: OwnedFd) -> Self {
+    fn new(child_end: OwnedFd, delivery: crate::seccomp::ErrnoDelivery) -> Self {
         Self {
-            inner: ListenerSender::new(child_end),
+            inner: ListenerSender::new(child_end).with_delivery(delivery),
             ack_deadline: None,
         }
+    }
+
+    /// filter の届け方（親が fork 前に決めた値）。
+    #[must_use]
+    pub fn delivery(&self) -> crate::seccomp::ErrnoDelivery {
+        self.inner.delivery()
     }
 
     /// ACK 待ちの絶対期限を設定する（実際の待ちは `ACK_TIMEOUT` と残り時間の短い方。REPAIR-5）。
@@ -639,8 +647,11 @@ impl ExecListenerReceiver {
 }
 
 /// 子の端から送信口を作る（`exec_command` の worker 内で呼ぶ）。
-pub(crate) fn exec_sender_from(child_end: OwnedFd) -> ExecListenerSender {
-    ExecListenerSender::new(child_end)
+pub(crate) fn exec_sender_from(
+    child_end: OwnedFd,
+    delivery: crate::seccomp::ErrnoDelivery,
+) -> ExecListenerSender {
+    ExecListenerSender::new(child_end, delivery)
 }
 
 /// 試験専用: worker の中で本番と同じ seccomp の listener 付き適用（NNP → `NEW_LISTENER` 付き filter → 送信 → ACK 待ち）を行い、
@@ -1214,7 +1225,12 @@ mod tests {
         body: impl FnOnce(ExecListenerSender) -> i32 + Send + 'static,
     ) -> (ExecListenerReceiver, WorkerStandIn) {
         let (receiver, child_end) = exec_listener_pair().unwrap();
-        let handle = std::thread::spawn(move || body(exec_sender_from(child_end)));
+        let handle = std::thread::spawn(move || {
+            body(exec_sender_from(
+                child_end,
+                crate::seccomp::ErrnoDelivery::Errno,
+            ))
+        });
         (
             receiver,
             WorkerStandIn {
@@ -1330,17 +1346,29 @@ mod tests {
     #[test]
     fn sec4_sup6_2385_ack_wait_is_capped_by_the_deadline() {
         let (_r, c) = exec_listener_pair().unwrap();
-        let (_, t) = exec_sender_from(c).into_parts();
+        let (_, t) = exec_sender_from(c, crate::seccomp::ErrnoDelivery::Errno).into_parts();
         assert_eq!(t, ACK_TIMEOUT);
         let (_r, c) = exec_listener_pair().unwrap();
-        let (_, t) = exec_sender_from(c)
+        let (_, t) = exec_sender_from(c, crate::seccomp::ErrnoDelivery::Errno)
             .with_ack_deadline(Instant::now() + Duration::from_secs(2))
             .into_parts();
         assert!(t <= Duration::from_secs(2), "{t:?}");
         let (_r, c) = exec_listener_pair().unwrap();
-        let (_, t) = exec_sender_from(c)
+        let (_, t) = exec_sender_from(c, crate::seccomp::ErrnoDelivery::Errno)
             .with_ack_deadline(Instant::now() + Duration::from_secs(3600))
             .into_parts();
         assert_eq!(t, ACK_TIMEOUT);
+    }
+
+    /// SEC-4・SUP-6・#2544: exec の送信口の届け方は親が fork 前に決めた値のまま持ち上がる（`Errno` と `UserNotif` を取り違えない）。
+    #[test]
+    fn sec4_sup6_2544_exec_sender_carries_the_delivery_chosen_by_the_parent() {
+        use crate::seccomp::ErrnoDelivery;
+        for delivery in [ErrnoDelivery::Errno, ErrnoDelivery::UserNotif] {
+            let (_r, c) = exec_listener_pair().unwrap();
+            let sender = exec_sender_from(c, delivery);
+            assert_eq!(sender.delivery(), delivery);
+            assert_eq!(sender.into_parts().0.delivery(), delivery);
+        }
     }
 }

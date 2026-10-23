@@ -4487,9 +4487,8 @@ pub(crate) fn kill_pid(pid: u32, sig: Signal) -> Result<(), SysError> {
 /// CORE-6・SEC-5・#2376)。呼び出し側は、`pgid` が未回収の自分の子(グループのリーダー)の pid であることを保証する
 /// (未回収の間は pid 番号が解放されず、別のグループ ID として再利用されない)。
 ///
-/// holder(`rootless::holder_await_release`。#2551)も期限切れのときに mapper のセッションへ使う。holder の呼び出しでは
-/// `pgid` は未回収の自分の子とは限らないため、呼び出し側が `/proc/<pid>` の fd 経由でセッション ID が `pgid` であることを
-/// kill の直前に確かめる(確かめられなければ送らない)。
+/// holder(`rootless::holder_await_release`。#2551)はこの関数を使わない。`pgid` が自分の未回収の子とは限らず、数値では
+/// 宛先の同一性を保証できないため、錨にした mapper の pidfd へ [`pidfd_send_signal_group`] で送る。
 ///
 /// `pgid` が 0（自グループ宛て）・1（`kill(-1)` は全プロセス宛てになる）・`i32` を超える値は `EINVAL` で拒否する。
 /// グループに誰も居なければ `ESRCH`。

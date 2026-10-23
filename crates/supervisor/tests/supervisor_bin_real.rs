@@ -49,7 +49,7 @@
 //! - 動的リンクのためホストの共有ライブラリを rootfs へコピーする（ネットワークは不要）
 //!
 //! # 実機前提テストとしての分離
-//! 上記の環境は GitHub ホステッド runner で保証できないため、`-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」。
+//! 上記の環境は既定のテスト集合では保証できないため、`-- --ignored` 指定時のみ実行する（`platform-ci` の ubuntu は #2596 で実行し成功行を照合する。ci.md「実機前提テスト」。
 //! 既定集合で動くはずの試験を移したものではない。既定集合では `supervisor_bin.rs` が fail-closed の不変条件を照合する）。
 //! 実行された場合は、user namespace の拒否・Landlock ABI 不足・cgroup の委譲無しを含むあらゆる失敗を失敗として扱い、
 //! 検証せずに成功する分岐は持たない。
@@ -63,7 +63,7 @@
 //! captured, seccomp denial recorded once; failed start left no process; restart fails closed until #2043; SIGTERM
 //! via the control channel recorded Stopped(43) and the stopped container was deleted; ESC-03 mount denied via the
 //! SeccompNotifyHub and recorded once`。
-//! 実行と結果の記録は人間担当（#499・#485・#491・#219 のうち該当するもの、または PR）。Linux 限定。
+//! CI（ubuntu-latest）以外の環境・root の分岐の実行と結果の記録は人間担当（#499・#485・#491・#219 のうち該当するもの、または PR）。Linux 限定。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

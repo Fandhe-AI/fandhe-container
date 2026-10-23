@@ -184,7 +184,8 @@ impl ContainerOptions {
     /// 選ぶ（CORE-5・SUP-12・#1672 事後監査 P2）。`--ipc=host` では `/dev/shm` を載せないため
     /// `ImplicitDevMounts::WithoutShm` になり、適用時に無い `/dev/shm` のルールで起動を拒否しない。
     /// `tmpfs_set` と同じ検証を通し、同じ指定の矛盾はここでも拒否する。core の `landlock::build_path_rules_with_dev`
-    /// へ渡す想定で、本番の launcher からの結線は #1314 の後続（REPAIR-3）。
+    /// へ渡す想定。本番 launcher は現在 `ContainerOptions` を受け取らず、暗黙の `/dev` 系は常に
+    /// `ImplicitDevMounts::All`（既定の `/dev/shm` を載せる）で作る。launcher からの結線は未実装（担当 #2625。REPAIR-3）。
     pub fn implicit_dev_mounts(&self) -> Result<ImplicitDevMounts, TraitError> {
         Ok(ImplicitDevMounts::for_tmpfs_set(&self.tmpfs_set()?))
     }

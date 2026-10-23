@@ -22,7 +22,7 @@
 //! 2 理由（`path_symlink_or_not_directory`・`path_missing`）だけを `RootfsPinError` で運び、supervisor の
 //! `load_exec_bundle` が目印つきの `TraitError` にして `err` 行へ載せる（#1702）。照合の限界: `launch.rs` は
 //! pin 以外のコードも含むため、そこに `ViolationReason::` を足すと照合に混ざる（足すなら一覧との関係を決めること）。
-//! start の経路は `AuditSink` の配線が無く記録しない（#1314）。
+//! start の経路は、拒否の記録先はあるが違反の理由をまだ流しておらず記録しない（未実装。#2623）。
 
 use std::collections::BTreeSet;
 

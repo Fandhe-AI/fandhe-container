@@ -24,14 +24,17 @@
 //! # helper の個別診断・`subid:`・名前の行（#2545）
 //! - `newuidmap` と `newgidmap` は core の `verify_helper_path`（`HelperPaths::new` と同じ規則）で 1 本ずつ検証し、
 //!   欠けた側ごとに 1 件出す（state は `newuidmap_not_found` 等）。
-//! - `/etc/nsswitch.conf` の `subid:` が `files` 以外（範囲を NSS から配る構成）は `SUBID_NAME_SERVICE_UNSUPPORTED`、
-//!   読めない・書式不正は `NSSWITCH_UNUSABLE`（どちらも Warning。`start` も拒否する）。
+//! - `/etc/nsswitch.conf` の `subid:` の最初の語が `files` 以外（範囲を NSS から配る構成。shadow 4.13 の `nss.c` に合わせた
+//!   判定で、大文字小文字は区別しない。#2636）は `SUBID_NAME_SERVICE_UNSUPPORTED`、
+//!   読めない・NUL などで判定できないのは `NSSWITCH_UNUSABLE`（どちらも Warning。`start` も拒否する）。
 //! - 名前を引けず（`getent` が無い）、subuid / subgid に名前の行しか無い構成は `SUBID_OWNER_UNDETERMINED`（Warning。
 //!   `start` も拒否する）。数値 uid の行だけなら従来どおり `SUBID_OWNER_LOOKUP_UNAVAILABLE`（通知）。
 //!
-//! # 未実装（REPAIR-3）
-//! - 状態ストアの inspect の `idMapping`（`RecordedIdModel`）と、現在のホスト設定で選ばれるモデルの突き合わせ
-//!   （状態ストアを読む設計が要る。追跡予定）。
+//! # 行わないこと（#2636）
+//! - 状態ストアの inspect の `idMapping`（`RecordedIdModel`）と、現在のホスト設定で選ばれるモデルの突き合わせは
+//!   行わない。1 つのコンテナの写像は一生変わらず利用者の取れる行動が無いうえ、doctor の読み取り専用の契約
+//!   （状態ルートを作らない・`@lock` を取らない）を崩すため。理由と見直す条件は
+//!   `docs/design/subid-owner-resolution.md` の決定 15。
 //!
 //! # 所有者名の解決（#2390）
 //! 名前は `start` と同じ `user_db::resolve_owner_name` で得る（passwd を先に読み、行が無いときだけ固定パスの
@@ -66,11 +69,11 @@ pub enum OwnerState {
 /// `/etc/nsswitch.conf` の `subid:` の状態（#2545）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NsswitchState {
-    /// `subid:` が無い・`files` だけ。
+    /// `subid:` が無い・値が空・最初の語が `files`。
     Files,
-    /// `files` 以外の源（範囲を NSS から配る構成。`start` は拒否する）。
+    /// 最初の語が `files` 以外（範囲を NSS から配る構成。`start` は拒否する）。
     NameService,
-    /// 読めない・書式不正（`start` は拒否する）。
+    /// 読めない・UTF-8 不正・NUL などで判定できない（`start` は拒否する）。
     Unusable,
     /// 検査しなかった。
     NotChecked,
@@ -1222,6 +1225,12 @@ mod tests {
             let (f, r) = run(&d, &status(1000, 1000), &s);
             assert_eq!(f.subid_source, NsswitchState::Unusable);
             assert_eq!(codes(&r), ["NSSWITCH_UNUSABLE"]);
+            // #2636: 大文字小文字を区別しない（shadow は strncasecmp）。
+            let conf = d.write("nsswitch.conf", "SUBID: sss\n");
+            s.lookup = s.lookup.clone().with_nsswitch_conf(conf);
+            let (f, r) = run(&d, &status(1000, 1000), &s);
+            assert_eq!(f.subid_source, NsswitchState::NameService);
+            assert_eq!(codes(&r), ["SUBID_NAME_SERVICE_UNSUPPORTED"]);
             // files なら従来どおり。
             let conf = d.write("nsswitch.conf", "subid: files\n");
             s.lookup = s.lookup.clone().with_nsswitch_conf(conf);

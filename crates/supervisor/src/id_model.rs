@@ -29,8 +29,9 @@
 //! 名前なしで数値 uid の行だけで照合する（`doctor` が通知する）。ただし、そのとき選ばれるモデルが 1 対 1 で、
 //! subuid / subgid に**名前の行**（第 1 欄が `u32` でない行）があれば、自分の行か判定できないため拒否する
 //! （`RefusalReason::OwnerUndetermined`。数値行だけ・ファイル無しなら従来どおり。#2545）。
-//! `/etc/nsswitch.conf` の `subid:` が `files` 以外（範囲を NSS から配る構成）は、ファイルを読む方式では範囲を得られない
-//! ため拒否する（`SubidFromNameService`。読めない・書式不正は `NsswitchUnusable`。#2545）。
+//! `/etc/nsswitch.conf` の `subid:` の最初の語が `files` 以外（範囲を NSS から配る構成。shadow 4.13 の `nss.c` に合わせた
+//! 判定。#2636）は、ファイルを読む方式では範囲を得られない
+//! ため拒否する（`SubidFromNameService`。読めない・NUL などで判定できないのは `NsswitchUnusable`。#2545）。
 //!
 //! # doctor との共用
 //! 設定ファイルの既定位置（`SYSTEM_*`）・passwd の読み取り（`read_owner_name`）・subuid / subgid の分類
@@ -94,9 +95,9 @@ pub enum RefusalReason {
     OwnerNameInvalid,
     /// 名前を引けず（`LookupUnavailable`）、名前の行が自分のものか判定できない（#2545）。
     OwnerUndetermined,
-    /// `nsswitch.conf` の `subid:` が `files` 以外（#2545）。
+    /// `nsswitch.conf` の `subid:` の最初の語が `files` 以外（#2545・#2636）。
     SubidFromNameService,
-    /// `nsswitch.conf` が読めない・書式不正（#2545）。
+    /// `nsswitch.conf` が読めない・判定できない文字を含む（#2545・#2636）。
     NsswitchUnusable,
     /// subuid / subgid が読めない・解析できない。
     SubIdUnreadable,
@@ -777,6 +778,13 @@ mod tests {
                 run(Some("passwd: files\n")).unwrap().model,
                 RootlessIdModel::SingleId
             );
+            // #2636・shadow 4.13 nss.c: 最初の語だけを見る。大文字小文字は区別しない。
+            assert_eq!(
+                run(Some("subid: files sss\n")).unwrap().model,
+                RootlessIdModel::SingleId
+            );
+            let r = run(Some("SUBID: sss\n")).unwrap_err();
+            assert_eq!(r.reason, RefusalReason::SubidFromNameService);
             let r = run(Some("subid: sss\n")).unwrap_err();
             assert_eq!(r.reason, RefusalReason::SubidFromNameService);
             assert_eq!(

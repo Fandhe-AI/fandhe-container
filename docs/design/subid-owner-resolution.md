@@ -13,7 +13,9 @@ PR #2367（#2243）の `start` は所有者名を `/etc/passwd` だけから得�
 - `lib/subordinateio.c` の `find_range()` は 2 段で照合する。1 段目は第 1 欄が呼び出し元の名前と完全一致する行。2 段目は `getpwnam(owner)->pw_uid` を求め、第 1 欄が uid の 10 進文字列の行、または第 1 欄の名前を `getpwnam` で引いた uid が一致する行（同じ uid の別名）を受理する
 - `/etc/subgid` の数値の行も、gid ではなく **uid** で照合する（`newgidmap` も同じ `find_range`）
 - 所有者名の文字種・長さの制限は shadow 側に無い
-- `/etc/nsswitch.conf` に `subid:` があると、ファイルを読まずに libsubid へ問い合わせる
+- `/etc/nsswitch.conf` に `subid:` があると、ファイルを読まずに libsubid へ問い合わせる場合がある。判定は `lib/nss.c` の `nss_init()`（4.13 の commit `24b44b686ea2221405cfd806dede046cf1fd9584` の L42〜146）で、NSS を使う箇所は `lib/subordinateio.c` の `have_sub_uids`（L613）・`have_sub_gids`（L704）・`list_owner_ranges`（L814）・`find_subid_owners`（L931）が呼ぶ `get_subid_nss_handle()`。`newuidmap` は `src/newuidmap.c` の L35 で `have_sub_uids` を呼ぶ
+- `nss_init()` の挙動: `/etc/nsswitch.conf` を開けなければ files（L60〜64）。`#` で始まる行だけ読み飛ばし、行の途中の `#` は注釈にしない（L66〜67）。`strncasecmp(line, "subid:", 6)` で大文字小文字を区別せず行頭だけで照合する（L70）。`:` の後ろの空白を読み飛ばし、値が空ならその行を捨てる（L72〜76）。区切り `" \n\t"` の `strtok_r` で最初の語だけを見て、`files` なら files に決まり、後ろの語・後ろの行は読まない。角括弧は特別扱いしない（L77〜85）。語が 50 文字を超えると files（L86〜91）。それ以外は `dlopen("libsubid_<語>.so")` を試し、失敗するか必要なシンボルが無ければ files、揃えば NSS を使う（L92〜130）
+- 4.19.4（commit `115f7aa445f051a413d8b771efaa2ab0ca302770`）の `lib/nss.c` も、大文字小文字を区別しない `subid:`・`#` で始まる行だけ注釈・値が空でない最初の行の最初の語・`files` なら files、の形は同じ。違いは区切り文字と非テキストの扱いだけ
 
 ## 決定
 
@@ -29,8 +31,9 @@ PR #2367（#2243）の `start` は所有者名を `/etc/passwd` だけから得�
 10. **グループ kill は未回収の子にだけ送る**（#2545・REPAIR-5）: `try_wait` を標準出力の EOF の後まで呼ばず、期限切れ・出力超過・読み取り失敗の kill は未回収の子（ゾンビは pid / pgid を保持する）に対してだけ送る。回収後に pid が一周して別プロセスのグループリーダーになる窓をなくす。回収後に期限を超えた場合は kill せず `Timeout` を返す
 11. **root の呼び出し元では NSS を引かない**（#2545・SEC-5）: 実 uid / 実効 uid が 0 の exec は、ambient を消しても実行ファイルの capability が全ビットとみなされる。real / effective / saved / fs uid のどれかが 0（`/proc/self/status` を読めなければ root とみなす）なら `getent` を起動せず、`FailedPrecondition`（`RefusedAsRoot`）にする。passwd に行があれば従来どおり成功する。現状は start・doctor が rootful を拒否しており、pull 時の展開（`image_ownership`）を本番へ配線したときに root から呼ばれうるための先回りの契約。uid を落として引く方式は #2241（rootful の承認）で再検討する
 12. **argv[0] は選んだ候補のパス**（#2545）: 実体は `canonicalize` 後のパスで exec するが、busybox 等の multi-call バイナリがアプレットを argv[0] の basename で解決するため、`CommandExt::arg0` に候補のパスを渡す
-13. **`subid:` が `files` 以外なら拒否**（#2545・CORE-6）: `/etc/nsswitch.conf` の `subid:` の値が `files` 以外を含む（libsubid・sssd・FreeIPA）と、ファイルを読む方式では範囲を得られないため `start` は拒否し、`doctor` は `SUBID_NAME_SERVICE_UNSUPPORTED`（警告）にする。`subid:` が無い・`files` だけ・ファイルが無いときは従来どおり。ファイルが読めない・上限超過・UTF-8 不正・角括弧の不正・値が空のときも拒否する（`NSSWITCH_UNUSABLE`）。shadow の `lib/nss.c` の原文での値の解釈の確認は未実施で、`files` 以外はすべて拒否する安全側の規則にした
+13. **`subid:` の最初の語が `files` 以外なら拒否**（#2545・#2636・CORE-6）: shadow 4.13 の `lib/nss.c` `nss_init()` の判定に合わせる。`/etc/nsswitch.conf` の `subid:` の最初の語が `files` 以外（libsubid・sssd・FreeIPA）だと、ファイルを読む方式では範囲を得られないため `start` は拒否し、`doctor` は `SUBID_NAME_SERVICE_UNSUPPORTED`（警告）にする。規則は次のとおり。(a) `#` で始まる行だけを注釈として読み飛ばす（行の途中の `#` は注釈にしない）。(b) 行頭が大文字小文字を区別せず `subid:` の行だけが対象（前置きの空白・`:` の前の空白は対象外）。(c) 値の先頭の空白とタブを読み飛ばし、空ならその行を捨てる。(d) 値が空でない最初の行の最初の語だけを見て、`files` なら `Files`、それ以外は `NameService`（後ろの語・後ろの行は読まない）。(e) 本文に NUL がある、または対象行の値に `\v`・`\f`・`\r` があるときは `Unusable`（`NSSWITCH_UNUSABLE`。版によって区切りの扱いが違うため）。読めない・上限超過・UTF-8 不正も `Unusable`。対象の行が無い・ファイルが無いときは従来どおり `Files`。shadow は最初の語が `files` でなければ `dlopen("libsubid_<語>.so")` の成否で NSS を使うか決めるが、成否はファイルの内容から分からないため、`files` 以外はすべて拒否する。50 文字を超える語は shadow では files になるが、拒否の安全側に倒す。#2636 以前の規則（`files` 以外の語が 1 つでもあれば拒否）との差: `SUBID:` の大文字・`files#x`・`files\r` を files と誤る甘い側を締め、`files sss`・`files [..]`・値が空・行頭の空白・`subid :` を拒否しすぎていた側を緩めた
 14. **判定を型にして共有する**（#2545）: 所有者名の解決の失敗は `OwnerLookupFailure`、`start` / `doctor` 共通の拒否は `RefusalReason`（`id_model::diagnose_rootless_id_source_with`）で返し、`doctor` はエラー文言の文字列比較をしない。固定の英語文言は変えない
+15. **`doctor` と inspect の `idMapping` を突き合わせない**（#2636・SEC-5・CORE-6）: 記録（`RecordedIdModel`）と現在のホスト設定で選ばれるモデルの食い違いを `doctor` の診断にしない。理由: (1) 1 つのコンテナの写像は一生変わらない（OCI の `start` は `Created` のときしか受けず、supervisor の restart は start で使った launcher と `LaunchSpec` をそのまま使うため）。食い違っても、既存のコンテナは作った時点の設定で動き続け、利用者が取れる行動が無い。記録は観測専用で、選択にも権限の判断にも使わない。新しいコンテナがどの写像になるかは `doctor` の既存の `id_model` の診断がすでに示す。`start` が通らない前提の不成立という Warning の定義にも当たらない。(2) `doctor` の契約（読み取り専用・状態ルートを使わない・引数なし）を崩す。`FileStateStore::open` は状態ルートが無ければ作って `@revision` を初期化し、`@lock` は start と競合する（REPAIR-5。Windows では未実装）。`--root` を受けるための引数の変更も要る。(3) inspect は CLI へ未配線。見直す条件: 止まったコンテナを再び `start` できるようにする、または supervisor が再接続のときに写像を選び直すようになったとき。
 
 ## `getent` の子プロセスにした理由と却下した案
 
@@ -53,7 +56,7 @@ PR #2367（#2243）の `start` は所有者名を `/etc/passwd` だけから得�
 ## 対象外（既知の差）
 
 - `subid:` の NSS で範囲を配る構成の**利用**（検出と拒否は決定 13。libsubid 経由で範囲を得る実装は無い）
-- `doctor` と状態ストアの `idMapping`（`RecordedIdModel`）の突き合わせ（状態ストアを読む設計が要る。追跡予定）
+- `doctor` と状態ストアの `idMapping`（`RecordedIdModel`）の突き合わせは行わない（決定 15）。イメージ展開の所有者（`image_ownership`。#2377・#2241 待ちで未配線）と現在の写像の食い違いは別の問題として残す
 - root の呼び出し元で uid を落として NSS を引く方式（決定 11。#2241 で rootful が承認されたときに再検討）
 - 同じ uid の別名の行（`newuidmap` の 2 段目の別名照合）は範囲として使わない（部分集合のため helper の拒否は起きない）
 - ambient capability つきの本番構成で `getent` に capability が渡らないことの実機での実証、LDAP / sssd の実環境での範囲写像の確認（いずれも実機・人間担当）
@@ -66,6 +69,6 @@ PR #2367（#2243）の `start` は所有者名を `/etc/passwd` だけから得�
 | `SUBID_OWNER_LOOKUP_UNAVAILABLE` | notice | passwd に行が無く、信頼できる `getent` も無い |
 | `SUBID_OWNER_LOOKUP_FAILED` | warning | NSS の参照が失敗・期限切れ（`start` は拒否する。終了コード 3） |
 | `SUBID_OWNER_UNDETERMINED` | warning | 名前を引けず、名前の行が自分のものか判定できない（決定 9。state `owner_undetermined`） |
-| `SUBID_NAME_SERVICE_UNSUPPORTED` | warning | `subid:` が `files` 以外（決定 13。check `nsswitch`・state `subid_name_service`） |
-| `NSSWITCH_UNUSABLE` | warning | `nsswitch.conf` が読めない・書式不正（決定 13。check `nsswitch`・state `unusable`） |
+| `SUBID_NAME_SERVICE_UNSUPPORTED` | warning | `subid:` の最初の語が `files` 以外（決定 13。check `nsswitch`・state `subid_name_service`） |
+| `NSSWITCH_UNUSABLE` | warning | `nsswitch.conf` が読めない・NUL などで判定できない（決定 13。check `nsswitch`・state `unusable`） |
 | `ID_MAP_HELPER_NOT_FOUND` / `ID_MAP_HELPER_UNTRUSTED` | warning | `newuidmap` / `newgidmap` のどちらかが無い・信頼できない。欠けた側ごとに 1 件、state は `newuidmap_not_found`・`newgidmap_untrusted` 等（#2545） |

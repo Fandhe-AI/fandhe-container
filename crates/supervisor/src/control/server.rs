@@ -8,7 +8,8 @@
 //!
 //! - accept の直後に `SO_PEERCRED` で接続元の uid を取り、実効 uid と違えば何も書かずに切断する
 //!   （多層防御。ソケットは 0600・0700 の `<id>/` の中にあり、別 uid は通常 connect 自体ができない）。
-//! - 要求（SignalRequest・StopRequest は 21 バイト、CancelRestartRequest〔#2440〕は 16 バイトの固定長）で、kind ごとの payload 長と
+//! - 要求（SignalRequest・StopRequest は 21 バイト、CancelRestartRequest〔#2440〕は 16 バイト、ExecHandoverRequest〔#2626〕は
+//!   20 バイトの固定長）で、kind ごとの payload 長と
 //!   一致しない・ヘッダの payload_len が上限（64）を超える場合は payload を読まずに拒否する。
 //! - 読み取りは絶対期限（[`ServeConfig::read_deadline`]）、返信待ちは送信期限 + 猶予、書き込みは
 //!   [`ServeConfig::write_timeout`] で打ち切る（REPAIR-5）。
@@ -20,7 +21,7 @@
 //! スレッドを止める必要が出たときの口である。
 
 use std::io::{self, Read, Write};
-use std::os::fd::AsFd as _;
+use std::os::fd::{AsFd as _, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,9 +34,9 @@ use fandhe_container_core::audit_log::ControlPeerRejection;
 use super::log_control_event;
 use super::observe::ControlObserver;
 use super::protocol::{
-    CANCEL_RESTART_PAYLOAD_LEN, CancelRestartRequestFrame, ControlReason, FrameHeader, HEADER_LEN,
-    RequestHeader, ResponseFrame, SIGNAL_REQUEST_PAYLOAD_LEN, SignalDeadline, SignalRequestFrame,
-    encode_hello,
+    CANCEL_RESTART_PAYLOAD_LEN, CancelRestartRequestFrame, ControlReason,
+    EXEC_HANDOVER_PAYLOAD_LEN, ExecHandoverRequestFrame, FrameHeader, HEADER_LEN, RequestHeader,
+    ResponseFrame, SIGNAL_REQUEST_PAYLOAD_LEN, SignalDeadline, SignalRequestFrame, encode_hello,
 };
 use super::target::{SignalSlot, wait_reply};
 
@@ -166,6 +167,9 @@ fn handle_request(
         Ok(RequestHeader::CancelRestart) => {
             return handle_cancel_restart(stream, slot, read_deadline);
         }
+        Ok(RequestHeader::ExecHandover) => {
+            return handle_exec_handover(stream, slot, read_deadline);
+        }
         Err(reason) => return respond(&mut stream, reason),
     };
     let mut payload = [0u8; SIGNAL_REQUEST_PAYLOAD_LEN];
@@ -209,6 +213,65 @@ fn handle_cancel_restart(
     };
     let reason = slot.cancel_pending_restart(deadline);
     respond(&mut stream, reason)
+}
+
+/// ExecHandoverRequest（kind 6）の payload を読んで、起動時 pidfd の複製を `SCM_RIGHTS` で返す（SUP-6・SEC-1・#2626）。
+///
+/// uid の照合は `serve_connection` が済ませている。スロットの状態判定は [`SignalSlot::handover_pidfd`]（受け箱は経由せず、
+/// シグナルも送らない）。成功は `Response(Ok)` と pidfd 1 本を 1 回の `sendmsg` で送り、拒否は fd なしの通常の応答。
+fn handle_exec_handover(
+    mut stream: UnixStream,
+    slot: &SignalSlot,
+    read_deadline: Instant,
+) -> ControlReason {
+    let mut payload = [0u8; EXEC_HANDOVER_PAYLOAD_LEN];
+    if read_exact_until(&mut stream, &mut payload, read_deadline).is_err() {
+        return respond(&mut stream, ControlReason::Malformed);
+    }
+    let request = match ExecHandoverRequestFrame::decode_payload(&payload) {
+        Ok(r) => r,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    let deadline = match absolute_deadline(request.deadline) {
+        Ok(d) => d,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    let pidfd = match slot.handover_pidfd(request.pid) {
+        Ok(fd) => fd,
+        Err(reason) => return respond(&mut stream, reason),
+    };
+    // 期限を過ぎていたら fd を渡さない（クライアントはもう Timeout を返している。REPAIR-5）。
+    if Instant::now() >= deadline {
+        return respond(&mut stream, ControlReason::Timeout);
+    }
+    respond_with_fd(&mut stream, pidfd.as_fd())
+}
+
+/// `Response(Ok)` に `fd` を 1 本添えて送る。送れなかったら（相手が閉じた・期限）`Internal` を返す
+/// （fd は添付されていない、または相手が受け取り済みで、こちらに残る資源は無い）。
+fn respond_with_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>) -> ControlReason {
+    let frame = ResponseFrame {
+        reason: ControlReason::Ok,
+    }
+    .encode();
+    let sent = match crate::sys::send_with_fd(stream.as_fd(), &frame, fd) {
+        Ok(n) => n,
+        Err(_) => {
+            log_control_event(
+                "control_request_rejected",
+                Some(ControlReason::Internal.name()),
+            );
+            return ControlReason::Internal;
+        }
+    };
+    // ストリームの短い書き込み: fd は最初のバイトに付いて届いているので、残りは通常の書き込みで送る。
+    if let Some(rest) = frame.get(sent..)
+        && !rest.is_empty()
+        && stream.write_all(rest).is_err()
+    {
+        return ControlReason::Internal;
+    }
+    ControlReason::Ok
 }
 
 /// 要求が載せた絶対期限（`CLOCK_MONOTONIC`）を、サーバ側の `Instant` に写す。

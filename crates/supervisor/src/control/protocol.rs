@@ -1,6 +1,6 @@
 //! 制御チャネルのワイヤー形式（固定長・big-endian。REPAIR-2・SUP-1・SUP-9・SEC-1・#2058・#2162・#2440）。
 //!
-//! CLI（クライアント。[`super::client`]）と supervisor（サーバ。`control::server`）が UDS 上で交わす 5 種類の
+//! CLI（クライアント。[`super::client`]）と supervisor（サーバ。`control::server`）が UDS 上で交わす 6 種類の
 //! frame を、壊れた値を表現できない型で組み立てる。生の `Vec<u8>` を手で組まず、encode は固定長の配列を返し、
 //! decode は `get`・`from_be_bytes`・配列パターンだけで読む（添字アクセスをしない。外部入力の経路）。
 //!
@@ -15,6 +15,12 @@
 //! | Response | サーバ → クライアント | 3 | reason `u8` | 9 |
 //! | StopRequest | クライアント → サーバ | 4 | SignalRequest と同じ（pid・signal・deadline_ns） | 21 |
 //! | CancelRestartRequest | クライアント → サーバ | 5 | deadline_ns `u64` | 16 |
+//! | ExecHandoverRequest | クライアント → サーバ | 6 | pid `u32`・deadline_ns `u64` | 20 |
+//!
+//! ExecHandoverRequest は CLI の `exec` が、稼働中コンテナの起動時 pidfd を受け取るための要求（SUP-6・SEC-1・#2626）。
+//! supervisor は、スロットが `Active` で記録 pid と要求の pid が一致するときだけ、`Response(Ok)` と同じ `sendmsg` に
+//! `SCM_RIGHTS` で pidfd の複製を 1 本添えて返す（`control::server`）。それ以外の応答（拒否）に fd は添えない。
+//! 受け取った fd の同一性は CLI が `identify_pid1_with_pidfd` で記録 pid との一致を確かめる（fd を信用しない）。
 //!
 //! StopRequest は「シグナルを送る」に加えて「これは利用者の明示的な stop である」という意図を supervisor に記録させる
 //! （SUP-9・#2162）。supervisor は意図を記録してからシグナルを送り、その後の終了を restart ポリシーの対象から外す。
@@ -37,7 +43,8 @@
 //! `Malformed` として拒否し、クライアントは `InvalidArgument` を返す（シグナルは送られない。fail-closed）。古い CLI と
 //! 新しい supervisor の組では kind 2 が従来どおり処理され、stop の意図は立たない。CLI と supervisor は同じ配布物から
 //! 一緒に入る前提で、版の不一致は上のとおり安全側に倒れる。kind 5（#2440）も同じ方針で、古い supervisor は
-//! `Malformed` として拒否し、クライアントは `NoSupervisor` 相当（従来の stop）に倒す。
+//! `Malformed` として拒否し、クライアントは `NoSupervisor` 相当（従来の stop）に倒す。kind 6（#2626）も同じ方針で、
+//! 古い supervisor は `Malformed` として拒否し、クライアントは `InvalidArgument` を返す（exec しない。fail-closed）。
 
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -60,6 +67,10 @@ pub const SIGNAL_REQUEST_LEN: usize = HEADER_LEN + SIGNAL_REQUEST_PAYLOAD_LEN;
 pub const CANCEL_RESTART_PAYLOAD_LEN: usize = 8;
 /// CancelRestartRequest の全長。
 pub const CANCEL_RESTART_REQUEST_LEN: usize = HEADER_LEN + CANCEL_RESTART_PAYLOAD_LEN;
+/// ExecHandoverRequest の payload 長（pid `u32` と deadline_ns `u64`）。
+pub const EXEC_HANDOVER_PAYLOAD_LEN: usize = 12;
+/// ExecHandoverRequest の全長。
+pub const EXEC_HANDOVER_REQUEST_LEN: usize = HEADER_LEN + EXEC_HANDOVER_PAYLOAD_LEN;
 /// Response の payload 長。
 pub const RESPONSE_PAYLOAD_LEN: usize = 1;
 /// Response の全長。
@@ -72,6 +83,7 @@ const KIND_SIGNAL_REQUEST: u8 = 2;
 const KIND_RESPONSE: u8 = 3;
 const KIND_STOP_REQUEST: u8 = 4;
 const KIND_CANCEL_RESTART_REQUEST: u8 = 5;
+const KIND_EXEC_HANDOVER_REQUEST: u8 = 6;
 
 /// 要求の種類。payload は共通で、supervisor が stop の意図を記録するかどうかだけが違う（SUP-9）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,7 +109,7 @@ impl RequestKind {
 #[repr(u8)]
 #[non_exhaustive]
 pub enum ControlReason {
-    /// シグナルを送った。
+    /// 要求を果たした（シグナルを送った・再起動を取り消した・exec 用の pidfd を添えた）。
     Ok = 0,
     /// 起動ハンドルを保持していない。
     NoHandle = 1,
@@ -308,6 +320,10 @@ impl FrameHeader {
             self.expect(KIND_CANCEL_RESTART_REQUEST, CANCEL_RESTART_PAYLOAD_LEN)?;
             return Ok(RequestHeader::CancelRestart);
         }
+        if self.kind == KIND_EXEC_HANDOVER_REQUEST {
+            self.expect(KIND_EXEC_HANDOVER_REQUEST, EXEC_HANDOVER_PAYLOAD_LEN)?;
+            return Ok(RequestHeader::ExecHandover);
+        }
         self.expect_request().map(RequestHeader::Signal)
     }
 
@@ -330,6 +346,8 @@ pub enum RequestHeader {
     Signal(RequestKind),
     /// CancelRestartRequest（payload 8 バイト。#2440）。
     CancelRestart,
+    /// ExecHandoverRequest（payload 12 バイト。#2626）。
+    ExecHandover,
 }
 
 /// Hello frame（payload なし）を encode する。
@@ -432,6 +450,40 @@ impl CancelRestartRequestFrame {
     }
 }
 
+/// ExecHandoverRequest frame（kind 6。SUP-6・SEC-1・#2626）。pid と期限の値域は型が保証する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecHandoverRequestFrame {
+    /// 対象の pid（スロットの起動ハンドルの pid と一致したときだけ pidfd を渡す）。
+    pub pid: NonZeroU32,
+    /// 応答を完了する期限（`CLOCK_MONOTONIC` の絶対時刻）。
+    pub deadline: SignalDeadline,
+}
+
+impl ExecHandoverRequestFrame {
+    /// 20 バイトに encode する。
+    pub fn encode(&self) -> [u8; EXEC_HANDOVER_REQUEST_LEN] {
+        let [h0, h1, h2, h3, h4, h5, h6, h7] =
+            FrameHeader::encode(KIND_EXEC_HANDOVER_REQUEST, EXEC_HANDOVER_PAYLOAD_LEN as u16);
+        let [p0, p1, p2, p3] = self.pid.get().to_be_bytes();
+        let [b0, b1, b2, b3, b4, b5, b6, b7] = self.deadline.as_nanos().to_be_bytes();
+        [
+            h0, h1, h2, h3, h4, h5, h6, h7, p0, p1, p2, p3, b0, b1, b2, b3, b4, b5, b6, b7,
+        ]
+    }
+
+    /// 検証済みヘッダ（[`RequestHeader::ExecHandover`]）の後ろの payload 12 バイトを読む。pid 0・deadline 0 は `Malformed`。
+    pub fn decode_payload(
+        payload: &[u8; EXEC_HANDOVER_PAYLOAD_LEN],
+    ) -> Result<Self, ControlReason> {
+        let [p0, p1, p2, p3, b0, b1, b2, b3, b4, b5, b6, b7] = *payload;
+        let pid = NonZeroU32::new(u32::from_be_bytes([p0, p1, p2, p3]))
+            .ok_or(ControlReason::Malformed)?;
+        let deadline =
+            SignalDeadline::from_nanos(u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]))?;
+        Ok(Self { pid, deadline })
+    }
+}
+
 /// Response frame。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseFrame {
@@ -520,10 +572,72 @@ mod tests {
         );
     }
 
-    /// SUP-9: 要求として受けるのは kind 2・4 だけ。1・3・5 以上は `Malformed`（kind 5 は `expect_any_request` だけが受ける）。
+    /// SUP-6・SEC-1・REPAIR-2・#2626: ExecHandoverRequest は kind 6・payload 12 バイトで、具体バイトで往復する。
+    #[test]
+    fn sup6_exec_handover_request_roundtrip_concrete_bytes() {
+        let frame = ExecHandoverRequestFrame {
+            pid: NonZeroU32::new(4242).unwrap(),
+            deadline: SignalDeadline::from_nanos(1_500_000_000).unwrap(),
+        };
+        let bytes = frame.encode();
+        assert_eq!(
+            bytes,
+            [
+                b'F', b'C', b'S', b'C', 1, 6, 0, 12, // ヘッダ
+                0, 0, 0x10, 0x92, // pid 4242
+                0, 0, 0, 0, 0x59, 0x68, 0x2f, 0x00, // deadline 1_500_000_000ns
+            ]
+        );
+        let (head, payload) = bytes.split_first_chunk::<HEADER_LEN>().unwrap();
+        assert_eq!(
+            FrameHeader::decode(head).unwrap().expect_any_request(),
+            Ok(RequestHeader::ExecHandover)
+        );
+        let payload: [u8; EXEC_HANDOVER_PAYLOAD_LEN] = payload.try_into().unwrap();
+        assert_eq!(
+            ExecHandoverRequestFrame::decode_payload(&payload).unwrap(),
+            frame
+        );
+        // pid 0・deadline 0 は表現できない。
+        let mut zero_pid = payload;
+        zero_pid[..4].copy_from_slice(&[0; 4]);
+        assert_eq!(
+            ExecHandoverRequestFrame::decode_payload(&zero_pid),
+            Err(ControlReason::Malformed)
+        );
+        let mut zero_deadline = payload;
+        zero_deadline[4..].copy_from_slice(&[0; 8]);
+        assert_eq!(
+            ExecHandoverRequestFrame::decode_payload(&zero_deadline),
+            Err(ControlReason::Malformed)
+        );
+    }
+
+    /// SUP-6・#2626: kind 6 は payload 12 だけを受ける。`expect_request`（kind 2・4 用）は kind 6 を拒否する。
+    #[test]
+    fn sup6_exec_handover_header_checks_payload_len() {
+        let h = |kind: u8, len: u8| {
+            FrameHeader::decode(&[b'F', b'C', b'S', b'C', 1, kind, 0, len]).unwrap()
+        };
+        assert_eq!(
+            h(6, 12).expect_any_request(),
+            Ok(RequestHeader::ExecHandover)
+        );
+        for len in [0u8, 8, 11, 13, 21] {
+            assert_eq!(
+                h(6, len).expect_any_request(),
+                Err(ControlReason::Malformed),
+                "len {len}"
+            );
+        }
+        assert_eq!(h(6, 12).expect_request(), Err(ControlReason::Malformed));
+        assert_eq!(h(7, 12).expect_any_request(), Err(ControlReason::Malformed));
+    }
+
+    /// SUP-9: 要求として受けるのは kind 2・4 だけ。1・3・5 以上は `Malformed`（kind 5・6 は `expect_any_request` だけが受ける）。
     #[test]
     fn sup9_expect_request_rejects_other_kinds() {
-        for kind in [0u8, 1, 3, 5, 255] {
+        for kind in [0u8, 1, 3, 5, 6, 255] {
             let head = [b'F', b'C', b'S', b'C', 1, kind, 0, 13];
             assert_eq!(
                 FrameHeader::decode(&head).unwrap().expect_request(),

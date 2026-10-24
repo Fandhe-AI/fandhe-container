@@ -12,11 +12,20 @@
 //!
 //! | モジュール | 役割 |
 //! | ---------- | ---- |
-//! | `protocol` | 固定長 frame（Hello・SignalRequest・StopRequest・CancelRestartRequest・Response）と理由コード。全 OS |
-//! | `target` | 起動ハンドルの包み（`ControlledProcess`）と共有状態（`SignalSlot`）。全 OS |
+//! | `protocol` | 固定長 frame（Hello・SignalRequest・StopRequest・CancelRestartRequest・ExecHandoverRequest・Response）と理由コード。全 OS |
+//! | `target` | 起動ハンドルの包み（`ControlledProcess`）と共有状態（`SignalSlot`。exec 用に起動時 pidfd の複製も保持する）。全 OS |
 //! | `listener` | 置き場所の検証・bind・削除（Linux） |
 //! | `server` | accept ループ・接続元の検証・期限（Linux） |
-//! | `client` | CLI が使う入口 `ControlSignaler`（core の `ProcessSignaler` を実装）と `ControlRestartCanceller`（非 Linux は `Unimplemented`） |
+//! | `client` | CLI が使う入口 `ControlSignaler`（core の `ProcessSignaler` を実装）と `ControlRestartCanceller`（非 Linux は `Unimplemented`）、Linux のみ `ControlExecHandover`（CLI の `exec` 用に起動時 pidfd の複製を `SCM_RIGHTS` で受け取る。#2626） |
+//!
+//! # exec 用 pidfd の受け渡し（SUP-6・SEC-1・#2626）
+//!
+//! CLI の `exec` は `run_command_with_pidfd` に起動時の pidfd を要する（記録 pid からの `pidfd_open` は pid 再利用に弱く、
+//! 本番では使わない）。pidfd を持つのは supervisor の監視スレッドだけなので、ExecHandoverRequest（kind 6）で複製を
+//! `SCM_RIGHTS` の fd 1 本として返す。`Active` で記録 pid が一致するときだけ渡し（拒否には fd を添えない）、複製は
+//! `Exited`・`Empty` へ遷移したら落とす。受け取った CLI は fd を信用せず、`identify_pid1_with_pidfd` が記録 pid との
+//! 一致を確かめる。信頼境界は他の要求と同じ（同じ uid・コンテナごとの 0600 のソケット・`SO_PEERCRED` の照合）。
+//! 判断記録は `docs/design/exec-pidfd-handover.md`。
 //!
 //! # 寿命
 //!
@@ -54,6 +63,8 @@ pub mod observe;
 #[cfg(target_os = "linux")]
 pub mod server;
 
+#[cfg(target_os = "linux")]
+pub use client::ControlExecHandover;
 pub use client::{CancelOutcome, ControlRestartCanceller, ControlSignaler};
 
 /// 状態ルートを公開しないストア用の fail-closed の signaler。常に `Unimplemented` で失敗する（REPAIR-3）。
@@ -140,6 +151,54 @@ pub fn production_restart_canceller(
     match store.host_state_root() {
         Some(root) => std::sync::Arc::new(ControlRestartCanceller::new(root.to_path_buf())),
         None => std::sync::Arc::new(UnavailableRestartCanceller),
+    }
+}
+
+/// 稼働中コンテナの起動時 pidfd の複製を取得する注入点（CLI の `exec` 用。SUP-6・SEC-1・CLI-1・#2626）。Linux のみ。
+///
+/// 本番は [`ControlExecHandover`]（supervisor の制御チャネルの ExecHandoverRequest）、CLI の試験は差し替える。
+/// 取得した fd を信用しない: 呼び出し側が `exec::identify_pid1_with_pidfd`（`run_command_with_pidfd`）で記録 pid との一致を
+/// 確かめる。`state.json` の pid からの `pidfd_open` への縮退は持たない（pid 再利用。SEC-1）。
+#[cfg(target_os = "linux")]
+pub trait ExecPidfdSource: Send + Sync {
+    /// `deadline` までに、`pid`（記録上の pid1）の起動時 pidfd の複製を受け取る。supervisor に届かない・保持していない・
+    /// pid 不一致・古い版の supervisor などは構造化エラー（fd は渡らない）。
+    fn obtain(
+        &self,
+        id: &fandhe_container_core::traits::ContainerId,
+        pid: std::num::NonZeroU32,
+        deadline: std::time::Instant,
+    ) -> Result<std::os::fd::OwnedFd, fandhe_container_core::traits::TraitError>;
+}
+
+/// 状態ルートを公開しないストア用の fail-closed の取得元。常に `Unimplemented` で失敗する（REPAIR-3）。
+#[cfg(target_os = "linux")]
+pub struct UnavailableExecPidfdSource;
+
+#[cfg(target_os = "linux")]
+impl ExecPidfdSource for UnavailableExecPidfdSource {
+    fn obtain(
+        &self,
+        _id: &fandhe_container_core::traits::ContainerId,
+        _pid: std::num::NonZeroU32,
+        _deadline: std::time::Instant,
+    ) -> Result<std::os::fd::OwnedFd, fandhe_container_core::traits::TraitError> {
+        Err(fandhe_container_core::traits::TraitError::new(
+            fandhe_container_core::traits::ErrorCode::Unimplemented,
+            "exec pidfd source is not available yet",
+        ))
+    }
+}
+
+/// 本番の exec 用 pidfd 取得元。[`production_stop_signaler`] と同じ到達先の規則で、`host_state_root()` の無いストアには
+/// fail-closed の実装を返す（縮退しない。SEC-1・CORE-1）。
+#[cfg(target_os = "linux")]
+pub fn production_exec_pidfd_source(
+    store: &dyn fandhe_container_core::traits::StateStore,
+) -> std::sync::Arc<dyn ExecPidfdSource> {
+    match store.host_state_root() {
+        Some(root) => std::sync::Arc::new(ControlExecHandover::new(root.to_path_buf())),
+        None => std::sync::Arc::new(UnavailableExecPidfdSource),
     }
 }
 

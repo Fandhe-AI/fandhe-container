@@ -172,12 +172,16 @@ mod linux {
         escape_probe_mount, probe_denied_syscalls_for_test, probe_escape_syscall,
         probe_kcmp_self_for_test,
     };
+    use fandhe_container_core::injected_files::{
+        InjectedContent, InjectedFileMode, InjectedFileSet, InjectedFileSpec,
+    };
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
-        ProcessExit, ProcessLauncher, ProductionLauncher, StartTimeouts, SubordinateIdSource,
-        create, start,
+        LaunchIpcMode, LaunchOptions, ProcessExit, ProcessLauncher, ProductionLauncher,
+        StartTimeouts, SubordinateIdSource, create, start,
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+    use fandhe_container_core::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
     use fandhe_container_core::traits::{
         ContainerId, ContainerState, CreateRequest, ErrorCode, GetStateRequest, StartRequest,
         StateStore, TraitError,
@@ -198,6 +202,12 @@ mod linux {
     /// シナリオ D の bind 先のコンテナ内パスと、書くファイル名。
     const BIND_DEST: &str = "/data";
     const BIND_FILE: &str = "from-container";
+    /// シナリオ S（起動オプション。SUP-12・CORE-5・SEC-1・#2625）の注入ファイルのコンテナ内パス・内容（ダミー値）・モード。
+    const LO_SECRET_PATH: &str = "/secrets/token";
+    const LO_SECRET_CONTENT: &str = "dummy-secret-for-launch-options-test";
+    const LO_SECRET_MODE: u32 = 0o440;
+    /// シナリオ S で指定する tmpfs のコンテナ内パス。
+    const LO_TMPFS_DEST: &str = "/run";
     /// 1 行の長さの上限（無制限確保を避ける。REPAIR-5 と同趣旨）。
     const LINE_MAX: u64 = 4096;
     /// 受け取る行数の上限。
@@ -416,6 +426,41 @@ mod linux {
                 },
             );
             emit(format!("BIND_OPTS {opts}"));
+        }
+        // シナリオ S（起動オプション。#2625）: IPC namespace の識別子・指定 tmpfs の種別・`/dev/shm` の有無・注入ファイル。
+        if std::env::args().any(|a| a == "--with-launch-options") {
+            let ipc = std::fs::read_link("/proc/self/ns/ipc").map_or_else(
+                |e| format!("error:{:?}", e.kind()),
+                |p| p.display().to_string(),
+            );
+            emit(format!("LO_IPC {ipc}"));
+            let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+            // mountinfo の 5 番目がマウント先、`-` の次が fs 種別。
+            let fstype_of = |dest: &str| -> String {
+                info.lines()
+                    .filter_map(|l| {
+                        let f: Vec<&str> = l.split_whitespace().collect();
+                        let dash = f.iter().position(|x| *x == "-")?;
+                        (f.get(4).copied() == Some(dest))
+                            .then(|| f.get(dash + 1).copied().unwrap_or("").to_string())
+                    })
+                    .next_back()
+                    .unwrap_or_else(|| "not-mounted".to_string())
+            };
+            emit(format!(
+                "LO_TMPFS {LO_TMPFS_DEST} {}",
+                fstype_of(LO_TMPFS_DEST)
+            ));
+            emit(format!("LO_SHM {}", fstype_of("/dev/shm")));
+            emit(format!("LO_SECRET_DIR {}", fstype_of("/secrets")));
+            let content = std::fs::read_to_string(LO_SECRET_PATH)
+                .unwrap_or_else(|e| format!("error:{:?}", e.kind()));
+            emit(format!("LO_SECRET {content}"));
+            let mode = std::fs::metadata(LO_SECRET_PATH).map_or_else(
+                |e| format!("error:{:?}", e.kind()),
+                |m| format!("{:o}", m.permissions().mode() & 0o777),
+            );
+            emit(format!("LO_SECRET_MODE {mode}"));
         }
         emit(PROBE_READY.to_string());
         // シナリオ P（名前だけの args[0]。#2314）: READY の後に指定の終了コードで終わる。
@@ -734,6 +779,7 @@ mod linux {
         scenario_f_bind_over_protected_path_refused(&env, tag);
         scenario_g_devtmpfs_bind_refused(&env, tag);
         scenario_h_state_root_moved_after_start(&env, tag);
+        scenario_s_launch_options(&env, tag);
         if subordinate_requested() {
             scenario_i_subordinate_ids(&env, tag);
         } else {
@@ -1026,6 +1072,110 @@ mod linux {
             assert_eq!(on_host, BIND_CONTENT);
             println!(
                 "production_launcher: scenario=bind-mount pid={pid} dest={BIND_DEST} visible on host, nosuid+nodev"
+            );
+        }));
+        let (_record, process) = started.into_parts();
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "production_launcher: terminate after failed verification also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after terminate"
+        );
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ S(SUP-12・CORE-5・SEC-1・#2625): `ProductionLauncher::builder().launch_options(..)` で渡した
+    /// `--ipc=host` + `--tmpfs /run` + 注入ファイルが、`create` → `start` の実プロセスへ実効状態として届くことを
+    /// 具体値で照合する(IPC namespace の識別子がホストと一致・`/run` が tmpfs・`/dev/shm` を載せない・注入ファイルの
+    /// 内容とモード・注入ディレクトリが専用 tmpfs)。supervisor の `ContainerOptions::launch_options` から同じ
+    /// builder 呼び出しへ至る変換は supervisor 側の単体試験が担う。
+    fn scenario_s_launch_options(env: &Env, tag: u32) {
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs
+            .push(TmpfsMountSpec::new(LO_TMPFS_DEST, None).expect("tmpfs spec"))
+            .expect("push tmpfs");
+        let mut inject = InjectedFileSet::new();
+        inject
+            .push(
+                InjectedFileSpec::new(
+                    LO_SECRET_PATH,
+                    InjectedContent::from_bytes(LO_SECRET_CONTENT.as_bytes().to_vec())
+                        .expect("content"),
+                    InjectedFileMode::new(LO_SECRET_MODE).expect("mode"),
+                )
+                .expect("inject spec"),
+            )
+            .expect("push inject");
+        let options =
+            LaunchOptions::new(tmpfs, inject, LaunchIpcMode::Host).expect("launch options");
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+            ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                .launch_options(options)
+                .build()
+                .expect("build launcher with launch options"),
+        );
+        let host_ipc = std::fs::read_link("/proc/self/ns/ipc")
+            .expect("host ipc ns")
+            .display()
+            .to_string();
+
+        let bundle = Bundle::new("s");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--with-launch-options"], json!([]));
+        let id = ContainerId::new(format!("pls{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            let output = started.process().take_output().expect("container output");
+            let stdout = output.stdout.expect("container stdout");
+            reader_slot = Some(spawn_reader(stdout));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            // ホストから見た PID 1 の IPC namespace も、コンテナ内の見え方も、起動側と同じ。
+            let from_host = std::fs::read_link(format!("/proc/{pid}/ns/ipc"))
+                .expect("container ipc ns from host")
+                .display()
+                .to_string();
+            assert_eq!(from_host, host_ipc);
+            assert_eq!(value_of(&lines, "LO_IPC"), host_ipc);
+            assert_eq!(
+                value_of(&lines, "LO_TMPFS"),
+                format!("{LO_TMPFS_DEST} tmpfs")
+            );
+            // `--ipc=host` では専用の `/dev/shm` を載せない。
+            assert_eq!(value_of(&lines, "LO_SHM"), "not-mounted");
+            assert_eq!(value_of(&lines, "LO_SECRET_DIR"), "tmpfs");
+            assert_eq!(value_of(&lines, "LO_SECRET"), LO_SECRET_CONTENT);
+            assert_eq!(value_of(&lines, "LO_SECRET_MODE"), "440");
+            println!(
+                "production_launcher: launch options reached the container (scenario=S ipc=host tmpfs={LO_TMPFS_DEST} secret mode=440)"
             );
         }));
         let (_record, process) = started.into_parts();

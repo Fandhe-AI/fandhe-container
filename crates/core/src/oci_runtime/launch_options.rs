@@ -26,10 +26,11 @@
 //! # 未実装・残余(REPAIR-3)
 //!
 //! - CLI / stack から supervisor への `ContainerOptions` の受け渡しは未結線(`run_main` は既定のまま)。
-//! - 範囲写像の経路では ID 写像の holder が中間プロセスのメモリ(注入内容を含む)を継承する。露出の解消は #2628。
+//! - 範囲写像の経路では ID 写像の holder が中間プロセスのメモリ(注入内容を含む)を継承し dumpable になる。
+//!   露出の解消(#2628)までは、launcher が範囲写像(`RootlessSubordinateIds`)と非空の注入の併用を起動前に拒否する。
 
 use crate::dev_mounts::ImplicitDevMounts;
-use crate::injected_files::InjectedFileSet;
+use crate::injected_files::{InjectedFileSet, overlaps};
 use crate::tmpfs::{DEV_SHM_PATH, TmpfsMountSet};
 use crate::traits::types::{ErrorCode, TraitError};
 
@@ -79,6 +80,18 @@ impl LaunchOptions {
             _ => {}
         }
         inject.check_against_tmpfs(&tmpfs)?;
+        // 注入は親ディレクトリに専用 tmpfs を載せる。Host IPC で `/dev/shm` を含む位置へ載せると、
+        // ホストの共有を private な tmpfs で隠し、Landlock の WithoutShm も検査しない(SEC-1・CORE-5)。
+        if ipc == LaunchIpcMode::Host
+            && inject
+                .files()
+                .iter()
+                .any(|f| overlaps(f.parent(), DEV_SHM_PATH))
+        {
+            return Err(invalid(
+                "an injected file under /dev/shm cannot be combined with --ipc=host",
+            ));
+        }
         Ok(Self { tmpfs, inject, ipc })
     }
 
@@ -194,6 +207,33 @@ mod tests {
             set_of(&["/run"]),
             secret("/run/secrets/db", b"x"),
             LaunchIpcMode::Host,
+        )
+        .expect_err("rejected");
+        assert_eq!(
+            err.message(),
+            "injected file directory overlaps a tmpfs mount"
+        );
+    }
+
+    /// SEC-1・CORE-5: Host IPC と /dev/shm 配下(親が /dev/shm)の注入は拒否する(ホストの共有を隠すため)。
+    #[test]
+    fn sec1_launch_options_rejects_host_ipc_with_inject_under_dev_shm() {
+        let err = LaunchOptions::new(
+            set_of(&["/run"]),
+            secret("/dev/shm/token", b"x"),
+            LaunchIpcMode::Host,
+        )
+        .expect_err("rejected");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "an injected file under /dev/shm cannot be combined with --ipc=host"
+        );
+        // Private では /dev/shm の tmpfs と重なるため別の文言で拒否される。
+        let err = LaunchOptions::new(
+            set_of(&["/dev/shm"]),
+            secret("/dev/shm/a/token", b"x"),
+            LaunchIpcMode::Private,
         )
         .expect_err("rejected");
         assert_eq!(

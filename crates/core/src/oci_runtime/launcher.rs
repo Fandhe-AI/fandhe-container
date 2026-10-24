@@ -388,6 +388,9 @@ impl ProductionLauncherBuilder {
                 self.cgroup_join_source,
             );
             inner.applied_resources = self.applied_resources;
+            if let Some(options) = &self.launch_options {
+                refuse_inject_with_subordinate(privilege, options)?;
+            }
             inner.launch_options = self.launch_options;
             inner.seccomp_delivery = self.seccomp_delivery;
             inner.audit_policy = self.audit_policy;
@@ -403,6 +406,24 @@ impl ProductionLauncherBuilder {
             ))
         }
     }
+}
+
+/// 範囲写像(`RootlessSubordinateIds`)と非空の機密ファイル注入の併用を拒否する(fail-closed)。
+///
+/// 範囲写像の ID 写像 holder は中間プロセスのメモリ(注入内容を含む)を fork で継承し、`run_userns_holder` で
+/// dumpable になるため、Yama=0 では同一 UID の別プロセスから secret を読める。露出の解消は #2628
+/// (SEC-1・SEC-5・CORE-6・SUP-12)。`build` と launch の両方で呼ぶ(builder の呼び出し順で迂回させない)。
+fn refuse_inject_with_subordinate(
+    privilege: IsolationPrivilege,
+    options: &LaunchOptions,
+) -> Result<(), TraitError> {
+    if privilege == IsolationPrivilege::RootlessSubordinateIds && !options.inject().is_empty() {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "injected files cannot be combined with the subordinate id privilege model",
+        ));
+    }
+    Ok(())
 }
 
 /// `RootlessSubordinateIds` の写像の入力元(`/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap` のパス。
@@ -1132,6 +1153,8 @@ impl Inner {
                 &default_options
             }
         };
+        // 範囲写像の holder は fork で機密を含むメモリを継承し dumpable になるため、併用は #2628 まで拒否する。
+        refuse_inject_with_subordinate(self.privilege, options)?;
         // Landlock は必須。ABI 不足・生成失敗は起動を拒否し、Landlock 無しで続けない(CORE-5・#1314)。
         let ruleset = self
             .ops
@@ -3712,6 +3735,74 @@ mod tests {
                 .expect_err("rejected");
             assert_eq!(err.code(), ErrorCode::InvalidArgument, "{dest}");
         }
+    }
+
+    /// SEC-1・SEC-5・CORE-6(#2628 まで): 範囲写像と非空の注入の併用は launch で fork 前に拒否する。
+    #[test]
+    fn sec1_subordinate_privilege_with_inject_is_refused_before_fork() {
+        let spec = spec_for("opts-sub-inject", serde_json::json!({}));
+        let ev = events();
+        let src = source_in(
+            "inject-refused",
+            "tester:100000:65536\n",
+            "tester:200000:65536\n",
+            helper_stand_in(),
+        );
+        let ids = resolve_privilege(
+            IsolationPrivilege::RootlessSubordinateIds,
+            Some(src),
+            1000,
+            1001,
+        )
+        .expect("resolved")
+        .expect("some");
+        let mut l = launcher_with(
+            FakeOps::new(&ev),
+            IsolationPrivilege::RootlessSubordinateIds,
+            Some(ids),
+            None,
+        );
+        l.inner.launch_options = Some(options_with(
+            &["/run"],
+            false,
+            &[("/etc/secret-token", b"v")],
+            LaunchIpcMode::Host,
+        ));
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "injected files cannot be combined with the subordinate id privilege model"
+        );
+        assert!(
+            !ev.lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("spawn") || e.starts_with("landlock")),
+            "{:?}",
+            ev.lock().unwrap()
+        );
+    }
+
+    /// SEC-1: 判定関数は範囲写像 + 注入だけを拒否し、注入なしの範囲写像・単一 ID + 注入は通す。
+    #[test]
+    fn sec1_refuse_inject_with_subordinate_only_rejects_the_combination() {
+        let with = options_with(&[], true, &[("/etc/t", b"v")], LaunchIpcMode::Private);
+        let without = options_with(&[], true, &[], LaunchIpcMode::Private);
+        assert!(
+            refuse_inject_with_subordinate(IsolationPrivilege::RootlessSubordinateIds, &with)
+                .is_err()
+        );
+        assert!(
+            refuse_inject_with_subordinate(IsolationPrivilege::RootlessSubordinateIds, &without)
+                .is_ok()
+        );
+        assert!(
+            refuse_inject_with_subordinate(IsolationPrivilege::RootlessSingleId, &with).is_ok()
+        );
     }
 
     /// SEC-4(#1915): `rejection_audit_sink` は構築時の sink を返す。

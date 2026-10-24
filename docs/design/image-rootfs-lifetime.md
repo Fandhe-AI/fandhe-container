@@ -51,7 +51,7 @@ spec では、OCI-6 の delete が消すのは状態ファイルと cgroup、OCI
 
 1. 公開済みの core 製の木を探す: `find <bundle の置き場> -xdev -name .fandhe-container-rootfs-owner -type f`（印は木の直下にある）
 2. 印の 1 行目（トークン）を、使っている状態ルートごとに照合する: `grep -l '"token":"<トークン>"' <状態ルート>/*/state.json`（レイアウトは `<id>/state.json` の `imageRootfs.token`）。印の 3 行目は状態ルートの識別子で、`printf '%s' <状態ルートの絶対パス> | sha256sum | cut -c1-32` で求められる。どの状態ルートの `state.json` にも参照が無く、同じ bundle を指すレコードも無ければ孤児の候補
-3. 展開途中の木（`<bundle>/.fandhe-unpack-*`）は、`flock -n <dir> true` が成功すれば持ち主がいない
+3. 展開途中の木（`<bundle>/.fandhe-unpack-*`）は、`flock -n <dir> true` が成功しても、その場でロックが外れるため使用中でないことの保証にならない（確認の後に create が同じ木のロックを取って展開を始めうる）。手順の前提として、対象 bundle に関わる create・delete のプロセスを止めておく。そのうえで削除までロックを保持する: `flock -n <dir> rm -rf --one-file-system <dir>`（ロックを取れなければ何も消さない。取れた後に `<dir>` が確認した実体〔`stat -c '%d:%i'`〕のままかを手順 4 の前に照合する）
 4. 削除: rootful は `rm -rf --one-file-system <dir>`。subuid 所有の木は `podman unshare` 相当の userns の中で消す。`image_rootfs_remove` の失敗が subordinate の木だったときは、delete が状態の削除まで済ませており delete し直しは冒頭の状態取得で `NotFound` になるため使えない。権限（`SubordinateIds`）つきの次の create（`ContainerImage::with_rootfs_privilege`）による孤児の回収に任せることもできる
 
 delete の rootfs 削除の失敗は `DeleteResponse` の `image_rootfs`（`CleanupOutcome`。#2633）に載り、CLI が警告 `image rootfs removal failed` として表に出す。plugin-cri では `container_delete_cleanup`（`target: image_rootfs`）が手動回復のきっかけになる。

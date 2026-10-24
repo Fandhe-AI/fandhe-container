@@ -80,7 +80,7 @@ use super::error::{LifecycleOp, OciRuntimeError};
 use super::image_refs::{ContainerImage, ImageRefRegistration};
 use super::image_rootfs::{
     CreatedRootfs, ImageRootfsPrivilege, ImageRootfsUnpacker, prepare_rootfs_target_with,
-    reap_published_orphan, record_staging_reclamation,
+    reap_published_orphan, record_staging_reclamation, state_root_scope,
 };
 use super::launch::BundleLock;
 use super::mount_destination::audit_mount_config_error;
@@ -459,7 +459,8 @@ fn unpack_rootfs(
         return Err(e);
     }
     // 公開前に所有トークンの印を書く（delete が作成世代を照合する。OCI-7・#2378）。失敗は公開前なので消す。
-    if let Err(e) = created.seal() {
+    // 印には状態ルートの識別子も載せる（孤児の回収が別の状態ルートの木を消さないため。OCI-5・#2635）。
+    if let Err(e) = created.seal(state_root_scope(store).as_deref()) {
         remove_created_rootfs(recorder, created, privilege);
         return Err(e);
     }

@@ -83,8 +83,11 @@ CLI の表面・3 OS の parity スクリプトへの波及を避けるため。
 入力が bundle と `root.path` で、参照テーブルは bundle を持たないため、参照の回収と同じ契機では呼べない。同じ bundle への次の create
 （`prepare_rootfs_target_with`）では既に呼ばれている。状態ルート全体の掃引は状態レコード・bundle の列挙が要るため本 issue の範囲外とする。
 公開済みで状態の無い rootfs（孤児）も同じ bundle への次の create が回収する（#2540）。孤児は状態レコードを持たないので
-`StateStore::list` でも参照テーブルでも bundle を列挙できず、状態ルート全体の掃引は行わない。契機の決定は
-[image-rootfs-lifetime.md](image-rootfs-lifetime.md) の決定 E を参照。
+`StateStore::list` でも参照テーブルでも bundle を列挙できず、状態ルート全体の掃引は行わない（決定 E は #2635 で確定）。
+bundle の意図の記録（journal）を入れても、それを読んで掃引する契機が無い（候補は起動時の全件照合と新しいトップレベルコマンドだけで、
+どちらも決定 2 で不採用）。展開途中の木（`.fandhe-unpack-*`）の契機も同じで、同じ bundle への次の create と、bundle を知る呼び出し元が呼ぶ
+`reap_stale_unpacks` / `reap_stale_unpacks_with` に限る。根拠と運用者向けの手動回収の手順は
+[image-rootfs-lifetime.md](image-rootfs-lifetime.md) の決定 E と「失敗後の手動回復」を参照。
 
 ## 制約・未実装（実装済みを装わない。REPAIR-3）
 

@@ -446,6 +446,15 @@ jobs:
         run: cargo build --workspace
       - name: cargo clippy（既定 feature）
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # 試験用 feature 無効の `-p` 単独 lib/bin ビルドの clippy（#2640・REPAIR-7・REPAIR-12。経緯は #2550）。
+      # ワークスペース単位の clippy は feature 統一で試験用 feature が有効になり、「無効の単独ビルドでだけ出る
+      # dead_code・cfg 漏れ」を見逃す。全メンバーを `cargo metadata` で列挙して個別に見る。型検査段の結果は
+      # OS に依らず、macOS・Windows の cfg 分岐は cross-target-check が PR で `--target` 付きで検査するため、
+      # ubuntu だけで実行する（直前の clippy で外部依存の成果物が温まっている）。既存ジョブのステップ（check-run 件数は不変）
+      - name: 試験用 feature 無効の -p 単独 lib/bin の clippy（#2640・REPAIR-12。ubuntu のみ）
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: make check-standalone-clippy
       - name: cargo test（既定 feature）
         run: cargo test --workspace
       # macOS・Windows の `--all-features` の clippy / test（2026-10-10 の再構成で rust-ci〔reusable
@@ -842,6 +851,13 @@ jobs:
         if: env.HANG_PROBE != 'true'
         timeout-minutes: 5
         run: make check-launch-target-selftest
+
+      # 単独 clippy の判定スクリプトの自己テスト（#2640・REPAIR-12）。スタブの cargo と jq だけを使う。
+      # 既存ジョブのステップ（check-run 件数は不変）
+      - name: 単独 clippy 判定の自己テスト（#2640・REPAIR-12。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make check-standalone-clippy-selftest
 
       # 試験の繰り返し実行スクリプトの自己テスト（REPAIR-12・#2538）。スタブの cargo だけを使う。
       # 既存ジョブのステップ（check-run 件数は不変）
@@ -1768,6 +1784,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --target aarch64-apple-darwin -- -D warnings
       - name: cargo clippy（aarch64-apple-darwin・既定 feature）
         run: cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+      - name: 試験用 feature 無効の -p 単独 clippy（aarch64-apple-darwin・#2640）
+        env:
+          CLIPPY_TARGET: aarch64-apple-darwin
+        run: make check-standalone-clippy
       - name: cargo doc（aarch64-apple-darwin・既定 feature・-D warnings）
         env:
           RUSTDOCFLAGS: -D warnings
@@ -1778,6 +1798,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings
       - name: cargo clippy（x86_64-pc-windows-msvc・既定 feature）
         run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - name: 試験用 feature 無効の -p 単独 clippy（x86_64-pc-windows-msvc・#2640）
+        env:
+          CLIPPY_TARGET: x86_64-pc-windows-msvc
+        run: make check-standalone-clippy
       - name: cargo doc（x86_64-pc-windows-msvc・既定 feature・-D warnings）
         env:
           RUSTDOCFLAGS: -D warnings

@@ -202,7 +202,7 @@ impl RootfsDir {
     /// 前者（`rootfs changed after validation`）に限り、`open_dir_beneath` が返した違反の理由
     /// （`path_symlink_or_not_directory`・`path_missing`）を [`RootfsPinError::violation`] で運ぶ
     /// （SEC-4・SEC-1・SUP-6・#1702）。exec の経路（supervisor の `load_exec_bundle`）はこれを監査ログの層
-    /// `mount` へ記録する。start の経路はまだ記録しない（launcher の拒否の記録先 `ProcessLauncher::rejection_audit_sink` はあるが、違反の理由をまだ流していない。supervisor の relay は理由つきの Mount を運べない点も含め未実装・REPAIR-3。担当 #2623）。
+    /// `mount` へ記録する。start の経路は `build_spec` が launcher の拒否の記録先（`ProcessLauncher::rejection_audit_sink`）へ記録する（supervisor の relay は閉じた表の理由として運ぶ。#2623）。
     #[cfg(target_os = "linux")]
     pub(super) fn pin(bundle: &Path, rootfs: &Path) -> Result<Self, RootfsPinError> {
         use crate::exec::ViolationReason;

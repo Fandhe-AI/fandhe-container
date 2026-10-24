@@ -68,3 +68,42 @@ fn sec4_2072_other_reason_is_not_recorded() {
     assert!(r.error.violation.is_none());
     assert!(sink.0.lock().unwrap().is_empty());
 }
+
+/// SEC-4・#2624: launch の PID 1 が exec 前に返す entrypoint 系の違反 8 理由は、状態 pipe の 2 行目を通り、
+/// 親側の層 `entrypoint` に理由コードだけ（パスなし）で 1 拒否 1 件ずつ記録される。
+#[test]
+fn sec4_2624_every_entrypoint_reason_reaches_parent_audit() {
+    use fandhe_container_core::exec::relay_entrypoint_violation_for_test;
+    use fandhe_container_core::traits::ContainerId;
+
+    let id = ContainerId::new("c2624").unwrap();
+    assert_eq!(ViolationReason::ENTRYPOINT_REASONS.len(), 8);
+    for reason in ViolationReason::ENTRYPOINT_REASONS {
+        let token = reason.as_str();
+        let sink = VecSink(Mutex::new(Vec::new()));
+        let r = relay_entrypoint_violation_for_test(reason, &sink, Some(&id)).unwrap_err();
+        assert_eq!(r.delivery, AuditDelivery::Recorded, "{token}");
+        assert_eq!(
+            r.error.violation.as_ref().map(|v| v.reason.as_str()),
+            Some(token)
+        );
+        let recs = sink.0.lock().unwrap();
+        assert_eq!(recs.len(), 1, "{token}");
+        assert_eq!(recs[0].layer(), AuditLayer::Entrypoint);
+        assert_eq!(recs[0].path(), None);
+        assert_eq!(recs[0].reason().map(|x| x.as_str()), Some(token));
+    }
+}
+
+/// SEC-4・#2624: entrypoint 系ではない理由（マウント層の `NoNamespaces`）は子の符号化で落ち、記録されない。
+#[test]
+fn sec4_2624_non_entrypoint_reason_is_not_recorded() {
+    use fandhe_container_core::exec::relay_entrypoint_violation_for_test;
+
+    let sink = VecSink(Mutex::new(Vec::new()));
+    let r = relay_entrypoint_violation_for_test(ViolationReason::NoNamespaces, &sink, None)
+        .unwrap_err();
+    assert_eq!(r.delivery, AuditDelivery::NotApplicable);
+    assert!(r.error.violation.is_none());
+    assert!(sink.0.lock().unwrap().is_empty());
+}

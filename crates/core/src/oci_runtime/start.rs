@@ -520,6 +520,24 @@ pub fn claim_start(
         .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Start, e))
 }
 
+/// 試験専用: [`claim_start`] の `build_spec` で、rootfs の検証（`check_rootfs`）と固定（`RootfsDir::pin`）の間に
+/// `swap` を差し込む（SEC-4・SEC-1・#2623）。
+///
+/// 「検証後に bundle 配下の要素が差し替えられた」競合を決定的に再現し、start の経路の pin 違反の記録を
+/// 結合試験で通すための入口。本番経路には存在しない（`exec-test-support` feature の下のみ。この feature を付けた
+/// リリースビルドは supervisor が `compile_error!` で拒否する）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub fn claim_start_with_pin_swap_for_test(
+    store: &dyn StateStore,
+    launcher: &dyn ProcessLauncher,
+    req: &StartRequest,
+    mut swap: impl FnMut(),
+) -> Result<ClaimedStart, OciRuntimeError> {
+    claim_inner_with_swap(store, launcher, req, Some(&mut swap))
+        .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Start, e))
+}
+
 /// [`start`] の後半。`SelfBounded` の launcher は呼び出しスレッドで直接呼ぶ（単一スレッドの要求）。
 ///
 /// 成功・失敗の件数と所要時間は `recorder` へ操作名 `start` で記録する（launch から状態記録まで）。失敗時の
@@ -543,6 +561,16 @@ fn claim_inner(
     launcher: &dyn ProcessLauncher,
     req: &StartRequest,
 ) -> Result<ClaimedStart, TraitError> {
+    claim_inner_with_swap(store, launcher, req, None)
+}
+
+/// [`claim_inner`] の本体。`pin_swap` は試験専用の差し込み（本番は常に `None`。#2623）。
+fn claim_inner_with_swap(
+    store: &dyn StateStore,
+    launcher: &dyn ProcessLauncher,
+    req: &StartRequest,
+    pin_swap: Option<&mut dyn FnMut()>,
+) -> Result<ClaimedStart, TraitError> {
     let reservation = Arc::new(StartReservation::acquire(req.id())?);
     let record = store.get(&GetStateRequest::new(req.id().clone()))?;
     if record.status().state() != ContainerState::Created {
@@ -560,7 +588,13 @@ fn claim_inner(
         ));
     }
 
-    let spec = build_spec(record.bundle(), req.id(), launcher, store.host_state_root())?;
+    let spec = build_spec_with_swap(
+        record.bundle(),
+        req.id(),
+        launcher,
+        store.host_state_root(),
+        pin_swap,
+    )?;
 
     // 起動権の所有ロック（プロセス間の排他）を予約の前に取り、launch が終わるまで保持する。所有ロックを
     // 持つプロセスが終了すればカーネルが解放するため、回復はその終了を条件にできる（CORE-2）。
@@ -769,11 +803,24 @@ fn release_claim(
 
 /// bundle の `config.json` を一度だけ読んで検証し、start が適用できない指定を拒否したうえで、rootfs を
 /// fd で固定して [`LaunchSpec`] を組み立てる（`config.json` は読み直さない）。
+#[cfg(test)]
 fn build_spec(
     bundle: &Path,
     id: &ContainerId,
     launcher: &dyn ProcessLauncher,
     state_root: Option<&Path>,
+) -> Result<LaunchSpec, TraitError> {
+    build_spec_with_swap(bundle, id, launcher, state_root, None)
+}
+
+/// `build_spec`（試験用の薄い入口）の本体。start の本番経路（`claim_inner_with_swap`）が呼ぶ。
+/// `pin_swap` は rootfs の固定の直前に呼ぶ試験専用の差し込み（本番は `None`。#2623）。
+fn build_spec_with_swap(
+    bundle: &Path,
+    id: &ContainerId,
+    launcher: &dyn ProcessLauncher,
+    state_root: Option<&Path>,
+    pin_swap: Option<&mut dyn FnMut()>,
 ) -> Result<LaunchSpec, TraitError> {
     // destination の拒否は launcher の拒否の記録先へ残す（TOCTOU の再検証。#2594・SEC-4・OCI-4）。手順 5 の
     // `load_resource_limits_audited` で既に拒否された場合はここへ来ないため、1 回の start で高々 1 件。
@@ -866,8 +913,12 @@ fn build_spec(
     })?;
     // 検査済みの rootfs を、`/` から祖先を含む全要素を symlink 非追従で辿って fd で固定する（SEC-1）。
     // 以後の使用はこの fd に限るため、検査後に祖先や rootfs を差し替えても固定した実体は変わらない。
-    // 違反の理由（`RootfsPinError::violation`）は start の経路ではまだ記録しない（拒否の記録先 `rejection_audit_sink` はあるが理由を流していない・未実装。#2623・#1702）。
-    let rootfs_dir = RootfsDir::pin(bundle, &rootfs).map_err(TraitError::from)?;
+    // 試験専用の差し込み（検証後の差し替えの再現。本番は `None`。#2623）。
+    if let Some(swap) = pin_swap {
+        swap();
+    }
+    // 違反の理由（`RootfsPinError::violation`）は launcher の拒否の記録先へ記録する（#2623・#1702）。
+    let rootfs_dir = pin_rootfs_audited(bundle, &rootfs, id, launcher)?;
     Ok(LaunchSpec::new(
         rootfs,
         rootfs_dir,
@@ -883,6 +934,33 @@ fn build_spec(
         ids,
     )
     .with_sysfs(sysfs))
+}
+
+/// rootfs を固定し、検証後の差し替えによる違反（`RootfsPinError::violation`）なら launcher の拒否の記録先
+/// （[`ProcessLauncher::rejection_audit_sink`]）へ層 `mount`・パスなし・理由コードつきの 1 件を残す
+/// （SEC-4・SEC-1・#2623・#1702）。
+///
+/// 違反を伴わない失敗（I/O エラー・bundle 自体や祖先の差し替え）は記録しない。記録の成否で拒否は覆さない
+/// （bind・sysfs の拒否と同じ）。本番の supervisor では作業スレッドから呼ばれ、記録先は制御チャネルの
+/// 監査 relay（閉じた表の理由として運ぶ。`audit_log::control_relay`）。非 Linux は rootfs を固定できず違反も起きない。
+fn pin_rootfs_audited(
+    bundle: &Path,
+    rootfs: &Path,
+    id: &ContainerId,
+    launcher: &dyn ProcessLauncher,
+) -> Result<RootfsDir, TraitError> {
+    RootfsDir::pin(bundle, rootfs).map_err(|err| {
+        #[cfg(target_os = "linux")]
+        if let (Some(event), Some(sink)) = (
+            err.violation().and_then(|r| r.exec_worker_audit_event()),
+            launcher.rejection_audit_sink(),
+        ) {
+            let _ = crate::audit_log::mount::deliver(event, Some(id), sink);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (id, launcher);
+        err.into_error()
+    })
 }
 
 /// `mounts[]` を検証済みの bind mount 集合へ変換する（TASK-29 追補・#1915・OCI-4・CORE-5・SEC-1・SEC-4）。
@@ -2601,6 +2679,108 @@ mod tests {
             assert_eq!(err2.code(), err.code());
             assert_eq!(err2.message(), err.message());
         }
+    }
+
+    /// 検証後（`claim_inner_with_swap` の差し込み点）に rootfs を `swap` で差し替えて claim する。
+    #[cfg(target_os = "linux")]
+    fn claim_with_swap(
+        name: &str,
+        launcher: &Arc<RecordingLauncher>,
+        swap: impl Fn(&Path),
+    ) -> (TraitError, MemStateStore) {
+        let (b, store) = created(name);
+        let rootfs = b.dir.join("rootfs");
+        let mut f = || swap(&rootfs);
+        let err = claim_inner_with_swap(&store, launcher.as_ref(), &sid(name), Some(&mut f))
+            .expect_err("must fail");
+        (err, store)
+    }
+
+    /// SEC-4・SEC-1・#2623: 検証後に rootfs が symlink / 不在へ差し替えられた start は、launcher の拒否の記録先へ
+    /// 層 `mount`・パスなし・理由コードつきで 1 件記録し、拒否の code・文言は記録先が無くても同じ。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2623_start_pin_violation_records_one_mount_reason() {
+        type Swap = fn(&Path);
+        let cases: [(&str, Swap, &str); 2] = [
+            (
+                "pin-symlink",
+                |rootfs| {
+                    std::fs::remove_dir(rootfs).expect("rmdir");
+                    std::os::unix::fs::symlink("/", rootfs).expect("symlink");
+                },
+                "path_symlink_or_not_directory",
+            ),
+            (
+                "pin-missing",
+                |rootfs| std::fs::remove_dir(rootfs).expect("rmdir"),
+                "path_missing",
+            ),
+        ];
+        for (name, swap, reason) in cases {
+            let launcher = RecordingLauncher::new(false);
+            let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+            assert!(launcher.audit.set(Arc::clone(&sink)).is_ok());
+            let (err, store) = claim_with_swap(name, &launcher, swap);
+            assert_eq!(err.code(), ErrorCode::PermissionDenied, "{name}");
+            assert_eq!(err.message(), "rootfs changed after validation", "{name}");
+            assert_eq!(launcher.calls(), 0);
+            let recs = sink.snapshot();
+            assert_eq!(recs.len(), 1, "{name}");
+            assert_eq!(
+                recs[0].container_id().map(|c| c.as_str()),
+                Some(name),
+                "{name}"
+            );
+            match recs[0].event() {
+                crate::audit_log::AuditEvent::Mount {
+                    path: None,
+                    reason: Some(r),
+                } => assert_eq!(r.as_str(), reason, "{name}"),
+                other => panic!("unexpected event: {other:?}"),
+            }
+            let got = store
+                .get(&GetStateRequest::new(ContainerId::new(name).expect("id")))
+                .expect("stored");
+            assert_eq!(got.status().state(), ContainerState::Created);
+
+            // 記録先が無い launcher でも拒否の内容は同じ（記録の有無で結果を変えない）。
+            let plain = RecordingLauncher::new(false);
+            let (err2, _store2) = claim_with_swap(&format!("{name}-nosink"), &plain, swap);
+            assert_eq!(err2.code(), err.code());
+            assert_eq!(err2.message(), err.message());
+        }
+    }
+
+    /// SEC-4・SEC-1・#2623: 記録先が失敗しても拒否の code・文言は変わらない（fail-closed）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2623_start_pin_violation_sink_failure_keeps_rejection() {
+        let launcher = RecordingLauncher::new(false);
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(true));
+        assert!(launcher.audit.set(Arc::clone(&sink)).is_ok());
+        let (err, _store) = claim_with_swap("pin-sink-fail", &launcher, |rootfs| {
+            std::fs::remove_dir(rootfs).expect("rmdir");
+        });
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        assert_eq!(err.message(), "rootfs changed after validation");
+        assert!(sink.snapshot().is_empty());
+        assert_eq!(launcher.calls(), 0);
+    }
+
+    /// SEC-4・#2623: 違反を伴わない成功（差し替えなし）は記録 0 件。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec4_2623_start_without_pin_violation_records_nothing() {
+        let (_b, store) = created("pin-none");
+        let launcher = RecordingLauncher::new(false);
+        let sink = Arc::new(crate::audit_log::mount::tests::VecSink::new(false));
+        assert!(launcher.audit.set(Arc::clone(&sink)).is_ok());
+        let mut noop = || {};
+        let claimed =
+            claim_inner_with_swap(&store, launcher.as_ref(), &sid("pin-none"), Some(&mut noop));
+        assert!(claimed.is_ok());
+        assert!(sink.snapshot().is_empty());
     }
 
     /// REPAIR-5: 状態更新に失敗したら起動済みプロセスをちょうど 1 回 terminate し、元のエラーを返す。

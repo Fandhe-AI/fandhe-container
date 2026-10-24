@@ -252,7 +252,7 @@
 //!   `path_symlink_or_not_directory`・`path_missing` を `RootfsPinError` で運び、`from_pin_error` が末尾の目印つきの
 //!   `TraitError`（`code`・文言は従来どおり）にして、他の worker の違反と同じ経路で層 `mount` に記録する（#1702）。
 //!   bundle 自体や祖先の差し替え・I/O エラーは違反を運ばず記録しない。start の経路（core の `RootfsDir::pin`）は、
-//!   拒否の記録先はあるが違反の理由をまだ流しておらず記録しない（未実装。#2623）。bundle は supervisor と同じ信頼境界にあるため、差し替えは境界の侵害の兆候。
+//!   `build_spec` が launcher の拒否の記録先（relay の閉じた表の理由として運ぶ）へ記録する（#2623。試験 `tests/start_rootfs_pin_audit_relay.rs`）。bundle は supervisor と同じ信頼境界にあるため、差し替えは境界の侵害の兆候。
 //!   再起動を越えて残る置き場所・ローテーション・常時の二重記録も未実装（`FileAuditSink` の doc）
 //! - launcher による記録の書き込み（`launch_rlimits_from_self` の結果を `StagePipeline::with_rlimits` と
 //!   `CreateStateRequest::with_rlimits` の両方へ渡す結線）。本番の `start` は `process.rlimits` を `Unimplemented` で

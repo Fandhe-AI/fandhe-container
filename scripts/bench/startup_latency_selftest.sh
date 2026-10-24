@@ -941,6 +941,7 @@ cat >>"$dstub" <<'DSTUB'
 #   list-fail: ok と同じだが、run 後の ps が失敗する
 #   image-missing: image inspect が失敗する
 #   run-fail-no-cid: run が cidfile を書かず失敗する（終了コード 125 = timeout の 125 と同値）
+#   run-fail-no-cid-slow-ps: run-fail-no-cid と同じで、run 後の ps が 1.0 秒かかる（#2639）
 #   run-hang-cid-written: cidfile を書きコンテナを作ってからハングする
 #   run-hang-no-cid-listed: cidfile を書かずコンテナだけ作ってハングする
 mode="${DSTUB_MODE:-ok}"
@@ -964,7 +965,7 @@ case "$cmd" in
     echo "$n" >"$DSTUB_STATE/counter"
     cid="$(printf '%064x' "$n")"
     case "$mode" in
-      run-fail-no-cid) echo "docker: daemon error" >&2; exit 125 ;;
+      run-fail-no-cid | run-fail-no-cid-slow-ps) echo "docker: daemon error" >&2; exit 125 ;;
       ok | list-fail) printf '%s' "$cid" >"$cidfile"; sleep 0.05 ;;
       leftover-after-rm | rm-fail) printf '%s' "$cid" >"$cidfile"; touch "$DSTUB_STATE/containers/$cid"; sleep 0.05 ;;
       run-hang-cid-written) printf '%s' "$cid" >"$cidfile"; touch "$DSTUB_STATE/containers/$cid"; exec sleep 30 ;;
@@ -972,6 +973,7 @@ case "$cmd" in
     esac
     ;;
   ps)
+    [ "$mode" = run-fail-no-cid-slow-ps ] && [ -e "$DSTUB_STATE/ran" ] && sleep 1.0
     [ "$mode" = list-fail ] && [ -e "$DSTUB_STATE/ran" ] && { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
     for f in "$DSTUB_STATE"/containers/*; do
       [ -e "$f" ] && basename "$f"
@@ -1056,6 +1058,27 @@ reset_dlog
 DSTUB_MODE=run-fail-no-cid expect_rc "docker-run-fail-no-cid" 1 --runtime "$dstub" --iterations 1 --warmup 0
 expect_contains "docker-run-fail-no-cid-error" "docker-run-failed"
 if grep -q '^rm ' "$dstub_log"; then fail "docker-run-fail-no-cid-no-rm"; else pass "docker-run-fail-no-cid-no-rm"; fi
+# cidfile 無しの後始末の一覧は、収集待ちを後始末の期限で切り詰めない（#2639・REPAIR-5・REPAIR-12・CORE-10）。
+# --timeout 2 で ps が 1.0 秒かかると、期限の残りは約 1.0 秒以下になる。収集の遅延 1.4 秒は残りより長く、
+# 上限（2 秒）より短い。切り詰めると残存扱い（exit 4・absence cannot be confirmed）になるが、切り詰めなければ
+# 一覧が空と確定して exit 1 になる。事前確認の ps は run 前なので遅くならない。
+reset_dlog
+started="$SECONDS"
+DSTUB_MODE=run-fail-no-cid-slow-ps STARTUP_LATENCY_TEST_COLLECT_DELAY=list.out:1.4 \
+  expect_rc "docker-run-fail-no-cid-flush-straddles-deadline" 1 --runtime "$dstub" --iterations 1 --warmup 0 --timeout 2
+elapsed=$((SECONDS - started))
+if [ "$elapsed" -lt 15 ]; then pass "docker-run-fail-no-cid-flush-straddles-bounded (${elapsed}s < 15s)"; else fail "docker-run-fail-no-cid-flush-straddles-bounded (${elapsed}s)"; fi
+expect_contains "docker-run-fail-no-cid-flush-straddles-run-error" "docker-run-failed"
+expect_not_contains "docker-run-fail-no-cid-flush-straddles-no-preflight-fail" "docker-list-failed"
+expect_not_contains "docker-run-fail-no-cid-flush-straddles-no-leftover" "containers left behind"
+expect_not_contains "docker-run-fail-no-cid-flush-straddles-no-unconfirmed" "absence cannot be confirmed"
+expect_not_contains "docker-run-fail-no-cid-flush-straddles-no-manual" "inspect it manually"
+if grep -q '^rm ' "$dstub_log"; then fail "docker-run-fail-no-cid-flush-straddles-no-rm"; else pass "docker-run-fail-no-cid-flush-straddles-no-rm"; fi
+expect_eq "docker-run-fail-no-cid-flush-straddles-sequence" "image ps run ps" "$(dlog_cmds)"
+# 事前確認の一覧の収集待ちの上限も --timeout 秒（固定 200ms でない。#2639・#1687）。
+reset_dlog
+DSTUB_MODE=ok STARTUP_LATENCY_TEST_COLLECT_DELAY=list.out:0.5 expect_rc "docker-preflight-list-collector-delay" 0 --runtime "$dstub" --iterations 1 --warmup 0 --timeout 2
+expect_eq "docker-preflight-list-collector-delay-samples" "1" "$(jq -r '.samples_us | length' <<<"$last_stdout")"
 # run がハングし cidfile が書かれていれば、その ID だけに rm -f を 1 回送る。
 reset_dlog
 started="$SECONDS"

@@ -606,6 +606,95 @@ mod tests {
         assert_eq!(sorted_names(&dir), Vec::<String>::new());
     }
 
+    /// SUP-7・CRI-2・#2634: sink が待ちの途中で閉じれば、試し直して消せる。
+    #[test]
+    fn sup7_waiting_removes_after_sink_released() {
+        let t = TmpDir::new("waitok");
+        let dir = crate::logs::container_log_dir(&t.0);
+        let sink = container_sink(&t.0, "c1");
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(sink);
+        });
+        let removed = crate::logs::remove_container_logs_guarded_bounded_waiting(
+            &t.0,
+            &id(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Arc::new(|| true),
+        )
+        .unwrap();
+        h.join().unwrap();
+        assert_eq!(removed.log_files(), 1);
+        assert_eq!(sorted_names(&dir), Vec::<String>::new());
+    }
+
+    /// REPAIR-5・#2634: sink が閉じなければ期限で `FailedPrecondition` になり、何も消さない。
+    #[test]
+    fn repair5_waiting_gives_up_after_deadline() {
+        let t = TmpDir::new("waitdl");
+        let dir = crate::logs::container_log_dir(&t.0);
+        let _sink = container_sink(&t.0, "c1");
+        let started = Instant::now();
+        let e = crate::logs::remove_container_logs_guarded_bounded_waiting(
+            &t.0,
+            &id(),
+            Duration::from_millis(150),
+            Duration::from_secs(5),
+            Arc::new(|| true),
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(elapsed >= Duration::from_millis(150), "{elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(150) + Duration::from_secs(1),
+            "{elapsed:?}"
+        );
+        assert_eq!(sorted_names(&dir), ["c1.log", "c1.log.lock"]);
+    }
+
+    /// SUP-7・#2634: `lock_wait` が 0 なら 1 回だけ試す。
+    #[test]
+    fn sup7_waiting_zero_wait_is_single_attempt() {
+        let t = TmpDir::new("waitzero");
+        let _sink = container_sink(&t.0, "c1");
+        let started = Instant::now();
+        let e = crate::logs::remove_container_logs_guarded_bounded_waiting(
+            &t.0,
+            &id(),
+            Duration::ZERO,
+            Duration::from_secs(5),
+            Arc::new(|| true),
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    /// SUP-7・#2634: `guard` が `false` なら 0 件で成功し、試し直さない（guard は 1 回だけ評価される）。
+    #[test]
+    fn sup7_waiting_guard_false_does_not_retry() {
+        use std::sync::atomic::AtomicUsize;
+        let t = TmpDir::new("waitguard");
+        drop(container_sink(&t.0, "c1"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let removed = crate::logs::remove_container_logs_guarded_bounded_waiting(
+            &t.0,
+            &id(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Arc::new(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+                false
+            }),
+        )
+        .unwrap();
+        assert_eq!(removed.log_files(), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     /// SUP-7・#2446: ディレクトリが無ければ 0 件で成功し（冪等）、作らない。
     #[test]
     fn sup7_remove_container_logs_missing_dir_is_ok() {

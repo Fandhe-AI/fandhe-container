@@ -33,14 +33,17 @@
 //!   core の `delete` が成功した後に限り、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）を期限つきで
 //!   best effort で消す（失敗は戻り値に影響させず、期限切れは記録器の `supervisor_log_remove` の失敗として計上する）。
 //!   続けてコンテナログ（`<root>/@container-logs/<id>.log*`・ロック。#2593・SUP-7・CRI-2・CLI-1）も CLI の `delete` と同じ
-//!   `remove_container_logs_guarded_bounded` で消す（期限 5 秒・同じ ID の sink が生きていれば `FailedPrecondition` で何も消さない・
-//!   削除関数そのものは stderr へ書かない）。残した結果は `DeleteResponse` の `supervisor_log`・`container_log` に載せ
-//!   （`Kept { code }`。rootfs の欄は core が埋める。#2633）、`Kept` が 1 件でもあれば 1 件につき 1 行の構造化ログ
-//!   （`event: container_delete_cleanup`。パス・errno は含めない）を `LineSink`（有界キュー。待たない）経由で出す。消せなくても `delete` は `Ok` のままにする: CRI 層は `Err` で記録を残して再試行するが、再試行は
+//!   `remove_container_logs_guarded_bounded_waiting` で消す（同じ ID の sink が生きていれば `FailedPrecondition` で何も消さず、
+//!   最大 10 秒まで 50ms 間隔で試し直して sink の閉鎖を待つ。1 回の試行の期限は 5 秒。設計は
+//!   `docs/design/container-log-removal-wait.md`・#2634。削除関数そのものは stderr へ書かない）。残した結果は `DeleteResponse` の
+//!   `supervisor_log`・`container_log` に載せ（`Kept { code }`。rootfs の欄は core が埋める。#2633）、`Kept` が 1 件でもあれば
+//!   1 件につき 1 行の構造化ログ（`event: container_delete_cleanup`。パス・errno は含めない）を `LineSink`（有界キュー。待たない）経由で出す。
+//!   消せなくても `delete` は `Ok` のままにする: CRI 層は `Err` で記録を残して再試行するが、再試行は
 //!   core の `NOT_FOUND` で止まりログ削除まで届かないため、CLI と同じく成功として扱い、失敗は記録器の `container_log_remove`
 //!   の失敗として計上する（構造化エラーは [`CoreLifecycleRuntime::remove_container_log`] の `TraitError`）。最悪の上乗せは
-//!   supervisor ログと合わせて 10 秒。記録器にエラーコード別の内訳は無い（REPAIR-3）。既知の制約として、running への force
-//!   `RemoveContainer` は supervisor の終了が sink を閉じきる前だとロックが取れず、ログが残る（1 ID あたり世代数 × 上限に収まる）
+//!   supervisor ログと合わせて 20 秒。失敗は `container_log_remove.<code>`（`failed_precondition`・`timeout`・`invalid_argument`・
+//!   `internal`・`other`）の操作名でも計上する（REPAIR-4）。既知の制約として、既定を超える terminate で窓が 10 秒を超えると
+//!   待ち切れずログが残る（1 ID あたり世代数 × 上限に収まり、回収の経路は無い）
 //! - bundle 供給: 本番は `CriPluginBackends::production_bundle_provider`（unix のみ）（pull 済みイメージの再展開と
 //!   ContainerConfig → config.json 変換。#2433）。`ImageService` をサーブしていないためタグは解決できず、
 //!   image ID（`sha256:<hex>`）だけを受ける（イメージ取り込みの結線と合わせて別途。REPAIR-3）。
@@ -78,7 +81,8 @@ use fandhe_container_cri::instrument::{CriOpOutcome, CriOpRecorder, CriOpSample}
 use fandhe_container_cri::runtime_service::CriRuntimeService;
 use fandhe_container_supervisor::cgroup_remover::production_cgroup_remover;
 use fandhe_container_supervisor::logs::{
-    CONTAINER_LOG_REMOVE_TIMEOUT, RemovedLogs, remove_container_logs_guarded_bounded,
+    CONTAINER_LOG_LOCK_WAIT, CONTAINER_LOG_REMOVE_TIMEOUT, RemovedLogs,
+    remove_container_logs_guarded_bounded_waiting,
 };
 use fandhe_container_supervisor::supervisor_log::{
     LogRemoval, SUPERVISOR_LOG_REMOVE_TIMEOUT, remove_bounded,
@@ -253,6 +257,8 @@ pub struct CoreLifecycleRuntime {
     cgroups: Arc<dyn ContainerCgroupRemover>,
     /// `create` の `mounts[].destination` 拒否の記録先（`with_create_audit_sink`。#2594）。無ければ記録しない。
     create_audit: Option<Arc<dyn AuditSink>>,
+    /// コンテナログ削除で sink の閉鎖を待つ上限（`CONTAINER_LOG_LOCK_WAIT` 以下。#2634・REPAIR-5）。
+    container_log_lock_wait: Duration,
     /// `delete` の後始末で残した資源の構造化ログ 1 行の出力先（本番は stderr の `LineSink`。試験で差し替える。#2633）。
     cleanup_warn: Arc<dyn Fn(String) + Send + Sync>,
     #[cfg(target_os = "linux")]
@@ -381,6 +387,7 @@ impl CoreLifecycleRuntime {
             recorder,
             cgroups: Arc::new(production_cgroup_remover()),
             create_audit: None,
+            container_log_lock_wait: CONTAINER_LOG_LOCK_WAIT,
             cleanup_warn: Arc::new(|line| {
                 let _ = crate::telemetry::stderr_sink().submit(line);
             }),
@@ -400,6 +407,14 @@ impl CoreLifecycleRuntime {
     #[must_use]
     pub fn with_cgroup_remover(mut self, cgroups: Arc<dyn ContainerCgroupRemover>) -> Self {
         self.cgroups = cgroups;
+        self
+    }
+
+    /// コンテナログ削除で sink の閉鎖を待つ上限を変える（試験用。`CONTAINER_LOG_LOCK_WAIT` を超える値は切り詰める。
+    /// `PLUGIN_RUNTIME_TIMEOUT` に収まる予算の不変条件を壊さないため。#2634・REPAIR-5）。
+    #[must_use]
+    pub fn with_container_log_lock_wait(mut self, wait: Duration) -> Self {
+        self.container_log_lock_wait = wait.min(CONTAINER_LOG_LOCK_WAIT);
         self
     }
 
@@ -462,13 +477,15 @@ impl CoreLifecycleRuntime {
     /// コンテナログ（現在ログ・全世代・ロック）を消す。core の `delete` が成功した後にだけ呼ぶ（失敗した delete で
     /// 稼働中のコンテナのログを消さないため。#2593・SUP-7・CRI-2・CLI-1）。
     ///
-    /// CLI の `delete` と同じ supervisor の関数・契約で、期限は 5 秒（同時実行枠は supervisor ログの削除と共有）、
-    /// stderr へは何も書かない。ロック取得後に状態ストアで ID が `NotFound` のままであることを確かめ、
+    /// CLI の `delete` と同じ契約に、sink の閉鎖待ちを足したもの。`FailedPrecondition` のあいだ最大
+    /// `container_log_lock_wait`（既定 10 秒）まで 50ms 間隔で試し直し、1 回の試行の期限は 5 秒（同時実行枠は
+    /// supervisor ログの削除と共有し、試行の間だけ占める）。running への force 削除では `Stopped` の記録後に supervisor が
+    /// drain してから sink を閉じるため、この待ちで窓を覆う（#2634）。stderr へは何も書かない。ロック取得後に状態ストアで ID が `NotFound` のままであることを確かめ、
     /// 読み取りに失敗したら fail-closed で削除を見送る（同じ ID で再作成されたインスタンスのログを消さない）。
     /// 状態ルートが無い（ホスト上のパスを持たない）ストアでは何もせず `Ok`。
     ///
     /// # Errors
-    /// supervisor の `TraitError` をそのまま返す。`FailedPrecondition`（同じ ID の sink が生きている）・
+    /// supervisor の `TraitError` をそのまま返す。`FailedPrecondition`（待ちの期限まで同じ ID の sink が閉じなかった）・
     /// `Timeout`（期限切れか枠の満杯）・`InvalidArgument`（名前空間の不正）・`Internal`（ディレクトリ検査の失敗）。
     pub fn remove_container_log(&self, id: &ContainerId) -> Result<RemovedLogs, TraitError> {
         let Some(root) = self.store.host_state_root() else {
@@ -476,12 +493,18 @@ impl CoreLifecycleRuntime {
         };
         let store = Arc::clone(&self.store);
         let guard_id = id.clone();
-        remove_container_logs_guarded_bounded(root, id, CONTAINER_LOG_REMOVE_TIMEOUT, move || {
-            matches!(
-                store.get(&GetStateRequest::new(guard_id.clone())),
-                Err(e) if e.code() == ErrorCode::NotFound
-            )
-        })
+        remove_container_logs_guarded_bounded_waiting(
+            root,
+            id,
+            self.container_log_lock_wait,
+            CONTAINER_LOG_REMOVE_TIMEOUT,
+            Arc::new(move || {
+                matches!(
+                    store.get(&GetStateRequest::new(guard_id.clone())),
+                    Err(e) if e.code() == ErrorCode::NotFound
+                )
+            }),
+        )
     }
 
     /// [`Self::remove_container_log`] の結果を記録器の `container_log_remove` に計上する（戻り値には影響させない）。
@@ -491,17 +514,37 @@ impl CoreLifecycleRuntime {
         }
         let started = Instant::now();
         let removed = self.remove_container_log(id);
-        let result = match removed {
+        let elapsed = started.elapsed();
+        let result = match &removed {
             Ok(_) => OpOutcome::Success,
             Err(_) => OpOutcome::Failure,
         };
         if let Ok(name) = OpName::new("container_log_remove") {
-            let _ = self.recorder.record(&name, result, started.elapsed());
+            let _ = self.recorder.record(&name, result, elapsed);
+        }
+        // エラーコード別の内訳（固定語彙 5 種。失敗したときだけ名前を作る。REPAIR-4・#2634）。
+        if let Err(e) = &removed
+            && let Ok(name) = OpName::new(container_log_remove_failure_op(e.code()))
+        {
+            let _ = self.recorder.record(&name, OpOutcome::Failure, elapsed);
         }
         match removed {
             Ok(_) => CleanupOutcome::Removed,
             Err(e) => CleanupOutcome::Kept { code: e.code() },
         }
+    }
+}
+
+/// コンテナログ削除の失敗をコード別に計上する操作名（固定語彙 5 種。ID・パス・errno は入れない。ERR-1・REPAIR-4・#2634）。
+///
+/// 記録器の名前の種類には上限（`MAX_TRACKED_OPS`）があるため、語彙を絞り、失敗したときだけ作る。
+fn container_log_remove_failure_op(code: ErrorCode) -> &'static str {
+    match code {
+        ErrorCode::FailedPrecondition => "container_log_remove.failed_precondition",
+        ErrorCode::Timeout => "container_log_remove.timeout",
+        ErrorCode::InvalidArgument => "container_log_remove.invalid_argument",
+        ErrorCode::Internal => "container_log_remove.internal",
+        _ => "container_log_remove.other",
     }
 }
 
@@ -1037,5 +1080,37 @@ mod tests {
             .find("telemetry::PeerAuditForwarder::spawn(")
             .expect("the forwarder keeps the original sink");
         assert!(wire < forwarder);
+    }
+
+    /// REPAIR-4・#2634: コンテナログ削除のコード別の操作名は固定語彙 5 種で、記録器の名前の規則に収まる。
+    #[test]
+    fn repair4_container_log_failure_op_names_are_valid_and_bounded() {
+        use fandhe_container_core::observability::OpName;
+        let cases = [
+            (
+                ErrorCode::FailedPrecondition,
+                "container_log_remove.failed_precondition",
+            ),
+            (ErrorCode::Timeout, "container_log_remove.timeout"),
+            (
+                ErrorCode::InvalidArgument,
+                "container_log_remove.invalid_argument",
+            ),
+            (ErrorCode::Internal, "container_log_remove.internal"),
+            (ErrorCode::NotFound, "container_log_remove.other"),
+            (ErrorCode::AlreadyExists, "container_log_remove.other"),
+            (ErrorCode::Unimplemented, "container_log_remove.other"),
+            (ErrorCode::PermissionDenied, "container_log_remove.other"),
+            (ErrorCode::Unavailable, "container_log_remove.other"),
+            (ErrorCode::ResourceExhausted, "container_log_remove.other"),
+        ];
+        let mut names = std::collections::BTreeSet::new();
+        for (code, expected) in cases {
+            let name = container_log_remove_failure_op(code);
+            assert_eq!(name, expected);
+            assert!(OpName::new(name).is_ok(), "{name}");
+            names.insert(name);
+        }
+        assert_eq!(names.len(), 5);
     }
 }

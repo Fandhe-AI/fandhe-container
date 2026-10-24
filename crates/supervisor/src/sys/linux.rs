@@ -708,6 +708,7 @@ mod control_ffi {
 
     /// `sock` へ `data` を送り、`fd` を `SCM_RIGHTS` で 1 本添える。送れたバイト数を返す
     /// （ストリームなので短い書き込みはあり得る。fd は最初に送れたバイトに付く。呼び出し側が残りを書く）。
+    /// `EINTR` は再試行せず `Interrupted` のまま返す（呼び出し側が絶対期限を確認して再試行する。REPAIR-5）。
     pub(super) fn send_with_fd(
         sock: std::os::fd::BorrowedFd<'_>,
         data: &[u8],
@@ -736,23 +737,21 @@ mod control_ffi {
             msg_controllen: std::mem::size_of::<ControlOne>(),
             msg_flags: 0,
         };
-        loop {
+        {
             // SAFETY: `sock`・`fd` は借用で呼び出しの間開いている。`msg` は `#[repr(C)]` の 56 バイト（コンパイル時に固定）で、
             // `msg_iov` は 1 要素の `iov`（`data` の先頭と長さ。カーネルは読むだけ）、`msg_control` は 24 バイトの
             // `ControlOne`（8 バイト整列。`msg_controllen` はその大きさ）を指す。いずれもこの関数のスタック上の値か
             // 呼び出し元の借用で、呼び出しの間有効。`msg_name` は null・長さ 0。カーネルは `fd` の複製を受け手に作るだけで、
             // 呼び出し側の fd の所有権は動かない。本モジュールは LP64 の x86_64 / aarch64 でのみコンパイルされる。
             let rc = unsafe { sendmsg(sock.as_raw_fd(), &raw const msg, MSG_NOSIGNAL) };
-            match check(rc as i64) {
-                Ok(n) => return usize::try_from(n).map_err(|_| io::Error::from_raw_os_error(22)),
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
+            let n = check(rc as i64)?;
+            usize::try_from(n).map_err(|_| io::Error::from_raw_os_error(22))
         }
     }
 
     /// `sock` から最大 `buf.len()` バイトと、添えられた `SCM_RIGHTS` の fd（最大 4 本）を 1 回の `recvmsg` で受ける。
     /// 受け取った fd は close-on-exec で、`OwnedFd` として返す（呼び出し側が不要なら drop で閉じる）。
+    /// `EINTR` は再試行せず `Interrupted` のまま返す（呼び出し側が絶対期限を確認して再試行する。REPAIR-5）。
     pub(super) fn recv_with_fds(
         sock: std::os::fd::BorrowedFd<'_>,
         buf: &mut [u8],
@@ -771,18 +770,15 @@ mod control_ffi {
             msg_controllen: RECV_CONTROL_LEN,
             msg_flags: 0,
         };
-        let n = loop {
+        let n = {
             // SAFETY: `sock` は借用で呼び出しの間開いている。`msg` は `#[repr(C)]` の 56 バイトで、`msg_iov` は 1 要素の
             // `iov`（`buf` の先頭と長さ。カーネルは `buf` に最大その長さを書く）、`msg_control` は 32 バイトの
             // `ControlBuf`（8 バイト整列。`msg_controllen` はその大きさ）を指す。いずれも呼び出しの間有効かつ排他的。
             // カーネルは `msg_controllen`・`msg_flags` を更新する。本モジュールは LP64 の x86_64 / aarch64 でのみ
             // コンパイルされる。
             let rc = unsafe { recvmsg(sock.as_raw_fd(), &raw mut msg, MSG_CMSG_CLOEXEC) };
-            match check(rc as i64) {
-                Ok(n) => break usize::try_from(n).map_err(|_| io::Error::from_raw_os_error(22))?,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
+            let n = check(rc as i64)?;
+            usize::try_from(n).map_err(|_| io::Error::from_raw_os_error(22))?
         };
         let used = msg.msg_controllen.min(RECV_CONTROL_LEN);
         let raw = control.0.get(..used).unwrap_or(&[]);

@@ -25,13 +25,19 @@ struct TmpDir(PathBuf);
 impl TmpDir {
     fn new(tag: &str) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
-        let n = SEQ.fetch_add(1, Ordering::SeqCst);
-        let p = std::env::temp_dir().join(format!("fc-cli-exec-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&p).expect("mkdir");
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-        }
+        // 予測可能な共有 /tmp 上の名前なので、排他的作成（`create_dir`）だけを使い、既存エントリ（symlink を含む）は
+        // 採用せず別名で再試行する。作成時から 0700（`set_permissions` で symlink の参照先を chmod しない）。
+        use std::os::unix::fs::DirBuilderExt as _;
+        let p = loop {
+            let n = SEQ.fetch_add(1, Ordering::SeqCst);
+            let p =
+                std::env::temp_dir().join(format!("fc-cli-exec-{tag}-{}-{n}", std::process::id()));
+            match std::fs::DirBuilder::new().mode(0o700).create(&p) {
+                Ok(()) => break p,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => panic!("mkdir: {e}"),
+            }
+        };
         Self(p)
     }
 

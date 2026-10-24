@@ -425,19 +425,23 @@ mod linux {
         stream: &mut UnixStream,
         deadline: Instant,
     ) -> Result<(ControlReason, Vec<OwnedFd>), TraitError> {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(timeout());
-        }
-        stream
-            .set_read_timeout(Some(remaining))
-            .map_err(|_| unavailable())?;
         let mut frame = [0u8; RESPONSE_LEN];
-        // `EINTR` は sys 側で再試行する。`EAGAIN`（受信タイムアウト）は期限切れ。
-        let received = match crate::sys::recv_with_fds(stream.as_fd(), &mut frame) {
-            Ok(r) => r,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(timeout()),
-            Err(e) => return Err(io_error(&e)),
+        // `EINTR` は sys が返すので、再試行のたびに残り時間を受信タイムアウトへ設定し直す（割り込みが続いても
+        // 絶対期限を超えない。REPAIR-5）。`EAGAIN`（受信タイムアウト）は期限切れ。
+        let received = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(timeout());
+            }
+            stream
+                .set_read_timeout(Some(remaining))
+                .map_err(|_| unavailable())?;
+            match crate::sys::recv_with_fds(stream.as_fd(), &mut frame) {
+                Ok(r) => break r,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Err(timeout()),
+                Err(e) => return Err(io_error(&e)),
+            }
         };
         // 切り詰められた（想定外の本数）制御データは、受け切れなかった分をカーネルが閉じている。受け取った分は drop で閉じる。
         if received.truncated {

@@ -244,17 +244,40 @@ fn handle_exec_handover(
     if Instant::now() >= deadline {
         return respond(&mut stream, ControlReason::Timeout);
     }
-    respond_with_fd(&mut stream, pidfd.as_fd())
+    respond_with_fd(&mut stream, pidfd.as_fd(), deadline)
+}
+
+/// `EINTR` のときだけ、期限内なら再試行して `send_with_fd` を呼ぶ。期限切れは `TimedOut`。
+fn send_with_fd_until(
+    stream: &UnixStream,
+    frame: &[u8],
+    fd: BorrowedFd<'_>,
+    deadline: Instant,
+) -> io::Result<usize> {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        match crate::sys::send_with_fd(stream.as_fd(), frame, fd) {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            other => return other,
+        }
+    }
 }
 
 /// `Response(Ok)` に `fd` を 1 本添えて送る。送れなかったら（相手が閉じた・期限）`Internal` を返す
 /// （fd は添付されていない、または相手が受け取り済みで、こちらに残る資源は無い）。
-fn respond_with_fd(stream: &mut UnixStream, fd: BorrowedFd<'_>) -> ControlReason {
+fn respond_with_fd(
+    stream: &mut UnixStream,
+    fd: BorrowedFd<'_>,
+    deadline: Instant,
+) -> ControlReason {
     let frame = ResponseFrame {
         reason: ControlReason::Ok,
     }
     .encode();
-    let sent = match crate::sys::send_with_fd(stream.as_fd(), &frame, fd) {
+    // `EINTR` は sys が返すので、再試行のたびに絶対期限を確かめる（割り込みが続いても期限を超えない。REPAIR-5）。
+    let sent = match send_with_fd_until(stream, &frame, fd, deadline) {
         Ok(n) => n,
         Err(_) => {
             log_control_event(

@@ -469,14 +469,36 @@ fn sup6_status_to_code_maps_exit_and_signal() {
     assert_eq!(status_to_code(ExitStatus::from_raw(9)), 137);
 }
 
-/// SUP-6・REPAIR-5・#2626: 子の期限は `--timeout` を超えて延びない（環境変数が無い・壊れていれば `--timeout` のまま）。
+/// SUP-6・REPAIR-5・#2626: 環境変数が無ければ子の期限は `--timeout` のまま（並列実行のため set はしない）。
 #[test]
 fn sup6_scoped_timeout_never_extends() {
-    // 環境変数を触らない前提の確認（並列実行のため set はしない）。未設定なら要求値のまま。
-    if std::env::var_os(REMAINING_MS_ENV).is_none() {
+    if std::env::var_os(DEADLINE_MS_ENV).is_none() {
         assert_eq!(
             scoped_timeout(Duration::from_secs(30)),
             Duration::from_secs(30)
         );
     }
+}
+
+/// REPAIR-5・#2626: 絶対期限から残りを算出する（起動に使った時間が差し引かれる。過ぎていれば 1ms）。
+#[test]
+fn repair5_remaining_is_derived_from_absolute_deadline() {
+    assert_eq!(
+        remaining_until(100_000, 92_500),
+        Duration::from_millis(7_500)
+    );
+    assert_eq!(remaining_until(100_000, 100_000), Duration::from_millis(1));
+    assert_eq!(remaining_until(100_000, 200_000), Duration::from_millis(1));
+}
+
+/// #2626: `/proc/uptime` の本文の解釈（10ms 刻み。壊れていれば None）。
+#[test]
+fn sup6_parse_uptime_ms() {
+    assert_eq!(parse_uptime_ms("12345.67 9999.00\n"), Some(12_345_670));
+    assert_eq!(parse_uptime_ms("5.1 0.0"), Some(5_100));
+    assert_eq!(parse_uptime_ms("7 0"), Some(7_000));
+    assert_eq!(parse_uptime_ms("abc 1"), None);
+    assert_eq!(parse_uptime_ms("1.x 1"), None);
+    assert_eq!(parse_uptime_ms(""), None);
+    assert!(monotonic_now_ms().is_some());
 }

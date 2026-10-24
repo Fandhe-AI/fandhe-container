@@ -236,8 +236,14 @@ mod linux {
     /// systemd-run 自身の失敗（スコープ登録の失敗・user マネージャの stale ソケット等）は、子の CLI が走らないため
     /// 目印が作られず、親が「コマンドの失敗」と取り違えない（終了コード 1〜10 は ERR-2 と重なるため。ERR-2・SUP-6）。
     const RESULT_FILE_ENV: &str = "FANDHE_CONTAINER_EXEC_RESULT_FILE";
-    /// 再実行した子へ渡す残り時間（ミリ秒）。子はこれと `--timeout` の小さい方を全体の期限にする（REPAIR-5）。
-    const REMAINING_MS_ENV: &str = "FANDHE_CONTAINER_EXEC_REMAINING_MS";
+    /// 再実行した子へ渡す絶対期限（`/proc/uptime` の経過時間による、ミリ秒の単調な絶対時刻。`CLOCK_BOOTTIME` で
+    /// 同一ホストの別プロセスと比較できる）。子は実行開始時にここから残り時間を算出し、`--timeout` と小さい方を
+    /// 全体の期限にする（延長はしない）。残り時間そのものを渡すと、子の起動（D-Bus 接続・scope 登録）に使った時間が
+    /// 差し引かれず `--timeout` を超えて実行できる（REPAIR-5）ため、絶対時刻で渡す。
+    const DEADLINE_MS_ENV: &str = "FANDHE_CONTAINER_EXEC_DEADLINE_MS";
+    /// 再実行した子へ渡す親 CLI の pid。子は `PR_SET_PDEATHSIG` の設定後に実際の親と照合し、設定前に親が
+    /// 終わっていた競合を検出する（#2626・SUP-6）。
+    const PARENT_PID_ENV: &str = "FANDHE_CONTAINER_EXEC_PARENT_PID";
     /// 再実行した子が「CLI として走り始めた」ことを親へ伝える目印ファイルのパス（環境変数）。
     /// 親はこれが作られるまでの systemd-run 自身の stderr（D-Bus 接続失敗等の非 JSON の診断）を捨てる（ERR-1・ERR-2）。
     const START_FILE_ENV: &str = "FANDHE_CONTAINER_EXEC_START_FILE";
@@ -253,13 +259,63 @@ mod linux {
     /// 子の終了待ちの確認間隔。
     const WAIT_POLL: Duration = Duration::from_millis(20);
 
-    /// 委譲スコープ内の子が使う期限。環境変数が無い・壊れていれば `--timeout` のまま、あれば小さい方（延長はしない）。
+    /// `/proc/uptime` の本文（`"<稼働秒> <アイドル秒>"`）から稼働時間をミリ秒で取り出す。壊れていれば `None`。
+    /// 小数部は最大 2 桁（10ms 刻み）として扱い、それ以上は切り捨てる。
+    fn parse_uptime_ms(text: &str) -> Option<u64> {
+        let first = text.split_whitespace().next()?;
+        let (secs, frac) = first.split_once('.').unwrap_or((first, ""));
+        let secs: u64 = secs.parse().ok()?;
+        let mut ms_frac = 0u64;
+        for (i, ch) in frac.chars().take(3).enumerate() {
+            let digit = u64::from(ch.to_digit(10)?);
+            let scale = [100u64, 10, 1].get(i).copied()?;
+            ms_frac = ms_frac.checked_add(digit.checked_mul(scale)?)?;
+        }
+        secs.checked_mul(1000)?.checked_add(ms_frac)
+    }
+
+    /// 単調な現在時刻（ミリ秒。`/proc/uptime`＝`CLOCK_BOOTTIME`。壁時計の調整に影響されず、別プロセスと比較できる）。
+    fn monotonic_now_ms() -> Option<u64> {
+        parse_uptime_ms(&std::fs::read_to_string("/proc/uptime").ok()?)
+    }
+
+    /// 絶対期限 `deadline_ms` までの残り時間。過ぎていれば 1ms（0 にせず、内側の期限切れの経路で `Timeout` を返す）。
+    fn remaining_until(deadline_ms: u64, now_ms: u64) -> Duration {
+        Duration::from_millis(deadline_ms.saturating_sub(now_ms).max(1))
+    }
+
+    /// 委譲スコープ内の子が使う期限。絶対期限の環境変数が無い・壊れている・時計を読めないときは `--timeout` のまま、
+    /// 読めたときは実行開始時の残り時間と `--timeout` の小さい方（延長はしない）。
     fn scoped_timeout(requested: Duration) -> Duration {
-        std::env::var(REMAINING_MS_ENV)
+        let remaining = std::env::var(DEADLINE_MS_ENV)
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .map(|ms| requested.min(Duration::from_millis(ms).max(Duration::from_millis(1))))
-            .unwrap_or(requested)
+            .zip(monotonic_now_ms())
+            .map(|(deadline, now)| remaining_until(deadline, now));
+        remaining.map_or(requested, |r| requested.min(r))
+    }
+
+    /// 委譲スコープ内の子が、親 CLI の終了に追従して止まるようにする（親の SIGTERM・SIGHUP・SIGKILL を含む。#2626・SUP-6）。
+    /// `PR_SET_PDEATHSIG` を設定した後で実際の親が親 CLI であることを照合する（設定前に親が終わっていた競合を閉じる）。
+    /// 子の worker とコマンドは core が同じ設定を持つため、子が止まれば連鎖して止まる。設定できない・親が居ないときは
+    /// 実行せず失敗する（fail-closed。親へ中断が届かない実行を残さない）。
+    fn bind_to_parent_lifetime() -> Result<(), TraitError> {
+        let fail = || TraitError::new(ErrorCode::Unavailable, "the exec parent is gone");
+        crate::sys::set_parent_death_sigkill().map_err(|_| {
+            TraitError::new(
+                ErrorCode::Unavailable,
+                "failed to bind the exec to its parent process",
+            )
+        })?;
+        let expected: u32 = std::env::var(PARENT_PID_ENV)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(fail)?;
+        if std::os::unix::process::parent_id() == expected {
+            Ok(())
+        } else {
+            Err(fail())
+        }
     }
 
     /// 子が最後まで走ったことを示す目印を作る（`create_new` で既存・symlink を辿らない。失敗は親が wrapper 失敗と判断する）。
@@ -326,6 +382,7 @@ mod linux {
     /// 戻り値の後ろは「計測を子が行った」かどうか（起動前の失敗・wrapper の失敗・親の期限切れは親が計測する。REPAIR-4）。
     fn rerun_in_user_scope(timeout: Duration) -> (CliExit, bool) {
         let started = Instant::now();
+        let start_ms = monotonic_now_ms();
         let fail = |code: ErrorCode, msg: &str| (CliExit::Error(CliError::new(code, msg)), false);
         let euid = match effective_uid() {
             Ok(u) => u,
@@ -354,9 +411,14 @@ mod linux {
         cmd.env(RESULT_FILE_ENV, &marker);
         let start_marker = marker.with_extension("start");
         cmd.env(START_FILE_ENV, &start_marker);
-        // 起動前に使った時間を引き、子が内側の期限をそろえて数えられるようにする。
-        let remaining = timeout.saturating_sub(started.elapsed());
-        cmd.env(REMAINING_MS_ENV, remaining.as_millis().to_string());
+        // 絶対期限（親の開始時刻 + `--timeout`）を渡す。子は実行開始時に残りを算出するため、systemd-run の起動に
+        // かかった時間が自動的に差し引かれる。時計を読めなければ渡さず、子は `--timeout` のままになる。
+        if let Some(deadline) = start_ms
+            .and_then(|ms| ms.checked_add(u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)))
+        {
+            cmd.env(DEADLINE_MS_ENV, deadline.to_string());
+        }
+        cmd.env(PARENT_PID_ENV, std::process::id().to_string());
         cmd.stderr(std::process::Stdio::piped());
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -371,7 +433,19 @@ mod linux {
         match child.stderr.take() {
             Some(stderr) => {
                 let (path, flag) = (start_marker.clone(), std::sync::Arc::clone(&drained));
-                std::thread::spawn(move || forward_after_start(stderr, path, flag));
+                // 生成失敗は panic させず、起動済みの子を止めて回収してから構造化エラーにする（P0）。
+                let spawned = std::thread::Builder::new()
+                    .name("exec-stderr".into())
+                    .spawn(move || forward_after_start(stderr, path, flag));
+                if spawned.is_err() {
+                    let _ = kill_and_reap(&mut child);
+                    let _ = std::fs::remove_file(&marker);
+                    let _ = std::fs::remove_file(&start_marker);
+                    return fail(
+                        ErrorCode::Unavailable,
+                        "failed to start the stderr forwarder for the user scope command",
+                    );
+                }
             }
             None => drained.store(true, std::sync::atomic::Ordering::SeqCst),
         }
@@ -379,7 +453,7 @@ mod linux {
             .checked_add(timeout)
             .and_then(|d| d.checked_add(PARENT_GRACE))
             .unwrap_or(started);
-        let waited = loop {
+        let mut waited = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(Ok(status)),
                 Ok(None) if Instant::now() >= deadline => break None,
@@ -392,6 +466,15 @@ mod linux {
         while !drained.load(std::sync::atomic::Ordering::SeqCst) && Instant::now() < drain_deadline
         {
             std::thread::sleep(WAIT_POLL);
+        }
+        // 待機が期限切れと判定した後の drain 待機中に子が終了していることがある。終了していれば本当の終了状態を採用し、
+        // 親の timeout として捨てない（子が目印を書いて終わっていれば `ran` もその結果を反映する）。
+        if waited.is_none() {
+            match child.try_wait() {
+                Ok(Some(status)) => waited = Some(Ok(status)),
+                Ok(None) => {}
+                Err(e) => waited = Some(Err(e)),
+            }
         }
         let ran = marker.exists();
         let _ = std::fs::remove_file(&marker);
@@ -470,6 +553,10 @@ mod linux {
                 Ok(_) => {}
             }
             return rerun_in_user_scope(args.timeout);
+        }
+        // 親 CLI の終了に追従して止まる（親へ届いた中断を無視して最長 `--timeout` 走り続けない。#2626）。
+        if let Err(e) = bind_to_parent_lifetime() {
+            return (failure(&e), false);
         }
         let source = production_exec_pidfd_source(&store);
         let result = exec_in_container(

@@ -66,6 +66,28 @@ impl RootHandle {
         self.id
     }
 
+    /// root がストアのパスから切り離されて（unlink 済みで）いないことを fd の fstat で確かめる。
+    ///
+    /// 開いた fd は unlink 後も inode を指し続けるため、確定（rename・成功の返却）の直前に呼び、
+    /// 到達できないディレクトリへの永続化を成功と報告しない（OCI-7・SEC-1・#2696）。Linux の
+    /// ディレクトリは rmdir で `st_nlink` が 0 になる。移動（rename）では 0 にならず、fd 起点の実装は
+    /// 設計どおり移動後も検査済みの実体に書く。unix 以外はパス起点で、消えていれば操作自体が失敗するため
+    /// 何も検査しない（Windows は同等の確認を持たない）。
+    pub(crate) fn ensure_linked(&self) -> Result<(), OciError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let m = self.root_meta().map_err(|_| root_inaccessible())?;
+            if m.nlink() == 0 {
+                return Err(OciError::new(
+                    OciErrorCode::Internal,
+                    "image store root was removed",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// `p` が本ハンドルの root と同じディレクトリか（unix は dev / ino、他はパス比較）。
     pub(crate) fn matches(&self, p: &Path) -> bool {
         #[cfg(unix)]
@@ -633,5 +655,18 @@ mod tests {
         assert!(!h.matches(&r));
         let _ = std::fs::remove_dir_all(&r);
         let _ = std::fs::remove_dir_all(&moved);
+    }
+
+    /// OCI-7・SEC-1・#2696: root を rmdir した後は `ensure_linked` が `Internal` で拒否する（移動では拒否しない）。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_ensure_linked_rejects_removed_root() {
+        let r = temp_root("unlinked");
+        let h = RootHandle::open_unchecked(&r).expect("open");
+        h.ensure_linked().expect("linked");
+        std::fs::remove_dir_all(&r).expect("remove");
+        let e = h.ensure_linked().expect_err("removed");
+        assert_eq!(e.code(), OciErrorCode::Internal);
+        assert_eq!(e.message(), "image store root was removed");
     }
 }

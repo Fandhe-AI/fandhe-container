@@ -735,6 +735,8 @@ fn write_and_rename(root: &RootHandle, tmp: &str, bytes: &[u8]) -> Result<(), Oc
     f.sync_all()
         .map_err(|_| fail("failed to sync the image inventory temp file"))?;
     drop(f);
+    // 確定の直前に、root が unlink されて到達不能になっていないことを確かめる。
+    root.ensure_linked()?;
     root.rename(tmp, IMAGE_INVENTORY_FILE_NAME)
         .map_err(|_| fail("failed to replace the image inventory file"))?;
     // 新しい名前を永続化する（Windows ではディレクトリを開けないため `sync` は何もしない）。

@@ -35,15 +35,46 @@ Agent の推奨（決定ではない）: 案 A + 案 A'（現行維持）。既�
 - 拒否にすると oci の `sys` に新しい FFI と `unsafe` を足すことになり、core と同じくホスト配下の既定の deny ACL による制約（実機で未確認）も抱える
 - 再検討の契機: macOS ホストでローカルの `ImageStore` を開く本番経路を足すとき。core の `sys/macos.rs` の `has_extended_acl` と同じ形で root と祖先に入れる
 
-## 3. 論点 3: `lock` ごとの再検査（入れる）と `openat` 起点の検査（入れない）
+## 3. 論点 3: `lock` ごとの再検査と root の fd 起点の操作（#2638）
 
-- 入れた: `lock`（`recover_pending_deletion` を含む）と create ゲート（`enter_container_create` / `quiesce_container_creates`）の取得ごとに、`@lock` / ゲートファイルの作成より前に `reverify_root` で root の dev / ino・権限・所有者と祖先を再検査する。open 後の chmod・差し替えは fail-closed（`PermissionDenied` / `Internal`）。`unsafe` は増えない
-- 入れない: 永続化・GC・pull の各モジュール（`container_ref_persist`・`inventory_persist`・`gc_journal`・`pull`・`pull_recovery`・`usage`）が `self.root` からパスで組み立てて操作しており、fd 起点へ移すと全体に手が入る。`sys/at.rs`（`openat2`）は Linux の x86_64 / aarch64 限定で `layer::anchored` 専用、macOS に `RESOLVE_*` 相当が無い
-- 残る隙間: 再検査から使用までの差し替えは「root と祖先は所有者専用」の前提で防ぐ。所有者自身による差し替えは信頼境界の内側。fd 起点への移行は必要になったときのフォローアップ
+2 層で防ぐ。(a) 入口の検出: `lock`（`recover_pending_deletion` を含む）と create ゲート（`enter_container_create` / `quiesce_container_creates`）の取得ごとに、`@lock` / ゲートファイルの作成より前に `reverify_root` で root の dev / ino・権限・所有者と祖先を再検査し、open 後の chmod・差し替えを fail-closed（`PermissionDenied` / `Internal`）にする。(b) 区間内の閉じ込め: 検査済み root を `RootHandle`（`crates/oci/src/image_management/root_handle.rs`）が開いたまま持ち、排他区間の中の永続化操作を、その fd 起点の `openat2`（`RESOLVE_IN_ROOT | NO_SYMLINKS | NO_MAGICLINKS | NO_XDEV`・最後の要素も `O_NOFOLLOW`）と `*at` に閉じ込める。再検査の後に root が差し替えられても、書き込み・削除は検査済みの実体にだけ届き、差し替え後のディレクトリには何も書かず何も消さない。名前は定数か検証済みの hex の 1 コンポーネントに限る。
 
-## 4. 論点 4: libc 照合（しない）
+### 3-a. 棚卸し（#2638 時点）
 
-issue #1318 の決定は対象を 9 crate と列挙し oci を含まず、#1837 の子 issue にも oci は無い。oci へ libc の dev 依存を足すには新しいユーザー承認が要る（dependency-policy）ため、承認を得るまで照合しない。理由は `crates/oci/src/sys.rs` のモジュール doc にも書いた。承認後は `ffi-libc-check.md` の方式で `geteuid` の型と `sys/at.rs` の番号・フラグ・`OpenHow` を照合する。
+| 区分 | 操作 | 対象 | 扱い |
+| ---- | ---- | ---- | ---- |
+| ロック | `store::open_named_lock_file`（`lock`・create ゲート） | `@lock`・`@create-gate` | fd 起点へ移した |
+| 参照 | `container_ref_persist` の読み込み・保存・一時ファイル・rename・root の fsync | `@container-refs.json` | 移した |
+| 在庫 | `inventory_persist` の読み込み・保存 | `@image-inventory.json` | 移した |
+| ジャーナル | `gc_journal` の存在確認・読み・公開・削除・root の fsync | `@gc-pending.json`（墓標・一時ファイルを含む） | 移した |
+| 残骸回収 | `gc_journal::reap_stale_tmp` | root 直下の `*.tmp-*` | 移した（走査は新しい open file description で行う） |
+| blob の削除 | `gc_journal::remove_blob_durable`・`sweep_blobs`・`settle` の `blobs/sha256` の fsync、`remove` / `prune` の事前検査 | `blobs/sha256/<hex>` | 移した（`blobs/sha256` は root の fd から開き直す） |
+| 読み取りのみ | `usage*`（`blob_size`・`scan_cache`・`expanded`・`staging`） | `blobs/`・`staging/` | 移していない（#2695） |
+| pull | `pull::PullSession`・`pull_recovery` | `staging/<pull-id>/`・`blobs/sha256` | 移していない（#2694） |
+
+移していない根拠:
+
+- `usage*`: 読み取り専用で書き込みも削除もしない。差し替えの影響は表示する値の誤りにとどまり、root の外へは書き込まない。入口の再検査で差し替えは検出される。追跡は #2695
+- `pull` / `pull_recovery`: 公開 API が fetcher へパスを渡す形（`staged_blob_path` -> `RegistryClient::fetch_blob(dest: &Path)`）で、fd 起点にはその API と Windows の一時名による固定の設計を変える必要がある。本番の配線（cri の `image_pull` -> `PullSession`）も未実装（REPAIR-3）。staging の操作は `lock` の再検査の内側にあり、残る隙間は所有者自身による差し替え（信頼境界の内側）だけ。追跡は #2694
+
+### 3-b. `cfg` の局所化と OS ごとの扱い
+
+`cfg` は `root_handle.rs` の中だけに置き、永続化モジュールには `cfg(target_os)` / `cfg(target_arch)` を書かない。
+
+- Linux の x86_64 / aarch64: fd 起点（`sys::at` の `openat2`・`renameat`・`unlinkat`・`getdents64`）。`openat2`（Linux 5.6 以降）が使えない環境（`ENOSYS`・seccomp による `EPERM`）では `ImageStore::open` が `Unimplemented` で拒否し、パス起点へは縮退しない（fail-closed）。Linux 5.6 未満ではストアを開けなくなる
+- macOS: 本番経路が `ImageStore::open` に届かない（cli の `non_linux_failure`）。fd 起点の `openat` 系には macOS 用の定数・FFI・libc 照合が要り、足す根拠が無いため、パス起点＋入口の再検査の現行を保つ。再検討の契機は論点 2 と同じ
+- Windows: パス起点のまま。ACL の検査は #2428 の方式判断待ち
+- Linux の他アーキテクチャ: パス起点。`sys::at` の定数・番号を確かめていない
+
+### 3-c. 残る隙間
+
+- 読み取り専用の集計と pull がパス起点のまま（#2694・#2695）
+- fd を開いた後に、所有者自身が root を信頼できない場所へ移す操作は信頼境界の内側。入口の再検査で検出される
+- 試験: `root_swap_tests.rs`（Linux の x86_64 / aarch64。再検査の直後・区間内で root を差し替えても、参照・在庫・ジャーナル・blob の削除・残骸の回収が検査済みの root にだけ作用し、おとりが無傷であることを具体値で照合する）
+
+## 4. 論点 4: libc 照合（#2590 で導入済み）
+
+issue #1318 の決定は当初 oci を含まなかったが、#2590 のオーナーコメント（2026-10-23）で oci の dev 依存 `libc` が承認され、`geteuid` の型と `sys/at.rs` の番号・フラグ・`OpenHow`・関数の型を `ffi-libc-check.md` の方式で照合している。#2638 で足した `renameat` の宣言も同じ PR で `sys/at.rs` の `libc_abi` に照合を足した。
 
 ## 5. 未決事項（論点 1 の決定後に変える箇所）
 

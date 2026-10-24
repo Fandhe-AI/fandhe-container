@@ -256,6 +256,21 @@ pub fn covering_mount_fstype(mountinfo: &str, path: &Path) -> Option<String> {
     fields.get(sep + 1).map(|f| (*f).to_string())
 }
 
+/// `mountinfo` 上で `path`（正規化済みの絶対パス）を含むマウントの per-mount options（6 番目の欄。例 `rw,nosuid,nodev`）に
+/// `option` が完全一致のトークンとして含まれるかを返す。`-` の後ろの super options は見ない
+/// （`nosuid` はマウントごとのフラグのため）。
+///
+/// cli の `doctor` のランチャー診断が、ランチャーの実体が `nosuid` マウント上にあるか
+/// （setuid と file capability が効かないか）を調べるために呼ぶ（SUP-14・CORE-6・#2661）。
+/// 選び方は [`covering_mount_fstype`] と同じ（最長一致・同長は最上位）。該当マウントが無い・欄が欠けている・
+/// `-` 区切りが無い壊れた行は `None`（呼び出し側は判定不能として扱う。fail-closed）。OS 呼び出しを含まない純粋関数。
+pub fn covering_mount_has_option(mountinfo: &str, path: &Path, option: &str) -> Option<bool> {
+    let fields = covering_mount(mountinfo, path)?;
+    fields.iter().position(|f| *f == "-")?;
+    let opts = fields.get(5)?;
+    Some(opts.split(',').any(|t| t == option))
+}
+
 /// `mountinfo` の内容から `dir`（正規化済みの絶対パス）を含むマウントを探し、その伝播が `shared` なら
 /// 拒否する（OS 呼び出しを含まない純粋関数。単体テスト用に分離）。最長一致のマウントポイントを採り、
 /// 同長なら後の行（重ねマウントの最上位）を採る。見つからなければ拒否する（fail-closed）。
@@ -1190,6 +1205,36 @@ mod tests {
         // `-` 区切りの無い壊れた行は種別を返さない。
         assert_eq!(fs("/broken/a"), None);
         assert_eq!(covering_mount_fstype("", Path::new("/proc/sys/net")), None);
+    }
+
+    /// SUP-14・#2661: per-mount options のトークン完全一致（super options は見ない・境界・重ねマウント）。
+    #[test]
+    fn net10_sup14_covering_mount_has_option() {
+        let info = "\
+22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw,nosuid
+24 22 0:22 / /proc rw,nosuid,nodev - proc proc rw
+26 22 0:23 / /opt/fc rw,nosuid,relatime - tmpfs tmpfs rw
+27 22 0:24 / /opt/fcx rw,relatime - tmpfs tmpfs rw
+28 22 0:25 / /over rw,nosuid - tmpfs tmpfs rw
+29 22 0:26 / /over rw,relatime - tmpfs tmpfs rw
+30 22 0:27 / /sp\\040ace rw,nosuid - tmpfs tmpfs rw
+31 22 0:28 / /part rw,nosuidx - tmpfs tmpfs rw
+32 22 0:29 / /broken rw,nosuid
+";
+        let has = |p: &str| covering_mount_has_option(info, Path::new(p), "nosuid");
+        assert_eq!(has("/proc/sys"), Some(true));
+        // `/` の super options にだけ nosuid がある場合は false。
+        assert_eq!(has("/home/u/bin"), Some(false));
+        assert_eq!(has("/opt/fc/bin/x"), Some(true));
+        assert_eq!(has("/opt/fcx/bin/x"), Some(false));
+        assert_eq!(has("/over/a"), Some(false));
+        assert_eq!(has("/sp ace/a"), Some(true));
+        assert_eq!(has("/part/a"), Some(false));
+        assert_eq!(has("/broken/a"), None);
+        assert_eq!(
+            covering_mount_has_option("", Path::new("/x"), "nosuid"),
+            None
+        );
     }
 
     /// 8 進エスケープの復号。

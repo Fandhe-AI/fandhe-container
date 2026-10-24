@@ -1127,41 +1127,6 @@ jobs:
           done
           echo "::notice::runtime_service_namespaces verified"
 
-      # userns_extract（`crates/oci/tests/userns_extract.rs`。OCI-2・SEC-5・REPAIR-7・#2542）: rootless の user namespace 内での
-      # レイヤー展開（所有者・setuid・写像外 ID の拒否）を `unshare --user --map-root-user` の単一行写像で照合する実機前提
-      # テスト（harness = false）。非 root・上で緩和した AppArmor の sysctl・util-linux の `unshare` だけが前提で、
-      # 後段の subuid 前提確認ステップには依存しない。新しい check-run・sudo・permissions は追加しない。
-      # `--ignored` が届かなくても exit 0 になるため、成功行を行単位の完全一致で照合し、`ignored` 行の出現は失敗にする。
-      # `newuidmap` による範囲写像のケースは試験に未実装で、後続の実装と実機確認は #1621 で追跡する。
-      - name: userns_extract のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
-        timeout-minutes: 10
-        run: cargo test -p fandhe-container-oci --test userns_extract --no-run
-
-      - name: userns_extract の実行（実機前提テスト・--ignored。OCI-2・SEC-5・#2542）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
-        timeout-minutes: 5
-        run: |
-          set -euo pipefail
-          log="${RUNNER_TEMP}/userns_extract.log"
-          cargo test -p fandhe-container-oci --test userns_extract -- --ignored 2>&1 | tee "${log}"
-          if grep -Fq 'userns_extract: ignored' "${log}"; then
-            echo "::error::userns_extract was skipped (--ignored did not reach the test)" >&2
-            exit 1
-          fi
-          for line in \
-            'ok: extract_ok' \
-            'ok: outside_map' \
-            'ok: map_mismatch' \
-            'test userns_extract ... ok'; do
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::userns_extract did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          echo "::notice::userns_extract verified"
-
       # production_launcher・rootless_file_owner・rootless_image_rootfs_remove・seccomp（`crates/core/tests/`。CORE-1・CORE-5・CORE-6・SEC-1・
       # SEC-4・SEC-5・#2376）と、rootless_launch・rootless・rootless_uid_mapping（core）・supervisor_bin_real（supervisor）・
       # start_stop_delete_real（cli）（CORE-6・SUP-4・REPAIR-7・#2596。前提は同じ。Landlock ABI 6 以上と user manager の
@@ -1199,6 +1164,46 @@ jobs:
             echo "systemd user manager private socket: present"
             echo "Landlock ABI: ${abi}"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # userns_extract（`crates/oci/tests/userns_extract.rs`。OCI-2・SEC-5・CORE-6・REPAIR-7・#2542・#2642）: rootless の
+      # user namespace 内でのレイヤー展開（所有者・setuid・写像外 ID の拒否）を照合する実機前提テスト（harness = false）。
+      # 単一行写像（`unshare --user --map-root-user`）に加え、`newuidmap` / `newgidmap` の範囲写像（subuid / subgid）のケース
+      # （`subordinate_*`）を含む。範囲写像は上の前提確認ステップ（uidmap・subuid / subgid の行）に依存するため、その後に置く。
+      # 試験は `USER`（subuid の所有者名）を使うので渡す。新しい check-run・sudo・permissions は追加しない。
+      # `--ignored` が届かなくても exit 0 になるため、成功行を行単位の完全一致で照合し、`ignored` 行の出現は失敗にする。
+      # root で走る分岐は CI では回さない（実機確認は #1621）。
+      - name: userns_extract のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-oci --test userns_extract --no-run
+
+      - name: userns_extract の実行（実機前提テスト・--ignored。OCI-2・SEC-5・#2542・#2642）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/userns_extract.log"
+          USER="$(id -un)" cargo test -p fandhe-container-oci --test userns_extract -- --ignored 2>&1 | tee "${log}"
+          if grep -Fq 'userns_extract: ignored' "${log}"; then
+            echo "::error::userns_extract was skipped (--ignored did not reach the test)" >&2
+            exit 1
+          fi
+          for line in \
+            'ok: extract_ok' \
+            'ok: outside_map' \
+            'ok: map_mismatch' \
+            'ok: subordinate_extract_ok' \
+            'ok: subordinate_outside_map' \
+            'ok: subordinate_map_mismatch' \
+            'ok: subordinate_cleanup' \
+            'test userns_extract ... ok'; do
+            if ! grep -Fxq "${line}" "${log}"; then
+              echo "::error::userns_extract did not report: ${line} (possibly not executed)" >&2
+              exit 1
+            fi
+            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "::notice::userns_extract verified"
 
       - name: production_launcher のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'

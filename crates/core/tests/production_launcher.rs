@@ -1144,7 +1144,7 @@ mod linux {
         let bundle = Bundle::new("s");
         let ld = make_rootfs(&bundle.rootfs(), true);
         write_config(&bundle, &ld, &["--with-launch-options"], json!([]));
-        let id = ContainerId::new(format!("pls{tag}")).expect("id");
+        let id = ContainerId::new(format!("plt{tag}")).expect("id");
         do_create(env, &bundle, &id);
 
         wait_single_thread();

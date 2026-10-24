@@ -73,6 +73,27 @@ on:
         description: 繰り返す lib 試験の完全名（例 start_entry::tests::sup_repair5_2008_full_queue_does_not_block）
         type: string
         default: ''
+      repeat-test-bin:
+        description: >-
+          繰り返す harness = false の結合試験の名前（[[test]] の name。例 exec_seccomp_listener）。
+          repeat-test と排他で、repeat-success-line が必須（REPAIR-12・#2660）
+        type: string
+        default: ''
+      repeat-success-line:
+        description: >-
+          repeat-test-bin の成功行（行全体の完全一致。例 exec_seccomp_listener: all scenarios passed）
+        type: string
+        default: ''
+      repeat-test-ignored:
+        description: true にすると repeat-test-bin を -- --ignored 付きで実行する
+        type: boolean
+        default: false
+      repeat-linux-only:
+        description: >-
+          true にすると繰り返しのステップを Linux だけで実行する（非 Linux で not applicable になる
+          試験用。既定 false は 3 OS）
+        type: boolean
+        default: false
       repeat-count:
         description: 繰り返し回数（1〜1000）
         type: string
@@ -481,15 +502,23 @@ jobs:
         shell: bash
         timeout-minutes: 10
         run: make doc
-      # 指定した lib 試験の繰り返し（workflow_dispatch の repeat-* 入力があるときだけ。REPAIR-12・#2538）。
+      # 指定した試験の繰り返し（workflow_dispatch の repeat-* 入力があるときだけ。REPAIR-12・#2538・#2660）。
+      # repeat-test は lib 試験、repeat-test-bin + repeat-success-line は harness = false の結合試験。
+      # repeat-linux-only=true のときは Linux だけで回す（非 Linux で not applicable になる試験用）。
       # 入力は env 経由で渡し、run 内で式を展開しない（スクリプトインジェクション対策）。既存ジョブのステップ
       - name: 指定した試験の繰り返し（workflow_dispatch のみ）
-        if: github.event_name == 'workflow_dispatch' && inputs.repeat-test != ''
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          (inputs.repeat-test != '' || inputs.repeat-test-bin != '') &&
+          (!inputs.repeat-linux-only || runner.os == 'Linux')
         shell: bash
         timeout-minutes: 30
         env:
           PACKAGE: ${{ inputs.repeat-package }}
           TEST: ${{ inputs.repeat-test }}
+          TEST_BIN: ${{ inputs.repeat-test-bin }}
+          SUCCESS_LINE: ${{ inputs.repeat-success-line }}
+          TEST_IGNORED: ${{ inputs.repeat-test-ignored && '1' || '' }}
           COUNT: ${{ inputs.repeat-count }}
         run: make repeat-test
       # core の plugin 無効構成（--no-default-features）の検証（PLUG-3・TASK-111.1・#262）。

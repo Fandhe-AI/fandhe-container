@@ -804,7 +804,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&r);
     }
 
-    /// 形式の検証: 名前の禁止文字・長さ・`:` 過多は解決対象にしない。
+    /// passwd 側の名前長の上限が CRI の変換側の上限と一致することを固定する。
     #[test]
     fn cri2_username_limit_matches_spec() {
         assert_eq!(MAX_NAME_BYTES, super::super::spec::MAX_USERNAME_BYTES);
@@ -863,6 +863,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&r);
     }
 
+    /// 形式の検証: 名前の禁止文字・長さ・`:` 過多は解決対象にしない。
     #[test]
     fn cri2_user_lookup_parse_rejects_malformed() {
         assert!(parse_user_lookup("a:b:c").is_none());

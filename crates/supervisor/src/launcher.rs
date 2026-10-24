@@ -40,7 +40,7 @@
 //! - 理由: ランチャーは fork せずに `setsid` してから supervisor を exec するため、supervisor は生涯セッションリーダーで
 //!   制御端末を持たない。Linux ではこの状態で `O_NOCTTY` なしに端末を開くとそれが制御端末になり、`TIOCSTI` による
 //!   入力注入や hangup 時の SIGHUP の波及という、#537 で断った経路が再発する
-//! - 対象になりうる将来の箇所: tty 対応（attach 等）・healthcheck の exec（#495）・ログや env ファイル等の外部指定パスの open
+//! - 対象になりうる将来の箇所: tty 対応（attach 等）・healthcheck の exec（#2441）・ログや env ファイル等の外部指定パスの open
 //! - 先例: core の `exec/process.rs`（setsid 後の fd の開き直し）と core の `sys.rs` の `O_NOCTTY`
 //! - 現状の担保: 外部指定パスを開く 2 つのヘルパー（`container_options::env::open_nonblocking`・
 //!   `logs::rotating::open_read_nofollow_nonblocking`）が `O_NOCTTY` を付け、単体テストでフラグを照合する。
@@ -62,8 +62,8 @@
 //!   （PLUG-11 との整合は設計書 12 章に未確認として残す）
 //! - ambient capability は exec 後の子孫へ引き継がれる。子で落とす箇所は 2 つ: (1) コンテナの子は core の制限段
 //!   （`fandhe_container_core::exec` の capability 段。ambient を全消去してから bounding / capset）。(2) supervisor の
-//!   healthcheck コマンド実行は未実装（TASK-161.2・#495）で、実装時に子で ambient を落としてから exec する要件を
-//!   #495 へ記録する（設計書 5 章 5・10 章）。取りこぼしがないことの確認は実機検証（#538・#539。人間担当）
+//!   healthcheck コマンド実行は未実装（TASK-161.2・#2441）で、実装時に子で ambient を落としてから exec する要件を
+//!   #2441 へ記録する（設計書 5 章 5・10 章）。取りこぼしがないことの確認は実機検証（#538・#539。人間担当）
 //! - setcap / setuid の付与（`scripts/install-privileged-launcher.sh`。#1721 で実装済み）・CLI `setup` の表示（#1722）
 //!   （`setsid` と pty 非経由の確認〔#537〕は実装済み。実機での確認は #539）
 

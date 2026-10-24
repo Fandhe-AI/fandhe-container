@@ -486,7 +486,7 @@ pub fn record_exec_worker_rejection<E>(
 /// launch 経路の pivot 前段で子が失敗した理由を、親が `Mount` 監査レコードとして 1 件記録して返す
 /// （SEC-4・CORE-1・TASK-29 追補・#1815）。
 ///
-/// 呼び出し元は、子が状態 pipe で運んだ失敗を復号した親プロセス（`launch_status` の判定。将来は本番 launcher）。
+/// 呼び出し元は、子が状態 pipe で運んだ失敗を復号した親プロセス（`launch_status` の判定。本番 launcher〔`ProductionLauncher`〕が `spawn_container_via_intermediate` を通して呼ぶ。#1816）。
 /// `reason` は `ViolationReason::from_launch_token` で引き直した値を渡す。種別 `mount_target`・
 /// `shared_propagation`・`rootfs_pivot` と、bind mount の段の user namespace 由来の 2 理由
 /// （`user_namespace_required`・`host_root_identity_mapping`。SEC-5・#2072）だけが、層 `mount` の
@@ -516,7 +516,7 @@ pub fn record_launch_mount_rejection<E>(
 /// システムエラー）は `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
 /// `ExecError` を直接扱う launch 側の入口で、理由コードだけを持つ supervisor の親プロセスは
 /// [`record_entrypoint_rejection`] を使う。launch 経路（`spawn_container` の子・launcher）への配線は
-/// 未実装（#1314。TASK-29 / TASK-157 系。REPAIR-3）。
+/// 未実装（担当 #2624。TASK-29 / TASK-157 系。REPAIR-3）。
 ///
 /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
 /// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った

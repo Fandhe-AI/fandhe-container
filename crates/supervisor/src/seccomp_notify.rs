@@ -36,7 +36,7 @@
 //! 起動した後に記録に失敗した分の `unrecorded` の集計とログまで。exec 経路（SUP-6）の
 //! listener 受け渡しは #2385、応答者は #2544 で実装済み（下の [`ExecResponder`]。exec の親が単一スレッドで同期に応答する。
 //! 方式の判断と残余は `audit-delivery.md` 9.4）。ハブ（本モジュールの [`SeccompNotifyHub`]）への exec の listener の
-//! 2 段目の受け渡しは未実装（供給元の複数化と exec の本番配線〔#492・#495・#1314〕の後）。restart の再 launch を本番で成り立たせること自体は #2043（本モジュールの差し替えは
+//! 2 段目の受け渡しは未実装（供給元の複数化と exec の本番配線〔healthcheck #2441・CLI の exec #2626〕の後）。restart の再 launch を本番で成り立たせること自体は #2043（本モジュールの差し替えは
 //! 偽の launcher でだけ試している）。
 
 use std::collections::VecDeque;

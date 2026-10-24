@@ -21,7 +21,7 @@
 //!   `SetupFailed` は supervisor の `run_command*` が親側で 1 拒否 1 件を記録する。パスは持たない
 //!   （型で保証）。記録の PID と時刻は記録を行った親プロセスのもので、時刻は拒否から最大で exec の
 //!   上限時間ぶん遅れ得る。ワイヤー形式には安定値 `entrypoint` が `layer` に増える（既存の層の行は不変。
-//!   `reason` を持つ層は plugin_trust・exec_target・entrypoint の 3 つ）。launch 経路の本番配線は #1314
+//!   `reason` を持つ層は plugin_trust・exec_target・entrypoint の 3 つ）。launch 経路（本番 launcher の子）の entrypoint 違反の記録は未配線（担当 #2624。REPAIR-3）
 //! - TASK-41.3（#194）の Landlock フックは [`landlock_denial_record`] で実装済み（プロセス内で観測した
 //!   `EACCES` の写像まで。ワークロードの拒否のカーネル側監査〔Linux 6.15+ の `AUDIT_LANDLOCK_*`〕による
 //!   捕捉は未実装）
@@ -31,7 +31,7 @@
 //!   通知は発生しない既定の launcher では、フックは呼ばれない。supervisor の start 経路は
 //!   `ProductionLauncherBuilder::seccomp_errno_delivery(UserNotif)` で ERRNO 側を USER_NOTIF にし、listener ループ
 //!   〔`fandhe-container-supervisor::seccomp_notify`。#2025〕が `record_seccomp_denial_for` で記録してから `-EPERM` で応答する。
-//!   exec 経路〔SUP-6〕の listener 受け渡しは #2385 で実装済みで、USER_NOTIF 化は後続。KILL 側の正の記録はカーネルの
+//!   exec 経路〔SUP-6〕も #2544 で USER_NOTIF になり、exec の親が listener に応答して記録する（`docs/design/audit-delivery.md` 9.4）。KILL 側の正の記録はカーネルの
 //!   `AUDIT_SECCOMP`、親の回収点が出す `exit_signal` 層の補助記録は [`AuditEvent::ExitSignal`]〔#2004〕）・41.4（#195 マウント検証/API。
 //!   `exec::IsolationViolation` からの写像もここで扱う）が、違反検知時に [`AuditRecord`] を組み立てる
 //! - ローカルファイルへの JSON Lines 書き込み（主経路）は `file_writer` で実装済み（TASK-41.5.1・#839）。

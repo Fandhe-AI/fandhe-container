@@ -126,7 +126,7 @@
 //!   `tests/default_devices.rs`（人間担当・`-- --ignored`）が担う
 //! - `/dev/console` は端末機能の親 issue で別途設計する（設計ドラフト 3.5）。`process.terminal: true` も
 //!   従来どおり拒否のまま
-//! - `spawn_container` の最小フローへの本関数の配線（#1314）
+//! - 最小入口 `spawn_container` への本関数の配線（本番の launch 経路は本番 launcher の `PrePivotSetup.devices` から結線済み。#1816。最小入口は呼ばず、配線を追う issue は無い）
 //!
 //! # 単体テストの安全策
 //!
@@ -261,7 +261,7 @@ const DEVPTS_GID: u32 = sys::DevptsGid::TTY_GID;
 /// `Rootful` は基本デバイスを `mknodat(2)` で作り、`Rootless` はホストのノードを bind で供給する
 /// （`DeviceSupply`。#1660）。`mknod` の `EPERM` を見て経路を切り替える方式にはせず、この申告で明示的に決める。
 ///
-/// 呼び出し元（#1314 で配線する `oci_runtime` / fork 段）が、すでに検証済みの写像を渡す。子（PID 1）側で
+/// 呼び出し元（本番 launcher〔`oci_runtime::launcher`〕。rootless は検証済みの写像から `Rootless(gid_map)` を渡す。`Rootful` を本番で使うかは #2241 の判断待ちで、launcher は `RootfulHostRoot` を `Unimplemented` で拒否する）が、すでに検証済みの写像を渡す。子（PID 1）側で
 /// `/proc/self/gid_map` を独自に解析し直さない。申告が実態とずれた場合も緩む方向には働かない:
 /// rootless で `Rootful` を渡すと `gid=5` が写像されずカーネルが `EINVAL` で拒否し（fail-closed）、
 /// rootful で `Rootless` を渡すと `gid=` が付かないだけで権限は広がらない。

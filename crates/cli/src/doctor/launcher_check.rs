@@ -13,6 +13,10 @@
 //!
 //! # 構成
 //! - 事実の収集（[`collect`]。Linux のみ）と評価（[`evaluate`]。純粋関数で全 OS で単体テストできる）を分ける。
+//! - 昇格手段の判定の後に、ランチャーの実体（正規化済みパス）が `nosuid` のマウント上にあるかを mountinfo の
+//!   per-mount options で調べる（[`apply_mount`]。#2661）。`nosuid` なら setuid も file capability も効かない
+//!   ため、昇格手段が正しくても `nosuid_mount` の警告にする。mountinfo を読めない・該当マウントが無いときは、
+//!   `start` が通るはずの状態を Ok と断定せず判定不能にする（fail-closed）。
 //! - 出力は `user_scope_check` と同じ JSON Lines（`severity`・`code`・`message`・`remediation`・`check`・`state`）で、
 //!   `check` は常に `launcher`。パス・uid・mode・errno・capability の生の値は載せない（REPAIR-4）。
 //! - 終了ステータス: Warning があれば 3、そうでなく判定不能があれば 4、それ以外は 0。rootless のインストール
@@ -21,7 +25,10 @@
 //! # 未実装・範囲外（REPAIR-3。実装済みを装わない）
 //! - ランチャー・supervisor の hash / 署名の照合は扱わない（`docs/design/privilege-separation.md` 12 章の未確認事項。
 //!   #2599 の受け入れ条件 3）。
-//! - `nosuid` マウント上のランチャー（setuid と file capability が効かない）・LSM 下の挙動は検出しない。
+//! - LSM 下の挙動は検出しない。
+//! - `nosuid` の検出は doctor 自身の mount namespace から見た `/proc/self/mountinfo` だけを根拠にする。`start` が
+//!   systemd-run 経由で起動する実行環境の mount namespace とは食い違いうる。superblock の所有 user namespace が
+//!   init でないために `mnt_may_suid` が偽になる場合も検出しない。
 //! - 診断と `start` の実行の間の差し替え（TOCTOU）は防げない。昇格の可否は実行時にランチャーが検証する（fail-closed）。
 
 use super::DoctorSeverity;
@@ -83,8 +90,41 @@ pub enum Elevation {
     Malformed,
     /// 昇格手段が無い。
     NoElevation,
+    /// 実体が `nosuid` マウント上にあり、setuid も file capability も効かない（#2661）。
+    NosuidMount,
+    /// 実体のマウント属性を確認できない（#2661）。
+    MountUnknown,
     /// 読み取りに失敗した。
     Unreadable,
+}
+
+/// ランチャーの実体が載るマウントの `nosuid` 属性の確認結果（#2661）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LauncherMount {
+    /// `nosuid` ではない。
+    Allowed,
+    /// `nosuid` のマウント上にある。
+    Nosuid,
+    /// 確認できなかった（mountinfo を読めない・上限超過・該当マウント無し・壊れた行）。
+    Unknown,
+}
+
+/// 昇格手段の判定にマウント属性を重ねる純粋関数（SUP-14・CORE-6・#2661）。
+///
+/// `Nosuid` は常に `NosuidMount`（setuid も file capability も効かないため）。`Unknown` は `start` が通るはずの状態
+/// （`FileCapabilities`・`SetuidRoot`・`Excess`）だけを `MountUnknown` に置き換え、既に不備を示す警告・読み取り失敗は
+/// そのまま残す。`Allowed` は何も変えない。
+pub fn apply_mount(mount: LauncherMount, e: Elevation) -> Elevation {
+    match mount {
+        LauncherMount::Allowed => e,
+        LauncherMount::Nosuid => Elevation::NosuidMount,
+        LauncherMount::Unknown => match e {
+            Elevation::FileCapabilities | Elevation::SetuidRoot | Elevation::Excess => {
+                Elevation::MountUnknown
+            }
+            other => other,
+        },
+    }
 }
 
 /// ランチャーの状態。
@@ -267,6 +307,23 @@ fn evaluate_elevation(e: Elevation) -> UserScopeReport {
             "malformed",
             "the privileged launcher file capabilities are malformed",
         ),
+        Elevation::NosuidMount => report(diag(
+            Warning,
+            "LAUNCHER_ELEVATION_UNAVAILABLE",
+            "the privileged launcher is on a filesystem mounted nosuid; setuid and file capabilities have no effect there and start cannot elevate",
+            vec![
+                "Install the cli, supervisor and launcher into a directory on a filesystem mounted without nosuid",
+                REINSTALL,
+            ],
+            "nosuid_mount",
+        )),
+        Elevation::MountUnknown => report(diag(
+            Notice,
+            "LAUNCHER_ELEVATION_INCONCLUSIVE",
+            "the mount options of the filesystem that holds the privileged launcher could not be read",
+            vec!["Check that /proc is mounted and /proc/self/mountinfo is readable"],
+            "mount_unreadable",
+        )),
         Elevation::Unreadable => report(diag(
             Notice,
             "LAUNCHER_ELEVATION_INCONCLUSIVE",
@@ -274,6 +331,23 @@ fn evaluate_elevation(e: Elevation) -> UserScopeReport {
             vec!["Check the filesystem that holds the launcher supports extended attributes"],
             "xattr_unreadable",
         )),
+    }
+}
+
+/// mountinfo の内容と実体パスから `nosuid` 属性を判定する純粋関数（Linux のみ。#2661）。
+/// 読めていない（`None`）・絶対パスでない・該当マウントが無い・壊れた行は `Unknown`（fail-closed）。
+#[cfg(target_os = "linux")]
+fn launcher_mount_state(mountinfo: Option<&str>, path: &std::path::Path) -> LauncherMount {
+    let Some(info) = mountinfo else {
+        return LauncherMount::Unknown;
+    };
+    if !path.is_absolute() {
+        return LauncherMount::Unknown;
+    }
+    match fandhe_container_net::netns::covering_mount_has_option(info, path, "nosuid") {
+        Some(true) => LauncherMount::Nosuid,
+        Some(false) => LauncherMount::Allowed,
+        None => LauncherMount::Unknown,
     }
 }
 
@@ -323,7 +397,14 @@ pub fn collect() -> LauncherFindings {
         }),
         LauncherPresence::Trusted(t) => {
             let xattr = read_launcher_file_caps(&t.path);
-            LauncherState::Trusted(match assess_elevation(t.owner_uid, t.mode, &xattr) {
+            // `/proc/self/mountinfo` は外部入力として上限つきで読む（超過・失敗は判定不能）。
+            let mountinfo = super::read_limited(
+                std::path::Path::new("/proc/self/mountinfo"),
+                super::MAX_MOUNTINFO_READ,
+            )
+            .ok();
+            let mount = launcher_mount_state(mountinfo.as_deref(), &t.path);
+            let elevation = match assess_elevation(t.owner_uid, t.mode, &xattr) {
                 ElevationAssessment::SetuidRoot => Elevation::SetuidRoot,
                 ElevationAssessment::SetuidRootRestrictedByFileCaps => {
                     Elevation::SetuidRootRestricted
@@ -336,7 +417,8 @@ pub fn collect() -> LauncherFindings {
                 ElevationAssessment::FileCapabilitiesMalformed => Elevation::Malformed,
                 ElevationAssessment::NoElevation => Elevation::NoElevation,
                 _ => Elevation::Unreadable,
-            })
+            };
+            LauncherState::Trusted(apply_mount(mount, elevation))
         }
     })
 }
@@ -472,6 +554,20 @@ mod tests {
                 S::Warning,
             ),
             (
+                Elevation::NosuidMount,
+                "warning",
+                "LAUNCHER_ELEVATION_UNAVAILABLE",
+                "nosuid_mount",
+                S::Warning,
+            ),
+            (
+                Elevation::MountUnknown,
+                "notice",
+                "LAUNCHER_ELEVATION_INCONCLUSIVE",
+                "mount_unreadable",
+                S::Inconclusive,
+            ),
+            (
                 Elevation::Unreadable,
                 "notice",
                 "LAUNCHER_ELEVATION_INCONCLUSIVE",
@@ -490,6 +586,76 @@ mod tests {
             );
             assert_eq!(st, status, "{e:?}");
         }
+    }
+
+    /// SUP-14・#2661: nosuid マウントは警告（3）で JSON 1 行の完全一致。
+    #[test]
+    fn sup14_nosuid_mount_is_warning() {
+        let (out, st) = one(LauncherState::Trusted(Elevation::NosuidMount));
+        assert_eq!(
+            out,
+            "{\"severity\":\"warning\",\"code\":\"LAUNCHER_ELEVATION_UNAVAILABLE\",\"message\":\"the privileged launcher is on a filesystem mounted nosuid; setuid and file capabilities have no effect there and start cannot elevate\",\"remediation\":[\"Install the cli, supervisor and launcher into a directory on a filesystem mounted without nosuid\",\"Reinstall with scripts/install-privileged-launcher.sh as root; it sets the file capabilities and verifies them\"],\"check\":\"launcher\",\"state\":\"nosuid_mount\"}\n"
+        );
+        assert_eq!(st, DoctorExitStatus::Warning);
+    }
+
+    /// SUP-14・#2661: マウント属性が読めないときは判定不能（4）で JSON 1 行の完全一致。
+    #[test]
+    fn sup14_mount_unknown_is_inconclusive() {
+        let (out, st) = one(LauncherState::Trusted(Elevation::MountUnknown));
+        assert_eq!(
+            out,
+            "{\"severity\":\"notice\",\"code\":\"LAUNCHER_ELEVATION_INCONCLUSIVE\",\"message\":\"the mount options of the filesystem that holds the privileged launcher could not be read\",\"remediation\":[\"Check that /proc is mounted and /proc/self/mountinfo is readable\"],\"check\":\"launcher\",\"state\":\"mount_unreadable\"}\n"
+        );
+        assert_eq!(st, DoctorExitStatus::Inconclusive);
+    }
+
+    /// SUP-14・#2661: `apply_mount` の全組み合わせ。
+    #[test]
+    fn sup14_apply_mount_table() {
+        use Elevation as E;
+        use LauncherMount as M;
+        let all = [
+            E::SetuidRoot,
+            E::SetuidRootRestricted,
+            E::FileCapabilities,
+            E::Excess,
+            E::Insufficient,
+            E::NotEffective,
+            E::Namespaced,
+            E::Malformed,
+            E::NoElevation,
+            E::NosuidMount,
+            E::MountUnknown,
+            E::Unreadable,
+        ];
+        for e in all {
+            assert_eq!(apply_mount(M::Allowed, e), e, "{e:?}");
+            assert_eq!(apply_mount(M::Nosuid, e), E::NosuidMount, "{e:?}");
+            let expected = match e {
+                E::FileCapabilities | E::SetuidRoot | E::Excess => E::MountUnknown,
+                other => other,
+            };
+            assert_eq!(apply_mount(M::Unknown, e), expected, "{e:?}");
+        }
+    }
+
+    /// SUP-14・#2661: mountinfo の fixture からの nosuid 判定。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup14_launcher_mount_state_from_fixture() {
+        use std::path::Path;
+        let info = "\
+22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+26 22 0:23 / /opt/fc rw,nosuid,relatime - tmpfs tmpfs rw
+";
+        let l = "fandhe-container-launcher";
+        let st = |i: Option<&str>, p: &str| launcher_mount_state(i, &Path::new(p).join(l));
+        assert_eq!(st(Some(info), "/opt/fc/bin"), LauncherMount::Nosuid);
+        assert_eq!(st(Some(info), "/usr/local/bin"), LauncherMount::Allowed);
+        assert_eq!(st(None, "/opt/fc/bin"), LauncherMount::Unknown);
+        assert_eq!(st(Some(""), "/opt/fc/bin"), LauncherMount::Unknown);
+        assert_eq!(st(Some(info), "rel/bin"), LauncherMount::Unknown);
     }
 
     /// SUP-14・#2599: rootful・読めない・対象外・exe 解決不可の扱い。

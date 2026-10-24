@@ -803,7 +803,10 @@ fn release_claim(
 
 /// bundle の `config.json` を一度だけ読んで検証し、start が適用できない指定を拒否したうえで、rootfs を
 /// fd で固定して [`LaunchSpec`] を組み立てる（`config.json` は読み直さない）。
-#[cfg(test)]
+///
+/// 呼び出し元の試験がすべて Linux 限定のため、定義も同じ cfg に揃える（非 Linux の lib test で
+/// dead_code になるのを避ける。CORE-3・SUP-14）。
+#[cfg(all(test, target_os = "linux"))]
 fn build_spec(
     bundle: &Path,
     id: &ContainerId,

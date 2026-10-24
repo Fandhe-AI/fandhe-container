@@ -11,32 +11,39 @@
 //!
 //! # 範囲外（実装済みを装わない。REPAIR-3）
 //! - ランチャー・supervisor の hash / 署名の照合（`docs/design/privilege-separation.md` 12 章の未確認事項のまま。PLUG-11）
-//! - `nosuid` マウント上のランチャーの検出（setuid と file capability が効かない。ランチャーが実行時に fail-closed で拒否する）
+//! - `nosuid` マウント上のランチャーの検出は本モジュールでは行わない（setuid と file capability が効かない。
+//!   cli の `doctor` の `launcher_check` が mountinfo で検出し、最終的にはランチャーが実行時に fail-closed で拒否する。#2661）
+//! - v1（12 バイト）の `security.capability`。カーネルは受け付けるが、`setcap` が書くのは v2 / v3 で期待集合は
+//!   32 bit に収まるため `Malformed` として扱う
 //! - LSM（AppArmor 等）下の挙動
 //! - 診断と `start` の実行の間の差し替え（TOCTOU）。診断にすぎず、昇格の可否は実行時にランチャーの
 //!   `privilege::elevate` が検証する
 //!
 //! # 値の出典
-//! `security.capability` の配置はカーネルの `include/uapi/linux/capability.h`（`VFS_CAP_*`）による。
+//! `security.capability` の配置はカーネルの `include/uapi/linux/capability.h`（`VFS_CAP_*`・`XATTR_CAPS_SZ_*`）による。
+//! 下の定数は torvalds/linux のタグ v6.12 の原文と 2026-10-24 に照合した（`security/commoncap.c` の
+//! `get_vfs_caps_from_disk` がリビジョンごとに `XATTR_CAPS_SZ_2` / `_3` との完全一致を要求することも同じ版で確認）。
+//! `libc` 0.2.189 には `VFS_CAP_*`・`XATTR_CAPS_SZ*` の対応物が無いため、`libc` との機械照合（#1840）では覆えず、
+//! 試験 `sup14_vfs_cap_constants_match_kernel_uapi` で原文の値と照合する（#2661）。
 //! `magic_etc`（LE u32）= リビジョン（上位 8 bit）| フラグ（下位 24 bit。bit 0 が effective）、続いて
 //! `{permitted, inheritable}`（LE u32）の組が 2 組（v2 は計 20 バイト）、v3 はさらに `rootid`（LE u32。計 24 バイト）。
 
 use crate::privilege::launcher_file_capability_mask;
 use fandhe_container_core::capabilities::Capability;
 
-/// `magic_etc` のリビジョン部のマスク。
+/// `magic_etc` のリビジョン部のマスク。カーネル原文の `VFS_CAP_REVISION_MASK`（v6.12・`capability.h`）。
 const VFS_CAP_REVISION_MASK: u32 = 0xFF00_0000;
-/// `magic_etc` の effective フラグ。
+/// `magic_etc` の effective フラグ。カーネル原文の `VFS_CAP_FLAGS_EFFECTIVE`（v6.12・`capability.h`）。
 const VFS_CAP_FLAGS_EFFECTIVE: u32 = 0x0000_0001;
-/// 64 bit 形式（2 語）の最初のリビジョン。20 バイト。
+/// 64 bit 形式（2 語）の最初のリビジョン。20 バイト。カーネル原文の `VFS_CAP_REVISION_2`（v6.12・`capability.h`）。
 const VFS_CAP_REVISION_2: u32 = 0x0200_0000;
-/// v2 に `rootid` を足したリビジョン。24 バイト。
+/// v2 に `rootid` を足したリビジョン。24 バイト。カーネル原文の `VFS_CAP_REVISION_3`（v6.12・`capability.h`）。
 const VFS_CAP_REVISION_3: u32 = 0x0300_0000;
-/// v2 の大きさ。
-const VFS_CAP_LEN_V2: usize = 20;
-/// v3 の大きさ。
-const VFS_CAP_LEN_V3: usize = 24;
-/// setuid ビット。
+/// v2 の大きさ。カーネル原文の `XATTR_CAPS_SZ_2` = `sizeof(__le32) * (1 + 2 * VFS_CAP_U32_2)` = 20（v6.12・`capability.h`）。
+const XATTR_CAPS_SZ_2: usize = 20;
+/// v3 の大きさ。カーネル原文の `XATTR_CAPS_SZ_3` = `sizeof(__le32) * (2 + 2 * VFS_CAP_U32_3)` = 24（v6.12・`capability.h`）。
+const XATTR_CAPS_SZ_3: usize = 24;
+/// setuid ビット。`include/uapi/linux/stat.h` の `S_ISUID`（v6.12。`0004000`）。
 const S_ISUID: u32 = 0o4000;
 
 /// 復号した file capability。
@@ -73,8 +80,8 @@ pub fn decode_vfs_cap(bytes: &[u8]) -> Result<FileCaps, VfsCapDecodeError> {
     let magic = le_u32(bytes, 0).ok_or(bad)?;
     let revision = magic & VFS_CAP_REVISION_MASK;
     let expected_len = match revision {
-        VFS_CAP_REVISION_2 => VFS_CAP_LEN_V2,
-        VFS_CAP_REVISION_3 => VFS_CAP_LEN_V3,
+        VFS_CAP_REVISION_2 => XATTR_CAPS_SZ_2,
+        VFS_CAP_REVISION_3 => XATTR_CAPS_SZ_3,
         _ => return Err(bad),
     };
     if bytes.len() != expected_len {
@@ -226,6 +233,31 @@ mod tests {
     use super::*;
 
     const MASK: u64 = 0x0000_0000_2820_1162;
+
+    /// SUP-14・#2661: `VFS_CAP_*` / `XATTR_CAPS_SZ_*` を torvalds/linux v6.12 の
+    /// `include/uapi/linux/capability.h` の原文の値と、導出式の両方で照合する。
+    #[test]
+    fn sup14_vfs_cap_constants_match_kernel_uapi() {
+        assert_eq!(VFS_CAP_REVISION_MASK, 0xFF00_0000);
+        assert_eq!(VFS_CAP_FLAGS_EFFECTIVE, 0x0000_0001);
+        assert_eq!(VFS_CAP_REVISION_2, 0x0200_0000);
+        assert_eq!(VFS_CAP_REVISION_3, 0x0300_0000);
+        assert_eq!(S_ISUID, 0o4000);
+        // VFS_CAP_REVISION_SHIFT = 24、VFS_CAP_U32_2 = VFS_CAP_U32_3 = 2、sizeof(__le32) = 4。
+        assert_eq!(VFS_CAP_REVISION_2 >> 24, 2);
+        assert_eq!(VFS_CAP_REVISION_3 >> 24, 3);
+        assert_eq!(XATTR_CAPS_SZ_2, 4 * (1 + 2 * 2));
+        assert_eq!(XATTR_CAPS_SZ_3, 4 * (2 + 2 * 2));
+        assert_eq!(XATTR_CAPS_SZ_2, 20);
+        assert_eq!(XATTR_CAPS_SZ_3, 24);
+    }
+
+    /// SUP-14・#2661: 読み取りバッファの大きさ（`sys` の `FILE_CAPS_BUF_LEN`）が復号の上限 v3 と一致する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup14_file_caps_buf_len_matches_xattr_caps_sz_3() {
+        assert_eq!(crate::sys::FILE_CAPS_BUF_LEN, XATTR_CAPS_SZ_3);
+    }
 
     fn v2(magic_flags: u32, perm: u64, inh: u64) -> Vec<u8> {
         let mut v = Vec::new();

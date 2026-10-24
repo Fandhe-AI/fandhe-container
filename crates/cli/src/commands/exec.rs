@@ -232,18 +232,53 @@ mod linux {
         code.unwrap_or(OCI_EXIT_INTERNAL.get())
     }
 
+    /// 再実行した子が「CLI として最後まで走った」ことを親へ伝える目印ファイルの絶対パス（環境変数）。
+    /// systemd-run 自身の失敗（スコープ登録の失敗・user マネージャの stale ソケット等）は、子の CLI が走らないため
+    /// 目印が作られず、親が「コマンドの失敗」と取り違えない（終了コード 1〜10 は ERR-2 と重なるため。ERR-2・SUP-6）。
+    const RESULT_FILE_ENV: &str = "FANDHE_CONTAINER_EXEC_RESULT_FILE";
+    /// 再実行した子へ渡す残り時間（ミリ秒）。子はこれと `--timeout` の小さい方を全体の期限にする（REPAIR-5）。
+    const REMAINING_MS_ENV: &str = "FANDHE_CONTAINER_EXEC_REMAINING_MS";
+    /// 親が子の自前の Timeout 報告を待つ猶予（子の期限が先に切れて構造化エラーを出せるようにする）。
+    const PARENT_GRACE: Duration = Duration::from_secs(2);
+    /// 子の終了待ちの確認間隔。
+    const WAIT_POLL: Duration = Duration::from_millis(20);
+
+    /// 委譲スコープ内の子が使う期限。環境変数が無い・壊れていれば `--timeout` のまま、あれば小さい方（延長はしない）。
+    fn scoped_timeout(requested: Duration) -> Duration {
+        std::env::var(REMAINING_MS_ENV)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|ms| requested.min(Duration::from_millis(ms).max(Duration::from_millis(1))))
+            .unwrap_or(requested)
+    }
+
+    /// 子が最後まで走ったことを示す目印を作る（`create_new` で既存・symlink を辿らない。失敗は親が wrapper 失敗と判断する）。
+    fn write_result_marker() {
+        let Some(path) = std::env::var_os(RESULT_FILE_ENV) else {
+            return;
+        };
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path);
+    }
+
     /// 呼び出しプロセスを user マネージャの委譲スコープへ移すため、自分自身を `systemd-run --user --scope` で再実行する。
     ///
     /// core の cgroup 参加（`exec/cgroup_join.rs`）は移動元と移動先の共通祖先の `cgroup.procs` への書き込み権を要する。
     /// ログインセッションの cgroup からでは祖先が root 所有で `PermissionDenied` になるため、user マネージャ配下
     /// （委譲済み）の scope で実行する。systemd-run は scope 登録後に同じプロセスでコマンドを exec する。
     /// 再実行した子が終了コードと stderr の構造化エラー行を決め、親は終了コードだけを引き継ぐ（stdio は継承）。
+    /// 親は全体の期限（`timeout` + 猶予）の間だけ待ち、超えたら子を止めて回収し `Timeout` を返す（REPAIR-5）。
+    /// 子が目印を作らずに終わったとき（systemd-run 自身の失敗）は固定文言の構造化エラーにする。
     /// 前提（systemd-run・user マネージャ）が満たせないときは exec せず失敗する（fail-closed）。
-    fn rerun_in_user_scope() -> CliExit {
-        let fail = |code: ErrorCode, msg: &str| CliExit::Error(CliError::new(code, msg));
+    /// 戻り値の後ろは「計測を子が行った」かどうか（起動前の失敗・wrapper の失敗・親の期限切れは親が計測する。REPAIR-4）。
+    fn rerun_in_user_scope(timeout: Duration) -> (CliExit, bool) {
+        let started = Instant::now();
+        let fail = |code: ErrorCode, msg: &str| (CliExit::Error(CliError::new(code, msg)), false);
         let euid = match effective_uid() {
             Ok(u) => u,
-            Err(e) => return failure(&e),
+            Err(e) => return (failure(&e), false),
         };
         let systemd_run = match locate_systemd_run(euid) {
             Ok(p) => p,
@@ -259,12 +294,58 @@ mod linux {
                 "cannot resolve the cli executable path",
             );
         };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let marker =
+            Path::new(&xdg).join(format!("fandhe-exec-{}-{nanos}.done", std::process::id()));
         let mut cmd = scoped_command(&systemd_run, &exe, std::env::args_os().skip(1), &xdg);
-        match cmd.status() {
-            Ok(status) => CliExit::Executed(status_to_code(status)),
-            Err(_) => fail(
+        cmd.env(RESULT_FILE_ENV, &marker);
+        cmd.env(REMAINING_MS_ENV, timeout.as_millis().to_string());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => {
+                return fail(
+                    ErrorCode::Unavailable,
+                    "failed to run the command in a user scope",
+                );
+            }
+        };
+        let deadline = started
+            .checked_add(timeout)
+            .and_then(|d| d.checked_add(PARENT_GRACE))
+            .unwrap_or(started);
+        let waited = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(Ok(status)),
+                Ok(None) if Instant::now() >= deadline => break None,
+                Ok(None) => std::thread::sleep(WAIT_POLL),
+                Err(e) => break Some(Err(e)),
+            }
+        };
+        let ran = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        match waited {
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                fail(
+                    ErrorCode::Timeout,
+                    "exec timed out waiting for the user scope command",
+                )
+            }
+            Some(Err(_)) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                fail(
+                    ErrorCode::Unavailable,
+                    "failed to wait for the user scope command",
+                )
+            }
+            Some(Ok(status)) if ran => (CliExit::Executed(status_to_code(status)), true),
+            Some(Ok(_)) => fail(
                 ErrorCode::Unavailable,
-                "failed to run the command in a user scope",
+                "the user scope wrapper failed before running the command",
             ),
         }
     }
@@ -277,6 +358,8 @@ mod linux {
         let started = Instant::now();
         let recorder = OpRecorder::new();
         let (exit, delegated) = run_exec_inner(global, args);
+        // 委譲スコープ内の子は、最後まで走ったことを親へ伝える（systemd-run 自身の失敗と見分ける）。
+        write_result_marker();
         // 委譲スコープでの再実行の親は、子が自分の分を記録するため記録しない（二重計上を避ける）。
         if !delegated {
             record_op(&recorder, "exec", is_ok(&exit), started);
@@ -288,7 +371,7 @@ mod linux {
         matches!(exit, CliExit::Success | CliExit::Executed(0))
     }
 
-    /// 戻り値の後ろは「委譲スコープで再実行した（計測は子が行う）」かどうか。
+    /// 戻り値の後ろは「計測を委譲スコープの子が行った」かどうか。
     fn run_exec_inner(global: &GlobalArgs, args: &ExecArgs) -> (CliExit, bool) {
         let prepared = ContainerId::new(args.id.as_str())
             .and_then(|id| build_request(args).map(|request| (id, request)));
@@ -315,7 +398,7 @@ mod linux {
                 }
                 Ok(_) => {}
             }
-            return (rerun_in_user_scope(), true);
+            return rerun_in_user_scope(args.timeout);
         }
         let source = production_exec_pidfd_source(&store);
         let result = exec_in_container(
@@ -325,7 +408,7 @@ mod linux {
             &production_runner,
             &id,
             &request,
-            args.timeout,
+            scoped_timeout(args.timeout),
         );
         match result {
             Ok(code) => (CliExit::Executed(code), false),

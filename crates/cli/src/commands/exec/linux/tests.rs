@@ -468,3 +468,15 @@ fn sup6_status_to_code_maps_exit_and_signal() {
     assert_eq!(status_to_code(ExitStatus::from_raw(7 << 8)), 7);
     assert_eq!(status_to_code(ExitStatus::from_raw(9)), 137);
 }
+
+/// SUP-6・REPAIR-5・#2626: 子の期限は `--timeout` を超えて延びない（環境変数が無い・壊れていれば `--timeout` のまま）。
+#[test]
+fn sup6_scoped_timeout_never_extends() {
+    // 環境変数を触らない前提の確認（並列実行のため set はしない）。未設定なら要求値のまま。
+    if std::env::var_os(REMAINING_MS_ENV).is_none() {
+        assert_eq!(
+            scoped_timeout(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
+    }
+}

@@ -782,12 +782,16 @@ mod control_ffi {
         };
         let used = msg.msg_controllen.min(RECV_CONTROL_LEN);
         let raw = control.0.get(..used).unwrap_or(&[]);
-        let fds = parse_rights(raw)?
+        // 解析が途中で失敗しても、それまでに読めた fd は `OwnedFd` にして drop で閉じる（fd の漏れを防ぐ）。
+        let mut raw_fds = Vec::new();
+        let parsed = parse_rights_into(raw, &mut raw_fds);
+        let fds: Vec<OwnedFd> = raw_fds
             .into_iter()
             // SAFETY: `recvmsg(2)` が呼び出しプロセスの fd 表へ新規に作った fd で、他に所有者がいない。`OwnedFd` が
-            // drop で閉じる。値は `parse_rights` がカーネルの返した `SCM_RIGHTS` から読んだもの。
+            // drop で閉じる。値は `parse_rights_into` がカーネルの返した `SCM_RIGHTS` から読んだもの。
             .map(|raw_fd| unsafe { OwnedFd::from_raw_fd(raw_fd) })
             .collect();
+        parsed?;
         Ok(super::Received {
             len: n,
             fds,
@@ -797,9 +801,16 @@ mod control_ffi {
 
     /// 制御データのバイト列から `SCM_RIGHTS` の fd 番号を取り出す（純関数。添字アクセスをしない）。
     /// 長さの足りないヘッダ・範囲外の `cmsg_len`・4 の倍数でないデータは `InvalidData`。他の種別の cmsg は読み飛ばす。
+    #[cfg(test)]
     pub(super) fn parse_rights(control: &[u8]) -> io::Result<Vec<i32>> {
-        let bad = || io::Error::from(io::ErrorKind::InvalidData);
         let mut fds = Vec::new();
+        parse_rights_into(control, &mut fds)?;
+        Ok(fds)
+    }
+
+    /// [`parse_rights`] の本体。失敗しても、失敗までに読めた fd 番号は `fds` に残す（呼び出し側が閉じるため）。
+    fn parse_rights_into(control: &[u8], fds: &mut Vec<i32>) -> io::Result<()> {
+        let bad = || io::Error::from(io::ErrorKind::InvalidData);
         let mut pos = 0usize;
         while pos < control.len() {
             let head_end = pos.checked_add(CMSG_HDR_LEN).ok_or_else(bad)?;
@@ -827,7 +838,7 @@ mod control_ffi {
             // 次の cmsg は 8 バイト境界から始まる。
             pos = end.checked_add(7).ok_or_else(bad)? & !7;
         }
-        Ok(fds)
+        Ok(())
     }
 
     #[cfg(test)]

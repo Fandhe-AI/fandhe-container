@@ -256,6 +256,20 @@ pub fn covering_mount_fstype(mountinfo: &str, path: &Path) -> Option<String> {
     fields.get(sep + 1).map(|f| (*f).to_string())
 }
 
+/// [`covering_mount_has_option`] の判定結果。属性の有無と、判定できない理由を区別する（将来の理由追加に備え列挙型にする）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MountOptionState {
+    /// 該当マウントの per-mount options に指定の option がある。
+    Present,
+    /// 該当マウントはあるが、指定の option は無い。
+    Absent,
+    /// パスを含むマウントが mountinfo に見つからない。
+    NoCoveringMount,
+    /// 該当マウントの行が壊れていて option を読めない（`-` 区切りや options 欄が無い）。
+    MalformedEntry,
+}
+
 /// `mountinfo` 上で `path`（正規化済みの絶対パス）を含むマウントの per-mount options（6 番目の欄。例 `rw,nosuid,nodev`）に
 /// `option` が完全一致のトークンとして含まれるかを返す。`-` の後ろの super options は見ない
 /// （`nosuid` はマウントごとのフラグのため）。
@@ -263,12 +277,23 @@ pub fn covering_mount_fstype(mountinfo: &str, path: &Path) -> Option<String> {
 /// cli の `doctor` のランチャー診断が、ランチャーの実体が `nosuid` マウント上にあるか
 /// （setuid と file capability が効かないか）を調べるために呼ぶ（SUP-14・CORE-6・#2661）。
 /// 選び方は [`covering_mount_fstype`] と同じ（最長一致・同長は最上位）。該当マウントが無い・欄が欠けている・
-/// `-` 区切りが無い壊れた行は `None`（呼び出し側は判定不能として扱う。fail-closed）。OS 呼び出しを含まない純粋関数。
-pub fn covering_mount_has_option(mountinfo: &str, path: &Path, option: &str) -> Option<bool> {
-    let fields = covering_mount(mountinfo, path)?;
-    fields.iter().position(|f| *f == "-")?;
-    let opts = fields.get(5)?;
-    Some(opts.split(',').any(|t| t == option))
+/// `-` 区切りが無い壊れた行は理由つきの判定不能（`Present` / `Absent` 以外）で返す。呼び出し側は fail-closed に扱う。
+/// OS 呼び出しを含まない純粋関数。
+pub fn covering_mount_has_option(mountinfo: &str, path: &Path, option: &str) -> MountOptionState {
+    let Some(fields) = covering_mount(mountinfo, path) else {
+        return MountOptionState::NoCoveringMount;
+    };
+    if !fields.contains(&"-") {
+        return MountOptionState::MalformedEntry;
+    }
+    let Some(opts) = fields.get(5) else {
+        return MountOptionState::MalformedEntry;
+    };
+    if opts.split(',').any(|t| t == option) {
+        MountOptionState::Present
+    } else {
+        MountOptionState::Absent
+    }
 }
 
 /// `mountinfo` の内容から `dir`（正規化済みの絶対パス）を含むマウントを探し、その伝播が `shared` なら
@@ -1222,18 +1247,18 @@ mod tests {
 32 22 0:29 / /broken rw,nosuid
 ";
         let has = |p: &str| covering_mount_has_option(info, Path::new(p), "nosuid");
-        assert_eq!(has("/proc/sys"), Some(true));
+        assert_eq!(has("/proc/sys"), MountOptionState::Present);
         // `/` の super options にだけ nosuid がある場合は false。
-        assert_eq!(has("/home/u/bin"), Some(false));
-        assert_eq!(has("/opt/fc/bin/x"), Some(true));
-        assert_eq!(has("/opt/fcx/bin/x"), Some(false));
-        assert_eq!(has("/over/a"), Some(false));
-        assert_eq!(has("/sp ace/a"), Some(true));
-        assert_eq!(has("/part/a"), Some(false));
-        assert_eq!(has("/broken/a"), None);
+        assert_eq!(has("/home/u/bin"), MountOptionState::Absent);
+        assert_eq!(has("/opt/fc/bin/x"), MountOptionState::Present);
+        assert_eq!(has("/opt/fcx/bin/x"), MountOptionState::Absent);
+        assert_eq!(has("/over/a"), MountOptionState::Absent);
+        assert_eq!(has("/sp ace/a"), MountOptionState::Present);
+        assert_eq!(has("/part/a"), MountOptionState::Absent);
+        assert_eq!(has("/broken/a"), MountOptionState::MalformedEntry);
         assert_eq!(
             covering_mount_has_option("", Path::new("/x"), "nosuid"),
-            None
+            MountOptionState::NoCoveringMount
         );
     }
 

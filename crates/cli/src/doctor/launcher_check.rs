@@ -344,10 +344,12 @@ fn launcher_mount_state(mountinfo: Option<&str>, path: &std::path::Path) -> Laun
     if !path.is_absolute() {
         return LauncherMount::Unknown;
     }
+    use fandhe_container_net::netns::MountOptionState;
     match fandhe_container_net::netns::covering_mount_has_option(info, path, "nosuid") {
-        Some(true) => LauncherMount::Nosuid,
-        Some(false) => LauncherMount::Allowed,
-        None => LauncherMount::Unknown,
+        MountOptionState::Present => LauncherMount::Nosuid,
+        MountOptionState::Absent => LauncherMount::Allowed,
+        // 将来の理由追加も含め、判定できないものは Unknown（fail-closed）。
+        _ => LauncherMount::Unknown,
     }
 }
 

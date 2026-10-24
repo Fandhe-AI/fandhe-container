@@ -726,7 +726,7 @@ mod linux {
             .unwrap_or_else(|e| panic!("Landlock ABI 6+ is required for this test: {e}"));
         // rootfs に dev が無い最小入口（`spawn_container` は `create_default_devices` を呼ばない。本番の launch 経路は /dev を作り `All` を使う）
         // では暗黙の `/dev` 系のルールを足せない（存在しないパスは適用時に拒否される）ため `None` を渡す。
-        // 専用 `/dev` を載せる `landlock-exec` だけ `WithoutShm` を渡す。（#1657）。
+        // 専用 `/dev` を載せる `landlock-exec` だけ `WithoutShm` を渡す（#1657）。
         build_path_rules_with_dev(&support, config.root(), config.mounts(), dev)
             .unwrap_or_else(|e| panic!("rules: {e}"))
     }

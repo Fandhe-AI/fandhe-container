@@ -792,10 +792,12 @@ trait LaunchOps: Send + Sync {
     fn is_single_threaded(&self) -> bool;
     /// `config` から Landlock の ruleset を作る(ABI 検出を含む。6 未満は拒否)。
     ///
+    /// `user_tmpfs` は利用者指定の tmpfs(暗黙の `/dev/shm` を除く。`mounts[]` とは別枠で `RuleOrigin::UserTmpfs` になる)。
     /// `implicit` は暗黙の `/dev` 系マウントのルールの含め方(起動オプションの tmpfs 集合から導く。SUP-12・#2625)。
     fn landlock_ruleset(
         &self,
         config: &super::config::OciConfig,
+        user_tmpfs: &[super::config::OciMount],
         implicit: ImplicitDevMounts,
     ) -> Result<LandlockRuleset, ExecError>;
     /// pin 済みの rootfs の `(st_dev, st_ino)`（launch 時の分離の記録の `/`。fstat できなければ `None`。
@@ -1186,19 +1188,19 @@ impl Inner {
         // 範囲写像の holder は fork で機密を含むメモリを継承し dumpable になるため、併用は #2628 まで拒否する。
         refuse_inject_with_subordinate(self.privilege, options)?;
         // Landlock は必須。ABI 不足・生成失敗は起動を拒否し、Landlock 無しで続けない(CORE-5・#1314)。
-        // 利用者指定の tmpfs(暗黙の `/dev/shm` を除く)は書き込み可能にマウントされるため、同じ属性で Landlock の
-        // ルールにも載せる。載せないと読み取り専用 root 配下の `--tmpfs /run` が EACCES になる(SUP-12・#2625)。
-        let landlock_config = spec.config().with_appended_mounts(
-            options
-                .tmpfs()
-                .mounts()
-                .iter()
-                .filter(|m| m.destination.as_str() != crate::tmpfs::DEV_SHM_PATH)
-                .map(super::config::OciMount::from_user_tmpfs),
-        );
+        // 利用者指定の tmpfs(暗黙の `/dev/shm` を除く)は `mounts[]` とは別枠で Landlock のルールにも載せる。載せないと
+        // 読み取り専用 root 配下の `--tmpfs /run` が EACCES になる。`ro` の tmpfs はルール生成側が除外する
+        // (SUP-12・#2625)。
+        let user_tmpfs: Vec<super::config::OciMount> = options
+            .tmpfs()
+            .mounts()
+            .iter()
+            .filter(|m| m.destination.as_str() != crate::tmpfs::DEV_SHM_PATH)
+            .map(super::config::OciMount::from_user_tmpfs)
+            .collect();
         let ruleset = self
             .ops
-            .landlock_ruleset(&landlock_config, options.implicit_dev_mounts())
+            .landlock_ruleset(spec.config(), &user_tmpfs, options.implicit_dev_mounts())
             .map_err(|e| to_trait_error(&e))?;
         // 分離の記録は `with_landlock` へ渡す ruleset そのものと pin 済み rootfs の fstat から、fork の前に作る
         // (入力を 1 つに保つ。作れなければ子を作らず拒否する。fail-closed。SUP-6・CORE-5・SEC-1・#2007)。
@@ -1724,9 +1726,11 @@ impl LaunchOps for RealOps {
     fn landlock_ruleset(
         &self,
         config: &super::config::OciConfig,
+        user_tmpfs: &[super::config::OciMount],
         implicit: ImplicitDevMounts,
     ) -> Result<LandlockRuleset, ExecError> {
-        let ruleset = crate::exec::landlock_ruleset_from_config_with_dev(config, implicit)?;
+        let ruleset =
+            crate::exec::landlock_ruleset_from_config_with_dev(config, user_tmpfs, implicit)?;
         // ABI 7 未満ではカーネル監査へ拒否を残せない。縮退を構造化ログに出して続行する（SEC-4・#2026）。
         // 縮退の拒否(厳格モード)と 3 か所への表示は `Inner::assess_audit_coverage`（#2027）。送れなくても起動の可否は変えない。
         if let Some(line) = ruleset.audit_mode().log_line() {
@@ -1973,12 +1977,13 @@ mod tests {
         fn landlock_ruleset(
             &self,
             config: &super::super::config::OciConfig,
+            user_tmpfs: &[super::super::config::OciMount],
             implicit: ImplicitDevMounts,
         ) -> Result<LandlockRuleset, ExecError> {
             push(&self.events, "landlock");
             self.seen_implicit.lock().unwrap().push(implicit);
             let detected = crate::landlock::evaluate_abi(self.abi.unwrap_or(6));
-            crate::exec::ruleset_from_detection_with_dev(detected, config, implicit)
+            crate::exec::ruleset_from_detection_with_dev(detected, config, user_tmpfs, implicit)
         }
 
         fn effective_ids(&self) -> (u32, u32) {
@@ -3735,7 +3740,7 @@ mod tests {
             .rules()
             .iter()
             .filter_map(|r| match r.target() {
-                RecordedTarget::Mount { destination, .. } => {
+                RecordedTarget::Tmpfs { destination } => {
                     Some((destination.as_str().to_owned(), r.allowed()))
                 }
                 _ => None,
@@ -3745,6 +3750,34 @@ mod tests {
         let write = crate::landlock::AccessFs::WRITE.bits();
         assert_eq!(run.1 & write, write);
         assert!(rules.iter().all(|(d, _)| d != "/dev/shm"));
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SUP-12・CORE-5(#2625): `ro` の利用者 tmpfs は書き込み可能な root の下でも起動でき、Landlock のルールには載らない。
+    #[test]
+    fn sup12_read_only_user_tmpfs_launches_without_a_landlock_rule() {
+        use crate::launch_isolation::RecordedTarget;
+        let spec = spec_for("opts-landlock-ro-tmpfs", serde_json::json!({}));
+        let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+        let mut opts = options_with(&["/ro"], true, &[], LaunchIpcMode::Private);
+        let mut tmpfs = TmpfsMountSet::new();
+        for m in opts.tmpfs().mounts() {
+            let mut m = m.clone();
+            m.read_only = m.destination.as_str() == "/ro";
+            tmpfs.push(m).expect("push");
+        }
+        opts = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+            .expect("options");
+        l.inner.launch_options = Some(opts);
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let record = p.launch_isolation().expect("record");
+        let tmpfs_rules = record
+            .landlock()
+            .rules()
+            .iter()
+            .filter(|r| matches!(r.target(), RecordedTarget::Tmpfs { .. }))
+            .count();
+        assert_eq!(tmpfs_rules, 0);
         p.terminate(Duration::from_secs(5)).expect("terminate");
     }
 

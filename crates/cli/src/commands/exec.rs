@@ -238,8 +238,18 @@ mod linux {
     const RESULT_FILE_ENV: &str = "FANDHE_CONTAINER_EXEC_RESULT_FILE";
     /// 再実行した子へ渡す残り時間（ミリ秒）。子はこれと `--timeout` の小さい方を全体の期限にする（REPAIR-5）。
     const REMAINING_MS_ENV: &str = "FANDHE_CONTAINER_EXEC_REMAINING_MS";
-    /// 親が子の自前の Timeout 報告を待つ猶予（子の期限が先に切れて構造化エラーを出せるようにする）。
-    const PARENT_GRACE: Duration = Duration::from_secs(2);
+    /// 再実行した子が「CLI として走り始めた」ことを親へ伝える目印ファイルのパス（環境変数）。
+    /// 親はこれが作られるまでの systemd-run 自身の stderr（D-Bus 接続失敗等の非 JSON の診断）を捨てる（ERR-1・ERR-2）。
+    const START_FILE_ENV: &str = "FANDHE_CONTAINER_EXEC_START_FILE";
+    /// 親が子の自前の Timeout 報告を待つ猶予。内側の worker 回収（supervisor の `WORKER_GRACE` 7 秒）と
+    /// 子 cgroup の後始末（同 `CHILD_CGROUP_CLEANUP_TIMEOUT` 5 秒）の合計以上にし、通常の期限切れでは
+    /// 子が自前の構造化 Timeout を出して cgroup を回収し終えてから親が待ち終えるようにする（REPAIR-5・SUP-6）。
+    const PARENT_GRACE: Duration = Duration::from_secs(14);
+    /// 親が子を `SIGKILL` した後の回収待ちの上限（無期限に待たない。REPAIR-5）。
+    const REAP_BOUND: Duration = Duration::from_secs(2);
+    /// systemd-run の stderr を一度に読む量と、捕捉を終えるのを待つ上限。
+    const STDERR_CHUNK: usize = 4096;
+    const STDERR_DRAIN_WAIT: Duration = Duration::from_secs(1);
     /// 子の終了待ちの確認間隔。
     const WAIT_POLL: Duration = Duration::from_millis(20);
 
@@ -254,7 +264,12 @@ mod linux {
 
     /// 子が最後まで走ったことを示す目印を作る（`create_new` で既存・symlink を辿らない。失敗は親が wrapper 失敗と判断する）。
     fn write_result_marker() {
-        let Some(path) = std::env::var_os(RESULT_FILE_ENV) else {
+        write_marker(RESULT_FILE_ENV);
+    }
+
+    /// 環境変数 `env` が指すパスへ目印ファイルを作る（無ければ何もしない）。
+    fn write_marker(env: &str) {
+        let Some(path) = std::env::var_os(env) else {
             return;
         };
         let _ = std::fs::OpenOptions::new()
@@ -268,10 +283,46 @@ mod linux {
     /// core の cgroup 参加（`exec/cgroup_join.rs`）は移動元と移動先の共通祖先の `cgroup.procs` への書き込み権を要する。
     /// ログインセッションの cgroup からでは祖先が root 所有で `PermissionDenied` になるため、user マネージャ配下
     /// （委譲済み）の scope で実行する。systemd-run は scope 登録後に同じプロセスでコマンドを exec する。
-    /// 再実行した子が終了コードと stderr の構造化エラー行を決め、親は終了コードだけを引き継ぐ（stdio は継承）。
+    /// 再実行した子が終了コードと stderr の構造化エラー行を決め、親は終了コードだけを引き継ぐ（stdout は継承。stderr は走り始めの目印までの wrapper の診断を捨て、以降を流す）。
     /// 親は全体の期限（`timeout` + 猶予）の間だけ待ち、超えたら子を止めて回収し `Timeout` を返す（REPAIR-5）。
     /// 子が目印を作らずに終わったとき（systemd-run 自身の失敗）は固定文言の構造化エラーにする。
     /// 前提（systemd-run・user マネージャ）が満たせないときは exec せず失敗する（fail-closed）。
+    /// 子を `SIGKILL` して有限時間だけ回収を待つ。回収できたかを返す（待ち続けない。REPAIR-5）。
+    fn kill_and_reap(child: &mut std::process::Child) -> bool {
+        let _ = child.kill();
+        let deadline = Instant::now() + REAP_BOUND;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(WAIT_POLL),
+                _ => return false,
+            }
+        }
+    }
+
+    /// systemd-run の stderr を捨てるか流すかを決めながら読み切る（容量は 1 回 `STDERR_CHUNK`、保持しない）。
+    /// 子の「走り始めた」目印が出るまでの出力（wrapper の非 JSON 診断）は捨て、出た後（子 CLI 自身の構造化エラー等）は
+    /// そのまま親の stderr へ流す。目印は子が最初の出力より前に作る。終了で `done` を立てる。
+    fn forward_after_start(
+        mut stderr: std::process::ChildStderr,
+        start: std::path::PathBuf,
+        done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        use std::io::{Read, Write};
+        let mut buf = [0u8; STDERR_CHUNK];
+        while let Ok(n) = stderr.read(&mut buf) {
+            let Some(chunk) = buf.get(..n).filter(|c| !c.is_empty()) else {
+                break;
+            };
+            if start.exists() {
+                let mut out = std::io::stderr().lock();
+                let _ = out.write_all(chunk);
+                let _ = out.flush();
+            }
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// 戻り値の後ろは「計測を子が行った」かどうか（起動前の失敗・wrapper の失敗・親の期限切れは親が計測する。REPAIR-4）。
     fn rerun_in_user_scope(timeout: Duration) -> (CliExit, bool) {
         let started = Instant::now();
@@ -301,7 +352,12 @@ mod linux {
             Path::new(&xdg).join(format!("fandhe-exec-{}-{nanos}.done", std::process::id()));
         let mut cmd = scoped_command(&systemd_run, &exe, std::env::args_os().skip(1), &xdg);
         cmd.env(RESULT_FILE_ENV, &marker);
-        cmd.env(REMAINING_MS_ENV, timeout.as_millis().to_string());
+        let start_marker = marker.with_extension("start");
+        cmd.env(START_FILE_ENV, &start_marker);
+        // 起動前に使った時間を引き、子が内側の期限をそろえて数えられるようにする。
+        let remaining = timeout.saturating_sub(started.elapsed());
+        cmd.env(REMAINING_MS_ENV, remaining.as_millis().to_string());
+        cmd.stderr(std::process::Stdio::piped());
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(_) => {
@@ -311,6 +367,14 @@ mod linux {
                 );
             }
         };
+        let drained = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        match child.stderr.take() {
+            Some(stderr) => {
+                let (path, flag) = (start_marker.clone(), std::sync::Arc::clone(&drained));
+                std::thread::spawn(move || forward_after_start(stderr, path, flag));
+            }
+            None => drained.store(true, std::sync::atomic::Ordering::SeqCst),
+        }
         let deadline = started
             .checked_add(timeout)
             .and_then(|d| d.checked_add(PARENT_GRACE))
@@ -323,20 +387,25 @@ mod linux {
                 Err(e) => break Some(Err(e)),
             }
         };
+        // 子が終わった直後の出力を取りこぼさないよう、捕捉の終了を有限時間だけ待つ。
+        let drain_deadline = Instant::now() + STDERR_DRAIN_WAIT;
+        while !drained.load(std::sync::atomic::Ordering::SeqCst) && Instant::now() < drain_deadline
+        {
+            std::thread::sleep(WAIT_POLL);
+        }
         let ran = marker.exists();
         let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&start_marker);
         match waited {
             None => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = kill_and_reap(&mut child);
                 fail(
                     ErrorCode::Timeout,
                     "exec timed out waiting for the user scope command",
                 )
             }
             Some(Err(_)) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = kill_and_reap(&mut child);
                 fail(
                     ErrorCode::Unavailable,
                     "failed to wait for the user scope command",
@@ -357,6 +426,8 @@ mod linux {
     pub(in super::super) fn run_exec(global: &GlobalArgs, args: &ExecArgs) -> CliExit {
         let started = Instant::now();
         let recorder = OpRecorder::new();
+        // 委譲スコープ内の子は、最初の出力より前に「走り始めた」目印を作る（wrapper の診断と見分ける）。
+        write_marker(START_FILE_ENV);
         let (exit, delegated) = run_exec_inner(global, args);
         // 委譲スコープ内の子は、最後まで走ったことを親へ伝える（systemd-run 自身の失敗と見分ける）。
         write_result_marker();

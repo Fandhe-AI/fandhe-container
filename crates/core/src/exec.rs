@@ -186,8 +186,6 @@ pub use exec_command::{
 };
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
 pub use landlock::launch_isolation_from_bundle;
-#[cfg(test)]
-pub(crate) use landlock::ruleset_from_detection;
 /// 結合試験 `tests/landlock.rs` 専用の再公開（CORE-5・TASK-39.5・#185。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use landlock::{
@@ -195,7 +193,9 @@ pub use landlock::{
     LandlockAccessProbe, observe_landlock_path_access,
 };
 /// 本番 launcher（`oci_runtime::ProductionLauncher`。#1816）だけが使う crate 内の再公開。
-pub(crate) use landlock::{landlock_ruleset_from_config, launch_isolation_from_ruleset};
+pub(crate) use landlock::{landlock_ruleset_from_config_with_dev, launch_isolation_from_ruleset};
+#[cfg(test)]
+pub(crate) use landlock::{ruleset_from_detection, ruleset_from_detection_with_dev};
 pub(crate) use launch_intermediate::{
     IntermediatePlan, IntermediateSpec, LaunchTag, Rescan, rescan_unreported_init,
     spawn_container_via_intermediate,

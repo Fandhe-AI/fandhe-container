@@ -668,10 +668,10 @@ fn apply_with<K: LandlockKernel>(
         if let MountCheck::Recorded(recorded) = check
             && matches!(
                 rule.origin,
-                RuleOrigin::Implicit { .. } | RuleOrigin::Mount { .. }
+                RuleOrigin::Implicit { .. } | RuleOrigin::Mount { .. } | RuleOrigin::UserTmpfs
             )
         {
-            let Some(expected) = recorded.expected_for(&rule.origin) else {
+            let Some(expected) = recorded.expected_for(&rule.origin, rule.path.as_str()) else {
                 return Err(LandlockApplyError::new(
                     ErrorCode::FailedPrecondition,
                     Kind::MountRecordMissing { index },

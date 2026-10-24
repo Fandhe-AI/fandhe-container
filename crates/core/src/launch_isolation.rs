@@ -37,8 +37,10 @@ use crate::audit_log::{AuditCoverage, AuditCoveragePolicy};
 use crate::dev_mounts::{IMPLICIT_DEV_MOUNT_COUNT, ImplicitDevMount};
 use crate::oci_runtime::{CONFIG_MAX_MOUNTS, MountDestination};
 
-/// 記録できるルール本数の上限（`landlock::MAX_LANDLOCK_RULES` と同じ値。mount 上限 + rootfs 1 本 + 暗黙の `/dev` 系）。
-pub const MAX_RECORDED_RULES: usize = CONFIG_MAX_MOUNTS + 1 + IMPLICIT_DEV_MOUNT_COUNT;
+/// 記録できるルール本数の上限（`landlock::MAX_LANDLOCK_RULES` と同じ値。mount 上限 + 利用者 tmpfs 上限 + rootfs 1 本 +
+/// 暗黙の `/dev` 系）。
+pub const MAX_RECORDED_RULES: usize =
+    CONFIG_MAX_MOUNTS + crate::tmpfs::TMPFS_MAX_MOUNTS + 1 + IMPLICIT_DEV_MOUNT_COUNT;
 
 /// 既知の Landlock fs 権利ビットの全体（`landlock::AccessFs::ALL` と同じ値。Linux 以外でも検証できるよう複製し、
 /// Linux では単体テストで一致を照合する）。
@@ -117,6 +119,11 @@ pub enum RecordedTarget {
         /// `mounts` 内の位置。
         index: usize,
     },
+    /// 利用者指定の tmpfs（`--tmpfs`。SUP-12・CORE-5・#2625）。
+    Tmpfs {
+        /// 検証済みのコンテナ内マウント先。
+        destination: MountDestination,
+    },
     /// ランタイムが暗黙に載せるマウント（`/dev`・`/dev/pts`・`/dev/shm`）。
     Implicit(ImplicitDevMount),
 }
@@ -126,7 +133,7 @@ impl RecordedTarget {
     pub fn as_str(&self) -> &str {
         match self {
             Self::Root => "/",
-            Self::Mount { destination, .. } => destination.as_str(),
+            Self::Mount { destination, .. } | Self::Tmpfs { destination } => destination.as_str(),
             Self::Implicit(m) => m.destination(),
         }
     }
@@ -658,6 +665,10 @@ mod linux {
                             RulePath::Beneath(destination.clone()),
                             RuleOrigin::Mount { index: *index },
                         ),
+                        RecordedTarget::Tmpfs { destination } => (
+                            RulePath::Beneath(destination.clone()),
+                            RuleOrigin::UserTmpfs,
+                        ),
                         RecordedTarget::Implicit(m) => (
                             RulePath::ImplicitDev(*m),
                             RuleOrigin::Implicit { mount: *m },
@@ -680,6 +691,9 @@ mod linux {
             (RulePath::Beneath(d), RuleOrigin::Mount { index }) => RecordedTarget::Mount {
                 destination: d.clone(),
                 index: *index,
+            },
+            (RulePath::Beneath(d), RuleOrigin::UserTmpfs) => RecordedTarget::Tmpfs {
+                destination: d.clone(),
             },
             (RulePath::ImplicitDev(p), RuleOrigin::Implicit { mount }) if p == mount => {
                 RecordedTarget::Implicit(*mount)

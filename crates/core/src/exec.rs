@@ -1616,6 +1616,10 @@ fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
 ///   プロセスが ptrace・`/proc/<holder>/mem` で読める。pidfd 経由の `setns` が対象の dumpable を要する
 ///   (`ptrace_may_access`。Linux v6.12 で確認)ため、window は release まで縮められない。棚卸しと残課題
 ///   (注入ファイルの secret 内容)は `docs/design/rootless-id-map-holder.md` §4
+/// - 書き手が [`IdMapWriter::Helper`] のときは Linux 6.9 以降(pidfd のプロセスグループ送信)が要る。holder の期限切れ後に
+///   helper が pid の再利用先へ書く残余を閉じる kill の手段が無い環境では、fork の前に副作用なしで
+///   `FailedPrecondition` にする(#2644・CORE-6・SEC-5。fail-closed)。Direct は検査しない。本番の起動は Landlock
+///   ABI 6(Linux 6.12 以降)を要求するため、launcher 経路では実質の制約は増えない
 /// - シングルスレッドから呼ぶこと（holder・mapper の fork と `setns(CLONE_NEWUSER)` の制約。マルチスレッドは
 ///   副作用なしで `FailedPrecondition`）
 /// - 失敗したプロセスは破棄すること（写像は write-once で戻せない。[`isolate`] と同じ）。holder と mapper は
@@ -1683,6 +1687,13 @@ fn isolate_rootless_subordinate_with(
             None,
         ));
     }
+    // helper を起動する前に、期限切れ後の kill の手段(pidfd のグループ送信。Linux 6.9 以降)があることを確かめる。
+    // 無ければ holder の pid の再利用先へ helper が書く残余(#2551)を閉じられないため、fork 前に拒否する(#2644)。
+    rootless::require_group_kill_for_helper(matches!(plan.writer, IdMapWriter::Helper(_)), || {
+        let pidfd = sys::pidfd_open(std::process::id())?;
+        sys::pidfd_group_signal_probe(std::os::fd::AsFd::as_fd(&pidfd))
+    })
+    .map_err(|e| ExecError::new(e.code, IsolationStage::UserNamespaceMap, e.message))?;
     let io_err = |e: &std::io::Error, what: &str| {
         ExecError::from_io(e, IsolationStage::UserNamespaceMap, what)
     };

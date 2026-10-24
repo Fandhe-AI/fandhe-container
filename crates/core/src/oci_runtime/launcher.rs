@@ -1186,9 +1186,19 @@ impl Inner {
         // 範囲写像の holder は fork で機密を含むメモリを継承し dumpable になるため、併用は #2628 まで拒否する。
         refuse_inject_with_subordinate(self.privilege, options)?;
         // Landlock は必須。ABI 不足・生成失敗は起動を拒否し、Landlock 無しで続けない(CORE-5・#1314)。
+        // 利用者指定の tmpfs(暗黙の `/dev/shm` を除く)は書き込み可能にマウントされるため、同じ属性で Landlock の
+        // ルールにも載せる。載せないと読み取り専用 root 配下の `--tmpfs /run` が EACCES になる(SUP-12・#2625)。
+        let landlock_config = spec.config().with_appended_mounts(
+            options
+                .tmpfs()
+                .mounts()
+                .iter()
+                .filter(|m| m.destination.as_str() != crate::tmpfs::DEV_SHM_PATH)
+                .map(super::config::OciMount::from_user_tmpfs),
+        );
         let ruleset = self
             .ops
-            .landlock_ruleset(spec.config(), options.implicit_dev_mounts())
+            .landlock_ruleset(&landlock_config, options.implicit_dev_mounts())
             .map_err(|e| to_trait_error(&e))?;
         // 分離の記録は `with_landlock` へ渡す ruleset そのものと pin 済み rootfs の fstat から、fork の前に作る
         // (入力を 1 つに保つ。作れなければ子を作らず拒否する。fail-closed。SUP-6・CORE-5・SEC-1・#2007)。
@@ -3709,6 +3719,33 @@ mod tests {
             implicit.lock().unwrap().clone(),
             vec![ImplicitDevMounts::WithoutShm; 2]
         );
+    }
+
+    /// SUP-12・CORE-5(#2625): 利用者指定の tmpfs(`/run`)は Landlock のルールと分離の記録にも書き込み可能で載る。
+    #[test]
+    fn sup12_user_tmpfs_is_writable_in_landlock_rules_and_record() {
+        use crate::launch_isolation::RecordedTarget;
+        let spec = spec_for("opts-landlock-tmpfs", serde_json::json!({}));
+        let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+        l.inner.launch_options = Some(options_with(&["/run"], true, &[], LaunchIpcMode::Private));
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let record = p.launch_isolation().expect("record");
+        let rules: Vec<(String, u64)> = record
+            .landlock()
+            .rules()
+            .iter()
+            .filter_map(|r| match r.target() {
+                RecordedTarget::Mount { destination, .. } => {
+                    Some((destination.as_str().to_owned(), r.allowed()))
+                }
+                _ => None,
+            })
+            .collect();
+        let run = rules.iter().find(|(d, _)| d == "/run").expect("/run rule");
+        let write = crate::landlock::AccessFs::WRITE.bits();
+        assert_eq!(run.1 & write, write);
+        assert!(rules.iter().all(|(d, _)| d != "/dev/shm"));
+        p.terminate(Duration::from_secs(5)).expect("terminate");
     }
 
     /// SUP-12(#2625): `/dev/shm` と `/run` を指定順で渡し、IPC namespace は保つ。

@@ -1112,6 +1112,25 @@ impl OciMount {
         self.destination.as_path()
     }
 
+    /// 利用者指定の tmpfs(検証済み)を Landlock のルール生成へ渡すための `mounts[]` 相当の 1 件にする
+    /// (SUP-12・CORE-5・#2625)。`nosuid`・`nodev` を常に付け、`ro` / `rw`・`noexec` は型付きの属性から導く。
+    pub(crate) fn from_user_tmpfs(spec: &crate::tmpfs::TmpfsMountSpec) -> Self {
+        let mut options = vec![
+            if spec.read_only { "ro" } else { "rw" }.to_owned(),
+            "nosuid".to_owned(),
+            "nodev".to_owned(),
+        ];
+        if !spec.exec {
+            options.push("noexec".to_owned());
+        }
+        Self {
+            destination: spec.destination.clone(),
+            fs_type: Some("tmpfs".to_owned()),
+            source: None,
+            options,
+        }
+    }
+
     /// 検証済みのマウント先型。
     pub fn mount_destination(&self) -> &MountDestination {
         &self.destination
@@ -1283,6 +1302,14 @@ impl OciConfig {
     /// `mounts`。
     pub fn mounts(&self) -> &[OciMount] {
         &self.mounts
+    }
+
+    /// `mounts` の末尾へ launcher が供給するマウントを足した写しを返す(Landlock のルール生成専用。
+    /// 利用者指定 tmpfs の書き込み権を反映する。SUP-12・CORE-5・#2625)。
+    pub(crate) fn with_appended_mounts(&self, extra: impl IntoIterator<Item = OciMount>) -> Self {
+        let mut c = self.clone();
+        c.mounts.extend(extra);
+        c
     }
 
     /// `linux.namespaces`。

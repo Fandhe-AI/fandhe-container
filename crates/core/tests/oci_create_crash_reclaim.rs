@@ -242,8 +242,8 @@ mod linux {
         let before = staging_names(&bundle);
         assert_eq!(before.len(), 1, "one leftover staging tree: {before:?}");
         assert!(
-            bundle.join(&before[0]).join("etc/partial").exists(),
-            "partial content left by the killed create"
+            bundle.join(&before[0]).join("rootfs/etc/partial").exists(),
+            "partial content left by the killed create (wrapper/rootfs layout, #2635)"
         );
         assert!(!bundle.join("rootfs").exists());
 

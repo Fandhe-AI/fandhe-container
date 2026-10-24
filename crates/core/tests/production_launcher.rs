@@ -56,6 +56,11 @@
 //!   当コンテナの `layer=exit_signal` の行がちょうど 1 行で、`signal` 31・`target_pid` = コンテナの PID・`syscall`/`arch` は null、
 //!   再度の `wait` / `terminate` の後も 1 行のままであることを照合する。成功行の前に
 //!   `production_launcher: exit_signal recorded once via audit relay (scenario=Q)` を出す
+//! - シナリオ S（launch 経路の entrypoint 系違反の記録。#2624・SEC-4・SUP-6）: 試験バイナリ自身のディレクトリを bind し、
+//!   `args[0]` をその中の試験バイナリ（PID 1 の `/proc/self/exe` と同一の inode）にした start が `PermissionDenied` で失敗し、
+//!   状態が Created のまま子が残らず、launcher の記録先に層 `entrypoint`・`reason=entrypoint_is_runtime_binary`・当コンテナの
+//!   ID・パスなしのレコードがちょうど 1 件あることを照合する。成功行の前に
+//!   `production_launcher: entrypoint violation recorded once and launch refused (scenario=S)` を出す
 //! - root で実行された場合: 主経路は非 root（SEC-5）。launch が拒否され、状態が Created に戻り、子が残らないことだけを
 //!   照合する（コンテナ内 root をホスト root へ写す起動は試さない）
 //!
@@ -163,7 +168,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::audit_log::{
-        AUDIT_LOG_FILE_NAME, AuditRecord, AuditSink, ControlAuditRelay, FileAuditSink,
+        AUDIT_LOG_FILE_NAME, AuditLayer, AuditRecord, AuditSink, ControlAuditRelay, FileAuditSink,
     };
     use fandhe_container_core::capabilities::OCI_DEFAULT_CAPABILITIES;
     use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup, DelegatedCgroup};
@@ -794,6 +799,7 @@ mod linux {
         scenario_o_user_outside_mapping_refused(&env, tag);
         scenario_p_bare_name_entrypoint(&env, tag);
         scenario_r_cwd_relative_entrypoint(&env, tag);
+        scenario_s_entrypoint_violation_recorded(&env, container, tag);
         scenario_q_exit_signal_via_relay(&env, container, tag);
         if subordinate_requested() {
             scenario_i_user_applied(tag);
@@ -2100,6 +2106,110 @@ mod linux {
         drop(relay);
         wait_single_thread();
         assert!(eventually(|| children_of_self().is_empty()));
+    }
+
+    /// シナリオ S（SEC-4・SUP-6・SEC-1・REPAIR-3・#2624）: エントリポイントがランタイム自身のバイナリ（PID 1 の
+    /// `/proc/self/exe` と同じ `(st_dev, st_ino)`）の launch は、PID 1 が exec 前に状態 pipe へ返す違反が親（この
+    /// テストプロセス = C）で層 `entrypoint` に記録され、起動失敗になる。
+    ///
+    /// 構成: 試験バイナリ自身のディレクトリを `/host-bin` へ bind し、`args[0]` をその中の試験バイナリの絶対パスにする
+    /// （bind は inode と `st_dev` を保つため、PID 1 の `/proc/self/exe` と同一になる。PID 1 は fork 子で、exec していない）。
+    /// 照合: `start` が `Err`（`PermissionDenied`）、状態は Created のまま、子が残らない。launcher の記録先に層
+    /// `entrypoint`・`reason=entrypoint_is_runtime_binary`・当コンテナの ID・パスなしのレコードがちょうど 1 件。
+    /// 成功行は変えず、固有の行を前に出す（`ci.yml` の grep は最終行だけを見る）。
+    fn scenario_s_entrypoint_violation_recorded(
+        env: &Env,
+        container: &Arc<ContainerCgroup>,
+        tag: u32,
+    ) {
+        struct RecSink(std::sync::Mutex<Vec<AuditRecord>>);
+        impl AuditSink for RecSink {
+            fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(record.clone());
+                Ok(())
+            }
+        }
+        const HOST_BIN: &str = "/host-bin";
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe_dir = exe.parent().expect("exe dir").to_path_buf();
+        let exe_name = exe.file_name().and_then(|n| n.to_str()).expect("exe name");
+
+        let sink = Arc::new(RecSink(std::sync::Mutex::new(Vec::new())));
+        let join_container = Arc::clone(container);
+        let launcher = ProductionLauncher::builder()
+            .privilege(IsolationPrivilege::RootlessSingleId)
+            .audit_sink(Arc::clone(&sink) as Arc<dyn AuditSink>)
+            .cgroup_join_source(move || join_container.join_hook())
+            .build()
+            .expect("build the launcher with a recording sink");
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(launcher);
+
+        let bundle = Bundle::new("s");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        mkdir(&bundle.rootfs().join(HOST_BIN.trim_start_matches('/')));
+        let config = json!({
+            "ociVersion": "1.2.0",
+            "root": {"path": "rootfs", "readonly": false},
+            "hostname": HOSTNAME,
+            "process": {
+                "user": {"uid": 0, "gid": 0},
+                "args": [format!("{HOST_BIN}/{exe_name}")],
+                "env": ["PATH=/", "TERM=dumb", format!("LD_LIBRARY_PATH={ld}")],
+                "cwd": "/"
+            },
+            "mounts": [{
+                "destination": HOST_BIN,
+                "type": "bind",
+                "source": exe_dir.to_str().expect("utf8 exe dir"),
+                "options": ["bind", "rw"]
+            }],
+            "linux": {"namespaces": [
+                {"type": "pid"}, {"type": "mount"}, {"type": "uts"}, {"type": "ipc"}, {"type": "user"}
+            ]}
+        });
+        std::fs::write(
+            bundle.dir.join("config.json"),
+            serde_json::to_vec(&config).expect("serialize config"),
+        )
+        .expect("write config.json");
+        let id = ContainerId::new(format!("pls{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        match start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        ) {
+            Ok(started) => {
+                let _ = started.into_parts().1.terminate(timeout());
+                panic!("a launch of the runtime binary itself must be refused");
+            }
+            Err(e) => assert_eq!(e.code(), ErrorCode::PermissionDenied, "{}", e.message()),
+        }
+        assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+        let records = sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(records.len(), 1, "exactly one record: {records:?}");
+        assert_eq!(records[0].layer(), AuditLayer::Entrypoint);
+        assert_eq!(
+            records[0].reason().map(|r| r.as_str()),
+            Some("entrypoint_is_runtime_binary")
+        );
+        assert_eq!(records[0].container_id(), Some(&id));
+        assert_eq!(records[0].path(), None);
+        drop(launcher);
+        assert!(eventually(|| children_of_self().is_empty()));
+        println!(
+            "production_launcher: entrypoint violation recorded once and launch refused (scenario=S)"
+        );
     }
 
     /// シナリオ P（OCI-1・TASK-55 追補・#2314）: 名前だけの `process.args[0]` を、コンテナ内の `process.env` の

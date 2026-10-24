@@ -2035,7 +2035,7 @@ mod linux {
 
     /// start の検証の拒否の記録先を包み、記録できなかったことを固定語彙の構造化ログへ残す（SEC-4・REPAIR-4・#2481）。
     ///
-    /// 呼び出し元は core の `claim_start`（bind・sysfs の拒否。結果は `let _ =` で捨てられる）。運べない種類や helper の
+    /// 呼び出し元は core の `claim_start`（bind・sysfs・rootfs の固定の違反〔#2623〕の拒否。結果は `let _ =` で捨てられる）。運べない種類や helper の
     /// 失敗は内側が `Err` で返すので、ここで 1 行出してから同じ `Err` を返す（拒否の結果は変えない）。`log_event` は
     /// `stderr_sink` の常駐スレッドを作るが、拒否の記録は必ず start の失敗の直前で起き launch に進まないため、
     /// 「手順 8 の前の成功経路では `log_event` を呼ばない」規則に触れない。
@@ -2089,7 +2089,7 @@ mod linux {
         /// （`with_exit_audit_sink`。入口が単一スレッドの間に作った `ControlAuditRelay`。SEC-4・ESC-06・#2236）。
         /// 無ければ `audit`（`FileAuditSink`）を使う。
         exit_audit: Option<Arc<dyn AuditSink>>,
-        /// start の検証（`claim_start` の bind・sysfs の拒否）が出す mount 層の拒否だけの記録先
+        /// start の検証（`claim_start` の bind・sysfs・rootfs の固定の違反の拒否）が出す mount 層の拒否だけの記録先
         /// （`with_rejection_audit_sink`。`ObservedRejectionSink` で包んだ `ControlAuditRelay`。SEC-4・#2481）。
         /// 無ければ `audit`（`FileAuditSink`）を使う。
         rejection_audit: Option<Arc<dyn AuditSink>>,
@@ -2242,8 +2242,8 @@ mod linux {
         ///
         /// 回収点は監視スレッドなど複数スレッドから呼ばれ、`FileAuditSink` の fork 隔離が使えない（rootless では代替経路も
         /// 失敗する）。入口が単一スレッドの間に作った `ControlAuditRelay` を渡す。launch の時点の記録（監査網羅の縮退・
-        /// pre-pivot の違反）は単一スレッドなので `build_audit_sink` の `FileAuditSink` のままにする（relay は理由つきの
-        /// `Mount` 等の運べない層がある）。start の検証（bind・sysfs）の拒否は作業スレッドで出るため
+        /// pre-pivot の違反）は単一スレッドなので `build_audit_sink` の `FileAuditSink` のままにする（relay は閉じた表の理由つきの
+        /// `Mount` 以外の理由つきの層を運べない）。start の検証（bind・sysfs）の拒否は作業スレッドで出るため
         /// [`Self::with_rejection_audit_sink`] で別に渡す。
         #[must_use]
         pub fn with_exit_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {

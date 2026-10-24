@@ -201,6 +201,10 @@ pub(crate) use launch_intermediate::{
     spawn_container_via_intermediate,
 };
 pub(crate) use launch_status::LaunchAudit;
+/// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・#2624。entrypoint 系の違反の往復。通常の利用者は呼ばない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use launch_status::relay_entrypoint_violation_for_test;
 /// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・SEC-5・REPAIR-10・#2072。通常の利用者は呼ばない）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
@@ -515,8 +519,10 @@ pub fn record_launch_mount_rejection<E>(
 /// `err.violation` が種別 `Entrypoint` のときだけ 1 件 `sink` へ渡す。それ以外（マウント層・exec 対象の違反・
 /// システムエラー）は `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
 /// `ExecError` を直接扱う launch 側の入口で、理由コードだけを持つ supervisor の親プロセスは
-/// [`record_entrypoint_rejection`] を使う。launch 経路（`spawn_container` の子・launcher）への配線は
-/// 未実装（担当 #2624。TASK-29 / TASK-157 系。REPAIR-3）。
+/// [`record_entrypoint_rejection`] を使う。本番 launcher の launch 経路は配線済み（#2624。`launch_intermediate` が
+/// 状態 pipe の exec 前の 2 行目〔`R`/`E`〕から違反を引き直し、親〔C〕でこの関数を呼んで 1 拒否 1 件を記録する）。
+/// 未配線なのは、状態 pipe を持たない経路（`spawn_container` 系の子。何も報告しない）と、`R` の後の `execveat`
+/// 自体の失敗（errno 由来で違反ではないため記録しない）。TASK-29 / TASK-157 系。
 ///
 /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
 /// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った

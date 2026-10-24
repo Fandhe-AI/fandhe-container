@@ -3511,7 +3511,7 @@ mod linux {
     ///
     /// `ControlAuditRelay` は使わない: この試験は単一スレッドで `start` を呼ぶため `FileAuditSink` が主経路で書ける。
     /// 本番の supervisor の `start` は検証が複数スレッドの作業スレッドで走るので、`rejection_audit_sink` に relay
-    /// （理由なしの `Mount` を運べる。#2481）を渡す。その経路の照合は supervisor の結合試験
+    /// （理由なしの `Mount` と、rootfs の固定の違反の閉じた表の理由つき `Mount` を運べる。#2481・#2623）を渡す。その経路の照合は supervisor の結合試験
     /// `start_bind_audit_relay` が担う（docs/design/audit-delivery.md）。
     struct RejectionOnlyLauncher {
         sink: FileAuditSink,

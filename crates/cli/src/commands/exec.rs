@@ -244,9 +244,14 @@ mod linux {
     /// 再実行した子へ渡す親 CLI の pid。子は `PR_SET_PDEATHSIG` の設定後に実際の親と照合し、設定前に親が
     /// 終わっていた競合を検出する（#2626・SUP-6）。
     const PARENT_PID_ENV: &str = "FANDHE_CONTAINER_EXEC_PARENT_PID";
-    /// 再実行した子が「CLI として走り始めた」ことを親へ伝える目印ファイルのパス（環境変数）。
-    /// 親はこれが作られるまでの systemd-run 自身の stderr（D-Bus 接続失敗等の非 JSON の診断）を捨てる（ERR-1・ERR-2）。
-    const START_FILE_ENV: &str = "FANDHE_CONTAINER_EXEC_START_FILE";
+    /// 再実行した子が stderr の最初に書く開始行に含める使い捨ての値（環境変数）。
+    /// 親はこの行が現れるまでの systemd-run 自身の stderr（D-Bus 接続失敗等の非 JSON の診断）を捨てる（ERR-1・ERR-2）。
+    /// 区切りは同じ pipe の中の行なので、時刻やファイルの存在で推定する場合と違い、読み取りの前後関係に左右されない。
+    const START_NONCE_ENV: &str = "FANDHE_CONTAINER_EXEC_START_NONCE";
+    /// 開始行の接頭辞（行は `<接頭辞><nonce>\n`）。
+    const START_LINE_PREFIX: &str = "\u{1e}fandhe-exec-start:";
+    /// 開始行が現れるまでに保持する wrapper の診断の上限（超えた分は先頭から捨て、開始行の長さ分だけ末尾を残す）。
+    const START_SCAN_CAP: usize = 64 * 1024;
     /// 親が子の自前の Timeout 報告を待つ猶予。内側の worker 回収（supervisor の `WORKER_GRACE` 7 秒）と
     /// 子 cgroup の後始末（同 `CHILD_CGROUP_CLEANUP_TIMEOUT` 5 秒）の合計以上にし、通常の期限切れでは
     /// 子が自前の構造化 Timeout を出して cgroup を回収し終えてから親が待ち終えるようにする（REPAIR-5・SUP-6）。
@@ -323,6 +328,20 @@ mod linux {
         write_marker(RESULT_FILE_ENV);
     }
 
+    /// 開始行を stderr へ書く（環境変数が無ければ何もしない）。どの出力よりも前に呼ぶ。
+    fn write_start_line() {
+        use std::io::Write;
+        let Some(nonce) = std::env::var_os(START_NONCE_ENV) else {
+            return;
+        };
+        let Some(nonce) = nonce.to_str() else {
+            return;
+        };
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "{START_LINE_PREFIX}{nonce}");
+        let _ = err.flush();
+    }
+
     /// 環境変数 `env` が指すパスへ目印ファイルを作る（無ければ何もしない）。
     fn write_marker(env: &str) {
         let Some(path) = std::env::var_os(env) else {
@@ -339,7 +358,7 @@ mod linux {
     /// core の cgroup 参加（`exec/cgroup_join.rs`）は移動元と移動先の共通祖先の `cgroup.procs` への書き込み権を要する。
     /// ログインセッションの cgroup からでは祖先が root 所有で `PermissionDenied` になるため、user マネージャ配下
     /// （委譲済み）の scope で実行する。systemd-run は scope 登録後に同じプロセスでコマンドを exec する。
-    /// 再実行した子が終了コードと stderr の構造化エラー行を決め、親は終了コードだけを引き継ぐ（stdout は継承。stderr は走り始めの目印までの wrapper の診断を捨て、以降を流す）。
+    /// 再実行した子が終了コードと stderr の構造化エラー行を決め、親は終了コードだけを引き継ぐ（stdout は継承。stderr は子の開始行までの wrapper の診断を捨て、以降を流す）。
     /// 親は全体の期限（`timeout` + 猶予）の間だけ待ち、超えたら子を止めて回収し `Timeout` を返す（REPAIR-5）。
     /// 子が目印を作らずに終わったとき（systemd-run 自身の失敗）は固定文言の構造化エラーにする。
     /// 前提（systemd-run・user マネージャ）が満たせないときは exec せず失敗する（fail-closed）。
@@ -356,24 +375,58 @@ mod linux {
         }
     }
 
-    /// systemd-run の stderr を捨てるか流すかを決めながら読み切る（容量は 1 回 `STDERR_CHUNK`、保持しない）。
-    /// 子の「走り始めた」目印が出るまでの出力（wrapper の非 JSON 診断）は捨て、出た後（子 CLI 自身の構造化エラー等）は
-    /// そのまま親の stderr へ流す。目印は子が最初の出力より前に作る。終了で `done` を立てる。
+    /// 開始行 `needle` が現れるまでに読んだ出力 `scan` から、開始行の直後の位置を探す。
+    fn find_after(scan: &[u8], needle: &[u8]) -> Option<usize> {
+        scan.windows(needle.len())
+            .position(|w| w == needle)
+            .map(|p| p + needle.len())
+    }
+
+    /// systemd-run の stderr を、開始行までは捨て、以降を親の stderr へ流しながら読み切る（ERR-1・ERR-2）。
+    /// 子は最初の出力として開始行（`<接頭辞><nonce>\n`）を同じ pipe へ書くため、pipe 内の順序で wrapper の診断と
+    /// 子の出力が分かれる。1 回の read に両方が入っても開始行の位置で切る。開始行が現れないまま終わったときは
+    /// 何も流さない（子が走っていない＝wrapper の失敗。親は固定文言の構造化エラーにする）。終了で `done` を立てる。
     fn forward_after_start(
         mut stderr: std::process::ChildStderr,
-        start: std::path::PathBuf,
+        nonce: String,
         done: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
         use std::io::{Read, Write};
+        let needle = format!("{START_LINE_PREFIX}{nonce}\n").into_bytes();
+        let mut scan: Vec<u8> = Vec::new();
+        let mut started = false;
         let mut buf = [0u8; STDERR_CHUNK];
         while let Ok(n) = stderr.read(&mut buf) {
             let Some(chunk) = buf.get(..n).filter(|c| !c.is_empty()) else {
                 break;
             };
-            if start.exists() {
+            let rest: &[u8] = if started {
+                chunk
+            } else {
+                scan.extend_from_slice(chunk);
+                match find_after(&scan, &needle) {
+                    Some(end) => {
+                        started = true;
+                        scan.get(end..).unwrap_or_default()
+                    }
+                    None => {
+                        // 上限を超えたら先頭から捨てる（開始行をまたぐ分だけ末尾を残す）。
+                        let keep = needle.len().saturating_sub(1);
+                        if scan.len() > START_SCAN_CAP {
+                            let cut = scan.len().saturating_sub(keep);
+                            scan.drain(..cut);
+                        }
+                        continue;
+                    }
+                }
+            };
+            if !rest.is_empty() {
                 let mut out = std::io::stderr().lock();
-                let _ = out.write_all(chunk);
+                let _ = out.write_all(rest);
                 let _ = out.flush();
+            }
+            if started {
+                scan.clear();
             }
         }
         done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -409,8 +462,8 @@ mod linux {
             Path::new(&xdg).join(format!("fandhe-exec-{}-{nanos}.done", std::process::id()));
         let mut cmd = scoped_command(&systemd_run, &exe, std::env::args_os().skip(1), &xdg);
         cmd.env(RESULT_FILE_ENV, &marker);
-        let start_marker = marker.with_extension("start");
-        cmd.env(START_FILE_ENV, &start_marker);
+        let start_nonce = format!("{}-{nanos}", std::process::id());
+        cmd.env(START_NONCE_ENV, &start_nonce);
         // 絶対期限（親の開始時刻 + `--timeout`）を渡す。子は実行開始時に残りを算出するため、systemd-run の起動に
         // かかった時間が自動的に差し引かれる。時計を読めなければ渡さず、子は `--timeout` のままになる。
         if let Some(deadline) = start_ms
@@ -432,15 +485,14 @@ mod linux {
         let drained = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         match child.stderr.take() {
             Some(stderr) => {
-                let (path, flag) = (start_marker.clone(), std::sync::Arc::clone(&drained));
+                let (nonce, flag) = (start_nonce.clone(), std::sync::Arc::clone(&drained));
                 // 生成失敗は panic させず、起動済みの子を止めて回収してから構造化エラーにする（P0）。
                 let spawned = std::thread::Builder::new()
                     .name("exec-stderr".into())
-                    .spawn(move || forward_after_start(stderr, path, flag));
+                    .spawn(move || forward_after_start(stderr, nonce, flag));
                 if spawned.is_err() {
                     let _ = kill_and_reap(&mut child);
                     let _ = std::fs::remove_file(&marker);
-                    let _ = std::fs::remove_file(&start_marker);
                     return fail(
                         ErrorCode::Unavailable,
                         "failed to start the stderr forwarder for the user scope command",
@@ -478,7 +530,6 @@ mod linux {
         }
         let ran = marker.exists();
         let _ = std::fs::remove_file(&marker);
-        let _ = std::fs::remove_file(&start_marker);
         match waited {
             None => {
                 let _ = kill_and_reap(&mut child);
@@ -509,8 +560,8 @@ mod linux {
     pub(in super::super) fn run_exec(global: &GlobalArgs, args: &ExecArgs) -> CliExit {
         let started = Instant::now();
         let recorder = OpRecorder::new();
-        // 委譲スコープ内の子は、最初の出力より前に「走り始めた」目印を作る（wrapper の診断と見分ける）。
-        write_marker(START_FILE_ENV);
+        // 委譲スコープ内の子は、最初の出力として開始行を stderr へ書く（wrapper の診断と pipe 内の順序で見分ける）。
+        write_start_line();
         let (exit, delegated) = run_exec_inner(global, args);
         // 委譲スコープ内の子は、最後まで走ったことを親へ伝える（systemd-run 自身の失敗と見分ける）。
         write_result_marker();

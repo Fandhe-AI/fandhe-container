@@ -502,3 +502,15 @@ fn sup6_parse_uptime_ms() {
     assert_eq!(parse_uptime_ms(""), None);
     assert!(monotonic_now_ms().is_some());
 }
+
+/// ERR-1・ERR-2: 開始行は同じ read に wrapper の診断と子の出力が混ざっても位置で切れる（時刻・ファイルに依らない）。
+#[test]
+fn err1_start_line_splits_wrapper_diagnostic_from_child_output() {
+    let needle = format!("{START_LINE_PREFIX}n1\n").into_bytes();
+    let tail = b"{\"code\":1}\n".as_slice();
+    let mixed = [b"Failed to connect to bus\n".as_slice(), &needle, tail].concat();
+    let end = find_after(&mixed, &needle).expect("start line present");
+    assert_eq!(mixed.get(end..), Some(tail));
+    assert_eq!(find_after(b"Failed to connect to bus\n", &needle), None);
+    assert_eq!(find_after(&needle[..needle.len() - 1], &needle), None);
+}

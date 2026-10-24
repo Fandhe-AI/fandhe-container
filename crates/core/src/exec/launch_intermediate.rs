@@ -11,6 +11,7 @@
 //! C --fork--> I(中間プロセス) : isolate(plan。範囲写像では mapper を fork し、応答まで待つ) -> fork -> PID 1(child_main) / 報告 pipe へ "K <pid>" -> _exit
 //! C : 報告 pipe を期限つきで読む -> adopt_reparented(pid) で PID 1 の pidfd を開く -> I を回収する
 //!   -> 状態 pipe(pivot 前段の結果)を読み、監査(C だけが sink に触る)・判定 -> 失敗なら PID 1 を kill_and_reap
+//!   -> (listener の受け渡しの後)状態 pipe の 2 行目(exec 前の `R`/`E`。entrypoint 系の違反)を読み、同様に記録・判定(#2624)
 //! ```
 //!
 //! - **二重 fork の理由**: `unshare(CLONE_NEWPID)` の効果は次の子にだけ及ぶ。呼び出しプロセスを分離すると
@@ -77,8 +78,8 @@ use crate::sys;
 use crate::traits::types::ErrorCode;
 
 use super::launch_status::{
-    ALL_ERROR_CODES, LaunchAudit, PrePivotStatusError, read_line_bounded, read_pre_pivot_status,
-    resolve_pre_pivot_status,
+    ALL_ERROR_CODES, LaunchAudit, PrePivotStatusError, read_exec_phase_status, read_line_bounded,
+    read_pre_pivot_status, resolve_exec_phase_status, resolve_pre_pivot_status,
 };
 use super::process::{
     ChildStdio, ContainerChild, EXIT_SETUP_FAILED, Entrypoint, KILL_REAP_TIMEOUT, PrePivotSetup,
@@ -521,7 +522,11 @@ pub(crate) struct IntermediateSpec<'a> {
 /// sink へ C が 1 件記録する(層 `mount`・パスなし)。
 ///
 /// 前提: 呼び出しプロセスが `Threads: 1`(満たさなければ `FailedPrecondition`。副作用は pipe の作成のみ)。成功
-/// (`P`)の後の失敗(ステージ列・exec)は本入口では返らず、PID 1 の終了として観測される。
+/// (`P`)の後は seccomp の listener を受け取り、さらに PID 1 が `execveat` の直前に書く 2 行目(`R`)まで読んで成功とする。
+/// エントリポイントの検証の失敗(`E`。entrypoint 系の違反 8 理由。`launch_status` の「exec 前の 2 行目」)は起動失敗として
+/// 返り、違反ありなら C が `audit_entrypoint_violation` で層 `entrypoint` に 1 件記録する(SEC-4・#2624)。
+/// 本入口が返った後の失敗は、`R` の後の `execveat` 自体の errno 由来の失敗で、PID 1 の終了として観測される
+/// (違反ではないため記録の対象外)。
 ///
 /// `dev.tty.legacy_tiocsti` の警告(CORE-5・SEC-1・REPAIR-4・REPAIR-5・#1739・#2008): 中間プロセスの fork に成功した
 /// 後、C の側で 1 回だけ、host の値が `1` のときに固定の 1 行を C の stderr へ出す(従来経路
@@ -740,29 +745,40 @@ fn launch_via_intermediate(
             listener: None,
         }),
         Ok(()) => match receive_listener(parent_end.as_fd(), pid1.get(), deadline) {
-            Ok(listener) => Ok(LaunchedChild {
-                child,
-                listener: Some(listener),
-            }),
+            // listener を受け取って ACK を返した後に、PID 1 が書く exec 前の 2 行目(`R`/`E`)を読む(SEC-4・#2624)。
+            // 順序の根拠: PID 1 は ACK を待ってからエントリポイントの検証へ進み、C は上の `P` の判定より前に listener を
+            // 受け取らない。したがって 2 行目は `P` を読み終えた後にしか書かれず、2 行が 1 回の `read` に混ざらない。
+            Ok(listener) => {
+                let exec_phase = read_exec_phase_status(&status_r, remaining());
+                match resolve_exec_phase_status(exec_phase, audit) {
+                    Ok(()) => Ok(LaunchedChild {
+                        child,
+                        listener: Some(listener),
+                    }),
+                    Err(rejection) => Err(kill_pid1_failure(child, *rejection)),
+                }
+            }
             // 受け渡せなければ listener 無しで走らせない。PID 1 は ACK 待ちか既に終了しているため回収する。
-            Err(e) => match child.kill_and_reap(KILL_REAP_TIMEOUT) {
-                Ok(_) => Err(Box::new(PreparedLaunchFailure::clean(
-                    AuditedRejection::not_applicable(e),
-                ))),
-                Err(reap_error) => Err(Box::new(PreparedLaunchFailure::with_unreaped(
-                    AuditedRejection::not_applicable(e),
-                    child,
-                    reap_error,
-                ))),
-            },
+            Err(e) => Err(kill_pid1_failure(
+                child,
+                AuditedRejection::not_applicable(e),
+            )),
         },
-        Err(rejection) => match child.kill_and_reap(KILL_REAP_TIMEOUT) {
-            Ok(_) => Err(Box::new(PreparedLaunchFailure::clean(*rejection))),
-            // 回収失敗は握りつぶさず、子のハンドルごと呼び出し側へ返す(孤児化の防止。CORE-2)。
-            Err(reap_error) => Err(Box::new(PreparedLaunchFailure::with_unreaped(
-                *rejection, child, reap_error,
-            ))),
-        },
+        Err(rejection) => Err(kill_pid1_failure(child, *rejection)),
+    }
+}
+
+/// 起動失敗にする PID 1 を kill して回収し、`rejection` を添えた失敗を返す。回収に失敗した場合は握りつぶさず、
+/// 子のハンドルごと呼び出し側へ返す(孤児化の防止。CORE-2)。
+fn kill_pid1_failure(
+    child: ContainerChild,
+    rejection: AuditedRejection<ExecError>,
+) -> Box<PreparedLaunchFailure> {
+    match child.kill_and_reap(KILL_REAP_TIMEOUT) {
+        Ok(_) => Box::new(PreparedLaunchFailure::clean(rejection)),
+        Err(reap_error) => Box::new(PreparedLaunchFailure::with_unreaped(
+            rejection, child, reap_error,
+        )),
     }
 }
 
@@ -1311,7 +1327,10 @@ mod tests {
     use super::*;
     use crate::audit_log::{AuditLayer, AuditRecord, AuditSink};
     use crate::exec::ViolationReason;
-    use crate::exec::launch_status::{PrePivotFailure, PrePivotStep, report_failure, report_ready};
+    use crate::exec::launch_status::{
+        PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready, report_failure,
+        report_ready,
+    };
     use crate::exec::process::ChildExit;
     use crate::traits::{ContainerId, TraitError};
 
@@ -1813,8 +1832,18 @@ mod tests {
     /// listener の受け渡しの試験で、代役の PID 1(または中間プロセス)が取る動作。
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Handoff {
-        /// 実 listener を載せて送り、ACK を待って 0 で終了する(正常)。
+        /// 実 listener を載せて送り、ACK を待って exec 前の `R` を書き、0 で終了する(正常)。
         Good,
+        /// ACK の後に entrypoint 系の違反 `E ... entrypoint_is_runtime_binary` を書いて眠る(SEC-4・#2624)。
+        ExecViolation,
+        /// ACK の後に理由なしの失敗 `E NOT_FOUND -` を書いて眠る(記録されない)。
+        ExecFailureWithoutReason,
+        /// ACK の後に許可リスト外の理由(`E PERMISSION_DENIED target_moved`)を書いて眠る(`Malformed`)。
+        ExecForeignReason,
+        /// ACK の後に 2 行目を書かずに終了する(EOF)。
+        ExecSilentExit,
+        /// ACK の後に 2 行目を書かずに眠る(期限切れ)。
+        ExecSilentSleep,
         /// `P` を報告して何も送らずに終了する(EOF で即時に失敗するはず)。
         NoSend,
         /// listener ではない fd(pipe)を送る(種別の不一致)。
@@ -1841,6 +1870,20 @@ mod tests {
         Duration,
         u32,
     ) {
+        let (result, elapsed, pid1, _records) = run_handoff_audited(mode, timeout);
+        (result, elapsed, pid1)
+    }
+
+    /// [`run_handoff`] に、C が sink へ記録したレコードを足した版(SEC-4・#2624)。
+    fn run_handoff_audited(
+        mode: Handoff,
+        timeout: Duration,
+    ) -> (
+        Result<LaunchedChild, Box<PreparedLaunchFailure>>,
+        Duration,
+        u32,
+        Vec<AuditRecord>,
+    ) {
         let subreaper = ChildSubreaper::enable().expect("subreaper");
         let (mut pid_read, pid_write) = std::io::pipe().unwrap();
         let pid_write = std::fs::File::from(std::os::fd::OwnedFd::from(pid_write));
@@ -1866,8 +1909,56 @@ mod tests {
                     match mode {
                         Handoff::Good => {
                             match sender.hand_over(child_listener(), Duration::from_secs(10)) {
-                                Ok(()) => 0,
+                                Ok(()) => {
+                                    let _ = report_exec_ready(s);
+                                    0
+                                }
                                 Err(_) => 3,
+                            }
+                        }
+                        Handoff::ExecViolation
+                        | Handoff::ExecFailureWithoutReason
+                        | Handoff::ExecForeignReason
+                        | Handoff::ExecSilentExit
+                        | Handoff::ExecSilentSleep => {
+                            if sender
+                                .hand_over(child_listener(), Duration::from_secs(10))
+                                .is_err()
+                            {
+                                return 3;
+                            }
+                            let mut w = s;
+                            match mode {
+                                Handoff::ExecViolation => {
+                                    let _ = report_exec_failure(
+                                        s,
+                                        &ExecError::from_violation_at(
+                                            ViolationReason::EntrypointIsRuntimeBinary,
+                                            None,
+                                            IsolationStage::Exec,
+                                        ),
+                                    );
+                                }
+                                Handoff::ExecFailureWithoutReason => {
+                                    let _ = report_exec_failure(
+                                        s,
+                                        &ExecError::new(
+                                            ErrorCode::NotFound,
+                                            IsolationStage::Exec,
+                                            "not found",
+                                        ),
+                                    );
+                                }
+                                Handoff::ExecForeignReason => {
+                                    let _ = w.write_all(b"E PERMISSION_DENIED target_moved\n");
+                                }
+                                _ => {}
+                            }
+                            if mode == Handoff::ExecSilentExit {
+                                0
+                            } else {
+                                std::thread::sleep(Duration::from_secs(120));
+                                0
                             }
                         }
                         Handoff::NoSend | Handoff::WrongSender => 0,
@@ -1913,7 +2004,96 @@ mod tests {
         drop(pid_write);
         let mut buf = [0u8; 4];
         let _ = pid_read.read_exact(&mut buf);
-        (result, elapsed, u32::from_le_bytes(buf))
+        let records = sink.0.lock().unwrap().clone();
+        (result, elapsed, u32::from_le_bytes(buf), records)
+    }
+
+    /// SEC-4・#2624: PID 1 が exec 前に返す entrypoint 系の違反(`E`)は、C が層 `entrypoint` に 1 件だけ記録し、
+    /// 起動失敗にして PID 1 を回収する。
+    #[test]
+    fn sec4_2624_launch_records_entrypoint_violation_and_reaps_pid1() {
+        let _serial = serialize_forks();
+        let (result, _, pid1, records) =
+            run_handoff_audited(Handoff::ExecViolation, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::PermissionDenied);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Exec);
+        assert_eq!(
+            failure
+                .rejection
+                .error
+                .violation
+                .as_ref()
+                .map(|v| v.reason.as_str()),
+            Some("entrypoint_is_runtime_binary")
+        );
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::Recorded
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].layer(), AuditLayer::Entrypoint);
+        assert_eq!(
+            records[0].reason().map(|r| r.as_str()),
+            Some("entrypoint_is_runtime_binary")
+        );
+        assert_eq!(records[0].path(), None);
+    }
+
+    /// SEC-4・#2624: 理由なしの失敗(`E NOT_FOUND -`)は起動失敗にするが記録しない。
+    #[test]
+    fn sec4_2624_launch_fails_without_record_for_reasonless_exec_failure() {
+        let _serial = serialize_forks();
+        let (result, _, pid1, records) =
+            run_handoff_audited(Handoff::ExecFailureWithoutReason, Duration::from_secs(20));
+        let failure = result.expect_err("must fail");
+        assert_eq!(failure.rejection.error.code, ErrorCode::NotFound);
+        assert_eq!(failure.rejection.error.stage, IsolationStage::Exec);
+        assert_eq!(
+            failure.rejection.delivery,
+            crate::audit_log::AuditDelivery::NotApplicable
+        );
+        assert!(failure.unreaped.is_empty());
+        assert!(gone(pid1));
+        assert!(records.is_empty());
+    }
+
+    /// SEC-4・#2624: 許可リスト外の理由・2 行目の欠落(EOF)・期限切れは、記録せずに起動失敗にして PID 1 を回収する
+    /// (fail-closed。REPAIR-5)。
+    #[test]
+    fn sec4_2624_launch_fails_closed_on_malformed_missing_or_late_exec_phase() {
+        let _serial = serialize_forks();
+        for (mode, timeout, message) in [
+            (
+                Handoff::ExecForeignReason,
+                Duration::from_secs(20),
+                "the pre-pivot status is malformed",
+            ),
+            (
+                Handoff::ExecSilentExit,
+                Duration::from_secs(20),
+                "the container child exited before reporting the pre-pivot status",
+            ),
+            (
+                Handoff::ExecSilentSleep,
+                Duration::from_secs(4),
+                "timed out waiting for the pre-pivot status",
+            ),
+        ] {
+            let (result, elapsed, pid1, records) = run_handoff_audited(mode, timeout);
+            let failure = result.expect_err("must fail");
+            assert_eq!(failure.rejection.error.message, message);
+            assert_eq!(
+                failure.rejection.delivery,
+                crate::audit_log::AuditDelivery::NotApplicable
+            );
+            assert!(failure.unreaped.is_empty());
+            assert!(gone(pid1));
+            assert!(records.is_empty());
+            assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+        }
     }
 
     /// SEC-4・#2024: PID 1 が載せた実 listener を C が受け取り、種別・close-on-exec を満たす。PID 1 は ACK を

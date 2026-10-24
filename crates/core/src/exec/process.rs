@@ -114,7 +114,10 @@ use crate::traits::types::ErrorCode;
 use super::devices::{NullNodeSource, create_default_devices_with_null_source};
 use super::entrypoint_mode::EntrypointExecMode;
 use super::interpreter::reject_runtime_interpreter;
-use super::launch_status::{PrePivotFailure, PrePivotStep, report_failure, report_ready};
+use super::launch_status::{
+    PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready, report_failure,
+    report_ready,
+};
 use super::masked_paths;
 use super::path_lookup::{self, CandidateKind};
 use super::path_masks;
@@ -503,6 +506,12 @@ fn exec_entrypoint_verified_with(
     entry: &Entrypoint,
     nulling: StdioNulling,
 ) -> Result<Infallible, ExecError> {
+    verify_pivot_root(pivot_mnt_id)?;
+    exec_checked_entrypoint(entry, nulling)
+}
+
+/// `/` のマウント ID が pivot 直後の新 root と一致することを確かめる（`exec_entrypoint_verified` の手順 1）。
+fn verify_pivot_root(pivot_mnt_id: u64) -> Result<(), ExecError> {
     const STAGE: IsolationStage = IsolationStage::Exec;
     let root = sys::open_dir_path_nofollow(None, c"/")
         .map_err(|e| ExecError::from_sys(e, STAGE, "openat(/)"))?;
@@ -514,7 +523,55 @@ fn exec_entrypoint_verified_with(
         ));
     }
     drop::<OwnedFd>(root);
-    exec_checked_entrypoint(entry, nulling)
+    Ok(())
+}
+
+/// launch の PID 1 の終端（`run_child`）。[`exec_entrypoint_verified_with`] の手順に、状態 pipe `status` への
+/// 2 行目の報告を足したもの（SEC-4・#2624。ワイヤー形式は `launch_status` の「exec 前の 2 行目」）。
+///
+/// `status` が `Some` のとき、`execveat` より前の手順が失敗したら `E <CODE> <reason|->` を書いて失敗を返し、全手順が
+/// 通ったら `R` を書いてから `execveat` する（`R` を書けなければ `execveat` へ進まない。fail-closed）。`R` の後の
+/// `execveat` 自体の失敗は何も書かない（親が `R` を読んだ後に `E` が混ざらないようにするため。errno 由来で、
+/// PID 1 の終了として観測される）。状態 pipe は `close_inherited_fds` が 1 本だけ残し、`execveat` の成功で閉じる
+/// （close-on-exec）。`status` が `None` なら [`exec_entrypoint_verified_with`] と同じ（何も書かない）。
+fn exec_entrypoint_verified_reporting(
+    pivot_mnt_id: u64,
+    entry: &Entrypoint,
+    nulling: StdioNulling,
+    status: Option<&std::fs::File>,
+) -> Result<Infallible, ExecError> {
+    let Some(status) = status else {
+        return exec_entrypoint_verified_with(pivot_mnt_id, entry, nulling);
+    };
+    let prepared = verify_pivot_root(pivot_mnt_id).and_then(|()| {
+        prepare_exec_child(
+            entry,
+            Some(status.as_fd()),
+            EntrypointSource::Pinned,
+            None,
+            nulling,
+        )
+    });
+    match prepared {
+        Err(err) => {
+            report_exec_failure_best_effort(status, &err);
+            Err(err)
+        }
+        Ok(exe) => {
+            report_exec_ready(status)?;
+            Err(execve_checked(entry, &exe))
+        }
+    }
+}
+
+/// `execveat` 前の失敗を状態 pipe へ書く。書けなくても元のエラーを返す（親は EOF を起動失敗として扱う）。
+fn report_exec_failure_best_effort(status: &std::fs::File, err: &ExecError) {
+    if report_exec_failure(status, err).is_err() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "fandhe-container: the exec phase status could not be reported"
+        );
+    }
 }
 
 /// `exec_entrypoint_verified` の手順 2 以降（fd 3 以上の close → エントリポイントの検査 → 標準入出力の置換 →
@@ -2065,11 +2122,20 @@ fn run_child(
     setup: Option<PrePivotSetup<'_>>,
     nulling: StdioNulling,
 ) -> Result<Infallible, ExecError> {
+    // 状態 pipe は pivot 前段の報告（`P`/`F`）に続き、終端でも exec 前の 2 行目（`R`/`E`）に使う（#2624）。
+    let status = setup.and_then(|s| s.status);
     run_child_then(rootfs, setup, stages, |isolation, report, evidence| {
         // `exec_entrypoint` と同じ検証を、ステージ列が作った証跡を添えて行う。
-        isolation.verify_caller(IsolationStage::Exec)?;
-        require_restriction_evidence(evidence)?;
-        exec_entrypoint_verified_with(report.new_root_mnt_id, entry, nulling)
+        let checked = isolation
+            .verify_caller(IsolationStage::Exec)
+            .and_then(|()| require_restriction_evidence(evidence));
+        if let Err(err) = checked {
+            if let Some(status) = status {
+                report_exec_failure_best_effort(status, &err);
+            }
+            return Err(err);
+        }
+        exec_entrypoint_verified_reporting(report.new_root_mnt_id, entry, nulling, status)
     })
 }
 
@@ -2101,7 +2167,9 @@ pub(crate) struct PrePivotSetup<'a> {
     pub(crate) pinned_rootfs: Option<BorrowedFd<'a>>,
     /// pivot 前段の結果を親へ返す状態 pipe の書き込み側（#1815。`launch_status` の形式）。あれば `run_child_then` が
     /// 成功（`P`）または失敗（`F ...`）を 1 行書く。`None` なら何も返さない（従来どおり）。子はここ以外で sink に
-    /// 触らない。pivot 前段が終われば `close_inherited_fds` が閉じる（workload へ渡らない）。
+    /// 触らない。終端（`run_child`）は同じ pipe に exec 前の 2 行目（`R`/`E`。entrypoint 系の違反を親の監査へ届ける。
+    /// #2624）も書くため、`close_inherited_fds` はこの 1 本だけ残し、`mark_fds_cloexec` と close-on-exec により
+    /// `execveat` の成功で閉じる（workload へ渡らない）。
     pub(crate) status: Option<&'a std::fs::File>,
     /// pivot 後に移る作業ディレクトリ（`process.cwd`。`None` または `Root` なら移らない。OCI-1・TASK-29）。
     /// 違反は状態 pipe の段 `working_dir` で親へ返る。

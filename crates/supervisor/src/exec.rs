@@ -240,9 +240,11 @@
 //!   [`run_command_with_pidfd`] へ [`default_audit_sink`] の sink を渡す配線（未実装。healthcheck は #2441、CLI の exec は #2626）。supervisor の start 入口（`start_entry`）からは配線済み（#1717・#2481）。本番の
 //!   `AuditSink` の実体（`FileAuditSink`）と生成の入口 [`default_audit_sink`] は実装済み（#1594）。層 `exec_target` と
 //!   [`run_command_with_pidfd`] での 1 拒否 1 件の記録は実装済み（#1465）。`ExecOutcome::exit` が運ぶ `execve` 前の違反
-//!   （`SetupFailed`。種別 `entrypoint`）の層 `entrypoint` での記録も実装済み（#1595）。未実装なのは
-//!   launch 経路（`spawn_container` の子・本番 launcher）で同じ理由が生じたときの記録の配線（担当 #2624。core の
-//!   `exec::audit_entrypoint_violation`。entrypoint 系の理由は pre-pivot の状態 pipe の許可リストに無く、子の側で落とされる）。worker の経路の違反（種別 `exec_target` の 10 理由と種別 `rootfs_pivot` の
+//!   （`SetupFailed`。種別 `entrypoint`）の層 `entrypoint` での記録も実装済み（#1595）。launch 経路（本番 launcher の子）で
+//!   同じ理由が生じたときの記録も配線済み（#2624。core の `launch_intermediate` が状態 pipe の exec 前の 2 行目〔`R`/`E`〕を
+//!   読み、`exec::audit_entrypoint_violation` で記録して起動失敗にする。supervisor ではなく launcher の呼び出し元の
+//!   `audit_sink` に書く）。`R` の後の `execveat` 自体の errno 由来の失敗は違反ではないため記録しない。
+//!   status 無しの経路（`spawn_container` 系）の子は何も報告しない。worker の経路の違反（種別 `exec_target` の 10 理由と種別 `rootfs_pivot` の
 //!   `rootfs_is_host_root`、bundle の rootfs の固定の種別 `mount_target` の `path_symlink_or_not_directory`・`path_missing`）と
 //!   exec の子の違反（種別 `entrypoint` の 8 理由）は、いずれもこの入口で記録する（「監査記録」）。
 //!   この入口の記録の対象外: 種別 `mount_target` の `target_moved` は launch の `pivot_root` 前だけで生じ、種別

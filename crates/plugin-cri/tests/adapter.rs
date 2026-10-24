@@ -5,13 +5,15 @@
 
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+use fandhe_container_core::traits::CleanupOutcome;
 #[cfg(not(target_os = "linux"))]
 use fandhe_container_core::traits::Signal;
 use fandhe_container_core::traits::{
-    AttachRequest, CleanupOutcome, ContainerId, ContainerRuntime, ContainerStatus,
-    CreateNetnsRequest, CreateNetworkRequest, DeleteNetworkRequest, DeleteRequest, DetachRequest,
-    ErrorCode, IpCidr, KillRequest, NetworkName, NetworkPlugin, PublishPortRequest, StartRequest,
-    StateRequest, StopRequest,
+    AttachRequest, ContainerId, ContainerRuntime, ContainerStatus, CreateNetnsRequest,
+    CreateNetworkRequest, DeleteNetworkRequest, DeleteRequest, DetachRequest, ErrorCode, IpCidr,
+    KillRequest, NetworkName, NetworkPlugin, PublishPortRequest, StartRequest, StateRequest,
+    StopRequest,
 };
 use fandhe_container_cri::adapter::{BundleProvider, BundleRequest};
 use fandhe_container_cri::error::CriErrorCode;
@@ -436,7 +438,7 @@ mod store_backed {
         assert_eq!(
             lines,
             vec![
-                "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_log\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"cleanup after delete left resources behind\"}\n"
+                "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_log\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"cleanup after delete left resources behind\"}"
                     .to_owned()
             ]
         );

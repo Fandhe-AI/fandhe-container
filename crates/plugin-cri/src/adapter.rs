@@ -259,13 +259,13 @@ pub struct CoreLifecycleRuntime {
     supervised: SupervisedLifecycle,
 }
 
-/// `delete` の後始末で残した資源 1 件の構造化ログ 1 行（末尾に改行）を作る（OCI-7・CRI-2・SUP-7・REPAIR-4）。
+/// `delete` の後始末で残した資源 1 件の構造化ログ 1 行（末尾の改行は付けない。`LineSink` が書き込み時に付ける）を作る（OCI-7・CRI-2・SUP-7・REPAIR-4）。
 ///
 /// 値は `ContainerId`（検証済みの文字種）・`CleanupTarget::as_str`・`ErrorCode::as_str` の固定語彙だけで組み、
 /// パス・errno・外部入力の文字列を含めない（ERR-1・ERR-2）。
 fn cleanup_warning_line(id: &ContainerId, target: CleanupTarget, code: ErrorCode) -> String {
     format!(
-        "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"{}\",\"target\":\"{}\",\"code\":\"{}\",\"message\":\"cleanup after delete left resources behind\"}}\n",
+        "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"{}\",\"target\":\"{}\",\"code\":\"{}\",\"message\":\"cleanup after delete left resources behind\"}}",
         id.as_str(),
         target.as_str(),
         code.as_str()

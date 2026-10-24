@@ -25,8 +25,8 @@
 //!   ときに再検討する。#2545・SEC-5）。
 //! - `argv[0]` は選んだ候補のパスにする（実体は `canonicalize` 後のパスで exec する）。busybox 等の multi-call
 //!   バイナリがアプレットを `argv[0]` の basename で解決するため（#2545）。
-//! - `/etc/nsswitch.conf` の `subid:` が `files` 以外（libsubid・sssd・FreeIPA 等）の構成は、ファイルを読む方式では
-//!   範囲を得られないため `SubidSourceProbe::NameService` として検出し、`id_model` が起動を拒否する（#2545）。
+//! - `/etc/nsswitch.conf` の `subid:` の最初の語が `files` 以外（libsubid・sssd・FreeIPA 等。shadow 4.13 の `nss.c`
+//!   に合わせた判定。#2636）の構成は、ファイルを読む方式では範囲を得られないため `SubidSourceProbe::NameService` として検出し、`id_model` が起動を拒否する（#2545）。
 //! - 終了コード 2（キー無し）は、`/etc/nsswitch.conf` の passwd 系が `files` 等のローカル源だけのときに限り
 //!   「名前なし」とする。LDAP・sssd 等の遠隔源があるときは NSS の障害と区別できないため `Err`（起動拒否）。
 //! - 参照の失敗・不正な出力・期限切れは `Err`（fail-closed）。名前の有無を判定できないまま 1 対 1 写像へ落とさない。
@@ -126,11 +126,11 @@ impl From<OwnerLookupError> for fandhe_container_core::traits::TraitError {
 /// `/etc/nsswitch.conf` の `subid:` の判定（範囲を NSS から配る構成の検出。#2545・CORE-6）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubidSourceProbe {
-    /// `subid:` が無い・`files` だけ（`/etc/subuid`・`/etc/subgid` を読む既存の方式で足りる）。
+    /// `subid:` が無い・値が空・最初の語が `files`（`/etc/subuid`・`/etc/subgid` を読む既存の方式で足りる）。
     Files,
-    /// `files` 以外の源がある（libsubid・sssd・FreeIPA 等。ファイルを読む方式では範囲を得られない）。
+    /// 最初の語が `files` 以外（libsubid・sssd・FreeIPA 等。ファイルを読む方式では範囲を得られない）。
     NameService,
-    /// 読めない・上限超過・書式不正・値が空（判定できないため拒否する）。
+    /// 読めない・上限超過・UTF-8 不正・NUL・`\v`/`\f`/`\r` を含む（判定できないため拒否する）。
     Unusable,
 }
 
@@ -319,31 +319,47 @@ mod linux {
 
     /// `nsswitch.conf` の本文から `subid:` の判定をする（純関数）。
     ///
-    /// 行が無い・値が `files` だけなら `Files`。角括弧の動作指定は読み飛ばす。値が空・閉じていない角括弧は
-    /// `Unusable`（判定できないため拒否）。`files` 以外の源が 1 つでもあれば `NameService`。
-    /// shadow の `lib/nss.c` の原文での値の解釈の確認は未実施のため、`files` 以外はすべて拒否の安全側に倒している。
+    /// shadow 4.13（commit `24b44b686ea2221405cfd806dede046cf1fd9584`）の `lib/nss.c` `nss_init()` の判定に合わせる
+    /// （4.19.4 の commit `115f7aa445f051a413d8b771efaa2ab0ca302770` も同じ意味。#2636・CORE-6・SEC-5）。
+    ///
+    /// - `#` で始まる行だけを注釈として読み飛ばす（行の途中の `#` は注釈にしない）。
+    /// - 行頭の 6 バイトが大文字小文字を区別せず `subid:` と一致する行だけを対象にする（前置きの空白・`:` の前の空白は対象外）。
+    /// - 値の先頭の空白とタブを読み飛ばし、空ならその行を捨てて次の行へ進む。
+    /// - 値が空でない最初の行の、最初の語（空白かタブまで）だけを見る。`files` なら `Files`、それ以外は `NameService`
+    ///   （shadow は `dlopen("libsubid_<語>.so")` の成否で決めるが、ファイルの内容からは分からないため拒否の安全側に倒す）。
+    /// - 本文に NUL がある、または対象行の値に `\v`・`\f`・`\r` がある場合は `Unusable`（版によって区切りの扱いが違い、
+    ///   結果が `dlopen` 次第になるため判定しない）。
     #[must_use]
     pub fn subid_sources_from_text(text: &str) -> SubidSourceProbe {
-        let mut found: Option<Vec<String>> = None;
-        for raw in text.lines() {
-            let line = raw.split('#').next().unwrap_or("");
-            let Some((key, rest)) = line.split_once(':') else {
-                continue;
-            };
-            if key.trim() != "subid" {
+        if text.contains('\0') {
+            return SubidSourceProbe::Unusable;
+        }
+        for line in text.split('\n') {
+            if line.starts_with('#') {
                 continue;
             }
-            let Some(srcs) = plain_sources(rest) else {
-                return SubidSourceProbe::Unusable;
+            let Some(head) = line.get(..6) else {
+                continue;
             };
-            found.get_or_insert_with(Vec::new).extend(srcs);
+            if !head.eq_ignore_ascii_case("subid:") {
+                continue;
+            }
+            let rest = line.get(6..).unwrap_or("");
+            if rest.contains(['\u{b}', '\u{c}', '\r']) {
+                return SubidSourceProbe::Unusable;
+            }
+            let value = rest.trim_start_matches([' ', '\t']);
+            if value.is_empty() {
+                continue;
+            }
+            let word = value.split([' ', '\t']).next().unwrap_or("");
+            return if word == "files" {
+                SubidSourceProbe::Files
+            } else {
+                SubidSourceProbe::NameService
+            };
         }
-        match found {
-            None => SubidSourceProbe::Files,
-            Some(v) if v.is_empty() => SubidSourceProbe::Unusable,
-            Some(v) if v.iter().all(|t| t == "files") => SubidSourceProbe::Files,
-            Some(_) => SubidSourceProbe::NameService,
-        }
+        SubidSourceProbe::Files
     }
 
     /// 期限後の子の回収の猶予。
@@ -1180,16 +1196,44 @@ mod linux {
                 ("subid: files\n", SubidSourceProbe::Files),
                 ("subid: files # c\n", SubidSourceProbe::Files),
                 ("subid: sss\n", SubidSourceProbe::NameService),
-                ("subid: files sss\n", SubidSourceProbe::NameService),
+                // shadow 4.13 nss.c: 最初の語だけを見る（L77〜85）。
+                ("subid: files sss\n", SubidSourceProbe::Files),
                 (
                     "subid: files [SUCCESS=return] sss\n",
+                    SubidSourceProbe::Files,
+                ),
+                ("subid: files [x\n", SubidSourceProbe::Files),
+                // 値が空の行は捨てる（L72〜76）。行頭の空白・`:` 前の空白は対象外（L70）。
+                ("subid:\n", SubidSourceProbe::Files),
+                ("subid:   \n", SubidSourceProbe::Files),
+                (" subid: sss\n", SubidSourceProbe::Files),
+                ("subid : sss\n", SubidSourceProbe::Files),
+                ("subid: files\nsubid: sss\n", SubidSourceProbe::Files),
+                ("#subid: sss\n", SubidSourceProbe::Files),
+                ("Subid: files\n", SubidSourceProbe::Files),
+                // 大文字小文字は区別しない（strncasecmp）。dlopen 次第の語は拒否する。
+                ("SUBID: sss\n", SubidSourceProbe::NameService),
+                ("subid: files#x\n", SubidSourceProbe::NameService),
+                ("subid:\tsss files\n", SubidSourceProbe::NameService),
+                (
+                    "subid: [SUCCESS=return] files\n",
                     SubidSourceProbe::NameService,
                 ),
-                ("subid: files [x\n", SubidSourceProbe::Unusable),
-                ("subid:\n", SubidSourceProbe::Unusable),
+                ("subid:\nsubid: sss\n", SubidSourceProbe::NameService),
+                ("subid: sss", SubidSourceProbe::NameService),
+                // 版によって扱いが違う文字は判定しない。
+                ("subid: files\r\n", SubidSourceProbe::Unusable),
+                ("subid: files\0\n", SubidSourceProbe::Unusable),
+                ("subid:\x0bsss\n", SubidSourceProbe::Unusable),
             ] {
                 assert_eq!(subid_sources_from_text(text), want, "{text}");
             }
+            // 50 文字を超える語は shadow では files になるが、ここでは拒否の安全側（NameService）に倒す。
+            let long = format!("subid: {}\n", "x".repeat(51));
+            assert_eq!(
+                subid_sources_from_text(&long),
+                SubidSourceProbe::NameService
+            );
             let d = tmp("subidfile");
             let conf = d.join("nsswitch.conf");
             let l = stub(&d, "exit 2");

@@ -166,6 +166,52 @@ pub fn remove_container_logs_guarded_bounded(
     })
 }
 
+/// コンテナログ削除で、同じ ID の sink が閉じるのを待つ既定の上限（SUP-7・CRI-2・REPAIR-5・#2634）。
+///
+/// supervisor は `Stopped` を記録した後に seccomp hub と ログ hub の drain（各々 `terminate` で上限づけ。既定
+/// `StartTimeouts::DEFAULT_TERMINATE` = 5 秒）を行ってから sink を閉じる。このため `stop` 直後の削除では最悪で
+/// 約 10 秒ロックが取れない。その窓を覆う値で、`CONTAINER_LOG_REMOVE_TIMEOUT`（1 回の試行の上限）とは別に数える。
+pub const CONTAINER_LOG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`remove_container_logs_guarded_bounded_waiting`] が試し直す間隔。
+pub const CONTAINER_LOG_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// [`remove_container_logs_guarded_bounded`] を、`FailedPrecondition`（同じ ID の sink が生存中）のあいだ
+/// `lock_wait` まで試し直す版（plugin-cri の `RemoveContainer` 用。SUP-7・CRI-2・REPAIR-5・#2634）。
+///
+/// running への force 削除や `stop` 直後の削除では、状態が `Stopped` になっても supervisor が sink を閉じきるまで
+/// ロックが取れない。ここでは呼び出し元スレッドが sleep するだけで、I/O と同時実行枠（supervisor ログの削除と共有）は
+/// 1 回の試行の間（上限 `attempt_timeout`）しか使わない。試し直すのは `FailedPrecondition` だけで、`Timeout`・
+/// `InvalidArgument`・`Internal` は即座に返す（待ちを延ばさない）。`guard` は試行ごとにロック保持中に評価され、
+/// `false`（再作成済み）なら 0 件で成功して試し直さない。最悪の所要は `lock_wait` + `attempt_timeout`。
+/// `lock_wait` が 0 なら 1 回だけ試す。
+pub fn remove_container_logs_guarded_bounded_waiting(
+    root: &std::path::Path,
+    id: &fandhe_container_core::traits::ContainerId,
+    lock_wait: std::time::Duration,
+    attempt_timeout: std::time::Duration,
+    guard: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+) -> Result<RemovedLogs, fandhe_container_core::traits::TraitError> {
+    use fandhe_container_core::traits::ErrorCode;
+    use std::time::Instant;
+    let started = Instant::now();
+    loop {
+        let g = std::sync::Arc::clone(&guard);
+        let result = remove_container_logs_guarded_bounded(root, id, attempt_timeout, move || g());
+        match &result {
+            Err(e) if e.code() == ErrorCode::FailedPrecondition => {
+                let elapsed = started.elapsed();
+                let Some(remaining) = lock_wait.checked_sub(elapsed).filter(|r| !r.is_zero())
+                else {
+                    return result;
+                };
+                std::thread::sleep(CONTAINER_LOG_LOCK_POLL.min(remaining));
+            }
+            _ => return result,
+        }
+    }
+}
+
 /// コンテナログのローテーション設定（既定 1MiB × 3 世代）。書き手と読み手が同じ値を使う。
 pub fn container_log_rotation_config() -> RotationConfig {
     RotationConfig::default()

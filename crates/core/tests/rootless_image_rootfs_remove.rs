@@ -16,6 +16,9 @@
 //! - `d2`: 最上位自身が subuid 所有・mode 0700 の展開途中の木（ホストの uid ではロック用に開けない）を、
 //!   権限なしは `LockError` で残し、権限ありは userns の中でロック・同一性確認・削除まで行って回収する
 //! - `e`: 展開に失敗した create の後始末（`image_rootfs_cleanup`）が、権限ありなら subuid 所有の木を消す
+//! - `f`: core 専有のラッパー（実効 uid 所有）の下の子が subuid 所有・mode 0700 の展開途中の木（#2635）。
+//!   ラッパーの所有者が崩れないので `Unverified` にならず、権限なしは失敗として残し、権限ありは回収する。
+//!   rootful でイメージが所有者を変える場合の実機確認〔root 版〕は CI で回さない（#1621）
 //!
 //! # 実機前提テストとしての分離
 //! `harness = false` の単一スレッド `main`（fork と `CLONE_NEWUSER` の前提）。非特権 user namespace を許可する
@@ -429,6 +432,36 @@ mod linux {
         assert_eq!(r.reclaimed.len(), 1, "{r:?}");
         assert!(!staging.exists());
         println!("rootless_image_rootfs_remove: scenario d2 verified");
+        drop(sb);
+
+        // f: core 専有のラッパー（実効 uid 所有・0700）の下の子が subuid 所有・mode 0700 の展開途中の木（#2635）。
+        // ラッパーの所有者は崩れないので `Unverified` にならず、権限なしは削除の失敗として残し、権限ありは
+        // 通常の経路（ホストでラッパーを開いてロックし、userns の中で消す）で回収する。
+        let sb = Sandbox::new("f");
+        let wrapper = sb.bundle().join(".fandhe-unpack-3-1");
+        std::fs::create_dir(&wrapper).expect("wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        let child = wrapper.join("rootfs");
+        std::fs::create_dir(&child).expect("child");
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).expect("mode");
+        populate_child(&child, true);
+        let rec = OpRecorder::new();
+        let r =
+            reap_stale_unpacks_with(&sb.bundle(), Path::new("rootfs"), &ReapOptions::new(), &rec)
+                .expect("reap (host)");
+        assert!(r.reclaimed.is_empty(), "{r:?}");
+        assert!(r.kept_unverified.is_empty(), "{r:?}");
+        assert_eq!(r.failed.len(), 1, "{r:?}");
+        assert_eq!(counts(&rec, "image_rootfs_reap_failed"), (0, 1));
+        assert_eq!(counts(&rec, "image_rootfs_reap_kept_unverified"), (0, 0));
+        assert!(wrapper.exists());
+        let options = ReapOptions::new().with_privilege(sub.clone());
+        let r = reap_stale_unpacks_with(&sb.bundle(), Path::new("rootfs"), &options, &rec)
+            .expect("reap (subordinate)");
+        assert_eq!(r.reclaimed.len(), 1, "{r:?}");
+        assert!(r.kept_unverified.is_empty() && r.failed.is_empty(), "{r:?}");
+        assert!(!wrapper.exists());
+        println!("rootless_image_rootfs_remove: scenario f verified");
         drop(sb);
 
         // e: 展開に失敗した create の後始末。

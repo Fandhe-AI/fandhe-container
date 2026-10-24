@@ -81,6 +81,12 @@ impl Sandbox {
         FileStateStore::open(StateRoot::from_override(root).expect("root")).expect("open store")
     }
 
+    /// 別の状態ルート（`--root` 違い）のストア（`name` は状態ルートのディレクトリ名）。
+    fn store_at(&self, name: &str) -> FileStateStore {
+        let root = self.dir.join(name);
+        FileStateStore::open(StateRoot::from_override(root).expect("root")).expect("open store")
+    }
+
     fn request(&self) -> CreateRequest {
         CreateRequest::new(ContainerId::new("c1").expect("id"), self.bundle()).expect("request")
     }
@@ -186,6 +192,9 @@ impl StateStore for Wrapped<'_> {
     }
     fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
         self.inner.delete(req)
+    }
+    fn host_state_root(&self) -> Option<&Path> {
+        self.inner.host_state_root()
     }
 }
 
@@ -721,6 +730,9 @@ fn oci7_orphan_reap_keeps_rootfs_when_state_list_fails() {
         fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
             self.0.delete(req)
         }
+        fn host_state_root(&self) -> Option<&Path> {
+            self.0.host_state_root()
+        }
     }
     let sb = Sandbox::new();
     let inner = sb.store();
@@ -729,6 +741,103 @@ fn oci7_orphan_reap_keeps_rootfs_when_state_list_fails() {
     lose_state(&sb);
     let rec = OpRecorder::new();
     let err = run_recorded(&ListFails(&inner), &refs, &rec, &sb.request()).expect_err("keep");
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+    assert!(sb.rootfs().join("bin").join("true").is_file());
+    assert_eq!(orphan_reap_counts(&rec), (0, 1));
+}
+
+/// OCI-5・OCI-7・#2635: 別の状態ルート（`--root` 違い）のコンテナが使う公開済みの rootfs は、こちらの状態ルートの
+/// 一覧に見えなくても孤児と取り違えて消さない。`AlreadyExists` で拒否し、印も展開物も残り、失敗 1 件を記録する。
+#[test]
+fn oci7_2635_orphan_reap_keeps_tree_of_other_state_root() {
+    let sb = Sandbox::new();
+    let refs = Refs::default();
+    run(&sb.store(), &refs, &Unpacker { fail: false }, &sb).expect("create in root A");
+    let marker_before = std::fs::read(sb.rootfs().join(MARKER_NAME)).expect("marker");
+
+    let other = sb.store_at("state-b");
+    let rec = OpRecorder::new();
+    let err = run_recorded(&other, &refs, &rec, &sb.request()).expect_err("blocked");
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+    assert!(sb.rootfs().join("bin").join("true").is_file());
+    assert_eq!(
+        std::fs::read(sb.rootfs().join(MARKER_NAME)).expect("marker"),
+        marker_before
+    );
+    assert_eq!(orphan_reap_counts(&rec), (0, 1));
+}
+
+/// OCI-5・OCI-7・#2635: 状態を失った木でも、別の状態ルートの create は消さない。持ち主の状態ルートの
+/// create だけが孤児として回収する（成功 1 件）。
+#[test]
+fn oci7_2635_orphan_of_other_root_is_kept_until_same_root_reaps() {
+    let sb = Sandbox::new();
+    let refs = Refs::default();
+    run(&sb.store(), &refs, &Unpacker { fail: false }, &sb).expect("create in root A");
+    lose_state(&sb);
+
+    let rec_b = OpRecorder::new();
+    let err = run_recorded(&sb.store_at("state-b"), &refs, &rec_b, &sb.request())
+        .expect_err("other root keeps it");
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+    assert_eq!(orphan_reap_counts(&rec_b), (0, 1));
+    assert!(sb.rootfs().join("bin").join("true").is_file());
+
+    let rec_a = OpRecorder::new();
+    let req = CreateRequest::new(ContainerId::new("a2").expect("id"), sb.bundle()).expect("req");
+    run_recorded(&sb.store(), &refs, &rec_a, &req).expect("same root reclaims");
+    assert_eq!(orphan_reap_counts(&rec_a), (1, 0));
+}
+
+/// OCI-5・OCI-7・#2635: 識別子を持たない v2 の印の木は、別の状態ルートのものかもしれず確かめられないので消さない。
+#[test]
+fn oci7_2635_orphan_reap_keeps_v2_marker() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let refs = Refs::default();
+    run(&store, &refs, &Unpacker { fail: false }, &sb).expect("create");
+    let marker = sb.rootfs().join(MARKER_NAME);
+    let text = std::fs::read_to_string(&marker).expect("marker");
+    let v2: String = text.lines().take(2).map(|l| format!("{l}\n")).collect();
+    assert_eq!(text.lines().count(), 3, "v3 marker has the scope line");
+    write_marker(&marker, v2.as_bytes());
+    lose_state(&sb);
+    let rec = OpRecorder::new();
+    let err = run_recorded(&store, &refs, &rec, &sb.request()).expect_err("blocked");
+    assert_eq!(err.code(), ErrorCode::AlreadyExists);
+    assert!(sb.rootfs().join("bin").join("true").is_file());
+    assert_eq!(orphan_reap_counts(&rec), (0, 1));
+}
+
+/// OCI-5・OCI-7・#2635: 状態ルートを示せないストア（`host_state_root` が `None`）は識別子を照合できないので、
+/// 同じ状態ルートの木でも消さない。
+#[test]
+fn oci7_2635_orphan_reap_keeps_tree_without_host_state_root() {
+    struct NoRoot<'a>(&'a FileStateStore);
+    impl StateStore for NoRoot<'_> {
+        fn create(&self, req: &CreateStateRequest) -> Result<StateRecord, TraitError> {
+            self.0.create(req)
+        }
+        fn update(&self, req: &UpdateStateRequest) -> Result<StateRecord, TraitError> {
+            self.0.update(req)
+        }
+        fn get(&self, req: &GetStateRequest) -> Result<StateRecord, TraitError> {
+            self.0.get(req)
+        }
+        fn list(&self, req: &ListStateRequest) -> Result<StateList, TraitError> {
+            self.0.list(req)
+        }
+        fn delete(&self, req: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
+            self.0.delete(req)
+        }
+    }
+    let sb = Sandbox::new();
+    let inner = sb.store();
+    let refs = Refs::default();
+    run(&inner, &refs, &Unpacker { fail: false }, &sb).expect("create");
+    lose_state(&sb);
+    let rec = OpRecorder::new();
+    let err = run_recorded(&NoRoot(&inner), &refs, &rec, &sb.request()).expect_err("keep");
     assert_eq!(err.code(), ErrorCode::AlreadyExists);
     assert!(sb.rootfs().join("bin").join("true").is_file());
     assert_eq!(orphan_reap_counts(&rec), (0, 1));

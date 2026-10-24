@@ -38,12 +38,15 @@
 //!   取得ごとに同じ検査を `@lock` / ゲートファイルの作成より前に再実行する（`reverify_root`・#2547）。
 //!   権限の基準（厳密な 0700 か現行の `0o022` か）と root の所有者の基準はオーナー判断待ちで、現行を保つ
 //!   （選択肢と影響は `docs/design/image-store-root-trust.md`・#2547）。残る制約: Windows は検査しない
-//!   （ACL は #2428 の方式判断後）、macOS の拡張 ACL は見ない（根拠は同 doc）、再検査から使用までの
-//!   差し替え（TOCTOU）は `openat` 起点の操作に移さない限り閉じきれず「root と祖先は所有者専用」の前提で
-//!   防ぐ（移さない根拠は同 doc）。`sys` は `geteuid` と Linux 限定の `at` で、`O_NOFOLLOW` /
-//!   `O_NONBLOCK` は持たない。
+//!   （ACL は #2428 の方式判断後）、macOS の拡張 ACL は見ない（根拠は同 doc）。
+//! - 再検査から使用までの差し替え（TOCTOU）は、Linux の x86_64 / aarch64 では root を開いたまま持つ
+//!   `RootHandle`（`root_handle`）の fd 起点の `openat2` / `*at` で閉じる（#2638）。入口の `reverify_root` が
+//!   差し替えを検出して拒否し、区間内の永続化操作（`@lock`・参照・在庫・ジャーナル・blob の削除）は検査済みの
+//!   実体にだけ届く。他の OS・アーキテクチャはパス起点＋入口の再検査のままで、「root と祖先は所有者専用」の
+//!   前提で防ぐ。`usage` の読み取りと `pull` の staging・公開はパス起点のまま（根拠は同 doc の論点 3）。
+//!   Linux 5.6 未満など `openat2` が使えない環境では `open` が `Unimplemented` で拒否する。
 
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, TryLockError};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError as MutexTryLockError};
@@ -56,6 +59,7 @@ use super::gc_journal::{
     PendingDeletionRecovery, STALE_TMP_PREFIXES, journal_exists, reap_stale_tmp,
 };
 use super::inventory_persist::load_image_inventory;
+use super::root_handle::RootHandle;
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 
@@ -73,10 +77,8 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 /// 参照テーブルへの唯一の入口が [`ImageStore::lock`] で、返るガードの生存期間が排他区間になる。
 #[derive(Debug)]
 pub struct ImageStore {
-    root: PathBuf,
-    /// open 時に検査した root の (dev, ino)。`reverify_root` が差し替えの検出に使う（#2547）。
-    #[cfg(unix)]
-    root_id: (u64, u64),
+    /// open 時に検査した root を開いたまま持つ。永続化操作はここを起点にする（#2638）。
+    handle: Arc<RootHandle>,
     table: Mutex<ReferenceTable>,
     timeout: Duration,
     recorder: Arc<dyn OciOpRecorder>,
@@ -116,11 +118,14 @@ impl ImageStore {
             ));
         }
         #[cfg(unix)]
-        let (root, root_id) = verify_root_trust(root, &meta)?;
+        let handle = {
+            let (canonical, id) = verify_root_trust(root, &meta)?;
+            RootHandle::open_checked(canonical, id)?
+        };
+        #[cfg(not(unix))]
+        let handle = RootHandle::open_checked(root)?;
         Ok(Self {
-            root,
-            #[cfg(unix)]
-            root_id,
+            handle: Arc::new(handle),
             table: Mutex::new(table),
             timeout: IMAGE_STORE_LOCK_TIMEOUT,
             recorder: Arc::new(NoopOciOpRecorder),
@@ -146,7 +151,12 @@ impl ImageStore {
 
     /// ストア root。
     pub fn root(&self) -> &Path {
-        &self.root
+        self.handle.path()
+    }
+
+    /// 検査済み root のハンドル（永続化操作の起点。同モジュール階層の入口が使う）。
+    pub(super) fn handle(&self) -> &Arc<RootHandle> {
+        &self.handle
     }
 
     /// 排他区間の取得を待つ上限（`with_timeout` の値）。create ゲートが同じ期限を使う。
@@ -163,7 +173,7 @@ impl ImageStore {
             let guard = self.lock_inner()?;
             // 復旧後もジャーナル（墓標を含む）が見えているなら、変更を許さない（OCI-7）。
             // 古い untag・manifest 除去が再登録と両立しないため、障害が除かれて復旧が完了するまで拒否する。
-            if journal_exists(&self.root) {
+            if journal_exists(&self.handle) {
                 return Err(OciError::new(
                     OciErrorCode::FailedPrecondition,
                     "a pending image deletion could not be completed; retry after it is recovered",
@@ -194,28 +204,30 @@ impl ImageStore {
         let table = self.lock_table_until(deadline)?;
         // open 後の chmod / 差し替えを `@lock` の作成より前に fail-closed で拒否する（#2547・SEC-1）。
         self.reverify_root()?;
-        let file = open_lock_file(&self.root)?;
+        #[cfg(test)]
+        test_hook::run_after_reverify();
+        let file = open_lock_file(&self.handle)?;
         lock_file_until(&file, deadline)?;
         let mut guard = ImageStoreGuard {
             _file: file,
             table,
             recovered: None,
         };
-        guard.table.set_journal_root(&self.root);
+        guard.table.set_root_handle(Arc::clone(&self.handle));
         // 区間に入るたびにディスクのコンテナ参照を正とする（#2341）。壊れた参照表は fail-closed で拒否する。
-        if let Some(persisted) = load_container_refs(&self.root)? {
+        if let Some(persisted) = load_container_refs(&self.handle)? {
             guard.table.apply_persisted_container_refs(persisted);
         }
         // manifest の在庫・タグ・pull リースも同様にディスクを正とする（#2380）。ファイルが無ければメモリ上の
         // 内容を保つ。復旧と GC の数え直しが別プロセスのリース・タグを見られるよう、復旧より前に読む。
-        if let Some(persisted) = load_image_inventory(&self.root)? {
+        if let Some(persisted) = load_image_inventory(&self.handle)? {
             guard.table.apply_persisted_inventory(persisted);
         }
         // 他の操作が割り込む前に、前回の中断した削除を片づける。ジャーナルがあったときだけ記録する。
-        reap_stale_tmp(&self.root, STALE_TMP_PREFIXES);
-        let recovered = if journal_exists(&self.root) {
+        reap_stale_tmp(&self.handle, STALE_TMP_PREFIXES);
+        let recovered = if journal_exists(&self.handle) {
             record_oci_op(&*self.recorder, OciOpKind::RecoverPendingDeletion, || {
-                guard.table.resume_pending_deletion(&self.root)
+                guard.table.resume_pending_deletion_at(&self.handle)
             })?
         } else {
             None
@@ -297,7 +309,7 @@ impl ImageStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let meta = fs::symlink_metadata(&self.root).map_err(|e| {
+            let meta = fs::symlink_metadata(self.handle.path()).map_err(|e| {
                 let code = if e.kind() == std::io::ErrorKind::NotFound {
                     OciErrorCode::NotFound
                 } else {
@@ -311,15 +323,19 @@ impl ImageStore {
                     "image store root is not a directory",
                 ));
             }
-            if (meta.dev(), meta.ino()) != self.root_id {
+            if (meta.dev(), meta.ino()) != self.handle.id() {
                 return Err(OciError::new(
                     OciErrorCode::Internal,
                     "image store root changed after open",
                 ));
             }
+            // 所有者・権限は開いている実体（fd）で見る。パスの差し替えに影響されない（#2638）。
+            let held = self.handle.root_meta().map_err(|_| {
+                OciError::new(OciErrorCode::Internal, "image store root is not accessible")
+            })?;
             let euid = crate::sys::effective_uid();
-            verify_root_meta(&meta, euid)?;
-            verify_ancestors(&self.root, euid)?;
+            verify_root_meta(&held, euid)?;
+            verify_ancestors(self.handle.path(), euid)?;
         }
         Ok(())
     }
@@ -411,19 +427,19 @@ fn verify_ancestor_meta(meta: &fs::Metadata, euid: u32) -> Result<(), OciError> 
 }
 
 /// `@lock` を開く（無ければ 0600 で作る）。symlink・通常ファイル以外は拒否する。
-fn open_lock_file(root: &Path) -> Result<File, OciError> {
+fn open_lock_file(root: &RootHandle) -> Result<File, OciError> {
     open_named_lock_file(root, IMAGE_STORE_LOCK_FILE_NAME)
 }
 
 /// root 直下の固定名ロックファイルを開く（無ければ 0600 で作る）。symlink・通常ファイル以外は拒否する。
 ///
 /// `name` は定数だけを渡す（外部入力からパスを組まない）。`@lock` と create ゲート（`create_gate.rs`）が共用する。
-pub(super) fn open_named_lock_file(root: &Path, name: &str) -> Result<File, OciError> {
-    let path = root.join(name);
-    let pre = match fs::symlink_metadata(&path) {
-        Ok(m) if m.is_file() => Some(m),
-        Ok(_) => return Err(lock_file_error()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+/// Linux の x86_64 / aarch64 では検査済み root の fd 起点で開く（`O_NOFOLLOW`。#2638）。
+pub(super) fn open_named_lock_file(root: &RootHandle, name: &str) -> Result<File, OciError> {
+    let pre = match root.stat_name(name) {
+        Ok(Some(m)) if m.is_file() => Some(m),
+        Ok(Some(_)) => return Err(lock_file_error()),
+        Ok(None) => None,
         Err(_) => {
             return Err(OciError::new(
                 OciErrorCode::Internal,
@@ -431,19 +447,19 @@ pub(super) fn open_named_lock_file(root: &Path, name: &str) -> Result<File, OciE
             ));
         }
     };
-    let mut opts = OpenOptions::new();
-    opts.create(true).truncate(false).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let file = opts.open(&path).map_err(|_| {
-        OciError::new(
-            OciErrorCode::Internal,
-            "failed to open the image store lock file",
-        )
-    })?;
+    let file = match root.open_lock(name) {
+        Ok(f) => f,
+        Err(_) => {
+            // 検査後に symlink・ディレクトリへ差し替えられた場合（`O_NOFOLLOW` の拒否など）は通常ファイルでない扱い。
+            return Err(match root.stat_name(name) {
+                Ok(Some(m)) if !m.is_file() => lock_file_error(),
+                _ => OciError::new(
+                    OciErrorCode::Internal,
+                    "failed to open the image store lock file",
+                ),
+            });
+        }
+    };
     let post = file.metadata().map_err(|_| lock_file_error())?;
     if !post.is_file() {
         return Err(lock_file_error());
@@ -472,6 +488,37 @@ fn lock_file_until(file: &File, deadline: Instant) -> Result<(), OciError> {
                     "failed to lock the image store lock file",
                 ));
             }
+        }
+    }
+}
+
+/// 試験用: `reverify_root` の直後（排他区間の中の最初の操作の前）に任意の処理を差し込む。
+/// 検査後に root を差し替える競合を決定的に再現するために使う（OCI-7・SEC-1・#2638）。
+#[cfg(test)]
+pub(super) mod test_hook {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static AFTER_REVERIFY: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// 次の 1 回の `lock` の再検査直後に実行する処理を仕込む（このスレッドだけ・1 回限り）。
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        allow(dead_code)
+    )]
+    pub(in crate::image_management) fn set_after_reverify(f: impl FnOnce() + 'static) {
+        AFTER_REVERIFY.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn run_after_reverify() {
+        if let Some(f) = AFTER_REVERIFY.with(|h| h.borrow_mut().take()) {
+            f();
         }
     }
 }
@@ -610,7 +657,8 @@ mod tests {
     #[test]
     fn oci7_other_file_handle_holding_lock_times_out() {
         let (root, store) = seeded_store("handle", SHORT);
-        let other = open_lock_file(&root).expect("open lock file");
+        let other = open_lock_file(&RootHandle::open_unchecked(&root).expect("handle"))
+            .expect("open lock file");
         lock_file_until(&other, Instant::now() + SHORT).expect("external lock");
         let e = store.lock().expect_err("held elsewhere");
         assert_eq!(e.code(), OciErrorCode::Timeout);

@@ -1,9 +1,10 @@
 //! ディレクトリ fd 起点の操作（`openat2(2)`・`*at(2)`・`getdents64(2)`）の薄いラッパー。Linux の x86_64 / aarch64 限定。
 //!
 //! # 呼び出し文脈
-//! `layer::anchored` の `AnchoredRoot` だけが使う。レイヤー展開（OCI-1・OCI-2）の変更操作を `root` の fd 起点に
-//! 閉じ込め、確認（`lstat`）から使用までの間に祖先が symlink へ差し替えられても `root` の外へ書き込めない
-//! ようにする（SEC-5・#2437）。依存追加は禁止のため `extern "C"` 宣言を自前で持つ。`libc` との機械照合は
+//! `layer::anchored` の `AnchoredRoot` と `image_management::root_handle` が使う。前者はレイヤー展開
+//! （OCI-1・OCI-2）の変更操作を `root` の fd 起点に閉じ込め、確認（`lstat`）から使用までの間に祖先が
+//! symlink へ差し替えられても `root` の外へ書き込めないようにする（SEC-5・#2437）。後者はイメージストア root
+//! 直下の永続化操作を検査済み root の fd 起点に閉じ込める（OCI-7・SEC-1・#2638）。依存追加は禁止のため `extern "C"` 宣言を自前で持つ。`libc` との機械照合は
 //! 子 `libc_abi` で行う（#2590。`docs/design/ffi-libc-check.md`）。定数と構造体は次の一次情報で確認した値である:
 //! `include/uapi/linux/openat2.h`（`struct open_how` は `flags` / `mode` / `resolve` の `u64` 3 つで 24 バイト。
 //! Linux 5.6 で追加）、`include/uapi/asm-generic/unistd.h`（`__NR_openat2` = 437 は全アーキテクチャ共通。
@@ -91,6 +92,13 @@ unsafe extern "C" {
     fn mkdirat(dirfd: c_int, path: *const c_char, mode: c_uint) -> c_int;
     // SAFETY（宣言そのものの妥当性）: POSIX の `int unlinkat(int, const char *, int)`。
     fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int;
+    // SAFETY（宣言そのものの妥当性）: POSIX の `int renameat(int, const char *, int, const char *)`。
+    fn renameat(
+        olddirfd: c_int,
+        oldpath: *const c_char,
+        newdirfd: c_int,
+        newpath: *const c_char,
+    ) -> c_int;
     // SAFETY（宣言そのものの妥当性）: POSIX の `int symlinkat(const char *, int, const char *)`。
     fn symlinkat(target: *const c_char, newdirfd: c_int, linkpath: *const c_char) -> c_int;
     // SAFETY（宣言そのものの妥当性）: POSIX の `int linkat(int, const char *, int, const char *, int)`。
@@ -208,6 +216,20 @@ pub(crate) fn unlinkat_name(dir: BorrowedFd<'_>, name: &OsStr, remove_dir: bool)
     let flags = if remove_dir { AT_REMOVEDIR } else { 0 };
     // SAFETY: `n` は NUL 終端で呼び出しの間生きる。`dir` は借用の間有効。
     check(unsafe { unlinkat(raw(dir), n.as_ptr(), flags) })
+}
+
+/// `renameat(2)`。両方の名前は 1 コンポーネントで、`new_name` が既にあれば原子的に置き換わる
+/// （`image_management::root_handle` が一時ファイルを固定名へ公開するために使う。#2638）。
+pub(crate) fn renameat_names(
+    old_dir: BorrowedFd<'_>,
+    old_name: &OsStr,
+    new_dir: BorrowedFd<'_>,
+    new_name: &OsStr,
+) -> io::Result<()> {
+    let o = component_cstring(old_name)?;
+    let n = component_cstring(new_name)?;
+    // SAFETY: `o` と `n` は NUL 終端で呼び出しの間生きる。2 つの fd は借用の間有効。
+    check(unsafe { renameat(raw(old_dir), o.as_ptr(), raw(new_dir), n.as_ptr()) })
 }
 
 /// `symlinkat(2)`。`target` は NUL を含まない任意のバイト列（リンク先は解釈されない）。
@@ -403,6 +425,19 @@ mod libc_abi {
         libc::unlinkat;
 
     const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+    ) -> libc::c_int = renameat;
+    const _: unsafe extern "C" fn(
+        libc::c_int,
+        *const libc::c_char,
+        libc::c_int,
+        *const libc::c_char,
+    ) -> libc::c_int = libc::renameat;
+
+    const _: unsafe extern "C" fn(
         *const libc::c_char,
         libc::c_int,
         *const libc::c_char,
@@ -547,6 +582,33 @@ mod tests {
         std::os::unix::fs::symlink(base.join("outside"), base.join("root/a")).unwrap();
         let e = openat2(Some(root.as_fd()), &ab, flags, 0, resolve).unwrap_err();
         assert_eq!(e.raw_os_error(), Some(ELOOP));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// OCI-7・SEC-1・#2638: `renameat_names` は fd 起点で名前を付け替え、既存の名前を置き換える。
+    /// 1 コンポーネントでない名前は `InvalidInput`、存在しない元は `NotFound`。
+    #[test]
+    fn oci7_renameat_names_concrete_values() {
+        let base = tmp("renameat");
+        let d = open_dir(&base);
+        std::fs::write(base.join("a"), b"new").unwrap();
+        std::fs::write(base.join("b"), b"old").unwrap();
+        renameat_names(d.as_fd(), OsStr::new("a"), d.as_fd(), OsStr::new("b")).unwrap();
+        assert_eq!(std::fs::read(base.join("b")).unwrap(), b"new");
+        assert_eq!(
+            std::fs::symlink_metadata(base.join("a"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        for bad in ["x/y", "..", ""] {
+            let e =
+                renameat_names(d.as_fd(), OsStr::new(bad), d.as_fd(), OsStr::new("c")).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad}");
+        }
+        let e =
+            renameat_names(d.as_fd(), OsStr::new("nope"), d.as_fd(), OsStr::new("c")).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
         std::fs::remove_dir_all(&base).unwrap();
     }
 

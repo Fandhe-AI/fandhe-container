@@ -7,6 +7,8 @@
 //! `image_management::store` の `ImageStore::open` / `with_table` が、イメージストア root と祖先ディレクトリの
 //! 所有者を現在プロセスの実効 uid と照合するために使う（OCI-7・SEC-1・#2381）。依存追加は禁止
 //! （dependency-policy）のため、他 crate の `sys` と同じ流儀で `extern "C"` 宣言を自前で持つ。
+//! Linux の x86_64 / aarch64 では `at`（`openat2` 系）を `layer::anchored` と `image_management::root_handle`
+//! （root 配下の永続化操作を検査済み root の fd 起点にする。#2638）が使う。
 //!
 //! # libc との照合（#2590）
 //! `geteuid` の型は子 `libc_abi`、`at.rs` の番号・フラグ・`OpenHow` のレイアウト・関数の型は `at::libc_abi` で、
@@ -35,7 +37,8 @@ pub(crate) fn effective_uid() -> u32 {
 }
 
 // ディレクトリ fd 起点の操作（`openat2` 系。#2437・OCI-1・SEC-5）。Linux の x86_64 / aarch64 限定。
-// 他のアーキテクチャ・OS ではコンパイルせず、呼び出し側（`layer::anchored`）が fail-closed にする。
+// 他のアーキテクチャ・OS ではコンパイルせず、呼び出し側（`layer::anchored`）が fail-closed にし、
+// `image_management::root_handle` はパス起点の実装に切り替える（#2638）。
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")

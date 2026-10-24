@@ -73,7 +73,7 @@ impl ImageStore {
         guard: &mut ImageStoreGuard<'_>,
         before: ContainerPortion,
     ) -> Result<(), OciError> {
-        match save_container_refs(self.root(), guard) {
+        match save_container_refs(self.handle(), guard) {
             Ok(()) => Ok(()),
             Err(e) => {
                 guard.restore_container_portion(before);

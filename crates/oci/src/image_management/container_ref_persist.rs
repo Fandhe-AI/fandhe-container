@@ -30,12 +30,13 @@
 //! 矛盾したファイルは fail-closed で拒否する（空として扱うと参照が消えて GC が誤削除するため）。
 //! 世代の矛盾（`generation >= next_generation`・重複）は再発行の恐れがあるため `DataLoss` とする。
 //! group / other に書き込み権のあるファイル（`PermissionDenied`）・symlink・通常ファイル以外（`Internal`）も拒否する。
-//! root の所有者・権限・祖先の検査は `ImageStore::open` が行う（#2381。unix のみ）。
+//! root の所有者・権限・祖先の検査は `ImageStore::open` が行う（#2381。unix のみ）。読み書きは検査済み root の
+//! ハンドル（`root_handle::RootHandle`）起点で、Linux の x86_64 / aarch64 では検査後に root が差し替えられても
+//! 差し替え後のディレクトリへ届かない（#2638。他の OS はパス起点で入口の再検査のみ）。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use std::cell::Cell;
@@ -44,6 +45,7 @@ use std::fmt;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
+use super::root_handle::RootHandle;
 use super::{ContainerRefEntry, ContainerRefGeneration, ContainerRefId, ReferenceTable};
 use crate::error::{OciError, OciErrorCode};
 use crate::reference::Digest;
@@ -166,19 +168,20 @@ fn check_trust(m: &fs::Metadata) -> Result<(), OciError> {
 }
 
 /// コンテナ参照ファイルを読む。無ければ `Ok(None)`（永続化された状態なし）。
-pub(super) fn load_container_refs(root: &Path) -> Result<Option<PersistedContainerRefs>, OciError> {
+pub(super) fn load_container_refs(
+    root: &RootHandle,
+) -> Result<Option<PersistedContainerRefs>, OciError> {
     load_with_limits(root, MAX_CONTAINER_REFS, MAX_CONTAINER_REFS_FILE_BYTES)
 }
 
 fn load_with_limits(
-    root: &Path,
+    root: &RootHandle,
     max_entries: usize,
     max_bytes: u64,
 ) -> Result<Option<PersistedContainerRefs>, OciError> {
-    let path = root.join(CONTAINER_REFS_FILE_NAME);
-    let pre = match fs::symlink_metadata(&path) {
-        Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    let pre = match root.stat_name(CONTAINER_REFS_FILE_NAME) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Ok(None),
         Err(_) => {
             return Err(e(
                 OciErrorCode::Internal,
@@ -187,12 +190,16 @@ fn load_with_limits(
         }
     };
     check_trust(&pre)?;
-    let file = File::open(&path).map_err(|_| {
+    let open_failed = || {
         e(
             OciErrorCode::Internal,
             "failed to open the container refs file",
         )
-    })?;
+    };
+    let file = root
+        .open_read(CONTAINER_REFS_FILE_NAME)
+        .map_err(|_| open_failed())?
+        .ok_or_else(open_failed)?;
     let post = file.metadata().map_err(|_| {
         e(
             OciErrorCode::Internal,
@@ -386,11 +393,8 @@ fn next_tmp_nonce() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-fn tmp_path(root: &Path, nonce: u64) -> PathBuf {
-    root.join(format!(
-        "{CONTAINER_REFS_TMP_PREFIX}{}-{nonce}",
-        std::process::id()
-    ))
+fn tmp_name(nonce: u64) -> String {
+    format!("{CONTAINER_REFS_TMP_PREFIX}{}-{nonce}", std::process::id())
 }
 
 #[cfg(test)]
@@ -400,7 +404,10 @@ thread_local! {
 }
 
 /// テーブルのコンテナ参照部分を保存する（一時ファイル → fsync → rename → 親ディレクトリ fsync）。
-pub(super) fn save_container_refs(root: &Path, table: &ReferenceTable) -> Result<(), OciError> {
+pub(super) fn save_container_refs(
+    root: &RootHandle,
+    table: &ReferenceTable,
+) -> Result<(), OciError> {
     #[cfg(test)]
     if FAIL_SAVE.with(Cell::get) {
         // 権限に依存せず（root・DAC 迂回環境でも）保存失敗を再現する試験用の注入。
@@ -415,7 +422,7 @@ pub(super) fn save_container_refs(root: &Path, table: &ReferenceTable) -> Result
 }
 
 fn save_with_limits(
-    root: &Path,
+    root: &RootHandle,
     table: &ReferenceTable,
     max_entries: usize,
     max_bytes: u64,
@@ -448,38 +455,30 @@ fn save_with_limits(
             "container refs file would be too large",
         ));
     }
-    let tmp = tmp_path(root, next_tmp_nonce());
+    let tmp = tmp_name(next_tmp_nonce());
     let result = write_and_rename(root, &tmp, &bytes);
     if result.is_err() {
         // rename 前の失敗では一時ファイルを残さない（ベストエフォート）。
-        let _ = fs::remove_file(&tmp);
+        let _ = root.unlink(&tmp);
     }
     result
 }
 
-fn write_and_rename(root: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), OciError> {
+/// 一時ファイルを書いて固定名へ公開し、root を fsync する。すべて検査済み root の fd 起点（#2638）。
+fn write_and_rename(root: &RootHandle, tmp: &str, bytes: &[u8]) -> Result<(), OciError> {
     let fail = |msg: &'static str| e(OciErrorCode::Internal, msg);
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(tmp)
+    let mut f = root
+        .create_new(tmp)
         .map_err(|_| fail("failed to create the container refs temp file"))?;
     f.write_all(bytes)
         .map_err(|_| fail("failed to write the container refs temp file"))?;
     f.sync_all()
         .map_err(|_| fail("failed to sync the container refs temp file"))?;
     drop(f);
-    fs::rename(tmp, root.join(CONTAINER_REFS_FILE_NAME))
+    root.rename(tmp, CONTAINER_REFS_FILE_NAME)
         .map_err(|_| fail("failed to replace the container refs file"))?;
-    // 新しい名前を永続化する。Windows ではディレクトリを File として開けないため unix に限る。
-    #[cfg(unix)]
-    File::open(root)
-        .and_then(|d| d.sync_all())
+    // 新しい名前を永続化する（Windows ではディレクトリを開けないため `sync` は何もしない）。
+    root.sync()
         .map_err(|_| fail("failed to sync the image store directory"))?;
     Ok(())
 }
@@ -487,7 +486,10 @@ fn write_and_rename(root: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), OciErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_management::root_handle::rh;
     use crate::image_management::{ContainerRefRelease, ImageStore, ManifestComposition};
+    use std::fs::OpenOptions;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 
@@ -850,13 +852,15 @@ mod tests {
         t.register_container(cid("x1"), &d(0xa0)).expect("x1");
         t.register_container(cid("x2"), &d(0xa0)).expect("x2");
         assert_eq!(
-            save_with_limits(&r, &t, 1, MAX_CONTAINER_REFS_FILE_BYTES)
+            save_with_limits(&rh(&r), &t, 1, MAX_CONTAINER_REFS_FILE_BYTES)
                 .expect_err("over")
                 .code(),
             OciErrorCode::ResourceExhausted
         );
         assert_eq!(
-            save_with_limits(&r, &t, 2, 10).expect_err("bytes").code(),
+            save_with_limits(&rh(&r), &t, 2, 10)
+                .expect_err("bytes")
+                .code(),
             OciErrorCode::ResourceExhausted
         );
         let b = open(&r);

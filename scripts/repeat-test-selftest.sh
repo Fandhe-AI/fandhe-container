@@ -30,6 +30,9 @@ case "${STUB_MODE}" in
   bin-ok) echo "exec_x: all scenarios passed" ;;
   bin-na) echo "exec_x: Linux only, not applicable on this OS" ;;
   bin-prefix) echo "xx exec_x: all scenarios passed yy" ;;
+  bin-early-large)
+    echo "exec_x: all scenarios passed"
+    head -c 4000000 /dev/zero | tr '\0' 'x'; echo ;;
   bin-crlf) printf 'exec_x: all scenarios passed\r\n' ;;
   bin-fail2)
     if [ "${n}" -eq 2 ]; then echo "boom"; exit 1; fi
@@ -70,6 +73,8 @@ check bin-one-failure 1 "passed=2 failed=1 count=3" bin-fail2 "${P}" "${B}" "${S
 check bin-one-failure-reason 1 "reason=exit" bin-fail2 "${P}" "${B}" "${S}" COUNT=3
 check bin-timeout 1 "reason=timeout" bin-hang "${P}" "${B}" "${S}" COUNT=1 RUN_TIMEOUT=1
 check bin-crlf-accepted 0 "passed=2 failed=0 count=2" bin-crlf "${P}" "${B}" "${S}" COUNT=2
+# 成功行が大きなログの先頭にあっても（grep の早期終了による SIGPIPE で）失敗に数えない。
+check bin-early-success-line-large-log 0 "passed=2 failed=0 count=2" bin-early-large "${P}" "${B}" "${S}" COUNT=2
 # 引数: --test が付き、--lib / --exact が付かない。TEST_IGNORED=1 で -- --ignored が付く。
 rm -f "${work}/args"
 env PATH="${work}/bin:${PATH}" STUB_MODE=bin-ok STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \

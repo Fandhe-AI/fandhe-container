@@ -99,7 +99,9 @@ output_ok() {
   if [ -n "${TEST}" ]; then
     grep -q 'test result: ok. 1 passed' "${out}"
   else
-    tr -d '\r' <"${out}" | grep -qxF -- "${SUCCESS_LINE}"
+    # grep -q は最初の一致で終了し、上流の tr が SIGPIPE で非ゼロ終了して pipefail が誤って失敗にするため、
+    # -q を使わず入力を最後まで読み切る（成功行が出力の途中にあっても判定は一致の有無だけで決まる）。
+    tr -d '\r' <"${out}" | grep -xF -- "${SUCCESS_LINE}" >/dev/null
   fi
 }
 

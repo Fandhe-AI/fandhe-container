@@ -29,6 +29,11 @@
 //! # 実機前提テストとしての分離
 //! Linux 5.12 以降で root もしくは非特権 user namespace を許可するホストが必要。`-- --ignored` 指定時のみ実行する
 //! （ci.md「実機前提テスト」。AGENTS.md）。rootful 経路（root）の実行は root 権限コマンドのため明示指示のもとで行う。
+//!
+//! # fork 子で観測する理由（#2630・CORE-5・REPAIR-3）
+//! `spawn_container_probe_with_tmpfs_and_config_paths` を使い続け、exec 後のエントリポイント内の観測へは移さない。
+//! 目的が「Landlock を載せない exec 層のマウントの結果」の観測にあるため。exec 経路は `LaunchReady` のために Landlock が
+//! 必須で、本番は同じ重なりを start で拒否する（Landlock 段の照合は #2071）。移すと観測の対象そのものが変わる。
 
 #[cfg(target_os = "linux")]
 #[path = "support/temp_rootfs.rs"]

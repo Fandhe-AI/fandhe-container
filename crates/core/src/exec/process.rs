@@ -2652,14 +2652,28 @@ fn run_child_then<T>(
 /// - probe の結果は終了コードではなく、呼び出し側が fork 前に用意した fd（pipe 等）で受け渡す
 /// - 単体テストは置かない（fork と分離環境を要するため `tests/escape_suite.rs` の結合試験でカバーする）
 ///
-/// # 将来仕様（記録のみ）
+/// # 残す呼び出し元と理由（#2630・REPAIR-3）
 ///
 /// プローブの成功は証跡ではない。`tests/seccomp.rs` はエントリポイント内の観測へ移したため本関数を使わない
-/// （#2386・#2543）。残る呼び出し元は `escape_suite`・`readonly_paths`・`masked_paths`・`config_paths`・
-/// `config_paths_implicit_dev`・`sysfs_mount`・`fork_exec_isolation` で、これらのエントリポイント内への移行と
-/// 本関数の廃止は未着手（REPAIR-3）。fork 子で観測しても識別性が落ちない根拠: seccomp フィルタ・
-/// `NO_NEW_PRIVS`・Landlock のドメイン・マウントの状態は execve をまたいで変わらない。capability は例外で、
-/// exec 後の値は `production_launcher` のシナリオ J が照合する。
+/// （#2386・#2543）。残る呼び出し元は `escape_suite`（ESC-03・ESC-06 を含む）・`readonly_paths`・`masked_paths`・
+/// `config_paths`・`config_paths_implicit_dev`・`sysfs_mount`・`fork_exec_isolation` で、#2630 で呼び出し元ごとに
+/// 判断した結果、いずれも移さず**本関数は廃止しない**（全部移せたときだけ廃止する）。
+/// fork 子で観測しても識別性が落ちない根拠: seccomp フィルタ・`NO_NEW_PRIVS`・Landlock のドメイン・
+/// マウントの状態は execve をまたいで変わらない。capability は例外で、exec 後の値は `production_launcher` の
+/// シナリオ J が照合する。
+///
+/// - `masked_paths`・`config_paths`・`sysfs_mount`: exec 経路の試験用入口が `config_paths` / `sysfs` を受け取らず、
+///   `platform-ci` の `--ignored` 対象でもないため移行後の観測を CI で確かめられない。exec 経路は Landlock が必須で
+///   `EACCES` の発生源も増える
+/// - `config_paths_implicit_dev`: Landlock なしの exec 層の観測が目的で、exec 経路では対象が変わる
+/// - `fork_exec_isolation` の `landlock-apply-*`: Landlock のドメインは execve をまたいで変わらず、exec 側は
+///   `landlock-exec` / `landlock-missing` が照合済み
+/// - `readonly_paths`: マウントの状態は execve をまたいで変わらず移せる見込みはあるが、`platform-ci` で観測を確かめる
+///   前に移すと検証不能な変更になるため、exec 経路の観測の確認（Landlock が書き込み用 `open` の errno を変えないこと）と
+///   同時に後続で移す
+/// - `escape_suite`: ESC-03 は listener の受け渡しと応答ループを 1 つのハーネスで扱い、exec 後の対応物は `supervisor_bin_real`
+///   のシナリオ E と `production_launcher` のシナリオ J。ESC-06 の exec 後の対応物は `tests/seccomp.rs` の `kill-<名前>` と
+///   シナリオ K。いずれも移さない
 ///
 /// 任意クロージャを分離後の子で実行できるため、cargo feature `escape-probe`（結合試験用に dev-dependency の
 /// 自己参照で有効化。通常ビルドには含まれない）でのみ公開する。
@@ -2707,7 +2721,7 @@ where
 ///
 /// 戻り値の listener は呼び出し側（試験）が持つ応答者の入力で、応答は `-EPERM` だけにする（許可へ覆さない）。
 /// 受け渡せなければ子を期限つきで kill して回収し `Err` を返す（listener 無しで走らせない。fail-closed）。
-/// 制限適用証跡の例外・契約・将来仕様は [`spawn_container_probe`] と同じ（REPAIR-3）。
+/// 制限適用証跡の例外・契約・残す理由は [`spawn_container_probe`] と同じ（REPAIR-3）。
 /// 呼び出し元は `escape_suite` の ESC-03 だけで、応答ハブ（supervisor の `SeccompNotifyHub`）そのものの試験ではない（hub の通しは `supervisor_bin_real` のシナリオ E が担う。#2482）。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
@@ -2746,7 +2760,7 @@ where
 /// `masked_paths` 段（覆うパスの固定集合。SEC-2・TASK-29 追補・#1851）まで本番と同じ順序で適用してから、pivot 後に
 /// `probe` を実行する。結合試験 `tests/masked_paths.rs` 専用で、本番 launcher には依存しない（`exec_entrypoint` の
 /// fail-closed は変えない）。`tmpfs`・`inject`・`pinned_rootfs`・`status` は指定しない。
-/// `spawn_container_probe` と同じ制限適用証跡の例外・契約・将来仕様に従う（REPAIR-3）。
+/// `spawn_container_probe` と同じ制限適用証跡の例外・契約・残す理由に従う（REPAIR-3）。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub fn spawn_container_probe_with_devices<F>(
@@ -2882,7 +2896,7 @@ where
 /// [`spawn_container_probe_with_devices`] に `/sys` の sysfs の供給（`mount_sysfs`。#2020・SEC-2）を足した版。
 /// 子は本番と同じ順序（`verify_pinned` の直後に `mount_sysfs` → `create_default_devices` → `readonly_paths` →
 /// `masked_paths` → `pivot_root`）で適用してから、pivot 後に `probe` を実行する。結合試験 `tests/sysfs_mount.rs`
-/// 専用で、本番 launcher には依存しない。`spawn_container_probe` と同じ制限適用証跡の例外・契約・将来仕様に従う（REPAIR-3）。
+/// 専用で、本番 launcher には依存しない。`spawn_container_probe` と同じ制限適用証跡の例外・契約・残す理由に従う（REPAIR-3）。
 #[cfg(feature = "escape-probe")]
 #[doc(hidden)]
 pub fn spawn_container_probe_with_sysfs<F>(

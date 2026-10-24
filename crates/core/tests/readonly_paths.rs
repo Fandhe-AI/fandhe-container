@@ -42,6 +42,13 @@
 //! Linux 5.12 以降（`mount_setattr`）で、root もしくは非特権 user namespace を許可するホストが必要。GitHub ホステッド
 //! runner では保証できないため `-- --ignored` 指定時のみ実行する（ci.md「実機前提テスト」）。rootful 経路（root）の
 //! 実行は root 権限コマンドのため明示指示のもとで行い、結果を #1621 へ記録する。
+//!
+//! # fork 子で観測する理由（#2630・CORE-5・REPAIR-3）
+//! `spawn_container_probe` を使い続け、exec 後のエントリポイント内の観測へはまだ移さない。観測するのは mountinfo の
+//! `ro` と書き込み用 `open` の errno で、マウントの状態は execve をまたいで変わらないため移せる見込みはある。ただし
+//! exec 経路は Landlock が必須で、書き込み用 `open` の errno（`EROFS` / `EACCES`）への影響を `platform-ci` の
+//! `--ignored` で確かめる必要がある（手元では setgroups の拒否で `--ignored` を実行できない）。期待値を緩めずに
+//! 移すため、確認できる環境での後続変更とする。
 
 #[cfg(not(target_os = "linux"))]
 fn main() {

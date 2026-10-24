@@ -231,4 +231,4 @@ rootless の user namespace の中での展開（#2382）: `extract.rs` の `cho
 `sec5_special_bits_to_keep_in_userns_matrix`（`/proc/self` の見え方の差し替え口で開始前の検証と宛先の値を照合）、
 `idmap.rs` の `sec5_parse_proc_id_map`・`sec5_same_lines_as`、`tests/idmap_core_parity.rs` の
 `oci2_parse_proc_id_map_matches_core`。実機前提の `tests/userns_extract.rs`（`harness = false`。`unshare --user --map-root-user`
-で子を namespace へ入れ、ホストから見た所有者・setuid を照合。`-- --ignored`。AGENTS.md「実機前提テスト」）。
+で子を namespace へ入れ、ホストから見た所有者・setuid を照合。`newuidmap` の範囲写像のケース〔#2642〕を含む。`-- --ignored`。AGENTS.md「実機前提テスト」）。

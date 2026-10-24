@@ -667,6 +667,17 @@ mod tests {
         std::fs::remove_dir_all(&r).expect("remove");
         let e = h.ensure_linked().expect_err("removed");
         assert_eq!(e.code(), OciErrorCode::Internal);
+        // fd 起点は `st_nlink == 0` を検出する。パス起点の unix（macOS・他アーキの Linux）は
+        // root_meta が lstat のため、削除後は到達不能として扱われる。
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
         assert_eq!(e.message(), "image store root was removed");
+        #[cfg(not(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )))]
+        assert_eq!(e.message(), "image store root is not accessible");
     }
 }

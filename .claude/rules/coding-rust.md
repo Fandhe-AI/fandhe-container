@@ -40,7 +40,7 @@
   - 条件不備はレビューで P0 として扱う
 - `sys` モジュールの外の `unsafe`（境界処理であっても）・性能目的の `unsafe` など事前承認の範囲外のものは、従来どおり 1 件ずつユーザー承認を得る（未承認は P0）
 - syscall 番号・構造体レイアウトのアーキテクチャ差（x86_64 / aarch64）は `cfg(target_arch = ...)` で扱い、定数を流用しない
-- `libc` との機械照合（#1318 の判断。`libc` は dev-dependencies のみ）が入っている crate の `sys` に新しい宣言（定数・`#[repr(C)]` 構造体・`extern "C"` 関数）を足す PR では、同じ PR で照合も足す。`libc` に対応物が無い場合（カーネル ABI の構造体を直接使う箇所など）はその理由をコメントに書く。照合は crates/cli（#1838）と crates/oci（#2590。オーナー判断で #1837 の範囲に入れた）で適用済みで、この 2 crate では本規則が効く。未導入の crate（#1837 の子の #1840〜#1849 と guest-init の #2076）には、その crate の実装 issue が済んでから効く。適用状況の正は `docs/design/ffi-libc-check.md`「適用状況」
+- `libc` との機械照合（#1318 の判断。`libc` は dev-dependencies のみ）が入っている crate の `sys` に新しい宣言（定数・`#[repr(C)]` 構造体・`extern "C"` 関数）を足す PR では、同じ PR で照合も足す。`libc` に対応物が無い場合（カーネル ABI の構造体を直接使う箇所など）はその理由をコメントに書く。照合は crates/cli（#1838）と crates/oci（#2590。オーナー判断で #1837 の範囲に入れた）で適用済みで、この 2 crate では本規則が効く。未導入の crate（#1837 の子の #1840〜#1849）には、その crate の実装 issue が済んでから効く。適用状況の正は `docs/design/ffi-libc-check.md`「適用状況」
 
 ## クロスプラットフォーム（macOS・Windows・Linux の 3 OS 一級対応）
 

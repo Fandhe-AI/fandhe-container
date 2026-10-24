@@ -26,9 +26,9 @@ pub mod types;
 pub mod volume_provider;
 
 pub use container_runtime::{
-    ContainerRuntime, ContainerState, ContainerStatus, CreateRequest, DeleteRequest,
-    DeleteResponse, KillRequest, Signal, StartRequest, StateRequest, StopRequest,
-    TerminationReason,
+    CleanupOutcome, CleanupTarget, ContainerRuntime, ContainerState, ContainerStatus,
+    CreateRequest, DeleteRequest, DeleteResponse, KillRequest, Signal, StartRequest, StateRequest,
+    StopRequest, TerminationReason,
 };
 pub use network_plugin::{
     AttachRequest, AttachResponse, CreateNetnsRequest, CreateNetworkRequest, DeleteNetworkRequest,

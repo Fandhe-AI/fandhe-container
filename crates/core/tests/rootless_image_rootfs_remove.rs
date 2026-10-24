@@ -65,8 +65,8 @@ mod linux {
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
     use fandhe_container_core::traits::{
-        CgroupScope, ContainerId, CreateRequest, DeleteRequest, ErrorCode, ImageRootfsOwnership,
-        StateRevision, StateStore, TraitError,
+        CgroupScope, CleanupOutcome, ContainerId, CreateRequest, DeleteRequest, DeleteResponse,
+        ErrorCode, ImageRootfsOwnership, StateRevision, StateStore, TraitError,
     };
     use serde_json::json;
 
@@ -317,7 +317,7 @@ mod linux {
         store: &dyn StateStore,
         rec: &OpRecorder,
         privilege: ImageRootfsPrivilege,
-    ) -> Result<(), fandhe_container_core::oci_runtime::OciRuntimeError> {
+    ) -> Result<DeleteResponse, fandhe_container_core::oci_runtime::OciRuntimeError> {
         delete_releasing_image_ref_with_options(
             store,
             rec,
@@ -326,7 +326,6 @@ mod linux {
             &DeleteRequest::new(ContainerId::new("c1").expect("id")),
             &DeleteOptions::new().with_rootfs_privilege(privilege),
         )
-        .map(|_| ())
     }
 
     /// ホストの実効 uid ではこの木の中身を消せないこと（前提の確認）。
@@ -366,7 +365,12 @@ mod linux {
 
         // a: 権限なしの delete は木に触れず、失敗として記録する（状態は消える）。
         let rec = OpRecorder::new();
-        delete(&store, &rec, host).expect("delete succeeds even if the tree is kept");
+        let resp = delete(&store, &rec, host).expect("delete succeeds even if the tree is kept");
+        assert!(
+            matches!(resp.image_rootfs(), CleanupOutcome::Kept { .. }),
+            "unprivileged delete must report the kept tree: {:?}",
+            resp.image_rootfs()
+        );
         assert_eq!(counts(&rec, "image_rootfs_remove"), (0, 1));
         assert!(sb.rootfs().join("sub/f").is_file());
         println!("rootless_image_rootfs_remove: scenario a verified");
@@ -380,7 +384,8 @@ mod linux {
 
         // b: 権限ありの delete が木を消す。
         let rec = OpRecorder::new();
-        delete(&store, &rec, sub.clone()).expect("delete");
+        let resp = delete(&store, &rec, sub.clone()).expect("delete");
+        assert_eq!(resp.image_rootfs(), CleanupOutcome::Removed);
         assert_eq!(counts(&rec, "image_rootfs_remove"), (1, 0));
         assert!(!sb.rootfs().exists());
         println!("rootless_image_rootfs_remove: scenario b verified");

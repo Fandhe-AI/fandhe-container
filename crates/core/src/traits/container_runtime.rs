@@ -63,6 +63,9 @@ pub trait ContainerRuntime: Send + Sync {
     ///
     /// 前提: `force` が false の場合、対象コンテナが停止済みであること。実行中であれば
     /// [`ErrorCode::FailedPrecondition`] を返す。対応: CORE-2・ERR-2。
+    ///
+    /// 後始末（core が作った rootfs・ログ等）の失敗は `Err` にせず、`Ok(DeleteResponse)` の該当欄に
+    /// `Kept { code }` で載せる。`Err` は状態を消していない（再試行できる）失敗に限る（OCI-7・REPAIR-4）。
     fn delete(&self, req: &DeleteRequest) -> Result<DeleteResponse, TraitError>;
 
     /// コンテナの現在状態を照会する。
@@ -454,16 +457,119 @@ impl ContainerStatus {
     }
 }
 
-/// [`ContainerRuntime::delete`] の応答。当面は空だが、将来の拡張
-/// （解放した資源の情報等）に備えて構造体にする。
+/// delete の後始末 1 件の結果（OCI-7・SUP-7・REPAIR-4）。
+///
+/// 後始末の失敗は delete の成否を変えない（状態は既に消えており、`Err` を返すと再実行が
+/// `NotFound` になる）。残した資源は [`Self::Kept`] で呼び出し元へ伝える。
+/// パス・errno は含めず、分類コードだけを持つ（ERR-1・ERR-2）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct DeleteResponse {}
+pub enum CleanupOutcome {
+    /// この層では対象が無い（記録の無い rootfs・この層の担当外のログ等）。既定値。
+    #[default]
+    NotApplicable,
+    /// 消した（期限内に作業を終えた best effort を含む）。
+    Removed,
+    /// 既に無かった（冪等な再実行）。
+    AlreadyAbsent,
+    /// 消せずに残した。`code` は理由の分類。
+    Kept {
+        /// 残した理由の機械可読な分類。
+        code: ErrorCode,
+    },
+}
+
+/// delete の後始末の対象（[`DeleteResponse::kept`] の識別に使う。REPAIR-4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CleanupTarget {
+    /// core が `create_with_image` で作った rootfs（OCI-7）。
+    ImageRootfs,
+    /// supervisor ログ（SUP-7）。
+    SupervisorLog,
+    /// コンテナログ（CRI-2）。
+    ContainerLog,
+}
+
+impl CleanupTarget {
+    /// 安定した snake_case 名（構造化ログのキー値に使う）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ImageRootfs => "image_rootfs",
+            Self::SupervisorLog => "supervisor_log",
+            Self::ContainerLog => "container_log",
+        }
+    }
+}
+
+/// [`ContainerRuntime::delete`] の応答。delete の後始末（rootfs・ログ）の結果を載せる
+/// （OCI-7・CRI-2・SUP-7・REPAIR-4。#2633）。
+///
+/// 各欄は既定で [`CleanupOutcome::NotApplicable`]。埋める層は欄ごとに異なる:
+/// - `image_rootfs`: core の delete（記録の無い rootfs は `NotApplicable`）
+/// - `supervisor_log`・`container_log`: ログを消す層（`fandhe-container-plugin-cri`）。CLI は
+///   トレイトを通らず、自前の警告で出すため欄を使わない
+///
+/// 後始末の失敗は `Err` にせず `Kept` として載せる。RPC 境界（#1869）の DTO への追加は未実装。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DeleteResponse {
+    image_rootfs: CleanupOutcome,
+    supervisor_log: CleanupOutcome,
+    container_log: CleanupOutcome,
+}
 
 impl DeleteResponse {
-    /// 空の応答を作る。
+    /// 全欄 `NotApplicable` の応答を作る。
     pub fn new() -> Self {
-        Self {}
+        Self::default()
+    }
+
+    /// イメージ由来 rootfs の後始末の結果を設定する。
+    pub fn with_image_rootfs(mut self, outcome: CleanupOutcome) -> Self {
+        self.image_rootfs = outcome;
+        self
+    }
+
+    /// supervisor ログの後始末の結果を設定する。
+    pub fn with_supervisor_log(mut self, outcome: CleanupOutcome) -> Self {
+        self.supervisor_log = outcome;
+        self
+    }
+
+    /// コンテナログの後始末の結果を設定する。
+    pub fn with_container_log(mut self, outcome: CleanupOutcome) -> Self {
+        self.container_log = outcome;
+        self
+    }
+
+    /// イメージ由来 rootfs の後始末の結果。
+    pub fn image_rootfs(&self) -> CleanupOutcome {
+        self.image_rootfs
+    }
+
+    /// supervisor ログの後始末の結果。
+    pub fn supervisor_log(&self) -> CleanupOutcome {
+        self.supervisor_log
+    }
+
+    /// コンテナログの後始末の結果。
+    pub fn container_log(&self) -> CleanupOutcome {
+        self.container_log
+    }
+
+    /// 残した資源を固定順（rootfs・supervisor ログ・コンテナログ）で返す。
+    pub fn kept(&self) -> impl Iterator<Item = (CleanupTarget, ErrorCode)> {
+        [
+            (CleanupTarget::ImageRootfs, self.image_rootfs),
+            (CleanupTarget::SupervisorLog, self.supervisor_log),
+            (CleanupTarget::ContainerLog, self.container_log),
+        ]
+        .into_iter()
+        .filter_map(|(t, o)| match o {
+            CleanupOutcome::Kept { code } => Some((t, code)),
+            _ => None,
+        })
     }
 }
 
@@ -699,5 +805,46 @@ mod tests {
         assert_eq!(created.state(), ContainerState::Created);
         assert_eq!(created.pid(), Some(pid));
         assert_eq!(created.exit_code(), None);
+    }
+
+    /// REPAIR-4: 既定の応答は全欄 `NotApplicable` で `kept()` が空。
+    #[test]
+    fn repair4_delete_response_defaults_to_not_applicable() {
+        let r = DeleteResponse::new();
+        assert_eq!(r, DeleteResponse::default());
+        assert_eq!(r.image_rootfs(), CleanupOutcome::NotApplicable);
+        assert_eq!(r.supervisor_log(), CleanupOutcome::NotApplicable);
+        assert_eq!(r.container_log(), CleanupOutcome::NotApplicable);
+        assert_eq!(r.kept().count(), 0);
+    }
+
+    /// REPAIR-4: `with_*` の値が各 accessor に出て、`kept()` は `Kept` だけを固定順で返す。
+    #[test]
+    fn repair4_delete_response_builders_set_each_field() {
+        let r = DeleteResponse::new()
+            .with_container_log(CleanupOutcome::Kept {
+                code: ErrorCode::FailedPrecondition,
+            })
+            .with_supervisor_log(CleanupOutcome::Removed)
+            .with_image_rootfs(CleanupOutcome::Kept {
+                code: ErrorCode::Unimplemented,
+            });
+        assert_eq!(r.supervisor_log(), CleanupOutcome::Removed);
+        let kept: Vec<_> = r.kept().collect();
+        assert_eq!(
+            kept,
+            vec![
+                (CleanupTarget::ImageRootfs, ErrorCode::Unimplemented),
+                (CleanupTarget::ContainerLog, ErrorCode::FailedPrecondition),
+            ]
+        );
+    }
+
+    /// REPAIR-4: `CleanupTarget::as_str` は安定した名前を返す。
+    #[test]
+    fn repair4_cleanup_target_names_are_stable() {
+        assert_eq!(CleanupTarget::ImageRootfs.as_str(), "image_rootfs");
+        assert_eq!(CleanupTarget::SupervisorLog.as_str(), "supervisor_log");
+        assert_eq!(CleanupTarget::ContainerLog.as_str(), "container_log");
     }
 }

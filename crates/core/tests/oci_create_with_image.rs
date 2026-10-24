@@ -22,10 +22,10 @@ use fandhe_container_core::oci_runtime::{
 };
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
 use fandhe_container_core::traits::{
-    CgroupScope, ContainerId, ContainerState, ContainerStatus, CreateRequest, CreateStateRequest,
-    DeleteRequest, DeleteResponse, DeleteStateRequest, DeleteStateResponse, ErrorCode,
-    GetStateRequest, ListStateRequest, StateList, StateRecord, StateRevision, StateStore,
-    TraitError, UpdateStateRequest,
+    CgroupScope, CleanupOutcome, ContainerId, ContainerState, ContainerStatus, CreateRequest,
+    CreateStateRequest, DeleteRequest, DeleteResponse, DeleteStateRequest, DeleteStateResponse,
+    ErrorCode, GetStateRequest, ListStateRequest, StateList, StateRecord, StateRevision,
+    StateStore, TraitError, UpdateStateRequest,
 };
 use serde_json::json;
 
@@ -326,7 +326,9 @@ fn oci7_delete_removes_core_created_rootfs() {
     assert!(record.image_rootfs().is_some());
     assert!(sb.rootfs().join("bin").join("true").is_file());
     let rec = OpRecorder::new();
-    delete_c1(&store, &rec, &refs).expect("delete");
+    let resp = delete_c1(&store, &rec, &refs).expect("delete");
+    assert_eq!(resp.image_rootfs(), CleanupOutcome::Removed);
+    assert_eq!(resp.kept().count(), 0);
     assert!(!sb.rootfs().exists());
     assert!(sb.bundle().join("config.json").is_file());
     assert_eq!(get(&store).expect_err("gone").code(), ErrorCode::NotFound);
@@ -385,7 +387,8 @@ fn oci7_delete_keeps_user_supplied_rootfs() {
     .expect("create");
     assert!(record.image_rootfs().is_none());
     let rec = OpRecorder::new();
-    delete_c1(&store, &rec, &refs).expect("delete");
+    let resp = delete_c1(&store, &rec, &refs).expect("delete");
+    assert_eq!(resp.image_rootfs(), CleanupOutcome::NotApplicable);
     assert_eq!(
         std::fs::read(sb.rootfs().join("user-data")).expect("kept"),
         b"keep"
@@ -404,7 +407,13 @@ fn sec1_delete_keeps_replaced_rootfs_and_succeeds() {
     std::fs::create_dir(sb.rootfs()).expect("replacement");
     std::fs::write(sb.rootfs().join("marker"), b"other").expect("marker");
     let rec = OpRecorder::new();
-    delete_c1(&store, &rec, &refs).expect("delete succeeds");
+    let resp = delete_c1(&store, &rec, &refs).expect("delete succeeds");
+    assert_eq!(
+        resp.image_rootfs(),
+        CleanupOutcome::Kept {
+            code: ErrorCode::FailedPrecondition
+        }
+    );
     assert_eq!(
         std::fs::read(sb.rootfs().join("marker")).expect("kept"),
         b"other"
@@ -505,6 +514,19 @@ fn sec1_plain_create_through_symlinked_bundle_locks_the_real_bundle() {
         .expect("create after unlock");
 }
 
+/// OCI-7・REPAIR-4: rootfs が既に無い（手動で消された）delete は成功し、`AlreadyAbsent` を返す。
+#[test]
+fn oci7_delete_reports_already_absent_rootfs() {
+    let sb = Sandbox::new();
+    let store = sb.store();
+    let refs = Refs::default();
+    run(&store, &refs, &Unpacker { fail: false }, &sb).expect("create");
+    std::fs::remove_dir_all(sb.rootfs()).expect("manual removal");
+    let rec = OpRecorder::new();
+    let resp = delete_c1(&store, &rec, &refs).expect("delete");
+    assert_eq!(resp.image_rootfs(), CleanupOutcome::AlreadyAbsent);
+}
+
 /// SEC-1: rootfs が symlink に差し替えられても、symlink の先は消さない。
 #[test]
 fn sec1_delete_does_not_follow_symlinked_rootfs() {
@@ -518,7 +540,13 @@ fn sec1_delete_does_not_follow_symlinked_rootfs() {
     std::fs::rename(sb.rootfs(), sb.bundle().join("moved")).expect("move");
     std::os::unix::fs::symlink(&outside, sb.rootfs()).expect("symlink");
     let rec = OpRecorder::new();
-    delete_c1(&store, &rec, &refs).expect("delete succeeds");
+    let resp = delete_c1(&store, &rec, &refs).expect("delete succeeds");
+    assert_eq!(
+        resp.image_rootfs(),
+        CleanupOutcome::Kept {
+            code: ErrorCode::FailedPrecondition
+        }
+    );
     assert_eq!(std::fs::read(outside.join("marker")).expect("kept"), b"x");
     assert_eq!(rootfs_remove_counts(&rec), (0, 1));
 }

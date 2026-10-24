@@ -26,6 +26,7 @@ SHELL := /bin/bash
 .PHONY: help setup rustup submodule hooks lint-md lint-yaml lint-editorconfig lint-commits lint-docs \
 	check-workspace-manifest fmt fmt-check lint test doc poc-venus-jig-check check-cli-backend-deps \
 	check-launch-target check-launch-target-selftest \
+	check-standalone-clippy check-standalone-clippy-selftest \
 	test-core-no-plugin plugin-feature-size plug4-core-invariance plug4-core-invariance-selftest \
 	test-integration cli-parity-selftest cli-parity-native-reclaim-check \
 	cli-parity-native-reclaim-selftest commit-msg-line-length-selftest crash-summary-check \
@@ -116,6 +117,12 @@ check-launch-target: ## plugin 起動対象の構築口 from_verified_file を�
 
 check-launch-target-selftest: ## check-launch-target の自己テスト（REPAIR-12。fixture のみ）
 	@scripts/check-plugin-launch-target-construction-selftest.sh
+
+check-standalone-clippy: ## 試験用 feature 無効の -p 単独 lib/bin ビルドの clippy を全メンバーに回す（CLIPPY_TARGET=<triple> で --target。#2640・REPAIR-12）
+	@scripts/targets/check-standalone-clippy.sh
+
+check-standalone-clippy-selftest: ## check-standalone-clippy の自己テスト（REPAIR-12。スタブの cargo のみ。jq が必要）
+	@scripts/check-standalone-clippy-selftest.sh
 
 test-core-no-plugin: ## core を --no-default-features でテストし plugin 依存が入らないことを検証する
 	@scripts/targets/test-core-no-plugin.sh

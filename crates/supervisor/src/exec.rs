@@ -283,9 +283,12 @@ use fandhe_container_core::exec::{
     join_namespaces, prepare_cgroup_join as core_prepare_cgroup_join,
     prepare_exec_restrictions as core_prepare_exec_restrictions,
     reapply_restrictions as core_reapply_restrictions, record_entrypoint_rejection,
-    record_exec_worker_rejection, remove_exec_child_cgroup, spawn_exec_command, spawn_exec_worker,
+    record_exec_worker_rejection, remove_exec_child_cgroup, spawn_exec_command,
     spawn_exec_worker_with_listener, sweep_stale_exec_child_cgroups,
 };
+// `None` の入口（試験専用）だけが使う。無効の単独ビルドの unused_imports を避ける（#2640）。
+#[cfg(feature = "exec-test-support")]
+use fandhe_container_core::exec::spawn_exec_worker;
 use fandhe_container_core::launch_isolation::LaunchIsolationRecord;
 use fandhe_container_core::oci_runtime::{
     OciConfig, RootfsDir, RootfsPinError, load_config, pin_bundle_rootfs_audited,
@@ -1137,6 +1140,9 @@ enum ListenerPolicy<'a> {
     #[cfg(feature = "exec-test-support")]
     AckThenDrop,
     /// 受け渡しの対象外（試験専用の入口。worker の機構だけを任意の処理で確かめる）。
+    /// 作る側が `exec-test-support` の入口と `cfg(test)` だけなので、同じ cfg で型から消す（無効の単独ビルドでの
+    /// `dead_code` の解消。#2640・REPAIR-12。`cfg(test)` は自己参照の dev-dependency で feature が有効になる）。
+    #[cfg(feature = "exec-test-support")]
     None,
 }
 
@@ -1148,6 +1154,7 @@ impl ListenerPolicy<'_> {
             Self::Respond(_) => ErrnoDelivery::UserNotif,
             #[cfg(feature = "exec-test-support")]
             Self::AckThenDrop => ErrnoDelivery::UserNotif,
+            #[cfg(feature = "exec-test-support")]
             Self::None => ErrnoDelivery::Errno,
         }
     }
@@ -1182,6 +1189,8 @@ fn run_in_worker_with(
         let _ = (&writer).write_all(&line);
         0
     };
+    // `None` は試験専用なので、無効の単独ビルドでは分岐ごと消す（match が `_` だけになる lint を避ける。#2640）。
+    #[cfg(feature = "exec-test-support")]
     let (child, receiver) = match &listener {
         ListenerPolicy::None => (
             spawn_exec_worker(|proof| body(proof, None)).map_err(from_exec_error)?,
@@ -1195,6 +1204,15 @@ fn run_in_worker_with(
                 .map_err(from_exec_error)?;
             (child, Some(receiver))
         }
+    };
+    #[cfg(not(feature = "exec-test-support"))]
+    let (child, receiver) = {
+        let (child, receiver) =
+            spawn_exec_worker_with_listener(listener.delivery(), |proof, sender| {
+                body(proof, Some(sender))
+            })
+            .map_err(from_exec_error)?;
+        (child, Some(receiver))
     };
     // 親は書き込み側を閉じる（worker の終了後に読み取りが EOF で終わるようにする）。
     drop(writer);
@@ -1323,7 +1341,11 @@ fn respond_and_collect(
     deadline: Deadline,
     grace: Duration,
 ) -> Result<ExecOutcome, WorkerFailure> {
+    // 試験専用の `None` を持たない構成では、`Respond` の分岐が必ず audit を決める（#2640）。
+    #[cfg(feature = "exec-test-support")]
     let mut audit = ExecSeccompAudit::NOT_APPLICABLE;
+    #[cfg(not(feature = "exec-test-support"))]
+    let audit;
     let mut held = None;
     match policy {
         ListenerPolicy::Respond(responder) => {
@@ -1352,6 +1374,7 @@ fn respond_and_collect(
             drop(received);
             audit.responder = ExecResponderState::Lost;
         }
+        #[cfg(feature = "exec-test-support")]
         ListenerPolicy::None => drop(received),
     }
     let collected = collect_worker_result(child, reader, deadline, grace);

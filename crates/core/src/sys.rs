@@ -4572,25 +4572,45 @@ const PIDFD_SIGNAL_PROCESS_GROUP: i64 = 1 << 2;
 ///
 /// 宛先は pid の数値ではなく、pidfd が参照する `struct pid` に属するグループである。そのため回収後に番号が別の
 /// プロセスへ再利用されても、元のグループ以外には届かない。グループに誰も居なければ `ESRCH`。未対応カーネル
-/// (6.9 未満)は `EINVAL` を返すので、呼び出し側は数値 PGID の経路へ退避するか送らないかを決める。
+/// (6.9 未満)は `EINVAL` を返す。数値 PGID の経路へは退避しない(宛先の同一性を保証できない)。
+/// 6.9 未満では helper の起動前に [`pidfd_group_signal_probe`] で検出して拒否する(#2644)。
 pub(crate) fn pidfd_send_signal_group(pidfd: BorrowedFd<'_>, sig: Signal) -> Result<(), SysError> {
     pidfd_send_signal_flags(pidfd, sig, PIDFD_SIGNAL_PROCESS_GROUP)
 }
 
-/// `pidfd_send_signal(2)` の本体([`pidfd_send_signal`]・[`pidfd_send_signal_group`] が共有する唯一の呼び出し)。
+/// プロセスグループ送信(`PIDFD_SIGNAL_PROCESS_GROUP`)が使えるカーネルかを、シグナル 0(存在確認のみで何も
+/// 送らない)で調べる(`pidfd_send_signal(fd, 0, NULL, PIDFD_SIGNAL_PROCESS_GROUP)`。CORE-6・SEC-5・#2644)。
+///
+/// 6.9 未満は未知のフラグを最初に検査して `EINVAL` を返す。対応カーネルでは `Ok`、または `pidfd` が
+/// グループリーダーでないときの `ESRCH`。呼び出し側(`exec::isolate_rootless_subordinate`)が helper の起動前に
+/// 自プロセスの pidfd で呼び、未対応なら写像を拒否する。
+pub(crate) fn pidfd_group_signal_probe(pidfd: BorrowedFd<'_>) -> Result<(), SysError> {
+    pidfd_send_signal_raw(pidfd, 0, PIDFD_SIGNAL_PROCESS_GROUP)
+}
+
+/// `pidfd_send_signal(2)` の本体の前段。[`Signal`] を検証済みの番号(1..=64)へ直して [`pidfd_send_signal_raw`] を呼ぶ。
 fn pidfd_send_signal_flags(pidfd: BorrowedFd<'_>, sig: Signal, flags: i64) -> Result<(), SysError> {
-    if !consts::SUPPORTED {
-        return Err(SysError::Unsupported);
-    }
     let number = match sig {
         Signal::Kill => consts::SIGKILL,
         Signal::Number(n) if (1..=64).contains(&n.get()) => i32::from(n.get()),
         Signal::Number(_) => return Err(SysError::Os(EINVAL)),
     };
+    pidfd_send_signal_raw(pidfd, number, flags)
+}
+
+/// `pidfd_send_signal(2)` を呼ぶ唯一の箇所。`number` は 0(存在確認)か 1..=64 だけを受ける。
+fn pidfd_send_signal_raw(pidfd: BorrowedFd<'_>, number: i32, flags: i64) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    if !(0..=64).contains(&number) {
+        return Err(SysError::Os(EINVAL));
+    }
     let nr = consts::SYS_PIDFD_SEND_SIGNAL.get()?;
     // SAFETY: `pidfd` は呼び出しの間有効な fd（`BorrowedFd`）。`info` は NULL（カーネルが siginfo を
-    // 既定値で作る）で、ポインタ引数は書き込み・読み出しされない。`number` は検証済みの値、`flags` は
-    // 呼び出し元(この関数は非公開)が渡す 0 か `PIDFD_SIGNAL_PROCESS_GROUP` のどちらかである。
+    // 既定値で作る）で、ポインタ引数は書き込み・読み出しされない。`number` は 0(存在確認。何も送らない)か
+    // 1..=64 を直前で確認済み、`flags` は呼び出し元(この関数は非公開)が渡す 0 か
+    // `PIDFD_SIGNAL_PROCESS_GROUP` のどちらかである。
     let rc = unsafe {
         syscall(
             nr,
@@ -5411,6 +5431,34 @@ pub(crate) fn effective_gid() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// CORE-6・SEC-5(#2644): 自分の pidfd への検査の結果が、実際のグループ送信の対応可否(`EINVAL` かどうか)と一致する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec5_pidfd_group_signal_probe_matches_group_send() {
+        let fd = pidfd_open(std::process::id()).expect("pidfd_open");
+        let probe = pidfd_group_signal_probe(std::os::fd::AsFd::as_fd(&fd));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        let cfd = pidfd_open(child.id()).expect("pidfd_open");
+        // 6.9 以降は、リーダーでない子へは ESRCH、未満は EINVAL。シグナル 0 は何も送らない。
+        let send = pidfd_send_signal_raw(
+            std::os::fd::AsFd::as_fd(&cfd),
+            0,
+            PIDFD_SIGNAL_PROCESS_GROUP,
+        );
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+        let supported = |r: &Result<(), SysError>| match r {
+            Ok(()) => true,
+            Err(SysError::Os(e)) if *e == ESRCH => true,
+            Err(SysError::Os(e)) if *e == EINVAL => false,
+            Err(e) => panic!("unexpected: {e:?}"),
+        };
+        assert_eq!(supported(&probe), supported(&send));
+    }
+
     use super::*;
 
     /// CORE-5・TASK-38.4: プローブ用定数の固定値照合（x86_64。arch ごとの個別定義の誤り検出）。

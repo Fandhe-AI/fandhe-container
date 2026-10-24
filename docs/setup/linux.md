@@ -75,6 +75,7 @@ rootless の `start` は、`/etc/subuid` と `/etc/subgid` の設定で ID 写�
 | 片方だけ | — | `FAILED_PRECONDITION` で起動しない（1 対 1 へ黙って縮退しない） |
 | 読めない・書式不正 | — | `FAILED_PRECONDITION` で起動しない |
 
+- helper 経由の範囲写像には Linux 6.9 以降（pidfd のプロセスグループ送信）が要る。満たさないカーネルでは helper を起動する前に `FAILED_PRECONDITION` で拒否する（CORE-6・SEC-5・#2644。本番の起動は Landlock ABI 6〔Linux 6.12 以降〕が必須のため、通常は満たされる）
 - 自分の行は、ユーザー名（`alice:100000:65536`。ダミーの値）か数値の uid で書く。名前は `/etc/passwd` から実効 uid で引き、行が無いときだけ NSS（固定パスの `getent passwd <uid>` を 5 秒の期限つきで実行）で引く。環境変数 `USER` は使わない（#2390・SEC-5・CORE-6。`docs/design/subid-owner-resolution.md`）
 - `getent` は `/usr/bin/getent` などの固定候補だけを見る（`PATH` は探索しない）。実体と祖先ディレクトリが root 所有で group / other から書き込めないことが条件で、満たさないときは NSS を引かず、数値 uid の行だけで照合する（`doctor` が `SUBID_OWNER_LOOKUP_UNAVAILABLE` で通知する）
 - LDAP・sssd の停止などで NSS の参照が失敗・期限切れになると、`start` は 1 対 1 へ縮退せず `FAILED_PRECONDITION` / `TIMEOUT` で止まる（`doctor` は `SUBID_OWNER_LOOKUP_FAILED`。警告）

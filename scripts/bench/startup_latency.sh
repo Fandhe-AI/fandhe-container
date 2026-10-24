@@ -122,11 +122,9 @@ readonly LOG_TAIL_LINES=20
 # 収集プロセスがランタイム 1 呼び出しあたりログファイルへ記録する最大サイズ（KiB）。
 # 超過分は読み捨てる（ディスク枯渇防止。REPAIR-5）。書き手は止めない。
 readonly LOG_MAX_KIB=1024
-# docker の一覧など出力を解析する呼び出しの後に、その出力の収集プロセスの終了を待つ既定の上限
-# （マイクロ秒）。超えたら出力が不完全になり得るので、その呼び出しを失敗として扱う（fail-closed）。
-# state の照会（query_state）はこの固定値でなく、呼び出しの期限（--timeout）に基づく上限を渡す
-# （負荷の高い runner で収集プロセスの終了が 200ms を超えて偶発的に失敗するのを防ぐ。Issue #1687）。
-readonly LOG_FLUSH_WAIT_US=200000
+# 出力を解析する呼び出し（state の照会 query_state・docker の一覧 list_run_containers）の後の
+# 収集プロセスの終了待ちの上限は、固定値でなく --timeout 秒に基づく値を呼び出し側が渡す
+# （負荷の高い runner で収集の終了が固定の短い上限を超えて偶発的に失敗するのを防ぐ。Issue #1687・#2639）。
 # 後始末で収集プロセスの自然終了を待つ上限（マイクロ秒）。超えたら SIGKILL で回収する。
 readonly LOG_REAP_WAIT_US=500000
 # start 復帰後に state で実行開始（running / stopped）を観測する照会の間隔（秒）。
@@ -554,13 +552,14 @@ wait_children() {
 }
 
 # 直前の run_rt の収集プロセスの終了を待つ。出力を解析する呼び出しの直後にだけ使う。
-# 待機の上限は引数 <budget_us>（省略時は LOG_FLUSH_WAIT_US）と、期限（rt_deadline_us。空なら無し）までの
-# 残りの小さい方（観測ループの state 照会だけが期限を外す。query_state 参照）。引数: [<budget_us>]
+# 待機の上限は引数 <budget_us> と、期限（rt_deadline_us。空なら無し）までの残りの小さい方。
+# 収集待ちを期限で切り詰めたくない呼び出し元（query_state・list_run_containers）は、呼ぶ前に
+# rt_deadline_us を空にして呼び、後で戻す。引数: <budget_us>
 # create / start / delete 等の直後には使わない: runc 系の create は init がランタイムの stdio を
 # 保持するため収集プロセスがコンテナの終了まで EOF にならず、待つと create_us が待機上限分だけ
 # 水増しされる（それらの出力は失敗時の診断にしか使わない）。
 flush_last_call() {
-  local budget="${1:-$LOG_FLUSH_WAIT_US}" rem
+  local budget="$1" rem
   if [ -n "$rt_deadline_us" ]; then
     rem=$((rt_deadline_us - $(mono_us)))
     [ "$rem" -lt "$budget" ] && budget="$rem"
@@ -661,15 +660,14 @@ show_log() {
 
 # state を 1 回呼び、state_rc・state_status・state_reason・state_raw_rc を設定する。state_status は
 # stdout が単一の OCI state JSON で id が一致するときだけその status、それ以外は空文字。
-# 収集の完了待ちの上限は --timeout 秒。ただし第 2 引数に full-flush を渡さない呼び出しでは
-# 期限（rt_deadline_us）までの残りで切り詰める（REPAIR-5）。観測ループと、後始末の created=0
-# の照会（#2548）は full-flush を渡し、最後の
-# 照会の収集待ちが観測期限をまたいでも collector-timeout にしない（期限の判定は待ちの前に取る
-# state の復帰時刻と 124 で行う。負荷時の間欠失敗 #2375・#1687）。待ちの最悪時間は 1 回分
-# （--timeout 秒）で有界。観測点は待ちの前に取るので、待ちは計測値に乗らない。
-# 引数: <id> [full-flush]
+# 収集の完了待ちの上限は --timeout 秒で、呼び出しの期限（rt_deadline_us）では切り詰めない。
+# 観測ループと後始末の created=0 の照会（#2548）で、最後の照会の収集待ちが期限をまたいでも
+# collector-timeout にしないため（期限の判定は待ちの前に取る state の復帰時刻と 124 で行う。
+# 負荷時の間欠失敗 #2375・#1687）。ただし state が 124（呼び出しの期限切れ）の分岐の診断用の待ちは
+# 期限で切り詰める（観測ループの時間の上限を変えない）。待ちの最悪時間は 1 回分（--timeout 秒）で
+# 有界。観測点は待ちの前に取るので、待ちは計測値に乗らない。引数: <id>
 query_state() {
-  local id="$1" full="${2:-}" out="$tmpdir/state.out" flush_us saved_deadline flush_rc=0
+  local id="$1" out="$tmpdir/state.out" flush_us saved_deadline flush_rc=0
   state_rc=0
   state_reason=""
   rt_state "$out" "$tmpdir/state.err" "$id" || state_rc=$?
@@ -685,7 +683,7 @@ query_state() {
     flush_last_call "$flush_us" || true
   else
     saved_deadline="$rt_deadline_us"
-    [ "$full" = "full-flush" ] && rt_deadline_us=""
+    rt_deadline_us=""
     flush_last_call "$flush_us" || flush_rc=$?
     rt_deadline_us="$saved_deadline"
     if [ "$flush_rc" -ne 0 ]; then
@@ -751,7 +749,7 @@ create_not_made() {
 #              未作成（create_not_made）を確定できれば成功、できなければ残存の可能性ありとして
 #              記録し、手動での確認を促す（所有を証明できないコンテナへ破壊的操作を送らない。
 #              特権操作の後始末）。
-# 例外: created=0 の照会の収集待ちは期限で切り詰めないため、その経路の最悪時間は
+# 例外: created=0 の照会（query_state）の収集待ちは期限で切り詰めないため、その経路の最悪時間は
 # state 呼び出し（≦ --timeout）＋収集待ち（≦ --timeout）の 2 × --timeout になる（有界。#2548・REPAIR-5）。
 finish_container() {
   local status=0
@@ -768,7 +766,7 @@ finish_container_within_deadline() {
   if [ "$created" = "0" ]; then
     # 収集待ちは後始末の期限で切り詰めない（上限は --timeout 秒のまま。#2548・REPAIR-12）。
     # state が期限の大半を使っても、収集が上限内に終わるなら collector-timeout にしない。
-    query_state "$id" full-flush
+    query_state "$id"
     if create_not_made; then
       return 0
     fi
@@ -824,13 +822,21 @@ read_cidfile() {
 }
 
 # dk_list_by_label の結果を listed_ids（64 桁 16 進の ID 配列）へ入れる。取得失敗・想定外の
-# 出力は非ゼロを返す（未作成を確定できない）。呼び出しは期限内（rt_deadline_us 設定中）で行う。
+# 出力は非ゼロを返す（未作成を確定できない）。docker ps の呼び出しは期限内（rt_deadline_us 設定中）で
+# 行うが、収集の完了待ちは期限で切り詰めず上限を --timeout 秒とする（query_state と同じ。ps が期限の
+# 大半を使っても、一覧が正しく空なら収集待ちの切り詰めで残存扱いにしない。#2639・#1687・REPAIR-12）。
 list_run_containers() {
-  local out="$tmpdir/list.out" line rc=0
+  local out="$tmpdir/list.out" line rc=0 flush_us flush_rc=0 saved_deadline
   listed_ids=()
   dk_list_by_label "$out" "$tmpdir/list.err" || rc=$?
+  flush_us=$((timeout_secs * 1000000))
   # 出力を読む前に収集の完了を待つ（上限内に終わらなければ不完全として失敗。fail-closed）。
-  flush_last_call || return 1
+  # 期限は待ちの間だけ外し、すべての戻り経路の前に復元する（空のまま漏らさない）。
+  saved_deadline="$rt_deadline_us"
+  rt_deadline_us=""
+  flush_last_call "$flush_us" || flush_rc=$?
+  rt_deadline_us="$saved_deadline"
+  [ "$flush_rc" -eq 0 ] || return 1
   [ "$rc" -eq 0 ] || return 1
   # 切り詰められた一覧は不完全（未作成を誤って確定し得る）なので失敗として扱う。
   ! log_truncated "$out" || return 1
@@ -850,6 +856,9 @@ list_run_containers() {
 #     何もしない。残っていれば `rm -f <cid>` を期限と回数の上限内で再試行する。
 #   cidfile がない・不正: ラベル一覧が空なら未作成とみなす。1 件でも見つかれば所有を証明
 #     できないので何も送らず exit 4 の対象にする。一覧の取得失敗も未作成を確定できないので同様。
+# 最悪時間: 期限内に収まる docker 呼び出しと、期限をまたげる最後の収集待ち 1 回（list_run_containers。
+# ≦ --timeout）の合計で 2 × --timeout 以下に有界（#2639・REPAIR-5）。期限が尽きた後は run_rt が
+# 呼び出さず 124 を返し収集プロセスの記録も空にするため、期限をまたぐ待ちが 2 回以上起きることはない。
 finish_container_docker() {
   local status=0
   rt_deadline_us=$(($(mono_us) + timeout_secs * 1000000))
@@ -1089,7 +1098,7 @@ measure_once() {
     state_polls=$((state_polls + 1))
     # 各照会には観測期限までの残り時間だけを渡す。残りがなければ呼ばずに 124 になる。
     rt_deadline_us="$deadline"
-    query_state "$id" full-flush
+    query_state "$id"
     rt_deadline_us=""
     t2="$state_wall_us"
     m2="$state_mono_us"

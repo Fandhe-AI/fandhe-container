@@ -367,7 +367,11 @@ impl ProductionLauncherBuilder {
             let audit_sink = self
                 .audit_sink
                 .ok_or_else(|| missing("the launcher requires an audit sink"))?;
-            // 写像の解決と検証は subreaper 化(プロセス属性の変更)より前に行い、拒否で副作用を残さない。
+            // 写像の解決と検証・注入との併用の拒否は subreaper 化(プロセス属性の変更)より前に行い、
+            // 拒否で副作用を残さない(失敗した build の後に孤児を回収し続けない)。
+            if let Some(options) = &self.launch_options {
+                refuse_inject_with_subordinate(privilege, options)?;
+            }
             let subordinate = resolve_privilege(
                 privilege,
                 self.subordinate_ids,
@@ -388,9 +392,6 @@ impl ProductionLauncherBuilder {
                 self.cgroup_join_source,
             );
             inner.applied_resources = self.applied_resources;
-            if let Some(options) = &self.launch_options {
-                refuse_inject_with_subordinate(privilege, options)?;
-            }
             inner.launch_options = self.launch_options;
             inner.seccomp_delivery = self.seccomp_delivery;
             inner.audit_policy = self.audit_policy;
@@ -406,6 +407,34 @@ impl ProductionLauncherBuilder {
             ))
         }
     }
+}
+
+/// 利用者指定の tmpfs と注入ディレクトリ(いずれも pivot 前段で載せる tmpfs)が、config の
+/// `linux.readonlyPaths` の厳密な子孫のとき拒否する(fail-closed。SEC-2・CORE-5・#2625)。
+///
+/// `apply_readonly_paths` は readonlyPaths のマウント上端だけを読み取り専用にし、子マウント（`/sys` を除く）は
+/// 検査しないため、`readonlyPaths=["/data"]` の配下に書き込み可能な tmpfs `/data/cache` を置くと書き込み可能のまま残る。
+/// 同一の宛先は上端が読み取り専用になるため対象外。fork 前に呼び、子を作らず拒否する。
+#[cfg(target_os = "linux")]
+fn check_tmpfs_against_readonly_paths(
+    readonly: &[crate::path_masks::ProtectedPath],
+    tmpfs: &TmpfsMountSet,
+    inject: Option<&InjectedFileSet>,
+) -> Result<(), TraitError> {
+    use crate::injected_files::within;
+    let inside = |dest: &str| readonly.iter().any(|r| within(dest, r.as_str()));
+    let tmpfs_hit = tmpfs
+        .mounts()
+        .iter()
+        .any(|t| inside(t.destination.as_str()));
+    let inject_hit = inject.is_some_and(|i| i.groups().iter().any(|g| inside(g.directory)));
+    if tmpfs_hit || inject_hit {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a tmpfs mount or injected file directory lies under a read-only path",
+        ));
+    }
+    Ok(())
 }
 
 /// 範囲写像(`RootlessSubordinateIds`)と非空の機密ファイル注入の併用を拒否する(fail-closed)。
@@ -1203,6 +1232,7 @@ impl Inner {
         let tmpfs = options.tmpfs();
         let inject = (!options.inject().is_empty()).then(|| options.inject());
         let binds = (!spec.bind_mounts().is_empty()).then(|| spec.bind_mounts());
+        check_tmpfs_against_readonly_paths(spec.config().readonly_paths(), tmpfs, inject)?;
         if let Some(binds) = binds
             && let Err(err) = binds
                 .check_against_tmpfs(tmpfs)
@@ -3735,6 +3765,40 @@ mod tests {
                 .map(|_| ())
                 .expect_err("rejected");
             assert_eq!(err.code(), ErrorCode::InvalidArgument, "{dest}");
+        }
+    }
+
+    /// SEC-2・CORE-5(#2625): readonlyPaths の厳密な子孫への tmpfs・注入ディレクトリは spawn の前に拒否する。
+    /// 同一の宛先と無関係な宛先(`/datax`)は通る。
+    #[test]
+    fn sec2_tmpfs_under_readonly_path_is_rejected_before_spawn() {
+        let linux = serde_json::json!({"readonlyPaths": ["/data"]});
+        let rejected: [(&str, LaunchOptions); 2] = [
+            (
+                "tmpfs",
+                options_with(&["/data/cache"], true, &[], LaunchIpcMode::Private),
+            ),
+            (
+                "inject",
+                options_with(&[], true, &[("/data/sec/db", b"v")], LaunchIpcMode::Private),
+            ),
+        ];
+        for (name, options) in rejected {
+            let spec = spec_for(&format!("opts-ro-{name}"), linux.clone());
+            let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+            l.inner.launch_options = Some(options);
+            let err = l
+                .launch(&spec, Duration::from_secs(1))
+                .map(|_| ())
+                .expect_err("rejected");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{name}");
+        }
+        for dest in ["/data", "/datax"] {
+            let spec = spec_for("opts-ro-ok", linux.clone());
+            let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+            l.inner.launch_options = Some(options_with(&[dest], true, &[], LaunchIpcMode::Private));
+            let p = l.launch(&spec, Duration::from_secs(1)).expect(dest);
+            p.terminate(Duration::from_secs(5)).expect("terminate");
         }
     }
 

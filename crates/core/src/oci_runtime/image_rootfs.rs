@@ -795,9 +795,25 @@ mod imp {
             .map(|(_, _, _, mode)| mode & 0o7777)
             .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to stat rootfs"))?;
         let widened = original | 0o300;
+        // 子が実効 uid 所有でない（rootless で `./` が subuid 所有。決定 G の既知の制限・#2690）と、mode の補完も
+        // 印の作成もできない。seal は publish より先に走るため、汎用の印の書き込み失敗ではなく publish と同じ
+        // 診断で拒否する（利用者が原因を判別できるように。OCI-7）。
+        let foreign = fd_owner(b.dir.as_fd()).is_some_and(|o| o != sys::effective_uid());
+        let foreign_err = || {
+            TraitError::new(
+                ErrorCode::Internal,
+                "failed to publish rootfs: cannot make unpacked root writable for rename (owned by another uid)",
+            )
+        };
         if widened != original {
             std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(widened)).map_err(
-                |_| TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token"),
+                |_| {
+                    if foreign {
+                        foreign_err()
+                    } else {
+                        TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token")
+                    }
+                },
             )?;
         }
         // v2: 1 行目 = トークン、2 行目 = 木の作成時の `<dev>:<ino>`。複製（`cp -a`）は inode が新しくなり
@@ -808,7 +824,13 @@ mod imp {
             Some(scope) => format!("{token}\n{}:{}\n{scope}\n", b.identity.0, b.identity.1),
             None => format!("{token}\n{}:{}\n", b.identity.0, b.identity.1),
         };
-        let written = write_marker(&proc_dir, &content);
+        let written = write_marker(&proc_dir, &content).map_err(|e| {
+            if foreign && e.code() == ErrorCode::Internal {
+                foreign_err()
+            } else {
+                e
+            }
+        });
         if widened != original {
             let restored =
                 std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(original));

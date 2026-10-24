@@ -970,8 +970,15 @@ mod imp {
             .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to stat rootfs"))?;
         let widened = original | 0o200;
         if widened != original {
+            // 子が実効 uid 所有でない（rootless で `./` が subuid 所有。決定 G の既知の制限・#2690）と chmod できず、
+            // 改名もできない。成功を装わず、理由が分かる明示エラーで拒否する。
             std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(widened))
-                .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to publish rootfs"))?;
+                .map_err(|_| {
+                    TraitError::new(
+                        ErrorCode::Internal,
+                        "failed to publish rootfs: cannot make unpacked root writable for rename (owned by another uid)",
+                    )
+                })?;
         }
         let renamed =
             sys::rename_noreplace_at(b.wrapper.as_fd(), &child, b.parent.as_fd(), &b.final_name);

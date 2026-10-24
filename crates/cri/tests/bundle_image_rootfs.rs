@@ -867,3 +867,106 @@ fn sec1_symlinked_etc_in_image_is_not_read() {
     let u = parsed.process().unwrap().user();
     assert_eq!((u.uid(), u.gid()), (33, 0));
 }
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn run_as_username_container(image: &str, name: &str, gid: Option<i64>) -> ContainerConfig {
+    let mut c = container(image);
+    c.linux = Some(LinuxContainerConfig {
+        security_context: Some(LinuxContainerSecurityContext {
+            run_as_username: name.into(),
+            run_as_group: gid.map(|value| Int64Value { value }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    c
+}
+
+/// CRI-2・SEC-5（#2664）: run_as_username が rootfs の passwd で解決され、run_as_group が gid を上書きする。
+/// イメージ User が未解決（`ghost`）でも username が解決すれば成功する。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn cri2_run_as_username_is_resolved_from_rootfs_passwd() {
+    let l1 = tar_of(&[
+        tar_entry("etc/", 0o755, b"", true),
+        tar_entry(
+            "etc/passwd",
+            0o644,
+            b"root:x:0:0:r:/root:/bin/sh\napp:x:1000:1001::/h:/bin/sh\n",
+            false,
+        ),
+        tar_entry("bin/", 0o755, b"", true),
+        tar_entry("bin/app", 0o755, b"app", false),
+    ]);
+    let env = pulled_env_with_layers(
+        "run-as-username",
+        r#""config":{"Entrypoint":["/bin/app"],"User":"ghost"},"#,
+        l1,
+        layer2(),
+    );
+    let p = env.provider();
+    let ids = |dir: &Path| {
+        let parsed = oci_runtime::load_config(&dir.join("config.json")).unwrap();
+        let u = parsed.process().unwrap().user();
+        (u.uid(), u.gid())
+    };
+    let d = prepare(
+        &p,
+        "c1",
+        &run_as_username_container(&env.image_id, "app", None),
+    )
+    .expect("c1");
+    assert_eq!(ids(&d), (1000, 1001));
+    let d = prepare(
+        &p,
+        "c2",
+        &run_as_username_container(&env.image_id, "app", Some(44)),
+    )
+    .expect("c2");
+    assert_eq!(ids(&d), (1000, 44));
+    // passwd に無い名前は INVALID_ARGUMENT で、bundle を残さない。
+    let before = bundle_count(&env);
+    let e = prepare(
+        &p,
+        "c3",
+        &run_as_username_container(&env.image_id, "nobody", None),
+    )
+    .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::InvalidArgument);
+    assert_eq!(bundle_count(&env), before);
+}
+
+/// SEC-1・SEC-5（#2664）: `etc` がホストを指す symlink のイメージでは passwd を読まず FAILED_PRECONDITION にする。
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn sec1_run_as_username_with_symlinked_etc_is_rejected() {
+    let l1 = tar_of(&[
+        tar_symlink("etc", "/etc"),
+        tar_entry("bin/", 0o755, b"", true),
+        tar_entry("bin/app", 0o755, b"app", false),
+    ]);
+    let env = pulled_env_with_layers(
+        "username-symlink-etc",
+        r#""config":{"Entrypoint":["/bin/app"]},"#,
+        l1,
+        layer2(),
+    );
+    let p = env.provider();
+    let e = prepare(
+        &p,
+        "c1",
+        &run_as_username_container(&env.image_id, "root", None),
+    )
+    .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::FailedPrecondition);
+    assert_eq!(bundle_count(&env), 0);
+}

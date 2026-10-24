@@ -41,6 +41,10 @@
 //!   読めない・見つからない場合は [`ImageDefaults::user_unresolved`] のまま返し、`build_runtime_config` に拒否させる
 //!   （root へ黙ってフォールバックしない）。`/etc/group` の所属から補助グループは作らない（core が
 //!   `additionalGids` を未受理のため。権限は弱い側に倒れる）
+//! - **run_as_username**（CRI）: 展開後の rootfs の `/etc/passwd` を同じ読み口で読み、名前の完全一致で `(uid, gid)` を
+//!   [`ImageDefaults::resolved_run_as_username`] へ返す（#2664・CRI-2・SEC-5）。見つからない・passwd が無い場合は
+//!   `INVALID_ARGUMENT`、安全に読めない場合は `FAILED_PRECONDITION`、読む手段が無い場合は `UNIMPLEMENTED`。
+//!   数字だけの名前は拒否する（数値は `run_as_user`。containerd は uid 扱いの既知の差）
 //! - **展開設定**: 所有者・特殊ビットの本番の値（`ChownMapped` 等）の決定は #2534 の担当。既定は pull と同じ
 //!   `Keep` + `Strip`。pull と create の設定は [`ImageExtractConfig`] で 1 か所にまとめる
 //! - 展開中の処理は打ち切れない。期限は展開の前後で確認する（REPAIR-5。pull と同じ制約）
@@ -64,7 +68,7 @@ use fandhe_container_oci::layer::{VerifiedLayerBlob, open_blob_nofollow, read_ro
 use fandhe_container_oci::manifest::MAX_LAYERS;
 use fandhe_container_oci::reference::Digest;
 
-use super::provider::RootfsSource;
+use super::provider::{RootfsSource, UserResolveRequest};
 use super::spec::ImageDefaults;
 use crate::error::CriError;
 use crate::image_pull::{
@@ -353,6 +357,7 @@ fn defaults_from(process: &ImageProcessConfig) -> Result<ImageDefaults, CriError
         working_dir,
         user,
         user_unresolved,
+        resolved_run_as_username: None,
     })
 }
 
@@ -456,15 +461,58 @@ fn group_gid(body: &[u8], name: &str) -> Option<u32> {
 }
 
 /// rootfs の `etc/<file>` を fd 起点で読む。`Ok(None)` は不在、`Err` は読めない（呼び出し側が未解決にする）。
-fn read_etc(rootfs: &Path, file: &str) -> Result<Option<Vec<u8>>, ()> {
-    let body = read_rootfs_file(rootfs, &["etc", file], MAX_ETC_FILE_BYTES).map_err(|_| ())?;
+fn read_etc(rootfs: &Path, file: &str) -> Result<Option<Vec<u8>>, EtcReadError> {
+    let body = read_rootfs_file(rootfs, &["etc", file], MAX_ETC_FILE_BYTES).map_err(|e| {
+        if e.code() == OciErrorCode::Unimplemented {
+            EtcReadError::Unsupported
+        } else {
+            EtcReadError::Untrusted
+        }
+    })?;
     // 行数上限を超える本文は切り捨てず未解決にする（後続行の取りこぼしで gid が 0 に落ちるのを防ぐ）。
     if let Some(b) = &body
         && b.split(|c| *c == b'\n').count() > MAX_ETC_LINES
     {
-        return Err(());
+        return Err(EtcReadError::Untrusted);
     }
     Ok(body)
+}
+
+/// `read_etc` の失敗の種類。`run_as_username` は両者でエラーコードを分ける（#2664）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EtcReadError {
+    /// `openat2` 不可・非対応 OS など、安全に読む手段が無い（`UNIMPLEMENTED`）。
+    Unsupported,
+    /// symlink・FIFO・上限超過など、安全に読めない（`FAILED_PRECONDITION`）。
+    Untrusted,
+}
+
+/// CRI の `run_as_username` を rootfs の `/etc/passwd` で `(uid, gid)` へ解決する（#2664・CRI-2・SEC-5）。
+///
+/// 名前は passwd の第 1 フィールドとの完全一致比較にだけ使い、パス要素にしない。見つからない・passwd が無い場合は
+/// `INVALID_ARGUMENT`、安全に読めない場合は `FAILED_PRECONDITION`、読む手段が無い場合は `UNIMPLEMENTED`
+/// （いずれも root へ黙って落とさない）。メッセージに名前は含めない。
+fn resolve_run_as_username(rootfs: &Path, name: &str) -> Result<(u32, u32), CriError> {
+    let key = match parse_id_part(name) {
+        Some(k @ IdPart::Name(_)) => k,
+        _ => return Err(CriError::invalid_argument("run_as_username is invalid")),
+    };
+    let body = match read_etc(rootfs, "passwd") {
+        Ok(b) => b,
+        Err(EtcReadError::Unsupported) => {
+            return Err(CriError::unimplemented(
+                "image passwd cannot be read on this platform",
+            ));
+        }
+        Err(EtcReadError::Untrusted) => {
+            return Err(CriError::failed_precondition(
+                "image passwd could not be read",
+            ));
+        }
+    };
+    body.as_deref()
+        .and_then(|b| passwd_entry(b, &key))
+        .ok_or_else(|| CriError::invalid_argument("run_as_username is not present in the image"))
 }
 
 /// 名前・uid のみの User を `(uid, gid)` へ解決する。解決できなければ `None`（未解決）。
@@ -497,7 +545,12 @@ fn resolve_user(rootfs: &Path, lookup: &UserLookup) -> Option<(u32, u32)> {
 }
 
 impl RootfsSource for ImageRootfsSource {
-    fn prepare(&self, image: &ImageSpec, rootfs: &Path) -> Result<ImageDefaults, CriError> {
+    fn prepare(
+        &self,
+        image: &ImageSpec,
+        rootfs: &Path,
+        user: &UserResolveRequest<'_>,
+    ) -> Result<ImageDefaults, CriError> {
         let started = Instant::now();
         let id = self.resolve_image_id(image)?;
         let opts = &self.config.extract_options;
@@ -568,8 +621,14 @@ impl RootfsSource for ImageRootfsSource {
         .and_then(|_| self.check_deadline(started))
         .and_then(|()| open_rootfs_for_search(rootfs))
         .and_then(|()| {
+            // CRI の run_as_username は展開後の私有 rootfs の passwd で解決する（失敗は拒否。#2664）。
+            if let Some(name) = user.run_as_username {
+                defaults.resolved_run_as_username = Some(resolve_run_as_username(rootfs, name)?);
+            }
             // 名前・uid のみの User は、展開後の私有 rootfs の passwd / group で解決する（失敗は未解決のまま返す）。
-            if defaults.user_unresolved
+            // run_as_username があるときは CRI 側が優先するため省略する。
+            if user.run_as_username.is_none()
+                && defaults.user_unresolved
                 && let Some(lookup) = parse_user_lookup(process.user())
                 && let Some(ids) = resolve_user(rootfs, &lookup)
             {
@@ -746,6 +805,64 @@ mod tests {
     }
 
     /// 形式の検証: 名前の禁止文字・長さ・`:` 過多は解決対象にしない。
+    #[test]
+    fn cri2_username_limit_matches_spec() {
+        assert_eq!(MAX_NAME_BYTES, super::super::spec::MAX_USERNAME_BYTES);
+    }
+
+    /// CRI-2・SEC-5: run_as_username の解決（具体値とエラーコード）。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn cri2_run_as_username_resolution() {
+        use crate::error::CriErrorCode as C;
+        let r = lookup_rootfs(Some(PASSWD), None);
+        assert_eq!(resolve_run_as_username(&r, "app").unwrap(), (1000, 1001));
+        assert_eq!(resolve_run_as_username(&r, "root").unwrap(), (0, 0));
+        for bad in ["ghost", "bad"] {
+            assert_eq!(
+                resolve_run_as_username(&r, bad).unwrap_err().code(),
+                C::InvalidArgument
+            );
+        }
+        for bad in ["1000", "a:b", "a/b"] {
+            assert_eq!(
+                resolve_run_as_username(&r, bad).unwrap_err().code(),
+                C::InvalidArgument
+            );
+        }
+        assert_eq!(
+            resolve_run_as_username(&r, &"a".repeat(MAX_NAME_BYTES + 1))
+                .unwrap_err()
+                .code(),
+            C::InvalidArgument
+        );
+        let _ = std::fs::remove_dir_all(&r);
+        let r = lookup_rootfs(None, None);
+        assert_eq!(
+            resolve_run_as_username(&r, "app").unwrap_err().code(),
+            C::InvalidArgument
+        );
+        std::os::unix::fs::symlink("/etc/passwd", r.join("etc/passwd")).unwrap();
+        assert_eq!(
+            resolve_run_as_username(&r, "root").unwrap_err().code(),
+            C::FailedPrecondition
+        );
+        let _ = std::fs::remove_dir_all(&r);
+        let body = format!(
+            "{}app:x:1000:1001::/h:/bin/sh\n",
+            "\n".repeat(MAX_ETC_LINES)
+        );
+        let r = lookup_rootfs(Some(&body), None);
+        assert_eq!(
+            resolve_run_as_username(&r, "app").unwrap_err().code(),
+            C::FailedPrecondition
+        );
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
     #[test]
     fn cri2_user_lookup_parse_rejects_malformed() {
         assert!(parse_user_lookup("a:b:c").is_none());

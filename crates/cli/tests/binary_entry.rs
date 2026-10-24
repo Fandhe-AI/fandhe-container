@@ -2883,3 +2883,73 @@ fn sup14_doctor_reports_launcher_without_elevation() {
     );
     assert_eq!(code, 3);
 }
+
+/// `/proc/self/mountinfo` を試験側で独立に解析し、`path` を含む最長一致のマウント（同長は後の行）が
+/// `nosuid` かを返す。製品側の解析（`covering_mount_has_option`）と別実装で期待値を決める。
+#[cfg(target_os = "linux")]
+fn test_side_is_nosuid(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let info = std::fs::read("/proc/self/mountinfo").expect("mountinfo");
+    let target = path.as_os_str().as_bytes();
+    let mut best: Option<(usize, bool)> = None;
+    for line in info.split(|b| *b == b'\n') {
+        let f: Vec<&[u8]> = line
+            .split(|b| *b == b' ')
+            .filter(|x| !x.is_empty())
+            .collect();
+        let (Some(mp), Some(opts)) = (f.get(4), f.get(5)) else {
+            continue;
+        };
+        // 8 進エスケープは空白（\040）だけ戻せば試験の一時パスには足りる。
+        let mp: Vec<u8> = String::from_utf8_lossy(mp)
+            .replace("\\040", " ")
+            .into_bytes();
+        let covers = target == mp.as_slice()
+            || mp == b"/"
+            || (target.starts_with(&mp) && target.get(mp.len()) == Some(&b'/'));
+        if covers && best.is_none_or(|(l, _)| mp.len() >= l) {
+            best = Some((mp.len(), opts.split(|b| *b == b',').any(|t| t == b"nosuid")));
+        }
+    }
+    best.expect("covering mount").1
+}
+
+/// SUP-14・CORE-6（#2661）: 実バイナリの `doctor` が、兄弟のランチャー（file capability も setuid も持たない
+/// 信頼できる実行ファイル）の載るマウントの `nosuid` 属性を診断に反映する。`collect` の実体パス解決・mountinfo 読み取り・
+/// 評価・JSON 出力・終了コードをつなぐ経路を観測する。期待値は試験側で独立に求める。nosuid ならば `nosuid_mount`、
+/// そうでなければ `no_file_capabilities`（どちらも warning・終了コード 3）。mountinfo を読めない場合の
+/// `mount_unreadable` は、実バイナリから /proc を差し替えられないため `launcher_check` の単体試験で照合する。
+/// nosuid マウントの人工的な構築（root・mount 権限が要る）はこの試験では行わない。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup14_doctor_reports_launcher_mount_state() {
+    if is_root() {
+        return; // root では検査を省く（`doctor_reports_unset_xdg_runtime_dir` が通知を照合する）。
+    }
+    let dir = isolated_cli_dir("doctor-mount");
+    install_fake_exe(&dir, "fandhe-container-launcher", "#!/bin/sh\nexit 0\n");
+    let real = dir.canonicalize().expect("canonicalize");
+    let expect_nosuid = test_side_is_nosuid(&real);
+    let out = run_isolated(&dir.join("fandhe-container"), &["doctor"]);
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("\"check\":\"launcher\""))
+        .unwrap_or_else(|| panic!("no launcher line: {stdout}"));
+    assert!(
+        line.starts_with("{\"severity\":\"warning\",\"code\":\"LAUNCHER_ELEVATION_UNAVAILABLE\""),
+        "{line}"
+    );
+    let state = if expect_nosuid {
+        "nosuid_mount"
+    } else {
+        "no_file_capabilities"
+    };
+    assert!(
+        line.ends_with(&format!("\"check\":\"launcher\",\"state\":\"{state}\"}}")),
+        "expected {state}: {line}"
+    );
+    assert_eq!(out.status.code(), Some(3), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

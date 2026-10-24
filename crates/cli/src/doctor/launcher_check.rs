@@ -351,6 +351,16 @@ fn launcher_mount_state(mountinfo: Option<&str>, path: &std::path::Path) -> Laun
     }
 }
 
+/// mountinfo を外部入力として上限つきで読む。超過・読み取り失敗・不正な UTF-8 は `None`（判定不能。fail-closed）。
+///
+/// 不正な UTF-8 を置換して続けると、置換後の文字列と実体パスの生バイトを比べる `covering_mount_has_option` が
+/// 非 UTF-8 名の nosuid マウントを取り逃がし、祖先のマウントを選んで `Allowed` と誤判定する。
+#[cfg(target_os = "linux")]
+fn read_mountinfo_strict(path: &std::path::Path) -> Option<String> {
+    let bytes = super::read_limited_bytes(path, super::MAX_MOUNTINFO_READ).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
 /// 事実を集める（読み取りのみ。`start` と同じ `classify_launcher_beside` を使う）。
 #[cfg(target_os = "linux")]
 pub fn collect() -> LauncherFindings {
@@ -397,12 +407,7 @@ pub fn collect() -> LauncherFindings {
         }),
         LauncherPresence::Trusted(t) => {
             let xattr = read_launcher_file_caps(&t.path);
-            // `/proc/self/mountinfo` は外部入力として上限つきで読む（超過・失敗は判定不能）。
-            let mountinfo = super::read_limited(
-                std::path::Path::new("/proc/self/mountinfo"),
-                super::MAX_MOUNTINFO_READ,
-            )
-            .ok();
+            let mountinfo = read_mountinfo_strict(std::path::Path::new("/proc/self/mountinfo"));
             let mount = launcher_mount_state(mountinfo.as_deref(), &t.path);
             let elevation = match assess_elevation(t.owner_uid, t.mode, &xattr) {
                 ElevationAssessment::SetuidRoot => Elevation::SetuidRoot,
@@ -656,6 +661,26 @@ mod tests {
         assert_eq!(st(None, "/opt/fc/bin"), LauncherMount::Unknown);
         assert_eq!(st(Some(""), "/opt/fc/bin"), LauncherMount::Unknown);
         assert_eq!(st(Some(info), "rel/bin"), LauncherMount::Unknown);
+    }
+
+    /// SUP-14・#2661: 不正な UTF-8 を含む mountinfo は置換せず判定不能（`None`）にする。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup14_mountinfo_non_utf8_is_unreadable() {
+        let dir = std::env::temp_dir().join(format!("fc-mi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let ok = dir.join("ok");
+        std::fs::write(&ok, b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n").expect("write");
+        assert_eq!(
+            read_mountinfo_strict(&ok).as_deref(),
+            Some("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n")
+        );
+        let bad = dir.join("bad");
+        std::fs::write(&bad, b"26 22 0:23 / /opt/\xff rw,nosuid - tmpfs tmpfs rw\n")
+            .expect("write");
+        assert_eq!(read_mountinfo_strict(&bad), None);
+        assert_eq!(read_mountinfo_strict(&dir.join("missing")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SUP-14・#2599: rootful・読めない・対象外・exe 解決不可の扱い。

@@ -81,8 +81,9 @@
 //! - **fail-closed**: 記録した bundle から経路を fd 相対・リンク非追従で辿り、末尾の (dev, ino) が記録と
 //!   一致するときだけ消す。symlink・ディレクトリでないもの・差し替えは `FailedPrecondition` で何も消さない。
 //!   既に無ければ成功扱い
-//! - **失敗は delete の結果を変えない**: 状態は既に消えており、エラーを返すと再実行が `NotFound` になる
-//!   （`image_ref_release` と同じ）。操作名 `image_rootfs_remove` で `recorder` に記録し、木は残す。残った木が
+//! - **失敗は delete を `Err` にしない**: 状態は既に消えており、エラーを返すと再実行が `NotFound` になる
+//!   （`image_ref_release` と同じ）。結果は [`DeleteResponse::image_rootfs`]（`Kept { code }` 等。#2633）に載せ、
+//!   操作名 `image_rootfs_remove` で `recorder` にも記録し、木は残す。残った木が
 //!   あると同じ bundle の次の `create_with_image` は `AlreadyExists` になるため、手動で消す。孤児の自動回収は
 //!   本件の対象外。設計と制約は `docs/design/image-rootfs-lifetime.md`
 //! - **bundle の所有ロックを保持して消す**: 状態削除の前から rootfs の後始末の完了まで `BundleLock` を保持し、
@@ -164,9 +165,9 @@ use super::image_rootfs::{
 use super::launch::BundleLock;
 use crate::observability::{OpName, OpRecorder};
 use crate::traits::{
-    CgroupPlacement, CgroupScope, ContainerId, ContainerState, DeleteRequest, DeleteResponse,
-    DeleteStateRequest, ErrorCode, GetStateRequest, StateRecord, StateRevision, StateStore,
-    TraitError,
+    CgroupPlacement, CgroupScope, CleanupOutcome, ContainerId, ContainerState, DeleteRequest,
+    DeleteResponse, DeleteStateRequest, ErrorCode, GetStateRequest, StateRecord, StateRevision,
+    StateStore, TraitError,
 };
 
 /// [`OpRecorder`] に記録する操作名（REPAIR-4）。
@@ -437,13 +438,13 @@ fn delete_inner(
     match store.delete(&delete_req) {
         Ok(_) => {
             // 状態を消した実際の revision のレコード（関数の先頭で読んだもの）に付いた記録だけを使う。
-            remove_core_created_rootfs(
+            let outcome = remove_core_created_rootfs(
                 recorder,
                 &record,
                 rootfs_lock.as_ref(),
                 &options.rootfs_privilege,
             );
-            Ok(DeleteResponse::new())
+            Ok(DeleteResponse::new().with_image_rootfs(outcome))
         }
         Err(e) if e.code() == ErrorCode::FailedPrecondition => {
             // get の後に状態が進んだか、並行する delete が先に削除した。1 回だけ確認する。
@@ -461,8 +462,8 @@ fn delete_inner(
 
 /// 状態削除の成功後に、core が `create_with_image` で作った rootfs を消す（OCI-7・OCI-5・#2378）。
 ///
-/// 記録（[`StateRecord::image_rootfs`]）が無いレコード（利用者が用意した rootfs）では何もしない。失敗は
-/// delete の結果を変えず（状態は既に消えており、エラーを返すと再実行が `NotFound` になる。`image_ref_release`
+/// 記録（[`StateRecord::image_rootfs`]）が無いレコード（利用者が用意した rootfs）では何もせず
+/// [`CleanupOutcome::NotApplicable`] を返す。失敗は delete を `Err` にせず（状態は既に消えており、エラーを返すと再実行が `NotFound` になる。`image_ref_release`
 /// と同じ考え方）、操作名 `image_rootfs_remove` で `recorder` に記録して木を残す。残った木は手動で消す
 /// （`docs/design/image-rootfs-lifetime.md`）。
 ///
@@ -471,19 +472,25 @@ fn delete_inner(
 /// 記録する。排他なしで消すと、状態削除の後に同じ ID・同じ実体の rootfs を採用した create のコンテナの
 /// rootfs を消しうるため（OCI-7 の使用中 rootfs の保持。fail-closed）。bundle 自体が無い（`NotFound`）なら
 /// 消す物も無いので `NotPresent` として記録する。
+///
+/// 戻り値は [`DeleteResponse::image_rootfs`] へ載せる結果（`Removed`・`AlreadyAbsent`・`Kept { code }`。
+/// 呼び出し側の CLI・plugin が利用者へ伝える。#2633・REPAIR-4）。
 fn remove_core_created_rootfs(
     recorder: &OpRecorder,
     record: &StateRecord,
     lock: Option<&Result<BundleLock, TraitError>>,
     privilege: &ImageRootfsPrivilege,
-) {
+) -> CleanupOutcome {
     let Some(rec) = record.image_rootfs() else {
-        return;
+        return CleanupOutcome::NotApplicable;
     };
     let Ok(name) = OpName::new(IMAGE_ROOTFS_REMOVE_OP_NAME) else {
-        return;
+        // 操作名を作れない（定数のため通常起きない）場合は、消さずに残したことを分類つきで返す。
+        return CleanupOutcome::Kept {
+            code: ErrorCode::Internal,
+        };
     };
-    let _ = recorder.record_op(&name, || match lock {
+    let result = recorder.record_op(&name, || match lock {
         Some(Ok(_held)) => remove_recorded_rootfs_with(record.bundle(), rec, privilege),
         Some(Err(e)) if e.code() == ErrorCode::NotFound => Ok(RecordedRootfsRemoval::NotPresent),
         Some(Err(e)) => Err(TraitError::new(
@@ -495,6 +502,11 @@ fn remove_core_created_rootfs(
             "bundle lock was not taken; image rootfs was kept",
         )),
     });
+    match result {
+        Ok(RecordedRootfsRemoval::Removed) => CleanupOutcome::Removed,
+        Ok(RecordedRootfsRemoval::NotPresent) => CleanupOutcome::AlreadyAbsent,
+        Err(e) => CleanupOutcome::Kept { code: e.code() },
+    }
 }
 
 /// 状態の判定表（モジュール doc）。`ContainerState` の追加をコンパイルエラーで検出するため網羅で書く。

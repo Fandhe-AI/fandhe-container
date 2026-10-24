@@ -20,6 +20,10 @@
 //!   が記録のスコープを fd 起点で検証つきに開いてコンテナ cgroup を消す（#2096）。検証に失敗すれば何も消さず
 //!   記録を残す。非 Linux では `UnavailableCgroupRemover` が `Unimplemented` で失敗する。
 //!
+//! `delete` は core の delete が成功したとき、`DeleteResponse::image_rootfs` が `Kept { code }`（core が作ったイメージ由来
+//! rootfs を消せずに残した。OCI-7・#2633）なら、`code` / `message` の 1 行 JSON の警告を stderr に出す（終了コードは 0 のまま。
+//! bundle のパス・errno は含めない）。消せた・既に無かった・記録が無いときの stderr は空。
+//!
 //! `delete` は core の delete が成功した後に、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）を best effort で
 //! 消す（`remove_supervisor_log`。失敗は握り、成功時の stderr は空のまま。#2067・REPAIR-4・ERR-2）。
 //!
@@ -72,8 +76,8 @@ use fandhe_container_core::oci_runtime::{
     delete_releasing_image_ref, kill,
 };
 use fandhe_container_core::traits::{
-    ContainerId, ContainerState, ContainerStatus, DeleteRequest, DeleteResponse, ErrorCode,
-    GetStateRequest, KillRequest, Signal, StateStore, TraitError,
+    CleanupOutcome, ContainerId, ContainerState, ContainerStatus, DeleteRequest, DeleteResponse,
+    ErrorCode, GetStateRequest, KillRequest, Signal, StateStore, TraitError,
 };
 // 試験が `use super::*` 経由で使う型（本番の経路では使わない）。
 #[cfg(all(test, target_os = "linux"))]
@@ -309,12 +313,29 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
     };
     export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
     match result {
-        Ok(_) => {
+        Ok(resp) => {
+            if let Some(warning) = image_rootfs_removal_warning(resp.image_rootfs()) {
+                emit_warning_bounded(warning, write_warning_to_stderr, WARNING_WRITE_TIMEOUT);
+            }
             remove_supervisor_log(rt.store.as_ref(), &req);
             remove_container_log(rt.store.as_ref(), &req);
             CliExit::Success
         }
         Err(e) => CliExit::Runtime(e),
+    }
+}
+
+/// イメージ由来 rootfs を残した場合の警告（stderr に 1 行の JSON。ERR-1・OCI-7・#2633）。
+///
+/// `Kept` のときだけ `Some`。パス・errno・ID は含めず、`code` で理由を見分ける。残った木は手動で消す
+/// （`docs/design/image-rootfs-lifetime.md`）。
+fn image_rootfs_removal_warning(outcome: CleanupOutcome) -> Option<String> {
+    match outcome {
+        CleanupOutcome::Kept { code } => Some(format!(
+            "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"image rootfs removal failed; leftover rootfs may remain\"}}",
+            code.as_str()
+        )),
+        _ => None,
     }
 }
 
@@ -493,6 +514,31 @@ mod tests {
         );
         let w = container_log_removal_warning(&TraitError::new(ErrorCode::Timeout, "x"));
         assert!(w.contains("\"code\":\"TIMEOUT\"") && !w.contains('\n') && !w.contains('/'));
+    }
+
+    /// ERR-1・OCI-7・#2633: rootfs を残したときだけ、code ごとに完全一致する 1 行 JSON の警告を作る。
+    #[test]
+    fn err1_image_rootfs_removal_warning_is_single_line_json() {
+        let w = image_rootfs_removal_warning(CleanupOutcome::Kept {
+            code: ErrorCode::FailedPrecondition,
+        })
+        .expect("kept warns");
+        assert_eq!(
+            w,
+            "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"image rootfs removal failed; leftover rootfs may remain\"}"
+        );
+        let w = image_rootfs_removal_warning(CleanupOutcome::Kept {
+            code: ErrorCode::Unimplemented,
+        })
+        .expect("kept warns");
+        assert!(w.contains("\"code\":\"UNIMPLEMENTED\"") && !w.contains('\n'));
+        for quiet in [
+            CleanupOutcome::Removed,
+            CleanupOutcome::AlreadyAbsent,
+            CleanupOutcome::NotApplicable,
+        ] {
+            assert_eq!(image_rootfs_removal_warning(quiet), None);
+        }
     }
 
     fn stop_args(id: &str) -> StopArgs {

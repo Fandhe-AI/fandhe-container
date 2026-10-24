@@ -34,7 +34,9 @@
 //!   best effort で消す（失敗は戻り値に影響させず、期限切れは記録器の `supervisor_log_remove` の失敗として計上する）。
 //!   続けてコンテナログ（`<root>/@container-logs/<id>.log*`・ロック。#2593・SUP-7・CRI-2・CLI-1）も CLI の `delete` と同じ
 //!   `remove_container_logs_guarded_bounded` で消す（期限 5 秒・同じ ID の sink が生きていれば `FailedPrecondition` で何も消さない・
-//!   stderr へは書かない）。消せなくても `delete` は `Ok` のままにする: CRI 層は `Err` で記録を残して再試行するが、再試行は
+//!   削除関数そのものは stderr へ書かない）。残した結果は `DeleteResponse` の `supervisor_log`・`container_log` に載せ
+//!   （`Kept { code }`。rootfs の欄は core が埋める。#2633）、`Kept` が 1 件でもあれば 1 件につき 1 行の構造化ログ
+//!   （`event: container_delete_cleanup`。パス・errno は含めない）を `LineSink`（有界キュー。待たない）経由で出す。消せなくても `delete` は `Ok` のままにする: CRI 層は `Err` で記録を残して再試行するが、再試行は
 //!   core の `NOT_FOUND` で止まりログ削除まで届かないため、CLI と同じく成功として扱い、失敗は記録器の `container_log_remove`
 //!   の失敗として計上する（構造化エラーは [`CoreLifecycleRuntime::remove_container_log`] の `TraitError`）。最悪の上乗せは
 //!   supervisor ログと合わせて 10 秒。記録器にエラーコード別の内訳は無い（REPAIR-3）。既知の制約として、running への force
@@ -64,8 +66,8 @@ use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{self, ContainerCgroupRemover, OciRuntimeError};
 use fandhe_container_core::state_store::{FileStateStore, StateRoot};
 use fandhe_container_core::traits::{
-    AttachRequest, AttachResponse, ContainerId, ContainerRuntime, ContainerStatus,
-    CreateNetnsRequest, CreateNetworkRequest, CreateRequest, DeleteNetworkRequest,
+    AttachRequest, AttachResponse, CleanupOutcome, CleanupTarget, ContainerId, ContainerRuntime,
+    ContainerStatus, CreateNetnsRequest, CreateNetworkRequest, CreateRequest, DeleteNetworkRequest,
     DeleteNetworkResponse, DeleteRequest, DeleteResponse, DetachRequest, DetachResponse, ErrorCode,
     GetStateRequest, KillRequest, NetnsStatus, NetworkPlugin, NetworkStatus, PortMapping,
     PublishPortRequest, StartRequest, StateRequest, StateStore, StopRequest, TraitError,
@@ -251,8 +253,23 @@ pub struct CoreLifecycleRuntime {
     cgroups: Arc<dyn ContainerCgroupRemover>,
     /// `create` の `mounts[].destination` 拒否の記録先（`with_create_audit_sink`。#2594）。無ければ記録しない。
     create_audit: Option<Arc<dyn AuditSink>>,
+    /// `delete` の後始末で残した資源の構造化ログ 1 行の出力先（本番は stderr の `LineSink`。試験で差し替える。#2633）。
+    cleanup_warn: Arc<dyn Fn(String) + Send + Sync>,
     #[cfg(target_os = "linux")]
     supervised: SupervisedLifecycle,
+}
+
+/// `delete` の後始末で残した資源 1 件の構造化ログ 1 行（末尾に改行）を作る（OCI-7・CRI-2・SUP-7・REPAIR-4）。
+///
+/// 値は `ContainerId`（検証済みの文字種）・`CleanupTarget::as_str`・`ErrorCode::as_str` の固定語彙だけで組み、
+/// パス・errno・外部入力の文字列を含めない（ERR-1・ERR-2）。
+fn cleanup_warning_line(id: &ContainerId, target: CleanupTarget, code: ErrorCode) -> String {
+    format!(
+        "{{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"{}\",\"target\":\"{}\",\"code\":\"{}\",\"message\":\"cleanup after delete left resources behind\"}}\n",
+        id.as_str(),
+        target.as_str(),
+        code.as_str()
+    )
 }
 
 /// `create` の拒否の記録先を包み、記録の失敗を固定語彙の 1 行で stderr へ残す（結果は内側のまま返す。#2594）。
@@ -364,9 +381,19 @@ impl CoreLifecycleRuntime {
             recorder,
             cgroups: Arc::new(production_cgroup_remover()),
             create_audit: None,
+            cleanup_warn: Arc::new(|line| {
+                let _ = crate::telemetry::stderr_sink().submit(line);
+            }),
             #[cfg(target_os = "linux")]
             supervised: SupervisedLifecycle::production(),
         }
+    }
+
+    /// `delete` の後始末で残した資源の構造化ログの出力先を差し替える（試験用。本番の既定は stderr の `LineSink`。#2633）。
+    #[must_use]
+    pub fn with_cleanup_warning_sink(mut self, sink: Arc<dyn Fn(String) + Send + Sync>) -> Self {
+        self.cleanup_warn = sink;
+        self
     }
 
     /// cgroup remover を差し替える（結合試験と別実装。本番の既定は supervisor crate の遅延検出つき remover）。
@@ -410,9 +437,9 @@ impl CoreLifecycleRuntime {
     ///
     /// 失敗・期限切れでも `delete` の結果は変えない（状態の削除は完了済み）。期限切れは記録器の操作名
     /// `supervisor_log_remove` の失敗として計上し、観測できるようにする。
-    fn remove_supervisor_log(&self, id: &ContainerId) {
+    fn remove_supervisor_log(&self, id: &ContainerId) -> CleanupOutcome {
         let Some(root) = self.store.host_state_root() else {
-            return;
+            return CleanupOutcome::NotApplicable;
         };
         let started = Instant::now();
         let outcome = remove_bounded(root, id, SUPERVISOR_LOG_REMOVE_TIMEOUT);
@@ -422,6 +449,13 @@ impl CoreLifecycleRuntime {
                 LogRemoval::TimedOut => OpOutcome::Failure,
             };
             let _ = self.recorder.record(&name, result, started.elapsed());
+        }
+        // `Finished` は期限内に作業を終えた best effort（個々の失敗は削除関数が握る）。
+        match outcome {
+            LogRemoval::Finished => CleanupOutcome::Removed,
+            LogRemoval::TimedOut => CleanupOutcome::Kept {
+                code: ErrorCode::Timeout,
+            },
         }
     }
 
@@ -451,17 +485,22 @@ impl CoreLifecycleRuntime {
     }
 
     /// [`Self::remove_container_log`] の結果を記録器の `container_log_remove` に計上する（戻り値には影響させない）。
-    fn record_container_log_removal(&self, id: &ContainerId) {
+    fn record_container_log_removal(&self, id: &ContainerId) -> CleanupOutcome {
         if self.store.host_state_root().is_none() {
-            return;
+            return CleanupOutcome::NotApplicable;
         }
         let started = Instant::now();
-        let result = match self.remove_container_log(id) {
+        let removed = self.remove_container_log(id);
+        let result = match removed {
             Ok(_) => OpOutcome::Success,
             Err(_) => OpOutcome::Failure,
         };
         if let Ok(name) = OpName::new("container_log_remove") {
             let _ = self.recorder.record(&name, result, started.elapsed());
+        }
+        match removed {
+            Ok(_) => CleanupOutcome::Removed,
+            Err(e) => CleanupOutcome::Kept { code: e.code() },
         }
     }
 }
@@ -554,8 +593,15 @@ impl ContainerRuntime for CoreLifecycleRuntime {
         }
         let response = oci_runtime::delete(&*self.store, &self.recorder, &*self.cgroups, req)
             .map_err(to_trait_error)?;
-        self.remove_supervisor_log(req.id());
-        self.record_container_log_removal(req.id());
+        let supervisor_log = self.remove_supervisor_log(req.id());
+        let container_log = self.record_container_log_removal(req.id());
+        let response = response
+            .with_supervisor_log(supervisor_log)
+            .with_container_log(container_log);
+        // 残した資源は `Err` にせず、応答と構造化ログで知らせる（再試行は core の `NOT_FOUND` で止まるため。#2633）。
+        for (target, code) in response.kept() {
+            (self.cleanup_warn)(cleanup_warning_line(req.id(), target, code));
+        }
         Ok(response)
     }
 

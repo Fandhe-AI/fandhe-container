@@ -413,6 +413,7 @@ impl ProductionLauncherBuilder {
 /// 範囲写像の ID 写像 holder は中間プロセスのメモリ(注入内容を含む)を fork で継承し、`run_userns_holder` で
 /// dumpable になるため、Yama=0 では同一 UID の別プロセスから secret を読める。露出の解消は #2628
 /// (SEC-1・SEC-5・CORE-6・SUP-12)。`build` と launch の両方で呼ぶ(builder の呼び出し順で迂回させない)。
+#[cfg(target_os = "linux")]
 fn refuse_inject_with_subordinate(
     privilege: IsolationPrivilege,
     options: &LaunchOptions,

@@ -264,7 +264,7 @@ impl ProductionLauncherBuilder {
     /// 回収点は supervisor の監視スレッドなど複数スレッドのプロセスから呼ばれ、`FileAuditSink` の fork 隔離が使えない
     /// (rootless では代替経路も失敗する)。supervisor は単一スレッドの間に作った `ControlAuditRelay` をここへ渡す。
     /// launch の時点の記録(監査網羅の縮退・pre-pivot の違反)は単一スレッドで出るため `audit_sink` のままで、
-    /// relay は理由つきの `Mount` 等を運べないので `audit_sink` 全体の差し替えには使わない。
+    /// relay は閉じた表の理由つきの `Mount` しか運べず（それ以外の理由つきは `InvalidArgument`）、`audit_sink` 全体の差し替えには使わない。
     /// start の検証(bind・sysfs)の拒否の記録先は [`Self::rejection_audit_sink`]。
     #[must_use]
     pub fn exit_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {
@@ -277,7 +277,7 @@ impl ProductionLauncherBuilder {
     ///
     /// この検証は start の作業スレッド(入口スレッドが待つ間のため複数スレッド)で走り、`FileAuditSink` の fork 隔離が
     /// 使えない(rootless では代替経路も失敗して拒否が残らない)。supervisor は単一スレッドの間に作った
-    /// `ControlAuditRelay`(理由なしの `Mount` を運べる)をここへ渡す。launch の時点の記録(監査網羅の縮退・
+    /// `ControlAuditRelay`(理由なしの `Mount` と、rootfs の固定の違反の閉じた表の理由つき `Mount`〔#2623〕を運べる)をここへ渡す。launch の時点の記録(監査網羅の縮退・
     /// pre-pivot の違反)は単一スレッドで出るので `audit_sink` のまま。
     #[must_use]
     pub fn rejection_audit_sink(mut self, sink: Arc<dyn AuditSink>) -> Self {

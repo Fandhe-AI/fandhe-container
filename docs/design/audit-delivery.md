@@ -167,6 +167,7 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
 - **縮退**: カーネル監査を使えない環境では補助レコードだけが残る（syscall は残らない）。検出と表示は #2027（7.1）
 - **複数スレッド・rootless での配送（#2236 で実装）**: supervisor は監視の時点で複数スレッドのため `FileAuditSink` の隔離（fork）が使えず、rootless では代替のカーネル監査送信（`CAP_AUDIT_WRITE` が要る）も失敗する。そこで `ControlAuditRelay` が `ExitSignal` の固定長の枠（タグ 0x82。signal 1 バイトと target_pid 4 バイト。復号は長さの厳密一致と値の範囲検査で、壊れた枠は記録にしない）も運ぶようにし、supervisor の入口が単一スレッドの間に作った relay を `ProductionLauncherBuilder::exit_audit_sink` で launcher の**回収点だけ**の記録先に渡す。launch の時点の記録（監査網羅の縮退・pre-pivot の違反）は単一スレッドで出るため従来どおり `FileAuditSink` のままにする（relay は理由つきの `Mount` 等を運べず、sink 全体を差し替えると退行するため）。start の検証（bind・sysfs の拒否）の記録先は #2481 で別に扱う（次の項目）。回収点は `AtomicBool` で 1 回だけ記録し、relay の待ちは `RECORD_WAIT_LIMIT` までで、応答が無ければ helper を SIGKILL して以後は `Unavailable`（REPAIR-5。終了状態の返却は変えない）
 - **start の bind・sysfs の拒否の配送（#2481 で実装）**: `claim_start` の検証は作業スレッド `supervisor-start` で走り、入口スレッドが待つ間はプロセスが複数スレッドになる。このため launcher の `audit_sink`（`FileAuditSink`）は主経路を試せず、rootless では代替経路も失敗して mount 層の拒否が `@audit.log` に残らなかった（`claim_start` は記録の結果を捨てる）。そこで `ControlAuditRelay` が理由なしの `Mount` の固定の枠（タグ 0x83。path_present 1・path_len 2・original_len 8 の後にパス本体を生バイトで運ぶ。復号は長さの厳密一致・保持長 4096 以下・`AuditPath` の切り詰めの整合を検査し、矛盾する枠は記録にしない。helper は本体を確保する前に長さを上限と照合する）を運ぶようにし、supervisor の入口が `ProductionLauncherBuilder::rejection_audit_sink` で start の検証の拒否だけの記録先に relay を渡す。relay が記録できなかったときは、記録先を包む `ObservedRejectionSink` が固定語彙の構造化ログ（`rejection_audit_record_failed`・エラーコード）を 1 行出し、拒否の結果は変えない。結合試験は `crates/supervisor/tests/start_bind_audit_relay.rs`
+- **start の rootfs の固定の違反の配送（#2623 で実装）**: `RootfsDir::pin` が検証後の差し替え（symlink・非ディレクトリ・不在）を拒否したとき、`build_spec` が `RootfsPinError::violation` の理由（`path_symlink_or_not_directory`・`path_missing`）を launcher の `rejection_audit_sink` へ層 `mount`・パスなし・コンテナ ID つきで 1 件記録する（違反を伴わない失敗は記録しない。記録の成否で拒否は変えない）。relay は理由つきの `Mount` の枠（タグ 0x85。理由の添字 1 バイトに `MountHeader` とパス本体が続く）を運び、理由は閉じた表（`MOUNT_REASONS`）の添字だけで、復号側は表の静的トークンから `AuditReason` を作る（表に無い理由は `InvalidArgument`、範囲外の添字は記録にしない）。結合試験は `crates/supervisor/tests/start_rootfs_pin_audit_relay.rs`（作業スレッドから start の前半を実行し `@audit.log` の 2 行を照合）
 - **`AuditEvent` の種類ごとの relay の扱い（#2481）**: relay で運ぶのは下表の「運ぶ」だけで、運ばない種類は `InvalidArgument` で失敗が見える（黙って捨てない）。運ばない種類は、記録するのが単一スレッドの段か別プロセスのため、`FileAuditSink` で足りる。`audit_sink` を丸ごと relay へ差し替えない（差し替えると理由つきの `Mount` や縮退の記録が `InvalidArgument` で落ちて退行する）
 
   | 種類 | relay | 記録する段・スレッドの状況 | 使う sink |
@@ -175,7 +176,8 @@ Landlock には USER_NOTIF に相当するユーザー空間への通知経路�
   | `Seccomp` | 運ぶ | seccomp ハブのスレッド（複数スレッド） | relay |
   | `ExitSignal` | 運ぶ | launcher の回収点（監視スレッド。複数スレッド） | relay（`exit_audit_sink`） |
   | `Mount`（理由なし） | 運ぶ | start の bind・sysfs の拒否（作業スレッド。複数スレッド） | relay（`rejection_audit_sink`） |
-  | `Mount`（理由つき） | 運ばない（理由の静的トークンは開いた語彙で、復号側で閉じた表へ戻せない） | launch・create・exec の拒否（単一スレッド） | `FileAuditSink` |
+  | `Mount`（閉じた表の理由つき。rootfs の固定の 2 理由） | 運ぶ（#2623。理由は表の添字で運び、復号側が表の静的トークンへ戻す） | start の作業スレッド（`rejection_audit_sink`） | relay |
+  | `Mount`（それ以外の理由つき） | 運ばない（理由の静的トークンは開いた語彙で、復号側で閉じた表へ戻せない） | launch・create・exec の拒否（単一スレッド） | `FileAuditSink` |
   | `Landlock`・`PluginTrust`・`ExecTarget`・`Entrypoint` | 運ばない | 単一スレッドの段（launch の pre-pivot・exec の親・plugin 検証） | `FileAuditSink` またはカーネル監査 |
   | `AuditCoverageDegraded` | 運ばない | launcher の launch（入口スレッド。単一スレッド）。`start_entry_audit_record_failed.rs` が照合済み。restart の再 launch は複数スレッドでは本番 launcher が拒否する（#2043） | `FileAuditSink`（`audit_sink`） |
 

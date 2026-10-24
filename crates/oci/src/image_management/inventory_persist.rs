@@ -37,6 +37,8 @@
 //! root の所有者・権限・祖先の検査は `ImageStore::open` が行い、`lock` と create ゲートの取得ごとに
 //! 再検査する（#2381・#2547。unix のみ）。root は所有者専用のディレクトリである前提で、ここでは
 //! 通常ファイル・symlink・権限・dev/ino だけを見る。
+//! 読み書きは検査済み root のハンドル（`root_handle::RootHandle`）起点で、Linux の x86_64 / aarch64 では
+//! 検査後に root が差し替えられても差し替え後のディレクトリへ届かない（#2638）。
 //!
 //! # 既知の残り（実装済みを装わない。REPAIR-3）
 //!
@@ -47,14 +49,14 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
+use super::root_handle::RootHandle;
 use super::tag::MAX_TAG_REFS;
 use super::{ManifestComposition, PullId, ReferenceTable, TagKey};
 use crate::error::{OciError, OciErrorCode};
@@ -241,7 +243,9 @@ fn check_trust(m: &fs::Metadata) -> Result<(), OciError> {
 }
 
 /// 在庫ファイルを読む。無ければ `Ok(None)`（永続化された状態なし。メモリ上の内容を保つ）。
-pub(super) fn load_image_inventory(root: &Path) -> Result<Option<InventoryPortion>, OciError> {
+pub(super) fn load_image_inventory(
+    root: &RootHandle,
+) -> Result<Option<InventoryPortion>, OciError> {
     load_with_limits(root, Limits::DEFAULT, MAX_IMAGE_INVENTORY_FILE_BYTES)
 }
 
@@ -262,14 +266,13 @@ impl Limits {
 }
 
 fn load_with_limits(
-    root: &Path,
+    root: &RootHandle,
     limits: Limits,
     max_bytes: u64,
 ) -> Result<Option<InventoryPortion>, OciError> {
-    let path = root.join(IMAGE_INVENTORY_FILE_NAME);
-    let pre = match fs::symlink_metadata(&path) {
-        Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+    let pre = match root.stat_name(IMAGE_INVENTORY_FILE_NAME) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Ok(None),
         Err(_) => {
             return Err(e(
                 OciErrorCode::Internal,
@@ -278,12 +281,16 @@ fn load_with_limits(
         }
     };
     check_trust(&pre)?;
-    let file = File::open(&path).map_err(|_| {
+    let open_failed = || {
         e(
             OciErrorCode::Internal,
             "failed to open the image inventory file",
         )
-    })?;
+    };
+    let file = root
+        .open_read(IMAGE_INVENTORY_FILE_NAME)
+        .map_err(|_| open_failed())?
+        .ok_or_else(open_failed)?;
     let post = file.metadata().map_err(|_| {
         e(
             OciErrorCode::Internal,
@@ -623,11 +630,8 @@ fn next_tmp_nonce() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-fn tmp_path(root: &Path, nonce: u64) -> PathBuf {
-    root.join(format!(
-        "{IMAGE_INVENTORY_TMP_PREFIX}{}-{nonce}",
-        std::process::id()
-    ))
+fn tmp_name(nonce: u64) -> String {
+    format!("{IMAGE_INVENTORY_TMP_PREFIX}{}-{nonce}", std::process::id())
 }
 
 #[cfg(test)]
@@ -643,7 +647,10 @@ pub(super) fn set_fail_save(on: bool) {
 }
 
 /// テーブルの在庫・タグ・リースを保存する（一時ファイル → fsync → rename → 親ディレクトリ fsync）。
-pub(super) fn save_image_inventory(root: &Path, table: &ReferenceTable) -> Result<(), OciError> {
+pub(super) fn save_image_inventory(
+    root: &RootHandle,
+    table: &ReferenceTable,
+) -> Result<(), OciError> {
     #[cfg(test)]
     if FAIL_SAVE.with(Cell::get) {
         return Err(e(OciErrorCode::Internal, "injected save failure"));
@@ -652,7 +659,7 @@ pub(super) fn save_image_inventory(root: &Path, table: &ReferenceTable) -> Resul
 }
 
 fn save_with_limits(
-    root: &Path,
+    root: &RootHandle,
     table: &ReferenceTable,
     limits: Limits,
     max_bytes: u64,
@@ -708,38 +715,32 @@ fn save_with_limits(
             "image inventory file would be too large",
         ));
     }
-    let tmp = tmp_path(root, next_tmp_nonce());
+    let tmp = tmp_name(next_tmp_nonce());
     let result = write_and_rename(root, &tmp, &bytes);
     if result.is_err() {
         // rename 前の失敗では一時ファイルを残さない（ベストエフォート）。
-        let _ = fs::remove_file(&tmp);
+        let _ = root.unlink(&tmp);
     }
     result
 }
 
-fn write_and_rename(root: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), OciError> {
+/// 一時ファイルを書いて固定名へ公開し、root を fsync する。すべて検査済み root の fd 起点（#2638）。
+fn write_and_rename(root: &RootHandle, tmp: &str, bytes: &[u8]) -> Result<(), OciError> {
     let fail = |msg: &'static str| e(OciErrorCode::Internal, msg);
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(tmp)
+    let mut f = root
+        .create_new(tmp)
         .map_err(|_| fail("failed to create the image inventory temp file"))?;
     f.write_all(bytes)
         .map_err(|_| fail("failed to write the image inventory temp file"))?;
     f.sync_all()
         .map_err(|_| fail("failed to sync the image inventory temp file"))?;
     drop(f);
-    fs::rename(tmp, root.join(IMAGE_INVENTORY_FILE_NAME))
+    // 確定の直前に、root が unlink されて到達不能になっていないことを確かめる。
+    root.ensure_linked()?;
+    root.rename(tmp, IMAGE_INVENTORY_FILE_NAME)
         .map_err(|_| fail("failed to replace the image inventory file"))?;
-    // 新しい名前を永続化する。Windows ではディレクトリを File として開けないため unix に限る。
-    #[cfg(unix)]
-    File::open(root)
-        .and_then(|d| d.sync_all())
+    // 新しい名前を永続化する（Windows ではディレクトリを開けないため `sync` は何もしない）。
+    root.sync()
         .map_err(|_| fail("failed to sync the image store directory"))?;
     Ok(())
 }
@@ -748,6 +749,8 @@ fn write_and_rename(root: &Path, tmp: &Path, bytes: &[u8]) -> Result<(), OciErro
 mod tests {
     use super::*;
     use crate::image_management::ImageStore;
+    use crate::image_management::root_handle::rh;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 
@@ -829,8 +832,8 @@ mod tests {
     fn oci7_round_trip_restores_inventory_tags_and_leases() {
         let r = root("roundtrip");
         let t = sample();
-        save_image_inventory(&r, &t).expect("save");
-        let loaded = load_image_inventory(&r).expect("load").expect("some");
+        save_image_inventory(&rh(&r), &t).expect("save");
+        let loaded = load_image_inventory(&rh(&r)).expect("load").expect("some");
         assert_eq!(loaded, t.inventory_portion());
         assert_eq!(
             loaded.manifests.keys().cloned().collect::<Vec<_>>(),
@@ -855,7 +858,7 @@ mod tests {
     #[test]
     fn oci7_missing_file_loads_as_none() {
         let r = root("missing");
-        assert!(load_image_inventory(&r).expect("load").is_none());
+        assert!(load_image_inventory(&rh(&r)).expect("load").is_none());
     }
 
     /// OCI-7: 入れ子の `layers`（`MAX_LAYERS` 超）と `pulls`（ファイル全体の残りリース件数超）も
@@ -878,7 +881,11 @@ mod tests {
         );
         write_raw(&r, &body);
         assert_eq!(
-            code(load_with_limits(&r, lim, MAX_IMAGE_INVENTORY_FILE_BYTES)),
+            code(load_with_limits(
+                &rh(&r),
+                lim,
+                MAX_IMAGE_INVENTORY_FILE_BYTES
+            )),
             OciErrorCode::ResourceExhausted
         );
         // 2 件 + 2 件 = 4 件のリースは上限 3 を超える（2 件目の pulls の途中で拒否される）。
@@ -888,7 +895,11 @@ mod tests {
         );
         write_raw(&r, &body);
         assert_eq!(
-            code(load_with_limits(&r, lim, MAX_IMAGE_INVENTORY_FILE_BYTES)),
+            code(load_with_limits(
+                &rh(&r),
+                lim,
+                MAX_IMAGE_INVENTORY_FILE_BYTES
+            )),
             OciErrorCode::ResourceExhausted
         );
         // ちょうど 3 件なら受け入れる。
@@ -896,14 +907,14 @@ mod tests {
             r#"{{"version":{FORMAT_VERSION},"manifests":[],"tags":[],"leases":[{{"blob":"{a}","pulls":["p1","p2"]}},{{"blob":"{b}","pulls":["p3"]}}]}}"#
         );
         write_raw(&r, &body);
-        assert!(load_with_limits(&r, lim, MAX_IMAGE_INVENTORY_FILE_BYTES).is_ok());
+        assert!(load_with_limits(&rh(&r), lim, MAX_IMAGE_INVENTORY_FILE_BYTES).is_ok());
     }
 
     /// OCI-7: 件数の上限超過は蓄積の前に `ResourceExhausted`（小さい上限を注入して確かめる）。
     #[test]
     fn oci7_load_rejects_over_limit_counts() {
         let r = root("limits");
-        save_image_inventory(&r, &sample()).expect("save");
+        save_image_inventory(&rh(&r), &sample()).expect("save");
         let lim = |manifests, tags, leases| Limits {
             manifests,
             tags,
@@ -916,22 +927,22 @@ mod tests {
             (lim(16, 16, 2), "lease pairs"),
         ] {
             assert_eq!(
-                code(load_with_limits(&r, l, MAX_IMAGE_INVENTORY_FILE_BYTES)),
+                code(load_with_limits(&rh(&r), l, MAX_IMAGE_INVENTORY_FILE_BYTES)),
                 OciErrorCode::ResourceExhausted,
                 "{label}"
             );
         }
         // 上限ちょうどは通る（manifests 2・tags 2・leases の組 3）。
-        assert!(load_with_limits(&r, lim(2, 2, 3), MAX_IMAGE_INVENTORY_FILE_BYTES).is_ok());
+        assert!(load_with_limits(&rh(&r), lim(2, 2, 3), MAX_IMAGE_INVENTORY_FILE_BYTES).is_ok());
     }
 
     /// OCI-7: サイズ上限超過は読み込む前に `ResourceExhausted`。
     #[test]
     fn oci7_load_rejects_oversized_file() {
         let r = root("size");
-        save_image_inventory(&r, &sample()).expect("save");
+        save_image_inventory(&rh(&r), &sample()).expect("save");
         assert_eq!(
-            code(load_with_limits(&r, Limits::DEFAULT, 16)),
+            code(load_with_limits(&rh(&r), Limits::DEFAULT, 16)),
             OciErrorCode::ResourceExhausted
         );
     }
@@ -1000,7 +1011,7 @@ mod tests {
         for (body, want, label) in cases {
             let r = root("corrupt");
             write_raw(&r, &body);
-            assert_eq!(code(load_image_inventory(&r)), want, "{label}");
+            assert_eq!(code(load_image_inventory(&rh(&r))), want, "{label}");
         }
     }
 
@@ -1009,24 +1020,24 @@ mod tests {
     fn oci7_load_rejects_untrusted_files() {
         let r = root("trust-dir");
         fs::create_dir(r.join(IMAGE_INVENTORY_FILE_NAME)).expect("mkdir");
-        assert_eq!(code(load_image_inventory(&r)), OciErrorCode::Internal);
+        assert_eq!(code(load_image_inventory(&rh(&r))), OciErrorCode::Internal);
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::{PermissionsExt, symlink};
             let r = root("trust-symlink");
             let real = r.join("real.json");
-            save_image_inventory(&r, &sample()).expect("save");
+            save_image_inventory(&rh(&r), &sample()).expect("save");
             fs::rename(r.join(IMAGE_INVENTORY_FILE_NAME), &real).expect("mv");
             symlink(&real, r.join(IMAGE_INVENTORY_FILE_NAME)).expect("symlink");
-            assert_eq!(code(load_image_inventory(&r)), OciErrorCode::Internal);
+            assert_eq!(code(load_image_inventory(&rh(&r))), OciErrorCode::Internal);
 
             let r = root("trust-perm");
-            save_image_inventory(&r, &sample()).expect("save");
+            save_image_inventory(&rh(&r), &sample()).expect("save");
             let p = r.join(IMAGE_INVENTORY_FILE_NAME);
             fs::set_permissions(&p, fs::Permissions::from_mode(0o666)).expect("chmod");
             assert_eq!(
-                code(load_image_inventory(&r)),
+                code(load_image_inventory(&rh(&r))),
                 OciErrorCode::PermissionDenied
             );
         }
@@ -1067,13 +1078,13 @@ mod tests {
             t.acquire_lease(dg(9_000_000 + i), p).expect("lease");
         }
         let r = root("max");
-        save_image_inventory(&r, &t).expect("max table must be persistable");
+        save_image_inventory(&rh(&r), &t).expect("max table must be persistable");
         let len = fs::metadata(r.join(IMAGE_INVENTORY_FILE_NAME))
             .expect("meta")
             .len();
         assert!(len <= MAX_IMAGE_INVENTORY_FILE_BYTES, "{len}");
         // 往復も通る（上限ちょうどの件数を読み込める）。
-        let loaded = load_image_inventory(&r).expect("load").expect("some");
+        let loaded = load_image_inventory(&rh(&r)).expect("load").expect("some");
         assert_eq!(loaded.manifests.len(), MAX_IMAGE_MANIFESTS);
         assert_eq!(loaded.tag_refs.len(), MAX_TAG_REFS);
         let _ = fs::remove_dir_all(&r);
@@ -1120,12 +1131,14 @@ mod tests {
     #[test]
     fn oci7_failed_save_leaves_no_temp_file_and_keeps_old_file() {
         let r = root("savefail");
-        save_image_inventory(&r, &sample()).expect("save");
+        save_image_inventory(&rh(&r), &sample()).expect("save");
         let before = fs::read(r.join(IMAGE_INVENTORY_FILE_NAME)).expect("read");
         // root を消すと create_new が失敗する（rename 前の失敗）。別 root で再現する。
-        let missing = r.join("no-such-dir");
+        let gone = root("gone");
+        let gone_handle = rh(&gone);
+        fs::remove_dir_all(&gone).expect("remove root");
         assert_eq!(
-            code(save_image_inventory(&missing, &sample())),
+            code(save_image_inventory(&gone_handle, &sample())),
             OciErrorCode::Internal
         );
         assert_eq!(
@@ -1140,7 +1153,7 @@ mod tests {
         };
         assert_eq!(
             code(save_with_limits(
-                &r,
+                &rh(&r),
                 &sample(),
                 tiny,
                 MAX_IMAGE_INVENTORY_FILE_BYTES
@@ -1148,7 +1161,7 @@ mod tests {
             OciErrorCode::ResourceExhausted
         );
         assert_eq!(
-            code(save_with_limits(&r, &sample(), Limits::DEFAULT, 16)),
+            code(save_with_limits(&rh(&r), &sample(), Limits::DEFAULT, 16)),
             OciErrorCode::ResourceExhausted
         );
         let names: Vec<String> = fs::read_dir(&r)

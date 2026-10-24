@@ -46,7 +46,6 @@ use super::gc_journal::{
     DeletionDurability, GcJournal, ensure_no_pending_journal, remove_journal, settle, sweep_blobs,
     write_journal,
 };
-use super::usage::check_blob_dirs;
 use super::{ContainerRefId, ReferenceTable, TagKey};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
@@ -364,6 +363,9 @@ impl ReferenceTable {
         opts: &ImageRmOptions,
         stopped: &StoppedContainers,
     ) -> Result<ImageRmOutcome, OciError> {
+        // 以降の永続化操作（ジャーナル・blob の削除）は、排他区間で検査済みの root の fd を起点にする（#2638）。
+        let handle = self.root_handle_for(root)?;
+        let root = &*handle;
         // 未完了のテーブル操作が残る間は rm を始めない（OCI-7）。
         self.ensure_no_pending_deletion()?;
         let (action, delete) = match self.plan_image_rm_with(target, opts, stopped)? {
@@ -377,7 +379,7 @@ impl ReferenceTable {
         }
         // テーブルを変える前にディレクトリを検証する（symlink なら何も変えない）。
         let dirs_present = if delete {
-            check_blob_dirs(root)?
+            root.check_blob_dirs()?
         } else {
             false
         };

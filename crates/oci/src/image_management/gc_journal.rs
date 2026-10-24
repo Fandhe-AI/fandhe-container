@@ -21,6 +21,9 @@
 //! 信頼境界: ジャーナルの読み込みは種別・group/other の書き込み権限・サイズ・件数・未知フィールドを
 //! 検査するが、所有者（uid）は検査しない。ストア root 自体の所有者・権限・祖先の検査は
 //! `ImageStore::open` が行う（#2381。unix のみ）ため、ここでは root が信頼できることを前提とする。
+//! 本モジュールの永続化操作（ジャーナル・一時ファイルの回収・blob の削除と fsync）は検査済み root の
+//! ハンドル（`root_handle::RootHandle`）起点で、Linux の x86_64 / aarch64 では検査後に root が差し替えられても
+//! 差し替え後のディレクトリへ届かない（#2638）。
 //! 書き込み中のクラッシュで残る一時ファイル `@gc-pending.json.tmp-*` は、lock 取得時に回収する。
 //!
 //! 呼び出し元: `remove`（`execute_image_rm`）・`prune`（`execute_image_prune`）・`store`（lock 時の再試行）。
@@ -34,16 +37,18 @@
 //!   [`DeletionDurability::Unconfirmed`] を返す（永続化を確認できていない）。
 //! - コンテナ参照テーブルの未解決（unresolved）参照の考慮は、その永続化が入ってから足す。
 
-use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use super::container_ref_persist::CONTAINER_REFS_TMP_PREFIX;
 use super::inventory_persist::IMAGE_INVENTORY_TMP_PREFIX;
-use super::usage::{blob_dir, blob_path, check_blob_dirs};
+use super::root_handle::{BlobDir, RootHandle};
+#[cfg(test)]
+use super::usage::blob_dir;
 use super::{MAX_CACHE_SCAN_ENTRIES, ReferenceTable, TagKey};
 use crate::error::{OciError, OciErrorCode};
 use crate::reference::{Digest, RegistryHost, Repository, Tag};
@@ -139,27 +144,29 @@ struct RawTag {
     manifest: String,
 }
 
-fn journal_path(root: &Path) -> PathBuf {
-    root.join(GC_JOURNAL_FILE_NAME)
-}
-
-/// ディレクトリの fsync（unix）。Windows では std で開けないため何もしない。
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
+/// root ディレクトリの fsync（検査済み root の fd 起点）。Windows では std で開けないため何もしない。
+fn sync_dir(root: &RootHandle) -> std::io::Result<()> {
     #[cfg(test)]
-    if test_hook::should_fail(dir) {
+    if test_hook::should_fail(root.path()) {
         return Err(std::io::Error::other("injected directory fsync failure"));
     }
-    sync_dir_os(dir)
+    root.sync()
 }
 
-#[cfg(unix)]
-fn sync_dir_os(dir: &Path) -> std::io::Result<()> {
-    File::open(dir)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_dir_os(_dir: &Path) -> std::io::Result<()> {
-    Ok(())
+/// `blobs/sha256` の fsync（root の fd から開き直す。ディレクトリが無ければ `NotFound`）。
+fn sync_blob_dir(root: &RootHandle) -> std::io::Result<()> {
+    #[cfg(test)]
+    if test_hook::should_fail(&blob_dir(root.path())) {
+        return Err(std::io::Error::other("injected directory fsync failure"));
+    }
+    match root.open_blob_dir() {
+        Ok(Some(d)) => d.sync(),
+        Ok(None) => Err(std::io::Error::new(
+            ErrorKind::NotFound,
+            "blob directory is missing",
+        )),
+        Err(e) => Err(std::io::Error::other(e.message().to_owned())),
+    }
 }
 
 /// テスト専用: 指定ディレクトリの fsync を回数限定で失敗させる（OCI-7 の fsync 失敗経路の検証用）。
@@ -306,14 +313,11 @@ fn from_raw(raw: RawJournal) -> Result<GcJournal, OciError> {
 /// タグ・リースは `@image-inventory.json`（`inventory_persist`・#2380）、コンテナ参照は
 /// `@container-refs.json` に永続化されて排他取得ごとに読み直されるため、別プロセスのリースや再公開された
 /// blob の参照を数え直しに含め、それらの blob を消さない。
-pub(super) fn journal_exists(root: &Path) -> bool {
-    match fs::symlink_metadata(journal_path(root)) {
-        Ok(_) => true,
-        Err(e) => e.kind() != ErrorKind::NotFound,
-    }
+pub(super) fn journal_exists(root: &RootHandle) -> bool {
+    !matches!(root.stat_name(GC_JOURNAL_FILE_NAME), Ok(None))
 }
 
-pub(super) fn ensure_no_pending_journal(root: &Path) -> Result<(), OciError> {
+pub(super) fn ensure_no_pending_journal(root: &RootHandle) -> Result<(), OciError> {
     if journal_exists(root) {
         return Err(err(
             OciErrorCode::FailedPrecondition,
@@ -326,7 +330,7 @@ pub(super) fn ensure_no_pending_journal(root: &Path) -> Result<(), OciError> {
 /// ジャーナルを永続化する（一時ファイル → fsync → rename → root の fsync）。
 ///
 /// 失敗しても既存のジャーナルは壊さない。上限超過は `ResourceExhausted`。
-pub(super) fn write_journal(root: &Path, journal: &GcJournal) -> Result<(), OciError> {
+pub(super) fn write_journal(root: &RootHandle, journal: &GcJournal) -> Result<(), OciError> {
     persist_journal(root, journal, true)
 }
 
@@ -336,7 +340,7 @@ pub(super) fn write_journal(root: &Path, journal: &GcJournal) -> Result<(), OciE
 /// 取り消すと削除対象を持つジャーナルが消え、電源断で unlink が巻き戻っても再削除できなくなる（OCI-7）。
 /// その場合は `Ok` を返す（書き直したジャーナルは見えており、永続化は未確定）。呼び出し側は
 /// 常に `Pending` を返し、次の lock の復旧が再試行する。公開前の失敗は元のジャーナルが残る `Err`。
-fn rewrite_journal(root: &Path, journal: &GcJournal) -> Result<(), OciError> {
+fn rewrite_journal(root: &RootHandle, journal: &GcJournal) -> Result<(), OciError> {
     #[cfg(test)]
     if test_hook::should_fail_rewrite() {
         return Err(err(OciErrorCode::Internal, "injected rewrite failure"));
@@ -345,7 +349,7 @@ fn rewrite_journal(root: &Path, journal: &GcJournal) -> Result<(), OciError> {
 }
 
 fn persist_journal(
-    root: &Path,
+    root: &RootHandle,
     journal: &GcJournal,
     revoke_on_unsynced: bool,
 ) -> Result<(), OciError> {
@@ -398,29 +402,22 @@ enum PublishError {
 }
 
 /// 一時ファイル → fsync → rename → root の fsync。失敗を公開の前後で区別して返す。
-fn publish_journal(root: &Path, bytes: &[u8]) -> Result<(), PublishError> {
+fn publish_journal(root: &RootHandle, bytes: &[u8]) -> Result<(), PublishError> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
-    let tmp = root.join(format!(
+    let tmp = format!(
         "{TMP_PREFIX}{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
+    );
     let before = (|| {
-        let mut f = opts.open(&tmp)?;
+        let mut f = root.create_new(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        fs::rename(&tmp, journal_path(root))
+        root.rename(&tmp, GC_JOURNAL_FILE_NAME)
     })();
     if before.is_err() {
-        let _ = fs::remove_file(&tmp);
+        let _ = root.unlink(&tmp);
         return Err(PublishError::BeforePublish);
     }
     sync_dir(root).map_err(|_| PublishError::AfterPublish)
@@ -434,19 +431,24 @@ fn publish_journal(root: &Path, bytes: &[u8]) -> Result<(), PublishError> {
 /// 一時ファイル（`@image-inventory.json.tmp-*`。#2380）。いずれも書き手が
 /// 排他区間の中でしか作らないため、排他を取った時点で残っているものは中断した書き込みの残骸で、PID の
 /// 生存確認は要らない。走査は 1 回にまとめ、件数は `MAX_CACHE_SCAN_ENTRIES` で打ち切る。
-pub(super) fn reap_stale_tmp(root: &Path, prefixes: &[&str]) {
-    let Ok(rd) = fs::read_dir(root) else {
+pub(super) fn reap_stale_tmp(root: &RootHandle, prefixes: &[&str]) {
+    let Ok(names) = root.list_names(MAX_CACHE_SCAN_ENTRIES) else {
         return;
     };
-    for ent in rd.flatten().take(MAX_CACHE_SCAN_ENTRIES) {
-        let name = ent.file_name();
-        let name = name.to_string_lossy();
-        if !prefixes.iter().any(|p| name.starts_with(p)) {
+    for name in names {
+        if !prefixes
+            .iter()
+            .any(|p| name.to_string_lossy().starts_with(p))
+        {
             continue;
         }
-        let path = ent.path();
-        if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
-            let _ = fs::remove_file(&path);
+        if root
+            .stat_name(&name)
+            .ok()
+            .flatten()
+            .is_some_and(|m| m.is_file())
+        {
+            let _ = root.unlink(&name);
         }
     }
 }
@@ -466,7 +468,7 @@ pub(super) const STALE_TMP_PREFIXES: &[&str] = &[
 /// （古い内容か墓標）が残り、[`journal_exists`] により変更は拒否され続ける。(3) が失敗したら墓標を
 /// 再公開して `Err`（再公開も失敗しても、復活し得るのは意図なしの墓標だけで無害）。
 /// 次の lock の復旧が墓標を読み、何も消さずに `blobs/sha256` と root の fsync をやり直して片づける。
-pub(super) fn remove_journal(root: &Path) -> std::io::Result<()> {
+pub(super) fn remove_journal(root: &RootHandle) -> std::io::Result<()> {
     if journal_exists(root) {
         let tombstone = tombstone_bytes()?;
         // (1) 墓標へ置換して確定する。失敗したら unlink に進まない。
@@ -477,7 +479,7 @@ pub(super) fn remove_journal(root: &Path) -> std::io::Result<()> {
         if test_hook::should_fail_unlink() {
             return Err(std::io::Error::other("injected journal unlink failure"));
         }
-        match fs::remove_file(journal_path(root)) {
+        match root.unlink(GC_JOURNAL_FILE_NAME) {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -505,11 +507,10 @@ fn untrusted(msg: &str) -> OciError {
 }
 
 /// ジャーナルを読む。無ければ `None`。信頼できない・壊れている場合はファイルに触らずエラー。
-pub(super) fn read_journal(root: &Path) -> Result<Option<GcJournal>, OciError> {
-    let path = journal_path(root);
-    let pre = match fs::symlink_metadata(&path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+pub(super) fn read_journal(root: &RootHandle) -> Result<Option<GcJournal>, OciError> {
+    let pre = match root.stat_name(GC_JOURNAL_FILE_NAME) {
+        Ok(Some(m)) => m,
+        Ok(None) => return Ok(None),
         Err(_) => return Err(err(OciErrorCode::Internal, "failed to stat gc journal")),
     };
     if !pre.is_file() {
@@ -528,8 +529,11 @@ pub(super) fn read_journal(root: &Path) -> Result<Option<GcJournal>, OciError> {
             "gc journal is too large",
         ));
     }
-    let file =
-        File::open(&path).map_err(|_| err(OciErrorCode::Internal, "failed to open gc journal"))?;
+    let open_failed = || err(OciErrorCode::Internal, "failed to open gc journal");
+    let file = root
+        .open_read(GC_JOURNAL_FILE_NAME)
+        .map_err(|_| open_failed())?
+        .ok_or_else(open_failed)?;
     let post = file
         .metadata()
         .map_err(|_| err(OciErrorCode::Internal, "failed to stat gc journal"))?;
@@ -566,21 +570,23 @@ pub(super) enum BlobRemoval {
 }
 
 /// 通常ファイルだけを消す。symlink・その他は辿らず触らない（`Kept`）。
-pub(super) fn remove_blob_durable(root: &Path, digest: &Digest) -> BlobRemoval {
-    let Ok(path) = blob_path(root, digest) else {
+///
+/// `dir` は `blobs/sha256` を root の fd から開いたもの（差し替え後のディレクトリへは届かない。#2638）。
+pub(super) fn remove_blob_durable(dir: &BlobDir, digest: &Digest) -> BlobRemoval {
+    let Some(hex) = digest.as_str().strip_prefix("sha256:") else {
         return BlobRemoval::Kept;
     };
-    match fs::symlink_metadata(&path) {
-        Ok(m) if m.is_file() => {
+    match dir.stat(hex) {
+        Ok(Some(m)) if m.is_file() => {
             let len = m.len();
-            match fs::remove_file(&path) {
+            match dir.unlink(hex) {
                 Ok(()) => BlobRemoval::Deleted(len),
                 Err(e) if e.kind() == ErrorKind::NotFound => BlobRemoval::Absent,
                 Err(_) => BlobRemoval::Kept,
             }
         }
-        Ok(_) => BlobRemoval::Kept,
-        Err(e) if e.kind() == ErrorKind::NotFound => BlobRemoval::Absent,
+        Ok(Some(_)) => BlobRemoval::Kept,
+        Ok(None) => BlobRemoval::Absent,
         Err(_) => BlobRemoval::Kept,
     }
 }
@@ -594,14 +600,23 @@ pub(super) struct Sweep {
 }
 
 /// `blobs` を unlink する。`dirs_present` が偽ならディレクトリが無いので全件 `absent` とする。
-pub(super) fn sweep_blobs(root: &Path, blobs: &[Digest], dirs_present: bool) -> Sweep {
+pub(super) fn sweep_blobs(root: &RootHandle, blobs: &[Digest], dirs_present: bool) -> Sweep {
     let mut s = Sweep::default();
+    // 判定後にディレクトリが消えた・差し替えられた場合も、開き直した結果に従う（消せなければ残す側）。
+    let dir = dirs_present.then(|| root.open_blob_dir());
     for b in blobs {
-        if !dirs_present {
-            s.absent.push(b.clone());
-            continue;
-        }
-        match remove_blob_durable(root, b) {
+        let dir = match &dir {
+            None | Some(Ok(None)) => {
+                s.absent.push(b.clone());
+                continue;
+            }
+            Some(Err(_)) => {
+                s.undeleted.push(b.clone());
+                continue;
+            }
+            Some(Ok(Some(d))) => d,
+        };
+        match remove_blob_durable(dir, b) {
             BlobRemoval::Deleted(n) => s.deleted.push((b.clone(), n)),
             BlobRemoval::Absent => s.absent.push(b.clone()),
             BlobRemoval::Kept => s.undeleted.push(b.clone()),
@@ -620,15 +635,14 @@ pub(super) fn sweep_blobs(root: &Path, blobs: &[Digest], dirs_present: bool) -> 
 /// 全件片づいたらジャーナルを削除して root を fsync し、成功すれば `Confirmed`。
 /// 消せない blob が `MAX_GC_RETRY_ATTEMPTS` 回目に達したらジャーナルを削除して `Abandoned`。
 pub(super) fn settle(
-    root: &Path,
+    root: &RootHandle,
     undeleted: &[Digest],
     deleted: &[Digest],
     prior_attempts: u32,
     force_blob_dir_sync: bool,
 ) -> DeletionDurability {
     // 復旧では今回の削除件数に依存せず fsync する（前回プロセスが unlink 後・fsync 前に落ちた場合に備える）。
-    let blobs_synced =
-        (deleted.is_empty() && !force_blob_dir_sync) || sync_dir(&blob_dir(root)).is_ok();
+    let blobs_synced = (deleted.is_empty() && !force_blob_dir_sync) || sync_blob_dir(root).is_ok();
     if !undeleted.is_empty() {
         let attempts = prior_attempts.saturating_add(1);
         let abandon = || match remove_journal(root) {
@@ -701,8 +715,30 @@ pub struct PendingDeletionRecovery {
 
 impl ReferenceTable {
     /// 検査用の root を設定する（`ImageStore::lock` が区間ごとに呼ぶ）。
+    pub(super) fn set_root_handle(&mut self, root: Arc<RootHandle>) {
+        self.journal_root = super::JournalRoot(Some(root));
+    }
+
+    /// 試験用: パスから検査なしでハンドルを開いて設定する。
+    #[cfg(test)]
     pub(super) fn set_journal_root(&mut self, root: &Path) {
-        self.journal_root = super::JournalRoot(Some(root.to_path_buf()));
+        let h = RootHandle::open_unchecked(root).expect("open root handle");
+        self.set_root_handle(Arc::new(h));
+    }
+
+    /// 操作の起点にする root のハンドルを決める（公開 API が受け取るパスと排他区間の root の対応）。
+    ///
+    /// - 排他区間で設定済み: `root` が同じディレクトリならそのハンドル。違えば `InvalidArgument`（fail-closed）
+    /// - 未設定の単体テーブル: `root` を検査なしで開く（従来どおり信頼検査をしない）
+    pub(super) fn root_handle_for(&self, root: &Path) -> Result<Arc<RootHandle>, OciError> {
+        match &self.journal_root.0 {
+            Some(h) if h.matches(root) => Ok(Arc::clone(h)),
+            Some(_) => Err(err(
+                OciErrorCode::InvalidArgument,
+                "root does not match the image store root of this exclusive section",
+            )),
+            None => RootHandle::open_unchecked(root).map(Arc::new),
+        }
     }
 
     /// 削除ジャーナル（墓標を含む）がディスクに見えていれば
@@ -751,6 +787,15 @@ impl ReferenceTable {
         &mut self,
         root: &Path,
     ) -> Result<Option<PendingDeletionRecovery>, OciError> {
+        let handle = self.root_handle_for(root)?;
+        self.resume_pending_deletion_at(&handle)
+    }
+
+    /// [`Self::resume_pending_deletion`] の本体。検査済み root のハンドルを起点にする（#2638）。
+    pub(super) fn resume_pending_deletion_at(
+        &mut self,
+        root: &RootHandle,
+    ) -> Result<Option<PendingDeletionRecovery>, OciError> {
         let Some(journal) = read_journal(root)? else {
             return Ok(None);
         };
@@ -791,7 +836,7 @@ impl ReferenceTable {
         }
         // ディレクトリ異常（symlink 等）なら何も消さず、全件を残してジャーナルを保持する。
         let mut force_sync = false;
-        let sweep = match check_blob_dirs(root) {
+        let sweep = match root.check_blob_dirs() {
             Ok(present) => {
                 force_sync = present;
                 sweep_blobs(root, &to_sweep, present)
@@ -829,12 +874,16 @@ impl ReferenceTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_management::root_handle::rh;
+    use crate::image_management::usage::blob_path;
     use crate::image_management::{
         ContainerRefId, ImageRmKind, ImageRmOptions, ImageRmTarget, ImageStore,
         ManifestComposition, PullId, StoppedContainers,
     };
     use crate::instrument::testing::Collect;
     use crate::instrument::{OciOpKind, OciOpOutcome};
+    use std::fs::{self, File};
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -946,7 +995,7 @@ mod tests {
     fn oci7_interrupted_after_journal_before_unlink_converges_to_after() {
         let root = Root::new();
         files(&root);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         let mut t = table();
         t.register_tag(tk("v1"), &d(0xa0)).unwrap();
         let store = ImageStore::with_table(&root.0, t).unwrap();
@@ -965,7 +1014,7 @@ mod tests {
         for k in 0..=blobs.len() {
             let root = Root::new();
             files(&root);
-            write_journal(&root.0, &journal_a()).unwrap();
+            write_journal(&rh(&root.0), &journal_a()).unwrap();
             for b in &blobs[..k] {
                 fs::remove_file(blob_path(&root.0, b).unwrap()).unwrap();
             }
@@ -984,7 +1033,7 @@ mod tests {
     fn oci7_interrupted_after_all_unlinks_clears_journal() {
         let root = Root::new();
         files(&root);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         for n in [0x11, 0xc1] {
             fs::remove_file(blob_path(&root.0, &d(n)).unwrap()).unwrap();
         }
@@ -1001,7 +1050,7 @@ mod tests {
     fn oci7_recovery_recounts_and_keeps_blob_referenced_after_restart() {
         let root = Root::new();
         files(&root);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         let mut t = table();
         // 0x11 は別の manifest C の構成に、0xc1 は pull リースに守られている。
         t.register_manifest(
@@ -1024,7 +1073,7 @@ mod tests {
     fn oci7_recovery_keeps_manifest_that_regained_reference() {
         let root = Root::new();
         files(&root);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         let mut t = table();
         t.register_container(ContainerRefId::new("c1").unwrap(), &d(0xa0))
             .unwrap();
@@ -1042,7 +1091,7 @@ mod tests {
     fn oci7_recovery_is_idempotent() {
         let root = Root::new();
         files(&root);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         let store = ImageStore::with_table(&root.0, table()).unwrap();
         assert!(store.recover_pending_deletion().unwrap().is_some());
         assert!(store.recover_pending_deletion().unwrap().is_none());
@@ -1091,7 +1140,7 @@ mod tests {
         let out = store.lock().unwrap().execute_image_prune(&root.0).unwrap();
         assert_eq!(out.undeleted_blobs, vec![d(0x11)]);
         assert_eq!(out.durability, DeletionDurability::Pending);
-        let j = read_journal(&root.0).unwrap().unwrap();
+        let j = read_journal(&rh(&root.0)).unwrap().unwrap();
         assert_eq!(j.delete_blobs, vec![d(0x11)]);
         // 障害が残る間は再試行も Pending のまま、新しい削除は拒否される。
         let rec = store.recover_pending_deletion().unwrap().unwrap();
@@ -1131,7 +1180,7 @@ mod tests {
         assert!(!root.journal());
         // 孤児として残り、新しい削除は拒否されない。
         assert!(fs::symlink_metadata(&p).is_ok());
-        ensure_no_pending_journal(&root.0).unwrap();
+        ensure_no_pending_journal(&rh(&root.0)).unwrap();
         assert!(store.recover_pending_deletion().unwrap().is_none());
     }
 
@@ -1142,10 +1191,10 @@ mod tests {
         // blobs/sha256 の fsync を注入で失敗させる（Windows の sync_dir_os は常に成功するため、
         // ディレクトリ削除ではなく test_hook で 3 OS 共通の障害条件にする）。
         test_hook::fail_sync_of(&blob_dir(&root.0), 8);
-        let st = settle(&root.0, &[d(0x22)], &[d(0x11)], 0, false);
+        let st = settle(&rh(&root.0), &[d(0x22)], &[d(0x11)], 0, false);
         test_hook::clear();
         assert_eq!(st, DeletionDurability::Pending);
-        let j = read_journal(&root.0).unwrap().unwrap();
+        let j = read_journal(&rh(&root.0)).unwrap().unwrap();
         assert_eq!(j.delete_blobs, vec![d(0x11), d(0x22)]);
         assert_eq!(j.attempts, 1);
     }
@@ -1156,7 +1205,7 @@ mod tests {
     fn oci7_resume_keeps_absent_blobs_when_blob_dir_fsync_fails() {
         let root = Root::new();
         files(&root);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         // 0x11 は前回プロセスが unlink 済み（不在）、0xc1 は消せない（ディレクトリ）。
         fs::remove_file(blob_path(&root.0, &d(0x11)).unwrap()).unwrap();
         let p = blob_path(&root.0, &d(0xc1)).unwrap();
@@ -1171,7 +1220,7 @@ mod tests {
         assert_eq!(rec.durability, DeletionDurability::Pending);
         assert_eq!(rec.absent_blobs, vec![d(0x11)]);
         assert_eq!(rec.undeleted_blobs, vec![d(0xc1)]);
-        let j = read_journal(&root.0).unwrap().unwrap();
+        let j = read_journal(&rh(&root.0)).unwrap().unwrap();
         assert_eq!(j.delete_blobs, vec![d(0x11), d(0xc1)]);
     }
 
@@ -1181,7 +1230,7 @@ mod tests {
     fn oci7_resume_completes_when_blob_dirs_missing() {
         for remove_whole_blobs in [true, false] {
             let root = Root::new();
-            write_journal(&root.0, &journal_a()).unwrap();
+            write_journal(&rh(&root.0), &journal_a()).unwrap();
             let target = if remove_whole_blobs {
                 root.0.join("blobs")
             } else {
@@ -1196,7 +1245,7 @@ mod tests {
             assert!(!rec.absent_blobs.is_empty());
             assert!(rec.undeleted_blobs.is_empty());
             assert_ne!(rec.durability, DeletionDurability::Pending);
-            assert!(read_journal(&root.0).unwrap().is_none());
+            assert!(read_journal(&rh(&root.0)).unwrap().is_none());
         }
     }
 
@@ -1209,7 +1258,7 @@ mod tests {
         // root を書き込み不可にして、一時ファイルの作成（書き直し）を失敗させる。
         fs::set_permissions(&root.0, fs::Permissions::from_mode(0o500)).unwrap();
         let writable = fs::File::create(root.0.join("probe")).is_ok();
-        let st = settle(&root.0, &[d(0x22)], &[], 0, false);
+        let st = settle(&rh(&root.0), &[d(0x22)], &[], 0, false);
         fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
         // 特権で実行されて書き込めてしまう環境では前提が成り立たないので判定しない。
         if !writable {
@@ -1225,7 +1274,7 @@ mod tests {
         files(&root);
         // 1 回目（公開後の fsync）だけ失敗、取り消しの fsync は成功 -> 削除前に収束して Err。
         test_hook::fail_sync_of(&root.0, 1);
-        let e = write_journal(&root.0, &journal_a()).unwrap_err();
+        let e = write_journal(&rh(&root.0), &journal_a()).unwrap_err();
         test_hook::clear();
         assert_eq!(e.code(), OciErrorCode::Internal);
         assert!(!root.journal());
@@ -1245,10 +1294,10 @@ mod tests {
         let root = Root::new();
         files(&root);
         test_hook::fail_sync_of(&root.0, 2);
-        let e = write_journal(&root.0, &journal_a()).unwrap_err();
+        let e = write_journal(&rh(&root.0), &journal_a()).unwrap_err();
         test_hook::clear();
         assert_eq!(e.code(), OciErrorCode::Internal);
-        let j = read_journal(&root.0).unwrap().unwrap();
+        let j = read_journal(&rh(&root.0)).unwrap().unwrap();
         assert!(j.is_tombstone());
         // 失敗した操作の blob は消えない。
         assert!(root.exists(&d(0x12)));
@@ -1266,23 +1315,23 @@ mod tests {
     fn oci7_journal_removal_fsync_failure_keeps_pending_until_next_lock() {
         let root = Root::new();
         files(&root);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         for n in [0x10u8, 0x11, 0x12] {
             let _ = fs::remove_file(blob_path(&root.0, &d(n)).unwrap());
         }
         test_hook::fail_sync_of(&root.0, 1);
-        let st = settle(&root.0, &[], &[d(0x10)], 0, false);
+        let st = settle(&rh(&root.0), &[], &[d(0x10)], 0, false);
         test_hook::clear();
         assert_eq!(st, DeletionDurability::Pending);
         // 墓標が見えるので次の削除は拒否され、lock が復旧する。
         assert!(root.journal());
-        let e = ensure_no_pending_journal(&root.0).unwrap_err();
+        let e = ensure_no_pending_journal(&rh(&root.0)).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::FailedPrecondition);
         let store = ImageStore::with_table(&root.0, table()).unwrap();
         let rec = store.recover_pending_deletion().unwrap().unwrap();
         assert_eq!(rec.durability, success_durability(DIR_SYNC_SUPPORTED));
         assert!(!root.journal());
-        ensure_no_pending_journal(&root.0).unwrap();
+        ensure_no_pending_journal(&rh(&root.0)).unwrap();
     }
 
     /// OCI-7: 全 blob を unlink した後に blob ディレクトリの fsync が失敗して Pending のとき、
@@ -1291,17 +1340,17 @@ mod tests {
     fn oci7_pending_after_table_update_does_not_remove_reregistered_tag() {
         let root = Root::new();
         files(&root);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         // 削除対象の blob を全部 unlink 済みにして、blob ディレクトリの fsync だけ失敗させる。
         for n in [0x11u8, 0xc1] {
             fs::remove_file(blob_path(&root.0, &d(n)).unwrap()).unwrap();
         }
         test_hook::fail_sync_of(&blob_dir(&root.0), 1);
-        let st = settle(&root.0, &[], &[d(0x11), d(0xc1)], 0, false);
+        let st = settle(&rh(&root.0), &[], &[d(0x11), d(0xc1)], 0, false);
         test_hook::clear();
         assert_eq!(st, DeletionDurability::Pending);
         // 残ったジャーナルは unlink 済み blob の fsync 待ちだけで、manifest・untag を含まない。
-        let j = read_journal(&root.0).unwrap().unwrap();
+        let j = read_journal(&rh(&root.0)).unwrap().unwrap();
         assert!(j.manifests.is_empty());
         assert!(j.untag.is_empty());
         assert_eq!(j.delete_blobs, vec![d(0x11), d(0xc1)]);
@@ -1330,14 +1379,14 @@ mod tests {
     fn oci7_rewrite_root_fsync_failure_keeps_journal_and_recovers() {
         let root = Root::new();
         files(&root);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         // 0x11 は unlink 済み、0xc1 は今回は消せなかった扱い。書き直しの root fsync だけ失敗させる。
         fs::remove_file(blob_path(&root.0, &d(0x11)).unwrap()).unwrap();
         test_hook::fail_sync_of(&root.0, 1);
-        let st = settle(&root.0, &[d(0xc1)], &[d(0x11)], 0, false);
+        let st = settle(&rh(&root.0), &[d(0xc1)], &[d(0x11)], 0, false);
         test_hook::clear();
         assert_eq!(st, DeletionDurability::Pending);
-        let j = read_journal(&root.0).unwrap().unwrap();
+        let j = read_journal(&rh(&root.0)).unwrap().unwrap();
         assert_eq!(j.delete_blobs, vec![d(0xc1)]);
         assert_eq!(j.attempts, 1);
         // テーブル更新は済んでいる（A は無い）状態で復旧する。
@@ -1354,12 +1403,12 @@ mod tests {
     fn oci7_unlink_failure_blocks_lock_until_recovered() {
         let root = Root::new();
         files(&root);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         for n in [0x11u8, 0xc1] {
             fs::remove_file(blob_path(&root.0, &d(n)).unwrap()).unwrap();
         }
         test_hook::fail_unlink(100);
-        let st = settle(&root.0, &[], &[d(0x11), d(0xc1)], 0, false);
+        let st = settle(&rh(&root.0), &[], &[d(0x11), d(0xc1)], 0, false);
         assert_eq!(st, DeletionDurability::Pending);
         assert!(root.journal());
         let store = ImageStore::with_table(&root.0, table()).unwrap();
@@ -1389,15 +1438,15 @@ mod tests {
     fn oci7_rewrite_failure_blocks_lock_until_recovered() {
         let root = Root::new();
         files(&root);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         for n in [0x11u8, 0xc1] {
             fs::remove_file(blob_path(&root.0, &d(n)).unwrap()).unwrap();
         }
         test_hook::fail_sync_of(&blob_dir(&root.0), 100);
         test_hook::fail_rewrite(100);
-        let st = settle(&root.0, &[], &[d(0x11), d(0xc1)], 0, false);
+        let st = settle(&rh(&root.0), &[], &[d(0x11), d(0xc1)], 0, false);
         assert_eq!(st, DeletionDurability::Pending);
-        let j = read_journal(&root.0).unwrap().unwrap();
+        let j = read_journal(&rh(&root.0)).unwrap().unwrap();
         assert_eq!(j, journal_a());
         let store = ImageStore::with_table(&root.0, table()).unwrap();
         let e = store.lock().unwrap_err();
@@ -1504,7 +1553,7 @@ mod tests {
         let mut g = store.lock().unwrap();
         let out = g.execute_image_prune(&root.0).unwrap();
         assert_eq!(out.durability, DeletionDurability::Pending);
-        let j = read_journal(&root.0).unwrap().unwrap();
+        let j = read_journal(&rh(&root.0)).unwrap().unwrap();
         assert!(j.manifests.is_empty() && j.untag.is_empty());
         assert_eq!(j.delete_blobs, vec![d(0x11)]);
         // 同じガード: 参照の追加はすべて拒否される。
@@ -1536,16 +1585,16 @@ mod tests {
     fn oci7_tombstone_visible_blocks_lock_and_mutations() {
         let root = Root::new();
         files(&root);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         for n in [0x11u8, 0xc1] {
             fs::remove_file(blob_path(&root.0, &d(n)).unwrap()).unwrap();
         }
         // root の fsync を全部失敗させる: 墓標への置換は rename されるが確定できない。
         test_hook::fail_sync_of(&root.0, 100);
-        let st = settle(&root.0, &[], &[d(0x11), d(0xc1)], 0, false);
+        let st = settle(&rh(&root.0), &[], &[d(0x11), d(0xc1)], 0, false);
         assert_eq!(st, DeletionDurability::Pending);
         // 削除意図を持つジャーナルは unlink されず、見えているのは墓標。
-        let j = read_journal(&root.0).unwrap().unwrap();
+        let j = read_journal(&rh(&root.0)).unwrap().unwrap();
         assert!(j.is_tombstone());
         let mut t = table();
         t.set_journal_root(&root.0);
@@ -1569,10 +1618,10 @@ mod tests {
         let root = Root::new();
         files(&root);
         test_hook::fail_sync_of(&root.0, 100);
-        let e = write_journal(&root.0, &journal_a()).unwrap_err();
+        let e = write_journal(&rh(&root.0), &journal_a()).unwrap_err();
         assert_eq!(e.code(), OciErrorCode::Internal);
         // 取り消しの unlink は走らず、見えているのは（確定できていない）墓標。
-        let j = read_journal(&root.0).unwrap().unwrap();
+        let j = read_journal(&rh(&root.0)).unwrap().unwrap();
         assert!(j.is_tombstone());
         let store = ImageStore::with_table(&root.0, table()).unwrap();
         let e = store.lock().unwrap_err();
@@ -1636,7 +1685,7 @@ mod tests {
     fn oci7_new_gc_refused_while_journal_pending() {
         let root = Root::new();
         files(&root);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         let mut t = table();
         let snapshot = t.clone();
         let e = t
@@ -1686,7 +1735,7 @@ mod tests {
             ..GcJournal::default()
         };
         assert_eq!(
-            write_journal(&root.0, &big).unwrap_err().code(),
+            write_journal(&rh(&root.0), &big).unwrap_err().code(),
             OciErrorCode::ResourceExhausted
         );
         assert!(!root.journal());
@@ -1699,7 +1748,7 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         }
         assert_eq!(
-            read_journal(&root.0).unwrap_err().code(),
+            read_journal(&rh(&root.0)).unwrap_err().code(),
             OciErrorCode::ResourceExhausted
         );
     }
@@ -1715,25 +1764,25 @@ mod tests {
         let path = root.0.join(GC_JOURNAL_FILE_NAME);
         std::os::unix::fs::symlink(&target, &path).unwrap();
         assert_eq!(
-            read_journal(&root.0).unwrap_err().code(),
+            read_journal(&rh(&root.0)).unwrap_err().code(),
             OciErrorCode::FailedPrecondition
         );
         assert_eq!(fs::read(&target).unwrap(), b"keep");
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
         assert_eq!(
-            read_journal(&root.0).unwrap_err().code(),
+            read_journal(&rh(&root.0)).unwrap_err().code(),
             OciErrorCode::FailedPrecondition
         );
         fs::remove_dir(&path).unwrap();
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
         assert_eq!(
-            read_journal(&root.0).unwrap_err().code(),
+            read_journal(&rh(&root.0)).unwrap_err().code(),
             OciErrorCode::FailedPrecondition
         );
     }
@@ -1742,8 +1791,8 @@ mod tests {
     #[test]
     fn oci7_journal_roundtrip() {
         let root = Root::new();
-        write_journal(&root.0, &journal_a()).unwrap();
-        assert_eq!(read_journal(&root.0).unwrap(), Some(journal_a()));
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
+        assert_eq!(read_journal(&rh(&root.0)).unwrap(), Some(journal_a()));
     }
 
     /// REPAIR-4: ジャーナルがあったときだけ gc_recover が記録される。
@@ -1763,7 +1812,7 @@ mod tests {
                 .count()
         };
         assert_eq!(n(&rec), 0);
-        write_journal(&root.0, &journal_a()).unwrap();
+        write_journal(&rh(&root.0), &journal_a()).unwrap();
         drop(store.lock().unwrap());
         let items = rec.items();
         let r: Vec<_> = items

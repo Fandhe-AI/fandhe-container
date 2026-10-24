@@ -8,7 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|image|system|setup|doctor>\"}\n";
+const USAGE_JSON: &str = "{\"code\":\"INVALID_ARGUMENT\",\"message\":\"usage: fandhe-container <create|start|stop|delete|list|logs|exec|image|system|setup|doctor>\"}\n";
 
 /// 子プロセスの終了を待つ上限（REPAIR-5）。超過時は kill して失敗させる。
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -307,6 +307,65 @@ fn cli1_stop_delete_usage_errors() {
     ] {
         assert_failure(&run(a), 2, USAGE_JSON);
     }
+}
+
+/// CLI-1・SUP-6・#2626: exec は引数の過不足・未知オプション・不正な `--timeout`・値なしの `--env` で使い方エラー（2）。
+#[test]
+fn cli1_exec_usage_errors() {
+    for a in [
+        &["exec"][..],
+        &["exec", "c1"],
+        &["exec", "--bogus", "c1", "/bin/true"],
+        &["exec", "--timeout", "0", "c1", "/bin/true"],
+        &["exec", "--timeout", "99999", "c1", "/bin/true"],
+        &["exec", "--env", "KEY", "c1", "/bin/true"],
+    ] {
+        assert_failure(&run(a), 2, USAGE_JSON);
+    }
+}
+
+/// CLI-1・SUP-6・#2626: Linux で存在しないコンテナの exec は NOT_FOUND（3）、稼働中でない Created は
+/// FAILED_PRECONDITION（5）、相対パスは core 到達前に INVALID_ARGUMENT（2）。stdout は空で、stderr は構造化エラー 1 行。
+#[cfg(target_os = "linux")]
+#[test]
+fn cli1_exec_rejections_on_linux() {
+    let tmp = TmpDir::new("exec");
+    let bundle = tmp.0.join("bundle");
+    std::fs::create_dir(&bundle).expect("bundle");
+    std::fs::create_dir(bundle.join("rootfs")).expect("rootfs");
+    std::fs::write(
+        bundle.join("config.json"),
+        r#"{"ociVersion":"1.2.0","root":{"path":"rootfs"},"process":{"user":{"uid":0,"gid":0},"args":["/bin/echo","it"],"cwd":"/"},"linux":{"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"user"},{"type":"uts"},{"type":"ipc"}]}}"#,
+    )
+    .expect("config");
+    let root = tmp.0.join("state");
+    let root_s = root.to_str().expect("utf8");
+    let bundle_s = bundle.to_str().expect("utf8");
+
+    let out = run(&["--root", root_s, "exec", "nope", "/bin/true"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert!(out.stdout.is_empty());
+    let line = String::from_utf8(out.stderr).expect("utf8");
+    assert!(line.starts_with("{\"code\":\"NOT_FOUND\""), "{line}");
+
+    assert_eq!(
+        run(&["--root", root_s, "create", "--bundle", bundle_s, "c1"])
+            .status
+            .code(),
+        Some(0)
+    );
+    let out = run(&["--root", root_s, "exec", "c1", "/bin/true"]);
+    assert_eq!(out.status.code(), Some(5));
+    let line = String::from_utf8(out.stderr).expect("utf8");
+    assert!(
+        line.starts_with("{\"code\":\"FAILED_PRECONDITION\""),
+        "{line}"
+    );
+
+    let out = run(&["--root", root_s, "exec", "c1", "relative/path"]);
+    assert_eq!(out.status.code(), Some(2));
+    let line = String::from_utf8(out.stderr).expect("utf8");
+    assert!(line.starts_with("{\"code\":\"INVALID_ARGUMENT\""), "{line}");
 }
 
 /// `parent` 配下に一意名のディレクトリを排他的に作る（既存パスは削除も採用もしない）。

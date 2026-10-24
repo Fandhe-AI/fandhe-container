@@ -63,12 +63,22 @@ struct PendingSignal {
     reply: SyncSender<ControlReason>,
 }
 
+/// exec 用に CLI へ渡す、起動時 pidfd の複製（SUP-6・SEC-1・#2626）。Linux 以外は pidfd が無く、値を持たない型にする。
+#[cfg(target_os = "linux")]
+pub type PidfdDup = Arc<std::os::fd::OwnedFd>;
+/// exec 用に CLI へ渡す、起動時 pidfd の複製（Linux 以外は pidfd が無く、常に `None`）。
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone)]
+pub enum PidfdDup {}
+
 enum SlotState {
     Empty,
     Active {
         generation: u64,
         pid: NonZeroU32,
         inbox: SyncSender<PendingSignal>,
+        /// 起動ハンドルの pidfd の複製（close-on-exec）。`Active` の間だけ持ち、`Exited`・`Empty` へ遷移したら落とす。
+        pidfd: Option<PidfdDup>,
     },
     Exited {
         generation: u64,
@@ -117,7 +127,7 @@ impl SignalSlot {
     }
 
     /// 新しいハンドルを登録し、世代と受け箱を返す（直前の状態は上書きする）。
-    fn register(&self, pid: NonZeroU32) -> (u64, Receiver<PendingSignal>) {
+    fn register(&self, pid: NonZeroU32, pidfd: Option<PidfdDup>) -> (u64, Receiver<PendingSignal>) {
         let (tx, rx) = sync_channel(INBOX_CAPACITY);
         let mut inner = self.lock();
         let generation = inner.next_generation;
@@ -126,8 +136,36 @@ impl SignalSlot {
             generation,
             pid,
             inbox: tx,
+            pidfd,
         };
         (generation, rx)
+    }
+
+    /// CLI の `exec` へ渡す起動時 pidfd の複製を取り出す（ExecHandoverRequest。SUP-6・SEC-1・#2626）。
+    ///
+    /// スロットのロックの下で判定し（受け箱は経由しない。シグナルも送らない）、`Active` で記録 pid が `pid` と一致し、
+    /// 複製を持っているときだけ `Ok`。それ以外の理由は次のとおり（世代交代後の古い複製は `Active` の入れ替えで落ちており、
+    /// 渡らない）。
+    /// - `Empty`: `NoHandle`。`Exited`: pid 一致なら `ContainerExited`、不一致なら `PidMismatch`。
+    /// - `Active` で pid 不一致: `PidMismatch`。複製を持たない（pidfd 非対応のカーネル・起動ハンドルなし）: `NoHandle`。
+    pub fn handover_pidfd(&self, pid: NonZeroU32) -> Result<PidfdDup, ControlReason> {
+        let inner = self.lock();
+        match &inner.state {
+            SlotState::Empty => Err(ControlReason::NoHandle),
+            SlotState::Exited { pid: held, .. } => Err(if *held == pid {
+                ControlReason::ContainerExited
+            } else {
+                ControlReason::PidMismatch
+            }),
+            SlotState::Active {
+                pid: held, pidfd, ..
+            } => {
+                if *held != pid {
+                    return Err(ControlReason::PidMismatch);
+                }
+                pidfd.clone().ok_or(ControlReason::NoHandle)
+            }
+        }
     }
 
     /// `generation` の `Active` を `Exited` にする（別世代なら何もしない）。
@@ -235,6 +273,22 @@ impl SignalSlot {
     }
 }
 
+/// 起動ハンドルの pidfd を close-on-exec で複製する（`F_DUPFD_CLOEXEC`。std の `try_clone_to_owned`）。
+/// 複製できない（pidfd が無い・fd 枯渇）ときは `None`: exec の受け渡しは `NoHandle` で断り、起動ハンドルの
+/// 監視・シグナル送信には影響しない（fail-closed。記録 pid からの縮退はしない）。
+#[cfg(target_os = "linux")]
+fn dup_launch_pidfd(inner: &dyn LaunchedProcess) -> Option<PidfdDup> {
+    inner
+        .launch_pidfd()
+        .and_then(|fd| fd.try_clone_to_owned().ok())
+        .map(Arc::new)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dup_launch_pidfd(_inner: &dyn LaunchedProcess) -> Option<PidfdDup> {
+    None
+}
+
 /// 起動ハンドルを包み、制御チャネルからの送信要求を監視ループの `wait` で処理する `LaunchedProcess`。
 ///
 /// 呼び出し元は `supervise_with_restart`（監視ループ）。`pid`・`terminate`・`signal`・`take_output`・
@@ -250,7 +304,7 @@ pub struct ControlledProcess {
 impl ControlledProcess {
     /// `inner` を包み、`slot` へ新しい世代として登録する。
     pub fn new(inner: Box<dyn LaunchedProcess>, slot: SignalSlot) -> Self {
-        let (generation, inbox) = slot.register(inner.pid());
+        let (generation, inbox) = slot.register(inner.pid(), dup_launch_pidfd(inner.as_ref()));
         Self {
             inner,
             slot,
@@ -445,6 +499,9 @@ mod tests {
         exited: Arc<AtomicBool>,
         output_taken: Arc<AtomicBool>,
         isolation: Option<fandhe_container_core::launch_isolation::LaunchIsolationRecord>,
+        /// 起動時 pidfd の代役（実 pidfd である必要はない。複製と寿命の試験用）。
+        #[cfg(target_os = "linux")]
+        pidfd: Option<std::os::fd::OwnedFd>,
     }
 
     impl Fake {
@@ -458,6 +515,8 @@ mod tests {
                     exited: Arc::clone(&exited),
                     output_taken: Arc::new(AtomicBool::new(false)),
                     isolation: None,
+                    #[cfg(target_os = "linux")]
+                    pidfd: None,
                 },
                 signals,
                 exited,
@@ -497,10 +556,108 @@ mod tests {
             Some(ContainerOutput::default())
         }
         #[cfg(target_os = "linux")]
+        fn launch_pidfd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+            use std::os::fd::AsFd as _;
+            self.pidfd.as_ref().map(|fd| fd.as_fd())
+        }
+        #[cfg(target_os = "linux")]
         fn take_seccomp_listener(&self) -> Option<fandhe_container_core::exec::SeccompListener> {
             self.output_taken.store(true, Ordering::SeqCst);
             None
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_with_pidfd(pid: u32) -> Fake {
+        let (mut fake, _, _) = Fake::new(pid);
+        let file = std::fs::File::open("/dev/null").unwrap();
+        fake.pidfd = Some(std::os::fd::OwnedFd::from(file));
+        fake
+    }
+
+    /// SUP-6・SEC-1・#2626: exec 用の pidfd の複製は `Active` で pid が一致するときだけ渡り、元の fd とは別番号の
+    /// close-on-exec の複製である。拒否の理由は状態ごとに固定。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup6_handover_pidfd_only_for_active_matching_pid() {
+        use std::os::fd::AsRawFd as _;
+        let slot = SignalSlot::new();
+        // 空: NoHandle。
+        assert_eq!(
+            slot.handover_pidfd(pid(100)).unwrap_err(),
+            ControlReason::NoHandle
+        );
+
+        let fake = fake_with_pidfd(100);
+        let original = fake.pidfd.as_ref().unwrap().as_raw_fd();
+        let cp = ControlledProcess::new(Box::new(fake), slot.clone());
+        let dup = slot.handover_pidfd(pid(100)).unwrap();
+        assert_ne!(dup.as_raw_fd(), original);
+        // close-on-exec が付いている（std の複製は F_DUPFD_CLOEXEC）。fdinfo の flags は 8 進で O_CLOEXEC = 0o2000000。
+        let info =
+            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", dup.as_raw_fd())).unwrap();
+        let flags = info
+            .lines()
+            .find_map(|l| l.strip_prefix("flags:"))
+            .map(|v| u32::from_str_radix(v.trim(), 8).unwrap())
+            .unwrap();
+        assert_eq!(flags & 0o2_000_000, 0o2_000_000);
+        // pid 不一致。
+        assert_eq!(
+            slot.handover_pidfd(pid(101)).unwrap_err(),
+            ControlReason::PidMismatch
+        );
+        // 終了を観測したら複製を渡さない（一致は ContainerExited、不一致は PidMismatch）。
+        slot.mark_exited(cp.generation);
+        assert_eq!(
+            slot.handover_pidfd(pid(100)).unwrap_err(),
+            ControlReason::ContainerExited
+        );
+        assert_eq!(
+            slot.handover_pidfd(pid(101)).unwrap_err(),
+            ControlReason::PidMismatch
+        );
+        // 内部の複製は落ちている（呼び出し側が持つ Arc だけが残る）。
+        assert_eq!(Arc::strong_count(&dup), 1);
+        drop(cp);
+        assert_eq!(
+            slot.handover_pidfd(pid(100)).unwrap_err(),
+            ControlReason::NoHandle
+        );
+    }
+
+    /// SUP-6・SEC-1・#2626: pidfd を持たない起動ハンドル（未対応カーネル等）は `NoHandle`。記録 pid からの縮退はしない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup6_handover_pidfd_without_launch_pidfd_is_no_handle() {
+        let slot = SignalSlot::new();
+        let (fake, _, _) = Fake::new(100);
+        let _cp = ControlledProcess::new(Box::new(fake), slot.clone());
+        assert_eq!(
+            slot.handover_pidfd(pid(100)).unwrap_err(),
+            ControlReason::NoHandle
+        );
+    }
+
+    /// SUP-6・SEC-1・#2626: 再起動で世代が替わったら、新しい世代の複製だけを渡す（古い世代の複製は落ちる）。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sup6_handover_pidfd_follows_new_generation() {
+        use std::os::fd::AsRawFd as _;
+        let slot = SignalSlot::new();
+        let old_cp = ControlledProcess::new(Box::new(fake_with_pidfd(100)), slot.clone());
+        let old = slot.handover_pidfd(pid(100)).unwrap();
+        let new_fake = fake_with_pidfd(200);
+        let _new_cp = ControlledProcess::new(Box::new(new_fake), slot.clone());
+        drop(old_cp);
+        // 古い pid は渡らず、スロットが保持していた古い複製は落ちて呼び出し側の Arc だけが残る。
+        assert_eq!(
+            slot.handover_pidfd(pid(100)).unwrap_err(),
+            ControlReason::PidMismatch
+        );
+        assert_eq!(Arc::strong_count(&old), 1);
+        let new = slot.handover_pidfd(pid(200)).unwrap();
+        assert_ne!(new.as_raw_fd(), old.as_raw_fd());
     }
 
     fn pid(n: u32) -> NonZeroU32 {

@@ -1,14 +1,18 @@
-//! `create` / `start` / `stop` / `delete` / `list` / `logs` / `image` / `system` の argv 解析（TASK-79.2.1・TASK-79.2.2・TASK-79.3・CLI-1・MS-6）。
+//! `create` / `start` / `stop` / `delete` / `list` / `logs` / `exec` / `image` / `system` の argv 解析（TASK-79.2.1・TASK-79.2.2・TASK-79.3・CLI-1・MS-6）。
 //!
 //! `commands::run` が先頭のグローバルオプション（`--root`・`--plugin-path-search`。順不同）とサブコマンド名の後ろを渡して呼ぶ純粋関数群。
 //! ファイルシステムにも環境にも触れず、値の意味検証（絶対パス・ID の文字種）は core の型
 //! （`ContainerId`・`CreateRequest`・`StateRoot`）に委ねる（検査の二重実装を避ける。SEC-1）。
 //! 構文は runc 互換: `fandhe-container [--root <dir>] create [--image-root <dir> --image <sha256:digest|name[:tag]>] --bundle <dir> <id>` / `... start <id>` / `... stop <id>` / `... delete [--force] [--image-root <dir>] <id>` / `... list` / `... logs [--follow] [--tail <N>] [--stream <stdout|stderr>] [--escape] <id>`。
+//! `exec`（SUP-6・#2626）は `... exec [--env KEY=VALUE]... [--timeout <秒>] <id> <path> [<arg>...]`（オプションは `<id>` の前だけ）。
 //! イメージ管理（#2221）は `image ls --image-root <dir>` / `image rm [--force] --image-root <dir> <ref>` / `image tag --image-root <dir> <source> <target>` / `system df --image-root <dir>`（`--image-root` は必須の絶対パス）。
 //! 解析失敗の理由は呼び出し元で固定文言に落とし、引数値を出力へ埋め込まない（インジェクション回避）。
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::time::Duration;
+
+use fandhe_container_supervisor::container_options::env::EnvVar;
 
 /// グローバルオプション（サブコマンドより前）。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -59,6 +63,30 @@ pub(super) struct DeleteArgs {
     pub(super) force: bool,
     /// `--image-root`（イメージ参照を解除するストアの root。絶対パス。省略時は解除しない。OCI-7・#2315）。
     pub(super) image_root: Option<PathBuf>,
+}
+
+/// `exec` の既定の全体期限（秒。pidfd の受け渡しから終了待ちまで。REPAIR-5・SUP-6・#2626）。
+pub(super) const EXEC_DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+/// `exec --timeout` に指定できる秒数の上限（超える値は使い方エラー。無制限に長い期限を受けない。REPAIR-5・#2626）。
+pub(super) const EXEC_MAX_TIMEOUT_SECS: u64 = 3600;
+
+/// `exec` の引数（SUP-6・CLI-1・#2626）。
+///
+/// 非 Linux の `exec` は plugin 解決の拒否に到達するだけでフィールドを読まないため、dead_code を許す
+/// （3 OS で同じ構文を受理する。CLI-1）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) struct ExecArgs {
+    pub(super) id: String,
+    /// `--env KEY=VALUE`（その exec に対して明示した環境変数。指定順で後勝ち。ホスト環境は継承しない）。
+    pub(super) env: Vec<EnvVar>,
+    /// `--timeout <秒>`（準備から終了待ちまでの全体の期限。`1..=EXEC_MAX_TIMEOUT_SECS`）。
+    pub(super) timeout: Duration,
+    /// コンテナ内の実行ファイルの絶対パス（絶対パスの検証は supervisor の `ExecRequest::new` が行う。PATH 探索はしない）。
+    pub(super) path: String,
+    /// `argv[0]` を除く引数（argv は `[path, args...]`）。
+    pub(super) args: Vec<String>,
 }
 
 /// `list` の引数（現状オプションなし。将来のオプション追加に備えて構造体にしておく。TASK-79.3）。
@@ -252,6 +280,68 @@ pub(super) fn parse_start(args: Vec<OsString>) -> Result<StartArgs, UsageError> 
 pub(super) fn parse_stop(args: Vec<OsString>) -> Result<StopArgs, UsageError> {
     Ok(StopArgs {
         id: single_positional(args)?,
+    })
+}
+
+/// `exec [--env KEY=VALUE]... [--timeout <秒>] [--] <id> <path> [<arg>...]` を解析する（SUP-6・CLI-1・#2626）。
+///
+/// オプションは `<id>` より前だけで受ける（`<id>` の後ろはすべてコマンドの引数で、`-l` のようなオプション風の語も
+/// そのまま渡す。docker exec と同じ）。`--env` は何回でも、`--timeout` は 1 回まで。`--env` の値は `EnvVar::parse` で検証する
+/// （値なしの `KEY` によるホスト環境の継承・NUL・空のキーは使い方エラー）。`--timeout` は `1..=EXEC_MAX_TIMEOUT_SECS` の
+/// 10 進整数。`<path>` は必須（空でないこと以外の検証は supervisor の `ExecRequest::new`）。
+pub(super) fn parse_exec(args: Vec<OsString>) -> Result<ExecArgs, UsageError> {
+    let mut env: Vec<EnvVar> = Vec::new();
+    let mut timeout: Option<Duration> = None;
+    let mut it = args.into_iter();
+    let id = loop {
+        let a = it.next().ok_or(UsageError)?;
+        if a == "--" {
+            break it.next().ok_or(UsageError)?;
+        } else if a == "--env" {
+            let value = it
+                .next()
+                .ok_or(UsageError)?
+                .into_string()
+                .map_err(|_| UsageError)?;
+            env.push(EnvVar::parse(&value).map_err(|_| UsageError)?);
+        } else if a == "--timeout" {
+            let value = it
+                .next()
+                .ok_or(UsageError)?
+                .into_string()
+                .map_err(|_| UsageError)?;
+            if timeout.is_some() {
+                return Err(UsageError);
+            }
+            let secs: u64 = value.parse().map_err(|_| UsageError)?;
+            if !(1..=EXEC_MAX_TIMEOUT_SECS).contains(&secs) {
+                return Err(UsageError);
+            }
+            timeout = Some(Duration::from_secs(secs));
+        } else if is_option_like(&a) {
+            return Err(UsageError);
+        } else {
+            break a;
+        }
+    };
+    let id = id.into_string().map_err(|_| UsageError)?;
+    let path = it
+        .next()
+        .ok_or(UsageError)?
+        .into_string()
+        .map_err(|_| UsageError)?;
+    if path.is_empty() {
+        return Err(UsageError);
+    }
+    let rest = it
+        .map(|a| a.into_string().map_err(|_| UsageError))
+        .collect::<Result<Vec<String>, UsageError>>()?;
+    Ok(ExecArgs {
+        id,
+        env,
+        timeout: timeout.unwrap_or(Duration::from_secs(EXEC_DEFAULT_TIMEOUT_SECS)),
+        path,
+        args: rest,
     })
 }
 
@@ -1034,6 +1124,65 @@ mod tests {
         ] {
             assert_eq!(parse_image(bad.clone()), Err(UsageError), "{bad:?}");
         }
+    }
+
+    /// SUP-6・CLI-1・#2626: `exec` はオプション（`--env`・`--timeout`）を `<id>` の前に受け、`<id>` の後ろは
+    /// オプション風の語を含めてすべてコマンドの引数として保つ。
+    #[test]
+    fn sup6_parse_exec_options_and_command() {
+        let a = parse_exec(v(&["c1", "/bin/echo", "hi", "-n", "--env"])).expect("ok");
+        assert_eq!(a.id, "c1");
+        assert_eq!(a.path, "/bin/echo");
+        assert_eq!(a.args, vec!["hi", "-n", "--env"]);
+        assert!(a.env.is_empty());
+        assert_eq!(a.timeout, Duration::from_secs(EXEC_DEFAULT_TIMEOUT_SECS));
+
+        let a = parse_exec(v(&[
+            "--env",
+            "A=1",
+            "--timeout",
+            "30",
+            "--env",
+            "B=",
+            "c1",
+            "/bin/true",
+        ]))
+        .expect("ok");
+        let env: Vec<(&str, &str)> = a.env.iter().map(|e| (e.key(), e.value())).collect();
+        assert_eq!(env, vec![("A", "1"), ("B", "")]);
+        assert_eq!(a.timeout, Duration::from_secs(30));
+        assert!(a.args.is_empty());
+
+        // `--` の後ろは `<id>` から始まる位置引数（`-` で始まる ID も `--` なら受ける。ID の文字種は core が検証する）。
+        let a = parse_exec(v(&["--", "-x", "/bin/true"])).expect("ok");
+        assert_eq!((a.id.as_str(), a.path.as_str()), ("-x", "/bin/true"));
+    }
+
+    /// SUP-6・CLI-1・#2626: `exec` の使い方エラー（id・path 欠落、未知オプション、値なしの `--env`、
+    /// `--timeout` の 0・上限超・重複・非数値）。
+    #[test]
+    fn sup6_parse_exec_rejections() {
+        for bad in [
+            v(&[]),
+            v(&["c1"]),
+            v(&["c1", ""]),
+            v(&["--bogus", "c1", "/bin/true"]),
+            v(&["--env"]),
+            v(&["--env", "KEY", "c1", "/bin/true"]),
+            v(&["--env", "=v", "c1", "/bin/true"]),
+            v(&["--timeout"]),
+            v(&["--timeout", "0", "c1", "/bin/true"]),
+            v(&["--timeout", "3601", "c1", "/bin/true"]),
+            v(&["--timeout", "-1", "c1", "/bin/true"]),
+            v(&["--timeout", "x", "c1", "/bin/true"]),
+            v(&["--timeout", "5", "--timeout", "6", "c1", "/bin/true"]),
+            v(&["--"]),
+        ] {
+            assert_eq!(parse_exec(bad.clone()), Err(UsageError), "{bad:?}");
+        }
+        // 上限ちょうどは受ける。
+        let a = parse_exec(v(&["--timeout", "3600", "c1", "/bin/true"])).expect("ok");
+        assert_eq!(a.timeout, Duration::from_secs(EXEC_MAX_TIMEOUT_SECS));
     }
 
     /// CLI-1: 非 UTF-8 の位置引数は image tag で使い方エラー。

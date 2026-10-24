@@ -5,6 +5,8 @@
 
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+use fandhe_container_core::traits::CleanupOutcome;
 #[cfg(not(target_os = "linux"))]
 use fandhe_container_core::traits::Signal;
 use fandhe_container_core::traits::{
@@ -351,6 +353,19 @@ mod store_backed {
         )
     }
 
+    /// 後始末の警告行を捕捉する出力先つきに差し替える（#2633）。
+    #[cfg(target_os = "linux")]
+    fn capture_cleanup_warnings(
+        rt: CoreLifecycleRuntime,
+    ) -> (CoreLifecycleRuntime, Arc<std::sync::Mutex<Vec<String>>>) {
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        let rt = rt.with_cleanup_warning_sink(Arc::new(move |line| {
+            sink.lock().expect("lock").push(line);
+        }));
+        (rt, lines)
+    }
+
     #[cfg(target_os = "linux")]
     fn log_remove_counts(
         recorder: &fandhe_container_core::observability::OpRecorder,
@@ -368,6 +383,7 @@ mod store_backed {
         let dir = tmp_dir("ctrlog-target");
         let bundle = make_bundle(&dir);
         let (rt, recorder, root) = log_runtime(&dir);
+        let (rt, warnings) = capture_cleanup_warnings(rt);
         for n in ["c1", "c2"] {
             rt.create(&CreateRequest::new(cid(n), bundle.clone()).expect("req"))
                 .expect("create");
@@ -388,7 +404,11 @@ mod store_backed {
         assert_eq!(err.code(), ErrorCode::NotFound);
         assert_eq!(sorted_dir_names(&logs).len(), 5);
 
-        rt.delete(&DeleteRequest::new(cid("c1"))).expect("delete");
+        let resp = rt.delete(&DeleteRequest::new(cid("c1"))).expect("delete");
+        assert_eq!(resp.supervisor_log(), CleanupOutcome::Removed);
+        assert_eq!(resp.container_log(), CleanupOutcome::Removed);
+        assert_eq!(resp.image_rootfs(), CleanupOutcome::NotApplicable);
+        assert!(warnings.lock().expect("lock").is_empty());
         assert_eq!(sorted_dir_names(&logs), ["c2.log", "c2.log.lock"]);
         assert_eq!(log_remove_counts(&recorder), Some((1, 0)));
         let st = rt.state(&StateRequest::new(cid("c2"))).expect("c2 state");
@@ -403,12 +423,28 @@ mod store_backed {
         let dir = tmp_dir("ctrlog-locked");
         let bundle = make_bundle(&dir);
         let (rt, recorder, root) = log_runtime(&dir);
+        let (rt, warnings) = capture_cleanup_warnings(rt);
         rt.create(&CreateRequest::new(cid("c1"), bundle).expect("req"))
             .expect("create");
         let logs = fandhe_container_supervisor::logs::container_log_dir(&root);
         let sink = open_container_log_sink(&root, "c1");
 
-        rt.delete(&DeleteRequest::new(cid("c1"))).expect("delete");
+        let resp = rt.delete(&DeleteRequest::new(cid("c1"))).expect("delete");
+        assert_eq!(
+            resp.container_log(),
+            CleanupOutcome::Kept {
+                code: ErrorCode::FailedPrecondition
+            }
+        );
+        let lines = warnings.lock().expect("lock").clone();
+        assert_eq!(
+            lines,
+            vec![
+                "{\"level\":\"warn\",\"event\":\"container_delete_cleanup\",\"id\":\"c1\",\"target\":\"container_log\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"cleanup after delete left resources behind\"}"
+                    .to_owned()
+            ]
+        );
+        assert!(!lines[0].contains(dir.to_str().expect("utf8 path")));
         assert_eq!(sorted_dir_names(&logs), ["c1.log", "c1.log.lock"]);
         assert_eq!(log_remove_counts(&recorder), Some((0, 1)));
         let by_code = |n: &str| {

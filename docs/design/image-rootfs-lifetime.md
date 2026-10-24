@@ -16,7 +16,8 @@ spec では、OCI-6 の delete が消すのは状態ファイルと cgroup、OCI
 | 消すタイミング | `delete`（`delete_releasing_image_ref` から呼ばれる場合も含む）の中で、`StateStore::delete` が成功した後に消す。使うのは関数の先頭で読んだレコード（実際に消した revision のもの）に付いた記録 |
 | 状態削除の後にする理由 | start は `BundleLock` と revision の予約より前に rootfs の fd を固定する。状態削除の前に消す順だと、Created のコンテナで start が rootfs を固定し、delete が消し、start が予約し、delete の状態削除が `FailedPrecondition` になる窓が残る。状態の削除が成功した後なら、そのコンテナへの start・restart（supervisor）・update は revision 照合つきの `StateStore::update` で `NotFound` になるので、使用中の rootfs を消す窓が無い（supervisor の更新も `UpdateStateRequest::new(status, expected_revision)` を経る） |
 | 消し方（fail-closed） | 記録した bundle を開き（bundle 自体は作成時と同じく追従する）、中間要素はリンク非追従の fd 相対で辿り、末尾もリンク非追従で開く。`fstat` の (dev, ino) が記録と一致したときだけ、中身を再帰的に消してから空のディレクトリを消す。symlink・ディレクトリでないもの・同一性の不一致は `FailedPrecondition` にして何も消さない。どの段でも `ENOENT` なら「既に無い」として成功扱いにする（冪等） |
-| 失敗時の扱い | delete の戻り値は変えない（状態は既に消えている。エラーを返すと再実行が `NotFound` になる。`image_ref_release` と同じ考え方）。失敗は操作名 `image_rootfs_remove` で `OpRecorder` に記録し、木は残す |
+| 失敗時の扱い | delete は `Ok` のまま（`Err` にしない。状態は既に消えている。エラーを返すと再実行が `NotFound` になる。`image_ref_release` と同じ考え方）。結果は `DeleteResponse::image_rootfs` に `Kept { code }` で載せ（次行）、操作名 `image_rootfs_remove` で `OpRecorder` にも記録し、木は残す |
+| delete の後始末の結果の返し方（#2633・OCI-7・CRI-2・SUP-7・REPAIR-4・PLUG-1） | **`DeleteResponse` に載せる**。理由: (1) 記録器は件数の集計で、呼び出しごと・コンテナごとの結果を運べず、CLI は `OP_LOG_ENV` のときしか出さないため利用者は木が残ったことを知れなかった、(2) `ContainerRuntime` の実装は plugin 側（PLUG-1）で、RPC 境界の先の結果を呼び出しごとに返せるのは戻り値だけ。**delete の成否は変えない**（終了コード 0・CRI の `RemoveContainer` は成功のまま）。型は `CleanupOutcome`（`NotApplicable`〔既定〕・`Removed`・`AlreadyAbsent`・`Kept { code: ErrorCode }`。パス・errno は含めない）で、欄は `image_rootfs`・`supervisor_log`・`container_log`。埋める層: `image_rootfs` は core の delete（記録なし = `NotApplicable`、`Removed` / `NotPresent` = `Removed` / `AlreadyAbsent`、失敗 = `Kept { code }`）、`supervisor_log`・`container_log` はログを消す層（plugin-cri。`Finished` = `Removed`〔期限内に終えた best effort〕、`TimedOut` = `Kept { Timeout }`、失敗 = `Kept { code }`、状態ルートが無いストア = `NotApplicable`）。出し方: CLI は `image_rootfs` が `Kept` のとき stderr に 1 行 JSON（`code` + 固定文言 `image rootfs removal failed; leftover rootfs may remain`）の警告を出し、終了コードは 0（ログ側の警告は従来のまま）。CRI は cri-api の `RemoveContainerResponse` にフィールドが無い（無改変。CRI-3）ため応答には載せず、plugin-cri が `Kept` 1 件につき 1 行の構造化ログ（`event: container_delete_cleanup`・`id`・`target`・`code`）を `LineSink` 経由で stderr に出す。cri crate の `RuntimeDeleteResult` は同じ 3 欄を `RuntimeCleanupOutcome` に写す（未知の値は `Kept { Internal }`）。記録器への計上はメトリクスとして残す |
 | 作成世代の照合（#2378） | (dev, ino) は rootfs を手で消して同名のディレクトリを作り直すと再利用されうる。そこで create は展開後・公開前に、rootfs 直下の印のファイル `.fandhe-container-rootfs-owner`（0400）へ 128 bit の乱数トークン（小文字 16 進 32 文字）を書き、同じ値を状態レコードの `imageRootfs.token` に記録する。delete は固定した rootfs の fd 直下の印をリンク非追従・通常ファイルのみで読み、記録と完全一致したときだけ消す。印の欠落・不一致・記録のトークン欠落（旧記録）は `FailedPrecondition` で何も消さない。展開済みの木に同名のファイルがあれば（イメージ由来の偽の印）create が拒否する。コンテナ内から rootfs の `/` に印のファイルが見える |
 | delete と create・start の排他（#2378） | `StateStore::delete` が成功するとストアのロックは外れる。rootfs を持つコンテナの delete は、状態削除の前から rootfs の後始末の完了まで bundle の所有ロック（`BundleLock`。start と同じ `flock`）を保持する。通常の create・`create_with_image` の状態作成も同じロックを取り、保持中は `FailedPrecondition`（何も変えず再試行）。start は既存の `BundleLock` で排他される。create・delete のロックは bundle が指す実体に取る（祖先が symlink なら解決した実体の経路で取り直す。ロックは inode に掛かるため、表記の違う bundle 経由でも同じ実体なら排他する）。Linux でそれでもロックを取れない create は状態を作らずに拒否し、delete は状態を消すが rootfs は消さずに残して失敗を記録する（fail-closed）。Linux 以外はロックが未実装で、create は排他なしで進み、delete は rootfs を消さない |
 | 同じ ID の再作成との競合 | 旧い最終名がある間は、新しい `create_with_image` は `RENAME_NOREPLACE` のため公開できない。同じ名前に別の同一性の実体があるのは差し替えられた場合だけで、そのときは消さない |
@@ -42,7 +43,7 @@ spec では、OCI-6 の delete が消すのは状態ファイルと cgroup、OCI
 
 ## 失敗後の手動回復
 
-公開済みで状態の無い木は、上の決定 A の条件を満たせば次の `create_with_image` が自動で回収する。回収されずに `AlreadyExists` で止まり続けるとき（`image_rootfs_orphan_reap` の失敗、印が v1・複製・欠落、別の状態ルートの使用、再起動で `st_dev` が変わった等）は、利用者が `<bundle>/<root.path>` の中身を確認し、不要なら手で削除する。`image_rootfs_remove` の失敗が subordinate の木だったときは、delete が状態の削除まで済ませており delete し直しは冒頭の状態取得で `NotFound` になるため使えない。権限（`SubordinateIds`）つきの次の create（`ContainerImage::with_rootfs_privilege`）による公開済みの孤児の回収に任せるか、`podman unshare` 相当の userns の中で手で削除する。
+公開済みで状態の無い木は、上の決定 A の条件を満たせば次の `create_with_image` が自動で回収する。回収されずに `AlreadyExists` で止まり続けるとき（`image_rootfs_orphan_reap` の失敗、印が v1・複製・欠落、別の状態ルートの使用、再起動で `st_dev` が変わった等）は、利用者が `<bundle>/<root.path>` の中身を確認し、不要なら手で削除する（CLI の警告 `image rootfs removal failed` と plugin-cri の `container_delete_cleanup`〔`target: image_rootfs`〕が手動回復のきっかけになる）。`image_rootfs_remove` の失敗が subordinate の木だったときは、delete が状態の削除まで済ませており delete し直しは冒頭の状態取得で `NotFound` になるため使えない。権限（`SubordinateIds`）つきの次の create（`ContainerImage::with_rootfs_privilege`）による公開済みの孤児の回収に任せるか、`podman unshare` 相当の userns の中で手で削除する。
 
 ## 対象外（後続の候補）
 
@@ -50,5 +51,6 @@ spec では、OCI-6 の delete が消すのは状態ファイルと cgroup、OCI
 - CLI / CRI / supervisor から `ImageRootfsPrivilege`・`DeleteOptions`・`ReapOptions` を渡す配線（#2315・#2243）と、マルチスレッド経路の子プロセス方式
 - 別の状態ルートのコンテナと同じ bundle の rootfs を共有する構成の支援
 - rootful でイメージが所有者を 0 以外へ変えた展開途中の木の自動回収（`Unverified` として観測できるだけ）
-- `DeleteResponse` に rootfs の削除結果を載せること（現状は recorder で観測する）
+- イメージ参照の解除（`image_ref_release`）の結果を `DeleteResponse` に載せること（現状は記録器のみ。安全側で、起動時の照合 #854 が回収する）
+- plugin RPC（#1869 の `RuntimeResponse::Deleted`）の DTO へ後始末の欄を足すこと（RPC の実装時に行う。plugin から受けた値は untrusted として閉じた語彙へ写す）
 - 参照と blob の起動時照合（#854）が rootfs の木を GC・prune の対象にするか

@@ -53,7 +53,7 @@ spec では、OCI-6 の delete が消すのは状態ファイルと cgroup、OCI
 3. 展開途中の木（`<bundle>/.fandhe-unpack-*`）は、`flock -n <dir> true` が成功すれば持ち主がいない
 4. 削除: rootful は `rm -rf --one-file-system <dir>`。subuid 所有の木は `podman unshare` 相当の userns の中で消す。`image_rootfs_remove` の失敗が subordinate の木だったときは、delete が状態の削除まで済ませており delete し直しは冒頭の状態取得で `NotFound` になるため使えない。権限（`SubordinateIds`）つきの次の create（`ContainerImage::with_rootfs_privilege`）による孤児の回収に任せることもできる
 
-delete の rootfs 削除の失敗は、PR #2685（#2633）がマージされれば stderr の警告として表に出る（現存のものではない）。
+delete の rootfs 削除の失敗は `DeleteResponse` の `image_rootfs`（`CleanupOutcome`。#2633・PR #2685）に載り、CLI が stderr の警告として表に出す。
 
 ## 対象外（後続の候補）
 
@@ -62,5 +62,4 @@ delete の rootfs 削除の失敗は、PR #2685（#2633）がマージされれ�
 - `OpRecorder` の計数（`image_rootfs_orphan_reap` 等）を運用者へ出す手段
 - rootless でイメージの `./` が root 以外の所有のとき、userns の中で子を最終の名前へ改名すること（決定 G の既知の制限）
 - rootful でイメージが所有者を変える場合の実機確認（root 版。#1621 の範囲。CI の rootless 試験は子の所有者を subuid へ変える代役で確かめる）
-- `DeleteResponse` に rootfs の削除結果を載せること（現状は recorder で観測する。#2633）
 - 参照と blob の起動時照合（#854）が rootfs の木を GC・prune の対象にするか

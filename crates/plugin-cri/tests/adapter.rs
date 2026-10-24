@@ -345,7 +345,9 @@ mod store_backed {
         let state_root = store.host_state_root().expect("host root").to_path_buf();
         let recorder = Arc::new(OpRecorder::new());
         (
-            CoreLifecycleRuntime::with_recorder(store, Arc::clone(&recorder)),
+            // sink が閉じない試験が 10 秒待たないよう、閉鎖待ちを短くする（#2634）。
+            CoreLifecycleRuntime::with_recorder(store, Arc::clone(&recorder))
+                .with_container_log_lock_wait(std::time::Duration::from_millis(200)),
             recorder,
             state_root,
         )
@@ -445,6 +447,17 @@ mod store_backed {
         assert!(!lines[0].contains(dir.to_str().expect("utf8 path")));
         assert_eq!(sorted_dir_names(&logs), ["c1.log", "c1.log.lock"]);
         assert_eq!(log_remove_counts(&recorder), Some((0, 1)));
+        let by_code = |n: &str| {
+            use fandhe_container_core::observability::OpName;
+            recorder
+                .snapshot_op(&OpName::new(n).expect("name"))
+                .map(|s| (s.success(), s.failure()))
+        };
+        assert_eq!(
+            by_code("container_log_remove.failed_precondition"),
+            Some((0, 1))
+        );
+        assert_eq!(by_code("container_log_remove.timeout"), None);
         let gone = rt.state(&StateRequest::new(cid("c1"))).expect_err("gone");
         assert_eq!(gone.code(), ErrorCode::NotFound);
 

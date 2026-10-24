@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::num::NonZeroU32;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -123,6 +123,8 @@ struct Sim {
     cgroup: bool,
     root: PathBuf,
     deletes: AtomicU32,
+    /// 状態ストアの `delete` が呼ばれたら立ち、以後 `get` は `NotFound` を返す（ログ削除の guard が通るように）。
+    deleted: AtomicBool,
 }
 
 impl Sim {
@@ -136,6 +138,22 @@ impl Sim {
             cgroup: false,
             root: scripts().dir.clone(),
             deletes: AtomicU32::new(0),
+            deleted: AtomicBool::new(false),
+        })
+    }
+
+    /// `root` を指定して作る（ログを実ファイルで扱う試験用。`scripts().dir` はプロセスで共有のため使わない）。
+    fn running_in(root: PathBuf, id: &str, p: u32) -> Arc<Self> {
+        Arc::new(Self {
+            status: Mutex::new(ContainerStatus::running(cid(id), Some(pid(p)))),
+            calls: Mutex::new(Vec::new()),
+            stop_on: Mutex::new(None),
+            race: Mutex::new(None),
+            fail: Mutex::new(None),
+            cgroup: false,
+            root,
+            deletes: AtomicU32::new(0),
+            deleted: AtomicBool::new(false),
         })
     }
 
@@ -149,6 +167,7 @@ impl Sim {
             cgroup: true,
             root: scripts().dir.clone(),
             deletes: AtomicU32::new(0),
+            deleted: AtomicBool::new(false),
         })
     }
 
@@ -173,6 +192,9 @@ impl StateStore for SimStore {
         Err(unused())
     }
     fn get(&self, _r: &GetStateRequest) -> Result<StateRecord, TraitError> {
+        if self.0.deleted.load(Ordering::SeqCst) {
+            return Err(TraitError::new(ErrorCode::NotFound, "deleted"));
+        }
         let status = self.0.status.lock().expect("lock").clone();
         let record = StateRecord::new(status, self.0.root.join("bundle"), StateRevision::INITIAL)?;
         Ok(if self.0.cgroup {
@@ -189,6 +211,7 @@ impl StateStore for SimStore {
     }
     fn delete(&self, _r: &DeleteStateRequest) -> Result<DeleteStateResponse, TraitError> {
         self.0.deletes.fetch_add(1, Ordering::SeqCst);
+        self.0.deleted.store(true, Ordering::SeqCst);
         Ok(DeleteStateResponse::new())
     }
     fn list(&self, _r: &ListStateRequest) -> Result<StateList, TraitError> {
@@ -639,4 +662,132 @@ fn repair5_plugin_runtime_timeout_exceeds_supervisor_deadline() {
     let receive = cli_receive_deadline(&StartTimeouts::default());
     assert_eq!(receive, Duration::from_millis(58_900));
     assert_eq!(PLUGIN_RUNTIME_TIMEOUT, receive + Duration::from_secs(2));
+}
+
+/// 試験ごとの一時ルート（mode 0700）。
+fn temp_root(tag: &str) -> PathBuf {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let p = std::env::temp_dir().join(format!(
+        "fc-2634-{tag}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&p).expect("mkdir");
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    p
+}
+
+fn open_log_sink(root: &Path, id: &str) -> fandhe_container_supervisor::logs::RotatingFileSink {
+    use fandhe_container_supervisor::logs::{
+        LogSink as _, RotatingFileSink, StreamKind, container_log_dir,
+        container_log_rotation_config,
+    };
+    let dir = container_log_dir(root);
+    std::fs::create_dir_all(&dir).expect("logdir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let sink =
+        RotatingFileSink::open(&dir, &cid(id), container_log_rotation_config()).expect("open");
+    sink.append(StreamKind::Stdout, b"hello").expect("append");
+    sink.flush().expect("flush");
+    sink
+}
+
+fn log_dir_names(root: &Path) -> Vec<String> {
+    let dir = fandhe_container_supervisor::logs::container_log_dir(root);
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .expect("read_dir")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+fn op_counts(rec: &OpRecorder, name: &str) -> Option<(u64, u64)> {
+    rec.snapshot_op(&OpName::new(name).expect("name"))
+        .map(|s| (s.success(), s.failure()))
+}
+
+fn force_runtime(sim: &Arc<Sim>, rec: &Arc<OpRecorder>, wait: Duration) -> CoreLifecycleRuntime {
+    CoreLifecycleRuntime::with_recorder(Arc::new(SimStore(Arc::clone(sim))), Arc::clone(rec))
+        .with_supervision(SupervisedLifecycle::new(
+            starter(LONG),
+            Arc::new(SimSignalers(Arc::clone(sim))),
+        ))
+        .with_container_log_lock_wait(wait)
+}
+
+/// SUP-7・CRI-2・#2634: running への force 削除で、`Stopped` の後に supervisor が sink を閉じるまでの窓を待ち、
+/// ログとロックファイルを消す。
+#[test]
+fn sup7_cri2_force_delete_running_waits_for_sink_and_removes_logs() {
+    let root = temp_root("force-ok");
+    let sim = Sim::running_in(root.clone(), "c1", 4242);
+    *sim.stop_on.lock().expect("lock") = Some(Signal::SIGTERM);
+    let sink = open_log_sink(&root, "c1");
+    assert_eq!(log_dir_names(&root), ["c1.log", "c1.log.lock"]);
+    let rec = Arc::new(OpRecorder::new());
+    let rt = force_runtime(&sim, &rec, Duration::from_secs(5));
+    // 状態が Stopped になった後で supervisor が drain してから sink を閉じる窓を模す。
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        drop(sink);
+    });
+    rt.delete(&DeleteRequest::new(cid("c1")).with_force(true))
+        .expect("force delete");
+    closer.join().expect("join");
+    assert_eq!(sim.calls(), [(Kind::Stop, Signal::SIGTERM)]);
+    assert_eq!(log_dir_names(&root), Vec::<String>::new());
+    assert_eq!(op_counts(&rec, "container_log_remove"), Some((1, 0)));
+    assert_eq!(
+        op_counts(&rec, "container_log_remove.failed_precondition"),
+        None
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// SUP-7・CRI-2・REPAIR-4・REPAIR-5・#2634: 待ちの期限までに sink が閉じなければ、`delete` は `Ok` のままログを残し、
+/// 失敗を `failed_precondition` の内訳つきで計上する。
+#[test]
+fn sup7_cri2_force_delete_running_keeps_logs_after_wait_deadline() {
+    let root = temp_root("force-deadline");
+    let sim = Sim::running_in(root.clone(), "c1", 4242);
+    *sim.stop_on.lock().expect("lock") = Some(Signal::SIGTERM);
+    let _sink = open_log_sink(&root, "c1");
+    let rec = Arc::new(OpRecorder::new());
+    let rt = force_runtime(&sim, &rec, Duration::from_millis(200));
+    rt.delete(&DeleteRequest::new(cid("c1")).with_force(true))
+        .expect("force delete");
+    assert_eq!(log_dir_names(&root), ["c1.log", "c1.log.lock"]);
+    assert_eq!(op_counts(&rec, "container_log_remove"), Some((0, 1)));
+    assert_eq!(
+        op_counts(&rec, "container_log_remove.failed_precondition"),
+        Some((0, 1))
+    );
+    for other in ["timeout", "invalid_argument", "internal", "other"] {
+        assert_eq!(
+            op_counts(&rec, &format!("container_log_remove.{other}")),
+            None
+        );
+    }
+    drop(_sink);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// REPAIR-5・#2634: running への force 削除の最悪所要（stop + supervisor ログ + コンテナログの待ち）は
+/// `PLUGIN_RUNTIME_TIMEOUT` に収まる。
+#[test]
+fn repair5_force_delete_worst_case_fits_runtime_timeout() {
+    use fandhe_container_core::oci_runtime::KillTimeout;
+    use fandhe_container_plugin_cri::supervised::STOP_KILL_WAIT;
+    use fandhe_container_supervisor::logs::{
+        CONTAINER_LOG_LOCK_WAIT, CONTAINER_LOG_REMOVE_TIMEOUT,
+    };
+    use fandhe_container_supervisor::supervisor_log::SUPERVISOR_LOG_REMOVE_TIMEOUT;
+    let stop = (KillTimeout::DEFAULT + Duration::from_secs(1)) * 2 + STOP_KILL_WAIT;
+    assert_eq!(stop, Duration::from_secs(17));
+    let logs =
+        SUPERVISOR_LOG_REMOVE_TIMEOUT + CONTAINER_LOG_LOCK_WAIT + CONTAINER_LOG_REMOVE_TIMEOUT;
+    assert_eq!(logs, Duration::from_secs(20));
+    assert_eq!(stop + logs, Duration::from_secs(37));
+    assert!(stop + logs < PLUGIN_RUNTIME_TIMEOUT);
 }

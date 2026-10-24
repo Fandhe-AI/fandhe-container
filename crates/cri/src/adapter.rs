@@ -24,13 +24,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fandhe_container_core::traits::{
-    ContainerId, ContainerRuntime, ContainerState, ContainerStatus, CreateRequest, DeleteRequest,
-    DeleteResponse, KillRequest, Signal, StartRequest, StateRequest, StopRequest,
+    CleanupOutcome, ContainerId, ContainerRuntime, ContainerState, ContainerStatus, CreateRequest,
+    DeleteRequest, DeleteResponse, KillRequest, Signal, StartRequest, StateRequest, StopRequest,
     TerminationReason, TraitError,
 };
 use tonic::Status;
 
-use crate::error::CriError;
+use crate::error::{CriError, CriErrorCode};
 use crate::runtime::v1::ContainerState as CriContainerState;
 use crate::runtime::v1::{ContainerConfig, PodSandboxConfig};
 
@@ -133,17 +133,69 @@ impl From<&ContainerStatus> for RuntimeContainerStatus {
     }
 }
 
-/// `ContainerRuntime::delete` の結果を CRI 側の語彙へ写した値（CRI-2）。
+/// delete の後始末 1 件の結果を CRI 側の語彙へ写した値（core の `CleanupOutcome` を写す。
+/// OCI-7・CRI-2・SUP-7・REPAIR-4・#2633）。
 ///
-/// core の `DeleteResponse` を公開 API へ漏らさず、将来の拡張（解放した資源の情報等）に備えて
-/// `#[non_exhaustive]` とする。当面は core 側の応答が空のためフィールドを持たない。
+/// core の型を公開 API へ漏らさないための型。`Kept` の `code` は core の `ErrorCode` を
+/// [`CriError`] の写像表（`From<&TraitError>`）と同じ規則で写した値。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct RuntimeDeleteResult {}
+pub enum RuntimeCleanupOutcome {
+    /// この層では対象が無い。既定値。
+    #[default]
+    NotApplicable,
+    /// 消した。
+    Removed,
+    /// 既に無かった。
+    AlreadyAbsent,
+    /// 消せずに残した。
+    Kept {
+        /// 残した理由の分類。
+        code: CriErrorCode,
+    },
+}
+
+impl RuntimeCleanupOutcome {
+    /// core の結果を写す。未知の値（将来追加分）は成功に見せず `Kept { Internal }` へ倒す（fail-closed）。
+    fn from_core(outcome: CleanupOutcome) -> Self {
+        match outcome {
+            CleanupOutcome::NotApplicable => Self::NotApplicable,
+            CleanupOutcome::Removed => Self::Removed,
+            CleanupOutcome::AlreadyAbsent => Self::AlreadyAbsent,
+            CleanupOutcome::Kept { code } => Self::Kept {
+                code: CriError::from(&TraitError::new(code, "")).code(),
+            },
+            _ => Self::Kept {
+                code: CriErrorCode::Internal,
+            },
+        }
+    }
+}
+
+/// `ContainerRuntime::delete` の結果を CRI 側の語彙へ写した値（CRI-2）。
+///
+/// core の `DeleteResponse` を公開 API へ漏らさず、将来の拡張に備えて `#[non_exhaustive]` とする。
+/// 後始末（rootfs・ログ）の結果を載せる。cri-api の `RemoveContainerResponse` にはフィールドが無い
+/// （無改変。CRI-3）ため、`runtime_service` は結果を応答へ載せない。残した資源は後始末をした層
+/// （`fandhe-container-plugin-cri`）が構造化ログで出す。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RuntimeDeleteResult {
+    /// イメージ由来 rootfs の後始末の結果。
+    pub image_rootfs: RuntimeCleanupOutcome,
+    /// supervisor ログの後始末の結果。
+    pub supervisor_log: RuntimeCleanupOutcome,
+    /// コンテナログの後始末の結果。
+    pub container_log: RuntimeCleanupOutcome,
+}
 
 impl From<&DeleteResponse> for RuntimeDeleteResult {
-    fn from(_: &DeleteResponse) -> Self {
-        Self {}
+    fn from(resp: &DeleteResponse) -> Self {
+        Self {
+            image_rootfs: RuntimeCleanupOutcome::from_core(resp.image_rootfs()),
+            supervisor_log: RuntimeCleanupOutcome::from_core(resp.supervisor_log()),
+            container_log: RuntimeCleanupOutcome::from_core(resp.container_log()),
+        }
     }
 }
 
@@ -388,6 +440,33 @@ mod tests {
         assert_eq!(
             RuntimeDeleteResult::from(&DeleteResponse::new()),
             RuntimeDeleteResult::default()
+        );
+    }
+
+    /// OCI-7・CRI-2・REPAIR-4: 後始末の結果（残した理由を含む）を CRI の語彙へ具体値で写す。
+    #[test]
+    fn oci7_delete_result_maps_cleanup_outcomes() {
+        let resp = DeleteResponse::new()
+            .with_image_rootfs(CleanupOutcome::AlreadyAbsent)
+            .with_supervisor_log(CleanupOutcome::Kept {
+                code: ErrorCode::Timeout,
+            })
+            .with_container_log(CleanupOutcome::Kept {
+                code: ErrorCode::FailedPrecondition,
+            });
+        let got = RuntimeDeleteResult::from(&resp);
+        assert_eq!(got.image_rootfs, RuntimeCleanupOutcome::AlreadyAbsent);
+        assert_eq!(
+            got.supervisor_log,
+            RuntimeCleanupOutcome::Kept {
+                code: CriErrorCode::Timeout
+            }
+        );
+        assert_eq!(
+            got.container_log,
+            RuntimeCleanupOutcome::Kept {
+                code: CriErrorCode::FailedPrecondition
+            }
         );
     }
 

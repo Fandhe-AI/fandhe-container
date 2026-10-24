@@ -10,7 +10,6 @@
 
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -52,14 +51,25 @@ impl LaunchedProcess for Fake {
 struct TempRoot(PathBuf);
 
 impl TempRoot {
+    /// 0700 で排他的に作る（既存エントリは採用せず、別名で再試行する。共有 `/tmp` での symlink 差し替えを避ける。SEC-1）。
     fn new(tag: &str) -> Self {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let p = std::env::temp_dir().join(format!("fc-hand-it-{tag}-{}-{n}", std::process::id()));
-        std::fs::create_dir_all(&p).unwrap();
-        Self(p)
+        use std::os::unix::fs::DirBuilderExt as _;
+        for attempt in 0..64u32 {
+            let n = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let p = std::env::temp_dir().join(format!(
+                "fc-hand-it-{tag}-{}-{n}-{attempt}",
+                std::process::id()
+            ));
+            match std::fs::DirBuilder::new().mode(0o700).create(&p) {
+                Ok(()) => return Self(p),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => panic!("create temp root: {e}"),
+            }
+        }
+        panic!("could not create a unique temp root");
     }
 }
 
@@ -82,8 +92,10 @@ impl Rig {
     fn start(tag: &str, with_process: bool, with_fd: bool) -> Self {
         let root = TempRoot::new(tag);
         let dir = root.0.join(tag);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        }
         let id = ContainerId::new(tag).unwrap();
         let listener = ControlListener::bind(&root.0, &id).unwrap();
         let slot = SignalSlot::new();

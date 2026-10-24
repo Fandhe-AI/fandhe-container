@@ -414,3 +414,57 @@ fn sup6_build_request_validates_before_anything_else() {
         ErrorCode::InvalidArgument
     );
 }
+
+/// SUP-6・CORE-3・#2626: 委譲スコープでの再実行の argv・環境は固定（systemd-run の引数 + 自分 + 元の argv。目印の環境変数つき）。
+#[test]
+fn sup6_core3_scoped_command_is_fixed() {
+    use std::ffi::OsString;
+    let cmd = scoped_command(
+        std::path::Path::new("/usr/bin/systemd-run"),
+        std::path::Path::new("/opt/fc/fandhe-container"),
+        ["--root", "/r", "exec", "c1", "/bin/true"].map(OsString::from),
+        std::ffi::OsStr::new("/run/user/1000"),
+    );
+    assert_eq!(cmd.get_program(), "/usr/bin/systemd-run");
+    let args: Vec<_> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "--user",
+            "--scope",
+            "--quiet",
+            "-p",
+            "Delegate=yes",
+            "--",
+            "/opt/fc/fandhe-container",
+            "--root",
+            "/r",
+            "exec",
+            "c1",
+            "/bin/true"
+        ]
+    );
+    let envs: Vec<_> = cmd
+        .get_envs()
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.map(|v| v.to_string_lossy().into_owned()),
+            )
+        })
+        .collect();
+    assert!(envs.contains(&("XDG_RUNTIME_DIR".into(), Some("/run/user/1000".into()))));
+    assert!(envs.contains(&(IN_SCOPE_ENV.into(), Some("1".into()))));
+}
+
+/// SUP-6・#2626: 子の終了状態の写像（通常終了は値そのまま、シグナルは 128 + s）。
+#[test]
+fn sup6_status_to_code_maps_exit_and_signal() {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::ExitStatus;
+    assert_eq!(status_to_code(ExitStatus::from_raw(7 << 8)), 7);
+    assert_eq!(status_to_code(ExitStatus::from_raw(9)), 137);
+}

@@ -1113,6 +1113,13 @@ mod tests {
         use std::io::{Read as _, Write as _};
         use std::os::fd::{AsFd as _, AsRawFd as _};
         let (a, b) = UnixStream::pair().unwrap();
+        // REPAIR-5: 送受信が無期限にブロックしないよう期限を付ける。
+        for s in [&a, &b] {
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            s.set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+        }
         let (mut read_end, write_end) = std::io::pipe().unwrap();
         let sent = send_with_fd(a.as_fd(), b"hello", write_end.as_fd()).unwrap();
         assert_eq!(sent, 5);
@@ -1132,8 +1139,17 @@ mod tests {
         w.write_all(b"x").unwrap();
         drop(w);
         drop(write_end);
-        let mut out = String::new();
-        read_end.read_to_string(&mut out).unwrap();
+        // REPAIR-5: EOF 待ちは別スレッド + 期限付きの受信で上限を設ける（書き端が漏れていても無期限に待たない）。
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = String::new();
+            let r = read_end.read_to_string(&mut out).map(|_| out);
+            let _ = tx.send(r);
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("pipe EOF within the deadline")
+            .unwrap();
         assert_eq!(out, "x");
     }
 
@@ -1147,6 +1163,11 @@ mod tests {
         use std::io::Write as _;
         use std::os::fd::AsFd as _;
         let (mut a, b) = UnixStream::pair().unwrap();
+        // REPAIR-5: 受信が無期限にブロックしないよう期限を付ける。
+        a.set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        b.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
         a.write_all(b"abc").unwrap();
         let mut buf = [0u8; 8];
         let got = recv_with_fds(b.as_fd(), &mut buf).unwrap();

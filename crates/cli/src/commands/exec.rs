@@ -15,6 +15,12 @@
 //!    `pidfd_open` する縮退はしない。SEC-1）
 //! 5. `run_command_with_pidfd` を呼ぶ（監査 sink を必須引数として渡す）
 //!
+//! 委譲スコープ（#2626 の review 対応）: core の cgroup 参加は移動元と移動先の共通祖先への書き込み権を要するため、
+//! ログインセッションの cgroup からでは `PermissionDenied` になる。`run_exec` は 1 の検査と「稼働中か」の確認の後、
+//! 自分自身を `systemd-run --user --scope -p Delegate=yes --` で再実行し（目印の環境変数で再帰を止める）、
+//! スコープ内の実行が 2〜5 を行う。親は子の終了コードを引き継ぐ。計測（`OpRecorder`、操作名 `exec`）は
+//! 実行した側が 1 回だけ行う（REPAIR-4）。
+//!
 //! 5 の呼び出しプロセスは **単一スレッド** でなければならない（`setns` は多スレッドを拒否する。core の
 //! `fork_single_threaded` が実行時にも強制する）。本 module は 1〜4 でスレッドを起こさない（`plugin_backend` を通る
 //! 非 Linux の経路は別）。pidfd（`OwnedFd`）は関数を抜けると閉じ、コマンドへは渡らない（core が `execveat` の前に
@@ -60,26 +66,34 @@ pub(super) fn run_exec(
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::ffi::{OsStr, OsString};
     use std::os::fd::{AsFd as _, BorrowedFd};
+    use std::os::unix::process::ExitStatusExt as _;
     use std::path::Path;
+    use std::process::Command;
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::audit_log::{AuditSink, AuditedRejection};
     use fandhe_container_core::exec::{ChildExit, ExecExit};
+    use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::OCI_EXIT_INTERNAL;
     use fandhe_container_core::traits::{
         ContainerId, ContainerState, ErrorCode, GetStateRequest, StateRecord, StateStore,
         TraitError,
     };
+    use fandhe_container_supervisor::control::listener::effective_uid;
     use fandhe_container_supervisor::control::{ExecPidfdSource, production_exec_pidfd_source};
     use fandhe_container_supervisor::exec::{
         AuditedOutcome, ExecRequest, default_audit_sink, run_command_with_pidfd,
     };
+    use fandhe_container_supervisor::start_client::locate_systemd_run;
+    use fandhe_container_supervisor::start_contract::USER_SCOPE_WRAPPER_ARGS;
+    use fandhe_container_supervisor::user_scope::user_manager_env;
 
     use super::super::CliExit;
     use super::super::args::{ExecArgs, GlobalArgs};
     use super::super::create_start::open_store;
-    use super::super::list_logs::store_open_failure;
+    use super::super::list_logs::{record_op, store_open_failure};
     use crate::error::CliError;
 
     /// pidfd の受け渡しに割り当てる上限（全体の期限の内側で打ち切る。REPAIR-5）。
@@ -188,18 +202,121 @@ mod linux {
         }
     }
 
+    /// 委譲スコープの内側で動いていることを子へ伝える環境変数（再実行の無限再帰を止める目印）。
+    /// 偽装されても exec 側の cgroup 参加が `PermissionDenied` で fail-closed になるだけで、権限は増えない。
+    const IN_SCOPE_ENV: &str = "FANDHE_CONTAINER_EXEC_IN_USER_SCOPE";
+
+    /// 委譲スコープで再実行するコマンドを組む（`systemd-run --user --scope ... -- <自分> <元の argv>`。シェルも文字列連結も使わない）。
+    fn scoped_command(
+        systemd_run: &Path,
+        exe: &Path,
+        argv: impl IntoIterator<Item = OsString>,
+        xdg: &OsStr,
+    ) -> Command {
+        let mut cmd = Command::new(systemd_run);
+        cmd.args(USER_SCOPE_WRAPPER_ARGS);
+        cmd.arg(exe);
+        cmd.args(argv);
+        cmd.env("XDG_RUNTIME_DIR", xdg);
+        cmd.env(IN_SCOPE_ENV, "1");
+        cmd
+    }
+
+    /// 子プロセスの終了状態を exec の終了コードへ写す（シグナル終了は `128 + s`。範囲外は `OCI_EXIT_INTERNAL`）。
+    fn status_to_code(status: std::process::ExitStatus) -> u8 {
+        let code = match (status.code(), status.signal()) {
+            (Some(c), _) => u8::try_from(c).ok(),
+            (None, Some(s)) => s.checked_add(128).and_then(|c| u8::try_from(c).ok()),
+            (None, None) => None,
+        };
+        code.unwrap_or(OCI_EXIT_INTERNAL.get())
+    }
+
+    /// 呼び出しプロセスを user マネージャの委譲スコープへ移すため、自分自身を `systemd-run --user --scope` で再実行する。
+    ///
+    /// core の cgroup 参加（`exec/cgroup_join.rs`）は移動元と移動先の共通祖先の `cgroup.procs` への書き込み権を要する。
+    /// ログインセッションの cgroup からでは祖先が root 所有で `PermissionDenied` になるため、user マネージャ配下
+    /// （委譲済み）の scope で実行する。systemd-run は scope 登録後に同じプロセスでコマンドを exec する。
+    /// 再実行した子が終了コードと stderr の構造化エラー行を決め、親は終了コードだけを引き継ぐ（stdio は継承）。
+    /// 前提（systemd-run・user マネージャ）が満たせないときは exec せず失敗する（fail-closed）。
+    fn rerun_in_user_scope() -> CliExit {
+        let fail = |code: ErrorCode, msg: &str| CliExit::Error(CliError::new(code, msg));
+        let euid = match effective_uid() {
+            Ok(u) => u,
+            Err(e) => return failure(&e),
+        };
+        let systemd_run = match locate_systemd_run(euid) {
+            Ok(p) => p,
+            Err(e) => return fail(e.code(), e.message()),
+        };
+        let xdg = match user_manager_env(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), euid) {
+            Ok(x) => x,
+            Err(e) => return fail(ErrorCode::FailedPrecondition, e.message()),
+        };
+        let Ok(exe) = std::env::current_exe() else {
+            return fail(
+                ErrorCode::FailedPrecondition,
+                "cannot resolve the cli executable path",
+            );
+        };
+        let mut cmd = scoped_command(&systemd_run, &exe, std::env::args_os().skip(1), &xdg);
+        match cmd.status() {
+            Ok(status) => CliExit::Executed(status_to_code(status)),
+            Err(_) => fail(
+                ErrorCode::Unavailable,
+                "failed to run the command in a user scope",
+            ),
+        }
+    }
+
     /// 本番入口の `exec`。コマンドの終了コードで終了し（stderr は空）、基盤側の失敗は構造化エラー 1 行で終了する。
+    ///
+    /// 不正入力・コンテナ不在・非稼働は委譲スコープへ移る前に断る。通ったら（まだ委譲スコープの外なら）自分自身を
+    /// 委譲スコープで再実行し、スコープ内の実行が本体を行う。全体の成否とレイテンシは 1 回だけ計測する（REPAIR-4）。
     pub(in super::super) fn run_exec(global: &GlobalArgs, args: &ExecArgs) -> CliExit {
+        let started = Instant::now();
+        let recorder = OpRecorder::new();
+        let (exit, delegated) = run_exec_inner(global, args);
+        // 委譲スコープでの再実行の親は、子が自分の分を記録するため記録しない（二重計上を避ける）。
+        if !delegated {
+            record_op(&recorder, "exec", is_ok(&exit), started);
+        }
+        exit
+    }
+
+    fn is_ok(exit: &CliExit) -> bool {
+        matches!(exit, CliExit::Success | CliExit::Executed(0))
+    }
+
+    /// 戻り値の後ろは「委譲スコープで再実行した（計測は子が行う）」かどうか。
+    fn run_exec_inner(global: &GlobalArgs, args: &ExecArgs) -> (CliExit, bool) {
         let prepared = ContainerId::new(args.id.as_str())
             .and_then(|id| build_request(args).map(|request| (id, request)));
         let (id, request) = match prepared {
             Ok(v) => v,
-            Err(e) => return failure(&e),
+            Err(e) => return (failure(&e), false),
         };
         let store = match open_store(global) {
             Ok(s) => s,
-            Err(e) => return store_open_failure(&e),
+            Err(e) => return (store_open_failure(&e), false),
         };
+        if std::env::var_os(IN_SCOPE_ENV).is_none() {
+            // 早期の拒否（不在・非稼働）は再実行の前に返す。
+            match store.get(&GetStateRequest::new(id.clone())) {
+                Err(e) => return (failure(&e), false),
+                Ok(r) if r.status().state() != ContainerState::Running => {
+                    return (
+                        failure(&TraitError::new(
+                            ErrorCode::FailedPrecondition,
+                            "container is not running",
+                        )),
+                        false,
+                    );
+                }
+                Ok(_) => {}
+            }
+            return (rerun_in_user_scope(), true);
+        }
         let source = production_exec_pidfd_source(&store);
         let result = exec_in_container(
             &store,
@@ -211,8 +328,8 @@ mod linux {
             args.timeout,
         );
         match result {
-            Ok(code) => CliExit::Executed(code),
-            Err(e) => failure(&e),
+            Ok(code) => (CliExit::Executed(code), false),
+            Err(e) => (failure(&e), false),
         }
     }
 

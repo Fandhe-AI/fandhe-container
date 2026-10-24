@@ -21,7 +21,7 @@
 //!
 //! # 未対応（REPAIR-3: 実装済みを装わない）
 //!
-//! launcher・CLI・stack（TOML）からの配線、uid / gid 指定、単一ファイルの bind 注入（既存ディレクトリへ
+//! CLI・stack（TOML）からの配線（launcher への配線は `oci_runtime::LaunchOptions` で済み。#2625）、uid / gid 指定、単一ファイルの bind 注入（既存ディレクトリへ
 //! 1 ファイルだけ見せる）、利用者 tmpfs の配下への注入、環境変数由来の内容。
 
 use crate::oci_runtime::{CONFIG_MAX_PATH_BYTES, MountDestination};

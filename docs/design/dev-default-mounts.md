@@ -96,7 +96,7 @@ bind したマウントへの `nosuid`・`noexec` は付与しない（#1659 の
 
 ## 5. 実装 issue（2h 粒度。#54 配下）
 
-本番 launcher への配線は #1816 で済んだ（`PrePivotSetup.devices`）。最小入口 `spawn_container` はこれらを呼ばない。`--ipc=host` 等の結線は #2625。
+本番 launcher への配線は #1816 で済んだ（`PrePivotSetup.devices`）。最小入口 `spawn_container` はこれらを呼ばない。`--ipc=host`・`--shm-size`・`--tmpfs`・secrets の起動オプションは #2625 で本番 launcher へ結線済み（core の `oci_runtime::LaunchOptions`。`--ipc=host` は IPC namespace を作らず `/dev/shm` を載せず Landlock を `WithoutShm` にする）。CLI から supervisor への受け渡し、ホストの `/dev/shm` の bind は未実装。
 
 | 順 | issue | 旧分割案 | 内容 | 依存 | ID |
 | -- | ----- | -------- | ---- | ---- | -- |

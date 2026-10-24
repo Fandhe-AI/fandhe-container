@@ -72,7 +72,7 @@
 //! - `linux.namespaces` に user namespace が無い（`process.user` がホストの uid として働いてしまう。
 //!   `PermissionDenied`。SEC-5）
 //! - `linux.namespaces` に IPC namespace が無い（ホストの IPC を共有する起動を防ぐ。共有の明示許可は
-//!   未実装のため必須。`InvalidArgument`。SEC-1）
+//!   launcher の起動オプション〔`LaunchOptions` の `Host`。SUP-12・#2625〕だけで、config.json からは外せないため必須。`InvalidArgument`。SEC-1）
 //! - `linux.namespaces` に PID・mount・UTS namespace が無い（CORE-1 の最小分離〔PID/mount/UTS/IPC〕を
 //!   欠く起動を防ぐ。UTS は hostname 指定の有無にかかわらず必須で、無いとホストの hostname を共有・
 //!   変更し得る。`InvalidArgument`。SEC-1）
@@ -838,8 +838,8 @@ fn build_spec(
             "the PID and mount namespaces are required",
         ));
     }
-    // IPC namespace が無いとホストの IPC（SysV IPC・POSIX メッセージキュー）を共有する。共有を明示許可する
-    // 仕組みが無いため fail-closed で必須とする（SEC-1）。
+    // IPC namespace が無いとホストの IPC（SysV IPC・POSIX メッセージキュー）を共有する。共有の明示許可は
+    // launcher の起動オプション（`LaunchOptions` の `Host`。#2625）だけで、config.json からは外せない。fail-closed で必須とする（SEC-1）。
     if !has(NamespaceKind::Ipc) {
         return Err(TraitError::new(
             ErrorCode::InvalidArgument,

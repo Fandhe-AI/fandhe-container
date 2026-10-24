@@ -2003,6 +2003,7 @@ mod linux {
     };
 
     use super::*;
+    use crate::container_options::ContainerOptions;
     use crate::id_model::{
         RootlessIdResolution, SYSTEM_PASSWD, SYSTEM_SUBGID, SYSTEM_SUBUID,
         resolve_rootless_id_source,
@@ -2098,6 +2099,9 @@ mod linux {
         seccomp: Option<Arc<SeccompNotifyHub>>,
         /// 監査の網羅を満たせない環境への方針（`with_audit_policy`。既定 `BestEffort`。SEC-4・#2027）。
         audit_policy: AuditCoveragePolicy,
+        /// 起動オプション（`with_container_options`。`--ipc`・`--shm-size`・`--tmpfs`・secrets / configs。SUP-12・#2625）。
+        /// 既定（指定なし）は従来の動作と同じ。
+        container_options: ContainerOptions,
     }
 
     /// 決めた権限モデルと、範囲写像のときの入力元（#2243・CORE-6）。
@@ -2209,7 +2213,21 @@ mod linux {
                 companions: Vec::new(),
                 seccomp: None,
                 audit_policy: AuditCoveragePolicy::default(),
+                container_options: ContainerOptions::default(),
             }
+        }
+
+        /// 起動オプション（`--ipc`・`--shm-size`・`--tmpfs`・secrets / configs）を設定する（SUP-12・CORE-5・#2625）。
+        ///
+        /// 手順 4 が矛盾（`--ipc=host` と `--shm-size` 等。ファイルは読まない）を cgroup の連鎖より前に拒否し、手順 7 の
+        /// `build_launcher` が [`ContainerOptions::launch_options`] を本番 launcher へ渡す。restart の再 launch も同じ
+        /// launcher を使うので同じ指定が効く。ホストの secrets のファイルは手順 7 で一度だけ読み、launcher が保持する
+        /// （supervisor は non-dumpable。範囲写像の経路で holder が継承するメモリの露出は未解決で #2628）。
+        /// CLI からの受け渡しは未実装（`run_main` は既定のまま。REPAIR-3）。
+        #[must_use]
+        pub fn with_container_options(mut self, options: ContainerOptions) -> Self {
+            self.container_options = options;
+            self
         }
 
         /// 監査の網羅を満たせない環境への方針を設定する（`--audit-policy`。start と restart の再 launch が同じ launcher を
@@ -2308,6 +2326,8 @@ mod linux {
         /// `ProductionLauncherBuilder::build` は child subreaper 化の副作用を持つため、ここでは呼ばない。
         fn check_launcher_available(&self) -> Result<(), TraitError> {
             self.privilege.clone()?;
+            // 起動オプションの矛盾は cgroup の連鎖の前に拒否する（ファイルは読まない純粋な検証。手順 7 が変換の本体）。
+            self.container_options.implicit_dev_mounts()?;
             // 確実な層（seccomp の ERRNO 側の USER_NOTIF）の応答者が無い構成は起動しない（fail-closed。SEC-4・#2027）。
             if self.seccomp.is_none() {
                 return Err(seccomp_audit_unavailable());
@@ -2446,7 +2466,11 @@ mod linux {
                 Some(sink) => builder.rejection_audit_sink(Arc::clone(sink)),
                 None => builder,
             };
+            // 起動オプションの変換（secrets のファイル読み取りを含む）は fork 前の単一スレッドのこの手順で行う。失敗は
+            // 手順 5〜7 の他の失敗と同じ経路で後始末される（SUP-12・#2625）。
+            let launch_options = self.container_options.launch_options()?;
             let launcher = builder
+                .launch_options(launch_options)
                 .cgroup_join_source(move || source.join_hook())
                 .applied_resource_limits(held.applied_resources.clone())
                 .build()?;

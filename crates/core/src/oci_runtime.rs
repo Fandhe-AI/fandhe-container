@@ -41,6 +41,7 @@ mod image_refs;
 mod image_rootfs;
 mod kill;
 mod launch;
+mod launch_options;
 mod launcher;
 mod mount_destination;
 pub(crate) mod mountinfo_identity;
@@ -99,6 +100,7 @@ pub use launch::{
     RootfsDir, RootfsPinError, START_TIMEOUT_MAX, StartTimeouts, pin_bundle_rootfs,
     pin_bundle_rootfs_audited,
 };
+pub use launch_options::{LaunchIpcMode, LaunchOptions};
 pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
 #[cfg(target_os = "linux")]
 pub use launcher::{SubordinateIdMaps, SubordinateIdSource};

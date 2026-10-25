@@ -41,7 +41,7 @@
 //!   `net.*`（pod の netns の結線 #2675 が前提）と UTS 系（`kernel.hostname`・`kernel.domainname`）は `UNIMPLEMENTED`、
 //!   文法違反・名前空間を持たないキー（`kernel.panic`・`vm.*` 等）・不正な値は `INVALID_ARGUMENT`。
 //! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（log_path・dns_config・port_mappings・cgroup_parent・
-//!   devices・stop_signal・capabilities の add / ambient・supplemental_groups・propagation 等）の受け入れ順序と担当は
+//!   devices・capabilities の add / ambient・supplemental_groups・propagation 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 //! - `linux.cgroup_parent` の受け入れ方針（オーナー承認待ち。判断が出るまで `UNIMPLEMENTED`）は
 //!   `docs/design/cri-cgroup-parent.md`（#2672・CRI-2・CORE-4）にまとめている。
@@ -803,9 +803,9 @@ fn build_inner(
     if !container.devices.is_empty() || !container.cdi_devices.is_empty() {
         return Err(unsupported("devices"));
     }
-    if container.stop_signal != 0 {
-        return Err(unsupported("stop_signal"));
-    }
+    // stop_signal は config.json に出さない（OCI の config に欄が無い）。停止時に StopRequest で運ぶため、
+    // ここでは値域だけを検証する（未知の値は INVALID_ARGUMENT。CRI-2・#2668）。
+    crate::stop_signal::linux_stop_signal(container.stop_signal)?;
     if !container.log_path.is_empty() || !sandbox.log_directory.is_empty() {
         return Err(unsupported("log_path"));
     }

@@ -10,7 +10,7 @@
 //!   `start_contract::cli_receive_deadline`。REPAIR-5）。報告された pid を状態ストアの記録と照合し、Running で pid が
 //!   一致するか、直後に終了して Stopped が記録済みのときだけ成功とする。それ以外は `INTERNAL` で fail-closed。
 //! - `kill`: 意図なしの `ProcessSignaler` で core の `oci_runtime::kill` を呼ぶ（終了は待たない）。
-//! - `stop`: SIGTERM を stop の意図つきで送り（SUP-9。supervisor が意図を記録してから届けるので、`always` /
+//! - `stop`: `StopRequest::signal`（既定 SIGTERM。CRI の stop_signal。#2668）を stop の意図つきで送り（SUP-9。supervisor が意図を記録してから届けるので、`always` /
 //!   `on-failure` / `unless-stopped` でも再起動されない）、`grace` まで Stopped への遷移を状態ストアで待ち、超えたら
 //!   SIGKILL を送って最長 [`STOP_KILL_WAIT`] 待つ。待っても Stopped にならなければ `TIMEOUT`。全体の上限は
 //!   `grace + 2 × (KillTimeout + 1 秒) + STOP_KILL_WAIT` で有界（REPAIR-5）。
@@ -272,7 +272,7 @@ impl SupervisedLifecycle {
         kill(store, recorder, &signaler, req, &KillTimeout::default()).map_err(to_trait_error)
     }
 
-    /// SIGTERM（stop の意図つき）→ `grace` 待ち → SIGKILL → 最長 [`STOP_KILL_WAIT`] 待ち。
+    /// `req.signal()`（既定 SIGTERM。stop の意図つき）→ `grace` 待ち → SIGKILL → 最長 [`STOP_KILL_WAIT`] 待ち。
     pub fn stop(
         &self,
         store: &dyn StateStore,
@@ -302,12 +302,12 @@ impl SupervisedLifecycle {
             }
         }
         let term = self.signalers.for_stop(store);
-        let sigterm = KillRequest::new(id.clone(), Signal::SIGTERM);
-        send_or_observe_exit(store, recorder, &term, &sigterm)?;
+        let first = KillRequest::new(id.clone(), req.signal());
+        send_or_observe_exit(store, recorder, &term, &first)?;
         if let Some(s) = wait_stopped(store, id, req.grace())? {
             return Ok(s);
         }
-        // 意図は SIGTERM の段階で記録済みのため、SIGKILL は意図なしの signaler で送る。
+        // 意図は最初のシグナルの段階で記録済みのため、SIGKILL は意図なしの signaler で送る。
         let plain = self.signalers.plain(store);
         let sigkill = KillRequest::new(id.clone(), Signal::SIGKILL);
         send_or_observe_exit(store, recorder, &plain, &sigkill)?;

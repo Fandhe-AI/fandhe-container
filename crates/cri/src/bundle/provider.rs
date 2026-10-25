@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use fandhe_container_core::traits::ContainerId;
 
-use super::spec::{ImageDefaults, build_runtime_config, validate_config};
+use super::spec::{ImageDefaults, build_runtime_config_with_pod_netns, validate_config};
 use crate::adapter::{BundleProvider, BundleRequest};
 use crate::error::CriError;
 use crate::runtime::v1::ImageSpec;
@@ -308,7 +308,12 @@ impl BundleProvider for SpecBundleProvider {
         };
         let built = (|| {
             let defaults = self.rootfs.prepare(image, &rootfs, &user)?;
-            let json = build_runtime_config(req.sandbox_config, req.config, &defaults)?;
+            let json = build_runtime_config_with_pod_netns(
+                req.sandbox_config,
+                req.config,
+                &defaults,
+                req.pod_netns_path.and_then(|p| p.to_str()),
+            )?;
             write_new_file(&dir.join("config.json"), json.as_bytes())
         })();
         if let Err(e) = built {

@@ -47,6 +47,12 @@ struct Script {
     attach_leftover: usize,
     /// 次の delete_network を失敗させ、渡されたハンドルを全部 retry に返す回数。
     fail_delete: u32,
+    /// netns の事前作成・解放の呼び出し列（`calls` とは別に持ち、既存の期待列を変えない）。
+    netns_calls: Vec<String>,
+    /// create_netns を失敗させるか。
+    fail_create_netns: bool,
+    /// 次の release_netns を失敗させる回数。
+    fail_release: u32,
 }
 
 #[derive(Clone, Default)]
@@ -55,6 +61,9 @@ struct Fake(Arc<Mutex<Script>>);
 impl Fake {
     fn calls(&self) -> Vec<String> {
         self.0.lock().expect("lock").calls.clone()
+    }
+    fn netns_calls(&self) -> Vec<String> {
+        self.0.lock().expect("lock").netns_calls.clone()
     }
 }
 
@@ -106,6 +115,27 @@ impl NetsetupBackend for Fake {
         } else {
             Err(TraitError::new(ErrorCode::Internal, "reclaim failed"))
         }
+    }
+
+    fn create_netns(&self, _network: &mut String, endpoint: &EndpointId) -> Result<(), TraitError> {
+        let mut s = self.0.lock().expect("lock");
+        s.netns_calls
+            .push(format!("create_netns {}", endpoint.as_str()));
+        if s.fail_create_netns {
+            return Err(TraitError::new(ErrorCode::Internal, "create_netns failed"));
+        }
+        Ok(())
+    }
+
+    fn release_netns(&self, endpoint: &EndpointId) -> Result<(), TraitError> {
+        let mut s = self.0.lock().expect("lock");
+        s.netns_calls
+            .push(format!("release_netns {}", endpoint.as_str()));
+        if s.fail_release > 0 {
+            s.fail_release -= 1;
+            return Err(TraitError::new(ErrorCode::Internal, "release failed"));
+        }
+        Ok(())
     }
 
     fn attach(
@@ -858,4 +888,275 @@ fn net1_persist_failure_is_reported_and_memory_record_kept() {
     net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
         .expect("reclaimed from memory");
     std::fs::remove_dir_all(&root).expect("cleanup");
+}
+// ---- sandbox 単位の netns 作成・結線（CRI-2・NET-1・PLUG-1。#2675） ----
+
+const SB: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// 事前作成の netns は detach で解放される。解放に失敗したら記録を残し、再試行で成功する。
+#[test]
+fn net1_detach_releases_the_prepared_netns() {
+    let (net, fake) = plugin();
+    pod_network::set_up_pod(&net, &nname("a"), subnet()).expect("a");
+    net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c1")))
+        .expect("netns");
+    fake.0.lock().expect("lock").fail_release = 1;
+    let e = net
+        .detach(&DetachRequest::new(nname("a"), cid("c1")))
+        .expect_err("release fails");
+    assert_eq!(e.code(), ErrorCode::Internal);
+    net.detach(&DetachRequest::new(nname("a"), cid("c1")))
+        .expect("retry");
+    assert_eq!(
+        fake.netns_calls(),
+        vec!["create_netns c1", "release_netns c1", "release_netns c1"]
+    );
+    // 記録は消えている。
+    assert_eq!(
+        net.detach(&DetachRequest::new(nname("a"), cid("c1")))
+            .expect_err("gone")
+            .code(),
+        ErrorCode::NotFound
+    );
+}
+
+/// delete_network は未 attach の事前作成 netns も解放する（attach 済みはバックエンドの delete に任せる）。
+#[test]
+fn net1_delete_network_releases_unattached_prepared_netns() {
+    let (net, fake) = plugin();
+    pod_network::set_up_pod(&net, &nname("a"), subnet()).expect("a");
+    net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c1")))
+        .expect("c1");
+    net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c2")))
+        .expect("c2");
+    net.attach(&AttachRequest::new(nname("a"), cid("c2")))
+        .expect("attach c2");
+    // 解放の失敗ではネットワークを消さず、再試行で完了する。
+    fake.0.lock().expect("lock").fail_release = 1;
+    assert_eq!(
+        pod_network::tear_down_pod(&net, &nname("a"))
+            .expect_err("release fails")
+            .code(),
+        ErrorCode::Internal
+    );
+    assert!(!fake.calls().iter().any(|c| c.starts_with("delete_network")));
+    pod_network::tear_down_pod(&net, &nname("a")).expect("retry");
+    assert_eq!(
+        fake.netns_calls(),
+        vec![
+            "create_netns c1",
+            "create_netns c2",
+            "release_netns c1",
+            "release_netns c1"
+        ]
+    );
+    assert_eq!(fake.calls().last().unwrap(), "delete_network a [c2]");
+}
+
+/// create_netns の失敗では記録を作らない。
+#[test]
+fn net1_failed_create_netns_leaves_no_record() {
+    let (net, fake) = plugin();
+    pod_network::set_up_pod(&net, &nname("a"), subnet()).expect("a");
+    fake.0.lock().expect("lock").fail_create_netns = true;
+    assert!(
+        net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c1")))
+            .is_err()
+    );
+    fake.0.lock().expect("lock").fail_create_netns = false;
+    net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c1")))
+        .expect("retry is not AlreadyExists");
+}
+
+/// set_up_sandbox: 呼び出し列は create_network → create_netns → attach（sandbox ID が名前・コンテナ ID）。
+#[test]
+fn set_up_sandbox_calls_in_order() {
+    let (net, fake) = plugin();
+    let st = pod_network::set_up_sandbox(&net, SB, subnet()).expect("set up");
+    assert_eq!(st.name().as_str(), SB);
+    assert_eq!(
+        fake.calls(),
+        vec![
+            format!("create_network {SB} 10.89.0.1/24"),
+            format!("attach {SB} {SB}"),
+        ]
+    );
+    assert_eq!(fake.netns_calls(), vec![format!("create_netns {SB}")]);
+    pod_network::tear_down_pod(&net, &nname(SB)).expect("tear down");
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("delete_network {SB} [{SB}]")
+    );
+}
+
+/// set_up_sandbox: create_netns の失敗は delete_network で戻す。
+#[test]
+fn set_up_sandbox_rolls_back_network_when_create_netns_fails() {
+    let (net, fake) = plugin();
+    fake.0.lock().expect("lock").fail_create_netns = true;
+    let f = pod_network::set_up_sandbox(&net, SB, subnet()).expect_err("fail");
+    assert!(f.rolled_back);
+    assert_eq!(f.error.message(), "create_netns failed");
+    assert_eq!(
+        fake.calls(),
+        vec![
+            format!("create_network {SB} 10.89.0.1/24"),
+            format!("delete_network {SB} []"),
+        ]
+    );
+    // 記録が残らないので同じ sandbox を作り直せる。
+    fake.0.lock().expect("lock").fail_create_netns = false;
+    pod_network::set_up_sandbox(&net, SB, subnet()).expect("retry");
+}
+
+/// set_up_sandbox: attach の失敗は detach（netns の解放）→ delete_network の順に戻す。
+#[test]
+fn set_up_sandbox_rolls_back_in_reverse_when_attach_fails() {
+    let (net, fake) = plugin();
+    fake.0.lock().expect("lock").fail_attach = true;
+    let f = pod_network::set_up_sandbox(&net, SB, subnet()).expect_err("fail");
+    assert!(f.rolled_back);
+    assert_eq!(f.error.message(), "attach failed");
+    assert_eq!(
+        fake.netns_calls(),
+        vec![format!("create_netns {SB}"), format!("release_netns {SB}")]
+    );
+    assert_eq!(
+        fake.calls().last().unwrap(),
+        &format!("delete_network {SB} []")
+    );
+}
+
+/// set_up_sandbox: 戻しも失敗したら両方を載せた Internal で、rolled_back は偽。
+#[test]
+fn set_up_sandbox_reports_failed_rollback() {
+    let (net, fake) = plugin();
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_attach = true;
+        s.fail_release = 1;
+    }
+    let f = pod_network::set_up_sandbox(&net, SB, subnet()).expect_err("fail");
+    assert!(!f.rolled_back);
+    assert_eq!(f.error.code(), ErrorCode::Internal);
+    assert!(f.error.message().contains("attach failed"), "{}", f.error);
+    assert!(
+        f.error.message().contains("rollback detach failed"),
+        "{}",
+        f.error
+    );
+}
+
+fn parent() -> IpCidr {
+    IpCidr::new(IpAddr::V4(Ipv4Addr::new(10, 90, 0, 0)), 16).expect("parent")
+}
+
+/// サブネットの払い出し: 具体値・冪等・返却・枯渇。
+#[test]
+fn pod_subnet_pool_allocates_releases_and_exhausts() {
+    use fandhe_container_plugin_cri::pod_network::PodSubnetPool;
+    let pool = PodSubnetPool::new(parent(), 24).expect("pool");
+    let a = pool.allocate("a").expect("a");
+    assert_eq!(
+        (a.network_address(), a.prefix_len()),
+        (IpAddr::V4(Ipv4Addr::new(10, 90, 0, 0)), 24)
+    );
+    let b = pool.allocate("b").expect("b");
+    assert_eq!(b.network_address(), IpAddr::V4(Ipv4Addr::new(10, 90, 1, 0)));
+    // 冪等。
+    assert_eq!(pool.allocate("a").expect("again"), a);
+    assert_eq!(pool.in_use(), 2);
+    // 返却した枠は再利用される。
+    pool.release("a");
+    assert_eq!(pool.allocate("c").expect("c"), a);
+    // 枯渇。
+    let small = PodSubnetPool::new(
+        IpCidr::new(IpAddr::V4(Ipv4Addr::new(10, 91, 0, 0)), 23).expect("p"),
+        24,
+    )
+    .expect("small");
+    small.allocate("x").expect("x");
+    small.allocate("y").expect("y");
+    assert_eq!(
+        small.allocate("z").expect_err("full").code(),
+        ErrorCode::ResourceExhausted
+    );
+    // 不正な分割。
+    for (len, pod) in [(16u8, 16u8), (24, 16), (16, 31), (8, 30)] {
+        let p = IpCidr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), len).expect("p");
+        assert_eq!(
+            PodSubnetPool::new(p, pod).expect_err("bad").code(),
+            ErrorCode::InvalidArgument,
+            "{len}/{pod}"
+        );
+    }
+}
+
+fn provider_with(fake: &Fake) -> fandhe_container_plugin_cri::pod_network::NetsetupPodNetwork {
+    use fandhe_container_plugin_cri::pod_network::{NetsetupPodNetwork, PodSubnetPool};
+    let net: Arc<dyn NetworkPlugin> = Arc::new(NetsetupNetwork::new(fake.clone()));
+    NetsetupPodNetwork::new(
+        net,
+        std::path::PathBuf::from(if cfg!(windows) {
+            r"C:\state\.netns"
+        } else {
+            "/state/.netns"
+        }),
+        PodSubnetPool::new(parent(), 24).expect("pool"),
+    )
+}
+
+/// provider: set_up は netns のパスを返し、tear_down は冪等で枠を返す。
+#[test]
+fn pod_network_provider_set_up_and_tear_down() {
+    use fandhe_container_cri::adapter::{PodNetworkProvider, PodNetworkRequest};
+    use fandhe_container_cri::runtime::v1::PodSandboxConfig;
+    let fake = Fake::default();
+    let provider = provider_with(&fake);
+    let cfg = PodSandboxConfig::default();
+    let netns = provider
+        .set_up(&PodNetworkRequest::new(SB, &cfg))
+        .expect("set up");
+    let expected = std::path::PathBuf::from(if cfg!(windows) {
+        r"C:\state\.netns"
+    } else {
+        "/state/.netns"
+    })
+    .join(SB);
+    assert_eq!(netns.path(), expected);
+    assert_eq!(fake.calls()[0], format!("create_network {SB} 10.90.0.1/24"));
+    provider.tear_down(SB).expect("tear down");
+    // 冪等: 解放済み・未知は成功。
+    provider.tear_down(SB).expect("again");
+    provider.tear_down(&"f".repeat(64)).expect("unknown");
+    // 不正な ID はエラー。
+    assert!(provider.tear_down("bad_id").is_err());
+}
+
+/// provider: 巻き戻しが完了した失敗は枠を返し、次の set_up が同じ枠から始まる。
+#[test]
+fn pod_network_provider_reuses_the_subnet_after_a_clean_rollback() {
+    use fandhe_container_cri::adapter::{PodNetworkProvider, PodNetworkRequest};
+    use fandhe_container_cri::runtime::v1::PodSandboxConfig;
+    let fake = Fake::default();
+    let provider = provider_with(&fake);
+    let cfg = PodSandboxConfig::default();
+    fake.0.lock().expect("lock").fail_attach = true;
+    assert!(provider.set_up(&PodNetworkRequest::new(SB, &cfg)).is_err());
+    fake.0.lock().expect("lock").fail_attach = false;
+    provider
+        .set_up(&PodNetworkRequest::new(SB, &cfg))
+        .expect("retry");
+    let creates: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("create_network"))
+        .collect();
+    assert_eq!(
+        creates,
+        vec![
+            format!("create_network {SB} 10.90.0.1/24"),
+            format!("create_network {SB} 10.90.0.1/24")
+        ]
+    );
 }

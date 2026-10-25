@@ -105,6 +105,9 @@
 //! - peer の `eth0` へのリネーム（`LinkSet` に `IFLA_IFNAME` 変更が無い）、コンテナ単位のポート公開解除
 //!   （ルールハンドルの取得経路が無い）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
 //! - IPAM 状態の永続化とプロセスをまたぐ残置 pin の清掃、コンテナ単体の切り離し。担当 Issue 未確定（作成失敗の請求書の永続化は #2604 で済み）
+//! - netns の事前作成（`create_container_netns`・`attach_prepared_container`・`release_container_netns`。#2675）は
+//!   作成と pin だけを切り出した入口で、コンテナがその netns へ入る側（core）は未実装。未 attach の
+//!   `PreparedNetns` は呼び出し側が必ず解放する（Drop では unpin しない）
 //! - IPv6 と `NftFamily::Inet`（IPv4 のみ。静的 IPAM が IPv4 のみのため）
 
 pub mod delete;
@@ -1327,6 +1330,65 @@ pub(crate) fn host_owner_token(bridge_token: &str, endpoint: &EndpointId) -> Str
     format!("{bridge_token}/ep/{}", endpoint.as_str())
 }
 
+/// attach の前に作って pin した netns（#2675・NET-1・CRI-2・PLUG-1）。
+///
+/// [`create_container_netns`] が作り、[`attach_prepared_container`] が使う。CRI の POD モードは「netns が
+/// コンテナの作成より前に存在する」ため、`attach_container` が netns の作成を内部で行う形とは別に、作成だけを
+/// 先に行える入口として持つ。pin のファイルと fd を所有し、手放すときは [`release_container_netns`]
+/// （unpin）か attach の成功（以後は `AttachedContainer::netns` が所有）で行う。**Drop では unpin しない**
+/// （pin は mount でプロセスの外に残るため。放置すると pin が残る。呼び出し側が必ず解放すること）。
+/// 未 attach の間は netns 内の route ソケットを fd として 1 本保持する（件数は呼び出し側の上限で有界）。
+#[derive(Debug)]
+pub struct PreparedNetns<N> {
+    netns: N,
+    pin_dir_id: (u64, u64),
+    endpoint: EndpointId,
+    dir: PathBuf,
+}
+
+impl<N> PreparedNetns<N> {
+    /// このエンドポイント ID 用の netns。
+    pub fn endpoint(&self) -> &EndpointId {
+        &self.endpoint
+    }
+
+    /// pin 先のパス（`<置き場>/<エンドポイント ID>`）。
+    pub fn pin_path(&self) -> PathBuf {
+        self.dir.join(self.endpoint.as_str())
+    }
+}
+
+/// 解除の失敗（原因と、解除できなかった netns）。`Err` を小さく保つため Box。
+type ReleaseFailure<N> = Box<(NetError, PreparedNetns<N>)>;
+
+/// 接続手順の失敗（原因と、事前作成の netns を使った場合に unpin せず返すその netns）。`Err` を小さく保つため Box。
+type AttachFailure<N> = Box<(ContainerAttachError, Option<PreparedNetns<N>>)>;
+
+/// 事前作成した netns を unpin する（未 attach のまま不要になったとき）。失敗時はハンドルを返して再試行できる。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn release_prepared_with<O: AttachOps>(
+    ops: &O,
+    prepared: PreparedNetns<O::Netns>,
+) -> Result<(), ReleaseFailure<O::Netns>> {
+    let PreparedNetns {
+        netns,
+        pin_dir_id,
+        endpoint,
+        dir,
+    } = prepared;
+    ops.unpin_netns(netns).map_err(|f| {
+        Box::new((
+            f.error,
+            PreparedNetns {
+                netns: f.netns,
+                pin_dir_id,
+                endpoint,
+                dir,
+            },
+        ))
+    })
+}
+
 /// 接続手順が使うカーネル操作の境界。Linux 実装とテストの fake を差し替えるための crate 内部トレイトで、
 /// 公開の拡張点（PLUG-1）ではない。[`NetworkOps`] とは独立（ネットワーク作成のテストに影響させない）。
 pub(crate) trait AttachOps {
@@ -1457,77 +1519,138 @@ pub(crate) fn attach_container_with<O: AttachOps>(
     ipam: &mut StaticIpam,
     ports: &mut PortRegistry,
 ) -> Result<AttachedContainer<O::Netns>, ContainerAttachError> {
+    attach_with_source(ops, spec, None, ipam, ports).map_err(|failure| failure.0)
+}
+
+/// 事前に作って pin した netns へ接続する版の手順本体（#2675・NET-1・CRI-2）。
+///
+/// [`attach_container_with`] との違いは netns を作らず `prepared` を使うことだけで、後半（veth・アドレス・
+/// route・DNAT）は同じ。失敗時は veth・IPAM の払い出し・受け口の予約を同じ規則で戻すが、**netns は unpin せず**
+/// 呼び出し側へ返す（netns の寿命は事前に作った側が持つ。`PreparedNetns` の doc）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn attach_prepared_with<O: AttachOps>(
+    ops: &O,
+    spec: &ContainerAttachSpec,
+    prepared: PreparedNetns<O::Netns>,
+    ipam: &mut StaticIpam,
+    ports: &mut PortRegistry,
+) -> Result<AttachedContainer<O::Netns>, AttachFailure<O::Netns>> {
+    attach_with_source(ops, spec, Some(prepared), ipam, ports)
+}
+
+/// [`attach_container_with`]・[`attach_prepared_with`] の共通本体。`source` が `Some` なら netns を作らず、
+/// 失敗時はその netns を unpin せずに返す。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn attach_with_source<O: AttachOps>(
+    ops: &O,
+    spec: &ContainerAttachSpec,
+    source: Option<PreparedNetns<O::Netns>>,
+    ipam: &mut StaticIpam,
+    ports: &mut PortRegistry,
+) -> Result<AttachedContainer<O::Netns>, AttachFailure<O::Netns>> {
     let fail = |error, step, rollback| ContainerAttachError {
         error,
         step,
         rollback,
     };
-    let names = VethNames::derive(&spec.endpoint)
-        .map_err(|e| fail(e, AttachStep::DeriveNames, AttachRollbackReport::default()))?;
-
-    // default route の gateway（bridge アドレス）は IPv4 に限る。何かを作る前に確認する。
-    let IpAddr::V4(gateway) = spec.gateway.addr() else {
-        return Err(fail(
-            NetError::new(
-                NetErrorCode::FailedPrecondition,
-                "network gateway is not an IPv4 address",
+    // 事前作成の netns が別のエンドポイント・置き場のものなら、何も作らず拒否して返す。
+    if let Some(p) = &source
+        && (p.endpoint != spec.endpoint || p.dir != spec.netns_dir)
+    {
+        return Err(Box::new((
+            fail(
+                NetError::new(
+                    NetErrorCode::FailedPrecondition,
+                    "prepared netns does not belong to this endpoint",
+                ),
+                AttachStep::CreateNetns,
+                AttachRollbackReport::default(),
             ),
-            AttachStep::DefaultRoute,
-            AttachRollbackReport::default(),
-        ));
-    };
-
-    // 別ネットワークの IPAM を渡す誤用は、何かを作る前に止める。
-    if ipam.network() != &spec.network || ipam.gateway() != spec.gateway {
-        return Err(fail(
-            NetError::new(
-                NetErrorCode::FailedPrecondition,
-                "ipam pool does not belong to this network",
-            ),
-            AttachStep::AllocateAddress,
-            AttachRollbackReport::default(),
-        ));
+            source,
+        )));
     }
-
-    // 何かを作る前に、接続先が作成時の bridge のままであることを確認する。
-    match ops.owned_bridge_index(&spec.bridge, &spec.bridge_token) {
-        Ok(i) if i == spec.bridge_index => {}
-        Ok(_) => {
-            return Err(fail(
+    // 何かを作る前の検査（すべて読み取りのみ）。失敗時は `source` をそのまま返す。
+    let precheck = || -> Result<(VethNames, Ipv4Addr), (NetError, AttachStep)> {
+        let names = VethNames::derive(&spec.endpoint).map_err(|e| (e, AttachStep::DeriveNames))?;
+        // default route の gateway（bridge アドレス）は IPv4 に限る。
+        let IpAddr::V4(gateway) = spec.gateway.addr() else {
+            return Err((
+                NetError::new(
+                    NetErrorCode::FailedPrecondition,
+                    "network gateway is not an IPv4 address",
+                ),
+                AttachStep::DefaultRoute,
+            ));
+        };
+        // 別ネットワークの IPAM を渡す誤用は止める。
+        if ipam.network() != &spec.network || ipam.gateway() != spec.gateway {
+            return Err((
+                NetError::new(
+                    NetErrorCode::FailedPrecondition,
+                    "ipam pool does not belong to this network",
+                ),
+                AttachStep::AllocateAddress,
+            ));
+        }
+        // 接続先が作成時の bridge のままであることを確認する。
+        match ops.owned_bridge_index(&spec.bridge, &spec.bridge_token) {
+            Ok(i) if i == spec.bridge_index => Ok((names, gateway)),
+            Ok(_) => Err((
                 NetError::new(
                     NetErrorCode::FailedPrecondition,
                     "bridge ifindex changed (network was replaced)",
                 ),
                 AttachStep::VerifyBridge,
-                AttachRollbackReport::default(),
-            ));
+            )),
+            Err(e) => Err((e, AttachStep::VerifyBridge)),
         }
-        Err(e) => {
-            return Err(fail(
-                e,
-                AttachStep::VerifyBridge,
-                AttachRollbackReport::default(),
-            ));
-        }
-    }
-
-    let pin = spec.netns_path();
-    let (mut netns, pin_dir_id) = match ops.create_netns(&spec.netns_dir, &spec.endpoint) {
-        Ok(created) => created,
-        Err(f) => {
-            let mut report = AttachRollbackReport::default();
-            if let Some(state) = f.leftover {
-                report.leftover.push((AttachResource::Netns(pin), state));
-            }
-            return Err(fail(f.error, AttachStep::CreateNetns, report));
+    };
+    let (names, gateway) = match precheck() {
+        Ok(v) => v,
+        Err((e, step)) => {
+            return Err(Box::new((
+                fail(e, step, AttachRollbackReport::default()),
+                source,
+            )));
         }
     };
 
-    // 以降の失敗は、veth の後始末（あれば）→ netns の unpin の順で戻す。
+    let pin = spec.netns_path();
+    // 事前作成の netns を使う場合は、失敗しても unpin せず呼び出し側へ返す。
+    let keep_netns = source.is_some();
+    let (mut netns, pin_dir_id) = match source {
+        Some(p) => (p.netns, p.pin_dir_id),
+        None => match ops.create_netns(&spec.netns_dir, &spec.endpoint) {
+            Ok(created) => created,
+            Err(f) => {
+                let mut report = AttachRollbackReport::default();
+                if let Some(state) = f.leftover {
+                    report.leftover.push((AttachResource::Netns(pin), state));
+                }
+                return Err(Box::new((
+                    fail(f.error, AttachStep::CreateNetns, report),
+                    None,
+                )));
+            }
+        },
+    };
+    let give_back = |netns: O::Netns| PreparedNetns {
+        netns,
+        pin_dir_id,
+        endpoint: spec.endpoint.clone(),
+        dir: spec.netns_dir.clone(),
+    };
+
+    // 以降の失敗は、veth の後始末（あれば）→ netns の unpin の順で戻す（事前作成の netns は unpin せず返す）。
     let abort =
         |netns: O::Netns, mut report: AttachRollbackReport, error: NetError, step: AttachStep| {
-            rollback_netns(ops, netns, &pin, &mut report);
-            fail(error, step, report)
+            let back = if keep_netns {
+                Some(give_back(netns))
+            } else {
+                rollback_netns(ops, netns, &pin, &mut report);
+                None
+            };
+            Box::new((fail(error, step, report), back))
         };
 
     if let Err(e) = ops.create_veth(names.host(), names.peer()) {
@@ -1616,7 +1739,12 @@ pub(crate) fn attach_container_with<O: AttachOps>(
                 .push((AttachResource::Address(address), ResourceState::Unknown));
         }
         rollback_veth(ops, names.host(), host_index, &mut report);
-        rollback_netns(ops, netns, &pin, &mut report);
+        let back = if keep_netns {
+            Some(give_back(netns))
+        } else {
+            rollback_netns(ops, netns, &pin, &mut report);
+            None
+        };
         if !f.ports_unknown {
             // veth・netns の後始末が完了したことを確認できた場合に限り、払い出しと予約を戻す。
             // 資源が残った・結果不明の場合は、設定済みアドレスを持つ資源が生きている可能性があるため、
@@ -1640,7 +1768,7 @@ pub(crate) fn attach_container_with<O: AttachOps>(
                     .push((AttachResource::Address(address), ResourceState::Unknown));
             }
         }
-        return Err(fail(f.error, f.step, report));
+        return Err(Box::new((fail(f.error, f.step, report), back)));
     }
     ops.release_netns_socket(&mut netns);
 
@@ -1936,6 +2064,130 @@ pub fn attach_container(
         ipam,
         ports,
     )
+}
+
+/// [`create_container_netns`] の失敗。作成途中の残骸が残りうるかを `leftover` で伝える。
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct NetnsCreateError {
+    /// 失敗の原因。
+    pub error: NetError,
+    /// 取り残した pin の状態（何も残していなければ `None`。`Present` は後始末の失敗、`Unknown` は結果不明で
+    /// fail-closed のため削除していない）。
+    pub leftover: Option<ResourceState>,
+}
+
+/// [`attach_prepared_container`] の失敗。事前作成の netns は unpin せずに返す。
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct PreparedAttachError {
+    /// 失敗の内容と veth・IPAM・受け口のロールバック結果（netns は含まない）。
+    pub error: ContainerAttachError,
+    /// 返却された netns（再試行または [`release_container_netns`] で解放する）。現在の実装は失敗時に必ず
+    /// `Some` で返す。`None` は netns を返せなかった場合を表す（呼び出し側は pin が残りうるとして扱う）。
+    pub netns: Option<PreparedNetns<ContainerNetns>>,
+}
+
+/// [`release_container_netns`] の失敗。解除できなかった netns を返して再試行できるようにする。
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct ReleaseNetnsError {
+    /// 失敗の原因。
+    pub error: NetError,
+    /// 解除できなかった netns（fd と pin を保持したまま）。
+    pub netns: PreparedNetns<ContainerNetns>,
+}
+
+/// コンテナ用の netns を attach より前に作って pin する（#2675・NET-1・CRI-2・PLUG-1）。
+///
+/// `attach_container` が内部で行う「netns の作成と pin」だけを切り出した入口で、安全性の検査（置き場の所有者・
+/// 権限・symlink、`O_EXCL`、`shared` 伝播の拒否）は同じ関数を通る。`lo` の up は attach が netns 内設定で行う。
+/// 作った netns は [`attach_prepared_container`] へ渡すか、不要なら [`release_container_netns`] で解放する。
+/// `CAP_SYS_ADMIN`（`unshare` / `mount`）が必要で、本 crate は権限を上げない。`timeout` は netns 作成の待ちの期限
+/// （REPAIR-5）。
+#[cfg(target_os = "linux")]
+pub fn create_container_netns(
+    route: &NetlinkRouteSocket,
+    netns_dir: &Path,
+    endpoint: &EndpointId,
+    timeout: Duration,
+) -> Result<PreparedNetns<ContainerNetns>, NetnsCreateError> {
+    if !netns_dir.is_absolute() {
+        return Err(NetnsCreateError {
+            error: invalid("netns directory must be an absolute path"),
+            leftover: None,
+        });
+    }
+    match netns::create_pinned(netns_dir, endpoint, timeout, route.recorder()) {
+        Ok((netns, pin_dir_id)) => Ok(PreparedNetns {
+            netns,
+            pin_dir_id,
+            endpoint: endpoint.clone(),
+            dir: netns_dir.to_owned(),
+        }),
+        Err(f) => Err(NetnsCreateError {
+            error: f.error,
+            leftover: f.leftover,
+        }),
+    }
+}
+
+/// 事前作成した netns へコンテナを接続する（#2675）。[`attach_container`] と同じ手順で、netns を作らない点だけが違う。
+///
+/// `prepared` のエンドポイント ID と置き場は `spec` と一致していること（不一致は `FailedPrecondition` で、何も作らず
+/// netns を返す）。失敗時は veth・IPAM の払い出し・受け口の予約を [`attach_container`] と同じ規則で戻し、
+/// netns は unpin せず [`PreparedAttachError::netns`] で返す。成功すると netns の所有は
+/// [`AttachedContainer::netns`] に移り、解放は `delete_network` が行う。
+#[cfg(target_os = "linux")]
+pub fn attach_prepared_container(
+    route: &NetlinkRouteSocket,
+    nft: &NetlinkNetfilterSocket,
+    spec: &ContainerAttachSpec,
+    prepared: PreparedNetns<ContainerNetns>,
+    ipam: &mut StaticIpam,
+    ports: &mut PortRegistry,
+    timeout: Duration,
+) -> Result<AttachedContainer<ContainerNetns>, Box<PreparedAttachError>> {
+    attach_prepared_with(
+        &LinuxAttachOps {
+            route,
+            nft,
+            timeout,
+        },
+        spec,
+        prepared,
+        ipam,
+        ports,
+    )
+    .map_err(|failure| {
+        let (error, netns) = *failure;
+        Box::new(PreparedAttachError { error, netns })
+    })
+}
+
+/// 未 attach の事前作成 netns を解放する（unpin: umount → ファイル削除）。失敗時は netns を返して再試行できる。
+#[cfg(target_os = "linux")]
+pub fn release_container_netns(
+    route: &NetlinkRouteSocket,
+    nft: &NetlinkNetfilterSocket,
+    prepared: PreparedNetns<ContainerNetns>,
+    timeout: Duration,
+) -> Result<(), Box<ReleaseNetnsError>> {
+    release_prepared_with(
+        &LinuxAttachOps {
+            route,
+            nft,
+            timeout,
+        },
+        prepared,
+    )
+    .map_err(|failure| {
+        let (error, netns) = *failure;
+        Box::new(ReleaseNetnsError { error, netns })
+    })
 }
 #[cfg(test)]
 mod tests {
@@ -3471,6 +3723,162 @@ mod attach_tests {
             assert_eq!(calls[n - 2], "delete_link 21");
             assert_eq!(calls[n - 1], "unpin_netns");
         }
+    }
+
+    fn prepared(id: &str, dir: PathBuf) -> PreparedNetns<()> {
+        PreparedNetns {
+            netns: (),
+            pin_dir_id: (8, 9),
+            endpoint: eid(id),
+            dir,
+        }
+    }
+
+    /// NET-1・CRI-2（#2675）: 事前作成の netns への接続は netns を作らず、後半の手順は通常の接続と同じ。
+    #[test]
+    fn net1_attach_prepared_does_not_create_netns() {
+        let f = Fake::default();
+        let mut pool = ipam();
+        let a = attach_prepared_with(
+            &f,
+            &spec("web-1"),
+            prepared("web-1", netns_dir()),
+            &mut pool,
+            &mut PortRegistry::new(),
+        )
+        .unwrap();
+        let calls = f.calls();
+        assert!(!calls.iter().any(|c| c.starts_with("create_netns")));
+        assert!(!calls.iter().any(|c| c.starts_with("unpin_netns")));
+        let n = VethNames::derive(&eid("web-1")).unwrap();
+        assert_eq!(
+            calls,
+            [
+                format!("link_index {}", created().bridge.as_str()),
+                format!("create_veth {} {}", n.host().as_str(), n.peer().as_str()),
+                format!("link_index {}", n.host().as_str()),
+                format!("link_index {}", n.peer().as_str()),
+                "set_owner_token 21 fandhe-net:web:1:0:0/ep/web-1".to_owned(),
+                "set_master 21 7".to_owned(),
+                "set_up 21".to_owned(),
+                "move_to_netns 22".to_owned(),
+                "ns_index_lo lo".to_owned(),
+                "ns_up_lo 1".to_owned(),
+                format!("ns_index_peer {}", n.peer().as_str()),
+                "ns_addr 5 10.89.0.2/24".to_owned(),
+                "ns_up_peer 5".to_owned(),
+                "ns_route 10.89.0.1 5".to_owned(),
+                "release_socket".to_owned(),
+            ]
+        );
+        assert_eq!(a.netns_path, pin_of("web-1"));
+        assert_eq!(a.address, ip(2));
+        // 削除時の残存 pin の照合用の置き場記録も、事前作成の置き場の識別子で払い出しと同時に残る。
+        assert_eq!(
+            pool.netns_dir_of(&eid("web-1")),
+            Some(&NetnsDirRecord::new(netns_dir(), (8, 9)))
+        );
+    }
+
+    /// NET-1・CRI-2（#2675）: 事前作成の netns への接続が失敗しても、veth は戻すが netns は unpin せず返す。
+    #[test]
+    fn net1_attach_prepared_failure_hands_netns_back_without_unpin() {
+        let cases = [
+            (
+                Fake {
+                    fail_master: true,
+                    ..Default::default()
+                },
+                AttachStep::SetMaster,
+            ),
+            (
+                Fake {
+                    fail_move: Some(NetErrorCode::Internal),
+                    ..Default::default()
+                },
+                AttachStep::MoveToNetns,
+            ),
+            (
+                Fake {
+                    fail_ns: Some("ns_addr"),
+                    ..Default::default()
+                },
+                AttachStep::AddAddress,
+            ),
+        ];
+        for (f, step) in cases {
+            let (e, back) = *attach_prepared_with(
+                &f,
+                &spec("c1"),
+                prepared("c1", netns_dir()),
+                &mut ipam(),
+                &mut PortRegistry::new(),
+            )
+            .unwrap_err();
+            assert_eq!(e.step, step);
+            assert_eq!(e.rollback.removed, [AttachResource::Veth(host_of("c1"))]);
+            assert!(e.rollback.leftover.is_empty());
+            let calls = f.calls();
+            assert!(
+                !calls.iter().any(|c| c.starts_with("unpin_netns")),
+                "{step:?}"
+            );
+            let back = back.expect("netns is handed back");
+            assert_eq!(back.endpoint(), &eid("c1"));
+            assert_eq!(back.pin_path(), pin_of("c1"));
+        }
+    }
+
+    /// NET-1・CRI-2（#2675）: エンドポイントまたは置き場が違う事前作成の netns は、何も作らず拒否して返す。
+    #[test]
+    fn net1_attach_prepared_mismatch_creates_nothing() {
+        for p in [
+            prepared("other", netns_dir()),
+            prepared("c1", PathBuf::from("/elsewhere")),
+        ] {
+            let f = Fake::default();
+            let (e, back) =
+                *attach_prepared_with(&f, &spec("c1"), p, &mut ipam(), &mut PortRegistry::new())
+                    .unwrap_err();
+            assert_eq!(e.code(), NetErrorCode::FailedPrecondition);
+            assert!(f.calls().is_empty(), "{:?}", f.calls());
+            assert!(back.is_some());
+        }
+    }
+
+    /// NET-1（#2675）: 事前検査（bridge の不一致）の失敗でも netns は返る。
+    #[test]
+    fn net1_attach_prepared_precheck_failure_hands_netns_back() {
+        let f = Fake {
+            bridge_index: Some(99),
+            ..Default::default()
+        };
+        let (e, back) = *attach_prepared_with(
+            &f,
+            &spec("c1"),
+            prepared("c1", netns_dir()),
+            &mut ipam(),
+            &mut PortRegistry::new(),
+        )
+        .unwrap_err();
+        assert_eq!(e.step, AttachStep::VerifyBridge);
+        assert!(back.is_some());
+        assert!(!f.calls().iter().any(|c| c.starts_with("create_")));
+    }
+
+    /// NET-1（#2675）: 未 attach の事前作成 netns の解放は unpin を 1 回呼び、失敗時はハンドルを返す。
+    #[test]
+    fn net1_release_prepared_unpins_and_returns_handle_on_failure() {
+        let f = Fake::default();
+        release_prepared_with(&f, prepared("c1", netns_dir())).unwrap();
+        assert_eq!(f.calls(), ["unpin_netns"]);
+        let f = Fake {
+            unpin_fails: true,
+            ..Default::default()
+        };
+        let (e, back) = *release_prepared_with(&f, prepared("c1", netns_dir())).unwrap_err();
+        assert_eq!(e.code(), NetErrorCode::Internal);
+        assert_eq!(back.pin_path(), pin_of("c1"));
     }
 
     /// NET-1: ロールバックが失敗しても元のエラーを保ち、状態を Present / Unknown で分けて報告する。

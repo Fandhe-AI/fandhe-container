@@ -1,21 +1,34 @@
-//! Pod 単位のライフサイクルを `NetworkPlugin` の呼び出しへ写す層（TASK-114.4・#460・MS-4・CRI-7・CRI-2）。
+//! Pod 単位のライフサイクルを `NetworkPlugin` の呼び出しへ写す層（TASK-114.4・#460・#2675・MS-4・CRI-7・CRI-2・NET-1）。
 //!
-//! 呼び出し元: 将来は `fandhe-container-cri` の `RunPodSandbox`・`CreateContainer`・`RemovePodSandbox`
-//! の配線（#459 以降）が使う。現状は CRI の RPC からの呼び出しが無く、plugin 層で「PodSandbox の作成で
-//! ネットワークが作られ、コンテナの作成で netns が用意されて接続され、PodSandbox の削除で資源が解放される」
-//! 順序を機械的に照合するための薄い関数である（REPAIR-3）。
+//! CRI の POD モードは「netns が sandbox 単位で、配下のコンテナが共有する」ため、sandbox ごとに 1 つのネットワークと
+//! 1 つの netns を作る写像（[`set_up_sandbox`]・[`tear_down_pod`]）を主とし、cri の注入点
+//! `fandhe_container_cri::adapter::PodNetworkProvider` を [`NetsetupPodNetwork`] が実装する。
+//! コンテナ単位の [`set_up_container`] は共有ネットワークへ接続する旧来の写像で、CRI の RPC からは呼ばない
+//! （試験だけが呼ぶ。net にコンテナ単位の切り離しが無く、共有ネットワークでは pod ごとの後始末ができないため。REPAIR-3）。
+//!
+//! 呼び出し元: `RunPodSandbox` / `StopPodSandbox` / `RemovePodSandbox`（cri の `CriRuntimeService::with_pod_network`
+//! で注入したときだけ）。**本番（`CriPluginBackends::production`）は注入しない**: core の start が network namespace の
+//! join を未実装で拒否するため、注入すると bridge・netns・veth を作るのに start が `UNIMPLEMENTED` で失敗する
+//! （`docs/design/cri-config-acceptance.md` の順 13。REPAIR-3）。
 //!
 //! | CRI の操作 | 関数 | `NetworkPlugin` の呼び出し |
 //! | ---------- | ---- | -------------------------- |
-//! | `RunPodSandbox` | [`set_up_pod`] | `create_network` |
-//! | `CreateContainer` | [`set_up_container`] | `create_netns` → `attach` |
-//! | `StopPodSandbox` / `RemovePodSandbox` | [`tear_down_pod`] | `delete_network` |
+//! | `RunPodSandbox`（POD） | [`set_up_sandbox`] | `create_network` → `create_netns` → `attach`（失敗は逆順に戻す） |
+//! | `StopPodSandbox` / `RemovePodSandbox` | [`tear_down_pod`] | `delete_network`（pod のネットワークごと一括解放） |
+//! | （試験のみ） | [`set_up_pod`]・[`set_up_container`] | `create_network`・`create_netns` → `attach` |
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::{IpAddr, Ipv4Addr};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use fandhe_container_core::traits::{
     AttachRequest, AttachResponse, ContainerId, CreateNetnsRequest, CreateNetworkRequest,
-    DeleteNetworkRequest, DeleteNetworkResponse, DetachRequest, ErrorCode, IpCidr, NetworkName,
-    NetworkPlugin, NetworkStatus, TraitError,
+    DeleteNetworkRequest, DeleteNetworkResponse, DetachRequest, ErrorCode, IpCidr, NetnsName,
+    NetnsStatus, NetworkName, NetworkPlugin, NetworkStatus, TraitError,
 };
+use fandhe_container_cri::adapter::{PodNetns, PodNetworkProvider, PodNetworkRequest};
+use fandhe_container_cri::error::CriError;
 
 /// PodSandbox のネットワークを作る（`net-create`）。
 pub fn set_up_pod(
@@ -62,4 +75,227 @@ pub fn tear_down_pod(
     name: &NetworkName,
 ) -> Result<DeleteNetworkResponse, TraitError> {
     net.delete_network(&DeleteNetworkRequest::new(name.clone()))
+}
+/// [`set_up_sandbox`] の失敗。巻き戻しが完了したか（資源が残らないか）を伝える。
+#[derive(Debug)]
+pub struct SandboxSetUpError {
+    /// 失敗の原因（巻き戻しも失敗したときは両方を載せた `Internal`）。
+    pub error: TraitError,
+    /// 巻き戻しが完了し、カーネル資源もレジストリの記録も残らないか。偽ならネットワークの記録が残りうるため、
+    /// 呼び出し側は [`tear_down_pod`] で回収を再試行する。
+    pub rolled_back: bool,
+}
+
+/// sandbox の識別子から導く 3 つの名前（ネットワーク名・コンテナ ID・netns 名はすべて同じ文字列）。
+fn sandbox_names(sandbox_id: &str) -> Result<(NetworkName, ContainerId, NetnsName), TraitError> {
+    Ok((
+        NetworkName::new(sandbox_id)?,
+        ContainerId::new(sandbox_id)?,
+        NetnsName::new(sandbox_id)?,
+    ))
+}
+
+/// 巻き戻しの失敗を元のエラーへ足す（握りつぶさない。契約 6・9）。
+fn with_rollback_errors(orig: TraitError, rollback: &[(&str, TraitError)]) -> TraitError {
+    if rollback.is_empty() {
+        return orig;
+    }
+    let mut message = format!("{} ({})", orig.message(), orig.code().as_str());
+    for (step, e) in rollback {
+        message.push_str(&format!(
+            "; rollback {step} failed ({}: {})",
+            e.code().as_str(),
+            e.message()
+        ));
+    }
+    TraitError::new(ErrorCode::Internal, message)
+}
+
+/// sandbox 単位のネットワークと netns を作って接続する（`net-create` → `netns-create` → `veth-attach`）。
+///
+/// ネットワーク名・コンテナ ID・netns 名は `sandbox_id` を使う。途中で失敗したら逆順に戻す: `attach` の失敗は
+/// `detach`（事前作成の netns の解放）→ `delete_network`、`create_netns` の失敗は `delete_network`。戻しも失敗
+/// したら、元のエラーと戻しのエラーを載せた `Internal` を返し、[`SandboxSetUpError::rolled_back`] を偽にする。
+pub fn set_up_sandbox(
+    net: &dyn NetworkPlugin,
+    sandbox_id: &str,
+    subnet: IpCidr,
+) -> Result<NetnsStatus, SandboxSetUpError> {
+    let plain = |error| SandboxSetUpError {
+        error,
+        rolled_back: true,
+    };
+    let (name, container, _) = sandbox_names(sandbox_id).map_err(plain)?;
+    net.create_network(&CreateNetworkRequest::new(name.clone(), subnet))
+        .map_err(plain)?;
+    let mut rollback: Vec<(&str, TraitError)> = Vec::new();
+    let failure = match net.create_netns(&CreateNetnsRequest::new(name.clone(), container.clone()))
+    {
+        Err(e) => e,
+        Ok(status) => match net.attach(&AttachRequest::new(name.clone(), container.clone())) {
+            Ok(_) => return Ok(status),
+            Err(e) => {
+                if let Err(d) = net.detach(&DetachRequest::new(name.clone(), container.clone())) {
+                    rollback.push(("detach", d));
+                }
+                e
+            }
+        },
+    };
+    if let Err(d) = net.delete_network(&DeleteNetworkRequest::new(name)) {
+        rollback.push(("delete_network", d));
+    }
+    Err(SandboxSetUpError {
+        rolled_back: rollback.is_empty(),
+        error: with_rollback_errors(failure, &rollback),
+    })
+}
+
+/// pod 用サブネットを払い出す上限件数（親サブネットと pod の prefix 長の差で決まる枠数の上限）。
+pub const MAX_POD_SUBNET_SLOTS: u32 = 4096;
+
+/// 親の IPv4 サブネットを pod ごとの小さなサブネットへ分け、空いている枠を払い出す（NET-1・#2675）。
+///
+/// 払い出しと返却は 1 つの `Mutex` の下で行い、同じ sandbox への二重払い出しは同じ枠を返す（冪等）。枠が尽きたら
+/// `ResourceExhausted`。枠の数は [`MAX_POD_SUBNET_SLOTS`] 以下に限る（無制限の確保・走査を防ぐ）。状態はメモリだけで、
+/// plugin の再起動で失われる（`NetsetupNetwork` の状態と同じ制約）。
+#[derive(Debug)]
+pub struct PodSubnetPool {
+    base: u32,
+    pod_prefix_len: u8,
+    slots: u32,
+    used: Mutex<BTreeMap<String, u32>>,
+}
+
+impl PodSubnetPool {
+    /// `parent`（IPv4）を `pod_prefix_len` の長さのサブネットへ分ける。`pod_prefix_len` は親より長く 30 以下
+    /// （net が受ける `/1`〜`/30`）で、枠数が [`MAX_POD_SUBNET_SLOTS`] を超える分割は `InvalidArgument`。
+    pub fn new(parent: IpCidr, pod_prefix_len: u8) -> Result<Self, TraitError> {
+        let IpAddr::V4(network) = parent.network_address() else {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "only IPv4 pod subnets are supported",
+            ));
+        };
+        let parent_len = parent.prefix_len();
+        if pod_prefix_len > 30 || pod_prefix_len <= parent_len {
+            return Err(TraitError::new(
+                ErrorCode::InvalidArgument,
+                "pod prefix length must be longer than the parent and at most 30",
+            ));
+        }
+        let bits = u32::from(pod_prefix_len - parent_len);
+        let slots = 1u32
+            .checked_shl(bits)
+            .filter(|n| *n <= MAX_POD_SUBNET_SLOTS)
+            .ok_or_else(|| {
+                TraitError::new(ErrorCode::InvalidArgument, "too many pod subnet slots")
+            })?;
+        Ok(Self {
+            base: u32::from(network),
+            pod_prefix_len,
+            slots,
+            used: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, u32>>, TraitError> {
+        self.used
+            .lock()
+            .map_err(|_| TraitError::new(ErrorCode::Internal, "pod subnet pool is poisoned"))
+    }
+
+    fn subnet_of(&self, slot: u32) -> Result<IpCidr, TraitError> {
+        let size = 1u32 << (32 - u32::from(self.pod_prefix_len));
+        let addr = slot
+            .checked_mul(size)
+            .and_then(|off| self.base.checked_add(off))
+            .ok_or_else(|| TraitError::new(ErrorCode::Internal, "pod subnet overflow"))?;
+        IpCidr::new(IpAddr::V4(Ipv4Addr::from(addr)), self.pod_prefix_len)
+    }
+
+    /// `sandbox_id` に枠を払い出す（既に払い出し済みなら同じ枠）。
+    pub fn allocate(&self, sandbox_id: &str) -> Result<IpCidr, TraitError> {
+        let mut used = self.lock()?;
+        if let Some(slot) = used.get(sandbox_id) {
+            return self.subnet_of(*slot);
+        }
+        let taken: BTreeSet<u32> = used.values().copied().collect();
+        let slot = (0..self.slots)
+            .find(|s| !taken.contains(s))
+            .ok_or_else(|| {
+                TraitError::new(ErrorCode::ResourceExhausted, "pod subnet pool is exhausted")
+            })?;
+        let subnet = self.subnet_of(slot)?;
+        used.insert(sandbox_id.to_owned(), slot);
+        Ok(subnet)
+    }
+
+    /// `sandbox_id` の枠を返す（未払い出しは何もしない）。
+    pub fn release(&self, sandbox_id: &str) {
+        if let Ok(mut used) = self.lock() {
+            used.remove(sandbox_id);
+        }
+    }
+
+    /// 払い出し中の枠の数（試験・計測用）。
+    pub fn in_use(&self) -> usize {
+        self.lock().map(|u| u.len()).unwrap_or(0)
+    }
+}
+
+/// cri の `PodNetworkProvider` を `NetworkPlugin` の呼び出しへ写す実装（CRI-2・NET-1・PLUG-1・#2675）。
+///
+/// `set_up` は pod 用サブネットを払い出し、[`set_up_sandbox`] で netns を作って接続し、netns の pin のパス
+/// （`<netns 置き場>/<netns 名>`）を返す。`tear_down` は [`tear_down_pod`] で pod のネットワークごと解放する
+/// （冪等。未知は成功）。パスは検証済みの名前（`/`・`.` を含まない）と固定の置き場からだけ組む。
+///
+/// **未実装・簡易実装（REPAIR-3）**: 本番へは注入されない（モジュール doc）。サブネットのプールの出どころは未決で、
+/// 構築時の引数として受けるだけ。
+pub struct NetsetupPodNetwork {
+    net: Arc<dyn NetworkPlugin>,
+    netns_dir: PathBuf,
+    pool: PodSubnetPool,
+}
+
+impl NetsetupPodNetwork {
+    /// `netns_dir` は `LinuxNetsetup` に渡したものと同じ netns の pin の置き場（絶対パス）。
+    pub fn new(net: Arc<dyn NetworkPlugin>, netns_dir: PathBuf, pool: PodSubnetPool) -> Self {
+        Self {
+            net,
+            netns_dir,
+            pool,
+        }
+    }
+}
+
+impl PodNetworkProvider for NetsetupPodNetwork {
+    fn set_up(&self, req: &PodNetworkRequest<'_>) -> Result<PodNetns, CriError> {
+        let to_cri = |e: TraitError| CriError::from(&e);
+        let (_, _, netns_name) = sandbox_names(req.sandbox_id).map_err(to_cri)?;
+        let subnet = self.pool.allocate(req.sandbox_id).map_err(to_cri)?;
+        match set_up_sandbox(self.net.as_ref(), req.sandbox_id, subnet) {
+            Ok(_) => PodNetns::new(self.netns_dir.join(netns_name.as_str())),
+            Err(f) => {
+                // 資源が残らないと確認できたときだけ枠を返す（残りうる間は tear_down の成功まで保持する）。
+                if f.rolled_back {
+                    self.pool.release(req.sandbox_id);
+                }
+                Err(to_cri(f.error))
+            }
+        }
+    }
+
+    fn tear_down(&self, sandbox_id: &str) -> Result<(), CriError> {
+        let to_cri = |e: TraitError| CriError::from(&e);
+        let (name, _, _) = sandbox_names(sandbox_id).map_err(to_cri)?;
+        match tear_down_pod(self.net.as_ref(), &name) {
+            Ok(_) => {}
+            // 未作成・解放済みは成功（冪等）。
+            Err(e) if e.code() == ErrorCode::NotFound => {}
+            Err(e) => return Err(to_cri(e)),
+        }
+        self.pool.release(sandbox_id);
+        Ok(())
+    }
 }

@@ -19,7 +19,7 @@
 //! （bundle の供給は [`BundleProvider`] の注入点だけを定義し、config 変換と bundle の寿命は `crate::bundle`）。
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -223,6 +223,10 @@ pub struct BundleRequest<'a> {
     pub sandbox_config: &'a PodSandboxConfig,
     /// 作成するコンテナの設定。
     pub config: &'a ContainerConfig,
+    /// 所属サンドボックスの pod network namespace のパス（[`PodNetworkProvider::set_up`] が返した値。
+    /// 無ければ `None`）。`namespace_options.network` が `POD` のときだけ `linux.namespaces` の network に
+    /// `path` として出す（#2675・CRI-2・NET-1）。
+    pub pod_netns_path: Option<&'a Path>,
 }
 
 impl<'a> BundleRequest<'a> {
@@ -238,9 +242,93 @@ impl<'a> BundleRequest<'a> {
             sandbox_id,
             sandbox_config,
             config,
+            pod_netns_path: None,
         }
     }
+
+    /// pod network namespace のパスを足す（#2675）。
+    #[must_use]
+    pub fn with_pod_netns_path(mut self, path: Option<&'a Path>) -> Self {
+        self.pod_netns_path = path;
+        self
+    }
 }
+
+/// pod の network namespace を `NetworkPlugin` 経由で作って結線する注入点（#2675・CRI-2・NET-1・PLUG-1）。
+///
+/// `RunPodSandbox`（`namespace_options.network` が `POD`）が worker スレッドから [`PodNetworkProvider::set_up`] を、
+/// `StopPodSandbox`・`RemovePodSandbox` が [`PodNetworkProvider::tear_down`] を呼ぶ。実装は plugin-cri が
+/// `NetworkPlugin`（core のトレイト境界）へ写して差す。cri は net の具象型を知らない（CRI-7）。
+///
+/// **未実装・簡易実装（REPAIR-3）**: コンテナが netns へ入る側（core の `linux.namespaces[].path` の受け入れ）は
+/// 未実装で、注入しても start は `UNIMPLEMENTED` で拒否される。本番の plugin-cri は注入しない
+/// （`docs/design/cri-config-acceptance.md` の順 13）。
+/// エラー文言に config の値・パスを含めないこと。
+pub trait PodNetworkProvider: Send + Sync {
+    /// サンドボックスの netns を作って結線し、そのパスを返す。失敗時は資源を残さない（残るなら `Err` で報告）。
+    fn set_up(&self, req: &PodNetworkRequest<'_>) -> Result<PodNetns, CriError>;
+
+    /// `set_up` で用意した資源を解放する。冪等で、未知の ID・不在は `Ok`。失敗は資源が残るとみなされる。
+    fn tear_down(&self, sandbox_id: &str) -> Result<(), CriError>;
+}
+
+/// [`PodNetworkProvider::set_up`] への入力。将来の項目追加に備えて `#[non_exhaustive]`。
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct PodNetworkRequest<'a> {
+    /// サンドボックス ID（`RunPodSandbox` が採番した値）。
+    pub sandbox_id: &'a str,
+    /// サンドボックスの設定（port_mappings・dns_config 等。現状の実装は読まない）。
+    pub config: &'a PodSandboxConfig,
+}
+
+impl<'a> PodNetworkRequest<'a> {
+    /// 各項目から入力を作る。
+    pub fn new(sandbox_id: &'a str, config: &'a PodSandboxConfig) -> Self {
+        Self { sandbox_id, config }
+    }
+}
+
+/// [`PodNetworkProvider::set_up`] の結果（結線済みの pod network namespace）。
+///
+/// 将来の項目（IP の報告等）の追加に備えて `#[non_exhaustive]` とし、[`PodNetns::new`] で作る。
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PodNetns {
+    path: PathBuf,
+}
+
+impl PodNetns {
+    /// netns の絶対パスから作る。絶対パスで、`..`・`.`・空要素を含まず、長さが上限内であることを検証する
+    /// （壊れた値を bundle へ流さない多層防御。違反は `INTERNAL`）。
+    pub fn new(path: PathBuf) -> Result<Self, CriError> {
+        use std::path::Component;
+        let ok = path.is_absolute()
+            && path.as_os_str().len() <= POD_NETNS_PATH_MAX_BYTES
+            && path.to_str().is_some_and(|s| !s.contains('\0'))
+            && path
+                .components()
+                .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+            && path.components().count() > 1
+            // `Path::components` は `.` と連続する `/` を黙って正規化するため、文字列でも検査する。
+            && path.to_str().is_some_and(|s| {
+                cfg!(windows) || s[1..].split('/').all(|e| !matches!(e, "" | "." | ".."))
+            });
+        if ok {
+            Ok(Self { path })
+        } else {
+            Err(CriError::internal("invalid pod network namespace path"))
+        }
+    }
+
+    /// netns のパス。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// pod network namespace のパスの長さの上限（バイト。Linux の `PATH_MAX` と同じ）。
+const POD_NETNS_PATH_MAX_BYTES: usize = 4096;
 
 /// CRI の `ContainerConfig` から OCI bundle（rootfs と `config.json`）を用意する注入点（TASK-59.2・#438・CRI-2）。
 ///

@@ -18,7 +18,7 @@
 | 10 | cgroup_parent | core の `linux.cgroupsPath`（#2010 の方針で拒否。再判断が要る。判断材料は [cri-cgroup-parent.md](cri-cgroup-parent.md)。オーナー承認待ちで、それまで `UNIMPLEMENTED`） | core → cri | #2672 |
 | 11 | devices・CDI | core の `linux.devices`（UnappliedField）・gpu の CDI 適用 | gpu・core → cri | #2673 |
 | 12 | pod の pid / ipc の共有（join） | core の `linux.namespaces[].path` の拒否 | core → cri | #2674 |
-| 13 | pod netns の作成・結線 | core の network namespace の拒否・plugin-cri `netsetup` の `create_netns` | net・core・cri | #2675 |
+| 13 | pod netns の作成・結線 | core の network namespace の拒否（netns への join）。net・plugin-cri・cri の結線と注入点は本変更で実装済み。core の join と本番への注入は後続 | net・core・cri | #2675 |
 | 14 | port_mappings | plugin-cri `netsetup` の `publish_port`。順 13 が前提 | net・cri | #2676 |
 | 15 | userns の uids / gids の写像 | オーナー判断待ち | core → cri | #2240 |
 
@@ -102,3 +102,33 @@ CRI の `LinuxContainerSecurityContext.capabilities` のうち `drop_capabilitie
 
 - 名前の正規化（大文字化・`CAP_` 接頭辞の補完・`ALL`）は containerd に合わせた想定で、実装時に一次情報（commit 指定）との再照合は行っていない。食い違いが見つかれば厳しい側（拒否）へ倒す
 - 集合ごとに別の値を指定する細かい制御は未対応（未適用として拒否）
+
+## pod netns の作成・結線（CRI-2・NET-1・PLUG-1。#2675）
+
+CRI の `namespace_options.network` は既定が `POD` で、netns は sandbox 単位で配下のコンテナが共有する。`RunPodSandbox` が `NetworkPlugin` 経由で netns を作って結線し、`CreateContainer` の bundle がその netns を指す経路のうち、core の外側（net・plugin-cri・cri）を実装した。**コンテナが netns へ入る側（core）と本番への注入は未実装**で、本番の挙動は変わらない。
+
+| 層 | 実装 |
+| -- | ---- |
+| net | `create_container_netns`（作成と pin だけを切り出した入口。安全性の検査は `attach_container` と同じ関数）・`attach_prepared_container`（事前作成の netns へ接続。失敗時は veth・IPAM・受け口を戻すが netns は unpin せず返す）・`release_container_netns` |
+| plugin-cri `netsetup` | `LinuxNetsetup::create_netns` が事前作成してハンドルを保持し、`attach` が使う。`detach`（未 attach）・`delete_network` が未 attach の netns を解放する。解放に失敗したら記録を残す |
+| plugin-cri `pod_network` | `set_up_sandbox`（`create_network` → `create_netns` → `attach`。失敗は逆順に戻す）・`NetsetupPodNetwork`（cri の `PodNetworkProvider` の実装）・`PodSubnetPool`（pod ごとのサブネットの払い出し。上限つき） |
+| cri | `PodNetworkProvider`（注入点）。`RunPodSandbox`（`POD`）が `set_up`、`StopPodSandbox`・`RemovePodSandbox` が `tear_down`、`CreateContainer` が `BundleRequest::pod_netns_path` で bundle へ渡す。`POD` でパスがあるときだけ `{"type":"network","path":…}` を出す |
+
+| CRI の要求 | 結果 |
+| ---------- | ---- |
+| `POD`・provider 注入あり | `set_up` を sandbox ID で 1 回。以後の `CreateContainer` の `linux.namespaces` の network に `path` |
+| `POD`・provider なし（本番） | 従来どおり `{"type":"network"}`（path なし）。core の start が `UNIMPLEMENTED` |
+| `NODE` | ネットワークに触れない。network namespace を出さない |
+| `CONTAINER`・`TARGET` | 従来どおり（`CONTAINER` は path なし、`TARGET` は `UNIMPLEMENTED`） |
+| `set_up` 失敗 | `tear_down` で回収を試み、回収できたら sandbox を登録しない。できない・期限超過は notready で残し、Stop・Remove が回収する |
+| `tear_down` 失敗 | Stop・Remove が `INTERNAL` で失敗し、記録を残して再試行できる |
+
+既知の差:
+
+- **コンテナが pod netns へ入る側（core）は未実装**: core は `linux.namespaces[].path` を全 namespace 種で拒否する。network の join は user namespace より前に `setns(CLONE_NEWNET)` する順序と、netns の検証（`O_NOFOLLOW`・`NSFS_MAGIC`・`NS_GET_NSTYPE`・置き場の配下性・所有者）を要し、方式は #1870 の設計事項。順 12（pid / ipc の join。#2674）と共通の土台にする。それまで provider を差した構成の start は `UNIMPLEMENTED` で失敗する
+- **本番へは注入しない**: 差すと `RunPodSandbox` が bridge・netns・veth を作るのに start が失敗する。pod 用サブネットの出どころ（起動引数・固定値・設定）も未決
+- 本番の plugin-cri は rootless で、bridge・veth の pin は初期 user namespace の `CAP_NET_ADMIN`・`CAP_SYS_ADMIN` を要するため作れない。rootless の pod netns は pasta 構成（NET-9。#1935 系）の領域で、rootful は #2241 のオーナー承認待ち
+- net にコンテナ単位の切り離しが無いため、pod ごとにネットワーク（bridge と nft テーブル）を作って `delete_network` で一括解放する。共有ネットワークと per-container の detach への移行は後続（CORE-9 の資源効率）
+- 未 attach の事前作成 netns は route ソケットの fd を 1 本保持する（件数は `MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK` で有界）。状態はプロセスのメモリだけで、plugin の再起動で失われる
+- `port_mappings` は順 14（#2676）。`PodSandboxStatus` の `network`（IP の報告）は空のスタブのまま
+- 実機（root）の試験は `crates/net/tests/network_attach_privileged.rs` に準備したが、本変更では未実行

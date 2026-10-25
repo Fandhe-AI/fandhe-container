@@ -65,7 +65,8 @@ mod linux {
     use fandhe_container_net::network::{
         AttachResource, AttachStep, ContainerAttachSpec, CreateStep, EndpointId, NetworkCreateSpec,
         NetworkName, PortProtocol, PortPublish, PortRegistry, StaticIpam, VethNames,
-        attach_container, create_network, delete_network,
+        attach_container, attach_prepared_container, create_container_netns, create_network,
+        delete_network, release_container_netns,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -497,14 +498,68 @@ mod linux {
             )));
         }
 
+        // --- 事前作成の netns（#2675・CRI-2）: 作成 → 接続 と、作成 → 解放 ---
+        // 準備済みの試験で、実機（root）での実行結果は PR に記録する（未実行のまま成功とは書かない）。
+        let ep4 = EndpointId::new("c4")?;
+        let prepared4 = create_container_netns(&route, &base, &ep4, t)
+            .map_err(|e| fail(format!("create_container_netns failed: {e:?}")))?;
+        let pin4 = prepared4.pin_path();
+        if !pin4.exists() {
+            return Err(fail("prepared netns pin does not exist"));
+        }
+        let pin4_ino = fs::metadata(&pin4)
+            .map_err(|e| fail(format!("stat prepared pin: {e}")))?
+            .ino();
+        let own_ino4 = fs::metadata("/proc/self/ns/net")
+            .map_err(|e| fail(format!("stat own netns: {e}")))?
+            .ino();
+        if pin4_ino == own_ino4 {
+            return Err(fail("prepared netns is the same as the current netns"));
+        }
+        let spec4 = ContainerAttachSpec::new(ep4.clone(), &net, base.clone())?;
+        let attached4 =
+            attach_prepared_container(&route, &nft, &spec4, prepared4, &mut ipam, &mut ports, t)
+                .map_err(|e| {
+                    fail(format!(
+                        "attach_prepared_container failed at {:?}: {}",
+                        e.error.step, e.error
+                    ))
+                })?;
+        if attached4.netns_path != pin4 {
+            return Err(fail("attached netns path differs from the prepared pin"));
+        }
+        let (_, flags4, master4) = link_state(&route, attached4.host_veth.as_str())?;
+        if master4 != Some(net.bridge_index.get()) || flags4 & IFF_UP == 0 {
+            return Err(fail(
+                "host veth of the prepared netns is not up on the bridge",
+            ));
+        }
+        let ep5 = EndpointId::new("c5")?;
+        let prepared5 = create_container_netns(&route, &base, &ep5, t)
+            .map_err(|e| fail(format!("create_container_netns (c5) failed: {e:?}")))?;
+        let pin5 = prepared5.pin_path();
+        release_container_netns(&route, &nft, prepared5, t)
+            .map_err(|e| fail(format!("release_container_netns failed: {}", e.error)))?;
+        if pin5.exists() {
+            return Err(fail("released netns pin still exists"));
+        }
+
         // --- ネットワーク削除（TASK-139.4・#317）: bridge・veth・netns pin・nft テーブル・予約が解放される ---
-        let hosts = [attached.host_veth.clone(), attached3.host_veth.clone()];
-        let pins = [attached.netns_path.clone(), attached3.netns_path.clone()];
+        let hosts = [
+            attached.host_veth.clone(),
+            attached3.host_veth.clone(),
+            attached4.host_veth.clone(),
+        ];
+        let pins = [
+            attached.netns_path.clone(),
+            attached3.netns_path.clone(),
+            attached4.netns_path.clone(),
+        ];
         let deleted = delete_network(
             &route,
             &nft,
             &net,
-            vec![attached, attached3],
+            vec![attached, attached3, attached4],
             &mut ipam,
             &mut ports,
             t,

@@ -15,8 +15,10 @@
 //! **未実装・簡易実装（REPAIR-3）**:
 //! - namespace の共有（POD の pid / ipc を pod 内で共有する）は未実装で、`POD` もコンテナごとの新しい
 //!   namespace にする（共有の欠落であり、要求より分離が弱くなる方向ではない）。
-//! - network namespace: `POD` / `CONTAINER` は `{"type":"network"}` を出す。core の start は network namespace を
-//!   まだ受けず `Unimplemented` で拒否する（NetworkPlugin の結線〔NET 系。`docs/design/cri-config-acceptance.md` の順 13〕まで）。`NODE`（host）は
+//! - network namespace: `POD` / `CONTAINER` は `{"type":"network"}` を出す。`POD` で pod の netns のパスを受けたとき
+//!   （[`build_runtime_config_with_pod_netns`]。`NetworkPlugin` 経由で作って結線した netns。#2675・NET-1）は
+//!   `{"type":"network","path":…}` にする。core の start は network namespace も `linux.namespaces[].path` も
+//!   まだ受けず `Unimplemented` で拒否する（core の join は後続。`docs/design/cri-config-acceptance.md` の順 13）。`NODE`（host）は
 //!   network namespace を出さない（ホストの netns で動く。利用者が明示した場合だけ）。crictl 疎通確認
 //!   （#442）の pod.json は当面 `namespace_options.network = NODE` を要する。
 //! - user namespace: `userns_options.mode` が `NODE` でも新しい user namespace にする（分離を強める方向。
@@ -270,6 +272,17 @@ struct LinuxOut<'a> {
 struct NamespaceOut {
     #[serde(rename = "type")]
     kind: &'static str,
+    /// 既存 namespace へ join するパス。pod の network namespace（`NetworkPlugin` が作って pin したもの）だけが
+    /// 持つ（#2675・CRI-2・NET-1）。他の種別は常に `None` で出力しない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+impl NamespaceOut {
+    /// 新しい namespace を作る要素（`path` なし）。
+    const fn new_ns(kind: &'static str) -> Self {
+        Self { kind, path: None }
+    }
 }
 
 #[derive(Serialize)]
@@ -471,7 +484,13 @@ fn resolve_mode(field: &'static str, v: i32) -> Result<NamespaceMode, CriError> 
 }
 
 /// コンテナの namespace_options（無ければ sandbox の）を読み、`linux.namespaces` を決める。
-fn namespaces(opts: Option<&NamespaceOption>) -> Result<Vec<NamespaceOut>, CriError> {
+///
+/// `pod_netns` は `POD` モードの network namespace へ join するパス（pod の netns を `NetworkPlugin` 経由で
+/// 作って結線したとき。#2675・CRI-2・NET-1）。`POD` 以外のモードでは使わない。
+fn namespaces(
+    opts: Option<&NamespaceOption>,
+    pod_netns: Option<&str>,
+) -> Result<Vec<NamespaceOut>, CriError> {
     let default = NamespaceOption::default();
     let o = opts.unwrap_or(&default);
     let mut out = Vec::with_capacity(6);
@@ -482,14 +501,14 @@ fn namespaces(opts: Option<&NamespaceOption>) -> Result<Vec<NamespaceOut>, CriEr
         ("ipc", "namespace_options.ipc", o.ipc),
     ] {
         match resolve_mode(field, v)? {
-            NamespaceMode::Pod | NamespaceMode::Container => out.push(NamespaceOut { kind }),
+            NamespaceMode::Pod | NamespaceMode::Container => out.push(NamespaceOut::new_ns(kind)),
             NamespaceMode::Node | NamespaceMode::Target => return Err(unsupported(field)),
         }
     }
-    out.push(NamespaceOut { kind: "mount" });
-    out.push(NamespaceOut { kind: "uts" });
+    out.push(NamespaceOut::new_ns("mount"));
+    out.push(NamespaceOut::new_ns("uts"));
     // user: 常に新しい namespace（SEC-5）。写像の指定は未実装（#2240）。
-    out.push(NamespaceOut { kind: "user" });
+    out.push(NamespaceOut::new_ns("user"));
     if let Some(u) = &o.userns_options {
         match resolve_mode("namespace_options.userns_options.mode", u.mode)? {
             NamespaceMode::Pod | NamespaceMode::Container | NamespaceMode::Node => {}
@@ -502,7 +521,13 @@ fn namespaces(opts: Option<&NamespaceOption>) -> Result<Vec<NamespaceOut>, CriEr
         }
     }
     match resolve_mode("namespace_options.network", o.network)? {
-        NamespaceMode::Pod | NamespaceMode::Container => out.push(NamespaceOut { kind: "network" }),
+        // POD で pod の netns のパスを受けたときだけ join 指定にする。パス無しは従来どおり path なしの
+        // 要素で、core の start が `UNIMPLEMENTED` で拒否する（実装済みを装わない。REPAIR-3）。
+        NamespaceMode::Pod => out.push(NamespaceOut {
+            kind: "network",
+            path: pod_netns.map(str::to_owned),
+        }),
+        NamespaceMode::Container => out.push(NamespaceOut::new_ns("network")),
         NamespaceMode::Node => {}
         NamespaceMode::Target => return Err(unsupported("namespace_options.network")),
     }
@@ -730,7 +755,24 @@ pub fn build_runtime_config(
     container: &ContainerConfig,
     image: &ImageDefaults,
 ) -> Result<RuntimeConfigJson, CriError> {
-    build_inner(sandbox, container, image, Stage::Build)
+    build_inner(sandbox, container, image, None, Stage::Build)
+}
+
+/// [`build_runtime_config`] に、pod の network namespace へ join するパスを足した版（#2675・CRI-2・NET-1）。
+///
+/// `pod_netns` は `NetworkPlugin` 経由で作って結線した netns の絶対パス（`BundleRequest::pod_netns_path`）。
+/// `namespace_options.network` が `POD` のときだけ `{"type":"network","path":…}` として出し、他のモードでは
+/// 無視する。形の検証（絶対パス・`..` なし・長さ）はここでも行う（多層防御）。
+pub fn build_runtime_config_with_pod_netns(
+    sandbox: &PodSandboxConfig,
+    container: &ContainerConfig,
+    image: &ImageDefaults,
+    pod_netns: Option<&str>,
+) -> Result<RuntimeConfigJson, CriError> {
+    if let Some(p) = pod_netns {
+        check_host_source("pod netns path", p)?;
+    }
+    build_inner(sandbox, container, image, pod_netns, Stage::Build)
 }
 
 /// イメージを展開する前に、CRI の設定だけで判定できる拒否・検証を済ませる（不正な要求で bundle を作らない）。
@@ -744,6 +786,7 @@ pub fn validate_config(
         sandbox,
         container,
         &ImageDefaults::default(),
+        None,
         Stage::Validate,
     )
     .map(|_| ())
@@ -753,6 +796,7 @@ fn build_inner(
     sandbox: &PodSandboxConfig,
     container: &ContainerConfig,
     image: &ImageDefaults,
+    pod_netns: Option<&str>,
     stage: Stage,
 ) -> Result<RuntimeConfigJson, CriError> {
     // 実行層が受けない・無視すると要求より弱くなる入力を先に拒否する。
@@ -908,7 +952,7 @@ fn build_inner(
             .and_then(|l| l.security_context.as_ref())
             .and_then(|s| s.namespace_options.as_ref())
     });
-    let namespaces = namespaces(ns_opts)?;
+    let namespaces = namespaces(ns_opts, pod_netns)?;
 
     let resources = match linux.and_then(|l| l.resources.as_ref()) {
         Some(r) => resources(r)?,

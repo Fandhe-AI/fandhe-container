@@ -12,10 +12,10 @@
 //! | netsetup | メソッド | net の API |
 //! | -------- | -------- | ---------- |
 //! | `net-create` | `create_network` | `network::create_network` と `StaticIpam::for_network` |
-//! | `netns-create` | `create_netns` | Linux バックエンドは `Unimplemented`（下記「netns の作成時点」） |
-//! | `veth-attach` | `attach` | `network::attach_container`（netns の作成と pin を含む） |
+//! | `netns-create` | `create_netns` | `network::create_container_netns`（netns の作成と pin。#2675） |
+//! | `veth-attach` | `attach` | `network::attach_prepared_container`（事前作成の netns へ接続） |
 //! | `publish-port` | `publish_port` | 未実装（`Unimplemented`） |
-//! | （なし） | `detach` | 未 attach の記録の取り消しのみ。attach 済みは `Unimplemented` |
+//! | （なし） | `detach` | 未 attach の記録の取り消しと事前作成 netns の解放（`network::release_container_netns`）のみ。attach 済みは `Unimplemented` |
 //! | `net-delete` | `delete_network` | `network::delete_network` |
 //!
 //! # 契約との対応（`NetworkPlugin` の doc の契約番号）
@@ -33,11 +33,15 @@
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //!
-//! - netns の作成時点: トレイトの `create_netns` は「netns の作成（lo の up を含む）」だが、net の
-//!   `attach_container` は netns の作成と pin から veth・アドレス設定までを 1 回で行い、先に netns を作ると
-//!   同じ pin パスで `AlreadyExists` になる。そのため Linux バックエンド（`LinuxNetsetup`）の `create_netns` は
-//!   メモリ上の登録だけで成功を装わず `Unimplemented` を返す（実 netns の事前作成は net の API 分割の後続作業）。
-//!   バックエンドの `create_netns` が成功したときだけ契約 7・8 の記録を作る
+//! - netns の作成時点（#2675）: `create_netns` は net の `create_container_netns` で netns を作って pin し、
+//!   attach 前のハンドルをバックエンド（`LinuxNetsetup`）が保持する。`lo` の up は attach が netns 内設定で行う
+//!   （トレイトの「lo の up を含む」は attach 完了時点で満たす）。attach の失敗では veth・アドレスを戻すが
+//!   netns は unpin せず保持し、`detach`・`delete_network` が解放する。バックエンドの `create_netns` が
+//!   成功したときだけ契約 7・8 の記録を作る。置き場の作成途中の取り残しは件数入りの `Internal` で報告するが、
+//!   記録が無いため手動回収になる
+//! - コンテナがこの netns へ入る側（core の `linux.namespaces[].path` の受け入れ）は未実装で、本層の呼び出し元は
+//!   cri の `PodNetworkProvider`（[`crate::pod_network::NetsetupPodNetwork`]）だけ。本番へは注入しない
+//!   （`docs/design/cri-config-acceptance.md` の順 13）
 //! - 作成失敗の回収（#2467）: 手動回収のまま残るのは、所有トークンを刻む前の失敗で残った bridge（請求書が無い、
 //!   または別名が空で証明できない）、他者の同名資源が残っている場合、置き場に記録できなかった・壊れた記録の場合。
 //!   いずれも記録を保持して `FailedPrecondition`（または件数入りの `Internal`）を返す。請求書は
@@ -92,9 +96,8 @@ pub const MSG_PUBLISH_PORT_UNAVAILABLE: &str =
 /// attach 済みコンテナの切り離しの未実装文言。
 pub const MSG_DETACH_UNAVAILABLE: &str =
     "detach of an attached container is not available yet: net has no per-container teardown";
-/// netns の事前作成の未実装文言（Linux バックエンド）。
-pub const MSG_NETNS_CREATE_UNAVAILABLE: &str =
-    "netns pre-creation is not available yet: net creates the netns inside attach";
+/// 事前作成した netns が見つからないときの文言（Linux バックエンド。attach は `create_netns` を前提とする）。
+pub const MSG_NETNS_NOT_PREPARED: &str = "netns was not prepared for the container";
 /// 静的アドレスの未実装文言。
 pub const MSG_STATIC_ADDRESS_UNAVAILABLE: &str =
     "static container addresses are not available yet: net allocates addresses at attach time";
@@ -299,16 +302,23 @@ pub trait NetsetupBackend: Send + Sync {
         ))
     }
 
-    /// コンテナ専用の netns を（lo の up を含めて）作る。既定は何もしない成功（試験用 fake 向け）。
+    /// コンテナ専用の netns を作る。既定は何もしない成功（カーネル資源を作らない試験用 fake 向け）。
     ///
-    /// net の `attach_container` は netns の作成と pin から veth の設定までを 1 回で行い、先に netns を作ると
-    /// 同じ pin パスで `AlreadyExists` になる。実体を作れないバックエンドは、成功を装わず `Unimplemented` を
-    /// 返すこと（契約 3・REPAIR-3。実 netns を先に作れるよう net の API を分割する作業は後続）。
+    /// Linux バックエンドは net の `create_container_netns` で作って pin し、ハンドルを `attach` まで保持する
+    /// （#2675）。実体を作れないバックエンドは、成功を装わず `Unimplemented` を返すこと（契約 3・REPAIR-3）。
     fn create_netns(
         &self,
         _network: &mut Self::Network,
         _endpoint: &EndpointId,
     ) -> Result<(), TraitError> {
+        Ok(())
+    }
+
+    /// 未 attach のまま不要になった netns を解放する（`detach`・`delete_network` が呼ぶ。#2675）。
+    ///
+    /// 冪等で、`create_netns` が資源を保持していなければ成功する（既定）。失敗時は資源を保持したまま
+    /// エラーを返し、呼び出し側は記録を残して再試行できる。
+    fn release_netns(&self, _endpoint: &EndpointId) -> Result<(), TraitError> {
         Ok(())
     }
 
@@ -756,7 +766,9 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 MSG_DETACH_UNAVAILABLE,
             ));
         }
-        // 未 attach（記録だけ）はカーネル資源が無いので記録を消すだけで解放が済む。
+        // 未 attach は事前作成した netns があれば解放してから記録を消す。解放に失敗したら記録を保持して
+        // エラーを返す（pin を取り残したまま追跡を失わない。#2675）。
+        self.backend.release_netns(&container.endpoint)?;
         reg.containers.remove(req.container().as_str());
         Ok(DetachResponse::new())
     }
@@ -804,6 +816,23 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             .iter()
             .filter(|id| reg.containers.get(*id).is_some_and(|c| c.unreclaimed))
             .count();
+        // 未 attach で事前作成の netns を持つコンテナは、attach 済みのハンドルを取り出す前に解放する。
+        // 失敗したら記録を保持して返す（deleting は保たれ、再試行の delete_network で解放をやり直せる。#2675）。
+        if !network.backend_deleted {
+            let mut first_error = None;
+            for id in &linked {
+                if let Some(c) = reg.containers.get(id)
+                    && c.attached.is_none()
+                    && !c.unreclaimed
+                    && let Err(e) = self.backend.release_netns(&c.endpoint)
+                {
+                    first_error.get_or_insert(e);
+                }
+            }
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+        }
         let mut handles = Vec::new();
         let mut attached_ids: Vec<String> = Vec::new();
         for id in &linked {
@@ -897,9 +926,10 @@ pub use linux::{LinuxNetsetup, NETSETUP_REQUEST_TIMEOUT};
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::collections::HashMap;
     use std::os::unix::fs::DirBuilderExt as _;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use fandhe_container_net::instrument::{NetOpRecorder, NoopNetOpRecorder};
@@ -907,8 +937,9 @@ mod linux {
     use fandhe_container_net::netns::ContainerNetns;
     use fandhe_container_net::network::{
         AttachedContainer, ContainerAttachSpec, CreatedNetwork, FailedCreateClaim,
-        NetworkCreateSpec, PortRegistry, StaticIpam, attach_container, create_network,
-        delete_network, reclaim_failed_create,
+        NetworkCreateSpec, PortRegistry, PreparedNetns, StaticIpam, attach_prepared_container,
+        create_container_netns, create_network, delete_network, reclaim_failed_create,
+        release_container_netns,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -937,6 +968,9 @@ mod linux {
         netns_dir: PathBuf,
         /// netlink / nftables ソケットの計測先（REPAIR-4）。
         recorder: Arc<dyn NetOpRecorder>,
+        /// `create_netns` で作って attach 前の netns（エンドポイント ID → ハンドル）。件数はレジストリの
+        /// 上限（`MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK`）で有界。`Clone` した複製とも共有する。
+        prepared: Arc<Mutex<HashMap<String, PreparedNetns<ContainerNetns>>>>,
     }
 
     impl std::fmt::Debug for LinuxNetsetup {
@@ -956,7 +990,19 @@ mod linux {
             Self {
                 netns_dir,
                 recorder,
+                prepared: Arc::new(Mutex::new(HashMap::new())),
             }
+        }
+
+        fn lock_prepared(
+            &self,
+        ) -> Result<
+            std::sync::MutexGuard<'_, HashMap<String, PreparedNetns<ContainerNetns>>>,
+            TraitError,
+        > {
+            self.prepared.lock().map_err(|_| {
+                TraitError::new(ErrorCode::Internal, "prepared netns state is poisoned")
+            })
         }
 
         fn open_sockets(&self) -> Result<(NetlinkRouteSocket, NetlinkNetfilterSocket), TraitError> {
@@ -1058,14 +1104,52 @@ mod linux {
         fn create_netns(
             &self,
             _network: &mut Self::Network,
-            _endpoint: &EndpointId,
+            endpoint: &EndpointId,
         ) -> Result<(), TraitError> {
-            // net の attach_container が netns の作成と pin を含み、先に作ると AlreadyExists になる。
-            // メモリ上の登録だけで成功を装わない（契約 3・REPAIR-3）。
-            Err(TraitError::new(
-                ErrorCode::Unimplemented,
-                MSG_NETNS_CREATE_UNAVAILABLE,
-            ))
+            self.ensure_netns_dir()?;
+            if self.lock_prepared()?.contains_key(endpoint.as_str()) {
+                return Err(TraitError::new(
+                    ErrorCode::AlreadyExists,
+                    "netns already exists for the container",
+                ));
+            }
+            let (route, _nft) = self.open_sockets()?;
+            let prepared =
+                create_container_netns(&route, &self.netns_dir, endpoint, NETSETUP_REQUEST_TIMEOUT)
+                    .map_err(|e| {
+                        // 取り残した pin があれば件数 1 として報告する（記録が無く手動回収になる）。
+                        with_leftover(
+                            net_error_to_trait(&e.error),
+                            usize::from(e.leftover.is_some()),
+                        )
+                    })?;
+            self.lock_prepared()?
+                .insert(endpoint.as_str().to_owned(), prepared);
+            Ok(())
+        }
+
+        fn release_netns(&self, endpoint: &EndpointId) -> Result<(), TraitError> {
+            let Some(prepared) = self.lock_prepared()?.remove(endpoint.as_str()) else {
+                return Ok(());
+            };
+            let (route, nft) = match self.open_sockets() {
+                Ok(s) => s,
+                Err(e) => {
+                    self.lock_prepared()?
+                        .insert(endpoint.as_str().to_owned(), prepared);
+                    return Err(e);
+                }
+            };
+            match release_container_netns(&route, &nft, prepared, NETSETUP_REQUEST_TIMEOUT) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // 解除できなかった netns は保持して、再試行できるようにする。
+                    let error = net_error_to_trait(&e.error);
+                    self.lock_prepared()?
+                        .insert(endpoint.as_str().to_owned(), e.netns);
+                    Err(error)
+                }
+            }
         }
 
         fn attach(
@@ -1080,22 +1164,43 @@ mod linux {
                 self.netns_dir.clone(),
             )
             .map_err(|e| net_error_to_trait(&e))?;
-            let (route, nft) = self.open_sockets()?;
-            let attached = attach_container(
+            let prepared = self
+                .lock_prepared()?
+                .remove(endpoint.as_str())
+                .ok_or_else(|| {
+                    TraitError::new(ErrorCode::FailedPrecondition, MSG_NETNS_NOT_PREPARED)
+                })?;
+            let (route, nft) = match self.open_sockets() {
+                Ok(s) => s,
+                Err(e) => {
+                    self.lock_prepared()?
+                        .insert(endpoint.as_str().to_owned(), prepared);
+                    return Err(e.into());
+                }
+            };
+            let attached = match attach_prepared_container(
                 &route,
                 &nft,
                 &spec,
+                prepared,
                 &mut network.ipam,
                 &mut network.ports,
                 NETSETUP_REQUEST_TIMEOUT,
-            )
-            .map_err(|e| {
-                let leftover = e.rollback.leftover.len();
-                AttachFailure {
-                    error: with_leftover(net_error_to_trait(&e.error), leftover),
-                    leftover,
+            ) {
+                Ok(a) => a,
+                Err(e) => {
+                    // netns は unpin されずに返る。保持して detach・delete_network に解放を任せる。
+                    if let Some(netns) = e.netns {
+                        self.lock_prepared()?
+                            .insert(endpoint.as_str().to_owned(), netns);
+                    }
+                    let leftover = e.error.rollback.leftover.len();
+                    return Err(AttachFailure {
+                        error: with_leftover(net_error_to_trait(&e.error.error), leftover),
+                        leftover,
+                    });
                 }
-            })?;
+            };
             Ok(AttachOutcome {
                 address: attached.address,
                 container: attached,

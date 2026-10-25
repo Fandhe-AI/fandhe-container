@@ -112,13 +112,18 @@ impl InjectedContent {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            use std::io::Read as _;
+            use std::io::{Read as _, Seek as _, SeekFrom};
+            let internal = |_| TraitError::new(ErrorCode::Internal, "failed to read injected file");
+            let mut handle = file;
+            // 現在位置を使わず先頭から読み、読み終えたら元の位置へ戻す（Linux 実装と同じ契約）。
+            let saved = handle.stream_position().map_err(internal)?;
+            handle.seek(SeekFrom::Start(0)).map_err(internal)?;
             let mut buf = Vec::new();
             let limit = INJECTED_FILE_MAX_BYTES as u64 + 1;
-            let mut reader = file.take(limit);
-            reader.read_to_end(&mut buf).map_err(|_| {
-                TraitError::new(ErrorCode::Internal, "failed to read injected file")
-            })?;
+            let read = (&mut handle).take(limit).read_to_end(&mut buf);
+            let restore = handle.seek(SeekFrom::Start(saved));
+            read.map_err(internal)?;
+            restore.map_err(internal)?;
             Self::from_bytes(buf)
         }
     }
@@ -796,6 +801,21 @@ mod tests {
         for d in [d1, d2, d3] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// CORE-6・SEC-5(#2628): `from_file` は現在位置が先頭でない File でも先頭から読み、同じ File を
+    /// 2 回読んでも同じ内容を返す（OS 非依存の契約）。
+    #[test]
+    fn core6_sec5_injected_content_from_file_ignores_cursor() {
+        use std::io::{Seek as _, SeekFrom};
+        let (dir, mut file) = host_file("cursor", SENTINEL);
+        file.seek(SeekFrom::Start(5)).expect("seek");
+        let a = InjectedContent::from_file(&file).expect("a");
+        let b = InjectedContent::from_file(&file).expect("b");
+        assert_eq!(a.len(), SENTINEL.len());
+        assert_eq!(b.len(), SENTINEL.len());
+        assert_eq!(file.stream_position().expect("pos"), 5);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// CORE-6・SEC-5(#2628): 比較は同一性。clone 同士は等しく、同じ内容でも別々に作った封印 memfd や

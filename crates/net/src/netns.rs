@@ -222,11 +222,17 @@ fn unescape_mountinfo(field: &str) -> Vec<u8> {
 /// `mountinfo` の内容から `path`（正規化済みの絶対パス）を含むマウントの行を空白区切りの欄で返す
 /// （OS 呼び出しを含まない純粋関数）。
 ///
-/// マウントの親子関係（2 番目の欄の parent ID）を根から辿り、各段で `path` を含む子のうち最長一致の
-/// マウントポイントを採る（同長なら後の行を採る）。ただし、同じ親の下で後の行のマウントが `path` の
-/// 祖先位置に重ねられている場合、その下に残る古い子は不可視として除外する（例: `/opt/fc` のマウントの後に
-/// `/opt` へ重ねたマウントは、mountinfo に古い `/opt/fc` の行を残したまま覆い隠す）。根が定まらない・
-/// 親子関係が循環する場合は判定不能として `None`（呼び出し側は fail-closed に扱う）。
+/// `path` を含むマウントのうち、見えているものから最長一致のマウントポイントを採る（同長なら後の行。同じ
+/// マウントポイントへの重ねマウントの最上位）。見えていないものとして次を除く:
+///
+/// - 同じ親（2 番目の欄の parent ID）の下で、後の行のマウントが自分の祖先位置に重ねられているもの（例:
+///   `/opt/fc` のマウントの後に `/opt` へ重ねたマウントは、mountinfo に古い `/opt/fc` の行を残したまま覆い隠す）
+/// - 親を辿った先に上記で隠れたマウントがあるもの（隠れたマウントの子孫）
+/// - 親子関係が循環する・親が `path` を含まない（表として壊れている）もの
+///
+/// 親の辿りは、親 ID が自身と同じ行（proc(5) の mount namespace の根）か、親 ID が表に無い行（読み手の
+/// ルートの外にある親）で止める。見えている候補が無ければ `None`（呼び出し側は fail-closed に扱う）。
+/// 行の順序が作成順である（後から重ねたマウントが後の行に出る）ことを前提にする。
 fn covering_mount<'a>(mountinfo: &'a str, path: &Path) -> Option<Vec<&'a str>> {
     use std::collections::{HashMap, HashSet};
     struct Entry<'a> {
@@ -234,6 +240,14 @@ fn covering_mount<'a>(mountinfo: &'a str, path: &Path) -> Option<Vec<&'a str>> {
         parent: &'a str,
         mp: Vec<u8>,
         fields: Vec<&'a str>,
+    }
+    /// 親を辿った可視性の判定状態（循環の検出を兼ねる）。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Seen {
+        Unknown,
+        InProgress,
+        Visible,
+        Hidden,
     }
     let target = path.as_os_str().as_bytes();
     let contains = |mp: &[u8]| {
@@ -251,63 +265,88 @@ fn covering_mount<'a>(mountinfo: &'a str, path: &Path) -> Option<Vec<&'a str>> {
         ) else {
             continue;
         };
-        entries.push(Entry {
-            id,
-            parent,
-            mp: unescape_mountinfo(mp_field),
-            fields,
-        });
-    }
-    // 上限つきの mountinfo（cli は 4 MiB）でも行数の 2 乗にならないよう、ID の集合と
-    // 「親 ID → `path` を含む子の行番号（行順）」の表を先に作る。
-    let ids: HashSet<&str> = entries.iter().map(|e| e.id).collect();
-    let mut children: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (i, e) in entries.iter().enumerate() {
-        if e.id != e.parent && contains(&e.mp) {
-            children.entry(e.parent).or_default().push(i);
+        let mp = unescape_mountinfo(mp_field);
+        // `path` を含まない行は候補にも祖先にもならない（祖先のマウントポイントは子の前置きのため）。
+        if contains(&mp) {
+            entries.push(Entry {
+                id,
+                parent,
+                mp,
+                fields,
+            });
         }
     }
-    // 根: 親が表に無く、`path` を含むマウント。複数あれば後の行を採る。`path` を含まない根しか無ければ
-    // 判定不能（`path` を含まないマウントの属性を返すと fail-open になる）。
-    let mut cur = entries
-        .iter()
-        .rposition(|e| !ids.contains(e.parent) && contains(&e.mp))?;
-    // 深さは行数を超えない（超えたら循環とみなして判定不能）。
-    for _ in 0..=entries.len() {
-        let cur_id = entries.get(cur)?.id;
-        let cands = children.get(cur_id).map_or(&[][..], Vec::as_slice);
-        // 後の行から見て、自分より後に祖先位置へ重ねられたマウントがあれば隠れている。
+    // 上限つきの mountinfo（cli は 4 MiB）でも行数の 2 乗にならないよう、表を先に作る。
+    let all_ids: HashSet<&str> = mountinfo
+        .lines()
+        .filter_map(|l| l.split_ascii_whitespace().next())
+        .collect();
+    let mut by_id: HashMap<&str, usize> = HashMap::new();
+    let mut siblings: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        by_id.insert(e.id, i);
+        if e.id != e.parent {
+            siblings.entry(e.parent).or_default().push(i);
+        }
+    }
+    // 後の兄弟に祖先位置を覆われたもの。後の行から見て、祖先の前置き（`/` と、`/` の直前で切った各前置き。
+    // `/opt/fc` なら `/opt`）が既に出ていれば隠れている。
+    let mut covered = vec![false; entries.len()];
+    for group in siblings.values() {
         let mut later: HashSet<&[u8]> = HashSet::new();
-        let mut best: Option<usize> = None;
-        for &c in cands.iter().rev() {
+        for &c in group.iter().rev() {
             let mp = entries.get(c)?.mp.as_slice();
-            // 祖先位置: `/`（自分が `/` でなければ）と、`/` の直前で切った各前置き（`/opt/fc` なら `/opt`）。
             let under_root = mp != b"/" && later.contains(&b"/"[..]);
             let under_dir = mp
                 .iter()
                 .enumerate()
                 .skip(1)
                 .any(|(i, b)| *b == b'/' && mp.get(..i).is_some_and(|a| later.contains(a)));
-            let hidden = under_root || under_dir;
+            if under_root || under_dir {
+                *covered.get_mut(c)? = true;
+            }
             later.insert(mp);
-            if hidden {
-                continue;
-            }
-            // 後の行から見ているので、同長は先に見たもの（後の行）を残す。
-            let better = match best {
-                None => true,
-                Some(b) => mp.len() > entries.get(b)?.mp.len(),
-            };
-            if better {
-                best = Some(c);
-            }
-        }
-        match best {
-            Some(next) => cur = next,
-            None => return Some(entries.get(cur)?.fields.clone()),
         }
     }
-    None
+    // 親を辿って可視性を決める（結果を覚えて、重ねマウントが長く連なっても線形に収める）。
+    let mut seen = vec![Seen::Unknown; entries.len()];
+    let mut best: Option<usize> = None;
+    for start in 0..entries.len() {
+        let mut chain: Vec<usize> = Vec::new();
+        let mut cur = start;
+        let result = loop {
+            match *seen.get(cur)? {
+                Seen::Visible => break Seen::Visible,
+                Seen::Hidden | Seen::InProgress => break Seen::Hidden, // InProgress は循環
+                Seen::Unknown => {}
+            }
+            *seen.get_mut(cur)? = Seen::InProgress;
+            chain.push(cur);
+            let e = entries.get(cur)?;
+            if *covered.get(cur)? {
+                break Seen::Hidden;
+            }
+            if e.parent == e.id || !all_ids.contains(e.parent) {
+                break Seen::Visible;
+            }
+            match by_id.get(e.parent) {
+                Some(&p) => cur = p,
+                // 親は表にあるが `path` を含まない（壊れた表）。fail-closed に見えていない側へ寄せる。
+                None => break Seen::Hidden,
+            }
+        };
+        for i in chain {
+            *seen.get_mut(i)? = result;
+        }
+        if result == Seen::Visible {
+            let len = entries.get(start)?.mp.len();
+            // 行順に見ているので、同長は後の行で置き換える。
+            if best.is_none_or(|b| entries.get(b).is_some_and(|e| len >= e.mp.len())) {
+                best = Some(start);
+            }
+        }
+    }
+    best.and_then(|b| entries.get(b)).map(|e| e.fields.clone())
 }
 
 /// `mountinfo`（`/proc/self/mountinfo` の内容）上で `path`（正規化済みの絶対パス）を含むマウントの
@@ -315,7 +354,7 @@ fn covering_mount<'a>(mountinfo: &'a str, path: &Path) -> Option<Vec<&'a str>> {
 ///
 /// パスの存在だけでは分からない「そのパスがどのファイルシステム上にあるか」の確認に使う
 /// （cli の `doctor` が `/proc/sys/net` が procfs 上にあることを確認する。NET-10・TASK-148.1）。
-/// 選び方は netns 置き場の伝播検査と同じ（`covering_mount`: 親子関係を辿り、隠れたマウントを除いた最長一致）。
+/// 選び方は netns 置き場の伝播検査と同じ（`covering_mount`: 隠れたマウントを除いた最長一致）。
 /// OS 呼び出しを含まない純粋関数。
 pub fn covering_mount_fstype(mountinfo: &str, path: &Path) -> Option<String> {
     let fields = covering_mount(mountinfo, path)?;
@@ -343,7 +382,7 @@ pub enum MountOptionState {
 ///
 /// cli の `doctor` のランチャー診断が、ランチャーの実体が `nosuid` マウント上にあるか
 /// （setuid と file capability が効かないか）を調べるために呼ぶ（SUP-14・CORE-6・#2661）。
-/// 選び方は [`covering_mount_fstype`] と同じ（親子関係を辿り、隠れたマウントを除いた最長一致）。該当マウントが無い・欄が欠けている・
+/// 選び方は [`covering_mount_fstype`] と同じ（隠れたマウントを除いた最長一致）。該当マウントが無い・欄が欠けている・
 /// `-` 区切りが無い壊れた行は理由つきの判定不能（`Present` / `Absent` 以外）で返す。呼び出し側は fail-closed に扱う。
 /// OS 呼び出しを含まない純粋関数。
 pub fn covering_mount_has_option(mountinfo: &str, path: &Path, option: &str) -> MountOptionState {
@@ -365,7 +404,7 @@ pub fn covering_mount_has_option(mountinfo: &str, path: &Path, option: &str) -> 
 
 /// `mountinfo` の内容から `dir`（正規化済みの絶対パス）を含むマウントを探し、その伝播が `shared` なら
 /// 拒否する（OS 呼び出しを含まない純粋関数。単体テスト用に分離）。マウントの選び方は `covering_mount`
-/// （親子関係を辿り、隠れたマウントを除いた最長一致）。見つからなければ拒否する（fail-closed）。
+/// （隠れたマウントを除いた最長一致）。見つからなければ拒否する（fail-closed）。
 fn check_propagation(mountinfo: &str, dir: &Path) -> Result<(), NetError> {
     let Some(fields) = covering_mount(mountinfo, dir) else {
         return Err(NetError::new(
@@ -1372,6 +1411,34 @@ mod tests {
                 .code(),
             NetErrorCode::Internal
         );
+        // proc(5): mount namespace の根は parent ID が自身の ID と同じ。これを根として扱う。
+        let selfroot = "\
+22 22 8:1 / / rw,nosuid - ext4 /dev/sda1 rw
+26 22 0:23 / /opt/fc rw,relatime - tmpfs tmpfs rw
+";
+        let has4 = |p: &str| covering_mount_has_option(selfroot, Path::new(p), "nosuid");
+        assert_eq!(has4("/opt/fc/bin/launcher"), MountOptionState::Absent);
+        assert_eq!(has4("/srv/x"), MountOptionState::Present);
+        assert_eq!(check_propagation(selfroot, Path::new("/run/netns")), Ok(()));
+        // `path` を含まない親なしの行（pivot_root 前の古い根など）が別にあっても、本物の `/` 側から選ぶ。
+        let oldroot = "\
+30 7 0:40 / /oldroot rw - ext4 /dev/sdb1 rw
+22 22 8:1 / / rw,nosuid - ext4 /dev/sda1 rw
+26 22 0:23 / /opt/fc rw,relatime - tmpfs tmpfs rw
+";
+        let has5 = |p: &str| covering_mount_has_option(oldroot, Path::new(p), "nosuid");
+        assert_eq!(has5("/opt/fc/bin/launcher"), MountOptionState::Absent);
+        assert_eq!(has5("/srv/x"), MountOptionState::Present);
+        assert_eq!(has5("/oldroot/x"), MountOptionState::Absent);
+        // 隠れたマウントの子孫も選ばない（/opt/fc が隠れていれば、その上の /opt/fc/bin も見えない）。
+        let nested = "\
+22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+26 22 0:23 / /opt/fc rw,relatime - tmpfs tmpfs rw
+28 26 0:25 / /opt/fc/bin rw,relatime - tmpfs tmpfs rw
+27 22 0:24 / /opt rw,nosuid,relatime - tmpfs tmpfs rw
+";
+        let has6 = |p: &str| covering_mount_has_option(nested, Path::new(p), "nosuid");
+        assert_eq!(has6("/opt/fc/bin/launcher"), MountOptionState::Present);
         // 根が無い（循環）表は判定不能（fail-closed）。
         let cyc = "1 2 0:1 / /a rw - tmpfs t rw\n2 1 0:2 / /a/b rw - tmpfs t rw\n";
         assert_eq!(

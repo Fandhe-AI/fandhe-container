@@ -301,11 +301,12 @@ mod imp {
     }
 
     fn list_path(p: &Path, limit: usize) -> io::Result<Vec<OsString>> {
-        Ok(fs::read_dir(p)?
-            .flatten()
-            .take(limit)
-            .map(|e| e.file_name())
-            .collect())
+        // 各エントリの読み取りエラーは捨てず伝播する（不完全な一覧を成功として返さない。OCI-7）。
+        let mut out = Vec::new();
+        for e in fs::read_dir(p)?.take(limit) {
+            out.push(e?.file_name());
+        }
+        Ok(out)
     }
 
     fn stage_stat_failed() -> OciError {

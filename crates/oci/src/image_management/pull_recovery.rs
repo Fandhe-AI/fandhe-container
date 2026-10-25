@@ -183,10 +183,14 @@ fn reclaim_dir_with(
         }
         Err(_) => return Err(OciErrorCode::Internal),
     };
-    // 子の列挙は上限つき。上限を超える分が残れば最後の rmdir が失敗し、`@pull.lock` ごと残る（余分に残す側）。
+    // 子の列挙は上限を 1 件超えて読み、超過を検出したら何も消さず `@pull.lock` ごと残す（確認できなければ
+    // 残す。未列挙の子が残ったままロックだけ消すと次回の probe_pull が Undetermined になり再回収できない。OCI-7）。
     let names = dir
-        .list_names(MAX_CACHE_SCAN_ENTRIES)
+        .list_names(MAX_CACHE_SCAN_ENTRIES + 1)
         .map_err(|_| OciErrorCode::Internal)?;
+    if names.len() > MAX_CACHE_SCAN_ENTRIES {
+        return Err(OciErrorCode::ResourceExhausted);
+    }
     let mut failed = false;
     for name in names {
         if name == PULL_LOCK_FILE_NAME {

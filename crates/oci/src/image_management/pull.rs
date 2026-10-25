@@ -587,6 +587,22 @@ impl PullSession<'_> {
                     "staged blob is not a regular file",
                 )
             })?;
+        // unix は検証するハンドル自身の指紋を採り、名前側の指紋と一致することを確かめる。名前の再解決だけで
+        // 指紋を採ると、確認後に同名へ差し替えた別実体の指紋が検証済みハンドルに結び付く（OCI-1・OCI-7・SEC-1）。
+        #[cfg(unix)]
+        {
+            let handle_ident = FileIdent::of(
+                &file
+                    .metadata()
+                    .map_err(|e| io_err(&e, "failed to stat staged blob"))?,
+            );
+            if handle_ident != before {
+                return Err(err(
+                    OciErrorCode::DataLoss,
+                    "staged blob changed during verification",
+                ));
+            }
+        }
         // unix は確認済みの同じハンドルの内容を検証する（パスを開き直さない）。
         #[cfg(unix)]
         let v = verify_blob_file_digest_with(self.store.recorder(), &file, digest, max_bytes)?;

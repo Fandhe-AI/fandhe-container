@@ -15,11 +15,13 @@
 //!
 //! - 種類: bind のみ（`type == "bind"`、または options に `bind` / `rbind`）。それ以外は `UNIMPLEMENTED`（受けるかは #2347 で判断待ち。docs/design/oci-mounts-implicit-entries.md）。
 //!   ただし bind でない `type == "sysfs"` は読み飛ばし（位置は元のまま）、`SysfsMountSpec` が受ける（#2020）
-//! - 受けるオプション: `bind`・`rbind`・`ro`・`rw`・`nosuid`・`nodev`・`noexec`・`exec`・`private`・`rprivate`
-//! - 拒否: `suid`・`dev`（制限を外す側。SEC-1）、`shared`・`rshared`・`slave`・`rslave`・`unbindable`・
-//!   `runbindable`（伝播）、上記以外すべて（未知は fail-closed）
-//! - 常に付ける: `nosuid`・`nodev`（型が常に真を返し、外した値を表現できない。REPAIR-2）。伝播は常に private
-//!   （適用側は private で付ける契約）。`noexec` は指定時のみ
+//! - 受けるオプション: `bind`・`rbind`・`ro`・`rw`・`nosuid`・`nodev`・`noexec`・`exec`・`private`・`rprivate`・`rslave`
+//!   （`rslave` はホストの peer group から受けるだけの slave。ホストへは伝播しない。#2669・CRI-2・OCI-4・SEC-1。
+//!   `private`・`rprivate` との併記は `ConflictingPropagation`）
+//! - 拒否: `suid`・`dev`（制限を外す側。SEC-1）、`shared`・`rshared`・`slave`・`unbindable`・
+//!   `runbindable`（伝播。`rshared` を受けない理由は `docs/design/mount-propagation.md`）、上記以外すべて（未知は fail-closed）
+//! - 常に付ける: `nosuid`・`nodev`（型が常に真を返し、外した値を表現できない。REPAIR-2）。伝播は private、
+//!   `rslave` 指定時だけ [`BindPropagation::HostSlave`]（適用側は `BindMountSpec::propagation` に従う契約）。`noexec` は指定時のみ
 //! - 再帰: 既定は非再帰。`rbind` 指定時のみ再帰（属性を再帰で付けるのは適用側）
 //! - マウント元: 字句検証（絶対・`..`/`.`/空要素/NUL/`\` なし・`/` 不可）。rootfs・bundle の同一・祖先は
 //!   [`BindMountSet::check_against_host_paths`]（子孫は受ける）、状態ルートの同一・祖先・子孫は
@@ -38,7 +40,7 @@
 //! | `source` | 絶対、または bundle 相対 | 絶対のみ |
 //! | `nosuid`・`nodev` | 指定時のみ | 常に付与・外せない |
 //! | `suid`・`dev` | 受ける | 拒否 |
-//! | 伝播系・`unbindable` | 受ける | 拒否（常に private） |
+//! | 伝播系・`unbindable` | 受ける | `rslave` のみ受ける（ホスト側が shared / slave の元に限る）。他は拒否 |
 //! | `defaults` | no-op | 拒否（許可集合外） |
 //! | 再帰版 `rro` 等・`idmap` | 受ける | 拒否 |
 //! | 宛先 `/proc`・`/sys`・`/dev` 配下 | 制限なし | 拒否 |
@@ -95,7 +97,8 @@ const RESERVED_DESTINATIONS: [&str; 3] = ["/proc", "/sys", "/dev"];
 
 /// 検証済みの bind mount 1 件（フィールドは非公開。REPAIR-2）。
 ///
-/// `nosuid` / `nodev` は常に付与され外せない（#1910）。伝播は常に private で、適用側は private で付ける。
+/// `nosuid` / `nodev` は常に付与され外せない（#1910）。伝播は [`Self::propagation`] に従い、既定は private、
+/// `rslave` 指定時だけホストからの slave（#2669）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BindMountSpec {
     index: usize,
@@ -104,6 +107,21 @@ pub struct BindMountSpec {
     read_only: bool,
     noexec: bool,
     recursive: bool,
+    propagation: BindPropagation,
+}
+
+/// bind mount の伝播（検証済み。値は 2 通りで、`shared` 系を表現できない。REPAIR-2・SEC-1）。
+///
+/// `exec::MountIsolation::establish_with` が `HostSlave` の元を `/` の再帰 private 化の前に複製し、
+/// `mount_binds` がその複製を載せる。コンテナからホストへ伝播する向きは表現できない（OCI-4・CRI-2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BindPropagation {
+    /// 伝播させず、受けない（既定。`private`・`rprivate`・指定なし）。
+    Private,
+    /// ホストの peer group から受けるだけの slave（`rslave`）。ホスト側の元が shared か slave であることが前提で、
+    /// 満たさなければ適用の段が起動を拒否する。
+    HostSlave,
 }
 
 impl BindMountSpec {
@@ -151,6 +169,11 @@ impl BindMountSpec {
     pub fn recursive(&self) -> bool {
         self.recursive
     }
+
+    /// 伝播（既定は private。`rslave` 指定時だけ `HostSlave`）。
+    pub fn propagation(&self) -> BindPropagation {
+        self.propagation
+    }
 }
 
 /// bind mount 変換・検証の失敗分類。
@@ -174,8 +197,10 @@ pub enum BindMountErrorKind {
     ForbiddenSource,
     /// `suid` / `dev`（制限を外す指定）。
     RestrictionLifting,
-    /// 伝播系（`shared` / `slave` / `unbindable` 等）。
+    /// 伝播系（`shared` / `rshared` / `slave` / `unbindable` 等。`rslave` は受ける）。
     Propagation,
+    /// `rslave` と `private` / `rprivate` の併記（#2669。#2063 の (a) と同じ扱い）。
+    ConflictingPropagation,
     /// 許可集合外のオプション。
     UnsupportedOption,
     /// `bind` と `rbind` の併記（暫定）。
@@ -245,6 +270,7 @@ impl BindMountError {
             BindMountErrorKind::ForbiddenSource => "bind mount source is a forbidden host path",
             BindMountErrorKind::RestrictionLifting => "mount option lifts a mandatory restriction",
             BindMountErrorKind::Propagation => "mount propagation options are not supported",
+            BindMountErrorKind::ConflictingPropagation => "conflicting mount propagation options",
             BindMountErrorKind::UnsupportedOption => "unsupported mount option",
             BindMountErrorKind::ConflictingBindKind => "both bind and rbind are specified",
             BindMountErrorKind::ReservedDestination => {
@@ -489,6 +515,7 @@ impl BindMountSet {
                 read_only: opts.read_only,
                 noexec: opts.noexec,
                 recursive: opts.recursive,
+                propagation: opts.propagation,
             });
         }
         Ok(Self {
@@ -505,6 +532,13 @@ impl BindMountSet {
     /// 空か。
     pub fn is_empty(&self) -> bool {
         self.mounts.is_empty()
+    }
+
+    /// `rslave`（ホストからの slave）の bind を 1 件でも含むか。launcher が中間プロセス側の `/` の伝播を選ぶ根拠にする。
+    pub fn has_host_slave(&self) -> bool {
+        self.mounts
+            .iter()
+            .any(|m| m.propagation == BindPropagation::HostSlave)
     }
 
     /// 件数。
@@ -654,12 +688,14 @@ struct ParsedOptions {
     read_only: bool,
     noexec: bool,
     recursive: bool,
+    propagation: BindPropagation,
 }
 
 fn parse_options(index: usize, m: &OciMount) -> Result<ParsedOptions, BindMountError> {
     let err = |kind| BindMountError::at(index, kind);
     let (mut has_bind, mut has_rbind) = (false, false);
     let (mut read_only, mut noexec) = (false, false);
+    let (mut has_slave, mut has_private) = (false, false);
     // 種類判定を先に行う（処理順は種類 → オプション）。bind 以外は他オプションの内容に依らず NotBind。
     let opts_have = |name: &str| m.options().iter().any(|o| o.as_str() == name);
     if !(m.fs_type() == Some("bind") || opts_have("bind") || opts_have("rbind")) {
@@ -674,9 +710,11 @@ fn parse_options(index: usize, m: &OciMount) -> Result<ParsedOptions, BindMountE
             "noexec" => noexec = true,
             "exec" => noexec = false,
             // 効果は常時付与済み（nosuid / nodev）または既定（private）。
-            "nosuid" | "nodev" | "private" | "rprivate" => {}
+            "nosuid" | "nodev" => {}
+            "private" | "rprivate" => has_private = true,
+            "rslave" => has_slave = true,
             "suid" | "dev" => return Err(err(BindMountErrorKind::RestrictionLifting)),
-            "shared" | "rshared" | "slave" | "rslave" | "unbindable" | "runbindable" => {
+            "shared" | "rshared" | "slave" | "unbindable" | "runbindable" => {
                 return Err(err(BindMountErrorKind::Propagation));
             }
             _ => return Err(err(BindMountErrorKind::UnsupportedOption)),
@@ -685,10 +723,18 @@ fn parse_options(index: usize, m: &OciMount) -> Result<ParsedOptions, BindMountE
     if has_bind && has_rbind {
         return Err(err(BindMountErrorKind::ConflictingBindKind));
     }
+    if has_slave && has_private {
+        return Err(err(BindMountErrorKind::ConflictingPropagation));
+    }
     Ok(ParsedOptions {
         read_only,
         noexec,
         recursive: has_rbind,
+        propagation: if has_slave {
+            BindPropagation::HostSlave
+        } else {
+            BindPropagation::Private
+        },
     })
 }
 
@@ -918,16 +964,60 @@ mod tests {
     /// SEC-1: 伝播系は拒否する。
     #[test]
     fn sec1_bind_rejects_propagation() {
-        for o in [
-            "shared",
-            "rshared",
-            "slave",
-            "rslave",
-            "unbindable",
-            "runbindable",
-        ] {
+        for o in ["shared", "rshared", "slave", "unbindable", "runbindable"] {
             let (k, _, _) = kind_of(json!([bind(&["bind", o])]));
             assert_eq!(k, BindMountErrorKind::Propagation, "opt={o}");
+        }
+    }
+
+    /// OCI-4・CRI-2（#2669）: `rslave` は受け、伝播は `HostSlave`。`bind` でも `rbind` でも同じ。
+    #[test]
+    fn oci4_bind_accepts_rslave() {
+        let m = set(json!([
+            one(Some("bind"), "/x", Some("/var/lib/x"), &["rbind", "rslave"]),
+            one(Some("bind"), "/y", Some("/var/lib/y"), &["bind", "rslave"]),
+            one(
+                Some("bind"),
+                "/z",
+                Some("/var/lib/z"),
+                &["rbind", "rprivate"]
+            ),
+        ]))
+        .expect("accepted");
+        let got: Vec<_> = m
+            .mounts()
+            .iter()
+            .map(|b| (b.recursive(), b.propagation()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (true, BindPropagation::HostSlave),
+                (false, BindPropagation::HostSlave),
+                (true, BindPropagation::Private),
+            ]
+        );
+        assert!(m.has_host_slave());
+        let plain = set(json!([bind(&["bind"])])).expect("plain");
+        assert!(!plain.has_host_slave());
+    }
+
+    /// SEC-1（#2669）: `rslave` と `private` / `rprivate` の併記は拒否する。
+    #[test]
+    fn sec1_bind_rejects_rslave_with_private() {
+        for o in ["private", "rprivate"] {
+            for opts in [["bind", "rslave", o], ["bind", o, "rslave"]] {
+                let (k, i, c) = kind_of(json!([bind(&opts)]));
+                assert_eq!(
+                    (k, i, c),
+                    (
+                        BindMountErrorKind::ConflictingPropagation,
+                        Some(0),
+                        ErrorCode::InvalidArgument
+                    ),
+                    "opts={opts:?}"
+                );
+            }
         }
     }
 
@@ -1065,6 +1155,14 @@ mod tests {
         assert_eq!(m, d);
         assert_eq!(m, "mounts[1]: unsupported mount option");
         assert!(!m.contains("x-token") && !m.contains("secret-host-dir"));
+        // 伝播の併記（#2669）も位置と固定文言だけ。
+        let e =
+            BindMountSet::from_mounts(cfg(json!([bind(&["bind", "rslave", "rprivate"])])).mounts())
+                .expect_err("rejected");
+        assert_eq!(
+            e.message(),
+            "mounts[0]: conflicting mount propagation options"
+        );
     }
 
     /// CORE-2: tmpfs・注入・保護パス・ホストパスとの交差検査。

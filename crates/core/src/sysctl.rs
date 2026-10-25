@@ -20,7 +20,7 @@
 //!
 //! 出典: runc `libcontainer/configs/validate/validator.go` の `sysctl`（tag v1.3.0、commit
 //! `4ca628d1d4c974f92d24daccb901aa078aad748e`、Apache-2.0）の許可集合と同じ分類。写したのはキー名と接頭辞だけで、
-//! ロジックは写していない。
+//! ロジックは写していない。runc の NOTICE の帰属行はルート `NOTICE` に記載済み（#2670）。
 //!
 //! # 文法（`/proc/sys` 配下のパスへ変換するため、すり抜けを文法の段で閉じる）
 //!

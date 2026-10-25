@@ -38,3 +38,31 @@ to the derived path strings, and an export-control note) do not relate
 to any part of this product and are omitted under Section 4(d) of the
 Apache License 2.0. The full text is in the NOTICE file at the commit
 above.
+
+--------------------------------------------------------------------
+Third-party attribution: opencontainers/runc (Apache License 2.0)
+--------------------------------------------------------------------
+
+Source:  https://github.com/opencontainers/runc
+File:    libcontainer/configs/validate/validator.go (func sysctl)
+Commit:  4ca628d1d4c974f92d24daccb901aa078aad748e (tag v1.3.0)
+
+What was derived: only the key names and prefixes of the allowed
+namespaced sysctl set (kernel.shm*, kernel.msg*, kernel.sem,
+fs.mqueue.*, net.*, and the kernel.hostname / kernel.domainname
+classification). No logic was copied. The corresponding definition file
+in this repository is crates/core/src/sysctl.rs (issue #2670).
+
+The attribution lines of the runc NOTICE file at that commit:
+
+    runc
+
+    Copyright 2012-2015 Docker, Inc.
+
+    This product includes software developed at Docker, Inc.
+    (http://www.docker.com).
+
+The export-control note in the runc NOTICE file at that commit does not
+relate to any part of this product and is omitted here; whether this
+omission is acceptable is pending the repository owner's decision. The
+full text is in the NOTICE file at the commit above.

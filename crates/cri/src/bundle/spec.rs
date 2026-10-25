@@ -39,6 +39,8 @@
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 //! - `linux.cgroup_parent` の受け入れ方針（オーナー承認待ち。判断が出るまで `UNIMPLEMENTED`）は
 //!   `docs/design/cri-cgroup-parent.md`（#2672・CRI-2・CORE-4）にまとめている。
+//! - `devices`・`cdi_devices` の受け入れ方針（オーナー判断待ち。判断が出るまで `UNIMPLEMENTED`）は
+//!   `docs/design/cri-devices-cdi.md`（#2673・CRI-2・GPU-1）にまとめている。
 
 use std::collections::HashMap;
 
@@ -759,8 +761,14 @@ fn build_inner(
     if container.tty || container.stdin || container.stdin_once {
         return Err(unsupported("tty/stdin"));
     }
-    if !container.devices.is_empty() || !container.cdi_devices.is_empty() {
+    // devices・cdi_devices は core の `linux.devices` の適用・device cgroup の許可リスト・gpu の CDI 適用が揃うまで
+    // 拒否する。受けて値を捨てると、要求したデバイスが黙って無いコンテナが起動するため（一般デバイスは GPU-9 が
+    // 検討中）。docs/design/cri-devices-cdi.md・#2673（CRI-2・GPU-1）。
+    if !container.devices.is_empty() {
         return Err(unsupported("devices"));
+    }
+    if !container.cdi_devices.is_empty() {
+        return Err(unsupported("cdi_devices"));
     }
     // stop_signal は config.json に出さない（OCI の config に欄が無い）。停止時に StopRequest で運ぶため、
     // ここでは値域だけを検証する（未知の値は INVALID_ARGUMENT。CRI-2・#2668）。

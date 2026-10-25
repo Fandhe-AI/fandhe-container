@@ -460,11 +460,11 @@ fn unpack_rootfs(
     }
     // 公開前に所有トークンの印を書く（delete が作成世代を照合する。OCI-7・#2378）。失敗は公開前なので消す。
     // 印には状態ルートの識別子も載せる（孤児の回収が別の状態ルートの木を消さないため。OCI-5・#2635）。
-    if let Err(e) = created.seal(state_root_scope(store).as_deref()) {
+    if let Err(e) = created.seal_with(state_root_scope(store).as_deref(), privilege) {
         remove_created_rootfs(recorder, created, privilege);
         return Err(e);
     }
-    if let Err(e) = created.publish() {
+    if let Err(e) = created.publish_with(privilege) {
         // 改名前の失敗だけ非公開の木を消す。改名後の検証失敗は公開済みで、並行する create が使いうるため
         // 残す（OCI-7 の使用中 rootfs の保持。#854 の起動時照合・手動で回収する）。
         if !created.is_published() {

@@ -56,8 +56,8 @@
 //!   macOS / Windows ではコンテナはゲスト VM（Linux）内で実行されるため、ホスト側から
 //!   直接呼ぶ経路は存在しない（非 Linux ビルドの確認は #137・TASK-27.5）
 //! - syscall を呼ぶ `unsafe` は `crate::sys` に閉じ込め、本ファイルには置かない
-//! - 呼び出し元は TASK-29 の `oci_runtime`（`create` / `start`）と supervisor（TASK-157）を想定し、fork 段は
-//!   [`spawn_container`]（#831）が担う
+//! - 製品コードの呼び出し元は本番 launcher（`ProductionLauncher`。`spawn_container_via_intermediate`）で、
+//!   fork 段の最小入口 [`spawn_container`]（#831）は結合試験だけが呼び、専用の `/dev` を載せない（#2700）
 //! - 常駐デーモンを前提にしない（CORE-1・D-19）
 //! - 分離違反の試行を拒否したエラーは `ExecError::violation` に構造化された違反記録
 //!   （[`IsolationViolation`]: 種別・理由コード・ビヘイビア ID・対象）を持つ。**記録の経路のみ**で、

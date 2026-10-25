@@ -107,6 +107,8 @@ mod root_handle;
 #[cfg(test)]
 mod root_swap_tests;
 mod store;
+#[cfg(test)]
+mod xdev_tests;
 pub use store::{
     IMAGE_STORE_LOCK_FILE_NAME, IMAGE_STORE_LOCK_TIMEOUT, ImageStore, ImageStoreGuard,
 };

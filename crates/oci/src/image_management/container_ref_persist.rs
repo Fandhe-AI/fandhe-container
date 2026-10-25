@@ -45,7 +45,7 @@ use std::fmt;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 
-use super::root_handle::RootHandle;
+use super::root_handle::{RootHandle, map_root_io};
 use super::{ContainerRefEntry, ContainerRefGeneration, ContainerRefId, ReferenceTable};
 use crate::error::{OciError, OciErrorCode};
 use crate::reference::Digest;
@@ -182,11 +182,13 @@ fn load_with_limits(
     let pre = match root.stat_name(CONTAINER_REFS_FILE_NAME) {
         Ok(Some(m)) => m,
         Ok(None) => return Ok(None),
-        Err(_) => {
-            return Err(e(
-                OciErrorCode::Internal,
-                "failed to inspect the container refs file",
-            ));
+        Err(err) => {
+            return Err(map_root_io(&err, || {
+                e(
+                    OciErrorCode::Internal,
+                    "failed to inspect the container refs file",
+                )
+            }));
         }
     };
     check_trust(&pre)?;
@@ -198,7 +200,7 @@ fn load_with_limits(
     };
     let file = root
         .open_read(CONTAINER_REFS_FILE_NAME)
-        .map_err(|_| open_failed())?
+        .map_err(|err| map_root_io(&err, open_failed))?
         .ok_or_else(open_failed)?;
     let post = file.metadata().map_err(|_| {
         e(
@@ -467,16 +469,18 @@ fn save_with_limits(
 /// 一時ファイルを書いて固定名へ公開し、root を fsync する。すべて検査済み root の fd 起点（#2638）。
 fn write_and_rename(root: &RootHandle, tmp: &str, bytes: &[u8]) -> Result<(), OciError> {
     let fail = |msg: &'static str| e(OciErrorCode::Internal, msg);
+    // root 配下の別マウント（EXDEV）は対応外として原因を示す（#2701）。
+    let fail_io = |err: &std::io::Error, msg: &'static str| map_root_io(err, || fail(msg));
     let mut f = root
         .create_new(tmp)
-        .map_err(|_| fail("failed to create the container refs temp file"))?;
+        .map_err(|err| fail_io(&err, "failed to create the container refs temp file"))?;
     f.write_all(bytes)
         .map_err(|_| fail("failed to write the container refs temp file"))?;
     f.sync_all()
         .map_err(|_| fail("failed to sync the container refs temp file"))?;
     drop(f);
     root.rename(tmp, CONTAINER_REFS_FILE_NAME)
-        .map_err(|_| fail("failed to replace the container refs file"))?;
+        .map_err(|err| fail_io(&err, "failed to replace the container refs file"))?;
     // 新しい名前を永続化する（Windows ではディレクトリを開けないため `sync` は何もしない）。
     root.sync()
         .map_err(|_| fail("failed to sync the image store directory"))?;

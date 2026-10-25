@@ -631,10 +631,20 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     })
     .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))
     .and_then(|(rt, (req, image))| {
-        reclaim_stale_container_log(rt.store.as_ref(), req.id(), &rt.recorder)?;
-        let r = match &image {
-            Some(image) => create_container_with_image_reclaiming(&rt, image, &req),
-            None => create_container(&rt, &req),
+        let r = match reclaim_stale_container_log(rt.store.as_ref(), req.id(), &rt.recorder) {
+            // 回収の期限切れは core を呼ばずに create の失敗として計測する（REPAIR-4）。
+            Err(e) => {
+                if let Ok(name) = OpName::new("create") {
+                    let _ = rt
+                        .recorder
+                        .record(&name, OpOutcome::Failure, started.elapsed());
+                }
+                Err(e)
+            }
+            Ok(()) => match &image {
+                Some(image) => create_container_with_image_reclaiming(&rt, image, &req),
+                None => create_container(&rt, &req),
+            },
         };
         export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
         r

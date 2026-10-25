@@ -253,7 +253,11 @@ mod tests {
             assert!((1..=124).contains(&n));
             assert!(seen.insert(n));
         }
-        assert_eq!(seen.len(), 10);
+        assert_eq!(seen.len(), ErrorCode::ALL.len());
+        assert_eq!(ALL.len(), ErrorCode::ALL.len());
+        for c in ErrorCode::ALL {
+            assert!(ALL.iter().any(|(k, _)| *k == c), "{}", c.as_str());
+        }
     }
 
     /// ERR-2: 操作名は OpRecorder の操作名と一致する。

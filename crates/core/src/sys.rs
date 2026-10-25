@@ -4276,6 +4276,65 @@ pub(crate) fn clear_supplementary_groups() -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// 補助グループの件数の上限（`NGROUPS_MAX` = 65536。OCI-1・SEC-5・CORE-6・#2667）。
+///
+/// `set_supplementary_groups` / `read_supplementary_groups` が syscall の前に件数を検査する上限で、
+/// `oci_runtime/config.rs` の `process.user.additionalGids` の上限と同値。
+pub(crate) const SUPPLEMENTARY_GROUPS_MAX: usize = 65_536;
+
+/// 呼び出しスレッドの補助グループを `gids` に置き換える（`setgroups(len, list)`。OCI-1・SEC-5・CORE-6・#2667）。
+///
+/// launch の子の capability 削減段が、`process.user.additionalGids` を適用するために呼ぶ（launcher が fork の前に
+/// user namespace の gid 写像と照合済み）。`CAP_SETGID` を要し、`setgroups` が `deny` の user namespace では
+/// `EPERM`、写像されていない gid は `EINVAL`。件数が [`SUPPLEMENTARY_GROUPS_MAX`] を超える場合は syscall の前に
+/// `EINVAL`。生の syscall のため効果は呼び出しスレッドだけに及ぶ（呼び出し側が単一スレッドであることを確かめる）。
+// テストビルドでは capability 削減段が偽のカーネルを使い、本関数を呼ばない（libtest のプロセスの資格情報を
+// 変えないため）。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn set_supplementary_groups(gids: &[u32]) -> Result<(), SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    if gids.len() > SUPPLEMENTARY_GROUPS_MAX {
+        return Err(SysError::Os(EINVAL));
+    }
+    let nr = consts::SYS_SETGROUPS.get()?;
+    // SAFETY: `setgroups(size_t size, const gid_t *list)` に `gids.len()` と `gids.as_ptr()` を渡す。ポインタは
+    // `len` 個の `u32`（gid_t と同幅）の有効な領域を指し、カーネルはそこを読むだけで書き込まない。呼び出しの間
+    // `gids` は借用されたまま生きている。効果は呼び出しスレッドの資格情報の変更のみ。
+    let rc = unsafe { syscall(nr, gids.len() as i64, gids.as_ptr()) };
+    if rc == -1 { Err(last_error()) } else { Ok(()) }
+}
+
+/// 呼び出しスレッドの補助グループを読み戻す（`getgroups`。OCI-1・SEC-5・CORE-6・#2667）。
+///
+/// 件数を `getgroups(0, NULL)` で取り、[`SUPPLEMENTARY_GROUPS_MAX`] 以下を確かめてから確保して読む。
+/// 読んだ件数が最初の件数と食い違えば `EINVAL`（呼び出しの間に変わった = 単一スレッドの前提違反）。
+// テストビルドでは capability 削減段が偽のカーネルを使うため、本関数は sys の試験からだけ呼ばれる。
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn read_supplementary_groups() -> Result<Vec<u32>, SysError> {
+    let n = supplementary_group_count()?;
+    if n > SUPPLEMENTARY_GROUPS_MAX {
+        return Err(SysError::Os(EINVAL));
+    }
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let nr = consts::SYS_GETGROUPS.get()?;
+    let mut buf = vec![0u32; n];
+    // SAFETY: `getgroups(int size, gid_t *list)` に `n` と、`n` 個の `u32`（gid_t と同幅）を持つ `buf` の
+    // 先頭ポインタを渡す。カーネルは最大 `n` 個を書き込み、それ以上は書かない（足りなければ `EINVAL`）。
+    // `buf` は呼び出しの間可変借用されたまま生きている。
+    let got = unsafe { syscall(nr, n as i64, buf.as_mut_ptr()) };
+    if got < 0 {
+        return Err(last_error());
+    }
+    if usize::try_from(got) != Ok(n) {
+        return Err(SysError::Os(EINVAL));
+    }
+    Ok(buf)
+}
+
 /// 呼び出しスレッドの実効 gid・実 gid・保存 gid を `gid` に揃える（`setresgid(gid, gid, gid)`。SUP-6・SEC-5・
 /// TASK-163 追補・#1462）。
 ///
@@ -5970,6 +6029,29 @@ mod tests {
             .split_whitespace()
             .count();
         assert_eq!(supplementary_group_count(), Ok(groups));
+    }
+
+    /// OCI-1・SEC-5・CORE-6（#2667）: 補助グループの読み戻しが実スレッドの `Groups:` と一致し、
+    /// 上限超過の `setgroups` は syscall の前に `EINVAL` になること（資格情報は変えない）。
+    #[test]
+    fn oci1_sec5_supplementary_groups_readback_matches_status_and_limit_is_enforced() {
+        let status = std::fs::read_to_string("/proc/thread-self/status").unwrap();
+        let mut expected: Vec<u32> = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Groups:"))
+            .unwrap()
+            .split_whitespace()
+            .map(|g| g.parse().unwrap())
+            .collect();
+        let mut got = read_supplementary_groups().unwrap();
+        expected.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(got, expected);
+        let too_many = vec![1u32; SUPPLEMENTARY_GROUPS_MAX + 1];
+        assert_eq!(
+            set_supplementary_groups(&too_many),
+            Err(SysError::Os(EINVAL))
+        );
     }
 
     /// SUP-6・SEC-5・TASK-163 追補（#1462）: `setresuid` / `getresuid` / `setresgid` / `getresgid` の syscall

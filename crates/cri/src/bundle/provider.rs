@@ -29,17 +29,23 @@ use fandhe_container_core::traits::ContainerId;
 use super::spec::{ImageDefaults, build_runtime_config, validate_config};
 use crate::adapter::{BundleProvider, BundleRequest};
 use crate::error::CriError;
-use crate::runtime::v1::ImageSpec;
+use crate::runtime::v1::{ImageSpec, SupplementalGroupsPolicy};
 
 /// `RootfsSource::prepare` へ渡す、rootfs の passwd 等で解決してほしい User 関連の要求（#2664・CRI-2・SEC-5）。
 ///
-/// `SpecBundleProvider::prepare` が CRI の設定から作る。将来 `supplemental_groups` 等の解決（#2667）を
-/// 足せるよう、裸の引数にせず構造体にしている。外部から作るときは [`Self::none`] / [`Self::with_run_as_username`]。
+/// `SpecBundleProvider::prepare` が CRI の設定から作る。解決の要求を足せるよう、裸の引数にせず構造体にしている
+/// （`supplemental_groups` のイメージ由来の解決は #2667）。外部から作るときは [`Self::none`] /
+/// [`Self::with_run_as_username`] / [`Self::with_run_as_user`] / [`Self::with_image_groups`]。
 #[derive(Debug, Clone, Copy, Default)]
 #[non_exhaustive]
 pub struct UserResolveRequest<'a> {
     /// CRI の `run_as_username`（未指定は `None`）。形式は `validate_config` が検証済みだが、実装側も再検証する。
     pub run_as_username: Option<&'a str>,
+    /// CRI の `run_as_user`（未指定は `None`）。実効ユーザーの名前を passwd から引くために使う（#2667）。
+    pub run_as_user: Option<u32>,
+    /// 実効ユーザーのイメージの `/etc/group` での所属グループを求めてほしい（`supplemental_groups_policy` が
+    /// `Merge`。#2667）。真のとき実装は [`ImageDefaults::supplementary_gids`] を埋める。
+    pub image_groups: bool,
 }
 
 impl<'a> UserResolveRequest<'a> {
@@ -52,7 +58,20 @@ impl<'a> UserResolveRequest<'a> {
     pub fn with_run_as_username(name: &'a str) -> Self {
         Self {
             run_as_username: Some(name),
+            ..Self::default()
         }
+    }
+
+    /// CRI の `run_as_user` を伝える（#2667）。
+    pub fn with_run_as_user(mut self, uid: u32) -> Self {
+        self.run_as_user = Some(uid);
+        self
+    }
+
+    /// イメージ由来の補助グループの解決を要求する（#2667）。
+    pub fn with_image_groups(mut self) -> Self {
+        self.image_groups = true;
+        self
     }
 }
 
@@ -303,8 +322,21 @@ impl BundleProvider for SpecBundleProvider {
             .and_then(|l| l.security_context.as_ref())
             .map(|s| s.run_as_username.as_str())
             .filter(|n| !n.is_empty());
+        let sc = req
+            .config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref());
+        // `validate_config` が値の範囲と方針を検証済みなので、ここでの変換失敗は「要求なし」に倒す。
+        let run_as_user = sc
+            .and_then(|s| s.run_as_user.as_ref())
+            .and_then(|v| u32::try_from(v.value).ok());
+        let merge = sc
+            .is_none_or(|s| s.supplemental_groups_policy == SupplementalGroupsPolicy::Merge as i32);
         let user = UserResolveRequest {
             run_as_username: username,
+            run_as_user,
+            image_groups: merge,
         };
         let built = (|| {
             let defaults = self.rootfs.prepare(image, &rootfs, &user)?;

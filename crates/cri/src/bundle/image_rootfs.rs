@@ -358,6 +358,7 @@ fn defaults_from(process: &ImageProcessConfig) -> Result<ImageDefaults, CriError
         user,
         user_unresolved,
         resolved_run_as_username: None,
+        supplementary_gids: Vec::new(),
     })
 }
 
@@ -458,6 +459,114 @@ fn group_gid(body: &[u8], name: &str) -> Option<u32> {
             None
         }
     })
+}
+
+/// passwd から uid の最初の一致の名前を引く（形式が崩れた行は読み飛ばす）。
+fn passwd_name_of(body: &[u8], uid: u32) -> Option<String> {
+    etc_fields(body).find_map(|f| {
+        let (name, id) = (f.first()?, f.get(2)?.parse::<u32>().ok()?);
+        (id == uid).then(|| (*name).to_owned())
+    })
+}
+
+/// group から、第 4 フィールド（メンバー一覧）に `user` を含む行の gid を行順に集める（重複は除く）。
+///
+/// グループ名が `user` と同じ行は除く（containerd の `WithAdditionalGIDs` と同じ。#2667）。形式が崩れた行は読み飛ばす。
+fn group_memberships(body: &[u8], user: &str) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+    for f in etc_fields(body) {
+        let (Some(name), Some(gid), Some(members)) = (
+            f.first(),
+            f.get(2).and_then(|g| g.parse::<u32>().ok()),
+            f.get(3),
+        ) else {
+            continue;
+        };
+        if *name != user && members.split(',').any(|m| m == user) && !out.contains(&gid) {
+            out.push(gid);
+        }
+    }
+    out
+}
+
+/// `read_etc` の失敗を CRI のエラーへ写す（`Unsupported` は `UNIMPLEMENTED`、`Untrusted` は `FAILED_PRECONDITION`。
+/// メッセージは固定文言）。
+fn etc_read_error(e: EtcReadError, what: &'static str) -> CriError {
+    match e {
+        EtcReadError::Unsupported => {
+            CriError::unimplemented(format!("image {what} cannot be read on this platform"))
+        }
+        EtcReadError::Untrusted => {
+            CriError::failed_precondition(format!("image {what} could not be read"))
+        }
+    }
+}
+
+/// 実効ユーザーの `(uid, 名前)` を決める。決まらない（イメージ User が無い・名前が引けない・passwd を読めない等）と `None`。
+///
+/// 優先順位は CRI の `run_as_username`（解決済みの uid）→ `run_as_user`（passwd を uid で引く）→ イメージ User
+/// （名前形式ならその名前、uid 形式なら passwd を uid で引く）。uid 0 は passwd を読まずに `None` とする
+/// （root にはイメージ由来のグループを付けない。#2667）。
+fn effective_username(
+    rootfs: &Path,
+    request: &UserResolveRequest<'_>,
+    image_user: &str,
+    defaults: &ImageDefaults,
+) -> Result<Option<(u32, String)>, CriError> {
+    let (uid, hint) = if let Some(name) = request.run_as_username {
+        let Some((uid, _)) = defaults.resolved_run_as_username else {
+            return Ok(None);
+        };
+        (uid, Some(name.to_owned()))
+    } else if let Some(uid) = request.run_as_user {
+        (uid, None)
+    } else if let Some((uid, _)) = defaults.user {
+        let hint = match parse_user_lookup(image_user).map(|l| l.user) {
+            Some(IdPart::Name(n)) => Some(n),
+            _ => None,
+        };
+        (uid, hint)
+    } else {
+        return Ok(None);
+    };
+    if uid == 0 {
+        return Ok(None);
+    }
+    let name = match hint {
+        Some(n) => n,
+        None => {
+            // passwd を安全に読めない場合は名前を決められないものとして扱い、イメージ由来のグループを付けない
+            // （権限が弱くなる側。明示した run_as_user の起動を passwd の不備で止めない。#2667）。
+            let Ok(body) = read_etc(rootfs, "passwd") else {
+                return Ok(None);
+            };
+            match body.as_deref().and_then(|b| passwd_name_of(b, uid)) {
+                Some(n) => n,
+                None => return Ok(None),
+            }
+        }
+    };
+    Ok(Some((uid, name)))
+}
+
+/// 実効ユーザーのイメージの `/etc/group` での所属グループを求める（#2667・CRI-2・SEC-5）。
+///
+/// 実効 uid が 0 でなく名前が決まったときだけ group を読む。group が無ければ空、安全に読めなければ拒否する
+/// （読めなかったグループを黙って空にしない）。
+fn resolve_image_groups(
+    rootfs: &Path,
+    request: &UserResolveRequest<'_>,
+    image_user: &str,
+    defaults: &ImageDefaults,
+) -> Result<Vec<u32>, CriError> {
+    let Some((_, name)) = effective_username(rootfs, request, image_user, defaults)? else {
+        return Ok(Vec::new());
+    };
+    let body = read_etc(rootfs, "group").map_err(|e| etc_read_error(e, "group"))?;
+    Ok(body
+        .as_deref()
+        .map(|b| group_memberships(b, &name))
+        .unwrap_or_default())
 }
 
 /// rootfs の `etc/<file>` を fd 起点で読む。`Ok(None)` は不在、`Err` は読めない（呼び出し側が未解決にする）。
@@ -634,6 +743,11 @@ impl RootfsSource for ImageRootfsSource {
             {
                 defaults.user = Some(ids);
                 defaults.user_unresolved = false;
+            }
+            // 補助グループ（Merge のとき）: 実効ユーザーの所属グループを /etc/group から求める（#2667）。
+            if user.image_groups {
+                defaults.supplementary_gids =
+                    resolve_image_groups(rootfs, user, process.user(), &defaults)?;
             }
             self.check_deadline(started)
         });
@@ -877,5 +991,101 @@ mod tests {
                 group: Some(IdPart::Name("staff".into()))
             })
         );
+    }
+
+    const GROUPS_PASSWD: &str =
+        "root:x:0:0:r:/root:/bin/sh\napp:x:1000:1001::/h:/bin/sh\nother:x:2000:2000::/h:/bin/sh\n";
+    const GROUPS_GROUP: &str = "root:x:0:app\nwheel:x:10:root,app\napp:x:1001:app\nstaff:x:50:other,app\nbad:x:q:app\nshort:x\nwheel2:x:10:app\n";
+
+    /// CRI-2・SEC-5（#2667）: 所属グループは第 4 フィールドにユーザー名を含む行の gid を行順に集め、同名のグループ・
+    /// 形式の崩れた行・重複する gid は除く。
+    #[test]
+    fn cri2_group_memberships_table() {
+        let body = GROUPS_GROUP.as_bytes();
+        assert_eq!(group_memberships(body, "app"), vec![0, 10, 50]);
+        assert_eq!(group_memberships(body, "other"), vec![50]);
+        assert_eq!(group_memberships(body, "nobody"), Vec::<u32>::new());
+        assert_eq!(
+            passwd_name_of(GROUPS_PASSWD.as_bytes(), 1000),
+            Some("app".to_owned())
+        );
+        assert_eq!(passwd_name_of(GROUPS_PASSWD.as_bytes(), 7), None);
+    }
+
+    /// CRI-2・SEC-5（#2667）: 実効ユーザーと rootfs の `/etc/group` からイメージ由来の補助グループを求める。
+    /// 名前は username → run_as_user（passwd を uid で引く）→ イメージ User の順。uid 0 は group を読まない。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn cri2_resolve_image_groups_table() {
+        use crate::error::CriErrorCode as C;
+        let r = lookup_rootfs(Some(GROUPS_PASSWD), Some(GROUPS_GROUP));
+        let none = UserResolveRequest::none();
+        let img = |uid: u32| ImageDefaults {
+            user: Some((uid, uid)),
+            ..Default::default()
+        };
+        // イメージ User が名前形式。
+        assert_eq!(
+            resolve_image_groups(&r, &none, "app", &img(1000)).unwrap(),
+            vec![0, 10, 50]
+        );
+        // イメージ User が uid 形式 -> passwd を uid で引く。
+        assert_eq!(
+            resolve_image_groups(&r, &none, "1000:1001", &img(1000)).unwrap(),
+            vec![0, 10, 50]
+        );
+        // run_as_user が優先（イメージ User は無視）。
+        let req = UserResolveRequest::none().with_run_as_user(2000);
+        assert_eq!(
+            resolve_image_groups(&r, &req, "app", &img(1000)).unwrap(),
+            vec![50]
+        );
+        // run_as_username（解決済み）。
+        let req = UserResolveRequest::with_run_as_username("other");
+        let d = ImageDefaults {
+            resolved_run_as_username: Some((2000, 2000)),
+            ..Default::default()
+        };
+        assert_eq!(resolve_image_groups(&r, &req, "", &d).unwrap(), vec![50]);
+        // passwd に uid が無い・イメージ User が無い -> 空。
+        let req = UserResolveRequest::none().with_run_as_user(7);
+        assert!(
+            resolve_image_groups(&r, &req, "", &img(1000))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            resolve_image_groups(&r, &none, "", &ImageDefaults::default())
+                .unwrap()
+                .is_empty()
+        );
+        // uid 0 は読まない（group が symlink でもエラーにならない）。
+        let _ = std::fs::remove_dir_all(&r);
+        let r = lookup_rootfs(Some(GROUPS_PASSWD), None);
+        std::os::unix::fs::symlink("/etc/passwd", r.join("etc/group")).unwrap();
+        assert!(
+            resolve_image_groups(&r, &none, "root", &img(0))
+                .unwrap()
+                .is_empty()
+        );
+        // 非 root で group が symlink -> FAILED_PRECONDITION。
+        assert_eq!(
+            resolve_image_groups(&r, &none, "app", &img(1000))
+                .unwrap_err()
+                .code(),
+            C::FailedPrecondition
+        );
+        let _ = std::fs::remove_dir_all(&r);
+        // group が無い -> 空。
+        let r = lookup_rootfs(Some(GROUPS_PASSWD), None);
+        assert!(
+            resolve_image_groups(&r, &none, "app", &img(1000))
+                .unwrap()
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&r);
     }
 }

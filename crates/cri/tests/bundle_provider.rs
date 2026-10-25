@@ -16,8 +16,8 @@ use fandhe_container_cri::bundle::{
 };
 use fandhe_container_cri::error::{CriError, CriErrorCode};
 use fandhe_container_cri::runtime::v1::{
-    ContainerConfig, ContainerMetadata, ImageSpec, LinuxContainerConfig,
-    LinuxContainerSecurityContext, PodSandboxConfig,
+    ContainerConfig, ContainerMetadata, ImageSpec, Int64Value, LinuxContainerConfig,
+    LinuxContainerSecurityContext, PodSandboxConfig, SupplementalGroupsPolicy,
 };
 
 struct TempDir(PathBuf);
@@ -58,6 +58,8 @@ struct FakeRootfs {
     seen_username: Mutex<Option<String>>,
     /// 真なら要求を解決して `resolved_run_as_username` を返す（偽は要求を無視する実装を模す）。
     resolve_username: Mutex<Option<(u32, u32)>>,
+    /// 受け取った解決要求の (run_as_user, image_groups)（#2667）。
+    seen_groups_request: Mutex<Option<(Option<u32>, bool)>>,
 }
 
 impl RootfsSource for FakeRootfs {
@@ -69,6 +71,7 @@ impl RootfsSource for FakeRootfs {
     ) -> Result<ImageDefaults, CriError> {
         self.prepares.fetch_add(1, Ordering::SeqCst);
         *self.seen_username.lock().unwrap() = user.run_as_username.map(str::to_owned);
+        *self.seen_groups_request.lock().unwrap() = Some((user.run_as_user, user.image_groups));
         fs::create_dir(rootfs).map_err(|_| CriError::internal("rootfs"))?;
         if *self.fail_prepare.lock().unwrap() {
             return Err(CriError::resource_exhausted("no space"));
@@ -158,6 +161,48 @@ fn run_as_username_is_resolved_through_the_rootfs_source() {
         serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
     assert_eq!(v["process"]["user"]["uid"], 1000);
     assert_eq!(v["process"]["user"]["gid"], 1001);
+}
+
+/// CRI-2・SEC-5（#2667）: run_as_user と方針（Merge か Strict）が解決要求に載り、RootfsSource が返したイメージ由来の
+/// 補助グループが CRI の一覧に先立って config.json の additionalGids になる。Strict ではイメージ由来を使わない。
+#[test]
+fn supplemental_groups_request_and_merge_reach_the_config() {
+    let sc = |policy: SupplementalGroupsPolicy| LinuxContainerConfig {
+        security_context: Some(LinuxContainerSecurityContext {
+            run_as_user: Some(Int64Value { value: 1000 }),
+            supplemental_groups: vec![70, 60],
+            supplemental_groups_policy: policy as i32,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let gids = |dir: &Path| -> serde_json::Value {
+        let v: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
+        v["process"]["user"]["additionalGids"].clone()
+    };
+    let (_tmp, rootfs, p) = setup("groups-merge");
+    *rootfs.defaults.lock().unwrap() = ImageDefaults {
+        supplementary_gids: vec![50, 60],
+        ..Default::default()
+    };
+    let mut c = container();
+    c.linux = Some(sc(SupplementalGroupsPolicy::Merge));
+    let dir = prepare(&p, "ctr1", &c).expect("prepare");
+    assert_eq!(
+        *rootfs.seen_groups_request.lock().unwrap(),
+        Some((Some(1000), true))
+    );
+    assert_eq!(gids(&dir), serde_json::json!([50, 60, 70]));
+    oci_runtime::load_config(&dir.join("config.json")).expect("core parses config.json");
+
+    c.linux = Some(sc(SupplementalGroupsPolicy::Strict));
+    let dir = prepare(&p, "ctr2", &c).expect("prepare");
+    assert_eq!(
+        *rootfs.seen_groups_request.lock().unwrap(),
+        Some((Some(1000), false))
+    );
+    assert_eq!(gids(&dir), serde_json::json!([70, 60]));
 }
 
 /// CRI-2・SEC-5（#2664）: 解決要求を無視する実装では UNIMPLEMENTED で拒否し、bundle を残さない。

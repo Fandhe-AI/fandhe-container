@@ -34,8 +34,9 @@
 
 5. コンテナ内から `/data/sub/marker` の内容 `from-host` が読めることを確かめる（伝播した）。`ro` の bind に変えた場合は書けないこと、`nosuid`・`nodev` が伝播した側にも付くとは限らないこと（残余。`docs/design/mount-propagation.md`）も記録する
 6. 逆方向: コンテナ内からのマウントはできない（`CAP_SYS_ADMIN` なし・seccomp）ため、ホストへ伝播しないことは構造的に保たれる。ホスト側に `/srv/rslave-src/sub` 以外の新しいマウントが現れていないこと（`findmnt -R /srv/rslave-src`）を確かめる
-7. ホスト側の元が private のときの拒否: `sudo mount --make-rprivate /srv/rslave-src` の後に同じ bundle を `start` し、`FAILED_PRECONDITION`（メッセージに `not a shared or slave mount on the host`）で失敗し、状態が Created のまま、子が残らず、rootfs に `data` が作られていないことを確かめる
-8. 後始末（root）: コンテナを `terminate` → `delete`、`sudo umount /srv/rslave-src/sub; sudo umount /srv/rslave-src; rmdir` で戻す
+7. 手順 2 のコンテナを `terminate` → `delete` で終わらせ、rootfs を作り直す（手順 2 の起動で bind 先 `data` が rootfs に作られているため、使い回さない）。`sudo umount /srv/rslave-src/sub` で手順 4 のマウントを外し、`data` のない新しい rootfs で同じ内容の `config.json` から Created 状態の新しいコンテナを `create` する（`start` 済みのコンテナを再 `start` すると Created 状態の検査で `container is not in created state` となり、以下の拒否の検査に到達しない）
+8. ホスト側の元が private のときの拒否: `sudo mount --make-rprivate /srv/rslave-src` の後に、手順 7 で作った新しいコンテナを `start` し、`FAILED_PRECONDITION`（メッセージに `not a shared or slave mount on the host`）で失敗し、状態が Created のまま、子が残らず、rootfs に `data` が作られていないことを確かめる
+9. 後始末（root）: コンテナを `terminate` → `delete`、`sudo umount /srv/rslave-src; rmdir` で戻す
 
 ## 結果記録（雛形）
 
@@ -45,5 +46,5 @@
 | 手順 3: コンテナ内の `/data` の optional fields | `master:N` あり・`shared:` なし | 未記入 |
 | 手順 5: `/data/sub/marker` の内容 | `from-host` | 未記入 |
 | 手順 6: ホスト側の新しいマウント | `sub` のみ | 未記入 |
-| 手順 7: ホスト側が private のときの `start` | `FAILED_PRECONDITION`・Created のまま・子なし・`data` なし | 未記入 |
+| 手順 8: ホスト側が private のときの `start` | `FAILED_PRECONDITION`・Created のまま・子なし・`data` なし | 未記入 |
 | 備考（残余の観測） | 未記入 | 未記入 |

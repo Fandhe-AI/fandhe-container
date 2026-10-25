@@ -408,6 +408,8 @@ mod consts {
     pub const MFD_CLOEXEC: u32 = 0x1;
     pub const MFD_ALLOW_SEALING: u32 = 0x2;
     pub const MFD_EXEC: u32 = 0x10;
+    // include/uapi/linux/memfd.h の `MFD_NOEXEC_SEAL`（6.3+。実行不可で `F_SEAL_EXEC` つきの memfd。全アーキテクチャ共通）。
+    pub const MFD_NOEXEC_SEAL: u32 = 0x8;
     // include/uapi/linux/fcntl.h の `F_ADD_SEALS`・`F_GET_SEALS`（`F_LINUX_SPECIFIC_BASE` 1024 + 9・+ 10）。
     pub const F_ADD_SEALS: i32 = 1033;
     pub const F_GET_SEALS: i32 = 1034;
@@ -758,6 +760,8 @@ mod consts {
     pub const MFD_CLOEXEC: u32 = 0x1;
     pub const MFD_ALLOW_SEALING: u32 = 0x2;
     pub const MFD_EXEC: u32 = 0x10;
+    // include/uapi/linux/memfd.h の `MFD_NOEXEC_SEAL`（6.3+。実行不可で `F_SEAL_EXEC` つきの memfd。全アーキテクチャ共通）。
+    pub const MFD_NOEXEC_SEAL: u32 = 0x8;
     // include/uapi/linux/fcntl.h の `F_ADD_SEALS`・`F_GET_SEALS`（`F_LINUX_SPECIFIC_BASE` 1024 + 9・+ 10）。
     pub const F_ADD_SEALS: i32 = 1033;
     pub const F_GET_SEALS: i32 = 1034;
@@ -1048,6 +1052,7 @@ mod consts {
     pub const MFD_CLOEXEC: u32 = 0;
     pub const MFD_ALLOW_SEALING: u32 = 0;
     pub const MFD_EXEC: u32 = 0;
+    pub const MFD_NOEXEC_SEAL: u32 = 0;
     pub const F_ADD_SEALS: i32 = 0;
     pub const F_GET_SEALS: i32 = 0;
     pub const F_SEAL_SEAL: u32 = 0;
@@ -1294,6 +1299,10 @@ unsafe extern "C" {
     // SAFETY（宣言そのものの妥当性）: `int fstatfs(int fd, struct statfs *buf)`。構造体は下の
     // [`StatFs`]（arch 別に個別定義）で、カーネルが書く 120 バイトを確保する。
     fn fstatfs(fd: i32, buf: *mut StatFs) -> i32;
+    // SAFETY（宣言そのものの妥当性）: `ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)`
+    // （glibc / musl。Linux の LP64 で `off_t` は i64・`ssize_t` は isize）。`libc` との機械照合は core には未適用
+    // （適用は cli・oci のみ。docs/design/ffi-libc-check.md）。#2628・CORE-6・SEC-5。
+    fn sendfile(out_fd: i32, in_fd: i32, offset: *mut i64, count: usize) -> isize;
     // SAFETY（宣言そのものの妥当性）: `int socket(int domain, int type, int protocol)`。
     fn socket(domain: i32, ty: i32, protocol: i32) -> i32;
     // SAFETY（宣言そのものの妥当性）: `ssize_t sendto(int fd, const void *buf, size_t len, int flags,
@@ -3385,6 +3394,10 @@ impl SealSet {
         consts::F_SEAL_SEAL | consts::F_SEAL_SHRINK | consts::F_SEAL_GROW | consts::F_SEAL_WRITE,
     );
 
+    /// 注入ファイルの内容用 memfd に付ける seal（書き込み・伸長・縮小・seal の追加を禁止。#2628）。
+    /// `MFD_NOEXEC_SEAL` が付ける `F_SEAL_EXEC` は含めず、検証は [`SealSet::contains`] で行う。
+    pub(crate) const DATA_COPY: SealSet = SealSet::EXEC_COPY;
+
     /// seal のビット値（診断・テスト用）。
     pub(crate) fn bits(self) -> u32 {
         self.0
@@ -3413,6 +3426,73 @@ pub(crate) fn memfd_create_for_exec_copy(name: &'static CStr) -> Result<OwnedFd,
         Err(SysError::Os(e)) if e == EINVAL => memfd_create_raw(name, base),
         other => other,
     }
+}
+
+/// 注入ファイルの内容を置く memfd を作る（`memfd_create(2)`。`MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL`）。
+///
+/// 内容をユーザー空間のバッファへ載せず、ホストのファイルから `sendfile(2)` のカーネル内コピーだけで置く入口
+/// （ID 写像の holder が fork で継承するメモリへ secret を載せないため。#2628・CORE-6・SEC-5）。実行できない
+/// memfd にする（`MFD_EXEC` は付けない）。`MFD_NOEXEC_SEAL` を知らないカーネル（6.3 未満）は `EINVAL` を返すため、
+/// そのときだけ外して 1 回再試行する（6.3 未満の memfd は実行可能だが、内容用で実行には使わない）。
+/// それ以外の失敗（`EPERM` = seccomp・`ENOSYS` など）はそのまま返し、呼び出し側が拒否する（fail-closed）。
+/// `name` は固定値を渡す前提で外部入力を混ぜない。
+pub(crate) fn memfd_create_for_data(name: &'static CStr) -> Result<OwnedFd, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    let base = consts::MFD_CLOEXEC | consts::MFD_ALLOW_SEALING;
+    match memfd_create_raw(name, base | consts::MFD_NOEXEC_SEAL) {
+        Err(SysError::Os(e)) if e == EINVAL => memfd_create_raw(name, base),
+        other => other,
+    }
+}
+
+/// `input` の `*offset` から最大 `count` バイトを `out` へカーネル内でコピーする（`sendfile(2)`。EINTR は再試行）。
+///
+/// 戻り値はコピーしたバイト数（0 は `input` の終端）。`*offset` はコピーした分だけ進み、`input` のファイル位置は
+/// 動かさない。ユーザーバッファを経由しないため、secret の内容を呼び出し元のメモリへ載せない（#2628）。
+pub(crate) fn sendfile_at(
+    out: BorrowedFd<'_>,
+    input: BorrowedFd<'_>,
+    offset: &mut i64,
+    count: usize,
+) -> Result<usize, SysError> {
+    if !consts::SUPPORTED {
+        return Err(SysError::Unsupported);
+    }
+    loop {
+        // SAFETY: `out` / `input` は生存中の `BorrowedFd`。`offset` は呼び出しの間有効な `&mut i64`（カーネルが
+        // 読み書きするのは `off_t` 1 個分だけ）。`count` は size_t で、カーネルはその範囲を超えてコピーしない。
+        let rc = unsafe {
+            sendfile(
+                out.as_raw_fd(),
+                input.as_raw_fd(),
+                std::ptr::from_mut(offset),
+                count,
+            )
+        };
+        if rc < 0 {
+            let e = last_error();
+            if e == SysError::Os(EINTR) {
+                continue;
+            }
+            return Err(e);
+        }
+        return usize::try_from(rc).map_err(|_| SysError::Os(EINVAL));
+    }
+}
+
+/// `fd`（[`memfd_create_for_data`] で作り内容を書き終えたもの）に [`SealSet::DATA_COPY`] を付け、含まれることを確かめる。
+/// 以後の書き込み・伸長・縮小・seal の変更は `EPERM`。確認できなければ `Err`（封印を確かめていない内容を使わない）。
+pub(crate) fn seal_data_memfd(fd: BorrowedFd<'_>) -> Result<(), SealError> {
+    add_seals(fd, SealSet::DATA_COPY).map_err(SealError::Sys)?;
+    let actual = get_seals(fd).map_err(SealError::Sys)?;
+    if !actual.contains(SealSet::DATA_COPY) {
+        return Err(SealError::Unexpected {
+            actual: actual.bits(),
+        });
+    }
+    Ok(())
 }
 
 fn memfd_create_raw(name: &CStr, flags: u32) -> Result<OwnedFd, SysError> {

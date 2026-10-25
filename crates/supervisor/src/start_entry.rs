@@ -2222,7 +2222,7 @@ mod linux {
         /// 手順 4 が矛盾（`--ipc=host` と `--shm-size` 等。ファイルは読まない）を cgroup の連鎖より前に拒否し、手順 7 の
         /// `build_launcher` が [`ContainerOptions::launch_options`] を本番 launcher へ渡す。restart の再 launch も同じ
         /// launcher を使うので同じ指定が効く。ホストの secrets のファイルは手順 7 で一度だけ読み、launcher が保持する
-        /// （supervisor は non-dumpable。範囲写像の経路で holder が継承するメモリの露出は未解決で #2628）。
+        /// （内容は core が封印 memfd に置くため、範囲写像の経路で holder が継承するメモリに載らない。#2628）。
         /// CLI からの受け渡しは未実装（`run_main` は既定のまま。REPAIR-3）。
         #[must_use]
         pub fn with_container_options(mut self, options: ContainerOptions) -> Self {

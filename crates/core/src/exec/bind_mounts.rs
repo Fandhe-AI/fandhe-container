@@ -67,13 +67,29 @@
 //! 7. **移動検査**: 付け替えの直前にマウント先が改名・移動・削除されていないことを fd の現在位置で確かめる（`target_moved`）
 //! 8. **付け替え**: `move_mount(2)` の空パス + fd 指定。直後に自分のマウントの fd を保持する
 //! 9. **事後検証**: マウント前と別のマウントであること・自分のマウントの ID であること・`mount_flags` が要求どおりであること・
-//!    元と同じ `(st_dev, st_ino)` であること・mountinfo で自分のマウント（`rbind` は配下全体）に `shared:`・`master:` が無く
+//!    元と同じ `(st_dev, st_ino)` であること・mountinfo で自分のマウント（`rbind` は配下全体）に `shared:`・`master:` が無く（`rslave` は
+//!    `shared:` が無く、最上位に `master:` か `propagate_from:` があること）
 //!    per-mount options が要求を満たすこと。満たさなければ fail-closed で失敗にする。続けて同じ mountinfo で、自分のマウント
 //!    （`rbind` は配下全体）の fstype を拒否リストの名前と照合し、疑似 FS が 1 つでもあれば `bind_source_pseudo_fs` で拒否する
 //!    （配下だけ除いて載せることはしない。付け替えた木そのものを見るため、検査から複製までの間に元の下へマウントが足される
 //!    TOCTOU が無い。拒否は付け替えの後だが `pivot_root`・exec の前で、後始末が自分のマウントを外す）
 //!
-//! **伝播**: 明示の private 化はしない。`MountIsolation::establish` が `/` を `MS_REC|MS_PRIVATE` にしており、この
+//! **`rslave` の例外（#2669・OCI-4・CRI-2・SEC-1）**: `BindMountSpec::propagation()` が `HostSlave` の bind だけは、下の「`/` が
+//! private である前提」の例外になる。`/` の再帰 private 化は接続済みの木の `master` 関係をすべて消すため、`MountIsolation::
+//! establish_with` が `unshare(CLONE_NEWNS)` の直後・private 化の前に、その元を固定して `clone_host_slave_sources` で複製する
+//! （ホスト側の元が shared か slave でなければ、rootfs に触れる前に `FAILED_PRECONDITION`）。複製は匿名 namespace にあり、
+//! private 化の対象にならないため `master` を保つ。本段（`apply_one`）は手順 1 の固定と手順 5 の `open_tree` の代わりにその固定と
+//! 複製を使い、他の手順（疑似 FS・rootfs・状態ルートの照合、属性、移動検査、付け替え）は private の bind と同じ。手順 9 は、
+//! `shared:` を全メンバーで禁止したまま、最上位に `master:`・`propagate_from:` のどちらかを必須にする（配下の `master:` は許す）。
+//! 付け替え先は手順 4 で非 shared と確認済みで、slave の複製はコンテナからホストへ伝播しない。
+//!
+//! 残余（REPAIR-3）: ホストから `rslave` の bind へ伝播してきたマウントは、ホスト側のマウントの属性とカーネルのロックを持ち、
+//! こちらの `nosuid`・`nodev`・`ro`・`noexec` が付かない。疑似 FS と状態ルートの検査も付け替え時点の 1 回だけである。これは
+//! HostToContainer の意味に内在し、引き起こせるのはホスト側の特権主体だけ。Landlock は経路で判定するため、bind 先の規則は
+//! 伝播したマウントにも効く。`rshared`（コンテナからホストへの伝播）は、user namespace の中では原理的に成り立たないため受けない
+//! （`docs/design/mount-propagation.md`）。
+//!
+//! **伝播（private の bind）**: 明示の private 化はしない。`MountIsolation::establish` が `/` を `MS_REC|MS_PRIVATE` にしており、この
 //! namespace のマウントは shared でも slave でもない。shared でも slave でもないマウントの複製はやはりそうなる。付け替え先は
 //! 手順 4 で非 shared と確認済みで、手順 9 が `shared:`・`master:` の不在を確かめる。`establish` の private 化は計画の
 //! namespace 集合に依らず無条件で、`mount_binds` は `&MountIsolation`（`establish` の証跡）を引数に取るため、型の上で
@@ -178,6 +194,7 @@
 //! 新マウント API・属性の観測・mountinfo は [`BindDeps`] の差し込み点で差し替える（本番は `mount_binds`、単体テストは
 //! 記録つきの dry-run）。元の固定・種別・読めるかは実ファイルで照合する。実機の挙動は #1916 の結合試験で確認する。
 
+use std::cell::RefCell;
 use std::ffi::{CString, OsStr};
 use std::io::Read as _;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
@@ -190,7 +207,7 @@ use crate::oci_runtime::mountinfo_identity::{
     fs_identity, mounts_under, parse_fdinfo_mnt_id, parse_mountinfo, path_mount_id,
     source_contains, source_reaches,
 };
-use crate::oci_runtime::{BindMountSet, BindMountSpec};
+use crate::oci_runtime::{BindMountSet, BindMountSpec, BindPropagation};
 use crate::rootless::parse_id_map;
 use crate::sys::{
     self, BindMountAttrs, BindSourceError, BindSourceKind, MountFlags, MountTreeScope, SysError,
@@ -310,6 +327,7 @@ fn mount_binds_checked(
         is_shared: &|dir| mount_is_shared(dir, STAGE),
         still_at: &fd_still_at,
         open_tree: &sys::open_tree_clone_bind,
+        pre_cloned: &|index| isolation.host_slave_clones().take(index),
         set_attrs: &sys::set_bind_mount_attrs,
         flags_of: &sys::mount_flags,
         attach: &sys::move_mount_empty_path,
@@ -333,6 +351,9 @@ struct BindDeps<'a> {
     still_at: &'a dyn Fn(&OwnedFd, &Path) -> bool,
     /// 検証済みの元を切り離して複製する。
     open_tree: &'a dyn Fn(&VerifiedBindSourceFd, MountTreeScope) -> Result<OwnedFd, SysError>,
+    /// `rslave` の bind について、`MountIsolation::establish_with` が `/` の private 化の前に固定・複製した元と複製を取り出す
+    /// （1 件につき 1 回。#2669）。`rslave` でない bind では呼ばない。
+    pre_cloned: &'a dyn Fn(usize) -> Option<HostSlaveClone>,
     /// 切り離したマウントへ属性を足す。
     set_attrs: &'a dyn Fn(BorrowedFd<'_>, BindMountAttrs, MountTreeScope) -> Result<(), SysError>,
     /// fd が属するマウントのフラグ。
@@ -356,6 +377,112 @@ struct BindDeps<'a> {
     state_identity: &'a dyn Fn(&ProtectedFsRoot, &[MountRow]) -> Option<FsIdentity>,
     /// 移動検査の後・付け替えの直前に呼ぶ（本番は空。結合試験専用の入口だけが差し込む）。
     before_attach: &'a dyn Fn(),
+}
+
+/// `rslave` の bind について、`/` の再帰 private 化の前に固定・複製した元と複製（#2669・OCI-4・CRI-2・SEC-1）。
+pub(super) struct HostSlaveClone {
+    /// 固定した元（`mount_binds` が、従来の固定の代わりに使う。同じ inode の照合は変えない）。
+    source: PinnedSource,
+    /// 切り離した複製（`ro`・`noexec` の属性はまだ付いていない）。
+    clone: OwnedFd,
+}
+
+/// `MountIsolation` が持つ `HostSlaveClone` の置き場（`spec.index()` で取り出す。1 件につき 1 回）。
+///
+/// `MountIsolation` の `Debug`・`PartialEq` のために、未取得の添字だけで比べる。fd は持ち出せない。
+#[derive(Default)]
+pub(super) struct HostSlaveClones {
+    items: RefCell<Vec<(usize, HostSlaveClone)>>,
+}
+
+impl HostSlaveClones {
+    /// `index` の複製を取り出す（取り出すと無くなる）。
+    pub(super) fn take(&self, index: usize) -> Option<HostSlaveClone> {
+        let mut items = self.items.borrow_mut();
+        let pos = items.iter().position(|(i, _)| *i == index)?;
+        Some(items.swap_remove(pos).1)
+    }
+
+    fn indices(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.items.borrow().iter().map(|(i, _)| *i).collect();
+        v.sort_unstable();
+        v
+    }
+}
+
+impl std::fmt::Debug for HostSlaveClones {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostSlaveClones")
+            .field("indices", &self.indices())
+            .finish()
+    }
+}
+
+impl PartialEq for HostSlaveClones {
+    fn eq(&self, other: &Self) -> bool {
+        self.indices() == other.indices()
+    }
+}
+
+impl Eq for HostSlaveClones {}
+
+/// mountinfo の `mnt_id` のマウントが「ホストから受ける slave」か（`master:` か `propagate_from:` があり、`shared:` が無い）。
+/// 該当なし・複数・書式違反は `Err`（fail-closed。純関数）。
+fn source_mount_is_host_slave(info: &str, mnt_id: u64) -> Result<bool, String> {
+    let entries = parse_all_mountinfo(info)?;
+    let mut found = entries.iter().filter(|e| e.id == mnt_id);
+    let Some(e) = found.next() else {
+        return Err("no mount entry found for the bind mount source".to_owned());
+    };
+    if found.next().is_some() {
+        return Err("duplicate mount ID in /proc/thread-self/mountinfo".to_owned());
+    }
+    let slave = e
+        .optional
+        .iter()
+        .any(|f| f.starts_with("master:") || f.starts_with("propagate_from:"));
+    let shared = e.optional.iter().any(|f| f.starts_with("shared:"));
+    Ok(slave && !shared)
+}
+
+/// `rslave` の bind の元を固定し、ホスト側が shared か slave であることを確かめて、`/` の再帰 private 化の前に複製する
+/// （`MountIsolation::establish_with` から、`unshare(CLONE_NEWNS)` の直後に呼ぶ。#2669）。
+///
+/// 再帰 private 化は接続済みの木の `master` 関係を消すため、後からでは `rslave` を表現できない。同じ mount namespace の中で
+/// 複製するので `check_mnt` を満たす。元のマウントが slave でない（ホスト側が private）なら、rootfs に触れる前に
+/// `FAILED_PRECONDITION` で拒否する（黙って private で載せない。containerd の `ensureSharedOrSlave` 相当）。
+/// 疑似 FS・rootfs・状態ルートとの重なりの検査は、従来どおり `mount_binds` が付け替えの前に行う。
+pub(super) fn clone_host_slave_sources(set: &BindMountSet) -> Result<HostSlaveClones, ExecError> {
+    let clones = HostSlaveClones::default();
+    for spec in set
+        .mounts()
+        .iter()
+        .filter(|m| m.propagation() == BindPropagation::HostSlave)
+    {
+        let source = pin_source(spec)?;
+        let mnt_id = pinned_source_mnt_id(&source.fd).map_err(|e| annotate(spec, e))?;
+        let info = read_thread_mountinfo(STAGE).map_err(|e| annotate(spec, e))?;
+        let is_slave =
+            source_mount_is_host_slave(&info, mnt_id).map_err(|why| failed(spec, &why))?;
+        if !is_slave {
+            return Err(failed(
+                spec,
+                "the rslave bind mount source is not a shared or slave mount on the host; make it shared (for example `mount --make-rshared`) or remove rslave",
+            ));
+        }
+        let scope = if spec.recursive() {
+            MountTreeScope::Recursive
+        } else {
+            MountTreeScope::MountOnly
+        };
+        let clone = sys::open_tree_clone_bind(&source.fd, scope)
+            .map_err(|e| open_tree_error(spec, e, scope))?;
+        clones
+            .items
+            .borrow_mut()
+            .push((spec.index(), HostSlaveClone { source, clone }));
+    }
+    Ok(clones)
 }
 
 /// 拒否リストの 1 行（疑似 FS の `statfs.f_type` と、mountinfo の fstype 欄の名前）。
@@ -671,7 +798,25 @@ fn apply_one(
     state: &mut Applied<'_>,
 ) -> Result<BindSourceKind, ExecError> {
     let deps = ctx.deps;
-    let PinnedSource { fd: src, dir_ids } = pin_source(spec)?;
+    // `rslave` の bind は、`establish_with` が `/` の private 化の前に固定・複製した元と複製を使う（そこで master 関係が
+    // 消える前に複製しておく必要がある。取り出せなければ establish を通っていないため fail-closed。#2669）。
+    let (PinnedSource { fd: src, dir_ids }, mut pre_clone) = if spec.propagation()
+        == BindPropagation::HostSlave
+    {
+        let Some(HostSlaveClone { source, clone }) = (deps.pre_cloned)(spec.index()) else {
+            return Err(annotate(
+                spec,
+                ExecError::new(
+                    ErrorCode::Internal,
+                    STAGE,
+                    "the rslave bind mount source was not cloned before the root was made private",
+                ),
+            ));
+        };
+        (source, Some(clone))
+    } else {
+        (pin_source(spec)?, None)
+    };
     // 固定した fd の FS の種類を見る（パスで再解決しない）。procfs・sysfs などの疑似 FS は、宛先に何も作る前に拒否する（#2098・SEC-1）。
     let f_type = (deps.source_fs_type)(&src)
         .map_err(|e| mount_api_error(spec, e, "fstatfs(bind mount source)"))?;
@@ -722,7 +867,10 @@ fn apply_one(
         read_only: spec.read_only(),
         noexec: spec.noexec(),
     };
-    let clone = (deps.open_tree)(&src, scope).map_err(|e| open_tree_error(spec, e, scope))?;
+    let clone = match pre_clone.take() {
+        Some(clone) => clone,
+        None => (deps.open_tree)(&src, scope).map_err(|e| open_tree_error(spec, e, scope))?,
+    };
     (deps.set_attrs)(
         clone.as_fd(),
         BindMountAttrs {
@@ -757,8 +905,14 @@ fn apply_one(
     let observed = (deps.observe)(&dest, &after, own)?;
     check_new_bind(&observed, expected, src.dev_ino()).map_err(|why| failed(spec, &why))?;
     let info = (deps.mountinfo)()?;
-    check_bind_subtree(&info, observed.own_mnt_id, expected, spec.recursive())
-        .map_err(|why| failed(spec, &why))?;
+    check_bind_subtree_with(
+        &info,
+        observed.own_mnt_id,
+        expected,
+        spec.recursive(),
+        spec.propagation() == BindPropagation::HostSlave,
+    )
+    .map_err(|why| failed(spec, &why))?;
     // 付け替えた木そのものの fstype を照合する（`rbind` の配下の疑似 FS を含む。検査から複製までの TOCTOU が無い）。
     match find_pseudo_fs_in_subtree(&info, observed.own_mnt_id, spec.recursive()) {
         Ok(None) => {}
@@ -1243,7 +1397,7 @@ fn mountinfo_failed(msg: &str) -> ExecError {
 }
 
 /// 固定した元と、辿った途中のディレクトリ（`/` から葉の親まで）の `(st_dev, st_ino)`。
-struct PinnedSource {
+pub(super) struct PinnedSource {
     fd: VerifiedBindSourceFd,
     /// 元の祖先ディレクトリの実体。元が状態ルートの bind 別名の配下にあれば、別名の mount root（状態ルートと同じ inode）が入る。
     dir_ids: Vec<(u64, u64)>,
@@ -1732,11 +1886,25 @@ fn parse_all_mountinfo(info: &str) -> Result<Vec<MountInfoEntry<'_>>, String> {
 /// 自分のマウント（mount top）は `ro`・`noexec` の有無が要求と完全に一致すること。配下は、要求した制限
 /// （`ro`・`noexec`）が付いていれば足りる（元が持つ、より強い制限は安全側のため許す）。書式に反する行・該当なし・
 /// 重複は fail-closed。
+#[cfg(test)]
 fn check_bind_subtree(
     info: &str,
     own_id: u64,
     expected: Expected,
     recursive: bool,
+) -> Result<(), String> {
+    check_bind_subtree_with(info, own_id, expected, recursive, false)
+}
+
+/// [`check_bind_subtree`] の本体。`host_slave` が真（`rslave` の bind）のときは、`shared:` を全メンバーで禁止したまま、
+/// 自分のマウント（mount top）に `master:`・`propagate_from:` のどちらかを必須にし、配下の `master:` は許す（配下も
+/// 元の slave を引き継ぐため。#2669・OCI-4・SEC-1）。偽のときは従来どおり 3 つとも禁止する。
+fn check_bind_subtree_with(
+    info: &str,
+    own_id: u64,
+    expected: Expected,
+    recursive: bool,
+    host_slave: bool,
 ) -> Result<(), String> {
     let entries = parse_all_mountinfo(info)?;
     let members = subtree_members(&entries, own_id, recursive)?;
@@ -1745,11 +1913,20 @@ fn check_bind_subtree(
     };
     let has = |e: &MountInfoEntry<'_>, opt: &str| e.options.split(',').any(|o| o == opt);
     for e in &members {
-        if e.optional.iter().any(|f| {
-            f.starts_with("shared:") || f.starts_with("master:") || f.starts_with("propagate_from:")
-        }) {
+        let slave_field = |f: &&str| f.starts_with("master:") || f.starts_with("propagate_from:");
+        if e.optional.iter().any(|f| f.starts_with("shared:")) {
             return Err(
                 "the bind mount is shared or a slave in /proc/thread-self/mountinfo".to_owned(),
+            );
+        }
+        if !host_slave && e.optional.iter().any(slave_field) {
+            return Err(
+                "the bind mount is shared or a slave in /proc/thread-self/mountinfo".to_owned(),
+            );
+        }
+        if host_slave && e.id == top.id && !e.optional.iter().any(slave_field) {
+            return Err(
+                "the rslave bind mount is not a slave in /proc/thread-self/mountinfo".to_owned(),
             );
         }
         if !has(e, "nosuid") || !has(e, "nodev") {
@@ -2366,6 +2543,8 @@ mod tests {
     /// dry-run の挙動を変える設定。
     #[derive(Default)]
     struct Knobs {
+        /// `rslave` の bind の事前の複製を返す（`establish_with` の代わり。#2669）。
+        pre_cloned: bool,
         shared: bool,
         moved: bool,
         open_tree_err: Option<SysError>,
@@ -2418,6 +2597,17 @@ mod tests {
             still_at: &|_, p| {
                 push(format!("still_at({})", fx.rel(p)));
                 !k.moved
+            },
+            pre_cloned: &|index| {
+                push(format!("pre_cloned({index})"));
+                if !k.pre_cloned {
+                    return None;
+                }
+                let spec = set.mounts().iter().find(|m| m.index() == index)?;
+                let source = pin_source(spec).ok()?;
+                src_id.set(source.fd.dev_ino());
+                let clone = source.fd.as_fd().try_clone_to_owned().ok()?;
+                Some(HostSlaveClone { source, clone })
             },
             open_tree: &|src, scope| {
                 push(format!("open_tree({scope:?})"));
@@ -3577,6 +3767,126 @@ mod tests {
         format!("{id} {parent} 0:1 / /x {opts} {optional} - tmpfs none rw\n")
     }
 
+    /// OCI-4・SEC-1（#2669）: `rslave` の bind は事前の複製を使い、`open_tree` を呼ばない。最上位に `master:` があれば受ける。
+    #[test]
+    fn oci4_rslave_bind_uses_pre_cloned_source_and_accepts_master() {
+        let fx = fx();
+        let set = one("/d", &fx.src("dir"), &["rbind", "rslave"]);
+        let knobs = Knobs {
+            pre_cloned: true,
+            mountinfo: Some("200 1 0:1 / /x rw,nosuid,nodev master:3 - tmpfs none rw\n".to_owned()),
+            ..Knobs::default()
+        };
+        let (r, log) = run(&fx, &set, &knobs);
+        let report = r.unwrap_or_else(|e| panic!("unexpected error: {e}; log: {log:?}"));
+        assert_eq!(log.first().map(String::as_str), Some("pre_cloned(0)"));
+        assert!(!log.iter().any(|l| l.starts_with("open_tree(")), "{log:?}");
+        assert_eq!(report.mounts.len(), 1);
+        assert!(report.mounts[0].recursive);
+    }
+
+    /// SEC-1（#2669）: `rslave` でも最上位に `master:` が無ければ（private で載った）拒否し、`shared:` は拒否する。
+    #[test]
+    fn sec1_rslave_bind_requires_master_and_rejects_shared() {
+        for (info, needle) in [
+            (
+                "200 1 0:1 / /x rw,nosuid,nodev - tmpfs none rw\n",
+                "not a slave",
+            ),
+            (
+                "200 1 0:1 / /x rw,nosuid,nodev shared:5 - tmpfs none rw\n",
+                "shared or a slave",
+            ),
+            (
+                "200 1 0:1 / /x rw,nosuid,nodev shared:5 master:3 - tmpfs none rw\n",
+                "shared or a slave",
+            ),
+        ] {
+            let fx = fx();
+            let set = one("/d", &fx.src("dir"), &["rbind", "rslave"]);
+            let knobs = Knobs {
+                pre_cloned: true,
+                mountinfo: Some(info.to_owned()),
+                ..Knobs::default()
+            };
+            let (r, _log) = run(&fx, &set, &knobs);
+            let err = r.expect_err(info);
+            assert_eq!(err.code, ErrorCode::FailedPrecondition, "{info}");
+            assert!(err.message.contains(needle), "{info}: {}", err.message);
+        }
+    }
+
+    /// SEC-1（#2669）: private の bind は従来どおり `master:` を拒否する（`rslave` の許可を private へ広げない）。
+    #[test]
+    fn sec1_private_bind_still_rejects_master() {
+        let fx = fx();
+        let set = one("/d", &fx.src("dir"), &["rbind"]);
+        let knobs = Knobs {
+            mountinfo: Some("200 1 0:1 / /x rw,nosuid,nodev master:3 - tmpfs none rw\n".to_owned()),
+            ..Knobs::default()
+        };
+        let (r, _log) = run(&fx, &set, &knobs);
+        let err = r.expect_err("master on a private bind");
+        assert!(err.message.contains("shared or a slave"), "{}", err.message);
+    }
+
+    /// SEC-1（#2669）: `establish_with` を通っていない（事前の複製が無い）`rslave` の bind は、何も作らず `INTERNAL` で拒否する。
+    #[test]
+    fn sec1_rslave_bind_without_pre_clone_fails_closed() {
+        let fx = fx();
+        let set = one("/d", &fx.src("dir"), &["rbind", "rslave"]);
+        let (r, log) = run(&fx, &set, &Knobs::default());
+        let err = r.expect_err("no pre clone");
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(log, ["pre_cloned(0)"]);
+        assert!(!fx.rootfs.join("d").exists());
+    }
+
+    /// OCI-4（#2669）: ホスト側の元が slave か判定する純関数。`master:`・`propagate_from:` があり `shared:` が無ければ真。
+    #[test]
+    fn oci4_source_mount_is_host_slave_by_mountinfo() {
+        let l = |id: u64, optional: &str| line(id, 1, "rw", optional);
+        assert_eq!(source_mount_is_host_slave(&l(10, "master:3"), 10), Ok(true));
+        assert_eq!(
+            source_mount_is_host_slave(&l(10, "master:3 propagate_from:2"), 10),
+            Ok(true)
+        );
+        assert_eq!(
+            source_mount_is_host_slave(&l(10, "propagate_from:2"), 10),
+            Ok(true)
+        );
+        assert_eq!(source_mount_is_host_slave(&l(10, ""), 10), Ok(false));
+        assert_eq!(
+            source_mount_is_host_slave(&l(10, "shared:5"), 10),
+            Ok(false)
+        );
+        assert_eq!(
+            source_mount_is_host_slave(&l(10, "shared:5 master:3"), 10),
+            Ok(false)
+        );
+        // 別のマウントの行は見ない。
+        let two = format!("{}{}", l(10, ""), l(11, "master:3"));
+        assert_eq!(source_mount_is_host_slave(&two, 10), Ok(false));
+        assert_eq!(source_mount_is_host_slave(&two, 11), Ok(true));
+        // 該当なし・重複・書式違反は fail-closed。
+        assert!(
+            source_mount_is_host_slave(&l(10, "master:3"), 99)
+                .unwrap_err()
+                .contains("no mount entry")
+        );
+        let dup = format!("{}{}", l(10, "master:3"), l(10, "master:3"));
+        assert!(
+            source_mount_is_host_slave(&dup, 10)
+                .unwrap_err()
+                .contains("duplicate")
+        );
+        assert!(
+            source_mount_is_host_slave("x y\n", 10)
+                .unwrap_err()
+                .contains("malformed")
+        );
+    }
+
     /// `check_bind_subtree`: 自分のマウントは `ro`・`noexec` が要求と完全一致、配下は要求した制限が付いていればよい。
     #[test]
     fn check_bind_subtree_is_exact_for_top_and_requires_restrictions_for_children() {
@@ -4144,6 +4454,7 @@ mod tests {
             is_shared: &|_| Ok(false),
             still_at: &|_, _| true,
             open_tree: &|_, _| Err(unused()),
+            pre_cloned: &|_| None,
             set_attrs: &|_, _, _| Err(unused()),
             flags_of: &|_| Err(unused()),
             attach: &|_, _| Err(unused()),
@@ -4184,6 +4495,7 @@ mod tests {
             is_shared: &|_| Ok(false),
             still_at: &|_, _| true,
             open_tree: &|_, _| Err(unused()),
+            pre_cloned: &|_| None,
             set_attrs: &|_, _, _| Err(unused()),
             flags_of: &|_| Err(unused()),
             attach: &|_, _| Err(unused()),

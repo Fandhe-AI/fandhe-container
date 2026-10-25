@@ -1602,6 +1602,8 @@ impl CriRuntimeService {
         run_bounded(self.runtime_timeout, move || -> Result<(), CriError> {
             // worker が実際に走り出してから bundle の解放責務を持つ（起動失敗時は RPC スレッドで release しない）。
             guard.arm_bundles(Arc::clone(&bundles));
+            // pod の ipc 共有（BundleRequest::with_pod_namespaces）は pod の保持役が未実装のため当面渡さない
+            // （常に新しい namespace。CRI-2・CORE-3。#2674 の後続 issue で保持役とともに結線する）。
             let bundle = bundles.prepare(
                 &BundleRequest::new(&id, &sandbox_id, &sandbox_config, &config)
                     .with_pod_netns_path(pod_netns.as_deref()),

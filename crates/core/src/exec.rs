@@ -1641,6 +1641,109 @@ pub fn plan_rootless_subordinate(
     )
 }
 
+/// 中間プロセス I が、pod の user・ipc namespace へ join して残りを分離する(CRI-2・CORE-3・SEC-1・SEC-5。#2674)。
+///
+/// 本番 launcher の中間プロセス(`launch_intermediate`)だけが、`NamespaceJoin` があるときに [`isolate`] /
+/// [`isolate_rootless_subordinate`] の代わりに呼ぶ。`plan` は通常どおり検証済みの計画(`User`・`Ipc` を含む。
+/// 権限モデルの写像と hostname を持つ)で、join では `User`・`Ipc` を作らず参加する。
+///
+/// 処理順: 実行 ID の再検証 → `setns(user)` → `setns(ipc)` → `/proc/self/{uid,gid}_map` を読み直し、計画の期待する
+/// 写像と **完全一致** することを確かめる(不一致は `FailedPrecondition`。コンテナ内 root をホストの非特権 UID へ
+/// 写す SEC-5 と `process.user` の照合の前提を、参加先の userns でも保つ) → 残りの namespace(pid・mount・uts)を
+/// `unshare` → `/` を再帰 private 化 → hostname。
+///
+/// 前提: 単一スレッドで `fs_struct` を共有しない fork 子から呼ぶ(`setns(CLONE_NEWUSER)` の条件。満たさなければ
+/// カーネルが `EINVAL`)。mapper・holder・`newuidmap` は使わない(写像は参加先に書き込み済み)。失敗したら
+/// プロセスを破棄すること([`isolate`] と同じ)。
+pub(crate) fn isolate_join(
+    plan: IntermediatePlan<'_>,
+    join: &crate::oci_runtime::NamespaceJoin,
+) -> Result<(), ExecError> {
+    let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
+    let (identity_ok, namespaces, hostname, uid, gid, root_propagation): (
+        _,
+        _,
+        _,
+        Vec<IdMapping>,
+        Vec<IdMapping>,
+        _,
+    ) = match plan {
+        IntermediatePlan::SingleId(p) => (
+            euid == p.uid_mapping.host_id && egid == p.gid_mapping.host_id,
+            p.namespaces,
+            p.hostname.as_ref(),
+            vec![p.uid_mapping],
+            vec![p.gid_mapping],
+            p.root_propagation,
+        ),
+        IntermediatePlan::Subordinate(p) => (
+            euid == p.euid && egid == p.egid,
+            p.namespaces,
+            p.hostname.as_ref(),
+            p.uid.entries().to_vec(),
+            p.gid.entries().to_vec(),
+            p.root_propagation,
+        ),
+    };
+    if !identity_ok {
+        return Err(ExecError::from_violation(
+            ViolationReason::IdentityChanged,
+            None,
+        ));
+    }
+    // 呼び出し元が non-dumpable だった場合は、参加後も保つ(範囲写像の経路と同じ。資格情報の更新で dumpable が変わる環境でも
+    // 戻す方向にだけ動かす。同じ uid のホスト側プロセスが ptrace・`/proc/<pid>/fd` で触れる窓を作らない)。
+    let was_non_dumpable = matches!(sys::is_dumpable(), Ok(false));
+    sys::setns_fd(join.user_fd(), NsFlag::User)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::SetNs, "setns(user)"))?;
+    if was_non_dumpable {
+        sys::set_non_dumpable().map_err(|e| {
+            ExecError::from_sys(e, IsolationStage::UserNamespaceMap, "PR_SET_DUMPABLE")
+        })?;
+    }
+    sys::setns_fd(join.ipc_fd(), NsFlag::Ipc)
+        .map_err(|e| ExecError::from_sys(e, IsolationStage::SetNs, "setns(ipc)"))?;
+    verify_joined_id_maps(
+        |kind| {
+            let target = rootless::TargetPid::new(std::process::id())?;
+            rootless::read_id_map_of(&rootless::ProcHandle::open(target)?, kind)
+        },
+        &uid,
+        &gid,
+    )?;
+    let rest = namespaces.without(Namespace::User).without(Namespace::Ipc);
+    if !rest.is_empty() {
+        unshare_and_configure(rest, hostname, None, root_propagation)?;
+    }
+    Ok(())
+}
+
+/// 参加した user namespace の写像(`read` が返す `/proc/self/{uid,gid}_map` の内容)が、計画の期待値と完全一致する
+/// ことを確かめる(SEC-5。pod の userns が別の権限モデル・別の範囲で作られていれば起動しない)。
+fn verify_joined_id_maps(
+    read: impl Fn(rootless::IdKind) -> Result<Vec<IdMapping>, RootlessError>,
+    uid: &[IdMapping],
+    gid: &[IdMapping],
+) -> Result<(), ExecError> {
+    for (kind, expected) in [(rootless::IdKind::Uid, uid), (rootless::IdKind::Gid, gid)] {
+        let got = read(kind).map_err(|e| {
+            ExecError::new(
+                e.code,
+                IsolationStage::UserNamespaceMap,
+                "read the joined id map",
+            )
+        })?;
+        if got != expected {
+            return Err(ExecError::new(
+                ErrorCode::FailedPrecondition,
+                IsolationStage::UserNamespaceMap,
+                "the pod user namespace id mapping does not match the expected mapping",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 呼び出し元が `sys::fork_single_threaded` で fork した子 `pid` を、期限つきで待って回収する(REPAIR-5)。
 ///
 /// `oci_runtime::image_rootfs` が subuid 所有の木を userns の中で消す子の回収に使う(SEC-5・#2540)。
@@ -2628,6 +2731,59 @@ fn mount_is_shared_in(info: &str, mnt_id: u64) -> Result<bool, ExecError> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// SEC-5・CORE-3（#2674）: 参加した user namespace の写像は、計画の期待値と完全一致するときだけ受ける。
+    #[test]
+    fn sec5_joined_id_maps_must_match_the_plan_exactly() {
+        let single = |host| IdMapping {
+            container_id: 0,
+            host_id: host,
+            count: 1,
+        };
+        let read_ok = |kind: rootless::IdKind| {
+            rootless::parse_id_map(match kind {
+                rootless::IdKind::Uid => b"         0       1000          1\n",
+                rootless::IdKind::Gid => b"         0       1001          1\n",
+            })
+        };
+        verify_joined_id_maps(read_ok, &[single(1000)], &[single(1001)]).expect("exact match");
+        // uid が違う・gid が違う・行が足りない / 余る はいずれも FailedPrecondition。
+        for (uid, gid) in [
+            (vec![single(1002)], vec![single(1001)]),
+            (vec![single(1000)], vec![single(1000)]),
+            (
+                vec![
+                    single(1000),
+                    IdMapping {
+                        container_id: 1,
+                        host_id: 100_000,
+                        count: 65_536,
+                    },
+                ],
+                vec![single(1001)],
+            ),
+            (vec![], vec![single(1001)]),
+        ] {
+            let err = verify_joined_id_maps(read_ok, &uid, &gid).expect_err("mismatch");
+            assert_eq!(err.code, ErrorCode::FailedPrecondition);
+            assert_eq!(err.stage, IsolationStage::UserNamespaceMap);
+        }
+        // 範囲写像(subuid)の複数行も順序つきで一致を要する。
+        let range = [
+            single(1000),
+            IdMapping {
+                container_id: 1,
+                host_id: 100_000,
+                count: 65_536,
+            },
+        ];
+        let read_range =
+            |_: rootless::IdKind| rootless::parse_id_map(b"0 1000 1\n1 100000 65536\n");
+        verify_joined_id_maps(read_range, &range, &range).expect("range match");
+        // 読み取りの失敗はそのままエラー(通過させない)。
+        let failing = |_: rootless::IdKind| rootless::parse_id_map(b"x y z");
+        assert!(verify_joined_id_maps(failing, &range, &range).is_err());
+    }
 
     fn cfg(namespaces: NamespaceSet, hostname: Option<&str>) -> IsolationConfig {
         IsolationConfig {

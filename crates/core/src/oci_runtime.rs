@@ -45,6 +45,7 @@ mod launch_options;
 mod launcher;
 mod mount_destination;
 pub(crate) mod mountinfo_identity;
+mod namespace_join;
 mod resources;
 mod start;
 mod sysfs_mount;
@@ -106,6 +107,7 @@ pub use launcher::{ProductionLauncher, ProductionLauncherBuilder};
 #[cfg(target_os = "linux")]
 pub use launcher::{SubordinateIdMaps, SubordinateIdSource};
 pub use mount_destination::{MountDestination, audit_mount_config_error};
+pub use namespace_join::NamespaceJoin;
 pub use resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]

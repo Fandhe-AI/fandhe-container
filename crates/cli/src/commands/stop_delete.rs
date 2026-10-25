@@ -112,7 +112,7 @@ use fandhe_container_supervisor::control::{
 };
 use fandhe_container_supervisor::logs::{CONTAINER_LOG_LOCK_WAIT, CONTAINER_LOG_REMOVE_TIMEOUT};
 use fandhe_container_supervisor::supervisor_log::{
-    LogRemoval, SUPERVISOR_LOG_REMOVE_TIMEOUT, run_log_removal_bounded,
+    SUPERVISOR_LOG_REMOVE_TIMEOUT, run_log_removal_bounded,
 };
 
 /// ID を core の型で検証し、`SIGTERM` の kill 要求を作る。
@@ -364,7 +364,7 @@ fn cleanup_warnings(resp: &DeleteResponse) -> Vec<String> {
     resp.kept()
         .filter_map(|(target, code)| match target {
             CleanupTarget::ImageRootfs => Some(image_rootfs_removal_warning(code)),
-            CleanupTarget::SupervisorLog => Some(log_removal_timeout_warning().to_string()),
+            CleanupTarget::SupervisorLog => Some(supervisor_log_removal_warning(code)),
             CleanupTarget::ContainerLog => Some(container_log_removal_warning(code)),
             // 将来追加される対象は、警告の文言が決まるまで出さない（`DeleteResponse` の欄には残る）。
             _ => None,
@@ -381,16 +381,30 @@ fn remove_supervisor_log(store: &dyn StateStore, req: &DeleteRequest) -> Cleanup
     let Some(root) = store.host_state_root() else {
         return CleanupOutcome::NotApplicable;
     };
-    match fandhe_container_supervisor::supervisor_log::remove_bounded(
-        root,
-        req.id(),
+    // 削除の成否を持ち帰る（失敗を `Removed` と偽らない。REPAIR-4）。枠満杯・期限切れ・起動失敗は結果なしで `Timeout`。
+    let root = root.to_path_buf();
+    let id = req.id().clone();
+    match fandhe_container_supervisor::supervisor_log::run_bounded(
+        move || fandhe_container_supervisor::supervisor_log::remove(&root, &id),
         SUPERVISOR_LOG_REMOVE_TIMEOUT,
     ) {
-        LogRemoval::TimedOut => CleanupOutcome::Kept {
+        Some(Ok(_)) => CleanupOutcome::Removed,
+        Some(Err(e)) => CleanupOutcome::Kept { code: e.code() },
+        None => CleanupOutcome::Kept {
             code: ErrorCode::Timeout,
         },
-        _ => CleanupOutcome::Removed,
     }
+}
+
+/// supervisor ログ削除の警告。期限切れは専用文言、それ以外（ロック保持・権限エラー等）は `code` つきの失敗文言（REPAIR-4）。
+fn supervisor_log_removal_warning(code: ErrorCode) -> String {
+    if code == ErrorCode::Timeout {
+        return log_removal_timeout_warning().to_string();
+    }
+    format!(
+        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"supervisor log removal failed; leftover logs may remain\"}}",
+        code.as_str()
+    )
 }
 
 /// コンテナログ削除失敗の警告（stderr に 1 行の JSON。ERR-1）。パス・errno・ID・内容は含めない。
@@ -478,6 +492,20 @@ fn emit_warning_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fandhe_container_supervisor::supervisor_log::LogRemoval;
+
+    /// REPAIR-4: 失敗コードの supervisor ログ警告は code つきの 1 行 JSON。
+    #[test]
+    fn repair4_supervisor_log_failure_warning_carries_code() {
+        assert_eq!(
+            supervisor_log_removal_warning(ErrorCode::Internal),
+            "{\"level\":\"warn\",\"code\":\"INTERNAL\",\"message\":\"supervisor log removal failed; leftover logs may remain\"}"
+        );
+        assert_eq!(
+            supervisor_log_removal_warning(ErrorCode::Timeout),
+            log_removal_timeout_warning()
+        );
+    }
 
     /// REPAIR-5: 警告の書き込みが止まっても期限で戻り、書き込みが panic しても呼び出し元へ伝播しない。
     #[test]

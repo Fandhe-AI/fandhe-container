@@ -19,4 +19,13 @@ ID を再利用しない場合（plugin-cri の CRI など）は自動では回�
 
 1. その ID の状態が無いことを確かめる（`fandhe-container list` に出ない）。状態がある ID のログは消さない
 2. そのログのロックを持つプロセス（古い supervisor）が居ないことを確かめる（Linux・macOS は `lsof <state_root>/@container-logs/<encoded-id>.log.lock`、Linux は `fuser` でも可）。居る場合はそのプロセスが終わるのを待つ
-3. その ID のファイル（`<encoded-id>.log*`）だけを `rm` で消す。他の ID のファイルには触れない
+3. 削除候補を先に確認する。対象は次の正確な名前だけで、`<encoded-id>.log*` のような glob は使わない（ID はドットを含み得るため、ID `a` の `a.log*` が別 ID `a.logger` の `a.logger.log` やロックにも一致する）:
+   - `<encoded-id>.log`
+   - `<encoded-id>.log.lock`
+   - `<encoded-id>.log.<n>`（`<n>` は数字だけの世代接尾辞）
+
+   ```sh
+   cd <state_root>/@container-logs
+   ls -1 | grep -E '^<encoded-id>\.log(\.lock|\.[0-9]+)?$'   # 候補の確認（<encoded-id> 中のドットは \. にする）
+   ```
+4. 候補が上の名前だけで、他の ID のファイルを含まないことを確かめてから、その名前を 1 つずつ `rm` で消す。他の ID のファイルには触れない

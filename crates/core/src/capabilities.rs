@@ -6,8 +6,8 @@
 //! OS 非依存のデータ型。適用処理（`capset(2)`・`prctl(2)`）は Linux 限定の
 //! `exec/capabilities.rs` の `apply_default_capabilities` が担い、本モジュールの
 //! [`CapabilitySet::oci_default`] を許可集合として使う。組み込みのステージ（`StagePipeline::run_then`）から呼ばれる（#173・TASK-37.2）。
-//! 将来 `config.json` の `process.capabilities` を解釈する際の型としても使える
-//! （現状は `UnappliedField::ProcessCapabilities` として記録するのみ）。
+//! `config.json` の `process.capabilities` の drop は [`ContainerCapabilities`]（OCI 既定の部分集合だけを表す型）で
+//! 受ける（#2666）。add・`inheritable`・`ambient` は `UnappliedField::ProcessCapabilities` として拒否する。
 //!
 //! # 契約
 //!
@@ -198,6 +198,12 @@ impl Capability {
         }
     }
 
+    /// `CAP_CHOWN` 形式の識別子の逆写像。`CAP_` 接頭辞つき・大文字の完全一致だけを受ける
+    /// （`config.json` の `process.capabilities` の名前の解釈用。SEC-1。未知名は `None`）。
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == name)
+    }
+
     /// `CAP_CHOWN` 形式の機械可読な識別子。
     pub fn as_str(self) -> &'static str {
         match self {
@@ -341,9 +347,90 @@ impl CapabilitySet {
     }
 }
 
+impl CapabilitySet {
+    /// `other` の部分集合か。
+    pub fn is_subset_of(self, other: Self) -> bool {
+        self.0 & !other.0 == 0
+    }
+}
+
+/// コンテナへ許可する capability 集合（SEC-1・CRI-2・#2666）。
+///
+/// 作る経路を [`ContainerCapabilities::oci_default`] と、OCI 既定集合の部分集合だけを受ける
+/// [`ContainerCapabilities::restrict`] に限る。これで「OCI 既定より広い許可集合」を型の上で
+/// 表現できず、設定から capability を足す経路が無い（drop だけを受ける）ことを保証する。
+/// `config.json` の解釈（`oci_runtime/config.rs`）が作り、launch の `CapabilityDrop` 段と
+/// launch 時の分離の記録（exec の再適用）が使う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerCapabilities(CapabilitySet);
+
+impl ContainerCapabilities {
+    /// OCI 既定集合そのもの。
+    pub fn oci_default() -> Self {
+        Self(CapabilitySet::oci_default())
+    }
+
+    /// `set` が OCI 既定集合の部分集合なら許可集合にする。既定外を含めば `Err(())`。
+    #[allow(clippy::result_unit_err)]
+    pub fn restrict(set: CapabilitySet) -> Result<Self, ()> {
+        if set.is_subset_of(CapabilitySet::oci_default()) {
+            Ok(Self(set))
+        } else {
+            Err(())
+        }
+    }
+
+    /// 許可集合（bounding / permitted / effective に使う）。
+    pub fn bounding(self) -> CapabilitySet {
+        self.0
+    }
+
+    /// 含む capability を番号順に返す。
+    pub fn iter(self) -> impl Iterator<Item = Capability> {
+        self.0.iter()
+    }
+
+    /// OCI 既定集合と等しいか。
+    pub fn is_default(self) -> bool {
+        self.0 == CapabilitySet::oci_default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SEC-1: 名前の逆写像は `as_str` と往復し、接頭辞なし・小文字・未知名は `None`。
+    #[test]
+    fn sec1_from_name_round_trips() {
+        for cap in Capability::ALL {
+            assert_eq!(Capability::from_name(cap.as_str()), Some(cap));
+        }
+        for bad in [
+            "",
+            "CHOWN",
+            "cap_chown",
+            "CAP_NOPE",
+            "CAP_CHOWN ",
+            "CAP_CHOWN\0",
+        ] {
+            assert_eq!(Capability::from_name(bad), None, "{bad:?}");
+        }
+    }
+
+    /// SEC-1: 許可集合は既定の部分集合だけを作れる。
+    #[test]
+    fn sec1_container_capabilities_restrict_only_subsets() {
+        let sub =
+            CapabilitySet::oci_default().intersect(CapabilitySet::empty().with(Capability::Kill));
+        let c = ContainerCapabilities::restrict(sub).unwrap();
+        assert_eq!(c.iter().collect::<Vec<_>>(), vec![Capability::Kill]);
+        assert!(!c.is_default());
+        assert!(ContainerCapabilities::restrict(CapabilitySet::empty()).is_ok());
+        assert!(ContainerCapabilities::oci_default().is_default());
+        let wide = CapabilitySet::oci_default().with(Capability::SysAdmin);
+        assert!(ContainerCapabilities::restrict(wide).is_err());
+    }
 
     /// SEC-1: 既定集合は Docker の root コンテナの `CapEff`（`a80425fb`）と一致する。
     #[test]

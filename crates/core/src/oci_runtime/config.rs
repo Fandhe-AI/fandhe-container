@@ -26,7 +26,7 @@
 //!
 //! パースの成功（`Ok`）は「形式が正しく上限内である」ことだけを意味し、「そのまま実行してよい」
 //! ことは意味しない。OCI Runtime Spec が定義するプロパティのうち本パーサが解釈しないもの
-//! （`process.capabilities`・`process.noNewPrivileges`・`process.rlimits`〔SEC-1・TASK-27.4.3 系〕、
+//! （`process.capabilities` の `inheritable` / `ambient` と OCI 既定の部分集合でない指定〔drop だけを解釈済み。#2666〕・`process.noNewPrivileges`・`process.rlimits`〔SEC-1・TASK-27.4.3 系〕、
 //! `linux.seccomp`〔CORE-5・TASK-38〕、`linux.resources` のうち setter が無い項目〔#2019。memory / cpu / pids /
 //! blockIO の weight・throttle は解釈済みで、`resources.rs` の型に正規化する〕、
 //! `mounts[].uidMappings` / `gidMappings`、`hooks` 等）は、
@@ -80,6 +80,7 @@ use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
 use super::mount_destination::MountDestination;
 use super::resources::{ByteLimit, CgroupsPath, IoThrottle, LinuxResourceLimits};
+use crate::capabilities::{Capability, CapabilitySet, ContainerCapabilities};
 use crate::path_masks::ProtectedPath;
 use crate::traits::ErrorCode;
 
@@ -91,6 +92,10 @@ pub const CONFIG_MAX_BYTES: usize = 4 << 20;
 pub const CONFIG_MAX_ARGS: usize = 4096;
 /// `process.env` の最大件数（`exec::ENTRYPOINT_MAX_ENV` と同値）。
 pub const CONFIG_MAX_ENV: usize = 4096;
+/// `process.capabilities` の各集合の最大件数（既知の capability は 41 個。重複を許すため余裕を持たせる）。
+pub const CONFIG_MAX_CAPABILITIES: usize = 64;
+/// `process.capabilities` の名前 1 件の最大バイト数（最長の `CAP_CHECKPOINT_RESTORE` は 22）。
+pub const CONFIG_MAX_CAPABILITY_NAME_BYTES: usize = 32;
 /// `args` / `env` の 1 要素の最大バイト長（NUL 終端を含まない。131071）。
 ///
 /// `exec::ENTRYPOINT_MAX_STRING_BYTES`（Linux の `MAX_ARG_STRLEN` = 131072）は NUL 終端を含めた
@@ -348,6 +353,8 @@ limits! {
     EnvItemLimit => ("process.env[]", CONFIG_MAX_STRING_BYTES),
     CwdLimit => ("process.cwd", CONFIG_MAX_PATH_BYTES),
     GidsLimit => ("process.user.additionalGids", CONFIG_MAX_ADDITIONAL_GIDS),
+    CapsLimit => ("process.capabilities.*", CONFIG_MAX_CAPABILITIES),
+    CapNameLimit => ("process.capabilities.*[]", CONFIG_MAX_CAPABILITY_NAME_BYTES),
     HostnameLimit => ("hostname", CONFIG_MAX_HOSTNAME_BYTES),
     MountsLimit => ("mounts", CONFIG_MAX_MOUNTS),
     MountDestLimit => ("mounts[].destination", CONFIG_MAX_PATH_BYTES),
@@ -673,8 +680,8 @@ struct RawProcess {
     command_line: Seen,
     #[serde(default)]
     console_size: Seen,
-    #[serde(default)]
-    capabilities: Seen,
+    #[serde(default, deserialize_with = "present")]
+    capabilities: Option<Obj<RawCapabilities>>,
     #[serde(default)]
     apparmor_profile: Seen,
     #[serde(default)]
@@ -691,6 +698,61 @@ struct RawProcess {
     rlimits: Seen,
     #[serde(default, rename = "execCPUAffinity")]
     exec_cpu_affinity: Seen,
+}
+
+/// `process.capabilities`（OCI Runtime Spec の 5 集合。未知キーは fail-closed に拒否する）。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCapabilities {
+    #[serde(default, deserialize_with = "present")]
+    bounding: Option<Bounded<BoundedStr<CapNameLimit>, CapsLimit>>,
+    #[serde(default, deserialize_with = "present")]
+    effective: Option<Bounded<BoundedStr<CapNameLimit>, CapsLimit>>,
+    #[serde(default, deserialize_with = "present")]
+    inheritable: Option<Bounded<BoundedStr<CapNameLimit>, CapsLimit>>,
+    #[serde(default, deserialize_with = "present")]
+    permitted: Option<Bounded<BoundedStr<CapNameLimit>, CapsLimit>>,
+    #[serde(default, deserialize_with = "present")]
+    ambient: Option<Bounded<BoundedStr<CapNameLimit>, CapsLimit>>,
+}
+
+type RawCapList = Option<Bounded<BoundedStr<CapNameLimit>, CapsLimit>>;
+
+/// 名前の配列を集合へ変換する。未知名・`CAP_` なし・小文字は `InvalidArgument`（値は載せない）。
+/// キーが無い配列は空集合（runc の nil と同じ）。重複は集合として吸収する。
+fn parse_cap_list(list: &RawCapList) -> Result<CapabilitySet, OciConfigError> {
+    let mut set = CapabilitySet::empty();
+    for name in list.iter().flat_map(|b| b.0.iter()) {
+        let cap = Capability::from_name(&name.0)
+            .ok_or_else(|| OciConfigError::invalid("process.capabilities"))?;
+        set = set.with(cap);
+    }
+    Ok(set)
+}
+
+/// `process.capabilities` を許可集合へ解釈する（SEC-1・CRI-2・#2666）。
+///
+/// 返す真偽値は「解釈できなかった指定がある」（`UnappliedField::ProcessCapabilities` を記録する）。
+/// 解釈済みにするのは、bounding / permitted / effective の 3 集合が互いに等しく、かつ OCI 既定集合の
+/// 部分集合（drop だけ）の場合に限る。`inheritable` / `ambient` が空でない指定、集合ごとに違う指定、
+/// 既定外を含む指定（add）は未適用として拒否側へ倒す。オブジェクトが無ければ OCI 既定集合。
+fn convert_capabilities(
+    raw: Option<&Obj<RawCapabilities>>,
+) -> Result<(ContainerCapabilities, bool), OciConfigError> {
+    let Some(Obj(c)) = raw else {
+        return Ok((ContainerCapabilities::oci_default(), false));
+    };
+    let bounding = parse_cap_list(&c.bounding)?;
+    let effective = parse_cap_list(&c.effective)?;
+    let permitted = parse_cap_list(&c.permitted)?;
+    let inheritable = parse_cap_list(&c.inheritable)?;
+    let ambient = parse_cap_list(&c.ambient)?;
+    let uniform = bounding == effective && bounding == permitted;
+    let extra = !inheritable.is_empty() || !ambient.is_empty();
+    match ContainerCapabilities::restrict(bounding) {
+        Ok(caps) if uniform && !extra => Ok((caps, false)),
+        _ => Ok((ContainerCapabilities::oci_default(), true)),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1245,6 +1307,7 @@ pub struct OciConfig {
     readonly_paths: Vec<ProtectedPath>,
     resources: Option<LinuxResourceLimits>,
     cgroups_path: Option<CgroupsPath>,
+    capabilities: ContainerCapabilities,
     unapplied: Vec<UnappliedField>,
 }
 
@@ -1255,6 +1318,13 @@ impl OciConfig {
     /// これを確認せずに起動してはならず、実際に `Unimplemented` で拒否する（fail-closed。SEC-1・CORE-5）。
     pub fn unapplied_fields(&self) -> &[UnappliedField] {
         &self.unapplied
+    }
+
+    /// `process.capabilities` から解釈した許可集合（無指定は OCI 既定集合。OCI 既定の部分集合、つまり
+    /// drop だけを受ける。add・`inheritable`・`ambient` は [`UnappliedField::ProcessCapabilities`]
+    /// として拒否側へ倒すため、ここには反映されない。SEC-1・CRI-2・#2666）。
+    pub fn capabilities(&self) -> ContainerCapabilities {
+        self.capabilities
     }
 
     /// `linux.maskedPaths`（検証済み。固定集合に**追加**する指定で、固定集合を外す・緩める手段ではない。
@@ -1573,7 +1643,14 @@ impl RawConfig {
             path: checked_path(self.root.0.path.0, "root.path")?,
             readonly: self.root.0.readonly,
         };
+        let (capabilities, caps_unapplied) = match &self.process {
+            Some(Obj(p)) => convert_capabilities(p.capabilities.as_ref())?,
+            None => (ContainerCapabilities::oci_default(), false),
+        };
         let mut unapplied = Vec::new();
+        if caps_unapplied {
+            unapplied.push(UnappliedField::ProcessCapabilities);
+        }
         let mut mark = |seen: Seen, field: UnappliedField| {
             if seen.0 {
                 unapplied.push(field);
@@ -1589,7 +1666,6 @@ impl RawConfig {
         if let Some(Obj(p)) = &self.process {
             mark(p.command_line, UnappliedField::ProcessCommandLine);
             mark(p.console_size, UnappliedField::ProcessConsoleSize);
-            mark(p.capabilities, UnappliedField::ProcessCapabilities);
             mark(p.apparmor_profile, UnappliedField::ProcessApparmorProfile);
             mark(p.oom_score_adj, UnappliedField::ProcessOomScoreAdj);
             mark(p.selinux_label, UnappliedField::ProcessSelinuxLabel);
@@ -1680,6 +1756,7 @@ impl RawConfig {
             readonly_paths,
             resources,
             cgroups_path,
+            capabilities,
             unapplied,
         })
     }
@@ -2249,7 +2326,7 @@ mod tests {
     }
 
     /// OCI 既知だが解釈しないプロパティは、種別ごとに指定の有無を記録する（SEC-1・CORE-5・OCI-4）。
-    /// 値が `null` でも「指定あり」とみなす（fail-closed 側）。未指定なら空。
+    /// 値が `null` でも「指定あり」とみなす（fail-closed 側。型付きで解釈する `process.capabilities` を除く）。未指定なら空。
     #[test]
     fn sec1_each_unapplied_field_is_reported() {
         assert_eq!(UNAPPLIED_FIELDS.len(), 54);
@@ -2259,7 +2336,17 @@ mod tests {
             let path = field.as_str().replace("mounts[]", "mounts.0");
             let keys: Vec<&str> = path.split('.').collect();
             let (last, parent) = keys.split_last().expect("non-empty path");
-            for value in [json!({"any": [1]}), Value::Null] {
+            // `process.capabilities` だけは型付きで解釈する（`null`・未知キーは `Data`）。拒否側になる指定
+            // （集合ごとに違う・`inheritable` あり）で未適用の記録を確かめる（#2666）。
+            let values = if field == UnappliedField::ProcessCapabilities {
+                vec![
+                    json!({"bounding": ["CAP_KILL"]}),
+                    json!({"bounding": [], "effective": [], "permitted": [], "inheritable": ["CAP_KILL"]}),
+                ]
+            } else {
+                vec![json!({"any": [1]}), Value::Null]
+            };
+            for value in values {
                 let mut v = base();
                 // `linux.resources.memory` のように base に無い中間 object は作る。
                 for depth in 1..=parent.len() {
@@ -2276,6 +2363,120 @@ mod tests {
                 assert_eq!(cfg.unapplied_fields(), [field], "{path}");
             }
         }
+    }
+
+    fn caps_cfg(caps: Value) -> Result<OciConfig, OciConfigError> {
+        let mut v = base();
+        v["process"]["capabilities"] = caps;
+        parse(&v)
+    }
+
+    fn names(c: ContainerCapabilities) -> Vec<&'static str> {
+        c.iter().map(Capability::as_str).collect()
+    }
+
+    fn default_names() -> Vec<&'static str> {
+        crate::capabilities::OCI_DEFAULT_CAPABILITIES
+            .iter()
+            .map(|c| c.as_str())
+            .collect()
+    }
+
+    /// SEC-1・CRI-2・#2666: 無指定は OCI 既定 14 個、既定の部分集合（drop）は解釈済みで未適用に残らない。
+    #[test]
+    fn sec1_cri2_capabilities_drop_is_interpreted() {
+        let cfg = parse(&base()).expect("valid");
+        assert!(cfg.capabilities().is_default());
+        assert_eq!(cfg.capabilities().iter().count(), 14);
+        let none: [UnappliedField; 0] = [];
+        // 3 集合とも既定から CAP_NET_RAW を除いた 13 個（重複は集合として吸収する）。
+        let set: Vec<&str> = default_names()
+            .into_iter()
+            .filter(|c| *c != "CAP_NET_RAW")
+            .collect();
+        let mut dup = set.clone();
+        dup.push("CAP_KILL");
+        let cfg = caps_cfg(json!({"bounding": dup, "effective": set, "permitted": set})).unwrap();
+        assert_eq!(cfg.unapplied_fields(), none);
+        assert_eq!(
+            names(cfg.capabilities()),
+            [
+                "CAP_CHOWN",
+                "CAP_DAC_OVERRIDE",
+                "CAP_FOWNER",
+                "CAP_FSETID",
+                "CAP_KILL",
+                "CAP_SETGID",
+                "CAP_SETUID",
+                "CAP_SETPCAP",
+                "CAP_NET_BIND_SERVICE",
+                "CAP_SYS_CHROOT",
+                "CAP_MKNOD",
+                "CAP_AUDIT_WRITE",
+                "CAP_SETFCAP"
+            ]
+        );
+        // 空配列 3 つは全 drop。キーが無い配列は空集合（`{}` も全 drop）。
+        let all_drop = caps_cfg(json!({"bounding": [], "effective": [], "permitted": []})).unwrap();
+        assert_eq!(all_drop.unapplied_fields(), none);
+        assert!(all_drop.capabilities().iter().next().is_none());
+        assert!(
+            caps_cfg(json!({}))
+                .unwrap()
+                .capabilities()
+                .iter()
+                .next()
+                .is_none()
+        );
+    }
+
+    /// SEC-1・CRI-2・#2666: add（既定外）・集合ごとの違い・`inheritable` / `ambient` は未適用として拒否側に倒す。
+    #[test]
+    fn sec1_cri2_capabilities_non_drop_is_unapplied() {
+        let d = default_names();
+        let mut wide = d.clone();
+        wide.push("CAP_SYS_ADMIN");
+        for caps in [
+            json!({"bounding": wide, "effective": wide, "permitted": wide}),
+            json!({"bounding": d, "effective": ["CAP_KILL"], "permitted": d}),
+            json!({"bounding": d, "effective": d, "permitted": d, "inheritable": ["CAP_KILL"]}),
+            json!({"bounding": d, "effective": d, "permitted": d, "ambient": ["CAP_KILL"]}),
+        ] {
+            let cfg = caps_cfg(caps.clone()).unwrap();
+            assert_eq!(
+                cfg.unapplied_fields(),
+                [UnappliedField::ProcessCapabilities],
+                "{caps}"
+            );
+        }
+        // 空の inheritable / ambient は指定なしと同じ。
+        let cfg = caps_cfg(json!({
+            "bounding": d, "effective": d, "permitted": d, "inheritable": [], "ambient": []
+        }))
+        .unwrap();
+        assert!(cfg.unapplied_fields().is_empty());
+    }
+
+    /// SEC-1・CRI-2・#2666: 未知名・小文字・接頭辞なし・`null`・未知キー・件数超過・名前の長さ超過は拒否する。
+    #[test]
+    fn sec1_cri2_capabilities_invalid_inputs_are_rejected() {
+        for caps in [
+            json!({"bounding": ["CAP_NOPE"]}),
+            json!({"bounding": ["cap_kill"]}),
+            json!({"bounding": ["KILL"]}),
+            json!({"bounding": [1]}),
+            json!({"bounding": null}),
+            json!({"unknown": []}),
+            Value::Null,
+            json!([]),
+            json!({"bounding": vec!["CAP_KILL"; CONFIG_MAX_CAPABILITIES + 1]}),
+            json!({"bounding": ["CAP_".to_owned() + &"A".repeat(CONFIG_MAX_CAPABILITY_NAME_BYTES)]}),
+        ] {
+            let e = caps_cfg(caps.clone()).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::InvalidArgument, "{caps}");
+        }
+        // 件数の上限ちょうどは受理する。
+        assert!(caps_cfg(json!({"bounding": vec!["CAP_KILL"; CONFIG_MAX_CAPABILITIES]})).is_ok());
     }
 
     /// SEC-2・OCI-4（#1852）: `maskedPaths` / `readonlyPaths` は解釈済みで、未適用に残らない。

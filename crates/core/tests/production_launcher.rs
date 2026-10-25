@@ -1939,7 +1939,7 @@ mod linux {
         config["process"]["capabilities"] =
             json!({"bounding": names, "effective": names, "permitted": names});
         std::fs::write(&path, serde_json::to_vec(&config).expect("serialize")).expect("write");
-        let id = ContainerId::new(format!("plt{tag}")).expect("id");
+        let id = ContainerId::new(format!("plv{tag}")).expect("id");
         do_create(env, &bundle, &id);
 
         wait_single_thread();

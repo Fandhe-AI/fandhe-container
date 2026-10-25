@@ -11,10 +11,13 @@ use std::sync::{Arc, Mutex};
 
 use fandhe_container_core::oci_runtime;
 use fandhe_container_cri::adapter::{BundleProvider, BundleRequest};
-use fandhe_container_cri::bundle::{ImageDefaults, RootfsSource, SpecBundleProvider};
+use fandhe_container_cri::bundle::{
+    ImageDefaults, RootfsSource, SpecBundleProvider, UserResolveRequest,
+};
 use fandhe_container_cri::error::{CriError, CriErrorCode};
 use fandhe_container_cri::runtime::v1::{
-    ContainerConfig, ContainerMetadata, ImageSpec, PodSandboxConfig,
+    ContainerConfig, ContainerMetadata, ImageSpec, LinuxContainerConfig,
+    LinuxContainerSecurityContext, PodSandboxConfig,
 };
 
 struct TempDir(PathBuf);
@@ -51,16 +54,30 @@ struct FakeRootfs {
     prepares: AtomicUsize,
     releases: AtomicUsize,
     defaults: Mutex<ImageDefaults>,
+    /// 受け取った解決要求の run_as_username。
+    seen_username: Mutex<Option<String>>,
+    /// 真なら要求を解決して `resolved_run_as_username` を返す（偽は要求を無視する実装を模す）。
+    resolve_username: Mutex<Option<(u32, u32)>>,
 }
 
 impl RootfsSource for FakeRootfs {
-    fn prepare(&self, _image: &ImageSpec, rootfs: &Path) -> Result<ImageDefaults, CriError> {
+    fn prepare(
+        &self,
+        _image: &ImageSpec,
+        rootfs: &Path,
+        user: &UserResolveRequest<'_>,
+    ) -> Result<ImageDefaults, CriError> {
         self.prepares.fetch_add(1, Ordering::SeqCst);
+        *self.seen_username.lock().unwrap() = user.run_as_username.map(str::to_owned);
         fs::create_dir(rootfs).map_err(|_| CriError::internal("rootfs"))?;
         if *self.fail_prepare.lock().unwrap() {
             return Err(CriError::resource_exhausted("no space"));
         }
-        Ok(self.defaults.lock().unwrap().clone())
+        let mut d = self.defaults.lock().unwrap().clone();
+        if user.run_as_username.is_some() {
+            d.resolved_run_as_username = *self.resolve_username.lock().unwrap();
+        }
+        Ok(d)
     }
     fn release(&self, rootfs: &Path) -> Result<(), CriError> {
         self.releases.fetch_add(1, Ordering::SeqCst);
@@ -119,6 +136,46 @@ fn prepare_creates_bundle_with_private_modes_and_a_parsable_config() {
         ["/bin/sh", "-c", "sleep 30"]
     );
     assert_eq!(rootfs.prepares.load(Ordering::SeqCst), 1);
+}
+
+/// CRI-2・SEC-5（#2664）: run_as_username が RootfsSource へ渡り、解決結果が config.json の process.user になる。
+#[test]
+fn run_as_username_is_resolved_through_the_rootfs_source() {
+    let (_tmp, rootfs, p) = setup("username");
+    *rootfs.resolve_username.lock().unwrap() = Some((1000, 1001));
+    let mut c = container();
+    c.linux = Some(LinuxContainerConfig {
+        security_context: Some(LinuxContainerSecurityContext {
+            run_as_username: "app".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let dir = prepare(&p, "ctr1", &c).expect("prepare");
+    assert_eq!(rootfs.seen_username.lock().unwrap().as_deref(), Some("app"));
+    oci_runtime::load_config(&dir.join("config.json")).expect("core parses config.json");
+    let v: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();
+    assert_eq!(v["process"]["user"]["uid"], 1000);
+    assert_eq!(v["process"]["user"]["gid"], 1001);
+}
+
+/// CRI-2・SEC-5（#2664）: 解決要求を無視する実装では UNIMPLEMENTED で拒否し、bundle を残さない。
+#[test]
+fn run_as_username_without_resolution_is_rejected_and_rolled_back() {
+    let (tmp, rootfs, p) = setup("username-unresolved");
+    let mut c = container();
+    c.linux = Some(LinuxContainerConfig {
+        security_context: Some(LinuxContainerSecurityContext {
+            run_as_username: "app".into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    let e = prepare(&p, "ctr1", &c).unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+    assert_eq!(rootfs.releases.load(Ordering::SeqCst), 1);
+    assert!(!tmp.0.join("ctr1").exists());
 }
 
 #[test]
@@ -292,8 +349,13 @@ fn rootfs_release_failure_during_rollback_keeps_the_bundle() {
     // 解放失敗時は資源を保持し、後続の release が回収する（rootfs 解放 → bundle 削除の順）。
     struct StickyRootfs(Arc<FakeRootfs>);
     impl RootfsSource for StickyRootfs {
-        fn prepare(&self, i: &ImageSpec, r: &Path) -> Result<ImageDefaults, CriError> {
-            self.0.prepare(i, r)
+        fn prepare(
+            &self,
+            i: &ImageSpec,
+            r: &Path,
+            u: &UserResolveRequest<'_>,
+        ) -> Result<ImageDefaults, CriError> {
+            self.0.prepare(i, r, u)
         }
         fn release(&self, _r: &Path) -> Result<(), CriError> {
             Err(CriError::internal("rootfs release"))

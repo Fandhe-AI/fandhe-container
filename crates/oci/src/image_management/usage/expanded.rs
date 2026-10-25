@@ -18,12 +18,12 @@ use std::collections::BTreeSet;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use super::{add, blob_path, check_blob_dirs, err};
+use super::{add, blob_hex, err};
 use crate::error::{OciError, OciErrorCode};
-use crate::image_management::ReferenceTable;
+use crate::image_management::root_handle::BlobDir;
+use crate::image_management::{JournalRoot, ReferenceTable};
 use crate::layer::{
     DEFAULT_MAX_UNCOMPRESSED_LAYER_BYTES, GzipLayerReader, oci_error_from_layer_io,
-    open_blob_nofollow,
 };
 use crate::reference::Digest;
 
@@ -51,6 +51,9 @@ pub struct ExpandedUsage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpandedSizePlan {
     layers: BTreeSet<Digest>,
+    /// 計画を取った排他区間の検査済み root（#2695）。`measure` がガードの外でも、渡されたパスをこれと
+    /// 照合し、読み取りをこの fd 起点に閉じ込める。単体テーブル（未設定）では `measure` がパスから開く。
+    root: JournalRoot,
 }
 
 impl ReferenceTable {
@@ -60,7 +63,10 @@ impl ReferenceTable {
         for (_, comp) in self.manifests() {
             layers.extend(comp.layers().iter().cloned());
         }
-        ExpandedSizePlan { layers }
+        ExpandedSizePlan {
+            layers,
+            root: self.journal_root.clone(),
+        }
     }
 }
 
@@ -82,18 +88,22 @@ impl ExpandedSizePlan {
     /// `blobs` / `blobs/sha256` が symlink・非ディレクトリなら `FailedPrecondition`。合計が
     /// [`MAX_EXPANDED_SCAN_BYTES`] を超えたら `ResourceExhausted`。権限・I/O の失敗は `Internal`。
     /// 非 Unix では blob を安全に開けないため `Unimplemented`（`open_blob_nofollow` と同じ fail-closed）。
+    ///
+    /// 読み取りは検査済み root の fd 起点（#2695）。計画を排他区間で取った場合、`root` がその区間の root と
+    /// 別のディレクトリなら `InvalidArgument`（ガードを手放した後に差し替えられたパスを読まない）。
     pub fn measure(&self, root: &Path) -> Result<ExpandedUsage, OciError> {
-        let dirs_exist = check_blob_dirs(root)?;
+        let handle = self.root.resolve(root)?;
+        let blobs = handle.open_blob_dir()?;
         let mut usage = ExpandedUsage::default();
         // 成功・失敗を問わず実際に展開した量の累計（報告用の `expanded_bytes` とは別に予算を管理する）。
         let mut scanned: u64 = 0;
         for digest in &self.layers {
-            if !dirs_exist {
+            let Some(dir) = blobs.as_ref() else {
                 usage.missing_layers += 1;
                 continue;
-            }
+            };
             let remaining = MAX_EXPANDED_SCAN_BYTES.saturating_sub(scanned);
-            let (outcome, consumed) = measure_layer(root, digest, remaining)?;
+            let (outcome, consumed) = measure_layer(dir, digest, remaining)?;
             scanned = add(scanned, consumed)?;
             if scanned > MAX_EXPANDED_SCAN_BYTES {
                 return Err(err(
@@ -117,25 +127,13 @@ impl ExpandedSizePlan {
 /// 1 レイヤーを計測し、結果と実際に展開した量（失敗時も含む）を返す。`remaining` は総予算の残りで、
 /// 展開側の上限をこれに絞る（残りを 1 バイト超えた時点で打ち切り、呼び出し側が総予算超過を判定する）。
 fn measure_layer(
-    root: &Path,
+    dir: &BlobDir,
     digest: &Digest,
     remaining: u64,
 ) -> Result<(LayerOutcome, u64), OciError> {
-    let path = blob_path(root, digest)?;
-    let mut file = match open_blob_nofollow(&path) {
-        Ok(f) => f,
-        // 無い・通常ファイルでない（symlink 等）・開く間に差し替えられた blob は欠損として扱う。
-        Err(e)
-            if matches!(
-                e.code(),
-                OciErrorCode::NotFound
-                    | OciErrorCode::InvalidArgument
-                    | OciErrorCode::FailedPrecondition
-            ) =>
-        {
-            return Ok((LayerOutcome::Missing, 0));
-        }
-        Err(e) => return Err(e),
+    // 無い・通常ファイルでない（symlink 等）・開く間に差し替えられた blob は欠損として扱う。
+    let Some(mut file) = dir.open_file(blob_hex(digest)?)? else {
+        return Ok((LayerOutcome::Missing, 0));
     };
     let io_internal = |_: io::Error| err(OciErrorCode::Internal, "failed to read layer blob");
     let mut header = Vec::new();
@@ -176,6 +174,7 @@ fn measure_layer(
 mod tests {
     use super::*;
     use crate::image_management::ManifestComposition;
+    use crate::image_management::usage::blob_path;
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::fs;

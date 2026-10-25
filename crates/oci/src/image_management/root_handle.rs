@@ -18,6 +18,7 @@
 //! `cfg` は本モジュールの中だけに置き、永続化モジュールには `cfg(target_os)` / `cfg(target_arch)` を書かない。
 //!
 //! - Linux の x86_64 / aarch64: root の fd を `OwnedFd` で持つ。名前の解決は
+//!   `RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV` 付きの `openat2` で行い、
 //!   最後の要素も `O_NOFOLLOW` で辿らない。`openat2`（Linux 5.6 以降）が使えない環境（`ENOSYS`・seccomp による
 //!   `EPERM`）では `ImageStore::open` が `Unimplemented` で拒否し、パス起点へは縮退しない（fail-closed）。
 //!   root 配下の別マウントは `RESOLVE_NO_XDEV` の `EXDEV` で拒否し、`FailedPrecondition` と固定メッセージ

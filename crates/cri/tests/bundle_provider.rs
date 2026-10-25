@@ -447,15 +447,53 @@ fn dns_resolv_conf_is_0644_even_under_umask_077() {
         return;
     }
     let exe = std::env::current_exe().expect("exe");
-    let out = std::process::Command::new("sh")
+    // REPAIR-5: 子が停止しても試験が止まらないよう、期限つきで待ち、超過したら kill して回収する。
+    let mut child = std::process::Command::new("sh")
         .arg("-c")
         .arg("umask 077; exec \"$0\" --exact dns_resolv_conf_is_0644_even_under_umask_077 --test-threads=1")
         .arg(exe)
         .env(CHILD, "1")
-        .output()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("spawn");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success(), "child failed: {stdout}");
+    // 出力は別スレッドで収集する（パイプ満杯による子のブロックを避ける）。
+    let mut so = child.stdout.take().expect("stdout");
+    let mut se = child.stderr.take().expect("stderr");
+    let h_out = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut so, &mut b);
+        b
+    });
+    let h_err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut se, &mut b);
+        b
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let status = loop {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            break Some(st);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // 子が kill 済み（または終了済み）なのでパイプは閉じ、収集スレッドは終わる。
+    let stdout_bytes = h_out.join().expect("stdout thread");
+    let stderr_bytes = h_err.join().expect("stderr thread");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "child timed out after 60s: {stdout} {}",
+            String::from_utf8_lossy(&stderr_bytes)
+        )
+    });
+    assert!(status.success(), "child failed: {stdout}");
     assert!(stdout.contains("1 passed"), "child did not run: {stdout}");
 }
 

@@ -54,7 +54,15 @@ mod linux {
                 Some(s) => break s,
                 None if std::time::Instant::now() >= deadline => {
                     let _ = child.kill();
-                    let _ = child.wait();
+                    // kill 後の回収にも有限の期限を設ける(REPAIR-5)。回収できなくても失敗報告へ到達する。
+                    let reap_deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while std::time::Instant::now() < reap_deadline {
+                        if !matches!(child.try_wait(), Ok(None)) {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
                     panic!("head did not finish within 10s");
                 }
                 None => std::thread::sleep(std::time::Duration::from_millis(10)),

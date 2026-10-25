@@ -150,7 +150,7 @@ mod imp {
     use std::os::fd::{AsFd as _, OwnedFd};
     use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
     use std::os::unix::fs::MetadataExt as _;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::{OciError, OciErrorCode, PullDir, RootHandle, root_inaccessible};
     use crate::sys::at::{
@@ -402,6 +402,17 @@ mod imp {
     pub(crate) struct BlobDir(OwnedFd);
 
     impl BlobDir {
+        /// `p`（パスで辿った `blobs/sha256`）が、この fd と同じ実体か（dev / ino の照合。OCI-7・SEC-1・#2694）。
+        pub(crate) fn matches_path(&self, p: &Path) -> bool {
+            let Ok(fd) = self.0.try_clone() else {
+                return false;
+            };
+            let Ok(mine) = File::from(fd).metadata() else {
+                return false;
+            };
+            std::fs::metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == (mine.dev(), mine.ino()))
+        }
+
         /// blob のメタデータ（symlink は辿らない）。無ければ `None`。
         pub(crate) fn stat(&self, hex: &str) -> io::Result<Option<Metadata>> {
             let n = at::component_cstring(OsStr::new(hex))?;
@@ -670,6 +681,11 @@ mod imp {
     pub(crate) struct BlobDir(PathBuf);
 
     impl BlobDir {
+        /// パス起点の実装は同じパスを辿るため常に真（差し替えは入口の再検査だけで検出する）。
+        pub(crate) fn matches_path(&self, _p: &Path) -> bool {
+            true
+        }
+
         /// blob のメタデータ（symlink は辿らない）。無ければ `None`。
         pub(crate) fn stat(&self, hex: &str) -> io::Result<Option<Metadata>> {
             match fs::symlink_metadata(self.0.join(hex)) {

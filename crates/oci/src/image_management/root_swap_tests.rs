@@ -385,6 +385,32 @@ fn oci7_sec1_root_swapped_during_recover_stale_pulls_reclaims_only_verified_root
     let _ = fs::remove_dir_all(&moved);
 }
 
+/// OCI-7・SEC-1・#2694: キャッシュ済み blob のリース登録の排他区間の直後に root が差し替わると、fd 側では
+/// blob が見えるがパス側はおとりになる。`Leased` に存在しないパスを載せず `Internal` で拒否する。
+#[test]
+fn oci7_sec1_lease_rejects_root_swapped_after_reverify() {
+    let root = temp_root("lease");
+    let moved = root.with_extension("moved");
+    let store = open_store(&root);
+    let mut s = store.begin_pull(pid("p1")).expect("begin");
+    let layer = sha_of(b"cached");
+    let hex = layer.to_string().replace("sha256:", "");
+    let dir = root.join("blobs").join("sha256");
+    fs::create_dir_all(&dir).expect("blob dir");
+    fs::write(dir.join(&hex), b"cached").expect("blob");
+    let (r, m) = (root.clone(), moved.clone());
+    set_after_reverify(move || swap_root(&r, &m));
+
+    let e = s.lease_existing_blob(&layer).expect_err("swapped root");
+    assert_eq!(e.code(), OciErrorCode::Internal);
+    assert_eq!(e.message(), "image store root changed after open");
+    assert_eq!(names(&root), Vec::<String>::new());
+    assert!(moved.join("blobs").join("sha256").join(&hex).is_file());
+    drop(s);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&moved);
+}
+
 /// OCI-7・SEC-1・#2694: `staged_blob_path` で得たパスへ fetcher が書く前に root が差し替わると、書かれた先は
 /// おとりになる。検証は保持している pull ディレクトリ fd 起点で開き直すため `NotFound` になり、公開もされない
 /// （fetcher の書き込み先がパスである残りの隙間の fail-closed を機械照合する）。

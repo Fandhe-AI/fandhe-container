@@ -485,6 +485,20 @@ impl PullSession<'_> {
         };
         match miss {
             None => {
+                // 返すパスは文字列で組み立てるため、fd で確かめた実体と同じ `blobs/sha256` を指すことを照合する。
+                // root が差し替わっていれば存在しない・おとりの path を `Leased` に載せず fail-closed で拒否する
+                // （OCI-7・SEC-1・#2694。`staged_blob_path` と同じ照合）。リースは戻す。root が差し替わった
+                // 後は排他区間の再検査が拒否するため戻せないことがあるが、その場合も拒否は変えない。
+                let dir_ok = blob_dir
+                    .as_ref()
+                    .is_some_and(|bd| path.parent().is_some_and(|p| bd.matches_path(p)));
+                if !dir_ok {
+                    let _ = self.release_own(digest);
+                    return Err(err(
+                        OciErrorCode::Internal,
+                        "image store root changed after open",
+                    ));
+                }
                 self.leased.insert(digest.clone());
                 Ok(BlobReuse::Leased(LeasedBlob {
                     digest: digest.clone(),

@@ -94,6 +94,10 @@ const MARKER_MAX_BYTES: u64 = 128;
 #[cfg(target_os = "linux")]
 const USERNS_REMOVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// userns の中での seal / publish に与える予算（写像の書き込みの期限とは別。REPAIR-5・#2690）。
+#[cfg(target_os = "linux")]
+const USERNS_FINALIZE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// 公開済みの孤児の回収で、状態を調べるページ数・1 ページの件数の上限（無制限の走査を避ける。REPAIR-5）。
 #[cfg(target_os = "linux")]
 const ORPHAN_SCAN_MAX_PAGES: usize = 200;
@@ -606,8 +610,18 @@ impl CreatedRootfs {
     ///
     /// Linux は固定した親の下で `renameat2(RENAME_NOREPLACE)` により改名し、最終の名前が既にあれば
     /// `AlreadyExists`（置き換えない）。Linux 以外は作成自体が拒否されるため到達しない。
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn publish(&mut self) -> Result<(), TraitError> {
-        imp::publish(&mut self.backing)
+        self.publish_with(&HOST_PRIVILEGE)
+    }
+
+    /// [`Self::publish`] に権限を指定したもの。子 rootfs が subuid 所有で権限が `SubordinateIds` なら、改名を
+    /// userns の中で行う（rootless の `./` が root 以外の所有のとき。OCI-7・SEC-5・#2690）。
+    pub(super) fn publish_with(
+        &mut self,
+        privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
+        imp::publish(&mut self.backing, privilege)
     }
 
     /// 最終の名前への改名が済んでいるか。`publish` が Err でも true なら公開済みで、他の create が
@@ -640,8 +654,19 @@ impl CreatedRootfs {
     ///
     /// `state_root_scope` は [`state_root_scope`] の識別子（印 v3 の 3 行目。`None` なら v2 を書き、孤児の回収は
     /// この木を残す。#2635・OCI-5）。
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn seal(&mut self, state_root_scope: Option<&str>) -> Result<(), TraitError> {
-        imp::seal(&mut self.backing, state_root_scope)
+        self.seal_with(state_root_scope, &HOST_PRIVILEGE)
+    }
+
+    /// [`Self::seal`] に権限を指定したもの。子 rootfs が subuid 所有で権限が `SubordinateIds` なら、印の書き込みを
+    /// userns の中で行う（OCI-7・SEC-5・#2690）。
+    pub(super) fn seal_with(
+        &mut self,
+        state_root_scope: Option<&str>,
+        privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
+        imp::seal(&mut self.backing, state_root_scope, privilege)
     }
 
     /// rootfs を消す。
@@ -705,7 +730,9 @@ mod imp {
         ORPHAN_SCAN_MAX_PAGES, ORPHAN_SCAN_PAGE_SIZE, OrphanReap, RecordedRootfsRemoval,
         STAGING_PREFIX, StagingReclamation, UnverifiedReason, invalid, refuse, remove_failed,
     };
-    use super::{HOST_PRIVILEGE, ImageRootfsPrivilege, USERNS_REMOVE_BUDGET};
+    use super::{
+        HOST_PRIVILEGE, ImageRootfsPrivilege, USERNS_FINALIZE_BUDGET, USERNS_REMOVE_BUDGET,
+    };
     use crate::exec::{
         ChildExit, IsolationConfig, Namespace, NamespaceSet, isolate_rootless_subordinate,
         plan_rootless_subordinate, wait_forked_child,
@@ -779,7 +806,212 @@ mod imp {
         Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
     }
 
-    pub(super) fn seal(b: &mut Backing, scope: Option<&str>) -> Result<(), TraitError> {
+    /// 子が実効 uid 所有でない（rootless で `./` が subuid 所有）ときの、ホストでは改名できないことの明示エラー。
+    fn foreign_root_err() -> TraitError {
+        TraitError::new(
+            ErrorCode::Internal,
+            "failed to publish rootfs: cannot make unpacked root writable for rename (owned by another uid)",
+        )
+    }
+
+    /// seal / publish の実行場所（[`finalize_route`] の結果）。
+    #[derive(Debug)]
+    pub(super) enum FinalizeRoute<'a> {
+        /// ホストの実効 uid で行う。`foreign` は子が別 uid 所有（失敗時に明示エラーへ読み替える）。
+        Host { foreign: bool },
+        /// 子プロセスの user namespace の中で行う（子が subuid 所有で、権限が `SubordinateIds`。#2690）。
+        Userns(&'a SubordinateIdSource),
+    }
+
+    /// 子 rootfs の所有者と権限から、seal / publish を行う場所を決める（純関数。OCI-7・SEC-5・#2690）。
+    ///
+    /// 所有者が実効 uid または不明なら従来どおりホスト（fork しない）。別 uid 所有で権限が `SubordinateIds` のときだけ
+    /// userns の中で行う。`HostEffectiveIds` では暗黙に userns へ昇格せず、ホストで試して明示エラーで拒否する。
+    pub(super) fn finalize_route<'a>(
+        child_owner: Option<u32>,
+        euid: u32,
+        privilege: &'a ImageRootfsPrivilege,
+    ) -> FinalizeRoute<'a> {
+        let foreign = child_owner.is_some_and(|o| o != euid);
+        match (foreign, privilege) {
+            (true, ImageRootfsPrivilege::SubordinateIds(source)) => FinalizeRoute::Userns(source),
+            _ => FinalizeRoute::Host { foreign },
+        }
+    }
+
+    /// seal の失敗（userns の子の終了コードの語彙と 1 対 1）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum SealFailure {
+        Stat,
+        Exists,
+        Widen,
+        Write,
+        Restore,
+    }
+
+    const SEAL_OK: i32 = 0;
+    const SEAL_EXISTS: i32 = 30;
+    const SEAL_WIDEN_FAILED: i32 = 31;
+    const SEAL_WRITE_FAILED: i32 = 32;
+    const SEAL_RESTORE_FAILED: i32 = 33;
+    const SEAL_STAT_FAILED: i32 = 34;
+
+    impl SealFailure {
+        fn code(self) -> i32 {
+            match self {
+                Self::Stat => SEAL_STAT_FAILED,
+                Self::Exists => SEAL_EXISTS,
+                Self::Widen => SEAL_WIDEN_FAILED,
+                Self::Write => SEAL_WRITE_FAILED,
+                Self::Restore => SEAL_RESTORE_FAILED,
+            }
+        }
+
+        /// 失敗の写し方。`foreign` なら書き込み系の失敗は原因が分かる明示エラーにする。
+        fn into_error(self, foreign: bool) -> TraitError {
+            match self {
+                Self::Stat => TraitError::new(ErrorCode::Internal, "failed to stat rootfs"),
+                Self::Exists => TraitError::new(
+                    ErrorCode::AlreadyExists,
+                    "rootfs owner marker already exists",
+                ),
+                Self::Widen | Self::Write if foreign => foreign_root_err(),
+                Self::Widen | Self::Write => {
+                    TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token")
+                }
+                Self::Restore => {
+                    TraitError::new(ErrorCode::Internal, "failed to restore rootfs mode")
+                }
+            }
+        }
+    }
+
+    /// fd の指す rootfs の mode を一時的に補って印を書き、成功・失敗のどちらでも元の mode へ戻す。
+    ///
+    /// ホストの `seal` と、userns の子（#2690）の両方が呼ぶ。展開器は rootfs 自身の mode を変えてよい（契約は
+    /// 禁止していない）ので、所有者の write・search 権限が無いと印を作れず従来成功した create が失敗する
+    /// 退行になる。`/proc/self/fd/N` は経路を再解決しない。
+    fn write_marker_widened(dir: BorrowedFd<'_>, content: &str) -> Result<(), SealFailure> {
+        let proc_dir = format!("/proc/self/fd/{}", dir.as_raw_fd());
+        let original = fstat(dir)
+            .map(|(_, _, _, mode)| mode & 0o7777)
+            .map_err(|_| SealFailure::Stat)?;
+        let widened = original | 0o300;
+        if widened != original {
+            std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(widened))
+                .map_err(|_| SealFailure::Widen)?;
+        }
+        let written = write_marker(&proc_dir, content).map_err(|e| match e.code() {
+            ErrorCode::AlreadyExists => SealFailure::Exists,
+            _ => SealFailure::Write,
+        });
+        if widened != original {
+            let restored =
+                std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(original));
+            written?;
+            restored.map_err(|_| SealFailure::Restore)?;
+        } else {
+            written?;
+        }
+        Ok(())
+    }
+
+    /// userns の子の実行が親へ返すエラー（固定語彙）。
+    #[derive(Debug, PartialEq, Eq)]
+    enum UsernsRunError {
+        MultiThreaded,
+        Timeout,
+        Other(ErrorCode),
+    }
+
+    impl UsernsRunError {
+        fn into_error(self) -> TraitError {
+            match self {
+                Self::MultiThreaded => TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "cannot finalize a subordinate-owned rootfs in a user namespace",
+                ),
+                Self::Timeout => TraitError::new(
+                    ErrorCode::Timeout,
+                    "finalizing a subordinate-owned rootfs timed out",
+                ),
+                Self::Other(code) => TraitError::new(
+                    code,
+                    "failed to finalize a subordinate-owned rootfs in a user namespace",
+                ),
+            }
+        }
+    }
+
+    /// 子プロセスの user namespace（User のみ・holder / mapper 方式。#2374）の中で `child` を実行し、終了コードを返す。
+    ///
+    /// seal / publish（#2690）が使う。親は期限つきで待ち、超えたら kill して回収する（REPAIR-5）。呼び出しプロセスが
+    /// マルチスレッドなら fork の検査が拒否する（CRI / tokio 経路の子プロセス方式の配線は #2315 の範囲）。
+    fn run_in_userns(
+        source: &SubordinateIdSource,
+        child: impl FnOnce() -> i32,
+    ) -> Result<i32, UsernsRunError> {
+        let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
+        let inputs = source
+            .removal_inputs(euid, egid)
+            .map_err(|e| UsernsRunError::Other(e.code()))?;
+        let config = IsolationConfig {
+            namespaces: NamespaceSet::empty().with(Namespace::User),
+            hostname: None,
+        };
+        let helper_timeout = inputs.timeout;
+        let plan = plan_rootless_subordinate(
+            &config,
+            inputs.uid,
+            inputs.gid,
+            inputs.writer,
+            helper_timeout,
+        )
+        .map_err(|e| UsernsRunError::Other(e.code))?;
+        let pid = sys::fork_single_threaded(
+            || {
+                if isolate_rootless_subordinate(&plan).is_err() {
+                    return CHILD_SETUP_FAILED;
+                }
+                child()
+            },
+            CHILD_SETUP_FAILED,
+        )
+        .map_err(|e| match e {
+            SysError::MultiThreaded => UsernsRunError::MultiThreaded,
+            _ => UsernsRunError::Other(ErrorCode::Internal),
+        })?;
+        let budget =
+            helper_timeout * 3 + std::time::Duration::from_secs(5) + USERNS_FINALIZE_BUDGET;
+        match wait_forked_child(pid, budget) {
+            Ok(ChildExit::Exited(code)) => Ok(code),
+            Err(e) if e.code == ErrorCode::Timeout => Err(UsernsRunError::Timeout),
+            _ => Err(UsernsRunError::Other(ErrorCode::Internal)),
+        }
+    }
+
+    /// userns の中の seal の結果を親の結果へ写す（純関数）。
+    fn seal_outcome(run: Result<i32, UsernsRunError>) -> Result<(), TraitError> {
+        match run {
+            Ok(SEAL_OK) => Ok(()),
+            Ok(SEAL_EXISTS) => Err(SealFailure::Exists.into_error(true)),
+            Ok(SEAL_WIDEN_FAILED) => Err(SealFailure::Widen.into_error(true)),
+            Ok(SEAL_WRITE_FAILED) => Err(SealFailure::Write.into_error(true)),
+            Ok(SEAL_RESTORE_FAILED) => Err(SealFailure::Restore.into_error(true)),
+            Ok(SEAL_STAT_FAILED) => Err(SealFailure::Stat.into_error(true)),
+            Ok(_) => Err(TraitError::new(
+                ErrorCode::Internal,
+                "failed to write rootfs owner token",
+            )),
+            Err(e) => Err(e.into_error()),
+        }
+    }
+
+    pub(super) fn seal(
+        b: &mut Backing,
+        scope: Option<&str>,
+        privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
         if scope.is_some_and(|s| !is_hex32(s)) {
             return Err(TraitError::new(
                 ErrorCode::Internal,
@@ -787,35 +1019,6 @@ mod imp {
             ));
         }
         let token = new_token()?;
-        // 展開器は rootfs 自身の mode を変えてよい（契約は禁止していない）。所有者の write・search 権限が無いと
-        // 印を作れず、従来成功した create が失敗する退行になるため、固定した fd の実体（`/proc/self/fd/N` は
-        // 経路を再解決しない）の mode を一時的に補って印を書き、成功・失敗のどちらでも元の mode へ戻す。
-        let proc_dir = format!("/proc/self/fd/{}", b.dir.as_raw_fd());
-        let original = fstat(b.dir.as_fd())
-            .map(|(_, _, _, mode)| mode & 0o7777)
-            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to stat rootfs"))?;
-        let widened = original | 0o300;
-        // 子が実効 uid 所有でない（rootless で `./` が subuid 所有。決定 G の既知の制限・#2690）と、mode の補完も
-        // 印の作成もできない。seal は publish より先に走るため、汎用の印の書き込み失敗ではなく publish と同じ
-        // 診断で拒否する（利用者が原因を判別できるように。OCI-7）。
-        let foreign = fd_owner(b.dir.as_fd()).is_some_and(|o| o != sys::effective_uid());
-        let foreign_err = || {
-            TraitError::new(
-                ErrorCode::Internal,
-                "failed to publish rootfs: cannot make unpacked root writable for rename (owned by another uid)",
-            )
-        };
-        if widened != original {
-            std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(widened)).map_err(
-                |_| {
-                    if foreign {
-                        foreign_err()
-                    } else {
-                        TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token")
-                    }
-                },
-            )?;
-        }
         // v2: 1 行目 = トークン、2 行目 = 木の作成時の `<dev>:<ino>`。複製（`cp -a`）は inode が新しくなり
         // 2 行目が一致しないので、孤児の回収が利用者の複製を消さない（#2540）。
         // v3（#2635）: 3 行目 = 状態ルートの識別子。別の状態ルートの木を孤児の回収が消さない（OCI-5）。
@@ -824,22 +1027,20 @@ mod imp {
             Some(scope) => format!("{token}\n{}:{}\n{scope}\n", b.identity.0, b.identity.1),
             None => format!("{token}\n{}:{}\n", b.identity.0, b.identity.1),
         };
-        let written = write_marker(&proc_dir, &content).map_err(|e| {
-            if foreign && e.code() == ErrorCode::Internal {
-                foreign_err()
-            } else {
-                e
+        match finalize_route(fd_owner(b.dir.as_fd()), sys::effective_uid(), privilege) {
+            FinalizeRoute::Host { foreign } => {
+                write_marker_widened(b.dir.as_fd(), &content).map_err(|f| f.into_error(foreign))?;
             }
-        });
-        if widened != original {
-            let restored =
-                std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(original));
-            written?;
-            restored.map_err(|_| {
-                TraitError::new(ErrorCode::Internal, "failed to restore rootfs mode")
-            })?;
-        } else {
-            written?;
+            FinalizeRoute::Userns(source) => {
+                // 子が subuid 所有（#2690）。ホストの uid では mode の補完も印の作成もできないので、userns の中で
+                // 行う。印はコンテナ 0 = ホストの実効 uid 所有・0400 で作られ、孤児の回収の厳格照合と整合する。
+                let dir = b.dir.as_fd();
+                let run = run_in_userns(source, || match write_marker_widened(dir, &content) {
+                    Ok(()) => SEAL_OK,
+                    Err(f) => f.code(),
+                });
+                seal_outcome(run)?;
+            }
         }
         b.token = Some(token);
         Ok(())
@@ -978,60 +1179,162 @@ mod imp {
         PathBuf::from(format!("/proc/self/fd/{}", b.dir.as_raw_fd()))
     }
 
-    pub(super) fn publish(b: &mut Backing) -> Result<(), TraitError> {
-        if b.published {
-            return Ok(());
+    /// 改名の失敗（userns の子の終了コードの語彙と 1 対 1）。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PublishFailure {
+        Stat,
+        Widen,
+        Exists,
+        Rename,
+        /// 改名には成功したが、mode を戻せなかった。
+        RestoreAfterRename,
+    }
+
+    const PUB_RENAMED: i32 = 0;
+    const PUB_EXISTS: i32 = 20;
+    const PUB_WIDEN_FAILED: i32 = 21;
+    const PUB_RENAME_FAILED: i32 = 22;
+    const PUB_RESTORE_FAILED: i32 = 23;
+    const PUB_STAT_FAILED: i32 = 24;
+
+    impl PublishFailure {
+        fn code(self) -> i32 {
+            match self {
+                Self::Stat => PUB_STAT_FAILED,
+                Self::Widen => PUB_WIDEN_FAILED,
+                Self::Exists => PUB_EXISTS,
+                Self::Rename => PUB_RENAME_FAILED,
+                Self::RestoreAfterRename => PUB_RESTORE_FAILED,
+            }
         }
-        let child = cstr(OsStr::new(STAGING_CHILD))?;
-        // 別のディレクトリの下へ移すには、移すディレクトリ自身への write 権限が要る（`..` の付け替え。同じ親の下の
-        // 改名では要らなかった）。展開器は rootfs 自身の mode を変えてよい（例: 0555）ので、write が無ければ
-        // 固定した fd の実体（`/proc/self/fd/N` は経路を再解決しない）の mode を一時的に補い、改名の後に戻す。
+
+        fn into_error(self) -> TraitError {
+            match self {
+                Self::Stat => TraitError::new(ErrorCode::Internal, "failed to stat rootfs"),
+                Self::Widen => foreign_root_err(),
+                Self::Exists => TraitError::new(ErrorCode::AlreadyExists, "rootfs already exists"),
+                Self::Rename => TraitError::new(ErrorCode::Internal, "failed to publish rootfs"),
+                Self::RestoreAfterRename => {
+                    TraitError::new(ErrorCode::Internal, "failed to restore rootfs mode")
+                }
+            }
+        }
+    }
+
+    /// 子 rootfs を最終の名前へ `RENAME_NOREPLACE` で改名する。ホストと userns の子（#2690）の両方が呼ぶ。
+    ///
+    /// 別のディレクトリの下へ移すには、移すディレクトリ自身への write 権限が要る（`..` の付け替え。同じ親の下の
+    /// 改名では要らなかった）。展開器は rootfs 自身の mode を変えてよい（例: 0555）ので、write が無ければ固定した
+    /// fd の実体（`/proc/self/fd/N` は経路を再解決しない）の mode を一時的に補い、改名の後に戻す。
+    fn rename_widened(b: &Backing) -> Result<(), PublishFailure> {
+        let child = cstr(OsStr::new(STAGING_CHILD)).map_err(|_| PublishFailure::Rename)?;
         let proc_dir = format!("/proc/self/fd/{}", b.dir.as_raw_fd());
         let original = fstat(b.dir.as_fd())
             .map(|(_, _, _, mode)| mode & 0o7777)
-            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to stat rootfs"))?;
+            .map_err(|_| PublishFailure::Stat)?;
         let widened = original | 0o200;
         if widened != original {
-            // 子が実効 uid 所有でない（rootless で `./` が subuid 所有。決定 G の既知の制限・#2690）と chmod できず、
-            // 改名もできない。成功を装わず、理由が分かる明示エラーで拒否する。
             std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(widened))
-                .map_err(|_| {
-                    TraitError::new(
-                        ErrorCode::Internal,
-                        "failed to publish rootfs: cannot make unpacked root writable for rename (owned by another uid)",
-                    )
-                })?;
+                .map_err(|_| PublishFailure::Widen)?;
         }
         let renamed =
             sys::rename_noreplace_at(b.wrapper.as_fd(), &child, b.parent.as_fd(), &b.final_name);
         if widened != original {
             let restored =
                 std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(original));
-            // 改名に成功していれば公開済みとして扱い（後始末で消さない）、戻せなかったことだけを報告する。
+            // 改名に成功していれば公開済みとして扱い、戻せなかったことだけを報告する。
             if renamed.is_ok() && restored.is_err() {
-                b.published = true;
-                return Err(TraitError::new(
-                    ErrorCode::Internal,
-                    "failed to restore rootfs mode",
-                ));
+                return Err(PublishFailure::RestoreAfterRename);
             }
         }
         renamed.map_err(|e| match e {
-            SysError::Os(n) if n == sys::EEXIST || n == sys::ENOTEMPTY => {
-                TraitError::new(ErrorCode::AlreadyExists, "rootfs already exists")
+            SysError::Os(n) if n == sys::EEXIST || n == sys::ENOTEMPTY => PublishFailure::Exists,
+            _ => PublishFailure::Rename,
+        })
+    }
+
+    /// 最終の名前が、展開した実体（dev・ino）を指しているか。改名は原子的なので、これが公開済みの判定になる。
+    fn observe_published(b: &Backing) -> bool {
+        open_dir(b.parent.as_fd(), &b.final_name)
+            .ok()
+            .and_then(|fd| fstat(fd.as_fd()).ok())
+            .is_some_and(|(dev, ino, is_dir, _)| is_dir && (dev, ino) == b.identity)
+    }
+
+    /// userns の中の改名の結果を `(公開済みか, 結果)` へ写す（純関数）。
+    ///
+    /// 公開済みかは終了コードではなく観測（`observed`）で決める。期限切れで kill した場合も、改名が済んでいれば
+    /// 公開済みとして残す（OCI-7 の使用中 rootfs の保持。create は公開済みの木を消さない）。
+    fn publish_outcome(
+        run: Result<i32, UsernsRunError>,
+        observed: bool,
+    ) -> (bool, Result<(), TraitError>) {
+        if observed {
+            // 公開済みの観測が保証するのは改名が済んだことだけで、mode の復元までは保証しない。
+            // 子が改名の後・復元の前に止まった場合（期限切れの kill・異常終了）に成功を装わない（fail-closed）。
+            // 公開済みの木は消さず（published = true）、エラーで返す。
+            return match run {
+                Ok(PUB_RENAMED) => (true, Ok(())),
+                Ok(PUB_RESTORE_FAILED) | Ok(_) => {
+                    (true, Err(PublishFailure::RestoreAfterRename.into_error()))
+                }
+                Err(e) => (true, Err(e.into_error())),
+            };
+        }
+        let err = match run {
+            Ok(PUB_EXISTS) => PublishFailure::Exists.into_error(),
+            Ok(PUB_WIDEN_FAILED) => PublishFailure::Widen.into_error(),
+            Ok(PUB_STAT_FAILED) => PublishFailure::Stat.into_error(),
+            // 改名したと言うのに最終の名前が展開した実体を指さない。成功を装わない。
+            Ok(PUB_RENAMED) => refuse(),
+            Ok(_) => PublishFailure::Rename.into_error(),
+            Err(e) => e.into_error(),
+        };
+        (false, Err(err))
+    }
+
+    pub(super) fn publish(
+        b: &mut Backing,
+        privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
+        if b.published {
+            return Ok(());
+        }
+        match finalize_route(fd_owner(b.dir.as_fd()), sys::effective_uid(), privilege) {
+            FinalizeRoute::Host { .. } => match rename_widened(b) {
+                Ok(()) => {}
+                Err(PublishFailure::RestoreAfterRename) => {
+                    b.published = true;
+                    return Err(PublishFailure::RestoreAfterRename.into_error());
+                }
+                Err(f) => return Err(f.into_error()),
+            },
+            FinalizeRoute::Userns(source) => {
+                // 子が subuid 所有（#2690）。ホストの uid では mode の補完も改名もできないので userns の中で行う。
+                // 子が触れるのは固定済みの fd と固定の 2 つの名前だけで、経路を再解決しない。
+                let run = run_in_userns(source, || match rename_widened(b) {
+                    Ok(()) => PUB_RENAMED,
+                    Err(f) => f.code(),
+                });
+                let observed = observe_published(b);
+                let (published, result) = publish_outcome(run, observed);
+                if published {
+                    b.published = true;
+                    let _ = sys::remove_dir_at(b.parent.as_fd(), &b.wrapper_name);
+                }
+                return result;
             }
-            _ => TraitError::new(ErrorCode::Internal, "failed to publish rootfs"),
-        })?;
+        }
         b.published = true;
         // 空になったラッパーは best effort で消す（消し損ねても、次の回収が予約名の空の木として拾う）。
         let _ = sys::remove_dir_at(b.parent.as_fd(), &b.wrapper_name);
         // 改名した先を固定済みの親から開き直し、展開した実体（保持中の fd の dev・ino）と一致することを確認する。
         // 一致しなければ公開した名前は別の実体を指しており、成功を装わず拒否する。
-        let same = open_dir(b.parent.as_fd(), &b.final_name)
-            .ok()
-            .and_then(|fd| fstat(fd.as_fd()).ok())
-            .is_some_and(|(dev, ino, is_dir, _)| is_dir && (dev, ino) == b.identity);
-        if same { Ok(()) } else { Err(refuse()) }
+        if observe_published(b) {
+            Ok(())
+        } else {
+            Err(refuse())
+        }
     }
 
     /// 最終の名前への改名が済んでいるか。
@@ -2012,6 +2315,119 @@ mod imp {
         }
         Ok(())
     }
+
+    /// OCI-7・SEC-5・#2690: seal / publish の実行場所の分岐と、userns の子の終了コードの写し方。
+    #[cfg(test)]
+    mod finalize_tests {
+        use super::*;
+
+        fn sub() -> ImageRootfsPrivilege {
+            let source = SubordinateIdSource::with_id_files(
+                None,
+                Path::new("/nonexistent/subuid"),
+                Path::new("/nonexistent/subgid"),
+            )
+            .expect("source");
+            ImageRootfsPrivilege::SubordinateIds(source)
+        }
+
+        #[test]
+        fn route_host_when_owner_is_euid_or_unknown() {
+            let p = sub();
+            assert!(matches!(
+                finalize_route(Some(1000), 1000, &p),
+                FinalizeRoute::Host { foreign: false }
+            ));
+            assert!(matches!(
+                finalize_route(None, 1000, &p),
+                FinalizeRoute::Host { foreign: false }
+            ));
+        }
+
+        #[test]
+        fn route_foreign_host_effective_ids_stays_on_host() {
+            assert!(matches!(
+                finalize_route(Some(100_000), 1000, &HOST_PRIVILEGE),
+                FinalizeRoute::Host { foreign: true }
+            ));
+        }
+
+        #[test]
+        fn route_userns_when_foreign_and_subordinate() {
+            let p = sub();
+            assert!(matches!(
+                finalize_route(Some(100_000), 1000, &p),
+                FinalizeRoute::Userns(_)
+            ));
+        }
+
+        #[test]
+        fn seal_outcome_maps_every_exit_code() {
+            assert!(seal_outcome(Ok(SEAL_OK)).is_ok());
+            let e = seal_outcome(Ok(SEAL_EXISTS)).expect_err("exists");
+            assert_eq!(e.code(), ErrorCode::AlreadyExists);
+            let e = seal_outcome(Ok(SEAL_WIDEN_FAILED)).expect_err("widen");
+            assert_eq!(e.code(), ErrorCode::Internal);
+            assert!(e.message().contains("cannot make unpacked root writable"));
+            let e = seal_outcome(Ok(SEAL_WRITE_FAILED)).expect_err("write");
+            assert!(e.message().contains("cannot make unpacked root writable"));
+            let e = seal_outcome(Ok(SEAL_RESTORE_FAILED)).expect_err("restore");
+            assert_eq!(e.message(), "failed to restore rootfs mode");
+            let e = seal_outcome(Ok(CHILD_SETUP_FAILED)).expect_err("setup");
+            assert_eq!(e.code(), ErrorCode::Internal);
+            let e = seal_outcome(Err(UsernsRunError::MultiThreaded)).expect_err("mt");
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+            let e = seal_outcome(Err(UsernsRunError::Timeout)).expect_err("timeout");
+            assert_eq!(e.code(), ErrorCode::Timeout);
+        }
+
+        #[test]
+        fn publish_outcome_observation_decides_published() {
+            let (p, r) = publish_outcome(Ok(PUB_RENAMED), true);
+            assert!(p && r.is_ok());
+            // 期限切れで kill しても、改名が済んでいれば公開済みとして残す（削除しない）が、
+            // mode の復元を確認できないので成功にはしない（Timeout のエラーで返す）。
+            let (p, r) = publish_outcome(Err(UsernsRunError::Timeout), true);
+            assert!(p);
+            assert_eq!(r.expect_err("timeout").code(), ErrorCode::Timeout);
+            // 改名の後に異常終了した子も同様（復元前に止まった可能性）。
+            let (p, r) = publish_outcome(Ok(99), true);
+            assert!(p);
+            assert_eq!(
+                r.expect_err("abnormal").message(),
+                "failed to restore rootfs mode"
+            );
+            let (p, r) = publish_outcome(Err(UsernsRunError::Other(ErrorCode::Internal)), true);
+            assert!(p);
+            assert_eq!(r.expect_err("other").code(), ErrorCode::Internal);
+            let (p, r) = publish_outcome(Ok(PUB_RESTORE_FAILED), true);
+            assert!(p);
+            assert_eq!(
+                r.expect_err("restore").message(),
+                "failed to restore rootfs mode"
+            );
+            let (p, r) = publish_outcome(Ok(PUB_EXISTS), false);
+            assert!(!p);
+            assert_eq!(r.expect_err("exists").code(), ErrorCode::AlreadyExists);
+            let (p, r) = publish_outcome(Ok(PUB_WIDEN_FAILED), false);
+            assert!(!p);
+            assert!(
+                r.expect_err("widen")
+                    .message()
+                    .contains("cannot make unpacked root writable")
+            );
+            // 改名したと言うのに観測できない場合は成功を装わない。
+            let (p, r) = publish_outcome(Ok(PUB_RENAMED), false);
+            assert!(!p);
+            assert_eq!(r.expect_err("refuse").code(), ErrorCode::FailedPrecondition);
+            let (_, r) = publish_outcome(Ok(PUB_RENAME_FAILED), false);
+            assert_eq!(r.expect_err("rename").message(), "failed to publish rootfs");
+            let (_, r) = publish_outcome(Ok(99), false);
+            assert_eq!(r.expect_err("unknown").code(), ErrorCode::Internal);
+            let (_, r) = publish_outcome(Err(UsernsRunError::MultiThreaded), false);
+            assert_eq!(r.expect_err("mt").code(), ErrorCode::FailedPrecondition);
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -2037,7 +2453,10 @@ mod imp {
         path.to_path_buf()
     }
 
-    pub(super) fn publish(_b: &mut Backing) -> Result<(), TraitError> {
+    pub(super) fn publish(
+        _b: &mut Backing,
+        _privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
         Ok(())
     }
 
@@ -2094,7 +2513,11 @@ mod imp {
     }
 
     /// 作成自体が拒否される（`create_dir` は Unimplemented）ため到達しない。
-    pub(super) fn seal(_b: &mut Backing, _scope: Option<&str>) -> Result<(), TraitError> {
+    pub(super) fn seal(
+        _b: &mut Backing,
+        _scope: Option<&str>,
+        _privilege: &ImageRootfsPrivilege,
+    ) -> Result<(), TraitError> {
         Err(TraitError::new(
             ErrorCode::Unimplemented,
             "image rootfs requires Linux",

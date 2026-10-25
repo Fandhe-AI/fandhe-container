@@ -482,6 +482,9 @@ pub struct LaunchSpec {
     working_dir: ContainerWorkingDir,
     /// `process.user` の (uid, gid)（名前空間内の値。写像との整合は launcher が fork 前に検査する。OCI-1・SEC-5）。
     user: (u32, u32),
+    /// `process.user.additionalGids`（start が件数の上限を検証済み。写像との照合と適用は launcher。
+    /// OCI-1・SEC-5・CORE-6・#2667）。
+    additional_gids: Vec<u32>,
     /// pod の user・ipc namespace への join（`linux.namespaces[].path`。start が fork 前に fd へ固定して検証済み。
     /// 無ければ `None`。CRI-2・CORE-3・SEC-1・SEC-5。#2674）。
     namespace_join: Option<NamespaceJoin>,
@@ -519,8 +522,23 @@ impl LaunchSpec {
             sysfs: None,
             working_dir,
             user,
+            additional_gids: Vec::new(),
             namespace_join: None,
         }
+    }
+
+    /// 検証済みの補助グループ（`process.user.additionalGids`）を載せる（`start` だけが呼ぶ。#2667）。
+    pub(super) fn with_additional_gids(mut self, gids: Vec<u32>) -> Self {
+        self.additional_gids = gids;
+        self
+    }
+
+    /// `process.user.additionalGids`（名前空間内の値。OCI-1・SEC-5・CORE-6・#2667）。
+    ///
+    /// 本番 launcher が fork の前に gid の写像と照合し、子の capability 削減段が `setgroups(list)` で適用する。
+    /// 空なら補助グループを持たせない（持ち越しもしない）。
+    pub fn additional_gids(&self) -> &[u32] {
+        &self.additional_gids
     }
 
     /// 検証済みの pod の namespace への join を載せる（`start` と launcher の試験が呼ぶ。#2674）。

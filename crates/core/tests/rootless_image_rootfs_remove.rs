@@ -19,6 +19,13 @@
 //! - `f`: core 専有のラッパー（実効 uid 所有）の下の子が subuid 所有・mode 0700 の展開途中の木（#2635）。
 //!   ラッパーの所有者が崩れないので `Unverified` にならず、権限なしは失敗として残し、権限ありは回収する。
 //!   rootful でイメージが所有者を変える場合の実機確認〔root 版〕は CI で回さない（#1621）
+//! - `g`: イメージの `./` が subuid 所有・mode 0700（rootless の展開器が最上位を chown する）で、権限なし
+//!   （`HostEffectiveIds`）の create は seal で明示エラーにして拒否する。後始末もホストでは消せず、残った
+//!   ラッパーは権限ありの回収が消す（#2690。暗黙に userns へ昇格しない）
+//! - `h`: 同じ構成で権限あり（`SubordinateIds`）の create は、印の書き込みと最終の名前への改名を userns の中で
+//!   行って成功し、最上位の mode が元（0700）に戻っている。delete が木を消す（#2690）
+//! - `h2`: 同じ構成で最上位が mode 0555 のとき、mode が 0555 に戻り、ホストから読める印が実効 uid 所有・
+//!   0400・nlink 1 で残る（孤児の回収の厳格照合と整合。#2690）
 //!
 //! # 実機前提テストとしての分離
 //! `harness = false` の単一スレッド `main`（fork と `CLONE_NEWUSER` の前提）。非特権 user namespace を許可する
@@ -36,7 +43,12 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if let Some(i) = args.iter().position(|a| a == "--populate") {
         let dir = args.get(i + 1).expect("directory after --populate");
-        linux::populate(dir, args.iter().any(|a| a == "--chown-root"));
+        let root_mode = args.iter().position(|a| a == "--chown-root").map(|j| {
+            args.get(j + 1)
+                .and_then(|m| u32::from_str_radix(m, 8).ok())
+                .expect("octal mode after --chown-root")
+        });
+        linux::populate(dir, root_mode);
     } else if args.iter().any(|a| a == "--ignored") {
         linux::run();
     } else {
@@ -92,9 +104,9 @@ mod linux {
     }
 
     /// 展開器の役の子: userns の中で subuid 所有の木を作る（`chown(1, 1)`・mode 0555）。
-    /// `chown_root` なら、木の最上位 `dir` 自身も subuid 所有・mode 0700 にする（展開途中でクラッシュした
-    /// 木の再現。ホストの実効 uid ではロック用に開き直せない）。
-    pub fn populate(dir: &str, chown_root: bool) {
+    /// `root_mode` が `Some` なら、木の最上位 `dir` 自身も subuid 所有・その mode にする（展開途中でクラッシュした
+    /// 木や、イメージの `./` が root 以外の所有の再現。ホストの実効 uid ではロック用に開き直せない）。
+    pub fn populate(dir: &str, root_mode: Option<u32>) {
         // userns に入る前にディレクトリを開く（入った後は親の `/proc/<pid>/fd` に頼らない）。
         let root = std::fs::File::open(dir).expect("open target dir");
         let (euid, egid) = (euid(), std::fs::metadata("/proc/self").expect("stat").gid());
@@ -123,8 +135,8 @@ mod linux {
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o555)).expect("chmod sub");
         std::os::unix::fs::chown(sub.join("f"), Some(1), Some(1)).expect("chown f");
         std::os::unix::fs::chown(&sub, Some(1), Some(1)).expect("chown sub");
-        if chown_root {
-            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+        if let Some(mode) = root_mode {
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(mode))
                 .expect("chmod root");
             std::os::unix::fs::chown(&base, Some(1), Some(1)).expect("chown root");
         }
@@ -133,10 +145,10 @@ mod linux {
     /// 本試験バイナリを `--populate` で再実行して、`dir`（親のプロセスが保持する fd を指す経路でも可）に
     /// subuid 所有の木を作らせる。子の待ちは期限つきで、超えたら kill して失敗にする（REPAIR-5）。
     fn populate_via_child(dir: &Path) {
-        populate_child(dir, false);
+        populate_child(dir, None);
     }
 
-    fn populate_child(dir: &Path, chown_root: bool) {
+    fn populate_child(dir: &Path, root_mode: Option<u32>) {
         // `/proc/self/fd/N` は子から見ると別のプロセスの fd なので、親の pid の経路へ読み替える。
         let text = dir.to_string_lossy();
         let path = match text.strip_prefix("/proc/self/") {
@@ -146,8 +158,8 @@ mod linux {
         let exe = std::env::current_exe().expect("current exe");
         let mut cmd = Command::new(exe);
         cmd.args(["--populate", &path]);
-        if chown_root {
-            cmd.arg("--chown-root");
+        if let Some(mode) = root_mode {
+            cmd.args(["--chown-root", &format!("{mode:o}")]);
         }
         let mut child = cmd.spawn().expect("spawn populate child");
         let deadline = Instant::now() + CHILD_DEADLINE;
@@ -169,6 +181,8 @@ mod linux {
 
     struct Populating {
         fail: bool,
+        /// `Some` なら最上位自身も subuid 所有にして、その mode にする（イメージの `./` が root 以外の所有）。
+        root_mode: Option<u32>,
     }
 
     impl ImageRootfsUnpacker for Populating {
@@ -177,7 +191,7 @@ mod linux {
             _manifest: &ImageManifestDigest,
             rootfs: &Path,
         ) -> Result<ImageRootfsUnpacked, TraitError> {
-            populate_via_child(rootfs);
+            populate_child(rootfs, self.root_mode);
             if self.fail {
                 return Err(TraitError::new(ErrorCode::Internal, "unpack failed"));
             }
@@ -303,8 +317,20 @@ mod linux {
         privilege: &ImageRootfsPrivilege,
         fail: bool,
     ) -> Result<(), fandhe_container_core::oci_runtime::OciRuntimeError> {
+        create_rooted(sb, store, rec, privilege, fail, None)
+    }
+
+    /// [`create`] に、最上位自身の所有・mode（`Some(mode)`）を指定したもの。
+    fn create_rooted(
+        sb: &Sandbox,
+        store: &dyn StateStore,
+        rec: &OpRecorder,
+        privilege: &ImageRootfsPrivilege,
+        fail: bool,
+        root_mode: Option<u32>,
+    ) -> Result<(), fandhe_container_core::oci_runtime::OciRuntimeError> {
         let manifest = ImageManifestDigest::new(MANIFEST).expect("digest");
-        let unpacker = Populating { fail };
+        let unpacker = Populating { fail, root_mode };
         create_with_image(
             store,
             rec,
@@ -368,7 +394,8 @@ mod linux {
 
         // a: 権限なしの delete は木に触れず、失敗として記録する（状態は消える）。
         let rec = OpRecorder::new();
-        let resp = delete(&store, &rec, host).expect("delete succeeds even if the tree is kept");
+        let resp =
+            delete(&store, &rec, host.clone()).expect("delete succeeds even if the tree is kept");
         assert!(
             matches!(resp.image_rootfs(), CleanupOutcome::Kept { .. }),
             "unprivileged delete must report the kept tree: {:?}",
@@ -423,7 +450,7 @@ mod linux {
         let staging = sb.bundle().join(".fandhe-unpack-2-1");
         std::fs::create_dir(&staging).expect("staging");
         std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o700)).expect("mode");
-        populate_child(&staging, true);
+        populate_child(&staging, Some(0o700));
         let rec = OpRecorder::new();
         let r =
             reap_stale_unpacks_with(&sb.bundle(), Path::new("rootfs"), &ReapOptions::new(), &rec)
@@ -449,7 +476,7 @@ mod linux {
         let child = wrapper.join("rootfs");
         std::fs::create_dir(&child).expect("child");
         std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).expect("mode");
-        populate_child(&child, true);
+        populate_child(&child, Some(0o700));
         let rec = OpRecorder::new();
         let r =
             reap_stale_unpacks_with(&sb.bundle(), Path::new("rootfs"), &ReapOptions::new(), &rec)
@@ -467,6 +494,99 @@ mod linux {
         assert!(r.kept_unverified.is_empty() && r.failed.is_empty(), "{r:?}");
         assert!(!wrapper.exists());
         println!("rootless_image_rootfs_remove: scenario f verified");
+        drop(sb);
+
+        // g: イメージの `./` が subuid 所有・mode 0700。権限なしは seal で明示エラーにして拒否する（#2690）。
+        let sb = Sandbox::new("g");
+        let store = sb.store();
+        let rec = OpRecorder::new();
+        let err = create_rooted(&sb, &store, &rec, &host, false, Some(0o700))
+            .expect_err("create without privilege must be rejected");
+        assert_eq!(err.code(), ErrorCode::Internal, "{err:?}");
+        assert!(
+            err.message()
+                .contains("cannot make unpacked root writable for rename"),
+            "{}",
+            err.message()
+        );
+        // ホストの ID では後始末もできない。最終の名前は無く、予約名のラッパーが残る。
+        assert_eq!(counts(&rec, "image_rootfs_cleanup"), (0, 1));
+        assert!(!sb.rootfs().exists());
+        let wrappers: Vec<_> = std::fs::read_dir(sb.bundle())
+            .expect("read bundle")
+            .map(|e| e.expect("entry").file_name())
+            .filter(|n| n.to_string_lossy().starts_with(".fandhe-unpack-"))
+            .collect();
+        assert_eq!(wrappers.len(), 1, "{wrappers:?}");
+        let options = ReapOptions::new().with_privilege(sub.clone());
+        let r = reap_stale_unpacks_with(&sb.bundle(), Path::new("rootfs"), &options, &rec)
+            .expect("reap (subordinate)");
+        assert_eq!(r.reclaimed.len(), 1, "{r:?}");
+        let leftovers: Vec<_> = std::fs::read_dir(sb.bundle())
+            .expect("read bundle")
+            .map(|e| e.expect("entry").file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("config.json")]);
+        println!("rootless_image_rootfs_remove: scenario g verified");
+        drop(store);
+        drop(sb);
+
+        // h: 同じ構成で権限あり。印の書き込みと改名が userns の中で行われて成功する（#2690）。
+        let sb = Sandbox::new("h");
+        let store = sb.store();
+        let rec = OpRecorder::new();
+        create_rooted(&sb, &store, &rec, &sub, false, Some(0o700))
+            .expect("create with subordinate privilege");
+        let record = store
+            .get(&fandhe_container_core::traits::GetStateRequest::new(
+                ContainerId::new("c1").expect("id"),
+            ))
+            .expect("state");
+        assert_eq!(
+            record.image_rootfs().map(|r| r.ownership()),
+            Some(ImageRootfsOwnership::SubordinateIds)
+        );
+        let meta = std::fs::metadata(sb.rootfs()).expect("stat rootfs");
+        assert_ne!(meta.uid(), euid, "rootfs must stay subordinate-owned");
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o700);
+        let wrappers = std::fs::read_dir(sb.bundle())
+            .expect("read bundle")
+            .filter(|e| {
+                e.as_ref()
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".fandhe-unpack-")
+            })
+            .count();
+        assert_eq!(wrappers, 0, "wrapper must be removed after publish");
+        let rec = OpRecorder::new();
+        let resp = delete(&store, &rec, sub.clone()).expect("delete");
+        assert_eq!(resp.image_rootfs(), CleanupOutcome::Removed);
+        assert_eq!(counts(&rec, "image_rootfs_remove"), (1, 0));
+        assert!(!sb.rootfs().exists());
+        println!("rootless_image_rootfs_remove: scenario h verified");
+        drop(store);
+        drop(sb);
+
+        // h2: 最上位が mode 0555。mode が戻り、ホストから読める印が実効 uid 所有・0400・nlink 1 で残る。
+        let sb = Sandbox::new("h2");
+        let store = sb.store();
+        let rec = OpRecorder::new();
+        create_rooted(&sb, &store, &rec, &sub, false, Some(0o555))
+            .expect("create with subordinate privilege (0555)");
+        let meta = std::fs::metadata(sb.rootfs()).expect("stat rootfs");
+        assert_ne!(meta.uid(), euid, "rootfs must stay subordinate-owned");
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o555);
+        let marker = std::fs::metadata(sb.rootfs().join(".fandhe-container-rootfs-owner"))
+            .expect("stat marker");
+        assert_eq!(marker.uid(), euid);
+        assert_eq!(marker.permissions().mode() & 0o7777, 0o400);
+        assert_eq!(marker.nlink(), 1);
+        let resp = delete(&store, &OpRecorder::new(), sub.clone()).expect("delete");
+        assert_eq!(resp.image_rootfs(), CleanupOutcome::Removed);
+        println!("rootless_image_rootfs_remove: scenario h2 verified");
+        drop(store);
         drop(sb);
 
         // e: 展開に失敗した create の後始末。

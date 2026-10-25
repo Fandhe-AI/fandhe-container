@@ -3,7 +3,12 @@
 //! 参照テーブル（`ReferenceTable`）が持つ manifest 構成とタグを、ローカルキャッシュ
 //! （`<root>/blobs/sha256/<hex>`。cri の `image_pull` と同じ配置）の実ファイルと突き合わせ、
 //! 一覧の行（repository・tag・digest・サイズ）と使用容量を返す。参照テーブルはサイズを持たないため、
-//! サイズはここで blob ファイルを `symlink_metadata` で読んで求める。
+//! サイズはここで blob ファイルを（symlink を辿らず）stat して求める。
+//!
+//! 読み取りはすべて検査済み root の fd（`RootHandle`。#2638）起点で行う（#2695）。Linux の x86_64 / aarch64 では
+//! `openat2` で root の外・symlink・マウントへ出ず、検査後に root が差し替えられても数えるのは検査済みの実体だけ。
+//! 他の OS は従来どおりパス起点で、差し替えは入口の再検査（`ImageStore::lock`）だけで検出する。排他区間の中で
+//! 区間の root と別のディレクトリを指すパスは `InvalidArgument` で拒否する（`root_handle_for`）。
 //!
 //! 呼び出し文脈: 読み取り専用で、削除も書き込みもしない。テーブルとキャッシュの整合を取るため、
 //! 呼び出し側が `ImageStoreGuard`（#473）を保持したまま、ガードの `Deref` 越しに呼ぶ前提で、本モジュールは排他をかけない
@@ -32,10 +37,9 @@
 //! 所要時間を渡す。`list_images` / `disk_usage` は何も記録しない `NoopOciOpRecorder` 版。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
+use super::root_handle::{BlobDir, RootHandle};
 use super::{ReferenceTable, TagKey};
 
 mod expanded;
@@ -194,13 +198,24 @@ pub(super) fn blob_path(root: &Path, digest: &Digest) -> Result<PathBuf, OciErro
     Ok(blob_dir(root).join(hex))
 }
 
+/// `Digest` の hex 部（`sha256:` 以外は拒否）。
+pub(super) fn blob_hex(digest: &Digest) -> Result<&str, OciError> {
+    digest
+        .as_str()
+        .strip_prefix("sha256:")
+        .ok_or_else(|| err(OciErrorCode::Internal, "unsupported digest algorithm"))
+}
+
 /// blob 1 件のサイズ。存在しない・symlink・通常ファイルでないものは `None`（辿らない）。
-fn blob_size(root: &Path, digest: &Digest) -> Result<Option<u64>, OciError> {
-    let path = blob_path(root, digest)?;
-    match fs::symlink_metadata(&path) {
-        Ok(m) if m.is_file() => Ok(Some(m.len())),
+/// `dir` が `None`（`blobs/sha256` が無い）なら全 blob が欠損。
+fn blob_size(dir: Option<&BlobDir>, digest: &Digest) -> Result<Option<u64>, OciError> {
+    let hex = blob_hex(digest)?;
+    let Some(dir) = dir else {
+        return Ok(None);
+    };
+    match dir.stat(hex) {
+        Ok(Some(m)) if m.is_file() => Ok(Some(m.len())),
         Ok(_) => Ok(None),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
         Err(_) => Err(err(OciErrorCode::Internal, "failed to stat blob")),
     }
 }
@@ -212,14 +227,14 @@ fn add(a: u64, b: u64) -> Result<u64, OciError> {
 
 /// `Digest` を一度だけ計測するためのキャッシュ付きサイズ表。
 struct SizeCache<'a> {
-    root: &'a Path,
+    dir: Option<&'a BlobDir>,
     sizes: BTreeMap<Digest, Option<u64>>,
 }
 
 impl<'a> SizeCache<'a> {
-    fn new(root: &'a Path) -> Self {
+    fn new(dir: Option<&'a BlobDir>) -> Self {
         Self {
-            root,
+            dir,
             sizes: BTreeMap::new(),
         }
     }
@@ -228,7 +243,7 @@ impl<'a> SizeCache<'a> {
         if let Some(v) = self.sizes.get(d) {
             return Ok(*v);
         }
-        let v = blob_size(self.root, d)?;
+        let v = blob_size(self.dir, d)?;
         self.sizes.insert(d.clone(), v);
         Ok(v)
     }
@@ -240,6 +255,9 @@ impl ReferenceTable {
     /// 欠損 blob があっても失敗させず、行の `missing_blobs` に載せる。
     /// `blobs` / `blobs/sha256` が symlink・非ディレクトリなら `system df` と同様に辿らず
     /// `FailedPrecondition`（存在しない場合は全 blob が欠損扱い）。
+    ///
+    /// 排他区間の中で `root` が区間の root と別のディレクトリなら `InvalidArgument`（#2695。読み取りは検査済み
+    /// root の fd 起点で行う）。
     pub fn list_images(&self, root: &Path) -> Result<ImageList, OciError> {
         self.list_images_with(&NoopOciOpRecorder, root)
     }
@@ -256,8 +274,14 @@ impl ReferenceTable {
     }
 
     fn list_images_inner(&self, root: &Path) -> Result<ImageList, OciError> {
-        check_blob_dirs(root)?;
-        let mut cache = SizeCache::new(root);
+        let handle = self.root_handle_for(root)?;
+        self.list_images_at(&handle)
+    }
+
+    /// `list_images` の本体（検査済み root のハンドル起点。差し替え試験が直接渡す）。
+    pub(super) fn list_images_at(&self, root: &RootHandle) -> Result<ImageList, OciError> {
+        let blobs = root.open_blob_dir()?;
+        let mut cache = SizeCache::new(blobs.as_ref());
         let mut per_manifest: BTreeMap<&Digest, (u64, Vec<Digest>)> = BTreeMap::new();
         for (digest, comp) in self.manifests() {
             let mut total = 0u64;
@@ -303,6 +327,7 @@ impl ReferenceTable {
     ///
     /// `blobs` / `blobs/sha256` が symlink・非ディレクトリなら辿らず `FailedPrecondition`。
     /// 走査が `MAX_CACHE_SCAN_ENTRIES` を超えたら `ResourceExhausted`。
+    /// 排他区間の中で `root` が区間の root と別のディレクトリなら `InvalidArgument`（#2695）。
     pub fn disk_usage(&self, root: &Path) -> Result<DiskUsage, OciError> {
         self.disk_usage_with(&NoopOciOpRecorder, root)
     }
@@ -319,9 +344,16 @@ impl ReferenceTable {
     }
 
     fn disk_usage_inner(&self, root: &Path) -> Result<DiskUsage, OciError> {
+        let handle = self.root_handle_for(root)?;
+        self.disk_usage_at(&handle)
+    }
+
+    /// `disk_usage` の本体（検査済み root のハンドル起点。差し替え試験が直接渡す）。
+    pub(super) fn disk_usage_at(&self, root: &RootHandle) -> Result<DiskUsage, OciError> {
         // blob を stat する前にディレクトリ構成を検証する（symlink・非ディレクトリは辿らず拒否）。
-        let dirs_exist = check_blob_dirs(root)?;
-        let mut cache = SizeCache::new(root);
+        // 開いた `blobs/sha256` を images 側と cache 側で共有し、2 つの読み取りの間の差し替えも閉じる。
+        let blobs = root.open_blob_dir()?;
+        let mut cache = SizeCache::new(blobs.as_ref());
         let mut union: BTreeSet<&Digest> = BTreeSet::new();
         let mut count = 0usize;
         for (_, comp) in self.manifests() {
@@ -350,10 +382,9 @@ impl ReferenceTable {
                 None => images.missing_blobs += 1,
             }
         }
-        let cache_usage = if dirs_exist {
-            scan_cache(root, &union)?
-        } else {
-            CacheUsage::default()
+        let cache_usage = match &blobs {
+            Some(dir) => scan_cache(dir, &union)?,
+            None => CacheUsage::default(),
         };
         // staging は 1 階層・メタデータだけの走査なのでガードの内側でも軽い（#2222）。
         let staging = staging::scan_staging(root)?;
@@ -372,6 +403,8 @@ fn is_hex64(name: &str) -> bool {
 
 /// ディレクトリが実在の通常ディレクトリか。存在しなければ `Ok(false)`、symlink 等は拒否。
 fn checked_dir(path: &Path) -> Result<bool, OciError> {
+    use std::fs;
+    use std::io::ErrorKind;
     match fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() => Ok(true),
         Ok(_) => Err(err(
@@ -389,9 +422,10 @@ pub(super) fn check_blob_dirs(root: &Path) -> Result<bool, OciError> {
     Ok(checked_dir(&root.join("blobs"))? && checked_dir(&blob_dir(root))?)
 }
 
-fn scan_cache(root: &Path, registered: &BTreeSet<&Digest>) -> Result<CacheUsage, OciError> {
+fn scan_cache(dir: &BlobDir, registered: &BTreeSet<&Digest>) -> Result<CacheUsage, OciError> {
     let mut usage = CacheUsage::default();
-    let rd = fs::read_dir(blob_dir(root))
+    let rd = dir
+        .entries()
         .map_err(|_| err(OciErrorCode::Internal, "failed to read blob directory"))?;
     let mut seen = 0usize;
     for ent in rd {
@@ -403,8 +437,7 @@ fn scan_cache(root: &Path, registered: &BTreeSet<&Digest>) -> Result<CacheUsage,
             ));
         }
         let ent = ent.map_err(|_| err(OciErrorCode::Internal, "failed to read blob entry"))?;
-        let name = ent.file_name();
-        let Some(name) = name.to_str() else {
+        let Some(name) = ent.to_str() else {
             usage.foreign_entries += 1;
             continue;
         };
@@ -413,10 +446,10 @@ fn scan_cache(root: &Path, registered: &BTreeSet<&Digest>) -> Result<CacheUsage,
             usage.foreign_entries += 1;
             continue;
         }
-        let meta = match fs::symlink_metadata(ent.path()) {
-            Ok(m) => m,
+        let meta = match dir.stat(name) {
+            Ok(Some(m)) => m,
             // 列挙後に消えた blob は存在しないものとして扱う。
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Ok(None) => continue,
             Err(_) => return Err(err(OciErrorCode::Internal, "failed to stat blob entry")),
         };
         if !meta.is_file() {
@@ -439,6 +472,7 @@ mod tests {
     use super::*;
     use crate::image_management::{ContainerRefId, ManifestComposition, PullId};
     use crate::reference::{RegistryHost, Repository, Tag};
+    use std::fs;
 
     fn d(n: u8) -> Digest {
         Digest::parse(&format!("sha256:{}", format!("{n:02x}").repeat(32))).unwrap()

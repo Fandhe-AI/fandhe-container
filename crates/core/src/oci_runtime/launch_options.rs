@@ -26,8 +26,10 @@
 //! # 未実装・残余(REPAIR-3)
 //!
 //! - CLI / stack から supervisor への `ContainerOptions` の受け渡しは未結線(`run_main` は既定のまま)。
-//! - 範囲写像の経路では ID 写像の holder が中間プロセスのメモリ(注入内容を含む)を継承し dumpable になる。
-//!   露出の解消(#2628)までは、launcher が範囲写像(`RootlessSubordinateIds`)と非空の注入の併用を起動前に拒否する。
+//! - 範囲写像の経路では ID 写像の holder が中間プロセスのメモリを継承し dumpable になる。注入内容は
+//!   `InjectedContent::from_file` の封印 memfd ならユーザー空間のメモリに載らず holder にも継承されない(#2628)。
+//!   呼び出し元のメモリにある内容(`from_bytes`)は、launcher が範囲写像(`RootlessSubordinateIds`)との併用を
+//!   起動前に拒否する。CLI → supervisor の結線では secret を fd で渡す必要がある(未設計)。
 
 use crate::dev_mounts::ImplicitDevMounts;
 use crate::injected_files::{InjectedFileSet, overlaps};

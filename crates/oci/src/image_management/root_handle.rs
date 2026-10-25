@@ -428,6 +428,13 @@ mod imp {
         /// FIFO で止まらないよう `O_NONBLOCK`。その他の I/O の失敗は `Err`（過少計上しない）。
         pub(crate) fn open_file(&self, name: &str) -> Result<Option<File>, OciError> {
             let n = at::component_cstring(OsStr::new(name)).map_err(crate::layer::map_io_error)?;
+            // 開く前に O_PATH の fstat で種類を確かめる。socket・デバイスを読み取りで開くと ENXIO 等で
+            // 失敗し集計全体が落ちる（従来の lstat 先行と同じく、通常ファイル以外は開かず欠損扱い）。
+            match self.stat(name) {
+                Ok(Some(m)) if m.is_file() => {}
+                Ok(_) => return Ok(None),
+                Err(e) => return Err(crate::layer::map_io_error(e)),
+            }
             match at::openat2(
                 Some(self.0.as_fd()),
                 &n,
@@ -925,6 +932,9 @@ mod tests {
         assert!(d.open_file("a").expect("open a").is_some());
         assert!(d.open_file("lnk").expect("open lnk").is_none());
         assert!(d.open_file("none").expect("open none").is_none());
+        // socket・FIFO は開く前の種類確認で欠損扱い（ENXIO で集計全体が落ちない。OCI-7・SEC-1）。
+        let _sock = std::os::unix::net::UnixListener::bind(r.join("d").join("sock")).expect("sock");
+        assert!(d.open_file("sock").expect("open sock").is_none());
         let _ = std::fs::remove_dir_all(&r);
     }
 

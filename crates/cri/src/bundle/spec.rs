@@ -35,7 +35,7 @@
 //!   #2666・CRI-2・SEC-1）。名前は大文字小文字を区別せず `CAP_` 接頭辞は任意、`ALL` は全 drop、既定に無いものの
 //!   drop は no-op、未知名は `INVALID_ARGUMENT`。`add_capabilities` / `add_ambient_capabilities` は `UNIMPLEMENTED`。
 //! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（log_path・dns_config・port_mappings・cgroup_parent・sysctls・
-//!   devices・stop_signal・capabilities の add / ambient・supplemental_groups・propagation 等）の受け入れ順序と担当は
+//!   devices・stop_signal・capabilities・supplemental_groups・propagation 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 //! - `linux.cgroup_parent` の受け入れ方針（オーナー承認待ち。判断が出るまで `UNIMPLEMENTED`）は
 //!   `docs/design/cri-cgroup-parent.md`（#2672・CRI-2・CORE-4）にまとめている。
@@ -762,9 +762,9 @@ fn build_inner(
     if !container.devices.is_empty() || !container.cdi_devices.is_empty() {
         return Err(unsupported("devices"));
     }
-    if container.stop_signal != 0 {
-        return Err(unsupported("stop_signal"));
-    }
+    // stop_signal は config.json に出さない（OCI の config に欄が無い）。停止時に StopRequest で運ぶため、
+    // ここでは値域だけを検証する（未知の値は INVALID_ARGUMENT。CRI-2・#2668）。
+    crate::stop_signal::linux_stop_signal(container.stop_signal)?;
     if !container.log_path.is_empty() || !sandbox.log_directory.is_empty() {
         return Err(unsupported("log_path"));
     }

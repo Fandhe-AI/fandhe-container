@@ -766,7 +766,6 @@ fn rejection_table_is_unimplemented() {
     add("cdi", &|_, c| {
         c.cdi_devices = vec![fandhe_container_cri::runtime::v1::CdiDevice::default()];
     });
-    add("stop_signal", &|_, c| c.stop_signal = 15);
     add("log_path", &|_, c| c.log_path = "a.log".into());
     add("log_directory", &|p, _| p.log_directory = "/var/log".into());
     add("windows ctr", &|_, c| {
@@ -1049,5 +1048,26 @@ fn nested_duplicate_and_protected_overlapping_mounts_are_rejected() {
             ..Default::default()
         });
         assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument, "{bad:?}");
+    }
+}
+
+/// CRI-2（#2668）: stop_signal は受け入れる（config.json には出さず、停止時に StopRequest で運ぶ）。
+#[test]
+fn cri2_stop_signal_is_accepted() {
+    use fandhe_container_cri::runtime::v1::Signal;
+    for sig in [Signal::Sigint, Signal::Sigkill, Signal::RuntimeDefault] {
+        let mut c = ctr();
+        c.stop_signal = sig as i32;
+        build(&pod(), &c);
+    }
+}
+
+/// CRI-2（#2668）: 未知の stop_signal は `INVALID_ARGUMENT`。
+#[test]
+fn cri2_stop_signal_unknown_value_is_invalid_argument() {
+    for v in [66, -1] {
+        let mut c = ctr();
+        c.stop_signal = v;
+        assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
     }
 }

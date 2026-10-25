@@ -530,14 +530,33 @@ fn check_protected_path(field: &'static str, p: &str) -> Result<(), CriError> {
 /// `supplemental_groups` の各値を検証して `u32` にする（0〜4294967294。`u32::MAX` はカーネルの無効 gid
 /// `(gid_t)-1` でどの写像にも入らないため拒否する。#2667）。
 fn supplemental_gids(field: &'static str, v: &[i64]) -> Result<Vec<u32>, CriError> {
+    check_supplemental_gid_count(v)?;
+    v.iter().map(|g| supplemental_gid(field, *g)).collect()
+}
+
+/// `supplemental_groups` の件数を確保の前に検証する（重複を畳む前の入力件数。無制限確保を防ぐ。#2667）。
+fn check_supplemental_gid_count(v: &[i64]) -> Result<(), CriError> {
+    if v.len() > MAX_ADDITIONAL_GIDS {
+        return Err(CriError::failed_precondition(
+            "supplemental groups exceed the limit",
+        ));
+    }
+    Ok(())
+}
+
+/// `supplemental_groups` の 1 値を検証する。
+fn supplemental_gid(field: &'static str, g: i64) -> Result<u32, CriError> {
+    u32::try_from(g)
+        .ok()
+        .filter(|g| *g != u32::MAX)
+        .ok_or_else(|| invalid(field))
+}
+
+/// 値の検証だけを行い、一覧は確保しない（適用先が無い sandbox 側用。#2667）。
+fn validate_supplemental_gids(field: &'static str, v: &[i64]) -> Result<(), CriError> {
+    check_supplemental_gid_count(v)?;
     v.iter()
-        .map(|g| {
-            u32::try_from(*g)
-                .ok()
-                .filter(|g| *g != u32::MAX)
-                .ok_or_else(|| invalid(field))
-        })
-        .collect()
+        .try_for_each(|g| supplemental_gid(field, *g).map(|_| ()))
 }
 
 /// `supplemental_groups_policy` を検証する（`Merge` か `Strict`。それ以外は `INVALID_ARGUMENT`）。
@@ -923,7 +942,7 @@ fn build_inner(
                 return Err(unsupported("selinux_options"));
             }
             // 適用先が無い（sandbox にプロセスは無い）ため検証だけして出力しない（#2667）。
-            supplemental_gids("supplemental_groups", &sc.supplemental_groups)?;
+            validate_supplemental_gids("supplemental_groups", &sc.supplemental_groups)?;
             supplemental_policy("supplemental_groups_policy", sc.supplemental_groups_policy)?;
             check_profile("seccomp", &sc.seccomp)?;
             check_apparmor("apparmor", &sc.apparmor)?;

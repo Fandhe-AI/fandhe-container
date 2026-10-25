@@ -474,6 +474,7 @@ fn passwd_name_of(body: &[u8], uid: u32) -> Option<String> {
 /// グループ名が `user` と同じ行は除く（containerd の `WithAdditionalGIDs` と同じ。#2667）。形式が崩れた行は読み飛ばす。
 fn group_memberships(body: &[u8], user: &str) -> Vec<u32> {
     let mut out: Vec<u32> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for f in etc_fields(body) {
         let (Some(name), Some(gid), Some(members)) = (
             f.first(),
@@ -482,7 +483,7 @@ fn group_memberships(body: &[u8], user: &str) -> Vec<u32> {
         ) else {
             continue;
         };
-        if *name != user && members.split(',').any(|m| m == user) && !out.contains(&gid) {
+        if *name != user && members.split(',').any(|m| m == user) && seen.insert(gid) {
             out.push(gid);
         }
     }

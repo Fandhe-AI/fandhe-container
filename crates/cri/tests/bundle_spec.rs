@@ -574,6 +574,22 @@ fn cri2_supplemental_groups_acceptance() {
             .code(),
         CriErrorCode::FailedPrecondition
     );
+    // 入力件数の上限: 重複で畳めても、件数が上限を超える要求は確保の前に拒否する（コンテナ側・sandbox 側とも）。
+    let dup = vec![1000_i64; MAX_ADDITIONAL_GIDS + 1];
+    let c = with_sc(|sc| sc.supplemental_groups = dup.clone());
+    assert_eq!(
+        build_runtime_config(&pod(), &c, &ImageDefaults::default())
+            .unwrap_err()
+            .code(),
+        CriErrorCode::FailedPrecondition
+    );
+    assert_eq!(
+        validate_config(&sandbox(dup), &ctr()).unwrap_err().code(),
+        CriErrorCode::FailedPrecondition
+    );
+    // 上限ちょうどの重複は受け、1 件に畳まれる。
+    let c = with_sc(|sc| sc.supplemental_groups = vec![1000_i64; MAX_ADDITIONAL_GIDS]);
+    assert_eq!(gids(&c, &ImageDefaults::default()), Some(vec![1000]));
     // core で読み戻せる（additionalGids が launch の入力になる）。
     let c = with_sc(|sc| sc.supplemental_groups = vec![3000, 2000]);
     let json = build_runtime_config(&pod(), &c, &ImageDefaults::default()).unwrap();

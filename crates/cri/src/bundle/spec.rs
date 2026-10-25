@@ -30,17 +30,26 @@
 //!   `ImageRootfsSource` が展開後の rootfs の passwd で解決した値を [`ImageDefaults::resolved_run_as_username`] で受ける
 //!   （#2664・CRI-2・SEC-5）。`run_as_user` との同時指定は `INVALID_ARGUMENT`、`run_as_group` は `run_as_user` か
 //!   `run_as_username` があるときだけ有効。解決結果が無ければ `UNIMPLEMENTED`（root へ黙って落とさない）。
+//! - `dns_config` は [`resolv_conf::render`] で検証して resolv.conf を作り、`/etc/resolv.conf` への ro の bind を
+//!   `mounts[]` の末尾に出す（#2665・CRI-2・NET-5）。ファイル自体は [`super::SpecBundleProvider`] が bundle に書き、
+//!   そのパスを [`BundleFiles`] で受ける（本モジュールはファイルに触れない）。ファイルのパスを渡さない入口
+//!   （[`build_runtime_config`]）に空でない `dns_config` が来たら `UNIMPLEMENTED`（黙って落とさない）。
+//!   現状は core の start が、この ro の bind を拒否する（Landlock の書き込み可能な root 配下の ro は #1917、
+//!   状態ルート配下の source の拒否。plugin-cri の bundle は `<state_root>/.cri/bundles`）。cri は受け入れて mount を
+//!   出し、start は構造化エラーで止まる（network namespace と同じ形。`docs/design/cri-config-acceptance.md`）。
 //! - `capabilities.drop_capabilities` は受け入れ、OCI 既定集合から除いた集合を `process.capabilities` の 3 集合
 //!   （bounding / effective / permitted）へ書く（core が drop だけを解釈済みにして launch・exec へ適用する。
 //!   #2666・CRI-2・SEC-1）。名前は大文字小文字を区別せず `CAP_` 接頭辞は任意、`ALL` は全 drop、既定に無いものの
 //!   drop は no-op、未知名は `INVALID_ARGUMENT`。`add_capabilities` / `add_ambient_capabilities` は `UNIMPLEMENTED`。
 //! - `log_path`（コンテナ）と `log_directory`（サンドボックス）は [`resolve_log_path`] で検証して結合し、受け入れる
 //!   （CRI-2・SUP-4・#2671）。結合結果は config.json には出さず、StartContainer が supervisor へ渡す。
-//! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（dns_config・port_mappings・cgroup_parent・sysctls・
-//!   devices・stop_signal・capabilities・supplemental_groups・propagation 等）の受け入れ順序と担当は
+//! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（port_mappings・cgroup_parent・sysctls・
+//!   devices・capabilities の add / ambient・supplemental_groups・propagation 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 //! - `linux.cgroup_parent` の受け入れ方針（オーナー承認待ち。判断が出るまで `UNIMPLEMENTED`）は
 //!   `docs/design/cri-cgroup-parent.md`（#2672・CRI-2・CORE-4）にまとめている。
+//! - `devices`・`cdi_devices` の受け入れ方針（オーナー判断待ち。判断が出るまで `UNIMPLEMENTED`）は
+//!   `docs/design/cri-devices-cdi.md`（#2673・CRI-2・GPU-1）にまとめている。
 
 use std::collections::HashMap;
 
@@ -50,6 +59,7 @@ use fandhe_container_core::capabilities::{Capability, CapabilitySet, OCI_DEFAULT
 use fandhe_container_core::path_masks::normalize_container_path;
 use fandhe_container_core::traits::ContainerLogPath;
 
+use super::resolv_conf;
 use crate::error::CriError;
 use crate::runtime::v1::{
     ContainerConfig, Int64Value, LinuxContainerResources, Mount, MountPropagation, NamespaceMode,
@@ -111,6 +121,36 @@ pub struct ImageDefaults {
 enum Stage {
     Validate,
     Build,
+}
+
+/// `/etc/resolv.conf` の宛先（利用者の値は宛先にも source にも届かない）。
+const RESOLV_CONF_DESTINATION: &str = "/etc/resolv.conf";
+/// 検証段（source 未確定）で使う仮の source。出力は捨てられ、重なり検査にだけ宛先が使われる。
+const RESOLV_CONF_PLACEHOLDER_SOURCE: &str = "/resolv.conf";
+
+/// bundle の中に provider が生成したファイルのホスト側の絶対パス（本モジュールはファイルシステムに触れない。#2665）。
+///
+/// 将来 hostname / hosts の生成（NET-12）を同じ構造体に足せるよう `#[non_exhaustive]` にしている。
+/// 外部からは [`Self::none`] / [`Self::with_resolv_conf`] で作る。
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct BundleFiles<'a> {
+    /// 生成した resolv.conf のパス（`dns_config` が空でないときに必要）。
+    pub resolv_conf: Option<&'a str>,
+}
+
+impl<'a> BundleFiles<'a> {
+    /// 生成ファイルなし。
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// 生成した resolv.conf のパスを渡す。
+    pub fn with_resolv_conf(path: &'a str) -> Self {
+        Self {
+            resolv_conf: Some(path),
+        }
+    }
 }
 
 /// `run_as_username` の長さ上限（バイト。passwd の名前の上限。`image_rootfs` の名前上限と同値）。
@@ -733,7 +773,19 @@ pub fn build_runtime_config(
     container: &ContainerConfig,
     image: &ImageDefaults,
 ) -> Result<RuntimeConfigJson, CriError> {
-    build_inner(sandbox, container, image, Stage::Build)
+    build_runtime_config_with_files(sandbox, container, image, &BundleFiles::none())
+}
+
+/// [`build_runtime_config`] に、provider が bundle に生成したファイルのパス（[`BundleFiles`]）を渡す版。
+///
+/// `sandbox.dns_config` が空でなければ `files.resolv_conf` が要る（無ければ `UNIMPLEMENTED`。#2665）。
+pub fn build_runtime_config_with_files(
+    sandbox: &PodSandboxConfig,
+    container: &ContainerConfig,
+    image: &ImageDefaults,
+    files: &BundleFiles<'_>,
+) -> Result<RuntimeConfigJson, CriError> {
+    build_inner(sandbox, container, image, files, Stage::Build)
 }
 
 /// イメージを展開する前に、CRI の設定だけで判定できる拒否・検証を済ませる（不正な要求で bundle を作らない）。
@@ -747,6 +799,7 @@ pub fn validate_config(
         sandbox,
         container,
         &ImageDefaults::default(),
+        &BundleFiles::none(),
         Stage::Validate,
     )
     .map(|_| ())
@@ -802,14 +855,21 @@ fn build_inner(
     sandbox: &PodSandboxConfig,
     container: &ContainerConfig,
     image: &ImageDefaults,
+    files: &BundleFiles<'_>,
     stage: Stage,
 ) -> Result<RuntimeConfigJson, CriError> {
     // 実行層が受けない・無視すると要求より弱くなる入力を先に拒否する。
     if container.tty || container.stdin || container.stdin_once {
         return Err(unsupported("tty/stdin"));
     }
-    if !container.devices.is_empty() || !container.cdi_devices.is_empty() {
+    // devices・cdi_devices は core の `linux.devices` の適用・device cgroup の許可リスト・gpu の CDI 適用が揃うまで
+    // 拒否する。受けて値を捨てると、要求したデバイスが黙って無いコンテナが起動するため（一般デバイスは GPU-9 が
+    // 検討中）。docs/design/cri-devices-cdi.md・#2673（CRI-2・GPU-1）。
+    if !container.devices.is_empty() {
         return Err(unsupported("devices"));
+    }
+    if !container.cdi_devices.is_empty() {
+        return Err(unsupported("cdi_devices"));
     }
     // stop_signal は config.json に出さない（OCI の config に欄が無い）。停止時に StopRequest で運ぶため、
     // ここでは値域だけを検証する（未知の値は INVALID_ARGUMENT。CRI-2・#2668）。
@@ -819,9 +879,6 @@ fn build_inner(
     resolve_log_path(sandbox, container)?;
     if container.windows.is_some() || sandbox.windows.is_some() {
         return Err(unsupported("windows"));
-    }
-    if sandbox.dns_config.is_some() {
-        return Err(unsupported("dns_config"));
     }
     if !sandbox.port_mappings.is_empty() {
         return Err(unsupported("port_mappings"));
@@ -945,11 +1002,41 @@ fn build_inner(
     if container.mounts.len() > MAX_MOUNTS {
         return Err(invalid("mounts"));
     }
-    let mounts = container
+    let mut mounts = container
         .mounts
         .iter()
         .map(|m| mount_out(m, &mut budget))
         .collect::<Result<Vec<_>, _>>()?;
+    // dns_config: 内容は両段で検証する。bind の source は Build 段で provider が生成したパスを使い、
+    // 無ければ拒否する（要求を黙って落とさない）。Validate 段は仮の source で宛先の重なりだけを見る。
+    if let Some(dns) = &sandbox.dns_config
+        && resolv_conf::render(dns)?.is_some()
+    {
+        let source = match (stage, files.resolv_conf) {
+            (Stage::Validate, _) => RESOLV_CONF_PLACEHOLDER_SOURCE,
+            (Stage::Build, Some(p)) => {
+                check_host_source("dns_config", p)?;
+                p
+            }
+            (Stage::Build, None) => return Err(unsupported("dns_config")),
+        };
+        // 生成する bind を足した総件数でも上限（core の `CONFIG_MAX_MOUNTS`）を守る。
+        if mounts.len() >= MAX_MOUNTS {
+            return Err(invalid("mounts"));
+        }
+        budget.spend(
+            source
+                .len()
+                .saturating_add(RESOLV_CONF_DESTINATION.len())
+                .saturating_add(MOUNT_OVERHEAD),
+        )?;
+        mounts.push(MountOut {
+            destination: RESOLV_CONF_DESTINATION,
+            kind: "bind",
+            source,
+            options: vec!["bind", "private", "nosuid", "nodev", "noexec", "ro"],
+        });
+    }
 
     // 名前空間: コンテナ側の指定を優先し、無ければ sandbox 側。
     let ns_opts = sc.and_then(|s| s.namespace_options.as_ref()).or_else(|| {

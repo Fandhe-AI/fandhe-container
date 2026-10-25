@@ -47,8 +47,11 @@
 //!   〔[`ImageDefaults::supplementary_gids`]〕に続けて CRI の一覧を並べる）か `Strict`（CRI の一覧だけ）。実効 uid が 0 の
 //!   コンテナにはイメージ由来のグループを付けない（単一 ID 写像で使える uid が 0 だけのため。CRI の明示した一覧は付ける）。
 //!   主 gid は足さない。合計は [`MAX_ADDITIONAL_GIDS`] まで。sandbox 側の指定は検証だけして適用先が無いため出力しない。
+//! - `mounts[].propagation` は PRIVATE を `rprivate`、HOST_TO_CONTAINER を `rslave` で `config.json` の `mounts[].options` へ書く
+//!   （core が `rslave` の bind をホストの slave として載せる。BIDIRECTIONAL と未知の値は `UNIMPLEMENTED`。
+//!   `linux.rootfsPropagation` は出力しない。#2669・CRI-2・OCI-4）。
 //! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（log_path・port_mappings・cgroup_parent・sysctls・
-//!   devices・capabilities の add / ambient・propagation 等）の受け入れ順序と担当は
+//!   devices・capabilities の add / ambient・propagation の BIDIRECTIONAL 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 //! - `linux.cgroup_parent` の受け入れ方針（オーナー承認待ち。判断が出るまで `UNIMPLEMENTED`）は
 //!   `docs/design/cri-cgroup-parent.md`（#2672・CRI-2・CORE-4）にまとめている。
@@ -691,9 +694,14 @@ fn mount_out<'a>(m: &'a Mount, budget: &mut Budget) -> Result<MountOut<'a>, CriE
             .saturating_add(m.host_path.len())
             .saturating_add(MOUNT_OVERHEAD),
     )?;
-    if m.propagation != MountPropagation::PropagationPrivate as i32 {
-        return Err(unsupported("mounts.propagation"));
-    }
+    // PRIVATE は `rprivate`、HOST_TO_CONTAINER は `rslave`（ホストの peer group から受けるだけ。core が受け、元がホスト側で
+    // private なら起動を拒否する。#2669・CRI-2・OCI-4）。BIDIRECTIONAL（rshared）は、user namespace の中ではコンテナから
+    // ホストへ伝播できないため受けず、未知の値とあわせて `UNIMPLEMENTED`（`docs/design/mount-propagation.md`）。
+    let propagation = match MountPropagation::try_from(m.propagation) {
+        Ok(MountPropagation::PropagationPrivate) => "rprivate",
+        Ok(MountPropagation::PropagationHostToContainer) => "rslave",
+        _ => return Err(unsupported("mounts.propagation")),
+    };
     if m.selinux_relabel {
         return Err(unsupported("mounts.selinux_relabel"));
     }
@@ -715,7 +723,7 @@ fn mount_out<'a>(m: &'a Mount, budget: &mut Budget) -> Result<MountOut<'a>, CriE
         source: &m.host_path,
         options: vec![
             "rbind",
-            "rprivate",
+            propagation,
             "nosuid",
             "nodev",
             if m.readonly { "ro" } else { "rw" },

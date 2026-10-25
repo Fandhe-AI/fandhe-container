@@ -662,6 +662,37 @@ fn mounts_map_to_bind_with_ro_rw_options() {
     assert_eq!(cfg.mounts().len(), 2);
 }
 
+/// CRI-2・OCI-4（#2669）: HOST_TO_CONTAINER は `rslave` で書く。`rootfsPropagation` は出さず、core が受ける。
+#[test]
+fn mount_host_to_container_maps_to_rslave() {
+    let mut c = ctr();
+    let mut ro = mount("/srv/a", "/data", true);
+    ro.propagation = MountPropagation::PropagationHostToContainer as i32;
+    let mut rw = mount("/srv/b", "/work", false);
+    rw.propagation = MountPropagation::PropagationHostToContainer as i32;
+    c.mounts = vec![ro, rw];
+    let v = build(&pod(), &c);
+    assert_eq!(
+        v["mounts"],
+        serde_json::json!([
+            {"destination": "/data", "type": "bind", "source": "/srv/a",
+             "options": ["rbind", "rslave", "nosuid", "nodev", "ro"]},
+            {"destination": "/work", "type": "bind", "source": "/srv/b",
+             "options": ["rbind", "rslave", "nosuid", "nodev", "rw"]},
+        ])
+    );
+    assert!(
+        v["linux"].get("rootfsPropagation").is_none(),
+        "{}",
+        v["linux"]
+    );
+    let json = build_runtime_config(&pod(), &c, &ImageDefaults::default()).unwrap();
+    let cfg = oci_runtime::parse_config_bytes(json.as_bytes()).unwrap();
+    let set = oci_runtime::BindMountSet::from_mounts(cfg.mounts()).expect("core accepts rslave");
+    assert!(set.has_host_slave());
+    assert_eq!(set.len(), 2);
+}
+
 #[test]
 fn mount_rejections() {
     let bad_paths = [
@@ -695,7 +726,7 @@ fn mount_rejections() {
     }
     let tweaks: Vec<MountTweak> = vec![
         Box::new(|m| m.propagation = MountPropagation::PropagationBidirectional as i32),
-        Box::new(|m| m.propagation = MountPropagation::PropagationHostToContainer as i32),
+        Box::new(|m| m.propagation = 7),
         Box::new(|m| m.selinux_relabel = true),
         Box::new(|m| m.recursive_read_only = true),
         Box::new(|m| m.image = Some(ImageSpec::default())),

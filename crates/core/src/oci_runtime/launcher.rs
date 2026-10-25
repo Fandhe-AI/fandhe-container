@@ -1820,12 +1820,16 @@ impl LaunchOps for RealOps {
         // euid 0 の写像は計画の段階で拒否される(`HostRootIdentityMapping`。SEC-5)。
         // 単一 ID は自 egid をコンテナ内 0 へ写す写像、範囲写像は解決済みの subuid / subgid 写像(CORE-6・#2009)。
         // どちらも devpts の gid= の決定元になる gid 写像を併せて得る。
+        // `rslave` の bind を求める起動だけ、中間プロセス側の `/` を slave にして master 関係を残す(OCI-4・CRI-2・#2669)。
+        let host_slave = input.spec.bind_mounts().has_host_slave();
         let single_plan;
         let single_gid;
         let subordinate_plan;
         let (isolation_plan, gid_map): (IntermediatePlan<'_>, &IdMapSet) = match input.subordinate {
             None => {
-                single_plan = plan(&input.isolation).map_err(not_started)?;
+                single_plan = plan(&input.isolation)
+                    .map_err(not_started)?
+                    .with_host_slave_root(host_slave);
                 // 計画が euid / egid 0 を拒否した後に作る。
                 single_gid = crate::rootless::single_id_mapping(crate::sys::effective_gid())
                     .map_err(|_| {
@@ -1845,7 +1849,8 @@ impl LaunchOps for RealOps {
                     ids.writer.clone(),
                     ids.timeout,
                 )
-                .map_err(not_started)?;
+                .map_err(not_started)?
+                .with_host_slave_root(host_slave);
                 (
                     IntermediatePlan::Subordinate(&subordinate_plan),
                     subordinate_plan.gid_map(),

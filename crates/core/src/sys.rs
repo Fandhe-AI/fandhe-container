@@ -265,6 +265,8 @@ mod consts {
     pub const MS_BIND: u64 = 0x1000;
     pub const MS_REC: u64 = 0x4000;
     pub const MS_PRIVATE: u64 = 0x4_0000;
+    // include/uapi/linux/mount.h の `MS_SLAVE`（1 << 19。全アーキテクチャ共通）。
+    pub const MS_SLAVE: u64 = 0x8_0000;
     // include/uapi/linux/mount.h の `MNT_DETACH`（umount2 のフラグ。全アーキテクチャ共通）。
     pub const MNT_DETACH: i32 = 2;
     // arch/x86/entry/syscalls/syscall_64.tbl の `pivot_root`。
@@ -607,6 +609,8 @@ mod consts {
     pub const MS_BIND: u64 = 0x1000;
     pub const MS_REC: u64 = 0x4000;
     pub const MS_PRIVATE: u64 = 0x4_0000;
+    // include/uapi/linux/mount.h の `MS_SLAVE`（1 << 19。全アーキテクチャ共通）。
+    pub const MS_SLAVE: u64 = 0x8_0000;
     // include/uapi/linux/mount.h の `MNT_DETACH`（umount2 のフラグ。全アーキテクチャ共通）。
     pub const MNT_DETACH: i32 = 2;
     // include/uapi/asm-generic/unistd.h の `__NR_pivot_root`（arm64 は asm-generic の表を使う。
@@ -958,6 +962,7 @@ mod consts {
     pub const MS_BIND: u64 = 0;
     pub const MS_REC: u64 = 0;
     pub const MS_PRIVATE: u64 = 0;
+    pub const MS_SLAVE: u64 = 0;
     pub const MNT_DETACH: i32 = 0;
     pub const SYS_PIVOT_ROOT: ArchSysNo = ArchSysNo::UNSUPPORTED;
     pub const SYS_CLOSE_RANGE: ArchSysNo = ArchSysNo::UNSUPPORTED;
@@ -1641,19 +1646,44 @@ pub(crate) fn set_hostname(name: &[u8]) -> Result<(), SysError> {
     if rc == -1 { Err(last_error()) } else { Ok(()) }
 }
 
+/// `/` の再帰的な伝播の設定（`mount(2)` の `MS_REC` と組み合わせる種類）。値は 2 つに限り、任意のフラグを渡す経路を
+/// 持たない（REPAIR-2・SEC-1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RootPropagation {
+    /// `MS_REC|MS_PRIVATE`。以後のマウントをホストへ伝播させず、ホストからも受けない（既定）。
+    Private,
+    /// `MS_REC|MS_SLAVE`。ホストからは受け、ホストへは伝播させない。`master:` の関係を消さないためだけに使い、
+    /// `rslave` の bind mount を求めた起動の中間プロセス側に限る（OCI-4・CRI-2・SEC-1。`docs/design/mount-propagation.md`）。
+    Slave,
+}
+
+/// [`RootPropagation`] の `mount(2)` のフラグ（`MS_REC` を含む）。
+pub(crate) const fn root_propagation_flags(mode: RootPropagation) -> u64 {
+    match mode {
+        RootPropagation::Private => consts::MS_REC | consts::MS_PRIVATE,
+        RootPropagation::Slave => consts::MS_REC | consts::MS_SLAVE,
+    }
+}
+
 /// `/` を再帰的に private へ変更し、以後のマウントをホストへ伝播させない。
 pub(crate) fn mount_root_private_recursive() -> Result<(), SysError> {
+    mount_root_recursive(RootPropagation::Private)
+}
+
+/// `/` を再帰的に `mode` の伝播へ変更する。`Slave` でもコンテナからホストへは伝播しない（slave は受けるだけ）。
+pub(crate) fn mount_root_recursive(mode: RootPropagation) -> Result<(), SysError> {
     if !consts::SUPPORTED {
         return Err(SysError::Unsupported);
     }
     // SAFETY: `c"/"` は NUL 終端の静的文字列。source / fstype / data は NULL で、
-    // MS_REC|MS_PRIVATE の propagation 変更ではカーネルが参照しない。
+    // MS_REC|MS_PRIVATE / MS_REC|MS_SLAVE の propagation 変更ではカーネルが参照しない。
+    // フラグは列挙型から `root_propagation_flags` が作る 2 通りだけ。
     let rc = unsafe {
         mount(
             core::ptr::null(),
             c"/".as_ptr(),
             core::ptr::null(),
-            consts::MS_REC | consts::MS_PRIVATE,
+            root_propagation_flags(mode),
             core::ptr::null(),
         )
     };
@@ -2565,7 +2595,8 @@ const fn clear_read_only_probe_mount_attr() -> MountAttr {
 /// `attr_clr` = 0 のため、元のマウントでロックされた属性は外さない（`rw` 指定も ro を外さない）。
 /// `propagation` は 0（変更しない）。切り離した（`OPEN_TREE_CLONE` の匿名 namespace の）マウントに対する propagation 変更は
 /// Linux v5.12・v6.12・v7.0 の `mount_setattr` 系（`mount_setattr_prepare`／`do_mount_setattr`）で許されると確認済み（#2064）だが、
-/// 複製は元の伝播を引き継ぐため使わない。private であることは `MountIsolation::establish` の `MS_REC|MS_PRIVATE` に依存し、
+/// 複製は元の伝播を引き継ぐため使わない。private であることは `MountIsolation::establish` の `MS_REC|MS_PRIVATE` に依存し（`rslave` の bind は
+/// 例外で、`establish_with` が private 化の前に複製して `master` を保つ。#2669。`propagation` = 0 は変えない）、
 /// 明示設定はせず、呼び出し側（#1913）が付け替え先の非 shared の確認と、付け替え後の mountinfo の照合で確かめる。
 /// 明示設定を足すと構築子の `propagation` = 0 という不変条件が崩れるため、#2165 で見送った（SEC-1・OCI-4）。
 const fn bind_mount_attr(attrs: BindMountAttrs) -> MountAttr {
@@ -7253,6 +7284,25 @@ mod tests {
         );
         assert!(!dir.join("target-not-created").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// OCI-4・SEC-1: 根の伝播の設定は 2 通りのフラグだけを作る。
+    #[test]
+    fn oci4_root_propagation_flags_are_exact() {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))]
+        {
+            assert_eq!(
+                root_propagation_flags(RootPropagation::Private),
+                0x4000 | 0x4_0000
+            );
+            assert_eq!(
+                root_propagation_flags(RootPropagation::Slave),
+                0x4000 | 0x8_0000
+            );
+        }
     }
 
     /// CORE-1（TASK-27.3）: mount 系フラグ・pivot_root の syscall 番号の具体値。番号は arch ごとに

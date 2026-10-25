@@ -87,6 +87,7 @@ fandhe-container/
 │   │   ├── privilege-separation.md  # 権限分離方式の比較と必要最小権限の設計書（TASK-171.1.1・SUP-14。方式承認済み〔#1454〕）
 │   │   ├── user-manager-connect-precheck.md  # start の事前検査への実 connect と connect 先の SO_PEERCRED 照合を足すかの判断記録（#2448・CORE-3・SUP-14。オーナー承認待ち）
 │   │   ├── rootful-host-root.md   # RootfulHostRoot（ホスト root のまま分離する権限モデル）を許すかの判断記録（#2241・SEC-5・CORE-6。オーナー承認待ち）
+│   │   ├── launch-sealed-copy.md  # launch に封印複製（B'）を適用しない判断の記録（ローカル実測つき。#2687・CORE-5・CORE-7〜9・REPAIR-3）
 │   │   ├── healthcheck-argv-timeout.md  # healthcheck の argv[0] の解決方式と timeout の上限の判断記録（#2439・SUP-4・TASK-161 追補。オーナー承認待ち）
 │   │   ├── subid-owner-resolution.md  # rootless の subuid / subgid の所有者名を passwd 優先・無ければ `getent`（NSS）で解決する方針の判断記録（#2390・SEC-5・CORE-6。shadow 4.13 の `newuidmap` の照合に合わせる）
 │   │   ├── dev-default-mounts.md  # OCI 既定の /dev の残り（/dev/pts・/dev/ptmx・/dev/shm・/dev/console）と rootless の /dev 供給方式の設計ドラフト（TASK-29 追補・#1609。方式を確定し実装 issue を #54 配下に起票）

@@ -641,6 +641,8 @@ impl DeleteResponse {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::sync::Arc;
 
     /// CRI-2・SUP-4（#2671）: `ContainerLogPath` の受理と拒否。
     #[test]
@@ -677,8 +679,6 @@ mod tests {
         let req = StartRequest::new(id).with_log_path(lp.clone());
         assert_eq!(req.log_path(), Some(&lp));
     }
-    use super::*;
-    use std::sync::Arc;
 
     /// テスト用のスタブ実装。dyn 互換性と各メソッドの戻り値を確認するためのみに使う。
     struct StubRuntime;

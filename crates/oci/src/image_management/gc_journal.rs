@@ -713,6 +713,21 @@ pub struct PendingDeletionRecovery {
     pub durability: DeletionDurability,
 }
 
+impl super::JournalRoot {
+    /// `root_handle_for` の本体。`ExpandedSizePlan::measure`（ガードの外で、plan が持つハンドルと照合する）も
+    /// 同じ規則で解決する（#2695）。
+    pub(super) fn resolve(&self, root: &Path) -> Result<Arc<RootHandle>, OciError> {
+        match &self.0 {
+            Some(h) if h.matches(root) => Ok(Arc::clone(h)),
+            Some(_) => Err(err(
+                OciErrorCode::InvalidArgument,
+                "root does not match the image store root of this exclusive section",
+            )),
+            None => RootHandle::open_unchecked(root).map(Arc::new),
+        }
+    }
+}
+
 impl ReferenceTable {
     /// 検査用の root を設定する（`ImageStore::lock` が区間ごとに呼ぶ）。
     pub(super) fn set_root_handle(&mut self, root: Arc<RootHandle>) {
@@ -731,14 +746,7 @@ impl ReferenceTable {
     /// - 排他区間で設定済み: `root` が同じディレクトリならそのハンドル。違えば `InvalidArgument`（fail-closed）
     /// - 未設定の単体テーブル: `root` を検査なしで開く（従来どおり信頼検査をしない）
     pub(super) fn root_handle_for(&self, root: &Path) -> Result<Arc<RootHandle>, OciError> {
-        match &self.journal_root.0 {
-            Some(h) if h.matches(root) => Ok(Arc::clone(h)),
-            Some(_) => Err(err(
-                OciErrorCode::InvalidArgument,
-                "root does not match the image store root of this exclusive section",
-            )),
-            None => RootHandle::open_unchecked(root).map(Arc::new),
-        }
+        self.journal_root.resolve(root)
     }
 
     /// 削除ジャーナル（墓標を含む）がディスクに見えていれば

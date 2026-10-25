@@ -4,8 +4,8 @@
 //!
 //! `crate::exec` の最小実行フロー第 5 段。namespace 分離済み（`isolate` /
 //! `isolate_rootful_host_root` の後）の親から [`spawn_container`] で子を fork し、子（新しい PID
-//! namespace の PID 1）が次を順に行う。呼び出し元は TASK-29 の `oci_runtime`（`create` / `start`）と
-//! supervisor（TASK-157）を想定する。
+//! namespace の PID 1）が次を順に行う。製品コードの呼び出し元は本番 launcher
+//! （`ProductionLauncher`）の `spawn_container_via_intermediate` で、最小入口 `spawn_container` は結合試験だけが呼ぶ（#2700）。
 //!
 //! ```text
 //! spawn_container(rootfs, &entry)                      // 親: fork して ContainerChild を返す
@@ -57,7 +57,7 @@
 //!   fd は 3 以上に置く。稼働中コンテナへの exec の子は、照合した本体を封印した memfd へ複製し
 //!   （`sealed_copy.rs`。TASK-163 追補・#1531）、解析・照合・実行を複製に対して行う（launch は複製しない。常駐するワークロードのメモリ増を避ける設計判断。CORE-7〜9。launch に適用しない判断は `docs/design/launch-sealed-copy.md`・#2687）。
 //!   上限超過・封印の検証失敗は違反で拒否する。シェバン付きスクリプトは、インタープリタが開き直す新 root の
-//!   `/dev/fd/N` が同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` は `create_default_devices`〔#834・#1297〕が用意する。本番の launch 経路は呼ぶ。最小入口 `spawn_container` は呼ばない）
+//!   `/dev/fd/N` が同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` は `create_default_devices`〔#834・#1297〕が用意する。本番の launch 経路は呼ぶ。最小入口 `spawn_container` は呼ばない。配線しない判断は #2700）
 //! - **fork の健全性は `sys::fork_single_threaded` が強制する**: 呼び出し元が `Threads: 1`
 //!   でなければ fork せず `FailedPrecondition` で返す。子はクロージャの結果で必ず `_exit(2)` し、
 //!   呼び出し元のスタックへ戻らない
@@ -3025,6 +3025,19 @@ where
 /// 戻り値の [`ContainerChild`] は [`ContainerChild::wait_timeout`] で回収する。`unshare(CLONE_NEWPID)`
 /// の最初の子だけが PID 1 になり、それが終わると namespace は以後 fork できないため、分離した親からの
 /// `spawn_container` は 1 回だけ成功する。
+///
+/// 専用の `/dev`（`create_default_devices`）は載せない（#2700・CORE-2・SEC-2・REPAIR-3。配線しないと決めた）。
+/// 製品コードにこの入口の呼び出し元は無く（結合試験だけ）、本番の起動は `ProductionLauncher` が
+/// `spawn_container_via_intermediate` を通す経路で、`PrePivotSetup.devices` から `/dev` を結線済み（#1816）。
+/// 配線しない理由は次のとおり。
+/// - 本番は常に `setup` を渡すため、ここへ配線しても本番の挙動は変わらない
+/// - `StagePipeline::new()`（Landlock 無し）では制限適用の証跡（`LaunchReady`。#1714）が作られず、exec は常に拒否される
+///   （fail-closed。`/dev` を足しても観測できる効果が無い）
+/// - 配線には `DevptsGidSource` の入力が要り、本番で使わない関数の公開シグネチャを変えることになる
+/// - `masked_paths` も適用しない最小構成に `/dev` だけを足すと部分適用になり、実装済みを装う（REPAIR-3）
+/// - `/dev` が要る試験には試験専用の入口 `spawn_container_with_stages_and_devices` がある
+///
+/// 本番の起動にこの入口を使ってはならない（分離が弱くなる）。
 pub fn spawn_container(rootfs: &Path, entry: &Entrypoint) -> Result<ContainerChild, ExecError> {
     spawn_container_with_stages(rootfs, entry, StagePipeline::new())
 }
@@ -3033,6 +3046,7 @@ pub fn spawn_container(rootfs: &Path, entry: &Entrypoint) -> Result<ContainerChi
 ///
 /// `stages` は親（fork 前）で構築し、fork で子へコピーされて子の pivot 後・exec 前に固定順で
 /// 実行される。フックの失敗・panic では exec に進まず `EXIT_SETUP_FAILED` で終わる。
+/// `/dev` は載せない（`spawn_container` と同じ。#2700）。
 /// 挙動の変更（#1714）: `stages` に `with_landlock` を載せて全段が成功したときだけ制限適用の証跡
 /// （`LaunchReady`）がそろい exec へ進む。Landlock 無し・独自の Landlock フック・ダミーフックだけでは
 /// 証跡にならず exec は拒否される（fail-closed）。
@@ -3152,7 +3166,7 @@ pub fn spawn_container_with_stages_reporting_for_test(
 ///
 /// `LaunchReady` がそろった後の `redirect_stdio_to_null` が検証済みの `/dev/null`（文字デバイス 1:3）を開けることを、
 /// 実 exec（`execveat`）の成功で照合するための入口。本番の `/dev` は launcher 経路で結線済み（#1816）で、
-/// これは最小入口 `spawn_container` に `/dev` を足すための試験専用の入口。
+/// 最小入口 `spawn_container` へは `/dev` を配線しない（#2700）ため、`/dev` が要る試験だけが使う試験専用の入口。
 /// 制限適用の証跡の要求（`require_restriction_evidence`）は `spawn_container_with_stages` と同じく行う。
 /// 通常の利用者は呼ばない。
 #[doc(hidden)]

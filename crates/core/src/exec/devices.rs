@@ -126,7 +126,6 @@
 //!   `tests/default_devices.rs`（人間担当・`-- --ignored`）が担う
 //! - `/dev/console` は端末機能の親 issue で別途設計する（設計ドラフト 3.5）。`process.terminal: true` も
 //!   従来どおり拒否のまま
-//! - 最小入口 `spawn_container` への本関数の配線（本番の launch 経路は本番 launcher の `PrePivotSetup.devices` から結線済み。#1816。最小入口は呼ばず、配線を追う issue は無い）
 //!
 //! # 単体テストの安全策
 //!

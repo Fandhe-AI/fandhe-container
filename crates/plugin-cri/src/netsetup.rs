@@ -353,6 +353,19 @@ pub trait NetsetupBackend: Send + Sync {
         ))
     }
 
+    /// 取り残しの請求書がプロセス内の保持（IPAM のアドレス・DNAT ルール・ポート予約。quarantine）を含むとき、
+    /// カーネル側の資源（veth・netns の pin）を除いた残りの請求書を返す。含まなければ `None`（既定）。
+    ///
+    /// quarantine は `reclaim_failed_attach` では解放されず、`delete_network` がネットワークごと解放する。
+    /// カーネル側の回収が済んでも quarantine が残る間は、detach を成功させず登録を保持して、同じ endpoint の
+    /// 再 attach がアドレスの二重払い出し（`AlreadyExists`）で失敗するのを防ぐ（NET-1・#2681）。
+    fn attach_claim_quarantine_remainder(
+        &self,
+        _claim: &Self::FailedAttach,
+    ) -> Option<Self::FailedAttach> {
+        None
+    }
+
     /// コンテナ専用の netns を（lo の up を含めて）作る。既定は何もしない成功（試験用 fake 向け）。
     ///
     /// net の `attach_container` は netns の作成と pin から veth の設定までを 1 回で行い、先に netns を作ると
@@ -392,6 +405,10 @@ struct ContainerEntry<C, A> {
     /// fail-closed で拒否する。`claim` があれば detach・`delete_network` が所有確認つきで回収し、成功したときだけ
     /// 印と記録を外す（#2681）。作成失敗の回収（#2467）とは別。
     unreclaimed: bool,
+    /// カーネル側の資源の回収は済んだが、プロセス内の保持（quarantine）が生きたネットワークに残っている印。
+    /// `unreclaimed` と併せて立ち、detach では外さず（`delete_network` がネットワークごと解放する）、
+    /// `delete_network` の回収待ちの数には含めない（#2681）。
+    quarantine_held: bool,
     /// 取り残しを所有確認つきで回収するための請求書。`None` は所有を証明できない取り残しで、手動回収。
     claim: Option<A>,
 }
@@ -548,6 +565,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                     endpoint,
                     attached: None,
                     unreclaimed: true,
+                    quarantine_held: false,
                     claim: Some(claim),
                 },
             );
@@ -634,6 +652,13 @@ fn delete_incomplete(count: usize) -> TraitError {
 }
 
 /// attach の巻き戻しで取り残した資源が残っているコンテナへの操作の拒否（記録を消して成功を装わない）。
+fn quarantine_held() -> TraitError {
+    TraitError::new(
+        ErrorCode::FailedPrecondition,
+        "container resources were reclaimed but its address and port reservations are released only when the network is deleted; the container stays registered",
+    )
+}
+
 fn unreclaimed() -> TraitError {
     TraitError::new(
         ErrorCode::FailedPrecondition,
@@ -801,6 +826,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 endpoint,
                 attached: None,
                 unreclaimed: false,
+                quarantine_held: false,
                 claim: None,
             },
         );
@@ -911,7 +937,12 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             if container.claim.is_none() {
                 return Err(unreclaimed());
             }
-            self.reclaim_attach_entry(&mut reg.containers, req.container().as_str())?;
+            let live = quarantine_live(reg.networks.get(req.network().as_str()));
+            match self.reclaim_attach_entry(&mut reg.containers, req.container().as_str(), live)? {
+                AttachReclaim::Removed => {}
+                // カーネル側は回収済みだが、アドレス・ポート予約はネットワークごとの解放まで残る。成功を装わない。
+                AttachReclaim::QuarantineHeld => return Err(quarantine_held()),
+            }
             forget_recovered_if_empty(reg, req.network().as_str());
             return Ok(DetachResponse::new());
         }
@@ -937,10 +968,13 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         // attach の取り残しは bridge がある間に先に回収する（veth の所有の証明は bridge への所属。bridge を消すと
         // 証明を失う）。バックエンドでの解放後は bridge が無く証明できないため試みない（手動。#2681）。
         let mut reclaim_error = None;
+        let live = quarantine_live(Some(&*network));
         if !network.backend_deleted {
-            reclaim_error = self.reclaim_network_attach_leftovers(&mut reg.containers, name);
+            reclaim_error = self.reclaim_network_attach_leftovers(&mut reg.containers, name, live);
         }
-        let remaining = network_has_unreclaimed(&reg.containers, name);
+        // quarantine だけが残るコンテナ（カーネル側は回収済み）は、バックエンドのネットワーク解放が片付けるので
+        // 回収待ちに数えない。
+        let remaining = network_has_kernel_unreclaimed(&reg.containers, name);
         let network = reg.networks.get_mut(name).ok_or_else(not_found_network)?;
         if network.recovered {
             // 復元したネットワークは、取り残しを回収し終えたら記録を外す。ネットワーク本体は手動回収。
@@ -986,7 +1020,11 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         // 所有を確認できる残りの資源の解放は続行する（契約 9: 個々の失敗で残りを止めない）。
         let unreclaimed_count = linked
             .iter()
-            .filter(|id| reg.containers.get(*id).is_some_and(|c| c.unreclaimed))
+            .filter(|id| {
+                reg.containers
+                    .get(*id)
+                    .is_some_and(|c| c.unreclaimed && !c.quarantine_held)
+            })
             .count();
         let mut handles = Vec::new();
         let mut attached_ids: Vec<String> = Vec::new();
@@ -1004,13 +1042,34 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         match result {
             Ok(()) => {
                 network.backend_deleted = true;
+                let mut store_error = None;
                 for id in &linked {
-                    if !reg.containers.get(id).is_some_and(|c| c.unreclaimed) {
-                        reg.containers.remove(id);
+                    let Some(c) = reg.containers.get(id) else {
+                        continue;
+                    };
+                    if c.unreclaimed && !c.quarantine_held {
+                        continue;
                     }
+                    // quarantine だけの保持は、ネットワークの解放で片付いた。記録ファイルも外す（失敗なら保持して再試行）。
+                    if c.quarantine_held
+                        && let (Some(store), Some(record)) = (
+                            &self.store,
+                            c.claim
+                                .as_ref()
+                                .and_then(|cl| self.backend.encode_attach_claim(cl)),
+                        )
+                        && let Err(e) = store.remove_attach_if_matches(c.endpoint.as_str(), &record)
+                    {
+                        store_error.get_or_insert(e);
+                        continue;
+                    }
+                    reg.containers.remove(id);
                 }
                 if unreclaimed_count > 0 {
                     return Err(delete_incomplete(unreclaimed_count));
+                }
+                if let Some(e) = store_error {
+                    return Err(e);
                 }
                 reg.networks.remove(name);
                 Ok(DeleteNetworkResponse::new())
@@ -1045,6 +1104,30 @@ fn network_has_unreclaimed<C, A>(
         .any(|c| c.network == name && c.unreclaimed)
 }
 
+/// カーネル側の資源（veth・pin）の取り残しがあるコンテナが残っているか。quarantine だけの保持は含めない。
+fn network_has_kernel_unreclaimed<C, A>(
+    containers: &HashMap<String, ContainerEntry<C, A>>,
+    name: &str,
+) -> bool {
+    containers
+        .values()
+        .any(|c| c.network == name && c.unreclaimed && !c.quarantine_held)
+}
+
+/// ネットワークが、プロセス内の保持（IPAM・ポート予約）を持つ生きたハンドルを持つか。復元したネットワーク・
+/// 解放済みのネットワーク・無いものは `false`。
+fn quarantine_live<N, F>(network: Option<&NetworkEntry<N, F>>) -> bool {
+    network.is_some_and(|n| n.handle.is_some() && !n.recovered && !n.backend_deleted)
+}
+
+/// `reclaim_attach_entry` の結果。
+enum AttachReclaim {
+    /// 回収し、記録を外した。
+    Removed,
+    /// カーネル側は回収したが、quarantine が生きたネットワークに残るため記録を保持した。
+    QuarantineHeld,
+}
+
 /// 復元したネットワーク（`recovered`）で、コンテナの記録が無くなったら外す（#2681）。
 fn forget_recovered_if_empty<N, C, F, A>(reg: &mut Registry<N, C, F, A>, name: &str) {
     let recovered = reg.networks.get(name).is_some_and(|n| n.recovered);
@@ -1056,20 +1139,40 @@ fn forget_recovered_if_empty<N, C, F, A>(reg: &mut Registry<N, C, F, A>, name: &
 impl<B: NetsetupBackend> NetsetupNetwork<B> {
     /// 取り残したコンテナ 1 件を、所有確認つきで回収する。成功したときだけ記録ファイル → メモリの順に外す
     /// （失敗なら両方保持して再試行できる。記録の削除は中身が一致するときだけ。NET-1・#2681）。
+    ///
+    /// 請求書にプロセス内の保持（quarantine）が含まれ、かつ生きたネットワークの上なら、カーネル側の回収後も
+    /// 記録を外さず quarantine だけの請求書へ置き換えて保持する（[`AttachReclaim::QuarantineHeld`]）。
+    /// アドレス・DNAT ルール・ポート予約はここでは解放できず、解放前に記録を外すと同じ endpoint の再 attach が
+    /// `AlreadyExists` で失敗し、`network_has_unreclaimed` の防御も外れるため。`quarantine_live` はその
+    /// ネットワークが生きている（`handle` があり、復元でも解放済みでもない）か。
     fn reclaim_attach_entry(
         &self,
         containers: &mut HashMap<String, ContainerEntry<B::Container, B::FailedAttach>>,
         id: &str,
-    ) -> Result<(), TraitError> {
+        quarantine_live: bool,
+    ) -> Result<AttachReclaim, TraitError> {
         let entry = containers.get(id).ok_or_else(not_found_netns)?;
         let claim = entry.claim.as_ref().ok_or_else(unreclaimed)?;
         self.backend.reclaim_failed_attach(claim)?;
+        if quarantine_live && let Some(rest) = self.backend.attach_claim_quarantine_remainder(claim)
+        {
+            if !entry.quarantine_held
+                && let (Some(store), Some(record)) =
+                    (&self.store, self.backend.encode_attach_claim(&rest))
+            {
+                store.save_attach(entry.endpoint.as_str(), &record)?;
+            }
+            let entry = containers.get_mut(id).ok_or_else(not_found_netns)?;
+            entry.claim = Some(rest);
+            entry.quarantine_held = true;
+            return Ok(AttachReclaim::QuarantineHeld);
+        }
         if let (Some(store), Some(record)) = (&self.store, self.backend.encode_attach_claim(claim))
         {
             store.remove_attach_if_matches(entry.endpoint.as_str(), &record)?;
         }
         containers.remove(id);
-        Ok(())
+        Ok(AttachReclaim::Removed)
     }
 
     /// ネットワークの取り残し全件の回収を試みる（請求書の無いものは触れない）。1 件の失敗で残りを止めず、
@@ -1078,16 +1181,20 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         &self,
         containers: &mut HashMap<String, ContainerEntry<B::Container, B::FailedAttach>>,
         name: &str,
+        quarantine_live: bool,
     ) -> Option<TraitError> {
         let mut ids: Vec<String> = containers
             .iter()
-            .filter(|(_, c)| c.network == name && c.unreclaimed && c.claim.is_some())
+            .filter(|(_, c)| {
+                c.network == name && c.unreclaimed && !c.quarantine_held && c.claim.is_some()
+            })
             .map(|(id, _)| id.clone())
             .collect();
         ids.sort_unstable();
         let mut first = None;
         for id in ids {
-            if let Err(e) = self.reclaim_attach_entry(containers, &id) {
+            // quarantine だけが残った（QuarantineHeld）ものは、このあとの backend の delete_network が解放する。
+            if let Err(e) = self.reclaim_attach_entry(containers, &id, quarantine_live) {
                 first.get_or_insert(e);
             }
         }
@@ -1311,6 +1418,13 @@ mod linux {
                 ));
             }
             Ok((claim.network().clone(), claim))
+        }
+
+        fn attach_claim_quarantine_remainder(
+            &self,
+            claim: &Self::FailedAttach,
+        ) -> Option<Self::FailedAttach> {
+            claim.quarantine_only()
         }
 
         fn reclaim_failed_attach(&self, claim: &Self::FailedAttach) -> Result<(), TraitError> {

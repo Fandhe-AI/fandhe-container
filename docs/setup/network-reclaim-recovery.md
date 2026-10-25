@@ -35,6 +35,17 @@
 
 root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge を巻き込まないよう、必ず名前を確認してから実行する。
 
+## 手順（所有トークンを持つ bridge）
+
+作成に成功した bridge は `IFLA_IFALIAS` に所有トークン `fandhe-net:<名前>:...` を持つ。plugin の再起動後は作成に成功したネットワークの記録が無いため、自動回収されず（上の表）、「別名の無い bridge」の手順（別名が空であることを条件にする）はそのままでは使えない。次の手順で、別名が所有トークンであることを確認して手で回収する（NET-1・REPAIR-3・#2681）。
+
+1. ネットワーク名から bridge 名（`fcbr` + 11 桁の 16 進）を求め、`ip -o link show type bridge` の該当行の `alias` が `fandhe-net:<名前>:` で始まることを確認する。**別名が別のネットワークのもの・空・不明なら消さない**（空なら上の「手順（別名の無い bridge）」）
+2. 残っている接続を確認する: `ip link show master <bridge名>`。各 veth の `alias` は `<bridge の別名>/ep/<endpoint>/g/<世代>` の形である。attach の記録（`attach/<endpoint>.attach`）の `token` が bridge の別名と一致し、`endpoint` が veth の別名と一致する veth だけが、その取り残しの対象になる（`generation` が一致しない veth は別の接続のものなので消さない）
+3. 生きているコンテナの veth が付いていないことを確かめてから、veth を消す: `ip link delete <host側veth名>`（名前は `VethNames` の導出で、`ip link show master` で確認する）。その後、nft テーブル `fandhe_net_<名前>` が自分のものであることを確認して `nft delete table ip fandhe_net_<名前>`、bridge を `ip link delete <bridge名>` で消す
+4. 手順 3 で消した接続の `attach/<endpoint>.attach` と、ネットワークの記録ファイルがあれば手で消し、plugin を再起動してメモリ上の登録を捨てる
+
+root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge・veth を巻き込まないよう、名前・別名・ifindex を確認してから実行する。
+
 ## attach の取り残し（#2681）
 
 `attach` の巻き戻しで取り残した host 側 veth・netns の pin は、請求書が `<状態ルート>/.cri/net/pending-reclaim/attach/<endpoint>.attach` に残る。`NetworkPlugin::detach`（同じコンテナ）または `delete_network`（ネットワーク）を呼ぶと、別名と master の一致を確かめた veth だけが自動回収され、成功すると記録ファイルも消える。
@@ -44,8 +55,9 @@ root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge を�
 | 状況 | 理由 | 手順 |
 | ---- | ---- | ---- |
 | plugin の再起動後の netns の pin | `netns::unpin_path` はこのプロセスが作った pin しか外さない | 下の手順 |
-| 別名の無い・別名の異なる veth、bridge に繋がっていない veth | 所有を証明できない | 手動で確認する（`ip -o link show` の `alias fandhe-net:<名前>:...` が `/ep/<endpoint>` で終わるものだけが対象） |
-| 再起動後の bridge・nft テーブル | 作成に成功したネットワークの記録が永続化されていない（#1870 の後続） | 上の「手順（別名の無い bridge）」と同じ確認で手動回収する |
+| 別名の無い・別名の異なる veth、bridge に繋がっていない veth | 所有を証明できない | 手動で確認する（`ip -o link show` の `alias fandhe-net:<名前>:...` が `/ep/<endpoint>/g/<32 桁の 16 進>` で終わるものだけが対象。`<32 桁の 16 進>` は接続ごとの世代で、同じ endpoint の再接続では変わる。請求書の `generation` と一致しない veth は別の接続のもので消さない） |
+| 再起動後の bridge・nft テーブル | 作成に成功したネットワークの記録が永続化されていない（#1870 の後続） | 下の「手順（所有トークンを持つ bridge）」 |
+| アドレス・DNAT ルール・ポート予約（quarantine）がカーネル側の回収後も残るとき | プロセス内の保持で、`detach` は `released only when the network is deleted` の `FailedPrecondition` を返し登録を保持する（同じコンテナの再 attach は拒否） | `delete_network` を呼ぶとネットワークごと解放される |
 | 壊れた attach の記録 | 復号できない（ファイルは消えずに残り、同じコンテナの再 attach は `AlreadyExists` で拒否される） | 資源を確認・削除したうえで、記録ファイルを手で消して plugin を再起動する |
 
 復元したネットワークで `delete_network` が `attach leftovers were reclaimed; the network itself was not tracked across the plugin restart and needs manual reclaim` の `FailedPrecondition` を返したら、取り残しの回収は済み、ネットワーク本体（bridge・nft テーブル）は手動回収が必要という意味である。

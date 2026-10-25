@@ -52,6 +52,8 @@ struct Script {
     no_attach_encode: bool,
     /// 次の reclaim_failed_attach を成功させるか。
     reclaim_attach_ok: bool,
+    /// attach の請求書に quarantine（プロセス内の保持）が含まれる模型にするか。
+    attach_quarantine: bool,
     /// 次の delete_network を失敗させ、渡されたハンドルを全部 retry に返す回数。
     fail_delete: u32,
 }
@@ -135,6 +137,14 @@ impl NetsetupBackend for Fake {
             .ok_or_else(bad)?;
         let name = NetName::new(net).map_err(|_| bad())?;
         Ok((name, (net.to_owned(), ep.to_owned())))
+    }
+
+    fn attach_claim_quarantine_remainder(
+        &self,
+        claim: &(String, String),
+    ) -> Option<(String, String)> {
+        let s = self.0.lock().expect("lock");
+        s.attach_quarantine.then(|| claim.clone())
     }
 
     fn reclaim_failed_attach(&self, claim: &(String, String)) -> Result<(), TraitError> {
@@ -961,6 +971,50 @@ fn net1_attach_leftover_reclaimed_by_detach() {
     // 記録が外れているので、netns をやり直せる。
     net.create_netns(&CreateNetnsRequest::new(nname("n0"), cid("c1")))
         .expect("netns again");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// NET-1・#2681: quarantine（アドレス・ポート予約）を含む取り残しは、detach でカーネル側を回収しても成功を
+/// 装わず、登録と記録を保持する（再 attach を拒否）。delete_network がネットワークごと解放して記録も消す。
+#[test]
+fn net1_detach_keeps_registration_while_quarantine_held() {
+    let root = temp_state_root("quarantine");
+    let fake = Fake::default();
+    let net = persistent(&root, &fake);
+    fake.0.lock().expect("lock").attach_quarantine = true;
+    leak_attach(&net, &fake, "n0", "c1");
+    fake.0.lock().expect("lock").reclaim_attach_ok = true;
+    let file = root.join(RECLAIM_DIR).join(ATTACH_DIR).join("c1.attach");
+    for _ in 0..2 {
+        let e = net
+            .detach(&DetachRequest::new(nname("n0"), cid("c1")))
+            .expect_err("quarantine still held");
+        assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+        assert!(
+            e.message()
+                .contains("released only when the network is deleted")
+        );
+        assert!(file.exists());
+        // 再 attach は IPAM の二重払い出しに進まず、バックエンドの attach を呼ばずに拒否される。
+        let before = fake
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("attach "))
+            .count();
+        let e = pod_network::set_up_container(&net, &nname("n0"), &cid("c1"))
+            .expect_err("blocked while held");
+        assert!(e.message().contains("unreclaimed"));
+        let after = fake
+            .calls()
+            .iter()
+            .filter(|c| c.starts_with("attach "))
+            .count();
+        assert_eq!(before, after);
+    }
+    // カーネル側の取り残しではないので、delete_network は回収待ちとして止まらず、ネットワークと一緒に片付ける。
+    net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
+        .expect("delete releases the held quarantine");
+    assert!(!file.exists());
     std::fs::remove_dir_all(&root).expect("cleanup");
 }
 

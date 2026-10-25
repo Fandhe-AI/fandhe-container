@@ -1120,6 +1120,8 @@ pub struct ContainerAttachSpec {
     gateway: IpPrefix,
     table: NftName,
     ports: Vec<PortPublish>,
+    /// この接続の世代識別子（`new` ごとに新規）。veth の所有トークンと取り残しの請求書に載る。
+    generation: String,
 }
 
 impl ContainerAttachSpec {
@@ -1144,7 +1146,20 @@ impl ContainerAttachSpec {
             gateway: network.gateway,
             table: network.table.clone(),
             ports: Vec::new(),
+            generation: new_generation(),
         })
+    }
+
+    /// この接続の世代識別子。
+    pub fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    /// テスト用: 世代を固定する。
+    #[cfg(test)]
+    pub(crate) fn with_generation_for_test(mut self, generation: &str) -> Self {
+        self.generation = generation.to_owned();
+        self
     }
 
     /// ポート公開の指定を加える（既定は公開なし）。件数が [`MAX_PORT_PUBLISHES`] を超える、または
@@ -1288,15 +1303,15 @@ pub struct ContainerAttachError {
     /// この接続のネットワーク名・bridge の所有トークン・endpoint。回収用の請求書
     /// （[`FailedAttachClaim`]）の元になるためだけに保持し、公開しない（#2681）。
     /// `Err` の型を大きくしないため Box にする。
-    owner: Option<Box<(NetworkName, String, EndpointId)>>,
+    owner: Option<Box<(NetworkName, String, EndpointId, String)>>,
 }
 
 impl ContainerAttachError {
     /// 取り残した資源（`rollback.leftover`）の回収用の請求書。取り残しが無ければ `None`。
     /// quarantine（アドレス・DNAT ルール・ポート予約）はプロセス内の保持で、カーネル側の回収対象ではない。
     pub fn reclaim_claim(&self) -> Option<FailedAttachClaim> {
-        let (network, token, endpoint) = &**self.owner.as_ref()?;
-        FailedAttachClaim::from_error(network, token, endpoint, self)
+        let (network, token, endpoint, generation) = &**self.owner.as_ref()?;
+        FailedAttachClaim::from_error(network, token, endpoint, generation, self)
     }
 
     /// 機械可読な分類。
@@ -1338,13 +1353,56 @@ pub(crate) struct UnpinFailure<N> {
     pub(crate) netns: N,
 }
 
-/// host 側 veth の所有トークン（`IFLA_IFALIAS`）を、ネットワークの所有トークンと endpoint から導出する。
+/// 接続ごとの世代識別子の長さ（小文字 16 進。128 bit）。
+pub(crate) const GENERATION_LEN: usize = 32;
+
+/// 接続ごとの世代識別子を作る（時刻 ns・PID・プロセス内連番。各 16 進 16・8・8 桁）。
 ///
-/// 接続（`attach_container`）が刻み、削除（`delete_network`。TASK-139.4・NET-1）が再導出して照合する
-/// （呼び出し側が渡す `AttachedContainer::host_token` をそのまま所有の証明に使わないため）。形式
-/// （`<bridge_token>/ep/<endpoint>`）は既存 veth の照合に関わる契約で、変更すると削除で所有を証明できなくなる。
-pub(crate) fn host_owner_token(bridge_token: &str, endpoint: &EndpointId) -> String {
-    format!("{bridge_token}/ep/{}", endpoint.as_str())
+/// 同じ endpoint を再接続しても別の値になり、host 側 veth の所有トークンと取り残しの請求書に載せて
+/// 「どの接続の資源か」を区別する（古い請求書を新しい接続の veth へ適用して正常な veth を消さないため。
+/// NET-1・#2681）。暗号論的な乱数ではない（敵対者への耐性ではなく、並行する回収との取り違えの防止が目的）。
+pub(crate) fn new_generation() -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!(
+        "{nanos:016x}{:08x}{:08x}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// 世代識別子の形式（小文字 16 進のちょうど [`GENERATION_LEN`] 桁）を満たすか。
+pub(crate) fn is_valid_generation(g: &str) -> bool {
+    g.len() == GENERATION_LEN && g.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// host 側 veth の所有トークン（`IFLA_IFALIAS`）を、ネットワークの所有トークン・endpoint・接続の世代から導出する。
+///
+/// 接続（`attach_container`）が刻み、削除（`delete_network`。TASK-139.4・NET-1）が形式を再検証して照合する
+/// （呼び出し側が渡す `AttachedContainer::host_token` をそのまま所有の証明に使わないため）。世代を含めるのは、
+/// 同じ endpoint の再接続で同じトークンになると、古い請求書が新しい正常な veth に一致してしまうため（#2681）。
+/// 形式は `<bridge_token>/ep/<endpoint>/g/<世代>`。
+pub(crate) fn host_owner_token(
+    bridge_token: &str,
+    endpoint: &EndpointId,
+    generation: &str,
+) -> String {
+    format!("{bridge_token}/ep/{}/g/{generation}", endpoint.as_str())
+}
+
+/// `token` が、このネットワーク・endpoint の発行形式（世代が正しい形式）か。世代の値そのものは問わない。
+/// `delete_network` が呼び出し側の渡した `host_token` の出自を検査するのに使う。
+pub(crate) fn host_token_is_for(bridge_token: &str, endpoint: &EndpointId, token: &str) -> bool {
+    token
+        .strip_prefix(bridge_token)
+        .and_then(|r| r.strip_prefix("/ep/"))
+        .and_then(|r| r.strip_prefix(endpoint.as_str()))
+        .and_then(|r| r.strip_prefix("/g/"))
+        .is_some_and(is_valid_generation)
 }
 
 /// 接続手順が使うカーネル操作の境界。Linux 実装とテストの fake を差し替えるための crate 内部トレイトで、
@@ -1485,6 +1543,7 @@ pub(crate) fn attach_container_with<O: AttachOps>(
             spec.network.clone(),
             spec.bridge_token.clone(),
             spec.endpoint.clone(),
+            spec.generation.clone(),
         ))),
     };
     let names = VethNames::derive(&spec.endpoint)
@@ -1588,7 +1647,7 @@ pub(crate) fn attach_container_with<O: AttachOps>(
     };
 
     // ifindex は再利用されうるため、削除時に元の veth と照合できるよう所有トークンを刻む。
-    let host_token = host_owner_token(&spec.bridge_token, &spec.endpoint);
+    let host_token = host_owner_token(&spec.bridge_token, &spec.endpoint, &spec.generation);
     let attach = || {
         ops.set_owner_token(host_index, &host_token)
             .map_err(|e| (e, AttachStep::SetOwnerToken))?;
@@ -2944,7 +3003,9 @@ mod attach_tests {
     }
 
     fn spec(id: &str) -> ContainerAttachSpec {
-        ContainerAttachSpec::new(eid(id), &created(), netns_dir()).unwrap()
+        ContainerAttachSpec::new(eid(id), &created(), netns_dir())
+            .unwrap()
+            .with_generation_for_test(TEST_GEN)
     }
 
     /// 呼び出しを記録し、指定手順で失敗を注入する fake。link の ifindex は名前の接頭辞で決める。
@@ -3188,6 +3249,19 @@ mod attach_tests {
         }
     }
 
+    /// テストで固定する接続の世代識別子。
+    const TEST_GEN: &str = "0123456789abcdef0123456789abcdef";
+
+    /// NET-1・#2681: 世代識別子は接続（spec）ごとに別の値で、形式を満たす。
+    #[test]
+    fn net1_generation_is_unique_per_spec() {
+        let a = ContainerAttachSpec::new(eid("c1"), &created(), netns_dir()).unwrap();
+        let b = ContainerAttachSpec::new(eid("c1"), &created(), netns_dir()).unwrap();
+        assert_ne!(a.generation(), b.generation());
+        assert!(is_valid_generation(a.generation()));
+        assert_eq!(a.generation().len(), GENERATION_LEN);
+    }
+
     /// NET-1: netns 置き場は絶対パスのみ。pin 先は置き場直下の ID 名。
     #[test]
     fn net1_spec_requires_absolute_netns_dir() {
@@ -3213,7 +3287,7 @@ mod attach_tests {
                 format!("create_veth {} {}", n.host().as_str(), n.peer().as_str()),
                 format!("link_index {}", n.host().as_str()),
                 format!("link_index {}", n.peer().as_str()),
-                "set_owner_token 21 fandhe-net:web:1:0:0/ep/web-1".to_owned(),
+                "set_owner_token 21 fandhe-net:web:1:0:0/ep/web-1/g/0123456789abcdef0123456789abcdef".to_owned(),
                 "set_master 21 7".to_owned(),
                 "set_up 21".to_owned(),
                 "move_to_netns 22".to_owned(),
@@ -3266,7 +3340,9 @@ mod attach_tests {
     fn spec_for(id: &str, gateway_len: u8) -> ContainerAttachSpec {
         let mut net = created();
         net.gateway = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, 1)), gateway_len).unwrap();
-        ContainerAttachSpec::new(eid(id), &net, netns_dir()).unwrap()
+        ContainerAttachSpec::new(eid(id), &net, netns_dir())
+            .unwrap()
+            .with_generation_for_test(TEST_GEN)
     }
 
     /// NET-1・ERR-1・TASK-139.2.2: プール枯渇で veth と netns をこの順に戻し、元のエラーを返す。

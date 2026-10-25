@@ -81,7 +81,7 @@
 //! # veth の所有
 //!
 //! ifindex は削除後に再利用されうるため、ifindex だけでは veth の所有を証明できない。接続時に host 側
-//! veth の `IFLA_IFALIAS` へ所有トークンを刻み（`AttachedContainer::host_token`）、削除の直前に名前から
+//! veth の `IFLA_IFALIAS` へ、接続ごとの世代（再接続で変わる）を含む所有トークンを刻み（`AttachedContainer::host_token`。形式は `host_owner_token`）、削除の直前に名前から
 //! ifindex・別名・所属先 master を引き直して、ifindex が記録と一致し、別名がトークンと一致し、かつ master が
 //! このネットワークの bridge であることを確認する。いずれかを満たさない link は元の veth と証明できないため
 //! 削除せず `Unknown` で報告する。ifindex が記録と異なり別名もトークンと異なる場合は、同名の別 link への
@@ -126,8 +126,8 @@ use super::link_ref;
 use super::{
     AttachedContainer, CreatedNetwork, EndpointId, FailedAttachClaim, FailedCreateClaim,
     NetnsDirRecord, NetworkName, NetworkResourceNames, NftApplyFailure, PortRegistry,
-    ResourceState, StaticIpam, UnpinFailure, VethNames, host_owner_token, is_indeterminate,
-    token_names_network,
+    ResourceState, StaticIpam, UnpinFailure, VethNames, host_owner_token, host_token_is_for,
+    is_indeterminate, token_names_network,
 };
 
 /// 失敗した手順。
@@ -414,7 +414,7 @@ pub(crate) fn delete_network_with<O: DeleteOps>(
                 if ipam.address_of(&c.endpoint) != Some(c.address)
                     || names.host() != &c.host_veth
                     || names.peer() != &c.peer_veth
-                    || host_owner_token(&network.bridge_token, &c.endpoint) != c.host_token
+                    || !host_token_is_for(&network.bridge_token, &c.endpoint, &c.host_token)
                     || pin_mismatch
                 {
                     invalid = Some(precondition("container does not belong to the network"));
@@ -790,7 +790,7 @@ pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
                 failures.note(e, DeleteStep::DeleteVeth);
             }
             Ok(att) => {
-                let want = host_owner_token(token, claim.endpoint());
+                let want = host_owner_token(token, claim.endpoint(), claim.generation());
                 let bridge = ops.owned_bridge_index(names.bridge(), token);
                 match bridge {
                     Err(e) => {
@@ -1323,9 +1323,14 @@ mod tests {
         VethNames::derive(&eid(id)).unwrap().host().clone()
     }
 
+    /// テストの接続の世代識別子。
+    const GEN: &str = "0123456789abcdef0123456789abcdef";
+    /// 取り残しの請求書が別の（古い）接続のものであることを表す世代識別子。
+    const OLD_GEN: &str = "fedcba9876543210fedcba9876543210";
+
     /// 接続処理と同じ導出の、endpoint `id` の veth 所有トークン。
     fn token_of(id: &str) -> String {
-        host_owner_token(TOKEN, &eid(id))
+        host_owner_token(TOKEN, &eid(id), GEN)
     }
 
     /// fake が名前から引く veth の別名（テストで使う endpoint のうち host 名が一致するもののトークン）。
@@ -1615,11 +1620,16 @@ mod tests {
             let (net, mut ipam, mut ports) = setup();
             let mut c1 = attached(&mut ipam, "c1");
             match forge {
-                "token" => c1.host_token = "fandhe-net:other:9:9:9/ep/c1".to_owned(),
+                "token" => {
+                    c1.host_token =
+                        "fandhe-net:other:9:9:9/ep/c1/g/0123456789abcdef0123456789abcdef".to_owned()
+                }
                 _ => c1.peer_veth = VethNames::derive(&eid("zzz")).unwrap().peer().clone(),
             }
             let fake = Fake {
-                veth_alias: Some(Some("fandhe-net:other:9:9:9/ep/c1".to_owned())),
+                veth_alias: Some(Some(
+                    "fandhe-net:other:9:9:9/ep/c1/g/0123456789abcdef0123456789abcdef".to_owned(),
+                )),
                 ..Fake::default()
             };
             let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
@@ -2441,6 +2451,7 @@ mod tests {
             NetworkName::new("web").unwrap(),
             eid("c1"),
             TOKEN,
+            GEN,
             veth,
             netns,
             quarantine,
@@ -2534,6 +2545,7 @@ mod tests {
             NetworkName::new("web").unwrap(),
             eid("c1"),
             "fandhe-net:other:1:2:3",
+            GEN,
             true,
             true,
             false,
@@ -2581,5 +2593,49 @@ mod tests {
                 .unwrap();
         assert!(fake.calls().is_empty());
         assert_eq!(report, NetworkDeleteReport::default());
+    }
+
+    /// NET-1・#2681: 回収 → 同じ endpoint の再接続 → 古い請求書での回収で、新しい接続の veth は消えない。
+    /// 再接続した veth の別名は別の世代のトークンになるため、古い請求書では所有を証明できない。
+    #[test]
+    fn net1_reclaim_attach_stale_claim_keeps_reconnected_veth() {
+        // fake の veth は現在の世代（GEN）のトークンを持つ。請求書は古い接続（OLD_GEN）のもの。
+        let fake = Fake::default();
+        let stale = FailedAttachClaim::for_test(
+            NetworkName::new("web").unwrap(),
+            eid("c1"),
+            TOKEN,
+            OLD_GEN,
+            true,
+            true,
+            false,
+        );
+        let e = reclaim_failed_attach_with(&fake, &stale, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::DeleteVeth);
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+        assert_eq!(
+            e.report.leftover.first(),
+            Some(&(DeleteResource::Veth(host_of("c1")), ResourceState::Unknown))
+        );
+        // 同じ世代の請求書なら消える（対照）。
+        let fake = Fake::default();
+        reclaim_failed_attach_with(&fake, &attach_claim(true, false, false), &netns_dir()).unwrap();
+        assert!(fake.calls().iter().any(|c| c.starts_with("delete_link")));
+    }
+
+    /// NET-1・#2681: `delete_network` は、世代の形式が正しくない `host_token` を持つ記録を拒否する。
+    #[test]
+    fn net1_host_token_requires_generation_form() {
+        let ep = eid("c1");
+        assert!(host_token_is_for(TOKEN, &ep, &token_of("c1")));
+        for bad in [
+            format!("{TOKEN}/ep/c1"),
+            format!("{TOKEN}/ep/c1/g/"),
+            format!("{TOKEN}/ep/c1/g/ZZ"),
+            format!("{TOKEN}/ep/c1/g/{GEN}0"),
+            format!("{TOKEN}/ep/c2/g/{GEN}"),
+        ] {
+            assert!(!host_token_is_for(TOKEN, &ep, &bad), "{bad}");
+        }
     }
 }

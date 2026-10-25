@@ -14,7 +14,7 @@ use crate::error::NetError;
 
 use super::{
     AttachResource, CLAIM_RECORD_MAX_LEN, CLAIM_TOKEN_MAX_LEN, ContainerAttachError, EndpointId,
-    NetworkName, invalid, parse_flag, token_names_network,
+    NetworkName, invalid, is_valid_generation, parse_flag, token_names_network,
 };
 
 /// 記録の先頭行（版）。
@@ -30,6 +30,8 @@ pub struct FailedAttachClaim {
     network: NetworkName,
     token: String,
     endpoint: EndpointId,
+    /// この接続の世代識別子。veth の所有トークンに含まれ、再接続した別の接続と区別する。
+    generation: String,
     veth: bool,
     netns: bool,
     quarantine: bool,
@@ -41,6 +43,7 @@ impl FailedAttachClaim {
         network: &NetworkName,
         token: &str,
         endpoint: &EndpointId,
+        generation: &str,
         err: &ContainerAttachError,
     ) -> Option<Self> {
         let has = |f: fn(&AttachResource) -> bool| err.rollback.leftover.iter().any(|(r, _)| f(r));
@@ -58,6 +61,7 @@ impl FailedAttachClaim {
             network: network.clone(),
             token: token.to_owned(),
             endpoint: endpoint.clone(),
+            generation: generation.to_owned(),
             veth,
             netns,
             quarantine,
@@ -67,10 +71,11 @@ impl FailedAttachClaim {
     /// 永続化記録（固定のテキスト。LF・ASCII）へ符号化する。
     pub fn to_record(&self) -> String {
         format!(
-            "{ATTACH_RECORD_VERSION_LINE}\nnetwork={}\nendpoint={}\ntoken={}\nveth={}\nnetns={}\nquarantine={}\n",
+            "{ATTACH_RECORD_VERSION_LINE}\nnetwork={}\nendpoint={}\ntoken={}\ngeneration={}\nveth={}\nnetns={}\nquarantine={}\n",
             self.network.as_str(),
             self.endpoint.as_str(),
             self.token,
+            self.generation,
             u8::from(self.veth),
             u8::from(self.netns),
             u8::from(self.quarantine),
@@ -97,6 +102,7 @@ impl FailedAttachClaim {
         let network = NetworkName::new(field("network")?)?;
         let endpoint = EndpointId::new(field("endpoint")?)?;
         let token = field("token")?;
+        let generation = field("generation")?;
         let veth = parse_flag(field("veth")?)?;
         let netns = parse_flag(field("netns")?)?;
         let quarantine = parse_flag(field("quarantine")?)?;
@@ -109,6 +115,9 @@ impl FailedAttachClaim {
         {
             return Err(invalid("attach claim record token invalid"));
         }
+        if !is_valid_generation(generation) {
+            return Err(invalid("attach claim record generation invalid"));
+        }
         if !(veth || netns || quarantine) {
             return Err(invalid("attach claim record names no resource"));
         }
@@ -116,6 +125,7 @@ impl FailedAttachClaim {
             network,
             token: token.to_owned(),
             endpoint,
+            generation: generation.to_owned(),
             veth,
             netns,
             quarantine,
@@ -148,6 +158,22 @@ impl FailedAttachClaim {
         self.quarantine
     }
 
+    /// カーネル側の資源（veth・netns の pin）を除いた、プロセス内の保持（quarantine）だけの請求書。
+    /// veth・netns の回収を確認した後も quarantine が残る間の記録に使う（`delete_network` が解放する）。
+    pub fn quarantine_only(&self) -> Option<Self> {
+        self.quarantine.then(|| Self {
+            veth: false,
+            netns: false,
+            ..self.clone()
+        })
+    }
+
+    /// 回収側（`delete.rs`）が所有の証明に使う接続の世代識別子。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn generation(&self) -> &str {
+        &self.generation
+    }
+
     /// 回収側（`delete.rs`）が所有の証明に使う bridge のトークン。
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn token(&self) -> &str {
@@ -160,6 +186,7 @@ impl FailedAttachClaim {
         network: NetworkName,
         endpoint: EndpointId,
         token: &str,
+        generation: &str,
         veth: bool,
         netns: bool,
         quarantine: bool,
@@ -168,6 +195,7 @@ impl FailedAttachClaim {
             network,
             token: token.to_owned(),
             endpoint,
+            generation: generation.to_owned(),
             veth,
             netns,
             quarantine,
@@ -179,6 +207,8 @@ impl FailedAttachClaim {
 mod tests {
     use super::*;
     use crate::error::NetErrorCode;
+
+    const GEN: &str = "0123456789abcdef0123456789abcdef";
 
     fn n(s: &str) -> NetworkName {
         NetworkName::new(s).unwrap()
@@ -194,6 +224,7 @@ mod tests {
             n("web"),
             e("c1"),
             "fandhe-net:web:1:2:3",
+            GEN,
             true,
             false,
             true,
@@ -201,7 +232,7 @@ mod tests {
         let rec = c.to_record();
         assert_eq!(
             rec,
-            "fandhe-net-attach-claim v1\nnetwork=web\nendpoint=c1\ntoken=fandhe-net:web:1:2:3\nveth=1\nnetns=0\nquarantine=1\n"
+            "fandhe-net-attach-claim v1\nnetwork=web\nendpoint=c1\ntoken=fandhe-net:web:1:2:3\ngeneration=0123456789abcdef0123456789abcdef\nveth=1\nnetns=0\nquarantine=1\n"
         );
         assert_eq!(FailedAttachClaim::from_record(&rec), Ok(c));
     }
@@ -209,7 +240,7 @@ mod tests {
     /// NET-1・#2681: 不正な記録は `InvalidArgument` で拒否する。
     #[test]
     fn net1_attach_claim_record_rejects_malformed() {
-        let ok = "fandhe-net-attach-claim v1\nnetwork=web\nendpoint=c1\ntoken=fandhe-net:web:1:2:3\nveth=1\nnetns=0\nquarantine=0\n";
+        let ok = "fandhe-net-attach-claim v1\nnetwork=web\nendpoint=c1\ntoken=fandhe-net:web:1:2:3\ngeneration=0123456789abcdef0123456789abcdef\nveth=1\nnetns=0\nquarantine=0\n";
         assert!(FailedAttachClaim::from_record(ok).is_ok());
         let long_token = ok.replace(
             "token=fandhe-net:web:1:2:3",

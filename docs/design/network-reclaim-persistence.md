@@ -89,11 +89,11 @@ table=<0|1>
 `attach_container` の巻き戻しで取り残した host 側 veth・netns の pin も、作成失敗の請求書と同じ置き場と形式で永続化する。NET-1・REPAIR-5（あわせて REPAIR-3・REPAIR-4・NET-6・CORE-1）。
 
 - 置き場: `<状態ルート>/.cri/net/pending-reclaim/attach/<endpoint>.attach`。`attach/` は `open` が 0700 で作り、親と同じ検査（symlink でない・状態ルートと同じ所有者・group / other の権限なし）にかける。排他は親の `.lock` を共有する。一時ファイル（`O_EXCL`・0600）→ fsync → rename → ディレクトリの fsync、長さの上限 1024 バイト、読み込み時の件数の上限（`MAX_NETWORKS` × `MAX_CONTAINERS_PER_NETWORK`）は作成失敗の記録と同じ
-- 形式（net の `FailedAttachClaim::to_record` / `from_record`）: 版の行 `fandhe-net-attach-claim v1` の後に `network` / `endpoint` / `token` / `veth` / `netns` / `quarantine` を固定順で書く。版・順序・LF・余分な行・名前の規則・トークンの形式（そのネットワークの発行形式で 256 バイト以下の可視 ASCII）・フラグ（`0` か `1`。すべて `0` は拒否）を厳密に検証し、違反は `InvalidArgument`（入力値は載せない）。所有の最終判定は記録ではなく、カーネル側の別名（`host_owner_token`）と master の一致で行う
+- 形式（net の `FailedAttachClaim::to_record` / `from_record`）: 版の行 `fandhe-net-attach-claim v1` の後に `network` / `endpoint` / `token` / `generation` / `veth` / `netns` / `quarantine` を固定順で書く。`generation` は接続ごとの世代（小文字 16 進 32 桁）で、host 側 veth の別名 `<token>/ep/<endpoint>/g/<generation>` に含まれる。同じ endpoint の再接続で別の値になるため、古い請求書は新しい接続の veth の所有を証明できず、正常な veth を消さない。版・順序・LF・余分な行・名前の規則・トークンの形式（そのネットワークの発行形式で 256 バイト以下の可視 ASCII）・フラグ（`0` か `1`。すべて `0` は拒否）を厳密に検証し、違反は `InvalidArgument`（入力値は載せない）。所有の最終判定は記録ではなく、カーネル側の別名（`host_owner_token`）と master の一致で行う
 - 書く時点: attach が取り残し付きで失敗し、請求書があるとき。書けなくてもメモリの記録は保持し、元のエラーに `the reclaim record could not be persisted` を足した `Internal` を返す
 - 消す時点: `detach` または `delete_network` が回収に成功した後、記録ファイルを中身が一致するときだけ消し（別プロセスが書いた新しい記録を消さない）、そのあとでメモリの記録を外す。回収に失敗したら記録・ファイルとも保持して再試行できる
 - 回収の順序: `delete_network` は bridge を解放する前に、attach の取り残しを先に回収する（veth の所有の証明は bridge への所属で、bridge を消すと証明を失うため）。バックエンドでの解放後は bridge が無く証明できないため試みない（手動回収）
-- 回収の内容（`network::reclaim_failed_attach`）: host 側 veth は、別名が endpoint のトークンに一致し、master が所有を確かめた bridge に一致するときだけ、照会で得た ifindex で消す。不一致・bridge 無し・判定不能は `Unknown` のまま触れない。netns の pin は `netns::unpin_path` で外し、pin の置き場は記録ではなく plugin の固定設定（`<状態ルート>/.netns`）から受ける。quarantine（アドレス・DNAT ルール・ポート予約）はプロセス内の保持で、解放は `delete_network` が行う
+- 回収の内容（`network::reclaim_failed_attach`）: host 側 veth は、別名が endpoint のトークンに一致し、master が所有を確かめた bridge に一致するときだけ、照会で得た ifindex で消す。不一致・bridge 無し・判定不能は `Unknown` のまま触れない。netns の pin は `netns::unpin_path` で外し、pin の置き場は記録ではなく plugin の固定設定（`<状態ルート>/.netns`）から受ける。quarantine（アドレス・DNAT ルール・ポート予約）はプロセス内の保持で、解放は `delete_network` が行う。plugin-cri はカーネル側の回収後も quarantine が生きたネットワークに残る間、`detach` を成功させず登録と記録（quarantine だけの請求書へ置き換え）を保持し、同じ endpoint の再 attach を `unreclaimed` で拒否する。`delete_network` はそれを回収待ちに数えず、ネットワークの解放後に登録と記録を外す
 
 ### 再起動後に回収できるもの・できないもの
 

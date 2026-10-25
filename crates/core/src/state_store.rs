@@ -99,6 +99,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::audit_log::{AuditCoverage, AuditCoveragePolicy, CoverageLayer, KernelAuditLayerStatus};
+use crate::capabilities::{Capability, CapabilitySet, ContainerCapabilities};
 use crate::dev_mounts::ImplicitDevMount;
 use crate::launch_isolation::{
     AuditCoverageRecordOutcome, LaunchIsolationRecord, MAX_RECORDED_ID_EXTENTS, MAX_RECORDED_RULES,
@@ -1740,6 +1741,15 @@ struct LaunchIsolationDto {
     /// launch が使った ID 写像（CORE-6・#2388）。無ければ記録なし。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     id_mapping: Option<IdMappingDto>,
+    /// launch が適用した capability の許可集合（`CAP_*` 名。SEC-1・CRI-2・#2666）。無ければ記録なし
+    /// （導入前の launch は OCI 既定集合で起動したため、exec は OCI 既定集合として扱う）。
+    /// キー欠落だけを旧記録として許し、`null` を含む配列以外は破損として拒否する（fail-closed）。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "capabilities_array"
+    )]
+    capabilities: Option<Vec<String>>,
 }
 
 /// ID 写像の記録。`model` は `single` / `subordinate`。
@@ -1952,6 +1962,9 @@ impl LaunchIsolationDto {
                 c
             }),
             id_mapping: record.id_mapping().map(IdMappingDto::from_record),
+            capabilities: record
+                .capabilities()
+                .map(|c| c.iter().map(|c| c.as_str().to_owned()).collect()),
         }
     }
 
@@ -2000,11 +2013,36 @@ impl LaunchIsolationDto {
             }
             None => record,
         };
-        Ok(match self.id_mapping {
+        let record = match self.id_mapping {
             Some(m) => record.with_id_mapping(m.into_record()?),
+            None => record,
+        };
+        Ok(match self.capabilities {
+            Some(names) => record.with_capabilities(capabilities_from_names(&names)?),
             None => record,
         })
     }
+}
+
+/// `capabilities` のキーが在るとき配列だけを受ける（`null` は拒否。`default` がキー欠落を `None` にする）。
+fn capabilities_array<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(d).map(Some)
+}
+
+/// 記録された `CAP_*` 名を許可集合へ組み直す。件数は確保の前に既知の capability 数で検証し、未知名・
+/// OCI 既定外を含む集合は破損として拒否する（`ContainerCapabilities::restrict`。SEC-1・#2666）。
+fn capabilities_from_names(names: &[String]) -> Result<ContainerCapabilities, ()> {
+    if names.len() > Capability::ALL.len() {
+        return Err(());
+    }
+    let mut set = CapabilitySet::empty();
+    for n in names {
+        set = set.with(Capability::from_name(n).ok_or(())?);
+    }
+    ContainerCapabilities::restrict(set).map_err(|_| ())
 }
 
 impl LandlockRuleDto {
@@ -3499,6 +3537,49 @@ mod tests {
             serde_json::json!({"mode": "kernel_audit_requested"});
         let dto: LaunchIsolationDto = serde_json::from_value(bad).unwrap();
         assert!(dto.into_record().is_err());
+    }
+
+    /// SEC-1・CRI-2・#2666: capability の許可集合の記録が `CAP_*` 名の具体値で往復し、キーの無い旧記録は
+    /// `None`、未知名・OCI 既定外・件数超過・型不正は破損として拒否される。
+    #[test]
+    fn sec1_cri2_state_capabilities_roundtrip_and_rejects_corruption() {
+        let caps = ContainerCapabilities::restrict(
+            CapabilitySet::empty()
+                .with(Capability::Chown)
+                .with(Capability::Kill),
+        )
+        .unwrap();
+        let rec = iso(100).with_capabilities(caps);
+        let v = serde_json::to_value(LaunchIsolationDto::from_record(&rec)).unwrap();
+        assert_eq!(
+            v["capabilities"],
+            serde_json::json!(["CAP_CHOWN", "CAP_KILL"])
+        );
+        let back: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+        assert_eq!(back.into_record().unwrap().capabilities(), Some(caps));
+        let legacy = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+        assert!(legacy.get("capabilities").is_none());
+        let back: LaunchIsolationDto = serde_json::from_value(legacy).unwrap();
+        assert_eq!(back.into_record().unwrap().capabilities(), None);
+        let too_many: Vec<_> = (0..=Capability::ALL.len()).map(|_| "CAP_KILL").collect();
+        for bad in [
+            serde_json::json!(["CAP_NOPE"]),
+            serde_json::json!(["cap_kill"]),
+            serde_json::json!(["CAP_SYS_ADMIN"]),
+            serde_json::json!(too_many),
+        ] {
+            let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+            v["capabilities"] = bad;
+            let dto: LaunchIsolationDto = serde_json::from_value(v).unwrap();
+            assert!(dto.into_record().is_err());
+        }
+        let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+        v["capabilities"] = serde_json::json!("CAP_KILL");
+        assert!(serde_json::from_value::<LaunchIsolationDto>(v).is_err());
+        // 明示的な null は旧記録ではなく破損（SEC-1 fail-closed）。
+        let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+        v["capabilities"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<LaunchIsolationDto>(v).is_err());
     }
 
     /// CORE-6・SEC-5・#2388: ID 写像の記録が JSON の具体値で往復し、無い旧記録は記録なし、

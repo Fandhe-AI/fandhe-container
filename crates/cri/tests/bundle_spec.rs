@@ -233,6 +233,97 @@ fn user_mapping() {
     assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
 }
 
+/// CRI-2・SEC-1（#2666）: drop_capabilities は OCI 既定集合から除いた集合を 3 集合へ書き、core で読み戻せる。
+#[test]
+fn cri2_drop_capabilities_acceptance() {
+    let caps = |names: &[&str]| {
+        let names: Vec<String> = names.iter().map(|n| (*n).to_owned()).collect();
+        with_sc(|sc| {
+            sc.capabilities = Some(Capability {
+                drop_capabilities: names,
+                ..Default::default()
+            });
+        })
+    };
+    let read_back = |c: &ContainerConfig| {
+        let json = build_runtime_config(&pod(), c, &ImageDefaults::default()).expect("build");
+        let v: Value = serde_json::from_slice(json.as_bytes()).unwrap();
+        let cfg = oci_runtime::parse_config_bytes(json.as_bytes()).expect("core parses it");
+        assert!(
+            cfg.unapplied_fields().is_empty(),
+            "{:?}",
+            cfg.unapplied_fields()
+        );
+        let core: Vec<&str> = cfg.capabilities().iter().map(|c| c.as_str()).collect();
+        (v, core)
+    };
+    let names_of = |v: &Value, key: &str| -> Vec<String> {
+        v["process"]["capabilities"][key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap().to_owned())
+            .collect()
+    };
+    // 指定なしは capabilities を書かない（core の既定の 14 個）。
+    assert!(
+        build(&pod(), &ctr())["process"]
+            .get("capabilities")
+            .is_none()
+    );
+
+    // NET_RAW だけ drop: 既定 14 個から 13 個。
+    let (v, core) = read_back(&caps(&["NET_RAW"]));
+    let want = [
+        "CAP_CHOWN",
+        "CAP_DAC_OVERRIDE",
+        "CAP_FOWNER",
+        "CAP_FSETID",
+        "CAP_KILL",
+        "CAP_SETGID",
+        "CAP_SETUID",
+        "CAP_SETPCAP",
+        "CAP_NET_BIND_SERVICE",
+        "CAP_SYS_CHROOT",
+        "CAP_MKNOD",
+        "CAP_AUDIT_WRITE",
+        "CAP_SETFCAP",
+    ];
+    for key in ["bounding", "effective", "permitted"] {
+        assert_eq!(names_of(&v, key), want, "{key}");
+    }
+    assert!(v["process"]["capabilities"].get("ambient").is_none());
+    assert!(v["process"]["capabilities"].get("inheritable").is_none());
+    assert_eq!(core, want);
+
+    // 小文字・CAP_ 接頭辞つき・重複は同じ扱い。MKNOD も落ちて 12 個。
+    let (_, core) = read_back(&caps(&["cap_net_raw", "CAP_MKNOD", "net_raw"]));
+    assert_eq!(core.len(), 12);
+    assert!(!core.contains(&"CAP_NET_RAW") && !core.contains(&"CAP_MKNOD"));
+
+    // ALL は全 drop（3 集合とも空）。
+    let (v, core) = read_back(&caps(&["ALL"]));
+    assert!(names_of(&v, "bounding").is_empty() && names_of(&v, "permitted").is_empty());
+    assert!(core.is_empty());
+
+    // 既定に無い capability の drop は no-op（14 個のまま）。
+    let (_, core) = read_back(&caps(&["SYS_ADMIN"]));
+    assert_eq!(core.len(), 14);
+
+    // 未知名・空・長すぎる名前・非 ASCII は INVALID_ARGUMENT で、名前をエラーに載せない。
+    for bad in ["NOPE", "", "CAP_", "A".repeat(33).as_str(), "ＫＩＬＬ"] {
+        let e = build_runtime_config(&pod(), &caps(&[bad]), &ImageDefaults::default())
+            .expect_err("must be rejected");
+        assert_eq!(e.code(), CriErrorCode::InvalidArgument, "{bad:?}");
+        if !bad.is_empty() {
+            assert!(!e.to_string().contains(bad), "{bad:?}");
+        }
+    }
+    // 検証段（validate_config）でも同じく拒否する。
+    assert!(validate_config(&pod(), &caps(&["NOPE"])).is_err());
+    assert!(validate_config(&pod(), &caps(&["NET_RAW"])).is_ok());
+}
+
 /// CRI-2・SEC-5（#2664）: run_as_username は解決済みの (uid, gid) を採り、形式・相互排他・未解決を拒否する。
 #[test]
 fn run_as_username_acceptance() {
@@ -707,9 +798,10 @@ fn rejection_table_is_unimplemented() {
             }),
         ),
         (
-            "drop caps",
+            "add caps with drop",
             Box::new(|sc| {
                 sc.capabilities = Some(Capability {
+                    add_capabilities: vec!["SYS_ADMIN".into()],
                     drop_capabilities: vec!["ALL".into()],
                     ..Default::default()
                 });

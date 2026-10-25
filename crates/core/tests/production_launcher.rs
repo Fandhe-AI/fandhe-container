@@ -794,6 +794,7 @@ mod linux {
         }
         scenario_j_exec_restrictions(&env, tag);
         scenario_k_seccomp_kill_after_exec(&env, tag);
+        scenario_t_capabilities_drop(&env, tag);
         scenario_l_working_dir(&env, tag);
         scenario_m_n_working_dir_refused(&env, tag);
         scenario_o_user_outside_mapping_refused(&env, tag);
@@ -1908,6 +1909,74 @@ mod linux {
                 "post-exec umount2 EPERM"
             );
             println!("production_launcher: scenario=j pid={pid} post-exec caps and seccomp ok");
+        }));
+        finish_started(started, verified);
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ T: `process.capabilities` の drop が exec 後の PID 1 に効く（#2666・SEC-1・CRI-2）。
+    /// 3 集合を「OCI 既定 - CAP_NET_RAW - CAP_MKNOD」にすると、`CapPrm`・`CapEff`・`CapBnd` が
+    /// `0xa80425fb` から bit 13・27 を除いた `0xa00405fb` になり、`CapInh`・`CapAmb` は 0 のまま。
+    fn scenario_t_capabilities_drop(env: &Env, tag: u32) {
+        const DROPPED_MASK: u64 = 0x0000_0000_a004_05fb;
+        let names: Vec<&str> = OCI_DEFAULT_CAPABILITIES
+            .iter()
+            .filter(|c| c.as_str() != "CAP_NET_RAW" && c.as_str() != "CAP_MKNOD")
+            .map(|c| c.as_str())
+            .collect();
+        let bundle = Bundle::new("t");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--with-restrictions"], json!([]));
+        let path = bundle.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read config")).expect("json");
+        config["process"]["capabilities"] =
+            json!({"bounding": names, "effective": names, "permitted": names});
+        std::fs::write(&path, serde_json::to_vec(&config).expect("serialize")).expect("write");
+        let id = ContainerId::new(format!("plv{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let output = started.process().take_output().expect("container output");
+            let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+            reader_slot = Some((rx, reader));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            for (key, want) in [
+                ("CapInh", 0),
+                ("CapAmb", 0),
+                ("CapPrm", DROPPED_MASK),
+                ("CapEff", DROPPED_MASK),
+                ("CapBnd", DROPPED_MASK),
+            ] {
+                assert_eq!(
+                    cap_value(value_of(&lines, &format!("CAP {key}"))),
+                    want,
+                    "in-container {key}"
+                );
+                let host = status_field(&format!("/proc/{pid}/status"), &format!("{key}:"))
+                    .unwrap_or_else(|| panic!("host {key} missing"));
+                assert_eq!(cap_value(&host), want, "host view of {key}");
+            }
+            println!(
+                "production_launcher: capabilities drop applied (scenario=T pid={pid} cap_eff=0xa00405fb)"
+            );
         }));
         finish_started(started, verified);
         let (rx, reader) = reader_slot.take().expect("reader slot");

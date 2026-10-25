@@ -241,6 +241,9 @@ pub(crate) trait DeleteOps {
         dir: &NetnsDirRecord,
         endpoint: &EndpointId,
     ) -> Result<bool, PinCheckError>;
+    /// 固定設定の置き場 `dir` を検査して開き、直下に `endpoint` 名の pin が無いことを確かめる
+    /// （`Ok(true)` が不存在。置き場を検査できない・判定できない場合は `Err`。何も変更しない。#2681）。
+    fn pin_absent(&self, dir: &Path, endpoint: &EndpointId) -> Result<bool, NetError>;
     /// 専用テーブルのハンドルとユーザーデータ（所有トークン）を引く（読み取り専用の照会）。無ければ `NotFound`。
     fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError>;
     /// 専用テーブルをハンドル指定で削除する（配下の chain・ルールも消える）。名前では消さない。
@@ -842,11 +845,30 @@ pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
         let pin = netns_dir.join(claim.endpoint().as_str());
         let res = DeleteResource::Netns(pin.clone());
         let veth_res = DeleteResource::Veth(veth_names.host().clone());
-        let proven: Result<(), NetError> = if claim.pin().is_none() {
-            Err(precondition(
-                "claim has no pin identity; netns pin left in place",
-            ))
-        } else if claim.includes_veth() {
+        // 識別子を控えていない請求書（`create_pinned` のタイムアウト等）は pin を外せない。ただし固定設定の
+        // 置き場で pin の不存在を安全に確認できたら、回収済みとして冪等に扱う（回収側が既に消した場合に
+        // detach / delete_network が永久に未回収扱いになるのを避ける）。存在する・確認できないなら拒否する。
+        if claim.pin().is_none() {
+            match ops.pin_absent(netns_dir, claim.endpoint()) {
+                Ok(true) => report.removed.push(res),
+                Ok(false) => {
+                    report.leftover.push((res, ResourceState::Unknown));
+                    failures.note(
+                        precondition("claim has no pin identity; netns pin left in place"),
+                        DeleteStep::UnpinNetns,
+                    );
+                }
+                Err(e) => {
+                    report.leftover.push((res, ResourceState::Unknown));
+                    failures.note(e, DeleteStep::UnpinNetns);
+                }
+            }
+            return match failures.first {
+                None => Ok(report),
+                Some((error, step)) => Err(fail(error, step, report, Vec::new())),
+            };
+        }
+        let proven: Result<(), NetError> = if claim.includes_veth() {
             if report.removed.contains(&veth_res) {
                 Ok(())
             } else {
@@ -1068,6 +1090,10 @@ impl DeleteOps for LinuxDeleteOps<'_> {
         endpoint: &EndpointId,
     ) -> Result<bool, PinCheckError> {
         netns::pin_exists_in(dir.path(), dir.dir_id(), endpoint)
+    }
+
+    fn pin_absent(&self, dir: &Path, endpoint: &EndpointId) -> Result<bool, NetError> {
+        netns::pin_absent_in(dir, endpoint)
     }
 
     fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError> {
@@ -1346,6 +1372,14 @@ mod tests {
                 return Err(PinCheckError::Pin(err(NetErrorCode::Internal)));
             }
             Ok(self.pins_present.iter().any(|p| p == &path))
+        }
+        fn pin_absent(&self, dir: &Path, endpoint: &EndpointId) -> Result<bool, NetError> {
+            let path = dir.join(endpoint.as_str());
+            self.rec(format!("pin_absent {}", path.display()));
+            if self.pin_check_err {
+                return Err(err(NetErrorCode::Internal));
+            }
+            Ok(!self.pins_present.iter().any(|p| p == &path))
         }
         fn table_info(&self, table: &NftName) -> Result<TableInfo, NetError> {
             self.rec(format!("table_info {}", table.as_str()));
@@ -2588,17 +2622,48 @@ mod tests {
         assert!(e.report.removed.is_empty());
     }
 
-    /// NET-1・#2681: pin の識別子を控えていない請求書では pin に触れない。
+    /// NET-1・#2681: pin の識別子を控えていない請求書では、pin が残っていれば触れず拒否する。
     #[test]
     fn net1_reclaim_attach_without_pin_identity_leaves_pin() {
         let fake = Fake {
             absent_veths: vec![host_of("c1").as_str().to_owned()],
+            pins_present: vec![pin("c1")],
             ..Default::default()
         };
         let claim = attach_claim(false, true, false).with_pin_for_test(None);
         let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
         assert_eq!(e.step, DeleteStep::UnpinNetns);
         assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Netns(pin("c1")), ResourceState::Unknown)]
+        );
+    }
+
+    /// NET-1・#2681: 識別子の無い請求書でも、pin の不存在を確認できたら回収済みとして冪等に成功する。
+    #[test]
+    fn net1_reclaim_attach_without_pin_identity_succeeds_when_pin_absent() {
+        let fake = Fake {
+            absent_veths: vec![host_of("c1").as_str().to_owned()],
+            ..Default::default()
+        };
+        let claim = attach_claim(false, true, false).with_pin_for_test(None);
+        let report = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap();
+        assert_eq!(report.removed, vec![DeleteResource::Netns(pin("c1"))]);
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
+    }
+
+    /// NET-1・#2681: 不存在を確認できない（置き場の検査失敗）なら回収済みとせず拒否する。
+    #[test]
+    fn net1_reclaim_attach_without_pin_identity_unverifiable_is_refused() {
+        let fake = Fake {
+            pin_check_err: true,
+            ..Default::default()
+        };
+        let claim = attach_claim(false, true, false).with_pin_for_test(None);
+        let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert_eq!(e.error.code(), NetErrorCode::Internal);
     }
 
     /// NET-1・#2681: 別名と master が一致する veth は、照会で得た ifindex で消え、pin はパス指定で外れる。

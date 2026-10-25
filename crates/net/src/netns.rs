@@ -945,6 +945,20 @@ pub(crate) fn pin_exists_in(
         Err(e) => Err(PinCheckError::Pin(io_error("stat netns pin", &e))),
     }
 }
+/// 固定設定の置き場 `dir` の直下に `id` 名の pin が無いことを確かめる（attach の取り残しの回収用。#2681）。
+///
+/// 置き場は作成時と同じ検査（[`open_pin_dir`]）を通して fd で固定し、固定した fd 経由で `lstat` する。
+/// 不存在（`NotFound`）だけが `Ok(true)`、存在すれば `Ok(false)`、置き場を検査できない・判定できない場合は
+/// `Err`（不存在を証明できないので呼び出し側は何も変更しない）。何も変更しない。
+pub(crate) fn pin_absent_in(dir: &Path, id: &EndpointId) -> Result<bool, NetError> {
+    let pinned = open_pin_dir(dir)?;
+    match fs::symlink_metadata(pinned.entry(std::ffi::OsStr::new(id.as_str()))) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(io_error("stat netns pin", &e)),
+    }
+}
+
 /// pin ファイルの実体検査（OS 呼び出しを含まない純粋関数）。`create_pinned` が作る形
 /// （通常ファイル・実効 UID 所有・mode `0o400`・空）だけを許す。
 fn check_pin_file_attrs(

@@ -271,8 +271,8 @@ impl ReclaimStore {
     ///
     /// 一致の照合と書き込みを同じプロセス間ロックの下で行う比較交換。古い請求書を読んだ側が、遅れて
     /// quarantine だけの記録へ更新しようとしても、その間に別プロセスが同じ endpoint の新しい世代の請求書を
-    /// 保存していれば、上書きせず新しい請求書を保持する（NET-1）。記録が無い・中身が違うときは何も書かずに成功する
-    /// （回収済み、または新しい世代に置き換わっている）。読めない記録は失敗する。
+    /// 保存していれば、上書きせず `FailedPrecondition` で失敗する（NET-1。成功扱いにして追跡を外させない）。
+    /// 記録が無いときは `record` を書く。読めない記録は失敗する。
     pub fn update_attach_if_matches(
         &self,
         endpoint: &str,
@@ -287,7 +287,16 @@ impl ReclaimStore {
         let _lock = self.lock()?;
         match read_record(&file) {
             ReadOutcome::Record(current) if current == expected => {}
-            ReadOutcome::Missing | ReadOutcome::Record(_) => return Ok(()),
+            // 記録が無い: 追跡している quarantine を持つのは自分だけなので、quarantine の記録を書き戻す。
+            ReadOutcome::Missing => {}
+            // 別世代の請求書に置き換わっている。成功扱いにすると呼び出し側が追跡を外し、新しい世代の資源が
+            // 追跡外になるため、何も書かずに失敗する（呼び出し側はメモリ上の請求書を書き換えない）。
+            ReadOutcome::Record(_) => {
+                return Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "reclaim record was replaced by another claim; reload required",
+                ));
+            }
             ReadOutcome::Unreadable => {
                 return Err(internal("failed to read the reclaim record"));
             }
@@ -707,7 +716,7 @@ mod tests {
         fs::remove_dir_all(&root).expect("cleanup");
     }
 
-    /// NET-1・#2681: 条件付き更新は中身が一致するときだけ置き換え、別世代の記録・記録なしでは書かない。
+    /// NET-1・#2681: 条件付き更新は中身が一致するときだけ置き換え、別世代の記録は失敗し、記録なしは書き戻す。
     #[test]
     fn net1_store_attach_update_if_matches_is_compare_and_swap() {
         let root = temp_root("attach-cas");
@@ -717,7 +726,7 @@ mod tests {
         // 別プロセスが新しい世代の請求書を保存した後に、遅れた旧世代の更新が走る。
         s.save_attach("c1", "gen-2\n").expect("save gen-2");
         s.update_attach_if_matches("c1", "gen-1\n", "gen-1-quarantine\n")
-            .expect("stale update is a no-op");
+            .expect_err("stale update is refused");
         assert_eq!(fs::read_to_string(&file).expect("read"), "gen-2\n");
         // 一致すれば置き換わる。
         s.update_attach_if_matches("c1", "gen-2\n", "gen-2-quarantine\n")
@@ -726,12 +735,12 @@ mod tests {
             fs::read_to_string(&file).expect("read"),
             "gen-2-quarantine\n"
         );
-        // 記録が無ければ作らない。
+        // 記録が無ければ quarantine の記録を書き戻す。
         s.remove_attach_if_matches("c1", "gen-2-quarantine\n")
             .expect("remove");
         s.update_attach_if_matches("c1", "gen-2\n", "x\n")
-            .expect("missing is a no-op");
-        assert!(!file.exists());
+            .expect("missing writes back");
+        assert_eq!(fs::read_to_string(&file).expect("read"), "x\n");
         fs::remove_dir_all(&root).expect("cleanup");
     }
 

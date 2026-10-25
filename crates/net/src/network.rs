@@ -1283,6 +1283,17 @@ pub struct AttachRollbackReport {
     pub leftover: Vec<(AttachResource, ResourceState)>,
 }
 
+/// 回収用の請求書の元になる、接続の所有情報（[`ContainerAttachError`] の非公開フィールド）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachOwner {
+    network: NetworkName,
+    token: String,
+    endpoint: EndpointId,
+    generation: String,
+    /// 失敗の時点で控えた取り残し pin の実体の識別子（請求書の生成時に採り直さない）。
+    pin: Option<attach_claim::PinIdentity>,
+}
+
 /// コンテナ接続の失敗（元のエラー・失敗手順・ロールバック結果。ERR-1）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1296,15 +1307,22 @@ pub struct ContainerAttachError {
     /// この接続のネットワーク名・bridge の所有トークン・endpoint。回収用の請求書
     /// （[`FailedAttachClaim`]）の元になるためだけに保持し、公開しない（#2681）。
     /// `Err` の型を大きくしないため Box にする。
-    owner: Option<Box<(NetworkName, String, EndpointId, String)>>,
+    owner: Option<Box<AttachOwner>>,
 }
 
 impl ContainerAttachError {
     /// 取り残した資源（`rollback.leftover`）の回収用の請求書。取り残しが無ければ `None`。
     /// quarantine（アドレス・DNAT ルール・ポート予約）はプロセス内の保持で、カーネル側の回収対象ではない。
     pub fn reclaim_claim(&self) -> Option<FailedAttachClaim> {
-        let (network, token, endpoint, generation) = &**self.owner.as_ref()?;
-        FailedAttachClaim::from_error(network, token, endpoint, generation, self)
+        let o = &**self.owner.as_ref()?;
+        FailedAttachClaim::from_error(
+            &o.network,
+            &o.token,
+            &o.endpoint,
+            &o.generation,
+            o.pin,
+            self,
+        )
     }
 
     /// 機械可読な分類。
@@ -1542,16 +1560,28 @@ pub(crate) fn attach_container_with_generation<O: AttachOps>(
     ports: &mut PortRegistry,
     generation: &str,
 ) -> Result<AttachedContainer<O::Netns>, ContainerAttachError> {
-    let fail = |error, step, rollback| ContainerAttachError {
-        error,
-        step,
-        rollback,
-        owner: Some(Box::new((
-            spec.network.clone(),
-            spec.bridge_token.clone(),
-            spec.endpoint.clone(),
-            generation.to_owned(),
-        ))),
+    let fail = |error, step, rollback: AttachRollbackReport| {
+        // 取り残した pin の識別子は、この失敗の時点で控える（請求書の生成時に採り直さない。NET-1）。
+        let pin = rollback
+            .leftover
+            .iter()
+            .find_map(|(r, _)| match r {
+                AttachResource::Netns(path) => Some(path.as_path()),
+                _ => None,
+            })
+            .and_then(attach_claim::pin_identity_of);
+        ContainerAttachError {
+            error,
+            step,
+            rollback,
+            owner: Some(Box::new(AttachOwner {
+                network: spec.network.clone(),
+                token: spec.bridge_token.clone(),
+                endpoint: spec.endpoint.clone(),
+                generation: generation.to_owned(),
+                pin,
+            })),
+        }
     };
     let names = VethNames::derive(&spec.endpoint)
         .map_err(|e| fail(e, AttachStep::DeriveNames, AttachRollbackReport::default()))?;

@@ -85,6 +85,7 @@ impl FailedAttachClaim {
         token: &str,
         endpoint: &EndpointId,
         generation: &str,
+        pin: Option<PinIdentity>,
         err: &ContainerAttachError,
     ) -> Option<Self> {
         let has = |f: fn(&AttachResource) -> bool| err.rollback.leftover.iter().any(|(r, _)| f(r));
@@ -98,16 +99,8 @@ impl FailedAttachClaim {
                     | AttachResource::PortReservation(..)
             )
         });
-        // 取り残した pin の実体を、失敗した接続の記録から控える（特定できなければ `None`。回収は拒否される）。
-        let pin = err
-            .rollback
-            .leftover
-            .iter()
-            .find_map(|(r, _)| match r {
-                AttachResource::Netns(path) => Some(path.as_path()),
-                _ => None,
-            })
-            .and_then(pin_identity_of);
+        // pin の識別子は失敗した接続の時点（`attach_container` の失敗構築時）で固定済みのものを使う。
+        // 呼出時点のパスから採り直すと、再接続された別の pin を取り込んでしまう（世代保護。NET-1）。
         (veth || netns || quarantine).then(|| Self {
             network: network.clone(),
             token: token.to_owned(),
@@ -294,12 +287,12 @@ pub(super) fn pin_record_value(path: &std::path::Path) -> String {
 
 /// 取り残した pin のパスから、作成した pin の識別子を控える（Linux のみ。他 OS は常に `None`）。
 #[cfg(target_os = "linux")]
-fn pin_identity_of(path: &std::path::Path) -> Option<PinIdentity> {
+pub(super) fn pin_identity_of(path: &std::path::Path) -> Option<PinIdentity> {
     crate::netns::pin_identity(path).ok().flatten()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pin_identity_of(_path: &std::path::Path) -> Option<PinIdentity> {
+pub(super) fn pin_identity_of(_path: &std::path::Path) -> Option<PinIdentity> {
     None
 }
 

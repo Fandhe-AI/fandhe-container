@@ -34,6 +34,7 @@
 use std::fmt;
 
 use crate::audit_log::{AuditCoverage, AuditCoveragePolicy};
+use crate::capabilities::ContainerCapabilities;
 use crate::dev_mounts::{IMPLICIT_DEV_MOUNT_COUNT, ImplicitDevMount};
 use crate::oci_runtime::{CONFIG_MAX_MOUNTS, MountDestination};
 
@@ -500,6 +501,7 @@ pub struct LaunchIsolationRecord {
     audit_coverage: RecordedAuditCoverage,
     audit_coverage_record: AuditCoverageRecordOutcome,
     id_mapping: Option<RecordedIdMapping>,
+    capabilities: Option<ContainerCapabilities>,
 }
 
 impl LaunchIsolationRecord {
@@ -511,7 +513,22 @@ impl LaunchIsolationRecord {
             audit_coverage: RecordedAuditCoverage::NotRecorded,
             audit_coverage_record: AuditCoverageRecordOutcome::NotFailed,
             id_mapping: None,
+            capabilities: None,
         }
+    }
+
+    /// launch が適用した capability の許可集合を添える（SEC-1・CRI-2・#2666）。exec の再適用がこの集合を使い、
+    /// launch より広い集合では動かさない。添えなければ `None`（導入前の launch は必ず OCI 既定集合で起動したため、
+    /// exec は `None` を OCI 既定集合として扱う）。
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: ContainerCapabilities) -> Self {
+        self.capabilities = Some(capabilities);
+        self
+    }
+
+    /// 添えられた capability の許可集合（無ければ `None`）。
+    pub fn capabilities(&self) -> Option<ContainerCapabilities> {
+        self.capabilities
     }
 
     /// launch が使った ID 写像の記録を添える（CORE-6・#2388）。添えなければ `None`（旧記録と同じ。「single」とは推測しない）。

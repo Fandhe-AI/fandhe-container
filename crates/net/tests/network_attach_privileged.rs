@@ -17,6 +17,10 @@
 //!   続けて host 側 veth 名を事前に作っておき `AlreadyExists` で失敗させ、pin ファイルが消え、事前作成の
 //!   veth が残ることでロールバック（他者のリソースを消さない）を確認する
 //!
+//! `delete_network` の前に、attach の取り残しの回収（`reclaim_failed_attach`。#2681）を確かめる。c4 を接続し、
+//! 請求書の記録の復号から回収して veth が `NotFound`・pin が消えること（2 回目も成功する冪等性）と、別名のない他者の veth は
+//! 請求書に載っても消えないことを具体値で照合する。
+//!
 //! 最後に `delete_network`（TASK-139.4・#317）で c1 と c3 を渡してネットワークを削除し、bridge・host 側 veth が
 //! `NotFound`、`nft list table` の失敗、pin ファイルの消滅、IPAM・ポート予約が空であることを具体値で照合する
 //! （渡していない c2 の事前作成 veth は IPAM に無く、削除の対象外）。続けて空の `containers` での再実行が成功する（冪等）。
@@ -63,16 +67,16 @@ mod linux {
         NetlinkRouteSocket, NlMsgBuilder, RTM_GETLINK, RTM_NEWLINK,
     };
     use fandhe_container_net::network::{
-        AttachResource, AttachStep, ContainerAttachSpec, CreateStep, EndpointId, NetworkCreateSpec,
-        NetworkName, PortProtocol, PortPublish, PortRegistry, StaticIpam, VethNames,
-        attach_container, create_network, delete_network,
+        AttachResource, AttachStep, ContainerAttachSpec, CreateStep, DeleteStep, EndpointId,
+        FailedAttachClaim, NetworkCreateSpec, NetworkName, PortProtocol, PortPublish, PortRegistry,
+        StaticIpam, VethNames, attach_container, create_network, delete_network,
+        reclaim_failed_attach,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
     const LAUNCHER_PID_ENV: &str = "FANDHE_ATTACH_TEST_LAUNCHER_PID";
     const DIR_ENV: &str = "FANDHE_ATTACH_TEST_DIR";
-    const OK_LINE: &str =
-        "network_attach_privileged: ok master=bridge host=up peer=moved pin=bound rollback=clean";
+    const OK_LINE: &str = "network_attach_privileged: ok master=bridge host=up peer=moved pin=bound rollback=clean reclaim_attach=ok reclaim_attach_foreign=kept";
     /// 新規 netns にカーネルが自動生成するフォールバックトンネルデバイス（有無は環境で変わる）。
     const FALLBACK_TUNNEL_DEVICES: [&str; 10] = [
         "tunl0",
@@ -496,6 +500,64 @@ mod linux {
                 "expected 2 DNAT rules (prerouting and output), found {dnat_lines} in:\n{ruleset}"
             )));
         }
+
+        // --- attach の取り残しの回収（NET-1・#2681）: 請求書の記録から、所有を確かめて veth と pin を回収する ---
+        let c4 = EndpointId::new("c4")?;
+        let spec4 = ContainerAttachSpec::new(c4.clone(), &net, base.clone())?;
+        let attached4 = attach_container(&route, &nft, &spec4, &mut ipam, &mut ports, t)
+            .map_err(|e| fail(format!("attach c4 failed at {:?}: {e}", e.step)))?;
+        let host4 = attached4.host_veth.clone();
+        let pin4 = attached4.netns_path.clone();
+        let record = format!(
+            "fandhe-net-attach-claim v1\nnetwork=att\nendpoint=c4\ntoken={}\nveth=1\nnetns=1\nquarantine=0\n",
+            net.bridge_token
+        );
+        let claim4 = FailedAttachClaim::from_record(&record)?;
+        for round in 0..2 {
+            // 2 回目は何も残っていない状態での再実行で、冪等に成功する。
+            reclaim_failed_attach(&route, &nft, &claim4, &base, t).map_err(|e| {
+                fail(format!(
+                    "reclaim_failed_attach (round {round}) failed at {:?}: {e}; report: {:?}",
+                    e.step, e.report
+                ))
+            })?;
+        }
+        if !matches!(
+            route.link_index(&host4, t),
+            Err(ref e) if e.code() == NetErrorCode::NotFound
+        ) {
+            return Err(fail("reclaimed veth still exists"));
+        }
+        if pin4.exists() {
+            return Err(fail("reclaimed pin still exists"));
+        }
+        ipam.release(&c4)?;
+        drop(attached4);
+        // 別名のない（他者の）veth は、請求書に載っていても消さない。
+        let c5 = EndpointId::new("c5")?;
+        let names5 = VethNames::derive(&c5)?;
+        route.create_link(
+            &LinkCreate::veth(names5.host().clone(), IfName::new("fxpre1")?)?,
+            t,
+        )?;
+        let record5 = record
+            .replace("endpoint=c4", "endpoint=c5")
+            .replace("netns=1", "netns=0");
+        let e = match reclaim_failed_attach(
+            &route,
+            &nft,
+            &FailedAttachClaim::from_record(&record5)?,
+            &base,
+            t,
+        ) {
+            Err(e) => e,
+            Ok(_) => return Err(fail("reclaim of a foreign veth unexpectedly succeeded")),
+        };
+        if e.step != DeleteStep::DeleteVeth {
+            return Err(fail(format!("unexpected reclaim step {:?}", e.step)));
+        }
+        link_state(&route, names5.host().as_str())
+            .map_err(|_| fail("a foreign veth must not be deleted by the reclaim"))?;
 
         // --- ネットワーク削除（TASK-139.4・#317）: bridge・veth・netns pin・nft テーブル・予約が解放される ---
         let hosts = [attached.host_veth.clone(), attached3.host_veth.clone()];

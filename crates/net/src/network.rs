@@ -63,6 +63,9 @@
 //! FNV-1a 下位 44bit hex 11 桁（[`VethNames`]。互換性に関わる契約）。veth には所有トークンを付けられない
 //! ため `NLM_F_EXCL` 作成 + 直後の ifindex 確保 + ifindex 指定の削除で運用する（`attach_container_with` の doc）。
 //!
+//! 失敗して取り残した veth・pin は `ContainerAttachError::reclaim_claim` の請求書（[`FailedAttachClaim`]）で
+//! `reclaim_failed_attach`（Linux のみ。#2681）から回収できる（`delete` モジュール doc「attach の取り残しの回収」）。
+//!
 //! 接続の最後に [`StaticIpam`]（`ipam`。TASK-139.2.2・#848）で重複しない IPv4 アドレスを払い出す。
 //! 払い出しに失敗（枯渇 `ResourceExhausted` 等）したら veth と netns を戻す。IPAM の状態は呼び出し側が
 //! 所有し、接続失敗時は変更されない。
@@ -104,9 +107,12 @@
 //!   `ip_forward` が別途必要（本 crate は host のグローバル設定を変更しない）。担当 Issue 未確定
 //! - peer の `eth0` へのリネーム（`LinkSet` に `IFLA_IFNAME` 変更が無い）、コンテナ単位のポート公開解除
 //!   （ルールハンドルの取得経路が無い）、`RTM_DELROUTE` / `RTM_DELADDR`。担当 Issue 未確定
-//! - IPAM 状態の永続化とプロセスをまたぐ残置 pin の清掃、コンテナ単体の切り離し。担当 Issue 未確定（作成失敗の請求書の永続化は #2604 で済み）
+//! - IPAM 状態の永続化とプロセスをまたぐ残置 pin の清掃、コンテナ単体の切り離し。担当 Issue 未確定（作成失敗の請求書の永続化は #2604 で済み。
+//!   attach の取り残しの請求書 [`FailedAttachClaim`] と所有確認つきの回収 `reclaim_failed_attach` は #2681 で追加。回収できるのは host 側 veth と、
+//!   同じプロセスで作った pin まで。再起動後の pin・ネットワーク本体は手動。write-ahead は #1870 の後に再検討）
 //! - IPv6 と `NftFamily::Inet`（IPv4 のみ。静的 IPAM が IPv4 のみのため）
 
+pub mod attach_claim;
 pub mod delete;
 pub mod ipam;
 pub mod publish;
@@ -117,8 +123,11 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
+pub use attach_claim::FailedAttachClaim;
 #[cfg(target_os = "linux")]
 pub use delete::delete_network;
+#[cfg(target_os = "linux")]
+pub use delete::reclaim_failed_attach;
 #[cfg(target_os = "linux")]
 pub use delete::reclaim_failed_create;
 pub use delete::{DeleteResource, DeleteStep, NetworkDeleteError, NetworkDeleteReport};
@@ -1276,9 +1285,20 @@ pub struct ContainerAttachError {
     pub step: AttachStep,
     /// ロールバックの結果。
     pub rollback: AttachRollbackReport,
+    /// この接続のネットワーク名・bridge の所有トークン・endpoint。回収用の請求書
+    /// （[`FailedAttachClaim`]）の元になるためだけに保持し、公開しない（#2681）。
+    /// `Err` の型を大きくしないため Box にする。
+    owner: Option<Box<(NetworkName, String, EndpointId)>>,
 }
 
 impl ContainerAttachError {
+    /// 取り残した資源（`rollback.leftover`）の回収用の請求書。取り残しが無ければ `None`。
+    /// quarantine（アドレス・DNAT ルール・ポート予約）はプロセス内の保持で、カーネル側の回収対象ではない。
+    pub fn reclaim_claim(&self) -> Option<FailedAttachClaim> {
+        let (network, token, endpoint) = &**self.owner.as_ref()?;
+        FailedAttachClaim::from_error(network, token, endpoint, self)
+    }
+
     /// 機械可読な分類。
     pub fn code(&self) -> NetErrorCode {
         self.error.code()
@@ -1461,6 +1481,11 @@ pub(crate) fn attach_container_with<O: AttachOps>(
         error,
         step,
         rollback,
+        owner: Some(Box::new((
+            spec.network.clone(),
+            spec.bridge_token.clone(),
+            spec.endpoint.clone(),
+        ))),
     };
     let names = VethNames::derive(&spec.endpoint)
         .map_err(|e| fail(e, AttachStep::DeriveNames, AttachRollbackReport::default()))?;
@@ -3361,6 +3386,42 @@ mod attach_tests {
             [(AttachResource::Netns(pin_of("c1")), ResourceState::Unknown)]
         );
         assert!(e.rollback.removed.is_empty());
+    }
+
+    /// NET-1・#2681: 取り残しの種類ごとに請求書のフラグが決まる。取り残しが無ければ請求書は無い。
+    #[test]
+    fn net1_attach_error_reclaim_claim_flags() {
+        let f = Fake {
+            fail_netns: Some((NetErrorCode::Timeout, Some(ResourceState::Unknown))),
+            ..Default::default()
+        };
+        let e = attach_container_with(&f, &spec("c1"), &mut ipam(), &mut PortRegistry::new())
+            .unwrap_err();
+        let claim = e.reclaim_claim().unwrap();
+        assert_eq!(claim.endpoint().as_str(), "c1");
+        assert_eq!(claim.network().as_str(), "web");
+        assert!(!claim.includes_veth() && claim.includes_netns() && !claim.includes_quarantine());
+        assert_eq!(
+            FailedAttachClaim::from_record(&claim.to_record()),
+            Ok(claim)
+        );
+
+        let mut e = e;
+        e.rollback.leftover = vec![
+            (
+                AttachResource::Veth(VethNames::derive(&eid("c1")).unwrap().host().clone()),
+                ResourceState::Present,
+            ),
+            (
+                AttachResource::PortReservation(NetworkName::new("web").unwrap(), eid("c1")),
+                ResourceState::Present,
+            ),
+        ];
+        let claim = e.reclaim_claim().unwrap();
+        assert!(claim.includes_veth() && !claim.includes_netns() && claim.includes_quarantine());
+
+        e.rollback.leftover.clear();
+        assert_eq!(e.reclaim_claim(), None);
     }
 
     /// NET-1: veth の AlreadyExists は他者のリソースなので削除せず、netns だけ戻す。

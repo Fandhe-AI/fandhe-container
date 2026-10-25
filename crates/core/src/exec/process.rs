@@ -55,7 +55,7 @@
 //! - **エントリポイントは fd に固定して `execveat` する**: 検査（`/proc/self/exe` との同一性）と実行の
 //!   間にパスが差し替わる TOCTOU を防ぐ。読み取り権限のない実行専用バイナリは開けず拒否される。
 //!   fd は 3 以上に置く。稼働中コンテナへの exec の子は、照合した本体を封印した memfd へ複製し
-//!   （`sealed_copy.rs`。TASK-163 追補・#1531）、解析・照合・実行を複製に対して行う（launch は複製しない。常駐するワークロードのメモリ増を避ける設計判断。CORE-7〜9。launch への適用の追跡は #2687）。
+//!   （`sealed_copy.rs`。TASK-163 追補・#1531）、解析・照合・実行を複製に対して行う（launch は複製しない。常駐するワークロードのメモリ増を避ける設計判断。CORE-7〜9。launch に適用しない判断は `docs/design/launch-sealed-copy.md`・#2687）。
 //!   上限超過・封印の検証失敗は違反で拒否する。シェバン付きスクリプトは、インタープリタが開き直す新 root の
 //!   `/dev/fd/N` が同じ実体を指さなければ `FailedPrecondition` で拒否する（`/dev/fd` は `create_default_devices`〔#834・#1297〕が用意する。本番の launch 経路は呼ぶ。最小入口 `spawn_container` は呼ばない）
 //! - **fork の健全性は `sys::fork_single_threaded` が強制する**: 呼び出し元が `Threads: 1`
@@ -479,7 +479,7 @@ pub fn exec_entrypoint(
 ///    検査から実行までの間のパス差し替え〔TOCTOU〕を防ぐ。稼働中コンテナへの exec の子〔`EntrypointSource::Switchable`〕
 ///    は、封印した複製を使える環境なら照合した本体を封印した memfd に複製し〔`sealed_copy.rs`。#1531〕、以降の解析・照合・
 ///    実行を複製に対して行う〔使えない環境は現行方式で、理由を記録する。オーナー判断 2026-10-09〕。
-///    launch は複製しない〔常駐メモリの設計判断。追跡は #2687〕。ランタイム自身の封印複製の判断記録は `docs/design/runtime-self-sealed-copy.md`〔#2686〕）。シェバンの連鎖・
+///    launch は複製しない〔適用しない判断。`docs/design/launch-sealed-copy.md`・#2687〕。ランタイム自身の封印複製の判断記録は `docs/design/runtime-self-sealed-copy.md`〔#2686〕）。シェバンの連鎖・
 ///    `PT_INTERP` の解決先がランタイムのバイナリなら同じく拒否する（#1458。`interpreter.rs`）
 /// 3. 開いたエントリポイントが fd 0〜2 と同一 inode なら拒否する（`/proc/self/fd/{0,1,2}` 経由の参照対策。
 ///    fd 0〜2 の実体を確認できなければ拒否。エントリポイントの fd は 3 以上に置く）。
@@ -732,7 +732,7 @@ impl ExecutableFd {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EntrypointSource {
     /// 照合した fd（元の inode）をそのまま `execveat` する。launch 経路（常駐するワークロードのメモリ増を避ける。
-    /// 封印した複製の適用は未着手で、追跡は #2687）。
+    /// 封印した複製は適用しない判断で、理由は `docs/design/launch-sealed-copy.md`・#2687）。
     Pinned,
     /// 稼働中コンテナへの exec。値（`prepare_exec_restrictions` が `setns` の前に作る判定。#1531）の方式に従い、
     /// 封印した memfd に複製して `execveat` するか、照合した元の fd をそのまま `execveat` する（現行方式。#1478）。

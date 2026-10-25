@@ -26,8 +26,10 @@ use std::sync::{Arc, Mutex};
 
 use fandhe_container_core::traits::ContainerId;
 
+use super::resolv_conf;
 use super::spec::{
-    ImageDefaults, build_runtime_config_with_pod_namespaces, validate_config_with_pod_namespaces,
+    BundleFiles, ImageDefaults, build_runtime_config_with_files_and_pod_namespaces,
+    validate_config_with_pod_namespaces,
 };
 use crate::adapter::{BundleProvider, BundleRequest};
 use crate::error::CriError;
@@ -262,20 +264,36 @@ fn create_private_dir(path: &Path) -> Result<(), CriError> {
     })
 }
 
-fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), CriError> {
+/// 既存・symlink を辿らず排他作成して書く。失敗の文言は固定（`what` はファイル名）。
+fn write_new_file(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    what: &'static str,
+) -> Result<(), CriError> {
     let mut o = fs::OpenOptions::new();
     o.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        o.mode(0o600);
+        o.mode(mode);
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     let mut f = o
         .open(path)
-        .map_err(|_| CriError::internal("failed to create config.json"))?;
+        .map_err(|_| CriError::internal(format!("failed to create {what}")))?;
+    // open 時の mode は umask で削られる（umask 077 だと 0644 が 0600 になる）。排他作成した自分のハンドルに
+    // 対して明示的に設定し直す（プロセス全体の umask は変えない）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        f.set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|_| CriError::internal(format!("failed to set permissions of {what}")))?;
+    }
     f.write_all(bytes)
         .and_then(|()| f.sync_all())
-        .map_err(|_| CriError::internal("failed to write config.json"))
+        .map_err(|_| CriError::internal(format!("failed to write {what}")))
 }
 
 impl BundleProvider for SpecBundleProvider {
@@ -310,13 +328,40 @@ impl BundleProvider for SpecBundleProvider {
         };
         let built = (|| {
             let defaults = self.rootfs.prepare(image, &rootfs, &user)?;
-            let json = build_runtime_config_with_pod_namespaces(
+            // dns_config: 検証済みの resolv.conf を bundle に書き、そのパスを config.json の bind の source にする。
+            // mode は 0644（mount の root がファイル自身になり bundle の 0700 が効かないため、写像された
+            // 非 root の uid で動く process が読めるようにする。DNS 設定だけで秘密値は含まない）。
+            let resolv = req
+                .sandbox_config
+                .dns_config
+                .as_ref()
+                .map(resolv_conf::render)
+                .transpose()?
+                .flatten();
+            let resolv_path = dir.join("resolv.conf");
+            let files = match &resolv {
+                Some(r) => {
+                    write_new_file(&resolv_path, r.as_bytes(), 0o644, "resolv.conf")?;
+                    let p = resolv_path
+                        .to_str()
+                        .ok_or_else(|| CriError::internal("bundle path is not valid UTF-8"))?;
+                    BundleFiles::with_resolv_conf(p)
+                }
+                None => BundleFiles::none(),
+            };
+            let json = build_runtime_config_with_files_and_pod_namespaces(
                 req.sandbox_config,
                 req.config,
                 &defaults,
+                &files,
                 req.pod_namespaces,
             )?;
-            write_new_file(&dir.join("config.json"), json.as_bytes())
+            write_new_file(
+                &dir.join("config.json"),
+                json.as_bytes(),
+                0o600,
+                "config.json",
+            )
         })();
         if let Err(e) = built {
             // 自分が作ったものだけを後始末する。rootfs の解放に失敗したら bundle を残し（通常の release と同じ

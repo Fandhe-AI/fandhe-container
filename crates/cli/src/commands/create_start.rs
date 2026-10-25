@@ -12,6 +12,10 @@
 //! （core の `create_audited` / `create_with_image_audited`。SEC-4・OCI-4・#2480。Linux のみ。非 Linux は
 //! `open_store` が先に失敗するため到達しない）。
 //!
+//! `create` は core を呼ぶ前に、同じ ID の前のインスタンスが残したコンテナログを best effort で回収する
+//! （`reclaim_stale_container_log`。`delete` の待ちを超えて残った分。#2698・SUP-7・CLI-1）。ID を再利用しない場合の
+//! 残りは手動で消す（`docs/setup/container-log-recovery.md`）。
+//!
 //! 未実装・簡易実装（REPAIR-3）:
 //! - `--image-root <abs> --image <sha256:digest|name[:tag]>` つきの `create` は core の `create_with_image` を呼び、イメージ参照（OCI-7）を
 //!   `image_refs::StoreImageRefs` で登録・確定する（#2315）。レイヤーの展開はしない（本番の展開器は #2377。bundle の rootfs は展開済みの前提）。
@@ -627,6 +631,7 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     })
     .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))
     .and_then(|(rt, (req, image))| {
+        reclaim_stale_container_log(rt.store.as_ref(), req.id(), &rt.recorder);
         let r = match &image {
             Some(image) => create_container_with_image_reclaiming(&rt, image, &req),
             None => create_container(&rt, &req),
@@ -637,6 +642,44 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     match result {
         Ok(_) => CliExit::Success,
         Err(e) => CliExit::Runtime(e),
+    }
+}
+
+/// 同じ ID の前のインスタンスが残したコンテナログを、core の create の前に回収する（#2698・SUP-7・CLI-1・REPAIR-4）。
+///
+/// `delete` はコンテナログの sink 閉鎖を最大 10 秒しか待たないため、supervisor の terminate がそれを超えるとログが残る。
+/// 残りは同じ ID の `create` で消す（そうしないと新しいインスタンスの sink が既存の `<id>.log` を世代へ退避し、
+/// 古い出力が新しい世代に混ざる）。待たずに 1 回だけ試す（create を遅らせない。上限は
+/// `CONTAINER_LOG_REMOVE_TIMEOUT`）。古い supervisor がまだ sink を持つ（ロックが取れない）ときは何も消さない。
+/// guard は `stop_delete::id_is_still_deleted`（ロック保持中に状態の不在を確認）で、同じ ID が既にあるときは消さず、
+/// 続く core の create が `ALREADY_EXISTS` を返す。best effort で create の成否・stderr は変えない。
+/// 観測は op 名 `container_log_reclaim`（1 件以上消した Success、エラーの Failure）。0 件は記録しない。
+fn reclaim_stale_container_log(
+    store: &dyn StateStore,
+    id: &fandhe_container_core::traits::ContainerId,
+    recorder: &OpRecorder,
+) {
+    use fandhe_container_supervisor::logs::{
+        CONTAINER_LOG_REMOVE_TIMEOUT, remove_container_logs_guarded_bounded,
+    };
+    let Some(root) = store.host_state_root() else {
+        return;
+    };
+    let started = Instant::now();
+    let guard_root = root.to_path_buf();
+    let guard_id = id.clone();
+    let outcome = match remove_container_logs_guarded_bounded(
+        root,
+        id,
+        CONTAINER_LOG_REMOVE_TIMEOUT,
+        move || super::stop_delete::id_is_still_deleted(&guard_root, &guard_id),
+    ) {
+        Ok(removed) if removed.log_files() > 0 => OpOutcome::Success,
+        Ok(_) => return,
+        Err(_) => OpOutcome::Failure,
+    };
+    if let Ok(name) = OpName::new("container_log_reclaim") {
+        let _ = recorder.record(&name, outcome, started.elapsed());
     }
 }
 
@@ -1745,5 +1788,115 @@ mod tests {
                 .expect("snap");
             assert_eq!((snap.success(), snap.failure()), (1, 1));
         }
+    }
+}
+/// 同じ ID の create 前の残りログ回収（#2698・SUP-7・CLI-1・REPAIR-4）の試験。ディレクトリ 0700 を前提にするため Linux のみ。
+#[cfg(all(test, target_os = "linux"))]
+mod reclaim_tests {
+    use super::*;
+    use fandhe_container_core::state_store::StateRoot;
+    use fandhe_container_core::traits::{ContainerStatus, CreateStateRequest};
+    use fandhe_container_supervisor::logs::{RotatingFileSink, container_log_rotation_config};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    struct Tmp(PathBuf);
+    impl Tmp {
+        fn new(tag: &str) -> Self {
+            let p = std::env::temp_dir().join(format!("fc-cli-rc-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).expect("mkdir");
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+            Self(p)
+        }
+        fn root(&self) -> PathBuf {
+            self.0.join("state")
+        }
+        fn store(&self) -> FileStateStore {
+            FileStateStore::open(StateRoot::from_override(self.root()).expect("root"))
+                .expect("open")
+        }
+        /// ロックファイルを除いたログファイルの数（ロックは guard が false でも片付く）。
+        fn names(&self) -> usize {
+            std::fs::read_dir(self.root().join("@container-logs"))
+                .map(|d| {
+                    d.filter(|e| {
+                        !e.as_ref()
+                            .expect("e")
+                            .file_name()
+                            .to_string_lossy()
+                            .ends_with(".lock")
+                    })
+                    .count()
+                })
+                .unwrap_or(0)
+        }
+    }
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn id(s: &str) -> ContainerId {
+        ContainerId::new(s).expect("id")
+    }
+
+    fn open_sink(t: &Tmp, name: &str) -> RotatingFileSink {
+        let dir = t.root().join("@container-logs");
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        RotatingFileSink::open(&dir, &id(name), container_log_rotation_config()).expect("sink")
+    }
+
+    fn stats(rec: &OpRecorder) -> Option<(u64, u64)> {
+        let n = OpName::new("container_log_reclaim").expect("name");
+        rec.snapshot_op(&n).map(|s| (s.success(), s.failure()))
+    }
+
+    /// 残ったログ（sink は閉じ済み）は消え、Success が 1 件記録される。0 件のときは何も記録しない。
+    #[test]
+    fn sup7_cli1_create_reclaims_leftover_logs_for_same_id() {
+        let t = Tmp::new("leftover");
+        let st = t.store();
+        let rec = OpRecorder::new();
+        reclaim_stale_container_log(&st, &id("a1"), &rec);
+        assert_eq!(stats(&rec), None);
+        drop(open_sink(&t, "a1"));
+        assert!(t.names() > 0);
+        reclaim_stale_container_log(&st, &id("a1"), &rec);
+        assert_eq!(t.names(), 0);
+        assert_eq!(stats(&rec), Some((1, 0)));
+    }
+
+    /// 同じ ID の状態が既にあるときは消さず、何も記録しない（続く core の create が ALREADY_EXISTS を返す）。
+    #[test]
+    fn sup7_cli1_create_reclaim_keeps_logs_when_state_present() {
+        let t = Tmp::new("present");
+        let st = t.store();
+        drop(open_sink(&t, "p1"));
+        let bundle = t.0.join("bundle");
+        std::fs::create_dir_all(&bundle).expect("bundle");
+        let req =
+            CreateStateRequest::new(ContainerStatus::created(id("p1"), None), bundle).expect("req");
+        st.create(&req).expect("create");
+        let before = t.names();
+        let rec = OpRecorder::new();
+        reclaim_stale_container_log(&st, &id("p1"), &rec);
+        assert_eq!(t.names(), before);
+        assert_eq!(stats(&rec), None);
+    }
+
+    /// 古い supervisor の sink が生きている（ロック保持）ときは消さず、Failure が 1 件記録される。
+    #[test]
+    fn sup7_cli1_create_reclaim_records_failure_when_sink_alive() {
+        let t = Tmp::new("alive");
+        let st = t.store();
+        let _sink = open_sink(&t, "l1");
+        let before = t.names();
+        let rec = OpRecorder::new();
+        reclaim_stale_container_log(&st, &id("l1"), &rec);
+        assert_eq!(t.names(), before);
+        assert_eq!(stats(&rec), Some((0, 1)));
     }
 }

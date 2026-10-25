@@ -31,7 +31,11 @@
 //! 消せなかった（supervisor 生存中でロックが取れない・期限切れ等）ときも delete は成功のまま（状態は削除済みで、再試行は
 //! `NOT_FOUND` になり回復できないため。残りは 1 ID あたり世代数 × 上限に収まり、次の start で世代として回る）、
 //! `code` / `message` の 1 行 JSON の警告を stderr に出す。消せたとき（0 件を含む）の stderr は空（ERR-2）。
-//! 削除は supervisor ログ → コンテナログの直列で、各 5 秒が上限（最悪 10 秒）。
+//! 削除は supervisor ログ（上限 5 秒）→ コンテナログの直列。コンテナログは `stop` 直後の sink 閉鎖の窓を
+//! `FailedPrecondition` の間 10 秒まで待ち（`CONTAINER_LOG_LOCK_WAIT`）、1 回の試行は 5 秒が上限で、最悪 20 秒（#2698・REPAIR-5）。
+//! 結果は `DeleteResponse` の `supervisor_log` / `container_log` 欄に載せ、警告は欄の `kept()` から出す（#2698・#2633）。
+//! 窓を超えて残ったログは、同じ ID の `create` が core を呼ぶ前に回収する（`create_start::reclaim_stale_container_log`）。
+//! ID を再利用しない場合の残りは手動で消す（`docs/setup/container-log-recovery.md`）。
 //!
 //! 状態ルートが無ければ `production_runtime` の状態ストアを開く段階で親の下に 0700 で作る（親は作らない）。
 //! list / logs と同じ判断で、読み取り専用 open は足さない（理由は `list_logs` の module doc。#1607 E2）。
@@ -76,8 +80,8 @@ use fandhe_container_core::oci_runtime::{
     delete_releasing_image_ref, kill,
 };
 use fandhe_container_core::traits::{
-    CleanupOutcome, ContainerId, ContainerState, ContainerStatus, DeleteRequest, DeleteResponse,
-    ErrorCode, GetStateRequest, KillRequest, Signal, StateStore, TraitError,
+    CleanupOutcome, CleanupTarget, ContainerId, ContainerState, ContainerStatus, DeleteRequest,
+    DeleteResponse, ErrorCode, GetStateRequest, KillRequest, Signal, StateStore, TraitError,
 };
 // 試験が `use super::*` 経由で使う型（本番の経路では使わない）。
 #[cfg(all(test, target_os = "linux"))]
@@ -106,6 +110,7 @@ use fandhe_container_supervisor::control::production_signaler;
 use fandhe_container_supervisor::control::{
     CancelOutcome, PendingRestartCanceller, production_restart_canceller, production_stop_signaler,
 };
+use fandhe_container_supervisor::logs::{CONTAINER_LOG_LOCK_WAIT, CONTAINER_LOG_REMOVE_TIMEOUT};
 use fandhe_container_supervisor::supervisor_log::{
     LogRemoval, SUPERVISOR_LOG_REMOVE_TIMEOUT, run_log_removal_bounded,
 };
@@ -314,11 +319,10 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
     export_ops(&rt.recorder, std::env::var_os(OP_LOG_ENV).as_deref());
     match result {
         Ok(resp) => {
-            if let Some(warning) = image_rootfs_removal_warning(resp.image_rootfs()) {
+            let resp = finish_delete(rt.store.as_ref(), &req, resp, CONTAINER_LOG_LOCK_WAIT);
+            for warning in cleanup_warnings(&resp) {
                 emit_warning_bounded(warning, write_warning_to_stderr, WARNING_WRITE_TIMEOUT);
             }
-            remove_supervisor_log(rt.store.as_ref(), &req);
-            remove_container_log(rt.store.as_ref(), &req);
             CliExit::Success
         }
         Err(e) => CliExit::Runtime(e),
@@ -327,16 +331,12 @@ pub(super) fn run_delete(global: &GlobalArgs, args: &DeleteArgs) -> CliExit {
 
 /// イメージ由来 rootfs を残した場合の警告（stderr に 1 行の JSON。ERR-1・OCI-7・#2633）。
 ///
-/// `Kept` のときだけ `Some`。パス・errno・ID は含めず、`code` で理由を見分ける。残った木は手動で消す
-/// （`docs/design/image-rootfs-lifetime.md`）。
-fn image_rootfs_removal_warning(outcome: CleanupOutcome) -> Option<String> {
-    match outcome {
-        CleanupOutcome::Kept { code } => Some(format!(
-            "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"image rootfs removal failed; leftover rootfs may remain\"}}",
-            code.as_str()
-        )),
-        _ => None,
-    }
+/// パス・errno・ID は含めず、`code` で理由を見分ける。残った木は手動で消す（`docs/design/image-rootfs-lifetime.md`）。
+fn image_rootfs_removal_warning(code: ErrorCode) -> String {
+    format!(
+        "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"image rootfs removal failed; leftover rootfs may remain\"}}",
+        code.as_str()
+    )
 }
 
 /// 期限切れの警告（stderr に 1 行の JSON。`code` / `message` は ERR-1 の形）。
@@ -344,61 +344,89 @@ fn log_removal_timeout_warning() -> &'static str {
     "{\"level\":\"warn\",\"code\":\"TIMEOUT\",\"message\":\"supervisor log removal did not finish within the deadline; leftover logs may remain\"}"
 }
 
+/// core の `delete` が成功した後の後始末（supervisor ログ → コンテナログ）を行い、結果を `DeleteResponse` の
+/// `supervisor_log` / `container_log` 欄に載せて返す（#2698・CLI-1・SUP-7・#2633）。`image_rootfs` は core の値のまま。
+///
+/// `run_delete` から呼ばれる。警告の出力は呼び出し元が [`cleanup_warnings`] で行う。`lock_wait` はコンテナログの
+/// sink 閉鎖を待つ上限（本番は [`CONTAINER_LOG_LOCK_WAIT`]。試験は短い値を渡す）。
+fn finish_delete(
+    store: &dyn StateStore,
+    req: &DeleteRequest,
+    resp: DeleteResponse,
+    lock_wait: Duration,
+) -> DeleteResponse {
+    resp.with_supervisor_log(remove_supervisor_log(store, req))
+        .with_container_log(remove_container_log(store, req, lock_wait))
+}
+
+/// 残った後始末の警告行（固定の順序: rootfs → supervisor ログ → コンテナログ）。消せた・対象外は含まない。
+fn cleanup_warnings(resp: &DeleteResponse) -> Vec<String> {
+    resp.kept()
+        .filter_map(|(target, code)| match target {
+            CleanupTarget::ImageRootfs => Some(image_rootfs_removal_warning(code)),
+            CleanupTarget::SupervisorLog => Some(log_removal_timeout_warning().to_string()),
+            CleanupTarget::ContainerLog => Some(container_log_removal_warning(code)),
+            // 将来追加される対象は、警告の文言が決まるまで出さない（`DeleteResponse` の欄には残る）。
+            _ => None,
+        })
+        .collect()
+}
+
 /// core の `delete` が成功した後に、supervisor の構造化ログ（`<root>/@supervisor-logs/<id>.log*`）を best effort で消す
 /// （#2067・REPAIR-4）。削除は作業スレッドで [`SUPERVISOR_LOG_REMOVE_TIMEOUT`] まで待つ（REPAIR-5）。
 ///
-/// 失敗しても delete の結果は変えず、成功時の stderr は空（ERR-2）。期限切れのときも delete は成功のまま
-/// （状態の削除は完了済みで、ログは残っても次の start で世代として回るため）、警告を 1 行だけ stderr に出す。
-/// supervisor が生存中でロックを取れない等で消せなかった分は、1 ID あたり世代数 × 上限（3 MiB）に収まる。
+/// 失敗しても delete の結果は変えない。期限切れは `Kept { Timeout }`、状態ルートが無ければ `NotApplicable`。
 /// core の delete より前には消さない（delete が失敗したとき稼働中のログを消さないため）。
-fn remove_supervisor_log(store: &dyn StateStore, req: &DeleteRequest) {
+fn remove_supervisor_log(store: &dyn StateStore, req: &DeleteRequest) -> CleanupOutcome {
     let Some(root) = store.host_state_root() else {
-        return;
+        return CleanupOutcome::NotApplicable;
     };
-    let outcome = fandhe_container_supervisor::supervisor_log::remove_bounded(
+    match fandhe_container_supervisor::supervisor_log::remove_bounded(
         root,
         req.id(),
         SUPERVISOR_LOG_REMOVE_TIMEOUT,
-    );
-    if outcome == LogRemoval::TimedOut {
-        emit_warning_bounded(
-            log_removal_timeout_warning().to_string(),
-            write_warning_to_stderr,
-            WARNING_WRITE_TIMEOUT,
-        );
+    ) {
+        LogRemoval::TimedOut => CleanupOutcome::Kept {
+            code: ErrorCode::Timeout,
+        },
+        _ => CleanupOutcome::Removed,
     }
 }
 
-/// コンテナログ削除の失敗の警告（stderr に 1 行の JSON。ERR-1）。パス・errno・内容は含めない。
+/// コンテナログ削除失敗の警告（stderr に 1 行の JSON。ERR-1）。パス・errno・ID・内容は含めない。
 /// 期限切れ（`TIMEOUT`）も同じ文言で、`code` で見分ける。
-fn container_log_removal_warning(e: &TraitError) -> String {
+fn container_log_removal_warning(code: ErrorCode) -> String {
     format!(
         "{{\"level\":\"warn\",\"code\":\"{}\",\"message\":\"container log removal failed; leftover logs may remain\"}}",
-        e.code().as_str()
+        code.as_str()
     )
 }
 
-/// core の `delete` が成功した後に、コンテナログ（`<root>/@container-logs/<id>.log*`）を消す（#2446・SUP-7・CLI-1）。
+/// core の `delete` が成功した後に、コンテナログ（`<root>/@container-logs/<id>.log*`）を消す（#2446・#2698・SUP-7・CLI-1）。
 ///
-/// 失敗しても delete の結果は変えず、警告を 1 行だけ stderr に出す（理由はモジュール doc）。core の delete より前には
-/// 呼ばない（delete が失敗したとき稼働中のコンテナのログを消さないため）。
-fn remove_container_log(store: &dyn StateStore, req: &DeleteRequest) {
+/// supervisor は `Stopped` を記録した後で hub を drain してから sink のロックを手放すため、`stop` 直後の delete では
+/// ロックが取れない窓がある。plugin-cri と同じく `FailedPrecondition` の間は `lock_wait` まで待つ
+/// （1 回の試行の上限は [`CONTAINER_LOG_REMOVE_TIMEOUT`]）。再作成済みの ID は guard で見送る。
+/// 残ったログは同じ ID の `create` で回収する（`create_start::reclaim_stale_container_log`）。
+fn remove_container_log(
+    store: &dyn StateStore,
+    req: &DeleteRequest,
+    lock_wait: Duration,
+) -> CleanupOutcome {
     let Some(root) = store.host_state_root() else {
-        return;
+        return CleanupOutcome::NotApplicable;
     };
     let guard_root = root.to_path_buf();
     let guard_id = req.id().clone();
-    if let Err(e) = fandhe_container_supervisor::logs::remove_container_logs_guarded_bounded(
+    match fandhe_container_supervisor::logs::remove_container_logs_guarded_bounded_waiting(
         root,
         req.id(),
-        fandhe_container_supervisor::logs::CONTAINER_LOG_REMOVE_TIMEOUT,
-        move || id_is_still_deleted(&guard_root, &guard_id),
+        lock_wait.min(CONTAINER_LOG_LOCK_WAIT),
+        CONTAINER_LOG_REMOVE_TIMEOUT,
+        Arc::new(move || id_is_still_deleted(&guard_root, &guard_id)),
     ) {
-        emit_warning_bounded(
-            container_log_removal_warning(&e),
-            write_warning_to_stderr,
-            WARNING_WRITE_TIMEOUT,
-        );
+        Ok(_) => CleanupOutcome::Removed,
+        Err(e) => CleanupOutcome::Kept { code: e.code() },
     }
 }
 
@@ -406,7 +434,7 @@ fn remove_container_log(store: &dyn StateStore, req: &DeleteRequest) {
 ///
 /// supervisor のログ削除がロックを取った後（同じ ID の sink が開けない状態）で評価される。再作成済みなら削除を
 /// 見送り、新しいインスタンスのログを消さない。ストアを開けない・NotFound 以外の失敗は fail-closed で `false`。
-fn id_is_still_deleted(
+pub(super) fn id_is_still_deleted(
     root: &std::path::Path,
     id: &fandhe_container_core::traits::ContainerId,
 ) -> bool {
@@ -504,41 +532,54 @@ mod tests {
     /// ERR-1・#2446: コンテナログ削除失敗の警告は改行なしの 1 行 JSON で、code ごとに完全一致し、パスを含まない。
     #[test]
     fn err1_container_log_removal_warning_is_single_line_json() {
-        let w = container_log_removal_warning(&TraitError::new(
-            ErrorCode::FailedPrecondition,
-            "/secret/path",
-        ));
+        let w = container_log_removal_warning(ErrorCode::FailedPrecondition);
         assert_eq!(
             w,
             "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"container log removal failed; leftover logs may remain\"}"
         );
-        let w = container_log_removal_warning(&TraitError::new(ErrorCode::Timeout, "x"));
+        let w = container_log_removal_warning(ErrorCode::Timeout);
         assert!(w.contains("\"code\":\"TIMEOUT\"") && !w.contains('\n') && !w.contains('/'));
     }
 
-    /// ERR-1・OCI-7・#2633: rootfs を残したときだけ、code ごとに完全一致する 1 行 JSON の警告を作る。
+    /// ERR-1・OCI-7・#2633: rootfs の警告は code ごとに完全一致する 1 行 JSON で、`cleanup_warnings` は残した欄だけを
+    /// 固定の順序（rootfs → supervisor ログ → コンテナログ）で出す（#2698）。
     #[test]
-    fn err1_image_rootfs_removal_warning_is_single_line_json() {
-        let w = image_rootfs_removal_warning(CleanupOutcome::Kept {
-            code: ErrorCode::FailedPrecondition,
-        })
-        .expect("kept warns");
+    fn err1_cleanup_warnings_cover_only_kept_targets_in_order() {
+        let w = image_rootfs_removal_warning(ErrorCode::FailedPrecondition);
         assert_eq!(
             w,
             "{\"level\":\"warn\",\"code\":\"FAILED_PRECONDITION\",\"message\":\"image rootfs removal failed; leftover rootfs may remain\"}"
         );
-        let w = image_rootfs_removal_warning(CleanupOutcome::Kept {
-            code: ErrorCode::Unimplemented,
-        })
-        .expect("kept warns");
-        assert!(w.contains("\"code\":\"UNIMPLEMENTED\"") && !w.contains('\n'));
-        for quiet in [
-            CleanupOutcome::Removed,
-            CleanupOutcome::AlreadyAbsent,
-            CleanupOutcome::NotApplicable,
-        ] {
-            assert_eq!(image_rootfs_removal_warning(quiet), None);
-        }
+        let quiet = DeleteResponse::new()
+            .with_supervisor_log(CleanupOutcome::Removed)
+            .with_container_log(CleanupOutcome::AlreadyAbsent);
+        assert!(cleanup_warnings(&quiet).is_empty());
+        let all = DeleteResponse::new()
+            .with_image_rootfs(CleanupOutcome::Kept {
+                code: ErrorCode::Unimplemented,
+            })
+            .with_supervisor_log(CleanupOutcome::Kept {
+                code: ErrorCode::Timeout,
+            })
+            .with_container_log(CleanupOutcome::Kept {
+                code: ErrorCode::FailedPrecondition,
+            });
+        let lines = cleanup_warnings(&all);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("\"code\":\"UNIMPLEMENTED\"") && lines[0].contains("rootfs"));
+        assert_eq!(lines[1], log_removal_timeout_warning());
+        assert!(
+            lines[2].contains("\"code\":\"FAILED_PRECONDITION\"")
+                && lines[2].contains("container log")
+        );
+    }
+
+    /// REPAIR-5・#2698: CLI の delete の後始末（supervisor ログ + コンテナログの待ち + 最後の試行）は 20 秒に収まる。
+    #[test]
+    fn repair5_cli_delete_cleanup_budget_fits_20s() {
+        let total =
+            SUPERVISOR_LOG_REMOVE_TIMEOUT + CONTAINER_LOG_LOCK_WAIT + CONTAINER_LOG_REMOVE_TIMEOUT;
+        assert_eq!(total, Duration::from_secs(20));
     }
 
     fn stop_args(id: &str) -> StopArgs {
@@ -878,6 +919,114 @@ mod tests {
             .expect("req")
             .with_cgroup_scope(CgroupScope::new(FAKE_SCOPE).expect("scope"));
             store.create(&req).expect("create").revision()
+        }
+
+        fn log_names(base: &TmpDir) -> Vec<String> {
+            let dir = state_root(base).join("@container-logs");
+            match std::fs::read_dir(dir) {
+                Ok(rd) => rd
+                    .map(|e| e.expect("e").file_name().to_string_lossy().into_owned())
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+
+        /// `@container-logs`（0700）に `name` の sink を開いて 1 行書く。
+        fn open_sink(
+            base: &TmpDir,
+            name: &str,
+        ) -> fandhe_container_supervisor::logs::RotatingFileSink {
+            use fandhe_container_supervisor::logs::{
+                RotatingFileSink, container_log_rotation_config,
+            };
+            use std::os::unix::fs::PermissionsExt;
+            let root = state_root(base);
+            let dir = root.join("@container-logs");
+            std::fs::create_dir_all(&dir).expect("dir");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+            RotatingFileSink::open(&dir, &id(name), container_log_rotation_config()).expect("sink")
+        }
+
+        fn delete_req(name: &str) -> DeleteRequest {
+            DeleteRequest::new(id(name))
+        }
+
+        /// SUP-7・CLI-1・#2698: sink が窓の間だけ生きていても、delete は閉鎖を待ってログとロックを消し、欄に載せる。
+        #[test]
+        fn sup7_cli1_delete_waits_for_sink_close_in_window() {
+            let base = TmpDir::new("waitwin");
+            let st = store(&base);
+            let sink = open_sink(&base, "w1");
+            let h = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                drop(sink);
+            });
+            let resp = finish_delete(
+                &st,
+                &delete_req("w1"),
+                DeleteResponse::new(),
+                Duration::from_secs(3),
+            );
+            h.join().expect("join");
+            assert_eq!(resp.container_log(), CleanupOutcome::Removed);
+            assert_eq!(resp.supervisor_log(), CleanupOutcome::Removed);
+            assert!(log_names(&base).is_empty(), "{:?}", log_names(&base));
+            assert!(cleanup_warnings(&resp).is_empty());
+        }
+
+        /// SUP-7・REPAIR-5・#2698: sink が待ちより長く生きるときはログを残し、Kept{FailedPrecondition} と警告 1 行になる。
+        #[test]
+        fn sup7_repair5_delete_keeps_logs_when_sink_outlives_wait() {
+            let base = TmpDir::new("keep");
+            let st = store(&base);
+            let _sink = open_sink(&base, "k1");
+            let t = Instant::now();
+            let resp = finish_delete(
+                &st,
+                &delete_req("k1"),
+                DeleteResponse::new(),
+                Duration::from_millis(100),
+            );
+            assert!(t.elapsed() < Duration::from_secs(5));
+            assert_eq!(
+                resp.container_log(),
+                CleanupOutcome::Kept {
+                    code: ErrorCode::FailedPrecondition
+                }
+            );
+            assert!(!log_names(&base).is_empty());
+            let w = cleanup_warnings(&resp);
+            assert_eq!(w.len(), 1);
+            assert!(w[0].contains("\"code\":\"FAILED_PRECONDITION\""));
+        }
+
+        /// CLI-1・#2698: ログが無くても Removed（0 件で成功）、core の image_rootfs は保たれ、状態ルートが無いストアは NotApplicable。
+        #[test]
+        fn cli1_delete_response_carries_cleanup_outcomes() {
+            let base = TmpDir::new("outcomes");
+            let st = store(&base);
+            let core = DeleteResponse::new().with_image_rootfs(CleanupOutcome::Removed);
+            let resp = finish_delete(&st, &delete_req("o1"), core, Duration::from_millis(50));
+            assert_eq!(resp.image_rootfs(), CleanupOutcome::Removed);
+            assert_eq!(resp.supervisor_log(), CleanupOutcome::Removed);
+            assert_eq!(resp.container_log(), CleanupOutcome::Removed);
+        }
+
+        /// SUP-7・#2698: 同じ ID が再作成済み（guard が false）ならログは消さずに成功（0 件）で返す。
+        #[test]
+        fn sup7_delete_does_not_remove_recreated_instance_logs() {
+            let base = TmpDir::new("recreated2");
+            let st = store(&base);
+            drop(open_sink(&base, "r1"));
+            create_placed(&base, &st, "r1");
+            let resp = finish_delete(
+                &st,
+                &delete_req("r1"),
+                DeleteResponse::new(),
+                Duration::from_millis(50),
+            );
+            assert_eq!(resp.container_log(), CleanupOutcome::Removed);
+            assert!(!log_names(&base).is_empty());
         }
 
         /// SUP-7・#2446: コンテナログ削除の確認は、同じ ID が再作成されていたら `false`（削除を見送る）、

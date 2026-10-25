@@ -43,6 +43,7 @@ Linux・cgroup v2・非 root・非特権 user namespace・user マネージャ�
 | A6 | 参考: LDAP にも無い uid | `getent passwd <存在しない uid>; echo $?` が 2 になることだけ記録（遠隔源があると終了コード 2 を「名前なし」と断定しない） | — |
 | A7（任意） | `subid:` に不正な値（空、壊れた角括弧） | `NSSWITCH_UNUSABLE`（warning・state `unusable`） | 5・`the name service switch configuration is unusable` |
 
+- doctor の終了コードは network・user scope・ID 写像・launcher の各 check の合成（`crates/cli/src/doctor.rs` の `run`。warning が 1 件でもあれば 3、無くて判定不能があれば 4）。表の終了コードは ID 写像・`nsswitch` 以外の check が warning を出さない前提の値で、他の check が warning を出す環境では ID 写像・`nsswitch` の行の `code`・`severity` で判定し、終了コードは記録だけにする
 - 各ケースの後に設定ファイルを元へ戻し、`sha256sum` が控えと一致することを記録する
 - A3・A4 で shadow の `newuidmap` 自身の挙動を手で試すのは任意の参考記録とする（我々の拒否の判定とは独立）
 

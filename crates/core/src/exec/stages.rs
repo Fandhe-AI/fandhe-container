@@ -65,6 +65,7 @@ use super::landlock::apply_landlock_stage;
 use super::seccomp::{apply_default_seccomp, apply_default_seccomp_with_listener};
 use super::seccomp_listener::ListenerSender;
 use super::{CapabilityReport, ExecError, IsolationStage, no_new_privs, rlimits};
+use crate::capabilities::ContainerCapabilities;
 // テストでは本物（`Threads: 1` を要求）の代わりに偽カーネルで走る関数へ差し替える。
 #[cfg(test)]
 use super::capabilities::testing::apply_default_capabilities_ids;
@@ -347,6 +348,9 @@ pub struct StagePipeline {
     /// `process.user` の uid・gid（0/0 以外のときだけ `Some`）。組み込みの capability 削減段が、補助グループの
     /// 消去の後・bounding set の削減の前に切り替える（#1462 の経路。OCI-1・SEC-5・TASK-29）。
     process_ids: Option<ProcessIds>,
+    /// 組み込みの capability 削減段が適用する許可集合（既定は OCI 既定集合。`process.capabilities` の drop で絞る。
+    /// SEC-1・CRI-2・#2666）。OCI 既定の部分集合だけを表す型なので、ここから広げる経路は無い。
+    capabilities: ContainerCapabilities,
     /// seccomp の listener fd を C へ渡す送り手（SEC-4・#2024）。あれば組み込みの `Seccomp` 段が `NEW_LISTENER` 付きで
     /// 適用して渡し、ACK を待つ。無ければ従来の `prctl` 適用（旧経路・観測用の入口）。
     listener_sender: Option<ListenerSender>,
@@ -395,6 +399,7 @@ impl StagePipeline {
             landlock: None,
             mounts: MountedTargets::new(),
             process_ids: None,
+            capabilities: ContainerCapabilities::oci_default(),
             listener_sender: None,
             seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
         }
@@ -414,6 +419,12 @@ impl StagePipeline {
     /// seccomp の listener fd を C へ渡す送り手を登録する（本番 launch 経路だけが呼ぶ。SEC-4・#2024）。
     pub(crate) fn with_listener_sender(mut self, sender: ListenerSender) -> Self {
         self.listener_sender = Some(sender);
+        self
+    }
+
+    /// capability 削減段が適用する許可集合を設定する（本番 launcher だけが `config.json` の解釈結果で呼ぶ。SEC-1・#2666）。
+    pub(crate) fn with_capabilities(mut self, capabilities: ContainerCapabilities) -> Self {
+        self.capabilities = capabilities;
         self
     }
 
@@ -615,9 +626,11 @@ impl StagePipeline {
                     let applied = apply_default_capabilities_for_launch(
                         &mut ThreadCountSource::ProcSelf,
                         self.process_ids,
+                        self.capabilities,
                     );
                     #[cfg(test)]
-                    let applied = apply_default_capabilities_ids(self.process_ids);
+                    let applied =
+                        apply_default_capabilities_ids(self.process_ids, self.capabilities);
                     let r = applied.map_err(|e| e.at_stage(kind.isolation_stage()))?;
                     capability_report = Some(r);
                     capabilities_ev = Some(CapabilitiesDropped { _private: () });
@@ -1396,6 +1409,34 @@ mod tests {
         assert_eq!(
             granted,
             Some(crate::capabilities::CapabilitySet::oci_default())
+        );
+        take();
+    }
+
+    /// SEC-1・CRI-2・#2666: `with_capabilities` の集合が削減段へ渡り、終端の `granted` が指定集合になる
+    /// （既定の部分集合。drop した `CAP_NET_RAW`・`CAP_MKNOD` が落ちる）。
+    #[test]
+    fn sec1_cri2_with_capabilities_reaches_capability_drop() {
+        use crate::capabilities::{Capability, CapabilitySet};
+        take();
+        let mut set = CapabilitySet::oci_default();
+        let mut kept = CapabilitySet::empty();
+        for c in set.iter() {
+            if c != Capability::NetRaw && c != Capability::Mknod {
+                kept = kept.with(c);
+            }
+        }
+        set = kept;
+        let caps = ContainerCapabilities::restrict(set).unwrap();
+        let granted = StagePipeline::new()
+            .with_capabilities(caps)
+            .run_then(|_, caps, _| Ok(caps.map(|c| c.granted)))
+            .unwrap();
+        assert_eq!(granted, Some(set));
+        assert_eq!(set.len(), 12);
+        assert_eq!(
+            super::super::capabilities::testing::take_allowed_seen(),
+            Some(caps)
         );
         take();
     }

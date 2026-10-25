@@ -64,13 +64,27 @@ Agent の推奨（決定ではない）: 案 A + 案 A'（現行維持）。既�
 - Linux の x86_64 / aarch64: fd 起点（`sys::at` の `openat2`・`renameat`・`unlinkat`・`getdents64`）。`openat2`（Linux 5.6 以降）が使えない環境（`ENOSYS`・seccomp による `EPERM`）では `ImageStore::open` が `Unimplemented` で拒否し、パス起点へは縮退しない（fail-closed）。Linux 5.6 未満ではストアを開けなくなる
 - macOS: 本番経路が `ImageStore::open` に届かない（cli の `non_linux_failure`）。fd 起点の `openat` 系には macOS 用の定数・FFI・libc 照合が要り、足す根拠が無いため、パス起点＋入口の再検査の現行を保つ。再検討の契機は論点 2 と同じ
 - Windows: パス起点のまま。ACL の検査は #2428 の方式判断待ち
-- Linux の他アーキテクチャ: パス起点。`sys::at` の定数・番号を確かめていない
+- Linux の他アーキテクチャ: `sys::at` の定数・番号を確かめていないため、パス起点へ縮退せず `ImageStore::open` が `Unimplemented` で拒否する（`layer::anchored` と同じ fail-closed。同じアーキテクチャではレイヤー展開も既に `Unimplemented` でイメージを使えない。#2701）
 
 ### 3-c. 残る隙間
 
 - 読み取り専用の集計と pull がパス起点のまま（#2694・#2695）
 - fd を開いた後に、所有者自身が root を信頼できない場所へ移す操作は信頼境界の内側。入口の再検査で検出される
+- 試験: `xdev_tests.rs`（3-d の拒否を `EXDEV` の注入で決定的に再現。既定のテスト集合）・`tests/image_store_xdev.rs`（実マウントでの確認。実機前提・`--ignored`）
 - 試験: `root_swap_tests.rs`（Linux の x86_64 / aarch64。再検査の直後・区間内で root を差し替えても、参照・在庫・ジャーナル・blob の削除・残骸の回収が検査済みの root にだけ作用し、おとりが無傷であることを具体値で照合する）
+
+### 3-d. マウント越え（EXDEV）と openat2 の拒否（#2701・OCI-7・SEC-1・ERR-1）
+
+fd 起点の名前解決は `RESOLVE_NO_XDEV` を常に付けるため、root 配下に別マウント（`blobs`・`blobs/sha256` を別ボリュームにしたもの、`@lock` などの固定名ファイルの bind mount）があると `EXDEV` で失敗する。この構成は**対応外**で、受け入れる方向には変えない（fail-closed）。変えたのは分類と文言だけである。
+
+- **写像**: `EXDEV` は `FailedPrecondition` とメッセージ `image store path crosses a mount point; unsupported (RESOLVE_NO_XDEV)` に写す（`root_handle::map_root_io`・`mount_crossing`）。永続化モジュールは errno を書かず、この写像を通す。
+- **対象**: `@lock`・create ゲート・`@gc-pending.json`・`@container-refs.json`・`@image-inventory.json`（とその一時ファイル）の stat・open・作成・rename と、blob 置き場の検査（`blobs/sha256`）。rm・prune はテーブルもディスクも変える前の `check_blob_dirs` で止まり、何も変えない。
+- **個々の blob ファイルが bind mount の場合**: 検査は通り、削除だけが失敗するため、従来どおり「消せずに残す」（`undeleted`）扱いのまま変えない。
+- **復旧**: ジャーナルがあり `blobs/sha256` が別マウントのとき、`lock` と `recover_pending_deletion` はジャーナルに触れず（`attempts` も増やさず）に同じエラーで止まる。構成の誤りは一時的な障害ではなく、再試行回数を消費すると `MAX_GC_RETRY_ATTEMPTS` でジャーナルが断念され blob が黙って孤児になるため。墓標も同じ（root の fsync に blob 置き場が絡む）。構成を直せば次の `lock` が復旧する。
+- **`@gc-pending.json` が別マウント**: stat の失敗は従来どおり存在とみなす（fail-closed）が、`EXDEV` だけは "pending deletion" という誤った原因ではなくマウント越えとして返す。
+- **採らなかった案**: `lock` のたびに blob 置き場を検査して一律に拒否する案。既存構成の pull・ls・run まで止めてしまい本 issue の範囲を超えるため、ジャーナルがあるときの復旧だけで検査する。`blobs` だけが別マウントでジャーナルが無ければ `lock` は成功し、rm・prune だけが恒久的に失敗する非対称が残る（原因は上のエラーで分かる）。pull・usage は現状パス起点のため成功する（#2694・#2695 で fd 起点にする際は同じ写像を通すこと）。
+- **`openat2` の拒否の区別**: root を開けないとき、`ENOSYS`（Linux 5.6 未満、または seccomp が `ENOSYS` を返す）と `EPERM`（古い Docker の既定 seccomp プロファイルなど、外側のコンテナランタイムによる拒否）はどちらも `Unimplemented` のまま、メッセージで見分ける（`openat2 is not available (ENOSYS): …` / `openat2 was denied (EPERM), likely by a seccomp profile …`）。`PermissionDenied` は root の権限・所有者の信頼検査の違反に使っており、`FailedPrecondition` は cli の `failure_message` が別の文言に写すため、どちらも使わない。cli は oci のメッセージを出さない（`(Stage, code)` から固定文言を引く）ので、これらの原因は CRI・構造化ログ・ライブラリの利用者に届き、CLI の出力には出ない。
+- **単体テーブルの拒否（P2-2）**: `ImageStore::lock` のガードを経由しない単体の `ReferenceTable` の rm・prune・`resume_pending_deletion` は、本番ビルドでは `FailedPrecondition`（`image store operation requires the exclusive section of an opened ImageStore`）で拒否する。信頼検査なしの root とジャーナルの検査抜きで永続化操作が動く経路を公開 API から閉じるため（本番の cli は必ずガード経由）。`cfg(test)` の単体テストだけが従来の検査なしの経路（`RootHandle::open_unchecked`）を使う。
 
 ## 4. 論点 4: libc 照合（#2590 で導入済み）
 

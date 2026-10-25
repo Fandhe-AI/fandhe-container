@@ -45,6 +45,8 @@ struct Script {
     fail_attach: bool,
     /// attach 失敗時に巻き戻しで取り残す資源の件数。
     attach_leftover: usize,
+    /// attach 失敗時にバックエンドが準備済み netns を保持している印を立てるか。
+    attach_retained: bool,
     /// 次の delete_network を失敗させ、渡されたハンドルを全部 retry に返す回数。
     fail_delete: u32,
     /// netns の事前作成・解放の呼び出し列（`calls` とは別に持ち、既存の期待列を変えない）。
@@ -162,7 +164,7 @@ impl NetsetupBackend for Fake {
             return Err(AttachFailure {
                 error: TraitError::new(ErrorCode::Internal, "attach failed"),
                 leftover: s.attach_leftover,
-                netns_retained: false,
+                netns_retained: s.attach_retained,
             });
         }
         Ok(AttachOutcome {
@@ -1024,6 +1026,66 @@ fn net1_create_netns_retained_handle_is_released_by_delete() {
     net.delete_network(&DeleteNetworkRequest::new(nname("a")))
         .expect("released and deleted");
     assert!(fake.netns_calls().contains(&"release_netns c1".to_owned()));
+}
+
+/// attach 失敗で veth が残り（unreclaimed）かつ準備済み netns をバックエンドが保持していても、
+/// detach は netns を `release_netns` で解放する。取り残しの回収待ち自体は残る（#2675・NET-1）。
+#[test]
+fn net1_attach_leftover_with_retained_netns_is_released_by_detach() {
+    let (net, fake) = plugin();
+    pod_network::set_up_pod(&net, &nname("a"), subnet()).expect("a");
+    net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c1")))
+        .expect("netns");
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_attach = true;
+        s.attach_leftover = 1;
+        s.attach_retained = true;
+    }
+    net.attach(&AttachRequest::new(nname("a"), cid("c1")))
+        .expect_err("attach fails");
+    let e = net
+        .detach(&DetachRequest::new(nname("a"), cid("c1")))
+        .expect_err("still unreclaimed");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    let releases = |f: &Fake| {
+        f.netns_calls()
+            .iter()
+            .filter(|c| *c == "release_netns c1")
+            .count()
+    };
+    assert_eq!(releases(&fake), 1);
+    // 解放済みなので二度目の detach は release を繰り返さない。
+    let _ = net.detach(&DetachRequest::new(nname("a"), cid("c1")));
+    assert_eq!(releases(&fake), 1);
+}
+
+/// 同じ状況で delete_network も、取り残しの拒否の前に netns を解放する（pin と fd を残さない）。
+#[test]
+fn net1_attach_leftover_with_retained_netns_is_released_by_delete_network() {
+    let (net, fake) = plugin();
+    pod_network::set_up_pod(&net, &nname("a"), subnet()).expect("a");
+    net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c1")))
+        .expect("netns");
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_attach = true;
+        s.attach_leftover = 1;
+        s.attach_retained = true;
+    }
+    net.attach(&AttachRequest::new(nname("a"), cid("c1")))
+        .expect_err("attach fails");
+    let e = net
+        .delete_network(&DeleteNetworkRequest::new(nname("a")))
+        .expect_err("blocked by unreclaimed");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(
+        fake.netns_calls()
+            .iter()
+            .filter(|c| *c == "release_netns c1")
+            .count(),
+        1
+    );
 }
 
 /// create_netns の失敗では記録を作らない。

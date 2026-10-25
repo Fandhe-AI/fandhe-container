@@ -349,6 +349,33 @@ async fn timeout_keeps_a_notready_record_and_remove_tears_down() {
     assert!(list_ids(&svc).await.is_empty());
 }
 
+/// CRI-2・NET-1: 期限超過で DEADLINE_EXCEEDED を返した後に worker の set_up が成功しても、
+/// sandbox は NotReady のまま（Ready に戻さず、CreateContainer も通さない）。
+#[tokio::test]
+async fn late_set_up_success_after_timeout_never_becomes_ready() {
+    let net = FakeNetwork::new(SetUp::Hang);
+    let svc = CriRuntimeService::new()
+        .with_pod_network(net.clone())
+        .with_runtime_timeout(Duration::from_millis(200));
+    let e = run(&svc, None).await.unwrap_err();
+    assert_eq!(e.code(), Code::DeadlineExceeded);
+    let id = list_ids(&svc).await.remove(0);
+    // Hang の set_up（3 秒）が完了するまで待つ。pending が外れれば Stop が受理される。
+    tokio::time::sleep(Duration::from_millis(3600)).await;
+    let list = svc
+        .list_pod_sandbox(Request::new(v1::ListPodSandboxRequest { filter: None }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(list.items.len(), 1);
+    assert_eq!(
+        list.items[0].state,
+        v1::PodSandboxState::SandboxNotready as i32
+    );
+    let e = create_container(&svc, &id).await.unwrap_err();
+    assert_eq!(e.code(), Code::FailedPrecondition);
+}
+
 #[tokio::test]
 async fn stop_tears_down_once_and_remove_does_not_repeat() {
     let net = FakeNetwork::new(SetUp::Ok);

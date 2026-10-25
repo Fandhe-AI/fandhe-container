@@ -1101,6 +1101,11 @@ impl CriRuntimeService {
         // 追跡させる（完了前の Stop・Remove の tear_down との競合で資源が漏れるのを防ぐ。CRI-2・NET-1）。
         let ran = Arc::new(AtomicBool::new(false));
         let worker_ran = Arc::clone(&ran);
+        // 呼び出し側が期限超過・待ち受け失敗で結果不明として返した印。ロック下で立て、worker が
+        // ロック下で読む。立っていれば遅れて成功しても Ready へは戻さず NotReady のまま資源だけ記録する
+        // （失敗扱いで返した sandbox を Ready として公開しない。CRI-2・NET-1）。
+        let abandoned = Arc::new(AtomicBool::new(false));
+        let worker_abandoned = Arc::clone(&abandoned);
         let guard = NetworkSetUpGuard {
             registry: Arc::clone(&self.registry),
             id: id.clone(),
@@ -1120,7 +1125,7 @@ impl CriRuntimeService {
                 // 失敗時は notready を worker がロック下で確定する（Ready のまま CreateContainer が通らないように）。
                 record.network_owned = true;
                 record.network_pending = false;
-                record.state = if outcome.is_ok() {
+                record.state = if outcome.is_ok() && !worker_abandoned.load(Ordering::SeqCst) {
                     SandboxState::Ready
                 } else {
                     SandboxState::NotReady
@@ -1170,6 +1175,9 @@ impl CriRuntimeService {
                 } else if let Ok(mut registry) = self.registry.lock()
                     && let Some(record) = registry.records.get_mut(&id)
                 {
+                    if unknown {
+                        abandoned.store(true, Ordering::SeqCst);
+                    }
                     record.state = SandboxState::NotReady;
                     record.network_owned = true;
                     // 結果不明のときは worker の完了まで pending を保つ。

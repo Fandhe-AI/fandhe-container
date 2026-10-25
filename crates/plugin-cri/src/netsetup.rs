@@ -765,6 +765,9 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             Err(f) => {
                 if f.leftover > 0 {
                     container.unreclaimed = true;
+                    // veth・ポートの取り残しと別に、バックエンドが準備済み netns を保持していれば、
+                    // detach・delete_network が取り残しの手動回収待ちでも `release_netns` に届くよう印を持つ（#2675）。
+                    container.netns_retained = f.netns_retained;
                 }
                 return Err(f.error);
             }
@@ -787,12 +790,18 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         }
         let container = reg
             .containers
-            .get(req.container().as_str())
+            .get_mut(req.container().as_str())
             .ok_or_else(not_found_netns)?;
         if container.network != req.network().as_str() {
             return Err(network_mismatch());
         }
         if container.unreclaimed {
+            // 取り残しの回収待ちでも、保持中の netns（pin・fd）は先に解放する。解放に失敗したら
+            // その旨のエラーを返し、成功すれば印を外して取り残しの拒否を返す（#2675）。
+            if container.netns_retained {
+                self.backend.release_netns(&container.endpoint)?;
+                container.netns_retained = false;
+            }
             return Err(unreclaimed());
         }
         if container.attached.is_some() {
@@ -832,10 +841,23 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             return Ok(DeleteNetworkResponse::new());
         }
         let handle = network.handle.as_mut().ok_or_else(not_found_network)?;
+        // attach 失敗で取り残しがあっても、保持中の netns（pin・fd）の解放は取り残しの拒否より前に試みる。
+        // 失敗は握りつぶさず最初のエラーとして覚え、記録は保持する（#2675）。
+        let mut early_error = None;
+        for c in reg.containers.values_mut() {
+            if c.network == name && c.unreclaimed && c.netns_retained {
+                match self.backend.release_netns(&c.endpoint) {
+                    Ok(()) => c.netns_retained = false,
+                    Err(e) => {
+                        early_error.get_or_insert(e);
+                    }
+                }
+            }
+        }
         // 取り残しの veth は bridge への master で自分のものと証明される。bridge を消すと証明を失い
         // 二度と回収できないため、取り残しが残る間はバックエンドを呼ばず何も解放しない（記録も保持）。
         if !network.backend_deleted && network_has_unreclaimed(&reg.containers, name) {
-            return Err(delete_blocked_by_unreclaimed());
+            return Err(early_error.unwrap_or_else(delete_blocked_by_unreclaimed));
         }
         // 以降は成功して記録ごと消えるまで、失敗しても deleting を保つ（部分削除済みのまま再利用させない）。
         network.deleting = true;
@@ -855,7 +877,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         // 1 件の失敗で残りを止めない（契約 9）: 失敗した記録は保持し、最初のエラーを覚えたまま
         // attach 済みの資源の解放を続け、最後にそのエラーを返す（deleting は保たれ、再試行で解放をやり直せる。#2675）。
         // バックエンドのネットワーク解放済みでも再試行で解放できるよう、常に試みる（冪等）。
-        let mut first_error = None;
+        let mut first_error = early_error;
         let mut release_failed: Vec<String> = Vec::new();
         for id in &linked {
             if let Some(c) = reg.containers.get(id)
@@ -1244,6 +1266,7 @@ mod linux {
                 Ok(a) => a,
                 Err(e) => {
                     // netns は unpin されずに返る。保持して detach・delete_network に解放を任せる。
+                    let retained = e.netns.is_some();
                     if let Some(netns) = e.netns {
                         self.lock_prepared()?
                             .insert(endpoint.as_str().to_owned(), netns);
@@ -1252,7 +1275,7 @@ mod linux {
                     return Err(AttachFailure {
                         error: with_leftover(net_error_to_trait(&e.error.error), leftover),
                         leftover,
-                        netns_retained: false,
+                        netns_retained: leftover > 0 && retained,
                     });
                 }
             };

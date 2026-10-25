@@ -335,7 +335,7 @@ supervisor-independence: ## 監視プロセス 1 個を kill して他の継続�
 restart-latency: ## restart レイテンシを計測する（既定バックオフ 100ms 差し引き値も出す）（実機前提・timeout 付き。BIN_DIR=<絶対パス> BUNDLE=<dir> 必須。[TRIALS= WARMUP= OUTPUT= RESTART_LATENCY_WAIT_TIMEOUT=]。SUP-3）
 	@scripts/targets/restart-latency.sh
 
-repeat-test: ## 1 つの試験を N 回繰り返す（PACKAGE=fandhe-container-<名> と TEST=<lib 試験の完全名> または TEST_BIN=<名> SUCCESS_LINE=<成功行> [TEST_IGNORED=1]、[COUNT=300 RUN_TIMEOUT=120]。REPAIR-12・#2538・#2660）
+repeat-test: ## 1 つの試験を N 回繰り返す（PACKAGE=fandhe-container-<名> と TEST=<lib 試験の完全名> または TEST_BIN=<名> SUCCESS_LINE=<成功行> [TEST_IGNORED=1]、[FEATURES=<a,b>]、[COUNT=300 RUN_TIMEOUT=120]。REPAIR-12・#2538・#2660・#2711）
 	@scripts/targets/repeat-test.sh
 
 crictl-smoke: ## crictl の runp→create→start の疎通確認（実機前提・timeout 付き。CRI_ENDPOINT=unix:///<絶対パス> 必須。[CRICTL= POD_CONFIG= CONTAINER_CONFIG= LOG_DIR= STEP_TIMEOUT= CRICTL_TIMEOUT= KEEP=1]。CRI-1・TASK-60）

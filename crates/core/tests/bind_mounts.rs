@@ -12,7 +12,8 @@ use fandhe_container_core::injected_files::{
     InjectedContent, InjectedFileMode, InjectedFileSet, InjectedFileSpec,
 };
 use fandhe_container_core::oci_runtime::{
-    BindMountErrorKind, BindMountSet, OciConfig, audit_bind_mount_error, parse_config_bytes,
+    BindMountErrorKind, BindMountSet, BindPropagation, OciConfig, audit_bind_mount_error,
+    parse_config_bytes,
 };
 use fandhe_container_core::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
 use fandhe_container_core::traits::{ErrorCode, TraitError};
@@ -65,12 +66,47 @@ fn core2_oci4_parse_config_to_bind_mount_set() {
     assert!(m.iter().all(|x| x.nosuid() && x.nodev()));
 }
 
+/// OCI-4・CRI-2・SEC-1（#2669）: `rslave` は受け、伝播は `HostSlave`。指定が無ければ `Private`。
+#[test]
+fn oci4_cri2_rslave_is_accepted_as_host_slave() {
+    let c = config(
+        r#"[
+        {"destination":"/mnt/a","type":"bind","source":"/data/a","options":["rbind","rslave","nosuid","nodev"]},
+        {"destination":"/mnt/b","type":"bind","source":"/data/b","options":["rbind","rprivate"]},
+        {"destination":"/mnt/c","type":"bind","source":"/data/c","options":["bind"]}
+    ]"#,
+        "{}",
+    );
+    let s = BindMountSet::from_mounts(c.mounts()).expect("accepted");
+    let got: Vec<_> = s
+        .mounts()
+        .iter()
+        .map(|m| (m.recursive(), m.propagation()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            (true, BindPropagation::HostSlave),
+            (true, BindPropagation::Private),
+            (false, BindPropagation::Private),
+        ]
+    );
+    assert!(s.has_host_slave());
+}
+
 /// CORE-5・SEC-1: 拒否の種類・位置・エラーコード・固定英文メッセージ（#2063 の決定 (a): bind と rbind の併記を含む）。
 #[test]
 fn core5_sec1_rejections_have_kind_index_and_message() {
     let cases = [
         (r#"["bind","suid"]"#, BindMountErrorKind::RestrictionLifting),
         (r#"["bind","rshared"]"#, BindMountErrorKind::Propagation),
+        (r#"["bind","shared"]"#, BindMountErrorKind::Propagation),
+        (r#"["bind","slave"]"#, BindMountErrorKind::Propagation),
+        (r#"["bind","unbindable"]"#, BindMountErrorKind::Propagation),
+        (
+            r#"["rbind","rslave","rprivate"]"#,
+            BindMountErrorKind::ConflictingPropagation,
+        ),
         (r#"["bind","idmap"]"#, BindMountErrorKind::UnsupportedOption),
         (
             r#"["bind","rbind"]"#,

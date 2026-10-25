@@ -23,14 +23,17 @@ Linux の fandhe-container は、OCI `config.json` の `mounts[]` に書いた b
 
 ## 受けるオプション
 
-`bind`・`rbind`・`ro`・`rw`・`nosuid`・`nodev`・`noexec`・`exec`・`private`・`rprivate`。後に書いた指定が勝つ（`ro` と `rw`、`noexec` と `exec`）。`rbind` のときだけ再帰的に bind する。
+`bind`・`rbind`・`ro`・`rw`・`nosuid`・`nodev`・`noexec`・`exec`・`private`・`rprivate`・`rslave`。後に書いた指定が勝つ（`ro` と `rw`、`noexec` と `exec`）。`rbind` のときだけ再帰的に bind する。
+
+`rslave` は、ホストの peer group から受けるだけの slave で付ける（ホストで後からその元の下にマウントされた内容がコンテナ内に見える。コンテナからホストへは伝播しない）。元が属するホスト側のマウントが shared か slave である必要があり、private なら `start` は rootfs に触れる前に `FAILED_PRECONDITION` で失敗する（黙って private で載せない）。`private`・`rprivate` との併記は `INVALID_ARGUMENT`。CRI の HostToContainer はこの指定へ変換される（#2669・CRI-2・OCI-4）。
 
 ## 拒否するもの
 
 | 指定 | 理由 |
 | ---- | ---- |
 | `suid`・`dev` | 必須の制限を外すため（SEC-1） |
-| `shared`・`rshared`・`slave`・`rslave`・`unbindable`・`runbindable` | 伝播は常に private（ホストへのマウントの漏れを防ぐ） |
+| `shared`・`rshared`・`slave`・`unbindable`・`runbindable` | コンテナからホストへ伝播させない（ホストへのマウントの漏れを防ぐ）。user namespace の中ではホストの shared マウントが slave に格下げされるため、`rshared` は原理的に成り立たない（`docs/design/mount-propagation.md`）。`slave`（非再帰）は `rbind` で配下も slave になり意味が食い違うため受けない |
+| `rslave` と `private`・`rprivate` の併記 | 意味が曖昧なため（#2669。`bind` と `rbind` の併記と同じ扱い） |
 | 上記以外のオプション（`defaults`・`rro`・`idmap` を含む） | 未知の指定は fail-closed |
 | `bind` と `rbind` の併記 | 意味が曖昧なため |
 | 相対パス・`..`・`.`・空要素・`\`・NUL を含む `source`、`source: "/"` | 絶対パスの正規形のみ受ける |
@@ -65,7 +68,7 @@ Docker / runc との差: 本実装は方式を事前に決め、縮退しない�
 ## Docker / runc と異なる既定
 
 - `nosuid` と `nodev` を常に付ける。外せない
-- 伝播は常に private
+- 伝播は private が既定。`rslave` だけ受け、ホスト側の元が private なら runc と違って起動を拒否する（runc は private のまま載せる）
 - `source` は絶対パスのみ（bundle 相対は不可）
 - 疑似 FS（procfs・sysfs・cgroup など）上の `source` は拒否する（runc は受ける）
 - ホストの `/dev`（devtmpfs）配下の `source` は拒否する（runc は受ける。SEC-1・#2129）
@@ -75,6 +78,7 @@ Docker / runc との差: 本実装は方式を事前に決め、縮退しない�
 
 ## 制約と未対応
 
+- `rslave` でホストから伝播してきたマウントには、ホスト側のマウントの属性とカーネルのロックが付き、こちらの `nosuid`・`nodev`・`ro`・`noexec` は付かない。疑似 FS と状態ルートの検査も付け替えた時点の 1 回だけである（HostToContainer の意味に内在する。引き起こせるのはホスト側の特権主体だけ。#2669）。実機での伝播の確認は [verification](../verification/bind-rslave-propagation.md)
 - `ro` の bind は、root が書き込み可能な構成では Landlock が書き込み制限を保証できないため、起動前に拒否される。解消は #1917
 - bind と `/sys` の sysfs（下記）以外の `mounts[]` の種類は未対応
 - 状態ルート（`StateStore::host_state_root`）と同一・祖先・子孫の `source` は start が拒否する（字句比較と `canonicalize` した実体の比較。SEC-1）。状態ルートを示せないストアでは bind つきの start を拒否する。適用の段も、固定した元に対して状態ルートとの重なりを毎回再検証する（元の属するマウントは fd の `mnt_id` で特定し、`rbind` のときだけ配下のマウントも照合する。保護対象と同じファイルシステム上でリンク数 2 以上の通常ファイルは状態ファイルへのハードリンクかもしれないため拒否する。start は状態ルート配下の通常ファイルのリンク数を上限つきで走査し、リンク数 2 以上のものがある〔または走査できない〕場合は、同じファイルシステム上のディレクトリ元も適用の段で拒否する）。元のマウント ID は `O_PATH` で固定した fd から取り、FIFO への差し替えでもブロックしない（REPAIR-5）。mountinfo は読み取りバイト数と行数に上限を設け、超過は構造化エラーで拒否する

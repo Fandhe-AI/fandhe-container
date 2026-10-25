@@ -32,7 +32,7 @@
 //! **実装済み（稼働中コンテナへの exec のみ。#1531）**: `prepare_exec_child` の `EntrypointSource::Switchable`
 //! （`run_exec_child` 経由）が、判定した方式（`EntrypointExecMode`。`entrypoint_mode.rs`）が封印した複製なら
 //! `sealed_copy.rs` の `seal_entrypoint_copy` を呼び、以降の解析・照合・実行を複製に対して行う。launch 経路
-//! （`EntrypointSource::Pinned`）には掛けない（下記「サイズ上限」の理由。再検討の追跡は #2687）。
+//! （`EntrypointSource::Pinned`）には掛けない（適用しない判断。脅威モデル・メモリ・`/proc/self/exe` の理由は `docs/design/launch-sealed-copy.md`。#2687）。
 //!
 //! **方式の切り替え（オーナー判断 2026-10-09「条件付き切り替え」）**: 封印した複製を使える環境（下記「限界」の
 //! (a)・(b)）では B' で実行し、それ以外では A（O_PATH での固定 + inode 照合をした元の fd をそのまま `execveat` する
@@ -133,8 +133,8 @@
 //! - **B' は稼働中コンテナへの exec のみ**: 本体の内容の書き換えは #1531 の組み込みで閉じる（複製の前の書き換えは
 //!   「解析と実行が同じバイトを見る」ことを保証するのであって、元の内容が実行されるとは限らない。複製したバイト列
 //!   をランタイムの照合に通すため、書き換えた内容はシェバン・`PT_INTERP` の照合に掛かる）。B' でもインタープリタの
-//!   パスの差し替えとインタープリタ自身の内容の書き換えは閉じず、引き続き Landlock に頼る。launch 経路への適用は
-//!   未着手（本番 launcher の構成は入った〔#1816〕が、追跡は #2687）
+//!   パスの差し替えとインタープリタ自身の内容の書き換えは閉じず、引き続き Landlock に頼る。launch 経路には適用しない
+//!   （判断済み。`docs/design/launch-sealed-copy.md`・#2687。閉じ方の本筋は方式 B〔#2686〕とマウント・Landlock の方針）
 //! - **B' は元のファイルに結び付いた exec 後の拘束を再現しない（維持できない環境は拒否する）**: 実行の **許可**
 //!   （実行ビット・`noexec`・Landlock の `EXECUTE`・`security_bprm_creds_for_exec`）は、複製の前に元のファイルの fd へ
 //!   `AT_EXECVE_CHECK`（Linux 6.14+）で問い合わせる（6.14 未満は B' を使わない）。一方、AppArmor のパス結び付きプロファイル・

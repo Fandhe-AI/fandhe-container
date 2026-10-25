@@ -258,6 +258,14 @@ name = "rootless_holder_expiry"
 path = "tests/rootless_holder_expiry.rs"
 harness = false
 
+# holder が継承するメモリに注入ファイルの secret が無いことを、本番の holder の `/proc/<pid>/mem` 走査で
+# 具体値で照合する結合試験（CORE-6・SEC-5・SUP-12・#2628）。単一スレッドの fork が要るため harness = false。
+# `-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
+[[test]]
+name = "rootless_holder_memory"
+path = "tests/rootless_holder_memory.rs"
+harness = false
+
 # rootless 起動フローへの統合（subuid 範囲写像 → spawn_container）の結合試験（CORE-6・SEC-5・TASK-40.2）。
 # 上と同じ理由で harness = false。`-- --ignored` 指定時のみ実行する実機前提テスト（AGENTS.md）。
 [[test]]

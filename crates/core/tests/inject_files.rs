@@ -267,13 +267,27 @@ mod linux {
         devs
     }
 
+    /// 内容をホストの一時ファイル経由の封印 memfd(`InjectedContent::from_file`。本番の secret の経路。#2628)にして、
+    /// 実 tmpfs へ `sendfile` で書かれる経路も通す。
+    fn sealed(body: &str, index: usize) -> InjectedContent {
+        let path = std::env::temp_dir().join(format!(
+            "fandhe-inject-files-src-{}-{index}",
+            std::process::id()
+        ));
+        std::fs::write(&path, body).expect("write host source");
+        let file = std::fs::File::open(&path).expect("open host source");
+        let content = InjectedContent::from_file(&file).expect("sealed content");
+        let _ = std::fs::remove_file(&path);
+        content
+    }
+
     fn set(files: &[(&str, &str, u32)]) -> InjectedFileSet {
         let mut s = InjectedFileSet::new();
-        for (dest, body, mode) in files {
+        for (i, (dest, body, mode)) in files.iter().enumerate() {
             s.push(
                 InjectedFileSpec::new(
                     dest,
-                    InjectedContent::from_bytes(body.as_bytes().to_vec()).expect("content"),
+                    sealed(body, i),
                     InjectedFileMode::new(*mode).expect("mode"),
                 )
                 .expect("spec"),

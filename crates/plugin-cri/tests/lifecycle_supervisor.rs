@@ -521,6 +521,39 @@ fn sup9_stop_escalates_to_sigkill_after_grace() {
     );
 }
 
+/// SUP-9・CRI-2（#2668）: `StopRequest::with_signal` の指定シグナルを stop の意図つきで送る。
+#[test]
+fn sup9_stop_sends_requested_signal_with_stop_intent() {
+    let sigint = Signal::new(2).expect("2 is valid");
+    let sim = running("c1", 4242);
+    *sim.stop_on.lock().expect("lock") = Some(sigint);
+    let h = harness(sim, LONG);
+    let req = StopRequest::new(cid("c1"), Duration::from_secs(5))
+        .expect("req")
+        .with_signal(sigint);
+    let status = h.rt.stop(&req).expect("stop");
+    assert_eq!(status.state(), ContainerState::Stopped);
+    assert_eq!(h.sim.calls(), [(Kind::Stop, sigint)]);
+}
+
+/// SUP-9・REPAIR-5・CRI-2（#2668）: 指定シグナルで止まらなくても、猶予後は無条件に SIGKILL へ昇格する。
+#[test]
+fn sup9_stop_custom_signal_still_escalates_to_sigkill() {
+    let sigint = Signal::new(2).expect("2 is valid");
+    let sim = running("c1", 4242);
+    *sim.stop_on.lock().expect("lock") = Some(Signal::SIGKILL);
+    let h = harness(sim, LONG);
+    let req = StopRequest::new(cid("c1"), Duration::ZERO)
+        .expect("req")
+        .with_signal(sigint);
+    let status = h.rt.stop(&req).expect("stop");
+    assert_eq!(status.state(), ContainerState::Stopped);
+    assert_eq!(
+        h.sim.calls(),
+        [(Kind::Stop, sigint), (Kind::Plain, Signal::SIGKILL)]
+    );
+}
+
 /// 冪等: Stopped には何も送らず、その status を返す。
 #[test]
 fn sup9_stop_already_stopped_is_idempotent() {

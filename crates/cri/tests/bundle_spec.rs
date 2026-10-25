@@ -176,6 +176,38 @@ fn env_merge_is_deterministic_and_container_overrides_image() {
     );
 }
 
+/// CRI-2・CORE-4（#2672）: `linux.cgroup_parent` は判断が出るまで `UNIMPLEMENTED`。固定文言で、値を message に含めない。
+/// 空文字列（未指定）は拒否しない。
+#[test]
+fn cri2_core4_cgroup_parent_is_rejected_with_fixed_message() {
+    let long = "a".repeat(4097);
+    let cases: [(&str, &str); 5] = [
+        ("kubepods", "kubepods"),
+        ("/kubepods/burstable/pod-abc", "pod-abc"),
+        ("kubepods-burstable-pod_abc.slice", "pod_abc"),
+        ("../escape", "escape"),
+        (long.as_str(), "aaaa"),
+    ];
+    for (value, leak) in cases {
+        let mut p = pod();
+        p.linux = Some(LinuxPodSandboxConfig {
+            cgroup_parent: value.into(),
+            ..Default::default()
+        });
+        let e = build_runtime_config(&p, &ctr(), &ImageDefaults::default()).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::Unimplemented, "{value}");
+        assert_eq!(e.message(), "linux.cgroup_parent is not supported");
+        assert!(!e.message().contains(leak), "{}", e.message());
+        let e = validate_config(&p, &ctr()).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::Unimplemented, "{value}");
+        assert_eq!(e.message(), "linux.cgroup_parent is not supported");
+    }
+    let mut p = pod();
+    p.linux = Some(LinuxPodSandboxConfig::default());
+    build_runtime_config(&p, &ctr(), &ImageDefaults::default())
+        .expect("empty cgroup_parent is accepted");
+}
+
 #[test]
 fn invalid_env_is_rejected_without_leaking_values() {
     let secret = "SUPER-SECRET-VALUE-123";
@@ -804,7 +836,6 @@ fn rejection_table_is_unimplemented() {
     add("cdi", &|_, c| {
         c.cdi_devices = vec![fandhe_container_cri::runtime::v1::CdiDevice::default()];
     });
-    add("stop_signal", &|_, c| c.stop_signal = 15);
     add("windows ctr", &|_, c| {
         c.windows = Some(Default::default());
     });
@@ -1085,5 +1116,26 @@ fn nested_duplicate_and_protected_overlapping_mounts_are_rejected() {
             ..Default::default()
         });
         assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument, "{bad:?}");
+    }
+}
+
+/// CRI-2（#2668）: stop_signal は受け入れる（config.json には出さず、停止時に StopRequest で運ぶ）。
+#[test]
+fn cri2_stop_signal_is_accepted() {
+    use fandhe_container_cri::runtime::v1::Signal;
+    for sig in [Signal::Sigint, Signal::Sigkill, Signal::RuntimeDefault] {
+        let mut c = ctr();
+        c.stop_signal = sig as i32;
+        build(&pod(), &c);
+    }
+}
+
+/// CRI-2（#2668）: 未知の stop_signal は `INVALID_ARGUMENT`。
+#[test]
+fn cri2_stop_signal_unknown_value_is_invalid_argument() {
+    for v in [66, -1] {
+        let mut c = ctr();
+        c.stop_signal = v;
+        assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
     }
 }

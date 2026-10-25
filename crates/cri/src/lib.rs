@@ -21,6 +21,7 @@ pub mod image_pull;
 pub mod image_service;
 pub mod instrument;
 pub mod runtime_service;
+pub mod stop_signal;
 
 /// cri-api の proto package `runtime` に対応するモジュール階層（CRI-3・TASK-56.4）。
 pub mod runtime {

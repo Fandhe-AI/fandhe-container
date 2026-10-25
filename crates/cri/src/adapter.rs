@@ -323,8 +323,24 @@ impl RuntimeAdapter {
     ///
     /// 負値は 0（即時 SIGKILL）に丸める。上限（24 時間。REPAIR-5）超過は `INVALID_ARGUMENT`。
     pub fn stop(&self, id: &str, timeout_secs: i64) -> Result<RuntimeContainerStatus, CriError> {
+        self.stop_with_signal(id, timeout_secs, Signal::SIGTERM.as_u8())
+    }
+
+    /// 最初に送るシグナル（Linux の番号 1..=64。範囲外は `INVALID_ARGUMENT`）を指定して停止する。
+    ///
+    /// CRI の `stop_signal`（`stop_signal::linux_stop_signal` で写した番号。CRI-2・PLUG-1。#2668）を
+    /// `StopRequest::with_signal` で実行層へ運ぶ。猶予後の SIGKILL への切り替えは実行層が無条件に行う。
+    pub fn stop_with_signal(
+        &self,
+        id: &str,
+        timeout_secs: i64,
+        signal: u8,
+    ) -> Result<RuntimeContainerStatus, CriError> {
+        let signal = Signal::new(signal).map_err(|e| CriError::from(&e))?;
         let grace = Duration::from_secs(u64::try_from(timeout_secs).unwrap_or(0));
-        let req = StopRequest::new(Self::id(id)?, grace).map_err(|e| CriError::from(&e))?;
+        let req = StopRequest::new(Self::id(id)?, grace)
+            .map_err(|e| CriError::from(&e))?
+            .with_signal(signal);
         Self::finish(id, self.runtime.stop(&req))
     }
 

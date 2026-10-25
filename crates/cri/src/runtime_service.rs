@@ -1432,14 +1432,22 @@ impl CriRuntimeService {
                 }
                 ContainerState::Running | ContainerState::Unknown => {}
             }
+            // 写像に失敗したら in_flight を立てる前に失敗する（SIGTERM へ黙って落とさない。fail-closed）。
+            let signal = crate::stop_signal::linux_stop_signal(record.config.stop_signal)
+                .map_err(|_| CriError::internal("stop_signal could not be resolved"))?;
             record.in_flight = true;
-            InFlightGuard::new(
-                Arc::clone(&self.registry),
-                req.container_id.clone(),
-                InFlightKind::Stop,
+            (
+                InFlightGuard::new(
+                    Arc::clone(&self.registry),
+                    req.container_id.clone(),
+                    InFlightKind::Stop,
+                ),
+                signal,
             )
         };
-        self.runtime_stop_one(binding, guard, req.timeout).await?;
+        let (guard, signal) = guard;
+        self.runtime_stop_one(binding, guard, req.timeout, signal)
+            .await?;
         Ok(v1::StopContainerResponse {})
     }
 
@@ -1453,6 +1461,7 @@ impl CriRuntimeService {
         binding: &RuntimeBinding,
         mut guard: InFlightGuard,
         grace_secs: i64,
+        signal: u8,
     ) -> Result<(), CriError> {
         let adapter = binding.adapter.clone();
         let id = guard.id.clone();
@@ -1461,7 +1470,7 @@ impl CriRuntimeService {
             self.runtime_timeout.saturating_add(grace),
             move || -> Result<(), CriError> {
                 guard.mark_dispatched();
-                match adapter.stop(&id, grace_secs) {
+                match adapter.stop_with_signal(&id, grace_secs, signal) {
                     Ok(status) if status.lifecycle == RuntimeLifecycle::Stopped => {
                         guard.set_exit(&status);
                         guard.commit()
@@ -1575,7 +1584,7 @@ impl CriRuntimeService {
             return Err(CriError::invalid_argument("pod_sandbox_id is required"));
         }
         let finished_at_nanos = now_nanos()?;
-        let mut pending = {
+        let pending = {
             let mut registry = self
                 .registry
                 .lock()
@@ -1596,6 +1605,8 @@ impl CriRuntimeService {
                 record.state = SandboxState::NotReady;
             }
             let mut ids = Vec::new();
+            // コンテナごとの停止シグナル（Linux の番号）。写像に失敗した件は停止を呼ばず INTERNAL にする。
+            let mut signals: HashMap<String, Result<u8, CriError>> = HashMap::new();
             for (id, c) in registry
                 .containers
                 .iter_mut()
@@ -1608,6 +1619,12 @@ impl CriRuntimeService {
                     ) => {
                         c.in_flight = true;
                         ids.push(id.clone());
+                        signals.insert(
+                            id.clone(),
+                            crate::stop_signal::linux_stop_signal(c.config.stop_signal).map_err(
+                                |_| CriError::internal("stop_signal could not be resolved"),
+                            ),
+                        );
                     }
                     (false, ContainerState::Running) => {
                         c.state = ContainerState::Exited;
@@ -1616,12 +1633,26 @@ impl CriRuntimeService {
                     _ => {}
                 }
             }
-            PendingMarks::new(Arc::clone(&self.registry), ids)
+            (PendingMarks::new(Arc::clone(&self.registry), ids), signals)
         };
+        let (mut pending, mut signals) = pending;
         let mut first_error = None;
         while let Some(guard) = pending.next_guard(InFlightKind::Stop) {
+            let signal = match signals.remove(&guard.id) {
+                Some(Ok(signal)) => signal,
+                Some(Err(status)) => {
+                    // guard の drop が in_flight を戻す。他の件の停止は続ける。
+                    first_error.get_or_insert(status);
+                    continue;
+                }
+                None => {
+                    first_error
+                        .get_or_insert(CriError::internal("stop_signal could not be resolved"));
+                    continue;
+                }
+            };
             if let Err(status) = self
-                .runtime_stop_one(binding, guard, SANDBOX_STOP_GRACE_SECS)
+                .runtime_stop_one(binding, guard, SANDBOX_STOP_GRACE_SECS, signal)
                 .await
             {
                 first_error.get_or_insert(status);

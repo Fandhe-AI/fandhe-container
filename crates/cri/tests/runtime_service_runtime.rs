@@ -28,6 +28,8 @@ use tonic::{Code, Request, Status};
 #[derive(Default)]
 struct FakeRuntime {
     calls: Mutex<Vec<String>>,
+    /// stop が受けたシグナル番号（CRI-2・#2668）。
+    stop_signals: Mutex<Vec<u8>>,
     fail_create: Mutex<Option<ErrorCode>>,
     fail_start: Mutex<Option<ErrorCode>>,
     /// true のとき start は created を返す（running でない応答の検証用）。
@@ -144,6 +146,7 @@ impl ContainerRuntime for Shared {
         Err(TraitError::new(ErrorCode::Unimplemented, "not used"))
     }
     fn stop(&self, r: &StopRequest) -> Result<ContainerStatus, TraitError> {
+        self.0.stop_signals.lock().unwrap().push(r.signal().as_u8());
         self.0.calls.lock().unwrap().push(format!(
             "stop {} {}s",
             r.id().as_str(),
@@ -318,6 +321,26 @@ async fn create(service: &CriRuntimeService, sandbox: &str, name: &str) -> Resul
         Request::new(v1::CreateContainerRequest {
             pod_sandbox_id: sandbox.into(),
             config: Some(container(name)),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .map(|r| r.into_inner().container_id)
+}
+
+async fn create_with_signal(
+    service: &CriRuntimeService,
+    sandbox: &str,
+    name: &str,
+    stop_signal: v1::Signal,
+) -> Result<String, Status> {
+    let mut config = container(name);
+    config.stop_signal = stop_signal as i32;
+    RuntimeService::create_container(
+        service,
+        Request::new(v1::CreateContainerRequest {
+            pod_sandbox_id: sandbox.into(),
+            config: Some(config),
             sandbox_config: None,
         }),
     )
@@ -1701,4 +1724,37 @@ async fn cri_2_start_unimplemented_returns_to_created() {
         status(&h.service, &id).await.state,
         S::ContainerCreated as i32
     );
+}
+
+/// CRI-2・PLUG-1（#2668）: StopContainer は作成時の stop_signal を Linux の番号へ写して実行層へ渡す（既定は SIGTERM）。
+#[tokio::test]
+async fn cri2_stop_container_uses_config_stop_signal() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let a = create_with_signal(&h.service, &sb, "a", v1::Signal::Sigint)
+        .await
+        .expect("create a");
+    start(&h.service, &a).await.expect("start a");
+    stop_c(&h.service, &a).await.expect("stop a");
+    let b = create(&h.service, &sb, "b").await.expect("create b");
+    start(&h.service, &b).await.expect("start b");
+    stop_c(&h.service, &b).await.expect("stop b");
+    assert_eq!(h.runtime.stop_signals.lock().unwrap().clone(), vec![2, 15]);
+}
+
+/// CRI-2・PLUG-1（#2668）: StopPodSandbox はコンテナごとの stop_signal を使う。
+#[tokio::test]
+async fn cri2_stop_pod_sandbox_uses_each_container_stop_signal() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    for (name, sig) in [("a", v1::Signal::Sigint), ("b", v1::Signal::Sigusr1)] {
+        let id = create_with_signal(&h.service, &sb, name, sig)
+            .await
+            .expect("create");
+        start(&h.service, &id).await.expect("start");
+    }
+    stop_sb(&h.service, &sb).await.expect("stop sandbox");
+    let mut got = h.runtime.stop_signals.lock().unwrap().clone();
+    got.sort_unstable();
+    assert_eq!(got, vec![2, 10]);
 }

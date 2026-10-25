@@ -102,7 +102,8 @@
 //!   未指定なら既定の `/dev/shm`(64 MiB)のみ・注入なし・専用 IPC namespace。`Host` は IPC namespace を作らず `/dev/shm` を載せず、
 //!   Landlock の暗黙マウントを `WithoutShm` にする(config.json からは外せない)。`reject_protected_paths_over_implicit_dev` は
 //!   常に全暗黙マウントで判定するため、`WithoutShm` でも `/dev/shm` 上の保護パス指定を拒否する(厳しい側。fail-closed)。
-//!   CLI から supervisor への受け渡し・範囲写像の holder が継承する注入内容の露出(#2628)は未解決
+//!   範囲写像の holder が継承するメモリから secret を外す方式(封印 memfd。#2628)は `InjectedContent` の doc を参照。
+//!   CLI から supervisor への受け渡しは未結線
 //! - bind・`/sys` の sysfs 以外の `mounts[]` の種類と config.json の `mounts[]` の tmpfs は `start` が拒否済みで、ここでは載せない
 
 #[cfg(target_os = "linux")]
@@ -437,20 +438,28 @@ fn check_tmpfs_against_readonly_paths(
     Ok(())
 }
 
-/// 範囲写像(`RootlessSubordinateIds`)と非空の機密ファイル注入の併用を拒否する(fail-closed)。
+/// 範囲写像(`RootlessSubordinateIds`)と、呼び出し元のメモリにある注入内容の併用を拒否する(fail-closed)。
 ///
-/// 範囲写像の ID 写像 holder は中間プロセスのメモリ(注入内容を含む)を fork で継承し、`run_userns_holder` で
-/// dumpable になるため、Yama=0 では同一 UID の別プロセスから secret を読める。露出の解消は #2628
-/// (SEC-1・SEC-5・CORE-6・SUP-12)。`build` と launch の両方で呼ぶ(builder の呼び出し順で迂回させない)。
+/// 範囲写像の ID 写像 holder は中間プロセスのメモリを fork で継承し、`run_userns_holder` で dumpable になるため、
+/// Yama=0 では同一 UID の別プロセスから継承したメモリを読める。注入内容が封印 memfd
+/// (`InjectedContent::from_file`)にあれば内容はユーザー空間のメモリに載らず holder も fd を持たないので通す。
+/// `InjectedContent::from_bytes` の内容(呼び出し元のヒープに残る)だけを拒否する(#2628・SEC-1・SEC-5・CORE-6・
+/// SUP-12。方式は `docs/design/rootless-id-map-holder.md`)。`build` と launch の両方で呼ぶ(builder の呼び出し順で迂回させない)。
 #[cfg(target_os = "linux")]
 fn refuse_inject_with_subordinate(
     privilege: IsolationPrivilege,
     options: &LaunchOptions,
 ) -> Result<(), TraitError> {
-    if privilege == IsolationPrivilege::RootlessSubordinateIds && !options.inject().is_empty() {
+    if privilege == IsolationPrivilege::RootlessSubordinateIds
+        && options
+            .inject()
+            .files()
+            .iter()
+            .any(|f| f.content().is_caller_memory())
+    {
         return Err(TraitError::new(
             ErrorCode::InvalidArgument,
-            "injected files cannot be combined with the subordinate id privilege model",
+            "injected file content held in process memory cannot be combined with the subordinate id privilege model",
         ));
     }
     Ok(())
@@ -1185,7 +1194,7 @@ impl Inner {
                 &default_options
             }
         };
-        // 範囲写像の holder は fork で機密を含むメモリを継承し dumpable になるため、併用は #2628 まで拒否する。
+        // 範囲写像の holder は fork でメモリを継承し dumpable になるため、呼び出し元のメモリにある注入内容は拒否する(#2628)。
         refuse_inject_with_subordinate(self.privilege, options)?;
         // Landlock は必須。ABI 不足・生成失敗は起動を拒否し、Landlock 無しで続けない(CORE-5・#1314)。
         // 利用者指定の tmpfs(暗黙の `/dev/shm` を除く)は `mounts[]` とは別枠で Landlock のルールにも載せる。載せないと
@@ -3677,6 +3686,32 @@ mod tests {
         LaunchOptions::new(tmpfs, set, ipc).expect("options")
     }
 
+    /// 封印 memfd の注入内容 1 件だけを持つ起動オプション(#2628)。
+    fn options_sealed(bytes: &[u8]) -> LaunchOptions {
+        use crate::injected_files::{InjectedContent, InjectedFileMode, InjectedFileSpec};
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("fandhe-sealed-opts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("secret");
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(bytes))
+            .expect("write");
+        let file = std::fs::File::open(&path).expect("open");
+        let content = InjectedContent::from_file(&file).expect("sealed");
+        assert!(!content.is_caller_memory());
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut set = InjectedFileSet::new();
+        set.push(
+            InjectedFileSpec::new("/etc/secret-token", content, InjectedFileMode::DEFAULT)
+                .expect("file"),
+        )
+        .expect("push");
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs.ensure_default_dev_shm().expect("shm");
+        LaunchOptions::new(tmpfs, set, LaunchIpcMode::Private).expect("options")
+    }
+
     /// SUP-12・CORE-5(#2625): 起動オプション未指定は従来どおり(`/dev/shm` のみ・注入なし・IPC あり・All)。
     #[test]
     fn sup12_default_launch_keeps_current_behavior() {
@@ -3878,7 +3913,7 @@ mod tests {
         }
     }
 
-    /// SEC-1・SEC-5・CORE-6(#2628 まで): 範囲写像と非空の注入の併用は launch で fork 前に拒否する。
+    /// SEC-1・SEC-5・CORE-6(#2628): 範囲写像と、呼び出し元のメモリにある注入内容の併用は launch で fork 前に拒否する。
     #[test]
     fn sec1_subordinate_privilege_with_inject_is_refused_before_fork() {
         let spec = spec_for("opts-sub-inject", serde_json::json!({}));
@@ -3916,7 +3951,7 @@ mod tests {
         assert_eq!(err.code(), ErrorCode::InvalidArgument);
         assert_eq!(
             err.message(),
-            "injected files cannot be combined with the subordinate id privilege model"
+            "injected file content held in process memory cannot be combined with the subordinate id privilege model"
         );
         assert!(
             !ev.lock()
@@ -3928,11 +3963,17 @@ mod tests {
         );
     }
 
-    /// SEC-1: 判定関数は範囲写像 + 注入だけを拒否し、注入なしの範囲写像・単一 ID + 注入は通す。
+    /// SEC-1・CORE-6(#2628): 判定関数は範囲写像 + 呼び出し元のメモリの注入内容だけを拒否し、注入なしの範囲写像・
+    /// 封印 memfd の注入・単一 ID + 注入は通す。
     #[test]
     fn sec1_refuse_inject_with_subordinate_only_rejects_the_combination() {
         let with = options_with(&[], true, &[("/etc/t", b"v")], LaunchIpcMode::Private);
         let without = options_with(&[], true, &[], LaunchIpcMode::Private);
+        let sealed = options_sealed(b"sealed-secret-value");
+        assert!(
+            refuse_inject_with_subordinate(IsolationPrivilege::RootlessSubordinateIds, &sealed)
+                .is_ok()
+        );
         assert!(
             refuse_inject_with_subordinate(IsolationPrivilege::RootlessSubordinateIds, &with)
                 .is_err()

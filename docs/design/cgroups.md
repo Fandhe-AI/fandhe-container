@@ -119,7 +119,7 @@ setter が無い既知の項目は未適用として記録し、create / start �
 
 ### `linux.cgroupsPath`
 
-型つき（4096 バイト以下・空と NUL は拒否）で保持するが、コンテナの cgroup は常に委譲スコープ配下の `fc-<id>@<n>` に置かれ、値を配置に使わない方針とする（#2010 の判断）。状態記録・記録済みスコープの検証つき削除（#2060）がこの配置を前提にしており、systemd cgroup driver は対象外（TASK-32）で `slice:prefix:name` 形式を解釈する必要も無いため。指定があれば値に関わらず（`..`・絶対パス・別表記を含め）`cgroup_requirement::check_cgroups_path` が create / start で fork 前に `UNIMPLEMENTED` として拒否する。受理に開く場合は、委譲スコープ配下に閉じる検証（`..`・絶対パス・symlink・別表記の拒否）と状態記録との整合を前提とし、オーナー判断を経て別 issue で扱う。
+型つき（4096 バイト以下・空と NUL は拒否）で保持するが、コンテナの cgroup は常に委譲スコープ配下の `fc-<id>@<n>` に置かれ、値を配置に使わない方針とする（#2010 の判断）。状態記録・記録済みスコープの検証つき削除（#2060）がこの配置を前提にしており、systemd cgroup driver は対象外（TASK-32）で `slice:prefix:name` 形式を解釈する必要も無いため。指定があれば値に関わらず（`..`・絶対パス・別表記を含め）`cgroup_requirement::check_cgroups_path` が create / start で fork 前に `UNIMPLEMENTED` として拒否する。受理に開く場合は、委譲スコープ配下に閉じる検証（`..`・絶対パス・symlink・別表記の拒否）と状態記録との整合を前提とし、オーナー判断を経て別 issue で扱う。CRI の `cgroup_parent` の受け入れ方針は判断記録 [cri-cgroup-parent.md](cri-cgroup-parent.md)（#2672・CRI-2・CORE-4）にまとめている。
 
 ## 前提環境（委譲スコープの作り手。#2081・CORE-3・CORE-4・SUP-1・CLI-1）
 

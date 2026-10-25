@@ -458,42 +458,53 @@ fn dns_resolv_conf_is_0644_even_under_umask_077() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn");
-    // 出力は別スレッドで収集する（パイプ満杯による子のブロックを避ける）。
+    // 出力は別スレッドで収集する（パイプ満杯による子のブロックを避ける）。結果は channel で受け、
+    // 孫プロセスがパイプを握り続けても join で無期限に止まらないようにする。
     let mut so = child.stdout.take().expect("stdout");
     let mut se = child.stderr.take().expect("stderr");
-    let h_out = std::thread::spawn(move || {
+    let (tx_out, rx_out) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (tx_err, rx_err) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
         let mut b = Vec::new();
         let _ = std::io::Read::read_to_end(&mut so, &mut b);
-        b
+        let _ = tx_out.send(b);
     });
-    let h_err = std::thread::spawn(move || {
+    std::thread::spawn(move || {
         let mut b = Vec::new();
         let _ = std::io::Read::read_to_end(&mut se, &mut b);
-        b
+        let _ = tx_err.send(b);
     });
+    let grace = std::time::Duration::from_secs(5);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let status = loop {
         if let Some(st) = child.try_wait().expect("try_wait") {
             break Some(st);
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
+            // kill の結果を確認し、回収も有限の猶予内の try_wait ポーリングで行う。
+            let kill_result = child.kill();
+            let reap_deadline = std::time::Instant::now() + grace;
+            let mut reaped = false;
+            while std::time::Instant::now() < reap_deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    reaped = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            panic!("child timed out after 60s (kill: {kill_result:?}, reaped: {reaped})");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    // 子が kill 済み（または終了済み）なのでパイプは閉じ、収集スレッドは終わる。
-    let stdout_bytes = h_out.join().expect("stdout thread");
-    let stderr_bytes = h_err.join().expect("stderr thread");
+    let stdout_bytes = rx_out.recv_timeout(grace).unwrap_or_default();
+    let stderr_bytes = rx_err.recv_timeout(grace).unwrap_or_default();
     let stdout = String::from_utf8_lossy(&stdout_bytes);
-    let status = status.unwrap_or_else(|| {
-        panic!(
-            "child timed out after 60s: {stdout} {}",
-            String::from_utf8_lossy(&stderr_bytes)
-        )
-    });
-    assert!(status.success(), "child failed: {stdout}");
+    let status = status.expect("status is Some when the loop breaks normally");
+    assert!(
+        status.success(),
+        "child failed: {stdout} {}",
+        String::from_utf8_lossy(&stderr_bytes)
+    );
     assert!(stdout.contains("1 passed"), "child did not run: {stdout}");
 }
 

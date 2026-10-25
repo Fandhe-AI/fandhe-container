@@ -348,6 +348,10 @@ pub struct StagePipeline {
     /// `process.user` の uid・gid（0/0 以外のときだけ `Some`）。組み込みの capability 削減段が、補助グループの
     /// 消去の後・bounding set の削減の前に切り替える（#1462 の経路。OCI-1・SEC-5・TASK-29）。
     process_ids: Option<ProcessIds>,
+    /// `process.user.additionalGids`。空でなければ組み込みの capability 削減段が `setgroups(list)` で適用し、
+    /// 読み戻して確かめる（空なら補助グループを消去する。写像との照合は launcher が fork の前に済ませる。
+    /// OCI-1・SEC-5・CORE-6・#2667）。
+    supplementary_groups: Vec<u32>,
     /// 組み込みの capability 削減段が適用する許可集合（既定は OCI 既定集合。`process.capabilities` の drop で絞る。
     /// SEC-1・CRI-2・#2666）。OCI 既定の部分集合だけを表す型なので、ここから広げる経路は無い。
     capabilities: ContainerCapabilities,
@@ -399,6 +403,7 @@ impl StagePipeline {
             landlock: None,
             mounts: MountedTargets::new(),
             process_ids: None,
+            supplementary_groups: Vec::new(),
             capabilities: ContainerCapabilities::oci_default(),
             listener_sender: None,
             seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
@@ -425,6 +430,12 @@ impl StagePipeline {
     /// capability 削減段が適用する許可集合を設定する（本番 launcher だけが `config.json` の解釈結果で呼ぶ。SEC-1・#2666）。
     pub(crate) fn with_capabilities(mut self, capabilities: ContainerCapabilities) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    /// `process.user.additionalGids` を capability 削減段で適用させる（launch。OCI-1・SEC-5・CORE-6・#2667）。
+    pub(crate) fn with_supplementary_groups(mut self, gids: Vec<u32>) -> Self {
+        self.supplementary_groups = gids;
         self
     }
 
@@ -626,11 +637,15 @@ impl StagePipeline {
                     let applied = apply_default_capabilities_for_launch(
                         &mut ThreadCountSource::ProcSelf,
                         self.process_ids,
+                        &self.supplementary_groups,
                         self.capabilities,
                     );
                     #[cfg(test)]
-                    let applied =
-                        apply_default_capabilities_ids(self.process_ids, self.capabilities);
+                    let applied = apply_default_capabilities_ids(
+                        self.process_ids,
+                        &self.supplementary_groups,
+                        self.capabilities,
+                    );
                     let r = applied.map_err(|e| e.at_stage(kind.isolation_stage()))?;
                     capability_report = Some(r);
                     capabilities_ev = Some(CapabilitiesDropped { _private: () });
@@ -1437,6 +1452,26 @@ mod tests {
         assert_eq!(
             super::super::capabilities::testing::take_allowed_seen(),
             Some(caps)
+        );
+        take();
+    }
+
+    /// OCI-1・SEC-5・CORE-6（#2667）: `with_supplementary_groups` の一覧が削減段へ届き、既定は空。
+    #[test]
+    fn oci1_sec5_with_supplementary_groups_reaches_capability_drop() {
+        take();
+        StagePipeline::new()
+            .with_supplementary_groups(vec![5, 6])
+            .run_then(|_, _, _| Ok(()))
+            .unwrap();
+        assert_eq!(
+            super::super::capabilities::testing::take_groups_seen(),
+            Some(vec![5, 6])
+        );
+        StagePipeline::new().run_then(|_, _, _| Ok(())).unwrap();
+        assert_eq!(
+            super::super::capabilities::testing::take_groups_seen(),
+            Some(Vec::new())
         );
         take();
     }

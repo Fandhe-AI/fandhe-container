@@ -62,8 +62,9 @@
 //! `Unimplemented` で拒否する（指定より強い権限・弱い分離での起動を防ぐ）。後続タスクが適用を
 //! 実装した時点で該当検査を外す。
 //!
-//! - `process.user.additionalGids` が空でない（補助グループの適用は未実装。`process.cwd` は pivot 直後に fd 起点で適用し、
-//!   `process.user` の uid・gid は launcher が user namespace の写像と照合して適用する。OCI-1・SEC-5）
+//! - （適用済み）`process.cwd` は pivot 直後に fd 起点で適用し、`process.user` の uid・gid と
+//!   `additionalGids` は launcher が user namespace の写像と照合して適用する（OCI-1・SEC-5・CORE-6・#2667）。
+//!   `additionalGids` の写像外・単一 ID 写像での指定は launcher が fork の前に拒否する
 //! - `process.terminal` が true（端末受け渡し未実装）
 //! - `mounts` のうち bind・`/sys` の sysfs（`SysfsMountSpec`。読み取り専用で供給する。#2020）以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
 //!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind〔#1917〕は未対応）
@@ -854,6 +855,7 @@ fn build_spec_with_swap(
     validate_entrypoint_limits(process.args(), process.env())?;
     let user = process.user();
     let ids = (user.uid(), user.gid());
+    let additional_gids = user.additional_gids().to_vec();
     // cwd は字句検証だけここで行い、適用は子が pivot 直後に fd 起点で行う（不在・非ディレクトリは launch 側の拒否。OCI-1）。
     let working_dir = ContainerWorkingDir::parse(process.cwd()).ok_or_else(|| {
         TraitError::new(
@@ -861,10 +863,7 @@ fn build_spec_with_swap(
             "process.cwd must be a normalized absolute path without .. components",
         )
     })?;
-    // uid・gid は launcher が写像と照合して適用する（SEC-5）。補助グループは未実装のため拒否する（REPAIR-3）。
-    if !user.additional_gids().is_empty() {
-        return Err(unsupported("process.user.additionalGids"));
-    }
+    // uid・gid・補助グループは launcher が写像と照合して適用する（SEC-5・#2667）。
     if process.terminal() {
         return Err(unsupported("process.terminal"));
     }
@@ -943,6 +942,7 @@ fn build_spec_with_swap(
         ids,
     )
     .with_sysfs(sysfs)
+    .with_additional_gids(additional_gids)
     .with_namespace_join(namespace_join))
 }
 
@@ -2154,10 +2154,6 @@ mod tests {
     #[test]
     fn sec1_start_rejects_unsupported_fields() {
         let cases: Vec<Case> = vec![
-            (
-                "addgid",
-                Box::new(|c| c["process"]["user"]["additionalGids"] = json!([5])),
-            ),
             ("tty", Box::new(|c| c["process"]["terminal"] = json!(true))),
             (
                 "nspath",
@@ -2274,6 +2270,22 @@ mod tests {
             err.message(),
             "process.cwd must be a normalized absolute path without .. components"
         );
+    }
+
+    /// OCI-1・SEC-5・CORE-6（#2667）: `process.user.additionalGids` は start で拒否せず、検証済みの値として
+    /// launcher へ渡る（写像との照合と適用は launcher と子）。指定が無ければ空。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci1_start_passes_additional_gids_to_launcher() {
+        let mut cfg = valid_config();
+        cfg["process"]["user"]["uid"] = json!(1000);
+        cfg["process"]["user"]["gid"] = json!(1000);
+        cfg["process"]["user"]["additionalGids"] = json!([5, 6]);
+        let spec = build_spec_with_state_root("addgids", &cfg, None).expect("spec");
+        assert_eq!(spec.additional_gids(), [5, 6]);
+
+        let spec = build_spec_with_state_root("no-addgids", &valid_config(), None).expect("spec");
+        assert_eq!(spec.additional_gids(), [] as [u32; 0]);
     }
 
     /// bind mount つきの config（宛先・元・オプションを指定）。

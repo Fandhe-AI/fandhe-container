@@ -59,7 +59,8 @@
 //!   （[`prepare_exec_restrictions`] の最後。対象の user namespace へ `setns` した後は `deny` で消せなくなり、
 //!   起動者のグループを持ち込むため。参加前に消せば参加後の削減は「元から空」になり、結果には参加前の消去を
 //!   残す）。`config.json` の `process.user.additionalGids` は launch が
-//!   非空を拒否するので「空」が唯一の指定で、解釈（指定したグループの付与）は launch・exec とも未実装。user
+//!   写像と照合して適用する（#2667）が、exec は非空を `process_ids_from_config` が拒否するので「空」が唯一の
+//!   指定で、exec のグループ付与は未実装。user
 //!   namespace が `setgroups` を `deny` にしている場合（rootless。`setns` の前に開いた自分の procfs の `setgroups` で
 //!   確認する。`EPERM` という errno だけでは判断しない）は消去できないため現状のまま残し、結果
 //!   （[`ExecRestrictionReport::supplementary_groups`]）へ記録する。それ以外の理由で消去できなければ拒否する

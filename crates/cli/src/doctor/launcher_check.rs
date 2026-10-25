@@ -13,10 +13,12 @@
 //!
 //! # 構成
 //! - 事実の収集（[`collect`]。Linux のみ）と評価（[`evaluate`]。純粋関数で全 OS で単体テストできる）を分ける。
-//! - 昇格手段の判定の後に、ランチャーの実体（正規化済みパス）が `nosuid` のマウント上にあるかを mountinfo の
-//!   per-mount options で調べる（[`apply_mount`]。#2661）。`nosuid` なら setuid も file capability も効かない
-//!   ため、昇格手段が正しくても `nosuid_mount` の警告にする。mountinfo を読めない・該当マウントが無いときは、
-//!   `start` が通るはずの状態を Ok と断定せず判定不能にする（fail-closed）。
+//! - 昇格手段の判定の後に、ランチャーの実体が `nosuid` のマウント上にあるかを調べる（[`apply_mount`]。#2661）。
+//!   実体を開いた fd の mount ID（`/proc/self/fdinfo/<fd>` の `mnt_id`）で mountinfo の行を引き、その per-mount
+//!   options を見る（パスの最長一致は、重ねマウント・`mount --move` で隠れた古い行を選びうるため使わない）。
+//!   `nosuid` なら setuid も file capability も効かないため、昇格手段が正しくても `nosuid_mount` の警告にする。
+//!   実体を開けない・fdinfo や mountinfo を読めない・該当の行が無いときは、`start` が通るはずの状態を Ok と
+//!   断定せず判定不能にする（fail-closed）。
 //! - 出力は `user_scope_check` と同じ JSON Lines（`severity`・`code`・`message`・`remediation`・`check`・`state`）で、
 //!   `check` は常に `launcher`。パス・uid・mode・errno・capability の生の値は載せない（REPAIR-4）。
 //! - 終了ステータス: Warning があれば 3、そうでなく判定不能があれば 4、それ以外は 0。rootless のインストール
@@ -26,7 +28,7 @@
 //! - ランチャー・supervisor の hash / 署名の照合は扱わない（`docs/design/privilege-separation.md` 12 章の未確認事項。
 //!   #2599 の受け入れ条件 3）。
 //! - LSM 下の挙動は検出しない。
-//! - `nosuid` の検出は doctor 自身の mount namespace から見た `/proc/self/mountinfo` だけを根拠にする。`start` が
+//! - `nosuid` の検出は doctor 自身の mount namespace から見た fdinfo と `/proc/self/mountinfo` だけを根拠にする。`start` が
 //!   systemd-run 経由で起動する実行環境の mount namespace とは食い違いうる。superblock の所有 user namespace が
 //!   init でないために `mnt_may_suid` が偽になる場合も検出しない。
 //! - 診断と `start` の実行の間の差し替え（TOCTOU）は防げない。昇格の可否は実行時にランチャーが検証する（fail-closed）。
@@ -105,7 +107,7 @@ pub enum LauncherMount {
     Allowed,
     /// `nosuid` のマウント上にある。
     Nosuid,
-    /// 確認できなかった（mountinfo を読めない・上限超過・該当マウント無し・壊れた行）。
+    /// 確認できなかった（実体を開けない・fdinfo / mountinfo を読めない・上限超過・該当の行が無い・壊れた行）。
     Unknown,
 }
 
@@ -321,7 +323,9 @@ fn evaluate_elevation(e: Elevation) -> UserScopeReport {
             Notice,
             "LAUNCHER_ELEVATION_INCONCLUSIVE",
             "the mount options of the filesystem that holds the privileged launcher could not be read",
-            vec!["Check that /proc is mounted and /proc/self/mountinfo is readable"],
+            vec![
+                "Check that /proc is mounted and /proc/self/mountinfo and /proc/self/fdinfo are readable",
+            ],
             "mount_unreadable",
         )),
         Elevation::Unreadable => report(diag(
@@ -334,18 +338,15 @@ fn evaluate_elevation(e: Elevation) -> UserScopeReport {
     }
 }
 
-/// mountinfo の内容と実体パスから `nosuid` 属性を判定する純粋関数（Linux のみ。#2661）。
-/// 読めていない（`None`）・絶対パスでない・該当マウントが無い・壊れた行は `Unknown`（fail-closed）。
+/// mountinfo の内容と実体の mount ID から `nosuid` 属性を判定する純粋関数（Linux のみ。#2661）。
+/// どちらかが得られていない（`None`）・該当の行が無い・壊れた行は `Unknown`（fail-closed）。
 #[cfg(target_os = "linux")]
-fn launcher_mount_state(mountinfo: Option<&str>, path: &std::path::Path) -> LauncherMount {
-    let Some(info) = mountinfo else {
+fn launcher_mount_state(mountinfo: Option<&[u8]>, mount_id: Option<u64>) -> LauncherMount {
+    let (Some(info), Some(id)) = (mountinfo, mount_id) else {
         return LauncherMount::Unknown;
     };
-    if !path.is_absolute() {
-        return LauncherMount::Unknown;
-    }
     use fandhe_container_net::netns::MountOptionState;
-    match fandhe_container_net::netns::covering_mount_has_option(info, path, "nosuid") {
+    match fandhe_container_net::netns::mount_option_by_id(info, id, "nosuid") {
         MountOptionState::Present => LauncherMount::Nosuid,
         MountOptionState::Absent => LauncherMount::Allowed,
         // 将来の理由追加も含め、判定できないものは Unknown（fail-closed）。
@@ -353,14 +354,13 @@ fn launcher_mount_state(mountinfo: Option<&str>, path: &std::path::Path) -> Laun
     }
 }
 
-/// mountinfo を外部入力として上限つきで読む。超過・読み取り失敗・不正な UTF-8 は `None`（判定不能。fail-closed）。
-///
-/// 不正な UTF-8 を置換して続けると、置換後の文字列と実体パスの生バイトを比べる `covering_mount_has_option` が
-/// 非 UTF-8 名の nosuid マウントを取り逃がし、祖先のマウントを選んで `Allowed` と誤判定する。
+/// ランチャーの実体を読み取り専用で開き、その fd の mount ID を得る。開けない・読めないときは `None`。
+/// 実体はインストールスクリプトが 0755 / 4755 で置くため読める。開くのは mount ID を得るためだけで、
+/// 中身は読まない。
 #[cfg(target_os = "linux")]
-fn read_mountinfo_strict(path: &std::path::Path) -> Option<String> {
-    let bytes = super::read_limited_bytes(path, super::MAX_MOUNTINFO_READ).ok()?;
-    String::from_utf8(bytes).ok()
+fn launcher_mount_id(path: &std::path::Path) -> Option<u64> {
+    let file = std::fs::File::open(path).ok()?;
+    fandhe_container_net::netns::file_mount_id(&file).ok()
 }
 
 /// 事実を集める（読み取りのみ。`start` と同じ `classify_launcher_beside` を使う）。
@@ -409,8 +409,13 @@ pub fn collect() -> LauncherFindings {
         }),
         LauncherPresence::Trusted(t) => {
             let xattr = read_launcher_file_caps(&t.path);
-            let mountinfo = read_mountinfo_strict(std::path::Path::new("/proc/self/mountinfo"));
-            let mount = launcher_mount_state(mountinfo.as_deref(), &t.path);
+            // mountinfo は外部入力として上限つきで生バイトのまま読む（パス欄は比べないため置換は不要）。
+            let mountinfo = super::read_limited_bytes(
+                std::path::Path::new("/proc/self/mountinfo"),
+                super::MAX_MOUNTINFO_READ,
+            )
+            .ok();
+            let mount = launcher_mount_state(mountinfo.as_deref(), launcher_mount_id(&t.path));
             let elevation = match assess_elevation(t.owner_uid, t.mode, &xattr) {
                 ElevationAssessment::SetuidRoot => Elevation::SetuidRoot,
                 ElevationAssessment::SetuidRootRestrictedByFileCaps => {
@@ -612,7 +617,7 @@ mod tests {
         let (out, st) = one(LauncherState::Trusted(Elevation::MountUnknown));
         assert_eq!(
             out,
-            "{\"severity\":\"notice\",\"code\":\"LAUNCHER_ELEVATION_INCONCLUSIVE\",\"message\":\"the mount options of the filesystem that holds the privileged launcher could not be read\",\"remediation\":[\"Check that /proc is mounted and /proc/self/mountinfo is readable\"],\"check\":\"launcher\",\"state\":\"mount_unreadable\"}\n"
+            "{\"severity\":\"notice\",\"code\":\"LAUNCHER_ELEVATION_INCONCLUSIVE\",\"message\":\"the mount options of the filesystem that holds the privileged launcher could not be read\",\"remediation\":[\"Check that /proc is mounted and /proc/self/mountinfo and /proc/self/fdinfo are readable\"],\"check\":\"launcher\",\"state\":\"mount_unreadable\"}\n"
         );
         assert_eq!(st, DoctorExitStatus::Inconclusive);
     }
@@ -647,42 +652,40 @@ mod tests {
         }
     }
 
-    /// SUP-14・#2661: mountinfo の fixture からの nosuid 判定。
+    /// SUP-14・#2661: mountinfo の fixture と mount ID からの nosuid 判定（行は ID で引き、非 UTF-8 の
+    /// パス欄があっても置換せずに判定する）。
     #[cfg(target_os = "linux")]
     #[test]
     fn sup14_launcher_mount_state_from_fixture() {
-        use std::path::Path;
-        let info = "\
+        let info: &[u8] = b"\
 22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
 26 22 0:23 / /opt/fc rw,nosuid,relatime - tmpfs tmpfs rw
+27 22 0:24 / /opt/\xff rw,nosuid - tmpfs tmpfs rw
 ";
-        let l = "fandhe-container-launcher";
-        let st = |i: Option<&str>, p: &str| launcher_mount_state(i, &Path::new(p).join(l));
-        assert_eq!(st(Some(info), "/opt/fc/bin"), LauncherMount::Nosuid);
-        assert_eq!(st(Some(info), "/usr/local/bin"), LauncherMount::Allowed);
-        assert_eq!(st(None, "/opt/fc/bin"), LauncherMount::Unknown);
-        assert_eq!(st(Some(""), "/opt/fc/bin"), LauncherMount::Unknown);
-        assert_eq!(st(Some(info), "rel/bin"), LauncherMount::Unknown);
+        let st = launcher_mount_state;
+        assert_eq!(st(Some(info), Some(26)), LauncherMount::Nosuid);
+        assert_eq!(st(Some(info), Some(22)), LauncherMount::Allowed);
+        assert_eq!(st(Some(info), Some(27)), LauncherMount::Nosuid);
+        assert_eq!(st(Some(info), Some(99)), LauncherMount::Unknown);
+        assert_eq!(st(None, Some(26)), LauncherMount::Unknown);
+        assert_eq!(st(Some(info), None), LauncherMount::Unknown);
+        assert_eq!(st(Some(b""), Some(22)), LauncherMount::Unknown);
     }
 
-    /// SUP-14・#2661: 不正な UTF-8 を含む mountinfo は置換せず判定不能（`None`）にする。
+    /// SUP-14・#2661: 実体を開けないときは mount ID を得られず判定不能（`None`）。開けるファイルでは得られる。
     #[cfg(target_os = "linux")]
     #[test]
-    fn sup14_mountinfo_non_utf8_is_unreadable() {
-        let dir = std::env::temp_dir().join(format!("fc-mi-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        let ok = dir.join("ok");
-        std::fs::write(&ok, b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n").expect("write");
-        assert_eq!(
-            read_mountinfo_strict(&ok).as_deref(),
-            Some("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n")
+    fn sup14_launcher_mount_id_needs_openable_file() {
+        let missing = std::env::temp_dir().join(format!("fc-mi-missing-{}", std::process::id()));
+        assert_eq!(launcher_mount_id(&missing), None);
+        let exe = std::env::current_exe().expect("exe");
+        let id = launcher_mount_id(&exe).expect("mount id of the test binary");
+        let info = std::fs::read("/proc/self/mountinfo").expect("mountinfo");
+        assert_ne!(
+            launcher_mount_state(Some(&info), Some(id)),
+            LauncherMount::Unknown,
+            "mount id {id}"
         );
-        let bad = dir.join("bad");
-        std::fs::write(&bad, b"26 22 0:23 / /opt/\xff rw,nosuid - tmpfs tmpfs rw\n")
-            .expect("write");
-        assert_eq!(read_mountinfo_strict(&bad), None);
-        assert_eq!(read_mountinfo_strict(&dir.join("missing")), None);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SUP-14・#2599: rootful・読めない・対象外・exe 解決不可の扱い。

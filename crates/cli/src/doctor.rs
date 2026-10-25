@@ -25,7 +25,7 @@
 //!
 //! rootful のインストールで `start` が選ぶ特権ランチャー（CLI の実体の隣の固定名）の信頼条件と、昇格手段
 //! （file capability、xattr 非対応なら setuid root）を、`start` と同じ判定関数で読み取り専用に診断する
-//! （`launcher_check`。SUP-14・CORE-6）。実体が `nosuid` マウント上にあるかも `/proc/self/mountinfo` で調べる（#2661）。hash / 署名の照合は扱わない（`privilege-separation.md` 12 章の未確認事項）。
+//! （`launcher_check`。SUP-14・CORE-6）。実体が `nosuid` マウント上にあるかも、実体の fd の mount ID と `/proc/self/mountinfo` で調べる（#2661）。hash / 署名の照合は扱わない（`privilege-separation.md` 12 章の未確認事項）。
 //! 終了ステータスは 4 つの結果の合成。
 //!
 //! # 確認方法

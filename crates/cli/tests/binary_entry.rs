@@ -2905,10 +2905,10 @@ fn sup14_doctor_reports_launcher_without_elevation() {
 }
 
 /// `/proc/self/mountinfo` を試験側で独立に解析し、`path` を含む最長一致のマウント（同長は後の行）が
-/// `nosuid` かを返す。製品側の解析（`covering_mount_has_option`）と別実装で期待値を決める。
-/// 製品側は親子関係を辿って隠れたマウントを除くが、ここは最長一致だけで選ぶ。試験の一時ディレクトリの祖先に
-/// 後から重ねたマウント（古い子マウントを隠すもの）が無い前提で両者は一致する（隠れたマウントの選び方は
-/// net の単体試験 `sup14_hidden_child_mount_is_not_selected` が照合する）。
+/// `nosuid` かを返す。製品側（実体の fd の mount ID で mountinfo の行を引く `mount_option_by_id`）と別の方法で
+/// 期待値を決める。ここはパスの最長一致で選ぶため、試験の一時ディレクトリの祖先に後から重ねたマウント
+/// （古い子マウントを隠すもの）が無い前提で両者は一致する（ID で引くこと自体は net の単体試験
+/// `sup14_mount_option_by_id` が照合する）。
 #[cfg(target_os = "linux")]
 fn test_side_is_nosuid(path: &std::path::Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
@@ -2938,8 +2938,8 @@ fn test_side_is_nosuid(path: &std::path::Path) -> bool {
 }
 
 /// SUP-14・CORE-6（#2661）: 実バイナリの `doctor` が、兄弟のランチャー（file capability も setuid も持たない
-/// 信頼できる実行ファイル）の載るマウントの `nosuid` 属性を診断に反映する。`collect` の実体パス解決・mountinfo 読み取り・
-/// 評価・JSON 出力・終了コードをつなぐ経路を観測する。期待値は試験側で独立に求める。nosuid ならば `nosuid_mount`、
+/// 信頼できる実行ファイル）の載るマウントの `nosuid` 属性を診断に反映する。`collect` の実体パス解決・実体の fd の
+/// mount ID の取得・mountinfo 読み取り・評価・JSON 出力・終了コードをつなぐ経路を観測する。期待値は試験側で独立に求める。nosuid ならば `nosuid_mount`、
 /// そうでなければ `no_file_capabilities`（どちらも warning・終了コード 3）。mountinfo を読めない場合の
 /// `mount_unreadable` は、実バイナリから /proc を差し替えられないため `launcher_check` の単体試験で照合する。
 /// nosuid マウントの人工的な構築（root・mount 権限が要る）はこの試験では行わない。

@@ -78,7 +78,7 @@ use crate::sys;
 use crate::traits::types::ErrorCode;
 
 use super::launch_status::{
-    ALL_ERROR_CODES, LaunchAudit, PrePivotStatusError, read_exec_phase_status, read_line_bounded,
+    LaunchAudit, PrePivotStatusError, read_exec_phase_status, read_line_bounded,
     read_pre_pivot_status, resolve_exec_phase_status, resolve_pre_pivot_status,
 };
 use super::process::{
@@ -226,10 +226,7 @@ impl IntermediateReport {
         match parts.as_slice() {
             ["K", pid] => Ok(Self::Pid1(parse_pid(pid)?)),
             ["R", code, phase] => {
-                let code = ALL_ERROR_CODES
-                    .into_iter()
-                    .find(|c| c.as_str() == *code)
-                    .ok_or(PrePivotStatusError::Malformed)?;
+                let code = ErrorCode::from_name(code).ok_or(PrePivotStatusError::Malformed)?;
                 let phase =
                     IntermediatePhase::from_token(phase).ok_or(PrePivotStatusError::Malformed)?;
                 Ok(Self::Failed { code, phase })
@@ -1388,7 +1385,7 @@ mod tests {
     /// REPAIR-2: 全 `ErrorCode` と全段が往復でき、最長の行が上限に収まる。
     #[test]
     fn repair2_every_code_and_phase_fits_and_roundtrips() {
-        for code in ALL_ERROR_CODES {
+        for code in ErrorCode::ALL {
             for phase in IntermediatePhase::ALL {
                 let report = IntermediateReport::Failed { code, phase };
                 let encoded = report.encode();

@@ -1272,7 +1272,8 @@ jobs:
             'production_launcher: scenario=user-applied uid=gid=1000 host_uid=' \
             'production_launcher: exit_signal recorded once via audit relay (scenario=Q)' \
             'production_launcher: launch options reached the container (scenario=S ipc=host tmpfs=/run' \
-            'production_launcher: capabilities drop applied (scenario=T pid='; do
+            'production_launcher: capabilities drop applied (scenario=T pid=' \
+            'production_launcher: scenario=rslave-bind host='; do
             if ! grep -Fq "${part}" "${log}"; then
               echo "::error::production_launcher did not report: ${part} (possibly not executed)" >&2
               exit 1

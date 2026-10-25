@@ -16,6 +16,7 @@ use fandhe_container_cri::runtime::v1::{
     NamespaceOption, PodSandboxConfig, PodSandboxMetadata, SecurityProfile, UserNamespace,
     security_profile::ProfileType,
 };
+use fandhe_container_cri::runtime::v1::{CdiDevice, Device};
 use serde_json::Value;
 
 fn pod() -> PodSandboxConfig {
@@ -204,6 +205,60 @@ fn cri2_core4_cgroup_parent_is_rejected_with_fixed_message() {
     p.linux = Some(LinuxPodSandboxConfig::default());
     build_runtime_config(&p, &ctr(), &ImageDefaults::default())
         .expect("empty cgroup_parent is accepted");
+}
+
+/// CRI-2・GPU-1（#2673）: `devices` / `cdi_devices` は判断が出るまで `UNIMPLEMENTED`。固定文言で、値を message に含めない。
+/// 両方指定は先に評価する `devices` の文言。空は拒否しない。
+#[test]
+fn cri2_gpu1_devices_and_cdi_devices_are_rejected_with_fixed_message() {
+    let long = "a".repeat(4097);
+    let dev = |path: &str, perms: &str| Device {
+        container_path: path.into(),
+        host_path: path.into(),
+        permissions: perms.into(),
+    };
+    let cases = [
+        (dev("/dev/nvidia0", "rwm"), "nvidia0"),
+        (dev("/dev/../etc/shadow", "rwm"), "shadow"),
+        (dev(long.as_str(), "rwm"), "aaaa"),
+        (dev("/dev/x\u{1}y", "r\u{7}"), "/dev/x"),
+    ];
+    for (d, leak) in cases {
+        let mut c = ctr();
+        c.devices = vec![d];
+        let p = pod();
+        let e = build_runtime_config(&p, &c, &ImageDefaults::default()).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::Unimplemented);
+        assert_eq!(e.message(), "devices is not supported");
+        assert!(!e.message().contains(leak), "{}", e.message());
+        let e = validate_config(&p, &c).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::Unimplemented);
+        assert_eq!(e.message(), "devices is not supported");
+    }
+    for (name, leak) in [
+        ("nvidia.com/gpu=all", "nvidia"),
+        ("vendor.example/class=dev0", "dev0"),
+        (long.as_str(), "aaaa"),
+    ] {
+        let mut c = ctr();
+        c.cdi_devices = vec![CdiDevice { name: name.into() }];
+        let p = pod();
+        let e = build_runtime_config(&p, &c, &ImageDefaults::default()).unwrap_err();
+        assert_eq!(e.code(), CriErrorCode::Unimplemented);
+        assert_eq!(e.message(), "cdi_devices is not supported");
+        assert!(!e.message().contains(leak), "{}", e.message());
+        let e = validate_config(&p, &c).unwrap_err();
+        assert_eq!(e.message(), "cdi_devices is not supported");
+    }
+    let mut c = ctr();
+    c.devices = vec![dev("/dev/nvidia0", "rwm")];
+    c.cdi_devices = vec![CdiDevice {
+        name: "nvidia.com/gpu=all".into(),
+    }];
+    let e = build_runtime_config(&pod(), &c, &ImageDefaults::default()).unwrap_err();
+    assert_eq!(e.message(), "devices is not supported");
+    build_runtime_config(&pod(), &ctr(), &ImageDefaults::default())
+        .expect("empty devices and cdi_devices are accepted");
 }
 
 #[test]

@@ -7,10 +7,13 @@ use fandhe_container_cri::bundle::spec::{
     MAX_ARGS, MAX_CONFIG_BYTES, MAX_ENV, MAX_HOSTNAME_BYTES, MAX_MOUNTS, MAX_PATH_BYTES,
     MAX_PROTECTED_PATHS, MAX_STRING_BYTES,
 };
-use fandhe_container_cri::bundle::{ImageDefaults, build_runtime_config, validate_config};
+use fandhe_container_cri::bundle::{
+    BundleFiles, ImageDefaults, build_runtime_config, build_runtime_config_with_files,
+    validate_config,
+};
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::runtime::v1::{
-    Capability, ContainerConfig, ContainerMetadata, ImageSpec, Int64Value, KeyValue,
+    Capability, ContainerConfig, ContainerMetadata, DnsConfig, ImageSpec, Int64Value, KeyValue,
     LinuxContainerConfig, LinuxContainerResources, LinuxContainerSecurityContext,
     LinuxPodSandboxConfig, LinuxSandboxSecurityContext, Mount, MountPropagation, NamespaceMode,
     NamespaceOption, PodSandboxConfig, PodSandboxMetadata, SecurityProfile, UserNamespace,
@@ -652,7 +655,6 @@ fn rejection_table_is_unimplemented() {
     add("windows pod", &|p, _| {
         p.windows = Some(Default::default());
     });
-    add("dns", &|p, _| p.dns_config = Some(Default::default()));
     add("ports", &|p, _| {
         p.port_mappings = vec![fandhe_container_cri::runtime::v1::PortMapping::default()];
     });
@@ -926,4 +928,125 @@ fn nested_duplicate_and_protected_overlapping_mounts_are_rejected() {
         });
         assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument, "{bad:?}");
     }
+}
+
+fn dns_pod(servers: &[&str]) -> PodSandboxConfig {
+    let mut p = pod();
+    p.dns_config = Some(DnsConfig {
+        servers: servers.iter().map(|s| (*s).to_owned()).collect(),
+        searches: vec!["svc.cluster.local".into()],
+        options: vec!["ndots:5".into()],
+    });
+    p
+}
+
+fn build_with_resolv(p: &PodSandboxConfig, c: &ContainerConfig) -> Result<Value, CriErrorCode> {
+    let files = BundleFiles::with_resolv_conf("/b/ctr/resolv.conf");
+    build_runtime_config_with_files(p, c, &ImageDefaults::default(), &files)
+        .map(|j| serde_json::from_slice(j.as_bytes()).expect("json"))
+        .map_err(|e| e.code())
+}
+
+/// CRI-2・NET-5（#2665）: dns_config は /etc/resolv.conf への ro の bind として出る。
+#[test]
+fn cri2_dns_config_emits_a_readonly_resolv_conf_bind() {
+    let v = build_with_resolv(&dns_pod(&["10.0.0.10"]), &ctr()).expect("build");
+    assert_eq!(
+        v["mounts"],
+        serde_json::json!([{
+            "destination": "/etc/resolv.conf",
+            "type": "bind",
+            "source": "/b/ctr/resolv.conf",
+            "options": ["bind", "private", "nosuid", "nodev", "noexec", "ro"]
+        }])
+    );
+    // core の字句規則で読み戻せ、ro の非再帰 bind として受理される。
+    let json = build_runtime_config_with_files(
+        &dns_pod(&["10.0.0.10"]),
+        &ctr(),
+        &ImageDefaults::default(),
+        &BundleFiles::with_resolv_conf("/b/ctr/resolv.conf"),
+    )
+    .unwrap();
+    let parsed = oci_runtime::parse_config_bytes(json.as_bytes()).expect("core parses");
+    assert!(parsed.unapplied_fields().is_empty());
+}
+
+/// 利用者の mount の後ろに足される。
+#[test]
+fn cri2_dns_bind_follows_user_mounts() {
+    let mut c = ctr();
+    c.mounts = vec![Mount {
+        container_path: "/data".into(),
+        host_path: "/srv/data".into(),
+        propagation: MountPropagation::PropagationPrivate as i32,
+        ..Default::default()
+    }];
+    let v = build_with_resolv(&dns_pod(&["10.0.0.10"]), &c).expect("build");
+    assert_eq!(v["mounts"][0]["destination"], "/data");
+    assert_eq!(v["mounts"][1]["destination"], "/etc/resolv.conf");
+}
+
+/// ファイルのパスを渡さない入口では、要求を黙って落とさず UNIMPLEMENTED。
+#[test]
+fn cri2_dns_config_without_generated_file_is_unimplemented() {
+    let e = build_runtime_config(&dns_pod(&["10.0.0.10"]), &ctr(), &ImageDefaults::default())
+        .unwrap_err();
+    assert_eq!(e.code(), CriErrorCode::Unimplemented);
+}
+
+/// 3 リストがすべて空の dns_config は指定なしと同じ（mount を出さない）。
+#[test]
+fn cri2_empty_dns_config_emits_no_mount() {
+    let mut p = pod();
+    p.dns_config = Some(DnsConfig::default());
+    let v = build_with_resolv(&p, &ctr()).expect("build");
+    assert!(v.get("mounts").is_none());
+}
+
+#[test]
+fn cri2_invalid_dns_values_are_invalid_argument_in_both_stages() {
+    let p = dns_pod(&["not-an-ip"]);
+    assert_eq!(
+        validate_config(&p, &ctr()).unwrap_err().code(),
+        CriErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        build_with_resolv(&p, &ctr()).unwrap_err(),
+        CriErrorCode::InvalidArgument
+    );
+}
+
+/// 利用者の mount が /etc/resolv.conf またはその祖先を指すと、両段で INVALID_ARGUMENT（fail-closed）。
+#[test]
+fn cri2_dns_bind_conflicting_with_user_mount_is_rejected() {
+    for dest in ["/etc/resolv.conf", "/etc"] {
+        let mut c = ctr();
+        c.mounts = vec![Mount {
+            container_path: dest.into(),
+            host_path: "/srv/x".into(),
+            propagation: MountPropagation::PropagationPrivate as i32,
+            ..Default::default()
+        }];
+        let p = dns_pod(&["10.0.0.10"]);
+        assert_eq!(
+            validate_config(&p, &c).unwrap_err().code(),
+            CriErrorCode::InvalidArgument,
+            "{dest}"
+        );
+        assert_eq!(
+            build_with_resolv(&p, &c).unwrap_err(),
+            CriErrorCode::InvalidArgument,
+            "{dest}"
+        );
+    }
+}
+
+#[test]
+fn cri2_dns_bind_conflicting_with_readonly_paths_is_rejected() {
+    let c = with_sc(|sc| sc.readonly_paths = vec!["/etc/resolv.conf".into()]);
+    assert_eq!(
+        build_with_resolv(&dns_pod(&["10.0.0.10"]), &c).unwrap_err(),
+        CriErrorCode::InvalidArgument
+    );
 }

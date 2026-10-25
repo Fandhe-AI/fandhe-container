@@ -7,6 +7,7 @@
 //!
 //! - [`image_rootfs`]: 本番の [`RootfsSource`] [`ImageRootfsSource`]（pull 済みイメージを bundle の `rootfs/` へ再展開し、
 //!   イメージ config の Entrypoint・Cmd・Env・WorkingDir・User を [`ImageDefaults`] で返す。#2433）。
+//! - [`resolv_conf`]: `dns_config` の検証と resolv.conf の内容の生成（純粋関数。#2665）。
 //!
 //! **未実装・簡易実装（REPAIR-3）**: タグ・digest 参照の解決（plugin-cri は `ImageService` をサーブしていない）、
 //! イメージの User の名前解決、overlay による rootfs の用意は未実装で、詳細は [`image_rootfs`] の doc。
@@ -15,8 +16,12 @@
 
 pub mod image_rootfs;
 pub mod provider;
+pub mod resolv_conf;
 pub mod spec;
 
 pub use image_rootfs::{ImageExtractConfig, ImageRootfsSource};
 pub use provider::{RootfsSource, SpecBundleProvider, UserResolveRequest};
-pub use spec::{ImageDefaults, RuntimeConfigJson, build_runtime_config, validate_config};
+pub use spec::{
+    BundleFiles, ImageDefaults, RuntimeConfigJson, build_runtime_config,
+    build_runtime_config_with_files, validate_config,
+};

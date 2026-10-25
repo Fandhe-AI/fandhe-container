@@ -410,6 +410,8 @@ fn await_start_gate(gate_r: &std::fs::File, timeout: Duration) -> Result<(), Pre
 /// 本番の動作(既存の `isolate`・`child_main` への薄い委譲)。
 struct RealIntermediateOps<'a> {
     plan: IntermediatePlan<'a>,
+    /// pod の user・ipc namespace への join(あれば `isolate` は作成ではなく参加する。#2674)。
+    join: Option<&'a crate::oci_runtime::NamespaceJoin>,
     rootfs: &'a Path,
     entry: &'a Entrypoint,
     stages: Option<StagePipeline>,
@@ -431,6 +433,10 @@ impl IntermediateOps for RealIntermediateOps<'_> {
         // 作らずに失敗させる(fail-closed)。
         sys::set_process_comm(self.tag.comm_bytes())
             .map_err(|e| ExecError::from_sys(e, IsolationStage::Spawn, "set the launch tag"))?;
+        // pod の namespace へ join する起動は mapper・holder を使わず、参加先の写像を計画と照合する(#2674)。
+        if let Some(join) = self.join {
+            return super::isolate_join(self.plan, join);
+        }
         match self.plan {
             IntermediatePlan::SingleId(plan) => isolate(plan).map(|_| ()),
             // mapper の fork は flush しない版(I は C の stdio バッファを複製した子。#2009)。
@@ -506,6 +512,8 @@ pub(crate) enum IntermediatePlan<'a> {
 pub(crate) struct IntermediateSpec<'a> {
     /// 検証済みの分離計画(euid 0 の写像は計画の段階で拒否済み。SEC-5)。
     pub(crate) plan: IntermediatePlan<'a>,
+    /// pod の user・ipc namespace への join(`None` なら新しく作る。CRI-2・CORE-3。#2674)。
+    pub(crate) join: Option<&'a crate::oci_runtime::NamespaceJoin>,
     /// rootfs のパス(使用は `setup.pinned_rootfs` の固定 fd との照合を通る)。
     pub(crate) rootfs: &'a Path,
     /// exec するエントリポイント。
@@ -545,6 +553,7 @@ pub(crate) fn spawn_container_via_intermediate(
 ) -> Result<LaunchedChild, Box<PreparedLaunchFailure>> {
     let IntermediateSpec {
         plan,
+        join,
         rootfs,
         entry,
         setup,
@@ -555,6 +564,7 @@ pub(crate) fn spawn_container_via_intermediate(
         |status, report, gate_r, listener_end| {
             let mut ops = RealIntermediateOps {
                 plan,
+                join,
                 rootfs,
                 entry,
                 stages: Some(stages),

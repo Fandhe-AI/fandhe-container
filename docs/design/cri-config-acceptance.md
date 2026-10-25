@@ -17,7 +17,7 @@
 | 9 | log_path / log_directory | core / supervisor の CRI ログ形式の書き出し | core・supervisor → cri | #2671 |
 | 10 | cgroup_parent | core の `linux.cgroupsPath`（#2010 の方針で拒否。再判断が要る。判断材料は [cri-cgroup-parent.md](cri-cgroup-parent.md)。オーナー承認待ちで、それまで `UNIMPLEMENTED`） | core → cri | #2672 |
 | 11 | devices・CDI | core の `linux.devices`（UnappliedField）・gpu の CDI 適用 | gpu・core → cri | #2673 |
-| 12 | pod の pid / ipc の共有（join） | core の `linux.namespaces[].path` の拒否 | core → cri | #2674 |
+| 12 | pod の pid / ipc の共有（join） | core は user＋ipc の path の組だけ受理済み（#2674）。cri は変換まで実装済みで、供給元（pod の保持役）は未決のため本番では常に新しい namespace。pid の共有は未対応 | core → cri | #2674 |
 | 13 | pod netns の作成・結線 | core の network namespace の拒否・plugin-cri `netsetup` の `create_netns` | net・core・cri | #2675 |
 | 14 | port_mappings | plugin-cri `netsetup` の `publish_port`。順 13 が前提 | net・cri | #2676 |
 | 15 | userns の uids / gids の写像 | オーナー判断待ち | core → cri | #2240 |
@@ -102,3 +102,37 @@ CRI の `LinuxContainerSecurityContext.capabilities` のうち `drop_capabilitie
 
 - 名前の正規化（大文字化・`CAP_` 接頭辞の補完・`ALL`）は containerd に合わせた想定で、実装時に一次情報（commit 指定）との再照合は行っていない。食い違いが見つかれば厳しい側（拒否）へ倒す
 - 集合ごとに別の値を指定する細かい制御は未対応（未適用として拒否）
+
+## pod の ipc 共有の受け入れ方式（CRI-2・CORE-3。#2674）
+
+### core の検査（`oci_runtime::NamespaceJoin`。すべて fork・予約の前）
+
+`linux.namespaces[].path` は `user` と `ipc` を組で指す場合だけ受ける。非特権では ipc namespace への `setns` が、参加先を所有する user namespace と現在の user namespace の両方で `CAP_SYS_ADMIN` を要するため、pod の user namespace に先に参加する形でしか成立しない（k8s の pod 単位の userns と同じ形）。
+
+| 検査 | 不合格 |
+| ---- | ------ |
+| 絶対パス・`..` なし・4096 バイト以内 | `InvalidArgument` |
+| 開けない | `FailedPrecondition`（権限不足は `PermissionDenied`） |
+| nsfs でない・`NS_GET_NSTYPE` が宣言と違う | `InvalidArgument` |
+| user: 自身の namespace・親が自身の namespace でない・作成者 uid が euid と違う | `PermissionDenied` |
+| ipc: 所有する user namespace が join 先と違う | `PermissionDenied` |
+| pid / mount / uts 等の path、片方だけの path | `Unimplemented` |
+
+path は 1 回だけ開いて fd に固定する（pid の再利用で別 pod へ入る TOCTOU を閉じる）。中間プロセスは `setns(user)` → `setns(ipc)` → `/proc/self/{uid,gid}_map` を権限モデルの期待値と完全一致で照合（SEC-5）→ pid・mount・uts を `unshare` する。`--ipc=host` との併用は `InvalidArgument`。
+
+### cri の出力
+
+| 要求 | 供給元 | 出力 |
+| ---- | ------ | ---- |
+| ipc `POD` | あり | ipc と user を `path` つき（join） |
+| ipc `POD` | 無し | 新しい namespace |
+| ipc `CONTAINER` | 問わない | 新しい namespace |
+| ipc `POD` ＋ userns `CONTAINER` | あり | `UNIMPLEMENTED` |
+| pid（全モード） | 問わない | 新しい namespace（`NODE` / `TARGET` は `UNIMPLEMENTED`） |
+
+`/proc/<pid>` を Create の時点で書く方式は pid の再利用で別 pod の namespace に入り得るため採らない。
+
+### 既知の差と残り
+
+- `/dev/shm`（POSIX shm）は共有されない（コンテナごとの tmpfs）。SysV IPC と POSIX mqueue は共有される。userns が pod 単位になり、共有者は同じ userns の root になる（capability は既定の 14 個、seccomp が `setns`・`unshare` を禁じ、pid namespace は別）。
+- 残り（後続 issue）: pod の保持役（#2675 の netns と共有する設計）と cri へのパスの供給、pid の共有（PID 1 の証跡・`Pid1Target` の見直しが要る）、pod 内の `/dev/shm` の共有、`NamespaceMode::TARGET`。

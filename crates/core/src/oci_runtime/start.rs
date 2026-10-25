@@ -67,7 +67,9 @@
 //! - `process.terminal` が true（端末受け渡し未実装）
 //! - `mounts` のうち bind・`/sys` の sysfs（`SysfsMountSpec`。読み取り専用で供給する。#2020）以外の種類・#1910 の拒否規則に反する bind（`BindMountSet`。検証済みの bind は
 //!   launcher が pivot 前に適用する。#1915。状態ルートとの重なりは字句・`canonicalize`・mountinfo の実体照合で検査する。`ro` の bind〔#1917〕は未対応）
-//! - `linux.namespaces[].path` の指定（既存 namespace への join 未実装）
+//! - `linux.namespaces[].path` の指定のうち、`user` と `ipc` を組で指す以外（pod の user・ipc namespace への join だけを
+//!   受ける。`NamespaceJoin` が fork の前に fd へ固定して所有者・種別・親子を検証する。pid・mount・uts 等の path と
+//!   片方だけの path は未実装。CRI-2・CORE-3。#2674）
 //! - `network`・`cgroup`・`time` namespace（exec の対応は PID/Mount/UTS/IPC/User のみ）
 //! - `linux.namespaces` に user namespace が無い（`process.user` がホストの uid として働いてしまう。
 //!   `PermissionDenied`。SEC-5）
@@ -134,6 +136,7 @@ use super::mountinfo_identity::{
     FsIdentity, MountinfoReadError, dir_identity_chain, fs_identity, mounts_under, parse_mountinfo,
     path_mount_id, read_mountinfo_bounded, source_contains, source_reaches,
 };
+use super::namespace_join::NamespaceJoin;
 use super::sysfs_mount::{SysfsMountSpec, audit_sysfs_mount_error};
 use super::working_dir::ContainerWorkingDir;
 use crate::observability::{OpName, OpRecorder};
@@ -922,6 +925,9 @@ fn build_spec_with_swap(
     }
     // 違反の理由（`RootfsPinError::violation`）は launcher の拒否の記録先へ記録する（#2623・#1702）。
     let rootfs_dir = pin_rootfs_audited(bundle, &rootfs, id, launcher)?;
+    // pod の user・ipc namespace への join（`linux.namespaces[].path`）。path を 1 回だけ開いて fd へ固定し、
+    // 所有者・種別・親子関係を fork の前に検証する（失敗してもプロセスのいない Running を残さない。#2674）。
+    let namespace_join = NamespaceJoin::from_config(&config)?;
     Ok(LaunchSpec::new(
         rootfs,
         rootfs_dir,
@@ -936,7 +942,8 @@ fn build_spec_with_swap(
         working_dir,
         ids,
     )
-    .with_sysfs(sysfs))
+    .with_sysfs(sysfs)
+    .with_namespace_join(namespace_join))
 }
 
 /// rootfs を固定し、検証後の差し替えによる違反（`RootfsPinError::violation`）なら launcher の拒否の記録先
@@ -1261,10 +1268,10 @@ fn reject_unsupported_linux(config: &OciConfig) -> Result<(), TraitError> {
         return Err(unsupported("root.readonly"));
     }
     reject_config_id_mappings(config)?;
+    // path は user と ipc の組だけを受ける（pod の join。形の検査だけここで行い、開いて固定するのは rootfs の
+    // 固定の段。他の種別の path・片方だけの path は `Unimplemented`。#2674）。
+    NamespaceJoin::paths_of(config)?;
     for ns in config.namespaces() {
-        if ns.path().is_some() {
-            return Err(unsupported("linux.namespaces[].path"));
-        }
         if matches!(
             ns.kind(),
             NamespaceKind::Network | NamespaceKind::Cgroup | NamespaceKind::Time
@@ -2064,6 +2071,29 @@ mod tests {
         assert_eq!(err.message(), "process.args[0] must not be empty");
     }
 
+    /// CRI-2・CORE-3・SEC-1（#2674）: user と ipc の path が呼び出し側自身の namespace を指す config は、
+    /// 予約・launch の前に `PermissionDenied` で拒否し、状態は Created のまま。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cri2_start_rejects_pod_join_to_own_namespaces() {
+        let mut cfg = valid_config();
+        cfg["linux"]["namespaces"] = json!([
+            {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "ipc", "path": "/proc/self/ns/ipc"},
+            {"type": "user", "path": "/proc/self/ns/user"}
+        ]);
+        let err = start_rejected_after_rewrite("pod-join-own", &cfg);
+        assert_eq!(err.code(), ErrorCode::PermissionDenied);
+        // 開けない path は FailedPrecondition。
+        cfg["linux"]["namespaces"] = json!([
+            {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "ipc", "path": "/proc/2147483647/ns/ipc"},
+            {"type": "user", "path": "/proc/2147483647/ns/user"}
+        ]);
+        let err = start_rejected_after_rewrite("pod-join-gone", &cfg);
+        assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    }
+
     /// SEC-1・SEC-5・CORE-5: start が適用できない指定は黙って無視せず Unimplemented で拒否する。
     #[test]
     fn sec1_start_rejects_unsupported_fields() {
@@ -2077,6 +2107,34 @@ mod tests {
                 "nspath",
                 Box::new(|c| {
                     c["linux"]["namespaces"] = json!([{"type": "pid", "path": "/proc/1/ns/pid"}])
+                }),
+            ),
+            // #2674: path は user と ipc の組だけを受ける。mount・uts への path と片方だけの path は未実装。
+            (
+                "nspath-mount",
+                Box::new(|c| {
+                    c["linux"]["namespaces"] = json!([
+                        {"type": "pid"}, {"type": "mount", "path": "/proc/1/ns/mnt"},
+                        {"type": "uts"}, {"type": "ipc"}, {"type": "user"}
+                    ])
+                }),
+            ),
+            (
+                "nspath-ipc-only",
+                Box::new(|c| {
+                    c["linux"]["namespaces"] = json!([
+                        {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+                        {"type": "ipc", "path": "/proc/1/ns/ipc"}, {"type": "user"}
+                    ])
+                }),
+            ),
+            (
+                "nspath-user-only",
+                Box::new(|c| {
+                    c["linux"]["namespaces"] = json!([
+                        {"type": "pid"}, {"type": "mount"}, {"type": "uts"}, {"type": "ipc"},
+                        {"type": "user", "path": "/proc/1/ns/user"}
+                    ])
                 }),
             ),
             (

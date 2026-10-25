@@ -66,6 +66,11 @@
 //!   状態が Created のまま子が残らず、launcher の記録先に層 `entrypoint`・`reason=entrypoint_is_runtime_binary`・当コンテナの
 //!   ID・パスなしのレコードがちょうど 1 件あることを照合する。成功行の前に
 //!   `production_launcher: entrypoint violation recorded once and launch refused (scenario=S)` を出す
+//! - シナリオ W（pod の user・ipc namespace への join。#2674・CRI-2・CORE-3・SEC-1・SEC-5）: コンテナ A を start し、B の
+//!   `linux.namespaces` の `user`・`ipc` に `/proc/<A の pid>/ns/{user,ipc}` の path を入れて start する。ホストから読んだ B の
+//!   `ns/user`・`ns/ipc` が A と同一で、`ns/pid`・`ns/mnt`・`ns/uts` は異なることを照合する。否定として、試験プロセス自身の
+//!   namespace を指す path は fork の前に `PermissionDenied` で拒否され、状態は Created のまま子が残らない。成功行の前に
+//!   `production_launcher: pod ipc namespace joined (scenario=W ...)` を出す
 //! - root で実行された場合: 主経路は非 root（SEC-5）。launch が拒否され、状態が Created に戻り、子が残らないことだけを
 //!   照合する（コンテナ内 root をホスト root へ写す起動は試さない）
 //!
@@ -801,6 +806,7 @@ mod linux {
         scenario_j_exec_restrictions(&env, tag);
         scenario_k_seccomp_kill_after_exec(&env, tag);
         scenario_t_capabilities_drop(&env, tag);
+        scenario_w_pod_ipc_join(&env, tag);
         scenario_l_working_dir(&env, tag);
         scenario_m_n_working_dir_refused(&env, tag);
         scenario_o_user_outside_mapping_refused(&env, tag);
@@ -2097,6 +2103,149 @@ mod linux {
             children_of_self().is_empty(),
             "no child may remain after terminate"
         );
+    }
+
+    /// 起動済みコンテナの標準出力を読み、プローブの `READY` までを回収して返す（exec 後の状態を観測するため）。
+    fn wait_probe_ready(
+        started: &fandhe_container_core::oci_runtime::StartedContainer,
+    ) -> (mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
+        let output = started.process().take_output().expect("container output");
+        let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+        let _ = collect_probe(&rx);
+        (rx, reader)
+    }
+
+    /// 名前空間の識別子（`/proc/<pid>/ns/<name>` のリンク先。例 `ipc:[4026531839]`）。
+    fn ns_link(pid: impl std::fmt::Display, name: &str) -> String {
+        std::fs::read_link(format!("/proc/{pid}/ns/{name}"))
+            .unwrap_or_else(|e| panic!("read_link /proc/{pid}/ns/{name}: {e}"))
+            .display()
+            .to_string()
+    }
+
+    /// シナリオ W: pod の user・ipc namespace への join（#2674・CRI-2・CORE-3・SEC-1・SEC-5）。
+    fn scenario_w_pod_ipc_join(env: &Env, tag: u32) {
+        // 否定: 試験プロセス自身の namespace を指す path は、fork の前に PermissionDenied で拒否される。
+        {
+            let bundle = Bundle::new("w-own");
+            let ld = make_rootfs(&bundle.rootfs(), true);
+            write_config(&bundle, &ld, &[], json!([]));
+            patch_namespaces(
+                &bundle,
+                json!([
+                    {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+                    {"type": "ipc", "path": "/proc/self/ns/ipc"},
+                    {"type": "user", "path": "/proc/self/ns/user"}
+                ]),
+            );
+            let id = ContainerId::new(format!("plwn{tag}")).expect("id");
+            do_create(env, &bundle, &id);
+            wait_single_thread();
+            let Err(err) = start(
+                &env.store,
+                &env.recorder,
+                &env.launcher,
+                &StartRequest::new(id.clone()),
+                &timeouts(),
+            ) else {
+                panic!("joining the caller's own namespaces must be refused");
+            };
+            assert_eq!(err.code(), ErrorCode::PermissionDenied);
+            assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+            assert!(children_of_self().is_empty(), "no child may remain");
+        }
+
+        // 正常: A の user・ipc namespace に B が join する。
+        let a_bundle = Bundle::new("w-a");
+        let ld = make_rootfs(&a_bundle.rootfs(), true);
+        write_config(&a_bundle, &ld, &[], json!([]));
+        let a_id = ContainerId::new(format!("plwa{tag}")).expect("id");
+        do_create(env, &a_bundle, &a_id);
+        wait_single_thread();
+        let a = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(a_id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start A failed: {:?} {}", e.code(), e.message()));
+        let a_pid = a.process().pid();
+        let mut a_reader: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            a_reader = Some(wait_probe_ready(&a));
+            let b_bundle = Bundle::new("w-b");
+            let ld = make_rootfs(&b_bundle.rootfs(), true);
+            write_config(&b_bundle, &ld, &[], json!([]));
+            patch_namespaces(
+                &b_bundle,
+                json!([
+                    {"type": "pid"}, {"type": "mount"}, {"type": "uts"},
+                    {"type": "ipc", "path": format!("/proc/{a_pid}/ns/ipc")},
+                    {"type": "user", "path": format!("/proc/{a_pid}/ns/user")}
+                ]),
+            );
+            let b_id = ContainerId::new(format!("plwb{tag}")).expect("id");
+            do_create(env, &b_bundle, &b_id);
+            wait_single_thread();
+            let b = start(
+                &env.store,
+                &env.recorder,
+                &env.launcher,
+                &StartRequest::new(b_id.clone()),
+                &timeouts(),
+            )
+            .unwrap_or_else(|e| panic!("start B failed: {:?} {}", e.code(), e.message()));
+            let b_pid = b.process().pid();
+            let mut b_reader: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+            let b_verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                b_reader = Some(wait_probe_ready(&b));
+                for shared in ["user", "ipc"] {
+                    assert_eq!(
+                        ns_link(b_pid, shared),
+                        ns_link(a_pid, shared),
+                        "B must share A's {shared} namespace"
+                    );
+                }
+                for own in ["pid", "mnt", "uts"] {
+                    assert_ne!(
+                        ns_link(b_pid, own),
+                        ns_link(a_pid, own),
+                        "B must have its own {own} namespace"
+                    );
+                }
+                // B の PID 1 は自分の pid namespace の PID 1(共有しない)。
+                let nspid =
+                    status_field(&format!("/proc/{b_pid}/status"), "NSpid:").expect("host NSpid");
+                assert_eq!(nspid.split_whitespace().last(), Some("1"));
+                println!(
+                    "production_launcher: pod ipc namespace joined (scenario=W user and ipc shared, pid/mnt/uts separate, join of own namespaces refused)"
+                );
+            }));
+            finish_started(b, b_verified);
+            if let Some((rx, reader)) = b_reader.take() {
+                reader.join().expect("join reader");
+                drop(rx);
+            }
+        }));
+        finish_started(a, verified);
+        if let Some((rx, reader)) = a_reader.take() {
+            reader.join().expect("join reader");
+            drop(rx);
+        }
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// 書き出した `config.json` の `linux.namespaces` を差し替える（シナリオ W）。
+    fn patch_namespaces(bundle: &Bundle, namespaces: serde_json::Value) {
+        let path = bundle.dir.join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read config")).expect("json");
+        config["linux"]["namespaces"] = namespaces;
+        std::fs::write(&path, serde_json::to_vec(&config).expect("serialize")).expect("write");
     }
 
     /// シナリオ K: exec 後の seccomp が禁止 syscall を SIGSYS で拒否する（#2012・SEC-2・CORE-5）。

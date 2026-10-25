@@ -13,8 +13,13 @@
 //! （cri は core の `traits` だけを参照する境界のため。CRI-7）。一致は試験で core の定数と照合する。
 //!
 //! **未実装・簡易実装（REPAIR-3）**:
-//! - namespace の共有（POD の pid / ipc を pod 内で共有する）は未実装で、`POD` もコンテナごとの新しい
-//!   namespace にする（共有の欠落であり、要求より分離が弱くなる方向ではない）。
+//! - namespace の共有: pid の `POD` は未実装で、コンテナごとの新しい namespace にする（共有の欠落であり、
+//!   要求より分離が弱くなる方向ではない。core の PID 1 前提の証跡と両立しないため。#2674 の後続）。ipc の `POD` は
+//!   [`PodNamespacePaths`]（pod の保持役が作った user＋ipc namespace のパス）が与えられたときだけ
+//!   `linux.namespaces[].path` で join する（core が user＋ipc の組に限って受ける。CRI-2・CORE-3。#2674）。
+//!   供給元（保持役）はまだ無く、`CriRuntimeService` は当面 `None` を渡すため、本番では共有されず新しい
+//!   namespace になる。`/dev/shm` は共有しない（core がコンテナごとの tmpfs を載せる）。`/proc/<pid>` を
+//!   Create の時点で書く方式は pid の再利用で別 pod の namespace へ入り得る（SEC-1）ため採らない。
 //! - network namespace: `POD` / `CONTAINER` は `{"type":"network"}` を出す。core の start は network namespace を
 //!   まだ受けず `Unimplemented` で拒否する（NetworkPlugin の結線〔NET 系。`docs/design/cri-config-acceptance.md` の順 13〕まで）。`NODE`（host）は
 //!   network namespace を出さない（ホストの netns で動く。利用者が明示した場合だけ）。crictl 疎通確認
@@ -257,7 +262,7 @@ struct MountOut<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LinuxOut<'a> {
-    namespaces: Vec<NamespaceOut>,
+    namespaces: Vec<NamespaceOut<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resources: Option<ResourcesOut>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -267,9 +272,46 @@ struct LinuxOut<'a> {
 }
 
 #[derive(Serialize)]
-struct NamespaceOut {
+struct NamespaceOut<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
+    /// 既存 namespace へ join するパス（pod の ipc 共有のとき user と ipc だけ。#2674）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<&'a str>,
+}
+
+/// pod の保持役が作った user・ipc namespace のパス（CRI-2・CORE-3。#2674）。
+///
+/// `SpecBundleProvider::prepare` が `BundleRequest` 経由で受け、ipc の `POD` を join に変える。
+/// 供給元（pod の保持役）は未実装のため、`CriRuntimeService` は当面 `None` を渡す。パスは core が start で
+/// fd に固定して所有者・種別を照合する（cri は形式だけを見る）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PodNamespacePaths {
+    user: String,
+    ipc: String,
+}
+
+impl PodNamespacePaths {
+    /// 絶対パスで `MAX_PATH_BYTES` 以内・NUL なしのものだけを受ける。違反は供給元の誤りなので `INTERNAL`。
+    pub fn new(user: impl Into<String>, ipc: impl Into<String>) -> Result<Self, CriError> {
+        let (user, ipc) = (user.into(), ipc.into());
+        for p in [&user, &ipc] {
+            if !p.starts_with('/') || p.len() > MAX_PATH_BYTES || p.contains('\0') {
+                return Err(CriError::internal("invalid pod namespace path"));
+            }
+        }
+        Ok(Self { user, ipc })
+    }
+
+    /// user namespace のパス。
+    pub fn user(&self) -> &str {
+        &self.user
+    }
+
+    /// ipc namespace のパス。
+    pub fn ipc(&self) -> &str {
+        &self.ipc
+    }
 }
 
 #[derive(Serialize)]
@@ -471,28 +513,58 @@ fn resolve_mode(field: &'static str, v: i32) -> Result<NamespaceMode, CriError> 
 }
 
 /// コンテナの namespace_options（無ければ sandbox の）を読み、`linux.namespaces` を決める。
-fn namespaces(opts: Option<&NamespaceOption>) -> Result<Vec<NamespaceOut>, CriError> {
+///
+/// `pod` があり ipc が `POD` のときだけ、ipc と user を既存 namespace への join（`path` 付き）にする。
+fn namespaces<'a>(
+    opts: Option<&NamespaceOption>,
+    pod: Option<&'a PodNamespacePaths>,
+) -> Result<Vec<NamespaceOut<'a>>, CriError> {
     let default = NamespaceOption::default();
     let o = opts.unwrap_or(&default);
     let mut out = Vec::with_capacity(6);
-    // pid・ipc: POD / CONTAINER はコンテナごとの新しい namespace（共有は未実装。REPAIR-3）。
+    // pid・ipc: POD / CONTAINER はコンテナごとの新しい namespace。ipc の POD だけは供給元があれば join。
     // NODE は必須 namespace を外す（SEC-1）ため拒否、TARGET は join 未対応。
+    let mut join: Option<&PodNamespacePaths> = None;
     for (kind, field, v) in [
         ("pid", "namespace_options.pid", o.pid),
         ("ipc", "namespace_options.ipc", o.ipc),
     ] {
         match resolve_mode(field, v)? {
-            NamespaceMode::Pod | NamespaceMode::Container => out.push(NamespaceOut { kind }),
+            NamespaceMode::Pod if kind == "ipc" && pod.is_some() => {
+                join = pod;
+                out.push(NamespaceOut {
+                    kind,
+                    path: pod.map(PodNamespacePaths::ipc),
+                });
+            }
+            NamespaceMode::Pod | NamespaceMode::Container => {
+                out.push(NamespaceOut { kind, path: None })
+            }
             NamespaceMode::Node | NamespaceMode::Target => return Err(unsupported(field)),
         }
     }
-    out.push(NamespaceOut { kind: "mount" });
-    out.push(NamespaceOut { kind: "uts" });
-    // user: 常に新しい namespace（SEC-5）。写像の指定は未実装（#2240）。
-    out.push(NamespaceOut { kind: "user" });
+    out.push(NamespaceOut {
+        kind: "mount",
+        path: None,
+    });
+    out.push(NamespaceOut {
+        kind: "uts",
+        path: None,
+    });
+    // user: 常に新しい namespace（SEC-5）。ipc を join するときは pod の user namespace に入る
+    // （非特権では所有する user namespace ごとでなければ ipc に入れない）。写像の指定は未実装（#2240）。
+    out.push(NamespaceOut {
+        kind: "user",
+        path: join.map(PodNamespacePaths::user),
+    });
     if let Some(u) = &o.userns_options {
         match resolve_mode("namespace_options.userns_options.mode", u.mode)? {
-            NamespaceMode::Pod | NamespaceMode::Container | NamespaceMode::Node => {}
+            NamespaceMode::Pod | NamespaceMode::Node => {}
+            // コンテナ単位の userns と pod の ipc 共有は両立しない。
+            NamespaceMode::Container if join.is_some() => {
+                return Err(unsupported("namespace_options.userns_options.mode"));
+            }
+            NamespaceMode::Container => {}
             NamespaceMode::Target => {
                 return Err(unsupported("namespace_options.userns_options.mode"));
             }
@@ -502,7 +574,10 @@ fn namespaces(opts: Option<&NamespaceOption>) -> Result<Vec<NamespaceOut>, CriEr
         }
     }
     match resolve_mode("namespace_options.network", o.network)? {
-        NamespaceMode::Pod | NamespaceMode::Container => out.push(NamespaceOut { kind: "network" }),
+        NamespaceMode::Pod | NamespaceMode::Container => out.push(NamespaceOut {
+            kind: "network",
+            path: None,
+        }),
         NamespaceMode::Node => {}
         NamespaceMode::Target => return Err(unsupported("namespace_options.network")),
     }
@@ -730,7 +805,19 @@ pub fn build_runtime_config(
     container: &ContainerConfig,
     image: &ImageDefaults,
 ) -> Result<RuntimeConfigJson, CriError> {
-    build_inner(sandbox, container, image, Stage::Build)
+    build_runtime_config_with_pod_namespaces(sandbox, container, image, None)
+}
+
+/// [`build_runtime_config`] に pod の user・ipc namespace のパスを足した版（CRI-2・CORE-3。#2674）。
+///
+/// `pod` が `Some` で ipc が `POD` のとき、`linux.namespaces` の ipc と user を join（`path` 付き）にする。
+pub fn build_runtime_config_with_pod_namespaces(
+    sandbox: &PodSandboxConfig,
+    container: &ContainerConfig,
+    image: &ImageDefaults,
+    pod: Option<&PodNamespacePaths>,
+) -> Result<RuntimeConfigJson, CriError> {
+    build_inner(sandbox, container, image, pod, Stage::Build)
 }
 
 /// イメージを展開する前に、CRI の設定だけで判定できる拒否・検証を済ませる（不正な要求で bundle を作らない）。
@@ -740,10 +827,20 @@ pub fn validate_config(
     sandbox: &PodSandboxConfig,
     container: &ContainerConfig,
 ) -> Result<(), CriError> {
+    validate_config_with_pod_namespaces(sandbox, container, None)
+}
+
+/// [`validate_config`] に pod の namespace のパスを足した版（#2674）。
+pub fn validate_config_with_pod_namespaces(
+    sandbox: &PodSandboxConfig,
+    container: &ContainerConfig,
+    pod: Option<&PodNamespacePaths>,
+) -> Result<(), CriError> {
     build_inner(
         sandbox,
         container,
         &ImageDefaults::default(),
+        pod,
         Stage::Validate,
     )
     .map(|_| ())
@@ -753,6 +850,7 @@ fn build_inner(
     sandbox: &PodSandboxConfig,
     container: &ContainerConfig,
     image: &ImageDefaults,
+    pod: Option<&PodNamespacePaths>,
     stage: Stage,
 ) -> Result<RuntimeConfigJson, CriError> {
     // 実行層が受けない・無視すると要求より弱くなる入力を先に拒否する。
@@ -908,7 +1006,7 @@ fn build_inner(
             .and_then(|l| l.security_context.as_ref())
             .and_then(|s| s.namespace_options.as_ref())
     });
-    let namespaces = namespaces(ns_opts)?;
+    let namespaces = namespaces(ns_opts, pod)?;
 
     let resources = match linux.and_then(|l| l.resources.as_ref()) {
         Some(r) => resources(r)?,

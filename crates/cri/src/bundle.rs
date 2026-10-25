@@ -19,4 +19,7 @@ pub mod spec;
 
 pub use image_rootfs::{ImageExtractConfig, ImageRootfsSource};
 pub use provider::{RootfsSource, SpecBundleProvider, UserResolveRequest};
-pub use spec::{ImageDefaults, RuntimeConfigJson, build_runtime_config, validate_config};
+pub use spec::{
+    ImageDefaults, PodNamespacePaths, RuntimeConfigJson, build_runtime_config,
+    build_runtime_config_with_pod_namespaces, validate_config, validate_config_with_pod_namespaces,
+};

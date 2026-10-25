@@ -1273,7 +1273,8 @@ jobs:
             'production_launcher: exit_signal recorded once via audit relay (scenario=Q)' \
             'production_launcher: launch options reached the container (scenario=S ipc=host tmpfs=/run' \
             'injected secret reached the container under subordinate id mapping (scenario=S-sub' \
-            'production_launcher: capabilities drop applied (scenario=T pid='; do
+            'production_launcher: capabilities drop applied (scenario=T pid=' \
+            'production_launcher: pod ipc namespace joined (scenario=W'; do
             if ! grep -Fq "${part}" "${log}"; then
               echo "::error::production_launcher did not report: ${part} (possibly not executed)" >&2
               exit 1

@@ -7,7 +7,10 @@ use fandhe_container_cri::bundle::spec::{
     MAX_ARGS, MAX_CONFIG_BYTES, MAX_ENV, MAX_HOSTNAME_BYTES, MAX_MOUNTS, MAX_PATH_BYTES,
     MAX_PROTECTED_PATHS, MAX_STRING_BYTES,
 };
-use fandhe_container_cri::bundle::{ImageDefaults, build_runtime_config, validate_config};
+use fandhe_container_cri::bundle::{
+    ImageDefaults, PodNamespacePaths, build_runtime_config,
+    build_runtime_config_with_pod_namespaces, validate_config,
+};
 use fandhe_container_cri::error::CriErrorCode;
 use fandhe_container_cri::runtime::v1::{
     Capability, ContainerConfig, ContainerMetadata, ImageSpec, Int64Value, KeyValue,
@@ -739,6 +742,123 @@ fn userns_mappings_are_rejected_but_node_mode_still_gets_a_user_namespace() {
     });
     let c = with_sc(|sc| sc.namespace_options = Some(o));
     assert_eq!(code(&pod(), &c), CriErrorCode::Unimplemented);
+}
+
+fn pod_paths() -> PodNamespacePaths {
+    PodNamespacePaths::new("/proc/4242/ns/user", "/proc/4242/ns/ipc").expect("paths")
+}
+
+fn build_with_pod(c: &ContainerConfig, paths: &PodNamespacePaths) -> Value {
+    let json =
+        build_runtime_config_with_pod_namespaces(&pod(), c, &ImageDefaults::default(), Some(paths))
+            .expect("build");
+    serde_json::from_slice(json.as_bytes()).expect("json")
+}
+
+/// CRI-2・CORE-3（#2674）: 供給元があり ipc が POD のとき、ipc と user だけが path つきの join になる。
+#[test]
+fn pod_ipc_is_joined_when_paths_are_supplied() {
+    let v = build_with_pod(&ctr(), &pod_paths());
+    assert_eq!(
+        v["linux"]["namespaces"],
+        serde_json::json!([
+            {"type": "pid"},
+            {"type": "ipc", "path": "/proc/4242/ns/ipc"},
+            {"type": "mount"},
+            {"type": "uts"},
+            {"type": "user", "path": "/proc/4242/ns/user"},
+            {"type": "network"},
+        ])
+    );
+}
+
+#[test]
+fn container_ipc_and_pid_never_join() {
+    // ipc CONTAINER は供給元があっても新しい namespace。
+    let c = with_sc(|sc| {
+        sc.namespace_options = Some(ns(
+            NamespaceMode::Pod,
+            NamespaceMode::Pod,
+            NamespaceMode::Container,
+        ));
+    });
+    let v = build_with_pod(&c, &pod_paths());
+    assert_eq!(
+        v["linux"]["namespaces"],
+        serde_json::json!([
+            {"type": "pid"}, {"type": "ipc"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "user"}, {"type": "network"},
+        ])
+    );
+    // pid POD も新しい namespace のまま（path なし）。
+    let v = build_with_pod(&ctr(), &pod_paths());
+    assert_eq!(
+        v["linux"]["namespaces"][0],
+        serde_json::json!({"type": "pid"})
+    );
+}
+
+#[test]
+fn without_supplier_output_is_unchanged() {
+    let plain = build(&pod(), &ctr());
+    let none = serde_json::from_slice::<Value>(
+        build_runtime_config_with_pod_namespaces(&pod(), &ctr(), &ImageDefaults::default(), None)
+            .expect("build")
+            .as_bytes(),
+    )
+    .expect("json");
+    assert_eq!(plain, none);
+    assert_eq!(
+        plain["linux"]["namespaces"],
+        serde_json::json!([
+            {"type": "pid"}, {"type": "ipc"}, {"type": "mount"}, {"type": "uts"},
+            {"type": "user"}, {"type": "network"},
+        ])
+    );
+}
+
+#[test]
+fn pod_ipc_join_conflicts_with_container_userns() {
+    let c = with_sc(|sc| {
+        sc.namespace_options = Some(NamespaceOption {
+            userns_options: Some(UserNamespace {
+                mode: NamespaceMode::Container as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    });
+    let err = build_runtime_config_with_pod_namespaces(
+        &pod(),
+        &c,
+        &ImageDefaults::default(),
+        Some(&pod_paths()),
+    )
+    .expect_err("must be rejected");
+    assert_eq!(err.code(), CriErrorCode::Unimplemented);
+    // 供給元が無ければ従来どおり受ける。
+    build(&pod(), &c);
+}
+
+#[test]
+fn pod_namespace_paths_are_validated() {
+    for (u, i) in [
+        ("proc/1/ns/user", "/proc/1/ns/ipc"),
+        ("/proc/1/ns/user", "ns/ipc"),
+        ("/proc/1/ns/user", "/proc/1/ns/ipc\0x"),
+    ] {
+        let e = PodNamespacePaths::new(u, i).expect_err("invalid");
+        assert_eq!(e.code(), CriErrorCode::Internal);
+    }
+    let long = format!("/{}", "a".repeat(MAX_PATH_BYTES));
+    assert_eq!(
+        PodNamespacePaths::new(long, "/proc/1/ns/ipc")
+            .expect_err("too long")
+            .code(),
+        CriErrorCode::Internal
+    );
+    let at_limit = format!("/{}", "a".repeat(MAX_PATH_BYTES - 1));
+    PodNamespacePaths::new(at_limit, "/proc/1/ns/ipc").expect("at the limit");
 }
 
 fn profile(t: ProfileType) -> Option<SecurityProfile> {

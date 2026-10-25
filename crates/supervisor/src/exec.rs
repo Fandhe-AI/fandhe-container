@@ -203,7 +203,7 @@
 //! - **縮退経路**: [`identify_pid1`]（段単位の API）と試験専用の通しの入口 `run_command`（`exec-test-support` feature の下だけ。
 //!   既定ビルドには無く、呼ぶとコンパイルが通らない。#1617）は記録 pid から開き、cgroup の所属で同一性を照合する。
 //!   本番の通しの入口は [`run_command_with_pidfd`] だけなので、supervisor 不在（孤児化・再起動後で起動時の pidfd を失った）
-//!   場合の exec は現状拒否される（fail-closed）。この場合の再設計の担当は #2688（REPAIR-3）。#514（TASK-165.5）は re-adopt・終了ポリシーだけを扱い、監視を引き継いだ supervisor が起動ハンドル（pidfd）を取り直すという前提を与えるにとどまる。healthcheck（#2441）・CLI の exec（#2626）は supervisor が居る経路の本番の呼び出し元。この縮退経路は、「コンテナの中から
+//!   場合の exec は現状拒否される（fail-closed）。この場合の方式の判断記録は `docs/design/exec-without-supervisor.md`（#2688・REPAIR-3。オーナー承認待ち。推奨は re-adopt で起動時の同一性の証跡と照合して pidfd を取り直し、それまでは拒否）。#514（TASK-165.5）は re-adopt・終了ポリシーだけを扱い、監視を引き継いだ supervisor が起動ハンドル（pidfd）を取り直すという前提を与えるにとどまる。healthcheck（#2441）・CLI の exec（#2626）は supervisor が居る経路の本番の呼び出し元。この縮退経路は、「コンテナの中から
 //!   cgroupfs に書けない」前提（core の `exec/setns.rs` のモジュール doc）が成り立つ間だけ使う。cgroupfs の
 //!   マウント・cgroup namespace・`/sys/fs/cgroup` の bind mount を導入する変更は、この縮退経路を拒否へ切り替える
 //!   こと

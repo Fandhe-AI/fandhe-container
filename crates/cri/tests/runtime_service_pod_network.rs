@@ -281,6 +281,8 @@ async fn set_up_failure_with_failed_tear_down_keeps_a_notready_record() {
     assert!(run(&svc, None).await.is_err());
     let ids = list_ids(&svc).await;
     assert_eq!(ids.len(), 1);
+    // set_up の失敗後は notready で、配下のコンテナを作れない（Ready のまま残らない）。
+    assert!(create_container(&svc, &ids[0]).await.is_err());
     // 回収の再試行（Remove）が成功すれば記録は消える。
     *net.tear_down_fails.lock().unwrap() = false;
     remove(&svc, &ids[0]).await.unwrap();

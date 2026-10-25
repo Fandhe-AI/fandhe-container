@@ -306,13 +306,23 @@ impl PodNetns {
         let ok = path.is_absolute()
             && path.as_os_str().len() <= POD_NETNS_PATH_MAX_BYTES
             && path.to_str().is_some_and(|s| !s.contains('\0'))
-            && path
-                .components()
-                .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+            // Windows の絶対パスは先頭が `Prefix`（`C:` 等）になるため許可する（3 OS で検証する）。
+            && path.components().all(|c| {
+                matches!(
+                    c,
+                    Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+                )
+            })
             && path.components().count() > 1
             // `Path::components` は `.` と連続する `/` を黙って正規化するため、文字列でも検査する。
             && path.to_str().is_some_and(|s| {
-                cfg!(windows) || s[1..].split('/').all(|e| !matches!(e, "" | "." | ".."))
+                // 先頭の区切りを 1 つ除き（添字を使わない）、残りの要素に空・`.`・`..` が無いこと。
+                let rest = s
+                    .strip_prefix('/')
+                    .or_else(|| s.strip_prefix('\\'))
+                    .or_else(|| s.split_once(':').and_then(|(_, r)| r.strip_prefix(['/', '\\'])))
+                    .unwrap_or(s);
+                rest.split(['/', '\\']).all(|e| !matches!(e, "" | "." | ".."))
             });
         if ok {
             Ok(Self { path })

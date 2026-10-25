@@ -1332,9 +1332,9 @@ pub(crate) fn host_owner_token(bridge_token: &str, endpoint: &EndpointId) -> Str
 
 /// attach の前に作って pin した netns（#2675・NET-1・CRI-2・PLUG-1）。
 ///
-/// [`create_container_netns`] が作り、[`attach_prepared_container`] が使う。CRI の POD モードは「netns が
+/// `create_container_netns` が作り、`attach_prepared_container` が使う。CRI の POD モードは「netns が
 /// コンテナの作成より前に存在する」ため、`attach_container` が netns の作成を内部で行う形とは別に、作成だけを
-/// 先に行える入口として持つ。pin のファイルと fd を所有し、手放すときは [`release_container_netns`]
+/// 先に行える入口として持つ。pin のファイルと fd を所有し、手放すときは `release_container_netns`
 /// （unpin）か attach の成功（以後は `AttachedContainer::netns` が所有）で行う。**Drop では unpin しない**
 /// （pin は mount でプロセスの外に残るため。放置すると pin が残る。呼び出し側が必ず解放すること）。
 /// 未 attach の間は netns 内の route ソケットを fd として 1 本保持する（件数は呼び出し側の上限で有界）。
@@ -2104,7 +2104,8 @@ pub struct ReleaseNetnsError {
 /// コンテナ用の netns を attach より前に作って pin する（#2675・NET-1・CRI-2・PLUG-1）。
 ///
 /// `attach_container` が内部で行う「netns の作成と pin」だけを切り出した入口で、安全性の検査（置き場の所有者・
-/// 権限・symlink、`O_EXCL`、`shared` 伝播の拒否）は同じ関数を通る。`lo` の up は attach が netns 内設定で行う。
+/// 権限・symlink、`O_EXCL`、`shared` 伝播の拒否）は同じ関数を通る。`lo` は作成時点で up にする（失敗したら
+/// netns を unpin して回収する）。attach の netns 内設定も `lo` を up にするが、up 済みなら冪等。
 /// 作った netns は [`attach_prepared_container`] へ渡すか、不要なら [`release_container_netns`] で解放する。
 /// `CAP_SYS_ADMIN`（`unshare` / `mount`）が必要で、本 crate は権限を上げない。`timeout` は netns 作成の待ちの期限
 /// （REPAIR-5）。
@@ -2122,17 +2123,49 @@ pub fn create_container_netns(
         });
     }
     match netns::create_pinned(netns_dir, endpoint, timeout, route.recorder()) {
-        Ok((netns, pin_dir_id)) => Ok(PreparedNetns {
-            netns,
-            pin_dir_id,
-            endpoint: endpoint.clone(),
-            dir: netns_dir.to_owned(),
-        }),
+        Ok((netns, pin_dir_id)) => {
+            // 契約どおり作成時点で `lo` を up にする。失敗したら作った netns を unpin して回収する
+            // （回収もできなければ pin が残るため `leftover` で報告する）。
+            if let Err(error) = netns_loopback_up(&netns, timeout) {
+                return Err(match netns::unpin(netns) {
+                    Ok(()) => NetnsCreateError {
+                        error,
+                        leftover: None,
+                    },
+                    Err(_) => NetnsCreateError {
+                        error,
+                        leftover: Some(ResourceState::Present),
+                    },
+                });
+            }
+            Ok(PreparedNetns {
+                netns,
+                pin_dir_id,
+                endpoint: endpoint.clone(),
+                dir: netns_dir.to_owned(),
+            })
+        }
         Err(f) => Err(NetnsCreateError {
             error: f.error,
             leftover: f.leftover,
         }),
     }
+}
+
+/// 作成直後の netns の中で `lo` を up にする（`create_container_netns` だけが呼ぶ。#2675・NET-2）。
+#[cfg(target_os = "linux")]
+fn netns_loopback_up(ns: &ContainerNetns, timeout: Duration) -> Result<(), NetError> {
+    let route = ns.route_socket().ok_or_else(|| {
+        NetError::new(
+            NetErrorCode::FailedPrecondition,
+            "netns route socket is not available",
+        )
+    })?;
+    let lo = IfName::new("lo")?;
+    let index = route.link_index(&lo, timeout)?;
+    route
+        .set_link(&LinkSet::up(link_ref(index)?), timeout)
+        .map(|_| ())
 }
 
 /// 事前作成した netns へコンテナを接続する（#2675）。[`attach_container`] と同じ手順で、netns を作らない点だけが違う。

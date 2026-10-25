@@ -34,11 +34,11 @@
 //! # 未実装・簡易実装（REPAIR-3）
 //!
 //! - netns の作成時点（#2675）: `create_netns` は net の `create_container_netns` で netns を作って pin し、
-//!   attach 前のハンドルをバックエンド（`LinuxNetsetup`）が保持する。`lo` の up は attach が netns 内設定で行う
-//!   （トレイトの「lo の up を含む」は attach 完了時点で満たす）。attach の失敗では veth・アドレスを戻すが
+//!   attach 前のハンドルをバックエンド（`LinuxNetsetup`）が保持する。`lo` は作成時点で up にする
+//!   （失敗したら net が netns を unpin して回収する）。attach の失敗では veth・アドレスを戻すが
 //!   netns は unpin せず保持し、`detach`・`delete_network` が解放する。バックエンドの `create_netns` が
-//!   成功したときだけ契約 7・8 の記録を作る。置き場の作成途中の取り残しは件数入りの `Internal` で報告するが、
-//!   記録が無いため手動回収になる
+//!   成功したときだけ契約 7・8 の記録を作る。作成途中の取り残した pin は件数入りの `Internal` で報告し、
+//!   回収待ち（`unreclaimed`）の記録として保持する（`delete_network` は手動回収まで成功を返さない）
 //! - コンテナがこの netns へ入る側（core の `linux.namespaces[].path` の受け入れ）は未実装で、本層の呼び出し元は
 //!   cri の `PodNetworkProvider`（[`crate::pod_network::NetsetupPodNetwork`]）だけ。本番へは注入しない
 //!   （`docs/design/cri-config-acceptance.md` の順 13）
@@ -310,7 +310,7 @@ pub trait NetsetupBackend: Send + Sync {
         &self,
         _network: &mut Self::Network,
         _endpoint: &EndpointId,
-    ) -> Result<(), TraitError> {
+    ) -> Result<(), AttachFailure> {
         Ok(())
     }
 
@@ -663,7 +663,22 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             .get_mut(req.network().as_str())
             .and_then(|n| n.handle.as_mut())
             .ok_or_else(not_found_network)?;
-        self.backend.create_netns(handle, &endpoint)?;
+        if let Err(f) = self.backend.create_netns(handle, &endpoint) {
+            if f.leftover > 0 {
+                // 取り残した pin を追跡から落とさない。回収待ち（unreclaimed）の記録として保持し、
+                // 回収を確認できるまで `delete_network` は成功を返さない（契約 6・9。#2675）。
+                reg.containers.insert(
+                    req.container().as_str().to_owned(),
+                    ContainerEntry {
+                        network: req.network().as_str().to_owned(),
+                        endpoint,
+                        attached: None,
+                        unreclaimed: true,
+                    },
+                );
+            }
+            return Err(f.error);
+        }
         reg.containers.insert(
             req.container().as_str().to_owned(),
             ContainerEntry {
@@ -1105,23 +1120,25 @@ mod linux {
             &self,
             _network: &mut Self::Network,
             endpoint: &EndpointId,
-        ) -> Result<(), TraitError> {
+        ) -> Result<(), AttachFailure> {
             self.ensure_netns_dir()?;
             if self.lock_prepared()?.contains_key(endpoint.as_str()) {
                 return Err(TraitError::new(
                     ErrorCode::AlreadyExists,
                     "netns already exists for the container",
-                ));
+                )
+                .into());
             }
             let (route, _nft) = self.open_sockets()?;
             let prepared =
                 create_container_netns(&route, &self.netns_dir, endpoint, NETSETUP_REQUEST_TIMEOUT)
                     .map_err(|e| {
-                        // 取り残した pin があれば件数 1 として報告する（記録が無く手動回収になる）。
-                        with_leftover(
-                            net_error_to_trait(&e.error),
-                            usize::from(e.leftover.is_some()),
-                        )
+                        // 取り残した pin があれば件数 1 として報告し、レジストリが回収待ちとして保持する。
+                        let leftover = usize::from(e.leftover.is_some());
+                        AttachFailure {
+                            error: with_leftover(net_error_to_trait(&e.error), leftover),
+                            leftover,
+                        }
                     })?;
             self.lock_prepared()?
                 .insert(endpoint.as_str().to_owned(), prepared);

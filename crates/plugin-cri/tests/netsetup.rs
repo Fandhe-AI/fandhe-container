@@ -51,6 +51,8 @@ struct Script {
     netns_calls: Vec<String>,
     /// create_netns を失敗させるか。
     fail_create_netns: bool,
+    /// create_netns の失敗時に取り残す pin の件数。
+    create_netns_leftover: usize,
     /// 次の release_netns を失敗させる回数。
     fail_release: u32,
 }
@@ -117,12 +119,19 @@ impl NetsetupBackend for Fake {
         }
     }
 
-    fn create_netns(&self, _network: &mut String, endpoint: &EndpointId) -> Result<(), TraitError> {
+    fn create_netns(
+        &self,
+        _network: &mut String,
+        endpoint: &EndpointId,
+    ) -> Result<(), AttachFailure> {
         let mut s = self.0.lock().expect("lock");
         s.netns_calls
             .push(format!("create_netns {}", endpoint.as_str()));
         if s.fail_create_netns {
-            return Err(TraitError::new(ErrorCode::Internal, "create_netns failed"));
+            return Err(AttachFailure {
+                error: TraitError::new(ErrorCode::Internal, "create_netns failed"),
+                leftover: s.create_netns_leftover,
+            });
         }
         Ok(())
     }
@@ -968,6 +977,32 @@ fn net1_failed_create_netns_leaves_no_record() {
         .expect("retry is not AlreadyExists");
 }
 
+/// create_netns が pin を取り残したら回収待ちとして保持し、delete_network は成功を返さない（契約 6・9。#2675）。
+#[test]
+fn net1_create_netns_leftover_is_tracked_and_blocks_delete() {
+    let (net, fake) = plugin();
+    pod_network::set_up_pod(&net, &nname("a"), subnet()).expect("a");
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_create_netns = true;
+        s.create_netns_leftover = 1;
+    }
+    assert!(
+        net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c1")))
+            .is_err()
+    );
+    // 同じコンテナの再作成は記録が残るので AlreadyExists ではなく取り残しで拒否される。
+    fake.0.lock().expect("lock").fail_create_netns = false;
+    let e = net
+        .create_netns(&CreateNetnsRequest::new(nname("a"), cid("c1")))
+        .expect_err("tracked");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    let e = net
+        .delete_network(&DeleteNetworkRequest::new(nname("a")))
+        .expect_err("blocked");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+}
+
 /// set_up_sandbox: 呼び出し列は create_network → create_netns → attach（sandbox ID が名前・コンテナ ID）。
 #[test]
 fn set_up_sandbox_calls_in_order() {
@@ -1007,6 +1042,19 @@ fn set_up_sandbox_rolls_back_network_when_create_netns_fails() {
     // 記録が残らないので同じ sandbox を作り直せる。
     fake.0.lock().expect("lock").fail_create_netns = false;
     pod_network::set_up_sandbox(&net, SB, subnet()).expect("retry");
+}
+
+/// set_up_sandbox: create_network が取り残し付きで失敗したら rolled_back は偽（サブネット枠を返さない。CRI-2・NET-1）。
+#[test]
+fn set_up_sandbox_create_network_leftover_is_not_rolled_back() {
+    let (net, fake) = plugin();
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_create = true;
+        s.create_leftover = 2;
+    }
+    let f = pod_network::set_up_sandbox(&net, SB, subnet()).expect_err("fail");
+    assert!(!f.rolled_back);
 }
 
 /// set_up_sandbox: attach の失敗は detach（netns の解放）→ delete_network の順に戻す。

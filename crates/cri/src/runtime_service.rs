@@ -101,7 +101,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasher, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -589,6 +589,29 @@ impl<T> std::future::Future for BoundedWait<T> {
     }
 }
 
+/// `set_up` の worker が正常に確定できないまま終わった（panic・起動されないままの破棄）とき、
+/// `network_pending` を解除して資源が残りうる印（`network_owned`・notready）へ倒す guard（#2675・CRI-2・NET-1）。
+///
+/// 正常な完了では worker が先に `network_pending` を偽にするため何もしない。解除しないと Stop・Remove が
+/// 永久に `FAILED_PRECONDITION` になる。
+struct NetworkSetUpGuard {
+    registry: Arc<Mutex<SandboxRegistry>>,
+    id: String,
+}
+
+impl Drop for NetworkSetUpGuard {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.registry.lock()
+            && let Some(record) = registry.records.get_mut(&self.id)
+            && record.network_pending
+        {
+            record.network_pending = false;
+            record.network_owned = true;
+            record.state = SandboxState::NotReady;
+        }
+    }
+}
+
 /// 実行層の呼び出しを専用スレッドで走らせ、結果を `timeout` まで待つ（REPAIR-5）。
 ///
 /// 期限を過ぎたら `DEADLINE_EXCEEDED` を返すが、worker は打ち切れない。worker は自分の
@@ -644,6 +667,10 @@ fn wants_pod_network(config: Option<&PodSandboxConfig>) -> bool {
 /// 件数・保持量を整合させたままサンドボックスの記録 1 件を除去する（配下のコンテナが無い前提。
 /// `run_sandbox_networked` の回収済みの後始末だけが使う）。不整合なら何もしない。
 fn remove_sandbox_record(registry: &mut SandboxRegistry, id: &str) {
+    // 配下のコンテナが残っているなら親だけを消さない（孤児のコンテナ記録を作らない）。
+    if registry.container_keys.iter().any(|(sid, _, _)| sid == id) {
+        return;
+    }
     if let Some(record) = registry.records.get(id)
         && let Some(remaining) = registry.retained_bytes.checked_sub(record.retained_bytes)
     {
@@ -1043,7 +1070,15 @@ impl CriRuntimeService {
         // 記録の確定は worker 自身が set_up の完了直後に行う。期限超過で呼び出し側が先に結果不明として
         // 返っても、遅れて完了した set_up が `network_pending` を解除し、作った資源を `network_owned` で
         // 追跡させる（完了前の Stop・Remove の tear_down との競合で資源が漏れるのを防ぐ。CRI-2・NET-1）。
+        let ran = Arc::new(AtomicBool::new(false));
+        let worker_ran = Arc::clone(&ran);
+        let guard = NetworkSetUpGuard {
+            registry: Arc::clone(&self.registry),
+            id: id.clone(),
+        };
         let set_up = run_bounded(self.runtime_timeout, move || {
+            let _guard = guard;
+            worker_ran.store(true, Ordering::SeqCst);
             let result = worker_provider.set_up(&PodNetworkRequest::new(&worker_id, &config));
             let (netns, outcome) = match result {
                 Ok(netns) => (Some(netns), Ok(())),
@@ -1053,8 +1088,12 @@ impl CriRuntimeService {
                 && let Some(record) = registry.records.get_mut(&worker_id)
             {
                 // 失敗でも資源が残りうるため、回収の印は付ける（呼び出し側が回収後に外す）。
+                // 失敗時は notready を worker がロック下で確定する（Ready のまま CreateContainer が通らないように）。
                 record.network_owned = true;
                 record.network_pending = false;
+                if outcome.is_err() {
+                    record.state = SandboxState::NotReady;
+                }
                 record.pod_netns = netns;
             }
             outcome
@@ -1064,6 +1103,18 @@ impl CriRuntimeService {
         match set_up {
             Ok(()) => Ok(resp),
             Err(err) => {
+                // worker を起動できなかった（`ran` が偽の `UNAVAILABLE`）なら資源は作られていない。
+                // 予約を巻き戻して記録を除去する（pending を残して Stop・Remove を塞がない）。
+                if err.code() == CriErrorCode::Unavailable && !ran.load(Ordering::SeqCst) {
+                    if let Ok(mut registry) = self.registry.lock() {
+                        if let Some(record) = registry.records.get_mut(&id) {
+                            record.network_pending = false;
+                            record.network_owned = false;
+                        }
+                        remove_sandbox_record(&mut registry, &id);
+                    }
+                    return Err(err);
+                }
                 // 期限超過・待ち受け側の失敗は worker がまだ走っている可能性があり、tear_down を同時に呼ばない。
                 // `network_pending` を残し、worker の完了が解除するまで Stop・Remove を拒否する。
                 let unknown = matches!(

@@ -126,8 +126,13 @@ pub fn set_up_sandbox(
         rolled_back: true,
     };
     let (name, container, _) = sandbox_names(sandbox_id).map_err(plain)?;
+    // `Internal` は取り残しの件数入りの失敗（契約 6）を含む。残骸があるのに枠を返すと別 pod に同じサブネットが
+    // 渡りうるため、`Internal` は巻き戻し済みとみなさず、`tear_down`（delete_network）の成功まで枠を保持させる。
     net.create_network(&CreateNetworkRequest::new(name.clone(), subnet))
-        .map_err(plain)?;
+        .map_err(|error| SandboxSetUpError {
+            rolled_back: error.code() != ErrorCode::Internal,
+            error,
+        })?;
     let mut rollback: Vec<(&str, TraitError)> = Vec::new();
     let failure = match net.create_netns(&CreateNetnsRequest::new(name.clone(), container.clone()))
     {

@@ -10,7 +10,7 @@
 | 2 | run_as_username | cri（`RootfsSource::prepare` へ解決要求 `UserResolveRequest` を渡す口の変更。順 1 の読み口を再利用。本変更で実装済み） | cri | #2664 |
 | 3 | dns_config | cri（bundle に resolv.conf を生成して `/etc/resolv.conf` へ ro で bind。変換の段は本変更で実装済み。start は core の制約〔#1917・状態ルート配下の source の拒否〕で現状は拒否される。下記「dns_config の受け入れ方式」） | cri（end-to-end は core の解消待ち） | #2665 |
 | 4 | capabilities（drop を先行。add / ambient はオーナー判断。SEC-1） | core の `process.capabilities`（UnappliedField）の適用 → cri。drop は本変更で実装済み。add / ambient は `UNIMPLEMENTED` のまま | core → cri | #2666 |
-| 5 | supplemental_groups（とイメージ User の補助グループ） | core の `additionalGids`（start.rs で拒否。SEC-5） → cri | core → cri | #2667 |
+| 5 | supplemental_groups（とイメージ User の補助グループ） | core の `additionalGids`（launcher が gid 写像と照合して `setgroups` で適用） → cri。本変更で実装済み | core → cri | #2667 |
 | 6 | stop_signal | core の `StopRequest` に `signal` を足し（PLUG-1 の境界変更）、cri が受け入れる。本変更で実装済み | core → cri | #2668 |
 | 7 | mount の propagation（HostToContainer は受け入れ済み。Bidirectional はオーナー判断待ち） | core が `rslave` の bind をホストの slave として載せる（本変更で実装済み）→ cri が HostToContainer を `rslave` へ変換（実装済み）。`rshared`（Bidirectional）は user namespace の中でコンテナからホストへ伝播できないため受けず `UNIMPLEMENTED` のまま。`linux.rootfsPropagation` は使わない。理由と緩和点は `docs/design/mount-propagation.md` | core → cri | #2669 |
 | 8 | sysctls（namespaced のみ） | core の `linux.sysctl`（UnappliedField） | core → cri | #2670 |
@@ -72,8 +72,28 @@ CRI の `LinuxContainerSecurityContext.run_as_username` は、`ImageRootfsSource
 既知の差:
 
 - 数字だけの `run_as_username` は拒否する（containerd は uid 扱いだが、CRI の「passwd に存在すること」を満たさない。数値は `run_as_user` を使う）
-- `/etc/group` の所属から補助グループは作らない（core が `additionalGids` を未受理のため。権限は弱い側に倒れる。順 5）
+- 実効 uid が 0 のコンテナにはイメージの `/etc/group` 由来の補助グループを付けない。主 gid を `additionalGids` へ足さない（containerd の `ensureAdditionalGids` との差。いずれも権限が弱い側に倒れる。#2667）
+- passwd を安全に読めず実効ユーザーの名前を決められないときも、イメージ由来のグループは付けない（権限が弱い側。明示した `run_as_user` の起動を passwd の不備で止めない）
 - uid のみで gid 0 に落とす挙動は runc / containerd の `GetExecUser` に合わせたもので、実装時に一次情報との再照合は行っていない（食い違いが見つかれば未解決へ倒す）
+
+## supplemental_groups の受け入れ方式（CRI-2・SEC-5・CORE-6。#2667）
+
+コンテナ側の `supplemental_groups` と `supplemental_groups_policy` を受け入れ、`process.user.additionalGids` へ写す。core の launcher が fork の前に user namespace の gid 写像と照合し、子の capability 削減段が `setgroups(list)` で適用して `getgroups` で読み戻す。
+
+| 要求 | 結果 |
+| ---- | ---- |
+| 値が負・`4294967295`（`u32::MAX`）・範囲外 | `INVALID_ARGUMENT`（`validate_config` でも拒否） |
+| ポリシーが `Merge`(0)・`Strict`(1) 以外 | `INVALID_ARGUMENT` |
+| `Merge`（既定） | イメージの `/etc/group` 由来 → CRI の一覧の順。重複は最初のものを残す |
+| `Strict` | CRI の一覧だけ |
+| 実効 uid が 0 | イメージ由来は付けない。CRI の明示した一覧は付ける |
+| 合計が 65,536 超 | `FAILED_PRECONDITION` |
+| sandbox 側の `supplemental_groups` | 値を検証して受け入れ、適用先が無いため出力しない |
+| 範囲写像で gid が写像外 | start で `FAILED_PRECONDITION`（fork 前） |
+| 単一 ID 写像で非空 | start で `FAILED_PRECONDITION`（`setgroups` が `deny` のため。黙って落とさない） |
+| `/etc/group` が symlink・FIFO・上限超過（uid 非 0 で名前が決まったとき） | `FAILED_PRECONDITION`。不在は空 |
+
+exec は `process.user` の非 root と `additionalGids` を引き続き `UNIMPLEMENTED` で拒否する。`ContainerStatus.user` の報告と `RuntimeHandlerFeatures` の `supplemental_groups_policy` は未対応。
 
 ## dns_config の受け入れ方式（CRI-2・NET-5。#2665）
 

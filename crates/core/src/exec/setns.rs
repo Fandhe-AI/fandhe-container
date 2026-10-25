@@ -45,7 +45,7 @@
 //!   `Pid:`（`/proc/self/fdinfo`）と記録 pid の一致を同一性の根拠にする。この入口でも期待 cgroup の照合は
 //!   多層防御として残るが、同一性の根拠ではない。pidfd を得られない場合は縮退せず拒否する。supervisor 不在
 //!   （孤児化・再起動後で起動時の pidfd を失った）の場合の明示された縮退経路が [`Pid1Target::open`] で、
-//!   上記の前提が成り立つ間だけ使う。supervisor から別プロセスの exec 専用プロセスへ pidfd を渡す 1 段目
+//!   上記の前提が成り立つ間だけ使う（本番の通しの入口はこの縮退経路を使わず拒否する。supervisor 不在時の方式は `docs/design/exec-without-supervisor.md`〔#2688。承認待ち〕）。supervisor から別プロセスの exec 専用プロセスへ pidfd を渡す 1 段目
 //!   （execve 越しの継承・`SCM_RIGHTS`）は未実装（下記）
 //! - **対象の限定**: 対象は、呼び出し側の PID namespace に **直接** 入れ子になった PID namespace の PID 1
 //!   （`NSpid:` がちょうど 2 要素で末尾が 1）に限り、呼び出し側と同じ pid / mnt namespace へは参加しない。

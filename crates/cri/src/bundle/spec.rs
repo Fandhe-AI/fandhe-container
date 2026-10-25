@@ -46,11 +46,17 @@
 //!   （bounding / effective / permitted）へ書く（core が drop だけを解釈済みにして launch・exec へ適用する。
 //!   #2666・CRI-2・SEC-1）。名前は大文字小文字を区別せず `CAP_` 接頭辞は任意、`ALL` は全 drop、既定に無いものの
 //!   drop は no-op、未知名は `INVALID_ARGUMENT`。`add_capabilities` / `add_ambient_capabilities` は `UNIMPLEMENTED`。
+//! - `supplemental_groups` は受け入れ、`process.user.additionalGids` へ写す（core が launch の fork の前に user namespace の
+//!   gid 写像と照合して `setgroups` で適用する。#2667・CRI-2・SEC-5・CORE-6）。各値は 0〜4294967294（負の値と
+//!   `u32::MAX` は `INVALID_ARGUMENT`）。`supplemental_groups_policy` は `Merge`（既定。イメージの `/etc/group` の所属グループ
+//!   〔[`ImageDefaults::supplementary_gids`]〕に続けて CRI の一覧を並べる）か `Strict`（CRI の一覧だけ）。実効 uid が 0 の
+//!   コンテナにはイメージ由来のグループを付けない（単一 ID 写像で使える uid が 0 だけのため。CRI の明示した一覧は付ける）。
+//!   主 gid は足さない。合計は [`MAX_ADDITIONAL_GIDS`] まで。sandbox 側の指定は検証だけして適用先が無いため出力しない。
 //! - `mounts[].propagation` は PRIVATE を `rprivate`、HOST_TO_CONTAINER を `rslave` で `config.json` の `mounts[].options` へ書く
 //!   （core が `rslave` の bind をホストの slave として載せる。BIDIRECTIONAL と未知の値は `UNIMPLEMENTED`。
 //!   `linux.rootfsPropagation` は出力しない。#2669・CRI-2・OCI-4）。
 //! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（log_path・port_mappings・cgroup_parent・sysctls・
-//!   devices・capabilities の add / ambient・supplemental_groups・propagation の BIDIRECTIONAL 等）の受け入れ順序と担当は
+//!   devices・capabilities の add / ambient・propagation の BIDIRECTIONAL 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 //! - `linux.cgroup_parent` の受け入れ方針（オーナー承認待ち。判断が出るまで `UNIMPLEMENTED`）は
 //!   `docs/design/cri-cgroup-parent.md`（#2672・CRI-2・CORE-4）にまとめている。
@@ -68,7 +74,8 @@ use super::resolv_conf;
 use crate::error::CriError;
 use crate::runtime::v1::{
     ContainerConfig, Int64Value, LinuxContainerResources, Mount, MountPropagation, NamespaceMode,
-    NamespaceOption, PodSandboxConfig, SecurityProfile, security_profile::ProfileType,
+    NamespaceOption, PodSandboxConfig, SecurityProfile, SupplementalGroupsPolicy,
+    security_profile::ProfileType,
 };
 
 /// `config.json` 全体の上限（core の `CONFIG_MAX_BYTES` と同値）。
@@ -87,6 +94,8 @@ pub const MAX_MOUNTS: usize = 1024;
 pub const MAX_PROTECTED_PATHS: usize = 256;
 /// hostname の長さ上限（core の `CONFIG_MAX_HOSTNAME_BYTES` と同値）。
 pub const MAX_HOSTNAME_BYTES: usize = 64;
+/// `process.user.additionalGids` の件数上限（core の `CONFIG_MAX_ADDITIONAL_GIDS` と同値。`NGROUPS_MAX`。#2667）。
+pub const MAX_ADDITIONAL_GIDS: usize = 65_536;
 
 /// 生成する `ociVersion`（core は `1.x` 系だけを受ける）。
 /// mount 1 件あたりの JSON 構造の概算オーバーヘッド（キー名・options 等）。
@@ -119,6 +128,10 @@ pub struct ImageDefaults {
     /// `ImageRootfsSource` が [`super::UserResolveRequest`] を受けて埋める。要求があるのに `None` の
     /// ままなら `build_runtime_config` は `UNIMPLEMENTED` で拒否する（root へ黙って落とさない）。
     pub resolved_run_as_username: Option<(u32, u32)>,
+    /// 実効ユーザーのイメージの `/etc/group` での所属グループ（`/etc/group` の行順。#2667・CRI-2・SEC-5）。
+    /// `ImageRootfsSource` が [`super::UserResolveRequest::image_groups`] が真で実効 uid が 0 でないときだけ埋める
+    /// （既定は空 = イメージ由来のグループは付かない。付かない方向は権限が弱くなる側）。
+    pub supplementary_gids: Vec<u32>,
 }
 
 /// `build_inner` の段階。`Validate` は rootfs を触る前の形式検証、`Build` は `config.json` の確定。
@@ -291,6 +304,9 @@ fn drop_capabilities(names: &[String]) -> Result<Option<CapabilitiesOut>, CriErr
 struct UserOut {
     uid: u32,
     gid: u32,
+    /// 補助グループ。空なら出力しない（core は省略を空として扱う）。
+    #[serde(rename = "additionalGids", skip_serializing_if = "Vec::is_empty")]
+    additional_gids: Vec<u32>,
 }
 
 #[derive(Serialize)]
@@ -387,6 +403,36 @@ fn unsupported(field: &'static str) -> CriError {
 
 fn invalid(field: &'static str) -> CriError {
     CriError::invalid_argument(format!("{field} is invalid"))
+}
+
+/// `additionalGids` 1 件あたりの JSON の大きさの見積もり（10 桁 + 区切り）。
+const ADDITIONAL_GID_JSON_BYTES: usize = 11;
+
+/// 補助グループを方針に従って並べる（重複は最初のものを残す。件数は [`MAX_ADDITIONAL_GIDS`] まで。#2667）。
+///
+/// `Strict` は `image` を使わない。上限超過は黙って切り詰めず `FAILED_PRECONDITION`（core が拒否する件数と同じ）。
+fn merge_additional_gids(
+    policy: SupplementalGroupsPolicy,
+    image: &[u32],
+    cri: &[u32],
+) -> Result<Vec<u32>, CriError> {
+    let image = match policy {
+        SupplementalGroupsPolicy::Merge => image,
+        SupplementalGroupsPolicy::Strict => &[],
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for g in image.iter().chain(cri) {
+        if seen.insert(*g) {
+            if out.len() >= MAX_ADDITIONAL_GIDS {
+                return Err(CriError::failed_precondition(
+                    "supplemental groups exceed the limit",
+                ));
+            }
+            out.push(*g);
+        }
+    }
+    Ok(out)
 }
 
 /// 文字列 1 要素の長さと NUL を検証する。
@@ -524,6 +570,43 @@ impl std::io::Write for LimitedWriter {
 /// 保護パス（masked / readonly）の検証。core の `ProtectedPath` と同じく root のみ（`/`）は拒否する。
 fn check_protected_path(field: &'static str, p: &str) -> Result<(), CriError> {
     check_canonical_path(field, p)
+}
+
+/// `supplemental_groups` の各値を検証して `u32` にする（0〜4294967294。`u32::MAX` はカーネルの無効 gid
+/// `(gid_t)-1` でどの写像にも入らないため拒否する。#2667）。
+fn supplemental_gids(field: &'static str, v: &[i64]) -> Result<Vec<u32>, CriError> {
+    check_supplemental_gid_count(v)?;
+    v.iter().map(|g| supplemental_gid(field, *g)).collect()
+}
+
+/// `supplemental_groups` の件数を確保の前に検証する（重複を畳む前の入力件数。無制限確保を防ぐ。#2667）。
+fn check_supplemental_gid_count(v: &[i64]) -> Result<(), CriError> {
+    if v.len() > MAX_ADDITIONAL_GIDS {
+        return Err(CriError::failed_precondition(
+            "supplemental groups exceed the limit",
+        ));
+    }
+    Ok(())
+}
+
+/// `supplemental_groups` の 1 値を検証する。
+fn supplemental_gid(field: &'static str, g: i64) -> Result<u32, CriError> {
+    u32::try_from(g)
+        .ok()
+        .filter(|g| *g != u32::MAX)
+        .ok_or_else(|| invalid(field))
+}
+
+/// 値の検証だけを行い、一覧は確保しない（適用先が無い sandbox 側用。#2667）。
+fn validate_supplemental_gids(field: &'static str, v: &[i64]) -> Result<(), CriError> {
+    check_supplemental_gid_count(v)?;
+    v.iter()
+        .try_for_each(|g| supplemental_gid(field, *g).map(|_| ()))
+}
+
+/// `supplemental_groups_policy` を検証する（`Merge` か `Strict`。それ以外は `INVALID_ARGUMENT`）。
+fn supplemental_policy(field: &'static str, v: i32) -> Result<SupplementalGroupsPolicy, CriError> {
+    SupplementalGroupsPolicy::try_from(v).map_err(|_| invalid(field))
 }
 
 fn nonneg_u32(field: &'static str, v: &Option<Int64Value>) -> Result<Option<u32>, CriError> {
@@ -987,9 +1070,9 @@ fn build_inner(
             if sc.selinux_options.is_some() {
                 return Err(unsupported("selinux_options"));
             }
-            if !sc.supplemental_groups.is_empty() {
-                return Err(unsupported("supplemental_groups"));
-            }
+            // 適用先が無い（sandbox にプロセスは無い）ため検証だけして出力しない（#2667）。
+            validate_supplemental_gids("supplemental_groups", &sc.supplemental_groups)?;
+            supplemental_policy("supplemental_groups_policy", sc.supplemental_groups_policy)?;
             check_profile("seccomp", &sc.seccomp)?;
             check_apparmor("apparmor", &sc.apparmor)?;
             // 非推奨の文字列欄も、指定されたまま黙って落とさない（プロファイルの無効化を見逃さない）。
@@ -1003,7 +1086,11 @@ fn build_inner(
     let linux = container.linux.as_ref();
     let sc = linux.and_then(|l| l.security_context.as_ref());
     let mut capabilities = None;
+    let mut cri_groups = Vec::new();
+    let mut policy = SupplementalGroupsPolicy::Merge;
     if let Some(sc) = sc {
+        cri_groups = supplemental_gids("supplemental_groups", &sc.supplemental_groups)?;
+        policy = supplemental_policy("supplemental_groups_policy", sc.supplemental_groups_policy)?;
         if sc.privileged {
             return Err(unsupported("privileged"));
         }
@@ -1016,9 +1103,6 @@ fn build_inner(
         }
         if sc.readonly_rootfs {
             return Err(unsupported("readonly_rootfs"));
-        }
-        if !sc.supplemental_groups.is_empty() {
-            return Err(unsupported("supplemental_groups"));
         }
         if sc.selinux_options.is_some() {
             return Err(unsupported("selinux_options"));
@@ -1078,6 +1162,22 @@ fn build_inner(
         .or(resolved.map(|r| r.1))
         .or_else(|| (!explicit_user).then(|| image.user.map(|u| u.1)).flatten())
         .unwrap_or(0);
+
+    // 補助グループ: Merge はイメージ由来（uid 0 には付けない）→ CRI の順、Strict は CRI だけ。最初に出たものを残す。
+    let additional_gids = merge_additional_gids(
+        policy,
+        if uid == 0 {
+            &[]
+        } else {
+            &image.supplementary_gids
+        },
+        &cri_groups,
+    )?;
+    budget.spend(
+        additional_gids
+            .len()
+            .saturating_mul(ADDITIONAL_GID_JSON_BYTES),
+    )?;
 
     if container.mounts.len() > MAX_MOUNTS {
         return Err(invalid("mounts"));
@@ -1148,7 +1248,11 @@ fn build_inner(
             args,
             env,
             cwd,
-            user: UserOut { uid, gid },
+            user: UserOut {
+                uid,
+                gid,
+                additional_gids,
+            },
             capabilities,
         },
         mounts,

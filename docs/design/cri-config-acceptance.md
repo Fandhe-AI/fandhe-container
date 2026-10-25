@@ -106,7 +106,7 @@ CRI の `LinuxContainerSecurityContext.capabilities` のうち `drop_capabilitie
 ## sysctls の受け入れ方式（CRI-2・CORE-3・SEC-1。#2670）
 
 - 分類・文法は core の `sysctl` モジュール（`SysctlKey::parse`）が唯一の定義で、cri はそれを再利用する。
-- 許可集合の出典: runc `libcontainer/configs/validate/validator.go` の `sysctl`（tag v1.3.0、commit `4ca628d1d4c974f92d24daccb901aa078aad748e`、Apache-2.0）。写したのはキー名と接頭辞だけ。runc の NOTICE（Docker, Inc. の帰属行と輸出規制の注記）を一次情報で確認し、帰属行をルート `NOTICE` に追記した。輸出規制の注記を省く点はオーナー判断待ち（licensing 規約）。
+- 許可集合の出典: runc `libcontainer/configs/validate/validator.go` の `sysctl`（tag v1.3.0、commit `4ca628d1d4c974f92d24daccb901aa078aad748e`、Apache-2.0）。写したのはキー名と接頭辞だけ。runc の NOTICE（Docker, Inc. の帰属行と輸出規制の注記）を一次情報で確認し、帰属行をルート `NOTICE` に追記した。輸出規制の注記も、省略の可否がオーナー判断待ちのため（licensing 規約）、判断が出るまでルート `NOTICE` に原文のまま保持する。
 - 判定:
 
 | 種別 | キー | CRI の結果 | core（config.json 直指定）の結果 |

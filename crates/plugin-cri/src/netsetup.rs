@@ -15,7 +15,7 @@
 //! | `netns-create` | `create_netns` | Linux バックエンドは `Unimplemented`（下記「netns の作成時点」） |
 //! | `veth-attach` | `attach` | `network::attach_container`（netns の作成と pin を含む） |
 //! | `publish-port` | `publish_port` | 未実装（`Unimplemented`） |
-//! | （なし） | `detach` | 未 attach の記録の取り消しのみ。attach 済みは `Unimplemented` |
+//! | （なし） | `detach` | 未 attach の記録の取り消しと、attach の取り残しの回収（`network::reclaim_failed_attach`）。attach 済みは `Unimplemented` |
 //! | `net-delete` | `delete_network` | `network::delete_network` |
 //!
 //! # 契約との対応（`NetworkPlugin` の doc の契約番号）
@@ -28,8 +28,11 @@
 //!   ネットワーク未作成、netns 未登録（いずれも `NotFound`）、紐付けネットワーク不一致（`FailedPrecondition`）の順
 //! - 契約 9: `delete_network` は net が残りを続行する。失敗時は再試行用のハンドルをレジストリへ戻し、
 //!   ネットワークを削除中として印を残す（完了まで `create_netns`・`attach` は `FailedPrecondition`。再試行の `delete_network` は可）。
-//!   attach の巻き戻しで取り残した記録があっても、所有を確認できる資源の解放は続行し、取り残しの記録は保持して
-//!   最後に `Internal` を返す。取り残しのあるネットワークへの `create_netns`・`attach` は `FailedPrecondition`
+//!   attach の巻き戻しで取り残したコンテナに請求書（net の `FailedAttachClaim`）があれば、bridge を解放する前に
+//!   `reclaim_failed_attach`（別名と master の一致を確かめた veth と、このプロセスが作った pin だけを消す）で回収し、
+//!   成功したものから記録ファイルと記録を外す（`detach` も同じ回収をする。#2681）。請求書が無い・回収に失敗した取り残しは
+//!   記録を保持して `delete_network` を拒否し、取り残しのあるネットワークへの `create_netns`・`attach` は
+//!   `FailedPrecondition`
 //!
 //! # 未実装・簡易実装（REPAIR-3）
 //!
@@ -49,8 +52,16 @@
 //! - `detach`: net にコンテナ単体の切り離しが無いため、attach 済みは `Unimplemented`
 //! - 静的アドレス（`AttachRequest::address`）: net の `attach_container` は内部で動的割り当てを行い、事前予約と
 //!   併用できないため `Unimplemented`（契約 10。カーネル操作の前に判定する）
+//! - attach の取り残しの回収（#2681）: 請求書は [`ReclaimStore`] の `attach/<endpoint>.attach` に永続化し、再起動後に
+//!   読み込む。作成に成功したネットワークの記録（`CreatedNetwork`・IPAM）は永続化されていないため、再起動後は
+//!   「attach の記録だけから復元したネットワーク」となり、回収できるのは veth（所有確認つき）だけで、bridge・nft テーブルは
+//!   自動回収しない。netns の pin は同じプロセスで作ったものに限って解除でき、再起動後の pin は手動回収に残る。
+//!   復元したネットワークの `delete_network` は取り残しを回収し終えたら記録を外し、ネットワーク本体は手動回収と
+//!   [`MSG_RECOVERED_NETWORK_UNTRACKED`] の `FailedPrecondition` で知らせる（成功を装わない）。壊れた記録はファイルを残して
+//!   登録せず、同じコンテナの再 attach はカーネルの `AlreadyExists` で拒否される。write-ahead（作成・attach 前の記録）は
+//!   採らない（#1870 の後に再検討。`docs/design/network-reclaim-persistence.md`）
 //! - 状態（作成に成功したネットワーク・IPAM・pin・削除中の印）はプロセスのメモリにだけあり、plugin プロセスの
-//!   再起動で失われる（永続化するのは作成失敗の回収待ちの記録だけ。残りは #1870 の設計の後続）
+//!   再起動で失われる（永続化するのは作成失敗と attach の取り残しの回収待ちの記録だけ。残りは #1870 の設計の後続）
 //! - DNS ヘルパーの起動・停止（NET-5・NET-7）は行わない
 //! - ネットワーク名は net の規則（小文字のみ、`_`・`.` を許す）に合わせて検査するため、トレイトの規則では有効な
 //!   大文字入りの名前は `InvalidArgument` になる。サブネットは IPv4 の `/1`〜`/30` のみ
@@ -196,17 +207,24 @@ pub struct AttachOutcome<C> {
 
 /// [`NetsetupBackend::attach`] の失敗。巻き戻しで取り残した資源の件数を握りつぶさず運ぶ（契約 6・SEC 後始末）。
 #[derive(Debug)]
-pub struct AttachFailure {
+pub struct AttachFailure<A = ()> {
     /// 失敗の原因（取り残しがあれば件数入りの `Internal`）。
     pub error: TraitError,
     /// 巻き戻しで回収できずカーネルに残った資源の件数（0 なら回収済み）。
     pub leftover: usize,
+    /// 取り残しを所有確認つきで回収するための請求書（Linux は net の `FailedAttachClaim`）。
+    /// 所有を証明できない取り残しでは `None`（手動回収。NET-1・#2681）。
+    pub reclaim: Option<A>,
 }
 
-impl From<TraitError> for AttachFailure {
+impl<A> From<TraitError> for AttachFailure<A> {
     /// 取り残しなしの失敗。
     fn from(error: TraitError) -> Self {
-        Self { error, leftover: 0 }
+        Self {
+            error,
+            leftover: 0,
+            reclaim: None,
+        }
     }
 }
 
@@ -254,6 +272,9 @@ pub trait NetsetupBackend: Send + Sync {
     /// 作成失敗の回収に使う請求書（Linux は net の `FailedCreateClaim`。#2467）。回収待ちの記録が保持し、
     /// [`reclaim_failed_create`](Self::reclaim_failed_create) へそのまま返す。
     type FailedCreate: Send;
+    /// attach の巻き戻しで取り残した資源の請求書（Linux は net の `FailedAttachClaim`。#2681）。
+    /// コンテナの記録が保持し、[`reclaim_failed_attach`](Self::reclaim_failed_attach) へそのまま返す。
+    type FailedAttach: Send;
 
     /// ネットワークを作る。失敗時の巻き戻しは実装が行う（契約 6）。
     fn create_network(
@@ -299,6 +320,39 @@ pub trait NetsetupBackend: Send + Sync {
         ))
     }
 
+    /// attach の取り残しの請求書を永続化記録へ符号化する（plugin の再起動をまたいで回収するため。NET-1・#2681）。
+    /// 既定は `None`（永続化しない。再起動で請求書を失い、手動回収になる）。
+    fn encode_attach_claim(&self, _claim: &Self::FailedAttach) -> Option<String> {
+        None
+    }
+
+    /// [`encode_attach_claim`](Self::encode_attach_claim) の記録を、属するネットワーク名と請求書へ復号する。
+    /// 記録は信頼しない入力として検証し、不正なら `InvalidArgument`。endpoint が記録と食い違う場合も拒否する。
+    /// 既定は復号しない（`FailedPrecondition`）。
+    fn decode_attach_claim(
+        &self,
+        _endpoint: &EndpointId,
+        _record: &str,
+    ) -> Result<(NetName, Self::FailedAttach), TraitError> {
+        Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "attach reclaim records are not supported by this backend",
+        ))
+    }
+
+    /// attach の巻き戻しで取り残した資源を、所有を確認したうえで回収する。成功は回収の確認済み。
+    ///
+    /// 既定は回収せず `FailedPrecondition`（成功を装わない）。Linux バックエンドは net の
+    /// `network::reclaim_failed_attach` で、別名と master の一致を確かめた veth と、このプロセスが作った pin だけを消す。
+    /// 所有を証明できない資源は残り、手動回収になる（REPAIR-3）。
+    fn reclaim_failed_attach(&self, _claim: &Self::FailedAttach) -> Result<(), TraitError> {
+        Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "attach left resources behind that cannot be reclaimed automatically; \
+             manual reclaim required",
+        ))
+    }
+
     /// コンテナ専用の netns を（lo の up を含めて）作る。既定は何もしない成功（試験用 fake 向け）。
     ///
     /// net の `attach_container` は netns の作成と pin から veth の設定までを 1 回で行い、先に netns を作ると
@@ -317,7 +371,7 @@ pub trait NetsetupBackend: Send + Sync {
         &self,
         network: &mut Self::Network,
         endpoint: &EndpointId,
-    ) -> Result<AttachOutcome<Self::Container>, AttachFailure>;
+    ) -> Result<AttachOutcome<Self::Container>, AttachFailure<Self::FailedAttach>>;
 
     /// ネットワークと、渡した attach 済みコンテナを解放する（契約 9）。
     fn delete_network(
@@ -328,16 +382,18 @@ pub trait NetsetupBackend: Send + Sync {
 }
 
 /// `create_netns` で登録されたコンテナ 1 件の記録。
-struct ContainerEntry<C> {
+struct ContainerEntry<C, A> {
     /// 紐付けたネットワーク名（`CreateNetnsRequest::network`）。
     network: String,
     endpoint: EndpointId,
     /// attach 済みならハンドル（未 attach ならカーネル資源は無い）。
     attached: Option<C>,
-    /// attach の巻き戻しで資源を取り残した印。立っている間は記録を消さず、attach・detach・
-    /// ネットワーク削除を fail-closed で拒否する（net に所有確認つきの個別回収 API が入るまでの保持）。
-    /// 作成失敗の回収（#2467）とは別で、attach 側の回収は未実装。
+    /// attach の巻き戻しで資源を取り残した印。立っている間は記録を消さず、attach・ネットワーク削除を
+    /// fail-closed で拒否する。`claim` があれば detach・`delete_network` が所有確認つきで回収し、成功したときだけ
+    /// 印と記録を外す（#2681）。作成失敗の回収（#2467）とは別。
     unreclaimed: bool,
+    /// 取り残しを所有確認つきで回収するための請求書。`None` は所有を証明できない取り残しで、手動回収。
+    claim: Option<A>,
 }
 
 /// 作成済みネットワーク 1 件の記録。
@@ -354,6 +410,10 @@ struct NetworkEntry<N, F> {
     /// 作成失敗で取り残した・結果不明の資源の件数。`Some` の間は回収待ちとして上限に数え、
     /// 接続系の操作を拒否し、`delete_network` で回収を再試行する（回収確認まで記録を保持する）。
     leaked: Option<LeakedCreate<F>>,
+    /// plugin の再起動後に、attach の取り残しの記録だけから復元したネットワーク（#2681）。作成に成功した
+    /// ネットワークの記録（`CreatedNetwork`・IPAM）は永続化されていない（#1870）ため `handle` は無く、bridge・nft
+    /// テーブルは自動回収しない。取り残した veth・pin の回収に使い、回収し終えたら外す。
+    recovered: bool,
 }
 
 /// 作成失敗で取り残した資源の回収待ちの記録。
@@ -362,10 +422,10 @@ struct LeakedCreate<F> {
     claim: Option<F>,
 }
 
-struct Registry<N, C, F> {
+struct Registry<N, C, F, A> {
     networks: HashMap<String, NetworkEntry<N, F>>,
     /// コンテナ ID（文字列）→ 記録。同じコンテナはネットワークを問わず 1 件だけ（契約 7・8）。
-    containers: HashMap<String, ContainerEntry<C>>,
+    containers: HashMap<String, ContainerEntry<C, A>>,
 }
 
 /// バックエンド `B` のハンドル型で具体化したレジストリ。
@@ -373,6 +433,7 @@ type BackendRegistry<B> = Registry<
     <B as NetsetupBackend>::Network,
     <B as NetsetupBackend>::Container,
     <B as NetsetupBackend>::FailedCreate,
+    <B as NetsetupBackend>::FailedAttach,
 >;
 
 /// `NetworkPlugin` を netsetup の操作単位で実装する（CRI-7・PLUG-1）。
@@ -435,9 +496,63 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                     gateway: None,
                     handle: None,
                     leaked: Some(LeakedCreate { claim }),
+                    recovered: false,
                 },
             );
         }
+        // attach の取り残しの記録。ネットワークの記録が無ければ「復元したネットワーク」として作る（#2681）。
+        // 件数の上限を超える場合は fail-closed で起動を失敗させる（記録を捨てて資源を忘れない）。
+        let mut containers: HashMap<String, ContainerEntry<B::Container, B::FailedAttach>> =
+            HashMap::new();
+        for stored in report.attach_claims {
+            let decoded = EndpointId::new(&stored.name)
+                .ok()
+                .zip(stored.record.as_deref())
+                .and_then(|(ep, rec)| backend.decode_attach_claim(&ep, rec).ok().map(|d| (ep, d)));
+            let Some((endpoint, (net_name, claim))) = decoded else {
+                broken = broken.saturating_add(1);
+                continue;
+            };
+            let key = net_name.as_str().to_owned();
+            if !networks.contains_key(&key) {
+                if networks.len() >= MAX_NETWORKS {
+                    return Err(TraitError::new(
+                        ErrorCode::ResourceExhausted,
+                        "reclaim store holds too many networks",
+                    ));
+                }
+                networks.insert(
+                    key.clone(),
+                    NetworkEntry {
+                        deleting: false,
+                        backend_deleted: false,
+                        gateway: None,
+                        handle: None,
+                        leaked: None,
+                        recovered: true,
+                    },
+                );
+            }
+            if containers.values().filter(|c| c.network == key).count()
+                >= MAX_CONTAINERS_PER_NETWORK
+            {
+                return Err(TraitError::new(
+                    ErrorCode::ResourceExhausted,
+                    "reclaim store holds too many containers for a network",
+                ));
+            }
+            containers.insert(
+                stored.name,
+                ContainerEntry {
+                    network: key,
+                    endpoint,
+                    attached: None,
+                    unreclaimed: true,
+                    claim: Some(claim),
+                },
+            );
+        }
+        broken = broken.saturating_add(report.attach_unrecognized);
         if let (Some(r), Ok(op)) = (&recorder, OpName::new("net.reclaim_store_load")) {
             for _ in 0..broken {
                 r.start(op.clone()).failure();
@@ -450,7 +565,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             backend,
             state: Mutex::new(Registry {
                 networks,
-                containers: HashMap::new(),
+                containers,
             }),
             recorder,
             store: Some(store),
@@ -523,6 +638,29 @@ fn unreclaimed() -> TraitError {
     TraitError::new(
         ErrorCode::FailedPrecondition,
         "container has unreclaimed network resources from a failed attach; manual reclaim required",
+    )
+}
+
+/// plugin の再起動後に attach の取り残しの記録だけから復元したネットワークへの操作の拒否・回収後の削除の応答
+/// （ネットワーク本体の記録は永続化されておらず、bridge・nft テーブルは手動回収。#1870・#2681）。
+pub const MSG_RECOVERED_NETWORK_UNTRACKED: &str = "attach leftovers were reclaimed; the network itself was not tracked across the plugin restart and needs manual reclaim";
+
+fn recovered_network() -> TraitError {
+    TraitError::new(
+        ErrorCode::FailedPrecondition,
+        MSG_RECOVERED_NETWORK_UNTRACKED,
+    )
+}
+
+/// 取り残しの記録を永続化できなかった失敗（メモリの記録は保持している）。元のエラーを残して件を足す。
+fn with_persist_failure(e: TraitError) -> TraitError {
+    TraitError::new(
+        ErrorCode::Internal,
+        format!(
+            "{} ({}); the reclaim record could not be persisted",
+            e.message(),
+            e.code().as_str()
+        ),
     )
 }
 
@@ -610,6 +748,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 gateway: handle.as_ref().map(|_| gateway),
                 handle,
                 leaked,
+                recovered: false,
             },
         );
         result?;
@@ -624,6 +763,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         match reg.networks.get(req.network().as_str()) {
             None => return Err(not_found_network()),
             Some(n) if n.leaked.is_some() => return Err(leaked_network()),
+            Some(n) if n.recovered => return Err(recovered_network()),
             Some(n) if n.deleting => return Err(network_deleting()),
             Some(_) => {}
         }
@@ -661,6 +801,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 endpoint,
                 attached: None,
                 unreclaimed: false,
+                claim: None,
             },
         );
         Ok(NetnsStatus::new(req.container().clone(), netns))
@@ -695,6 +836,9 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         if network.leaked.is_some() {
             return Err(leaked_network());
         }
+        if network.recovered {
+            return Err(recovered_network());
+        }
         if network.deleting {
             return Err(network_deleting());
         }
@@ -718,10 +862,25 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let outcome = match self.backend.attach(handle, &container.endpoint) {
             Ok(o) => o,
             Err(f) => {
-                if f.leftover > 0 {
-                    container.unreclaimed = true;
+                if f.leftover == 0 {
+                    return Err(f.error);
                 }
-                return Err(f.error);
+                container.unreclaimed = true;
+                container.claim = f.reclaim;
+                // 取り残しの記録は再起動をまたいで残す。書けなくてもメモリの記録は保持し、成功を装わず失敗を足す
+                // （NET-1・#2681）。
+                let persisted = match (&self.store, container.claim.as_ref()) {
+                    (Some(store), Some(claim)) => self
+                        .backend
+                        .encode_attach_claim(claim)
+                        .map(|rec| store.save_attach(container.endpoint.as_str(), &rec)),
+                    _ => None,
+                };
+                return Err(if matches!(persisted, Some(Err(_))) {
+                    with_persist_failure(f.error)
+                } else {
+                    f.error
+                });
             }
         };
         let address = IpCidr::new(outcome.address.addr(), outcome.address.prefix_len())?;
@@ -748,7 +907,13 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             return Err(network_mismatch());
         }
         if container.unreclaimed {
-            return Err(unreclaimed());
+            // 請求書があれば所有を確認して回収する。成功したときだけ記録を外す（#2681）。無ければ手動回収。
+            if container.claim.is_none() {
+                return Err(unreclaimed());
+            }
+            self.reclaim_attach_entry(&mut reg.containers, req.container().as_str())?;
+            forget_recovered_if_empty(reg, req.network().as_str());
+            return Ok(DetachResponse::new());
         }
         if container.attached.is_some() {
             return Err(TraitError::new(
@@ -769,6 +934,25 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let reg = &mut *guard;
         let name = req.name().as_str();
         let network = reg.networks.get_mut(name).ok_or_else(not_found_network)?;
+        // attach の取り残しは bridge がある間に先に回収する（veth の所有の証明は bridge への所属。bridge を消すと
+        // 証明を失う）。バックエンドでの解放後は bridge が無く証明できないため試みない（手動。#2681）。
+        let mut reclaim_error = None;
+        if !network.backend_deleted {
+            reclaim_error = self.reclaim_network_attach_leftovers(&mut reg.containers, name);
+        }
+        let remaining = network_has_unreclaimed(&reg.containers, name);
+        let network = reg.networks.get_mut(name).ok_or_else(not_found_network)?;
+        if network.recovered {
+            // 復元したネットワークは、取り残しを回収し終えたら記録を外す。ネットワーク本体は手動回収。
+            if remaining {
+                return Err(reclaim_error.unwrap_or_else(delete_blocked_by_unreclaimed));
+            }
+            reg.networks.remove(name);
+            return Err(recovered_network());
+        }
+        if network.leaked.is_some() && remaining {
+            return Err(reclaim_error.unwrap_or_else(delete_blocked_by_unreclaimed));
+        }
         // 作成失敗で取り残した資源の回収待ち: 回収を確認できたときだけ記録を外す（失敗なら保持して再試行）。
         if let Some(leaked) = &network.leaked {
             // 請求書が無い（所有を証明できない）取り残しは、バックエンドを呼ばず手動回収を求める。
@@ -787,8 +971,8 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         let handle = network.handle.as_mut().ok_or_else(not_found_network)?;
         // 取り残しの veth は bridge への master で自分のものと証明される。bridge を消すと証明を失い
         // 二度と回収できないため、取り残しが残る間はバックエンドを呼ばず何も解放しない（記録も保持）。
-        if !network.backend_deleted && network_has_unreclaimed(&reg.containers, name) {
-            return Err(delete_blocked_by_unreclaimed());
+        if !network.backend_deleted && remaining {
+            return Err(reclaim_error.unwrap_or_else(delete_blocked_by_unreclaimed));
         }
         // 以降は成功して記録ごと消えるまで、失敗しても deleting を保つ（部分削除済みのまま再利用させない）。
         network.deleting = true;
@@ -852,10 +1036,63 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
 }
 
 /// ネットワークに、attach の巻き戻しで資源を取り残したコンテナがあるか。
-fn network_has_unreclaimed<C>(containers: &HashMap<String, ContainerEntry<C>>, name: &str) -> bool {
+fn network_has_unreclaimed<C, A>(
+    containers: &HashMap<String, ContainerEntry<C, A>>,
+    name: &str,
+) -> bool {
     containers
         .values()
         .any(|c| c.network == name && c.unreclaimed)
+}
+
+/// 復元したネットワーク（`recovered`）で、コンテナの記録が無くなったら外す（#2681）。
+fn forget_recovered_if_empty<N, C, F, A>(reg: &mut Registry<N, C, F, A>, name: &str) {
+    let recovered = reg.networks.get(name).is_some_and(|n| n.recovered);
+    if recovered && !reg.containers.values().any(|c| c.network == name) {
+        reg.networks.remove(name);
+    }
+}
+
+impl<B: NetsetupBackend> NetsetupNetwork<B> {
+    /// 取り残したコンテナ 1 件を、所有確認つきで回収する。成功したときだけ記録ファイル → メモリの順に外す
+    /// （失敗なら両方保持して再試行できる。記録の削除は中身が一致するときだけ。NET-1・#2681）。
+    fn reclaim_attach_entry(
+        &self,
+        containers: &mut HashMap<String, ContainerEntry<B::Container, B::FailedAttach>>,
+        id: &str,
+    ) -> Result<(), TraitError> {
+        let entry = containers.get(id).ok_or_else(not_found_netns)?;
+        let claim = entry.claim.as_ref().ok_or_else(unreclaimed)?;
+        self.backend.reclaim_failed_attach(claim)?;
+        if let (Some(store), Some(record)) = (&self.store, self.backend.encode_attach_claim(claim))
+        {
+            store.remove_attach_if_matches(entry.endpoint.as_str(), &record)?;
+        }
+        containers.remove(id);
+        Ok(())
+    }
+
+    /// ネットワークの取り残し全件の回収を試みる（請求書の無いものは触れない）。1 件の失敗で残りを止めず、
+    /// 最初のエラーを返す（ERR-1）。
+    fn reclaim_network_attach_leftovers(
+        &self,
+        containers: &mut HashMap<String, ContainerEntry<B::Container, B::FailedAttach>>,
+        name: &str,
+    ) -> Option<TraitError> {
+        let mut ids: Vec<String> = containers
+            .iter()
+            .filter(|(_, c)| c.network == name && c.unreclaimed && c.claim.is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort_unstable();
+        let mut first = None;
+        for id in ids {
+            if let Err(e) = self.reclaim_attach_entry(containers, &id) {
+                first.get_or_insert(e);
+            }
+        }
+        first
+    }
 }
 
 impl<B: NetsetupBackend> NetworkPlugin for NetsetupNetwork<B> {
@@ -906,9 +1143,9 @@ mod linux {
     use fandhe_container_net::netlink_route::NetlinkRouteSocket;
     use fandhe_container_net::netns::ContainerNetns;
     use fandhe_container_net::network::{
-        AttachedContainer, ContainerAttachSpec, CreatedNetwork, FailedCreateClaim,
-        NetworkCreateSpec, PortRegistry, StaticIpam, attach_container, create_network,
-        delete_network, reclaim_failed_create,
+        AttachedContainer, ContainerAttachSpec, CreatedNetwork, FailedAttachClaim,
+        FailedCreateClaim, NetworkCreateSpec, PortRegistry, StaticIpam, attach_container,
+        create_network, delete_network, reclaim_failed_attach, reclaim_failed_create,
     };
     use fandhe_container_net::nftables_batch::NetlinkNetfilterSocket;
 
@@ -982,6 +1219,7 @@ mod linux {
         type Network = LinuxNetwork;
         type Container = AttachedContainer<ContainerNetns>;
         type FailedCreate = FailedCreateClaim;
+        type FailedAttach = FailedAttachClaim;
 
         fn create_network(
             &self,
@@ -1055,6 +1293,44 @@ mod linux {
             }
         }
 
+        fn encode_attach_claim(&self, claim: &Self::FailedAttach) -> Option<String> {
+            Some(claim.to_record())
+        }
+
+        fn decode_attach_claim(
+            &self,
+            endpoint: &EndpointId,
+            record: &str,
+        ) -> Result<(NetName, Self::FailedAttach), TraitError> {
+            let claim =
+                FailedAttachClaim::from_record(record).map_err(|e| net_error_to_trait(&e))?;
+            if claim.endpoint() != endpoint {
+                return Err(TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    "reclaim record does not belong to the endpoint",
+                ));
+            }
+            Ok((claim.network().clone(), claim))
+        }
+
+        fn reclaim_failed_attach(&self, claim: &Self::FailedAttach) -> Result<(), TraitError> {
+            let (route, nft) = self.open_sockets()?;
+            // pin の置き場は記録からではなく、この plugin の固定設定から受ける。
+            match reclaim_failed_attach(
+                &route,
+                &nft,
+                claim,
+                &self.netns_dir,
+                NETSETUP_REQUEST_TIMEOUT,
+            ) {
+                Ok(_) => Ok(()),
+                Err(e) => Err(with_leftover(
+                    net_error_to_trait(&e.error),
+                    e.report.leftover.len(),
+                )),
+            }
+        }
+
         fn create_netns(
             &self,
             _network: &mut Self::Network,
@@ -1072,7 +1348,7 @@ mod linux {
             &self,
             network: &mut Self::Network,
             endpoint: &EndpointId,
-        ) -> Result<AttachOutcome<Self::Container>, AttachFailure> {
+        ) -> Result<AttachOutcome<Self::Container>, AttachFailure<Self::FailedAttach>> {
             self.ensure_netns_dir()?;
             let spec = ContainerAttachSpec::new(
                 endpoint.clone(),
@@ -1094,6 +1370,7 @@ mod linux {
                 AttachFailure {
                     error: with_leftover(net_error_to_trait(&e.error), leftover),
                     leftover,
+                    reclaim: e.reclaim_claim(),
                 }
             })?;
             Ok(AttachOutcome {

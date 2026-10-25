@@ -16,8 +16,9 @@ use fandhe_container_core::traits::{
 use fandhe_container_net::netlink_route::IpPrefix;
 use fandhe_container_net::network::{EndpointId, NetworkName as NetName};
 use fandhe_container_plugin_cri::netsetup::{
-    AttachFailure, AttachOutcome, CreateFailure, DeleteFailure, MAX_NETWORKS, NetsetupBackend,
-    NetsetupContainer, NetsetupNetwork, RECLAIM_DIR, ReclaimStore,
+    AttachFailure, AttachOutcome, CreateFailure, DeleteFailure, MAX_NETWORKS,
+    MSG_RECOVERED_NETWORK_UNTRACKED, NetsetupBackend, NetsetupContainer, NetsetupNetwork,
+    RECLAIM_DIR, ReclaimStore,
 };
 use fandhe_container_plugin_cri::pod_network;
 
@@ -45,6 +46,12 @@ struct Script {
     fail_attach: bool,
     /// attach 失敗時に巻き戻しで取り残す資源の件数。
     attach_leftover: usize,
+    /// attach の取り残しに回収用の請求書を付けるか（所有を証明できる取り残し）。
+    attach_claim: bool,
+    /// attach の請求書を永続化しない（None）にするか。
+    no_attach_encode: bool,
+    /// 次の reclaim_failed_attach を成功させるか。
+    reclaim_attach_ok: bool,
     /// 次の delete_network を失敗させ、渡されたハンドルを全部 retry に返す回数。
     fail_delete: u32,
 }
@@ -62,6 +69,8 @@ impl NetsetupBackend for Fake {
     type Network = String;
     type Container = FakeContainer;
     type FailedCreate = String;
+    /// (ネットワーク名, endpoint)。
+    type FailedAttach = (String, String);
 
     fn create_network(
         &self,
@@ -108,11 +117,45 @@ impl NetsetupBackend for Fake {
         }
     }
 
+    fn encode_attach_claim(&self, claim: &(String, String)) -> Option<String> {
+        let s = self.0.lock().expect("lock");
+        (!s.no_attach_encode).then(|| format!("arec:{}:{}", claim.0, claim.1))
+    }
+
+    fn decode_attach_claim(
+        &self,
+        endpoint: &EndpointId,
+        record: &str,
+    ) -> Result<(NetName, (String, String)), TraitError> {
+        let bad = || TraitError::new(ErrorCode::InvalidArgument, "bad record");
+        let (net, ep) = record
+            .strip_prefix("arec:")
+            .and_then(|r| r.split_once(':'))
+            .filter(|(_, ep)| *ep == endpoint.as_str())
+            .ok_or_else(bad)?;
+        let name = NetName::new(net).map_err(|_| bad())?;
+        Ok((name, (net.to_owned(), ep.to_owned())))
+    }
+
+    fn reclaim_failed_attach(&self, claim: &(String, String)) -> Result<(), TraitError> {
+        let mut s = self.0.lock().expect("lock");
+        s.calls
+            .push(format!("reclaim_attach {} {}", claim.0, claim.1));
+        if s.reclaim_attach_ok {
+            Ok(())
+        } else {
+            Err(TraitError::new(
+                ErrorCode::Internal,
+                "reclaim attach failed",
+            ))
+        }
+    }
+
     fn attach(
         &self,
         network: &mut String,
         endpoint: &EndpointId,
-    ) -> Result<AttachOutcome<FakeContainer>, AttachFailure> {
+    ) -> Result<AttachOutcome<FakeContainer>, AttachFailure<(String, String)>> {
         let mut s = self.0.lock().expect("lock");
         s.calls
             .push(format!("attach {network} {}", endpoint.as_str()));
@@ -120,6 +163,9 @@ impl NetsetupBackend for Fake {
             return Err(AttachFailure {
                 error: TraitError::new(ErrorCode::Internal, "attach failed"),
                 leftover: s.attach_leftover,
+                reclaim: s
+                    .attach_claim
+                    .then(|| (network.clone(), endpoint.as_str().to_owned())),
             });
         }
         Ok(AttachOutcome {
@@ -417,6 +463,7 @@ fn poisoned_lock_returns_internal() {
         type Network = ();
         type Container = FakeContainer;
         type FailedCreate = ();
+        type FailedAttach = ();
         fn create_network(&self, _: &NetName, _: IpPrefix) -> Result<(), CreateFailure> {
             panic!("injected");
         }
@@ -857,5 +904,259 @@ fn net1_persist_failure_is_reported_and_memory_record_kept() {
     ReclaimStore::open(&root).expect("reopen");
     net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
         .expect("reclaimed from memory");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+const ATTACH_DIR: &str = "attach";
+
+/// attach を取り残し付き（請求書つき）で失敗させる。
+fn leak_attach(net: &NetsetupNetwork<Fake>, fake: &Fake, network: &str, container: &str) {
+    pod_network::set_up_pod(net, &nname(network), subnet()).expect("pod");
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_attach = true;
+        s.attach_leftover = 1;
+        s.attach_claim = true;
+    }
+    pod_network::set_up_container(net, &nname(network), &cid(container)).expect_err("attach fails");
+    fake.0.lock().expect("lock").fail_attach = false;
+}
+
+/// NET-1・#2681: 請求書つきの attach の取り残しは、記録ファイルへ書かれ、detach の所有確認つき回収で記録ごと消え、
+/// 同じ container で netns をやり直せる。回収に失敗する間は記録とファイルが残り、再試行で収束する。
+#[test]
+fn net1_attach_leftover_reclaimed_by_detach() {
+    let root = temp_state_root("detach");
+    let fake = Fake::default();
+    let net = persistent(&root, &fake);
+    leak_attach(&net, &fake, "n0", "c1");
+    let file = root.join(RECLAIM_DIR).join(ATTACH_DIR).join("c1.attach");
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("record"),
+        "arec:n0:c1"
+    );
+    // 回収に失敗する間は、記録とファイルを保持してエラーを返す。
+    let e = net
+        .detach(&DetachRequest::new(nname("n0"), cid("c1")))
+        .expect_err("reclaim fails");
+    assert_eq!(e.message(), "reclaim attach failed");
+    assert!(file.exists());
+    fake.0.lock().expect("lock").reclaim_attach_ok = true;
+    net.detach(&DetachRequest::new(nname("n0"), cid("c1")))
+        .expect("reclaimed");
+    assert!(!file.exists());
+    let calls: Vec<String> = fake
+        .calls()
+        .into_iter()
+        .filter(|c| c.starts_with("reclaim_attach "))
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            "reclaim_attach n0 c1",
+            "reclaim_attach n0 c1",
+            "reclaim_attach n0 c1"
+        ]
+    );
+    // 記録が外れているので、netns をやり直せる。
+    net.create_netns(&CreateNetnsRequest::new(nname("n0"), cid("c1")))
+        .expect("netns again");
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// NET-1・#2681: delete_network は bridge の解放より前に attach の取り残しを回収し、成功すれば通常の削除へ進む。
+#[test]
+fn net1_delete_network_reclaims_attach_leftover_first() {
+    let root = temp_state_root("delfirst");
+    let fake = Fake::default();
+    let net = persistent(&root, &fake);
+    leak_attach(&net, &fake, "n0", "c1");
+    fake.0.lock().expect("lock").reclaim_attach_ok = true;
+    // 回収は set_up_container のロールバックの detach でも 1 回走る（失敗して残った）ので、呼び出し列は後ろだけ見る。
+    net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
+        .expect("delete");
+    let calls = fake.calls();
+    let tail: Vec<&str> = calls.iter().rev().take(2).map(String::as_str).collect();
+    assert_eq!(tail, ["delete_network n0 []", "reclaim_attach n0 c1"]);
+    assert!(
+        !root
+            .join(RECLAIM_DIR)
+            .join(ATTACH_DIR)
+            .join("c1.attach")
+            .exists()
+    );
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// NET-1・#2681: 再起動後は attach の記録だけから復元したネットワークとなり、delete_network が取り残しを回収して
+/// 記録を消し、ネットワーク本体は手動回収と固定の文言で知らせる（成功を装わない）。2 回目は NotFound。
+#[test]
+fn net1_attach_leftover_survives_plugin_restart() {
+    let root = temp_state_root("attrestart");
+    let fake = Fake::default();
+    let net = persistent(&root, &fake);
+    leak_attach(&net, &fake, "n0", "c1");
+    let file = root.join(RECLAIM_DIR).join(ATTACH_DIR).join("c1.attach");
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("record"),
+        "arec:n0:c1"
+    );
+    drop(net);
+
+    let fake2 = Fake::default();
+    let net = persistent(&root, &fake2);
+    // 復元したネットワークへは資源を増やさない。
+    assert_eq!(
+        net.create_netns(&CreateNetnsRequest::new(nname("n0"), cid("c2")))
+            .expect_err("recovered")
+            .code(),
+        ErrorCode::FailedPrecondition
+    );
+    // 回収に失敗する間は記録を保持する。
+    assert_eq!(
+        net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
+            .expect_err("reclaim fails")
+            .message(),
+        "reclaim attach failed"
+    );
+    assert!(file.exists());
+    fake2.0.lock().expect("lock").reclaim_attach_ok = true;
+    let e = net
+        .delete_network(&DeleteNetworkRequest::new(nname("n0")))
+        .expect_err("network itself needs manual reclaim");
+    assert_eq!(e.code(), ErrorCode::FailedPrecondition);
+    assert_eq!(e.message(), MSG_RECOVERED_NETWORK_UNTRACKED);
+    assert!(!file.exists());
+    assert_eq!(
+        net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
+            .expect_err("gone")
+            .code(),
+        ErrorCode::NotFound
+    );
+    // バックエンドの delete_network は呼ばれない（ハンドルが無い）。
+    assert!(
+        !fake2
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("delete_network"))
+    );
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// NET-1・#2681: 復元したネットワークの detach も回収でき、コンテナが 0 件になればネットワークの記録も外れる。
+#[test]
+fn net1_recovered_network_is_forgotten_after_detach_reclaim() {
+    let root = temp_state_root("attdetach");
+    let fake = Fake::default();
+    let net = persistent(&root, &fake);
+    leak_attach(&net, &fake, "n0", "c1");
+    drop(net);
+    let fake2 = Fake::default();
+    fake2.0.lock().expect("lock").reclaim_attach_ok = true;
+    let net = persistent(&root, &fake2);
+    net.detach(&DetachRequest::new(nname("n0"), cid("c1")))
+        .expect("detach reclaims");
+    assert_eq!(
+        net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
+            .expect_err("forgotten")
+            .code(),
+        ErrorCode::NotFound
+    );
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// NET-1・#2681: 壊れた attach の記録は消さず、登録せず、記録器の失敗件数に数える。
+#[test]
+fn net1_corrupt_attach_record_is_counted_and_kept() {
+    let root = temp_state_root("attcorrupt");
+    let store = ReclaimStore::open(&root).expect("store");
+    let dir = root.join(RECLAIM_DIR).join(ATTACH_DIR);
+    std::fs::write(dir.join("c1.attach"), "garbage").expect("write");
+    std::fs::write(dir.join("c2.attach"), "arec:n0:other").expect("mismatch");
+    let fake = Fake::default();
+    let recorder = Arc::new(fandhe_container_core::observability::OpRecorder::new());
+    let net = NetsetupNetwork::with_reclaim_store(fake.clone(), store, Some(Arc::clone(&recorder)))
+        .expect("plugin");
+    assert!(dir.join("c1.attach").exists() && dir.join("c2.attach").exists());
+    assert_eq!(
+        net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
+            .expect_err("not registered")
+            .code(),
+        ErrorCode::NotFound
+    );
+    let op = fandhe_container_core::observability::OpName::new("net.reclaim_store_load")
+        .expect("op name");
+    assert_eq!(recorder.snapshot_op(&op).expect("stats").failure(), 2);
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// NET-1・#2681: 記録を書けないときは成功を装わず、件を足した Internal を返し、メモリの記録は保持する。
+#[cfg(unix)]
+#[test]
+fn net1_attach_persist_failure_is_reported() {
+    let root = temp_state_root("attfail");
+    let fake = Fake::default();
+    let net = persistent(&root, &fake);
+    let dir = root.join(RECLAIM_DIR).join(ATTACH_DIR);
+    std::fs::remove_dir_all(&dir).expect("rm dir");
+    std::fs::write(&dir, "not a directory").expect("replace by file");
+    pod_network::set_up_pod(&net, &nname("n0"), subnet()).expect("pod");
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_attach = true;
+        s.attach_leftover = 1;
+        s.attach_claim = true;
+    }
+    net.create_netns(&CreateNetnsRequest::new(nname("n0"), cid("c1")))
+        .expect("netns");
+    let e = net
+        .attach(&AttachRequest::new(nname("n0"), cid("c1")))
+        .expect_err("fails");
+    assert_eq!(e.code(), ErrorCode::Internal);
+    assert!(e.message().contains("could not be persisted"));
+    // メモリの記録は保持されているので、再 attach は拒否される。
+    assert_eq!(
+        net.attach(&AttachRequest::new(nname("n0"), cid("c1")))
+            .expect_err("kept")
+            .code(),
+        ErrorCode::FailedPrecondition
+    );
+    std::fs::remove_dir_all(&root).expect("cleanup");
+}
+
+/// NET-1・#2681: 請求書の無い取り残しは今までどおり手動回収のまま（detach・delete を拒否し、ファイルも書かない）。
+#[test]
+fn net1_attach_leftover_without_claim_stays_manual() {
+    let root = temp_state_root("attnoclaim");
+    let fake = Fake::default();
+    let net = persistent(&root, &fake);
+    pod_network::set_up_pod(&net, &nname("n0"), subnet()).expect("pod");
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_attach = true;
+        s.attach_leftover = 1;
+    }
+    pod_network::set_up_container(&net, &nname("n0"), &cid("c1")).expect_err("attach fails");
+    assert!(
+        !root
+            .join(RECLAIM_DIR)
+            .join(ATTACH_DIR)
+            .join("c1.attach")
+            .exists()
+    );
+    fake.0.lock().expect("lock").reclaim_attach_ok = true;
+    assert_eq!(
+        net.detach(&DetachRequest::new(nname("n0"), cid("c1")))
+            .expect_err("manual")
+            .code(),
+        ErrorCode::FailedPrecondition
+    );
+    assert_eq!(
+        net.delete_network(&DeleteNetworkRequest::new(nname("n0")))
+            .expect_err("blocked")
+            .code(),
+        ErrorCode::FailedPrecondition
+    );
+    assert!(!fake.calls().iter().any(|c| c.starts_with("reclaim_attach")));
     std::fs::remove_dir_all(&root).expect("cleanup");
 }

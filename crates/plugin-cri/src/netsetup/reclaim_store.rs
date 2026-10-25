@@ -1,11 +1,13 @@
-//! 作成失敗の回収待ちの記録（請求書）を plugin プロセスの再起動をまたいで残す置き場
-//! （NET-1・NET-6・REPAIR-3・REPAIR-4。#2604。設計は `docs/design/network-reclaim-persistence.md`）。
+//! 作成失敗の回収待ちの記録（請求書）と、attach の巻き戻しの取り残しの記録を plugin プロセスの再起動を
+//! またいで残す置き場（NET-1・NET-6・REPAIR-3・REPAIR-4。#2604・#2681。設計は `docs/design/network-reclaim-persistence.md`）。
 //!
 //! 呼び出し元: [`super::NetsetupNetwork`] が、作成失敗で取り残しを登録する時点で [`ReclaimStore::save`]、
 //! 回収を確認して記録を外した直後に [`ReclaimStore::remove_if_matches`]、起動時に [`ReclaimStore::load`] を呼ぶ。
 //! 記録の中身（net の `FailedCreateClaim` の符号化）は本モジュールにとって不透明な文字列で、符号化と復号は
 //! [`super::NetsetupBackend`] が担う。置き場は `<状態ルート>/.cri/net/pending-reclaim/<ネットワーク名>.claim`
-//! の固定の場所で、要求の入力からは受けない。
+//! の固定の場所で、要求の入力からは受けない。attach の取り残しの記録（net の `FailedAttachClaim` の符号化）は
+//! 同じ置き場の下位ディレクトリ `attach/<endpoint>.attach` に置き、権限・原子的な書き込み・排他（親の `.lock` を共有）・
+//! 長さの上限・読み込みの検査は作成失敗の記録と同じ（#2681）。
 //!
 //! # 安全性
 //!
@@ -24,14 +26,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use fandhe_container_core::traits::{ErrorCode, TraitError};
-use fandhe_container_net::network::{CLAIM_RECORD_MAX_LEN, NetworkName as NetName};
+use fandhe_container_net::network::{CLAIM_RECORD_MAX_LEN, EndpointId, NetworkName as NetName};
 
-use super::MAX_NETWORKS;
+use super::{MAX_CONTAINERS_PER_NETWORK, MAX_NETWORKS};
 
 /// 置き場の状態ルートからの相対位置（先頭が `.` のため `ContainerId` の状態ディレクトリと衝突しない）。
 pub const RECLAIM_DIR: &str = ".cri/net/pending-reclaim";
 /// 記録ファイルの拡張子。
 const EXT: &str = ".claim";
+/// attach の取り残しの記録を置く下位ディレクトリ名（`.claim` で終わらないため作成失敗の記録の列挙に混ざらない）。
+const ATTACH_DIR: &str = "attach";
+/// attach の取り残しの記録ファイルの拡張子。
+const ATTACH_EXT: &str = ".attach";
+/// 読み込む attach の記録の件数の上限（ネットワーク数 × ネットワークごとのコンテナ数）。
+const MAX_ATTACH_RECORDS: usize = MAX_NETWORKS * MAX_CONTAINERS_PER_NETWORK;
 /// プロセス間の排他に使うファイル名。
 const LOCK_NAME: &str = ".lock";
 /// 一時ファイルの名前の接頭辞（`.` 始まりで `*.claim` に一致しない）。
@@ -61,12 +69,18 @@ pub struct LoadReport {
     pub claims: Vec<StoredClaim>,
     /// `.claim` で終わるがネットワーク名として不正なファイルの件数（触れずに残す）。
     pub unrecognized: usize,
+    /// attach の取り残しの記録（`name` は endpoint）。#2681。
+    pub attach_claims: Vec<StoredClaim>,
+    /// `.attach` で終わるが endpoint として不正なファイルの件数（触れずに残す）。
+    pub attach_unrecognized: usize,
 }
 
 /// 回収待ちの記録の置き場。
 #[derive(Debug, Clone)]
 pub struct ReclaimStore {
     dir: PathBuf,
+    /// attach の取り残しの記録の置き場（`dir` の下位）。
+    attach_dir: PathBuf,
 }
 
 impl ReclaimStore {
@@ -82,7 +96,16 @@ impl ReclaimStore {
                 return Err(fail());
             }
         }
-        Ok(Self { dir: cur })
+        let dir = cur.clone();
+        cur.push(ATTACH_DIR);
+        create_private_dir(&cur).map_err(|_| fail())?;
+        if !dir_is_private(&cur, owner) {
+            return Err(fail());
+        }
+        Ok(Self {
+            dir,
+            attach_dir: cur,
+        })
     }
 
     /// 全記録を列挙する。件数が [`MAX_NETWORKS`] を超えれば fail-closed で失敗する。
@@ -115,6 +138,28 @@ impl ReclaimStore {
             });
         }
         report.claims.sort_by(|a, b| a.name.cmp(&b.name));
+        for entry in fs::read_dir(&self.attach_dir).map_err(|_| fail())? {
+            let entry = entry.map_err(|_| fail())?;
+            let file_name = entry.file_name();
+            let Some(stem) = file_name.to_str().and_then(|f| f.strip_suffix(ATTACH_EXT)) else {
+                continue;
+            };
+            if EndpointId::new(stem).is_err() {
+                report.attach_unrecognized = report.attach_unrecognized.saturating_add(1);
+                continue;
+            }
+            if report.attach_claims.len() >= MAX_ATTACH_RECORDS {
+                return Err(internal("reclaim store holds too many records"));
+            }
+            report.attach_claims.push(StoredClaim {
+                name: stem.to_owned(),
+                record: match read_record(&entry.path()) {
+                    ReadOutcome::Record(r) => Some(r),
+                    _ => None,
+                },
+            });
+        }
+        report.attach_claims.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(report)
     }
 
@@ -132,6 +177,26 @@ impl ReclaimStore {
         next_seq: &dyn Fn() -> u64,
     ) -> Result<(), TraitError> {
         let file = self.file_for(name)?;
+        self.save_at(&self.dir, &file, record, next_seq)
+    }
+
+    /// attach の取り残しの記録を不可分に書く（同じ endpoint があれば置き換える。#2681）。
+    pub fn save_attach(&self, endpoint: &str, record: &str) -> Result<(), TraitError> {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let file = self.attach_file_for(endpoint)?;
+        self.save_at(&self.attach_dir, &file, record, &|| {
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        })
+    }
+
+    /// `dir` 直下の `file` へ不可分に書く本体。一時ファイルは `dir` に作り、同じ親のロックで排他する。
+    fn save_at(
+        &self,
+        dir: &Path,
+        file: &Path,
+        record: &str,
+        next_seq: &dyn Fn() -> u64,
+    ) -> Result<(), TraitError> {
         if record.len() > CLAIM_RECORD_MAX_LEN {
             return Err(internal("reclaim record is too long"));
         }
@@ -141,9 +206,7 @@ impl ReclaimStore {
         const TMP_ATTEMPTS: usize = 16;
         let mut opened = None;
         for _ in 0..TMP_ATTEMPTS {
-            let tmp = self
-                .dir
-                .join(format!("{TMP_PREFIX}{}-{}", std::process::id(), next_seq()));
+            let tmp = dir.join(format!("{TMP_PREFIX}{}-{}", std::process::id(), next_seq()));
             let mut opts = OpenOptions::new();
             opts.write(true).create_new(true);
             set_private_mode(&mut opts);
@@ -164,14 +227,14 @@ impl ReclaimStore {
             .and_then(|()| f.sync_all())
             .and_then(|()| {
                 drop(f);
-                fs::rename(&tmp, &file)
+                fs::rename(&tmp, file)
             });
         if written.is_err() {
             // best-effort。残った一時ファイルは `.claim` に一致しないため読み込みに影響しない。
             let _ = fs::remove_file(&tmp);
             return Err(internal("failed to persist the reclaim record"));
         }
-        sync_dir(&self.dir)
+        sync_dir(dir)
     }
 
     /// 記録の中身が `expected` と一致するときだけ消す。無ければ成功（冪等）。
@@ -180,8 +243,23 @@ impl ReclaimStore {
     /// 新しい請求書まで消さないための条件付き削除（排他の下で照合する。NET-1・#2604）。中身が違えば消さずに成功する。
     pub fn remove_if_matches(&self, name: &str, expected: &str) -> Result<(), TraitError> {
         let file = self.file_for(name)?;
+        self.remove_at(&self.dir, &file, expected)
+    }
+
+    /// attach の取り残しの記録を、中身が `expected` と一致するときだけ消す（#2681）。無ければ成功（冪等）。
+    pub fn remove_attach_if_matches(
+        &self,
+        endpoint: &str,
+        expected: &str,
+    ) -> Result<(), TraitError> {
+        let file = self.attach_file_for(endpoint)?;
+        self.remove_at(&self.attach_dir, &file, expected)
+    }
+
+    /// `file` を排他の下で照合して消す本体。
+    fn remove_at(&self, dir: &Path, file: &Path, expected: &str) -> Result<(), TraitError> {
         let _lock = self.lock()?;
-        match read_record(&file) {
+        match read_record(file) {
             ReadOutcome::Record(current) if current == expected => {}
             // 既に無い、または別の請求書に置き換わっている。消さずに成功する。
             ReadOutcome::Missing | ReadOutcome::Record(_) => return Ok(()),
@@ -190,12 +268,19 @@ impl ReclaimStore {
                 return Err(internal("failed to read the reclaim record"));
             }
         }
-        match fs::remove_file(&file) {
+        match fs::remove_file(file) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(_) => return Err(internal("failed to remove the reclaim record")),
         }
-        sync_dir(&self.dir)
+        sync_dir(dir)
+    }
+
+    /// endpoint（検証済みの文字種のみ）から attach の記録のパスを作る。
+    fn attach_file_for(&self, endpoint: &str) -> Result<PathBuf, TraitError> {
+        EndpointId::new(endpoint)
+            .map_err(|_| TraitError::new(ErrorCode::InvalidArgument, "invalid endpoint id"))?;
+        Ok(self.attach_dir.join(format!("{endpoint}{ATTACH_EXT}")))
     }
 
     /// ネットワーク名（検証済みの文字種のみ）から記録のパスを作る。
@@ -538,6 +623,94 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("mode");
         fs::remove_dir_all(&dir).expect("rmdir");
         let elsewhere = temp_root("elsewhere");
+        std::os::unix::fs::symlink(&elsewhere, &dir).expect("symlink");
+        assert!(ReclaimStore::open(&root).is_err());
+        fs::remove_dir_all(&root).expect("cleanup");
+        fs::remove_dir_all(&elsewhere).expect("cleanup");
+    }
+
+    /// NET-1・#2681: attach の記録は `attach/` に保存・読み戻し・条件付き削除でき、作成失敗の記録と混ざらない。
+    #[test]
+    fn net1_store_attach_save_load_remove_roundtrip() {
+        let root = temp_root("attach-rt");
+        let s = ReclaimStore::open(&root).expect("open");
+        s.save("web", "net-rec\n").expect("save net");
+        s.save_attach("c1", "att-1\n").expect("save c1");
+        s.save_attach("c1", "att-2\n").expect("replace c1");
+        s.save_attach("c2.x", "att-3\n").expect("save c2");
+        let file = root.join(RECLAIM_DIR).join(ATTACH_DIR).join("c1.attach");
+        assert_eq!(fs::read_to_string(&file).expect("read"), "att-2\n");
+        let r = s.load().expect("load");
+        assert_eq!(r.claims.len(), 1);
+        assert_eq!(
+            r.attach_claims,
+            vec![
+                StoredClaim {
+                    name: "c1".into(),
+                    record: Some("att-2\n".into())
+                },
+                StoredClaim {
+                    name: "c2.x".into(),
+                    record: Some("att-3\n".into())
+                },
+            ]
+        );
+        s.remove_attach_if_matches("c1", "stale\n")
+            .expect("mismatch keeps");
+        assert!(file.exists());
+        s.remove_attach_if_matches("c1", "att-2\n").expect("remove");
+        s.remove_attach_if_matches("c1", "att-2\n")
+            .expect("idempotent");
+        assert!(!file.exists());
+        assert_eq!(s.load().expect("load").attach_claims.len(), 1);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// NET-1・#2681: 不正な endpoint 名・長すぎる記録は保存を拒否し、壊れたファイルは記録なし・未認識として残す。
+    #[test]
+    fn net1_store_attach_rejects_bad_input_and_flags_bad_files() {
+        let root = temp_root("attach-bad");
+        let s = ReclaimStore::open(&root).expect("open");
+        assert_eq!(
+            s.save_attach("../x", "r").expect_err("name").code(),
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(
+            s.save_attach("c1", &"a".repeat(CLAIM_RECORD_MAX_LEN + 1))
+                .expect_err("long")
+                .code(),
+            ErrorCode::Internal
+        );
+        let dir = root.join(RECLAIM_DIR).join(ATTACH_DIR);
+        fs::write(dir.join("big.attach"), vec![b'a'; CLAIM_RECORD_MAX_LEN + 1]).expect("big");
+        fs::write(dir.join("Bad Name.attach"), "x").expect("bad");
+        fs::write(dir.join("ignored.txt"), "x").expect("other");
+        let r = s.load().expect("load");
+        assert_eq!(
+            r.attach_claims,
+            vec![StoredClaim {
+                name: "big".into(),
+                record: None
+            }]
+        );
+        assert_eq!(r.attach_unrecognized, 1);
+        assert!(dir.join("big.attach").exists());
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// SEC-1・#2681: attach の置き場の権限違反と symlink は開けない（unix）。
+    #[cfg(unix)]
+    #[test]
+    fn net1_store_open_rejects_loose_attach_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = temp_root("attach-perm");
+        ReclaimStore::open(&root).expect("open");
+        let dir = root.join(RECLAIM_DIR).join(ATTACH_DIR);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o750)).expect("mode");
+        assert!(ReclaimStore::open(&root).is_err());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("mode");
+        fs::remove_dir_all(&dir).expect("rmdir");
+        let elsewhere = temp_root("attach-elsewhere");
         std::os::unix::fs::symlink(&elsewhere, &dir).expect("symlink");
         assert!(ReclaimStore::open(&root).is_err());
         fs::remove_dir_all(&root).expect("cleanup");

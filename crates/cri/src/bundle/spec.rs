@@ -884,6 +884,10 @@ fn build_inner(
             }
             (Stage::Build, None) => return Err(unsupported("dns_config")),
         };
+        // 生成する bind を足した総件数でも上限（core の `CONFIG_MAX_MOUNTS`）を守る。
+        if mounts.len() >= MAX_MOUNTS {
+            return Err(invalid("mounts"));
+        }
         budget.spend(
             source
                 .len()

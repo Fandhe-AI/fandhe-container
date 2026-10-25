@@ -280,6 +280,14 @@ fn write_new_file(
     let mut f = o
         .open(path)
         .map_err(|_| CriError::internal(format!("failed to create {what}")))?;
+    // open 時の mode は umask で削られる（umask 077 だと 0644 が 0600 になる）。排他作成した自分のハンドルに
+    // 対して明示的に設定し直す（プロセス全体の umask は変えない）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        f.set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|_| CriError::internal(format!("failed to set permissions of {what}")))?;
+    }
     f.write_all(bytes)
         .and_then(|()| f.sync_all())
         .map_err(|_| CriError::internal(format!("failed to write {what}")))

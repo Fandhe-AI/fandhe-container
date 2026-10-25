@@ -434,6 +434,31 @@ fn dns_config_generates_resolv_conf_and_binds_it() {
     assert_eq!(v["mounts"][0]["source"], resolv.to_str().unwrap());
 }
 
+/// CRI-2・NET-5（#2665）: umask 077 のプロセスでも resolv.conf は 0644（非 root のコンテナ側が読める）。
+/// umask はプロセス全体の状態なので、`umask 077` を掛けた子プロセスとして自分自身を再実行して確かめる。
+#[test]
+fn dns_resolv_conf_is_0644_even_under_umask_077() {
+    const CHILD: &str = "FANDHE_TEST_UMASK_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let (_tmp, _rootfs, p) = setup("dnsumask");
+        let dir = prepare_dns(&p, "ctr1").expect("prepare");
+        assert_eq!(mode(&dir.join("resolv.conf")), 0o644);
+        assert_eq!(mode(&dir.join("config.json")), 0o600);
+        return;
+    }
+    let exe = std::env::current_exe().expect("exe");
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("umask 077; exec \"$0\" --exact dns_resolv_conf_is_0644_even_under_umask_077 --test-threads=1")
+        .arg(exe)
+        .env(CHILD, "1")
+        .output()
+        .expect("spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "child failed: {stdout}");
+    assert!(stdout.contains("1 passed"), "child did not run: {stdout}");
+}
+
 #[test]
 fn no_dns_config_creates_no_resolv_conf() {
     let (_tmp, _rootfs, p) = setup("nodns");

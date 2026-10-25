@@ -987,6 +987,40 @@ fn cri2_dns_bind_follows_user_mounts() {
     assert_eq!(v["mounts"][1]["destination"], "/etc/resolv.conf");
 }
 
+fn n_mounts(n: usize) -> ContainerConfig {
+    let mut c = ctr();
+    c.mounts = (0..n)
+        .map(|i| Mount {
+            container_path: format!("/m{i}"),
+            host_path: format!("/srv/{i}"),
+            propagation: MountPropagation::PropagationPrivate as i32,
+            ..Default::default()
+        })
+        .collect();
+    c
+}
+
+/// CRI-2・NET-5（#2665）: 生成する resolv.conf の bind を含む総件数が 1024 を超えると両段で INVALID_ARGUMENT。
+#[test]
+fn cri2_dns_bind_counts_toward_the_mount_limit() {
+    let p = dns_pod(&["10.0.0.10"]);
+    let over = n_mounts(1024);
+    assert_eq!(
+        validate_config(&p, &over).unwrap_err().code(),
+        CriErrorCode::InvalidArgument
+    );
+    assert_eq!(
+        build_with_resolv(&p, &over).unwrap_err(),
+        CriErrorCode::InvalidArgument
+    );
+    let ok = n_mounts(1023);
+    validate_config(&p, &ok).expect("1023 + dns = 1024");
+    let v = build_with_resolv(&p, &ok).expect("build");
+    assert_eq!(v["mounts"].as_array().unwrap().len(), 1024);
+    // dns_config なしなら 1024 件ちょうどは受理される。
+    validate_config(&pod(), &over).expect("1024 without dns");
+}
+
 /// ファイルのパスを渡さない入口では、要求を黙って落とさず UNIMPLEMENTED。
 #[test]
 fn cri2_dns_config_without_generated_file_is_unimplemented() {

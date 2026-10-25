@@ -28,8 +28,19 @@
 //!
 //! # 移していない操作（実装済みを装わない。REPAIR-3）
 //!
-//! `usage*` の読み取り（件数・サイズの集計）と `pull` / `pull_recovery` の staging・公開はパス起点のまま
-//! である。根拠と追跡 issue は `docs/design/image-store-root-trust.md` の論点 3 を参照。
+//! `pull` / `pull_recovery` の staging・公開・回収は `staging` 子モジュールの `StagingDir` / `PullDir` と
+//! `BlobDir` 経由で fd 起点へ移した（#2694）。移していないのは次の 2 つである。根拠と追跡 issue は
+//! `docs/design/image-store-root-trust.md` の論点 3 を参照。
+//!
+//! - `usage*` の読み取り（件数・サイズの集計）はパス起点のまま（#2695）。
+//! - fetcher（`RegistryClient::fetch_blob`）が書く先は `PullSession::staged_blob_path` が返すパスである。
+//!   fetcher の API がパスを受け取るためで、handle 起点にするには cri の fetch トレイトを含む crate をまたぐ
+//!   変更が要る。差し替えが起きてもおとりへ書かれた内容は公開されない（公開は pull ディレクトリ fd 起点で
+//!   開き直して検証した実体に限る）。
+
+mod staging;
+
+pub(crate) use staging::{PullDir, StagingDir};
 
 use std::path::{Path, PathBuf};
 
@@ -141,7 +152,7 @@ mod imp {
     use std::os::unix::fs::MetadataExt as _;
     use std::path::PathBuf;
 
-    use super::{OciError, OciErrorCode, RootHandle, root_inaccessible};
+    use super::{OciError, OciErrorCode, PullDir, RootHandle, root_inaccessible};
     use crate::sys::at::{
         self, ELOOP, ENOSYS, ENOTDIR, EPERM, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW,
         O_NONBLOCK, O_PATH, O_RDONLY, O_WRONLY, RESOLVE_IN_ROOT, RESOLVE_NO_MAGICLINKS,
@@ -152,14 +163,14 @@ mod imp {
     pub(super) type Inner = OwnedFd;
 
     /// 名前解決で常に付ける制約。root の外・symlink・マウント越えへ出ない。
-    const RESOLVE: u64 =
+    pub(super) const RESOLVE: u64 =
         RESOLVE_IN_ROOT | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV;
 
     /// blob 置き場の相対パス。
     const BLOB_DIR: [&str; 2] = ["blobs", "sha256"];
 
     /// blob 置き場の検査で使う文言（`usage::checked_dir` と同じ code・文言を保つ）。
-    fn blob_dir_not_plain() -> OciError {
+    pub(super) fn blob_dir_not_plain() -> OciError {
         OciError::new(
             OciErrorCode::FailedPrecondition,
             "blob directory is not a plain directory",
@@ -212,7 +223,12 @@ mod imp {
             })
         }
 
-        fn open_at(&self, rel: &std::ffi::CStr, flags: u64, mode: u64) -> io::Result<OwnedFd> {
+        pub(super) fn open_at(
+            &self,
+            rel: &std::ffi::CStr,
+            flags: u64,
+            mode: u64,
+        ) -> io::Result<OwnedFd> {
             at::openat2(
                 Some(self.inner.as_fd()),
                 rel,
@@ -331,6 +347,56 @@ mod imp {
         }
     }
 
+    impl RootHandle {
+        /// `blobs/sha256` を開く。無ければ 0700 で作る（`blobs` → `sha256` の順。すべて root の fd 起点）。
+        ///
+        /// 既にあるものが symlink・非ディレクトリなら `FailedPrecondition`（`open_blob_dir` と同じ判定）。
+        /// 並行する別の作成者に先を越された（`EEXIST`）場合は作られたものを開き直して検査する。
+        pub(crate) fn ensure_blob_dirs(&self) -> Result<BlobDir, OciError> {
+            if let Some(b) = self.open_blob_dir()? {
+                return Ok(b);
+            }
+            let create_failed =
+                || OciError::new(OciErrorCode::Internal, "failed to create blob directory");
+            match at::mkdirat_name(self.inner.as_fd(), OsStr::new("blobs"), 0o700) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(create_failed()),
+            }
+            let blobs = self.open_blobs_parent()?;
+            match at::mkdirat_name(blobs.as_fd(), OsStr::new("sha256"), 0o700) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(create_failed()),
+            }
+            self.open_blob_dir()?.ok_or_else(|| {
+                OciError::new(
+                    OciErrorCode::FailedPrecondition,
+                    "blob directory is unavailable",
+                )
+            })
+        }
+
+        /// `blobs` を開く（symlink・非ディレクトリは `FailedPrecondition`）。
+        fn open_blobs_parent(&self) -> Result<OwnedFd, OciError> {
+            let rel =
+                at::component_cstring(OsStr::new("blobs")).map_err(|_| blob_dir_stat_failed())?;
+            self.open_at(&rel, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, 0)
+                .map_err(|e| match errno(&e) {
+                    Some(ELOOP | ENOTDIR) => blob_dir_not_plain(),
+                    _ => blob_dir_stat_failed(),
+                })
+        }
+
+        /// `blobs` ディレクトリを fsync する（`sha256` の新設を永続化する。公開の永続化の一部）。
+        pub(crate) fn sync_blobs_parent(&self) -> Result<(), OciError> {
+            let blobs = self.open_blobs_parent()?;
+            File::from(blobs).sync_all().map_err(|_| {
+                OciError::new(OciErrorCode::Internal, "failed to sync published blobs")
+            })
+        }
+    }
+
     /// 開いた `blobs/sha256`。
     #[derive(Debug)]
     pub(crate) struct BlobDir(OwnedFd);
@@ -357,6 +423,52 @@ mod imp {
             at::unlinkat_name(self.0.as_fd(), OsStr::new(hex), false)
         }
 
+        /// pull ディレクトリの `from` を、この置き場の `to` へハードリンクで公開する（宛先は置き換えない。
+        /// 既にあれば `AlreadyExists`）。両方とも開いた fd 起点で、名前は 1 コンポーネント。
+        pub(crate) fn link_from(&self, src: &PullDir, from: &str, to: &str) -> io::Result<()> {
+            at::linkat_names(
+                src.0.as_fd(),
+                OsStr::new(from),
+                self.0.as_fd(),
+                OsStr::new(to),
+            )
+        }
+
+        /// blob 本体を fsync する（読み取り専用で開いても fsync できる。blob は 0o444 のことがある）。
+        pub(crate) fn sync_blob(&self, hex: &str) -> io::Result<()> {
+            self.open_nofollow(hex)?.sync_all()
+        }
+
+        /// pull ディレクトリの `from` を、この置き場の `to` へ原子的に移す（宛先があれば置き換える）。
+        pub(crate) fn rename_from(&self, src: &PullDir, from: &str, to: &str) -> io::Result<()> {
+            at::renameat_names(
+                src.0.as_fd(),
+                OsStr::new(from),
+                self.0.as_fd(),
+                OsStr::new(to),
+            )
+        }
+
+        /// blob を symlink を辿らず読み取りで開く（FIFO で止まらないよう `O_NONBLOCK`）。無ければ `NotFound`、
+        /// symlink・非ディレクトリの途中要素は `InvalidInput`。
+        pub(crate) fn open_nofollow(&self, hex: &str) -> io::Result<File> {
+            let n = at::component_cstring(OsStr::new(hex))?;
+            at::openat2(
+                Some(self.0.as_fd()),
+                &n,
+                O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+                0,
+                RESOLVE,
+            )
+            .map(File::from)
+            .map_err(|e| match errno(&e) {
+                Some(ELOOP | ENOTDIR) => {
+                    io::Error::new(io::ErrorKind::InvalidInput, "blob is not a plain file")
+                }
+                _ => e,
+            })
+        }
+
         /// ディレクトリを fsync する。
         pub(crate) fn sync(&self) -> io::Result<()> {
             File::from(self.0.try_clone()?).sync_all()
@@ -377,7 +489,7 @@ mod imp {
     use std::io;
     use std::path::PathBuf;
 
-    use super::{OciError, RootHandle, root_inaccessible};
+    use super::{OciError, PullDir, RootHandle, root_inaccessible};
     use crate::image_management::usage::{blob_dir, check_blob_dirs};
 
     fn opts_mode(opts: &mut OpenOptions) {
@@ -497,6 +609,62 @@ mod imp {
         }
     }
 
+    impl RootHandle {
+        /// `blobs/sha256` を（無ければ 0700 で）用意して返す。symlink・非ディレクトリは拒否。
+        pub(crate) fn ensure_blob_dirs(&self) -> Result<BlobDir, OciError> {
+            if let Some(b) = self.open_blob_dir()? {
+                return Ok(b);
+            }
+            for dir in [
+                self.path.join("blobs"),
+                self.path.join("blobs").join("sha256"),
+            ] {
+                #[cfg_attr(not(unix), allow(unused_mut))]
+                let mut b = fs::DirBuilder::new();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    b.mode(0o700);
+                }
+                match b.create(&dir) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(_) => {
+                        return Err(OciError::new(
+                            super::OciErrorCode::Internal,
+                            "failed to create blob directory",
+                        ));
+                    }
+                }
+            }
+            self.open_blob_dir()?.ok_or_else(|| {
+                OciError::new(
+                    super::OciErrorCode::FailedPrecondition,
+                    "blob directory is unavailable",
+                )
+            })
+        }
+
+        /// `blobs` ディレクトリを fsync する（Windows は何もしない）。
+        pub(crate) fn sync_blobs_parent(&self) -> Result<(), OciError> {
+            #[cfg(unix)]
+            {
+                File::open(self.path.join("blobs"))
+                    .and_then(|d| d.sync_all())
+                    .map_err(|_| {
+                        OciError::new(
+                            super::OciErrorCode::Internal,
+                            "failed to sync published blobs",
+                        )
+                    })
+            }
+            #[cfg(not(unix))]
+            {
+                Ok(())
+            }
+        }
+    }
+
     /// `blobs/sha256` のパス。
     #[derive(Debug)]
     pub(crate) struct BlobDir(PathBuf);
@@ -514,6 +682,54 @@ mod imp {
         /// blob を unlink する。
         pub(crate) fn unlink(&self, hex: &str) -> io::Result<()> {
             fs::remove_file(self.0.join(hex))
+        }
+
+        /// pull ディレクトリの `from` を、この置き場の `to` へハードリンクで公開する（宛先は置き換えない）。
+        pub(crate) fn link_from(&self, src: &PullDir, from: &str, to: &str) -> io::Result<()> {
+            fs::hard_link(src.0.join(from), self.0.join(to))
+        }
+
+        /// blob 本体を fsync する。unix は読み取り専用で開いても fsync できる。Windows は書き込み権が要る。
+        pub(crate) fn sync_blob(&self, hex: &str) -> io::Result<()> {
+            let p = self.0.join(hex);
+            #[cfg(unix)]
+            let file = File::open(&p);
+            #[cfg(not(unix))]
+            let file = OpenOptions::new().write(true).open(&p);
+            file?.sync_all()
+        }
+
+        /// pull ディレクトリの `from` を、この置き場の `to` へ移す（宛先があれば置き換える）。
+        pub(crate) fn rename_from(&self, src: &PullDir, from: &str, to: &str) -> io::Result<()> {
+            fs::rename(src.0.join(from), self.0.join(to))
+        }
+
+        /// blob を symlink を辿らず読み取りで開く。無ければ `NotFound`、通常ファイルでなければ `InvalidInput`。
+        pub(crate) fn open_nofollow(&self, hex: &str) -> io::Result<File> {
+            let p = self.0.join(hex);
+            #[cfg(unix)]
+            {
+                crate::layer::open_blob_nofollow(&p).map_err(|e| match e.code() {
+                    super::OciErrorCode::NotFound => {
+                        io::Error::new(io::ErrorKind::NotFound, "blob not found")
+                    }
+                    super::OciErrorCode::InvalidArgument
+                    | super::OciErrorCode::FailedPrecondition => {
+                        io::Error::new(io::ErrorKind::InvalidInput, "blob is not a plain file")
+                    }
+                    _ => io::Error::other("failed to open blob"),
+                })
+            }
+            #[cfg(not(unix))]
+            {
+                if !fs::symlink_metadata(&p)?.is_file() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "blob is not a plain file",
+                    ));
+                }
+                File::open(&p)
+            }
         }
 
         /// ディレクトリを fsync する（Windows は何もしない）。

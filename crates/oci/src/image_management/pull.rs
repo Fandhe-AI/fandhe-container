@@ -31,6 +31,13 @@
 //! ガードの内側でリースを数え直すため、登録後に blob が消されることはない
 //! （OCI-7 の「余分に残す方向にのみ誤る」）。
 //!
+//! root の fd 起点（OCI-7・SEC-1・#2694）: staging の作成・`@pull.lock`・ステージングした blob の検証・
+//! `blobs/sha256` への公開・fsync・中止の削除は、`ImageStore::open` が検査した root を保持する `RootHandle` の
+//! fd 起点（`root_handle::StagingDir` / `PullDir` / `BlobDir`）で行い、入口の再検査の後に root が差し替え
+//! られてもおとりへ書き込み・削除が届かない。パスのままなのは fetcher の書き込み先（`staged_blob_path` の
+//! 戻り値。`fetch_blob` の API がパスを受け取るため）だけで、おとりへ書かれた内容は検証が NotFound になり
+//! 公開されない。根拠は `docs/design/image-store-root-trust.md` の論点 3。
+//!
 //! 公開する blob の信頼条件（OCI-1・SEC。cri の `check_blob_trust` と同じ条件）: 通常ファイル・
 //! 所有者がステージング領域と同じ・ハードリンク数 1・group / other 書き込み不可（unix）。ステージングの
 //! blob は検証時に開いたハンドルで確認し、権限だけ 0600 へ狭める（所有者・リンク数は変えられないので拒否）。
@@ -44,6 +51,7 @@
 //! 指紋が一致するときだけ受け入れ、それ以外は検証済みのステージングで置き換える。
 //!
 //! 未実装（実装済みを装わない。REPAIR-3）:
+//! - fetcher の書き込み先を root の fd 起点にすること（fetch の API と cri の fetch トレイトの変更を伴う後続）。
 //! - `PullSession` に `Drop` は実装しない（ロック待ちの Timeout・panic 中の毒化があり、ロックを取る
 //!   `Drop` は危険なため）。publish も abort もせずに drop すると、リースとステージングが残る
 //!   （余分に残す側）。呼び出し側は失敗経路で [`PullSession::abort`] を呼ぶ契約である。
@@ -59,20 +67,20 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::root_handle::{BlobDir, PullDir, RootHandle};
 use super::tag::ImageTagChange;
-use super::usage::{blob_path, check_blob_dirs};
+use super::usage::blob_path;
 use super::{ImageStore, MAX_COMPOSITION_LAYERS, ManifestComposition, PullId, TagKey};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{OciOpKind, OciOpRecorder, record_oci_op};
-#[cfg(unix)]
-use crate::layer::open_blob_nofollow;
-#[cfg(windows)]
-use crate::layer::verify_blob_file_digest_with;
+#[cfg(not(unix))]
+use crate::layer::verify_blob_digest_with;
 use crate::layer::{
-    VerifiedBlob, blob_trust_violation, verify_blob_digest, verify_blob_digest_with,
+    VerifiedBlob, blob_trust_violation, verify_blob_file_digest, verify_blob_file_digest_with,
 };
 use crate::reference::Digest;
 
@@ -157,7 +165,11 @@ pub struct PullSession<'a> {
     id: PullId,
     /// このセッション固有の識別子（`LeasedBlob` の発行元照合）。
     session: u64,
+    /// 表示・fetcher への受け渡し用のパス（操作の起点には使わない。`pull_dir` が起点）。
     staging_dir: PathBuf,
+    /// 開いた `<root>/staging/<pull-id>`。検証・公開・削除はこの fd 起点で行い、root が差し替えられても
+    /// おとりへ届かない（OCI-7・SEC-1・#2694）。
+    pull_dir: PullDir,
     touched: BTreeSet<Digest>,
     /// 現在リースを保持している digest。同一 digest の二重取得を拒否して、
     /// 1 リース = 1 トークンを保つ（片方の解放で他方のリースが消えないようにする）。
@@ -207,26 +219,21 @@ impl FileIdent {
         }
     }
 
-    /// symlink を辿らず、通常ファイルのときだけ指紋を返す。
-    fn of_regular(path: &Path) -> std::io::Result<Option<Self>> {
-        let m = fs::symlink_metadata(path)?;
-        Ok(m.is_file().then(|| Self::of(&m)))
+    /// symlink を辿らず取ったメタデータ（`stat_name` の結果）が通常ファイルのときだけ指紋を返す。
+    fn of_regular(m: std::io::Result<Option<fs::Metadata>>) -> std::io::Result<Option<Self>> {
+        Ok(m?.filter(fs::Metadata::is_file).map(|m| Self::of(&m)))
     }
 }
 
-/// パスが信頼条件を満たす通常ファイル（symlink を辿らない）か。
-fn is_trusted_regular(path: &Path, owner: Option<u32>) -> bool {
-    fs::symlink_metadata(path)
-        .map(|m| blob_trust_violation(&m, owner).is_none())
-        .unwrap_or(false)
-}
-
-/// ステージング領域の所有者（このプロセスが作った 0700 のディレクトリの uid）。unix 以外は `None`。
-fn dir_owner(dir: &Path) -> Result<Option<u32>, OciError> {
+/// ステージング領域の所有者（このプロセスが作った 0700 のディレクトリの uid。開いた fd の fstat）。
+/// unix 以外は `None`。
+fn dir_owner(dir: &PullDir) -> Result<Option<u32>, OciError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let m = fs::symlink_metadata(dir).map_err(|e| io_err(&e, "failed to stat staging"))?;
+        let m = dir
+            .dir_meta()
+            .map_err(|e| io_err(&e, "failed to stat staging"))?;
         Ok(Some(m.uid()))
     }
     #[cfg(not(unix))]
@@ -324,45 +331,14 @@ fn io_err(e: &std::io::Error, msg: &str) -> OciError {
     err(code, msg)
 }
 
-fn make_dir(path: &Path) -> std::io::Result<()> {
-    #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut b = fs::DirBuilder::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        b.mode(0o700);
-    }
-    b.create(path)
-}
-
-/// `<dir>/@pull.lock` を新規作成（0600）して排他ロックを取る。保持している間が「pull が生きている」印。
-fn create_pull_lock(dir: &Path) -> Result<File, OciError> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let file = opts
-        .open(dir.join(PULL_LOCK_FILE_NAME))
+/// `<pull dir>/@pull.lock` を新規作成（0600）して排他ロックを取る。保持している間が「pull が生きている」印。
+fn create_pull_lock(dir: &PullDir) -> Result<File, OciError> {
+    let file = dir
+        .create_lock(PULL_LOCK_FILE_NAME)
         .map_err(|_| err(OciErrorCode::Internal, "failed to create pull lock file"))?;
     file.try_lock()
         .map_err(|_| err(OciErrorCode::Internal, "failed to lock pull lock file"))?;
     Ok(file)
-}
-
-/// `staging` が symlink でない通常ディレクトリであることを確かめる。
-fn check_staging_is_dir(staging: &Path) -> Result<(), OciError> {
-    let m = fs::symlink_metadata(staging).map_err(|e| io_err(&e, "failed to stat staging"))?;
-    if m.is_dir() {
-        Ok(())
-    } else {
-        Err(err(
-            OciErrorCode::FailedPrecondition,
-            "staging is not a directory",
-        ))
-    }
 }
 
 impl ImageStore {
@@ -393,34 +369,26 @@ impl ImageStore {
         // ロックファイルを作ってから排他ロックを取るまでの間を回収 GC に見せないため、ストアの排他区間で
         // 行う（内側はメタデータ操作だけ）。排他待ちの Timeout・毒化はそのままエラーになる。
         let _guard = self.lock()?;
-        let staging = self.root().join(STAGING_DIR_NAME);
-        match fs::symlink_metadata(&staging) {
-            Ok(_) => check_staging_is_dir(&staging)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match make_dir(&staging) {
-                Ok(()) => {}
-                // 並行する別 pull が先に作った場合は、作られたものを再検査する。
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    check_staging_is_dir(&staging)?
-                }
-                Err(e) => return Err(io_err(&e, "failed to create staging")),
-            },
-            Err(e) => return Err(io_err(&e, "failed to stat staging")),
-        }
-        let dir = staging.join(id.as_str());
-        make_dir(&dir).map_err(|e| io_err(&e, "failed to create pull staging directory"))?;
-        let pull_lock = match create_pull_lock(&dir) {
+        // staging の確認・作成と pull ディレクトリの作成は、検査済み root の fd 起点で行う（#2694）。
+        let staging = self.handle().ensure_staging_dir()?;
+        let pull_dir = staging
+            .create_pull_dir(&id)
+            .map_err(|e| io_err(&e, "failed to create pull staging directory"))?;
+        let pull_lock = match create_pull_lock(&pull_dir) {
             Ok(f) => f,
             Err(e) => {
                 // 作成直後で他者はまだ使っていないので消してよい。
-                let _ = fs::remove_dir_all(&dir);
+                let _ = super::pull_recovery::reclaim_dir(&staging, &id);
                 return Err(e);
             }
         };
+        let dir = self.root().join(STAGING_DIR_NAME).join(id.as_str());
         Ok(PullSession {
             store: self,
             id,
             session: SESSION_SEQ.fetch_add(1, Ordering::Relaxed),
             staging_dir: dir,
+            pull_dir,
             touched: BTreeSet::new(),
             leased: BTreeSet::new(),
             verified: BTreeMap::new(),
@@ -487,7 +455,8 @@ impl PullSession<'_> {
         }
         // `blobs` / `blobs/sha256` が symlink・非ディレクトリなら、ストア外を指すため stat せず拒否する
         // （ls / df / prune / rm と同じ fail-closed）。リース登録の前に判定し、拒否時は何も残さない。
-        let dirs_exist = check_blob_dirs(self.store.root())?;
+        let blob_dir = self.store.handle().open_blob_dir()?;
+        let hex = hex_of(digest)?;
         let path = self
             .store
             .root()
@@ -501,11 +470,14 @@ impl PullSession<'_> {
             // 別プロセスの GC が数え直せるよう、使う前にリースを永続化する。失敗したら戻してエラー（#2380）。
             guard.persist_inventory(before)?;
         }
-        let miss = match fs::symlink_metadata(&path) {
-            _ if !dirs_exist => Some(BlobReuse::Absent),
-            Ok(m) if m.is_file() => None,
-            Ok(_) => Some(BlobReuse::NotRegularFile),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(BlobReuse::Absent),
+        let stat = match &blob_dir {
+            Some(bd) => bd.stat(hex),
+            None => Ok(None),
+        };
+        let miss = match stat {
+            Ok(Some(m)) if m.is_file() => None,
+            Ok(Some(_)) => Some(BlobReuse::NotRegularFile),
+            Ok(None) => Some(BlobReuse::Absent),
             Err(e) => {
                 self.release_own(digest)?;
                 return Err(io_err(&e, "failed to stat cached blob"));
@@ -562,9 +534,21 @@ impl PullSession<'_> {
     ///
     /// `RegistryClient::fetch_blob` の `dest` に渡す。参照テーブルには何も登録しない
     /// （GC の走査にも `image ls` にも出さない）。公開は [`PullSession::publish`]。
+    ///
+    /// 戻り値はパスである（`fetch_blob` の API がパスを受け取るため）。パスで辿った pull ディレクトリが、保持している
+    /// fd と同じ実体であることを確かめ、root が差し替えられていれば `Internal` で拒否する。確認から書き込みまでの
+    /// 間の差し替えは残るが、おとりへ書かれた内容は [`PullSession::verify_staged_blob`] が保持する fd 起点で開き直す
+    /// ため `NotFound` になり、公開されない（fail-closed。OCI-7・SEC-1・#2694）。
     pub fn staged_blob_path(&mut self, digest: &Digest) -> Result<PathBuf, OciError> {
         self.note_blob(digest)?;
-        Ok(self.staging_dir.join(hex_of(digest)?))
+        let hex = hex_of(digest)?;
+        if !self.pull_dir.matches_path(&self.staging_dir) {
+            return Err(err(
+                OciErrorCode::Internal,
+                "image store root changed after open",
+            ));
+        }
+        Ok(self.staging_dir.join(hex))
     }
 
     /// ステージング済みの blob の sha256 を検証し、成功したらこのセッションの「公開できる」集合へ入れる。
@@ -579,25 +563,23 @@ impl PullSession<'_> {
         self.note_blob(digest)?;
         // 再検証の開始時に以前の検証結果を無効化する（信頼性検査を含め、失敗した再検証の前の登録を残さない）。
         self.verified.remove(digest);
-        let path = self.staging_dir.join(hex_of(digest)?);
-        match fs::symlink_metadata(&path) {
-            Ok(m) if m.is_file() => {}
-            Ok(_) => {
+        let hex = hex_of(digest)?;
+        match self.pull_dir.stat_name(hex) {
+            Ok(Some(m)) if m.is_file() => {}
+            Ok(Some(_)) => {
                 return Err(err(
                     OciErrorCode::FailedPrecondition,
                     "staged blob is not a regular file",
                 ));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(err(OciErrorCode::NotFound, "staged blob not found"));
-            }
+            Ok(None) => return Err(err(OciErrorCode::NotFound, "staged blob not found")),
             Err(e) => return Err(io_err(&e, "failed to stat staged blob")),
         }
         // 開いたハンドルで信頼条件を確認し、権限を 0600 へ狭める（公開前に必ず行う。OCI-1・SEC）。
         #[cfg(unix)]
-        self.secure_staged_blob(&path)?;
+        let file = self.secure_staged_blob(hex)?;
         // 検証の前後で指紋が一致することを確かめ、検証した実体を固定する（公開直前の再ハッシュの代わり）。
-        let before = FileIdent::of_regular(&path)
+        let before = FileIdent::of_regular(self.pull_dir.stat_name(hex))
             .map_err(|e| io_err(&e, "failed to stat staged blob"))?
             .ok_or_else(|| {
                 err(
@@ -605,9 +587,18 @@ impl PullSession<'_> {
                     "staged blob is not a regular file",
                 )
             })?;
-        let v = verify_blob_digest_with(self.store.recorder(), &path, digest, max_bytes)?;
-        let after =
-            FileIdent::of_regular(&path).map_err(|e| io_err(&e, "failed to stat staged blob"))?;
+        // unix は確認済みの同じハンドルの内容を検証する（パスを開き直さない）。
+        #[cfg(unix)]
+        let v = verify_blob_file_digest_with(self.store.recorder(), &file, digest, max_bytes)?;
+        #[cfg(not(unix))]
+        let v = verify_blob_digest_with(
+            self.store.recorder(),
+            &self.staging_dir.join(hex),
+            digest,
+            max_bytes,
+        )?;
+        let after = FileIdent::of_regular(self.pull_dir.stat_name(hex))
+            .map_err(|e| io_err(&e, "failed to stat staged blob"))?;
         if after.as_ref() != Some(&before) {
             return Err(err(
                 OciErrorCode::DataLoss,
@@ -624,15 +615,26 @@ impl PullSession<'_> {
         Ok(v)
     }
 
-    /// ステージングの blob を symlink を辿らず開き、ハンドルの fstat で信頼条件を確認する（unix）。
-    /// 権限は 0600 へ狭めて確認し直す。所有者・種別・リンク数の違反は変えられないので拒否する。
-    /// 開いたファイルがパスの指す実体と同一（dev / inode）であることも確かめる。
+    /// ステージングの blob を pull ディレクトリ fd 起点で symlink を辿らず開き、ハンドルの fstat で信頼条件を
+    /// 確認する（unix）。権限は 0600 へ狭めて確認し直す。所有者・種別・リンク数の違反は変えられないので拒否する。
+    /// 開いたファイルが pull ディレクトリ直下の同名エントリと同一（dev / inode）であることも確かめる。
     #[cfg(unix)]
-    fn secure_staged_blob(&self, path: &Path) -> Result<(), OciError> {
+    fn secure_staged_blob(&self, hex: &str) -> Result<File, OciError> {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let unsafe_blob = |msg: &str| err(OciErrorCode::FailedPrecondition, msg);
-        let owner = dir_owner(&self.staging_dir)?;
-        let file = open_blob_nofollow(path)?;
+        let owner = dir_owner(&self.pull_dir)?;
+        let file = self
+            .pull_dir
+            .open_nofollow(hex)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => {
+                    err(OciErrorCode::NotFound, "staged blob not found")
+                }
+                std::io::ErrorKind::InvalidInput => {
+                    unsafe_blob("staged blob is not a regular file")
+                }
+                _ => io_err(&e, "failed to open staged blob"),
+            })?;
         let m = file
             .metadata()
             .map_err(|e| io_err(&e, "failed to stat staged blob"))?;
@@ -651,15 +653,17 @@ impl PullSession<'_> {
         if let Some(v) = blob_trust_violation(&m2, owner) {
             return Err(unsafe_blob(v));
         }
-        let at_path =
-            fs::symlink_metadata(path).map_err(|e| io_err(&e, "failed to stat staged blob"))?;
-        if (at_path.dev(), at_path.ino()) != (m2.dev(), m2.ino()) {
+        let at_name = self
+            .pull_dir
+            .stat_name(hex)
+            .map_err(|e| io_err(&e, "failed to stat staged blob"))?;
+        if !at_name.is_some_and(|a| (a.dev(), a.ino()) == (m2.dev(), m2.ino())) {
             return Err(err(
                 OciErrorCode::FailedPrecondition,
                 "staged blob changed while being opened",
             ));
         }
-        Ok(())
+        Ok(file)
     }
 
     /// Windows では排他区間の外で、検証済みの内容を公開専用の私的な名前へ固定する。
@@ -797,24 +801,23 @@ impl PullSession<'_> {
     }
 
     /// 自分のステージングディレクトリを消す。親・自分が symlink なら辿らず失敗とする。
+    ///
+    /// 検査済み root の fd 起点で `staging` を開き直し、その直下の自分のディレクトリを消す（root が差し替え
+    /// られてもおとりの同名ディレクトリには届かない。OCI-7・SEC-1・#2694）。
     fn remove_staging(&self) -> StagingCleanup {
         let failed = |code| StagingCleanup::Failed { code };
-        let parent = self.store.root().join(STAGING_DIR_NAME);
-        match fs::symlink_metadata(&parent) {
-            Ok(m) if m.is_dir() => {}
-            Ok(_) => return failed(OciErrorCode::FailedPrecondition),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return StagingCleanup::Removed,
-            Err(_) => return failed(OciErrorCode::Internal),
-        }
-        match fs::symlink_metadata(&self.staging_dir) {
-            Ok(m) if m.is_dir() => match super::pull_recovery::reclaim_dir(&self.staging_dir) {
-                // `@pull.lock` は他の内容を消し終えるまで残す（中断時も GC が回収できる。OCI-7・#852）。
+        match self
+            .store
+            .handle()
+            .open_staging_dir("staging is not a plain directory")
+        {
+            Ok(None) => StagingCleanup::Removed,
+            // `@pull.lock` は他の内容を消し終えるまで残す（中断時も GC が回収できる。OCI-7・#852）。
+            Ok(Some(staging)) => match super::pull_recovery::reclaim_dir(&staging, &self.id) {
                 Ok(()) => StagingCleanup::Removed,
                 Err(code) => failed(code),
             },
-            Ok(_) => failed(OciErrorCode::FailedPrecondition),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => StagingCleanup::Removed,
-            Err(_) => failed(OciErrorCode::Internal),
+            Err(e) => failed(e.code()),
         }
     }
 
@@ -841,15 +844,17 @@ impl PullSession<'_> {
             }
         }
         for b in &to_move {
-            let src = self.staging_dir.join(hex_of(b)?);
-            self.check_staged_ident(&src, b)?;
+            self.check_staged_ident(hex_of(b)?, b)?;
         }
-        if !to_move.is_empty() {
-            self.ensure_blob_dirs()?;
-        }
+        let handle = Arc::clone(self.store.handle());
+        let blob_dir = if to_move.is_empty() {
+            None
+        } else {
+            Some(handle.ensure_blob_dirs()?)
+        };
 
         let root = self.store.root().to_path_buf();
-        let owner = dir_owner(&self.staging_dir)?;
+        let owner = dir_owner(&self.pull_dir)?;
         // Windows: 実体を共有拒否のハンドルで固定して検証する（ガードの外。以降は固定済みの実体を公開する）。
         let nonce = next_publish_nonce();
         let mut tmps = PublishTmpCleanup::default();
@@ -859,36 +864,44 @@ impl PullSession<'_> {
         // ロックの規律）。
         let mut dst_checked: BTreeMap<Digest, Option<FileIdent>> = BTreeMap::new();
         for b in &to_move {
-            let dst = blob_path(&root, b)?;
+            let hex = hex_of(b)?;
+            let Some(bd) = blob_dir.as_ref() else {
+                return Err(err(OciErrorCode::Internal, "blob directory is unavailable"));
+            };
             // Windows の指紋は size / mtime だけで差し替えを検出できないが、既存の宛先は受け入れの根拠にせず
             // 報告（already_present か moved か）にだけ使う。宛先の内容は検証済みの一時名の rename で
             // 常に確定する（OCI-1・OCI-7）。
             let size = self.verified.get(b).map_or(0, |v| v.size);
-            let ident = match FileIdent::of_regular(&dst) {
-                Ok(Some(_)) if !is_trusted_regular(&dst, owner) => None,
-                Ok(Some(before)) => match verify_blob_digest(&dst, b, size) {
-                    Ok(_) => {
-                        // 検証中に変わっていれば「未検証」として扱い、ガード内で置き換える。
-                        match FileIdent::of_regular(&dst) {
-                            Ok(Some(after)) if after == before => Some(after),
-                            _ => None,
+            let ident = match bd.stat(hex) {
+                Ok(Some(before_meta))
+                    if before_meta.is_file()
+                        && blob_trust_violation(&before_meta, owner).is_none() =>
+                {
+                    let before = FileIdent::of(&before_meta);
+                    match verify_existing_dst(bd, hex, b, size) {
+                        Ok(()) => {
+                            // 検証中に変わっていれば「未検証」として扱い、ガード内で置き換える。
+                            match FileIdent::of_regular(bd.stat(hex)) {
+                                Ok(Some(after)) if after == before => Some(after),
+                                _ => None,
+                            }
                         }
+                        // NotFound は並行 prune が未参照の blob を消した場合。「宛先は未検証」として扱い、
+                        // 排他区間の下の hard_link で公開を続ける（OCI-7）。
+                        Err(e)
+                            if matches!(
+                                e.code(),
+                                OciErrorCode::DataLoss
+                                    | OciErrorCode::ResourceExhausted
+                                    | OciErrorCode::NotFound
+                            ) =>
+                        {
+                            None
+                        }
+                        Err(e) => return Err(e),
                     }
-                    // NotFound は並行 prune が未参照の blob を消した場合。「宛先は未検証」として扱い、
-                    // 排他区間の下の hard_link で公開を続ける（OCI-7）。
-                    Err(e)
-                        if matches!(
-                            e.code(),
-                            OciErrorCode::DataLoss
-                                | OciErrorCode::ResourceExhausted
-                                | OciErrorCode::NotFound
-                        ) =>
-                    {
-                        None
-                    }
-                    Err(e) => return Err(e),
-                },
-                // 不在・通常ファイルでないもの。ガード内の hard_link の結果で判定する。
+                }
+                // 不在・通常ファイルでないもの・信頼条件を満たさないもの。ガード内の hard_link の結果で判定する。
                 _ => None,
             };
             dst_checked.insert(b.clone(), ident);
@@ -896,6 +909,9 @@ impl PullSession<'_> {
         let mut guard = self.store.lock()?;
         // blob を置く前に未完了の削除が無いことを確かめる（OCI-7。lock も拒否するが入口として明示する）。
         guard.ensure_no_pending_deletion()?;
+        // 移動の前に、検査済み root がストアのパスから切り離されて（unlink 済みで）いないことを確かめる
+        // （到達できないディレクトリへの公開を成功と報告しない。#2696）。
+        handle.ensure_linked()?;
         if guard
             .manifests()
             .any(|(d, c)| d == &req.manifest && c != &req.composition)
@@ -910,37 +926,40 @@ impl PullSession<'_> {
         // タグ件数の上限は blob の移動より前に検査する（ループ途中の失敗で半端なタグを残さない。#2316）。
         guard.ensure_tag_capacity(req.tags.iter())?;
         // 移動。この呼び出しで作った宛先だけを記録し、失敗時はそれだけを消す。
-        let mut created: Vec<PathBuf> = Vec::new();
+        let mut created: Vec<String> = Vec::new();
         let mut moved = Vec::new();
         let mut present = Vec::new();
         let moves = (|| -> Result<(), OciError> {
             for b in &to_move {
-                let src = self.staging_dir.join(hex_of(b)?);
-                let dst = blob_path(&root, b)?;
+                let hex = hex_of(b)?;
+                let Some(bd) = blob_dir.as_ref() else {
+                    return Err(err(OciErrorCode::Internal, "blob directory is unavailable"));
+                };
                 // 検証後にステージングのファイルが差し替わっても未検証の内容を公開しないよう、
                 // 排他区間の下では再ハッシュせず、検証した実体の指紋と信頼条件を照合する（OCI-1・OCI-7）。
                 // Windows は指紋が size / mtime だけのため、ガードの外で digest 検証済みの一時名へ結び付けて
                 // 固定してあり（`pin_staged_blobs`）、ここではその一時名を rename で宛先へ移すだけにする
                 // （ガード内で再ハッシュしない。既存の宛先は同じ digest の検証済みの内容で置換される）。
-                self.check_staged_ident(&src, b)?;
+                self.check_staged_ident(hex, b)?;
                 if cfg!(windows) {
-                    let existed = match fs::symlink_metadata(&dst) {
-                        Ok(m) if m.is_file() => true,
-                        Ok(_) => {
+                    let dst = blob_path(&root, b)?;
+                    let existed = match bd.stat(hex) {
+                        Ok(Some(m)) if m.is_file() => true,
+                        Ok(Some(_)) => {
                             return Err(err(
                                 OciErrorCode::FailedPrecondition,
                                 "blob destination is not a regular file",
                             ));
                         }
-                        // 「不在」と確定できるのは NotFound のときだけ。共有違反・アクセス拒否などは
+                        // 「不在」と確定できるのは不在のときだけ。共有違反・アクセス拒否などは
                         // 存在の有無が不明なため、失敗にして共有の blob をロールバックで消さない。
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                        Ok(None) => false,
                         Err(e) => return Err(io_err(&e, "failed to stat blob destination")),
                     };
                     fs::rename(publish_tmp_path(&dst, nonce), &dst)
                         .map_err(|_| err(OciErrorCode::Internal, "failed to publish blob"))?;
                     if !existed {
-                        created.push(dst);
+                        created.push(hex.to_owned());
                         moved.push(b.clone());
                     } else if dst_checked.get(b).is_some_and(Option::is_some) {
                         // ガードの外で digest 検証済みだった既存の宛先。同じ内容で置換済みのため報告だけ区別する。
@@ -949,30 +968,30 @@ impl PullSession<'_> {
                         moved.push(b.clone());
                     }
                     pinned.remove(b);
-                    fs::remove_file(&src)
+                    self.pull_dir
+                        .unlink(hex)
                         .map_err(|_| err(OciErrorCode::Internal, "failed to remove staged blob"))?;
                     continue;
                 }
-                match fs::hard_link(&src, &dst) {
+                match bd.link_from(&self.pull_dir, hex, hex) {
                     Ok(()) => {
-                        created.push(dst);
+                        created.push(hex.to_owned());
                         moved.push(b.clone());
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        match fs::symlink_metadata(&dst) {
-                            Ok(m) if m.is_file() => {
+                        match bd.stat(hex) {
+                            Ok(Some(m)) if m.is_file() => {
                                 // 既存の宛先は、ガードの外で検証した実体と指紋が一致するときだけ受け入れる。
                                 // 壊れている・検証後に変わった・未検証のものは、検証済みのステージングで
                                 // 原子的に置き換えて修復する。
                                 let verified_dst = dst_checked.get(b).and_then(Option::as_ref);
                                 if verified_dst.is_some()
-                                    && FileIdent::of_regular(&dst).ok().flatten().as_ref()
-                                        == verified_dst
-                                    && is_trusted_regular(&dst, owner)
+                                    && Some(&FileIdent::of(&m)) == verified_dst
+                                    && blob_trust_violation(&m, owner).is_none()
                                 {
                                     present.push(b.clone());
                                 } else {
-                                    fs::rename(&src, &dst).map_err(|_| {
+                                    bd.rename_from(&self.pull_dir, hex, hex).map_err(|_| {
                                         err(OciErrorCode::Internal, "failed to repair corrupt blob")
                                     })?;
                                     moved.push(b.clone());
@@ -992,7 +1011,8 @@ impl PullSession<'_> {
                 // 公開後のハードリンク数を 1 に保つため、ステージング側の名前を消す
                 // （Windows は固定を外してから。公開は固定した実体への hard_link で済んでいる）。
                 pinned.remove(b);
-                fs::remove_file(&src)
+                self.pull_dir
+                    .unlink(hex)
                     .map_err(|_| err(OciErrorCode::Internal, "failed to remove staged blob"))?;
             }
             Ok(())
@@ -1015,8 +1035,10 @@ impl PullSession<'_> {
             Err(e) => {
                 // 途中まで登録した manifest・タグは戻す（blob を消した後に在庫へ残さない。保存はまだ）。
                 guard.restore_inventory_portion(before);
-                for p in &created {
-                    let _ = fs::remove_file(p);
+                if let Some(bd) = blob_dir.as_ref() {
+                    for hex in &created {
+                        let _ = bd.unlink(hex);
+                    }
                 }
                 return Err(e);
             }
@@ -1024,7 +1046,7 @@ impl PullSession<'_> {
         // 在庫を保存する前に、公開した blob 本体とそれを置いたディレクトリ（新設した祖先を含む）を永続化する。
         // 電源断後に manifest・タグだけが残り blob が欠損する状態を作らない（OCI-7。保存の失敗と同じく、
         // テーブルは戻し、公開済みの blob は消さない）。
-        if let Err(e) = sync_published_blobs(&root, &to_move) {
+        if let Err(e) = sync_published_blobs(&handle, blob_dir.as_ref(), &to_move) {
             guard.restore_inventory_portion(before);
             return Err(e);
         }
@@ -1052,88 +1074,77 @@ impl PullSession<'_> {
 
     /// ステージングのファイルが検証時と同じ実体（指紋が一致）であることを確かめる。再ハッシュはしない。
     /// 通常ファイルでない・指紋が違う（差し替え・書き換え）なら `DataLoss`（通常ファイルでなければ
-    /// `FailedPrecondition`）。
+    /// `FailedPrecondition`）。pull ディレクトリ fd 起点の stat で調べる。
     /// unix では所有者・ハードリンク数・group / other 書き込みの信頼条件も確かめる（OCI-1・SEC）。
-    fn check_staged_ident(&self, src: &Path, digest: &Digest) -> Result<(), OciError> {
+    fn check_staged_ident(&self, hex: &str, digest: &Digest) -> Result<(), OciError> {
         let Some(entry) = self.verified.get(digest) else {
             return Err(err(
                 OciErrorCode::FailedPrecondition,
                 "blob is neither leased nor verified by this pull",
             ));
         };
-        match FileIdent::of_regular(src) {
-            Ok(Some(now)) if now == entry.ident => {
-                let owner = dir_owner(&self.staging_dir)?;
-                let m = fs::symlink_metadata(src)
-                    .map_err(|e| io_err(&e, "failed to stat staged blob"))?;
+        let stat_failed = |e: &std::io::Error| io_err(e, "failed to stat staged blob");
+        match self.pull_dir.stat_name(hex) {
+            Ok(Some(m)) if m.is_file() => {
+                if FileIdent::of(&m) != entry.ident {
+                    return Err(err(
+                        OciErrorCode::DataLoss,
+                        "staged blob changed after verification",
+                    ));
+                }
+                let owner = dir_owner(&self.pull_dir)?;
                 match blob_trust_violation(&m, owner) {
                     None => Ok(()),
                     Some(v) => Err(err(OciErrorCode::FailedPrecondition, v)),
                 }
             }
             Ok(Some(_)) => Err(err(
-                OciErrorCode::DataLoss,
-                "staged blob changed after verification",
-            )),
-            Ok(None) => Err(err(
                 OciErrorCode::FailedPrecondition,
                 "staged blob is not a regular file",
             )),
-            Err(e) => Err(io_err(&e, "failed to stat staged blob")),
-        }
-    }
-
-    /// `blobs` / `blobs/sha256` を（無ければ 0700 で）用意する。symlink・非ディレクトリは拒否。
-    fn ensure_blob_dirs(&self) -> Result<(), OciError> {
-        let root = self.store.root();
-        if check_blob_dirs(root)? {
-            return Ok(());
-        }
-        for dir in [root.join("blobs"), root.join("blobs").join("sha256")] {
-            match make_dir(&dir) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(io_err(&e, "failed to create blob directory")),
-            }
-        }
-        if check_blob_dirs(root)? {
-            Ok(())
-        } else {
-            Err(err(
-                OciErrorCode::FailedPrecondition,
-                "blob directory is unavailable",
-            ))
+            Ok(None) => Err(stat_failed(&std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            ))),
+            Err(e) => Err(stat_failed(&e)),
         }
     }
 }
 
+/// 既存の宛先 blob を symlink を辿らず開き、内容を検証する（ガードの外。再ハッシュ）。
+/// 開く間に差し替わった（通常ファイルでなくなった）場合は `DataLoss` として「未検証」に倒す。
+fn verify_existing_dst(
+    bd: &BlobDir,
+    hex: &str,
+    digest: &Digest,
+    max_bytes: u64,
+) -> Result<(), OciError> {
+    let file = bd.open_nofollow(hex).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => err(OciErrorCode::NotFound, "blob destination not found"),
+        std::io::ErrorKind::InvalidInput => err(OciErrorCode::DataLoss, "blob destination changed"),
+        _ => io_err(&e, "failed to open blob destination"),
+    })?;
+    verify_blob_file_digest(&file, digest, max_bytes).map(|_| ())
+}
+
 /// 公開した blob の本体と、`blobs/sha256`・`blobs`・ストアルートのディレクトリを fsync する（OCI-7）。
-/// `blobs` 配下は `ensure_blob_dirs` が新設しうるため、祖先のエントリも永続化する。
-/// ディレクトリの fsync は unix のみ（Windows は std で開けない）。
-fn sync_published_blobs(root: &Path, digests: &[Digest]) -> Result<(), OciError> {
+/// `blobs` 配下は `ensure_blob_dirs` が新設しうるため、祖先のエントリも永続化する。すべて検査済み root の
+/// fd 起点（#2694）。ディレクトリの fsync は unix のみ（Windows は std で開けない）。
+fn sync_published_blobs(
+    handle: &RootHandle,
+    blob_dir: Option<&BlobDir>,
+    digests: &[Digest],
+) -> Result<(), OciError> {
     if digests.is_empty() {
         return Ok(());
     }
     let fail = || err(OciErrorCode::Internal, "failed to sync published blobs");
+    let bd = blob_dir.ok_or_else(fail)?;
     for b in digests {
-        let path = blob_path(root, b)?;
-        // unix は読み取り専用で開いても fsync できる（blob は 0o444 のことがある）。Windows は書き込み権が要る。
-        #[cfg(unix)]
-        let file = fs::File::open(&path);
-        #[cfg(not(unix))]
-        let file = fs::OpenOptions::new().write(true).open(&path);
-        file.and_then(|f| f.sync_all()).map_err(|_| fail())?;
+        bd.sync_blob(hex_of(b)?).map_err(|_| fail())?;
     }
-    #[cfg(unix)]
-    for dir in [
-        root.join("blobs").join("sha256"),
-        root.join("blobs"),
-        root.to_path_buf(),
-    ] {
-        fs::File::open(&dir)
-            .and_then(|d| d.sync_all())
-            .map_err(|_| fail())?;
-    }
+    bd.sync().map_err(|_| fail())?;
+    handle.sync_blobs_parent().map_err(|_| fail())?;
+    handle.sync().map_err(|_| fail())?;
     Ok(())
 }
 

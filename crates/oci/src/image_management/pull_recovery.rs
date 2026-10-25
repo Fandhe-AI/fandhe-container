@@ -30,6 +30,11 @@
 //! ディレクトリである前提で、ロックファイルは symlink を辿らず、unix では開いた後に dev / inode を照合して
 //! 差し替えを検出する（`store` の `@lock` と同じ）。
 //!
+//! staging の走査・判定・削除は、`ImageStore::open` が検査した root を保持する `RootHandle` の fd 起点で行う
+//! （`root_handle::StagingDir` / `PullDir`。Linux の x86_64 / aarch64。それ以外はパス起点）。入口の再検査の
+//! 後に root が別のディレクトリへ差し替えられても、削除は検査済みの実体にだけ届き、おとりの同名の残骸には
+//! 触れない（OCI-7・SEC-1・#2694）。
+//!
 //! `abort` は排他を取れなければステージングを消さずエラーを返す（残骸は本 GC が回収し、メモリに残ったリースも
 //! 解放する）。
 //!
@@ -51,9 +56,11 @@
 //! 未実装（REPAIR-3）: 起動時の呼び出しの配線と結果のログ出力は、cri・core と oci の両方に依存するアダプタの
 //! 担当（#2315）。ここでは新しい操作種別を増やさず、結果を構造化された戻り値で返す。
 
-use std::fs::{self, File, TryLockError};
+use std::ffi::OsStr;
+use std::fs::{File, TryLockError};
 
-use super::pull::{PULL_LOCK_FILE_NAME, STAGING_DIR_NAME};
+use super::pull::PULL_LOCK_FILE_NAME;
+use super::root_handle::{PullDir, StagingDir};
 use super::{ImageStore, MAX_CACHE_SCAN_ENTRIES, PullId};
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{OciOpKind, record_oci_op};
@@ -109,27 +116,21 @@ enum PullLiveness {
     Undetermined,
 }
 
-/// `<dir>/@pull.lock` のロックを試して pull の生存を判定する。確認できなければ `Undetermined`。
-fn probe_pull(dir: &std::path::Path) -> PullLiveness {
-    let lock_path = dir.join(PULL_LOCK_FILE_NAME);
-    let pre = match fs::symlink_metadata(&lock_path) {
-        Ok(m) if m.is_file() => m,
+/// `<pull dir>/@pull.lock` のロックを試して pull の生存を判定する。確認できなければ `Undetermined`。
+fn probe_pull(dir: &PullDir) -> PullLiveness {
+    let pre = match dir.stat_name(PULL_LOCK_FILE_NAME) {
+        Ok(Some(m)) if m.is_file() => m,
         // 回収の途中で `@pull.lock` を消した後に落ちた残骸。排他下の空ディレクトリは不在とみなす。
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return match fs::read_dir(dir).map(|mut r| r.next().is_none()) {
-                Ok(true) => PullLiveness::Absent(None),
+        Ok(None) => {
+            return match dir.list_names(1) {
+                Ok(names) if names.is_empty() => PullLiveness::Absent(None),
                 _ => PullLiveness::Undetermined,
             };
         }
         _ => return PullLiveness::Undetermined,
     };
-    // Windows の LockFileEx は読み書き権限が要る。作成はしない（無ければ確認できない扱い）。
-    let file = match fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(false)
-        .open(&lock_path)
-    {
+    // 作成はしない（無ければ確認できない扱い）。symlink は辿らない。
+    let file = match dir.open_lock_for_probe(PULL_LOCK_FILE_NAME) {
         Ok(f) => f,
         Err(_) => return PullLiveness::Undetermined,
     };
@@ -157,40 +158,41 @@ fn probe_pull(dir: &std::path::Path) -> PullLiveness {
 /// （部分削除の後も次回の判定・再試行ができるように。モジュール doc「回収の順序」）。
 ///
 /// pull 自身の abort / publish 後の後始末（`pull` モジュールの `remove_staging`）も同じ関数を使い、
-/// 通常の後始末の中断でも証跡を失わず本 GC が回収できるようにする（OCI-7・#852）。
-pub(super) fn reclaim_dir(dir: &std::path::Path) -> Result<(), OciErrorCode> {
-    reclaim_dir_with(dir, &remove_entry)
+/// 通常の後始末の中断でも証跡を失わず本 GC が回収できるようにする（OCI-7・#852）。`staging` は検査済み root の
+/// fd 起点で開いたもの（#2694）。ディレクトリが無ければ成功、symlink・非ディレクトリなら `FailedPrecondition`。
+pub(super) fn reclaim_dir(staging: &StagingDir, id: &PullId) -> Result<(), OciErrorCode> {
+    reclaim_dir_with(staging, id, &remove_entry)
 }
 
 /// 子エントリ 1 件の削除（ディレクトリは再帰）。
-fn remove_entry(path: &std::path::Path) -> std::io::Result<()> {
-    if fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
-    }
+fn remove_entry(dir: &PullDir, name: &OsStr) -> std::io::Result<()> {
+    dir.remove_child_tree(name)
 }
 
 /// [`reclaim_dir`] の本体。子エントリの削除手段を差し替えられる（削除失敗の注入試験用）。
 fn reclaim_dir_with(
-    dir: &std::path::Path,
-    remove: &dyn Fn(&std::path::Path) -> std::io::Result<()>,
+    staging: &StagingDir,
+    id: &PullId,
+    remove: &dyn Fn(&PullDir, &OsStr) -> std::io::Result<()>,
 ) -> Result<(), OciErrorCode> {
-    let rd = match fs::read_dir(dir) {
-        Ok(rd) => rd,
+    let dir = match staging.open_pull_dir(id) {
+        Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            return Err(OciErrorCode::FailedPrecondition);
+        }
         Err(_) => return Err(OciErrorCode::Internal),
     };
+    // 子の列挙は上限つき。上限を超える分が残れば最後の rmdir が失敗し、`@pull.lock` ごと残る（余分に残す側）。
+    let names = dir
+        .list_names(MAX_CACHE_SCAN_ENTRIES)
+        .map_err(|_| OciErrorCode::Internal)?;
     let mut failed = false;
-    for ent in rd {
-        let Ok(ent) = ent else {
-            failed = true;
-            continue;
-        };
-        if ent.file_name() == PULL_LOCK_FILE_NAME {
+    for name in names {
+        if name == PULL_LOCK_FILE_NAME {
             continue;
         }
-        match remove(&ent.path()) {
+        match remove(&dir, &name) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => failed = true,
@@ -199,12 +201,12 @@ fn reclaim_dir_with(
     if failed {
         return Err(OciErrorCode::Internal);
     }
-    match fs::remove_file(dir.join(PULL_LOCK_FILE_NAME)) {
+    match dir.unlink(PULL_LOCK_FILE_NAME) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err(OciErrorCode::Internal),
     }
-    match fs::remove_dir(dir) {
+    match staging.remove_pull_dir(id) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(OciErrorCode::Internal),
@@ -245,35 +247,34 @@ impl ImageStore {
 
     fn recover_stale_pulls_inner(&self) -> Result<StalePullRecovery, OciError> {
         let mut result = StalePullRecovery::default();
-        let staging = self.root().join(STAGING_DIR_NAME);
 
         let mut guard = self.lock()?;
-        match fs::symlink_metadata(&staging) {
-            Ok(m) if m.is_dir() => {}
-            Ok(_) => {
-                return Err(OciError::new(
-                    OciErrorCode::FailedPrecondition,
-                    "staging is not a plain directory",
-                ));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(result),
-            Err(_) => return Err(scan_err("failed to stat staging")),
+        // 検査済み root の fd 起点で `staging` を開く（symlink・非ディレクトリは辿らず拒否。#2694）。
+        let staging = match self
+            .handle()
+            .open_staging_dir("staging is not a plain directory")?
+        {
+            Some(s) => s,
+            None => return Ok(result),
+        };
+        // 上限を 1 件超えて読み、超過を検出したら何も消す前に拒否する。
+        let names = staging
+            .list_names(MAX_CACHE_SCAN_ENTRIES + 1)
+            .map_err(|_| scan_err("failed to read staging directory"))?;
+        if names.len() > MAX_CACHE_SCAN_ENTRIES {
+            return Err(OciError::new(
+                OciErrorCode::ResourceExhausted,
+                "too many entries in staging directory",
+            ));
         }
-        let rd =
-            fs::read_dir(&staging).map_err(|_| scan_err("failed to read staging directory"))?;
         let mut ids: Vec<PullId> = Vec::new();
-        let mut seen = 0usize;
-        for ent in rd {
-            let ent = ent.map_err(|_| scan_err("failed to read staging entry"))?;
-            seen += 1;
-            if seen > MAX_CACHE_SCAN_ENTRIES {
-                return Err(OciError::new(
-                    OciErrorCode::ResourceExhausted,
-                    "too many entries in staging directory",
-                ));
-            }
-            let id = ent.file_name().to_str().and_then(|n| PullId::new(n).ok());
-            let is_dir = fs::symlink_metadata(ent.path()).is_ok_and(|m| m.is_dir());
+        for name in names {
+            let id = name.to_str().and_then(|n| PullId::new(n).ok());
+            let is_dir = staging
+                .stat_name(&name)
+                .ok()
+                .flatten()
+                .is_some_and(|m| m.is_dir());
             match id {
                 Some(id) if is_dir => ids.push(id),
                 _ => result.foreign_entries += 1,
@@ -286,8 +287,12 @@ impl ImageStore {
         // 手放すと別の GC が同じ残骸を確定し、この削除の後に `begin_pull` が同 ID で作った新しい
         // ステージングを遅れて消しうる（OCI-7）。
         for id in ids {
-            let dir = staging.join(id.as_str());
-            match probe_pull(&dir) {
+            let liveness = match staging.open_pull_dir(&id) {
+                Ok(dir) => probe_pull(&dir),
+                // 開けない（消えた・差し替えられた）ものは確認できない扱いで残す。
+                Err(_) => PullLiveness::Undetermined,
+            };
+            match liveness {
                 PullLiveness::Live => result.kept_live.push(id),
                 PullLiveness::Undetermined => result.kept_undetermined.push(id),
                 PullLiveness::Absent(file) => {
@@ -306,7 +311,7 @@ impl ImageStore {
                     }
                     // Windows は開いたハンドルがディレクトリ削除を妨げるため、先に閉じる。
                     drop(file);
-                    match reclaim_dir(&dir) {
+                    match reclaim_dir(&staging, &id) {
                         Ok(()) => result.reclaimed.push(id),
                         Err(code) => result.failed.push((id, code)),
                     }
@@ -320,8 +325,10 @@ impl ImageStore {
 
 #[cfg(test)]
 mod tests {
+    use super::super::root_handle::RootHandle;
     use super::*;
     use crate::reference::Digest;
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -652,24 +659,32 @@ mod tests {
         let dir = mk_stale(&root, "p1", true);
         fs::write(dir.join("keep"), b"x").unwrap();
         let fail = std::cell::Cell::new(true);
-        let inject = |p: &std::path::Path| -> std::io::Result<()> {
-            if fail.get() && p.file_name().is_some_and(|n| n == "keep") {
+        let inject = |d: &PullDir, n: &OsStr| -> std::io::Result<()> {
+            if fail.get() && n == "keep" {
                 return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
             }
-            remove_entry(p)
+            remove_entry(d, n)
         };
-        assert_eq!(reclaim_dir_with(&dir, &inject), Err(OciErrorCode::Internal));
+        let handle = RootHandle::open_unchecked(&root.0).unwrap();
+        let staging = handle.open_staging_dir("not a dir").unwrap().unwrap();
+        let id = pid("p1");
+        assert_eq!(
+            reclaim_dir_with(&staging, &id, &inject),
+            Err(OciErrorCode::Internal)
+        );
         // 証跡の `@pull.lock` と失敗した子は残る。
         assert!(dir.join(PULL_LOCK_FILE_NAME).exists());
         assert!(dir.join("keep").exists());
         // 注入を止めた再試行で回収できる。
         fail.set(false);
-        assert_eq!(reclaim_dir_with(&dir, &inject), Ok(()));
+        assert_eq!(reclaim_dir_with(&staging, &id, &inject), Ok(()));
         assert!(!dir.exists());
     }
 
     /// REPAIR-4・OCI-7: `recover_stale_pulls` が削除失敗を `failed()` と失敗記録に反映する
     /// （unix の非 root では実際の権限エラーで確認。root では上の注入試験が契約を担保する）。
+    /// fd 起点の再帰削除（Linux の x86_64 / aarch64）は所有者の rwx を戻してから消すため、権限だけでは
+    /// 失敗を作れず、その環境では回収成功の分岐になる。失敗経路の契約は注入試験が担保する（#2694）。
     #[cfg(unix)]
     #[test]
     fn oci7_recover_records_partial_removal_failure() {

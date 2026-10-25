@@ -42,11 +42,24 @@ mod linux {
     fn make_secret(dir: &std::path::Path, name: &str) -> PathBuf {
         let path = dir.join(name);
         let out = std::fs::File::create(&path).expect("create secret file");
-        let status = Command::new("head")
+        let mut child = Command::new("head")
             .args(["-c", "64", "/dev/urandom"])
             .stdout(Stdio::from(out))
-            .status()
-            .expect("run head");
+            .spawn()
+            .expect("spawn head");
+        // 待機には期限を設ける(REPAIR-5)。超過したら kill して有限時間で回収する。
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            match child.try_wait().expect("try_wait head") {
+                Some(s) => break s,
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("head did not finish within 10s");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
         assert!(status.success(), "head failed: {status:?}");
         assert_eq!(std::fs::metadata(&path).expect("meta").len(), 64);
         path

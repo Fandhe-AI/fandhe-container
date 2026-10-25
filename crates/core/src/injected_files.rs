@@ -717,8 +717,7 @@ mod tests {
         assert!(empty.groups().is_empty() && empty.is_empty());
     }
 
-    /// 一時ファイルに `bytes` を書いて開く（試験用。使い終わったら呼び出し側が消す）。
-    #[cfg(target_os = "linux")]
+    /// 一時ファイルに `bytes` を書いて開く（試験用。使い終わったら呼び出し側が消す。OS 共通）。
     fn host_file(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, std::fs::File) {
         use std::io::Write as _;
         let dir = std::env::temp_dir().join(format!("fandhe-inj-{tag}-{}", std::process::id()));

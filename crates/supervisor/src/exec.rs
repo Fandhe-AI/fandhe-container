@@ -1884,20 +1884,7 @@ fn decode_worker_result(line: &[u8]) -> Result<ExecOutcome, WorkerFailure> {
                     .ok_or_else(malformed)?,
             ),
         };
-        let code = [
-            ErrorCode::InvalidArgument,
-            ErrorCode::NotFound,
-            ErrorCode::AlreadyExists,
-            ErrorCode::FailedPrecondition,
-            ErrorCode::Unimplemented,
-            ErrorCode::Internal,
-            ErrorCode::PermissionDenied,
-            ErrorCode::Timeout,
-            ErrorCode::Unavailable,
-        ]
-        .into_iter()
-        .find(|c| c.as_str() == code)
-        .unwrap_or(ErrorCode::Internal);
+        let code = ErrorCode::from_name(code).unwrap_or(ErrorCode::Internal);
         return Err(WorkerFailure {
             error: TraitError::new(code, message),
             violation,
@@ -3041,6 +3028,13 @@ mod tests {
         assert_eq!(back.violation, None);
         assert_eq!(back.error.code(), ErrorCode::Timeout);
         assert_eq!(back.error.message(), "exec timed out before x");
+
+        // REPAIR-1・ERR-1: 一覧は core の `ErrorCode::ALL` を共有するため `RESOURCE_EXHAUSTED` も通る。未知は `Internal`。
+        let back = decode_worker_result(b"err RESOURCE_EXHAUSTED - m\n").unwrap_err();
+        assert_eq!(back.error.code(), ErrorCode::ResourceExhausted);
+        assert_eq!(back.error.message(), "m");
+        let back = decode_worker_result(b"err BOGUS - m\n").unwrap_err();
+        assert_eq!(back.error.code(), ErrorCode::Internal);
 
         // 対照: 持ち越した rlimit 数が 0・1 なら同じ欄の並びで復号できる（下の値域外の行は値だけで拒否される）。
         for deferred in [0usize, 1] {

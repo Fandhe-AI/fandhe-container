@@ -599,6 +599,10 @@ mod tests {
             (ErrorCode::Unavailable, 9),
             (ErrorCode::ResourceExhausted, 10),
         ];
+        assert_eq!(codes.len(), ErrorCode::ALL.len());
+        for c in ErrorCode::ALL {
+            assert!(codes.iter().any(|(k, _)| *k == c), "{}", c.as_str());
+        }
         for (code, exit) in codes {
             let m = failure_message(code);
             assert!(!m.is_empty());

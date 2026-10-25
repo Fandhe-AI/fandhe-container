@@ -1394,7 +1394,7 @@ jobs:
           log="${RUNNER_TEMP}/rootless_image_rootfs_remove.log"
           USER="$(id -un)" \
             cargo test -p fandhe-container-core --test rootless_image_rootfs_remove -- --ignored 2>&1 | tee "${log}"
-          for scenario in a b c d e f; do
+          for scenario in a b c d e f g h h2; do
             line="rootless_image_rootfs_remove: scenario ${scenario} verified"
             if ! grep -Fxq "${line}" "${log}"; then
               echo "::error::rootless_image_rootfs_remove did not report: ${line} (possibly not executed)" >&2

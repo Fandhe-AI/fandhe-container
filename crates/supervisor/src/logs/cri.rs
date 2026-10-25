@@ -424,21 +424,25 @@ impl TeeLogSink {
     }
 }
 
-/// 出力先の最初の失敗を構造化 1 行（JSON）で stderr へ出す（REPAIR-4。パス・errno・行の内容は含めない。ERR-1）。
-/// stderr の書き込み失敗では panic しない。supervisor の監視経路（stderr）が読む。
-fn report_destination_failure(index: usize, code: ErrorCode) {
-    use std::io::Write as _;
+/// 出力先の失敗通知の構造化 1 行（JSON。末尾改行つき）を作る（パス・errno・行の内容は含めない。ERR-1）。
+fn destination_failure_line(index: usize, code: ErrorCode) -> String {
     let destination = if index == 0 {
         "container_logs"
     } else {
         "cri_log"
     };
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "{{\"component\":\"supervisor.logs\",\"operation\":\"tee_append\",\"result\":\"destination_failed\",\"destination\":\"{}\",\"code\":\"{}\"}}",
+    format!(
+        "{{\"component\":\"supervisor.logs\",\"operation\":\"tee_append\",\"result\":\"destination_failed\",\"destination\":\"{}\",\"code\":\"{}\"}}\n",
         destination,
         code.as_str()
-    );
+    )
+}
+
+/// 出力先の最初の失敗を共有の非同期出力（`stderr_sink`）へ出す（REPAIR-4）。
+/// 本番では stderr が `Stdio::null()` で、書き先が `@supervisor-logs` へ差し替わるため、
+/// `std::io::stderr()` へ直接書かず sink 経由にする（保存経路を迂回せず、満杯でも捕捉スレッドを止めない）。
+fn report_destination_failure(index: usize, code: ErrorCode) {
+    let _ = crate::stderr_sink::stderr().emit(destination_failure_line(index, code).into_bytes());
 }
 
 impl LogSink for TeeLogSink {
@@ -454,6 +458,18 @@ impl LogSink for TeeLogSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// REPAIR-4: 失敗通知は末尾改行つきの 1 行 JSON で、出力先名とコードだけを含む。
+    #[test]
+    fn repair4_destination_failure_line_is_single_json_line() {
+        let line = destination_failure_line(1, ErrorCode::FailedPrecondition);
+        assert!(
+            line.ends_with("\"code\":\"FAILED_PRECONDITION\"}\n"),
+            "{line}"
+        );
+        assert!(line.contains("\"destination\":\"cri_log\""), "{line}");
+        assert_eq!(line.matches('\n').count(), 1);
+    }
 
     fn ts(secs: u64, nanos: u32) -> String {
         String::from_utf8(format_timestamp(Duration::new(secs, nanos)).to_vec()).expect("ascii")

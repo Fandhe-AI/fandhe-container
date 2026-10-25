@@ -17,7 +17,8 @@
 //!
 //! # 安全性
 //! - 開くとき最終要素は `O_NOFOLLOW`（symlink を辿らない）・`O_NONBLOCK`（FIFO で止まらない）・`O_NOCTTY` で、開いた後に通常ファイル
-//!   であることを確かめる。ディレクトリは作らない（kubelet が作る）。親ディレクトリは絶対パス・`..` なし・root 以外が所有する
+//!   であることを確かめる。`log_directory` は作らない（kubelet が作る）が、その直下の `containerName/` は 1 階層だけ 0o750 で作る
+//!   （検査済みの祖先の直下に限る）。親ディレクトリは絶対パス・`..` なし・root 以外が所有する
 //!   祖先の symlink なし・group / other 書き込み不可を確かめる（`rotating` の `check_dir` と同じ検査）。検査と open の間の差し替え
 //!   （TOCTOU）は残る既知の制限で、`rotating` と同じ（core に fd 相対 open が公開されていない。#1470 の判断）。
 //! - 特権ランチャー経由（ambient capability あり）では開かない（[`deny_elevated_capabilities`]）。`CAP_DAC_OVERRIDE` を持ったまま
@@ -193,9 +194,41 @@ enum Inner {
     Failed,
 }
 
+/// 親ディレクトリを検査して実体パスを返す。親が無いときは、検査を通った祖先（kubelet が作る `log_directory`）の直下に限り
+/// 1 階層だけ 0o750 で作る（CRI 標準の `<containerName>/<N>.log`。kubelet は `log_directory` しか作らない。containerd・
+/// CRI-O は親を MkdirAll する）。作る前に祖先を `check_dir` で検査し、作った後も `check_dir` で再検査する。`mkdir` は最終要素の
+/// symlink を辿らない（既存なら `AlreadyExists` で、その場合も再検査で symlink を拒否する）。2 階層以上欠けていれば作らない。
+#[cfg(unix)]
+fn ensure_parent_dir(
+    parent: &std::path::Path,
+    unopenable: impl Fn() -> TraitError,
+) -> Result<std::path::PathBuf, TraitError> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    match super::rotating::check_dir(parent) {
+        Ok(dir) => return Ok(dir),
+        Err(e) => {
+            if std::fs::symlink_metadata(parent).is_ok() {
+                return Err(e);
+            }
+        }
+    }
+    // 親が存在しない: その親（祖先）が検査を通ることを確かめてから 1 階層だけ作る。
+    let Some(grand) = parent.parent() else {
+        return Err(unopenable());
+    };
+    super::rotating::check_dir(grand)?;
+    match std::fs::DirBuilder::new().mode(0o750).create(parent) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(unopenable()),
+    }
+    super::rotating::check_dir(parent)
+}
+
 impl CriFileSink {
-    /// `path`（cri が結合・検証した絶対パス）を追記で開く。親ディレクトリが無い・安全でない・最終要素が symlink / 通常ファイル
-    /// 以外のときは開かない。ディレクトリは作らない。開けない場合は `FailedPrecondition`（launch の前の確定失敗）。
+    /// `path`（cri が結合・検証した絶対パス）を追記で開く。親ディレクトリが安全でない・最終要素が symlink / 通常ファイル
+    /// 以外のときは開かない。親ディレクトリが無ければ検査済みの祖先の直下に 1 階層だけ作る（`ensure_parent_dir`）。開けない場合は `FailedPrecondition`（launch の前の確定失敗）。
     #[cfg(unix)]
     pub fn open(
         path: &fandhe_container_core::traits::ContainerLogPath,
@@ -213,7 +246,7 @@ impl CriFileSink {
         let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
             return Err(invalid("cri log path has no file name"));
         };
-        let dir = super::rotating::check_dir(parent)?;
+        let dir = ensure_parent_dir(parent, unopenable)?;
         let file = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -291,31 +324,74 @@ impl LogSink for CriFileSink {
 
 /// 2 つの [`LogSink`] の両方へ書く（`@container-logs` と CRI ログの二重書き。CRI-2・SUP-4・#2671）。
 ///
-/// 片方が失敗しても他方への書き込みは試み、どちらかが `Err` なら `Err`（先に失敗した側のエラー）を返す
-/// （片方の失敗を黙って許さない。失敗は `report_drain` が構造化ログに出す）。
+/// 出力先ごとに失敗状態を持つ。片方が失敗してもその出力先だけを以後呼ばず、正常な出力先への `append` / `flush` は
+/// 続ける（呼び出し元の `LineSplitter` は最初の `Err` でストリームの以降を読み捨てるため、片方の失敗で
+/// 既存の `@container-logs` の記録を止めない。SUP-4）。`Err` を返すのは両方が失敗した場合だけ。
+/// 片方の失敗は黙って消さず、[`Self::failed_codes`] で出力先ごとの最初のエラーコードを観測できる。
 pub struct TeeLogSink {
     primary: Arc<dyn LogSink>,
     secondary: Arc<dyn LogSink>,
+    /// 出力先ごと（主・副）の最初のエラーコード。`Some` の出力先は以後呼ばない。
+    failed: Mutex<[Option<ErrorCode>; 2]>,
 }
 
 impl TeeLogSink {
     /// 主（`@container-logs`）と副（CRI ログ）から作る。
     pub fn new(primary: Arc<dyn LogSink>, secondary: Arc<dyn LogSink>) -> Self {
-        Self { primary, secondary }
+        Self {
+            primary,
+            secondary,
+            failed: Mutex::new([None, None]),
+        }
+    }
+
+    /// 出力先ごと（主・副の順）の最初の失敗のエラーコード。失敗していなければ `None`。
+    pub fn failed_codes(&self) -> [Option<ErrorCode>; 2] {
+        *self.failed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// 失敗していない出力先へ `op` を適用する。両方が（以前から、または今回）失敗したときだけ `Err`。
+    fn each(&self, op: impl Fn(&dyn LogSink) -> Result<(), TraitError>) -> Result<(), TraitError> {
+        let sinks = [&self.primary, &self.secondary];
+        let mut last_err = None;
+        let mut alive = 0usize;
+        for (i, sink) in sinks.into_iter().enumerate() {
+            let already = self
+                .failed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(i)
+                .copied()
+                .flatten();
+            if let Some(code) = already {
+                last_err = Some(TraitError::new(code, "log destination is in failed state"));
+                continue;
+            }
+            match op(sink.as_ref()) {
+                Ok(()) => alive += 1,
+                Err(e) => {
+                    let mut g = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
+                    if let Some(slot) = g.get_mut(i) {
+                        slot.get_or_insert(e.code());
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        match (alive, last_err) {
+            (0, Some(e)) => Err(e),
+            _ => Ok(()),
+        }
     }
 }
 
 impl LogSink for TeeLogSink {
     fn append(&self, stream: StreamKind, line: &[u8]) -> Result<(), TraitError> {
-        let a = self.primary.append(stream, line);
-        let b = self.secondary.append(stream, line);
-        a.and(b)
+        self.each(|s| s.append(stream, line))
     }
 
     fn flush(&self) -> Result<(), TraitError> {
-        let a = self.primary.flush();
-        let b = self.secondary.flush();
-        a.and(b)
+        self.each(|s| s.flush())
     }
 }
 
@@ -418,24 +494,47 @@ mod tests {
         }
     }
 
-    /// CRI-2・SUP-4: tee は両方へ書き、片方が失敗しても他方へ書いた上で Err を返す。
+    /// CRI-2・SUP-4: tee は両方へ書き、片方が失敗しても他方への書き込みを続け（Ok）、両方失敗で Err を返す。
     #[test]
-    fn cri2_tee_writes_both_and_reports_failure() {
+    fn cri2_tee_continues_with_healthy_sink_after_one_fails() {
         let a = Arc::new(Recorder(Mutex::new(Vec::new()), false));
         let b = Arc::new(Recorder(Mutex::new(Vec::new()), false));
         let tee = TeeLogSink::new(a.clone(), b.clone());
         tee.append(StreamKind::Stdout, b"x").expect("ok");
         assert_eq!(a.0.lock().expect("lock").clone(), ["stdout x"]);
         assert_eq!(b.0.lock().expect("lock").clone(), ["stdout x"]);
+        assert_eq!(tee.failed_codes(), [None, None]);
 
+        // 副（CRI ログ）が失敗しても主は継続し、失敗した副は以後呼ばれない。
+        let bad = Arc::new(Recorder(Mutex::new(Vec::new()), true));
+        let good = Arc::new(Recorder(Mutex::new(Vec::new()), false));
+        let tee = TeeLogSink::new(good.clone(), bad.clone());
+        tee.append(StreamKind::Stderr, b"y").expect("primary ok");
+        tee.append(StreamKind::Stderr, b"z").expect("primary ok");
+        tee.flush().expect("flush ok");
+        assert_eq!(
+            good.0.lock().expect("lock").clone(),
+            ["stderr y", "stderr z"]
+        );
+        assert_eq!(bad.0.lock().expect("lock").clone(), ["stderr y"]);
+        assert_eq!(tee.failed_codes(), [None, Some(ErrorCode::Internal)]);
+
+        // 逆方向（主が失敗しても副は継続）。
         let bad = Arc::new(Recorder(Mutex::new(Vec::new()), true));
         let good = Arc::new(Recorder(Mutex::new(Vec::new()), false));
         let tee = TeeLogSink::new(bad.clone(), good.clone());
-        assert!(tee.append(StreamKind::Stderr, b"y").is_err());
-        assert_eq!(good.0.lock().expect("lock").clone(), ["stderr y"]);
-        let tee = TeeLogSink::new(good.clone(), bad);
-        assert!(tee.append(StreamKind::Stderr, b"z").is_err());
+        tee.append(StreamKind::Stdout, b"p").expect("secondary ok");
+        tee.append(StreamKind::Stdout, b"q").expect("secondary ok");
         assert_eq!(good.0.lock().expect("lock").len(), 2);
+        assert_eq!(bad.0.lock().expect("lock").len(), 1);
+        assert_eq!(tee.failed_codes(), [Some(ErrorCode::Internal), None]);
+
+        // 両方失敗したときだけ Err。
+        let b1 = Arc::new(Recorder(Mutex::new(Vec::new()), true));
+        let b2 = Arc::new(Recorder(Mutex::new(Vec::new()), true));
+        let tee = TeeLogSink::new(b1, b2);
+        assert!(tee.append(StreamKind::Stdout, b"r").is_err());
+        assert!(tee.append(StreamKind::Stdout, b"s").is_err());
     }
 
     #[cfg(unix)]
@@ -539,7 +638,7 @@ mod tests {
             assert_eq!(e.code(), ErrorCode::FailedPrecondition);
         }
 
-        /// SEC-1: 親ディレクトリが group 書き込み可・存在しない・祖先に root 以外の symlink があれば拒否し、mkdir しない。
+        /// SEC-1: 親ディレクトリが group 書き込み可・2 階層以上欠け・祖先に root 以外の symlink があれば拒否し、mkdir しない。
         #[test]
         fn cri2_file_sink_rejects_unsafe_parent() {
             let t = Tmp::new("parent");
@@ -549,7 +648,8 @@ mod tests {
                 .expect("chmod");
             assert!(CriFileSink::open(&t.log("open/0.log")).is_err());
 
-            assert!(CriFileSink::open(&t.log("missing/0.log")).is_err());
+            // 2 階層以上欠けていれば作らない。
+            assert!(CriFileSink::open(&t.log("missing/deeper/0.log")).is_err());
             assert!(!t.0.join("missing").exists());
 
             let real = t.0.join("real");
@@ -557,6 +657,29 @@ mod tests {
             std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o750)).expect("chmod");
             symlink(&real, t.0.join("via")).expect("symlink");
             assert!(CriFileSink::open(&t.log("via/0.log")).is_err());
+            assert!(!real.join("0.log").exists());
+        }
+
+        /// CRI-2・SUP-4: CRI 標準の `<containerName>/0.log` で親（containerName）が未作成でも、検査済みの祖先の直下に
+        /// 1 階層だけ 0o750 で作って開ける。親が symlink なら作らず拒否する。
+        #[test]
+        fn cri2_file_sink_creates_missing_container_dir() {
+            let t = Tmp::new("mkparent");
+            let sink = CriFileSink::open(&t.log("web/0.log")).expect("open");
+            sink.append(StreamKind::Stdout, b"hi").expect("append");
+            sink.flush().expect("flush");
+            assert!(read(&t.0.join("web/0.log")).ends_with(" stdout F hi\n"));
+            let mode = std::fs::metadata(t.0.join("web"))
+                .expect("meta")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o750 & !current_umask_bits());
+
+            let real = t.0.join("real");
+            std::fs::create_dir(&real).expect("dir");
+            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o750)).expect("chmod");
+            symlink(&real, t.0.join("sym")).expect("symlink");
+            assert!(CriFileSink::open(&t.log("sym/0.log")).is_err());
             assert!(!real.join("0.log").exists());
         }
 

@@ -118,8 +118,8 @@ CRI の `log_path`（コンテナ）と `log_directory`（サンドボックス�
 
 - `ContainerStatus.log_path` は結合済みの絶対パスを返す（containerd と同じ。kubelet の GetContainerLogs と crictl logs が直接開く）。実行層未接続（スタブ）の経路は従来どおり指定値を無改変で返す
 - 形式は `<RFC3339Nano UTC 固定 9 桁> <stdout|stderr> <F|P> <内容>\n`。1 行は 16 KiB（containerd の `max_container_log_line_size` の既定）ごとに分け、最後を `F`、それ以前を `P` にする。空行は `<ts> stdout F \n`。捕捉側が 64 KiB で切り詰めた分は残らない（既知の制限）
-- `@container-logs`（`fandhe logs`・delete のログ削除の対象）にも従来どおり書く（二重書き）。CRI ログは kubelet の所有物で、`RemoveContainer`・delete は消さない
-- 開き方: 追記・`O_NOFOLLOW`・通常ファイルのみ・ディレクトリは作らない。親は絶対パス・`..` なし・root 以外が所有する祖先の symlink なし・group / other 書き込み不可。検査と open の間の差し替え（TOCTOU）は残る既知の制限（`@container-logs` の sink と同じ）
+- `@container-logs`（`fandhe logs`・delete のログ削除の対象）にも従来どおり書く（二重書き）。出力先ごとに失敗状態を持ち、片方（CRI ログ等）が失敗しても正常な側への書き込みは続ける（`Err` を返すのは両方失敗のときだけ）。CRI ログは kubelet の所有物で、`RemoveContainer`・delete は消さない
+- 開き方: 追記・`O_NOFOLLOW`・通常ファイルのみ。`log_directory` は作らない（kubelet が作る）が、標準の `<containerName>/<N>.log` の `containerName/` は、検査済みの祖先の直下に限り 1 階層だけ 0o750 で作る（kubelet は `log_directory` しか作らず、containerd・CRI-O は親を作るため。2 階層以上欠けていれば拒否）。親は絶対パス・`..` なし・root 以外が所有する祖先の symlink なし・group / other 書き込み不可。検査と open の間の差し替え（TOCTOU）は残る既知の制限（`@container-logs` の sink と同じ）
 - 特権ランチャー経由（ambient capability あり）は `UNIMPLEMENTED` で拒否する。`CAP_DAC_OVERRIDE` のまま利用者指定のパスを開くと任意のファイルへ追記できてしまうため（`CapEff` / `CapPrm` が 0 でなければ拒否）。cri は `UNIMPLEMENTED` を確定失敗として created へ戻す
 - 既知の制約: rootless の supervisor は root 所有 0755 の `/var/log/pods` に書けず、標準配置の kubelet では start が失敗する。動くのは rootless の kubelet や、利用者が所有する `log_directory` の場合。`log_directory` に `/tmp`（1777）は使えない（group / other 書き込み可のため拒否）
 - 未対応（後続 issue）: `ReopenContainerLog`（kubelet のログ回転。未実装のため CRI ログの総量に上限が無い）、ランチャー経由での CRI ログ（open の間だけ DAC 系 capability を落とす等）、64 KiB を超える行の P 断片化

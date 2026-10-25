@@ -267,8 +267,11 @@ fn covering_mount<'a>(mountinfo: &'a str, path: &Path) -> Option<Vec<&'a str>> {
             children.entry(e.parent).or_default().push(i);
         }
     }
-    // 根: 親が表に無いマウント。複数あれば後の行を採る。
-    let mut cur = entries.iter().rposition(|e| !ids.contains(e.parent))?;
+    // 根: 親が表に無く、`path` を含むマウント。複数あれば後の行を採る。`path` を含まない根しか無ければ
+    // 判定不能（`path` を含まないマウントの属性を返すと fail-open になる）。
+    let mut cur = entries
+        .iter()
+        .rposition(|e| !ids.contains(e.parent) && contains(&e.mp))?;
     // 深さは行数を超えない（超えたら循環とみなして判定不能）。
     for _ in 0..=entries.len() {
         let cur_id = entries.get(cur)?.id;
@@ -1356,6 +1359,19 @@ mod tests {
 ";
         let has3 = |p: &str| covering_mount_has_option(info3, Path::new(p), "nosuid");
         assert_eq!(has3("/opt/fc/bin/launcher"), MountOptionState::Present);
+        // 親の無い行が `path` を含まなければ、その属性を返さず判定不能（fail-closed）。
+        let stray = "1 0 0:1 / /a rw - tmpfs t rw\n";
+        assert_eq!(
+            covering_mount_has_option(stray, Path::new("/b/c"), "nosuid"),
+            MountOptionState::NoCoveringMount
+        );
+        assert_eq!(covering_mount_fstype(stray, Path::new("/b/c")), None);
+        assert_eq!(
+            check_propagation(stray, Path::new("/b/c"))
+                .unwrap_err()
+                .code(),
+            NetErrorCode::Internal
+        );
         // 根が無い（循環）表は判定不能（fail-closed）。
         let cyc = "1 2 0:1 / /a rw - tmpfs t rw\n2 1 0:2 / /a/b rw - tmpfs t rw\n";
         assert_eq!(

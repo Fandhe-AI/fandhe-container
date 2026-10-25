@@ -1270,11 +1270,15 @@ mod imp {
         observed: bool,
     ) -> (bool, Result<(), TraitError>) {
         if observed {
+            // 公開済みの観測が保証するのは改名が済んだことだけで、mode の復元までは保証しない。
+            // 子が改名の後・復元の前に止まった場合（期限切れの kill・異常終了）に成功を装わない（fail-closed）。
+            // 公開済みの木は消さず（published = true）、エラーで返す。
             return match run {
-                Ok(PUB_RESTORE_FAILED) => {
+                Ok(PUB_RENAMED) => (true, Ok(())),
+                Ok(PUB_RESTORE_FAILED) | Ok(_) => {
                     (true, Err(PublishFailure::RestoreAfterRename.into_error()))
                 }
-                _ => (true, Ok(())),
+                Err(e) => (true, Err(e.into_error())),
             };
         }
         let err = match run {
@@ -2381,9 +2385,21 @@ mod imp {
         fn publish_outcome_observation_decides_published() {
             let (p, r) = publish_outcome(Ok(PUB_RENAMED), true);
             assert!(p && r.is_ok());
-            // 期限切れで kill しても、改名が済んでいれば公開済みとして残す。
+            // 期限切れで kill しても、改名が済んでいれば公開済みとして残す（削除しない）が、
+            // mode の復元を確認できないので成功にはしない（Timeout のエラーで返す）。
             let (p, r) = publish_outcome(Err(UsernsRunError::Timeout), true);
-            assert!(p && r.is_ok());
+            assert!(p);
+            assert_eq!(r.expect_err("timeout").code(), ErrorCode::Timeout);
+            // 改名の後に異常終了した子も同様（復元前に止まった可能性）。
+            let (p, r) = publish_outcome(Ok(99), true);
+            assert!(p);
+            assert_eq!(
+                r.expect_err("abnormal").message(),
+                "failed to restore rootfs mode"
+            );
+            let (p, r) = publish_outcome(Err(UsernsRunError::Other(ErrorCode::Internal)), true);
+            assert!(p);
+            assert_eq!(r.expect_err("other").code(), ErrorCode::Internal);
             let (p, r) = publish_outcome(Ok(PUB_RESTORE_FAILED), true);
             assert!(p);
             assert_eq!(

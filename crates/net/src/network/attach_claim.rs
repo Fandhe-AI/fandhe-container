@@ -20,6 +20,45 @@ use super::{
 /// 記録の先頭行（版）。
 const ATTACH_RECORD_VERSION_LINE: &str = "fandhe-net-attach-claim v1";
 
+/// netns の pin の実体の識別子（作成時の `st_dev`・`st_ino` と、プロセス内で単調増加する作成の連番）。
+///
+/// 請求書がどの接続世代の pin を指すかを固定する。inode 番号は解除後に再利用されうるため、連番を併せて持ち、
+/// 同じ endpoint・置き場に作り直された新しい pin を古い請求書で解除しないために使う（NET-1・#2681）。
+/// 連番は作成したプロセスの中でだけ意味を持ち、再起動後の記録は所有記録に照合できず解除自体が拒否される。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PinIdentity {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) serial: u64,
+}
+
+impl PinIdentity {
+    fn encode(self) -> String {
+        format!("{}:{}:{}", self.dev, self.ino, self.serial)
+    }
+
+    fn decode(s: &str) -> Result<Self, NetError> {
+        let bad = || invalid("attach claim record pin invalid");
+        let mut it = s.split(':');
+        let mut num = || -> Result<u64, NetError> {
+            let t = it.next().ok_or_else(bad)?;
+            if t.is_empty() || t.len() > 20 || !t.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(bad());
+            }
+            t.parse().map_err(|_| bad())
+        };
+        let id = Self {
+            dev: num()?,
+            ino: num()?,
+            serial: num()?,
+        };
+        if it.next().is_some() {
+            return Err(bad());
+        }
+        Ok(id)
+    }
+}
+
 /// attach の巻き戻しで取り残した資源の請求書。
 ///
 /// フィールドは非公開で、構築口は `ContainerAttachError::reclaim_claim`・[`FailedAttachClaim::from_record`]
@@ -34,6 +73,8 @@ pub struct FailedAttachClaim {
     generation: String,
     veth: bool,
     netns: bool,
+    /// netns の pin の実体の識別子。`netns` を含む請求書で、作成した pin を特定できたときだけ持つ。
+    pin: Option<PinIdentity>,
     quarantine: bool,
 }
 
@@ -57,6 +98,16 @@ impl FailedAttachClaim {
                     | AttachResource::PortReservation(..)
             )
         });
+        // 取り残した pin の実体を、失敗した接続の記録から控える（特定できなければ `None`。回収は拒否される）。
+        let pin = err
+            .rollback
+            .leftover
+            .iter()
+            .find_map(|(r, _)| match r {
+                AttachResource::Netns(path) => Some(path.as_path()),
+                _ => None,
+            })
+            .and_then(pin_identity_of);
         (veth || netns || quarantine).then(|| Self {
             network: network.clone(),
             token: token.to_owned(),
@@ -64,6 +115,7 @@ impl FailedAttachClaim {
             generation: generation.to_owned(),
             veth,
             netns,
+            pin,
             quarantine,
         })
     }
@@ -71,13 +123,14 @@ impl FailedAttachClaim {
     /// 永続化記録（固定のテキスト。LF・ASCII）へ符号化する。
     pub fn to_record(&self) -> String {
         format!(
-            "{ATTACH_RECORD_VERSION_LINE}\nnetwork={}\nendpoint={}\ntoken={}\ngeneration={}\nveth={}\nnetns={}\nquarantine={}\n",
+            "{ATTACH_RECORD_VERSION_LINE}\nnetwork={}\nendpoint={}\ntoken={}\ngeneration={}\nveth={}\nnetns={}\npin={}\nquarantine={}\n",
             self.network.as_str(),
             self.endpoint.as_str(),
             self.token,
             self.generation,
             u8::from(self.veth),
             u8::from(self.netns),
+            self.pin.map_or_else(|| "-".to_owned(), PinIdentity::encode),
             u8::from(self.quarantine),
         )
     }
@@ -105,6 +158,10 @@ impl FailedAttachClaim {
         let generation = field("generation")?;
         let veth = parse_flag(field("veth")?)?;
         let netns = parse_flag(field("netns")?)?;
+        let pin = match field("pin")? {
+            "-" => None,
+            v => Some(PinIdentity::decode(v)?),
+        };
         let quarantine = parse_flag(field("quarantine")?)?;
         if lines.next().is_some() {
             return Err(invalid("attach claim record malformed"));
@@ -121,6 +178,9 @@ impl FailedAttachClaim {
         if !(veth || netns || quarantine) {
             return Err(invalid("attach claim record names no resource"));
         }
+        if pin.is_some() && !netns {
+            return Err(invalid("attach claim record pin without netns"));
+        }
         Ok(Self {
             network,
             token: token.to_owned(),
@@ -128,6 +188,7 @@ impl FailedAttachClaim {
             generation: generation.to_owned(),
             veth,
             netns,
+            pin,
             quarantine,
         })
     }
@@ -164,6 +225,7 @@ impl FailedAttachClaim {
         self.quarantine.then(|| Self {
             veth: false,
             netns: false,
+            pin: None,
             ..self.clone()
         })
     }
@@ -172,6 +234,12 @@ impl FailedAttachClaim {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn generation(&self) -> &str {
         &self.generation
+    }
+
+    /// 回収側（`delete.rs`）が接続世代の照合に使う netns の pin の識別子。控えられなかった請求書は `None`。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn pin(&self) -> Option<PinIdentity> {
+        self.pin
     }
 
     /// 回収側（`delete.rs`）が所有の証明に使う bridge のトークン。
@@ -198,9 +266,41 @@ impl FailedAttachClaim {
             generation: generation.to_owned(),
             veth,
             netns,
+            pin: netns.then_some(TEST_PIN),
             quarantine,
         }
     }
+
+    /// テスト用: pin の識別子を差し替える。
+    #[cfg(test)]
+    pub(crate) fn with_pin_for_test(mut self, pin: Option<PinIdentity>) -> Self {
+        self.pin = pin;
+        self
+    }
+}
+
+/// テストの請求書が持つ pin の識別子。
+#[cfg(test)]
+pub(crate) const TEST_PIN: PinIdentity = PinIdentity {
+    dev: 1,
+    ino: 2,
+    serial: 3,
+};
+
+/// 請求書の記録の `pin=` 行の値（特定できなければ `-`）。
+pub(super) fn pin_record_value(path: &std::path::Path) -> String {
+    pin_identity_of(path).map_or_else(|| "-".to_owned(), PinIdentity::encode)
+}
+
+/// 取り残した pin のパスから、作成した pin の識別子を控える（Linux のみ。他 OS は常に `None`）。
+#[cfg(target_os = "linux")]
+fn pin_identity_of(path: &std::path::Path) -> Option<PinIdentity> {
+    crate::netns::pin_identity(path).ok().flatten()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_identity_of(_path: &std::path::Path) -> Option<PinIdentity> {
+    None
 }
 
 #[cfg(test)]
@@ -232,15 +332,34 @@ mod tests {
         let rec = c.to_record();
         assert_eq!(
             rec,
-            "fandhe-net-attach-claim v1\nnetwork=web\nendpoint=c1\ntoken=fandhe-net:web:1:2:3\ngeneration=0123456789abcdef0123456789abcdef\nveth=1\nnetns=0\nquarantine=1\n"
+            "fandhe-net-attach-claim v1\nnetwork=web\nendpoint=c1\ntoken=fandhe-net:web:1:2:3\ngeneration=0123456789abcdef0123456789abcdef\nveth=1\nnetns=0\npin=-\nquarantine=1\n"
         );
         assert_eq!(FailedAttachClaim::from_record(&rec), Ok(c));
+    }
+
+    /// NET-1・#2681: pin の識別子は記録に載り、往復で等しくなる。
+    #[test]
+    fn net1_attach_claim_pin_identity_roundtrip() {
+        let c = FailedAttachClaim::for_test(
+            n("web"),
+            e("c1"),
+            "fandhe-net:web:1:2:3",
+            GEN,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(c.pin(), Some(TEST_PIN));
+        let rec = c.to_record();
+        assert!(rec.contains("netns=1\npin=1:2:3\n"), "{rec}");
+        assert_eq!(FailedAttachClaim::from_record(&rec), Ok(c.clone()));
+        assert_eq!(c.quarantine_only(), None);
     }
 
     /// NET-1・#2681: 不正な記録は `InvalidArgument` で拒否する。
     #[test]
     fn net1_attach_claim_record_rejects_malformed() {
-        let ok = "fandhe-net-attach-claim v1\nnetwork=web\nendpoint=c1\ntoken=fandhe-net:web:1:2:3\ngeneration=0123456789abcdef0123456789abcdef\nveth=1\nnetns=0\nquarantine=0\n";
+        let ok = "fandhe-net-attach-claim v1\nnetwork=web\nendpoint=c1\ntoken=fandhe-net:web:1:2:3\ngeneration=0123456789abcdef0123456789abcdef\nveth=1\nnetns=0\npin=-\nquarantine=0\n";
         assert!(FailedAttachClaim::from_record(ok).is_ok());
         let long_token = ok.replace(
             "token=fandhe-net:web:1:2:3",
@@ -256,6 +375,10 @@ mod tests {
             ok.replace("token=fandhe-net:web:1:2:3", "token=fandhe-net:web:1 2"),
             ok.replace("veth=1", "veth=0"),
             ok.replace("veth=1", "veth=2"),
+            ok.replace("pin=-", "pin=1:2"),
+            ok.replace("pin=-", "pin=1:2:x"),
+            ok.replace("pin=-", "pin=1:2:3:4"),
+            ok.replace("pin=-", "pin=1:2:3"),
             ok.replace("endpoint=c1", "endpoint=../c1"),
             ok.replace("endpoint=c1", "endpoint=C1"),
             long_token,

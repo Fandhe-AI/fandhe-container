@@ -514,9 +514,10 @@ mod linux {
             .rsplit_once("/g/")
             .map(|(_, g)| g.to_owned())
             .ok_or_else(|| fail("host_token has no generation"))?;
+        let pin4_value = attached4.netns_pin_record_value();
         let record = format!(
-            "fandhe-net-attach-claim v1\nnetwork=att\nendpoint=c4\ntoken={}\ngeneration={generation4}\nveth=1\nnetns=1\nquarantine=0\n",
-            net.bridge_token
+            "fandhe-net-attach-claim v1\nnetwork=att\nendpoint=c4\ntoken={}\ngeneration={generation4}\nveth=1\nnetns=1\npin={}\nquarantine=0\n",
+            net.bridge_token, pin4_value
         );
         let claim4 = FailedAttachClaim::from_record(&record)?;
         for round in 0..2 {
@@ -548,7 +549,8 @@ mod linux {
         )?;
         let record5 = record
             .replace("endpoint=c4", "endpoint=c5")
-            .replace("netns=1", "netns=0");
+            .replace("netns=1", "netns=0")
+            .replace(&format!("pin={pin4_value}"), "pin=-");
         let e = match reclaim_failed_attach(
             &route,
             &nft,

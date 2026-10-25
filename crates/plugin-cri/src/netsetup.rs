@@ -1156,11 +1156,16 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
         self.backend.reclaim_failed_attach(claim)?;
         if quarantine_live && let Some(rest) = self.backend.attach_claim_quarantine_remainder(claim)
         {
+            // 更新は、読み出した元の請求書と一致するときだけ（比較交換）。回収の間に別プロセスが同じ endpoint の
+            // 新しい世代の請求書を保存していても、旧世代の更新で上書きしない（NET-1・#2681）。
             if !entry.quarantine_held
-                && let (Some(store), Some(record)) =
-                    (&self.store, self.backend.encode_attach_claim(&rest))
+                && let (Some(store), Some(original), Some(record)) = (
+                    &self.store,
+                    self.backend.encode_attach_claim(claim),
+                    self.backend.encode_attach_claim(&rest),
+                )
             {
-                store.save_attach(entry.endpoint.as_str(), &record)?;
+                store.update_attach_if_matches(entry.endpoint.as_str(), &original, &record)?;
             }
             let entry = containers.get_mut(id).ok_or_else(not_found_netns)?;
             entry.claim = Some(rest);

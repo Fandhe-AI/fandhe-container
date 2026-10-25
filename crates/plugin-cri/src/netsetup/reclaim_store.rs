@@ -201,6 +201,17 @@ impl ReclaimStore {
             return Err(internal("reclaim record is too long"));
         }
         let _lock = self.lock()?;
+        self.write_locked(dir, file, record, next_seq)
+    }
+
+    /// ロックを持った状態で `file` へ不可分に書く本体（呼び出し側が `lock()` を保持していること）。
+    fn write_locked(
+        &self,
+        dir: &Path,
+        file: &Path,
+        record: &str,
+        next_seq: &dyn Fn() -> u64,
+    ) -> Result<(), TraitError> {
         // 異常終了で残った同名の一時ファイル（PID の再利用で連番が 0 から始まり衝突しうる）が保存を妨げないよう、
         // `AlreadyExists` のときは連番を進めて有限回だけ別名で再試行する（NET-1・REPAIR-3・#2604）。
         const TMP_ATTEMPTS: usize = 16;
@@ -254,6 +265,36 @@ impl ReclaimStore {
     ) -> Result<(), TraitError> {
         let file = self.attach_file_for(endpoint)?;
         self.remove_at(&self.attach_dir, &file, expected)
+    }
+
+    /// attach の取り残しの記録を、現在の中身が `expected` と一致するときだけ `record` へ置き換える（#2681）。
+    ///
+    /// 一致の照合と書き込みを同じプロセス間ロックの下で行う比較交換。古い請求書を読んだ側が、遅れて
+    /// quarantine だけの記録へ更新しようとしても、その間に別プロセスが同じ endpoint の新しい世代の請求書を
+    /// 保存していれば、上書きせず新しい請求書を保持する（NET-1）。記録が無い・中身が違うときは何も書かずに成功する
+    /// （回収済み、または新しい世代に置き換わっている）。読めない記録は失敗する。
+    pub fn update_attach_if_matches(
+        &self,
+        endpoint: &str,
+        expected: &str,
+        record: &str,
+    ) -> Result<(), TraitError> {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        if record.len() > CLAIM_RECORD_MAX_LEN {
+            return Err(internal("reclaim record is too long"));
+        }
+        let file = self.attach_file_for(endpoint)?;
+        let _lock = self.lock()?;
+        match read_record(&file) {
+            ReadOutcome::Record(current) if current == expected => {}
+            ReadOutcome::Missing | ReadOutcome::Record(_) => return Ok(()),
+            ReadOutcome::Unreadable => {
+                return Err(internal("failed to read the reclaim record"));
+            }
+        }
+        self.write_locked(&self.attach_dir, &file, record, &|| {
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        })
     }
 
     /// `file` を排他の下で照合して消す本体。
@@ -663,6 +704,34 @@ mod tests {
             .expect("idempotent");
         assert!(!file.exists());
         assert_eq!(s.load().expect("load").attach_claims.len(), 1);
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// NET-1・#2681: 条件付き更新は中身が一致するときだけ置き換え、別世代の記録・記録なしでは書かない。
+    #[test]
+    fn net1_store_attach_update_if_matches_is_compare_and_swap() {
+        let root = temp_root("attach-cas");
+        let s = ReclaimStore::open(&root).expect("open");
+        let file = root.join(RECLAIM_DIR).join(ATTACH_DIR).join("c1.attach");
+        s.save_attach("c1", "gen-1\n").expect("save gen-1");
+        // 別プロセスが新しい世代の請求書を保存した後に、遅れた旧世代の更新が走る。
+        s.save_attach("c1", "gen-2\n").expect("save gen-2");
+        s.update_attach_if_matches("c1", "gen-1\n", "gen-1-quarantine\n")
+            .expect("stale update is a no-op");
+        assert_eq!(fs::read_to_string(&file).expect("read"), "gen-2\n");
+        // 一致すれば置き換わる。
+        s.update_attach_if_matches("c1", "gen-2\n", "gen-2-quarantine\n")
+            .expect("matching update");
+        assert_eq!(
+            fs::read_to_string(&file).expect("read"),
+            "gen-2-quarantine\n"
+        );
+        // 記録が無ければ作らない。
+        s.remove_attach_if_matches("c1", "gen-2-quarantine\n")
+            .expect("remove");
+        s.update_attach_if_matches("c1", "gen-2\n", "x\n")
+            .expect("missing is a no-op");
+        assert!(!file.exists());
         fs::remove_dir_all(&root).expect("cleanup");
     }
 

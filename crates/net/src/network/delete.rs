@@ -121,6 +121,7 @@ use crate::netns::{self, ContainerNetns};
 use crate::nftables_batch::{NetlinkNetfilterSocket, NftFamily, TableDelete, TableGet};
 use crate::nftables_batch::{NftBatchOutcome, NftName, TableInfo};
 
+use super::attach_claim::PinIdentity;
 #[cfg(target_os = "linux")]
 use super::link_ref;
 use super::{
@@ -230,8 +231,9 @@ pub(crate) trait DeleteOps {
     /// pin を外す。失敗時はハンドルを返す。
     fn unpin_netns(&self, ns: Self::Netns) -> Result<(), UnpinFailure<Self::Netns>>;
     /// ハンドルを持たない pin をパスで外す（attach の取り残しの回収。#2681）。同じプロセスの所有記録に
-    /// 照合できない pin は `FailedPrecondition` で拒否される（`netns::unpin_path`）。
-    fn unpin_path(&self, pin: &Path) -> Result<(), NetError>;
+    /// 照合できない pin、および請求書に控えた識別子 `expected` と別の作成の pin（同じ名前に作り直された新しい
+    /// 世代）は `FailedPrecondition` で拒否される（`netns::unpin_path_expecting`）。
+    fn unpin_path(&self, pin: &Path, expected: PinIdentity) -> Result<(), NetError>;
     /// 接続時に記録した置き場 `dir` の直下に `endpoint` 名の pin が残っているか（`NotFound` だけが `Ok(false)`）。
     /// 置き場が記録と同じ実体と確認できなければ [`PinCheckError::Dir`]。何も変更しない。
     fn pin_exists(
@@ -829,16 +831,22 @@ pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
 
     // 3. netns の pin。プロセスの所有記録に照合できる pin だけを外せる。再起動後の pin は拒否されて
     //    取り残しになり、手動回収に回る（fail-closed）。
-    //    `unpin_path` は「pin の inode が本プロセスの作成物か」しか見ず、請求書の世代と対応しない。
-    //    そのため同じ endpoint を再接続した新しい pin を古い請求書で外さないよう、同じ endpoint の veth が
-    //    この請求書の世代のものと確認できる（または存在しない）ときだけ pin へ進む（fail-closed。#2681）。
+    //    解除は、請求書に控えた pin の実体の識別子（dev・ino・作成の連番）を解除の直前に所有記録と照合する
+    //    `unpin_path` で行う。同じ endpoint・置き場に作り直された新しい pin は識別子が違うため、古い請求書では
+    //    外れない（veth の不在は pin の世代の証明にならない。fail-closed。#2681）。識別子を控えていない請求書は
+    //    pin に触れない。加えて、同じ endpoint の veth がこの請求書の世代のものと確認できる（または存在しない）
+    //    ときだけ pin へ進む。
     //    veth を含む請求書は、veth を消せた（消失を確認した）ときだけ。netns のみの請求書は、veth の別名を
     //    照会して他の世代のものが居ないことを確かめる。
     if claim.includes_netns() {
         let pin = netns_dir.join(claim.endpoint().as_str());
         let res = DeleteResource::Netns(pin.clone());
         let veth_res = DeleteResource::Veth(veth_names.host().clone());
-        let proven: Result<(), NetError> = if claim.includes_veth() {
+        let proven: Result<(), NetError> = if claim.pin().is_none() {
+            Err(precondition(
+                "claim has no pin identity; netns pin left in place",
+            ))
+        } else if claim.includes_veth() {
             if report.removed.contains(&veth_res) {
                 Ok(())
             } else {
@@ -867,7 +875,10 @@ pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
                 report.leftover.push((res, ResourceState::Unknown));
                 failures.note(e, DeleteStep::UnpinNetns);
             }
-            Ok(()) => match ops.unpin_path(&pin) {
+            Ok(()) => match claim.pin().map_or_else(
+                || Err(precondition("claim has no pin identity")),
+                |id| ops.unpin_path(&pin, id),
+            ) {
                 Ok(()) => report.removed.push(res),
                 Err(e) => {
                     report.leftover.push((res, state_of(e.code())));
@@ -1033,8 +1044,8 @@ impl DeleteOps for LinuxDeleteOps<'_> {
         netns::unpin(ns)
     }
 
-    fn unpin_path(&self, pin: &Path) -> Result<(), NetError> {
-        netns::unpin_path(pin)
+    fn unpin_path(&self, pin: &Path, expected: PinIdentity) -> Result<(), NetError> {
+        netns::unpin_path_expecting(pin, expected)
     }
 
     fn pin_exists(
@@ -1196,6 +1207,8 @@ mod tests {
         unpin_fails: bool,
         /// `unpin_path` の失敗。
         unpin_path_err: Option<NetErrorCode>,
+        /// 現在の pin の識別子。`Some` で請求書のものと違えば別世代の pin とみなして拒否する。
+        pin_now: Option<PinIdentity>,
         /// pin が残っている（`Ok(true)`）とみなす endpoint 名。
         pins_present: Vec<PathBuf>,
         pin_check_err: bool,
@@ -1279,8 +1292,12 @@ mod tests {
             };
             e.map_or(Ok(()), |c| Err(err(c)))
         }
-        fn unpin_path(&self, pin: &Path) -> Result<(), NetError> {
+        fn unpin_path(&self, pin: &Path, expected: PinIdentity) -> Result<(), NetError> {
             self.rec(format!("unpin_path {}", pin.display()));
+            // 現在の pin が別世代なら、実装と同じく何も解除せず拒否する。
+            if self.pin_now.is_some_and(|now| now != expected) {
+                return Err(err(NetErrorCode::FailedPrecondition));
+            }
             match self.unpin_path_err {
                 Some(c) => Err(err(c)),
                 None => Ok(()),
@@ -2492,6 +2509,44 @@ mod tests {
             netns,
             quarantine,
         )
+    }
+
+    /// NET-1・#2681: 同じ endpoint・置き場に作り直された新しい pin（識別子が請求書と違う）は、veth が無くても
+    /// 旧い請求書では解除されず、取り残しとして保持される。
+    #[test]
+    fn net1_reclaim_attach_keeps_pin_of_a_newer_generation() {
+        let fake = Fake {
+            // veth は既に無い（旧接続の回収後）。現在の pin は新しい世代のもの。
+            absent_veths: vec![host_of("c1").as_str().to_owned()],
+            pin_now: Some(PinIdentity {
+                dev: 1,
+                ino: 2,
+                serial: 99,
+            }),
+            ..Default::default()
+        };
+        let e = reclaim_failed_attach_with(&fake, &attach_claim(false, true, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+        assert_eq!(
+            e.report.leftover,
+            vec![(DeleteResource::Netns(pin("c1")), ResourceState::Present)]
+        );
+        assert!(e.report.removed.is_empty());
+    }
+
+    /// NET-1・#2681: pin の識別子を控えていない請求書では pin に触れない。
+    #[test]
+    fn net1_reclaim_attach_without_pin_identity_leaves_pin() {
+        let fake = Fake {
+            absent_veths: vec![host_of("c1").as_str().to_owned()],
+            ..Default::default()
+        };
+        let claim = attach_claim(false, true, false).with_pin_for_test(None);
+        let e = reclaim_failed_attach_with(&fake, &claim, &netns_dir()).unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
     }
 
     /// NET-1・#2681: 別名と master が一致する veth は、照会で得た ifindex で消え、pin はパス指定で外れる。

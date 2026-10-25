@@ -1207,6 +1207,14 @@ pub struct AttachedContainer<N> {
     pub netns: N,
 }
 
+impl<N> AttachedContainer<N> {
+    /// 請求書の記録の `pin=` 行の値（この接続の pin の識別子。特定できなければ `-`）。成功した接続の請求書の
+    /// 記録を試験で組むための口で、記録を信頼する根拠にはならない（回収側が所有記録と照合する。NET-1・#2681）。
+    pub fn netns_pin_record_value(&self) -> String {
+        attach_claim::pin_record_value(&self.netns_path)
+    }
+}
+
 /// 失敗した手順。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

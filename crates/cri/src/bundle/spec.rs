@@ -34,16 +34,25 @@
 //!   （bounding / effective / permitted）へ書く（core が drop だけを解釈済みにして launch・exec へ適用する。
 //!   #2666・CRI-2・SEC-1）。名前は大文字小文字を区別せず `CAP_` 接頭辞は任意、`ALL` は全 drop、既定に無いものの
 //!   drop は no-op、未知名は `INVALID_ARGUMENT`。`add_capabilities` / `add_ambient_capabilities` は `UNIMPLEMENTED`。
-//! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（log_path・dns_config・port_mappings・cgroup_parent・sysctls・
+//! - `sandbox.linux.sysctls`（pod 単位）は、IPC 系（`kernel.shmmax` 等・`fs.mqueue.*`）だけ受け入れ、各コンテナの
+//!   `config.json` の `linux.sysctl` へ写す（core が pivot 前に `rootfs/proc/sys` へ適用する。#2670・CRI-2・CORE-3）。
+//!   pod の名前空間の共有は未実装のため、pod 単位の値を各コンテナ自身の IPC namespace へ適用する近似になる
+//!   （containerd も pod の sysctls を各コンテナへ写す）。分類は core の `sysctl::SysctlKey` を使い、規則を二重に持たない:
+//!   `net.*`（pod の netns の結線 #2675 が前提）と UTS 系（`kernel.hostname`・`kernel.domainname`）は `UNIMPLEMENTED`、
+//!   文法違反・名前空間を持たないキー（`kernel.panic`・`vm.*` 等）・不正な値は `INVALID_ARGUMENT`。
+//! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（log_path・dns_config・port_mappings・cgroup_parent・
 //!   devices・stop_signal・capabilities の add / ambient・supplemental_groups・propagation 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 
 use fandhe_container_core::capabilities::{Capability, CapabilitySet, OCI_DEFAULT_CAPABILITIES};
 use fandhe_container_core::path_masks::normalize_container_path;
+use fandhe_container_core::sysctl::{
+    SYSCTL_MAX_ENTRIES, SysctlError, SysctlKey, SysctlNamespace, SysctlValue,
+};
 
 use crate::error::CriError;
 use crate::runtime::v1::{
@@ -262,6 +271,8 @@ struct LinuxOut<'a> {
     masked_paths: Vec<&'a str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     readonly_paths: Vec<&'a str>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    sysctl: BTreeMap<&'a str, &'a str>,
 }
 
 #[derive(Serialize)]
@@ -292,6 +303,36 @@ struct CpuOut {
     period: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     quota: Option<i64>,
+}
+
+/// pod の `sysctls` を core の分類で検証する（#2670）。キー昇順に走査して、複数の不正があっても結果を決定的にする。
+/// 受理した組は予算に計上し、`config.json` の `linux.sysctl` へ写す。
+fn check_sysctls<'a>(
+    sysctls: &'a HashMap<String, String>,
+    budget: &mut Budget,
+) -> Result<BTreeMap<&'a str, &'a str>, CriError> {
+    if sysctls.len() > SYSCTL_MAX_ENTRIES {
+        return Err(invalid("linux.sysctls"));
+    }
+    let sorted: BTreeMap<&str, &str> = sysctls
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    for (key, value) in &sorted {
+        match SysctlKey::parse(key) {
+            Ok(k) if k.namespace() == SysctlNamespace::Ipc => {}
+            // net.* は pod の netns の結線（#2675）が前提で未実装。
+            Ok(_) | Err(SysctlError::Uts) => return Err(unsupported("linux.sysctls")),
+            Err(_) => return Err(invalid("linux.sysctls")),
+        }
+        SysctlValue::parse(value).map_err(|_| invalid("linux.sysctls"))?;
+        budget.spend(
+            key.len()
+                .saturating_add(value.len())
+                .saturating_add(ITEM_OVERHEAD),
+        )?;
+    }
+    Ok(sorted)
 }
 
 fn unsupported(field: &'static str) -> CriError {
@@ -779,12 +820,13 @@ fn build_inner(
     let mut budget = Budget::new();
 
     let sandbox_linux = sandbox.linux.as_ref();
+    let sysctls = match sandbox_linux {
+        Some(l) => check_sysctls(&l.sysctls, &mut budget)?,
+        None => BTreeMap::new(),
+    };
     if let Some(l) = sandbox_linux {
         if !l.cgroup_parent.is_empty() {
             return Err(unsupported("linux.cgroup_parent"));
-        }
-        if !l.sysctls.is_empty() {
-            return Err(unsupported("linux.sysctls"));
         }
         if l.overhead.is_some() || l.resources.is_some() {
             return Err(unsupported("linux.resources"));
@@ -936,6 +978,7 @@ fn build_inner(
             resources,
             masked_paths: masked,
             readonly_paths: readonly,
+            sysctl: sysctls,
         },
     };
     // 上限付き writer へ直列化し、JSON 全体の確保を上限で止める。

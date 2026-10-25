@@ -138,6 +138,7 @@ mod seccomp_listener;
 mod setns;
 mod stages;
 mod subreaper;
+mod sysctls;
 mod sysfs;
 mod tmpfs;
 mod violation;
@@ -303,6 +304,7 @@ pub use seccomp_listener::{UserNotifProbe, kcmp_self_errno_for_test, user_notif_
 pub use seccomp_listener::{
     apply_exec_seccomp_listener_for_test, hand_over_non_listener_for_test, open_socket_ids_for_test,
 };
+pub(crate) use sysctls::SysctlPlan;
 /// 試験用プローブが `SIGTERM` で終わるときの終了コード（[`exit_on_sigterm_for_test`] のハンドラが使う）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
@@ -816,6 +818,8 @@ pub enum IsolationStage {
     MountSysfs,
     /// pivot 後の作業ディレクトリへの `chdir`（`process.cwd`。fd 起点で 1 要素ずつ symlink 非追従に辿る。OCI-1・TASK-29）。
     WorkingDir,
+    /// namespaced な sysctl の適用（`linux.sysctl`。`rootfs/proc/sys` へ fd 起点で書く。CRI-2・CORE-3・SEC-1・#2670）。
+    ApplySysctls,
 }
 
 /// 実行層の構造化エラー（`code` は `traits::types::ErrorCode` を再利用）。

@@ -13,7 +13,7 @@
 | 5 | supplemental_groups（とイメージ User の補助グループ） | core の `additionalGids`（start.rs で拒否。SEC-5） → cri | core → cri | #2667 |
 | 6 | stop_signal | `StopRequest` にシグナルが無い（PLUG-1 の境界変更） → cri | core → cri | #2668 |
 | 7 | mount の propagation（rslave / rshared） | core の `bind_mounts.rs` が拒否・`linux.rootfsPropagation` | core → cri | #2669 |
-| 8 | sysctls（namespaced のみ） | core の `linux.sysctl`（UnappliedField） | core → cri | #2670 |
+| 8 | sysctls（namespaced のみ） | core の `linux.sysctl` の適用 → cri。IPC 系は本変更で実装済み。`net.*` は順 13 まで `UNIMPLEMENTED` | core → cri | #2670 |
 | 9 | log_path / log_directory | core / supervisor の CRI ログ形式の書き出し | core・supervisor → cri | #2671 |
 | 10 | cgroup_parent | core の `linux.cgroupsPath`（#2010 の方針で拒否。再判断が要る） | core → cri | #2672 |
 | 11 | devices・CDI | core の `linux.devices`（UnappliedField）・gpu の CDI 適用 | gpu・core → cri | #2673 |
@@ -95,3 +95,21 @@ CRI の `LinuxContainerSecurityContext.capabilities` のうち `drop_capabilitie
 
 - 名前の正規化（大文字化・`CAP_` 接頭辞の補完・`ALL`）は containerd に合わせた想定で、実装時に一次情報（commit 指定）との再照合は行っていない。食い違いが見つかれば厳しい側（拒否）へ倒す
 - 集合ごとに別の値を指定する細かい制御は未対応（未適用として拒否）
+
+## sysctls の受け入れ方式（CRI-2・CORE-3・SEC-1。#2670）
+
+- 分類・文法は core の `sysctl` モジュール（`SysctlKey::parse`）が唯一の定義で、cri はそれを再利用する。
+- 許可集合の出典: runc `libcontainer/configs/validate/validator.go` の `sysctl`（tag v1.3.0、commit `4ca628d1d4c974f92d24daccb901aa078aad748e`、Apache-2.0）。写したのはキー名と接頭辞だけ。`NOTICE` への追記の要否は未判断（licensing 規約に従いオーナー判断待ち）。
+- 判定:
+
+| 種別 | キー | CRI の結果 | core（config.json 直指定）の結果 |
+| ---- | ---- | ---------- | ------------------------------- |
+| IPC | `kernel.msgmax`・`msgmnb`・`msgmni`・`sem`・`shmall`・`shmmax`・`shmmni`・`shm_rmid_forced`、`fs.mqueue.*` | 受け入れ | 受け入れ。IPC namespace が要る（`--ipc=host` と併用は fork 前に `InvalidArgument`） |
+| net | `net.*` | `UNIMPLEMENTED`（pod の netns の結線 #2675 が前提） | network namespace なしは `InvalidArgument`、ありは未実装の名前空間として `Unimplemented` |
+| UTS | `kernel.hostname`・`kernel.domainname` | `UNIMPLEMENTED` | `Unimplemented` |
+| その他 | 名前空間を持たないキー、文法違反（`/` 区切り・空要素・非 ASCII 等） | `INVALID_ARGUMENT` | `InvalidArgument` |
+
+- 適用は pivot 前段 `apply_sysctls`（`verify_pinned` の直後。`readonly_paths` が `/proc/sys` を ro にする前）で、`rootfs/proc/sys` へ fd 起点・`O_NOFOLLOW`・procfs の `f_type` 照合つきで 1 回の `write` で書く。存在しないキー・不正な値は起動を止める。
+- 既知の差: runc は `/` 区切りのキーも受けるが、許可リストのすり抜けを防ぐため本実装は `.` 区切りだけ。
+- pod の名前空間共有は未実装のため、pod 単位の値を各コンテナ自身の IPC namespace へ適用する近似（#2674）。
+- rootless で IPC 系 sysctl に書けるかはカーネルの所有者づけに依存する。書けない環境では `PermissionDenied` で起動が失敗する。実機（`production_launcher` への組み込みを含む）での確認は未実施。

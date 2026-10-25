@@ -140,7 +140,7 @@ use crate::exec::{
     ChildStdio, ChildSubreaper, ConfigPaths, ContainerChild, Entrypoint, ExecError, Hostname,
     IntermediatePlan, IntermediateSpec, IsolationConfig, IsolationPrivilege, IsolationStage,
     LaunchAudit, LaunchTag, Namespace, NamespaceSet, PrePivotSetup, PreparedLaunchFailure, Rescan,
-    StageKind, StagePipeline, plan, plan_rootless_subordinate, rescan_unreported_init,
+    StageKind, StagePipeline, SysctlPlan, plan, plan_rootless_subordinate, rescan_unreported_init,
     spawn_container_via_intermediate,
 };
 #[cfg(target_os = "linux")]
@@ -842,6 +842,8 @@ struct SpawnInput<'a> {
     binds: Option<&'a BindMountSet>,
     /// 供給する `/sys` の sysfs(無ければ `None`。#2020)。
     sysfs: Option<&'a SysfsMountSpec>,
+    /// 実効の名前空間と照合済みの sysctl の適用計画(`linux.sysctl` が空なら `None`。#2670)。
+    sysctls: Option<&'a SysctlPlan<'a>>,
     /// 範囲写像で起動するときの解決済み写像(`None` なら単一 ID 写像。CORE-6・#2009)。
     subordinate: Option<&'a SubordinateIds>,
 }
@@ -1244,6 +1246,15 @@ impl Inner {
         }
         let entry = entrypoint_of(spec)?;
         let isolation = isolation_config_of(spec, options.ipc())?;
+        // `linux.sysctl` は子が実際に作る名前空間と照合してから子へ渡す(`--ipc=host` で IPC namespace を外した構成で
+        // ホストの IPC の値を書かせない。計画は照合を通らないと作れない型。CRI-2・CORE-3・SEC-1・#2670)。
+        let sysctls =
+            SysctlPlan::new(spec.config().sysctls(), isolation.namespaces).map_err(|_| {
+                TraitError::new(
+                    ErrorCode::InvalidArgument,
+                    "linux.sysctl requires a namespace the container does not have",
+                )
+            })?;
         // tmpfs と注入を fork 前に確定し、bind の宛先との重なりをここで検査する(三者の集合が揃う場所。
         // 子の `run_pre_pivot` の検査は多重防御として残す。CORE-5・SUP-12・#1654・#1915・#2625)。
         let tmpfs = options.tmpfs();
@@ -1292,6 +1303,7 @@ impl Inner {
                 inject,
                 binds,
                 sysfs: spec.sysfs_mount(),
+                sysctls: sysctls.as_ref(),
                 subordinate: self.subordinate.as_ref(),
             })
             .map_err(|failure| self.absorb_failure(id, *failure))?;
@@ -1809,6 +1821,7 @@ impl LaunchOps for RealOps {
             inject: input.inject,
             binds: input.binds,
             sysfs: input.sysfs,
+            sysctls: input.sysctls,
             pinned_rootfs: Some(input.spec.rootfs_dir().as_fd()),
             config_paths: ConfigPaths {
                 readonly: input.spec.config().readonly_paths(),
@@ -3926,6 +3939,37 @@ mod tests {
             "{:?}",
             ev.lock().unwrap()
         );
+    }
+
+    /// CRI-2・CORE-3・SEC-1(#2670): IPC 系の sysctl は、`--ipc=host`(IPC namespace を外す)と併用すると fork の前に
+    /// `InvalidArgument` で拒否する(ホストの IPC の値を書かせない)。専用の IPC namespace なら起動できる。
+    #[test]
+    fn cri2_ipc_sysctl_with_host_ipc_is_refused_before_fork() {
+        let linux = serde_json::json!({"sysctl": {"kernel.shmmax": "16384"}});
+        let spec = spec_for("sysctl-host-ipc", linux.clone());
+        let ev = events();
+        let mut l = launcher(FakeOps::new(&ev), rootless(), None);
+        l.inner.launch_options = Some(options_with(&["/run"], false, &[], LaunchIpcMode::Host));
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "linux.sysctl requires a namespace the container does not have"
+        );
+        assert!(
+            !ev.lock().unwrap().iter().any(|e| e.starts_with("spawn")),
+            "{:?}",
+            ev.lock().unwrap()
+        );
+
+        let spec = spec_for("sysctl-private-ipc", linux);
+        let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+        l.inner.launch_options = Some(options_with(&[], true, &[], LaunchIpcMode::Private));
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launched");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
     }
 
     /// SEC-1: 判定関数は範囲写像 + 注入だけを拒否し、注入なしの範囲写像・単一 ID + 注入は通す。

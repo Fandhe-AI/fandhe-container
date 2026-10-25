@@ -136,6 +136,7 @@ pub mod seccomp;
 pub mod state_store;
 #[cfg(target_os = "linux")]
 mod sys;
+pub mod sysctl;
 // macOS 向けの `sys` は別ファイル（Linux の宣言を macOS へ漏らさない。#2247・OCI-5）。
 #[cfg(target_os = "macos")]
 #[path = "sys/macos.rs"]

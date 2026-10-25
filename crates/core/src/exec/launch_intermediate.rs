@@ -560,6 +560,7 @@ pub(crate) fn spawn_container_via_intermediate(
                 stages: Some(stages),
                 stdio: Some(stdio),
                 setup: PrePivotSetup {
+                    sysctls: None,
                     status: Some(status),
                     ..setup
                 },

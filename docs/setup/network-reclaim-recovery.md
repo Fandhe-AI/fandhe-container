@@ -67,6 +67,7 @@ root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge・vet
 1. `<状態ルート>/.netns/<endpoint>` を確認する。`findmnt <パス>` で `nsfs` がマウントされているか見る
 2. 他のプロセスがその netns を使っていないことを確かめる（`lsns -t net`）
 3. `umount <パス>` でマウントを外し、空の通常ファイルになったことを確認して `rm <パス>`
-4. 該当する `attach/<endpoint>.attach` を手で消す
+4. 請求書に veth も含まれる場合は、請求書を手で消さない。pin の削除後に `NetworkPlugin::detach`（同じコンテナ）または `delete_network` を再試行して、残りの veth を自動回収させる
+5. `ip -o link show` で、その endpoint の host veth（世代が請求書と一致するもの）と pin の両方が無いことを確認してから、`attach/<endpoint>.attach` を手で消す（請求書は全対象資源の回収を確認した後にだけ消す。veth が残ったまま消すと追跡できなくなり、再 attach が `AlreadyExists` になる）
 
 root を要する操作で、ホストの他の netns を巻き込まないよう、必ずパスと endpoint を確認してから実行する。

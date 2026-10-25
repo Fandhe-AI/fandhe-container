@@ -836,8 +836,8 @@ pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
     //    外れない（veth の不在は pin の世代の証明にならない。fail-closed。#2681）。識別子を控えていない請求書は
     //    pin に触れない。加えて、同じ endpoint の veth がこの請求書の世代のものと確認できる（または存在しない）
     //    ときだけ pin へ進む。
-    //    veth を含む請求書は、veth を消せた（消失を確認した）ときだけ。netns のみの請求書は、veth の別名を
-    //    照会して他の世代のものが居ないことを確かめる。
+    //    veth を含む請求書は、veth を消せた（消失を確認した）ときだけ。netns のみの請求書は、同じ endpoint の host veth が
+    //    世代を問わず居ないときだけ（居れば請求書を消費させず未回収として拒否する）。
     if claim.includes_netns() {
         let pin = netns_dir.join(claim.endpoint().as_str());
         let res = DeleteResource::Netns(pin.clone());
@@ -858,16 +858,12 @@ pub(crate) fn reclaim_failed_attach_with<O: DeleteOps>(
             match ops.link_attachment(veth_names.host()) {
                 Err(e) if e.code() == NetErrorCode::NotFound => Ok(()),
                 Err(e) => Err(e),
-                Ok(att) => {
-                    let want = host_owner_token(token, claim.endpoint(), claim.generation());
-                    if att.alias.as_deref() == Some(want.as_str()) {
-                        Ok(())
-                    } else {
-                        Err(precondition(
-                            "endpoint has a veth of another generation; netns pin left in place",
-                        ))
-                    }
-                }
+                // 請求書が含まない host veth が居る間は pin を外さず成功も返さない。外すと請求書が消費され、
+                // veth が bridge 上に追跡外で残って再 attach が AlreadyExists になる（NET-1・REPAIR-3）。
+                // veth は請求書の対象外のため、ここでは消さず、手動回収または別の請求書に委ねる。
+                Ok(_) => Err(precondition(
+                    "endpoint still has a host veth not covered by the claim; netns pin left in place",
+                )),
             }
         };
         match proven {
@@ -2533,6 +2529,20 @@ mod tests {
             e.report.leftover,
             vec![(DeleteResource::Netns(pin("c1")), ResourceState::Present)]
         );
+        assert!(e.report.removed.is_empty());
+    }
+
+    /// NET-1・REPAIR-3・#2681: netns のみの請求書でも、同じ endpoint の host veth が（同世代でも）残っていれば
+    /// pin を外さず、成功も返さない（請求書を消費させない）。
+    #[test]
+    fn net1_reclaim_attach_netns_only_keeps_pin_while_veth_remains() {
+        let fake = Fake::default();
+        let e = reclaim_failed_attach_with(&fake, &attach_claim(false, true, false), &netns_dir())
+            .unwrap_err();
+        assert_eq!(e.step, DeleteStep::UnpinNetns);
+        assert_eq!(e.error.code(), NetErrorCode::FailedPrecondition);
+        assert!(!fake.calls().iter().any(|c| c.starts_with("unpin_path")));
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
         assert!(e.report.removed.is_empty());
     }
 

@@ -322,7 +322,27 @@ async fn timeout_keeps_a_notready_record_and_remove_tears_down() {
     assert_eq!(ids.len(), 1);
     // 期限超過では同時に tear_down を呼ばない。
     assert_eq!(net.calls(), vec![format!("set_up {}", ids[0])]);
-    remove(&svc, &ids[0]).await.unwrap();
+    // set_up がまだ走っている間は Stop・Remove を拒否し、tear_down と競合させない（資源の漏れ防止）。
+    let e = remove(&svc, &ids[0]).await.unwrap_err();
+    assert_eq!(e.code(), Code::FailedPrecondition);
+    let e = stop(&svc, &ids[0]).await.unwrap_err();
+    assert_eq!(e.code(), Code::FailedPrecondition);
+    assert_eq!(net.calls().len(), 1, "{:?}", net.calls());
+    // worker の完了後（pending 解除後）は Remove が tear_down で回収して記録を消す。
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        match remove(&svc, &ids[0]).await {
+            Ok(()) => break,
+            Err(e) => {
+                assert_eq!(e.code(), Code::FailedPrecondition);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "set_up never finished"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
     assert_eq!(net.calls()[1], format!("tear_down {}", ids[0]));
     assert!(list_ids(&svc).await.is_empty());
 }

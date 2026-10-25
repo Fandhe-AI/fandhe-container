@@ -1039,29 +1039,33 @@ impl CriRuntimeService {
         };
         let worker_provider = Arc::clone(provider);
         let worker_id = id.clone();
+        let worker_registry = Arc::clone(&self.registry);
+        // 記録の確定は worker 自身が set_up の完了直後に行う。期限超過で呼び出し側が先に結果不明として
+        // 返っても、遅れて完了した set_up が `network_pending` を解除し、作った資源を `network_owned` で
+        // 追跡させる（完了前の Stop・Remove の tear_down との競合で資源が漏れるのを防ぐ。CRI-2・NET-1）。
         let set_up = run_bounded(self.runtime_timeout, move || {
-            worker_provider.set_up(&PodNetworkRequest::new(&worker_id, &config))
+            let result = worker_provider.set_up(&PodNetworkRequest::new(&worker_id, &config));
+            let (netns, outcome) = match result {
+                Ok(netns) => (Some(netns), Ok(())),
+                Err(err) => (None, Err(err)),
+            };
+            if let Ok(mut registry) = worker_registry.lock()
+                && let Some(record) = registry.records.get_mut(&worker_id)
+            {
+                // 失敗でも資源が残りうるため、回収の印は付ける（呼び出し側が回収後に外す）。
+                record.network_owned = true;
+                record.network_pending = false;
+                record.pod_netns = netns;
+            }
+            outcome
         })
         .await
         .and_then(|r| r);
         match set_up {
-            Ok(netns) => {
-                let mut registry = self
-                    .registry
-                    .lock()
-                    .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
-                let record = registry
-                    .records
-                    .get_mut(&id)
-                    .ok_or_else(|| CriError::internal("sandbox record is unavailable"))?;
-                record.pod_netns = Some(netns);
-                record.network_owned = true;
-                record.network_pending = false;
-                Ok(resp)
-            }
+            Ok(()) => Ok(resp),
             Err(err) => {
                 // 期限超過・待ち受け側の失敗は worker がまだ走っている可能性があり、tear_down を同時に呼ばない。
-                // 結果不明として記録を残し、Stop・Remove の回収に任せる。
+                // `network_pending` を残し、worker の完了が解除するまで Stop・Remove を拒否する。
                 let unknown = matches!(
                     err.code(),
                     CriErrorCode::Timeout | CriErrorCode::Unavailable
@@ -1077,7 +1081,10 @@ impl CriRuntimeService {
                 {
                     record.state = SandboxState::NotReady;
                     record.network_owned = true;
-                    record.network_pending = false;
+                    // 結果不明のときは worker の完了まで pending を保つ。
+                    if !unknown {
+                        record.network_pending = false;
+                    }
                 }
                 Err(err)
             }

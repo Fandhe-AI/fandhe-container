@@ -27,7 +27,10 @@ use std::sync::{Arc, Mutex};
 use fandhe_container_core::traits::ContainerId;
 
 use super::resolv_conf;
-use super::spec::{BundleFiles, ImageDefaults, build_runtime_config_with_files, validate_config};
+use super::spec::{
+    BundleFiles, ImageDefaults, build_runtime_config_with_files_and_pod_namespaces,
+    validate_config_with_pod_namespaces,
+};
 use crate::adapter::{BundleProvider, BundleRequest};
 use crate::error::CriError;
 use crate::runtime::v1::ImageSpec;
@@ -301,7 +304,7 @@ impl BundleProvider for SpecBundleProvider {
         self.lock_refused().insert(req.container_id.to_owned());
         self.verify_root()?;
         // ファイルシステムに触れる前に、設定だけで判定できる拒否を済ませる。
-        validate_config(req.sandbox_config, req.config)?;
+        validate_config_with_pod_namespaces(req.sandbox_config, req.config, req.pod_namespaces)?;
         let image = req
             .config
             .image
@@ -346,8 +349,13 @@ impl BundleProvider for SpecBundleProvider {
                 }
                 None => BundleFiles::none(),
             };
-            let json =
-                build_runtime_config_with_files(req.sandbox_config, req.config, &defaults, &files)?;
+            let json = build_runtime_config_with_files_and_pod_namespaces(
+                req.sandbox_config,
+                req.config,
+                &defaults,
+                &files,
+                req.pod_namespaces,
+            )?;
             write_new_file(
                 &dir.join("config.json"),
                 json.as_bytes(),

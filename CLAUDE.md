@@ -104,7 +104,7 @@ fandhe-container/
 │   │   ├── config-id-mappings.md  # config の linux.uidMappings / gidMappings を受けるかの判断記録（#2240・SEC-5・CORE-6。オーナー承認待ち）
 │   │   ├── windows-state-store-acl.md  # Windows の FileStateStore の所有者 SID 照合・保護 DACL の実装方式（windows-sys / 自前宣言 / 恒久拒否）の判断記録（#2428・OCI-5・SEC-4。オーナー承認待ち）
 │   │   ├── oci-mounts-implicit-entries.md  # mounts[] の bind・sysfs 以外（暗黙に供給済みの /proc・/dev 系・tmpfs 等）を受けるかの判断記録（#2347・TASK-29 追補・OCI-4・SEC-1。オーナー承認待ち）
-│   │   ├── network-reclaim-persistence.md  # 作成失敗の回収待ちの記録（請求書）を plugin の再起動をまたいで残す設計（置き場所・形式・排他・書く/消す時点・起動時の読み込み。IPAM 等は #1870 の後続。#2604・NET-1・NET-6・REPAIR-3・REPAIR-4）
+│   │   ├── network-reclaim-persistence.md  # 作成失敗の回収待ちの記録（請求書）と attach の取り残しの記録を plugin の再起動をまたいで残す設計（置き場所・形式・排他・書く/消す時点・起動時の読み込み・再起動後に回収できる範囲・write-ahead を採らない判断。IPAM 等は #1870 の後続。#2604・#2681・NET-1・NET-6・REPAIR-3・REPAIR-4・REPAIR-5）
 │   │   ├── container-ref-reconcile.md  # コンテナ参照の照合とクラッシュ復旧 GC の起動点（create ゲートの共有 / 排他・契機 A / B・probe の写し方。`Present` かつ未確定の扱いはオーナー確認待ち。#2495・OCI-7・CLI-1・CORE-1）
 │   │   ├── container-log-removal-wait.md  # コンテナログ削除で sink の閉鎖を期限つきで待つ方式と、失敗のコード別内訳の観測（#2634・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
 │   │   ├── image-rootfs-lifetime.md  # イメージ由来 rootfs（core が create_with_image で作ったもの）の所有・delete での削除・失敗時の扱い（#2378・OCI-7・OCI-5）

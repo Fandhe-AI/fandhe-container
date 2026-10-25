@@ -1,6 +1,6 @@
 # 作成失敗で残った資源の観測と手動回収
 
-`create_network` の失敗で bridge・nft テーブルが残ったときの見分け方と、所有を証明できない bridge（印を刻む前の失敗）を手で回収する手順。NET-1・NET-6・REPAIR-3・REPAIR-4・#2604。設計は [network-reclaim-persistence.md](../design/network-reclaim-persistence.md)。
+`create_network` の失敗で bridge・nft テーブルが残ったときの見分け方と、所有を証明できない bridge（印を刻む前の失敗）を手で回収する手順。NET-1・NET-6・REPAIR-3・REPAIR-4・#2604・#2681。設計は [network-reclaim-persistence.md](../design/network-reclaim-persistence.md)。
 
 ## 自動で回収されるもの
 
@@ -34,3 +34,27 @@
 5. 壊れた記録の場合だけ、残っている資源を上の手順で確認・削除したうえで、記録ファイルを手で消し、plugin を再起動する（メモリ上の登録を捨てるため）
 
 root と `CAP_NET_ADMIN` を要する操作で、ホストの他の bridge を巻き込まないよう、必ず名前を確認してから実行する。
+
+## attach の取り残し（#2681）
+
+`attach` の巻き戻しで取り残した host 側 veth・netns の pin は、請求書が `<状態ルート>/.cri/net/pending-reclaim/attach/<endpoint>.attach` に残る。`NetworkPlugin::detach`（同じコンテナ）または `delete_network`（ネットワーク）を呼ぶと、別名と master の一致を確かめた veth だけが自動回収され、成功すると記録ファイルも消える。
+
+自動回収されないもの:
+
+| 状況 | 理由 | 手順 |
+| ---- | ---- | ---- |
+| plugin の再起動後の netns の pin | `netns::unpin_path` はこのプロセスが作った pin しか外さない | 下の手順 |
+| 別名の無い・別名の異なる veth、bridge に繋がっていない veth | 所有を証明できない | 手動で確認する（`ip -o link show` の `alias fandhe-net:<名前>:...` が `/ep/<endpoint>` で終わるものだけが対象） |
+| 再起動後の bridge・nft テーブル | 作成に成功したネットワークの記録が永続化されていない（#1870 の後続） | 上の「手順（別名の無い bridge）」と同じ確認で手動回収する |
+| 壊れた attach の記録 | 復号できない（ファイルは消えずに残り、同じコンテナの再 attach は `AlreadyExists` で拒否される） | 資源を確認・削除したうえで、記録ファイルを手で消して plugin を再起動する |
+
+復元したネットワークで `delete_network` が `attach leftovers were reclaimed; the network itself was not tracked across the plugin restart and needs manual reclaim` の `FailedPrecondition` を返したら、取り残しの回収は済み、ネットワーク本体（bridge・nft テーブル）は手動回収が必要という意味である。
+
+再起動後の pin の手動回収:
+
+1. `<状態ルート>/.netns/<endpoint>` を確認する。`findmnt <パス>` で `nsfs` がマウントされているか見る
+2. 他のプロセスがその netns を使っていないことを確かめる（`lsns -t net`）
+3. `umount <パス>` でマウントを外し、空の通常ファイルになったことを確認して `rm <パス>`
+4. 該当する `attach/<endpoint>.attach` を手で消す
+
+root を要する操作で、ホストの他の netns を巻き込まないよう、必ずパスと endpoint を確認してから実行する。

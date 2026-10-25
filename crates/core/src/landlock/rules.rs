@@ -556,7 +556,7 @@ pub fn build_path_rules(
 /// `ImplicitDevMounts::for_tmpfs_set` で実際に載せる tmpfs 集合から選ぶ（#1672 事後監査 P2）。どの variant でも、
 /// 暗黙分のパスが実際に期待する fs の独立したマウントであることは適用時に確かめる（`apply` の `check_implicit_mount`）。
 ///
-/// `ImplicitDevMounts::None` は rootfs にこれらのマウントが無い経路（専用の `/dev` を載せない最小入口 `spawn_container`。本番の launcher は `All` を使う）向けで、
+/// `ImplicitDevMounts::None` は rootfs にこれらのマウントが無い経路（専用の `/dev` を載せない最小入口 `spawn_container`。配線しないと #2700 で決定。本番の launcher は `All` を使う）向けで、
 /// ルールが減るだけで権利は広がらない。このとき `mounts` は上限 +3 件まで通るが、`mounts[]` の件数は
 /// config のパース時に [`CONFIG_MAX_MOUNTS`] で制限済みのため確保量は抑えられる。
 ///

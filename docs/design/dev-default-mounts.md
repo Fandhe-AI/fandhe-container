@@ -96,7 +96,7 @@ bind したマウントへの `nosuid`・`noexec` は付与しない（#1659 の
 
 ## 5. 実装 issue（2h 粒度。#54 配下）
 
-本番 launcher への配線は #1816 で済んだ（`PrePivotSetup.devices`）。最小入口 `spawn_container` はこれらを呼ばない。`--ipc=host`・`--shm-size`・`--tmpfs`・secrets の起動オプションは #2625 で本番 launcher へ結線済み（core の `oci_runtime::LaunchOptions`。`--ipc=host` は IPC namespace を作らず `/dev/shm` を載せず Landlock を `WithoutShm` にする）。CLI から supervisor への受け渡し、ホストの `/dev/shm` の bind は未実装。
+本番 launcher への配線は #1816 で済んだ（`PrePivotSetup.devices`）。最小入口 `spawn_container` はこれらを呼ばず、配線しないと #2700 で決めた（CORE-2・SEC-2・REPAIR-3。オーナー確認待ち）。理由は、製品コードの呼び出し元が無く（結合試験のみ。本番は `spawn_container_via_intermediate`）、Landlock 無しでは制限適用の証跡が作られず exec が常に拒否され `/dev` を足しても効果が無く、`DevptsGidSource` の入力で公開シグネチャが変わり、`masked_paths` も飛ばす最小構成への部分適用は実装済みを装うことになり、`/dev` が要る試験には試験専用の入口 `spawn_container_with_stages_and_devices` があるため。`--ipc=host`・`--shm-size`・`--tmpfs`・secrets の起動オプションは #2625 で本番 launcher へ結線済み（core の `oci_runtime::LaunchOptions`。`--ipc=host` は IPC namespace を作らず `/dev/shm` を載せず Landlock を `WithoutShm` にする）。CLI から supervisor への受け渡し、ホストの `/dev/shm` の bind は未実装。
 
 | 順 | issue | 旧分割案 | 内容 | 依存 | ID |
 | -- | ----- | -------- | ---- | ---- | -- |

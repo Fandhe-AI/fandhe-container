@@ -256,6 +256,99 @@ pub fn covering_mount_fstype(mountinfo: &str, path: &Path) -> Option<String> {
     fields.get(sep + 1).map(|f| (*f).to_string())
 }
 
+/// [`mount_option_by_id`] の判定結果。option の有無と、判定できない理由を区別する（将来の理由追加に備え列挙型にする）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MountOptionState {
+    /// 該当マウントの per-mount options に指定の option がある。
+    Present,
+    /// 該当マウントはあるが、指定の option は無い。
+    Absent,
+    /// 指定の mount ID の行が mountinfo に無い。
+    MountNotFound,
+    /// 該当の行が壊れている（`-` 区切りや options 欄が無い）か、同じ mount ID の行が複数ある。
+    MalformedEntry,
+}
+
+/// `/proc/self/fdinfo/<fd>` の読み込み上限（無制限確保の防止。通常は数百バイト）。
+const MAX_FDINFO_READ: u64 = 64 * 1024;
+
+/// `mountinfo`（`/proc/self/mountinfo` の生バイト列）上で、mount ID（1 番目の欄）が `mount_id` の行の
+/// per-mount options（6 番目の欄。例 `rw,nosuid,nodev`）に `option` が完全一致のトークンとして含まれるかを返す。
+/// `-` の後ろの super options は見ない（`nosuid` はマウントごとのフラグのため）。
+///
+/// cli の `doctor` のランチャー診断が、ランチャーの実体が `nosuid` マウント上にあるか（setuid と file capability が
+/// 効かないか）を調べるために呼ぶ（SUP-14・CORE-6・#2661）。`mount_id` は開いたファイルの fd から
+/// [`file_mount_id`] で得る。パスの最長一致で選ぶと、祖先への重ねマウントや `mount --move` で隠れた古い子
+/// マウントの行を選んでしまい、行の順序も重ねた順と一致しないため、実体の mount ID で行を引く。
+/// マウントポイント等のパス欄は比べないため、非 UTF-8 の名前があっても置換せずにそのまま扱える。
+/// 該当の行が無い・壊れている・同じ ID の行が複数ある場合は理由つきの判定不能（`Present` / `Absent` 以外）で返す。
+/// 呼び出し側は fail-closed に扱う。OS 呼び出しを含まない純粋関数。
+pub fn mount_option_by_id(mountinfo: &[u8], mount_id: u64, option: &str) -> MountOptionState {
+    let mut found: Option<Vec<&[u8]>> = None;
+    for line in mountinfo.split(|b| *b == b'\n') {
+        let fields: Vec<&[u8]> = line
+            .split(|b| *b == b' ' || *b == b'\t')
+            .filter(|f| !f.is_empty())
+            .collect();
+        let id = fields
+            .first()
+            .and_then(|f| std::str::from_utf8(f).ok())
+            .and_then(|f| f.parse::<u64>().ok());
+        if id != Some(mount_id) {
+            continue;
+        }
+        if found.is_some() {
+            return MountOptionState::MalformedEntry;
+        }
+        found = Some(fields);
+    }
+    let Some(fields) = found else {
+        return MountOptionState::MountNotFound;
+    };
+    // 6 番目の欄（per-mount options）より後に `-` 区切りがある行だけを正しい行とみなす。
+    if !fields.iter().skip(6).any(|f| *f == b"-") {
+        return MountOptionState::MalformedEntry;
+    }
+    let Some(opts) = fields.get(5) else {
+        return MountOptionState::MalformedEntry;
+    };
+    if opts.split(|b| *b == b',').any(|t| t == option.as_bytes()) {
+        MountOptionState::Present
+    } else {
+        MountOptionState::Absent
+    }
+}
+
+/// 開いたファイルが属するマウントの ID（mountinfo の 1 番目の欄と同じ値）を `/proc/self/fdinfo/<fd>` の
+/// `mnt_id:` 行から読む（Linux 3.15 以降）。読めない・上限超過・行が無い・数値でない場合はエラー。
+///
+/// cli の `doctor` が [`mount_option_by_id`] に渡す ID を得るために呼ぶ（SUP-14・#2661）。
+pub fn file_mount_id(file: &File) -> io::Result<u64> {
+    use std::io::Read as _;
+    let mut buf = Vec::new();
+    File::open(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?
+        .take(MAX_FDINFO_READ + 1)
+        .read_to_end(&mut buf)?;
+    if u64::try_from(buf.len()).map_or(true, |n| n > MAX_FDINFO_READ) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fdinfo is too large",
+        ));
+    }
+    parse_fdinfo_mnt_id(&buf)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "mount id is missing in fdinfo"))
+}
+
+/// `/proc/self/fdinfo/<fd>` の本文から `mnt_id:` 行の値を取り出す（OS 呼び出しを含まない純粋関数）。
+/// 行が無い・数値でない場合は `None`。`pos:`・`flags:` 等の他の行は無視する。
+fn parse_fdinfo_mnt_id(text: &[u8]) -> Option<u64> {
+    text.split(|b| *b == b'\n')
+        .find_map(|l| l.strip_prefix(b"mnt_id:"))
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .and_then(|v| v.trim().parse().ok())
+}
+
 /// `mountinfo` の内容から `dir`（正規化済みの絶対パス）を含むマウントを探し、その伝播が `shared` なら
 /// 拒否する（OS 呼び出しを含まない純粋関数。単体テスト用に分離）。最長一致のマウントポイントを採り、
 /// 同長なら後の行（重ねマウントの最上位）を採る。見つからなければ拒否する（fail-closed）。
@@ -1190,6 +1283,76 @@ mod tests {
         // `-` 区切りの無い壊れた行は種別を返さない。
         assert_eq!(fs("/broken/a"), None);
         assert_eq!(covering_mount_fstype("", Path::new("/proc/sys/net")), None);
+    }
+
+    /// SUP-14・#2661: mount ID で行を引き、per-mount options のトークン完全一致で判定する（super options は
+    /// 見ない・行順や重ねマウントに依らない・非 UTF-8 のパス欄も置換せずに扱う）。
+    #[test]
+    fn sup14_mount_option_by_id() {
+        let info: &[u8] = b"\
+22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw,nosuid
+27 22 0:24 / /opt rw,nosuid,relatime - tmpfs tmpfs rw
+26 22 0:23 / /opt/fc rw,relatime - tmpfs tmpfs rw
+30 22 0:27 / /sp\\040ace rw,nosuid - tmpfs tmpfs rw
+31 22 0:28 / /part rw,nosuidx - tmpfs tmpfs rw
+32 22 0:29 / /broken rw,nosuid
+33 22 0:30 / /\xff\xfe rw,nosuid,nodev - tmpfs tmpfs rw
+34 22 0:31 / /x rw - tmpfs tmpfs rw
+34 22 0:32 / /y rw,nosuid - tmpfs tmpfs rw
+";
+        let has = |id: u64| mount_option_by_id(info, id, "nosuid");
+        // `/` の super options にだけ nosuid がある場合は Absent。
+        assert_eq!(has(22), MountOptionState::Absent);
+        assert_eq!(has(27), MountOptionState::Present);
+        // 行順・パスの包含関係に関わらず ID の行を見る（隠れた古い /opt/fc の行でも ID で引けばその行）。
+        assert_eq!(has(26), MountOptionState::Absent);
+        assert_eq!(has(30), MountOptionState::Present);
+        assert_eq!(has(31), MountOptionState::Absent);
+        assert_eq!(has(32), MountOptionState::MalformedEntry);
+        assert_eq!(has(33), MountOptionState::Present);
+        // 同じ ID の行が複数あれば判定不能（fail-closed）。
+        assert_eq!(has(34), MountOptionState::MalformedEntry);
+        assert_eq!(has(99), MountOptionState::MountNotFound);
+        assert_eq!(
+            mount_option_by_id(b"", 22, "nosuid"),
+            MountOptionState::MountNotFound
+        );
+        // 非 UTF-8 の行が別にあっても他の行の判定に影響しない。
+        assert_eq!(
+            mount_option_by_id(
+                b"9 1 0:1 / /\xff rw - tmpfs t rw\n10 1 0:2 / /a rw,nosuid - tmpfs t rw\n",
+                10,
+                "nosuid"
+            ),
+            MountOptionState::Present
+        );
+    }
+
+    /// SUP-14・#2661: fdinfo の `mnt_id:` 行の取り出し。
+    #[test]
+    fn sup14_parse_fdinfo_mnt_id() {
+        assert_eq!(
+            parse_fdinfo_mnt_id(b"pos:\t0\nflags:\t02100000\nmnt_id:\t27\nino:\t5\n"),
+            Some(27)
+        );
+        assert_eq!(parse_fdinfo_mnt_id(b"pos:\t0\nflags:\t0\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:\tx\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(b""), None);
+    }
+
+    /// SUP-14・#2661: 実ファイルの fd から得た mount ID が、`/proc/self/mountinfo` に 1 行だけある。
+    #[test]
+    fn sup14_file_mount_id_is_listed_in_mountinfo() {
+        let file = File::open("/proc/self/exe").expect("open exe");
+        let id = file_mount_id(&file).expect("mount id");
+        let info = fs::read("/proc/self/mountinfo").expect("mountinfo");
+        assert!(
+            matches!(
+                mount_option_by_id(&info, id, "nosuid"),
+                MountOptionState::Present | MountOptionState::Absent
+            ),
+            "mount id {id} not resolvable"
+        );
     }
 
     /// 8 進エスケープの復号。

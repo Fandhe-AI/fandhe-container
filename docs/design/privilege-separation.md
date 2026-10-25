@@ -170,8 +170,8 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 - 一時ファイルで検証を済ませてから rename で置換するため、途中失敗で半端な属性を残さない。CLI・supervisor・launcher の順に置換し、途中で止まったら supervisor、CLI の順に旧ファイル（ハードリンクの退避）へ戻す。launcher は最後に置換するので退避を取らない。
 - 同じ配置先への並行インストールは、配置先ごとのロックファイル `<dest-dir>/.install.lock`（root 所有・0600。消さずに残す）への `flock(1)` で排他する。既存ファイルの確認から置換・復元・最後の読み戻しまでを 1 つのインストールだけが行い、並行する実行が CLI・launcher・supervisor を別々の版にしたり、他方の更新を旧版へ戻したりしない。ロックは待たずに取り、取れなければ `error: install-locked`（終了コード 3）で何も変えずに止まる。ロックはプロセスの終了で解放される。0600 にするのは、読めるだけの利用者でも `flock` を取れてインストールを止められるため（他の利用者から読めるロックファイルは信頼できない配置先として拒否する）。
 - 配置先・入力元に触る外部コマンド（`stat`・`mkdir`・`flock`・`mktemp`・`dd`・`sha256sum`・`chown`・`chmod`・`setcap`・`getcap`・`ln`・`mv`・`rm`）はすべて `timeout(1)` の期限つき（30 秒・超過後 5 秒で KILL）で実行し、親シェルはファイル検査も配置先へのリダイレクトも行わない（REPAIR-5。NFS / FUSE の停止で無期限に待たない。親シェルが開くのは入力元とロックファイルだけで、どちらも watchdog が同じ期限で打ち切る）。期限超過は `error: operation-timeout`（終了コード 1）。期限を超えた操作は実行されたか不明として扱い、置換の有無を inode の読み戻しで確かめてから戻す。結果は stderr の 2 行目以降に `warning: rolled-back`（旧 supervisor・旧 CLI へ戻した・置換済みのファイルは無い）・`error: restore-failed`（戻せなかった。退避ファイルを残し復元コマンドを示す）・`error: state-indeterminate`（launcher の置換を確かめられなかった。2 つの退避ファイルを残す）・`warning: replaced-unverified`（3 つとも置換済みで最後の読み戻しが未完）・`warning: cleanup-incomplete`（一時ファイル・退避ファイルを消せなかっただけ。置換の成否には影響せず、成功時は終了コード 0 のまま）で示す。SIGKILL でも終わらない子（割り込めない I/O 待ち）は `timeout(1)` が回収を待つため、期限では打ち切れない。
-- `doctor` の診断（#2599）: `fandhe-container doctor` が、`start` と同じ関数（`start_client::classify_launcher_beside`）でランチャーの信頼条件を、`launcher_probe` で file capability（`security.capability` を `lgetxattr` で読む）と setuid root の代替を読み取り専用で診断し、`check:"launcher"` の JSON Lines で出す。hash / 署名の照合・`nosuid`・LSM は扱わず、診断と実行の間の差し替えも防げない（昇格の可否は実行時にランチャーが検証する）。
-- 既知の範囲外: 入力元の署名の検証は未実装（ハッシュの照合は上記のとおり実装済み。12 章）。nosuid マウント上の配置先では file capability / setuid が効かず、ランチャーが実行時に fail-closed で拒否する。
+- `doctor` の診断（#2599）: `fandhe-container doctor` が、`start` と同じ関数（`start_client::classify_launcher_beside`）でランチャーの信頼条件を、`launcher_probe` で file capability（`security.capability` を `lgetxattr` で読む）と setuid root の代替を読み取り専用で診断し、`check:"launcher"` の JSON Lines で出す。ランチャーの実体が `nosuid` マウント上にあるかも、実体を開いた fd の mount ID（`/proc/self/fdinfo/<fd>` の `mnt_id`）で `/proc/self/mountinfo` の行を引き、その per-mount options（上限つきで読む）で検出し（パスの最長一致は重ねマウント・`mount --move` で隠れた行を選びうるため使わない）、`nosuid` なら `state:"nosuid_mount"`（警告）、読めない・該当マウントが無いときは `state:"mount_unreadable"`（判定不能）にする（#2661）。根拠はカーネル v6.12 の `fs/exec.c` と `security/commoncap.c` が `mnt_may_suid()` が偽なら setuid / file capability を無視すること。doctor 自身の mount namespace から見た情報なので、`start` が systemd-run 経由で起動する環境の mount namespace や、superblock の所有 user namespace による `mnt_may_suid` の偽は検出しない。hash / 署名の照合・LSM は扱わず、診断と実行の間の差し替えも防げない（昇格の可否は実行時にランチャーが検証する）。
+- 既知の範囲外: 入力元の署名の検証は未実装（ハッシュの照合は上記のとおり実装済み。12 章）。nosuid マウント上の配置先では file capability / setuid が効かず、ランチャーが実行時に fail-closed で拒否する（`doctor` は上記のとおり事前に警告する）。
 
 ## 11. 参照
 
@@ -182,14 +182,14 @@ TASK-171 の成果物は `crates/supervisor/src/privilege.rs`（仮称）だが�
 
 | 項目 | 状態 |
 | ---- | ---- |
-| `prctl(2)`・`execve(2)`・`setsid(2)`・`mount(8)` の `nosuid`・sudoers `use_pty` の原文照合 | 未確認 |
+| `prctl(2)`・`execve(2)`・`setsid(2)`・`mount(8)` の `nosuid`・sudoers `use_pty` の原文照合 | 未確認（`nosuid` のうち、カーネル v6.12 の `fs/exec.c` と `security/commoncap.c` が `mnt_may_suid()` が偽なら setuid / file capability を無視する点と、`security.capability` の `VFS_CAP_*` / `XATTR_CAPS_SZ_*` の値は `capability.h` の原文で確認済み。#2661） |
 | `CAP_SYS_CHROOT`・UTS namespace・cgroup 書き込み権限の要否 | 未確認（4 章の「想定」） |
 | セッションリーダーが `O_NOCTTY` を付けずに tty を `open` すると制御端末を再取得しうる | 契約として明記（#2426。`launcher.rs` の module doc と 5 章 1 項。env ファイル・ログ等の外部指定パスを開くヘルパーは `O_NOCTTY` を付ける）。カーネル挙動の原文照合と実機での確認は #539 |
 | `sudo`（`use_pty`）経由で起動すると標準入出力が pty になりランチャーが拒否する | 設計どおり（「sudo へ戻らない」の帰結。回避手段は設けない） |
 | file capabilities 付きバイナリの AppArmor 等の LSM 下の挙動 | 未確認 |
 | macOS・Windows（VM 内）で本方式が不要であること | 要確認（MAC・WIN 系ビヘイビア） |
 | rootless（CORE-6）経路との関係 | PoC 未検証 |
-| ランチャーの実行時の supervisor の hash / 署名照合の要否（PLUG-11 との整合） | 未確認（#1719 は所有権と書き込み権限のみで信頼を判断）。`doctor` のランチャー診断（#2599）も hash / 署名は照合しない |
+| ランチャーの実行時の supervisor の hash / 署名照合の要否（PLUG-11 との整合） | 未確認（#1719 は所有権と書き込み権限のみで信頼を判断）。`doctor` のランチャー診断（#2599）も hash / 署名は照合しない。オーナー判断待ちで、判断の記録先は本行。追跡は #2661（受け入れ条件 3）と #2231（PLUG-11 の判断） |
 | インストール時の入力元のハッシュ照合 | 決定・実装済み（#2137。許可済み sha256 を引数で渡し、複製した一時ファイルを照合する。10 章） |
 | インストール時の署名検証 | 未採用（PLUG-11 の opt-in の将来拡張。差し込む位置は 10 章） |
 | `CAP_AUDIT_READ`（`AUDIT_SECCOMP` の READLOG 購読） | 最小集合に含めない。付与の可否は判断待ち（`audit-seccomp-reader.md`。#2237） |

@@ -2798,10 +2798,14 @@ fn oci7_create_with_tag_ref_resolves_persisted_tag_on_linux() {
     assert_eq!(refs.containers.len(), 1);
     assert!(refs.containers[0].as_str().ends_with(".c1"));
 }
-/// 隣に置いた偽ランチャーで `doctor` を実行し、`check":"launcher"` の行と終了コードを返す。
+/// 隣に置いた偽ランチャーで `doctor` を実行し、`check":"launcher"` の行・終了コード・配置先ディレクトリ
+/// （正規化済み。マウント属性から期待値を選ぶ試験が使う）を返す。
 /// 一意のディレクトリ名（タグ）が出力に載らないことも照合する（REPAIR-4）。root では検査を省くため `None`。
 #[cfg(target_os = "linux")]
-fn doctor_launcher_line(tag: &str, launcher_mode: Option<&str>) -> Option<(Option<String>, i32)> {
+fn doctor_launcher_line(
+    tag: &str,
+    launcher_mode: Option<&str>,
+) -> Option<(Option<String>, i32, std::path::PathBuf)> {
     use std::os::unix::fs::PermissionsExt;
     if is_root() {
         return None;
@@ -2825,14 +2829,15 @@ fn doctor_launcher_line(tag: &str, launcher_mode: Option<&str>) -> Option<(Optio
         .lines()
         .find(|l| l.contains("\"check\":\"launcher\""))
         .map(str::to_owned);
-    Some((line, out.status.code().expect("code")))
+    let real = dir.canonicalize().expect("canonicalize");
+    Some((line, out.status.code().expect("code"), real))
 }
 
 /// SUP-14・CORE-6・CLI-1（#2599）: 隣にランチャーが無い rootless のインストールは通知の 1 行。
 #[cfg(target_os = "linux")]
 #[test]
 fn sup14_doctor_reports_absent_launcher() {
-    let Some((line, _)) = doctor_launcher_line("doctor-launcher-absent", None) else {
+    let Some((line, _, _)) = doctor_launcher_line("doctor-launcher-absent", None) else {
         return;
     };
     assert_eq!(
@@ -2845,7 +2850,8 @@ fn sup14_doctor_reports_absent_launcher() {
 #[cfg(target_os = "linux")]
 #[test]
 fn sup14_doctor_reports_untrusted_launcher() {
-    let Some((line, code)) = doctor_launcher_line("doctor-launcher-untrusted", Some("775")) else {
+    let Some((line, code, _)) = doctor_launcher_line("doctor-launcher-untrusted", Some("775"))
+    else {
         return;
     };
     let line = line.expect("launcher line");
@@ -2862,24 +2868,111 @@ fn sup14_doctor_reports_untrusted_launcher() {
     assert_eq!(code, 3);
 }
 
-/// SUP-14・CORE-6・CLI-1（#2599）: 信頼できるが file capability も setuid root も無いランチャーは warning・終了コード 3
+/// SUP-14・CORE-6・CLI-1（#2599・#2661）: 信頼できるが file capability も setuid root も無いランチャーは warning・終了コード 3
 /// （非 root では file capability を付けられないため、昇格手段なしの経路を実ファイルで照合する）。
+/// 配置先が `nosuid` のマウント上なら、昇格手段の判定より先に効かない理由として `nosuid_mount` になる（#2661）。
+/// 期待する message と state は、配置先のマウント属性を試験側で独立に求めて選ぶ（`test_side_is_nosuid`）。
 #[cfg(target_os = "linux")]
 #[test]
 fn sup14_doctor_reports_launcher_without_elevation() {
-    let Some((line, code)) = doctor_launcher_line("doctor-launcher-noelev", Some("755")) else {
+    let Some((line, code, real)) = doctor_launcher_line("doctor-launcher-noelev", Some("755"))
+    else {
         return;
     };
     let line = line.expect("launcher line");
+    let (message, state) = if test_side_is_nosuid(&real) {
+        (
+            "the privileged launcher is on a filesystem mounted nosuid; setuid and file capabilities have no effect there and start cannot elevate",
+            "nosuid_mount",
+        )
+    } else {
+        (
+            "the privileged launcher has neither file capabilities nor the setuid root bit; start cannot elevate",
+            "no_file_capabilities",
+        )
+    };
     assert!(
-        line.starts_with(
-            "{\"severity\":\"warning\",\"code\":\"LAUNCHER_ELEVATION_UNAVAILABLE\",\"message\":\"the privileged launcher has neither file capabilities nor the setuid root bit; start cannot elevate\","
-        ),
-        "{line}"
+        line.starts_with(&format!(
+            "{{\"severity\":\"warning\",\"code\":\"LAUNCHER_ELEVATION_UNAVAILABLE\",\"message\":\"{message}\","
+        )),
+        "expected {state}: {line}"
     );
     assert!(
-        line.ends_with("\"check\":\"launcher\",\"state\":\"no_file_capabilities\"}"),
-        "{line}"
+        line.ends_with(&format!("\"check\":\"launcher\",\"state\":\"{state}\"}}")),
+        "expected {state}: {line}"
     );
     assert_eq!(code, 3);
+}
+
+/// `/proc/self/mountinfo` を試験側で独立に解析し、`path` を含む最長一致のマウント（同長は後の行）が
+/// `nosuid` かを返す。製品側（実体の fd の mount ID で mountinfo の行を引く `mount_option_by_id`）と別の方法で
+/// 期待値を決める。ここはパスの最長一致で選ぶため、試験の一時ディレクトリの祖先に後から重ねたマウント
+/// （古い子マウントを隠すもの）が無い前提で両者は一致する（ID で引くこと自体は net の単体試験
+/// `sup14_mount_option_by_id` が照合する）。
+#[cfg(target_os = "linux")]
+fn test_side_is_nosuid(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let info = std::fs::read("/proc/self/mountinfo").expect("mountinfo");
+    let target = path.as_os_str().as_bytes();
+    let mut best: Option<(usize, bool)> = None;
+    for line in info.split(|b| *b == b'\n') {
+        let f: Vec<&[u8]> = line
+            .split(|b| *b == b' ')
+            .filter(|x| !x.is_empty())
+            .collect();
+        let (Some(mp), Some(opts)) = (f.get(4), f.get(5)) else {
+            continue;
+        };
+        // 8 進エスケープは空白（\040）だけ戻せば試験の一時パスには足りる。
+        let mp: Vec<u8> = String::from_utf8_lossy(mp)
+            .replace("\\040", " ")
+            .into_bytes();
+        let covers = target == mp.as_slice()
+            || mp == b"/"
+            || (target.starts_with(&mp) && target.get(mp.len()) == Some(&b'/'));
+        if covers && best.is_none_or(|(l, _)| mp.len() >= l) {
+            best = Some((mp.len(), opts.split(|b| *b == b',').any(|t| t == b"nosuid")));
+        }
+    }
+    best.expect("covering mount").1
+}
+
+/// SUP-14・CORE-6（#2661）: 実バイナリの `doctor` が、兄弟のランチャー（file capability も setuid も持たない
+/// 信頼できる実行ファイル）の載るマウントの `nosuid` 属性を診断に反映する。`collect` の実体パス解決・実体の fd の
+/// mount ID の取得・mountinfo 読み取り・評価・JSON 出力・終了コードをつなぐ経路を観測する。期待値は試験側で独立に求める。nosuid ならば `nosuid_mount`、
+/// そうでなければ `no_file_capabilities`（どちらも warning・終了コード 3）。mountinfo を読めない場合の
+/// `mount_unreadable` は、実バイナリから /proc を差し替えられないため `launcher_check` の単体試験で照合する。
+/// nosuid マウントの人工的な構築（root・mount 権限が要る）はこの試験では行わない。
+#[cfg(target_os = "linux")]
+#[test]
+fn sup14_doctor_reports_launcher_mount_state() {
+    if is_root() {
+        return; // root では検査を省く（`doctor_reports_unset_xdg_runtime_dir` が通知を照合する）。
+    }
+    let dir = isolated_cli_dir("doctor-mount");
+    install_fake_exe(&dir, "fandhe-container-launcher", "#!/bin/sh\nexit 0\n");
+    let real = dir.canonicalize().expect("canonicalize");
+    let expect_nosuid = test_side_is_nosuid(&real);
+    let out = run_isolated(&dir.join("fandhe-container"), &["doctor"]);
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(out.stderr.is_empty(), "{:?}", out.stderr);
+    let line = stdout
+        .lines()
+        .find(|l| l.contains("\"check\":\"launcher\""))
+        .unwrap_or_else(|| panic!("no launcher line: {stdout}"));
+    assert!(
+        line.starts_with("{\"severity\":\"warning\",\"code\":\"LAUNCHER_ELEVATION_UNAVAILABLE\""),
+        "{line}"
+    );
+    let state = if expect_nosuid {
+        "nosuid_mount"
+    } else {
+        "no_file_capabilities"
+    };
+    assert!(
+        line.ends_with(&format!("\"check\":\"launcher\",\"state\":\"{state}\"}}")),
+        "expected {state}: {line}"
+    );
+    assert_eq!(out.status.code(), Some(3), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

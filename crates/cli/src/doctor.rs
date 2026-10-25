@@ -25,7 +25,7 @@
 //!
 //! rootful のインストールで `start` が選ぶ特権ランチャー（CLI の実体の隣の固定名）の信頼条件と、昇格手段
 //! （file capability、xattr 非対応なら setuid root）を、`start` と同じ判定関数で読み取り専用に診断する
-//! （`launcher_check`。SUP-14・CORE-6）。hash / 署名の照合は扱わない（`privilege-separation.md` 12 章の未確認事項）。
+//! （`launcher_check`。SUP-14・CORE-6）。実体が `nosuid` マウント上にあるかも、実体の fd の mount ID と `/proc/self/mountinfo` で調べる（#2661）。hash / 署名の照合は扱わない（`privilege-separation.md` 12 章の未確認事項）。
 //! 終了ステータスは 4 つの結果の合成。
 //!
 //! # 確認方法
@@ -236,6 +236,11 @@ fn mount_fstype(_mountinfo: &str, _path: &Path) -> Option<String> {
 /// 上限を超えるファイルは途中で切れた内容を返さず `InvalidData` で失敗させる（切れた内容から
 /// 「行が無い」と誤断定しない fail-closed。呼び出し側は判定不能として扱う）。
 fn read_limited(path: &Path, limit: u64) -> std::io::Result<String> {
+    Ok(String::from_utf8_lossy(&read_limited_bytes(path, limit)?).into_owned())
+}
+
+/// [`read_limited`] のバイト列版。不正な UTF-8 を置換せずそのまま返す（生バイトで比較する呼び出し側用）。
+fn read_limited_bytes(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     // 上限 + 1 バイトまで読み、超過分が読めたら EOF に達していない（読み切れていない）と判定する。
     File::open(path)?
@@ -247,7 +252,7 @@ fn read_limited(path: &Path, limit: u64) -> std::io::Result<String> {
             "file exceeds read limit",
         ));
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(buf)
 }
 
 /// ホストの `ip filter FORWARD` チェイン policy の取得結果。

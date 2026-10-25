@@ -2203,7 +2203,8 @@ trait PrePivotOps {
     type Pivoted;
     /// `mount_sysfs` の成功の証跡。`masked_paths` 段へ渡し、sysfs を供給したときだけ `/sys` 配下を覆う（#2014）。
     type Sysfs;
-    fn establish(&self) -> Result<Self::Isolation, ExecError>;
+    /// `binds` に `rslave` があれば、`/` の private 化の前にその元を複製する（#2669）。
+    fn establish(&self, binds: Option<&BindMountSet>) -> Result<Self::Isolation, ExecError>;
     fn prepare_rootfs(
         &self,
         isolation: &Self::Isolation,
@@ -2336,8 +2337,8 @@ impl PrePivotOps for RealPrePivotOps {
     type Pivoted = PivotReport;
     type Sysfs = SysfsReport;
 
-    fn establish(&self) -> Result<MountIsolation, ExecError> {
-        MountIsolation::establish()
+    fn establish(&self, binds: Option<&BindMountSet>) -> Result<MountIsolation, ExecError> {
+        MountIsolation::establish_with(binds)
     }
 
     fn prepare_rootfs(
@@ -2578,7 +2579,9 @@ fn run_pre_pivot<O: PrePivotOps>(
     setup: Option<PrePivotSetup<'_>>,
 ) -> Result<(O::Isolation, O::Pivoted), Box<StepError>> {
     use PrePivotStep as S;
-    let isolation = ops.establish().map_err(StepError::at(S::Establish))?;
+    let isolation = ops
+        .establish(setup.as_ref().and_then(|s| s.binds))
+        .map_err(StepError::at(S::Establish))?;
     let prepared = ops
         .prepare_rootfs(&isolation, rootfs)
         .map_err(StepError::at(S::PrepareRootfs))?;
@@ -5854,7 +5857,7 @@ mod tests {
         type Devices = ();
         type Pivoted = ();
         type Sysfs = ();
-        fn establish(&self) -> Result<(), ExecError> {
+        fn establish(&self, _: Option<&BindMountSet>) -> Result<(), ExecError> {
             self.step("establish")
         }
         fn prepare_rootfs(&self, _: &(), _: &Path) -> Result<(), ExecError> {

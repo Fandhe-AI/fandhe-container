@@ -151,21 +151,6 @@ impl PrePivotStep {
     }
 }
 
-/// `ErrorCode` の全 variant（`as_str` の逆引き用。`ErrorCode` に `from_str` が無いため）。
-/// 足し忘れは `error_code_ordinal` を使う単体テストが検出する。
-pub(super) const ALL_ERROR_CODES: [ErrorCode; 10] = [
-    ErrorCode::InvalidArgument,
-    ErrorCode::NotFound,
-    ErrorCode::AlreadyExists,
-    ErrorCode::FailedPrecondition,
-    ErrorCode::Unimplemented,
-    ErrorCode::Internal,
-    ErrorCode::PermissionDenied,
-    ErrorCode::Timeout,
-    ErrorCode::Unavailable,
-    ErrorCode::ResourceExhausted,
-];
-
 /// 段つきの許可リスト照合（子の符号化と親の復号で共有する唯一の規則。#2072）。
 ///
 /// `ViolationReason::from_launch_token` が通す理由に加え、段 `MountBinds` に限って user namespace 由来の 2 理由
@@ -289,10 +274,7 @@ impl PrePivotStatus {
             ["P"] => Ok(Self::Ready),
             ["F", step, code, reason] => {
                 let step = PrePivotStep::from_token(step).ok_or(PrePivotStatusError::Malformed)?;
-                let code = ALL_ERROR_CODES
-                    .into_iter()
-                    .find(|c| c.as_str() == *code)
-                    .ok_or(PrePivotStatusError::Malformed)?;
+                let code = ErrorCode::from_name(code).ok_or(PrePivotStatusError::Malformed)?;
                 let violation = if *reason == "-" {
                     None
                 } else {
@@ -499,10 +481,7 @@ impl ExecPhaseStatus {
         match parts.as_slice() {
             ["R"] => Ok(Self::Ready),
             ["E", code, reason] => {
-                let code = ALL_ERROR_CODES
-                    .into_iter()
-                    .find(|c| c.as_str() == *code)
-                    .ok_or(PrePivotStatusError::Malformed)?;
+                let code = ErrorCode::from_name(code).ok_or(PrePivotStatusError::Malformed)?;
                 let violation = if *reason == "-" {
                     None
                 } else {
@@ -692,22 +671,6 @@ pub(super) fn resolve_pre_pivot_status(
 }
 
 #[cfg(test)]
-fn error_code_ordinal(code: ErrorCode) -> usize {
-    match code {
-        ErrorCode::InvalidArgument => 0,
-        ErrorCode::NotFound => 1,
-        ErrorCode::AlreadyExists => 2,
-        ErrorCode::FailedPrecondition => 3,
-        ErrorCode::Unimplemented => 4,
-        ErrorCode::Internal => 5,
-        ErrorCode::PermissionDenied => 6,
-        ErrorCode::Timeout => 7,
-        ErrorCode::Unavailable => 8,
-        ErrorCode::ResourceExhausted => 9,
-    }
-}
-
-#[cfg(test)]
 fn step_ordinal(step: PrePivotStep) -> usize {
     match step {
         PrePivotStep::Establish => 0,
@@ -777,13 +740,9 @@ mod tests {
         std::fs::File::from(std::os::fd::OwnedFd::from(r))
     }
 
-    /// `ErrorCode`・段の一覧は全 variant を網羅する（足し忘れの検出。REPAIR-2）。
+    /// 段の一覧は全 variant を網羅する（`ErrorCode` は types.rs の試験）（足し忘れの検出。REPAIR-2）。
     #[test]
     fn sec4_1815_tables_cover_every_variant() {
-        for (i, c) in ALL_ERROR_CODES.into_iter().enumerate() {
-            assert_eq!(error_code_ordinal(c), i);
-        }
-        assert_eq!(ALL_ERROR_CODES.len(), 10);
         for (i, s) in PrePivotStep::ALL.into_iter().enumerate() {
             assert_eq!(step_ordinal(s), i);
         }
@@ -821,7 +780,7 @@ mod tests {
     fn sec4_1815_roundtrip_every_step_code_and_reason() {
         let mut longest = 0;
         for step in PrePivotStep::ALL {
-            for code in ALL_ERROR_CODES {
+            for code in ErrorCode::ALL {
                 let mut reasons: Vec<Option<ViolationReason>> = vec![None];
                 reasons.extend(
                     ViolationReason::ALL

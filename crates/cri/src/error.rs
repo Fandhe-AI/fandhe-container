@@ -349,6 +349,10 @@ mod tests {
             (ErrorCode::ResourceExhausted, Code::ResourceExhausted),
             (ErrorCode::Internal, Code::Internal),
         ];
+        assert_eq!(cases.len(), ErrorCode::ALL.len());
+        for c in ErrorCode::ALL {
+            assert!(cases.iter().any(|(k, _)| *k == c), "{}", c.as_str());
+        }
         for (ec, expected) in cases {
             let te = TraitError::new(ec, "msg");
             let st = Status::from(CriError::from(&te));

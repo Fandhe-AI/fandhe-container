@@ -61,6 +61,13 @@
 //!   当コンテナの `layer=exit_signal` の行がちょうど 1 行で、`signal` 31・`target_pid` = コンテナの PID・`syscall`/`arch` は null、
 //!   再度の `wait` / `terminate` の後も 1 行のままであることを照合する。成功行の前に
 //!   `production_launcher: exit_signal recorded once via audit relay (scenario=Q)` を出す
+//! - シナリオ U（`rslave` の bind。#2669・OCI-4・CRI-2・SEC-1）: 元（一時ディレクトリ）が属するホスト側のマウントの伝播を
+//!   `/proc/self/mountinfo` で先に読む。`shared:` か `master:` があれば `options: ["rbind", "rslave"]` の start が成功し、コンテナ内の
+//!   mountinfo で bind 先に `master:` があり `shared:` が無いことを照合する（`private` の bind は `master:` が無いシナリオ D で照合済み）。
+//!   どちらも無ければ（ホスト側が private）start が `FailedPrecondition` で失敗し、状態が Created のまま子が残らず、bind 先が
+//!   rootfs に作られないことを照合する。どちらの分岐でも `production_launcher: scenario=rslave-bind host=<..> ...` を出す。
+//!   ホスト側で後からマウントした内容がコンテナ内に見えること自体は root が要るため本試験では確かめない
+//!   （`docs/verification/bind-rslave-propagation.md`）
 //! - シナリオ S（launch 経路の entrypoint 系違反の記録。#2624・SEC-4・SUP-6）: 試験バイナリ自身のディレクトリを bind し、
 //!   `args[0]` をその中の試験バイナリ（PID 1 の `/proc/self/exe` と同一の inode）にした start が `PermissionDenied` で失敗し、
 //!   状態が Created のまま子が残らず、launcher の記録先に層 `entrypoint`・`reason=entrypoint_is_runtime_binary`・当コンテナの
@@ -437,6 +444,29 @@ mod linux {
             );
             emit(format!("BIND_OPTS {opts}"));
         }
+        // シナリオ U（`rslave` の bind。#2669）: bind 先のマウントの optional fields（`master:N` など）を出す。
+        if std::env::args().any(|a| a == "--with-rslave") {
+            let optional = std::fs::read_to_string("/proc/self/mountinfo").map_or_else(
+                |e| format!("error:{:?}", e.kind()),
+                |info| {
+                    info.lines()
+                        .filter_map(|l| {
+                            let f: Vec<&str> = l.split_whitespace().collect();
+                            (f.get(4).copied() == Some(BIND_DEST)).then(|| {
+                                f.iter()
+                                    .skip(6)
+                                    .take_while(|x| **x != "-")
+                                    .copied()
+                                    .collect::<Vec<_>>()
+                                    .join(",")
+                            })
+                        })
+                        .next_back()
+                        .unwrap_or_else(|| "not-mounted".to_string())
+                },
+            );
+            emit(format!("RSLAVE_OPTIONAL {optional}"));
+        }
         // シナリオ S（起動オプション。#2625）: IPC namespace の識別子・指定 tmpfs の種別・`/dev/shm` の有無・注入ファイル。
         if std::env::args().any(|a| a == "--with-launch-options") {
             let ipc = std::fs::read_link("/proc/self/ns/ipc").map_or_else(
@@ -785,6 +815,7 @@ mod linux {
         scenario_b_failed_launch_leaves_nothing(&env, tag);
         scenario_c_multithreaded_refused(&env, tag);
         scenario_d_bind_mount(&env, tag);
+        scenario_u_rslave_bind(&env, tag);
         scenario_e_state_root_bind_refused(&env, tag);
         scenario_f_bind_over_protected_path_refused(&env, tag);
         scenario_g_devtmpfs_bind_refused(&env, tag);
@@ -1085,6 +1116,152 @@ mod linux {
             assert_eq!(on_host, BIND_CONTENT);
             println!(
                 "production_launcher: scenario=bind-mount pid={pid} dest={BIND_DEST} visible on host, nosuid+nodev"
+            );
+        }));
+        let (_record, process) = started.into_parts();
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "production_launcher: terminate after failed verification also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after terminate"
+        );
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// 元が属するホスト側のマウントの伝播（`/proc/self/mountinfo` の最長一致の行の optional fields。試験プロセスはホストの
+    /// mount namespace にいる）。`(shared, slave)`。
+    fn host_propagation_of(path: &Path) -> (bool, bool) {
+        let info = std::fs::read_to_string("/proc/self/mountinfo").expect("read mountinfo");
+        let mut best: Option<(usize, bool, bool)> = None;
+        for line in info.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let Some(mount_point) = f.get(4) else {
+                continue;
+            };
+            if !path.starts_with(mount_point) {
+                continue;
+            }
+            let optional: Vec<&str> = f
+                .iter()
+                .skip(6)
+                .take_while(|x| **x != "-")
+                .copied()
+                .collect();
+            let shared = optional.iter().any(|o| o.starts_with("shared:"));
+            let slave = optional
+                .iter()
+                .any(|o| o.starts_with("master:") || o.starts_with("propagate_from:"));
+            if best.is_none_or(|(len, _, _)| mount_point.len() >= len) {
+                best = Some((mount_point.len(), shared, slave));
+            }
+        }
+        let (_, shared, slave) = best.expect("a mount must contain the source directory");
+        (shared, slave)
+    }
+
+    /// シナリオ U: `rslave` の bind（#2669・OCI-4・CRI-2・SEC-1）。ホスト側の元のマウントが shared か slave なら起動でき、
+    /// コンテナ内の bind 先は `master:` を持ち `shared:` を持たない。ホスト側が private なら rootfs に触れる前に
+    /// `FailedPrecondition` で拒否される（黙って private で載せない）。
+    fn scenario_u_rslave_bind(env: &Env, tag: u32) {
+        let src = Bundle::new("u-src");
+        let bundle = Bundle::new("u");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        let mounts = json!([{
+            "destination": BIND_DEST,
+            "type": "bind",
+            "source": src.dir.to_str().expect("utf8 source path"),
+            "options": ["rbind", "rslave", "rw"]
+        }]);
+        write_config(&bundle, &ld, &["--with-rslave"], mounts);
+        let id = ContainerId::new(format!("plu{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        let (host_shared, host_slave) = host_propagation_of(&src.dir);
+        let host = match (host_shared, host_slave) {
+            (true, _) => "shared",
+            (false, true) => "slave",
+            (false, false) => "private",
+        };
+
+        wait_single_thread();
+        let result = start(
+            &env.store,
+            &env.recorder,
+            &env.launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        );
+        if !(host_shared || host_slave) {
+            let err = match result {
+                Ok(_) => panic!("rslave bind of a private host mount must be refused"),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.code(),
+                ErrorCode::FailedPrecondition,
+                "{}",
+                err.message()
+            );
+            assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+            assert!(!env.launcher.last_launch_may_have_left_process());
+            env.launcher
+                .confirm_no_process(&id, timeout())
+                .expect("confirm_no_process must be Ok for a cleanly failed launch");
+            assert!(
+                eventually(|| children_of_self().is_empty()),
+                "no intermediate process or PID 1 may remain: {:?}",
+                children_of_self()
+            );
+            assert!(
+                !bundle.rootfs().join("data").exists(),
+                "the bind destination must not be created in the rootfs"
+            );
+            println!(
+                "production_launcher: scenario=rslave-bind host={host} refused code={:?} state=created children=0",
+                err.code()
+            );
+            return;
+        }
+        let started = result.unwrap_or_else(|e| {
+            panic!(
+                "start with rslave bind failed: {:?} {}",
+                e.code(),
+                e.message()
+            )
+        });
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            let output = started.process().take_output().expect("container output");
+            let stdout = output.stdout.expect("container stdout");
+            reader_slot = Some(spawn_reader(stdout));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            let optional = value_of(&lines, "RSLAVE_OPTIONAL");
+            let fields: Vec<&str> = optional.split(',').collect();
+            assert!(
+                fields.iter().any(|f| f.starts_with("master:")),
+                "the rslave bind must be a slave in the container: {optional}"
+            );
+            assert!(
+                !fields.iter().any(|f| f.starts_with("shared:")),
+                "the rslave bind must not be shared in the container: {optional}"
+            );
+            println!(
+                "production_launcher: scenario=rslave-bind host={host} pid={pid} dest={BIND_DEST} slave in the container, not shared"
             );
         }));
         let (_record, process) = started.into_parts();

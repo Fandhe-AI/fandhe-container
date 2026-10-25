@@ -73,7 +73,7 @@ pub const USER_SCOPE_WRAPPER_ARGS: [&str; 6] =
     ["--user", "--scope", "--quiet", "-p", "Delegate=yes", "--"];
 /// 報告の先頭トークン（契約の版。互換性のない変更では数字を上げる）。
 ///
-/// `ErrorCode` への語彙の追加（`RESOURCE_EXHAUSTED`・#2609）では上げない。未知の文字列は `parse_error_code` が
+/// `ErrorCode` への語彙の追加（`RESOURCE_EXHAUSTED`・#2609）では上げない。未知の文字列は `ErrorCode::from_name` が
 /// `None` にして fail-closed で失敗し、CLI と supervisor は同じ版を一組で配置する前提のため。
 pub const REPORT_MAGIC: &str = "FCSUP1";
 /// 報告 1 行（終端の `\n` を含む）の最大バイト数。
@@ -135,23 +135,6 @@ pub enum StartReport {
 
 fn invalid(message: &'static str) -> TraitError {
     TraitError::new(ErrorCode::InvalidArgument, message)
-}
-
-/// `ErrorCode::as_str` の逆写像（完全一致のみ）。未知の文字列は `None`（`Internal` に写さない）。
-pub fn parse_error_code(s: &str) -> Option<ErrorCode> {
-    Some(match s {
-        "INVALID_ARGUMENT" => ErrorCode::InvalidArgument,
-        "NOT_FOUND" => ErrorCode::NotFound,
-        "ALREADY_EXISTS" => ErrorCode::AlreadyExists,
-        "FAILED_PRECONDITION" => ErrorCode::FailedPrecondition,
-        "UNIMPLEMENTED" => ErrorCode::Unimplemented,
-        "INTERNAL" => ErrorCode::Internal,
-        "PERMISSION_DENIED" => ErrorCode::PermissionDenied,
-        "TIMEOUT" => ErrorCode::Timeout,
-        "UNAVAILABLE" => ErrorCode::Unavailable,
-        "RESOURCE_EXHAUSTED" => ErrorCode::ResourceExhausted,
-        _ => return None,
-    })
 }
 
 /// 10 進数字だけ・先頭 0 なしの文字列を `u32` へ `checked` で変換する（`+`・空・空白を拒否）。
@@ -227,7 +210,7 @@ impl StartReport {
                 else {
                     return Err(invalid("report has the wrong number of fields"));
                 };
-                let code = parse_error_code(code)
+                let code = ErrorCode::from_name(code)
                     .ok_or_else(|| invalid("report error code is unknown"))?;
                 let exit_code = parse_decimal_u32(exit)
                     .and_then(|v| u8::try_from(v).ok())
@@ -411,19 +394,6 @@ mod tests {
     #[cfg(not(windows))]
     const ROOT2: &str = "/s";
 
-    const ALL_CODES: [ErrorCode; 10] = [
-        ErrorCode::InvalidArgument,
-        ErrorCode::NotFound,
-        ErrorCode::AlreadyExists,
-        ErrorCode::FailedPrecondition,
-        ErrorCode::Unimplemented,
-        ErrorCode::Internal,
-        ErrorCode::PermissionDenied,
-        ErrorCode::Timeout,
-        ErrorCode::Unavailable,
-        ErrorCode::ResourceExhausted,
-    ];
-
     fn os(v: &[&str]) -> Vec<OsString> {
         v.iter().map(OsString::from).collect()
     }
@@ -460,7 +430,7 @@ mod tests {
     /// REPAIR-2・ERR-2: `exit_code` が `exit_code_for(CODE)` と食い違う報告は拒否し、一致すれば受理する。
     #[test]
     fn repair2_report_decode_rejects_exit_code_mismatch() {
-        for code in ALL_CODES {
+        for code in ErrorCode::ALL {
             let expected = exit_code_for(code).get();
             let ok = format!("FCSUP1 ERR {} {expected} m\n", code.as_str());
             let decoded = StartReport::decode(ok.as_bytes()).expect("matching exit code");
@@ -527,14 +497,14 @@ mod tests {
         assert_eq!(ReportMessage::new("").as_str(), "unspecified");
     }
 
-    /// ERR-1: 既知の全 ErrorCode で as_str と parse_error_code が往復する。
+    /// ERR-1: 既知の全 ErrorCode で as_str と from_name が往復する。
     #[test]
     fn err2_error_code_strings_roundtrip() {
-        for c in ALL_CODES {
-            assert_eq!(parse_error_code(c.as_str()), Some(c));
+        for c in ErrorCode::ALL {
+            assert_eq!(ErrorCode::from_name(c.as_str()), Some(c));
         }
-        assert_eq!(parse_error_code("internal"), None);
-        assert_eq!(parse_error_code(""), None);
+        assert_eq!(ErrorCode::from_name("internal"), None);
+        assert_eq!(ErrorCode::from_name(""), None);
     }
 
     /// SUP-1: 正しい argv の解析。

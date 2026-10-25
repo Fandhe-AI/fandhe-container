@@ -41,7 +41,8 @@ Linux・cgroup v2・非 root・非特権 user namespace・user マネージャ�
 | A4 | A1 と `subid: files sss`、続けて `subid: sss files` | `files sss` は A1 と同じ、`sss files` は A3 と同じ（#2692 より前の commit ではどちらも A3 と同じ） | 同左 |
 | A5 | A1 で sssd を停止しキャッシュも無効化（LDAP に届かない状態） | `SUBID_OWNER_LOOKUP_FAILED`（warning・state `lookup_failed`。終了コード 3） | 5・`the user database lookup failed`・`the user database lookup could not start`・`the user database could not confirm that the entry is absent` のいずれか、または期限切れで 7・`TIMEOUT`・`the user database lookup timed out`。経過秒も記録 |
 | A6 | 参考: LDAP にも無い uid | `getent passwd <存在しない uid>; echo $?` が 2 になることだけ記録（遠隔源があると終了コード 2 を「名前なし」と断定しない） | — |
-| A7（任意） | `subid:` に不正な値（空、壊れた角括弧） | `NSSWITCH_UNUSABLE`（warning・state `unusable`） | 5・`the name service switch configuration is unusable` |
+| A7（任意） | 判定できない `nsswitch.conf`: `subid:` の行の値に CR を含める（例 `printf 'subid: files\r\n'` で書いた行）、または本文に NUL を含める | `NSSWITCH_UNUSABLE`（warning・state `unusable`） | 5・`the name service switch configuration is unusable` |
+| A8（任意・参考） | `subid:` の値が空（`subid:` だけの行）、または最初の語が壊れた角括弧（例 `subid: [x`） | 空は無視されて A1 と同じ（他に `subid:` の行が無ければ `files` 扱い）、`[x` は `files` 以外の語なので A3 と同じ（`NSSWITCH_UNUSABLE` にはならない） | 同左 |
 
 - doctor の終了コードは network・user scope・ID 写像・launcher の各 check の合成（`crates/cli/src/doctor.rs` の `run`。warning が 1 件でもあれば 3、無くて判定不能があれば 4）。表の終了コードは ID 写像・`nsswitch` 以外の check が warning を出さない前提の値で、他の check が warning を出す環境では ID 写像・`nsswitch` の行の `code`・`severity` で判定し、終了コードは記録だけにする
 - 各ケースの後に設定ファイルを元へ戻し、`sha256sum` が控えと一致することを記録する
@@ -58,7 +59,7 @@ Linux・cgroup v2・非 root・非特権 user namespace・user マネージャ�
    - 方法 2（使い捨てホストに限る）: root が `getent` を `getent.real` へ移し、同じ場所に root 所有・0755 のラッパーを置く。ラッパーは `/proc/self/status` の `Cap*`・`NoNewPrivs` の行だけを、試験ユーザー所有・0600 のログ（root が事前に作る）へ追記してから `exec <getent.real> "$@"` する。注意点: (a) 子は `env_clear` で `PATH` が無いので外部コマンドは絶対パスで呼ぶかシェル組み込みだけで書く、(b) argv[0] は候補のパスで渡される（busybox 環境では `exec -a "$0"`）、(c) ラッパーと親ディレクトリは root 所有・g/o 書き込み不可（信頼の検査を通すため）。終了後に元の `getent` へ戻し `sha256sum` の一致を記録する
 
 3. 期待値: `getent` の子の `CapAmb`・`CapPrm`・`CapEff` がすべて 0、uid は非 root。`CapInh` は supervisor から引き継がれて 0 でないことがありうる（記録のみで判定に含めない）。`CapBnd` も記録のみ
-4. 補助確認（任意。本番経路ではない）: 単体試験 `sec5_child_has_no_ambient_caps`（`crates/supervisor/src/user_db.rs`）を ambient つきで走らせる。`cargo test -p fandhe-container-supervisor --lib sec5_child_has_no_ambient_caps --no-run` で試験バイナリを作り、root が `capsh` で試験ユーザーへ落としつつ任意の capability を inheritable と ambient に載せて実行する（形の例: `capsh --keep=1 --user=<試験ユーザー> --inh=cap_net_raw --addamb=cap_net_raw -- -c '<bin> sec5_child_has_no_ambient_caps --exact'`。版により引数が異なるので調整する）。事前に親の `grep CapAmb /proc/self/status` が 0 でないことを確かめる。この試験はホストの `nsswitch.conf` に左右されない。合格は `test ... ok`
+4. 補助確認（任意。本番経路ではない）: 単体試験 `sec5_child_has_no_ambient_caps`（`crates/supervisor/src/user_db.rs`）を ambient つきで走らせる。`cargo test -p fandhe-container-supervisor --lib sec5_child_has_no_ambient_caps --no-run` で試験バイナリを作り（出力の `Executable` の行が `<bin>`）、root が `capsh` で試験ユーザーへ落としつつ任意の capability を inheritable と ambient に載せて実行する（形の例: `capsh --keep=1 --user=<試験ユーザー> --inh=cap_net_raw --addamb=cap_net_raw -- -c '<bin> user_db::linux::tests::sec5_child_has_no_ambient_caps --exact'`。`--exact` には完全修飾名を渡す。版により `capsh` の引数が異なるので調整する）。先に `<bin> user_db::linux::tests::sec5_child_has_no_ambient_caps --exact --list` で対象がちょうど 1 件であることを確かめる。事前に親の `grep CapAmb /proc/self/status` が 0 でないことを確かめる。この試験はホストの `nsswitch.conf` に左右されない。合格は `test user_db::linux::tests::sec5_child_has_no_ambient_caps ... ok` と `1 passed`
 
 ## 結果記録の雛形
 
@@ -70,7 +71,7 @@ Linux・cgroup v2・非 root・非特権 user namespace・user マネージャ�
 | fandhe-container の commit SHA（#2692 を含むか） | |
 | `passwd:` と `subid:` の行 | |
 | `getent` の候補の実体と信頼の検査の結果 | |
-| A1〜A7（doctor の code / severity / state / 終了コード、start の終了コード / code / message、`model`、判定） | |
+| A1〜A8（doctor の code / severity / state / 終了コード、start の終了コード / code / message、`model`、判定） | |
 | B: supervisor の Cap 集合 | |
 | B: `getent` の子の Cap 集合（方法 1 / 2）、補助確認、判定 | |
 | 後始末（設定ファイルと `getent` の sha256 の一致、cgroup・`state.json`・scope の残骸なし） | |

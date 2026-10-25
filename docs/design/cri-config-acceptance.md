@@ -156,4 +156,4 @@ CRI の `LinuxContainerSecurityContext.capabilities` のうち `drop_capabilitie
 - 適用は pivot 前段 `apply_sysctls`（`verify_pinned` の直後。`readonly_paths` が `/proc/sys` を ro にする前）で、`rootfs/proc/sys` へ fd 起点・`O_NOFOLLOW`・procfs の `f_type` 照合つきで 1 回の `write` で書く。存在しないキー・不正な値は起動を止める。
 - 既知の差: runc は `/` 区切りのキーも受けるが、許可リストのすり抜けを防ぐため本実装は `.` 区切りだけ。
 - pod の名前空間共有は未実装のため、pod 単位の値を各コンテナ自身の IPC namespace へ適用する近似（#2674）。
-- rootless で IPC 系 sysctl に書けるかはカーネルの所有者づけに依存する。書けない環境では `PermissionDenied` で起動が失敗する。実機（`production_launcher` への組み込みを含む）での確認は未実施。
+- rootless で IPC 系 sysctl に書けるかは、その IPC namespace を所有する user namespace を、書き込む側のプロセスが持っているかに依存する。本実装は新しい user namespace と IPC namespace を同時に作るため、コンテナの root が所有者となり書ける。書けない環境では `PermissionDenied` で起動が失敗する(fail-closed。黙って無視しない)。確認済み: `production_launcher` のシナリオ U(`kernel.shmmax`)が `platform-ci` の ubuntu-latest(非 root・委譲 cgroup)で成功行を出す(PR #2733 の CI で合格)。他のカーネル・配布物・LSM(AppArmor 等)の構成での確認は未実施で、そうした環境で `PermissionDenied` となる場合は、シナリオ U と `ci.yml` の成功行の照合が失敗する(環境の前提不足として扱い、照合は緩めない)。

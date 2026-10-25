@@ -3,7 +3,7 @@
 //!
 //! # 役割と呼び出し元
 //!
-//! `start` が config の `linux.namespaces[]` から [`NamespaceJoin::from_config`] を呼び、`user` と `ipc` の
+//! `start` が config の `linux.namespaces[]` から `NamespaceJoin::paths_of` と `pin` を呼び、`user` と `ipc` の
 //! path を **組** で受ける。検証済みの fd を [`LaunchSpec`](super::LaunchSpec) に載せ、本番 launcher が
 //! 中間プロセス I の分離で `setns(2)` に使う（`exec::isolate_join`）。pid・mount・uts・network・cgroup・time の
 //! path、片方だけの path は従来どおり `Unimplemented` で拒否する（fail-closed）。
@@ -49,6 +49,7 @@ use crate::traits::{ErrorCode, TraitError};
 use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
 /// パス長の上限（`CONFIG_MAX_PATH_BYTES` と同値）。
+#[cfg(target_os = "linux")]
 const PATH_MAX_BYTES: usize = 4096;
 
 /// 検証済みの pod の user・ipc namespace の fd の組（Linux のみ。他 OS では作れない）。
@@ -124,14 +125,6 @@ impl NamespaceJoin {
             ));
         }
         Ok(Some((user, ipc)))
-    }
-
-    /// config の `linux.namespaces[]` から join の指定を読み、検証して fd に固定する（`paths_of` の後に開く）。
-    pub(super) fn from_config(config: &OciConfig) -> Result<Option<Self>, TraitError> {
-        match Self::paths_of(config)? {
-            None => Ok(None),
-            Some((user, ipc)) => Self::pin(user, ipc).map(Some),
-        }
     }
 
     /// user・ipc namespace のパスを開き、素性を照合して fd に固定する（モジュール doc の表）。
@@ -226,6 +219,7 @@ impl NamespaceJoin {
 }
 
 /// 絶対パスで `..` を含まず上限以内であること（NUL は config の段で拒否済み）。
+#[cfg(target_os = "linux")]
 fn check_path(path: &Path) -> Result<(), TraitError> {
     let bad = path.as_os_str().len() > PATH_MAX_BYTES
         || !path.is_absolute()

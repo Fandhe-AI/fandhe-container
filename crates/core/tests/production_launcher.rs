@@ -2105,14 +2105,32 @@ mod linux {
         );
     }
 
-    /// 起動済みコンテナの標準出力を読み、プローブの `READY` までを回収して返す（exec 後の状態を観測するため）。
-    fn wait_probe_ready(
-        started: &fandhe_container_core::oci_runtime::StartedContainer,
-    ) -> (mpsc::Receiver<String>, std::thread::JoinHandle<()>) {
+    /// 起動済みコンテナの標準出力を読み、プローブの `READY` までを回収する（exec 後の状態を観測するため）。
+    ///
+    /// リーダースレッドは `READY` を送った時点で終了し、ここで join する。スレッドを残すと次の launch の前提
+    /// （`wait_single_thread` の `Threads: 1`）に戻れないため（REPAIR-12）。`READY` の後のプローブは出力せず待つだけ。
+    fn wait_probe_ready(started: &fandhe_container_core::oci_runtime::StartedContainer) {
         let output = started.process().take_output().expect("container output");
-        let (rx, reader) = spawn_reader(output.stdout.expect("container stdout"));
+        let stdout = output.stdout.expect("container stdout");
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(stdout);
+            for _ in 0..LINES_MAX {
+                let mut line = String::new();
+                match (&mut reader).take(LINE_MAX).read_line(&mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {
+                        let line = line.trim_end().to_string();
+                        let ready = line == PROBE_READY;
+                        if tx.send(line).is_err() || ready {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
         let _ = collect_probe(&rx);
-        (rx, reader)
+        handle.join().expect("join reader");
     }
 
     /// 名前空間の識別子（`/proc/<pid>/ns/<name>` のリンク先。例 `ipc:[4026531839]`）。
@@ -2171,9 +2189,8 @@ mod linux {
         )
         .unwrap_or_else(|e| panic!("start A failed: {:?} {}", e.code(), e.message()));
         let a_pid = a.process().pid();
-        let mut a_reader: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
         let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            a_reader = Some(wait_probe_ready(&a));
+            wait_probe_ready(&a);
             let b_bundle = Bundle::new("w-b");
             let ld = make_rootfs(&b_bundle.rootfs(), true);
             write_config(&b_bundle, &ld, &[], json!([]));
@@ -2197,9 +2214,8 @@ mod linux {
             )
             .unwrap_or_else(|e| panic!("start B failed: {:?} {}", e.code(), e.message()));
             let b_pid = b.process().pid();
-            let mut b_reader: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
             let b_verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                b_reader = Some(wait_probe_ready(&b));
+                wait_probe_ready(&b);
                 for shared in ["user", "ipc"] {
                     assert_eq!(
                         ns_link(b_pid, shared),
@@ -2223,16 +2239,8 @@ mod linux {
                 );
             }));
             finish_started(b, b_verified);
-            if let Some((rx, reader)) = b_reader.take() {
-                reader.join().expect("join reader");
-                drop(rx);
-            }
         }));
         finish_started(a, verified);
-        if let Some((rx, reader)) = a_reader.take() {
-            reader.join().expect("join reader");
-            drop(rx);
-        }
         assert!(
             children_of_self().is_empty(),
             "no child may remain after terminate"

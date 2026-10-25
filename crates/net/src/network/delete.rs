@@ -128,7 +128,7 @@ use super::{
     AttachedContainer, CreatedNetwork, EndpointId, FailedAttachClaim, FailedCreateClaim,
     NetnsDirRecord, NetworkName, NetworkResourceNames, NftApplyFailure, PortRegistry,
     ResourceState, StaticIpam, UnpinFailure, VethNames, host_owner_token, host_token_is_for,
-    is_indeterminate, token_names_network,
+    is_indeterminate, is_valid_generation, token_names_network,
 };
 
 /// 失敗した手順。
@@ -915,6 +915,24 @@ fn delete_veth<O: DeleteOps>(
         Ok(LinkAttachment {
             index: now, alias, ..
         }) if now != expected => {
+            // 同じ endpoint の別世代のトークン（再接続された新しい veth）。渡された handle は古い世代のもので、
+            // 決定的な pin のパスは新しい接続のものを指すため、消失済みと扱って unpin に進むと現在の pin を
+            // 消してしまう。削除も unpin もしない（fail-closed。#2681・NET-1・NET-6）。
+            let newer_generation = token.rfind("/g/").is_some_and(|i| {
+                let (prefix, generation) = token.split_at(i + 3);
+                is_valid_generation(generation)
+                    && alias
+                        .as_deref()
+                        .is_some_and(|a| a.strip_prefix(prefix).is_some_and(is_valid_generation))
+            });
+            if newer_generation && alias.as_deref() != Some(token) {
+                report.leftover.push((res, ResourceState::Unknown));
+                failures.note(
+                    precondition("veth belongs to a different attach generation"),
+                    DeleteStep::DeleteVeth,
+                );
+                return false;
+            }
             if alias.as_deref() == Some(token) {
                 // 所有トークンは一致するのに ifindex が記録と異なる。host 側 veth の ifindex は生存中に
                 // 変わらないため、渡された記録（`host_index`）が実体と食い違っている。この link を消失済みと
@@ -1602,6 +1620,30 @@ mod tests {
         assert!(!fake.calls().contains(&"delete_link 99".to_owned()));
         assert!(fake.calls().contains(&"delete_link 7".to_owned()));
         assert_eq!(ipam.allocated_count(), 0);
+    }
+
+    /// NET-1・NET-6・#2681: 同じ endpoint の別世代のトークンを持つ veth が居る（古い世代の handle）なら、
+    /// 消失済みと扱わず、現在の pin を外さずにアドレスも保持する。
+    #[test]
+    fn net1_delete_refuses_stale_generation_handle() {
+        let (net, mut ipam, mut ports) = setup();
+        let c1 = attached(&mut ipam, "c1");
+        let newer = host_owner_token(&net.bridge_token, &eid("c1"), OLD_GEN);
+        assert_ne!(newer, c1.host_token);
+        let fake = Fake {
+            veth_index: Some(99),
+            veth_alias: Some(Some(newer)),
+            ..Fake::default()
+        };
+        let e = delete_network_with(&fake, &net, vec![c1], &mut ipam, &mut ports).unwrap_err();
+        assert_eq!(
+            (e.code(), e.step),
+            (NetErrorCode::FailedPrecondition, DeleteStep::DeleteVeth)
+        );
+        assert_eq!(e.message(), "veth belongs to a different attach generation");
+        assert!(!fake.calls().iter().any(|c| c.starts_with("delete_link")));
+        assert!(!fake.calls().iter().any(|c| c == "unpin_netns"));
+        assert_eq!(ipam.allocated_count(), 1);
     }
 
     /// NET-1・TASK-139.4・P0: 所有トークンが一致するのに ifindex だけが記録と異なる（渡された `host_index` が

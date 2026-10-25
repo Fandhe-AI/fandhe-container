@@ -37,6 +37,7 @@ use std::time::Duration;
 use super::bind_mounts::BindMountSet;
 use super::cgroup_requirement::CgroupRequirement;
 use super::config::{NamespaceKind, OciConfig};
+use super::namespace_join::NamespaceJoin;
 use super::sysfs_mount::SysfsMountSpec;
 use super::working_dir::ContainerWorkingDir;
 use crate::traits::{CgroupPlacement, ContainerId, ErrorCode, Signal, TraitError};
@@ -481,6 +482,9 @@ pub struct LaunchSpec {
     working_dir: ContainerWorkingDir,
     /// `process.user` の (uid, gid)（名前空間内の値。写像との整合は launcher が fork 前に検査する。OCI-1・SEC-5）。
     user: (u32, u32),
+    /// pod の user・ipc namespace への join（`linux.namespaces[].path`。start が fork 前に fd へ固定して検証済み。
+    /// 無ければ `None`。CRI-2・CORE-3・SEC-1・SEC-5。#2674）。
+    namespace_join: Option<NamespaceJoin>,
 }
 
 impl LaunchSpec {
@@ -515,7 +519,22 @@ impl LaunchSpec {
             sysfs: None,
             working_dir,
             user,
+            namespace_join: None,
         }
+    }
+
+    /// 検証済みの pod の namespace への join を載せる（`start` と launcher の試験が呼ぶ。#2674）。
+    pub(super) fn with_namespace_join(mut self, join: Option<NamespaceJoin>) -> Self {
+        self.namespace_join = join;
+        self
+    }
+
+    /// pod の user・ipc namespace への join（無ければ `None`。CRI-2・CORE-3。#2674）。
+    ///
+    /// 本番 launcher が中間プロセスの分離で `setns` に使う。`namespaces()` には `User`・`Ipc` が含まれ（新規作成ではなく
+    /// join する）、restart の再 launch でも同じ fd を使う。
+    pub fn namespace_join(&self) -> Option<&NamespaceJoin> {
+        self.namespace_join.as_ref()
     }
 
     /// 検証済みの sysfs の指定を載せる（`start` だけが呼ぶ。#2020）。

@@ -92,6 +92,12 @@
 //!   `run_start` 手順 8 は、準備の作業スレッドを `join` してから入口スレッドが直接呼ぶ形に再構成済み(#1819)。
 //!   restart の再 launch は `fandhe-relaunch` スレッド等が存在する状態で呼ばれ、この launcher が拒否する
 //!   (`RelaunchFailed`・fail-closed)。呼び出しスレッドで直接行う再構成は #2043
+//! - **pod の namespace への join(CRI-2・CORE-3・SEC-1・SEC-5。#2674)**: `LaunchSpec::namespace_join`(config の
+//!   `linux.namespaces[].path` の user と ipc の組。start が fd に固定し、親子関係・作成者 uid・種別を検証済み)があると、
+//!   中間プロセスは user namespace と ipc namespace を作らずに `setns` で参加し(`exec::isolate_join`)、参加先の
+//!   `/proc/self/{uid,gid}_map` が権限モデルの期待する写像と完全一致することを確かめてから、残り(pid・mount・uts)を
+//!   `unshare` する。`--ipc=host` との併用は `InvalidArgument`。pid の共有・`/dev/shm` の共有・片方だけの join は未対応
+//!   (pid は init が PID 1 であることを制限適用の証跡の前提にしているため。保持役〔供給元〕の設計は後続 issue)
 //! - bind mount（`LaunchSpec::bind_mounts`。#1915）は載せる。fork 前に tmpfs・注入ディレクトリとの重なりを検査して
 //!   `PrePivotSetup.binds` へ渡し、restart の再 launch でも同じ集合を使う。`ro` の bind は Landlock の
 //!   `WriteRestrictionShadowed` で fork 前に拒否される（#1917 で解消するまでの想定挙動）
@@ -1694,6 +1700,16 @@ fn isolation_config_of(
     spec: &LaunchSpec,
     ipc: LaunchIpcMode,
 ) -> Result<IsolationConfig, TraitError> {
+    // pod の ipc namespace へ join する起動と `--ipc=host` は同時に成り立たない(join を黙って捨てると、指定より
+    // 弱い分離になる。fail-closed。CRI-2・CORE-3・SEC-1。#2674)。
+    if spec.namespace_join().is_some() && ipc == LaunchIpcMode::Host {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a pod namespace join cannot be combined with --ipc=host",
+        ));
+    }
+    // join する起動でも `User`・`Ipc` は集合に含める(計画の検証〔user namespace 必須・権限モデルの写像〕を通すため)。
+    // 実際には作らず、中間プロセスが `NamespaceJoin` の fd へ参加する(`exec::isolate_join`)。
     let mut namespaces = NamespaceSet::empty();
     for kind in spec.namespaces() {
         let ns = match kind {
@@ -1834,6 +1850,7 @@ impl LaunchOps for RealOps {
         let launched = spawn_container_via_intermediate(
             IntermediateSpec {
                 plan: isolation_plan,
+                join: input.spec.namespace_join(),
                 rootfs: input.spec.rootfs(),
                 entry: input.entry,
                 setup,
@@ -3770,6 +3787,23 @@ mod tests {
             implicit.lock().unwrap().clone(),
             vec![ImplicitDevMounts::WithoutShm; 2]
         );
+    }
+
+    /// CRI-2・CORE-3・SEC-1(#2674): pod の namespace への join と `--ipc=host` は併用できず、spawn の前に
+    /// `InvalidArgument` で拒否する(join を黙って捨てて弱い分離で起動しない)。
+    #[test]
+    fn cri2_pod_join_with_host_ipc_is_rejected_before_spawn() {
+        let open =
+            || -> std::os::fd::OwnedFd { std::fs::File::open("/dev/null").expect("open").into() };
+        let spec = spec_for("opts-join-host", serde_json::json!({}))
+            .with_namespace_join(Some(super::super::NamespaceJoin::for_test(open(), open())));
+        let ops = FakeOps::new(&events());
+        let mut l = launcher(ops, rootless(), None);
+        l.inner.launch_options = Some(options_with(&[], false, &[], LaunchIpcMode::Host));
+        let Err(err) = l.launch(&spec, Duration::from_secs(1)) else {
+            panic!("must be rejected");
+        };
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
     }
 
     /// SUP-12・CORE-5(#2625): 利用者指定の tmpfs(`/run`)は Landlock のルールと分離の記録にも書き込み可能で載る。

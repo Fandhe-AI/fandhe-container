@@ -557,7 +557,57 @@ mod control_ffi {
         // SAFETY（宣言そのものの妥当性）: `int clock_gettime(clockid_t clk_id, struct timespec *tp)`
         // （`clockid_t` は i32）。LP64 の `struct timespec` は `time_t`・`long` がともに 8 バイト。
         fn clock_gettime(clock_id: i32, tp: *mut Timespec) -> i32;
+        // SAFETY（宣言そのものの妥当性）: `ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags)`
+        // （`ssize_t` は LP64 で isize）。制御チャネルの exec 用 pidfd の受け渡し（`SCM_RIGHTS`。#2626）だけに使う。
+        fn sendmsg(fd: i32, msg: *const Msghdr, flags: i32) -> isize;
+        // SAFETY（宣言そのものの妥当性）: `ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)`。同上。
+        fn recvmsg(fd: i32, msg: *mut Msghdr, flags: i32) -> isize;
     }
+
+    /// `struct iovec`（LP64 で 16 バイト）。
+    // フィールドはカーネルがポインタ越しに読み書きするもので、Rust からは読まない（dead_code の誤検出を避ける）。
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct Iovec {
+        iov_base: *mut std::ffi::c_void,
+        iov_len: usize,
+    }
+
+    /// `struct msghdr`（glibc / musl の LP64 で 56 バイト。カーネルの `struct user_msghdr` と同じ配置）。
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct Msghdr {
+        msg_name: *mut std::ffi::c_void,
+        msg_namelen: u32,
+        msg_iov: *mut Iovec,
+        msg_iovlen: usize,
+        msg_control: *mut std::ffi::c_void,
+        msg_controllen: usize,
+        msg_flags: i32,
+    }
+
+    /// `struct cmsghdr`（LP64 で 16 バイト。データは 8 バイト境界から始まる）。
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct Cmsghdr {
+        cmsg_len: usize,
+        cmsg_level: i32,
+        cmsg_type: i32,
+    }
+
+    /// 送信用の制御メッセージ（`SCM_RIGHTS` で fd 1 本。`CMSG_SPACE(4)` = 24 バイト、8 バイト整列）。
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct ControlOne {
+        hdr: Cmsghdr,
+        fd: i32,
+        pad: i32,
+    }
+
+    /// 受信用の制御バッファ（`CMSG_SPACE(4 * 4)` = 32 バイト = fd 4 本分。8 バイト整列）。溢れた fd は
+    /// カーネルが `MSG_CTRUNC` を立てて閉じる。
+    #[repr(C, align(8))]
+    struct ControlBuf([u8; RECV_CONTROL_LEN]);
 
     /// `struct timespec`（LP64 の Linux。`time_t` と `long` はともに i64）。本モジュールは LP64 でのみ
     /// コンパイルされ、大きさはコンパイル時と単体テストが固定する。
@@ -577,6 +627,26 @@ mod control_ffi {
     // レイアウトのずれはコンパイル時に検出する（推測したレイアウトで syscall しない）。
     const _: () = assert!(std::mem::size_of::<Timespec>() == 16);
     const _: () = assert!(std::mem::size_of::<SockaddrUn>() == 110);
+    const _: () = assert!(std::mem::size_of::<Iovec>() == 16);
+    const _: () = assert!(std::mem::size_of::<Msghdr>() == 56);
+    const _: () = assert!(std::mem::size_of::<Cmsghdr>() == 16);
+    const _: () = assert!(std::mem::size_of::<ControlOne>() == 24);
+    const _: () = assert!(std::mem::align_of::<ControlOne>() == 8);
+
+    /// `SOL_SOCKET`（asm-generic/socket.h。x86_64・aarch64 で共通）。
+    const SOL_SOCKET: i32 = 1;
+    /// `SCM_RIGHTS`（include/linux/socket.h）。
+    const SCM_RIGHTS: i32 = 1;
+    /// `MSG_NOSIGNAL`（0x4000。x86_64・aarch64 で共通）。
+    const MSG_NOSIGNAL: i32 = 0x4000;
+    /// `MSG_CMSG_CLOEXEC`（0x40000000。受け取った fd に close-on-exec を付ける）。
+    const MSG_CMSG_CLOEXEC: i32 = 0x4000_0000;
+    /// `MSG_CTRUNC`（制御データが切り詰められた）。
+    const MSG_CTRUNC: i32 = 0x8;
+    /// 受信する制御バッファの長さ。
+    const RECV_CONTROL_LEN: usize = 32;
+    /// cmsg のデータ部の先頭オフセット（`CMSG_LEN(0)` = ヘッダの 16 バイト）。
+    const CMSG_HDR_LEN: usize = 16;
 
     const AF_UNIX: i32 = 1;
     const SOCK_STREAM: i32 = 1;
@@ -636,6 +706,152 @@ mod control_ffi {
             .ok_or_else(|| io::Error::from_raw_os_error(22))
     }
 
+    /// `sock` へ `data` を送り、`fd` を `SCM_RIGHTS` で 1 本添える。送れたバイト数を返す
+    /// （ストリームなので短い書き込みはあり得る。fd は最初に送れたバイトに付く。呼び出し側が残りを書く）。
+    /// `EINTR` は再試行せず `Interrupted` のまま返す（呼び出し側が絶対期限を確認して再試行する。REPAIR-5）。
+    pub(super) fn send_with_fd(
+        sock: std::os::fd::BorrowedFd<'_>,
+        data: &[u8],
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> io::Result<usize> {
+        let mut control = ControlOne {
+            hdr: Cmsghdr {
+                // CMSG_LEN(4) = ヘッダ 16 + データ 4。
+                cmsg_len: CMSG_HDR_LEN + 4,
+                cmsg_level: SOL_SOCKET,
+                cmsg_type: SCM_RIGHTS,
+            },
+            fd: fd.as_raw_fd(),
+            pad: 0,
+        };
+        let mut iov = Iovec {
+            iov_base: data.as_ptr().cast_mut().cast(),
+            iov_len: data.len(),
+        };
+        let msg = Msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &raw mut iov,
+            msg_iovlen: 1,
+            msg_control: (&raw mut control).cast(),
+            msg_controllen: std::mem::size_of::<ControlOne>(),
+            msg_flags: 0,
+        };
+        {
+            // SAFETY: `sock`・`fd` は借用で呼び出しの間開いている。`msg` は `#[repr(C)]` の 56 バイト（コンパイル時に固定）で、
+            // `msg_iov` は 1 要素の `iov`（`data` の先頭と長さ。カーネルは読むだけ）、`msg_control` は 24 バイトの
+            // `ControlOne`（8 バイト整列。`msg_controllen` はその大きさ）を指す。いずれもこの関数のスタック上の値か
+            // 呼び出し元の借用で、呼び出しの間有効。`msg_name` は null・長さ 0。カーネルは `fd` の複製を受け手に作るだけで、
+            // 呼び出し側の fd の所有権は動かない。本モジュールは LP64 の x86_64 / aarch64 でのみコンパイルされる。
+            let rc = unsafe { sendmsg(sock.as_raw_fd(), &raw const msg, MSG_NOSIGNAL) };
+            let n = check(rc as i64)?;
+            usize::try_from(n).map_err(|_| io::Error::from_raw_os_error(22))
+        }
+    }
+
+    /// `sock` から最大 `buf.len()` バイトと、添えられた `SCM_RIGHTS` の fd（最大 4 本）を 1 回の `recvmsg` で受ける。
+    /// 受け取った fd は close-on-exec で、`OwnedFd` として返す（呼び出し側が不要なら drop で閉じる）。
+    /// `EINTR` は再試行せず `Interrupted` のまま返す（呼び出し側が絶対期限を確認して再試行する。REPAIR-5）。
+    pub(super) fn recv_with_fds(
+        sock: std::os::fd::BorrowedFd<'_>,
+        buf: &mut [u8],
+    ) -> io::Result<super::Received> {
+        let mut control = ControlBuf([0u8; RECV_CONTROL_LEN]);
+        let mut iov = Iovec {
+            iov_base: buf.as_mut_ptr().cast(),
+            iov_len: buf.len(),
+        };
+        let mut msg = Msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: &raw mut iov,
+            msg_iovlen: 1,
+            msg_control: (&raw mut control).cast(),
+            msg_controllen: RECV_CONTROL_LEN,
+            msg_flags: 0,
+        };
+        let n = {
+            // SAFETY: `sock` は借用で呼び出しの間開いている。`msg` は `#[repr(C)]` の 56 バイトで、`msg_iov` は 1 要素の
+            // `iov`（`buf` の先頭と長さ。カーネルは `buf` に最大その長さを書く）、`msg_control` は 32 バイトの
+            // `ControlBuf`（8 バイト整列。`msg_controllen` はその大きさ）を指す。いずれも呼び出しの間有効かつ排他的。
+            // カーネルは `msg_controllen`・`msg_flags` を更新する。本モジュールは LP64 の x86_64 / aarch64 でのみ
+            // コンパイルされる。
+            let rc = unsafe { recvmsg(sock.as_raw_fd(), &raw mut msg, MSG_CMSG_CLOEXEC) };
+            let n = check(rc as i64)?;
+            usize::try_from(n).map_err(|_| io::Error::from_raw_os_error(22))?
+        };
+        let used = msg.msg_controllen.min(RECV_CONTROL_LEN);
+        let raw = control.0.get(..used).unwrap_or(&[]);
+        // 解析が途中で失敗しても、それまでに読めた fd は `OwnedFd` にして drop で閉じる（fd の漏れを防ぐ）。
+        let mut raw_fds = Vec::new();
+        let parsed = parse_rights_into(raw, &mut raw_fds);
+        let fds: Vec<OwnedFd> = raw_fds
+            .into_iter()
+            // SAFETY: `recvmsg(2)` が呼び出しプロセスの fd 表へ新規に作った fd で、他に所有者がいない。`OwnedFd` が
+            // drop で閉じる。値は `parse_rights_into` がカーネルの返した `SCM_RIGHTS` から読んだもの。
+            .map(|raw_fd| unsafe { OwnedFd::from_raw_fd(raw_fd) })
+            .collect();
+        parsed?;
+        Ok(super::Received {
+            len: n,
+            fds,
+            truncated: msg.msg_flags & MSG_CTRUNC != 0,
+        })
+    }
+
+    /// 制御データのバイト列から `SCM_RIGHTS` の fd 番号を取り出す（純関数。添字アクセスをしない）。
+    /// 長さの足りないヘッダ・範囲外の `cmsg_len`・4 の倍数でないデータは `InvalidData`。他の種別の cmsg は読み飛ばす。
+    #[cfg(test)]
+    pub(super) fn parse_rights(control: &[u8]) -> io::Result<Vec<i32>> {
+        let mut fds = Vec::new();
+        parse_rights_into(control, &mut fds)?;
+        Ok(fds)
+    }
+
+    /// [`parse_rights`] の本体。失敗しても、失敗までに読めた fd 番号は `fds` に残す（呼び出し側が閉じるため）。
+    fn parse_rights_into(control: &[u8], fds: &mut Vec<i32>) -> io::Result<()> {
+        let bad = || io::Error::from(io::ErrorKind::InvalidData);
+        let mut pos = 0usize;
+        while pos < control.len() {
+            let head_end = pos.checked_add(CMSG_HDR_LEN).ok_or_else(bad)?;
+            let head = control.get(pos..head_end).ok_or_else(bad)?;
+            let (len_bytes, rest) = head.split_first_chunk::<8>().ok_or_else(bad)?;
+            let (level_bytes, rest) = rest.split_first_chunk::<4>().ok_or_else(bad)?;
+            let (type_bytes, _) = rest.split_first_chunk::<4>().ok_or_else(bad)?;
+            let cmsg_len = usize::from_ne_bytes(*len_bytes);
+            let level = i32::from_ne_bytes(*level_bytes);
+            let kind = i32::from_ne_bytes(*type_bytes);
+            let end = pos.checked_add(cmsg_len).ok_or_else(bad)?;
+            if cmsg_len < CMSG_HDR_LEN || end > control.len() {
+                return Err(bad());
+            }
+            if level == SOL_SOCKET && kind == SCM_RIGHTS {
+                let data = control.get(head_end..end).ok_or_else(bad)?;
+                if data.len() % 4 != 0 {
+                    return Err(bad());
+                }
+                let (words, _) = data.as_chunks::<4>();
+                for word in words {
+                    fds.push(i32::from_ne_bytes(*word));
+                }
+            }
+            // 次の cmsg は 8 バイト境界から始まる。
+            pos = end.checked_add(7).ok_or_else(bad)? & !7;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn control_constants() -> (i32, i32, i32, i32, i32) {
+        (
+            SOL_SOCKET,
+            SCM_RIGHTS,
+            MSG_NOSIGNAL,
+            MSG_CMSG_CLOEXEC,
+            MSG_CTRUNC,
+        )
+    }
+
     #[cfg(test)]
     pub(super) fn layout_sizes() -> (usize, usize) {
         (
@@ -669,6 +885,50 @@ mod control_ffi {
     pub(super) fn monotonic_now_ns() -> io::Result<u64> {
         Err(unsupported_control())
     }
+
+    pub(super) fn send_with_fd(
+        _sock: std::os::fd::BorrowedFd<'_>,
+        _data: &[u8],
+        _fd: std::os::fd::BorrowedFd<'_>,
+    ) -> io::Result<usize> {
+        Err(unsupported_control())
+    }
+
+    pub(super) fn recv_with_fds(
+        _sock: std::os::fd::BorrowedFd<'_>,
+        _buf: &mut [u8],
+    ) -> io::Result<super::Received> {
+        Err(unsupported_control())
+    }
+}
+
+/// [`recv_with_fds`] の結果。
+#[derive(Debug)]
+pub(crate) struct Received {
+    /// 受け取ったバイト数。
+    pub(crate) len: usize,
+    /// 添えられていた fd（close-on-exec。最大 4 本。drop で閉じる）。
+    pub(crate) fds: Vec<std::os::fd::OwnedFd>,
+    /// 制御データが切り詰められた（受け切れなかった fd はカーネルが閉じている）。
+    pub(crate) truncated: bool,
+}
+
+/// `data` を送り、`fd` を `SCM_RIGHTS` で 1 本添える（`sendmsg(2)`）。制御チャネルの exec 用 pidfd の受け渡し
+/// （サーバ側。#2626・SUP-6・SEC-1）。送れたバイト数を返す（短い書き込みは呼び出し側が残りを書く）。
+/// LP64 の x86_64 / aarch64 以外は `Unsupported`（#2140）。
+pub(crate) fn send_with_fd(
+    sock: BorrowedFd<'_>,
+    data: &[u8],
+    fd: BorrowedFd<'_>,
+) -> io::Result<usize> {
+    control_ffi::send_with_fd(sock, data, fd)
+}
+
+/// 最大 `buf.len()` バイトと添えられた fd（最大 4 本）を 1 回で受ける（`recvmsg(2)`。close-on-exec）。
+/// 制御チャネルの exec 用 pidfd の受け取り（クライアント側。#2626）。呼び出し側は fd の本数と `truncated` を
+/// 検証し、想定外なら `fds` を drop して閉じる。LP64 の x86_64 / aarch64 以外は `Unsupported`。
+pub(crate) fn recv_with_fds(sock: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<Received> {
+    control_ffi::recv_with_fds(sock, buf)
 }
 
 /// UNIX ドメインソケットへ non-blocking で 1 回だけ接続を試みる（制御チャネルのクライアント。#2058・REPAIR-5）。
@@ -771,6 +1031,158 @@ mod tests {
         let a = monotonic_now_ns().unwrap();
         let b = monotonic_now_ns().unwrap();
         assert!(b >= a && a > 0);
+    }
+
+    /// SUP-6・SEC-1・#2626: `SCM_RIGHTS` 関連の定数は具体値で固定する（x86_64・aarch64 で共通の値。
+    /// この crate は libc との機械照合が未導入のため、値は include/uapi の出典と本試験で照合する）。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn sup6_exec_handover_scm_constants() {
+        assert_eq!(
+            control_ffi::control_constants(),
+            (1, 1, 0x4000, 0x4000_0000, 8)
+        );
+    }
+
+    /// 試験用: `SCM_RIGHTS` の cmsg 1 件（ヘッダ 16 バイト + データ。8 バイトへ詰める）を組み立てる。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    fn cmsg(level: i32, kind: i32, fds: &[i32]) -> Vec<u8> {
+        let len = 16 + fds.len() * 4;
+        let mut v = Vec::new();
+        v.extend_from_slice(&len.to_ne_bytes());
+        v.extend_from_slice(&level.to_ne_bytes());
+        v.extend_from_slice(&kind.to_ne_bytes());
+        for fd in fds {
+            v.extend_from_slice(&fd.to_ne_bytes());
+        }
+        while v.len() % 8 != 0 {
+            v.push(0);
+        }
+        v
+    }
+
+    /// SUP-6・#2626: cmsg の解析は fd 番号を具体値で取り出し、壊れた入力を `InvalidData` で拒否する。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn sup6_exec_handover_parse_rights() {
+        // 空・fd 1 本・fd 2 本・他種別（読み飛ばし）・種別違いの後ろの fd。
+        assert_eq!(control_ffi::parse_rights(&[]).unwrap(), Vec::<i32>::new());
+        assert_eq!(
+            control_ffi::parse_rights(&cmsg(1, 1, &[7])).unwrap(),
+            vec![7]
+        );
+        assert_eq!(
+            control_ffi::parse_rights(&cmsg(1, 1, &[7, 9])).unwrap(),
+            vec![7, 9]
+        );
+        let mut mixed = cmsg(1, 2, &[5]);
+        mixed.extend(cmsg(1, 1, &[11]));
+        assert_eq!(control_ffi::parse_rights(&mixed).unwrap(), vec![11]);
+        // 短いヘッダ・cmsg_len がヘッダ未満・範囲外・データが 4 の倍数でない。
+        for bad in [
+            vec![0u8; 8],
+            {
+                let mut v = cmsg(1, 1, &[7]);
+                v[..8].copy_from_slice(&8usize.to_ne_bytes());
+                v
+            },
+            {
+                let mut v = cmsg(1, 1, &[7]);
+                v[..8].copy_from_slice(&1000usize.to_ne_bytes());
+                v
+            },
+            {
+                let mut v = cmsg(1, 1, &[7]);
+                v[..8].copy_from_slice(&18usize.to_ne_bytes());
+                v
+            },
+        ] {
+            assert_eq!(
+                control_ffi::parse_rights(&bad).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    /// SUP-6・SEC-1・#2626: fd が実際に `SCM_RIGHTS` で届く（ソケット対の上で、パイプの書き端を渡し、
+    /// 受け手がそれへ書いて元のパイプの読み端で読める）。受け取った fd は close-on-exec。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn sup6_exec_handover_send_recv_roundtrip() {
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let (a, b) = UnixStream::pair().unwrap();
+        // REPAIR-5: 送受信が無期限にブロックしないよう期限を付ける。
+        for s in [&a, &b] {
+            s.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            s.set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+        }
+        let (mut read_end, write_end) = std::io::pipe().unwrap();
+        let sent = send_with_fd(a.as_fd(), b"hello", write_end.as_fd()).unwrap();
+        assert_eq!(sent, 5);
+        let mut buf = [0u8; 16];
+        let got = recv_with_fds(b.as_fd(), &mut buf).unwrap();
+        assert_eq!(got.len, 5);
+        assert_eq!(buf.get(..5), Some(&b"hello"[..]));
+        assert!(!got.truncated);
+        assert_eq!(got.fds.len(), 1);
+        let received = got.fds.into_iter().next().unwrap();
+        assert_ne!(received.as_raw_fd(), write_end.as_raw_fd());
+        // FD_CLOEXEC（F_GETFD = 1, FD_CLOEXEC = 1）。
+        // SAFETY: テスト用。開いている fd に対する `fcntl(F_GETFD)` は整数のみを返す。
+        let flags = unsafe { fcntl(received.as_raw_fd(), F_GETFD) };
+        assert_eq!(flags & 1, 1);
+        let mut w = std::fs::File::from(received);
+        w.write_all(b"x").unwrap();
+        drop(w);
+        drop(write_end);
+        // REPAIR-5: EOF 待ちは別スレッド + 期限付きの受信で上限を設ける（書き端が漏れていても無期限に待たない）。
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = String::new();
+            let r = read_end.read_to_string(&mut out).map(|_| out);
+            let _ = tx.send(r);
+        });
+        let out = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("pipe EOF within the deadline")
+            .unwrap();
+        assert_eq!(out, "x");
+    }
+
+    /// SUP-6・#2626: fd が添えられていない通常の送信では `fds` は空で `truncated` は偽。
+    #[cfg(any(
+        all(target_arch = "x86_64", target_pointer_width = "64"),
+        all(target_arch = "aarch64", target_pointer_width = "64")
+    ))]
+    #[test]
+    fn sup6_exec_handover_recv_without_fd() {
+        use std::io::Write as _;
+        use std::os::fd::AsFd as _;
+        let (mut a, b) = UnixStream::pair().unwrap();
+        // REPAIR-5: 受信が無期限にブロックしないよう期限を付ける。
+        a.set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        b.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        a.write_all(b"abc").unwrap();
+        let mut buf = [0u8; 8];
+        let got = recv_with_fds(b.as_fd(), &mut buf).unwrap();
+        assert_eq!((got.len, got.fds.len(), got.truncated), (3, 0, false));
     }
 
     /// REPAIR-5: 長すぎる・NUL を含むパスは接続を試みず `InvalidInput`、存在しないパスは `NotFound`。

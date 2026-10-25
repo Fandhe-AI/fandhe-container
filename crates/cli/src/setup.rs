@@ -591,6 +591,8 @@ mod tests {
                     },
                 ),
                 Command::Logs => (vec!["logs", "c1"], if linux { 0 } else { 5 }, ""),
+                // c1 は Created（稼働中ではない）なので exec は FAILED_PRECONDITION（5）。非 Linux は plugin 解決の失敗の 5。
+                Command::Exec => (vec!["exec", "c1", "/bin/true"], 5, ""),
                 Command::Image => (
                     vec!["image", "ls", "--image-root", &ir],
                     if linux { 0 } else { 5 },
@@ -627,7 +629,7 @@ mod tests {
         assert_eq!(
             seen,
             [
-                "create", "start", "stop", "delete", "list", "logs", "image", "system"
+                "create", "start", "stop", "delete", "list", "logs", "exec", "image", "system"
             ]
         );
         // 日常操作は OS 固有設定を要求しないが、plugin 拒否の監査記録先（`<状態ルート>/@audit.log`。SEC-4）を

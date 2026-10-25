@@ -214,11 +214,13 @@
 //!
 //! # 未実装（REPAIR-3）
 //!
-//! - supervisor から別プロセスの exec 専用プロセスへ pidfd を渡す 1 段目（execve 越しの継承、または外部 CLI への
-//!   `SCM_RIGHTS`）。supervisor のバイナリ入口・制御ソケットが無く、`SCM_RIGHTS` は UDS の所有者・peer credential
-//!   検証と core `sys` の cmsg ラッパーの設計を要する。fork 継承（[`run_command_with_pidfd`]）は pidfd を保持する
-//!   単一スレッドのプロセスが呼ぶ場合に限り成立し、logs 捕捉スレッドを持つ supervisor 本体は直接呼べない
-//!   （`setns` が拒否する）
+//! - supervisor から別プロセスの exec 専用プロセスへ pidfd を渡す 1 段目のうち、外部 CLI への `SCM_RIGHTS` は
+//!   実装済み（#2626）: CLI の `exec` が supervisor の制御チャネルの ExecHandoverRequest（`control::protocol` の kind 6。
+//!   接続元の uid の照合つき）で起動時 pidfd の複製を受け取り、単一スレッドの CLI プロセス自身が
+//!   [`run_command_with_pidfd`] を呼ぶ（判断記録は `docs/design/exec-pidfd-handover.md`。オーナー承認待ち）。**未実装**:
+//!   execve 越しの継承（専用の exec プロセスを supervisor が起動する方式）は採らない。fork 継承
+//!   （[`run_command_with_pidfd`]）は pidfd を保持する単一スレッドのプロセスが呼ぶ場合に限り成立し、logs 捕捉スレッドを持つ
+//!   supervisor 本体は直接呼べない（`setns` が拒否する）。supervisor 自身を呼び出し元にする healthcheck の配線は #2441
 //! - rootless の exec の通しの確認。user namespace への参加（[`enter_namespaces`] が、対象が別の user namespace に
 //!   いるときだけ 5 種に先立って参加する。#1462）と参加後の資格情報は `tests/exec_setns_join.rs` が非特権の
 //!   user namespace で照合する。制限の再適用を含む通し（Landlock ABI 6+）は実機前提の `tests/exec.rs` の
@@ -236,8 +238,8 @@
 //!   コマンド内の `kill(SIGSYS)` と区別できないため seccomp 由来とは断定しない。**未実装（REPAIR-3）**: コマンドの
 //!   子孫の SIGSYS 終了は worker の子ではないため worker も親も観測できず、記録しない
 //!   （`docs/design/audit-delivery.md` 9.1）
-//! - 違反記録（SEC-4）の監査ログへの保存のうち、CLI の exec コマンド・TASK-161 の healthcheck（#492）から
-//!   [`run_command_with_pidfd`] へ [`default_audit_sink`] の sink を渡す配線（未実装。healthcheck は #2441、CLI の exec は #2626）。supervisor の start 入口（`start_entry`）からは配線済み（#1717・#2481）。本番の
+//! - 違反記録（SEC-4）の監査ログへの保存のうち、TASK-161 の healthcheck（#492）から
+//!   [`run_command_with_pidfd`] へ [`default_audit_sink`] の sink を渡す配線（未実装。healthcheck は #2441）。supervisor の start 入口（`start_entry`）からは配線済み（#1717・#2481）で、CLI の `exec` コマンドからも配線済み（#2626。`default_audit_sink` で作れなければ exec しない）。本番の
 //!   `AuditSink` の実体（`FileAuditSink`）と生成の入口 [`default_audit_sink`] は実装済み（#1594）。層 `exec_target` と
 //!   [`run_command_with_pidfd`] での 1 拒否 1 件の記録は実装済み（#1465）。`ExecOutcome::exit` が運ぶ `execve` 前の違反
 //!   （`SetupFailed`。種別 `entrypoint`）の層 `entrypoint` での記録も実装済み（#1595）。launch 経路（本番 launcher の子）で
@@ -521,7 +523,7 @@ pub fn prepare_restrictions(
 /// 開いてから `<状態ルート>/@audit.log` を主経路とする `FileAuditSink` を返す。返す sink はファイルを開いたまま
 /// 持たないので、fork 前に作っても worker へ fd は継承されない。[`run_command_with_pidfd`] / `run_command_in` の
 /// `audit` へ渡す。Linux 以外では core が `Unimplemented` を返す（fail-closed）。supervisor の start 入口（`start_entry`）から
-/// 配線済み（#1717・#2481）。healthcheck（#2441）と CLI の exec（#2626）からは未配線。
+/// 配線済み（#1717・#2481）で、CLI の `exec`（#2626）も配線済み。healthcheck（#2441）からは未配線。
 pub fn default_audit_sink(
     root_override: Option<std::path::PathBuf>,
 ) -> Result<FileAuditSink, TraitError> {
@@ -925,7 +927,7 @@ fn audit_worker_result(
 /// pidfd を必須の引数にしているため、pidfd が得られない（未対応カーネル・seccomp・起動ハンドルなし）ときは呼べず、
 /// exec は拒否される（fail-closed）。縮退経路の入口 `run_command` は `exec-test-support` feature の試験専用で、
 /// 既定ビルドには存在せず、呼ぶとコンパイルが通らない。supervisor 不在時（孤児化・再起動後）の exec の再設計（担当は #2688。#514 は re-adopt・終了ポリシーのみ）と
-/// 本番の呼び出し元（healthcheck #2441・CLI の exec #2626）の配線は未実装（モジュール doc）。
+/// 本番の呼び出し元のうち、CLI の exec は配線済み（#2626。制御チャネルで受け取った pidfd を渡す）で、healthcheck（#2441）は未実装（モジュール doc）。
 ///
 /// コマンドの環境は、記録の bundle の `config.json` の `process.env` へ `request` の明示の指定を重ねたもので、
 /// 呼び出しプロセスの環境は使わない（TASK-163 追補・#1457。契約はモジュール doc）。
@@ -937,7 +939,7 @@ fn audit_worker_result(
 ///
 /// worker は fork で親の fd を継承するため、pidfd は呼び出しプロセスが保持するものをそのまま worker が使う
 /// （追加の syscall なし）。pidfd はコンテナ内コマンドへ渡らない（core が `execveat` の前に `close_range` で閉じ、
-/// 複製は close-on-exec）。別プロセスの exec 専用プロセスへ渡す 1 段目（execve 越しの継承・`SCM_RIGHTS`）は未実装
+/// 複製は close-on-exec）。別プロセスの CLI へ渡す 1 段目は制御チャネルの `SCM_RIGHTS`（#2626）で実装済み、execve 越しの継承は未実装
 /// （モジュール doc）。
 ///
 /// `timeout` は準備から終了待ちまでの全体の上限（REPAIR-5）。段の間で期限を確かめ、fork 後は残り時間で

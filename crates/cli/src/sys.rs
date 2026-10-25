@@ -261,6 +261,38 @@ mod imp {
         RECORDED.store(sig, std::sync::atomic::Ordering::SeqCst);
     }
 
+    // SAFETY（宣言そのものの妥当性）: `int prctl(int option, ...)`（glibc）。可変長引数として宣言する
+    // （非可変長で宣言して呼ぶと、可変長引数の渡し方が異なる ABI で未定義動作になる）。可変長部は
+    // `unsigned long`（LP64 で u64）なので呼び出し側は u64 で渡す。
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" {
+        fn prctl(option: i32, ...) -> i32;
+    }
+
+    /// include/uapi/linux/prctl.h の `PR_SET_PDEATHSIG`（1）。
+    #[cfg(target_os = "linux")]
+    const PR_SET_PDEATHSIG: i32 = 1;
+    /// 親の終了で受けるシグナル `SIGKILL`（Linux で 9。`asm-generic/signal.h`）。
+    #[cfg(target_os = "linux")]
+    const PDEATHSIG_SIGKILL: u64 = 9;
+
+    /// 親が終了したら呼び出しプロセスへ `SIGKILL` が届くようにする（`PR_SET_PDEATHSIG`。#2626・SUP-6・REPAIR-5）。
+    ///
+    /// `exec` が委譲スコープで再実行した子が、親 CLI の終了（SIGTERM・SIGHUP・SIGKILL を含む）に追従して止まるために
+    /// 子の入口で 1 回呼ぶ。子の worker とコマンドは core が同じ設定を持つため、子が落ちれば連鎖して止まる。
+    /// 設定は呼び出したスレッドの親（生成したスレッド）に結びつく。呼び出し後の親の生存確認は呼び出し側の責務。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_parent_death_sigkill() -> io::Result<()> {
+        // SAFETY: 引数は整数のみでポインタを渡さない。呼び出したスレッドの `pdeath_signal` を設定するだけで、
+        // メモリ・fd には触れない。
+        let rc = unsafe { prctl(PR_SET_PDEATHSIG, PDEATHSIG_SIGKILL, 0u64, 0u64, 0u64) };
+        if rc == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
     /// `sig` に転送用の固定ハンドラ（`forward_and_reraise`）を登録する（[`install`] の規則に従う）。
     pub(crate) fn install_forwarding_handler(sig: i32) -> io::Result<Disposition> {
         // ハンドラが動き得るようになる前に所有者を記録する（照合が常に「所有者あり」で始まるように）。
@@ -615,6 +647,16 @@ mod imp {
             *const libc::sigaction,
             *mut libc::sigaction,
         ) -> libc::c_int = libc::sigaction;
+        // `prctl` は可変長引数（`int prctl(int, ...)`）。関数の型ごと照合する。
+        #[cfg(target_os = "linux")]
+        const _: () = {
+            assert!(super::PR_SET_PDEATHSIG == libc::PR_SET_PDEATHSIG);
+            assert!(super::PDEATHSIG_SIGKILL == libc::SIGKILL as u64);
+        };
+        #[cfg(target_os = "linux")]
+        const _: unsafe extern "C" fn(libc::c_int, ...) -> libc::c_int = super::prctl;
+        #[cfg(target_os = "linux")]
+        const _: unsafe extern "C" fn(libc::c_int, ...) -> libc::c_int = libc::prctl;
         const _: unsafe extern "C" fn(libc::c_int) -> libc::c_int = super::raise;
         const _: unsafe extern "C" fn(libc::c_int) -> libc::c_int = libc::raise;
         const _: extern "C" fn(libc::c_int) = super::forward_and_reraise;
@@ -675,6 +717,12 @@ mod imp {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 
+    /// 確認していない OS・libc では設定しない（fail-closed。呼び出し側は exec を拒否する）。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_parent_death_sigkill() -> io::Result<()> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
     /// 構造体レイアウトを確認していない OS・アーキテクチャでは登録しない（fail-closed）。
     #[cfg(feature = "signal-test-support")]
     pub(crate) fn install_recording_handler(_sig: i32) -> io::Result<Disposition> {
@@ -711,6 +759,8 @@ mod imp {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) use imp::set_parent_death_sigkill;
 #[cfg(feature = "signal-test-support")]
 pub(crate) use imp::{
     fork_and_raise_for_test, ignore_child_signal_for_test, install_recording_handler,

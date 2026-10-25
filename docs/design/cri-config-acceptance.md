@@ -11,11 +11,11 @@
 | 3 | dns_config | cri（bundle に resolv.conf を生成して `/etc/resolv.conf` へ ro で bind） | cri | #2665 |
 | 4 | capabilities（drop を先行。add / ambient はオーナー判断。SEC-1） | core の `process.capabilities`（UnappliedField）の適用 → cri。drop は本変更で実装済み。add / ambient は `UNIMPLEMENTED` のまま | core → cri | #2666 |
 | 5 | supplemental_groups（とイメージ User の補助グループ） | core の `additionalGids`（launcher が gid 写像と照合して `setgroups` で適用） → cri。本変更で実装済み | core → cri | #2667 |
-| 6 | stop_signal | `StopRequest` にシグナルが無い（PLUG-1 の境界変更） → cri | core → cri | #2668 |
+| 6 | stop_signal | core の `StopRequest` に `signal` を足し（PLUG-1 の境界変更）、cri が受け入れる。本変更で実装済み | core → cri | #2668 |
 | 7 | mount の propagation（rslave / rshared） | core の `bind_mounts.rs` が拒否・`linux.rootfsPropagation` | core → cri | #2669 |
 | 8 | sysctls（namespaced のみ） | core の `linux.sysctl`（UnappliedField） | core → cri | #2670 |
 | 9 | log_path / log_directory | core / supervisor の CRI ログ形式の書き出し | core・supervisor → cri | #2671 |
-| 10 | cgroup_parent | core の `linux.cgroupsPath`（#2010 の方針で拒否。再判断が要る） | core → cri | #2672 |
+| 10 | cgroup_parent | core の `linux.cgroupsPath`（#2010 の方針で拒否。再判断が要る。判断材料は [cri-cgroup-parent.md](cri-cgroup-parent.md)。オーナー承認待ちで、それまで `UNIMPLEMENTED`） | core → cri | #2672 |
 | 11 | devices・CDI | core の `linux.devices`（UnappliedField）・gpu の CDI 適用 | gpu・core → cri | #2673 |
 | 12 | pod の pid / ipc の共有（join） | core の `linux.namespaces[].path` の拒否 | core → cri | #2674 |
 | 13 | pod netns の作成・結線 | core の network namespace の拒否・plugin-cri `netsetup` の `create_netns` | net・core・cri | #2675 |
@@ -92,6 +92,13 @@ CRI の `LinuxContainerSecurityContext.run_as_username` は、`ImageRootfsSource
 | `/etc/group` が symlink・FIFO・上限超過（uid 非 0 で名前が決まったとき） | `FAILED_PRECONDITION`。不在は空 |
 
 exec は `process.user` の非 root と `additionalGids` を引き続き `UNIMPLEMENTED` で拒否する。`ContainerStatus.user` の報告と `RuntimeHandlerFeatures` の `supplemental_groups_policy` は未対応。
+
+## stop_signal の受け入れ方式（CRI-2・PLUG-1。#2668）
+
+- core の `StopRequest` に `signal`（既定 SIGTERM）を足した（`with_signal` / `signal()`）。実装は `signal()` を停止の意図つきで 1 回送り、`grace` を過ぎても止まらなければ、シグナルが何であっても無条件に SIGKILL へ切り替える。全体の待ちは有界のまま（REPAIR-5）。wire の形式は変わらない
+- CRI の enum `Signal` の値は Linux の番号ではない（例: `SIGTERM = 23`、`SIGKILL = 13`）。`crates/cri/src/stop_signal.rs` の表で Linux の番号へ写す。`RUNTIME_DEFAULT`（0）は SIGTERM。実時間シグナルは glibc / moby の慣習（`SIGRTMIN` = 34、`SIGRTMAX` = 64）
+- 未知の値は CreateContainer の検証で `INVALID_ARGUMENT`。StopContainer は記録した config から、StopPodSandbox はコンテナごとに値を求めて渡す（写像に失敗したら SIGTERM へ落とさず `INTERNAL`）
+- 既知の差: イメージ config の `StopSignal` は読まないため、`RUNTIME_DEFAULT` は常に SIGTERM になる。ContainerStatus の `stop_signal` は config の値をそのまま返す（後続で扱う）
 
 ## capabilities の受け入れ方式（CRI-2・SEC-1。#2666）
 

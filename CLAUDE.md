@@ -99,6 +99,7 @@ fandhe-container/
 │   │   ├── audit-seccomp-reader.md  # AUDIT_SECCOMP の読み手と CAP_AUDIT_READ の付与の判断記録（v6.12 の原文での確認結果を含む。#2237・SEC-4・SUP-14。オーナー承認待ち）
 │   │   ├── plugin-backend-wiring.md  # バックエンド plugin の検証後の起動と RPC の配線の設計案（#1869・TASK-115・TASK-79 追補・PLUG-1・PLUG-7。承認待ち）
 │   │   ├── rootless-id-map-holder.md  # 範囲写像の書き込み先を専用の holder プロセスへ分け、中間プロセスが dumpable になる窓をなくす設計（#2374・CORE-6・SEC-5・SEC-1）
+│   │   ├── cri-cgroup-parent.md   # CRI の cgroup_parent の受け入れ方針の判断記録（#2672・CRI-2・CORE-4。オーナー承認待ち。判断が出るまで `UNIMPLEMENTED`）
 │   │   ├── config-id-mappings.md  # config の linux.uidMappings / gidMappings を受けるかの判断記録（#2240・SEC-5・CORE-6。オーナー承認待ち）
 │   │   ├── windows-state-store-acl.md  # Windows の FileStateStore の所有者 SID 照合・保護 DACL の実装方式（windows-sys / 自前宣言 / 恒久拒否）の判断記録（#2428・OCI-5・SEC-4。オーナー承認待ち）
 │   │   ├── oci-mounts-implicit-entries.md  # mounts[] の bind・sysfs 以外（暗黙に供給済みの /proc・/dev 系・tmpfs 等）を受けるかの判断記録（#2347・TASK-29 追補・OCI-4・SEC-1。オーナー承認待ち）

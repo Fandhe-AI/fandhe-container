@@ -53,7 +53,8 @@ pub trait ContainerRuntime: Send + Sync {
     /// 対応: CORE-2・ERR-2。
     fn kill(&self, req: &KillRequest) -> Result<ContainerStatus, TraitError>;
 
-    /// SIGTERM を送り、猶予時間（[`StopRequest::grace`]）を過ぎたら SIGKILL で強制停止する。
+    /// [`StopRequest::signal`]（既定 SIGTERM）を停止の意図つきで 1 回送り、猶予時間
+    /// （[`StopRequest::grace`]）を過ぎたら SIGKILL で強制停止する。
     ///
     /// CLI の `stop` サブコマンド（CLI-1）と CRI `StopContainer` に対応する。
     /// 猶予は呼び出し側が明示し、無期限には待たない（REPAIR-5）。
@@ -218,11 +219,18 @@ impl KillRequest {
 const STOP_GRACE_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// [`ContainerRuntime::stop`] の要求。
+///
+/// 実装は [`StopRequest::signal`]（既定 SIGTERM）を停止の意図つきで 1 回送り、
+/// [`StopRequest::grace`] を過ぎても止まらなければ、シグナルが何であっても無条件に
+/// SIGKILL へ切り替える（全体の待ちは有界のまま。REPAIR-5）。CRI の `stop_signal`
+/// （CRI-2。#2668）を運ぶための欄で、番号は Linux の体系（[`Signal`] の doc 参照）。
+/// 対応: PLUG-1。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct StopRequest {
     id: ContainerId,
     grace: Duration,
+    signal: Signal,
 }
 
 impl StopRequest {
@@ -238,7 +246,23 @@ impl StopRequest {
                 format!("grace must not exceed {STOP_GRACE_MAX:?}"),
             ));
         }
-        Ok(Self { id, grace })
+        Ok(Self {
+            id,
+            grace,
+            signal: Signal::SIGTERM,
+        })
+    }
+
+    /// 猶予の間に最初に送るシグナルを指定する（既定は SIGTERM）。
+    #[must_use]
+    pub fn with_signal(mut self, signal: Signal) -> Self {
+        self.signal = signal;
+        self
+    }
+
+    /// 最初に送るシグナル（既定 SIGTERM）を返す。
+    pub fn signal(&self) -> Signal {
+        self.signal
     }
 
     /// 対象コンテナの ID を返す。
@@ -745,6 +769,24 @@ mod tests {
         let err_max = StopRequest::new(sample_id(), Duration::MAX)
             .expect_err("Duration::MAX must be rejected");
         assert_eq!(err_max.code().as_str(), "INVALID_ARGUMENT");
+    }
+
+    /// PLUG-1・CRI-2: `StopRequest` の停止シグナルの既定は SIGTERM。
+    #[test]
+    fn plug1_stop_request_default_signal_is_sigterm() {
+        let req = StopRequest::new(sample_id(), Duration::from_secs(5)).expect("valid grace");
+        assert_eq!(req.signal(), Signal::SIGTERM);
+    }
+
+    /// PLUG-1・CRI-2: `with_signal` は signal だけを差し替え、id と grace を保つ。
+    #[test]
+    fn plug1_stop_request_with_signal_round_trips() {
+        let req = StopRequest::new(sample_id(), Duration::from_secs(5))
+            .expect("valid grace")
+            .with_signal(Signal::new(2).expect("2 is valid"));
+        assert_eq!(req.signal().as_u8(), 2);
+        assert_eq!(req.grace(), Duration::from_secs(5));
+        assert_eq!(req.id(), &sample_id());
     }
 
     /// OCI Runtime Spec: `ContainerState::as_str` が全バリアントで規定の小文字文字列を返す。

@@ -1274,6 +1274,7 @@ jobs:
             'production_launcher: scenario=groups-single-id-refused' \
             'production_launcher: exit_signal recorded once via audit relay (scenario=Q)' \
             'production_launcher: launch options reached the container (scenario=S ipc=host tmpfs=/run' \
+            'injected secret reached the container under subordinate id mapping (scenario=S-sub' \
             'production_launcher: capabilities drop applied (scenario=T pid='; do
             if ! grep -Fq "${part}" "${log}"; then
               echo "::error::production_launcher did not report: ${part} (possibly not executed)" >&2
@@ -1349,6 +1350,32 @@ jobs:
             exit 1
           fi
           echo "::notice::rootless_holder_expiry verified"
+
+      - name: rootless_holder_memory のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-core --test rootless_holder_memory --no-run
+
+      # holder が継承するメモリに注入ファイルの secret が無いこと（本番の holder の /proc/<pid>/mem を走査。陽性対照つき。
+      # CORE-6・SEC-5・SUP-12・#2628）。範囲写像の前提は要らない（unshare の user namespace のみ。Yama ptrace_scope=1 は
+      # 祖先が読める。新しい check-run は増えない）。
+      - name: rootless_holder_memory の実行（実機前提テスト・--ignored。CORE-6・SEC-5・#2628）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/rootless_holder_memory.log"
+          cargo test -p fandhe-container-core --test rootless_holder_memory -- --ignored 2>&1 | tee "${log}"
+          line='rootless_holder_memory: holder memory has no injected secret ('
+          if ! grep -Fq "${line}" "${log}"; then
+            echo "::error::rootless_holder_memory did not report: ${line} (possibly not executed)" >&2
+            exit 1
+          fi
+          if grep -Fq 'rootless_holder_memory: ignored' "${log}"; then
+            echo "::error::rootless_holder_memory reported an unexpected line: ignored" >&2
+            exit 1
+          fi
+          echo "::notice::rootless_holder_memory verified"
 
       - name: rootless_image_rootfs_remove のビルド（実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'

@@ -48,40 +48,222 @@ fn invalid(msg: &'static str) -> TraitError {
 }
 
 /// 注入するファイルの内容。`Debug` は長さだけを出し、内容を表に出さない。
-#[derive(Clone, PartialEq, Eq)]
-pub struct InjectedContent(Vec<u8>);
+///
+/// # 内容の置き場（#2628・CORE-6・SEC-5）
+///
+/// 範囲写像（`RootlessSubordinateIds`）の起動では、supervisor → 中間プロセス → ID 写像の holder の順に fork する。
+/// holder は exec せず、`unshare(CLONE_NEWUSER)` から解放まで dumpable のため、同じ uid のホスト側プロセスが
+/// `/proc/<holder>/mem` で holder のメモリ（fork 時点の中間プロセスのメモリの複製）を読める
+/// （`docs/design/rootless-id-map-holder.md` §4）。内容が呼び出し元のユーザー空間メモリにあると、その複製に
+/// secret が載る。そこで内容の置き場を 2 つに分ける。
+///
+/// - **封印 memfd**（[`InjectedContent::from_file`]。Linux）: ホストのファイルから `sendfile(2)` のカーネル内コピー
+///   だけで memfd へ置く。close-on-exec・fd 3 以上・封印（書き込み・伸長・縮小・seal 追加の禁止）で、ユーザー
+///   バッファを一度も通らない。holder は fd 3 以上を閉じてから dumpable になるため memfd を持たず、メモリにも
+///   現れない。PID 1 の `inject_files` が memfd から tmpfs のファイルへ `sendfile` で書く
+/// - **呼び出し元のメモリ**（[`InjectedContent::from_bytes`]）: `Vec` の内容が呼び出し元のヒープに残る。
+///   ゼロ化では realloc の残骸や一時コピーを消せず、内容は fork の後にも要るため、範囲写像では拒否される
+///   （[`InjectedContent::is_caller_memory`]。launcher の検査）。CLI → supervisor の結線では secret を fd で渡す
+///   必要がある（後続の制約）
+///
+/// 比較（`PartialEq`）は内容を読まない（比較のたびに内容がメモリへ載るため）。封印 memfd 同士は同一の memfd
+/// （`clone` で共有したもの）と長さが同じ場合だけ等しい。
+#[derive(Clone)]
+pub struct InjectedContent(Repr);
+
+#[derive(Clone)]
+enum Repr {
+    /// 呼び出し元のメモリにある内容。
+    Bytes(Vec<u8>),
+    /// 封印した memfd にある内容（`len` は注入するバイト数）。
+    #[cfg(target_os = "linux")]
+    Sealed {
+        fd: std::sync::Arc<std::os::fd::OwnedFd>,
+        len: usize,
+    },
+}
+
+/// 封印 memfd の名前（固定値。`/proc/<pid>/fd/N` のリンク先は `/memfd:fandhe-injected-content (deleted)`）。
+#[cfg(target_os = "linux")]
+const SEALED_NAME: &std::ffi::CStr = c"fandhe-injected-content";
 
 impl InjectedContent {
-    /// 内容から作る。[`INJECTED_FILE_MAX_BYTES`] 超は拒否する（空は許す）。
+    /// 呼び出し元のメモリの内容から作る。[`INJECTED_FILE_MAX_BYTES`] 超は拒否する（空は許す）。
+    ///
+    /// 内容が呼び出し元のメモリに残るため、範囲写像（`RootlessSubordinateIds`）の起動では拒否される。
+    /// secret には [`InjectedContent::from_file`] を使う。
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, TraitError> {
         if bytes.len() > INJECTED_FILE_MAX_BYTES {
             return Err(invalid("injected file content is too large"));
         }
-        Ok(Self(bytes))
+        Ok(Self(Repr::Bytes(bytes)))
     }
 
-    /// 内容のバイト列。
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+    /// 開いた通常ファイルの内容から作る。[`INJECTED_FILE_MAX_BYTES`] 超は拒否する（空は許す）。
+    ///
+    /// Linux では内容をユーザー空間に載せず、`sendfile(2)` で封印 memfd へ置く（型の doc を参照）。memfd の作成・
+    /// コピー・封印の失敗はどれもエラーで、ユーザーバッファへ縮退しない（fail-closed）。上限は
+    /// `INJECTED_FILE_MAX_BYTES + 1` バイトでコピーを止めて判定する（無制限コピーの防止）。ファイルの現在位置は
+    /// 使わず先頭から読む。非 Linux には holder が無いため、上限まで読んだ `Bytes` を返す。
+    pub fn from_file(file: &std::fs::File) -> Result<Self, TraitError> {
+        #[cfg(target_os = "linux")]
+        {
+            sealed_from_file(file)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            use std::io::{Read as _, Seek as _, SeekFrom};
+            let internal = |_| TraitError::new(ErrorCode::Internal, "failed to read injected file");
+            let mut handle = file;
+            // 現在位置を使わず先頭から読み、読み終えたら元の位置へ戻す（Linux 実装と同じ契約）。
+            let saved = handle.stream_position().map_err(internal)?;
+            handle.seek(SeekFrom::Start(0)).map_err(internal)?;
+            let mut buf = Vec::new();
+            let limit = INJECTED_FILE_MAX_BYTES as u64 + 1;
+            let read = (&mut handle).take(limit).read_to_end(&mut buf);
+            let restore = handle.seek(SeekFrom::Start(saved));
+            read.map_err(internal)?;
+            restore.map_err(internal)?;
+            Self::from_bytes(buf)
+        }
+    }
+
+    /// 内容が呼び出し元のメモリ（[`InjectedContent::from_bytes`]）にあるか。範囲写像の起動の拒否に使う。
+    pub fn is_caller_memory(&self) -> bool {
+        matches!(self.0, Repr::Bytes(_))
     }
 
     /// 内容のバイト数。
     pub fn len(&self) -> usize {
-        self.0.len()
+        match &self.0 {
+            Repr::Bytes(b) => b.len(),
+            #[cfg(target_os = "linux")]
+            Repr::Sealed { len, .. } => *len,
+        }
     }
 
     /// 空か。
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.len() == 0
+    }
+
+    /// 内容を `out`（書き込み用に開いた通常ファイル）へ、先頭から `len()` バイトちょうど書く。
+    ///
+    /// `crate::exec` の `inject_files`（PID 1 の pivot 前）が呼ぶ。封印 memfd は `sendfile(2)` のカーネル内コピーで、
+    /// ユーザーバッファを通さない。途中で終端に達したら（`len()` に満たない）失敗にする。
+    #[cfg(target_os = "linux")]
+    pub(crate) fn write_to(&self, out: &mut std::fs::File) -> std::io::Result<()> {
+        match &self.0 {
+            Repr::Bytes(b) => {
+                use std::io::Write as _;
+                out.write_all(b)
+            }
+            Repr::Sealed { fd, len } => {
+                use std::os::fd::AsFd as _;
+                let mut offset: i64 = 0;
+                let mut done = 0usize;
+                while done < *len {
+                    let n =
+                        crate::sys::sendfile_at(out.as_fd(), fd.as_fd(), &mut offset, *len - done)
+                            .map_err(sys_io_error)?;
+                    if n == 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "sealed injected content ended early",
+                        ));
+                    }
+                    done += n;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// 封印 memfd に付いている seal（試験用。`Bytes` は `None`）。
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn sealed_seals(&self) -> Option<crate::sys::SealSet> {
+        use std::os::fd::AsFd as _;
+        match &self.0 {
+            Repr::Sealed { fd, .. } => crate::sys::get_seals(fd.as_fd()).ok(),
+            Repr::Bytes(_) => None,
+        }
+    }
+
+    /// 封印 memfd の fd 番号（試験用。`Bytes` は `None`）。
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn sealed_raw_fd(&self) -> Option<i32> {
+        match &self.0 {
+            Repr::Sealed { fd, .. } => Some(std::os::fd::AsRawFd::as_raw_fd(&**fd)),
+            Repr::Bytes(_) => None,
+        }
     }
 }
+
+#[cfg(target_os = "linux")]
+fn sys_io_error(e: crate::sys::SysError) -> std::io::Error {
+    match e {
+        crate::sys::SysError::Os(errno) => std::io::Error::from_raw_os_error(errno),
+        _ => std::io::Error::other("sendfile is not supported"),
+    }
+}
+
+/// ホストのファイル `file` を封印 memfd へ `sendfile` で置く（[`InjectedContent::from_file`] の Linux 実装）。
+#[cfg(target_os = "linux")]
+fn sealed_from_file(file: &std::fs::File) -> Result<InjectedContent, TraitError> {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    let fail = |msg: &'static str| TraitError::new(ErrorCode::Internal, msg);
+    let mem = crate::sys::memfd_create_for_data(SEALED_NAME)
+        .map_err(|_| fail("failed to create a memfd for injected file content"))?;
+    let limit = INJECTED_FILE_MAX_BYTES + 1;
+    let mut offset: i64 = 0;
+    let mut total = 0usize;
+    while total < limit {
+        let n = crate::sys::sendfile_at(mem.as_fd(), file.as_fd(), &mut offset, limit - total)
+            .map_err(|_| fail("failed to copy injected file content"))?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    if total > INJECTED_FILE_MAX_BYTES {
+        return Err(invalid("injected file content is too large"));
+    }
+    crate::sys::seal_data_memfd(mem.as_fd())
+        .map_err(|_| fail("failed to seal injected file content"))?;
+    // holder は fd 3 以上だけを閉じるため、0〜2 に来た fd は 3 以上へ複製する（元は drop で閉じる）。
+    let mem = if mem.as_raw_fd() > 2 {
+        mem
+    } else {
+        crate::sys::dup_fd_at_least(mem.as_fd(), 3)
+            .map_err(|_| fail("failed to move injected file content above stdio"))?
+    };
+    Ok(InjectedContent(Repr::Sealed {
+        fd: std::sync::Arc::new(mem),
+        len: total,
+    }))
+}
+
+impl PartialEq for InjectedContent {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Repr::Bytes(a), Repr::Bytes(b)) => a == b,
+            #[cfg(target_os = "linux")]
+            (Repr::Sealed { fd: a, len: la }, Repr::Sealed { fd: b, len: lb }) => {
+                std::sync::Arc::ptr_eq(a, b) && la == lb
+            }
+            #[cfg(target_os = "linux")]
+            _ => false,
+        }
+    }
+}
+
+impl Eq for InjectedContent {}
 
 impl std::fmt::Debug for InjectedContent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "InjectedContent(<redacted {} bytes>)", self.0.len())
+        write!(f, "InjectedContent(<redacted {} bytes>)", self.len())
     }
 }
-
 /// 注入ファイルのモード（`0o777` 以下）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InjectedFileMode(u32);
@@ -533,6 +715,123 @@ mod tests {
         assert_eq!(many.groups()[0].tmpfs_size, 64 * 65_536);
         let empty = InjectedFileSet::new();
         assert!(empty.groups().is_empty() && empty.is_empty());
+    }
+
+    /// 一時ファイルに `bytes` を書いて開く（試験用。使い終わったら呼び出し側が消す。OS 共通）。
+    fn host_file(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, std::fs::File) {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("fandhe-inj-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("host");
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(bytes))
+            .expect("write");
+        let file = std::fs::File::open(&path).expect("open");
+        (dir, file)
+    }
+
+    /// CORE-6・SEC-5(#2628): `from_file` は封印 memfd（fd 3 以上・close-on-exec・固定名・封印済み・長さ一致）に置き、
+    /// `write_to` で元と同じ内容が具体値で書き出される。呼び出し元のメモリ扱いではない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core6_sec5_injected_content_from_file_is_sealed_memfd() {
+        use std::io::Read as _;
+        let (dir, file) = host_file("sealed", SENTINEL);
+        let c = InjectedContent::from_file(&file).expect("from_file");
+        assert!(!c.is_caller_memory());
+        assert_eq!(c.len(), SENTINEL.len());
+        let raw = c.sealed_raw_fd().expect("sealed");
+        assert!(raw >= 3, "fd {raw}");
+        let link = std::fs::read_link(format!("/proc/self/fd/{raw}")).expect("link");
+        assert_eq!(
+            link.to_string_lossy(),
+            "/memfd:fandhe-injected-content (deleted)"
+        );
+        let seals = c.sealed_seals().expect("seals");
+        assert!(seals.contains(crate::sys::SealSet::DATA_COPY));
+        // close-on-exec が立つ（fdinfo の flags は 8 進で O_CLOEXEC = 02000000）。
+        let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{raw}")).expect("fdinfo");
+        assert!(info.contains("flags:\t02"), "{info}");
+        // 封印後は /proc 経由で書き込み用に開き直しても書き込めない。
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{raw}"))
+        {
+            assert!(
+                std::io::Write::write(&mut f, b"x").is_err(),
+                "sealed memfd must reject writes"
+            );
+        }
+        // 書き出し。
+        let out_path = dir.join("out");
+        let mut out = std::fs::File::create(&out_path).expect("out");
+        c.write_to(&mut out).expect("write_to");
+        let mut got = Vec::new();
+        std::fs::File::open(&out_path)
+            .and_then(|mut f| f.read_to_end(&mut got))
+            .expect("read");
+        assert_eq!(got, SENTINEL);
+        // 2 回目も同じ内容（カーソルを共有しない）。
+        let out2_path = dir.join("out2");
+        let mut out2 = std::fs::File::create(&out2_path).expect("out2");
+        c.clone().write_to(&mut out2).expect("write_to again");
+        assert_eq!(std::fs::read(&out2_path).expect("read"), SENTINEL);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CORE-6・SEC-5(#2628): `from_file` の上限は ちょうど 512 KiB まで成功、+1 は InvalidArgument。空は成功。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core6_sec5_injected_content_from_file_bounds() {
+        let (d1, f1) = host_file("max", &vec![b'a'; INJECTED_FILE_MAX_BYTES]);
+        assert_eq!(
+            InjectedContent::from_file(&f1).expect("max").len(),
+            INJECTED_FILE_MAX_BYTES
+        );
+        let (d2, f2) = host_file("over", &vec![b'a'; INJECTED_FILE_MAX_BYTES + 1]);
+        assert_eq!(
+            err_of(InjectedContent::from_file(&f2)),
+            invalid_msg("injected file content is too large")
+        );
+        let (d3, f3) = host_file("empty", b"");
+        let c = InjectedContent::from_file(&f3).expect("empty");
+        assert!(c.is_empty());
+        for d in [d1, d2, d3] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// CORE-6・SEC-5(#2628): `from_file` は現在位置が先頭でない File でも先頭から読み、同じ File を
+    /// 2 回読んでも同じ内容を返す（OS 非依存の契約）。
+    #[test]
+    fn core6_sec5_injected_content_from_file_ignores_cursor() {
+        use std::io::{Seek as _, SeekFrom};
+        let (dir, mut file) = host_file("cursor", SENTINEL);
+        file.seek(SeekFrom::Start(5)).expect("seek");
+        let a = InjectedContent::from_file(&file).expect("a");
+        let b = InjectedContent::from_file(&file).expect("b");
+        assert_eq!(a.len(), SENTINEL.len());
+        assert_eq!(b.len(), SENTINEL.len());
+        assert_eq!(file.stream_position().expect("pos"), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CORE-6・SEC-5(#2628): 比較は同一性。clone 同士は等しく、同じ内容でも別々に作った封印 memfd や
+    /// `Bytes` とは等しくない。`Debug` は長さだけで内容を出さない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core6_sec5_injected_content_equality_is_identity_for_sealed() {
+        let (dir, file) = host_file("eq", SENTINEL);
+        let a = InjectedContent::from_file(&file).expect("a");
+        let b = InjectedContent::from_file(&file).expect("b");
+        assert_eq!(a, a.clone());
+        assert_ne!(a, b);
+        assert_ne!(a, content(SENTINEL));
+        assert_eq!(content(SENTINEL), content(SENTINEL));
+        assert!(content(SENTINEL).is_caller_memory());
+        assert_eq!(format!("{a:?}"), "InjectedContent(<redacted 20 bytes>)");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SUP-12・TASK-169.4.2: どのエラー message にも内容・入力値が現れない。

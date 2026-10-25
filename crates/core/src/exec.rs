@@ -1041,6 +1041,9 @@ pub struct MountIsolation {
     /// プロセス自身の PID namespace（`ns/pid`）を映すため、子向けの `pid_for_children`
     /// ではなくこちらを束縛する。
     pid_ns: String,
+    /// `rslave` の bind について、`/` の再帰 private 化の前に複製した元（`establish_with` が作り、`mount_binds` が取り出す。
+    /// 無ければ空。#2669・OCI-4・CRI-2）。
+    host_slave_clones: bind_mounts::HostSlaveClones,
     /// `!Send`・`!Sync` にするための印（生ポインタは Send / Sync でない）。
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -1200,7 +1203,8 @@ impl MountIsolation {
     ///    （判定は `check_establish_preconditions`）
     /// 2. 呼び出しスレッドを `unshare(CLONE_NEWNS)` で新しい mount namespace へ移し、`/` を
     ///    再帰 private にする（コピーされたマウントの shared peer から切り離し、以後のマウントを
-    ///    外へ伝播させない）
+    ///    外へ伝播させない）。ただし `establish_with` に `rslave` の bind があれば、private 化の前に
+    ///    その元を複製する（#2669）
     /// 3. `unshare` の前後で `/proc/thread-self/ns/mnt` が変わったことを確かめ、作成直後の
     ///    mount namespace と PID namespace を証跡に記録する
     ///
@@ -1222,6 +1226,19 @@ impl MountIsolation {
     /// 移るのは呼んだスレッドだけのため、前提としてシングルスレッドであることを確かめている
     /// （establish 後に作ったスレッドは新しい mount namespace を引き継ぐ）。
     pub fn establish() -> Result<Self, ExecError> {
+        Self::establish_with(None)
+    }
+
+    /// [`Self::establish`] の本体。`binds` に `rslave` の bind があれば、`unshare(CLONE_NEWNS)` の直後・`/` の再帰 private 化の前に、
+    /// その元を固定してホスト側が shared か slave であることを確かめ、複製する（#2669・OCI-4・CRI-2・SEC-1）。
+    ///
+    /// 再帰 private 化は接続済みの木の `master` 関係をすべて消すため、`rslave` は private 化の前に複製しておかないと表現できない
+    /// （複製は匿名 namespace にあり、private 化の対象にならない）。`/` 自体は従来どおり再帰 private のままで、複製を `mount_binds` が
+    /// 付け替えるまでの間も、ホストへの伝播は起きない（slave は受けるだけ）。元がホスト側で private なら、rootfs に触れる前に
+    /// `FAILED_PRECONDITION` で失敗する。`binds` が `None` か `rslave` を含まなければ [`Self::establish`] と同じ。
+    pub(crate) fn establish_with(
+        binds: Option<&crate::oci_runtime::BindMountSet>,
+    ) -> Result<Self, ExecError> {
         let fail = |msg: &str| {
             ExecError::new(
                 ErrorCode::FailedPrecondition,
@@ -1247,6 +1264,10 @@ impl MountIsolation {
             thread_ns_link("mnt").map_err(|_| fail("cannot read /proc/thread-self/ns/mnt"))?;
         sys::unshare_namespaces(&[NsFlag::Mount])
             .map_err(|e| ExecError::from_sys(e, IsolationStage::Unshare, "unshare(CLONE_NEWNS)"))?;
+        let host_slave_clones = match binds {
+            Some(set) if set.has_host_slave() => bind_mounts::clone_host_slave_sources(set)?,
+            _ => bind_mounts::HostSlaveClones::default(),
+        };
         sys::mount_root_private_recursive().map_err(|e| {
             ExecError::from_sys(e, IsolationStage::MountPrivate, "mount(MS_PRIVATE)")
         })?;
@@ -1258,8 +1279,14 @@ impl MountIsolation {
         Ok(Self {
             mnt_ns,
             pid_ns,
+            host_slave_clones,
             _not_send: std::marker::PhantomData,
         })
+    }
+
+    /// `establish_with` が複製した `rslave` の元の置き場（`mount_binds` が取り出す）。
+    fn host_slave_clones(&self) -> &bind_mounts::HostSlaveClones {
+        &self.host_slave_clones
     }
 
     /// 呼び出し元の現在の状態（PID・スレッドの mount / PID namespace）が証跡と一致するか。
@@ -1299,6 +1326,28 @@ pub struct IsolationPlan {
     hostname: Option<Hostname>,
     uid_mapping: IdMapping,
     gid_mapping: IdMapping,
+    /// `Mount` を含むときの `/` の再帰的な伝播（既定は private。`rslave` の bind を求める起動だけ slave。#2669）。
+    root_propagation: sys::RootPropagation,
+}
+
+impl IsolationPlan {
+    /// `rslave` の bind mount を求める起動のとき、`/` を `MS_REC|MS_SLAVE` にする（既定は `MS_REC|MS_PRIVATE`）。
+    ///
+    /// ホストの peer group との master 関係を、PID 1 側の `MountIsolation::establish_with` が元を複製するまで残すための
+    /// 選択で、外へは伝播しない（slave は受けるだけ）。launcher が `BindMountSet::has_host_slave` で決める（OCI-4・CRI-2・SEC-1）。
+    pub(crate) fn with_host_slave_root(mut self, enabled: bool) -> Self {
+        self.root_propagation = root_propagation_of(enabled);
+        self
+    }
+}
+
+/// `rslave` を求めるかから `/` の伝播を決める。
+const fn root_propagation_of(host_slave: bool) -> sys::RootPropagation {
+    if host_slave {
+        sys::RootPropagation::Slave
+    } else {
+        sys::RootPropagation::Private
+    }
 }
 
 /// rootful 経路の検証済み計画。[`plan_rootful_host_root`] だけが作り、
@@ -1361,6 +1410,7 @@ fn plan_for(config: &IsolationConfig, euid: u32, egid: u32) -> Result<IsolationP
         hostname: config.hostname.clone(),
         uid_mapping: IdMapping::single(euid),
         gid_mapping: IdMapping::single(egid),
+        root_propagation: sys::RootPropagation::Private,
     })
 }
 
@@ -1429,6 +1479,7 @@ pub fn isolate(plan: &IsolationPlan) -> Result<IsolationReport, ExecError> {
         plan.namespaces,
         plan.hostname.as_ref(),
         Some((plan.uid_mapping, plan.gid_mapping)),
+        plan.root_propagation,
     )?;
     Ok(IsolationReport {
         privilege: IsolationPrivilege::RootlessSingleId,
@@ -1451,7 +1502,12 @@ pub fn isolate_rootful_host_root(plan: &RootfulHostRootPlan) -> Result<Isolation
             None,
         ));
     }
-    unshare_and_configure(plan.namespaces, plan.hostname.as_ref(), None)?;
+    unshare_and_configure(
+        plan.namespaces,
+        plan.hostname.as_ref(),
+        None,
+        sys::RootPropagation::Private,
+    )?;
     Ok(IsolationReport {
         privilege: IsolationPrivilege::RootfulHostRoot,
         namespaces: plan.namespaces,
@@ -1477,6 +1533,16 @@ pub struct SubordinateIsolationPlan {
     timeout: Duration,
     euid: u32,
     egid: u32,
+    /// `Mount` を含むときの `/` の再帰的な伝播（[`IsolationPlan`] の同名の項目と同じ。#2669）。
+    root_propagation: sys::RootPropagation,
+}
+
+impl SubordinateIsolationPlan {
+    /// [`IsolationPlan::with_host_slave_root`] と同じ（範囲写像の経路）。
+    pub(crate) fn with_host_slave_root(mut self, enabled: bool) -> Self {
+        self.root_propagation = root_propagation_of(enabled);
+        self
+    }
 }
 
 /// [`isolate_rootless_subordinate`] の成功結果。[`IsolationReport`] は拡張できない型のため、
@@ -1547,6 +1613,7 @@ fn plan_subordinate_for(
         timeout,
         euid,
         egid,
+        root_propagation: sys::RootPropagation::Private,
     })
 }
 
@@ -1593,23 +1660,31 @@ pub(crate) fn isolate_join(
     join: &crate::oci_runtime::NamespaceJoin,
 ) -> Result<(), ExecError> {
     let (euid, egid) = (sys::effective_uid(), sys::effective_gid());
-    let (identity_ok, namespaces, hostname, uid, gid): (_, _, _, Vec<IdMapping>, Vec<IdMapping>) =
-        match plan {
-            IntermediatePlan::SingleId(p) => (
-                euid == p.uid_mapping.host_id && egid == p.gid_mapping.host_id,
-                p.namespaces,
-                p.hostname.as_ref(),
-                vec![p.uid_mapping],
-                vec![p.gid_mapping],
-            ),
-            IntermediatePlan::Subordinate(p) => (
-                euid == p.euid && egid == p.egid,
-                p.namespaces,
-                p.hostname.as_ref(),
-                p.uid.entries().to_vec(),
-                p.gid.entries().to_vec(),
-            ),
-        };
+    let (identity_ok, namespaces, hostname, uid, gid, root_propagation): (
+        _,
+        _,
+        _,
+        Vec<IdMapping>,
+        Vec<IdMapping>,
+        _,
+    ) = match plan {
+        IntermediatePlan::SingleId(p) => (
+            euid == p.uid_mapping.host_id && egid == p.gid_mapping.host_id,
+            p.namespaces,
+            p.hostname.as_ref(),
+            vec![p.uid_mapping],
+            vec![p.gid_mapping],
+            p.root_propagation,
+        ),
+        IntermediatePlan::Subordinate(p) => (
+            euid == p.euid && egid == p.egid,
+            p.namespaces,
+            p.hostname.as_ref(),
+            p.uid.entries().to_vec(),
+            p.gid.entries().to_vec(),
+            p.root_propagation,
+        ),
+    };
     if !identity_ok {
         return Err(ExecError::from_violation(
             ViolationReason::IdentityChanged,
@@ -1638,7 +1713,7 @@ pub(crate) fn isolate_join(
     )?;
     let rest = namespaces.without(Namespace::User).without(Namespace::Ipc);
     if !rest.is_empty() {
-        unshare_and_configure(rest, hostname, None)?;
+        unshare_and_configure(rest, hostname, None, root_propagation)?;
     }
     Ok(())
 }
@@ -1865,7 +1940,7 @@ fn isolate_rootless_subordinate_with(
 
     let rest = plan.namespaces.without(Namespace::User);
     if !rest.is_empty() {
-        unshare_and_configure(rest, plan.hostname.as_ref(), None)?;
+        unshare_and_configure(rest, plan.hostname.as_ref(), None, plan.root_propagation)?;
     }
     let container_root = |host_id| IdMapping {
         container_id: 0,
@@ -2179,6 +2254,7 @@ fn unshare_and_configure(
     namespaces: NamespaceSet,
     hostname: Option<&Hostname>,
     mappings: Option<(IdMapping, IdMapping)>,
+    root_propagation: sys::RootPropagation,
 ) -> Result<(), ExecError> {
     sys::unshare_namespaces(&namespaces.flags())
         .map_err(|e| ExecError::from_sys(e, IsolationStage::Unshare, "unshare"))?;
@@ -2191,8 +2267,12 @@ fn unshare_and_configure(
     }
 
     if namespaces.contains(Namespace::Mount) {
-        sys::mount_root_private_recursive().map_err(|e| {
-            ExecError::from_sys(e, IsolationStage::MountPrivate, "mount(MS_PRIVATE)")
+        sys::mount_root_recursive(root_propagation).map_err(|e| {
+            let what = match root_propagation {
+                sys::RootPropagation::Private => "mount(MS_PRIVATE)",
+                sys::RootPropagation::Slave => "mount(MS_SLAVE)",
+            };
+            ExecError::from_sys(e, IsolationStage::MountPrivate, what)
         })?;
     }
 
@@ -3041,6 +3121,21 @@ mod tests {
         );
     }
 
+    /// OCI-4・CRI-2（#2669）: `/` の伝播は既定が private で、`rslave` の bind を求める起動だけ slave にできる。
+    #[test]
+    fn oci4_plan_root_propagation_defaults_to_private_and_opts_into_slave() {
+        let p = plan_for(&cfg(NamespaceSet::all(), None), 4242, 4242).unwrap();
+        assert_eq!(p.root_propagation, sys::RootPropagation::Private);
+        let slave = p.clone().with_host_slave_root(true);
+        assert_eq!(slave.root_propagation, sys::RootPropagation::Slave);
+        assert_eq!(
+            slave.with_host_slave_root(false).root_propagation,
+            sys::RootPropagation::Private
+        );
+        assert_eq!(root_propagation_of(true), sys::RootPropagation::Slave);
+        assert_eq!(root_propagation_of(false), sys::RootPropagation::Private);
+    }
+
     const STATUS_PID1: &str = "Name:\tx\nNSpid:\t4321\t1\nThreads:\t1\n";
 
     /// 再監査 P2-2・P2-3: establish の前提（PID 1・NSpid 末尾 1・入れ子・シングルスレッド）。
@@ -3229,6 +3324,7 @@ mod tests {
         MountIsolation {
             mnt_ns: mnt_ns.to_string(),
             pid_ns: pid_ns.to_string(),
+            host_slave_clones: Default::default(),
             _not_send: std::marker::PhantomData,
         }
     }

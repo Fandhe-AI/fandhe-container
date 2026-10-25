@@ -54,7 +54,8 @@ mod working_dir;
 #[cfg(target_os = "linux")]
 pub(crate) use bind_mounts::ProtectedFsRoot;
 pub use bind_mounts::{
-    BindMountError, BindMountErrorKind, BindMountSet, BindMountSpec, audit_bind_mount_error,
+    BindMountError, BindMountErrorKind, BindMountSet, BindMountSpec, BindPropagation,
+    audit_bind_mount_error,
 };
 pub use cgroup_requirement::{
     CgroupJoinMeans, CgroupRequirement, launch_after_cgroup_check, require_cgroup_join,

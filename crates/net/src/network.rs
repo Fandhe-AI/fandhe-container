@@ -1120,8 +1120,6 @@ pub struct ContainerAttachSpec {
     gateway: IpPrefix,
     table: NftName,
     ports: Vec<PortPublish>,
-    /// この接続の世代識別子（`new` ごとに新規）。veth の所有トークンと取り残しの請求書に載る。
-    generation: String,
 }
 
 impl ContainerAttachSpec {
@@ -1146,20 +1144,7 @@ impl ContainerAttachSpec {
             gateway: network.gateway,
             table: network.table.clone(),
             ports: Vec::new(),
-            generation: new_generation(),
         })
-    }
-
-    /// この接続の世代識別子。
-    pub fn generation(&self) -> &str {
-        &self.generation
-    }
-
-    /// テスト用: 世代を固定する。
-    #[cfg(test)]
-    pub(crate) fn with_generation_for_test(mut self, generation: &str) -> Self {
-        self.generation = generation.to_owned();
-        self
     }
 
     /// ポート公開の指定を加える（既定は公開なし）。件数が [`MAX_PORT_PUBLISHES`] を超える、または
@@ -1535,6 +1520,20 @@ pub(crate) fn attach_container_with<O: AttachOps>(
     ipam: &mut StaticIpam,
     ports: &mut PortRegistry,
 ) -> Result<AttachedContainer<O::Netns>, ContainerAttachError> {
+    attach_container_with_generation(ops, spec, ipam, ports, &new_generation())
+}
+
+/// [`attach_container_with`] の本体。接続の世代識別子を呼び出し側から受ける（attach の試行ごとに発行するため
+/// spec には持たせない。テストでは固定値を渡す）。世代は veth の所有トークンと取り残しの請求書に載る
+/// （NET-1・#2681）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn attach_container_with_generation<O: AttachOps>(
+    ops: &O,
+    spec: &ContainerAttachSpec,
+    ipam: &mut StaticIpam,
+    ports: &mut PortRegistry,
+    generation: &str,
+) -> Result<AttachedContainer<O::Netns>, ContainerAttachError> {
     let fail = |error, step, rollback| ContainerAttachError {
         error,
         step,
@@ -1543,7 +1542,7 @@ pub(crate) fn attach_container_with<O: AttachOps>(
             spec.network.clone(),
             spec.bridge_token.clone(),
             spec.endpoint.clone(),
-            spec.generation.clone(),
+            generation.to_owned(),
         ))),
     };
     let names = VethNames::derive(&spec.endpoint)
@@ -1647,7 +1646,7 @@ pub(crate) fn attach_container_with<O: AttachOps>(
     };
 
     // ifindex は再利用されうるため、削除時に元の veth と照合できるよう所有トークンを刻む。
-    let host_token = host_owner_token(&spec.bridge_token, &spec.endpoint, &spec.generation);
+    let host_token = host_owner_token(&spec.bridge_token, &spec.endpoint, generation);
     let attach = || {
         ops.set_owner_token(host_index, &host_token)
             .map_err(|e| (e, AttachStep::SetOwnerToken))?;
@@ -3003,9 +3002,17 @@ mod attach_tests {
     }
 
     fn spec(id: &str) -> ContainerAttachSpec {
-        ContainerAttachSpec::new(eid(id), &created(), netns_dir())
-            .unwrap()
-            .with_generation_for_test(TEST_GEN)
+        ContainerAttachSpec::new(eid(id), &created(), netns_dir()).unwrap()
+    }
+
+    /// 世代を固定して接続する（本番は試行ごとに発行。fake の呼び出し列を決定的にするため）。
+    fn attach_container_with<O: AttachOps>(
+        ops: &O,
+        spec: &ContainerAttachSpec,
+        ipam: &mut StaticIpam,
+        ports: &mut PortRegistry,
+    ) -> Result<AttachedContainer<O::Netns>, ContainerAttachError> {
+        super::attach_container_with_generation(ops, spec, ipam, ports, TEST_GEN)
     }
 
     /// 呼び出しを記録し、指定手順で失敗を注入する fake。link の ifindex は名前の接頭辞で決める。
@@ -3252,14 +3259,35 @@ mod attach_tests {
     /// テストで固定する接続の世代識別子。
     const TEST_GEN: &str = "0123456789abcdef0123456789abcdef";
 
-    /// NET-1・#2681: 世代識別子は接続（spec）ごとに別の値で、形式を満たす。
+    /// NET-1・#2681: 世代識別子は発行ごとに別の値で、形式を満たす。
     #[test]
-    fn net1_generation_is_unique_per_spec() {
-        let a = ContainerAttachSpec::new(eid("c1"), &created(), netns_dir()).unwrap();
-        let b = ContainerAttachSpec::new(eid("c1"), &created(), netns_dir()).unwrap();
-        assert_ne!(a.generation(), b.generation());
-        assert!(is_valid_generation(a.generation()));
-        assert_eq!(a.generation().len(), GENERATION_LEN);
+    fn net1_generation_is_unique_per_attempt() {
+        let a = new_generation();
+        let b = new_generation();
+        assert_ne!(a, b);
+        assert!(is_valid_generation(&a));
+        assert_eq!(a.len(), GENERATION_LEN);
+    }
+
+    /// NET-1・#2681: 同じ spec での 2 回の試行は別の世代の所有トークンを刻む（再接続が古い請求書と重ならない）。
+    #[test]
+    fn net1_same_spec_attempts_get_distinct_tokens() {
+        let sp = spec("c1");
+        let a = super::attach_container_with(
+            &Fake::default(),
+            &sp,
+            &mut ipam(),
+            &mut PortRegistry::new(),
+        )
+        .unwrap();
+        let b = super::attach_container_with(
+            &Fake::default(),
+            &sp,
+            &mut ipam(),
+            &mut PortRegistry::new(),
+        )
+        .unwrap();
+        assert_ne!(a.host_token, b.host_token);
     }
 
     /// NET-1: netns 置き場は絶対パスのみ。pin 先は置き場直下の ID 名。
@@ -3340,9 +3368,7 @@ mod attach_tests {
     fn spec_for(id: &str, gateway_len: u8) -> ContainerAttachSpec {
         let mut net = created();
         net.gateway = IpPrefix::new(IpAddr::V4(Ipv4Addr::new(10, 89, 0, 1)), gateway_len).unwrap();
-        ContainerAttachSpec::new(eid(id), &net, netns_dir())
-            .unwrap()
-            .with_generation_for_test(TEST_GEN)
+        ContainerAttachSpec::new(eid(id), &net, netns_dir()).unwrap()
     }
 
     /// NET-1・ERR-1・TASK-139.2.2: プール枯渇で veth と netns をこの順に戻し、元のエラーを返す。

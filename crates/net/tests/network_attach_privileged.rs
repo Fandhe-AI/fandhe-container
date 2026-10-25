@@ -508,8 +508,14 @@ mod linux {
             .map_err(|e| fail(format!("attach c4 failed at {:?}: {e}", e.step)))?;
         let host4 = attached4.host_veth.clone();
         let pin4 = attached4.netns_path.clone();
+        // 世代は attach の試行ごとに発行されるため、成功ハンドルの所有トークン（`<..>/g/<世代>`）から取る。
+        let generation4 = attached4
+            .host_token
+            .rsplit_once("/g/")
+            .map(|(_, g)| g.to_owned())
+            .ok_or_else(|| fail("host_token has no generation"))?;
         let record = format!(
-            "fandhe-net-attach-claim v1\nnetwork=att\nendpoint=c4\ntoken={}\nveth=1\nnetns=1\nquarantine=0\n",
+            "fandhe-net-attach-claim v1\nnetwork=att\nendpoint=c4\ntoken={}\ngeneration={generation4}\nveth=1\nnetns=1\nquarantine=0\n",
             net.bridge_token
         );
         let claim4 = FailedAttachClaim::from_record(&record)?;

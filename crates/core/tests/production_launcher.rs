@@ -36,6 +36,11 @@
 //!   `/etc/subuid`・`/etc/subgid` の範囲写像（コンテナ 0 → 自 ID、コンテナ 1 以上 → subuid / subgid の範囲の先頭）と
 //!   完全一致することを照合する。opt-in 時に前提（`uidmap`・自ユーザーの subuid / subgid 行・`USER`）が無ければ失敗とする。
 //!   root で実行された場合は、この launcher の構築が `PermissionDenied`（SEC-5）で拒否されることだけを照合する
+//! - シナリオ S の範囲写像版（`FANDHE_CONTAINER_TEST_ID_HELPER=1` の時だけ。CORE-6・SEC-5・SUP-12・#2628）: ホストのファイルを
+//!   `InjectedContent::from_file`（封印 memfd）にした注入を `RootlessSubordinateIds` の launcher で start し、注入の
+//!   内容とモードがコンテナ内で具体値で一致することを照合する（呼び出し元のメモリ由来の内容は launcher が拒否する。
+//!   holder のメモリに secret が無いことは `rootless_holder_memory` が照合する）。成功時は
+//!   `production_launcher: injected secret reached the container under subordinate id mapping (scenario=S-subordinate)` を出す
 //! - シナリオ J（exec 後の capability と seccomp の実効。#2012・SEC-1・CORE-5）: コンテナ内プローブ（`--with-restrictions`）の
 //!   `/proc/self/status` が `CapInh`・`CapAmb` = 0、`CapPrm`・`CapEff`・`CapBnd` = `0x0000_0000_a804_25fb`（OCI 既定の 14 個。
 //!   公開 API の `OCI_DEFAULT_CAPABILITIES` から組んだマスクとリテラルの両方と照合）で、ホストから見た同プロセスの
@@ -787,6 +792,7 @@ mod linux {
         scenario_s_launch_options(&env, tag);
         if subordinate_requested() {
             scenario_i_subordinate_ids(&env, tag);
+            scenario_s_subordinate_sealed_inject(&env, tag);
         } else {
             println!(
                 "production_launcher: subordinate id case not requested (set FANDHE_CONTAINER_TEST_ID_HELPER=1)"
@@ -1304,6 +1310,111 @@ mod linux {
                 "production_launcher: subordinate id mapping verified (uid extents={}, gid extents={})",
                 uid_map.len(),
                 gid_map.len()
+            );
+        }));
+        let (_record, process) = started.into_parts();
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "production_launcher: terminate after failed verification also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after terminate"
+        );
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ S の範囲写像版(`FANDHE_CONTAINER_TEST_ID_HELPER=1`。CORE-6・SEC-5・SUP-12・#2628): ホストのファイルを
+    /// 封印 memfd(`InjectedContent::from_file`)にした注入が、`RootlessSubordinateIds` の launcher で拒否されず、
+    /// 内容とモードが具体値でコンテナへ届くことを照合する。呼び出し元のメモリの内容(`from_bytes`)は start の前に
+    /// 拒否されることも照合する。
+    fn scenario_s_subordinate_sealed_inject(env: &Env, tag: u32) {
+        let host_dir =
+            std::env::temp_dir().join(format!("fandhe-plt-sealed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&host_dir);
+        std::fs::create_dir_all(&host_dir).expect("host dir");
+        let host_file = host_dir.join("secret");
+        std::fs::write(&host_file, LO_SECRET_CONTENT).expect("write host secret");
+        let build = |content: InjectedContent| -> Result<ProductionLauncher, TraitError> {
+            let mut tmpfs = TmpfsMountSet::new();
+            tmpfs
+                .push(TmpfsMountSpec::new(LO_TMPFS_DEST, None).expect("tmpfs spec"))
+                .expect("push tmpfs");
+            let mut inject = InjectedFileSet::new();
+            inject
+                .push(
+                    InjectedFileSpec::new(
+                        LO_SECRET_PATH,
+                        content,
+                        InjectedFileMode::new(LO_SECRET_MODE).expect("mode"),
+                    )
+                    .expect("inject spec"),
+                )
+                .expect("push inject");
+            let options =
+                LaunchOptions::new(tmpfs, inject, LaunchIpcMode::Host).expect("launch options");
+            ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSubordinateIds)
+                .subordinate_ids(SubordinateIdSource::system(std::env::var("USER").ok())?)
+                .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                .launch_options(options)
+                .build()
+        };
+        // 呼び出し元のメモリの内容は build で拒否される(fork 前)。
+        let refused = build(
+            InjectedContent::from_bytes(LO_SECRET_CONTENT.as_bytes().to_vec()).expect("content"),
+        )
+        .expect_err("caller-memory content must be refused under subordinate ids");
+        assert_eq!(refused.code(), ErrorCode::InvalidArgument);
+
+        let file = std::fs::File::open(&host_file).expect("open host secret");
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+            build(InjectedContent::from_file(&file).expect("sealed content"))
+                .expect("build subordinate launcher with sealed injection"),
+        );
+        drop(file);
+        let _ = std::fs::remove_dir_all(&host_dir);
+
+        let bundle = Bundle::new("ss");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--with-launch-options"], json!([]));
+        let id = ContainerId::new(format!("plss{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            let output = started.process().take_output().expect("container output");
+            let stdout = output.stdout.expect("container stdout");
+            reader_slot = Some(spawn_reader(stdout));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            assert_eq!(value_of(&lines, "LO_SECRET_DIR"), "tmpfs");
+            assert_eq!(value_of(&lines, "LO_SECRET"), LO_SECRET_CONTENT);
+            assert_eq!(value_of(&lines, "LO_SECRET_MODE"), "440");
+            println!(
+                "production_launcher: injected secret reached the container under subordinate id mapping (scenario=S-subordinate)"
             );
         }));
         let (_record, process) = started.into_parts();

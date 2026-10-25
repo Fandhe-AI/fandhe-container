@@ -39,7 +39,8 @@
 //! 本番 launcher・CLI・stack（TOML）からの配線、uid / gid 指定、単一ファイルの bind 注入（既存ディレクトリへ
 //! 1 ファイルだけ見せる）、利用者 tmpfs の配下への注入（`/run` を tmpfs にした上で `/run/secrets` を注入する
 //! 構成は [`InjectedFileSet::check_against_tmpfs`] が拒否する）、tmpfs のスワップ退避の抑止（`noswap`。
-//! カーネル版数依存）、メモリ上の内容のゼロ化。
+//! カーネル版数依存）。
+//! 内容の置き場は [`InjectedContent`] の doc を参照（secret は封印 memfd から `sendfile` で書く。#2628）。
 //!
 //! # 単体テストの安全策
 //!
@@ -49,11 +50,10 @@
 //! tmpfs マウントの失敗は `tmpfs::tests::MOUNT_FAIL` で注入できる（#2248・#2398。SEC-2・REPAIR-12）。
 
 use std::ffi::{CString, OsStr};
-use std::io::Write as _;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt as _;
 
-use crate::injected_files::{InjectedFileSet, InjectedGroup};
+use crate::injected_files::{InjectedContent, InjectedFileSet, InjectedGroup};
 use crate::sys::{self, SysError};
 use crate::traits::types::ErrorCode;
 
@@ -204,7 +204,7 @@ fn apply_group(
         write_file(
             tmpfs_root.as_fd(),
             f.file_name(),
-            f.content().as_bytes(),
+            f.content(),
             f.mode().bits(),
         )
         .map_err(|e| e.with_file(&display_destination(f.destination().as_str())))?;
@@ -267,7 +267,7 @@ impl WriteError {
 fn write_file(
     parent: BorrowedFd<'_>,
     name: &str,
-    content: &[u8],
+    content: &InjectedContent,
     mode: u32,
 ) -> Result<(), WriteError> {
     let c_name = CString::new(name).map_err(|_| WriteError {
@@ -279,7 +279,7 @@ fn write_file(
         err: WriteErrKind::Sys(e),
     })?;
     let mut file = std::fs::File::from(fd);
-    file.write_all(content).map_err(|e| WriteError {
+    content.write_to(&mut file).map_err(|e| WriteError {
         what: "write",
         err: WriteErrKind::Io(e),
     })?;
@@ -394,6 +394,59 @@ mod tests {
         READ_ONLY_FAIL.with(|c| c.set(None));
         MOUNT_FAIL.with(|f| f.set(None));
         UMOUNT_FAIL.with(|f| f.set(None));
+    }
+
+    /// CORE-6・SEC-5(#2628): 封印 memfd の内容は `sendfile` で tmpfs のファイルへ書かれ、内容・モードが具体値で一致する
+    /// （`Bytes` と混在しても順序どおり）。
+    #[test]
+    fn core6_sec5_sealed_content_is_written_by_sendfile() {
+        let tmp = Tmp::new("inject-sealed");
+        reset();
+        let host =
+            std::env::temp_dir().join(format!("fandhe-inject-sealed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&host);
+        std::fs::create_dir_all(&host).expect("host dir");
+        std::fs::write(host.join("src"), SENTINEL).expect("write");
+        let file = std::fs::File::open(host.join("src")).expect("open");
+        let sealed = InjectedContent::from_file(&file).expect("sealed");
+        assert!(!sealed.is_caller_memory());
+        let mut s = InjectedFileSet::new();
+        s.push(
+            InjectedFileSpec::new(
+                "/run/secrets/db",
+                sealed,
+                InjectedFileMode::new(0o400).expect("mode"),
+            )
+            .expect("spec"),
+        )
+        .expect("push");
+        s.push(
+            InjectedFileSpec::new(
+                "/run/secrets/plain",
+                InjectedContent::from_bytes(b"k=v".to_vec()).expect("content"),
+                InjectedFileMode::DEFAULT,
+            )
+            .expect("spec"),
+        )
+        .expect("push");
+        let fd = tmp.fd();
+        inject_files_at(fd.as_fd(), &s, &not_shared).expect("inject");
+        assert_eq!(
+            std::fs::read_to_string(tmp.0.join("run/secrets/db")).expect("read"),
+            SENTINEL
+        );
+        assert_eq!(
+            std::fs::metadata(tmp.0.join("run/secrets/db"))
+                .expect("meta")
+                .mode()
+                & 0o7777,
+            0o400
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.0.join("run/secrets/plain")).expect("read"),
+            "k=v"
+        );
+        let _ = std::fs::remove_dir_all(&host);
     }
 
     /// SUP-12・TASK-169.4.2・#1620: ディレクトリごとに rw マウント → 書き込み → `mount_setattr` で ro にし、

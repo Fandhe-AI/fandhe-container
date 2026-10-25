@@ -7,7 +7,7 @@
 | 順 | 項目 | 塞いでいる箇所 | 担当 | issue |
 | -- | ---- | -------------- | ---- | ----- |
 | 1 | イメージ User の名前解決 | cri＋oci の fd 起点の読み取り（本変更で実装済み） | cri・oci | #2606 |
-| 2 | run_as_username | cri（`RootfsSource::prepare` へ解決要求を渡す口の変更。順 1 の解決器を再利用） | cri | #2664 |
+| 2 | run_as_username | cri（`RootfsSource::prepare` へ解決要求 `UserResolveRequest` を渡す口の変更。順 1 の読み口を再利用。本変更で実装済み） | cri | #2664 |
 | 3 | dns_config | cri（bundle に resolv.conf を生成して `/etc/resolv.conf` へ ro で bind） | cri | #2665 |
 | 4 | capabilities（drop を先行。add / ambient はオーナー判断。SEC-1） | core の `process.capabilities`（UnappliedField）の適用 → cri | core → cri | #2666 |
 | 5 | supplemental_groups（とイメージ User の補助グループ） | core の `additionalGids`（start.rs で拒否。SEC-5） → cri | core → cri | #2667 |
@@ -49,7 +49,26 @@
 
 形式が崩れた行（フィールド不足・数値不正）・空行・コメント・NIS（`+` `-`）の行は読み飛ばし、名前は完全一致で最初の一致を採る。
 
+## run_as_username の解決方式（CRI-2・SEC-5。#2664）
+
+CRI の `LinuxContainerSecurityContext.run_as_username` は、`ImageRootfsSource` が同じ読み口で展開後の rootfs の `/etc/passwd` を読み、名前の完全一致で `(uid, gid)` を `ImageDefaults::resolved_run_as_username` へ返して受け入れる。`validate_config` は rootfs に触れる前に形式（256 バイト以下・NUL / `:` / `/` / 改行なし・数字だけは不可）と `run_as_user` との同時指定を検査する。
+
+| 要求 | 結果 |
+| ---- | ---- |
+| `app`（passwd に `app:x:1000:1001`） | `(1000, 1001)`。イメージ User より優先 |
+| `app` + `run_as_group=44` | `(1000, 44)` |
+| `run_as_group` のみ | `INVALID_ARGUMENT`（従来どおり） |
+| `run_as_user` と `run_as_username` の同時指定 | `INVALID_ARGUMENT` |
+| 数字だけ・`:` `/` NUL 改行を含む・257 バイト以上 | `INVALID_ARGUMENT` |
+| passwd に名前が無い・passwd が無い | `INVALID_ARGUMENT` |
+| `etc` / `etc/passwd` が symlink・FIFO・上限超過 | `FAILED_PRECONDITION` |
+| `openat2` 不可・対象外の OS / アーキ | `UNIMPLEMENTED` |
+| 解決要求を無視する `RootfsSource`（結果が無い） | `UNIMPLEMENTED`（root へ黙って落とさない） |
+
+エラーメッセージは固定文言で、利用者の指定した名前を含めない。
+
 既知の差:
 
+- 数字だけの `run_as_username` は拒否する（containerd は uid 扱いだが、CRI の「passwd に存在すること」を満たさない。数値は `run_as_user` を使う）
 - `/etc/group` の所属から補助グループは作らない（core が `additionalGids` を未受理のため。権限は弱い側に倒れる。順 5）
 - uid のみで gid 0 に落とす挙動は runc / containerd の `GetExecUser` に合わせたもので、実装時に一次情報との再照合は行っていない（食い違いが見つかれば未解決へ倒す）

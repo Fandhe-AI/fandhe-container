@@ -15,7 +15,9 @@
 //!
 //! | #1473（TASK-169.4.2） | secrets / configs（[`secrets`]）。[`ContainerOptions::injected_files`] で core の注入仕様型へ変換 | core の `exec::inject_files`（専用 tmpfs へ書き込み後に read-only 化） |
 //!
-//! secrets / configs の指定モデルと core 側の注入は実装済みだが、launcher・CLI・stack（TOML）からの結線は未実装（REPAIR-3）。
+//! secrets / configs の指定モデルと core 側の注入、および本番 launcher への結線（[`ContainerOptions::launch_options`] →
+//! `ProductionStartDeps::with_container_options` → core の `ProductionLauncherBuilder::launch_options`。`--ipc`・
+//! `--shm-size`・`--tmpfs`・secrets / configs。#2625）は実装済み。CLI・stack（TOML）から supervisor への受け渡しは未実装（REPAIR-3）。
 //!
 //! 変換先の [`Rlimits`] は `fandhe_container_core::exec::StagePipeline::with_rlimits`（fork 後・capability
 //! 削減の前に `prlimit(2)` で適用。Linux 限定）が消費する。
@@ -34,8 +36,12 @@
 //!
 //! # 未結線の箇所（REPAIR-3）
 //!
-//! start 経路（`start_entry`・本番 launcher）からの結線が未実装のため、現時点で [`ContainerOptions`] の消費者は無い
-//! （CLI・launcher からの結線は後続作業。label を `CreateStateRequest::with_annotations` へ渡す結線も同様）。OS 非依存で、3 OS でビルド・テストする。
+//! - `--ipc`・`--shm-size`・`--tmpfs`・secrets / configs は start の `build_launcher` が [`ContainerOptions::launch_options`] を
+//!   本番 launcher へ渡す（#2625）。ただし CLI から supervisor への `ContainerOptions` の受け渡しは未実装で、`run_main` は
+//!   既定のまま（secret の内容を argv / env に載せない受け渡し方式が要る）。
+//! - ulimit・env・label の launcher への結線は未実装（label を `CreateStateRequest::with_annotations` へ渡す結線も同様）。
+//!
+//! OS 非依存で、3 OS でビルド・テストする。
 //!
 //! # 外部入力の扱い
 //!
@@ -56,6 +62,7 @@ pub use secrets::{InjectedFileOption, InjectedFileOptions, InjectedKind, Injecte
 use self::env::EnvSet;
 use fandhe_container_core::dev_mounts::ImplicitDevMounts;
 use fandhe_container_core::injected_files::InjectedFileSet;
+use fandhe_container_core::oci_runtime::{LaunchIpcMode, LaunchOptions};
 use fandhe_container_core::rlimits::{RLIMIT_INFINITY, Rlimit, RlimitKind, Rlimits};
 use fandhe_container_core::tmpfs::TmpfsMountSet;
 use fandhe_container_core::traits::types::{ErrorCode, TraitError};
@@ -183,9 +190,9 @@ impl ContainerOptions {
     /// Landlock のルールに含める暗黙の `/dev` 系マウントを、実際に載せる tmpfs 集合（[`Self::tmpfs_set`]）から
     /// 選ぶ（CORE-5・SUP-12・#1672 事後監査 P2）。`--ipc=host` では `/dev/shm` を載せないため
     /// `ImplicitDevMounts::WithoutShm` になり、適用時に無い `/dev/shm` のルールで起動を拒否しない。
-    /// `tmpfs_set` と同じ検証を通し、同じ指定の矛盾はここでも拒否する。core の `landlock::build_path_rules_with_dev`
-    /// へ渡す想定。本番 launcher は現在 `ContainerOptions` を受け取らず、暗黙の `/dev` 系は常に
-    /// `ImplicitDevMounts::All`（既定の `/dev/shm` を載せる）で作る。launcher からの結線は未実装（担当 #2625。REPAIR-3）。
+    /// `tmpfs_set` と同じ検証を通し、同じ指定の矛盾はここでも拒否する。本番 launcher は
+    /// [`Self::launch_options`] 経由で受け取った tmpfs 集合から core 側で同じ規則（`ImplicitDevMounts::for_tmpfs_set`）
+    /// で導くため、この関数は launcher からは呼ばれない（検証と試験用の観測口。結線は #2625）。
     pub fn implicit_dev_mounts(&self) -> Result<ImplicitDevMounts, TraitError> {
         Ok(ImplicitDevMounts::for_tmpfs_set(&self.tmpfs_set()?))
     }
@@ -210,6 +217,22 @@ impl ContainerOptions {
         let set = self.injected.to_file_set()?;
         set.check_against_tmpfs(&self.tmpfs_set()?)?;
         Ok(set)
+    }
+
+    /// 本番 launcher（core の `ProductionLauncherBuilder::launch_options`）へ渡す起動オプションへ変換する
+    /// （SUP-12・CORE-5・SEC-1・#2625）。
+    ///
+    /// tmpfs 集合（`--ipc=host` 以外は `/dev/shm` を含む）・注入ファイル集合・IPC の扱いを 1 回の検証で作る。
+    /// ホスト上の secrets / configs のファイルはこの呼び出しで読むため、呼び出し元（start の `build_launcher`）は
+    /// fork 前の単一スレッドで呼ぶ。`Shareable` は join 側が未実装のため `Private` と同じ扱い（`ipc` モジュール）。
+    /// 矛盾した指定（`--ipc=host` と `--shm-size` 等）は `InvalidArgument` で拒否する。
+    pub fn launch_options(&self) -> Result<LaunchOptions, TraitError> {
+        let ipc = if self.ipc.shares_host_namespace() {
+            LaunchIpcMode::Host
+        } else {
+            LaunchIpcMode::Private
+        };
+        LaunchOptions::new(self.tmpfs_set()?, self.injected_files()?, ipc)
     }
 
     /// core の `StagePipeline::with_rlimits` へ渡す集合。
@@ -472,5 +495,52 @@ mod tests {
             "mode=1777,size=67108864"
         );
         assert!(ContainerOptions::new().mounts().tmpfs().is_empty());
+    }
+
+    /// SUP-12・CORE-5(#2625): 既定の指定は core の既定の起動オプションと等しい(従来の動作)。
+    #[test]
+    fn sup12_launch_options_default_equals_core_default() {
+        let got = ContainerOptions::new().launch_options().expect("options");
+        let want = LaunchOptions::try_default().expect("default");
+        assert_eq!(got, want);
+    }
+
+    /// SUP-12・SEC-1(#2625): `--ipc=host` は IPC を共有し、`/dev/shm` を載せない。`shareable` は `Private` に写る。
+    #[test]
+    fn sup12_launch_options_maps_ipc_modes() {
+        let host = ContainerOptions::new().with_ipc_mode(IpcMode::Host);
+        let o = host.launch_options().expect("host");
+        assert_eq!(o.ipc(), LaunchIpcMode::Host);
+        assert!(o.tmpfs().mounts().is_empty());
+        assert_eq!(o.implicit_dev_mounts(), ImplicitDevMounts::WithoutShm);
+        let shareable = ContainerOptions::new().with_ipc_mode(IpcMode::Shareable);
+        let o = shareable.launch_options().expect("shareable");
+        assert_eq!(o.ipc(), LaunchIpcMode::Private);
+        assert_eq!(o.implicit_dev_mounts(), ImplicitDevMounts::All);
+    }
+
+    /// SUP-12(#2625): `--shm-size 128m` は `/dev/shm` の size=134217728 になる。
+    #[test]
+    fn sup12_launch_options_applies_shm_size() {
+        let mounts = MountOptions::default().with_shm_size(ShmSize::parse("128m").expect("size"));
+        let o = ContainerOptions::new()
+            .with_mounts(mounts)
+            .launch_options()
+            .expect("options");
+        let shm = o.tmpfs().mounts().first().expect("shm");
+        assert_eq!(shm.destination.as_str(), "/dev/shm");
+        assert_eq!(shm.data_string(), "mode=1777,size=134217728");
+    }
+
+    /// SUP-12(#2625): `--ipc=host` と `--shm-size` の併用は固定文言で拒否する。
+    #[test]
+    fn sup12_launch_options_rejects_host_ipc_with_shm_size() {
+        let mounts = MountOptions::default().with_shm_size(ShmSize::parse("64m").expect("size"));
+        let err = ContainerOptions::new()
+            .with_ipc_mode(IpcMode::Host)
+            .with_mounts(mounts)
+            .launch_options()
+            .expect_err("rejected");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
     }
 }

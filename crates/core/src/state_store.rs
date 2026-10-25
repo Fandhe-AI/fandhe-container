@@ -1904,7 +1904,7 @@ impl LandlockAuditDto {
     }
 }
 
-/// Landlock ルール 1 件。`origin` は `root` / `mount`（`index` 必須）/ `implicit`。
+/// Landlock ルール 1 件。`origin` は `root` / `mount`（`index` 必須）/ `tmpfs`（利用者指定の tmpfs）/ `implicit`。
 #[derive(Debug, Serialize, Deserialize)]
 struct LandlockRuleDto {
     path: String,
@@ -1924,6 +1924,7 @@ impl LaunchIsolationDto {
                 let (origin, index) = match r.target() {
                     RecordedTarget::Root => ("root", None),
                     RecordedTarget::Mount { index, .. } => ("mount", Some(*index as u64)),
+                    RecordedTarget::Tmpfs { .. } => ("tmpfs", None),
                     RecordedTarget::Implicit(_) => ("implicit", None),
                 };
                 LandlockRuleDto {
@@ -2013,6 +2014,9 @@ impl LandlockRuleDto {
             ("mount", Some(index)) => RecordedTarget::Mount {
                 destination: MountDestination::parse(&self.path).map_err(|_| ())?,
                 index: usize::try_from(index).map_err(|_| ())?,
+            },
+            ("tmpfs", None) => RecordedTarget::Tmpfs {
+                destination: MountDestination::parse(&self.path).map_err(|_| ())?,
             },
             ("implicit", None) => RecordedTarget::Implicit(
                 ImplicitDevMount::ALL

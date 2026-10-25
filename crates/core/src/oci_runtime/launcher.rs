@@ -92,13 +92,18 @@
 //!   `run_start` 手順 8 は、準備の作業スレッドを `join` してから入口スレッドが直接呼ぶ形に再構成済み(#1819)。
 //!   restart の再 launch は `fandhe-relaunch` スレッド等が存在する状態で呼ばれ、この launcher が拒否する
 //!   (`RelaunchFailed`・fail-closed)。呼び出しスレッドで直接行う再構成は #2043
-//! - bind mount（`LaunchSpec::bind_mounts`。#1915）は載せる。fork 前に既定 tmpfs との重なりを検査して
+//! - bind mount（`LaunchSpec::bind_mounts`。#1915）は載せる。fork 前に tmpfs・注入ディレクトリとの重なりを検査して
 //!   `PrePivotSetup.binds` へ渡し、restart の再 launch でも同じ集合を使う。`ro` の bind は Landlock の
 //!   `WriteRestrictionShadowed` で fork 前に拒否される（#1917 で解消するまでの想定挙動）
 //! - `/sys` の sysfs（`LaunchSpec::sysfs_mount`。#2020）は載せる。`PrePivotSetup.sysfs` へ渡し、restart の再 launch でも
 //!   同じ指定を使う。方式（新しい sysfs か、ホストの `/sys` の読み取り専用 rbind か）は pivot 前段が user namespace から
 //!   事前に決める。本番の `start` 経路は user namespace を必須とするため、実際には rbind になる
-//! - bind・`/sys` の sysfs 以外の `mounts[]` の種類と `/dev` 以外の tmpfs の注入は `start` が拒否済みで、ここでは載せない
+//! - 起動オプション(`ProductionLauncherBuilder::launch_options`。SUP-12・CORE-5・#2625)の tmpfs・注入ファイル・IPC は載せる。
+//!   未指定なら既定の `/dev/shm`(64 MiB)のみ・注入なし・専用 IPC namespace。`Host` は IPC namespace を作らず `/dev/shm` を載せず、
+//!   Landlock の暗黙マウントを `WithoutShm` にする(config.json からは外せない)。`reject_protected_paths_over_implicit_dev` は
+//!   常に全暗黙マウントで判定するため、`WithoutShm` でも `/dev/shm` 上の保護パス指定を拒否する(厳しい側。fail-closed)。
+//!   CLI から supervisor への受け渡し・範囲写像の holder が継承する注入内容の露出(#2628)は未解決
+//! - bind・`/sys` の sysfs 以外の `mounts[]` の種類と config.json の `mounts[]` の tmpfs は `start` が拒否済みで、ここでは載せない
 
 #[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
@@ -118,6 +123,8 @@ use super::cgroup_requirement::{CgroupJoinMeans, launch_after_cgroup_check};
 use super::config::NamespaceKind;
 use super::launch::{LaunchMode, LaunchSpec, LaunchedProcess, ProcessLauncher};
 #[cfg(target_os = "linux")]
+use super::launch_options::{LaunchIpcMode, LaunchOptions};
+#[cfg(target_os = "linux")]
 use super::resources::LinuxResourceLimits;
 #[cfg(target_os = "linux")]
 use super::sysfs_mount::SysfsMountSpec;
@@ -127,6 +134,8 @@ use crate::audit_log::AuditedRejection;
 #[cfg(target_os = "linux")]
 use crate::cgroups::{CgroupError, CgroupJoin, RecordedCgroupOutcome};
 #[cfg(target_os = "linux")]
+use crate::dev_mounts::ImplicitDevMounts;
+#[cfg(target_os = "linux")]
 use crate::exec::{
     ChildStdio, ChildSubreaper, ConfigPaths, ContainerChild, Entrypoint, ExecError, Hostname,
     IntermediatePlan, IntermediateSpec, IsolationConfig, IsolationPrivilege, IsolationStage,
@@ -134,6 +143,8 @@ use crate::exec::{
     StageKind, StagePipeline, plan, plan_rootless_subordinate, rescan_unreported_init,
     spawn_container_via_intermediate,
 };
+#[cfg(target_os = "linux")]
+use crate::injected_files::InjectedFileSet;
 #[cfg(target_os = "linux")]
 use crate::landlock::LandlockRuleset;
 #[cfg(target_os = "linux")]
@@ -208,6 +219,8 @@ pub struct ProductionLauncherBuilder {
     subordinate_ids: Option<SubordinateIdSource>,
     #[cfg(target_os = "linux")]
     applied_resources: Option<LinuxResourceLimits>,
+    #[cfg(target_os = "linux")]
+    launch_options: Option<LaunchOptions>,
     #[cfg(target_os = "linux")]
     seccomp_delivery: crate::seccomp::ErrnoDelivery,
     #[cfg(target_os = "linux")]
@@ -296,6 +309,18 @@ impl ProductionLauncherBuilder {
         self
     }
 
+    /// 起動オプション(`--ipc`・`--shm-size`・`--tmpfs`・secrets / configs。SUP-12・CORE-5・#2625)。
+    ///
+    /// 呼び出し元は supervisor の start 経路(`ContainerOptions::launch_options` の結果)。launcher は launch のたびに
+    /// (restart の再 launch を含む)同じ指定を使う。未指定なら既定の `/dev/shm`(64 MiB)1 件・注入なし・
+    /// 専用の IPC namespace で、従来の動作と同じ。`LaunchIpcMode::Host` だけが IPC namespace を外す緩和で、
+    /// `config.json` からは外せない(SEC-1)。
+    #[must_use]
+    pub fn launch_options(mut self, options: LaunchOptions) -> Self {
+        self.launch_options = Some(options);
+        self
+    }
+
     /// ERRNO 側の拒否の届け方(SEC-4・#2025)。既定は [`crate::seccomp::ErrnoDelivery::Errno`](通知なし。listener を
     /// 受け取っても応答者がいなくてよい)。`UserNotif` は **launch で得た listener に応答する者がいる呼び出し元だけ**が
     /// 指定する(supervisor の start 経路が `LaunchedProcess::take_seccomp_listener` で受け取って応答する)。
@@ -342,7 +367,11 @@ impl ProductionLauncherBuilder {
             let audit_sink = self
                 .audit_sink
                 .ok_or_else(|| missing("the launcher requires an audit sink"))?;
-            // 写像の解決と検証は subreaper 化(プロセス属性の変更)より前に行い、拒否で副作用を残さない。
+            // 写像の解決と検証・注入との併用の拒否は subreaper 化(プロセス属性の変更)より前に行い、
+            // 拒否で副作用を残さない(失敗した build の後に孤児を回収し続けない)。
+            if let Some(options) = &self.launch_options {
+                refuse_inject_with_subordinate(privilege, options)?;
+            }
             let subordinate = resolve_privilege(
                 privilege,
                 self.subordinate_ids,
@@ -363,6 +392,7 @@ impl ProductionLauncherBuilder {
                 self.cgroup_join_source,
             );
             inner.applied_resources = self.applied_resources;
+            inner.launch_options = self.launch_options;
             inner.seccomp_delivery = self.seccomp_delivery;
             inner.audit_policy = self.audit_policy;
             inner.exit_audit_sink = self.exit_audit_sink;
@@ -377,6 +407,53 @@ impl ProductionLauncherBuilder {
             ))
         }
     }
+}
+
+/// 利用者指定の tmpfs と注入ディレクトリ(いずれも pivot 前段で載せる tmpfs)が、config の
+/// `linux.readonlyPaths` の厳密な子孫のとき拒否する(fail-closed。SEC-2・CORE-5・#2625)。
+///
+/// `apply_readonly_paths` は readonlyPaths のマウント上端だけを読み取り専用にし、子マウント（`/sys` を除く）は
+/// 検査しないため、`readonlyPaths=["/data"]` の配下に書き込み可能な tmpfs `/data/cache` を置くと書き込み可能のまま残る。
+/// 同一の宛先は上端が読み取り専用になるため対象外。fork 前に呼び、子を作らず拒否する。
+#[cfg(target_os = "linux")]
+fn check_tmpfs_against_readonly_paths(
+    readonly: &[crate::path_masks::ProtectedPath],
+    tmpfs: &TmpfsMountSet,
+    inject: Option<&InjectedFileSet>,
+) -> Result<(), TraitError> {
+    use crate::injected_files::within;
+    let inside = |dest: &str| readonly.iter().any(|r| within(dest, r.as_str()));
+    let tmpfs_hit = tmpfs
+        .mounts()
+        .iter()
+        .any(|t| inside(t.destination.as_str()));
+    let inject_hit = inject.is_some_and(|i| i.groups().iter().any(|g| inside(g.directory)));
+    if tmpfs_hit || inject_hit {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "a tmpfs mount or injected file directory lies under a read-only path",
+        ));
+    }
+    Ok(())
+}
+
+/// 範囲写像(`RootlessSubordinateIds`)と非空の機密ファイル注入の併用を拒否する(fail-closed)。
+///
+/// 範囲写像の ID 写像 holder は中間プロセスのメモリ(注入内容を含む)を fork で継承し、`run_userns_holder` で
+/// dumpable になるため、Yama=0 では同一 UID の別プロセスから secret を読める。露出の解消は #2628
+/// (SEC-1・SEC-5・CORE-6・SUP-12)。`build` と launch の両方で呼ぶ(builder の呼び出し順で迂回させない)。
+#[cfg(target_os = "linux")]
+fn refuse_inject_with_subordinate(
+    privilege: IsolationPrivilege,
+    options: &LaunchOptions,
+) -> Result<(), TraitError> {
+    if privilege == IsolationPrivilege::RootlessSubordinateIds && !options.inject().is_empty() {
+        return Err(TraitError::new(
+            ErrorCode::InvalidArgument,
+            "injected files cannot be combined with the subordinate id privilege model",
+        ));
+    }
+    Ok(())
 }
 
 /// `RootlessSubordinateIds` の写像の入力元(`/etc/subuid`・`/etc/subgid` と `newuidmap` / `newgidmap` のパス。
@@ -714,9 +791,14 @@ trait LaunchOps: Send + Sync {
     /// 呼び出しプロセスのスレッドが 1 つか(fork の前提)。
     fn is_single_threaded(&self) -> bool;
     /// `config` から Landlock の ruleset を作る(ABI 検出を含む。6 未満は拒否)。
+    ///
+    /// `user_tmpfs` は利用者指定の tmpfs(暗黙の `/dev/shm` を除く。`mounts[]` とは別枠で `RuleOrigin::UserTmpfs` になる)。
+    /// `implicit` は暗黙の `/dev` 系マウントのルールの含め方(起動オプションの tmpfs 集合から導く。SUP-12・#2625)。
     fn landlock_ruleset(
         &self,
         config: &super::config::OciConfig,
+        user_tmpfs: &[super::config::OciMount],
+        implicit: ImplicitDevMounts,
     ) -> Result<LandlockRuleset, ExecError>;
     /// pin 済みの rootfs の `(st_dev, st_ino)`（launch 時の分離の記録の `/`。fstat できなければ `None`。
     /// SUP-6・#2007）。
@@ -751,8 +833,11 @@ struct SpawnInput<'a> {
     stages: StagePipeline,
     audit: LaunchAudit<'a>,
     timeout: Duration,
-    /// 暗黙の既定 tmpfs(`/dev/shm`)。launcher が fork 前に構築し、bind との重なりも検査済み。
+    /// pivot 前段で載せる tmpfs(既定の `/dev/shm` か起動オプション由来の集合)。launcher が fork 前に確定し、
+    /// bind との重なりも検査済み。
     tmpfs: &'a TmpfsMountSet,
+    /// 注入するファイル(secrets / configs。空なら `None`。SUP-12・#2625)。bind との重なりは検査済み。
+    inject: Option<&'a InjectedFileSet>,
     /// 適用する bind mount の集合(空なら `None`。#1915)。
     binds: Option<&'a BindMountSet>,
     /// 供給する `/sys` の sysfs(無ければ `None`。#2020)。
@@ -966,6 +1051,8 @@ struct Inner {
     cgroup_join_source: Option<JoinSource>,
     /// cgroup 連鎖で書いた `linux.resources`(`ProductionLauncherBuilder::applied_resource_limits`)。
     applied_resources: Option<LinuxResourceLimits>,
+    /// 起動オプション(`ProductionLauncherBuilder::launch_options`。`None` は従来どおりの既定。SUP-12・#2625)。
+    launch_options: Option<LaunchOptions>,
     /// ERRNO 側の拒否の届け方(`ProductionLauncherBuilder::seccomp_errno_delivery`。既定 `Errno`。SEC-4・#2025)。
     seccomp_delivery: crate::seccomp::ErrnoDelivery,
     /// 監査の網羅を満たせない環境への方針(`ProductionLauncherBuilder::audit_coverage_policy`。既定 `BestEffort`。SEC-4・#2027)。
@@ -997,6 +1084,7 @@ impl Inner {
             rejection_audit_sink: None,
             cgroup_join_source,
             applied_resources: None,
+            launch_options: None,
             seccomp_delivery: crate::seccomp::ErrnoDelivery::Errno,
             audit_policy: crate::audit_log::AuditCoveragePolicy::BestEffort,
             ledger: Arc::new(Mutex::new(Ledger::default())),
@@ -1087,10 +1175,32 @@ impl Inner {
                 "launch requires a single-threaded process",
             ));
         }
+        // 起動オプション(未指定なら既定の `/dev/shm` 1 件・注入なし・専用 IPC)。暗黙の `/dev` 系の Landlock ルールは
+        // 実際に載せる tmpfs 集合から導き、実マウントとの食い違いを作らない(SUP-12・CORE-5・#2625)。
+        let default_options;
+        let options = match &self.launch_options {
+            Some(options) => options,
+            None => {
+                default_options = LaunchOptions::try_default()?;
+                &default_options
+            }
+        };
+        // 範囲写像の holder は fork で機密を含むメモリを継承し dumpable になるため、併用は #2628 まで拒否する。
+        refuse_inject_with_subordinate(self.privilege, options)?;
         // Landlock は必須。ABI 不足・生成失敗は起動を拒否し、Landlock 無しで続けない(CORE-5・#1314)。
+        // 利用者指定の tmpfs(暗黙の `/dev/shm` を除く)は `mounts[]` とは別枠で Landlock のルールにも載せる。載せないと
+        // 読み取り専用 root 配下の `--tmpfs /run` が EACCES になる。`ro` の tmpfs はルール生成側が除外する
+        // (SUP-12・#2625)。
+        let user_tmpfs: Vec<super::config::OciMount> = options
+            .tmpfs()
+            .mounts()
+            .iter()
+            .filter(|m| m.destination.as_str() != crate::tmpfs::DEV_SHM_PATH)
+            .map(super::config::OciMount::from_user_tmpfs)
+            .collect();
         let ruleset = self
             .ops
-            .landlock_ruleset(spec.config())
+            .landlock_ruleset(spec.config(), &user_tmpfs, options.implicit_dev_mounts())
             .map_err(|e| to_trait_error(&e))?;
         // 分離の記録は `with_landlock` へ渡す ruleset そのものと pin 済み rootfs の fstat から、fork の前に作る
         // (入力を 1 つに保つ。作れなければ子を作らず拒否する。fail-closed。SUP-6・CORE-5・SEC-1・#2007)。
@@ -1128,16 +1238,20 @@ impl Inner {
                 .map_err(|e| to_trait_error(&e))?;
         }
         let entry = entrypoint_of(spec)?;
-        let isolation = isolation_config_of(spec)?;
-        // 暗黙の `/dev/shm` を fork 前に構築し、bind の宛先との重なりをここで検査する(両方の集合が揃う場所。
-        // 子の `run_pre_pivot` の検査は多重防御として残す。CORE-5・#1654・#1915)。
-        let mut default_tmpfs = TmpfsMountSet::new();
-        default_tmpfs.ensure_default_dev_shm().map_err(|e| {
-            TraitError::new(e.code(), "failed to prepare the default /dev/shm mount")
-        })?;
+        let isolation = isolation_config_of(spec, options.ipc())?;
+        // tmpfs と注入を fork 前に確定し、bind の宛先との重なりをここで検査する(三者の集合が揃う場所。
+        // 子の `run_pre_pivot` の検査は多重防御として残す。CORE-5・SUP-12・#1654・#1915・#2625)。
+        let tmpfs = options.tmpfs();
+        let inject = (!options.inject().is_empty()).then(|| options.inject());
         let binds = (!spec.bind_mounts().is_empty()).then(|| spec.bind_mounts());
+        check_tmpfs_against_readonly_paths(spec.config().readonly_paths(), tmpfs, inject)?;
         if let Some(binds) = binds
-            && let Err(err) = binds.check_against_tmpfs(&default_tmpfs)
+            && let Err(err) = binds
+                .check_against_tmpfs(tmpfs)
+                .and_then(|()| match inject {
+                    Some(inject) => binds.check_against_injected(inject),
+                    None => Ok(()),
+                })
         {
             let (code, message) = (err.code(), err.message());
             let _ = audit_bind_mount_error(
@@ -1169,7 +1283,8 @@ impl Inner {
                 stages,
                 audit,
                 timeout,
-                tmpfs: &default_tmpfs,
+                tmpfs,
+                inject,
                 binds,
                 sysfs: spec.sysfs_mount(),
                 subordinate: self.subordinate.as_ref(),
@@ -1561,10 +1676,15 @@ fn entrypoint_of(spec: &LaunchSpec) -> Result<Entrypoint, TraitError> {
 
 /// `LaunchSpec` の namespace・hostname から分離の設定を作る(`start` が検証済み。未対応の種別は拒否)。
 #[cfg(target_os = "linux")]
-fn isolation_config_of(spec: &LaunchSpec) -> Result<IsolationConfig, TraitError> {
+fn isolation_config_of(
+    spec: &LaunchSpec,
+    ipc: LaunchIpcMode,
+) -> Result<IsolationConfig, TraitError> {
     let mut namespaces = NamespaceSet::empty();
     for kind in spec.namespaces() {
         let ns = match kind {
+            // `--ipc=host` のときだけ IPC namespace を作らない(config.json からは外せない。SEC-1・SUP-12・#2625)。
+            NamespaceKind::Ipc if ipc == LaunchIpcMode::Host => continue,
             NamespaceKind::Pid => Namespace::Pid,
             NamespaceKind::Mount => Namespace::Mount,
             NamespaceKind::Uts => Namespace::Uts,
@@ -1606,8 +1726,11 @@ impl LaunchOps for RealOps {
     fn landlock_ruleset(
         &self,
         config: &super::config::OciConfig,
+        user_tmpfs: &[super::config::OciMount],
+        implicit: ImplicitDevMounts,
     ) -> Result<LandlockRuleset, ExecError> {
-        let ruleset = crate::exec::landlock_ruleset_from_config(config)?;
+        let ruleset =
+            crate::exec::landlock_ruleset_from_config_with_dev(config, user_tmpfs, implicit)?;
         // ABI 7 未満ではカーネル監査へ拒否を残せない。縮退を構造化ログに出して続行する（SEC-4・#2026）。
         // 縮退の拒否(厳格モード)と 3 か所への表示は `Inner::assess_audit_coverage`（#2027）。送れなくても起動の可否は変えない。
         if let Some(line) = ruleset.audit_mode().log_line() {
@@ -1678,7 +1801,7 @@ impl LaunchOps for RealOps {
         let setup = PrePivotSetup {
             devices: crate::exec::DevptsGidSource::Rootless(gid_map),
             tmpfs: Some(input.tmpfs),
-            inject: None,
+            inject: input.inject,
             binds: input.binds,
             sysfs: input.sysfs,
             pinned_rootfs: Some(input.spec.rootfs_dir().as_fd()),
@@ -1777,6 +1900,9 @@ mod tests {
     /// spawn に渡った (bind の宛先列, 既定 tmpfs の宛先列)。
     type SeenSpawn = (Option<Vec<String>>, Vec<String>);
 
+    /// spawn に渡った (注入の宛先列, namespace に IPC があるか)。
+    type SeenOptions = (Option<Vec<String>>, bool);
+
     /// 偽の実体が返す実効 uid / gid(試験を実行ユーザーに依存させない)。
     const FAKE_EUID: u32 = 1000;
     const FAKE_EGID: u32 = 1001;
@@ -1799,6 +1925,10 @@ mod tests {
         run_stages: bool,
         /// spawn に渡った bind mount の宛先列と既定 tmpfs の宛先列の記録(spawn ごとに 1 件。bind 無しは `None`)。
         seen: Arc<Mutex<Vec<SeenSpawn>>>,
+        /// spawn に渡った起動オプション由来の値(注入の宛先列・namespace に IPC があるか。SUP-12・#2625)。
+        seen_options: Arc<Mutex<Vec<SeenOptions>>>,
+        /// `landlock_ruleset` に渡った暗黙マウントの含め方(launch ごとに 1 件)。
+        seen_implicit: Arc<Mutex<Vec<ImplicitDevMounts>>>,
         /// `root_identity` が `None`(rootfs を fstat できない)を返すか。
         fail_root_identity: bool,
         /// `ensure_no_process_in_recorded` が順に返す結果(尽きたら `AlreadyAbsent`)と、受け取った配置の記録(#2011)。
@@ -1823,6 +1953,8 @@ mod tests {
                 rescan_results: Mutex::new(VecDeque::new()),
                 run_stages: true,
                 seen: Arc::new(Mutex::new(Vec::new())),
+                seen_options: Arc::new(Mutex::new(Vec::new())),
+                seen_implicit: Arc::new(Mutex::new(Vec::new())),
                 fail_root_identity: false,
                 recorded_script: Mutex::new(VecDeque::new()),
                 recorded_calls: Arc::new(Mutex::new(Vec::new())),
@@ -1845,10 +1977,13 @@ mod tests {
         fn landlock_ruleset(
             &self,
             config: &super::super::config::OciConfig,
+            user_tmpfs: &[super::super::config::OciMount],
+            implicit: ImplicitDevMounts,
         ) -> Result<LandlockRuleset, ExecError> {
             push(&self.events, "landlock");
+            self.seen_implicit.lock().unwrap().push(implicit);
             let detected = crate::landlock::evaluate_abi(self.abi.unwrap_or(6));
-            crate::exec::ruleset_from_detection(detected, config)
+            crate::exec::ruleset_from_detection_with_dev(detected, config, user_tmpfs, implicit)
         }
 
         fn effective_ids(&self) -> (u32, u32) {
@@ -1886,6 +2021,15 @@ mod tests {
                     .iter()
                     .map(|m| m.destination.as_str().to_owned())
                     .collect(),
+            ));
+            self.seen_options.lock().unwrap().push((
+                input.inject.map(|set| {
+                    set.files()
+                        .iter()
+                        .map(|f| f.destination().as_str().to_owned())
+                        .collect()
+                }),
+                input.isolation.namespaces.contains(Namespace::Ipc),
             ));
             // 範囲写像で起動する場合だけ、渡された写像の内容を記録する(単一 ID の起動の記録は増やさない)。
             if let Some(ids) = input.subordinate {
@@ -3492,6 +3636,307 @@ mod tests {
         assert_eq!(
             seen.lock().unwrap().clone(),
             vec![(None, vec!["/dev/shm".to_owned()])]
+        );
+    }
+
+    fn options_with(
+        tmpfs_dests: &[&str],
+        shm: bool,
+        inject: &[(&str, &[u8])],
+        ipc: LaunchIpcMode,
+    ) -> LaunchOptions {
+        use crate::injected_files::{InjectedContent, InjectedFileMode, InjectedFileSpec};
+        use crate::tmpfs::TmpfsMountSpec;
+        let mut tmpfs = TmpfsMountSet::new();
+        if shm {
+            tmpfs.ensure_default_dev_shm().expect("shm");
+        }
+        for d in tmpfs_dests {
+            tmpfs
+                .push(TmpfsMountSpec::new(d, None).expect("spec"))
+                .expect("push");
+        }
+        let mut set = InjectedFileSet::new();
+        for (dest, bytes) in inject {
+            set.push(
+                InjectedFileSpec::new(
+                    dest,
+                    InjectedContent::from_bytes(bytes.to_vec()).expect("content"),
+                    InjectedFileMode::new(0o444).expect("mode"),
+                )
+                .expect("file"),
+            )
+            .expect("push");
+        }
+        LaunchOptions::new(tmpfs, set, ipc).expect("options")
+    }
+
+    /// SUP-12・CORE-5(#2625): 起動オプション未指定は従来どおり(`/dev/shm` のみ・注入なし・IPC あり・All)。
+    #[test]
+    fn sup12_default_launch_keeps_current_behavior() {
+        let spec = spec_for("opts-default", serde_json::json!({}));
+        let ops = FakeOps::new(&events());
+        let (opts, implicit) = (
+            Arc::clone(&ops.seen_options),
+            Arc::clone(&ops.seen_implicit),
+        );
+        let l = launcher(ops, rootless(), None);
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert_eq!(opts.lock().unwrap().clone(), vec![(None, true)]);
+        assert_eq!(
+            implicit.lock().unwrap().clone(),
+            vec![ImplicitDevMounts::All]
+        );
+    }
+
+    /// SUP-12・CORE-5・SEC-1(#2625): `--ipc=host` + `--tmpfs /run` + 注入。IPC namespace を外し、tmpfs は
+    /// 指定どおり(`/dev/shm` なし)、Landlock は `WithoutShm`。他の namespace は保つ。再 launch でも同じ。
+    #[test]
+    fn sup12_host_ipc_options_reach_spawn_and_landlock_on_every_launch() {
+        let spec = spec_for("opts-host", serde_json::json!({}));
+        let ops = FakeOps::new(&events());
+        let (seen, opts, implicit) = (
+            Arc::clone(&ops.seen),
+            Arc::clone(&ops.seen_options),
+            Arc::clone(&ops.seen_implicit),
+        );
+        let mut l = launcher(ops, rootless(), None);
+        l.inner.launch_options = Some(options_with(
+            &["/run"],
+            false,
+            &[("/etc/secret-token", b"v")],
+            LaunchIpcMode::Host,
+        ));
+        for _ in 0..2 {
+            let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![(None, vec!["/run".to_owned()]); 2]
+        );
+        assert_eq!(
+            opts.lock().unwrap().clone(),
+            vec![(Some(vec!["/etc/secret-token".to_owned()]), false); 2]
+        );
+        assert_eq!(
+            implicit.lock().unwrap().clone(),
+            vec![ImplicitDevMounts::WithoutShm; 2]
+        );
+    }
+
+    /// SUP-12・CORE-5(#2625): 利用者指定の tmpfs(`/run`)は Landlock のルールと分離の記録にも書き込み可能で載る。
+    #[test]
+    fn sup12_user_tmpfs_is_writable_in_landlock_rules_and_record() {
+        use crate::launch_isolation::RecordedTarget;
+        let spec = spec_for("opts-landlock-tmpfs", serde_json::json!({}));
+        let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+        l.inner.launch_options = Some(options_with(&["/run"], true, &[], LaunchIpcMode::Private));
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let record = p.launch_isolation().expect("record");
+        let rules: Vec<(String, u64)> = record
+            .landlock()
+            .rules()
+            .iter()
+            .filter_map(|r| match r.target() {
+                RecordedTarget::Tmpfs { destination } => {
+                    Some((destination.as_str().to_owned(), r.allowed()))
+                }
+                _ => None,
+            })
+            .collect();
+        let run = rules.iter().find(|(d, _)| d == "/run").expect("/run rule");
+        let write = crate::landlock::AccessFs::WRITE.bits();
+        assert_eq!(run.1 & write, write);
+        assert!(rules.iter().all(|(d, _)| d != "/dev/shm"));
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SUP-12・CORE-5(#2625): `ro` の利用者 tmpfs は書き込み可能な root の下でも起動でき、Landlock のルールには載らない。
+    #[test]
+    fn sup12_read_only_user_tmpfs_launches_without_a_landlock_rule() {
+        use crate::launch_isolation::RecordedTarget;
+        let spec = spec_for("opts-landlock-ro-tmpfs", serde_json::json!({}));
+        let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+        let mut opts = options_with(&["/ro"], true, &[], LaunchIpcMode::Private);
+        let mut tmpfs = TmpfsMountSet::new();
+        for m in opts.tmpfs().mounts() {
+            let mut m = m.clone();
+            m.read_only = m.destination.as_str() == "/ro";
+            tmpfs.push(m).expect("push");
+        }
+        opts = LaunchOptions::new(tmpfs, InjectedFileSet::new(), LaunchIpcMode::Private)
+            .expect("options");
+        l.inner.launch_options = Some(opts);
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let record = p.launch_isolation().expect("record");
+        let tmpfs_rules = record
+            .landlock()
+            .rules()
+            .iter()
+            .filter(|r| matches!(r.target(), RecordedTarget::Tmpfs { .. }))
+            .count();
+        assert_eq!(tmpfs_rules, 0);
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// SUP-12(#2625): `/dev/shm` と `/run` を指定順で渡し、IPC namespace は保つ。
+    #[test]
+    fn sup12_private_ipc_tmpfs_set_is_passed_in_order() {
+        let spec = spec_for("opts-private", serde_json::json!({}));
+        let ops = FakeOps::new(&events());
+        let (seen, opts) = (Arc::clone(&ops.seen), Arc::clone(&ops.seen_options));
+        let mut l = launcher(ops, rootless(), None);
+        l.inner.launch_options = Some(options_with(&["/run"], true, &[], LaunchIpcMode::Private));
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+        assert_eq!(
+            seen.lock().unwrap().clone(),
+            vec![(None, vec!["/dev/shm".to_owned(), "/run".to_owned()])]
+        );
+        assert_eq!(opts.lock().unwrap().clone(), vec![(None, true)]);
+    }
+
+    /// SUP-12・CORE-5(#2625): bind が利用者 tmpfs・注入ディレクトリと重なるときは spawn の前に拒否する。
+    #[test]
+    fn sup12_bind_overlapping_user_tmpfs_or_injected_is_rejected_before_spawn() {
+        let binds = |dest: &str| {
+            serde_json::json!([
+                {"destination": dest, "type": "bind", "source": "/srv/data", "options": ["rbind"]}
+            ])
+        };
+        let cases: [(&str, LaunchOptions); 2] = [
+            (
+                "/run/cache",
+                options_with(&["/run"], true, &[], LaunchIpcMode::Private),
+            ),
+            (
+                "/run/secrets",
+                options_with(
+                    &[],
+                    true,
+                    &[("/run/secrets/db", b"v")],
+                    LaunchIpcMode::Private,
+                ),
+            ),
+        ];
+        for (i, (dest, options)) in cases.into_iter().enumerate() {
+            let spec = spec_with_mounts(
+                &format!("opts-overlap-{i}"),
+                serde_json::json!({}),
+                binds(dest),
+            );
+            let ops = FakeOps::new(&events());
+            let mut l = launcher(ops, rootless(), None);
+            l.inner.launch_options = Some(options);
+            let err = l
+                .launch(&spec, Duration::from_secs(1))
+                .map(|_| ())
+                .expect_err("rejected");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{dest}");
+        }
+    }
+
+    /// SEC-2・CORE-5(#2625): readonlyPaths の厳密な子孫への tmpfs・注入ディレクトリは spawn の前に拒否する。
+    /// 同一の宛先と無関係な宛先(`/datax`)は通る。
+    #[test]
+    fn sec2_tmpfs_under_readonly_path_is_rejected_before_spawn() {
+        let linux = serde_json::json!({"readonlyPaths": ["/data"]});
+        let rejected: [(&str, LaunchOptions); 2] = [
+            (
+                "tmpfs",
+                options_with(&["/data/cache"], true, &[], LaunchIpcMode::Private),
+            ),
+            (
+                "inject",
+                options_with(&[], true, &[("/data/sec/db", b"v")], LaunchIpcMode::Private),
+            ),
+        ];
+        for (name, options) in rejected {
+            let spec = spec_for(&format!("opts-ro-{name}"), linux.clone());
+            let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+            l.inner.launch_options = Some(options);
+            let err = l
+                .launch(&spec, Duration::from_secs(1))
+                .map(|_| ())
+                .expect_err("rejected");
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{name}");
+        }
+        for dest in ["/data", "/datax"] {
+            let spec = spec_for("opts-ro-ok", linux.clone());
+            let mut l = launcher(FakeOps::new(&events()), rootless(), None);
+            l.inner.launch_options = Some(options_with(&[dest], true, &[], LaunchIpcMode::Private));
+            let p = l.launch(&spec, Duration::from_secs(1)).expect(dest);
+            p.terminate(Duration::from_secs(5)).expect("terminate");
+        }
+    }
+
+    /// SEC-1・SEC-5・CORE-6(#2628 まで): 範囲写像と非空の注入の併用は launch で fork 前に拒否する。
+    #[test]
+    fn sec1_subordinate_privilege_with_inject_is_refused_before_fork() {
+        let spec = spec_for("opts-sub-inject", serde_json::json!({}));
+        let ev = events();
+        let src = source_in(
+            "inject-refused",
+            "tester:100000:65536\n",
+            "tester:200000:65536\n",
+            helper_stand_in(),
+        );
+        let ids = resolve_privilege(
+            IsolationPrivilege::RootlessSubordinateIds,
+            Some(src),
+            1000,
+            1001,
+        )
+        .expect("resolved")
+        .expect("some");
+        let mut l = launcher_with(
+            FakeOps::new(&ev),
+            IsolationPrivilege::RootlessSubordinateIds,
+            Some(ids),
+            None,
+        );
+        l.inner.launch_options = Some(options_with(
+            &["/run"],
+            false,
+            &[("/etc/secret-token", b"v")],
+            LaunchIpcMode::Host,
+        ));
+        let err = l
+            .launch(&spec, Duration::from_secs(1))
+            .err()
+            .expect("refused");
+        assert_eq!(err.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            err.message(),
+            "injected files cannot be combined with the subordinate id privilege model"
+        );
+        assert!(
+            !ev.lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("spawn") || e.starts_with("landlock")),
+            "{:?}",
+            ev.lock().unwrap()
+        );
+    }
+
+    /// SEC-1: 判定関数は範囲写像 + 注入だけを拒否し、注入なしの範囲写像・単一 ID + 注入は通す。
+    #[test]
+    fn sec1_refuse_inject_with_subordinate_only_rejects_the_combination() {
+        let with = options_with(&[], true, &[("/etc/t", b"v")], LaunchIpcMode::Private);
+        let without = options_with(&[], true, &[], LaunchIpcMode::Private);
+        assert!(
+            refuse_inject_with_subordinate(IsolationPrivilege::RootlessSubordinateIds, &with)
+                .is_err()
+        );
+        assert!(
+            refuse_inject_with_subordinate(IsolationPrivilege::RootlessSubordinateIds, &without)
+                .is_ok()
+        );
+        assert!(
+            refuse_inject_with_subordinate(IsolationPrivilege::RootlessSingleId, &with).is_ok()
         );
     }
 

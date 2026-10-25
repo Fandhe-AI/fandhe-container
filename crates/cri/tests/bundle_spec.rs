@@ -233,6 +233,73 @@ fn user_mapping() {
     assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
 }
 
+/// CRI-2・SEC-5（#2664）: run_as_username は解決済みの (uid, gid) を採り、形式・相互排他・未解決を拒否する。
+#[test]
+fn run_as_username_acceptance() {
+    let u = |v: i64| Some(Int64Value { value: v });
+    let resolved = ImageDefaults {
+        resolved_run_as_username: Some((1000, 1001)),
+        ..Default::default()
+    };
+    let ids = |c: &ContainerConfig, img: &ImageDefaults| {
+        build_runtime_config(&pod(), c, img).map(|j| {
+            let v: Value = serde_json::from_slice(j.as_bytes()).unwrap();
+            (
+                v["process"]["user"]["uid"].as_u64().unwrap(),
+                v["process"]["user"]["gid"].as_u64().unwrap(),
+            )
+        })
+    };
+    let named = with_sc(|sc| sc.run_as_username = "app".into());
+    assert_eq!(ids(&named, &resolved).unwrap(), (1000, 1001));
+    let with_group = with_sc(|sc| {
+        sc.run_as_username = "app".into();
+        sc.run_as_group = u(44);
+    });
+    assert_eq!(ids(&with_group, &resolved).unwrap(), (1000, 44));
+    // イメージの User より username が勝つ。
+    let img = ImageDefaults {
+        user: Some((7, 8)),
+        ..resolved.clone()
+    };
+    assert_eq!(ids(&named, &img).unwrap(), (1000, 1001));
+    // イメージの User が未解決でも username が解決済みなら成功する。
+    let img = ImageDefaults {
+        user_unresolved: true,
+        ..resolved.clone()
+    };
+    assert_eq!(ids(&named, &img).unwrap(), (1000, 1001));
+    // 解決結果が無い（解決要求を無視する実装）ときは build が UNIMPLEMENTED。validate は通る。
+    assert_eq!(code(&pod(), &named), CriErrorCode::Unimplemented);
+    validate_config(&pod(), &named).expect("validate does not need the resolution");
+    // run_as_user との同時指定は両段で INVALID_ARGUMENT。
+    let both = with_sc(|sc| {
+        sc.run_as_user = u(33);
+        sc.run_as_username = "app".into();
+    });
+    assert_eq!(code(&pod(), &both), CriErrorCode::InvalidArgument);
+    assert_eq!(
+        validate_config(&pod(), &both).unwrap_err().code(),
+        CriErrorCode::InvalidArgument
+    );
+    // 形式不正は両段で INVALID_ARGUMENT。
+    for bad in ["1000", "a:b", "a/b", "a\0b", "a\nb", &"a".repeat(257)] {
+        let c = with_sc(|sc| sc.run_as_username = bad.into());
+        assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument, "{bad:?}");
+        assert_eq!(
+            validate_config(&pod(), &c).unwrap_err().code(),
+            CriErrorCode::InvalidArgument,
+            "{bad:?}"
+        );
+    }
+    // 256 バイトちょうどは形式として受ける。
+    let c = with_sc(|sc| sc.run_as_username = "a".repeat(256));
+    validate_config(&pod(), &c).expect("256 bytes");
+    // run_as_group 単独は従来どおり INVALID_ARGUMENT。
+    let c = with_sc(|sc| sc.run_as_group = u(44));
+    assert_eq!(code(&pod(), &c), CriErrorCode::InvalidArgument);
+}
+
 #[test]
 fn working_dir_and_hostname() {
     let mut c = ctr();
@@ -658,10 +725,6 @@ fn rejection_table_is_unimplemented() {
             }),
         ),
         ("readonly_rootfs", Box::new(|sc| sc.readonly_rootfs = true)),
-        (
-            "username",
-            Box::new(|sc| sc.run_as_username = "nobody".into()),
-        ),
         (
             "supplemental",
             Box::new(|sc| sc.supplemental_groups = vec![10]),

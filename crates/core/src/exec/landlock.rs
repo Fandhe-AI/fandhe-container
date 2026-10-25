@@ -32,13 +32,14 @@ use std::path::PathBuf;
 
 use super::{ExecError, IsolationStage, ThreadCountSource};
 use crate::audit_log::{AuditRecord, AuditRecordError, landlock_denial_record_now};
+use crate::dev_mounts::ImplicitDevMounts;
 use crate::landlock::{
     LandlockApplyError, LandlockApplyReport, LandlockError, LandlockRuleError, LandlockRuleset,
-    LandlockSupport, detect_landlock_abi, path_rules_from_config,
+    LandlockSupport, build_path_rules_with_user_tmpfs, detect_landlock_abi,
 };
 use crate::landlock::{MountCheck, handled_for_abi};
 use crate::launch_isolation::{LaunchIsolationRecord, RootIdentity};
-use crate::oci_runtime::{OciConfig, RootfsDir};
+use crate::oci_runtime::{OciConfig, OciMount, RootfsDir};
 use crate::sys;
 use crate::traits::types::ErrorCode;
 
@@ -95,7 +96,19 @@ pub(super) fn apply_landlock_stage_with(
 pub(crate) fn landlock_ruleset_from_config(
     config: &OciConfig,
 ) -> Result<LandlockRuleset, ExecError> {
-    ruleset_from_detection(detect_landlock_abi(), config)
+    landlock_ruleset_from_config_with_dev(config, &[], ImplicitDevMounts::All)
+}
+
+/// [`landlock_ruleset_from_config`] で暗黙の `/dev` 系マウントの含め方を選べる版(SUP-12・CORE-5・#2625)。
+///
+/// 本番 launcher が、起動オプションの tmpfs 集合から導いた [`ImplicitDevMounts`](`--ipc=host` では
+/// `WithoutShm`)を渡す。権利は減る方向にしか働かない。
+pub(crate) fn landlock_ruleset_from_config_with_dev(
+    config: &OciConfig,
+    user_tmpfs: &[OciMount],
+    implicit: ImplicitDevMounts,
+) -> Result<LandlockRuleset, ExecError> {
+    ruleset_from_detection_with_dev(detect_landlock_abi(), config, user_tmpfs, implicit)
 }
 
 /// 記録した launch 時の Landlock ルールから ruleset を組み直す（exec の再適用用。CORE-5・SUP-6・TASK-163 追補・
@@ -173,12 +186,30 @@ pub(crate) fn launch_isolation_from_ruleset(
 
 /// [`landlock_ruleset_from_config`] の ABI 検出結果を差し替えられる版（試験用の継ぎ目。本番は
 /// `detect_landlock_abi()` の結果を渡すだけ）。
+#[cfg(test)]
 pub(crate) fn ruleset_from_detection(
     detected: Result<LandlockSupport, LandlockError>,
     config: &OciConfig,
 ) -> Result<LandlockRuleset, ExecError> {
+    ruleset_from_detection_with_dev(detected, config, &[], ImplicitDevMounts::All)
+}
+
+/// [`ruleset_from_detection`] で暗黙マウントの含め方を選べる版(SUP-12・CORE-5・#2625)。
+pub(crate) fn ruleset_from_detection_with_dev(
+    detected: Result<LandlockSupport, LandlockError>,
+    config: &OciConfig,
+    user_tmpfs: &[OciMount],
+    implicit: ImplicitDevMounts,
+) -> Result<LandlockRuleset, ExecError> {
     let support = detected.map_err(from_landlock_unavailable)?;
-    path_rules_from_config(&support, config).map_err(from_landlock_rule)
+    build_path_rules_with_user_tmpfs(
+        &support,
+        config.root(),
+        config.mounts(),
+        user_tmpfs,
+        implicit,
+    )
+    .map_err(from_landlock_rule)
 }
 
 /// [`observe_landlock_path_access`] が 1 件ずつ試す操作の種別（CORE-5・TASK-39.5・#185）。

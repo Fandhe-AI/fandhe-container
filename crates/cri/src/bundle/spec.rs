@@ -26,8 +26,12 @@
 //!   `ImageRootfsSource` が展開後の rootfs の passwd / group を fd 起点で読んで解決する（#2606）。解決できなかった
 //!   ときは [`ImageDefaults::user_unresolved`] で受け、CRI の `run_as_user` が無ければ `UNIMPLEMENTED` で拒否する
 //!   （root へ黙ってフォールバックしない）。
+//! - `run_as_username` は形式を検証し（空でない・256 バイト以下・NUL / `:` / `/` / 改行なし・数字だけは不可）、
+//!   `ImageRootfsSource` が展開後の rootfs の passwd で解決した値を [`ImageDefaults::resolved_run_as_username`] で受ける
+//!   （#2664・CRI-2・SEC-5）。`run_as_user` との同時指定は `INVALID_ARGUMENT`、`run_as_group` は `run_as_user` か
+//!   `run_as_username` があるときだけ有効。解決結果が無ければ `UNIMPLEMENTED`（root へ黙って落とさない）。
 //! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（log_path・dns_config・port_mappings・cgroup_parent・sysctls・
-//!   devices・stop_signal・capabilities・supplemental_groups・run_as_username・propagation 等）の受け入れ順序と担当は
+//!   devices・stop_signal・capabilities・supplemental_groups・propagation 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 
 use std::collections::HashMap;
@@ -86,6 +90,39 @@ pub struct ImageDefaults {
     /// イメージの User が名前または uid のみで、解決できていない（passwd / group に無い・読めない等。#2433・#2606）。
     /// 真で CRI の `run_as_user` が無いときは `UNIMPLEMENTED` で拒否する。
     pub user_unresolved: bool,
+    /// CRI の `run_as_username` を rootfs の passwd で解決した `(uid, gid)`（#2664・CRI-2・SEC-5）。
+    /// `ImageRootfsSource` が [`super::UserResolveRequest`] を受けて埋める。要求があるのに `None` の
+    /// ままなら `build_runtime_config` は `UNIMPLEMENTED` で拒否する（root へ黙って落とさない）。
+    pub resolved_run_as_username: Option<(u32, u32)>,
+}
+
+/// `build_inner` の段階。`Validate` は rootfs を触る前の形式検証、`Build` は `config.json` の確定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Validate,
+    Build,
+}
+
+/// `run_as_username` の長さ上限（バイト。passwd の名前の上限。`image_rootfs` の名前上限と同値）。
+pub(crate) const MAX_USERNAME_BYTES: usize = 256;
+
+/// `run_as_username` の形式を検証する（空は未指定）。ファイルシステムに触れる前に呼ぶ。
+///
+/// 数字だけの名前は uid との曖昧さを作るため拒否する（数値は `run_as_user`。containerd は uid 扱いだが、
+/// CRI の「passwd に存在すること」を満たさないため採らない。#2664）。
+pub(crate) fn check_username(name: &str) -> Result<Option<&str>, CriError> {
+    if name.is_empty() {
+        return Ok(None);
+    }
+    if name.len() > MAX_USERNAME_BYTES
+        || name.bytes().all(|b| b.is_ascii_digit())
+        || name
+            .bytes()
+            .any(|b| matches!(b, 0 | b':' | b'/' | b'\n' | b'\r'))
+    {
+        return Err(invalid("run_as_username"));
+    }
+    Ok(Some(name))
 }
 
 /// 検証済みの `config.json` のバイト列（REPAIR-2）。
@@ -618,7 +655,7 @@ pub fn build_runtime_config(
     container: &ContainerConfig,
     image: &ImageDefaults,
 ) -> Result<RuntimeConfigJson, CriError> {
-    build_inner(sandbox, container, image, true)
+    build_inner(sandbox, container, image, Stage::Build)
 }
 
 /// イメージを展開する前に、CRI の設定だけで判定できる拒否・検証を済ませる（不正な要求で bundle を作らない）。
@@ -628,14 +665,20 @@ pub fn validate_config(
     sandbox: &PodSandboxConfig,
     container: &ContainerConfig,
 ) -> Result<(), CriError> {
-    build_inner(sandbox, container, &ImageDefaults::default(), false).map(|_| ())
+    build_inner(
+        sandbox,
+        container,
+        &ImageDefaults::default(),
+        Stage::Validate,
+    )
+    .map(|_| ())
 }
 
 fn build_inner(
     sandbox: &PodSandboxConfig,
     container: &ContainerConfig,
     image: &ImageDefaults,
-    require_command: bool,
+    stage: Stage,
 ) -> Result<RuntimeConfigJson, CriError> {
     // 実行層が受けない・無視すると要求より弱くなる入力を先に拒否する。
     if container.tty || container.stdin || container.stdin_once {
@@ -709,9 +752,6 @@ fn build_inner(
         if sc.readonly_rootfs {
             return Err(unsupported("readonly_rootfs"));
         }
-        if !sc.run_as_username.is_empty() {
-            return Err(unsupported("run_as_username"));
-        }
         if !sc.supplemental_groups.is_empty() {
             return Err(unsupported("supplemental_groups"));
         }
@@ -728,7 +768,7 @@ fn build_inner(
         }
     }
 
-    let args = build_args(container, image, require_command, &mut budget)?;
+    let args = build_args(container, image, stage == Stage::Build, &mut budget)?;
     let env = build_env(container, image, &mut budget)?;
 
     // 複製前に借用のまま長さと形を検証する（巨大な値を拒否する場合でも追加確保しない）。
@@ -745,21 +785,33 @@ fn build_inner(
     }
 
     let run_as_user = nonneg_u32("run_as_user", &sc.and_then(|s| s.run_as_user))?;
-    if run_as_user.is_none() && image.user_unresolved {
+    let username = check_username(sc.map_or("", |s| s.run_as_username.as_str()))?;
+    if run_as_user.is_some() && username.is_some() {
+        return Err(invalid("run_as_username"));
+    }
+    let resolved = match (username, stage) {
+        (Some(_), Stage::Build) => Some(
+            image
+                .resolved_run_as_username
+                .ok_or_else(|| unsupported("run_as_username"))?,
+        ),
+        _ => None,
+    };
+    let explicit_user = run_as_user.is_some() || username.is_some();
+    if !explicit_user && image.user_unresolved {
         return Err(unsupported("image user"));
     }
     let run_as_group = nonneg_u32("run_as_group", &sc.and_then(|s| s.run_as_group))?;
-    if run_as_group.is_some() && run_as_user.is_none() {
+    if run_as_group.is_some() && !explicit_user {
         return Err(invalid("run_as_group"));
     }
-    let uid = run_as_user.or(image.user.map(|u| u.0)).unwrap_or(0);
+    let uid = run_as_user
+        .or(resolved.map(|r| r.0))
+        .or(image.user.map(|u| u.0))
+        .unwrap_or(0);
     let gid = run_as_group
-        .or_else(|| {
-            run_as_user
-                .is_none()
-                .then(|| image.user.map(|u| u.1))
-                .flatten()
-        })
+        .or(resolved.map(|r| r.1))
+        .or_else(|| (!explicit_user).then(|| image.user.map(|u| u.1)).flatten())
         .unwrap_or(0);
 
     if container.mounts.len() > MAX_MOUNTS {

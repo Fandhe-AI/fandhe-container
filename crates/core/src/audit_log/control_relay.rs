@@ -16,9 +16,10 @@
 //! - 運べるのは [`AuditEvent::PluginPeer`]（#2484。plugin-cri の peer 認証の拒否。socket のパスは mount と同じ枠で運ぶ）・
 //!   [`AuditEvent::ControlPeer`]・[`AuditEvent::Seccomp`]・[`AuditEvent::ExitSignal`]（#2236。launcher の
 //!   回収点が出す補助の `exit_signal`）・理由なしの [`AuditEvent::Mount`]（#2481。supervisor の `start` が作業スレッドで
-//!   出す bind・sysfs の拒否。パスは生バイトで運ぶ）の記録だけ（他の層と、理由つきの `Mount` は `InvalidArgument`。
-//!   理由トークンは静的文字列の開いた語彙で、復号側が閉じた表へ戻せないため。理由つきの記録は単一スレッドの launch が
-//!   `FileAuditSink` へ直接出す）。時刻・PID・
+//!   出す bind・sysfs の拒否。パスは生バイトで運ぶ）・閉じた表（`MOUNT_REASONS`）の理由つきの `Mount`（#2623。start の
+//!   作業スレッドが出す rootfs の固定の検証後の差し替えの 2 理由）の記録だけ（他の層と、表に無い理由の `Mount` は
+//!   `InvalidArgument`。理由トークンは静的文字列の開いた語彙で、復号側が閉じた表へ戻せるものだけを運ぶ。それ以外の
+//!   理由つきの記録は単一スレッドの launch が `FileAuditSink` へ直接出す）。時刻・PID・
 //!   コンテナ ID・理由トークン（seccomp は種別トークンと syscall 番号・arch）を固定の枠で送り、helper が [`AuditRecord`] を
 //!   組み直す（生のバイト列を記録として扱わない。REPAIR-2）。seccomp の記録は supervisor の seccomp 通知ループ
 //!   （`record_seccomp_denial_for` 経由。SEC-4・REPAIR-5・#2025）が書く
@@ -82,6 +83,21 @@ const TAG_PLUGIN_PEER: u8 = 0x84;
 /// plugin_peer の枠の固定の追加部の長さ（理由の添字 1 ＋ `MOUNT_EXTRA_LEN`）。
 const PLUGIN_PEER_EXTRA_LEN: usize = 1 + MOUNT_EXTRA_LEN;
 
+/// 理由つきの mount（`AuditEvent::Mount { reason: Some(_) }`。#2623）の記録を示す先頭バイト。コンテナ ID の後に
+/// 理由の添字（`MOUNT_REASONS` の位置 1）と mount と同じ追加部（`MountHeader`）、可変長のパス本体が付く。
+const TAG_MOUNT_REASON: u8 = 0x85;
+/// 理由つき mount の枠の固定の追加部の長さ（理由の添字 1 ＋ `MOUNT_EXTRA_LEN`）。
+const MOUNT_REASON_EXTRA_LEN: usize = 1 + MOUNT_EXTRA_LEN;
+
+/// 理由つき mount で運べる理由（枠の添字）の閉じた表。start の作業スレッド（複数スレッド）が出す
+/// rootfs の固定（`RootfsDir::pin`）の検証後の差し替えの 2 理由だけ（SEC-4・SEC-1・#2623）。
+/// 理由トークンは静的文字列の開いた語彙のため、復号側はこの表から静的トークンを引き直す。
+/// 増やすときは表と試験を同時に更新する。
+const MOUNT_REASONS: [crate::exec::ViolationReason; 2] = [
+    crate::exec::ViolationReason::PathSymlinkOrNotDirectory,
+    crate::exec::ViolationReason::PathMissing,
+];
+
 /// plugin_peer で運べる拒否理由（枠の添字）。`Unknown` も運ぶ（落とさず記録する）。
 const PLUGIN_PEER_REJECTIONS: [PluginPeerRejection; 5] = [
     PluginPeerRejection::PeerUidMismatch,
@@ -98,6 +114,7 @@ const fn extra_len(tag: u8) -> usize {
         TAG_EXIT_SIGNAL => EXIT_SIGNAL_EXTRA_LEN,
         TAG_MOUNT => MOUNT_EXTRA_LEN,
         TAG_PLUGIN_PEER => PLUGIN_PEER_EXTRA_LEN,
+        TAG_MOUNT_REASON => MOUNT_REASON_EXTRA_LEN,
         _ => 0,
     }
 }
@@ -118,11 +135,11 @@ fn encode(record: &AuditRecord) -> Result<Vec<u8>, TraitError> {
         AuditEvent::Mount { path, reason: None } => {
             return encode_mount(record, path.as_ref());
         }
-        AuditEvent::Mount { .. } => {
-            return Err(err(
-                ErrorCode::InvalidArgument,
-                "the audit relay does not carry mount records with a reason",
-            ));
+        AuditEvent::Mount {
+            path,
+            reason: Some(reason),
+        } => {
+            return encode_mount_reason(record, path.as_ref(), reason.as_str());
         }
         AuditEvent::PluginPeer { path, reason } => {
             return encode_plugin_peer(record, path, reason.as_str());
@@ -298,6 +315,31 @@ fn encode_mount(record: &AuditRecord, path: Option<&AuditPath>) -> Result<Vec<u8
     Ok(frame)
 }
 
+/// 理由つきの `Mount`（#2623）を枠へ符号化する。理由は閉じた表 `MOUNT_REASONS` の添字で運び、表に無いトークンは拒否する。
+fn encode_mount_reason(
+    record: &AuditRecord,
+    path: Option<&AuditPath>,
+    reason: &str,
+) -> Result<Vec<u8>, TraitError> {
+    let Some(index) = MOUNT_REASONS
+        .iter()
+        .position(|r| r.as_str() == reason)
+        .and_then(|i| u8::try_from(i).ok())
+    else {
+        return Err(err(
+            ErrorCode::InvalidArgument,
+            "the audit relay does not carry mount records with this reason",
+        ));
+    };
+    let (header, bytes) = MountHeader::for_path(path)?;
+    let mut frame = Vec::with_capacity(FIXED_LEN + MOUNT_REASON_EXTRA_LEN + bytes.len());
+    push_head(&mut frame, TAG_MOUNT_REASON, record)?;
+    frame.push(index);
+    frame.extend_from_slice(&header.to_bytes());
+    frame.extend_from_slice(bytes);
+    Ok(frame)
+}
+
 /// `PluginPeer`（#2484）を枠へ符号化する。理由は閉じた表の添字で運び、表に無いトークンは拒否する。
 fn encode_plugin_peer(
     record: &AuditRecord,
@@ -338,6 +380,22 @@ fn decode_plugin_peer(rest: &[u8], id_len: usize) -> Option<(&[u8], AuditEvent)>
     ))
 }
 
+/// `rest`（ID の後ろ）から理由つき mount の記録の ID と事象を組み直す。理由は表の静的トークンから作り、
+/// 枠のバイト列から文字列を作らない。壊れた枠・範囲外の添字は `None`。
+fn decode_mount_reason(rest: &[u8], id_len: usize) -> Option<(&[u8], AuditEvent)> {
+    let (id, after) = rest.split_at_checked(id_len)?;
+    let reason = MOUNT_REASONS.get(usize::from(*after.first()?))?;
+    let header = MountHeader::parse(after.get(1..MOUNT_REASON_EXTRA_LEN)?)?;
+    let path = header.into_path(after.get(MOUNT_REASON_EXTRA_LEN..)?)?;
+    Some((
+        id,
+        AuditEvent::Mount {
+            path,
+            reason: Some(super::AuditReason::new(reason.as_str())),
+        },
+    ))
+}
+
 /// `rest`（ID の後ろ）から mount の記録の ID と事象を組み直す。壊れた枠は `None`。
 fn decode_mount(rest: &[u8], id_len: usize) -> Option<(&[u8], AuditEvent)> {
     let (id, after) = rest.split_at_checked(id_len)?;
@@ -359,6 +417,8 @@ fn decode(frame: &[u8]) -> Option<AuditRecord> {
     }
     let (id, event) = if tag == TAG_MOUNT {
         decode_mount(rest, id_len)?
+    } else if tag == TAG_MOUNT_REASON {
+        decode_mount_reason(rest, id_len)?
     } else if tag == TAG_PLUGIN_PEER {
         decode_plugin_peer(rest, id_len)?
     } else if tag == TAG_SECCOMP {
@@ -419,7 +479,7 @@ fn serve(mut stream: UnixStream, sink: &FileAuditSink) -> i32 {
         let header_offset = match head.first() {
             Some(&TAG_MOUNT) => Some(0),
             // plugin_peer は追加部の先頭に理由の添字 1 バイトがあり、MountHeader はその後ろ。
-            Some(&TAG_PLUGIN_PEER) => Some(1),
+            Some(&TAG_PLUGIN_PEER | &TAG_MOUNT_REASON) => Some(1),
             _ => None,
         };
         if let Some(offset) = header_offset {
@@ -923,18 +983,91 @@ mod tests {
         assert!(decode(&none_with_len).is_none());
     }
 
-    /// SEC-4・#2481: 理由つきの mount は運ばない（静的トークンを復号側で戻せない）。
-    #[test]
-    fn sec4_2481_mount_with_reason_is_rejected() {
-        let rec = AuditRecord::new(
-            AuditTimestamp::from_unix_duration(Duration::new(1, 0)),
-            AuditPid::new(1).unwrap(),
+    fn reason_sample(
+        path: Option<AuditPath>,
+        reason: &'static str,
+        id: Option<&str>,
+    ) -> AuditRecord {
+        let mut rec = AuditRecord::new(
+            AuditTimestamp::from_unix_duration(Duration::new(5, 6)),
+            AuditPid::new(7).unwrap(),
             AuditEvent::Mount {
-                path: None,
-                reason: Some(super::super::AuditReason::new("x")),
+                path,
+                reason: Some(super::super::AuditReason::new(reason)),
             },
         );
-        assert_eq!(encode(&rec).unwrap_err().code(), ErrorCode::InvalidArgument);
+        if let Some(id) = id {
+            rec = rec.with_container_id(ContainerId::new(id).unwrap());
+        }
+        rec
+    }
+
+    /// SEC-4・#2623: 閉じた表の理由つき mount は枠を往復し、理由・ID・PID が一致する。
+    #[test]
+    fn sec4_2623_mount_with_closed_reason_round_trips() {
+        for r in MOUNT_REASONS {
+            for path in [None, Some(AuditPath::new("/a/b"))] {
+                let rec = reason_sample(path.clone(), r.as_str(), Some("c1"));
+                let frame = encode(&rec).unwrap();
+                assert_eq!(frame[0], TAG_MOUNT_REASON);
+                assert_eq!(extra_len(frame[0]), MOUNT_REASON_EXTRA_LEN);
+                let back = decode(&frame).unwrap();
+                assert_eq!(back.container_id().unwrap().as_str(), "c1");
+                assert_eq!(back.pid().get(), 7);
+                match back.event() {
+                    AuditEvent::Mount {
+                        path: p,
+                        reason: Some(reason),
+                    } => {
+                        assert_eq!(reason.as_str(), r.as_str());
+                        assert_eq!(
+                            p.as_ref().map(AuditPath::as_path),
+                            path.as_ref().map(AuditPath::as_path)
+                        );
+                    }
+                    other => panic!("unexpected event: {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// SEC-4・#2623: 表に無い理由の mount は運ばない（静的トークンを復号側で戻せない）。
+    #[test]
+    fn sec4_2623_mount_with_reason_outside_table_is_rejected() {
+        for reason in ["x", "rootfs_is_host_root", "path_not_absolute"] {
+            let rec = reason_sample(None, reason, None);
+            assert_eq!(encode(&rec).unwrap_err().code(), ErrorCode::InvalidArgument);
+        }
+    }
+
+    /// REPAIR-2・#2623: 範囲外の添字・長さの食い違いは復号しない（記録を捏造しない）。
+    #[test]
+    fn repair2_2623_malformed_mount_reason_frames_are_not_decoded() {
+        let rec = reason_sample(None, MOUNT_REASONS[0].as_str(), Some("c1"));
+        let frame = encode(&rec).unwrap();
+        let idx_at = FIXED_LEN + 2;
+        let mut bad_index = frame.clone();
+        bad_index[idx_at] = u8::try_from(MOUNT_REASONS.len()).unwrap();
+        assert!(decode(&bad_index).is_none());
+        let mut extra = frame.clone();
+        extra.push(b'x');
+        assert!(decode(&extra).is_none());
+        assert!(decode(&frame[..frame.len() - 1]).is_none());
+        assert!(decode(&frame).is_some());
+    }
+
+    /// 表の一貫性: 各理由は exec worker の写像でパスなしの理由つき Mount になる（start の記録と同じ写像）。
+    #[test]
+    fn sec4_2623_reason_table_matches_exec_worker_mapping() {
+        for r in MOUNT_REASONS {
+            match r.exec_worker_audit_event() {
+                Some(AuditEvent::Mount {
+                    path: None,
+                    reason: Some(x),
+                }) => assert_eq!(x.as_str(), r.as_str()),
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
     }
 
     fn seccomp_sample(nr: i32, arch: u32, id: Option<&str>) -> AuditRecord {

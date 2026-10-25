@@ -21,7 +21,7 @@
 //!   `SetupFailed` は supervisor の `run_command*` が親側で 1 拒否 1 件を記録する。パスは持たない
 //!   （型で保証）。記録の PID と時刻は記録を行った親プロセスのもので、時刻は拒否から最大で exec の
 //!   上限時間ぶん遅れ得る。ワイヤー形式には安定値 `entrypoint` が `layer` に増える（既存の層の行は不変。
-//!   `reason` を持つ層は plugin_trust・exec_target・entrypoint の 3 つ）。launch 経路（本番 launcher の子）の entrypoint 違反の記録は未配線（担当 #2624。REPAIR-3）
+//!   `reason` を持つ層は plugin_trust・exec_target・entrypoint の 3 つ）。launch 経路（本番 launcher の子）の entrypoint 違反は、子が状態 pipe の exec 前の 2 行目で返し、親〔launcher の呼び出し元〕が `exec::audit_entrypoint_violation` で記録して配線済み（#2624）。状態 pipe を持たない `spawn_container` 系の子は報告しない（REPAIR-3）
 //! - TASK-41.3（#194）の Landlock フックは [`landlock_denial_record`] で実装済み（プロセス内で観測した
 //!   `EACCES` の写像まで。ワークロードの拒否のカーネル側監査〔Linux 6.15+ の `AUDIT_LANDLOCK_*`〕による
 //!   捕捉は未実装）

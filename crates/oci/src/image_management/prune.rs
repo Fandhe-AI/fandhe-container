@@ -34,7 +34,6 @@ use super::gc_journal::{
     DeletionDurability, GcJournal, ensure_no_pending_journal, remove_journal, settle, sweep_blobs,
     write_journal,
 };
-use super::usage::check_blob_dirs;
 use crate::error::{OciError, OciErrorCode};
 use crate::instrument::{NoopOciOpRecorder, OciOpKind, OciOpRecorder, record_oci_op};
 use crate::reference::Digest;
@@ -130,12 +129,15 @@ impl ReferenceTable {
     }
 
     fn execute_image_prune_inner(&mut self, root: &Path) -> Result<ImagePruneOutcome, OciError> {
+        // 以降の永続化操作（ジャーナル・blob の削除）は、排他区間で検査済みの root の fd を起点にする（#2638）。
+        let handle = self.root_handle_for(root)?;
+        let root = &*handle;
         // 未完了のテーブル操作が残る間は prune を始めない（OCI-7）。
         self.ensure_no_pending_deletion()?;
         // 片づいていない削除が残っているうちは新しい削除を始めない（lock 時の再試行が先に片づける）。
         ensure_no_pending_journal(root)?;
         // テーブルもファイルも触る前にディレクトリ構成を検証する。
-        let dirs_present = check_blob_dirs(root)?;
+        let dirs_present = root.check_blob_dirs()?;
         let plan = self.plan_image_prune();
         // テーブルを変える前に削除の意図を永続化する。書けなければ何も変えずに返す（削除前に収束）。
         let journaled = dirs_present && !plan.delete_blobs.is_empty();

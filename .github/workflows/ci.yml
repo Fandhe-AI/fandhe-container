@@ -73,6 +73,27 @@ on:
         description: 繰り返す lib 試験の完全名（例 start_entry::tests::sup_repair5_2008_full_queue_does_not_block）
         type: string
         default: ''
+      repeat-test-bin:
+        description: >-
+          繰り返す harness = false の結合試験の名前（[[test]] の name。例 exec_seccomp_listener）。
+          repeat-test と排他で、repeat-success-line が必須（REPAIR-12・#2660）
+        type: string
+        default: ''
+      repeat-success-line:
+        description: >-
+          repeat-test-bin の成功行（行全体の完全一致。例 exec_seccomp_listener: all scenarios passed）
+        type: string
+        default: ''
+      repeat-test-ignored:
+        description: true にすると repeat-test-bin を -- --ignored 付きで実行する
+        type: boolean
+        default: false
+      repeat-linux-only:
+        description: >-
+          true にすると繰り返しのステップを Linux だけで実行する（非 Linux で not applicable になる
+          試験用。既定 false は 3 OS）
+        type: boolean
+        default: false
       repeat-count:
         description: 繰り返し回数（1〜1000）
         type: string
@@ -446,6 +467,15 @@ jobs:
         run: cargo build --workspace
       - name: cargo clippy（既定 feature）
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # 試験用 feature 無効の `-p` 単独 lib/bin ビルドの clippy（#2640・REPAIR-7・REPAIR-12。経緯は #2550）。
+      # ワークスペース単位の clippy は feature 統一で試験用 feature が有効になり、「無効の単独ビルドでだけ出る
+      # dead_code・cfg 漏れ」を見逃す。全メンバーを `cargo metadata` で列挙して個別に見る。型検査段の結果は
+      # OS に依らず、macOS・Windows の cfg 分岐は cross-target-check が PR で `--target` 付きで検査するため、
+      # ubuntu だけで実行する（直前の clippy で外部依存の成果物が温まっている）。既存ジョブのステップ（check-run 件数は不変）
+      - name: 試験用 feature 無効の -p 単独 lib/bin の clippy（#2640・REPAIR-12。ubuntu のみ）
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        run: make check-standalone-clippy
       - name: cargo test（既定 feature）
         run: cargo test --workspace
       # macOS・Windows の `--all-features` の clippy / test（2026-10-10 の再構成で rust-ci〔reusable
@@ -472,15 +502,23 @@ jobs:
         shell: bash
         timeout-minutes: 10
         run: make doc
-      # 指定した lib 試験の繰り返し（workflow_dispatch の repeat-* 入力があるときだけ。REPAIR-12・#2538）。
+      # 指定した試験の繰り返し（workflow_dispatch の repeat-* 入力があるときだけ。REPAIR-12・#2538・#2660）。
+      # repeat-test は lib 試験、repeat-test-bin + repeat-success-line は harness = false の結合試験。
+      # repeat-linux-only=true のときは Linux だけで回す（非 Linux で not applicable になる試験用）。
       # 入力は env 経由で渡し、run 内で式を展開しない（スクリプトインジェクション対策）。既存ジョブのステップ
       - name: 指定した試験の繰り返し（workflow_dispatch のみ）
-        if: github.event_name == 'workflow_dispatch' && inputs.repeat-test != ''
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          (inputs.repeat-test != '' || inputs.repeat-test-bin != '') &&
+          (!inputs.repeat-linux-only || runner.os == 'Linux')
         shell: bash
         timeout-minutes: 30
         env:
           PACKAGE: ${{ inputs.repeat-package }}
           TEST: ${{ inputs.repeat-test }}
+          TEST_BIN: ${{ inputs.repeat-test-bin }}
+          SUCCESS_LINE: ${{ inputs.repeat-success-line }}
+          TEST_IGNORED: ${{ inputs.repeat-test-ignored && '1' || '' }}
           COUNT: ${{ inputs.repeat-count }}
         run: make repeat-test
       # core の plugin 無効構成（--no-default-features）の検証（PLUG-3・TASK-111.1・#262）。
@@ -843,6 +881,13 @@ jobs:
         timeout-minutes: 5
         run: make check-launch-target-selftest
 
+      # 単独 clippy の判定スクリプトの自己テスト（#2640・REPAIR-12）。スタブの cargo と jq だけを使う。
+      # 既存ジョブのステップ（check-run 件数は不変）
+      - name: 単独 clippy 判定の自己テスト（#2640・REPAIR-12。ubuntu・macos・windows）
+        if: env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: make check-standalone-clippy-selftest
+
       # 試験の繰り返し実行スクリプトの自己テスト（REPAIR-12・#2538）。スタブの cargo だけを使う。
       # 既存ジョブのステップ（check-run 件数は不変）
       - name: 試験の繰り返し実行スクリプトの自己テスト（#2538・REPAIR-12。ubuntu・macos・windows）
@@ -1111,41 +1156,6 @@ jobs:
           done
           echo "::notice::runtime_service_namespaces verified"
 
-      # userns_extract（`crates/oci/tests/userns_extract.rs`。OCI-2・SEC-5・REPAIR-7・#2542）: rootless の user namespace 内での
-      # レイヤー展開（所有者・setuid・写像外 ID の拒否）を `unshare --user --map-root-user` の単一行写像で照合する実機前提
-      # テスト（harness = false）。非 root・上で緩和した AppArmor の sysctl・util-linux の `unshare` だけが前提で、
-      # 後段の subuid 前提確認ステップには依存しない。新しい check-run・sudo・permissions は追加しない。
-      # `--ignored` が届かなくても exit 0 になるため、成功行を行単位の完全一致で照合し、`ignored` 行の出現は失敗にする。
-      # `newuidmap` による範囲写像のケースは試験に未実装で、後続の実装と実機確認は #1621 で追跡する。
-      - name: userns_extract のビルド（実行タイムアウトの時間枠を消費しないよう分離）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
-        timeout-minutes: 10
-        run: cargo test -p fandhe-container-oci --test userns_extract --no-run
-
-      - name: userns_extract の実行（実機前提テスト・--ignored。OCI-2・SEC-5・#2542）
-        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
-        timeout-minutes: 5
-        run: |
-          set -euo pipefail
-          log="${RUNNER_TEMP}/userns_extract.log"
-          cargo test -p fandhe-container-oci --test userns_extract -- --ignored 2>&1 | tee "${log}"
-          if grep -Fq 'userns_extract: ignored' "${log}"; then
-            echo "::error::userns_extract was skipped (--ignored did not reach the test)" >&2
-            exit 1
-          fi
-          for line in \
-            'ok: extract_ok' \
-            'ok: outside_map' \
-            'ok: map_mismatch' \
-            'test userns_extract ... ok'; do
-            if ! grep -Fxq "${line}" "${log}"; then
-              echo "::error::userns_extract did not report: ${line} (possibly not executed)" >&2
-              exit 1
-            fi
-            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
-          done
-          echo "::notice::userns_extract verified"
-
       # production_launcher・rootless_file_owner・rootless_image_rootfs_remove・seccomp（`crates/core/tests/`。CORE-1・CORE-5・CORE-6・SEC-1・
       # SEC-4・SEC-5・#2376）と、rootless_launch・rootless・rootless_uid_mapping（core）・supervisor_bin_real（supervisor）・
       # start_stop_delete_real（cli）（CORE-6・SUP-4・REPAIR-7・#2596。前提は同じ。Landlock ABI 6 以上と user manager の
@@ -1184,6 +1194,46 @@ jobs:
             echo "Landlock ABI: ${abi}"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # userns_extract（`crates/oci/tests/userns_extract.rs`。OCI-2・SEC-5・CORE-6・REPAIR-7・#2542・#2642）: rootless の
+      # user namespace 内でのレイヤー展開（所有者・setuid・写像外 ID の拒否）を照合する実機前提テスト（harness = false）。
+      # 単一行写像（`unshare --user --map-root-user`）に加え、`newuidmap` / `newgidmap` の範囲写像（subuid / subgid）のケース
+      # （`subordinate_*`）を含む。範囲写像は上の前提確認ステップ（uidmap・subuid / subgid の行）に依存するため、その後に置く。
+      # 試験は `USER`（subuid の所有者名）を使うので渡す。新しい check-run・sudo・permissions は追加しない。
+      # `--ignored` が届かなくても exit 0 になるため、成功行を行単位の完全一致で照合し、`ignored` 行の出現は失敗にする。
+      # root で走る分岐は CI では回さない（実機確認は #1621）。
+      - name: userns_extract のビルド（実行タイムアウトの時間枠を消費しないよう分離）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 10
+        run: cargo test -p fandhe-container-oci --test userns_extract --no-run
+
+      - name: userns_extract の実行（実機前提テスト・--ignored。OCI-2・SEC-5・#2542・#2642）
+        if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          log="${RUNNER_TEMP}/userns_extract.log"
+          USER="$(id -un)" cargo test -p fandhe-container-oci --test userns_extract -- --ignored 2>&1 | tee "${log}"
+          if grep -Fq 'userns_extract: ignored' "${log}"; then
+            echo "::error::userns_extract was skipped (--ignored did not reach the test)" >&2
+            exit 1
+          fi
+          for line in \
+            'ok: extract_ok' \
+            'ok: outside_map' \
+            'ok: map_mismatch' \
+            'ok: subordinate_extract_ok' \
+            'ok: subordinate_outside_map' \
+            'ok: subordinate_map_mismatch' \
+            'ok: subordinate_cleanup' \
+            'test userns_extract ... ok'; do
+            if ! grep -Fxq "${line}" "${log}"; then
+              echo "::error::userns_extract did not report: ${line} (possibly not executed)" >&2
+              exit 1
+            fi
+            echo "${line}" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "::notice::userns_extract verified"
+
       - name: production_launcher のビルド（バイナリの特定。実行タイムアウトの時間枠を消費しないよう分離）
         if: runner.os == 'Linux' && env.HANG_PROBE != 'true'
         timeout-minutes: 10
@@ -1220,7 +1270,8 @@ jobs:
           for part in \
             'production_launcher: subordinate id mapping verified (uid extents=' \
             'production_launcher: scenario=user-applied uid=gid=1000 host_uid=' \
-            'production_launcher: exit_signal recorded once via audit relay (scenario=Q)'; do
+            'production_launcher: exit_signal recorded once via audit relay (scenario=Q)' \
+            'production_launcher: launch options reached the container (scenario=S ipc=host tmpfs=/run'; do
             if ! grep -Fq "${part}" "${log}"; then
               echo "::error::production_launcher did not report: ${part} (possibly not executed)" >&2
               exit 1
@@ -1311,7 +1362,7 @@ jobs:
           log="${RUNNER_TEMP}/rootless_image_rootfs_remove.log"
           USER="$(id -un)" \
             cargo test -p fandhe-container-core --test rootless_image_rootfs_remove -- --ignored 2>&1 | tee "${log}"
-          for scenario in a b c d e; do
+          for scenario in a b c d e f; do
             line="rootless_image_rootfs_remove: scenario ${scenario} verified"
             if ! grep -Fxq "${line}" "${log}"; then
               echo "::error::rootless_image_rootfs_remove did not report: ${line} (possibly not executed)" >&2
@@ -1768,6 +1819,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --target aarch64-apple-darwin -- -D warnings
       - name: cargo clippy（aarch64-apple-darwin・既定 feature）
         run: cargo clippy --workspace --all-targets --target aarch64-apple-darwin -- -D warnings
+      - name: 試験用 feature 無効の -p 単独 clippy（aarch64-apple-darwin・#2640）
+        env:
+          CLIPPY_TARGET: aarch64-apple-darwin
+        run: make check-standalone-clippy
       - name: cargo doc（aarch64-apple-darwin・既定 feature・-D warnings）
         env:
           RUSTDOCFLAGS: -D warnings
@@ -1778,6 +1833,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --target x86_64-pc-windows-msvc -- -D warnings
       - name: cargo clippy（x86_64-pc-windows-msvc・既定 feature）
         run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-msvc -- -D warnings
+      - name: 試験用 feature 無効の -p 単独 clippy（x86_64-pc-windows-msvc・#2640）
+        env:
+          CLIPPY_TARGET: x86_64-pc-windows-msvc
+        run: make check-standalone-clippy
       - name: cargo doc（x86_64-pc-windows-msvc・既定 feature・-D warnings）
         env:
           RUSTDOCFLAGS: -D warnings

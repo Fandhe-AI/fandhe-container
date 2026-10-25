@@ -113,7 +113,8 @@ impl ImplicitDevMount {
 /// 暗黙マウントを Landlock のルールに含めるか。
 ///
 /// `None` は rootfs にこれらのマウントが無い経路（専用の `/dev` を載せない最小入口 `spawn_container`。本番では使われず、
-/// 本番の launcher は `All` を使う。`--ipc=host` の `WithoutShm` の結線は #2625）向けで、
+/// 本番の launcher は起動オプションの tmpfs 集合から [`ImplicitDevMounts::for_tmpfs_set`] で選ぶ。`--ipc=host` の `WithoutShm` は
+/// `LaunchOptions` 経由で結線済み。SUP-12・#2625）向けで、
 /// ルールが減るだけで権利は広がらない（緩む方向には働かない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

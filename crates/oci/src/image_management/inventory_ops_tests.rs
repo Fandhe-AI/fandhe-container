@@ -261,7 +261,7 @@ fn oci7_prune_persists_and_survives_save_failure() {
 /// 前回の削除（A を外し 0x11・0xc1 を消す意図）を残したジャーナルを書く。
 fn journal_for_a(root: &Root) {
     write_journal(
-        &root.0,
+        &super::root_handle::rh(&root.0),
         &GcJournal {
             manifests: vec![d(0xa0)],
             untag: vec![(tk("v1"), d(0xa0))],

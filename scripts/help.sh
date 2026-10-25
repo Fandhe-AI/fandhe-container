@@ -55,6 +55,10 @@ cat <<'EOF'
                                         plugin 起動対象の構築口 from_verified_file を呼ぶのが core の変換と許可した試験コードだけか判定する（PLUG-11・#1857）
   check-launch-target-selftest        scripts/check-plugin-launch-target-construction-selftest.sh
                                         check-launch-target の自己テスト（REPAIR-12。fixture のみ）
+  check-standalone-clippy             scripts/targets/check-standalone-clippy.sh
+                                        試験用 feature 無効の -p 単独 lib/bin ビルドの clippy を全メンバーに回す（CLIPPY_TARGET=<triple> で --target。#2640・REPAIR-12）
+  check-standalone-clippy-selftest    scripts/check-standalone-clippy-selftest.sh
+                                        check-standalone-clippy の自己テスト（REPAIR-12。スタブの cargo のみ。jq が必要）
   test-core-no-plugin                 scripts/targets/test-core-no-plugin.sh
                                         core を --no-default-features でテストし plugin 依存が入らないことを検証する
   plugin-feature-size                 scripts/targets/plugin-feature-size.sh
@@ -126,7 +130,7 @@ cat <<'EOF'
   crictl-smoke-selftest               scripts/cri/crictl-smoke-selftest.sh
                                         crictl 疎通確認スクリプトの自己テスト（CRI-1・TASK-60・REPAIR-12。スタブの crictl のみ・python3 が必要）
   repeat-test-selftest                scripts/repeat-test-selftest.sh
-                                        repeat-test.sh の自己テスト（REPAIR-12。入力検査・回数範囲・1 回ごとの timeout・成功行の照合をスタブで確認）
+                                        repeat-test.sh の自己テスト（REPAIR-12・#2660。lib と結合試験の両モード。入力検査・回数範囲・1 回ごとの timeout・成功行の照合をスタブで確認）
   deny                                scripts/targets/deny.sh
                                         cargo deny check advisories bans licenses sources（ルート workspace と venus 試験治具の依存監査。cargo-deny 未導入なら自動導入）
   deny-poc-venus-jig                  scripts/targets/deny-poc-venus-jig.sh

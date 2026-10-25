@@ -43,7 +43,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::PathBuf;
 
 mod container_ref_persist;
 pub use container_ref_persist::{
@@ -104,6 +103,9 @@ pub use pull_recovery::StalePullRecovery;
 mod tag;
 pub use tag::{ImageTagChange, ImageTagOutcome, ImageTagSource, MAX_TAG_REFS};
 
+mod root_handle;
+#[cfg(test)]
+mod root_swap_tests;
 mod store;
 pub use store::{
     IMAGE_STORE_LOCK_FILE_NAME, IMAGE_STORE_LOCK_TIMEOUT, ImageStore, ImageStoreGuard,
@@ -368,7 +370,7 @@ pub struct ReferenceTable {
 
 /// `ReferenceTable` に載せる検査用の root。等価比較・複製には影響しない（テーブルの内容ではないため）。
 #[derive(Debug, Clone, Default)]
-pub(crate) struct JournalRoot(Option<PathBuf>);
+pub(crate) struct JournalRoot(Option<std::sync::Arc<root_handle::RootHandle>>);
 
 impl PartialEq for JournalRoot {
     fn eq(&self, _: &Self) -> bool {

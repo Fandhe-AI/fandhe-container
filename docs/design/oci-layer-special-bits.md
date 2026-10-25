@@ -110,7 +110,8 @@ uid / gid）で渡す。入れ子の user namespace の中で展開するとき�
 ## ディレクトリ fd 起点の解決と展開中の再確認（#2437・OCI-1・OCI-2・SEC-5）
 
 実装は `crates/oci/src/layer/anchored.rs`（`AnchoredRoot`）と `crates/oci/src/sys/at.rs`（`openat2` 等の自前宣言。新しい `unsafe` は
-`sys` の中だけ）。
+`sys` の中だけ。宣言は子 `libc_abi` で `libc` と機械照合する〔#2590〕。照合の対象外とその理由は
+`docs/design/ffi-libc-check.md`「適用状況」）。
 
 - 解決は 2 段にする。各コンポーネントの `lstat` による確認（別表記の検出 IO-5・型の衝突・symlink の chroot 意味論）は残し、
   変更操作（作成・削除・symlink・hardlink・`chown`・mode の適用・whiteout の削除）だけを `root` の fd 起点にする。`root` は
@@ -192,7 +193,6 @@ tar のコンテナ内 ID をそのまま `chown` する（namespace の中で�
   fail-closed にしホストでの展開に届かない／Linux の他アーキテクチャは展開が `Unimplemented` で展開物が無く、削除も空の木を
   消すだけ／macOS の `openat` 系・Windows のハンドル起点操作は新しい FFI 宣言・libc 照合（Windows はオーナー判断）が要る。
   ゲストが共有ディレクトリへ書き込みうる設計（`macos-shared-vm.md`）になれば優先度が上がる
-- oci の `sys` への `libc` との機械照合の導入（`docs/design/ffi-libc-check.md`。`sys/at.rs` の定数は一次情報との突き合わせのみ）
 - 本番の呼び出し元（pull → 展開 → 起動の経路）から `ExtractOptions` を渡す配線
 - `IdMap` と core の `IdMapSet` を下位 crate へ共通化するかどうか（crate 境界の判断）
 
@@ -231,4 +231,4 @@ rootless の user namespace の中での展開（#2382）: `extract.rs` の `cho
 `sec5_special_bits_to_keep_in_userns_matrix`（`/proc/self` の見え方の差し替え口で開始前の検証と宛先の値を照合）、
 `idmap.rs` の `sec5_parse_proc_id_map`・`sec5_same_lines_as`、`tests/idmap_core_parity.rs` の
 `oci2_parse_proc_id_map_matches_core`。実機前提の `tests/userns_extract.rs`（`harness = false`。`unshare --user --map-root-user`
-で子を namespace へ入れ、ホストから見た所有者・setuid を照合。`-- --ignored`。AGENTS.md「実機前提テスト」）。
+で子を namespace へ入れ、ホストから見た所有者・setuid を照合。`newuidmap` の範囲写像のケース〔#2642〕を含む。`-- --ignored`。AGENTS.md「実機前提テスト」）。

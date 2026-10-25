@@ -41,10 +41,14 @@ use crate::oci_runtime::{
     CONFIG_MAX_MOUNTS, CONFIG_MAX_PATH_BYTES, MountDestination, OciConfig, OciMount, OciMountKind,
     OciRoot,
 };
+use crate::tmpfs::TMPFS_MAX_MOUNTS;
 use crate::traits::ErrorCode;
 
 /// 生成するルール本数の上限（mount 上限 + rootfs 1 本 + 暗黙の `/dev` 系 3 本。DoS 防止）。
-pub const MAX_LANDLOCK_RULES: usize = CONFIG_MAX_MOUNTS + 1 + IMPLICIT_DEV_MOUNT_COUNT;
+///
+/// 利用者指定の tmpfs（`--tmpfs`。上限 [`TMPFS_MAX_MOUNTS`]）は `mounts[]` とは別枠で数える（SUP-12・CORE-5・#2625）。
+pub const MAX_LANDLOCK_RULES: usize =
+    CONFIG_MAX_MOUNTS + TMPFS_MAX_MOUNTS + 1 + IMPLICIT_DEV_MOUNT_COUNT;
 
 /// Landlock の fs アクセス権ビット集合。既知の 16 ビット以外を表現できない。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +207,8 @@ pub enum RuleOrigin {
         /// `mounts` 内の位置。
         index: usize,
     },
+    /// 利用者指定の tmpfs（`--tmpfs`。tmpfs の段が載せた同じ宛先のマウントと照合する。SUP-12・CORE-5・#2625）。
+    UserTmpfs,
     /// ランタイムが暗黙に載せるマウント（`/dev`・`/dev/pts`・`/dev/shm`。#1657）。
     Implicit {
         /// 対象のマウント。
@@ -561,17 +567,49 @@ pub fn build_path_rules_with_dev(
     mounts: &[OciMount],
     implicit: ImplicitDevMounts,
 ) -> Result<LandlockRuleset, LandlockRuleError> {
+    build_path_rules_with_user_tmpfs(support, root, mounts, &[], implicit)
+}
+
+/// [`build_path_rules_with_dev`] に利用者指定の tmpfs（`--tmpfs`。暗黙の `/dev/shm` を除く）を足せる版
+/// （SUP-12・CORE-5・#2625）。
+///
+/// 利用者 tmpfs は `mounts[]` の後に重ね、ルールの由来は [`RuleOrigin::UserTmpfs`]（`mounts[]` の位置は持たない）。
+/// `ro` の tmpfs はルールを作らない: 書き込み可能な祖先（root）の下では Landlock で書き込みを狭められず
+/// `WriteRestrictionShadowed` になるだけで、書き込みの禁止は VFS の `ro` が担う（`/sys` の sysfs と同じ扱い）。
+/// 件数は `mounts` と別枠で [`TMPFS_MAX_MOUNTS`] まで許す。
+pub(crate) fn build_path_rules_with_user_tmpfs(
+    support: &LandlockSupport,
+    root: &OciRoot,
+    mounts: &[OciMount],
+    user_tmpfs: &[OciMount],
+    implicit: ImplicitDevMounts,
+) -> Result<LandlockRuleset, LandlockRuleError> {
     let handled = handled_for_abi(support.abi.get());
     let implicit_mounts = implicit.entries();
     let count = mounts
         .len()
+        .saturating_add(user_tmpfs.len())
         .saturating_add(1)
         .saturating_add(implicit_mounts.len());
-    if count > MAX_LANDLOCK_RULES {
+    // `mounts[]` 側（root・暗黙分を含む）と利用者 tmpfs 側は別枠で検証する（片方の余りでもう片方の超過を通さない）。
+    let base = mounts
+        .len()
+        .saturating_add(1)
+        .saturating_add(implicit_mounts.len());
+    let base_max = CONFIG_MAX_MOUNTS + 1 + IMPLICIT_DEV_MOUNT_COUNT;
+    if base > base_max {
         return Err(LandlockRuleError::new(
             LandlockRuleErrorKind::TooManyRules {
-                count,
-                max: MAX_LANDLOCK_RULES,
+                count: base,
+                max: base_max,
+            },
+        ));
+    }
+    if user_tmpfs.len() > TMPFS_MAX_MOUNTS {
+        return Err(LandlockRuleError::new(
+            LandlockRuleErrorKind::TooManyRules {
+                count: user_tmpfs.len(),
+                max: TMPFS_MAX_MOUNTS,
             },
         ));
     }
@@ -588,7 +626,9 @@ pub fn build_path_rules_with_dev(
             origin: RuleOrigin::Implicit { mount },
         });
     }
-    for (index, m) in mounts.iter().enumerate() {
+    let user_start = mounts.len();
+    for (index, m) in mounts.iter().chain(user_tmpfs).enumerate() {
+        let is_user_tmpfs = index >= user_start;
         let dest = m.mount_destination();
         let len = dest.as_str().len();
         if len > CONFIG_MAX_PATH_BYTES {
@@ -619,10 +659,17 @@ pub fn build_path_rules_with_dev(
         if OciMountKind::of(m) == OciMountKind::Sysfs && dest.as_str() == "/sys" {
             continue;
         }
+        if is_user_tmpfs && m.options().iter().any(|o| o == "ro") {
+            continue;
+        }
         rules.push(PathRule {
             path: RulePath::Beneath(dest.clone()),
             allowed: mount_rights(m),
-            origin: RuleOrigin::Mount { index },
+            origin: if is_user_tmpfs {
+                RuleOrigin::UserTmpfs
+            } else {
+                RuleOrigin::Mount { index }
+            },
         });
     }
 
@@ -1155,7 +1202,58 @@ mod tests {
         );
         assert_eq!(e.code, ErrorCode::InvalidArgument);
         assert!(e.to_string().starts_with("INVALID_ARGUMENT: "), "{e}");
-        assert_eq!(MAX_LANDLOCK_RULES, 1028);
+        assert_eq!(MAX_LANDLOCK_RULES, 1092);
+    }
+
+    /// SUP-12・CORE-5(#2625): 利用者 tmpfs は `UserTmpfs` 由来で書き込み可能に載り、`ro` は書き込み可能な root の下でも
+    /// `WriteRestrictionShadowed` にならずルールを作らない。件数は `mounts[]` と別枠。
+    #[test]
+    fn sup12_user_tmpfs_rules_are_separate_origin_and_ro_is_skipped() {
+        let s = evaluate_abi(6).expect("abi6");
+        let c = cfg(
+            false,
+            json!([
+                {"destination": "/run", "type": "tmpfs", "options": ["rw", "nosuid", "nodev"]},
+                {"destination": "/ro", "type": "tmpfs", "options": ["ro", "nosuid", "nodev"]}
+            ]),
+        );
+        let rs = build_path_rules_with_user_tmpfs(
+            &s,
+            c.root(),
+            &[],
+            c.mounts(),
+            ImplicitDevMounts::None,
+        )
+        .expect("rules");
+        let got: Vec<(&str, RuleOrigin)> = rs
+            .rules()
+            .iter()
+            .map(|r| (r.path.as_str(), r.origin))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("/", RuleOrigin::Root), ("/run", RuleOrigin::UserTmpfs)]
+        );
+        let many = vec![c.mounts()[0].clone(); TMPFS_MAX_MOUNTS + 1];
+        let e = build_path_rules_with_user_tmpfs(&s, c.root(), &[], &many, ImplicitDevMounts::None)
+            .expect_err("over tmpfs limit");
+        assert_eq!(
+            e.kind,
+            LandlockRuleErrorKind::TooManyRules {
+                count: TMPFS_MAX_MOUNTS + 1,
+                max: TMPFS_MAX_MOUNTS
+            }
+        );
+        // mounts[] が上限ちょうどでも、利用者 tmpfs を足して拒否されない。
+        let full = vec![c.mounts()[0].clone(); CONFIG_MAX_MOUNTS];
+        build_path_rules_with_user_tmpfs(
+            &s,
+            c.root(),
+            &full,
+            &c.mounts()[..1],
+            ImplicitDevMounts::All,
+        )
+        .expect("mounts at limit plus tmpfs");
     }
 
     /// CORE-5（#1657）: 暗黙分を含めない版は root のみで、上限は暗黙分を含めた値のまま。
@@ -1164,7 +1262,7 @@ mod tests {
         let rs = build(&cfg(true, json!([])));
         assert_eq!(summary(&rs), vec![("/", RuleOrigin::Root, 0x000D)]);
         assert!(rs.shadowed().is_empty());
-        assert_eq!(MAX_LANDLOCK_RULES, 1028);
+        assert_eq!(MAX_LANDLOCK_RULES, 1092);
     }
 
     /// CORE-5（#1657）: `mounts[]` が空でも暗黙の `/dev` 系のルールが具体的な権利で付く。

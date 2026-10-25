@@ -18,5 +18,5 @@ pub mod provider;
 pub mod spec;
 
 pub use image_rootfs::{ImageExtractConfig, ImageRootfsSource};
-pub use provider::{RootfsSource, SpecBundleProvider};
+pub use provider::{RootfsSource, SpecBundleProvider, UserResolveRequest};
 pub use spec::{ImageDefaults, RuntimeConfigJson, build_runtime_config, validate_config};

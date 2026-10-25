@@ -63,7 +63,7 @@ impl ImageStore {
         let deadline = self.gate_deadline()?;
         // ゲートファイルの作成より前に root の信頼性を再検査する（#2547・SEC-1）。
         self.reverify_root()?;
-        let file = open_named_lock_file(self.root(), IMAGE_STORE_CREATE_GATE_FILE_NAME)?;
+        let file = open_named_lock_file(self.handle(), IMAGE_STORE_CREATE_GATE_FILE_NAME)?;
         loop {
             match file.try_lock_shared() {
                 Ok(()) => {
@@ -90,7 +90,7 @@ impl ImageStore {
         let deadline = self.gate_deadline()?;
         // ゲートファイルの作成より前に root の信頼性を再検査する（#2547・SEC-1）。
         self.reverify_root()?;
-        let file = open_named_lock_file(self.root(), IMAGE_STORE_CREATE_GATE_FILE_NAME)?;
+        let file = open_named_lock_file(self.handle(), IMAGE_STORE_CREATE_GATE_FILE_NAME)?;
         loop {
             match file.try_lock() {
                 Ok(()) => {

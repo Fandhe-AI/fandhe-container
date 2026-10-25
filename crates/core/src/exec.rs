@@ -186,8 +186,6 @@ pub use exec_command::{
 };
 pub use inject::{InjectReport, InjectedDirectoryOutcome, InjectedFileOutcome, inject_files};
 pub use landlock::launch_isolation_from_bundle;
-#[cfg(test)]
-pub(crate) use landlock::ruleset_from_detection;
 /// 結合試験 `tests/landlock.rs` 専用の再公開（CORE-5・TASK-39.5・#185。通常の利用者は呼ばない。詳細は定義側）。
 #[doc(hidden)]
 pub use landlock::{
@@ -195,12 +193,18 @@ pub use landlock::{
     LandlockAccessProbe, observe_landlock_path_access,
 };
 /// 本番 launcher（`oci_runtime::ProductionLauncher`。#1816）だけが使う crate 内の再公開。
-pub(crate) use landlock::{landlock_ruleset_from_config, launch_isolation_from_ruleset};
+pub(crate) use landlock::{landlock_ruleset_from_config_with_dev, launch_isolation_from_ruleset};
+#[cfg(test)]
+pub(crate) use landlock::{ruleset_from_detection, ruleset_from_detection_with_dev};
 pub(crate) use launch_intermediate::{
     IntermediatePlan, IntermediateSpec, LaunchTag, Rescan, rescan_unreported_init,
     spawn_container_via_intermediate,
 };
 pub(crate) use launch_status::LaunchAudit;
+/// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・#2624。entrypoint 系の違反の往復。通常の利用者は呼ばない）。
+#[cfg(feature = "exec-test-support")]
+#[doc(hidden)]
+pub use launch_status::relay_entrypoint_violation_for_test;
 /// 結合試験 `tests/launch_userns_audit.rs` 専用の再公開（SEC-4・SEC-5・REPAIR-10・#2072。通常の利用者は呼ばない）。
 #[cfg(feature = "exec-test-support")]
 #[doc(hidden)]
@@ -515,8 +519,10 @@ pub fn record_launch_mount_rejection<E>(
 /// `err.violation` が種別 `Entrypoint` のときだけ 1 件 `sink` へ渡す。それ以外（マウント層・exec 対象の違反・
 /// システムエラー）は `NotApplicable`。`err` は常にそのまま返り、記録の失敗で拒否は覆らない（fail-closed）。
 /// `ExecError` を直接扱う launch 側の入口で、理由コードだけを持つ supervisor の親プロセスは
-/// [`record_entrypoint_rejection`] を使う。launch 経路（`spawn_container` の子・launcher）への配線は
-/// 未実装（担当 #2624。TASK-29 / TASK-157 系。REPAIR-3）。
+/// [`record_entrypoint_rejection`] を使う。本番 launcher の launch 経路は配線済み（#2624。`launch_intermediate` が
+/// 状態 pipe の exec 前の 2 行目〔`R`/`E`〕から違反を引き直し、親〔C〕でこの関数を呼んで 1 拒否 1 件を記録する）。
+/// 未配線なのは、状態 pipe を持たない経路（`spawn_container` 系の子。何も報告しない）と、`R` の後の `execveat`
+/// 自体の失敗（errno 由来で違反ではないため記録しない）。TASK-29 / TASK-157 系。
 ///
 /// 移行（#1618）: 引数 `container` を `sink` の直前に追加した。記録の `container_id` に載せる検証済みの
 /// コンテナ ID で、ID が無い呼び出し側は `None` を渡す（ワイヤーでは null）。記録の `pid` は記録を行った
@@ -1610,6 +1616,10 @@ fn sync_io_error(e: &std::io::Error, what: &str) -> ExecError {
 ///   プロセスが ptrace・`/proc/<holder>/mem` で読める。pidfd 経由の `setns` が対象の dumpable を要する
 ///   (`ptrace_may_access`。Linux v6.12 で確認)ため、window は release まで縮められない。棚卸しと残課題
 ///   (注入ファイルの secret 内容)は `docs/design/rootless-id-map-holder.md` §4
+/// - 書き手が [`IdMapWriter::Helper`] のときは Linux 6.9 以降(pidfd のプロセスグループ送信)が要る。holder の期限切れ後に
+///   helper が pid の再利用先へ書く残余を閉じる kill の手段が無い環境では、fork の前に副作用なしで
+///   `FailedPrecondition` にする(#2644・CORE-6・SEC-5。fail-closed)。Direct は検査しない。本番の起動は Landlock
+///   ABI 6(Linux 6.12 以降)を要求するため、launcher 経路では実質の制約は増えない
 /// - シングルスレッドから呼ぶこと（holder・mapper の fork と `setns(CLONE_NEWUSER)` の制約。マルチスレッドは
 ///   副作用なしで `FailedPrecondition`）
 /// - 失敗したプロセスは破棄すること（写像は write-once で戻せない。[`isolate`] と同じ）。holder と mapper は
@@ -1677,6 +1687,13 @@ fn isolate_rootless_subordinate_with(
             None,
         ));
     }
+    // helper を起動する前に、期限切れ後の kill の手段(pidfd のグループ送信。Linux 6.9 以降)があることを確かめる。
+    // 無ければ holder の pid の再利用先へ helper が書く残余(#2551)を閉じられないため、fork 前に拒否する(#2644)。
+    rootless::require_group_kill_for_helper(matches!(plan.writer, IdMapWriter::Helper(_)), || {
+        let pidfd = sys::pidfd_open(std::process::id())?;
+        sys::pidfd_group_signal_probe(std::os::fd::AsFd::as_fd(&pidfd))
+    })
+    .map_err(|e| ExecError::new(e.code, IsolationStage::UserNamespaceMap, e.message))?;
     let io_err = |e: &std::io::Error, what: &str| {
         ExecError::from_io(e, IsolationStage::UserNamespaceMap, what)
     };

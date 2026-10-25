@@ -65,8 +65,12 @@
 //! - 残余（実装済みを装わない。REPAIR-3）: ESC-06（`KILL_PROCESS` の 3 件）の監査は `Deferred`（追跡: #2236・#2237）。
 //!   `USER_NOTIF` では届かず、補助の `exit_signal` は本番 launcher の回収点が出し、正の記録はカーネルの
 //!   `AUDIT_SECCOMP` で fandhe は自前の読み手を持たない。`create` のパース時の destination 拒否
-//!   （`esc-08-config-destination`）は本番の `create_audited` が `@audit.log` へ記録する（#2480）。plugin-cri の
-//!   `create` と start の TOCTOU 再検証での destination 拒否は未配線（`docs/design/audit-delivery.md`）
+//!   （`esc-08-config-destination`）は本番の `create_audited` が `@audit.log` へ記録する（#2480）。start の TOCTOU
+//!   再検証（create 後に `config.json` の destination を書き換えて `start`。`esc-08-start-destination-rewrite`）も
+//!   本番の `start` → `rejection_audit_sink` → `FileAuditSink` が mount 層 3 行を記録する（#2594・#2641）。
+//!   plugin-cri の `create` と supervisor の `start` の relay 経由は結合試験
+//!   `crates/plugin-cri/tests/create_destination_audit_relay.rs`・`crates/supervisor/tests/start_destination_audit_relay.rs`
+//!   が照合する（`docs/design/audit-delivery.md`）
 //!
 //! # 構成
 //! - 常に走る部分（3 OS 共通・既定のテスト集合）: 判定ロジック `judge` と記録パーサの自己テスト
@@ -2076,6 +2080,9 @@ mod linux {
         StartRejection,
         /// 分離もコンテナ probe もせず、本番の `create_audited` の destination 拒否を実行する（ESC-08。SEC-4・OCI-4・#2480）。
         CreateRejection,
+        /// 分離もコンテナ probe もせず、create 後に `config.json` の destination を書き換えて `start` の再検証（TOCTOU）の
+        /// 拒否を実行する（ESC-08。SEC-4・OCI-4・#2594・#2641）。
+        StartDestinationRewrite,
     }
 
     /// ホスト視点の検査関数の型。
@@ -2092,6 +2099,15 @@ mod linux {
     /// ESC-08 のパース時の拒否の期待。本番の `create_audited` が mount 層 3 件（遡り・`/`・相対 `..`）を
     /// `@audit.log` へ記録する（SEC-4・OCI-4・#2480）。start の bind の拒否（`ESC08_EXPECT`）と同じ形。
     const ESC08_CONFIG_EXPECT: Expectation = ESC08_EXPECT;
+
+    /// ESC-08 の start の TOCTOU（destination の書き換え）の期待。本番の `start` → `build_spec` →
+    /// `validate_bundle_audited` → `rejection_audit_sink` → `FileAuditSink` が要求ごとに 1 行、計 3 行を
+    /// `@audit.log` の mount 層へ記録する（SEC-4・OCI-4・#2594・#2641）。
+    const ESC08_START_REWRITE_EXPECT: Expectation = ESC08_EXPECT;
+
+    /// ESC-08 の destination の攻撃入力（rootfs 外への遡り・rootfs 全体・相対 `..`）。
+    /// `create_rejection`（パース時）と `start_destination_rewrite`（TOCTOU）が共有する。
+    const ESC08_DESTINATIONS: [&str; 3] = ["/../../run/fandhe-container", "/", "run/../../../etc"];
 
     /// 登録済みケース。対照ケースと ESC-01〜03（#200）・ESC-04〜06（#201）・ESC-07〜08（#202）・ESC-09〜10（#203）。
     const CASES: &[EscapeCase] = &[
@@ -2288,6 +2304,18 @@ mod linux {
             id: "esc-08-config-destination",
             body: CaseBody::CreateRejection,
             expectation: ESC08_CONFIG_EXPECT,
+            stages: StagePipeline::new,
+            attack: attack_unused,
+            precondition: no_precondition,
+            host_check: None,
+            launcher: LauncherRequirement::Any,
+        },
+        // ESC-08 の start の TOCTOU: create 後に destination を書き換えても `start` の再検証が拒否し、本番の
+        // 拒否経路が `@audit.log` の mount 層へ記録する（#2594・#2641）。
+        EscapeCase {
+            id: "esc-08-start-destination-rewrite",
+            body: CaseBody::StartDestinationRewrite,
+            expectation: ESC08_START_REWRITE_EXPECT,
             stages: StagePipeline::new,
             attack: attack_unused,
             precondition: no_precondition,
@@ -2615,7 +2643,7 @@ mod linux {
         rec.outcome(outcome);
     }
 
-    /// 何もしない攻撃（`CaseBody::StartRejection` / `CreateRejection` は子で攻撃を実行しないため、フィールドを埋めるためだけに使う）。
+    /// 何もしない攻撃（`CaseBody::StartRejection` / `CreateRejection` / `StartDestinationRewrite` は子で攻撃を実行しないため、フィールドを埋めるためだけに使う）。
     fn attack_unused(_rec: &Recorder, _host_canary: &Path) {}
 
     /// 対照: 禁止対象外の操作（`/proc/self/status` の読み出し）が制限下でも動くこと。
@@ -3255,6 +3283,9 @@ mod linux {
         let meta = match case.body {
             CaseBody::StartRejection => start_rejection(rootfs, state_root, started_at),
             CaseBody::CreateRejection => create_rejection(rootfs, state_root, started_at),
+            CaseBody::StartDestinationRewrite => {
+                start_destination_rewrite(rootfs, state_root, started_at)
+            }
             CaseBody::Probe | CaseBody::ProbeWithSeccompListener => {
                 probe_scenario(case, rootfs, relay, started_at)
             }
@@ -3407,6 +3438,9 @@ mod linux {
             ),
             CaseBody::StartRejection => unreachable!("handled by start_rejection"),
             CaseBody::CreateRejection => unreachable!("handled by create_rejection"),
+            CaseBody::StartDestinationRewrite => {
+                unreachable!("handled by start_destination_rewrite")
+            }
         };
         let child_pid = child.pid();
         // seccomp の記録の期待値: 子自身の PID namespace での pid。子の最初の拒否は応答ループが読むまで
@@ -3477,7 +3511,7 @@ mod linux {
     ///
     /// `ControlAuditRelay` は使わない: この試験は単一スレッドで `start` を呼ぶため `FileAuditSink` が主経路で書ける。
     /// 本番の supervisor の `start` は検証が複数スレッドの作業スレッドで走るので、`rejection_audit_sink` に relay
-    /// （理由なしの `Mount` を運べる。#2481）を渡す。その経路の照合は supervisor の結合試験
+    /// （理由なしの `Mount` と、rootfs の固定の違反の閉じた表の理由つき `Mount` を運べる。#2481・#2623）を渡す。その経路の照合は supervisor の結合試験
     /// `start_bind_audit_relay` が担う（docs/design/audit-delivery.md）。
     struct RejectionOnlyLauncher {
         sink: FileAuditSink,
@@ -3616,7 +3650,7 @@ mod linux {
         let recorder = OpRecorder::new();
         let config_path = bundle.join("config.json");
         let mut outcome = AttackOutcome::Failed;
-        for dest in ["/../../run/fandhe-container", "/", "run/../../../etc"] {
+        for dest in ESC08_DESTINATIONS {
             let config = serde_json::to_vec(&serde_json::json!({
                 "ociVersion": "1.2.0",
                 "root": {"path": "rootfs"},
@@ -3651,6 +3685,104 @@ mod linux {
         assert!(
             store.get(&GetStateRequest::new(id)).is_err(),
             "a rejected create must not leave a state"
+        );
+        ScenarioMeta {
+            exit: ObservedExit::Exited(0),
+            outcome: Some(outcome),
+            child_pid: None,
+            pid_in_ns: None,
+            started_at,
+        }
+    }
+
+    /// ESC-08 の start の TOCTOU の本体（SEC-4・OCI-4・#2594・#2641）: 正しい config で `create` した後に
+    /// `config.json` の destination を遡り・`/`・相対 `..` へ書き換え、`start` の再検証がいずれも
+    /// `InvalidArgument` で拒否すること（launcher に到達しない・状態は Created のまま）を確かめる。
+    /// 記録は本番の拒否経路が出す（ここでは作らない）。ディスパッチャが `@audit.log` の mount 層 3 行
+    /// （要求ごとに 1 行。cgroup の準備は supervisor 側で core の `start` には無い）を照合する。
+    /// 単一スレッドで `FileAuditSink` を使う前提は `start_rejection` と同じ。supervisor の relay 経由は結合試験
+    /// `start_destination_audit_relay` が担う。
+    fn start_destination_rewrite(
+        bundle: &Path,
+        state_root: &Path,
+        started_at: u64,
+    ) -> ScenarioMeta {
+        let id = ContainerId::new(AUDIT_CONTAINER_ID).expect("harness container id");
+        let sink = FileAuditSink::open_in_state_root(Some(state_root.to_path_buf()))
+            .unwrap_or_else(|e| panic!("open the audit sink in the state root: {e}"));
+        std::fs::create_dir(bundle.join("rootfs")).expect("create bundle/rootfs");
+        let store = FileStateStore::open(
+            StateRoot::from_override(state_root.to_path_buf()).expect("state root"),
+        )
+        .unwrap_or_else(|e| panic!("open the state store: {e}"));
+        let recorder = OpRecorder::new();
+        let config = |mounts: serde_json::Value| {
+            serde_json::to_vec(&serde_json::json!({
+                "ociVersion": "1.2.0",
+                "root": {"path": "rootfs"},
+                "process": {"user": {"uid": 0, "gid": 0}, "args": ["/bin/echo", "it"], "cwd": "/"},
+                "mounts": mounts,
+                "linux": {"namespaces": [
+                    {"type": "pid"}, {"type": "mount"}, {"type": "user"}, {"type": "uts"}, {"type": "ipc"}
+                ]}
+            }))
+            .expect("serialize config")
+        };
+        let config_path = bundle.join("config.json");
+        std::fs::write(&config_path, config(serde_json::json!([]))).expect("write config");
+        create(
+            &store,
+            &recorder,
+            &CreateRequest::new(id.clone(), bundle.to_path_buf()).expect("absolute bundle"),
+        )
+        .unwrap_or_else(|e| panic!("create: {e}"));
+
+        let launcher = Arc::new(RejectionOnlyLauncher {
+            sink,
+            launches: AtomicUsize::new(0),
+        });
+        let dyn_launcher: Arc<dyn ProcessLauncher> = launcher.clone();
+        let mut outcome = AttackOutcome::Failed;
+        for dest in ESC08_DESTINATIONS {
+            // create 後の書き換え（TOCTOU）。
+            let mounts = serde_json::json!([{
+                "destination": dest,
+                "type": "bind",
+                "source": "/run/fandhe-container",
+                "options": ["bind"]
+            }]);
+            std::fs::write(&config_path, config(mounts)).expect("rewrite config");
+            match start(
+                &store,
+                &recorder,
+                &dyn_launcher,
+                &StartRequest::new(id.clone()),
+                &StartTimeouts::default(),
+            ) {
+                // 拒否されなかった（start の再検証の欠落）。残りは試さず、成功として失敗にする。
+                Ok(_) => {
+                    outcome = AttackOutcome::Succeeded;
+                    break;
+                }
+                Err(err) => assert_eq!(
+                    err.code(),
+                    ErrorCode::InvalidArgument,
+                    "rewritten destination {dest:?} must be rejected as InvalidArgument: {err}"
+                ),
+            }
+        }
+        assert_eq!(
+            launcher.launches.load(Ordering::SeqCst),
+            0,
+            "a rejected start must never reach the launcher"
+        );
+        let state = store
+            .get(&GetStateRequest::new(id))
+            .expect("state after the rejected starts");
+        assert_eq!(
+            state.status().state(),
+            ContainerState::Created,
+            "a rejected start leaves the container Created"
         );
         ScenarioMeta {
             exit: ObservedExit::Exited(0),

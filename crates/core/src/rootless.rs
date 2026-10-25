@@ -1427,17 +1427,51 @@ pub(crate) struct HolderWait<'a> {
     pub(crate) release_wait: Duration,
     /// 期限切れで kill した後、EOF を待つ上限。
     pub(crate) drain_wait: Duration,
+    /// mapper の pidfd を開く関数(本番は `sys::pidfd_open`。試験が失敗を注入する継ぎ目。#2644)。
+    pub(crate) open_pidfd: &'a dyn Fn(u32) -> Result<std::os::fd::OwnedFd, SysError>,
 }
 
 /// pidfd でグループへ SIGKILL を送る関数の型([`holder_await_release`] の `kill`)。
 pub(crate) type PidfdKill<'a> =
     dyn FnMut(std::os::fd::BorrowedFd<'_>, u32) -> Result<(), SysError> + 'a;
 
+/// pidfd のプロセスグループ送信が使えるかの検査結果を、helper 起動の可否へ写す(#2644・CORE-6・SEC-5)。
+///
+/// `probe` は [`sys::pidfd_group_signal_probe`] の結果。`Ok`(送れた)と `ESRCH`(対応しているが宛先グループが
+/// 無い)は対応。6.9 未満は未知のフラグとして `EINVAL`(`ENOSYS` 等を含むそれ以外もすべて)なので未対応として
+/// `FailedPrecondition` にする。helper は holder を pid の数値で持つため、期限切れ後に kill できない環境では
+/// 起動しない(fail-closed)。
+pub(crate) fn group_kill_support(probe: Result<(), SysError>) -> Result<(), RootlessError> {
+    match probe {
+        Ok(()) => Ok(()),
+        Err(SysError::Os(e)) if e == sys::ESRCH => Ok(()),
+        Err(_) => Err(RootlessError::new(
+            ErrorCode::FailedPrecondition,
+            RootlessStage::Validate,
+            "kernel lacks pidfd process-group signals (Linux 6.9+) required for helper-based id mapping; refusing to map",
+        )),
+    }
+}
+
+/// `uses_held_pid_helper`(`matches!(writer, IdMapWriter::Helper(_))`)のときだけ `probe` を呼び、
+/// [`group_kill_support`] で判定する。Direct は pid を数値で持つ helper が居ないため検査しない(#2644)。
+pub(crate) fn require_group_kill_for_helper(
+    uses_held_pid_helper: bool,
+    probe: impl FnOnce() -> Result<(), SysError>,
+) -> Result<(), RootlessError> {
+    if uses_held_pid_helper {
+        group_kill_support(probe())
+    } else {
+        Ok(())
+    }
+}
+
 /// holder の錨(mapper の `/proc/<pid>` の fd・pid・pidfd)。
 struct Anchor {
     pid: u32,
-    /// pid の数値に依らずグループへ送るための pidfd。開けなければ `None`(kill しない。fail-closed)。
-    pidfd: Option<std::os::fd::OwnedFd>,
+    /// pid の数値に依らずグループへ送るための pidfd(必須)。開けなければ錨を作らず、I は helper を起動しない
+    /// (kill の手段が無いまま helper を走らせない。fail-closed。CORE-6・SEC-5・#2644)。
+    pidfd: std::os::fd::OwnedFd,
 }
 
 /// 錨(mapper の `/proc/<pid>` の fd と pid)を作る。作れない・親が一致しない場合は `None`(診断を 1 行出す)。
@@ -1445,7 +1479,8 @@ struct Anchor {
 /// 開けないのは mapper が既に回収された場合で、mapper は helper を回収してから終わるか go を受けずに終わる
 /// ため helper は残らない。`/proc/<pid>` の fd と pidfd を確保した**後**に親を確かめる(読めれば、どちらの fd も
 /// 回収前の同じプロセスを指す)ため、別プロセスを錨にしない。pidfd は mapper の `struct pid` を保持し、回収後に
-/// 番号が再利用されても元のグループにだけ送れる(#2551)。pidfd を開けない環境では `None` のままにし、期限切れでも kill しない(fail-closed)。
+/// 番号が再利用されても元のグループにだけ送れる(#2551)。pidfd を開けない環境では錨を作らず(`None`)、I へ
+/// `Failed` を返して go を送らせない。helper が起動しないので期限切れ後の残余も生じない(#2644・CORE-6・SEC-5)。
 fn open_anchor(
     pid: MapperPid,
     w: &HolderWait<'_>,
@@ -1459,7 +1494,7 @@ fn open_anchor(
         let handle = TargetPid::new(pid)
             .and_then(ProcHandle::open)
             .map_err(|_| "cannot open the mapper proc directory")?;
-        let pidfd = sys::pidfd_open(pid).ok();
+        let pidfd = (w.open_pidfd)(pid).map_err(|_| "cannot open the mapper pidfd")?;
         match handle.parent_pid() {
             Ok(ppid) if ppid == (w.current_parent)() => Ok(Anchor { pid, pidfd }),
             _ => Err("mapper is not a sibling of the holder"),
@@ -1480,9 +1515,11 @@ fn open_anchor(
 /// kill の安全性: 送信は錨と同時に開いた mapper の pidfd へのグループ送信(`PIDFD_SIGNAL_PROCESS_GROUP`、Linux 6.9 以降。
 /// `kill` が受ける `BorrowedFd` がその pidfd)だけで行う。宛先は pid の数値ではなく pidfd が保持する `struct pid` の
 /// グループなので、mapper・helper が全員終了・回収された後に番号が再利用されても、無関係なグループには届かない
-/// (誰も居なければ ESRCH)。mapper が回収済みでも `setsid` の前でも同じ理由で安全に送れる。pidfd を開けない・
-/// 未対応カーネル(EINVAL)では、数値 PGID の `kill` は宛先の同一性を保証できないため送らない(fail-closed。
-/// この場合 #2551 の残余は閉じない。`docs/design/rootless-id-map-holder.md`)。
+/// (誰も居なければ ESRCH)。mapper が回収済みでも `setsid` の前でも同じ理由で安全に送れる。pidfd を開けない
+/// 環境は錨を作らず(I は helper を起動しない)、未対応カーネル(6.9 未満)は I が fork の前に
+/// [`group_kill_support`] で拒否する(#2644)。そのため本番では EINVAL / ENOSYS に到達しないが、到達しても
+/// 数値 PGID の `kill` は宛先の同一性を保証できないため送らない(多層防御。fail-closed。
+/// `docs/design/rootless-id-map-holder.md`)。
 pub(crate) fn holder_await_release(
     sock: &mut std::os::unix::net::UnixStream,
     w: &HolderWait<'_>,
@@ -1551,16 +1588,9 @@ fn holder_await_release_inner(
         return HolderExit::ExpiredNoKill;
     };
     // 送信は pidfd 経由のグループ送信だけで行う(宛先は mapper の `struct pid` のグループで、番号の再利用に影響されない。
-    // mapper が回収済み・`setsid` の前でも、元のグループ以外には届かず、誰も居なければ ESRCH)。pidfd を開けない・
-    // 未対応カーネル(6.9 未満の EINVAL)では、数値 PGID の `kill` は宛先の同一性を保証できないため送らない(fail-closed)。
-    let Some(fd) = pidfd.as_ref() else {
-        let _ = writeln!(
-            diag,
-            "fandhe-container: userns holder: no pidfd, not killing"
-        );
-        return HolderExit::ExpiredNoKill;
-    };
-    match kill(std::os::fd::AsFd::as_fd(fd), mapper_pid) {
+    // mapper が回収済み・`setsid` の前でも、元のグループ以外には届かず、誰も居なければ ESRCH)。未対応カーネルの
+    // EINVAL は I の事前検査で弾かれる(#2644)が、到達しても数値 PGID へは退避せず送らない(fail-closed)。
+    match kill(std::os::fd::AsFd::as_fd(&pidfd), mapper_pid) {
         Ok(()) => {}
         Err(SysError::Os(e)) if e == sys::ESRCH => {}
         Err(SysError::Os(e)) if e == sys::EINVAL || e == sys::ENOSYS => {
@@ -1637,8 +1667,9 @@ impl<W: std::io::Write + std::os::fd::AsFd> std::io::Write for NonBlockingDiag<W
 /// 再利用され得た(#2551)。これを閉じるため、I は mapper の fork 直後(go の前)に [`HolderControl::MapperPid`] を
 /// 送り、holder は期限が来たとき**自分が終わる前に** mapper のセッション(helper を含む)へ SIGKILL を送って EOF を
 /// 待つ([`holder_await_release`]。待ちはどちらも有限で、生存は最長 `release_wait + drain_wait`)。同一性が確かめられ
-/// ない場合は kill しない(fail-closed)。残る窓(pidfd のグループ送信が使えない環境〔Linux 6.9 未満〕では kill しないため #2551 の元の残余が残ること、
-/// SIGKILL でも `drain_wait` を超えて終わらない helper)は `docs/design/rootless-id-map-holder.md` に記す。
+/// ない場合は kill しない(fail-closed)。pidfd を開けない環境・グループ送信が使えない環境〔Linux 6.9 未満〕は、
+/// helper を起動する前に I が拒否する(#2644。`exec::isolate_rootless_subordinate`)。残る窓(SIGKILL でも
+/// `drain_wait` を超えて終わらない helper)は `docs/design/rootless-id-map-holder.md` に記す。
 /// I・C は helper を止めた後に holder を kill する(`exec::stop_mapper_and_helpers`・
 /// `exec::launch_intermediate::rescan_unreported_init`)。
 /// `diag`(#2546): 失敗の 1 行の書き先。本番は fork 後の子の中で作った unbuffered の `std::io::stderr()` を渡し、試験は
@@ -1680,6 +1711,7 @@ pub(crate) fn run_userns_holder(
         current_parent: &std::os::unix::process::parent_id,
         release_wait,
         drain_wait,
+        open_pidfd: &sys::pidfd_open,
     };
     holder_await_release(
         &mut sock,
@@ -2490,6 +2522,7 @@ mod tests {
             current_parent: &std::process::id,
             release_wait: Duration::from_millis(release_ms),
             drain_wait: Duration::from_millis(drain_ms),
+            open_pidfd: &sys::pidfd_open,
         }
     }
 
@@ -2912,5 +2945,85 @@ mod tests {
                 stage: RootlessStage::Validate
             }
         );
+    }
+
+    /// CORE-6・SEC-5(#2644): mapper の pidfd を開けなければ錨を作らず、I へ `Failed` を返す(go を送らせない)。
+    /// 期限切れでも kill はしない。
+    #[test]
+    fn sec5_holder_anchor_requires_pidfd() {
+        let (mut a, mut b) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let mut child = spawn_session_leader(&a);
+        send_pid(&mut a, child.id());
+        let mut w = holder_test_wait(200, 100);
+        let fail = |_: u32| Err(SysError::Os(sys::EMFILE));
+        w.open_pidfd = &fail;
+        let mut diag = Vec::new();
+        let mut kills = 0;
+        let r = holder_await_release(
+            &mut b,
+            &w,
+            &mut |_, _| {
+                kills += 1;
+                Ok(())
+            },
+            &mut diag,
+        );
+        assert_eq!(r, HolderExit::ExpiredNoKill);
+        assert_eq!(kills, 0);
+        let mut buf = [0u8; MAPPER_REPLY_LEN];
+        a.read_exact(&mut buf).expect("reply");
+        assert_eq!(
+            MapperReply::decode(&buf).expect("decode"),
+            MapperReply::Failed {
+                code: ErrorCode::FailedPrecondition,
+                stage: RootlessStage::Validate
+            }
+        );
+        let text = String::from_utf8(diag).expect("utf8");
+        assert!(text.contains("no anchor"), "{text}");
+        assert!(text.contains("cannot open the mapper pidfd"), "{text}");
+        child.kill().expect("kill");
+        child.wait().expect("wait");
+    }
+
+    /// CORE-6・SEC-5(#2644): グループ送信の検査結果の写像。`Ok`・`ESRCH` は対応、それ以外は `FailedPrecondition`。
+    #[test]
+    fn sec5_group_kill_support_maps_results() {
+        assert!(group_kill_support(Ok(())).is_ok());
+        assert!(group_kill_support(Err(SysError::Os(sys::ESRCH))).is_ok());
+        let msg = "kernel lacks pidfd process-group signals (Linux 6.9+) required for helper-based id mapping; refusing to map";
+        for e in [
+            SysError::Os(sys::EINVAL),
+            SysError::Os(sys::ENOSYS),
+            SysError::Unsupported,
+            SysError::Os(sys::EPERM),
+        ] {
+            let err = group_kill_support(Err(e)).expect_err("rejected");
+            assert_eq!(err.code, ErrorCode::FailedPrecondition);
+            assert_eq!(err.message, msg);
+        }
+    }
+
+    /// CORE-6・SEC-5(#2644): 検査は helper 経路のときだけ行う(Direct では probe を呼ばない)。
+    #[test]
+    fn sec5_require_group_kill_only_for_helper() {
+        let calls = std::cell::Cell::new(0);
+        let calls = &calls;
+        let probe = |r: Result<(), SysError>| {
+            move || {
+                calls.set(calls.get() + 1);
+                r
+            }
+        };
+        assert!(
+            require_group_kill_for_helper(false, probe(Err(SysError::Os(sys::EINVAL)))).is_ok()
+        );
+        assert_eq!(calls.get(), 0);
+        let err = require_group_kill_for_helper(true, probe(Err(SysError::Os(sys::EINVAL))))
+            .expect_err("rejected");
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(calls.get(), 1);
+        assert!(require_group_kill_for_helper(true, probe(Ok(()))).is_ok());
+        assert_eq!(calls.get(), 2);
     }
 }

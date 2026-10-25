@@ -31,12 +31,46 @@ use crate::adapter::{BundleProvider, BundleRequest};
 use crate::error::CriError;
 use crate::runtime::v1::ImageSpec;
 
+/// `RootfsSource::prepare` へ渡す、rootfs の passwd 等で解決してほしい User 関連の要求（#2664・CRI-2・SEC-5）。
+///
+/// `SpecBundleProvider::prepare` が CRI の設定から作る。将来 `supplemental_groups` 等の解決（#2667）を
+/// 足せるよう、裸の引数にせず構造体にしている。外部から作るときは [`Self::none`] / [`Self::with_run_as_username`]。
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
+pub struct UserResolveRequest<'a> {
+    /// CRI の `run_as_username`（未指定は `None`）。形式は `validate_config` が検証済みだが、実装側も再検証する。
+    pub run_as_username: Option<&'a str>,
+}
+
+impl<'a> UserResolveRequest<'a> {
+    /// 解決要求なし。
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// `run_as_username` の解決を要求する。
+    pub fn with_run_as_username(name: &'a str) -> Self {
+        Self {
+            run_as_username: Some(name),
+        }
+    }
+}
+
 /// `rootfs/` の用意と解放の注入点（本番の実装は [`super::ImageRootfsSource`]。#2433）。
 ///
 /// 実装は rootfs の内容と digest を検証する責務を持つ。
 pub trait RootfsSource: Send + Sync {
     /// 存在しないパス `rootfs` を作成して `image` の内容で満たし、イメージ config 由来の既定値を返す。
-    fn prepare(&self, image: &ImageSpec, rootfs: &Path) -> Result<ImageDefaults, CriError>;
+    ///
+    /// `user.run_as_username` が `Some` なら rootfs の passwd で解決して
+    /// [`ImageDefaults::resolved_run_as_username`] を埋めるか `Err` を返す。対応しない実装は無視してよく、
+    /// その場合 `build_runtime_config` が `UNIMPLEMENTED` で拒否する（#2664）。
+    fn prepare(
+        &self,
+        image: &ImageSpec,
+        rootfs: &Path,
+        user: &UserResolveRequest<'_>,
+    ) -> Result<ImageDefaults, CriError>;
 
     /// `prepare` で作った rootfs を解放する（不在は `Ok`）。
     fn release(&self, rootfs: &Path) -> Result<(), CriError>;
@@ -262,8 +296,18 @@ impl BundleProvider for SpecBundleProvider {
         create_private_dir(&dir)?;
         self.lock_refused().remove(req.container_id);
         let rootfs = dir.join("rootfs");
+        let username = req
+            .config
+            .linux
+            .as_ref()
+            .and_then(|l| l.security_context.as_ref())
+            .map(|s| s.run_as_username.as_str())
+            .filter(|n| !n.is_empty());
+        let user = UserResolveRequest {
+            run_as_username: username,
+        };
         let built = (|| {
-            let defaults = self.rootfs.prepare(image, &rootfs)?;
+            let defaults = self.rootfs.prepare(image, &rootfs, &user)?;
             let json = build_runtime_config(req.sandbox_config, req.config, &defaults)?;
             write_new_file(&dir.join("config.json"), json.as_bytes())
         })();

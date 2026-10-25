@@ -75,11 +75,12 @@ rootless の `start` は、`/etc/subuid` と `/etc/subgid` の設定で ID 写�
 | 片方だけ | — | `FAILED_PRECONDITION` で起動しない（1 対 1 へ黙って縮退しない） |
 | 読めない・書式不正 | — | `FAILED_PRECONDITION` で起動しない |
 
+- helper 経由の範囲写像には Linux 6.9 以降（pidfd のプロセスグループ送信）が要る。満たさないカーネルでは helper を起動する前に `FAILED_PRECONDITION` で拒否する（CORE-6・SEC-5・#2644。本番の起動は Landlock ABI 6〔Linux 6.12 以降〕が必須のため、通常は満たされる）
 - 自分の行は、ユーザー名（`alice:100000:65536`。ダミーの値）か数値の uid で書く。名前は `/etc/passwd` から実効 uid で引き、行が無いときだけ NSS（固定パスの `getent passwd <uid>` を 5 秒の期限つきで実行）で引く。環境変数 `USER` は使わない（#2390・SEC-5・CORE-6。`docs/design/subid-owner-resolution.md`）
 - `getent` は `/usr/bin/getent` などの固定候補だけを見る（`PATH` は探索しない）。実体と祖先ディレクトリが root 所有で group / other から書き込めないことが条件で、満たさないときは NSS を引かず、数値 uid の行だけで照合する（`doctor` が `SUBID_OWNER_LOOKUP_UNAVAILABLE` で通知する）
 - LDAP・sssd の停止などで NSS の参照が失敗・期限切れになると、`start` は 1 対 1 へ縮退せず `FAILED_PRECONDITION` / `TIMEOUT` で止まる（`doctor` は `SUBID_OWNER_LOOKUP_FAILED`。警告）
 - `getent` が使えず（`/etc/passwd` にも行が無い）、`/etc/subuid`・`/etc/subgid` に名前で書かれた行がある構成では、自分の行か判定できないため `start` は拒否する（`doctor` は `SUBID_OWNER_UNDETERMINED`。警告）。第 1 欄に数値の uid を書くか、信頼できる `getent` を入れる（#2545）
-- `/etc/nsswitch.conf` の `subid:` で範囲を NSS から配る構成（libsubid・sssd・FreeIPA）は未対応で、`subid:` が `files` 以外のとき `start` は拒否する（`doctor` は `SUBID_NAME_SERVICE_UNSUPPORTED`。読めない・書式不正は `NSSWITCH_UNUSABLE`）。範囲は `/etc/subuid`・`/etc/subgid` のファイルに書く（#2545）
+- `/etc/nsswitch.conf` の `subid:` で範囲を NSS から配る構成（libsubid・sssd・FreeIPA）は未対応で、`subid:` の最初の語が `files` 以外のとき（大文字小文字を区別しない。shadow 4.13 の `nss.c` と同じ判定）`start` は拒否する（`doctor` は `SUBID_NAME_SERVICE_UNSUPPORTED`。読めない・NUL などで判定できないのは `NSSWITCH_UNUSABLE`）。範囲は `/etc/subuid`・`/etc/subgid` のファイルに書く（#2545）
 - 範囲があるのに `uidmap` が無い・検証に通らないときも起動に失敗する（1 対 1 へ縮退しない）
 - これらの前提は `fandhe-container doctor` で `start` の前に確かめられる（読み取りのみ。`start` と同じ判定を使う。CORE-6・SEC-5・#2387）。主な `code` は、`SUBORDINATE_IDS_INCOMPLETE`（片方だけ）・`SUBUID_UNUSABLE` / `SUBGID_UNUSABLE`（読めない・書式不正）・`SUBORDINATE_ID_RANGE_INVALID`（範囲を写像にできない）・`ID_MAP_HELPER_NOT_FOUND` / `ID_MAP_HELPER_UNTRUSTED`（`newuidmap` / `newgidmap` が無い・信頼できない。欠けた側ごとに 1 件）で、いずれも警告（終了コード 3）。`SUBORDINATE_IDS_NOT_CONFIGURED`（1 対 1 写像になる）は通知のみで終了コードは 0 のまま
 - 起動したコンテナにどの写像が効いているかは、`state.json` の `launchIsolation.id_mapping` と、supervisor の `inspect` 出力の `idMapping` で確かめられる（CORE-6・REPAIR-4・#2388）。`model` は `single`（1 対 1）か `subordinate`（範囲写像）で、`uid` / `gid` はコンテナ側先頭・ホスト側先頭・個数の配列である（`inspect` では `containerId`・`hostId`・`size`）。この記録を作る前の `state.json` では `null` になる（1 対 1 とは推測しない）。記録は観測用で、写像の選択には使わない

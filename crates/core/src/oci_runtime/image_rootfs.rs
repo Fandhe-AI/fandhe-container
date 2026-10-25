@@ -11,6 +11,16 @@
 //!
 //! # 展開途中の木の回収（#2379・OCI-7）
 //!
+//! 展開先は core 専有のラッパー `.fandhe-unpack-<pid>-<seq>/`（0700・実効 uid 所有。展開器には渡さない）と
+//! その子 `rootfs/`（展開器に渡す実際の展開先）の 2 段である（#2635）。イメージ（展開器）が所有者や mode を
+//! 変えられるのは子だけなので、rootful でイメージの `./` の項目が所有者を 0 以外へ変えても、回収が判定する
+//! ラッパーは実効 uid 所有のまま回収できる。公開は子をラッパーから最終の名前へ `renameat2` で移し、空の
+//! ラッパーを best effort で消す（消し損ねても次の回収が拾う）。ラッパーの名前が予約名なので `root.path` から
+//! 子へは到達できない。bundle の親に書ける者は rootful では bundle の設定自体を握る信頼された主体で、予約名の
+//! 位置に他人が置いたディレクトリは所有者の照合で落ちる（この前提は従来と同じ）。この変更より前の平らな構造の
+//! 木（予約名の木そのものが展開先）は従来の挙動のまま残り、rootful で所有者が変わったものは
+//! `Unverified(Owner)` で観測できる。
+//!
 //! 展開の途中でプロセスが落ちると、非公開の名前 `.fandhe-unpack-<pid>-<seq>` の木が残る（連番は
 //! プロセスごとに 0 から数えるため、PID が再利用されると次の create が `EEXIST` で止まる）。
 //! 持ち主がいるかは PID ではなく、木のディレクトリ自体への OS ロック（`flock`）で判定する。作る側は作った
@@ -30,16 +40,23 @@
 //! 所有者は実効 uid、権限が `SubordinateIds` なら subuid の範囲も受ける）。確かめられず残した木の理由は
 //! [`UnverifiedReason`] で観測でき、[`reap_stale_unpacks_with`] は残した木・消せなかった木を 1 件ずつ失敗として
 //! 記録する（#2540・REPAIR-4）。Linux 以外は作成自体が `Unimplemented` で木が生じず、[`reap_stale_unpacks`] も
-//! `Unimplemented` を返す（REPAIR-3）。起動時の照合への配線（`StateStore::list` で列挙した bundle への呼び出し）は
-//! #2315 で扱う。
+//! `Unimplemented` を返す（REPAIR-3）。状態ルート全体の掃引はしない（決定 E。#2635）。回収の契機は
+//! 同じ bundle への次の `create_with_image` と、bundle を知る呼び出し元が呼ぶ [`reap_stale_unpacks`] /
+//! [`reap_stale_unpacks_with`] に限る。
 //!
 //! # 公開済みで状態の無い rootfs の回収（#2540・OCI-7）
 //!
 //! 公開（`renameat2`）の後・状態作成の前にクラッシュした木、delete が状態を消した後の rootfs 削除に失敗した木、
 //! 状態を失った木は、次の同じ bundle の create を `AlreadyExists` で塞ぎ続ける。`create_with_image` は展開先を
-//! 作る前に [`reap_published_orphan`] を呼び、孤児と確かめられたときだけ消す（条件は同関数の doc）。印は v2
-//! （トークン + 作成時の (dev, ino)）で、同一性が一致しない複製（`cp -a`）や v1 の印は残す。生きている create は
+//! 作る前に [`reap_published_orphan`] を呼び、孤児と確かめられたときだけ消す（条件は同関数の doc）。印は v3
+//! （トークン + 作成時の (dev, ino) + 状態ルートの識別子）で、同一性が一致しない複製（`cp -a`）や v1 の印は残す。生きている create は
 //! `CreatedRootfs` が状態作成まで木の `flock` を保持することで見分ける。
+//!
+//! 印は v3（#2635・OCI-5）で、3 行目に状態ルートの識別子（`StateStore::host_state_root` の絶対パスの SHA-256 の
+//! 先頭 128 bit。`state_root_scope`）を載せる。孤児の回収は識別子が現在のストアと一致する木だけを消す
+//! （別の状態ルート〔`--root` 違い〕のコンテナが使う公開済みの rootfs を、`StateStore::list` に見えないことを
+//! 理由に孤児と取り違えない fail-closed）。v2 の印・識別子を持たないストアの木は残す（`OrphanReap::ForeignStateRoot`）。
+//! 状態ルート全体の掃引（journal・起動時の全件照合）は決定 E として入れない（`docs/design/image-rootfs-lifetime.md`）。
 //!
 //! # subuid 所有の木の削除（#2540・SEC-5・CORE-6）
 //!
@@ -69,7 +86,7 @@ pub(super) const STAGING_PREFIX: &str = crate::traits::state_store::IMAGE_ROOTFS
 #[cfg(target_os = "linux")]
 const OWNER_TOKEN_FILE: &str = ".fandhe-container-rootfs-owner";
 
-/// 印のファイルの最大バイト数（v2 は 32 + 1 + 20 + 1 + 20 + 1 = 75 バイト。余裕を見て 128）。
+/// 印のファイルの最大バイト数（v3 は 32 + 1 + 41 + 1 + 32 + 1 = 108 バイト以下。余裕を見て 128）。
 #[cfg(target_os = "linux")]
 const MARKER_MAX_BYTES: u64 = 128;
 
@@ -238,8 +255,9 @@ impl StagingReclamation {
 ///   最終要素の symlink を辿ること（`O_NOFOLLOW` を付けて開かない）。以降の要素は `rootfs` 配下を fd 相対・
 ///   リンク非追従で扱うこと。この経路は展開の呼び出しの間だけ有効で、保持・保存してはならない
 ///   （Linux 以外は作成の前に `Unimplemented` で拒否されるため、この経路は渡されない）
-/// - 展開中の rootfs は、Linux では最終の `root.path` とは別の非公開の名前にあり、展開の成功後に core が
-///   最終の名前へ公開する（展開中に別の create が rootfs を使用中と見なして成功する競合を防ぐ。OCI-7）
+/// - 展開中の rootfs は、Linux では最終の `root.path` とは別の非公開の名前（core 専有のラッパーディレクトリの
+///   子）にあり、展開の成功後に core が最終の名前へ公開する（展開中に別の create が rootfs を使用中と見なして
+///   成功する競合を防ぐ。OCI-7・#2635）
 /// - 展開器は `rootfs` 自体を作り直したり別の場所へ移したりしない
 /// - 失敗時に部分的な展開物を残してよい。後始末は core が行う
 /// - イメージストアの排他は blob パスの解決に必要な間だけ取り、展開の全体にわたっては保持しない
@@ -489,6 +507,9 @@ pub(super) enum OrphanReap {
     Unverified,
     /// 回収を試みて削除に失敗した（一部が消えて残っていることがある）。
     Failed,
+    /// 印の状態ルートの識別子が現在のストアと一致しない（別の状態ルートの木かもしれない）、印が識別子を持たない
+    /// （v2）、またはストアが状態ルートを示せないため残した（#2635・OCI-5。fail-closed）。
+    ForeignStateRoot,
 }
 
 /// `root.path` の最終の名前に公開済みの rootfs があり、状態を持たない孤児と確かめられれば消す（#2540・OCI-7）。
@@ -501,13 +522,17 @@ pub(super) enum OrphanReap {
 /// 1. bundle の所有ロックを取れる（delete・通常の create の状態作成と排他。保持中は `Held`）
 /// 2. 最終の名前がリンクでないディレクトリで、親と同じマウント
 /// 3. 木のディレクトリの `flock` が取れる（`WouldBlock` は生きている create。`Alive`）
-/// 4. 印のファイルが v2 形式で、所有者が実効 uid・mode 0400・nlink 1・通常ファイル、かつ印の (dev, ino) が
+/// 4. 印のファイルが v3 形式で、所有者が実効 uid・mode 0400・nlink 1・通常ファイル、かつ印の (dev, ino) が
 ///    木の実体と一致する（`cp -a` での複製や利用者のデータを消さない）
-/// 5. `store` の全レコードに、印のトークンを持つものも、同じ bundle を指すものも無い（一覧の失敗・打ち切りは
+/// 5. 印の状態ルートの識別子（[`state_root_scope`]）が `store` の識別子と一致する。不一致・v2 の印・`store` が
+///    状態ルートを示せない（`host_state_root` が `None`）ときは消さず `ForeignStateRoot`（別の状態ルートの
+///    コンテナが使う rootfs を、`store` に見えないことを理由に孤児と取り違えない。#2635・OCI-5）
+/// 6. `store` の全レコードに、印のトークンを持つものも、同じ bundle を指すものも無い（一覧の失敗・打ち切りは
 ///    確かめられないので残す）
 ///
-/// 別の状態ルート（`--root` 違い）のコンテナが同じ bundle の rootfs を使う構成は支援しない（5. で見えない。
-/// `docs/design/image-rootfs-lifetime.md`）。Linux 以外は常に `NotPresent`（作成が `Unimplemented`）。
+/// 別の状態ルート（`--root` 違い）のコンテナが同じ bundle の rootfs を共有する構成は支援しない。core 製の木に
+/// ついては 5. で消さずに残す。通常の create が core 製の木を `root.path` で採用した構成は検出できない
+/// （`docs/design/image-rootfs-lifetime.md`）。Linux 以外は常に `NotPresent`（作成が `Unimplemented`）。
 pub(super) fn reap_published_orphan(
     store: &dyn StateStore,
     recorder: &OpRecorder,
@@ -520,7 +545,10 @@ pub(super) fn reap_published_orphan(
     let result = match outcome {
         OrphanReap::NotPresent | OrphanReap::Alive => None,
         OrphanReap::Reclaimed => Some(OpOutcome::Success),
-        OrphanReap::Held | OrphanReap::Unverified | OrphanReap::Failed => Some(OpOutcome::Failure),
+        OrphanReap::Held
+        | OrphanReap::Unverified
+        | OrphanReap::Failed
+        | OrphanReap::ForeignStateRoot => Some(OpOutcome::Failure),
     };
     if let Some(result) = result
         && let Ok(name) = OpName::new(IMAGE_ROOTFS_ORPHAN_REAP_OP_NAME)
@@ -528,6 +556,24 @@ pub(super) fn reap_published_orphan(
         let _ = recorder.record(&name, result, started.elapsed());
     }
     outcome
+}
+
+/// 状態ルートの識別子（印 v3 の 3 行目。#2635・OCI-5）。
+///
+/// `store.host_state_root()` の絶対パスのバイト列の SHA-256 の先頭 128 bit を小文字 16 進 32 文字にしたもの。
+/// 印はコンテナの `/` から見えるため、生のパスは書かない。(dev, ino) でなくパスにしたのは、tmpfs の状態ルートが
+/// 再起動をまたいで一致しなくなり、正当な孤児の回収が退行するのを避けるため。パスの表記が変わる（symlink 経由・
+/// 移設）と別の状態ルート扱いになり、孤児の回収は木を残す側に倒れる。ストアが状態ルートを示せない（`None`）ときは
+/// `None`。`create::unpack_rootfs` が `seal` へ渡し、孤児の回収が現在のストアの値と照合する。
+pub(super) fn state_root_scope(store: &dyn StateStore) -> Option<String> {
+    store.host_state_root().map(scope_of)
+}
+
+/// [`state_root_scope`] の本体（状態ルートのパス → 識別子）。
+fn scope_of(root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(root.as_os_str().as_encoded_bytes());
+    digest.iter().take(16).map(|b| format!("{b:02x}")).collect()
 }
 
 /// 経路のいずれかの要素が非公開の展開先の予約名（[`STAGING_PREFIX`] 始まり）か。
@@ -591,8 +637,11 @@ impl CreatedRootfs {
     /// 展開後・公開前に、作成世代を区別する所有トークンを rootfs 直下の印のファイルへ書く（OCI-7・#2378）。
     ///
     /// 展開済みの木に同名のファイルがあれば（イメージ由来の偽の印を採用しない）`AlreadyExists` で拒否する。
-    pub(super) fn seal(&mut self) -> Result<(), TraitError> {
-        imp::seal(&mut self.backing)
+    ///
+    /// `state_root_scope` は [`state_root_scope`] の識別子（印 v3 の 3 行目。`None` なら v2 を書き、孤児の回収は
+    /// この木を残す。#2635・OCI-5）。
+    pub(super) fn seal(&mut self, state_root_scope: Option<&str>) -> Result<(), TraitError> {
+        imp::seal(&mut self.backing, state_root_scope)
     }
 
     /// rootfs を消す。
@@ -672,22 +721,37 @@ mod imp {
     /// 非公開の展開先の名前の連番（同一プロセス内の衝突を避ける。別プロセスとは pid で分ける）。
     static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 
+    /// 展開先のラッパー（予約名のディレクトリ）の下の、展開器に渡す子の名前（#2635）。
+    ///
+    /// ラッパーは core 専有（0700・実効 uid 所有）で展開器へ渡さない。イメージが所有者や mode を変えられるのは
+    /// 子だけなので、回収側が判定するラッパーの所有者は崩れない。子の名前自体は予約名ではないが、ラッパーが予約名
+    /// なので `root.path` から子へは到達できない（`has_staging_component` が拒否する）。
+    const STAGING_CHILD: &str = "rootfs";
+
     /// 検証済みの親ディレクトリの fd と、その下の rootfs の名前・同一性。
     ///
-    /// 作成直後は `current` が非公開の展開先の名前で、`publish` 後に最終の名前 `final_name` になる。
+    /// 作成直後は rootfs が親の下の非公開のラッパー `wrapper_name` の子 [`STAGING_CHILD`] にあり、`publish` で
+    /// 最終の名前 `final_name` へ改名する（その後、空のラッパーは best effort で消す）。
     #[derive(Debug)]
     pub(super) struct Backing {
         parent: OwnedFd,
         final_name: CString,
-        current: CString,
-        /// 作った rootfs ディレクトリそのものの fd（展開器へ `/proc/self/fd/N` で渡す）。
+        wrapper_name: CString,
+        /// 非公開のラッパーディレクトリの fd・同一性（未公開の後始末はラッパーごと消す）。
+        wrapper: OwnedFd,
+        wrapper_identity: (u64, u64),
+        /// 最終の名前への改名が済んだか。
+        published: bool,
+        /// 作った rootfs ディレクトリ（ラッパーの子）そのものの fd（展開器へ `/proc/self/fd/N` で渡す）。
         dir: OwnedFd,
         identity: (u64, u64),
         /// `seal` が書いた所有トークン（小文字 16 進 32 文字）。
         token: Option<String>,
-        /// 展開先のディレクトリ自体への排他の `flock`。生きている間は他の回収側から「持ち主あり」に見え、
-        /// プロセスが落ちれば OS が外す（#2379・OCI-7）。`Backing` と同じ寿命で保持する。
+        /// 展開先（子）のディレクトリ自体への排他の `flock`。公開後も状態作成まで保持し、孤児の回収から
+        /// 「持ち主あり」に見せる。プロセスが落ちれば OS が外す（#2379・OCI-7）。
         _lock: File,
+        /// ラッパーへの排他の `flock`。展開途中の回収から「持ち主あり」に見せる。
+        _wrapper_lock: File,
     }
 
     /// 削除時に照合する所有トークンの扱い。
@@ -715,7 +779,13 @@ mod imp {
         Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
     }
 
-    pub(super) fn seal(b: &mut Backing) -> Result<(), TraitError> {
+    pub(super) fn seal(b: &mut Backing, scope: Option<&str>) -> Result<(), TraitError> {
+        if scope.is_some_and(|s| !is_hex32(s)) {
+            return Err(TraitError::new(
+                ErrorCode::Internal,
+                "invalid state root scope",
+            ));
+        }
         let token = new_token()?;
         // 展開器は rootfs 自身の mode を変えてよい（契約は禁止していない）。所有者の write・search 権限が無いと
         // 印を作れず、従来成功した create が失敗する退行になるため、固定した fd の実体（`/proc/self/fd/N` は
@@ -725,15 +795,42 @@ mod imp {
             .map(|(_, _, _, mode)| mode & 0o7777)
             .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to stat rootfs"))?;
         let widened = original | 0o300;
+        // 子が実効 uid 所有でない（rootless で `./` が subuid 所有。決定 G の既知の制限・#2690）と、mode の補完も
+        // 印の作成もできない。seal は publish より先に走るため、汎用の印の書き込み失敗ではなく publish と同じ
+        // 診断で拒否する（利用者が原因を判別できるように。OCI-7）。
+        let foreign = fd_owner(b.dir.as_fd()).is_some_and(|o| o != sys::effective_uid());
+        let foreign_err = || {
+            TraitError::new(
+                ErrorCode::Internal,
+                "failed to publish rootfs: cannot make unpacked root writable for rename (owned by another uid)",
+            )
+        };
         if widened != original {
             std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(widened)).map_err(
-                |_| TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token"),
+                |_| {
+                    if foreign {
+                        foreign_err()
+                    } else {
+                        TraitError::new(ErrorCode::Internal, "failed to write rootfs owner token")
+                    }
+                },
             )?;
         }
         // v2: 1 行目 = トークン、2 行目 = 木の作成時の `<dev>:<ino>`。複製（`cp -a`）は inode が新しくなり
         // 2 行目が一致しないので、孤児の回収が利用者の複製を消さない（#2540）。
-        let content = format!("{token}\n{}:{}\n", b.identity.0, b.identity.1);
-        let written = write_marker(&proc_dir, &content);
+        // v3（#2635）: 3 行目 = 状態ルートの識別子。別の状態ルートの木を孤児の回収が消さない（OCI-5）。
+        // 識別子が無いストアは v2 を書き、孤児の回収はその木を残す。
+        let content = match scope {
+            Some(scope) => format!("{token}\n{}:{}\n{scope}\n", b.identity.0, b.identity.1),
+            None => format!("{token}\n{}:{}\n", b.identity.0, b.identity.1),
+        };
+        let written = write_marker(&proc_dir, &content).map_err(|e| {
+            if foreign && e.code() == ErrorCode::Internal {
+                foreign_err()
+            } else {
+                e
+            }
+        });
         if widened != original {
             let restored =
                 std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(original));
@@ -777,29 +874,34 @@ mod imp {
         Ok(())
     }
 
-    /// 印のファイルの内容（#2378 の v1 = トークンのみ、#2540 の v2 = トークン + 作成時の (dev, ino)）。
-    struct Marker {
-        token: String,
-        /// v2 だけが持つ、木の作成時の実体の (dev, ino)。v1 は `None`。
-        identity: Option<(u64, u64)>,
+    /// 印のファイルの内容（#2378 の v1 = トークンのみ、#2540 の v2 = トークン + 作成時の (dev, ino)、
+    /// #2635 の v3 = v2 + 状態ルートの識別子）。
+    pub(super) struct Marker {
+        pub(super) token: String,
+        /// v2 以降が持つ、木の作成時の実体の (dev, ino)。v1 は `None`。
+        pub(super) identity: Option<(u64, u64)>,
+        /// v3 だけが持つ、状態ルートの識別子（小文字 16 進 32 文字）。v1・v2 は `None`。
+        pub(super) scope: Option<String>,
+    }
+
+    /// 小文字 16 進ちょうど 32 文字か（トークン・状態ルートの識別子の形式）。
+    fn is_hex32(v: &str) -> bool {
+        v.len() == 32 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     }
 
     /// 印の内容を厳密に解析する（16 進と 10 進だけ。長さは呼び出し側が [`MARKER_MAX_BYTES`] で制限済み）。
-    fn parse_marker(buf: &[u8]) -> Option<Marker> {
+    pub(super) fn parse_marker(buf: &[u8]) -> Option<Marker> {
         let text = std::str::from_utf8(buf).ok()?;
         let mut lines = text.split('\n');
         let token = lines.next()?;
-        if token.len() != 32
-            || !token
-                .bytes()
-                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        {
+        if !is_hex32(token) {
             return None;
         }
         let Some(second) = lines.next() else {
             return Some(Marker {
                 token: token.to_owned(),
                 identity: None,
+                scope: None,
             });
         };
         let (dev, ino) = second.split_once(':')?;
@@ -808,13 +910,24 @@ mod imp {
                 .then(|| v.parse::<u64>().ok())
                 .flatten()
         };
-        // 2 行目の後は空（末尾の改行）だけで、それ以外は拒否する。
-        if lines.next() != Some("") || lines.next().is_some() {
+        // 2 行目の後は、v2 なら空（末尾の改行）だけ、v3 なら識別子の行と空だけで、それ以外は拒否する。
+        let scope = match lines.next()? {
+            "" => None,
+            third if is_hex32(third) => {
+                if lines.next() != Some("") {
+                    return None;
+                }
+                Some(third.to_owned())
+            }
+            _ => return None,
+        };
+        if lines.next().is_some() {
             return None;
         }
         Some(Marker {
             token: token.to_owned(),
             identity: Some((num(dev)?, num(ino)?)),
+            scope,
         })
     }
 
@@ -856,7 +969,7 @@ mod imp {
         parse_marker(&buf)
     }
 
-    /// 固定した rootfs の fd 直下の印のファイルのトークンが `expected` と一致するか（v1・v2 のどちらも受ける）。
+    /// 固定した rootfs の fd 直下の印のファイルのトークンが `expected` と一致するか（v1・v2・v3 のすべてを受ける）。
     fn token_matches(root: BorrowedFd<'_>, expected: &str) -> bool {
         read_marker(root, false).is_some_and(|m| m.token == expected)
     }
@@ -866,22 +979,52 @@ mod imp {
     }
 
     pub(super) fn publish(b: &mut Backing) -> Result<(), TraitError> {
-        if b.current == b.final_name {
+        if b.published {
             return Ok(());
         }
-        sys::rename_noreplace_at(
-            b.parent.as_fd(),
-            &b.current,
-            b.parent.as_fd(),
-            &b.final_name,
-        )
-        .map_err(|e| match e {
+        let child = cstr(OsStr::new(STAGING_CHILD))?;
+        // 別のディレクトリの下へ移すには、移すディレクトリ自身への write 権限が要る（`..` の付け替え。同じ親の下の
+        // 改名では要らなかった）。展開器は rootfs 自身の mode を変えてよい（例: 0555）ので、write が無ければ
+        // 固定した fd の実体（`/proc/self/fd/N` は経路を再解決しない）の mode を一時的に補い、改名の後に戻す。
+        let proc_dir = format!("/proc/self/fd/{}", b.dir.as_raw_fd());
+        let original = fstat(b.dir.as_fd())
+            .map(|(_, _, _, mode)| mode & 0o7777)
+            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to stat rootfs"))?;
+        let widened = original | 0o200;
+        if widened != original {
+            // 子が実効 uid 所有でない（rootless で `./` が subuid 所有。決定 G の既知の制限・#2690）と chmod できず、
+            // 改名もできない。成功を装わず、理由が分かる明示エラーで拒否する。
+            std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(widened))
+                .map_err(|_| {
+                    TraitError::new(
+                        ErrorCode::Internal,
+                        "failed to publish rootfs: cannot make unpacked root writable for rename (owned by another uid)",
+                    )
+                })?;
+        }
+        let renamed =
+            sys::rename_noreplace_at(b.wrapper.as_fd(), &child, b.parent.as_fd(), &b.final_name);
+        if widened != original {
+            let restored =
+                std::fs::set_permissions(&proc_dir, std::fs::Permissions::from_mode(original));
+            // 改名に成功していれば公開済みとして扱い（後始末で消さない）、戻せなかったことだけを報告する。
+            if renamed.is_ok() && restored.is_err() {
+                b.published = true;
+                return Err(TraitError::new(
+                    ErrorCode::Internal,
+                    "failed to restore rootfs mode",
+                ));
+            }
+        }
+        renamed.map_err(|e| match e {
             SysError::Os(n) if n == sys::EEXIST || n == sys::ENOTEMPTY => {
                 TraitError::new(ErrorCode::AlreadyExists, "rootfs already exists")
             }
             _ => TraitError::new(ErrorCode::Internal, "failed to publish rootfs"),
         })?;
-        b.current = b.final_name.clone();
+        b.published = true;
+        // 空になったラッパーは best effort で消す（消し損ねても、次の回収が予約名の空の木として拾う）。
+        let _ = sys::remove_dir_at(b.parent.as_fd(), &b.wrapper_name);
         // 改名した先を固定済みの親から開き直し、展開した実体（保持中の fd の dev・ino）と一致することを確認する。
         // 一致しなければ公開した名前は別の実体を指しており、成功を装わず拒否する。
         let same = open_dir(b.parent.as_fd(), &b.final_name)
@@ -891,9 +1034,9 @@ mod imp {
         if same { Ok(()) } else { Err(refuse()) }
     }
 
-    /// 経路を今ここで解決した実体が、展開した実体（保持中の fd の dev・ino）か。
+    /// 最終の名前への改名が済んでいるか。
     pub(super) fn is_published(b: &Backing) -> bool {
-        b.current == b.final_name
+        b.published
     }
 
     pub(super) fn path_is_unpacked(path: &Path, b: &Backing) -> bool {
@@ -1136,6 +1279,8 @@ mod imp {
         Gone,
         Alive,
         Unverified,
+        /// 印の状態ルートの識別子が現在のストアと一致しない・無い（#2635）。
+        ForeignStateRoot,
         Orphan(Orphan),
     }
 
@@ -1147,8 +1292,12 @@ mod imp {
     }
 
     /// 親 `cur`（固定済みの fd）の下の最終の名前 `cname` が、孤児の条件（[`super::reap_published_orphan`] の
-    /// 2〜4）を満たすかを調べる。
-    fn inspect_published(cur: BorrowedFd<'_>, cname: &CString) -> Probe {
+    /// 2〜5）を満たすかを調べる。`expected_scope` は現在のストアの状態ルートの識別子。
+    fn inspect_published(
+        cur: BorrowedFd<'_>,
+        cname: &CString,
+        expected_scope: Option<&str>,
+    ) -> Probe {
         let fd = match sys::open_dir_path_nofollow(Some(cur), cname) {
             Ok(fd) => fd,
             Err(SysError::Os(n)) if n == sys::ENOENT => return Probe::Gone,
@@ -1181,12 +1330,17 @@ mod imp {
             Err(SysError::Os(n)) if n == sys::ENOENT => return Probe::Gone,
             Err(_) => return Probe::Unverified,
         }
-        // 印は v2（同一性つき）で、木の実体と一致するものだけを証拠にする。v1 や複製された印は残す。
+        // 印は v2 以降（同一性つき）で、木の実体と一致するものだけを証拠にする。v1 や複製された印は残す。
         let Some(marker) = read_marker(fd.as_fd(), true) else {
             return Probe::Unverified;
         };
         if marker.identity != Some(identity) {
             return Probe::Unverified;
+        }
+        // 状態ルートの識別子が現在のストアと一致する木だけを孤児の候補にする（別の状態ルートのコンテナが
+        // 使う rootfs は、このストアの一覧に見えないだけで孤児ではない。v2・識別子の無いストアも残す。#2635）。
+        if !matches!((marker.scope.as_deref(), expected_scope), (Some(m), Some(e)) if m == e) {
+            return Probe::ForeignStateRoot;
         }
         Probe::Orphan(Orphan {
             identity,
@@ -1263,10 +1417,12 @@ mod imp {
             Err(e) if e.code() == ErrorCode::FailedPrecondition => return OrphanReap::Held,
             Err(_) => return OrphanReap::Unverified,
         };
-        let orphan = match inspect_published(cur.as_fd(), &cname) {
+        let expected_scope = super::state_root_scope(store);
+        let orphan = match inspect_published(cur.as_fd(), &cname, expected_scope.as_deref()) {
             Probe::Gone => return OrphanReap::NotPresent,
             Probe::Alive => return OrphanReap::Alive,
             Probe::Unverified => return OrphanReap::Unverified,
+            Probe::ForeignStateRoot => return OrphanReap::ForeignStateRoot,
             Probe::Orphan(o) => o,
         };
         if store_references(store, bundle, &orphan.token) != Some(false) {
@@ -1318,8 +1474,78 @@ mod imp {
             std::process::id(),
             STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
         );
-        let name = cstr(OsStr::new(&staging))?;
-        sys::mkdir_at(cur.as_fd(), &name, 0o700).map_err(|e| match e {
+        let wrapper_name = cstr(OsStr::new(&staging))?;
+        // 展開先の名前が回収側に取られた場合の失敗（後始末はしない。持ち主は回収側。#2379）。
+        let reclaimed_concurrently = || {
+            TraitError::new(
+                ErrorCode::Internal,
+                "rootfs staging was reclaimed concurrently",
+            )
+        };
+        // 1 段目: core 専有のラッパー（展開器へは渡さない。回収側が判定する名前）。
+        let (wrapper, wrapper_identity) = make_private_dir(cur.as_fd(), &wrapper_name)?;
+        // ラッパー自体に排他ロックを取る。取れない・取った後に名前の実体が変わっていれば、直前に回収側が
+        // 空の木を取った（持ち主はその回収側）ので、後始末せず失敗する。再試行で成功する（#2379）。
+        let wrapper_lock = lock_dir(wrapper.as_fd())?;
+        if !same_dir(cur.as_fd(), &wrapper_name, wrapper_identity) {
+            return Err(reclaimed_concurrently());
+        }
+        // 2 段目: 展開器に渡す子（#2635）。ラッパーのロックを保持しているので回収側は触れない。失敗はラッパーごと
+        // 消す（まだ展開物は無い。空のラッパーと子だけ）。
+        let child_name = cstr(OsStr::new(STAGING_CHILD))?;
+        let cleanup_wrapper = |err: TraitError| {
+            let _ = remove_tree_priv(
+                privilege,
+                cur.as_fd(),
+                &wrapper_name,
+                wrapper_identity,
+                Owner::Unchecked,
+            );
+            err
+        };
+        let (dir, identity) = match make_private_dir(wrapper.as_fd(), &child_name) {
+            Ok(v) => v,
+            Err(e) => return Err(cleanup_wrapper(e)),
+        };
+        // 子のロックは公開後も状態作成まで保持する（孤児の回収が生きている create を見分ける）。
+        let lock = match lock_dir(dir.as_fd()) {
+            Ok(l) => l,
+            Err(e) => return Err(cleanup_wrapper(e)),
+        };
+        if !same_dir(wrapper.as_fd(), &child_name, identity) {
+            return Err(cleanup_wrapper(TraitError::new(
+                ErrorCode::Internal,
+                "created rootfs is not a directory",
+            )));
+        }
+        Ok((
+            Backing {
+                parent: cur,
+                final_name,
+                wrapper_name,
+                wrapper,
+                wrapper_identity,
+                published: false,
+                dir,
+                identity,
+                token: None,
+                _lock: lock,
+                _wrapper_lock: wrapper_lock,
+            },
+            reclamation,
+        ))
+    }
+
+    /// `parent` の下に `name` を 0700 のディレクトリとして排他的に作り、開いて返す。
+    ///
+    /// mkdirat と open の間に、親へ書ける別プロセスが別の実体へ差し替えうる。採用する実体は、自分（実効 uid）
+    /// 所有・権限 0700・空のディレクトリに限る（既存データへ展開せず、失敗時の再帰削除が他人のデータに
+    /// 及ばない）。0700（setgid 親の下の 02700 も許容）で自分の所有なら、検証後に他者は中身を足せない（root を除く）。
+    fn make_private_dir(
+        parent: BorrowedFd<'_>,
+        name: &CString,
+    ) -> Result<(OwnedFd, (u64, u64)), TraitError> {
+        sys::mkdir_at(parent, name, 0o700).map_err(|e| match e {
             SysError::Os(n) if n == sys::EEXIST => {
                 TraitError::new(ErrorCode::AlreadyExists, "rootfs already exists")
             }
@@ -1331,61 +1557,49 @@ mod imp {
             }
             _ => TraitError::new(ErrorCode::Internal, "failed to create rootfs"),
         })?;
-        let opened = open_dir(cur.as_fd(), &name).ok().and_then(|fd| {
+        let opened = open_dir(parent, name).ok().and_then(|fd| {
             fstat(fd.as_fd())
                 .ok()
                 .map(|(dev, ino, is_dir, _)| (fd, dev, ino, is_dir))
         });
-        // mkdirat と open の間に、親へ書ける別プロセスが別の実体へ差し替えうる。採用する実体は、自分（実効 uid）
-        // 所有・権限 0700・空のディレクトリに限る（既存データへ展開せず、失敗時の再帰削除が他人のデータに
-        // 及ばない）。0700（setgid 親の下の 02700 も許容）で自分の所有なら、検証後に他者は中身を足せない（root を除く）。
         let owned_empty = opened.as_ref().is_some_and(|(fd, _, _, _)| {
             fstat(fd.as_fd()).is_ok_and(|(_, _, is_dir, mode)| is_dir && mode & 0o777 == 0o700)
                 && fd_owner(fd.as_fd()) == Some(sys::effective_uid())
                 && dir_is_empty(fd.as_fd())
         });
-        let (dir, identity) = match opened {
-            Some((fd, dev, ino, true)) if owned_empty => (fd, (dev, ino)),
+        match opened {
+            Some((fd, dev, ino, true)) if owned_empty => Ok((fd, (dev, ino))),
             _ => {
                 // 作った直後に差し替えられた。差し替えられた実体は自分のものと確認できないため消さない
                 // （空ディレクトリでなければ `remove_dir_at` は失敗する。best effort で戻すのは空の場合だけ）。
-                let _ = sys::remove_dir_at(cur.as_fd(), &name);
-                return Err(TraitError::new(
+                let _ = sys::remove_dir_at(parent, name);
+                Err(TraitError::new(
                     ErrorCode::Internal,
                     "created rootfs is not a directory",
-                ));
+                ))
             }
-        };
-        // 展開先自体に排他ロックを取る。取れない・取った後に名前の実体が変わっていれば、直前に回収側が
-        // 空の木を取った（持ち主はその回収側）ので、後始末せず失敗する。再試行で成功する（#2379）。
-        let reclaimed_concurrently = || {
+        }
+    }
+
+    /// 固定したディレクトリ自体に排他の `flock` を取って返す（`try_lock` だけで待たない）。
+    fn lock_dir(dir: BorrowedFd<'_>) -> Result<File, TraitError> {
+        let lock = File::open(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to lock rootfs staging"))?;
+        lock.try_lock().map_err(|_| {
             TraitError::new(
                 ErrorCode::Internal,
                 "rootfs staging was reclaimed concurrently",
             )
-        };
-        let lock = File::open(format!("/proc/self/fd/{}", dir.as_raw_fd()))
-            .map_err(|_| TraitError::new(ErrorCode::Internal, "failed to lock rootfs staging"))?;
-        lock.try_lock().map_err(|_| reclaimed_concurrently())?;
-        match open_dir(cur.as_fd(), &name)
-            .ok()
-            .and_then(|fd| fstat(fd.as_fd()).ok())
-        {
-            Some((dev, ino, true, _)) if (dev, ino) == identity => {}
-            _ => return Err(reclaimed_concurrently()),
-        }
-        Ok((
-            Backing {
-                parent: cur,
-                final_name,
-                current: name,
-                dir,
-                identity,
-                token: None,
-                _lock: lock,
-            },
-            reclamation,
-        ))
+        })?;
+        Ok(lock)
+    }
+
+    /// `parent` の下の `name` を今開き直した実体が、`identity` のディレクトリのままか。
+    fn same_dir(parent: BorrowedFd<'_>, name: &CString, identity: (u64, u64)) -> bool {
+        matches!(
+            open_dir(parent, name).ok().and_then(|fd| fstat(fd.as_fd()).ok()),
+            Some((dev, ino, true, _)) if (dev, ino) == identity
+        )
     }
 
     pub(super) fn identity(b: &Backing) -> Result<(u64, u64), TraitError> {
@@ -1397,12 +1611,17 @@ mod imp {
         b: Backing,
         privilege: &ImageRootfsPrivilege,
     ) -> Result<(), TraitError> {
-        // 既に無ければ消す物が無い（`NotPresent` も成功）。
+        // 既に無ければ消す物が無い（`NotPresent` も成功）。未公開ならラッパーごと、公開済みなら最終の名前の木を消す。
+        let (name, identity) = if b.published {
+            (&b.final_name, b.identity)
+        } else {
+            (&b.wrapper_name, b.wrapper_identity)
+        };
         remove_tree_priv(
             privilege,
             b.parent.as_fd(),
-            &b.current,
-            b.identity,
+            name,
+            identity,
             Owner::Unchecked,
         )
         .map(|_| ())
@@ -1875,7 +2094,7 @@ mod imp {
     }
 
     /// 作成自体が拒否される（`create_dir` は Unimplemented）ため到達しない。
-    pub(super) fn seal(_b: &mut Backing) -> Result<(), TraitError> {
+    pub(super) fn seal(_b: &mut Backing, _scope: Option<&str>) -> Result<(), TraitError> {
         Err(TraitError::new(
             ErrorCode::Unimplemented,
             "image rootfs requires Linux",
@@ -2142,7 +2361,7 @@ mod tests {
     fn published_record(b: &Path, rel: &str) -> ImageRootfsRecord {
         let mut c = prepare_rootfs_target(b, Path::new(rel)).expect("prepare");
         std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
-        c.seal().expect("seal");
+        c.seal(None).expect("seal");
         c.publish().expect("publish");
         c.record().expect("record")
     }
@@ -2158,7 +2377,8 @@ mod tests {
         std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
         std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(0o555))
             .expect("chmod 0555");
-        c.seal().expect("seal must not fail on a read-only rootfs");
+        c.seal(None)
+            .expect("seal must not fail on a read-only rootfs");
         let mode = |p: &Path| std::fs::metadata(p).expect("meta").permissions().mode() & 0o7777;
         assert_eq!(mode(&c.unpack_path()), 0o555);
         c.publish().expect("publish");
@@ -2184,7 +2404,7 @@ mod tests {
             std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
             std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(m))
                 .expect("chmod");
-            c.seal().expect("seal");
+            c.seal(None).expect("seal");
             c.publish().expect("publish");
             let rec = c.record().expect("record");
             assert_eq!(
@@ -2207,7 +2427,7 @@ mod tests {
         std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
         std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(0o000))
             .expect("chmod");
-        c.seal().expect("seal");
+        c.seal(None).expect("seal");
         c.publish().expect("publish");
         let rec = c.record().expect("record");
         let (dev, ino) = rec.identity();
@@ -2292,7 +2512,7 @@ mod tests {
         let b = tmp("seal-pre");
         let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
         std::fs::write(c.unpack_path().join(super::OWNER_TOKEN_FILE), "x").expect("fake");
-        let e = c.seal().expect_err("exists");
+        let e = c.seal(None).expect_err("exists");
         assert_eq!(e.code(), ErrorCode::AlreadyExists);
         c.remove().expect("cleanup");
         let _ = std::fs::remove_dir_all(&b);
@@ -2410,7 +2630,7 @@ mod tests {
         std::fs::write(up.join("ro/f"), b"x").expect("f");
         std::fs::set_permissions(up.join("ro"), std::fs::Permissions::from_mode(0o500))
             .expect("chmod");
-        c.seal().expect("seal");
+        c.seal(None).expect("seal");
         c.publish().expect("publish");
         let rec = c.record().expect("record");
         assert_eq!(
@@ -2833,5 +3053,188 @@ mod tests {
         assert_eq!(count("image_rootfs_reap_failed"), (0, 0));
         let _ = std::fs::remove_dir_all(&b);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+    /// 印 v3 の検証用の状態ルートの識別子（小文字 16 進 32 文字）。
+    #[cfg(target_os = "linux")]
+    const SCOPE: &str = "d2cd8dfaa9ec16995946ca58e01842e2";
+
+    /// OCI-5・#2635: 状態ルートの識別子は絶対パスの SHA-256 の先頭 128 bit（小文字 16 進 32 文字）で、
+    /// パスが違えば値も違う。`printf '%s' /run/x | sha256sum | cut -c1-32` と一致する。
+    #[test]
+    fn oci5_2635_scope_of_is_sha256_prefix_of_path() {
+        assert_eq!(
+            scope_of(Path::new("/run/x")),
+            "d2cd8dfaa9ec16995946ca58e01842e2"
+        );
+        assert_ne!(scope_of(Path::new("/run/x")), scope_of(Path::new("/run/y")));
+        assert_eq!(scope_of(Path::new("/run/x")), scope_of(Path::new("/run/x")));
+        assert_eq!(scope_of(Path::new("/run/x")).len(), 32);
+    }
+
+    /// OCI-7・#2635: 展開先は core 専有のラッパー（実効 uid 所有・0700）とその子 `rootfs` の 2 段で、展開器へ渡す
+    /// 経路は子を指す。公開すると子が最終の名前になり、空のラッパーは消える。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_2635_staging_uses_core_owned_wrapper() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let b = tmp("wrapper");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        let wrappers = |dir: &Path| -> Vec<std::ffi::OsString> {
+            let mut v: Vec<_> = std::fs::read_dir(dir)
+                .expect("read")
+                .map(|e| e.expect("ent").file_name())
+                .filter(|n| n.to_string_lossy().starts_with(STAGING_PREFIX))
+                .collect();
+            v.sort();
+            v
+        };
+        let live = wrappers(&b);
+        assert_eq!(live.len(), 1);
+        let wrapper = b.join(&live[0]);
+        let meta = std::fs::metadata(&wrapper).expect("wrapper");
+        assert_eq!(meta.uid(), crate::sys::effective_uid());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        let inner: Vec<_> = std::fs::read_dir(&wrapper)
+            .expect("read wrapper")
+            .map(|e| e.expect("ent").file_name())
+            .collect();
+        assert_eq!(inner, vec![std::ffi::OsString::from("rootfs")]);
+        let child = std::fs::metadata(c.unpack_path()).expect("child");
+        let child_id = (child.dev(), child.ino());
+        assert_eq!(
+            (
+                std::fs::metadata(wrapper.join("rootfs")).expect("c").dev(),
+                std::fs::metadata(wrapper.join("rootfs")).expect("c").ino()
+            ),
+            child_id
+        );
+        assert_ne!(child_id, (meta.dev(), meta.ino()));
+
+        c.seal(Some(SCOPE)).expect("seal");
+        c.publish().expect("publish");
+        assert!(wrappers(&b).is_empty(), "the empty wrapper is removed");
+        let published = std::fs::metadata(b.join("rootfs")).expect("published");
+        assert_eq!((published.dev(), published.ino()), child_id);
+        let rec = c.record().expect("record");
+        assert_eq!(rec.identity(), child_id);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7・#2635: 展開器が子の mode を 0 にしても（rootful で所有者が変わる場合の代役）、回収が判定するのは
+    /// 実効 uid 所有のラッパーなので、持ち主のいない木は回収される。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_2635_reap_reclaims_wrapper_when_child_mode_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        for child_mode in [0o000, 0o755] {
+            let b = tmp("wrapper-reap");
+            let w = b.join(".fandhe-unpack-1-0");
+            std::fs::create_dir(&w).expect("wrapper");
+            std::fs::set_permissions(&w, std::fs::Permissions::from_mode(0o700)).expect("0700");
+            let child = w.join("rootfs");
+            std::fs::create_dir(&child).expect("child");
+            std::fs::write(child.join("f"), b"x").expect("f");
+            std::fs::set_permissions(&child, std::fs::Permissions::from_mode(child_mode))
+                .expect("child mode");
+            let r = reap_stale_unpacks(&b, Path::new("rootfs")).expect("reap");
+            assert_eq!(
+                r.reclaimed,
+                vec![std::ffi::OsString::from(".fandhe-unpack-1-0")],
+                "child mode {child_mode:o}"
+            );
+            assert!(r.kept_unverified.is_empty() && r.failed.is_empty());
+            assert!(!w.exists());
+            let _ = std::fs::remove_dir_all(&b);
+        }
+    }
+
+    /// OCI-7・#2635: 公開前の `remove` はラッパーごと消し、bundle 直下に何も残さない。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_2635_unpublished_remove_removes_wrapper() {
+        let b = tmp("wrapper-remove");
+        let c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        std::fs::write(c.unpack_path().join("f"), b"x").expect("write");
+        c.remove().expect("remove");
+        assert_eq!(std::fs::read_dir(&b).expect("read").count(), 0);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7・#2635: 展開器が子を 0555（write なし）にしても、公開（別ディレクトリへの改名）は成功し、公開後の
+    /// mode は展開器が残したままになる。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_2635_publish_works_when_child_has_no_write_permission() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = tmp("wrapper-ro");
+        let mut c = prepare_rootfs_target(&b, Path::new("rootfs")).expect("prepare");
+        std::fs::set_permissions(c.unpack_path(), std::fs::Permissions::from_mode(0o555))
+            .expect("ro");
+        c.publish().expect("publish");
+        let mode = std::fs::metadata(b.join("rootfs"))
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o555);
+        std::fs::set_permissions(b.join("rootfs"), std::fs::Permissions::from_mode(0o755))
+            .expect("restore");
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7・OCI-5・#2635: 印 v3 は `トークン\n<dev>:<ino>\n識別子\n` と完全に一致し、識別子の無い seal は v2 を書く。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_2635_seal_writes_v3_with_scope_and_v2_without() {
+        let b = tmp("seal-v3");
+        let mut c = prepare_rootfs_target(&b, Path::new("a")).expect("prepare");
+        c.seal(Some(SCOPE)).expect("seal");
+        c.publish().expect("publish");
+        let rec = c.record().expect("record");
+        let token = rec.token().expect("token");
+        let (dev, ino) = rec.identity();
+        let text = std::fs::read_to_string(b.join("a").join(super::OWNER_TOKEN_FILE)).expect("m");
+        assert_eq!(text, format!("{token}\n{dev}:{ino}\n{SCOPE}\n"));
+
+        let mut c2 = prepare_rootfs_target(&b, Path::new("b")).expect("prepare 2");
+        c2.seal(None).expect("seal v2");
+        c2.publish().expect("publish 2");
+        let rec2 = c2.record().expect("record 2");
+        let (dev2, ino2) = rec2.identity();
+        let text2 = std::fs::read_to_string(b.join("b").join(super::OWNER_TOKEN_FILE)).expect("m");
+        assert_eq!(
+            text2,
+            format!("{}\n{dev2}:{ino2}\n", rec2.token().expect("token"))
+        );
+
+        let mut c3 = prepare_rootfs_target(&b, Path::new("c")).expect("prepare 3");
+        let e = c3.seal(Some("NOT-HEX")).expect_err("invalid scope");
+        assert_eq!(e.code(), ErrorCode::Internal);
+        let _ = std::fs::remove_dir_all(&b);
+    }
+
+    /// OCI-7・#2635: 印の解析は v1・v2・v3 だけを受け、3 行目が小文字 16 進 32 文字でない・4 行目がある・
+    /// 末尾の改行が無いものは拒否する。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oci7_2635_parse_marker_accepts_only_v1_v2_v3() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let parse = |t: String| imp::parse_marker(t.as_bytes());
+        let m = parse(format!("{token}\n7:9\n{SCOPE}\n")).expect("v3");
+        assert_eq!(m.identity, Some((7, 9)));
+        assert_eq!(m.scope.as_deref(), Some(SCOPE));
+        let m = parse(format!("{token}\n7:9\n")).expect("v2");
+        assert_eq!((m.identity, m.scope), (Some((7, 9)), None));
+        let m = parse(token.to_owned()).expect("v1");
+        assert_eq!((m.identity, m.scope), (None, None));
+        for bad in [
+            format!("{token}\n7:9\n{}\n", &SCOPE[..31]),
+            format!("{token}\n7:9\n{}\n", SCOPE.to_uppercase()),
+            format!("{token}\n7:9\n{SCOPE}\nextra\n"),
+            format!("{token}\n7:9\n{SCOPE}"),
+            format!("{token}\n7:9\n\n"),
+            format!("{token}\n7:9\nzz\n"),
+        ] {
+            assert!(parse(bad.clone()).is_none(), "{bad:?}");
+        }
     }
 }

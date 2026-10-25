@@ -56,6 +56,11 @@
 //!   当コンテナの `layer=exit_signal` の行がちょうど 1 行で、`signal` 31・`target_pid` = コンテナの PID・`syscall`/`arch` は null、
 //!   再度の `wait` / `terminate` の後も 1 行のままであることを照合する。成功行の前に
 //!   `production_launcher: exit_signal recorded once via audit relay (scenario=Q)` を出す
+//! - シナリオ S（launch 経路の entrypoint 系違反の記録。#2624・SEC-4・SUP-6）: 試験バイナリ自身のディレクトリを bind し、
+//!   `args[0]` をその中の試験バイナリ（PID 1 の `/proc/self/exe` と同一の inode）にした start が `PermissionDenied` で失敗し、
+//!   状態が Created のまま子が残らず、launcher の記録先に層 `entrypoint`・`reason=entrypoint_is_runtime_binary`・当コンテナの
+//!   ID・パスなしのレコードがちょうど 1 件あることを照合する。成功行の前に
+//!   `production_launcher: entrypoint violation recorded once and launch refused (scenario=S)` を出す
 //! - root で実行された場合: 主経路は非 root（SEC-5）。launch が拒否され、状態が Created に戻り、子が残らないことだけを
 //!   照合する（コンテナ内 root をホスト root へ写す起動は試さない）
 //!
@@ -163,7 +168,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use fandhe_container_core::audit_log::{
-        AUDIT_LOG_FILE_NAME, AuditRecord, AuditSink, ControlAuditRelay, FileAuditSink,
+        AUDIT_LOG_FILE_NAME, AuditLayer, AuditRecord, AuditSink, ControlAuditRelay, FileAuditSink,
     };
     use fandhe_container_core::capabilities::OCI_DEFAULT_CAPABILITIES;
     use fandhe_container_core::cgroups::{CgroupName, ContainerCgroup, DelegatedCgroup};
@@ -172,12 +177,16 @@ mod linux {
         escape_probe_mount, probe_denied_syscalls_for_test, probe_escape_syscall,
         probe_kcmp_self_for_test,
     };
+    use fandhe_container_core::injected_files::{
+        InjectedContent, InjectedFileMode, InjectedFileSet, InjectedFileSpec,
+    };
     use fandhe_container_core::observability::OpRecorder;
     use fandhe_container_core::oci_runtime::{
-        ProcessExit, ProcessLauncher, ProductionLauncher, StartTimeouts, SubordinateIdSource,
-        create, start,
+        LaunchIpcMode, LaunchOptions, ProcessExit, ProcessLauncher, ProductionLauncher,
+        StartTimeouts, SubordinateIdSource, create, start,
     };
     use fandhe_container_core::state_store::{FileStateStore, StateRoot};
+    use fandhe_container_core::tmpfs::{TmpfsMountSet, TmpfsMountSpec};
     use fandhe_container_core::traits::{
         ContainerId, ContainerState, CreateRequest, ErrorCode, GetStateRequest, StartRequest,
         StateStore, TraitError,
@@ -198,6 +207,12 @@ mod linux {
     /// シナリオ D の bind 先のコンテナ内パスと、書くファイル名。
     const BIND_DEST: &str = "/data";
     const BIND_FILE: &str = "from-container";
+    /// シナリオ S（起動オプション。SUP-12・CORE-5・SEC-1・#2625）の注入ファイルのコンテナ内パス・内容（ダミー値）・モード。
+    const LO_SECRET_PATH: &str = "/secrets/token";
+    const LO_SECRET_CONTENT: &str = "dummy-secret-for-launch-options-test";
+    const LO_SECRET_MODE: u32 = 0o440;
+    /// シナリオ S で指定する tmpfs のコンテナ内パス。
+    const LO_TMPFS_DEST: &str = "/run";
     /// 1 行の長さの上限（無制限確保を避ける。REPAIR-5 と同趣旨）。
     const LINE_MAX: u64 = 4096;
     /// 受け取る行数の上限。
@@ -416,6 +431,41 @@ mod linux {
                 },
             );
             emit(format!("BIND_OPTS {opts}"));
+        }
+        // シナリオ S（起動オプション。#2625）: IPC namespace の識別子・指定 tmpfs の種別・`/dev/shm` の有無・注入ファイル。
+        if std::env::args().any(|a| a == "--with-launch-options") {
+            let ipc = std::fs::read_link("/proc/self/ns/ipc").map_or_else(
+                |e| format!("error:{:?}", e.kind()),
+                |p| p.display().to_string(),
+            );
+            emit(format!("LO_IPC {ipc}"));
+            let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+            // mountinfo の 5 番目がマウント先、`-` の次が fs 種別。
+            let fstype_of = |dest: &str| -> String {
+                info.lines()
+                    .filter_map(|l| {
+                        let f: Vec<&str> = l.split_whitespace().collect();
+                        let dash = f.iter().position(|x| *x == "-")?;
+                        (f.get(4).copied() == Some(dest))
+                            .then(|| f.get(dash + 1).copied().unwrap_or("").to_string())
+                    })
+                    .next_back()
+                    .unwrap_or_else(|| "not-mounted".to_string())
+            };
+            emit(format!(
+                "LO_TMPFS {LO_TMPFS_DEST} {}",
+                fstype_of(LO_TMPFS_DEST)
+            ));
+            emit(format!("LO_SHM {}", fstype_of("/dev/shm")));
+            emit(format!("LO_SECRET_DIR {}", fstype_of("/secrets")));
+            let content = std::fs::read_to_string(LO_SECRET_PATH)
+                .unwrap_or_else(|e| format!("error:{:?}", e.kind()));
+            emit(format!("LO_SECRET {content}"));
+            let mode = std::fs::metadata(LO_SECRET_PATH).map_or_else(
+                |e| format!("error:{:?}", e.kind()),
+                |m| format!("{:o}", m.permissions().mode() & 0o777),
+            );
+            emit(format!("LO_SECRET_MODE {mode}"));
         }
         emit(PROBE_READY.to_string());
         // シナリオ P（名前だけの args[0]。#2314）: READY の後に指定の終了コードで終わる。
@@ -734,6 +784,7 @@ mod linux {
         scenario_f_bind_over_protected_path_refused(&env, tag);
         scenario_g_devtmpfs_bind_refused(&env, tag);
         scenario_h_state_root_moved_after_start(&env, tag);
+        scenario_s_launch_options(&env, tag);
         if subordinate_requested() {
             scenario_i_subordinate_ids(&env, tag);
         } else {
@@ -748,6 +799,7 @@ mod linux {
         scenario_o_user_outside_mapping_refused(&env, tag);
         scenario_p_bare_name_entrypoint(&env, tag);
         scenario_r_cwd_relative_entrypoint(&env, tag);
+        scenario_s_entrypoint_violation_recorded(&env, container, tag);
         scenario_q_exit_signal_via_relay(&env, container, tag);
         if subordinate_requested() {
             scenario_i_user_applied(tag);
@@ -1026,6 +1078,110 @@ mod linux {
             assert_eq!(on_host, BIND_CONTENT);
             println!(
                 "production_launcher: scenario=bind-mount pid={pid} dest={BIND_DEST} visible on host, nosuid+nodev"
+            );
+        }));
+        let (_record, process) = started.into_parts();
+        let terminated = process.terminate(timeout());
+        if let Err(p) = verified {
+            if let Err(e) = &terminated {
+                eprintln!(
+                    "production_launcher: terminate after failed verification also failed: {e:?}"
+                );
+            }
+            std::panic::resume_unwind(p);
+        }
+        terminated.expect("terminate");
+        let (rx, reader) = reader_slot.take().expect("reader slot");
+        assert!(
+            eventually(|| !Path::new(&format!("/proc/{pid}")).exists()),
+            "/proc/{pid} must disappear after terminate"
+        );
+        reader.join().expect("join reader");
+        drop(rx);
+        assert!(
+            children_of_self().is_empty(),
+            "no child may remain after terminate"
+        );
+    }
+
+    /// シナリオ S(SUP-12・CORE-5・SEC-1・#2625): `ProductionLauncher::builder().launch_options(..)` で渡した
+    /// `--ipc=host` + `--tmpfs /run` + 注入ファイルが、`create` → `start` の実プロセスへ実効状態として届くことを
+    /// 具体値で照合する(IPC namespace の識別子がホストと一致・`/run` が tmpfs・`/dev/shm` を載せない・注入ファイルの
+    /// 内容とモード・注入ディレクトリが専用 tmpfs)。supervisor の `ContainerOptions::launch_options` から同じ
+    /// builder 呼び出しへ至る変換は supervisor 側の単体試験が担う。
+    fn scenario_s_launch_options(env: &Env, tag: u32) {
+        let mut tmpfs = TmpfsMountSet::new();
+        tmpfs
+            .push(TmpfsMountSpec::new(LO_TMPFS_DEST, None).expect("tmpfs spec"))
+            .expect("push tmpfs");
+        let mut inject = InjectedFileSet::new();
+        inject
+            .push(
+                InjectedFileSpec::new(
+                    LO_SECRET_PATH,
+                    InjectedContent::from_bytes(LO_SECRET_CONTENT.as_bytes().to_vec())
+                        .expect("content"),
+                    InjectedFileMode::new(LO_SECRET_MODE).expect("mode"),
+                )
+                .expect("inject spec"),
+            )
+            .expect("push inject");
+        let options =
+            LaunchOptions::new(tmpfs, inject, LaunchIpcMode::Host).expect("launch options");
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(
+            ProductionLauncher::builder()
+                .privilege(IsolationPrivilege::RootlessSingleId)
+                .audit_sink(Arc::new(MemSink(std::sync::Mutex::new(Vec::new()))))
+                .launch_options(options)
+                .build()
+                .expect("build launcher with launch options"),
+        );
+        let host_ipc = std::fs::read_link("/proc/self/ns/ipc")
+            .expect("host ipc ns")
+            .display()
+            .to_string();
+
+        let bundle = Bundle::new("s");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        write_config(&bundle, &ld, &["--with-launch-options"], json!([]));
+        let id = ContainerId::new(format!("plt{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+
+        wait_single_thread();
+        let started = start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        )
+        .unwrap_or_else(|e| panic!("start failed: {:?} {}", e.code(), e.message()));
+        let pid = started.process().pid();
+        let mut reader_slot: Option<(mpsc::Receiver<String>, std::thread::JoinHandle<()>)> = None;
+        let verified = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(started.record().status().state(), ContainerState::Running);
+            let output = started.process().take_output().expect("container output");
+            let stdout = output.stdout.expect("container stdout");
+            reader_slot = Some(spawn_reader(stdout));
+            let lines = collect_probe(&reader_slot.as_ref().expect("reader slot").0);
+            // ホストから見た PID 1 の IPC namespace も、コンテナ内の見え方も、起動側と同じ。
+            let from_host = std::fs::read_link(format!("/proc/{pid}/ns/ipc"))
+                .expect("container ipc ns from host")
+                .display()
+                .to_string();
+            assert_eq!(from_host, host_ipc);
+            assert_eq!(value_of(&lines, "LO_IPC"), host_ipc);
+            assert_eq!(
+                value_of(&lines, "LO_TMPFS"),
+                format!("{LO_TMPFS_DEST} tmpfs")
+            );
+            // `--ipc=host` では専用の `/dev/shm` を載せない。
+            assert_eq!(value_of(&lines, "LO_SHM"), "not-mounted");
+            assert_eq!(value_of(&lines, "LO_SECRET_DIR"), "tmpfs");
+            assert_eq!(value_of(&lines, "LO_SECRET"), LO_SECRET_CONTENT);
+            assert_eq!(value_of(&lines, "LO_SECRET_MODE"), "440");
+            println!(
+                "production_launcher: launch options reached the container (scenario=S ipc=host tmpfs={LO_TMPFS_DEST} secret mode=440)"
             );
         }));
         let (_record, process) = started.into_parts();
@@ -1950,6 +2106,110 @@ mod linux {
         drop(relay);
         wait_single_thread();
         assert!(eventually(|| children_of_self().is_empty()));
+    }
+
+    /// シナリオ S（SEC-4・SUP-6・SEC-1・REPAIR-3・#2624）: エントリポイントがランタイム自身のバイナリ（PID 1 の
+    /// `/proc/self/exe` と同じ `(st_dev, st_ino)`）の launch は、PID 1 が exec 前に状態 pipe へ返す違反が親（この
+    /// テストプロセス = C）で層 `entrypoint` に記録され、起動失敗になる。
+    ///
+    /// 構成: 試験バイナリ自身のディレクトリを `/host-bin` へ bind し、`args[0]` をその中の試験バイナリの絶対パスにする
+    /// （bind は inode と `st_dev` を保つため、PID 1 の `/proc/self/exe` と同一になる。PID 1 は fork 子で、exec していない）。
+    /// 照合: `start` が `Err`（`PermissionDenied`）、状態は Created のまま、子が残らない。launcher の記録先に層
+    /// `entrypoint`・`reason=entrypoint_is_runtime_binary`・当コンテナの ID・パスなしのレコードがちょうど 1 件。
+    /// 成功行は変えず、固有の行を前に出す（`ci.yml` の grep は最終行だけを見る）。
+    fn scenario_s_entrypoint_violation_recorded(
+        env: &Env,
+        container: &Arc<ContainerCgroup>,
+        tag: u32,
+    ) {
+        struct RecSink(std::sync::Mutex<Vec<AuditRecord>>);
+        impl AuditSink for RecSink {
+            fn record(&self, record: &AuditRecord) -> Result<(), TraitError> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(record.clone());
+                Ok(())
+            }
+        }
+        const HOST_BIN: &str = "/host-bin";
+        let exe = std::env::current_exe().expect("current_exe");
+        let exe_dir = exe.parent().expect("exe dir").to_path_buf();
+        let exe_name = exe.file_name().and_then(|n| n.to_str()).expect("exe name");
+
+        let sink = Arc::new(RecSink(std::sync::Mutex::new(Vec::new())));
+        let join_container = Arc::clone(container);
+        let launcher = ProductionLauncher::builder()
+            .privilege(IsolationPrivilege::RootlessSingleId)
+            .audit_sink(Arc::clone(&sink) as Arc<dyn AuditSink>)
+            .cgroup_join_source(move || join_container.join_hook())
+            .build()
+            .expect("build the launcher with a recording sink");
+        let launcher: Arc<dyn ProcessLauncher> = Arc::new(launcher);
+
+        let bundle = Bundle::new("s");
+        let ld = make_rootfs(&bundle.rootfs(), true);
+        mkdir(&bundle.rootfs().join(HOST_BIN.trim_start_matches('/')));
+        let config = json!({
+            "ociVersion": "1.2.0",
+            "root": {"path": "rootfs", "readonly": false},
+            "hostname": HOSTNAME,
+            "process": {
+                "user": {"uid": 0, "gid": 0},
+                "args": [format!("{HOST_BIN}/{exe_name}")],
+                "env": ["PATH=/", "TERM=dumb", format!("LD_LIBRARY_PATH={ld}")],
+                "cwd": "/"
+            },
+            "mounts": [{
+                "destination": HOST_BIN,
+                "type": "bind",
+                "source": exe_dir.to_str().expect("utf8 exe dir"),
+                "options": ["bind", "rw"]
+            }],
+            "linux": {"namespaces": [
+                {"type": "pid"}, {"type": "mount"}, {"type": "uts"}, {"type": "ipc"}, {"type": "user"}
+            ]}
+        });
+        std::fs::write(
+            bundle.dir.join("config.json"),
+            serde_json::to_vec(&config).expect("serialize config"),
+        )
+        .expect("write config.json");
+        let id = ContainerId::new(format!("pls{tag}")).expect("id");
+        do_create(env, &bundle, &id);
+        wait_single_thread();
+        match start(
+            &env.store,
+            &env.recorder,
+            &launcher,
+            &StartRequest::new(id.clone()),
+            &timeouts(),
+        ) {
+            Ok(started) => {
+                let _ = started.into_parts().1.terminate(timeout());
+                panic!("a launch of the runtime binary itself must be refused");
+            }
+            Err(e) => assert_eq!(e.code(), ErrorCode::PermissionDenied, "{}", e.message()),
+        }
+        assert_eq!(state_of(&env.store, &id), ContainerState::Created);
+        let records = sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(records.len(), 1, "exactly one record: {records:?}");
+        assert_eq!(records[0].layer(), AuditLayer::Entrypoint);
+        assert_eq!(
+            records[0].reason().map(|r| r.as_str()),
+            Some("entrypoint_is_runtime_binary")
+        );
+        assert_eq!(records[0].container_id(), Some(&id));
+        assert_eq!(records[0].path(), None);
+        drop(launcher);
+        assert!(eventually(|| children_of_self().is_empty()));
+        println!(
+            "production_launcher: entrypoint violation recorded once and launch refused (scenario=S)"
+        );
     }
 
     /// シナリオ P（OCI-1・TASK-55 追補・#2314）: 名前だけの `process.args[0]` を、コンテナ内の `process.env` の

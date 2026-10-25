@@ -115,7 +115,12 @@ impl MountedTargets {
     ///
     /// - `Implicit{Dev|DevPts}` は専用 `/dev` の段、`Implicit{DevShm}` は tmpfs の段で宛先が `/dev/shm` の件
     /// - `Mount{index}` は bind の段の同じ `index`
-    pub(crate) fn expected_for(&self, origin: &RuleOrigin) -> Option<&MountIdentity> {
+    /// - `UserTmpfs` は tmpfs の段で宛先がルールの宛先（`destination`）と一致する件（SUP-12・#2625）
+    pub(crate) fn expected_for(
+        &self,
+        origin: &RuleOrigin,
+        destination: &str,
+    ) -> Option<&MountIdentity> {
         let found = self.0.iter().rev().find(|t| match origin {
             RuleOrigin::Implicit {
                 mount: ImplicitDevMount::DevShm,
@@ -124,6 +129,7 @@ impl MountedTargets {
             }
             RuleOrigin::Implicit { mount } => t.by == MountedBy::DefaultDevices(*mount),
             RuleOrigin::Mount { index } => t.by == MountedBy::Bind { index: *index },
+            RuleOrigin::UserTmpfs => t.by == MountedBy::Tmpfs && t.destination == destination,
             _ => false,
         });
         found.map(|t| &t.identity)
@@ -178,7 +184,8 @@ mod tests {
         ] {
             m.push(t).expect("capacity");
         }
-        let id = |o: RuleOrigin| m.expected_for(&o).map(|i| i.mnt_id);
+        let id = |o: RuleOrigin| m.expected_for(&o, "").map(|i| i.mnt_id);
+        let tmpfs = |d: &str| m.expected_for(&RuleOrigin::UserTmpfs, d).map(|i| i.mnt_id);
         assert_eq!(
             id(RuleOrigin::Implicit {
                 mount: ImplicitDevMount::Dev
@@ -201,6 +208,9 @@ mod tests {
         assert_eq!(id(RuleOrigin::Mount { index: 1 }), Some(16));
         assert_eq!(id(RuleOrigin::Mount { index: 2 }), None);
         assert_eq!(id(RuleOrigin::Root), None);
+        // 利用者 tmpfs は tmpfs の段の同じ宛先で引く(bind の段は拾わない)。
+        assert_eq!(tmpfs("/run"), Some(12));
+        assert_eq!(tmpfs("/a"), None);
         assert_eq!(m.len(), 7);
         assert_eq!(m.targets().len(), 7);
     }

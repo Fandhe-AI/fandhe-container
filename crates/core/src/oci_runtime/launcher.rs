@@ -67,7 +67,9 @@
 //! - **`process.cwd` と `process.user`(OCI-1・TASK-29・SEC-5)**: cwd は子が pivot 直後に fd 起点・symlink 非追従で
 //!   適用する(symlink を含む cwd は追従せず拒否。Docker/runc と異なる)。uid・gid は fork の前に `check_user_mapped` で
 //!   user namespace の写像と照合し(単一 ID 写像は 0/0 のみ)、capability 削減段が既存の資格情報の切り替えで適用する。
-//!   補助グループ(`additionalGids`)・名前形式の `User` の解決・exec 経路の非 root は未対応
+//!   補助グループ(`additionalGids`)は uid・gid と同様に fork の前に gid の写像と照合し
+//!   (`check_additional_gids_mapped`。単一 ID 写像では指定を拒否)、同じ削減段が `setgroups(list)` で適用して読み戻す(#2667)。
+//!   名前形式の `User` の解決・exec 経路の非 root は未対応
 //! - **権限モデル**: `RootlessSingleId` と `RootlessSubordinateIds`(#2009)を扱う。`RootfulHostRoot`
 //!   (SEC-5・CORE-7・CORE-9。start が user namespace を必須とするため、start を通る構成では到達しない。
 //!   許すかはオーナー判断待ちで #2241・`docs/design/rootful-host-root.md`)は、決まるまで `Unimplemented` で拒否する
@@ -975,6 +977,39 @@ impl Ledger {
     }
 }
 
+/// `process.user.additionalGids` が user namespace の gid 写像に含まれることを fork の前に確かめる(純関数。
+/// 副作用なし。OCI-1・SEC-5・CORE-6・#2667)。
+///
+/// 空なら常に `Ok`。`RootlessSingleId` の写像は `setgroups` を `deny` にするため、非空の指定は適用できず
+/// 黙って落とさずに拒否する。`RootlessSubordinateIds` は全 gid が `gid_map` に含まれる場合だけ許す
+/// (写像外の gid は子の `setgroups` が `EINVAL` になり構造化されない)。メッセージは固定文言で、値を含めない(ERR-1)。
+#[cfg(target_os = "linux")]
+fn check_additional_gids_mapped(
+    privilege: IsolationPrivilege,
+    gid_map: Option<&IdMapSet>,
+    gids: &[u32],
+) -> Result<(), TraitError> {
+    if gids.is_empty() {
+        return Ok(());
+    }
+    match (privilege, gid_map) {
+        (IsolationPrivilege::RootlessSubordinateIds, Some(g)) => {
+            if gids.iter().all(|gid| g.host_id_of(*gid).is_some()) {
+                Ok(())
+            } else {
+                Err(TraitError::new(
+                    ErrorCode::FailedPrecondition,
+                    "process.user.additionalGids is not mapped in the user namespace (SEC-5)",
+                ))
+            }
+        }
+        _ => Err(TraitError::new(
+            ErrorCode::FailedPrecondition,
+            "process.user.additionalGids requires a subordinate id mapping (SEC-5)",
+        )),
+    }
+}
+
 /// `process.user` の (uid, gid) が user namespace の写像に含まれることを fork の前に確かめる(純関数。副作用なし。
 /// OCI-1・SEC-5)。
 ///
@@ -1129,6 +1164,11 @@ impl Inner {
             self.subordinate.as_ref().map(|s| (&s.uid, &s.gid)),
             spec.user(),
         )?;
+        check_additional_gids_mapped(
+            self.privilege,
+            self.subordinate.as_ref().map(|s| &s.gid),
+            spec.additional_gids(),
+        )?;
         let means = if self.cgroup_join_source.is_some() {
             CgroupJoinMeans::Provided
         } else {
@@ -1243,6 +1283,7 @@ impl Inner {
         let mut stages = StagePipeline::new()
             .with_seccomp_delivery(self.seccomp_delivery)
             .with_process_ids(uid, gid)
+            .with_supplementary_groups(spec.additional_gids().to_vec())
             .with_capabilities(capabilities)
             .with_landlock(ruleset)
             .map_err(|e| to_trait_error(&e))?;
@@ -2354,6 +2395,48 @@ mod tests {
         }
         for bad in [(65536, 1), (1, 65536), (65536, 65536), (u32::MAX, 0)] {
             assert!(check_user_mapped(sub, r, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// OCI-1・SEC-5・CORE-6（#2667）: 補助グループは範囲写像で全件が gid 写像内なら許し、1 件でも外れれば拒否する。
+    /// 単一 ID 写像では非空を固定文言で拒否し、空は常に許す。
+    #[test]
+    fn oci1_check_additional_gids_mapped_boundaries() {
+        use crate::exec::IdMapping;
+        use crate::rootless::IdMapSet;
+        let gid_map = IdMapSet::new(vec![
+            IdMapping {
+                container_id: 0,
+                host_id: 1000,
+                count: 1,
+            },
+            IdMapping {
+                container_id: 1,
+                host_id: 200_000,
+                count: 65535,
+            },
+        ])
+        .unwrap();
+        let single = IsolationPrivilege::RootlessSingleId;
+        let sub = IsolationPrivilege::RootlessSubordinateIds;
+        assert!(check_additional_gids_mapped(single, None, &[]).is_ok());
+        assert!(check_additional_gids_mapped(sub, Some(&gid_map), &[]).is_ok());
+        assert!(check_additional_gids_mapped(sub, Some(&gid_map), &[0, 1, 65535]).is_ok());
+        for bad in [&[65536][..], &[1, 65536], &[u32::MAX]] {
+            let e = check_additional_gids_mapped(sub, Some(&gid_map), bad).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition, "{bad:?}");
+            assert_eq!(
+                e.message(),
+                "process.user.additionalGids is not mapped in the user namespace (SEC-5)"
+            );
+        }
+        for gids in [&[0][..], &[5, 6]] {
+            let e = check_additional_gids_mapped(single, None, gids).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::FailedPrecondition, "{gids:?}");
+            assert_eq!(
+                e.message(),
+                "process.user.additionalGids requires a subordinate id mapping (SEC-5)"
+            );
         }
     }
 

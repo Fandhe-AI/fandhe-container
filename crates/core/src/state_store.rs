@@ -1743,7 +1743,12 @@ struct LaunchIsolationDto {
     id_mapping: Option<IdMappingDto>,
     /// launch が適用した capability の許可集合（`CAP_*` 名。SEC-1・CRI-2・#2666）。無ければ記録なし
     /// （導入前の launch は OCI 既定集合で起動したため、exec は OCI 既定集合として扱う）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// キー欠落だけを旧記録として許し、`null` を含む配列以外は破損として拒否する（fail-closed）。
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "capabilities_array"
+    )]
     capabilities: Option<Vec<String>>,
 }
 
@@ -2019,6 +2024,14 @@ impl LaunchIsolationDto {
     }
 }
 
+/// `capabilities` のキーが在るとき配列だけを受ける（`null` は拒否。`default` がキー欠落を `None` にする）。
+fn capabilities_array<'de, D>(d: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<String>::deserialize(d).map(Some)
+}
+
 /// 記録された `CAP_*` 名を許可集合へ組み直す。件数は確保の前に既知の capability 数で検証し、未知名・
 /// OCI 既定外を含む集合は破損として拒否する（`ContainerCapabilities::restrict`。SEC-1・#2666）。
 fn capabilities_from_names(names: &[String]) -> Result<ContainerCapabilities, ()> {
@@ -2029,7 +2042,7 @@ fn capabilities_from_names(names: &[String]) -> Result<ContainerCapabilities, ()
     for n in names {
         set = set.with(Capability::from_name(n).ok_or(())?);
     }
-    ContainerCapabilities::restrict(set)
+    ContainerCapabilities::restrict(set).map_err(|_| ())
 }
 
 impl LandlockRuleDto {
@@ -3562,6 +3575,10 @@ mod tests {
         }
         let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
         v["capabilities"] = serde_json::json!("CAP_KILL");
+        assert!(serde_json::from_value::<LaunchIsolationDto>(v).is_err());
+        // 明示的な null は旧記録ではなく破損（SEC-1 fail-closed）。
+        let mut v = serde_json::to_value(LaunchIsolationDto::from_record(&iso(100))).unwrap();
+        v["capabilities"] = serde_json::Value::Null;
         assert!(serde_json::from_value::<LaunchIsolationDto>(v).is_err());
     }
 

@@ -354,6 +354,31 @@ impl CapabilitySet {
     }
 }
 
+/// OCI 既定集合に無い capability を許可集合へ入れようとして拒否したことを表すエラー（SEC-1・#2666）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityNotAllowed {
+    rejected: Vec<Capability>,
+}
+
+impl CapabilityNotAllowed {
+    /// 拒否した（OCI 既定集合に無い）capability を番号順に返す。
+    pub fn rejected(&self) -> &[Capability] {
+        &self.rejected
+    }
+}
+
+impl std::fmt::Display for CapabilityNotAllowed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("capabilities outside the OCI default set are not allowed:")?;
+        for c in &self.rejected {
+            write!(f, " {}", c.as_str())?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for CapabilityNotAllowed {}
+
 /// コンテナへ許可する capability 集合（SEC-1・CRI-2・#2666）。
 ///
 /// 作る経路を [`ContainerCapabilities::oci_default`] と、OCI 既定集合の部分集合だけを受ける
@@ -370,13 +395,16 @@ impl ContainerCapabilities {
         Self(CapabilitySet::oci_default())
     }
 
-    /// `set` が OCI 既定集合の部分集合なら許可集合にする。既定外を含めば `Err(())`。
-    #[allow(clippy::result_unit_err)]
-    pub fn restrict(set: CapabilitySet) -> Result<Self, ()> {
-        if set.is_subset_of(CapabilitySet::oci_default()) {
+    /// `set` が OCI 既定集合の部分集合なら許可集合にする。既定外を含めば、その capability を
+    /// 保持した [`CapabilityNotAllowed`] を返す（SEC-1・#2666）。
+    pub fn restrict(set: CapabilitySet) -> Result<Self, CapabilityNotAllowed> {
+        let default = CapabilitySet::oci_default();
+        if set.is_subset_of(default) {
             Ok(Self(set))
         } else {
-            Err(())
+            Err(CapabilityNotAllowed {
+                rejected: set.iter().filter(|c| !default.contains(*c)).collect(),
+            })
         }
     }
 

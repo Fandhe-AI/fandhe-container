@@ -465,7 +465,8 @@ fn group_gid(body: &[u8], name: &str) -> Option<u32> {
 fn passwd_name_of(body: &[u8], uid: u32) -> Option<String> {
     etc_fields(body).find_map(|f| {
         let (name, id) = (f.first()?, f.get(2)?.parse::<u32>().ok()?);
-        (id == uid).then(|| (*name).to_owned())
+        // 空の名前は不正エントリとして除く（空名が group の空メンバーに一致するのを防ぐ。#2667・SEC-5）。
+        (id == uid && !name.is_empty()).then(|| (*name).to_owned())
     })
 }
 
@@ -473,6 +474,10 @@ fn passwd_name_of(body: &[u8], uid: u32) -> Option<String> {
 ///
 /// グループ名が `user` と同じ行は除く（containerd の `WithAdditionalGIDs` と同じ。#2667）。形式が崩れた行は読み飛ばす。
 fn group_memberships(body: &[u8], user: &str) -> Vec<u32> {
+    // 空の検索名は空メンバー（`root:x:0:`）に一致して無関係な gid を混入させるため、何も返さない。
+    if user.is_empty() {
+        return Vec::new();
+    }
     let mut out: Vec<u32> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for f in etc_fields(body) {
@@ -1011,6 +1016,17 @@ mod tests {
             Some("app".to_owned())
         );
         assert_eq!(passwd_name_of(GROUPS_PASSWD.as_bytes(), 7), None);
+    }
+
+    /// CRI-2・SEC-5（#2667）: 空名の passwd 行は採用せず、空の検索名は `root:x:0:` のような空メンバー行に
+    /// 一致させない（gid 0 の混入を防ぐ）。
+    #[test]
+    fn cri2_empty_user_name_never_matches_groups() {
+        let passwd = ":x:1000:1000::/:/bin/sh\n";
+        assert_eq!(passwd_name_of(passwd.as_bytes(), 1000), None);
+        let group = b"root:x:0:\nwheel:x:10:app\n";
+        assert_eq!(group_memberships(group, ""), Vec::<u32>::new());
+        assert_eq!(group_memberships(group, "app"), vec![10]);
     }
 
     /// CRI-2・SEC-5（#2667）: 実効ユーザーと rootfs の `/etc/group` からイメージ由来の補助グループを求める。

@@ -1497,6 +1497,8 @@ mod linux {
 
     /// `run_probe_with` に `additionalGids` を指定できる版。ホストから見た補助グループを `HOST_GROUPS` 行として足す
     /// (OCI-1・SEC-5・CORE-6・#2667)。
+    // 既存の `run_probe_with` と同じ並びに `additionalGids` を足した試験用ヘルパーで、引数は呼び出し側の
+    // 試験ごとに全て異なる値を取る。構造体に束ねると 1 回限りの型が増えるため抑止する。
     #[allow(clippy::too_many_arguments)]
     fn run_probe_groups(
         env: &Env,

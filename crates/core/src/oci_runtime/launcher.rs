@@ -1229,10 +1229,15 @@ impl Inner {
             euid,
             egid,
         )?);
+        // `process.capabilities` の drop を解釈した許可集合（OCI 既定の部分集合）。launch の削減段へ渡し、同じ値を
+        // 分離の記録へ添えて exec の再適用が launch より広い集合を与えないようにする(SEC-1・CRI-2・#2666)。
+        let capabilities = spec.config().capabilities();
+        let isolation_record = isolation_record.with_capabilities(capabilities);
         let (uid, gid) = spec.user();
         let mut stages = StagePipeline::new()
             .with_seccomp_delivery(self.seccomp_delivery)
             .with_process_ids(uid, gid)
+            .with_capabilities(capabilities)
             .with_landlock(ruleset)
             .map_err(|e| to_trait_error(&e))?;
         if let Some(source) = &self.cgroup_join_source {
@@ -2418,7 +2423,8 @@ mod tests {
             .with_audit_coverage(crate::audit_log::AuditCoveragePolicy::BestEffort, coverage)
             .with_id_mapping(
                 recorded_id_mapping(rootless(), None, FAKE_EUID, FAKE_EGID).expect("id mapping"),
-            );
+            )
+            .with_capabilities(crate::capabilities::ContainerCapabilities::oci_default());
         assert!(
             record == expected,
             "record must come from the applied ruleset"

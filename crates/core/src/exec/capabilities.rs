@@ -3,7 +3,8 @@
 //! # 役割と呼び出し文脈
 //!
 //! ステージ列（`exec/stages.rs`）の第 2 段「capability 削減」の実体。呼び出したスレッドの
-//! capability を OCI 既定集合（[`CapabilitySet::oci_default`]。SEC-1）へ絞り込み、結果を読み戻して
+//! capability を許可集合（[`ContainerCapabilities`]。OCI 既定集合〔[`CapabilitySet::oci_default`]。SEC-1〕
+//! またはその部分集合）へ絞り込み、結果を読み戻して
 //! 検証する。ステージ列（`StagePipeline`）へは #173（TASK-37.2）で組み込み済みで、`StagePipeline::run_then`
 //! が差し替え不可の組み込み段として呼ぶ（返す [`CapabilityReport`] は終端クロージャへ渡る）。
 //! 制限適用の証跡は `stages.rs` の `run_then` が本関数の成功後に作る `LaunchReady`（#1714）で、[`CapabilityReport`]
@@ -18,8 +19,8 @@
 //!   あることを適用の前後で実行時に確認し、事前に満たさない・読めないときは何も変更せず
 //!   `FailedPrecondition`、適用中に増えたときは `Internal` で失敗する（fail-closed。他スレッドに強い
 //!   capability が残ったまま `Ok` を返さない）。関数自体も `pub(crate)` で、外部 crate から呼べない
-//! - 許可集合は OCI 既定集合に固定し、任意の集合を渡せる公開経路は持たない（設定から危険な
-//!   capability を足せない）
+//! - 許可集合は [`ContainerCapabilities`]（OCI 既定集合の部分集合だけを作れる型。drop だけを受ける。
+//!   #2666）に限り、任意の集合を渡せる経路は持たない（設定から危険な capability を足せない）
 //! - bounding set は `execve` 後の uid 0 プロセスの permitted の上限を決めるため、最初に縮める。
 //!   カーネルが知る全番号を `PR_CAPBSET_READ` で調べ、許可集合に無いものはすべて drop する。
 //!   本 crate の `Capability` が知らない新しい capability も drop される（fail-closed）
@@ -40,7 +41,7 @@ use std::os::fd::{AsFd as _, BorrowedFd};
 
 use super::setns::read_bounded_from;
 use super::{ExecError, IsolationStage, ThreadCountSource};
-use crate::capabilities::CapabilitySet;
+use crate::capabilities::{CapabilitySet, ContainerCapabilities};
 use crate::sys::{self, EINVAL, EPERM, SysError, ThreadCaps};
 use crate::traits::types::ErrorCode;
 
@@ -285,7 +286,12 @@ pub struct CapabilityReport {
 // 本番の launch は ids を渡せる `apply_default_capabilities_with` を使う。本関数は ids なしの単体テストの入口。
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError> {
-    apply_default_capabilities_with(&mut ThreadCountSource::ProcSelf, None, None)
+    apply_default_capabilities_with(
+        &mut ThreadCountSource::ProcSelf,
+        None,
+        None,
+        ContainerCapabilities::oci_default(),
+    )
 }
 
 /// [`apply_default_capabilities`] の、スレッド数の取得元を差し替えられる版（SUP-6・TASK-163.4・#503）。
@@ -298,13 +304,16 @@ pub(crate) fn apply_default_capabilities() -> Result<CapabilityReport, ExecError
 ///
 /// `ids` が `Some` なら、補助グループの消去の後・bounding set の削減の前に、gid → uid の順で `process.user` の値へ
 /// 揃えて読み戻す（rootless の exec が user namespace へ参加した後。#1462）。launch は非 root の `process.user` のときだけ `Some`（OCI-1）。
+///
+/// `allowed` は許可集合。exec は launch 時の分離の記録の集合を渡し、launch より広い集合では動かさない（SEC-1・#2666）。
 pub(crate) fn apply_default_capabilities_with(
     threads: &mut ThreadCountSource,
     own_proc_dir: Option<BorrowedFd<'_>>,
     ids: Option<ProcessIds>,
+    allowed: ContainerCapabilities,
 ) -> Result<CapabilityReport, ExecError> {
     apply_capabilities_single_threaded(
-        CapabilitySet::oci_default(),
+        allowed.bounding(),
         ids,
         &mut RealKernel {
             threads,
@@ -323,9 +332,10 @@ pub(crate) fn apply_default_capabilities_with(
 pub(crate) fn apply_default_capabilities_for_launch(
     threads: &mut ThreadCountSource,
     ids: Option<ProcessIds>,
+    allowed: ContainerCapabilities,
 ) -> Result<CapabilityReport, ExecError> {
     apply_capabilities_single_threaded(
-        CapabilitySet::oci_default(),
+        allowed.bounding(),
         ids,
         &mut RealKernel {
             threads,
@@ -742,7 +752,7 @@ pub(super) mod testing {
     use std::cell::Cell;
 
     use super::{
-        CapabilityReport, CapabilitySet, ExecError, PreJoinGroups, ProcessIds,
+        CapabilityReport, ContainerCapabilities, ExecError, PreJoinGroups, ProcessIds,
         apply_capabilities_single_threaded,
     };
     use crate::sys::{EINVAL, EPERM, SysError, ThreadCaps};
@@ -762,18 +772,24 @@ pub(super) mod testing {
     /// `process.user`（0/0 のときは `None`。OCI-1・SEC-5）。
     pub(in crate::exec) fn apply_default_capabilities_ids(
         ids: Option<ProcessIds>,
+        allowed: ContainerCapabilities,
     ) -> Result<CapabilityReport, ExecError> {
-        apply_with_ids(ids)
+        apply_with_ids(ids, allowed)
     }
 
-    fn apply_with_ids(ids: Option<ProcessIds>) -> Result<CapabilityReport, ExecError> {
+    fn apply_with_ids(
+        ids: Option<ProcessIds>,
+        allowed: ContainerCapabilities,
+    ) -> Result<CapabilityReport, ExecError> {
         crate::exec::no_new_privs::testing::rec("capability_drop");
         let mut k = Fake::new();
         k.drop_err = DROP_ERR.with(Cell::take);
-        apply_capabilities_single_threaded(CapabilitySet::oci_default(), ids, &mut k)
+        ALLOWED_SEEN.with(|c| c.set(Some(allowed)));
+        apply_capabilities_single_threaded(allowed.bounding(), ids, &mut k)
     }
 
     thread_local! {
+        static ALLOWED_SEEN: Cell<Option<ContainerCapabilities>> = const { Cell::new(None) };
         static GROUPS_BEFORE_JOIN: Cell<usize> = const { Cell::new(0) };
     }
 
@@ -828,9 +844,15 @@ pub(super) mod testing {
         _threads: &mut super::ThreadCountSource,
         _own_proc_dir: Option<std::os::fd::BorrowedFd<'_>>,
         ids: Option<ProcessIds>,
+        allowed: ContainerCapabilities,
     ) -> Result<CapabilityReport, ExecError> {
         IDS_SEEN.with(|c| c.set(Some(ids)));
-        apply_with_ids(ids)
+        apply_with_ids(ids, allowed)
+    }
+
+    /// 直近の偽物の適用に渡された許可集合（読むと消える。launch / exec が記録の集合を渡したことの照合用）。
+    pub(in crate::exec) fn take_allowed_seen() -> Option<ContainerCapabilities> {
+        ALLOWED_SEEN.with(Cell::take)
     }
 
     /// 偽カーネルの状態と、呼び出し記録・注入するエラー。
@@ -1063,6 +1085,35 @@ mod tests {
         assert_eq!(report.retained_after_exec, CapabilitySet::oci_default());
         assert_eq!(report.bounding, CapabilitySet::oci_default());
         assert!(report.unavailable.is_empty());
+    }
+
+    /// SEC-1・CRI-2・#2666: 許可集合が既定から `CAP_NET_RAW`・`CAP_MKNOD` を除いた 12 個のとき、その 2 つも
+    /// bounding から落ち、granted・bounding が指定集合になる（ビット値は `a80425fb` から 2 ビットを除いた値）。
+    #[test]
+    fn sec1_cri2_dropped_caps_leave_bounding() {
+        let allowed = CapabilitySet::oci_default().intersect(
+            CapabilitySet::empty()
+                .with(Capability::Chown)
+                .with(Capability::DacOverride)
+                .with(Capability::Fsetid)
+                .with(Capability::Fowner)
+                .with(Capability::Setgid)
+                .with(Capability::Setuid)
+                .with(Capability::Setfcap)
+                .with(Capability::Setpcap)
+                .with(Capability::NetBindService)
+                .with(Capability::SysChroot)
+                .with(Capability::Kill)
+                .with(Capability::AuditWrite),
+        );
+        assert_eq!(allowed.len(), 12);
+        let mut k = Fake::new();
+        let report = apply_capabilities(allowed, None, &mut k).unwrap();
+        assert_eq!(k.bounding, 0xA004_05FB);
+        assert_eq!(report.granted, allowed);
+        assert_eq!(report.bounding, allowed);
+        assert!(report.bounding_dropped.contains(&13));
+        assert!(report.bounding_dropped.contains(&27));
     }
 
     /// SEC-1: 本 crate が知らない新しい capability（41〜45）も drop される。
@@ -1631,7 +1682,13 @@ mod tests {
             ThreadCountSource::PreOpened(std::fs::File::open("/dev/null").expect("null")),
         ];
         for source in &mut sources {
-            let e = apply_default_capabilities_with(source, None, None).unwrap_err();
+            let e = apply_default_capabilities_with(
+                source,
+                None,
+                None,
+                ContainerCapabilities::oci_default(),
+            )
+            .unwrap_err();
             assert_eq!(e.code, ErrorCode::FailedPrecondition);
             assert_eq!(e.stage, IsolationStage::CapabilityDrop);
             assert_eq!(

@@ -42,12 +42,13 @@
 //!   （再現性があり、コンテナ側から exec の値を操作できない）。記録の hard が exec を起動したプロセスの hard を
 //!   超える場合は `EPERM` で拒否する（rlimit は対象の user namespace へ参加した後に適用するため、hard の引き上げには
 //!   初期 user namespace の `CAP_SYS_RESOURCE` が要る。rootless では fail-closed になる）
-//! - **capability は OCI 既定集合へ削減する**（SEC-1）: launch と同じ関数・同じ集合
-//!   （`CapabilitySet::oci_default` 固定）で、bounding set を許可集合まで落とし、ambient を空にし、
-//!   effective = permitted = 許可集合 ∩ 現在の permitted、inheritable = 空にして読み戻す。launch 経路も
-//!   `config.json` の `process.capabilities` を解釈せず同じ固定集合を使うため、exec が launch より広い
-//!   集合を与えることはない（設定による絞り込みは launch・exec とも未実装）。pid1 が起動後に自分の
-//!   capability をさらに落としていても、exec は launch がコンテナへ与えた集合（OCI 既定）で動く。uid / gid・
+//! - **capability は launch と同じ許可集合へ削減する**（SEC-1・CRI-2・#2666）: launch と同じ関数・同じ集合で、
+//!   bounding set を許可集合まで落とし、ambient を空にし、effective = permitted = 許可集合 ∩ 現在の permitted、
+//!   inheritable = 空にして読み戻す。許可集合は launch 時の分離の記録（`LaunchIsolationRecord::capabilities`）の
+//!   値で、`process.capabilities` の drop で絞った集合も launch と一致する。記録が無い旧記録は OCI 既定集合
+//!   （導入前の launch は必ず OCI 既定集合で起動した）。許可集合の型は OCI 既定の部分集合だけを表すため、
+//!   exec が launch より広い集合を与えることはない。pid1 が起動後に自分の
+//!   capability をさらに落としていても、exec は launch がコンテナへ与えた集合で動く。uid / gid・
 //!   securebits は launch・exec とも変更しない（呼び出しプロセスの値を引き継ぐ）。ただし user namespace へ参加した
 //!   場合（下記）は、補助グループの消去の後・bounding set の削減の前に、gid → uid の順で `process.user` の値へ揃える。spec（SUP-6）が
 //!   exec での capability 削減に言及しない点は確認事項で、「launch より弱くしない」側に倒している
@@ -203,6 +204,7 @@ use super::{
     ExecError, ExecWorkerProof, IsolationStage, Pid1Target, StageKind, SupplementaryGroups,
     ThreadCountSource, ViolationReason, no_new_privs,
 };
+use crate::capabilities::ContainerCapabilities;
 use crate::landlock::LandlockRuleset;
 use crate::launch_isolation::{LaunchIsolationRecord, RootIdentity};
 use crate::oci_runtime::{OciConfig, RootfsDir};
@@ -257,6 +259,10 @@ pub struct ExecRestrictions {
     /// seccomp の段で listener を exec の親へ渡す送信口（SEC-4・SUP-6・#2385）。本番の再適用（`Complete`）では必須
     /// （[`Self::with_seccomp_listener`] で付ける。無ければ何も適用せず拒否する）。観測用の経路では任意。
     seccomp_listener: Option<ExecListenerSender>,
+    /// 再適用する capability の許可集合。launch 時の分離の記録から取る（`process.capabilities` の drop を
+    /// launch と同じにする。SEC-1・CRI-2・#2666）。記録が無い旧記録・観測用の経路は OCI 既定集合
+    /// （導入前の launch は必ず OCI 既定集合で起動したため、これが旧記録の正しい値）。
+    capabilities: ContainerCapabilities,
 }
 
 /// 制限を exec の対象（pid1）へ束縛する材料（SUP-6・SEC-1・TASK-163.4）。
@@ -943,6 +949,9 @@ fn prepare_with_launch(
         ids: None,
         seal_policy,
         seccomp_listener: None,
+        capabilities: launch
+            .capabilities()
+            .unwrap_or_else(ContainerCapabilities::oci_default),
     })
 }
 
@@ -1063,6 +1072,7 @@ fn reapply_inner(
         ids,
         seal_policy,
         seccomp_listener,
+        capabilities: allowed_capabilities,
     } = restrictions;
     if owner_pid != std::process::id() {
         return Err(ExecError::new(
@@ -1103,8 +1113,13 @@ fn reapply_inner(
     // capability 削減は、先頭で補助グループも空にする（launch 経路と同じ関数。#1457）。
     let capabilities = if drop_capabilities {
         Some(
-            apply_default_capabilities_with(&mut threads, Some(binding.proc_dir.as_fd()), ids)
-                .map_err(|e| e.at_stage(IsolationStage::CapabilityDrop))?,
+            apply_default_capabilities_with(
+                &mut threads,
+                Some(binding.proc_dir.as_fd()),
+                ids,
+                allowed_capabilities,
+            )
+            .map_err(|e| e.at_stage(IsolationStage::CapabilityDrop))?,
         )
     } else {
         None
@@ -1362,6 +1377,7 @@ mod tests {
             ids: None,
             seal_policy: SealPolicy::unrestricted(),
             seccomp_listener: Some(test_listener_sender()),
+            capabilities: ContainerCapabilities::oci_default(),
         }
     }
 
@@ -2298,6 +2314,42 @@ mod tests {
             // Landlock 未対応のカーネルでは検出で拒否される（fail-closed）。
             Err(e) => assert_eq!(e.stage, IsolationStage::Landlock),
         }
+    }
+
+    /// SEC-1・CRI-2・#2666: exec の許可集合は launch 時の記録の値で、記録が無い旧記録は OCI 既定集合になり、
+    /// 再適用は準備で決めた集合を capability 段へ渡す（launch より広い集合では動かさない）。
+    #[test]
+    fn sec1_cri2_exec_capabilities_follow_the_launch_record() {
+        use crate::capabilities::{Capability, CapabilitySet};
+        use crate::exec::capabilities::testing::take_allowed_seen;
+        let narrowed = ContainerCapabilities::restrict(
+            CapabilitySet::empty()
+                .with(Capability::Kill)
+                .with(Capability::Chown),
+        )
+        .expect("subset of the default");
+        let legacy = hand_made_record(identity_of(Path::new("/")), 0xFFFF);
+        let recorded = legacy.clone().with_capabilities(narrowed);
+        for (launch, want) in [
+            (&legacy, ContainerCapabilities::oci_default()),
+            (&recorded, narrowed),
+        ] {
+            // Landlock 未対応のカーネルでは検出で拒否される（fail-closed）ため、通った場合だけ照合する。
+            if let Ok(r) =
+                prepare_with_launch(launch, launch.root(), Rlimits::default(), own_binding())
+            {
+                assert_eq!(r.capabilities, want);
+            }
+        }
+        let _ = take();
+        let _ = take_allowed_seen();
+        let mut r = restrictions(std::process::id());
+        r.capabilities = narrowed;
+        let report = reapply_restrictions(r).expect("reapply");
+        assert_eq!(take_allowed_seen(), Some(narrowed));
+        assert_eq!(report.capability_bounding_dropped, 39);
+        let _ = take();
+        let _ = crate::exec::rlimits::testing::take_sets();
     }
 
     /// SUP-6・SEC-1・SEC-4・#1468: 記録した `/` が自プロセスの `/` と同じ（壊れた記録・ホストの `/` を指す記録）なら、

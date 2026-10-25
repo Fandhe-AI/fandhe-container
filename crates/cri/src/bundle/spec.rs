@@ -30,14 +30,19 @@
 //!   `ImageRootfsSource` が展開後の rootfs の passwd で解決した値を [`ImageDefaults::resolved_run_as_username`] で受ける
 //!   （#2664・CRI-2・SEC-5）。`run_as_user` との同時指定は `INVALID_ARGUMENT`、`run_as_group` は `run_as_user` か
 //!   `run_as_username` があるときだけ有効。解決結果が無ければ `UNIMPLEMENTED`（root へ黙って落とさない）。
+//! - `capabilities.drop_capabilities` は受け入れ、OCI 既定集合から除いた集合を `process.capabilities` の 3 集合
+//!   （bounding / effective / permitted）へ書く（core が drop だけを解釈済みにして launch・exec へ適用する。
+//!   #2666・CRI-2・SEC-1）。名前は大文字小文字を区別せず `CAP_` 接頭辞は任意、`ALL` は全 drop、既定に無いものの
+//!   drop は no-op、未知名は `INVALID_ARGUMENT`。`add_capabilities` / `add_ambient_capabilities` は `UNIMPLEMENTED`。
 //! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（log_path・dns_config・port_mappings・cgroup_parent・sysctls・
-//!   devices・stop_signal・capabilities・supplemental_groups・propagation 等）の受け入れ順序と担当は
+//!   devices・stop_signal・capabilities の add / ambient・supplemental_groups・propagation 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 
 use std::collections::HashMap;
 
 use serde::Serialize;
 
+use fandhe_container_core::capabilities::{Capability, CapabilitySet, OCI_DEFAULT_CAPABILITIES};
 use fandhe_container_core::path_masks::normalize_container_path;
 
 use crate::error::CriError;
@@ -162,6 +167,74 @@ struct ProcessOut {
     env: Vec<String>,
     cwd: String,
     user: UserOut,
+    /// `drop_capabilities` の指定があるときだけ書く（無ければ core が OCI 既定集合を使う）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<CapabilitiesOut>,
+}
+
+/// `process.capabilities`。3 集合を同じ値にする（core が drop だけを解釈済みにする形。#2666）。
+/// `inheritable` / `ambient` は書かない（core は空でない指定を未適用として拒否する）。
+#[derive(Serialize)]
+struct CapabilitiesOut {
+    bounding: Vec<&'static str>,
+    effective: Vec<&'static str>,
+    permitted: Vec<&'static str>,
+}
+
+/// `drop_capabilities` の件数の上限（既知の capability 数の 2 倍。重複を許す）。
+const MAX_DROP_CAPABILITIES: usize = 2 * Capability::ALL.len();
+/// `drop_capabilities` の名前 1 件の長さの上限（バイト）。
+const MAX_CAPABILITY_NAME_BYTES: usize = 32;
+
+/// CRI の `drop_capabilities` を OCI 既定集合から除いた集合へ変換する（CRI-2・SEC-1・#2666）。
+///
+/// 名前は大文字小文字を区別せず、`CAP_` 接頭辞は任意（containerd と同じ想定）。`ALL` は全 drop。
+/// 既定集合に無い capability の drop は no-op として受理する。未知の名前・空・長すぎる名前は
+/// `INVALID_ARGUMENT`（指定された名前はエラーに載せない）。drop の指定が無ければ `None`。
+fn drop_capabilities(names: &[String]) -> Result<Option<CapabilitiesOut>, CriError> {
+    if names.is_empty() {
+        return Ok(None);
+    }
+    if names.len() > MAX_DROP_CAPABILITIES {
+        return Err(invalid("drop_capabilities"));
+    }
+    let mut dropped = CapabilitySet::empty();
+    for name in names {
+        if name.is_empty() || name.len() > MAX_CAPABILITY_NAME_BYTES || !name.is_ascii() {
+            return Err(invalid("drop_capabilities"));
+        }
+        let upper = name.to_ascii_uppercase();
+        if upper == "ALL" {
+            dropped = OCI_DEFAULT_CAPABILITIES
+                .iter()
+                .fold(dropped, |set, c| set.with(*c));
+            continue;
+        }
+        let full = if upper.starts_with("CAP_") {
+            upper
+        } else {
+            format!("CAP_{upper}")
+        };
+        let cap = Capability::from_name(&full).ok_or_else(|| invalid("drop_capabilities"))?;
+        dropped = dropped.with(cap);
+    }
+    let kept: Vec<&'static str> = OCI_DEFAULT_CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|c| !dropped.contains(*c))
+        .map(Capability::as_str)
+        .collect();
+    // 出力順は `Capability::ALL`（番号順）にそろえる。
+    let ordered: Vec<&'static str> = Capability::ALL
+        .iter()
+        .map(|c| c.as_str())
+        .filter(|n| kept.contains(n))
+        .collect();
+    Ok(Some(CapabilitiesOut {
+        bounding: ordered.clone(),
+        effective: ordered.clone(),
+        permitted: ordered,
+    }))
 }
 
 #[derive(Serialize)]
@@ -738,16 +811,17 @@ fn build_inner(
 
     let linux = container.linux.as_ref();
     let sc = linux.and_then(|l| l.security_context.as_ref());
+    let mut capabilities = None;
     if let Some(sc) = sc {
         if sc.privileged {
             return Err(unsupported("privileged"));
         }
-        if let Some(c) = &sc.capabilities
-            && (!c.add_capabilities.is_empty()
-                || !c.drop_capabilities.is_empty()
-                || !c.add_ambient_capabilities.is_empty())
-        {
-            return Err(unsupported("capabilities"));
+        // add / ambient は受けない（オーナー判断まで UNIMPLEMENTED）。drop だけ受ける（#2666）。
+        if let Some(c) = &sc.capabilities {
+            if !c.add_capabilities.is_empty() || !c.add_ambient_capabilities.is_empty() {
+                return Err(unsupported("capabilities"));
+            }
+            capabilities = drop_capabilities(&c.drop_capabilities)?;
         }
         if sc.readonly_rootfs {
             return Err(unsupported("readonly_rootfs"));
@@ -854,6 +928,7 @@ fn build_inner(
             env,
             cwd,
             user: UserOut { uid, gid },
+            capabilities,
         },
         mounts,
         linux: LinuxOut {

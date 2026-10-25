@@ -6,7 +6,7 @@ fandhe-container の実行ファイル（CLI・supervisor・特権ランチャ�
 - タスク: TASK-171 追補（#1721）・#2068。`start` の解決規則は TASK-79 追補（#1718）、`fandhe-container setup` はステップ `privileged-launcher-install` として rootful の手順を表示する（実行はしない。#1722）
 - 設計: [privilege-separation.md](../design/privilege-separation.md) の「インストールスクリプト」
 
-> 未検証の注記（REPAIR-3）: rootful の手順は `scripts/install-privileged-launcher.sh` の自己テスト（スタブのみ・root 不要）で確かめたもので、root での実機実行と検証は未実施である（#538・#539）。rootless の手順は CLI の結合試験（symlink 経由の `start`）に基づくが、実機での手順全体の通し確認は未実施である。rootless の範囲写像（subuid / subgid）の実機確認も未実施である（#1621）。rootless の `start` は supervisor が core の本番 launcher で起動するが（#1819）、委譲 cgroup の準備を含む実機での確認は未実施である（#2062）。rootful の `start` は CLI の実体の隣にある `fandhe-container-launcher` を選んで起動するが（#2442）、ランチャー経由の本物の systemd-run・file capability・`setsid` を通す実機での確認は未実施である（#538・#539）。root（uid 0）での `start` は `UNIMPLEMENTED`（終了コード 8）で終わる（#2241 の判断待ち）。
+> 未検証の注記（REPAIR-3）: rootful の手順は `scripts/install-privileged-launcher.sh` の自己テスト（スタブのみ・root 不要）で確かめたもので、root での実機実行と検証は未実施である（#538・#539）。rootless の手順は CLI の結合試験（symlink 経由の `start`）に基づくが、実機での手順全体の通し確認は未実施である。rootless の範囲写像（subuid / subgid）の実機確認も未実施である（#1621）。rootless の `start` は supervisor が core の本番 launcher で起動するが（#1819）、委譲 cgroup の準備を含む実機での確認は未実施である（#2062）。rootful の `start` は CLI の実体の隣にある `fandhe-container-launcher` を選んで起動するが（#2442）、ランチャー経由の本物の systemd-run・file capability・`setsid` を通す実機での確認は未実施である（#538・#539）。root（uid 0）での `start` は `UNIMPLEMENTED`（終了コード 8）で終わる（#2241 の判断待ち）。LDAP / sssd の環境での所有者名の解決と、ambient capability つきの構成で `getent` の子に capability が渡らないことも実機では未確認である（手順書は [subid-nss-ambient-getent.md](../verification/subid-nss-ambient-getent.md)・#2637）。
 
 ## 配置の規則
 

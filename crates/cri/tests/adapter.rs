@@ -17,6 +17,7 @@ struct Fake {
     calls: Mutex<Vec<String>>,
     fail: Mutex<Option<ErrorCode>>,
     status: Mutex<Option<ContainerStatus>>,
+    stop_signals: Mutex<Vec<u8>>,
 }
 
 impl Fake {
@@ -47,6 +48,7 @@ impl ContainerRuntime for Shared {
             .rec(format!("kill {} {}", r.id().as_str(), r.signal().as_u8()))
     }
     fn stop(&self, r: &StopRequest) -> Result<ContainerStatus, TraitError> {
+        self.0.stop_signals.lock().unwrap().push(r.signal().as_u8());
         self.0
             .rec(format!("stop {} {}", r.id().as_str(), r.grace().as_secs()))
     }
@@ -195,4 +197,26 @@ fn adapter_depends_only_on_core_traits() {
             rest = tail;
         }
     }
+}
+
+/// CRI-2・PLUG-1（#2668）: `stop_with_signal` は指定の番号を `StopRequest::signal` で運び、`stop` は SIGTERM。
+#[test]
+fn cri2_stop_with_signal_carries_signal() {
+    let (f, a) = fake_with(ContainerStatus::stopped(cid("c1"), None));
+    a.stop_with_signal("c1", 10, 2).unwrap();
+    a.stop("c1", 10).unwrap();
+    assert_eq!(f.stop_signals.lock().unwrap().clone(), vec![2, 15]);
+}
+
+/// CRI-2（#2668）: 範囲外のシグナル番号は実行層を呼ばず `INVALID_ARGUMENT`。
+#[test]
+fn cri2_stop_with_signal_rejects_out_of_range() {
+    let (f, a) = fake_with(ContainerStatus::stopped(cid("c1"), None));
+    for sig in [0u8, 65] {
+        assert_eq!(
+            a.stop_with_signal("c1", 10, sig).unwrap_err().code(),
+            fandhe_container_cri::error::CriErrorCode::InvalidArgument
+        );
+    }
+    assert!(f.stop_signals.lock().unwrap().is_empty());
 }

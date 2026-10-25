@@ -31,7 +31,7 @@
 //!   （#2664・CRI-2・SEC-5）。`run_as_user` との同時指定は `INVALID_ARGUMENT`、`run_as_group` は `run_as_user` か
 //!   `run_as_username` があるときだけ有効。解決結果が無ければ `UNIMPLEMENTED`（root へ黙って落とさない）。
 //! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（log_path・dns_config・port_mappings・cgroup_parent・sysctls・
-//!   devices・stop_signal・capabilities・supplemental_groups・propagation 等）の受け入れ順序と担当は
+//!   devices・capabilities・supplemental_groups・propagation 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 
 use std::collections::HashMap;
@@ -687,9 +687,9 @@ fn build_inner(
     if !container.devices.is_empty() || !container.cdi_devices.is_empty() {
         return Err(unsupported("devices"));
     }
-    if container.stop_signal != 0 {
-        return Err(unsupported("stop_signal"));
-    }
+    // stop_signal は config.json に出さない（OCI の config に欄が無い）。停止時に StopRequest で運ぶため、
+    // ここでは値域だけを検証する（未知の値は INVALID_ARGUMENT。CRI-2・#2668）。
+    crate::stop_signal::linux_stop_signal(container.stop_signal)?;
     if !container.log_path.is_empty() || !sandbox.log_directory.is_empty() {
         return Err(unsupported("log_path"));
     }

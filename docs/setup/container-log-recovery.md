@@ -28,4 +28,5 @@ ID を再利用しない場合（plugin-cri の CRI など）は自動では回�
    cd <state_root>/@container-logs
    ls -1 | grep -E '^<encoded-id>\.log(\.lock|\.[0-9]+)?$'   # 候補の確認（<encoded-id> 中のドットは \. にする）
    ```
+
 4. 候補が上の名前だけで、他の ID のファイルを含まないことを確かめてから、その名前を 1 つずつ `rm` で消す。他の ID のファイルには触れない

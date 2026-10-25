@@ -228,6 +228,7 @@ fn unescape_mountinfo(field: &str) -> Vec<u8> {
 /// `/opt` へ重ねたマウントは、mountinfo に古い `/opt/fc` の行を残したまま覆い隠す）。根が定まらない・
 /// 親子関係が循環する場合は判定不能として `None`（呼び出し側は fail-closed に扱う）。
 fn covering_mount<'a>(mountinfo: &'a str, path: &Path) -> Option<Vec<&'a str>> {
+    use std::collections::{HashMap, HashSet};
     struct Entry<'a> {
         id: &'a str,
         parent: &'a str,
@@ -243,51 +244,56 @@ fn covering_mount<'a>(mountinfo: &'a str, path: &Path) -> Option<Vec<&'a str>> {
     let mut entries: Vec<Entry<'a>> = Vec::new();
     for line in mountinfo.lines() {
         let fields: Vec<&str> = line.split_ascii_whitespace().collect();
-        let (Some(id), Some(parent), Some(mp_field)) =
-            (fields.first(), fields.get(1), fields.get(4))
-        else {
+        let (Some(id), Some(parent), Some(mp_field)) = (
+            fields.first().copied(),
+            fields.get(1).copied(),
+            fields.get(4),
+        ) else {
             continue;
         };
         entries.push(Entry {
             id,
             parent,
             mp: unescape_mountinfo(mp_field),
-            fields: fields.clone(),
+            fields,
         });
     }
+    // 上限つきの mountinfo（cli は 4 MiB）でも行数の 2 乗にならないよう、ID の集合と
+    // 「親 ID → `path` を含む子の行番号（行順）」の表を先に作る。
+    let ids: HashSet<&str> = entries.iter().map(|e| e.id).collect();
+    let mut children: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, e) in entries.iter().enumerate() {
+        if e.id != e.parent && contains(&e.mp) {
+            children.entry(e.parent).or_default().push(i);
+        }
+    }
     // 根: 親が表に無いマウント。複数あれば後の行を採る。
-    let mut cur = entries
-        .iter()
-        .rposition(|e| !entries.iter().any(|o| o.id == e.parent))?;
+    let mut cur = entries.iter().rposition(|e| !ids.contains(e.parent))?;
     // 深さは行数を超えない（超えたら循環とみなして判定不能）。
     for _ in 0..=entries.len() {
         let cur_id = entries.get(cur)?.id;
-        let cands: Vec<usize> = entries
-            .iter()
-            .enumerate()
-            .filter(|(i, e)| *i != cur && e.parent == cur_id && contains(&e.mp))
-            .map(|(i, _)| i)
-            .collect();
+        let cands = children.get(cur_id).map_or(&[][..], Vec::as_slice);
+        // 後の行から見て、自分より後に祖先位置へ重ねられたマウントがあれば隠れている。
+        let mut later: HashSet<&[u8]> = HashSet::new();
         let mut best: Option<usize> = None;
-        for &c in &cands {
-            let cmp = &entries.get(c)?.mp;
-            let hidden = cands.iter().any(|&o| {
-                o > c
-                    && entries.get(o).is_some_and(|eo| {
-                        eo.mp.len() < cmp.len()
-                            && (eo.mp == b"/"
-                                || (cmp.starts_with(&eo.mp) && cmp.get(eo.mp.len()) == Some(&b'/')))
-                    })
-            });
+        for &c in cands.iter().rev() {
+            let mp = entries.get(c)?.mp.as_slice();
+            // 祖先位置: `/`（自分が `/` でなければ）と、`/` の直前で切った各前置き（`/opt/fc` なら `/opt`）。
+            let under_root = mp != b"/" && later.contains(&b"/"[..]);
+            let under_dir = mp
+                .iter()
+                .enumerate()
+                .skip(1)
+                .any(|(i, b)| *b == b'/' && mp.get(..i).is_some_and(|a| later.contains(a)));
+            let hidden = under_root || under_dir;
+            later.insert(mp);
             if hidden {
                 continue;
             }
+            // 後の行から見ているので、同長は先に見たもの（後の行）を残す。
             let better = match best {
                 None => true,
-                Some(b) => {
-                    let blen = entries.get(b)?.mp.len();
-                    cmp.len() > blen || (cmp.len() == blen && c > b)
-                }
+                Some(b) => mp.len() > entries.get(b)?.mp.len(),
             };
             if better {
                 best = Some(c);
@@ -306,7 +312,8 @@ fn covering_mount<'a>(mountinfo: &'a str, path: &Path) -> Option<Vec<&'a str>> {
 ///
 /// パスの存在だけでは分からない「そのパスがどのファイルシステム上にあるか」の確認に使う
 /// （cli の `doctor` が `/proc/sys/net` が procfs 上にあることを確認する。NET-10・TASK-148.1）。
-/// 選び方は netns 置き場の伝播検査と同じ（最長一致・同長は最上位）。OS 呼び出しを含まない純粋関数。
+/// 選び方は netns 置き場の伝播検査と同じ（`covering_mount`: 親子関係を辿り、隠れたマウントを除いた最長一致）。
+/// OS 呼び出しを含まない純粋関数。
 pub fn covering_mount_fstype(mountinfo: &str, path: &Path) -> Option<String> {
     let fields = covering_mount(mountinfo, path)?;
     let sep = fields.iter().position(|f| *f == "-")?;
@@ -333,7 +340,7 @@ pub enum MountOptionState {
 ///
 /// cli の `doctor` のランチャー診断が、ランチャーの実体が `nosuid` マウント上にあるか
 /// （setuid と file capability が効かないか）を調べるために呼ぶ（SUP-14・CORE-6・#2661）。
-/// 選び方は [`covering_mount_fstype`] と同じ（最長一致・同長は最上位）。該当マウントが無い・欄が欠けている・
+/// 選び方は [`covering_mount_fstype`] と同じ（親子関係を辿り、隠れたマウントを除いた最長一致）。該当マウントが無い・欄が欠けている・
 /// `-` 区切りが無い壊れた行は理由つきの判定不能（`Present` / `Absent` 以外）で返す。呼び出し側は fail-closed に扱う。
 /// OS 呼び出しを含まない純粋関数。
 pub fn covering_mount_has_option(mountinfo: &str, path: &Path, option: &str) -> MountOptionState {
@@ -354,8 +361,8 @@ pub fn covering_mount_has_option(mountinfo: &str, path: &Path, option: &str) -> 
 }
 
 /// `mountinfo` の内容から `dir`（正規化済みの絶対パス）を含むマウントを探し、その伝播が `shared` なら
-/// 拒否する（OS 呼び出しを含まない純粋関数。単体テスト用に分離）。最長一致のマウントポイントを採り、
-/// 同長なら後の行（重ねマウントの最上位）を採る。見つからなければ拒否する（fail-closed）。
+/// 拒否する（OS 呼び出しを含まない純粋関数。単体テスト用に分離）。マウントの選び方は `covering_mount`
+/// （親子関係を辿り、隠れたマウントを除いた最長一致）。見つからなければ拒否する（fail-closed）。
 fn check_propagation(mountinfo: &str, dir: &Path) -> Result<(), NetError> {
     let Some(fields) = covering_mount(mountinfo, dir) else {
         return Err(NetError::new(
@@ -1341,12 +1348,38 @@ mod tests {
         let has2 = |p: &str| covering_mount_has_option(info2, Path::new(p), "nosuid");
         assert_eq!(has2("/opt/fc/bin/launcher"), MountOptionState::Absent);
         assert_eq!(has2("/opt/x"), MountOptionState::Present);
+        // `/` に重ねた後は、それより前の `/opt/fc` も隠れる（重ねた `/` 側を採る）。
+        let info3 = "\
+22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+26 22 0:23 / /opt/fc rw,relatime - tmpfs tmpfs rw
+30 22 0:30 / / rw,nosuid - tmpfs tmpfs rw
+";
+        let has3 = |p: &str| covering_mount_has_option(info3, Path::new(p), "nosuid");
+        assert_eq!(has3("/opt/fc/bin/launcher"), MountOptionState::Present);
         // 根が無い（循環）表は判定不能（fail-closed）。
         let cyc = "1 2 0:1 / /a rw - tmpfs t rw\n2 1 0:2 / /a/b rw - tmpfs t rw\n";
         assert_eq!(
             covering_mount_has_option(cyc, Path::new("/a/b/c"), "nosuid"),
             MountOptionState::NoCoveringMount
         );
+    }
+
+    /// SUP-14・NET-1・#2661: 行数が多い mountinfo（cli の上限 4 MiB 相当の数万行）でも、親子関係の辿り方が
+    /// 行数の 2 乗の比較にならず（ID の集合・子の表で引く）、正しいマウントを選ぶ。
+    #[test]
+    fn sup14_covering_mount_handles_many_entries() {
+        use std::fmt::Write as _;
+        let mut info = String::from("22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n");
+        for i in 0..40_000u32 {
+            let id = 100 + i;
+            let _ = writeln!(info, "{id} 22 0:{i} / /m/{i} rw,relatime - tmpfs tmpfs rw");
+        }
+        info.push_str("50000 22 0:9 / /opt/fc rw,nosuid - tmpfs tmpfs rw\n");
+        assert!(info.len() < 4 * 1024 * 1024);
+        let has = |p: &str| covering_mount_has_option(&info, Path::new(p), "nosuid");
+        assert_eq!(has("/opt/fc/bin/launcher"), MountOptionState::Present);
+        assert_eq!(has("/m/39999/x"), MountOptionState::Absent);
+        assert_eq!(has("/srv/x"), MountOptionState::Absent);
     }
 
     /// 8 進エスケープの復号。

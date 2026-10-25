@@ -109,6 +109,7 @@ fandhe-container/
 │   │   ├── container-ref-reconcile.md  # コンテナ参照の照合とクラッシュ復旧 GC の起動点（create ゲートの共有 / 排他・契機 A / B・probe の写し方。`Present` かつ未確定の扱いはオーナー確認待ち。#2495・OCI-7・CLI-1・CORE-1）
 │   │   ├── container-log-removal-wait.md  # コンテナログ削除で sink の閉鎖を期限つきで待つ方式と、失敗のコード別内訳の観測（#2634・SUP-7・CRI-2・REPAIR-4・REPAIR-5）
 │   │   ├── image-rootfs-lifetime.md  # イメージ由来 rootfs（core が create_with_image で作ったもの）の所有・delete での削除・失敗時の扱い（#2378・OCI-7・OCI-5）
+│   │   ├── exec-without-supervisor.md  # supervisor 不在時（孤児化・再起動後）の exec の方式（起動時の同一性の証跡と re-adopt での pidfd の取り直し）の判断記録（#2688・SUP-4・SUP-6・SUP-8・SEC-1。オーナー承認待ち）
 │   │   ├── mount-propagation.md   # mount の propagation（rslave を受け rshared を受けない理由・事前複製の方式・却下案・rshared の緩和点・残余。#2669・CRI-2・OCI-4・SEC-1）
 │   │   ├── cri-config-acceptance.md  # CRI の未受理項目の受け入れ順序と担当、イメージ User の名前解決の方式（fd 起点の passwd / group 読み取り。#2606・CRI-2・CRI-7・SEC-1・SEC-5）
 │   │   └── plugin-hash-allowlist.md  # plugin の許可済みハッシュ一覧の置き場所・読み込み経路・一覧ファイル自体の検証の設計案（TASK-122 追補・#1868・PLUG-11。オーナー承認待ち）

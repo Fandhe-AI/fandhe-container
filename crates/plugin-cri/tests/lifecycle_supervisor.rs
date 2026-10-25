@@ -20,10 +20,10 @@ use fandhe_container_core::oci_runtime::{
     CgroupRemoval, ContainerCgroupRemover, ProcessSignaler, StartTimeouts,
 };
 use fandhe_container_core::traits::{
-    CgroupPlacement, CgroupScope, ContainerId, ContainerRuntime, ContainerState, ContainerStatus,
-    CreateStateRequest, DeleteRequest, DeleteStateRequest, DeleteStateResponse, ErrorCode,
-    GetStateRequest, KillRequest, ListStateRequest, Signal, StartRequest, StateList, StateRecord,
-    StateRevision, StateStore, StopRequest, TraitError, UpdateStateRequest,
+    CgroupPlacement, CgroupScope, ContainerId, ContainerLogPath, ContainerRuntime, ContainerState,
+    ContainerStatus, CreateStateRequest, DeleteRequest, DeleteStateRequest, DeleteStateResponse,
+    ErrorCode, GetStateRequest, KillRequest, ListStateRequest, Signal, StartRequest, StateList,
+    StateRecord, StateRevision, StateStore, StopRequest, TraitError, UpdateStateRequest,
 };
 use fandhe_container_plugin_cri::adapter::{CoreLifecycleRuntime, PLUGIN_RUNTIME_TIMEOUT};
 use fandhe_container_plugin_cri::supervised::{
@@ -51,6 +51,10 @@ struct Scripts {
 
 /// 偽の supervisor。引数は `start --root <root> <id>`（契約の argv）で、`<id>` で報告を切り替える。
 const FAKE_SUPERVISOR: &str = r#"#!/bin/sh
+if [ "$4" = "--cri-log-path" ]; then
+  printf '%s %s\n' "$5" "$6" > "$3/cri-log-arg"
+  printf 'FCSUP1 OK 4242\n'; exec sleep 3
+fi
 case "$4" in
   c-ok) printf 'FCSUP1 OK 4242\n'; exec sleep 3;;
   c-err) printf 'FCSUP1 ERR FAILED_PRECONDITION 5 container is not created\n'; exit 0;;
@@ -302,6 +306,20 @@ fn cri2_start_reports_running_status() {
     assert_eq!(status.state(), ContainerState::Running);
     assert_eq!(status.pid(), Some(pid(4242)));
     assert_eq!(h.rt.tracked_supervisors(), 1);
+}
+
+/// CRI-2・SUP-4（#2671）: `StartRequest` の CRI ログの書き先は supervisor の argv `--cri-log-path <path> <id>` として渡る。
+#[test]
+fn cri2_start_passes_cri_log_path_to_supervisor_argv() {
+    let root = temp_root("crilog");
+    let h = harness(Sim::running_in(root.clone(), "c-log", 4242), LONG);
+    let lp = ContainerLogPath::new("/var/log/pods/ns_p_u/c/0.log").expect("log path");
+    let req = StartRequest::new(cid("c-log")).with_log_path(lp);
+    let status = h.rt.start(&req).expect("start");
+    assert_eq!(status.state(), ContainerState::Running);
+    let seen = std::fs::read_to_string(root.join("cri-log-arg")).expect("fake supervisor argv");
+    assert_eq!(seen, "/var/log/pods/ns_p_u/c/0.log c-log\n");
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// ERR-2・CRI-2: supervisor の ERR 報告は code と message をそのまま写す。

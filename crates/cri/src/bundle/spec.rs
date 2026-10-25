@@ -34,7 +34,9 @@
 //!   （bounding / effective / permitted）へ書く（core が drop だけを解釈済みにして launch・exec へ適用する。
 //!   #2666・CRI-2・SEC-1）。名前は大文字小文字を区別せず `CAP_` 接頭辞は任意、`ALL` は全 drop、既定に無いものの
 //!   drop は no-op、未知名は `INVALID_ARGUMENT`。`add_capabilities` / `add_ambient_capabilities` は `UNIMPLEMENTED`。
-//! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（log_path・dns_config・port_mappings・cgroup_parent・sysctls・
+//! - `log_path`（コンテナ）と `log_directory`（サンドボックス）は [`resolve_log_path`] で検証して結合し、受け入れる
+//!   （CRI-2・SUP-4・#2671）。結合結果は config.json には出さず、StartContainer が supervisor へ渡す。
+//! - 本モジュールが `UNIMPLEMENTED` で拒否する CRI 項目（dns_config・port_mappings・cgroup_parent・sysctls・
 //!   devices・stop_signal・capabilities の add / ambient・supplemental_groups・propagation 等）の受け入れ順序と担当は
 //!   `docs/design/cri-config-acceptance.md`（#2606）にまとめている。
 
@@ -44,6 +46,7 @@ use serde::Serialize;
 
 use fandhe_container_core::capabilities::{Capability, CapabilitySet, OCI_DEFAULT_CAPABILITIES};
 use fandhe_container_core::path_masks::normalize_container_path;
+use fandhe_container_core::traits::ContainerLogPath;
 
 use crate::error::CriError;
 use crate::runtime::v1::{
@@ -747,6 +750,52 @@ pub fn validate_config(
     .map(|_| ())
 }
 
+/// `log_path` / `log_directory` の要素（`/` 区切り）が空・`.`・`..` でないことを確かめる。
+fn check_log_components(rest: &str) -> bool {
+    rest.split('/')
+        .all(|c| !c.is_empty() && c != "." && c != "..")
+}
+
+/// CRI の `log_directory`（サンドボックス）と `log_path`（コンテナ）を検証し、結合した書き先を返す
+/// （CRI-2・SUP-4・#2671）。
+///
+/// - 両方空: `Ok(None)`（CRI ログなし）
+/// - `log_directory` だけ: 形式を検証して `Ok(None)`（そのコンテナは CRI ログなし。containerd と同じ）
+/// - `log_path` だけ: `INVALID_ARGUMENT`（相対パスの基点が無い。黙ってログを無効化しない）
+/// - 両方: `log_directory` は絶対パス、`log_path` は相対パスで、どちらも `.`・`..`・空要素・制御文字を含まない。
+///   `..` を禁じるため、結合結果は構造上 `log_directory` の配下に収まる。
+///
+/// `validate_config` / `build_runtime_config` と StartContainer の結線が同じ関数を使う（判定の二重管理を避ける）。
+/// 純関数でファイルシステムには触れない。
+pub fn resolve_log_path(
+    sandbox: &PodSandboxConfig,
+    container: &ContainerConfig,
+) -> Result<Option<ContainerLogPath>, CriError> {
+    let dir = sandbox.log_directory.as_str();
+    let path = container.log_path.as_str();
+    if !dir.is_empty() {
+        let ok = dir
+            .strip_prefix('/')
+            .filter(|_| dir.len() <= MAX_PATH_BYTES)
+            .is_some_and(|rest| check_log_components(rest) && !dir.chars().any(char::is_control));
+        if !ok {
+            return Err(invalid("log_directory"));
+        }
+    }
+    if path.is_empty() {
+        return Ok(None);
+    }
+    if dir.is_empty() {
+        return Err(invalid("log_path"));
+    }
+    if path.starts_with('/') || !check_log_components(path) || path.chars().any(char::is_control) {
+        return Err(invalid("log_path"));
+    }
+    ContainerLogPath::new(format!("{dir}/{path}"))
+        .map(Some)
+        .map_err(|_| invalid("log_path"))
+}
+
 fn build_inner(
     sandbox: &PodSandboxConfig,
     container: &ContainerConfig,
@@ -763,9 +812,9 @@ fn build_inner(
     if container.stop_signal != 0 {
         return Err(unsupported("stop_signal"));
     }
-    if !container.log_path.is_empty() || !sandbox.log_directory.is_empty() {
-        return Err(unsupported("log_path"));
-    }
+    // log_path / log_directory は supervisor の CRI ログ書き出しで受け入れる（#2671）。
+    // config.json には出さない（書き先は config.json の外の情報。StartContainer が別経路で渡す）。
+    resolve_log_path(sandbox, container)?;
     if container.windows.is_some() || sandbox.windows.is_some() {
         return Err(unsupported("windows"));
     }

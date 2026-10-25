@@ -854,7 +854,7 @@ fn open_existing_regular_read(path: &Path, deny_delete: bool) -> Result<File, Tr
         target_arch = "loongarch64"
     )
 ))]
-const O_NOFOLLOW: i32 = 0o400000;
+pub(super) const O_NOFOLLOW: i32 = 0o400000;
 #[cfg(all(
     any(target_os = "linux", target_os = "android"),
     any(
@@ -864,7 +864,7 @@ const O_NOFOLLOW: i32 = 0o400000;
         target_arch = "powerpc64"
     )
 ))]
-const O_NOFOLLOW: i32 = 0o100000;
+pub(super) const O_NOFOLLOW: i32 = 0o100000;
 #[cfg(any(
     target_os = "macos",
     target_os = "ios",
@@ -873,7 +873,7 @@ const O_NOFOLLOW: i32 = 0o100000;
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-const O_NOFOLLOW: i32 = 0x100;
+pub(super) const O_NOFOLLOW: i32 = 0x100;
 #[cfg(all(
     unix,
     not(any(
@@ -900,7 +900,7 @@ const O_NOFOLLOW: i32 = 0x100;
         target_os = "dragonfly"
     ))
 ))]
-const O_NOFOLLOW: i32 = 0;
+pub(super) const O_NOFOLLOW: i32 = 0;
 
 /// ログ読み取り open の `custom_flags`（非ブロッキング・symlink 非追従・`O_NOCTTY`。SUP-14・#2426）。
 #[cfg(unix)]
@@ -1221,7 +1221,7 @@ pub(crate) fn current_log_path(dir: &Path, id: &ContainerId) -> Result<PathBuf, 
 /// 相対パスは拒否する（CWD より上の要素を検査できない）。検査の前に要素から組み直して、末尾の区切り文字と
 /// `.` を除く（`link/` のような末尾の区切り文字があると `lstat` が最終要素の symlink を辿り、symlink 検査を
 /// すり抜けるため。core の `StateRoot::from_override` と同じ扱い）。
-fn check_dir(dir: &Path) -> Result<PathBuf, TraitError> {
+pub(super) fn check_dir(dir: &Path) -> Result<PathBuf, TraitError> {
     if !dir.is_absolute() {
         return Err(invalid("log directory must be an absolute path"));
     }

@@ -12,12 +12,14 @@
 //! `Running` は記録上の状態で、プロセスは起動しない。StopContainer / RemoveContainer（TASK-58.2・#434）も
 //! 記録上の遷移と除去だけで、プロセスの終了・猶予待ちは行わない。TASK-59（CRI-2）で `ContainerRuntime`
 //! 経由の namespace 分離起動・終了と `StateStore` へ置き換える。
-//! `command`・`mounts`・`log_path` 等のパス類は保持するだけで検証していない（ホストへ触れる TASK-59 で検証する）。
+//! `command`・`mounts` 等のパス類は保持するだけで検証していない（ホストへ触れる TASK-59 で検証する）。
+//! `log_path` は実行層接続時に `log_directory` と結合・検証した値を別途保持する（`resolved_log_path`。#2671）。
 
 use std::collections::HashMap;
 
 use crate::adapter::RuntimeTerminationReason;
 use crate::error::CriError;
+use fandhe_container_core::traits::ContainerLogPath;
 use prost::Message;
 
 use super::config_limits::{
@@ -137,6 +139,10 @@ pub(super) struct ContainerRecord {
     /// 実行層が報告した特別な終了理由（OOM 等。CRI-2・CORE-4）。未報告は None。
     pub(super) termination: Option<RuntimeTerminationReason>,
     pub(super) retained_bytes: usize,
+    /// `log_directory` と `log_path` を結合・検証した CRI ログの書き先（実行層接続時の CreateContainer のみ。
+    /// CRI-2・SUP-4・#2671）。`ContainerStatus.log_path` に返し（kubelet・crictl が直接開く）、StartContainer が
+    /// supervisor へ渡す。スタブ経路・両方空・`log_directory` だけのときは `None`。
+    pub(super) resolved_log_path: Option<ContainerLogPath>,
     /// 実行層（`ContainerRuntime`）の create・start・stop・delete を呼び出し中（TASK-59.2・#438、TASK-59.3・#439）。
     ///
     /// 状態は呼び出し前のまま、並行する Start・Stop・Remove・親サンドボックスの停止・除去を `FAILED_PRECONDITION` で
@@ -187,7 +193,8 @@ fn exit_reason(
 impl ContainerRecord {
     /// ContainerStatus 応答用の変換（CRI-1・TASK-58.3・#435）。
     ///
-    /// labels・annotations・mounts・log_path は保持した値を無改変で返す。`envs`・`command`・`args` は
+    /// labels・annotations・mounts は保持した値を無改変で返す。`log_path` は結合済みの絶対パス（`resolved_log_path`。
+    /// containerd と同じ。kubelet の GetContainerLogs と crictl logs が直接開く）があればそれ、無ければ保持した値を返す。`envs`・`command`・`args` は
     /// 応答項目に無く（秘密値が入り得る）、返さない。`exit_code` は実行層が報告した値（不明は 0）、
     /// `reason` は `exit_reason` で導く（`Completed`・`Error`・`OOMKilled`）。
     ///
@@ -231,7 +238,10 @@ impl ContainerRecord {
             labels: self.config.labels.clone(),
             annotations: self.config.annotations.clone(),
             mounts: self.config.mounts.clone(),
-            log_path: self.config.log_path.clone(),
+            log_path: self
+                .resolved_log_path
+                .as_ref()
+                .map_or_else(|| self.config.log_path.clone(), |p| p.as_str().to_owned()),
             resources,
             image_id: String::new(),
             user: None,
@@ -407,6 +417,11 @@ impl BoundedContainerConfig {
             config,
             retained_bytes,
         })
+    }
+
+    /// 検証済みの `config` を借りる（CRI ログの書き先の結合に使う）。
+    pub(super) fn config(&self) -> &ContainerConfig {
+        &self.config
     }
 
     /// 保持量の見積もり。

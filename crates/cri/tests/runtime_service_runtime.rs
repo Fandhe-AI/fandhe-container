@@ -68,6 +68,8 @@ struct FakeRuntime {
     stop_oom_killed: AtomicBool,
     /// true のとき start の stopped 応答が OOM の停止を報告する（同上）。
     start_oom_killed: AtomicBool,
+    /// start が受けた `StartRequest::log_path()`（CRI-2・SUP-4・#2671 の検証用）。
+    start_log_paths: Mutex<Vec<Option<String>>>,
 }
 
 impl FakeRuntime {
@@ -105,6 +107,11 @@ impl ContainerRuntime for Shared {
             .lock()
             .unwrap()
             .push(format!("start {}", r.id().as_str()));
+        self.0
+            .start_log_paths
+            .lock()
+            .unwrap()
+            .push(r.log_path().map(|p| p.as_str().to_owned()));
         while self.0.hold_start.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -1608,5 +1615,90 @@ async fn cri_2_repair_3_stopped_start_response_reflects_exit_code() {
     assert_eq!(
         (st.state, st.exit_code, st.reason.as_str()),
         (S::ContainerExited as i32, 1, "Error")
+    );
+}
+
+/// CRI-2・SUP-4（#2671）: log_directory と log_path は結合され、status と StartRequest に同じ値で現れる。
+#[tokio::test]
+async fn cri_2_log_path_is_joined_and_reaches_start_request() {
+    let h = harness();
+    let sb = RuntimeService::run_pod_sandbox(
+        &h.service,
+        Request::new(v1::RunPodSandboxRequest {
+            config: Some(PodSandboxConfig {
+                metadata: Some(PodSandboxMetadata {
+                    name: "pod".into(),
+                    uid: "uid-1".into(),
+                    namespace: "ns".into(),
+                    attempt: 0,
+                }),
+                log_directory: "/var/log/pods/ns_pod_uid-1".into(),
+                ..Default::default()
+            }),
+            runtime_handler: String::new(),
+        }),
+    )
+    .await
+    .expect("run sandbox")
+    .into_inner()
+    .pod_sandbox_id;
+    let mut cfg = container("c");
+    cfg.log_path = "c/0.log".into();
+    let id = RuntimeService::create_container(
+        &h.service,
+        Request::new(v1::CreateContainerRequest {
+            pod_sandbox_id: sb.clone(),
+            config: Some(cfg),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect("create")
+    .into_inner()
+    .container_id;
+    let expected = "/var/log/pods/ns_pod_uid-1/c/0.log";
+    assert_eq!(status(&h.service, &id).await.log_path, expected);
+    start(&h.service, &id).await.expect("start");
+    assert_eq!(
+        h.runtime.start_log_paths.lock().unwrap().clone(),
+        vec![Some(expected.to_owned())]
+    );
+    assert_eq!(status(&h.service, &id).await.log_path, expected);
+}
+
+/// CRI-2・SUP-4（#2671）: log_path だけ（基点なし）の CreateContainer は INVALID_ARGUMENT で、記録を残さない。
+#[tokio::test]
+async fn cri_2_log_path_without_directory_is_rejected_on_create() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let mut cfg = container("c");
+    cfg.log_path = "c/0.log".into();
+    let err = RuntimeService::create_container(
+        &h.service,
+        Request::new(v1::CreateContainerRequest {
+            pod_sandbox_id: sb,
+            config: Some(cfg),
+            sandbox_config: None,
+        }),
+    )
+    .await
+    .expect_err("must be rejected");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert_eq!(list_count(&h.service).await, 0);
+}
+
+/// CRI-2・SUP-4（#2671）: 実行層が Unimplemented（supervisor が CRI ログを受けられない構成）で
+/// start に失敗したら確定失敗として created へ戻る。
+#[tokio::test]
+async fn cri_2_start_unimplemented_returns_to_created() {
+    let h = harness();
+    let sb = run_sandbox(&h.service).await;
+    let id = create(&h.service, &sb, "c").await.expect("create");
+    *h.runtime.fail_start.lock().unwrap() = Some(ErrorCode::Unimplemented);
+    let err = start(&h.service, &id).await.expect_err("start");
+    assert_eq!(err.code(), Code::Unimplemented);
+    assert_eq!(
+        status(&h.service, &id).await.state,
+        S::ContainerCreated as i32
     );
 }

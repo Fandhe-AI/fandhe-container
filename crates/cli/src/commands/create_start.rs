@@ -631,7 +631,7 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
     })
     .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Create, e))
     .and_then(|(rt, (req, image))| {
-        reclaim_stale_container_log(rt.store.as_ref(), req.id(), &rt.recorder);
+        reclaim_stale_container_log(rt.store.as_ref(), req.id(), &rt.recorder)?;
         let r = match &image {
             Some(image) => create_container_with_image_reclaiming(&rt, image, &req),
             None => create_container(&rt, &req),
@@ -651,6 +651,10 @@ pub(super) fn run_create(global: &GlobalArgs, args: &CreateArgs) -> CliExit {
 /// 残りは同じ ID の `create` で消す（そうしないと新しいインスタンスの sink が既存の `<id>.log` を世代へ退避し、
 /// 古い出力が新しい世代に混ざる）。待たずに 1 回だけ試す（create を遅らせない。上限は
 /// `CONTAINER_LOG_REMOVE_TIMEOUT`）。古い supervisor がまだ sink を持つ（ロックが取れない）ときは何も消さない。
+/// 回収が期限切れ（`Timeout`。I/O 停止等で作業スレッドが残り得る）のときは、残った作業スレッドを抱えたまま
+/// 後続の監査記録（`FileAuditSink` は単一スレッド前提の fork を要する。SEC-4）へ進まないよう、core を呼ばずに
+/// `TIMEOUT` で create を失敗させる（fail-closed。分離違反の監査記録を失わない）。作業スレッドは CLI の終了で消え、
+/// guard は削除直前にロック保持中で評価されるため、後から別インスタンスのログを消すことはない。
 /// guard は `stop_delete::id_is_still_deleted`（ロック保持中に状態の不在を確認）で、同じ ID が既にあるときは消さず、
 /// 続く core の create が `ALREADY_EXISTS` を返す。best effort で create の成否・stderr は変えない。
 /// 観測は op 名 `container_log_reclaim`（1 件以上消した Success、エラーの Failure）。0 件は記録しない。
@@ -658,16 +662,17 @@ fn reclaim_stale_container_log(
     store: &dyn StateStore,
     id: &fandhe_container_core::traits::ContainerId,
     recorder: &OpRecorder,
-) {
+) -> Result<(), OciRuntimeError> {
     use fandhe_container_supervisor::logs::{
         CONTAINER_LOG_REMOVE_TIMEOUT, remove_container_logs_guarded_bounded,
     };
     let Some(root) = store.host_state_root() else {
-        return;
+        return Ok(());
     };
     let started = Instant::now();
     let guard_root = root.to_path_buf();
     let guard_id = id.clone();
+    let mut timed_out = false;
     let outcome = match remove_container_logs_guarded_bounded(
         root,
         id,
@@ -675,12 +680,28 @@ fn reclaim_stale_container_log(
         move || super::stop_delete::id_is_still_deleted(&guard_root, &guard_id),
     ) {
         Ok(removed) if removed.log_files() > 0 => OpOutcome::Success,
-        Ok(_) => return,
-        Err(_) => OpOutcome::Failure,
+        Ok(_) => return Ok(()),
+        Err(e) => {
+            timed_out = e.code() == fandhe_container_core::traits::ErrorCode::Timeout;
+            OpOutcome::Failure
+        }
     };
     if let Ok(name) = OpName::new("container_log_reclaim") {
         let _ = recorder.record(&name, outcome, started.elapsed());
     }
+    reclaim_timeout_result(timed_out)
+}
+
+/// 回収の期限切れを create の失敗へ写す（残った作業スレッドを抱えたまま監査記録へ進まない。SEC-4・#2698）。
+fn reclaim_timeout_result(timed_out: bool) -> Result<(), OciRuntimeError> {
+    if timed_out {
+        return Err(OciRuntimeError::new(
+            LifecycleOp::Create,
+            fandhe_container_core::traits::ErrorCode::Timeout,
+            "stale container log reclaim did not finish within the deadline",
+        ));
+    }
+    Ok(())
 }
 
 /// 本番入口の `start`。成功時は何も出さない（OCI の start 互換）。
@@ -1860,11 +1881,11 @@ mod reclaim_tests {
         let t = Tmp::new("leftover");
         let st = t.store();
         let rec = OpRecorder::new();
-        reclaim_stale_container_log(&st, &id("a1"), &rec);
+        reclaim_stale_container_log(&st, &id("a1"), &rec).expect("ok");
         assert_eq!(stats(&rec), None);
         drop(open_sink(&t, "a1"));
         assert!(t.names() > 0);
-        reclaim_stale_container_log(&st, &id("a1"), &rec);
+        reclaim_stale_container_log(&st, &id("a1"), &rec).expect("ok");
         assert_eq!(t.names(), 0);
         assert_eq!(stats(&rec), Some((1, 0)));
     }
@@ -1882,9 +1903,17 @@ mod reclaim_tests {
         st.create(&req).expect("create");
         let before = t.names();
         let rec = OpRecorder::new();
-        reclaim_stale_container_log(&st, &id("p1"), &rec);
+        reclaim_stale_container_log(&st, &id("p1"), &rec).expect("ok");
         assert_eq!(t.names(), before);
         assert_eq!(stats(&rec), None);
+    }
+
+    /// 回収が期限切れなら create は core を呼ばず TIMEOUT で失敗する（SEC-4・SUP-7・#2698）。
+    #[test]
+    fn sup7_cli1_create_reclaim_timeout_fails_create_before_core() {
+        assert!(reclaim_timeout_result(false).is_ok());
+        let e = reclaim_timeout_result(true).expect_err("timeout");
+        assert_eq!(e.code(), fandhe_container_core::traits::ErrorCode::Timeout);
     }
 
     /// 古い supervisor の sink が生きている（ロック保持）ときは消さず、Failure が 1 件記録される。
@@ -1895,7 +1924,7 @@ mod reclaim_tests {
         let _sink = open_sink(&t, "l1");
         let before = t.names();
         let rec = OpRecorder::new();
-        reclaim_stale_container_log(&st, &id("l1"), &rec);
+        reclaim_stale_container_log(&st, &id("l1"), &rec).expect("ok");
         assert_eq!(t.names(), before);
         assert_eq!(stats(&rec), Some((0, 1)));
     }

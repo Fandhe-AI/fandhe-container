@@ -53,7 +53,7 @@ plugin-cri の `RemoveContainer`（`CoreLifecycleRuntime::delete`）は、core �
   （`repair5_cli_delete_cleanup_budget_fits_20s`）
 - 残ったログの回収（#2698）: 同じ ID の CLI `create` が core を呼ぶ前に、待たずに 1 回だけ（上限 5 秒）消す
   （`reclaim_stale_container_log`）。古い supervisor が生きていれば何も消さず、状態がある ID は guard で消さない。best effort で
-  create の成否と stderr は変えず、観測は op 名 `container_log_reclaim`（消した Success・エラーの Failure）
+  create の成否と stderr は変えず（ただし回収が期限切れ `Timeout` のときは、作業スレッドを残したまま監査記録の fork〔単一スレッド前提。SEC-4〕へ進まないよう core を呼ばず `TIMEOUT` で create を失敗させる）、観測は op 名 `container_log_reclaim`（消した Success・エラーの Failure）
 - 範囲外: ID を再利用しない場合（plugin-cri の CRI など）の残りの自動回収（`@container-logs` 全体の走査は stem の復号と状態の照合、
   delete の遅延予算の再設計が要る）、plugin-cri の `CreateContainer` への同じ契機の配線。残りは手動で消す
   （`docs/setup/container-log-recovery.md`）

@@ -204,12 +204,20 @@ pub struct AttachFailure {
     pub error: TraitError,
     /// 巻き戻しで回収できずカーネルに残った資源の件数（0 なら回収済み）。
     pub leftover: usize,
+    /// `create_netns` の失敗で、回収できなかった netns のハンドルをバックエンドが保持している印。
+    /// 立っていればレジストリは記録を残し、`detach`・`delete_network` が `release_netns` で再試行する
+    /// （ハンドルを捨てて回収不能にしない。#2675）。`create_netns` 以外では常に false。
+    pub netns_retained: bool,
 }
 
 impl From<TraitError> for AttachFailure {
     /// 取り残しなしの失敗。
     fn from(error: TraitError) -> Self {
-        Self { error, leftover: 0 }
+        Self {
+            error,
+            leftover: 0,
+            netns_retained: false,
+        }
     }
 }
 
@@ -348,6 +356,9 @@ struct ContainerEntry<C> {
     /// ネットワーク削除を fail-closed で拒否する（net に所有確認つきの個別回収 API が入るまでの保持）。
     /// 作成失敗の回収（#2467）とは別で、attach 側の回収は未実装。
     unreclaimed: bool,
+    /// `create_netns` が `lo` の up に失敗して unpin もできず、バックエンドが netns を保持している印。
+    /// attach は拒否し、`detach`・`delete_network` が `release_netns` で回収する（#2675）。
+    netns_retained: bool,
 }
 
 /// 作成済みネットワーク 1 件の記録。
@@ -664,16 +675,18 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             .and_then(|n| n.handle.as_mut())
             .ok_or_else(not_found_network)?;
         if let Err(f) = self.backend.create_netns(handle, &endpoint) {
-            if f.leftover > 0 {
-                // 取り残した pin を追跡から落とさない。回収待ち（unreclaimed）の記録として保持し、
-                // 回収を確認できるまで `delete_network` は成功を返さない（契約 6・9。#2675）。
+            if f.leftover > 0 || f.netns_retained {
+                // 取り残した pin を追跡から落とさない（契約 6・9。#2675）。バックエンドがハンドルを保持して
+                // いれば `release_netns` で回収できる記録として、保持していなければ手動回収待ち
+                // （unreclaimed）の記録として残す。
                 reg.containers.insert(
                     req.container().as_str().to_owned(),
                     ContainerEntry {
                         network: req.network().as_str().to_owned(),
                         endpoint,
                         attached: None,
-                        unreclaimed: true,
+                        unreclaimed: !f.netns_retained,
+                        netns_retained: f.netns_retained,
                     },
                 );
             }
@@ -686,6 +699,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 endpoint,
                 attached: None,
                 unreclaimed: false,
+                netns_retained: false,
             },
         );
         Ok(NetnsStatus::new(req.container().clone(), netns))
@@ -737,6 +751,12 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             return Err(TraitError::new(
                 ErrorCode::Unimplemented,
                 MSG_STATIC_ADDRESS_UNAVAILABLE,
+            ));
+        }
+        if container.netns_retained {
+            return Err(TraitError::new(
+                ErrorCode::FailedPrecondition,
+                "container netns is pending release after a failed create; detach it first",
             ));
         }
         let handle = network.handle.as_mut().ok_or_else(leaked_network)?;
@@ -832,20 +852,19 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             .filter(|id| reg.containers.get(*id).is_some_and(|c| c.unreclaimed))
             .count();
         // 未 attach で事前作成の netns を持つコンテナは、attach 済みのハンドルを取り出す前に解放する。
-        // 失敗したら記録を保持して返す（deleting は保たれ、再試行の delete_network で解放をやり直せる。#2675）。
-        if !network.backend_deleted {
-            let mut first_error = None;
-            for id in &linked {
-                if let Some(c) = reg.containers.get(id)
-                    && c.attached.is_none()
-                    && !c.unreclaimed
-                    && let Err(e) = self.backend.release_netns(&c.endpoint)
-                {
-                    first_error.get_or_insert(e);
-                }
-            }
-            if let Some(e) = first_error {
-                return Err(e);
+        // 1 件の失敗で残りを止めない（契約 9）: 失敗した記録は保持し、最初のエラーを覚えたまま
+        // attach 済みの資源の解放を続け、最後にそのエラーを返す（deleting は保たれ、再試行で解放をやり直せる。#2675）。
+        // バックエンドのネットワーク解放済みでも再試行で解放できるよう、常に試みる（冪等）。
+        let mut first_error = None;
+        let mut release_failed: Vec<String> = Vec::new();
+        for id in &linked {
+            if let Some(c) = reg.containers.get(id)
+                && c.attached.is_none()
+                && !c.unreclaimed
+                && let Err(e) = self.backend.release_netns(&c.endpoint)
+            {
+                first_error.get_or_insert(e);
+                release_failed.push(id.clone());
             }
         }
         let mut handles = Vec::new();
@@ -865,9 +884,14 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
             Ok(()) => {
                 network.backend_deleted = true;
                 for id in &linked {
-                    if !reg.containers.get(id).is_some_and(|c| c.unreclaimed) {
+                    if !reg.containers.get(id).is_some_and(|c| c.unreclaimed)
+                        && !release_failed.contains(id)
+                    {
                         reg.containers.remove(id);
                     }
+                }
+                if let Some(e) = first_error {
+                    return Err(e);
                 }
                 if unreclaimed_count > 0 {
                     return Err(delete_incomplete(unreclaimed_count));
@@ -889,7 +913,7 @@ impl<B: NetsetupBackend> NetsetupNetwork<B> {
                 for id in attached_ids.iter().filter(|id| !kept.contains(id)) {
                     reg.containers.remove(id);
                 }
-                Err(failure.error)
+                Err(first_error.unwrap_or(failure.error))
             }
         }
     }
@@ -1135,9 +1159,22 @@ mod linux {
                     .map_err(|e| {
                         // 取り残した pin があれば件数 1 として報告し、レジストリが回収待ちとして保持する。
                         let leftover = usize::from(e.leftover.is_some());
+                        let error = with_leftover(net_error_to_trait(&e.error), leftover);
+                        // unpin できなかった netns は保持し、`release_netns` で再試行できるようにする（#2675）。
+                        let netns_retained = match e.retained {
+                            Some(netns) => match self.lock_prepared() {
+                                Ok(mut p) => {
+                                    p.insert(endpoint.as_str().to_owned(), *netns);
+                                    true
+                                }
+                                Err(_) => false,
+                            },
+                            None => false,
+                        };
                         AttachFailure {
-                            error: with_leftover(net_error_to_trait(&e.error), leftover),
+                            error,
                             leftover,
+                            netns_retained,
                         }
                     })?;
             self.lock_prepared()?
@@ -1215,6 +1252,7 @@ mod linux {
                     return Err(AttachFailure {
                         error: with_leftover(net_error_to_trait(&e.error.error), leftover),
                         leftover,
+                        netns_retained: false,
                     });
                 }
             };

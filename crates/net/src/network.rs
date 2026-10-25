@@ -2068,7 +2068,7 @@ pub fn attach_container(
 
 /// [`create_container_netns`] の失敗。作成途中の残骸が残りうるかを `leftover` で伝える。
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct NetnsCreateError {
     /// 失敗の原因。
@@ -2076,6 +2076,9 @@ pub struct NetnsCreateError {
     /// 取り残した pin の状態（何も残していなければ `None`。`Present` は後始末の失敗、`Unknown` は結果不明で
     /// fail-closed のため削除していない）。
     pub leftover: Option<ResourceState>,
+    /// `lo` の up に失敗し、unpin もできなかった netns（fd と pin を保持したまま）。呼び出し側が保持して
+    /// [`release_container_netns`] で再試行できるようにする（捨てるとハンドルを失い二度と回収できない。#2675）。
+    pub retained: Option<Box<PreparedNetns<ContainerNetns>>>,
 }
 
 /// [`attach_prepared_container`] の失敗。事前作成の netns は unpin せずに返す。
@@ -2120,6 +2123,7 @@ pub fn create_container_netns(
         return Err(NetnsCreateError {
             error: invalid("netns directory must be an absolute path"),
             leftover: None,
+            retained: None,
         });
     }
     match netns::create_pinned(netns_dir, endpoint, timeout, route.recorder()) {
@@ -2131,10 +2135,18 @@ pub fn create_container_netns(
                     Ok(()) => NetnsCreateError {
                         error,
                         leftover: None,
+                        retained: None,
                     },
-                    Err(_) => NetnsCreateError {
+                    // unpin に失敗したら netns を返して再試行できるようにする（#2675）。
+                    Err(f) => NetnsCreateError {
                         error,
                         leftover: Some(ResourceState::Present),
+                        retained: Some(Box::new(PreparedNetns {
+                            netns: f.netns,
+                            pin_dir_id,
+                            endpoint: endpoint.clone(),
+                            dir: netns_dir.to_owned(),
+                        })),
                     },
                 });
             }
@@ -2148,6 +2160,7 @@ pub fn create_container_netns(
         Err(f) => Err(NetnsCreateError {
             error: f.error,
             leftover: f.leftover,
+            retained: None,
         }),
     }
 }

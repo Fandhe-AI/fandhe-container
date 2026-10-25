@@ -53,6 +53,8 @@ struct Script {
     fail_create_netns: bool,
     /// create_netns の失敗時に取り残す pin の件数。
     create_netns_leftover: usize,
+    /// create_netns の失敗でバックエンドがハンドルを保持している印を立てるか。
+    create_netns_retained: bool,
     /// 次の release_netns を失敗させる回数。
     fail_release: u32,
 }
@@ -131,6 +133,7 @@ impl NetsetupBackend for Fake {
             return Err(AttachFailure {
                 error: TraitError::new(ErrorCode::Internal, "create_netns failed"),
                 leftover: s.create_netns_leftover,
+                netns_retained: s.create_netns_retained,
             });
         }
         Ok(())
@@ -159,6 +162,7 @@ impl NetsetupBackend for Fake {
             return Err(AttachFailure {
                 error: TraitError::new(ErrorCode::Internal, "attach failed"),
                 leftover: s.attach_leftover,
+                netns_retained: false,
             });
         }
         Ok(AttachOutcome {
@@ -948,7 +952,8 @@ fn net1_delete_network_releases_unattached_prepared_netns() {
             .code(),
         ErrorCode::Internal
     );
-    assert!(!fake.calls().iter().any(|c| c.starts_with("delete_network")));
+    // 契約 9: c1 の解放失敗で止まらず、attach 済みの c2 の解放は続ける。
+    assert_eq!(fake.calls().last().unwrap(), "delete_network a [c2]");
     pod_network::tear_down_pod(&net, &nname("a")).expect("retry");
     assert_eq!(
         fake.netns_calls(),
@@ -960,6 +965,65 @@ fn net1_delete_network_releases_unattached_prepared_netns() {
         ]
     );
     assert_eq!(fake.calls().last().unwrap(), "delete_network a [c2]");
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|c| c.starts_with("delete_network"))
+            .count(),
+        1
+    );
+}
+
+/// 保持された netns を解放できなくても、同じネットワークの attach 済みコンテナの回収は続く（契約 9。#2675）。
+#[test]
+fn contract9_release_failure_does_not_stop_attached_cleanup() {
+    let (net, fake) = plugin();
+    pod_network::set_up_pod(&net, &nname("a"), subnet()).expect("a");
+    net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c1")))
+        .expect("c1");
+    net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c2")))
+        .expect("c2");
+    net.attach(&AttachRequest::new(nname("a"), cid("c2")))
+        .expect("attach c2");
+    fake.0.lock().expect("lock").fail_release = 5;
+    let e = net
+        .delete_network(&DeleteNetworkRequest::new(nname("a")))
+        .expect_err("release fails");
+    assert_eq!(e.code(), ErrorCode::Internal);
+    assert_eq!(fake.calls().last().unwrap(), "delete_network a [c2]");
+    // 失敗した c1 の記録は残り、解放できるようになれば完了する。
+    fake.0.lock().expect("lock").fail_release = 0;
+    net.delete_network(&DeleteNetworkRequest::new(nname("a")))
+        .expect("retry");
+}
+
+/// create_netns が lo の up 失敗後の unpin にも失敗し、バックエンドがハンドルを保持したら、
+/// 回収待ちで固定せず `release_netns` で回収できる（#2675）。
+#[test]
+fn net1_create_netns_retained_handle_is_released_by_delete() {
+    let (net, fake) = plugin();
+    pod_network::set_up_pod(&net, &nname("a"), subnet()).expect("a");
+    {
+        let mut s = fake.0.lock().expect("lock");
+        s.fail_create_netns = true;
+        s.create_netns_leftover = 1;
+        s.create_netns_retained = true;
+    }
+    assert!(
+        net.create_netns(&CreateNetnsRequest::new(nname("a"), cid("c1")))
+            .is_err()
+    );
+    fake.0.lock().expect("lock").fail_create_netns = false;
+    // attach はできない。
+    assert_eq!(
+        net.attach(&AttachRequest::new(nname("a"), cid("c1")))
+            .expect_err("pending release")
+            .code(),
+        ErrorCode::FailedPrecondition
+    );
+    net.delete_network(&DeleteNetworkRequest::new(nname("a")))
+        .expect("released and deleted");
+    assert!(fake.netns_calls().contains(&"release_netns c1".to_owned()));
 }
 
 /// create_netns の失敗では記録を作らない。

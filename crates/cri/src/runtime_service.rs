@@ -241,6 +241,9 @@ struct SandboxRecord {
     /// `PodNetworkProvider` の資源が残りうる（set_up の成功、または結果不明）。Stop・Remove が `tear_down` で
     /// 回収し、成功したら偽に戻す。回収に失敗したら真のまま保持して再試行できるようにする（fail-closed）。
     network_owned: bool,
+    /// `tear_down` の worker が走っている間は真（Stop・Remove の重複起動を拒否する。REPAIR-5・CRI-2）。
+    /// 期限超過で RPC が返っても worker が終わるまで偽に戻らない（[`NetworkTearDownGuard`] が解除する）。
+    network_teardown: bool,
     /// set_up が返した、結線済みの pod network namespace。配下のコンテナの bundle へ渡す。
     pod_netns: Option<PodNetns>,
 }
@@ -608,6 +611,25 @@ impl Drop for NetworkSetUpGuard {
             record.network_pending = false;
             record.network_owned = true;
             record.state = SandboxState::NotReady;
+        }
+    }
+}
+
+/// `tear_down` の worker が終わるまで `network_teardown` を保つ guard（worker へ move する）。
+///
+/// 期限超過で呼び出し側が先に返っても worker の終了（panic 含む）で解除されるため、ハングした worker が
+/// 残っている間の重複起動を拒否できる（REPAIR-5）。
+struct NetworkTearDownGuard {
+    registry: Arc<Mutex<SandboxRegistry>>,
+    id: String,
+}
+
+impl Drop for NetworkTearDownGuard {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = self.registry.lock()
+            && let Some(record) = registry.records.get_mut(&self.id)
+        {
+            record.network_teardown = false;
         }
     }
 }
@@ -1027,12 +1049,19 @@ impl CriRuntimeService {
             pod_sandbox_id.clone(),
             SandboxRecord {
                 config: config.into_config(),
-                state: SandboxState::Ready,
+                // netns の用意が済むまでは Ready にしない（List・Status に未完了の sandbox を見せない。CRI-2）。
+                // `run_sandbox_networked` の worker が set_up 成功を確定するロック内で Ready へ遷移させる。
+                state: if network_pending {
+                    SandboxState::NotReady
+                } else {
+                    SandboxState::Ready
+                },
                 created_at_nanos,
                 runtime_handler,
                 retained_bytes,
                 network_pending,
                 network_owned: false,
+                network_teardown: false,
                 pod_netns: None,
             },
         );
@@ -1091,9 +1120,11 @@ impl CriRuntimeService {
                 // 失敗時は notready を worker がロック下で確定する（Ready のまま CreateContainer が通らないように）。
                 record.network_owned = true;
                 record.network_pending = false;
-                if outcome.is_err() {
-                    record.state = SandboxState::NotReady;
-                }
+                record.state = if outcome.is_ok() {
+                    SandboxState::Ready
+                } else {
+                    SandboxState::NotReady
+                };
                 record.pod_netns = netns;
             }
             outcome
@@ -1121,7 +1152,16 @@ impl CriRuntimeService {
                     err.code(),
                     CriErrorCode::Timeout | CriErrorCode::Unavailable
                 );
-                let reclaimed = !unknown && self.tear_down_bounded(provider, &id).await.is_ok();
+                let reclaimed = if unknown {
+                    false
+                } else {
+                    match self.reserve_tear_down(&id) {
+                        Ok(Some(guard)) => {
+                            self.tear_down_bounded(provider, &id, guard).await.is_ok()
+                        }
+                        _ => false,
+                    }
+                };
                 if reclaimed {
                     // 資源は無い。記録と件数枠を解放する（失敗しても元のエラーを返す）。
                     if let Ok(mut registry) = self.registry.lock() {
@@ -1142,17 +1182,59 @@ impl CriRuntimeService {
         }
     }
 
+    /// 回収の開始をロック下で予約する（既に回収中・set_up 中なら `FAILED_PRECONDITION`）。
+    ///
+    /// 戻り値の guard を `tear_down_bounded` へ渡す。記録が無ければ `None`。
+    fn reserve_tear_down(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<NetworkTearDownGuard>, CriError> {
+        let mut registry = self
+            .registry
+            .lock()
+            .map_err(|_| CriError::internal("sandbox registry is unavailable"))?;
+        let Some(record) = registry.records.get_mut(sandbox_id) else {
+            return Ok(None);
+        };
+        if record.network_pending || record.network_teardown {
+            return Err(CriError::failed_precondition(
+                "sandbox network setup or teardown is in progress",
+            ));
+        }
+        record.network_teardown = true;
+        Ok(Some(NetworkTearDownGuard {
+            registry: Arc::clone(&self.registry),
+            id: sandbox_id.to_owned(),
+        }))
+    }
+
     /// `PodNetworkProvider::tear_down` を worker スレッドで期限つきに呼ぶ（REPAIR-5）。
+    ///
+    /// 成功は worker がロック下で `network_owned` を外して確定する（期限超過後に遅れて成功しても反映される）。
+    /// guard は worker が終わるまで重複起動を拒否する。
     async fn tear_down_bounded(
         &self,
         provider: &Arc<dyn PodNetworkProvider>,
         sandbox_id: &str,
+        guard: NetworkTearDownGuard,
     ) -> Result<(), CriError> {
         let provider = Arc::clone(provider);
         let id = sandbox_id.to_owned();
-        run_bounded(self.runtime_timeout, move || provider.tear_down(&id))
-            .await
-            .and_then(|r| r)
+        let registry = Arc::clone(&self.registry);
+        run_bounded(self.runtime_timeout, move || {
+            let _guard = guard;
+            let result = provider.tear_down(&id);
+            if result.is_ok()
+                && let Ok(mut registry) = registry.lock()
+                && let Some(record) = registry.records.get_mut(&id)
+            {
+                record.network_owned = false;
+                record.pod_netns = None;
+            }
+            result
+        })
+        .await
+        .and_then(|r| r)
     }
 
     /// 資源が残りうる pod network を回収し、成功したら記録の印を外す（Stop・Remove から呼ぶ）。
@@ -1180,14 +1262,10 @@ impl CriRuntimeService {
                 return Ok(());
             }
         }
-        self.tear_down_bounded(provider, sandbox_id).await?;
-        if let Ok(mut registry) = self.registry.lock()
-            && let Some(record) = registry.records.get_mut(sandbox_id)
-        {
-            record.network_owned = false;
-            record.pod_netns = None;
-        }
-        Ok(())
+        let Some(guard) = self.reserve_tear_down(sandbox_id)? else {
+            return Ok(());
+        };
+        self.tear_down_bounded(provider, sandbox_id, guard).await
     }
 
     /// `StopPodSandbox` 本体（実行層の有無で分岐）に、pod network の回収を足したもの。
@@ -1248,10 +1326,10 @@ impl CriRuntimeService {
         if registry
             .records
             .get(sandbox_id)
-            .is_some_and(|r| r.network_pending)
+            .is_some_and(|r| r.network_pending || r.network_teardown)
         {
             return Err(CriError::failed_precondition(
-                "sandbox network setup is in progress",
+                "sandbox network setup or teardown is in progress",
             ));
         }
         Ok(())

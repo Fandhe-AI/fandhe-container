@@ -105,6 +105,28 @@ check ignored-invalid 2 "usage:" bin-ok "${P}" "${B}" "${S}" TEST_IGNORED=yes
 check missing-test 2 "usage:" ok "${P}"
 check bad-package 2 "usage:" ok PACKAGE=other "${T}"
 check flag-injection 2 "usage:" ok "${P}" "TEST=--help"
+# FEATURES: 検証と cargo への受け渡し（#2711）。
+check features-bad-flag 2 "usage:" ok "${P}" "${T}" FEATURES=-x
+check features-bad-space 2 "usage:" ok "${P}" "${T}" "FEATURES=a b"
+check features-bad-semicolon 2 "usage:" ok "${P}" "${T}" "FEATURES=a;b"
+check features-too-long 2 "usage:" ok "${P}" "${T}" "FEATURES=$(printf 'a%.0s' $(seq 1 129))"
+check features-pass 0 "passed=2 failed=0 count=2" ok "${P}" "${T}" FEATURES=grpc,x COUNT=2
+rm -f "${work}/args" "${work}/counter"
+env PATH="${work}/bin:${PATH}" STUB_MODE=ok STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \
+  "${P}" "${T}" FEATURES=grpc COUNT=1 "${target}" >/dev/null 2>&1
+if [ "$(grep -cF -- "--features grpc" "${work}/args")" -eq 2 ]; then
+  echo "OK: features-args"
+else
+  echo "NG: features-args" >&2; cat "${work}/args" >&2; fails=$((fails + 1))
+fi
+rm -f "${work}/args" "${work}/counter"
+env PATH="${work}/bin:${PATH}" STUB_MODE=ok STUB_COUNTER="${work}/counter" STUB_ARGS_LOG="${work}/args" \
+  "${P}" "${T}" COUNT=1 "${target}" >/dev/null 2>&1
+if ! grep -qF -- "--features" "${work}/args"; then
+  echo "OK: no-features-args"
+else
+  echo "NG: no-features-args" >&2; cat "${work}/args" >&2; fails=$((fails + 1))
+fi
 check count-zero 2 "usage:" ok "${P}" "${T}" COUNT=0
 check count-over 2 "usage:" ok "${P}" "${T}" COUNT=1001
 

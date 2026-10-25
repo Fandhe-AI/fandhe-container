@@ -446,3 +446,136 @@ fn oci7_sec1_fetch_into_swapped_root_is_not_published() {
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&moved);
 }
+
+/// `root` に `blobs/sha256/<hex>` を `len` バイトで置く（`blobs/sha256` が無ければ作る）。
+fn put_blob(root: &Path, n: u8, len: usize) {
+    let p = blob_path(root, &d(n)).expect("blob path");
+    fs::create_dir_all(p.parent().expect("parent")).expect("mkdir blobs");
+    fs::write(p, vec![0u8; len]).expect("write blob");
+}
+
+/// `root` に `staging/<pull>/<file>` を `len` バイトで置く。
+fn put_staged(root: &Path, pull: &str, file: &str, len: usize) {
+    let dir = root.join("staging").join(pull);
+    fs::create_dir_all(&dir).expect("mkdir staging");
+    fs::write(dir.join(file), vec![0u8; len]).expect("write staged");
+}
+
+/// OCI-7・SEC-1・#2695: 排他区間を取った後に root を差し替えても、`disk_usage` / `list_images` は検査済みの
+/// 実体（本物の値）だけを数える。おとりの別サイズの blob・staging は数えず、おとりには何も書かない。
+#[test]
+fn oci7_sec1_usage_after_root_swap_counts_only_verified_root() {
+    let root = temp_root("usage");
+    let moved = root.with_extension("moved");
+    let store = seeded(&root);
+    put_blob(&root, 0xc1, 10);
+    put_blob(&root, 0x11, 1000);
+    put_staged(&root, "p1", "aa", 777);
+    let guard = store.lock().expect("lock");
+    swap_root(&root, &moved);
+    put_blob(&root, 0xc1, 5000);
+    put_blob(&root, 0x11, 7000);
+    put_blob(&root, 0x99, 999);
+    put_staged(&root, "p9", "zz", 55);
+    let decoy_before = names(&root.join("blobs").join("sha256"));
+    let real_before = names(&moved.join("blobs").join("sha256"));
+
+    let df = guard.disk_usage_at(store.handle()).expect("df");
+    assert_eq!(df.images.count, 1);
+    assert_eq!(df.images.bytes, 1010);
+    assert_eq!(df.images.reclaimable_bytes, 1010);
+    assert_eq!(df.images.missing_blobs, 0);
+    assert_eq!(df.cache.blob_count, 2);
+    assert_eq!(df.cache.bytes, 1010);
+    assert_eq!(df.cache.unregistered_count, 0);
+    assert_eq!(df.staging.pulls, 1);
+    assert_eq!(df.staging.file_count, 1);
+    assert_eq!(df.staging.bytes, 777);
+
+    let ls = guard.list_images_at(store.handle()).expect("ls");
+    assert_eq!(ls.entries.len(), 1);
+    assert_eq!(ls.entries[0].digest, d(0xa0));
+    assert_eq!(ls.entries[0].size_bytes, 1010);
+    assert!(ls.entries[0].missing_blobs.is_empty());
+
+    // 読み取りは何も書かず・消さない。
+    assert_eq!(names(&root.join("blobs").join("sha256")), decoy_before);
+    assert_eq!(names(&moved.join("blobs").join("sha256")), real_before);
+    assert_eq!(
+        fs::metadata(blob_path(&root, &d(0x99)).expect("path"))
+            .expect("decoy blob")
+            .len(),
+        999
+    );
+    drop(guard);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&moved);
+}
+
+/// OCI-7・SEC-1・#2695: 再検査の直後に root が差し替えられた排他区間では、公開 API に差し替え後のパスを渡すと
+/// `InvalidArgument` で拒否し、同じ実体（移動先）のパスなら本物の値を返す。
+#[test]
+fn oci7_sec1_usage_with_swapped_root_path_is_rejected() {
+    let root = temp_root("usage-path");
+    let moved = root.with_extension("moved");
+    let store = seeded(&root);
+    put_blob(&root, 0xc1, 10);
+    put_blob(&root, 0x11, 1000);
+    let (r, m) = (root.clone(), moved.clone());
+    set_after_reverify(move || swap_root(&r, &m));
+    let guard = store.lock().expect("lock");
+    put_blob(&root, 0xc1, 5000);
+
+    let msg = "root does not match the image store root of this exclusive section";
+    let e = guard.list_images(&root).expect_err("decoy path (ls)");
+    assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+    assert_eq!(e.message(), msg);
+    let e = guard.disk_usage(&root).expect_err("decoy path (df)");
+    assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+    assert_eq!(e.message(), msg);
+    assert_eq!(guard.disk_usage(&moved).expect("df").images.bytes, 1010);
+    assert_eq!(
+        guard.list_images(&moved).expect("ls").entries[0].size_bytes,
+        1010
+    );
+    drop(guard);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&moved);
+}
+
+/// OCI-7・SEC-1・#2695: ガードの内側で取った展開後サイズの計画は、ガードを手放して root が差し替えられても
+/// 検査済みの実体のレイヤーだけを読み、差し替え後のパスは `InvalidArgument` で拒否する。
+#[test]
+fn oci7_sec1_expanded_measure_after_root_swap_reads_only_verified_root() {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    fn gz(len: usize) -> Vec<u8> {
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(&vec![1u8; len]).expect("gz write");
+        e.finish().expect("gz finish")
+    }
+    let root = temp_root("expanded");
+    let moved = root.with_extension("moved");
+    let store = seeded(&root);
+    let p = blob_path(&root, &d(0x11)).expect("path");
+    fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+    fs::write(&p, gz(3000)).expect("real layer");
+    let plan = {
+        let guard = store.lock().expect("lock");
+        guard.expanded_size_plan()
+    };
+    swap_root(&root, &moved);
+    let q = blob_path(&root, &d(0x11)).expect("path");
+    fs::create_dir_all(q.parent().expect("parent")).expect("mkdir decoy");
+    fs::write(&q, gz(40)).expect("decoy layer");
+
+    let u = plan.measure(&moved).expect("measure moved");
+    assert_eq!(u.expanded_bytes, 3000);
+    assert_eq!(u.measured_layers, 1);
+    assert_eq!(u.missing_layers, 0);
+    let e = plan.measure(&root).expect_err("decoy path");
+    assert_eq!(e.code(), OciErrorCode::InvalidArgument);
+    let _ = fs::remove_dir_all(&root);
+    let _ = fs::remove_dir_all(&moved);
+}

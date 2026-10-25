@@ -9,8 +9,10 @@
 //! `@image-inventory.json`・`@gc-pending.json` とその一時ファイル・`blobs/sha256/<hex>` の削除）を
 //! その fd 起点の `openat2` / `*at` に閉じ込める。差し替えが起きても書き込み・削除は検査済みの実体にだけ
 //! 届き、差し替え後のディレクトリには何も書かず何も消さない（入口の検出と区間内の閉じ込めの 2 層）。
+//! 読み取り専用の集計（`usage*`。件数・サイズ・staging・展開後サイズ）も同じ fd 起点の `open_blob_dir` /
+//! `open_subdir` / `stat` / `entries` / `open_file` で行い、検査済みの実体にだけ届く（#2695）。
 //! 呼び出し元は `store`（open・lock・create ゲート）・`container_ref_persist`・`inventory_persist`・
-//! `gc_journal`・`remove`・`prune`。名前は定数か検証済みの hex の 1 コンポーネントに限る
+//! `gc_journal`・`remove`・`prune`・`usage`。名前は定数か検証済みの hex の 1 コンポーネントに限る
 //! （外部入力からパスを組まない。`sys::at::component_cstring` が入口で再検証する）。
 //!
 //! # 方式と `cfg` の局所化
@@ -29,10 +31,9 @@
 //! # 移していない操作（実装済みを装わない。REPAIR-3）
 //!
 //! `pull` / `pull_recovery` の staging・公開・回収は `staging` 子モジュールの `StagingDir` / `PullDir` と
-//! `BlobDir` 経由で fd 起点へ移した（#2694）。移していないのは次の 2 つである。根拠と追跡 issue は
+//! `BlobDir` 経由で fd 起点へ移した（#2694）。移していないのは次の 1 つである。根拠と追跡 issue は
 //! `docs/design/image-store-root-trust.md` の論点 3 を参照。
 //!
-//! - `usage*` の読み取り（件数・サイズの集計）はパス起点のまま（#2695）。
 //! - fetcher（`RegistryClient::fetch_blob`）が書く先は `PullSession::staged_blob_path` が返すパスである。
 //!   fetcher の API がパスを受け取るためで、handle 起点にするには cri の fetch トレイトを含む crate をまたぐ
 //!   変更が要る。差し替えが起きてもおとりへ書かれた内容は公開されない（公開は pull ディレクトリ fd 起点で
@@ -48,6 +49,15 @@ use crate::error::{OciError, OciErrorCode};
 
 fn root_inaccessible() -> OciError {
     OciError::new(OciErrorCode::Internal, "image store root is not accessible")
+}
+
+/// `open_subdir` の失敗。呼び出し側（usage）が既存の code・文言へ写す（文言はここに固定しない）。
+#[derive(Debug)]
+pub(crate) enum SubDirError {
+    /// symlink・非ディレクトリ（辿らない）。
+    NotPlain,
+    /// その他の I/O の失敗。
+    Io,
 }
 
 /// 検査済み root へのハンドル。`ImageStore` が `Arc` で保持し、`ReferenceTable` の排他区間にも渡す。
@@ -152,7 +162,7 @@ mod imp {
     use std::os::unix::fs::MetadataExt as _;
     use std::path::{Path, PathBuf};
 
-    use super::{OciError, OciErrorCode, PullDir, RootHandle, root_inaccessible};
+    use super::{OciError, OciErrorCode, PullDir, RootHandle, SubDirError, root_inaccessible};
     use crate::sys::at::{
         self, ELOOP, ENOSYS, ENOTDIR, EPERM, O_CLOEXEC, O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW,
         O_NONBLOCK, O_PATH, O_RDONLY, O_WRONLY, RESOLVE_IN_ROOT, RESOLVE_NO_MAGICLINKS,
@@ -337,13 +347,22 @@ mod imp {
         pub(crate) fn open_blob_dir(&self) -> Result<Option<BlobDir>, OciError> {
             let rel = at::relative_cstring(&BLOB_DIR).map_err(|_| blob_dir_stat_failed())?;
             match self.open_at(&rel, O_RDONLY | O_DIRECTORY | O_NOFOLLOW, 0) {
-                Ok(fd) => Ok(Some(BlobDir(fd))),
+                Ok(fd) => Ok(Some(SubDir(fd))),
                 Err(e) => match errno(&e) {
                     Some(ELOOP | ENOTDIR) => Err(blob_dir_not_plain()),
                     _ if e.kind() == io::ErrorKind::NotFound => Ok(None),
                     _ => Err(blob_dir_stat_failed()),
                 },
             }
+        }
+
+        /// 直下のサブディレクトリを開く（#2695）。無ければ `None`、symlink・非ディレクトリは `NotPlain`。
+        pub(crate) fn open_subdir(
+            &self,
+            name: impl AsRef<OsStr>,
+        ) -> Result<Option<SubDir>, SubDirError> {
+            let n = Self::name_cstr(name.as_ref()).map_err(|_| SubDirError::Io)?;
+            open_dir_at(self.inner.as_fd(), &n)
         }
     }
 
@@ -397,11 +416,36 @@ mod imp {
         }
     }
 
-    /// 開いた `blobs/sha256`。
-    #[derive(Debug)]
-    pub(crate) struct BlobDir(OwnedFd);
+    /// `dirfd` 起点で `rel` のディレクトリを開く（末尾の symlink は辿らない）。
+    fn open_dir_at(
+        dirfd: std::os::fd::BorrowedFd<'_>,
+        rel: &std::ffi::CStr,
+    ) -> Result<Option<SubDir>, SubDirError> {
+        match at::openat2(
+            Some(dirfd),
+            rel,
+            O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC,
+            0,
+            RESOLVE,
+        ) {
+            Ok(fd) => Ok(Some(SubDir(fd))),
+            Err(e) => match errno(&e) {
+                Some(ELOOP | ENOTDIR) => Err(SubDirError::NotPlain),
+                _ if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                _ => Err(SubDirError::Io),
+            },
+        }
+    }
 
-    impl BlobDir {
+    /// 開いたディレクトリ（`blobs/sha256`・`staging`・`staging/<pull-id>`）。fd 起点で、読み取りの名前解決は
+    /// 常にこの fd の下に閉じる。
+    #[derive(Debug)]
+    pub(crate) struct SubDir(OwnedFd);
+
+    /// `blobs/sha256`（`SubDir` と同じ型）。
+    pub(crate) type BlobDir = SubDir;
+
+    impl SubDir {
         /// `p`（パスで辿った `blobs/sha256`）が、この fd と同じ実体か（dev / ino の照合。OCI-7・SEC-1・#2694）。
         pub(crate) fn matches_path(&self, p: &Path) -> bool {
             let Ok(fd) = self.0.try_clone() else {
@@ -413,9 +457,9 @@ mod imp {
             std::fs::metadata(p).is_ok_and(|m| (m.dev(), m.ino()) == (mine.dev(), mine.ino()))
         }
 
-        /// blob のメタデータ（symlink は辿らない）。無ければ `None`。
-        pub(crate) fn stat(&self, hex: &str) -> io::Result<Option<Metadata>> {
-            let n = at::component_cstring(OsStr::new(hex))?;
+        /// 直下のメタデータ（symlink は辿らない）。無ければ `None`。
+        pub(crate) fn stat(&self, name: impl AsRef<OsStr>) -> io::Result<Option<Metadata>> {
+            let n = at::component_cstring(name.as_ref())?;
             match at::openat2(
                 Some(self.0.as_fd()),
                 &n,
@@ -426,6 +470,63 @@ mod imp {
                 Ok(fd) => File::from(fd).metadata().map(Some),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(e),
+            }
+        }
+
+        /// 直下のサブディレクトリを開く。無ければ `None`、symlink・非ディレクトリは `NotPlain`。
+        pub(crate) fn open_subdir(
+            &self,
+            name: impl AsRef<OsStr>,
+        ) -> Result<Option<SubDir>, SubDirError> {
+            let n = at::component_cstring(name.as_ref()).map_err(|_| SubDirError::Io)?;
+            open_dir_at(self.0.as_fd(), &n)
+        }
+
+        /// 直下の名前を 1 件ずつ返す（`.` と `..` は除く）。呼ぶたびに新しい open file description を開く
+        /// （dup はファイル位置を共有し、2 回目以降の走査が空になる）。件数の上限判定は呼び出し側が行う。
+        pub(crate) fn entries(&self) -> io::Result<Entries> {
+            let dot = at::relative_cstring::<&str>(&[])?;
+            let dir = at::openat2(
+                Some(self.0.as_fd()),
+                &dot,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+                0,
+                RESOLVE,
+            )?;
+            Ok(Entries {
+                dir,
+                buf: vec![0u8; 8192],
+                queue: std::collections::VecDeque::new(),
+                done: false,
+            })
+        }
+
+        /// 直下の通常ファイルを読み取りで開く。無い・symlink・通常ファイルでないものは `None`（欠損扱い）。
+        /// FIFO で止まらないよう `O_NONBLOCK`。その他の I/O の失敗は `Err`（過少計上しない）。
+        pub(crate) fn open_file(&self, name: &str) -> Result<Option<File>, OciError> {
+            let n = at::component_cstring(OsStr::new(name)).map_err(crate::layer::map_io_error)?;
+            // 開く前に O_PATH の fstat で種類を確かめる。socket・デバイスを読み取りで開くと ENXIO 等で
+            // 失敗し集計全体が落ちる（従来の lstat 先行と同じく、通常ファイル以外は開かず欠損扱い）。
+            match self.stat(name) {
+                Ok(Some(m)) if m.is_file() => {}
+                Ok(_) => return Ok(None),
+                Err(e) => return Err(crate::layer::map_io_error(e)),
+            }
+            match at::openat2(
+                Some(self.0.as_fd()),
+                &n,
+                O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC,
+                0,
+                RESOLVE,
+            ) {
+                Ok(fd) => {
+                    let f = File::from(fd);
+                    let m = f.metadata().map_err(crate::layer::map_io_error)?;
+                    Ok(m.is_file().then_some(f))
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) if errno(&e) == Some(ELOOP) => Ok(None),
+                Err(e) => Err(crate::layer::map_io_error(e)),
             }
         }
 
@@ -485,6 +586,55 @@ mod imp {
             File::from(self.0.try_clone()?).sync_all()
         }
     }
+
+    /// `SubDir::entries` の逐次イテレータ。`getdents64` を 8192 バイトずつ読み、溜めた名前を 1 件ずつ返す。
+    #[derive(Debug)]
+    pub(crate) struct Entries {
+        dir: OwnedFd,
+        buf: Vec<u8>,
+        queue: std::collections::VecDeque<OsString>,
+        done: bool,
+    }
+
+    impl Iterator for Entries {
+        type Item = io::Result<OsString>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            loop {
+                if let Some(n) = self.queue.pop_front() {
+                    return Some(Ok(n));
+                }
+                if self.done {
+                    return None;
+                }
+                let n = match at::getdents64(self.dir.as_fd(), &mut self.buf) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        self.done = true;
+                        return Some(Err(e));
+                    }
+                };
+                if n == 0 {
+                    self.done = true;
+                    return None;
+                }
+                let Some(chunk) = self.buf.get(..n) else {
+                    self.done = true;
+                    return Some(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "malformed directory entry",
+                    )));
+                };
+                let queue = &mut self.queue;
+                if let Err(e) = at::for_each_dirent(chunk, |name| {
+                    queue.push_back(OsString::from_vec(name.to_vec()));
+                }) {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -498,9 +648,9 @@ mod imp {
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, File, Metadata, OpenOptions};
     use std::io;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
-    use super::{OciError, PullDir, RootHandle, root_inaccessible};
+    use super::{OciError, OciErrorCode, PullDir, RootHandle, SubDirError, root_inaccessible};
     use crate::image_management::usage::{blob_dir, check_blob_dirs};
 
     fn opts_mode(opts: &mut OpenOptions) {
@@ -616,7 +766,15 @@ mod imp {
 
         /// `blobs/sha256` を検査して開く（無ければ `None`）。
         pub(crate) fn open_blob_dir(&self) -> Result<Option<BlobDir>, OciError> {
-            Ok(check_blob_dirs(&self.path)?.then(|| BlobDir(blob_dir(&self.path))))
+            Ok(check_blob_dirs(&self.path)?.then(|| SubDir(blob_dir(&self.path))))
+        }
+
+        /// 直下のサブディレクトリを開く（#2695）。無ければ `None`、symlink・非ディレクトリは `NotPlain`。
+        pub(crate) fn open_subdir(
+            &self,
+            name: impl AsRef<OsStr>,
+        ) -> Result<Option<SubDir>, SubDirError> {
+            open_dir_path(self.path.join(name.as_ref()))
         }
     }
 
@@ -676,21 +834,65 @@ mod imp {
         }
     }
 
-    /// `blobs/sha256` のパス。
-    #[derive(Debug)]
-    pub(crate) struct BlobDir(PathBuf);
+    fn open_dir_path(p: PathBuf) -> Result<Option<SubDir>, SubDirError> {
+        match fs::symlink_metadata(&p) {
+            Ok(m) if m.is_dir() => Ok(Some(SubDir(p))),
+            Ok(_) => Err(SubDirError::NotPlain),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(SubDirError::Io),
+        }
+    }
 
-    impl BlobDir {
+    /// 開いたディレクトリ（パス起点）。
+    #[derive(Debug)]
+    pub(crate) struct SubDir(PathBuf);
+
+    /// `blobs/sha256`（`SubDir` と同じ型）。
+    pub(crate) type BlobDir = SubDir;
+
+    impl SubDir {
         /// パス起点の実装は同じパスを辿るため常に真（差し替えは入口の再検査だけで検出する）。
         pub(crate) fn matches_path(&self, _p: &Path) -> bool {
             true
         }
 
-        /// blob のメタデータ（symlink は辿らない）。無ければ `None`。
-        pub(crate) fn stat(&self, hex: &str) -> io::Result<Option<Metadata>> {
-            match fs::symlink_metadata(self.0.join(hex)) {
+        /// 直下のメタデータ（symlink は辿らない）。無ければ `None`。
+        pub(crate) fn stat(&self, name: impl AsRef<OsStr>) -> io::Result<Option<Metadata>> {
+            match fs::symlink_metadata(self.0.join(name.as_ref())) {
                 Ok(m) => Ok(Some(m)),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
+            }
+        }
+
+        /// 直下のサブディレクトリを開く。
+        pub(crate) fn open_subdir(
+            &self,
+            name: impl AsRef<OsStr>,
+        ) -> Result<Option<SubDir>, SubDirError> {
+            open_dir_path(self.0.join(name.as_ref()))
+        }
+
+        /// 直下の名前を 1 件ずつ返す（`.` と `..` は除く）。
+        pub(crate) fn entries(&self) -> io::Result<Entries> {
+            Ok(Entries(fs::read_dir(&self.0)?))
+        }
+
+        /// 直下の通常ファイルを読み取りで開く。無い・通常ファイルでない（symlink 等）・開く間に差し替えられた
+        /// ものは `None`（欠損扱い）。非 Unix は `open_blob_nofollow` と同じく `Unimplemented`。
+        pub(crate) fn open_file(&self, name: &str) -> Result<Option<File>, OciError> {
+            match crate::layer::open_blob_nofollow(&self.0.join(name)) {
+                Ok(f) => Ok(Some(f)),
+                Err(e)
+                    if matches!(
+                        e.code(),
+                        OciErrorCode::NotFound
+                            | OciErrorCode::InvalidArgument
+                            | OciErrorCode::FailedPrecondition
+                    ) =>
+                {
+                    Ok(None)
+                }
                 Err(e) => Err(e),
             }
         }
@@ -760,9 +962,23 @@ mod imp {
             }
         }
     }
+
+    /// `SubDir::entries` のイテレータ（`read_dir` の包み）。
+    #[derive(Debug)]
+    pub(crate) struct Entries(fs::ReadDir);
+
+    impl Iterator for Entries {
+        type Item = io::Result<OsString>;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            self.0.next().map(|r| r.map(|e| e.file_name()))
+        }
+    }
 }
 
 pub(crate) use imp::BlobDir;
+#[cfg(all(test, unix))]
+pub(crate) use imp::SubDir;
 
 impl RootHandle {
     /// 正規化済みのパスと検査時の (dev, ino) から開く（`ImageStore::open` が信頼検査の後に呼ぶ）。
@@ -911,5 +1127,75 @@ mod tests {
             any(target_arch = "x86_64", target_arch = "aarch64")
         )))]
         assert_eq!(e.message(), "image store root is not accessible");
+    }
+
+    /// OCI-7・SEC-1・#2695: `entries` は何度呼んでも同じ名前の集合を返し、`open_subdir` は symlink・通常ファイルを
+    /// `NotPlain`、不在を `None` にする。`stat` は symlink を辿らない。
+    #[cfg(unix)]
+    #[test]
+    fn oci7_subdir_entries_open_and_stat() {
+        let r = temp_root("subdir");
+        std::fs::create_dir_all(r.join("d")).expect("d");
+        std::fs::write(r.join("d").join("a"), b"1").expect("a");
+        std::fs::write(r.join("d").join("b"), b"22").expect("b");
+        std::os::unix::fs::symlink(r.join("d").join("a"), r.join("d").join("lnk")).expect("lnk");
+        std::fs::write(r.join("file"), b"x").expect("file");
+        std::os::unix::fs::symlink(r.join("d"), r.join("dlink")).expect("dlink");
+        let h = RootHandle::open_unchecked(&r).expect("open");
+        let d = h.open_subdir("d").expect("open d").expect("some");
+        let names = |d: &SubDir| {
+            let mut v: Vec<String> = d
+                .entries()
+                .expect("entries")
+                .map(|n| n.expect("entry").to_string_lossy().into_owned())
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(names(&d), vec!["a", "b", "lnk"]);
+        assert_eq!(names(&d), vec!["a", "b", "lnk"]);
+        assert!(d.stat("lnk").expect("stat").expect("some").is_symlink());
+        assert_eq!(d.stat("b").expect("stat").expect("some").len(), 2);
+        assert!(d.stat("none").expect("stat").is_none());
+        assert!(matches!(h.open_subdir("file"), Err(SubDirError::NotPlain)));
+        assert!(matches!(h.open_subdir("dlink"), Err(SubDirError::NotPlain)));
+        assert!(h.open_subdir("none").expect("absent").is_none());
+        // 通常ファイルは読めて、symlink・ディレクトリは欠損（None）。
+        assert!(d.open_file("a").expect("open a").is_some());
+        assert!(d.open_file("lnk").expect("open lnk").is_none());
+        assert!(d.open_file("none").expect("open none").is_none());
+        // socket・FIFO は開く前の種類確認で欠損扱い（ENXIO で集計全体が落ちない。OCI-7・SEC-1）。
+        let _sock = std::os::unix::net::UnixListener::bind(r.join("d").join("sock")).expect("sock");
+        assert!(d.open_file("sock").expect("open sock").is_none());
+        let _ = std::fs::remove_dir_all(&r);
+    }
+
+    /// OCI-7・SEC-1・#2695: 開いたサブディレクトリは、root を移しておとりを置いた後も元の実体を列挙する。
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn oci7_open_subdir_follows_moved_root() {
+        let r = temp_root("subdir-moved");
+        std::fs::create_dir_all(r.join("d")).expect("d");
+        std::fs::write(r.join("d").join("real"), b"1").expect("real");
+        let h = RootHandle::open_unchecked(&r).expect("open");
+        let moved = r.with_file_name(format!(
+            "{}-moved",
+            r.file_name().expect("name").to_string_lossy()
+        ));
+        std::fs::rename(&r, &moved).expect("rename");
+        std::fs::create_dir_all(r.join("d")).expect("decoy d");
+        std::fs::write(r.join("d").join("decoy"), b"1").expect("decoy");
+        let d = h.open_subdir("d").expect("open").expect("some");
+        let v: Vec<String> = d
+            .entries()
+            .expect("entries")
+            .map(|n| n.expect("entry").to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(v, vec!["real"]);
+        let _ = std::fs::remove_dir_all(&r);
+        let _ = std::fs::remove_dir_all(&moved);
     }
 }

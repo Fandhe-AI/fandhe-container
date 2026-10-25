@@ -24,8 +24,9 @@
 //! - 特権ランチャー経由（ambient capability あり）では開かない（[`deny_elevated_capabilities`]）。`CAP_DAC_OVERRIDE` を持ったまま
 //!   利用者の指定したパスを開くと DAC を越えて任意のファイルへ追記できてしまうため。
 //! - エラー文言は固定の英語で、パス・errno・行の内容を含めない（ERR-1）。
-//! - 自前のローテーションはしない（kubelet が rename して `ReopenContainerLog` を呼ぶ方式。未実装は後続 issue）。そのため CRI ログの
-//!   総量に上限は無い（既知の制限）。
+//! - 自前のローテーションはしない（kubelet が rename して `ReopenContainerLog` を呼ぶ方式。未実装は後続 issue）。代わりに CRI ログ 1 本の
+//!   総量に上限を設ける（[`CRI_LOG_MAX_BYTES`]。既存サイズも数える）。超えると書き出しを止め（`ResourceExhausted`）、[`TeeLogSink`] が
+//!   構造化ログで通知する。`@container-logs` は `RotatingFileSink` の上限どおり続く。
 
 #[cfg(unix)]
 use std::io::Write as _;
@@ -45,6 +46,11 @@ pub const CRI_TIMESTAMP_LEN: usize = 30;
 /// 書き込みバッファ（固定。`RotatingFileSink` と同じ 8 KiB）。
 #[cfg(unix)]
 const WRITE_BUFFER_BYTES: usize = 8 * 1024;
+
+/// CRI ログファイル 1 本の総量の上限（50 MiB。kubelet の `containerLogMaxSize` 10 MiB × `containerLogMaxFiles` 5 に合わせる）。
+/// `ReopenContainerLog` による回転が未実装のため、超えた時点で CRI ログへの書き出しを止める
+/// （`ResourceExhausted`。`@container-logs` 側の `RotatingFileSink` は影響を受けない）。再起動をまたぐ追記も既存のサイズから数える。
+pub const CRI_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 /// 9999-12-31T23:59:59 のエポック秒（4 桁の年に収めるための上限）。
 const MAX_EPOCH_SECS: u64 = 253_402_300_799;
@@ -188,7 +194,11 @@ pub struct CriFileSink {
 
 enum Inner {
     #[cfg(unix)]
-    Active(std::io::BufWriter<std::fs::File>),
+    Active {
+        writer: std::io::BufWriter<std::fs::File>,
+        /// 上限までに書ける残りバイト数（ファイルの既存サイズを引いた値から始める）。
+        remaining: u64,
+    },
     // 非 unix では `open` が常に失敗し、この状態を作る経路が無い。
     #[cfg_attr(not(unix), allow(dead_code))]
     Failed,
@@ -233,6 +243,15 @@ impl CriFileSink {
     pub fn open(
         path: &fandhe_container_core::traits::ContainerLogPath,
     ) -> Result<Self, TraitError> {
+        Self::open_with_limit(path, CRI_LOG_MAX_BYTES)
+    }
+
+    /// [`Self::open`] の上限指定版（総量が `max_bytes` を超える書き込みは `ResourceExhausted` で止める）。
+    #[cfg(unix)]
+    fn open_with_limit(
+        path: &fandhe_container_core::traits::ContainerLogPath,
+        max_bytes: u64,
+    ) -> Result<Self, TraitError> {
         use std::os::unix::fs::OpenOptionsExt as _;
         use std::path::Path;
 
@@ -258,15 +277,17 @@ impl CriFileSink {
             )
             .open(dir.join(name))
             .map_err(|_| unopenable())?;
-        let is_file = file.metadata().map(|m| m.is_file()).unwrap_or(false);
-        if !is_file {
+        let Ok(meta) = file.metadata() else {
+            return Err(unopenable());
+        };
+        if !meta.is_file() {
             return Err(unopenable());
         }
         Ok(Self {
-            inner: Mutex::new(Inner::Active(std::io::BufWriter::with_capacity(
-                WRITE_BUFFER_BYTES,
-                file,
-            ))),
+            inner: Mutex::new(Inner::Active {
+                writer: std::io::BufWriter::with_capacity(WRITE_BUFFER_BYTES, file),
+                remaining: max_bytes.saturating_sub(meta.len()),
+            }),
         })
     }
 
@@ -295,11 +316,22 @@ impl LogSink for CriFileSink {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         match &mut *guard {
             #[cfg(unix)]
-            Inner::Active(writer) => {
+            Inner::Active { writer, remaining } => {
+                let need = u64::try_from(records.len()).unwrap_or(u64::MAX);
+                if need > *remaining {
+                    // 上限に達した: 溜めた分だけ書き出して止める（回転が無いため以後は書かない。REPAIR-3）。
+                    let _ = writer.flush();
+                    *guard = Inner::Failed;
+                    return Err(TraitError::new(
+                        ErrorCode::ResourceExhausted,
+                        "cri log size limit reached",
+                    ));
+                }
                 if writer.write_all(&records).is_err() {
                     *guard = Inner::Failed;
                     return Err(internal("cri log write failed"));
                 }
+                *remaining -= need;
                 Ok(())
             }
             Inner::Failed => Err(internal("cri log sink is in failed state")),
@@ -310,7 +342,7 @@ impl LogSink for CriFileSink {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         match &mut *guard {
             #[cfg(unix)]
-            Inner::Active(writer) => {
+            Inner::Active { writer, .. } => {
                 if writer.flush().is_err() {
                     *guard = Inner::Failed;
                     return Err(internal("cri log write failed"));
@@ -327,7 +359,8 @@ impl LogSink for CriFileSink {
 /// 出力先ごとに失敗状態を持つ。片方が失敗してもその出力先だけを以後呼ばず、正常な出力先への `append` / `flush` は
 /// 続ける（呼び出し元の `LineSplitter` は最初の `Err` でストリームの以降を読み捨てるため、片方の失敗で
 /// 既存の `@container-logs` の記録を止めない。SUP-4）。`Err` を返すのは両方が失敗した場合だけ。
-/// 片方の失敗は黙って消さず、[`Self::failed_codes`] で出力先ごとの最初のエラーコードを観測できる。
+/// 片方の失敗は黙って消さず、出力先ごとの最初の失敗を構造化ログ 1 行で stderr へ通知し（REPAIR-4）、
+/// [`Self::failed_codes`] でも観測できる。
 pub struct TeeLogSink {
     primary: Arc<dyn LogSink>,
     secondary: Arc<dyn LogSink>,
@@ -371,8 +404,14 @@ impl TeeLogSink {
                 Ok(()) => alive += 1,
                 Err(e) => {
                     let mut g = self.failed.lock().unwrap_or_else(PoisonError::into_inner);
-                    if let Some(slot) = g.get_mut(i) {
+                    let first = g.get_mut(i).is_some_and(|slot| {
+                        let first = slot.is_none();
                         slot.get_or_insert(e.code());
+                        first
+                    });
+                    drop(g);
+                    if first {
+                        report_destination_failure(i, e.code());
                     }
                     last_err = Some(e);
                 }
@@ -383,6 +422,23 @@ impl TeeLogSink {
             _ => Ok(()),
         }
     }
+}
+
+/// 出力先の最初の失敗を構造化 1 行（JSON）で stderr へ出す（REPAIR-4。パス・errno・行の内容は含めない。ERR-1）。
+/// stderr の書き込み失敗では panic しない。supervisor の監視経路（stderr）が読む。
+fn report_destination_failure(index: usize, code: ErrorCode) {
+    use std::io::Write as _;
+    let destination = if index == 0 {
+        "container_logs"
+    } else {
+        "cri_log"
+    };
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "{{\"component\":\"supervisor.logs\",\"operation\":\"tee_append\",\"result\":\"destination_failed\",\"destination\":\"{}\",\"code\":\"{}\"}}",
+        destination,
+        code.as_str()
+    );
 }
 
 impl LogSink for TeeLogSink {
@@ -573,6 +629,27 @@ mod tests {
 
         fn read(p: &Path) -> String {
             std::fs::read_to_string(p).expect("read")
+        }
+
+        /// CRI-2・SUP-4: 総量の上限（既存サイズ込み）を超える書き込みは `ResourceExhausted` で止まり、上限内の分は残る。
+        #[test]
+        fn cri2_file_sink_stops_at_size_limit() {
+            let t = Tmp::new("limit");
+            let path = t.log("0.log");
+            // 1 行は 30 + " stdout F x\n"(12) = 42 バイト。2 行ぶん（84）だけ許す。
+            let sink = CriFileSink::open_with_limit(&path, 84).expect("open");
+            sink.append(StreamKind::Stdout, b"x").expect("1");
+            sink.append(StreamKind::Stdout, b"y").expect("2");
+            let e = sink.append(StreamKind::Stdout, b"z").expect_err("limit");
+            assert_eq!(e.code(), ErrorCode::ResourceExhausted);
+            assert!(sink.flush().is_err());
+            drop(sink);
+            let text = read(Path::new(path.as_str()));
+            assert_eq!(text.lines().count(), 2);
+            // 開き直しても既存サイズから数えるため、上限に達していれば書けない。
+            let sink = CriFileSink::open_with_limit(&path, 84).expect("reopen");
+            let e = sink.append(StreamKind::Stdout, b"w").expect_err("full");
+            assert_eq!(e.code(), ErrorCode::ResourceExhausted);
         }
 
         /// CRI-2・SUP-4: 書いた行が CRI 形式でファイルに残り、開き直しても上書きせず追記する。

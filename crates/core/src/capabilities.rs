@@ -352,6 +352,76 @@ impl CapabilitySet {
     pub fn is_subset_of(self, other: Self) -> bool {
         self.0 & !other.0 == 0
     }
+
+    /// 差集合（`self` から `other` の要素を除いた集合。SEC-1）。
+    #[must_use]
+    pub fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    /// 既知の全 capability の集合（`ALL` の drop 指定に使う）。
+    pub fn all_known() -> Self {
+        Capability::ALL
+            .iter()
+            .fold(Self::empty(), |set, c| set.with(*c))
+    }
+}
+
+/// drop 指定の名前の件数の上限（既知の capability 数の 2 倍。重複を許す）。
+pub const MAX_DROP_NAMES: usize = 2 * Capability::ALL.len();
+/// drop 指定の名前 1 件の長さの上限（バイト）。
+pub const MAX_DROP_NAME_BYTES: usize = 32;
+
+/// capability の drop 指定の名前が不正なことを表すエラー（ERR-1）。
+///
+/// 指定された名前は文言に載せない（固定の英語）。呼び出し元（CLI の `create --cap-drop`・
+/// CRI の `drop_capabilities`）が自分の `INVALID_ARGUMENT` へ写す。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CapabilityDropError;
+
+impl std::fmt::Display for CapabilityDropError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("capability drop list is invalid")
+    }
+}
+
+impl std::error::Error for CapabilityDropError {}
+
+/// drop 指定の名前 1 件を capability 集合へ解釈する（`ALL` は既知の全集合）。
+///
+/// 大文字小文字を区別せず、`CAP_` 接頭辞は任意。空・長すぎる・非 ASCII・未知の名前は拒否する。
+/// 長さは確保の前に検査する。
+pub fn parse_drop_name(name: &str) -> Result<CapabilitySet, CapabilityDropError> {
+    if name.is_empty() || name.len() > MAX_DROP_NAME_BYTES || !name.is_ascii() {
+        return Err(CapabilityDropError);
+    }
+    let upper = name.to_ascii_uppercase();
+    if upper == "ALL" {
+        return Ok(CapabilitySet::all_known());
+    }
+    let full = if upper.starts_with("CAP_") {
+        upper
+    } else {
+        format!("CAP_{upper}")
+    };
+    let cap = Capability::from_name(&full).ok_or(CapabilityDropError)?;
+    Ok(CapabilitySet::empty().with(cap))
+}
+
+/// drop 指定の名前の並びを capability 集合へ解釈する（CRI-2・CLI-1・SEC-1）。
+///
+/// CRI の `drop_capabilities` と CLI の `create --cap-drop` が共有する唯一の正規化。
+/// 件数は [`MAX_DROP_NAMES`] 以下。1 件でも不正なら全体を拒否する。
+pub fn parse_drop_list<S: AsRef<str>>(names: &[S]) -> Result<CapabilitySet, CapabilityDropError> {
+    if names.len() > MAX_DROP_NAMES {
+        return Err(CapabilityDropError);
+    }
+    let mut dropped = CapabilitySet::empty();
+    for name in names {
+        let one = parse_drop_name(name.as_ref())?;
+        dropped = CapabilitySet(dropped.0 | one.0);
+    }
+    Ok(dropped)
 }
 
 /// OCI 既定集合に無い capability を許可集合へ入れようとして拒否したことを表すエラー（SEC-1・#2666）。
@@ -418,6 +488,13 @@ impl ContainerCapabilities {
         self.0.iter()
     }
 
+    /// `drop` の要素を除いた許可集合を返す（SEC-1・CLI-1）。部分集合の部分集合なので失敗せず、
+    /// 許可集合を広げる経路にはならない（add の経路は作らない）。
+    #[must_use]
+    pub fn without(self, drop: CapabilitySet) -> Self {
+        Self(self.0.without(drop))
+    }
+
     /// OCI 既定集合と等しいか。
     pub fn is_default(self) -> bool {
         self.0 == CapabilitySet::oci_default()
@@ -458,6 +535,47 @@ mod tests {
         assert!(ContainerCapabilities::oci_default().is_default());
         let wide = CapabilitySet::oci_default().with(Capability::SysAdmin);
         assert!(ContainerCapabilities::restrict(wide).is_err());
+    }
+
+    /// CLI-1・CRI-2: drop 名の正規化（接頭辞・大文字小文字・ALL・拒否）。
+    #[test]
+    fn cli1_parse_drop_list_normalizes() {
+        let chown = CapabilitySet::empty().with(Capability::Chown);
+        for n in ["chown", "CAP_CHOWN", "Cap_Chown"] {
+            assert_eq!(parse_drop_list(&[n]).unwrap(), chown, "{n}");
+        }
+        assert_eq!(
+            parse_drop_list(&["ALL"]).unwrap(),
+            CapabilitySet::all_known()
+        );
+        assert_eq!(
+            parse_drop_list::<&str>(&[]).unwrap(),
+            CapabilitySet::empty()
+        );
+        let long = "A".repeat(33);
+        let too_many = vec!["chown"; MAX_DROP_NAMES + 1];
+        assert!(parse_drop_list(&["CAP_BOGUS"]).is_err());
+        assert!(parse_drop_list(&[""]).is_err());
+        assert!(parse_drop_list(&[long.as_str()]).is_err());
+        assert!(parse_drop_list(&["ｃｈｏｗｎ"]).is_err());
+        assert!(parse_drop_list(&too_many).is_err());
+        assert_eq!(
+            CapabilityDropError.to_string(),
+            "capability drop list is invalid"
+        );
+    }
+
+    /// SEC-1: drop は狭める方向だけ（既定外の drop は no-op、ALL は空）。
+    #[test]
+    fn sec1_container_capabilities_without_only_narrows() {
+        let d = ContainerCapabilities::oci_default();
+        let noop = d.without(parse_drop_list(&["CAP_SYS_ADMIN"]).unwrap());
+        assert!(noop.is_default());
+        let less = d.without(parse_drop_list(&["chown"]).unwrap());
+        assert_eq!(less.iter().count(), 13);
+        assert!(!less.bounding().contains(Capability::Chown));
+        let none = d.without(parse_drop_list(&["ALL"]).unwrap());
+        assert!(none.bounding().is_empty());
     }
 
     /// SEC-1: 既定集合は Docker の root コンテナの `CapEff`（`a80425fb`）と一致する。

@@ -108,6 +108,97 @@ impl Signal {
     pub fn as_u8(&self) -> u8 {
         self.0.get()
     }
+
+    /// Docker の `--signal` / `STOPSIGNAL` と同じ表記（番号または名前）を解釈する
+    /// （CLI-1・ERR-1。CLI の `stop --signal` が使う。moby の `ParseSignal` の語彙）。
+    ///
+    /// - 数字だけなら Linux の番号（1..=64。glibc が予約する 32・33 は拒否する）
+    /// - それ以外は ASCII の大文字小文字を区別しない名前で、`SIG` 接頭辞は任意
+    ///   （`RTMIN`・`RTMIN+1..=15`・`RTMAX-14..=-1`・`RTMAX`、別名の `IOT`・`CLD`・`POLL` を含む）
+    /// - 空・長さ上限（64 バイト）超え・非 ASCII・符号つき数字・空白は拒否する。長さは解釈の前に検査する
+    ///
+    /// エラーは [`ErrorCode::InvalidArgument`] で、固定の英語文言にし入力値を含めない。
+    pub fn parse_notation(text: &str) -> Result<Self, TraitError> {
+        let invalid = || TraitError::new(ErrorCode::InvalidArgument, "signal is invalid");
+        if text.is_empty() || text.len() > MAX_SIGNAL_NOTATION_BYTES || !text.is_ascii() {
+            return Err(invalid());
+        }
+        let number = if text.bytes().all(|b| b.is_ascii_digit()) {
+            text.parse::<u32>().map_err(|_| invalid())?
+        } else {
+            signal_number_of_name(&text.to_ascii_uppercase()).ok_or_else(invalid)?
+        };
+        // 32・33 は glibc が予約する番号（実時間シグナルの先頭は 34）。
+        if number == 32 || number == 33 {
+            return Err(invalid());
+        }
+        let value = u8::try_from(number).map_err(|_| invalid())?;
+        Self::new(value).map_err(|_| invalid())
+    }
+}
+
+/// [`Signal::parse_notation`] が受ける文字列の長さの上限（バイト）。
+const MAX_SIGNAL_NOTATION_BYTES: usize = 64;
+
+/// 大文字化済みの名前を Linux のシグナル番号へ写す（x86_64 / aarch64 共通の体系）。
+fn signal_number_of_name(upper: &str) -> Option<u32> {
+    let name = upper.strip_prefix("SIG").unwrap_or(upper);
+    let fixed = match name {
+        "HUP" => 1,
+        "INT" => 2,
+        "QUIT" => 3,
+        "ILL" => 4,
+        "TRAP" => 5,
+        "ABRT" | "IOT" => 6,
+        "BUS" => 7,
+        "FPE" => 8,
+        "KILL" => 9,
+        "USR1" => 10,
+        "SEGV" => 11,
+        "USR2" => 12,
+        "PIPE" => 13,
+        "ALRM" => 14,
+        "TERM" => 15,
+        "STKFLT" => 16,
+        "CHLD" | "CLD" => 17,
+        "CONT" => 18,
+        "STOP" => 19,
+        "TSTP" => 20,
+        "TTIN" => 21,
+        "TTOU" => 22,
+        "URG" => 23,
+        "XCPU" => 24,
+        "XFSZ" => 25,
+        "VTALRM" => 26,
+        "PROF" => 27,
+        "WINCH" => 28,
+        "IO" | "POLL" => 29,
+        "PWR" => 30,
+        "SYS" => 31,
+        "RTMIN" => 34,
+        "RTMAX" => 64,
+        _ => 0,
+    };
+    if fixed != 0 {
+        return Some(fixed);
+    }
+    if let Some(n) = name.strip_prefix("RTMIN+") {
+        let n = parse_small_decimal(n)?;
+        return (1..=15).contains(&n).then_some(34 + n);
+    }
+    if let Some(n) = name.strip_prefix("RTMAX-") {
+        let n = parse_small_decimal(n)?;
+        return (1..=14).contains(&n).then_some(64 - n);
+    }
+    None
+}
+
+/// 1〜2 桁の ASCII 数字だけの文字列を数にする（符号・空白・長い桁は `None`）。
+fn parse_small_decimal(text: &str) -> Option<u32> {
+    if text.is_empty() || text.len() > 2 || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// [`ContainerRuntime::create`] の要求。
@@ -886,6 +977,68 @@ mod tests {
             .delete(&DeleteRequest::new(sample_id()).with_force(true))
             .expect("force delete succeeds");
         assert_eq!(ok, DeleteResponse::new());
+    }
+
+    /// CLI-1: Docker 表記のシグナルを具体値で解釈する。
+    #[test]
+    fn cli1_signal_parse_notation_accepts() {
+        for (text, want) in [
+            ("SIGKILL", 9),
+            ("kill", 9),
+            ("TERM", 15),
+            ("sigusr1", 10),
+            ("SIGRTMIN", 34),
+            ("rtmin+1", 35),
+            ("RTMIN+15", 49),
+            ("SIGRTMAX-1", 63),
+            ("RTMAX-14", 50),
+            ("SIGRTMAX", 64),
+            ("IOT", 6),
+            ("CLD", 17),
+            ("POLL", 29),
+            ("10", 10),
+            ("1", 1),
+            ("64", 64),
+        ] {
+            assert_eq!(
+                Signal::parse_notation(text).unwrap().as_u8(),
+                want,
+                "{text}"
+            );
+        }
+    }
+
+    /// CLI-1・ERR-1: 範囲外・予約・不正な表記は固定文言の `InvalidArgument` で拒否する。
+    #[test]
+    fn cli1_signal_parse_notation_rejects() {
+        let long = "S".repeat(65);
+        for text in [
+            "",
+            "0",
+            "32",
+            "33",
+            "65",
+            "256",
+            "99999999999",
+            "+15",
+            "-1",
+            " SIGTERM",
+            "SIGTERM ",
+            "SIGFOO",
+            "SIG",
+            "RTMIN+0",
+            "RTMIN+16",
+            "RTMAX-15",
+            "RTMAX-0",
+            "RTMIN+",
+            "SIGNAL_SIGTERM",
+            "ＳＩＧＫＩＬＬ",
+            long.as_str(),
+        ] {
+            let err = Signal::parse_notation(text).unwrap_err();
+            assert_eq!(err.code(), ErrorCode::InvalidArgument, "{text}");
+            assert_eq!(err.message(), "signal is invalid", "{text}");
+        }
     }
 
     /// REPAIR-5: `Signal::new` は境界値 1・64 を受理し、値が一致する。

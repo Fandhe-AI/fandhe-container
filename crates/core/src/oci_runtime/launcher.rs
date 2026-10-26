@@ -1279,7 +1279,11 @@ impl Inner {
         )?);
         // `process.capabilities` の drop を解釈した許可集合（OCI 既定の部分集合）。launch の削減段へ渡し、同じ値を
         // 分離の記録へ添えて exec の再適用が launch より広い集合を与えないようにする(SEC-1・CRI-2・#2666)。
-        let capabilities = spec.config().capabilities();
+        // 起動オプションの `--cap-drop` はここで重ねる(CLI-1・#2775)。狭めた同じ値を段と記録の両方へ渡す。
+        let capabilities = spec
+            .config()
+            .capabilities()
+            .without(options.capability_drop());
         let isolation_record = isolation_record.with_capabilities(capabilities);
         let (uid, gid) = spec.user();
         let mut stages = StagePipeline::new()
@@ -3977,6 +3981,30 @@ mod tests {
         }
         expected.push("FANDHE_NEW=3".to_owned());
         assert_eq!(seen_env.lock().unwrap().clone(), vec![expected]);
+        p.terminate(Duration::from_secs(5)).expect("terminate");
+    }
+
+    /// CLI-1・SEC-1(#2775): `--cap-drop` は config.json 由来の許可集合から除かれ、分離の記録に狭めた値が残る。
+    #[test]
+    fn cli1_cap_drop_option_narrows_the_recorded_capabilities() {
+        use crate::capabilities::{Capability, parse_drop_list};
+        let spec = spec_for("opts-capdrop", serde_json::json!({}));
+        let ops = FakeOps::new(&events());
+        let mut l = launcher(ops, rootless(), None);
+        let base = options_with(&[], true, &[], LaunchIpcMode::Private);
+        l.inner.launch_options = Some(
+            base.with_capability_drop(parse_drop_list(&["chown", "CAP_NET_RAW"]).expect("drop")),
+        );
+        let p = l.launch(&spec, Duration::from_secs(1)).expect("launch");
+        let caps = p
+            .launch_isolation()
+            .expect("record")
+            .capabilities()
+            .expect("capabilities recorded");
+        assert_eq!(caps.iter().count(), 12);
+        assert!(!caps.bounding().contains(Capability::Chown));
+        assert!(!caps.bounding().contains(Capability::NetRaw));
+        assert!(caps.bounding().contains(Capability::Kill));
         p.terminate(Duration::from_secs(5)).expect("terminate");
     }
 

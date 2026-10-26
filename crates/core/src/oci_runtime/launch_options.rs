@@ -14,6 +14,7 @@
 //! | `ipc` | `Host` のときだけ IPC namespace を作らず、Landlock の暗黙マウントを `WithoutShm` にする |
 //! | `rlimits` | `--ulimit` の指定値。launcher が 16 種へ補完して `Rlimits` 段へ渡し、`state.json` にも記録する(#2713) |
 //! | `env` | `--env` の上書き。`process.env` へ `KEY` 単位で重ねて entrypoint へ渡す(#2713) |
+//! | `capability_drop` | `create --cap-drop`。config.json 由来の許可集合から除く(狭める方向のみ。launch の段と分離の記録へ同じ値を渡す。CLI-1・SEC-1・#2775) |
 //!
 //! # 契約
 //!
@@ -34,6 +35,7 @@
 //!   呼び出し元のメモリにある内容(`from_bytes`)は、launcher が範囲写像(`RootlessSubordinateIds`)との併用を
 //!   起動前に拒否する。CLI → supervisor の結線では secret を fd で渡す必要がある(未設計)。
 
+use crate::capabilities::CapabilitySet;
 use crate::dev_mounts::ImplicitDevMounts;
 use crate::injected_files::{InjectedFileSet, overlaps};
 use crate::oci_runtime::config::{CONFIG_MAX_ENV, CONFIG_MAX_STRING_BYTES};
@@ -61,6 +63,8 @@ pub struct LaunchOptions {
     rlimits: Rlimits,
     /// `--env` の上書き(`KEY=VALUE`。`with_env` で検証済み)。
     env: Vec<String>,
+    /// `--cap-drop` の集合(config.json 由来の許可集合から除く。空なら何もしない)。
+    capability_drop: CapabilitySet,
 }
 
 /// `env` の値(秘密を含みうる)を出さず、件数だけを出す(SEC-1)。
@@ -72,6 +76,7 @@ impl std::fmt::Debug for LaunchOptions {
             .field("ipc", &self.ipc)
             .field("rlimits", &self.rlimits)
             .field("env_count", &self.env.len())
+            .field("capability_drop", &self.capability_drop)
             .finish()
     }
 }
@@ -122,6 +127,7 @@ impl LaunchOptions {
             ipc,
             rlimits: Rlimits::default(),
             env: Vec::new(),
+            capability_drop: CapabilitySet::empty(),
         })
     }
 
@@ -129,6 +135,14 @@ impl LaunchOptions {
     #[must_use]
     pub fn with_rlimits(mut self, rlimits: Rlimits) -> Self {
         self.rlimits = rlimits;
+        self
+    }
+
+    /// `--cap-drop` の集合を持たせる(CLI-1・SEC-1)。型が [`CapabilitySet`] なので不正な名前は表せず、
+    /// 許可集合は狭まる方向にしか変わらない(add の経路は無い)。
+    #[must_use]
+    pub fn with_capability_drop(mut self, drop: CapabilitySet) -> Self {
+        self.capability_drop = drop;
         self
     }
 
@@ -177,6 +191,11 @@ impl LaunchOptions {
     /// `--ulimit` で指定された rlimit(指定した種別だけ)。
     pub fn rlimits(&self) -> &Rlimits {
         &self.rlimits
+    }
+
+    /// `--cap-drop` で除く capability の集合。
+    pub fn capability_drop(&self) -> CapabilitySet {
+        self.capability_drop
     }
 
     /// `process.env`(`base`)へ上書きを重ねた env。既存のキーはその位置で値を置き換え、新しいキーは末尾へ足す

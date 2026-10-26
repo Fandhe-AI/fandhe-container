@@ -38,7 +38,7 @@
 
 use std::time::Instant;
 
-use fandhe_container_core::audit_log::{AuditSink, FileAuditSink};
+use fandhe_container_core::audit_log::{AuditCoveragePolicy, AuditSink, FileAuditSink};
 use fandhe_container_core::observability::{OpName, OpOutcome, OpRecorder};
 use fandhe_container_core::oci_runtime::{
     ContainerImage, ImageManifestDigest, LifecycleOp, OciRuntimeError, create_audited,
@@ -222,6 +222,15 @@ fn build_create_request(args: &CreateArgs) -> Result<CreateRequest, TraitError> 
 
 fn build_start_request(args: &StartArgs) -> Result<StartRequest, TraitError> {
     Ok(StartRequest::new(ContainerId::new(args.id.as_str())?))
+}
+
+/// `start --audit-policy` の値を core の固定語彙で検証する(未指定は `None` で、supervisor の既定が効く。SEC-4・#2761)。
+/// 不正な値は `INVALID_ARGUMENT`(入力値は文言に入らない)。
+fn build_audit_policy(args: &StartArgs) -> Result<Option<AuditCoveragePolicy>, TraitError> {
+    args.audit_policy
+        .as_deref()
+        .map(str::parse::<AuditCoveragePolicy>)
+        .transpose()
 }
 
 /// 要求を構築し、状態ルートを解決して本番の依存を組む。要求構築が先なので、不正な入力では状態ルートを作らない。
@@ -965,17 +974,18 @@ pub(super) fn run_start(global: &GlobalArgs, args: &StartArgs) -> CliExit {
     let started = Instant::now();
     let recorder = OpRecorder::new();
     let prepared = production_runtime(global, recorder, "start", started, || {
-        build_start_request(args)
+        Ok((build_start_request(args)?, build_audit_policy(args)?))
     })
     .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Start, e));
-    let (rt, req) = match prepared {
+    let (rt, (req, audit_policy)) = match prepared {
         Ok(v) => v,
         Err(e) => return CliExit::Runtime(e),
     };
     let Runtime {
         store, recorder, ..
     } = rt;
-    let result = ensure_exists(store, &req).and_then(|()| launch_supervisor(global, &req));
+    let result =
+        ensure_exists(store, &req).and_then(|()| launch_supervisor(global, &req, audit_policy));
     record_start_outcome(&recorder, started, result.is_ok());
     export_ops(&recorder, std::env::var_os(OP_LOG_ENV).as_deref());
     match result {
@@ -995,16 +1005,25 @@ fn ensure_exists(store: Box<dyn StateStore>, req: &StartRequest) -> Result<(), O
 
 /// 状態ルートの絶対パスを解決し、supervisor を起動して結果を受け取る。
 #[cfg(target_os = "linux")]
-fn launch_supervisor(global: &GlobalArgs, req: &StartRequest) -> Result<(), OciRuntimeError> {
+fn launch_supervisor(
+    global: &GlobalArgs,
+    req: &StartRequest,
+    audit_policy: Option<AuditCoveragePolicy>,
+) -> Result<(), OciRuntimeError> {
     use fandhe_container_core::state_store::StateRoot;
     let root = StateRoot::resolve(global.root.clone())
         .map_err(|e| OciRuntimeError::from_trait_error(LifecycleOp::Start, e))?;
-    super::supervisor_start::start_via_supervisor(root.path(), req.id()).map(|_pid| ())
+    super::supervisor_start::start_via_supervisor(root.path(), req.id(), audit_policy)
+        .map(|_pid| ())
 }
 
 /// 非 Linux は `production_runtime` が状態ストアを開く段階（plugin 解決）で必ず失敗するため到達しない。
 #[cfg(not(target_os = "linux"))]
-fn launch_supervisor(_global: &GlobalArgs, _req: &StartRequest) -> Result<(), OciRuntimeError> {
+fn launch_supervisor(
+    _global: &GlobalArgs,
+    _req: &StartRequest,
+    _audit_policy: Option<AuditCoveragePolicy>,
+) -> Result<(), OciRuntimeError> {
     Err(OciRuntimeError::new(
         LifecycleOp::Start,
         fandhe_container_core::traits::ErrorCode::Unimplemented,
@@ -1067,7 +1086,11 @@ mod tests {
             })
             .expect_err("id");
             assert_eq!(e.code(), ErrorCode::InvalidArgument);
-            let e = build_start_request(&StartArgs { id: id.to_string() }).expect_err("id");
+            let e = build_start_request(&StartArgs {
+                id: id.to_string(),
+                audit_policy: None,
+            })
+            .expect_err("id");
             assert_eq!(e.code(), ErrorCode::InvalidArgument);
         }
     }
@@ -2142,7 +2165,11 @@ mod tests {
             let rt = runtime(&base);
             let e = ensure_exists(
                 rt.store,
-                &build_start_request(&StartArgs { id: "nope".into() }).expect("req"),
+                &build_start_request(&StartArgs {
+                    id: "nope".into(),
+                    audit_policy: None,
+                })
+                .expect("req"),
             )
             .expect_err("nf");
             assert_eq!(e.code(), ErrorCode::NotFound);
@@ -2167,7 +2194,11 @@ mod tests {
                 .expect("req"),
             )
             .expect("create");
-            let req = build_start_request(&StartArgs { id: "c1".into() }).expect("req");
+            let req = build_start_request(&StartArgs {
+                id: "c1".into(),
+                audit_policy: None,
+            })
+            .expect("req");
             ensure_exists(rt.store, &req).expect("exists");
             let root =
                 fandhe_container_core::state_store::StateRoot::from_override(base.0.join("state"))

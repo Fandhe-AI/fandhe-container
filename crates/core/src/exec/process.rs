@@ -3,9 +3,10 @@
 //! # 役割と呼び出し文脈
 //!
 //! `crate::exec` の最小実行フロー第 5 段。namespace 分離済み（`isolate` /
-//! `isolate_rootful_host_root` の後）の親から [`spawn_container`] で子を fork し、子（新しい PID
+//! `isolate_rootful_host_root` の後）の親から `spawn_container` で子を fork し、子（新しい PID
 //! namespace の PID 1）が次を順に行う。製品コードの呼び出し元は本番 launcher
-//! （`ProductionLauncher`）の `spawn_container_via_intermediate` で、最小入口 `spawn_container` は結合試験だけが呼ぶ（#2700）。
+//! （`ProductionLauncher`）の `spawn_container_via_intermediate` で、最小入口 `spawn_container` は結合試験だけが呼ぶ（#2700）ため、
+//! `exec-test-support` の背後へ移した（#2762）。stdout / stderr のパイプ接続は `spawn_container_via_intermediate` だけが行う。
 //!
 //! ```text
 //! spawn_container(rootfs, &entry)                      // 親: fork して ContainerChild を返す
@@ -2027,7 +2028,7 @@ impl StdioNulling {
 
 /// 子の stdout / stderr へ付け替えるパイプの書き込み側（TASK-164 追補・#1471・SUP-7・SUP-1）。
 ///
-/// 親（launcher）が fork の前に [`ChildStdio::pipes`] で作り、`spawn_container_with_stages_and_stdio` へ渡す。
+/// 親（launcher）が fork の前に [`ChildStdio::pipes`] で作り、`spawn_container_via_intermediate` へ渡す。
 /// 読み取り側は親に残り、supervisor の行単位捕捉（`LogCapture`）へ `ContainerOutput` として渡る。
 /// fork 後の親側のコピーは spawn が drop して書き込み側を閉じるため、子と孫がすべて終了すれば読み取り側は EOF に
 /// なる。fd は `pipe()` の close-on-exec のまま保持し、子が `install` で 1・2 へ複製した分だけが
@@ -3084,11 +3085,16 @@ where
 /// - `/dev` が要る試験には試験専用の入口 `spawn_container_with_stages_and_devices` がある
 ///
 /// 本番の起動にこの入口を使ってはならない（分離が弱くなる）。
+/// 結合試験専用のため `exec-test-support` の背後に置く（#2762・REPAIR-3・CORE-2）。lib.rs の `compile_error!` が release
+/// ビルドでの有効化を禁じるので、製品バイナリからは呼べない。なお stdout / stderr を付け替える `_and_stdio` 版は
+/// 呼び出し元が無く削除した（パイプ接続は `spawn_container_via_intermediate` だけが行う）。
+#[doc(hidden)]
+#[cfg(feature = "exec-test-support")]
 pub fn spawn_container(rootfs: &Path, entry: &Entrypoint) -> Result<ContainerChild, ExecError> {
     spawn_container_with_stages(rootfs, entry, StagePipeline::new())
 }
 
-/// [`spawn_container`] にステージ列（#832・TASK-27.4.2）を渡す版。
+/// `spawn_container` にステージ列（#832・TASK-27.4.2）を渡す版。
 ///
 /// `stages` は親（fork 前）で構築し、fork で子へコピーされて子の pivot 後・exec 前に固定順で
 /// 実行される。フックの失敗・panic では exec に進まず `EXIT_SETUP_FAILED` で終わる。
@@ -3098,6 +3104,8 @@ pub fn spawn_container(rootfs: &Path, entry: &Entrypoint) -> Result<ContainerChi
 /// 証跡にならず exec は拒否される（fail-closed）。
 /// fork に成功した後、親の側で `dev.tty.legacy_tiocsti` が `1` のときだけ警告 1 行を標準エラーへ待たずに出す
 /// （CORE-5・SEC-1・REPAIR-4・REPAIR-5・#1739。出力は `report_legacy_tiocsti_to`。起動の可否は変えない）。
+#[doc(hidden)]
+#[cfg(feature = "exec-test-support")]
 pub fn spawn_container_with_stages(
     rootfs: &Path,
     entry: &Entrypoint,
@@ -3109,30 +3117,6 @@ pub fn spawn_container_with_stages(
         stages,
         crate::legacy_tiocsti::read_host(),
         std::io::stderr().as_fd(),
-    )
-    .map(|(child, _report)| child)
-}
-
-/// [`spawn_container_with_stages`] に、コンテナの stdout / stderr の付け替え先（[`ChildStdio`]）を足した版
-/// （TASK-164 追補・#1471・SUP-7・SUP-1）。
-///
-/// `stdio` の書き込み側は子が fd 1・2 へ付け替えて exec へ引き継ぎ、親の側のコピーは fork 後に閉じる。読み取り側
-/// （[`ChildStdio::pipes`] が返したもの）は呼び出し側が保持し、supervisor の行単位捕捉へ渡す。
-/// `ChildStdio::none()` なら [`spawn_container_with_stages`] と同じ（3 本とも `/dev/null`）。
-/// 副作用: パイプ指定時、子の setup 失敗診断（`fandhe-container: ...` の 1 行）もコンテナのログに入る。
-pub fn spawn_container_with_stages_and_stdio(
-    rootfs: &Path,
-    entry: &Entrypoint,
-    stages: StagePipeline,
-    stdio: ChildStdio,
-) -> Result<ContainerChild, ExecError> {
-    spawn_container_reporting_with_stdio(
-        rootfs,
-        entry,
-        stages,
-        crate::legacy_tiocsti::read_host(),
-        std::io::stderr().as_fd(),
-        stdio,
     )
     .map(|(child, _report)| child)
 }
@@ -3161,9 +3145,10 @@ pub fn report_legacy_tiocsti_to(
     }
 }
 
-/// `spawn_container_with_stages` の本体。観測値 `state` と警告の出力先 `out` を注入できる形にして、起動経路から
+/// `spawn_container_with_stages` の本体（結合試験専用。#2762）。観測値 `state` と警告の出力先 `out` を注入できる形にして、起動経路から
 /// 警告が出ることを結合試験で照合する（REPAIR-12・#1739）。fork に成功した後、親の側で 1 回だけ報告する
 /// （fork 失敗時は出さない）。子は exec 直前に fd 0〜2 を `/dev/null` へ差し替えるため、運用者へ確実に届く親の側で出す。
+#[cfg(feature = "exec-test-support")]
 fn spawn_container_reporting(
     rootfs: &Path,
     entry: &Entrypoint,
@@ -3171,19 +3156,8 @@ fn spawn_container_reporting(
     state: crate::legacy_tiocsti::LegacyTiocsti,
     out: BorrowedFd<'_>,
 ) -> Result<(ContainerChild, LegacyTiocstiReport), ExecError> {
-    spawn_container_reporting_with_stdio(rootfs, entry, stages, state, out, ChildStdio::none())
-}
-
-/// [`spawn_container_reporting`] に stdout / stderr の付け替え先を足した本体（#1471）。`stdio` は fork 後に
-/// 親の側でも drop され、親が持つ書き込み側は閉じる（読み取り側が EOF に達するための条件）。
-fn spawn_container_reporting_with_stdio(
-    rootfs: &Path,
-    entry: &Entrypoint,
-    stages: StagePipeline,
-    state: crate::legacy_tiocsti::LegacyTiocsti,
-    out: BorrowedFd<'_>,
-    stdio: ChildStdio,
-) -> Result<(ContainerChild, LegacyTiocstiReport), ExecError> {
+    // stdout / stderr のパイプ接続は本番 launcher（`spawn_container_via_intermediate`）だけが行う。ここは常に `/dev/null`。
+    let stdio = ChildStdio::none();
     let pid = sys::fork_single_threaded(
         move || child_main(rootfs, entry, stages, None, stdio),
         EXIT_SETUP_FAILED,

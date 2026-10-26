@@ -2229,9 +2229,7 @@ mod imp {
     /// fd の属するマウント ID（fdinfo の `mnt_id`）。経路の文字列に依存せず、固定した fd の実体で判定する
     /// （改名・bind mount の別名・非 UTF-8 の名前の影響を受けない。SEC-1）。読めない場合は `None`。
     fn mount_id(fd: BorrowedFd<'_>) -> Option<u64> {
-        let text =
-            std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd())).ok()?;
-        crate::oci_runtime::mountinfo_identity::parse_fdinfo_mnt_id(&text)
+        crate::oci_runtime::mountinfo_identity::read_fd_mnt_id(fd).ok()
     }
 
     /// `dir`（固定済みの fd）の中身を、fd 相対・リンク非追従で再帰的に消す（件数・深さの上限つき）。

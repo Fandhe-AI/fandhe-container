@@ -716,6 +716,12 @@ fn set_process_ids(kernel: &mut impl CapKernel, ids: ProcessIds) -> Result<(), E
 ///   読み戻しの不一致は `Internal`。現状維持（`KeptSetgroupsDenied`）へは逃がさない
 ///
 /// 写像との照合は fork の前に launcher の `check_user_mapped` が済ませているため、ここでの拒否は防御の二重化。
+///
+/// 本関数は fork 子で確保する（`to_vec`・`sort`・`dedup`）が安全である。子は必ず `sys::fork_single_threaded*`
+/// （`fork_checked`。core で唯一の `fork()`）を経ており、fork 直前の `Threads: 1` が強制されるため、他スレッドが
+/// 握ったアロケータのロックを引き継がない。本番の経路（launch の C → I → PID 1、exec worker）はどれも本物の
+/// スレッド数判定を渡し、定数判定は `#[cfg(test)]` の中だけにある。同じ段は既に確保もしている（`dropped`）。
+/// 確保を fork の前へ移す必要はない（#2759・#2731 P2-1）。
 fn apply_supplementary_groups(
     kernel: &mut impl CapKernel,
     target: &[u32],

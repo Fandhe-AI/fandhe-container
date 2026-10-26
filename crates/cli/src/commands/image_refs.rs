@@ -647,34 +647,34 @@ mod tests {
         );
     }
 
-    /// OCI-7・#2499: annotations の合計上限を超える長さの root は `INVALID_ARGUMENT` で、状態を作る前に失敗する。
+    /// OCI-7・#2499: root の記録を足すと annotations の合計上限を超える場合は `INVALID_ARGUMENT` で、状態を作る前に失敗する。
+    /// 上限ちょうどまでは通る。
+    ///
+    /// 上限を超える長さの root を実ディレクトリで作ると macOS の PATH_MAX（1024）に当たるため、既存の
+    /// annotations で残りの予算を埋めて境界を作る（3 OS で同じ判定を照合する。#2794）。
     #[cfg(unix)]
     #[test]
     fn oci7_attach_image_root_rejects_oversized_root() {
-        // annotations の合計上限（4096 バイト。キーを含む）を超え、PATH_MAX（4096）には収まる長さの root。
+        use fandhe_container_core::traits::ANNOTATIONS_MAX_TOTAL_BYTES;
         let tmp = Tmp::new("attach-long");
-        let mut deep = tmp.path().to_path_buf();
-        while deep.as_os_str().len() + 201 < 4080 {
-            deep.push("d".repeat(200));
-        }
-        let rest = 4080 - deep.as_os_str().len() - 1;
-        deep.push("e".repeat(rest));
-        assert_eq!(deep.as_os_str().len(), 4080);
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&deep)
-                .expect("deep");
-        }
-        let store = ImageStore::open(&deep).expect("open");
-        let base = CreateRequest::new(
-            ContainerId::new("c1").expect("id"),
-            std::env::temp_dir().join("bundle"),
-        )
-        .expect("req");
-        let e = attach_image_root(&base, &store).expect_err("too large");
+        let store = ImageStore::open(tmp.path()).expect("open");
+        let root_len = store.root().to_str().expect("utf-8").len();
+        // 記録 1 件ぶん（キー + root）を足すと合計がちょうど上限になる既存 annotations の値の長さ。
+        let fill = ANNOTATIONS_MAX_TOTAL_BYTES - IMAGE_ROOT_ANNOTATION.len() - root_len - "k".len();
+        let with_value_len = |len: usize| {
+            CreateRequest::new(
+                ContainerId::new("c1").expect("id"),
+                std::env::temp_dir().join("bundle"),
+            )
+            .expect("req")
+            .with_annotations(Annotations::new([("k".to_string(), "v".repeat(len))]).expect("ann"))
+        };
+        let req = attach_image_root(&with_value_len(fill), &store).expect("at limit");
+        assert_eq!(
+            req.annotations().get(IMAGE_ROOT_ANNOTATION),
+            store.root().to_str()
+        );
+        let e = attach_image_root(&with_value_len(fill + 1), &store).expect_err("too large");
         assert_eq!(e.code(), ErrorCode::InvalidArgument);
     }
 

@@ -85,7 +85,7 @@
 //!   専用の記録先に監査の記録が 0 件（違反ではない失敗は記録しない）であることを照合する。メッセージは `Exec` 段の固定文言で、
 //!   `R` の前後の経路は公開 API から区別できない（成功行の `phase` は設計上の経路の表示）。
 //!   (1) ローダ欠落: rootfs 内の `PT_INTERP` のローダを消すと `NotFound`。ローダは `R` の前の `prepare_exec_child`
-//!   （`pin_interpreter`）で `O_PATH` で開かれ、不在はそこで拒否されるため、経路は `R` の前（`E NOT_FOUND`）である。実カーネルで
+//!   （`pin_interpreter`）で `O_PATH` で開かれ、不在はそこで拒否されるため、経路は `R` の前（`E <step> NOT_FOUND`）である。実カーネルで
 //!   `R` の後に `ENOENT` を決定的に起こす手段は無く、`R` の後の `NOT_FOUND` は単体試験
 //!   `sec4_2716_launch_fails_on_execveat_failure_after_ready_and_on_silence_after_ready` が担う。
 //!   (2) 0644: 実行ビットの無いエントリポイントは launch では事前検査が無く、`R` の後の `execveat` が `EACCES` →

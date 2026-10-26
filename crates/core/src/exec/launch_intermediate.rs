@@ -1374,7 +1374,7 @@ mod tests {
     use crate::audit_log::{AuditLayer, AuditRecord, AuditSink};
     use crate::exec::ViolationReason;
     use crate::exec::launch_status::{
-        PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready,
+        ExecPhaseStep, PrePivotFailure, PrePivotStep, report_exec_failure, report_exec_ready,
         report_exec_returned, report_failure, report_ready,
     };
     use crate::exec::process::ChildExit;
@@ -1882,10 +1882,12 @@ mod tests {
         Good,
         /// ACK の後に entrypoint 系の違反 `E ... entrypoint_is_runtime_binary` を書いて終了する(SEC-4・#2624)。
         ExecViolation,
-        /// ACK の後に理由なしの失敗 `E NOT_FOUND -` を書いて終了する(記録されない)。
+        /// ACK の後に理由なしの失敗 `E verify_root NOT_FOUND -` を書いて終了する(記録されない)。
         ExecFailureWithoutReason,
-        /// ACK の後に許可リスト外の理由(`E PERMISSION_DENIED target_moved`)を書いて終了する(`Malformed`)。
+        /// ACK の後に許可リスト外の理由(`E open_entrypoint PERMISSION_DENIED target_moved`)を書いて終了する(`Malformed`)。
         ExecForeignReason,
+        /// ACK の後に共有外の exec の段(`E parent_lifetime INTERNAL -`)を書いて終了する(`Malformed`。#2895)。
+        ExecForeignStep,
         /// ACK の後に 2 行目を書かずに終了する(EOF)。
         ExecSilentExit,
         /// ACK の後に 2 行目を書かずに眠る(期限切れ)。
@@ -1969,6 +1971,7 @@ mod tests {
                         Handoff::ExecViolation
                         | Handoff::ExecFailureWithoutReason
                         | Handoff::ExecForeignReason
+                        | Handoff::ExecForeignStep
                         | Handoff::ExecSilentExit
                         | Handoff::ExecSilentSleep
                         | Handoff::ExecReturned
@@ -1984,6 +1987,9 @@ mod tests {
                                 Handoff::ExecViolation => {
                                     let _ = report_exec_failure(
                                         s,
+                                        ExecPhaseStep::Child(
+                                            crate::exec::ExecChildStep::OpenEntrypoint,
+                                        ),
                                         &ExecError::from_violation_at(
                                             ViolationReason::EntrypointIsRuntimeBinary,
                                             None,
@@ -1994,6 +2000,7 @@ mod tests {
                                 Handoff::ExecFailureWithoutReason => {
                                     let _ = report_exec_failure(
                                         s,
+                                        ExecPhaseStep::VerifyRoot,
                                         &ExecError::new(
                                             ErrorCode::NotFound,
                                             IsolationStage::Exec,
@@ -2008,8 +2015,13 @@ mod tests {
                                 Handoff::ExecReadyThenSleep => {
                                     let _ = report_exec_ready(s);
                                 }
+                                Handoff::ExecForeignStep => {
+                                    let _ = w.write_all(b"E parent_lifetime INTERNAL -\n");
+                                }
                                 Handoff::ExecForeignReason => {
-                                    let _ = w.write_all(b"E PERMISSION_DENIED target_moved\n");
+                                    let _ = w.write_all(
+                                        b"E open_entrypoint PERMISSION_DENIED target_moved\n",
+                                    );
                                 }
                                 _ => {}
                             }
@@ -2103,7 +2115,7 @@ mod tests {
         assert_eq!(records[0].path(), None);
     }
 
-    /// SEC-4・#2624: 理由なしの失敗(`E NOT_FOUND -`)は起動失敗にするが記録しない。
+    /// SEC-4・#2624: 理由なしの失敗(`E verify_root NOT_FOUND -`)は起動失敗にするが記録しない。
     #[test]
     fn sec4_2624_launch_fails_without_record_for_reasonless_exec_failure() {
         let _serial = serialize_forks();
@@ -2112,6 +2124,10 @@ mod tests {
         let failure = result.expect_err("must fail");
         assert_eq!(failure.rejection.error.code, ErrorCode::NotFound);
         assert_eq!(failure.rejection.error.stage, IsolationStage::Exec);
+        assert_eq!(
+            failure.rejection.error.message,
+            "exec phase step 'verify_root' failed in the container child"
+        );
         assert_eq!(
             failure.rejection.delivery,
             crate::audit_log::AuditDelivery::NotApplicable
@@ -2129,6 +2145,12 @@ mod tests {
         for (mode, timeout, message) in [
             (
                 Handoff::ExecForeignReason,
+                Duration::from_secs(20),
+                "the pre-pivot status is malformed",
+            ),
+            (
+                // exec と共有しない段(#2895)は語彙外として拒否する。
+                Handoff::ExecForeignStep,
                 Duration::from_secs(20),
                 "the pre-pivot status is malformed",
             ),

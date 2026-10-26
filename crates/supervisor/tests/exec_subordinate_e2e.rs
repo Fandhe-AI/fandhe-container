@@ -429,7 +429,7 @@ mod linux {
         std::fs::create_dir(&hostdata).expect("create hostdata");
         std::fs::set_permissions(&hostdata, std::fs::Permissions::from_mode(0o777))
             .expect("chmod hostdata");
-        let ld = rootfs::make_rootfs(&bundle_dir.join("rootfs"));
+        let ld = rootfs::make_rootfs(&bundle_dir.join("rootfs"), rootfs::ProcDir::Create);
         let config_path = bundle_dir.join("config.json");
         let config_a = config_text(&ld, &hostdata, USER_UID, USER_GID, &ADDITIONAL_GIDS);
         std::fs::write(&config_path, &config_a).expect("write config.json");

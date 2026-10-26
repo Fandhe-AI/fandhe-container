@@ -360,7 +360,7 @@ pub(crate) fn read_fdinfo_mount_id(file: &File) -> Result<u64, FdinfoMountIdErro
 /// `mnt_id:` 行から読む（Linux 3.15 以降）。読めない・上限超過・行が無い・数値でない場合はエラー。
 ///
 /// cli の `doctor` が [`mount_option_by_id`] に渡す ID を得るために呼ぶ（SUP-14・#2661）。
-/// 実体は [`read_fdinfo_mount_id`] で、ここは `io::Error` に写す薄い包み。
+/// 実体は `read_fdinfo_mount_id` で、ここは `io::Error` に写す薄い包み。
 pub fn file_mount_id(file: &File) -> io::Result<u64> {
     read_fdinfo_mount_id(file).map_err(|e| match e {
         FdinfoMountIdError::Read(e) => e,

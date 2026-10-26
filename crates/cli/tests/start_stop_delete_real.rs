@@ -95,6 +95,16 @@ fn main() -> std::process::ExitCode {
         any(target_arch = "x86_64", target_arch = "aarch64")
     )
 ))]
+#[path = "../../core/tests/support/scratch_root.rs"]
+mod scratch_root;
+
+#[cfg(all(
+    target_os = "linux",
+    all(
+        target_pointer_width = "64",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 mod linux {
     use std::fs;
     use std::io::{Read, Write as _};
@@ -416,6 +426,8 @@ mod linux {
             if let Err(e) = fs::remove_dir_all(&self.work) {
                 eprintln!("start_stop_delete_real: cleanup remove work dir failed: {e}");
             }
+            // 一時領域の親ディレクトリ（tmpfiles の掃除と flock 競合の回避）。診断用に work を残す分岐では消さない（#2887）。
+            super::scratch_root::remove_scratch_root();
         }
     }
 
@@ -472,8 +484,7 @@ mod linux {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
             .unwrap_or(0);
-        let work = fs::canonicalize(std::env::temp_dir())
-            .map_err(|e| format!("canonicalize temp_dir: {e}"))?
+        let work = super::scratch_root::scratch_root("fandhe-ssd-real-scratch", CLI_TIMEOUT)
             .join(format!("fandhe-ssd-real-{}-{nanos}", std::process::id()));
         fs::create_dir(&work).map_err(|e| format!("create work dir: {e}"))?;
         set_mode(&work, 0o700)?;

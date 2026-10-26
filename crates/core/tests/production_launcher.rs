@@ -201,6 +201,10 @@ mod real_entry;
 #[path = "support/proc_status.rs"]
 mod proc_status;
 
+#[cfg(target_os = "linux")]
+#[path = "support/scratch_root.rs"]
+mod scratch_root;
+
 #[cfg(all(
     target_os = "linux",
     all(
@@ -209,7 +213,7 @@ mod proc_status;
     )
 ))]
 mod linux {
-    use super::real_entry;
+    use super::{real_entry, scratch_root};
     use std::io::{BufRead as _, Read as _, Write as _};
     use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
     use std::path::{Path, PathBuf};
@@ -716,43 +720,9 @@ mod linux {
         dir: PathBuf,
     }
 
-    /// 試験の一時領域の親ディレクトリ（`fandhe-prodlaunch-<pid>-<nanos>`。#2840）と、その共有 flock の保持 fd。
-    ///
-    /// `systemd-tmpfiles-clean`（Ubuntu の `/tmp` は 30d の aging 対象）は走査中、サブディレクトリごとに
-    /// `flock(LOCK_EX|LOCK_NB)` を取る。製品の `BundleLock` は待たずに bundle の flock を取るため、走査と重なると
-    /// create が `container start is in progress in another process` で失敗した（main の CI で間欠）。
-    /// tmpfiles は LOCK_EX を取れないディレクトリを丸ごと飛ばす（tmpfiles.d(5)）ので、親に共有ロックを持ち続けて
-    /// bundle を親の下へ置く。製品側のロックは子の inode に対するもので、親とは干渉しない。
-    static SCRATCH_ROOT: std::sync::OnceLock<(PathBuf, std::fs::File)> = std::sync::OnceLock::new();
-
-    /// 保護済みの親ディレクトリを返す（初回に排他作成して共有ロックを取る。期限内に取れなければ panic。REPAIR-5）。
+    /// 保護済みの親ディレクトリ（共通補助 `scratch_root`。tmpfiles の掃除と flock 競合の回避。#2840・#2887）。
     fn scratch_root() -> &'static Path {
-        let (dir, _guard) = SCRATCH_ROOT.get_or_init(|| {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            let dir = std::fs::canonicalize(std::env::temp_dir())
-                .expect("canonicalize temp_dir")
-                .join(format!("fandhe-prodlaunch-{}-{nanos}", std::process::id()));
-            std::fs::create_dir(&dir).expect("exclusively create scratch root");
-            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                .expect("chmod scratch root");
-            let file = std::fs::File::open(&dir).expect("open scratch root");
-            assert!(
-                eventually(|| file.try_lock_shared().is_ok()),
-                "could not take a shared flock on the scratch root within the deadline"
-            );
-            (dir, file)
-        });
-        dir
-    }
-
-    /// 親ディレクトリを消す（`run` の後始末。成否に関わらず呼ぶ）。
-    fn remove_scratch_root() {
-        if let Some((dir, _)) = SCRATCH_ROOT.get() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        scratch_root::scratch_root("fandhe-prodlaunch", timeout())
     }
 
     impl Bundle {
@@ -1056,7 +1026,7 @@ mod linux {
             scenarios(root, &container, &expected_cgroup, tag);
         }));
         let removed = delegated.remove_child(&container);
-        remove_scratch_root();
+        scratch_root::remove_scratch_root();
         if let Err(p) = result {
             std::panic::resume_unwind(p);
         }

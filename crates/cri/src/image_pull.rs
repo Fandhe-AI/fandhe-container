@@ -407,6 +407,15 @@ impl OciRegistryClient {
             inner: RegistryClient::new(config)?,
         })
     }
+
+    /// 認証・manifest 取得・blob 取得の計測先を差し替える（`RegistryClient::with_recorder` への素通し。REPAIR-4・#2900）。
+    ///
+    /// plugin-cri などの上位が集計の実装（`OciOpRecorder`）を渡す入口。既定は何も記録しない。
+    #[must_use]
+    pub fn with_recorder(mut self, recorder: Arc<dyn OciOpRecorder>) -> Self {
+        self.inner = self.inner.with_recorder(recorder);
+        self
+    }
 }
 
 impl RegistryPullClient for OciRegistryClient {

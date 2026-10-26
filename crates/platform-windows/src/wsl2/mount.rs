@@ -22,6 +22,25 @@
 //! 記録を検証して（改ざんがあれば何も外さず）自分のマウントだけを外す。呼び出し側（plugin の stop・起動役の delete）
 //! への接続は `docs/design/windows-execution-layout.md` の論点 4（#2230）の承認待ちで未実装（REPAIR-3）。
 //!
+//! mountinfo のパス文字列による行選択の点検（#2908・SEC-1・NET-1・IO-5。core の #2853 と同じ観点）:
+//! 実行環境は、ホスト側（Windows 上の Rust。`wsl.exe ... cat /proc/self/mountinfo` の出力を解析する。fd は持てない）、
+//! ゲスト側（WSL2 ディストリ内の初期 mount namespace で root として動く `sh` スクリプト）、純粋関数（全 OS で試験）の 3 つ。
+//!
+//! | 箇所 | 判定 |
+//! | ---- | ---- |
+//! | `verify_shared`・`rollback`・`record_matches_mounts`（ホスト） | 祖先の overmount で隠れた行を「最上位」と取り違えうるため、[`find_reachable_mount`]（ID の親子関係で `/` から降りる到達判定）へ変更。隠れていれば `None` で既存の拒否・未解除報告・矛盾扱いに入る |
+//! | 事前検査の `e.mount_point == target`・`count_fresh_mounts` | 変更不要。拒否と件数報告にだけ使い、隠れた行も数える保守側 |
+//! | ID による照合（`entries.iter().any(\|e\| e.mount_id == id)`） | 変更不要。実体照合 |
+//! | `unescape_mountinfo`・`parse_mountinfo` | 変更不要。復号と解析のみ。[`MountName`] は ASCII 英数字と `.`・`_`・`-` だけで、マウント先に 8 進エスケープ対象が現れないためゲストの生の文字列とホストの復号後の文字列の判定は一致する |
+//! | ゲストの [`MOUNT_SCRIPT`] の ID 列挙（208 判定・mount 前後の差分） | 変更不要。208 は拒否側で、帰属は flock の下の ID の差分のため隠れた行で誤帰属しない |
+//! | ゲストの [`UMOUNT_SCRIPT`]・[`MOUNT_SCRIPT`] 自己後始末の最上位照合と、パス指定の `umount` | 残余。同じパス文字列の行が複数なら 203（fail-closed）だが、隠れた行 1 件はパス解決先に作用する |
+//!
+//! ゲスト側の残余は、祖先（`/`・`/mnt`・`/mnt/fandhe`。root 所有で他者は書き込めないことを検査済み）へ overmount できる
+//! ゲスト内 root だけが起こせる（信頼境界の内側。非特権 userns 内のマウントは初期 namespace へ伝播しない）。ホスト側の
+//! 到達判定により、隠れたマウントへのパス指定 `umount` は [`UMOUNT_SCRIPT`] を呼ぶ前に止まる。残る窓はホストの照合から
+//! 実行までの間にゲスト内 root が overmount する場合だけである。fdinfo の `mnt_id` による実体照合は、実 WSL2 での確認
+//! （#377・TASK-67.6）で扱う。
+//!
 //! 検証の本体はマウント後の fstype 確認である。`.wslconfig` の `virtiofs=true` はファイル上の設定に過ぎず、
 //! `wsl --shutdown` までは稼働中の VM に反映されないため、設定の確認だけでは virtiofs の成立を保証できない。
 //!
@@ -792,7 +811,7 @@ fn clear_record(distro: &DistroName, nonce: &str, exec: Exec<'_>) -> bool {
 /// 確認した自分のマウントではなく他者のマウントを外しうる。そのため [`MOUNT_SCRIPT`] と同様に単一プロセスへ拘束し、
 /// 窓を最小にする。位置引数は `$1`=マウント先（固定基底配下の検証済み名で、mountinfo の 8 進エスケープを含まない）・
 /// `$2`=記録したマウント ID・`$3`=nonce。mountinfo の 1 列目（マウント ID）・2 列目（親のマウント ID）・5 列目
-/// （マウント先）だけを `read` で読む（awk 等に依存しない）。最上位は [`find_mount`] と同じく行順でなくマウント階層で
+/// （マウント先）だけを `read` で読む（awk 等に依存しない）。最上位は行順でなくマウント階層で
 /// 決める（同じマウント先の他のエントリから親として参照されていないものがちょうど 1 件）。`umount` に成功したら
 /// [`MOUNT_SCRIPT`] の記録と claim を消す。終了コード 203=最上位を確定できない・最上位が記録したマウントでない（外さない）。
 /// それ以外は `umount` の終了コード（[`MOUNT_SCRIPT`] と同じ理由で、`umount(8)` の終了コード・シグナル終了と
@@ -932,13 +951,50 @@ fn find_mount<'a>(entries: &'a [MountEntry], guest_path: &str) -> Option<&'a Mou
         .iter()
         .filter(|e| e.mount_point == guest_path)
         .collect();
-    let mut tops = at
-        .iter()
-        .filter(|e| !at.iter().any(|o| o.parent_id == e.mount_id));
+    let mut tops = at.iter().filter(|e| {
+        !at.iter()
+            .any(|o| o.parent_id == e.mount_id && o.mount_id != e.mount_id)
+    });
     match (tops.next(), tops.next()) {
         (Some(top), None) => Some(top),
         _ => None,
     }
+}
+
+/// `guest_path` へパス解決で実際に到達するマウントを、マウント ID と親のマウント ID の木を `/` から降りて返す。
+///
+/// [`find_mount`] は同じパス文字列の行だけで最上位を決めるため、祖先のマウント先へ別のマウントが重ねられ
+/// （overmount）、`guest_path` の行がその下に隠れていても、その行を「最上位」として返してしまう。本関数は
+/// `/` の最上位から `guest_path` の要素ごとの接頭辞を順に降り、親が現在のマウントである行だけを辿る。
+/// 同じマウント先に積まれたマウントは親子の連鎖で最上位まで進む。隠れた行は辿れないので `None` になる
+/// （#2908・SEC-1・NET-1。mountinfo は fd を持てないホスト側の近似で、カーネルのパス解決と同じ親子関係を模す）。
+///
+/// `None` を返す場合: `/` の最上位を確定できない・同じ親の下に同じマウント先が複数ある・`guest_path` に
+/// 到達しない（隠れている・マウント先でない）・親子関係が循環している。呼び出し側は所有を確認できない
+/// ものとして扱い、外さない（fail-closed）。`guest_path` は `/` 始まりの正規形（固定基底配下の検証済み名）を前提にする。
+fn find_reachable_mount<'a>(entries: &'a [MountEntry], guest_path: &str) -> Option<&'a MountEntry> {
+    let mut cur = find_mount(entries, "/")?;
+    // 親子の連鎖を辿る総回数の上限（行数。循環した親子関係で止まらなくなるのを防ぐ。REPAIR-5）。
+    let mut budget = entries.len().saturating_add(1);
+    let mut prefix = String::new();
+    for part in guest_path.split('/').filter(|p| !p.is_empty()) {
+        prefix.push('/');
+        prefix.push_str(part);
+        loop {
+            let mut next = entries.iter().filter(|e| {
+                e.mount_point == prefix && e.parent_id == cur.mount_id && e.mount_id != cur.mount_id
+            });
+            match (next.next(), next.next()) {
+                (None, _) => break,
+                (Some(c), None) => {
+                    budget = budget.checked_sub(1)?;
+                    cur = c;
+                }
+                _ => return None,
+            }
+        }
+    }
+    (cur.mount_point == guest_path).then_some(cur)
 }
 
 // ---- シーケンス（実行器を差し替え可能にした本体） ----
@@ -1276,7 +1332,7 @@ fn rollback(distro: &DistroName, owned: &[OwnedMount], exec: Exec<'_>) -> Rollba
             out.retry.push(o);
             continue;
         };
-        match find_mount(&entries, &o.guest_path) {
+        match find_reachable_mount(&entries, &o.guest_path) {
             Some(e) if e.mount_id == id => {
                 let ok = matches!(
                     exec(
@@ -1544,7 +1600,7 @@ fn verify_shared(
     };
     let mut fstypes: Vec<&str> = Vec::with_capacity(owned.len());
     for (m, o) in req.mounts.iter().zip(owned) {
-        match find_mount(&after, &o.guest_path) {
+        match find_reachable_mount(&after, &o.guest_path) {
             Some(e) if Some(e.mount_id) != o.mount_id => {
                 return Err(precondition(
                     "a shared mount was replaced by another mount after mounting",
@@ -2071,7 +2127,7 @@ fn record_matches_mounts(rec: &RecoveredRecord, entries: &[MountEntry]) -> bool 
     let Some(id) = rec.mount_id else {
         return true;
     };
-    match find_mount(entries, &rec.guest_path) {
+    match find_reachable_mount(entries, &rec.guest_path) {
         Some(top) => top.mount_id == id,
         None => {
             !entries.iter().any(|e| e.mount_point == rec.guest_path)
@@ -4002,6 +4058,76 @@ mod tests {
         // UMOUNT_SCRIPT も行順でなく親子関係で最上位を数える。
         assert!(UMOUNT_SCRIPT.contains("while read -r id par _ _ mp _;"));
         assert!(UMOUNT_SCRIPT.contains("[ \"$n\" = 1 ] && [ \"$top\" = \"$2\" ] || exit 203; "));
+    }
+
+    /// #2908・SEC-1・NET-1: 祖先の overmount で隠れたマウントは到達判定で `None`、文字列照合は取り違える。
+    #[test]
+    fn sec1_2908_hidden_mount_is_not_reachable() {
+        let base = "1 0 0:1 / / rw - ext4 x rw\n\
+                    10 1 0:2 / /mnt rw - tmpfs x rw\n\
+                    100 10 0:3 / /mnt/fandhe/a rw - virtiofs x rw\n\
+                    200 10 0:4 / /mnt/fandhe rw - tmpfs x rw\n";
+        let e = parse_mountinfo(base).unwrap();
+        // 文字列だけの照合は隠れた 100 を返す（旧挙動）。
+        assert_eq!(
+            find_mount(&e, "/mnt/fandhe/a").map(|m| m.mount_id),
+            Some(100)
+        );
+        assert_eq!(find_reachable_mount(&e, "/mnt/fandhe/a"), None);
+        // overmount の中に別のマウントがあれば、それが到達する。
+        let text = format!("{base}201 200 0:5 / /mnt/fandhe/a rw - tmpfs x rw\n");
+        let e = parse_mountinfo(&text).unwrap();
+        assert_eq!(
+            find_reachable_mount(&e, "/mnt/fandhe/a").map(|m| m.mount_id),
+            Some(201)
+        );
+    }
+
+    /// #2908: 到達判定の積み重ね・兄弟・`/` の扱い。
+    #[test]
+    fn sec1_2908_reachable_mount_stack_and_roots() {
+        let text = "102 100 0:4 / /mnt/fandhe/a rw - tmpfs x rw\n\
+                    1 1 0:1 / / rw - ext4 x rw\n\
+                    100 1 0:2 / /mnt/fandhe/a rw - virtiofs x rw\n";
+        let e = parse_mountinfo(text).unwrap();
+        assert_eq!(
+            find_reachable_mount(&e, "/mnt/fandhe/a").map(|m| m.mount_id),
+            Some(102)
+        );
+        // 同じ親の下に同じマウント先が 2 件: 確定できない。
+        let text = "1 0 0:1 / / rw - ext4 x rw\n\
+                    100 1 0:2 / /mnt/fandhe/a rw - virtiofs x rw\n\
+                    101 1 0:3 / /mnt/fandhe/a rw - virtiofs x rw\n";
+        let e = parse_mountinfo(text).unwrap();
+        assert_eq!(find_reachable_mount(&e, "/mnt/fandhe/a"), None);
+        // `/` の行が無ければ到達を確定できない。
+        let text = "100 1 0:2 / /mnt/fandhe/a rw - virtiofs x rw\n";
+        let e = parse_mountinfo(text).unwrap();
+        assert_eq!(find_reachable_mount(&e, "/mnt/fandhe/a"), None);
+        // 循環した親子関係でも止まる。
+        let text = "1 0 0:1 / / rw - ext4 x rw\n\
+                    100 101 0:2 / /mnt/fandhe/a rw - virtiofs x rw\n\
+                    101 100 0:3 / /mnt/fandhe/a rw - virtiofs x rw\n";
+        let e = parse_mountinfo(text).unwrap();
+        assert_eq!(find_reachable_mount(&e, "/mnt/fandhe/a"), None);
+    }
+
+    /// #2908: 隠れたマウントは `record_matches_mounts` で矛盾とする（`verify_shared`・`rollback` は同じ到達判定が `None` を返して
+    /// 既存の拒否・未解除報告の分岐に入る）。
+    #[test]
+    fn sec1_2908_hidden_mount_is_a_record_mismatch() {
+        let text = "1 0 0:1 / / rw - ext4 x rw\n\
+                    10 1 0:2 / /mnt rw - tmpfs x rw\n\
+                    100 10 0:3 / /mnt/fandhe/a rw - virtiofs x rw\n\
+                    200 10 0:4 / /mnt/fandhe rw - tmpfs x rw\n";
+        let entries = parse_mountinfo(text).unwrap();
+        let rec = RecoveredRecord {
+            nonce: "n".to_string(),
+            mount_id: Some(100),
+            guest_path: "/mnt/fandhe/a".to_string(),
+        };
+        assert!(!record_matches_mounts(&rec, &entries));
+        assert!(find_reachable_mount(&entries, &rec.guest_path).is_none());
     }
 
     /// SEC: mountinfo の行が逆順でも、準備・解除と、他者に覆われたマウントを外さない判定が変わらない。

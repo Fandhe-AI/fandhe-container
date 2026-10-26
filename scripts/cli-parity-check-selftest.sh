@@ -9,7 +9,7 @@
 # ubuntu・macos・windows の 3 OS、PR では ubuntu。Windows は Git Bash）。make ci には含めない。
 # 失敗は `FAIL:` 行を出し、最後に非 0 で終了する。bash 3.2 以上で動く。
 #
-# 構成: capture は 8 本を同時に起動してから結果を照合する。Git Bash はプロセス生成が遅く、直列では
+# 構成: capture は 18 本を同時に起動してから結果を照合する。Git Bash はプロセス生成が遅く、直列では
 # CI の時間枠を圧迫するため。同時実行の負荷は、CLI が即座に終わるときの監視サブシェル停止の競合
 # （cli-parity-check.sh の run_cli を参照）が再発した場合に表面化しやすくするが、確定的な回帰テストではない。
 set -uo pipefail
@@ -51,6 +51,9 @@ expect_eq() {
 #                  A 層 18 ケースは全て使い方エラーで順に呼ばれるため、n 回目 = ケース A<n>。
 #   STUB_OUT_DIR = 成功するコマンドの n 回目に out.<n> があれば、その内容をそのまま stdout へ流す。
 #                  成功の順は B01 list・B02 create・B03 list・B06 list・B09 delete・B10 list。
+#   STUB_INSPECT_DIR = 存在する ID の inspect（B17。成功は 1 回だけ）の stdout を、そのディレクトリの
+#                  out ファイルの内容で差し替える（無ければ製品と同じ形の created の 1 行 JSON）。
+#                  STUB_OUT_DIR とはカウンタを共有しない（既存の fixture の番号をずらさないため）。
 #
 # stderr の形は製品 CLI に合わせる（crates/cli/src/commands.rs の CliExit::write_stderr）:
 #   固定文言（使い方エラー・list の状態ルート不在・logs）= {"code":..,"message":..}
@@ -205,7 +208,15 @@ case "$cmd" in
     ;;
   start) [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND start; fail_op 8 UNIMPLEMENTED start ;;
   logs) [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND; fail_with 8 UNIMPLEMENTED ;;
-  inspect) [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND; fail_with 8 UNIMPLEMENTED ;;
+  inspect)
+    [ -e "$root/$id.c" ] || fail_with 3 NOT_FOUND
+    if [ -n "${STUB_INSPECT_DIR:-}" ] && [ -f "$STUB_INSPECT_DIR/out" ]; then
+      cat "$STUB_INSPECT_DIR/out"
+    else
+      # 製品の InspectReport::to_json と同じキー順。bundle にはパス風の文字列を入れ、漏えいしないことを照合する。
+      printf '{"id":"%s","status":"created","pid":null,"exitCode":null,"bundle":"/home/secret-user/bundle","revision":1,"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":null}\n' "$id"
+    fi
+    ;;
   stop) [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND kill; fail_op 5 FAILED_PRECONDITION kill ;;
   delete)
     [ -e "$root/$id.c" ] || fail_op 3 NOT_FOUND delete
@@ -307,6 +318,51 @@ printf 'ID\tSTATUS\tPID\nc1\tcreated\t-\n\n' >"$outdir/out.3"
 printf 'a\000b' >"$outdir/out.5"
 printf 'ID\tSTATUS\tPID\nc1\tcreated\t4242' >"$outdir/out.6"
 
+
+# inspect fixture（B17 の stdout）。1 ケース 1 capture で、B17 の行を具体値で照合する。
+inspdir="$work/insp"
+mkdir -p "$inspdir"
+mkinsp() { # <名前> <printf の書式（stdout の全バイト）>
+  mkdir -p "$inspdir/$1"
+  # shellcheck disable=SC2059 # 書式は本ファイル内の固定 fixture
+  printf "$2" >"$inspdir/$1/out"
+}
+cap_names='"CAP_CHOWN","CAP_KILL","CAP_NET_RAW"'
+ext1='{"containerId":0,"hostId":100000,"size":65536}'
+ext2='{"containerId":65536,"hostId":300000,"size":10}'
+head_ok='{"id":"web-1","status":"running","pid":42,"exitCode":-9,"bundle":"/home/secret-user/b\\"q\\" \303\251","revision":5,'
+mkinsp full "${head_ok//%/%%}"'"cgroupScope":"/user/secret-slice","cgroupInstance":2,"supervisorPid":7,"health":"healthy","restartCount":2,"auditCoverage":{"policy":"evaluated","seccompKill":{"mode":"kill","reason":null},"landlock":{"mode":"enforce","reason":"kernel 6.12 secret"},"record":"failed"},"idMapping":{"model":"subordinate","uid":['"$ext1,$ext2"'],"gid":['"$ext1"']},"explicitStop":"recorded","capabilities":{"bounding":['"$cap_names"']},"rootReadonly":true}\n'
+tail_ok='"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":null}'
+base_head='{"id":"c1","status":"created","pid":null,"exitCode":null,"bundle":"/b","revision":1,'
+mkinsp order '{"status":"created","id":"c1","pid":null,"exitCode":null,"bundle":"/b","revision":1,'"$tail_ok"'\n'
+mkinsp extra "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"extra":1}\n'
+mkinsp rofalse "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":false}\n'
+mkinsp noro "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null}\n'
+mkinsp badro "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":"yes"}\n'
+mkinsp extrarw "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":true,"extra":1}\n'
+mkinsp missing '{"id":"c1","status":"created","pid":null,"exitCode":null,"bundle":"/b","revision":1,"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"capabilities":null,"rootReadonly":null}\n'
+mkinsp nolf "$base_head$tail_ok"
+mkinsp crlf "$base_head$tail_ok"'\r\n'
+mkinsp twolines "$base_head$tail_ok"'\n'"$base_head$tail_ok"'\n'
+mkinsp badcap "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":{"bounding":["cap_chown"]},"rootReadonly":null}\n'
+mkinsp badstr '{"id":"c1","status":"created","pid":null,"exitCode":null,"bundle":"a"b","revision":1,'"$tail_ok"'\n'
+mkinsp lead0pid '{"id":"c1","status":"running","pid":042,"exitCode":null,"bundle":"/b","revision":1,'"$tail_ok"'\n'
+mkinsp lead0ext "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":{"model":"subordinate","uid":[{"containerId":00,"hostId":100000,"size":1}],"gid":[]},"explicitStop":"not_recorded","capabilities":null,"rootReadonly":null}\n'
+mkinsp lead0cg "$base_head"'"cgroupScope":null,"cgroupInstance":01,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":null,"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":null}\n'
+mkinsp besteffort "$base_head"'"cgroupScope":null,"cgroupInstance":null,"supervisorPid":null,"health":null,"restartCount":0,"auditCoverage":{"policy":"best-effort","seccompKill":{"mode":"kill","reason":null},"landlock":{"mode":"enforce","reason":null},"record":null},"idMapping":null,"explicitStop":"not_recorded","capabilities":null,"rootReadonly":null}\n'
+mkinsp empty ''
+mkdir -p "$inspdir/big"
+{
+  printf '{"id":"c1","status":"created","pid":null,"exitCode":null,"bundle":"'
+  i=0
+  while [ "$i" -lt 9000 ]; do
+    printf 'aaaaaaaa'
+    i=$((i + 1))
+  done
+  printf '",'
+  printf '%s\n' "$tail_ok"
+} >"$inspdir/big/out"
+
 # --------------------------------------------------
 # capture を同時に起動し、全て終わってから照合する。
 # --------------------------------------------------
@@ -351,12 +407,18 @@ STUB_PIDFILE="$work/pids.txt" start_capture hang hang --timeout 1
 STUB_ERR_DIR="$errdir" start_capture errtable ok
 STUB_ERR_DIR="$errmax" STUB_OUT_DIR="$pidout" start_capture errmax ok
 STUB_OUT_DIR="$outdir" start_capture outtable ok
+insp_names="full rofalse noro badro extrarw order extra missing nolf crlf twolines badcap badstr big lead0pid lead0ext lead0cg besteffort empty"
+for n in $insp_names; do
+  STUB_INSPECT_DIR="$inspdir/$n" start_capture "insp_$n" ok
+done
 wait
 
-for name in ok lcall nonlinux diff noisy errtable errmax outtable; do
+all_caps="ok lcall nonlinux diff noisy errtable errmax outtable"
+for n in $insp_names; do all_caps="$all_caps insp_$n"; done
+for name in $all_caps; do
   expect_rc "capture $name exits 0" 0 "$(rc_of "$name")"
 done
-for name in ok lcall nonlinux diff noisy errtable errmax outtable; do
+for name in $all_caps; do
   # 失敗の調査用。capture の stderr は固定語彙の 1 行で、パスや環境の値を含まない。
   [ "$(rc_of "$name")" = "0" ] || [ ! -s "$work/$name.err" ] || sed "s/^/  $name stderr: /" "$work/$name.err"
 done
@@ -366,7 +428,7 @@ count=0
 while IFS= read -r l; do
   case "$l" in [ABD][0-9][0-9]"$tab"*) count=$((count + 1)) ;; esac
 done <"$work/ok.txt"
-expect_eq "capture records 50 cases" 50 "$count"
+expect_eq "capture records 51 cases" 51 "$count"
 expect_line "A02 usage error" ok "A02${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "B01 empty list" ok "B01${tab}B${tab}0${tab}-${tab}list:H"
 expect_line "B03 list after create" ok "B03${tab}B${tab}0${tab}-${tab}list:H;c1,created,-"
@@ -385,7 +447,7 @@ while IFS= read -r l; do
   loc_n=$((loc_n + 1))
   [ "$l" = "C" ] || loc_bad=$((loc_bad + 1))
 done <"$work/locale.txt"
-expect_eq "lcall stub invocations" 50 "$loc_n"
+expect_eq "lcall stub invocations" 51 "$loc_n"
 expect_eq "lcall stub got LC_ALL other than C" 0 "$loc_bad"
 expect_line "A20 unknown stop signal" ok "A20${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
 expect_line "A23 unknown cap-drop name" ok "A23${tab}A${tab}2${tab}INVALID_ARGUMENT${tab}-"
@@ -470,12 +532,12 @@ cmp_has_prefix() { # <表示名> <cmp.txt のいずれかの行の先頭に現�
 compare ok ok
 expect_rc "compare identical is rc 0" 0 $?
 cmp_has "layer A summary" 'layer A (syntax): match=27 mismatch=0 missing=0'
-cmp_has "layer B summary" 'layer B (behavior): match=16 mismatch=0 missing=0'
+cmp_has "layer B summary" 'layer B (behavior): match=17 mismatch=0 missing=0'
 cmp_has "layer D summary" 'layer D (logs options): match=7 mismatch=0 missing=0'
 compare ok lcall
 expect_rc "compare ok vs lcall is rc 0" 0 $?
 cmp_has "lcall layer A summary" 'layer A (syntax): match=27 mismatch=0 missing=0'
-cmp_has "lcall layer B summary" 'layer B (behavior): match=16 mismatch=0 missing=0'
+cmp_has "lcall layer B summary" 'layer B (behavior): match=17 mismatch=0 missing=0'
 
 compare ok diff
 expect_rc "compare with changed exit code is rc 1" 1 $?
@@ -485,7 +547,7 @@ cmp_has "unchanged case stays MATCH" 'B01 MATCH'
 compare ok nonlinux
 expect_rc "non-linux stub differs in layer B (rc 1)" 1 $?
 cmp_has "non-linux layer A all match" 'layer A (syntax): match=27 mismatch=0 missing=0'
-cmp_has "non-linux layer B mismatches (B08 coincides at 5)" 'layer B (behavior): match=1 mismatch=15 missing=0'
+cmp_has "non-linux layer B mismatches (B08 coincides at 5)" 'layer B (behavior): match=1 mismatch=16 missing=0'
 
 # ケース欠落は MISSING
 grep -v "^B05${tab}" "$work/ok.txt" >"$work/missing.txt"
@@ -502,7 +564,7 @@ cmp_has_prefix "B05 missing on both sides reported" 'B05 MISSING'
 base_B05="0/-/-" cand_B05="0/-/-" base_ids="B05" cand_os="macos" compare missing missing
 expect_rc "inherited env vars do not hide a missing case (rc 1)" 1 $?
 cmp_has "B05 still MISSING with base_B05/cand_B05 in env" 'B05 MISSING (baseline=absent candidate=absent)'
-cmp_has "layer B counts the missing case" 'layer B (behavior): match=15 mismatch=0 missing=1'
+cmp_has "layer B counts the missing case" 'layer B (behavior): match=16 mismatch=0 missing=1'
 # 想定外 ID（B99）と同名の環境変数があっても重複扱いにならず、片側だけにある ID は MISSING になる。
 {
   cat "$work/ok.txt"
@@ -581,6 +643,46 @@ expect_rc "list:garbage stdout field is rejected" 2 $?
 sed "s/^B02${tab}B${tab}0${tab}-${tab}.*/B02${tab}B${tab}0${tab}-${tab}list:H/" "$work/ok.txt" >"$work/g3.txt"
 compare g3 g3
 expect_rc "list form on a non-list case is rejected" 2 $?
+
+# --- inspect の 1 行 JSON（種別 i。B17）---
+expect_line "B17 inspect of a created container" ok "B17${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-,ro=-"
+expect_line "B17 inspect with every object is normalized" insp_full "B17${tab}B${tab}0${tab}-${tab}inspect:web-1,running,pid=<pid>,exit=-9,rev=5,cg=<set>,sup=<pid>,health=healthy,rst=2,audit=evaluated/kill/enforce/failed,idmap=subordinate:2:1,stop=recorded,caps=3,ro=true"
+for n in order extra noro badro extrarw missing nolf crlf twolines badcap badstr; do
+  expect_line "B17 malformed inspect ($n) is unexpected" "insp_$n" "B17${tab}B${tab}0${tab}-${tab}<unexpected>:$(case $n in nolf) echo 0 ;; twolines) echo 2 ;; *) echo 1 ;; esac)"
+done
+for n in lead0pid lead0ext lead0cg; do
+  expect_line "B17 leading-zero number ($n) is unexpected" "insp_$n" "B17${tab}B${tab}0${tab}-${tab}<unexpected>:1"
+done
+expect_line "B17 rootReadonly false is accepted" insp_rofalse "B17${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-,ro=false"
+expect_line "B17 hyphenated audit policy is accepted" insp_besteffort "B17${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=best-effort/kill/enforce/-,idmap=-,stop=not_recorded,caps=-,ro=-"
+expect_line "B17 empty stdout on success is unexpected" insp_empty "B17${tab}B${tab}0${tab}-${tab}<unexpected>:0"
+expect_line "B17 oversized inspect is unexpected" insp_big "B17${tab}B${tab}0${tab}-${tab}<unexpected>:big"
+# 漏えい検査: bundle のパス・cgroup 名・ホストの id・reason は capture に現れない
+leak=0
+for n in ok insp_full; do
+  while IFS= read -r l; do
+    case "$l" in *secret*|*100000*|*300000*|*kernel*) leak=$((leak + 1)) ;; esac
+  done <"$work/$n.txt"
+done
+expect_eq "inspect capture leaks no path / cgroup / hostId / reason" 0 "$leak"
+compare ok insp_order
+expect_rc "malformed inspect differs from ok (rc 1)" 1 $?
+cmp_has_prefix "B17 malformed inspect reported as UNVERIFIED" "B17 UNVERIFIED"
+compare ok insp_full
+expect_rc "different inspect values differ (rc 1)" 1 $?
+cmp_has_prefix "B17 different values reported as MISMATCH" "B17 MISMATCH"
+compare ok nonlinux
+cmp_has_prefix "B17 non-linux is MISMATCH" "B17 MISMATCH"
+# load_capture: 種別ごとに受理する形式を限定する
+sed "s/^B02${tab}B${tab}0${tab}-${tab}.*/B02${tab}B${tab}0${tab}-${tab}inspect:c1,created,pid=-,exit=-,rev=1,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=x,caps=-,ro=-/" "$work/ok.txt" >"$work/i1.txt"
+compare i1 i1
+expect_rc "inspect form on a non-inspect case is rejected" 2 $?
+sed "s/^B17${tab}B${tab}0${tab}-${tab}.*/B17${tab}B${tab}0${tab}-${tab}list:H/" "$work/ok.txt" >"$work/i2.txt"
+compare i2 i2
+expect_rc "list form on an inspect case is rejected" 2 $?
+sed "s/^B17${tab}B${tab}0${tab}-${tab}.*/B17${tab}B${tab}0${tab}-${tab}inspect:garbage/" "$work/ok.txt" >"$work/i3.txt"
+compare i3 i3
+expect_rc "inspect:garbage stdout field is rejected" 2 $?
 
 # 元のバイト列で検証する: 余分なタブ（空欄）・NUL・LF 終端なしは、read が畳んだ後の値が正常でも拒否する。
 # 両側に同じ壊れたファイルを渡し、MATCH（rc 0）にならないことを確かめる。

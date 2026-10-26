@@ -12,7 +12,7 @@ TASK-125（共同タスク）の確認記録の雛形。実機での実行・結
 | ---- | ---- |
 | 非 Linux の plugin 起動・RPC | 発見 → 登録 → 信頼性検証までは配線済みだが、plugin の起動と RPC は未実装（TASK-114）。macOS / Windows ではバックエンド解決が必ず失敗する。よって B 層（挙動）の非 Linux 欄は **前提未達** であり、合格として記入しない |
 | Linux 経路の未実装 | `start` の本番 launcher、cgroup 配置つき `delete` は未実装（REPAIR-3）。pid ありの `stop` は Linux では supervisor の制御チャネル経由で結線済み（#2059。supervisor に届かなければ `UNAVAILABLE`（9））。Linux 側の現行値（`start` = 8 など）は「現行実装での参考値」で、launcher 提供後に変わる。固定の合格基準にしない |
-| イメージ管理の現状（C 層） | コンテナ参照（#2341・#2352）と manifest の在庫・タグ・リース（#2380）は永続化済みだが、本番で在庫を埋める経路（pull → `ImageStore` の配線）が未実装のため、Linux でも `image ls` は 0 件（ヘッダのみ）・`image rm` と `image tag` と `create --image-root <dir> --image <digest または name[:tag]>`（タグ参照は永続化済みの在庫から解決。#2496） は `NOT_FOUND`（3）が現行値で、`system df` の images 側は 0 件。`--image-root` は必須で既定位置は未決（#2221）。非 Linux はイメージキャッシュの置き場が未決のため他コマンドと同じ plugin 解決の失敗（5 など）で fail-closed。`scripts/cli-parity-check.sh` は C 層を自動収集しないため、手動で実行して記録する |
+| イメージ管理の現状（C 層） | コンテナ参照（#2341・#2352）と manifest の在庫・タグ・リース（#2380）は永続化済みで、在庫は plugin-cri の `PullImage`（cri の `OciImagePuller::pull`）が登録する。plugin-cri のキャッシュは「plugin-cri が解決する既定の状態ルート（`StateRoot::resolve(None)`）の `.cri/images`」（#2539・#2800・#2592）。CLI に `pull` サブコマンドは無い（`docs/design/pull-inventory-wiring.md`）。同じ root を `--image-root` に渡せば、pull 済みの在庫に対して `image ls`・`image rm`・`image tag`・`create --image-root <dir> --image <digest または name[:tag]>`（タグ参照は永続化済みの在庫から解決。#2496）が成功する。未 pull の root（空のストア）では従来どおり `image ls` は 0 件（ヘッダのみ）・`image rm` と `image tag` と `create --image` は `NOT_FOUND`（3）で、`system df` の images 側は 0 件。`--image-root` は必須で既定位置は未決（#2221）。非 Linux はイメージキャッシュの置き場が未決のため他コマンドと同じ plugin 解決の失敗（5 など）で fail-closed。`scripts/cli-parity-check.sh` は C 層を自動収集しないため、手動で実行して記録する。pull 済み root の手順は C 層の節の「pull 済みの root の用意」 |
 | Windows の自動化 | `scripts/cli-parity-check.sh` は Git Bash で実行する。スタブ CLI による自己テストは CI の 3 OS（ubuntu・macos・windows）で実行しているが、製品バイナリ（ネイティブ exe）に対する capture は CI で確かめていない（実機確認の範囲）。タイムアウト時の子孫回収だけはヘルパー exe で CI 実測する（#1548） |
 
 期待値の正は「Linux ネイティブ実行と同一」。Linux の capture を基準にして他 OS を突き合わせる。
@@ -113,17 +113,21 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | `stop` | `stop <id>` | 終了コード・`code`・stdout 空・不在 ID は `NOT_FOUND`（3） |
 | `delete` | `delete [--force] <id>` | 終了コード・`code`・stdout 空・直後の `list` から ID が消える |
 | `list` | `list` | 終了コード・stdout の形式（ヘッダ `ID<TAB>STATUS<TAB>PID`、ID 昇順、0 件はヘッダのみで 0）・状態ルート不在は `NOT_FOUND`（3） |
+| `inspect` | `inspect <id>` | 終了コード・`code`・正規化した 1 行 JSON（B17。種別 `i`）・不在 ID は `NOT_FOUND`（3）。構文は A24・A25 |
 | `logs` | `logs [--follow] [--tail <N>] [--stream <stdout\|stderr>] [--escape] <id>` | 終了コード・`code`・不在 ID は `NOT_FOUND`（3）。オプションの構文は D 層（#2447・SUP-7） |
 
 ### ケース別チェックリスト
 
-結果欄は 終了コード / `code` / stdout 要約（`-` = 空、`list:H;<id>,<status>,<pid|->` = list 形式）。
+結果欄は 終了コード / `code` / stdout 要約（`-` = 空、`list:H;<id>,<status>,<pid|->` = list 形式、`inspect:...` = inspect の 1 行 JSON の正規化形式）。
+
+`inspect:<id>,<status>,pid=<pid|->,exit=<整数|->,rev=<整数>,cg=<set|->,sup=<pid|->,health=<語彙|->,rst=<整数>,audit=<policy/seccompKill/landlock/record|->,idmap=<model:uid件数:gid件数|->,stop=<語彙>,caps=<件数|->,ro=<true|false|->` の固定語彙の 1 欄に畳んで記録する（`scripts/cli-parity-check.sh` の `norm_inspect`。CLI-1・#2826）。値を記録する項目は id・status・health・exitCode・revision・restartCount・explicitStop で、PID（pid・supervisorPid）は `<pid>`、cgroup（cgroupScope・cgroupInstance）は `<set>` に置換する。記録しない項目は bundle（絶対パス）・auditCoverage の reason（カーネル版数に依る詳細）・idMapping の hostId（ホストの subuid 設定）・capabilities の名前（件数だけ記録）。キー順や形が製品の出力契約（`crates/supervisor/src/inspect.rs`）と違う出力は `<unexpected>:<行数>` になり、一致扱いにならない。
 
 | ID | コマンドと前提 | Linux の参考期待値 | Linux | macOS | Windows | 一致 | 備考 |
 | -- | -------------- | ------------------ | ----- | ----- | ------- | ---- | ---- |
 | B01 | `list`（空の状態ルート） | 0 / `-` / `list:H` | 0 / `-` / `list:H` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B02 | `create --bundle <bundle> c1` | 0 / `-` / `-` | 0 / `-` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B03 | `list`（create 後） | 0 / `-` / `list:H;c1,created,-` | 0 / `-` / `list:H;c1,created,-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
+| B17 | `inspect c1`（B03 の直後。created のコンテナ） | 0 / `-` / `inspect:c1,created,pid=-,exit=-,rev=<実装の値>,cg=-,sup=-,health=-,rst=0,audit=-,idmap=-,stop=not_recorded,caps=-` | | 前提未達 | 前提未達 | | `rev` は参考値で固定の合格基準にしない。macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない）。#2826 で追加 |
 | B04 | `create`（c1 重複） | 4 / `ALREADY_EXISTS` / `-` | 4 / `ALREADY_EXISTS` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B05 | `start c1` | 8 / `UNIMPLEMENTED` / `-`（本番 launcher 未提供） | 8 / `UNIMPLEMENTED` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B06 | `list`（start 後） | 0 / `-` / `list:H;c1,created,-` | 0 / `-` / `list:H;c1,created,-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
@@ -138,11 +142,15 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | B15 | `list`（状態ルートの親ディレクトリも不在） | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 | B16 | `inspect nonexist` | 3 / `NOT_FOUND` / `-` | 3 / `NOT_FOUND` / `-` | 前提未達 | 前提未達 | | macOS の capture の値: 5 / `FAILED_PRECONDITION` / `-`（合格として扱わない） |
 
-**手動確認（自動収集しない）**: Linux で start 済みコンテナの `inspect <id>` は 1 行の JSON を出し、末尾が `"explicitStop":"...","capabilities":{"bounding":[...]}` になる（`create --cap-drop chown` なら `CAP_CHOWN` が bounding から消える）。start 前・旧記録は `"capabilities":null`。`create --read-only` で作って start した後の `inspect` は末尾が `"capabilities":{...},"rootReadonly":true` になり、`--read-only` なしで config が `readonly:false` なら `"rootReadonly":false`、start 前・旧記録は `"rootReadonly":null`（#2828）。成功時の stdout は新しい stdout 種別が要るため `cli-parity-check.sh` では収集しない（#2775・#2828・CLI-1）。
+**手動確認（自動収集しない）**: created の `inspect <id>` は B17 で自動収集する。Linux で start 済みコンテナの `inspect <id>` は 1 行の JSON を出し、末尾が `"explicitStop":"...","capabilities":{"bounding":[...]}` になる（`create --cap-drop chown` なら `CAP_CHOWN` が bounding から消える）。start 前・旧記録は `"capabilities":null`。`create --read-only` で作って start した後の `inspect` は末尾が `"capabilities":{...},"rootReadonly":true` になり、`--read-only` なしで config が `readonly:false` なら `"rootReadonly":false`、start 前・旧記録は `"rootReadonly":null`（#2828）。capture の環境では B05 の `start` が成功しない（本番 launcher が無い）ため、start 済みの capability 集合の中身は自動収集できず手動のままにする（B17 の `caps=` は件数だけ。中身の照合は crates/cli・crates/supervisor の試験が担う。#2775・#2826・CLI-1）。
 
 ## C 層: イメージ管理（`image ls`・`system df`・`image rm`・`image tag`。#2221・#2316・CLI-1・OCI-7）
 
-`scripts/cli-parity-check.sh` は本層を自動収集しない。手動で実行し、結果欄だけを記入する（#661）。パス・ホスト名は記録しない（記録ルールは上記）。`<dir>` は事前に作った空のイメージストア root（絶対パス。`blobs/sha256` を持つ）。
+`scripts/cli-parity-check.sh` は本層を自動収集しない。手動で実行し、結果欄だけを記入する（#661）。パス・ホスト名は記録しない（記録ルールは上記）。`<dir>` は事前に作った空のイメージストア root（絶対パス。`blobs/sha256` を持つ）。C29〜C31 だけは pull 済みの root（下記）を使う。
+
+### pull 済みの root の用意（Linux 限定・人間担当。#661）
+
+CLI に `pull` は無いため、plugin-cri の `PullImage` で在庫を埋める。手順は `docs/verification/crictl-smoke.md` の前提（plugin-cri を UDS で起動。`fandhe-container-plugin-cri --socket <PATH>`）に従い、`crictl pull docker.io/library/busybox:latest` を実行する。plugin-cri のキャッシュは、plugin-cri が解決する既定の状態ルート（`StateRoot::resolve(None)`）の `.cri/images` である（状態ルートを指定するフラグは無い。#2592）。その `.cri/images` の絶対パスを `<pulled-dir>` として C29〜C31 の `--image-root` に渡す。C29〜C31 は変更を伴うため、実行順（C29 → C30 → C31）を守り、実行前に在庫を取り直せるようにしておく（`crictl pull` は再実行できる）。実環境の状態ルートのパスは記録しない。
 
 ### 4 コマンドの比較項目
 
@@ -182,13 +190,16 @@ B 層は上から順に実行し、状態遷移を直後の `list` で観測す�
 | -- | -------------- | ------------------ | ----- | ----- | ------- | ---- | ---- |
 | C20 | `image ls --image-root <dir>`（空） | 0 / ヘッダのみ | | 前提未達 | 前提未達 | | |
 | C21 | `system df --image-root <dir>`（空） | 0 / 固定 9 行（値は 0） | | 前提未達 | 前提未達 | | |
-| C22 | `image rm --image-root <dir> busybox:latest` | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 在庫を埋める経路が未実装のため常にこの値 |
+| C22 | `image rm --image-root <dir> busybox:latest` | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 空のストア（未 pull の root）での値。pull 済みの root は C31 |
 | C23 | `image ls --image-root <存在しない dir>` | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | |
 | C24 | `image ls --image-root <通常ファイル>` | 5 / `FAILED_PRECONDITION` | | 前提未達 | 前提未達 | | |
-| C25 | `image tag --image-root <dir> busybox:latest busybox:v2` | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 在庫を埋める経路が未実装のため常にこの値 |
-| C26 | `create --image-root <dir> --image sha256:<64 hex> または name[:tag] --bundle <bundle> <id>`（OCI-7・#2315） | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 在庫を埋める経路（pull → `ImageStore` の配線）が入るまで常にこの値。状態は作られない。`--image` だけ・`--image-root` だけは 2 / `INVALID_ARGUMENT` |
+| C25 | `image tag --image-root <dir> busybox:latest busybox:v2` | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 空のストア（未 pull の root）での値。pull 済みの root は C29 |
+| C26 | `create --image-root <dir> --image sha256:<64 hex> または name[:tag] --bundle <bundle> <id>`（OCI-7・#2315） | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 空のストア（未 pull の root）での値で、状態は作られない。pull 済みの root は C30。`--image` だけ・`--image-root` だけは 2 / `INVALID_ARGUMENT` |
 | C27 | `image rm --image-root <dir> nginx@sha256:<64 hex>`（空のストア。#2659） | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | `name@digest` は digest 優先で受ける（`INVALID_ARGUMENT` にならない） |
 | C28 | `image tag --image-root <dir> nginx@sha256:<64 hex> busybox:v2`（空のストア。#2659） | 3 / `NOT_FOUND` | | 前提未達 | 前提未達 | | 同上 |
+| C29 | `image tag --image-root <pulled-dir> busybox:latest busybox:v2`（pull 済みの root。#2826） | 0 / `tagged` の 1 行 | | 前提未達 | 前提未達 | | 出力は `tagged\t<tag>\t<manifest>`（`crates/cli/src/commands/image.rs`）。値は記録しない。同じ操作の再実行は `unchanged` |
+| C30 | `create --image-root <pulled-dir> --image busybox:latest --bundle <bundle> <id>`（pull 済みの root。OCI-7・#2826） | 0 / `-` | | 前提未達 | 前提未達 | | 状態が作られ、直後の `list` に ID が現れる。この参照が残る間、C31 は使用中になる |
+| C31 | `image rm --image-root <pulled-dir> busybox:latest`（pull 済みの root。#2826） | 0 / `untagged` 行のみ | | 前提未達 | 前提未達 | | C30 の `delete` 後（参照が残らない状態）の値。C29 で付けた `busybox:v2` が残るため `deleted` 行は出ない（最後のタグを消すと `deleted` 行も出る。`image rm busybox:v2` を続けて確認してよい）。コンテナが使用中なら 5 / `FAILED_PRECONDITION`（`--force` なしの拒否）。値は記録しない |
 
 ## D 層: logs のオプション（`--follow`・`--tail`・`--stream`・`--escape`。#2447・CLI-1・SUP-7）
 

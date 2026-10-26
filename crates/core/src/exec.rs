@@ -2602,14 +2602,6 @@ fn fd_still_at(dir: &OwnedFd, expected: &Path) -> bool {
         .is_ok_and(|now| now.components().eq(expected.components()))
 }
 
-/// `/proc/thread-self/fdinfo/<fd>` の `mnt_id:` 行（fd が属するマウントの ID）を取り出す。
-pub(crate) fn parse_fdinfo_mnt_id(fdinfo: &str) -> Option<u64> {
-    fdinfo
-        .lines()
-        .find_map(|l| l.strip_prefix("mnt_id:"))
-        .and_then(|v| v.trim().parse().ok())
-}
-
 /// `dir` が属するマウントが shared propagation か判定する。fdinfo の `mnt_id` と
 /// 呼び出しスレッドの `/proc/thread-self/mountinfo` の先頭フィールド（mount ID）を
 /// 突き合わせる（`/proc/self/mountinfo` はスレッドグループの代表の mount namespace を映し、
@@ -2632,10 +2624,16 @@ fn mount_is_shared(dir: &OwnedFd, stage: IsolationStage) -> Result<bool, ExecErr
 /// `dir` が属するマウントの ID（`/proc/thread-self/fdinfo/N` の `mnt_id`）。読めなければ
 /// システムエラー（fail-closed）。
 fn fd_mount_id(dir: &OwnedFd, stage: IsolationStage) -> Result<u64, ExecError> {
-    let err = |msg: &str| mountinfo_error(msg).at_stage(stage);
-    let fdinfo = std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", dir.as_raw_fd()))
-        .map_err(|_| err("cannot read fdinfo of the pinned directory"))?;
-    parse_fdinfo_mnt_id(&fdinfo).ok_or_else(|| err("no mnt_id in fdinfo of the pinned directory"))
+    use crate::oci_runtime::mountinfo_identity::{FdinfoMountIdError, read_fd_mnt_id};
+    read_fd_mnt_id(dir.as_fd()).map_err(|e| {
+        let msg = match e {
+            FdinfoMountIdError::Read(_) | FdinfoMountIdError::TooLarge => {
+                "cannot read fdinfo of the pinned directory"
+            }
+            _ => "no mnt_id in fdinfo of the pinned directory",
+        };
+        mountinfo_error(msg).at_stage(stage)
+    })
 }
 
 /// 呼び出しスレッドの mount namespace の mountinfo（`/proc/self/mountinfo` はスレッドグループの
@@ -3561,17 +3559,6 @@ mod tests {
         assert_eq!(err.stage, IsolationStage::MountProc);
     }
 
-    /// fdinfo の `mnt_id:` を取り出す（無い・数値でない場合は None）。
-    #[test]
-    fn fdinfo_mnt_id_parsing() {
-        assert_eq!(
-            parse_fdinfo_mnt_id("pos:\t0\nflags:\t012600000\nmnt_id:\t52\nino:\t1\n"),
-            Some(52)
-        );
-        assert_eq!(parse_fdinfo_mnt_id("pos:\t0\nflags:\t0\n"), None);
-        assert_eq!(parse_fdinfo_mnt_id("mnt_id:\tx\n"), None);
-    }
-
     /// 走査で固定した `/` の fd の mnt_id は、mountinfo で最後に現れる（最上位の）
     /// マウントポイント `/` の mount ID と一致し、その行の shared 判定を返す。
     #[test]
@@ -3596,10 +3583,7 @@ mod tests {
     #[test]
     fn mount_is_shared_uses_mount_id_of_fd() {
         let fd = open_dir_beneath(Path::new("/"), &[]).unwrap();
-        let fdinfo =
-            std::fs::read_to_string(format!("/proc/thread-self/fdinfo/{}", fd.as_raw_fd()))
-                .unwrap();
-        let mnt_id = parse_fdinfo_mnt_id(&fdinfo).unwrap();
+        let mnt_id = crate::oci_runtime::mountinfo_identity::read_fd_mnt_id(fd.as_fd()).unwrap();
         let info = std::fs::read_to_string("/proc/thread-self/mountinfo").unwrap();
         let root_line = info
             .lines()

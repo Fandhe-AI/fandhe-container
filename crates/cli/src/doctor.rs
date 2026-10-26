@@ -51,6 +51,26 @@
 //! procfs（fstype `proc`）であり、かつ `/proc/sys/net` がディレクトリと確認できた場合に限り未ロードとし、
 //! procfs 未マウント・通常ディレクトリ・mountinfo を読めない等で確認できなければ `Unknown` とする。
 //!
+//! # mountinfo の行選択の点検（#2909・SEC-1・CLI-1・REPAIR-4）
+//!
+//! core の行選択を fd の mount ID 照合へ寄せた #2823 に続き、doctor が `/proc/self/mountinfo` の行を引く箇所を
+//! 点検した。重なったマウントや祖先の overmount で隠れたマウントの行を取り違える箇所は無い。
+//!
+//! | 箇所 | 行の選び方 | 判定 |
+//! | ---- | ---------- | ---- |
+//! | `confirm_procfs`（`/proc/sys/net`。`BrNetfilterProbe` の `NotFound`） | 開いた fd の `mnt_id` を `file_mount_id` で得て `mount_fstype_by_id` で引く | 取り違え無し。ID のみで選びパス欄を比べない。同じ ID の重複行は `MalformedEntry` で判定不能（#2724） |
+//! | `confirm_procfs`（`/proc/net`。`has_legacy_filter` の `NotFound`） | 同上 | 同上 |
+//! | `launcher_check::launcher_mount_state` | 実体の fd の ID を `mount_option_by_id` で引く | 取り違え無し（#2661） |
+//! | `user_scope_check`・`id_mapping_check`・`landlock_check` | mountinfo を読まない | 該当なし |
+//!
+//! - core の `read_fd_mnt_id` は `pub(crate)` で、スレッドごとに mount namespace を切り替える core のため
+//!   `/proc/thread-self` を読む。doctor は setns せず単一の mount namespace で動き、cli は既に net に依存し、
+//!   net の `file_mount_id`（`/proc/self/fdinfo`）が同じ `mnt_id` を返すため等価。core に新しい公開 API は要らない。
+//! - `unescape_mountinfo` は cli に存在せず（パス欄を解釈しない）、統合の対象は無い。
+//! - 残余: net の `parse_fdinfo_mnt_id` は `mnt_id:` 行の重複を拒否せず先頭を採る（core は拒否）。カーネルは 1 行しか
+//!   出さないため判定に影響しない。判定は doctor 自身の mount namespace からの観測で、`start` の実行環境と食い違いうる。
+//! - 結合試験 `binary_entry.rs` のパス最長一致は、製品側と別の方法で期待値を独立に求める試験側のオラクルで、据え置く。
+//!
 //! # 未実装範囲（REPAIR-3。実装済みを装わない）
 //!
 //! IPv6（`ip6 filter FORWARD`）、Docker の nftables ネイティブバックエンドのテーブル、iptables-legacy の
@@ -1423,6 +1443,37 @@ mod tests {
         let exact = TempRoot::new();
         exact.write(IP_TABLES_NAMES, &"n".repeat(MAX_PROC_READ as usize));
         assert_eq!(has_legacy_filter(&exact.0), Some(false));
+    }
+
+    /// SEC-1・CLI-1・#2909: `/proc/net` と同じパスの別 ID の行（重なり）があっても fd の mount ID で行を選ぶ。
+    #[test]
+    fn sec1_2909_legacy_filter_overmounted_proc_net_uses_fd_mount_id() {
+        let nf = Mock(Err(NetErrorCode::NotFound));
+        let not_found = |l| ForwardPolicyState::NotFoundInNftables {
+            legacy_iptables_filter: l,
+        };
+        // A: 実 ID は procfs。同じパスの別 ID の tmpfs 行は無視され Some(false)。
+        let a = procfs_root();
+        let mut info = std::fs::read_to_string(a.0.join(PROC_SELF_MOUNTINFO)).expect("read");
+        info.push_str("99 1 0:99 / /proc/net rw - tmpfs tmpfs rw\n");
+        a.write(PROC_SELF_MOUNTINFO, &info);
+        assert_eq!(has_legacy_filter(&a.0), Some(false));
+        assert_eq!(probe_forward_policy(&nf, &a.0), not_found(Some(false)));
+        // B: 実 ID は tmpfs。同じパスの別 ID の procfs 行に騙されず None。
+        let b = procfs_root();
+        let mut info = mountinfo_for(&b.0, "tmpfs");
+        info.push_str("99 1 0:99 / /proc/net rw - proc proc rw\n");
+        b.write(PROC_SELF_MOUNTINFO, &info);
+        assert_eq!(has_legacy_filter(&b.0), None);
+        assert_eq!(probe_forward_policy(&nf, &b.0), not_found(None));
+        // C: 実 ID の行が 2 行（procfs と tmpfs）重複すると fail-closed で None。
+        let c = procfs_root();
+        let mut info = std::fs::read_to_string(c.0.join(PROC_SELF_MOUNTINFO)).expect("read");
+        let dup = mountinfo_for(&c.0, "tmpfs");
+        info.push_str(dup.lines().nth(1).expect("line"));
+        info.push('\n');
+        c.write(PROC_SELF_MOUNTINFO, &info);
+        assert_eq!(has_legacy_filter(&c.0), None);
     }
 
     /// NET-10: legacy iptables の filter テーブルの有無が補助情報に反映される。

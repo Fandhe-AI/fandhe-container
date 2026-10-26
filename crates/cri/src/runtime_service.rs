@@ -4,7 +4,7 @@
 //! 本ファイルの時点で実装済みなのは `RunPodSandbox`・`StopPodSandbox`・`RemovePodSandbox`・
 //! `PodSandboxStatus`・`ListPodSandbox` と、`CreateContainer`・`StartContainer`（TASK-58.1）・
 //! `StopContainer`・`RemoveContainer`（TASK-58.2・#434）・`ListContainers`・`ContainerStatus`
-//! （TASK-58.3・#435）で、他の RPC は `Unimplemented` を返す。
+//! （TASK-58.3・#435）と `Status`（#2830。待ちのない準備状態の報告。`docs/design/cri-status-rpc.md`）で、他の RPC は `Unimplemented` を返す。
 //!
 //! **Create/Start の扱い（CRI-1・ERR-3・TASK-58.1）**: cri-api の `CreateContainerRequest` にクライアント指定の
 //! ID はなく、ID はサービスが採番する。proto は `(metadata.name, metadata.attempt)` を sandbox 内で一意と
@@ -923,16 +923,50 @@ fn attach_prepared(
     Ok(())
 }
 
-/// kubelet に伝える実行時の機能フラグ（`StatusResponse.features`。KEP-3619 等。#2771・CRI-2）。
+/// kubelet に伝える実行時の機能フラグ（`StatusResponse.features`。KEP-3619 等。#2771・#2830・CRI-2）。
 ///
 /// `supplemental_groups_policy` は、`supplemental_groups` と `supplemental_groups_policy`（Merge / Strict）の受け入れ、
 /// `ContainerStatus.user.linux` の報告、イメージ config の StopSignal の解釈が揃ったため真にする。
-/// **スタブの明示（REPAIR-3）**: Status RPC は未実装（`UNIMPLEMENTED`）のため、現状この値は応答に乗らない。
-/// Status RPC を実装するときにこの関数の結果を `StatusResponse.features` に使う（CRI-1・CRI-2）。
+/// `mount_options`・`user_namespaces_host_network` は、対応する入力（`mounts.mount_options`・userns 写像）を
+/// bundle の変換が拒否している間は偽のままにする（`docs/design/cri-status-rpc.md`）。
+/// `Status` RPC の応答の `features` にそのまま乗る（CRI-1・CRI-2）。
 pub fn runtime_features() -> v1::RuntimeFeatures {
     v1::RuntimeFeatures {
         supplemental_groups_policy: true,
         ..Default::default()
+    }
+}
+
+/// `RuntimeReady` の condition 種別（kubelet が見る固定の語彙。CRI-1）。
+const CONDITION_RUNTIME_READY: &str = "RuntimeReady";
+/// `NetworkReady` の condition 種別（kubelet が見る固定の語彙。CRI-1）。
+const CONDITION_NETWORK_READY: &str = "NetworkReady";
+
+/// `Status` が報告する runtime handler の一覧（`SUPPORTED_RUNTIME_HANDLERS` から組み立てる。#2830・CRI-2）。
+///
+/// 既定ハンドラ（名前が空）だけを返す。各フラグは、対応する入力を bundle の変換が拒否している間は偽にする
+/// （`recursive_read_only_mounts` は `mounts.recursive_read_only`、`user_namespaces` は userns 写像〔#2240〕の拒否）。
+/// その拒否を外す変更は、ここのフラグも真にすること（REPAIR-3）。
+pub fn runtime_handlers() -> Vec<v1::RuntimeHandler> {
+    SUPPORTED_RUNTIME_HANDLERS
+        .iter()
+        .map(|name| v1::RuntimeHandler {
+            name: (*name).to_string(),
+            features: Some(v1::RuntimeHandlerFeatures {
+                recursive_read_only_mounts: false,
+                user_namespaces: false,
+            }),
+        })
+        .collect()
+}
+
+/// `RuntimeCondition` を組み立てる（`Status` 専用。reason・message は固定の英語文言で、入力や内部パスを含めない）。
+fn condition(kind: &str, status: bool, reason: &str, message: &str) -> v1::RuntimeCondition {
+    v1::RuntimeCondition {
+        r#type: kind.to_string(),
+        status,
+        reason: reason.to_string(),
+        message: message.to_string(),
     }
 }
 
@@ -1053,6 +1087,56 @@ impl CriRuntimeService {
     ) -> Self {
         self.runtime = Some(RuntimeBinding { adapter, bundles });
         self
+    }
+
+    /// `Status` の応答を組み立てる（CRI-1・CRI-2・REPAIR-3・REPAIR-5・#2830）。
+    ///
+    /// kubelet が約 5 秒ごとに呼ぶため待ちを持たない: I/O・スレッド生成・実行層の呼び出し・レジストリのロック取得を
+    /// 一切せず、持っている構成だけで判定する（REPAIR-5 の期限は構造上いらない）。
+    ///
+    /// - `RuntimeReady`: 実行層を注入済み（`with_runtime`）かつレジストリが poisoned でないとき真。未接続は
+    ///   `RuntimeNotConnected`、poisoned は `RuntimeStateUnavailable` で偽（記録だけの構成を ready と装わない）。
+    ///   poisoned でも RPC は `OK` で返す（kubelet はどちらもランタイム停止として扱い、condition なら理由が伝わる）
+    /// - `NetworkReady`: `PodNetworkProvider` を注入済み（`with_pod_network`）なら真、無ければ
+    ///   `NetworkPluginNotReady`（containerd と同じ語彙）で偽。本番の plugin-cri は core の network namespace の
+    ///   join が入るまで注入しないため偽になり、kubelet は hostNetwork でない Pod を拒否する
+    /// - `verbose` は受け付けるが `info` は常に空（内部のパス・構成を応答に出さない。proto は空の `info` を許す）
+    fn status_response(&self, _req: &v1::StatusRequest) -> Result<v1::StatusResponse, CriError> {
+        let runtime_condition = if self.runtime.is_none() {
+            condition(
+                CONDITION_RUNTIME_READY,
+                false,
+                "RuntimeNotConnected",
+                "container runtime backend is not connected",
+            )
+        } else if self.registry.is_poisoned() {
+            condition(
+                CONDITION_RUNTIME_READY,
+                false,
+                "RuntimeStateUnavailable",
+                "runtime state registry is unavailable",
+            )
+        } else {
+            condition(CONDITION_RUNTIME_READY, true, "", "")
+        };
+        let network_condition = if self.pod_network.is_some() {
+            condition(CONDITION_NETWORK_READY, true, "", "")
+        } else {
+            condition(
+                CONDITION_NETWORK_READY,
+                false,
+                "NetworkPluginNotReady",
+                "pod network provider is not configured",
+            )
+        };
+        Ok(v1::StatusResponse {
+            status: Some(v1::RuntimeStatus {
+                conditions: vec![runtime_condition, network_condition],
+            }),
+            info: HashMap::new(),
+            runtime_handlers: runtime_handlers(),
+            features: Some(runtime_features()),
+        })
     }
 
     /// 実行層の応答待ちの上限を指定する（既定 10 秒。REPAIR-5）。超過した RPC は `DEADLINE_EXCEEDED`。
@@ -2867,9 +2951,14 @@ impl RuntimeService for CriRuntimeService {
     }
     async fn status(
         &self,
-        _request: Request<v1::StatusRequest>,
+        request: Request<v1::StatusRequest>,
     ) -> Result<Response<v1::StatusResponse>, Status> {
-        Err(CriError::unimplemented("status").into())
+        let timer = CriOpTimer::start(self.recorder.as_ref(), CriOpKind::Status);
+        let result = self
+            .status_response(&request.into_inner())
+            .map_err(Status::from);
+        timer.finish_with(&result);
+        result.map(Response::new)
     }
     async fn checkpoint_container(
         &self,
@@ -3124,6 +3213,42 @@ mod tests {
         .unwrap_err();
         // NeverRuntime に届けば Unimplemented になる。届かないので FAILED_PRECONDITION。
         assert_eq!(err.code(), Code::FailedPrecondition);
+    }
+
+    /// CRI-2・REPAIR-3（#2830）: レジストリが poisoned なら `RuntimeReady` は false（`RuntimeStateUnavailable`）で、
+    /// RPC 自体は OK のまま condition で理由を伝える。ロックは取らないので待たない。
+    #[test]
+    fn cri_2_status_reports_runtime_not_ready_when_registry_is_poisoned() {
+        let svc = CriRuntimeService::new().with_runtime(
+            crate::adapter::RuntimeAdapter::new(Arc::new(NeverRuntime)),
+            Arc::new(HangingRelease::default()),
+        );
+        let ready = block_on(svc.status(Request::new(v1::StatusRequest { verbose: false })))
+            .unwrap()
+            .into_inner();
+        assert!(ready.status.unwrap().conditions[0].status);
+
+        let poisoned = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = svc.registry.lock().unwrap();
+                    panic!("poison the registry lock");
+                })
+                .join()
+        });
+        assert!(poisoned.is_err());
+        let resp = block_on(svc.status(Request::new(v1::StatusRequest { verbose: false })))
+            .unwrap()
+            .into_inner();
+        let conditions = resp.status.unwrap().conditions;
+        assert_eq!(conditions.len(), 2);
+        assert_eq!(conditions[0].r#type, "RuntimeReady");
+        assert!(!conditions[0].status);
+        assert_eq!(conditions[0].reason, "RuntimeStateUnavailable");
+        assert_eq!(
+            conditions[0].message,
+            "runtime state registry is unavailable"
+        );
     }
 
     /// REPAIR-5・CRI-2: worker / 監視スレッドの生成に失敗しても、bundle の `release`（外部処理）は

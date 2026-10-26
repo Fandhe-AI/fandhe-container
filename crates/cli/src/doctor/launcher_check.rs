@@ -672,6 +672,27 @@ mod tests {
         assert_eq!(st(Some(b""), Some(22)), LauncherMount::Unknown);
     }
 
+    /// SEC-1・CLI-1・#2909: 同じマウントポイントに重なったマウント・祖先の overmount でも ID で行を選ぶ。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sec1_2909_launcher_mount_state_stacked_mount_point() {
+        let info: &[u8] = b"\
+22 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw
+26 22 0:23 / /opt/fc rw,nosuid,relatime - tmpfs tmpfs rw
+28 26 0:25 / /opt/fc rw,relatime - ext4 /dev/sdb1 rw
+30 22 0:26 / /opt rw,nosuid - tmpfs tmpfs rw
+";
+        let st = launcher_mount_state;
+        assert_eq!(st(Some(info), Some(26)), LauncherMount::Nosuid);
+        assert_eq!(st(Some(info), Some(28)), LauncherMount::Allowed);
+        assert_eq!(st(Some(info), Some(30)), LauncherMount::Nosuid);
+        let dup: &[u8] = b"\
+26 22 0:23 / /opt/fc rw,nosuid - tmpfs tmpfs rw
+26 22 0:23 / /opt/fc rw - ext4 /dev/sdb1 rw
+";
+        assert_eq!(st(Some(dup), Some(26)), LauncherMount::Unknown);
+    }
+
     /// SUP-14・#2661: 実体を開けないときは mount ID を得られず判定不能（`None`）。開けるファイルでは得られる。
     #[cfg(target_os = "linux")]
     #[test]

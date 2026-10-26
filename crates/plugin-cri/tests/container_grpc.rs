@@ -480,8 +480,6 @@ async fn pull_image(
     .map(|r| r.into_inner().image_ref)
 }
 
-/// 段 A（PLUG-1・CRI-2・CRI-3・CRI-7）: 同じ UDS で ImageService がサーブされ、Container 系 RPC が実バイナリへ届いて
-/// 本番バックエンドの応答が境界を越えて返る。タグが未知の作成は `NOT_FOUND` で半端な記録を残さず、image ID の作成は成功する。
 /// `Status` を UDS＋gRPC 越しに呼び、実行層ありで pod network 無しの構成の応答を具体値で照合する
 /// （`RuntimeReady`=true・`NetworkReady`=false〔`NetworkPluginNotReady`〕・既定ハンドラ 1 件・features・空の `info`）。
 /// 本番は core の network namespace の join が未実装で `with_pod_network` を差さないため、段 A も同じ値になる
@@ -530,6 +528,8 @@ async fn assert_status_runtime_ready_network_not_ready(c: &mut Client, verbose: 
     assert!(resp.info.is_empty());
 }
 
+/// 段 A（PLUG-1・CRI-2・CRI-3・CRI-7）: 同じ UDS で ImageService がサーブされ、Container 系 RPC が実バイナリへ届いて
+/// 本番バックエンドの応答が境界を越えて返る。タグが未知の作成は `NOT_FOUND` で半端な記録を残さず、image ID の作成は成功する。
 #[tokio::test]
 async fn container_rpcs_reach_the_plugin_binary() {
     tokio::time::timeout(WATCHDOG, async {

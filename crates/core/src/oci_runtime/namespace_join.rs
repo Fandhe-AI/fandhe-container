@@ -29,9 +29,25 @@
 //! 別の実体を指すため、開いた後にパスで再解決しない。TOCTOU を閉じる。SEC-1）。fd を持つ間は参加先の
 //! namespace が生き続け、`delete`・プロセスの終了で解放される。
 //!
+//! # パスの形式を `/proc/<pid>/ns/*` に限らない理由（#2776。CORE-3・SEC-5）
+//!
+//! core はここで形式検査（`/proc/<pid>/ns/{user,ipc}` の完全一致）を足さない。
+//!
+//! 1. core は汎用の OCI runtime の入口である。OCI の `linux.namespaces[].path` は bind mount した nsfs ファイル
+//!    （`/run/user/<uid>/…`・`/run/netns/<name>` 等）も許し、netns の join（#2675 の後続）も同じ形を使いうる。
+//! 2. 認可の正はパスの形ではなく、1 回だけ開いて固定した fd の素性（nsfs・種別・自身でないこと・親子・作成者 uid・
+//!    ipc の所有者）である。形を限っても pid の再利用や「どの pod の pid か」は core には判断できず、core は
+//!    sandbox を知らない。それは cri の責務で、cri は保持役の pid からだけパスを作る（`PodNamespacePaths` の契約）。
+//! 3. `/proc/<pid>/ns/*` 自体が magic link で、形を限っても最終要素の magic link を辿ること（`open_ns_file`）は
+//!    無くならない。辿った先は fd で検証する。
+//! 4. `cri2_start_rejects_pod_join_to_own_namespaces` 等の試験と production_launcher のシナリオ W は、
+//!    `/proc/self/ns/*` を `pin` の素性検査まで通して `PermissionDenied` と監査記録（SEC-4）を照合している。
+//!    形式検査を足すと素性検査の前に `InvalidArgument` で止まり、この監査の網羅が失われる。
+//!
 //! # 未実装・残余（REPAIR-3）
 //!
-//! - 供給元（pod の保持役）は未実装で、cri は当面パスを出さない（本番では共有されない）。保持役は #2675 の pod の
+//! - 供給元（pod の保持役）は未実装で、cri は当面パスを出さない（本番では共有されない）。cri が出せるパスは
+//!   保持役の pid からの `/proc/<pid>/ns/{user,ipc}` だけに限られる（#2776）。保持役は #2675 の pod の
 //!   netns と共有する設計の後続 issue。
 //! - pid の共有（`shareProcessNamespace`）は未対応。コンテナの init が PID 1 であることを制限適用の証跡の前提に
 //!   している（`exec::check_establish_preconditions`・`Pid1Target`）ため、既存の pid namespace への参加と両立しない。

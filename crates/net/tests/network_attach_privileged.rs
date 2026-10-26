@@ -583,7 +583,9 @@ mod linux {
                 _ => break None,
             }
         };
-        let _ = reader.join();
+        // 読み取りスレッドは join しない。回収できなかった子が stdout を保持すると lines() が
+        // 終わらず join が無期限に待つため（REPAIR-5）。子の終了で EOF になりスレッドは自然に終わる。
+        drop(reader);
         let Some(line) = found else {
             return Err(fail(format!(
                 "{mode} did not report before the deadline; output: {seen:?}"

@@ -405,7 +405,7 @@ pub(super) fn delete_with_recorded_image_root(
                 (Ok(resp), Some(legacy)) => {
                     let merged = merge_legacy_outcome(
                         resp.image_ref(),
-                        release_legacy_ref(images, legacy, req.id()),
+                        release_legacy_ref(images, recorder, legacy, req.id()),
                     );
                     Ok(resp.with_image_ref(merged))
                 }
@@ -416,22 +416,55 @@ pub(super) fn delete_with_recorded_image_root(
     }
 }
 
+/// 旧 scope の解除を記録する操作名（core の `image_ref_release` と同じ）。
+const LEGACY_REF_RELEASE_OP_NAME: &str = "image_ref_release";
+
 /// 旧 scope の参照キー 1 件を外した結果（#2499・OCI-7・REPAIR-4）。
-fn release_legacy_ref(images: &ImageStore, legacy_scope: &str, id: &ContainerId) -> CleanupOutcome {
+///
+/// core の現行 scope の解除と同じ操作名 `image_ref_release` で、成否と所要時間を `recorder` に記録する
+/// （旧 scope にだけ参照が残る場合、core の解除は `AlreadyAbsent` で終わるため、この経路の失敗は
+/// ここで計測しないと観測できない）。キーを作れない失敗も 1 回の失敗として記録する。
+fn release_legacy_ref(
+    images: &ImageStore,
+    recorder: &OpRecorder,
+    legacy_scope: &str,
+    id: &ContainerId,
+) -> CleanupOutcome {
+    let started = Instant::now();
+    let name = OpName::new(LEGACY_REF_RELEASE_OP_NAME).ok();
+    let record = |ok: bool| {
+        if let Some(name) = &name {
+            let outcome = if ok {
+                OpOutcome::Success
+            } else {
+                OpOutcome::Failure
+            };
+            let _ = recorder.record(name, outcome, started.elapsed());
+        }
+    };
     let key = match ContainerRefId::new(&ref_key(legacy_scope, id.as_str())) {
         Ok(k) => k,
         Err(_) => {
+            record(false);
             return CleanupOutcome::Kept {
                 code: ErrorCode::Internal,
             };
         }
     };
     match images.release_container_ref(&key) {
-        Ok(ContainerRefRelease::Released(_)) => CleanupOutcome::Removed,
-        Ok(_) => CleanupOutcome::AlreadyAbsent,
-        Err(e) => CleanupOutcome::Kept {
-            code: fail(e).code(),
-        },
+        Ok(r) => {
+            record(true);
+            match r {
+                ContainerRefRelease::Released(_) => CleanupOutcome::Removed,
+                _ => CleanupOutcome::AlreadyAbsent,
+            }
+        }
+        Err(e) => {
+            record(false);
+            CleanupOutcome::Kept {
+                code: fail(e).code(),
+            }
+        }
     }
 }
 
@@ -2060,6 +2093,12 @@ mod tests {
             )
             .expect("delete");
             assert_eq!(persisted_refs(&base), Vec::<String>::new());
+            // REPAIR-4: 旧 scope の解除も `image_ref_release` として計測される（現行 scope の登録が無いので core 側の記録は無く、この 1 件）。
+            let stats = rt
+                .recorder
+                .snapshot_op(&OpName::new("image_ref_release").expect("name"))
+                .expect("recorded");
+            assert_eq!((stats.success(), stats.failure()), (1, 0));
         }
 
         /// OCI-7・#2499（条件 2）: 記録で解除した delete の後は、同じ ID・同じ digest の再 create が成功する。

@@ -1947,20 +1947,29 @@ mod tests {
             return;
         };
         let id = EndpointId::new(&name).unwrap();
-        let (_ns, fid) = create_pinned(
+        let (_ns, _dir_id) = create_pinned(
             Path::new(&base),
             &id,
             Duration::from_secs(10),
             &noop_recorder(),
         )
         .unwrap_or_else(|f| panic!("create_pinned failed: {}", f.error.message()));
-        let serial = lookup_pin(fid).unwrap().serial;
-        println!("XPROC_IDENT {} {} {}", fid.0, fid.1, serial);
+        // 第 2 戻り値は置き場ディレクトリの識別子で PINS に無い。pin ファイルの識別子を取り直す。
+        let pin = Path::new(&base).join(&name);
+        let ident = pin_identity(&pin)
+            .unwrap_or_else(|e| panic!("pin_identity failed: {}", e.message()))
+            .unwrap_or_else(|| panic!("pin {} is not registered", pin.display()));
+        println!("XPROC_IDENT {} {} {}", ident.dev, ident.ino, ident.serial);
     }
 
     /// 子役を別プロセスで起動し、出力された識別子を返す。子が終了してから返る。
     fn spawn_pin_creator(base: &Path, name: &str) -> PinIdentity {
-        let out = std::process::Command::new(std::env::current_exe().unwrap())
+        use std::io::Read as _;
+        use std::process::Stdio;
+        use std::sync::mpsc;
+        // 子の終了と出力の収集に同じ期限を設ける（REPAIR-5）。超過したら kill して回収する。
+        const CHILD_DEADLINE: Duration = Duration::from_secs(60);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--ignored",
                 "--exact",
@@ -1970,8 +1979,63 @@ mod tests {
             ])
             .env("FANDHE_NETNS_XPROC_BASE", base)
             .env("FANDHE_NETNS_XPROC_NAME", name)
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .unwrap();
+        let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
+        for (is_out, pipe) in [
+            (
+                true,
+                child
+                    .stdout
+                    .take()
+                    .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+            ),
+            (
+                false,
+                child
+                    .stderr
+                    .take()
+                    .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+            ),
+        ] {
+            let tx = tx.clone();
+            let mut pipe = pipe.unwrap();
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = pipe.read_to_end(&mut buf);
+                let _ = tx.send((is_out, buf));
+            });
+        }
+        drop(tx);
+        let deadline = std::time::Instant::now() + CHILD_DEADLINE;
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("child did not exit within {CHILD_DEADLINE:?}; killed");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        for _ in 0..2 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left.max(Duration::from_secs(1))) {
+                Ok((true, b)) => stdout = b,
+                Ok((false, b)) => stderr = b,
+                Err(_) => break,
+            }
+        }
+        let out = std::process::Output {
+            status,
+            stdout,
+            stderr,
+        };
         assert!(out.status.success(), "child failed: {out:?}");
         let text = String::from_utf8_lossy(&out.stdout);
         let line = text

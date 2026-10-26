@@ -127,16 +127,10 @@ impl OwnedDir {
     /// `.owned` を開く。無ければ（`create` のとき）0700 で作る。symlink・非ディレクトリ・実効 UID 以外の所有・
     /// group / other 書き込み可は拒否する（fail-closed）。
     pub(super) fn open(dir: &PinDir, create: bool) -> Result<Self, NetError> {
-        let mut created = false;
         let fd = match sys::open_dir_nofollow_at(dir.file.as_fd(), OWNED_DIR_NAME) {
             Ok(fd) => fd,
             Err(SysError::Os(e)) if e == sys::ENOENT && create => {
-                let path = dir.entry(std::ffi::OsStr::new(".owned"));
-                match fs::DirBuilder::new().mode(0o700).create(&path) {
-                    Ok(()) => created = true,
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(e) => return Err(io_error("create netns owner directory", &e)),
-                }
+                Self::create_dir(dir)?;
                 sys::open_dir_nofollow_at(dir.file.as_fd(), OWNED_DIR_NAME)
                     .map_err(|e| sys_error("open netns owner directory", e))?
             }
@@ -144,12 +138,6 @@ impl OwnedDir {
             Err(e) => return Err(sys_error("open netns owner directory", e)),
         };
         let file = File::from(fd);
-        if created {
-            // `DirBuilder::mode` は umask の影響を受ける（umask 0200 なら 0500 になり記録を作れない）。
-            // 開いた fd で固定した実体に対して明示的に 0700 へ揃える（fchmod）。
-            file.set_permissions(fs::Permissions::from_mode(0o700))
-                .map_err(|e| io_error("chmod netns owner directory", &e))?;
-        }
         let meta = file
             .metadata()
             .map_err(|e| io_error("stat netns owner directory", &e))?;
@@ -160,6 +148,31 @@ impl OwnedDir {
             sys::effective_uid(),
         )?;
         Ok(Self { file })
+    }
+
+    /// `.owned` を作り、権限に依存しない `O_PATH` の fd で固定して 0700 へ揃える。
+    /// `DirBuilder::mode` は umask の影響を受け（umask 0777 なら 0000 になる）、そのまま読み取りで開くと
+    /// 所有者でも EACCES になり再作成もできないため、`open` の前に権限を直す。失敗時は自分が作った実体を片付ける。
+    fn create_dir(dir: &PinDir) -> Result<(), NetError> {
+        let path = dir.entry(std::ffi::OsStr::new(".owned"));
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(e) => return Err(io_error("create netns owner directory", &e)),
+        }
+        let fixed = (|| -> Result<(), NetError> {
+            let pfd = sys::open_path_nofollow_at(dir.file.as_fd(), OWNED_DIR_NAME)
+                .map_err(|e| sys_error("pin netns owner directory", e))?;
+            // O_PATH の fd は /proc/self/fd 経由の chmod で権限を変えられる（読み取り権限は不要）。
+            let via = PathBuf::from(format!("/proc/self/fd/{}", pfd.as_raw_fd()));
+            fs::set_permissions(&via, fs::Permissions::from_mode(0o700))
+                .map_err(|e| io_error("chmod netns owner directory", &e))
+        })();
+        if let Err(e) = fixed {
+            let _ = fs::remove_dir(&path);
+            return Err(e);
+        }
+        Ok(())
     }
 
     fn entry(&self, name: &str) -> PathBuf {
@@ -229,6 +242,7 @@ impl OwnedDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn sample() -> OwnerRecord {
         OwnerRecord {
@@ -287,5 +301,54 @@ mod tests {
         }
         assert_eq!(OwnerRecord::parse(good.as_bytes(), "web-2"), None);
         assert_eq!(OwnerRecord::parse(&[0xff, 0xfe], "web-1"), None);
+    }
+
+    /// 子役: 環境変数で指定された置き場に `.owned` を作り、モードを標準出力へ出す。親役が `sh -c 'umask ..'`
+    /// 経由で起動したときだけ働く（umask はプロセス全体に効くため別プロセスで試す）。
+    #[test]
+    fn net1_owned_dir_umask_child() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let Ok(base) = std::env::var("FANDHE_OWNED_UMASK_BASE") else {
+            return;
+        };
+        let dir = super::super::open_pin_dir(Path::new(&base)).unwrap();
+        OwnedDir::open(&dir, true).unwrap();
+        // 再試行（既存の `.owned` の再オープン）も成功する。
+        OwnedDir::open(&dir, true).unwrap();
+        let mode = fs::metadata(Path::new(&base).join(".owned"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        println!("OWNED_MODE {mode:o}");
+    }
+
+    /// NET-1・REPAIR-3・#2824: umask 0777 / 0100 でも `.owned` は 0700 で作られ、EACCES で作れなくならない。
+    #[test]
+    fn net1_owned_dir_created_under_restrictive_umask() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::env::var("FANDHE_OWNED_UMASK_BASE").is_ok() {
+            return;
+        }
+        for umask in ["0777", "0100"] {
+            let base = std::env::temp_dir()
+                .join(format!("fandhe-owned-umask-{umask}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&base);
+            fs::create_dir(&base).unwrap();
+            fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!(
+                    "umask {umask}; exec \"$0\" --exact --nocapture --test-threads=1 netns::owner_record::tests::net1_owned_dir_umask_child"
+                ))
+                .arg(std::env::current_exe().unwrap())
+                .env("FANDHE_OWNED_UMASK_BASE", &base)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "umask {umask}: {out:?}");
+            assert!(stdout.contains("OWNED_MODE 700"), "umask {umask}: {stdout}");
+            let _ = fs::remove_dir_all(&base);
+        }
     }
 }

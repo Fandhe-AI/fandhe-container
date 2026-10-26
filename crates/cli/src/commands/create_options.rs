@@ -1,4 +1,4 @@
-//! `create` の起動オプション(`--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`)の
+//! `create` の起動オプション(`--ulimit`・`--env`・`--env-file`・`--label`・`--ipc`・`--shm-size`・`--tmpfs`・`--cap-drop`・`--read-only`)の
 //! 意味検証と、supervisor へ渡す文書・状態記録へ書く label の組み立て(SUP-12・CLI-1・SEC-1・#2713)。
 //!
 //! # 役割と呼び出し文脈
@@ -12,6 +12,9 @@
 //!   **CLI が利用者の権限で**読み(非ブロッキング・上限つき。FIFO で止まらない)、`-e` との優先順位(`-e` が後勝ち)で
 //!   統合した `KEY=VALUE` 列を文書の `env` にする。特権の supervisor に利用者指定のホストのパスを読ませない
 //!   (confused deputy の回避。SEC-1)。
+//!   `--read-only`(#2828・CLI-1・SUP-12)は文書の `read-only` になる。実効値は起動時に core が config の `root.readonly` と
+//!   OR で決める(狭める方向のみ)。指定が無ければ外部 bundle の値に従い、`readonly:true` の bundle を書き込み可能に
+//!   戻す指定は無い(`--read-only=false` は使い方エラー)。CLI は外部 bundle の `config.json` を書き換えない。
 //! - [`labels_of`]: `--label` を core の `Annotations` にし、`CreateRequest::with_annotations` で状態記録へ直接書く
 //!   (supervisor を通らない)。
 //!
@@ -47,6 +50,7 @@ pub(super) fn document_of(
         options.tmpfs.clone(),
     )?
     .with_cap_drop(options.cap_drop.clone())
+    .map(|doc| doc.with_read_only(options.read_only))
 }
 
 /// `--env-file` を読む待ちの上限(REPAIR-5)。
@@ -134,6 +138,18 @@ mod tests {
         assert_eq!(doc.env(), ["A=file", "B=flag", "C=3"]);
         assert_eq!(doc.ulimits(), ["nofile=1024:2048"]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CLI-1・SUP-12(#2828): `--read-only` だけでも文書は空にならず(黙って効かなくなるのを防ぐ)、`read_only()` が true になる。
+    /// 指定が無ければ空のまま。
+    #[test]
+    fn cli1_sup12_create_options_read_only() {
+        let mut a = CreateOptionArgs::default();
+        assert!(document_of(&a).expect("doc").is_empty());
+        a.read_only = true;
+        let doc = document_of(&a).expect("doc");
+        assert!(!doc.is_empty());
+        assert!(doc.read_only());
     }
 
     /// CLI-1・SEC-1(#2775): `--cap-drop` は文書の cap-drop になり、未知名は固定文言の `InvalidArgument` で拒否する。

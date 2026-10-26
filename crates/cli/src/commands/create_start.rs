@@ -1847,6 +1847,7 @@ mod tests {
                     env: vec!["A=1".into()],
                     labels: vec!["tier=web".into()],
                     cap_drop: vec!["chown".into(), "CAP_NET_RAW".into()],
+                    read_only: true,
                     ..CreateOptionArgs::default()
                 },
                 bundle: bundle.to_path_buf(),
@@ -1888,6 +1889,8 @@ mod tests {
             assert_eq!(written.env(), doc.env());
             // `--cap-drop` も文書に載り、supervisor 側の復号で同じ集合になる(CLI-1・SEC-1・#2775)。
             assert_eq!(written.cap_drop(), ["chown", "CAP_NET_RAW"]);
+            // `--read-only` も文書に載る(CLI-1・SUP-12・#2828)。
+            assert!(written.read_only());
             let before = std::fs::read(&path).expect("bytes");
             let e = create_with_options(&rt, &req, None, &doc).expect_err("dup");
             assert_eq!(e.code(), ErrorCode::AlreadyExists);

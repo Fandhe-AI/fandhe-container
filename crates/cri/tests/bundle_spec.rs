@@ -2,6 +2,8 @@
 //!
 //! 生成物を core の `oci_runtime::parse_config_bytes` で読み戻し、具体値で照合する。
 
+use std::num::NonZeroU32;
+
 use fandhe_container_core::oci_runtime::{self, NamespaceKind};
 use fandhe_container_cri::bundle::spec::{
     MAX_ADDITIONAL_GIDS, MAX_ARGS, MAX_CONFIG_BYTES, MAX_ENV, MAX_HOSTNAME_BYTES, MAX_MOUNTS,
@@ -1064,7 +1066,7 @@ fn userns_mappings_are_rejected_but_node_mode_still_gets_a_user_namespace() {
 }
 
 fn pod_paths() -> PodNamespacePaths {
-    PodNamespacePaths::new("/proc/4242/ns/user", "/proc/4242/ns/ipc").expect("paths")
+    PodNamespacePaths::for_holder_pid(NonZeroU32::new(4242).expect("nonzero")).expect("paths")
 }
 
 fn build_with_pod(c: &ContainerConfig, paths: &PodNamespacePaths) -> Value {
@@ -1159,25 +1161,19 @@ fn pod_ipc_join_conflicts_with_container_userns() {
     build(&pod(), &c);
 }
 
+/// 公開の構築口は保持役の pid だけ（#2776）。文字列形式の拒否の照合は spec.rs の単体試験にある。
 #[test]
-fn pod_namespace_paths_are_validated() {
-    for (u, i) in [
-        ("proc/1/ns/user", "/proc/1/ns/ipc"),
-        ("/proc/1/ns/user", "ns/ipc"),
-        ("/proc/1/ns/user", "/proc/1/ns/ipc\0x"),
-    ] {
-        let e = PodNamespacePaths::new(u, i).expect_err("invalid");
-        assert_eq!(e.code(), CriErrorCode::Internal);
+fn pod_namespace_paths_only_from_holder_pid() {
+    let max = i32::MAX as u32;
+    for pid in [1, 4242, max] {
+        let p = PodNamespacePaths::for_holder_pid(NonZeroU32::new(pid).expect("nonzero"))
+            .expect("in range");
+        assert_eq!(p.user(), format!("/proc/{pid}/ns/user"));
+        assert_eq!(p.ipc(), format!("/proc/{pid}/ns/ipc"));
     }
-    let long = format!("/{}", "a".repeat(MAX_PATH_BYTES));
-    assert_eq!(
-        PodNamespacePaths::new(long, "/proc/1/ns/ipc")
-            .expect_err("too long")
-            .code(),
-        CriErrorCode::Internal
-    );
-    let at_limit = format!("/{}", "a".repeat(MAX_PATH_BYTES - 1));
-    PodNamespacePaths::new(at_limit, "/proc/1/ns/ipc").expect("at the limit");
+    let e = PodNamespacePaths::for_holder_pid(NonZeroU32::new(max + 1).expect("nonzero"))
+        .expect_err("over pid_t");
+    assert_eq!(e.code(), CriErrorCode::Internal);
 }
 
 fn profile(t: ProfileType) -> Option<SecurityProfile> {
